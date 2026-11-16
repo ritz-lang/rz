@@ -202,6 +202,53 @@ def test_every_zeus_the_stack_starts_gets_the_store_env():
 
 # --- process hygiene -----------------------------------------------------------
 
+def dead_within(pid: int, deadline: float = 2.0) -> bool:
+    """True once pid is gone or a zombie, polling up to deadline seconds.
+
+    A SIGKILLed orphan stays a zombie until init reaps it, and kill -0
+    succeeds on a zombie, so a fixed sleep then kill -0 flakes under load
+    (#3674). A live process (state other than Z) for the whole deadline is a
+    real leak and returns False."""
+    end = time.monotonic() + deadline
+    while True:
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                if f.read().rsplit(") ", 1)[1].startswith("Z"):
+                    return True
+        except (FileNotFoundError, ProcessLookupError):
+            return True  # no such pid, or reaped between open() and read()
+        if time.monotonic() >= end:
+            return False
+        time.sleep(0.02)
+
+
+@pytest.mark.unit
+def test_dead_within_counts_a_zombie_as_dead():
+    # Our own unreaped child is a zombie: kill -0 still says alive (the #3674
+    # flake), dead_within must say dead at once.
+    p = subprocess.Popen(["true"])
+    try:
+        t = time.monotonic()
+        while Path(f"/proc/{p.pid}/stat").read_text().rsplit(") ", 1)[1][0] != "Z":
+            assert time.monotonic() - t < 10, "child never became a zombie"
+            time.sleep(0.01)
+        assert subprocess.run(["kill", "-0", str(p.pid)], check=False).returncode == 0
+        assert dead_within(p.pid, deadline=0)
+    finally:
+        p.wait()
+
+
+@pytest.mark.unit
+def test_dead_within_reports_a_live_process_after_the_deadline():
+    p = subprocess.Popen(["sleep", "60"])
+    try:
+        t = time.monotonic()
+        assert not dead_within(p.pid, deadline=0.3)
+        assert time.monotonic() - t >= 0.3
+    finally:
+        p.kill()
+        p.wait()
+
 @pytest.mark.unit
 def test_stop_kills_the_whole_group(tmp_path):
     procs = ss.Procs(tmp_path)
@@ -230,9 +277,7 @@ def test_run_cmd_times_out_and_kills_the_group(tmp_path):
     assert res.returncode == 124
     assert time.monotonic() - t < 5
     pid = int(marker.read_text())
-    time.sleep(0.1)
-    alive = subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0
-    assert not alive, "the hung command's child survived its timeout"
+    assert dead_within(pid), "the hung command's child survived its timeout"
 
 
 @pytest.mark.unit
@@ -256,9 +301,7 @@ def test_run_cmd_interrupted_kills_the_group(tmp_path):
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old)
     pid = int(marker.read_text())
-    time.sleep(0.1)
-    alive = subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode == 0
-    assert not alive, "the interrupted command survived"
+    assert dead_within(pid), "the interrupted command survived"
 
 
 @pytest.mark.unit
