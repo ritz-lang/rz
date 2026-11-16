@@ -181,7 +181,8 @@ fn test_collection_get() -> i32
 
     # Retrieve it
     var retrieved: Document
-    var result: i32 = collection_get(@col, @new_id, @retrieved)
+    var retrieved_buf: [2048]u8
+    var result: i32 = collection_get(@col, @new_id, @retrieved, @retrieved_buf[0], 2048)
     if result != ERR_OK
         return 1
 
@@ -204,7 +205,8 @@ fn test_collection_get_not_found() -> i32
 
     var id: DocumentId = doc_id_new(1, 999)
     var doc: Document
-    var result: i32 = collection_get(@col, @id, @doc)
+    var doc_buf: [2048]u8
+    var result: i32 = collection_get(@col, @id, @doc, @doc_buf[0], 2048)
     if result != ERR_NOT_FOUND
         return 1
     0
@@ -247,9 +249,12 @@ fn test_collection_get_multiple() -> i32
     var r1: Document
     var r2: Document
     var r3: Document
-    collection_get(@col, @id1, @r1)
-    collection_get(@col, @id2, @r2)
-    collection_get(@col, @id3, @r3)
+    var r1_buf: [2048]u8
+    collection_get(@col, @id1, @r1, @r1_buf[0], 2048)
+    var r2_buf: [2048]u8
+    collection_get(@col, @id2, @r2, @r2_buf[0], 2048)
+    var r3_buf: [2048]u8
+    collection_get(@col, @id3, @r3, @r3_buf[0], 2048)
 
     var rf1: Field
     var rf2: Field
@@ -270,7 +275,8 @@ fn test_collection_get_multiple() -> i32
 fn test_collection_get_null_collection() -> i32
     var id: DocumentId = doc_id_new(1, 1)
     var doc: Document
-    var result: i32 = collection_get(null, @id, @doc)
+    var doc_buf: [2048]u8
+    var result: i32 = collection_get(null, @id, @doc, @doc_buf[0], 2048)
     if result != ERR_INVALID
         return 1
     0
@@ -309,7 +315,8 @@ fn test_collection_update() -> i32
 
     # Verify update
     var retrieved: Document
-    collection_get(@col, @doc.id, @retrieved)
+    var retrieved_buf: [2048]u8
+    collection_get(@col, @doc.id, @retrieved, @retrieved_buf[0], 2048)
     var rf: Field
     doc_get_field(@retrieved, "x", @rf)
     if field_as_int(@rf) != 20
@@ -362,7 +369,8 @@ fn test_collection_delete() -> i32
 
     # Verify gone
     var retrieved: Document
-    result = collection_get(@col, @new_id, @retrieved)
+    var retrieved_buf: [2048]u8
+    result = collection_get(@col, @new_id, @retrieved, @retrieved_buf[0], 2048)
     if result != ERR_NOT_FOUND
         return 2
     0
@@ -564,4 +572,69 @@ fn test_collection_refuses_a_doc_one_byte_over_the_limit() -> i32
 fn test_collection_max_doc_size_is_the_btree_value_limit() -> i32
     if MAX_DOC_SIZE != btree_max_value_len(8) as i64
         return 1
+    0
+
+# ============================================================================
+# Returned string fields own their storage (#3639)
+# ============================================================================
+
+fn fill_text(text: *u8, n: i64, base: i64)
+    var i: i64 = 0
+    while i < n
+        text[i] = (base + (i % 26)) as u8
+        i = i + 1
+
+fn insert_body(col: *Collection, text: *u8, n: i64, out_id: *DocumentId) -> i32
+    var doc: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @id)
+    var f: Field = field_string(text, n)
+    doc_set_field(@doc, "body", @f)
+    return collection_insert(col, @doc, out_id)
+
+# A long string survives a get followed by another get, which reuses the
+# same stack depth: its bytes live in the buffer the caller handed in,
+# not in collection_get's frame.
+[[test]]
+fn test_collection_get_string_outlives_call() -> i32
+    var pool_opt = buffer_pool_new(64)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 10
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var text_a: [1500]u8
+    var text_b: [1500]u8
+    fill_text(@text_a[0], 1500, 65)
+    fill_text(@text_b[0], 1500, 97)
+    var id_a: DocumentId
+    var id_b: DocumentId
+    if insert_body(@col, @text_a[0], 1500, @id_a) != ERR_OK
+        return 1
+    if insert_body(@col, @text_b[0], 1500, @id_b) != ERR_OK
+        return 1
+
+    var doc_a: Document
+    var doc_b: Document
+    var doc_a_buf: [2048]u8
+    if collection_get(@col, @id_a, @doc_a, @doc_a_buf[0], 2048) != ERR_OK
+        return 2
+    var doc_b_buf: [2048]u8
+    if collection_get(@col, @id_b, @doc_b, @doc_b_buf[0], 2048) != ERR_OK
+        return 2
+
+    var fa: Field
+    var fb: Field
+    if doc_get_field(@doc_a, "body", @fa) != ERR_OK
+        return 3
+    if doc_get_field(@doc_b, "body", @fb) != ERR_OK
+        return 3
+    if field_string_len(@fa) != 1500
+        return 4
+    if memcmp(field_string_ptr(@fa), @text_a[0], 1500) != 0
+        return 5
+    if memcmp(field_string_ptr(@fb), @text_b[0], 1500) != 0
+        return 6
+    buffer_pool_destroy(pool)
     0

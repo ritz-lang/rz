@@ -705,19 +705,20 @@ fn test_query_exec_order_asc() -> i32
     # Verify order: Bob (25), Alice (30), Carol (35)
     var doc: Document
     var id0: DocumentId = query_result_get(result, 0)
-    collection_get(@col, @id0, @doc)
+    var doc_buf: [2048]u8
+    collection_get(@col, @id0, @doc, @doc_buf[0], 2048)
     var age0: Field
     doc_get_field(@doc, "age", @age0)
     assert field_as_int(@age0) == 25
 
     var id1: DocumentId = query_result_get(result, 1)
-    collection_get(@col, @id1, @doc)
+    collection_get(@col, @id1, @doc, @doc_buf[0], 2048)
     var age1: Field
     doc_get_field(@doc, "age", @age1)
     assert field_as_int(@age1) == 30
 
     var id2: DocumentId = query_result_get(result, 2)
-    collection_get(@col, @id2, @doc)
+    collection_get(@col, @id2, @doc, @doc_buf[0], 2048)
     var age2: Field
     doc_get_field(@doc, "age", @age2)
     assert field_as_int(@age2) == 35
@@ -747,7 +748,8 @@ fn test_query_exec_order_desc() -> i32
     # Verify order: Carol (35), Alice (30), Bob (25)
     var doc: Document
     var id0: DocumentId = query_result_get(result, 0)
-    collection_get(@col, @id0, @doc)
+    var doc_buf: [2048]u8
+    collection_get(@col, @id0, @doc, @doc_buf[0], 2048)
     var age0: Field
     doc_get_field(@doc, "age", @age0)
     assert field_as_int(@age0) == 35
@@ -773,7 +775,8 @@ fn test_query_first() -> i32
     query_eq_int(@q, "age", 25)
 
     var doc: Document
-    var result: i32 = query_first(@q, @col, @doc)
+    var doc_buf: [2048]u8
+    var result: i32 = query_first(@q, @col, @doc, @doc_buf[0], 2048)
 
     assert result == ERR_OK
     var age: Field
@@ -795,7 +798,8 @@ fn test_query_first_not_found() -> i32
     query_eq_int(@q, "age", 99)
 
     var doc: Document
-    var result: i32 = query_first(@q, @col, @doc)
+    var doc_buf: [2048]u8
+    var result: i32 = query_first(@q, @col, @doc, @doc_buf[0], 2048)
 
     assert result == ERR_NOT_FOUND
 
@@ -884,5 +888,106 @@ fn test_query_missing_field() -> i32
     assert result.count == 0
 
     query_result_destroy(result)
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# String fields read through collection_get (#3639)
+# ============================================================================
+
+fn result_name_is(col: *Collection, result: *QueryResult, idx: i32, want: *u8) -> i32
+    var id: DocumentId = query_result_get(result, idx)
+    var doc: Document
+    var doc_buf: [2048]u8
+    if collection_get(col, @id, @doc, @doc_buf[0], 2048) != ERR_OK
+        return 0
+    var f: Field
+    if doc_get_field(@doc, "name", @f) != ERR_OK
+        return 0
+    let n: i64 = strlen(want)
+    if field_string_len(@f) != n
+        return 0
+    if memcmp(field_string_ptr(@f), want, n) != 0
+        return 0
+    1
+
+# Sorting compares the key document's string against each earlier one;
+# both must stay readable while the other is fetched.
+[[test]]
+fn test_query_exec_order_by_string() -> i32
+    var pool: *BufferPool = make_test_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    insert_test_doc(@col, "Carol", 35, 0)
+    insert_test_doc(@col, "Alice", 30, 1)
+    insert_test_doc(@col, "Bob", 25, 1)
+
+    var q: Query = query_new()
+    query_order_asc(@q, "name")
+    var result: *QueryResult = query_exec(@q, @col)
+
+    assert result != null
+    assert result.count == 3
+    assert result_name_is(@col, result, 0, "Alice") == 1
+    assert result_name_is(@col, result, 1, "Bob") == 1
+    assert result_name_is(@col, result, 2, "Carol") == 1
+
+    query_result_destroy(result)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_query_exec_order_by_string_desc() -> i32
+    var pool: *BufferPool = make_test_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    insert_test_doc(@col, "Bob", 25, 1)
+    insert_test_doc(@col, "Alice", 30, 1)
+    insert_test_doc(@col, "Carol", 35, 0)
+
+    var q: Query = query_new()
+    query_order_desc(@q, "name")
+    var result: *QueryResult = query_exec(@q, @col)
+
+    assert result != null
+    assert result.count == 3
+    assert result_name_is(@col, result, 0, "Carol") == 1
+    assert result_name_is(@col, result, 1, "Bob") == 1
+    assert result_name_is(@col, result, 2, "Alice") == 1
+
+    query_result_destroy(result)
+    buffer_pool_destroy(pool)
+    0
+
+# query_first hands back a Document whose string still reads after the
+# next lookup reuses the same stack depth.
+[[test]]
+fn test_query_first_string_outlives_call() -> i32
+    var pool: *BufferPool = make_test_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    insert_test_doc(@col, "Alice", 30, 1)
+    insert_test_doc(@col, "Bartholomew-Fitzgerald", 25, 1)
+
+    var q: Query = query_new()
+    query_eq_int(@q, "age", 25)
+    var q2: Query = query_new()
+    query_eq_int(@q2, "age", 30)
+
+    var doc: Document
+    var doc_buf: [2048]u8
+    assert query_first(@q, @col, @doc, @doc_buf[0], 2048) == ERR_OK
+    var other: Document
+    var other_buf: [2048]u8
+    assert query_first(@q2, @col, @other, @other_buf[0], 2048) == ERR_OK
+
+    var f: Field
+    assert doc_get_field(@doc, "name", @f) == ERR_OK
+    assert field_string_len(@f) == 22
+    assert memcmp(field_string_ptr(@f), "Bartholomew-Fitzgerald", 22) == 0
+
     buffer_pool_destroy(pool)
     0
