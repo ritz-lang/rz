@@ -8,8 +8,8 @@
 # - https://www.kernel.org/doc/html/latest/input/event-codes.html
 
 import serial { prints, println, serial_print_hex, serial_print_hex8, serial_print_dec }
-import drivers.pci { PciDevice, pci_find_virtio, pci_find_virtio_nth, pci_enable_bus_master, pci_enable_io, VIRTIO_DEVICE_INPUT }
-import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
+import drivers.pci { PciDevice, pci_find_virtio, pci_find_virtio_nth, VIRTIO_DEVICE_INPUT }
+import drivers.virtio.common { VirtioDevice, VIO_TRANSPORT_MMIO,Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_setup_queue, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_virt_to_phys }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
@@ -248,21 +248,20 @@ pub fn virtio_input_init() -> i32
     serial_print_hex8((*pci_dev).function)
     prints("\n")
 
-    # Enable bus mastering and I/O space
-    pci_enable_bus_master(pci_dev)
-    pci_enable_io(pci_dev)
-
-    # Get I/O base address
-    let io_base: u16 = ((*pci_dev).bar[0] & 0xFFFC) as u16
-    prints("[virtio-input] I/O base: 0x")
-    serial_print_hex(io_base as u64)
-    prints("\n")
-
-    # Initialize VirtIO device
+    # Initialize VirtIO device. vio_init_device picks the transport: legacy
+    # I/O ports when BAR0 is an I/O BAR, else the modern MMIO capabilities.
+    # QEMU's virtio-keyboard/mouse-pci are modern-only (1af4:1052, no I/O
+    # BAR, AGAST #3438).
     let virtio_dev: *VirtioDevice = vio_init_device(pci_dev)
     if virtio_dev == 0 as *VirtioDevice
         prints("[virtio-input] Failed to init VirtIO device\n")
         return -1
+    if (*virtio_dev).transport == VIO_TRANSPORT_MMIO
+        prints("[virtio-input] transport: modern (MMIO)\n")
+    else
+        prints("[virtio-input] transport: legacy (I/O 0x")
+        serial_print_hex((*virtio_dev).io_base as u64)
+        prints(")\n")
 
     # Allocate input device structure
     input_device = kalloc(VIRTIO_INPUT_DEVICE_SIZE) as *VirtioInputDevice
@@ -344,6 +343,24 @@ pub fn virtio_input_init() -> i32
 # Poll for Input Events
 # ============================================================================
 
+# Serial-log the first LOGGED_EVENTS events queued, as proof a device's
+# events reach the input queue (tools/test_tier1_boot.sh asserts this line
+# for an injected key). Then stay quiet: the desktop's typing isn't a log.
+const LOGGED_EVENTS: i32 = 16
+var g_events_logged: i32 = 0
+
+fn log_event(ev: *VirtioInputEvent)
+    if g_events_logged >= LOGGED_EVENTS
+        return
+    g_events_logged = g_events_logged + 1
+    prints("[virtio-input] event type=")
+    serial_print_dec((*ev).event_type as i32)
+    prints(" code=")
+    serial_print_dec((*ev).code as i32)
+    prints(" value=")
+    serial_print_dec((*ev).value)
+    prints("\n")
+
 pub fn virtio_input_poll() -> i32
     if input_device == 0 as *VirtioInputDevice
         return 0
@@ -365,7 +382,8 @@ pub fn virtio_input_poll() -> i32
 
         # Push to ring buffer (skip SYN_REPORT events)
         if (*event_ptr).event_type != EV_SYN
-            ring_push(event_ptr)
+            if ring_push(event_ptr)
+                log_event(event_ptr)
             events_processed = events_processed + 1
 
         # Re-submit the buffer

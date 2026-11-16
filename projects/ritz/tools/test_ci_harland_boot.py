@@ -166,7 +166,15 @@ out = sys.argv[sys.argv.index("--output") + 1]
 open(out, "wb").close()
 """
 
-PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
+# A boot whose virtio-keyboard-pci came up and whose injected `sendkey a`
+# reached the kernel input queue and init (AGAST #3438).
+KEY_OK = (
+    r"  [OK] VirtIO input device\n"
+    r"[test] input ... [virtio-input] event type=1 code=30 value=1\n"
+    r"key event code=30 value=1\n"
+)
+SUITE_PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
+PASSED = KEY_OK + SUITE_PASSED
 
 
 @pytest.fixture
@@ -279,6 +287,31 @@ def test_all_tests_passed_passes_and_keeps_the_serial_log(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS (native)" in r.stdout
     assert "ALL TESTS PASSED" in (keep / "native.log").read_text()
+
+
+def test_boot_attaches_a_keyboard_and_a_monitor_socket(tree):
+    """The sendkey check needs a modern-only virtio-keyboard-pci and a
+    monitor socket to inject the key through (AGAST #3438)."""
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = (tree["tmp"] / "stub.log").read_text()
+    assert "virtio-keyboard-pci" in argv
+    assert "-monitor unix:" in argv
+
+
+def test_suite_passed_but_key_never_arrived_fails(tree):
+    """ALL TESTS PASSED is not enough: init's input check skips without a
+    key, so the script itself must see the key reach the kernel and init."""
+    r = _run(tree, r"  [OK] VirtIO input device\n" + SUITE_PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS (native): init Tier-1 suite" in r.stdout
+    assert "injected key A never reached the kernel input queue" in r.stdout
+
+
+def test_keyboard_that_never_came_up_fails(tree):
+    r = _run(tree, SUITE_PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "virtio-keyboard-pci did not come up" in r.stdout
 
 
 def test_kernel_panic_fails(tree):

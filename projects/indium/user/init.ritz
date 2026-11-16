@@ -9,7 +9,7 @@
 
 import libharland { print_str, print_int, sys_open, sys_close, O_RDONLY }
 import ritzlib.str { strlen }
-import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_acpi_poweroff, sys_read, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_acpi_poweroff, sys_read, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, sys_input_poll, sys_input_read }
 
 # ============================================================================
 # Test Infrastructure
@@ -270,6 +270,43 @@ fn test_yield() -> i32
 #
 # To add a new test, just add another run_test() call.
 
+# Read one key event from the virtio-input device (AGAST #3438).
+#
+# Not counted in the suite: a boot without a keyboard, or with one nobody
+# types on, skips. tools/test_tier1_boot.sh attaches virtio-keyboard-pci,
+# injects `sendkey a` through the QEMU monitor as soon as the kernel logs
+# "[OK] VirtIO input device", and asserts both the kernel's
+# "[virtio-input] event" line and this test's "key event" line.
+const INPUT_ERRNO_NODEV: i32 = -19
+const EV_KEY: u16 = 1
+# Poll rounds (input_read + yield) before giving up on a key. The key is
+# normally queued long before the suite gets here.
+const INPUT_WAIT_ROUNDS: i32 = 200000
+
+fn run_input_check()
+    print_str(c"[test] input ... ")
+    var ev: [8]u8
+    var round: i32 = 0
+    while round < INPUT_WAIT_ROUNDS
+        let rc: i32 = sys_input_read(@ev[0])
+        if rc == INPUT_ERRNO_NODEV
+            print_str(c"skipped (no input device)\n")
+            return
+        if rc == 0
+            let ev_type: u16 = (ev[0] as u16) | ((ev[1] as u16) << 8)
+            let code: u16 = (ev[2] as u16) | ((ev[3] as u16) << 8)
+            if ev_type == EV_KEY
+                print_str(c"key event code=")
+                print_int(code as i64)
+                print_str(c" value=")
+                print_int(ev[4] as i64)
+                print_str(c"\n")
+                return
+            continue
+        sys_yield()
+        round = round + 1
+    print_str(c"skipped (no key event)\n")
+
 fn run_tier1_tests() -> i32
     print_str(c"\n")
     print_str(c"========================================\n")
@@ -313,6 +350,8 @@ fn run_tier1_tests() -> i32
     rzsh_c_argv[1] = c"-c"
     rzsh_c_argv[2] = c"X=hello ; echo $X world ; N=7 ; exit $N"
     run_test_args(c"/bin/rzsh", c"rzsh -c vars", @rzsh_c_argv[0], 3, 7)
+
+    run_input_check()
 
     # Print summary
     print_str(c"\n")

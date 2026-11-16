@@ -9,7 +9,7 @@ import io { inb, outb, inw, outw, inl, outl }
 import serial { prints, println, serial_print_hex, serial_print_dec }
 import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
 import mm.heap { kalloc, kfree }
-import mm.vmm { vmm_map_page, vmm_virt_to_phys, PTE_PRESENT, PTE_WRITABLE, PTE_CACHE_DISABLE }
+import mm.vmm { vmm_map_mmio }
 import drivers.pci { PciDevice, pci_enable_bus_master, pci_enable_memory, pci_enable_io, pci_find_capability_nth, pci_read_config8, pci_read_config16, pci_read_config32, PCI_CAP_VENDOR }
 
 # ============================================================================
@@ -74,6 +74,9 @@ const VIRTIO_MMIO_QUEUE_AVAIL_HI: u32 = 0x2C       # W: Avail ring addr (high)
 const VIRTIO_MMIO_QUEUE_USED_LO: u32 = 0x30        # W: Used ring addr (low)
 const VIRTIO_MMIO_QUEUE_USED_HI: u32 = 0x34        # W: Used ring addr (high)
 const VIRTIO_MMIO_DEVICE_STATUS: u32 = 0x14        # R/W: Device status (8-bit)
+
+# VIRTIO_F_VERSION_1 is feature bit 32: bit 0 of feature word 1.
+const VIRTIO_F_VERSION_1_HI: u32 = 1
 
 # ============================================================================
 # Virtqueue Descriptor Flags
@@ -282,10 +285,18 @@ pub fn vio_get_features(dev: *VirtioDevice) -> u32
     else
         return vio_read32(dev, VIRTIO_PCI_HOST_FEATURES)
 
+# Accept `features` (feature bits 0-31). On the modern transport also accept
+# VIRTIO_F_VERSION_1 (bit 32): a modern device must be driven as virtio 1.x
+# and may refuse FEATURES_OK (or behave as legacy) without it (§6.1).
 pub fn vio_set_features(dev: *VirtioDevice, features: u32)
     if (*dev).transport == VIO_TRANSPORT_MMIO
-        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 0)
-        mmio_write32((*dev).mmio_common + VIRTIO_MMIO_DRIVER_FEATURES as u64, features)
+        let common: u64 = (*dev).mmio_common
+        mmio_write32(common + VIRTIO_MMIO_DEVICE_FEATURES_SEL as u64, 1)
+        let dev_hi: u32 = mmio_read32(common + VIRTIO_MMIO_DEVICE_FEATURES as u64)
+        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 0)
+        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, features)
+        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 1)
+        mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, dev_hi & VIRTIO_F_VERSION_1_HI)
     else
         vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, features)
 
@@ -578,12 +589,15 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
 
     return dev
 
-# Find VirtIO MMIO capabilities and map them
-# NOTE: Modern VirtIO MMIO mapping currently has issues with vmm_map_page
-# The MMIO regions are found but the page table mapping doesn't work correctly.
-# This needs further investigation - see github issue for tracking.
+# Find the virtio modern PCI capabilities (virtio 1.x §4.1.4) and map the
+# BAR regions they describe through the kernel MMIO window (vmm_map_mmio).
+# COMMON_CFG and NOTIFY_CFG are required; ISR_CFG and DEVICE_CFG are mapped
+# when present. Returns 0 on success, -1 if a required region is missing or
+# can't be mapped.
 fn vio_find_mmio_caps(dev: *VirtioDevice, pci_dev: *PciDevice) -> i32
-    # Look for vendor capabilities (VirtIO uses PCI_CAP_VENDOR = 0x09)
+    let b: u8 = (*pci_dev).bus
+    let d: u8 = (*pci_dev).device
+    let f: u8 = (*pci_dev).function
     var cap_idx: i32 = 0
     var found_common: bool = false
     var found_notify: bool = false
@@ -592,44 +606,39 @@ fn vio_find_mmio_caps(dev: *VirtioDevice, pci_dev: *PciDevice) -> i32
         let cap_ptr: u8 = pci_find_capability_nth(pci_dev, PCI_CAP_VENDOR, cap_idx)
         if cap_ptr == 0
             break
-
-        # Read the VirtIO capability type (offset 3 in vendor cap)
-        let cap_type: u8 = pci_read_config8((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_TYPE)
-        let bar: u8 = pci_read_config8((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_BAR)
-        let offset: u32 = pci_read_config32((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_OFFSET)
-        let length: u32 = pci_read_config32((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_LENGTH)
-
-        # Get the BAR base address
-        let bar_base: u64 = (*pci_dev).bar[bar as i32]
-
-        # Map the MMIO region to a known virtual address
-        # We use the kernel high memory region starting at 0xFFFFFFFF90000000
-        var virt_base: u64 = 0xFFFFFFFF90000000 + ((bar as u64) * 0x1000000)
-        virt_base = virt_base + (offset as u64)
-
-        # Map the physical page
-        let phys_page: u64 = (bar_base + (offset as u64)) & 0xFFFFFFFFFFFFF000
-        let virt_page: u64 = virt_base & 0xFFFFFFFFFFFFF000
-        let page_offset: u64 = (bar_base + (offset as u64)) & 0xFFF
-        let map_result: i32 = vmm_map_page(virt_page, phys_page, PTE_PRESENT | PTE_WRITABLE | PTE_CACHE_DISABLE)
-
-        # Store the virtual address with page offset
-        let mapped_addr: u64 = virt_page + page_offset
-
-        if cap_type == VIRTIO_PCI_CAP_COMMON_CFG
-            (*dev).mmio_common = mapped_addr
-            found_common = true
-        else if cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG
-            (*dev).mmio_notify = mapped_addr
-            # Read notify multiplier
-            (*dev).notify_multiplier = pci_read_config32((*pci_dev).bus, (*pci_dev).device, (*pci_dev).function, cap_ptr + VIRTIO_PCI_CAP_NOTIFY_MULT)
-            found_notify = true
-        else if cap_type == VIRTIO_PCI_CAP_ISR_CFG
-            (*dev).mmio_isr = mapped_addr
-        else if cap_type == VIRTIO_PCI_CAP_DEVICE_CFG
-            (*dev).mmio_device = mapped_addr
-
         cap_idx = cap_idx + 1
+
+        let cap_type: u8 = pci_read_config8(b, d, f, cap_ptr + VIRTIO_PCI_CAP_TYPE)
+        if cap_type < VIRTIO_PCI_CAP_COMMON_CFG or cap_type > VIRTIO_PCI_CAP_DEVICE_CFG
+            continue    # PCI_CFG (config-space window) or a vendor's own cap
+        let bar: u8 = pci_read_config8(b, d, f, cap_ptr + VIRTIO_PCI_CAP_BAR)
+        let offset: u32 = pci_read_config32(b, d, f, cap_ptr + VIRTIO_PCI_CAP_OFFSET)
+        let length: u32 = pci_read_config32(b, d, f, cap_ptr + VIRTIO_PCI_CAP_LENGTH)
+        if bar > 5 or (*pci_dev).bar_is_io[bar as i32] != 0 or (*pci_dev).bar[bar as i32] == 0 or length == 0
+            prints("[virtio] skipping cap type ")
+            serial_print_dec(cap_type as i32)
+            prints(": BAR ")
+            serial_print_dec(bar as i32)
+            prints(" is not a mapped memory BAR\n")
+            continue
+
+        # Each cap gets its own pages in the window; caps sharing a BAR page
+        # just map it twice.
+        let mapped: u64 = vmm_map_mmio((*pci_dev).bar[bar as i32] + (offset as u64), length as u64)
+        if mapped == 0
+            return -1
+
+        if cap_type == VIRTIO_PCI_CAP_COMMON_CFG and not found_common
+            (*dev).mmio_common = mapped
+            found_common = true
+        else if cap_type == VIRTIO_PCI_CAP_NOTIFY_CFG and not found_notify
+            (*dev).mmio_notify = mapped
+            (*dev).notify_multiplier = pci_read_config32(b, d, f, cap_ptr + VIRTIO_PCI_CAP_NOTIFY_MULT)
+            found_notify = true
+        else if cap_type == VIRTIO_PCI_CAP_ISR_CFG and (*dev).mmio_isr == 0
+            (*dev).mmio_isr = mapped
+        else if cap_type == VIRTIO_PCI_CAP_DEVICE_CFG and (*dev).mmio_device == 0
+            (*dev).mmio_device = mapped
 
     if found_common and found_notify
         return 0

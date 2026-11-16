@@ -534,6 +534,52 @@ pub fn vmm_ensure_mapped(paddr: u64, size: u64) -> i32
     return 0
 
 # ============================================================================
+# Device MMIO Window (AGAST #3438)
+# ============================================================================
+#
+# Device registers (virtio modern PCI capabilities, ...) live in BARs that
+# can sit anywhere in the 52-bit physical space, often above 4 GiB. They are
+# mapped uncached into a bump-allocated window at PML4[257], the slot after
+# the physmap. Being kernel-half, vmm_create_user_pml4 copies it into every
+# process, so a driver polled from a syscall reaches its registers whatever
+# CR3 is loaded. Map at boot, before the first process: a process PML4
+# copies PML4[257] only if it is present when the process is created.
+#
+# Before #3438 virtio used 0xFFFFFFFF90000000, inside the boot loader's
+# 2 MiB-page map of the kernel half: vmm_map_page refused it, the error was
+# ignored and the "registers" were RAM at phys 0x10000000.
+pub const MMIO_WINDOW_BASE: u64 = 0xFFFF808000000000
+const MMIO_WINDOW_SIZE: u64 = 0x8000000000    # 512 GiB, all of PML4[257]
+
+var g_mmio_next: u64 = 0xFFFF808000000000    # MMIO_WINDOW_BASE (ritz0: literal initializers only)
+
+# Map size bytes of device memory at physical address paddr. Returns the
+# kernel virtual address of paddr itself (page offset kept), or 0 on failure.
+pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
+    if size == 0
+        return 0
+    let page_mask: u64 = 0xFFFFFFFFFFFFF000
+    let first: u64 = paddr & page_mask
+    let end: u64 = (paddr + size + PAGE_SIZE - 1) & page_mask
+    if end <= first
+        return 0
+    let len: u64 = end - first
+    if len > MMIO_WINDOW_BASE + MMIO_WINDOW_SIZE - g_mmio_next
+        prints("[vmm] MMIO window exhausted\n")
+        return 0
+    let virt: u64 = g_mmio_next
+    var off: u64 = 0
+    while off < len
+        if vmm_map_page(virt + off, first + off, PTE_WRITABLE | PTE_CACHE_DISABLE | PTE_WRITE_THROUGH | g_pte_nx) != 0
+            prints("[vmm] MMIO map failed at phys ")
+            serial_print_hex(first + off)
+            prints("\n")
+            return 0
+        off = off + PAGE_SIZE
+    g_mmio_next = virt + len
+    return virt + (paddr - first)
+
+# ============================================================================
 # Debug Functions
 # ============================================================================
 

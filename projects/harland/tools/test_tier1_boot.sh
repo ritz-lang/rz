@@ -3,13 +3,17 @@
 # suite (#2132). Every Tier-1 test spawns a child that prints and exits, so
 # this covers the blocking spawn -> child exit -> parent resume path.
 #
-# Two boots, both with the initramfs on a virtio-blk disk:
+# Two boots, both with the initramfs on a virtio-blk disk and a modern-only
+# virtio-keyboard-pci (no I/O BAR, AGAST #3438):
 #   native  OVMF -> Harland's own BOOTX64.EFI -> kernel.elf. The suite must
 #           report ALL TESTS PASSED.
 #   grub    OVMF -> standalone GRUB-EFI -> multiboot2 harland.elf. The
 #           kernel takes its framebuffer from the multiboot2 framebuffer tag
 #           (#2143). The display driver must come up and the suite must also
 #           report ALL TESTS PASSED.
+# Each boot also injects `sendkey a` through the QEMU monitor once the kernel
+# logs "[OK] VirtIO input device"; the key must reach the kernel's input queue
+# ("[virtio-input] event type=1 code=30 value=1") and init's input check.
 #
 # Each ESP is a QEMU vvfat directory, so the only tools needed are
 # qemu-system-x86_64, OVMF, grub-mkstandalone (x86_64-efi) and python3.
@@ -108,16 +112,23 @@ boot() {
     # other one wrote.
     qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/initramfs.qcow2" "$WORK/$name-initramfs.qcow2"
     timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m "$MEM" \
-        -display none -no-reboot -monitor none \
+        -display none -no-reboot -monitor "unix:$WORK/$name-mon.sock,server,nowait" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
         -device virtio-blk-pci,drive=initramfs \
+        -device virtio-keyboard-pci \
         -drive "file=$WORK/$name-initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
         -serial "file:$serial" >/dev/null 2>&1 &
     local pid=$!
+    local key_sent=0
     # init halts after the suite, so stop QEMU once a verdict line appears.
     for _ in $(seq 1 "$TIMEOUT"); do
         sleep 1
+        if [ "$key_sent" = 0 ] && grep -aq "\[OK\] VirtIO input device" "$serial"; then
+            # A failed send (monitor not up yet) retries next second; a key
+            # that never lands is reported by key_received.
+            send_key "$WORK/$name-mon.sock" a 2>/dev/null && key_sent=1
+        fi
         grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$serial" && { sleep 1; break; }
         kill -0 "$pid" 2>/dev/null || break
     done
@@ -125,6 +136,34 @@ boot() {
     wait "$pid" 2>/dev/null
     echo "----- $name boot: Tier-1 suite output (tail) -----"
     sed -n '/Running Tier 1 Test Suite/,$p' "$serial" | grep -aE '^\[test\]|PASS|FAIL|Results|EXCEPTION|RIP|RSP' | tail -30
+}
+
+# send_key SOCK KEY: type KEY on the guest's keyboard through the QEMU
+# monitor socket SOCK (python3, so no socat is needed).
+send_key() {
+    python3 - "$1" "$2" <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(sys.argv[1])
+s.recv(4096)  # monitor banner
+s.sendall(("sendkey %s\n" % sys.argv[2]).encode())
+time.sleep(0.5)
+s.close()
+PY
+}
+
+# key_received NAME: pass only if the injected key reached the kernel's input
+# queue and init read it back (AGAST #3438).
+key_received() {
+    local log="$WORK/$1.log" ok=0
+    grep -aq "\[OK\] VirtIO input device" "$log" || { echo "FAIL ($1): virtio-keyboard-pci did not come up"; ok=1; }
+    grep -aq "\[virtio-input\] event type=1 code=30 value=1" "$log" || { echo "FAIL ($1): injected key A never reached the kernel input queue"; ok=1; }
+    # Not anchored to "[test] input ...": the kernel's event lines land on the
+    # same serial port between that prefix and init's verdict.
+    grep -aq "key event code=30 value=1" "$log" || { echo "FAIL ($1): init did not read the injected key"; ok=1; }
+    [ "$ok" = 0 ] && echo "PASS ($1): sendkey a reached the kernel input queue"
+    return $ok
 }
 
 # no_exception NAME: fail if the kernel took an exception or panicked.
@@ -155,6 +194,7 @@ if [ "$MODE" != grub ]; then
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
     boot native "$WORK/esp-native"
     all_passed native || rc=1
+    key_received native || rc=1
 fi
 
 if [ "$MODE" != native ]; then
@@ -179,6 +219,7 @@ EOF
         rc=1
     fi
     all_passed grub || rc=1
+    key_received grub || rc=1
 fi
 
 exit $rc
