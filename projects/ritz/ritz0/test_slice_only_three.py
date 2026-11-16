@@ -46,6 +46,20 @@ CALL = (f"{HEADER}fn g() -> *i32\n    return null\n\npub fn main() -> i32\n"
 RAW_DEREF = RAW_POINTER.replace("let t = p[1..3]\n    return t[0]", "let t = *(p[1..3])\n    return t")
 RAW_COMPARE = RAW_POINTER.replace("let t = p[1..3]\n    return t[0]",
                                   "let t = p[1..3] != p + 1\n    return 0")
+# AGAST #3403: a range on a full-rank N-D array is the same refusal as on a
+# 1-D one.  ritz1 lowered the range as an index value (emit_nd_index_value) and
+# refused it unlocated, as "unknown expression kind".
+ND_LOCAL = (f"{HEADER}pub fn main() -> i32\n    var a: [2][3]f32\n"
+            "    let t = a[1][0..2] + 1.0\n    return 0\n")
+ND_GLOBAL = (f"{HEADER}var g: [2][3]f64\n\npub fn main() -> i32\n"
+             "    let t = g[1][0..2] + 1.0\n    return 0\n")
+ND_FIELD = (f"{HEADER}struct M\n    m: [2][3]i32\n\npub fn main() -> i32\n    var h: M\n"
+            "    let t = h.m[1][0..2] + 1\n    return 0\n")
+ND_INCLUSIVE = (f"{HEADER}pub fn main() -> i32\n    var a: [2][2][3]i32\n"
+                "    let t = a[1][0][0..=2] + 1\n    return 0\n")
+# A plane pointer, `@g[1]` of a `[2][2][3]i32`, is a `*[2][3]i32`.
+PLANE = (f"{HEADER}var g: [2][2][3]i32\n\npub fn main() -> i32\n    let a = @g[1]\n"
+         "    let t = a[1][0..2] + 1\n    return 0\n")
 
 CASES = {
     "array": (ARRAY_LOCAL, "an array can't be sliced"),
@@ -57,6 +71,11 @@ CASES = {
     "raw_pointer_compare": (RAW_COMPARE, "a pointer can't be sliced"),
     "pointer_to_pointer": (POINTER_TO_POINTER, "a pointer to a pointer can't be sliced"),
     "pointer_to_array": (POINTER_TO_ARRAY, "a pointer to an array can't be sliced"),
+    "nd_local": (ND_LOCAL, "an array can't be sliced"),
+    "nd_global": (ND_GLOBAL, "an array can't be sliced"),
+    "nd_field": (ND_FIELD, "an array can't be sliced"),
+    "nd_inclusive": (ND_INCLUSIVE, "an array can't be sliced"),
+    "plane": (PLANE, "an array can't be sliced"),
 }
 
 
