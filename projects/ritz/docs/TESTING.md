@@ -431,7 +431,11 @@ Rules:
    `test_slice_through_reference.py` went from 2,070 tests to 37, but only
    from 102 to 93 CPU-s: most of what's left is the per-row compile that
    #2867's leaning check makes for a row that reaches a generic.  Folding
-   the two helpers into one is AGAST #3566.
+   the two helpers into one is AGAST #3566.  A `Refused` message may be a
+   tuple, every part of which must be said.  A grid with holes needs no
+   `@case`: list `Row(id, compilers, spec)`s directly, as
+   `test_array_store_rule.py` and `test_ritz1_array_pointer_index.py` do
+   (AGAST #3517: 3,348 tests to 58, 46 to ~26 CPU-s).
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

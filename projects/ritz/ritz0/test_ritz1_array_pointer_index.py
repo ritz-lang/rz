@@ -21,6 +21,11 @@ every position on ritz1 (index_through.ritz's `*(p# + i)`).
 A byte-wide element hides all of this, and `[2]i32` is 8 bytes, which hides a
 wrong-size access, so the grids cover several sizes and element types, and pass
 row 0 of a `[2][N]T` so a stride of `[N]T` lands on row 1.
+
+Every case is a row of one table (test_table_rows.py, AGAST #3517), checked a
+chunk of rows at a time per compiler; a row keeps the id its parametrised test
+had, less the compiler, and a failure names each row that failed with what it
+wanted and what it got.
 """
 
 from pathlib import Path
@@ -29,15 +34,16 @@ import pytest
 
 import array_rules
 import ref_rules
+import test_table_rows as table_rows
 from test_borrow_param_ref_field import _compile, _run
+from test_ref_into_value import _batch_build, _batch_compile
+from test_table_rows import Refused, Row, Run
 
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = pytest.mark.batched
+pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
-RITZ1S = ["ritz1", "ritz1_selfhosted"]
 
 # The pointer's spelling, and the `@` that makes one.
 KINDS = {"pointer": ("*", "@"), "reference": ("@", "@"), "mut_reference": ("@&", "@&")}
@@ -115,38 +121,6 @@ fn read_var{n}(p: {kind}[{n}]{ty}, i: i32) -> {ty}
     return decls, main
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-def test_every_kind_element_type_and_size(run_with, ty, kind, compiler):
-    spelled, addr = KINDS[kind]
-    parts = [_grid_size(spelled, addr, ty, n, 10 * (k + 1)) for k, n in enumerate(SIZES)]
-    program = ("".join(d for d, _ in parts) + "\npub fn main() -> i32\n"
-               + "".join(m for _, m in parts) + "    return 0\n")
-    assert run_with(compiler, ty, program) == 0
-
-
-# Stride T, not `[N]T`: row 0's pointer reads row 0, and never reaches row 1.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_the_stride_is_the_element_not_the_array(run_with, kind, compiler):
-    spelled, addr = KINDS[kind]
-    program = f"""\
-fn f(p: {spelled}[3]i32) -> i32
-    return p[1]
-
-pub fn main() -> i32
-    var a: [2][3]i32
-    a[0][1] = 2
-    a[1][1] = 5
-    a[1][0] = 4
-    return f({addr}a[0])
-"""
-    assert run_with(compiler, "stride", program) == 2
-
-
 def _a(body: str) -> str:
     return "pub fn main() -> i32\n    var a: [3]i32 = [10, 20, 30]\n" + body
 
@@ -201,13 +175,6 @@ READS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(READS))
-def test_reads(run_with, name, compiler):
-    assert run_with(compiler, name, READS[name]) == 20
-
-
 # An inferred local was an i64 slot.  What it could do then, it does now.
 INFERRED_STAYS_A_POINTER = {
     "cast_to_element_pointer": _a("    let p = @a\n    let q: *i32 = p as *i32\n    return q[1]\n"),
@@ -232,13 +199,6 @@ INFERRED_STAYS_A_POINTER = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(INFERRED_STAYS_A_POINTER))
-def test_an_inferred_local_stays_a_pointer(run_with, name, compiler):
-    assert run_with(compiler, name, INFERRED_STAYS_A_POINTER[name]) == 20
-
-
 # `@&T` fits `@T` (LARB R1).  An `@&` local is a `ptr` on ritz1 and an `@` param
 # the i64 value model, so the call converts it (#2334, #2416).  An inferred `@&a`
 # is an `@&` local, as an annotated one is: R1 makes `@T` read-only, so recording
@@ -252,13 +212,6 @@ MUT_INTO_SHARED = {
                   + _a("    return f(@&a)\n"),
     "scalar": "fn g(q: @i32) -> i32\n    return *q\n\n" + _a("    let p: @&i32 = @&a[1]\n    return g(p)\n"),
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(MUT_INTO_SHARED))
-def test_an_mut_reference_passes_as_a_reference(run_with, name, compiler):
-    assert run_with(compiler, name, MUT_INTO_SHARED[name]) == 20
 
 
 def _store_grid(kind: str, addr: str, ty: str, n: int, base: int, writable: bool) -> tuple[str, str]:
@@ -317,21 +270,6 @@ fn put{n}(p: {kind}[{n}]{ty}, i: i32, v: {ty})
     return decls, main
 
 
-# Every element type and size: a store, a store at a variable index, `@p[i]` read
-# and `@&p[i]` written, and row 1 untouched.  `@[N]T` takes the address only.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-def test_every_kind_stores_and_addresses_element_i(run_with, ty, kind, compiler):
-    spelled, addr = KINDS[kind]
-    parts = [_store_grid(spelled, addr, ty, n, 10 * (k + 1), kind in WRITABLE)
-             for k, n in enumerate(SIZES)]
-    program = ("".join(d for d, _ in parts) + "\npub fn main() -> i32\n"
-               + "".join(m for _, m in parts) + "    return 0\n")
-    assert run_with(compiler, ty, program) == 0
-
-
 def _store(kind: str, addr: str, stmt: str, ty: str = "i32") -> str:
     """`stmt` in `f`, over a `[3]ty` of ones; 20 when a[1] is 7 and the rest ones."""
     return f"""\
@@ -383,21 +321,6 @@ for _kind in WRITABLE:
     STORES[f"{_kind}_store_float_compound"] = _store(_spelled, _addr, "p[1] += 6.0", "f32")
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STORES))
-def test_a_store_through_the_index_is_element_i(run_with, name, compiler):
-    assert run_with(compiler, name, STORES[name]) == 20
-
-
-def _located(compile_with, compiler, name, program, message, where):
-    comp, _, _ = compile_with(compiler, name, program)
-    assert comp.returncode != 0, f"{compiler} took {name}"
-    out = comp.stdout + comp.stderr
-    assert message in out, out[-1500:]
-    assert f"main.ritz:{where}:" in out, out[-1500:]
-
-
 # §3.2: an `@[N]T` is read-only, whatever is written through it, at the place.
 SHARED_WRITES = {
     "store_const": ("    p[1] = 7\n", ref_rules.WRITE_THROUGH_SHARED, "2:5"),
@@ -409,37 +332,6 @@ SHARED_WRITES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SHARED_WRITES))
-def test_a_write_through_a_shared_array_is_section_3_2s(compile_with, name, compiler):
-    body, message, where = SHARED_WRITES[name]
-    program = f"fn f(p: @[3]i32, i: i32)\n{body}\n" + _a("    f(@a, 1)\n    return 0\n")
-    _located(compile_with, compiler, name, program, message, where)
-
-
-# `let p = @a` is an `@[N]T` too.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_inferred_shared_array_refuses_a_store(compile_with, compiler):
-    program = _a("    let p = @a\n    p[1] = 7\n    return a[1]\n")
-    _located(compile_with, compiler, "infer_addr_store", program, ref_rules.WRITE_THROUGH_SHARED, "4:5")
-
-
-# The element is a T, so a whole `[N]T` doesn't fit it, on all three, at the store.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("form", ["p[1] = b", "p[i] = b", "(*p)[1] = b", "p[1] = [1, 2, 3]", "p[1] = [0; 3]"])
-def test_a_whole_array_is_not_an_element(compile_with, form, kind, compiler):
-    spelled, addr = KINDS[kind]
-    program = (f"fn f(p: {spelled}[3]i32, i: i32)\n    var b: [3]i32 = [1, 2, 3]\n    {form}\n\n"
-               + _a(f"    f({addr}a, 1)\n    return 0\n"))
-    # `(*p)[1] = b` is located at the `*`, as `(*p).f = v` is.
-    _located(compile_with, compiler, "whole", program, array_rules.ELEMENT_NOT_ARRAY,
-             "3:6" if form.startswith("(*p)") else "3:5")
-
-
 # The element is the slot a literal lands in, as `a[1] = 300` on the array itself.
 # Base refused these stores outright; lowered without the slot, `300` was 44.
 SLOTS = {
@@ -449,32 +341,6 @@ SLOTS = {
     "bool_into_int": ("i32", "p[1] = true", "cannot use bool as an integer"),
     "inferred": ("u16", "let q = p\n    q[1] = 70000", "`70000` does not fit in `u16`"),
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("name", sorted(SLOTS))
-def test_the_element_is_the_literal_s_slot(compile_with, name, kind, compiler):
-    ty, stmt, message = SLOTS[name]
-    spelled, addr = KINDS[kind]
-    program = (f"fn f(p: {spelled}[3]{ty}, i: i32)\n    {stmt}\n\n"
-               f"pub fn main() -> i32\n    var a: [3]{ty}\n    f({addr}a, 1)\n    return 0\n")
-    line = 2 + stmt.count("\n")
-    col = ("    " + stmt).splitlines()[-1].index("=") + 3
-    _located(compile_with, compiler, name, program, message, f"{line}:{col}")
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_range_is_refused(compile_with, kind, compiler):
-    spelled, addr = KINDS[kind]
-    program = f"fn f(p: {spelled}[3]i32) -> i32\n    let t = p[1..3]\n    return t[0]\n\n" + _a(f"    return f({addr}a)\n")
-    comp, _, _ = compile_with(compiler, "range", program)
-    assert comp.returncode != 0
-    if compiler != "ritz0":
-        assert "can't be sliced" in comp.stderr
 
 
 # Row 0's pointer, into a `[2][3]i32`.  ritz0 took these at stride `[N]T` (#2330):
@@ -507,54 +373,11 @@ pub fn main() -> i32
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(RITZ0_STRIDES_BY_THE_ARRAY))
-def test_these_stride_by_the_element_now(run_with, compile_with, name, compiler):
-    program, expected = RITZ0_STRIDES_BY_THE_ARRAY[name]
-    if isinstance(expected, int):
-        assert run_with(compiler, name, program) == expected
-    else:
-        _located(compile_with, compiler, name, program, expected, "3:5")
-
-
-# `@p[i]` and `@&p[i]` as an argument, every kind.  `@&` through `@[N]T` is §3.2's.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("addr_op", ["@", "@&"])
-def test_every_address_of_an_element(run_with, compile_with, kind, addr_op, compiler):
-    spelled, addr = KINDS[kind]
-    program = (f"fn g(q: *i32) -> i32\n    return *q\n\nfn f(p: {spelled}[3]i32) -> i32\n"
-               f"    return g({addr_op}p[1] as *i32)\n\n" + _a(f"    return f({addr}a)\n"))
-    if kind == "reference" and addr_op == "@&":
-        _located(compile_with, compiler, "addr", program, "cannot borrow through an `@T` as mutable", "5:14")
-    else:
-        assert run_with(compiler, "addr", program) == 20
-
-
 # `p + i` strides `[N]T`, the pointee: it walks rows (R9).  Row 1 of a `[2][3]i32`.
 ROW_WALK = {
     "let": "    let q = p + 1\n    return q[0] * 10 + q[2]\n",
     "annotated": "    let q: *[3]i32 = p + 1\n    return q[0] * 10 + q[2]\n",
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("name", sorted(ROW_WALK))
-def test_pointer_arithmetic_walks_rows(run_with, name, kind, compiler):
-    # mut_reference: `p + 1` of an `@&[3]i32` was a `ptr` fed to inttoptr (#2554).
-    spelled, addr = KINDS[kind]
-    if name == "annotated":
-        program_body = ROW_WALK[name].replace("*[3]i32", f"{spelled}[3]i32")
-    else:
-        program_body = ROW_WALK[name]
-    program = (f"fn f(p: {spelled}[3]i32) -> i32\n{program_body}\n"
-               "pub fn main() -> i32\n    var a: [2][3]i32\n    a[0][0] = 1\n    a[0][2] = 3\n"
-               f"    a[1][0] = 4\n    a[1][2] = 6\n    return f({addr}a[0])\n")
-    assert run_with(compiler, name, program) == 46
 
 
 # Struct elements: H keeps a second array right behind the first, so a stride of
@@ -616,117 +439,6 @@ STRUCT_WRITES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("struct", sorted(_STRUCTS))
-@pytest.mark.parametrize("name", sorted(STRUCT_READS))
-def test_a_struct_element_reads(run_with, name, struct, kind, compiler):
-    body, ret, expected = STRUCT_READS[name]
-    program = _struct_program(struct, kind, body.replace("{t}", struct), ret)
-    assert run_with(compiler, name, program) == expected
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("struct", sorted(_STRUCTS))
-@pytest.mark.parametrize("name", sorted(STRUCT_WRITES))
-def test_a_struct_element_writes(run_with, name, struct, kind, compiler):
-    body, ret, expected = STRUCT_WRITES[name]
-    program = _struct_program(struct, kind, body.replace("{t}", struct), ret)
-    assert run_with(compiler, name, program) == expected
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STRUCT_WRITES))
-def test_a_struct_element_write_through_a_shared_array_is_section_3_2s(compile_with, name, compiler):
-    body, ret, _ = STRUCT_WRITES[name]
-    program = _struct_program("S", "reference", body.replace("{t}", "S"), ret)
-    comp, _, _ = compile_with(compiler, name, program)
-    assert comp.returncode != 0, f"{compiler} took {name}"
-    out = comp.stdout + comp.stderr
-    assert ("cannot write through an `@T`" in out or "cannot borrow through an `@T` as mutable" in out), out[-1500:]
-    assert "main.ritz:" in out
-
-
-# An un-annotated local that holds the pointer: `let q = p`, `let q = @h.a`.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-@pytest.mark.parametrize("bind", ["let q = p", "var q = p", "let q = p + 0"])
-def test_an_inferred_local_writes_a_struct_element(run_with, bind, kind, compiler):
-    body = f"    {bind}\n    q[1].x = 7\n    let r: *i32 = @q[2].x\n    *r = 1\n    let s: S = q[1]\n"
-    program = _struct_program("S", kind, body, "s.x * 10 + p[2].x")
-    assert run_with(compiler, "inferred", program) == 71
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("take", ["@", "@&"])
-def test_an_address_taken_local_indexes_struct_elements(run_with, take, compiler):
-    program = _struct_program("S", "pointer", "", "p[0].x").replace(
-        "    let r: i32 = f(@h.a)\n",
-        f"    let q = {take}h.a\n    let r: i32 = q[1].x * 10 + q[2].x\n")
-    if take == "@&":
-        program = program.replace("    let r: i32 = q[1]", "    q[1].x = 7\n    let r: i32 = q[1]")
-    assert run_with(compiler, take, program) == (76 if take == "@&" else 56)
-
-
-# A whole struct element out of a fn, and into a struct literal's field.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_struct_element_is_returned_and_held(run_with, kind, compiler):
-    spelled, _ = KINDS[kind]
-    body = ("    let w: W = W { s: p[1] }\n    let t: S = e(p)\n")
-    program = _struct_program("S", kind, body, "w.s.x * 10 + t.x")
-    program = program.replace("fn f(", f"struct W\n    s: S\n\nfn e(p: {spelled}[3]S) -> S\n    return p[2]\n\nfn f(")
-    assert run_with(compiler, "returned", program) == 56
-
-
-# A whole-array store built from `(*p)[i]` reads, from test_ritz1_whole_array.py's
-# REJECTED, where it sat because ritz0 couldn't index `(*p)` until #2331.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_deref_index_reads_into_a_whole_array_store(run_with, compiler):
-    program = """\
-fn s(p: *[4]i32)
-    *p = [(*p)[3], (*p)[2], (*p)[1], (*p)[0]]
-
-pub fn main() -> i32
-    var b: [4]i32 = [3, 0, 0, 0]
-    s(@b)
-    return b[3]
-"""
-    assert run_with(compiler, "self_copy", program) == 3
-
-
-# A method on an element: `p[i].m()` is a call on element i (#2382's row, here).
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_method_on_an_element(run_with, kind, compiler):
-    spelled, addr = KINDS[kind]
-    call = "p[1].get()" if kind == "reference" else "p[1].bump() + p[1].get() - 1"
-    program = (f"struct C\n    x: i32\n\nimpl C\n    fn bump(self: @&C) -> i32\n        self.x = self.x + 1\n        0\n\n"
-               f"    fn get(self: @C) -> i32\n        self.x\n\nfn f(p: {spelled}[2]C) -> i32\n    return {call}\n\n"
-               f"pub fn main() -> i32\n    var a: [2]C\n    a[0].x = 1\n    a[1].x = 6\n    return f({addr}a) * 10 + a[0].x\n")
-    assert run_with(compiler, "method", program) == (61 if kind == "reference" else 61)
-
-
-# `(*p)[i]` is `p[i]` (R9).  It falls out of #2330 on ritz1, and #2331 on ritz0.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", WRITABLE)
-def test_a_deref_index_is_the_same_place(run_with, kind, compiler):
-    spelled, addr = KINDS[kind]
-    program = (f"fn f(p: {spelled}[3]i32) -> i32\n    (*p)[1] = 7\n    return (*p)[1] + (*p)[2]\n\n"
-               + _a(f"    return f({addr}a) - 17\n"))
-    assert run_with(compiler, "deref", program) == 20
-
-
 # ritz0 fails at clang; a value that was a row must not come out as an integer.
 # R9 makes `p[i]` a row here, and `p[i] = row` its store: `*[N][M]T` is #2098's.
 ROWS = {
@@ -734,17 +446,6 @@ ROWS = {
     "row": "fn f(p: @[2][3]i32) -> i32\n    let r: *i32 = p[1] as *i32\n    return r[2]\n\n",
     "inferred": "fn f(a:& [2][3]i32) -> i32\n    let p = @a\n    return p[1][2]\n\n",
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(ROWS))
-def test_ritz1_refuses_to_index_a_pointer_to_rows(compile_with, name, compiler):
-    program = ROWS[name] + "pub fn main() -> i32\n    var a: [2][3]i32\n    a[1][2] = 6\n    return f(@a)\n"
-    comp, _, _ = compile_with(compiler, name, program)
-    assert comp.returncode != 0
-    # Not "multi-dimensional": emit_module's unlocated backstop says that too.
-    assert "a pointer to a multi-dimensional array can't be indexed" in comp.stderr
 
 
 # `p[i]` over a pointer to an array of pointers is element i, a pointer (LARB R9,
@@ -835,24 +536,6 @@ for _t in ("i16", "i32"):
                 + _PMAIN.format(t=_t, setup=_setup, arg=_arg), _want)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(POINTER_ELEMENT))
-def test_a_pointer_element(run_with, name, compiler):
-    program, expected = POINTER_ELEMENT[name]
-    assert run_with(compiler, name, program) == expected
-
-
-# §3.2: the element of an `@[N]*U` is the array's, so storing one is refused, at
-# the place; a store through it is the pointee's business, and runs above.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("op", ["    p[1] = p[0]\n", "    p[1] += 1\n"])
-def test_a_shared_pointer_element_is_read_only(compile_with, op, compiler):
-    program = "fn f(p: @[2]*i16) -> i32\n" + op + "    return 0\n" + _PTRS.format(t="i16", addr="@")
-    _located(compile_with, compiler, "shared_ptr_elem", program, ref_rules.WRITE_THROUGH_SHARED, "2:5")
-
-
 # A whole struct element by value.  R9 makes a copy legal: `let s: S = p[i]`, `g(p[i])`.
 # The rest put a struct where a number goes.  ritz0 refuses them or fails at clang;
 # ritz1 keeps #2321's located refusal, since `*(p# + i)` there failed at clang (#2525).
@@ -887,13 +570,6 @@ STRUCT_COPIES = {
     "tail_pointer_element_method": _S + "struct H\n    k: i32\n\nimpl H\n    fn f(self: @H, q: *S) -> S\n        q[1]\n\n"
     + "pub fn main() -> i32\n    var a: [3]S\n    a[1].x = 5\n    var h: H\n    let s = h.f(@a[0])\n    return s.x\n",
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STRUCT_COPIES))
-def test_a_whole_struct_element_copies(run_with, name, compiler):
-    assert run_with(compiler, name, STRUCT_COPIES[name]) == 5
 
 
 WHOLE_STRUCT_ELEMENT = {
@@ -942,16 +618,6 @@ for _db, (_ddecl, _dsetup, _dname) in _DIRECT_BASES.items():
                                              + "pub fn main() -> i32\n    return f() as i32\n")
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(WHOLE_STRUCT_ELEMENT))
-def test_ritz1_refuses_a_whole_struct_element(compile_with, name, compiler):
-    comp, _, _ = compile_with(compiler, name, WHOLE_STRUCT_ELEMENT[name])
-    assert comp.returncode != 0
-    assert "a whole struct is not a value here in ritz1" in comp.stderr
-    assert "main.ritz:" in comp.stderr
-
-
 # AGAST #2999: ritz0 typed `a[1] as i32`, and `return a[1]` from an `-> i64` fn, as
 # the struct itself, and clang refused the IR ("value doesn't match function result
 # type").  ritz0 refuses any struct value as an integer, located; ritz1's rows above.
@@ -976,31 +642,6 @@ STRUCT_AS_INTEGER = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", RITZ0_STRUCT_AS_INTEGER + sorted(STRUCT_AS_INTEGER))
-def test_ritz0_refuses_a_struct_as_an_integer(compile_with, name):
-    program = WHOLE_STRUCT_ELEMENT.get(name) or STRUCT_AS_INTEGER[name]
-    comp, _, _ = compile_with("ritz0", name, program)
-    assert comp.returncode != 0
-    assert "a struct is not an integer" in comp.stderr
-    # The cast's own refusal, not the `return` it sits in.
-    assert ("cannot cast struct `S`" if name.startswith("cast") else "the fn returns `i") in comp.stderr
-    assert "main.ritz:" in comp.stderr
-
-
-# AGAST #3008: ritz1 refused only the `[N]S` element (#2996); a struct local, param
-# or call result cast or returned as an integer passed it and failed at clang.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted(STRUCT_AS_INTEGER))
-def test_ritz1_refuses_a_struct_as_an_integer(compile_with, name, compiler):
-    comp, _, _ = compile_with(compiler, name, STRUCT_AS_INTEGER[name])
-    assert comp.returncode != 0
-    assert "a struct is not an integer" in comp.stderr
-    assert ("cannot cast struct `S`" if name.startswith("cast") else "the fn returns `i") in comp.stderr
-    assert "main.ritz:" in comp.stderr
-
-
 # What stays legal beside it: the element's address cast to a pointer, an integer
 # field cast, and (STRUCT_COPIES' returned_*) `return a[1]` from an `-> S` fn.
 # AGAST #3008: and the same of a struct local, param or call result.
@@ -1020,33 +661,6 @@ STRUCT_NEIGHBOURS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STRUCT_NEIGHBOURS))
-def test_a_struct_field_or_address_still_casts(run_with, name, compiler):
-    assert run_with(compiler, name, STRUCT_NEIGHBOURS[name]) == 5
-
-
-# `"..." as io.StrView` (harland's `as serial.StrView`) is refused now: there is
-# no `module.item` access (§15.3, AGAST #2215; test_qualified_access_refused.py).
-
-
-# The ordinary pointer stays pointer arithmetic, and its store stays a store.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_pointer_to_an_element_still_stores(run_with, compiler):
-    program = """\
-fn f(p: *i32)
-    p[1] = 7
-
-pub fn main() -> i32
-    var a: [3]i32 = [10, 20, 30]
-    f(@a[0])
-    return a[0] + a[1] + a[2]
-"""
-    assert run_with(compiler, "element", program) == 47
-
-
 # AGAST #2329, LARB R9: every base follows #2330's table, not just locals and
 # params.  A field, a global, a call result and `let q = h(p)` record no pointee N
 # and T on ritz1, which read 0 and stored `g[1] = 7` 8 bytes wide at stride 8.
@@ -1063,21 +677,7 @@ OPEN_BASES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(OPEN_BASES))
-def test_every_base_reads_element_i(run_with, name, compiler):
-    assert run_with(compiler, name, OPEN_BASES[name]) == 20
-
-
 GLOBAL_STORE = "var g: *[3]i32 = null\n\n" + _a("    g = @a\n    g[1] = 7\n    return a[1]\n")
-
-
-# R9 makes `g[1] = 7` element 1's store, as for a local.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_global_stores_element_i(run_with, compiler):
-    assert run_with(compiler, "global_store", GLOBAL_STORE) == 7
 
 
 def _base(base: str, kind: str, body: str, check: str) -> str:
@@ -1130,24 +730,6 @@ def _base_cases():
                 yield base, kind, op
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("base,kind,op", list(_base_cases()))
-def test_every_base_is_element_i_in_every_position(run_with, compile_with, base, kind, op, compiler):
-    body, check = BASE_OPS[op]
-    program = _base(base, kind, body, check)
-    if kind == "reference" and op in _WRITES:
-        # §3.2: nothing is written through an `@[N]T`, whatever the base.
-        message = ("cannot borrow through an `@T` as mutable" if op == "mut_address"
-                   else ref_rules.WRITE_THROUGH_SHARED)
-        comp, _, _ = compile_with(compiler, f"{base}_{op}", program)
-        out = comp.stdout + comp.stderr
-        assert comp.returncode != 0, f"{compiler} took {base} {op}"
-        assert message in out, out[-1500:]
-    else:
-        assert run_with(compiler, f"{base}_{op}", program) == 20
-
-
 # A struct element through each base: `.f` reads and writes element i's field.
 _SB = "struct S\n    x: i32\n    y: i64\n\n"
 _SA = "    var a: [3]S\n    a[1].x = 5\n    a[1].y = 6\n"
@@ -1155,7 +737,7 @@ STRUCT_BASES = {
     "field_read": _SB + "struct H\n    r: *[3]S\n\nfn f(h: *H) -> i32\n    return h.r[1].y as i32 + h.r[1].x\n\n"
                   "pub fn main() -> i32\n" + _SA + "    var h: H\n    h.r = @a\n    return f(@h)\n",
     "field_write": _SB + "struct H\n    r: @&[3]S\n\nfn f(h: *H)\n    h.r[1].y = 9\n\n"
-                   "pub fn main() -> i32\n" + _SA + "    var h: H\n    h.r = @&a\n    f(@h)\n    return a[1].y as i32 + a[0].x + a[2].x + 2\n",
+                   "pub fn main() -> i32\n" + _SA + "    a[0].x = 0\n    a[2].x = 0\n    var h: H\n    h.r = @&a\n    f(@h)\n    return a[1].y as i32 + a[0].x + a[2].x + 2\n",
     "global_write": _SB + "var g: *[3]S = null\n\npub fn main() -> i32\n" + _SA
                     + "    a[0].x = 0\n    a[2].x = 0\n    g = @a\n    g[1].x = 7\n    return a[1].x + a[0].x + a[2].x + 4\n",
     "call_read": _SB + "fn h(p: *[3]S) -> *[3]S\n    return p\n\npub fn main() -> i32\n" + _SA
@@ -1163,13 +745,6 @@ STRUCT_BASES = {
     "let_from_call_read": _SB + "fn h(p: @&[3]S) -> @&[3]S\n    return p\n\npub fn main() -> i32\n" + _SA
                           + "    let q = h(@&a)\n    return q[1].y as i32 + q[1].x\n",
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STRUCT_BASES))
-def test_every_base_reaches_a_struct_element(run_with, name, compiler):
-    assert run_with(compiler, name, STRUCT_BASES[name]) == 11
 
 
 # The base is evaluated once per use: a store, an address and `op=` call h once
@@ -1191,12 +766,6 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_call_base_is_evaluated_once(run_with, compiler):
-    assert run_with(compiler, "called_once", CALLED_ONCE) == 30
-
-
 # The element's type, where nothing annotates it: `let v = B[1]` is an f64.
 _F = "    var a: [3]f64 = [1.5, 10.0, 2.5]\n"
 FLOAT_BASES = {
@@ -1209,13 +778,6 @@ FLOAT_BASES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(FLOAT_BASES))
-def test_every_base_types_its_element(run_with, name, compiler):
-    assert run_with(compiler, name, FLOAT_BASES[name]) == 20
-
-
 # A generic struct's field and a generic fn's return keep N and T when T is a scalar.
 GENERIC_BASES = {
     "struct_field": "struct Box<T>\n    r: *[3]i32\n    t: T\n\npub fn main() -> i32\n"
@@ -1224,13 +786,6 @@ GENERIC_BASES = {
     "fn_return": "fn h<T>(p: *[3]i32, t: T) -> *[3]i32\n    return p\n\npub fn main() -> i32\n"
                  "    var a: [3]i32 = [10, 20, 30]\n    h<i64>(@a, 0)[2] = 7\n    return h<i64>(@a, 0)[1] + a[2] - 7\n",
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(GENERIC_BASES))
-def test_a_generic_base_is_element_i(run_with, name, compiler):
-    assert run_with(compiler, name, GENERIC_BASES[name]) == 20
 
 
 # A field of a field: `a.b.data[2] = 1` was ritz1's fail-closed refusal (an array
@@ -1251,7 +806,292 @@ pub fn main() -> i32
 """
 
 
+# ---- the rows ---------------------------------------------------------------
+#
+# Each was a parametrised test; its row id is that test's id, less `test_` and
+# the compiler.
+
+ALL = table_rows.ALL
+RITZ0 = ("ritz0",)
+RITZ1S = ("ritz1", "ritz1_selfhosted")
+_MUT_BORROW = "cannot borrow through an `@T` as mutable"
+
+
+def _grid(make, ty: str, kind: str, *extra) -> str:
+    """`make`'s decls and checks for each of SIZES, in one program."""
+    spelled, addr = KINDS[kind]
+    parts = [make(spelled, addr, ty, n, 10 * (k + 1), *extra) for k, n in enumerate(SIZES)]
+    return ("".join(d for d, _ in parts) + "\npub fn main() -> i32\n"
+            + "".join(m for _, m in parts) + "    return 0\n")
+
+
+def _escaped(text: str) -> str:
+    """A string parameter as pytest spelled it in an id."""
+    return text.encode("unicode_escape").decode()
+
+
+# Stride T, not `[N]T`: row 0's pointer reads row 0, and never reaches row 1.
+def _stride(kind: str) -> str:
+    spelled, addr = KINDS[kind]
+    return f"""\
+fn f(p: {spelled}[3]i32) -> i32
+    return p[1]
+
+pub fn main() -> i32
+    var a: [2][3]i32
+    a[0][1] = 2
+    a[1][1] = 5
+    a[1][0] = 4
+    return f({addr}a[0])
+"""
+
+
+# The element is a T, so a whole `[N]T` doesn't fit it, on all three, at the store.
+WHOLE_FORMS = ["p[1] = b", "p[i] = b", "(*p)[1] = b", "p[1] = [1, 2, 3]", "p[1] = [0; 3]"]
+
+
+def _whole(form: str, kind: str) -> Refused:
+    spelled, addr = KINDS[kind]
+    program = (f"fn f(p: {spelled}[3]i32, i: i32)\n    var b: [3]i32 = [1, 2, 3]\n    {form}\n\n"
+               + _a(f"    f({addr}a, 1)\n    return 0\n"))
+    # `(*p)[1] = b` is located at the `*`, as `(*p).f = v` is.
+    return Refused(program, array_rules.ELEMENT_NOT_ARRAY, at=(3, 6) if form.startswith("(*p)") else (3, 5))
+
+
+def _slot(name: str, kind: str) -> Refused:
+    ty, stmt, message = SLOTS[name]
+    spelled, addr = KINDS[kind]
+    program = (f"fn f(p: {spelled}[3]{ty}, i: i32)\n    {stmt}\n\n"
+               f"pub fn main() -> i32\n    var a: [3]{ty}\n    f({addr}a, 1)\n    return 0\n")
+    line = 2 + stmt.count("\n")
+    col = ("    " + stmt).splitlines()[-1].index("=") + 3
+    return Refused(program, message, at=(line, col))
+
+
+def _range(kind: str) -> str:
+    spelled, addr = KINDS[kind]
+    return f"fn f(p: {spelled}[3]i32) -> i32\n    let t = p[1..3]\n    return t[0]\n\n" + _a(f"    return f({addr}a)\n")
+
+
+def _strides_by_the_element(name: str):
+    program, expected = RITZ0_STRIDES_BY_THE_ARRAY[name]
+    if isinstance(expected, int):
+        return Run(program, expected)
+    return Refused(program, expected, at=(3, 5))
+
+
+# `@p[i]` and `@&p[i]` as an argument, every kind.  `@&` through `@[N]T` is §3.2's.
+def _address(kind: str, addr_op: str):
+    spelled, addr = KINDS[kind]
+    program = (f"fn g(q: *i32) -> i32\n    return *q\n\nfn f(p: {spelled}[3]i32) -> i32\n"
+               f"    return g({addr_op}p[1] as *i32)\n\n" + _a(f"    return f({addr}a)\n"))
+    if kind == "reference" and addr_op == "@&":
+        return Refused(program, _MUT_BORROW, at=(5, 14))
+    return Run(program, 20)
+
+
+def _row_walk(name: str, kind: str) -> Run:
+    # mut_reference: `p + 1` of an `@&[3]i32` was a `ptr` fed to inttoptr (#2554).
+    spelled, addr = KINDS[kind]
+    body = ROW_WALK[name].replace("*[3]i32", f"{spelled}[3]i32") if name == "annotated" else ROW_WALK[name]
+    return Run(f"fn f(p: {spelled}[3]i32) -> i32\n{body}\n"
+               "pub fn main() -> i32\n    var a: [2][3]i32\n    a[0][0] = 1\n    a[0][2] = 3\n"
+               f"    a[1][0] = 4\n    a[1][2] = 6\n    return f({addr}a[0])\n", 46)
+
+
+def _struct_row(table: dict, name: str, struct: str, kind: str) -> Run:
+    body, ret, expected = table[name]
+    return Run(_struct_program(struct, kind, body.replace("{t}", struct), ret), expected)
+
+
+def _struct_shared_write(name: str) -> Refused:
+    # Which of §3.2's two it is follows from the write: `@&` borrows, the rest store.
+    body, ret, _ = STRUCT_WRITES[name]
+    return Refused(_struct_program("S", "reference", body.replace("{t}", "S"), ret),
+                   _MUT_BORROW if "@&" in body else ref_rules.WRITE_THROUGH_SHARED)
+
+
+# An un-annotated local that holds the pointer: `let q = p`, `let q = @h.a`.
+def _inferred_writes(bind: str, kind: str) -> Run:
+    body = f"    {bind}\n    q[1].x = 7\n    let r: *i32 = @q[2].x\n    *r = 1\n    let s: S = q[1]\n"
+    return Run(_struct_program("S", kind, body, "s.x * 10 + p[2].x"), 71)
+
+
+def _address_taken(take: str) -> Run:
+    program = _struct_program("S", "pointer", "", "p[0].x").replace(
+        "    let r: i32 = f(@h.a)\n",
+        f"    let q = {take}h.a\n    let r: i32 = q[1].x * 10 + q[2].x\n")
+    if take == "@&":
+        program = program.replace("    let r: i32 = q[1]", "    q[1].x = 7\n    let r: i32 = q[1]")
+    return Run(program, 76 if take == "@&" else 56)
+
+
+# A whole struct element out of a fn, and into a struct literal's field.
+def _returned(kind: str) -> Run:
+    spelled, _ = KINDS[kind]
+    body = "    let w: W = W { s: p[1] }\n    let t: S = e(p)\n"
+    program = _struct_program("S", kind, body, "w.s.x * 10 + t.x")
+    return Run(program.replace("fn f(", f"struct W\n    s: S\n\nfn e(p: {spelled}[3]S) -> S\n    return p[2]\n\nfn f("), 56)
+
+
+# A whole-array store built from `(*p)[i]` reads, from test_ritz1_whole_array.py's
+# REJECTED, where it sat because ritz0 couldn't index `(*p)` until #2331.
+SELF_COPY = """\
+fn s(p: *[4]i32)
+    *p = [(*p)[3], (*p)[2], (*p)[1], (*p)[0]]
+
+pub fn main() -> i32
+    var b: [4]i32 = [3, 0, 0, 0]
+    s(@b)
+    return b[3]
+"""
+
+
+# A method on an element: `p[i].m()` is a call on element i (#2382's row, here).
+def _method(kind: str) -> Run:
+    spelled, addr = KINDS[kind]
+    call = "p[1].get()" if kind == "reference" else "p[1].bump() + p[1].get() - 1"
+    return Run(f"struct C\n    x: i32\n\nimpl C\n    fn bump(self: @&C) -> i32\n        self.x = self.x + 1\n        0\n\n"
+               f"    fn get(self: @C) -> i32\n        self.x\n\nfn f(p: {spelled}[2]C) -> i32\n    return {call}\n\n"
+               f"pub fn main() -> i32\n    var a: [2]C\n    a[0].x = 1\n    a[1].x = 6\n    return f({addr}a) * 10 + a[0].x\n",
+               61)
+
+
+# `(*p)[i]` is `p[i]` (R9).  It falls out of #2330 on ritz1, and #2331 on ritz0.
+def _deref_index(kind: str) -> Run:
+    spelled, addr = KINDS[kind]
+    return Run(f"fn f(p: {spelled}[3]i32) -> i32\n    (*p)[1] = 7\n    return (*p)[1] + (*p)[2]\n\n"
+               + _a(f"    return f({addr}a) - 17\n"), 20)
+
+
+# §3.2: the element of an `@[N]*U` is the array's, so storing one is refused, at
+# the place; a store through it is the pointee's business, and runs above.
+SHARED_POINTER_ELEMENT_OPS = ["    p[1] = p[0]\n", "    p[1] += 1\n"]
+
+
+def _struct_as_integer(name: str, program: str) -> Refused:
+    # The cast's own refusal, not the `return` it sits in.
+    return Refused(program, ("a struct is not an integer",
+                             "cannot cast struct `S`" if name.startswith("cast") else "the fn returns `i"))
+
+
+# The ordinary pointer stays pointer arithmetic, and its store stays a store.
+ELEMENT_POINTER = """\
+fn f(p: *i32)
+    p[1] = 7
+
+pub fn main() -> i32
+    var a: [3]i32 = [10, 20, 30]
+    f(@a[0])
+    return a[0] + a[1] + a[2]
+"""
+
+
+def _every_base(base: str, kind: str, op: str):
+    body, check = BASE_OPS[op]
+    program = _base(base, kind, body, check)
+    if kind == "reference" and op in _WRITES:
+        # §3.2: nothing is written through an `@[N]T`, whatever the base.
+        return Refused(program, _MUT_BORROW if op == "mut_address" else ref_rules.WRITE_THROUGH_SHARED,
+                       located=False)
+    return Run(program, 20)
+
+
+TABLE = [
+    *(Row(f"every_kind_element_type_and_size[{ty}-{kind}]", ALL, Run(_grid(_grid_size, ty, kind), 0))
+      for ty in sorted(SCALARS) for kind in sorted(KINDS)),
+    *(Row(f"the_stride_is_the_element_not_the_array[{kind}]", ALL, Run(_stride(kind), 2)) for kind in sorted(KINDS)),
+    *(Row(f"reads[{name}]", ALL, Run(READS[name], 20)) for name in sorted(READS)),
+    *(Row(f"an_inferred_local_stays_a_pointer[{name}]", ALL, Run(INFERRED_STAYS_A_POINTER[name], 20))
+      for name in sorted(INFERRED_STAYS_A_POINTER)),
+    *(Row(f"an_mut_reference_passes_as_a_reference[{name}]", ALL, Run(MUT_INTO_SHARED[name], 20))
+      for name in sorted(MUT_INTO_SHARED)),
+    # Every element type and size: a store, a store at a variable index, `@p[i]`
+    # read and `@&p[i]` written, and row 1 untouched.  `@[N]T` takes the address only.
+    *(Row(f"every_kind_stores_and_addresses_element_i[{ty}-{kind}]", ALL,
+          Run(_grid(_store_grid, ty, kind, kind in WRITABLE), 0))
+      for ty in sorted(SCALARS) for kind in sorted(KINDS)),
+    *(Row(f"a_store_through_the_index_is_element_i[{name}]", ALL, Run(STORES[name], 20)) for name in sorted(STORES)),
+    *(Row(f"a_write_through_a_shared_array_is_section_3_2s[{name}]", ALL,
+          Refused(f"fn f(p: @[3]i32, i: i32)\n{body}\n" + _a("    f(@a, 1)\n    return 0\n"), message,
+                  at=tuple(map(int, where.split(":")))))
+      for name, (body, message, where) in sorted(SHARED_WRITES.items())),
+    # `let p = @a` is an `@[N]T` too.
+    Row("an_inferred_shared_array_refuses_a_store", ALL,
+        Refused(_a("    let p = @a\n    p[1] = 7\n    return a[1]\n"), ref_rules.WRITE_THROUGH_SHARED, at=(4, 5))),
+    *(Row(f"a_whole_array_is_not_an_element[{form}-{kind}]", ALL, _whole(form, kind))
+      for form in WHOLE_FORMS for kind in WRITABLE),
+    *(Row(f"the_element_is_the_literal_s_slot[{name}-{kind}]", ALL, _slot(name, kind))
+      for name in sorted(SLOTS) for kind in WRITABLE),
+    # Every compiler words it "can't be sliced" now; ritz0 used to say otherwise.
+    *(Row(f"a_range_is_refused[{kind}]", ALL, Refused(_range(kind), "can't be sliced", located=False))
+      for kind in sorted(KINDS)),
+    *(Row(f"these_stride_by_the_element_now[{name}]", ALL, _strides_by_the_element(name))
+      for name in sorted(RITZ0_STRIDES_BY_THE_ARRAY)),
+    *(Row(f"every_address_of_an_element[{addr_op}-{kind}]", ALL, _address(kind, addr_op))
+      for addr_op in ("@", "@&") for kind in sorted(KINDS)),
+    *(Row(f"pointer_arithmetic_walks_rows[{name}-{kind}]", ALL, _row_walk(name, kind))
+      for name in sorted(ROW_WALK) for kind in sorted(KINDS)),
+    *(Row(f"a_struct_element_reads[{name}-{struct}-{kind}]", ALL, _struct_row(STRUCT_READS, name, struct, kind))
+      for name in sorted(STRUCT_READS) for struct in sorted(_STRUCTS) for kind in sorted(KINDS)),
+    *(Row(f"a_struct_element_writes[{name}-{struct}-{kind}]", ALL, _struct_row(STRUCT_WRITES, name, struct, kind))
+      for name in sorted(STRUCT_WRITES) for struct in sorted(_STRUCTS) for kind in WRITABLE),
+    *(Row(f"a_struct_element_write_through_a_shared_array_is_section_3_2s[{name}]", ALL, _struct_shared_write(name))
+      for name in sorted(STRUCT_WRITES)),
+    *(Row(f"an_inferred_local_writes_a_struct_element[{bind}-{kind}]", ALL, _inferred_writes(bind, kind))
+      for bind in ("let q = p", "var q = p", "let q = p + 0") for kind in WRITABLE),
+    *(Row(f"an_address_taken_local_indexes_struct_elements[{take}]", ALL, _address_taken(take)) for take in ("@", "@&")),
+    *(Row(f"a_struct_element_is_returned_and_held[{kind}]", ALL, _returned(kind)) for kind in sorted(KINDS)),
+    Row("a_deref_index_reads_into_a_whole_array_store", ALL, Run(SELF_COPY, 3)),
+    *(Row(f"a_method_on_an_element[{kind}]", ALL, _method(kind)) for kind in sorted(KINDS)),
+    *(Row(f"a_deref_index_is_the_same_place[{kind}]", ALL, _deref_index(kind)) for kind in WRITABLE),
+    # Not "multi-dimensional": emit_module's unlocated backstop says that too.
+    *(Row(f"ritz1_refuses_to_index_a_pointer_to_rows[{name}]", RITZ1S,
+          Refused(ROWS[name] + "pub fn main() -> i32\n    var a: [2][3]i32\n    a[1][2] = 6\n    return f(@a)\n",
+                  "a pointer to a multi-dimensional array can't be indexed", located=False))
+      for name in sorted(ROWS)),
+    *(Row(f"a_pointer_element[{name}]", ALL, Run(*POINTER_ELEMENT[name])) for name in sorted(POINTER_ELEMENT)),
+    *(Row(f"a_shared_pointer_element_is_read_only[{_escaped(op)}]", ALL,
+          Refused("fn f(p: @[2]*i16) -> i32\n" + op + "    return 0\n" + _PTRS.format(t="i16", addr="@"),
+                  ref_rules.WRITE_THROUGH_SHARED, at=(2, 5)))
+      for op in SHARED_POINTER_ELEMENT_OPS),
+    *(Row(f"a_whole_struct_element_copies[{name}]", ALL, Run(STRUCT_COPIES[name], 5)) for name in sorted(STRUCT_COPIES)),
+    *(Row(f"ritz1_refuses_a_whole_struct_element[{name}]", RITZ1S,
+          Refused(WHOLE_STRUCT_ELEMENT[name], "a whole struct is not a value here in ritz1"))
+      for name in sorted(WHOLE_STRUCT_ELEMENT)),
+    # AGAST #2999: ritz0 typed `a[1] as i32`, and `return a[1]` from an `-> i64` fn,
+    # as the struct itself; it refuses any struct value as an integer.
+    *(Row(f"ritz0_refuses_a_struct_as_an_integer[{name}]", RITZ0,
+          _struct_as_integer(name, WHOLE_STRUCT_ELEMENT.get(name) or STRUCT_AS_INTEGER[name]))
+      for name in RITZ0_STRUCT_AS_INTEGER + sorted(STRUCT_AS_INTEGER)),
+    # AGAST #3008: ritz1 refused only the `[N]S` element (#2996); a struct local,
+    # param or call result cast or returned as an integer passed it and failed at clang.
+    *(Row(f"ritz1_refuses_a_struct_as_an_integer[{name}]", RITZ1S, _struct_as_integer(name, STRUCT_AS_INTEGER[name]))
+      for name in sorted(STRUCT_AS_INTEGER)),
+    *(Row(f"a_struct_field_or_address_still_casts[{name}]", ALL, Run(STRUCT_NEIGHBOURS[name], 5))
+      for name in sorted(STRUCT_NEIGHBOURS)),
+    Row("a_pointer_to_an_element_still_stores", ALL, Run(ELEMENT_POINTER, 47)),
+    *(Row(f"every_base_reads_element_i[{name}]", ALL, Run(OPEN_BASES[name], 20)) for name in sorted(OPEN_BASES)),
+    # R9 makes `g[1] = 7` element 1's store, as for a local.
+    Row("a_global_stores_element_i", ALL, Run(GLOBAL_STORE, 7)),
+    *(Row(f"every_base_is_element_i_in_every_position[{base}-{kind}-{op}]", ALL, _every_base(base, kind, op))
+      for base, kind, op in _base_cases()),
+    *(Row(f"every_base_reaches_a_struct_element[{name}]", ALL, Run(STRUCT_BASES[name], 11))
+      for name in sorted(STRUCT_BASES)),
+    Row("a_call_base_is_evaluated_once", ALL, Run(CALLED_ONCE, 30)),
+    # The element's type, where nothing annotates it: `let v = B[1]` is an f64.
+    *(Row(f"every_base_types_its_element[{name}]", ALL, Run(FLOAT_BASES[name], 20)) for name in sorted(FLOAT_BASES)),
+    *(Row(f"a_generic_base_is_element_i[{name}]", ALL, Run(GENERIC_BASES[name], 20)) for name in sorted(GENERIC_BASES)),
+    Row("a_nested_field_stores_element_i", ALL, Run(NESTED_FIELD, 37)),
+]
+
+# `"..." as io.StrView` (harland's `as serial.StrView`) is refused now: there is
+# no `module.item` access (§15.3, AGAST #2215; test_qualified_access_refused.py).
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_nested_field_stores_element_i(run_with, compiler):
-    assert run_with(compiler, "nested_field", NESTED_FIELD) == 37
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=_batch_build, compile=_batch_compile, work=tmp_path)

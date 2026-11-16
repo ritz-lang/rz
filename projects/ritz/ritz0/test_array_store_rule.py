@@ -10,8 +10,11 @@ An array LITERAL has no element type until its slot gives it one, so the second
 half of this file runs literals through the same stores and checks their values:
 ritz0's conversion is gone, and it was what typed most of them.
 
-Each row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
-the same `line:col: message`.
+Each table runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
+the same `line:col: message`.  Every case is a row of one table
+(test_table_rows.py, AGAST #3517), checked a chunk of rows at a time per
+compiler; a row keeps the id its parametrised test had, less the compiler, and a
+failure names each row that failed with what it wanted and what it got.
 """
 
 from types import SimpleNamespace
@@ -21,10 +24,11 @@ from llvmlite import ir
 
 from array_rules import ELEMENT_MISMATCH
 from emitter_llvmlite import EmitError, LLVMEmitter
-from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
+import test_table_rows as table_rows
+from test_ref_into_value import _batch_build, _batch_compile, _compile, _located, _main
+from test_table_rows import Refused, Row, Run
 
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = [pytest.mark.integration, pytest.mark.batched]
+pytestmark = pytest.mark.integration
 
 # A fill can lower to a call to memset, and these programs link nothing else.
 PRELUDE = """\
@@ -107,34 +111,6 @@ SOURCES = {
 }
 
 
-def _entry():
-    return "    0\n"
-
-
-def _program(template, source, dest):
-    return _main(PRELUDE + template.replace("{S}", source).replace("{D}", dest), _entry())
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("shape", _ids(SHAPES))
-@pytest.mark.parametrize("slot", _ids(SLOTS))
-def test_every_store_refuses_another_element_type(tmp_path, compiler, slot, shape):
-    source, dest = SHAPES[shape]
-    _assert_refused(compiler, tmp_path, f"{slot}_{shape}", _program(SLOTS[slot], source, dest),
-                    ELEMENT_MISMATCH)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("shape", ["narrow", "sign", "pointer"])
-@pytest.mark.parametrize("source", _ids(SOURCES))
-def test_every_source_is_judged(tmp_path, compiler, source, shape):
-    from_type, dest = SHAPES[shape]
-    if source == "generic_instance" and shape != "narrow":
-        pytest.skip("the template instantiates at i64")
-    _assert_refused(compiler, tmp_path, f"{source}_{shape}", _program(SOURCES[source], from_type, dest),
-                    ELEMENT_MISMATCH)
-
-
 # The rule is about the element type: these are all the same one.
 SAME = {
     "plain": "fn f() -> i32\n    var a: [4]i32 = [0, 0, 0, 3]\n    var b: [4]i32 = a\n    b[3]\n",
@@ -149,12 +125,6 @@ SAME = {
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", _ids(SAME))
-def test_the_same_element_type_fits(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, _main(PRELUDE + SAME[name], "    f()\n")) == 3
-
-
 # ritz0 only: ritz1 has no `[4]T` param (#2305), and no float array without a type.
 SAME_RITZ0 = {
     "generic": "fn g<T>(a: [4]T) -> T\n    var b: [4]T = a\n    b[3]\n\nfn f() -> i32\n    var a: [4]i32 = [0, 0, 0, 3]\n    g<i32>(a)\n",
@@ -163,11 +133,6 @@ SAME_RITZ0 = {
     "loop_binding": ("fn f() -> i32\n    var m: [2][2]i32\n    m[1][1] = 3\n    var n: i32 = 0\n    for r in m\n"
                      "        var b: [2]i32 = r\n        n = n + b[1]\n    n\n"),
 }
-
-
-@pytest.mark.parametrize("name", _ids(SAME_RITZ0))
-def test_the_same_element_type_fits_ritz0(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, _main(PRELUDE + SAME_RITZ0[name], "    f()\n")) == 3
 
 
 # Literals.  `{T}` is the element type, `{L}` the literal; each program returns
@@ -233,31 +198,6 @@ LITERALS = {
 }
 
 
-def _literal_program(template, name):
-    elem, literal, value = LITERALS[name]
-    check = f"if b[3] != {value}\n"
-    return _main(PRELUDE + (template.replace("{T}", elem).replace("{L}", literal)
-                            .replace("{CHECK8}", f"        {check}            return 1\n")
-                            .replace("{CHECK}", f"    {check}        return 1\n")), "    f()\n")
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("literal", _ids(LITERALS))
-@pytest.mark.parametrize("store", _ids(LITERAL_STORES))
-def test_a_literal_takes_the_slots_element_type(tmp_path, compiler, store, literal):
-    if store == "const" and "f32" in literal or store == "const" and "f64" in literal:
-        pytest.skip("a const array folds integers only, on any element type")
-    assert _run(compiler, tmp_path, f"{store}_{literal}",
-                _literal_program(LITERAL_STORES[store], literal)) == 0
-
-
-@pytest.mark.parametrize("literal", _ids(LITERALS))
-@pytest.mark.parametrize("store", _ids(LITERAL_STORES_RITZ0))
-def test_a_literal_tail_takes_the_slots_element_type(tmp_path, store, literal):
-    assert _run("ritz0", tmp_path, f"{store}_{literal}",
-                _literal_program(LITERAL_STORES_RITZ0[store], literal)) == 0
-
-
 # A literal's elements land in the slot's element type one at a time, under §7.5.
 ELEMENTS = {
     "widened_element": "fn f() -> i32\n    var x: i32 = -3\n    var b: [2]i64 = [x, x]\n    b[1] as i32 + 3\n",
@@ -292,23 +232,6 @@ ELEMENTS_RITZ0 = {
 
 # Rows a compiler now refuses, by LARB ruling: their refusal is tested elsewhere.
 ELEMENTS_REFUSED = {("short_literal", "ritz0"): "LARB R42: test_array_literal_length.py"}
-
-
-def _element_params():
-    for name in _ids(ELEMENTS):
-        for compiler in COMPILERS:
-            why = ELEMENTS_REFUSED.get((name, compiler))
-            yield pytest.param(name, compiler, marks=[pytest.mark.skip(reason=why)] if why else [])
-
-
-@pytest.mark.parametrize("name,compiler", list(_element_params()))
-def test_literal_elements(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, _main(PRELUDE + ELEMENTS[name], "    f()\n")) == 0
-
-
-@pytest.mark.parametrize("name", _ids(ELEMENTS_RITZ0))
-def test_literal_elements_ritz0(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, _main(PRELUDE + ELEMENTS_RITZ0[name], "    f()\n")) == 0
 
 
 # What can sit behind a store.  ritz0 finds the slot from the target, so each way
@@ -367,14 +290,6 @@ TARGETS = {
 TARGET_VALUES = {"literal": "[0, 3]", "fill": "[3; 2]"}
 
 
-@pytest.mark.parametrize("value", _ids(TARGET_VALUES))
-@pytest.mark.parametrize("target", _ids(TARGETS))
-def test_a_literal_finds_its_slot_through_any_target(tmp_path, target, value):
-    body = (TARGETS[target].replace("{L}", TARGET_VALUES[value])
-            .replace("{R}", "    b[1] as i32 - 3\n"))
-    assert _run("ritz0", tmp_path, f"{target}_{value}", _main(PRELUDE + body, "    f()\n")) == 0
-
-
 # A multi-dimensional array has one element type too.  ritz1 has no initializer
 # or by-value param for one (#2098), so these store with `=`.
 NESTED = {
@@ -383,12 +298,6 @@ NESTED = {
     "global": "var G: [2][2]i32\n\nfn f() -> i32\n    var a: [2][2]i64\n    G = ^a\n    3\n",
     "field": "struct H\n    b: [2][2]i32\n\nfn f() -> i32\n    var a: [2][2]i64\n    var h: H\n    h.b = ^a\n    3\n",
 }
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", _ids(NESTED))
-def test_a_multi_dimensional_array_has_one_element_type(tmp_path, compiler, name):
-    _assert_refused(compiler, tmp_path, name, _main(PRELUDE + NESTED[name], _entry()), ELEMENT_MISMATCH)
 
 
 # ritz0 only: tuples, and a nested array ritz1 can't initialize.
@@ -405,10 +314,84 @@ RITZ0_REFUSED = {
 }
 
 
-@pytest.mark.parametrize("name", _ids(RITZ0_REFUSED))
-def test_ritz0_refuses(tmp_path, name):
-    _assert_refused("ritz0", tmp_path, name, _main(PRELUDE + RITZ0_REFUSED[name], _entry()),
-                    ELEMENT_MISMATCH)
+# Typing a fill at its slot mustn't cost it the cheap forms: a zero or byte fill
+# of an untyped literal is still a constant, whatever it is converted to.
+FILL_IR = {
+    "small_zero": ("var b: [16]u8 = [0; 16]", "[16 x i8] zeroinitializer"),
+    "big_zero_assign": ("var b: [100]i32\n    b = [0; 100]", 'call void @"llvm.memset'),
+    "big_byte_assign": ("var b: [100]u8\n    b = [3; 100]", 'call void @"llvm.memset'),
+}
+
+# ---- the rows ---------------------------------------------------------------
+
+ALL = table_rows.ALL
+RITZ0 = ("ritz0",)
+
+
+def _entry():
+    return "    0\n"
+
+
+def _program(template, source, dest):
+    return _main(PRELUDE + template.replace("{S}", source).replace("{D}", dest), _entry())
+
+
+def _mismatch(marked):
+    """Refused with ELEMENT_MISMATCH at the `^`."""
+    src, where = _located(marked)
+    return Refused(src, ELEMENT_MISMATCH, at=tuple(map(int, where.split(":"))))
+
+
+def _literal_program(template, name):
+    elem, literal, value = LITERALS[name]
+    check = f"if b[3] != {value}\n"
+    return _main(PRELUDE + (template.replace("{T}", elem).replace("{L}", literal)
+                            .replace("{CHECK8}", f"        {check}            return 1\n")
+                            .replace("{CHECK}", f"    {check}        return 1\n")), "    f()\n")
+
+
+def _runs_f(body, want):
+    return Run(_main(PRELUDE + body, "    f()\n"), want)
+
+
+TABLE = [
+    *(Row(f"every_store_refuses_another_element_type[{slot}-{shape}]", ALL,
+          _mismatch(_program(SLOTS[slot], *SHAPES[shape])))
+      for slot in sorted(SLOTS) for shape in sorted(SHAPES)),
+    # The template instantiates at i64, so only `narrow` puts a mismatch in it.
+    *(Row(f"every_source_is_judged[{source}-{shape}]", ALL, _mismatch(_program(SOURCES[source], *SHAPES[shape])))
+      for source in sorted(SOURCES) for shape in ("narrow", "sign", "pointer")
+      if source != "generic_instance" or shape == "narrow"),
+    *(Row(f"the_same_element_type_fits[{name}]", ALL, _runs_f(SAME[name], 3)) for name in sorted(SAME)),
+    *(Row(f"the_same_element_type_fits_ritz0[{name}]", RITZ0, _runs_f(SAME_RITZ0[name], 3))
+      for name in sorted(SAME_RITZ0)),
+    # A const array folds integers only, on any element type: no float rows for it.
+    *(Row(f"a_literal_takes_the_slots_element_type[{store}-{literal}]", ALL,
+          Run(_literal_program(LITERAL_STORES[store], literal), 0))
+      for store in sorted(LITERAL_STORES) for literal in sorted(LITERALS)
+      if not (store == "const" and ("f32" in literal or "f64" in literal))),
+    *(Row(f"a_literal_tail_takes_the_slots_element_type[{store}-{literal}]", RITZ0,
+          Run(_literal_program(LITERAL_STORES_RITZ0[store], literal), 0))
+      for store in sorted(LITERAL_STORES_RITZ0) for literal in sorted(LITERALS)),
+    *(Row(f"literal_elements[{name}]", tuple(c for c in ALL if (name, c) not in ELEMENTS_REFUSED),
+          _runs_f(ELEMENTS[name], 0)) for name in sorted(ELEMENTS)),
+    *(Row(f"literal_elements_ritz0[{name}]", RITZ0, _runs_f(ELEMENTS_RITZ0[name], 0))
+      for name in sorted(ELEMENTS_RITZ0)),
+    *(Row(f"a_literal_finds_its_slot_through_any_target[{target}-{value}]", RITZ0,
+          _runs_f(TARGETS[target].replace("{L}", TARGET_VALUES[value]).replace("{R}", "    b[1] as i32 - 3\n"), 0))
+      for target in sorted(TARGETS) for value in sorted(TARGET_VALUES)),
+    *(Row(f"a_multi_dimensional_array_has_one_element_type[{name}]", ALL,
+          _mismatch(_main(PRELUDE + NESTED[name], _entry()))) for name in sorted(NESTED)),
+    *(Row(f"ritz0_refuses[{name}]", RITZ0, _mismatch(_main(PRELUDE + RITZ0_REFUSED[name], _entry())))
+      for name in sorted(RITZ0_REFUSED)),
+]
+
+
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=_batch_build, compile=_batch_compile, work=tmp_path)
 
 
 def test_the_conversion_is_gone():
@@ -423,19 +406,13 @@ def test_the_emitter_refuses_what_the_checker_could_not_name():
         LLVMEmitter._convert_type(host, value, ir.ArrayType(ir.IntType(32), 4))
 
 
-# Typing a fill at its slot mustn't cost it the cheap forms: a zero or byte fill
-# of an untyped literal is still a constant, whatever it is converted to.
-FILL_IR = {
-    "small_zero": ("var b: [16]u8 = [0; 16]", "[16 x i8] zeroinitializer"),
-    "big_zero_assign": ("var b: [100]i32\n    b = [0; 100]", 'call void @"llvm.memset'),
-    "big_byte_assign": ("var b: [100]u8\n    b = [3; 100]", 'call void @"llvm.memset'),
-}
-
-
-@pytest.mark.parametrize("name", _ids(FILL_IR))
-def test_a_constant_fill_stays_cheap(tmp_path, name):
-    body, wanted = FILL_IR[name]
-    src = _main(PRELUDE + f"fn f() -> i32\n    {body}\n    0\n", "    f()\n")
-    comp, ll, _ = _compile("ritz0", tmp_path, name, src)
-    assert comp.returncode == 0, comp.stdout + comp.stderr
-    assert wanted in ll.read_text()
+def test_a_constant_fill_stays_cheap(tmp_path):
+    failures = []
+    for name, (body, wanted) in sorted(FILL_IR.items()):
+        src = _main(PRELUDE + f"fn f() -> i32\n    {body}\n    0\n", "    f()\n")
+        comp, ll, _ = _compile("ritz0", tmp_path, name, src)
+        if comp.returncode != 0:
+            failures.append(f"{name}: refused: {(comp.stdout + comp.stderr)[-600:]}")
+        elif wanted not in ll.read_text():
+            failures.append(f"{name}: wanted `{wanted}` in the IR")
+    assert not failures, "\n".join(failures)

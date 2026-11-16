@@ -59,11 +59,12 @@ class Run:
 class Refused:
     """The compiler refuses the program.
 
-    `message` is in what it says (None: any refusal will do); `located`, some
-    diagnostic is at a `main.ritz:` line; `at`, (line, col) is where one is.
+    `message` is in what it says (a tuple: every one of them is; None: any
+    refusal will do); `located`, some diagnostic is at a `main.ritz:` line;
+    `at`, (line, col) is where one is.
     """
     program: str
-    message: str | None
+    message: str | tuple | None
     at: tuple | None = None
     located: bool = True
 
@@ -151,8 +152,10 @@ def _run_alone(compiler, row, build, work) -> str | None:
 
 def _refusal_wrong(spec: Refused, out: str, at: str | None) -> str | None:
     """What a refusal's diagnostics `out` lack, or None.  `at` is "line:col" to find."""
-    if spec.message is not None and spec.message not in out:
-        return f"want {spec.message!r}, got:\n{_tail(out)}"
+    wanted = (spec.message,) if isinstance(spec.message, str) else spec.message or ()
+    missing = [m for m in wanted if m not in out]
+    if missing:
+        return f"want {' and '.join(map(repr, missing))}, got:\n{_tail(out)}"
     if spec.located and "main.ritz:" not in out:
         return f"want it located, got:\n{_tail(out)}"
     if at is not None and f"main.ritz:{at}:" not in out:
@@ -263,3 +266,13 @@ def test_a_refusal_row_names_itself_when_it_compiles_or_says_the_wrong_thing(rit
     assert "compiled" in failures[0]
     assert "no such message" in failures[1]
     assert "main.ritz:1:1:" in failures[2]
+
+
+@pytest.mark.integration
+def test_a_refusal_row_with_several_messages_wants_every_one(ritz1_bin, tmp_path):
+    # AGAST #3517: a tuple is every one of its messages, and a row missing one names it.
+    rows = [Row("both", ALL, Refused(BAD, ("cannot use bool", "as an integer"))),
+            Row("one_missing", ALL, Refused(BAD, ("cannot use bool", "no such message")))]
+    failures = _check(ritz1_bin, tmp_path, rows)
+    assert [f.split(":")[0] for f in failures] == ["ritz1 one_missing"], failures
+    assert "no such message" in failures[0] and "cannot use bool'" not in failures[0]
