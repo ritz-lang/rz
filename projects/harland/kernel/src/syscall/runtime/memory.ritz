@@ -7,7 +7,8 @@
 
 import serial { prints, serial_print_hex, serial_print_dec }
 import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
-import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, PTE_NO_EXECUTE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys }
+import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_nx_flag, phys_to_virt }
+import fs.syscall { fs_process_pid, fs_process_mmap_next, fs_process_set_mmap_next }
 import syscall.errno { Errno }
 
 # ============================================================================
@@ -31,8 +32,13 @@ const MAP_PRIVATE: u64 = 0x02     # Private mapping (copy-on-write if file-backe
 const MAP_ANONYMOUS: u64 = 0x20   # No file backing
 const MAP_FIXED: u64 = 0x10       # Map at exact address (hint is required)
 
-# User address space limits
-const USER_MMAP_START: u64 = 0x10000000      # 256MB - start of mmap region
+# User address space limits (AGAST #3530).
+# The mmap region starts at 512 GiB, PML4[1]: every table under it is the
+# process's own. It used to start at 256 MiB, under PML4[0] -> PDPT[0], the
+# kernel's identity-map PD that every process shares: built from 2 MiB pages
+# (so no 4 KiB page could be mapped there) and, where it had room, a PT there
+# put one process's pages in every process's address space.
+const USER_MMAP_START: u64 = 0x8000000000    # 512 GiB, PML4[1]
 const USER_MMAP_END: u64 = 0x7FFFFFF00000    # Just below stack
 
 # User stack configuration
@@ -50,8 +56,14 @@ const USER_STACK_SIZE: u64 = 65536  # 16 * 4096 = 64KB
 pub const USER_STACK_TOP: u64 = 0x7FFFFFFFE000   # Highest mapped page of user stack
 const USER_STACK_BASE: u64 = 0x7FFFFFFEF000  # Lowest page of stack (TOP - 15*PAGE_SIZE)
 
-# Simple mmap allocator state - tracks next free address for hint=0 case
-var g_next_mmap_addr: u64 = 0x10000000  # USER_MMAP_START
+# Kernel-chosen mmaps bump a per-process cursor (FsProc.mmap_next, 0 = not
+# yet used = USER_MMAP_START), so every process's region starts at the same
+# address and one process's mappings don't move another's.
+fn mmap_cursor() -> u64
+    let next: u64 = fs_process_mmap_next()
+    if next == 0
+        return USER_MMAP_START
+    return next
 
 # ============================================================================
 # User Stack Allocation Helper
@@ -151,6 +163,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
 
     # Determine the mapping address
     var map_addr: u64 = 0
+    var kernel_chose: bool = false
     if (flags & MAP_FIXED) != 0
         # Must map at the exact address
         if addr_hint == 0 or (addr_hint & 0xFFF) != 0
@@ -161,9 +174,12 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         # Try the hint address if it's page-aligned
         map_addr = addr_hint
     else
-        # Kernel chooses - use simple bump allocator
-        map_addr = g_next_mmap_addr
-        g_next_mmap_addr = g_next_mmap_addr + (num_pages * PAGE_SIZE)
+        # Kernel chooses: this process's bump cursor, advanced on success
+        if fs_process_pid() == 0
+            prints("[mmap] ERROR: no current process\n")
+            return Errno.Srch as i64
+        map_addr = mmap_cursor()
+        kernel_chose = true
 
     # Validate address is in user mmap region
     if map_addr < USER_MMAP_START or map_addr >= USER_MMAP_END
@@ -179,9 +195,10 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
     if (prot & PROT_WRITE) != 0
         pte_flags = pte_flags | PTE_WRITABLE
     if (prot & PROT_EXEC) == 0
-        pte_flags = pte_flags | PTE_NO_EXECUTE
+        pte_flags = pte_flags | vmm_nx_flag()
 
-    # Allocate and map each page
+    # Allocate, zero (through the physmap, before the user can see it) and
+    # map each page.
     var i: u64 = 0
     while i < num_pages
         let page_phys: u64 = pmm_alloc_page()
@@ -189,6 +206,12 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             prints("[mmap] ERROR: out of physical memory\n")
             # TODO: Unmap already-mapped pages
             return Errno.NoMem as i64
+
+        let zero: *u64 = phys_to_virt(page_phys) as *u64
+        var w: i64 = 0
+        while w < 512
+            *(zero + w) = 0
+            w = w + 1
 
         let page_virt: u64 = map_addr + (i * PAGE_SIZE)
         let result: i32 = vmm_map_page(page_virt, page_phys, pte_flags)
@@ -200,13 +223,10 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             # TODO: Unmap already-mapped pages
             return Errno.NoMem as i64
 
-        # Zero the page for security
-        var p: u64 = 0
-        while p < PAGE_SIZE
-            *((page_virt + p) as *u8) = 0
-            p = p + 1
-
         i = i + 1
+
+    if kernel_chose
+        fs_process_set_mmap_next(map_addr + num_pages * PAGE_SIZE)
 
     # Debug output
     prints("[mmap] Mapped ")

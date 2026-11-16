@@ -74,7 +74,8 @@ AREAS = {
 VARS = {
     "process": ["g_parent_ctx", "g_parent_frame", "g_has_parent", "g_child_pid", "g_child_pml4",
                 "g_child_exit_code"],
-    "memory": ["g_next_mmap_addr"],
+    # memory.ritz's one global, g_next_mmap_addr, became a per-process cursor
+    # (FsProc.mmap_next, fs/syscall.ritz) in AGAST #3530.
     "cwd": ["g_cwd", "g_cwd_len"],
     "framebuffer": ["g_user_fb_mapped", "g_user_fb_addr"],
 }

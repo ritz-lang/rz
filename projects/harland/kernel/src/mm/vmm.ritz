@@ -6,7 +6,8 @@
 # Depends on PMM for page table allocation.
 
 import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_mark_region_used }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_mark_region_used, pmm_get_total_pages }
+import io { rdmsr, wrmsr, CpuidResult, cpuid }
 
 # ============================================================================
 # Page Table Entry Flags (x86-64)
@@ -35,6 +36,60 @@ pub const PTE_ADDR_MASK: u64 = 4503599627366400
 pub var vmm_pml4_phys: u64 = 0
 
 # ============================================================================
+# Physmap (AGAST #3530)
+# ============================================================================
+#
+# The kernel reaches physical memory (page tables above all) through a
+# direct map of RAM at PHYSMAP_BASE, PML4[256], the first kernel-half slot.
+# vmm_create_user_pml4 copies PML4[256..511] into every process, so the
+# physmap is there whatever CR3 is loaded. Before #3530 page tables were read
+# through the identity map, which processes only get for phys < 1 GiB: a
+# table pmm handed out above that faulted the kernel (-m 2G).
+#
+# Until vmm_init_physmap runs, g_physmap_offset is 0 and phys_to_virt is the
+# boot identity map, which is how the physmap's own tables are written.
+pub const PHYSMAP_BASE: u64 = 0xFFFF800000000000
+const PHYSMAP_PML4_INDEX: u64 = 256
+const ONE_GB: u64 = 1073741824
+const TWO_MB: u64 = 2097152
+# pmm tracks at most 4 GiB (pmm.MAX_MEMORY).
+const PHYSMAP_MAX_GB: u64 = 4
+
+var g_physmap_offset: u64 = 0
+
+# Set once the physmap is up: page tables then come from the top of RAM
+# (pmm_alloc_page_high). Nothing reaches them but the physmap, which keeps
+# it load-bearing, and -m 2G boots put user tables above 1 GiB, where a
+# walk through the identity map would fault (the #3530 panic).
+var g_tables_high: bool = false
+
+# A zeroed page-table page, or 0.
+fn vmm_alloc_table() -> u64
+    var t: u64 = 0
+    if g_tables_high
+        t = pmm_alloc_page_high()
+    else
+        t = pmm_alloc_page()
+    if t == 0
+        return 0
+    var i: u64 = 0
+    while i < 512
+        vmm_set_entry(t, i, 0)
+        i = i + 1
+    return t
+
+# Kernel virtual address of physical address paddr.
+pub fn phys_to_virt(paddr: u64) -> u64
+    return paddr + g_physmap_offset
+
+# PTE_NO_EXECUTE if EFER.NXE is on (vmm_init), else 0: with NXE off the NX
+# bit is reserved and a user access to such a page faults.
+var g_pte_nx: u64 = 0
+
+pub fn vmm_nx_flag() -> u64
+    return g_pte_nx
+
+# ============================================================================
 # VMM Initialization and TLB Management
 # ============================================================================
 
@@ -47,7 +102,73 @@ pub fn vmm_init() -> i32
         movq {cr3_ptr}, %rcx
         movq %rax, (%rcx)
     vmm_pml4_phys = cr3_val & PTE_ADDR_MASK
+    vmm_enable_nx()
     return 0
+
+# Turn on EFER.NXE if the CPU has NX (CPUID 0x80000001 EDX bit 20). Only the
+# BSP runs page tables with NX set: APs halt in ap_entry.
+fn vmm_enable_nx() -> i32
+    let ext: CpuidResult = cpuid(0x80000000)
+    if ext.eax < 0x80000001
+        return 0
+    let feat: CpuidResult = cpuid(0x80000001)
+    if (feat.edx & 0x100000) == 0
+        return 0
+    let efer: u64 = rdmsr(0xC0000080)
+    wrmsr(0xC0000080, efer | 0x800)
+    g_pte_nx = PTE_NO_EXECUTE
+    return 0
+
+# Build the physmap: PML4[256] -> PDPT -> one PD of 2 MiB pages per GiB of
+# RAM pmm tracks. Its tables come from pmm right after vmm_init, so they are
+# low pages the boot identity map covers; refuse otherwise. On failure the
+# kernel keeps using the identity map. Returns 0 or -1.
+pub fn vmm_init_physmap() -> i32
+    if (vmm_get_entry(vmm_pml4_phys, PHYSMAP_PML4_INDEX) & PTE_PRESENT) != 0
+        prints("[vmm] physmap: PML4[256] already in use\n")
+        return -1
+    var gbs: u64 = (pmm_get_total_pages() * PAGE_SIZE + ONE_GB - 1) / ONE_GB
+    if gbs == 0
+        gbs = 1
+    if gbs > PHYSMAP_MAX_GB
+        gbs = PHYSMAP_MAX_GB
+    let pdpt: u64 = vmm_alloc_low_table()
+    if pdpt == 0
+        return -1
+    var g: u64 = 0
+    while g < gbs
+        let pd: u64 = vmm_alloc_low_table()
+        if pd == 0
+            return -1
+        var e: u64 = 0
+        while e < 512
+            vmm_set_entry(pd, e, (g * ONE_GB + e * TWO_MB) | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | g_pte_nx)
+            e = e + 1
+        vmm_set_entry(pdpt, g, pd | PTE_PRESENT | PTE_WRITABLE)
+        g = g + 1
+    vmm_set_entry(vmm_pml4_phys, PHYSMAP_PML4_INDEX, pdpt | PTE_PRESENT | PTE_WRITABLE)
+    g_physmap_offset = PHYSMAP_BASE
+    g_tables_high = true
+    prints("[vmm] physmap: ")
+    serial_print_dec(gbs)
+    prints(" GiB at 0xFFFF800000000000\n")
+    return 0
+
+# A zeroed page-table page below 1 GiB (written through the identity map),
+# or 0.
+fn vmm_alloc_low_table() -> u64
+    let t: u64 = pmm_alloc_page()
+    if t == 0
+        return 0
+    if t + PAGE_SIZE > ONE_GB
+        pmm_free_page(t)
+        prints("[vmm] physmap: no table page below 1 GiB\n")
+        return 0
+    var i: u64 = 0
+    while i < 512
+        vmm_set_entry(t, i, 0)
+        i = i + 1
+    return t
 
 # Flush TLB for a single page
 pub fn vmm_flush_tlb(vaddr: u64) -> i32
@@ -71,25 +192,23 @@ pub fn vmm_flush_tlb_all() -> i32
 # Page Table Entry Access
 # ============================================================================
 
-# Get entry from a page table level
-# NOTE: Uses identity mapping - requires low memory (< 1GB) to be accessible.
-# This is always true because we copy PML4[0] to all page tables for kernel use.
+# Get entry from a page table level, through the physmap (so any table pmm
+# hands out is reachable, whatever CR3 is loaded).
 # table_phys: physical address of table
 # index: entry index (0-511)
 fn vmm_get_entry(table_phys: u64, index: u64) -> u64
-    let entry_ptr: *u64 = (table_phys + index * 8) as *u64
+    let entry_ptr: *u64 = phys_to_virt(table_phys + index * 8) as *u64
     return *entry_ptr
 
 # Set entry in a page table level
 fn vmm_set_entry(table_phys: u64, index: u64, value: u64) -> i32
-    let entry_ptr: *u64 = (table_phys + index * 8) as *u64
+    let entry_ptr: *u64 = phys_to_virt(table_phys + index * 8) as *u64
     *entry_ptr = value
     return 0
 
 # Read a PML4 entry (public for debugging)
 pub fn vmm_read_pml4_entry(pml4_phys: u64, index: u64) -> u64
-    let entry_ptr: *u64 = (pml4_phys + index * 8) as *u64
-    return *entry_ptr
+    return vmm_get_entry(pml4_phys, index)
 
 # ============================================================================
 # Address Decomposition
@@ -212,14 +331,9 @@ pub fn vmm_map_page(vaddr: u64, paddr: u64, flags: u64) -> i32
 
     if (pml4_entry & PTE_PRESENT) == 0
         # Allocate new PDPT
-        pdpt_phys = pmm_alloc_page()
+        pdpt_phys = vmm_alloc_table()
         if pdpt_phys == 0
             return -1
-        # Zero the new table
-        var i: i32 = 0
-        while i < 512
-            vmm_set_entry(pdpt_phys, i as u64, 0)
-            i = i + 1
         # Set PML4 entry
         vmm_set_entry(vmm_pml4_phys, pml4i, pdpt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER)
     else
@@ -233,14 +347,9 @@ pub fn vmm_map_page(vaddr: u64, paddr: u64, flags: u64) -> i32
 
     if (pdpt_entry & PTE_PRESENT) == 0
         # Allocate new PD
-        pd_phys = pmm_alloc_page()
+        pd_phys = vmm_alloc_table()
         if pd_phys == 0
             return -1
-        # Zero the new table
-        var i: i32 = 0
-        while i < 512
-            vmm_set_entry(pd_phys, i as u64, 0)
-            i = i + 1
         # Set PDPT entry
         vmm_set_entry(pdpt_phys, pdpti, pd_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER)
     else
@@ -256,14 +365,9 @@ pub fn vmm_map_page(vaddr: u64, paddr: u64, flags: u64) -> i32
 
     if (pd_entry & PTE_PRESENT) == 0
         # Allocate new PT
-        pt_phys = pmm_alloc_page()
+        pt_phys = vmm_alloc_table()
         if pt_phys == 0
             return -1
-        # Zero the new table
-        var i: i32 = 0
-        while i < 512
-            vmm_set_entry(pt_phys, i as u64, 0)
-            i = i + 1
         # Set PD entry
         vmm_set_entry(pd_phys, pdi, pt_phys | PTE_PRESENT | PTE_WRITABLE | PTE_USER)
     else
@@ -534,28 +638,25 @@ fn vmm_print_flags(entry: u64) -> i32
 #
 # This creates a proper isolated address space:
 #
-# 1. PML4[0] - We create a NEW PDPT that ONLY maps PDPT[0] (identity 0-1GB).
-#    This gives the kernel access to physical memory for page table work.
-#    PDPT[1-511] are empty, so user addresses 1GB-512GB are NOT shared.
-#    User addresses like 0x100000000 (4GB = PDPT[4]) will be private.
+# 1. PML4[0] - We create a NEW PDPT that ONLY maps PDPT[0] (identity 0-1GB)
+#    and PDPT[3] (LAPIC/IOAPIC MMIO), both shared with the kernel. Code that
+#    still uses identity addresses for low memory needs them; page tables go
+#    through the physmap instead. PDPT[1-511] are otherwise private: user
+#    addresses like 0x100000000 (4GB = PDPT[4]) are the process's own.
 #
-# 2. PML4[256-511] - Higher-half kernel space (shared, read-only copy).
-#    This includes kernel code, data, and heap.
+# 2. PML4[256-511] - Higher-half kernel space (shared copy): the physmap
+#    (PML4[256]), kernel code, data and heap.
 #
-# 3. PML4[1-255] - Empty, for future user mappings if needed.
+# 3. PML4[1-255] - Private user space: the mmap region (from PML4[1],
+#    syscall/runtime/memory.ritz) and the user stack (PML4[255]).
 #
 pub fn vmm_create_user_pml4() -> u64
     # Allocate a new PML4 page
-    let new_pml4: u64 = pmm_alloc_page()
+    let new_pml4: u64 = vmm_alloc_table()
     if new_pml4 == 0
         prints("[vmm] Failed to allocate PML4\n")
         return 0
-
-    # Zero the entire table first
     var i: u64 = 0
-    while i < 512
-        vmm_set_entry(new_pml4, i, 0)
-        i = i + 1
 
     # For PML4[0], we need to create a NEW PDPT that only has the
     # identity mapping for physical memory 0-1GB (at PDPT[0]).
@@ -563,17 +664,11 @@ pub fn vmm_create_user_pml4() -> u64
     let kernel_pml4_0: u64 = vmm_get_entry(vmm_pml4_phys, 0)
     if (kernel_pml4_0 & PTE_PRESENT) != 0
         # Allocate a new PDPT for this process
-        let new_pdpt: u64 = pmm_alloc_page()
+        let new_pdpt: u64 = vmm_alloc_table()
         if new_pdpt == 0
             pmm_free_page(new_pml4)
             prints("[vmm] Failed to allocate PDPT\n")
             return 0
-
-        # Zero the new PDPT
-        i = 0
-        while i < 512
-            vmm_set_entry(new_pdpt, i, 0)
-            i = i + 1
 
         # Copy PDPT entries from kernel that the kernel needs:
         # - PDPT[0]: 0-1GB identity mapping (physical memory)

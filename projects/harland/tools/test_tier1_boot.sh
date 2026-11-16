@@ -20,6 +20,8 @@
 #        BOOT_TIMEOUT=N seconds per boot (default 60)
 #        KEEP_WORK=DIR  copy each boot's serial log (NAME.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
+#        QEMU_MEM=SIZE  guest RAM (default 2G; 512M puts every pmm page under
+#                       the low 1 GiB identity map, AGAST #3530)
 #
 # Exit: 0 = pass; 1 = a boot failed (panic, exception, failed suite, no
 #       verdict before the timeout, or a failed build); 2 = bad usage;
@@ -35,6 +37,7 @@ HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
 ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-60}"
+MEM="${QEMU_MEM:-2G}"
 MODE="${1:-all}"
 # Same packages indium/tools/mkiso.sh puts in the initramfs. init's suite
 # spawns rzsh and prism's hello_gfx as well as indium's binaries.
@@ -104,7 +107,7 @@ boot() {
     # A fresh qcow2 overlay per boot keeps each boot from seeing what the
     # other one wrote.
     qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/initramfs.qcow2" "$WORK/$name-initramfs.qcow2"
-    timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
+    timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m "$MEM" \
         -display none -no-reboot -monitor none \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
