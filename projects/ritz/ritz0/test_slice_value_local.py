@@ -300,6 +300,8 @@ INTO_SPAN_SITES = {
     "ok_return": ("fn view(v:& Vec<i32>) -> Result<Span<i32>, i32>\n    return Ok(v[1..3])\n\n",
                   "    var t = match view(@&v)\n        Ok(s) => s\n"
                   "        Err(_) => span_empty<i32>()\n"),
+    "struct_field": ("struct H\n    s: Span<i32>\n\n",
+                     "    var h = H { s: v[1..3] }\n    var t = h.s\n"),
 }
 
 
