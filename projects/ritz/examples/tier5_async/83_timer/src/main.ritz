@@ -5,36 +5,38 @@
 # so this prints only properties that hold on any run: return codes, ranges,
 # ordering.  It never prints a time.
 #
-# Only five of timer.ritz's functions are `pub` (clock_gettime, timer_init,
-# timer_print, stopwatch_init, stopwatch_print).  now_nanos, timer_start,
-# timer_stop, timer_elapsed_* and stopwatch_start/stop are module-private, so
-# an importer cannot call them (AGAST ticket filed by #1463).  start/stop and
-# elapsed are therefore done here with clock_gettime on the Timer's own
-# Timespec fields -- exactly what the private helpers do.  timer_print and
+# It drives the public API: clock_gettime and the CLOCK_* / NANOS_PER_*
+# consts, now_nanos/micros/millis, timer_init/start/stop/elapsed_*, and the
+# stopwatch fns (AGAST #3732 made them `pub`).  timer_print and
 # stopwatch_print print times, so they are not called.
+#
+# The golden stdout is pinned by test.sh.  Checks with no line of their own
+# (the elapsed_* conversions, the stopwatch's start/stop/count rules) report
+# on stderr and make main return 1, which test.sh refuses.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.timer
-
-# Linux clock ids (timer.ritz's own constants are private too).
-const MONOTONIC: i32 = 1
-const REALTIME: i32 = 0
-const NS_PER_SEC: i64 = 1000000000
-
-fn ts_nanos(ts: *Timespec) -> i64
-    return ts.tv_sec * NS_PER_SEC + ts.tv_nsec
 
 fn b(v: bool) -> i64
     if v
         return 1
     return 0
 
+# Report a failed silent check on stderr; returns 1 so callers can sum them.
+fn check(ok: bool, what: StrView) -> i32
+    if ok
+        return 0
+    eprint("FAIL: {what}\n")
+    return 1
+
 fn main() -> i32
+    var fails: i32 = 0
+
     var ts: Timespec
-    let rc: i32 = clock_gettime(MONOTONIC, @ts)
+    let rc: i32 = clock_gettime(CLOCK_MONOTONIC, @ts)
     print("clock_gettime(MONOTONIC) rc: {rc}\n")
-    print("tv_nsec in [0, 1e9): {b(ts.tv_nsec >= 0 and ts.tv_nsec < NS_PER_SEC)}\n")
+    print("tv_nsec in [0, 1e9): {b(ts.tv_nsec >= 0 and ts.tv_nsec < NANOS_PER_SEC)}\n")
 
     # timer_init must zero both ends, whatever was there before.
     var t: Timer
@@ -47,34 +49,53 @@ fn main() -> i32
     print("timer_init zeroes start/end: {b(zeroed)}\n")
 
     # Start, do some work, stop.
-    let rs: i32 = clock_gettime(MONOTONIC, @t.start)
+    let rs: i32 = timer_start(@t)
     var acc: i64 = 0
     var i: i64 = 0
     while i < 10000
         acc += i
         i += 1
-    let re: i32 = clock_gettime(MONOTONIC, @t.end)
+    let re: i32 = timer_stop(@t)
     print("start/stop rc: {rs} {re}\n")
-    let s: i64 = ts_nanos(@t.start)
-    let e: i64 = ts_nanos(@t.end)
+    let s: i64 = t.start.tv_sec * NANOS_PER_SEC + t.start.tv_nsec
+    let e: i64 = t.end.tv_sec * NANOS_PER_SEC + t.end.tv_nsec
     print("end >= start: {b(e >= s)}\n")
-    print("elapsed >= 0: {b(e - s >= 0 and acc > 0)}\n")
+    let ns: i64 = timer_elapsed_nanos(@t)
+    print("elapsed >= 0: {b(ns >= 0 and acc > 0)}\n")
+    fails += check(ns == e - s, "timer_elapsed_nanos == end - start")
+    fails += check(timer_elapsed_micros(@t) == ns / NANOS_PER_MICRO, "timer_elapsed_micros")
+    fails += check(timer_elapsed_millis(@t) == ns / NANOS_PER_MILLI, "timer_elapsed_millis")
+    fails += check(timer_elapsed_secs_x1000(@t) >= 0, "timer_elapsed_secs_x1000 >= 0")
+
+    # A real run is too short to tell the units apart, so check the
+    # conversions on a fixed span: 2s + 345678912ns.
+    var f: Timer
+    timer_init(@f)
+    f.start.tv_sec = 10
+    f.start.tv_nsec = 100000000
+    f.end.tv_sec = 12
+    f.end.tv_nsec = 445678912
+    fails += check(timer_elapsed_nanos(@f) == 2345678912, "fixed timer_elapsed_nanos")
+    fails += check(timer_elapsed_micros(@f) == 2345678, "fixed timer_elapsed_micros")
+    fails += check(timer_elapsed_millis(@f) == 2345, "fixed timer_elapsed_millis")
 
     # CLOCK_MONOTONIC never goes backwards.
     var prev: i64 = 0
     var mono: bool = true
     i = 0
     while i < 1000
-        clock_gettime(MONOTONIC, @ts)
-        let now: i64 = ts_nanos(@ts)
+        let now: i64 = now_nanos()
         if now < prev
             mono = false
         prev = now
         i += 1
     print("monotonic over 1000 reads: {b(mono)}\n")
+    # The coarser units read later, so they are >= the last nanos reading.
+    fails += check(now_micros() >= prev / NANOS_PER_MICRO, "now_micros monotonic")
+    fails += check(now_millis() >= prev / NANOS_PER_MILLI, "now_millis monotonic")
 
     # Wall clock: 1577836800 is 2020-01-01T00:00:00Z.
-    clock_gettime(REALTIME, @ts)
+    clock_gettime(CLOCK_REALTIME, @ts)
     print("CLOCK_REALTIME after 2020: {b(ts.tv_sec > 1577836800)}\n")
 
     # An invalid clock id is rejected by the kernel (-EINVAL).
@@ -89,4 +110,21 @@ fn main() -> i32
     stopwatch_init(@sw)
     let swz: bool = sw.total_ns == 0 and sw.count == 0 and sw.running == 0 and sw.start_ns == 0
     print("stopwatch_init zeroes: {b(swz)}\n")
+
+    # Stopwatch rules: stop before start and a second start are refused;
+    # each start/stop pair adds one to the count.
+    fails += check(stopwatch_stop(@sw) == -1, "stopwatch_stop while stopped is -1")
+    fails += check(stopwatch_start(@sw) == 0, "stopwatch_start rc 0")
+    fails += check(stopwatch_start(@sw) == -1, "stopwatch_start while running is -1")
+    fails += check(stopwatch_stop(@sw) == 0, "stopwatch_stop rc 0")
+    stopwatch_start(@sw)
+    stopwatch_stop(@sw)
+    fails += check(stopwatch_count(@sw) == 2, "stopwatch_count == 2")
+    fails += check(stopwatch_total_nanos(@sw) >= 0, "stopwatch_total_nanos >= 0")
+    fails += check(stopwatch_avg_nanos(@sw) == stopwatch_total_nanos(@sw) / 2, "stopwatch_avg_nanos")
+    stopwatch_reset(@sw)
+    fails += check(stopwatch_count(@sw) == 0 and stopwatch_avg_nanos(@sw) == 0, "stopwatch_reset")
+
+    if fails != 0
+        return 1
     return 0
