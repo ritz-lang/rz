@@ -78,7 +78,6 @@ Ritzlib is built on three core principles:
     - [timer](#timer) - High-precision timing
     - [json](#json) - JSON parsing
     - [elf](#elf) - ELF binary parsing
-    - [meta](#meta) - Module metadata
     - [testing](#testing) - Removed; use `assert`
 
 ---
@@ -2220,30 +2219,6 @@ struct ElfReader
 | `elf_symbol_count` | `fn(reader: *ElfReader) -> i64` | Get symbol count |
 | `elf_find_test_functions` | `fn(reader: *ElfReader, callback: *u8, user_data: *u8) -> i32` | Find test_* functions |
 | `elf_print_test_functions` | `fn(reader: *ElfReader)` | Print test functions |
-
----
-
-### meta
-
-**Module**: `ritzlib.meta`
-
-Module metadata parser for .ritz-meta JSON files (incremental compilation).
-
-**Structures**: `ParamMeta`, `FnSignature`, `StructMeta`, `EnumMeta`, `ConstMeta`, `TypeAliasMeta`, `TraitMeta`, `ModuleMetadata`
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `meta_alloc` | `fn() -> *ModuleMetadata` | Allocate metadata |
-| `meta_free` | `fn(m: *ModuleMetadata)` | Free metadata |
-| `meta_from_json` | `fn(json_str: *u8, len: i64) -> *ModuleMetadata` | Parse from JSON |
-| `meta_load_file` | `fn(path: *u8) -> *ModuleMetadata` | Load from file |
-| `meta_is_valid` | `fn(m: *ModuleMetadata, source_path: *u8) -> i32` | Check cache validity |
-| `meta_find_function` | `fn(m: *ModuleMetadata, name: *u8) -> *FnSignature` | Find function |
-| `meta_find_struct` | `fn(m: *ModuleMetadata, name: *u8) -> *StructMeta` | Find struct |
-| `meta_find_enum` | `fn(m: *ModuleMetadata, name: *u8) -> *EnumMeta` | Find enum |
-| `meta_find_constant` | `fn(m: *ModuleMetadata, name: *u8) -> *ConstMeta` | Find constant |
-| `meta_find_type_alias` | `fn(m: *ModuleMetadata, name: *u8) -> *TypeAliasMeta` | Find type alias |
-| `meta_find_trait` | `fn(m: *ModuleMetadata, name: *u8) -> *TraitMeta` | Find trait |
 
 ---
 

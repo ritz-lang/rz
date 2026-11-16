@@ -48,7 +48,6 @@ We have a working bootstrap compiler (ritz0 in Python) that compiles 49 examples
 | fs.ritz | Filesystem utilities | ⚠️ Raw stat handling |
 | elf.ritz | ELF parsing | ✅ Solid |
 | testing.ritz | Test framework | ⚠️ Macro-like needed |
-| meta.ritz | Metadata structs | ✅ Solid |
 
 ### ritz1 Problems (main_new.ritz = 4438 lines)
 

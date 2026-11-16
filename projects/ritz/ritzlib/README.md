@@ -89,7 +89,6 @@ fn main(argc: i32, argv: **u8) -> i32
 | `testing.ritz` | Test support utilities |
 | `timer.ritz` | Timer operations |
 | `iovec.ritz` | Scatter-gather I/O vectors |
-| `meta.ritz` | Compiler metadata |
 | `crt0.ritz` | C runtime zero (program entry) |
 
 ## Dependencies
