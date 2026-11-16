@@ -1,0 +1,109 @@
+# test/test_style_engine.ritz - the CSS → style engine path runs (#3700)
+#
+# Until #3700 every container on this path (Stylesheet, SelectorMap,
+# StyleEngine, RuleCandidates, MatchedRuleList) was a by-value nest of fixed
+# arrays: a Stylesheet was ~18 GB and a StyleEngine ~167 GB, so the first
+# call that touched one (css_parse, style_engine_new) faulted on its own
+# stack frame. These tests walk the path the lexis demo walks, then check the
+# cascade still gives the right answers.
+
+import ritzlib.strview { strview_eq }
+import lib.lexis { StyleEngine, style_engine_new, style_engine_free, style_engine_add_stylesheet, style_engine_compute, css_parse, get_default_ua_stylesheet }
+import lib.css.rule { Stylesheet, DeclarationBlock, Declaration, stylesheet_free, declaration_block_new, declaration_block_get }
+import lib.css.value { css_value_is_keyword }
+import lib.style.cascade { ORIGIN_USER_AGENT, ORIGIN_AUTHOR }
+import lib.style.matching { ElementInfo }
+import lib.style.bloom { bloom_filter_new }
+
+fn no_attribute(name: StrView) -> StrView
+    StrView { ptr: null, len: 0 }
+
+fn element(tag: StrView, id: StrView, classes: StrView) -> ElementInfo
+    ElementInfo {
+        tag: tag,
+        id: id,
+        classes: classes,
+        get_attribute: no_attribute,
+        parent: null,
+        prev_sibling: null,
+        ancestor_filter: bloom_filter_new()
+    }
+
+# 1 when `block` has `property` set to the keyword `kw`.
+fn has_keyword(block: @DeclarationBlock, property: StrView, kw: StrView) -> i32
+    let idx = declaration_block_get(block, property)
+    if idx < 0
+        return 0
+    css_value_is_keyword(block.declarations[idx].value, kw)
+
+[[test]]
+fn test_css_parse_counts_rules() -> i32
+    var sheet = css_parse("a \{ color: red; \} .b \{ color: blue; \} #c \{ color: green; \}")
+    let n = sheet.rule_count
+    stylesheet_free(sheet)
+    if n != 3
+        return 1
+    0
+
+# More rules than a Stylesheet's initial capacity (8), so the store has to
+# grow rather than drop rules on the floor.
+[[test]]
+fn test_css_parse_grows_past_initial_capacity() -> i32
+    var sheet = css_parse(get_default_ua_stylesheet())
+    let n = sheet.rule_count
+    stylesheet_free(sheet)
+    # The UA sheet has 28 rule blocks.
+    if n != 28
+        return 1
+    0
+
+[[test]]
+fn test_engine_cascade_author_beats_ua() -> i32
+    var engine = style_engine_new()
+    var ua = css_parse("p \{ display: block; color: black; \}")
+    var author = css_parse("p \{ color: red; \} .x \{ color: blue; \}")
+    style_engine_add_stylesheet(engine, @ua, ORIGIN_USER_AGENT)
+    style_engine_add_stylesheet(engine, @author, ORIGIN_AUTHOR)
+
+    let parent = declaration_block_new()
+    var rc = 0
+
+    # <p>: author `p` beats UA `p`; UA display survives.
+    let plain = style_engine_compute(@engine, element("p", "", ""), parent)
+    if has_keyword(@plain, "color", "red") != 1
+        rc = 1
+    if has_keyword(@plain, "display", "block") != 1
+        rc = 2
+
+    # <p class="x">: the class rule's specificity beats the tag rule.
+    let classy = style_engine_compute(@engine, element("p", "", "x"), parent)
+    if has_keyword(@classy, "color", "blue") != 1
+        rc = 3
+
+    # <div>: nothing matches.
+    let other = style_engine_compute(@engine, element("div", "", ""), parent)
+    if other.count != 0
+        rc = 4
+
+    stylesheet_free(author)
+    stylesheet_free(ua)
+    style_engine_free(engine)
+    rc
+
+# Many rules under one key: the old map kept a fixed bucket per hash slot.
+[[test]]
+fn test_engine_many_rules_one_key() -> i32
+    var engine = style_engine_new()
+    var sheet = css_parse(".k \{ color: red; \} .k \{ color: green; \} .k \{ color: blue; \} .k \{ display: inline; \}")
+    style_engine_add_stylesheet(engine, @sheet, ORIGIN_AUTHOR)
+    let parent = declaration_block_new()
+    let s = style_engine_compute(@engine, element("span", "", "k"), parent)
+    var rc = 0
+    # Last rule in source order wins at equal specificity.
+    if has_keyword(@s, "color", "blue") != 1
+        rc = 1
+    if has_keyword(@s, "display", "inline") != 1
+        rc = 2
+    stylesheet_free(sheet)
+    style_engine_free(engine)
+    rc

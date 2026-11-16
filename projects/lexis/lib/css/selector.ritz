@@ -2,6 +2,8 @@
 #
 # Represents parsed CSS selectors for matching against DOM elements.
 
+import ritzlib.memory { realloc, free }
+
 # =============================================================================
 # Selector Component Types
 # =============================================================================
@@ -34,7 +36,12 @@ pub const ATTR_SUBSTRING: i32 = 6           # [attr*=val]
 # Simple Selector
 # =============================================================================
 
-const MAX_SELECTOR_VALUE_LEN: u32 = 256
+# Capacities below are per-selector and stored inline, so they multiply:
+# a ComplexSelector is MAX_COMPOUND x MAX_SIMPLE SimpleSelectors. At the old
+# 256/16/16/32 a SelectorList was 4.4 MB and a 4096-rule Stylesheet 18 GB,
+# all of it on the stack (#3700). Keep the product small: a ComplexSelector
+# is ~18 KB now, and a SelectorList's complex selectors live on the heap.
+pub const MAX_SELECTOR_VALUE_LEN: u32 = 128
 
 pub struct SimpleSelector
     kind: i32               # SELECTOR_* constant
@@ -60,7 +67,7 @@ pub struct SimpleSelector
 # A compound selector is a sequence of simple selectors (no combinators)
 # e.g., "div.foo#bar" is three simple selectors
 
-const MAX_SIMPLE_SELECTORS: u32 = 16
+const MAX_SIMPLE_SELECTORS: u32 = 8
 
 pub struct CompoundSelector
     simple: [MAX_SIMPLE_SELECTORS]SimpleSelector
@@ -73,7 +80,7 @@ pub struct CompoundSelector
 # A complex selector is compound selectors joined by combinators
 # e.g., "div.foo > p.bar span" is three compound selectors with combinators
 
-const MAX_COMPOUND_SELECTORS: u32 = 16
+const MAX_COMPOUND_SELECTORS: u32 = 8
 
 pub struct ComplexSelector
     compounds: [MAX_COMPOUND_SELECTORS]CompoundSelector
@@ -87,11 +94,14 @@ pub struct ComplexSelector
 # A selector list is comma-separated complex selectors
 # e.g., "div, p, .foo" is three complex selectors
 
-const MAX_COMPLEX_SELECTORS: u32 = 32
-
+# The complex selectors live in a heap array that grows on demand, so a
+# SelectorList is a small header. Copies of the header share the array: the
+# Stylesheet that ends up holding a rule owns it (stylesheet_free), and
+# selector_list_free is for a list that never made it into one.
 pub struct SelectorList
-    selectors: [MAX_COMPLEX_SELECTORS]ComplexSelector
+    selectors: *ComplexSelector
     selector_count: u32
+    selector_cap: u32
 
 # =============================================================================
 # Specificity
@@ -223,14 +233,29 @@ pub fn complex_selector_add(sel:& ComplexSelector, compound: CompoundSelector, c
         sel.compound_count = sel.compound_count + 1
 
 pub fn selector_list_new() -> SelectorList
-    var list: SelectorList
-    list.selector_count = 0
-    list
+    SelectorList { selectors: null, selector_count: 0, selector_cap: 0 }
 
+# Append `selector`, growing the heap array as needed. A failed allocation
+# drops the selector, like the old fixed list did when it was full.
 pub fn selector_list_add(list:& SelectorList, selector: ComplexSelector)
-    if list.selector_count < MAX_COMPLEX_SELECTORS
-        list.selectors[list.selector_count] = selector
-        list.selector_count = list.selector_count + 1
+    if list.selector_count == list.selector_cap
+        var new_cap: u32 = list.selector_cap * 2
+        if new_cap == 0
+            new_cap = 4
+        let bytes: i64 = new_cap as i64 * sizeof(ComplexSelector)
+        let grown = realloc(list.selectors as *u8, bytes) as *ComplexSelector
+        if grown == null
+            return
+        list.selectors = grown
+        list.selector_cap = new_cap
+    list.selectors[list.selector_count] = selector
+    list.selector_count = list.selector_count + 1
+
+pub fn selector_list_free(list:& SelectorList)
+    free(list.selectors as *u8)
+    list.selectors = null
+    list.selector_count = 0
+    list.selector_cap = 0
 
 # =============================================================================
 # Helpers

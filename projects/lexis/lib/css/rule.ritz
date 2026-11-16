@@ -2,7 +2,8 @@
 #
 # Represents parsed CSS rules (style rules, at-rules, etc.)
 
-import lib.css.selector { SelectorList, Specificity, complex_selector_specificity }
+import ritzlib.memory { realloc, free }
+import lib.css.selector { SelectorList, Specificity, complex_selector_specificity, selector_list_free }
 import lib.css.value { CssValue }
 
 # =============================================================================
@@ -23,7 +24,7 @@ pub const RULE_LAYER: i32 = 8           # @layer
 # Declaration (property: value)
 # =============================================================================
 
-const MAX_PROPERTY_NAME_LEN: u32 = 64
+pub const MAX_PROPERTY_NAME_LEN: u32 = 64
 
 pub struct Declaration
     property: [MAX_PROPERTY_NAME_LEN]u8
@@ -65,7 +66,7 @@ pub fn declaration_property_eq(decl: Declaration, prop: StrView) -> i32
 # Declaration Block
 # =============================================================================
 
-const MAX_DECLARATIONS: u32 = 128
+pub const MAX_DECLARATIONS: u32 = 128
 
 pub struct DeclarationBlock
     declarations: [MAX_DECLARATIONS]Declaration
@@ -81,7 +82,7 @@ pub fn declaration_block_add(block:& DeclarationBlock, decl: Declaration)
         block.declarations[block.count] = decl
         block.count = block.count + 1
 
-pub fn declaration_block_get(block: DeclarationBlock, property: StrView) -> i32
+pub fn declaration_block_get(block: @DeclarationBlock, property: StrView) -> i32
     # Returns index or -1 if not found
     var i: u32 = 0
     while i < block.count
@@ -149,21 +150,45 @@ pub fn css_rule_style(selectors: SelectorList, declarations: DeclarationBlock, o
 # Stylesheet
 # =============================================================================
 
-const MAX_RULES: u32 = 4096
-
+# The rules live in a heap array that grows on demand, so a Stylesheet is a
+# small header and is cheap to return by value. It was a fixed [4096]CssRule
+# inline, ~18 GB, which put css_parse's and main's frames far past any stack
+# (#3700). Copies of the header share the array; free exactly one of them
+# with stylesheet_free, which also frees each rule's selector list.
 pub struct Stylesheet
-    rules: [MAX_RULES]CssRule
+    rules: *CssRule
     rule_count: u32
+    rule_cap: u32
 
 pub fn stylesheet_new() -> Stylesheet
-    var sheet: Stylesheet
-    sheet.rule_count = 0
-    sheet
+    Stylesheet { rules: null, rule_count: 0, rule_cap: 0 }
 
-pub fn stylesheet_add_rule(sheet:& Stylesheet, rule: CssRule)
-    if sheet.rule_count < MAX_RULES
-        sheet.rules[sheet.rule_count] = rule
-        sheet.rule_count = sheet.rule_count + 1
+# Append `rule`; the sheet takes ownership of its selector list. Returns 1 on
+# success, 0 when the array could not grow (the caller still owns `rule`).
+pub fn stylesheet_add_rule(sheet:& Stylesheet, rule: @CssRule) -> i32
+    if sheet.rule_count == sheet.rule_cap
+        var new_cap: u32 = sheet.rule_cap * 2
+        if new_cap == 0
+            new_cap = 8
+        let bytes: i64 = new_cap as i64 * sizeof(CssRule)
+        let grown = realloc(sheet.rules as *u8, bytes) as *CssRule
+        if grown == null
+            return 0
+        sheet.rules = grown
+        sheet.rule_cap = new_cap
+    sheet.rules[sheet.rule_count] = *rule
+    sheet.rule_count = sheet.rule_count + 1
+    1
+
+pub fn stylesheet_free(sheet:& Stylesheet)
+    var i: u32 = 0
+    while i < sheet.rule_count
+        selector_list_free(sheet.rules[i].style_rule.selectors)
+        i = i + 1
+    free(sheet.rules as *u8)
+    sheet.rules = null
+    sheet.rule_count = 0
+    sheet.rule_cap = 0
 
 # Get all style rules (for selector matching)
 pub fn stylesheet_style_rule_count(sheet: @Stylesheet) -> u32

@@ -6,7 +6,7 @@
 import ritzlib.strview { strview_eq }
 import lib.css.selector { Specificity, specificity_compare }
 import lib.css.value { CssValue, CSS_VALUE_KEYWORD, CSS_VALUE_LENGTH, CSS_VALUE_COLOR, CSS_VALUE_NUMBER, css_value_keyword, css_value_length, css_value_number }
-import lib.css.rule { Declaration, DeclarationBlock, StyleRule, declaration_block_new }
+import lib.css.rule { Declaration, DeclarationBlock, StyleRule, declaration_block_new, MAX_DECLARATIONS }
 import lib.style.selector_map { RuleEntry }
 
 # =============================================================================
@@ -21,16 +21,19 @@ pub const ORIGIN_AUTHOR: i32 = 2
 # Matched Rule (rule + metadata for sorting)
 # =============================================================================
 
+# `declarations` points at the RuleEntry's block in its SelectorMap rather
+# than copying it (a DeclarationBlock is ~46 KB; a list of 256 copies blew
+# the stack, #3700), so a MatchedRule lives no longer than its map's entries.
 pub struct MatchedRule
-    declarations: DeclarationBlock
+    declarations: *DeclarationBlock
     specificity: Specificity
     origin: i32
     source_order: u32
     important: i32
 
-pub fn matched_rule_new(entry: RuleEntry, origin: i32) -> MatchedRule
+pub fn matched_rule_new(entry: *RuleEntry, origin: i32) -> MatchedRule
     MatchedRule {
-        declarations: entry.declarations,
+        declarations: @entry.declarations as *DeclarationBlock,
         specificity: entry.specificity,
         origin: origin,
         source_order: entry.source_order,
@@ -56,18 +59,22 @@ pub fn cascade_compare(a: MatchedRule, b: MatchedRule) -> i32
     # Author > user > user-agent (for normal)
     # User-agent > user > author (for !important, reversed)
 
+    # Rules are applied in this order and the last one wins, so the winner
+    # sorts *after* (positive). The signs here were inverted, making UA rules
+    # beat author ones; nothing could run the engine to notice until #3700.
+
     # Check importance first
     if a.important != b.important
-        # !important wins
-        return b.important - a.important
+        # !important wins: it goes last
+        return a.important - b.important
 
     # For !important, origins are reversed
     if a.important == 1
         if a.origin != b.origin
-            return a.origin - b.origin  # Lower origin wins for !important
+            return b.origin - a.origin  # Lower origin wins for !important
     else
         if a.origin != b.origin
-            return b.origin - a.origin  # Higher origin wins for normal
+            return a.origin - b.origin  # Higher origin wins for normal
 
     # Same importance and origin: compare specificity
     let spec_cmp = specificity_compare(a.specificity, b.specificity)
@@ -146,7 +153,7 @@ pub fn cascade_apply(matched: MatchedRuleList) -> DeclarationBlock
                     break
                 e = e + 1
 
-            if found == 0 and result.count < 128
+            if found == 0 and result.count < MAX_DECLARATIONS
                 result.declarations[result.count] = decl
                 result.count = result.count + 1
 
@@ -239,7 +246,7 @@ pub fn apply_inheritance(child:& DeclarationBlock, parent: DeclarationBlock)
                 c = c + 1
 
             # If not set on child, inherit from parent
-            if found == 0 and child.count < 128
+            if found == 0 and child.count < MAX_DECLARATIONS
                 child.declarations[child.count] = parent_decl
                 child.count = child.count + 1
 

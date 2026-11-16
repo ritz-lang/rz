@@ -74,7 +74,7 @@ import lib.css.rule { Stylesheet, DeclarationBlock, RULE_STYLE }
 import lib.css.selector { Specificity }
 
 import lib.style.bloom { BloomFilter, bloom_filter_new }
-import lib.style.selector_map { SelectorMap, selector_map_new, selector_map_add_rule, selector_map_get_candidates }
+import lib.style.selector_map { SelectorMap, selector_map_new, selector_map_free, selector_map_add_rule, selector_map_get_candidates }
 import lib.style.matching { ElementInfo, selector_matches }
 import lib.style.cascade { ORIGIN_USER_AGENT, ORIGIN_USER, ORIGIN_AUTHOR, MatchedRule, matched_rule_new, matched_rule_list_new, matched_rule_list_add, matched_rule_list_sort, cascade_apply, apply_inheritance, get_initial_value }
 
@@ -105,6 +105,7 @@ pub fn html_parser_run(parser:& HtmlParser)
 # CSS Parsing
 # =============================================================================
 
+# The result owns heap memory: release it with stylesheet_free.
 pub fn css_parse(input: StrView) -> Stylesheet
     var parser = css_parser_new(input)
     css_parse_stylesheet(parser)
@@ -120,6 +121,8 @@ pub fn css_parse(input: StrView) -> Stylesheet
 # - Author stylesheets (page CSS)
 # - Selector map for fast rule lookup
 
+# Each SelectorMap is a ~10 KB header over a heap array of rule entries, so
+# the engine is cheap to hold by value; free it with style_engine_free.
 pub struct StyleEngine
     ua_map: SelectorMap      # User-agent rules
     user_map: SelectorMap    # User rules
@@ -136,11 +139,9 @@ pub fn style_engine_add_stylesheet(engine:& StyleEngine, sheet: @Stylesheet, ori
     # Add all rules from stylesheet to appropriate map
     var i: u32 = 0
     while i < sheet.rule_count
-        let css_rule = sheet.rules[i]
-
         # Only style rules go in a selector map; the other kinds carry no selectors
-        if css_rule.kind == RULE_STYLE
-            let rule = css_rule.style_rule
+        if sheet.rules[i].kind == RULE_STYLE
+            let rule = @sheet.rules[i].style_rule
             # Add to appropriate selector map based on origin
             if origin == ORIGIN_USER_AGENT
                 selector_map_add_rule(engine.ua_map, rule)
@@ -150,6 +151,11 @@ pub fn style_engine_add_stylesheet(engine:& StyleEngine, sheet: @Stylesheet, ori
                 selector_map_add_rule(engine.author_map, rule)
 
         i = i + 1
+
+pub fn style_engine_free(engine:& StyleEngine)
+    selector_map_free(engine.ua_map)
+    selector_map_free(engine.user_map)
+    selector_map_free(engine.author_map)
 
 pub fn style_engine_compute(engine: @StyleEngine, elem: ElementInfo, parent: DeclarationBlock) -> DeclarationBlock
     # 1. Collect matching rules from all origins

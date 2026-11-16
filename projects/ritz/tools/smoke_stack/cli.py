@@ -25,7 +25,6 @@ from .valet import suite_valet
 XFAILS: dict[str, str] = {
     # help: exit 0 on --help, usage on stdout, nothing written into cwd
     "help:ritz-lsp/ritz-lsp": "#3159 ignores --help: starts the server, logs to stderr only, nothing on stdout",
-    "help:lexis/lexis": "#3700 SIGSEGV at startup: main's stack frame is ~205 GB (by-value Stylesheet/StyleEngine locals)",
     # hollow entry points (#2460 made the rest honest; sage still runs nothing)
     "hollow.sage_runs_js": "#2787 sage has no interpreter: `sage t.js` exits 1 'not implemented'",
 }
