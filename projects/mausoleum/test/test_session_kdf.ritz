@@ -1,0 +1,58 @@
+# test/test_session_kdf.ritz - Shared mausoleum-v1 session-key HKDF
+#
+# #2763: encrypted_channel.ritz (derive_keys) and server_async.ritz
+# (cipher_derive_session_keys) both derive their send/recv keys through
+# session_kdf_derive.  It must surface hkdf_expand's Err instead of
+# discarding it, and leave okm untouched when it refuses.
+
+import ritzlib.sys
+
+import lib.session_kdf
+import cryptosec.hkdf
+import cryptosec.mem
+
+fn skdf_fill(p: *u8, n: i32, v: u8)
+    var i: i32 = 0
+    while i < n
+        p[i] = v
+        i += 1
+
+# Ok path: 0, and the bytes are HKDF-SHA256(salt="", IKM=shared,
+# info="mausoleum-v1", 64) — the wire format both peers agree on.
+[[test]]
+fn test_session_kdf_derive_matches_hkdf() -> i32
+    var shared: [32]u8
+    var i: i32 = 0
+    while i < 32
+        shared[i] = (i * 7 + 3) as u8
+        i += 1
+
+    var okm: [64]u8
+    assert session_kdf_derive(@shared[0], @okm[0], SESSION_KDF_OKM_LEN) == 0
+
+    var info: [12]u8
+    mem_copy(@info[0], "mausoleum-v1", 12)
+    var salt: [1]u8
+    salt[0] = 0
+    var want: [64]u8
+    match hkdf_sha256(@salt[0], 0, @shared[0], 32, @info[0], 12, @want[0], 64)
+        Ok(_) => 0
+        Err(_) => return 1
+    assert mem_eq(@okm[0], @want[0], 64) == 1
+    0
+
+# Err path: an over-long okm_len is refused with -1 and nothing written.
+[[test]]
+fn test_session_kdf_derive_refuses_overlong_okm() -> i32
+    var shared: [32]u8
+    skdf_fill(@shared[0], 32, 0x42)
+    var okm: [64]u8
+    skdf_fill(@okm[0], 64, 0xA5)
+
+    assert session_kdf_derive(@shared[0], @okm[0], HKDF_SHA256_MAX_OKM_LEN + 1) == -1
+
+    var i: i32 = 0
+    while i < 64
+        assert okm[i] == 0xA5
+        i += 1
+    0

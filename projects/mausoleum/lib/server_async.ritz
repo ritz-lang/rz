@@ -60,7 +60,7 @@ import mausoleum.btree {
 import cryptosec.x25519
 import cryptosec.chacha20_poly1305
 import cryptosec.crypto_error
-import cryptosec.hkdf
+import mausoleum.session_kdf
 import cryptosec.random
 import cryptosec.mem
 
@@ -234,41 +234,27 @@ pub fn m7sp_session_init_encrypted(idx: i32)
 # x25519(priv, peer_pub), info="mausoleum-v1") → 64 bytes; first 32 →
 # server.send (i.e. client.recv), second 32 → server.recv (client.send).
 # Returns 0, or -1 with nothing derived when x25519 refuses a small-order
-# peer key (all-zero secret, RFC 7748 §6.1; #2772).
+# peer key (all-zero secret, RFC 7748 §6.1; #2772) or the KDF refuses
+# (#2763).
 fn cipher_derive_session_keys(session: *M7SPSession) -> i32
     var shared: [32]u8
     match x25519(@shared[0], @session.cipher_private_key[0], @session.cipher_peer_pubkey[0])
         Ok(_) => 0
         Err(_) => return -1
 
-    var prk: [32]u8
-    var salt: [1]u8
-    salt[0] = 0
-    hkdf_extract(@salt[0], 0, @shared[0], 32, @prk[0])
-
+    # Shared with encrypted_channel's derive_keys; a refused KDF derives
+    # nothing and fails the handshake (#2763).
     var okm: [64]u8
-    var info: [12]u8
-    info[0] = 109   # 'm'
-    info[1] = 97    # 'a'
-    info[2] = 117   # 'u'
-    info[3] = 115   # 's'
-    info[4] = 111   # 'o'
-    info[5] = 108   # 'l'
-    info[6] = 101   # 'e'
-    info[7] = 117   # 'u'
-    info[8] = 109   # 'm'
-    info[9] = 45    # '-'
-    info[10] = 118  # 'v'
-    info[11] = 49   # '1'
-    hkdf_expand(@prk[0], @info[0], 12, @okm[0], 64)
+    let rc: i32 = session_kdf_derive(@shared[0], @okm[0], SESSION_KDF_OKM_LEN)
+    mem_zero(@shared[0], 32)
+    if rc != 0
+        return -1
 
     # Server side: send_key=okm[0..32], recv_key=okm[32..64].
     # Client side mirrors this — see channel_init_client / derive_keys.
     mem_copy(@session.cipher_send_key[0], @okm[0], 32)
     mem_copy(@session.cipher_recv_key[0], @okm[32], 32)
 
-    mem_zero(@shared[0], 32)
-    mem_zero(@prk[0], 32)
     mem_zero(@okm[0], 64)
     return 0
 

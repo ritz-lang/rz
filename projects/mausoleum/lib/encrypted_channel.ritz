@@ -25,7 +25,7 @@ import ritzlib.net
 import cryptosec.x25519
 import cryptosec.chacha20_poly1305
 import cryptosec.crypto_error
-import cryptosec.hkdf
+import mausoleum.session_kdf
 import cryptosec.sha256
 import cryptosec.random
 import cryptosec.mem
@@ -168,36 +168,13 @@ pub fn channel_free(ch: *EncryptedChannel)
 # Key Derivation
 # ============================================================================
 
-# Derive send and receive keys from shared secret
-fn derive_keys(ch: *EncryptedChannel, shared_secret: *u8)
-    # Use HKDF-SHA256 to derive keys
-    # Salt: empty (per Noise specification)
-    # Info: "mausoleum-v1" for domain separation
-
-    var prk: [32]u8
-    var salt: [1]u8
-    salt[0] = 0
-
-    # Extract: PRK = HKDF-Extract(salt="", IKM=shared_secret)
-    hkdf_extract(@salt[0], 0, shared_secret, 32, @prk[0])
-
-    # Expand: OKM = HKDF-Expand(PRK, info, 64)
+# Derive send and receive keys from shared secret (HKDF-SHA256, salt="",
+# info="mausoleum-v1"; see session_kdf.ritz).
+# Returns 0, or -1 with no keys installed when the KDF refuses (#2763).
+fn derive_keys(ch: *EncryptedChannel, shared_secret: *u8) -> i32
     var okm: [64]u8
-    var info: [12]u8
-    info[0] = 109  # 'm'
-    info[1] = 97   # 'a'
-    info[2] = 117  # 'u'
-    info[3] = 115  # 's'
-    info[4] = 111  # 'o'
-    info[5] = 108  # 'l'
-    info[6] = 101  # 'e'
-    info[7] = 117  # 'u'
-    info[8] = 109  # 'm'
-    info[9] = 45   # '-'
-    info[10] = 118 # 'v'
-    info[11] = 49  # '1'
-
-    hkdf_expand(@prk[0], @info[0], 12, @okm[0], 64)
+    if session_kdf_derive(shared_secret, @okm[0], SESSION_KDF_OKM_LEN) != 0
+        return -1
 
     # Server and client use opposite keys for send/recv
     if ch.is_server != 0
@@ -208,8 +185,8 @@ fn derive_keys(ch: *EncryptedChannel, shared_secret: *u8)
         mem_copy(@ch.send_key[0], @okm[32], 32)
 
     # Zero intermediate values
-    mem_zero(@prk[0], 32)
     mem_zero(@okm[0], 64)
+    return 0
 
 # ============================================================================
 # Handshake
@@ -251,9 +228,13 @@ pub fn channel_handshake_client(ch: *EncryptedChannel) -> i32
             ch.last_error = CHANNEL_ERR_HANDSHAKE
             return -4
 
-    # Derive keys
-    derive_keys(ch, @shared[0])
+    # Derive keys; a refused KDF fails the handshake (#2763)
+    let dk: i32 = derive_keys(ch, @shared[0])
     mem_zero(@shared[0], 32)
+    if dk != 0
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_HANDSHAKE
+        return -5
 
     ch.state = CHANNEL_STATE_CONNECTED
     return 0
@@ -294,9 +275,13 @@ pub fn channel_handshake_server(ch: *EncryptedChannel) -> i32
             ch.last_error = CHANNEL_ERR_HANDSHAKE
             return -4
 
-    # Derive keys
-    derive_keys(ch, @shared[0])
+    # Derive keys; a refused KDF fails the handshake (#2763)
+    let dk: i32 = derive_keys(ch, @shared[0])
     mem_zero(@shared[0], 32)
+    if dk != 0
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_HANDSHAKE
+        return -5
 
     ch.state = CHANNEL_STATE_CONNECTED
     return 0
