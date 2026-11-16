@@ -472,11 +472,24 @@ def _assert_runs(request, compiler, tmp_path, name, source, code):
     assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
 
 
+# AGAST #3505: ritz1's implicit-narrowing check runs on Sema, before
+# emission, and any Sema error stops the compile there.  An `if` whose literal
+# arms are i64 (#1445) and do not all fit is refused as a narrowing first, at
+# the `let`, so literal_slot's per-arm error (which ritz0 reports) is no
+# longer reached.  Same row, ritz1's first refusal.
+SEMA_FIRST = {
+    "fit_arm": (2, 5, "implicit narrowing: `a` is declared `u8` but its "
+                      "initialiser has type `i64`"),
+}
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REJECTED))
 def test_what_does_not_fit_is_a_located_error(request, tmp_path, compiler, name):
     source, line, col, message = REJECTED[name]
+    if compiler != "ritz0" and name in SEMA_FIRST:
+        line, col, message = SEMA_FIRST[name]
     code, output, where = _refusal(request, compiler, tmp_path, source, line, col)
     assert code != 0, f"{compiler} accepted it:\n{output}"
     assert message in output, output

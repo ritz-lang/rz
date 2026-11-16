@@ -27,7 +27,20 @@
 # ritz0 accepts, which the regression suite would (rightly) fail on.  In
 # particular an unannotated local is NOT trusted -- the parser defaults it to
 # TYPE_I64 whatever its initialiser is -- so identifiers resolve through the
-# per-function table of WRITTEN annotations kept here, not through s.locals.
+# WRITTEN annotations, never through an inferred type.
+#
+# WHERE IT RUNS (AGAST #3505, #1816).  check_implicit_narrowing is a Sema
+# check: sema_walk calls it on every `let` / `var`, before the name is bound,
+# so `let x: i32 = x` still sees the outer x.  Sema's scope is lexical, and
+# each binding carries the integer type its declaration wrote (SemaVar.narrow:
+# a param's, a typed let's, a match binding's payload or scrutinee type).
+#
+# The rule itself (narrow_src_type, narrow_unproven and the folding under them)
+# is also read mid-lowering by float_slot, literal_slot, enum_as_int, sizeof
+# and a match scrutinee's binding.  Those still run on EmitterState, so the
+# emitter keeps its per-function table of written annotations
+# (narrowing_begin_fn / narrow_note_decl / narrow_note_binding) for them.
+# A NarrowEnv says which view a lookup reads; everything else is one copy.
 
 import ritzlib.sys
 import ritzlib.io
@@ -35,6 +48,8 @@ import ritzlib.io
 import ast
 import ast_helpers
 import emitter_core
+import sema
+import sema_type
 
 # narrow_src_type results that are not a TYPE_* kind.
 # Positive and far from every TYPE_* kind (consts must be plain literals).
@@ -44,8 +59,14 @@ const NARROW_LIT: i32 = 9002       # a bare integer literal: adopts the
 
 const I64_MAX: i64 = 9223372036854775807
 
+# Which view of the names in scope a lookup reads: the emitter's table, for
+# the codegen paths above, or Sema's scope, for the check.  Exactly one is set.
+struct NarrowEnv
+    s: *EmitterState
+    sm: *Sema
+
 # =============================================================================
-# Per-function state
+# The emitter's per-function table (its codegen readers, see the header)
 # =============================================================================
 
 # Called at the start of every fn and impl method, where s.locals is reset.
@@ -54,7 +75,8 @@ pub fn narrowing_begin_fn(s: *EmitterState, params: *Param)
     s.narrow_decl_count = 0
     s.narrow_decl_overflow = 0
 
-fn narrow_record_decl(s: *EmitterState, stmt: *Stmt)
+# emit_var_decl records each `let` / `var` as it is lowered.
+pub fn narrow_note_decl(s: *EmitterState, stmt: *Stmt)
     if s.narrow_decl_count >= 256
         # Lookups could miss a shadowing entry: stop trusting the table.
         s.narrow_decl_overflow = 1
@@ -87,6 +109,63 @@ pub fn narrow_note_binding(s: *EmitterState, name: *u8, len: i32, t: i32)
     s.narrow_decls[idx].declared = TYPE_I64
     s.narrow_decls[idx].init = null
     s.narrow_decl_count = idx + 1
+
+# =============================================================================
+# Sema's bindings (AGAST #3505)
+# =============================================================================
+#
+# sema_walk binds a name, then notes here the integer type it was written
+# with, on that binding.  An unnamed bind (sema_bind_ty skips it) is no note.
+
+fn narrow_sema_note(sm: *Sema, name: *u8, len: i32, t: i32)
+    if sm.scope_top <= 0
+        return
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if v.name != name or v.name_len != len
+        return
+    v.narrow = 0
+    if narrow_int_width(t) > 0
+        v.narrow = t
+
+pub fn narrow_sema_param(sm: *Sema, p: *Param)
+    narrow_sema_note(sm, p.name, p.name_len, p.param_type)
+
+# A `let` / `var`: its annotation, or nothing for an unannotated one.
+pub fn narrow_sema_decl(sm: *Sema, st: *Stmt)
+    narrow_sema_note(sm, st.var_name, st.var_name_len, st.var_declared_type)
+
+# A match arm's binding (AGAST #3345 / #3358, as the emitter's
+# narrow_note_binding): a payload `Some(x)` has the payload's integer type, a
+# catch-all name `n` the scrutinee's.  `scrut` is null for if-expression arms.
+pub fn narrow_sema_arm(sm: *Sema, scrut: *Expr, arm: *MatchArm)
+    if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
+        narrow_sema_note(sm, arm.pattern_inner_name, arm.pattern_inner_name_len, narrow_sema_payload(sm, scrut, arm))
+    else if arm.pattern_kind == PAT_IDENT and scrut != null
+        var env: NarrowEnv
+        env.s = null
+        env.sm = sm
+        narrow_sema_note(sm, arm.pattern_name, arm.pattern_name_len, narrow_src_type_in(@env, scrut, 0))
+
+# The payload's integer type of `arm`'s variant of the enum `scrut` is, as
+# emit_match_arm_body picks the variant (`Some` / `Ok` tag 0, else 1; a user
+# enum's own index); 0 when Sema can't type the scrutinee as an enum.
+fn narrow_sema_payload(sm: *Sema, scrut: *Expr, arm: *MatchArm) -> i32
+    if scrut == null
+        return 0
+    var e: *Expr = scrut
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null
+        e = e.operand   # `match @place` matches the enum it addresses
+    var t: SemaTy
+    if sema_expr_ty(sm, e, @t) != TYPE_STRUCT or t.name == null or t.name_len <= 0
+        return 0
+    var variant: i32 = 1
+    if name_eq(arm.pattern_name, arm.pattern_name_len, c"Some", 4) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"Ok", 2) == 1
+        variant = 0
+    if user_enum_index(t.name, t.name_len) >= 0
+        let uvi: i32 = enum_variant_index(t.name, t.name_len, arm.pattern_name, arm.pattern_name_len)
+        if uvi >= 0
+            variant = uvi
+    tagged_enum_int_type_in(@sm.struct_map, sm.module, t.name, t.name_len, variant)
 
 # =============================================================================
 # Types
@@ -136,17 +215,53 @@ pub fn narrow_known(t: i32) -> i32
         return t
     NARROW_UNKNOWN
 
+# The const named `name`.  Sema runs before emit_module resolves a const
+# that named one not yet parsed (resolve_const_values), so it resolves the
+# one it reads, as the emitter's own lookup would find it resolved.
+fn narrow_env_const(env: *NarrowEnv, name: *u8, len: i32) -> *ConstEntry
+    if env.s != null
+        return find_const_entry(env.s, name, len)
+    let consts: *ConstEntry = env.sm.module.constants
+    var c: *ConstEntry = consts
+    while c != null
+        if name_eq(c.name, c.name_len, name, len) == 1
+            if c.fold_state == CONST_FOLD_PENDING
+                const_resolve(consts, c)
+            return c
+        c = c.next
+    null
+
 # Ritz type of an identifier, or NARROW_UNKNOWN.  Same precedence as
 # emission: constants shadow locals.
 pub fn narrow_ident_type(s: *EmitterState, e: *Expr) -> i32
     narrow_name_type(s, e.ident_ptr, e.ident_len)
 
 pub fn narrow_name_type(s: *EmitterState, name: *u8, len: i32) -> i32
-    let ce: *ConstEntry = find_const_entry(s, name, len)
+    var env: NarrowEnv
+    env.s = s
+    env.sm = null
+    narrow_env_name_type(@env, name, len)
+
+fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
+    let ce: *ConstEntry = narrow_env_const(env, name, len)
     if ce != null
         if ce.fold_state != CONST_FOLD_DONE
             return NARROW_UNKNOWN
         return narrow_known(ce.const_type)
+    if env.s == null
+        # Sema: the innermost binding of the name, else a global.
+        let v: *SemaVar = sema_find_local(env.sm, name, len)
+        if v != null
+            if v.narrow == 0
+                return NARROW_UNKNOWN
+            return v.narrow
+        var sg: *GlobalVarDef = env.sm.module.globals
+        while sg != null
+            if name_eq(sg.name, sg.name_len, name, len) == 1
+                return narrow_global_type(sg)
+            sg = sg.next
+        return NARROW_UNKNOWN
+    let s: *EmitterState = env.s
     if s.narrow_decl_overflow != 0
         return NARROW_UNKNOWN
     # Newest declaration first.  Block scopes are not tracked, so if two
@@ -170,23 +285,50 @@ pub fn narrow_name_type(s: *EmitterState, name: *u8, len: i32) -> i32
         if name_eq(p.name, p.name_len, name, len) == 1
             return narrow_known(p.param_type)
         p = p.next
-    # A global's TYPE_I64 may be the parser's default for a missing
-    # annotation, so only a narrower (necessarily written) type is trusted.
     let g: *GlobalVarDef = find_global(s, name, len)
     if g != null
-        let gw: i32 = narrow_int_width(g.var_type)
-        if gw > 1 and gw < 64
-            return g.var_type
+        return narrow_global_type(g)
+    NARROW_UNKNOWN
+
+# A global's TYPE_I64 may be the parser's default for a missing annotation,
+# so only a narrower (necessarily written) type is trusted.
+fn narrow_global_type(g: *GlobalVarDef) -> i32
+    let gw: i32 = narrow_int_width(g.var_type)
+    if gw > 1 and gw < 64
+        return g.var_type
     NARROW_UNKNOWN
 
 # Ritz type of `local.field` / `ptr.field`; field types are always written.
 pub fn narrow_member_type(s: *EmitterState, e: *Expr) -> i32
+    var env: NarrowEnv
+    env.s = s
+    env.sm = null
+    narrow_env_member_type(@env, e)
+
+fn narrow_env_member_type(env: *NarrowEnv, e: *Expr) -> i32
     if e.left == null or e.left.kind != EXPR_IDENT
         return NARROW_UNKNOWN
-    let local: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
-    if local == null or local.type_name_len == 0
+    var tn: *u8 = null
+    var tl: i32 = 0
+    if env.s != null
+        let local: *LocalVar = find_local_struct_name(env.s, e.left.ident_ptr, e.left.ident_len)
+        if local == null
+            return NARROW_UNKNOWN
+        tn = local.type_name
+        tl = local.type_name_len
+    else
+        let v: *SemaVar = sema_find_local(env.sm, e.left.ident_ptr, e.left.ident_len)
+        if v == null
+            return NARROW_UNKNOWN
+        tn = v.type_name
+        tl = v.type_name_len
+    if tl == 0
         return NARROW_UNKNOWN
-    let st: *StructDef = find_struct(s, local.type_name, local.type_name_len)
+    var st: *StructDef = null
+    if env.s != null
+        st = find_struct(env.s, tn, tl)
+    else
+        st = sema_find_struct(env.sm, tn, tl)
     if st == null
         return NARROW_UNKNOWN
     let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
@@ -195,11 +337,28 @@ pub fn narrow_member_type(s: *EmitterState, e: *Expr) -> i32
     let field: *StructField = get_field_type(st, idx)
     narrow_known(field.field_type)
 
-fn narrow_call_type(s: *EmitterState, e: *Expr) -> i32
-    let fn_def: *FnDef = find_call_fn(s, e)
+fn narrow_call_type(env: *NarrowEnv, e: *Expr) -> i32
+    var fn_def: *FnDef = null
+    if env.s != null
+        fn_def = find_call_fn(env.s, e)
+    else
+        fn_def = narrow_sema_call_fn(env.sm, e)
     if fn_def == null
         return NARROW_UNKNOWN
     narrow_known(fn_def.return_type)
+
+# The callee find_call_fn resolves, from Sema's scope: a typed fn-pointer
+# local of the name (AGAST #3666), else sema_call_fn.  A nameless call
+# (`fs[i](..)`) is not resolved, and a Deref step call does not exist yet
+# (deref_field makes it during lowering).
+fn narrow_sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
+    if e.func_name_len == 0
+        return null
+    if e.call_type_suffix_len <= 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+        if v != null and v.fn_sig != null and v.kind != TYPE_ARRAY
+            return v.fn_sig
+    sema_call_fn(sm, e)
 
 # The type ritz0 would give an arithmetic result: the wider operand, with a
 # bare literal adopting the other side (#1396).  Two literals stay i64 in
@@ -243,13 +402,16 @@ fn narrow_is_int_lit(e: *Expr) -> i32
 
 # Ritz type of an initialiser, NARROW_LIT, or NARROW_UNKNOWN (see header).
 pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
-    narrow_src_type_in(s, e, 0)
+    var env: NarrowEnv
+    env.s = s
+    env.sm = null
+    narrow_src_type_in(@env, e, 0)
 
 # `lit_i64` is 1 inside the arms of an `if` expression, where ritz0 emits
 # integer literals with no expected type, so they are i64 there and do NOT
 # adopt the other operand or arm (#1445): measured, `if c` + `x` / `else` +
 # `0` into an i32 is rejected, as is `x + 1` / `y`; `x` / `y` is accepted.
-fn narrow_src_type_in(s: *EmitterState, e: *Expr, lit_i64: i32) -> i32
+fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
     if e == null
         return NARROW_UNKNOWN
     let k: i32 = e.kind
@@ -260,13 +422,13 @@ fn narrow_src_type_in(s: *EmitterState, e: *Expr, lit_i64: i32) -> i32
     if k == EXPR_CHAR_LIT
         return TYPE_U8
     if k == EXPR_IDENT
-        return narrow_ident_type(s, e)
+        return narrow_env_name_type(env, e.ident_ptr, e.ident_len)
     if k == EXPR_CALL
-        return narrow_call_type(s, e)
+        return narrow_call_type(env, e)
     if k == EXPR_CAST
         return narrow_known(e.op)
     if k == EXPR_MEMBER
-        return narrow_member_type(s, e)
+        return narrow_env_member_type(env, e)
     if k == EXPR_BINARY
         if e.op >= OP_EQ and e.op <= OP_OR
             return TYPE_BOOL
@@ -275,27 +437,27 @@ fn narrow_src_type_in(s: *EmitterState, e: *Expr, lit_i64: i32) -> i32
             # inside either operand is an i64 there, and so is a literal left
             # operand: `(a << 4) >> 4` and `64 >> a` are i64 even below a u8
             # slot.  Only a bare literal count still adopts the left side.
-            let lt: i32 = narrow_src_type_in(s, e.left, 1)
+            let lt: i32 = narrow_src_type_in(env, e.left, 1)
             if e.right != null and e.right.kind == EXPR_INT_LIT
                 return narrow_join(lt, NARROW_LIT)
-            return narrow_join(lt, narrow_src_type_in(s, e.right, 1))
+            return narrow_join(lt, narrow_src_type_in(env, e.right, 1))
         if narrow_is_arith_op(e.op) == 1
             # LARB R21 (AGAST #3112): a literal operand is the other operand's
             # type, in an `if` arm or under `>>` too: `(a << 4) >> 4` is a's.
             # A shift's left literal is not (`1 << n`), as before.
             var lt: i32 = NARROW_LIT
             if e.op == OP_SHL or narrow_operand_lit(e.left, e.right) == 0
-                lt = narrow_src_type_in(s, e.left, lit_i64)
+                lt = narrow_src_type_in(env, e.left, lit_i64)
             var rt: i32 = NARROW_LIT
             if narrow_operand_lit(e.right, e.left) == 0
-                rt = narrow_src_type_in(s, e.right, lit_i64)
+                rt = narrow_src_type_in(env, e.right, lit_i64)
             return narrow_join(lt, rt)
         return NARROW_UNKNOWN
     if k == EXPR_UNARY
         if e.op == OP_NOT
             return TYPE_BOOL
         if e.op == OP_NEG or e.op == OP_BIT_NOT
-            return narrow_src_type_in(s, e.operand, lit_i64)
+            return narrow_src_type_in(env, e.operand, lit_i64)
         return NARROW_UNKNOWN
     if k == EXPR_IF
         # AGAST #1613: the wider of the two arms, literals counting as i64.
@@ -305,7 +467,7 @@ fn narrow_src_type_in(s: *EmitterState, e: *Expr, lit_i64: i32) -> i32
             return NARROW_UNKNOWN
         if else_arm.is_pass != 0 or else_arm.body == null
             return NARROW_UNKNOWN
-        return narrow_join(narrow_src_type_in(s, then_arm.body, 1), narrow_src_type_in(s, else_arm.body, 1))
+        return narrow_join(narrow_src_type_in(env, then_arm.body, 1), narrow_src_type_in(env, else_arm.body, 1))
     if k == EXPR_MATCH
         # Measured against ritz0, not assumed: a literal arm takes the type
         # of the non-literal arms (`match o: A => x_i32, B => 0` is i32), and
@@ -318,7 +480,7 @@ fn narrow_src_type_in(s: *EmitterState, e: *Expr, lit_i64: i32) -> i32
         while arm != null
             if arm.is_pass != 0 or arm.body == null
                 return NARROW_UNKNOWN
-            let at: i32 = narrow_src_type_in(s, arm.body, lit_i64)
+            let at: i32 = narrow_src_type_in(env, arm.body, lit_i64)
             if at == NARROW_UNKNOWN
                 return NARROW_UNKNOWN
             if at != NARROW_LIT
@@ -373,14 +535,14 @@ fn narrow_mul_ok(a: i64, b: i64) -> i32
 # A named constant narrower than 64 bits is trusted only as the WHOLE
 # initialiser: inside an expression it is computed at its own width and
 # could wrap before any widening.
-fn narrow_const_value(s: *EmitterState, e: *Expr, whole: i32, out: *i64) -> i32
+fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
     if e == null
         return 0
     if e.kind == EXPR_INT_LIT
         *out = e.int_val
         return 1
     if e.kind == EXPR_IDENT
-        let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+        let ce: *ConstEntry = narrow_env_const(env, e.ident_ptr, e.ident_len)
         if ce == null or ce.fold_state != CONST_FOLD_DONE
             return 0
         let w: i32 = narrow_int_width(ce.const_type)
@@ -394,7 +556,7 @@ fn narrow_const_value(s: *EmitterState, e: *Expr, whole: i32, out: *i64) -> i32
         var v: i64 = 0
         if e.op != OP_NEG and e.op != OP_BIT_NOT
             return 0
-        if narrow_const_value(s, e.operand, 0, @v) == 0
+        if narrow_const_value(env, e.operand, 0, @v) == 0
             return 0
         if e.op == OP_NEG
             if v == 0 - I64_MAX - 1
@@ -407,9 +569,9 @@ fn narrow_const_value(s: *EmitterState, e: *Expr, whole: i32, out: *i64) -> i32
         return 0
     var l: i64 = 0
     var r: i64 = 0
-    if narrow_const_value(s, e.left, 0, @l) == 0
+    if narrow_const_value(env, e.left, 0, @l) == 0
         return 0
-    if narrow_const_value(s, e.right, 0, @r) == 0
+    if narrow_const_value(env, e.right, 0, @r) == 0
         return 0
     let op: i32 = e.op
     if op == OP_SHL
@@ -469,9 +631,9 @@ fn narrow_const_value(s: *EmitterState, e: *Expr, whole: i32, out: *i64) -> i32
 # _provable_int_range: constants, `e & K` masks, and match over those.  No
 # reasoning about comparisons, loop bounds or variables -- widening this is a
 # language decision, pinned by test_implicit_narrowing.py.
-fn narrow_provable_range(s: *EmitterState, e: *Expr, whole: i32, lo: *i64, hi: *i64) -> i32
+fn narrow_provable_range(env: *NarrowEnv, e: *Expr, whole: i32, lo: *i64, hi: *i64) -> i32
     var v: i64 = 0
-    if narrow_const_value(s, e, whole, @v) == 1
+    if narrow_const_value(env, e, whole, @v) == 1
         *lo = v
         *hi = v
         return 1
@@ -481,10 +643,10 @@ fn narrow_provable_range(s: *EmitterState, e: *Expr, whole: i32, lo: *i64, hi: *
         var found: i32 = 0
         var best: i64 = 0
         var k: i64 = 0
-        if narrow_const_value(s, e.left, 0, @k) == 1 and k >= 0
+        if narrow_const_value(env, e.left, 0, @k) == 1 and k >= 0
             best = k
             found = 1
-        if narrow_const_value(s, e.right, 0, @k) == 1 and k >= 0
+        if narrow_const_value(env, e.right, 0, @k) == 1 and k >= 0
             if found == 0 or k < best
                 best = k
             found = 1
@@ -504,7 +666,7 @@ fn narrow_provable_range(s: *EmitterState, e: *Expr, whole: i32, lo: *i64, hi: *
         while arm != null
             if arm.is_pass != 0 or arm.body == null
                 return 0
-            if narrow_provable_range(s, arm.body, 0, @alo, @ahi) == 0
+            if narrow_provable_range(env, arm.body, 0, @alo, @ahi) == 0
                 return 0
             if any == 0 or alo < *lo
                 *lo = alo
@@ -532,32 +694,40 @@ pub fn narrow_eprint_name(name: *u8, len: i32)
         eprint_char(*(name + i))
         i += 1
 
-# Reject `let n: i32 = <i64 expr>` unless it provably loses no bits.  Called
-# at the top of emit_var_decl, before the declaration is in scope, so
-# `let x: i32 = x` still sees the outer x.
-pub fn check_implicit_narrowing(s: *EmitterState, stmt: *Stmt)
+# Reject `let n: i32 = <i64 expr>` unless it provably loses no bits.  A Sema
+# check (AGAST #3505): sema_walk calls it on each `let` / `var` before the
+# name is bound, so `let x: i32 = x` still sees the outer x.
+pub fn check_implicit_narrowing(sm: *Sema, stmt: *Stmt)
+    var env: NarrowEnv
+    env.s = null
+    env.sm = sm
     let decl: i32 = stmt.var_declared_type
-    let src: i32 = narrow_unproven(s, stmt.var_init, decl)
+    let src: i32 = narrow_unproven_in(@env, stmt.var_init, decl)
     if src != 0
-        narrow_report(s, stmt, decl, src)
-    narrow_record_decl(s, stmt)
+        narrow_report(sm, stmt, decl, src)
 
 # `init`'s type if landing in `decl` narrows it and might lose bits, else 0.
 pub fn narrow_unproven(s: *EmitterState, init: *Expr, decl: i32) -> i32
+    var env: NarrowEnv
+    env.s = s
+    env.sm = null
+    narrow_unproven_in(@env, init, decl)
+
+fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
     let dw: i32 = narrow_int_width(decl)
     if init == null or dw <= 1 or dw >= 64
         return 0
-    let src: i32 = narrow_src_type(s, init)
+    let src: i32 = narrow_src_type_in(env, init, 0)
     if src == NARROW_UNKNOWN or src == NARROW_LIT or narrow_int_width(src) <= dw
         return 0
     var lo: i64 = 0
     var hi: i64 = 0
-    if narrow_provable_range(s, init, 1, @lo, @hi) == 1
+    if narrow_provable_range(env, init, 1, @lo, @hi) == 1
         if narrow_fits(lo, decl) == 1 and narrow_fits(hi, decl) == 1
             return 0
     src
 
-fn narrow_report(s: *EmitterState, stmt: *Stmt, decl: i32, src: i32)
+fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
     if stmt.var_src_file != null
         eprints_cstr(stmt.var_src_file)
     else
@@ -579,7 +749,4 @@ fn narrow_report(s: *EmitterState, stmt: *Stmt, decl: i32, src: i32)
     eprints_cstr(c"` as `")
     eprints_cstr(narrow_type_name(src))
     eprints_cstr(c"`\n")
-    emit_str(s, c"  ; ERROR: implicit narrowing of `")
-    emit_name(s, stmt.var_name, stmt.var_name_len)
-    emit_str(s, c"`\n")
-    s.error_count = s.error_count + 1
+    sm.error_count = sm.error_count + 1

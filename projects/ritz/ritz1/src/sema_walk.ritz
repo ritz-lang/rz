@@ -30,10 +30,12 @@ import sema_probe
 import must_use
 import sema_index_store
 import pass_arm_init   # AGAST #3740
+import narrowing     # check_implicit_narrowing (AGAST #3505)
 import generic_method
 import field_slot
 
-fn sema_walk_arms(sm: *Sema, arms: *MatchArm)
+# `scrut` is the match's scrutinee; null for an if-expression's arms.
+fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
     var arm: *MatchArm = arms
     while arm != null
         let mark: i32 = sm.scope_top
@@ -41,6 +43,7 @@ fn sema_walk_arms(sm: *Sema, arms: *MatchArm)
             sema_bind(sm, arm.pattern_inner_name, arm.pattern_inner_name_len)
         else if arm.pattern_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_name, arm.pattern_name_len)
+        narrow_sema_arm(sm, scrut, arm)
         sema_walk_stmts(sm, arm.body_stmts, 0)
         sema_walk_expr(sm, arm.body)
         sm.scope_top = mark
@@ -55,7 +58,10 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     let k: i32 = e.kind
     if k == EXPR_MATCH or k == EXPR_IF
         sema_walk_expr(sm, e.left)
-        sema_walk_arms(sm, e.args as *MatchArm)
+        var scrut: *Expr = null
+        if k == EXPR_MATCH
+            scrut = e.left
+        sema_walk_arms(sm, scrut, e.args as *MatchArm)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
         sema_walk_expr(sm, e.left)
         sema_walk_expr(sm, e.right)
@@ -121,7 +127,9 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
         if st.kind == STMT_VAR_DECL
             sema_walk_expr(sm, st.var_init)
             pass_arm_init_check(sm, st)
+            check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
             sema_bind_decl(sm, st)
+            narrow_sema_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
             sema_walk_expr(sm, st.var_init)
             sema_bind(sm, st.var_name, st.var_name_len)
@@ -147,7 +155,7 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
         else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
             sema_walk_stmts(sm, st.while_body, 0)
         else if st.kind == STMT_MATCH
-            sema_walk_arms(sm, st.if_then as *MatchArm)
+            sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm)
         else if st.kind == STMT_RETURN
             sema_walk_expr(sm, st.return_value)
         else if st.kind == STMT_EXPR
@@ -174,6 +182,7 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
     var p: *Param = f.params
     while p != null
         sema_bind_param(sm, p)
+        narrow_sema_param(sm, p)
         p = p.next
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
     sm.scope_top = 0

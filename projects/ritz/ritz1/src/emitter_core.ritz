@@ -378,8 +378,10 @@ struct EmitterState
     # AGAST #1918 — 1 once a `[[packed]]` struct type is emitted; only then
     # does align_packed_accesses scan each fn body.
     packed_types_emitted: i32
-    # AGAST #1364 — per-function state for the implicit-narrowing check
-    # (narrowing.ritz).  Reset by narrowing_begin_fn at each fn/method start.
+    # AGAST #1364 — per-function table of written integer types
+    # (narrowing.ritz), for the codegen paths that read narrowing's rule
+    # mid-lowering (float_slot, literal_slot, enum_as_int, sizeof).  The check
+    # itself is Sema's (AGAST #3505).  Reset by narrowing_begin_fn per fn.
     narrow_params: *Param
     narrow_decls: [256]NarrowDecl
     narrow_decl_count: i32
@@ -1831,8 +1833,13 @@ pub fn value_fn_sig(s: *EmitterState, c: *Expr) -> *FnDef
 
 # Find a struct definition by name.  Same null-as-miss optimization.
 pub fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
+    struct_map_find(@s.struct_map, s.module, name, len)
+
+# find_struct over any fnv1a(name) -> first-StructDef map of `m`'s structs:
+# the emitter's, or Sema's (AGAST #3505).
+pub fn struct_map_find(map: *HashMapI64, m: *Module, name: *u8, len: i32) -> *StructDef
     let key: i64 = fnv1a_str(name, len) as i64
-    let st: *StructDef = hashmap_i64_get(@s.struct_map, key) as *StructDef
+    let st: *StructDef = hashmap_i64_get(map, key) as *StructDef
     if st == null
         return null
     if name_eq(st.name, st.name_len, name, len) == 1
@@ -1840,7 +1847,7 @@ pub fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
     # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
     # another name is a collision, not a miss.  Scan the list (first
     # occurrence wins, as in build_symbol_maps).
-    var cur: *StructDef = s.module.structs
+    var cur: *StructDef = m.structs
     while cur != null
         if name_eq(cur.name, cur.name_len, name, len) == 1
             return cur
@@ -2560,7 +2567,7 @@ const TAGGED_ENUM_FALLBACK_BYTES: i64 = 144
 # Option 1, a generic struct or enum template its parameter count; 0 for a leaf
 # (primitive, concrete struct, pointer to a leaf).  `ptr_` prefixes are
 # skipped: `ptr_Vec$u8` is one argument.
-fn te_component_arity(s: *EmitterState, name: *u8, len: i32) -> i32
+fn te_component_arity(structs: *HashMapI64, m: *Module, name: *u8, len: i32) -> i32
     var p: *u8 = name
     var n: i32 = len
     var k0: i32 = mangled_ref_prefix(p, n)
@@ -2572,7 +2579,7 @@ fn te_component_arity(s: *EmitterState, name: *u8, len: i32) -> i32
         return 2
     if name_eq(p, n, c"Option", 6) == 1
         return 1
-    let st: *StructDef = find_struct(s, p, n)
+    let st: *StructDef = struct_map_find(structs, m, p, n)
     if st == null
         # AGAST #3021: a generic enum template's parameter count, so
         # `Option$Slot$i32` splits into Option's one argument `Slot$i32`.
@@ -2588,16 +2595,16 @@ fn te_component_arity(s: *EmitterState, name: *u8, len: i32) -> i32
 
 # End (exclusive) of the mangled type argument starting at buf[pos]: its
 # first component plus one nested argument per generic parameter.
-fn te_arg_end(s: *EmitterState, buf: *u8, len: i32, pos: i32) -> i32
+fn te_arg_end(structs: *HashMapI64, m: *Module, buf: *u8, len: i32, pos: i32) -> i32
     var end: i32 = pos
     while end < len and *(buf + end) != 36   # '$'
         end = end + 1
-    let arity: i32 = te_component_arity(s, buf + pos, end - pos)
+    let arity: i32 = te_component_arity(structs, m, buf + pos, end - pos)
     var k: i32 = 0
     while k < arity
         if end >= len
             return end
-        end = te_arg_end(s, buf, len, end + 1)
+        end = te_arg_end(structs, m, buf, len, end + 1)
         k = k + 1
     end
 
@@ -2606,6 +2613,10 @@ fn te_arg_end(s: *EmitterState, buf: *u8, len: i32, pos: i32) -> i32
 # a non-tagged name, or a name that does not split into exactly its
 # arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
 pub fn tagged_enum_arg(s: *EmitterState, name: *u8, len: i32, variant: i32, out_len: *i32) -> *u8
+    tagged_enum_arg_in(@s.struct_map, s.module, name, len, variant, out_len)
+
+# tagged_enum_arg over a struct map of `m` (struct_map_find): Sema's too.
+pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name: *u8, len: i32, variant: i32, out_len: *i32) -> *u8
     *out_len = 0
     if name == null or is_tagged_enum_type(name, len) == 0
         return null
@@ -2613,7 +2624,7 @@ pub fn tagged_enum_arg(s: *EmitterState, name: *u8, len: i32, variant: i32, out_
     if start >= len
         return null
     let is_result: i32 = name_eq(name, 6, c"Result", 6)
-    let end0: i32 = te_arg_end(s, name, len, start)
+    let end0: i32 = te_arg_end(structs, m, name, len, start)
     if is_result == 0
         if variant != 0 or end0 != len
             return null
@@ -2622,7 +2633,7 @@ pub fn tagged_enum_arg(s: *EmitterState, name: *u8, len: i32, variant: i32, out_
     if end0 + 1 >= len
         return null
     let e_start: i32 = end0 + 1
-    let e_end: i32 = te_arg_end(s, name, len, e_start)
+    let e_end: i32 = te_arg_end(structs, m, name, len, e_start)
     if e_end != len
         return null
     if variant == 0
@@ -2870,6 +2881,11 @@ pub fn tagged_enum_narrow_int_type(s: *EmitterState, name: *u8, len: i32, varian
 # AGAST #3345: the payload's integer type, i64 / u64 included, else 0.  What
 # the payload binding is to the lossy-conversion check (float_slot.ritz).
 pub fn tagged_enum_int_type(s: *EmitterState, name: *u8, len: i32, variant: i32) -> i32
+    tagged_enum_int_type_in(@s.struct_map, s.module, name, len, variant)
+
+# tagged_enum_int_type over a struct map of `m`: Sema's narrowing check reads
+# a match binding's payload type with it (AGAST #3505).
+pub fn tagged_enum_int_type_in(structs: *HashMapI64, m: *Module, name: *u8, len: i32, variant: i32) -> i32
     var t: i32 = 0
     if is_tagged_enum_type(name, len) == 0
         let uf: *StructField = user_enum_tuple_field(name, len, variant)
@@ -2878,7 +2894,7 @@ pub fn tagged_enum_int_type(s: *EmitterState, name: *u8, len: i32, variant: i32)
         t = uf.field_type
     else
         var c_len: i32 = 0
-        let c: *u8 = tagged_enum_arg(s, name, len, variant, @c_len)
+        let c: *u8 = tagged_enum_arg_in(structs, m, name, len, variant, @c_len)
         if c == null
             return 0
         if name_eq(c, c_len, c"i8", 2) == 1
