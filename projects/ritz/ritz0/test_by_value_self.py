@@ -409,16 +409,12 @@ GENERIC_FREE_CALLS = {
     "type_args": ("^W_bump<i32>(c)", generic_method_free_call("bump", "W", ["T"])),
     "instance": ("W^$i32_bump(c)", DOLLAR_OUTSIDE_ASM),
 }
-# ritz1's side is AGAST #3373.
-RITZ1_GENERIC_FREE_CALL = "#3373"
 
 
 def _generic_free_call_rows():
     for call in sorted(GENERIC_FREE_CALLS):
         for compiler in COMPILERS:
-            marks = [] if compiler == "ritz0" else \
-                [pytest.mark.xfail(strict=True, reason=RITZ1_GENERIC_FREE_CALL)]
-            yield pytest.param(call, compiler, id=f"{call}-{compiler}", marks=marks)
+            yield pytest.param(call, compiler, id=f"{call}-{compiler}")
 
 
 @pytest.mark.parametrize("call,compiler", list(_generic_free_call_rows()))

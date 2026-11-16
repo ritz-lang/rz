@@ -1,0 +1,72 @@
+# ritz1/src/generic_method.ritz - a free call to a generic impl's method
+#
+# AGAST #3373.  LARB R37, LANGUAGE_SPEC §5.4: only a non-generic impl's
+# methods get R10's free name `Type_method`.  A method of `impl<T> W<T>` has
+# none, with or without type args:
+#
+#     impl<T> W<T>
+#         fn bump(self:&)
+#             ...
+#     fn main() -> i32
+#         W_bump(w)        # error: `bump` is a method of generic `W<T>`:
+#                          #        call it as `w.bump()`
+#
+# Refused at the callee in ritz0's words (ref_rules.generic_method_free_call,
+# #3372).  Monomorph keeps the template impls in the module beside their
+# instances (`W$i32`), which aren't generic, and the instance's own name,
+# `W$i32_bump`, can't be written: the lexer refuses its `$` (lexer_nfa).
+# Without this check the template answered `W_bump`, and the call was refused,
+# if at all, for its argument.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import sema
+
+# Report call `e` if it names a generic impl's method by `Type_method`.
+pub fn generic_method_check(sm: *Sema, e: *Expr)
+    if e == null or e.kind != EXPR_CALL or e.func_name_len == 0
+        return
+    # A local fn pointer, or a fn declared with that name, is what it calls.
+    if sema_is_local(sm, e.func_name, e.func_name_len) == 1
+        return
+    if sema_find_fn(sm, e.func_name, e.func_name_len) != null
+        return
+    var ib: *ImplBlock = sm.module.impls
+    while ib != null
+        if ib.type_params != null
+            var m: *FnDef = ib.methods
+            while m != null
+                if impl_method_symbol_eq(ib, m, e.func_name, e.func_name_len) == 1
+                    generic_method_report(sm, e, ib, m)
+                    return
+                m = m.next
+        ib = ib.next
+
+# "`bump` is a method of generic `W<T>`: call it as `w.bump()`", the receiver
+# the type's name in lower case, as ritz0 says it.
+fn generic_method_report(sm: *Sema, e: *Expr, ib: *ImplBlock, m: *FnDef)
+    sema_error_at(sm, e.span.line, e.span.col)
+    eprint_char('`')
+    eprint_bytes(m.name, m.name_len)
+    eprints_cstr(c"` is a method of generic `")
+    eprint_bytes(ib.type_name, ib.type_name_len)
+    eprint_char('<')
+    var tp: *TypeParam = ib.type_params
+    while tp != null
+        eprint_bytes(tp.name, tp.name_len)
+        if tp.next != null
+            eprints_cstr(c", ")
+        tp = tp.next
+    eprints_cstr(c">`: call it as `")
+    for i in 0..ib.type_name_len
+        var ch: u8 = *(ib.type_name + i)
+        if ch >= 'A' and ch <= 'Z'
+            ch = ch + 32
+        eprint_char(ch)
+    eprint_char('.')
+    eprint_bytes(m.name, m.name_len)
+    eprints_cstr(c"()`\n")
