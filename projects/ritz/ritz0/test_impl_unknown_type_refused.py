@@ -13,14 +13,18 @@ those types don't exist without a declaration.  The impl is now a located
 "unknown type `Foo`" at the impl's type name (after `for` in a trait impl)
 on ritz0, ritz1 and ritz1_selfhosted.
 
-A type the module declares (before or after the impl) or imports, or a
-primitive, is known, and its impl is unaffected: the controls below, and
+A type the module declares (before or after the impl) or imports is known,
+and its impl is unaffected: the controls below, and
 every ritzlib/corpus impl, which all target a type their own file declares
 (measured 2026-11-15: 0 sites refused).
 
 A type alias is known but can't be an impl target (LARB R35, #3368): `type
 Id = Foo` then `impl Id` is "`Id` is a type alias for `Foo`: write `impl
 Foo`", at `Id`.
+
+A primitive is known but closed (LARB R36, #3370): `impl u8` and `impl
+Speak for i32` are "`i32` is a built-in type; it can't have an `impl`", at
+the type.
 """
 
 import pytest
@@ -205,14 +209,32 @@ def test_impl_on_known_type_compiles(request, tmp_path, compiler, row):
     assert _run(compiler, tmp_path, row, PRELUDE + COMPILES[row]) == 7
 
 
-# A primitive.  ritz0 only: ritz1 can't parse `impl Speak for i32` (#3288).
-def test_impl_on_primitive_accepted(tmp_path):
-    assert _run("ritz0", tmp_path, "primitive", PRELUDE + """\
-impl Speak for i32
+# A primitive is a built-in type, closed to `impl` (LARB R36, #3288),
+# inherent or trait: located at the type.  ritz0 only: ritz1's half is #3371
+# (ritz1 can't parse `impl Speak for i32` yet).
+PRIMITIVE_ROWS = {
+    "inherent": ("u8", """\
+impl ^u8
+    fn zz(self: @u8) -> i32
+        return 7
+
+pub fn main() -> i32
+    return 0
+"""),
+    "trait": ("i32", """\
+impl Speak for ^i32
     fn say(self: @i32) -> i32
         return *self
 
 pub fn main() -> i32
     let x: i32 = 7
     return x.say()
-""") == 7
+"""),
+}
+
+
+@pytest.mark.parametrize("row", sorted(PRIMITIVE_ROWS))
+def test_impl_on_primitive_refused(tmp_path, row):
+    type_name, program = PRIMITIVE_ROWS[row]
+    _assert_refused("ritz0", tmp_path, f"primitive_{row}", PRELUDE + program,
+                    f"`{type_name}` is a built-in type; it can't have an `impl`")

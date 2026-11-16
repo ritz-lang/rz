@@ -28,6 +28,14 @@ BUILTIN_TYPES = {
 }
 
 
+# The scalars: built-in types closed to `impl`, inherent or trait (LARB R36,
+# AGAST #3370; spec §12.2).  Trait impls on them come back with trait bounds
+# (#1621) and cross-module impls (#3256).  SIMD vectors aren't in R36.
+PRIMITIVES = frozenset({
+    'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'bool',
+})
+
+
 def refusal(type_name: str) -> str:
     return (f"`{type_name}` is a built-in type and can't be extended here: "
             f"import {BUILTIN_TYPES[type_name]} or declare your own type")
@@ -59,7 +67,9 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
     parameters.  Only parsed impls carry `type_span`; one loaded from a module
     interface was checked when its own module compiled.  An impl on a type
     alias of the merged module is "`Id` is a type alias for `Foo`: write
-    `impl Foo`" at the same place (LARB R35).  ritz1 says the same for an
+    `impl Foo`" at the same place (LARB R35), and one on a primitive is
+    "`i32` is a built-in type; it can't have an `impl`" (LARB R36; ritz1's
+    half is #3371).  ritz1 says the same for an
     unknown type (monomorph.ritz, refuse_impls_on_unknown_types); its alias
     refusal is #3369."""
     known = {item.name for item in module.items
@@ -81,6 +91,9 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
             target = type_to_string(aliases[item.type_name])
             errors.append(f"{item.type_span}: `{item.type_name}` is a type alias "
                           f"for `{target}`: write `impl {target}`")
+        elif item.type_name in PRIMITIVES:
+            errors.append(f"{item.type_span}: `{item.type_name}` is a built-in "
+                          f"type; it can't have an `impl`")
         elif item.type_name not in known:
             errors.append(f"{item.type_span}: unknown type `{item.type_name}`")
     return errors
