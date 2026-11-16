@@ -49,6 +49,7 @@ LOCAL_MODULES = {
     "check_no_s_strings",
     "check_test_tempdirs",
     "check_test_budget",
+    "example_tests",
     "exec_tmpdir",
     "likely_tests",
     "ritz1_arch",

@@ -78,6 +78,16 @@ tools-unit:
 	@echo "=== Running tools/ unit tests (-n $(PYTEST_J)) ==="
 	@$(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup tools/
 
+# Every examples/**/test/*.ritz [[test]] suite, with ritz0 (AGAST #3729).
+# rz.toml keeps examples out of `rz test --all`, and regression.sh runs each
+# example's test.sh but never its test/*.ritz, so until this target nothing
+# ran them. Fails on an unlisted failure, on a stale KNOWN_FAILING entry, and
+# if fewer files ran than exist on disk. See tools/example_tests.py.
+.PHONY: example-tests
+example-tests:
+	@echo "=== Running example [[test]] suites ==="
+	@$(PYTHON) tools/example_tests.py
+
 # Self-tests for scripts/regression.sh's own logic. Same problem as tools-unit
 # above, one layer down: scripts/test-regression-stage5.sh existed since the
 # Stage 5 work and was wired into NOTHING — not make, not CI. A test that never
