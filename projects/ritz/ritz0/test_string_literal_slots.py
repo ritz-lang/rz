@@ -365,6 +365,19 @@ REJECTED.update({
                         4, 5, "`t` is declared `Span$u8` but its initialiser is a `String`"),
 })
 
+# AGAST #3580: StrView is built in, so the rule can't lean on ritzlib.strview.
+# Without it ritz0 typed the literal as a bare `{ ptr, len }`, which no struct
+# check could name: it compiled a fn main doesn't call, and crashed ("Cannot
+# determine struct type for value", no location) on one it does. No _PRELUDE,
+# and a test of their own so no batch lends them the import.
+# name -> (source, line, col, message)
+NO_IMPORT_REJECTED = {
+    "strview_span_uncalled": (_fn("", 'let v: StrView = "abc"\nlet s: Span<u8> = v\n0'),
+                              3, 5, _DECLARED),
+    "strview_span_main": ('fn main() -> i32\n    let v: StrView = "abc"\n'
+                          "    let s: Span<u8> = v\n    s.len as i32\n", 3, 5, _DECLARED),
+}
+
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
 # no tuple type and no `await`.
 RITZ0_ACCEPTED = {
@@ -392,10 +405,10 @@ def _emit(compiler, src, ll, work, roots):
                           env=env, capture_output=True, text=True, timeout=300)
 
 
-def _compile(request, compiler, tmp_path, source):
+def _compile(request, compiler, tmp_path, source, prelude=_PRELUDE):
     batching.per_row()  # AGAST #2806
     src = tmp_path / "unit.ritz"
-    src.write_text(_PRELUDE + source)
+    src.write_text(prelude + source)
     ll = tmp_path / "unit.ll"
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
@@ -425,16 +438,17 @@ def _batch_compile(compiler, src, work):
     return proc.returncode, proc.stdout + proc.stderr
 
 
-def _refusal(request, compiler, tmp_path, source, line, col):
+def _refusal(request, compiler, tmp_path, source, line, col, prelude=_PRELUDE):
     """(returncode, output, "line:col" to look for): batched if it can be (AGAST #2806)."""
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-    got = batching.refused(compiler, _PRELUDE + source, _batch_compile, at=(line + 1, col),
+    at = (line + prelude.count("\n"), col)
+    got = batching.refused(compiler, prelude + source, _batch_compile, at=at,
                            filename="unit.ritz")
     if got is not None:
         return 1, got[0], got[1]
-    proc, _ = _compile(request, compiler, tmp_path, source)
-    return proc.returncode, proc.stdout + proc.stderr, f"{line + 1}:{col}"
+    proc, _ = _compile(request, compiler, tmp_path, source, prelude)
+    return proc.returncode, proc.stdout + proc.stderr, f"{at[0]}:{col}"
 
 
 def _assert_runs(request, compiler, tmp_path, name, source, code):
@@ -459,6 +473,17 @@ def _assert_runs(request, compiler, tmp_path, name, source, code):
 def test_what_does_not_fit_is_a_located_error(request, tmp_path, compiler, name):
     source, line, col, message = REJECTED[name]
     code, output, where = _refusal(request, compiler, tmp_path, source, line, col)
+    assert code != 0, f"{compiler} accepted it:\n{output}"
+    assert message in output, output
+    assert re.search(rf"unit\.ritz:{where}\b", output), output
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(NO_IMPORT_REJECTED))
+def test_a_strview_is_refused_without_its_import(request, tmp_path, compiler, name):
+    source, line, col, message = NO_IMPORT_REJECTED[name]
+    code, output, where = _refusal(request, compiler, tmp_path, source, line, col, prelude="")
     assert code != 0, f"{compiler} accepted it:\n{output}"
     assert message in output, output
     assert re.search(rf"unit\.ritz:{where}\b", output), output

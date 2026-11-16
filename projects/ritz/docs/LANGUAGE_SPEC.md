@@ -1021,15 +1021,9 @@ fn main() -> i32
 Only the literal converts. A `StrView` value is refused (AGAST #3441), and so
 is a `c"..."` literal, which is a bare `*u8` with no length (AGAST #3440), and a `String`:
 
-```ritz expect-error="its initialiser is a `StrView`"
-import ritzlib.strview
-
-fn first(v: StrView) -> i64
-    let s: Span<u8> = v
-    s.len
-
-fn main() -> i32
-    0
+```ritz body expect-error="its initialiser is a `StrView`"
+let v: StrView = "abc"
+let s: Span<u8> = v
 ```
 
 ```ritz body expect-error='a `c"..."` literal is a `*u8`, not a `Span<u8>`'

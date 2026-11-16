@@ -1917,12 +1917,11 @@ class LLVMEmitter:
         if expr.as_span:
             # A `Span<u8>` slot (AGAST #3353), registered StrView or not.
             strview_type = self._u8_span_struct(expr.span)
-        elif "StrView" in self.struct_types:
-            strview_type = self.struct_types["StrView"]
         else:
-            # Create inline literal struct type if StrView not defined
-            # This allows string literals to work without importing ritzlib.strview
-            strview_type = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+            # StrView is built in: without ritzlib.strview, the built-in one
+            # (AGAST #3580). A bare `{ ptr, len }` here had no struct name, so
+            # `let s: Span<u8> = v` from a `v: StrView` slipped every check.
+            strview_type = self._ensure_strview_type()
 
         # Build the StrView struct value
         sv = self.builder.insert_value(ir.Constant(strview_type, ir.Undefined), ptr, 0)
