@@ -9053,10 +9053,10 @@ class LLVMEmitter:
 
         elif isinstance(expr, rast.QualifiedIdent):
             # AGAST #2591: `::` is not Ritz syntax (LANGUAGE_SPEC §10.2, §15.3).
-            # The parser still builds a QualifiedIdent so this can say so; the
-            # only one lowered is `alias::item` under `import ... as alias`
-            # (ImportResolver rewrites it to `item`, AGAST #1624). Any other
-            # reaching here is a source error, not a missing emitter case.
+            # The parser still builds a QualifiedIdent so this can say so.
+            # Nothing lowers one, not even `alias::item` under `import ... as
+            # alias` (AGAST #1624), so every one reaching here is a source
+            # error, not a missing emitter case.
             raise EmitError(qualified_access_removed(expr), expr.span)
 
         else:

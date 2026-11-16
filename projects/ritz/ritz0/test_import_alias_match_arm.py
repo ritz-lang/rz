@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """An `import M as A` alias must not crash on a single-expression match arm.
 
-Found by AGAST #1472. ImportResolver rewrites `A.f(...)` to `f(...)` in every
-module a program with an alias import reaches, and it walked each match arm's
-body with _transform_block, which assumes a Block. A body such as `Some(_) => 1`
+Found by AGAST #1472. ImportResolver used to rewrite `A::f(...)` to `f(...)` in
+every module a program with an alias import reaches, and it walked each match
+arm's body with _transform_block, which assumes a Block. A body such as `Some(_) => 1`
 is an IntLit, so ritz0 died with
 
     AttributeError: 'IntLit' object has no attribute 'stmts'
@@ -11,6 +11,10 @@ is an IntLit, so ritz0 died with
 before emitting anything. ritzlib/option.ritz is written in that style, so
 `import ritzlib.sys as sys` plus anything that reaches ritzlib.option (after
 #1472 that includes ritzlib.io, through strview) failed to compile.
+
+AGAST #1624 deleted that rewrite (`::` was removed in RERITZ, so `A::f(...)` is
+now refused: test_qualified_access_removed.py). These keep an alias import
+beside expression-arm bodies compiling.
 """
 
 import hashlib
@@ -104,22 +108,6 @@ def test_alias_import_with_expression_arms_in_an_imported_module(tmp_path):
     ))
     assert "has no attribute 'stmts'" not in result.stderr + result.stdout
     assert result.returncode == 7, result.stderr + result.stdout
-
-
-@pytest.mark.integration
-def test_alias_call_inside_an_expression_arm_is_resolved(tmp_path):
-    # `s::isdigit(c) + 10` is an expression arm calling through the alias: it
-    # must be rewritten to `isdigit`, not merely left alone.
-    result = _run(tmp_path, (
-        "import ritzlib.str as s\n"
-        "\n"
-        "fn main() -> i32\n"
-        "    let c: u8 = 55\n"
-        "    match c\n"
-        "        55 => s::isdigit(c) + 10\n"
-        "        _ => 20\n"
-    ))
-    _assert_exit(result, 11)
 
 
 # --- Wrong-exit forensics (AGAST #2251) ---------------------------------------

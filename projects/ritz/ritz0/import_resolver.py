@@ -23,7 +23,6 @@ Metadata caching:
 
 from pathlib import Path, PurePath
 from typing import Set, Dict, Iterable, Optional, List
-from dataclasses import replace
 import os
 import ritz_ast as rast
 import module_interface
@@ -524,190 +523,6 @@ class ImportResolver:
 
         return exports.get_export(name)
 
-    def _transform_qualified_idents(self, module: rast.Module, source_path: str) -> rast.Module:
-        """Transform QualifiedIdent nodes to regular Ident nodes.
-
-        Walks the AST and replaces `sys::write` with `write` after verifying
-        that `sys` is a registered alias. This desugars qualified imports to
-        allow the emitter to work with simple Ident nodes.
-
-        Issue #99: Qualified import name resolution not implemented
-        """
-        source_path = str(Path(source_path).resolve())
-        aliases = self.import_aliases.get(source_path, {})
-
-        if not aliases:
-            # No aliases registered for this file - no transformation needed
-            return module
-
-        # Walk and transform items
-        transformed_items = []
-        for item in module.items:
-            transformed_items.append(self._transform_item(item, aliases))
-
-        return rast.Module(module.span, transformed_items)
-
-    def _transform_item(self, item: rast.Item, aliases: Dict[str, str]) -> rast.Item:
-        """Transform QualifiedIdent nodes in an item."""
-        # Helper to preserve source_file attribute through replace()
-        def copy_source_file(old_item: rast.Item, new_item: rast.Item) -> rast.Item:
-            source_file = getattr(old_item, 'source_file', None)
-            if source_file is not None:
-                new_item.source_file = source_file
-            return new_item
-
-        if isinstance(item, rast.FnDef):
-            if item.body:
-                new_body = self._transform_block(item.body, aliases)
-                return copy_source_file(item, replace(item, body=new_body))
-            return item
-        elif isinstance(item, rast.ImplBlock):
-            # Transform method bodies
-            new_methods = []
-            for method in item.methods:
-                if method.body:
-                    new_body = self._transform_block(method.body, aliases)
-                    new_method = copy_source_file(method, replace(method, body=new_body))
-                    new_methods.append(new_method)
-                else:
-                    new_methods.append(method)
-            return copy_source_file(item, replace(item, methods=new_methods))
-        elif isinstance(item, rast.ConstDef):
-            if item.value:
-                new_value = self._transform_expr(item.value, aliases)
-                return copy_source_file(item, replace(item, value=new_value))
-            return item
-        elif isinstance(item, rast.VarDef):
-            if item.value:
-                new_value = self._transform_expr(item.value, aliases)
-                return copy_source_file(item, replace(item, value=new_value))
-            return item
-        # Other items don't contain expressions that need transformation
-        return item
-
-    def _transform_block(self, block: rast.Block, aliases: Dict[str, str]) -> rast.Block:
-        """Transform expressions in a block."""
-        new_stmts = [self._transform_stmt(stmt, aliases) for stmt in block.stmts]
-        new_expr = self._transform_expr(block.expr, aliases) if block.expr else None
-        return replace(block, stmts=new_stmts, expr=new_expr)
-
-    def _transform_stmt(self, stmt: rast.Stmt, aliases: Dict[str, str]) -> rast.Stmt:
-        """Transform expressions in a statement."""
-        if isinstance(stmt, rast.LetStmt):
-            if stmt.value:
-                new_value = self._transform_expr(stmt.value, aliases)
-                return replace(stmt, value=new_value)
-            return stmt
-        elif isinstance(stmt, rast.VarStmt):
-            if stmt.value:
-                new_value = self._transform_expr(stmt.value, aliases)
-                return replace(stmt, value=new_value)
-            return stmt
-        elif isinstance(stmt, rast.AssignStmt):
-            new_target = self._transform_expr(stmt.target, aliases)
-            new_value = self._transform_expr(stmt.value, aliases)
-            return replace(stmt, target=new_target, value=new_value)
-        elif isinstance(stmt, rast.ExprStmt):
-            new_expr = self._transform_expr(stmt.expr, aliases)
-            return replace(stmt, expr=new_expr)
-        elif isinstance(stmt, rast.ReturnStmt):
-            if stmt.value:
-                new_value = self._transform_expr(stmt.value, aliases)
-                return replace(stmt, value=new_value)
-            return stmt
-        elif isinstance(stmt, rast.WhileStmt):
-            new_cond = self._transform_expr(stmt.cond, aliases)
-            new_body = self._transform_block(stmt.body, aliases)
-            return replace(stmt, cond=new_cond, body=new_body)
-        elif isinstance(stmt, rast.DeferStmt):
-            return replace(stmt, body=self._transform_block(stmt.body, aliases))
-        elif isinstance(stmt, rast.ForStmt):
-            new_iter = self._transform_expr(stmt.iter, aliases)
-            new_body = self._transform_block(stmt.body, aliases)
-            return replace(stmt, iter=new_iter, body=new_body)
-        return stmt
-
-    def _transform_expr(self, expr: rast.Expr, aliases: Dict[str, str]) -> rast.Expr:
-        """Transform QualifiedIdent and recursively transform sub-expressions."""
-        if expr is None:
-            return None
-
-        # KEY TRANSFORMATION: QualifiedIdent -> Ident
-        if isinstance(expr, rast.QualifiedIdent):
-            if expr.qualifier in aliases:
-                # Transform sys::write -> write
-                return rast.Ident(expr.span, expr.name)
-            # Not an alias: leave it. The emitter reports every QualifiedIdent
-            # nothing lowered, with its location (AGAST #2591); this used to
-            # raise `RitzImportError`, a name this module never defined.
-            return expr
-
-        # Recursively transform sub-expressions using replace()
-        if isinstance(expr, rast.BinOp):
-            new_left = self._transform_expr(expr.left, aliases)
-            new_right = self._transform_expr(expr.right, aliases)
-            return replace(expr, left=new_left, right=new_right)
-        elif isinstance(expr, rast.UnaryOp):
-            new_operand = self._transform_expr(expr.operand, aliases)
-            return replace(expr, operand=new_operand)
-        elif isinstance(expr, rast.Call):
-            new_func = self._transform_expr(expr.func, aliases)
-            new_args = [self._transform_expr(arg, aliases) for arg in expr.args]
-            return replace(expr, func=new_func, args=new_args)
-        elif isinstance(expr, rast.Index):
-            new_base = self._transform_expr(expr.expr, aliases)
-            new_index = self._transform_expr(expr.index, aliases)
-            return replace(expr, expr=new_base, index=new_index)
-        elif isinstance(expr, rast.Field):
-            new_base = self._transform_expr(expr.expr, aliases)
-            return replace(expr, expr=new_base)
-        elif isinstance(expr, rast.If):
-            new_cond = self._transform_expr(expr.cond, aliases)
-            new_then = self._transform_block(expr.then_block, aliases)
-            new_else = self._transform_block(expr.else_block, aliases) if expr.else_block else None
-            return replace(expr, cond=new_cond, then_block=new_then, else_block=new_else)
-        elif isinstance(expr, rast.Match):
-            new_match_expr = self._transform_expr(expr.expr, aliases)
-            new_arms = []
-            for arm in expr.arms:
-                # An arm body is any Expr: a Block only for an indented arm,
-                # otherwise e.g. `Some(_) => 1`. _transform_expr handles both.
-                new_body = self._transform_expr(arm.body, aliases)
-                new_arms.append(replace(arm, body=new_body))
-            return replace(expr, expr=new_match_expr, arms=new_arms)
-        elif isinstance(expr, rast.Cast):
-            new_inner = self._transform_expr(expr.expr, aliases)
-            return replace(expr, expr=new_inner)
-        elif isinstance(expr, rast.StructLit):
-            new_fields = [(name, self._transform_expr(val, aliases)) for name, val in expr.fields]
-            return replace(expr, fields=new_fields)
-        elif isinstance(expr, rast.ArrayLit):
-            new_elements = [self._transform_expr(elem, aliases) for elem in expr.elements]
-            return replace(expr, elements=new_elements)
-        elif isinstance(expr, rast.ArrayFill):
-            new_value = self._transform_expr(expr.value, aliases)
-            return replace(expr, value=new_value)
-        elif isinstance(expr, rast.Block):
-            return self._transform_block(expr, aliases)
-        elif isinstance(expr, rast.TryOp):
-            new_inner = self._transform_expr(expr.expr, aliases)
-            return replace(expr, expr=new_inner)
-        elif isinstance(expr, rast.Await):
-            new_inner = self._transform_expr(expr.expr, aliases)
-            return replace(expr, expr=new_inner)
-        elif isinstance(expr, rast.SliceExpr):
-            new_base = self._transform_expr(expr.expr, aliases)
-            new_start = self._transform_expr(expr.start, aliases) if expr.start else None
-            new_end = self._transform_expr(expr.end, aliases) if expr.end else None
-            return replace(expr, expr=new_base, start=new_start, end=new_end)
-        elif isinstance(expr, rast.Range):
-            new_start = self._transform_expr(expr.start, aliases) if expr.start else None
-            new_end = self._transform_expr(expr.end, aliases) if expr.end else None
-            return replace(expr, start=new_start, end=new_end)
-
-        # Leaf expressions that don't contain sub-expressions
-        return expr
-
     def _process_re_exports(
         self,
         module: rast.Module,
@@ -810,9 +625,9 @@ class ImportResolver:
 
         result = rast.Module(module.span, merged_items)
 
-        # Transform QualifiedIdent nodes to regular Ident nodes (Issue #99)
-        # e.g., sys::write -> write (after verifying sys alias is valid)
-        result = self._transform_qualified_idents(result, source_path)
+        # `alias::item` is left as a QualifiedIdent: `::` was removed in RERITZ
+        # (LANGUAGE_SPEC §15.3), and the emitter refuses every one with its
+        # location. This used to rewrite it to `item` (Issue #99; AGAST #1624).
 
         # Extract and cache metadata for the main module
         # IMPORTANT: Extract from original `module` (has Import nodes) not `result` (merged)

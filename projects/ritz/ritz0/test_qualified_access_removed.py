@@ -14,9 +14,11 @@ reached `raise RitzImportError(...)` in import_resolver.py, a name that module
 never defines, so that path died with a `NameError` instead.
 
 Both are now one `file:line:column` diagnostic from ritz0, and all three
-compilers refuse the program. Whether an *aliased* `alias::item` should keep
-working is AGAST #1624's decision, not this ticket's. ritz0 still resolves it,
-so that is pinned here only so this change can't move it by accident.
+compilers refuse the program.
+
+AGAST #1624: an *aliased* `alias::item` (`import pkg.aa as aa` then `aa::f()`)
+is refused too. ritz0's ImportResolver used to rewrite it to `f()`, the one
+`::` form that still compiled, though the spec removed it and ritz1 refused it.
 """
 
 import os
@@ -45,6 +47,10 @@ REJECTED = {
     "plain_import": (
         "import pkg.aa\n\nfn main() -> i32\n    aa::f()\n", "aa::f", "4:5"),
     # An alias exists in the file, but not this one (was a NameError).
+    # AGAST #1624: the qualifier IS an `import ... as` alias. ritz0 used to
+    # rewrite this to `f()` and compile it.
+    "aliased_import": (
+        "import pkg.aa as aa\n\nfn main() -> i32\n    aa::f()\n", "aa::f", "4:5"),
     "unknown_qualifier_beside_alias": (
         "import pkg.aa as aa\n\nfn main() -> i32\n    zz::f()\n", "zz::f", "4:5"),
     # The spec's own example: an enum variant written the pre-RERITZ way.
@@ -105,10 +111,3 @@ def test_ritz1_spaced_colons_are_not_called_qualified_access(ritz1_bin, tmp_path
     assert "removed in RERITZ" not in out, out
     assert "main.ritz:5:18: error: unexpected ':'" in out, out
 
-
-def test_ritz0_aliased_qualified_call_is_unchanged(tmp_path):
-    """AGAST #1624 owns `alias::item`; ritz0 still lowers it to `item`."""
-    main = "import pkg.aa as aa\n\nfn main() -> i32\n    aa::f()\n"
-    proc, out, ll = _compile("ritz0", None, tmp_path, "alias", main)
-    assert proc.returncode == 0, out
-    assert "call i32 @f()" in ll.read_text() or "@\"f\"" in ll.read_text(), ll.read_text()

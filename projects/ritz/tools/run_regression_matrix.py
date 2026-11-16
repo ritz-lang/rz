@@ -71,8 +71,6 @@ _RITZ1_TWINS = {
     "test_issue_struct_enum_variants":
         "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
         "patterns",
-    "test_issue99":
-        "AGAST #1624 — `alias::item` calls, removed from the spec; ritz0 is the outlier",
     # --- codegen, runtime failures ---
 }
 
