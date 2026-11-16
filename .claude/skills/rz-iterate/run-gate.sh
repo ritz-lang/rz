@@ -8,7 +8,8 @@
 #   run-gate.sh --wait <log>           block until it ends; exit with its code
 #
 # Env overrides:
-#   RZ_GATE_CMD    command run from <worktree>   (default: clean ci-local)
+#   RZ_GATE_CMD    command run from a checkout of <worktree>'s HEAD
+#                                                (default: clean ci-local)
 #   RZ_GATE_SLOTS  gates allowed at once         (default: host.env, else 1)
 #   RZ_HOST_ENV    per-host config file          (default: ~/.config/rz/host.env)
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
@@ -84,6 +85,21 @@
 #     random.  The script goes to <log minus .log>.unit.sh, which the unit
 #     deletes as it starts; --setenv values are not expanded, so the env
 #     carries the rest.  Tests: test-run-gate-systemd.sh (real systemd-run).
+#   * a checkout of the SHA, not the room's worktree (AGAST #3559): #3455's
+#     tools/smoke_stack/core.py matched .gitignore's `core.*`, so it sat
+#     untracked in the room's worktree, the gate there passed, and the SHA
+#     it vouched for failed the train with ModuleNotFoundError.  So once it
+#     has a slot the unit runs `git worktree add --detach
+#     <gate dir>/.trees/<unit> <sha>`, runs the command there, and removes
+#     the checkout on exit (trap; a run killed outright leaves one that the
+#     unit's next run clears).  The
+#     build caches that matter are outside the tree (the CAS in
+#     ~/.cache/ritz), and the gate wipes ritz1/build anyway, so the checkout
+#     costs about a second.  The log lists the worktree's ignored or
+#     untracked sources (*.py, *.ritz, *.toml, Makefile; build dirs left
+#     out) as "NOT IN COMMIT <file> (ignored: <rule>)", so a failure on a
+#     missing file names it; --wait prints them.  Those lines fail nothing.
+#     A HEAD move in the worktree or the checkout still voids the result.
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -109,6 +125,8 @@ if [[ "${1:-}" == "--wait" ]]; then
         sleep 15
     done
     rc="$(sed -n 's/^EXIT=//p' "$LOG" | tail -1)"
+    # First, apart from the tail below: they come before any of the output.
+    grep '^NOT IN COMMIT ' "$LOG" || true
     grep -E '^(SHA|SLOT|EXIT)=|Stage [0-9]:|passed|FATAL|Failed build|SETUP ERROR|step\(s\) failed|^PKG ' "$LOG" | tail -20
     exit "$rc"
 fi
@@ -169,6 +187,29 @@ while :; do
     n=$((n + 1))
 done
 printf 'UNIT=%s\nSHA=%s\nCMD=%s\n' "$UNIT" "$SHA" "$CMD" >> "$LOG"
+
+# Source files the room's worktree has and the commit doesn't (AGAST #3559).
+# The gate can't see them (it runs on a checkout of the SHA), so a gate that
+# fails on a missing import says why: "NOT IN COMMIT <file> (ignored: <rule>)".
+# Informational: a scratch file the commit doesn't need fails nothing.
+not_in_commit() {
+    local src=('*.py' '*.ritz' '*.toml' '*Makefile') skip f how n=0
+    # Build output and caches: never source, and never meant to be committed.
+    skip='(build|\.ritz-cache[^/]*|__pycache__|\.regression|\.pytest_cache|\.venv|venv|node_modules)'
+    {
+        git -C "$WT" ls-files --others --exclude-standard -- "${src[@]}" | sed 's/^/U /'
+        git -C "$WT" ls-files --others --ignored --exclude-standard -- "${src[@]}" | sed 's/^/I /'
+    } | grep -Ev "^. (.*/)?$skip/" | while read -r how f; do
+        n=$((n + 1))
+        if [[ $n -gt 20 ]]; then echo "NOT IN COMMIT ... (more; see git status --ignored)"; break; fi
+        if [[ $how == U ]]; then
+            echo "NOT IN COMMIT $f (untracked)"
+        else
+            echo "NOT IN COMMIT $f (ignored: $(git -C "$WT" check-ignore -v -- "$f" | cut -f1))"
+        fi
+    done
+}
+not_in_commit >> "$LOG" 2>/dev/null || true
 
 # The inner script reads everything from the environment, so nothing here
 # needs a second layer of quoting.
@@ -239,7 +280,14 @@ ahead() {
     qunlock
     echo "$n"
 }
-trap 'dequeue; unmark' EXIT
+# The gate's own checkout of RZ_SHA (AGAST #3559; see the header).  untree
+# also clears one a killed run left behind: same unit, same path.
+untree() {
+    git worktree remove --force "$RZ_TREE" >/dev/null 2>&1
+    rm -rf "$RZ_TREE"
+    git worktree prune
+}
+trap 'dequeue; unmark; untree' EXIT
 # Fail fast if the unit can't write: otherwise the slot loop below spins
 # forever and never writes a verdict.  (Seen: an agent sandbox's /tmp is not
 # the /tmp systemd units see.)  The unit ends with no EXIT line; --wait -> 98.
@@ -276,11 +324,25 @@ done
 dequeue
 unmark
 echo "SLOT=$s START $(date -Is)" >> "$RZ_LOG"
-bash -c "$RZ_CMD" >> "$RZ_LOG" 2>&1
-rc=$?
+untree
+t0=$(date +%s)
+if mkdir -p "$(dirname "$RZ_TREE")" \
+        && git worktree add -q --detach "$RZ_TREE" "$RZ_SHA" >> "$RZ_LOG" 2>&1; then
+    echo "TREE=$RZ_TREE checked out in $(( $(date +%s) - t0 )) s" >> "$RZ_LOG"
+    (cd "$RZ_TREE" && bash -c "$RZ_CMD") >> "$RZ_LOG" 2>&1
+    rc=$?
+    tree_now="$(git -C "$RZ_TREE" rev-parse HEAD)"
+else
+    echo "SETUP ERROR: could not check out $RZ_SHA into $RZ_TREE" >> "$RZ_LOG"
+    rc=2
+    tree_now="$RZ_SHA"
+fi
 now="$(git rev-parse HEAD)"
 if [ "$now" != "$RZ_SHA" ]; then
     echo "HEAD MOVED during the gate: $RZ_SHA -> $now; result void" >> "$RZ_LOG"
+    rc=99
+elif [ "$tree_now" != "$RZ_SHA" ]; then
+    echo "HEAD MOVED in the gate's checkout: $RZ_SHA -> $tree_now; result void" >> "$RZ_LOG"
     rc=99
 fi
 # A train gate reserves the slot for the next train before it releases it
@@ -304,6 +366,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \
+    --setenv=RZ_TREE="$GATES/.trees/$UNIT" \
     /bin/bash "$SCRIPT"
 
 echo "$LOG"

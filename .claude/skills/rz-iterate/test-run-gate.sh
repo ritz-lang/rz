@@ -276,6 +276,58 @@ rm -f "$RES"
 RZ_GATE_CMD='exit 1' gate "$W" r2room >/dev/null
 check '[[ ! -e "$RES" ]]' "a room gate's end doesn't reserve the slot"
 
+# 15. AGAST #3559: the gate tests the commit, not the worktree.  #3455's
+# smoke_stack/core.py matched .gitignore's `core.*`, sat untracked in the
+# room's worktree, and the gate passed a SHA that was missing it.  Here
+# main.py imports helper.py, which .gitignore ignores, so only the worktree
+# has it.
+V="$T/wt15"
+git init -q "$V"
+printf 'helper.py\n' > "$V/.gitignore"
+printf 'import helper\nprint(helper.X)\n' > "$V/main.py"
+printf 'X = "from helper"\n' > "$V/helper.py"
+printf 'scratch\n' > "$V/notes.ritz"   # untracked, not ignored
+git -C "$V" add .gitignore main.py; git -C "$V" commit -qm "helper is ignored"
+l15="$(RZ_GATE_CMD='python3 -B main.py' gate "$V" t15a)"
+check 'grep -qx EXIT=1 "$l15"' "a commit missing an ignored module it imports fails the gate ($(grep '^EXIT=' "$l15"))"
+check 'grep -q "No module named .helper." "$l15"' "the failure is the missing module, as CI would see it"
+check 'grep -q "^NOT IN COMMIT helper.py (ignored: .gitignore:1:helper.py)" "$l15"' "the log names the ignored file and the rule that hides it"
+check 'grep -q "^NOT IN COMMIT notes.ritz (untracked)" "$l15"' "the log names an untracked source file too"
+gate --wait "$l15" > "$T/wait15" 2>&1
+check 'grep -q "^NOT IN COMMIT helper.py" "$T/wait15"' "--wait prints the NOT IN COMMIT lines"
+check '[[ "$(git -C "$V" worktree list | wc -l)" -eq 1 ]]' "the gate's checkout is removed after the gate"
+check '[[ -z "$(ls -A "$RZ_GATE_DIR/.trees" 2>/dev/null)" ]]' "no checkout dir is left in the gate dir"
+# The same tree, with helper.py committed: passes, from a checkout of the SHA.
+git -C "$V" add -f helper.py; git -C "$V" commit -qm "commit helper"
+S15="$(git -C "$V" rev-parse HEAD)"
+l15="$(RZ_GATE_CMD='python3 -B main.py && pwd -P > "$RZ_TEST_ORDER.pwd" && git rev-parse HEAD > "$RZ_TEST_ORDER.head"' gate "$V" t15b)"
+check 'grep -qx EXIT=0 "$l15" && grep -qx "from helper" "$l15"' "the same code with the module committed passes"
+check '! grep -q "^NOT IN COMMIT helper.py" "$l15"' "a committed file is not reported"
+check '[[ "$(cat "$RZ_TEST_ORDER.pwd")" != "$(cd "$V" && pwd -P)" ]]' "the command ran outside the room's worktree"
+check '[[ "$(cat "$RZ_TEST_ORDER.head")" == "$S15" ]]' "the command ran on a checkout of the gated SHA"
+# Section 4's commit moves the checkout's HEAD; one in the room's worktree
+# during the gate still voids it too.
+l15="$(RZ_GATE_CMD="git -C '$V' commit --allow-empty -qm move" gate "$V" t15m)"
+gate --wait "$l15" >/dev/null 2>&1; rc=$?
+check '[[ $rc -eq 99 ]] && grep -q "^HEAD MOVED during the gate" "$l15"' "--wait exits 99 when the room's HEAD moved, got $rc"
+git -C "$V" reset -q --hard "$S15"
+# A checkout left by a unit killed outright (no trap) doesn't block the next gate.
+mkdir -p "$RZ_GATE_DIR/.trees/ritz-gate-t15c/stale"
+l15="$(RZ_GATE_CMD='test ! -e stale' gate "$V" t15c)"
+check 'grep -qx EXIT=0 "$l15"' "a stale checkout from a killed gate is replaced ($(grep '^EXIT=' "$l15"))"
+check '[[ ! -e "$RZ_GATE_DIR/.trees/ritz-gate-t15c" ]]' "and removed afterwards"
+
+# 16. The repo's .gitignore ignores core dumps, not sources named core
+# (AGAST #3559: `core.*` hid smoke_stack/core.py from #3455's commit).
+R="$(git -C "$HERE" rev-parse --show-toplevel)"
+ign() { git -C "$R" check-ignore -q --no-index -- "$1"; }
+for p in core projects/x/core core.1234 projects/x/core.98765; do
+    check 'ign "$p"' ".gitignore ignores the core dump $p"
+done
+for p in projects/ritz/tools/smoke_stack/core.py projects/x/core.ritz projects/x/core.toml projects/x/core/mod.ritz; do
+    check '! ign "$p"' ".gitignore doesn't ignore the source $p"
+done
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1
