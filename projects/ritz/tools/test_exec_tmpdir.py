@@ -3,8 +3,9 @@ temp dir even when /tmp is mounted noexec (AGAST #3704).
 
 A room can't mount a noexec tmpfs, so the probe's "can't run it" path is
 driven by an injected exec function that raises EACCES as a noexec mount
-does -- plus, where the host has one (/run/user/<uid> on many systemd hosts),
-a real writable noexec mount.
+does -- plus, where the host has one (/dev/shm, /run/user/<uid> or a noexec
+/tmp), a real noexec mount this user can write to.  Hosts with none (a GitHub
+runner's are /sys and /proc, which it can't write) skip those two tests.
 
 Run: python3 -m pytest projects/ritz/tools/test_exec_tmpdir.py -q
 """
@@ -14,6 +15,7 @@ from __future__ import annotations
 import errno
 import io
 import os
+import stat
 import subprocess
 import sys
 import tempfile
@@ -43,19 +45,58 @@ def noexec_in(bad: Path):
     return run
 
 
-def writable_noexec_mount() -> Path | None:
+# Where to look first: mounts a user can normally write to.  On bangerang
+# /dev/shm and /tmp are both noexec; on a GitHub runner the first noexec mount
+# in the table is /sys/fs/pstore, which the runner user can't even stat into.
+PREFERRED_MOUNTS = ("/dev/shm", f"/run/user/{os.getuid()}", "/tmp")
+
+
+def _preferred_first(points: list[str]) -> list[str]:
+    rank = {p: i for i, p in enumerate(PREFERRED_MOUNTS)}
+    return sorted(points, key=lambda p: rank.get(p, len(rank)))
+
+
+def _can_write_in(d: Path) -> bool:
+    """Really create (and remove) a dir in `d`: os.access and is_dir() can't be
+    trusted on /sys and friends, and Path.is_dir() raises EACCES on 3.12."""
     try:
-        lines = Path("/proc/mounts").read_text().splitlines()
+        with tempfile.TemporaryDirectory(prefix="noexec_find_", dir=d):
+            pass
+    except OSError:
+        return False
+    return True
+
+
+def writable_noexec_mount(mounts: str | os.PathLike = "/proc/mounts") -> Path | None:
+    """A dir on a rw,noexec mount this process can write to, else None.
+    Never raises: an unreadable mount table or mount point is just skipped."""
+    try:
+        lines = Path(mounts).read_text().splitlines()
     except OSError:
         return None
+    points = []
     for line in lines:
         parts = line.split()
-        if len(parts) < 4 or "noexec" not in parts[3].split(",") or "rw" not in parts[3].split(","):
+        if len(parts) < 4:
             continue
-        for cand in (Path(parts[1]) / str(os.getuid()), Path(parts[1])):
-            if cand.is_dir() and os.access(cand, os.W_OK | os.X_OK):
+        opts = parts[3].split(",")
+        if "noexec" in opts and "rw" in opts:
+            points.append(parts[1])
+    for point in _preferred_first(points):
+        for cand in (Path(point) / str(os.getuid()), Path(point)):
+            if _can_write_in(cand):
                 return cand
     return None
+
+
+@pytest.fixture
+def noexec_mount() -> Path:
+    mnt = writable_noexec_mount()
+    if mnt is None:
+        pytest.skip("no writable noexec mount on this host (none in /proc/mounts "
+                    "that this user can create a dir in); the stub-based probe "
+                    "tests cover the logic")
+    return mnt
 
 
 @pytest.fixture
@@ -106,12 +147,88 @@ def test_probe_leaves_nothing_behind(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
-def test_probe_fails_on_a_real_noexec_mount():
-    mnt = writable_noexec_mount()
-    if mnt is None:
-        pytest.skip("no writable noexec mount on this host")
+def test_probe_fails_on_a_real_noexec_mount(noexec_mount):
+    mnt = noexec_mount
     why = exec_tmpdir.probe(mnt)
     assert why is not None and str(mnt) in why
+
+
+# ---- finding a real noexec mount (AGAST #3743) -----------------------------
+
+@pytest.fixture
+def py312_is_dir(monkeypatch):
+    """Path.is_dir() as on CI's Python 3.12: EACCES propagates (3.14 swallows it)."""
+    def is_dir(self):
+        try:
+            return stat.S_ISDIR(os.stat(self).st_mode)
+        except (FileNotFoundError, NotADirectoryError):
+            return False
+    monkeypatch.setattr(Path, "is_dir", is_dir)
+
+
+def mount_table(tmp_path, *entries) -> Path:
+    """A /proc/mounts listing (mount point, options) pairs."""
+    table = tmp_path / "mounts"
+    table.write_text("".join(f"fake {mp} tmpfs {opts} 0 0\n" for mp, opts in entries))
+    return table
+
+
+@pytest.fixture
+def locked(tmp_path):
+    """Dirs as the runner user sees /sys/fs/pstore (0750 root): 0o000 and 0o500."""
+    if os.getuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    made = []
+
+    def make(name, mode):
+        d = tmp_path / name
+        d.mkdir()
+        d.chmod(mode)
+        made.append(d)
+        return d
+    yield make
+    for d in made:
+        d.chmod(0o700)
+
+
+def test_discovery_skips_an_unsearchable_noexec_mount(tmp_path, locked, py312_is_dir):
+    """The CI failure: stat'ing /sys/fs/pstore/<uid> raised during setup."""
+    pstore = locked("pstore", 0o000)
+    table = mount_table(tmp_path, (pstore, "rw,nosuid,nodev,noexec,relatime"))
+    assert writable_noexec_mount(table) is None
+
+
+def test_discovery_skips_a_read_only_noexec_mount(tmp_path, locked, py312_is_dir):
+    ro = locked("ro", 0o500)
+    table = mount_table(tmp_path, (ro, "rw,nosuid,nodev,noexec"))
+    assert writable_noexec_mount(table) is None
+
+
+def test_discovery_moves_past_unwritable_mounts_to_a_writable_one(tmp_path, locked,
+                                                                  py312_is_dir):
+    ok = tmp_path / "ok"
+    ok.mkdir()
+    table = mount_table(tmp_path, (locked("pstore", 0o000), "rw,noexec"),
+                        (locked("ro", 0o500), "rw,noexec"), (ok, "rw,noexec"))
+    assert writable_noexec_mount(table) == ok
+    assert list(ok.iterdir()) == []
+
+
+def test_discovery_wants_rw_and_noexec(tmp_path):
+    exec_ok, ro = tmp_path / "exec", tmp_path / "ro"
+    exec_ok.mkdir()
+    ro.mkdir()
+    table = mount_table(tmp_path, (exec_ok, "rw,nosuid"), (ro, "ro,noexec"))
+    assert writable_noexec_mount(table) is None
+
+
+def test_discovery_without_a_mount_table_is_none(tmp_path):
+    assert writable_noexec_mount(tmp_path / "no-mounts") is None
+
+
+def test_discovery_tries_dev_shm_and_tmp_before_sys():
+    got = _preferred_first(["/sys/fs/pstore", "/tmp", "/proc", "/dev/shm"])
+    assert got[:2] == ["/dev/shm", "/tmp"]
 
 
 # ---- ensure_exec_tmpdir --------------------------------------------------
@@ -173,10 +290,8 @@ def test_cli_probe_is_a_setup_error_naming_the_dir(tmp_path):
     assert p.stdout.startswith("SETUP ERROR") and str(missing) in p.stdout
 
 
-def test_cli_probe_on_a_real_noexec_mount():
-    mnt = writable_noexec_mount()
-    if mnt is None:
-        pytest.skip("no writable noexec mount on this host")
+def test_cli_probe_on_a_real_noexec_mount(noexec_mount):
+    mnt = noexec_mount
     p = cli("probe", str(mnt))
     assert p.returncode == exec_tmpdir.EXIT_SETUP and str(mnt) in p.stdout
 
