@@ -3037,7 +3037,6 @@ for _name in NO_IMPLICIT_DEREF:
 RITZ1_GAPS = {
     "by_value_float_field": "AGAST #1668: a `:&` float isn't auto-dereferenced",
     "by_value_float_literal": "AGAST #1668: a `:&` float isn't auto-dereferenced",
-    "array_referent_literal": "AGAST #1748: a struct literal's array field takes only array literals",
 }
 
 # `@n` into a `*i32` that isn't a field: the caller's address, so the write

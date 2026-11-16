@@ -1,0 +1,147 @@
+# Regression tests for AGAST #1748: a struct literal's inline `[N]T` array
+# field initialised from a NON-literal array value under ritz1.
+#
+#     struct Big
+#         rows: [4]Row
+#         count: i32
+#     var c: Big = Big { rows: b.rows, count: 1 }   # b: *Big
+#
+# ritz1 took only `[a, b]` / `[v; N]` there and refused anything else with
+# "struct literal field of this type is not lowered". Assignment (`h.a = a`)
+# already copied an array field, a local array and a `:&` array param
+# (emit_array_field_whole_assign, #2279); the literal store now goes the same
+# way.
+#
+# Each program returns 42 when correct and a distinct small code naming the
+# check that failed otherwise. ritz0 is the oracle. Every check reads the
+# copied contents back at runtime, and each source is changed after the
+# literal is built, so a view of the source (rather than a copy) can't pass.
+
+# --- field_source (the ticket's repro) -------------------------------------
+
+struct Row
+    id: i32
+    name: [32]u8
+
+struct Big
+    rows: [4]Row
+    count: i32
+
+fn f1(b: *Big) -> i32
+    var c: Big = Big { rows: b.rows, count: 1 }
+    return c.count
+
+fn copy_big(b: *Big) -> Big
+    return Big { rows: b.rows, count: 7 }
+
+fn field_source_main() -> i32
+    var b: Big
+    var i: i32 = 0
+    while i < 4
+        b.rows[i].id = i * 10 + 1
+        b.rows[i].name[0] = 65 + i as u8
+        b.rows[i].name[31] = 90 - i as u8
+        i = i + 1
+    b.count = 4
+    if f1(@b) != 1
+        return 1
+    var c: Big = Big { rows: b.rows, count: 2 }
+    b.rows[2].id = 999
+    b.rows[3].name[31] = 0
+    if c.count != 2
+        return 2
+    if c.rows[0].id != 1 or c.rows[2].id != 21 or c.rows[3].id != 31
+        return 3
+    if c.rows[1].name[0] != 66 or c.rows[3].name[31] != 87
+        return 4
+    # Through a return literal (emit_struct_lit_to_alloca).
+    let d: Big = copy_big(@b)
+    if d.count != 7 or d.rows[2].id != 999 or d.rows[3].name[31] != 0
+        return 5
+    if d.rows[1].id != 11
+        return 6
+    return 42
+
+[[test]]
+fn test_field_source() -> i32
+    assert field_source_main() == 42
+    0
+
+
+# --- local_source ----------------------------------------------------------
+
+struct H
+    tag: i32
+    a: [2]i32
+
+fn local_source_main() -> i32
+    var a: [2]i32 = [1, 3]
+    var h: H = H { tag: 5, a: a }
+    a[0] = 100
+    if h.a[0] != 1 or h.a[1] != 3 or h.tag != 5
+        return 1
+    # Reassignment from a literal.
+    h = H { tag: 6, a: a }
+    a[1] = 200
+    if h.a[0] != 100 or h.a[1] != 3 or h.tag != 6
+        return 2
+    return 42
+
+[[test]]
+fn test_local_source() -> i32
+    assert local_source_main() == 42
+    0
+
+
+# --- referent_source: a `:&` array param -----------------------------------
+
+fn mk(a:& [2]i32) -> H
+    return H { tag: 9, a: a }
+
+fn mk_tail(a:& [2]i32) -> H
+    H { tag: 8, a: a }
+
+fn referent_source_main() -> i32
+    var a: [2]i32 = [4, 7]
+    let h: H = mk(@&a)
+    a[1] = 50
+    let t: H = mk_tail(@&a)
+    a[0] = 60
+    if h.a[0] != 4 or h.a[1] != 7 or h.tag != 9
+        return 1
+    if t.a[0] != 4 or t.a[1] != 50 or t.tag != 8
+        return 2
+    return 42
+
+[[test]]
+fn test_referent_source() -> i32
+    assert referent_source_main() == 42
+    0
+
+
+# --- large_source: an array of SRET_MIN_BYTES or more ----------------------
+
+struct L
+    head: i64
+    v: [64]i64
+
+fn large_source_main() -> i32
+    var src: [64]i64
+    var i: i32 = 0
+    while i < 64
+        src[i] = (i as i64) * 3
+        i = i + 1
+    var l: L = L { head: 1, v: src }
+    src[63] = 0
+    var m: L = L { head: 2, v: l.v }
+    l.v[10] = 0
+    if l.head != 1 or l.v[0] != 0 or l.v[1] != 3 or l.v[63] != 189
+        return 1
+    if m.head != 2 or m.v[10] != 30 or m.v[63] != 189
+        return 2
+    return 42
+
+[[test]]
+fn test_large_source() -> i32
+    assert large_source_main() == 42
+    0

@@ -226,7 +226,7 @@ pub fn main() -> i32
         return 2
     @ZEROED@
     # assignment whose initialisers read the old value of the destination
-    # (scalars only: ritz1 cannot lower `rows: b.rows` yet, AGAST #1748)
+    # (scalars here; `rows: b.rows` is test_diff_struct_lit_array_field.ritz)
     b.rows[0].b = 40
     b = Big {{ rows: [Row {{ id: b.count, name: [0; 32], pat: [0; 128], a: 0, b: b.rows[0].b + 1 }}; 4], count: b.count + 1 }}
     if b.count != 7 or b.rows[0].b != 41 or b.rows[3].id != 6

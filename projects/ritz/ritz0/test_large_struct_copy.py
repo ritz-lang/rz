@@ -184,6 +184,33 @@ def test_large_struct_copy_has_no_first_class_store(
         assert COPY_CALL.search(text), "no copy helper call was emitted"
 
 
+# --- AGAST #1748: a struct literal's array field from a non-literal ---------
+#
+# `Big { rows: p.rows, .. }` copies the `[N x %Row]` into the literal's slot.
+# A large one goes pointer-to-pointer like any other large copy; a first-class
+# `[N x %Row]` load/store is what clang -O2 explodes per element.
+
+ARRAY_FIELD_LIT = HUGE + """
+pub fn use1(p: *Big) -> i32
+    var x: Big = Big { rows: p.rows, count: 1 }
+    return sink(@x)
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_large_array_field_literal_copies_pointer_to_pointer(ritz1_bin, tmp_path, compiler):
+    text = _ll(compiler, tmp_path, "array_field_lit", ARRAY_FIELD_LIT).read_text()
+    first_class = [
+        ln.strip()
+        for ln in text.splitlines()
+        if re.search(r'(load|store) \[128 x %"?[\w.]*Row"?\]', ln)
+    ]
+    assert not first_class, f"first-class large-array copies survive: {first_class}"
+    assert COPY_CALL.search(text), "no copy helper call was emitted"
+    _assert_no_libc_mem(_o2_object(_ll(compiler, tmp_path, "array_field_lit", ARRAY_FIELD_LIT)))
+
+
 # --- behaviour, with a size small enough for ritz0's old IR as well ---------
 
 # 4 rows = 692 bytes: over the 256-byte threshold, so the rewrite engages.

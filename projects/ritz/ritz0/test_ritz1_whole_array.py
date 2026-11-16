@@ -1643,7 +1643,9 @@ pub fn main() -> i32
 
 CASES.update(MATCHES)
 
-STRUCT_LITERAL_GAPS = {
+# AGAST #1748: a struct literal's array field from a local or a by-value
+# array param (was a strict-xfail gap).
+STRUCT_LITERALS = {
     "struct_lit_local": """\
 struct H
     a: [4]i32
@@ -1666,6 +1668,9 @@ pub fn main() -> i32
     return f(a)
 """,
 }
+
+assert not set(STRUCT_LITERALS) & set(CASES)
+CASES.update(STRUCT_LITERALS)
 
 PARAM_ND_GAPS = {
     "arg_2d": """\
@@ -1701,7 +1706,6 @@ pub fn main() -> i32
 }
 
 GAPS = [
-    (STRUCT_LITERAL_GAPS, "AGAST #1748: a struct literal's array field takes only array literals"),
     (PARAM_ND_GAPS, "AGAST #2098: a multi-dimensional array param"),
     (ROW_GAPS, "AGAST #2099: a whole row of a multi-dimensional array"),
 ]
