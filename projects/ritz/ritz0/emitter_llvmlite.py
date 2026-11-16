@@ -272,6 +272,66 @@ def _abi_size_align(ty: ir.Type) -> tuple:
     return 8, 8
 
 
+# AGAST #3738: the largest stack frame a fn may have, the default
+# `ulimit -s`.  lexis's `main` held its stylesheet and selector map by value
+# and compiled to a ~205 GB frame that SIGSEGV'd on entry, in silence.
+FRAME_LIMIT_BYTES = 8 * 1024 * 1024
+
+
+def _fmt_bytes(n: int) -> str:
+    """`16777216 bytes (16 MiB)`: exact, then readable."""
+    for unit, size in (("GiB", 1 << 30), ("MiB", 1 << 20), ("KiB", 1 << 10)):
+        if n >= size:
+            whole = n / size
+            text = f"{whole:.0f}" if n % size == 0 else f"{whole:.1f}"
+            return f"{n} bytes ({text} {unit})"
+    return f"{n} bytes"
+
+
+def _slot_noun(name: str) -> str:
+    """`` `rules` `` for a local's / param's slot (`rules.addr`, `rules`,
+    llvmlite's de-duplicated `rules.addr.1`); a temporary's slot
+    (`sret.slot`, `lent.tmp`) has a dotted name of its own."""
+    base = re.sub(r"(\.\d+)+$", "", name)
+    base = base[:-len(".addr")] if base.endswith(".addr") else base
+    if not base or "." in base:
+        return "a by-value temporary"
+    return f"`{base}`"
+
+
+def frame_too_large(fn_name: str, fn: ir.Function, limit: int = FRAME_LIMIT_BYTES):
+    """The EmitError refusing `fn`'s frame, or None if it fits (AGAST #3738).
+
+    The frame is the sum of the fn's fixed-size allocas: locals, by-value
+    params' copies, sret slots and other by-value temporaries.  Each alloca
+    carries the span the emitter was at when it was made (`ritz_span`, set by
+    _SretAwareBuilder.alloca); the error points at the largest, first-made
+    winning a tie.  No opt-out: a deliberately big frame goes on the heap or
+    in a static.
+    """
+    total, largest, largest_size = 0, None, -1
+    for block in fn.blocks:
+        for instr in block.instructions:
+            if not isinstance(instr, ir.AllocaInstr):
+                continue
+            size = _abi_size_align(instr.allocated_type)[0]
+            count = instr.operands[0] if instr.operands else None
+            if count is not None:
+                if not isinstance(count, ir.Constant):
+                    continue   # a runtime count is not a fixed frame
+                size *= int(count.constant)
+            total += size
+            if size > largest_size:
+                largest, largest_size = instr, size
+    if total <= limit:
+        return None
+    return EmitError(
+        f"fn `{fn_name}` needs a {_fmt_bytes(total)} stack frame, over the "
+        f"{_fmt_bytes(limit)} stack; {_slot_noun(largest.name)} here takes "
+        f"{_fmt_bytes(largest_size)}: put it on the heap or in a static",
+        getattr(largest, 'ritz_span', None))
+
+
 def _byval_align(ty: ir.Type) -> int:
     """The `align` of a byval param of `ty`: 8 for a struct (#1739), the
     element's natural alignment for an array (#2306)."""
@@ -505,6 +565,13 @@ class _SretAwareBuilder(ir.IRBuilder):
             if attrs is not None:
                 attrs.align = _byval_align(ty)
 
+    def alloca(self, typ, size=None, name=''):
+        # AGAST #3738: remember where in the source each slot came from, so
+        # an oversized frame is reported at its largest local / temporary.
+        instr = super().alloca(typ, size=size, name=name)
+        instr.ritz_span = self._emitter._emit_span
+        return instr
+
     def _entry_alloca(self, ty, name):
         em = self._emitter
         if em.builder is self and em.current_fn is self.function:
@@ -718,6 +785,8 @@ class LLVMEmitter:
         # Target triple configuration
         self.target = target
         self.target_os = target_os
+        # AGAST #3738: the span new allocas carry (see frame_too_large).
+        self._emit_span: Optional[rast.Span] = None
         self.is_freestanding = target.endswith('-none-elf') or '-none-' in target
 
         # LLVM types - integers
@@ -5608,10 +5677,16 @@ class LLVMEmitter:
         test, `let metrics = font.glyph_metrics(0)` in the next).
         """
         saved_ritz_types = dict(self.ritz_types)
+        self._emit_span = getattr(fn_def, 'span', None)
         try:
-            return self._emit_function_body_inner(fn_def)
+            fn = self._emit_function_body_inner(fn_def)
         finally:
             self.ritz_types = saved_ritz_types
+            self._emit_span = None
+        err = frame_too_large(fn_def.name, fn)
+        if err is not None:
+            raise err
+        return fn
 
     def _emit_function_body_inner(self, fn_def: rast.FnDef) -> ir.Function:
         fn, _ = self.functions[fn_def.name]
@@ -6210,6 +6285,17 @@ class LLVMEmitter:
             self._evaluated_once[id(twin)] = self._evaluated_once[id(expr)]
 
     def _emit_stmt(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
+        """Emit a statement, its span the one new allocas carry (#3738)."""
+        saved = self._emit_span
+        span = getattr(stmt, 'span', None)
+        if span is not None:
+            self._emit_span = span
+        try:
+            return self._emit_stmt_spanned(stmt)
+        finally:
+            self._emit_span = saved
+
+    def _emit_stmt_spanned(self, stmt: rast.Stmt) -> Union[bool, ir.Value, None]:
         """Emit a statement. Returns True if block terminated.
 
         Clears `_expected_enum_name` for the statement's duration: the
@@ -8718,7 +8804,14 @@ class LLVMEmitter:
             pre = self._evaluated_once.get(id(expr))
             if pre is not None:
                 return pre
-        val = self._emit_expr_core(expr)
+        saved_span = self._emit_span
+        span = getattr(expr, 'span', None)
+        if span is not None:
+            self._emit_span = span   # AGAST #3738: where its temporaries are
+        try:
+            val = self._emit_expr_core(expr)
+        finally:
+            self._emit_span = saved_span
         if getattr(expr, 'drop_temp', None) is not None:
             self._own_temporary(expr, val)
         self._value_origin[id(val)] = (val, expr)
