@@ -1348,8 +1348,9 @@ fn test_ecdh_rejects_unreduced_y() -> i32
 # ============================================================================
 #
 # Expected bytes come from an independent reference encoder, not from
-# ecdsa_signature_to_der. Compare exact bytes: ecdsa_sig_from_der accepts both
-# a missing and a spurious pad, so a round trip alone cannot catch a wrong pad.
+# ecdsa_signature_to_der. Compare exact bytes: before #2234 ecdsa_sig_from_der
+# accepted both a missing and a spurious pad, so a round trip could not catch a
+# wrong pad.
 # The integer a test is not about starts with 0x22, which needs no pad whether
 # the encoder tests the high bit or bit 0.
 
@@ -1435,6 +1436,96 @@ fn test_der_control_first_byte_0x22_is_not_padded() -> i32
 [[test]]
 fn test_der_control_zero_r_is_one_zero_byte() -> i32
     return der_expect_2224(c"0000000000000000000000000000000000000000000000000000000000000000", c"2244444444444444444444444444444444444444444444444444444444444444", c"302502010002202244444444444444444444444444444444444444444444444444444444444444", 39)
+
+# ============================================================================
+# DER Signature Decoding: only canonical INTEGERs (#2234)
+# ============================================================================
+#
+# X.690 10.2 / 8.3.2: an INTEGER's content is minimal two's complement. So a
+# first byte with its high bit set is negative, and a leading 0x00 is legal
+# only when the next byte has its high bit set. Each (r, s) has exactly one
+# encoding; anything else is refused (as BoringSSL and Go do), for X.509 and
+# TLS alike. The integer a test is not about is canonical.
+
+# Parse `der_hex` (len bytes) with ecdsa_sig_from_der; return its result.
+fn der_parse_2234(der_hex: *u8, len: i64) -> i32
+    var d: [80]u8
+    hex_2182(der_hex, @d[0], len)
+    var sig: EcdsaSignature
+    return ecdsa_sig_from_der(@d[0], len, @sig)
+
+# 32-byte r with its high bit set and no pad: negative
+[[test]]
+fn test_der_parse_rejects_negative_r() -> i32
+    if der_parse_2234(c"30440220803333333333333333333333333333333333333333333333333333333333333302202244444444444444444444444444444444444444444444444444444444444444", 70) != -1
+        return 1
+    return 0
+
+# 32-byte s with its high bit set and no pad: negative
+[[test]]
+fn test_der_parse_rejects_negative_s() -> i32
+    if der_parse_2234(c"30440220223333333333333333333333333333333333333333333333333333333333333302208044444444444444444444444444444444444444444444444444444444444444", 70) != -1
+        return 1
+    return 0
+
+# one-byte negative r (0xff = -1)
+[[test]]
+fn test_der_parse_rejects_short_negative_r() -> i32
+    if der_parse_2234(c"30250201ff02202244444444444444444444444444444444444444444444444444444444444444", 39) != -1
+        return 1
+    return 0
+
+# 33-byte r: pad before a byte whose high bit is clear
+[[test]]
+fn test_der_parse_rejects_padded_0x7f_r() -> i32
+    if der_parse_2234(c"30450221007f3333333333333333333333333333333333333333333333333333333333333302202244444444444444444444444444444444444444444444444444444444444444", 71) != -1
+        return 1
+    return 0
+
+# 33-byte s: pad before a byte whose high bit is clear
+[[test]]
+fn test_der_parse_rejects_padded_0x7f_s() -> i32
+    if der_parse_2234(c"3045022022333333333333333333333333333333333333333333333333333333333333330221007f44444444444444444444444444444444444444444444444444444444444444", 71) != -1
+        return 1
+    return 0
+
+# 32-byte r holding a 31-byte value behind a redundant zero
+[[test]]
+fn test_der_parse_rejects_leading_zero_short_r() -> i32
+    if der_parse_2234(c"30440220002233333333333333333333333333333333333333333333333333333333333302202244444444444444444444444444444444444444444444444444444444444444", 70) != -1
+        return 1
+    return 0
+
+# zero written as two bytes
+[[test]]
+fn test_der_parse_rejects_two_byte_zero_r() -> i32
+    if der_parse_2234(c"30260202000002202244444444444444444444444444444444444444444444444444444444444444", 40) != -1
+        return 1
+    return 0
+
+# 33-byte r that is canonical DER but wider than 256 bits
+[[test]]
+fn test_der_parse_rejects_257_bit_r() -> i32
+    if der_parse_2234(c"3045022101333333333333333333333333333333333333333333333333333333333333333302202244444444444444444444444444444444444444444444444444444444444444", 71) != -1
+        return 1
+    return 0
+
+# controls: the canonical edges still parse (verify rejects r = 0 later)
+[[test]]
+fn test_der_parse_accepts_canonical_edges() -> i32
+    # single zero byte
+    if der_parse_2234(c"302502010002202244444444444444444444444444444444444444444444444444444444444444", 39) != 0
+        return 1
+    # single 0x7f byte
+    if der_parse_2234(c"302502017f02202244444444444444444444444444444444444444444444444444444444444444", 39) != 0
+        return 2
+    # 0x00 pad before 0x80 in a short value
+    if der_parse_2234(c"30440220008033333333333333333333333333333333333333333333333333333333333302202244444444444444444444444444444444444444444444444444444444444444", 70) != 0
+        return 3
+    # 0x00 pad before 0xff in a full 33-byte value
+    if der_parse_2234(c"3045022100ff3333333333333333333333333333333333333333333333333333333333333302202244444444444444444444444444444444444444444444444444444444444444", 71) != 0
+        return 4
+    return 0
 
 # ============================================================================
 # Secret wiping in ecdsa_p256_sign (AGAST #2581, GitHub #139)
