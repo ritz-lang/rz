@@ -2156,19 +2156,19 @@ struct JsonError
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `json_parse2` | `fn(input: *u8, len: i64) -> Result<*JsonValue, JsonError>` | Parse JSON (modern) |
-| `json_parse` | `fn(input: *u8, len: i64) -> JsonResult` | Parse JSON (legacy) |
+| `json_parse` | `fn(input: StrView) -> Result<*JsonValue, JsonError>` | Parse the first JSON value in `input` |
+| `json_parse2` | `fn(input: *u8, len: i64) -> Result<*JsonValue, JsonError>` | Deprecated wrapper: `json_parse(strview_from_ptr(input, len))` |
 | `json_free` | `fn(v: *JsonValue)` | Free JSON tree |
 
 **Value Access**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `json_get_field` | `fn(obj: *JsonValue, key: *u8) -> *JsonValue` | Get object field |
-| `json_get_index` | `fn(arr: *JsonValue, idx: i64) -> *JsonValue` | Get array element |
-| `json_get_string` | `fn(v: *JsonValue) -> *u8` | Get string value |
-| `json_get_number` | `fn(v: *JsonValue) -> i64` | Get number value |
-| `json_get_bool` | `fn(v: *JsonValue) -> i32` | Get bool value |
+| `json_get_field` | `fn(obj: *JsonValue, key: StrView) -> Option<*JsonValue>` | Object field; None if missing or not an object |
+| `json_get_index` | `fn(arr: *JsonValue, idx: i64) -> Option<*JsonValue>` | Array element; None if out of range or not an array |
+| `json_get_string` | `fn(v: *JsonValue) -> Option<StrView>` | String value, borrowed from `v`; None if not a string |
+| `json_get_number` | `fn(v: *JsonValue) -> Option<i64>` | Number value; None if not a number |
+| `json_get_bool` | `fn(v: *JsonValue) -> Option<bool>` | Bool value; None if not a bool |
 | `json_is_null` | `fn(v: *JsonValue) -> i32` | Check if null |
 | `json_array_len` | `fn(v: *JsonValue) -> i64` | Get array length |
 | `json_object_len` | `fn(v: *JsonValue) -> i64` | Get object size |
@@ -2179,13 +2179,13 @@ struct JsonError
 |----------|-----------|-------------|
 | `json_emit_value` | `fn(v: *JsonValue, buf: *Vec<u8>) -> i32` | Emit to buffer |
 | `json_emit_string` | `fn(s: *u8, buf: *Vec<u8>) -> i32` | Emit string |
-| `json_to_string` | `fn(v: *JsonValue) -> *u8` | Convert to string |
+| `json_to_string` | `fn(v: *JsonValue) -> String` | JSON text; caller owns (`string_drop`) |
 
 **Error Messages**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `json_error_message` | `fn(code: i32) -> *u8` | Get error message |
+| `json_error_message` | `fn(code: i32) -> StrView` | Get error message |
 
 ---
 

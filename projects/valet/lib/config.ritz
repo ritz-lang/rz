@@ -37,6 +37,9 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
 import ritzlib.json
 
 # ============================================================================
@@ -109,6 +112,15 @@ pub fn config_default(cfg: *ValetConfig)
 # JSON parsing helpers
 # ============================================================================
 
+# Field `key` of `obj`, or null if absent.  The config_get_* / copy helpers
+# below check each value's kind themselves and fall back to the default, so a
+# missing field and a wrong-kind one take the same path.
+fn config_field(obj: *JsonValue, key: StrView) -> *JsonValue
+    match json_get_field(obj, key)
+        Some(v) => v
+        None => null as *JsonValue
+
+
 # Copy a JSON string value into a fixed-size buffer
 pub fn config_copy_string(dst: *u8, max_len: i32, json_val: *JsonValue) -> i32
     if json_val == null
@@ -157,12 +169,12 @@ pub fn config_parse_server(cfg: *ValetConfig, server_obj: *JsonValue)
     if server_obj.kind != JSON_OBJECT
         return
 
-    cfg.port = config_get_int(json_get_field(server_obj, c"port"), cfg.port)
-    cfg.workers = config_get_int(json_get_field(server_obj, c"workers"), cfg.workers)
-    cfg.multishot = config_get_bool(json_get_field(server_obj, c"multishot"), cfg.multishot)
-    cfg.use_send_zc = config_get_bool(json_get_field(server_obj, c"use_send_zc"), cfg.use_send_zc)
-    cfg.backlog = config_get_int(json_get_field(server_obj, c"backlog"), cfg.backlog)
-    cfg.sndbuf = config_get_int(json_get_field(server_obj, c"sndbuf"), cfg.sndbuf)
+    cfg.port = config_get_int(config_field(server_obj, "port"), cfg.port)
+    cfg.workers = config_get_int(config_field(server_obj, "workers"), cfg.workers)
+    cfg.multishot = config_get_bool(config_field(server_obj, "multishot"), cfg.multishot)
+    cfg.use_send_zc = config_get_bool(config_field(server_obj, "use_send_zc"), cfg.use_send_zc)
+    cfg.backlog = config_get_int(config_field(server_obj, "backlog"), cfg.backlog)
+    cfg.sndbuf = config_get_int(config_field(server_obj, "sndbuf"), cfg.sndbuf)
 
 
 # Parse limits section
@@ -172,10 +184,10 @@ pub fn config_parse_limits(cfg: *ValetConfig, limits_obj: *JsonValue)
     if limits_obj.kind != JSON_OBJECT
         return
 
-    cfg.max_connections = config_get_int(json_get_field(limits_obj, c"max_connections"), cfg.max_connections)
-    cfg.max_request_size = config_get_int(json_get_field(limits_obj, c"max_request_size"), cfg.max_request_size)
-    cfg.keepalive_requests = config_get_int(json_get_field(limits_obj, c"keepalive_requests"), cfg.keepalive_requests)
-    cfg.idle_timeout = config_get_int(json_get_field(limits_obj, c"idle_timeout"), cfg.idle_timeout)
+    cfg.max_connections = config_get_int(config_field(limits_obj, "max_connections"), cfg.max_connections)
+    cfg.max_request_size = config_get_int(config_field(limits_obj, "max_request_size"), cfg.max_request_size)
+    cfg.keepalive_requests = config_get_int(config_field(limits_obj, "keepalive_requests"), cfg.keepalive_requests)
+    cfg.idle_timeout = config_get_int(config_field(limits_obj, "idle_timeout"), cfg.idle_timeout)
 
 
 # Parse static section
@@ -185,8 +197,8 @@ pub fn config_parse_static(cfg: *ValetConfig, static_obj: *JsonValue)
     if static_obj.kind != JSON_OBJECT
         return
 
-    let prefix_val: *JsonValue = json_get_field(static_obj, c"prefix")
-    let root_val: *JsonValue = json_get_field(static_obj, c"root")
+    let prefix_val: *JsonValue = config_field(static_obj, "prefix")
+    let root_val: *JsonValue = config_field(static_obj, "root")
 
     if config_copy_string(@cfg.static_prefix[0], 256, prefix_val) != 0
         if config_copy_string(@cfg.static_root[0], 256, root_val) != 0
@@ -200,11 +212,11 @@ pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
     if tls_obj.kind != JSON_OBJECT
         return
 
-    cfg.tls_enabled = config_get_bool(json_get_field(tls_obj, c"enabled"), cfg.tls_enabled)
+    cfg.tls_enabled = config_get_bool(config_field(tls_obj, "enabled"), cfg.tls_enabled)
 
     if cfg.tls_enabled != 0
-        config_copy_string(@cfg.tls_cert[0], 256, json_get_field(tls_obj, c"cert"))
-        config_copy_string(@cfg.tls_key[0], 256, json_get_field(tls_obj, c"key"))
+        config_copy_string(@cfg.tls_cert[0], 256, config_field(tls_obj, "cert"))
+        config_copy_string(@cfg.tls_key[0], 256, config_field(tls_obj, "key"))
 
 
 # ============================================================================
@@ -214,24 +226,31 @@ pub fn config_parse_tls(cfg: *ValetConfig, tls_obj: *JsonValue)
 # Parse a JSON string into config
 # Returns 0 on success, negative on error
 pub fn config_parse_json(cfg: *ValetConfig, json_str: *u8, json_len: i64) -> i32
-    let result: JsonResult = json_parse(json_str, json_len)
-    if result.ok == 0
-        eprints("config: JSON parse error at position ")
-        print_int(result.error_pos)
-        eprints("\n")
-        return -1
+    match json_parse(strview_from_ptr(json_str, json_len))
+        Ok(root) => config_apply_root(cfg, root)
+        Err(err) => config_parse_error(err)
 
-    let root: *JsonValue = result.value
+
+fn config_parse_error(err: JsonError) -> i32
+    eprints("config: JSON parse error at position ")
+    print_int(err.pos)
+    eprints("\n")
+    return -1
+
+
+# Apply a parsed document to `cfg` and free it.  Returns 0, or -2 if the root
+# is not an object.
+fn config_apply_root(cfg: *ValetConfig, root: *JsonValue) -> i32
     if root.kind != JSON_OBJECT
         eprints("config: root must be an object\n")
         json_free(root)
         return -2
 
     # Parse each section
-    config_parse_server(cfg, json_get_field(root, c"server"))
-    config_parse_limits(cfg, json_get_field(root, c"limits"))
-    config_parse_static(cfg, json_get_field(root, c"static"))
-    config_parse_tls(cfg, json_get_field(root, c"tls"))
+    config_parse_server(cfg, config_field(root, "server"))
+    config_parse_limits(cfg, config_field(root, "limits"))
+    config_parse_static(cfg, config_field(root, "static"))
+    config_parse_tls(cfg, config_field(root, "tls"))
 
     json_free(root)
     return 0

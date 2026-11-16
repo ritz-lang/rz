@@ -3,20 +3,28 @@
 # A simple JSON parser for reading .ritz-meta files.
 # Supports: objects, arrays, strings, numbers, booleans, null.
 #
-# Usage with Result type:
-#   let result: Result<*JsonValue, JsonError> = json_parse(input, strlen(input))
-#   match result
-#       Ok(root) =>
-#           # Use json_get_field(root, "key") to access fields
-#           json_free(root)
-#       Err(err) =>
-#           # Handle error: err.code, err.pos
+# Usage (AGAST #1482):
+#   match json_parse(input)                     # input: StrView
+#       Ok(root) => use_root(root)              # json_free(root) when done
+#       Err(err) => report(err.code, err.pos)   # json_error_message(err.code)
+#
+# Lookups return Option rather than a null/0 sentinel:
+#   json_get_field(obj, "key") -> Option<*JsonValue>   (key: StrView)
+#   json_get_index(arr, i)     -> Option<*JsonValue>
+#   json_get_string(v)         -> Option<StrView>      (borrows from v)
+#   json_get_number(v)         -> Option<i64>
+#   json_get_bool(v)           -> Option<bool>
+# Each is None for a missing field, an out-of-range index, a null `v` or a
+# value of another kind.  The jp_* parser primitives are private.
 
 import ritzlib.sys
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.result
+import ritzlib.option
+import ritzlib.strview
+import ritzlib.string
 
 # =============================================================================
 # JSON Value Types
@@ -55,14 +63,6 @@ const JSON_ERR_OUT_OF_MEMORY: i32 = 6
 struct JsonError
     code: i32           # JSON_ERR_* error code
     pos: i64            # Position of error in input
-
-# Legacy type alias for backwards compatibility
-# TODO: Remove after migrating all callers
-struct JsonResult
-    ok: i32             # 1 if success, 0 if error
-    value: *JsonValue   # Parsed value (only valid if ok)
-    error: *u8          # Error message (only valid if !ok)
-    error_pos: i64      # Position of error in input
 
 # =============================================================================
 # JSON Parser State
@@ -121,22 +121,22 @@ pub fn json_free(v: *JsonValue)
 # Parser Primitives
 # =============================================================================
 
-pub fn jp_at_end(p: *JsonParser) -> i32
+fn jp_at_end(p: *JsonParser) -> i32
     return (p.pos >= p.len) as i32
 
-pub fn jp_peek(p: *JsonParser) -> i32
+fn jp_peek(p: *JsonParser) -> i32
     if p.pos >= p.len
         return 0
     return *(p.src + p.pos) as i32
 
-pub fn jp_advance(p: *JsonParser) -> i32
+fn jp_advance(p: *JsonParser) -> i32
     if p.pos >= p.len
         return 0
     let ch: i32 = *(p.src + p.pos) as i32
     p.pos = p.pos + 1
     return ch
 
-pub fn jp_skip_ws(p: *JsonParser)
+fn jp_skip_ws(p: *JsonParser)
     while p.pos < p.len
         let ch: i32 = jp_peek(p)
         if ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r'
@@ -144,14 +144,14 @@ pub fn jp_skip_ws(p: *JsonParser)
         else
             return
 
-pub fn jp_expect(p: *JsonParser, ch: i32) -> i32
+fn jp_expect(p: *JsonParser, ch: i32) -> i32
     jp_skip_ws(p)
     if jp_peek(p) == ch
         jp_advance(p)
         return 1
     return 0
 
-pub fn jp_match_str(p: *JsonParser, s: *u8) -> i32
+fn jp_match_str(p: *JsonParser, s: *u8) -> i32
     var len: i64 = strlen(s)
     if p.pos + len > p.len
         return 0
@@ -166,7 +166,7 @@ pub fn jp_match_str(p: *JsonParser, s: *u8) -> i32
 # =============================================================================
 # Note: ritz0 pre-registers all function signatures, so these can call each other.
 
-pub fn jp_parse_value(p: *JsonParser) -> *JsonValue
+fn jp_parse_value(p: *JsonParser) -> *JsonValue
     jp_skip_ws(p)
     let ch: i32 = jp_peek(p)
 
@@ -216,7 +216,7 @@ pub fn jp_parse_value(p: *JsonParser) -> *JsonValue
 
     return null
 
-pub fn jp_parse_string(p: *JsonParser) -> *JsonValue
+fn jp_parse_string(p: *JsonParser) -> *JsonValue
     if jp_peek(p) != 34  # '"'
         return null
     jp_advance(p)  # Skip opening quote
@@ -286,7 +286,7 @@ pub fn jp_parse_string(p: *JsonParser) -> *JsonValue
     v.str_len = dst_pos
     return v
 
-pub fn jp_parse_number(p: *JsonParser) -> *JsonValue
+fn jp_parse_number(p: *JsonParser) -> *JsonValue
     var neg: i32 = 0
     if jp_peek(p) == '-'  # '-'
         neg = 1
@@ -320,7 +320,7 @@ pub fn jp_parse_number(p: *JsonParser) -> *JsonValue
     # Note: For float support, we'd need to track decimal_places
     return v
 
-pub fn jp_parse_array(p: *JsonParser) -> *JsonValue
+fn jp_parse_array(p: *JsonParser) -> *JsonValue
     if jp_peek(p) != 91  # '['
         return null
     jp_advance(p)
@@ -378,7 +378,7 @@ pub fn jp_parse_array(p: *JsonParser) -> *JsonValue
     vec_drop<u8>(@&items)
     return v
 
-pub fn jp_parse_object(p: *JsonParser) -> *JsonValue
+fn jp_parse_object(p: *JsonParser) -> *JsonValue
     if jp_peek(p) != 123  # '{'
         return null
     jp_advance(p)
@@ -474,11 +474,11 @@ pub fn jp_parse_object(p: *JsonParser) -> *JsonValue
 # Public API
 # =============================================================================
 
-# Modern API: Returns Result<*JsonValue, JsonError>
-pub fn json_parse2(input: *u8, len: i64) -> Result<*JsonValue, JsonError>
+# Parse the first JSON value in `input`; trailing input is ignored.
+pub fn json_parse(input: StrView) -> Result<*JsonValue, JsonError>
     var p: JsonParser
-    p.src = input
-    p.len = len
+    p.src = input.ptr
+    p.len = input.len
     p.pos = 0
 
     let v: *JsonValue = jp_parse_value(@p)
@@ -490,93 +490,80 @@ pub fn json_parse2(input: *u8, len: i64) -> Result<*JsonValue, JsonError>
 
     return Ok(v)
 
-# Legacy API: Returns JsonResult struct (deprecated - use json_parse2)
-pub fn json_parse(input: *u8, len: i64) -> JsonResult
-    var result: JsonResult
-    result.ok = 0
-    result.value = null
-    result.error = null
-    result.error_pos = 0
-
-    var p: JsonParser
-    p.src = input
-    p.len = len
-    p.pos = 0
-
-    let v: *JsonValue = jp_parse_value(@p)
-    if v == null
-        result.error = c"JSON parse error"
-        result.error_pos = p.pos
-        return result
-
-    result.ok = 1
-    result.value = v
-    return result
+# Deprecated (AGAST #1482): the (ptr, len) form of json_parse.  Kept as a
+# wrapper for one commit; use json_parse(strview_from_ptr(input, len)).
+pub fn json_parse2(input: *u8, len: i64) -> Result<*JsonValue, JsonError>
+    return json_parse(strview_from_ptr(input, len))
 
 # =============================================================================
 # Error Helpers
 # =============================================================================
 
-pub fn json_error_message(code: i32) -> *u8
+pub fn json_error_message(code: i32) -> StrView
     if code == JSON_ERR_UNEXPECTED_CHAR
-        return c"unexpected character"
+        return "unexpected character"
     if code == JSON_ERR_UNTERMINATED_STRING
-        return c"unterminated string"
+        return "unterminated string"
     if code == JSON_ERR_EXPECTED_COLON
-        return c"expected ':'"
+        return "expected ':'"
     if code == JSON_ERR_EXPECTED_BRACKET
-        return c"expected ']'"
+        return "expected ']'"
     if code == JSON_ERR_EXPECTED_BRACE
-        return c"expected '}'"
+        return "expected '}'"
     if code == JSON_ERR_OUT_OF_MEMORY
-        return c"out of memory"
-    return c"unknown error"
+        return "out of memory"
+    return "unknown error"
 
 # =============================================================================
 # Object Access Helpers
 # =============================================================================
 
-pub fn json_get_field(obj: *JsonValue, key: *u8) -> *JsonValue
+# The value of `key` in object `obj`; None if `obj` is null, not an object,
+# or has no such key.  Keys compare byte-for-byte.
+pub fn json_get_field(obj: *JsonValue, key: StrView) -> Option<*JsonValue>
     if obj == null
-        return null
+        return None
     if obj.kind != JSON_OBJECT
-        return null
+        return None
 
     for i in 0..obj.count
         let k: *u8 = *(obj.keys + i)
-        if streq(k, key) != 0
-            return *(obj.items + i)
-    return null
+        if strview_eq_cstr(key, k)
+            return Some(*(obj.items + i))
+    return None
 
-pub fn json_get_index(arr: *JsonValue, idx: i64) -> *JsonValue
+# Element `idx` of array `arr`; None if `arr` is null, not an array, or
+# `idx` is out of range.
+pub fn json_get_index(arr: *JsonValue, idx: i64) -> Option<*JsonValue>
     if arr == null
-        return null
+        return None
     if arr.kind != JSON_ARRAY
-        return null
+        return None
     if idx < 0 or idx >= arr.count
-        return null
-    return *(arr.items + idx)
+        return None
+    return Some(*(arr.items + idx))
 
-pub fn json_get_string(v: *JsonValue) -> *u8
+# A view of a string value's bytes, borrowed from `v` (valid until json_free).
+pub fn json_get_string(v: *JsonValue) -> Option<StrView>
     if v == null
-        return null
+        return None
     if v.kind != JSON_STRING
-        return null
-    return v.str_val
+        return None
+    return Some(strview_from_ptr(v.str_val, v.str_len))
 
-pub fn json_get_number(v: *JsonValue) -> i64
+pub fn json_get_number(v: *JsonValue) -> Option<i64>
     if v == null
-        return 0
+        return None
     if v.kind != JSON_NUMBER
-        return 0
-    return v.num_val
+        return None
+    return Some(v.num_val)
 
-pub fn json_get_bool(v: *JsonValue) -> i32
+pub fn json_get_bool(v: *JsonValue) -> Option<bool>
     if v == null
-        return 0
+        return None
     if v.kind != JSON_BOOL
-        return 0
-    return v.bool_val
+        return None
+    return Some(v.bool_val != 0)
 
 pub fn json_is_null(v: *JsonValue) -> i32
     if v == null
@@ -664,13 +651,10 @@ pub fn json_emit_string(s: *u8, buf: *Vec<u8>) -> i32
     vec_push<u8>(buf, 34)  # '"'
     return 0
 
-pub fn json_to_string(v: *JsonValue) -> *u8
+# The JSON text of `v`; the caller owns the String (string_drop).
+pub fn json_to_string(v: *JsonValue) -> String
     var buf: Vec<u8> = vec_with_cap<u8>(256)
     json_emit_value(v, @buf)
-    let s: *u8 = vec_as_str(@&buf)
-    # Transfer ownership - caller must free
-    let result: *u8 = malloc(buf.len + 1)
-    if result != null
-        memcpy(result, s, buf.len + 1)
+    let out: String = string_from_bytes(buf.data, buf.len)
     vec_drop<u8>(@&buf)
-    return result
+    return out

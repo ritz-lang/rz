@@ -877,6 +877,7 @@ Use descriptive names that explain **what is being tested** and **expected outco
 ```ritz
 import ritzlib.memory
 import ritzlib.gvec
+import ritzlib.result
 import ritzlib.json
 
 
@@ -901,8 +902,10 @@ fn test_vec_push_grows_capacity_when_full() -> i32
 
 [[test]]
 fn test_parse_invalid_json_returns_error() -> i32
-    let r = json_parse(c"{ not json", 10)
-    assert r.ok == 0, "malformed input must not parse"
+    let parsed: i32 = match json_parse("{ not json")
+        Ok(v) => 1
+        Err(e) => 0
+    assert parsed == 0, "malformed input must not parse"
     0
 ```
 

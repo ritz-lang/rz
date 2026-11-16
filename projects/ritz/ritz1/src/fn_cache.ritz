@@ -67,6 +67,8 @@ import ritzlib.strview
 import ritzlib.gvec
 import ritzlib.memory
 import ritzlib.hash
+import ritzlib.option
+import ritzlib.result
 import ritzlib.json
 import ritzlib.os.env
 
@@ -707,13 +709,10 @@ pub fn read_sig_file(sig_path: *u8) -> *SigData
     if buf == null or sz <= 0
         return null
 
-    let res: JsonResult = json_parse(buf, sz)
+    let root: *JsonValue = sig_parse_root(strview_from_ptr(buf, sz))
     free(buf)
-    if res.ok != 1 or res.value == null
-        if res.value != null
-            json_free(res.value)
+    if root == null
         return null
-    let root: *JsonValue = res.value
     if root.kind != JSON_OBJECT
         json_free(root)
         return null
@@ -723,16 +722,16 @@ pub fn read_sig_file(sig_path: *u8) -> *SigData
         json_free(root)
         return null
 
-    let sh_node: *JsonValue = json_get_field(root, c"source_hash")
+    let sh_node: *JsonValue = sig_field(root, "source_hash")
     if sh_node != null and sh_node.kind == JSON_STRING and sh_node.str_val != null
         sd.source_hash = hex16_to_u64(sh_node.str_val)
 
     # Absent → stays 0, and every reuse check fails closed.
-    let ch_node: *JsonValue = json_get_field(root, c"compiler_hash")
+    let ch_node: *JsonValue = sig_field(root, "compiler_hash")
     if ch_node != null and ch_node.kind == JSON_STRING and ch_node.str_val != null
         sd.compiler_hash = hex16_to_u64(ch_node.str_val)
 
-    let mir_node: *JsonValue = json_get_field(root, c"module_ir")
+    let mir_node: *JsonValue = sig_field(root, "module_ir")
     if mir_node != null and mir_node.kind == JSON_STRING and mir_node.str_val != null
         let ml: i64 = mir_node.str_len
         if ml > 0
@@ -742,16 +741,29 @@ pub fn read_sig_file(sig_path: *u8) -> *SigData
                 sd.module_ir = mb
                 sd.module_ir_len = ml
 
-    let ih_node: *JsonValue = json_get_field(root, c"import_hashes")
+    let ih_node: *JsonValue = sig_field(root, "import_hashes")
     if ih_node != null and ih_node.kind == JSON_OBJECT
         sig_parse_deps(sd, ih_node)
 
-    let im_node: *JsonValue = json_get_field(root, c"import_misses")
+    let im_node: *JsonValue = sig_field(root, "import_misses")
     if im_node != null and im_node.kind == JSON_ARRAY
         sig_parse_misses(sd, im_node)
 
     json_free(root)
     return sd
+
+# The parsed sig document, or null if `text` is not JSON (cold start).
+fn sig_parse_root(text: StrView) -> *JsonValue
+    match json_parse(text)
+        Ok(v) => v
+        Err(e) => null as *JsonValue
+
+# Field `key` of `root`, or null if absent: read_sig_file checks each field's
+# kind itself, so a missing one and a wrong-kind one take the same path.
+fn sig_field(root: *JsonValue, key: StrView) -> *JsonValue
+    match json_get_field(root, key)
+        Some(v) => v
+        None => null as *JsonValue
 
 # Fill `sd`'s missed candidates from the `import_misses` array.  Any entry
 # that is not a non-empty string, or that cannot be stored, leaves the record

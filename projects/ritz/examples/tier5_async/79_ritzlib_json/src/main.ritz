@@ -2,31 +2,39 @@
 #
 # ritz1 links ritzlib_json.o, yet no example imported ritzlib.json, so no
 # differential ritz0-vs-ritz1 stage ever ran it (AGAST #1459; 42_json carries
-# a private parser).  This one uses only the library's public API.
+# a private parser).  This one uses only the library's public API, in the
+# Option/Result shape of AGAST #1482.
 #
 # Three sections:
 #
 # 1. `== doc ==` — stdin (read with gvec's vec_read_all_fd) parsed with
-#    json_parse2, matched on its Result.  Empty stdin (the regression suite
-#    runs every example with </dev/null) parses a built-in document instead.
-#    The tree is walked depth-first with the accessor API only: objects via
-#    json_object_len + their keys + json_get_field, arrays via json_array_len
-#    + json_get_index, scalars via json_get_string / json_get_number /
-#    json_get_bool / json_is_null.  Each node prints as `<path> <kind> <value>`,
-#    then a per-kind tally, then the document re-emitted with json_to_string,
-#    which is re-parsed with the legacy json_parse and re-emitted to show the
+#    json_parse(StrView), matched on its Result<*JsonValue, JsonError>.  Empty
+#    stdin (the regression suite runs every example with </dev/null) parses a
+#    built-in document instead.  The tree is walked depth-first with the
+#    accessor API only: objects via json_object_len + their keys +
+#    json_get_field, arrays via json_array_len + json_get_index, scalars via
+#    json_get_string / json_get_number / json_get_bool (each an Option) and
+#    json_is_null.  Each node prints as `<path> <kind> <value>`, then a
+#    per-kind tally, then the document re-emitted with json_to_string (a
+#    String), which is re-parsed with json_parse and re-emitted to show the
 #    round trip is a fixed point.
-# 2. `== lookup ==` — typed lookups on the built-in document's keys, plus the
-#    accessors' defaults on a missing field, an out-of-range index and a
-#    wrong-kind value (the same lines run whatever stdin held).
-# 3. `== errors ==` — fixed malformed inputs through json_parse2 and
-#    json_parse, and the json_error_message table.
+# 2. `== lookup ==` — typed lookups on the built-in document's keys, plus a
+#    missing field, an out-of-range index and a wrong-kind value, each of
+#    which is None (the same lines run whatever stdin held).  None prints as
+#    the sentinel the pre-#1482 accessors returned — 0, `(null)`, is_null=1 —
+#    so the golden output did not move.
+# 3. `== errors ==` — fixed malformed inputs through json_parse and the
+#    deprecated json_parse2(ptr, len) wrapper (the `legacy:` line), and the
+#    json_error_message table.
 #
 # Behaviour pinned as it is today, quirks included (test.sh says the same):
-#   - json_parse2 reports every failure as JSON_ERR_UNEXPECTED_CHAR; only the
+#   - json_parse reports every failure as JSON_ERR_UNEXPECTED_CHAR; only the
 #     position differs.  The other codes exist only in json_error_message.
 #   - numbers are integers: "-1.25" parses as -125 (the '.' is skipped);
 #   - trailing input after the first value is ignored: "[1] x" parses as [1].
+#
+# `match` arms are single expressions, so each arm that does work is a helper
+# returning i32 (see 77_args).
 #
 # Invalid stdin prints the error line and exits 1.
 
@@ -35,7 +43,10 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.gvec
+import ritzlib.option
 import ritzlib.result
+import ritzlib.strview
+import ritzlib.string
 import ritzlib.json
 
 const PATH_MAX: i64 = 480
@@ -47,56 +58,124 @@ var g_tally: [6]i64
 # Output helpers
 # ============================================================================
 
-fn show(label: *u8, v: i64)
-    prints_cstr(label)
+fn show(label: StrView, v: i64) -> i32
+    prints(label)
     print_int(v)
     print_char('\n')
+    0
 
-fn kind_name(kind: i32) -> *u8
+fn kind_name(kind: i32) -> StrView
     if kind == JSON_NULL
-        return c"null"
+        return "null"
     if kind == JSON_BOOL
-        return c"bool"
+        return "bool"
     if kind == JSON_NUMBER
-        return c"number"
+        return "number"
     if kind == JSON_STRING
-        return c"string"
+        return "string"
     if kind == JSON_ARRAY
-        return c"array"
+        return "array"
     if kind == JSON_OBJECT
-        return c"object"
-    return c"?"
+        return "object"
+    return "?"
 
-# Print a C string with control bytes as `<decimal>` (so the golden output stays
-# free of raw tabs), or `(null)` for a null pointer.
-fn show_raw(s: *u8)
-    if s == null
-        prints_cstr(c"(null)")
-        return
-    var i: i64 = 0
-    while *(s + i) != 0
-        let c: u8 = *(s + i)
+# Print `s` with control bytes as `<decimal>` (so the golden output stays
+# free of raw tabs).
+fn show_raw(s: StrView) -> i32
+    for i in 0..s.len
+        let c: u8 = *(s.ptr + i)
         if c < 32
-            prints_cstr(c"<")
+            prints("<")
             print_int(c as i64)
-            prints_cstr(c">")
+            prints(">")
         else
             print_char(c)
-        i += 1
+    0
 
-fn show_cstr(label: *u8, s: *u8)
-    prints_cstr(label)
+fn show_view(label: StrView, s: StrView) -> i32
+    prints(label)
     show_raw(s)
     print_char('\n')
+    0
 
-# Print `v` as JSON (json_to_string), freeing the copy.
-fn print_json(v: *JsonValue)
-    let s: *u8 = json_to_string(v)
-    if s == null
-        prints_cstr(c"(oom)")
-        return
-    prints_cstr(s)
-    free(s)
+# --- Printers for the accessors' Options.  None prints what the pre-#1482
+# --- accessor returned in its place: 0 for numbers and bools, `(null)` for
+# --- strings.
+
+fn bool_i64(b: bool) -> i64
+    if b
+        return 1
+    0
+
+fn show_num(label: StrView, o: Option<i64>) -> i32
+    match o
+        Some(n) => show(label, n)
+        None => show(label, 0)
+
+fn show_bool(label: StrView, o: Option<bool>) -> i32
+    match o
+        Some(b) => show(label, bool_i64(b))
+        None => show(label, 0)
+
+fn show_str(label: StrView, o: Option<StrView>) -> i32
+    match o
+        Some(s) => show_view(label, s)
+        None => show_view(label, "(null)")
+
+# --- Option<*JsonValue> combinators, so a lookup chain stays one expression.
+
+fn field_of(o: Option<*JsonValue>, key: StrView) -> Option<*JsonValue>
+    match o
+        Some(v) => json_get_field(v, key)
+        None => None
+
+fn index_of(o: Option<*JsonValue>, i: i64) -> Option<*JsonValue>
+    match o
+        Some(v) => json_get_index(v, i)
+        None => None
+
+fn number_of(o: Option<*JsonValue>) -> Option<i64>
+    match o
+        Some(v) => json_get_number(v)
+        None => None
+
+fn bool_of(o: Option<*JsonValue>) -> Option<bool>
+    match o
+        Some(v) => json_get_bool(v)
+        None => None
+
+fn string_of(o: Option<*JsonValue>) -> Option<StrView>
+    match o
+        Some(v) => json_get_string(v)
+        None => None
+
+# A missing value counts as null, as json_is_null(null) does.
+fn is_null_of(o: Option<*JsonValue>) -> i64
+    match o
+        Some(v) => json_is_null(v) as i64
+        None => 1
+
+fn is_none(o: Option<*JsonValue>) -> i64
+    match o
+        Some(_) => 0
+        None => 1
+
+fn array_len_of(o: Option<*JsonValue>) -> i64
+    match o
+        Some(v) => json_array_len(v)
+        None => 0
+
+fn object_len_of(o: Option<*JsonValue>) -> i64
+    match o
+        Some(v) => json_object_len(v)
+        None => 0
+
+# Print `v` as JSON (json_to_string), dropping the String.
+fn print_json(v: *JsonValue) -> i32
+    var s: String = json_to_string(v)
+    prints(string_as_view(@s))
+    string_drop(@&s)
+    0
 
 # Append `s` to the path buffer at `len`, clamped to PATH_MAX; returns new len.
 fn path_push(path: *u8, len: i64, s: *u8) -> i64
@@ -113,64 +192,88 @@ fn path_push(path: *u8, len: i64, s: *u8) -> i64
 # 1. Walk
 # ============================================================================
 
+# Raw value between bars, then its JSON-escaped form.
+fn walk_string(v: *JsonValue, s: StrView) -> i32
+    print_char('|')
+    show_raw(s)
+    prints("| ")
+    print_json(v)
+    print_char('\n')
+    0
+
 # Print one node and recurse.  Uses only the public accessors to read values;
-# `kind` is the only struct field touched, to choose which accessor applies.
-fn walk(v: *JsonValue, path: *u8, plen: i64)
+# `kind` is the only struct field touched, to choose which accessor applies
+# (and `keys`, which has no accessor, to enumerate an object).  The None arms
+# below cannot fire for a node of the matching kind.
+fn walk(v: *JsonValue, path: *u8, plen: i64) -> i32
     let kind: i32 = v.kind
     g_tally[kind as i64] = g_tally[kind as i64] + 1
 
     if plen == 0
-        prints_cstr(c"$")
+        prints("$")
     else
         prints_cstr(path)
     print_char(' ')
-    prints_cstr(kind_name(kind))
+    prints(kind_name(kind))
     print_char(' ')
 
     if kind == JSON_OBJECT
         let n: i64 = json_object_len(v)
-        prints_cstr(c"{")
+        prints("{")
         print_int(n)
-        prints_cstr(c"}\n")
+        prints("}\n")
         for i in 0..n
             let key: *u8 = *(v.keys + i)
-            var nlen: i64 = path_push(path, plen, c".")
+            var nlen: i64 = path_push(path, plen, ".")
             nlen = path_push(path, nlen, key)
-            walk(json_get_field(v, key), path, nlen)
+            match json_get_field(v, strview_from_cstr(key))
+                Some(child) => walk(child, path, nlen)
+                None => 0
             *(path + plen) = 0
     else if kind == JSON_ARRAY
         let n: i64 = json_array_len(v)
-        prints_cstr(c"[")
+        prints("[")
         print_int(n)
-        prints_cstr(c"]\n")
+        prints("]\n")
         for i in 0..n
             var num: [24]u8
             itoa(i, @num[0])
-            var nlen: i64 = path_push(path, plen, c"[")
+            var nlen: i64 = path_push(path, plen, "[")
             nlen = path_push(path, nlen, @num[0])
-            nlen = path_push(path, nlen, c"]")
-            walk(json_get_index(v, i), path, nlen)
+            nlen = path_push(path, nlen, "]")
+            match json_get_index(v, i)
+                Some(child) => walk(child, path, nlen)
+                None => 0
             *(path + plen) = 0
     else if kind == JSON_STRING
-        # Raw value between bars, then its JSON-escaped form.
-        print_char('|')
-        show_raw(json_get_string(v))
-        prints_cstr(c"| ")
-        print_json(v)
-        print_char('\n')
+        match json_get_string(v)
+            Some(s) => walk_string(v, s)
+            None => 0
     else if kind == JSON_NUMBER
-        print_int(json_get_number(v))
-        print_char('\n')
+        show_num("", json_get_number(v))
     else if kind == JSON_BOOL
-        print_int(json_get_bool(v) as i64)
-        print_char('\n')
+        show_bool("", json_get_bool(v))
     else
-        prints_cstr(c"is_null=")
-        print_int(json_is_null(v) as i64)
-        print_char('\n')
+        show("is_null=", json_is_null(v) as i64)
+    0
 
-fn builtin_doc() -> *u8
-    return c"{\"name\": \"ritz\", \"version\": 3, \"stable\": false, \"tags\": [\"compiler\", \"self-hosted\"], \"owner\": null, \"meta\": {\"tier\": 5, \"ratio\": -1.25, \"quote\": \"say \\\"hi\\\"\\tnow\", \"empty\": [], \"none\": {}}}"
+fn builtin_doc() -> StrView
+    return "{\"name\": \"ritz\", \"version\": 3, \"stable\": false, \"tags\": [\"compiler\", \"self-hosted\"], \"owner\": null, \"meta\": {\"tier\": 5, \"ratio\": -1.25, \"quote\": \"say \\\"hi\\\"\\tnow\", \"empty\": [], \"none\": {}}}"
+
+# Compare the second emission with the first; frees the re-parsed tree.
+fn roundtrip_check(out: @String, again: *JsonValue) -> i32
+    var out2: String = json_to_string(again)
+    if string_eq_string(out, @out2)
+        println("roundtrip: identical")
+    else
+        show_view("roundtrip: DIFFERS: ", string_as_view(@out2))
+    string_drop(@&out2)
+    json_free(again)
+    0
+
+fn reparse_failed(err: JsonError) -> i32
+    show("roundtrip: reparse failed at ", err.pos)
+    1
 
 # Walk, tally and re-emit `root`; check the emitted text round-trips.
 fn report(root: *JsonValue) -> i32
@@ -182,49 +285,37 @@ fn report(root: *JsonValue) -> i32
 
     for k in 0..6
         if g_tally[k] != 0
-            prints_cstr(c"count ")
-            prints_cstr(kind_name(k as i32))
-            prints_cstr(c": ")
+            prints("count ")
+            prints(kind_name(k as i32))
+            prints(": ")
             print_int(g_tally[k])
             print_char('\n')
 
-    # Bounds: index len must be rejected, not read one slot past the end.
+    # Bounds: index len must be None, not read one slot past the end.
     if root.kind == JSON_ARRAY
         let n: i64 = json_array_len(root)
-        show(c"index len == null: ", (json_get_index(root, n) == null) as i64)
-        show(c"index len+100 == null: ", (json_get_index(root, n + 100) == null) as i64)
+        show("index len == null: ", is_none(json_get_index(root, n)))
+        show("index len+100 == null: ", is_none(json_get_index(root, n + 100)))
 
-    let out: *u8 = json_to_string(root)
-    if out == null
-        println("json_to_string failed")
-        return 1
-    prints_cstr(c"emit: ")
-    prints_cstr(out)
+    var out: String = json_to_string(root)
+    prints("emit: ")
+    prints(string_as_view(@out))
     print_char('\n')
 
-    # Re-parse the emitted text with the legacy API and emit it again.
-    let again: JsonResult = json_parse(out, strlen(out))
-    if again.ok == 0
-        show(c"roundtrip: reparse failed at ", again.error_pos)
-        free(out)
-        return 1
-    let out2: *u8 = json_to_string(again.value)
-    if streq(out, out2) != 0
-        println("roundtrip: identical")
-    else
-        show_cstr(c"roundtrip: DIFFERS: ", out2)
-    free(out2)
-    json_free(again.value)
-    free(out)
-    return 0
+    # Re-parse the emitted text and emit it again.
+    let rc: i32 = match json_parse(string_as_view(@out))
+        Ok(again) => roundtrip_check(@out, again)
+        Err(err) => reparse_failed(err)
+    string_drop(@&out)
+    return rc
 
 fn print_parse_error(err: JsonError) -> i32
-    prints_cstr(c"error: code=")
+    prints("error: code=")
     print_int(err.code as i64)
-    prints_cstr(c" pos=")
+    prints(" pos=")
     print_int(err.pos)
-    prints_cstr(c" msg=")
-    prints_cstr(json_error_message(err.code))
+    prints(" msg=")
+    prints(json_error_message(err.code))
     print_char('\n')
     return 1
 
@@ -232,103 +323,120 @@ fn print_parse_error(err: JsonError) -> i32
 # 2. Lookups
 # ============================================================================
 
-fn lookups()
-    let src: *u8 = builtin_doc()
-    let r: JsonResult = json_parse(src, strlen(src))
-    if r.ok == 0
-        println("builtin doc failed to parse")
-        return
-    let root: *JsonValue = r.value
+fn lookups_in(root: *JsonValue) -> i32
+    let doc: Option<*JsonValue> = Some(root)
+    let name: Option<*JsonValue> = json_get_field(root, "name")
+    let version: Option<*JsonValue> = json_get_field(root, "version")
+    let tags: Option<*JsonValue> = json_get_field(root, "tags")
+    let meta: Option<*JsonValue> = json_get_field(root, "meta")
 
-    show_cstr(c"name: ", json_get_string(json_get_field(root, c"name")))
-    show(c"version: ", json_get_number(json_get_field(root, c"version")))
-    show(c"stable: ", json_get_bool(json_get_field(root, c"stable")) as i64)
-    let tags: *JsonValue = json_get_field(root, c"tags")
-    show(c"tags len: ", json_array_len(tags))
-    show_cstr(c"tags[1]: ", json_get_string(json_get_index(tags, 1)))
-    show_cstr(c"tags[2] (out of range): ", json_get_string(json_get_index(tags, 2)))
-    show(c"tags[2] is_null: ", json_is_null(json_get_index(tags, 2)) as i64)
-    # The pointer itself, not just the accessor defaults on it: reading one
-    # slot past the end can still yield defaults from zeroed heap.
-    show(c"tags[2] == null: ", (json_get_index(tags, 2) == null) as i64)
-    show_cstr(c"tags[-1]: ", json_get_string(json_get_index(tags, 0 - 1)))
-    show(c"owner is_null: ", json_is_null(json_get_field(root, c"owner")) as i64)
-    show(c"name is_null: ", json_is_null(json_get_field(root, c"name")) as i64)
-    let meta: *JsonValue = json_get_field(root, c"meta")
-    show(c"meta object_len: ", json_object_len(meta))
-    show(c"meta.tier: ", json_get_number(json_get_field(meta, c"tier")))
-    show(c"meta.ratio (-1.25): ", json_get_number(json_get_field(meta, c"ratio")))
-    show_cstr(c"meta.quote: ", json_get_string(json_get_field(meta, c"quote")))
-    show(c"meta.empty array_len: ", json_array_len(json_get_field(meta, c"empty")))
-    show(c"meta.none object_len: ", json_object_len(json_get_field(meta, c"none")))
+    show_str("name: ", string_of(name))
+    show_num("version: ", number_of(version))
+    show_bool("stable: ", bool_of(field_of(doc, "stable")))
+    show("tags len: ", array_len_of(tags))
+    show_str("tags[1]: ", string_of(index_of(tags, 1)))
+    show_str("tags[2] (out of range): ", string_of(index_of(tags, 2)))
+    show("tags[2] is_null: ", is_null_of(index_of(tags, 2)))
+    # The Option itself, not just what the printers make of it: reading one
+    # slot past the end could still yield a plausible value from zeroed heap.
+    show("tags[2] == null: ", is_none(index_of(tags, 2)))
+    show_str("tags[-1]: ", string_of(index_of(tags, 0 - 1)))
+    show("owner is_null: ", is_null_of(field_of(doc, "owner")))
+    show("name is_null: ", is_null_of(name))
+    show("meta object_len: ", object_len_of(meta))
+    show_num("meta.tier: ", number_of(field_of(meta, "tier")))
+    show_num("meta.ratio (-1.25): ", number_of(field_of(meta, "ratio")))
+    show_str("meta.quote: ", string_of(field_of(meta, "quote")))
+    show("meta.empty array_len: ", array_len_of(field_of(meta, "empty")))
+    show("meta.none object_len: ", object_len_of(field_of(meta, "none")))
 
-    # Defaults: missing keys and wrong kinds never crash.
-    let missing: *JsonValue = json_get_field(root, c"missing")
-    show(c"missing == null: ", (missing == null) as i64)
-    show(c"missing is_null: ", json_is_null(missing) as i64)
-    show(c"missing number: ", json_get_number(missing))
-    show(c"missing bool: ", json_get_bool(missing) as i64)
-    show_cstr(c"missing string: ", json_get_string(missing))
-    show_cstr(c"name.x (field of string): ", json_get_string(json_get_field(json_get_field(root, c"name"), c"x")))
-    show(c"name as number: ", json_get_number(json_get_field(root, c"name")))
-    show_cstr(c"version as string: ", json_get_string(json_get_field(root, c"version")))
-    show(c"version as bool: ", json_get_bool(json_get_field(root, c"version")) as i64)
-    show(c"meta array_len: ", json_array_len(meta))
-    show(c"tags object_len: ", json_object_len(tags))
-    show(c"root[0]: ", json_is_null(json_get_index(root, 0)) as i64)
+    # None: missing keys and wrong kinds never crash.
+    let missing: Option<*JsonValue> = json_get_field(root, "missing")
+    show("missing == null: ", is_none(missing))
+    show("missing is_null: ", is_null_of(missing))
+    show_num("missing number: ", number_of(missing))
+    show_bool("missing bool: ", bool_of(missing))
+    show_str("missing string: ", string_of(missing))
+    show_str("name.x (field of string): ", string_of(field_of(name, "x")))
+    show_num("name as number: ", number_of(name))
+    show_str("version as string: ", string_of(version))
+    show_bool("version as bool: ", bool_of(version))
+    show("meta array_len: ", array_len_of(meta))
+    show("tags object_len: ", object_len_of(tags))
+    show("root[0]: ", is_null_of(json_get_index(root, 0)))
 
     json_free(root)
+    0
+
+fn builtin_failed(err: JsonError) -> i32
+    println("builtin doc failed to parse")
+    1
+
+fn lookups()
+    match json_parse(builtin_doc())
+        Ok(root) => lookups_in(root)
+        Err(err) => builtin_failed(err)
 
 # ============================================================================
 # 3. Errors
 # ============================================================================
 
-# Parse `src` both ways; print the Result's error or the emitted value.
-fn try_parse(label: *u8, src: *u8)
-    prints_cstr(label)
-    prints_cstr(c": ")
-    var res: Result<*JsonValue, JsonError> = json_parse2(src, strlen(src))
-    let failed: i32 = match res
-        Ok(v) => ok_case(v)
-        Err(err) => print_parse_error(err)
-
-    let legacy: JsonResult = json_parse(src, strlen(src))
-    prints_cstr(c"  legacy: ok=")
-    print_int(legacy.ok as i64)
-    if legacy.ok == 0
-        prints_cstr(c" pos=")
-        print_int(legacy.error_pos)
-        prints_cstr(c" error=")
-        prints_cstr(legacy.error)
-    else
-        json_free(legacy.value)
-    print_char('\n')
-    show(c"  failed: ", failed as i64)
-
 fn ok_case(v: *JsonValue) -> i32
-    prints_cstr(c"ok ")
+    prints("ok ")
     print_json(v)
     print_char('\n')
     json_free(v)
     return 0
 
+# The `legacy:` line, from the deprecated json_parse2(ptr, len) wrapper.  It
+# keeps the wording of the JsonResult struct it replaced (ok / pos / error).
+fn legacy_ok(v: *JsonValue) -> i32
+    println("  legacy: ok=1")
+    json_free(v)
+    0
+
+fn legacy_err(err: JsonError) -> i32
+    prints("  legacy: ok=0 pos=")
+    print_int(err.pos)
+    println(" error=JSON parse error")
+    1
+
+# Parse `src` with json_parse and with json_parse2; print the Result's error
+# or the emitted value.
+fn try_parse(label: StrView, src: StrView)
+    prints(label)
+    prints(": ")
+    let failed: i32 = match json_parse(src)
+        Ok(v) => ok_case(v)
+        Err(err) => print_parse_error(err)
+
+    match json_parse2(src.ptr, src.len)
+        Ok(v) => legacy_ok(v)
+        Err(err) => legacy_err(err)
+    show("  failed: ", failed as i64)
+
 fn errors()
-    try_parse(c"missing colon", c"{\"a\" 1}")
-    try_parse(c"unclosed array", c"[1, 2")
-    try_parse(c"unterminated string", c"\"open")
-    try_parse(c"bad literal", c"{\"a\": tru}")
-    try_parse(c"empty input", c"")
-    try_parse(c"trailing input (accepted)", c"[1] x")
+    try_parse("missing colon", "{\"a\" 1}")
+    try_parse("unclosed array", "[1, 2")
+    try_parse("unterminated string", "\"open")
+    try_parse("bad literal", "{\"a\": tru}")
+    try_parse("empty input", "")
+    try_parse("trailing input (accepted)", "[1] x")
     for code in 0..8
-        prints_cstr(c"message ")
+        prints("message ")
         print_int(code as i64)
-        prints_cstr(c": ")
-        prints_cstr(json_error_message(code as i32))
+        prints(": ")
+        prints(json_error_message(code as i32))
         print_char('\n')
 
 # ============================================================================
 # main
 # ============================================================================
+
+fn report_and_free(root: *JsonValue) -> i32
+    let rc: i32 = report(root)
+    json_free(root)
+    return rc
 
 fn main() -> i32
     println("== doc ==")
@@ -337,20 +445,15 @@ fn main() -> i32
         println("vec_read_all_fd failed")
         return 1
 
-    var src: *u8 = null
-    var len: i64 = 0
+    var src: StrView = builtin_doc()
     if input.len == 0
         println("source: builtin")
-        src = builtin_doc()
-        len = strlen(src)
     else
         println("source: stdin")
-        src = input.data
-        len = input.len
-    show(c"bytes: ", len)
+        src = strview_from_ptr(input.data, input.len)
+    show("bytes: ", src.len)
 
-    var res: Result<*JsonValue, JsonError> = json_parse2(src, len)
-    let rc: i32 = match res
+    let rc: i32 = match json_parse(src)
         Ok(root) => report_and_free(root)
         Err(err) => print_parse_error(err)
     vec_drop<u8>(@&input)
@@ -362,8 +465,3 @@ fn main() -> i32
     println("== errors ==")
     errors()
     return 0
-
-fn report_and_free(root: *JsonValue) -> i32
-    let rc: i32 = report(root)
-    json_free(root)
-    return rc

@@ -8,6 +8,9 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
 import ritzlib.json
 
 # =============================================================================
@@ -60,6 +63,48 @@ pub fn lsp_message_free(msg: *LspMessage)
         json_free(msg.json_root)
 
 # =============================================================================
+# JSON access adapters
+# =============================================================================
+# ritzlib.json's lookups return Option; the handlers here test each value for
+# null (and check its kind) themselves, so these collapse None to null / 0.
+
+# The parsed message, or null after reporting the parse error.
+fn parse_root(text: StrView) -> *JsonValue
+    match json_parse(text)
+        Ok(v) => v
+        Err(e) => report_parse_error(e)
+
+fn report_parse_error(err: JsonError) -> *JsonValue
+    eprints_cstr(c"[ritz-lsp] JSON parse error at position ")
+    eprint_int(err.pos)
+    eprints_cstr(c"\n")
+    return null
+
+# Field `key` of `obj`, or null if `obj` is not an object or lacks it.
+pub fn lsp_field(obj: *JsonValue, key: StrView) -> *JsonValue
+    match json_get_field(obj, key)
+        Some(v) => v
+        None => null as *JsonValue
+
+# Element `idx` of array `arr`, or null.
+pub fn lsp_index(arr: *JsonValue, idx: i64) -> *JsonValue
+    match json_get_index(arr, idx)
+        Some(v) => v
+        None => null as *JsonValue
+
+# The NUL-terminated bytes of string value `v`, or null if `v` is not a string.
+pub fn lsp_string(v: *JsonValue) -> *u8
+    match json_get_string(v)
+        Some(s) => s.ptr
+        None => null as *u8
+
+# The value of number `v`, or 0 if `v` is not a number.
+pub fn lsp_number(v: *JsonValue) -> i64
+    match json_get_number(v)
+        Some(n) => n
+        None => 0
+
+# =============================================================================
 # Message Parsing
 # =============================================================================
 
@@ -67,25 +112,20 @@ pub fn lsp_message_free(msg: *LspMessage)
 pub fn parse_message(json_str: *u8) -> LspMessage
     var msg: LspMessage = lsp_message_new()
 
-    let len: i64 = strlen(json_str)
-    let result: JsonResult = json_parse(json_str, len)
-
-    if result.ok == 0
-        eprints_cstr(c"[ritz-lsp] JSON parse error at position ")
-        eprint_int(result.error_pos)
-        eprints_cstr(c"\n")
+    let root: *JsonValue = parse_root(strview_from_cstr(json_str))
+    if root == null
         return msg
 
-    msg.json_root = result.value
+    msg.json_root = root
 
     # Check for "jsonrpc": "2.0"
-    let version: *JsonValue = json_get_field(result.value, c"jsonrpc")
+    let version: *JsonValue = lsp_field(root, "jsonrpc")
     if version == null
         eprints_cstr(c"[ritz-lsp] Missing jsonrpc field\n")
         return msg
 
     # Get ID if present
-    let id_val: *JsonValue = json_get_field(result.value, c"id")
+    let id_val: *JsonValue = lsp_field(root, "id")
     if id_val != null
         if id_val.kind == JSON_NUMBER
             msg.id = id_val.num_val
@@ -95,7 +135,7 @@ pub fn parse_message(json_str: *u8) -> LspMessage
             msg.id = 0
 
     # Get method if present
-    let method_val: *JsonValue = json_get_field(result.value, c"method")
+    let method_val: *JsonValue = lsp_field(root, "method")
     if method_val != null && method_val.kind == JSON_STRING
         # Copy method string
         let method_len: i64 = method_val.str_len
@@ -104,10 +144,10 @@ pub fn parse_message(json_str: *u8) -> LspMessage
             memcpy(msg.method, method_val.str_val, method_len + 1)
 
     # Get params if present
-    msg.params = json_get_field(result.value, c"params")
+    msg.params = lsp_field(root, "params")
 
     # Get result if present (for responses)
-    msg.result = json_get_field(result.value, c"result")
+    msg.result = lsp_field(root, "result")
 
     # Determine message type
     if msg.method != null
@@ -115,7 +155,7 @@ pub fn parse_message(json_str: *u8) -> LspMessage
             msg.kind = MSG_REQUEST
         else
             msg.kind = MSG_NOTIFICATION
-    else if msg.result != null || json_get_field(result.value, c"error") != null
+    else if msg.result != null || lsp_field(root, "error") != null
         msg.kind = MSG_RESPONSE
 
     return msg
