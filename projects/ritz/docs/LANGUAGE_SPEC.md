@@ -4778,10 +4778,19 @@ element always holds a value. An array of any rank is dropped element by element
 in index order (`g[0][0]`, `g[0][1]`, … `g[1][0]`), as a rank-1 array is. Both
 compilers do all of this (AGAST #3376, #3377).
 
-The place is evaluated before the value: `a[i] = v` evaluates `a`, then `i`,
-then `v`, left to right as everywhere else, and `g[i][j] = v` evaluates `i`
-before `j` (LARB R61, AGAST #3482). Then the old element drops and `v` is
-stored, as above.
+An assignment evaluates its place before its value, whatever the place is: a
+binding, a field, an element or a dereference. Every call in the place runs
+first, once each, left to right; `v` runs after them. That covers an
+`index_mut` or `deref_mut` the place goes through (§7.7, §7.8). It runs after
+its own operands, so `g[k()] = v` through `IndexMut` runs `k()`, then
+`index_mut`, then `v`. `a[i] = v` evaluates `a`, then `i`, then `v`, and
+`g[i][j] = v` evaluates `i` before `j` (LARB R61, AGAST #3482). `f().x = v`
+calls `f` once, then evaluates `v`, and so does `*f() = v`. `ps[i()].x = v`
+calls `i` once, then evaluates `v` (AGAST #1740). Then any old value drops and
+`v` is stored, as above.
+
+`m[k] = v` through `IndexSet` is `index_set(@&m, k, v)`. `v` is one of its
+arguments, so the order is `m`, `k`, `v`, then `index_set`.
 
 ```ritz
 var D: i64 = 0
@@ -4800,6 +4809,35 @@ fn main() -> i32
     var g: [2][2]i64 = [ [0, 0], [0, 0] ]
     g[idx(0)][idx(1)] = val(5)     # i, then j, then val: D is 78778
     return (D - 78778) as i32      # 0
+```
+
+A field of a call's result and a store through a call's pointer go the same
+way: the call in the place runs first, once.
+
+```ritz
+var D: i64 = 0
+
+struct P
+    x: i64
+
+fn at(p: *P) -> *P
+    D = D * 10 + 7
+    return p
+
+fn cell(p: *i64) -> *i64
+    D = D * 10 + 7
+    return p
+
+fn val(x: i64) -> i64
+    D = D * 10 + 8
+    return x
+
+fn main() -> i32
+    var p = P { x: 0 }
+    at(@p).x = val(5)              # at, then val: D is 78
+    var n: i64 = 0
+    *cell(@n) = val(6)             # cell, then val: D is 7878
+    return (D - 7878 + p.x + n - 11) as i32   # 0
 ```
 
 A move out of a nested field moves that field only, at any depth, as in Rust.

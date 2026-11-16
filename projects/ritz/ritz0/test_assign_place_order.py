@@ -11,7 +11,7 @@ measured index places only.  Member and deref places split the compilers:
 
 so `bump_o(p, @o).big = *p` exited 7 on ritz0 and 8 on ritz1.  Every place
 form now runs its calls first, once each, left to right, then the value.
-The spec's wording covers `a[i] = v` only; AGAST #3665 widens it.
+AGAST #3665 widened §13.6 to say so for every place.
 
 Each program records its calls as decimal digits in `seq`: 1 for a call in
 the place, 3 for an `index_mut` / `deref_mut` the place runs, 2 for the
