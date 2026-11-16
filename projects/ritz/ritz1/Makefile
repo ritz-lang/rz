@@ -47,7 +47,9 @@ SOURCES = \
 	emitter_expr \
 	emitter_match \
 	enum_as_int \
+	sema \
 	must_use \
+	sema_walk \
 	bool_check \
 	call_check \
 	literal_slot \

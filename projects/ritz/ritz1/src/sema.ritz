@@ -1,0 +1,142 @@
+# ritz1/src/sema.ritz - the checking phase: a `Sema` context over the AST
+#
+# AGAST #3462 (step 1 of #1816; LARB review/5 ritz1 N1).  ritz1 ran every
+# semantic check inside code generation, as a `pub fn *check*(s:
+# *EmitterState, ..)` called mid-lowering, so a check ran only where codegen
+# reached and every new rule grew the emitter.  Sema is the phase those
+# checks move to.  main runs it once per module, after infer_generic_calls
+# and monomorphize_module and before emit_module, and stops the compile on
+# any error it reports.  A check on Sema takes `sm: *Sema` and reads the AST
+# only.  tools/test_ritz1_emitter_check_freeze.py keeps a new one from going
+# on EmitterState ("Where a new check goes", ritz1/ARCHITECTURE.md).
+#
+# Sema walks exactly the fns emit_module lowers: the module's own
+# non-generic fns (first of each name), then the methods of its non-generic
+# impls.  Monomorphisation has already run, so a generic fn is judged in each
+# instance, as the emitter judged it.
+#
+# Its scope is lexical: a block, a `for` or a match arm puts back what it
+# bound on exit (binder_check's discipline).
+#
+# The checks on it:
+#   must_use_check (must_use.ritz, AGAST #2137): a discarded [[must_use]] call.
+#
+# It still imports emitter_core for pure helpers (name_eq, eprint_bytes,
+# find_impl_method_by_symbol); moving them off emitter_core belongs to #1816's
+# layering child tickets.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.hash
+import ritzlib.hashmap
+
+import ast
+import ast_helpers
+import emitter_core
+
+struct Sema
+    module: *Module
+    file: *u8              # the input path every diagnostic names
+    error_count: i32
+    fn_map: HashMapI64     # fnv1a(name) -> the first FnDef of that name
+    # The locals in scope in the fn being walked, innermost last.
+    scope_name: **u8
+    scope_len: *i32
+    scope_top: i32
+    scope_cap: i32
+
+pub fn sema_init(sm: *Sema, m: *Module, file: *u8)
+    sm.module = m
+    sm.file = file
+    sm.error_count = 0
+    sm.fn_map = hashmap_i64_with_cap(4096)
+    var f: *FnDef = m.functions
+    while f != null
+        let k: i64 = fnv1a_str(f.name, f.name_len) as i64
+        if hashmap_i64_contains(@sm.fn_map, k) == 0
+            hashmap_i64_insert(@&sm.fn_map, k, f as i64)
+        f = f.next
+    sm.scope_cap = 256
+    sm.scope_name = malloc(sm.scope_cap as i64 * 8) as **u8
+    sm.scope_len = malloc(sm.scope_cap as i64 * 4) as *i32
+    sm.scope_top = 0
+
+# --- Diagnostics ---------------------------------------------------------------
+
+# `error: <file>:<line>:<col>: ` -- the caller writes the rest of the line.
+# Counts one error.
+pub fn sema_error_at(sm: *Sema, line: i32, col: i32)
+    eprints_cstr(c"error: ")
+    if sm.file != null
+        eprints_cstr(sm.file)
+    else
+        eprints_cstr(c"<input>")
+    eprints_cstr(c":")
+    eprint_int(line as i64)
+    eprints_cstr(c":")
+    eprint_int(col as i64)
+    eprints_cstr(c": ")
+    sm.error_count = sm.error_count + 1
+
+# --- Name resolution -----------------------------------------------------------
+
+# The fn named `name`: the first of that name in the module, as the
+# emitter's find_fn resolves it.
+pub fn sema_find_fn(sm: *Sema, name: *u8, len: i32) -> *FnDef
+    let fd: *FnDef = hashmap_i64_get(@sm.fn_map, fnv1a_str(name, len) as i64) as *FnDef
+    if fd == null
+        return null
+    if name_eq(fd.name, fd.name_len, name, len) == 1
+        return fd
+    # The map is keyed by the hash alone: a hit with another name is a
+    # collision, so scan (first occurrence wins).
+    var cur: *FnDef = sm.module.functions
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    null
+
+# The fn a named call `e` calls, as the emitter's find_call_fn resolves it:
+# a generic instance by its type suffix, else the fn, else an impl method by
+# its `Type_method` symbol.  Null for a nameless call.
+pub fn sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
+    if e.func_name_len == 0
+        return null
+    if e.call_type_suffix_len <= 0
+        let f: *FnDef = sema_find_fn(sm, e.func_name, e.func_name_len)
+        if f != null
+            return f
+        return find_impl_method_by_symbol(sm.module, e.func_name, e.func_name_len)
+    let n: i32 = e.func_name_len + e.call_type_suffix_len
+    let buf: *u8 = malloc(n as i64 + 1)
+    for i in 0..e.func_name_len
+        *(buf + i) = *(e.func_name + i)
+    for i in 0..e.call_type_suffix_len
+        *(buf + e.func_name_len + i) = *(e.call_type_suffix + i)
+    *(buf + n) = 0
+    let fd: *FnDef = sema_find_fn(sm, buf, n)
+    free(buf)
+    fd
+
+# --- Scope ---------------------------------------------------------------------
+
+pub fn sema_bind(sm: *Sema, name: *u8, len: i32)
+    if name == null or len <= 0
+        return
+    if sm.scope_top >= sm.scope_cap
+        sm.scope_cap = sm.scope_cap * 2
+        sm.scope_name = realloc(sm.scope_name as *u8, sm.scope_cap as i64 * 8) as **u8
+        sm.scope_len = realloc(sm.scope_len as *u8, sm.scope_cap as i64 * 4) as *i32
+    *(sm.scope_name + sm.scope_top) = name
+    *(sm.scope_len + sm.scope_top) = len
+    sm.scope_top = sm.scope_top + 1
+
+# 1 when a local named `name` is in scope.
+pub fn sema_is_local(sm: *Sema, name: *u8, len: i32) -> i32
+    var i: i32 = sm.scope_top - 1
+    while i >= 0
+        if name_eq(*(sm.scope_name + i), *(sm.scope_len + i), name, len) == 1
+            return 1
+        i = i - 1
+    0

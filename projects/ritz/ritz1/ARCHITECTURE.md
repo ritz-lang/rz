@@ -43,11 +43,32 @@ source.ritz
     |         Specialize generic functions/structs with
     |         concrete type arguments (Vec<i32>, etc.)
     v
+[sema]      sema + sema_walk (+ one module per check)
+    |         Check the AST; any error stops the compile here
+    v
 [emit]      emitter
     |         Walk AST, generate LLVM IR with SSA registers
     v
 output.ll
 ```
+
+## Where a new check goes
+
+A semantic check (a rule that refuses a program) goes on **Sema**, never on
+the emitter (AGAST #3462, #1816; LARB review/5 ritz1 N1):
+
+- Write it as `pub fn <rule>_check(sm: *Sema, ..)` in its own module
+  (`must_use.ritz` is the pattern).  It reads the AST only.  Use
+  `sema_find_fn` / `sema_call_fn` / `sema_is_local` to resolve names, and
+  `sema_error_at` to report a located `error: file:line:col: ...`.
+- Call it from the walk in `sema_walk.ritz`.  main runs `sema_check_module`
+  after monomorphisation and before `emit_module`, over exactly the fns the
+  emitter lowers, and stops on any error.
+- Do not add a `pub fn *check*(s: *EmitterState, ..)`.
+  `tools/test_ritz1_emitter_check_freeze.py` fails on a new one.  Its
+  allowlist (`tools/ritz1_emitter_checks.allow`) lists the checks still in
+  the emitter.  The list only shrinks: each move off the emitter is a child
+  ticket of #1816 and deletes its entries.
 
 ## Module Dependency Graph
 

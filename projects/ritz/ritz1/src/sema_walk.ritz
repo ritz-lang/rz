@@ -1,0 +1,144 @@
+# ritz1/src/sema_walk.ritz - the Sema pass: walk the module, run the checks
+#
+# AGAST #3462 (#1816).  sema_check_module is main's checking phase, between
+# monomorphisation and emit_module; see sema.ritz.  A new check is a call
+# from here into a `*_check(sm: *Sema, ..)` fn, never from the emitter.
+#
+# The walk visits what binder_check visits: every statement list (fn body,
+# if / else, while, for, loop, unsafe, defer, match and if-expression arms)
+# and the match / if expressions in a statement's value.  parser_alloc does
+# not zero the fields one statement kind leaves unset, so only the fields
+# each kind sets are read.
+
+import ritzlib.sys
+import ritzlib.hash
+import ritzlib.hashmap
+
+import ast
+import ast_helpers
+import emitter_core
+import sema
+import must_use
+
+fn sema_walk_arms(sm: *Sema, arms: *MatchArm)
+    var arm: *MatchArm = arms
+    while arm != null
+        let mark: i32 = sm.scope_top
+        if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
+            sema_bind(sm, arm.pattern_inner_name, arm.pattern_inner_name_len)
+        else if arm.pattern_kind == PAT_IDENT
+            sema_bind(sm, arm.pattern_name, arm.pattern_name_len)
+        sema_walk_stmts(sm, arm.body_stmts, 0)
+        sema_walk_expr(sm, arm.body)
+        sm.scope_top = mark
+        arm = arm.next
+
+# Only a match or an if/else expression holds statements.
+fn sema_walk_expr(sm: *Sema, e: *Expr)
+    if e == null
+        return
+    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+        sema_walk_arms(sm, e.args as *MatchArm)
+
+fn sema_is_assign(kind: i32) -> i32
+    (kind == STMT_ASSIGN or kind == STMT_MEMBER_ASSIGN or kind == STMT_MEMBER_INDEX_ASSIGN or kind == STMT_INDEX_ASSIGN or kind == STMT_LOCAL_FIELD_ASSIGN or kind == STMT_LOCAL_FIELD_INDEX_ASSIGN) as i32
+
+# A block: what it binds goes out of scope at its end.  A `let` is bound
+# after its initialiser.  `void_tail` is 1 for the body of a fn that returns
+# nothing, whose last statement is discarded too.
+fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
+    let mark: i32 = sm.scope_top
+    var st: *Stmt = first
+    while st != null
+        if st.kind == STMT_VAR_DECL
+            sema_walk_expr(sm, st.var_init)
+            sema_bind(sm, st.var_name, st.var_name_len)
+        else if st.kind == STMT_TUPLE_DECL
+            sema_walk_expr(sm, st.var_init)
+            sema_bind(sm, st.var_name, st.var_name_len)
+            sema_bind(sm, st.assign_target, st.assign_target_len)
+        else if st.kind == STMT_FOR
+            let for_mark: i32 = sm.scope_top
+            sema_bind(sm, st.for_var, st.for_var_len)
+            sema_walk_stmts(sm, st.for_body, 0)
+            sm.scope_top = for_mark
+        else if st.kind == STMT_IF
+            sema_walk_expr(sm, st.if_cond)
+            sema_walk_stmts(sm, st.if_then, 0)
+            sema_walk_stmts(sm, st.if_else, 0)
+        else if st.kind == STMT_WHILE
+            sema_walk_expr(sm, st.while_cond)
+            sema_walk_stmts(sm, st.while_body, 0)
+        else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
+            sema_walk_stmts(sm, st.while_body, 0)
+        else if st.kind == STMT_MATCH
+            sema_walk_arms(sm, st.if_then as *MatchArm)
+        else if st.kind == STMT_RETURN
+            sema_walk_expr(sm, st.return_value)
+        else if st.kind == STMT_EXPR
+            # Only a block's last statement can be its value (AGAST #2137).
+            if st.next != null or void_tail == 1
+                must_use_check(sm, st.expr)
+            sema_walk_expr(sm, st.expr)
+        else if sema_is_assign(st.kind) == 1
+            sema_walk_expr(sm, st.assign_value)
+        st = st.next
+    sm.scope_top = mark
+
+fn sema_walk_fn(sm: *Sema, f: *FnDef)
+    if f.body == null or fn_is_naked(f) == 1
+        return
+    sm.scope_top = 0
+    var p: *Param = f.params
+    while p != null
+        sema_bind(sm, p.name, p.name_len)
+        p = p.next
+    sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
+    sm.scope_top = 0
+
+# 1 for an 8-byte `sysc...` name: emit_module leaves those fns to its own
+# syscall shims, so it lowers (and judged) no body of theirs.
+fn sema_is_syscall_name(f: *FnDef) -> i32
+    if f.name_len != 8 or f.name == null
+        return 0
+    (*(f.name + 0) == 115 and *(f.name + 1) == 121 and *(f.name + 2) == 115 and *(f.name + 3) == 99) as i32
+
+# 1 when a fn of `f`'s name was walked already: emit_module lowers only the
+# first of a name (was_fn_emitted).  `seen` maps fnv1a(name) to that fn.
+fn sema_seen_before(m: *Module, seen: *HashMapI64, f: *FnDef) -> i32
+    let k: i64 = fnv1a_str(f.name, f.name_len) as i64
+    let hit: *FnDef = hashmap_i64_get(seen, k) as *FnDef
+    if hit == null
+        hashmap_i64_insert(seen, k, f as i64)
+        return 0
+    if name_eq(hit.name, hit.name_len, f.name, f.name_len) == 1
+        return 1
+    # A hash collision: scan the walked fns before `f` by name.
+    var cur: *FnDef = m.functions
+    while cur != f
+        if cur.type_params == null and cur.is_local == 1 and sema_is_syscall_name(cur) == 0 and name_eq(cur.name, cur.name_len, f.name, f.name_len) == 1
+            return 1
+        cur = cur.next
+    0
+
+# Run every Sema check over the fns emit_module lowers.  Returns how many
+# errors it reported; main stops the compile on any.
+pub fn sema_check_module(m: *Module, path: *u8) -> i32
+    let sm: *Sema = malloc(sizeof(Sema)) as *Sema
+    sema_init(sm, m, path)
+    var seen: HashMapI64 = hashmap_i64_with_cap(4096)
+    var f: *FnDef = m.functions
+    while f != null
+        if f.type_params == null and f.is_local == 1 and sema_is_syscall_name(f) == 0 and sema_seen_before(m, @&seen, f) == 0
+            sema_walk_fn(sm, f)
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params == null
+            var method: *FnDef = ib.methods
+            while method != null
+                if method.is_local == 1
+                    sema_walk_fn(sm, method)
+                method = method.next
+        ib = ib.next
+    sm.error_count
