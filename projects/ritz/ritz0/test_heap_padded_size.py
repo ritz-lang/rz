@@ -27,6 +27,10 @@ The same family, fixed here too:
   struct today is `Span<T>`, `{ ptr, i64 }`, where the two agree, so that
   case is pinned by a unit test with a padded body.
 
+AGAST #3664: `heap W<P> { .. }`, a generic literal directly under `heap`,
+crashed with "Unknown struct: W": the monomorphizer's instantiation walk never
+entered `heap`.  The `generic_lit*` cases pin it, parenthesised and nested.
+
 ritz1 has no `heap` expression (the keyword is reserved, LANGUAGE_SPEC §2):
 it refuses one at parse time, which is pinned so a future ritz1 `heap` gets
 these tests.  The padded structs ritzlib's generic containers hold (Box<T>,
@@ -98,6 +102,31 @@ HEAPS = {
         ),
         "p.tag == 1 and p.v.b == 77 and p.v.c == 3",
         32,
+    ),
+    # AGAST #3664: the generic literal directly under `heap`.  The
+    # monomorphizer's instantiation walk never entered `heap`, so `W<P>` was
+    # never instantiated and the emitter raised "Unknown struct: W".
+    "generic_lit": (
+        16,
+        "    let p = heap W<P> { tag: 1, v: P { a: 2, b: 77, c: 3 } }\n",
+        "p.tag == 1 and p.v.b == 77 and p.v.c == 3",
+        32,
+    ),
+    "generic_lit_paren": (
+        16,
+        "    let p = heap (W<P> { tag: 1, v: P { a: 2, b: 77, c: 3 } })\n",
+        "p.tag == 1 and p.v.b == 77 and p.v.c == 3",
+        32,
+    ),
+    # {u8, W<P>}: 12 unpadded, 40 padded; W<P> is instantiated only here.
+    "generic_lit_nested": (
+        16,
+        (
+            "    let p = heap W<W<P>> { tag: 1, v: W<P> { tag: 2,"
+            " v: P { a: 4, b: 77, c: 5 } } }\n"
+        ),
+        "p.tag == 1 and p.v.tag == 2 and p.v.v.b == 77 and p.v.v.c == 5",
+        40,
     ),
     # An array of padded structs: 20 unpadded, 48 padded: the second
     # element's `b` (55) lands on b's header (offset 32).

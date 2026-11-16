@@ -1131,6 +1131,11 @@ class Monomorphizer:
         elif isinstance(expr, rast.Cast):
             self._visit_expr(expr.expr)
             self._visit_type(expr.target)
+        elif isinstance(expr, rast.HeapExpr):
+            # `heap W<P> { .. }` (AGAST #3664): unvisited, W<P> was never
+            # instantiated, the rewrite left the literal's bare `W`, and the
+            # emitter raised "Unknown struct: W".
+            self._visit_expr(expr.expr)
         elif isinstance(expr, rast.TypeExpr):
             # `sizeof(Box<i64>)` (AGAST #3268) may be Box<i64>'s only use:
             # unvisited, it was never instantiated and the rewrite left a
