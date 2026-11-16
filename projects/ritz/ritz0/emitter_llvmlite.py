@@ -6256,6 +6256,13 @@ class LLVMEmitter:
         name = expr.func.name
         if name in self.locals:
             return   # a local fn pointer, not the fn of that name
+        # AGAST #1395 (LANGUAGE_SPEC §16.2): a bare call to an async fn only
+        # builds its future.  Dropped, nothing runs -- not even when the body
+        # has no await, which is the case that read as "callable synchronously".
+        if name in self.async_functions:
+            raise EmitError(
+                f"calling async fn `{name}` without `await` builds its future and "
+                f"drops it; its body never runs: write `await {name}(...)`", expr.span)
         fn_def = self._fn_defs_by_name.get(name)
         if fn_def is not None and fn_def.has_attr('must_use'):
             raise EmitError(
@@ -14785,6 +14792,20 @@ class LLVMEmitter:
         if not ((self._is_aggregate(actual) and self._is_scalar(declared_ty))
                 or (self._is_scalar(actual) and self._is_aggregate(declared_ty))):
             return
+        # AGAST #1395: `let r: i32 = g()` for an async g is the missing
+        # `await`; naming only `g_Future` kept 53/54/55_async on the
+        # known-failures list as "unmigrated async" for months.
+        call = stmt.value
+        if (isinstance(call, rast.Call) and isinstance(call.func, rast.Ident)
+                and call.func.name in self.async_functions
+                and call.func.name not in self.locals):
+            fn = call.func.name
+            raise EmitError(
+                f"`{stmt.name}` is declared `{self._format_ritz_type(stmt.type)}` but "
+                f"`{fn}(...)` is an async fn call, which without `await` is its "
+                f"future `{fn}_Future`: write `await {fn}(...)`",
+                getattr(stmt, "span", None),
+            )
         raise EmitError(
             f"`{stmt.name}` is declared `{self._format_ritz_type(stmt.type)}` "
             f"but its initialiser has type `{actual}`",

@@ -5310,6 +5310,55 @@ fn main() -> i32
 
 ### 16.2 Await
 
+**Calling an `async fn` requires `await`, whatever its body does** (decided
+2026-09-09, AGAST #1395).  An `async fn` with no suspension point is not
+callable synchronously.  A bare call `f(args)` evaluates to the fn's future, a
+value of type `f_Future`, and runs none of the body.  `await f(args)` runs the
+body and is the call's result.  This holds for any `async fn`, unit or valued,
+empty-bodied or not.  `await` is allowed outside an `async fn` too, where it
+drives the future to completion in place.
+
+```ritz
+async fn ready() -> i32
+    42
+
+async fn nothing()
+    pass
+
+fn main() -> i32
+    await nothing()
+    let v: i32 = await ready()
+    v - 42
+```
+
+Two uses of a bare call are refused at the call:
+
+- As a statement, whose future would be built and dropped:
+
+```ritz expect-error="calling async fn `nothing` without `await` builds its future and drops it; its body never runs"
+async fn nothing()
+    pass
+
+fn main() -> i32
+    nothing()
+    0
+```
+
+- Where the fn's result type is expected: `let`, an argument, `return`, an
+  operand.
+
+```ritz expect-error="is an async fn call, which without `await` is its future `ready_Future`"
+async fn ready() -> i32
+    42
+
+fn main() -> i32
+    let v: i32 = ready()
+    v
+```
+
+Keeping the future is still allowed.  `var p: f_Future = f(args)` hands it to
+an executor that polls it with `f_poll(@p)` (see `examples/tier5_async/64_async_io`).
+
 Binding an untyped awaited value (`let v = await fetch(x)`) currently fails to
 lower — the transform does not add the temporary to the generated future
 struct, so it reports `Unknown field v in struct go_Future`. Give the binding a

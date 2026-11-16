@@ -408,6 +408,16 @@ class TrueAsyncGenerator:
             # Transform body to access params through self
             transformer = SimpleBodyTransformer(self.analysis, self.fn_def)
             transformed = transformer.transform(self.fn_def.body)
+            # AGAST #1395: a unit `async fn` (`async fn f()`, even an empty
+            # body) still has an i32 poll; Ready is 0.  Without a tail the poll
+            # could reach its end with no value, and ritz0 refused `f` outright
+            # -- awaited or not.  A unit fn's tail (`pass` parses as one) is a
+            # statement, so it is demoted ahead of the 0.
+            if self.fn_def.ret_type is None:
+                tail = transformed.expr
+                if tail is not None and not (isinstance(tail, rast.Ident) and tail.name == 'pass'):
+                    transformed.stmts.append(rast.ExprStmt(span=tail.span, expr=tail))
+                transformed.expr = self._make_int(0)
             return transformed
 
         # Generate state checks for each await point
@@ -417,6 +427,12 @@ class TrueAsyncGenerator:
 
         # Final state: compute and return the result
         final_expr = self._generate_final_return()
+        # AGAST #1395: a unit fn's tail is a statement; its poll is Ready(0).
+        if self.fn_def.ret_type is None:
+            if not (isinstance(final_expr, rast.IntLit)
+                    or (isinstance(final_expr, rast.Ident) and final_expr.name == 'pass')):
+                stmts.append(rast.ExprStmt(span=self.dummy_span, expr=final_expr))
+            final_expr = self._make_int(0)
 
         return rast.Block(
             span=self.dummy_span,
