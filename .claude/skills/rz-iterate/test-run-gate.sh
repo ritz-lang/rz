@@ -275,6 +275,51 @@ done
 rm -f "$RES"
 RZ_GATE_CMD='exit 1' gate "$W" r2room >/dev/null
 check '[[ ! -e "$RES" ]]' "a room gate's end doesn't reserve the slot"
+# (Section 14 runs at the default RZ_GATE_STARVE, 45 min: with no long
+# waiter, #3427's reservation still holds the room gate off.)
+
+# 15. AGAST #3578: back-to-back trains starved room gates on one slot.  With
+# RZ_GATE_STARVE=2, train T1 holds the slot, room gate R waits past the bound,
+# and train T2 queues behind it.  R polls 10x slower than T2, and T1's
+# reservation (600 s) would hold R, so only the bound gets R in before T2.
+OVR="$RZ_GATE_DIR/.room-override"
+export RZ_GATE_STARVE=2
+rm -f "$RZ_TEST_RELEASE" "$RES" "$OVR"; : > "$RZ_TEST_ORDER"
+RZ_TEST_NAME=T1 RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" s1t1 >/dev/null &
+until_ '[[ -n "$(logof s1t1)" ]] && grep -q "^SLOT=" "$(logof s1t1)"'
+RZ_TEST_NAME=R RZ_GATE_POLL=1 RZ_GATE_CMD="$fifo" gate "$W" s1r >/dev/null &
+until_ '[[ -n "$(logof s1r)" ]] && grep -q "^STARVED" "$(logof s1r)"'
+check 'grep -q "^STARVED" "$(logof s1r)"' "a room gate waiting past RZ_GATE_STARVE logs STARVED"
+RZ_TEST_NAME=T2 RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" s1t2 >/dev/null &
+until_ '[[ -n "$(logof s1t2)" ]] && grep -q "^WAITING" "$(logof s1t2)"'
+check 'grep -q "^WAITING.*position 2 " "$(logof s1t2)"' "a train gate counts a starved room gate ahead of it"
+before="$(date +%s)"; touch "$RZ_TEST_RELEASE"
+wait
+check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "T1 R T2 " ]]' "a starved room gate takes the slot before the next train, despite the reservation (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+t="$(cat "$OVR" 2>/dev/null)"
+check '[[ "$t" =~ ^[0-9]+$ ]] && (( t >= before ))' "the starved room gate stamps .room-override as it takes the slot (got '$t')"
+check 'grep -qx EXIT=0 "$(logof s1r)" && grep -qx EXIT=0 "$(logof s1t2)"' "the starved room gate and the next train both reach a verdict"
+
+# 16. At most one room gate per bound goes ahead of trains: R1 and R2 both
+# wait past it behind T1, then T2 queues.  R1 goes, its override restarts
+# R2's clock, so T2 goes next and R2 after (by the bound again, as T2's
+# reservation would otherwise hold it 600 s).
+rm -f "$RZ_TEST_RELEASE" "$RES" "$OVR"; : > "$RZ_TEST_ORDER"
+RZ_TEST_NAME=T1 RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$hold" gate "$W" s2t1 >/dev/null &
+until_ '[[ -n "$(logof s2t1)" ]] && grep -q "^SLOT=" "$(logof s2t1)"'
+for x in 1 2; do
+    RZ_TEST_NAME=R$x RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" s2r$x >/dev/null &
+    until_ "[[ -n \"\$(logof s2r$x)\" ]] && grep -q '^WAITING' \"\$(logof s2r$x)\""
+done
+until_ 'grep -q "^STARVED" "$(logof s2r1)"'; sleep 0.5
+RZ_TEST_NAME=T2 RZ_GATE_TRAIN=1 RZ_GATE_POLL=0.1 RZ_GATE_CMD="$fifo" gate "$W" s2t2 >/dev/null &
+until_ '[[ -n "$(logof s2t2)" ]] && grep -q "^WAITING" "$(logof s2t2)"'
+touch "$RZ_TEST_RELEASE"
+wait
+check '[[ "$(tr "\n" " " < "$RZ_TEST_ORDER")" == "T1 R1 T2 R2 " ]]' "one starved room gate per bound, then the train (order: $(tr '\n' ' ' < "$RZ_TEST_ORDER"))"
+check 'grep -qx EXIT=0 "$(logof s2r2)"' "the second room gate still reaches a verdict within the bound"
+unset RZ_GATE_STARVE
+rm -f "$RES" "$OVR"
 
 # 15. AGAST #3559: the gate tests the commit, not the worktree.  #3455's
 # smoke_stack/core.py matched .gitignore's `core.*`, sat untracked in the

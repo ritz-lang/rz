@@ -33,7 +33,9 @@
 # Slot reservation (AGAST #3365, #3427): the train's gate writes <gate
 # dir>/.train-reserved as it ends, and `land` renews it, so a room gate can't
 # take the gate slot before the next train's gate starts; run-gate.sh honours
-# it for RZ_GATE_TRAIN_HOLD seconds (default 600).
+# it for RZ_GATE_TRAIN_HOLD seconds (default 600).  Except a room gate that
+# has waited RZ_GATE_STARVE seconds (default 2700): it goes ahead of the next
+# train, at most one per bound (AGAST #3578; see run-gate.sh).
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"

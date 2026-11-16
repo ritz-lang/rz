@@ -542,6 +542,19 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    because the halved train (step 6) gates next. Room gates queue but take
    no slot until the next `train.sh gate` starts, or for 10 minutes at most
    (`RZ_GATE_TRAIN_HOLD`), so read the verdict and act on it promptly.
+   **Except a starved room gate** (AGAST #3578). While REAPs keep coming,
+   train priority plus the reservation kept omegalisk's one slot for
+   trains, and #3448/#3517 sat at queue position 1 for 2h+ through seven
+   trains. Once the oldest waiting room gate has waited 45 minutes
+   (`RZ_GATE_STARVE`, 2700 s), its log says `STARVED`. It ignores the
+   reservation and `.train-waiting`, and train gates queue behind it, so it
+   runs before the next train. As it takes the slot, it stamps
+   `gate-logs/.room-override`, which restarts every room's 45-minute clock.
+   So at most one room gate per 45 minutes jumps ahead of the trains,
+   and trains still get the slot in between. Keep building and gating
+   trains as usual: a train gate that queues behind a starved room gate
+   just waits one room gate (its log shows queue position 2). Don't hold
+   trains back by hand any more.
 5. **Gate passes (exit 0), or `gate=not-needed`:**
    ```bash
    .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed

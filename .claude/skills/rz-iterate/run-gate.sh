@@ -18,6 +18,8 @@
 #   RZ_GATE_AFTER  run after the command passes  (train.sh gate: its package
 #                  tests, AGAST #3363)
 #   RZ_GATE_TRAIN_HOLD  seconds a .train-reserved holds room gates (default 600)
+#   RZ_GATE_STARVE seconds a room gate waits before it goes ahead of the
+#                  merge trains (default 2700; AGAST #3578)
 #
 # Why each piece exists (rz-iterate):
 #   * systemd-run: a Bash background job dies when the agent's next turn
@@ -78,6 +80,20 @@
 #     pid is gone or whose unit is inactive (SIGKILL, reboot) is pruned, so a
 #     dead waiter never blocks the queue.  The log's WAITING lines give the
 #     position (1 = next).
+#   * starvation bound (AGAST #3578): with one slot, train priority plus the
+#     reservation meant a room gate never ran while REAPs kept coming: rz
+#     gates the next train right after each land, and #3448/#3517 sat at
+#     queue position 1 for 2h+ through seven trains.  Each queue line also
+#     carries the time the waiter queued.  The oldest live room waiter is
+#     "starved" once it has waited RZ_GATE_STARVE seconds (default 45 min),
+#     counted from when it queued or from <gate dir>/.room-override,
+#     whichever is later.  A starved room gate ignores .train-reserved and
+#     .train-waiting, and train gates count it as ahead of them, so it takes
+#     the next free slot.  On taking it, it stamps .room-override, which
+#     restarts every room's clock: at most one room gate per RZ_GATE_STARVE
+#     seconds goes ahead of trains, so trains can't be starved in turn.
+#     With no starved waiter nothing changes (#3317, #3427).  A queue line
+#     without a time (a gate started by an older run-gate.sh) never starves.
 #   * script by path (AGAST #3567): systemd unescapes and expands `$` in a
 #     unit's command line (`$$` -> `$`, `${x}` -> x from the unit's env, or
 #     empty), so `bash -c "$INNER"` ran a mangled script: every queue pid was
@@ -245,9 +261,24 @@ train_waiting() {
     [ -n "$u" ] && systemctl --user is-active -q "$u"
 }
 # FIFO queue (AGAST #3364; see the header).  One line per waiter,
-# "<unit> <pid> <train>", edited only under flock on .gate-queue.lock.
+# "<unit> <pid> <train> <queued epoch>", edited only under flock on
+# .gate-queue.lock.
 Q="$RZ_DIR/.gate-queue"
-ME="$RZ_UNIT $$ $RZ_TRAIN"
+OVR="$RZ_DIR/.room-override"
+ME="$RZ_UNIT $$ $RZ_TRAIN $(date +%s)"
+# Starvation bound (AGAST #3578; see the header).  starved <queued epoch>:
+# has a room gate queued then waited RZ_STARVE seconds, counting from the last
+# override if that is later?  Fails closed (not starved) on anything odd.
+starved() {
+    local e="$1" o now
+    [ -n "$e" ] && [ "$e" -ge 0 ] 2>/dev/null || return 1
+    o="$(cat "$OVR" 2>/dev/null)"
+    [ "$o" -ge 0 ] 2>/dev/null || o=0
+    now="$(date +%s)"
+    [ "$o" -le "$now" ] || o=0
+    [ "$o" -gt "$e" ] && e=$o
+    [ $((now - e)) -ge "$RZ_STARVE" ] 2>/dev/null
+}
 qlock() { exec 8>>"$Q.lock" && flock 8; }
 qunlock() { exec 8>&-; }
 dequeue() {
@@ -255,30 +286,39 @@ dequeue() {
     grep -vxF "$ME" "$Q" > "$Q.tmp" 2>/dev/null; mv -f "$Q.tmp" "$Q"
     qunlock
 }
-# ahead: print how many live waiters are ahead of this one, pruning dead
-# entries (pid gone or unit inactive: a SIGKILL or reboot skips the trap).  A
-# train gate counts only trains ahead of it: room gates already yield to it.
+# ahead: print "<n> <starved>": how many live waiters are ahead of this one,
+# and 1 if this is a starved room gate (else 0).  Prunes dead entries (pid
+# gone or unit inactive: a SIGKILL or reboot skips the trap).  A train gate
+# counts only trains ahead of it (room gates already yield to it), plus the
+# oldest room waiter if that one is starved.  A starved room gate is the
+# oldest room waiter, so nothing counts ahead of it (it outranks trains).
 ahead() {
-    local u p t n=0 seen= keep=
-    qlock || { echo 0; return; }
-    while read -r u p t; do
+    local u p t e n=0 seen= keep= head= me_starved=0
+    qlock || { echo "0 0"; return; }
+    while read -r u p t e; do
         [ -n "$u" ] || continue
-        if [ "$u $p $t" = "$ME" ]; then
+        if [ "$u $p $t${e:+ $e}" = "$ME" ]; then
             seen=1
-        elif kill -0 "$p" 2>/dev/null && systemctl --user is-active -q "$u"; then
-            if [ -z "$seen" ] && { [ "$RZ_TRAIN" != 1 ] || [ "$t" = 1 ]; }; then
-                n=$((n + 1))
-            fi
-        else
+        elif ! { kill -0 "$p" 2>/dev/null && systemctl --user is-active -q "$u"; }; then
             continue
+        elif [ -z "$seen" ] && { [ "$RZ_TRAIN" != 1 ] || [ "$t" = 1 ]; }; then
+            n=$((n + 1))
         fi
-        keep+="$u $p $t"$'\n'
+        # The oldest live room waiter, this one or another.
+        if [ "$t" != 1 ] && [ -z "$head" ]; then
+            head=1
+            if starved "$e"; then
+                if [ "$u $p $t${e:+ $e}" = "$ME" ]; then me_starved=1; n=0
+                elif [ "$RZ_TRAIN" = 1 ]; then n=$((n + 1)); fi
+            fi
+        fi
+        keep+="$u $p $t${e:+ $e}"$'\n'
     done < "$Q"
     # Lost our line (the file was removed by hand)?  Rejoin at the back.
     [ -n "$seen" ] || keep+="$ME"$'\n'
     printf '%s' "$keep" > "$Q.tmp" && mv -f "$Q.tmp" "$Q"
     qunlock
-    echo "$n"
+    echo "$n $me_starved"
 }
 # The gate's own checkout of RZ_SHA (AGAST #3559; see the header).  untree
 # also clears one a killed run left behind: same unit, same path.
@@ -292,17 +332,33 @@ trap 'dequeue; unmark; untree' EXIT
 # forever and never writes a verdict.  (Seen: an agent sandbox's /tmp is not
 # the /tmp systemd units see.)  The unit ends with no EXIT line; --wait -> 98.
 { qlock && echo "$ME" >> "$Q" && qunlock; } 2>/dev/null || exit 97
-pos=$(( $(ahead) + 1 ))
+read -r n st < <(ahead)
+pos=$((n + 1))
 echo "WAITING for a gate slot, queue position $pos $(date -Is)" >> "$RZ_LOG" || exit 97
 while :; do
-    now_pos=$(( $(ahead) + 1 ))
+    read -r n st < <(ahead)
+    now_pos=$((n + 1))
     if [ "$now_pos" != "$pos" ]; then
         pos=$now_pos
         echo "WAITING queue position $pos $(date -Is)" >> "$RZ_LOG"
     fi
+    if [ "$st" = 1 ]; then
+        # Starved (AGAST #3578; see the header): the merge train waits for us.
+        if [ -z "${said_starved:-}" ]; then
+            said_starved=1
+            echo "STARVED: waited ${RZ_STARVE}s or more; next free slot, ahead of merge trains $(date -Is)" >> "$RZ_LOG"
+        fi
+        for s in $(seq 0 $((RZ_SLOTS - 1))); do
+            exec 9>"$RZ_DIR/.gate-slot-$s"
+            if flock -n 9; then
+                { date +%s > "$OVR.$$" && mv -f "$OVR.$$" "$OVR"; } 2>/dev/null \
+                    || echo "warning: could not stamp $OVR" >> "$RZ_LOG"
+                break 2
+            fi
+        done
     # Reservation before marker: the train writes .train-waiting before it
     # removes .train-reserved, so checking in this order never sees neither.
-    if [ "$pos" = 1 ] && train_reserved; then
+    elif [ "$pos" = 1 ] && train_reserved; then
         if [ -z "${said_res:-}" ]; then
             said_res=1
             echo "WAITING: slot reserved for the merge train since $(date -Is -d "@$(cat "$RES")" 2>/dev/null) $(date -Is)" >> "$RZ_LOG"
@@ -367,6 +423,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \
     --setenv=RZ_TREE="$GATES/.trees/$UNIT" \
+    --setenv=RZ_STARVE="${RZ_GATE_STARVE:-2700}" \
     /bin/bash "$SCRIPT"
 
 echo "$LOG"
