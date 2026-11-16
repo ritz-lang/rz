@@ -629,7 +629,7 @@ def test_ritz1_still_cannot_parse_the_held_back_cases(request, tmp_path, compile
     source = REJECTED_RITZ0_ONLY[name][0]
     proc, _ = _compile(request, compiler, tmp_path, source, {})
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "Parse error" in out, f"{compiler}, {name}:\n{out[-800:]}"
+    assert proc.returncode != 0 and "failed to parse" in out, f"{compiler}, {name}:\n{out[-800:]}"
 
 
 @pytest.mark.integration

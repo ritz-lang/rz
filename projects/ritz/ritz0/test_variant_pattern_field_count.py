@@ -133,5 +133,5 @@ def test_ritz1_cannot_parse_a_second_field(request, tmp_path, compiler):
     source = _on("Option<i32>", ["Some(a, b) => a", "None => 2"], "Some(1)")
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "Parse error" in out, f"{compiler}:\n{out[-800:]}"
+    assert proc.returncode != 0 and "failed to parse" in out, f"{compiler}:\n{out[-800:]}"
     assert not ll.exists()

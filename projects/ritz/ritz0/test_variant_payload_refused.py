@@ -451,7 +451,7 @@ def test_ritz1_cannot_parse_a_payload_that_tests(request, tmp_path, compiler, na
     """Goes red when ritz1 learns one, which must then refuse it or compile it."""
     proc, ll = _ritz1(request, compiler, tmp_path, {**LITERALS, **TYPES}[name][0])
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "Parse error" in out, f"{compiler}, {name}:\n{out[-800:]}"
+    assert proc.returncode != 0 and "failed to parse" in out, f"{compiler}, {name}:\n{out[-800:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
