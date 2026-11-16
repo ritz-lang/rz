@@ -77,6 +77,13 @@
 #     pid is gone or whose unit is inactive (SIGKILL, reboot) is pruned, so a
 #     dead waiter never blocks the queue.  The log's WAITING lines give the
 #     position (1 = next).
+#   * script by path (AGAST #3567): systemd unescapes and expands `$` in a
+#     unit's command line (`$$` -> `$`, `${x}` -> x from the unit's env, or
+#     empty), so `bash -c "$INNER"` ran a mangled script: every queue pid was
+#     a literal `$`, each waiter pruned the others as dead, and the FIFO was
+#     random.  The script goes to <log minus .log>.unit.sh, which the unit
+#     deletes as it starts; --setenv values are not expanded, so the env
+#     carries the rest.  Tests: test-run-gate-systemd.sh (real systemd-run).
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -167,6 +174,8 @@ printf 'UNIT=%s\nSHA=%s\nCMD=%s\n' "$UNIT" "$SHA" "$CMD" >> "$LOG"
 # needs a second layer of quoting.
 read -r -d '' INNER <<'EOF' || true
 set -u
+# Bash holds the script open, so it can go now (see "script by path" above).
+rm -f "$0"
 # Train priority (AGAST #3317; see the header).
 MARK="$RZ_DIR/.train-waiting"
 unmark() {
@@ -283,6 +292,9 @@ if [ "$RZ_TRAIN" = 1 ]; then
 fi
 echo "EXIT=$rc" >> "$RZ_LOG"
 EOF
+# By path, never as `bash -c "$INNER"` (AGAST #3567; see the header).
+SCRIPT="${LOG%.log}.unit.sh"
+printf '%s\n' "$INNER" > "$SCRIPT"
 
 systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --slice=ritz-gate.slice --property=CPUWeight=100 \
@@ -292,6 +304,6 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \
-    /bin/bash -c "$INNER"
+    /bin/bash "$SCRIPT"
 
 echo "$LOG"
