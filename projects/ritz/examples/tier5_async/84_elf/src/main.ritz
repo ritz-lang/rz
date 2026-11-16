@@ -1,0 +1,140 @@
+# Example 84: elf — ritzlib.elf on the program's own binary
+#
+# ritzlib.elf had no importing example, so neither differential ritz0-vs-ritz1
+# stage exercised it (AGAST #1463).  The program reads /proc/self/exe (its own
+# executable) with gvec's vec_read_all_fd, validates it with elf_init, prints
+# its class, byte order and machine, looks sections up by name through the
+# section-header string table, and lists symbols with elf_parse_sections.
+#
+# elf.ritz has no find-section-by-name, so section_exists walks the section
+# headers itself with elf's read_u16/u32/u64 (the same raw offsets
+# elf_parse_sections uses).  Nothing printed depends on addresses, sizes or
+# symbol counts, which differ between the ritz0 and ritz1 builds.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+import ritzlib.elf
+
+const O_RDONLY: i32 = 0
+
+# 1 if `a` and `b` are equal NUL-terminated strings.
+fn cstr_eq(a: *u8, b: *u8) -> bool
+    var i: i64 = 0
+    loop
+        if *(a + i) != *(b + i)
+            return false
+        if *(a + i) == 0
+            return true
+        i += 1
+
+# Does the ELF image `data` have a section named `name`?
+fn section_exists(data: *u8, size: i64, name: *u8) -> bool
+    let shoff: i64 = read_u64(data + 40)
+    let shentsize: i64 = read_u16(data + 58) as i64
+    let shnum: i64 = read_u16(data + 60) as i64
+    let shstrndx: i64 = read_u16(data + 62) as i64
+    if shoff == 0 or shnum == 0 or shoff + shnum * shentsize > size
+        return false
+    let strtab_sh: *u8 = data + shoff + shstrndx * shentsize
+    let names: *u8 = data + read_u64(strtab_sh + 24)
+    var i: i64 = 0
+    while i < shnum
+        let sh: *u8 = data + shoff + i * shentsize
+        let off: i64 = read_u32(sh) as i64
+        if cstr_eq(names + off, name)
+            return true
+        i += 1
+    return false
+
+fn yes_no(v: bool) -> *u8
+    if v
+        return c"yes"
+    return c"no"
+
+fn show_section(data: *u8, size: i64, name: *u8)
+    let s: *u8 = yes_no(section_exists(data, size, name))
+    print("section {name}: {s}\n")
+
+fn main() -> i32
+    var image: Vec<u8> = vec_new<u8>()
+    let fd: i32 = sys_open(c"/proc/self/exe", O_RDONLY)
+    if fd < 0
+        print("open /proc/self/exe failed: {fd}\n")
+        return 1
+    let got: i64 = vec_read_all_fd(fd, @&image)
+    sys_close(fd)
+    if got <= 0
+        print("read /proc/self/exe failed: {got}\n")
+        return 1
+    print("read /proc/self/exe: ok\n")
+
+    var r: ElfReader
+    let rc: i32 = elf_init(@r, image.data, image.len)
+    print("elf_init: {rc}\n")
+    if rc != 0
+        return 1
+
+    # e_ident[4] = class, e_ident[5] = data encoding, e_machine at 18.
+    if *(image.data + 4) == 2
+        print("class: ELF64\n")
+    else
+        print("class: other\n")
+    if *(image.data + 5) == 1
+        print("data: little-endian\n")
+    else
+        print("data: big-endian\n")
+    let machine: i32 = read_u16(image.data + 18)
+    if machine == 62
+        print("machine: {machine} (x86-64)\n")
+    else
+        print("machine: {machine}\n")
+
+    show_section(image.data, image.len, c".text")
+    show_section(image.data, image.len, c".symtab")
+    show_section(image.data, image.len, c".no_such_section")
+
+    let ps: i32 = elf_parse_sections(@r)
+    print("elf_parse_sections: {ps}\n")
+    let nsyms: i64 = elf_symbol_count(@r)
+    var gt0: i32 = 0
+    if nsyms > 0
+        gt0 = 1
+    print("symbols > 0: {gt0}\n")
+
+    # Find `main` among the symbols: it must be a global function.
+    var main_ok: i32 = 0
+    var i: i64 = 0
+    while i < nsyms
+        let name: *u8 = elf_get_symbol_name(@r, i)
+        if name != null and cstr_eq(name, c"main")
+            let info: u8 = elf_get_symbol_info(@r, i)
+            if elf_is_function(info) != 0 and elf_is_global(info) != 0
+                main_ok = 1
+        i += 1
+    print("main is a global function: {main_ok}\n")
+
+    # Little-endian readers on a known byte pattern 01 02 .. 08.
+    var bytes: [8]u8
+    var k: i64 = 0
+    while k < 8
+        bytes[k] = (k + 1) as u8
+        k += 1
+    let a: i32 = read_u16(@bytes[0])
+    let bb: i32 = read_u32(@bytes[0])
+    let c: i64 = read_u64(@bytes[0])
+    print("read_u16/u32/u64: {a} {bb} {c}\n")
+
+    # Rejections: too short for a header, and a wrong magic number.
+    var bad: ElfReader
+    print("elf_init on 16 bytes: {elf_init(@bad, image.data, 16)}\n")
+    var copy: [64]u8
+    k = 0
+    while k < 64
+        copy[k] = *(image.data + k)
+        k += 1
+    copy[1] = 'X'
+    print("elf_init on bad magic: {elf_init(@bad, @copy[0], 64)}\n")
+
+    vec_drop<u8>(@&image)
+    return 0

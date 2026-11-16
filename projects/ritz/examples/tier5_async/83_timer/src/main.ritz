@@ -1,0 +1,92 @@
+# Example 83: timer — ritzlib.timer, printing only deterministic facts
+#
+# ritzlib.timer had no importing example, so neither differential
+# ritz0-vs-ritz1 stage exercised it (AGAST #1463).  Times differ on every run,
+# so this prints only properties that hold on any run: return codes, ranges,
+# ordering.  It never prints a time.
+#
+# Only five of timer.ritz's functions are `pub` (clock_gettime, timer_init,
+# timer_print, stopwatch_init, stopwatch_print).  now_nanos, timer_start,
+# timer_stop, timer_elapsed_* and stopwatch_start/stop are module-private, so
+# an importer cannot call them (AGAST ticket filed by #1463).  start/stop and
+# elapsed are therefore done here with clock_gettime on the Timer's own
+# Timespec fields -- exactly what the private helpers do.  timer_print and
+# stopwatch_print print times, so they are not called.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.timer
+
+# Linux clock ids (timer.ritz's own constants are private too).
+const MONOTONIC: i32 = 1
+const REALTIME: i32 = 0
+const NS_PER_SEC: i64 = 1000000000
+
+fn ts_nanos(ts: *Timespec) -> i64
+    return ts.tv_sec * NS_PER_SEC + ts.tv_nsec
+
+fn b(v: bool) -> i64
+    if v
+        return 1
+    return 0
+
+fn main() -> i32
+    var ts: Timespec
+    let rc: i32 = clock_gettime(MONOTONIC, @ts)
+    print("clock_gettime(MONOTONIC) rc: {rc}\n")
+    print("tv_nsec in [0, 1e9): {b(ts.tv_nsec >= 0 and ts.tv_nsec < NS_PER_SEC)}\n")
+
+    # timer_init must zero both ends, whatever was there before.
+    var t: Timer
+    t.start.tv_sec = 99
+    t.start.tv_nsec = 99
+    t.end.tv_sec = 99
+    t.end.tv_nsec = 99
+    timer_init(@t)
+    let zeroed: bool = t.start.tv_sec == 0 and t.start.tv_nsec == 0 and t.end.tv_sec == 0 and t.end.tv_nsec == 0
+    print("timer_init zeroes start/end: {b(zeroed)}\n")
+
+    # Start, do some work, stop.
+    let rs: i32 = clock_gettime(MONOTONIC, @t.start)
+    var acc: i64 = 0
+    var i: i64 = 0
+    while i < 10000
+        acc += i
+        i += 1
+    let re: i32 = clock_gettime(MONOTONIC, @t.end)
+    print("start/stop rc: {rs} {re}\n")
+    let s: i64 = ts_nanos(@t.start)
+    let e: i64 = ts_nanos(@t.end)
+    print("end >= start: {b(e >= s)}\n")
+    print("elapsed >= 0: {b(e - s >= 0 and acc > 0)}\n")
+
+    # CLOCK_MONOTONIC never goes backwards.
+    var prev: i64 = 0
+    var mono: bool = true
+    i = 0
+    while i < 1000
+        clock_gettime(MONOTONIC, @ts)
+        let now: i64 = ts_nanos(@ts)
+        if now < prev
+            mono = false
+        prev = now
+        i += 1
+    print("monotonic over 1000 reads: {b(mono)}\n")
+
+    # Wall clock: 1577836800 is 2020-01-01T00:00:00Z.
+    clock_gettime(REALTIME, @ts)
+    print("CLOCK_REALTIME after 2020: {b(ts.tv_sec > 1577836800)}\n")
+
+    # An invalid clock id is rejected by the kernel (-EINVAL).
+    let bad: i32 = clock_gettime(12345, @ts)
+    print("bad clock id rc < 0: {b(bad < 0)}\n")
+
+    var sw: Stopwatch
+    sw.total_ns = 5
+    sw.count = 5
+    sw.running = 1
+    sw.start_ns = 5
+    stopwatch_init(@sw)
+    let swz: bool = sw.total_ns == 0 and sw.count == 0 and sw.running == 0 and sw.start_ns == 0
+    print("stopwatch_init zeroes: {b(swz)}\n")
+    return 0
