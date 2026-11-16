@@ -26,6 +26,7 @@ import fast_link
 
 import ritz0_inproc
 from test_borrow_param_ref_field import _compile, _run
+from test_row_table import assert_runs
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
@@ -956,6 +957,37 @@ ROWS = {
 @pytest.mark.parametrize("name", sorted(ROWS))
 def test_a_row_binding_is_an_array(run_with, compiler, name):
     assert run_with(compiler, name, ROWS[name]) == 105
+
+
+# AGAST #3444 (#3378, LARB R40): `for plane in g` over a `[2][3][4]T` binds each
+# plane, a `[3][4]T`; `for row in plane` each `[4]T`; `for x in row` each cell.
+# Cell (p, r, c) holds 12p + 4r + c + 1, so 1..24 sum to 300; the indexed reads
+# take `plane[2][3]` (12, 24) and `row[0]` (1, 5, ... 21).  A wrong stride, a
+# flattened walk or a short trip count returns 1-4 instead of 42.
+_PLANES = ("".join(f"    g[{p}][{r}][{c}] = {12 * p + 4 * r + c + 1}\n"
+                   for p in range(2) for r in range(3) for c in range(4))
+           + "    var t: i32 = 0\n    var n: i32 = 0\n    var k: i32 = 0\n"
+           "    for plane in g\n        k = k + plane[2][3]\n"
+           "        for row in plane\n            k = k + row[0]\n"
+           "            for x in row\n                t = t + x\n                n = n + 1\n"
+           "    if n != 24\n        return 1\n    if t != 300\n        return 2\n"
+           "    if k != 102\n        return 3\n    if g[1][2][3] != 24\n        return 4\n"
+           "    return 42\n")
+
+RANK3 = {
+    "rank3_local": (MAIN + "    var g: [2][3][4]i32\n" + _PLANES, 42),
+    "rank3_global": ("var g: [2][3][4]i32\n\n" + MAIN + _PLANES, 42),
+}
+
+# ritz1 refuses rank-3+ iteration (NOT_LOWERED_ND below) until #3379 lowers it.
+RANK3_GAPS = {name: 3379 for name in RANK3}
+
+
+# One table per compiler (test_row_table.py), not a parametrised matrix.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_plane_binding_walks_a_rank3_array(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, RANK3, {} if compiler == "ritz0" else RANK3_GAPS)
 
 
 # A row is a copy of its row, as an element is, taken before the body runs.
