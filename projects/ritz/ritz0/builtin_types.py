@@ -70,8 +70,8 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
     `impl Foo`" at the same place (LARB R35), and one on a primitive is
     "`i32` is a built-in type; it can't have an `impl`" (LARB R36; ritz1's
     half is #3371).  ritz1 says the same for an
-    unknown type (monomorph.ritz, refuse_impls_on_unknown_types); its alias
-    refusal is #3369."""
+    unknown type and an alias (monomorph.ritz, refuse_impls_on_unknown_types,
+    #3369)."""
     known = {item.name for item in module.items
              if isinstance(item, (rast.StructDef, rast.EnumDef))}
     # A type alias is known, but not an impl target (LARB R35, #3368): a

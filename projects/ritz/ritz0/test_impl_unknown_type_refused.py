@@ -140,8 +140,9 @@ def test_impl_on_known_type_accepted(request, tmp_path, compiler, row):
 
 
 # An impl on a type alias (LARB R35, #3368), inherent or trait: located at
-# the alias name, both spelled "write `impl Foo`".  ritz0 only until ritz1
-# applies R35 (#3369), which adds ritz1 and ritz1_selfhosted here.
+# the alias name, both spelled "write `impl Foo`", on every compiler: ritz1
+# refuses it before lowering the impl body (#3369), which failed later with
+# an unlocated "cannot emit: unhandled EXPR_MEMBER".
 ALIAS_ROWS = {
     "inherent": """\
 struct Foo
@@ -172,9 +173,12 @@ pub fn main() -> i32
 }
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("row", sorted(ALIAS_ROWS))
-def test_impl_on_alias_refused(tmp_path, row):
-    _assert_refused("ritz0", tmp_path, f"alias_{row}", PRELUDE + ALIAS_ROWS[row],
+def test_impl_on_alias_refused(request, tmp_path, compiler, row):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    _assert_refused(compiler, tmp_path, f"alias_{row}", PRELUDE + ALIAS_ROWS[row],
                     "`Id` is a type alias for `Foo`: write `impl Foo`")
 
 
