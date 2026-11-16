@@ -4431,10 +4431,7 @@ fn emit_for_iterable(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # Body statements.
     let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
     own_push_scope(s)
-    var body_stmt: *Stmt = stmt.for_body
-    while body_stmt != null
-        emit_stmt(s, body_stmt, ret_type)
-        body_stmt = body_stmt.next
+    emit_void_body(s, stmt.for_body, ret_type)
     own_pop_scope(s)
     own_loop_exit(s, own_loop)
 
@@ -5909,18 +5906,43 @@ fn if_stmt_arm_ptr_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8) -> 
 # (unreachable) block is opened after it, as emit_match_arm_stmts does
 # (#1454): the arm's `br` to the merge and its phi incoming then name a block
 # that really branches there.
-fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32)
+#
+# AGAST #3749: an arm of a discarded `if` (`discarded` == 1) has no value
+# either, so an `if` ending it is discarded too.
+fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32, discarded: i32)
     let saved: *Stmt = s.if_arm_value
     var st: *Stmt = list
     while st != null
         if st.next == null and st.kind == STMT_EXPR
             s.if_arm_value = st
+        if st.next == null and discarded == 1
+            s.if_stmt_discarded = st
         emit_stmt(s, st, ret_type)
         s.if_arm_value = saved
         if st.kind == STMT_RETURN
             begin_block(s, next_label(s))
             clear_last_expr(s)
         st = st.next
+
+# AGAST #3749: a body with no value (a loop's, an `unsafe` block's), whose
+# last statement, if an `if`, is discarded: its arms get no phi.  That phi
+# was typed from the fn's return type, `phi %Option$i64 [ i64 ... ]`.
+fn emit_void_body(s: *EmitterState, list: *Stmt, ret_type: i32)
+    var st: *Stmt = list
+    while st != null
+        if st.next == null
+            s.if_stmt_discarded = st
+        emit_stmt(s, st, ret_type)
+        st = st.next
+
+# 1 if the statement `if` `stmt` has no value to give: a statement follows
+# it, or its list's value is unread (s.if_stmt_discarded).  Consumes the mark.
+fn if_stmt_is_discarded(s: *EmitterState, stmt: *Stmt) -> i32
+    let marked: *Stmt = s.if_stmt_discarded
+    s.if_stmt_discarded = null
+    if stmt.next != null or stmt == marked
+        return 1
+    0
 
 # AGAST #3323: an arm's phi incoming.  An arm that never reaches the merge (a
 # `return`, a `while true` with no `break`) has no value, but the phi still
@@ -6039,10 +6061,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #2248: the body runs in place, as ritz0's _emit_unsafe_block.
         # No drop scope is opened there either, so its bindings and defers
         # belong to the enclosing block.  It is a statement, not a value.
-        var body_stmt: *Stmt = stmt.while_body
-        while body_stmt != null
-            emit_stmt(s, body_stmt, ret_type)
-            body_stmt = body_stmt.next
+        emit_void_body(s, stmt.while_body, ret_type)
         clear_last_expr(s)
     else if stmt.kind == STMT_ASSIGN
         emit_assign(s, stmt)
@@ -6065,6 +6084,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # AGAST #1869: placement check, operand report, helper call site.
         emit_assert_stmt(s, stmt)
     else if stmt.kind == STMT_IF
+        let discarded: i32 = if_stmt_is_discarded(s, stmt)   # AGAST #3749
         bool_check_cond(s, stmt.if_cond, c"if condition")
         let cond: i32 = emit_expr(s, stmt.if_cond)
         # If the condition register is already an i1, use it directly in the
@@ -6116,7 +6136,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # merges the arms' moved bindings (own_if_merge).
         let own_before: *i32 = own_snapshot(s)
         own_push_scope(s)
-        emit_if_stmt_arm(s, stmt.if_then, ret_type)
+        emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded)
         # AGAST #2559: the arm value's struct type, while its bindings resolve.
         var then_agg: *u8 = null
         var then_agg_len: i32 = 0
@@ -6150,7 +6170,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             clear_last_expr(s)  # Reset before else branch
             own_restore(s, own_before)
             own_push_scope(s)
-            emit_if_stmt_arm(s, stmt.if_else, ret_type)
+            emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded)
             if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
             own_else_dead = own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
@@ -6190,6 +6210,9 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             else_result = if_stmt_arm_incoming(else_result, stmt.if_else)
             if then_result == IF_ARM_DIVERGES and else_result == IF_ARM_DIVERGES
                 then_result = 0   # both leave: no value reaches the merge
+                else_result = 0
+            if discarded == 1   # AGAST #3749: nobody reads the value
+                then_result = 0
                 else_result = 0
         if stmt.if_else != null and then_result != 0 and else_result != 0
             if ret_type == TYPE_STRUCT and s.ret_type_name_len > 0 and is_tagged_enum_type(s.ret_type_name, s.ret_type_name_len) == 1
@@ -6286,10 +6309,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         begin_block(s, body_label)
         let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
         own_push_scope(s)
-        var body_stmt: *Stmt = stmt.while_body
-        while body_stmt != null
-            emit_stmt(s, body_stmt, ret_type)
-            body_stmt = body_stmt.next
+        emit_void_body(s, stmt.while_body, ret_type)
         own_pop_scope(s)
         own_loop_exit(s, own_loop)
         emit_str(s, c"  br label %")
@@ -6328,10 +6348,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         begin_block(s, body_label)
         let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
         own_push_scope(s)
-        var body_stmt: *Stmt = stmt.while_body
-        while body_stmt != null
-            emit_stmt(s, body_stmt, ret_type)
-            body_stmt = body_stmt.next
+        emit_void_body(s, stmt.while_body, ret_type)
         own_pop_scope(s)
         own_loop_exit(s, own_loop)
         emit_str(s, c"  br label %")
@@ -6453,10 +6470,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         begin_block(s, body_label)
         let own_loop: i32 = own_loop_enter(s)   # AGAST #2158
         own_push_scope(s)
-        var body_stmt: *Stmt = stmt.for_body
-        while body_stmt != null
-            emit_stmt(s, body_stmt, ret_type)
-            body_stmt = body_stmt.next
+        emit_void_body(s, stmt.for_body, ret_type)
         own_pop_scope(s)
         own_loop_exit(s, own_loop)
         emit_str(s, c"  br label %")
