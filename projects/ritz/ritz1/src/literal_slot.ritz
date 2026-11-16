@@ -272,6 +272,66 @@ pub fn literal_tail(s: *EmitterState, stmt: *Stmt, t: i32, pointee: i32)
     if stmt.kind == STMT_IF or stmt.kind == STMT_MATCH
         lit_tail_stmt(s, stmt, t, pointee, 1)
 
+# AGAST #3440 (R62): a `c"..."` is a bare `*u8` with no length, so it doesn't
+# fit a `{ ptr, len }` slot: a `Span<u8>` or a StrView.  Only a plain `"..."`
+# does.  ritz0's _refuse_cstring_in_view.  The slot is named, as a struct is.
+fn lit_view_word(t: i32, name: *u8, len: i32) -> *u8
+    if t != TYPE_STRUCT
+        return null
+    if name_eq(name, len, c"Span$u8", 7) == 1 or name_eq(name, len, c"Span<u8>", 8) == 1
+        return c"Span<u8>"
+    if name_eq(name, len, c"StrView", 7) == 1
+        return c"StrView"
+    null
+
+fn lit_view_tails(s: *EmitterState, e: *Expr, word: *u8)
+    if e == null
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            if arm.is_pass == 0
+                lit_view_tails(s, arm.body, word)
+            arm = arm.next
+        return
+    if e.kind == EXPR_CSTRING_LIT and lit_report(s, e) == 1
+        eprints_cstr(c"a `c\"...\"` literal is a `*u8`, not a `")
+        eprints_cstr(word)
+        eprints_cstr(c"`: write a plain `\"...\"` literal\n")
+
+fn lit_view_block(s: *EmitterState, stmts: *Stmt, word: *u8)
+    var last: *Stmt = stmts
+    if last == null
+        return
+    while last.next != null
+        last = last.next
+    lit_view_stmt(s, last, word)
+
+fn lit_view_stmt(s: *EmitterState, stmt: *Stmt, word: *u8)
+    if stmt.kind == STMT_EXPR
+        lit_view_tails(s, stmt.expr, word)
+    else if stmt.kind == STMT_IF
+        lit_view_block(s, stmt.if_then, word)
+        lit_view_block(s, stmt.if_else, word)
+    else if stmt.kind == STMT_MATCH
+        var arm: *MatchArm = stmt.if_then as *MatchArm
+        while arm != null
+            if arm.is_pass == 0
+                lit_view_tails(s, arm.body, word)
+            arm = arm.next
+
+# `e` lands in a slot of kind `t` named `name`.
+pub fn literal_view(s: *EmitterState, e: *Expr, t: i32, name: *u8, len: i32)
+    let word: *u8 = lit_view_word(t, name, len)
+    if word != null
+        lit_view_tails(s, e, word)
+
+# `stmt`, the last of a fn, lands in its return slot of kind `t` named `name`.
+pub fn literal_view_tail(s: *EmitterState, stmt: *Stmt, t: i32, name: *u8, len: i32)
+    let word: *u8 = lit_view_word(t, name, len)
+    if word != null and (stmt.kind == STMT_IF or stmt.kind == STMT_MATCH)
+        lit_view_stmt(s, stmt, word)
+
 # What a fn's return slot points at: `-> *u8` keeps the name, not the kind.
 pub fn literal_ret_pointee(name: *u8, len: i32) -> i32
     primitive_type_from_name(name, len)
@@ -314,6 +374,7 @@ fn lit_field(s: *EmitterState, e: *Expr, f: *StructField)
         literal_array(s, e, f.array_elem_type, f.array_elem_pointee)
     else
         literal_slot(s, e, f.field_type, f.ptr_pointee)
+        literal_view(s, e, f.field_type, f.field_type_name, f.field_type_name_len)   # AGAST #3440
 
 # `S { f: e }`.
 pub fn literal_field(s: *EmitterState, e: *Expr, f: *StructField)
@@ -327,6 +388,7 @@ fn lit_args(s: *EmitterState, params: *Param, args: *Expr)
             literal_array(s, a, p.param_array_elem_type, p.param_array_elem_pointee)
         else
             literal_slot(s, a, p.param_type, p.param_pointee_type)
+            literal_view(s, a, p.param_type, p.param_type_name, p.param_type_name_len)   # AGAST #3440
         p = p.next
         a = a.next
 

@@ -135,7 +135,9 @@ REFUSED = {
     "generic_too_many": ("    return @id<i32>(1, 2)", ARITY.format(f="id$i32", n=2, m=1)),
     # test_level18's shape (#1371): a `*u8` where prints takes a StrView.
     "pointer_into_strview": ("    prints(@p)", WRONG.format(n=1, f="prints")),
-    "cstring_into_strview": ('    sv(@c"x")', WRONG.format(n=1, f="sv")),
+    # A `c"..."` literal says what to write instead (R62, AGAST #3440).
+    "cstring_into_strview": ('    sv(@c"x")', 'a `c"..."` literal is a `*u8`, not a `StrView`: '
+                             'write a plain `"..."` literal'),
     "other_pointer_into_struct": ("    byval(@pt)", WRONG.format(n=1, f="byval")),
     "null_into_struct": ("    byval(@null)", WRONG.format(n=1, f="byval")),
     "float_into_struct": ("    byval(@q)", WRONG.format(n=1, f="byval")),

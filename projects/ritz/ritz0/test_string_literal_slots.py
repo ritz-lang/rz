@@ -309,6 +309,33 @@ REJECTED["fit_element_nested"] = (_fn("", "let a: [1][2]u8 = [ [1, 300] ]\n0"), 
 ACCEPTED["element_nested"] = ('fn main() -> i32\n    var a: [1][2]*u8 = [ ["A", "B"] ]\n'
                               "    *a[0][1] as i32\n", 66)
 
+# AGAST #3440 (R62): a `c"..."` is a bare `*u8`, so it fits no `{ ptr, len }`
+# slot. ritz0 gave `.len` 120 with ritzlib.span imported and a traceback without;
+# ritz1 stored an i64 as the struct, which clang refused. Only `"..."` fits.
+_SPAN = "import ritzlib.span\n"
+
+
+def _not_a(view):
+    return f'a `c"..."` literal is a `*u8`, not a `{view}`: write a plain `"..."` literal'
+
+
+REJECTED.update({
+    "cstr_span_let": (_fn("", 'let s: Span<u8> = c"abc"\ns.len'), 2, 23, _not_a("Span<u8>")),
+    "cstr_span_let_imported": (_SPAN + _fn("", 'let s: Span<u8> = c"abc"\ns.len'),
+                               3, 23, _not_a("Span<u8>")),
+    "cstr_span_arm": (_fn("n: i64", 'let s: Span<u8> = if n > 0\n    "A"\nelse\n    c"B"\ns.len'),
+                      5, 9, _not_a("Span<u8>")),
+    "cstr_span_arg": ("fn take(s: Span<u8>) -> i64\n    s.len\n" + _fn("", 'take(c"abc")'),
+                      4, 10, _not_a("Span<u8>")),
+    "cstr_span_return": (_fn("", 'return c"abc"', "Span<u8>"), 2, 12, _not_a("Span<u8>")),
+    "cstr_span_tail_if": (_fn("n: i64", 'if n > 0\n    c"A"\nelse\n    "B"', "Span<u8>"),
+                          3, 9, _not_a("Span<u8>")),
+    "cstr_span_field": ("struct H\n    s: Span<u8>\n" + _fn("", 'let h = H { s: c"abc" }\nh.s.len'),
+                        4, 20, _not_a("Span<u8>")),
+    "cstr_strview_let": (_fn("", 'let s: StrView = c"abc"\ns.len'), 2, 22, _not_a("StrView")),
+})
+ACCEPTED["span_from_literal"] = ('fn main() -> i32\n    let s: Span<u8> = "abc"\n    s.len as i32\n', 3)
+
 # Shapes ritz1 refuses with an error of its own, whatever the literal: it lowers
 # no tuple type and no `await`.
 RITZ0_ACCEPTED = {

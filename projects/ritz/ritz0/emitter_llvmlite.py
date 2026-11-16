@@ -11310,6 +11310,10 @@ class LLVMEmitter:
                 # AGAST #3353: and a `Span<u8>` in a `Span<u8>` slot, so the
                 # answer no longer hangs on whether StrView is registered.
                 tail.as_span = self._is_u8_span(tail_slot)
+            elif isinstance(tail, rast.CStringLit) and fit:
+                # AGAST #3440: a `c"..."` is a bare `*u8` with no length, so a
+                # `{ ptr, len }` slot read garbage (`.len` was 120).
+                self._refuse_cstring_in_view(tail, tail_slot)
             if wants_ptr:
                 self._ptr_tails.add(id(tail))
             elif fit:
@@ -11399,6 +11403,18 @@ class LLVMEmitter:
         name = self._ensure_builtin_generic_struct_specialization(
             rast.NamedType(span, 'Span', [rast.NamedType(span, 'u8', [])]))
         return self.struct_types[name]
+
+    def _refuse_cstring_in_view(self, tail: rast.CStringLit,
+                                slot: Optional[rast.Type]) -> None:
+        """A `c"..."` doesn't fit a `Span<u8>` or a StrView slot (R62, #3440)."""
+        if self._is_u8_span(slot):
+            name = "Span<u8>"
+        elif isinstance(slot, rast.NamedType) and slot.name == "StrView" and not slot.args:
+            name = "StrView"
+        else:
+            return
+        raise EmitError(f'a `c"..."` literal is a `*u8`, not a `{name}`: '
+                        f'write a plain `"..."` literal', self._value_span(tail))
 
     def _check_literal_fits(self, tail: rast.Expr, slot: rast.Type) -> None:
         """A literal that can't be `slot` is an error wherever it is (#2341)."""
