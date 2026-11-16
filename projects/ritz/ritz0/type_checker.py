@@ -510,8 +510,10 @@ class TypeChecker:
                 # A function as a value
                 sig = self.functions.get(expr.name)
                 if sig is not None:
+                    # Its `:&` slots too (AGAST #3035): an un-annotated
+                    # `let g = lb` takes for them what `lb(...)` takes.
                     return rast.FnType(expr.span, [ty for _, ty in sig.params],
-                                       sig.ret_type)
+                                       sig.ret_type, lent=tuple(sorted(sig.lent)))
                 if expr.name == 'nil':
                     return rast.NamedType(expr.span, 'null', [])
                 if expr.name == 'pass' or expr.name in BUILTIN_VARIANTS \
@@ -812,8 +814,12 @@ class TypeChecker:
             if fn_name in self.locals or fn_name in self.globals:
                 callee = self._lookup_var(fn_name)
                 slots = callee.params if isinstance(callee, rast.FnType) else []
+                lent = callee.lent if isinstance(callee, rast.FnType) else ()
                 for i, arg in enumerate(expr.args):
-                    self._infer_into(arg, slots[i] if i < len(slots) else None)
+                    if i in lent and i < len(slots):
+                        self._check_lent_arg(arg, slots[i])
+                    else:
+                        self._infer_into(arg, slots[i] if i < len(slots) else None)
                 if isinstance(callee, rast.FnType):
                     return callee.ret or rast.NamedType(expr.span, 'void', [])
                 return rast.NamedType(expr.span, 'unknown', [])
@@ -877,12 +883,7 @@ class TypeChecker:
             # Check argument types
             for i, (arg, (param_name, param_type)) in enumerate(zip(expr.args, fn_sig.params)):
                 if i in fn_sig.lent:
-                    # `name:& T` borrows a `T` place, and takes what
-                    # already points at one (§13.4).
-                    arg_type = self._infer_type(arg)
-                    self._check_addr_into_mut(arg)
-                    self._check_lent_referent(arg, arg_type, param_type)
-                    self._forget_local_ref(arg)
+                    arg_type = self._check_lent_arg(arg, param_type)
                     if isinstance(self._resolve_alias(arg_type),
                                   (rast.PtrType, rast.RefType)):
                         continue
@@ -893,6 +894,16 @@ class TypeChecker:
                 if not self._value_fits(arg, arg_type, param_type):
                     self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
                               f"got {self._type_str(arg_type)}", arg.span)
+
+    def _check_lent_arg(self, arg: rast.Expr, param_type: rast.Type) -> rast.Type:
+        """`arg` into a `name:& T` slot, of a direct call or one through a fn
+        local (AGAST #3035). It borrows a `T` place, and takes what already
+        points at one (§13.4). Returns the argument's type."""
+        arg_type = self._infer_type(arg)
+        self._check_addr_into_mut(arg)
+        self._check_lent_referent(arg, arg_type, param_type)
+        self._forget_local_ref(arg)
+        return arg_type
 
     def _check_method_call(self, expr: rast.MethodCall) -> rast.Type:
         """Type check method call."""
