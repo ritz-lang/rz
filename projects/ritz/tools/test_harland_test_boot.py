@@ -112,6 +112,10 @@ def tree(tmp_path):
         p = root / "projects" / pkg / "build" / "debug" / elf
         p.parent.mkdir(parents=True)
         p.write_bytes(b"\x7fELF")
+    # The script reads its package list from here (AGAST #2759).
+    shutil.copy(
+        REPO / "projects/indium/initramfs.pkgs", root / "projects/indium/initramfs.pkgs"
+    )
     stubs = tmp_path / "stubs"
     stubs.mkdir()
     return {

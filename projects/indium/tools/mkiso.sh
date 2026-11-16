@@ -14,7 +14,6 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 HARLAND_DIR="$PROJECT_ROOT/../harland"
-RZSH_DIR="$PROJECT_ROOT/../rzsh"
 BUILD_DIR="$PROJECT_ROOT/build"
 RZ_CLI="$PROJECT_ROOT/../../rz"
 
@@ -50,37 +49,28 @@ echo "Kernel: $KERNEL_ELF"
 echo ""
 
 # Create build directory
-mkdir -p "$BUILD_DIR/debug"
+mkdir -p "$BUILD_DIR"
 
 # ============================================================================
 # Build userspace programs
 # ============================================================================
 
-echo "=== Building Indium Userspace ==="
-"$RZ_CLI" build indium
-cp "$PROJECT_ROOT/build/debug/"*.elf "$BUILD_DIR/debug/" 2>/dev/null || true
-
-echo ""
-echo "=== Building rzsh ==="
-"$RZ_CLI" build rzsh
-cp "$RZSH_DIR/build/debug/rzsh.elf" "$BUILD_DIR/debug/" 2>/dev/null || true
-
-echo ""
-echo "=== Building ritzutils ==="
-RITZUTILS_DIR="$PROJECT_ROOT/../ritzutils"
-"$RZ_CLI" build ritzutils
-cp "$RITZUTILS_DIR/build/debug/"*.elf "$BUILD_DIR/debug/" 2>/dev/null || true
-
-echo ""
-echo "=== Building prism ==="
-PRISM_DIR="$PROJECT_ROOT/../prism"
-"$RZ_CLI" build prism
-cp "$PRISM_DIR/build/debug/"*.elf "$BUILD_DIR/debug/" 2>/dev/null || true
+# The packages in initramfs.pkgs, the one list shared with the Makefile and
+# harland/tools/test_tier1_boot.sh (AGAST #2759). Staged apart from indium's
+# own build/debug so another package's ELFs never land in it.
+INITRAMFS_BIN="$BUILD_DIR/initramfs-bin"
+rm -rf "$INITRAMFS_BIN" && mkdir -p "$INITRAMFS_BIN"
+for pkg in $(sed -e 's/#.*//' "$PROJECT_ROOT/initramfs.pkgs"); do
+    echo "=== Building $pkg ==="
+    "$RZ_CLI" build "$pkg"
+    cp "$PROJECT_ROOT/../$pkg/build/debug/"*.elf "$INITRAMFS_BIN/"
+    echo ""
+done
 
 # List what we're including
 echo ""
 echo "=== Userspace binaries ==="
-ls -la "$BUILD_DIR/debug/"*.elf 2>/dev/null || echo "(none found)"
+ls -la "$INITRAMFS_BIN/"*.elf 2>/dev/null || echo "(none found)"
 echo ""
 
 # ============================================================================
@@ -89,7 +79,7 @@ echo ""
 
 echo "=== Creating initramfs ==="
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" \
-    --bin-dir "$BUILD_DIR/debug" \
+    --bin-dir "$INITRAMFS_BIN" \
     --output "$INITRAMFS"
 
 # ============================================================================

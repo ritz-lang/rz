@@ -138,8 +138,14 @@ table listing them here:
 
 | Program | Where it actually comes from |
 |---------|------------------------------|
-| `rzsh` | `projects/rzsh` → `build/debug/rzsh.elf`; indium's `make rzsh` target pulls it in |
+| `rzsh` | `projects/rzsh` → `build/debug/rzsh.elf` |
 | `prism_demo` | `projects/prism` → `build/debug/prism_demo.elf` |
+| `hello_gfx` | `projects/prism` → `build/debug/hello_gfx.elf` |
+
+The initramfs packs every package listed in `initramfs.pkgs` (indium, rzsh,
+ritzutils, prism). That file is the one list: the Makefile's
+`build/initramfs.tar` and `run-uefi`, `tools/mkiso.sh` and harland's boot
+tests all read it (AGAST #2759).
 
 ## Dependencies
 

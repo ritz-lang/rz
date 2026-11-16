@@ -31,9 +31,6 @@ PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
 ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-120}"
 ISO="$HARLAND_DIR/build/harland.iso"
-# Same packages as test_tier1_boot.sh and indium/tools/mkiso.sh: init's suite
-# spawns rzsh and prism's hello_gfx as well as indium's binaries.
-USER_PKGS="indium rzsh ritzutils prism"
 
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
@@ -42,6 +39,13 @@ command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not 
 command -v qemu-img >/dev/null || setup_error "qemu-img not found (qemu-utils)"
 
 [ -f "$ISO" ] || { echo "FAIL: ISO not found at $ISO (run: make -C projects/harland iso)"; exit 1; }
+
+# The packages in the initramfs, read after the tool checks so a missing
+# tool is still a SETUP ERROR: indium/initramfs.pkgs, the one list shared
+# with test_tier1_boot.sh and indium's Makefile and mkiso.sh (AGAST #2759).
+# init's suite spawns rzsh and prism's hello_gfx as well as indium's binaries.
+USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
+[ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     for pkg in $USER_PKGS; do

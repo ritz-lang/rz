@@ -43,9 +43,6 @@ ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-60}"
 MEM="${QEMU_MEM:-2G}"
 MODE="${1:-all}"
-# Same packages indium/tools/mkiso.sh puts in the initramfs. init's suite
-# spawns rzsh and prism's hello_gfx as well as indium's binaries.
-USER_PKGS="indium rzsh ritzutils prism"
 
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
@@ -72,6 +69,13 @@ if [ "$MODE" != native ]; then
     command -v grub-mkstandalone >/dev/null || setup_error "grub-mkstandalone not found"
     [ -d /usr/lib/grub/x86_64-efi ] || setup_error "GRUB x86_64-efi modules not found (grub-efi-amd64-bin)"
 fi
+
+# The packages in the initramfs, read after the tool checks so a missing
+# tool is still a SETUP ERROR: indium/initramfs.pkgs, the one list shared
+# with indium's Makefile and tools/mkiso.sh (AGAST #2759). init's suite spawns
+# rzsh and prism's hello_gfx as well as indium's binaries.
+USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
+[ -n "$USER_PKGS" ] || { echo "FAIL: no packages in $PROJECTS_DIR/indium/initramfs.pkgs"; exit 1; }
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     for pkg in harland $USER_PKGS; do

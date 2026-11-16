@@ -7,7 +7,6 @@
 
 # Paths
 HARLAND_DIR = ../harland
-RZSH_DIR = ../rzsh
 BUILD_DIR = build
 KERNEL_ELF = $(HARLAND_DIR)/build/debug/harland.elf
 BOOTLOADER = $(HARLAND_DIR)/build/debug/BOOTX64.EFI
@@ -22,6 +21,15 @@ QEMU_CPU = -cpu Haswell-v1
 # Find OVMF firmware
 OVMF_CODE := $(shell for p in /usr/share/OVMF/OVMF_CODE_4M.fd /usr/share/OVMF/OVMF_CODE.fd /usr/share/edk2/x64/OVMF_CODE.4m.fd; do [ -f "$$p" ] && echo "$$p" && break; done)
 
+# Packages in the initramfs: the one list, shared with tools/mkiso.sh and
+# harland/tools/test_tier1_boot.sh (AGAST #2759). Their ELFs are staged in
+# INITRAMFS_BIN, not indium's own build/debug, which lacked prism's hello_gfx.
+INITRAMFS_PKGS := $(strip $(shell sed -e 's/\#.*//' initramfs.pkgs))
+INITRAMFS_BIN = $(BUILD_DIR)/initramfs-bin
+
+# Headless runs: make run-uefi QEMU_DISPLAY="-display none"
+QEMU_DISPLAY ?=
+
 # VirtIO disks
 INITRAMFS = $(BUILD_DIR)/initramfs.qcow2
 STORAGE = $(BUILD_DIR)/storage.qcow2
@@ -30,7 +38,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace rzsh iso run run-iso run-uefi debug test test-uefi test-uefi-gui ec2-disk help
+.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi debug test test-uefi test-uefi-gui ec2-disk help
 
 all: iso
 
@@ -49,13 +57,6 @@ userspace:
 	../../rz build indium
 	@mkdir -p $(BUILD_DIR)/debug
 	@cp build/debug/*.elf $(BUILD_DIR)/debug/ 2>/dev/null || true
-
-# Build rzsh (Ritz Shell)
-rzsh:
-	@echo "=== Building rzsh ==="
-	../../rz build rzsh
-	@mkdir -p $(BUILD_DIR)/debug
-	@cp $(RZSH_DIR)/build/debug/rzsh.elf $(BUILD_DIR)/debug/ 2>/dev/null || true
 
 # Build bootable ISO with kernel and userspace
 iso: kernel
@@ -123,19 +124,28 @@ $(EC2_DISK): kernel $(BUILD_DIR)/initramfs.tar
 # Run targets
 # ============================================================================
 
-# Build userspace programs and create initramfs TAR
-$(BUILD_DIR)/initramfs.tar: userspace rzsh
+# Build every package in initramfs.pkgs and stage its ELFs in INITRAMFS_BIN.
+# A package that builds no ELF is an error, not a silently thinner initramfs.
+initramfs-bin:
+	@echo "=== Staging initramfs packages: $(INITRAMFS_PKGS) ==="
+	@rm -rf $(INITRAMFS_BIN) && mkdir -p $(INITRAMFS_BIN)
+	@for pkg in $(INITRAMFS_PKGS); do \
+		../../rz build $$pkg || exit 1; \
+		cp ../$$pkg/build/debug/*.elf $(INITRAMFS_BIN)/ || { echo "ERROR: $$pkg built no ELFs"; exit 1; }; \
+	done
+
+# Create initramfs TAR from the staged packages
+$(BUILD_DIR)/initramfs.tar: initramfs-bin
 	@echo "=== Creating Initramfs TAR ==="
-	@mkdir -p $(BUILD_DIR)
 	python3 $(HARLAND_DIR)/tools/mkinitramfs.py \
-		--bin-dir $(BUILD_DIR)/debug \
+		--bin-dir $(INITRAMFS_BIN) \
 		--output $(BUILD_DIR)/initramfs.tar
 
 # Create QCOW2 initramfs disk for QEMU
 $(INITRAMFS): $(BUILD_DIR)/initramfs.tar
 	@echo "=== Creating Initramfs QCOW2 ==="
 	python3 $(HARLAND_DIR)/tools/mkinitramfs.py \
-		--bin-dir $(BUILD_DIR)/debug \
+		--bin-dir $(INITRAMFS_BIN) \
 		--output $(INITRAMFS)
 
 $(STORAGE):
@@ -178,7 +188,7 @@ run-uefi: $(UEFI_DISK) $(INITRAMFS) $(STORAGE)
 		-device virtio-mouse-pci \
 		-m 256M \
 		-smp 4 \
-		-serial mon:stdio \
+		-serial mon:stdio $(QEMU_DISPLAY) \
 		-no-reboot
 
 # Run with GDB server for debugging (BIOS mode)
@@ -251,14 +261,15 @@ help:
 	@echo "Build Targets:"
 	@echo "  all         - Build ISO (default)"
 	@echo "  kernel      - Build Harland kernel"
-	@echo "  userspace   - Build userspace programs"
+	@echo "  userspace   - Build indium's own userspace programs"
+	@echo "  initramfs-bin - Build and stage every package in initramfs.pkgs"
 	@echo "  iso         - Create bootable ISO with GRUB"
 	@echo "  ec2-disk    - Create EC2-compatible UEFI disk (GPT + ESP)"
 	@echo ""
 	@echo "Run Targets:"
 	@echo "  run         - Boot in QEMU (BIOS/GRUB mode, default)"
 	@echo "  run-iso     - Boot in QEMU (BIOS/GRUB mode)"
-	@echo "  run-uefi    - Boot in QEMU (UEFI mode)"
+	@echo "  run-uefi    - Boot in QEMU (UEFI mode); headless: QEMU_DISPLAY=\"-display none\""
 	@echo "  debug       - Boot with GDB server on :1234 (BIOS)"
 	@echo "  debug-uefi  - Boot with GDB server on :1234 (UEFI)"
 	@echo ""
