@@ -398,6 +398,49 @@ pub fn main() -> i32
     let b: Box<i64> = p.second
     return (p.first + b.v) as i32
 """,
+    # AGAST #1582: a generic fn's parameter names a multi-arg generic over its
+    # own T.  `Pair$T$i64` must become `Pair$i64$i64`, not stay `Pair$T$i64`.
+    "generic_fn_multi_arg_param": PAIR
+    + """\
+fn keep<T>(x: T, p: Pair<T, i64>) -> T
+    return x
+
+pub fn main() -> i32
+    var p: Pair<i64, i64>
+    p.first = 1
+    p.second = 2
+    return keep<i64>(7, p) as i32
+""",
+    # T in EVERY component: the trailing-`$T` rewrite alone gave `Pair$T$i64`.
+    "generic_fn_repeated_param": PAIR
+    + """\
+fn keep<T>(x: T, p: Pair<T, T>) -> T
+    return x
+
+pub fn main() -> i32
+    var p: Pair<i64, i64>
+    p.first = 1
+    p.second = 2
+    return keep<i64>(7, p) as i32
+""",
+    # Same, three components with T at both ends, as param and return type.
+    "generic_fn_triple_param": """\
+struct Triple<A, B, C>
+    a: A
+    b: B
+    c: C
+
+fn same<T>(t: Triple<T, i32, T>) -> Triple<T, i32, T>
+    return t
+
+pub fn main() -> i32
+    var t: Triple<i64, i32, i64>
+    t.a = 1
+    t.b = 2
+    t.c = 4
+    let u: Triple<i64, i32, i64> = same<i64>(t)
+    return (u.a + u.b as i64 + u.c) as i32
+""",
     # `>>` in an impl header. The method is compiled but not called: neither
     # compiler dispatches `b2.seven()` to an impl on a concrete instantiation
     # (ritz0: "No method 'seven' found for type 'Box$Box_i64'").
