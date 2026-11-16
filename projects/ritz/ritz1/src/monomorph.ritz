@@ -973,6 +973,57 @@ pub fn type_param_index(tp: *TypeParam, name: *u8, len: i32) -> i32
         cur = cur.next
     -1
 
+# AGAST #3748: the parameter a `$`-component ends in after its `_`-pieces
+# (`ptr_A`, `ptr_ptr_A`, `arr2_A`), its index, with the length of the pieces
+# before it in `out_head` (`ptr_` is 4).  -1 when the last piece is no
+# parameter, or the component has no `_`: a whole-component parameter is
+# substitute_params_in_mangled's own case.  Only the last piece takes an
+# argument, as gi_match_pieces binds it (#3516).
+fn piece_param_index(tp: *TypeParam, c: *u8, clen: i32, out_head: *i32) -> i32
+    let k: i32 = last_piece_start(c, clen)
+    if k == 0
+        return -1
+    *out_head = k
+    type_param_index(tp, c + k, clen - k)
+
+# Where a `$`-component's last `_`-piece starts: 4 in `ptr_A`, 0 with no `_`
+# or when a piece before it is no type constructor the mangler writes (`ptr`,
+# `ref`, `refmut`, `arr<N>`): `My_A` is a struct's name, not `My` over A.
+fn last_piece_start(c: *u8, clen: i32) -> i32
+    var k: i32 = clen
+    while k > 0 and *(c + k - 1) != 95   # '_'
+        k = k - 1
+    var p: i32 = 0
+    while p < k
+        var e: i32 = p
+        while *(c + e) != 95
+            e = e + 1
+        if is_type_ctor_piece(c + p, e - p) == 0
+            return 0
+        p = e + 1
+    k
+
+# 1 for a mangled type-constructor piece: `ptr`, `ref`, `refmut`, `arr<N>`.
+fn is_type_ctor_piece(c: *u8, n: i32) -> i32
+    if n == 3 and (memcmp(c, c"ptr", 3) == 0 or memcmp(c, c"ref", 3) == 0)
+        return 1
+    if n == 6 and memcmp(c, c"refmut", 6) == 0
+        return 1
+    if n < 4 or memcmp(c, c"arr", 3) != 0
+        return 0
+    for i in 3..n
+        if *(c + i) < 48 or *(c + i) > 57   # not '0'..'9'
+            return 0
+    1
+
+# piece_param_index for the one parameter (type_param, type_param_len): the
+# length of the pieces before it, `ptr_` (4) in `ptr_A`, or 0 for no match.
+fn piece_param_head(c: *u8, clen: i32, type_param: *u8, type_param_len: i32) -> i32
+    let k: i32 = last_piece_start(c, clen)
+    if k == 0 or clen - k != type_param_len or memcmp(c + k, type_param, type_param_len as i64) != 0
+        return 0
+    k
+
 # Rewrite a mangled name, replacing every `$`-component that is a type
 # parameter with its argument: `Box$B` at <A=i64, B=i32> is `Box$i32`.
 # Returns `name` itself when no component is a parameter.
@@ -998,9 +1049,14 @@ pub fn substitute_params_in_mangled(tp: *TypeParam, suffix: *u8, starts: *i32, l
         while end < len and *(name + end) != 36
             end = end + 1
         let idx: i32 = type_param_index(tp, name + pos, end - pos)
+        var head: i32 = 0
+        let pidx: i32 = piece_param_index(tp, name + pos, end - pos, @head)
         if idx >= 0
             hit = 1
             total = total + *(lens + idx) - 1
+        else if pidx >= 0
+            hit = 1
+            total = total + head + *(lens + pidx) - 1
         else
             total = total + end - pos
         if end < len
@@ -1018,11 +1074,23 @@ pub fn substitute_params_in_mangled(tp: *TypeParam, suffix: *u8, starts: *i32, l
         while end < len and *(name + end) != 36
             end = end + 1
         let idx: i32 = type_param_index(tp, name + pos, end - pos)
+        var head: i32 = 0
+        let pidx: i32 = piece_param_index(tp, name + pos, end - pos, @head)
         if idx >= 0
             let a: *u8 = suffix + *(starts + idx) + 1
             let a_len: i32 = *(lens + idx) - 1
             for j in 0..a_len
                 *(out + o) = *(a + j)
+                o = o + 1
+        else if pidx >= 0
+            # AGAST #3748: `ptr_A` at A = u8 is `ptr_u8`.
+            for j in pos..(pos + head)
+                *(out + o) = *(name + j)
+                o = o + 1
+            let pa: *u8 = suffix + *(starts + pidx) + 1
+            let pa_len: i32 = *(lens + pidx) - 1
+            for j in 0..pa_len
+                *(out + o) = *(pa + j)
                 o = o + 1
         else
             for j in pos..end
@@ -2630,6 +2698,9 @@ fn subst_components(name: *u8, name_len: i32, type_param: *u8, type_param_len: i
         else if tuple_subst(name + pos, end - pos, type_param, type_param_len, new_suffix, new_suffix_len, @tl) != null
             hits = hits + 1
             total = total + tl
+        else if plain == 1 and piece_param_head(name + pos, end - pos, type_param, type_param_len) > 0
+            hits = hits + 1
+            total = total + piece_param_head(name + pos, end - pos, type_param, type_param_len) + arg_len
         else
             total = total + end - pos
         if end < name_len
@@ -2653,9 +2724,18 @@ fn subst_components(name: *u8, name_len: i32, type_param: *u8, type_param_len: i
                 o = o + 1
         else
             tn = tuple_subst(name + pos, end - pos, type_param, type_param_len, new_suffix, new_suffix_len, @tl)
+            let head: i32 = piece_param_head(name + pos, end - pos, type_param, type_param_len)
             if tn != null
                 for j in 0..tl
                     *(out + o) = *(tn + j)
+                    o = o + 1
+            else if plain == 1 and head > 0
+                # AGAST #3748: `ptr_A` at A = `Box2_u8` is `ptr_Box2_u8`.
+                for j in pos..(pos + head)
+                    *(out + o) = *(name + j)
+                    o = o + 1
+                for j in 0..arg_len
+                    *(out + o) = *(arg + j)
                     o = o + 1
             else
                 for j in pos..end

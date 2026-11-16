@@ -208,12 +208,33 @@ R51A_INFERS = {
                               "fn main() -> i32\n    var x: u8 = 7\n    let w = W3 { t: Box2 { v: @x } }\n"
                               "    f(w)\n", 17),
     # ...where the piece is a whole mangled generic: `ptr_A` against
-    # `ptr_Box2$u8` binds A = Box2$u8, not `Box2` (`w.t.v.v` is #3748).
+    # `ptr_Box2$u8` binds A = Box2$u8, not `Box2`.  `w.t.v.v` auto-derefs the
+    # `*Box2$u8` field of the Box2$ptr_Box2$u8 instance (#3748: it was ritz1's
+    # "cannot emit: unhandled EXPR_MEMBER").
     "outer_param_ptr_generic_field": (ALL, "struct W3<A>\n    t: Box2<*A>\n"
-                                      "fn f(w: W3<Box2<u8>>) -> i32\n    10\n"
+                                      "fn f(w: W3<Box2<u8>>) -> i32\n    w.t.v.v as i32 + 10\n"
                                       "fn main() -> i32\n    let x: u8 = 7\n    var b = Box2 { v: x }\n"
                                       "    let w = W3 { t: Box2 { v: @b } }\n"
-                                      "    f(w) + b.v as i32\n", 17),
+                                      "    f(w)\n", 17),
+    # ...the same read with the args spelled out, so no inference is involved.
+    "spelled_ptr_generic_field": (ALL, "struct W3<A>\n    t: Box2<*A>\n"
+                                  "fn main() -> i32\n    var b = Box2<u8> { v: 7 }\n"
+                                  "    let w = W3<Box2<u8>> { t: Box2<*Box2<u8>> { v: @b } }\n"
+                                  "    w.t.v.v as i32 + 10\n", 17),
+    # #3748's cause was monomorph: an instance's field type substituted whole
+    # `$`-components only, so W3$Box2_u8 kept `t: Box2$ptr_A`.  A two-param
+    # outer takes the other path (substitute_params_in_mangled).
+    "two_param_ptr_generic_field": (ALL, "struct W9<A, B>\n    t: Box2<*A>\n    n: B\n"
+                                    "fn main() -> i32\n    var b = Box2<u8> { v: 7 }\n"
+                                    "    let w = W9<Box2<u8>, i32> { t: Box2<*Box2<u8>> { v: @b }, n: 10 }\n"
+                                    "    w.t.v.v as i32 + w.n\n", 17),
+    # A piece substitutes only after a type constructor (`ptr`, `arr2`...):
+    # `My_A` is a struct's own name, not `My` over A.
+    "underscored_struct_field": (ALL, "struct My_A\n    n: i32\n"
+                                 "struct W10<A>\n    t: Box2<My_A>\n    a: A\n"
+                                 "fn main() -> i32\n"
+                                 "    let w = W10<u8> { t: Box2<My_A> { v: My_A { n: 9 } }, a: 1 }\n"
+                                 "    w.t.v.n + w.a as i32 * 10\n", 19),
     # The same principle: a generic fn's concrete param is its argument's
     # slot, its `6` a u8.
     "generic_fn_known_param": (ALL, TAGGED + "fn g<U>(x: U, t: Tagged<u8>, b: Box2<u8>) -> i32\n"
