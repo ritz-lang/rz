@@ -34,6 +34,7 @@ import ritzlib.option
 import ritzlib.span
 import ritzlib.os.env
 import ritzlib.args
+import ritzlib.process
 
 # Diagnostic helper — see 24_cp.  Used for the many timeout error
 # messages that embed an argv-derived path/value.
@@ -108,55 +109,9 @@ fn parse_duration(s: *u8, out_sec: *i64, out_nsec: *i64) -> i32
 # Command execution helpers
 # ============================================================================
 
-# Search PATH for command and return full path, or return command if it contains /
-fn find_command(name: *u8, buf: *u8, bufsize: i64) -> *u8
-    # If name contains a /, use it directly
-    var i: i64 = 0
-    while *(name + i) != 0
-        if *(name + i) == '/'  # '/'
-            return name
-        i += 1
-
-    # Get PATH from environment.  Unset and empty both search nothing.
-    let path: StrView = env_get_or("PATH", "")
-
-    var pos: i64 = 0
-
-    while pos < path.len
-        # Extract next PATH component (up to ':' or end)
-        var len: i64 = 0
-        while pos + len < path.len and *(path.ptr + pos + len) != 58  # ':'
-            len += 1
-
-        # Build full path: dir/name
-        var j: i64 = 0
-        while j < len and j < bufsize - 2
-            *(buf + j) = *(path.ptr + pos + j)
-            j += 1
-
-        # Add '/' separator
-        *(buf + j) = 47  # '/'
-        j += 1
-
-        # Add command name
-        var k: i64 = 0
-        while *(name + k) != 0 and j < bufsize - 1
-            *(buf + j) = *(name + k)
-            j += 1
-            k += 1
-
-        *(buf + j) = 0  # Null terminate
-
-        # Check if executable
-        if sys_access(buf, X_OK) == 0
-            return buf
-
-        # Move to next PATH component
-        pos += len
-        if pos < path.len and *(path.ptr + pos) == ':'  # ':'
-            pos += 1
-
-    return null
+# PATH lookup is ritzlib.process's find_command (AGAST #1481): $PATH, or the
+# standard directories when it is unset or empty, as execvp(3) does; a name
+# with a '/' is used as is.
 
 # ============================================================================
 # Wait status helpers
@@ -185,13 +140,14 @@ fn wtermsig(status: i32) -> i32
 
 fn run_timeout(timeout_sec: i64, timeout_nsec: i64, kill_sec: i64, kill_nsec: i64, use_kill: i32, signal: i32, cmd_argc: i32, cmd_argv: **u8) -> i32
     # Find the command
-    var path_buf: [4096]u8
     let cmd_name: *u8 = *(cmd_argv + 0)
-    let cmd_path: *u8 = find_command(cmd_name, @path_buf[0], 4096)
-
-    if cmd_path == null
-        timeout_err2("timeout: '", cmd_name, "': No such file or directory")
-        return EXIT_ENOENT
+    var found: String = string_new()
+    match find_command(strview_from_cstr(cmd_name))
+        Some(path) => found = path
+        None =>
+            timeout_err2("timeout: '", cmd_name, "': No such file or directory")
+            return EXIT_ENOENT
+    let cmd_path: *u8 = string_as_ptr(@&found)
 
     # Fork
     let pid: i32 = sys_fork()

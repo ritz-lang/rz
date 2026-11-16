@@ -9,20 +9,38 @@
 # - Vec<u8> for output capture (growable, owned)
 # - Clear, intent-revealing API
 #
-# Usage:
-#   let proc = spawn(c"./hello")
-#   let output = proc.read_stdout_all()  # Returns Vec<u8>
-#   let result = proc.wait()
-#   assert result.success()
+# Usage (AGAST #1481): the command and its arguments are StrViews, so a
+# "..." literal, a string_as_view(@s) or a slice all pass straight in.
 #
-# For commands with arguments:
-#   var args: [3]*u8 = [c"ls", c"-la", null]
-#   let proc = spawn_args(c"ls", @args[0])
+#   var args: [2]StrView
+#   args[0] = "-c"
+#   args[1] = "echo hi"
+#   match spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+#       Ok(p) =>
+#           var q: Process = p
+#           process_write_all(@&q, "input")
+#           var out: Vec<u8> = process_read_stdout_all(@q)
+#           let r: ProcessResult = process_wait(@q)
+#           process_cleanup(@q)
+#       Err(errno) => ...        # positive errno: 2 = ENOENT, 13 = EACCES
+#
+#   match find_command("sh")     # Option<String>: the path $PATH resolves to
+#       Some(path) => ...
+#       None => ...
+#
+# The *u8 forms below them (spawn_cstr, spawn_args, spawn_full,
+# find_command_in_path, process_write, process_write_str) are the older raw
+# API, kept so existing callers still build.
 
 import ritzlib.sys
 import ritzlib.memory
 import ritzlib.gvec
 import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
 import ritzlib.os.env
 
 # ============================================================================
@@ -92,12 +110,124 @@ pub fn find_command_in_path(name: *u8, buf: *u8, bufsize: i64) -> *u8
     return null
 
 # ============================================================================
+# find_command / find_command_in -> Option<String>
+# ============================================================================
+
+# The directories searched when $PATH is unset or empty: the same list
+# find_command_in_path has always searched.
+fn process_default_path() -> StrView
+    "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin"
+
+# Resolve `name` against `path`, a ':'-separated directory list in $PATH form.
+#
+# - A name containing '/' is a path, not a search: it comes back unchanged,
+#   whether or not it exists (exec reports that).
+# - Otherwise the first `dir/name` that sys_access(X_OK) accepts wins.  An
+#   empty component means the current directory, as in POSIX $PATH; a dir
+#   with a trailing '/' gets no second one.
+# - An empty name or an empty `path` finds nothing.
+pub fn find_command_in(name: StrView, path: StrView) -> Option<String>
+    if name.len == 0
+        return None
+    if strview_find_byte(name, '/') >= 0
+        return Some(string_from(name))
+    if path.len == 0
+        return None
+
+    var start: i64 = 0
+    loop
+        var end: i64 = start
+        while end < path.len and *(path.ptr + end) != ':'
+            end += 1
+
+        # The dir, or "." for an empty component.  Two one-armed ifs, not
+        # if/else: ritz1 types an if/else of calls as the fn's return value
+        # (AGAST #3749).
+        var cand: String = string_new()
+        string_push_bytes(@&cand, path.ptr + start, end - start)
+        if end == start
+            string_push(@&cand, '.')
+        if string_char_at(@cand, string_len(@cand) - 1) != '/'
+            string_push(@&cand, '/')
+        string_push_str(@&cand, name)
+
+        if sys_access(string_as_ptr(@&cand), X_OK) == 0
+            return Some(cand)
+        string_drop(@&cand)
+
+        if end >= path.len
+            break
+        start = end + 1
+    None
+
+# Resolve `name` the way a shell would: against $PATH, or against the
+# default list (/usr/local/bin, /usr/bin, /bin, and the sbin dirs) when $PATH
+# is unset or empty.  See find_command_in for the rules.
+pub fn find_command(name: StrView) -> Option<String>
+    var path: StrView = env_get_or("PATH", "")
+    if path.len == 0
+        path = process_default_path()
+    find_command_in(name, path)
+
+# ============================================================================
 # Process spawning
 # ============================================================================
 
-# Spawn a command (searched in PATH)
-# Returns Process with connected pipes, or invalid process on failure
-pub fn spawn(cmd: *u8) -> Process
+# Spawn `cmd` with `args` (argv[1..]; argv[0] is `cmd` exactly as given).
+#
+# `cmd` is resolved with find_command before anything is forked, so a
+# command that is not there is Err(2) (ENOENT) and one that cannot be
+# executed is Err(13) (EACCES), not a child that exits 127.  Pipe or fork
+# failure is Err(errno) too.  The child inherits this process's environment.
+#
+# None of the views need a terminator: each is copied into a NUL-terminated
+# argv block that lives until the fork is done.
+pub fn spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>
+    var path: String = string_new()
+    match find_command(cmd)
+        Some(found) => path = found
+        None => return Err(ENOENT)
+    let acc: i32 = sys_access(string_as_ptr(@&path), X_OK)
+    if acc < 0
+        string_drop(@&path)
+        return Err(-acc)
+
+    # One block for the bytes of every argument, NUL-terminated, and one for
+    # the argv pointers: [cmd, args..., null].
+    var total: i64 = cmd.len + 1
+    for i in 0..args.len
+        let a: *StrView = args.ptr + i
+        total += a.len + 1
+    let bytes: *u8 = malloc(total)
+    let argv: **u8 = malloc((args.len + 2) * 8) as **u8
+    if bytes == null or argv == null
+        free(bytes)
+        free(argv as *u8)
+        string_drop(@&path)
+        return Err(ENOMEM)
+
+    memcpy(bytes, cmd.ptr, cmd.len)
+    *(bytes + cmd.len) = 0
+    *argv = bytes
+    var off: i64 = cmd.len + 1
+    for i in 0..args.len
+        let a: *StrView = args.ptr + i
+        memcpy(bytes + off, a.ptr, a.len)
+        *(bytes + off + a.len) = 0
+        *(argv + i + 1) = bytes + off
+        off += a.len + 1
+    *(argv + args.len + 1) = null
+
+    let r: Result<Process, i32> = spawn_fork(string_as_ptr(@&path), argv, null)
+    free(bytes)
+    free(argv as *u8)
+    string_drop(@&path)
+    r
+
+# Spawn a command (searched in PATH) with no arguments.
+# Returns Process with connected pipes, or invalid process on failure.
+# Raw form of spawn(cmd, span_empty<StrView>()).
+pub fn spawn_cstr(cmd: *u8) -> Process
     # Build null-terminated argv: [cmd, null]
     var argv: [2]*u8
     argv[0] = cmd
@@ -113,8 +243,25 @@ pub fn spawn_args(cmd: *u8, argv: **u8) -> Process
 # envp is the child's environment, exactly as execve(2) takes it.  A null envp
 # means INHERIT this process's environment (ritzlib.os.env's env_raw_envp()):
 # passing null straight to execve would give the child an empty one.
-# spawn() and spawn_args() both pass null.
+# spawn(), spawn_cstr() and spawn_args() all pass null.
+#
+# Returns an invalid Process (pid -1, see process_valid) when the pipes or
+# the fork fail; spawn() reports the errno instead.
 pub fn spawn_full(cmd: *u8, argv: **u8, envp: **u8) -> Process
+    match spawn_fork(cmd, argv, envp)
+        Ok(p) => p
+        Err(_) =>
+            var bad: Process
+            bad.pid = -1
+            bad.stdin_fd = -1
+            bad.stdout_fd = -1
+            bad.stderr_fd = -1
+            bad.waited = 0
+            bad
+
+# The pipe/fork/exec shared by spawn and spawn_full.  Err is the positive
+# errno of a failed pipe or fork; a failed exec is the child's exit 127.
+fn spawn_fork(cmd: *u8, argv: **u8, envp: **u8) -> Result<Process, i32>
     # Resolved before fork: env_raw_envp() may allocate on first use.
     var child_envp: **u8 = envp
     if child_envp == null
@@ -133,18 +280,21 @@ pub fn spawn_full(cmd: *u8, argv: **u8, envp: **u8) -> Process
     var stdout_pipe: [2]i32
     var stderr_pipe: [2]i32
 
-    if sys_pipe(@stdin_pipe[0]) < 0
-        return p
-    if sys_pipe(@stdout_pipe[0]) < 0
+    let e_in: i32 = sys_pipe(@stdin_pipe[0])
+    if e_in < 0
+        return Err(-e_in)
+    let e_out: i32 = sys_pipe(@stdout_pipe[0])
+    if e_out < 0
         sys_close(stdin_pipe[0])
         sys_close(stdin_pipe[1])
-        return p
-    if sys_pipe(@stderr_pipe[0]) < 0
+        return Err(-e_out)
+    let e_err: i32 = sys_pipe(@stderr_pipe[0])
+    if e_err < 0
         sys_close(stdin_pipe[0])
         sys_close(stdin_pipe[1])
         sys_close(stdout_pipe[0])
         sys_close(stdout_pipe[1])
-        return p
+        return Err(-e_err)
 
     # Fork
     let pid: i32 = sys_fork()
@@ -157,7 +307,7 @@ pub fn spawn_full(cmd: *u8, argv: **u8, envp: **u8) -> Process
         sys_close(stdout_pipe[1])
         sys_close(stderr_pipe[0])
         sys_close(stderr_pipe[1])
-        return p
+        return Err(-pid)
 
     if pid == 0
         # Child process
@@ -176,13 +326,12 @@ pub fn spawn_full(cmd: *u8, argv: **u8, envp: **u8) -> Process
 
         # Find command in PATH
         var path_buf: [4096]u8
-        let cmd_path: *u8 = find_command_in_path(cmd, @path_buf[0], 4096)
-
-        if cmd_path != null
-            sys_execve(cmd_path, argv, child_envp)
-        else
-            # Try command directly (might be absolute path)
-            sys_execve(cmd, argv, child_envp)
+        # Not found: try the command directly (might be a relative path).
+        # One execve, not an if/else of two (ritz1, AGAST #3749).
+        var exec_path: *u8 = find_command_in_path(cmd, @path_buf[0], 4096)
+        if exec_path == null
+            exec_path = cmd
+        sys_execve(exec_path, argv, child_envp)
 
         # If we get here, exec failed
         sys_exit(127)
@@ -199,7 +348,7 @@ pub fn spawn_full(cmd: *u8, argv: **u8, envp: **u8) -> Process
     p.stdout_fd = stdout_pipe[0]  # We read from child's stdout
     p.stderr_fd = stderr_pipe[0]  # We read from child's stderr
 
-    return p
+    Ok(p)
 
 # ============================================================================
 # Process validity check
@@ -220,9 +369,27 @@ pub fn process_write(p: *Process, data: *u8, len: i64) -> i64
         return -1
     return sys_write(p.stdin_fd, data, len)
 
-# Write a null-terminated string to stdin
+# Write all of `data` to stdin, retrying short writes and EINTR.
+# Returns data.len, or a negative errno (-EBADF once stdin is closed).
+pub fn process_write_all(p: @&Process, data: StrView) -> i64
+    if p.stdin_fd < 0
+        return -(EBADF as i64)
+    var done: i64 = 0
+    while done < data.len
+        let n: i64 = sys_write(p.stdin_fd, data.ptr + done, data.len - done)
+        if n == -(EINTR as i64)
+            continue
+        if n < 0
+            return n
+        if n == 0
+            break
+        done += n
+    done
+
+# Write a null-terminated string to stdin.
+# Raw form of process_write_all(p, strview_from_cstr(s)).
 pub fn process_write_str(p: *Process, s: *u8) -> i64
-    return process_write(p, s, strlen(s))
+    return process_write_all(p, strview_from_cstr(s))
 
 # Close stdin (signals EOF to child)
 pub fn process_close_stdin(p: *Process)

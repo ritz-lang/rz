@@ -1,9 +1,9 @@
 #!/bin/bash
 # Golden stdout for process_demo (examples/tier5_async/80_process):
-# ritzlib.process (AGAST #1461).  Children are /bin/cat and sh, found through
-# find_command_in_path's fixed directory list (the suite runs examples under
-# `env -i`, so there is no PATH).  No PIDs are printed, so the output is the
-# same on every run and under both compilers.
+# ritzlib.process (AGAST #1461; StrView / Span API since #1481).  Children are
+# /bin/cat and sh, found through find_command ($PATH, or the standard
+# directories without one).  No PIDs are printed, so the output is the same on
+# every run and under both compilers.
 #
 # Run by scripts/regression.sh once per compiler, with CWD=pkg_dir and
 # ./process_demo linked to that compiler's build.

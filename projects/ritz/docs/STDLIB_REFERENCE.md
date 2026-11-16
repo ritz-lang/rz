@@ -1793,7 +1793,8 @@ struct ProcessResult
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `spawn` | `fn(cmd: *u8) -> Process` | Spawn command |
+| `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is the positive errno: 2 not found, 13 not executable, or a pipe/fork failure |
+| `spawn_cstr` | `fn(cmd: *u8) -> Process` | Raw form, no args |
 | `spawn_args` | `fn(cmd: *u8, argv: **u8) -> Process` | Spawn with args |
 | `spawn_full` | `fn(cmd: *u8, argv: **u8, envp: **u8) -> Process` | Spawn with env; a null `envp` inherits ours (`env_raw_envp()`) |
 | `process_valid` | `fn(p: *Process) -> i32` | Check if valid |
@@ -1802,8 +1803,9 @@ struct ProcessResult
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `process_write` | `fn(p: *Process, data: *u8, len: i64) -> i64` | Write to stdin |
-| `process_write_str` | `fn(p: *Process, s: *u8) -> i64` | Write string to stdin |
+| `process_write_all` | `fn(p: @&Process, data: StrView) -> i64` | Write all of `data` to stdin (retries short writes); `data.len` or a negative errno |
+| `process_write` | `fn(p: *Process, data: *u8, len: i64) -> i64` | Raw: one write(2) to stdin |
+| `process_write_str` | `fn(p: *Process, s: *u8) -> i64` | Raw: write a C string to stdin |
 | `process_close_stdin` | `fn(p: *Process)` | Close stdin (EOF) |
 | `process_read_stdout` | `fn(p: *Process, buf: *u8, max: i64) -> i64` | Read from stdout |
 | `process_read_stdout_all` | `fn(p: *Process) -> Vec<u8>` | Read all stdout |
@@ -1831,7 +1833,9 @@ struct ProcessResult
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `find_command_in_path` | `fn(name: *u8, buf: *u8, bufsize: i64) -> *u8` | Find command |
+| `find_command` | `fn(name: StrView) -> Option<String>` | Search `$PATH`, or the standard dirs if it is unset or empty |
+| `find_command_in` | `fn(name: StrView, path: StrView) -> Option<String>` | Search a `:`-separated dir list: first executable `dir/name`; an empty component is `.`; a name with `/` comes back as is |
+| `find_command_in_path` | `fn(name: *u8, buf: *u8, bufsize: i64) -> *u8` | Raw: the fixed standard dirs only, into `buf` |
 
 ---
 

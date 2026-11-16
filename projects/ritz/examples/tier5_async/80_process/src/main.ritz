@@ -4,25 +4,32 @@
 # stage exercised it (AGAST #1461).  Five parts, each printing only values
 # that are the same on every run (never a PID):
 #
-# 1. `== read all ==`  — spawn_args /bin/cat, write two lines, close stdin,
+# 1. `== read all ==`  — spawn /bin/cat, write two lines, close stdin,
 #    slurp stdout with process_read_stdout_all, wait.  A second wait on the
 #    same process returns the "not waitable" result (exit -1).
 # 2. `== read by line ==` — the same through process_read_line, with the
 #    second line left unterminated so the EOF behaviour shows: a final
 #    line without '\n', then an empty Vec.
-# 3. `== exit code ==` — `sh -c 'exit 3'`, sh found with
-#    find_command_in_path, and its result_code.
+# 3. `== exit code ==` — `sh -c 'exit 3'`, sh found with find_command,
+#    and its result_code.
 # 4. `== kill ==` — process_kill on a cat still waiting for input: wait
 #    reports SIGKILL (9) and exit code 128 + 9.
-# 5. `== missing ==` — find_command_in_path on a name that is nowhere.
+# 5. `== missing ==` — find_command on a name that is nowhere.
 #
-# The suite runs examples under `env -i`, so there is no PATH:
-# find_command_in_path searches a fixed directory list, and /bin/cat is
-# given as an absolute path.
+# The API is the StrView / Span one (AGAST #1481): spawn(cmd, args) takes
+# "..." literals and a Span<StrView> of arguments and returns
+# Result<Process, i32>; find_command returns Option<String>.  The suite runs
+# examples with a fixed PATH, and find_command falls back to the standard
+# directories without one, so the output does not depend on the caller's PATH.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
 import ritzlib.process
 
 # ============================================================================
@@ -55,11 +62,21 @@ fn show_result(r: *ProcessResult)
     show(c"success: ", result_success(r) as i64)
     show(c"signaled: ", r.signaled as i64)
 
+# spawn(), or an invalid Process (process_valid 0) if it failed.
+fn spawn_or_invalid(cmd: StrView, args: Span<StrView>) -> Process
+    var p: Process = Process { pid: -1, stdin_fd: -1, stdout_fd: -1, stderr_fd: -1, waited: 0 }
+    match spawn(cmd, args)
+        Ok(q) => p = q
+        Err(_) => p.pid = -1
+    p
+
 fn spawn_cat() -> Process
-    var argv: [2]*u8
-    argv[0] = c"cat"
-    argv[1] = null
-    return spawn_args(c"/bin/cat", @argv[0])
+    spawn_or_invalid("/bin/cat", span_empty<StrView>())
+
+fn is_some(o: *Option<String>) -> bool
+    match *o
+        Some(_) => true
+        None => false
 
 # ============================================================================
 # 1. Read all
@@ -69,8 +86,8 @@ fn read_all()
     println("== read all ==")
     var p: Process = spawn_cat()
     show(c"spawned: ", process_valid(@p) as i64)
-    show(c"wrote: ", process_write(@p, c"alpha\n", 6))
-    show(c"wrote: ", process_write_str(@p, c"bravo\n"))
+    show(c"wrote: ", process_write_all(@&p, "alpha\n"))
+    show(c"wrote: ", process_write_all(@&p, "bravo\n"))
     process_close_stdin(@p)
 
     var out: Vec<u8> = process_read_stdout_all(@p)
@@ -90,8 +107,8 @@ fn read_all()
 fn read_by_line()
     println("== read by line ==")
     var p: Process = spawn_cat()
-    process_write_str(@p, c"alpha\n")
-    process_write_str(@p, c"bravo")
+    process_write_all(@&p, "alpha\n")
+    process_write_all(@&p, "bravo")
     process_close_stdin(@p)
 
     var l1: Vec<u8> = process_read_line(@p)
@@ -114,19 +131,16 @@ fn read_by_line()
 
 fn exit_code()
     println("== exit code ==")
-    var path: [256]u8
-    let sh: *u8 = find_command_in_path(c"sh", @path[0], 256)
-    if sh == null
+    var sh: Option<String> = find_command("sh")
+    if not is_some(@sh)
         println("sh found: 0")
         return
     println("sh found: 1")
 
-    var argv: [4]*u8
-    argv[0] = c"sh"
-    argv[1] = c"-c"
-    argv[2] = c"exit 3"
-    argv[3] = null
-    var p: Process = spawn_args(sh, @argv[0])
+    var args: [2]StrView
+    args[0] = "-c"
+    args[1] = "exit 3"
+    var p: Process = spawn_or_invalid("sh", span_from_ptr<StrView>(@args[0], 2))
     var r: ProcessResult = process_wait(@p)
     show_result(@r)
     process_cleanup(@p)
@@ -151,9 +165,8 @@ fn kill_child()
 
 fn missing()
     println("== missing ==")
-    var path: [256]u8
-    let found: *u8 = find_command_in_path(c"ritz-no-such-command", @path[0], 256)
-    if found == null
+    var found: Option<String> = find_command("ritz-no-such-command")
+    if not is_some(@found)
         println("not found: 1")
     else
         println("not found: 0")

@@ -1,0 +1,237 @@
+# ritzlib.process: the StrView / Span API (AGAST #1481).
+#
+#   find_command_in(name: StrView, path: StrView) -> Option<String>
+#   find_command(name: StrView) -> Option<String>        ($PATH, or a default)
+#   spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>
+#   process_write_all(p: @&Process, data: StrView) -> i64
+#
+# A StrView carries no terminator, so every test that matters here hands the
+# API a view whose bytes run on past its length (a slice of a longer
+# literal): the callee must copy exactly `len` bytes and terminate them itself.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.process
+
+# 1 if `o` is Some and its String equals `want`.
+fn some_is(o: *Option<String>, want: StrView) -> i32
+    match *o
+        Some(s) => string_eq(@s, want) as i32
+        None => 0
+
+fn is_none(o: *Option<String>) -> i32
+    match *o
+        Some(_) => 0
+        None => 1
+
+fn spawn_err(r: *Result<Process, i32>) -> i32
+    match *r
+        Ok(_) => 0
+        Err(e) => e
+
+# Run the spawned process to completion: stdout into *out, the exit code back
+# (-1 if spawn failed).
+fn run(r: *Result<Process, i32>, out: *Vec<u8>) -> i32
+    match *r
+        Ok(p) =>
+            var q: Process = p
+            *out = process_read_stdout_all(@q)
+            let res: ProcessResult = process_wait(@q)
+            process_cleanup(@q)
+            res.exit_code
+        Err(_) => -1
+
+fn bytes_are(v: *Vec<u8>, want: StrView) -> i32
+    strview_eq(strview_from_ptr(v.data, v.len), want) as i32
+
+# ============================================================================
+# find_command_in -> Option<String>
+# ============================================================================
+
+[[test]]
+fn test_find_command_in_skips_missing_dirs() -> i32
+    var o: Option<String> = find_command_in("env", "/nonexistent-ritz:/usr/bin")
+    assert some_is(@o, "/usr/bin/env") == 1
+    0
+
+[[test]]
+fn test_find_command_in_dir_with_trailing_slash() -> i32
+    var o: Option<String> = find_command_in("env", "/usr/bin/")
+    assert some_is(@o, "/usr/bin/env") == 1
+    0
+
+[[test]]
+fn test_find_command_in_needs_execute_permission() -> i32
+    # /etc/passwd exists but is not executable.
+    var o: Option<String> = find_command_in("passwd", "/etc")
+    assert is_none(@o) == 1
+    0
+
+[[test]]
+fn test_find_command_in_not_found_is_none() -> i32
+    var o: Option<String> = find_command_in("ritz-no-such-command", "/usr/bin:/bin")
+    assert is_none(@o) == 1
+    0
+
+[[test]]
+fn test_find_command_in_empty_path_is_none() -> i32
+    var o: Option<String> = find_command_in("env", "")
+    assert is_none(@o) == 1
+    0
+
+[[test]]
+fn test_find_command_in_uses_view_length() -> i32
+    # name "env" and dir "/usr/bin", both views into longer literals.
+    let name: StrView = strview_slice("envXYZ", 0, 3)
+    let path: StrView = strview_slice("/usr/binNOPE", 0, 8)
+    var o: Option<String> = find_command_in(name, path)
+    assert some_is(@o, "/usr/bin/env") == 1
+    0
+
+[[test]]
+fn test_find_command_in_slash_name_is_returned_as_is() -> i32
+    # A name with a '/' is a path, not a PATH lookup -- exactly as before.
+    var o: Option<String> = find_command_in("./not/here", "/usr/bin")
+    assert some_is(@o, "./not/here") == 1
+    0
+
+# ============================================================================
+# find_command -> Option<String>
+# ============================================================================
+
+[[test]]
+fn test_find_command_finds_sh() -> i32
+    var o: Option<String> = find_command("sh")
+    match o
+        Some(s) =>
+            assert string_ends_with(@s, "/sh")
+            assert sys_access(string_as_ptr(@&s), X_OK) == 0
+        None =>
+            assert false
+    0
+
+[[test]]
+fn test_find_command_missing_is_none() -> i32
+    var o: Option<String> = find_command("ritz-no-such-command")
+    assert is_none(@o) == 1
+    0
+
+# ============================================================================
+# spawn(cmd, args) -> Result<Process, i32>
+# ============================================================================
+
+[[test]]
+fn test_spawn_no_args_cat_echoes_stdin() -> i32
+    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    match r
+        Ok(p) =>
+            var q: Process = p
+            assert process_write_all(@&q, "hello\n") == 6
+            process_close_stdin(@q)
+            var out: Vec<u8> = process_read_stdout_all(@q)
+            assert bytes_are(@out, "hello\n") == 1
+            let res: ProcessResult = process_wait(@q)
+            assert res.exit_code == 0
+            process_cleanup(@q)
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_spawn_searches_path_and_passes_args() -> i32
+    var args: [2]StrView
+    args[0] = "-c"
+    args[1] = "exit 3"
+    var r: Result<Process, i32> = spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+    var out: Vec<u8> = vec_new<u8>()
+    assert run(@r, @out) == 3
+    0
+
+[[test]]
+fn test_spawn_args_are_exact_bytes() -> i32
+    # An arg with a space, an empty arg, and an arg that is a view into a
+    # longer literal: the child must see "a b", "" and "xyz".
+    var args: [5]StrView
+    args[0] = "-c"
+    args[1] = "printf '%s|%s|%s|%s' \"$#\" \"$1\" \"$2\" \"$3\""
+    args[2] = "a b"
+    args[3] = ""
+    args[4] = strview_slice("xyzNOPE", 0, 3)
+    # sh -c CMD NAME ARGS...: args[2] is $0, so shift the view by one.
+    var shifted: [6]StrView
+    shifted[0] = args[0]
+    shifted[1] = args[1]
+    shifted[2] = "zero"
+    shifted[3] = args[2]
+    shifted[4] = args[3]
+    shifted[5] = args[4]
+    var r: Result<Process, i32> = spawn("sh", span_from_ptr<StrView>(@shifted[0], 6))
+    var out: Vec<u8> = vec_new<u8>()
+    assert run(@r, @out) == 0
+    assert bytes_are(@out, "3|a b||xyz") == 1
+    0
+
+[[test]]
+fn test_spawn_argv0_is_cmd_as_given() -> i32
+    # argv[0] is `cmd` exactly as the caller wrote it, not the resolved path.
+    var args: [2]StrView
+    args[0] = "-c"
+    args[1] = "printf '%s' \"$0\""
+    var r: Result<Process, i32> = spawn(strview_slice("shNOPE", 0, 2), span_from_ptr<StrView>(@args[0], 2))
+    var out: Vec<u8> = vec_new<u8>()
+    assert run(@r, @out) == 0
+    assert bytes_are(@out, "sh") == 1
+    0
+
+[[test]]
+fn test_spawn_missing_command_is_enoent() -> i32
+    var r: Result<Process, i32> = spawn("ritz-no-such-command", span_empty<StrView>())
+    assert spawn_err(@r) == 2
+    0
+
+[[test]]
+fn test_spawn_not_executable_is_eacces() -> i32
+    # Found (a '/' path is taken as is) but not executable: Err(13), no fork.
+    var r: Result<Process, i32> = spawn("/etc/passwd", span_empty<StrView>())
+    assert spawn_err(@r) == 13
+    0
+
+# ============================================================================
+# process_write_all(p, StrView)
+# ============================================================================
+
+[[test]]
+fn test_process_write_all_writes_view_length() -> i32
+    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    match r
+        Ok(p) =>
+            var q: Process = p
+            assert process_write_all(@&q, strview_slice("abcNOPE", 0, 3)) == 3
+            process_close_stdin(@q)
+            var out: Vec<u8> = process_read_stdout_all(@q)
+            assert bytes_are(@out, "abc") == 1
+            process_wait(@q)
+            process_cleanup(@q)
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_process_write_all_after_close_is_negative() -> i32
+    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    match r
+        Ok(p) =>
+            var q: Process = p
+            process_close_stdin(@q)
+            assert process_write_all(@&q, "x") < 0
+            process_wait(@q)
+            process_cleanup(@q)
+        Err(_) =>
+            assert false
+    0
