@@ -4745,6 +4745,30 @@ element always holds a value. An array of any rank is dropped element by element
 in index order (`g[0][0]`, `g[0][1]`, … `g[1][0]`), as a rank-1 array is. Both
 compilers do all of this (AGAST #3376, #3377).
 
+The place is evaluated before the value: `a[i] = v` evaluates `a`, then `i`,
+then `v`, left to right as everywhere else, and `g[i][j] = v` evaluates `i`
+before `j` (LARB R61, AGAST #3482). Then the old element drops and `v` is
+stored, as above.
+
+```ritz
+var D: i64 = 0
+
+fn idx(i: i64) -> i64
+    D = D * 10 + 7
+    return i
+
+fn val(x: i64) -> i64
+    D = D * 10 + 8
+    return x
+
+fn main() -> i32
+    var a: [2]i64 = [0, 0]
+    a[idx(1)] = val(5)             # idx, then val: D is 78
+    var g: [2][2]i64 = [ [0, 0], [0, 0] ]
+    g[idx(0)][idx(1)] = val(5)     # i, then j, then val: D is 78778
+    return (D - 78778) as i32      # 0
+```
+
 A move out of a nested field moves that field only, at any depth, as in Rust.
 After `v.w.t` moves, `v` and `v.w` are **partly moved**:
 

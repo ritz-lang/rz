@@ -1,9 +1,9 @@
 """An element store drops the old element; arrays of any rank drop;
 a Drop array must be initialised (LARB R39, AGAST #3305, #3376).
 
-LANGUAGE_SPEC §13.6: `a[i] = v`, `g[i][j] = v` and `h.a[i] = v` drop the
-element's old value after `v` and the index are evaluated, before `v` is
-stored, as a field store does. An array of any rank drops element by element
+LANGUAGE_SPEC §13.6: `a[i] = v`, `g[i][j] = v` and `h.a[i] = v` evaluate the
+place (`a`, then each index, left to right), then `v` (LARB R61); then the
+element's old value drops and `v` is stored, as a field store does. An array of any rank drops element by element
 in index order. §3.3: so every element always holds a value, a local array
 whose element type has drop glue must have an initialiser.
 
@@ -61,26 +61,45 @@ fn one()
     var a: [2]S = [S { x: 1 }, S { x: 2 }]
     a[1] = S { x: 30 }
 """, "one()", (2 * 10 + 1) * 10 + 30),
-    # The old element (2) drops after the index (7) is evaluated, and after
-    # v (8) is; 1 and 3 drop at the end.  Which of v and the index goes first
-    # is not pinned: ritz0 evaluates v first, ritz1 the index (AGAST #3432).
-    "store_after_index": ("""\
+    # LARB R61: the index (7), then v (8), left to right; then the old
+    # element (2) drops and v is stored.  1 and 3 drop at the end.
+    "store_after_index_and_value": ("""\
 fn f()
     var a: [2]S = [S { x: 1 }, S { x: 2 }]
-    a[idx(1)] = S { x: 3 }
-""", "f()", 7213),
-    "store_after_value": ("""\
-fn f()
-    var a: [2]S = [S { x: 1 }, S { x: 2 }]
-    a[1] = mk(3)
-""", "f()", 8213),
-    # As g[i][j] = v.
+    a[idx(1)] = mk(3)
+""", "f()", 78213),
+    # As g[i][j] = v: i (7) before j (6) before v (8).  The old g[0][1] (2)
+    # drops, then g[0][0] (1) and the new g[0][1] (3) at the end.
     "rank2_store_after_index_and_value": ("""\
+fn jdx(j: i64) -> i64
+    D = D * 10 + 6
+    return j
+
 fn f()
     var g: [1][2]S = [ [S { x: 1 }, S { x: 2 }] ]
-    g[0][idx(1)] = S { x: 3 }
-    g[0][0] = mk(4)
-""", "f()", 72814 * 10 + 3),
+    g[idx(0)][jdx(1)] = mk(3)
+""", "f()", 768213),
+    # As h.a[i] = v: the index (7), then v (8); the old h.a[0] (1) drops.
+    "field_array_store_after_index_and_value": ("""\
+fn f()
+    var h: H = H { a: [S { x: 1 }, S { x: 2 }], n: 0 }
+    h.a[idx(0)] = mk(5)
+""", "f()", 78152),
+    # The same order in a match arm (an assignment expression): the index
+    # (7), then v (8); a[1] then holds 3.
+    "match_arm_store_after_index_and_value": ("""\
+fn val(x: i64) -> i64
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [2]i64 = [1, 2]
+    let o: Option<i64> = Some(1)
+    match o
+        Some(k) => a[idx(k)] = val(3)
+        None => D = 0
+    D = D * 10 + a[1]
+""", "f()", 783),
     # Rank 2 at scope end: index order, g[0][0] .. g[1][1].
     "rank2_scope_end": ("""\
 fn f()
@@ -200,10 +219,7 @@ fn f()
 }
 
 
-@pytest.mark.parametrize("compiler", [
-    pytest.param(c, marks=pytest.mark.xfail(
-        strict=True, reason="AGAST #3482: ritz0 evaluates v before the place"))
-    if c == "ritz0" else c for c in COMPILERS])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(CALL_BASE))
 def test_store_into_call_result(tmp_path, compiler, name):
     body, call, want = CALL_BASE[name]

@@ -6591,11 +6591,18 @@ class LLVMEmitter:
                     target_enum = self._ensure_builtin_generic_specialization(
                         target_ritz_type)
             self._literal_into_slot(self._infer_ritz_type(stmt.target), stmt.value)
-            if target_enum is not None:
-                val = self._emit_enum_variant_with_type(stmt.value, target_enum)
-            else:
-                val = self._emit_into_array_slot(stmt.value, self._assign_slot(stmt))
-            self._reject_enum_assign(stmt.target, val, getattr(stmt, 'span', None))
+
+            def emit_val():
+                if target_enum is not None:
+                    v = self._emit_enum_variant_with_type(stmt.value, target_enum)
+                else:
+                    v = self._emit_into_array_slot(stmt.value, self._assign_slot(stmt))
+                self._reject_enum_assign(stmt.target, v, getattr(stmt, 'span', None))
+                return v
+
+            # LARB R61 (§13.6): `a[i] = v` evaluates `a`, then `i`, then `v`.
+            # The index arm below emits v once its place is addressed.
+            val = None if isinstance(stmt.target, rast.Index) else emit_val()
             if isinstance(stmt.target, rast.Ident):
                 name = stmt.target.name
                 # A `let` (#2025 slot or SSA value) was rejected by
@@ -6615,6 +6622,7 @@ class LLVMEmitter:
                 through = self._index_through(stmt.target)
                 if through is not None:
                     ptr = self._emit_expr(through.operand)
+                    val = emit_val()
                     # `(*p)[i] = b` over an array is `p[i] = b`: element i, not the
                     # whole array, as the general case below says (#2331).  Located
                     # at the `*`, as `(*p).f = v` is.
@@ -6627,7 +6635,10 @@ class LLVMEmitter:
                         raise EmitError(array_rules.ELEMENT_NOT_ARRAY, base.span)
                     self.builder.store(self._convert_type(val, ptr.type.pointee, stmt.value), ptr)
                     return None
-                index = self._emit_index_value(stmt.target.index)
+                # Each route addresses the base first, then emits the index
+                # (index_of), then v (emit_val): LARB R61.
+                def index_of():
+                    return self._emit_index_value(stmt.target.index)
 
                 # Special handling for identifiers that are arrays
                 if isinstance(stmt.target.expr, rast.Ident):
@@ -6637,8 +6648,8 @@ class LLVMEmitter:
                         if isinstance(ty, ir.ArrayType):
                             # Array type - use two-level GEP [0, index] on the alloca
                             zero = ir.Constant(self.i32, 0)
-                            ptr = self.builder.gep(alloca, [zero, index])
-                            val = self._convert_type(val, ty.element)
+                            ptr = self.builder.gep(alloca, [zero, index_of()])
+                            val = self._convert_type(emit_val(), ty.element)
                             self._drop_old_element(stmt.target, ptr)
                             self.builder.store(val, ptr)
                             return None
@@ -6647,8 +6658,8 @@ class LLVMEmitter:
                         if isinstance(ty, ir.ArrayType):
                             # Global array - use two-level GEP [0, index] on the global
                             zero = ir.Constant(self.i32, 0)
-                            ptr = self.builder.gep(gvar, [zero, index])
-                            val = self._convert_type(val, ty.element)
+                            ptr = self.builder.gep(gvar, [zero, index_of()])
+                            val = self._convert_type(emit_val(), ty.element)
                             self.builder.store(val, ptr)
                             return None
 
@@ -6661,8 +6672,8 @@ class LLVMEmitter:
                         pointee = field_addr.type.pointee
                         if isinstance(pointee, ir.ArrayType):
                             zero = ir.Constant(self.i32, 0)
-                            ptr = self.builder.gep(field_addr, [zero, index])
-                            val = self._convert_type(val, pointee.element)
+                            ptr = self.builder.gep(field_addr, [zero, index_of()])
+                            val = self._convert_type(emit_val(), pointee.element)
                             self._drop_old_element(stmt.target, ptr)
                             self.builder.store(val, ptr)
                             return None
@@ -6674,8 +6685,8 @@ class LLVMEmitter:
                         pointee = inner_addr.type.pointee
                         if isinstance(pointee, ir.ArrayType):
                             zero = ir.Constant(self.i32, 0)
-                            ptr = self.builder.gep(inner_addr, [zero, index])
-                            val = self._convert_type(val, pointee.element)
+                            ptr = self.builder.gep(inner_addr, [zero, index_of()])
+                            val = self._convert_type(emit_val(), pointee.element)
                             self._drop_old_element(stmt.target, ptr)
                             self.builder.store(val, ptr)
                             return None
@@ -6687,16 +6698,22 @@ class LLVMEmitter:
                     zero = ir.Constant(self.i32, 0)
                     data_ptr = self.builder.load(
                         self.builder.gep(vec_addr, [zero, ir.Constant(self.i32, 0)]))
-                    idx = index
+                    idx = index_of()
                     if idx.type != self.i64:
                         idx = self._convert_type(idx, self.i64)
                     ptr = self.builder.gep(data_ptr, [idx])
-                    val = self._convert_type(val, data_ptr.type.pointee)
+                    val = self._convert_type(emit_val(), data_ptr.type.pointee)
                     self.builder.store(val, ptr)
                     return None
 
                 # General case - pointer indexing
                 base = self._emit_expr(stmt.target.expr)
+                index = index_of()
+                if (isinstance(base.type, ir.ArrayType)
+                        and isinstance(stmt.target.expr, (rast.Call, rast.MethodCall))):
+                    # `mka()[1] = v`: an element of a call's array (AGAST #3234).
+                    raise EmitError(ref_rules.STORE_INTO_TEMP, stmt.target.span)
+                val = emit_val()
                 if isinstance(base.type, ir.PointerType) and isinstance(base.type.pointee, ir.ArrayType):
                     # AGAST #2330, LARB R9: element i at stride T, as the read.  This
                     # took GEP [i], at stride `[N]T`, so a scalar didn't fit and a
@@ -6710,10 +6727,6 @@ class LLVMEmitter:
                     ptr = self.builder.gep(base, [index])
                     val = self._convert_type(val, base.type.pointee)
                     self.builder.store(val, ptr)
-                elif (isinstance(base.type, ir.ArrayType)
-                        and isinstance(stmt.target.expr, (rast.Call, rast.MethodCall))):
-                    # `mka()[1] = v`: an element of a call's array (AGAST #3234).
-                    raise EmitError(ref_rules.STORE_INTO_TEMP, stmt.target.span)
                 else:
                     raise ValueError(f"Cannot index type: {base.type}")
             elif isinstance(stmt.target, rast.UnaryOp) and stmt.target.op == '*':
@@ -10897,6 +10910,9 @@ class LLVMEmitter:
                 target_enum = self._ensure_builtin_generic_specialization(
                     target_ritz_type)
         self._literal_into_slot(self._infer_ritz_type(expr.target), expr.value)
+        # LARB R61 (§13.6): `a[i] = v` addresses `a[i]` before it emits `v`.
+        ptr = (self._emit_lvalue_addr(expr.target)
+               if isinstance(expr.target, rast.Index) else None)
         if target_enum is not None:
             val = self._emit_enum_variant_with_type(expr.value, target_enum)
         else:
@@ -10919,7 +10935,8 @@ class LLVMEmitter:
 
         else:
             # For field access, index, dereference - use _emit_lvalue_addr
-            ptr = self._emit_lvalue_addr(expr.target)
+            if ptr is None:
+                ptr = self._emit_lvalue_addr(expr.target)
             target_ty = ptr.type.pointee
             val = self._convert_type(val, target_ty)
             self.builder.store(val, ptr)
