@@ -452,7 +452,48 @@ NO_LOOP = {
                                   "    return b.v.len as i32\n\n" + MAIN + "    var b: B<U>\n"
                                   "    b.v = vec_new<U>()\n    b.v.push(U.A)\n    b.v.push(U.Cc)\n"
                                   "    return f<U>(@b)\n", 2),
+    # AGAST #1578: a Vec of an Option / Result.  `vec_push$Option$i64`'s `data + i`
+    # had "element size of pointee unknown": a tagged enum is no struct ritz1 finds.
+    # The AGAST repro: a None pushed, read back, and the length.
+    "option_none_push_get_len": (GVEC + MAIN + "    var v: Vec<Option<i64>> = vec_new<Option<i64>>()\n"
+                                 "    let o: Option<i64> = None\n    vec_push<Option<i64>>(@&v, o)\n"
+                                 "    let b: Option<i64> = vec_get<Option<i64>>(@v, 0)\n"
+                                 "    match b\n        Some(n) => return 9\n        None => 0\n"
+                                 "    return vec_len<Option<i64>>(@v) as i32\n", 1),
 }
+
+# AGAST #1578: Some and None round-trip through a Vec of each tagged enum, at its
+# own stride: Option<u8> is 2 bytes, Option<i32> 8, Option<i64> 16, Result<i64, i32>
+# 16.  The middle element is the other variant, so a stride off by any amount reads
+# the wrong tag or payload.  Each value is checked; the return is what ritz0 gives.
+_TE_ROWS = {
+    "option_u8": ("Option<u8>", ("Some(200)", "None", "Some(7)"),
+                  "        Some(n) => t = t + n as i64 * i\n        None => t = t + 100 * i\n",
+                  200 + 200 + 21),
+    "option_i32": ("Option<i32>", ("Some(-70000)", "None", "Some(7)"),
+                   "        Some(n) => t = t + n as i64 * i\n        None => t = t + 100 * i\n",
+                   -70000 + 200 + 21),
+    "option_i64": ("Option<i64>", ("Some(12)", "None", "Some(-5000000000)"),
+                   "        Some(n) => t = t + n * i\n        None => t = t + 100 * i\n",
+                   12 + 200 - 15000000000),
+    "result_i64_i32": ("Result<i64, i32>", ("Ok(5000000000)", "Err(-3)", "Ok(7)"),
+                       "        Ok(n) => t = t + n * i\n        Err(e) => t = t + e as i64 * 1000 * i\n",
+                       5000000000 - 6000 + 21),
+}
+
+
+def _te_program(ty: str, values, arms: str, want: int) -> str:
+    """Push `values`, read each back with vec_get, weight by position, compare to want."""
+    pushes = "".join(f"    vec_push<{ty}>(@&v, {x})\n" for x in values)
+    reads = "".join(f"    i = {k + 1}\n    match vec_get<{ty}>(@v, {k})\n" + arms
+                    for k in range(len(values)))
+    return (GVEC + MAIN + f"    var v: Vec<{ty}> = vec_new<{ty}>()\n" + pushes
+            + "    var t: i64 = 0\n    var i: i64 = 0\n" + reads
+            + f"    if t != {want}\n        return 1\n    return v.len as i32\n")
+
+
+for _name, (_ty, _vs, _arms, _want) in _TE_ROWS.items():
+    NO_LOOP[f"{_name}_round_trip"] = (_te_program(_ty, _vs, _arms, _want), 3)
 
 
 @pytest.mark.integration
