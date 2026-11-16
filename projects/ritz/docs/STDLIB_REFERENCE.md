@@ -424,6 +424,7 @@ count elements as usual, and `data` is a non-null dangling pointer that
 | `vec_last` | `fn<T>(v: @Vec<T>) -> T` | Get last element |
 | `vec_as_ptr` | `fn<T>(v: @Vec<T>) -> *T` | Get raw pointer |
 | `vec_slice` | `fn<T>(v: @Vec<T>, start: i64, end: i64) -> Vec<T>` | Create slice copy |
+| `vec_clone` | `fn<T>(v: @Vec<T>) -> Vec<T>` | Copy every element (`v.clone()`); shallow, so a heap-owning `T` ends up owned twice |
 | `vec_swap` | `fn<T>(v: @&Vec<T>, i: i64, j: i64) -> i32` | Swap elements |
 | `vec_push_bytes` | `fn<T>(v: @&Vec<T>, data: *T, len: i64) -> i32` | Push multiple |
 | `vec_push_str` | `fn(v: @&Vec<u8>, s: *u8) -> i32` | Push C string |
