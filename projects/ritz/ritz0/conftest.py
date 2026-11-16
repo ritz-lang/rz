@@ -166,7 +166,6 @@ SMOKE_FILES = (
     "test_metadata.py",
     "test_export_map.py",
     "test_attrs.py",
-    "test_packaging.py",
     "test_reritz_integration.py",
     "emitter/test_struct_layout.py",
     "emitter/test_fn_cache.py",

@@ -433,8 +433,8 @@ def _build_module():
     if _BUILD_MODULE is None:
         import importlib.util
         pkg_dir = Path(__file__).resolve().parent.parent
-        # Appended, not prepended: projects/ritz holds `packaging.py`, which
-        # must not shadow the PyPI package. build.py itself is loaded by path,
+        # Appended, not prepended: projects/ritz modules must not shadow
+        # PyPI packages of the same name. build.py itself is loaded by path,
         # because a bare `import build` finds whichever `build` comes first on
         # sys.path (the `ritz0/build/` output directory, PyPA's `build`).
         if str(pkg_dir) not in sys.path:

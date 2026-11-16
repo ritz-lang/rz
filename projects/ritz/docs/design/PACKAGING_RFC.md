@@ -5,6 +5,12 @@
 **Author:** Aaron Sinclair, Adele
 **Date:** 2026-02-12
 
+> **Implementation removed (AGAST #1836).** `packaging.py` and the `build.py`
+> commands `install`, `uninstall`, `global-list`, `global-cache`, `lock` and
+> `vendor` had no user: no lockfile or vendor directory existed anywhere, and
+> only their own tests called them. git keeps the code. A future package
+> manager should be designed as its own tool, with a real user.
+
 ---
 
 ## Executive Summary

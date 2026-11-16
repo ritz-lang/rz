@@ -2,7 +2,7 @@
 
 `rz` rewritten in Ritz — the Ritz-native port of the workspace CLI.
 ("rz in rz" = rzrz.) `list`, `--help` and `--version` run natively.
-`build`, `test`, `run`, `clean` and `compare` delegate to `python3 ./rz`
+`build`, `test`, `run` and `clean` delegate to `python3 ./rz`
 (see below) and exit with its status (AGAST #2790). An unknown command
 exits 2.
 
@@ -50,7 +50,6 @@ All four commands above were measured at exit 0 on 2026-09-12.
 ./projects/rzrz/build/debug/rzrz test <project>      # or --all
 ./projects/rzrz/build/debug/rzrz run <project> -- <program args>
 ./projects/rzrz/build/debug/rzrz clean <project>     # or --all
-./projects/rzrz/build/debug/rzrz compare tier2
 ```
 
 `--help` reports:
@@ -64,7 +63,6 @@ Usage:
     rz run PROJECT [-- ARGS]    Build and run a project
     rz list                     List all projects in workspace
     rz clean [PROJECT]          Remove build artifacts (or all with --all)
-    rz compare [TIER]           Compare ritz0 vs ritz1 on example TIER
 
 Options:
     --all                       Apply to all projects
@@ -72,7 +70,7 @@ Options:
     --help, -h                  Show this help message
     --version, -V               Show version information
 
-build/test/run/clean/compare run `python3 ./rz` (build, test and
+build/test/run/clean run `python3 ./rz` (build, test and
 run with --compiler ritz1) from the workspace root.
 ```
 
@@ -89,7 +87,6 @@ stdin/stdout/stderr, and exits with the child's status:
 | `test <p>` / `test --all`          | `./rz test <p>\|--all --compiler ritz1`             |
 | `run <p> [--release] [-- ARGS]`    | `./rz run <p> --compiler ritz1 [--release] [-- ARGS]` |
 | `clean <p>` / `clean --all`        | `./rz clean <p>\|--all`                             |
-| `compare [TIER]`                   | `./rz compare [TIER]`                               |
 
 Before #2790 `build` read the child's stdout to EOF and only then its
 stderr, through pipes: a child writing more than a pipe's worth (64 KiB) to
@@ -113,7 +110,8 @@ ritz1_selfhosted" until 2026-09-12; it never did.
 
 `test`, `run`, `clean` and `compare` used to print "Testing project: X" (and
 so on) and exit 0 having done nothing; #2460 made them exit 1, and #2790
-implemented them by delegation. `test.sh` pins every exit code and the exact
+implemented them by delegation. `compare` went with `./rz compare`
+(AGAST #1836), which was dead code. `test.sh` pins every exit code and the exact
 argv each command hands `./rz`, using a fake `./rz` in a scratch directory.
 
 ## Dependencies

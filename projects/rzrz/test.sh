@@ -2,7 +2,7 @@
 # rzrz CLI behaviour: exit codes, and what each command delegates to.
 #
 # rzrz must not report success for work it did not do (AGAST #2460).
-# build/test/run/clean/compare delegate to `python3 ./rz <cmd> ...` in the
+# build/test/run/clean delegate to `python3 ./rz <cmd> ...` in the
 # current directory and exit with the child's status (AGAST #2790). Most
 # checks run rzrz inside a scratch workspace whose `./rz` is a fake that
 # prints the argv it got, so they pin the exact delegation without
@@ -52,6 +52,12 @@ inws() { (cd "$WS" && exec "$BIN" "$@"); }
 expect help      0       'Usage'           -- "$BIN" --help
 expect version   0       'rz '             -- "$BIN" --version
 expect unknown   nonzero 'Unknown command' -- "$BIN" no-such-command-2460
+# `./rz compare` was deleted as dead code (AGAST #1836): rzrz must not
+# forward to it, so `compare` is unknown and spawns nothing.
+expect compare   2       'Unknown command' -- inws compare
+if inws compare 2>&1 </dev/null | grep -q '^ARGV:'; then
+    echo "FAIL: compare: delegated to a deleted ./rz command"; fails=$((fails+1))
+fi
 # list reads ./projects: run it from the workspace root.
 expect list      0       'rzrz'            -- bash -c 'cd ../.. && exec "$0" list' "$BIN"
 # --help no longer advertises anything as unimplemented.
@@ -71,8 +77,6 @@ expect run-release   0 '^ARGV: run p --compiler ritz1 --release$'          -- in
 expect run-passthru  0 '^ARGV: run p --compiler ritz1 -- x -y --all$'      -- inws run p -- x -y --all
 expect clean         0 '^ARGV: clean p$'                                   -- inws clean p
 expect clean-all     0 '^ARGV: clean --all$'                               -- inws clean --all
-expect compare       0 '^ARGV: compare$'                                   -- inws compare
-expect compare-tier  0 '^ARGV: compare tier2$'                             -- inws compare tier2
 # The child's stderr reaches ours.
 expect stderr        0 '^FAKE-STDERR$'                                     -- inws test p
 
@@ -80,7 +84,6 @@ expect stderr        0 '^FAKE-STDERR$'                                     -- in
 for sub in build test run clean; do
     expect "$sub-exit" 3 '^ARGV: '"$sub"' p' -- env FAKE_RZ_EXIT=3 bash -c 'cd "$1" && exec "$2" "$3" p' _ "$WS" "$BIN" "$sub"
 done
-expect compare-exit 4 '^ARGV: compare' -- env FAKE_RZ_EXIT=4 bash -c 'cd "$1" && exec "$2" compare' _ "$WS" "$BIN"
 
 # A command missing its project is an error, and spawns nothing.
 for sub in build test run clean; do

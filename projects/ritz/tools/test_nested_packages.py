@@ -17,10 +17,8 @@ state, because:
     projects/projects/ritzunit/inventory, so it said "Project not found".
     A path to a package directory now resolves to its project id.
 
-(c) THE PR PLAN MAPPED EVERY CHANGE TO THE TOP-LEVEL DIRECTORY. A change
-    under projects/ritzunit/inventory/ marked `ritzunit` as changed and
-    never the package that contains the change. Changes now map to the
-    innermost workspace project that contains them.
+(c) The PR plan (`rz ci plan`) mapped every change to its top-level
+    directory. #1836 deleted `rz ci` as dead code, and its test with it.
 """
 
 import importlib.machinery
@@ -254,26 +252,3 @@ def test_cli_tests_inventory_by_path(tmp_path):
         cwd=WORKSPACE, capture_output=True, text=True, timeout=600)
     assert "not found" not in r.stderr
     assert r.returncode == 0, r.stdout + r.stderr
-
-
-# --------------------------------------------------------------------------
-# (c) the PR plan maps a change to the package that contains it
-# --------------------------------------------------------------------------
-
-@pytest.mark.unit
-class TestImpactMapsToInnermostPackage:
-    PROJECTS = ["ritz", "ritz/ritzlib/tests", "ritzunit", "ritzunit/inventory"]
-
-    def _direct(self, rz, files):
-        _impacted, direct = rz.compute_impacted_projects(files, self.PROJECTS, {}, {})
-        return direct
-
-    def test_nested_change_marks_the_nested_package(self, rz):
-        assert self._direct(rz, ["projects/ritzunit/inventory/test/t.ritz"]) == {
-            "ritzunit/inventory"}
-
-    def test_parent_change_marks_the_parent(self, rz):
-        assert self._direct(rz, ["projects/ritzunit/src/x.ritz"]) == {"ritzunit"}
-
-    def test_unrelated_path_marks_nothing(self, rz):
-        assert self._direct(rz, ["docs/x.md", "projects/nope/a.ritz"]) == set()

@@ -3497,91 +3497,6 @@ def cmd_cache_clear(args):
     return 0
 
 
-# =============================================================================
-# RFC #107: Global Install Commands
-# =============================================================================
-
-def cmd_install(args):
-    """Install a package globally (RFC #107)."""
-    from packaging import GlobalCache, install_package
-    cache = GlobalCache()
-    success = install_package(
-        args.uri,
-        cache,
-        Path(__file__),  # build.py path
-        release=getattr(args, "release", False),
-        force=getattr(args, "force", False)
-    )
-    return 0 if success else 1
-
-
-def cmd_uninstall(args):
-    """Uninstall a global package (RFC #107)."""
-    from packaging import cmd_uninstall as pkg_uninstall
-    return pkg_uninstall(args)
-
-
-def cmd_global_list(args):
-    """List globally installed packages (RFC #107)."""
-    from packaging import cmd_list_installed
-    return cmd_list_installed(args)
-
-
-def cmd_global_cache(args):
-    """Show global cache information (RFC #107)."""
-    from packaging import cmd_cache_info
-    return cmd_cache_info(args)
-
-
-def cmd_lock(args):
-    """Generate ritz.lock for reproducible builds (RFC #107)."""
-    from packaging import generate_lock_file
-
-    # Determine package directory
-    if args.name:
-        pkg_dir = Path(args.name)
-    else:
-        pkg_dir = Path.cwd()
-
-    if not (pkg_dir / "ritz.toml").exists():
-        print(f"Error: No ritz.toml found in {pkg_dir}", file=sys.stderr)
-        return 1
-
-    try:
-        lock_path = generate_lock_file(pkg_dir)
-        print(f"✓ Generated {lock_path}")
-        return 0
-    except Exception as e:
-        print(f"Error generating lock file: {e}", file=sys.stderr)
-        return 1
-
-
-def cmd_vendor(args):
-    """Vendor dependencies for offline builds (RFC #107)."""
-    from packaging import vendor_dependencies
-
-    # Determine package directory
-    if args.name:
-        pkg_dir = Path(args.name)
-    else:
-        pkg_dir = Path.cwd()
-
-    if not (pkg_dir / "ritz.toml").exists():
-        print(f"Error: No ritz.toml found in {pkg_dir}", file=sys.stderr)
-        return 1
-
-    try:
-        vendor_dir = vendor_dependencies(pkg_dir)
-        # Count vendored packages
-        if vendor_dir.exists():
-            count = len([d for d in vendor_dir.iterdir() if d.is_dir()])
-            print(f"✓ Vendored {count} package(s) to {vendor_dir}")
-        return 0
-    except Exception as e:
-        print(f"Error vendoring dependencies: {e}", file=sys.stderr)
-        return 1
-
-
 def main():
     parser = argparse.ArgumentParser(description="🎭 Ritz Build System")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3648,32 +3563,6 @@ def main():
     # cache-clear
     subparsers.add_parser("cache-clear", help="Clear the build cache")
 
-    # install (RFC #107)
-    install_parser = subparsers.add_parser("install", help="Install a package globally")
-    install_parser.add_argument("uri", help="Package URI (git URL or local path)")
-    install_parser.add_argument("--release", action="store_true",
-                                help="Build with release profile")
-    install_parser.add_argument("--force", action="store_true",
-                                help="Force reinstall")
-
-    # uninstall (RFC #107)
-    uninstall_parser = subparsers.add_parser("uninstall", help="Uninstall a global package")
-    uninstall_parser.add_argument("name", help="Package name")
-
-    # global-list (RFC #107)
-    subparsers.add_parser("global-list", help="List globally installed packages")
-
-    # global-cache (RFC #107)
-    subparsers.add_parser("global-cache", help="Show global cache information")
-
-    # lock (RFC #107)
-    lock_parser = subparsers.add_parser("lock", help="Generate ritz.lock for reproducible builds")
-    lock_parser.add_argument("name", nargs="?", help="Package directory (default: current directory)")
-
-    # vendor (RFC #107)
-    vendor_parser = subparsers.add_parser("vendor", help="Copy dependencies to vendor/ for offline builds")
-    vendor_parser.add_argument("name", nargs="?", help="Package directory (default: current directory)")
-
     args = parser.parse_args()
 
     commands = {
@@ -3685,12 +3574,6 @@ def main():
         "ritz-tests": cmd_ritz_tests,
         "cache-status": cmd_cache_status,
         "cache-clear": cmd_cache_clear,
-        "install": cmd_install,
-        "uninstall": cmd_uninstall,
-        "global-list": cmd_global_list,
-        "global-cache": cmd_global_cache,
-        "lock": cmd_lock,
-        "vendor": cmd_vendor,
     }
 
     return commands[args.command](args)

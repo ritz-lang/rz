@@ -99,7 +99,7 @@ python3 build.py test --all
 # Compile and run one file
 python3 build.py run examples/tier1_basics/01_hello/src/main.ritz
 
-# Other packaging subcommands
+# Other subcommands
 python3 build.py list
 python3 build.py cache-status
 ```

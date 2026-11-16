@@ -12,7 +12,8 @@ ritzlib from scratch on every run:
   so the ritz1 build could never share an object with the gate.
 * `rz compare` ran `build.py clean` before every example, which (ignoring its
   argument) deleted every package's binaries, every __pycache__ and the whole
-  .ritz-cache import-scan store, once per example.
+  .ritz-cache import-scan store, once per example. (#1836 later deleted
+  `rz compare` as dead code, and its test with it.)
 
 Plus the store had a `gc` nobody could reach from `rz`, and no trim ever ran.
 """
@@ -293,24 +294,3 @@ def test_ci_local_trims_the_store_after_the_gate(private_store, monkeypatch, cap
     ci_local.trim_cas()
     assert len(list(private_store.rglob("*.o"))) == 2
     assert "[ritz-cas] gc: removed 3 files" in capsys.readouterr().out
-
-
-# --- rz compare ------------------------------------------------------------
-
-
-@pytest.mark.unit
-def test_rz_compare_does_not_clean_per_example(monkeypatch):
-    rz = _load("rz_cli_1894", RZ_PATH)
-    cmds = []
-
-    class R:
-        returncode = 0
-        stdout = stderr = ""
-
-    def fake_run(cmd, *a, **kw):
-        cmds.append([str(c) for c in cmd])
-        return R()
-    monkeypatch.setattr(rz.subprocess, "run", fake_run)
-    assert rz.build_example_with_build_py("examples/tier1_basics/01_hello", "ritz1")
-    assert [c for c in cmds if "clean" in c] == [], "rz compare still wipes the cache per example"
-    assert any("build" in c and "ritz1" in c for c in cmds)

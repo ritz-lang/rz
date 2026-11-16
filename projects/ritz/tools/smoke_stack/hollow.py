@@ -114,7 +114,7 @@ def suite_hollow(r: Reporter, tmp: Path) -> None:
     r.run("hollow.sage_runs_js", partial(sage_runs_js, work))
     r.run("hollow.sage_no_false_success", partial(sage_no_false_success, work))
     r.run("hollow.goliath_unknown_command", partial(goliath_unknown, work))
-    for sub in ("test", "run", "clean", "compare"):
+    for sub in ("test", "run", "clean"):
         r.run(f"hollow.rzrz_{sub}", partial(rzrz_sub, sub))
     ctx = LspCtx(work)
     ctx.path.write_text(LSP_SRC)
