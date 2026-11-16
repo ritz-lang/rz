@@ -56,6 +56,10 @@ pub struct RefTy
     returned: i32         # 1 for a slot that leaves the fn as a pointer or reference
     ref_size: i32         # N for a pointer kind to `[N]T`; 0 if unknown
     ref_elem: i32         # its T's kind (a struct T is `name`); TYPE_VOID if unknown
+    # AGAST #2098: the `[N][M]..T` a pointer kind points at, else null.  A
+    # `*[N][M]T` records the flat count and the leaf in ref_size / ref_elem
+    # (#2570), so two N-D referents are judged by shape instead.
+    ref_shape: *ArrayShape
     name_only: i32        # 1 for a `-> *X` return: only a name, maybe a stale one
     # AGAST #2364: U when the pointee is a `*U` (pointee == TYPE_PTR), as
     # Param.param_ref_ptr_pointee keeps it; TYPE_VOID if unknown.  A scalar U
@@ -121,6 +125,7 @@ fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.returned = 0
     out.ref_size = 0
     out.ref_elem = TYPE_VOID
+    out.ref_shape = null
     out.name_only = 0
     out.ptr_pointee = TYPE_VOID
     out.held_name = null
@@ -164,6 +169,8 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
             return ref_set(out, loc.pointee_type, 0, loc.type_name, loc.type_name_len)
         ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
         out.ptr_pointee = loc.ref_ptr_pointee
+        if loc.pointee_type == TYPE_ARRAY
+            out.ref_shape = loc.pointee_array_shape   # AGAST #2098
         return 1
     if t == TYPE_ARRAY
         return ref_set_array(out, loc.array_elem_type, loc.array_elem_pointee, loc.type_name, loc.type_name_len, loc.array_shape, loc.array_size)
@@ -214,6 +221,7 @@ fn ref_of_param(p: *Param, out: *RefTy) -> i32
     if p.param_pointee_type == TYPE_ARRAY
         out.ref_size = p.param_pointee_array_size
         out.ref_elem = p.param_pointee_array_elem_type
+        out.ref_shape = p.param_pointee_array_shape   # AGAST #2098
     if p.param_pointee_type == TYPE_PTR
         out.ptr_pointee = p.param_ref_ptr_pointee
     1
@@ -279,6 +287,7 @@ pub fn ref_ty_of(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
             ref_set(out, TYPE_PTR, t.kind, t.name, t.name_len)
             if t.kind == TYPE_ARRAY
                 ref_array_referent(s, e.operand, out)
+                out.ref_shape = t.shape   # AGAST #2098
             return 1
         if e.op == OP_DEREF
             if ref_ty_of(s, e.operand, @t) == 0
@@ -603,6 +612,8 @@ fn ref_other_referent(s: *EmitterState, a: *RefTy, slot: *RefTy) -> i32
     if x == TYPE_STRUCT
         return 1 - name_eq(a.name, a.name_len, slot.name, slot.name_len)
     if x == TYPE_ARRAY
+        if a.ref_shape != null or slot.ref_shape != null
+            return ref_shapes_differ(a, slot)   # AGAST #2098
         if a.ref_size > 0 and slot.ref_size > 0 and a.ref_size != slot.ref_size
             return 1
         if ref_judged(s, a.ref_elem, a) == 1 and ref_judged(s, slot.ref_elem, slot) == 1
@@ -610,6 +621,27 @@ fn ref_other_referent(s: *EmitterState, a: *RefTy, slot: *RefTy) -> i32
                 return 1
             if a.ref_elem == TYPE_STRUCT
                 return 1 - name_eq(a.name, a.name_len, slot.name, slot.name_len)
+    0
+
+# AGAST #2098: 1 when two array referents, one of them N-D, differ: in rank, a
+# dimension or the leaf.  A known 1-D `[6]T` is another type than `[2][3]T`; a
+# referent of unknown size (a pointer local's) is unjudged.
+fn ref_shapes_differ(x: *RefTy, y: *RefTy) -> i32
+    let a: *ArrayShape = x.ref_shape
+    let b: *ArrayShape = y.ref_shape
+    if a == null or b == null
+        if (a == null and x.ref_size <= 0) or (b == null and y.ref_size <= 0)
+            return 0
+        return 1
+    if a.rank != b.rank or a.leaf_type != b.leaf_type
+        return 1
+    var i: i32 = 0
+    while i < a.rank
+        if a.dims[i] != b.dims[i]
+            return 1
+        i = i + 1
+    if a.leaf_type == TYPE_STRUCT
+        return 1 - name_eq(a.leaf_name, a.leaf_name_len, b.leaf_name, b.leaf_name_len)
     0
 
 # 1 when `kind`, with `t`'s name, is a referent the tables name: a scalar, an
@@ -1462,6 +1494,9 @@ fn ref_decl_slot(stmt: *Stmt, out: *RefTy) -> i32
     if stmt.var_pointee_type == TYPE_ARRAY
         out.ref_size = stmt.var_pointee_array_size
         out.ref_elem = stmt.var_pointee_array_elem_type
+        out.ref_shape = stmt.var_pointee_array_shape   # AGAST #2098
+        if stmt.var_ref != null
+            out.ref_shape = stmt.var_ref.param_pointee_array_shape   # `@[N][M]T`
     out.ptr_pointee = ref_decl_ptr_pointee(stmt)
     1
 

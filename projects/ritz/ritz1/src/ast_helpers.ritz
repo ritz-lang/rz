@@ -1601,6 +1601,12 @@ fn param_of_type(p: *Parser, name: *u8, len: i32, ty: i32) -> *Param
         param.param_pointee_array_elem_type = p.last_array_elem_type
         param.param_pointee_array_elem_pointee = p.last_array_elem_pointee
         param.param_pointee_array_shape = p.last_array_shape
+    let nd: *ArrayShape = ptr_nd_pointee_shape(p, ty)   # AGAST #2098: `*[N][M]T`
+    if nd != null
+        param.param_pointee_array_size = nd_shape_count(nd)
+        param.param_pointee_array_elem_type = nd.leaf_type
+        param.param_pointee_array_elem_pointee = nd.leaf_pointee
+        param.param_pointee_array_shape = nd
     param.param_ref_ptr_pointee = TYPE_VOID
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR
         param.param_ref_ptr_pointee = p.last_pointee_type
@@ -2501,6 +2507,7 @@ var g_var_array_size: i32 = 0
 var g_var_ptr_array_size: i32 = 0
 var g_var_ptr_array_elem: i32 = 0
 var g_var_ptr_array_elem_pointee: i32 = 0
+var g_var_ptr_array_shape: *ArrayShape = null   # AGAST #2098: `*[N][M]T`
 
 # AGAST #2822: one record of all the latches above per typed decl, so a typed
 # `let` nested in the initializer (a block arm) can't replace the outer decl's.
@@ -2526,6 +2533,7 @@ struct VarLatch
     ptr_array_size: i32
     ptr_array_elem: i32
     ptr_array_elem_pointee: i32
+    ptr_array_shape: *ArrayShape
 
 var g_var_latch: *VarLatch = null
 
@@ -2558,6 +2566,7 @@ fn push_var_latch(p: *Parser)
     r.ptr_array_size = g_var_ptr_array_size
     r.ptr_array_elem = g_var_ptr_array_elem
     r.ptr_array_elem_pointee = g_var_ptr_array_elem_pointee
+    r.ptr_array_shape = g_var_ptr_array_shape
     g_var_latch = r
 
 # Restore the latches of the typed decl whose `let` is at (line, col).
@@ -2582,6 +2591,7 @@ fn pop_var_latch(p: *Parser, line: i32, col: i32)
     g_var_ptr_array_size = mine.ptr_array_size
     g_var_ptr_array_elem = mine.ptr_array_elem
     g_var_ptr_array_elem_pointee = mine.ptr_array_elem_pointee
+    g_var_ptr_array_shape = mine.ptr_array_shape
 
 pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     g_var_ref = null
@@ -2595,6 +2605,11 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     g_var_ptr_array_size = ptr_array_pointee_size(p, ty)
     g_var_ptr_array_elem = ptr_array_pointee_elem(p, ty)
     g_var_ptr_array_elem_pointee = ptr_array_elem_pointee(p, ty)
+    g_var_ptr_array_shape = ptr_nd_pointee_shape(p, ty)   # AGAST #2098
+    if g_var_ptr_array_shape != null
+        g_var_ptr_array_size = nd_shape_count(g_var_ptr_array_shape)
+        g_var_ptr_array_elem = g_var_ptr_array_shape.leaf_type
+        g_var_ptr_array_elem_pointee = g_var_ptr_array_shape.leaf_pointee
     if ty == TYPE_STRUCT
         p.var_type_name = p.last_type_name
         p.var_type_name_len = p.last_type_name_len
@@ -2745,8 +2760,9 @@ var g_nd_reject_line: i32 = -1
 var g_nd_reject_col: i32 = -1
 
 # AGAST #1509: fail closed where ritz1 cannot lower a multi-dimensional
-# array type.  Only local and global `var` declarations and (AGAST #2097)
-# struct fields carry an ArrayShape; an enum payload, parameter, return type, const or pointee of type
+# array type.  Only local and global `var` declarations, (AGAST #2097)
+# struct fields and (#2098) the pointee of a `*` param or typed local
+# (type_ptr_nd) carry an ArrayShape; an enum payload, parameter, return type, const or other pointee of type
 # `[N][M]T` used to be laid out as `[N x i64]` and miscompiled silently.
 # `what` names the site ("a struct field", ...).  Reported once per source
 # position (the grammar can re-run an action while backtracking); the
@@ -3146,6 +3162,24 @@ fn ptr_names_array(p: *Parser, ty: i32) -> i32
         return 1
     0
 
+# AGAST #2098: the shape of a just-parsed `*[N][M]..T` (only type_ptr_nd lets
+# one parse), null for any other type.  Its holder records the flat `*[N*M..]T`
+# as a plane pointer `let q = @x[i]` does (#2570): `q + k` strides the whole
+# array and `q[i][j]` / `(*q)[i][j]` index over the shape.
+pub fn ptr_nd_pointee_shape(p: *Parser, ty: i32) -> *ArrayShape
+    if ty != TYPE_PTR or p.last_pointee_type != TYPE_ARRAY
+        return null
+    p.last_array_shape
+
+# The element count of `sh`, every dimension multiplied.
+fn nd_shape_count(sh: *ArrayShape) -> i32
+    var n: i32 = 1
+    var i: i32 = 0
+    while i < sh.rank
+        n = n * sh.dims[i]
+        i = i + 1
+    n
+
 # AGAST #1953: N for a just-parsed `*[N]T` (0 otherwise), or `**[N]T` (#2539).
 pub fn ptr_array_pointee_size(p: *Parser, ty: i32) -> i32
     if ptr_names_array(p, ty) == 0
@@ -3161,10 +3195,17 @@ pub fn ptr_array_pointee_elem(p: *Parser, ty: i32) -> i32
 # Handle pointer type *T
 # Stores the pointee type and preserves type name if pointing to struct/generic
 pub fn type_ptr(p: *Parser, written: i32) -> i32
+    nd_array_reject(p, written, parse_pos_line(p), parse_pos_col(p), c"a pointee")  # AGAST #1509
+    type_ptr_nd(p, written)
+
+# AGAST #2098: `*T`, where an N-D T `[N][M]..T` is lowered: the grammar calls
+# this for the outer `*` of a param's or a typed local's type only, which
+# record the shape (ptr_nd_pointee_shape).  Every other `*` is type_ptr, which
+# refuses an N-D pointee.
+pub fn type_ptr_nd(p: *Parser, written: i32) -> i32
     let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
     if is_indirection(inner_type) == 0
         p.last_inner_ref = INNER_REF_NONE
-    nd_array_reject(p, inner_type, parse_pos_line(p), parse_pos_col(p), c"a pointee")  # AGAST #1509
     # Store pointee type for emitter
     p.last_pointee_type = inner_type
     # AGAST #184: track the deepest non-pointer pointee.  For **Foo the
@@ -4449,7 +4490,7 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         s.var_type_name_len = 0
     # Copy array info from parser state if this is an array type
     s.var_array_shape = null
-    s.var_pointee_array_shape = null   # AGAST #2570: only inference sets it
+    s.var_pointee_array_shape = null   # AGAST #2570: inference sets it; #2098: or `*[N][M]T` below
     # AGAST #2822: latched by capture_var_type (every typed decl goes through
     # it) before a `<[M]U>` in the initializer re-set last_array_*.
     let arr: *ArrayElem = g_var_array
@@ -4503,6 +4544,11 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         s.var_pointee_array_size = g_var_ptr_array_size
         s.var_pointee_array_elem_type = g_var_ptr_array_elem
         s.var_pointee_array_elem_pointee = g_var_ptr_array_elem_pointee
+        # AGAST #2098: and its shape, consumed: a decl that captured nothing (an
+        # alias `var b: PA`) must not take an earlier `*[N][M]T`'s.
+        if ty == TYPE_PTR
+            s.var_pointee_array_shape = g_var_ptr_array_shape
+        g_var_ptr_array_shape = null
     s.var_ref = null
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and g_var_ref != null
         s.var_ref = g_var_ref
