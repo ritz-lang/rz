@@ -858,13 +858,10 @@ fn emit_ufcs_call(s: *EmitterState, e: *Expr, fn_def: *FnDef, receiver_reg: i32,
                 emit_str(s, c" to i16\n")
                 converted_regs[j] = trunc
             else if param_ptr.param_type == TYPE_MUT_REF
-                let cast: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, cast)
-                emit_str(s, c" = inttoptr i64 ")
-                emit_reg(s, arg_regs[j])
-                emit_str(s, c" to ptr\n")
-                converted_regs[j] = cast
+                # AGAST #1758: as emit_expr_call (#1757) -- `@&v`, an `@&T`
+                # ident and `v as @&T` are already `ptr`; only an i64 value
+                # (a `-> @&T` call result, a `*T`) is inttoptr'd.
+                converted_regs[j] = i64_value_to_ptr(s, nth_arg(e.args, j), arg_regs[j])
             else if param_ptr.param_type == TYPE_BOOL
                 # Callee expects i1. Bool values are i64 registers and need a
                 # trunc, except a bool global's i1 load (task-99 #100). This
@@ -4887,7 +4884,8 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             param_ptr = param_ptr.next
         else
             # fn_def is null - external function, assume i64 for all args
-            # But if argument is TYPE_MUT_REF, it's loaded as ptr, needs ptrtoint
+            # But a `ptr`-valued argument (`@&v`, an `@&T` local) needs a
+            # ptrtoint; a `-> @&T` call result is already i64 (AGAST #1758).
             param_types[j] = TYPE_I64
             var arg_expr: *Expr = e.args
             var k: i32 = 0
@@ -4903,22 +4901,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             if s176_ext_reg >= 0
                 converted_regs[j] = s176_ext_reg
             else
-                var need_convert: i32 = 0
-                if arg_expr != null
-                    let arg_type: i32 = get_expr_type(s, arg_expr)
-                    if arg_type == TYPE_MUT_REF
-                        # Value is ptr, need to convert to i64
-                        need_convert = 1
-                if need_convert == 1
-                    let pti: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, pti)
-                    emit_str(s, c" = ptrtoint ptr ")
-                    emit_reg(s, arg_regs[j])
-                    emit_str(s, c" to i64\n")
-                    converted_regs[j] = pti
-                else
-                    converted_regs[j] = arg_regs[j]
+                converted_regs[j] = ptr_value_to_i64(s, arg_expr, arg_regs[j])
 
     # Now emit the call with converted registers.  A typed indirect call
     # loads the fn pointer from its slot here, after the args.

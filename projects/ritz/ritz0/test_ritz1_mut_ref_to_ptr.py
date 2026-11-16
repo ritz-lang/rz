@@ -30,6 +30,9 @@ from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
+# The gate builds ritz1_selfhosted before pytest (see test_ritz1_array_elem_slot).
+SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
+RITZ1_BINS = {"ritz1": RITZ1_BIN, "ritz1_selfhosted": SELFHOSTED_BIN}
 # Build product, not a tracked file — see test_ritz1_ptr_arith_chain.py.
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 
@@ -460,12 +463,62 @@ pub fn main() -> i32
 """,
 }
 
+# AGAST #1758: the UFCS fallback (`v.rd(x)` -> `vec_rd$T(@v, x)`) converted
+# every `@&S` argument with `inttoptr i64`, but `@&v`, an `@&S` ident and
+# `p as @&S` are already `ptr`.  A `-> @&S` call result is i64 and still
+# needs it.  Leading `import` lines are hoisted above PRELUDE by _compile.
+UFCS_HELPER = """\
+import ritzlib.gvec
+
+fn vec_rd<T>(v: *Vec<T>, s: @&S) -> i32
+    s.a = s.a + 2
+    s.a
+
+fn pass_mut(s: @&S) -> @&S
+    s
+
+"""
+
+UFCS_MUT_REF_ARG = {
+    "ufcs_addr_mut": UFCS_HELPER + """\
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    var v: Vec<i64> = vec_new<i64>()
+    v.rd(@&s)
+""",
+    # An `@&S` param passed on through the method call.
+    "ufcs_mut_ref_param": UFCS_HELPER + """\
+fn f(v: *Vec<i64>, s: @&S) -> i32
+    v.rd(s)
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    var v: Vec<i64> = vec_new<i64>()
+    f(@v, @&s)
+""",
+    "ufcs_cast_to_mut_ref": UFCS_HELPER + """\
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    var v: Vec<i64> = vec_new<i64>()
+    let p: *S = @s
+    v.rd(p as @&S)
+""",
+    # Pinned: the i64 call result still gets its inttoptr.
+    "ufcs_call_result": UFCS_HELPER + """\
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    var v: Vec<i64> = vec_new<i64>()
+    v.rd(pass_mut(@&s))
+""",
+}
+
 LEFTOVERS = {
     **LOCAL_FROM_MUT_REF,
     **CAST_TO_MUT_REF,
     **REF_RETURN,
     **COMPARE,
     **CALL_RESULT_TO_MUT_REF,
+    **UFCS_MUT_REF_ARG,
 }
 
 BROKEN = {**LET_ASSIGN, **CAST, **RET_FIELD}
@@ -474,13 +527,19 @@ ALL = {**BROKEN, **WORKING, **LEFTOVERS}
 
 def _compile(compiler: str, tmp_path: Path, name: str, program: str):
     src = tmp_path / f"{name}_{compiler}.ritz"
-    src.write_text(PRELUDE + "\n" + program)
+    # Imports go first: hoist a program's leading `import` lines above PRELUDE.
+    lines = program.splitlines(keepends=True)
+    n_imports = 0
+    while n_imports < len(lines) and lines[n_imports].startswith("import "):
+        n_imports += 1
+    imports = "".join(lines[:n_imports])
+    src.write_text(imports + PRELUDE + "\n" + "".join(lines[n_imports:]))
     ll = tmp_path / f"{name}_{compiler}.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     if compiler == "ritz0":
         comp = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
     else:
-        cmd = [str(RITZ1_BIN), str(src), "-o", str(ll)]
+        cmd = [str(RITZ1_BINS[compiler]), str(src), "-o", str(ll)]
         comp = subprocess.run(
             cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300
         )
@@ -496,7 +555,7 @@ def _run(compiler: str, tmp_path: Path, name: str, program: str) -> int:
     )
     exe = tmp_path / f"{name}_{compiler}"
     link_cmd = ["clang", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler == "ritz1":
+    if compiler != "ritz0":
         link_cmd.insert(2, str(RITZ_START))
     link = fast_link.clang(link_cmd, cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, (
@@ -583,3 +642,50 @@ def test_ritz1_compare_ptr_with_mut_ref(ritz1_bin, tmp_path, name):
 def test_ritz1_call_result_into_mut_ref_param(ritz1_bin, tmp_path, name):
     """#1757: a `-> @&S` call result (i64) passed to an `@&S` param is inttoptr'd."""
     assert _run("ritz1", tmp_path, name, CALL_RESULT_TO_MUT_REF[name]) == 42
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", sorted(RITZ1_BINS))
+@pytest.mark.parametrize("name", sorted(UFCS_MUT_REF_ARG))
+def test_ritz1_ufcs_mut_ref_arg(ritz1_bin, tmp_path, compiler, name):
+    """#1758: a UFCS `@&S` argument already `ptr` is passed as-is, not inttoptr'd."""
+    assert _run(compiler, tmp_path, name, UFCS_MUT_REF_ARG[name]) == 42
+
+
+# AGAST #1758 item 2: the no-fn_def argument path (the callee is unknown, so
+# every argument goes as i64) ptrtoint'd whatever get_expr_type called
+# TYPE_MUT_REF -- including a `-> @&S` call result, which is already i64.
+# The only way in is a generic callee nothing defines: ritz0 refuses it
+# ("Unknown function"), ritz1 does not yet (a follow-up), so ritz1 must
+# either refuse it too or emit IR that verifies; never invalid IR.
+UNKNOWN_GENERIC = {
+    "unknown_generic_call_result": """\
+fn pass_mut(s: @&S) -> @&S
+    s
+
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    nope<i64>(pass_mut(@&s)) as i32
+""",
+    # A `ptr` argument still gets its ptrtoint.
+    "unknown_generic_addr_mut": """\
+pub fn main() -> i32
+    var s: S = S { a: 40 }
+    nope<i64>(@&s) as i32
+""",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", sorted(RITZ1_BINS))
+@pytest.mark.parametrize("name", sorted(UNKNOWN_GENERIC))
+def test_ritz1_unknown_callee_mut_ref_arg_ir_verifies(ritz1_bin, tmp_path, compiler, name):
+    """#1758: no `ptrtoint ptr <i64>` for an argument of an unresolved callee."""
+    comp, ll = _compile(compiler, tmp_path, name, UNKNOWN_GENERIC[name])
+    if comp.returncode != 0:
+        assert "Unknown function" in comp.stdout + comp.stderr, comp.stdout + comp.stderr
+        return
+    obj = tmp_path / f"{name}_{compiler}.o"
+    cc = subprocess.run(["clang", "-c", str(ll), "-o", str(obj)],
+                        check=False, capture_output=True, text=True, timeout=120)
+    assert cc.returncode == 0, cc.stderr[-2000:]
