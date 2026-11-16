@@ -11456,8 +11456,9 @@ class LLVMEmitter:
 
         # Fill in the field values as provided in the struct literal
         for idx, field_expr in self._struct_lit_field_indices(expr, field_defs):
-            _, expected_type = field_defs[idx]
-            field_values[idx] = self._emit_struct_lit_field(field_expr, expected_type)
+            field_name, expected_type = field_defs[idx]
+            field_values[idx] = self._emit_struct_lit_field(
+                field_expr, expected_type, field_name, expr.name)
 
         # Zero-initialize any fields not provided in the struct literal
         for i, val in enumerate(field_values):
@@ -11503,8 +11504,8 @@ class LLVMEmitter:
             out.append((field_indices[field_name], field_expr))
         return out
 
-    def _emit_struct_lit_field(self, field_expr: rast.Expr,
-                               expected_type: rast.Type) -> ir.Value:
+    def _emit_struct_lit_field(self, field_expr: rast.Expr, expected_type: rast.Type,
+                               field_name: str, struct_name: str) -> ir.Value:
         """One struct literal initialiser, converted to its field's type."""
         self._literal_into_slot(expected_type, field_expr)
         # `S { opt: None }` must build the variant for *this field's* enum:
@@ -11518,9 +11519,22 @@ class LLVMEmitter:
                 field_enum = self._ensure_builtin_generic_specialization(expected_type)
         if field_enum is not None:
             field_val = self._emit_enum_variant_with_type(field_expr, field_enum)
+        elif self._is_range_index(field_expr):
+            # AGAST #1293: a `Span<T>` field is a view slot, as for a let.
+            field_val = self._emit_slice_into(field_expr, expected_type)
         else:
             field_val = self._emit_into_array_slot(field_expr, expected_type)
-        return self._convert_type(field_val, self._ritz_type_to_llvm(expected_type), field_expr)
+        field_ty = self._ritz_type_to_llvm(expected_type)
+        field_val = self._convert_type(field_val, field_ty, field_expr)
+        if (field_val.type != field_ty
+                and isinstance(field_ty, (ir.BaseStructType, ir.ArrayType))):
+            # _convert_type passes an aggregate through unchanged; insertvalue
+            # would refuse it with an llvmlite TypeError (AGAST #1293).
+            got = self._get_struct_name_from_type(field_val.type) or str(field_val.type)
+            raise EmitError(f"field `{field_name}` of `{struct_name}` is "
+                            f"`{type_to_string(expected_type)}`, not `{got}`",
+                            field_expr.span)
+        return field_val
 
     def _sret_dest(self, fn: ir.Function, ret_type: ir.Type) -> Optional[ir.Value]:
         """`fn`'s sret pointer when it returns `ret_type` through one."""
@@ -11559,7 +11573,7 @@ class LLVMEmitter:
         given = set()
         for idx, field_expr in self._struct_lit_field_indices(expr, field_defs):
             given.add(idx)
-            _, expected_type = field_defs[idx]
+            field_name, expected_type = field_defs[idx]
             field_ty = struct_type.elements[idx]
             field_ptr = self.builder.gep(dest, [zero, ir.Constant(self.i32, idx)],
                                          inbounds=True)
@@ -11571,7 +11585,8 @@ class LLVMEmitter:
             elif self._emit_large_lit_into(field_expr, field_ptr):
                 pass
             else:
-                val = self._emit_struct_lit_field(field_expr, expected_type)
+                val = self._emit_struct_lit_field(field_expr, expected_type,
+                                                  field_name, expr.name)
                 # An sret call writes the field directly (dest is private).
                 if not self._retarget_sret_result(val, field_ptr):
                     self.builder.store(val, field_ptr)

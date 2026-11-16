@@ -22,10 +22,12 @@ runs fn by fn (`make matrix`); a pytest copy that ran the same files under
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 import ritz_ast as rast  # noqa: E402
-from emitter_llvmlite import emit  # noqa: E402
+from emitter_llvmlite import EmitError, emit  # noqa: E402
 from lexer import Lexer  # noqa: E402
 from parser import Parser  # noqa: E402
 
@@ -179,3 +181,29 @@ class TestNumericLiteralSuffixes:
     def test_unsuffixed_literal_is_untouched(self):
         fn = parse("fn f() -> i64\n    7\n").items[0]
         assert isinstance(fn.body.expr, rast.IntLit)
+
+
+# AGAST #1293: a Vec slice into a `Span<T>` struct-literal field is a view,
+# as #2877 made it for a let, var, argument, tail and return.  The field's
+# type is the slot; before, the literal emitted the slice with no expected
+# type, made a `Vec` copy and handed it to llvmlite as the Span field: a raw
+# `TypeError` traceback.  The local `Vec` stands in for ritzlib.gvec: with no
+# `vec_slice` in the module, the copy path fails loudly instead of linking.
+# ritz1 still makes the copy here (invalid IR): #3706.
+VEC = "struct Vec<T>\n    data: *T\n    len: i64\n    cap: i64\n\nstruct H\n    s: Span<u8>\n\n"
+
+
+class TestSliceIntoStructField:
+    """A struct-literal field typed `Span<T>` is a view slot."""
+
+    def test_vec_slice_into_span_field_is_a_view(self):
+        ir = compile_to_ir(VEC + "fn f(v:& Vec<u8>) -> H\n    H { s: v[0..2] }\n")
+        assert "vec_slice" not in ir
+
+    def test_a_field_of_the_wrong_struct_is_a_located_error(self):
+        """What still doesn't fit the field is the user's error, located,
+        not an llvmlite `TypeError` about `insertvalue`."""
+        with pytest.raises(EmitError) as err:
+            compile_to_ir(VEC + "struct G\n    x: i32\n\nfn f(g: G) -> H\n    H { s: g }\n")
+        assert str(err.value).startswith("test.ritz:13:12: ")
+        assert "field `s` of `H` is `Span<u8>`, not `G`" in str(err.value)
