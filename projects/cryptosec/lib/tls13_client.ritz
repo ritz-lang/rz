@@ -27,7 +27,10 @@
 #   dropped (no resumption); KeyUpdate rekeys, and answers update_requested
 #   with our own KeyUpdate on the next write; close_notify is a clean end of
 #   stream (TLS_READ_CLOSED); any other alert, or any other handshake
-#   message, ends the connection. No alert is sent back on errors.
+#   message, ends the connection.
+# - On an error it detects, the client has a fatal alert for the server
+#   (RFC 8446 6.2): fetch it with tls_client_pending_alert and send it before
+#   closing the socket.
 #
 # Non-blocking API for io_uring integration:
 # - tls_client_handshake_step() processes data incrementally
@@ -222,6 +225,9 @@ pub struct TlsClient
     peer_closed: i32          # 1 once the server's close_notify arrived
     peer_alert: i32           # description of the last alert received
 
+    # 1 once our fatal alert was handed out, or when there is none to send.
+    alert_done: i32
+
 # ============================================================================
 # Client Lifecycle
 # ============================================================================
@@ -237,6 +243,7 @@ pub fn tls_client_init(client: *TlsClient, config: *TlsConfig) -> i32
     # the name the caller asked for.
     if config.hostname_refused != 0
         client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+        client.alert_done = 1  # nobody to tell: nothing was sent
         return -1
 
     # Copy config
@@ -256,6 +263,7 @@ pub fn tls_client_init(client: *TlsClient, config: *TlsConfig) -> i32
     if config.hostname_len > 0
         if client_hello_set_hostname(@client.client_hello, @config.hostname[0], config.hostname_len) != 0
             client_fail(client, TLS_ERR_ILLEGAL_PARAMETER)
+            client.alert_done = 1
             return -1
 
     # Set cipher suites from config
@@ -1134,6 +1142,84 @@ pub fn tls_client_close(client: *TlsClient, out: *u8, out_cap: i64) -> i64
     else
         client.state = TLS_STATE_CLOSING
     return result as i64
+
+# ============================================================================
+# Our fatal alert (RFC 8446 6.2)
+# ============================================================================
+
+# Alert descriptions (RFC 8446 6).
+pub const TLS_ALERT_UNEXPECTED_MESSAGE: i32 = 10
+pub const TLS_ALERT_BAD_RECORD_MAC: i32 = 20
+pub const TLS_ALERT_RECORD_OVERFLOW: i32 = 22
+pub const TLS_ALERT_BAD_CERTIFICATE: i32 = 42
+pub const TLS_ALERT_ILLEGAL_PARAMETER: i32 = 47
+pub const TLS_ALERT_DECODE_ERROR: i32 = 50
+pub const TLS_ALERT_DECRYPT_ERROR: i32 = 51
+
+# The alert that reports `err` to the server, or -1 for none: TLS_ERR_PEER_ALERT
+# (the server already closed with its own), and errors not mapped yet.
+fn client_alert_for_error(err: i32) -> i32
+    if err == TLS_ERR_DECRYPT_FAILED
+        return TLS_ALERT_BAD_RECORD_MAC
+    if err == TLS_ERR_UNEXPECTED_MESSAGE
+        return TLS_ALERT_UNEXPECTED_MESSAGE
+    if err == TLS_ERR_PARSE_ERROR
+        return TLS_ALERT_DECODE_ERROR
+    if err == TLS_ERR_ILLEGAL_PARAMETER
+        return TLS_ALERT_ILLEGAL_PARAMETER
+    if err == TLS_ERR_RECORD_OVERFLOW
+        return TLS_ALERT_RECORD_OVERFLOW
+    if err == TLS_ERR_CERTIFICATE_INVALID
+        return TLS_ALERT_BAD_CERTIFICATE
+    if err == TLS_ERR_VERIFY_FAILED || err == TLS_ERR_FINISHED_MISMATCH
+        return TLS_ALERT_DECRYPT_ERROR
+    return -1
+
+# After an error (TLS_STATE_ERROR), the fatal alert that tells the server why
+# (RFC 8446 6.2): the side that detects an error sends one before it closes.
+# Call once the handshake step or read has failed, and send what it writes.
+#
+# Before the ServerHello the alert is a plaintext record; once handshake keys
+# exist it is encrypted under the current write keys (handshake keys during
+# the handshake, application keys after it).
+#
+# Returns the record's length (7 plaintext, 24 encrypted); 0 if there is
+# nothing to send (no error, the alert was already fetched, the server sent
+# its own fatal alert, or the error has no alert); -1 if out_cap is too small,
+# in which case nothing is written and the alert stays pending.
+#
+# Built here rather than at the failure: tls_client_read has no output
+# buffer, and an error freezes the write keys (write and close refuse), so
+# the record is the same either way.
+pub fn tls_client_pending_alert(client: *TlsClient, out: *u8, out_cap: i64) -> i64
+    if client.state != TLS_STATE_ERROR || client.alert_done != 0
+        return 0
+    let desc: i32 = client_alert_for_error(client.last_error)
+    if desc < 0
+        return 0
+
+    var alert: [2]u8
+    alert[0] = 2  # fatal
+    alert[1] = desc as u8
+
+    if client.encrypted_handshake == 0
+        if out_cap < 7
+            return -1
+        out[0] = 21  # alert
+        out[1] = 0x03
+        out[2] = 0x03
+        out[3] = 0
+        out[4] = 2
+        out[5] = alert[0]
+        out[6] = alert[1]
+        client.alert_done = 1
+        return 7
+
+    let n: i32 = tls_record_state_client_encrypt(@client.write_state, @alert[0], 2, 21, out, client_record_cap(out_cap))
+    if n < 0
+        return -1
+    client.alert_done = 1
+    return n as i64
 
 # ============================================================================
 # Helpers
