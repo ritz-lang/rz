@@ -33,7 +33,8 @@ from metadata import type_to_string
 from async_transform_v2 import generate_state_machine, AsyncStateMachine
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
-from type_checker import TypeChecker, check_ref_slots
+from type_checker import TypeChecker
+from typed import type_module
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
 
@@ -17384,11 +17385,12 @@ def emit(module: rast.Module, no_runtime: bool = False,
     else:
         emitter._cached_fn_names = set()
 
-    # A reference in a by-value slot or a value in a reference slot (§13.2, §13.4,
-    # AGAST #2336, #2337). After monomorphisation,
-    # so a generic body is judged at each `T` it's instantiated with.
+    # The typing pass over what is emitted (typed.py, AGAST #3448), so a
+    # generic body is typed, and its slots judged, at each `T` it's
+    # instantiated with: a reference in a by-value slot or a value in a
+    # reference slot (§13.2, §13.4, AGAST #2336, #2337).
     emitter._current_source_file = main_source_path
-    slot_errors = check_ref_slots(module, emitter._should_emit_body, module_names)
+    slot_errors = type_module(module, module_names, emitter._should_emit_body).slot_errors
     slot_errors += MoveChecker().check_instances(module)
     if slot_errors:
         raise EmitError('\n'.join(str(e) for e in slot_errors))

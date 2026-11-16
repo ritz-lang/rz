@@ -18,6 +18,7 @@ import array_rules
 import ref_rules
 from metadata import type_to_string
 import ritz_ast as rast
+import typed
 from ufcs import UFCS_NON_GENERIC_PREFIXES
 # The state lives in move_state.py, the per-node-kind walk in move_walk.py
 # (AGAST #3449); every name move_state defines is still importable from here.
@@ -57,8 +58,9 @@ class MoveChecker(MoveWalk):
         self.current_fn_name: Optional[str] = None
         # Type aliases: name -> underlying type
         self.type_aliases: Dict[str, rast.Type] = {}
-        # Function return types: name -> return type
-        self.fn_return_types: Dict[str, rast.Type] = {}
+        # Each expression's type, from the typing pass (typed.py): the
+        # kinds in typed.MOVE_CHECKER_READS come from here.
+        self.typed: Optional[typed.Typed] = None
         # Function parameters: name -> params, so an argument lent to an
         # `@T` / `*T` / `:&` parameter (auto-borrow) isn't counted as a move.
         self.fn_params: Dict[str, List[rast.Param]] = {}
@@ -109,6 +111,7 @@ class MoveChecker(MoveWalk):
         """
         self.errors = []
         self._collect(module)
+        self.typed = typed.typed_of(module)
         module.moves_annotated = True
 
         # Second pass: check functions and impl methods
@@ -138,9 +141,14 @@ class MoveChecker(MoveWalk):
         for item in module.items:
             if isinstance(item, rast.ImplBlock):
                 fns.extend(item.methods)
+        impls = {id(m): item for item in module.items
+                 if isinstance(item, rast.ImplBlock) for m in item.methods}
         for fn in fns:
             if any(self.types.is_move_only(a) for a in getattr(fn, 'instance_args', ())):
-                self._check_fn(copy.deepcopy(fn))
+                body = copy.deepcopy(fn)
+                # The copy's own types: the table holds the original's nodes.
+                self.typed = typed.type_bodies(module, [(body, impls.get(id(fn)))])
+                self._check_fn(body)
         kept = (ref_rules.MOVE_OUT_OF_REF, array_rules.FILL_MOVE_ONLY,
                 array_rules.MOVE_OUT_OF_ELEMENT)
         self.errors = [e for e in self.errors if e.reason in kept or e.after_move]
@@ -156,9 +164,6 @@ class MoveChecker(MoveWalk):
             elif isinstance(item, rast.VarDef) and item.type is not None:
                 self.globals[item.name] = item.type
             elif isinstance(item, (rast.FnDef, rast.ExternFn)):
-                # Collect function return type for call inference
-                if item.ret_type:
-                    self.fn_return_types[item.name] = item.ret_type
                 self.fn_params[item.name] = list(item.params)
             elif isinstance(item, rast.ImplBlock):
                 for m in item.methods:
@@ -229,13 +234,10 @@ class MoveChecker(MoveWalk):
     def _type_of_binop(self, expr: rast.BinOp) -> rast.Type:
         return self._infer_expr_type(expr.left)
 
-    def _type_of_cast(self, expr: rast.Cast) -> rast.Type:
-        return expr.target
-
-    def _type_of_struct_lit(self, expr: rast.StructLit) -> rast.Type:
-        # With its type arguments (AGAST #2263): `Box<T> { .. }` holds a
-        # T, and a method on it returns `T`, not an unsubstituted `X`.
-        return rast.NamedType(expr.span, expr.name, list(expr.type_args or []))
+    def _type_from_table(self, expr: rast.Expr) -> rast.Type:
+        """The typing pass's type for `expr` (typed.MOVE_CHECKER_READS)."""
+        ty = self.typed.type_of(expr) if self.typed is not None else None
+        return ty if ty is not None else rast.NamedType(expr.span, 'unknown', [])
 
     def _type_of_array_lit(self, expr: rast.ArrayLit) -> rast.Type:
         if expr.elements:
@@ -259,15 +261,6 @@ class MoveChecker(MoveWalk):
         # binding from that too.
         return (self._field_path_type(expr)
                 or rast.NamedType(expr.span, 'unknown', []))
-
-    def _type_of_call(self, expr: rast.Call) -> rast.Type:
-        # Look up function return type
-        if isinstance(expr.func, rast.Ident):
-            fn_name = expr.func.name
-            if fn_name in self.fn_return_types:
-                return self.fn_return_types[fn_name]
-        # Unknown function or no return type
-        return rast.NamedType(expr.span, 'unknown', [])
 
     def _type_of_match(self, expr: rast.Match) -> rast.Type:
         # What its arms give, typed as they were checked (AGAST #2178).
@@ -312,30 +305,19 @@ class MoveChecker(MoveWalk):
         return rast.NamedType(expr.span, 'unknown', [])
 
     # Every kind _infer_expr_type types, by class (see move_walk.py's
-    # EXPR_CHECKS on why `type(expr)` is enough).  Literals first.
+    # EXPR_CHECKS on why `type(expr)` is enough).  The typing pass's kinds
+    # first; the rest are still this checker's own rules (AGAST #3448).
     EXPR_TYPES = {
-        rast.IntLit: lambda self, e: rast.NamedType(e.span, 'i64', []),
-        rast.FloatLit: lambda self, e: rast.NamedType(e.span, 'f64', []),
-        rast.BoolLit: lambda self, e: rast.NamedType(e.span, 'bool', []),
-        rast.CharLit: lambda self, e: rast.NamedType(e.span, 'u8', []),
-        # Bare string literals produce StrView (AGAST #98).
-        # StrView is Copy (ptr + len view, no ownership).
-        rast.StringLit: lambda self, e: rast.NamedType(e.span, 'StrView', []),
-        # C-string literals: c"hello" -> *u8 (Copy)
-        rast.CStringLit: lambda self, e: rast.PtrType(
-            e.span, rast.NamedType(e.span, 'u8', []), mutable=False),
+        **dict.fromkeys(typed.MOVE_CHECKER_READS, _type_from_table),
         # Null is a special pointer type (Copy)
         rast.NullLit: lambda self, e: rast.PtrType(
             e.span, rast.NamedType(e.span, 'void', []), mutable=False),
         rast.Ident: _type_of_ident,
         rast.UnaryOp: _type_of_unary,
         rast.BinOp: _type_of_binop,
-        rast.Cast: _type_of_cast,
-        rast.StructLit: _type_of_struct_lit,
         rast.ArrayLit: _type_of_array_lit,
         rast.TupleLit: _type_of_tuple_lit,
         rast.Field: _type_of_field,
-        rast.Call: _type_of_call,
         rast.Match: _type_of_match,
         rast.TryOp: _type_of_try,
         rast.MethodCall: _type_of_method_call,

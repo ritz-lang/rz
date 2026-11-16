@@ -31,6 +31,7 @@ from monomorph import mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
 from name_resolver import (BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS,
                            SYSCALL_BUILTINS)
+from typed import Typed
 
 
 class FloatLitType(rast.NamedType):
@@ -40,8 +41,10 @@ class FloatLitType(rast.NamedType):
 class TypeError(Exception):
     """Type checking error with source location."""
     def __init__(self, message: str, span: Optional[rast.Span] = None,
-                 after_moves: bool = False):
+                 after_moves: bool = False, slot: bool = False):
         self.span = span
+        # A slot rule's (§13.2, §13.4): reported on every compile (Typed).
+        self.slot = slot
         # Doesn't explain a move error, so it's printed after one (ritz0.py):
         # a discarded whole array (#3189) beside #2949's move out of `a:&`.
         self.after_moves = after_moves
@@ -100,12 +103,10 @@ class TypeChecker:
     NUMERIC_TYPES = INT_TYPES | {'f32', 'f64'}
 
     def __init__(self, module_names: Optional[Set[str]] = None,
-                 slots_only: bool = False):
+                 typed: Optional[Typed] = None):
         self.errors: List[TypeError] = []
-
-        # Report only what doesn't fit between values and references
-        # (check_ref_slots).
-        self.slots_only = slots_only
+        # Where each expression's type goes (typed.py, the typing pass).
+        self.typed = typed if typed is not None else Typed()
         self._arg_depth = 0  # >0 while a call argument is checked
         # `name:& T` params of the current fn, by name, with their `T`: `*name`
         # is the `T` itself.
@@ -158,7 +159,34 @@ class TypeChecker:
         """Type check a module. Returns list of errors. `emits_body`, if
         given, picks the fns whose bodies are checked."""
         self.errors = []
+        self._register(module)
 
+        # Third pass: check function bodies
+        wanted = emits_body or (lambda _fn: True)
+        for item in module.items:
+            if isinstance(item, rast.FnDef) and wanted(item):
+                self._check_function(item)
+
+        # Check impl methods
+        for item in module.items:
+            if isinstance(item, rast.ImplBlock):
+                for method in item.methods:
+                    if wanted(method):
+                        self._check_function(method, item)
+
+        return self.errors
+
+    def check_bodies(self, module: rast.Module, bodies) -> List[TypeError]:
+        """Check `bodies`, (fn, its impl or None) pairs that needn't be
+        `module`'s items, against `module`'s declarations."""
+        self.errors = []
+        self._register(module)
+        for fn, impl in bodies:
+            self._check_function(fn, impl)
+        return self.errors
+
+    def _register(self, module: rast.Module) -> None:
+        """Every declaration in `module`: types, signatures, globals."""
         # First pass: collect all type definitions
         for item in module.items:
             if isinstance(item, rast.StructDef):
@@ -190,21 +218,6 @@ class TypeChecker:
         for item in module.items:
             if isinstance(item, (rast.VarDef, rast.ConstDef)) and item.value is not None:
                 self._check_global_literal(item.value, item.type)
-
-        # Third pass: check function bodies
-        wanted = emits_body or (lambda _fn: True)
-        for item in module.items:
-            if isinstance(item, rast.FnDef) and wanted(item):
-                self._check_function(item)
-
-        # Check impl methods
-        for item in module.items:
-            if isinstance(item, rast.ImplBlock):
-                for method in item.methods:
-                    if wanted(method):
-                        self._check_function(method, item)
-
-        return self.errors
 
     def _register_struct(self, struct: rast.StructDef):
         """Register struct definition."""
@@ -436,7 +449,13 @@ class TypeChecker:
                           stmt.condition.span)
 
     def _infer_type(self, expr: rast.Expr) -> rast.Type:
-        """Infer the type of an expression."""
+        """Infer the type of an expression, and record it (typed.py)."""
+        ty = self._type_by_kind(expr)
+        self.typed.record(expr, ty)
+        return ty
+
+    def _type_by_kind(self, expr: rast.Expr) -> rast.Type:
+        """The type of `expr`, by its kind."""
         if isinstance(expr, rast.IntLit):
             # Integer literals default to i64
             return rast.NamedType(expr.span, 'i64', [])
@@ -2213,20 +2232,10 @@ class TypeChecker:
         return str(ty)
 
     def _error(self, message: str, span: Optional[rast.Span]):
-        """Record a type error."""
-        if not self.slots_only:
-            self.errors.append(TypeError(message, span))
+        """Record a type error (reported under --check-types)."""
+        self.errors.append(TypeError(message, span))
 
     def _slot_error(self, message: str, span: Optional[rast.Span],
                     after_moves: bool = False):
-        self.errors.append(TypeError(message, span, after_moves))
-
-
-def check_ref_slots(module: rast.Module, emits_body,
-                    module_names: Optional[Set[str]] = None) -> List[TypeError]:
-    """The slot rules over a monomorphised module, for the fns
-    `emits_body` says this compile emits. `--check-types` is off by default and
-    sees generic bodies with `T` opaque, so this runs on every compile, after
-    monomorphisation, with the checker's other complaints switched off."""
-    checker = TypeChecker(module_names, slots_only=True)
-    return checker.check(module, emits_body)
+        """Record a slot error (reported on every compile)."""
+        self.errors.append(TypeError(message, span, after_moves, slot=True))

@@ -34,7 +34,8 @@ from builtin_types import check_builtin_impls, check_unknown_impl_targets
 from reachability import check_reachable
 from move_checker import MoveChecker, OwnershipError
 from monomorph import infer_struct_lit_args
-from type_checker import TypeChecker, TypeError as RitzTypeError, check_ref_slots
+from type_checker import TypeError as RitzTypeError
+from typed import type_module
 from const_eval import evaluate_array_sizes, ConstEvalError
 from emitter.fn_cache import (
     source_file_hash, hash_maps,
@@ -291,12 +292,19 @@ def _infer_struct_lit_args(ctx: _Compile) -> bool:
     return True
 
 
+def _type(ctx: _Compile) -> bool:
+    """The typing pass (typed.py, AGAST #3448): type every expression into
+    `module.typed`, which the passes after it read.  Always runs; its errors
+    are _check_types' and _check_ownership's to report."""
+    type_module(ctx.module, ctx.module_names)
+    return True
+
+
 def _check_types(ctx: _Compile) -> bool:
-    """`--check-types`: type compatibility."""
+    """`--check-types`: report the typing pass's type errors."""
     if not ctx.check_types:
         return True
-    errors = TypeChecker(ctx.module_names).check(ctx.module)
-    return _report(errors, "Type error: ")
+    return _report(ctx.module.typed.errors, "Type error: ")
 
 
 def _check_ownership(ctx: _Compile) -> bool:
@@ -307,7 +315,7 @@ def _check_ownership(ctx: _Compile) -> bool:
     if not ownership_errors:
         return True
     # `c` in a reference slot wants `@c`, not "cannot move out".
-    slot_errors = check_ref_slots(ctx.module, lambda fn: True, ctx.module_names)
+    slot_errors = ctx.module.typed.slot_errors
     explains = [err for err in slot_errors if not err.after_moves]
     if not _report(explains, "Type error: "):
         return False
@@ -426,8 +434,8 @@ def _emit(ctx: _Compile) -> bool:
 # The compile, in order: parse -> resolve -> check[] -> monomorph -> emit
 # (LARB review/5 N2, AGAST #3449).  The order is load-bearing: the lowering
 # passes (_rewrite_enum_from, _eval_array_sizes) run between the first checks,
-# and _infer_struct_lit_args, monomorph's first step, runs before the type
-# and ownership checks; the rest of monomorphisation, and the checks that
+# and _infer_struct_lit_args, monomorph's first step, runs before the typing
+# pass (_type) the type and ownership checks read; the rest of monomorphisation, and the checks that
 # judge each generic instance, still run inside emitter_llvmlite.emit.
 PASSES = (
     _parse,
@@ -439,6 +447,7 @@ PASSES = (
     _check_reachable,
     _check_names,
     _infer_struct_lit_args,
+    _type,
     _check_types,
     _check_ownership,
     _emit,

@@ -2644,6 +2644,24 @@ fn f(t: T) -> i32
         assert [e.after_move for e in errors] == [True]
         assert "use of moved value: `x`" in errors[0].reason
 
+    def test_a_calls_result_is_typed_at_the_instances_type(self):
+        """`let a = pass_on<X>(x)` holds a `T` in the `T` instance: the
+        instance's copy is typed itself (typed.type_bodies, AGAST #3448),
+        so its second use is a use after a move."""
+        module, _ = self.instances("""
+fn pass_on<X>(x: X) -> X
+    return x
+
+fn twice<X>(x: X) -> i32
+    let a = pass_on<X>(x)
+    return eat<X>(a) + eat<X>(a)
+
+fn f(t: T) -> i32
+    return twice<T>(t)
+""")
+        errors = MoveChecker().check_instances(module)
+        assert ["use of moved value: `a`" in e.reason for e in errors] == [True]
+
     def test_a_use_after_move_is_not_reported_at_a_copy_type(self):
         module, _ = self.instances("""
 fn twice<X>(x: X) -> i32
