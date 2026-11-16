@@ -1059,13 +1059,37 @@ pub fn btree_scan(tree: *BTree, start_key: *u8, start_len: i32, end_key: *u8, en
     else
         iter.slot_idx = 0
 
-    let header: *BTreeNodeHeader = get_node_header(leaf)
-    if iter.slot_idx >= header.num_keys
-        iter.exhausted = 1
-
     buffer_pool_unpin(tree.pool, page_id, 0)
 
+    # The start key may sort after every key left in its leaf, or the leaf
+    # may be empty: the scan begins in the next leaf with a key.
+    btree_iter_settle(iter)
+
     return Some(iter)
+
+# Move `iter` forward until it points at a real slot: past the end of its
+# leaf, follow next_leaf, skipping leaves with no keys, which deletes leave in
+# the chain (they never merge or unlink leaves). Exhausted when the chain ends.
+# Without this, one emptied leaf ended every scan that reached it (AGAST #3687).
+fn btree_iter_settle(iter: *BTreeIter)
+    while iter.exhausted == 0
+        let page_opt = buffer_pool_fetch(iter.tree.pool, iter.page_id)
+        if option_is_none<*Page>(@page_opt) == 1
+            iter.exhausted = 1
+            return
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+        let header: *BTreeNodeHeader = get_node_header(page)
+        let num_keys: i32 = header.num_keys
+        let next_leaf: i64 = header.next_leaf
+        buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
+
+        if iter.slot_idx < num_keys
+            return
+        if next_leaf == INVALID_PAGE_ID
+            iter.exhausted = 1
+            return
+        iter.page_id = next_leaf
+        iter.slot_idx = 0
 
 pub fn btree_iter_valid(iter: *BTreeIter) -> i32
     if iter == null
@@ -1104,28 +1128,8 @@ pub fn btree_iter_next(iter: *BTreeIter)
     if iter == null or iter.exhausted != 0
         return
 
-    let page_opt = buffer_pool_fetch(iter.tree.pool, iter.page_id)
-    if option_is_none<*Page>(@page_opt) == 1
-        iter.exhausted = 1
-        return
-    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
-
-    let header: *BTreeNodeHeader = get_node_header(page)
     iter.slot_idx += 1
-
-    if iter.slot_idx >= header.num_keys
-        # Move to next leaf
-        let next_leaf: i64 = header.next_leaf
-        buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
-
-        if next_leaf == INVALID_PAGE_ID
-            iter.exhausted = 1
-            return
-
-        iter.page_id = next_leaf
-        iter.slot_idx = 0
-    else
-        buffer_pool_unpin(iter.tree.pool, iter.page_id, 0)
+    btree_iter_settle(iter)
 
 pub fn btree_iter_key(iter: *BTreeIter, key: *u8, key_len: *i32)
     if iter == null or iter.exhausted != 0

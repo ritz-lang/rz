@@ -1519,3 +1519,180 @@ fn test_btree_max_size_keys_into_full_internal_nodes() -> i32
     btree_destroy(tree)
     buffer_pool_destroy(pool)
     0
+
+# ============================================================================
+# Empty leaves in scans (AGAST #3687)
+# ============================================================================
+#
+# Deletes never merge or unlink leaves, so a leaf can sit in the chain with
+# no keys. A scan that started on one, or stepped onto one, stopped there and
+# hid every key in the leaves after it.
+#
+# Every value here is btree_max_value_len(12) bytes, a 2008-byte entry with
+# its slot, and a leaf has 4080 bytes past its header: at most 2 entries per
+# leaf. So deleting 4 consecutive keys empties at least one whole leaf, and 6
+# empty at least two in a row.
+
+const EMPTY_LEAF_KEYS: i32 = 20
+
+# A tree of keys 0..n-1 with max-size values, then keys [del_lo, del_hi)
+# deleted. Null if any step fails.
+fn tree_with_hole(pool: *BufferPool, n: i32, del_lo: i32, del_hi: i32) -> *BTree
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return null
+    var key: [16]u8
+    var val: [4096]u8
+    let max: i32 = btree_max_value_len(12)
+    for i in 0..n
+        let kl: i32 = make_key(i, @key[0])
+        fill_value(@val[0], max, 65 + i % 26)
+        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+            return null
+    var d: i32 = del_lo
+    while d < del_hi
+        let kl: i32 = make_key(d, @key[0])
+        if btree_delete(tree, @key[0], kl) != ERR_OK
+            return null
+        d += 1
+    return tree
+
+# 0 if a scan from key `start` (-1: from the beginning) visits exactly the
+# keys of 0..n-1 that are >= start and outside [del_lo, del_hi), in order.
+fn scan_skips_hole(tree: *BTree, start: i32, n: i32, del_lo: i32, del_hi: i32) -> i32
+    var skey: [16]u8
+    var iter_opt = btree_scan(tree, null, 0, null, 0)
+    if start >= 0
+        let sl: i32 = make_key(start, @skey[0])
+        iter_opt = btree_scan(tree, @skey[0], sl, null, 0)
+    if option_is_none<*BTreeIter>(@iter_opt) == 1
+        return 1
+    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    # The next key the scan should produce.
+    var want: i32 = 0
+    if start > 0
+        want = start
+    var rc: i32 = 0
+    while rc == 0
+        while want >= del_lo and want < del_hi
+            want += 1
+        if btree_iter_valid(iter) == 0
+            if want < n
+                rc = 2  # stopped early: `want` and later keys hidden
+            break
+        if want >= n
+            rc = 3  # a key past the last one
+            break
+        var key: [16]u8
+        var key_len: i32 = 0
+        btree_iter_key(iter, @key[0], @key_len)
+        if key_len != 12 or key_number(@key[0]) != want
+            rc = 4
+            break
+        want += 1
+        btree_iter_next(iter)
+    btree_iter_destroy(iter)
+    rc
+
+[[test]]
+fn test_btree_scan_skips_an_empty_leaf_in_the_middle() -> i32
+    var pool: *BufferPool = big_test_pool()
+    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 8, 12)
+    if tree == null
+        return 10
+    let rc: i32 = scan_skips_hole(tree, -1, EMPTY_LEAF_KEYS, 8, 12)
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    rc
+
+[[test]]
+fn test_btree_scan_skips_an_empty_first_leaf() -> i32
+    var pool: *BufferPool = big_test_pool()
+    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 0, 2)
+    if tree == null
+        return 10
+    let rc: i32 = scan_skips_hole(tree, -1, EMPTY_LEAF_KEYS, 0, 2)
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    rc
+
+# Deleting the last keys must still end the scan cleanly, with nothing extra.
+[[test]]
+fn test_btree_scan_ends_at_an_empty_last_leaf() -> i32
+    var pool: *BufferPool = big_test_pool()
+    let n: i32 = EMPTY_LEAF_KEYS
+    let tree: *BTree = tree_with_hole(pool, n, n - 2, n)
+    if tree == null
+        return 10
+    let rc: i32 = scan_skips_hole(tree, -1, n, n - 2, n)
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    rc
+
+[[test]]
+fn test_btree_scan_skips_two_empty_leaves_in_a_row() -> i32
+    var pool: *BufferPool = big_test_pool()
+    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 6, 12)
+    if tree == null
+        return 10
+    let rc: i32 = scan_skips_hole(tree, -1, EMPTY_LEAF_KEYS, 6, 12)
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    rc
+
+# Every start key inside or just before the hole, deleted or not: the scan
+# begins on the first remaining key at or after it.
+[[test]]
+fn test_btree_scan_from_a_key_in_an_emptied_leaf() -> i32
+    var pool: *BufferPool = big_test_pool()
+    let tree: *BTree = tree_with_hole(pool, EMPTY_LEAF_KEYS, 6, 12)
+    if tree == null
+        return 10
+    var rc: i32 = 0
+    for s in 4..13
+        if rc == 0
+            let r: i32 = scan_skips_hole(tree, s, EMPTY_LEAF_KEYS, 6, 12)
+            if r != 0
+                rc = 10 * s + r
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    rc
+
+# No deletes: a start key absent from the tree, after the last key of its
+# leaf, must begin the scan in the next leaf.
+[[test]]
+fn test_btree_scan_from_an_absent_key_past_its_leaf() -> i32
+    var pool: *BufferPool = big_test_pool()
+    var tree_opt = btree_create(pool)
+    var tree: *BTree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if tree == null
+        return 10
+    var key: [16]u8
+    var val: [4096]u8
+    let max: i32 = btree_max_value_len(12)
+    # Even keys 0, 2, .., 38.
+    for i in 0..EMPTY_LEAF_KEYS
+        let kl: i32 = make_key(2 * i, @key[0])
+        fill_value(@val[0], max, 65)
+        if btree_put(tree, @key[0], kl, @val[0], max) != ERR_OK
+            return 11
+    var rc: i32 = 0
+    for j in 0..EMPTY_LEAF_KEYS
+        if rc == 0
+            # Scan from odd key 2j+1: expect even keys 2j+2 .. 38.
+            let sl: i32 = make_key(2 * j + 1, @key[0])
+            var iter_opt = btree_scan(tree, @key[0], sl, null, 0)
+            var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+            if iter == null
+                return 12
+            var seen: i32 = 0
+            while btree_iter_valid(iter) != 0
+                seen += 1
+                btree_iter_next(iter)
+            btree_iter_destroy(iter)
+            if seen != EMPTY_LEAF_KEYS - 1 - j
+                rc = 100 + j
+    btree_destroy(tree)
+    buffer_pool_destroy(pool)
+    rc
