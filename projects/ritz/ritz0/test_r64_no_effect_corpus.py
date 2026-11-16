@@ -38,8 +38,9 @@ GROUPS = {
         ROOT / "projects/ritz/examples/tier5_async/70_interp_string/test/test_interp.ritz",
         ROOT / "projects/ritz/examples/tier5_async/71_type_inference/src/main.ritz",
     ],
-    "regressions_93_94": [
-        ROOT / "projects/ritz/examples/tier1_basics/93_fn_boundary_label/src/main.ritz",
+    # 93_fn_boundary_label was retired by AGAST #3526 (its guard is now
+    # ritz0/test_ritz1_entry_block_label.py).
+    "regression_94": [
         ROOT / "projects/ritz/examples/tier1_basics/94_method_tail_return/src/main.ritz",
     ],
 }
