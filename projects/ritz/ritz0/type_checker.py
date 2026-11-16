@@ -907,7 +907,14 @@ class TypeChecker:
                 return sig.ret_type or rast.NamedType(expr.span, 'void', [])
             return rast.NamedType(expr.span, 'unknown', [])
 
-        receiver_type = self._infer_type(expr.expr)
+        # `Color.red()` names the type `Color` even when another enum has a
+        # variant `Color` (`Mode.Color`): a variant is reached qualified as a
+        # receiver, a type only bare (AGAST #3618).
+        type_receiver = self._type_receiver_name(expr.expr)
+        if type_receiver is not None:
+            receiver_type = rast.NamedType(expr.expr.span, type_receiver, [])
+        else:
+            receiver_type = self._infer_type(expr.expr)
 
         # `Color.Green(1)`: a variant constructed through its enum
         if isinstance(expr.expr, rast.Ident) and expr.expr.name in self.enums:
@@ -1993,6 +2000,18 @@ class TypeChecker:
         """An identifier naming an imported module, not a shadowing value."""
         return (isinstance(expr, rast.Ident) and expr.name in self.module_names
                 and self._lookup_var(expr.name) is None)
+
+    def _type_receiver_name(self, expr: rast.Expr) -> Optional[str]:
+        """The struct or enum a bare receiver identifier names, if any.
+
+        A local shadows the type; a type shadows another enum's same-named
+        variant (AGAST #3618), which a receiver reaches as `Mode.Color`.
+        """
+        if not isinstance(expr, rast.Ident) or self._lookup_var(expr.name) is not None:
+            return None
+        if expr.name in self.structs or expr.name in self.enums:
+            return expr.name
+        return None
 
     def _strip_indirection(self, ty: rast.Type) -> rast.Type:
         """The type under any pointers, references and aliases."""
