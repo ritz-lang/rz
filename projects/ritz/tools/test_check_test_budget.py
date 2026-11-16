@@ -143,6 +143,36 @@ def test_real_budget_file_loads_and_every_override_names_a_ticket():
         assert (RITZ0 / name).is_file(), f"{name}: override for a missing file"
 
 
+# Collected by `pytest --collect-only -q` under ritz0 once #3517-#3521 had
+# collapsed the eight matrix files (AGAST #3557, at 2c597655): 39,126 -> 29,700.
+COLLECTED_AT_LAST_CAP = 29_700
+
+
+@pytest.mark.unit
+def test_real_test_cap_sits_just_above_the_collected_count():
+    """The cap is the count plus #3453's ~5% headroom (41,000 over 39,126).
+    A cap left far above the count lets the suite grow back unnoticed,
+    and that growth is what the cap is meant to stop."""
+    cap = ctb.load_budget(ctb.DEFAULT_BUDGET)["suite"]["tests"]
+    assert COLLECTED_AT_LAST_CAP < cap <= COLLECTED_AT_LAST_CAP * 1.06, (
+        f"[suite] tests = {cap}: set it to the collected count plus ~5%")
+
+
+@pytest.mark.unit
+def test_real_budget_goes_red_on_one_extra_test_file():
+    """Under the real budget, a suite already at the cap plus one more test
+    file fails, and the failure names the cap.  Without that file it passes."""
+    b = ctb.load_budget(ctb.DEFAULT_BUDGET)
+    cap = int(b["suite"]["tests"])
+    r = report({"test_suite.py": 1.0})
+    r["files"]["test_suite.py"]["tests"] = cap
+    assert ctb.check(r, b) == []
+    r["files"]["test_planted_extra.py"] = {"tests": 1, "cpu_s": 0.1, "wall_s": 0.1}
+    errs = ctb.check(r, b)
+    assert errs == [f"suite: {cap + 1} tests over its cap of {cap}; "
+                    f"collapse a matrix into table rows before adding cases"]
+
+
 # --- end to end: a planted slow file, red then green -------------------------
 
 PLANTED = '''
