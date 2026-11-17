@@ -152,6 +152,13 @@ INFER_ERRORS = {
 RUNS = {
     # A plain struct's literal needs no args, beside generic ones.
     "plain_struct": ("fn main() -> i32\n    let t = T { id: 4 }\n    t.id\n", 4),
+    # sizeof of a plain struct's pointer field's pointee (#3747, as
+    # outer_param_ptr_field): `*p.v` is a u16, `*p.pp` a pointer.
+    "plain_ptr_field_sizeof": ("struct P\n    v: *u16\n    pp: **u8\n"
+                               "fn main() -> i32\n    var x: u16 = 7\n    var y: u8 = 1\n"
+                               "    var py: *u8 = @y\n    let p = P { v: @x, pp: @py }\n"
+                               "    sizeof(*p.v) as i32 * 10 + sizeof(*p.pp) as i32 + **p.pp as i32\n",
+                               29),
     # A program's own non-generic `struct Span` replaces the built-in one
     # (builtin_types.py), so its literal needs no args (AGAST #3357).
     "own_span": ("struct Span\n    n: i32\n"
@@ -201,18 +208,18 @@ R51A_INFERS = {
                           "    sizeof(w.t.v) as i32 * 10 + w.t.v as i32\n", 15),
     # ...through a pointer (#3516): the inner literal is a Box2<*u8>, and A
     # binds from the `ptr_A` piece of `Box2$ptr_A`, not a whole component.
-    # `f` takes only a W3<u8> (any other A is a parameter mismatch): ritz1
-    # can't size `*w.t.v` through the instance yet (#3747).
+    # `sizeof(*w.t.v)` is the u8 pointee's 1 (#3747: ritz1 said "sizeof:
+    # cannot determine the type of this expression" for any `*<field>`).
     "outer_param_ptr_field": (ALL, "struct W3<A>\n    t: Box2<*A>\n"
-                              "fn f(w: W3<u8>) -> i32\n    *w.t.v as i32 + 10\n"
                               "fn main() -> i32\n    var x: u8 = 7\n    let w = W3 { t: Box2 { v: @x } }\n"
-                              "    f(w)\n", 17),
+                              "    sizeof(*w.t.v) as i32 * 10 + *w.t.v as i32\n", 17),
     # ...where the piece is a whole mangled generic: `ptr_A` against
     # `ptr_Box2$u8` binds A = Box2$u8, not `Box2`.  `w.t.v.v` auto-derefs the
     # `*Box2$u8` field of the Box2$ptr_Box2$u8 instance (#3748: it was ritz1's
-    # "cannot emit: unhandled EXPR_MEMBER").
+    # "cannot emit: unhandled EXPR_MEMBER").  `*w.t.v` is a Box2$u8, size 1.
     "outer_param_ptr_generic_field": (ALL, "struct W3<A>\n    t: Box2<*A>\n"
-                                      "fn f(w: W3<Box2<u8>>) -> i32\n    w.t.v.v as i32 + 10\n"
+                                      "fn f(w: W3<Box2<u8>>) -> i32\n"
+                                      "    w.t.v.v as i32 + sizeof(*w.t.v) as i32 * 10\n"
                                       "fn main() -> i32\n    let x: u8 = 7\n    var b = Box2 { v: x }\n"
                                       "    let w = W3 { t: Box2 { v: @b } }\n"
                                       "    f(w)\n", 17),
