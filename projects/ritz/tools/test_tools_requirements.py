@@ -42,6 +42,7 @@ REQUIREMENTS = [
 # repo's own modules, which are resolved by path rather than installed.
 LOCAL_MODULES = {
     "ci_local",
+    "manifest",  # projects/ritz/manifest.py, the ritz.toml schema (AGAST #1837)
     "apply_string_migration",
     "check_liveness",
     "audit_string_literals",

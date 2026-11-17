@@ -631,8 +631,7 @@ def _build_package_and_run(compiler, tmp_path, name, src):
     pkg = tmp_path / f"{name}_{compiler}"
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "main.ritz").write_text(src)
-    (pkg / "ritz.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
-                                   '[build]\ntarget = "x86_64-linux"\n')
+    (pkg / "ritz.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n')
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     proc = subprocess.run(["python3", str(RITZ_ROOT / "build.py"), "build", str(pkg),
                            "--no-cache", "--compiler", compiler],

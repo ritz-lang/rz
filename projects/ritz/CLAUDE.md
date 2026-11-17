@@ -125,6 +125,10 @@ pass.
 - `docs/TESTING.md` - test system documentation
 - `docs/VALIDATION.md` - **validation workflow & build cadence** (read this!)
 
+**Generated:** `docs/RITZ_TOML_SPEC.md`, every ritz.toml / rz.toml key, rendered
+from the schema in `manifest.py` (`make manifest-spec`). The build rejects any
+key the schema does not name, with file:line; CI fails if the spec drifts.
+
 **Work tracking lives in AGAST**, the external task tracker — not in this repo.
 Per-project `TODO.md` / `DONE.md` files were deleted on 2026-09-12 after going
 seven months stale; git retains them. Do not recreate them. `docs/archive/` holds

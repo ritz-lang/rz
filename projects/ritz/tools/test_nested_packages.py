@@ -126,7 +126,8 @@ class TestRecursiveMembers:
         (root / "rz.toml").write_text(
             '[workspace]\nmembers = ["projects/**"]\n'
             '[workspace.exclude]\n"projects/a/b" = 3\n')
-        with pytest.raises(SystemExit):
+        # The manifest schema rejects it at load, with file:line (AGAST #1837).
+        with pytest.raises((SystemExit, rz.manifest.ManifestError)):
             rz.discover_projects()
 
     def test_no_exclude_table_is_fine(self, rz, fake_ws):

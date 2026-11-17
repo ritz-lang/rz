@@ -33,7 +33,7 @@ all: test
 # Run everything
 # AGAST #98: check-no-s-strings runs first so any resurrected s"..." literal
 # fails CI before we burn compile cycles on it.
-test: check-no-s-strings check-doc-examples unit tools-unit harness-selftest ritz ritz1 examples
+test: check-no-s-strings check-doc-examples check-manifest-spec unit tools-unit harness-selftest ritz ritz1 examples
 	@echo "✓ All tests passed!"
 
 # AGAST #98 guard: ensure no s"..." span-string literals leak back in.
@@ -63,6 +63,18 @@ DOC_EXAMPLE_DOCS := \
 check-doc-examples:
 	@echo "=== Compiling documentation examples ==="
 	@$(PYTHON) tools/check_doc_examples.py $(DOC_EXAMPLE_DOCS)
+
+# docs/RITZ_TOML_SPEC.md is generated from manifest.py's schema, the one rz
+# and build.py validate every ritz.toml / rz.toml against (AGAST #1837).
+# `manifest-spec` regenerates it; `check-manifest-spec` (CI) fails on drift
+# and prints the diff.
+.PHONY: manifest-spec check-manifest-spec
+manifest-spec:
+	@$(PYTHON) manifest.py --spec > docs/RITZ_TOML_SPEC.md
+	@echo "✓ wrote docs/RITZ_TOML_SPEC.md"
+
+check-manifest-spec:
+	@$(PYTHON) manifest.py --check-spec docs/RITZ_TOML_SPEC.md
 
 # Python unit tests for the tools/ scripts themselves. These existed but were
 # wired into nothing — tools/test_check_no_s_strings.py had never been run by

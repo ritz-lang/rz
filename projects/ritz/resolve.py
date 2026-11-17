@@ -17,10 +17,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-try:
-    import tomllib
-except ImportError:  # Python < 3.11
-    import tomli as tomllib
+import manifest  # the strict ritz.toml schema (AGAST #1837)
 
 MANIFEST = "ritz.toml"
 
@@ -30,8 +27,7 @@ def read_manifest(pkg_dir: Path) -> dict | None:
     path = Path(pkg_dir) / MANIFEST
     if not path.exists():
         return None
-    with open(path, "rb") as f:
-        return tomllib.load(f)
+    return manifest.load(path)
 
 
 @dataclass

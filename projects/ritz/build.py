@@ -32,11 +32,7 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
-try:
-    import tomllib
-except ImportError:
-    import tomli as tomllib  # Python < 3.11
-
+import manifest  # the strict ritz.toml schema (AGAST #1837)
 from cache import BuildCache
 import cas
 
@@ -1062,9 +1058,7 @@ def find_package_at(path: Path) -> tuple[Path, dict] | None:
     # Look for ritz.toml in this directory
     toml_path = path / "ritz.toml"
     if toml_path.exists():
-        with open(toml_path, "rb") as f:
-            config = tomllib.load(f)
-        return (path, config)
+        return (path, manifest.load(toml_path))
 
     return None
 
@@ -1105,9 +1099,7 @@ def find_all_packages(search_dir: Path = None) -> list[tuple[Path, dict]]:
 
     # Search for all ritz.toml files recursively
     for toml_path in sorted(search_dir.glob("**/ritz.toml")):
-        with open(toml_path, "rb") as f:
-            config = tomllib.load(f)
-        packages.append((toml_path.parent, config))
+        packages.append((toml_path.parent, manifest.load(toml_path)))
 
     return packages
 
@@ -2696,10 +2688,10 @@ def _declared_test_source_files(pkg_dir: Path, config: dict) -> list[Path]:
     package), whether or not ritz.toml mentions it. #3279 made it opt-in, so
     prism's src/text tests still ran nowhere (AGAST #1873).
 
-    Only the `[test]` table adds dirs. `[[test]]` in ritz.toml (goliath,
-    spire) parses as a list of entry-point test binaries whose `sources` feed
-    their builds, not this discovery; reading it as the table crashed `rz
-    test` for both (AGAST #3290).
+    Only the `[test]` table adds dirs. ritz.toml has no `[[test]]` array:
+    the two that existed (goliath, spire) were read by nothing and their
+    modules already ran from test/, so AGAST #1837 removed them, and the
+    manifest schema now rejects one.
     """
     test_cfg = config.get("test")
     dirs = ["src"]
@@ -3448,7 +3440,12 @@ def main():
         "cache-clear": cmd_cache_clear,
     }
 
-    return commands[args.command](args)
+    try:
+        return commands[args.command](args)
+    except manifest.ManifestError as e:
+        # file:line, not a traceback: the manifest is the user's to fix.
+        print(f"error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

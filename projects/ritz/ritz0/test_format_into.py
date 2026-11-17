@@ -41,8 +41,7 @@ def _build(compiler: str, tmp_path: Path, name: str, program: str):
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "main.ritz").write_text(program)
     (pkg / "ritz.toml").write_text(
-        f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
-        '[build]\ntarget = "x86_64-linux"\n'
+        f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
     )
     # AGAST #2793: cached build; ritzlib objects come from the session's
     # content-addressed store, the per-project index stays in the package.

@@ -136,8 +136,7 @@ def _run_pkg(compiler: str, tmp_path: Path, name: str, program: str,
     for fname, text in (extra or {}).items():
         (pkg / "src" / fname).write_text(text)
     (pkg / "ritz.toml").write_text(
-        f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
-        '[build]\ntarget = "x86_64-linux"\n'
+        f'[package]\nname = "{name}"\nversion = "0.1.0"\n'
     )
     # AGAST #2793: build with the cache.  The session's content-addressed
     # store (RITZ_CACHE_DIR, conftest.py) hands every case after the first

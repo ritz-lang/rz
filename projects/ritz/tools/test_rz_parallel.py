@@ -19,6 +19,7 @@ import json
 import sys
 import threading
 import time
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -514,15 +515,15 @@ class TestBuildPyUnits:
         assert got == ["test/t.ritz"]
 
     def test_test_array_entries_add_no_dirs(self, buildpy, tmp_path):
-        # AGAST #3290: `[[test]]` in ritz.toml (goliath, spire) parses as a
-        # list of entry-point test binaries, not the `[test]` table; #3279
-        # called .get() on it and `rz test` crashed before running anything.
-        # Their `sources` feed those binaries' builds, not file discovery,
-        # which is what they did before #3279.
+        # AGAST #3290: `[[test]]` in ritz.toml (goliath, spire) parsed as a
+        # list, not the `[test]` table; #3279 called .get() on it and `rz
+        # test` crashed before running anything. The manifest schema now
+        # rejects `[[test]]` at load (AGAST #1837), but discovery handed a
+        # raw parse must still not crash on one.
         pkg = _pkg(tmp_path, test_only=False, files=[("t.ritz", "")])
         (pkg / "src").mkdir()
         (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
-        cfg = buildpy.tomllib.loads(
+        cfg = tomllib.loads(
             '[package]\nname = "p"\n\n'
             '[[test]]\nname = "a"\nentry = "test_a"\n\n'
             '[[test]]\nname = "b"\nsources = ["src"]\nentry = "test::main"\n')
@@ -533,18 +534,19 @@ class TestBuildPyUnits:
 
     @pytest.mark.parametrize("name", ["goliath", "spire"])
     def test_test_array_packages_discover_as_before_3279(self, buildpy, name):
-        # The two packages CI's test-all went red on: discovery must not
-        # raise, and must find exactly test/*.ritz as it did on e800f872.
+        # The two packages CI's test-all went red on: discovery must find
+        # exactly test/*.ritz as it did on e800f872. Their `[[test]]` arrays,
+        # read by nothing, are gone (AGAST #1837); test/ is what ran them.
         pkg = PKG_DIR.parent / name
-        cfg = buildpy.tomllib.loads((pkg / "ritz.toml").read_text())
-        assert isinstance(cfg["test"], list)
+        cfg = buildpy.manifest.load(pkg / "ritz.toml")
+        assert "test" not in cfg
         got = buildpy.discover_test_files(pkg, cfg)
         assert got == sorted((pkg / "test").glob("*.ritz"))
 
     def test_angelo_declares_its_in_source_tests(self, buildpy):
         # The package this was found in: its tests must stay discoverable.
         angelo = PKG_DIR.parent / "angelo"
-        cfg = buildpy.tomllib.loads((angelo / "ritz.toml").read_text())
+        cfg = buildpy.manifest.load(angelo / "ritz.toml")
         got = {p.relative_to(angelo).as_posix()
                for p in buildpy.discover_test_files(angelo, cfg)}
         assert {"src/tests.ritz", "src/raster/bezier.ritz"} <= got
@@ -553,7 +555,7 @@ class TestBuildPyUnits:
         # AGAST #1873: prism declares no `[test] sources`; its in-source
         # [[test]] fns ran nowhere until src/ was searched by default.
         prism = PKG_DIR.parent / "prism"
-        cfg = buildpy.tomllib.loads((prism / "ritz.toml").read_text())
+        cfg = buildpy.manifest.load(prism / "ritz.toml")
         got = {p.relative_to(prism).as_posix()
                for p in buildpy.discover_test_files(prism, cfg)}
         assert {"src/text/renderer.ritz", "src/text/font_manager.ritz",

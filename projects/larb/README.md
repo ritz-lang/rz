@@ -38,7 +38,7 @@ cd rz/projects/larb
 - [Ecosystem Overview](docs/ECOSYSTEM.md) — all Ritz projects explained
 - [Open Issues & Roadmap](docs/ROADMAP.md)
 - [LSP Server Requirements](docs/LSP_REQUIREMENTS.md)
-- [ritz.toml Specification](docs/RITZ_TOML_SPEC.md)
+- [ritz.toml Specification](../ritz/docs/RITZ_TOML_SPEC.md) (generated from `projects/ritz/manifest.py`)
 - [PR Checklist](docs/PR_CHECKLIST.md)
 
 Note that the **canonical** language spec, style guide, stdlib reference and

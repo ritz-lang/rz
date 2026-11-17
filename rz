@@ -27,7 +27,6 @@ import os
 import re
 import subprocess
 import sys
-import tomllib
 from pathlib import Path
 
 # Workspace root is where this script lives
@@ -38,6 +37,9 @@ RITZ_BUILD = WORKSPACE_ROOT / "projects" / "ritz" / "build.py"
 # The dependency resolver build.py uses (AGAST #1835). Standard library only,
 # so importing it does not load the compiler.
 sys.path.insert(0, str(RITZ_BUILD.parent))
+# manifest: the ritz.toml / rz.toml schema every manifest is loaded through
+# (AGAST #1837).
+import manifest
 from resolve import dependency_package_dirs  # noqa: E402
 
 # Global compiler selection (can be overridden per command)
@@ -51,8 +53,7 @@ def load_workspace_config():
         print(f"Error: {config_path} not found", file=sys.stderr)
         sys.exit(1)
 
-    with open(config_path, "rb") as f:
-        return tomllib.load(f)
+    return manifest.load(config_path)
 
 
 def discover_projects():
@@ -176,8 +177,7 @@ def get_project_config(project_name):
     if not config_path.exists():
         return None
 
-    with open(config_path, "rb") as f:
-        return tomllib.load(f)
+    return manifest.load(config_path)
 
 
 def collect_dependency_paths(project_name):
@@ -758,13 +758,14 @@ def serial_test_sweep(projects, extra_args, compiler):
         #
         # This used to skip any project whose [build] table lacked a
         # literal `test` key. Almost nothing sets that key — projects
-        # declare tests via [[test]] sections, `test_only`, or simply a
+        # declare tests via `[[test]]` fns, `test_only`, or simply a
         # test/ directory — so `rz test --all` silently covered 2 of 26
         # projects while reporting "All tests passed!". A gate that skips
         # 92% of the workspace is worse than no gate: it reports green.
         #
-        # build.py already owns test discovery (ritz.toml [[test]],
-        # the test/ glob, test_only packages, test.sh) and prints
+        # build.py already owns test discovery (the test/ glob,
+        # `[[test]]` fns under src/ and ritz.toml [test] sources,
+        # test_only packages, test.sh) and prints
         # "No tests found, skipping" without failing. Deferring to it
         # keeps discovery in one place instead of two that disagree.
         #
@@ -832,7 +833,12 @@ def cmd_list(args):
     """Handle 'rz list' command."""
     projects = discover_projects()
 
-    print(f"Workspace: {WORKSPACE_ROOT.name}")
+    ws = load_workspace_config().get("workspace", {})
+    header = " ".join(filter(None, [ws.get("name", WORKSPACE_ROOT.name),
+                                    ws.get("version")]))
+    print(f"Workspace: {header}")
+    if ws.get("description"):
+        print(f"  {ws['description']}")
     print(f"Projects ({len(projects)}):\n")
 
     for project in projects:
@@ -840,7 +846,8 @@ def cmd_list(args):
         if config and "package" in config:
             desc = config["package"].get("description", "")
             name = config["package"].get("name", project)
-            print(f"  {name:20} {desc}")
+            version = config["package"].get("version", "")
+            print(f"  {name:20} {version:12} {desc}")
         else:
             print(f"  {project}")
 
@@ -972,7 +979,12 @@ def main():
         parser.print_help()
         return 1
 
-    return args.func(args)
+    try:
+        return args.func(args)
+    except manifest.ManifestError as e:
+        # file:line, not a traceback: the manifest is the user's to fix.
+        print(f"rz: error: {e}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
