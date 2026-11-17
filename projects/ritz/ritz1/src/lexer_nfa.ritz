@@ -181,7 +181,7 @@ fn lexer_asm_line_start(lex: *Lexer, out_tok: *Token) -> i32
   lex.asm_body = 1
   lex.indent_stack[lex.indent_depth] = indent
   lex.indent_depth = lex.indent_depth + 1
-  *out_tok = token_new(TOK_INDENT, lex.pos, 0, lex.line, lex.col)
+  *out_tok = token_new(TOK_INDENT, lex.src + lex.pos, 0, lex.line, lex.col)
   1
 
 # One line of an asm body, from lex.pos (past its indentation) to the end of
@@ -201,9 +201,7 @@ fn lexer_asm_text(lex: *Lexer) -> Token
     stop = stop - 1
   lex.col = lex.col + (end - start) as i32
   lex.pos = end
-  var tok: Token = token_new(TOK_ASM_LINE, start, (stop - start) as i32, line, col)
-  tok.start = lex.src + start
-  tok
+  token_new(TOK_ASM_LINE, lex.src + start, (stop - start) as i32, line, col)
 
 # 1 if `kind` is an infix operator, one a line can end in with the expression
 # going on: ritz0's Parser.PRECEDENCE less the ranges, which ritz1's grammar
@@ -251,15 +249,13 @@ fn lexer_fail_block(lex: *Lexer, start: *u8, line: i32, col: i32) -> Token
   lex.pos = lex.len
   lex.pending_dedents = 0
   lex.cont_line = 0
-  var tok: Token = token_new(TOK_ERROR, 0, 1, line, col)
-  tok.start = start
-  tok
+  token_new(TOK_ERROR, start, 1, line, col)
 
 # Return a located, fatal TOK_ERROR at the current position and stop lexing:
 # the next lexer_next returns EOF.  The tab case used to return TOK_ERROR
 # without advancing, so tokenize looped forever printing the same error.
 fn lexer_fail(lex: *Lexer, out_tok: *Token, msg: *u8) -> i32
-  *out_tok = token_new(TOK_ERROR, lex.pos, 1, lex.line, lex.col)
+  *out_tok = token_new(TOK_ERROR, lex.src + lex.pos, 1, lex.line, lex.col)
   lex.error_msg = msg
   lex.pos = lex.len
   lex.pending_dedents = 0
@@ -373,9 +369,7 @@ fn lexer_fail_escape(lex: *Lexer, pos: i64, line: i32, col: i32, p: *u8, code: i
   lex.error_msg = msg
   lex.pos = lex.len
   lex.pending_dedents = 0
-  var tok: Token = token_new(TOK_ERROR, pos, 1, line, col)
-  tok.start = lex.src + pos
-  tok
+  token_new(TOK_ERROR, lex.src + pos, 1, line, col)
 
 # Initialize a lexer on `src` (`len` bytes).  Nothing to build: the scanner
 # is code (AGAST #1821).
@@ -505,7 +499,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
       return lexer_fail(lex, out_tok, c"blocks nested more than 64 levels deep")
     lex.indent_stack[lex.indent_depth] = indent
     lex.indent_depth = lex.indent_depth + 1
-    *out_tok = token_new(TOK_INDENT, lex.pos, 0, lex.line, lex.col)
+    *out_tok = token_new(TOK_INDENT, lex.src + lex.pos, 0, lex.line, lex.col)
     lex.at_line_start = 0
     return 1
 
@@ -519,7 +513,7 @@ fn lexer_handle_indent(lex: *Lexer, out_tok: *Token) -> i32
       count = count + 1
     # Queue all but one DEDENT (we return the first one now)
     lex.pending_dedents = count - 1
-    *out_tok = token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
+    *out_tok = token_new(TOK_DEDENT, lex.src + lex.pos, 0, lex.line, lex.col)
     lex.at_line_start = 0
     return 1
 
@@ -714,7 +708,7 @@ fn lexer_cook(lex: *Lexer, at: *i64, braces: i32, start: i64, line: i32, col: i3
 # the end of input, ritz0's fatal error located at the literal's start (the
 # `c` of a c"...", ritz0's span).
 fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
-  var tok: Token = token_new(TOK_ERROR, 0, 0, 0, 0)
+  var tok: Token = token_new(TOK_ERROR, null, 0, 0, 0)
   let start: i64 = lex.pos
   let line: i32 = lex.line
   let col: i32 = lex.col
@@ -731,7 +725,6 @@ fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
     if kind == TOK_CSTRING
       msg = c"Unterminated C-string literal"
     lexer_fail(lex, @tok, msg)   # at lex.pos, still the literal's start
-    tok.start = lex.src + start
     return tok
   lex.pos = at + 1
   lex.col = col + (lex.pos - start) as i32
@@ -744,9 +737,7 @@ fn lexer_scan_string(lex: *Lexer, kind: i32, prefix: i32) -> Token
 
 # A token of `kind` at source offset `start`.
 fn lexer_token(lex: *Lexer, kind: i32, start: i64, len: i32, line: i32, col: i32) -> Token
-  var tok: Token = token_new(kind, start, len, line, col)
-  tok.start = lex.src + start
-  tok
+  token_new(kind, lex.src + start, len, line, col)
 
 # Number literal fix-ups after the match; returns the kind, the length in
 # *len updated.
@@ -804,8 +795,7 @@ fn lexer_int_suffix(lex: *Lexer, at: i64) -> i32
 fn lexer_track_bracket(lex: *Lexer, kind: i32, start: i64, line: i32, col: i32, err: *Token) -> i32
   if kind == TOK_LPAREN or kind == TOK_LBRACKET or kind == TOK_LBRACE
     if lex.bracket_depth >= MAX_BRACKET_DEPTH
-      *err = token_new(TOK_ERROR, 0, 1, line, col)
-      err.start = lex.src + start
+      *err = token_new(TOK_ERROR, lex.src + start, 1, line, col)
       lex.error_msg = c"brackets nested more than 64 levels deep"
       lex.pos = lex.len
       lex.pending_dedents = 0
@@ -862,15 +852,13 @@ fn lexer_bad_byte(lex: *Lexer) -> Token
 
 # The token at lex.pos, past layout, blanks and comments.
 fn lexer_scan_token(lex: *Lexer) -> Token
-  var tok: Token = token_new(TOK_ERROR, 0, 0, 0, 0)
+  var tok: Token = token_new(TOK_ERROR, null, 0, 0, 0)
   let ch: i32 = lexer_at(lex, lex.pos)
   # `$` is no identifier character: a monomorph's internal `W$i32_bump`
   # can't be written (spec §2.5, LARB R37, AGAST #3373).  An asm body's
   # lines never get here.  ritz0's words (ref_rules.DOLLAR_OUTSIDE_ASM).
   if ch == 36
-    let at: *u8 = lex.src + lex.pos
     lexer_fail(lex, @tok, c"`$` isn't part of a name: it's written only in an `asm` body")
-    tok.start = at
     return tok
   # "..." and c"..." end on their line (lexer_scan_string).
   if ch == 34
@@ -936,8 +924,8 @@ fn lexer_newline(lex: *Lexer, out_tok: *Token) -> i32
 fn lexer_next_token(lex: *Lexer) -> Token
   if lex.pending_dedents > 0
     lex.pending_dedents = lex.pending_dedents - 1
-    return token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
-  var tok: Token = token_new(TOK_ERROR, 0, 0, 0, 0)
+    return token_new(TOK_DEDENT, lex.src + lex.pos, 0, lex.line, lex.col)
+  var tok: Token = token_new(TOK_ERROR, null, 0, 0, 0)
   while lex.pos < lex.len
     if lex.at_line_start == 1
       if lexer_line_start(lex, @tok) == 1
@@ -961,5 +949,5 @@ fn lexer_next_token(lex: *Lexer) -> Token
   # End of input: close the open blocks, then EOF.
   if lex.indent_depth > 1
     lex.indent_depth = lex.indent_depth - 1
-    return token_new(TOK_DEDENT, lex.pos, 0, lex.line, lex.col)
-  token_new(TOK_EOF, lex.pos, 0, lex.line, lex.col)
+    return token_new(TOK_DEDENT, lex.src + lex.pos, 0, lex.line, lex.col)
+  token_new(TOK_EOF, lex.src + lex.pos, 0, lex.line, lex.col)

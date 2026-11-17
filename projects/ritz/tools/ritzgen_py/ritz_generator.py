@@ -249,11 +249,15 @@ class RitzGenerator:
         self._emit('')
 
         # token_new function
-        self._emit('# Helper function to create a Token')
-        self._emit('pub fn token_new(kind: i32, pos: i64, len: i32, line: i64, col: i64) -> Token')
+        # It takes the token's source pointer, not an offset it would have no
+        # source to add to: it used to take `pos`, drop it and leave `start`
+        # null for every token the lexer did not patch (AGAST #3888).
+        self._emit('# A Token of `kind` whose `len` bytes start at `start` in the source')
+        self._emit('# (zero-length layout and EOF tokens point at the byte they stand on).')
+        self._emit('pub fn token_new(kind: i32, start: *u8, len: i32, line: i64, col: i64) -> Token')
         self._emit('    Token {')
         self._emit('        kind: kind,')
-        self._emit('        start: null,')
+        self._emit('        start: start,')
         self._emit('        len: len,')
         self._emit('        line: line as i32,')
         self._emit('        col: col as i32,')

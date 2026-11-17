@@ -358,3 +358,86 @@ fn test_an_unclosed_cstring_still_refuses_its_bad_escapes() -> i32
   assert bad.col == 4
   assert lex.error_msg != null
   0
+
+# AGAST #3888: every token's `start` points into the source, not just those
+# lexer_token built.  The layout tokens are zero-length at the byte the
+# lexer stands on: an INDENT or DEDENT at the first byte of the line's first
+# token (same line and column, so a lookup by `start` gives that token's
+# span either way), the EOF and end-of-input DEDENTs one past the last byte.
+
+# 1 if `tok` is `kind`, starts `off` bytes into `src`, and is `len` long.
+fn is_at(tok: Token, kind: i32, src: *u8, off: i64, len: i32) -> i32
+  if tok.kind != kind or tok.len != len
+    return 0
+  if (tok.start as i64) - (src as i64) != off
+    return 0
+  1
+
+# The next token of `kind`, skipping others.
+fn next_of(lex: *Lexer, kind: i32) -> Token
+  var tok: Token = lexer_next(lex)
+  while tok.kind != kind and tok.kind != TOK_EOF
+    tok = lexer_next(lex)
+  tok
+
+[[test]]
+fn test_indent_and_dedent_point_at_the_next_token() -> i32
+  # Offsets: "f\n" 0-1, "  x\n" 2-5 (x at 4), "y\n" 6-7.
+  var lex: Lexer
+  let src: StrView = "f\n  x\ny\n"
+  feed(@lex, src)
+  let ind: Token = next_of(@lex, TOK_INDENT)
+  assert is_at(ind, TOK_INDENT, src.ptr, 4, 0) == 1
+  assert ind.line == 2
+  assert ind.col == 3
+  let ded: Token = next_of(@lex, TOK_DEDENT)
+  assert is_at(ded, TOK_DEDENT, src.ptr, 6, 0) == 1
+  assert ded.line == 3
+  assert ded.col == 1
+  0
+
+[[test]]
+fn test_queued_dedents_point_at_the_next_token() -> i32
+  # Two blocks close at `z` (offset 10): the first DEDENT and the queued one.
+  var lex: Lexer
+  let src: StrView = "a\n  b\n    c\nz\n"
+  feed(@lex, src)
+  let d1: Token = next_of(@lex, TOK_DEDENT)
+  assert is_at(d1, TOK_DEDENT, src.ptr, 12, 0) == 1
+  let d2: Token = lexer_next(@lex)
+  assert is_at(d2, TOK_DEDENT, src.ptr, 12, 0) == 1
+  0
+
+[[test]]
+fn test_end_of_input_dedent_and_eof_point_past_the_source() -> i32
+  var lex: Lexer
+  let src: StrView = "a\n  b\n"
+  feed(@lex, src)
+  let ded: Token = next_of(@lex, TOK_DEDENT)
+  assert is_at(ded, TOK_DEDENT, src.ptr, 6, 0) == 1
+  let eof: Token = lexer_next(@lex)
+  assert is_at(eof, TOK_EOF, src.ptr, 6, 0) == 1
+  0
+
+[[test]]
+fn test_a_tab_indent_error_points_at_the_tab() -> i32
+  # lexer_fail: the tab at offset 3, after the indentation's one space.
+  var lex: Lexer
+  let src: StrView = "a\n \tb\n"
+  feed(@lex, src)
+  let bad: Token = next_of(@lex, TOK_ERROR)
+  assert is_at(bad, TOK_ERROR, src.ptr, 3, 1) == 1
+  assert lex.error_msg != null
+  0
+
+[[test]]
+fn test_an_asm_body_indent_points_at_its_text() -> i32
+  # lexer_asm_line_start's INDENT, at `nop` (offset 14), then the line.
+  var lex: Lexer
+  let src: StrView = "asm x86_64:\n  nop\n"
+  feed(@lex, src)
+  let ind: Token = next_of(@lex, TOK_INDENT)
+  assert is_at(ind, TOK_INDENT, src.ptr, 14, 0) == 1
+  let line: Token = lexer_next(@lex)
+  assert is_at(line, TOK_ASM_LINE, src.ptr, 14, 3) == 1
+  0
