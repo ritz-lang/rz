@@ -186,8 +186,31 @@ pub fn main() -> i32
     PS[1].get() + PS[i].val() - PS[1].val()
 """
 
+# AGAST #3398: an element whose field is itself a struct.  ritz1 and
+# ritz1_selfhosted wrote `[%P { i64 0 }, ...]`, which clang refuses; #3651
+# lowers the nested literal.  Read by field path and by a method on the inner
+# struct, a constant and a runtime index: 3 + 3 - 3, element 0 gives -1.
+NESTED_STRUCT_FIELD = """\
+struct Q
+    a: i32
+
+struct P
+    q: Q
+
+const PS: [2]P = [P { q: Q { a: 1 } }, P { q: Q { a: 3 } }]
+
+impl Q
+    fn get(self: @Q) -> i32
+        self.a
+
+pub fn main() -> i32
+    var i: i64 = 1
+    PS[1].q.a + PS[i].q.get() - 3
+"""
+
 FORMS = {
     "i32_repro": I32_REPRO,
+    "nested_struct_field": NESTED_STRUCT_FIELD,
     "struct_elem": STRUCT_ELEM,
     "struct_elem_method": STRUCT_ELEM_METHOD,
     "u8_repro": U8_REPRO,
@@ -421,3 +444,11 @@ def test_ritz1_const_array_index(name: str, ritz1_bin: Path, tmp_path: Path) -> 
         f"ritz1 build of {name} exited {rc}, expected 3 "
         "(-11 = SIGSEGV: the index went through a null base)"
     )
+
+
+# AGAST #3398: ritz1_selfhosted emitted the same unlinkable nested initializer,
+# so the nested form runs on it too.  The other FORMS are ritz1-only.
+@pytest.mark.integration
+def test_ritz1_selfhosted_nested_struct_field(ritz1_bin: Path, tmp_path: Path) -> None:
+    name = "nested_struct_field"
+    assert _run("ritz1_selfhosted", tmp_path, name, FORMS[name]) == 3
