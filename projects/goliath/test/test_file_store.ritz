@@ -1,0 +1,357 @@
+# Tests for the file-backed store (AGAST #2788)
+#
+# file_store_open loads a host file into a MemoryBlobStore plus a Namespace
+# (a missing file is an empty store); file_store_save writes them back. A
+# file that is not a complete, untampered store must be refused, not half
+# loaded.
+#
+# Fixtures live under /tmp, named by pid so concurrent runs don't collide,
+# and each test removes its own.
+
+# Not ritzlib.fs: its path_basename collides with goliath.path's.
+import ritzlib.sys { sys_getpid, sys_open, sys_open3, sys_read, sys_write, sys_close, sys_unlink }
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.span { Span, span_from_ptr }
+import goliath.blob_id { BlobId, blob_id_eq }
+import goliath.blob_store { MemoryBlobStore, memory_store_new, memory_store_free, memory_store_count }
+import goliath.namespace { Namespace, namespace_root, namespace_read, namespace_write, namespace_list }
+import goliath.dir_entry { DirEntry }
+import goliath.error { ErrorCode, ERR_OK, ERR_CORRUPT_BLOB }
+import goliath.file_store { file_store_open, file_store_save }
+
+# "/tmp/goliath-fs-<pid>-<tag>" into `buf` (>= 96 bytes), as a StrView.
+fn tmp_path(tag: *u8, buf: *u8) -> StrView
+    let prefix: StrView = "/tmp/goliath-fs-"
+    var n: i64 = 0
+    while n < prefix.len
+        *(buf + n) = *(prefix.ptr + n)
+        n = n + 1
+    var digits: [12]u8
+    var pid: i32 = sys_getpid()
+    var d: i32 = 0
+    while pid > 0 or d == 0
+        digits[d] = (48 + pid % 10) as u8
+        pid = pid / 10
+        d = d + 1
+    while d > 0
+        d = d - 1
+        *(buf + n) = digits[d]
+        n = n + 1
+    *(buf + n) = 45  # '-'
+    n = n + 1
+    var t: i64 = 0
+    while *(tag + t) != 0
+        *(buf + n) = *(tag + t)
+        n = n + 1
+        t = t + 1
+    *(buf + n) = 0
+    strview_from_ptr(buf, n)
+
+const FIXTURE_MAX: i64 = 8192
+
+# Read the file at `path` into `buf` (FIXTURE_MAX bytes). Its length, or -1.
+fn fixture_read(path: StrView, buf: *u8) -> i64
+    let fd: i32 = sys_open(path.ptr, 0)
+    if fd < 0
+        return -1
+    var len: i64 = 0
+    loop
+        let n: i64 = sys_read(fd, buf + len, FIXTURE_MAX - len)
+        if n <= 0
+            break
+        len = len + n
+    sys_close(fd)
+    len
+
+# Create or truncate the file at `path` with `len` bytes of `data`.
+fn fixture_write(path: StrView, data: *u8, len: i64)
+    # O_WRONLY | O_CREAT | O_TRUNC, 0644
+    let fd: i32 = sys_open3(path.ptr, 577, 420)
+    if fd < 0
+        return
+    sys_write(fd, data, len)
+    sys_close(fd)
+
+fn fixture_exists(path: StrView) -> bool
+    let fd: i32 = sys_open(path.ptr, 0)
+    if fd < 0
+        return false
+    sys_close(fd)
+    true
+
+fn fixture_unlink(path: StrView)
+    sys_unlink(path.ptr)
+
+# Does `ns` hold `want` at `path`?
+fn reads_as(ns: *Namespace, path: StrView, want: StrView) -> bool
+    let got: Span<u8> = namespace_read(ns, path)
+    if got.len != want.len
+        return false
+    var i: i64 = 0
+    while i < got.len
+        if *(got.ptr + i) != *(want.ptr + i)
+            return false
+        i = i + 1
+    true
+
+# Save a store holding /a.txt = "hello" to `path`. 0 on success.
+fn save_hello(path: StrView) -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    if file_store_open(path, @store, @ns) != ERR_OK
+        memory_store_free(@store)
+        return 1
+    let hello: StrView = "hello"
+    let data: Span<u8> = span_from_ptr<u8>(hello.ptr, hello.len)
+    if namespace_write(@ns, "/a.txt", @data) != ERR_OK
+        memory_store_free(@store)
+        return 2
+    let rc: ErrorCode = file_store_save(path, @ns)
+    memory_store_free(@store)
+    if rc != ERR_OK
+        return 3
+    0
+
+# What file_store_open says about the file at `path`.
+fn open_code(path: StrView) -> ErrorCode
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    let rc: ErrorCode = file_store_open(path, @store, @ns)
+    memory_store_free(@store)
+    rc
+
+# Rewrite the file at `path` with its length changed by `len_delta` (-1, 0
+# or 1; a new last byte is 0) and, if `flip_from_end` > 0, that byte counted
+# from the end XORed by 1. 0 on success.
+fn tamper(path: StrView, len_delta: i64, flip_from_end: i64) -> i32
+    var body: [8193]u8
+    let len: i64 = fixture_read(path, @body[0])
+    if len < 0 or len >= FIXTURE_MAX or flip_from_end > len
+        return 1
+    body[len] = 0
+    if flip_from_end > 0
+        body[len - flip_from_end] = body[len - flip_from_end] ^ 1
+    fixture_write(path, @body[0], len + len_delta)
+    0
+
+# XOR byte `offset` of the file at `path` with `mask`; offset -1 means the
+# first byte of the first "hello" in it. 0 on success.
+fn flip_at(path: StrView, offset: i64, mask: u8) -> i32
+    var body: [8193]u8
+    let len: i64 = fixture_read(path, @body[0])
+    if len < 0 or len >= FIXTURE_MAX
+        return 1
+    var at: i64 = offset
+    if at < 0
+        var i: i64 = 0
+        while i + 5 <= len and at < 0
+            if body[i] == 104 and body[i + 1] == 101 and body[i + 2] == 108 and body[i + 3] == 108 and body[i + 4] == 111
+                at = i
+            i = i + 1
+    if at < 0 or at >= len
+        return 2
+    body[at] = body[at] ^ mask
+    fixture_write(path, @body[0], len)
+    0
+
+# Test: a store file that doesn't exist opens as an empty namespace, and
+# opening doesn't create it
+[[test]]
+fn test_file_store_missing_is_empty() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"missing", @buf[0])
+    fixture_unlink(path)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    if file_store_open(path, @store, @ns) != ERR_OK
+        memory_store_free(@store)
+        return 1
+    var entries: [4]DirEntry
+    let n: i32 = namespace_list(@ns, "/", @entries[0], 4)
+    memory_store_free(@store)
+    if n != 0
+        return 2
+    if fixture_exists(path)
+        fixture_unlink(path)
+        return 3
+    0
+
+# Test: what one process saves, another opens: same root, same bytes, and
+# a second save keeps the first file
+[[test]]
+fn test_file_store_roundtrip() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"roundtrip", @buf[0])
+    fixture_unlink(path)
+    if save_hello(path) != 0
+        fixture_unlink(path)
+        return 1
+
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    if file_store_open(path, @store, @ns) != ERR_OK
+        memory_store_free(@store)
+        fixture_unlink(path)
+        return 2
+    if not reads_as(@ns, "/a.txt", "hello")
+        memory_store_free(@store)
+        fixture_unlink(path)
+        return 3
+    let world: StrView = "world!"
+    let data: Span<u8> = span_from_ptr<u8>(world.ptr, world.len)
+    namespace_write(@ns, "/b.txt", @data)
+    var root1: BlobId = namespace_root(@ns)
+    let count1: i32 = memory_store_count(@store)
+    if file_store_save(path, @ns) != ERR_OK
+        memory_store_free(@store)
+        fixture_unlink(path)
+        return 4
+    memory_store_free(@store)
+
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    let rc: ErrorCode = file_store_open(path, @store2, @ns2)
+    fixture_unlink(path)
+    if rc != ERR_OK
+        memory_store_free(@store2)
+        return 5
+    var root2: BlobId = namespace_root(@ns2)
+    var ok: i32 = 0
+    if not blob_id_eq(@root1, @root2)
+        ok = 6
+    else if memory_store_count(@store2) != count1
+        ok = 7
+    else if not reads_as(@ns2, "/a.txt", "hello")
+        ok = 8
+    else if not reads_as(@ns2, "/b.txt", "world!")
+        ok = 9
+    memory_store_free(@store2)
+    ok
+
+# Test: a file that isn't a goliath store is refused: junk text, and a
+# real store with one byte of its magic changed
+[[test]]
+fn test_file_store_rejects_bad_magic() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"magic", @buf[0])
+    let junk: StrView = "this is not a goliath store, just some text long enough"
+    fixture_write(path, junk.ptr, junk.len)
+    if open_code(path) != ERR_CORRUPT_BLOB
+        fixture_unlink(path)
+        return 1
+    fixture_unlink(path)
+    if save_hello(path) != 0 or flip_at(path, 0, 1) != 0
+        fixture_unlink(path)
+        return 2
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 3
+    0
+
+# Test: an empty file is refused (it is not an empty store)
+[[test]]
+fn test_file_store_rejects_empty_file() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"empty", @buf[0])
+    fixture_write(path, @buf[0], 0)
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 1
+    0
+
+# Test: a store cut short by one byte is refused
+[[test]]
+fn test_file_store_rejects_truncated() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"trunc", @buf[0])
+    if save_hello(path) != 0
+        fixture_unlink(path)
+        return 1
+    if open_code(path) != ERR_OK
+        fixture_unlink(path)
+        return 2
+    if tamper(path, -1, 0) != 0
+        fixture_unlink(path)
+        return 3
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 4
+    0
+
+# Test: a store with trailing junk is refused
+[[test]]
+fn test_file_store_rejects_trailing_bytes() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"trail", @buf[0])
+    if save_hello(path) != 0
+        fixture_unlink(path)
+        return 1
+    if tamper(path, 1, 0) != 0
+        fixture_unlink(path)
+        return 2
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 4
+    0
+
+# Test: a blob whose bytes no longer hash to its id is refused (here the
+# "hello" file, not a directory, so the namespace alone wouldn't notice)
+[[test]]
+fn test_file_store_rejects_flipped_byte() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"flip", @buf[0])
+    if save_hello(path) != 0
+        fixture_unlink(path)
+        return 1
+    if flip_at(path, -1, 1) != 0
+        fixture_unlink(path)
+        return 2
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 3
+    0
+
+# Test: a blob whose size runs past the end of the file is refused, not read
+# (byte 87 is the top byte of the first blob's u64 size)
+[[test]]
+fn test_file_store_rejects_oversized_blob() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"huge", @buf[0])
+    if save_hello(path) != 0
+        fixture_unlink(path)
+        return 1
+    if flip_at(path, 87, 64) != 0
+        fixture_unlink(path)
+        return 2
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 3
+    0
+
+# Test: a header whose root isn't one of the file's blobs is refused
+# (byte 16 is the first byte of the root id)
+[[test]]
+fn test_file_store_rejects_unknown_root() -> i32
+    var buf: [96]u8
+    let path: StrView = tmp_path(c"root", @buf[0])
+    if save_hello(path) != 0
+        fixture_unlink(path)
+        return 1
+    var body: [8193]u8
+    let len: i64 = fixture_read(path, @body[0])
+    if len < 48 or len >= FIXTURE_MAX
+        fixture_unlink(path)
+        return 2
+    body[16] = body[16] ^ 1
+    fixture_write(path, @body[0], len)
+    let rc: ErrorCode = open_code(path)
+    fixture_unlink(path)
+    if rc != ERR_CORRUPT_BLOB
+        return 3
+    0

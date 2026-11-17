@@ -1,0 +1,236 @@
+# FileStore - a blob store and namespace persisted in one host file
+#
+# The goliath CLI (AGAST #2788) keeps its store in a regular file. The file is
+# loaded whole into a MemoryBlobStore (which the Namespace is built on) and
+# written back whole after a change. That is fine for the CLI's sizes; the
+# VirtIO store is the one for a disk.
+#
+# Format (integers little-endian):
+#
+#     0   magic    "GOLIATHS"           8 bytes
+#     8   version  u32 = 1
+#     12  count    u32                  number of blobs that follow
+#     16  root     BlobId               the namespace's root directory blob
+#     48  blobs    count x { id: BlobId, size: u64, data: [size]u8 }
+#
+# A file that doesn't match this exactly (bad magic or version, cut short,
+# trailing bytes, a blob whose bytes don't hash to its id, a root that isn't
+# one of its blobs) is refused with ERR_CORRUPT_BLOB rather than half loaded.
+#
+# Saving writes `<path>.tmp` and renames it over `<path>`, so a reader never
+# sees a half-written store. Two writers racing still lose one's update: there
+# is no lock.
+
+import ritzlib.sys { sys_open, sys_open3, sys_read, sys_write, sys_close, sys_lseek, sys_rename, sys_unlink, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.strview { StrView }
+import goliath.blob_id { BlobId, blob_id_compute, blob_id_eq, blob_id_from_hash, blob_id_copy, blob_id_is_zero }
+import goliath.blob_store { MemoryBlobStore, memory_store_put, memory_store_exists, memory_store_count, memory_store_capacity, memory_store_slot_used, memory_store_slot_id, memory_store_slot_data, memory_store_slot_size }
+import goliath.namespace { Namespace, namespace_new, namespace_open, namespace_root, namespace_store }
+import goliath.error { ErrorCode, ERR_OK, ERR_CORRUPT_BLOB, ERR_IO_ERROR, ERR_OUT_OF_SPACE, ERR_PATH_TOO_LONG }
+
+pub const FILE_STORE_VERSION: u32 = 1
+
+const FS_HEADER_SIZE: i64 = 48
+const FS_BLOB_HEADER_SIZE: i64 = 40
+const FS_PATH_BUF: i64 = 4096
+const FS_ENOENT: i32 = 2
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+# `path` + `suffix` (a C string) + NUL into `buf` (FS_PATH_BUF bytes).
+fn fs_path_cstr(path: StrView, suffix: *u8, buf: *u8) -> bool
+    var n: i64 = 0
+    while *(suffix + n) != 0
+        n = n + 1
+    if path.len == 0 or path.len + n >= FS_PATH_BUF
+        return false
+    var i: i64 = 0
+    while i < path.len
+        if *(path.ptr + i) == 0
+            return false
+        *(buf + i) = *(path.ptr + i)
+        i = i + 1
+    var j: i64 = 0
+    while j < n
+        *(buf + i + j) = *(suffix + j)
+        j = j + 1
+    *(buf + i + j) = 0
+    true
+
+fn fs_magic_byte(i: i64) -> u8
+    *(c"GOLIATHS" + i)
+
+fn fs_put_le(buf: *u8, value: u64, width: i64)
+    var i: i64 = 0
+    while i < width
+        *(buf + i) = ((value >> (i * 8) as u64) & 255) as u8
+        i = i + 1
+
+fn fs_get_le(buf: *u8, width: i64) -> u64
+    var v: u64 = 0
+    var i: i64 = width - 1
+    while i >= 0
+        v = (v << 8) | *(buf + i) as u64
+        i = i - 1
+    v
+
+# Write all `len` bytes. False on any error.
+fn fs_write_all(fd: i32, data: *u8, len: i64) -> bool
+    var done: i64 = 0
+    while done < len
+        let n: i64 = sys_write(fd, data + done, len - done)
+        if n <= 0
+            return false
+        done = done + n
+    true
+
+# ============================================================================
+# Load
+# ============================================================================
+
+# Fill `store` from the `len` bytes at `buf` and point `ns_out` at the root.
+fn fs_load_image(buf: *u8, len: i64, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
+    if len < FS_HEADER_SIZE
+        return ERR_CORRUPT_BLOB
+    var i: i64 = 0
+    while i < 8
+        if *(buf + i) != fs_magic_byte(i)
+            return ERR_CORRUPT_BLOB
+        i = i + 1
+    if fs_get_le(buf + 8, 4) as u32 != FILE_STORE_VERSION
+        return ERR_CORRUPT_BLOB
+    let count: u64 = fs_get_le(buf + 12, 4)
+    var root: BlobId = blob_id_from_hash(buf + 16)
+
+    var off: i64 = FS_HEADER_SIZE
+    var k: u64 = 0
+    while k < count
+        if len - off < FS_BLOB_HEADER_SIZE
+            return ERR_CORRUPT_BLOB
+        var id: BlobId = blob_id_from_hash(buf + off)
+        let size: u64 = fs_get_le(buf + off + 32, 8)
+        off = off + FS_BLOB_HEADER_SIZE
+        if size > (len - off) as u64
+            return ERR_CORRUPT_BLOB
+        let data: *u8 = buf + off
+        # Content addressing: the bytes must still be the ones named
+        var actual: BlobId = blob_id_compute(data, size)
+        if not blob_id_eq(@actual, @id)
+            return ERR_CORRUPT_BLOB
+        var stored: BlobId = memory_store_put(store, data, size)
+        if blob_id_is_zero(@stored)
+            return ERR_OUT_OF_SPACE
+        off = off + size as i64
+        k = k + 1
+    if off != len
+        return ERR_CORRUPT_BLOB
+    if not memory_store_exists(store, @root)
+        return ERR_CORRUPT_BLOB
+    *ns_out = namespace_open(store, @root)
+    ERR_OK
+
+# Load the store file at `path` into the empty `store`, and set `ns_out` to
+# its namespace. A missing file is an empty store (with an empty root
+# directory); nothing is created on disk until file_store_save.
+#
+# ERR_OK, ERR_CORRUPT_BLOB (not a whole, intact store file), ERR_IO_ERROR
+# (can't read it) or ERR_PATH_TOO_LONG.
+pub fn file_store_open(path: StrView, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
+    var cpath: [4096]u8
+    if not fs_path_cstr(path, c"", @cpath[0])
+        return ERR_PATH_TOO_LONG
+
+    let fd: i32 = sys_open(@cpath[0], 0)  # O_RDONLY
+    if fd == -FS_ENOENT
+        *ns_out = namespace_new(store)
+        return ERR_OK
+    if fd < 0
+        return ERR_IO_ERROR
+
+    let len: i64 = sys_lseek(fd, 0, 2)  # SEEK_END
+    if len < 0 or sys_lseek(fd, 0, 0) != 0
+        sys_close(fd)
+        return ERR_IO_ERROR
+    if len < FS_HEADER_SIZE
+        sys_close(fd)
+        return ERR_CORRUPT_BLOB
+
+    let buf: *u8 = sys_mmap(0, len, PROT_READ + PROT_WRITE, MAP_PRIVATE + MAP_ANONYMOUS, -1, 0)
+    if (buf as i64) < 0
+        sys_close(fd)
+        return ERR_IO_ERROR
+    var got: i64 = 0
+    while got < len
+        let n: i64 = sys_read(fd, buf + got, len - got)
+        if n <= 0
+            break
+        got = got + n
+    sys_close(fd)
+
+    var rc: ErrorCode = ERR_IO_ERROR
+    if got == len
+        rc = fs_load_image(buf, len, store, ns_out)
+    sys_munmap(buf, len)
+    rc
+
+# ============================================================================
+# Save
+# ============================================================================
+
+fn fs_save_to_fd(fd: i32, ns: *Namespace) -> bool
+    let store: *MemoryBlobStore = namespace_store(ns)
+    var header: [48]u8
+    var i: i64 = 0
+    while i < 8
+        header[i] = fs_magic_byte(i)
+        i = i + 1
+    fs_put_le(@header[8], FILE_STORE_VERSION as u64, 4)
+    fs_put_le(@header[12], memory_store_count(store) as u64, 4)
+    var root: BlobId = namespace_root(ns)
+    i = 0
+    while i < 32
+        header[16 + i] = root.hash[i]
+        i = i + 1
+    if not fs_write_all(fd, @header[0], FS_HEADER_SIZE)
+        return false
+
+    var blob_header: [40]u8
+    var slot: i32 = 0
+    while slot < memory_store_capacity(store)
+        if memory_store_slot_used(store, slot)
+            var id: BlobId = memory_store_slot_id(store, slot)
+            let size: u64 = memory_store_slot_size(store, slot)
+            var j: i64 = 0
+            while j < 32
+                blob_header[j] = id.hash[j]
+                j = j + 1
+            fs_put_le(@blob_header[32], size, 8)
+            if not fs_write_all(fd, @blob_header[0], FS_BLOB_HEADER_SIZE)
+                return false
+            if size > 0 and not fs_write_all(fd, memory_store_slot_data(store, slot), size as i64)
+                return false
+        slot = slot + 1
+    true
+
+# Write every blob of `ns`'s store, and its root, to the file at `path`
+# (atomically replacing it). ERR_OK, ERR_IO_ERROR or ERR_PATH_TOO_LONG.
+pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
+    var cpath: [4096]u8
+    var ctmp: [4096]u8
+    if not fs_path_cstr(path, c"", @cpath[0]) or not fs_path_cstr(path, c".tmp", @ctmp[0])
+        return ERR_PATH_TOO_LONG
+
+    # O_WRONLY | O_CREAT | O_TRUNC, mode 0644
+    let fd: i32 = sys_open3(@ctmp[0], 577, 420)
+    if fd < 0
+        return ERR_IO_ERROR
+    let ok: bool = fs_save_to_fd(fd, ns)
+    if sys_close(fd) != 0 or not ok
+        sys_unlink(@ctmp[0])
+        return ERR_IO_ERROR
+    if sys_rename(@ctmp[0], @cpath[0]) != 0
+        sys_unlink(@ctmp[0])
+        return ERR_IO_ERROR
+    ERR_OK

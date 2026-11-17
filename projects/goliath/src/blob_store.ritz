@@ -104,23 +104,39 @@ pub fn memory_store_init_ops()
     memory_store_ops.total_size_fn = memory_store_total_size_impl
     memory_store_ops.free_fn = memory_store_free_impl
 
-# Create a new empty memory blob store
-pub fn memory_store_new() -> MemoryBlobStore
-    # Allocate initial entry array
-    let entry_size: u64 = 56  # sizeof(BlobEntry) - approximate
-    let alloc_size: i64 = (entry_size * INITIAL_CAPACITY as u64) as i64
-
-    # Use mmap for allocation
+# An mmap'd array of `capacity` entries, all unused.
+fn entries_alloc(capacity: i32) -> *BlobEntry
+    let alloc_size: i64 = sizeof(BlobEntry) * capacity as i64
     let prot: i32 = PROT_READ + PROT_WRITE
     let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
     let entries: *BlobEntry = sys_mmap(0, alloc_size, prot, flags, -1, 0) as *BlobEntry
-
-    # Initialize all entries as unused
     var i: i32 = 0
-    while i < INITIAL_CAPACITY
+    while i < capacity
         let entry: *BlobEntry = entries + i
         (*entry).used = false
         i = i + 1
+    entries
+
+fn entries_free(entries: *BlobEntry, capacity: i32)
+    sys_munmap(entries as *u8, sizeof(BlobEntry) * capacity as i64)
+
+# Double the entry array. Returns the first new (free) slot.
+fn store_grow(store: *MemoryBlobStore) -> *BlobEntry
+    let old_cap: i32 = (*store).capacity
+    let new_cap: i32 = old_cap * 2
+    let entries: *BlobEntry = entries_alloc(new_cap)
+    var i: i32 = 0
+    while i < old_cap
+        *(entries + i) = *((*store).entries + i)
+        i = i + 1
+    entries_free((*store).entries, old_cap)
+    (*store).entries = entries
+    (*store).capacity = new_cap
+    entries + old_cap
+
+# Create a new empty memory blob store
+pub fn memory_store_new() -> MemoryBlobStore
+    let entries: *BlobEntry = entries_alloc(INITIAL_CAPACITY)
 
     MemoryBlobStore {
         entries: entries,
@@ -187,10 +203,8 @@ fn memory_store_put_impl(self: *u8, data: *u8, size: u64) -> BlobId
             break
         i = i + 1
 
-    # TODO: Grow array if no free slot
     if slot == 0 as *BlobEntry
-        # Return zero ID to indicate failure
-        return blob_id_zero()
+        slot = store_grow(store)
 
     # Allocate storage for data
     let prot: i32 = PROT_READ + PROT_WRITE
@@ -249,15 +263,34 @@ fn memory_store_free_impl(self: *u8) -> i32
             sys_munmap((*entry).data, (*entry).size as i64)
         i = i + 1
 
-    # Free entry array
-    let entry_size: u64 = 56
-    sys_munmap((*store).entries as *u8, (entry_size * (*store).capacity as u64) as i64)
+    entries_free((*store).entries, (*store).capacity)
 
     (*store).entries = 0 as *BlobEntry
     (*store).capacity = 0
     (*store).count = 0
     (*store).total_size = 0
     0
+
+# ============================================================================
+# Slot iteration (for saving a store: see file_store.ritz)
+# ============================================================================
+#
+# Slots 0..memory_store_capacity() - 1; unused ones have no blob.
+
+pub fn memory_store_capacity(store: *MemoryBlobStore) -> i32
+    (*store).capacity
+
+pub fn memory_store_slot_used(store: *MemoryBlobStore, slot: i32) -> bool
+    (*((*store).entries + slot)).used
+
+pub fn memory_store_slot_id(store: *MemoryBlobStore, slot: i32) -> BlobId
+    blob_id_copy(@(*((*store).entries + slot)).id)
+
+pub fn memory_store_slot_data(store: *MemoryBlobStore, slot: i32) -> *u8
+    (*((*store).entries + slot)).data
+
+pub fn memory_store_slot_size(store: *MemoryBlobStore, slot: i32) -> u64
+    (*((*store).entries + slot)).size
 
 # ============================================================================
 # Legacy API (for backwards compatibility)

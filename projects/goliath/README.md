@@ -1,11 +1,12 @@
 # Goliath
 
-Content-addressable filesystem for Harland, as a Ritz library. **What works
-today:** the library: SHA-256 blob ids, an in-memory blob store
-(put/get/exists/delete), a VirtIO-backed store, and a path namespace
-(`./rz test goliath`: 33 tests). **There is no CLI yet** (AGAST #2788): the
-`goliath` binary answers `--help`, and `put`/`get`/`ls` exit 1 with
-`not implemented`.
+Content-addressable filesystem for Harland, as a Ritz library and a CLI.
+**What works today:** SHA-256 blob ids, an in-memory blob store
+(put/get/exists/delete), a store persisted in one host file, a VirtIO-backed
+store, and a path namespace (`./rz test goliath`: 46 tests plus `test.sh`).
+The `goliath` binary stores files and reads them back: `goliath put FILE`
+prints the file's blob id, `goliath get ID` writes the blob to stdout, and
+`goliath ls PATH` lists the namespace (AGAST #2788).
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
@@ -38,10 +39,35 @@ Goliath is usable as a standalone library on Linux as well as the native filesys
 
 # Build and run tests (run from the monorepo root; `rz` sets RITZ_PATH itself)
 ./rz build goliath
-./projects/goliath/build/debug/goliath-tests    # 33 passed, 0 failed
+./rz test goliath                               # unit tests + test.sh
 ```
 
 ## Usage
+
+### CLI
+
+```bash
+export GOLIATH_STORE=/tmp/demo.store   # default: ./goliath.store
+goliath put notes.txt                  # stores it as /notes.txt
+# 1f2c...e9  (the SHA-256 of notes.txt: its blob id)
+goliath get 1f2c...e9 > copy.txt       # the exact bytes back
+goliath ls /                           # ID  SIZE  NAME, one line per entry
+goliath ls /notes.txt                  # just that file's line
+```
+
+`put` links the file at `/<its name>`, replacing an older file of that name.
+`get` and `ls` only read the store; a missing store is an empty one. Exit
+status: 0 done, 1 failed (not found, unreadable, corrupt store), 2 usage.
+
+The store file (`src/file_store.ritz`) holds every blob and the namespace
+root. It is read whole and written back whole (to `<store>.tmp`, then renamed
+over the store). A file that isn't a complete, intact store is refused, never
+half-read. Each blob is checked against its id on load. Limits for now: the
+root directory holds 256 entries; every `put` keeps the superseded root
+directory blob, so the store grows until garbage collection lands (#1881); two `put`s
+at once can lose one of them (there is no lock: #3882).
+
+### Library
 
 ```ritz
 import goliath { BlobStore, Namespace, BlobId }
@@ -83,18 +109,13 @@ store.gc(ns.all_blob_ids())
 
 ## Status
 
-**Alpha, with a passing suite.** Measured 2026-09-26: `./rz test goliath` runs
-4 test files, 33 tests passed. Run it to get today's numbers. The hand-rolled
-`goliath-tests` binary (`test/test_main.ritz`) was removed by AGAST #1484. It
-only re-ran the same `[[test]]` functions that `ritz0 --test` already runs.
+**Alpha, with a passing suite.** `./rz test goliath` runs 5 test files
+(46 tests) and `test.sh`, which drives the CLI end to end against a temp
+store. Run it to get today's numbers.
 
-Core blob store (put/get/exists), namespaces and path handling are implemented.
-Garbage collection and snapshot support are still planned.
-
-The `goliath` binary is not a tool yet. `goliath --help` prints usage (exit 0);
-`put`, `get` and `ls` exit 1 with `not implemented`; anything else is an unknown
-command (exit 2). It used to print "Run tests with: make test" and exit 0 for
-any input (AGAST #2460). `test.sh` pins this; the CLI itself is #2788.
+Core blob store (put/get/exists), the host-file store, namespaces and path
+handling are implemented. Garbage collection and snapshot support are still
+planned. The CLI has no `mkdir` yet, so `put` only fills `/`.
 
 ## License
 
