@@ -7213,6 +7213,16 @@ class LLVMEmitter:
                     val = self._convert_type(val, base.type.pointee)
                     self.builder.store(val, ptr)
                 else:
+                    # AGAST #3754: `(n + 1)[0] = v`, `(n as i64)[0] = v`: an
+                    # integer base has nothing to index, as `n[0] = v` (#2886),
+                    # in the same words and at the `[`.  This raised a bare
+                    # ValueError ("Cannot index type: i64") with a traceback.
+                    ty = self._infer_ritz_type(stmt.target.expr)
+                    if ty is not None:
+                        ty = resolve_alias_in(ty, self.type_aliases)
+                    if isinstance(ty, rast.NamedType) and ty.name in index_rules.SCALARS:
+                        raise EmitError(index_rules.needs_index(ty.name),
+                                        stmt.target.bracket or stmt.target.span)
                     raise ValueError(f"Cannot index type: {base.type}")
             elif isinstance(stmt.target, rast.UnaryOp) and stmt.target.op == '*':
                 # Assignment to dereferenced pointer: *ptr = val

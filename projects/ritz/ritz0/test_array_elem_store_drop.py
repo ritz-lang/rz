@@ -434,9 +434,9 @@ def test_store_into_cast_or_arith_base(tmp_path, compiler, name):
 
 # A scalar base, or pointer arithmetic the store above doesn't type, reached
 # that generic path too; ritz1's Sema refuses it (index_store_check).  An
-# integer base in ritz0's words for `n[i] = v`.  ritz1 only: ritz0 raises a
-# traceback on the integer bases (AGAST #3754) and stores through
-# `(@a[0] + 1)[i]`, which ritz1 is to route (AGAST #3757).
+# integer base in ritz0's words for `n[i] = v`, on every compiler (ritz0 raised
+# a traceback until AGAST #3754).  `(@a[0] + 1)[i]` is ritz1 only: ritz0 stores
+# through it, which ritz1 is to route (AGAST #3757).
 # The integer bases' error is at the `[` (index_scalar_check, AGAST #3755);
 # the store's own is at the target.
 EXPR_BASE_REFUSED = {
@@ -448,8 +448,9 @@ EXPR_BASE_REFUSED = {
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS[1:])
-@pytest.mark.parametrize("name", sorted(EXPR_BASE_REFUSED))
+@pytest.mark.parametrize("compiler, name", [
+    (c, n) for n in sorted(EXPR_BASE_REFUSED)
+    for c in (COMPILERS if n.startswith("int_") else COMPILERS[1:])])
 def test_store_into_untyped_base_refused(tmp_path, compiler, name):
     line, col, msg = EXPR_BASE_REFUSED[name]
     body = "fn f()\n    var a: [2]i32 = [1, 2]\n    var n: i64 = 0\n" + line
@@ -457,7 +458,8 @@ def test_store_into_untyped_base_refused(tmp_path, compiler, name):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {line.strip()!r}:\n{out[-1000:]}"
     assert not ll.exists()
-    found = re.findall(r"main\.ritz:(\d+:\d+): error: (.*)", out)
+    assert "Traceback" not in out, out[-2000:]
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
     where = f"{PRELUDE.count(chr(10)) + 4}:{col}"
     assert (where, msg) in found, f"{compiler}: wanted {msg!r} at {where}:\n{out[-2000:]}"
     assert len(found) == 1, f"{compiler}: reported more than once:\n{out[-2000:]}"
