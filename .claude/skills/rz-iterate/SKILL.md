@@ -67,10 +67,27 @@ Repeat until the goal is met:
    to the host room (see "Hosts") and judge from its last journal line per
    room. A room that isn't working gets `RESTART ritz-task-<id>` sent to the
    host room, then the same nudge sent to the room itself.
-4. **No tickets for the milestone?** Spawn a **survey room**: it measures the
+4. **Keep the AGAST tree whole** (Aaron, 2026-11-17 restructure). Every
+   open ritz ticket is in project 1 with a parent that leads to one of the
+   six roots: #46 Language (M1.1 #1828, M1.2 #1829 + LARB R54–R67 #3786,
+   M1.3 #1830 → #1812, M1.4 #1831 + ritz0 maintenance #3787), #48 Kernel
+   (M2.1–M2.5), #47 ritzlib, #1833 Tooling & gate, #50 Foundation, or the
+   parked #49/#51/#52.
+   - **Empty Triage (#3788) every cycle:** re-parent each child under its
+     milestone (`update_task(parent_task_id=...)`), fold it into an
+     existing ticket, or close it.
+   - **Catch orphans:** `search_tasks(project_id=1, parent_task_id=0,
+     completed=False, count_only=True)` should return 8 (the root tickets
+     themselves). `search_tasks(project_id=0, completed=False, query="ritz")`
+     finds ritz tickets filed with no project. It should return only
+     #1297, #2508 and #2986 (AGAST and DOKS work, which have no project of
+     their own). Place anything else you find.
+   - **Briefing `<milestone>`** is the parent of the ticket being worked
+     (Triage #3788 if it has none).
+5. **No tickets for the milestone?** Spawn a **survey room**: it measures the
    milestone, files one AGAST ticket per defect found, and REAPs with only its
    notes (or no commit at all; see "Survey rooms").
-5. **Wait.** Schedule a long fallback wakeup (`ScheduleWakeup`, 1800s,
+6. **Wait.** Schedule a long fallback wakeup (`ScheduleWakeup`, 1800s,
    prompt `/rz-iterate`). REAP messages arrive with `ask_claude=True` and wake
    the room sooner.
 
@@ -135,8 +152,9 @@ stays here; remote hosts only run rooms.
   - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=opus`, then
     the briefing. The host answers `SPAWNED ritz-task-<id> on <host>` or
     `SPAWN-FAILED ritz-task-<id> on <host>: <reason>`.
-    `SPAWN` also fast-forwards the host's `~/dev/ritz-lang/rz` to
-    `origin/main`, because `run-gate.sh` is read from there.
+    `SPAWN` creates the worktree off `origin/main`; the room gates with
+    its own worktree's `run-gate.sh` (briefing step 6), not the host's
+    `~/dev/ritz-lang/rz` checkout (Aaron, 2026-11-16 20:35).
   - `RESTART ritz-task-<id>`: restarts a room that isn't working.
   - `TEARDOWN ritz-task-<id>`: removes the room's unit, budget, worktree and
     local branch after its merge. The host answers `TORNDOWN ritz-task-<id>
@@ -334,9 +352,9 @@ You can't run `git worktree`, `systemctl`, `provision-room.sh` or
    reading a journal. No answer in 10 minutes: send `STATUS`.
 
 Paths in the briefing (`~/dev/ritz-lang/...`) are the same on every host.
-`run-gate.sh` is read from the host's own `~/dev/ritz-lang/rz` checkout, so
-the host must keep that checkout on current `origin/main`; the SPAWN's fetch
-covers it.
+Each room runs `run-gate.sh` from its own worktree (briefing step 6), so a
+gate fix on `main` reaches a room only when it rebases. Nothing reads the
+host's `~/dev/ritz-lang/rz` checkout for the gate.
 
 ### The briefing (send verbatim, with the placeholders filled)
 
@@ -370,7 +388,10 @@ vouches for that exact commit.
    the cross product, and read "What a ritz0 pytest case costs" in
    `projects/ritz/docs/TESTING.md` before adding hundreds of cases.
 3. **Subagents (Agent tool) for parallel work.** No rooms of your own.
-4. **Out of scope?** File an AGAST ticket. Don't widen the change.
+4. **Out of scope?** File an AGAST ticket. Don't widen the change. File it
+   with `project_id=1` and `parent_task_id=<milestone>` (the parent of your
+   own ticket). If it fits no milestone, use the Triage bucket `#3788`.
+   Never file a ritz ticket with no project or no parent.
 5. **Finish on main:** `git fetch origin && git rebase origin/main`, then
    squash to one commit: `ritz-task-<id>: 🤖 <terse description>`.
    Then run `make -C projects/ritz smoke` (≤ 2 min) before requesting a

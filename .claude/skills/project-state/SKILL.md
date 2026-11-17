@@ -55,20 +55,41 @@ AGAST links work to a roadmap item in one of two ways, and the IDs below use bot
 
   For example, #47 had 12 done of 27. Its `depends_on` holds only the previous phase.
 
-For each ID, run both calls and use whichever finds more children. Write down
-which one you used, so the next run counts the same way.
+**Since the 2026-11-17 restructure, membership is by subtask.** Every open ritz
+ticket was re-parented under its milestone; the old dependency links were kept
+and still hold the history (for example, M1.1's 21 done items are dependencies,
+and its 30 open items are subtasks). So for each ID, count the **union** of both
+sets by task ID: done = members with `status == "completed"`. Don't pick
+whichever call finds more, because that drops one of the two halves. New work is
+only ever added as subtasks.
 
-Run every call in one parallel batch. Large `search_tasks` results get saved to a
-file; count them with
-`jq -r '.result|fromjson|[length,(map(select(.status=="completed"))|length)]|@tsv' <file>`.
-Don't read the whole file.
+Sub-epics count toward their milestone. Count their children too: #1812 (and its
+#1816 and #1823) under M1.3 #1830, the buckets #3786 (LARB R54–R67) under M1.2
+and #3787 (ritz0 maintenance) under M1.4, #1844 under M2.1, and #198, #1343 and
+#1347 under #47.
+
+Page `search_tasks` (`page=1, 2, …`, `limit=200`) while `has_more` is true;
+without `page`, the list is cut off at `limit`. Run every call in one parallel
+batch. Large results get saved to a file; count them with `jq` and don't read the
+whole file.
+
+### Tree health (two lines in the report, below the pace chart)
+
+- **Orphans:** `search_tasks(project_id=1, parent_task_id=0, completed=False,
+  count_only=True)` minus the 8 roots (#46–#52, #1833). Also count
+  `search_tasks(parent_task_id=3788, completed=False, count_only=True)` (Triage).
+  The target is 0 orphans and a Triage bucket emptied each cycle.
+- **Filed vs merged, last 3 days:** tickets created in project 1 per UTC day
+  against `ritz-task` merges per day (`collect.sh` pace data). The target is
+  filed ≤ merged over a rolling 3 days. Report triage closures (duplicates,
+  already fixed) separately; they aren't merges.
 
 | Row label | AGAST | Track / epic |
 |---|---|---|
 | T0 Fast iter | #1801 | Track 0 |
 | M1.1 Parity | #1828 | Track 1 (#46) |
 | M1.2 One lang | #1829 | Track 1 |
-| M1.3 Structure | #1812 (#1830 points at it) | Track 1 |
+| M1.3 Structure | #1830 (its body is epic #1812) | Track 1 |
 | M1.4 ritz1 default | #1831 | Track 1 |
 | M2.1 Boot gate | #1839 | Track 2 (#48) |
 | M2.2 ritz1 kernel | #1840 | Track 2 |
