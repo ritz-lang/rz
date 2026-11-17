@@ -9037,10 +9037,14 @@ class LLVMEmitter:
                 # Return a null pointer of i8* type
                 return ir.Constant(ir.IntType(8).as_pointer(), None)
 
-            # Treat `pass` as a unit/no-op expression when used in expression position
-            # (e.g., as an `if` arm or match arm body). Returns 0 — typed as i32 since
-            # phi nodes / assignments will coerce as needed for the surrounding context.
+            # `pass` is a no-op with no value (LANGUAGE_SPEC §2.4, AGAST #3759).
+            # As an arm of an if / match used as a statement it yields a
+            # dummy that nothing reads. Where a value is wanted (a used arm,
+            # an initialiser, operand, argument, ...) it is an error here, at
+            # the `pass`: it was a silent 0, and invalid IR in a struct phi.
             if name == "pass":
+                if id(expr) in self._used_arms or id(expr) in self._wanted_values:
+                    raise EmitError(self.PASS_HAS_NO_VALUE, getattr(expr, 'span', None))
                 return ir.Constant(self.i32, 0)
 
             # Check if this is a unit variant (enum variant without parentheses)
@@ -15862,6 +15866,12 @@ class LLVMEmitter:
     # let / var and for an if or match arm, located at the pointer value.
 
     POINTER_AS_FLOAT = "cannot use a pointer as a float"
+
+    # AGAST #3759: `pass` where a value is wanted, worded as ritz1's
+    # (ritz1/src/pass_value.ritz). Located at the `pass`.
+    PASS_HAS_NO_VALUE = (
+        "`pass` has no value, so it can't be used where a value is wanted; "
+        "write the value (`0` if you mean 0)")
 
     def _reject_pointer_into_float(self, val: ir.Value, float_ty: ir.Type,
                                    at: Optional[rast.Expr] = None) -> None:

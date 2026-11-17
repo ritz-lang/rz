@@ -1,0 +1,118 @@
+# ritz1/src/pass_value.ritz - `pass` has no value
+#
+# AGAST #3759 (ruled 2026-11-17), after #3740.  LANGUAGE_SPEC §2.4, §6.1,
+# §8.2: `pass` is a no-op statement with no value.  Where a value is wanted
+# it is a located error, at the `pass`:
+#
+#     var c: i64 = if n > 0 then 5 else pass     # error, at `pass`
+#     var c: Big = match t
+#         T.A => *p
+#         T.B => pass                             # error, at `pass`
+#
+# It was a silent 0 in a scalar slot and an all-zero struct.  ritz0 refuses
+# it as it emits the `pass` (emitter_llvmlite.py PASS_HAS_NO_VALUE), in these
+# words; ritz0/test_match_pass_arm_value.py pins the rule on all three.
+#
+# "Wanted" is ritz0's walk (_used_arm_values, _want_value_of): a statement's
+# roots are consumed or not (`let` / `var` initialiser, assignment value,
+# condition, a `-> T` fn's `return`: consumed; an expression statement and
+# an assignment target: not), every operand, argument and receiver is
+# consumed, and an if / match passes its own flag on to its arms.  The tail of
+# a fn body is not consumed here: a `-> T` fn's tail that can end valueless is
+# tail_value.ritz's error (#1429), and a procedure's tail runs for effect.
+#
+# The walk stops at an arm's statements: sema_walk_stmts brings each of those
+# here as a statement of its own.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import sema
+
+fn pass_value_report(sm: *Sema, line: i32, col: i32)
+    sema_error_at(sm, line, col)
+    eprints_cstr(c"`pass` has no value, so it can't be used where a value is wanted; write the value (`0` if you mean 0)\n")
+
+fn pv_is_pass(e: *Expr) -> i32
+    (e.kind == EXPR_INT_LIT and e.lit_kind == LIT_PASS) as i32
+
+fn pv_list(sm: *Sema, first: *Expr)
+    var a: *Expr = first
+    while a != null
+        pv_expr(sm, a, 1)
+        a = a.next
+
+# The arms of an if / match whose value is wanted when `consumed` is 1.  An
+# arm written `=> pass` keeps only pass_span; a block arm with no tail
+# expression is is_pass too, with no pass_span, and is no `pass`.
+fn pv_arms(sm: *Sema, arms: *MatchArm, consumed: i32)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 1
+            if consumed == 1 and arm.pass_span.line > 0
+                pass_value_report(sm, arm.pass_span.line, arm.pass_span.col)
+        else
+            pv_expr(sm, arm.body, consumed)
+        arm = arm.next
+
+# Report each `pass` in `e` whose value is wanted; `consumed` is 1 when `e`'s
+# own value is.
+fn pv_expr(sm: *Sema, e: *Expr, consumed: i32)
+    if e == null
+        return
+    if pv_is_pass(e) == 1
+        if consumed == 1
+            pass_value_report(sm, e.span.line, e.span.col)
+        return
+    let k: i32 = e.kind
+    if k == EXPR_MATCH or k == EXPR_IF
+        pv_expr(sm, e.left, 1)
+        pv_arms(sm, e.args as *MatchArm, consumed)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        pv_expr(sm, e.left, 1)
+        pv_expr(sm, e.right, 1)
+    else if k == EXPR_UNARY
+        pv_expr(sm, e.operand, 1)
+    else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        pv_expr(sm, e.left, 1)
+    else if k == EXPR_CALL or k == EXPR_ARRAY_LIT
+        pv_list(sm, e.args)
+    else if k == EXPR_METHOD
+        pv_expr(sm, e.left, 1)
+        pv_list(sm, e.args)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            pv_expr(sm, fi.value, 1)
+            fi = fi.next
+
+# The roots of statement `st`, each with whether `st` consumes its value.
+# Only the fields each kind sets are read (parser_alloc does not zero).
+pub fn pass_value_check(sm: *Sema, st: *Stmt)
+    let k: i32 = st.kind
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        pv_expr(sm, st.var_init, 1)
+    else if k == STMT_FOR
+        pv_expr(sm, st.for_start, 1)
+        pv_expr(sm, st.for_end, 1)
+    else if k == STMT_IF or k == STMT_ASSERT
+        pv_expr(sm, st.if_cond, 1)
+    else if k == STMT_WHILE
+        pv_expr(sm, st.while_cond, 1)
+    else if k == STMT_MATCH
+        pv_expr(sm, st.if_cond, 1)
+        pv_arms(sm, st.if_then as *MatchArm, 0)
+    else if k == STMT_RETURN
+        let wanted: i32 = (sm.cur_fn != null and sm.cur_fn.return_type != TYPE_VOID) as i32
+        pv_expr(sm, st.return_value, wanted)
+    else if k == STMT_EXPR
+        pv_expr(sm, st.expr, 0)
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        if k == STMT_ASSIGN and st.assign_target_len == 0
+            pv_expr(sm, st.if_cond, 0)
+        else if k == STMT_INDEX_ASSIGN
+            pv_expr(sm, st.while_cond, 1)
+        pv_expr(sm, st.assign_value, 1)

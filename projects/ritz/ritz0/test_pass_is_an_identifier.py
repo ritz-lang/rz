@@ -14,8 +14,8 @@ identifiers, but ritz1's lexer made `pass` a PASS token, so no name position
 
 THE FIX
 
-ritz1 lexes `pass` as an IDENT.  A bare `pass` is the no-op (integer 0, and a
-valueless match arm) as before, unless a call, member or index follows it
+ritz1 lexes `pass` as an IDENT.  A bare `pass` is the no-op (a statement, and
+a valueless match arm) as before, unless a call, member or index follows it
 (`pass(2)`, `s.pass`), or the enclosing fn binds `pass` as a param or local,
 when it reads that binding: ritz0's order (locals and params first, then the
 no-op).
@@ -101,9 +101,10 @@ pub fn main() -> i32
         return 2
     return 0
 """,
-    # `pass` is still the no-op: a statement, an `if` branch, a valueless
-    # match arm, and an expression evaluating to 0, including in a fn after
-    # one that bound `pass` (the binding does not leak).
+    # `pass` is still the no-op: a statement, an `if` branch and a valueless
+    # match arm, including in a fn after one that bound `pass` (the binding
+    # does not leak).  It has no value: `let z: i32 = pass` is refused
+    # (AGAST #3759, test_match_pass_arm_value.py).
     "still_the_noop": """\
 fn binds(pass: i32) -> i32
     return pass
@@ -119,10 +120,6 @@ fn arms(n: i32) -> i32
         r += 1
     return r
 
-fn zero() -> i32
-    let z: i32 = pass
-    return z
-
 pub fn main() -> i32
     pass
     if binds(3) != 3
@@ -131,8 +128,6 @@ pub fn main() -> i32
         return 2
     if arms(1) != 10
         return 3
-    if zero() != 0
-        return 4
     return 0
 """,
 }

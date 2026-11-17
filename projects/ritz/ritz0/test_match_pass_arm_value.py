@@ -1,39 +1,41 @@
-"""AGAST #3740: a `pass` arm gives a typed struct / enum `let` / `var` no value.
+"""AGAST #3740, #3759: `pass` has no value, so it can't be used as one.
 
-LANGUAGE_SPEC §8: `pass` is the body of an arm that does nothing, so it has no
-value.  `var c: Big = match t` with `A => *p` and `B => pass` has nothing to
-put in `c` when `t` is `B`.  ritz0 refused it, at the declaration:
+LANGUAGE_SPEC §2.4, §6.1, §8.2 (ruled 2026-11-17): `pass` is a no-op
+statement with no value.  Wherever a value is wanted (an `if` / `match` arm
+whose merge is used, a `let` / `var` initialiser, a `return`, an assignment's
+right side, an argument, an operand) it is a located error, at the `pass`, on
+all three compilers.  If you mean 0, write 0.
 
-    `c` is declared `Big` but its initialiser has no single value type: its
-    match / if arms yield values that cannot be merged at that type
+Before: a scalar slot took the `pass` arm as a silent 0 on all three
+compilers; a struct `if` was invalid IR on ritz0 (`phi %Big [..], [0, ..]`)
+and a zero-fill on ritz1; ritz0 misnamed a pointer or `Option` slot, or
+crashed unlocated (#3758).  #3740 refused a struct / enum `match` at the `let`
+with a "no single value type" message; this rule now reports it at the `pass`.
 
-ritz1 and ritz1_selfhosted compiled it (rc 0), the `pass` arm's incoming a
-`zeroinitializer` of %Big: a silent all-zero `c`.  Now all three refuse it,
-in ritz0's words, at the `let` / `var` (ritz1 puts `error: ` before the
-message, as diag.ritz does), and write no IR.
+`pass` as a statement, or as an arm of an `if` / `match` used as a statement,
+is unchanged, as is the tail of a `-> T` fn (#1429's "can reach its end
+without producing a value", pinned by test_fn_tail_requires_value.py).
 
-Pinned here: a named struct (any size: #3696 sends a large one through a result
-slot, a small one through a phi), a generic's instance, a user enum, `let` and
-`var`, the `pass` arm first, last, or as a block.  ritz0 refuses a pointer, `Option`, untyped,
-`return`ed or assigned one too, but misnames the type or crashes unlocated
-(AGAST #3758). The `if` form and a scalar slot's `pass` arm, a silent 0, wait
-on a decision (#3759).
+ritz1 puts `error: ` before the message, as diag.ritz does.  The forms are
+one table per compiler (test_row_table.py, docs/TESTING.md): 66 cases
+were over the suite's test budget.
 """
 
-import os
-import re
-import subprocess
-from pathlib import Path
-
 import pytest
-from ritz0_inproc import run_ritz0
 
-RITZ_ROOT = Path(__file__).resolve().parent.parent
-RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
+from test_ref_into_value import COMPILERS, _compile
+from test_row_table import assert_refusals, assert_runs
 
+MESSAGE = (
+    "`pass` has no value, so it can't be used where a value is wanted; "
+    "write the value (`0` if you mean 0)"
+)
+
+# `PASS` marks the offending `pass`: the error is located there.
 BIG = "struct Big\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n\n"
 SMALL = "struct Big\n    a: i64\n    b: i64\n\n"
 ENUM_T = "enum T\n    A\n    B\n\n"
+BIG_INIT = "a: 1, b: 2, c: 3, d: 4"
 
 
 def _struct_form(struct, decl, arm_a, arm_b, init):
@@ -49,115 +51,121 @@ def _struct_form(struct, decl, arm_a, arm_b, init):
     )
 
 
-BIG_INIT = "a: 1, b: 2, c: 3, d: 4"
-# The `var` / `let` sits on line 12 (10 for the small struct), column 5.
-# name -> (source, line, col, declared type)
+def _scalar_fn(body, ret="i64", tail="    return 0\n"):
+    """`f(n: i64)` whose body is `body`; main calls it."""
+    return (
+        "fn g(x: i64) -> i64\n    x\n\n"
+        f"fn f(n: i64, p: *i64) -> {ret}\n{body}{tail}\n"
+        "fn main() -> i32\n"
+        "    var v: i64 = 7\n"
+        "    return f(1, @v) as i32\n"
+    )
+
+
 FORMS = {
-    # The ticket's repro: a large struct, `pass` last.
-    "var_large": (_struct_form(BIG, "var", "*p", "pass", BIG_INIT), 12, 5, "Big"),
-    "let_large": (_struct_form(BIG, "let", "*p", "pass", BIG_INIT), 12, 5, "Big"),
-    "pass_first": (_struct_form(BIG, "var", "pass", "*p", BIG_INIT), 12, 5, "Big"),
-    "pass_block": (
-        _struct_form(BIG, "var", "*p", "\n            pass", BIG_INIT),
-        12,
-        5,
-        "Big",
-    ),
+    # #3740: a struct / enum annotation, `match` form.
+    "match_struct_large": _struct_form(BIG, "var", "*p", "PASS", BIG_INIT),
+    "match_struct_let": _struct_form(BIG, "let", "*p", "PASS", BIG_INIT),
+    "match_pass_first": _struct_form(BIG, "var", "PASS", "*p", BIG_INIT),
+    "match_pass_block": _struct_form(BIG, "var", "*p", "\n            PASS", BIG_INIT),
     # Two words: merged through a phi, not #3696's result slot.
-    "var_small": (_struct_form(SMALL, "var", "*p", "pass", "a: 1, b: 2"), 10, 5, "Big"),
-    "var_enum": (
-        (
-            f"{ENUM_T}fn f(t: T) -> i64\n"
-            "    var c: T = match t\n"
-            "        T.A => T.B\n"
-            "        T.B => pass\n"
-            "    return 0\n\n"
-            "fn main() -> i32\n"
-            "    return f(T.A) as i32\n"
-        ),
-        6,
-        5,
-        "T",
+    "match_struct_small": _struct_form(SMALL, "var", "*p", "PASS", "a: 1, b: 2"),
+    "match_enum": (
+        f"{ENUM_T}fn f(t: T) -> i64\n"
+        "    var c: T = match t\n"
+        "        T.A => T.B\n"
+        "        T.B => PASS\n"
+        "    return 0\n\n"
+        "fn main() -> i32\n"
+        "    return f(T.A) as i32\n"
     ),
-    # A generic's instance is named as both compilers mangle it.
-    "var_generic": (
-        (
-            "struct Box<T>\n    v: T\n\n"
-            "fn f(n: i64) -> i64\n"
-            "    var c: Box<i64> = match n\n"
-            "        0 => Box<i64> { v: 3 }\n"
-            "        _ => pass\n"
-            "    return c.v\n\n"
-            "fn main() -> i32\n"
-            "    return f(0) as i32\n"
-        ),
-        5,
-        5,
-        "Box$i64",
+    "match_generic": (
+        "struct Box<T>\n    v: T\n\n"
+        "fn f(n: i64) -> i64\n"
+        "    var c: Box<i64> = match n\n"
+        "        0 => Box<i64> { v: 3 }\n"
+        "        _ => PASS\n"
+        "    return c.v\n\n"
+        "fn main() -> i32\n"
+        "    return f(0) as i32\n"
+    ),
+    # #3759: the scalar slot (a silent 0), the `if` form, the struct `if`
+    # (invalid IR on ritz0), pointer and Option slots (#3758).
+    "match_scalar": _scalar_fn(
+        "    var c: i64 = match n\n        0 => 5\n        _ => PASS\n",
+        tail="    return c\n",
+    ),
+    "if_scalar": _scalar_fn(
+        "    var c: i64 = if n > 0 then 5 else PASS\n", tail="    return c\n"
+    ),
+    "if_scalar_first": _scalar_fn(
+        "    let c: i64 = if n > 0 then PASS else 5\n", tail="    return c\n"
+    ),
+    "if_struct": (
+        f"{BIG}fn f(n: i64, p: *Big) -> i64\n"
+        "    var c: Big = if n > 0 then *p else PASS\n"
+        "    return c.a\n\n"
+        "fn main() -> i32\n"
+        f"    var b = Big {{ {BIG_INIT} }}\n"
+        "    return f(1, @b) as i32\n"
+    ),
+    "if_pointer": _scalar_fn(
+        "    var c: *i64 = if n > 0 then p else PASS\n", tail="    return *c\n"
+    ),
+    "match_option": _scalar_fn(
+        "    var c: Option<i64> = match n\n        0 => Some(5)\n        _ => PASS\n"
+    ),
+    "untyped_let": _scalar_fn(
+        "    let c = if n > 0 then 5 else PASS\n", tail="    return c\n"
+    ),
+    "bare_let": _scalar_fn("    let c: i64 = PASS\n", tail="    return c\n"),
+    "returned": _scalar_fn("    return if n > 0 then 5 else PASS\n", tail=""),
+    "assigned": _scalar_fn(
+        "    var c: i64 = 1\n    c = match n\n        0 => 5\n        _ => PASS\n",
+        tail="    return c\n",
+    ),
+    "argument": _scalar_fn(
+        "    let c: i64 = g(if n > 0 then 5 else PASS)\n", tail="    return c\n"
     ),
 }
 
 
-def _message(declared):
-    return (
-        f"`c` is declared `{declared}` but its initialiser has no single value "
-        "type: its match / if arms yield values that cannot be merged at that type"
+def _marked(source):
+    """`source` with its `PASS` spelled `^pass`: the error is reported there."""
+    assert source.count("PASS") == 1, source
+    return source.replace("PASS", "^pass")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_pass_used_as_value_is_refused(compiler, tmp_path):
+    assert_refusals(
+        compiler,
+        tmp_path,
+        {name: (_marked(src), MESSAGE) for name, src in FORMS.items()},
     )
 
 
-def _compile(compiler, tmp_path, source):
-    src = tmp_path / "bad.ritz"
-    src.write_text(source)
-    ll = tmp_path / "bad.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    if compiler == "ritz0":
-        return run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
-    binary = RITZ1_BUILD / compiler
-    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-    return subprocess.run(
-        [str(binary), str(src), "-o", str(ll)],
-        cwd=tmp_path,
-        env=env,
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-
-
-def _assert_refused(compiler, tmp_path, name):
-    source, line, col, declared = FORMS[name]
-    message = _message(declared)
-    proc = _compile(compiler, tmp_path, source)
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", ["match_struct_large", "if_struct"])
+def test_pass_is_reported_once_and_no_ir_is_written(compiler, tmp_path, name):
+    """Compiled alone (a batch can't show it): one error, at the `pass`, not a
+    second at the `let` (#3740's "no single value type"), and no IR."""
+    marked = _marked(FORMS[name])
+    where = f"{marked[: marked.index('^')].count(chr(10)) + 1}:"
+    proc, ll, _ = _compile(compiler, tmp_path, name, marked.replace("^", ""))
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out
-    hits = re.findall(
-        rf"bad\.ritz:{line}:{col}: (?:error: )?{re.escape(message)}$", out, re.MULTILINE
-    )
-    assert len(hits) == 1, out
-    assert out.count("no single value type") == 1, out
-    assert not (tmp_path / "bad.ll").exists(), f"{compiler} wrote IR for {name}"
+    assert out.count("`pass` has no value") == 1, out
+    assert f"main.ritz:{where}" in out, out
+    assert "no single value type" not in out, out
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", FORMS)
-def test_ritz0_refuses_pass_arm_value(tmp_path, name):
-    _assert_refused("ritz0", tmp_path, name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-@pytest.mark.parametrize("name", FORMS)
-def test_ritz1_refuses_pass_arm_value(request, tmp_path, compiler, name):
-    request.getfixturevalue("ritz1_bin")
-    _assert_refused(compiler, tmp_path, name)
-
-
-# The same match as a statement, or with every arm a value, still compiles
-# on all three: the refusal is the `pass` arm's missing value, nothing else.
-ACCEPTED = {
-    "statement": (
+# `pass` where no value is wanted still compiles, and runs, on all three.
+ACCEPTED = {  # name: (program, exit code)
+    "match_statement": (
         f"{BIG}{ENUM_T}fn f(t: T, p: *Big) -> i64\n"
         "    var c: Big = *p\n"
         "    match t\n"
@@ -166,18 +174,32 @@ ACCEPTED = {
         "    return c.a\n\n"
         "fn main() -> i32\n"
         f"    var b = Big {{ {BIG_INIT} }}\n"
-        "    return f(T.A, @b) as i32\n"
+        "    return f(T.A, @b) as i32\n",
+        1,
     ),
-    "all_values": _struct_form(BIG, "var", "*p", "*p", BIG_INIT),
+    "all_values": (_struct_form(BIG, "var", "*p", "*p", BIG_INIT), 1),
+    "if_statement": (
+        _scalar_fn(
+            "    var c: i64 = 1\n    if n > 0\n        c = 2\n    else\n        pass\n    pass\n",
+            tail="    return c\n",
+        ),
+        2,
+    ),
+    # A procedure's tail runs for effect: its `pass` arm wants no value.
+    "procedure_tail": (
+        "fn f(n: i64)\n"
+        "    match n\n"
+        "        0 => pass\n"
+        "        _ => pass\n\n"
+        "fn main() -> i32\n"
+        "    f(1)\n"
+        "    return 0\n",
+        0,
+    ),
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
-@pytest.mark.parametrize("name", ACCEPTED)
-def test_value_arms_still_compile(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    proc = _compile(compiler, tmp_path, ACCEPTED[name])
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-    assert (tmp_path / "bad.ll").exists()
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_pass_as_statement_still_runs(compiler, tmp_path):
+    assert_runs(compiler, tmp_path, ACCEPTED)

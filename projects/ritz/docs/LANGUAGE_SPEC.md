@@ -204,7 +204,7 @@ type      unsafe    var       while
 
 `self` and `pass` are **not** keywords — they are ordinary identifiers with
 special meaning by convention (`self` as a method receiver name, `pass` as a
-no-op expression that evaluates to `0`). `mut` is reserved but only valid in
+no-op statement with no value: see [§6.1](#61-ifelse)). `mut` is reserved but only valid in
 `*mut T`; `let mut` was removed by RERITZ (see [§4.2](#42-mutable-bindings-var)).
 
 `asm` starts an inline assembly block ([§18.6](#186-inline-assembly)), so it
@@ -1774,6 +1774,26 @@ if c
     r = 1
 ```
 
+`pass` has no value either. It is a statement that does nothing, so it can
+stand as a statement or as an arm of an `if` or `match` used as a statement,
+but not where a value is wanted: an arm of an `if` or `match` whose value is
+used, a `let` or `var` initialiser, an assignment, a `return` from a function
+that declares a value, an argument or an operand. All three compilers report
+it at the `pass` (AGAST #3759; before it, `pass` there was a silent `0`, and
+an all-zero struct). If you mean `0`, write `0`:
+
+```ritz body expect-error="`pass` has no value, so it can't be used where a value is wanted"
+let n = 3
+let c: i64 = if n > 0 then 5 else pass
+```
+
+```ritz body
+let n = 3
+let c: i64 = if n > 0 then 5 else 0
+if n > 0
+    pass
+```
+
 The arms of an `if`/`else` or `match` whose value is used must agree on
 integer versus float. With no float annotation to give the merge its type, an
 arm that yields an integer next to one that yields a float is an error, in
@@ -3290,6 +3310,16 @@ that should do nothing:
 ```ritz body
 match 3
     0 => pass
+    _ => pass
+```
+
+A `pass` arm has no value, so it can't be an arm of a `match` whose value is
+used (§6.1). Write the value the arm should give:
+
+```ritz body expect-error="`pass` has no value, so it can't be used where a value is wanted"
+let n = 3
+let c: i64 = match n
+    0 => 5
     _ => pass
 ```
 
