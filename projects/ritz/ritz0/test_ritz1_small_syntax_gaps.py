@@ -306,6 +306,15 @@ struct H
 struct O
     h: H
 
+struct P
+    p: *Vec<i64>
+
+struct Q
+    h: P
+
+struct R
+    r: @Vec<i64>
+
 fn make() -> Vec<i64>
     var v: Vec<i64> = vec_new<i64>()
     for i in 0..6
@@ -406,6 +415,60 @@ fn main() -> i32
     return (s.len() * 10 + h.v.len()) as i32
 """,
         76,
+    ),
+    # AGAST #3823: a field holding a POINTER or reference to the collection
+    # slices through it, as a pointer local does (R9 rule 2).  ritz0 passed
+    # the field's address (a `Vec$i64**`) and llvmlite threw; ritz1 refused
+    # it.  The field is `make()`'s [0, 10, 20, 30, 40, 50].  [20, 30]:
+    # 2 * 100 + 30.
+    "ptr_member_range_chain": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var v: Vec<i64> = make()
+    var h: P = P { p: @v }
+    return (h.p[2..4].len() * 100 + h.p[2..4][1]) as i32
+""",
+        230,
+    ),
+    # Open-ended colon slice through a `@Vec` field: its length bounds it,
+    # read through the reference.  [20, 30, 40, 50]: 4 * 10 + 20.
+    "ref_member_colon_open_end": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var v: Vec<i64> = make()
+    var r: R = R { r: @v }
+    var s: Vec<i64> = r.r[2:]
+    return (s.len() * 10 + s[0]) as i32
+""",
+        60,
+    ),
+    # The full colon slice through a pointer field is a copy: a push leaves
+    # the pointee alone.  7 * 10 + 6.
+    "ptr_member_colon_full": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var v: Vec<i64> = make()
+    var h: P = P { p: @v }
+    var s: Vec<i64> = h.p[:]
+    s.push(99)
+    return (s.len() * 10 + h.p.len()) as i32
+""",
+        76,
+    ),
+    # Two members deep, then through the pointer: [10, 20, 30], 3 * 10 + 30.
+    "nested_ptr_member_range": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var v: Vec<i64> = make()
+    var q: Q = Q { h: P { p: @v } }
+    var s: Vec<i64> = q.h.p[1..=3]
+    return (s.len() * 10 + s[2]) as i32
+""",
+        60,
     ),
 }
 
@@ -514,52 +577,6 @@ def test_member_slice(request, tmp_path, compiler, name):
     program, want = MEMBER_SLICE[name]
     code = _run_pkg(compiler, tmp_path, name, program)
     assert code == want, f"{compiler} {name}: exit {code}, want {want}"
-
-
-# A field holding a POINTER to a Vec is left alone by #3803's rewrite: ritz1
-# refuses it, located.  ritz0 crashes on it (an llvmlite arg-type error), so
-# there's no oracle yet.  Both should slice through it as they do for a pointer
-# local (R9 rule 2); when they do, this becomes a MEMBER_SLICE row.
-POINTER_FIELD_SLICE = """\
-import ritzlib.memory
-import ritzlib.gvec
-
-struct P
-    p: *Vec<i64>
-
-fn main() -> i32
-    var v: Vec<i64> = vec_new<i64>()
-    v.push(1)
-    var h: P = P { p: @v }
-    var s: Vec<i64> = h.p[0..1]
-    return s.len() as i32
-"""
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_pointer_field_range_refused(ritz1_bin, tmp_path, compiler):
-    src = tmp_path / "main.ritz"
-    src.write_text(POINTER_FIELD_SLICE)
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    comp = subprocess.run(
-        [
-            str(RITZ1_BIN.parent / compiler),
-            str(src),
-            "-o",
-            str(tmp_path / "main.ll"),
-            "-I",
-            str(RITZ_ROOT),
-        ],
-        cwd=tmp_path,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} accepted it:\n{out}"
-    assert "main.ritz:11:23: a pointer can't be sliced" in out, out
 
 
 @pytest.mark.integration

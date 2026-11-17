@@ -616,7 +616,14 @@ class TypeChecker:
                 self._check_integer_type(self._infer_type(expr.start), expr.start.span)
             if expr.end:
                 self._check_integer_type(self._infer_type(expr.end), expr.end.span)
-            # Slice returns same type (for now - could return Span<T> later)
+            # A slice of a Vec, Span or String is one of the same.  Through a
+            # pointer or reference, it slices what that points at (R9 rule 2,
+            # AGAST #3823): `h.p[2:]` with `p: *Vec<T>` is a Vec<T>.
+            if isinstance(base_type, (rast.PtrType, rast.RefType)):
+                inner = self._resolve_alias(base_type.inner)
+                if (isinstance(inner, rast.NamedType)
+                        and inner.name.split('$', 1)[0] in ('Vec', 'Span', 'String')):
+                    return inner
             return base_type
 
         elif isinstance(expr, rast.Range):

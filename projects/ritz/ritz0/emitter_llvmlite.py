@@ -9793,13 +9793,14 @@ class LLVMEmitter:
         raise EmitError(array_rules.NOT_A_POINTER, deref.span)
 
     def _slice_base(self, base: rast.Expr) -> rast.Expr:
-        """What `base[lo..hi]` slices: `*p` when `base` is a name `p` that sees
-        through, a `*T`, `@T` or `@&T` with T a Vec, Span or String (AGAST #2448,
-        LARB R9 rule 2), so `p[lo..hi]` is `(*p)[lo..hi]`.  The slice paths take
-        the struct's address from `_emit_lvalue_addr`, which for the name is the
-        pointer's own slot.  Anything else is sliced as it stands.
+        """What `base[lo..hi]` slices: `*p` when `base` sees through, a `*T`,
+        `@T` or `@&T` with T a Vec, Span or String (AGAST #2448, LARB R9 rule
+        2), so `p[lo..hi]` is `(*p)[lo..hi]`.  The slice paths take the
+        struct's address from `_emit_lvalue_addr`, which for a name `p` or a
+        field `h.p` (AGAST #3823) is the pointer's own slot, a `Vec**`.
+        Anything else is sliced as it stands.
         """
-        if not isinstance(base, rast.Ident):
+        if isinstance(base, rast.UnaryOp) and base.op == '*':
             return base
         ty = self._infer_ritz_type(base)
         if ty is not None:
@@ -9860,7 +9861,7 @@ class LLVMEmitter:
                 )
             return self._emit_slice(rast.SliceExpr(
                 span=expr.span,
-                expr=self._slice_base(expr.expr),
+                expr=expr.expr,
                 start=expr.index.start,
                 end=slice_end,
             ))
@@ -10131,7 +10132,11 @@ class LLVMEmitter:
         - [:end] → slice(0, end)
         - [start:] → slice(start, len)
         - [:] → clone()
+
+        Through a pointer or reference, a name's or a field's, both forms
+        slice what it points at (_slice_base).
         """
+        expr = rast.SliceExpr(expr.span, self._slice_base(expr.expr), expr.start, expr.end)
         # Determine the type of the base expression
         if isinstance(expr.expr, rast.Ident):
             name = expr.expr.name
