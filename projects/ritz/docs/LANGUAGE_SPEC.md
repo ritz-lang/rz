@@ -3356,6 +3356,10 @@ even one with a single field: `f(1)` for `fn f(s: S)` with `struct S { x: i32 }`
 is "argument 1 of `f` has the wrong type", and you write `f(S { x: 1 })` (LARB
 R47, AGAST #3336; ritz0 wraps the integer today).
 
+A field the literal leaves out is zero, and so is every element and field
+inside it: `S { count: 3 }` for `struct S { a: [64]i64, count: i32 }` has
+every `a[i] == 0` (AGAST #1749).
+
 A generic struct's literal may leave out its type arguments, as a bare enum
 constructor does (§11.3). They come from the slot the literal fills: a typed
 `let` or `var`, a parameter, a field, the fn's return type. With no slot (an

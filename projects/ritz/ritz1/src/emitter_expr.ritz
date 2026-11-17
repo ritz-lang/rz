@@ -2939,7 +2939,55 @@ pub fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) ->
         if field_idx >= 0
             emit_struct_lit_field_store(s, st, field_idx, fi.value, alloca_reg)
         fi = fi.next
+    emit_struct_lit_zero_omitted(s, st, e, alloca_reg)
     alloca_reg
+
+# 1 if struct literal `e` gives a field named `f`.
+fn struct_lit_gives(e: *Expr, f: *StructField) -> i32
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        if fi.name_len == f.name_len and memcmp(fi.name, f.name, f.name_len as i64) == 0
+            return 1
+        fi = fi.next
+    0
+
+# Zero every field of `st` that struct literal `e` leaves out, in the struct
+# at `base_reg` (LANGUAGE_SPEC §9.2, AGAST #1749).  Called after the given
+# fields are stored, so a given field is never overwritten.  A scalar is a
+# `store zeroinitializer`; an array or struct goes through @__ritz_sret_zero,
+# never llvm.memset (AGAST #3218: codegen turns a large one into a libc call,
+# and ritz links -nostdlib).  Both literal lowerings call it: emit_var_decl's
+# `let` / `var` loop and emit_struct_lit_to_alloca.
+pub fn emit_struct_lit_zero_omitted(s: *EmitterState, st: *StructDef, e: *Expr, base_reg: i32)
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if struct_lit_gives(e, f) == 0
+            let fp: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, fp)
+            emit_str(s, c" = getelementptr %")
+            emit_name(s, st.name, st.name_len)
+            emit_str(s, c", ptr ")
+            emit_reg(s, base_reg)
+            emit_str(s, c", i32 0, i32 ")
+            emit_int(s, idx as i64)
+            emit_str(s, c"  ; omitted field: zero\n")
+            if f.field_type == TYPE_ARRAY or f.field_type == TYPE_STRUCT
+                emit_str(s, c"  call void @__ritz_sret_zero(ptr ")
+                emit_reg(s, fp)
+                emit_str(s, c", i64 ptrtoint (ptr getelementptr (")
+                emit_field_llvm_type(s, f)
+                emit_str(s, c", ptr null, i32 1) to i64))\n")
+                s.sret_helpers_used = 1
+            else
+                emit_str(s, c"  store ")
+                emit_field_llvm_type(s, f)
+                emit_str(s, c" zeroinitializer, ptr ")
+                emit_reg(s, fp)
+                emit_str(s, c"\n")
+        idx = idx + 1
+        f = f.next
 
 # Lower a struct literal to a value: `alloca %T`, fill it field by field via
 # emit_struct_lit_to_alloca, then `load %T`. Returns the aggregate register.
