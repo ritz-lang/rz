@@ -180,13 +180,18 @@ def check(compiler, rows, *, build, compile, work: Path) -> list:
     `build` and `compile` are batching.run_rows's: `build(compiler, src, work) ->
     (ok, output, exe)` compiles and links, `compile(compiler, src, work) ->
     (rc, output)` only compiles, its module in `work/main.ll`.
+
+    Under RITZ_TEST_BATCH=0 (batching.enabled() false) nothing is batched: the
+    batch answers None for every row, so each is compiled alone (AGAST #3901).
     """
     failures = []
     runs = [r for r in rows if isinstance(r.spec, Run)]
     refusals = [r for r in rows if isinstance(r.spec, Refused)]
+    batch = batching.enabled()
     if runs:
-        got = batching.run_rows(compiler, [r.spec.program for r in runs], build, work / "run",
-                                compile=compile)
+        got = (batching.run_rows(compiler, [r.spec.program for r in runs], build, work / "run",
+                                 compile=compile)
+               if batch else [None] * len(runs))
         for row, code in zip(runs, got):
             if code != row.spec.want:
                 why = _run_alone(compiler, row, build, work)
@@ -195,7 +200,8 @@ def check(compiler, rows, *, build, compile, work: Path) -> list:
     if refusals:
         programs = [batching._insert_mark(r.spec.program, r.spec.at) if r.spec.at else r.spec.program
                     for r in refusals]
-        got = batching.refuse_rows(compiler, programs, compile, work / "refuse")
+        got = (batching.refuse_rows(compiler, programs, compile, work / "refuse")
+               if batch else [None] * len(refusals))
         for row, answer in zip(refusals, got):
             if (answer is not None and (row.spec.at is None or answer[1] is not None)
                     and _refusal_wrong(row.spec, answer[0], answer[1]) is None):
@@ -276,3 +282,57 @@ def test_a_refusal_row_with_several_messages_wants_every_one(ritz1_bin, tmp_path
     failures = _check(ritz1_bin, tmp_path, rows)
     assert [f.split(":")[0] for f in failures] == ["ritz1 one_missing"], failures
     assert "no such message" in failures[0] and "cannot use bool'" not in failures[0]
+
+
+# ---- RITZ_TEST_BATCH=0: every row is compiled alone (AGAST #3901) ----------
+#
+# docs/TESTING.md promises RITZ_TEST_BATCH=0 turns batching off, so that "every
+# row passes compiled alone" can be checked.  check() calls batching.run_rows /
+# refuse_rows itself, so it has to ask batching.enabled() too.  These stub the
+# compiler: what's under test is which path a row takes, not ritz1.
+
+def _stub_check(monkeypatch, tmp_path, rows, batch):
+    """check() on stubs; returns (failures, programs compiled alone, batch calls)."""
+    monkeypatch.setenv("RITZ_TEST_BATCH", batch)
+    batched = []
+    monkeypatch.setattr(batching, "run_rows",
+                        lambda c, programs, *a, **k: batched.append("run") or [7] * len(programs))
+    monkeypatch.setattr(batching, "refuse_rows",
+                        lambda c, programs, *a, **k: batched.append("refuse")
+                        or [("main.ritz:1:1: error: nope", "1:1")] * len(programs))
+    alone = []
+
+    def build(compiler, src, work):
+        alone.append(src.read_text())
+        return True, "", Path("/bin/false" if src.read_text() == WRONG else "/bin/true")
+
+    def compile(compiler, src, work):
+        alone.append(src.read_text())
+        return 1, "main.ritz:1:1: error: nope"
+
+    failures = check("ritz1", rows, build=build, compile=compile, work=tmp_path)
+    return failures, alone, batched
+
+
+_STUB_ROWS = [Row("runs", ALL, Run(GOOD, 0)),
+              Row("wrong", ALL, Run(WRONG, 0)),
+              Row("refused", ALL, Refused(BAD, "nope"))]
+
+
+@pytest.mark.integration    # runs /bin/true and /bin/false
+def test_with_batching_off_every_row_is_compiled_alone(monkeypatch, tmp_path):
+    failures, alone, batched = _stub_check(monkeypatch, tmp_path, _STUB_ROWS, "0")
+    assert batched == [], "RITZ_TEST_BATCH=0 must not batch a row"
+    assert alone == [GOOD, WRONG, BAD]
+    # A row compiled alone is still asserted, by name: /bin/false exits 1.
+    assert failures == ["ritz1 wrong: want exit 0, got 1"], failures
+
+
+@pytest.mark.unit
+def test_with_batching_on_a_row_the_batch_passes_is_not_compiled_again(monkeypatch, tmp_path):
+    # The batch's stub answers exit 7 and the refusal every row wants: a Run
+    # wanting 7 is the batch's, the refusal is the batch's, nothing goes alone.
+    rows = [Row("runs", ALL, Run(GOOD, 7)), Row("refused", ALL, Refused(BAD, "nope"))]
+    failures, alone, batched = _stub_check(monkeypatch, tmp_path, rows, "1")
+    assert batched == ["run", "refuse"]
+    assert alone == [] and failures == []
