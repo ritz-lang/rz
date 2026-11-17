@@ -231,9 +231,9 @@ fn test_basic_invocation() -> i32
     var n: i64 = 0
     let exit_code: i32 = util_exec(@argv[0], c"input data", 10, @out[0], @n)
 
-    assert exit_code == 0, c"binary should exit 0"
-    assert n == 12, c"expected 12 bytes back"
-    assert buf_eq(@out[0], c"expected out", 12) == 1, c"output mismatch"
+    assert exit_code == 0, "binary should exit 0"
+    assert n == 12, "expected 12 bytes back"
+    assert buf_eq(@out[0], c"expected out", 12) == 1, "output mismatch"
     0
 ```
 

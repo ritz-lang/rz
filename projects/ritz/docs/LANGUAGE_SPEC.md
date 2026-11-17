@@ -6204,6 +6204,17 @@ fn main() -> i32
     return 0
 ```
 
+The message is a `"..."` literal: a `StrView`, like every Ritz string. A
+`c"..."` message is C in Ritz clothing, and every compiler refuses it with a
+located error at the literal:
+
+```ritz expect-error='an assert message is a "..." literal: drop the `c`'
+[[test]]
+fn test_it() -> i32
+    assert 1 == 1, c"one is one"
+    0
+```
+
 **What a failing assert prints.** It writes one diagnostic to stderr and exits
 with status 1:
 

@@ -95,3 +95,52 @@ def test_assert_in_test_helper_compiles(request, tmp_path, compiler):
     ir_text = _ir(compiler, tmp_path, HELPER_OK)
     # Helpers read the call site the [[test]] fn records.
     assert "__ritz_assert_site_line" in ir_text
+
+
+# --- the message is a "..." literal (AGAST #3794) ---------------------------
+#
+# LANGUAGE_SPEC: `assert cond, "message"`.  The message is a StrView literal;
+# a `c"..."` message is C in Ritz clothing (AGENT.md, No Concessions), so all
+# three compilers refuse it at the literal in one wording.  ritz1 must give
+# the located error, not a parse error that refuses the whole file.
+# tools/test_assert_message_literal.py keeps the tree free of the form.
+
+ALL_THREE = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+MSG_RULE = 'an assert message is a "..." literal: drop the `c`'
+
+CSTRING_MSG = """\
+[[test]]
+fn test_it() -> i32
+    let n: i64 = 3
+    assert n == 3, c"cstr-msg-3794"
+    0
+
+fn main() -> i32
+    0
+"""
+
+STRING_MSG = """\
+[[test]]
+fn test_it() -> i32
+    let n: i64 = 3
+    assert n == 3, "str-msg-3794"
+    assert n > 0
+    0
+
+fn main() -> i32
+    0
+"""
+
+
+@pytest.mark.parametrize("compiler", ALL_THREE)
+def test_cstring_assert_message_is_a_located_error(request, tmp_path, compiler):
+    _need(compiler, request)
+    # Located at the `c` of the literal, line 4 col 20.
+    _assert_located_error(compiler, tmp_path, CSTRING_MSG, 4, 20, MSG_RULE)
+
+
+@pytest.mark.parametrize("compiler", ALL_THREE)
+def test_string_assert_message_compiles(request, tmp_path, compiler):
+    _need(compiler, request)
+    assert "str-msg-3794" in _ir(compiler, tmp_path, STRING_MSG)

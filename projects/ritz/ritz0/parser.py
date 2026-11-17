@@ -62,6 +62,8 @@ def _defer_escape(node, in_loop: bool) -> Optional[str]:
 UNION_TYPE_REFUSED = ("`A | B` isn't a type: declare an enum with a payload "
                       "per kind (LANGUAGE_SPEC §3.8)")
 TYPE_PATTERN_REFUSED = "a type isn't a pattern"
+# AGAST #3794: `assert cond, "message"` takes a StrView literal, never c"...".
+ASSERT_CSTRING_MESSAGE = 'an assert message is a "..." literal: drop the `c`'
 
 
 class ParseError(Exception):
@@ -1742,14 +1744,15 @@ class Parser:
             self._advance()
             condition = self.parse_expr()
             message = None
-            # Optional message: `assert x, "error message"`.  Accept either
-            # bare-string ("...") or c-string (c"...") form — both lex with
-            # the same payload, and the message is just text the emitter
-            # bakes into a global cstr at compile time.  Older code uses
-            # c"..."; idiomatic ritz prefers "..." (StrView).
+            # Optional message: `assert x, "error message"`.  The message is
+            # a "..." (StrView) literal only: a c"..." message is C in Ritz
+            # clothing (AGAST #3794), refused at the literal in the wording
+            # ritz1 uses (ASSERT_CSTRING_MESSAGE).
             if self._at(TokenType.COMMA):
                 self._advance()
-                if self._at(TokenType.STRING) or self._at(TokenType.CSTRING):
+                if self._at(TokenType.CSTRING):
+                    raise ParseError(ASSERT_CSTRING_MESSAGE, self._current().span)
+                if self._at(TokenType.STRING):
                     message = self._advance().value
             return rast.AssertStmt(span, condition, message)
 
