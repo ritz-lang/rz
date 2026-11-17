@@ -27,12 +27,19 @@ compiled in test mode, linked with ritzunit as `main` (LANGUAGE_SPEC.md
 §17.1). ritzunit forks a child per `[[test]]` function, so a SIGSEGV in one
 test does not stop the others. Exit 0 = pass, anything else = fail.
 
-A package that keeps `[[test]]` fns inside its own modules declares the dirs
-in `ritz.toml` as `[test] sources = ["src"]`. Each `.ritz` file under them
-(searched recursively) that has a `[[test]]` line becomes a test file too.
-`ritz0 --test` runs only the file's own `[[test]]` fns, so imports don't
-pull in more. angelo works this way. Before AGAST #3279 nothing read the
-key, and `rz test angelo` printed "No tests found".
+`[[test]]` fns inside a package's own modules run too. Each `.ritz` file
+under `src/` (searched recursively) that has a `[[test]]` line becomes a test
+file; `[test] sources = ["lib", ...]` in `ritz.toml` adds more dirs. `ritz0
+--test` runs only the file's own `[[test]]` fns, so imports don't pull in
+more. angelo and prism work this way. Before AGAST #3279 nothing read src/,
+and `rz test angelo` printed "No tests found"; until #1873 src/ was opt-in,
+so prism's in-source tests ran under no gate. A `[[test]]` fn under src/
+runs, and fails the package if it fails: it is never silently skipped.
+
+A test file imports the module it tests; it does not redeclare the module's
+types or copy its functions. A copy keeps passing while production breaks
+(AGAST #1873 deleted three: prism's damage and core tests, ritzunit's
+inventory).
 
 A `test.sh` that needs scratch files takes them from its own `mktemp -d`
 and removes that dir in its own EXIT trap: `T=$(mktemp -d) || exit 1;

@@ -3,77 +3,100 @@
 # Demonstrates ritzunit testing with a practical example.
 # Manages named items with quantities - perfect for games,
 # warehouses, or any item tracking scenario.
+#
+# Names live in fixed-size buffers (MAX_NAME_LEN, truncated) rather than a
+# nested Vec<u8> per item, so an Item is plain data and inventory_drop only
+# frees the item vector. test/test_inventory.ritz imports this module; it
+# used to carry its own copy of the whole implementation (AGAST #1873).
 
 import ritzlib.gvec
-import ritzlib.str
 import ritzlib.memory
 
 # ============================================================================
 # Item - A named item with a quantity
 # ============================================================================
+# Use fixed-size name buffer to avoid nested Vec complexity.
 
-struct Item
-    name: Vec<u8>      # Item name as byte vector (string)
-    quantity: i32      # Current quantity in inventory
+pub const MAX_NAME_LEN: i64 = 32
+
+pub struct Item
+    name: [32]u8       # Fixed-size name buffer
+    name_len: i64      # Actual name length
+    quantity: i32      # Current quantity
 
 # ============================================================================
 # Inventory - Collection of items
 # ============================================================================
 
-struct Inventory
+pub struct Inventory
     items: Vec<Item>   # Dynamic array of items
 
 # ============================================================================
 # Constructors
 # ============================================================================
 
-# Create a new empty inventory
-fn inventory_new() -> Inventory
+pub fn inventory_new() -> Inventory
     var inv: Inventory
     inv.items = vec_new<Item>()
     return inv
 
-# Free inventory resources
-fn inventory_drop(inv:&Inventory)
-    # Free each item's name
-    var i: i64 = 0
-    while i < inv.items.len
-        let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
-        vec_drop<u8>(@&item.name)
-        i += 1
+pub fn inventory_drop(inv:&Inventory)
     vec_drop<Item>(@&inv.items)
+
+# ============================================================================
+# String helpers
+# ============================================================================
+
+# Copy null-terminated string into fixed buffer, return length
+fn copy_name(dst: *u8, src: *u8) -> i64
+    var i: i64 = 0
+    while *(src + i) != 0 && i < MAX_NAME_LEN - 1
+        *(dst + i) = *(src + i)
+        i += 1
+    *(dst + i) = 0  # Null terminate
+    return i
+
+# Compare item name with null-terminated string
+fn name_eq(item: *Item, name: *u8) -> i32
+    var i: i64 = 0
+    while i < item.name_len
+        if *(name + i) == 0
+            return 0  # name ended early
+        if item.name[i] != *(name + i)
+            return 0  # mismatch
+        i += 1
+    # Check name is also at end
+    if *(name + i) == 0
+        return 1
+    return 0
 
 # ============================================================================
 # Core Operations
 # ============================================================================
 
-# Add quantity to an item (creates item if it doesn't exist)
-fn inventory_add(inv:&Inventory, name: *u8, qty: i32) -> i32
+pub fn inventory_add(inv:&Inventory, name: *u8, qty: i32) -> i32
     # Search for existing item
     var i: i64 = 0
     while i < inv.items.len
         let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
-        if str_eq_ptr(@item.name, name) == 1
+        if name_eq(item, name) == 1
             item.quantity = item.quantity + qty
             return 0
         i += 1
 
     # Not found - create new item
     var new_item: Item
-    new_item.name = vec_new<u8>()
-    vec_push_str(@&new_item.name, name)
+    new_item.name_len = copy_name(@new_item.name[0], name)
     new_item.quantity = qty
 
     vec_push<Item>(@&inv.items, new_item)
     return 0
 
-# Remove quantity from an item
-# Returns 0 on success, -1 if insufficient quantity or not found
-fn inventory_remove(inv:&Inventory, name: *u8, qty: i32) -> i32
+pub fn inventory_remove(inv:&Inventory, name: *u8, qty: i32) -> i32
     var i: i64 = 0
     while i < inv.items.len
         let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
-        if str_eq_ptr(@item.name, name) == 1
+        if name_eq(item, name) == 1
             if item.quantity < qty
                 return -1  # Insufficient quantity
             item.quantity = item.quantity - qty
@@ -81,61 +104,114 @@ fn inventory_remove(inv:&Inventory, name: *u8, qty: i32) -> i32
         i += 1
     return -1  # Not found
 
-# Get quantity of an item (returns 0 if not found)
-fn inventory_count(inv: &Inventory, name: *u8) -> i32
+pub fn inventory_count(inv:&Inventory, name: *u8) -> i32
     var i: i64 = 0
     while i < inv.items.len
-        let item: Item = vec_get<Item>(@inv.items, i)
-        if str_eq_ptr(@item.name, name) == 1
+        let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
+        if name_eq(item, name) == 1
             return item.quantity
         i += 1
     return 0
 
-# Check if item exists with quantity > 0
-fn inventory_has(inv: &Inventory, name: *u8) -> i32
+pub fn inventory_has(inv:&Inventory, name: *u8) -> i32
     if inventory_count(inv, name) > 0
         return 1
     return 0
 
-# Get total number of unique items
-fn inventory_len(inv: &Inventory) -> i64
+pub fn inventory_len(inv:&Inventory) -> i64
     return inv.items.len
 
-# Clear all items from inventory
-fn inventory_clear(inv:&Inventory)
-    # Free each item's name
-    var i: i64 = 0
-    while i < inv.items.len
-        let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
-        vec_drop<u8>(@&item.name)
-        i += 1
+pub fn inventory_clear(inv:&Inventory)
     vec_clear<Item>(@&inv.items)
 
-# ============================================================================
-# Utility Functions
-# ============================================================================
-
-# Compare Vec<u8> string to null-terminated string
-fn str_eq_ptr(v: @Vec<u8>, s: *u8) -> i32
-    var i: i64 = 0
-    while i < v.len
-        let c: u8 = *(s + i)
-        if c == 0
-            return 0  # s ended early
-        if vec_get<u8>(v, i) != c
-            return 0  # mismatch
-        i += 1
-    # Check s is also at end
-    if *(s + i) == 0
-        return 1
-    return 0
-
-# Get total quantity across all items
-fn inventory_total_quantity(inv: &Inventory) -> i32
+pub fn inventory_total_quantity(inv:&Inventory) -> i32
     var total: i32 = 0
     var i: i64 = 0
     while i < inv.items.len
-        let item: Item = vec_get<Item>(@inv.items, i)
+        let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
         total = total + item.quantity
         i += 1
     return total
+
+# ============================================================================
+# JSON Serialization
+# ============================================================================
+
+# Helper to print a character
+fn emit_char(buf: *Vec<u8>, c: u8)
+    vec_push<u8>(buf, c)
+
+# Helper to print a string into buffer
+fn emit_str(buf: *Vec<u8>, s: *u8)
+    var i: i64 = 0
+    while *(s + i) != 0
+        vec_push<u8>(buf, *(s + i))
+        i += 1
+
+# Helper to emit integer
+fn emit_int(buf: *Vec<u8>, n: i32)
+    if n < 0
+        emit_char(buf, 45)  # '-'
+        n = 0 - n
+    if n == 0
+        emit_char(buf, 48)  # '0'
+        return
+    # Build digits backwards
+    var tmp: [12]u8
+    var len: i64 = 0
+    while n > 0
+        tmp[len] = (48 + (n % 10)) as u8
+        n = n / 10
+        len += 1
+    # Emit in reverse
+    var i: i64 = len - 1
+    while i >= 0
+        emit_char(buf, tmp[i])
+        i -= 1
+
+# Serialize inventory to JSON string
+# Format: {"items":[{"name":"sword","quantity":5},...],"count":N}
+pub fn inventory_to_json(inv:&Inventory, buf: *Vec<u8>)
+    emit_char(buf, 123)  # {
+    emit_char(buf, 34)   # "
+    emit_str(buf, c"items")
+    emit_char(buf, 34)   # "
+    emit_char(buf, 58)   # :
+    emit_char(buf, 91)   # [
+
+    var i: i64 = 0
+    while i < inv.items.len
+        if i > 0
+            emit_char(buf, 44)  # ,
+        let item: *Item = vec_get_ptr<Item>(@&inv.items, i)
+
+        emit_char(buf, 123)  # {
+        emit_char(buf, 34)   # "
+        emit_str(buf, c"name")
+        emit_char(buf, 34)   # "
+        emit_char(buf, 58)   # :
+        emit_char(buf, 34)   # "
+        # Emit name
+        var j: i64 = 0
+        while j < item.name_len
+            emit_char(buf, item.name[j])
+            j += 1
+        emit_char(buf, 34)   # "
+        emit_char(buf, 44)   # ,
+        emit_char(buf, 34)   # "
+        emit_str(buf, c"quantity")
+        emit_char(buf, 34)   # "
+        emit_char(buf, 58)   # :
+        emit_int(buf, item.quantity)
+        emit_char(buf, 125)  # }
+        i += 1
+
+    emit_char(buf, 93)   # ]
+    emit_char(buf, 44)   # ,
+    emit_char(buf, 34)   # "
+    emit_str(buf, c"count")
+    emit_char(buf, 34)   # "
+    emit_char(buf, 58)   # :
+    emit_int(buf, inv.items.len as i32)
+    emit_char(buf, 125)  # }
+    emit_char(buf, 0)    # null terminator

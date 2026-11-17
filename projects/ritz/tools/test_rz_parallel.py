@@ -485,22 +485,35 @@ class TestBuildPyUnits:
                for p in buildpy.discover_test_files(pkg, cfg)]
         assert got == ["src/deep/nested.ritz", "src/has.ritz", "test/t.ritz"]
 
-    def test_undeclared_sources_are_not_searched(self, buildpy, tmp_path):
-        pkg = _pkg(tmp_path, test_only=False)
-        (pkg / "src").mkdir()
-        (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
-        assert buildpy.discover_test_files(pkg, {"package": {"name": "p"}}) == []
-
-    def test_test_table_without_sources_adds_nothing(self, buildpy, tmp_path):
+    @pytest.mark.parametrize("test_cfg", [None, {"timeout": 5},
+                                          {"sources": ["test"]}])
+    def test_src_test_fns_run_without_declaration(self, buildpy, tmp_path,
+                                                  test_cfg):
+        # AGAST #1873: a [[test]] fn under src/ must run or fail, never sit
+        # unrun. #3279 made src/ opt-in via `[test] sources`, so prism's
+        # src/text/*.ritz tests (no key) still ran under no gate. src/ is now
+        # always searched; `[test] sources` only adds dirs.
         pkg = _pkg(tmp_path, test_only=False, files=[("t.ritz", "")])
-        (pkg / "src").mkdir()
-        (pkg / "src" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
-        cfg = {"package": {"name": "p"}, "test": {"timeout": 5}}
+        (pkg / "src" / "deep").mkdir(parents=True)
+        (pkg / "src" / "deep" / "has.ritz").write_text(
+            "[[test]]\nfn t() -> i32\n    0\n")
+        (pkg / "src" / "none.ritz").write_text("fn f() -> i32\n    0\n")
+        cfg = {"package": {"name": "p"}}
+        if test_cfg is not None:
+            cfg["test"] = test_cfg
         got = [p.relative_to(pkg).as_posix()
                for p in buildpy.discover_test_files(pkg, cfg)]
+        assert got == ["src/deep/has.ritz", "test/t.ritz"]
+
+    def test_package_without_src_adds_nothing(self, buildpy, tmp_path):
+        pkg = _pkg(tmp_path, test_only=False, files=[("t.ritz", "")])
+        (pkg / "lib").mkdir()
+        (pkg / "lib" / "has.ritz").write_text("[[test]]\nfn t() -> i32\n    0\n")
+        got = [p.relative_to(pkg).as_posix()
+               for p in buildpy.discover_test_files(pkg, {"package": {"name": "p"}})]
         assert got == ["test/t.ritz"]
 
-    def test_test_array_entries_add_nothing(self, buildpy, tmp_path):
+    def test_test_array_entries_add_no_dirs(self, buildpy, tmp_path):
         # AGAST #3290: `[[test]]` in ritz.toml (goliath, spire) parses as a
         # list of entry-point test binaries, not the `[test]` table; #3279
         # called .get() on it and `rz test` crashed before running anything.
@@ -516,7 +529,7 @@ class TestBuildPyUnits:
         assert isinstance(cfg["test"], list)
         got = [p.relative_to(pkg).as_posix()
                for p in buildpy.discover_test_files(pkg, cfg)]
-        assert got == ["test/t.ritz"]
+        assert got == ["src/has.ritz", "test/t.ritz"]
 
     @pytest.mark.parametrize("name", ["goliath", "spire"])
     def test_test_array_packages_discover_as_before_3279(self, buildpy, name):
@@ -535,6 +548,16 @@ class TestBuildPyUnits:
         got = {p.relative_to(angelo).as_posix()
                for p in buildpy.discover_test_files(angelo, cfg)}
         assert {"src/tests.ritz", "src/raster/bezier.ritz"} <= got
+
+    def test_prism_src_tests_are_discovered(self, buildpy):
+        # AGAST #1873: prism declares no `[test] sources`; its in-source
+        # [[test]] fns ran nowhere until src/ was searched by default.
+        prism = PKG_DIR.parent / "prism"
+        cfg = buildpy.tomllib.loads((prism / "ritz.toml").read_text())
+        got = {p.relative_to(prism).as_posix()
+               for p in buildpy.discover_test_files(prism, cfg)}
+        assert {"src/text/renderer.ritz", "src/text/font_manager.ritz",
+                "src/text/glyph_cache.ritz"} <= got
 
     def test_summary_counts_like_the_serial_loop(self, buildpy):
         line = buildpy.summarize_file_outcomes([

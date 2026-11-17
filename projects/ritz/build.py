@@ -2621,25 +2621,30 @@ def discover_test_files(pkg_dir: Path, config: dict) -> list[Path]:
 
 
 def _declared_test_source_files(pkg_dir: Path, config: dict) -> list[Path]:
-    """Files under `[test] sources` dirs that define a `[[test]]` fn.
+    """Files under src/ and `[test] sources` dirs that define a `[[test]]` fn.
 
     For packages that keep [[test]] fns inside their modules rather than in
-    test/ (angelo: `[test] sources = ["src"]`). `ritz0 --test` runs only the
-    given file's own [[test]] fns, so each such module is its own test file.
-    Dirs are searched recursively; a module with no `[[test]]` line is not
-    taken, since it would report "ran 0 tests" and fail. Until AGAST #3279
-    build.py read no key for this and angelo's tests ran under no gate.
+    test/ (angelo, prism). `ritz0 --test` runs only the given file's own
+    [[test]] fns, so each such module is its own test file. Dirs are searched
+    recursively; a module with no `[[test]]` line is not taken, since it
+    would report "ran 0 tests" and fail. Until AGAST #3279 build.py read no
+    key for this and angelo's tests ran under no gate.
 
-    Only the `[test]` table counts. `[[test]]` in ritz.toml (goliath, spire)
-    parses as a list of entry-point test binaries whose `sources` feed their
-    builds, not this discovery; reading it as the table crashed `rz test`
-    for both (AGAST #3290).
+    src/ is always searched: a [[test]] fn written there runs (or fails the
+    package), whether or not ritz.toml mentions it. #3279 made it opt-in, so
+    prism's src/text tests still ran nowhere (AGAST #1873).
+
+    Only the `[test]` table adds dirs. `[[test]]` in ritz.toml (goliath,
+    spire) parses as a list of entry-point test binaries whose `sources` feed
+    their builds, not this discovery; reading it as the table crashed `rz
+    test` for both (AGAST #3290).
     """
     test_cfg = config.get("test")
-    if not isinstance(test_cfg, dict):
-        return []
+    dirs = ["src"]
+    if isinstance(test_cfg, dict):
+        dirs += test_cfg.get("sources", [])
     found = []
-    for rel in test_cfg.get("sources", []):
+    for rel in dict.fromkeys(dirs):
         d = pkg_dir / rel
         if not d.is_dir():
             continue
