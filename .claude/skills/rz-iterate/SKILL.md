@@ -521,10 +521,49 @@ gate `rz` runs; it still never edits, rebases or fixes a room's commit.
 `~/dev/ritz-lang/rz-train` (created on first use, detached HEAD, never a
 room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
 
+**Terms:** a **car** is one room's REAPed commit (one squashed commit),
+cherry-picked onto a train. A **train** is a stack of cars gated once, at
+its top. The **tail** is the train's top commit. **A train holds at most 8
+cars** (Aaron, 2026-11-17). If more than 8 are queued, cars 9 onward go into
+a new train stacked on the first train's tail. That train is gated and
+landed separately, after the first one. Every car is still cherry-picked;
+no room is asked to rebase because a train was full.
+
+**The rule (Aaron, 2026-11-17): never fast-forward rooms one at a time, and
+never send a room back to rebase onto `main` just because `main` moved.**
+On 2026-11-17 three REAPs that stacked cleanly were each sent to rebase and
+re-gate after one merge. That cost three gates where one train needed one.
+This is also how Borque's conductor works.
+
+- **No train in progress:** a REAP that arrives builds a train straight
+  away, with every queued car, and gates it.
+- **A train is gating:** REAPs that arrive form the **next** train, stacked
+  on the gating train's tail, not on `main`. Build it as cars arrive so a
+  conflict shows up at once. When the gating train lands, its tail *is*
+  `main`, and the next train's gate starts on its own tail. So one gate
+  tests every car that queued while the last train gated.
+- **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
+  with C): bounce E to its room with the exact commit to rebase onto, the
+  tail (D's train SHA), not `main`. The room resolves the conflict on D,
+  re-gates and REAPs again, and E joins the back of the train.
+- **A train fails:** find the culprit by reasoning first, bisection second
+  (step 6).
+
+**Until AGAST #3809 lands**, `train.sh` keeps one train and always builds
+on `origin/main`, and it marks a car rebased onto an unlanded tail `BAD`.
+So, while a train gates, don't run `train.sh build`, because it would
+reset the gating train's worktree. Instead, trial-stack the queued cars
+on the gating tail in a throwaway worktree (`git worktree add --detach
+$(mktemp -d) <tail>`, then `git cherry-pick` each car) to find conflicts
+early. Run `train.sh build` for the next train as soon as `land` pushes.
+Until then, bounce a conflicting car to rebase onto `main` once its train
+lands, not onto the unlanded tail.
+
 1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it)
    `append_scratchpad_item` immediately, even while a train is gating, then
    say in one line what's queued. Never add to a train that's gating: a REAP
-   that arrives then rides the next train.
+   that arrives then rides the next train, stacked on the gating train's
+   tail.
 2. **Check each REAP line before it boards.** A remote room's REAP must
    quote `SHA=<12> EXIT=0` from its gate log, and that SHA must be the REAP
    SHA's prefix. Without it, it's a room mistake (step 7). (`train.sh build`
@@ -627,20 +666,30 @@ room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
    so `git cherry origin/main ritz-task-<id>` prints `- <sha>` (same patch),
    not nothing; a `+` line is fine only if `<main sha12>`'s subject matches
    the branch tip's. The slot is free once the host answers `TORNDOWN`.
-6. **Gate fails:** find the culprit by halving. With `k` commits, rebuild
-   with the first `ceil(k/2)` and gate that. If it passes, land it; the rest
-   ride the next train. If it fails, halve again. A single commit that fails
-   on top of `main` goes back to its room: check its item and send it one
+6. **Gate fails: reason first, then bisect.** Read the failing lines
+   (`run-gate.sh --wait` prints them) against each car's diff
+   (`git show --stat <car>`, then the hunks near the failure): which car
+   touches the failing test, file, compiler stage or package? If one car
+   is the clear suspect, rebuild the train without it and gate that. If it
+   passes, land it and gate the suspect alone on the new `main`. If no car
+   stands out, or the guess was wrong (the train still fails without it),
+   fall back to halving. With `k` cars, rebuild with the first `ceil(k/2)`
+   and gate that. If it passes, land it, and the rest ride the next train.
+   If it fails, halve again. Reasoning only picks which car to drop; `rz`
+   still never edits, fixes or debugs a car. A single car that fails on
+   top of `main` goes back to its room: check its item and send it one
    line, "rebase onto <main sha7>: your commit fails the gate on top of
-   `main`", with the gate's failing lines (`run-gate.sh --wait` prints them).
-   Its fixed REAP goes to the back of the queue. Never investigate the
-   failure here.
-7. **`CONFLICT`, `BAD` or a missing gate quote** leave that item out of the
-   train. Once the train has landed, check the item and send its room one
-   line: for `CONFLICT`, "rebase onto <new main sha7>, re-gate and REAP";
-   otherwise, which check failed. Its next REAP goes to the back of the
-   queue. **`EMPTY`** means the patch is already on `main`: check the item,
-   then close and clean up as in step 5.
+   `main`", with the gate's failing lines. Its fixed REAP goes to the back
+   of the queue.
+7. **`CONFLICT`:** bounce it now, not after the train lands. Check its item
+   and send its room one line: "your commit conflicts with <conflicting
+   car's ritz-task-id> in the train; rebase onto <tail sha12>, resolve,
+   re-gate and REAP". Use the tail of the train it was trying to board, so
+   the rebased car stacks onto the back of that train. Its next REAP joins
+   the back of the queue. **`BAD` or a missing gate quote** leave that
+   item out too: tell its room which check failed. **`EMPTY`** means the
+   patch is already on `main`: check the item, then close and clean up as
+   in step 5.
 8. **All items checked:** `clear_scratchpad`.
 
 **Never tell running rooms that `main` moved.** A room rebases only when its
