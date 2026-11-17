@@ -214,6 +214,16 @@ ritz1-bootstrap:
 ritz1-unit:
 	@$(PYTHON) tools/ritz1_unit.py
 
+# ritzlib's [[test]] suites under ritz1 AND ritz1_selfhosted (AGAST #3805).
+# The regression matrix was the only ritz1 run, so whole ritzlib test files
+# could rot under ritz1 unseen (#3766).  ritz0's run is the train's package
+# step (#3909).  CI's bootstrap job runs this after ritz1-bootstrap, which
+# makes the prerequisite a no-op; ~20 s per compiler.
+.PHONY: ritzlib-tests-ritz1
+ritzlib-tests-ritz1: ritz1-bootstrap
+	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1
+	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1_selfhosted
+
 # Build and test all examples (always runs)
 .PHONY: examples
 examples:
