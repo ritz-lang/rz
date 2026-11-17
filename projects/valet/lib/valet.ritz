@@ -1054,6 +1054,10 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
         return 1
     b.len = len
     b.pos = 0
+    # Not a write_buf send: the SEND state's write_buf resume must not see
+    # a reused task's stale write_pos/write_len (AGAST #3678).
+    task.write_len = 0
+    task.write_pos = 0
     if task_send_buf(task, b.ptr, len as i32) < 0
         bigbuf_release(b)
         return 1
@@ -1455,6 +1459,19 @@ pub fn valet_handle_connection(task: *Task) -> i32
                 bigbuf_release(b)
             else if b != null and b.mode == BIGBUF_PARSED
                 bigbuf_release(b)
+
+        # A write_buf response: the rest of it is still in write_buf, from
+        # write_pos on. Send it before keep-alive moves on to the next
+        # request, or the client gets a truncated response followed by the
+        # next one (AGAST #3678; the TLS SEND state's fix is #2197 item 5).
+        if task.write_pos < task.write_len
+            if task.io_result == 0
+                return 1
+            task.write_pos = task.write_pos + task.io_result
+            if task.write_pos < task.write_len
+                if task_send_buf(task, @task.write_buf[task.write_pos], task.write_len - task.write_pos) < 0
+                    return 1
+                return -1
 
         # Check keep-alive limit from app config
         let app: *Valet = get_g_app()

@@ -143,7 +143,7 @@ CONN_STATE_SEND (2)  →  Send response, then:
 | `/json` | `{"msg":"Hello Valet"}` | JSON response |
 | `/users/:id` | "User ID: {id}" | Parameter capture |
 | `/echo/:msg` | "{msg}" | Echo parameter |
-| `/bytes/:n` | n bytes of "0123456789…" | n ≤ 3500; HTTPS short-send test (#2197) |
+| `/bytes/:n` | n bytes of "0123456789…" | n ≤ 3500; short-send tests: HTTPS (#2197), plain HTTP `test_short_send.sh` (#3678) |
 | `*` | 404 Not Found | Default |
 
 ## Ritz Language Notes
