@@ -4,6 +4,9 @@
 #   find_command(name: StrView) -> Option<String>        ($PATH, or a default)
 #   spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>
 #   process_write_all(p: @&Process, data: StrView) -> i64
+#   process_valid(p: @Process), process_wait(p: @&Process) and the other
+#   fns on a live Process (AGAST #3750)
+#   result_success(r: @ProcessResult) -> bool
 #
 # A StrView carries no terminator, so every test that matters here hands the
 # API a view whose bytes run on past its length (a slice of a longer
@@ -41,9 +44,9 @@ fn run(r: *Result<Process, i32>, out: *Vec<u8>) -> i32
     match *r
         Ok(p) =>
             var q: Process = p
-            *out = process_read_stdout_all(@q)
-            let res: ProcessResult = process_wait(@q)
-            process_cleanup(@q)
+            *out = process_read_stdout_all(@&q)
+            let res: ProcessResult = process_wait(@&q)
+            process_cleanup(@&q)
             res.exit_code
         Err(_) => -1
 
@@ -133,12 +136,12 @@ fn test_spawn_no_args_cat_echoes_stdin() -> i32
         Ok(p) =>
             var q: Process = p
             assert process_write_all(@&q, "hello\n") == 6
-            process_close_stdin(@q)
-            var out: Vec<u8> = process_read_stdout_all(@q)
+            process_close_stdin(@&q)
+            var out: Vec<u8> = process_read_stdout_all(@&q)
             assert bytes_are(@out, "hello\n") == 1
-            let res: ProcessResult = process_wait(@q)
+            let res: ProcessResult = process_wait(@&q)
             assert res.exit_code == 0
-            process_cleanup(@q)
+            process_cleanup(@&q)
         Err(_) =>
             assert false
     0
@@ -213,11 +216,11 @@ fn test_process_write_all_writes_view_length() -> i32
         Ok(p) =>
             var q: Process = p
             assert process_write_all(@&q, strview_slice("abcNOPE", 0, 3)) == 3
-            process_close_stdin(@q)
-            var out: Vec<u8> = process_read_stdout_all(@q)
+            process_close_stdin(@&q)
+            var out: Vec<u8> = process_read_stdout_all(@&q)
             assert bytes_are(@out, "abc") == 1
-            process_wait(@q)
-            process_cleanup(@q)
+            process_wait(@&q)
+            process_cleanup(@&q)
         Err(_) =>
             assert false
     0
@@ -228,10 +231,86 @@ fn test_process_write_all_after_close_is_negative() -> i32
     match r
         Ok(p) =>
             var q: Process = p
-            process_close_stdin(@q)
+            process_close_stdin(@&q)
             assert process_write_all(@&q, "x") < 0
-            process_wait(@q)
-            process_cleanup(@q)
+            process_wait(@&q)
+            process_cleanup(@&q)
+        Err(_) =>
+            assert false
+    0
+
+# ============================================================================
+# process_valid(p: @Process), result_success(r: @ProcessResult) -> bool
+# ============================================================================
+
+# Spawn `sh -c script`, wait for it, and return its ProcessResult; the
+# Process is checked valid through a shared reference first.
+[[test_helper]]
+fn sh_result(script: StrView) -> ProcessResult
+    var args: [2]StrView
+    args[0] = "-c"
+    args[1] = script
+    var bad: ProcessResult = ProcessResult { exit_code: -1, signaled: 0, signal: 0 }
+    match spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+        Ok(p) =>
+            var q: Process = p
+            assert process_valid(@q) == 1
+            let res: ProcessResult = process_wait(@&q)
+            process_cleanup(@&q)
+            res
+        Err(_) => bad
+
+[[test]]
+fn test_result_success_is_true_on_exit_0() -> i32
+    let r: ProcessResult = sh_result("exit 0")
+    let ok: bool = result_success(@r)
+    assert ok
+    assert r.exit_code == 0
+    0
+
+[[test]]
+fn test_result_success_is_false_on_nonzero_exit() -> i32
+    let r: ProcessResult = sh_result("exit 3")
+    assert not result_success(@r)
+    assert r.exit_code == 3
+    0
+
+[[test]]
+fn test_result_success_is_false_when_signaled() -> i32
+    # Killed by SIGKILL: not a success, whatever exit_code holds.
+    let r: ProcessResult = sh_result("kill -9 $$")
+    assert r.signaled == 1
+    assert r.signal == 9
+    assert not result_success(@r)
+    0
+
+[[test]]
+fn test_result_success_rule() -> i32
+    # The rule itself, on hand-built results: success needs BOTH no signal
+    # and exit code 0.  (process_wait never builds the last one, since it
+    # sets exit_code to 128 + signal, so only this test pins the signal half.)
+    let ok: ProcessResult = ProcessResult { exit_code: 0, signaled: 0, signal: 0 }
+    let code: ProcessResult = ProcessResult { exit_code: 1, signaled: 0, signal: 0 }
+    let sig: ProcessResult = ProcessResult { exit_code: 0, signaled: 1, signal: 9 }
+    assert result_success(@ok)
+    assert not result_success(@code)
+    assert not result_success(@sig)
+    0
+
+[[test]]
+fn test_process_kill_then_wait_reports_signal() -> i32
+    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    match r
+        Ok(p) =>
+            var q: Process = p
+            process_kill(@&q)
+            let res: ProcessResult = process_wait(@&q)
+            assert res.signaled == 1
+            assert res.exit_code == 128 + 9
+            # A second wait finds nothing to wait for.
+            let again: ProcessResult = process_wait(@&q)
+            assert again.exit_code == -1
+            process_cleanup(@&q)
         Err(_) =>
             assert false
     0

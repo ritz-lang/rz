@@ -1883,7 +1883,9 @@ struct IoUring
 
 **Module**: `ritzlib.process`
 
-Subprocess spawning with connected pipes.
+Subprocess spawning with connected pipes. Every fn on a live `Process` takes
+`@&Process` (they close fds and record the wait); `process_valid` only reads
+it (AGAST #3750).
 
 ```ritz
 struct Process
@@ -1904,40 +1906,35 @@ struct ProcessResult
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is the positive errno: 2 not found, 13 not executable, or a pipe/fork failure |
-| `spawn_cstr` | `fn(cmd: *u8) -> Process` | Raw form, no args |
-| `spawn_args` | `fn(cmd: *u8, argv: **u8) -> Process` | Spawn with args |
-| `spawn_full` | `fn(cmd: *u8, argv: **u8, envp: **u8) -> Process` | Spawn with env; a null `envp` inherits ours (`env_raw_envp()`) |
-| `process_valid` | `fn(p: *Process) -> i32` | Check if valid |
+| `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, i32>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
+| `process_valid` | `fn(p: @Process) -> i32` | 1 if the spawn gave a live pid |
 
 **I/O Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `process_write_all` | `fn(p: @&Process, data: StrView) -> i64` | Write all of `data` to stdin (retries short writes); `data.len` or a negative errno |
-| `process_write` | `fn(p: *Process, data: *u8, len: i64) -> i64` | Raw: one write(2) to stdin |
-| `process_write_str` | `fn(p: *Process, s: *u8) -> i64` | Raw: write a C string to stdin |
-| `process_close_stdin` | `fn(p: *Process)` | Close stdin (EOF) |
-| `process_read_stdout` | `fn(p: *Process, buf: *u8, max: i64) -> i64` | Read from stdout |
-| `process_read_stdout_all` | `fn(p: *Process) -> Vec<u8>` | Read all stdout |
-| `process_read_line` | `fn(p: *Process) -> Vec<u8>` | Read line |
-| `process_read_stderr` | `fn(p: *Process, buf: *u8, max: i64) -> i64` | Read stderr |
-| `process_read_stderr_all` | `fn(p: *Process) -> Vec<u8>` | Read all stderr |
+| `process_close_stdin` | `fn(p: @&Process)` | Close stdin (EOF) |
+| `process_read_stdout` | `fn(p: @&Process, buf: *u8, max: i64) -> i64` | Read from stdout |
+| `process_read_stdout_all` | `fn(p: @&Process) -> Vec<u8>` | Read all stdout |
+| `process_read_line` | `fn(p: @&Process) -> Vec<u8>` | Read line |
+| `process_read_stderr` | `fn(p: @&Process, buf: *u8, max: i64) -> i64` | Read stderr |
+| `process_read_stderr_all` | `fn(p: @&Process) -> Vec<u8>` | Read all stderr |
 
 **Lifecycle**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `process_wait` | `fn(p: *Process) -> ProcessResult` | Wait for exit |
-| `process_kill` | `fn(p: *Process)` | Kill process |
-| `process_close_pipes` | `fn(p: *Process)` | Close all pipes |
-| `process_cleanup` | `fn(p: *Process)` | Full cleanup |
+| `process_wait` | `fn(p: @&Process) -> ProcessResult` | Wait for exit |
+| `process_kill` | `fn(p: @&Process)` | Kill process |
+| `process_close_pipes` | `fn(p: @&Process)` | Close all pipes |
+| `process_cleanup` | `fn(p: @&Process)` | Full cleanup |
 
 **Result Helpers**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `result_success` | `fn(r: *ProcessResult) -> i32` | Exited with code 0? |
-| `result_code` | `fn(r: *ProcessResult) -> i32` | Get exit code |
+| `result_success` | `fn(r: @ProcessResult) -> bool` | Exited normally with code 0? The code itself is `r.exit_code` |
 
 **PATH Search**:
 
@@ -1945,7 +1942,6 @@ struct ProcessResult
 |----------|-----------|-------------|
 | `find_command` | `fn(name: StrView) -> Option<String>` | Search `$PATH`, or the standard dirs if it is unset or empty |
 | `find_command_in` | `fn(name: StrView, path: StrView) -> Option<String>` | Search a `:`-separated dir list: first executable `dir/name`; an empty component is `.`; a name with `/` comes back as is |
-| `find_command_in_path` | `fn(name: *u8, buf: *u8, bufsize: i64) -> *u8` | Raw: the fixed standard dirs only, into `buf` |
 
 ---
 
