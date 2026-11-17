@@ -362,6 +362,51 @@ fn import_is_ritzlib(imp: *ImportPath) -> i32
     seg_view.len = imp.segment_len as i64
     strview_eq_cstr(seg_view, c"ritzlib") as i32
 
+# The `--dep <name>=<dir>` entries (AGAST #3825), `:`-joined, in order: one
+# per (namespace, source root), as build.py's ritz1_compile_cmd passes them.
+# They carry what ritz0 gets from --deps and ritz1 can't read without a TOML
+# parser: a namespace's declared `sources`.  zeus declares
+# `sources = ["lib", "examples"]`; RITZ_PATH's <entry>/<ns>/{lib,src} probe
+# never looked in examples/, so `import zeus.echo_handler` failed under ritz1.
+var g_dep_ptr: *u8 = null
+var g_dep_len: i64 = 0
+
+# `import <name>.<rest>` against each `--dep <name>=<dir>`, in order:
+# `<dir>/<rest>.ritz`, as ritz0's DependencyMapping.resolve_import probes
+# `<path>/<source>/<rest>`.  The first file that opens wins; every miss
+# before it is recorded (AGAST #2030).  An empty String when none opens.
+#
+# Unlike ritz0, a miss falls through to the source-dir and RITZ_PATH probes:
+# those are what resolved every namespace before #3825, and a dep that lacks
+# the module must not break a build that resolved it there.
+fn try_open_dep_import(imp: *ImportPath) -> String
+    if imp == null or g_dep_len == 0
+        return string_new()
+    if imp.next == null
+        return string_new()
+    var ds: i64 = 0
+    var di: i64 = 0
+    while di <= g_dep_len
+        if di == g_dep_len or *(g_dep_ptr + di) == ':'
+            var eq: i64 = ds
+            while eq < di and *(g_dep_ptr + eq) != '='
+                eq = eq + 1
+            if eq - ds == imp.segment_len as i64 and eq + 1 < di
+                if memcmp(g_dep_ptr + ds, imp.segment, eq - ds) == 0
+                    var dir: StrView
+                    dir.ptr = g_dep_ptr + eq + 1
+                    dir.len = di - eq - 1
+                    var candidate: String = build_import_path(dir, imp.next)
+                    let fd: i32 = sys_open(string_as_ptr(@&candidate), O_RDONLY)
+                    if fd >= 0
+                        sys_close(fd)
+                        return candidate
+                    dep_record_miss(string_as_ptr(@&candidate))
+                    string_drop(@&candidate)
+            ds = di + 1
+        di = di + 1
+    string_new()
+
 # Try to open an import file, checking source-dir first, then each colon-
 # separated entry in RITZ_PATH (mirroring ritz0/Python's os.pathsep semantics).
 # Returns a fresh String with the resolved path, or empty String if not found.
@@ -378,6 +423,12 @@ fn import_is_ritzlib(imp: *ImportPath) -> i32
 # beyond ritzlib failed with "Could not read import: <module>".
 fn try_open_import(imp: *ImportPath, source_dir: StrView, ritz_path: StrView, found_via_ritz_path: *i32) -> String
     *found_via_ritz_path = 0
+
+    # Declared namespaces first, as ritz0 checks its --deps first.
+    var dep_hit: String = try_open_dep_import(imp)
+    if string_len(@dep_hit) > 0
+        return dep_hit
+    string_drop(@&dep_hit)
 
     # ritzlib imports skip source-dir and resolve only via RITZ_PATH.
     let is_ritzlib: i32 = import_is_ritzlib(imp)
@@ -1091,6 +1142,36 @@ struct CliArgs
     # `--test-table` (AGAST #1908): compile as the root of a test binary
     # (LANGUAGE_SPEC §17.1), as ritz0's --test-table does.
     test_table: i32
+    # Every `--dep <name>=<dir>` (AGAST #3825), in order, `:`-joined; null
+    # and 0 when there is none.  See g_dep_ptr.
+    deps_ptr: *u8
+    deps_len: i64
+
+# Append `entry` to the `:`-joined list at `*ptr`/`*len`.  The old buffer is
+# leaked, like -I's merge below: the compiler runs once per process.
+fn deps_append(ptr: **u8, len: *i64, entry: *u8)
+    let n: i64 = strlen(entry)
+    let sep: i64 = if *len > 0 then 1 else 0
+    let buf: *u8 = malloc(*len + sep + n + 1)
+    if *len > 0
+        memcpy(buf, *ptr, *len)
+        *(buf + *len) = ':' as u8
+    memcpy(buf + *len + sep, entry, n)
+    *(buf + *len + sep + n) = 0 as u8
+    *ptr = buf
+    *len = *len + sep + n
+
+# 1 when `s` is `<name>=<dir>` with neither part empty.
+fn dep_entry_ok(s: *u8) -> i32
+    let n: i64 = strlen(s)
+    var i: i64 = 0
+    while i < n
+        if *(s + i) == '='
+            if i > 0 and i + 1 < n
+                return 1
+            return 0
+        i = i + 1
+    0
 
 fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     var args: CliArgs
@@ -1101,6 +1182,8 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     args.dash_dash = 0
     args.target_os = strview_from_cstr(c"linux")
     args.test_table = 0
+    args.deps_ptr = null
+    args.deps_len = 0
 
     if argc < 2
         return args
@@ -1132,6 +1215,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     #                      `-I` like gcc's: prepends to the lookup list.
     #   --target-os <os>   see CliArgs.target_os.
     #   --test-table       see CliArgs.test_table.
+    #   --dep <name>=<dir> repeatable; see try_open_import.
     # Anything else is ignored, as it always has been.
     var dash_i_view: StrView
     dash_i_view.ptr = null
@@ -1141,9 +1225,17 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
         let opt: StrView = strview_from_cstr(argv[i])
         let is_dash_i: bool = strview_eq_cstr(opt, c"-I")
         let is_target_os: bool = strview_eq_cstr(opt, c"--target-os")
+        let is_dep: bool = strview_eq_cstr(opt, c"--dep")
         if strview_eq_cstr(opt, c"--test-table")
             args.test_table = 1
             i = i + 1
+        else if is_dep
+            if i + 1 >= argc or dep_entry_ok(argv[i + 1]) == 0
+                eprintln("Error: --dep needs <name>=<dir>")
+                args.input_path = null
+                return args
+            deps_append(@&args.deps_ptr, @&args.deps_len, argv[i + 1])
+            i = i + 2
         else if is_dash_i or is_target_os
             if i + 1 >= argc
                 if is_dash_i
@@ -1219,7 +1311,7 @@ fn drop_local_main(m: *Module)
         f = next
 
 fn print_usage()
-    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--test-table]")
+    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--test-table] [--dep <name>=<dir>]...")
     eprintln("       ritz1 -- <input.ritz>")
 
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
@@ -1287,7 +1379,9 @@ fn main(argc: i32, argv: **u8) -> i32
     set_target_os(args.target_os.ptr, args.target_os.len as i32)
     # Cached IR depends on the compiler, the target OS and the import
     # roots (see cache_fingerprint in fn_cache.ritz).
-    let cache_fp: u64 = cache_fingerprint(args.target_os.ptr, args.target_os.len, args.ritz_path.ptr, args.ritz_path.len, args.input_path)
+    g_dep_ptr = args.deps_ptr
+    g_dep_len = args.deps_len
+    let cache_fp: u64 = cache_fingerprint(args.target_os.ptr, args.target_os.len, args.ritz_path.ptr, args.ritz_path.len, args.input_path, args.deps_ptr, args.deps_len)
 
     # Read source file
     var src: Vec<u8> = read_file(args.input_path)

@@ -1321,16 +1321,23 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
     return plan_binaries(pkg_dir, config).buildable
 
 
-def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path) -> Optional[list]:
+def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path,
+                      namespaces: dict | None = None) -> Optional[list]:
     """The ritz1-family command that compiles one source to LLVM IR.
 
     ritz1's CLI is minimal: <input> -o <output> [-I <ritz_path>]
-    [--target-os <os>]. It doesn't understand --no-runtime, --deps, --sources
-    or --project-root; callers append --target-os when they need it.
+    [--target-os <os>] [--dep <name>=<dir>]... It doesn't understand
+    --no-runtime, --deps, --sources or --project-root; callers append
+    --target-os when they need it.
     Its default emitter is non-freestanding (no _start embedded), so the
     "--no-runtime" semantics come for free. Import resolution: ritz1 tries
-    source_dir first, then RITZ_PATH (see `ritz1_env`). `-I` points at the ritz
-    ROOT so ritzlib/* imports resolve.
+    the `--dep` dirs first, then source_dir, then RITZ_PATH (see
+    `ritz1_env`). `-I` points at the ritz ROOT so ritzlib/* imports resolve.
+
+    `namespaces` (as for `ritz1_env`) become one `--dep <name>=<path>/<src>`
+    per declared source root, in order: ritz0's `--deps` resolution, which
+    reads a namespace's `sources`. Without it ritz1 probed only
+    <ns>/{lib,src}, so zeus's `examples` root was invisible (AGAST #3825).
 
     Returns None (after saying why) if the binary is missing.
     """
@@ -1339,7 +1346,11 @@ def ritz1_compile_cmd(compiler: str, src: Path, ll_path: Path) -> Optional[list]
         print(f"  ✗ {compiler} binary not found at {ritz1_bin}", file=sys.stderr)
         print(f"    Run: cd {ROOT} && {make_hint}", file=sys.stderr)
         return None
-    return [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", str(ROOT)]
+    cmd = [str(ritz1_bin), str(src), "-o", str(ll_path), "-I", str(ROOT)]
+    for name, spec in (namespaces or {}).items():
+        for source in spec.sources:
+            cmd += ["--dep", f"{name}={Path(spec.path) / source}"]
+    return cmd
 
 
 def ritz1_env(namespaces: dict | None = None) -> dict:
@@ -1579,7 +1590,7 @@ def module_compile_cmd(compiler: str, src: Path, ll_path: Path, target: Target, 
     if compiler.startswith("ritz1"):
         # ritz1 emits no _start by default, which is what --no-runtime asks
         # of ritz0.
-        cmd = ritz1_compile_cmd(compiler, src, ll_path)
+        cmd = ritz1_compile_cmd(compiler, src, ll_path, dependencies)
         if cmd is None:
             return None
     else:

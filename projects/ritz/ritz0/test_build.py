@@ -1190,6 +1190,124 @@ class TestSelfNamespace:
 
 
 # ---------------------------------------------------------------------------
+# AGAST #3825: a namespace's source roots reach ritz1 as `--dep name=dir`.
+#
+# ritz0 resolves `import ns.mod` against every one of ns's declared `sources`
+# (DependencySpec.resolve_import). ritz1 used to see only RITZ_PATH and probe
+# <entry>/<ns>/{lib,src}, so zeus's `import zeus.echo_handler`, which lives in
+# zeus's `examples` source root, built under ritz0 and not under ritz1.
+# ---------------------------------------------------------------------------
+
+_NS_PKG = "nsdirs3825"  # unlike any workspace project: projects/ can't mask it
+
+
+def _non_lib_src_namespace_package(tmp_path):
+    """examples/worker imports nsdirs3825.handler, a sibling in `examples`:
+    a source root that is neither lib nor src (zeus's echo_worker shape)."""
+    pkg = tmp_path / _NS_PKG
+    (pkg / "examples").mkdir(parents=True)
+    (pkg / "examples" / "handler.ritz").write_text("pub fn answer() -> i32\n    42\n")
+    (pkg / "examples" / "worker.ritz").write_text(
+        f"import {_NS_PKG}.handler {{ answer }}\n\nfn main() -> i32\n    answer() - 42\n")
+    (pkg / "ritz.toml").write_text(
+        f'[package]\nname = "{_NS_PKG}"\nversion = "0.1.0"\nsources = ["lib", "examples"]\n'
+        '\n[[bin]]\nname = "worker"\nentry = "worker::main"\nsources = ["examples"]\n')
+    return pkg
+
+
+def _ritz1_ns_compile(ritz1_bin, src, ll, *deps):
+    """ritz1 on `src` with one `--dep` per entry, RITZ_PATH = the ritz root."""
+    import subprocess
+    cmd = [str(ritz1_bin), str(src), "-o", str(ll)]
+    for d in deps:
+        cmd += ["--dep", d]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                          env=dict(os.environ, RITZ_PATH=str(RITZ_DIR)), check=False)
+
+
+def _const_module(d, value):
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "k.ritz").write_text(f"pub const K: i32 = {value}\n")
+
+
+class TestNamespaceSourceDirs:
+    """ritz1 resolves a namespace through each of its source roots (AGAST #3825)."""
+
+    @pytest.mark.unit
+    def test_ritz1_compile_cmd_passes_every_namespace_source_root(self, tmp_path, monkeypatch):
+        fake = tmp_path / "ritz1"
+        fake.write_text("")
+        monkeypatch.setitem(_build_module.RITZ1_FAMILY_BINS, "ritz1", (fake, "make"))
+        spec = _build_module.DependencySpec
+        cmd = _build_module.ritz1_compile_cmd("ritz1", tmp_path / "a.ritz", tmp_path / "a.ll", {
+            "zeus": spec(name="zeus", path=tmp_path / "zeus", sources=["lib", "examples"]),
+            "sq": spec(name="sq", path=tmp_path / "sq", sources=["src"]),
+        })
+        deps = [cmd[i + 1] for i, a in enumerate(cmd) if a == "--dep"]
+        assert deps == [f"zeus={tmp_path / 'zeus' / 'lib'}",
+                        f"zeus={tmp_path / 'zeus' / 'examples'}",
+                        f"sq={tmp_path / 'sq' / 'src'}"], cmd
+
+    # Real build.py without --no-cache: shared .ritz-cache (#1804, conftest.py).
+    @pytest.mark.xdist_group("tree")
+    @pytest.mark.integration
+    @pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+    def test_package_imports_a_sibling_in_a_non_lib_src_root(self, request, tmp_path, compiler):
+        """The #3825 acceptance test: `zeus.echo_handler` from examples/."""
+        import subprocess
+        if compiler == "ritz1":
+            request.getfixturevalue("ritz1_bin")
+        pkg = _non_lib_src_namespace_package(tmp_path)
+        env = dict(os.environ, RITZ_PATH=str(RITZ_DIR))
+        proc = subprocess.run(
+            [sys.executable, "build.py", "build", str(pkg), "--compiler", compiler],
+            cwd=RITZ_DIR, env=env, capture_output=True, text=True, timeout=600, check=False,
+        )
+        output = proc.stdout + proc.stderr
+        assert f"Could not read import: {_NS_PKG}.handler" not in output, output
+        assert proc.returncode == 0, output
+        run = subprocess.run([str(pkg / "build" / "debug" / "worker")], capture_output=True, timeout=30, check=False)
+        assert run.returncode == 0, f"expected exit 0 (42 - 42), got {run.returncode}"
+
+    @pytest.mark.integration
+    def test_dep_roots_are_tried_in_order_and_misses_invalidate(self, ritz1_bin, tmp_path):
+        """The first `--dep` root holding the module wins, and a module created
+        later in an earlier root is picked up, not served from the sig."""
+        src = tmp_path / "main.ritz"
+        src.write_text("import ns.k\n\nfn main() -> i32\n    K\n")
+        ll = tmp_path / "main.ll"
+        first, second = tmp_path / "r1", tmp_path / "r2"
+        first.mkdir()
+        _const_module(second, 22)
+        deps = (f"ns={first}", f"ns={second}")
+        comp = _ritz1_ns_compile(ritz1_bin, src, ll, *deps)
+        assert comp.returncode == 0, comp.stderr
+        assert "add i64 0, 22" in ll.read_text()
+        _const_module(first, 11)
+        comp = _ritz1_ns_compile(ritz1_bin, src, ll, *deps)
+        assert comp.returncode == 0, comp.stderr
+        assert "Skipped (unchanged)" not in comp.stdout
+        assert "add i64 0, 11" in ll.read_text()
+
+    @pytest.mark.integration
+    def test_changing_dep_roots_invalidates_cached_ir(self, ritz1_bin, tmp_path):
+        """--dep decides which file an import resolves to, so it is part of the
+        cache fingerprint, as RITZ_PATH is (#1807)."""
+        src = tmp_path / "main.ritz"
+        src.write_text("import ns.k\n\nfn main() -> i32\n    K\n")
+        ll = tmp_path / "main.ll"
+        _const_module(tmp_path / "a", 11)
+        _const_module(tmp_path / "b", 22)
+        comp = _ritz1_ns_compile(ritz1_bin, src, ll, f"ns={tmp_path / 'a'}")
+        assert comp.returncode == 0, comp.stderr
+        assert "add i64 0, 11" in ll.read_text()
+        comp = _ritz1_ns_compile(ritz1_bin, src, ll, f"ns={tmp_path / 'b'}")
+        assert comp.returncode == 0, comp.stderr
+        assert "Skipped (unchanged)" not in comp.stdout
+        assert "add i64 0, 22" in ll.read_text()
+
+
+# ---------------------------------------------------------------------------
 # AGAST #1313: freestanding IR must not acquire libc calls from loop-idiom
 # recognition.
 # ---------------------------------------------------------------------------

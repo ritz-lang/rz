@@ -93,11 +93,11 @@ def _ritz1_compile(compiler: str, src: str, out_ll: str, project_root: Optional[
     a test file resolves as it does under ritz0's `--sources`.
     """
     build = _build_module()
-    cmd = build.ritz1_compile_cmd(compiler, Path(src), Path(out_ll))
-    if cmd is None:
-        return f"{compiler} binary not found"
     namespaces = {n: d for n, d in (dependencies or {}).items()
                   if isinstance(d.path, Path)}
+    cmd = build.ritz1_compile_cmd(compiler, Path(src), Path(out_ll), namespaces)
+    if cmd is None:
+        return f"{compiler} binary not found"
     env = build.ritz1_env(namespaces)
     entries = env["RITZ_PATH"].split(os.pathsep)
     entries += [r for r in project_source_roots(project_root) if r not in entries]
