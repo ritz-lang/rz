@@ -1,0 +1,397 @@
+# diagnostics.ritz - textDocument/publishDiagnostics from ritz1 (AGAST #2789)
+#
+# On didOpen/didChange the buffer is compiled by the ritz1 binary and every
+# error it prints becomes a diagnostic.  ritz1 is run, not linked: its front
+# end keeps process-wide parser state and exits on some errors, so one
+# compile per process is the only way it is meant to be used.
+#
+# ritz1 prints one line per error (ritz1/src/diag.ritz):
+#
+#     <file>:<line>:<col>: error: <message>
+#
+# A line located in the buffer becomes a diagnostic at that position (1-based
+# in, 0-based out, spanning the identifier there).  A located line in another
+# file (an import) and an unlocated `error` line become a diagnostic on the
+# first line carrying the whole line.  `note:` lines are dropped.  A failed
+# compile with no error line still gets one diagnostic naming the exit.
+#
+# Which ritz1:  $RITZ1 if set; else the monorepo's projects/ritz/ritz1/build/
+# ritz1 next to this binary (projects/ritz-lsp/build/debug/ritz-lsp); else
+# `ritz1` on $PATH.  With none, one warning says so.
+#
+# Where:  the buffer is written to <scratch>/<hash of uri>/<file name>, so
+# ritz1's messages name the document's file, nothing lands next to the
+# document, and ritz1's per-source cache gets one entry per document rather
+# than one per keystroke.  <scratch> is $XDG_RUNTIME_DIR/ritz-lsp, else
+# ${TMPDIR:-/tmp}/ritz-lsp-<uid>.  The copy, its output and the directory
+# are removed after each compile.
+#
+# Imports:  `-I` lists the document's directory and its ancestors (ritz1
+# looks for a relative import there, as it would beside the real file), then
+# the monorepo's projects/ritz for ritzlib.  ritz1 appends $RITZ_PATH.
+#
+# The compile runs on the request loop: a ritz1 that hangs stalls the server.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.process
+import ritzlib.os.env
+import ritzlib.fs
+import ritzlib.json
+
+import symbols
+
+const SEV_ERROR: i64 = 1
+const SEV_WARNING: i64 = 2
+
+# =============================================================================
+# Paths
+# =============================================================================
+
+# The monorepo's projects/ directory, four levels above this binary, or ""
+# if /proc/self/exe cannot be read.
+fn projects_dir() -> String
+    var buf: [4096]u8
+    let p: *u8 = @buf[0]
+    let n: i64 = sys_readlink(c"/proc/self/exe", p, 4095)
+    var end: i64 = n
+    var up: i32 = 0
+    while up < 4 and end > 0
+        end -= 1
+        while end > 0 and *(p + end) != '/'
+            end -= 1
+        up += 1
+    if n <= 0 or end <= 0
+        return string_new()
+    string_from_bytes(p, end)
+
+fn exists(path: @&String, mode: i32) -> bool
+    sys_access(string_as_ptr(path), mode) == 0
+
+# The ritz1 to run, or "" if there is none.
+fn find_ritz1() -> String
+    match env_get("RITZ1")
+        Some(v) => return string_from_strview(v)
+        None => 0
+    var p: String = projects_dir()
+    if string_len(@p) > 0
+        string_push_str(@&p, "/ritz/ritz1/build/ritz1")
+        if exists(@&p, X_OK)
+            return p
+    string_drop(@&p)
+    match find_command("ritz1")
+        Some(found) => found
+        None => string_new()
+
+# The decoded file-system path of a file:// uri, or "" for any other uri.
+fn uri_path(uri: *u8) -> String
+    var out: String = string_new()
+    let n: i64 = strlen(uri)
+    if n < 7 or memcmp(uri, c"file://", 7) != 0
+        return out
+    var i: i64 = 7
+    while i < n
+        let c: u8 = *(uri + i)
+        if c == '%' and i + 2 < n and hex_val(*(uri + i + 1)) >= 0 and hex_val(*(uri + i + 2)) >= 0
+            string_push(@&out, (hex_val(*(uri + i + 1)) * 16 + hex_val(*(uri + i + 2))) as u8)
+            i += 3
+        else
+            string_push(@&out, c)
+            i += 1
+    out
+
+fn hex_val(c: u8) -> i32
+    if c >= '0' and c <= '9'
+        return (c - '0') as i32
+    if c >= 'a' and c <= 'f'
+        return (c - 'a') as i32 + 10
+    if c >= 'A' and c <= 'F'
+        return (c - 'A') as i32 + 10
+    -1
+
+# Offset of the last '/' in s, or -1.
+fn last_slash(s: *u8, len: i64) -> i64
+    var i: i64 = len - 1
+    while i >= 0 and *(s + i) != '/'
+        i -= 1
+    i
+
+# FNV-1a of a C string, as 16 hex digits appended to `out`.
+fn push_hash_hex(out: @&String, s: *u8)
+    var h: u64 = 14695981039346656037
+    var i: i64 = 0
+    while *(s + i) != 0
+        h = (h ^ (*(s + i) as u64)) * 1099511628211
+        i += 1
+    var k: i32 = 60
+    while k >= 0
+        let d: u64 = (h >> (k as u64)) & 15
+        if d < 10
+            string_push(out, ('0' as u64 + d) as u8)
+        else
+            string_push(out, ('a' as u64 + d - 10) as u8)
+        k -= 4
+
+# The private directory compiles happen under (created, mode 0700).
+fn scratch_root() -> String
+    var out: String = string_new()
+    match env_get("XDG_RUNTIME_DIR")
+        Some(v) =>
+            if v.len > 0
+                string_push_str(@&out, v)
+                string_push_str(@&out, "/ritz-lsp")
+        None => 0
+    if string_len(@out) == 0
+        string_push_str(@&out, env_get_or("TMPDIR", "/tmp"))
+        string_push_str(@&out, "/ritz-lsp-")
+        string_push_i64(@&out, sys_getuid() as i64)
+    sys_mkdir(string_as_ptr(@&out), 448)
+    out
+
+# `-I`: the document's directory and up to 7 ancestors, then projects/ritz.
+fn import_path(doc_path: @&String) -> String
+    var out: String = string_new()
+    let p: *u8 = string_as_ptr(doc_path)
+    var end: i64 = last_slash(p, string_len(doc_path))
+    var levels: i32 = 0
+    while end > 0 and levels < 8
+        if string_len(@out) > 0
+            string_push(@&out, ':')
+        string_push_bytes(@&out, p, end)
+        end = last_slash(p, end)
+        levels += 1
+    var root: String = projects_dir()
+    if string_len(@root) > 0
+        string_push_str(@&root, "/ritz")
+        var lib: String = string_clone(@root)
+        string_push_str(@&lib, "/ritzlib")
+        if exists(@&lib, 0)
+            if string_len(@out) > 0
+                string_push(@&out, ':')
+            string_push_string(@&out, @root)
+        string_drop(@&lib)
+    string_drop(@&root)
+    out
+
+# =============================================================================
+# Diagnostics JSON
+# =============================================================================
+
+struct DiagList
+    json: Vec<u8>       # `{...},{...}` -- the array's elements
+    count: i32
+
+fn add_diag(dl: *DiagList, line: i64, col: i64, end_col: i64, sev: i64, msg: *u8, msg_len: i64)
+    if dl.count > 0
+        vec_push<u8>(@&dl.json, ',')
+    vec_push_str(@&dl.json, c"{\"range\":")
+    push_range(@dl.json, line, col, line, end_col)
+    vec_push_str(@&dl.json, c",\"severity\":")
+    var tmp: [32]u8
+    itoa(sev, @tmp[0])
+    vec_push_str(@&dl.json, @tmp[0])
+    vec_push_str(@&dl.json, c",\"source\":\"ritz1\",\"message\":")
+    # json_emit_string reads up to a NUL, so terminate a copy.
+    var m: String = string_from_bytes(msg, msg_len)
+    json_emit_string(string_as_ptr(@&m), @dl.json)
+    string_drop(@&m)
+    vec_push<u8>(@&dl.json, '}')
+    dl.count += 1
+
+# One at the start of the document, carrying a whole line of output.
+fn add_unlocated(dl: *DiagList, sev: i64, msg: *u8, msg_len: i64)
+    add_diag(dl, 0, 0, 0, sev, msg, msg_len)
+
+fn add_cstr(dl: *DiagList, sev: i64, msg: @&String)
+    add_unlocated(dl, sev, string_as_ptr(msg), string_len(msg))
+
+# Parse decimal digits at s[i..]; the value, and `*next` past them (or -1
+# if there are none).
+fn parse_num(s: *u8, i: i64, len: i64, next: *i64) -> i64
+    var v: i64 = 0
+    var j: i64 = i
+    while j < len and *(s + j) >= '0' and *(s + j) <= '9'
+        v = v * 10 + (*(s + j) - '0') as i64
+        j += 1
+    if j == i
+        *next = -1
+    else
+        *next = j
+    v
+
+fn starts_with_at(s: *u8, i: i64, len: i64, lit: *u8) -> bool
+    let n: i64 = strlen(lit)
+    i + n <= len and memcmp(s + i, lit, n) == 0
+
+fn contains_error(s: *u8, len: i64) -> bool
+    var i: i64 = 0
+    while i + 5 <= len
+        let c: u8 = *(s + i)
+        if (c == 'e' or c == 'E') and memcmp(s + i + 1, c"rror", 4) == 0
+            return true
+        i += 1
+    false
+
+# One line of ritz1's stderr.  `input` is the path ritz1 was given.
+fn add_line(dl: *DiagList, text: *u8, text_len: i64, input: *u8, s: *u8, len: i64)
+    if len == 0 or starts_with_at(s, 0, len, c"note:")
+        return
+    let in_len: i64 = strlen(input)
+    if starts_with_at(s, 0, len, input) and in_len < len and *(s + in_len) == ':'
+        var after_line: i64 = -1
+        let line: i64 = parse_num(s, in_len + 1, len, @after_line)
+        if after_line > 0 and after_line < len and *(s + after_line) == ':'
+            var after_col: i64 = -1
+            let col: i64 = parse_num(s, after_line + 1, len, @after_col)
+            if after_col > 0 and line > 0 and col > 0
+                var sev: i64 = 0
+                var msg: i64 = 0
+                if starts_with_at(s, after_col, len, c": error: ")
+                    sev = SEV_ERROR
+                    msg = after_col + 9
+                else if starts_with_at(s, after_col, len, c": warning: ")
+                    sev = SEV_WARNING
+                    msg = after_col + 11
+                if sev != 0
+                    let w: Word = word_at(text, text_len, line - 1, col - 1)
+                    var end_col: i64 = col
+                    if w.start >= 0
+                        end_col = col - 1 + w.end - doc_offset(text, text_len, line - 1, col - 1)
+                    add_diag(dl, line - 1, col - 1, end_col, sev, s + msg, len - msg)
+                    return
+    if contains_error(s, len)
+        add_unlocated(dl, SEV_ERROR, s, len)
+
+# Every line of `err` (ritz1's stderr) into `dl`.
+fn add_output(dl: *DiagList, text: *u8, text_len: i64, input: *u8, err: @Vec<u8>)
+    var start: i64 = 0
+    var i: i64 = 0
+    while i <= err.len
+        if i == err.len or *(err.data + i) == '\n'
+            var end: i64 = i
+            if end > start and *(err.data + end - 1) == '\r'
+                end -= 1
+            add_line(dl, text, text_len, input, err.data + start, end - start)
+            start = i + 1
+        i += 1
+
+# =============================================================================
+# Running ritz1
+# =============================================================================
+
+# Compile `text` as the document `uri` with ritz1; its diagnostics into `dl`.
+fn compile(dl: *DiagList, uri: *u8, text: *u8, text_len: i64)
+    var ritz1: String = find_ritz1()
+    if string_len(@ritz1) == 0
+        var m: String = string_from("ritz-lsp: no ritz1 to run (set RITZ1, put ritz1 on PATH, or build it: make -C projects/ritz ritz1); no compiler diagnostics")
+        add_cstr(dl, SEV_WARNING, @&m)
+        string_drop(@&m)
+        string_drop(@&ritz1)
+        return
+
+    var doc_path: String = uri_path(uri)
+    let dp: *u8 = string_as_ptr(@&doc_path)
+    let slash: i64 = last_slash(dp, string_len(@doc_path))
+    var base: String = string_from_cstr(dp + slash + 1)
+    if string_len(@base) == 0
+        string_push_str(@&base, "buffer.ritz")
+
+    var dir: String = scratch_root()
+    string_push(@&dir, '/')
+    push_hash_hex(@&dir, uri)
+    sys_mkdir(string_as_ptr(@&dir), 448)
+    var input: String = string_clone(@dir)
+    string_push(@&input, '/')
+    string_push_string(@&input, @base)
+    var output: String = string_clone(@dir)
+    string_push_str(@&output, "/ritz-lsp-out.ll")
+    var ipath: String = import_path(@&doc_path)
+
+    match write_file(string_as_view(@input), strview_from_ptr(text, text_len))
+        Ok(n) => run_ritz1(dl, @&ritz1, @&input, @&output, @&ipath, text, text_len)
+        Err(e) => write_failed(dl, @&input, e)
+
+    sys_unlink(string_as_ptr(@&input))
+    sys_unlink(string_as_ptr(@&output))
+    sys_rmdir(string_as_ptr(@&dir))
+    string_drop(@&ipath)
+    string_drop(@&output)
+    string_drop(@&input)
+    string_drop(@&dir)
+    string_drop(@&base)
+    string_drop(@&doc_path)
+    string_drop(@&ritz1)
+
+fn write_failed(dl: *DiagList, input: @&String, errno: i32)
+    var m: String = string_from("ritz-lsp: cannot write ")
+    string_push_string(@&m, input)
+    string_push_str(@&m, " (errno ")
+    string_push_i64(@&m, errno as i64)
+    string_push_str(@&m, "); no compiler diagnostics")
+    add_cstr(dl, SEV_WARNING, @&m)
+    string_drop(@&m)
+
+fn run_ritz1(dl: *DiagList, ritz1: @&String, input: @&String, output: @&String, ipath: @&String, text: *u8, text_len: i64)
+    var args: [5]StrView
+    args[0] = string_as_view(input)
+    args[1] = "-o"
+    args[2] = string_as_view(output)
+    args[3] = "-I"
+    args[4] = string_as_view(ipath)
+    var nargs: i64 = 5
+    if string_len(ipath) == 0
+        nargs = 3
+    match spawn(string_as_view(ritz1), span_from_ptr<StrView>(@args[0], nargs))
+        Ok(p) => collect(dl, p, input, text, text_len)
+        Err(e) => spawn_failed(dl, ritz1, e)
+
+fn spawn_failed(dl: *DiagList, ritz1: @&String, errno: i32)
+    var m: String = string_from("ritz-lsp: cannot run ritz1 ")
+    string_push_string(@&m, ritz1)
+    string_push_str(@&m, " (errno ")
+    string_push_i64(@&m, errno as i64)
+    string_push_str(@&m, "); no compiler diagnostics")
+    add_cstr(dl, SEV_WARNING, @&m)
+    string_drop(@&m)
+
+fn collect(dl: *DiagList, p: Process, input: @&String, text: *u8, text_len: i64)
+    var q: Process = p
+    process_close_stdin(@&q)
+    var err: Vec<u8> = process_read_stderr_all(@&q)
+    var out: Vec<u8> = process_read_stdout_all(@&q)
+    let r: ProcessResult = process_wait(@&q)
+    process_cleanup(@&q)
+    add_output(dl, text, text_len, string_as_ptr(input), @err)
+    if dl.count == 0 and not result_success(@r)
+        var m: String = string_from("ritz1 failed with no error message (exit ")
+        string_push_i64(@&m, r.exit_code as i64)
+        string_push_str(@&m, ")")
+        add_cstr(dl, SEV_ERROR, @&m)
+        string_drop(@&m)
+    vec_drop<u8>(@&out)
+    vec_drop<u8>(@&err)
+
+# The textDocument/publishDiagnostics params for `uri` at `version` into
+# `out`, from a ritz1 compile of `text`.
+pub fn diagnostics_json(uri: *u8, version: i64, text: *u8, text_len: i64, out: *Vec<u8>)
+    var dl: DiagList = DiagList { json: vec_with_cap<u8>(256), count: 0 }
+    compile(@dl, uri, text, text_len)
+    vec_clear<u8>(out)
+    vec_push_str(out, c"{\"uri\":")
+    json_emit_string(uri, out)
+    vec_push_str(out, c",\"version\":")
+    var tmp: [32]u8
+    itoa(version, @tmp[0])
+    vec_push_str(out, @tmp[0])
+    vec_push_str(out, c",\"diagnostics\":[")
+    vec_push_bytes<u8>(out, dl.json.data, dl.json.len)
+    vec_push_str(out, c"]}")
+    vec_drop<u8>(@&dl.json)

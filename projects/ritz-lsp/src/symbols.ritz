@@ -1,0 +1,249 @@
+# symbols.ritz - function names in an open document (AGAST #2789)
+#
+# Hover and go-to-definition for a function name in the open document.
+# These read the buffer the editor sent, not a ritz1 compile: they answer
+# while the buffer is half-typed and does not parse, and they need no
+# compiler on the machine.
+#
+# A function declaration is a line whose first words are `fn <name>`,
+# optionally after `pub`, `extern` or `async` and any indentation (methods
+# in an `impl` are indented).  Ritz has no block comments and no multi-line
+# string literals, so a `fn` that starts a line is never inside either.
+#
+# Positions are 0-based (line, column).  Columns count bytes, which match
+# LSP's UTF-16 columns on ASCII lines; a line with multi-byte characters
+# before the name is off by their extra bytes.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.json
+
+# =============================================================================
+# Bytes and lines
+# =============================================================================
+
+fn is_ident_start(c: u8) -> bool
+    (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or c == '_'
+
+fn is_ident_char(c: u8) -> bool
+    is_ident_start(c) or (c >= '0' and c <= '9')
+
+fn is_blank(c: u8) -> bool
+    c == ' ' or c == '\t'
+
+# Offset of the first byte of line `line`, or -1 if the text has fewer lines.
+pub fn line_start(text: *u8, len: i64, line: i64) -> i64
+    if line < 0
+        return -1
+    var i: i64 = 0
+    var l: i64 = 0
+    while l < line
+        if i >= len
+            return -1
+        if *(text + i) == '\n'
+            l += 1
+        i += 1
+    i
+
+# Offset of the end of the line starting at `start` (its '\n', or `len`).
+pub fn line_end(text: *u8, len: i64, start: i64) -> i64
+    var i: i64 = start
+    while i < len and *(text + i) != '\n'
+        i += 1
+    i
+
+# Offset of (line, col), or -1 if that is not a byte on that line.
+pub fn doc_offset(text: *u8, len: i64, line: i64, col: i64) -> i64
+    let start: i64 = line_start(text, len, line)
+    if start < 0 or col < 0
+        return -1
+    if start + col >= line_end(text, len, start)
+        return -1
+    start + col
+
+# The line holding offset `off` (0-based).
+fn line_of(text: *u8, off: i64) -> i64
+    var l: i64 = 0
+    var i: i64 = 0
+    while i < off
+        if *(text + i) == '\n'
+            l += 1
+        i += 1
+    l
+
+# Whether offset `off` on the line starting at `start` is code: not inside
+# a string or char literal, and not after a `#` comment.
+fn is_code(text: *u8, start: i64, off: i64) -> bool
+    var i: i64 = start
+    var quote: u8 = 0
+    while i < off
+        let c: u8 = *(text + i)
+        if quote != 0
+            if c == '\\'
+                i += 1
+            else if c == quote
+                quote = 0
+        else if c == '"' or c == '\''
+            quote = c
+        else if c == '#'
+            return false
+        i += 1
+    quote == 0
+
+# =============================================================================
+# Words and declarations
+# =============================================================================
+
+# A name in the document: bytes [start, end).
+struct Word
+    start: i64
+    end: i64
+
+fn no_word() -> Word
+    Word { start: -1, end: -1 }
+
+# The identifier covering (line, col), or no_word() if that byte is not part
+# of an identifier in code.
+pub fn word_at(text: *u8, len: i64, line: i64, col: i64) -> Word
+    let off: i64 = doc_offset(text, len, line, col)
+    if off < 0 or not is_ident_char(*(text + off))
+        return no_word()
+    var s: i64 = off
+    while s > 0 and is_ident_char(*(text + s - 1))
+        s -= 1
+    var e: i64 = off
+    while e < len and is_ident_char(*(text + e))
+        e += 1
+    if not is_code(text, line_start(text, len, line), s)
+        return no_word()
+    Word { start: s, end: e }
+
+# If bytes [i, end) start with keyword `kw` followed by a blank, the offset
+# after the keyword and its blanks; else -1.
+fn skip_keyword(text: *u8, i: i64, end: i64, kw: *u8) -> i64
+    let n: i64 = strlen(kw)
+    if i + n >= end
+        return -1
+    if memcmp(text + i, kw, n) != 0 or not is_blank(*(text + i + n))
+        return -1
+    var j: i64 = i + n
+    while j < end and is_blank(*(text + j))
+        j += 1
+    j
+
+# The name declared by the line [start, end) if it declares a function.
+fn decl_name(text: *u8, start: i64, end: i64) -> Word
+    var i: i64 = start
+    while i < end and is_blank(*(text + i))
+        i += 1
+    loop
+        var j: i64 = skip_keyword(text, i, end, c"pub")
+        if j < 0
+            j = skip_keyword(text, i, end, c"extern")
+        if j < 0
+            j = skip_keyword(text, i, end, c"async")
+        if j < 0
+            break
+        i = j
+    i = skip_keyword(text, i, end, c"fn")
+    if i < 0 or not is_ident_start(*(text + i))
+        return no_word()
+    var e: i64 = i
+    while e < end and is_ident_char(*(text + e))
+        e += 1
+    Word { start: i, end: e }
+
+# The first function declaration named text[w.start, w.end), or no_word().
+pub fn find_fn_decl(text: *u8, len: i64, w: Word) -> Word
+    let n: i64 = w.end - w.start
+    var start: i64 = 0
+    while start < len
+        let end: i64 = line_end(text, len, start)
+        let d: Word = decl_name(text, start, end)
+        if d.start >= 0 and d.end - d.start == n and memcmp(text + d.start, text + w.start, n) == 0
+            return d
+        start = end + 1
+    no_word()
+
+# =============================================================================
+# LSP answers
+# =============================================================================
+
+fn push_i64(buf: *Vec<u8>, n: i64)
+    var tmp: [32]u8
+    itoa(n, @tmp[0])
+    vec_push_str(buf, @tmp[0])
+
+# `{"line":L,"character":C}`
+pub fn push_position(buf: *Vec<u8>, line: i64, col: i64)
+    vec_push_str(buf, c"{\"line\":")
+    push_i64(buf, line)
+    vec_push_str(buf, c",\"character\":")
+    push_i64(buf, col)
+    vec_push<u8>(buf, '}')
+
+# `{"start":...,"end":...}`
+pub fn push_range(buf: *Vec<u8>, l0: i64, c0: i64, l1: i64, c1: i64)
+    vec_push_str(buf, c"{\"start\":")
+    push_position(buf, l0, c0)
+    vec_push_str(buf, c",\"end\":")
+    push_position(buf, l1, c1)
+    vec_push<u8>(buf, '}')
+
+# The range of word `w`, which lies on one line.
+fn push_word_range(buf: *Vec<u8>, text: *u8, w: Word)
+    let line: i64 = line_of(text, w.start)
+    let col: i64 = w.start - line_start(text, w.end, line)
+    push_range(buf, line, col, line, col + w.end - w.start)
+
+# The declaration of the function named at (line, col), or no_word().
+fn decl_at(text: *u8, len: i64, line: i64, col: i64) -> Word
+    let w: Word = word_at(text, len, line, col)
+    if w.start < 0
+        return no_word()
+    find_fn_decl(text, len, w)
+
+# Hover: the result JSON for (line, col) into `out` ("null" if it names no
+# function declared in the document).
+pub fn hover_json(text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
+    vec_clear<u8>(out)
+    let w: Word = word_at(text, len, line, col)
+    var d: Word = no_word()
+    if w.start >= 0
+        d = find_fn_decl(text, len, w)
+    if d.start < 0
+        vec_push_str(out, c"null")
+        return
+    # The declaration's line, without its indentation or trailing blanks.
+    var s: i64 = line_start(text, len, line_of(text, d.start))
+    var e: i64 = line_end(text, len, d.start)
+    while s < e and is_blank(*(text + s))
+        s += 1
+    while e > s and (is_blank(*(text + e - 1)) or *(text + e - 1) == '\r')
+        e -= 1
+    var md: Vec<u8> = vec_with_cap<u8>(64 + e - s)
+    vec_push_str(@&md, c"```ritz\n")
+    vec_push_bytes<u8>(@&md, text + s, e - s)
+    vec_push_str(@&md, c"\n```")
+    vec_push<u8>(@&md, 0)
+    vec_push_str(out, c"{\"contents\":{\"kind\":\"markdown\",\"value\":")
+    json_emit_string(md.data, out)
+    vec_push_str(out, c"},\"range\":")
+    push_word_range(out, text, w)
+    vec_push<u8>(out, '}')
+    vec_drop<u8>(@&md)
+
+# Definition: the Location JSON for (line, col) into `out` ("null" if it
+# names no function declared in the document).
+pub fn definition_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
+    vec_clear<u8>(out)
+    let d: Word = decl_at(text, len, line, col)
+    if d.start < 0
+        vec_push_str(out, c"null")
+        return
+    vec_push_str(out, c"{\"uri\":")
+    json_emit_string(uri, out)
+    vec_push_str(out, c",\"range\":")
+    push_word_range(out, text, d)
+    vec_push<u8>(out, '}')

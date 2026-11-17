@@ -2,6 +2,17 @@
 
 This document describes the technical architecture of the Ritz Language Server.
 
+> **What is built today (AGAST #2789)** is much smaller than the design below:
+> `src/transport.ritz` / `protocol.ritz` (JSON-RPC over stdio),
+> `documents.ritz` (full-text sync), `symbols.ritz` (hover and definition by
+> scanning the open buffer for `fn <name>` lines) and `diagnostics.ritz`
+> (runs the `ritz1` binary on a scratch copy of the buffer and turns its
+> `file:line:col: error:` lines into `publishDiagnostics`). ritz1 is run, not
+> linked: its front end keeps process-wide parser state. There is no symbol
+> table, type database, index or cache. The README's Diagnostics and Hover
+> sections are the reference for current behaviour; the rest of this
+> document is the plan.
+
 ## Overview
 
 The Ritz Language Server implements the [Language Server Protocol (LSP)](https://microsoft.github.io/language-server-protocol/) to provide IDE features for the Ritz programming language. It acts as a bridge between editors and the Ritz compiler infrastructure.
