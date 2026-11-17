@@ -22,14 +22,12 @@ This document outlines the ideal architecture for the Ritz parser system. The go
 | `emit_min.ritz` | 982 | OK | Minimal emitter for bootstrap |
 | `ir.ritz` | 751 | OK | IR types and operations |
 | `emitter.ritz` | 696 | OK | Full emitter (unused in bootstrap) |
-| `lexer_nfa.ritz` | 467 | OK | NFA-based lexer |
+| `lexer_nfa.ritz` | 990 | OK | Direct-coded lexer (AGAST #1821; no NFA, the name stayed) |
 | `ast.ritz` | 333 | ✅ | AST types and constants |
-| `nfa.ritz` | 289 | ✅ | NFA primitives |
 | `main.ritz` | 242 | ✅ | Entry point |
-| `regex.ritz` | 206 | ✅ | Regex → NFA |
 | `layout.ritz` | 143 | ✅ | Struct layout computation |
 | `tokens.ritz` | 135 | ✅ | Token constants (generated) |
-| `lexer_setup_gen.ritz` | 107 | ✅ | Lexer pattern registration (generated) |
+| `lexer_scan_gen.ritz` | 280 | ✅ | Keyword and operator matchers (generated) |
 
 ### Current Pipeline
 
@@ -40,7 +38,7 @@ ritz_generator.py + grammar_parser.py
     ↓
 ├── tokens.ritz (generated, 135 lines)
 ├── parser.ritz (generated, 3,569 lines) ← PROBLEM
-├── lexer_setup_gen.ritz (generated, 107 lines)
+├── lexer_scan_gen.ritz (generated)
 └── ast_helpers.ritz (hand-written, 1,171 lines)
 ```
 
@@ -73,7 +71,7 @@ ritz1.grammar
 ritz_generator.py (enhanced)
     ↓
 ├── tokens.ritz          (107 lines) - constants
-├── lexer_setup_gen.ritz (135 lines) - pattern registration
+├── lexer_scan_gen.ritz - keyword and operator matchers
 ├── parser_core.ritz     (~100 lines) - p_peek, p_advance, parser_init
 ├── parser_toplevel.ritz (~200 lines) - module, item, fn_def, struct_def
 ├── parser_stmt.ritz     (~300 lines) - stmt, if_stmt, while_stmt, assign_stmt
@@ -129,14 +127,12 @@ ast_helpers/
 ┌─────────────────────────────────────────────────────────────────┐
 │                         TOKEN LAYER                             │
 │  tokens.ritz - Token kind constants                             │
-│  lexer_setup_gen.ritz - Pattern registration                    │
+│  lexer_scan_gen.ritz - Keyword and operator matchers            │
 └─────────────────────────────────────────────────────────────────┘
                               ↓ uses
 ┌─────────────────────────────────────────────────────────────────┐
 │                          LEXER LAYER                            │
-│  lexer_nfa.ritz - NFA-based lexer (hand-written)               │
-│  nfa.ritz - NFA primitives (hand-written)                      │
-│  regex.ritz - Regex to NFA (hand-written)                      │
+│  lexer_nfa.ritz - Direct-coded scanner (hand-written)           │
 └─────────────────────────────────────────────────────────────────┘
                               ↓ produces tokens
 ┌─────────────────────────────────────────────────────────────────┐

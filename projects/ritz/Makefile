@@ -265,7 +265,7 @@ matrix-full: regen-check | _matrix_ritz1_built
 # fix the source, regen, or both.
 #
 # Covers every generated file that is committed verbatim: parser_gen,
-# tokens_gen and lexer_setup_gen (the last was unchecked until #1436, which had
+# tokens_gen and lexer_scan_gen (lexer_setup_gen until #1821; it was unchecked until #1436, which had
 # to change the generator and the generated file in step). ast_helpers.ritz is
 # NOT checked: it is hand-written.  The generator emits only a stub listing the
 # constructor names the grammar actions call, so there is no generated copy.
@@ -274,7 +274,7 @@ matrix-full: regen-check | _matrix_ritz1_built
 # so a failed generator skipped it and the trailing `rm` returned 0.
 #
 # See docs/VALIDATION.md "Hard rules" — the grammar is the source of truth.
-REGEN_PAIRS := parser.ritz:parser_gen.ritz tokens.ritz:tokens_gen.ritz lexer_setup_gen.ritz:lexer_setup_gen.ritz
+REGEN_PAIRS := parser.ritz:parser_gen.ritz tokens.ritz:tokens_gen.ritz lexer_scan_gen.ritz:lexer_scan_gen.ritz
 regen-check:
 	@TMPDIR=$$(mktemp -d) ; \
 	  if ! $(PYTHON) tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar \

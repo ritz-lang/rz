@@ -20,10 +20,8 @@ RITZ1_SELFHOSTED = build/ritz1_selfhosted
 SRC_DIR = src
 SOURCES = \
 	tokens_gen \
-	nfa \
-	regex \
+	lexer_scan_gen \
 	lexer_nfa \
-	lexer_setup_gen \
 	ast \
 	diag \
 	ast_helpers \

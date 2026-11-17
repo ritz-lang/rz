@@ -28,12 +28,12 @@ One case per reachable token path, because each path had its own
 green". A mutation run (revert one site, expect exactly its case red) confirms
 four of the five sites are individually covered.
 
-The fifth — the hand-written `c"..."` prefix scanner — is widened too but CANNOT
-be covered: it is dead for every input that yields a token. It accepts
-`c"` (not quote/newline/backslash | backslash-escape)* `"`, a strict subset of
-the NFA's own `c"([^"\\]|\\.)*"`, and the NFA takes the longest match; so any
-string the fallback could close, the NFA already lexed as TOK_CSTRING. The
-`cstring-literal` case below therefore exercises the generic NFA path. The exit code
+The fifth — the hand-written `c"..."` prefix scanner — CANNOT be covered: a
+`c"` with a closing quote anywhere after it is a TOK_CSTRING by the longest
+match, and one without can never close on its own line. Since AGAST #1821 it
+is lexer_scan_string reached from the identifier `c`, the same function (and
+the same i64 `start`) as the `string-literal` case. The `cstring-literal`
+case below exercises lexer_emit's c"..." path. The exit code
 separates "wrong offset" (the defect, 3) from "wrong token kind" (a broken
 probe, 4) — a probe that lexes the wrong thing proves nothing either way.
 
@@ -56,30 +56,20 @@ RITZ1_SRC = RITZ_ROOT / "ritz1" / "src"
 
 # The lexer and everything it transitively imports. ritz0 compiles one module
 # at a time, so each is compiled and linked explicitly.
-LOCAL_MODULES = ["tokens_gen", "nfa", "regex", "lexer_nfa", "lexer_setup_gen"]
+LOCAL_MODULES = ["tokens_gen", "lexer_scan_gen", "lexer_nfa"]
 RITZLIB_MODULES = ["memory", "strview", "sys", "str", "fmt"]  # str imports fmt (itoa)
 
 PROBE_HEAD = """\
 import tokens_gen
-import nfa
 import lexer_nfa
-import lexer_setup_gen
 
 # Returns start-minus-2^32 (0 when the position survived), or -1 if the lexer
 # produced a different token kind than the case expects.
 fn probe(buf: *u8, n: i64, want_kind: i32) -> i64
-    var nfa_storage: NFA
-    var patterns_storage: [128]TokenPattern
-    var states_storage: [4096]NFAState
-    var trans_storage: [8192]Transition
-    var sto_storage: [4096]i32
-    var stc_storage: [4096]i32
-    var ti_storage:  [8192]i32
     var lex: Lexer
-    setup_lexer(@lex, @nfa_storage, @patterns_storage[0], @states_storage[0], @trans_storage[0], @sto_storage[0], @stc_storage[0], @ti_storage[0], 4096, 8192)
     let big: i64 = 4294967296
     let base: *u8 = ((buf as i64) - big) as *u8
-    lexer_reset(@lex, base, big + n)
+    lexer_init(@lex, base, big + n)
     lex.pos = big
     lex.at_line_start = 0
     var tok: Token = lexer_next(@lex)
@@ -98,13 +88,13 @@ fn main() -> i32
 
 # (id, source bytes as a c-string literal, length, expected token kind)
 CASES = [
-    # lexer_nfa.ritz — the generic NFA-match path, `let start` at the tail
+    # lexer_nfa.ritz — the generic path (lexer_emit)
     pytest.param('c"abc "', 4, "TOK_IDENT", id="ident-generic-path"),
     # string literal path: `let start` and the derived `len`
     pytest.param('c"\\"ab\\" "', 5, "TOK_STRING", id="string-literal"),
     # newline token path
     pytest.param('c"\\nx"', 2, "TOK_NEWLINE", id="newline"),
-    # c"..." literal — lexed by the NFA pattern, i.e. the generic path again
+    # c"..." literal — matched by lexer_scan_ident, i.e. lexer_emit again
     pytest.param('c"c\\"ab\\" "', 6, "TOK_CSTRING", id="cstring-literal"),
     # no pattern matches -> single-char error token path
     pytest.param('c"` "', 2, "TOK_ERROR", id="error-token"),

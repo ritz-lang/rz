@@ -27,8 +27,8 @@ input.ritz
   │ fn_cache       check_source_unchanged: if the sig file records this source,
   │                this compiler and unchanged imports, reuse the .ll and stop
   ▼
-[lex]       lexer_setup_gen registers the token patterns; lexer_nfa runs them
-  │         (nfa + regex) longest-match, tracking indentation
+[lex]       lexer_nfa scans tokens longest-match (lexer_scan_gen's generated
+  │         keyword and operator matchers), tracking indentation
   ▼
 [parse]     parser_gen (generated recursive descent) calls ast_helpers to
   │         build the AST (ast). Errors are located via diag.
@@ -105,9 +105,8 @@ Sizes and imports are in [Measurements](#measurements).
 | Module | Responsibility |
 |---|---|
 | `tokens_gen` | Token kinds and the `Token` struct. Generated from `grammars/ritz1.grammar`. |
-| `nfa`, `regex` | Thompson-construction NFA engine, and the regex parser that builds NFAs from pattern strings. |
-| `lexer_nfa` | Multi-pattern lexer: longest match, first-definition priority, indentation and bracket tracking, string escapes. |
-| `lexer_setup_gen` | Registers the grammar's token patterns with the lexer. Generated. |
+| `lexer_nfa` | The lexer: a direct-coded scanner (longest match, a keyword beating an identifier of the same text), indentation and bracket tracking, string escapes. No NFA since #1821; the name stayed. |
+| `lexer_scan_gen` | The grammar's keywords and operators as direct-coded matchers. Generated; ritzgen refuses a regex token `lexer_nfa` does not implement. |
 | `parser_gen` | Recursive-descent parser. Generated. |
 | `ast` | AST node structs (`Expr`, `Stmt`, `FnDef`, `StructDef`, `Module`, ...) and kind constants. |
 | `ast_helpers` | AST constructors the grammar's actions call, the parser arena, type-alias and array-length folding, and AST queries used everywhere downstream. Hand-written (see below). |
@@ -200,8 +199,6 @@ Tracked under AGAST #1812 (M1.3). The measurements below show its shape.
   `TypeRef` and one table is #1889.
 - **C idioms** — `i32` flags for bool, `*u8`+length for names, kind codes
   as ints. #1820.
-- **Lexer** — runtime NFA built per file with recursive backtracking; a
-  generated scanner is #1821.
 - **Grammar** — special-cased assignment forms and parser shape; #1819.
 
 ## Measurements

@@ -10,7 +10,7 @@ Reads a .grammar file and generates:
 5. parser_expr.ritz - Expression parsing (binary, unary, postfix, primary)
 6. parser_type.ritz - Type parsing (type_spec, generic_params)
 7. ast_helpers.ritz - AST node constructor stubs
-8. lexer_setup_gen.ritz - Lexer pattern registration
+8. lexer_scan_gen.ritz - Direct-coded keyword and operator scanner
 
 THIS FILE IS THE GENERATOR - the output files are auto-generated Ritz code.
 
@@ -115,6 +115,28 @@ HAND_WRITTEN_TOKEN_IDS = {
     # Whitespace
     'WHITESPACE': 140, 'COMMENT': 141,
 }
+
+
+# Grammar tokens the lexer makes itself, never by matching a pattern.
+SCANNER_SKIP_TOKENS = frozenset({'EOF', 'ERROR', 'SKIP', 'NEWLINE', 'INDENT', 'DEDENT', 'ASM_LINE'})
+
+# The regex tokens ritz1/src/lexer_nfa.ritz scans by hand, exactly as the
+# grammar spells them (AGAST #1821).  The generator refuses any other
+# pattern: a changed regex needs its scan_* function changed with it.
+SCANNED_REGEX_TOKENS = {
+    'IDENT': r'[a-zA-Z_][a-zA-Z0-9_]*',             # lexer_scan_ident
+    'NUMBER': r'0x[0-9a-fA-F]+|0b[01]+|[0-9]+',     # lexer_scan_number
+    'FLOAT': r'[0-9]+\.[0-9]+',                     # lexer_scan_number
+    'STRING': r'"([^"\\]|\\.)*"',                 # lexer_scan_string
+    'CHAR': r"'([^'\\]|\\.|\\x[^'\n]*)'",         # lexer_scan_char
+    'CSTRING': r'c"([^"\\]|\\.)*"',               # lexer_cstring_end
+    'WHITESPACE': r'[ \t\r]+',                      # lexer_next_token
+    'COMMENT': r'#[^\n]*',                          # lexer_skip_comment
+}
+
+# Bytes lexer_next_token dispatches on before it tries an operator: an
+# operator starting with one could never be lexed.
+SCANNER_DISPATCHED_CHARS = '"\'#$ \t\r\n'
 
 
 # Rules whose parse_<rule>() other ritz1 files call (parser_api, main, ...).
@@ -827,77 +849,139 @@ class RitzGenerator:
         return self._get_output()
 
     # =========================================================================
-    # Lexer setup generation
+    # Lexer scanner generation (AGAST #1821)
     # =========================================================================
+    #
+    # ritz1 used to rebuild a regex NFA from these token definitions for every
+    # file it lexed (557 KB of stack each) and simulate it by recursive
+    # backtracking.  Now the generator does the work once: the literal tokens
+    # become two direct-coded functions, and the regex tokens are checked
+    # against the hand-written scanners in lexer_nfa.ritz that implement them.
 
-    def generate_lexer_setup(self) -> str:
-        """Generate lexer_setup_gen.ritz."""
+    def _scanner_tokens(self):
+        """Split the grammar's lexable tokens into (keywords, operators).
+
+        Each is a list of (text, token name) in grammar order.  A literal is a
+        keyword if it is shaped like an identifier (scan_ident looks it up),
+        else an operator (lexer_operator matches it).  Raises ValueError for
+        a token the scanner could never produce, rather than generating a
+        lexer that silently never returns it.
+        """
+        keywords, operators = [], []
+        for tok in self.grammar.tokens:
+            if tok.name in SCANNER_SKIP_TOKENS:
+                continue
+            if HAND_WRITTEN_TOKEN_IDS.get(tok.name) is None or not tok.pattern:
+                continue
+            if not tok.is_literal:
+                want = SCANNED_REGEX_TOKENS.get(tok.name)
+                if want != tok.pattern:
+                    raise ValueError(
+                        f"token {tok.name} = /{tok.pattern}/: ritz1's scanner has no "
+                        f"code for this pattern (it implements {sorted(SCANNED_REGEX_TOKENS)} "
+                        "as written in SCANNED_REGEX_TOKENS). Change the scan_* function "
+                        "in ritz1/src/lexer_nfa.ritz and SCANNED_REGEX_TOKENS together."
+                    )
+                continue
+            text = tok.pattern
+            if re.fullmatch(r'[a-zA-Z_][a-zA-Z0-9_]*', text):
+                keywords.append((text, tok.name))
+            elif text[0] in SCANNER_DISPATCHED_CHARS or text[0].isalnum() or text[0] == '_' \
+                    or not all(33 <= ord(c) <= 126 for c in text):
+                raise ValueError(
+                    f"token {tok.name} = \"{text}\": an operator must be printable ASCII "
+                    "punctuation, and must not start with a byte ritz1's lexer dispatches "
+                    f"before matching operators ({SCANNER_DISPATCHED_CHARS!r})"
+                )
+            else:
+                operators.append((text, tok.name))
+        return keywords, operators
+
+    def _emit_operator_node(self, node, depth: int, indent: str):
+        """Emit the longest-match test for one operator trie node.
+
+        The node's children are tried first, each nested `if` returning
+        only on a full operator, so a child that leads nowhere falls through
+        to this node's own token: the longest operator wins.
+        """
+        for ch in sorted(node['next']):
+            child = node['next'][ch]
+            if depth == 0:
+                test = f'c0 == {ord(ch)}'
+            else:
+                test = f'avail > {depth} and lexer_byte(p, {depth}) == {ord(ch)}'
+            self._emit(f'{indent}if {test}  # {child["text"]}')
+            self._emit_operator_node(child, depth + 1, indent + '    ')
+        if node['tok'] is not None:
+            self._emit(f'{indent}*out_len = {depth}')
+            self._emit(f'{indent}return TOK_{node["tok"]}')
+
+    def generate_lexer_scan(self) -> str:
+        """Generate lexer_scan_gen.ritz: keyword lookup and operator matcher."""
+        keywords, operators = self._scanner_tokens()
         self._reset()
-        self._emit('# Generated by ritzgen - Lexer setup')
+        self._emit('# Generated by ritzgen - Lexer scanner (AGAST #1821)')
         self._emit('#')
         self._emit('# This is auto-generated code. Do not edit.')
+        self._emit('#')
+        self._emit("# The grammar's literal tokens, direct-coded.  Its regex tokens (IDENT,")
+        self._emit('# NUMBER, FLOAT, STRING, CHAR, CSTRING, WHITESPACE, COMMENT) are')
+        self._emit("# scanned by hand in lexer_nfa.ritz; the generator refuses a grammar")
+        self._emit('# whose patterns differ from the ones those functions implement.')
         self._emit('')
         self._emit('import tokens_gen')
-        self._emit('import nfa')
-        self._emit('import lexer_nfa')
         self._emit('')
-        self._emit('# Initialize lexer with token patterns from grammar')
-        self._emit('pub fn setup_lexer(lex: *Lexer, nfa_storage: *NFA, patterns_storage: *TokenPattern, states_storage: *NFAState, trans_storage: *Transition, sto_storage: *i32, stc_storage: *i32, ti_storage: *i32, max_states: i32, max_trans: i32) -> i32')
-        self._emit('    # Initialize NFA storage (Tier 1 NFA opt: index buffers for state-indexed lookup)')
-        self._emit('    nfa_init(nfa_storage, states_storage, trans_storage, sto_storage, stc_storage, ti_storage, max_states, max_trans)')
+        self._emit('# Byte k of p, 0-255.')
+        self._emit('fn lexer_byte(p: *u8, k: i64) -> i32')
+        self._emit('    ((*(p + k)) as i32) & 255')
         self._emit('')
-        self._emit('    # Initialize lexer')
-        self._emit('    lexer_init(lex, null, 0, nfa_storage, patterns_storage)')
+        self._emit('# 1 if the n bytes at p are those of the NUL-terminated `word`.')
+        self._emit('fn lexer_same(p: *u8, word: *u8, n: i64) -> i32')
+        self._emit('    var k: i64 = 1')
+        self._emit('    while k < n')
+        self._emit('        if *(p + k) != *(word + k)')
+        self._emit('            return 0')
+        self._emit('        k = k + 1')
+        self._emit('    1')
         self._emit('')
-
-        # Group tokens: keywords first (is_keyword=1), then operators (is_keyword=1),
-        # then regex patterns (is_keyword=0)
-        for tok in self.grammar.tokens:
-            if tok.name in ('EOF', 'ERROR', 'SKIP', 'NEWLINE', 'INDENT', 'DEDENT'):
-                continue
-            if tok.name == 'WHITESPACE':
-                continue  # Handled separately
-            if tok.name == 'COMMENT':
-                continue  # Handled separately
-
-            tid = HAND_WRITTEN_TOKEN_IDS.get(tok.name)
-            if tid is None:
-                continue
-
-            if tok.is_literal and tok.pattern:
-                # Bare "..." literals lower to StrView in ritz1 — the pair
-                # of `*u8 + i32 len` parameters is collapsed to a single
-                # StrView at the lexer_add_pattern boundary.
-                pattern = tok.pattern.replace('\\', '\\\\').replace('"', '\\"')
-                self._emit(f'    lexer_add_pattern(lex, "{pattern}", TOK_{tok.name}, 1)')
-            elif not tok.is_literal and tok.pattern:
-                # Regex pattern — same StrView treatment as literal patterns.
-                raw_pat = tok.pattern
-                escaped = raw_pat.replace('\\', '\\\\').replace('"', '\\"')
-                self._emit(f'    lexer_add_pattern(lex, "{escaped}", TOK_{tok.name}, 0)')
-
-        # Add whitespace and comment patterns
-        wt = self.grammar.token_map.get('WHITESPACE')
-        if wt:
-            raw_pat = wt.pattern
-            escaped = raw_pat.replace('\\', '\\\\').replace('"', '\\"')
-            self._emit(f'    lexer_add_pattern(lex, "{escaped}", TOK_WHITESPACE, 0)')
-
-        ct = self.grammar.token_map.get('COMMENT')
-        if ct:
-            raw_pat = ct.pattern
-            escaped = raw_pat.replace('\\', '\\\\').replace('"', '\\"')
-            self._emit(f'    lexer_add_pattern(lex, "{escaped}", TOK_COMMENT, 0)')
-
+        # Keywords: by length, then first byte, then the rest.
+        self._emit('# The keyword spelled by the identifier p[0..n), or TOK_IDENT.  A keyword')
+        self._emit('# and an identifier of the same text are the same length, and the')
+        self._emit('# keyword wins: `fn` is TOK_FN, `fnx` an identifier.')
+        self._emit('pub fn lexer_keyword(p: *u8, n: i64) -> i32')
+        self._emit('    let c0: i32 = lexer_byte(p, 0)')
+        by_len: dict[int, list[tuple[str, str]]] = {}
+        for text, name in keywords:
+            by_len.setdefault(len(text), []).append((text, name))
+        for n in sorted(by_len):
+            self._emit(f'    if n == {n}')
+            for text, name in sorted(by_len[n]):
+                if n == 1:
+                    self._emit(f'        if c0 == {ord(text[0])}')
+                else:
+                    self._emit(f'        if c0 == {ord(text[0])} and lexer_same(p, c"{text}", {n}) == 1')
+                self._emit(f'            return TOK_{name}')
+            self._emit('        return TOK_IDENT')
+        self._emit('    TOK_IDENT')
         self._emit('')
-        self._emit('    # Add whitespace as skip token')
-        self._emit('    lexer_add_pattern(lex, " ", TOK_SKIP, 1)')
-        self._emit('')
-        self._emit('    # Finalize lexer')
-        self._emit('    lexer_finalize(lex)')
-        self._emit('')
-        self._emit('    0')
-
+        # Operators: a trie, longest match.
+        root = {'next': {}, 'tok': None, 'text': ''}
+        for text, name in operators:
+            node = root
+            for ch in text:
+                node = node['next'].setdefault(ch, {'next': {}, 'tok': None, 'text': node['text'] + ch})
+            if node['tok'] is not None:
+                raise ValueError(f'tokens {node["tok"]} and {name} are both "{text}"')
+            node['tok'] = name
+        self._emit('# The longest operator at p, of the `avail` bytes left: its kind, with its')
+        self._emit('# length in *out_len; -1 if none starts there.')
+        self._emit('pub fn lexer_operator(p: *u8, avail: i64, out_len: *i32) -> i32')
+        self._emit('    *out_len = 0')
+        self._emit('    if avail <= 0')
+        self._emit('        return -1')
+        self._emit('    let c0: i32 = lexer_byte(p, 0)')
+        self._emit_operator_node(root, 0, '    ')
+        self._emit('    -1')
         return self._get_output()
 
 
@@ -973,9 +1057,9 @@ def main():
     else:
         print(f"Skipped {helpers_path} (hand-written, already exists)")
 
-    # Generate lexer_setup_gen.ritz
-    lexer_code = gen.generate_lexer_setup()
-    lexer_path = os.path.join(output_dir, 'lexer_setup_gen.ritz')
+    # Generate lexer_scan_gen.ritz
+    lexer_code = gen.generate_lexer_scan()
+    lexer_path = os.path.join(output_dir, 'lexer_scan_gen.ritz')
     with open(lexer_path, 'w') as f:
         f.write(lexer_code + '\n')
     print(f"Generated {lexer_path}")
