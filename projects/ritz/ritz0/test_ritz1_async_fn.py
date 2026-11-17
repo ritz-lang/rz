@@ -1,29 +1,23 @@
-"""Regression tests for AGAST #1456 — ritz1 parses `async fn` and `await`.
+"""AGAST #1456 / #3814: ritz1 lowers `async fn` and `await` as ritz0 does.
 
-ritz1 had no `async` / `await` tokens, so every async item stopped the parse:
+#1456 made ritz1 parse `async fn` / `pub async fn` (top level and impl
+methods) and `await <expr>`, then refuse each one where written.  #3814 adds
+ritz0's lowering (ritz0/async_transform_v2.py, emitter_llvmlite.py
+_transform_async_functions / _emit_await) as ritz1/src/async_lower.ritz, an
+AST-to-AST pass the driver runs once before any check:
 
-    error: ritzlib/async/blocking_fs.ritz:25:1: cannot parse item starting at 'async'
+  * `async fn f(p..) -> T` becomes `struct f_Future { __state, p.., the
+    locals }`, a constructor `f(p..) -> f_Future` and `f_poll(self:
+    *f_Future) -> i32` (-1 is Pending);
+  * `async fn main` becomes `__main_future` + `main_poll`, and a sync `main`
+    polls it to completion;
+  * `await g(..)` outside an async fn drives g's future to completion in place;
+  * a bare call to an async fn is refused (LANGUAGE_SPEC §16.2, #1395).
 
-and the compile dropped every item after the first one.
-
-What this ticket does is parse only.  ritz0 never lowers an `async fn` as a
-plain fn: it always builds a state machine (a `<f>_Future` struct, a `<f>_poll`
-fn, a sync wrapper for `async fn main`; ritz0/async_transform_v2.py).  As
-#1456 required, that lowering is split out to AGAST #3814.  Until #3814 lands,
-ritz1 parses each form into the AST (FnDef.is_async, an EXPR_AWAIT node) and
-then refuses it at its own location, once, naming #3814.  It never emits it
-as a plain fn, which would let a caller drop the `await` that #1395
-(LANGUAGE_SPEC §16.2) requires.
-
-The tests pin:
-  * each `async fn` form (`async fn`, `pub async fn`, an impl method) and
-    each `await` (in an async fn, and in a sync fn) is reported at its own
-    line:col, once, with no "cannot parse" error;
-  * ritzlib/async/blocking_fs.ritz (the ticket's module) has no parse errors;
-  * `async` stays usable as an import path segment
-    (`import ritzlib.async.tasks`), which making it a keyword could break.
-
-When #3814 lands, the refusal cases become run-and-compare-with-ritz0 cases.
+Each run row is compiled, linked and run by ritz0 (the oracle) and by ritz1,
+and both must answer the row's exit code.  The rows are ritz0's own async
+rows (test_async_call_requires_await.py, test_async_tail_await.py,
+test_async_untyped_local.py) and #1456's refusal forms, now run.
 """
 
 import os
@@ -33,10 +27,11 @@ from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+from test_ritz1_builtin_struct_shadow import _run, _run_pkg
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
-
-REFUSAL = "AGAST #3814"
 
 # The minimal repro from #1456's #1789 survey (65_async_main), verbatim.
 REPRO_65 = """\
@@ -48,99 +43,196 @@ async fn main() -> i32
     result - 38
 """
 
+_FORTY_TWO = "async fn g() -> i32\n    42\n\n"
+_STORE = "fn store(p: *i32, v: i32)\n    *p = v\n\n"
+_DBL = "async fn dbl(x: i32) -> i32\n    x * 2\n\n"
 
-def _ritz1(tmp_path: Path, src: Path):
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    return subprocess.run(
-        [str(RITZ1_BIN), str(src), "-o", str(tmp_path / "out.ll"), "-I", str(RITZ_ROOT)],
-        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300, check=False,
-    )
+# A poll fn that is Pending twice, then Ready(30).
+_TICK = """\
+var g_n: i32 = 0
 
+fn tick() -> i32
+    g_n = g_n + 1
+    if g_n < 3
+        return 0 - 1
+    g_n * 10
 
-def _compile_text(tmp_path: Path, text: str):
-    src = tmp_path / "m.ritz"
-    src.write_text(text)
-    return _ritz1(tmp_path, src)
+async fn waits() -> i32
+    let v: i32 = await tick()
+    v + 1
 
-
-def _refusals(stderr: str):
-    """(line, col, text) of each error line naming the lowering ticket."""
-    out = []
-    for ln in stderr.splitlines():
-        m = re.search(r":(\d+):(\d+): error: (.*)", ln)
-        if m and REFUSAL in ln:
-            out.append((int(m.group(1)), int(m.group(2)), m.group(3)))
-    return out
+"""
 
 
-def _assert_parsed(res):
-    assert "cannot parse" not in res.stderr, res.stderr
-    assert res.returncode != 0, "refused forms must fail the compile until #3814"
+def _main(body: str) -> str:
+    return f"pub fn main() -> i32\n{body}"
 
 
-@pytest.mark.integration
-def test_repro_65_refused_where_written(ritz1_bin, tmp_path):
-    """Both async fns at their `async`, the await at its `await`, once each."""
-    res = _compile_text(tmp_path, REPRO_65)
-    _assert_parsed(res)
-    # Sorted: an async fn is refused once its body has parsed, after its awaits.
-    got = sorted(_refusals(res.stderr))
-    assert [(l, c) for l, c, _ in got] == [(1, 1), (4, 1), (5, 23)], res.stderr
-    assert "async fn 'compute_result'" in got[0][2]
-    assert "async fn 'main'" in got[1][2]
-    assert "await" in got[2][2]
-
-
-# Each item form, alone, with the line:col its refusal must carry.
-FORMS = {
-    "pub_async_fn": ("pub async fn f() -> i32\n    1\n", (1, 1), "async fn 'f'"),
-    "after_other_item": (
-        "const K: i32 = 1\n\nasync fn g() -> i32\n    K\n", (3, 1), "async fn 'g'"),
-    "impl_method": (
-        "struct S\n    v: i32\n\nimpl S\n    async fn get(self: *S) -> i32\n        1\n",
-        (5, 5), "async fn 'get'"),
-    "pub_impl_method": (
-        "struct S\n    v: i32\n\nimpl S\n    pub async fn get(self: *S) -> i32\n        1\n",
-        (5, 5), "async fn 'get'"),
-    # ritz0 lowers this to a poll loop (62_async_compiler's test_await_in_sync_fn).
-    "await_in_sync_fn": (
-        "fn h() -> i32\n    1\n\nfn k() -> i32\n    let v: i32 = await h()\n    v\n",
-        (5, 18), "await"),
-    # A match arm's body is parsed twice (backtracking): still one refusal.
-    "await_in_match_arm": (
-        "fn h() -> i32\n    1\n\nfn k() -> i32\n    match h()\n"
-        "        1 => 3\n        _ => await h()\n",
-        (7, 14), "await"),
-    # An attribute's item-kind lookahead must see `async fn` as a fn.
-    "attributed": ("[[inline]]\nasync fn a() -> i32\n    1\n", (2, 1), "async fn 'a'"),
+# name -> (program, exit code)
+RUNS = {
+    "repro_65": (REPRO_65, 0),
+    "no_await_body_awaited": (_FORTY_TWO + _main("    let r: i32 = await g()\n    r\n"), 42),
+    # A unit async fn's poll is Ready(0); its empty body still runs under await.
+    "empty_body_awaited": ("async fn f()\n    pass\n\n" + _main("    await f()\n    3\n"), 3),
+    "unit_body_runs": (_STORE + "async fn put(p: *i32)\n    store(p, 7)\n\n"
+                       + _main("    var x: i32 = 0\n    await put(@x)\n    x\n"), 7),
+    "unit_bare_return": (_STORE + "async fn put(p: *i32, n: i32)\n    if n > 0\n        return\n"
+                         "    store(p, 9)\n\n"
+                         + _main("    var x: i32 = 1\n    await put(@x, 5)\n    x\n"), 1),
+    "unit_with_await": (_STORE + _FORTY_TWO + "async fn put(p: *i32)\n    let v: i32 = await g()\n"
+                        "    store(p, v)\n\n"
+                        + _main("    var x: i32 = 0\n    await put(@x)\n    x\n"), 42),
+    # 55_async_state_machine's chain: each state reads the one before.
+    "three_awaits": (_DBL + "async fn chain(x: i32) -> i32\n    let a: i32 = await dbl(x)\n"
+                     "    let b: i32 = await dbl(a)\n    let c: i32 = await dbl(b)\n    c / 2\n\n"
+                     + _main("    let r: i32 = await chain(10)\n    r\n"), 40),
+    # 53_async's test 4: an await nested in the awaited call, as the tail.
+    "nested_tail_await": ("fn get_value(x: i32) -> i32\n    x * 10\n\nfn add_one(x: i32) -> i32\n    x + 1\n\n"
+                          "async fn e(x: i32) -> i32\n    await add_one(await get_value(x))\n\n"
+                          + _main("    let r: i32 = await e(4)\n    r\n"), 41),
+    # 55_async_state_machine's test 4: an await in each arm of the tail `if`.
+    "conditional_await": (_DBL + "async fn pick(x: i32) -> i32\n    if x > 0\n        await dbl(x)\n"
+                          "    else\n        await dbl(0 - x)\n\n"
+                          + _main("    let a: i32 = await pick(5)\n    let b: i32 = await pick(0 - 7)\n"
+                                  "    a * 10 + b\n"), 114),
+    # Pending propagates out of the poll; the executor polls again.
+    "pending_polled_by_hand": (_TICK + _main("    var f: waits_Future = waits()\n"
+                                             "    var r: i32 = waits_poll(@f)\n    var polls: i32 = 1\n"
+                                             "    while r == 0 - 1\n        r = waits_poll(@f)\n"
+                                             "        polls = polls + 1\n    r + polls * 50\n"), 181),
+    # `await` in a sync fn polls until Ready.
+    "pending_awaited_in_sync_fn": (_TICK + _main("    let v: i32 = await waits()\n    v + g_n\n"), 34),
+    # #3821: the let's value is computed once its await's result is stored.
+    "await_inside_let_value": (_DBL + "async fn plus(x: i32) -> i32\n    let v: i32 = (await dbl(x)) + 1\n"
+                               "    v * 2\n\n" + _main("    let r: i32 = await plus(5)\n    r\n"), 22),
+    # #1318: an untyped await binding takes the poll's i32.  (A non-await `let`
+    # ahead of the first await never runs under ritz0's machine, so none here: #3023.)
+    "untyped_locals": ("async fn fetch(x: i32) -> i32\n    x\n\n"
+                       "async fn go(x: i32) -> i32\n    let v = await fetch(x + 1)\n    v + 1\n\n"
+                       + _main("    let r: i32 = await go(4)\n    r\n"), 6),
+    # 64_async_io's shape: a struct pointer param handed to a poll fn.
+    "struct_ptr_param": ("struct St\n    n: i32\n\nfn st_poll(s: *St) -> i32\n    s.n\n\n"
+                         "async fn rd(s: *St) -> i32\n    let r: i32 = await st_poll(s)\n    r + 1\n\n"
+                         + _main("    var s: St = St { n: 40 }\n    let r: i32 = await rd(@s)\n    r\n"), 41),
+    # blocking_fs's shape: arithmetic on a primitive pointer param, held in the
+    # future, strides by its pointee (4 here, not 1).
+    "ptr_param_arith": ("fn id(x: i32) -> i32\n    x\n\n"
+                        "async fn at(p: *i32, i: i64) -> i32\n    let v: i32 = await id(*(p + i))\n    v\n\n"
+                        + _main("    var xs: [3]i32 = [10, 20, 30]\n    let r: i32 = await at(@xs[0], 2)\n    r\n"), 30),
+    # `return await` as the last statement is the fn's value.
+    "return_await_last": (_DBL + "async fn twice(x: i32) -> i32\n    let a: i32 = await dbl(x)\n"
+                          "    return await dbl(a)\n\n"
+                          + _main("    let r: i32 = await twice(3)\n    r\n"), 12),
+    # `async fn main` awaiting a chain of async fns, an i64 one among them.
+    "async_main_chain": ("async fn c(x: i32) -> i64\n    (x * 3) as i64\n\n"
+                         "async fn b(x: i32) -> i32\n    let v: i32 = await c(x)\n    v + 1\n\n"
+                         "async fn main() -> i32\n    let v: i32 = await b(4)\n    v\n", 13),
+    "pub_and_attributed": ("pub async fn f() -> i32\n    1\n\n[[inline]]\nasync fn a() -> i32\n    2\n\n"
+                           + _main("    let x: i32 = await f()\n    let y: i32 = await a()\n    x + y\n"), 3),
+    # The future is a value: an executor keeps it and polls it.
+    "future_kept": ("async fn f()\n    pass\n\n" + _main("    var p: f_Future = f()\n    f_poll(@p)\n    5\n"), 5),
+    # `await` of a sync fn is its call, in a sync fn, and in a match arm.
+    "await_sync_fn": ("fn h() -> i32\n    1\n\nfn k() -> i32\n    let v: i32 = await h()\n    v\n\n"
+                      "fn m() -> i32\n    match h()\n        1 => 3\n        _ => await h()\n\n"
+                      + _main("    k() * 10 + m()\n"), 13),
 }
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("form", sorted(FORMS))
-def test_form_refused_where_written(ritz1_bin, tmp_path, form):
-    text, loc, what = FORMS[form]
-    res = _compile_text(tmp_path, text)
-    _assert_parsed(res)
-    errors = [ln for ln in res.stderr.splitlines() if ": error: " in ln]
-    assert all(REFUSAL in ln for ln in errors), res.stderr
-    got = _refusals(res.stderr)
-    assert [(l, c) for l, c, _ in got] == [loc], res.stderr
-    assert what in got[0][2], res.stderr
+@pytest.mark.parametrize("name", sorted(RUNS))
+def test_async_row_runs_as_ritz0(ritz1_bin, tmp_path, name):
+    program, want = RUNS[name]
+    assert _run("ritz0", tmp_path, name, program) == want
+    assert _run("ritz1", tmp_path, name, program) == want
+
+
+# name -> (program, (line, col), message); ritz0's words (LANGUAGE_SPEC §16.2).
+REFUSALS = {
+    "bare_call_statement": (
+        "async fn nothing()\n    pass\n\nfn main() -> i32\n    nothing()\n    0\n", (5, 5),
+        "calling async fn `nothing` without `await` builds its future and drops it; "
+        "its body never runs: write `await nothing(...)`"),
+    "bare_call_in_typed_let": (
+        "async fn ready() -> i32\n    42\n\nfn main() -> i32\n    let v: i32 = ready()\n    v\n", (5, 5),
+        "`v` is declared `i32` but `ready(...)` is an async fn call, which without `await` "
+        "is its future `ready_Future`: write `await ready(...)`"),
+}
+
+
+def _compile(compiler: str, tmp_path: Path, text: str):
+    src = tmp_path / f"m_{compiler}.ritz"
+    src.write_text(text)
+    return _compile_file(compiler, tmp_path, src)
+
+
+def _compile_file(compiler: str, tmp_path: Path, src: Path):
+    out = tmp_path / f"{src.stem}_{compiler}.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    if compiler == "ritz0":
+        return run_ritz0([str(src), "-o", str(out)], cwd=tmp_path, env=env, timeout=300)
+    return subprocess.run([str(RITZ1_BIN), str(src), "-o", str(out), "-I", str(RITZ_ROOT)],
+                          cwd=tmp_path, env=env, capture_output=True, text=True,
+                          timeout=300, check=False)
 
 
 @pytest.mark.integration
-def test_blocking_fs_parses(ritz1_bin, tmp_path):
-    """The ticket's module: every error is a #3814 refusal, none a parse stop."""
-    res = _ritz1(tmp_path, RITZ_ROOT / "ritzlib" / "async" / "blocking_fs.ritz")
-    _assert_parsed(res)
+@pytest.mark.parametrize("name", sorted(REFUSALS))
+def test_bare_async_call_refused_as_ritz0(ritz1_bin, tmp_path, name):
+    program, (line, col), message = REFUSALS[name]
+    for compiler in ("ritz0", "ritz1"):
+        res = _compile(compiler, tmp_path, program)
+        assert res.returncode != 0, (compiler, res.stdout, res.stderr)
+        assert message in res.stderr, (compiler, res.stderr)
+        if compiler == "ritz1":
+            errors = [ln for ln in res.stderr.splitlines() if ": error: " in ln]
+            assert len(errors) == 1, res.stderr
+            assert re.search(rf":{line}:{col}: error: ", errors[0]), res.stderr
+
+
+@pytest.mark.integration
+def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path):
+    """#3726: an imported async fn is declared in its importer, defined in its
+    file.  The importer allocates its future, so it lays it out from the fn's
+    body as the defining file does: `go_Future` holds __state, x, a and b (16
+    bytes), which an import stripped to its interface would not know."""
+    extra = {"a.ritz": "pub async fn fetch(x: i32) -> i32\n    x + 1\n\n"
+                       "pub async fn go(x: i32) -> i32\n    let a: i32 = await fetch(x)\n"
+                       "    let b: i32 = await fetch(a)\n    b\n"}
+    program = "import a\n\nasync fn main() -> i32\n    let r: i32 = await go(40)\n    r + sizeof(go_Future) as i32\n"
+    assert _run_pkg("ritz0", tmp_path, "imp_async", program, extra) == 58
+    assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 58
+
+
+@pytest.mark.integration
+def test_private_async_fn_refused_once(ritz1_bin, tmp_path):
+    """A private async fn awaited from another file is refused once, at the
+    call, by its own name (#3413) -- not again for its generated poll.  ritz0
+    lets it through (#3925)."""
+    pkg = tmp_path / "priv"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "src" / "a.ritz").write_text("async fn fetch(x: i32) -> i32\n    x + 1\n")
+    (pkg / "src" / "main.ritz").write_text(
+        "import a\n\nasync fn main() -> i32\n    let v: i32 = await fetch(41)\n    v\n")
+    res = _compile_file("ritz1", tmp_path, pkg / "src" / "main.ritz")
+    assert res.returncode != 0, res.stderr
     errors = [ln for ln in res.stderr.splitlines() if ": error: " in ln]
-    assert errors and all(REFUSAL in ln for ln in errors), res.stderr
+    assert len(errors) == 1, res.stderr
+    assert re.search(r"main\.ritz:4:\d+: error: `fetch` is private to a\.ritz", errors[0]), res.stderr
+
+
+@pytest.mark.integration
+def test_blocking_fs_compiles(ritz1_bin, tmp_path):
+    """The ticket's module compiles."""
+    res = subprocess.run(
+        [str(RITZ1_BIN), str(RITZ_ROOT / "ritzlib" / "async" / "blocking_fs.ritz"),
+         "-o", str(tmp_path / "out.ll"), "-I", str(RITZ_ROOT)],
+        cwd=tmp_path, env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
+        capture_output=True, text=True, timeout=300, check=False)
+    assert res.returncode == 0, res.stderr
 
 
 @pytest.mark.integration
 def test_async_import_path_segment(ritz1_bin, tmp_path):
-    """`async` is a keyword now, and still a module path segment."""
-    res = _compile_text(
-        tmp_path, "import ritzlib.async.tasks\n\nfn main() -> i32\n    0\n")
+    """`async` is a keyword, and still a module path segment."""
+    res = _compile("ritz1", tmp_path, "import ritzlib.async.tasks\n\nfn main() -> i32\n    0\n")
     assert res.returncode == 0, res.stderr

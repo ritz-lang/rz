@@ -36,6 +36,7 @@ import monomorph
 import generic_infer   # infer_generic_calls (AGAST #1982)
 import struct_index   # struct_index_errors (AGAST #1635)
 import binder_check   # binder_check_module (AGAST #2407)
+import async_lower    # async_lower_module (AGAST #3814)
 import reachability   # reach_check_module (AGAST #2520)
 import sema_walk      # sema_check_module (AGAST #3462)
 import import_vis     # a plain import is private (AGAST #3891)
@@ -1024,9 +1025,10 @@ fn load_and_parse(path: @&String) -> *Module
 # So each import is cut down to its interface as it is loaded, with ritz0's
 # rule (ritz0/module_interface.py body_needed): every fn body is dropped
 # except those the importer instantiates itself -- generic fns, and methods
-# of generic impls or with their own type params.  ritz1 has no async fns,
-# and parses trait default bodies without keeping them, so this drops a
-# superset of what ritz0's interface drops: the importer's IR depends only
+# of generic impls or with their own type params -- and async fns, whose
+# future the importer builds from their locals (AGAST #3814).  ritz1 parses
+# trait default bodies without keeping them, so this drops a superset of
+# what ritz0's interface drops: the importer's IR depends only
 # on what ritz0's interface hash covers, which is what build.py keys ritz1
 # objects on (cas_module_key).
 #
@@ -1042,7 +1044,9 @@ fn strip_to_interface(m: *Module)
     let body: *Stmt = stripped_body()
     var f: *FnDef = m.functions
     while f != null
-        if f.type_params == null and f.body != null
+        # An async fn keeps its body, as in ritz0: the importer builds its
+        # future, whose fields are the fn's locals (AGAST #3814).
+        if f.type_params == null and f.body != null and f.is_async == 0
             f.body = body
         f = f.next
     var ib: *ImplBlock = m.impls
@@ -1444,6 +1448,11 @@ fn main(argc: i32, argv: **u8) -> i32
         m = parse_program(@tokens, args.input_path, source_dir2, ritz_path2)
         if m == null
             return 1
+
+    # `async fn` / `await` become ritz0's state machine (AGAST #3814), once,
+    # before anything checks or emits; a bare async call is refused (§16.2).
+    if async_lower_module(m, args.input_path) > 0
+        return 1
 
     # Test mode (LANGUAGE_SPEC §17.1): ritzunit supplies `main`, so the
     # file's own goes, before anything can emit or call it.

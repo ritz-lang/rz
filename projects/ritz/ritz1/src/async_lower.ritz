@@ -1,0 +1,1373 @@
+# async_lower.ritz - `async fn` / `await` lowered to ritz0's state machine (AGAST #3814)
+#
+# An AST-to-AST pass main runs once, after imports merge and before any check,
+# so everything downstream sees plain fns and structs.  It builds the items
+# ritz0 builds (ritz0/async_transform_v2.py generate_state_machine,
+# emitter_llvmlite.py _transform_async_functions / _emit_await), with the same
+# names and layout, so an executor written against one compiler's futures
+# polls the other's:
+#
+#     async fn f(x: i32) -> T               struct f_Future
+#         let a: i32 = await g(x)               __state: i32
+#         a + 1                                 x: i32          # params, in order
+#                                               a: i32          # locals, by name
+#                                           fn f(x: i32) -> f_Future
+#                                               f_Future { __state: 0, x: x }
+#                                           fn f_poll(self: *f_Future) -> i32
+#                                               if self.__state == 0
+#                                                   var __future_0: g_Future = g(self.x)
+#                                                   let __inner_result_0: i32 = g_poll(@__future_0)
+#                                                   if __inner_result_0 == 0 - 1
+#                                                       return 0 - 1      # Pending
+#                                                   self.a = __inner_result_0
+#                                                   self.__state = 1
+#                                               self.a + 1
+#
+#   * Each `await` is a state, in evaluation order (an await nested in the
+#     awaited call first).  An await of an async fn builds its future and
+#     polls it; of anything else, evaluates it.  Its result goes to the let
+#     it initialises, else to a field `__await_result_N`.  A top-level let
+#     whose value merely contains awaits is computed in its last await's
+#     state (#3821).  The final state is the body's tail (or last `return`
+#     value).  As in ritz0, with an await in the body every local lives in
+#     the future and no other statement runs; without one the whole body is
+#     the poll, its params read through `self`.
+#   * The poll answers i32 (a `-> i64` fn's value narrows, as a return
+#     does anywhere); a unit fn is Ready(0).
+#   * `async fn main` is `__main_future` + `main_poll`, and a sync `main`
+#     polls it to completion.
+#   * `await g(..)` anywhere else (a sync fn) polls g's future until Ready,
+#     through a private `__await_g` this file defines; `await` of a sync call
+#     is the call.
+#   * A bare call to an async fn, as a statement or into a typed let, only
+#     builds its future: refused (LANGUAGE_SPEC §16.2, #1395), in ritz0's words.
+#
+# As in ritz0, an impl's async method is a plain method.  Generated nodes are
+# zero-filled, so every optional AST field reads as "none"; type facts are
+# copied from the param or let they come from.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.string
+
+import ast
+import diag
+
+# ---------------------------------------------------------------------------
+# Names and nodes
+# ---------------------------------------------------------------------------
+
+fn al_zalloc(size: i64) -> *u8
+    calloc(1, size)
+
+fn al_clen(s: *u8) -> i32
+    var n: i32 = 0
+    while *(s + n) != 0
+        n += 1
+    n
+
+fn al_eq(a: *u8, alen: i32, b: *u8, blen: i32) -> i32
+    if alen != blen
+        return 0
+    var i: i32 = 0
+    while i < alen
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    1
+
+# Bytewise order of two names, as Python's sorted() orders ritz0's fields.
+fn al_less(a: *u8, alen: i32, b: *u8, blen: i32) -> i32
+    var i: i32 = 0
+    while i < alen and i < blen
+        if *(a + i) != *(b + i)
+            return (*(a + i) < *(b + i)) as i32
+        i += 1
+    (alen < blen) as i32
+
+# `a` then `b` (`blen` bytes), NUL-terminated; its length goes to `*out_len`.
+fn al_join(a: *u8, alen: i32, b: *u8, blen: i32, out_len: *i32) -> *u8
+    let r: *u8 = al_zalloc((alen + blen + 1) as i64)
+    var i: i32 = 0
+    while i < alen
+        *(r + i) = *(a + i)
+        i += 1
+    var j: i32 = 0
+    while j < blen
+        *(r + alen + j) = *(b + j)
+        j += 1
+    *out_len = alen + blen
+    r
+
+# `<prefix><n>`: `__future_3`.
+fn al_numbered(prefix: *u8, n: i32, out_len: *i32) -> *u8
+    var digits: [12]u8
+    var k: i32 = 0
+    var v: i32 = n
+    if v == 0
+        digits[0] = '0'
+        k = 1
+    while v > 0
+        digits[k] = ('0' as i32 + v % 10) as u8
+        v = v / 10
+        k += 1
+    var rev: [12]u8
+    var i: i32 = 0
+    while i < k
+        rev[i] = digits[k - 1 - i]
+        i += 1
+    al_join(prefix, al_clen(prefix), @rev[0], k, out_len)
+
+fn al_expr(kind: i32, span: SrcSpan) -> *Expr
+    let e: *Expr = al_zalloc(sizeof(Expr)) as *Expr
+    e.kind = kind
+    e.span = span
+    e.slot_type = TYPE_VOID
+    e
+
+fn al_int(v: i64, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(EXPR_INT_LIT, span)
+    e.int_val = v
+    e.lit_kind = LIT_PLAIN
+    e
+
+fn al_ident(name: *u8, len: i32, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(EXPR_IDENT, span)
+    e.ident_ptr = name
+    e.ident_len = len
+    e
+
+# `self.<name>`
+fn al_self_field(name: *u8, len: i32, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(EXPR_MEMBER, span)
+    e.left = al_ident(c"self", 4, span)
+    e.ident_ptr = name
+    e.ident_len = len
+    e.bracket = span
+    e
+
+fn al_binary(op: i32, left: *Expr, right: *Expr) -> *Expr
+    let e: *Expr = al_expr(EXPR_BINARY, left.span)
+    e.op = op
+    e.left = left
+    e.right = right
+    e
+
+# `0 - 1`, the poll's Pending, written as ritz0 writes it.
+fn al_pending(span: SrcSpan) -> *Expr
+    al_binary(OP_SUB, al_int(0, span), al_int(1, span))
+
+fn al_call(name: *u8, len: i32, args: *Expr, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(EXPR_CALL, span)
+    e.func_name = name
+    e.func_name_len = len
+    e.args = args
+    e
+
+fn al_addr_of(name: *u8, len: i32, span: SrcSpan) -> *Expr
+    let e: *Expr = al_expr(EXPR_UNARY, span)
+    e.op = OP_ADDR
+    e.operand = al_ident(name, len, span)
+    e
+
+fn al_stmt(kind: i32, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_zalloc(sizeof(Stmt)) as *Stmt
+    s.kind = kind
+    s.span = span
+    s
+
+fn al_expr_stmt(e: *Expr) -> *Stmt
+    let s: *Stmt = al_stmt(STMT_EXPR, e.span)
+    s.expr = e
+    s
+
+fn al_return(v: *Expr, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(STMT_RETURN, span)
+    s.return_value = v
+    s
+
+fn al_if(cond: *Expr, then_body: *Stmt, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(STMT_IF, span)
+    s.if_cond = cond
+    s.if_then = then_body
+    s
+
+# `self.<name> = v`
+fn al_assign_self(name: *u8, len: i32, v: *Expr, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(STMT_MEMBER_ASSIGN, span)
+    s.if_cond = al_ident(c"self", 4, span)
+    s.assign_target = name
+    s.assign_target_len = len
+    s.bracket = span
+    s.assign_value = v
+    s
+
+fn al_assign_name(name: *u8, len: i32, v: *Expr, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(STMT_ASSIGN, span)
+    s.assign_target = name
+    s.assign_target_len = len
+    s.assign_value = v
+    s
+
+# `let`/`var <name>: i32 = init` (ty TYPE_I32), or `: <type_name>` (TYPE_STRUCT).
+fn al_decl(name: *u8, len: i32, ty: i32, type_name: *u8, type_name_len: i32, init: *Expr, is_let: i32, file: *u8, span: SrcSpan) -> *Stmt
+    let s: *Stmt = al_stmt(STMT_VAR_DECL, span)
+    s.var_name = name
+    s.var_name_len = len
+    s.var_type = ty
+    s.var_declared_type = ty
+    s.var_type_name = type_name
+    s.var_type_name_len = type_name_len
+    s.var_pointee_type = TYPE_I64
+    if ty == TYPE_I32
+        s.var_src_file = file
+    s.var_init = init
+    s.var_is_let = is_let
+    s.name_span = span
+    s
+
+# `head` with `s` linked at its end.
+fn al_append(head: *Stmt, s: *Stmt) -> *Stmt
+    if head == null
+        return s
+    var cur: *Stmt = head
+    while cur.next != null
+        cur = cur.next
+    cur.next = s
+    head
+
+fn al_last(head: *Stmt) -> *Stmt
+    var cur: *Stmt = head
+    while cur != null and cur.next != null
+        cur = cur.next
+    cur
+
+# A fn generated from `orig`: its line, file, visibility and locality.
+fn al_fn(orig: *FnDef, name: *u8, len: i32, params: *Param, ret: i32, ret_name: *u8, ret_len: i32, body: *Stmt) -> *FnDef
+    let f: *FnDef = al_zalloc(sizeof(FnDef)) as *FnDef
+    f.name = name
+    f.name_len = len
+    f.params = params
+    f.return_type = ret
+    f.return_type_name = ret_name
+    f.return_type_name_len = ret_len
+    f.body = body
+    f.line = orig.line
+    f.col = orig.col
+    f.is_local = orig.is_local
+    f.is_pub = orig.is_pub
+    f.def_file = orig.def_file
+    f.target_gated = orig.target_gated
+    f
+
+# ---------------------------------------------------------------------------
+# The module's async fns
+# ---------------------------------------------------------------------------
+
+struct AlAsync
+    name: *u8
+    len: i32
+    params: *Param
+    helper: *FnDef      # its `__await_<name>`, once a sync fn awaits it
+    next: *AlAsync
+
+var g_al_async: *AlAsync = null
+var g_al_module: *Module = null
+var g_al_path: *u8 = null
+
+fn al_find_async(name: *u8, len: i32) -> *AlAsync
+    if name == null
+        return null
+    var a: *AlAsync = g_al_async
+    while a != null
+        if al_eq(a.name, a.len, name, len) == 1
+            return a
+        a = a.next
+    null
+
+fn al_call_of_async(e: *Expr) -> *AlAsync
+    if e == null or e.kind != EXPR_CALL or e.call_type_suffix_len != 0
+        return null
+    al_find_async(e.func_name, e.func_name_len)
+
+fn al_find_fn(name: *u8, len: i32) -> *FnDef
+    var f: *FnDef = g_al_module.functions
+    while f != null
+        if al_eq(f.name, f.name_len, name, len) == 1
+            return f
+        f = f.next
+    null
+
+# The file a fn's diagnostics name.
+fn al_file(f: *FnDef) -> *u8
+    if f.is_local == 0 and f.def_file != null
+        return f.def_file
+    g_al_path
+
+# ---------------------------------------------------------------------------
+# Analysis: the await points and the locals of one async fn
+# ---------------------------------------------------------------------------
+
+# A field of the future: a param, or a local of the async fn.
+struct AlLocal
+    name: *u8
+    len: i32
+    ty: i32
+    type_name: *u8
+    type_name_len: i32
+    pointee: i32
+    inner_pointee: i32
+    inner_ref: i32
+    is_param: i32
+    unsupported: i32    # a type the future can't hold yet (array, reference, fn)
+    span: SrcSpan
+    next: *AlLocal
+
+struct AlLet
+    stmt: *Stmt
+    next: *AlLet
+
+struct AlPoint
+    await_expr: *Expr
+    result: *u8         # the field its result is stored in
+    result_len: i32
+    then_lets: *AlLet   # top-level lets whose value it completes (#3821)
+    next: *AlPoint
+
+struct AlFn
+    f: *FnDef
+    file: *u8
+    locals: *AlLocal
+    points: *AlPoint
+    npoints: i32
+    let_target: *Stmt   # the let whose value IS the await being walked
+    top: *Stmt          # the body's statement being walked, if top-level
+    untyped: *Stmt      # the first local whose type can't be inferred
+    sync: i32           # 1: lowering awaits of a sync fn, not an async body
+
+fn al_local_find(a: *AlFn, name: *u8, len: i32) -> *AlLocal
+    var l: *AlLocal = a.locals
+    while l != null
+        if al_eq(l.name, l.len, name, len) == 1
+            return l
+        l = l.next
+    null
+
+# The local `name`, added at the end of a's list if new (ritz0's dict keeps
+# the first insertion and the last type).
+fn al_local(a: *AlFn, name: *u8, len: i32, span: SrcSpan) -> *AlLocal
+    var l: *AlLocal = al_local_find(a, name, len)
+    if l != null
+        return l
+    l = al_zalloc(sizeof(AlLocal)) as *AlLocal
+    l.name = name
+    l.len = len
+    l.span = span
+    if a.locals == null
+        a.locals = l
+    else
+        var cur: *AlLocal = a.locals
+        while cur.next != null
+            cur = cur.next
+        cur.next = l
+    l
+
+fn al_set_scalar(l: *AlLocal, ty: i32)
+    l.ty = ty
+    l.type_name = null
+    l.type_name_len = 0
+    l.pointee = TYPE_I64
+    l.inner_pointee = TYPE_VOID
+    l.inner_ref = INNER_REF_NONE
+    l.unsupported = 0
+
+fn al_set_struct(l: *AlLocal, name: *u8, len: i32)
+    al_set_scalar(l, TYPE_STRUCT)
+    l.type_name = name
+    l.type_name_len = len
+
+fn al_type_unsupported(ty: i32, pointee: i32) -> i32
+    if ty == TYPE_ARRAY or ty == TYPE_REF or ty == TYPE_MUT_REF
+        return 1
+    if (ty == TYPE_PTR or ty == TYPE_PTR_PTR) and pointee == TYPE_ARRAY
+        return 1
+    0
+
+fn al_local_of_param(a: *AlFn, p: *Param)
+    let l: *AlLocal = al_local(a, p.name, p.name_len, p.name_span)
+    l.is_param = 1
+    l.ty = p.param_type
+    l.type_name = p.param_type_name
+    l.type_name_len = p.param_type_name_len
+    l.pointee = p.param_pointee_type
+    l.inner_pointee = p.param_inner_pointee_type
+    l.inner_ref = p.param_inner_ref
+    l.unsupported = al_type_unsupported(p.param_type, p.param_pointee_type)
+    if p.fn_sig != null or p.is_borrow == 1
+        l.unsupported = 1
+
+# A scalar kind's literal-free type, as ritz0's _infer_type answers it; 0 if
+# it can't tell.  Fills `l` on success.
+fn al_infer(a: *AlFn, e: *Expr, l: *AlLocal) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_AWAIT
+        al_set_scalar(l, TYPE_I32)   # the poll's value (#1318)
+        return 1
+    if k == EXPR_INT_LIT
+        if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
+            al_set_scalar(l, TYPE_BOOL)
+        else
+            al_set_scalar(l, TYPE_I64)
+        return 1
+    if k == EXPR_FLOAT_LIT
+        al_set_scalar(l, TYPE_F64)
+        return 1
+    if k == EXPR_CHAR_LIT
+        al_set_scalar(l, TYPE_U8)
+        return 1
+    if k == EXPR_IDENT
+        let src: *AlLocal = al_local_find(a, e.ident_ptr, e.ident_len)
+        if src == null or src.ty == TYPE_VOID
+            return 0
+        l.ty = src.ty
+        l.type_name = src.type_name
+        l.type_name_len = src.type_name_len
+        l.pointee = src.pointee
+        l.inner_pointee = src.inner_pointee
+        l.inner_ref = src.inner_ref
+        l.unsupported = src.unsupported
+        return 1
+    if k == EXPR_CAST
+        if e.op == TYPE_STRUCT or e.op == TYPE_PTR or e.op == TYPE_PTR_PTR or e.op == TYPE_ARRAY or e.op == TYPE_REF or e.op == TYPE_MUT_REF
+            return 0
+        al_set_scalar(l, e.op)
+        return 1
+    if k == EXPR_BINARY
+        if e.op >= OP_EQ and e.op <= OP_OR
+            al_set_scalar(l, TYPE_BOOL)
+            return 1
+        if e.op != OP_SHL and e.op != OP_SHR and e.left.kind == EXPR_INT_LIT and e.right.kind != EXPR_INT_LIT
+            return al_infer(a, e.right, l)
+        return al_infer(a, e.left, l)
+    if k == EXPR_UNARY
+        if e.op == OP_NOT
+            al_set_scalar(l, TYPE_BOOL)
+            return 1
+        if e.op == OP_NEG or e.op == OP_BIT_NOT
+            return al_infer(a, e.operand, l)
+        return 0
+    if k == EXPR_CALL and e.func_name != null and e.call_type_suffix_len == 0
+        if al_local_find(a, e.func_name, e.func_name_len) != null
+            return 0
+        let f: *FnDef = al_find_fn(e.func_name, e.func_name_len)
+        if f == null or f.type_params != null
+            return 0
+        if f.is_async == 1
+            # A bare call is the fn's future (#1395).
+            var n: i32 = 0
+            let fut: *u8 = al_join(f.name, f.name_len, c"_Future", 7, @n)
+            al_set_struct(l, fut, n)
+            return 1
+        if f.return_type == TYPE_STRUCT
+            al_set_struct(l, f.return_type_name, f.return_type_name_len)
+            return 1
+        if f.return_type == TYPE_VOID or f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR or al_type_unsupported(f.return_type, TYPE_VOID) == 1
+            return 0
+        al_set_scalar(l, f.return_type)
+        return 1
+    0
+
+fn al_an_stmts(a: *AlFn, s: *Stmt, top: i32)
+    var cur: *Stmt = s
+    while cur != null
+        al_an_stmt(a, cur, top)
+        cur = cur.next
+
+fn al_an_arms(a: *AlFn, arm: *MatchArm)
+    var cur: *MatchArm = arm
+    while cur != null
+        al_an_stmts(a, cur.body_stmts, 0)
+        al_an_expr(a, cur.body)
+        cur = cur.next
+
+fn al_an_decl(a: *AlFn, s: *Stmt, top: i32)
+    # The local's type, before its value is walked (an await in it is not a
+    # local yet).  Untyped: its value's, as ritz0 infers it (#3762).
+    var t: AlLocal
+    t.unsupported = 0
+    var typed: i32 = 0
+    if s.var_declared_type != TYPE_VOID
+        typed = 1
+        t.ty = s.var_type
+        t.type_name = s.var_type_name
+        t.type_name_len = s.var_type_name_len
+        t.pointee = s.var_pointee_type
+        t.inner_pointee = s.var_inner_pointee_type
+        t.inner_ref = s.var_inner_ref
+        t.unsupported = al_type_unsupported(s.var_type, s.var_pointee_type)
+        if s.var_fn_sig != null
+            t.unsupported = 1
+    else if al_infer(a, s.var_init, @t) == 1
+        typed = 1
+    else if a.untyped == null
+        a.untyped = s
+    let direct: i32 = (s.var_init != null and s.var_init.kind == EXPR_AWAIT) as i32
+    if direct == 1
+        a.let_target = s
+    let first: i32 = a.npoints
+    al_an_expr(a, s.var_init)
+    a.let_target = null
+    if direct == 0 and a.npoints > first and top == 1
+        # Its last await's state computes it (#3821).
+        var p: *AlPoint = a.points
+        while p.next != null
+            p = p.next
+        let entry: *AlLet = al_zalloc(sizeof(AlLet)) as *AlLet
+        entry.stmt = s
+        if p.then_lets == null
+            p.then_lets = entry
+        else
+            var q: *AlLet = p.then_lets
+            while q.next != null
+                q = q.next
+            q.next = entry
+    let l: *AlLocal = al_local(a, s.var_name, s.var_name_len, s.span)
+    if typed == 1
+        l.ty = t.ty
+        l.type_name = t.type_name
+        l.type_name_len = t.type_name_len
+        l.pointee = t.pointee
+        l.inner_pointee = t.inner_pointee
+        l.inner_ref = t.inner_ref
+        l.unsupported = t.unsupported
+
+fn al_an_stmt(a: *AlFn, s: *Stmt, top: i32)
+    let k: i32 = s.kind
+    if k == STMT_VAR_DECL
+        al_an_decl(a, s, top)
+    else if k == STMT_EXPR
+        al_an_expr(a, s.expr)
+    else if k == STMT_RETURN
+        al_an_expr(a, s.return_value)
+    else if k == STMT_IF
+        al_an_expr(a, s.if_cond)
+        al_an_stmts(a, s.if_then, 0)
+        al_an_stmts(a, s.if_else, 0)
+    else if k == STMT_WHILE
+        al_an_expr(a, s.while_cond)
+        al_an_stmts(a, s.while_body, 0)
+    else if k == STMT_FOR
+        al_an_expr(a, s.for_start)
+        al_an_expr(a, s.for_end)
+        al_an_stmts(a, s.for_body, 0)
+    else if k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
+        al_an_stmts(a, s.while_body, 0)
+    else if k == STMT_MATCH
+        al_an_expr(a, s.if_cond)
+        al_an_arms(a, s.if_then as *MatchArm)
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        al_an_expr(a, s.assign_value)
+
+fn al_an_list(a: *AlFn, e: *Expr)
+    var cur: *Expr = e
+    while cur != null
+        al_an_expr(a, cur)
+        cur = cur.next
+
+fn al_an_expr(a: *AlFn, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_AWAIT
+        # An await nested in the awaited expression runs first: recorded
+        # first, so each state reads the ones before it.
+        let target: *Stmt = a.let_target
+        a.let_target = null
+        al_an_expr(a, e.operand)
+        let p: *AlPoint = al_zalloc(sizeof(AlPoint)) as *AlPoint
+        p.await_expr = e
+        if target != null
+            p.result = target.var_name
+            p.result_len = target.var_name_len
+        else
+            var n: i32 = 0
+            p.result = al_numbered(c"__await_result_", a.npoints, @n)
+            p.result_len = n
+            al_set_scalar(al_local(a, p.result, n, e.span), TYPE_I32)
+        if a.points == null
+            a.points = p
+        else
+            var q: *AlPoint = a.points
+            while q.next != null
+                q = q.next
+            q.next = p
+        a.npoints += 1
+    else if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
+        al_an_expr(a, e.left)
+        al_an_expr(a, e.right)
+    else if k == EXPR_UNARY
+        al_an_expr(a, e.operand)
+    else if k == EXPR_CALL
+        if e.func_name == null
+            al_an_expr(a, e.left)
+        al_an_list(a, e.args)
+    else if k == EXPR_METHOD
+        al_an_expr(a, e.left)
+        al_an_list(a, e.args)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        al_an_expr(a, e.left)
+    else if k == EXPR_IF or k == EXPR_MATCH
+        al_an_expr(a, e.left)
+        al_an_arms(a, e.args as *MatchArm)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            al_an_expr(a, fi.value)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        al_an_list(a, e.args)
+
+# ---------------------------------------------------------------------------
+# Rewriting: a body's names read through `self`, and its awaits lowered
+# ---------------------------------------------------------------------------
+
+# Is `name` held in the future?  Params always; the other locals when the
+# fn awaits (without an await they stay locals of the poll).
+fn al_is_field(a: *AlFn, name: *u8, len: i32) -> i32
+    if a.sync == 1 or name == null
+        return 0
+    let l: *AlLocal = al_local_find(a, name, len)
+    if l == null
+        return 0
+    (l.is_param == 1 or a.npoints > 0) as i32
+
+fn al_point_of(a: *AlFn, e: *Expr) -> *AlPoint
+    var p: *AlPoint = a.points
+    while p != null
+        if p.await_expr == e
+            return p
+        p = p.next
+    null
+
+# The `__await_<g>` that drives g's future to completion (ritz0's
+# _emit_await_poll_loop as a fn), built the first time a sync fn awaits g.
+fn al_await_helper(g: *AlAsync, span: SrcSpan) -> *FnDef
+    if g.helper != null
+        return g.helper
+    # Its params: copies of g's own.
+    var params: *Param = null
+    var last: *Param = null
+    var args: *Expr = null
+    var last_arg: *Expr = null
+    var p: *Param = g.params
+    while p != null
+        let c: *Param = al_zalloc(sizeof(Param)) as *Param
+        let src: *u8 = p as *u8
+        let dst: *u8 = c as *u8
+        var i: i64 = 0
+        while i < sizeof(Param)
+            *(dst + i) = *(src + i)
+            i += 1
+        c.next = null
+        if last == null
+            params = c
+        else
+            last.next = c
+        last = c
+        let arg: *Expr = al_ident(p.name, p.name_len, span)
+        if last_arg == null
+            args = arg
+        else
+            last_arg.next = arg
+        last_arg = arg
+        p = p.next
+    var n: i32 = 0
+    let name: *u8 = al_join(c"__await_", 8, g.name, g.len, @n)
+    var fl: i32 = 0
+    let fut: *u8 = al_join(g.name, g.len, c"_Future", 7, @fl)
+    var pl: i32 = 0
+    let poll: *u8 = al_join(g.name, g.len, c"_poll", 5, @pl)
+    let body: *Stmt = al_drive_body(g.name, g.len, args, fut, fl, poll, pl, span)
+    var orig: FnDef
+    orig.line = span.line
+    orig.col = span.col
+    orig.is_local = 1
+    orig.is_pub = 0
+    orig.def_file = null   # private to this file, which defines it
+    orig.target_gated = 0
+    let f: *FnDef = al_fn(@orig, name, n, params, TYPE_I32, null, 0, body)
+    module_append_fn(g_al_module, f)
+    g.helper = f
+    f
+
+#     var __future: <fut> = <ctor>(args)
+#     var __poll: i32 = <poll>(@__future)
+#     while __poll == 0 - 1
+#         __poll = <poll>(@__future)
+#     __poll
+fn al_drive_body(ctor: *u8, ctor_len: i32, args: *Expr, fut: *u8, fut_len: i32, poll: *u8, poll_len: i32, span: SrcSpan) -> *Stmt
+    var body: *Stmt = al_decl(c"__future", 8, TYPE_STRUCT, fut, fut_len, al_call(ctor, ctor_len, args, span), 0, null, span)
+    body = al_append(body, al_decl(c"__poll", 6, TYPE_I32, null, 0, al_call(poll, poll_len, al_addr_of(c"__future", 8, span), span), 0, g_al_path, span))
+    let w: *Stmt = al_stmt(STMT_WHILE, span)
+    w.while_cond = al_binary(OP_EQ, al_ident(c"__poll", 6, span), al_pending(span))
+    w.while_body = al_assign_name(c"__poll", 6, al_call(poll, poll_len, al_addr_of(c"__future", 8, span), span), span)
+    body = al_append(body, w)
+    al_append(body, al_expr_stmt(al_ident(c"__poll", 6, span)))
+
+fn module_append_fn(m: *Module, f: *FnDef)
+    f.next = null
+    if m.functions == null
+        m.functions = f
+        return
+    var cur: *FnDef = m.functions
+    while cur.next != null
+        cur = cur.next
+    cur.next = f
+
+fn al_rw_list(a: *AlFn, e: *Expr) -> *Expr
+    var head: *Expr = null
+    var prev: *Expr = null
+    var cur: *Expr = e
+    while cur != null
+        let nxt: *Expr = cur.next
+        let n: *Expr = al_rw_expr(a, cur)
+        n.next = nxt
+        if prev == null
+            head = n
+        else
+            prev.next = n
+        prev = n
+        cur = nxt
+    head
+
+fn al_rw_arms(a: *AlFn, arm: *MatchArm)
+    var cur: *MatchArm = arm
+    while cur != null
+        cur.body_stmts = al_rw_stmts(a, cur.body_stmts)
+        if cur.body != null
+            cur.body = al_rw_expr(a, cur.body)
+        cur = cur.next
+
+# `e` rewritten; a replacement takes over e's place in its list.
+fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
+    if e == null
+        return null
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        if al_is_field(a, e.ident_ptr, e.ident_len) == 1
+            let m: *Expr = al_self_field(e.ident_ptr, e.ident_len, e.span)
+            m.next = e.next
+            return m
+        return e
+    if k == EXPR_AWAIT
+        let p: *AlPoint = al_point_of(a, e)
+        if p != null
+            # A state already drove it: its result is stored.
+            let m: *Expr = al_self_field(p.result, p.result_len, e.span)
+            m.next = e.next
+            return m
+        var op: *Expr = al_rw_expr(a, e.operand)
+        let g: *AlAsync = al_call_of_async(op)
+        if g != null
+            let h: *FnDef = al_await_helper(g, e.span)
+            op.func_name = h.name
+            op.func_name_len = h.name_len
+        op.next = e.next
+        return op
+    if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
+        e.left = al_rw_expr(a, e.left)
+        e.right = al_rw_expr(a, e.right)
+    else if k == EXPR_UNARY
+        e.operand = al_rw_expr(a, e.operand)
+    else if k == EXPR_CALL
+        if e.func_name == null
+            e.left = al_rw_expr(a, e.left)
+        e.args = al_rw_list(a, e.args)
+    else if k == EXPR_METHOD
+        e.left = al_rw_expr(a, e.left)
+        e.args = al_rw_list(a, e.args)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        e.left = al_rw_expr(a, e.left)
+    else if k == EXPR_IF or k == EXPR_MATCH
+        e.left = al_rw_expr(a, e.left)
+        al_rw_arms(a, e.args as *MatchArm)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            fi.value = al_rw_expr(a, fi.value)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        e.args = al_rw_list(a, e.args)
+    e
+
+fn al_rw_stmts(a: *AlFn, s: *Stmt) -> *Stmt
+    var head: *Stmt = null
+    var prev: *Stmt = null
+    var cur: *Stmt = s
+    while cur != null
+        let nxt: *Stmt = cur.next
+        let n: *Stmt = al_rw_stmt(a, cur)
+        n.next = nxt
+        if prev == null
+            head = n
+        else
+            prev.next = n
+        prev = n
+        cur = nxt
+    head
+
+fn al_rw_stmt(a: *AlFn, s: *Stmt) -> *Stmt
+    let k: i32 = s.kind
+    if k == STMT_VAR_DECL
+        s.var_init = al_rw_expr(a, s.var_init)
+        if al_is_field(a, s.var_name, s.var_name_len) == 1
+            # The local lives in the future, where its uses read it.
+            var v: *Expr = s.var_init
+            if v == null
+                v = al_int(0, s.span)
+            return al_assign_self(s.var_name, s.var_name_len, v, s.span)
+    else if k == STMT_ASSIGN
+        s.assign_value = al_rw_expr(a, s.assign_value)
+        if s.assign_target == null
+            s.if_cond = al_rw_expr(a, s.if_cond)
+        else if al_is_field(a, s.assign_target, s.assign_target_len) == 1
+            return al_assign_self(s.assign_target, s.assign_target_len, s.assign_value, s.span)
+    else if k == STMT_RETURN
+        s.return_value = al_rw_expr(a, s.return_value)
+        if a.sync == 0
+            if s.return_value == null
+                s.return_value = al_int(0, s.span)   # a unit fn's Ready
+    else if k == STMT_EXPR
+        s.expr = al_rw_expr(a, s.expr)
+    else if k == STMT_IF
+        s.if_cond = al_rw_expr(a, s.if_cond)
+        s.if_then = al_rw_stmts(a, s.if_then)
+        s.if_else = al_rw_stmts(a, s.if_else)
+    else if k == STMT_WHILE
+        s.while_cond = al_rw_expr(a, s.while_cond)
+        s.while_body = al_rw_stmts(a, s.while_body)
+    else if k == STMT_FOR
+        s.for_start = al_rw_expr(a, s.for_start)
+        s.for_end = al_rw_expr(a, s.for_end)
+        s.for_body = al_rw_stmts(a, s.for_body)
+    else if k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
+        s.while_body = al_rw_stmts(a, s.while_body)
+    else if k == STMT_MATCH
+        s.if_cond = al_rw_expr(a, s.if_cond)
+        al_rw_arms(a, s.if_then as *MatchArm)
+    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        s.if_cond = al_rw_expr(a, s.if_cond)
+        if k == STMT_MEMBER_INDEX_ASSIGN
+            s.while_cond = al_rw_expr(a, s.while_cond)
+        s.assign_value = al_rw_expr(a, s.assign_value)
+    else if k == STMT_INDEX_ASSIGN
+        s.while_cond = al_rw_expr(a, s.while_cond)
+        s.assign_value = al_rw_expr(a, s.assign_value)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        s.assign_value = al_rw_expr(a, s.assign_value)
+    else if k == STMT_ASSERT
+        s.if_cond = al_rw_expr(a, s.if_cond)
+    s
+
+# ---------------------------------------------------------------------------
+# The state machine
+# ---------------------------------------------------------------------------
+
+fn al_field_of(l: *AlLocal) -> *StructField
+    let f: *StructField = al_zalloc(sizeof(StructField)) as *StructField
+    f.name = l.name
+    f.name_len = l.len
+    f.field_type = l.ty
+    f.ptr_pointee = TYPE_VOID
+    f.inner_pointee_type = l.inner_pointee
+    f.field_inner_ref = l.inner_ref
+    # As field_new: a struct, or a pointer to one, is named; a primitive
+    # pointee is recorded in array_elem_type (#1304), which `p + i` strides by.
+    if l.ty == TYPE_STRUCT
+        f.field_type_name = l.type_name
+        f.field_type_name_len = l.type_name_len
+    else if l.ty == TYPE_PTR
+        f.ptr_pointee = l.pointee
+        if l.pointee == TYPE_STRUCT
+            f.field_type_name = l.type_name
+            f.field_type_name_len = l.type_name_len
+        else
+            f.array_elem_type = l.pointee
+    else if l.ty == TYPE_PTR_PTR and l.type_name_len > 0
+        f.field_type_name = l.type_name
+        f.field_type_name_len = l.type_name_len
+    f
+
+# `struct <f>_Future { __state, params in order, the other locals by name }`
+fn al_future_struct(a: *AlFn, name: *u8, len: i32) -> *StructDef
+    var state: AlLocal
+    state.name = c"__state"
+    state.len = 7
+    al_set_scalar(@state, TYPE_I32)
+    let head: *StructField = al_field_of(@state)
+    var last: *StructField = head
+    var l: *AlLocal = a.locals
+    while l != null
+        if l.is_param == 1
+            last.next = al_field_of(l)
+            last = last.next
+        l = l.next
+    if a.npoints > 0
+        var placed: *AlLocal = null   # the last one placed, in name order
+        var more: i32 = 1
+        while more == 1
+            # The least name above `placed`: a selection sort, with no list
+            # surgery on a.locals.
+            var best: *AlLocal = null
+            var c: *AlLocal = a.locals
+            while c != null
+                if c.is_param == 0 and (placed == null or al_less(placed.name, placed.len, c.name, c.len) == 1)
+                    if best == null or al_less(c.name, c.len, best.name, best.len) == 1
+                        best = c
+                c = c.next
+            if best == null
+                more = 0
+            else
+                last.next = al_field_of(best)
+                last = last.next
+                placed = best
+    let s: *StructDef = al_zalloc(sizeof(StructDef)) as *StructDef
+    s.name = name
+    s.name_len = len
+    s.fields = head
+    s
+
+# `fn <ctor>(params) -> <f>_Future`: `<f>_Future { __state: 0, p: p, .. }`;
+# a local's field is left out, so zero, as ritz0 sets it.
+fn al_constructor(a: *AlFn, name: *u8, len: i32, fut: *u8, fut_len: i32) -> *FnDef
+    let f: *FnDef = a.f
+    let span: SrcSpan = SrcSpan { line: f.line, col: f.col }
+    let head: *FieldInit = al_zalloc(sizeof(FieldInit)) as *FieldInit
+    head.name = c"__state"
+    head.name_len = 7
+    head.value = al_int(0, span)
+    var last: *FieldInit = head
+    var p: *Param = f.params
+    while p != null
+        let fi: *FieldInit = al_zalloc(sizeof(FieldInit)) as *FieldInit
+        fi.name = p.name
+        fi.name_len = p.name_len
+        fi.value = al_ident(p.name, p.name_len, span)
+        last.next = fi
+        last = fi
+        p = p.next
+    let lit: *Expr = al_expr(EXPR_STRUCT_LIT, span)
+    lit.ident_ptr = fut
+    lit.ident_len = fut_len
+    lit.args = head as *Expr
+    al_fn(f, name, len, f.params, TYPE_STRUCT, fut, fut_len, al_expr_stmt(lit))
+
+# One await's state:
+#     if self.__state == N
+#         [var __future_N: g_Future = g(args)]
+#         let __inner_result_N: i32 = g_poll(@__future_N)   (or the awaited expr)
+#         if __inner_result_N == 0 - 1
+#             return 0 - 1
+#         self.<result> = __inner_result_N
+#         <the lets it completes>
+#         self.__state = N + 1
+fn al_state(a: *AlFn, p: *AlPoint, n: i32) -> *Stmt
+    let span: SrcSpan = p.await_expr.span
+    var rl: i32 = 0
+    let res: *u8 = al_numbered(c"__inner_result_", n, @rl)
+    let inner: *Expr = p.await_expr.operand
+    var body: *Stmt = null
+    let g: *AlAsync = al_call_of_async(inner)
+    if g != null
+        var fl: i32 = 0
+        let fut_var: *u8 = al_numbered(c"__future_", n, @fl)
+        var tl: i32 = 0
+        let fut_ty: *u8 = al_join(g.name, g.len, c"_Future", 7, @tl)
+        var pl: i32 = 0
+        let poll: *u8 = al_join(g.name, g.len, c"_poll", 5, @pl)
+        let args: *Expr = al_rw_list(a, inner.args)
+        body = al_decl(fut_var, fl, TYPE_STRUCT, fut_ty, tl, al_call(g.name, g.len, args, inner.span), 0, null, span)
+        body = al_append(body, al_decl(res, rl, TYPE_I32, null, 0, al_call(poll, pl, al_addr_of(fut_var, fl, span), span), 1, a.file, span))
+    else
+        body = al_decl(res, rl, TYPE_I32, null, 0, al_rw_expr(a, inner), 1, a.file, span)
+    let pending: *Stmt = al_return(al_pending(span), span)
+    body = al_append(body, al_if(al_binary(OP_EQ, al_ident(res, rl, span), al_pending(span)), pending, span))
+    body = al_append(body, al_assign_self(p.result, p.result_len, al_ident(res, rl, span), span))
+    var l: *AlLet = p.then_lets
+    while l != null
+        let st: *Stmt = al_rw_stmt(a, l.stmt)
+        st.next = null
+        body = al_append(body, st)
+        l = l.next
+    body = al_append(body, al_assign_self(c"__state", 7, al_int((n + 1) as i64, span), span))
+    let cond: *Expr = al_binary(OP_EQ, al_self_field(c"__state", 7, span), al_int(n as i64, span))
+    al_if(cond, body, span)
+
+fn al_is_lit(e: *Expr) -> i32
+    (e != null and e.kind == EXPR_INT_LIT) as i32
+
+# `fn <f>_poll(self: *<f>_Future) -> i32`
+fn al_poll(a: *AlFn, name: *u8, len: i32, fut: *u8, fut_len: i32) -> *FnDef
+    let f: *FnDef = a.f
+    let span: SrcSpan = SrcSpan { line: f.line, col: f.col }
+    let unit: i32 = (f.return_type == TYPE_VOID) as i32
+    var body: *Stmt = null
+    if a.npoints == 0
+        # The whole body is the poll, its params read through `self`.
+        body = al_rw_stmts(a, f.body)
+        if unit == 1
+            body = al_append(body, al_expr_stmt(al_int(0, span)))   # Ready(0)
+    else
+        var p: *AlPoint = a.points
+        var n: i32 = 0
+        while p != null
+            body = al_append(body, al_state(a, p, n))
+            n += 1
+            p = p.next
+        # The final state: the body's tail, or its last `return`'s value.
+        let last: *Stmt = al_last(f.body)
+        var value: *Expr = null
+        var tail: *Stmt = null
+        if last != null and last.kind == STMT_EXPR
+            value = al_rw_expr(a, last.expr)
+        else if last != null and last.kind == STMT_RETURN and last.return_value != null
+            value = al_rw_expr(a, last.return_value)
+        else if last != null and (last.kind == STMT_IF or last.kind == STMT_MATCH)
+            tail = al_rw_stmt(a, last)
+            tail.next = null
+        if unit == 1
+            if value != null and al_is_lit(value) == 0
+                body = al_append(body, al_expr_stmt(value))
+            if tail != null
+                body = al_append(body, tail)
+            body = al_append(body, al_expr_stmt(al_int(0, span)))
+        else if tail != null
+            body = al_append(body, tail)
+        else
+            if value == null
+                value = al_int(0, span)
+            else
+                value.next = null
+            body = al_append(body, al_expr_stmt(value))
+    let self_p: *Param = al_zalloc(sizeof(Param)) as *Param
+    self_p.name = c"self"
+    self_p.name_len = 4
+    self_p.param_type = TYPE_PTR
+    self_p.param_type_name = fut
+    self_p.param_type_name_len = fut_len
+    self_p.param_pointee_type = TYPE_STRUCT
+    self_p.name_span = span
+    let poll: *FnDef = al_fn(f, name, len, self_p, TYPE_I32, null, 0, body)
+    # A private async fn is refused once, at the call of its constructor:
+    # cc_private skips a fn with no file.  (Not from_generated, which would
+    # make a pub poll weak_odr.)  A local poll's file is the input's anyway.
+    poll.def_file = null
+    poll
+
+# Analyse async fn `f`; 0, or the errors it reported.
+fn al_analyse(a: *AlFn) -> i32
+    let f: *FnDef = a.f
+    var p: *Param = f.params
+    while p != null
+        al_local_of_param(a, p)
+        p = p.next
+    al_an_stmts(a, f.body, 1)
+    if a.npoints == 0
+        # Only the params are fields.
+        var errs: i32 = 0
+        var l: *AlLocal = a.locals
+        while l != null
+            if l.is_param == 1 and l.unsupported == 1
+                diag_error_name(a.file, l.span, c"ritz1 can't yet hold `", l.name, l.len, c"`'s type in a future: an array, reference or fn type")
+                errs += 1
+            l = l.next
+        return errs
+    # With an await every local is a field of the future, which needs its
+    # type (#3762).
+    if a.untyped != null
+        let s: *Stmt = a.untyped
+        var m: String = string_new()
+        string_push_str(@&m, "cannot infer the type of `")
+        string_push_bytes(@&m, s.var_name, s.var_name_len as i64)
+        string_push_str(@&m, "`, which `")
+        string_push_bytes(@&m, f.name, f.name_len as i64)
+        string_push_str(@&m, "`'s future holds across an `await`: give `")
+        string_push_bytes(@&m, s.var_name, s.var_name_len as i64)
+        string_push_str(@&m, "` a type (`let ")
+        string_push_bytes(@&m, s.var_name, s.var_name_len as i64)
+        string_push_str(@&m, ": T = ...`)")
+        diag_error_buf(a.file, s.span, @m)
+        string_drop(@&m)
+        return 1
+    var errs: i32 = 0
+    var l: *AlLocal = a.locals
+    while l != null
+        if l.unsupported == 1
+            diag_error_name(a.file, l.span, c"ritz1 can't yet hold `", l.name, l.len, c"`'s type in a future: an array, reference or fn type")
+            errs += 1
+        l = l.next
+    errs
+
+# Lower async fn `f`: its future struct joins m's structs, and its
+# constructor and poll (and for `main`, the sync wrapper) take its place in
+# the fn list, after `prev` (null: at the head).  0, or the errors reported.
+fn al_lower_fn(m: *Module, prev: *FnDef, f: *FnDef) -> i32
+    var a: AlFn
+    a.f = f
+    a.file = al_file(f)
+    a.locals = null
+    a.points = null
+    a.npoints = 0
+    a.let_target = null
+    a.top = null
+    a.untyped = null
+    a.sync = 0
+    if f.type_params != null
+        diag_error_name(a.file, diag_span(f.line, f.col), c"async fn '", f.name, f.name_len, c"' is generic, which ritz1 can't lower to a state machine")
+        return 1
+    let errs: i32 = al_analyse(@a)
+    if errs > 0
+        return errs
+    var fl: i32 = 0
+    let fut: *u8 = al_join(f.name, f.name_len, c"_Future", 7, @fl)
+    var pl: i32 = 0
+    let poll_name: *u8 = al_join(f.name, f.name_len, c"_poll", 5, @pl)
+    let st: *StructDef = al_future_struct(@a, fut, fl)
+    var sl: *StructDef = m.structs
+    if sl == null
+        m.structs = st
+    else
+        while sl.next != null
+            sl = sl.next
+        sl.next = st
+    let is_main: i32 = al_eq(f.name, f.name_len, c"main", 4)
+    var ctor: *FnDef = null
+    if is_main == 1
+        ctor = al_constructor(@a, c"__main_future", 13, fut, fl)
+    else
+        ctor = al_constructor(@a, f.name, f.name_len, fut, fl)
+    let poll: *FnDef = al_poll(@a, poll_name, pl, fut, fl)
+    ctor.next = poll
+    poll.next = f.next
+    if is_main == 1
+        let span: SrcSpan = SrcSpan { line: f.line, col: f.col }
+        let body: *Stmt = al_drive_body(c"__main_future", 13, null, fut, fl, poll_name, pl, span)
+        let wrapper: *FnDef = al_fn(f, c"main", 4, null, TYPE_I32, null, 0, body)
+        wrapper.is_pub = 1
+        poll.next = wrapper
+        wrapper.next = f.next
+    if prev == null
+        m.functions = ctor
+    else
+        prev.next = ctor
+    0
+
+# ---------------------------------------------------------------------------
+# LANGUAGE_SPEC §16.2: a bare call to an async fn
+# ---------------------------------------------------------------------------
+
+fn al_prim_name(t: i32) -> *u8
+    if t == TYPE_I8
+        return c"i8"
+    if t == TYPE_I16
+        return c"i16"
+    if t == TYPE_I32
+        return c"i32"
+    if t == TYPE_I64
+        return c"i64"
+    if t == TYPE_U8
+        return c"u8"
+    if t == TYPE_U16
+        return c"u16"
+    if t == TYPE_U32
+        return c"u32"
+    if t == TYPE_U64
+        return c"u64"
+    if t == TYPE_BOOL
+        return c"bool"
+    if t == TYPE_F32
+        return c"f32"
+    if t == TYPE_F64
+        return c"f64"
+    null
+
+# A let's written type, as ritz0 formats it in the message.
+fn al_push_type(m: @&String, s: *Stmt)
+    let t: i32 = s.var_declared_type
+    if t == TYPE_STRUCT
+        string_push_bytes(m, s.var_type_name, s.var_type_name_len as i64)
+        return
+    if t == TYPE_PTR
+        string_push_str(m, "*")
+        if s.var_pointee_type == TYPE_STRUCT
+            string_push_bytes(m, s.var_type_name, s.var_type_name_len as i64)
+            return
+        let pn: *u8 = al_prim_name(s.var_pointee_type)
+        if pn != null
+            string_push_bytes(m, pn, al_clen(pn) as i64)
+        return
+    let n: *u8 = al_prim_name(t)
+    if n != null
+        string_push_bytes(m, n, al_clen(n) as i64)
+
+fn al_bare_call_error(file: *u8, call: *Expr) -> i32
+    var m: String = string_new()
+    string_push_str(@&m, "calling async fn `")
+    string_push_bytes(@&m, call.func_name, call.func_name_len as i64)
+    string_push_str(@&m, "` without `await` builds its future and drops it; its body never runs: write `await ")
+    string_push_bytes(@&m, call.func_name, call.func_name_len as i64)
+    string_push_str(@&m, "(...)`")
+    diag_error_buf(file, call.span, @m)
+    string_drop(@&m)
+    1
+
+fn al_typed_let_error(file: *u8, s: *Stmt, call: *Expr) -> i32
+    var m: String = string_new()
+    string_push_str(@&m, "`")
+    string_push_bytes(@&m, s.var_name, s.var_name_len as i64)
+    string_push_str(@&m, "` is declared `")
+    al_push_type(@&m, s)
+    string_push_str(@&m, "` but `")
+    string_push_bytes(@&m, call.func_name, call.func_name_len as i64)
+    string_push_str(@&m, "(...)` is an async fn call, which without `await` is its future `")
+    string_push_bytes(@&m, call.func_name, call.func_name_len as i64)
+    string_push_str(@&m, "_Future`: write `await ")
+    string_push_bytes(@&m, call.func_name, call.func_name_len as i64)
+    string_push_str(@&m, "(...)`")
+    diag_error_buf(file, s.span, @m)
+    string_drop(@&m)
+    1
+
+# The bare async calls of a statement list.  `value` is 1 when the list's
+# last statement is the value of its fn (a `-> T` fn's tail, or an arm of one).
+fn al_bare_stmts(file: *u8, s: *Stmt, value: i32) -> i32
+    var errs: i32 = 0
+    var cur: *Stmt = s
+    while cur != null
+        let tail: i32 = (value == 1 and cur.next == null) as i32
+        let k: i32 = cur.kind
+        if k == STMT_EXPR
+            if tail == 0 and al_call_of_async(cur.expr) != null
+                errs += al_bare_call_error(file, cur.expr)
+            else if cur.expr != null and (cur.expr.kind == EXPR_IF or cur.expr.kind == EXPR_MATCH)
+                errs += al_bare_arms(file, cur.expr.args as *MatchArm, tail)
+        else if k == STMT_VAR_DECL
+            let g: *AlAsync = al_call_of_async(cur.var_init)
+            if g != null and cur.var_declared_type != TYPE_VOID
+                var fl: i32 = 0
+                let fut: *u8 = al_join(g.name, g.len, c"_Future", 7, @fl)
+                if cur.var_declared_type != TYPE_STRUCT or al_eq(cur.var_type_name, cur.var_type_name_len, fut, fl) == 0
+                    errs += al_typed_let_error(file, cur, cur.var_init)
+        else if k == STMT_IF
+            errs += al_bare_stmts(file, cur.if_then, tail)
+            errs += al_bare_stmts(file, cur.if_else, tail)
+        else if k == STMT_MATCH
+            errs += al_bare_arms(file, cur.if_then as *MatchArm, tail)
+        else if k == STMT_WHILE or k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
+            errs += al_bare_stmts(file, cur.while_body, 0)
+        else if k == STMT_FOR
+            errs += al_bare_stmts(file, cur.for_body, 0)
+        cur = cur.next
+    errs
+
+fn al_bare_arms(file: *u8, arm: *MatchArm, value: i32) -> i32
+    var errs: i32 = 0
+    var cur: *MatchArm = arm
+    while cur != null
+        errs += al_bare_stmts(file, cur.body_stmts, (value == 1 and cur.body == null) as i32)
+        cur = cur.next
+    errs
+
+fn al_bare_fn(f: *FnDef) -> i32
+    if f.is_local != 1 or f.body == null
+        return 0
+    al_bare_stmts(g_al_path, f.body, (f.return_type != TYPE_VOID) as i32)
+
+# Awaits in a sync fn: polled to completion in place.
+fn al_sync_fn(f: *FnDef)
+    if f.body == null
+        return
+    var a: AlFn
+    a.f = f
+    a.file = al_file(f)
+    a.locals = null
+    a.points = null
+    a.npoints = 0
+    a.let_target = null
+    a.top = null
+    a.untyped = null
+    a.sync = 1
+    f.body = al_rw_stmts(@a, f.body)
+
+# ---------------------------------------------------------------------------
+# The pass
+# ---------------------------------------------------------------------------
+
+# Lower every async fn of `m` and every await, after refusing each bare call
+# to an async fn.  `path` is the input file.  Returns the errors it reported;
+# main stops on any.
+pub fn async_lower_module(m: *Module, path: *u8) -> i32
+    g_al_module = m
+    g_al_path = path
+    g_al_async = null
+    var f: *FnDef = m.functions
+    while f != null
+        if f.is_async == 1
+            let entry: *AlAsync = al_zalloc(sizeof(AlAsync)) as *AlAsync
+            entry.name = f.name
+            entry.len = f.name_len
+            entry.params = f.params
+            entry.next = g_al_async
+            g_al_async = entry
+        f = f.next
+    var errs: i32 = 0
+    if g_al_async != null
+        f = m.functions
+        while f != null
+            errs += al_bare_fn(f)
+            f = f.next
+        var ib: *ImplBlock = m.impls
+        while ib != null
+            var method: *FnDef = ib.methods
+            while method != null
+                errs += al_bare_fn(method)
+                method = method.next
+            ib = ib.next
+    if errs > 0
+        return errs
+    # Each async fn becomes its future, constructor and poll.
+    var prev: *FnDef = null
+    f = m.functions
+    while f != null
+        let nxt: *FnDef = f.next
+        if f.is_async == 1
+            errs += al_lower_fn(m, prev, f)
+            # The last fn the lowering put in f's place.
+            if prev == null
+                prev = m.functions
+            else
+                prev = prev.next
+            while prev.next != nxt
+                prev = prev.next
+        else
+            prev = f
+        f = nxt
+    if errs > 0
+        return errs
+    # Every other await: in a sync fn (or a method), polled to completion.
+    # A helper this adds is appended, and has no await of its own.
+    f = m.functions
+    while f != null
+        al_sync_fn(f)
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            al_sync_fn(method)
+            method = method.next
+        ib = ib.next
+    0

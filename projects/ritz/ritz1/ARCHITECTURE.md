@@ -41,6 +41,10 @@ input.ritz
   │         strip it to its interface, merge it into the one Module.
   │         Re-parse once if type aliases / pending array lengths need it.
   ▼
+[async]     async_lower: each `async fn` becomes ritz0's `<f>_Future` struct,
+  │         constructor and `<f>_poll` state machine; every `await` is lowered;
+  │         a bare call to an async fn is refused (§16.2)
+  ▼
 [pre-mono checks]  impls on unknown/built-in types (main), binder_check,
   │                reachability — judged once per generic fn, used or not
   ▼
@@ -67,7 +71,8 @@ file `is_local = 1` before imports are merged; imported fns stay
 so each `.ll` holds only its own file's bodies plus the `linkonce_odr`
 monomorph instantiations it needs. Each import is cut to its interface as it
 loads (`strip_to_interface`): bodies are kept only for generic fns and methods
-the importer may instantiate, so a body-only edit to an import does not change
+the importer may instantiate, and for async fns (their locals lay out the
+future the importer allocates), so a body-only edit to an import does not change
 the importer's IR. An import may be read from its cached interface text
 instead of its source (`load_and_parse`, `fn_cache`).
 
@@ -115,6 +120,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `ast` | AST node structs (`Expr`, `Stmt`, `FnDef`, `StructDef`, `Module`, ...) and kind constants. |
 | `ast_helpers` | AST constructors the grammar's actions call, the parser arena, type-alias and array-length folding, and AST queries used everywhere downstream. Hand-written (see below). |
 | `diag` | Located diagnostics: one `<file>:<line>:<col>: error: <message>` line per error. |
+| `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>_Future`, `<f>`, `<f>_poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |
 | `interp` | Reads `{expr}` placeholders in print strings; re-enters the lexer/parser for each placeholder expression. |
 
 **Driver and caching**
