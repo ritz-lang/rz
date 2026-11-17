@@ -156,6 +156,16 @@ stays here; remote hosts only run rooms.
     its own worktree's `run-gate.sh` (briefing step 6), not the host's
     `~/dev/ritz-lang/rz` checkout (Aaron, 2026-11-16 20:35).
   - `RESTART ritz-task-<id>`: restarts a room that isn't working.
+    **Exec-capable TMPDIR (bangerang, 2026-11-17):** bangerang's `/tmp` is
+    `noexec` and room units run with `PrivateTmp=yes`, so a hand-run
+    `pytest` that execs a built ritz1 from `tmp_path` fails (#1334). Gates
+    are fine (`run-gate.sh` sets its own exec-capable TMPDIR, #3704). At
+    SPAWN the host makes `~/tmp/rz-room-<id>` and sets
+    `TMPDIR=/home/aaron/tmp/rz-room-<id>` in a systemd drop-in,
+    `adele-agent@ritz-task-<id>.service.d/60-rz-room-tmpdir.conf`, before
+    the unit starts. Not `room.env`: `adele room spawn` rewrites it at
+    install and starts the unit at once. TEARDOWN deletes the drop-in and
+    the dir.
   - `TEARDOWN ritz-task-<id>`: removes the room's unit, budget, worktree and
     local branch after its merge. The host answers `TORNDOWN ritz-task-<id>
     on <host>` (one word, no hyphen); the slot is free from then. Refusal is
