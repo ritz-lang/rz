@@ -25,6 +25,8 @@
 #     (AGAST #2197 item 5)
 #   - A handshake flight sent in short sends, a big cert chain under a small
 #     SO_SNDBUF, completes (AGAST #3677)
+#   - Every connection valet closes ends with its close_notify, not a bare
+#     EOF (AGAST #2196)
 #
 # Usage: bash projects/valet/test/test_tls_socket.sh  (after ./rz build valet)
 # PORT, SPORT and HPORT pin the three servers' ports; by default each run picks its own
@@ -288,20 +290,45 @@ elif mode == "oversized":
 reply = b""
 while True:
     try:
-        reply += tls.read(16384)
+        chunk = tls.read(16384)
+        if not chunk:  # SSLObject.read's answer to close_notify
+            reply += b"\nTLS: close_notify\n"
+            break
+        reply += chunk
     except ssl.SSLWantReadError:
         data = sock.recv(16384)
-        if not data:
-            break
-        inc.write(data)
-    except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+        if data:
+            inc.write(data)
+        else:
+            inc.write_eof()  # tls.read now tells close_notify from a bare EOF
+    except ssl.SSLZeroReturnError:
+        reply += b"\nTLS: close_notify\n"
+        break
+    except ssl.SSLEOFError:
+        # suppress_ragged_eofs=False semantics: a strict client calls the
+        # stream truncated (AGAST #2196).
+        reply += b"\nTLS: EOF without close_notify\n"
         break
 sys.stdout.write(reply.decode("latin-1"))
 EOF
 }
 
+# Every connection valet closes ends with its close_notify: a client that
+# demands one (Python's suppress_ragged_eofs=False) sees anything else as a
+# truncated stream. valet queued the alert, then shut down and freed the
+# task before the send completed (AGAST #2196).
+check_close_notify() {
+    if grep -q "^TLS: close_notify$" <<<"$2"; then
+        pass "$1: ended with close_notify"
+    else
+        fail "$1: connection ended without close_notify"
+        echo "--- client"; tail -8 <<<"$2"
+    fi
+}
+
 echo "=== Test 4: CCS, Finished and request in one write ==="
 OUT="$(raw_client coalesced 2>&1)"
+check_close_notify "coalesced flight" "$OUT"
 if grep -q "HTTP/1.1 200" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
     pass "coalesced flight: GET returned the response"
 else
@@ -320,6 +347,7 @@ cpu_ticks() {
 # first was incomplete, and valet closed without a response (AGAST #2201).
 echo "=== Test 5: request headers split across two records ==="
 OUT="$(raw_client split 2>&1)"
+check_close_notify "split headers" "$OUT"
 if grep -q "HTTP/1.1 200" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
     pass "split headers: GET returned the response"
 else
@@ -332,6 +360,7 @@ fi
 # the GET behind it is answered only if the connection survives.
 echo "=== Test 6: body in a later record, then a keep-alive GET ==="
 OUT="$(raw_client splitbody 2>&1)"
+check_close_notify "split body" "$OUT"
 NRESP="$(grep -o "HTTP/1.1 [0-9]" <<<"$OUT" | wc -l)"
 if [ "$NRESP" -eq 2 ] && grep -q "HTTP/1.1 404" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
     pass "split body: POST and the GET behind it both answered"
@@ -343,6 +372,7 @@ fi
 
 echo "=== Test 7: two pipelined requests in one record ==="
 OUT="$(raw_client pipelined 2>&1)"
+check_close_notify "pipelined" "$OUT"
 NOK="$(grep -o "HTTP/1.1 200" <<<"$OUT" | wc -l)"
 if [ "$NOK" -eq 2 ]; then
     pass "pipelined: both requests answered"
@@ -354,6 +384,7 @@ fi
 
 echo "=== Test 8: one record split across two TCP writes ==="
 OUT="$(raw_client splitrecord 2>&1)"
+check_close_notify "split record" "$OUT"
 if grep -q "HTTP/1.1 200" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
     pass "split record: GET returned the response"
 else
@@ -364,6 +395,7 @@ fi
 
 echo "=== Test 9: a request's two records in one TCP write ==="
 OUT="$(raw_client tworecords 2>&1)"
+check_close_notify "two records, one write" "$OUT"
 if grep -q "HTTP/1.1 200" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
     pass "two records, one write: GET returned the response"
 else
@@ -374,6 +406,7 @@ fi
 
 echo "=== Test 10: headers over the request limit ==="
 OUT="$(raw_client oversized 2>&1)"
+check_close_notify "oversized headers" "$OUT"
 if grep -q "^HTTP/1.1 413" <<<"$OUT"; then
     pass "oversized headers: 413"
 else
@@ -465,14 +498,23 @@ reply = b""
 try:
     while True:
         try:
-            reply += tls.read(16384)
+            chunk = tls.read(16384)
+            if not chunk:  # SSLObject.read's answer to close_notify
+                print("TLS: close_notify")
+                break
+            reply += chunk
         except ssl.SSLWantReadError:
             data = sock.recv(2048)
-            if not data:
-                break
-            inc.write(data)
-            time.sleep(0.002)
-        except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+            if data:
+                inc.write(data)
+                time.sleep(0.002)
+            else:
+                inc.write_eof()
+        except ssl.SSLZeroReturnError:
+            print("TLS: close_notify")
+            break
+        except ssl.SSLEOFError:
+            print("TLS: EOF without close_notify")
             break
 except ssl.SSLError as e:
     print("TLS error after %d bytes: %s" % (len(reply), e))
@@ -487,6 +529,7 @@ while sep:
 print("intact responses: %d of %d" % (got, N))
 EOF2
 )"
+check_close_notify "short sends" "$OUT"
 if grep -q "^intact responses: 12 of 12$" <<<"$OUT"; then
     pass "short sends: 12 responses of 3500 bytes arrived intact"
 else
@@ -562,17 +605,29 @@ sock.sendall(outg.read())
 reply = b""
 while True:
     try:
-        reply += tls.read(16384)
+        chunk = tls.read(16384)
+        if not chunk:  # SSLObject.read's answer to close_notify
+            reply += b"\nTLS: close_notify\n"
+            break
+        reply += chunk
     except ssl.SSLWantReadError:
         data = sock.recv(16384)
-        if not data:
-            break
-        inc.write(data)
-    except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+        if data:
+            inc.write(data)
+        else:
+            inc.write_eof()  # tls.read now tells close_notify from a bare EOF
+    except ssl.SSLZeroReturnError:
+        reply += b"\nTLS: close_notify\n"
+        break
+    except ssl.SSLEOFError:
+        # suppress_ragged_eofs=False semantics: a strict client calls the
+        # stream truncated (AGAST #2196).
+        reply += b"\nTLS: EOF without close_notify\n"
         break
 sys.stdout.write(reply.decode("latin-1"))
 EOF2
 )"
+check_close_notify "big cert chain" "$OUT"
 if grep -q "HTTP/1.1 200" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
     pass "big cert chain: handshake completed and GET answered ($(grep -o 'flight bytes: [0-9]*' <<<"$OUT"))"
 else

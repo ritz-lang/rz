@@ -1500,6 +1500,7 @@ const TLS_CONN_STATE_RECV: i32 = 2
 const TLS_CONN_STATE_PARSE: i32 = 3
 const TLS_CONN_STATE_SEND: i32 = 4
 const TLS_CONN_STATE_HANDSHAKE_SEND: i32 = 5
+const TLS_CONN_STATE_CLOSE_SEND: i32 = 6
 
 # Global TLS server instance per connection
 # We allocate these on the heap since TlsServer is large (~35KB with work buffers)
@@ -1928,7 +1929,9 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
                 return 1
             return -1
 
-        # Close TLS connection
+        # Close TLS connection: send close_notify, and shut down only once it
+        # is out. The send is only queued here; a shutdown now beats it to
+        # the wire and the client sees a truncated stream (AGAST #2196).
         var close_buf: [128]u8
         let close_len: i64 = tls_server_close(@tls_data.tls, @close_buf[0], 128)
         if close_len > 0
@@ -1936,8 +1939,23 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
             while i < close_len
                 task.write_buf[i] = close_buf[i]
                 i = i + 1
-            tls_task_send(task, tls_data, close_len as i32)
+            task.handler_state = TLS_CONN_STATE_CLOSE_SEND
+            if tls_task_send(task, tls_data, close_len as i32) == 0
+                return -1
 
+        tcp_shutdown(task.fd, SHUT_WR)
+        tls_task_data_free(tls_data)
+        task.user_data = null
+        return 0
+
+    # State: CLOSE_SEND - the close_notify alert finished sending. Finish a
+    # short send, then shut down. A failed send leaves nothing to wait for.
+    if task.handler_state == TLS_CONN_STATE_CLOSE_SEND
+        if task.io_result > 0
+            task.write_pos = task.write_pos + task.io_result
+            if task.write_pos < task.write_len
+                if task_submit_send_buf(tls_data.pool, task, @task.write_buf[task.write_pos], task.write_len - task.write_pos) == 0
+                    return -1
         tcp_shutdown(task.fd, SHUT_WR)
         tls_task_data_free(tls_data)
         task.user_data = null
