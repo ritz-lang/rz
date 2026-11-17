@@ -1,11 +1,14 @@
 #!/bin/bash
 # Golden stdout for json_walk (examples/tier5_async/79_ritzlib_json):
 # ritzlib.json (AGAST #1459).  Pins json's CURRENT behaviour, quirks included:
-#   - json_parse2 reports every failure as code 1 (JSON_ERR_UNEXPECTED_CHAR);
+#   - json_parse2 reports every failure as code 1 (JSON_ERR_UNEXPECTED_CHAR),
+#     except a malformed \uXXXX escape: code 7 (JSON_ERR_INVALID_ESCAPE) at
+#     its backslash (AGAST #3914);
 #     pos is where the parser stopped (end of input for "[1, 2" and "\"open");
 #   - numbers are integers: -1.25 parses as -125, -0012 as -12;
 #   - input after the first value is ignored: "[1] x" parses as [1];
-#   - an unknown escape copies the character: "\/" decodes to "/".
+#   - "\/" decodes to "/" (a JSON escape since AGAST #3914; before that it
+#     was an unknown escape that happened to copy the right character).
 # Byte counts, tallies, paths and error positions were checked by hand
 # against json.ritz, not just captured from a compiler.  If a fix to
 # json.ritz changes one on purpose, update the golden here in the same commit.
@@ -107,6 +110,9 @@ empty input: error: code=1 pos=0 msg=unexpected character
 trailing input (accepted): ok [1]
   legacy: ok=1
   failed: 0
+bad \u escape: error: code=7 pos=2 msg=invalid \u escape
+  legacy: ok=0 pos=2 error=JSON parse error
+  failed: 1
 message 0: unknown error
 message 1: unexpected character
 message 2: unterminated string
@@ -114,14 +120,15 @@ message 3: expected ':'
 message 4: expected ']'
 message 5: expected '}'
 message 6: out of memory
-message 7: unknown error
+message 7: invalid \u escape
+message 8: unknown error
 GOLDEN
 )
 out=$(./json_walk </dev/null); rc=$?
 check "empty stdin (builtin doc)" "$want" "$out" 0 "$rc"
 
 # 2. A document on stdin: newlines and indentation, every escape json.ritz
-#    decodes (\n \t \" \\) plus an unknown one (\/), a leading-zero negative
+#    decodes but \b \f \uXXXX (\n \t \" \\ \/), a leading-zero negative
 #    number, and nested/empty objects.  Emission normalises the layout and
 #    re-parsing the emitted text gives the same text back.
 want=$(cat <<'GOLDEN'

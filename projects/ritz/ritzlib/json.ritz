@@ -58,6 +58,7 @@ const JSON_ERR_EXPECTED_COLON: i32 = 3
 const JSON_ERR_EXPECTED_BRACKET: i32 = 4
 const JSON_ERR_EXPECTED_BRACE: i32 = 5
 const JSON_ERR_OUT_OF_MEMORY: i32 = 6
+const JSON_ERR_INVALID_ESCAPE: i32 = 7   # malformed \uXXXX: bad hex, unpaired surrogate
 
 # Error type for JSON parsing
 struct JsonError
@@ -72,6 +73,8 @@ struct JsonParser
     src: *u8            # Input buffer
     len: i64            # Input length
     pos: i64            # Current position
+    err: i32            # JSON_ERR_* for a failure more specific than "unexpected
+                        # character" (set where the parse returns null)
 
 # =============================================================================
 # Helper Functions
@@ -216,6 +219,79 @@ fn jp_parse_value(p: *JsonParser) -> *JsonValue
 
     return null
 
+# Value of the four hex digits at src[pos..pos+4), or -1 if one is not a hex
+# digit or `end` comes first.
+fn jp_hex4(src: *u8, pos: i64, end: i64) -> i32
+    if pos + 4 > end
+        return 0 - 1
+    var val: i32 = 0
+    var k: i64 = 0
+    while k < 4
+        let c: i32 = *(src + pos + k) as i32
+        var d: i32 = 0 - 1
+        if c >= 48 and c <= 57          # '0'-'9'
+            d = c - 48
+        else if c >= 97 and c <= 102    # 'a'-'f'
+            d = c - 87
+        else if c >= 65 and c <= 70     # 'A'-'F'
+            d = c - 55
+        if d < 0
+            return 0 - 1
+        val = val * 16 + d
+        k += 1
+    return val
+
+# Write code point `cp` (U+0000..U+10FFFF, not a surrogate) to `dst` as UTF-8;
+# returns the byte count, 1-4.
+fn jp_put_utf8(dst: *u8, cp: i32) -> i64
+    if cp < 0x80
+        *dst = cp as u8
+        return 1
+    if cp < 0x800
+        *dst = (0xC0 | (cp >> 6)) as u8
+        *(dst + 1) = (0x80 | (cp & 0x3F)) as u8
+        return 2
+    if cp < 0x10000
+        *dst = (0xE0 | (cp >> 12)) as u8
+        *(dst + 1) = (0x80 | ((cp >> 6) & 0x3F)) as u8
+        *(dst + 2) = (0x80 | (cp & 0x3F)) as u8
+        return 3
+    *dst = (0xF0 | (cp >> 18)) as u8
+    *(dst + 1) = (0x80 | ((cp >> 12) & 0x3F)) as u8
+    *(dst + 2) = (0x80 | ((cp >> 6) & 0x3F)) as u8
+    *(dst + 3) = (0x80 | (cp & 0x3F)) as u8
+    return 4
+
+# Fail a string parse on a malformed \u escape: report JSON_ERR_INVALID_ESCAPE
+# at `at`, the offset of the escape's backslash.
+fn jp_bad_escape(p: *JsonParser, str: *u8, at: i64) -> *JsonValue
+    free(str)
+    p.err = JSON_ERR_INVALID_ESCAPE
+    p.pos = at
+    return null
+
+# Code point of the \uXXXX escape whose 'u' is at src[pos], combining a
+# surrogate pair \uD8xx\uDCxx into one; -1 if the hex is bad or a surrogate
+# is unpaired.  *used is set to the bytes consumed from the 'u' on (5 or 11).
+fn jp_decode_u(src: *u8, pos: i64, end: i64, used: *i64) -> i32
+    let hi: i32 = jp_hex4(src, pos + 1, end)
+    if hi < 0 or (hi >= 0xDC00 and hi <= 0xDFFF)
+        return 0 - 1                    # bad hex, or a low surrogate first
+    *used = 5
+    if hi < 0xD800 or hi > 0xDBFF
+        return hi
+    # A high surrogate must be followed directly by \u and a low surrogate.
+    let lo_at: i64 = pos + 5
+    if lo_at + 1 >= end
+        return 0 - 1
+    if *(src + lo_at) as i32 != 92 or *(src + lo_at + 1) as i32 != 117   # '\\' 'u'
+        return 0 - 1
+    let lo: i32 = jp_hex4(src, lo_at + 2, end)
+    if lo < 0xDC00 or lo > 0xDFFF       # also catches lo == -1 (bad hex)
+        return 0 - 1
+    *used = 11
+    return 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+
 fn jp_parse_string(p: *JsonParser) -> *JsonValue
     if jp_peek(p) != 34  # '"'
         return null
@@ -223,7 +299,11 @@ fn jp_parse_string(p: *JsonParser) -> *JsonValue
 
     let start: i64 = p.pos
 
-    # First pass: measure length and handle escapes
+    # First pass: find the closing quote and bound the decoded length.  It
+    # counts 1 per escape plus 1 per other byte, so \uXXXX counts 5 (decodes
+    # to at most 3 bytes) and a surrogate pair counts 10 (decodes to 4): the
+    # estimate never undercounts, because no escape decodes to more bytes
+    # than it occupies in the input.
     var escaped_len: i64 = 0
     while p.pos < p.len
         let ch: i32 = jp_peek(p)
@@ -249,28 +329,43 @@ fn jp_parse_string(p: *JsonParser) -> *JsonValue
     if str == null
         return null
 
+    let end: i64 = start + raw_len
     var src_pos: i64 = start
     var dst_pos: i64 = 0
-    while src_pos < start + raw_len
+    while src_pos < end
         let ch: i32 = *(p.src + src_pos) as i32
         if ch == '\\'  # backslash
             src_pos += 1
-            if src_pos < start + raw_len
+            if src_pos < end
                 let esc: i32 = *(p.src + src_pos) as i32
-                if esc == 'n'  # 'n'
-                    *(str + dst_pos) = 10  # newline
-                else if esc == 't'  # 't'
-                    *(str + dst_pos) = 9  # tab
-                else if esc == 'r'  # 'r'
-                    *(str + dst_pos) = 13  # carriage return
-                else if esc == '"'  # '"'
-                    *(str + dst_pos) = 34
-                else if esc == '\\'  # '\'
-                    *(str + dst_pos) = 92
+                if esc == 'u'
+                    var used: i64 = 0
+                    let cp: i32 = jp_decode_u(p.src, src_pos, end, @used)
+                    if cp < 0
+                        return jp_bad_escape(p, str, src_pos - 1)
+                    dst_pos += jp_put_utf8(str + dst_pos, cp)
+                    src_pos += used
                 else
-                    *(str + dst_pos) = esc as u8  # Unknown escape, copy as-is
-                dst_pos += 1
-                src_pos += 1
+                    if esc == 'n'  # 'n'
+                        *(str + dst_pos) = 10  # newline
+                    else if esc == 't'  # 't'
+                        *(str + dst_pos) = 9  # tab
+                    else if esc == 'r'  # 'r'
+                        *(str + dst_pos) = 13  # carriage return
+                    else if esc == 'b'  # 'b'
+                        *(str + dst_pos) = 8  # backspace
+                    else if esc == 'f'  # 'f'
+                        *(str + dst_pos) = 12  # form feed
+                    else if esc == '/'  # '/'
+                        *(str + dst_pos) = 47
+                    else if esc == '"'  # '"'
+                        *(str + dst_pos) = 34
+                    else if esc == '\\'  # '\'
+                        *(str + dst_pos) = 92
+                    else
+                        *(str + dst_pos) = esc as u8  # Unknown escape, copy as-is
+                    dst_pos += 1
+                    src_pos += 1
         else
             *(str + dst_pos) = ch as u8
             dst_pos += 1
@@ -480,11 +575,14 @@ pub fn json_parse(input: StrView) -> Result<*JsonValue, JsonError>
     p.src = input.ptr
     p.len = input.len
     p.pos = 0
+    p.err = JSON_ERR_NONE
 
     let v: *JsonValue = jp_parse_value(@p)
     if v == null
         var err: JsonError
         err.code = JSON_ERR_UNEXPECTED_CHAR
+        if p.err != JSON_ERR_NONE
+            err.code = p.err
         err.pos = p.pos
         return Err(err)
 
@@ -512,6 +610,8 @@ pub fn json_error_message(code: i32) -> StrView
         return "expected '}'"
     if code == JSON_ERR_OUT_OF_MEMORY
         return "out of memory"
+    if code == JSON_ERR_INVALID_ESCAPE
+        return "invalid \\u escape"
     return "unknown error"
 
 # =============================================================================

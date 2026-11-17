@@ -68,11 +68,17 @@ for args in (["--bogus"], ["foo"], ["--stdio", "--bogus"]):
     check(f"{name} prints usage on stderr", "Usage: ritz-lsp" in err, repr(err[:80]))
 
 def frame(obj):
-    # Raw UTF-8, as editors send it: ritzlib.json does not decode \uXXXX (#3914).
+    # Raw UTF-8, as most editors send it.
     b = json.dumps(obj, ensure_ascii=False).encode()
     return b"Content-Length: %d\r\n\r\n%s" % (len(b), b)
 
-def session(msgs, argv=(), env=None, cwd=None):
+def frame_escaped(obj):
+    # Non-ASCII as \uXXXX escapes, a surrogate pair for U+10000 and up: what
+    # json.dumps sends by default, as some clients do (#3914).
+    b = json.dumps(obj, ensure_ascii=True).encode()
+    return b"Content-Length: %d\r\n\r\n%s" % (len(b), b)
+
+def session(msgs, argv=(), env=None, cwd=None, framer=frame):
     """Run one server over `msgs` (initialize first, shutdown/exit last);
     return (exit code, every message it sent, in order)."""
     msgs = ([{"jsonrpc": "2.0", "id": 1, "method": "initialize",
@@ -81,7 +87,7 @@ def session(msgs, argv=(), env=None, cwd=None):
             + msgs
             + [{"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
                {"jsonrpc": "2.0", "method": "exit"}])
-    p = subprocess.run([BIN, *argv], input=b"".join(map(frame, msgs)),
+    p = subprocess.run([BIN, *argv], input=b"".join(map(framer, msgs)),
                        capture_output=True, timeout=20, env=env, cwd=cwd)
     out = []
     for m in re.finditer(rb"Content-Length: (\d+)\r\n\r\n", p.stdout):
@@ -421,6 +427,30 @@ check("utf-16: hover after two runs of é€😀, range in units",
       and h.get("range") == rng(3, sc, 3, sc + 5), repr(r.get(5)))
 check("utf-16: a position past the end of the line -> null",
       6 in r and "error" not in r[6] and r[6].get("result") is None, repr(r.get(6)))
+
+# --- the same document sent with \uXXXX escapes (#3914) ---------------------
+# é€😀 escaped as \u00e9 \u20ac \ud83d\ude00 must decode to the same buffer as
+# the raw-UTF-8 run above: the pair combined into one 4-byte sequence, so the
+# positions after it land where they did.  Undecoded, each escape stays six
+# ASCII bytes ("u00e9"...) and every unit after it shifts.
+check("escaped: the frame carries \\u00e9, \\u20ac and a surrogate pair",
+      all(e in frame_escaped(did_open(uuri, usrc))
+          for e in (b"\\u00e9", b"\\u20ac", b"\\ud83d\\ude00")), "")
+rc, out = session([did_open(uuri, usrc), *ureqs[:4]], env=NO_RITZ1, framer=frame_escaped)
+r = by_id(out)
+h = r.get(2, {}).get("result") or {}
+check("escaped: hover after \\u-escaped é€😀 finds the name, range in units",
+      h.get("contents", {}).get("value") == "```ritz\nfn helper() -> i32\n```"
+      and h.get("range") == rng(3, hc, 3, hc + 6), repr(r.get(2)))
+check("escaped: definition from inside the name",
+      r.get(3, {}).get("result") == {"uri": uuri, "range": rng(0, 3, 0, 9)}, repr(r.get(3)))
+check("escaped: hover just past the name -> null",
+      4 in r and "error" not in r[4] and r[4].get("result") is None, repr(r.get(4)))
+h = r.get(5, {}).get("result") or {}
+check("escaped: hover after two escaped runs, range in units",
+      h.get("contents", {}).get("value") == "```ritz\nfn later(s: *u8) -> i32\n```"
+      and h.get("range") == rng(3, sc, 3, sc + 5), repr(r.get(5)))
+check("escaped: clean exit", rc == 0, f"exit {rc}")
 
 # --- diagnostics from a stub ritz1 -----------------------------------------
 # The stub prints, to stderr, every `#! <line>` in its input with {in}

@@ -740,3 +740,166 @@ fn test_to_string_roundtrip_is_owned_string() -> i32
     json_free(again)
     json_free(root)
     0
+
+# =============================================================================
+# String escapes (AGAST #3914): \b \f \/ and \uXXXX decoded to UTF-8, a
+# surrogate pair combined into one 4-byte sequence.  A malformed \u escape is
+# JSON_ERR_INVALID_ESCAPE at the offset of its backslash.
+# =============================================================================
+
+fn err_code(r: Result<*JsonValue, JsonError>) -> i32
+    match r
+        Ok(v) => 0 - 1
+        Err(e) => e.code
+
+# Parse `input` (one JSON string) and compare its decoded bytes with want[0..n].
+fn decodes_to(input: StrView, want: *u8, n: i64) -> bool
+    let root: *JsonValue = parse_or_null(input)
+    if root == null
+        return false
+    let ok: bool = str_is(json_get_string(root), strview_from_ptr(want, n))
+    json_free(root)
+    ok
+
+[[test]]
+fn test_escape_backspace() -> i32
+    let want: [3]u8 = [97, 8, 98]
+    assert decodes_to("\"a\\bb\"", @want[0], 3)
+    0
+
+[[test]]
+fn test_escape_formfeed() -> i32
+    let want: [3]u8 = [97, 12, 98]
+    assert decodes_to("\"a\\fb\"", @want[0], 3)
+    0
+
+[[test]]
+fn test_escape_solidus() -> i32
+    let want: [3]u8 = [97, 47, 98]
+    assert decodes_to("\"a\\/b\"", @want[0], 3)
+    0
+
+[[test]]
+fn test_escape_u_one_byte() -> i32
+    # U+0041 -> "A"; U+0000-U+007F encode as one byte.
+    let want: [3]u8 = [120, 65, 121]
+    assert decodes_to("\"x\\u0041y\"", @want[0], 3)
+    0
+
+[[test]]
+fn test_escape_u_two_bytes() -> i32
+    # U+00E9 (e acute) -> C3 A9
+    let want: [4]u8 = [120, 0xC3, 0xA9, 121]
+    assert decodes_to("\"x\\u00e9y\"", @want[0], 4)
+    0
+
+[[test]]
+fn test_escape_u_uppercase_hex() -> i32
+    let want: [2]u8 = [0xC3, 0xA9]
+    assert decodes_to("\"\\u00E9\"", @want[0], 2)
+    0
+
+[[test]]
+fn test_escape_u_two_byte_boundary() -> i32
+    # U+07FF is the last 2-byte code point -> DF BF; U+0800 the first 3-byte.
+    let want2: [2]u8 = [0xDF, 0xBF]
+    assert decodes_to("\"\\u07ff\"", @want2[0], 2)
+    let want3: [3]u8 = [0xE0, 0xA0, 0x80]
+    assert decodes_to("\"\\u0800\"", @want3[0], 3)
+    0
+
+[[test]]
+fn test_escape_u_three_bytes() -> i32
+    # U+20AC (euro sign) -> E2 82 AC
+    let want: [5]u8 = [120, 0xE2, 0x82, 0xAC, 121]
+    assert decodes_to("\"x\\u20acy\"", @want[0], 5)
+    0
+
+[[test]]
+fn test_escape_u_surrogate_pair_four_bytes() -> i32
+    # U+1F600 as the pair D83D DE00 -> F0 9F 98 80 (one sequence, not two
+    # 3-byte encodings of the halves).
+    let want: [6]u8 = [120, 0xF0, 0x9F, 0x98, 0x80, 121]
+    assert decodes_to("\"x\\ud83d\\ude00y\"", @want[0], 6)
+    0
+
+[[test]]
+fn test_escape_u_mixed_document() -> i32
+    # Every escape kind in one string, as an LSP client would send text.
+    let want: [12]u8 = [0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9F, 0x98, 0x80, 10, 47, 34]
+    assert decodes_to("\"\\u00e9\\u20ac\\ud83d\\ude00\\n\\/\\\"\"", @want[0], 12)
+    0
+
+[[test]]
+fn test_escape_u_lone_high_surrogate() -> i32
+    # High surrogate then the closing quote.
+    let r: Result<*JsonValue, JsonError> = json_parse("\"ab\\ud83d\"")
+    assert err_code(r) == JSON_ERR_INVALID_ESCAPE
+    assert err_pos(json_parse("\"ab\\ud83d\"")) == 3
+    0
+
+[[test]]
+fn test_escape_u_high_surrogate_then_plain_text() -> i32
+    assert err_code(json_parse("\"\\ud83dxxxxxx\"")) == JSON_ERR_INVALID_ESCAPE
+    0
+
+[[test]]
+fn test_escape_u_high_surrogate_then_non_low() -> i32
+    # A second \u that is not a low surrogate does not complete the pair.
+    assert err_code(json_parse("\"\\ud83d\\u0041\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_pos(json_parse("\"\\ud83d\\u0041\"")) == 1
+    # Two high surrogates in a row.
+    assert err_code(json_parse("\"\\ud83d\\ud83d\"")) == JSON_ERR_INVALID_ESCAPE
+    0
+
+[[test]]
+fn test_escape_u_lone_low_surrogate() -> i32
+    assert err_code(json_parse("\"a\\ude00b\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_pos(json_parse("\"a\\ude00b\"")) == 2
+    0
+
+[[test]]
+fn test_escape_u_bad_hex_digit() -> i32
+    assert err_code(json_parse("\"\\u00g9\"")) == JSON_ERR_INVALID_ESCAPE
+    assert err_pos(json_parse("\"\\u00g9\"")) == 1
+    # Bad hex in the low half of a pair.
+    assert err_code(json_parse("\"\\ud83d\\ude0z\"")) == JSON_ERR_INVALID_ESCAPE
+    0
+
+[[test]]
+fn test_escape_u_truncated() -> i32
+    # Fewer than four hex digits before the closing quote.
+    assert err_code(json_parse("\"\\u00e\"")) == JSON_ERR_INVALID_ESCAPE
+    0
+
+[[test]]
+fn test_escape_u_error_inside_container() -> i32
+    # The code survives the array/object unwinding.
+    assert err_code(json_parse("[1, {\"k\": \"\\uzzzz\"}]")) == JSON_ERR_INVALID_ESCAPE
+    assert err_code(json_parse("{\"\\ude00\": 1}")) == JSON_ERR_INVALID_ESCAPE
+    0
+
+[[test]]
+fn test_error_message_invalid_escape() -> i32
+    assert strview_eq(json_error_message(JSON_ERR_INVALID_ESCAPE), "invalid \\u escape")
+    0
+
+# The whole message table, ends included.  JSON_ERR_INVALID_ESCAPE is the last
+# code: the one after it must be "unknown error".  examples/tier5_async/
+# 79_ritzlib_json prints codes 0..8 against a golden, so adding a code moves
+# that golden too -- update both in the same commit (the gate's corpus run,
+# not ritzlib/tests, is what caught it last time).
+[[test]]
+fn test_error_message_table() -> i32
+    assert strview_eq(json_error_message(JSON_ERR_NONE), "unknown error")
+    assert strview_eq(json_error_message(JSON_ERR_UNEXPECTED_CHAR), "unexpected character")
+    assert strview_eq(json_error_message(JSON_ERR_UNTERMINATED_STRING), "unterminated string")
+    assert strview_eq(json_error_message(JSON_ERR_EXPECTED_COLON), "expected ':'")
+    assert strview_eq(json_error_message(JSON_ERR_EXPECTED_BRACKET), "expected ']'")
+    assert strview_eq(json_error_message(JSON_ERR_EXPECTED_BRACE), "expected '}'")
+    assert strview_eq(json_error_message(JSON_ERR_OUT_OF_MEMORY), "out of memory")
+    assert strview_eq(json_error_message(JSON_ERR_INVALID_ESCAPE), "invalid \\u escape")
+    assert JSON_ERR_INVALID_ESCAPE == 7
+    assert strview_eq(json_error_message(JSON_ERR_INVALID_ESCAPE + 1), "unknown error")
+    assert strview_eq(json_error_message(-1), "unknown error")
+    0

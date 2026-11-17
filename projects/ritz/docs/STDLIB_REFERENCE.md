@@ -2262,6 +2262,11 @@ struct JsonError
 | `json_parse2` | `fn(input: *u8, len: i64) -> Result<*JsonValue, JsonError>` | Deprecated wrapper: `json_parse(strview_from_ptr(input, len))` |
 | `json_free` | `fn(v: *JsonValue)` | Free JSON tree |
 
+Strings are decoded to UTF-8: `\n \t \r \b \f \/ \" \\` and `\uXXXX`, with a
+surrogate pair (`😀`) combined into one 4-byte sequence. Bad hex
+digits, a short `\u`, or a surrogate without its other half fail with
+`JSON_ERR_INVALID_ESCAPE` at the escape's backslash.
+
 **Value Access**:
 
 | Function | Signature | Description |
