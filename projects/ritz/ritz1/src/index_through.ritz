@@ -150,7 +150,12 @@ fn vec_field_through(s: *EmitterState, base: *Expr) -> *LocalVar
     if base == null or base.kind != EXPR_MEMBER or place_without_call(base) == 0
         return null
     let f: *StructField = member_field_def(s, base)
-    if f == null or f.field_type != TYPE_STRUCT
+    if f == null
+        return null
+    # AGAST #3816: and a field that is a `*T`, `@T` or `@&T` to one, `w.p[i]`:
+    # `w.p.data` sees through it, as through a local `p` (sees_through).
+    let by_ptr: bool = f.field_type == TYPE_PTR and f.ptr_pointee == TYPE_STRUCT
+    if f.field_type != TYPE_STRUCT and not by_ptr
         return null
     if name_is_indexable(f.field_type_name, f.field_type_name_len) == 0
         return null
@@ -172,28 +177,53 @@ fn vec_field_through(s: *EmitterState, base: *Expr) -> *LocalVar
 # so `x[i]` is `*(#k + i)` at stride T, as for `h(p)[i]` (#2329).  A String's
 # buffer is a Vec, one more level, and isn't taken; nor is an element that's a
 # pointer (its pointee isn't recorded).  It's in no scope.
+#
+# AGAST #3816: and a call that returns a `*T`, `@T` or `@&T` to one, `h.get()[i]`
+# on a `-> @Vec<P>`: `base.data` sees through the pointer, and through_spill
+# still runs the call once.  It was "unhandled EXPR_MEMBER" (ritz0 took the
+# element for the Vec itself).  A String's bytes are `base.data.data`.
 fn call_result_view(s: *EmitterState, base: *Expr) -> *LocalVar
     if base.kind != EXPR_CALL and base.kind != EXPR_METHOD
         return null
     var name: *u8 = null
     var name_len: i32 = 0
     call_result_struct_name(s, base, @name, @name_len)
-    if name == null or name_is_indexable(name, name_len) == 0 or through_is_string(name, name_len) == 1
+    if name == null
+        let ps: *StructDef = call_result_ptr_struct(s, base)
+        if ps != null and name_is_indexable(ps.name, ps.name_len) == 1
+            return call_ref_view(s, base, ps.name, ps.name_len)
         return null
+    if name_is_indexable(name, name_len) == 0 or through_is_string(name, name_len) == 1
+        return null
+    call_ref_view(s, base, name, name_len)
+
+# The view of the buffer of `base`'s result, a `name` (a Vec, Span or String) or
+# a pointer or reference to one: `base.data` (`.ptr`, or a String's
+# `.data.data`) at stride T, evaluated once by through_spill.
+fn call_ref_view(s: *EmitterState, base: *Expr, name: *u8, name_len: i32) -> *LocalVar
     var probe: LocalVar
     memset(@probe as *u8, 0, sizeof(LocalVar))
     probe.type_name = name
     probe.type_name_len = name_len
-    let f: *StructField = through_buffer(s, @probe)
-    if f == null or f.field_type != TYPE_PTR
-        return null
     let buf: *Expr = malloc(sizeof(Expr)) as *Expr
     memset(buf as *u8, 0, sizeof(Expr))
     if name_starts(name, name_len, c"Span$", 5) == 1
         through_member(buf, base, base, c"ptr", 3)
     else
         through_member(buf, base, base, c"data", 4)
+    if through_is_string(name, name_len) == 1
+        return unscoped_array_view(s, string_bytes(base, buf), TYPE_U8, null, 0, TYPE_VOID)
+    let f: *StructField = through_buffer(s, @probe)
+    if f == null or f.field_type != TYPE_PTR
+        return null
     unscoped_array_view(s, buf, ptr_field_elem_kind(f), f.field_type_name, f.field_type_name_len, TYPE_VOID)
+
+# `vec.data`, the bytes of a String whose Vec is `vec`.
+fn string_bytes(base: *Expr, vec: *Expr) -> *Expr
+    let bytes: *Expr = malloc(sizeof(Expr)) as *Expr
+    memset(bytes as *u8, 0, sizeof(Expr))
+    through_member(bytes, base, vec, c"data", 4)
+    bytes
 
 # 1 when `e` names a place with no call in it: names, fields, indexes, derefs, and
 # arithmetic on those in an index (`a[i - 1].vf`).

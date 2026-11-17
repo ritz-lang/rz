@@ -9713,7 +9713,7 @@ class LLVMEmitter:
                 raise EmitError(index_rules.needs_index(pointee.name), expr.bracket or expr.span)
         # A name, or an element that is itself a Vec: `v[i][j]`, `p[i][j]` (#2442).
         if not isinstance(root, (rast.Ident, rast.Index)):
-            return None
+            return self._index_through_pointer_value(expr, root, deref)
         ty = self._infer_ritz_type(root)
         if ty is not None:
             ty = resolve_alias_in(ty, self.type_aliases)
@@ -9769,6 +9769,30 @@ class LLVMEmitter:
                     expr.span, '+', rast.Cast(expr.span, root, elem), expr.index))
             return None
         if isinstance(expr.index, rast.Range):
+            return None
+        return self._buffer_element(expr, root, path)
+
+    def _index_through_pointer_value(self, expr: rast.Index, root: rast.Expr,
+                                     deref: bool) -> Optional[rast.UnaryOp]:
+        """`f()[i]`, `h.get()[i]` or `w.p[i]`: any other base whose value is a
+        `*T`, `@T` or `@&T` to a Vec, Span or String sees through to its buffer,
+        `*(base.data + i)`, as a name of that type does (AGAST #3816).
+
+        These fell to _emit_index_core's general path, which stepped the pointer
+        by whole Vecs: `h.get()[0]` on a `-> @Vec<P>` was the Vec itself, and
+        `.a` then met "Unknown field 'a' in struct 'Vec$P'".  The base is
+        evaluated once, by the `+`.  A slice, `(*e)[i]`, and every other type are
+        left to the paths that already handle them.
+        """
+        if deref or isinstance(expr.index, rast.Range):
+            return None
+        ty = self._infer_ritz_type(root)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+        if not isinstance(ty, (rast.PtrType, rast.RefType)):
+            return None
+        path = self._buffer_field_path(resolve_alias_in(ty.inner, self.type_aliases))
+        if path is None:
             return None
         return self._buffer_element(expr, root, path)
 
