@@ -15,6 +15,13 @@
 # ritz0/test_fn_tail_requires_value.py is the specification of the rule, and
 # ritz0/test_ritz1_fn_tail_requires_value.py feeds its tables to ritz1.
 #
+# WHERE IT RUNS (AGAST #3511, #1816).  A Sema check: sema_walk_fn calls
+# tail_value_check after it walks a fn's body, where emit_fn /
+# emit_impl_method called check_tail_value and check_tail_calls.  call_check notes each call it resolves to a procedure
+# (tail_note_callee), in scope, so a method on an arm's own local is known.
+# The divergence walk above the check (tail_stmts_diverge, ..) reads the AST
+# only; reachability and emit_stmt read it too.
+#
 # THE DIFFERENCES ARE ALL IN THE AST:
 #
 #   * ritz0 has a Block with a tail `expr`.  ritz1 has a statement list, so the
@@ -33,7 +40,8 @@ import ritzlib.io
 
 import ast
 import ast_helpers
-import emitter_core
+import emitter_core   # ProcCall, fn_source_file, eprint_bytes
+import sema
 
 # =============================================================================
 # Does a `break` leave this loop?
@@ -163,59 +171,58 @@ fn tail_expr_diverges(e: *Expr) -> i32
 #
 # Each of these returns the span to blame, or null when there is no gap.
 
-# Did emission resolve call `e` to a procedure?  Nothing is recorded yet when
-# check_tail_value runs, so only check_tail_calls sees a yes: before emission
-# a method's receiver is untyped (AGAST #2237) and a name may be a local fn
-# pointer that shadows the procedure (#2246).
-fn tail_is_procedure_call(s: *EmitterState, e: *Expr) -> i32
-    var n: *ProcCall = s.proc_calls
+# Did the walk resolve call `e` to a procedure?  Only in its scope is a
+# method's receiver typed (AGAST #2237, a local of an arm), or a name known to
+# be a local fn pointer that shadows the procedure (#2246).
+fn tail_is_procedure_call(e: *Expr) -> i32
+    var n: *ProcCall = g_tail_procs
     while n != null
         if n.call == e
             return 1
         n = n.next
     0
 
-fn tail_expr_gap(s: *EmitterState, e: *Expr) -> *SrcSpan
+fn tail_expr_gap(e: *Expr) -> *SrcSpan
     if e.kind == EXPR_IF or e.kind == EXPR_MATCH
-        return tail_arms_gap(s, e.args as *MatchArm)
+        return tail_arms_gap(e.args as *MatchArm)
     if e.kind == EXPR_INT_LIT and e.lit_kind == LIT_PASS
         return @e.span
-    if tail_is_procedure_call(s, e) == 1
+    if tail_is_procedure_call(e) == 1
         return @e.span
     null
 
-fn tail_arms_gap(s: *EmitterState, arms: *MatchArm) -> *SrcSpan
+fn tail_arms_gap(arms: *MatchArm) -> *SrcSpan
     var arm: *MatchArm = arms
     while arm != null
-        let gap: *SrcSpan = tail_arm_gap(s, arm)
+        let gap: *SrcSpan = tail_arm_gap(arm)
         if gap != null
             return gap
         arm = arm.next
     null
 
-fn tail_arm_gap(s: *EmitterState, arm: *MatchArm) -> *SrcSpan
+fn tail_arm_gap(arm: *MatchArm) -> *SrcSpan
     if tail_stmts_diverge(arm.body_stmts) == 1
         return null
     if arm.body != null
-        return tail_expr_gap(s, arm.body)
+        return tail_expr_gap(arm.body)
     if arm.body_stmts != null
-        return tail_stmts_gap(s, arm.body_stmts)
+        return tail_stmts_gap(arm.body_stmts)
     @arm.pass_span
 
-fn tail_stmt_gap(s: *EmitterState, st: *Stmt) -> *SrcSpan
+fn tail_stmt_gap(st: *Stmt) -> *SrcSpan
     let k: i32 = st.kind
     if k == STMT_EXPR
-        return tail_expr_gap(s, st.expr)
+        return tail_expr_gap(st.expr)
     if k == STMT_MATCH
-        return tail_arms_gap(s, st.if_then as *MatchArm)
+        return tail_arms_gap(st.if_then as *MatchArm)
     if k == STMT_IF and st.if_else != null
-        let gap: *SrcSpan = tail_stmts_gap(s, st.if_then)
+        let gap: *SrcSpan = tail_stmts_gap(st.if_then)
         if gap != null
             return gap
-        return tail_stmts_gap(s, st.if_else)
+        return tail_stmts_gap(st.if_else)
     @st.span
 
-fn tail_stmts_gap(s: *EmitterState, list: *Stmt) -> *SrcSpan
+fn tail_stmts_gap(list: *Stmt) -> *SrcSpan
     var st: *Stmt = list
     var last: *Stmt = null
     while st != null
@@ -225,19 +232,41 @@ fn tail_stmts_gap(s: *EmitterState, list: *Stmt) -> *SrcSpan
         st = st.next
     if last == null
         return null
-    tail_stmt_gap(s, last)
+    tail_stmt_gap(last)
 
 # =============================================================================
-# The check
+# The check (on Sema, AGAST #3511)
 # =============================================================================
+#
+# sema_walk_fn runs it once, after the body's walk: a gap the AST shows alone
+# (a `pass`, a missing `else`) and a tail call that call_check resolved to a
+# procedure on the way (emit_fn's check_tail_value and check_tail_calls).
 
-fn tail_report_gap(s: *EmitterState, f: *FnDef)
+# One call that resolved to a procedure; see tail_note_callee.
+struct ProcCall
+    call: *Expr
+    next: *ProcCall
+
+# The calls the walk of the current fn resolved to a procedure.  Module
+# state, as call_check's mute: Sema walks one fn at a time, and the check
+# clears it.
+var g_tail_procs: *ProcCall = null
+
+# call_check: call `e` resolved to `fd`.  Remembered when `fd` is a procedure.
+pub fn tail_note_callee(e: *Expr, fd: *FnDef)
+    if fd == null or fn_is_procedure(fd) == 0
+        return
+    let n: *ProcCall = malloc(sizeof(ProcCall)) as *ProcCall
+    n.call = e
+    n.next = g_tail_procs
+    g_tail_procs = n
+
+fn tail_report_gap(sm: *Sema, f: *FnDef)
     if f.return_type == TYPE_VOID or fn_is_decl(f) == 1
         return
-    let gap: *SrcSpan = tail_stmts_gap(s, f.body)
+    let gap: *SrcSpan = tail_stmts_gap(f.body)
     if gap == null
         return
-    s.tail_gap_reported = 1
     eprints_cstr(fn_source_file(f))
     eprint_char(':')
     eprint_i64(gap.line as i64)
@@ -246,20 +275,11 @@ fn tail_report_gap(s: *EmitterState, f: *FnDef)
     eprints_cstr(c": error: function '")
     eprint_bytes(f.name, f.name_len)
     eprints_cstr(c"' declares a return type but can reach its end without producing a value\n")
-    emit_str(s, c"  ; ERROR: `-> T` fn can reach its end without a value\n")
-    s.error_count = s.error_count + 1
+    sm.error_count = sm.error_count + 1
 
-# Reject `f` if it declares a value and can reach its end without one.  Called
-# by emit_fn and emit_impl_method, so like ritz0 it sees the generics that are
-# instantiated and not the templates.
-pub fn check_tail_value(s: *EmitterState, f: *FnDef)
-    s.proc_calls = null
-    s.tail_gap_reported = 0
-    tail_report_gap(s, f)
-
-# The same walk after the body is emitted, for what only emission can tell: a
-# call's callee.  A method call's receiver may be a local of an arm (AGAST
-# #2237), and a name may be a local fn pointer that shadows a procedure (#2246).
-pub fn check_tail_calls(s: *EmitterState, f: *FnDef)
-    if s.tail_gap_reported == 0
-        tail_report_gap(s, f)
+# Reject `f` if it declares a value and can reach its end without one.  Sema
+# walks the fns emit_module lowers, so like ritz0 it sees the generics that
+# are instantiated and not the templates.
+pub fn tail_value_check(sm: *Sema, f: *FnDef)
+    tail_report_gap(sm, f)
+    g_tail_procs = null

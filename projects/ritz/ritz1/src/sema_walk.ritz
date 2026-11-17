@@ -37,6 +37,8 @@ import field_slot
 import bool_check
 import call_check    # AGAST #1629, on Sema since #3503
 import let_check   # AGAST #2028 / #3504
+import tail_value    # AGAST #2236, on Sema since #3511
+import enum_as_int   # AGAST #2136, on Sema since #3511
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
@@ -54,9 +56,12 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
         # arm.body, so the last of body_stmts is never the arm's value: a
         # call there is discarded (AGAST #3515).  With no arm.body the last
         # statement isn't an expression, so the flag changes nothing there.
-        sema_walk_stmts(sm, arm.body_stmts, 1)
+        # The arm's `let`s stay bound for its trailing expression: `let b =
+        # ..` then `b.p()` (AGAST #2237 / #3511); the arm's mark drops them.
+        sema_walk_block(sm, arm.body_stmts, 1)
         if arm.is_pass == 0
             let_check_expr(sm, arm.body)   # AGAST #2028: as emit_match_arm_body
+        enum_as_int_expr(sm, arm.body)   # AGAST #2136 / #3511
         bool_no_value(sm, arm.body)
         sema_walk_expr(sm, arm.body)
         sm.scope_top = mark
@@ -163,6 +168,11 @@ fn sema_is_assign(kind: i32) -> i32
 # nothing, whose last statement is discarded too.
 fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
     let mark: i32 = sm.scope_top
+    sema_walk_block(sm, first, void_tail)
+    sm.scope_top = mark
+
+# sema_walk_stmts, leaving what the block binds in scope for the caller to drop.
+fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
     var st: *Stmt = first
     while st != null
         pass_value_check(sm, st)   # AGAST #3759
@@ -175,12 +185,14 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
             return_check_another_struct(sm, st.expr, st.expr.span.line, st.expr.span.col)
         else
             let_check_stmt(sm, st)
+        sema_enum_as_int(sm, st, first)   # AGAST #2136 / #3511
         if st.kind == STMT_VAR_DECL
             bool_check_decl(sm, st)   # AGAST #2342
             sema_walk_expr(sm, st.var_init)
             check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
             sema_bind_decl(sm, st)
             let_note_decl(sm, st)   # AGAST #3504
+            eai_note_decl(sm, st)   # AGAST #3511
             narrow_sema_decl(sm, st)
             bool_note_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
@@ -243,7 +255,16 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
                 index_field_scalar_check(sm, st)   # AGAST #3799
             sema_walk_expr(sm, st.assign_value)
         st = st.next
-    sm.scope_top = mark
+
+# enum_as_int (AGAST #2136 / #3511) on statement `st` of the list `first`:
+# a fn's trailing expression is its returned value, as emit_fn judged it.
+fn sema_enum_as_int(sm: *Sema, st: *Stmt, first: *Stmt)
+    if sm.cur_fn == null
+        return
+    if st.next == null and st.kind == STMT_EXPR and first == sm.cur_fn.body
+        enum_as_int_tail(sm, st.expr, sm.cur_fn.return_type)
+    else
+        enum_as_int_stmt(sm, st, sm.cur_fn.return_type)
 
 fn sema_walk_fn(sm: *Sema, f: *FnDef)
     if f.body == null or fn_is_naked(f) == 1
@@ -257,7 +278,9 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
         narrow_sema_param(sm, p)
         bool_note_param(sm, p)
         p = p.next
+    eai_begin_fn()
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
+    tail_value_check(sm, f)   # AGAST #2236 / #3511, after call_check's notes
     sm.scope_top = 0
     sm.cur_fn = null
 

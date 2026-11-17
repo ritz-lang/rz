@@ -21,11 +21,9 @@ import emitter_stmt
 import ll_copy_scan   # AGAST #1732
 import emitter_print
 import narrowing         # narrowing_begin_fn (AGAST #1364)
-import enum_as_int       # enum_as_int_tail (AGAST #2136)
 import literal_slot      # literal_slot (AGAST #2341)
 import ownership         # own_begin_fn / own_end_fn (AGAST #2158)
 import ref_check         # ref_begin_fn (AGAST #2336)
-import tail_value        # check_tail_value (AGAST #2236)
 import deref_field       # df_rewrite_stmt (AGAST #3015)
 import emitter_asm       # emit_naked_fn_body (AGAST #3395)
 import frame_limit       # refuse_huge_frame (AGAST #3739)
@@ -83,7 +81,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
     # trailing expression inside a loop body leaked its register into the
     # loop-exit block, where the body does not dominate the ret on the
     # zero-iteration path.  `last_expr_here` returns 0 in that case, and
-    # check_tail_value (AGAST #2236) has already rejected a fn that ends there.
+    # Sema's tail_value_check (AGAST #2236, #3511) has already rejected a fn that ends there.
     if has_explicit_return == 0 and ret_type != TYPE_VOID
         var ival: i32 = last_expr_here(s)
         # AGAST #2950: a tail `if` / `match` whose phi is an i64 in a `-> @&T`
@@ -171,7 +169,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
                 emit_reg(s, ival)
                 emit_str(s, c"\n")
         else
-            # No value here, and this block is dead.  check_tail_value (AGAST
+            # No value here, and this block is dead.  Sema's tail_value_check (AGAST
             # #2236) rejected every fn the rule says ends without one, and the
             # rule's "every arm diverges" is sound now that a match must cover
             # its scrutinee (#2245, #2344): this is the merge after arms that
@@ -949,7 +947,6 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     clear_last_expr(s)  # Reset before processing function body (ritz-task-1309)
     own_begin_fn(s, f.params)   # AGAST #2158: by-value move-only params
     ref_begin_fn(s, f)          # AGAST #2336
-    check_tail_value(s, f)      # AGAST #2236
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = f.body
     while stmt != null
@@ -969,7 +966,6 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR
             has_explicit_return = 1
-            enum_as_int_tail(s, stmt.expr, f.return_type)   # AGAST #2136
             struct_return_as_int_refused(s, stmt.expr, f.return_type)   # AGAST #3008
             if f.return_type == TYPE_VOID
                 discarded_array_check(s, stmt.expr)   # AGAST #3189
@@ -1138,7 +1134,6 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             emit_stmt(s, stmt, f.return_type)
         stmt = stmt.next
 
-    check_tail_calls(s, f)   # AGAST #2237, #2246
     emit_implicit_return_tail(s, has_explicit_return, f.return_type, f.return_type_name, f.return_type_name_len)
     refuse_huge_frame(s, f, body_start)          # AGAST #3739: before any rewrite
     own_end_fn(s, body_start)                    # AGAST #2158: drops before `ret`
@@ -1359,7 +1354,6 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     own_begin_fn(s, method.params)   # AGAST #2158
     ref_begin_fn(s, method)          # AGAST #2336
-    check_tail_value(s, method)      # AGAST #2236
     var has_explicit_return: i32 = 0
     var stmt: *Stmt = method.body
     while stmt != null
@@ -1378,7 +1372,6 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         # Check if this is the last statement and it's an expression (implicit return)
         if stmt.next == null and stmt.kind == STMT_EXPR
             has_explicit_return = 1
-            enum_as_int_tail(s, stmt.expr, method.return_type)   # AGAST #2136
             struct_return_as_int_refused(s, stmt.expr, method.return_type)   # AGAST #3008
             if method.return_type == TYPE_VOID
                 discarded_array_check(s, stmt.expr)   # AGAST #3189
@@ -1550,7 +1543,6 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     # AGAST #1573 — same tail as emit_fn: close the final block if the body
     # did not already end in a `ret`.
-    check_tail_calls(s, method)   # AGAST #2237, #2246
     emit_implicit_return_tail(s, has_explicit_return, method.return_type, method.return_type_name, method.return_type_name_len)
     refuse_huge_frame(s, method, body_start)     # AGAST #3739: before any rewrite
     own_end_fn(s, body_start)                    # AGAST #2158: drops before `ret`
