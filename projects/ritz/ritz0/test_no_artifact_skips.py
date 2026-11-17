@@ -72,12 +72,53 @@ def _skip_reasons(source: str) -> list[tuple[int, str]]:
     return reasons
 
 
+# AGAST #1333: the #1327 word list matched 0 of the 12 skip reasons then in
+# the tree; the only lines it fired on were the two #1327 itself deleted.
+# These are pytest `-rs` lines, verbatim in shape, each a skip on a missing
+# file or artifact. A tracked file that is absent means a broken checkout, so
+# the test should fail, not skip.
+ARTIFACT_SKIPS = [
+    "SKIPPED [1] test_build.py:1158: ritz1 binary not built",
+    "SKIPPED [1] test_skipfmt.py:9: ritz1 not found",
+    "SKIPPED [1] test_metadata.py:603: No .ritz-cache directory found",
+    "SKIPPED [1] test_metadata.py:607: No .ritz-meta files found in cache",
+    "SKIPPED [1] test_symbol_table.py:210: test_level1.ritz not found",
+    "SKIPPED [1] test_symbol_table.py:622: No struct-importing test level found",
+    "SKIPPED [2] test_x.py:5: sample program missing",
+    "SKIPPED [1] test_x.py:5: Missing fixture file",
+    "SKIPPED [1] test_x.py:5: /tmp/x: No such file or directory",
+]
+
+# Skips that are about the machine, not the checkout. These stay legitimate,
+# and a guard that fires on them turns CI red for no defect.
+ENVIRONMENT_SKIPS = [
+    "SKIPPED [1] test_x.py:1: no `opt` on PATH",
+    "SKIPPED [3] test_build.py:827: no `opt`/`llvm-as` on PATH",
+    "SKIPPED [1] test_build.py:1289: clang not on PATH",
+    "SKIPPED [1] test_o2_libc_names.py:70: clang not on PATH",
+    "SKIPPED [1] test_ritz1_fn_cache_uninit.py:64: valgrind not installed",
+    "SKIPPED [1] test_indium_iac.py:97: terraform not installed",
+    "SKIPPED [1] test_indium_mkuefi.py:41: mkfs.vfat / mtools not installed",
+    "SKIPPED [2] test_crypto_intrinsics.py:44: CPU doesn't support AES-NI",
+    "SKIPPED [1] test_ritz1_aesni_intrinsics.py:134: CPU lacks AES-NI",
+    "SKIPPED [2] test_ritzunit_core.py:113: hard RLIMIT_CORE is 0",
+    # The guard reads only the reason. A file name that contains a guard
+    # word must not trip it.
+    "SKIPPED [1] test_missing_found_no_such_file.py:3: clang not on PATH",
+]
+
+
 @pytest.mark.unit
-def test_guard_regex_is_live():
-    """The regex must still fire on the exact line that broke CI. Otherwise the scan below proves nothing."""
-    guard = _ci_guard_regex()
-    assert guard.search("SKIPPED [1] test_build.py:1158: ritz1 binary not built")
-    assert not guard.search("SKIPPED [1] test_x.py:1: no `opt` on PATH")
+@pytest.mark.parametrize("line", ARTIFACT_SKIPS)
+def test_guard_fires_on_artifact_skip(line):
+    """A planted missing-artifact skip must turn the CI step red. Otherwise the scan below proves nothing."""
+    assert _ci_guard_regex().search(line), f"CI guard misses: {line}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("line", ENVIRONMENT_SKIPS)
+def test_guard_spares_environment_skip(line):
+    assert not _ci_guard_regex().search(line), f"CI guard would fail on a legitimate skip: {line}"
 
 
 @pytest.mark.unit

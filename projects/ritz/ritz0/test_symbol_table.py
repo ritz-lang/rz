@@ -31,6 +31,19 @@ def parse_source(source: str) -> rast.Module:
     return parser.parse_module()
 
 
+def _tracked(path: Path) -> Path:
+    """Fail, never skip, when a tracked repo file or dir is absent (AGAST #1333).
+
+    These were `pytest.skip("... not found")`, so renaming or moving a test
+    level or ritzlib module silently turned real coverage into a green
+    skip. Every path passed here is in `git ls-files`: if it is missing, the
+    checkout is broken or the test needs updating, and either way it should
+    fail. #1327 made the same change for test_source_order.py.
+    """
+    assert path.exists(), f"{path} is tracked in git; its absence is a broken checkout or a stale test"
+    return path
+
+
 # ============================================================================
 # Step 1: Symbol table construction from AST
 # ============================================================================
@@ -206,8 +219,7 @@ class TestSymbolTableMatchesExports:
         """Symbol table for level 1 should have all [[test]] functions."""
         from symbol_table import SymbolTable
         source = Path(__file__).parent / "test" / "test_level1.ritz"
-        if not source.exists():
-            pytest.skip("test_level1.ritz not found")
+        _tracked(source)
         mod = parse_source(source.read_text())
         st = SymbolTable.from_module(mod, str(source))
         # Level 1 has test functions — they should be in the table
@@ -220,8 +232,7 @@ class TestSymbolTableMatchesExports:
         from symbol_table import SymbolTable
         ritzlib = Path(__file__).parent.parent / "ritzlib"
         sys_ritz = ritzlib / "sys.ritz"
-        if not sys_ritz.exists():
-            pytest.skip("ritzlib/sys.ritz not found")
+        _tracked(sys_ritz)
         mod = parse_source(sys_ritz.read_text())
         st = SymbolTable.from_module(mod, str(sys_ritz))
         # sys.ritz should export core syscall wrappers
@@ -236,8 +247,7 @@ class TestSymbolTableMatchesExports:
         from symbol_table import SymbolTable
         ritzlib = Path(__file__).parent.parent / "ritzlib"
         io_ritz = ritzlib / "io.ritz"
-        if not io_ritz.exists():
-            pytest.skip("ritzlib/io.ritz not found")
+        _tracked(io_ritz)
         mod = parse_source(io_ritz.read_text())
         st = SymbolTable.from_module(mod, str(io_ritz))
         # io.ritz should have print-related functions
@@ -249,8 +259,7 @@ class TestSymbolTableMatchesExports:
         from import_resolver import ImportResolver
         ritzlib = Path(__file__).parent.parent / "ritzlib"
         sys_ritz = ritzlib / "sys.ritz"
-        if not sys_ritz.exists():
-            pytest.skip("ritzlib/sys.ritz not found")
+        _tracked(sys_ritz)
 
         # Parse the module
         mod = parse_source(sys_ritz.read_text())
@@ -274,8 +283,7 @@ class TestSymbolTableMatchesExports:
         """Symbol table for level 19 (imports) should have test functions."""
         from symbol_table import SymbolTable
         source = Path(__file__).parent / "test" / "test_level19.ritz"
-        if not source.exists():
-            pytest.skip("test_level19.ritz not found")
+        _tracked(source)
         mod = parse_source(source.read_text())
         st = SymbolTable.from_module(mod, str(source))
         test_fns = st.get_test_functions()
@@ -557,8 +565,7 @@ class TestStubIREquivalence:
         import re
 
         test_file = Path(__file__).parent / "test" / "test_level19.ritz"
-        if not test_file.exists():
-            pytest.skip("test_level19.ritz not found")
+        _tracked(test_file)
 
         source = test_file.read_text()
         source_path = str(test_file)
@@ -728,8 +735,7 @@ class TestSymbolTableImportMode:
         from import_resolver import resolve_imports
 
         test_file = Path(__file__).parent / "test" / "test_level19.ritz"
-        if not test_file.exists():
-            pytest.skip("test_level19.ritz not found")
+        _tracked(test_file)
 
         source = test_file.read_text()
         source_path = str(test_file)
@@ -749,8 +755,7 @@ class TestSymbolTableImportMode:
         import re
 
         test_file = Path(__file__).parent / "test" / "test_level19.ritz"
-        if not test_file.exists():
-            pytest.skip("test_level19.ritz not found")
+        _tracked(test_file)
 
         source = test_file.read_text()
         source_path = str(test_file)
@@ -835,8 +840,7 @@ class TestSymbolTableImportMode:
         """Symbol table should successfully parse every ritzlib module."""
         from symbol_table import SymbolTable
         ritzlib = Path(__file__).parent.parent / "ritzlib"
-        if not ritzlib.exists():
-            pytest.skip("ritzlib not found")
+        _tracked(ritzlib)
 
         succeeded = 0
         parse_errors = []  # Pre-existing parse errors, not our fault
