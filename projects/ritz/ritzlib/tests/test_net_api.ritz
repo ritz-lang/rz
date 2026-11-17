@@ -1,0 +1,437 @@
+# ritzlib.net: the StrView / Span API (AGAST #1483).
+#
+#   parse_ipv4(s: StrView) -> Option<u32>
+#   socket_valid(sock: @Socket) -> bool
+#   socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
+#   socket_connect(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
+#   socket_send_all(sock: @&Socket, data: Span<u8>) -> Result<i64, i32>
+#   socket_send_str(sock: @&Socket, s: StrView) -> Result<i64, i32>
+#   socket_recv_into(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>
+#
+# An Err carries a positive errno.
+#
+# Addresses are handed over as slices of a longer literal wherever it
+# matters: a StrView carries no terminator, so the parser must stop at `len`.
+#
+# Everything runs over 127.0.0.1 on a kernel-chosen port (bind to port 0),
+# so no test depends on what else is listening on this host.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.net
+
+const E_BADF: i32 = 9
+const E_INVAL: i32 = 22
+const E_ADDRINUSE: i32 = 98
+const E_CONNREFUSED: i32 = 111
+
+# 127.0.0.1 in network byte order, as the kernel stores it: the bytes
+# 7f 00 00 01 in memory, which is 0x0100007f read as a little-endian u32.
+const LOOPBACK_NBO: u32 = 16777343
+
+# ============================================================================
+# Helpers
+# ============================================================================
+
+fn ip_is(o: Option<u32>, want: u32) -> i32
+    match o
+        Some(a) => (a == want) as i32
+        None => 0
+
+fn ip_none(o: Option<u32>) -> i32
+    match o
+        Some(_) => 0
+        None => 1
+
+fn unit_ok(r: Result<(), i32>) -> i32
+    match r
+        Ok(_) => 1
+        Err(_) => 0
+
+# The errno of an Err, 0 for Ok.
+fn unit_err(r: Result<(), i32>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => e
+
+# The count of an Ok, -1000 - errno for an Err (so a test sees which).
+fn count_of(r: Result<i64, i32>) -> i64
+    match r
+        Ok(n) => n
+        Err(e) => -1000 - e as i64
+
+fn bytes_are(v: *Vec<u8>, want: StrView) -> i32
+    strview_eq(strview_from_ptr(v.data, v.len), want) as i32
+
+# The port the kernel gave a socket bound to port 0, in host byte order.
+fn bound_port(sock: *Socket) -> i32
+    var addr: SockAddrIn
+    var len: i32 = 16
+    if sys_getsockname(sock.fd, @addr as *u8, @len) < 0
+        return -1
+    ntohs(addr.port)
+
+fn bound_addr(sock: *Socket) -> u32
+    var addr: SockAddrIn
+    var len: i32 = 16
+    sys_getsockname(sock.fd, @addr as *u8, @len)
+    addr.addr
+
+# A listening server on 127.0.0.1:<any>; its port in *port.
+fn listen_loopback(port: *i32) -> Socket
+    var s: Socket = socket_tcp()
+    if unit_ok(socket_bind(@&s, "127.0.0.1", 0)) == 0
+        s.fd = -1
+        return s
+    socket_listen(@s, 4)
+    *port = bound_port(@s)
+    s
+
+# ============================================================================
+# parse_ipv4 -> Option<u32>
+# ============================================================================
+
+[[test]]
+fn test_parse_ipv4_loopback() -> i32
+    assert ip_is(parse_ipv4("127.0.0.1"), LOOPBACK_NBO) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_any_is_some_zero() -> i32
+    # 0.0.0.0 is a real address, distinct from a parse failure.
+    assert ip_is(parse_ipv4("0.0.0.0"), 0) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_broadcast() -> i32
+    assert ip_is(parse_ipv4("255.255.255.255"), 4294967295) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_octet_order() -> i32
+    # 10.20.30.40 -> bytes 0a 14 1e 28 in memory.
+    assert ip_is(parse_ipv4("10.20.30.40"), 673059850) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_stops_at_len() -> i32
+    # The bytes after the view would make it invalid ("...1:80").
+    assert ip_is(parse_ipv4(strview_slice("127.0.0.1:80", 0, 9)), LOOPBACK_NBO) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_rejects_garbage() -> i32
+    assert ip_none(parse_ipv4("localhost")) == 1
+    assert ip_none(parse_ipv4("")) == 1
+    assert ip_none(parse_ipv4("1.2.3.4x")) == 1
+    assert ip_none(parse_ipv4(" 1.2.3.4")) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_rejects_wrong_octet_count() -> i32
+    assert ip_none(parse_ipv4("1.2.3")) == 1
+    assert ip_none(parse_ipv4("1.2.3.4.5")) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_rejects_empty_octet() -> i32
+    assert ip_none(parse_ipv4("1..3.4")) == 1
+    assert ip_none(parse_ipv4(".1.2.3")) == 1
+    assert ip_none(parse_ipv4("1.2.3.")) == 1
+    0
+
+[[test]]
+fn test_parse_ipv4_rejects_octet_over_255() -> i32
+    assert ip_none(parse_ipv4("256.0.0.1")) == 1
+    assert ip_none(parse_ipv4("1.2.3.999")) == 1
+    # Large enough to wrap a u32 accumulator back under 256.
+    assert ip_none(parse_ipv4("4294967297.0.0.1")) == 1
+    0
+
+[[test]]
+fn test_inaddr_loopback() -> i32
+    assert inaddr_loopback() == LOOPBACK_NBO
+    0
+
+# ============================================================================
+# socket_valid -> bool
+# ============================================================================
+
+[[test]]
+fn test_socket_valid_is_bool() -> i32
+    var s: Socket = socket_tcp()
+    assert socket_valid(@s)
+    assert s.valid()
+    socket_close(@s)
+    assert not socket_valid(@s)
+    assert not s.valid()
+    0
+
+# ============================================================================
+# socket_bind -> Result<(), i32>
+# ============================================================================
+
+[[test]]
+fn test_bind_loopback_ok() -> i32
+    var s: Socket = socket_tcp()
+    assert unit_ok(socket_bind(@&s, "127.0.0.1", 0)) == 1
+    assert bound_addr(@s) == LOOPBACK_NBO
+    assert bound_port(@s) > 0
+    socket_close(@s)
+    0
+
+[[test]]
+fn test_bind_address_from_a_slice() -> i32
+    var s: Socket = socket_tcp()
+    assert unit_ok(socket_bind(@&s, strview_slice("127.0.0.1NOPE", 0, 9), 0)) == 1
+    assert bound_addr(@s) == LOOPBACK_NBO
+    socket_close(@s)
+    0
+
+[[test]]
+fn test_bind_garbage_address_is_einval() -> i32
+    # Before #1483 "localhost" parsed to 0 and bound 0.0.0.0.
+    var s: Socket = socket_tcp()
+    assert unit_err(socket_bind(@&s, "localhost", 0)) == E_INVAL
+    socket_close(@s)
+    0
+
+[[test]]
+fn test_bind_syscall_failure_is_positive_errno() -> i32
+    var port: i32 = 0
+    var a: Socket = listen_loopback(@port)
+    assert a.fd >= 0
+    var b: Socket = socket_tcp()
+    assert unit_err(socket_bind(@&b, "127.0.0.1", port)) == E_ADDRINUSE
+    socket_close(@b)
+    socket_close(@a)
+    0
+
+[[test]]
+fn test_bind_method() -> i32
+    var s: Socket = socket_tcp()
+    assert unit_ok(s.bind("127.0.0.1", 0)) == 1
+    assert bound_addr(@s) == LOOPBACK_NBO
+    s.close()
+    0
+
+[[test]]
+fn test_bind_any_still_binds_every_interface() -> i32
+    var s: Socket = socket_tcp()
+    assert socket_bind_any(@s, 0) == 0
+    assert bound_addr(@s) == 0
+    socket_close(@s)
+    0
+
+# ============================================================================
+# socket_connect -> Result<(), i32>
+# ============================================================================
+
+[[test]]
+fn test_connect_loopback_ok() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    assert srv.fd >= 0
+    var c: Socket = socket_tcp()
+    assert unit_ok(socket_connect(@&c, strview_slice("127.0.0.1:x", 0, 9), port)) == 1
+    socket_close(@c)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_connect_garbage_address_is_einval() -> i32
+    var c: Socket = socket_tcp()
+    assert unit_err(socket_connect(@&c, "not-an-ip", 80)) == E_INVAL
+    socket_close(@c)
+    0
+
+[[test]]
+fn test_connect_refused_is_positive_errno() -> i32
+    # A port that was bound and released: nothing is listening on it.
+    var tmp: Socket = socket_tcp()
+    socket_bind(@&tmp, "127.0.0.1", 0)
+    let port: i32 = bound_port(@tmp)
+    socket_close(@tmp)
+    var c: Socket = socket_tcp()
+    assert unit_err(socket_connect(@&c, "127.0.0.1", port)) == E_CONNREFUSED
+    socket_close(@c)
+    0
+
+[[test]]
+fn test_connect_timeout_raw_form() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = socket_tcp()
+    assert socket_connect_timeout(@c, c"127.0.0.1", port, 1000) == 0
+    socket_close(@c)
+    # An address that doesn't parse is -1, not a connect to 0.0.0.0, where
+    # this very listener (bound to 127.0.0.1) would have answered.
+    var d: Socket = socket_tcp()
+    assert socket_connect_timeout(@d, c"bogus", port, 1000) == -1
+    socket_close(@d)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_connect_method() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = socket_tcp()
+    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    socket_close(@c)
+    socket_close(@srv)
+    0
+
+# ============================================================================
+# socket_send_all / socket_send_str / socket_recv_into
+# ============================================================================
+
+[[test]]
+fn test_send_and_recv_into_round_trip() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = socket_tcp()
+    assert unit_ok(socket_connect(@&c, "127.0.0.1", port)) == 1
+    var peer: Socket = socket_accept(@srv)
+    assert socket_valid(@peer)
+
+    assert count_of(socket_send_all(@&c, "hello world")) == 11
+    var buf: Vec<u8> = vec_new<u8>()
+    assert count_of(socket_recv_into(@&peer, @&buf, 64)) == 11
+    assert bytes_are(@buf, "hello world") == 1
+
+    socket_close(@peer)
+    socket_close(@c)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_recv_into_appends_and_respects_max() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = socket_tcp()
+    socket_connect(@&c, "127.0.0.1", port)
+    var peer: Socket = socket_accept(@srv)
+
+    assert count_of(socket_send_str(@&c, strview_slice("abcdefNOPE", 0, 6))) == 6
+    var buf: Vec<u8> = vec_new<u8>()
+    buf.push('>')
+    # At most 4 bytes this time; the rest stays in the socket.
+    assert count_of(socket_recv_into(@&peer, @&buf, 4)) == 4
+    assert bytes_are(@buf, ">abcd") == 1
+    assert count_of(socket_recv_into(@&peer, @&buf, 64)) == 2
+    assert bytes_are(@buf, ">abcdef") == 1
+
+    socket_close(@peer)
+    socket_close(@c)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_recv_into_eof_is_ok_zero() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = socket_tcp()
+    socket_connect(@&c, "127.0.0.1", port)
+    var peer: Socket = socket_accept(@srv)
+    socket_close(@c)
+    var buf: Vec<u8> = vec_new<u8>()
+    assert count_of(socket_recv_into(@&peer, @&buf, 64)) == 0
+    assert buf.len == 0
+    socket_close(@peer)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_send_and_recv_errors_are_positive_errno() -> i32
+    var s: Socket = socket_tcp()
+    socket_close(@s)
+    assert count_of(socket_send_all(@&s, "x")) == -1000 - E_BADF as i64
+    var buf: Vec<u8> = vec_new<u8>()
+    assert count_of(socket_recv_into(@&s, @&buf, 8)) == -1000 - E_BADF as i64
+    assert buf.len == 0
+    0
+
+[[test]]
+fn test_send_all_sends_a_vec_span_and_methods() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    var c: Socket = socket_tcp()
+    assert unit_ok(c.connect("127.0.0.1", port)) == 1
+    var peer: Socket = socket_accept(@srv)
+
+    var out: Vec<u8> = vec_new<u8>()
+    out.push('h')
+    out.push('i')
+    assert count_of(c.send(span_from_vec<u8>(@out))) == 2
+    var msg: String = string_from("there")
+    assert count_of(c.send_str(string_as_view(@msg))) == 5
+    var buf: Vec<u8> = vec_new<u8>()
+    var got: i64 = 0
+    while got < 7
+        let n: i64 = count_of(peer.recv(@&buf, 64))
+        assert n > 0
+        got += n
+    assert bytes_are(@buf, "hithere") == 1
+
+    socket_close(@peer)
+    socket_close(@c)
+    socket_close(@srv)
+    0
+
+fn sleep_ms(ms: i64)
+    var ts: [2]i64
+    ts[0] = 0
+    ts[1] = ms * 1000000
+    sys_nanosleep(@ts[0], null)
+
+# A blocking write() on a TCP socket only comes back short when something
+# cuts it off; SO_SNDTIMEO does, once the call has spent that long in total
+# waiting for buffer space.  16 MiB is more than loopback buffers hold, and a
+# forked reader drains it 64 KiB per 10 ms: well over the 300 ms timeout
+# overall, with no single gap near it.  So the first write() returns short
+# and send_all must keep going.  The child exits 0 iff it read every byte.
+[[test]]
+fn test_send_all_completes_after_short_writes() -> i32
+    let total: i64 = 16777216
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    assert srv.fd >= 0
+
+    let pid: i32 = sys_fork()
+    if pid == 0
+        var peer: Socket = socket_accept(@srv)
+        var got: i64 = 0
+        var chunk: Vec<u8> = vec_with_cap<u8>(65536)
+        loop
+            vec_clear<u8>(@&chunk)
+            let n: i64 = count_of(socket_recv_into(@&peer, @&chunk, 65536))
+            if n <= 0
+                break
+            got += n
+            sleep_ms(10)
+        if got == total
+            sys_exit(0)
+        sys_exit(1)
+
+    var c: Socket = socket_tcp()
+    assert unit_ok(socket_connect(@&c, "127.0.0.1", port)) == 1
+    assert socket_set_io_timeout(@c, 300) == 0
+    var big: Vec<u8> = vec_new<u8>()
+    vec_ensure_cap<u8>(@&big, total)
+    memset(big.data, 'z', total)
+    big.len = total
+    assert count_of(socket_send_all(@&c, span_from_vec<u8>(@big))) == total
+    socket_close(@c)
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    socket_close(@srv)
+    assert status == 0
+    0

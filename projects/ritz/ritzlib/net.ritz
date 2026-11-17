@@ -13,22 +13,36 @@
 #   # Server
 #   var sock: Socket = socket_tcp()
 #   sock.set_reuseaddr()
-#   sock.bind("0.0.0.0", 8080)
+#   match sock.bind("0.0.0.0", 8080)        # Result<(), i32>
+#       Ok(_) => pass
+#       Err(errno) => ...                   # positive errno; EINVAL = bad address
 #   sock.listen(128)
 #   var client: Socket = sock.accept()
-#   client.send("HTTP/1.1 200 OK\r\n\r\nHello" as *u8, 25)
+#   client.send("HTTP/1.1 200 OK\r\n\r\nHello")   # Span<u8>, Result<i64, i32>
 #   client.close()
 #
 #   # Client
 #   var sock: Socket = socket_tcp()
-#   sock.connect("127.0.0.1", 8080)
-#   sock.send("GET / HTTP/1.1\r\n\r\n" as *u8, 18)
-#   var n: i64 = sock.recv(buf, 4096)
+#   sock.connect("127.0.0.1", 8080)         # Result<(), i32>
+#   sock.send_str(string_as_view(@request)) # StrView, Result<i64, i32>
+#   var buf: Vec<u8> = vec_new<u8>()
+#   sock.recv(@&buf, 4096)                  # appends; Ok(0) at EOF
 #   sock.close()
+#
+# Addresses are StrViews (AGAST #1483), and every Err is a positive errno.
+# The pre-existing raw forms (socket_send / socket_recv with (*u8, len),
+# socket_bind_any, socket_connect_timeout) remain only for existing callers;
+# #3835 ports those callers and deletes them.  The sys_* syscall shims stay raw by design: their
+# pointer arguments are the kernel ABI.
 
 import ritzlib.sys  # For sys_read, sys_write, sys_close, syscallN
 import ritzlib.str  # For memset, strlen
 import ritzlib.string  # For String type
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.option
+import ritzlib.result
 
 # ============================================================================
 # Socket syscall numbers (Linux x86_64)
@@ -171,34 +185,47 @@ pub fn ntohl(val: i32) -> i32
 # IP address parsing
 # ============================================================================
 
-# Parse IPv4 address string (e.g., "127.0.0.1") to network byte order
-pub fn parse_ipv4(addr_str: *u8) -> u32
+# Parse a dotted-quad IPv4 address ("127.0.0.1") to network byte order.
+#
+# Exactly four dot-separated decimal octets, each 1-3 digits and at most 255,
+# and nothing else: an empty, short, long or non-numeric string is None, so
+# garbage is no longer indistinguishable from 0.0.0.0 (AGAST #1483).  Only
+# the view's `len` bytes are read; it needs no terminator.
+pub fn parse_ipv4(s: StrView) -> Option<u32>
     var result: u32 = 0
     var octet: u32 = 0
+    var digits: i32 = 0
     var shift: i32 = 0
-    var i: i64 = 0
 
-    while *(addr_str + i) != 0
-        let c: u8 = *(addr_str + i)
-        if c >= '0' and c <= '9'  # '0'-'9'
+    for i in 0..s.len
+        let c: u8 = *(s.ptr + i)
+        if c >= '0' and c <= '9'
+            digits += 1
+            if digits > 3
+                return None
             octet = octet * 10 + (c - '0') as u32
+        else if c == '.'
+            if digits == 0 or octet > 255 or shift == 24
+                return None
+            result = result | (octet << shift)
+            shift += 8
+            octet = 0
+            digits = 0
         else
-            if c == '.'  # '.'
-                result = result | (octet << shift)
-                shift += 8
-                octet = 0
-        i += 1
+            return None
 
-    # Last octet
-    result = result | (octet << shift)
-    return result
+    if digits == 0 or octet > 255 or shift != 24
+        return None
+    Some(result | (octet << shift))
 
 # INADDR_ANY (0.0.0.0)
 const INADDR_ANY: u32 = 0
 
 # INADDR_LOOPBACK (127.0.0.1) in network byte order
 pub fn inaddr_loopback() -> u32
-    return parse_ipv4(c"127.0.0.1")
+    match parse_ipv4("127.0.0.1")
+        Some(a) => a
+        None => 0
 
 # ============================================================================
 # Socket syscall wrappers
@@ -271,11 +298,9 @@ pub fn socket_udp() -> Socket
     sock.socktype = SOCK_DGRAM
     return sock
 
-# Check if socket is valid
-pub fn socket_valid(sock: *Socket) -> i32
-    if sock.fd >= 0
-        return 1
-    return 0
+# Whether the socket holds an open descriptor
+pub fn socket_valid(sock: @Socket) -> bool
+    sock.fd >= 0
 
 # Close a socket
 pub fn socket_close(sock: *Socket) -> i32
@@ -325,19 +350,41 @@ pub fn socket_set_io_timeout(sock: *Socket, timeout_ms: i32) -> i32
         return r1
     return sys_setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, @tv[0] as *u8, 16)
 
-# Bind socket to address and port
-pub fn socket_bind(sock: *Socket, addr_str: *u8, port: i32) -> i32
+# A sockaddr_in for `ip` (network byte order) and `port` (host order).
+fn sockaddr_in(ip: u32, port: i32) -> SockAddrIn
     var addr: SockAddrIn
     addr.family = AF_INET as i16
     addr.port = htons(port)
-    addr.addr = parse_ipv4(addr_str)
+    addr.addr = ip
     memset(@addr.zero[0], 0, 8)
+    addr
 
-    return sys_bind(sock.fd, @addr as *u8, 16)
+# A syscall's 0-or-negative-errno return as Ok(()) or Err(positive errno).
+fn unit_result(rc: i32) -> Result<(), i32>
+    if rc < 0
+        return Err(0 - rc)
+    Ok(())
 
-# Bind to any address
+# The raw forms' convention: 0, or a negative errno.
+fn unit_rc(r: Result<(), i32>) -> i32
+    match r
+        Ok(_) => 0
+        Err(e) => 0 - e
+
+# Bind the socket to an IPv4 address and port.  Err(EINVAL) if `addr`
+# isn't a dotted quad (parse_ipv4); otherwise Err(errno) from bind(2),
+# e.g. EADDRINUSE.
+pub fn socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
+    var ip: u32 = 0
+    match parse_ipv4(addr)
+        Some(a) => ip = a
+        None => return Err(EINVAL)
+    var sa: SockAddrIn = sockaddr_in(ip, port)
+    unit_result(sys_bind(sock.fd, @sa as *u8, 16))
+
+# Bind to any address (0.0.0.0): 0, or a negative errno.
 pub fn socket_bind_any(sock: *Socket, port: i32) -> i32
-    return socket_bind(sock, c"0.0.0.0", port)
+    unit_rc(socket_bind(sock, "0.0.0.0", port))
 
 # Listen for connections
 pub fn socket_listen(sock: *Socket, backlog: i32) -> i32
@@ -365,15 +412,16 @@ pub fn socket_accept_nonblock(sock: *Socket) -> Socket
     client.socktype = SOCK_STREAM
     return client
 
-# Connect to a remote address
-pub fn socket_connect(sock: *Socket, addr_str: *u8, port: i32) -> i32
-    var addr: SockAddrIn
-    addr.family = AF_INET as i16
-    addr.port = htons(port)
-    addr.addr = parse_ipv4(addr_str)
-    memset(@addr.zero[0], 0, 8)
-
-    return sys_connect(sock.fd, @addr as *u8, 16)
+# Connect to an IPv4 address and port (blocking).  Err(EINVAL) if `addr`
+# isn't a dotted quad; otherwise Err(errno) from connect(2), e.g.
+# ECONNREFUSED.
+pub fn socket_connect(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
+    var ip: u32 = 0
+    match parse_ipv4(addr)
+        Some(a) => ip = a
+        None => return Err(EINVAL)
+    var sa: SockAddrIn = sockaddr_in(ip, port)
+    unit_result(sys_connect(sock.fd, @sa as *u8, 16))
 
 
 # fcntl wrapper for setting/clearing socket flags.  Used by the timeout
@@ -405,12 +453,15 @@ fn sys_fcntl_get(fd: i32) -> i32
 # This is the standard fix for the "if a half-broken peer is on the port,
 # regular socket_connect() blocks for the kernel's TCP retry timeout
 # (~75s)" failure mode that bit nexus during the G-wedge testing.
+#
+# An `addr_str` that isn't a dotted quad is -1 (before #1483 it connected
+# to whatever the lenient parser made of it).
 pub fn socket_connect_timeout(sock: *Socket, addr_str: *u8, port: i32, timeout_ms: i32) -> i32
-    var addr: SockAddrIn
-    addr.family = AF_INET as i16
-    addr.port = htons(port)
-    addr.addr = parse_ipv4(addr_str)
-    memset(@addr.zero[0], 0, 8)
+    var ip: u32 = 0
+    match parse_ipv4(strview_from_cstr(addr_str))
+        Some(a) => ip = a
+        None => return -1
+    var addr: SockAddrIn = sockaddr_in(ip, port)
 
     # 1. Save current flags and switch to non-blocking
     let orig_flags: i32 = sys_fcntl_get(sock.fd)
@@ -468,11 +519,42 @@ pub fn socket_connect_timeout(sock: *Socket, addr_str: *u8, port: i32, timeout_m
 
     return 0
 
-# Send data
+# Send every byte of `data`, writing again after a short write or EINTR.
+# Ok(data.len), or Err(errno) from the first write that fails (bytes
+# before it have been sent).
+pub fn socket_send_all(sock: @&Socket, data: Span<u8>) -> Result<i64, i32>
+    var sent: i64 = 0
+    while sent < data.len
+        let n: i64 = sys_write(sock.fd, data.ptr + sent, data.len - sent)
+        if n < 0
+            if n != (0 - EINTR) as i64
+                return Err((0 - n) as i32)
+        else
+            sent += n
+    Ok(sent)
+
+# socket_send_all for text: a "..." literal, a string_as_view(@s), a slice.
+pub fn socket_send_str(sock: @&Socket, s: StrView) -> Result<i64, i32>
+    socket_send_all(sock, span_from_strview(s))
+
+# Receive at most `max` bytes, appended to `buf` (one read, retried on
+# EINTR).  Ok(bytes read), Ok(0) at end of stream, or Err(errno).
+pub fn socket_recv_into(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>
+    if vec_ensure_cap<u8>(buf, buf.len + max) != 0
+        return Err(ENOMEM)
+    loop
+        let n: i64 = sys_read(sock.fd, buf.data + buf.len, max)
+        if n >= 0
+            buf.len += n
+            return Ok(n)
+        if n != (0 - EINTR) as i64
+            return Err((0 - n) as i32)
+
+# Raw send: one write(2) of `len` bytes; bytes written or a negative errno.
 pub fn socket_send(sock: *Socket, buf: *u8, len: i64) -> i64
     return sys_write(sock.fd, buf, len)
 
-# Receive data
+# Raw receive: one read(2) into `buf`; bytes read, 0 at EOF, or a negative errno.
 pub fn socket_recv(sock: *Socket, buf: *u8, len: i64) -> i64
     return sys_read(sock.fd, buf, len)
 
@@ -520,7 +602,7 @@ pub fn epoll_wait_events(epfd: i32, events: *EpollEvent, maxevents: i32, timeout
 # ============================================================================
 
 impl Socket
-    pub fn valid(self: *Socket) -> i32
+    pub fn valid(self: @Socket) -> bool
         return socket_valid(self)
 
     pub fn close(self: *Socket) -> i32
@@ -532,7 +614,7 @@ impl Socket
     fn set_nodelay(self: *Socket) -> i32
         return socket_set_nodelay(self)
 
-    pub fn bind(self: *Socket, addr: *u8, port: i32) -> i32
+    pub fn bind(self: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
         return socket_bind(self, addr, port)
 
     pub fn listen(self: *Socket, backlog: i32) -> i32
@@ -541,11 +623,14 @@ impl Socket
     pub fn accept(self: *Socket) -> Socket
         return socket_accept(self)
 
-    fn connect(self: *Socket, addr: *u8, port: i32) -> i32
+    pub fn connect(self: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
         return socket_connect(self, addr, port)
 
-    fn send(self: *Socket, buf: *u8, len: i64) -> i64
-        return socket_send(self, buf, len)
+    pub fn send(self: @&Socket, data: Span<u8>) -> Result<i64, i32>
+        return socket_send_all(self, data)
 
-    fn recv(self: *Socket, buf: *u8, len: i64) -> i64
-        return socket_recv(self, buf, len)
+    pub fn send_str(self: @&Socket, s: StrView) -> Result<i64, i32>
+        return socket_send_str(self, s)
+
+    pub fn recv(self: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>
+        return socket_recv_into(self, buf, max)

@@ -138,7 +138,7 @@ import ritzlib.net
 
 pub fn main() -> i32
     var s: Socket = socket_tcp()
-    if s.valid() == 0
+    if not s.valid()
         return 1
     let r: i32 = s.set_reuseaddr()
     if s.fd < -1000

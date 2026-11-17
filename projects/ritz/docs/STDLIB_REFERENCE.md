@@ -1553,7 +1553,7 @@ struct EpollEvent
 | `htons` | `fn(val: i32) -> u16` | Host to network (16-bit) |
 | `ntohs` | `fn(val: u16) -> i32` | Network to host (16-bit) |
 | `htonl` | `fn(val: i64) -> u32` | Host to network (32-bit) |
-| `parse_ipv4` | `fn(addr_str: *u8) -> u32` | Parse "127.0.0.1" |
+| `parse_ipv4` | `fn(s: StrView) -> Option<u32>` | Parse "127.0.0.1" (network order); `None` unless exactly four octets 0-255 |
 
 **Socket Creation**:
 
@@ -1562,7 +1562,7 @@ struct EpollEvent
 | `socket_tcp` | `fn() -> Socket` | Create TCP socket |
 | `socket_tcp_nonblock` | `fn() -> Socket` | Create non-blocking TCP |
 | `socket_udp` | `fn() -> Socket` | Create UDP socket |
-| `socket_valid` | `fn(sock: *Socket) -> i32` | Check if valid |
+| `socket_valid` | `fn(sock: @Socket) -> bool` | Holds an open fd |
 | `socket_close` | `fn(sock: *Socket) -> i32` | Close socket |
 
 **Socket Options**:
@@ -1577,8 +1577,8 @@ struct EpollEvent
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_bind` | `fn(sock: *Socket, addr_str: *u8, port: i32) -> i32` | Bind to address |
-| `socket_bind_any` | `fn(sock: *Socket, port: i32) -> i32` | Bind to 0.0.0.0 |
+| `socket_bind` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Bind; `Err(EINVAL)` for a bad address, else `Err(errno)` |
+| `socket_bind_any` | `fn(sock: *Socket, port: i32) -> i32` | Bind to 0.0.0.0: 0 or -errno |
 | `socket_listen` | `fn(sock: *Socket, backlog: i32) -> i32` | Start listening |
 | `socket_accept` | `fn(sock: *Socket) -> Socket` | Accept (blocking) |
 | `socket_accept_nonblock` | `fn(sock: *Socket) -> Socket` | Accept (non-blocking) |
@@ -1587,9 +1587,13 @@ struct EpollEvent
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_connect` | `fn(sock: *Socket, addr_str: *u8, port: i32) -> i32` | Connect |
-| `socket_send` | `fn(sock: *Socket, buf: *u8, len: i64) -> i64` | Send data |
-| `socket_recv` | `fn(sock: *Socket, buf: *u8, len: i64) -> i64` | Receive data |
+| `socket_connect` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Connect; `Err(EINVAL)` for a bad address, else `Err(errno)` |
+| `socket_connect_timeout` | `fn(sock: *Socket, addr_str: *u8, port: i32, timeout_ms: i32) -> i32` | 0; -1 error or bad address; -2 timeout; -3 refused |
+| `socket_send_all` | `fn(sock: @&Socket, data: Span<u8>) -> Result<i64, i32>` | Send every byte (retries short writes and EINTR) |
+| `socket_send_str` | `fn(sock: @&Socket, s: StrView) -> Result<i64, i32>` | `socket_send_all` for text |
+| `socket_recv_into` | `fn(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>` | Append up to `max` bytes; `Ok(0)` at EOF |
+| `socket_send` | `fn(sock: *Socket, buf: *u8, len: i64) -> i64` | Raw: one write, bytes or -errno |
+| `socket_recv` | `fn(sock: *Socket, buf: *u8, len: i64) -> i64` | Raw: one read, bytes or -errno |
 | `socket_send_string` | `fn(sock: *Socket, s: *String) -> i64` | Send String |
 
 **Epoll Operations**:
