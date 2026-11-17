@@ -172,6 +172,9 @@ still run mid-lowering on `*EmitterState`, and
   (`Expr.deref_step`), before the other checks read the statement; the
   emitter only lowers them.
 
+- `discarded_array` — an array field alone as a statement does nothing
+  (#3189). Its receivers are typed by `deref_field`'s `df_member_field`.
+
 - `enum_as_int` — an enum value where an integer is expected (§10.4).
 
 - `field_slot` — a struct-literal field given a struct of another type.
@@ -181,6 +184,8 @@ still run mid-lowering on `*EmitterState`, and
 - `float_slot` — an integer into a float slot only where exact (§7.5).
 
 - `generic_method` — a free call to a generic impl's method (R37, §5.4).
+
+- `if_arm_value` — an if-expression arm must end in a value (§6.1, #1613).
 
 - `import_vis` — a plain `import` is private (§15.4, R54, #3891): a name
   that reaches the input only through another module's plain `import` is an

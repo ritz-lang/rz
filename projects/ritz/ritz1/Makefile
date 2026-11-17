@@ -53,6 +53,8 @@ SOURCES = \
 	sema_type \
 	sema_probe \
 	must_use \
+	discarded_array \
+	if_arm_value \
 	sema_index_store \
 	pass_value \
 	generic_method \

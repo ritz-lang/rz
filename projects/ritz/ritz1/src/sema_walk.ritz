@@ -44,6 +44,8 @@ import ritzlib.str
 import ritzlib.io
 import ritzlib.memory
 import deref_field   # `.` through Deref (AGAST #3015 / #3509)
+import discarded_array   # AGAST #3189, on Sema since #3512
+import if_arm_value      # AGAST #1613, on Sema since #3512
 
 # AGAST #3891: a use, in the input's own code, of a name that reaches the
 # input only through some module's plain `import` (import_vis.ritz).  A
@@ -116,6 +118,7 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     else if k == EXPR_STRUCT_LIT
         sema_vis_use(sm, e.span.line, e.span.col, e.ident_ptr, e.ident_len)
     if k == EXPR_MATCH or k == EXPR_IF
+        if_arm_check(sm, e)   # AGAST #1613 / #3512: both arms, before the condition
         sema_walk_expr(sm, e.left)
         var scrut: *Expr = null
         if k == EXPR_MATCH
@@ -198,6 +201,10 @@ fn sema_bind_param(sm: *Sema, p: *Param)
         t.pointee = p.param_pointee_type
         t.fn_sig = p.fn_sig
     sema_bind_ty(sm, p.name, p.name_len, @t, 0)
+    if p.is_borrow == 0 and p.param_type == TYPE_ARRAY and sm.scope_top > 0
+        # As sema_bind_decl: `ws[i].f` of a `ws: [N]S` param (AGAST #3512).
+        let av: *SemaVar = @sm.scope[sm.scope_top - 1]
+        av.elem = p.param_array_elem_type
     if (p.is_borrow == 1 or p.is_self_borrow == 1) and sm.scope_top > 0
         let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
         lv.lent = p
@@ -288,6 +295,10 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             # Only a block's last statement can be its value (AGAST #2137).
             if st.next != null or void_tail == 1
                 must_use_check(sm, st.expr)
+            # AGAST #3189 / #3512: a statement with a next one, or a void
+            # fn's tail; an inner block's last statement was never judged.
+            if st.next != null or (fn_tail == 1 and void_tail == 1)
+                discarded_array_check(sm, st.expr)
             sema_walk_expr(sm, st.expr)
         else if st.kind == STMT_ASSERT
             bool_check_cond(sm, st.if_cond, c"assert condition")

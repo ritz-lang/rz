@@ -1,0 +1,62 @@
+# ritz1/src/if_arm_value.ritz - an if-expression arm with no value
+#
+# AGAST #1613.  An if expression's arms are its value, so an arm that ends
+# in no value (its body is statements alone) is refused:
+#
+#     let n: i32 = if c == 1
+#         if d == 1       # error: an `if` with no `else` has no value ...
+#             1
+#     else
+#         2
+#
+# A trailing else-less `if` gets ritz0's wording, located where ritz0 puts
+# it, at that `if` (LANGUAGE_SPEC §6.1, AGAST #1406); expr_if already turned
+# every trailing if/else into the arm's value.  Any other valueless arm (one
+# ending in an assignment, say) is refused at the if expression.
+#
+# An arm that leaves the block (`return`, `break`, `continue`) reaches the
+# merge only through the unreachable block the emitter opens after it, so
+# its lack of a value is harmless (if_arm_diverges, emitter_match.ritz,
+# which emit_match_arm_body still reads).
+#
+# sema_walk calls this for every if expression, before its condition, as
+# emit_if_expr / emit_array_if_into checked both arms before lowering it.
+# Moved off the emitter onto Sema (AGAST #3512, #1816; the #3462 pattern).
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import sema
+
+# The last statement of the arm's body, or null.
+fn if_arm_last(arm: *MatchArm) -> *Stmt
+    var last: *Stmt = arm.body_stmts
+    while last != null and last.next != null
+        last = last.next
+    last
+
+fn if_arm_check_one(sm: *Sema, e: *Expr, arm: *MatchArm)
+    if arm == null or arm.is_pass == 0
+        return
+    let last: *Stmt = if_arm_last(arm)
+    if last != null and (last.kind == STMT_RETURN or last.kind == STMT_BREAK or last.kind == STMT_CONTINUE)
+        return
+    if last != null and last.kind == STMT_IF
+        sema_error_at(sm, last.span.line, last.span.col)
+        eprints_cstr(c"an `if` with no `else` has no value when its condition is false, so it cannot be used as a value here; add an `else` arm\n")
+    else
+        sema_error_at(sm, e.span.line, e.span.col)
+        eprints_cstr(c"an `if` expression arm does not end in a value\n")
+
+# Report each arm of the if expression `e` that ends in no value.
+pub fn if_arm_check(sm: *Sema, e: *Expr)
+    if e == null or e.kind != EXPR_IF
+        return
+    let then_arm: *MatchArm = e.args as *MatchArm
+    if then_arm == null
+        return
+    if_arm_check_one(sm, e, then_arm)
+    if_arm_check_one(sm, e, then_arm.next)
