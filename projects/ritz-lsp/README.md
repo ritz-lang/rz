@@ -3,8 +3,8 @@
 Language Server Protocol (LSP) server for Ritz, written in Ritz. **What works
 today:** JSON-RPC 2.0 over stdio, the initialize/shutdown handshake, and
 full-text document sync, diagnostics from a ritz1 compile of the buffer,
-hover and go-to-definition for function names in the open document
-(AGAST #2789), plus Vim syntax highlighting via `install.sh`. **No completion
+hover and go-to-definition for function names the open document declares
+or imports (AGAST #2789, #3884), plus Vim syntax highlighting via `install.sh`. **No completion
 yet**: anything it does not advertise gets MethodNotFound.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
@@ -12,7 +12,8 @@ yet**: anything it does not advertise gets MethodNotFound.
 ## Overview
 
 ritz-lsp provides IDE integration for the Ritz programming language through the Language Server Protocol. It runs as a background server that communicates with editors via JSON-RPC 2.0 over stdio, and is meant to provide diagnostics, navigation and code intelligence; today it
-reports compiler errors and resolves function names within one document (see
+reports compiler errors and resolves function names in a document and its
+imports (see
 [Status](#status)).
 
 The server is written entirely in Ritz itself, making it a useful showcase of ritzlib's JSON parsing and string handling capabilities. It integrates with Vim/Neovim via coc.nvim or native LSP, and can work with any LSP-compatible editor. It also installs Ritz syntax highlighting for Vim.
@@ -25,8 +26,8 @@ The server is written entirely in Ritz itself, making it a useful showcase of ri
 - Vim and Neovim syntax highlighting for `.ritz` files
 - coc.nvim automatic configuration
 - Diagnostics: every error ritz1 reports for the buffer (#2789)
-- Hover: the signature of a function declared in the open document (#2789)
-- Go to definition: a function's declaration in the open document (#2789)
+- Hover: the signature of a function the open document declares or imports (#2789, #3884)
+- Go to definition: that function's declaration, in its own file (#2789, #3884)
 - Completions (keywords, variables, fields) - planned
 
 ## Installation
@@ -149,8 +150,19 @@ parse. A function declaration is a line starting `fn <name>` after any
 indentation and `pub` / `extern` / `async`. On a name in code (not in a
 comment or string literal) that some line declares, hover answers the
 declaration's line as a `ritz` code block and definition answers its
-location; anything else answers `null`. Only the open document is searched:
-a function imported from another file answers `null`.
+location; anything else answers `null`.
+
+A name the document does not declare is looked up in its imports (#3884),
+read from disk. They are resolved as ritz1 resolves them for the diagnostics
+compile. The roots are the same `-I` list (the document's directory and its
+ancestors, then `projects/ritz`), then `$RITZ_PATH` as
+`<entry>/<pkg>/<rest>.ritz`, `<pkg>/lib/` and `<pkg>/src/`. A module's own
+imports are tried first from that module's directory, except `ritzlib`'s.
+A module exports its `pub` (and `extern`) functions, plus whatever its
+`pub import`s export. Its plain imports are private to it (#3891), so a name
+that reaches the document only through them answers `null`, as does a
+function without `pub`. Definition answers a Location in the imported file,
+and hover shows that file's declaration line.
 
 ## Status
 
@@ -165,13 +177,14 @@ binary answers an `initialize` request over stdio at exit 0.
 | Vim syntax highlighting | Working (`install.sh --vim`) |
 | `install.sh --build` | **Broken** — expects a pre-consolidation `ritz` submodule; use `./rz build ritz-lsp` |
 | Diagnostics | Working: ritz1 errors on open/change (#2789) |
-| Hover | Working: function names in the open document (#2789) |
-| Go to definition | Working: function names in the open document (#2789) |
+| Hover | Working: function names in the open document and its imports (#2789, #3884) |
+| Go to definition | Working: function names in the open document and its imports (#2789, #3884) |
 | Completions | Planned, not advertised: MethodNotFound |
 
 Hover and definition used to be advertised and answered `null` for every
 position (#2460); they were unadvertised until #2789 gave them real answers.
-`test.sh` pins the capabilities, the hover/definition answers, how ritz1's
+`test.sh` pins the capabilities, the hover/definition answers (in the
+document and across imports), how ritz1's
 output becomes diagnostics (with a stub ritz1) and, when ritz1 is built, the
 end-to-end answer for a call to an undefined function.
 

@@ -7,6 +7,8 @@
 #   (completion) gets MethodNotFound (-32601), not a fake empty answer.
 # - hover / definition on a function name in the open document answer with
 #   its signature / its declaration; on anything else they answer null.
+# - ... and on a function the document imports, the same from the imported
+#   file, resolved as ritz1 resolves it, exported names only (#3884).
 # - didOpen / didChange publish diagnostics from a ritz1 compile of the
 #   buffer (#2789). A stub ritz1 (via $RITZ1) pins how its stderr becomes
 #   diagnostics; the real ritz1, when it is built, pins the end-to-end
@@ -186,6 +188,114 @@ for argv in ([], ["--stdio"]):
           len(d) == 1 and len(d[0]["diagnostics"]) == 1
           and d[0]["diagnostics"][0]["severity"] == 2
           and "ritz1" in d[0]["diagnostics"][0]["message"], repr(d))
+
+# --- hover / definition across imports (#3884) ------------------------------
+# A fn the document imports is found in the imported file, resolved the way
+# ritz1 resolves it with the -I diagnostics passes: the document's directory
+# and its ancestors, the monorepo's projects/ritz (ritzlib), then $RITZ_PATH
+# (<entry>/<pkg>/<rest>.ritz, then <pkg>/lib/ and <pkg>/src/). A module's own
+# imports resolve from that module's directory. What a module exports is its
+# `pub` fns and, through `pub import`, what those modules export; a plain
+# import of an imported module is private to it (#3891), and so is a fn
+# without `pub`. The tree's path has a space, so the Location's uri must be
+# percent-encoded the way an editor encodes it.
+RITZLIB_STR = REAL_RITZ1.parents[2] / "ritzlib" / "str.ritz"
+tree = scratch / "imp tree"
+files = {
+    "app/util.ritz": "pub import reexp\nimport plain\n\npub fn util_fn() -> i32\n    1\n\nfn private_fn() -> i32\n    2\n",
+    "app/reexp.ritz": "pub import util\n\n# a cycle back to util\npub fn reexported(a: i32,  b: i32) -> i32\n    a\n",
+    "app/plain.ritz": "pub fn transitive_plain() -> i32\n    3\n",
+    "lib/deep.ritz": "pub import deepsib\n\n    pub fn deep_fn(x: i32) -> i32   \npub import ritzlib.memory\n",
+    # ritz1 resolves a ritzlib import only from its roots, never from the
+    # importing module's directory, so this file is never read.
+    "lib/ritzlib/memory.ritz": "pub fn decoy_mem() -> i32\n    7\n",
+    "lib/deepsib.ritz": "pub fn deepsib_fn() -> i32\n    4\n",
+    "deepsib.ritz": "pub fn decoy() -> i32\n    5\n",
+    "ext/extpkg/lib/thing.ritz": "pub fn ext_fn() -> i32\n    6\n",
+    "ext/extpkg/src/other.ritz": "pub fn ext_src_fn() -> i32\n    8\n",
+}
+for rel, text in files.items():
+    (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+    (tree / rel).write_text(text)
+# tree/deepsib.ritz is an ancestor of lib/ too, but lib/'s own directory is
+# probed first, so lib/deepsib.ritz answers.
+iuri = (tree / "app" / "main.ritz").as_uri()
+isrc = ("import ritzlib.str\n"                                      # 0
+        "import util\n"                                             # 1
+        "import lib.deep { deep_fn }\n"                             # 2
+        "import extpkg.thing\n"                                     # 3
+        "import extpkg.other\n"                                     # 4
+        "fn main() -> i32\n"                                        # 5
+        "    strlen(c\"x\") + util_fn() + deep_fn(1) + reexported(1, 2)\n"   # 6
+        "    deepsib_fn() + ext_fn() + transitive_plain() + private_fn() + nowhere()\n"  # 7
+        "    ext_src_fn() + decoy_mem()  # import plain\n")              # 8
+L6 = isrc.splitlines()[6]
+L7 = isrc.splitlines()[7]
+L8 = isrc.splitlines()[8]
+def at(line_text, name):
+    return line_text.index(name + "(")
+strlen_line = next(i for i, l in enumerate(RITZLIB_STR.read_text().splitlines())
+                   if l.startswith("pub fn strlen("))
+ireqs = [
+    req(2, "textDocument/definition", iuri, 6, at(L6, "strlen")),
+    req(3, "textDocument/hover", iuri, 6, at(L6, "strlen")),
+    req(4, "textDocument/definition", iuri, 6, at(L6, "util_fn") + 2),
+    req(5, "textDocument/definition", iuri, 6, at(L6, "deep_fn")),
+    req(6, "textDocument/hover", iuri, 6, at(L6, "deep_fn")),
+    req(7, "textDocument/definition", iuri, 6, at(L6, "reexported")),
+    req(8, "textDocument/hover", iuri, 6, at(L6, "reexported")),
+    req(9, "textDocument/definition", iuri, 7, at(L7, "deepsib_fn")),
+    req(10, "textDocument/definition", iuri, 7, at(L7, "ext_fn")),
+    req(11, "textDocument/definition", iuri, 7, at(L7, "transitive_plain")),
+    req(12, "textDocument/hover", iuri, 7, at(L7, "transitive_plain")),
+    req(13, "textDocument/definition", iuri, 7, at(L7, "private_fn")),
+    req(14, "textDocument/definition", iuri, 7, at(L7, "nowhere")),
+    req(15, "textDocument/definition", "untitled:Untitled-1", 1, 4),
+    req(16, "textDocument/definition", iuri, 8, 4),
+    req(17, "textDocument/definition", iuri, 8, at(L8, "decoy_mem")),
+]
+IENV = {**NO_RITZ1, "RITZ_PATH": str(tree / "ext")}
+rc, out = session([did_open(iuri, isrc), did_open("untitled:Untitled-1", "import ritzlib.str\n    strlen(c\"\")\n"),
+                   *ireqs], env=IENV)
+r = by_id(out)
+def res(rid):
+    return r.get(rid, {}).get("result")
+def loc(rel, line, ch, name):
+    return {"uri": (tree / rel).as_uri(), "range": rng(line, ch, line, ch + len(name))}
+str_loc = {"uri": RITZLIB_STR.as_uri(), "range": rng(strlen_line, 7, strlen_line, 13)}
+check("import: definition of a ritzlib fn -> its declaration in ritzlib",
+      res(2) == str_loc, repr(r.get(2)))
+check("import: hover on a ritzlib fn -> its signature from ritzlib, range in the document",
+      (res(3) or {}).get("contents", {}).get("value") == "```ritz\npub fn strlen(s: *u8) -> i64\n```"
+      and (res(3) or {}).get("range") == rng(6, at(L6, "strlen"), 6, at(L6, "strlen") + 6), repr(r.get(3)))
+check("import: definition of a sibling module's fn (uri percent-encoded)",
+      res(4) == loc("app/util.ritz", 3, 7, "util_fn"), repr(r.get(4)))
+check("import: definition through a dotted import found in an ancestor directory",
+      res(5) == loc("lib/deep.ritz", 2, 11, "deep_fn"), repr(r.get(5)))
+check("import: hover on an imported fn -> its line, trimmed",
+      (res(6) or {}).get("contents", {}).get("value") == "```ritz\npub fn deep_fn(x: i32) -> i32\n```",
+      repr(r.get(6)))
+check("import: a `pub import`ed module's fn is visible (and a cycle ends)",
+      res(7) == loc("app/reexp.ritz", 3, 7, "reexported"), repr(r.get(7)))
+check("import: hover through a `pub import`",
+      (res(8) or {}).get("contents", {}).get("value") == "```ritz\npub fn reexported(a: i32,  b: i32) -> i32\n```",
+      repr(r.get(8)))
+check("import: a module's own imports resolve from its directory",
+      res(9) == loc("lib/deepsib.ritz", 0, 7, "deepsib_fn"), repr(r.get(9)))
+check("import: $RITZ_PATH resolves, with the <pkg>/lib/ probe",
+      res(10) == loc("ext/extpkg/lib/thing.ritz", 0, 7, "ext_fn"), repr(r.get(10)))
+for rid, what in ((11, "definition of a fn only reachable through a plain import of an import"),
+                  (12, "hover on a fn only reachable through a plain import of an import"),
+                  (13, "definition of an imported module's private fn"),
+                  (14, "definition of a fn no import declares"),
+                  (17, "definition of a fn in a ritzlib/ beside an importing module, not in ritzlib")):
+    check("import: " + what + " -> null",
+          rid in r and "error" not in r[rid] and r[rid].get("result") is None, repr(r.get(rid)))
+check("import: $RITZ_PATH's <pkg>/src/ probe",
+      res(16) == loc("ext/extpkg/src/other.ritz", 0, 7, "ext_src_fn"), repr(r.get(16)))
+check("import: a non-file document still resolves ritzlib",
+      res(15) == str_loc, repr(r.get(15)))
+check("import: clean exit", rc == 0, f"exit {rc}")
 
 # --- diagnostics from a stub ritz1 -----------------------------------------
 # The stub prints, to stderr, every `#! <line>` in its input with {in}

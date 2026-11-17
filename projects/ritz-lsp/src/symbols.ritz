@@ -1,6 +1,8 @@
-# symbols.ritz - function names in an open document (AGAST #2789)
+# symbols.ritz - function names in an open document and its imports
+# (AGAST #2789, #3884)
 #
-# Hover and go-to-definition for a function name in the open document.
+# Hover and go-to-definition for a function name the open document declares
+# or imports (see "Imports" below for how imported modules are found).
 # These read the buffer the editor sent, not a ritz1 compile: they answer
 # while the buffer is half-typed and does not parse, and they need no
 # compiler on the machine.
@@ -18,6 +20,12 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.gvec
 import ritzlib.json
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.result
+import ritzlib.fs
+
+import paths
 
 # =============================================================================
 # Bytes and lines
@@ -133,7 +141,10 @@ fn skip_keyword(text: *u8, i: i64, end: i64, kw: *u8) -> i64
     j
 
 # The name declared by the line [start, end) if it declares a function.
-fn decl_name(text: *u8, start: i64, end: i64) -> Word
+# `*exported` says whether another file may call it: it is `pub` or `extern`
+# (LANGUAGE_SPEC §15.2 leaves an extern fn's privacy unchecked).
+fn decl_name(text: *u8, start: i64, end: i64, exported: *bool) -> Word
+    *exported = false
     var i: i64 = start
     while i < end and is_blank(*(text + i))
         i += 1
@@ -141,7 +152,9 @@ fn decl_name(text: *u8, start: i64, end: i64) -> Word
         var j: i64 = skip_keyword(text, i, end, c"pub")
         if j < 0
             j = skip_keyword(text, i, end, c"extern")
-        if j < 0
+        if j >= 0
+            *exported = true
+        else
             j = skip_keyword(text, i, end, c"async")
         if j < 0
             break
@@ -154,17 +167,225 @@ fn decl_name(text: *u8, start: i64, end: i64) -> Word
         e += 1
     Word { start: i, end: e }
 
-# The first function declaration named text[w.start, w.end), or no_word().
-pub fn find_fn_decl(text: *u8, len: i64, w: Word) -> Word
-    let n: i64 = w.end - w.start
+# The first function declaration in text[0, len) named name[0, n), or
+# no_word().  With `exported_only`, only one another file may call.
+fn find_decl_named(text: *u8, len: i64, name: *u8, n: i64, exported_only: bool) -> Word
     var start: i64 = 0
     while start < len
         let end: i64 = line_end(text, len, start)
-        let d: Word = decl_name(text, start, end)
-        if d.start >= 0 and d.end - d.start == n and memcmp(text + d.start, text + w.start, n) == 0
+        var exported: bool = false
+        let d: Word = decl_name(text, start, end, @exported)
+        if d.start >= 0 and d.end - d.start == n and (exported or not exported_only) and memcmp(text + d.start, name, n) == 0
             return d
         start = end + 1
     no_word()
+
+# The first function declaration named text[w.start, w.end), or no_word().
+pub fn find_fn_decl(text: *u8, len: i64, w: Word) -> Word
+    find_decl_named(text, len, text + w.start, w.end - w.start, false)
+
+# =============================================================================
+# Imports (#3884)
+# =============================================================================
+#
+# A function the document does not declare is looked up in the modules it
+# imports.  Modules are found the way ritz1 finds them when diagnostics.ritz
+# compiles the document: its -I roots (paths.ritz import_path) and then
+# $RITZ_PATH.  What a module exports is its `pub` (or `extern`) fns plus what
+# its `pub import`s export.  A module's plain imports are private to it
+# (#3891), so they are not followed.  The search reads the files on disk, not
+# any open editor buffers for them.
+
+# An import declaration: the module path text[start, end) (`a.b.c`) and
+# whether it is a `pub import`.
+struct ImportLine
+    start: i64
+    end: i64
+    is_pub: bool
+
+# The import declared by the line [start, end), or one whose start is -1.  An
+# import is top-level, so it starts the line.  Anything after the path (a
+# selective `{ ... }` list or an `as` alias) is ignored, since neither filters
+# what is imported (LANGUAGE_SPEC §15.1).
+fn import_decl(text: *u8, start: i64, end: i64) -> ImportLine
+    var i: i64 = start
+    var is_pub: bool = false
+    let j: i64 = skip_keyword(text, i, end, c"pub")
+    if j >= 0
+        is_pub = true
+        i = j
+    i = skip_keyword(text, i, end, c"import")
+    if i < 0 or not is_ident_start(*(text + i))
+        return ImportLine { start: -1, end: -1, is_pub: false }
+    var e: i64 = i
+    while e < end and (is_ident_char(*(text + e)) or *(text + e) == '.')
+        e += 1
+    ImportLine { start: i, end: e, is_pub: is_pub }
+
+# A new String holding dir[0, dir_len) + "/" + the module path with each '.'
+# turned into '/', + ".ritz".  If `sub` is non-empty it goes after the first
+# segment (<pkg>/<sub>/<rest>.ritz), and a single-segment module gives "".
+fn module_file(dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: *u8) -> String
+    var out: String = string_from_bytes(dir, dir_len)
+    if dir_len > 0 and *(dir + dir_len - 1) != '/'
+        string_push(@&out, '/')
+    var first: bool = true
+    var i: i64 = imp.start
+    while i < imp.end
+        let c: u8 = *(text + i)
+        if c == '.'
+            string_push(@&out, '/')
+            if first and *sub != 0
+                string_push_cstr(@&out, sub)
+                string_push(@&out, '/')
+            first = false
+        else
+            string_push(@&out, c)
+        i += 1
+    if first and *sub != 0
+        string_drop(@&out)
+        return string_new()
+    string_push_str(@&out, ".ritz")
+    out
+
+# Whether module_file(dir, dir_len, text, imp, sub) exists.  If it does, it is
+# appended to `found`.
+fn try_file(found: @&String, dir: *u8, dir_len: i64, text: *u8, imp: ImportLine, sub: *u8) -> bool
+    var c: String = module_file(dir, dir_len, text, imp, sub)
+    var hit: bool = false
+    if string_len(@c) > 0 and exists(@&c, 0)
+        string_push_string(found, @c)
+        hit = true
+    string_drop(@&c)
+    hit
+
+# The file the import `imp` in `text` names, or "" if none is found.  The
+# search follows ritz1's try_open_import.  For any import except ritzlib's,
+# it first tries `from_dir` (the importing file's directory) and up to 7 of
+# its ancestors.  It then tries each colon-separated root in `roots` as
+# <root>/<a>/<b>.ritz, <root>/<a>/lib/<b>.ritz and <root>/<a>/src/<b>.ritz.
+fn resolve_module(text: *u8, imp: ImportLine, from_dir: @&String, roots: @&String) -> String
+    var found: String = string_new()
+    let n: i64 = imp.end - imp.start
+    let is_ritzlib: bool = (n == 7 or (n > 7 and *(text + imp.start + 7) == '.')) and memcmp(text + imp.start, c"ritzlib", 7) == 0
+    if not is_ritzlib
+        let d: *u8 = string_as_ptr(from_dir)
+        var end: i64 = string_len(from_dir)
+        var levels: i32 = 0
+        while end > 0 and levels < 8
+            if try_file(@&found, d, end, text, imp, c"")
+                return found
+            end = last_slash(d, end)
+            levels += 1
+    let r: *u8 = string_as_ptr(roots)
+    let rn: i64 = string_len(roots)
+    var s: i64 = 0
+    while s < rn
+        var e: i64 = s
+        while e < rn and *(r + e) != ':'
+            e += 1
+        if e > s
+            if try_file(@&found, r + s, e - s, text, imp, c"")
+                return found
+            if try_file(@&found, r + s, e - s, text, imp, c"lib")
+                return found
+            if try_file(@&found, r + s, e - s, text, imp, c"src")
+                return found
+        s = e + 1
+    found
+
+# Where a function was found.  `path` is "" if it is in the document itself.
+# Otherwise it is the file it is in, and `text` holds that file.  `w` is the
+# name in that text, or no_word() if nothing was found.
+struct Found
+    path: String
+    text: String
+    w: Word
+
+fn found_new() -> Found
+    Found { path: string_new(), text: string_new(), w: no_word() }
+
+fn found_drop(f: *Found)
+    string_drop(@&f.path)
+    string_drop(@&f.text)
+
+# The contents of the file `path`, or "" if it cannot be read.
+fn read_text(path: @&String) -> String
+    match read_file(string_as_view(path))
+        Ok(s) => s
+        Err(e) => string_new()
+
+# Whether `seen` (a "\n" followed by paths, each ended by "\n") holds `path`.
+fn seen_has(seen: @&String, path: @&String) -> bool
+    let s: *u8 = string_as_ptr(seen)
+    let sn: i64 = string_len(seen)
+    let p: *u8 = string_as_ptr(path)
+    let pn: i64 = string_len(path)
+    var i: i64 = 0
+    while i + pn + 2 <= sn
+        if *(s + i) == '\n' and *(s + i + pn + 1) == '\n' and memcmp(s + i + 1, p, pn) == 0
+            return true
+        i += 1
+    false
+
+# Search the modules imported by text[0, len) for an exported fn named
+# name[0, n), depth first and in import order, and put the result in `f`.
+# `dir` is the directory of `text`'s file.  With `pub_only`, only
+# `pub import`s are followed.  Every file visited is added to `seen`, so an
+# import cycle ends.
+fn search_imports(f: *Found, text: *u8, len: i64, dir: @&String, roots: @&String, name: *u8, n: i64, pub_only: bool, seen: @&String) -> bool
+    var start: i64 = 0
+    while start < len
+        let end: i64 = line_end(text, len, start)
+        let imp: ImportLine = import_decl(text, start, end)
+        start = end + 1
+        if imp.start >= 0 and (imp.is_pub or not pub_only)
+            var path: String = resolve_module(text, imp, dir, roots)
+            if string_len(@path) > 0 and not seen_has(seen, @&path)
+                string_push_string(seen, @path)
+                string_push(seen, '\n')
+                var content: String = read_text(@&path)
+                let ct: *u8 = string_as_ptr(@&content)
+                let cl: i64 = string_len(@content)
+                let d: Word = find_decl_named(ct, cl, name, n, true)
+                if d.start >= 0
+                    string_drop(@&f.path)
+                    string_drop(@&f.text)
+                    f.path = path
+                    f.text = content
+                    f.w = d
+                    return true
+                let p: *u8 = string_as_ptr(@&path)
+                var child: String = string_from_bytes(p, last_slash(p, string_len(@path)))
+                let hit: bool = search_imports(f, ct, cl, @&child, roots, name, n, true, seen)
+                string_drop(@&child)
+                string_drop(@&content)
+                if hit
+                    string_drop(@&path)
+                    return true
+            string_drop(@&path)
+    false
+
+# The declaration of the function named text[w.start, w.end) that the
+# document `uri` can call goes in `f`.  The document's own declaration comes
+# first, then one its imports export.  If neither exists, f.w.start < 0.
+fn lookup(f: *Found, uri: *u8, text: *u8, len: i64, w: Word)
+    f.w = find_fn_decl(text, len, w)
+    if f.w.start >= 0
+        return
+    var doc_path: String = uri_path(uri)
+    var roots: String = lookup_roots(@&doc_path)
+    # ritz1 compiles a scratch copy of the document.  Its directory holds no
+    # modules, so the document's own imports come only from the roots (which
+    # start at the document's directory).  An imported module's imports start
+    # at that module's directory.
+    var no_dir: String = string_new()
+    var seen: String = string_from("\n")
+    search_imports(f, text, len, @&no_dir, @&roots, text + w.start, w.end - w.start, false, @&seen)
+    string_drop(@&seen)
+    string_drop(@&no_dir)
+    string_drop(@&roots)
+    string_drop(@&doc_path)
 
 # =============================================================================
 # LSP answers
@@ -191,40 +412,59 @@ pub fn push_range(buf: *Vec<u8>, l0: i64, c0: i64, l1: i64, c1: i64)
     push_position(buf, l1, c1)
     vec_push<u8>(buf, '}')
 
-# The range of word `w`, which lies on one line.
+# The range of word `w` in `text`.  The word lies on one line.  This is the
+# only place a byte offset becomes an LSP position (#3885 converts columns
+# here).
 fn push_word_range(buf: *Vec<u8>, text: *u8, w: Word)
     let line: i64 = line_of(text, w.start)
     let col: i64 = w.start - line_start(text, w.end, line)
     push_range(buf, line, col, line, col + w.end - w.start)
 
-# The declaration of the function named at (line, col), or no_word().
-fn decl_at(text: *u8, len: i64, line: i64, col: i64) -> Word
-    let w: Word = word_at(text, len, line, col)
-    if w.start < 0
-        return no_word()
-    find_fn_decl(text, len, w)
+# `{"uri":...,"range":...}`: the Location of word `w` in `text`, the file `uri`.
+fn push_location(buf: *Vec<u8>, uri: *u8, text: *u8, w: Word)
+    vec_push_str(buf, c"{\"uri\":")
+    json_emit_string(uri, buf)
+    vec_push_str(buf, c",\"range\":")
+    push_word_range(buf, text, w)
+    vec_push<u8>(buf, '}')
 
-# Hover: the result JSON for (line, col) into `out` ("null" if it names no
-# function declared in the document).
-pub fn hover_json(text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
+# The text `f` was found in: the document's `text` or the imported file's.
+fn found_text(f: *Found, text: *u8) -> *u8
+    if string_len(@f.path) == 0
+        return text
+    string_as_ptr(@&f.text)
+
+fn found_len(f: *Found, len: i64) -> i64
+    if string_len(@f.path) == 0
+        return len
+    string_len(@f.text)
+
+# Hover: the result JSON for (line, col) in the document `uri` into `out`.  It
+# is "null" if the word there names no function that the document declares or
+# imports.
+pub fn hover_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
     vec_clear<u8>(out)
     let w: Word = word_at(text, len, line, col)
-    var d: Word = no_word()
+    var f: Found = found_new()
     if w.start >= 0
-        d = find_fn_decl(text, len, w)
-    if d.start < 0
+        lookup(@f, uri, text, len, w)
+    if f.w.start < 0
         vec_push_str(out, c"null")
+        found_drop(@f)
         return
+    let dt: *u8 = found_text(@f, text)
+    let dl: i64 = found_len(@f, len)
+    let d: Word = f.w
     # The declaration's line, without its indentation or trailing blanks.
-    var s: i64 = line_start(text, len, line_of(text, d.start))
-    var e: i64 = line_end(text, len, d.start)
-    while s < e and is_blank(*(text + s))
+    var s: i64 = line_start(dt, dl, line_of(dt, d.start))
+    var e: i64 = line_end(dt, dl, d.start)
+    while s < e and is_blank(*(dt + s))
         s += 1
-    while e > s and (is_blank(*(text + e - 1)) or *(text + e - 1) == '\r')
+    while e > s and (is_blank(*(dt + e - 1)) or *(dt + e - 1) == '\r')
         e -= 1
     var md: Vec<u8> = vec_with_cap<u8>(64 + e - s)
     vec_push_str(@&md, c"```ritz\n")
-    vec_push_bytes<u8>(@&md, text + s, e - s)
+    vec_push_bytes<u8>(@&md, dt + s, e - s)
     vec_push_str(@&md, c"\n```")
     vec_push<u8>(@&md, 0)
     vec_push_str(out, c"{\"contents\":{\"kind\":\"markdown\",\"value\":")
@@ -233,17 +473,23 @@ pub fn hover_json(text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
     push_word_range(out, text, w)
     vec_push<u8>(out, '}')
     vec_drop<u8>(@&md)
+    found_drop(@f)
 
-# Definition: the Location JSON for (line, col) into `out` ("null" if it
-# names no function declared in the document).
+# Definition: the Location JSON for (line, col) in the document `uri` into
+# `out`.  It is "null" if the word there names no function that the document
+# declares or imports.
 pub fn definition_json(uri: *u8, text: *u8, len: i64, line: i64, col: i64, out: *Vec<u8>)
     vec_clear<u8>(out)
-    let d: Word = decl_at(text, len, line, col)
-    if d.start < 0
+    let w: Word = word_at(text, len, line, col)
+    var f: Found = found_new()
+    if w.start >= 0
+        lookup(@f, uri, text, len, w)
+    if f.w.start < 0
         vec_push_str(out, c"null")
-        return
-    vec_push_str(out, c"{\"uri\":")
-    json_emit_string(uri, out)
-    vec_push_str(out, c",\"range\":")
-    push_word_range(out, text, d)
-    vec_push<u8>(out, '}')
+    else if string_len(@f.path) == 0
+        push_location(out, uri, text, f.w)
+    else
+        var furi: String = uri_from_path(@&f.path)
+        push_location(out, string_as_ptr(@&furi), string_as_ptr(@&f.text), f.w)
+        string_drop(@&furi)
+    found_drop(@f)
