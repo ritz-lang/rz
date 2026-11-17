@@ -90,6 +90,14 @@ tools-unit:
 	@echo "=== Running tools/ unit tests (-n $(PYTEST_J)) ==="
 	@$(PYTHON) -m pytest -q -n $(PYTEST_J) --dist loadgroup tools/
 
+# ritz1's measurements: modules, sizes, import graph and cycles, where each
+# check runs, long functions.  Printed, never committed (AGAST #3896: a block
+# of them in ritz1/ARCHITECTURE.md made every ritz1 commit conflict); the
+# doc's invariants are checked by tools/test_ritz1_arch.py in tools-unit.
+.PHONY: arch-report
+arch-report:
+	@$(PYTHON) tools/ritz1_arch.py
+
 # Every examples/**/test/*.ritz [[test]] suite, with ritz0 (AGAST #3729).
 # rz.toml keeps examples out of `rz test --all`, and regression.sh runs each
 # example's test.sh but never its test/*.ritz, so until this target nothing

@@ -4,19 +4,22 @@ ritz1 is the Ritz compiler written in Ritz. ritz0 (the Python bootstrap
 compiler) builds it, and it then builds itself (`ritz1_selfhosted`). It
 compiles one `.ritz` file to one LLVM IR `.ll` file; clang and ld do the rest.
 
-**Numbers in this document are generated.** The block under
-[Measurements](#measurements) is the output of `tools/ritz1_arch.py`, and the
-prose outside it states no counts. The previous version of this file was
-written by hand and said "11 source files, ~13,700 lines" for months after
-that stopped being true (AGAST #1827). To refresh it, from `projects/ritz/`:
+**This document states no numbers.** A hand-written version said "11
+source files, ~13,700 lines" for months after that stopped being true (AGAST
+#1827), and a generated block committed here changed with every ritz1 commit,
+so every two rooms editing ritz1 conflicted on it (#3896). Measure instead,
+from `projects/ritz/`:
 
 ```bash
-python3 tools/ritz1_arch.py --write ritz1/ARCHITECTURE.md   # regenerate
-python3 tools/ritz1_arch.py --check ritz1/ARCHITECTURE.md   # exit 1 if stale
+make arch-report    # modules, sizes, import graph and cycles, where each check runs, long functions
 ```
 
-The counting rules (what a "code line", an "import" and a "function" are) are
-in the script's docstring and pinned by `tools/test_ritz1_arch.py`.
+The gate (`make tools-unit`) holds this file to `tools/ritz1_arch.py
+--check`: every module in `ritz1/src` has an entry under
+[Module responsibilities](#module-responsibilities), every Sema check is in
+its **Checks** list, and no module joins the import cycle. The script's
+docstring states the rules and the counting rules; `tools/test_ritz1_arch.py`
+pins them.
 
 ## Pipeline
 
@@ -98,7 +101,8 @@ the emitter (AGAST #3462, #1816; LARB review/5 ritz1 N1):
 ## Module responsibilities
 
 Each module's header comment is the authority on its rules; this is the map.
-Sizes and imports are in [Measurements](#measurements).
+Sizes and imports are in `make arch-report`. Every module in `ritz1/src` has
+an entry here, and every entry names a module that exists (`--check`).
 
 **Front end**
 
@@ -137,17 +141,74 @@ Sizes and imports are in [Measurements](#measurements).
 | `sema_type` | Types an expression from the AST and Sema's scope alone. |
 | `sema_walk` | Walks the module and calls each Sema check. |
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
-| `must_use`, `generic_method`, `field_slot`, `pass_value`, `narrowing`, `bool_check`, `float_compare`, `call_check`, `let_check`, `tail_value`, `enum_as_int` | Checks already moved onto Sema. `narrowing`'s rule is also read mid-lowering (float_slot, literal_slot, sizeof), from the emitter's own table of written types. `tail_value`'s divergence walk (`tail_stmts_diverge`) is also read by `reachability` and `emitter_stmt`. `let_check`'s place rule (`let_place`) reads either view through a `LetEnv`: ref_check, still on the emitter, asks it about an `@x` of a `let` (`let_addr_of_own`). |
-| `binder_check`, `reachability` | Whole-module checks run by main before monomorphisation. |
 
-**Checks still called from the emitter**
+**Checks**
 
-`deref_field`, `float_slot`,
-`index_through`, `literal_slot`, `ownership`
-(move checking and drop insertion), `ref_check`. Each header
-cites its rule. They take `*EmitterState` and run mid-lowering; moving them
-to Sema is #1816's work.  `bool_kind` is the emitter's copy of bool_check's
-inference (`sema_bool_kind`), which codegen and those checks still read.
+One entry per check module, sorted, with a blank line between entries, so
+two rooms editing neighbouring entries touch no adjacent lines and git merges
+them (#3896; `--check` enforces all three). An entry states the rule, not
+where it runs: `make arch-report` says which checks are on Sema and which
+still run mid-lowering on `*EmitterState`, and
+`tools/ritz1_emitter_checks.allow` lists the emitter-side ones still to move
+(#1816). A note that belongs to a move goes on that check's own entry.
+
+- `binder_check` — a local can't take a module value's name, nor a name
+  already in scope in its fn. Run by main over the whole module before
+  monomorphisation.
+
+- `bool_check` — `bool` is its own type: conditions and `and` / `or` / `not`
+  take bool (LARB R4). `bool_kind` is the emitter's copy of its inference.
+
+- `call_check` — a call's arguments fit its callee.
+
+- `deref_field` — `.` through a struct's `Deref` / `DerefMut` (§7.7, R17).
+
+- `enum_as_int` — an enum value where an integer is expected (§10.4).
+
+- `field_slot` — a struct-literal field given a struct of another type.
+
+- `float_compare` — an f32 compared with an f64 asks for `as` (§7.2).
+
+- `float_slot` — an integer into a float slot only where exact (§7.5).
+
+- `generic_method` — a free call to a generic impl's method (R37, §5.4).
+
+- `import_vis` — a plain `import` is private (§15.4, R54, #3891): a name
+  that reaches the input only through another module's plain `import` is an
+  error at its use. main records each loaded module and import edge before
+  merging; `sema_walk` asks `vis_hidden` at each use in the input's own fns.
+
+- `index_through` — `[]` through a pointer or reference (R9).
+
+- `let_check` — `let` immutability: no write or `@&` through a `let`'s place.
+  Its place rule (`let_place`) reads either view through a `LetEnv`:
+  ref_check, still on the emitter, asks it about an `@x` of a `let`
+  (`let_addr_of_own`).
+
+- `literal_slot` — a literal takes its type from its slot (R3).
+
+- `must_use` — a discarded call to a `[[must_use]]` fn (§17.8).
+
+- `narrowing` — implicit narrowing in a typed let/var. Its rule is also read
+  mid-lowering (float_slot, literal_slot, sizeof), from the emitter's own
+  table of written types.
+
+- `ownership` — move checking and drop insertion (§13).
+
+- `pass_value` — `pass` has no value (§2.4, §6.1).
+
+- `reachability` — code that can never run is refused. Run by main over the
+  whole module before monomorphisation.
+
+- `ref_check` — a reference doesn't fit a by-value slot, nor a value a
+  reference slot, and an array only fits a slot of its own element type.
+
+- `sema_index_store` — an index store ritz1 can't lower is refused, not
+  miscompiled.
+
+- `tail_value` — a `-> T` fn must not reach its end without a value. Its
+  divergence walk (`tail_stmts_diverge`) is also read by `reachability` and
+  `emitter_stmt`.
 
 **Emitter**
 
@@ -161,6 +222,7 @@ inference (`sema_bool_kind`), which codegen and those checks still read.
 | `emitter_match` | `match` lowered to an if-else chain. |
 | `emitter_print` | The `print` builtin, byte-identical to ritz0's output. |
 | `emitter_asm` | `asm` blocks to LLVM inline asm. |
+| `bool_kind` | The emitter's bool kind of an expression: bool_check's inference (`sema_bool_kind`), still read by codegen and the emitter-side checks. |
 | `ll_copy_scan` | Text scan of emitted IR for large-struct copies (used by `emitter`'s rewrite pass). |
 | `frame_limit` | Text scan of a fn's allocas: refuses a stack frame over 8 MiB at its largest local or temporary (#3739). |
 
@@ -185,14 +247,16 @@ compiler to produce `build/ritz1_selfhosted`.
 
 ## Known structural debt
 
-Tracked under AGAST #1812 (M1.3). The measurements below show its shape.
+Tracked under AGAST #1812 (M1.3). `make arch-report` shows its shape.
 
 - **No semantic phase yet** — types are inferred during emission and most
   checks still run inside the emitter. Sema exists; the move is #1816.
 - **The emitter import cycle** — the emitter modules, the emitter-side checks
-  and monomorph form one strongly connected component (see Import cycles),
-  around `emitter_core`'s `EmitterState`. Breaking it, dissolving
-  `emitter_core` and splitting the long functions listed below is #1818.
+  and monomorph form one strongly connected component (`make arch-report`,
+  "Import cycles"), around `emitter_core`'s `EmitterState`. No module may
+  join it (`CYCLE_BASELINE` in `tools/ritz1_arch.py`, checked by the gate).
+  Breaking it, dissolving `emitter_core` and splitting the long functions
+  the report lists is #1818.
 - **Raw IR text** — the emitter writes IR as string fragments and re-parses
   its own output in post-passes (`ll_copy_scan`). A typed IR builder is #1817.
 - **Duplicated type tables** — several type→LLVM/size/sign ladders; one
@@ -200,104 +264,3 @@ Tracked under AGAST #1812 (M1.3). The measurements below show its shape.
 - **C idioms** — `i32` flags for bool, `*u8`+length for names, kind codes
   as ints. #1820.
 - **Grammar** — special-cased assignment forms and parser shape; #1819.
-
-## Measurements
-
-<!-- BEGIN generated by tools/ritz1_arch.py -->
-
-`ritz1/src/` has **51** modules, **83222** lines (**62050** code lines, excluding blanks and comments), **2825** functions and **324** local import edges. 3 modules (11398 lines) are generated by ritzgen: `lexer_scan_gen`, `parser_gen`, `tokens_gen`.
-
-### Modules in dependency order
-
-Every module appears after all the modules it imports (modules in a cycle are adjacent). `(gen)` marks generated modules.
-
-| Module | Imported by | Lines | Code | Local imports |
-|---|--:|--:|--:|---|
-| `fn_cache` | 1 | 1086 | 724 | — |
-| `ll_copy_scan` | 2 | 143 | 107 | — |
-| `sha256` | 1 | 192 | 175 | — |
-| `tokens_gen` (gen) | 12 | 153 | 123 | — |
-| `ast` | 44 | 967 | 500 | tokens_gen |
-| `diag` | 10 | 84 | 36 | ast |
-| `lexer_scan_gen` (gen) | 1 | 273 | 253 | tokens_gen |
-| `lexer_nfa` | 4 | 993 | 661 | lexer_scan_gen, tokens_gen |
-| `ast_helpers` | 39 | 7884 | 5635 | ast, diag, lexer_nfa, tokens_gen |
-| `parser_gen` (gen) | 2 | 10972 | 8891 | ast, ast_helpers, tokens_gen |
-| `interp` | 1 | 142 | 92 | ast, ast_helpers, lexer_nfa, parser_gen, tokens_gen |
-| `struct_index` | 5 | 249 | 180 | ast, diag |
-| `binder_check` | 4 | 401 | 303 | ast, ast_helpers, emitter_core |
-| `bool_check` | 11 | 1485 | 1251 | ast, ast_helpers, diag, emitter_core, index_through, sema, sema_type |
-| `bool_kind` | 7 | 321 | 266 | ast, ast_helpers, bool_check, emitter_core, emitter_expr_call, index_through |
-| `deref_field` | 6 | 924 | 745 | ast, ast_helpers, emitter_core, emitter_expr_call, ref_check, struct_index |
-| `emitter_asm` | 2 | 529 | 433 | ast, ast_helpers, emitter_core |
-| `emitter_core` | 36 | 6553 | 4315 | ast, ast_helpers, deref_field, index_through, ownership, ref_check, tokens_gen |
-| `emitter_expr` | 10 | 2937 | 2215 | ast, ast_helpers, bool_check, bool_kind, emitter_core, emitter_expr_access, emitter_expr_arith, emitter_expr_call, emitter_match, emitter_stmt, float_slot, index_through, literal_slot, ownership, ref_check, sema_probe, struct_index, tokens_gen |
-| `emitter_expr_access` | 4 | 2011 | 1595 | ast, ast_helpers, deref_field, emitter_core, emitter_expr, emitter_expr_arith, index_through, ref_check |
-| `emitter_expr_arith` | 4 | 2293 | 1768 | ast, ast_helpers, emitter_core, emitter_expr, emitter_expr_access, emitter_expr_call, emitter_stmt, index_through, literal_slot, narrowing, ownership, ref_check |
-| `emitter_expr_call` | 9 | 7230 | 5539 | ast, ast_helpers, binder_check, emitter_core, emitter_expr, emitter_expr_access, emitter_expr_arith, emitter_print, emitter_stmt, float_slot, index_through, literal_slot, monomorph, narrowing, ownership |
-| `emitter_match` | 2 | 2591 | 1896 | ast, ast_helpers, bool_check, bool_kind, deref_field, emitter_core, emitter_expr, emitter_expr_access, emitter_expr_call, emitter_print, emitter_stmt, float_slot, monomorph, narrowing, ownership, tokens_gen |
-| `emitter_print` | 4 | 1185 | 984 | ast, ast_helpers, bool_check, bool_kind, emitter_core, emitter_expr, emitter_expr_call, interp, lexer_nfa |
-| `emitter_stmt` | 6 | 7145 | 5228 | ast, ast_helpers, binder_check, bool_check, bool_kind, deref_field, emitter_asm, emitter_core, emitter_expr, emitter_expr_arith, emitter_expr_call, emitter_match, emitter_print, float_slot, index_through, literal_slot, narrowing, ownership, ref_check, tail_value, tokens_gen |
-| `float_slot` | 4 | 118 | 75 | ast, ast_helpers, bool_check, bool_kind, diag, emitter_core, narrowing |
-| `index_through` | 13 | 670 | 479 | ast, ast_helpers, emitter_core, emitter_expr, struct_index |
-| `let_check` | 2 | 1144 | 879 | ast, ast_helpers, bool_check, emitter_core, emitter_expr, index_through, sema, sema_type |
-| `literal_slot` | 5 | 495 | 399 | ast, ast_helpers, bool_kind, emitter_core, index_through, narrowing |
-| `monomorph` | 4 | 4713 | 3377 | ast, ast_helpers, diag, emitter_core, struct_index |
-| `narrowing` | 9 | 760 | 566 | ast, ast_helpers, emitter_core, sema, sema_type |
-| `ownership` | 8 | 3817 | 3024 | ast, ast_helpers, emitter_core, emitter_expr, emitter_expr_call, emitter_stmt, index_through, ll_copy_scan, ref_check |
-| `ref_check` | 8 | 2482 | 1957 | ast, ast_helpers, deref_field, emitter_core, emitter_expr_call, index_through, let_check, ownership |
-| `sema` | 15 | 444 | 305 | ast, ast_helpers, diag, emitter_core |
-| `sema_probe` | 3 | 184 | 133 | ast, ast_helpers, bool_check, bool_kind, emitter_core, sema, sema_type |
-| `sema_type` | 10 | 222 | 166 | ast, ast_helpers, emitter_core, sema |
-| `tail_value` | 3 | 285 | 180 | ast, ast_helpers, emitter_core, sema |
-| `call_check` | 1 | 823 | 615 | ast, ast_helpers, bool_check, diag, emitter_core, index_through, sema, sema_type |
-| `enum_as_int` | 1 | 444 | 319 | ast, ast_helpers, bool_check, emitter_core, narrowing, sema, sema_type |
-| `field_slot` | 1 | 87 | 58 | ast, ast_helpers, emitter_core, sema, sema_type |
-| `float_compare` | 1 | 56 | 29 | ast, diag, emitter_core, sema, sema_type |
-| `frame_limit` | 1 | 292 | 239 | ast, diag, emitter_core |
-| `emitter` | 1 | 3838 | 2735 | ast, ast_helpers, deref_field, emitter_asm, emitter_core, emitter_expr, emitter_print, emitter_stmt, frame_limit, literal_slot, ll_copy_scan, narrowing, ownership, ref_check, tokens_gen |
-| `generic_infer` | 1 | 1200 | 991 | ast, ast_helpers, diag, monomorph |
-| `generic_method` | 1 | 74 | 46 | ast, ast_helpers, emitter_core, sema |
-| `must_use` | 1 | 44 | 17 | ast, ast_helpers, emitter_core, sema |
-| `pass_value` | 1 | 118 | 78 | ast, ast_helpers, emitter_core, sema |
-| `reachability` | 1 | 202 | 139 | ast, ast_helpers, binder_check, emitter_core, tail_value |
-| `sema_index_store` | 1 | 187 | 115 | ast, ast_helpers, emitter_core, sema, sema_type |
-| `sema_walk` | 1 | 326 | 263 | ast, ast_helpers, bool_check, call_check, emitter_core, enum_as_int, field_slot, float_compare, generic_method, let_check, must_use, narrowing, pass_value, sema, sema_index_store, sema_probe, sema_type, tail_value |
-| `main` | 0 | 1454 | 951 | ast, ast_helpers, binder_check, emitter, fn_cache, generic_infer, lexer_nfa, monomorph, parser_gen, reachability, sema_probe, sema_walk, sha256, struct_index, tokens_gen |
-
-### Import cycles
-
-1 import cycle (strongly connected components of more than one module):
-
-- 25 modules: `binder_check` ↔ `bool_check` ↔ `bool_kind` ↔ `deref_field` ↔ `emitter_asm` ↔ `emitter_core` ↔ `emitter_expr` ↔ `emitter_expr_access` ↔ `emitter_expr_arith` ↔ `emitter_expr_call` ↔ `emitter_match` ↔ `emitter_print` ↔ `emitter_stmt` ↔ `float_slot` ↔ `index_through` ↔ `let_check` ↔ `literal_slot` ↔ `monomorph` ↔ `narrowing` ↔ `ownership` ↔ `ref_check` ↔ `sema` ↔ `sema_probe` ↔ `sema_type` ↔ `tail_value`
-
-### ritzlib modules imported
-
-15 ritzlib modules, each with the number of ritz1 modules importing it: `fmt` (1), `gvec` (10), `hash` (5), `hashmap` (6), `io` (37), `json` (1), `memory` (17), `option` (2), `os.env` (2), `result` (1), `span` (1), `str` (12), `string` (4), `strview` (2), `sys` (41).
-
-### Long functions
-
-18 functions longer than 300 code lines:
-
-| Function | Module:line | Code lines |
-|---|---|--:|
-| `emit_var_decl_at` | `emitter_stmt:1228` | 774 |
-| `emit_stmt_inner` | `emitter_stmt:6066` | 772 |
-| `emit_expr_call` | `emitter_expr_call:4230` | 743 |
-| `emit_expr_index` | `emitter_expr_access:798` | 730 |
-| `emit_expr_method` | `emitter_expr_call:6138` | 705 |
-| `parse_primary_expr` | `parser_gen:9396` | 674 |
-| `parse_assign_stmt` | `parser_gen:6721` | 635 |
-| `emit_assign` | `emitter_stmt:2558` | 535 |
-| `emit_member_ptr_at` | `emitter_expr:485` | 418 |
-| `parse_type_spec` | `parser_gen:2998` | 396 |
-| `parse_postfix_op` | `parser_gen:8871` | 380 |
-| `parse_let_stmt` | `parser_gen:5054` | 369 |
-| `parse_global_var_def` | `parser_gen:2467` | 366 |
-| `parse_impl_block` | `parser_gen:10556` | 358 |
-| `emit_lvalue_ptr` | `emitter_expr_arith:1574` | 354 |
-| `emit_for_iterable` | `emitter_stmt:4038` | 354 |
-| `emit_expr_binary` | `emitter_expr_arith:224` | 347 |
-| `parse_fn_def` | `parser_gen:1139` | 335 |
-
-<!-- END generated by tools/ritz1_arch.py -->
