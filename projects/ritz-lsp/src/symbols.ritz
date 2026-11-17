@@ -12,9 +12,11 @@
 # in an `impl` are indented).  Ritz has no block comments and no multi-line
 # string literals, so a `fn` that starts a line is never inside either.
 #
-# Positions are 0-based (line, column).  Columns count bytes, which match
-# LSP's UTF-16 columns on ASCII lines; a line with multi-byte characters
-# before the name is off by their extra bytes.
+# Positions are 0-based.  LSP's `character` counts UTF-16 code units (the
+# encoding every server must support; ritz-lsp offers no other), while the
+# text is UTF-8 and the code here works in byte offsets.  doc_offset turns an
+# incoming position into a byte offset and push_word_range turns a byte range
+# back into LSP positions (#3885).
 
 import ritzlib.sys
 import ritzlib.str
@@ -61,14 +63,65 @@ pub fn line_end(text: *u8, len: i64, start: i64) -> i64
         i += 1
     i
 
-# Offset of (line, col), or -1 if that is not a byte on that line.
-pub fn doc_offset(text: *u8, len: i64, line: i64, col: i64) -> i64
+# UTF-16 code units taken by the character whose UTF-8 encoding starts with
+# byte `c`: 2 for a 4-byte sequence (a surrogate pair), 1 for any other lead
+# byte, 0 for a continuation byte (it is part of a character already counted).
+fn utf16_units(c: u8) -> i64
+    if (c & 0xC0) == 0x80
+        return 0
+    if c >= 0xF0
+        return 2
+    1
+
+# The UTF-16 column of byte offset `off` on the line starting at `start`.
+fn utf16_col(text: *u8, start: i64, off: i64) -> i64
+    var n: i64 = 0
+    var i: i64 = start
+    while i < off
+        n += utf16_units(*(text + i))
+        i += 1
+    n
+
+# Offset of the character at LSP position (line, character), where character
+# counts UTF-16 code units, or -1 if no character on that line is there.  A
+# position inside a surrogate pair gives that character's first byte.
+pub fn doc_offset(text: *u8, len: i64, line: i64, character: i64) -> i64
+    let start: i64 = line_start(text, len, line)
+    if start < 0 or character < 0
+        return -1
+    let end: i64 = line_end(text, len, start)
+    var units: i64 = 0
+    var i: i64 = start
+    while i < end
+        let n: i64 = utf16_units(*(text + i))
+        if n > 0
+            if character < units + n
+                return i
+            units += n
+        i += 1
+    -1
+
+# Offset of byte column `col` on `line`, or -1 if that is not a byte on that
+# line.  (ritz1's columns count bytes.)
+pub fn byte_offset(text: *u8, len: i64, line: i64, col: i64) -> i64
     let start: i64 = line_start(text, len, line)
     if start < 0 or col < 0
         return -1
     if start + col >= line_end(text, len, start)
         return -1
     start + col
+
+# The LSP character (UTF-16 column) of byte column `col` on `line`.  Bytes
+# past the end of the line, or the whole column on a line past the end of the
+# text, count one unit each, so an out-of-range position stays out of range.
+pub fn lsp_char(text: *u8, len: i64, line: i64, col: i64) -> i64
+    let start: i64 = line_start(text, len, line)
+    if start < 0
+        return col
+    let end: i64 = line_end(text, len, start)
+    if start + col <= end
+        return utf16_col(text, start, start + col)
+    utf16_col(text, start, end) + start + col - end
 
 # The line holding offset `off` (0-based).
 fn line_of(text: *u8, off: i64) -> i64
@@ -111,10 +164,14 @@ struct Word
 fn no_word() -> Word
     Word { start: -1, end: -1 }
 
-# The identifier covering (line, col), or no_word() if that byte is not part
-# of an identifier in code.
-pub fn word_at(text: *u8, len: i64, line: i64, col: i64) -> Word
-    let off: i64 = doc_offset(text, len, line, col)
+# The identifier covering LSP position (line, character), or no_word() if the
+# character there is not part of an identifier in code.
+pub fn word_at(text: *u8, len: i64, line: i64, character: i64) -> Word
+    word_at_offset(text, len, line, doc_offset(text, len, line, character))
+
+# The identifier covering byte offset `off` on `line`, or no_word() if that
+# byte is not part of an identifier in code (or `off` is -1).
+pub fn word_at_offset(text: *u8, len: i64, line: i64, off: i64) -> Word
     if off < 0 or not is_ident_char(*(text + off))
         return no_word()
     var s: i64 = off
@@ -413,12 +470,12 @@ pub fn push_range(buf: *Vec<u8>, l0: i64, c0: i64, l1: i64, c1: i64)
     vec_push<u8>(buf, '}')
 
 # The range of word `w` in `text`.  The word lies on one line.  This is the
-# only place a byte offset becomes an LSP position (#3885 converts columns
-# here).
+# only place a byte offset in symbols.ritz becomes an LSP position, so the
+# only place its columns turn from bytes into UTF-16 units (#3885).
 fn push_word_range(buf: *Vec<u8>, text: *u8, w: Word)
     let line: i64 = line_of(text, w.start)
-    let col: i64 = w.start - line_start(text, w.end, line)
-    push_range(buf, line, col, line, col + w.end - w.start)
+    let start: i64 = line_start(text, w.end, line)
+    push_range(buf, line, utf16_col(text, start, w.start), line, utf16_col(text, start, w.end))
 
 # `{"uri":...,"range":...}`: the Location of word `w` in `text`, the file `uri`.
 fn push_location(buf: *Vec<u8>, uri: *u8, text: *u8, w: Word)

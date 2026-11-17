@@ -15,6 +15,8 @@
 #   answer and the default lookup next to the monorepo's ritz1.
 # - A ritz1 that hangs is killed at the deadline, reaped, reported as one
 #   "timed out" warning, and the server goes on answering (#3883).
+# - Positions are UTF-16 code units both ways: hover, definition and a
+#   diagnostic after é, € and 😀 (a surrogate pair) on the same line (#3885).
 set -u
 cd "$(dirname "$0")"
 BIN=build/debug/ritz-lsp
@@ -65,7 +67,8 @@ for args in (["--bogus"], ["foo"], ["--stdio", "--bogus"]):
     check(f"{name} prints usage on stderr", "Usage: ritz-lsp" in err, repr(err[:80]))
 
 def frame(obj):
-    b = json.dumps(obj).encode()
+    # Raw UTF-8, as editors send it: ritzlib.json does not decode \uXXXX (#3914).
+    b = json.dumps(obj, ensure_ascii=False).encode()
     return b"Content-Length: %d\r\n\r\n%s" % (len(b), b)
 
 def session(msgs, argv=(), env=None, cwd=None):
@@ -297,6 +300,63 @@ check("import: a non-file document still resolves ritzlib",
       res(15) == str_loc, repr(r.get(15)))
 check("import: clean exit", rc == 0, f"exit {rc}")
 
+# --- positions are UTF-16 code units (#3885) --------------------------------
+# LSP's `character` counts UTF-16 code units; the server works in bytes. A line
+# with é (2 bytes, 1 unit), € (3 bytes, 1 unit) and 😀 (4 bytes, a surrogate
+# pair: 2 units) before a name puts it 9 bytes but 4 units further along.
+# The server must not claim another encoding, even when the client offers one.
+def u16(s):
+    return len(s.encode("utf-16-le")) // 2
+MB = "é€😀"
+uuri = "file:///tmp/t3885.ritz"
+usrc = ("fn helper() -> i32\n"                                   # 0
+        "    0\n"                                                # 1
+        "fn main() -> i32\n"                                     # 2
+        f"    later(c\"{MB}\") + helper() + later(c\"{MB}{MB}\")\n"  # 3
+        "fn later(s: *u8) -> i32\n"                              # 4
+        "    1\n")                                               # 5
+UL3 = usrc.splitlines()[3]
+hc = u16(UL3[:UL3.index("helper")])   # helper's first unit
+sc = u16(UL3[:UL3.rindex("later")])   # the second later, after 3 runs
+check("utf-16: test line really differs in bytes and units",
+      len(UL3[:UL3.index("helper")].encode()) - hc == 5, repr(hc))
+ureqs = [
+    req(2, "textDocument/hover", uuri, 3, hc),
+    req(3, "textDocument/definition", uuri, 3, hc + 2),   # inside helper
+    req(4, "textDocument/hover", uuri, 3, hc + 6),        # `(` just past it
+    req(5, "textDocument/hover", uuri, 3, sc + 2),
+    req(6, "textDocument/definition", uuri, 3, u16(UL3) + 3),  # past the line
+]
+init_utf8 = {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+             "params": {"processId": None, "rootUri": None,
+                        "capabilities": {"general": {"positionEncodings": ["utf-8", "utf-16"]}}}}
+p = subprocess.run([BIN], input=b"".join(map(frame, [
+        init_utf8, {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        did_open(uuri, usrc), *ureqs,
+        {"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
+        {"jsonrpc": "2.0", "method": "exit"}])), capture_output=True, timeout=20, env=NO_RITZ1)
+out = [json.loads(p.stdout[m.end():m.end() + int(m.group(1))])
+       for m in re.finditer(rb"Content-Length: (\d+)\r\n\r\n", p.stdout)]
+r = by_id(out)
+caps = r.get(1, {}).get("result", {}).get("capabilities") or {}
+check("utf-16: a client offering utf-8 still gets utf-16 positions",
+      caps.get("positionEncoding", "utf-16") == "utf-16", repr(caps))
+h = r.get(2, {}).get("result") or {}
+check("utf-16: hover after é€😀 finds the name at that unit",
+      h.get("contents", {}).get("value") == "```ritz\nfn helper() -> i32\n```", repr(r.get(2)))
+check("utf-16: hover range after é€😀 is in units",
+      h.get("range") == rng(3, hc, 3, hc + 6), repr(h))
+check("utf-16: definition from inside the name",
+      r.get(3, {}).get("result") == {"uri": uuri, "range": rng(0, 3, 0, 9)}, repr(r.get(3)))
+check("utf-16: hover just past the name -> null",
+      4 in r and "error" not in r[4] and r[4].get("result") is None, repr(r.get(4)))
+h = r.get(5, {}).get("result") or {}
+check("utf-16: hover after two runs of é€😀, range in units",
+      h.get("contents", {}).get("value") == "```ritz\nfn later(s: *u8) -> i32\n```"
+      and h.get("range") == rng(3, sc, 3, sc + 5), repr(r.get(5)))
+check("utf-16: a position past the end of the line -> null",
+      6 in r and "error" not in r[6] and r[6].get("result") is None, repr(r.get(6)))
+
 # --- diagnostics from a stub ritz1 -----------------------------------------
 # The stub prints, to stderr, every `#! <line>` in its input with {in}
 # replaced by the input path it was given, and exits with the code on a
@@ -381,6 +441,21 @@ check("stub: -o goes to a scratch file", len(first) >= 3 and first[1] == "-o"
 check("stub: -I puts the document's directory on the import path",
       "-I" in first and str(docdir) in first[first.index("-I") + 1].split(":")[0], repr(first))
 check("stub: nothing written next to the document", sorted(os.listdir(docdir)) == [], repr(os.listdir(docdir)))
+
+# ritz1 reports byte columns; the diagnostic's are UTF-16 units (#3885).
+# Line 2 below has é€😀 before `nope` (9 bytes, 4 units); the stub reports
+# the byte column, computed here rather than hand-counted.
+mb_line = f"    f(c\"{MB}\", nope(1))"
+mb_byte_col = len(mb_line[:mb_line.index("nope")].encode()) + 1
+mb_u16 = u16(mb_line[:mb_line.index("nope")])
+mb_doc = (f"#! {{in}}:2:{mb_byte_col}: error: Unknown function: nope\n" + mb_line + "\n"
+          f"#! {{in}}:2:{len(mb_line.encode()) + 3}: error: past the line end\n#exit 1\n")
+rc, out = session([did_open(duri, mb_doc, 1)], env=STUB)
+got = ((diags(out) or [{}])[0].get("diagnostics") or []) + [{}, {}]
+check("stub: a byte column after é€😀 becomes a UTF-16 range over the name",
+      got[0].get("range") == rng(1, mb_u16, 1, mb_u16 + 4), repr(got[0]))
+check("stub: a byte column past the line end stays past it, in units",
+      got[1].get("range", {}).get("start") == {"line": 1, "character": u16(mb_line) + 2}, repr(got[1]))
 
 # --- a ritz1 that hangs (#3883) ---------------------------------------------
 # The stub records its pid and sleeps, holding stderr open. The server must
@@ -479,6 +554,15 @@ if REAL_RITZ1.is_file():
           and "nope" in got[0].get("message", ""), repr(d[0]))
     check("ritz1: ritzlib imports resolve with no RITZ_PATH set",
           d[1].get("diagnostics") == [], repr(d[1]))
+    # ritz1's byte column becomes UTF-16 units after é€😀 (#3885).
+    mb_src = f'import ritzlib.str\n\nfn main() -> i32\n    (strlen(c"{MB}") + nope(1)) as i32\n'
+    mb_l3 = mb_src.splitlines()[3]
+    mc = u16(mb_l3[:mb_l3.index("nope")])
+    rc, out = session([did_open(ruri, mb_src, 1)], env=env, cwd=str(scratch))
+    got = (diags(out) or [{}])[0].get("diagnostics") or [{}]
+    check("ritz1: an error after é€😀 is at its UTF-16 column",
+          len(got) == 1 and got[0].get("range") == rng(3, mc, 3, mc + 4)
+          and "nope" in got[0].get("message", ""), repr(got))
 else:
     print(f"skip: real ritz1 not built ({REAL_RITZ1}); make -C projects/ritz ritz1")
 

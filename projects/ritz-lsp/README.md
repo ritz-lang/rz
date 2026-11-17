@@ -141,7 +141,7 @@ a `RITZ_PATH` entry needs it in the editor's environment.
 The compile runs on the request loop, so it has a deadline (#3883): a ritz1
 still running after 5 seconds (`COMPILE_DEADLINE_SECS`) is killed and the
 document gets one warning that the check timed out. Every open/change still
-compiles in turn; only the latest of a burst would be enough (#3902). Columns are bytes, which equal LSP's UTF-16 columns on ASCII lines.
+compiles in turn; only the latest of a burst would be enough (#3902). Positions are LSP's UTF-16 code units: ritz1's byte columns, and the byte offsets hover and definition work in, are converted both ways (#3885). ritz-lsp offers no other `positionEncoding`.
 
 ## Hover and go-to-definition
 
