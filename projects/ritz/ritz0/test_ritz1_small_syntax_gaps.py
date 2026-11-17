@@ -288,6 +288,127 @@ fn main() -> i32
     ),
 }
 
+# --- AGAST #3803: slicing a Vec / String held in a struct field ------------------
+#
+# ritz1 rewrote `v[lo..hi]` into `v.slice(lo, hi)` only for a local `v`, so
+# `h.v[2..4]` stayed an index and was refused: "this can't be sliced".  Each row
+# is a separate receiver shape the rewrite resolves, in range (`h.v[2..4]`) and
+# colon (`h.v[2:]`, #3766) syntax; `h.v[:]` already lowered to a method call
+# and guards that path.
+
+MEMBER_SLICE_PRELUDE = """\
+import ritzlib.memory
+import ritzlib.gvec
+
+struct H
+    v: Vec<i64>
+
+struct O
+    h: H
+
+fn make() -> Vec<i64>
+    var v: Vec<i64> = vec_new<i64>()
+    for i in 0..6
+        v.push(i * 10)
+    return v
+
+"""
+
+MEMBER_SLICE = {
+    # The ticket's repro: the slice is a method receiver and an index base.
+    # 2 * 100 + 20.
+    "member_range_chain": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var h: H = H { v: make() }
+    return (h.v[2..4].len() * 100 + h.v[2..4][0]) as i32
+""",
+        220,
+    ),
+    # Into an annotated local, through two members, inclusive: 1..=3 is 3
+    # elements, the last 30.  3 * 10 + 30.
+    "nested_member_range_decl": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var o: O = O { h: H { v: make() } }
+    var s: Vec<i64> = o.h.v[1..=3]
+    return (s.len() * 10 + s[2]) as i32
+""",
+        60,
+    ),
+    # A String field: string_slice, a copy.  The length is `data.len`.
+    # "abcdef"[1..4] is "bcd": 3 * 10 + 'd' (100).
+    "string_member_range": (
+        """\
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.string
+
+struct N
+    s: String
+
+fn main() -> i32
+    var n: N = N { s: string_from("abcdef") }
+    var t: String = n.s[1..4]
+    return (t.data.len * 10) as i32 + (*(t.data.data + 2) as i32)
+""",
+        130,
+    ),
+    # A Span field with no ritzlib.span: the view built in place, so a write
+    # through `t` lands in `a`.  2 * 10 + 7 + 30.
+    "span_member_range_view": (
+        """\
+struct G
+    s: Span<i32>
+
+fn main() -> i32
+    var a: [4]i32 = [10, 20, 30, 40]
+    var g: G
+    g.s = Span<i32> { ptr: @a[0], len: 4 }
+    var t: Span<i32> = g.s[1..3]
+    t[0] = 7
+    return (t.len * 10) as i32 + a[1] + t[1]
+""",
+        57,
+    ),
+    # The ticket's colon shape, open end: the field's own length bounds it.
+    # [20, 30, 40, 50]: 4 * 10 + 20.
+    "member_colon_open_end_chain": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var h: H = H { v: make() }
+    return (h.v[2:].len() * 10 + h.v[2:][0]) as i32
+""",
+        60,
+    ),
+    # Closed colon slice through two members: [10, 20], 2 * 10 + 20.
+    "nested_member_colon_closed": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var o: O = O { h: H { v: make() } }
+    var s: Vec<i64> = o.h.v[1:3]
+    return (s.len() * 10 + s[1]) as i32
+""",
+        40,
+    ),
+    # The colon form: a copy, so a push leaves the field alone.  7 * 10 + 6.
+    "member_colon_full": (
+        MEMBER_SLICE_PRELUDE
+        + """\
+fn main() -> i32
+    var h: H = H { v: make() }
+    var s: Vec<i64> = h.v[:]
+    s.push(99)
+    return (s.len() * 10 + h.v.len()) as i32
+""",
+        76,
+    ),
+}
+
 PROGRAMS = {
     **EMPTY_ARRAY,
     **REF_TYPE_ARG,
@@ -381,6 +502,64 @@ def test_ritz1_full_slice(ritz1_bin, tmp_path, name):
 def test_ritz1_colon_slice(ritz1_bin, tmp_path, name):
     """`a[lo:hi]`, `a[:hi]` and `a[lo:]` died with `unexpected ':'`."""
     _check(_run("ritz1", tmp_path, name), name)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(MEMBER_SLICE))
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+def test_member_slice(request, tmp_path, compiler, name):
+    """AGAST #3803: `h.v[2..4]` was "this can't be sliced" under ritz1."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    program, want = MEMBER_SLICE[name]
+    code = _run_pkg(compiler, tmp_path, name, program)
+    assert code == want, f"{compiler} {name}: exit {code}, want {want}"
+
+
+# A field holding a POINTER to a Vec is left alone by #3803's rewrite: ritz1
+# refuses it, located.  ritz0 crashes on it (an llvmlite arg-type error), so
+# there's no oracle yet.  Both should slice through it as they do for a pointer
+# local (R9 rule 2); when they do, this becomes a MEMBER_SLICE row.
+POINTER_FIELD_SLICE = """\
+import ritzlib.memory
+import ritzlib.gvec
+
+struct P
+    p: *Vec<i64>
+
+fn main() -> i32
+    var v: Vec<i64> = vec_new<i64>()
+    v.push(1)
+    var h: P = P { p: @v }
+    var s: Vec<i64> = h.p[0..1]
+    return s.len() as i32
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+def test_pointer_field_range_refused(ritz1_bin, tmp_path, compiler):
+    src = tmp_path / "main.ritz"
+    src.write_text(POINTER_FIELD_SLICE)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    comp = subprocess.run(
+        [
+            str(RITZ1_BIN.parent / compiler),
+            str(src),
+            "-o",
+            str(tmp_path / "main.ll"),
+            "-I",
+            str(RITZ_ROOT),
+        ],
+        cwd=tmp_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted it:\n{out}"
+    assert "main.ritz:11:23: a pointer can't be sliced" in out, out
 
 
 @pytest.mark.integration

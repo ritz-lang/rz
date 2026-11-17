@@ -1968,7 +1968,8 @@ fn rewrite_struct_index_stmt(m: *Module, s: *Stmt)
     collect_from_expr(m, key)
 
 # AGAST #2451: `v[lo..hi]` on a Vec, Span or String local (the value, not a
-# pointer to one) is rewritten in place into `v.slice(lo, hi)`, ritz0's lowering
+# pointer to one), or on a field holding one by value (`h.v[lo..hi]`, AGAST
+# #3803), is rewritten in place into `v.slice(lo, hi)`, ritz0's lowering
 # (_emit_slice): vec_slice<T> and string_slice copy, span_slice is a view.  It
 # was a bare address in an i64, so `t[1]` indexed bytes and `t.len` had no
 # struct.  As a method call, monomorph instantiates vec_slice$T / span_slice$T
@@ -1985,20 +1986,42 @@ fn rewrite_value_slice(m: *Module, e: *Expr)
     var base: *Expr = e.left
     if base != null and base.kind == EXPR_UNARY and base.op == OP_DEREF
         base = base.operand
-    if base == null or base.kind != EXPR_IDENT
+    if base == null
         return
-    let idx: i32 = find_local_var_idx(base.ident_ptr, base.ident_len)
-    if idx < 0
-        return
-    let by_value: i32 = *(g_lv_by_value + idx)
-    if by_value == 0 or (base != e.left and by_value != 2)
-        return
-    if *(g_lv_prefix_kind + idx) == 0
-        if buf_eq(*(g_lv_type_names + idx), *(g_lv_type_name_lens + idx), c"String", 6) == 0
+    # The receiver's collection kind (0 = String, 1 = Vec, 2 = Span) and its
+    # `$T` suffix, from a tracked local or from the field a member chain names.
+    var kind: i32 = 0
+    var suf: *u8 = null
+    var suf_len: i32 = 0
+    if base.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(base.ident_ptr, base.ident_len)
+        if idx < 0
             return
+        let by_value: i32 = *(g_lv_by_value + idx)
+        if by_value == 0 or (base != e.left and by_value != 2)
+            return
+        kind = *(g_lv_prefix_kind + idx)
+        suf = *(g_lv_suffixes + idx)
+        suf_len = *(g_lv_suffix_lens + idx)
+        if kind == 0
+            if buf_eq(*(g_lv_type_names + idx), *(g_lv_type_name_lens + idx), c"String", 6) == 0
+                return
+    else if base.kind == EXPR_MEMBER and base == e.left
+        # AGAST #3803: `h.v[lo..hi]` on a field holding a Vec, Span or String
+        # by value is `h.v.slice(lo, hi)`, as `h.v[:]` already was.  A field
+        # holding a pointer to one is left to the emitter, which refuses it.
+        let fld: *StructField = resolve_member_field(m, base)
+        if fld == null or fld.field_type != TYPE_STRUCT
+            return
+        kind = classify_collection_type(fld.field_type_name, fld.field_type_name_len, @suf, @suf_len)
+        if kind == 0
+            if buf_eq(fld.field_type_name, fld.field_type_name_len, c"String", 6) == 0
+                return
+    else
+        return
     let rng: *Expr = e.right
     let lo: *Expr = rng.left
-    if *(g_lv_prefix_kind + idx) == 2 and find_generic_function(m, c"span_slice", 10) == null
+    if kind == 2 and find_generic_function(m, c"span_slice", 10) == null
         # No ritzlib.span (a Span<u8> needs none): the view itself.  `lo` is
         # read for both fields, so as slice_into_span_slot has it: a call is
         # evaluated once (AGAST #3126: `s[idx()..0].len()` was left an index
@@ -2007,7 +2030,7 @@ fn rewrite_value_slice(m: *Module, e: *Expr)
             si_once_add(lo)
         else if slice_bound_rereadable(lo) == 0
             return
-        span_view_in_place(e, c"ptr", 3, *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
+        span_view_in_place(e, c"ptr", 3, suf, suf_len)
         return
     e.left = base
     lo.next = rng.right
