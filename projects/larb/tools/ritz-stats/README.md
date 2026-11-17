@@ -152,5 +152,5 @@ ritz build
 
 ## See Also
 
-- [ritz-lint](../ritz-lint/) - AI-powered code linter
+- [ritz-lint](../../../ritz/tools/ritz-lint/) - AI-powered code linter
 - [PR_CHECKLIST.md](../../docs/PR_CHECKLIST.md) - PR readiness process

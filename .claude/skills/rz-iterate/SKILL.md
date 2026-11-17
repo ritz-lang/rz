@@ -518,6 +518,32 @@ nothing more than it takes to act on it:
 reap ritz-task-1450 1a2b3c4
 ```
 
+### Gate coverage: what runs before a merge (AGAST #1838)
+
+`.github/workflows/main.yml` is the only workflow, and it runs on push to
+`main`, i.e. **after** the merge. Before the merge, the only check is the gate:
+`make -C projects/ritz ci-local` over main.yml's `build-all` and `bootstrap`
+jobs (room gate and train gate), plus `train.sh pkgs test` on the packages a
+train touches. So:
+
+| main.yml job | before merge | after merge (CI) |
+|---|---|---|
+| `build-all` (`./rz build --all`) | yes (#2141) | yes |
+| `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
+| `test-all` (`./rz test --all`) | **no**: only touched packages, train gate | yes |
+
+A test-all failure in a package the train didn't touch reaches `main`
+unseen, and CI finds it afterwards. pr.yml (a pull_request workflow that
+never fired, since nothing lands by PR) and the advisory `lint-all` job were
+deleted. ritz-lint is a local pre-commit hook
+(`projects/ritz/tools/ritz-lint/install-hook.sh`).
+
+Cost measured on bangerang (28 cores, room CPU weight, 2026-11-17):
+`./rz build --all` cold cache 16 s; `./rz test --all` cold 23 s and warm
+8 s. The figure above for omegalisk under a running gate was 142 s.
+Whether to add `test-all` to the gate is Aaron's decision (proposed in the
+#1838 REAP). Until he decides, the table above is the rule.
+
 ### Merge trains (Aaron, 2026-11-12)
 
 Every REAP is one squashed commit that its room already gated on its own

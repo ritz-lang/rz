@@ -357,7 +357,7 @@ def test_gate_runner_runs_build_all_and_bootstrap():
 # AGAST #1907: the gate must see CI's environment, not just CI's commands.
 #
 # #1805's gate passed and CI went red on the same commit: CI's
-# install-toolchain action puts /usr/lib/llvm-21/bin on PATH (so `opt` and
+# setup action (then install-toolchain) puts /usr/lib/llvm-21/bin on PATH (so `opt` and
 # `llvm-as` exist), ci_local dropped that `uses:` step without a trace, and
 # TestIRVerification skipped locally instead of tripping the spawn guard.
 # Step `env:` (RITZ_VERIFY_IR=1) was dropped the same way.
@@ -374,8 +374,12 @@ jobs:
     steps:
       - name: Before toolchain
         run: test "$(command -v opt || true)" != "{bindir}/opt"
-      - name: Install toolchain
-        uses: ./.github/actions/install-toolchain
+      - name: Python (not the toolchain, though its path contains actions/setup)
+        uses: actions/setup-python@v5
+      - name: Still unpinned
+        run: test "$(command -v opt || true)" != "{bindir}/opt"
+      - name: Set up Python, toolchain and ritz0 dependencies
+        uses: ./.github/actions/setup
         with:
           clang-version: ${{{{ env.CLANG_VERSION }}}}
       - name: Sees pinned opt
@@ -403,9 +407,10 @@ def toolchain_wf(tmp_path, monkeypatch):
     return bindir
 
 
-def test_steps_after_install_toolchain_get_the_pinned_bindir(toolchain_wf):
+def test_steps_after_the_setup_action_get_the_pinned_bindir(toolchain_wf):
     steps = {s.name: s for s in ci_local.load_steps()}
     assert steps["Before toolchain"].llvm_bindir is None
+    assert steps["Still unpinned"].llvm_bindir is None
     assert steps["Sees pinned opt"].llvm_bindir == str(toolchain_wf)
 
 

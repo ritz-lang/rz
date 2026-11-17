@@ -2,12 +2,21 @@ name: Main Branch Validation
 on:
   push:
     branches: [main]
-  # AGAST #1327: allow running this workflow against a branch. Nothing in
-  # pr.yml executes the ritz0 pytest suite (`rz test ritz` runs the [[test]]
-  # suites via build.py, not `make test`), so without this the bootstrap
-  # job's unit-test gate can only ever be observed AFTER a merge — the
-  # exact "first execution happens on main" failure mode #1327 removes.
+  # AGAST #1327: allow running this workflow against a branch, so a job can
+  # be observed before a merge rather than only after it.
   workflow_dispatch:
+
+# This is the only workflow (AGAST #1838). Work lands by `git merge --ff-only`
+# on a local machine, never through a pull request, so the pull_request
+# workflow pr.yml never ran (last run 2026-09-04) and was deleted, along with
+# the advisory lint-all job (continue-on-error, and a no-op without the
+# `claude` CLI, i.e. always). ritz-lint is a local pre-commit hook:
+# projects/ritz/tools/ritz-lint/install-hook.sh.
+#
+# What runs BEFORE a merge is the room gate, `make -C projects/ritz ci-local`
+# over this file's build-all and bootstrap jobs (tools/ci_local.py, invoked by
+# .claude/skills/rz-iterate/run-gate.sh). test-all runs only here, after the
+# push to main; see "Gate coverage" in .claude/skills/rz-iterate/SKILL.md.
 
 # CI drives the workspace through `./rz`, the same entry point developers use.
 #
@@ -35,6 +44,7 @@ on:
 # bugs into failures we can file and fix. See RITZ_VERIFY_IR below, which is
 # the durable version of the same idea.
 env:
+  # The one place CI's clang is pinned; .github/actions/setup installs it.
   # Keep in sync with projects/ritz/docs/TOOLCHAIN.md and the local
   # requirement documented there.
   CLANG_VERSION: '21'
@@ -57,18 +67,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install toolchain
-        uses: ./.github/actions/install-toolchain
+      - name: Set up Python, toolchain and ritz0 dependencies
+        uses: ./.github/actions/setup
         with:
           clang-version: ${{ env.CLANG_VERSION }}
-
-      - name: Install ritz0 dependencies
-        run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt -r projects/ritz/requirements-dev.txt
 
       - name: Build workspace
         run: ./rz build --all
@@ -215,18 +217,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install toolchain
-        uses: ./.github/actions/install-toolchain
+      - name: Set up Python, toolchain and ritz0 dependencies
+        uses: ./.github/actions/setup
         with:
           clang-version: ${{ env.CLANG_VERSION }}
-
-      - name: Install ritz0 dependencies
-        run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt -r projects/ritz/requirements-dev.txt
 
       - name: Test workspace
         run: ./rz test --all -j $(nproc)
@@ -259,18 +253,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Install toolchain
-        uses: ./.github/actions/install-toolchain
+      - name: Set up Python, toolchain and ritz0 dependencies
+        uses: ./.github/actions/setup
         with:
           clang-version: ${{ env.CLANG_VERSION }}
-
-      - name: Install ritz0 dependencies
-        run: python -m pip install --upgrade pip -r projects/ritz/requirements.txt -r projects/ritz/requirements-dev.txt
 
       # AGAST #1803. Smoke tier first: "fully broken" in ~2 min instead of
       # ~10 min into this job (a ritz1 that builds but compiles nothing used
@@ -282,13 +268,6 @@ jobs:
 
       # AGAST #1311. Compile every fenced ```ritz block in the language
       # documentation with ritz0, the reference compiler.
-      #
-      # This deliberately does NOT live in the lint-all job. lint-all is
-      # `continue-on-error: true` and no-ops entirely when the `claude` CLI
-      # is absent, which is always, on CI. Putting a real check there would
-      # produce a green tick that asserts nothing — the exact failure mode
-      # this task exists to remove. It gates here, next to the other things
-      # that are allowed to fail the build.
       #
       # Runs before the unit tests because it is ~15s and catches the class
       # of breakage (a doc teaching syntax the compiler rejects) that is
@@ -430,31 +409,3 @@ jobs:
         # and turns a two-year-old codegen bug into a mystery CI break.
         env:
           RITZ_VERIFY_IR: '1'
-
-  # ritz-lint is an AI-assisted reviewer: it shells out to the `claude` CLI and
-  # needs an authenticated subscription. That is not available to CI runners, so
-  # this job is advisory only and must never gate a merge. Run it locally with
-  #   python projects/larb/tools/ritz-lint/ritz_lint.py projects/
-  #
-  # Nothing that must actually pass belongs in this job. The documentation
-  # example checker (AGAST #1311) gates in `bootstrap` for that reason.
-  lint-all:
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-
-      - name: Run ritz-lint on all (advisory)
-        run: |
-          if ! command -v claude >/dev/null 2>&1; then
-            echo "::notice::claude CLI unavailable on CI runners - skipping ritz-lint."
-            exit 0
-          fi
-          if [ -f projects/larb/tools/ritz-lint/ritz_lint.py ]; then
-            python projects/larb/tools/ritz-lint/ritz_lint.py projects/
-          fi

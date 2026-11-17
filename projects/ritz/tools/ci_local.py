@@ -37,15 +37,17 @@ tools tests, harness self-tests, ritz0 unit tests, the bootstrap chain, the
 regression matrix and the differential corpus. It is the job a compiler change
 must not break.
 
-Environment-setup steps (toolchain, pip installs) are skipped by default: they
-are the runner's job, and running them locally would rewrite the developer's
-venv. `--with-setup` includes them. Skipped steps are PRINTED, not silently
+Environment-setup steps are skipped by default: they are the runner's job, and
+running them locally would rewrite the developer's machine or venv. Python,
+the toolchain and the pip installs live in the .github/actions/setup action,
+a `uses:` step, so they never run here; the `run:` steps named "Install test
+tools ..." are skipped unless `--with-setup` is given. Skipped steps are PRINTED, not silently
 dropped -- a runner that quietly omits work is the thing this file exists to
 prevent.
 
 Skipping setup must not skip its EFFECT on the environment (AGAST #1907).
 Each step runs with the workflow/job/step `env:` CI gives it (RITZ_VERIFY_IR=1),
-and, after an install-toolchain step, with /usr/lib/llvm-$CLANG_VERSION/bin
+and, after the .github/actions/setup step, with /usr/lib/llvm-$CLANG_VERSION/bin
 prepended to PATH as that action does -- without it `opt`/`llvm-as` are absent,
 verifier tests skip, and the gate passes what CI fails. A missing bindir fails
 the step rather than running on with whatever toolchain happens to be there.
@@ -124,11 +126,13 @@ DEFAULT_JOB = "bootstrap"
 # build.py's EXIT_SETUP (AGAST #2141).
 EXIT_SETUP = 3
 
-# The composite action that pins clang (AGAST #1308). It is a `uses:` step, so
-# it has no command to run -- but its effect matters: it prepends the
-# versioned LLVM bindir to PATH, which is what puts `opt`/`llvm-as` there.
-# Steps after it in the same job get that PATH here too (AGAST #1907).
-TOOLCHAIN_ACTION = "install-toolchain"
+# The composite setup action, which pins clang (AGAST #1308; one action for
+# every job since #1838). It is a `uses:` step, so it has no command to run --
+# but its effect matters: it prepends the versioned LLVM bindir to PATH, which
+# is what puts `opt`/`llvm-as` there. Steps after it in the same job get that
+# PATH here too (AGAST #1907). Matched exactly: `actions/setup-python@v5`
+# contains "actions/setup" too.
+TOOLCHAIN_ACTION = "./.github/actions/setup"
 LLVM_BINDIR = "/usr/lib/llvm-{version}/bin"
 
 # AGAST #3456: the step whose likely-failing files run first, the step that
@@ -151,7 +155,7 @@ class Step:
         self.workdir = workdir
         # workflow < job < step `env:`, merged as Actions merges them.
         self.env = dict(env or {})
-        # The pinned toolchain's bindir, if an install-toolchain step ran
+        # The pinned toolchain's bindir, if the setup action ran
         # earlier in this job; prepended to PATH when the step runs.
         self.llvm_bindir = llvm_bindir
 
@@ -183,7 +187,7 @@ def load_steps(workflow: Path | None = None) -> list[Step]:
         job_env = {**wf_env, **_env_block(jobspec)}
         bindir = None
         for s in jobspec.get("steps", []) or []:
-            if TOOLCHAIN_ACTION in str(s.get("uses", "")):
+            if str(s.get("uses", "")).rstrip("/") == TOOLCHAIN_ACTION:
                 version = _expand(str((s.get("with") or {}).get("clang-version", "")),
                                   job_env)
                 bindir = LLVM_BINDIR.format(version=version)
@@ -329,7 +333,7 @@ def run_step(step: Step, dry_run: bool = False) -> int:
     print(f"  cwd: {cwd}", flush=True)
     print(f"{'=' * 70}", flush=True)
     if step.llvm_bindir:
-        print(f"  PATH: {step.llvm_bindir} prepended (install-toolchain)", flush=True)
+        print(f"  PATH: {step.llvm_bindir} prepended (.github/actions/setup)", flush=True)
     for k, v in step.env.items():
         print(f"  env: {k}={v}", flush=True)
     if dry_run:

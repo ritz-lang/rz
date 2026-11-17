@@ -36,7 +36,6 @@ NC='\033[0m' # No Color
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-RITZ0="python3 $ROOT_DIR/ritz0/ritz0.py"
 BUILD_DIR="$ROOT_DIR/.regression"
 EXAMPLES_DIR="$ROOT_DIR/examples"
 
@@ -356,7 +355,8 @@ known_failures_file() {
 
 # Args: $1=compiler, $2=example key
 is_known_failure() {
-    local f=$(known_failures_file "$1")
+    local f
+    f=$(known_failures_file "$1")
     [[ -f "$f" ]] || return 1
     grep -qxF "$2" <(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$f")
 }
@@ -417,7 +417,7 @@ mark_stage_ran() {
 # across tiers (and silently overwrote baselines when it collided), so key on
 # the path relative to examples/ with separators flattened.
 example_key() {
-    local rel="${1#$EXAMPLES_DIR/}"
+    local rel="${1#"$EXAMPLES_DIR"/}"
     echo "${rel//\//_}"
 }
 
@@ -445,7 +445,8 @@ compile_with() {
     local compiler="$1"
     local example_dir="$2"
     local output="$3"
-    local example_name=$(basename "$example_dir")
+    local example_name
+    example_name=$(basename "$example_dir")
 
     {
         # Clear the output dir first.  All three stages build into the same
@@ -896,8 +897,9 @@ run_test_script() {
         return 201  # ritz.toml declares no usable name -- NOT a pass
     fi
 
-    local orig_dir=$(pwd)
-    cd "$example_dir"
+    local orig_dir
+    orig_dir=$(pwd)
+    cd "$example_dir" || return 1
 
     # Link EVERY declared binary, not just the first.  04_true_false's test.sh
     # runs `./true` and `./false`; linking only `./true` would leave `./false`
@@ -939,7 +941,7 @@ run_test_script() {
     kill_session "$sid"
 
     for n in "${linked[@]}"; do rm -f "./$n"; done
-    cd "$orig_dir"
+    cd "$orig_dir" || return 1
     return $result
 }
 
@@ -1032,8 +1034,9 @@ compare_runs() {
     local stdout_b="$4"
     local exit_b="$5"
 
-    local code_a=$(cat "$exit_a")
-    local code_b=$(cat "$exit_b")
+    local code_a code_b
+    code_a=$(cat "$exit_a")
+    code_b=$(cat "$exit_b")
 
     # Infrastructure first (see run_binary): a side that could not bind its
     # port never really ran, so no behavioural verdict -- termination, exit
@@ -1435,11 +1438,7 @@ run_stage1() {
     fi
 
     echo ""
-    echo "Stage 1: $passed passed, $failed failed, $skipped skipped"
-    STAGE_RESULTS+=("Stage 1: $passed passed, $failed failed, $skipped skipped")
-    TOTAL_PASSED=$((TOTAL_PASSED + passed))
-    TOTAL_FAILED=$((TOTAL_FAILED + failed))
-    TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped))
+    record_stage_tally "Stage 1" "$passed" "$failed" "$skipped"
 
     return 0
 }
@@ -1451,20 +1450,15 @@ run_stage2() {
     log "STAGE 2: Compile ritz1 with ritz0"
     echo "----------------------------------------"
 
-    local ritz1_dir="$ROOT_DIR/ritz1"
-    local ritz1_bin="$ROOT_DIR/ritz1/build/ritz1"
-
-    # Use the Makefile's approach
-    cd "$ritz1_dir"
-
-    # Build ritz1 using the Makefile (it has its own build/ dir)
-    local make_output
-    make_output=$(make -j"$(sh "$SCRIPT_DIR/ritz1-jobs.sh")" ritz1 2>&1)
-    local make_status=$?
+    # Build ritz1 with its own Makefile, into ritz1/build/ritz1, the path
+    # Stage 3 runs.  (This used to cd into ritz1/ and then `cp build/ritz1`
+    # onto that same path, which only ever failed with "are the same file".)
+    local make_output make_status
+    make_output=$(make -C "$ROOT_DIR/ritz1" -j"$(sh "$SCRIPT_DIR/ritz1-jobs.sh")" ritz1 2>&1)
+    make_status=$?
 
     if [[ $make_status -eq 0 ]]; then
         success "ritz1 compiled with ritz0"
-        cp build/ritz1 "$ritz1_bin"
         STAGE_RESULTS+=("Stage 2: ritz1 compiled successfully")
         TOTAL_PASSED=$((TOTAL_PASSED + 1))
     else
@@ -1474,11 +1468,9 @@ run_stage2() {
         fi
         STAGE_RESULTS+=("Stage 2: FAILED - ritz1 compilation error")
         TOTAL_FAILED=$((TOTAL_FAILED + 1))
-        cd "$ROOT_DIR"
         return 2
     fi
 
-    cd "$ROOT_DIR"
     echo ""
     return 0
 }
@@ -1511,7 +1503,7 @@ injected_selfhosted_reject() {
        "$2" == "$RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT" ]]
 }
 
-# Set by run_differential for its workers.
+# Set by run_compare_stage for its workers.
 DIFF_COMPILER=""
 DIFF_PREFIX=""
 DIFF_LABEL=""
@@ -1574,15 +1566,36 @@ differential_worker() {
     fi
 }
 
-# Run the differential over the corpus, tallying into the caller's
-# passed/failed/skipped.  Args: $1=compiler, $2=file prefix, $3=label
-run_differential() {
-    DIFF_COMPILER="$1" DIFF_PREFIX="$2" DIFF_LABEL="$3"
+# Print a stage's tally and add it to the run's totals and summary.
+# Args: $1=stage label ("Stage 3"), $2=passed, $3=failed, $4=skipped
+record_stage_tally() {
+    echo "$1: $2 passed, $3 failed, $4 skipped"
+    STAGE_RESULTS+=("$1: $2 passed, $3 failed, $4 skipped")
+    TOTAL_PASSED=$((TOTAL_PASSED + $2))
+    TOTAL_FAILED=$((TOTAL_FAILED + $3))
+    TOTAL_SKIPPED=$((TOTAL_SKIPPED + $4))
+}
+
+# Stages 3 and 4 (AGAST #1838: they were the same 55 lines with the compiler
+# swapped).  Run differential_worker over the corpus with <compiler>, mark its
+# accept set as complete for Stage 5, and record the tally.  Each stage's own
+# function keeps only what differs: making sure its compiler exists.
+# scripts/test-regression-compare-stage.sh tests it.
+# Args: $1=stage number, $2=compiler, $3=label for messages
+run_compare_stage() {
+    local stage="$1"
+    DIFF_COMPILER="$2" DIFF_PREFIX="stage$1" DIFF_LABEL="$3"
+    local passed=0 failed=0 skipped=0
     local -a examples
     mapfile -t examples < <(get_examples)
-    local rdir="$BUILD_DIR/results/$2"
+    local rdir="$BUILD_DIR/results/$DIFF_PREFIX"
     run_pool "$rdir" differential_worker "${examples[@]}"
     collect_pool "$rdir"
+    mark_stage_ran "$2"
+
+    echo ""
+    record_stage_tally "Stage $stage" "$passed" "$failed" "$skipped"
+    return 0
 }
 
 # ============================================================================
@@ -1600,21 +1613,7 @@ run_stage3() {
         return 0
     fi
 
-    local passed=0
-    local failed=0
-    local skipped=0
-
-    run_differential ritz1 stage3 "ritz1"
-    mark_stage_ran ritz1
-
-    echo ""
-    echo "Stage 3: $passed passed, $failed failed, $skipped skipped"
-    STAGE_RESULTS+=("Stage 3: $passed passed, $failed failed, $skipped skipped")
-    TOTAL_PASSED=$((TOTAL_PASSED + passed))
-    TOTAL_FAILED=$((TOTAL_FAILED + failed))
-    TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped))
-
-    return 0
+    run_compare_stage 3 ritz1 "ritz1"
 }
 
 # --- Per-stage timing (AGAST #1802) -----------------------------------------
@@ -1681,21 +1680,7 @@ run_stage4() {
         return 0
     fi
 
-    local passed=0
-    local failed=0
-    local skipped=0
-
-    run_differential ritz1_selfhosted stage4 "self-hosted ritz1"
-    mark_stage_ran ritz1_selfhosted
-
-    echo ""
-    echo "Stage 4: $passed passed, $failed failed, $skipped skipped"
-    STAGE_RESULTS+=("Stage 4: $passed passed, $failed failed, $skipped skipped")
-    TOTAL_PASSED=$((TOTAL_PASSED + passed))
-    TOTAL_FAILED=$((TOTAL_FAILED + failed))
-    TOTAL_SKIPPED=$((TOTAL_SKIPPED + skipped))
-
-    return 0
+    run_compare_stage 4 ritz1_selfhosted "self-hosted ritz1"
 }
 
 # ============================================================================
@@ -1808,8 +1793,14 @@ run_stage5() {
 # Sourcers MUST reset BUILD_DIR and clear the EXIT trap installed above; see
 # that test for the pattern.
 if [[ -n "${RITZ_REGRESSION_LIB_ONLY:-}" ]]; then
+    # `return` works when sourced; `exit` covers running it directly.
+    # shellcheck disable=SC2317
     return 0 2>/dev/null || exit 0
 fi
+
+# Every stage runs from projects/ritz.  Stages 3-5 used to get there as a side
+# effect of Stage 2's trailing `cd "$ROOT_DIR"`.
+cd "$ROOT_DIR" || exit 1
 
 echo ""
 echo "🎭 Ritz Regression Test Suite"

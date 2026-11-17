@@ -4,7 +4,11 @@
 #
 # Usage:
 #   cd your-project
-#   $RITZ_PATH/larb/tools/ritz-lint/install-hook.sh
+#   <ritz-lang checkout>/projects/ritz/tools/ritz-lint/install-hook.sh
+#
+# The hook calls the ritz_lint.py that sits next to this script (AGAST #1838:
+# there used to be a second copy under projects/larb, and both installers
+# pointed at that one through $RITZ_PATH).
 #
 
 set -e
@@ -16,16 +20,8 @@ if [ -z "$GIT_ROOT" ]; then
     exit 1
 fi
 
-# Check RITZ_PATH
-if [ -z "$RITZ_PATH" ]; then
-    echo "Error: RITZ_PATH not set"
-    echo "Set it to your ritz-lang directory:"
-    echo "  export RITZ_PATH=~/dev/ritz-lang"
-    exit 1
-fi
-
 HOOK_PATH="$GIT_ROOT/.git/hooks/pre-commit"
-LINT_PATH="$RITZ_PATH/larb/tools/ritz-lint/ritz_lint.py"
+LINT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ritz_lint.py"
 
 # Check if lint script exists
 if [ ! -f "$LINT_PATH" ]; then
@@ -53,13 +49,7 @@ fi
 
 echo "Running ritz-lint on staged files..."
 
-# Check RITZ_PATH
-if [ -z "$RITZ_PATH" ]; then
-    echo "Warning: RITZ_PATH not set, skipping lint"
-    exit 0
-fi
-
-LINT_PATH="$RITZ_PATH/larb/tools/ritz-lint/ritz_lint.py"
+LINT_PATH="@LINT_PATH@"
 
 if [ ! -f "$LINT_PATH" ]; then
     echo "Warning: ritz-lint not found, skipping"
@@ -87,6 +77,9 @@ fi
 echo "Lint passed!"
 HOOK
 
+# The heredoc is quoted (no expansion in the hook body), so fill in the
+# linter's absolute path here.
+sed -i "s|@LINT_PATH@|$LINT_PATH|" "$HOOK_PATH"
 chmod +x "$HOOK_PATH"
 
 echo "Pre-commit hook installed at $HOOK_PATH"

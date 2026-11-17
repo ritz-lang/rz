@@ -46,7 +46,7 @@ Zero leaks. Zero errors. Zero "still reachable" (unless explicitly documented as
 ### Gate 3: Lint Clean
 
 ```bash
-python $RITZ_PATH/larb/tools/ritz-lint/ritz_lint.py src/
+python $RITZ_PATH/ritz/tools/ritz-lint/ritz_lint.py src/
 ```
 
 The linter is a **purist**. It will flag:
@@ -78,7 +78,7 @@ make test
 make valgrind
 
 # 3. Run the linter
-python $RITZ_PATH/larb/tools/ritz-lint/ritz_lint.py src/
+python $RITZ_PATH/ritz/tools/ritz-lint/ritz_lint.py src/
 
 # 4. If all pass, commit
 git add -p                    # Stage carefully
@@ -101,7 +101,7 @@ Add to your `~/.bashrc` or `~/.zshrc`:
 export RITZ_PATH=~/dev/ritz-lang
 
 # Lint alias
-alias ritz-lint="python \$RITZ_PATH/larb/tools/ritz-lint/ritz_lint.py"
+alias ritz-lint="python \$RITZ_PATH/ritz/tools/ritz-lint/ritz_lint.py"
 
 # Full PR check
 ritz-check() {
@@ -125,7 +125,7 @@ ritz-check
 For automatic linting on every commit:
 
 ```bash
-$RITZ_PATH/larb/tools/ritz-lint/install-hook.sh
+$RITZ_PATH/ritz/tools/ritz-lint/install-hook.sh
 ```
 
 This installs a git hook that runs the linter on staged `.ritz` files.

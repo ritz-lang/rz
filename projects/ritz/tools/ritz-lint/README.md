@@ -83,38 +83,24 @@ repos:
     hooks:
       - id: ritz-lint
         name: ritz-lint
-        entry: python tools/ritz-lint/ritz_lint.py
+        entry: python projects/ritz/tools/ritz-lint/ritz_lint.py
         language: python
         files: \.ritz$
         additional_dependencies: [anthropic]
 ```
 
-### GitHub Action
+### CI
 
-```yaml
-# .github/workflows/lint.yml
-name: Ritz Lint
-on: [pull_request]
-jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install anthropic
-      - run: python tools/ritz-lint/ritz_lint.py src/
-        env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-```
+ritz-lint does not run in CI (AGAST #1838). It calls the `claude` CLI, which
+CI runners do not have, so the old `lint-all` job always exited 0 and gated
+nothing. Run it locally or through the pre-commit hook below.
 
 ## Pre-commit Hook
 
 Install automatic linting on every commit:
 
 ```bash
-$RITZ_PATH/larb/tools/ritz-lint/install-hook.sh
+projects/ritz/tools/ritz-lint/install-hook.sh   # from a ritz-lang checkout
 ```
 
 To bypass (not recommended):

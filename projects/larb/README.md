@@ -82,7 +82,7 @@ behind it anywhere in this repo; `projects/valet/test/test_basic.sh` measured
 projects/larb/
 ├── docs/                   # Specs, RFCs, design decisions, reviews
 ├── review/                 # Review instructions
-├── tools/                  # migrate_cstr.py, ritz-lint/
+├── tools/                  # migrate_cstr.py (ritz-lint lives in projects/ritz/tools/)
 ├── logs/                   # Archived session transcripts (Feb 2026)
 ├── CAPABILITY_SPEC.md
 ├── DEFAULTS.md

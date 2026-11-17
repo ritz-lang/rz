@@ -165,17 +165,19 @@ def test_pyyaml_specifically_is_declared():
 def test_ci_installs_the_dev_requirements():
     """Declaring it is not enough — CI has to install the file.
 
-    Every `pip install` step in the workflow must pull in requirements-dev.txt,
-    not just the one job that happens to run tools-unit today. Jobs move.
+    Every `pip install` step in CI must pull in requirements-dev.txt, not just
+    the one job that happens to run tools-unit today. Jobs move, and so do
+    steps: the install lives in the composite .github/actions/setup action
+    every job uses (AGAST #1838), so read the workflows and the actions.
     """
-    workflow = RITZ_ROOT.parents[1] / ".github" / "workflows" / "main.yml"
-    assert workflow.is_file(), workflow
-    text = workflow.read_text()
+    github = RITZ_ROOT.parents[1] / ".github"
+    files = sorted(github.glob("workflows/*.yml")) + sorted(github.glob("actions/*/action.yml"))
+    assert files, github
     install_lines = [
-        ln for ln in text.split("\n")
+        ln for f in files for ln in f.read_text().split("\n")
         if "pip install" in ln and "requirements.txt" in ln
     ]
-    assert install_lines, "no pip install step found in main.yml"
+    assert install_lines, f"no pip install step found in {[str(f) for f in files]}"
     missing = [ln.strip() for ln in install_lines
                if "requirements-dev.txt" not in ln]
     assert not missing, (

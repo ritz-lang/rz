@@ -196,11 +196,11 @@ done
 rs="$SCRIPT_DIR/regression.sh"
 
 # Two call sites since #1806: Stage 1's judge, and the differential worker
-# that Stages 3 and 4 share (run_differential).
+# that Stages 3 and 4 share (run_compare_stage since #1838).
 check "every stage's code path calls report_xpass" 2 \
     "$(grep -cE '^\s*report_xpass ' "$rs")"
 check "Stages 3 and 4 both go through the shared differential worker" 2 \
-    "$(grep -cE '^\s*run_differential ritz1(_selfhosted)? ' "$rs")"
+    "$(grep -cE '^\s*run_compare_stage [34] ritz1(_selfhosted)? ' "$rs")"
 
 check "no stage still only warns about an allowlisted example that compiles" 0 \
     "$(grep -cE 'warn .*(but COMPILES|allowlist but)' "$rs")"
