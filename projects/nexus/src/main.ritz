@@ -31,7 +31,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
-import ritzlib.strview { StrView }
+import ritzlib.strview { StrView, strview_from_ptr, strview_is_empty, strview_len, strview_eq, strview_starts_with, strview_ends_with }
 import ritzlib.string { String, string_new, string_drop, string_len, string_as_ptr, string_push_cstr, string_push_i64 }
 
 import zeus.worker { WorkerContext }
@@ -48,7 +48,7 @@ import zeus.ring { response_slot_set_body, response_slot_set_headers }
 import zeus.ring { RESP_FLAG_COMPLETE }
 
 import src.log { log_set_worker, log_begin, log_end, log_cstr }
-import src.slug { MAX_SLUG, path_starts_with, slug_valid, slug_from_path }
+import src.slug { slug_valid, slug_from_path }
 import src.pages { render_new_page, render_error_page }
 import src.pages { push_headers, push_redirect_to_page }
 
@@ -241,10 +241,10 @@ fn send_text(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, text: *u8) -
 
 
 # 303 to /wiki/<slug>; the slug must already be validated.
-fn send_redirect(ctx: *WorkerContext, resp: *ResponseSlot, slug: *u8, slug_len: i32) -> i32
+fn send_redirect(ctx: *WorkerContext, resp: *ResponseSlot, slug: StrView) -> i32
     var headers: String = string_new()
     var body: String = string_new()
-    push_redirect_to_page(@&headers, slug, slug_len)
+    push_redirect_to_page(@&headers, slug)
     let rc: i32 = send_raw(ctx, resp, 303, @&headers, @&body)
     string_drop(@&headers)
     string_drop(@&body)
@@ -267,7 +267,7 @@ fn send_html(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @&Stri
 fn send_presented(ctx: *WorkerContext, resp: *ResponseSlot, status: i32, body: @&String, slug: StrView) -> i32
     if status == STATUS_SAVED
         string_drop(body)
-        return send_redirect(ctx, resp, slug.ptr, slug.len as i32)
+        return send_redirect(ctx, resp, slug)
     return send_html(ctx, resp, status, body)
 
 
@@ -287,8 +287,9 @@ fn form_field(body: *u8, body_len: i32, name: *u8, buf_out: **u8) -> i32
     return n
 
 
-fn view_of(ptr: *u8, len: i32) -> StrView
-    return StrView { ptr: ptr, len: len as i64 }
+# The request's path.  Views into it (the slug) live as long as the request.
+fn request_path(ctx: *WorkerContext, req: *RequestSlot) -> StrView
+    return strview_from_ptr(worker_get_request_path(ctx, req), req.path_len as i64)
 
 
 # ============================================================================
@@ -315,14 +316,12 @@ fn handle_not_found(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot)
 # with no page gets a styled 404 offering to create it; mausoleum down is a
 # 503 (src/presenters/page_presenter.ritz).
 fn handle_wiki_view(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    let path: *u8 = worker_get_request_path(ctx, req)
-    var slug: [128]u8
-    let slug_len: i32 = slug_from_path(path, req.path_len as i32, @slug[0])
-    if slug_len <= 0
+    let slug: StrView = slug_from_path(request_path(ctx, req))
+    if strview_is_empty(slug)
         return handle_not_found(ctx, req, resp)
 
     var body: String = string_new()
-    let status: i32 = present_page_view(@g_svc, view_of(@slug[0], slug_len), @&body)
+    let status: i32 = present_page_view(@g_svc, slug, @&body)
     return send_html(ctx, resp, status, @&body)
 
 
@@ -350,7 +349,8 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     let slug_len: i32 = form_field(body_ptr, body_len, c"slug", @slug)
     if slug_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'slug' field.")
-    if slug_len > MAX_SLUG or slug_valid(slug, slug_len) == 0
+    let slug_view: StrView = strview_from_ptr(slug, slug_len as i64)
+    if not slug_valid(slug_view)
         free(slug)
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9] or '-', in segments separated by '/'.")
 
@@ -360,9 +360,8 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
         free(slug)
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
 
-    let slug_view: StrView = view_of(slug, slug_len)
     var body: String = string_new()
-    let status: i32 = present_page_create(@g_svc, slug_view, slug_view, view_of(content, content_len), @&body)
+    let status: i32 = present_page_create(@g_svc, slug_view, slug_view, strview_from_ptr(content, content_len as i64), @&body)
     let rc: i32 = send_presented(ctx, resp, status, @&body, slug_view)
     free(content)
     free(slug)
@@ -374,10 +373,8 @@ fn handle_wiki_create(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
 # Body shape: same as create but only `content` is read; the slug comes from
 # the URL.  Replaying it overwrites with the same bytes.
 fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    let path: *u8 = worker_get_request_path(ctx, req)
-    var slug: [128]u8
-    let slug_len: i32 = slug_from_path(path, req.path_len as i32, @slug[0])
-    if slug_len <= 0
+    let slug_view: StrView = slug_from_path(request_path(ctx, req))
+    if strview_is_empty(slug_view)
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Slug must be 1-128 chars of [a-z], [0-9] or '-', in segments separated by '/'.")
 
     let body_ptr: *u8 = worker_get_request_body(ctx, req)
@@ -390,9 +387,8 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
     if content_len < 0
         return send_error_page(ctx, resp, 400, c"Bad Request", c"Missing 'content' field.")
 
-    let slug_view: StrView = view_of(@slug[0], slug_len)
     var body: String = string_new()
-    let status: i32 = present_page_save(@g_svc, slug_view, slug_view, view_of(content, content_len), @&body)
+    let status: i32 = present_page_save(@g_svc, slug_view, slug_view, strview_from_ptr(content, content_len as i64), @&body)
     let rc: i32 = send_presented(ctx, resp, status, @&body, slug_view)
     free(content)
     return rc
@@ -402,28 +398,21 @@ fn handle_wiki_update(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlo
 # content; for a slug with no page yet, the new-page form.  An invalid slug is
 # a plain 404.
 fn handle_wiki_edit_form(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    let path: *u8 = worker_get_request_path(ctx, req)
-    var slug: [128]u8
-    let slug_len: i32 = slug_from_path(path, req.path_len as i32, @slug[0])
-    if slug_len <= 0
+    let slug: StrView = slug_from_path(request_path(ctx, req))
+    if strview_is_empty(slug)
         return handle_not_found(ctx, req, resp)
 
     var body: String = string_new()
-    let status: i32 = present_page_edit(@g_svc, view_of(@slug[0], slug_len), @&body)
+    let status: i32 = present_page_edit(@g_svc, slug, @&body)
     return send_html(ctx, resp, status, @&body)
 
 
 # Detect the trailing "/edit" suffix for a /wiki/:slug/edit GET.  We
 # match exactly five trailing bytes so /wiki/foo-edit-pet still routes
 # to the page view, not the edit form.
-fn path_ends_with_edit(path: *u8, path_len: i32) -> i32
-    if path_len < 11        # /wiki/x/edit minimum
-        return 0
-    let suffix: *u8 = c"/edit"
-    for i in 0..5
-        if *(path + path_len - 5 + i) != *(suffix + i)
-            return 0
-    return 1
+fn path_ends_with_edit(path: StrView) -> bool
+    # /wiki/x/edit is the shortest edit route.
+    strview_len(path) >= 11 and strview_ends_with(path, "/edit")
 
 
 # ============================================================================
@@ -431,39 +420,38 @@ fn path_ends_with_edit(path: *u8, path_len: i32) -> i32
 # ============================================================================
 
 fn route_request(ctx: *WorkerContext, req: *RequestSlot, resp: *ResponseSlot) -> i32
-    let path: *u8 = worker_get_request_path(ctx, req)
-    let path_len: i32 = req.path_len as i32
+    let path: StrView = request_path(ctx, req)
     let method: u8 = req.method
 
     # GET /
-    if method == HTTP_METHOD_GET and path_len == 1 and *path == '/'
+    if method == HTTP_METHOD_GET and strview_eq(path, "/")
         return handle_index(ctx, req, resp)
 
     # GET /health
-    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/health") != 0
+    if method == HTTP_METHOD_GET and strview_starts_with(path, "/health")
         return handle_health(ctx, req, resp)
 
     # GET /wiki/new — must come before /wiki/:slug so "new" isn't treated as
     # a slug (the slug rule reserves it).  Exactly /wiki/new: /wiki/news is a
     # page.
-    if method == HTTP_METHOD_GET and path_len == 9 and path_starts_with(path, path_len, c"/wiki/new") != 0
+    if method == HTTP_METHOD_GET and strview_eq(path, "/wiki/new")
         return handle_wiki_new(ctx, req, resp)
 
     # POST /wiki — create a new page from the form on /wiki/new.  Must
     # be checked before the longer-prefix POST below.
-    if method == HTTP_METHOD_POST and path_len == 5 and path_starts_with(path, path_len, c"/wiki") != 0
+    if method == HTTP_METHOD_POST and strview_eq(path, "/wiki")
         return handle_wiki_create(ctx, req, resp)
 
     # POST /wiki/:slug — update an existing page (called by the edit form).
-    if method == HTTP_METHOD_POST and path_starts_with(path, path_len, c"/wiki/") != 0
+    if method == HTTP_METHOD_POST and strview_starts_with(path, "/wiki/")
         return handle_wiki_update(ctx, req, resp)
 
     # GET /wiki/:slug/edit — render the edit form, pre-populated.
-    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0 and path_ends_with_edit(path, path_len) != 0
+    if method == HTTP_METHOD_GET and strview_starts_with(path, "/wiki/") and path_ends_with_edit(path)
         return handle_wiki_edit_form(ctx, req, resp)
 
     # GET /wiki/:slug — view a wiki page
-    if method == HTTP_METHOD_GET and path_starts_with(path, path_len, c"/wiki/") != 0
+    if method == HTTP_METHOD_GET and strview_starts_with(path, "/wiki/")
         return handle_wiki_view(ctx, req, resp)
 
     return handle_not_found(ctx, req, resp)

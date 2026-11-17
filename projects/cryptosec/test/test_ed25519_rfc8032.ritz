@@ -1,0 +1,826 @@
+# test/test_ed25519_rfc8032.ritz - Ed25519 RFC 8032 sign/verify vectors and tamper checks
+
+import cryptosec.ed25519
+import cryptosec.mem
+import cryptosec.sha512
+import ritzlib.memory { memzero }
+import cryptosec.x25519
+
+# Debug: test SHA512(prefix) for RFC 8032 vector 1
+# We need to verify what SHA512(hash[32:64]) produces
+[[test]]
+fn test_rfc8032_vector1_r_hash() -> i32
+    var seed: [32]u8
+    seed[0] = 0x9d
+    seed[1] = 0x61
+    seed[2] = 0xb1
+    seed[3] = 0x9d
+    seed[4] = 0xef
+    seed[5] = 0xfd
+    seed[6] = 0x5a
+    seed[7] = 0x60
+    seed[8] = 0xba
+    seed[9] = 0x84
+    seed[10] = 0x4a
+    seed[11] = 0xf4
+    seed[12] = 0x92
+    seed[13] = 0xec
+    seed[14] = 0x2c
+    seed[15] = 0xc4
+    seed[16] = 0x44
+    seed[17] = 0x49
+    seed[18] = 0xc5
+    seed[19] = 0x69
+    seed[20] = 0x7b
+    seed[21] = 0x32
+    seed[22] = 0x69
+    seed[23] = 0x19
+    seed[24] = 0x70
+    seed[25] = 0x3b
+    seed[26] = 0xac
+    seed[27] = 0x03
+    seed[28] = 0x1c
+    seed[29] = 0xae
+    seed[30] = 0x7f
+    seed[31] = 0x60
+
+    # hash = SHA512(seed)
+    var hash: [64]u8
+    sha512(@seed[0], 32, @hash[0])
+
+    # r_hash = SHA512(prefix)  where prefix = hash[32:64]
+    var r_hash: [64]u8
+    sha512(@hash[32], 32, @r_hash[0])
+
+    # For debugging, just check r_hash[0] is not zero
+    if r_hash[0] == 0
+        if r_hash[1] == 0
+            return 1  # Unexpected all-zero start
+
+    # Now reduce
+    sc_reduce(@r_hash[0])
+
+    # After reduction, compute R = r * B
+    var R: Ge25519
+    ge_scalarmult_base(@R, @r_hash[0])
+
+    var R_bytes: [32]u8
+    ge_tobytes(@R_bytes[0], @R)
+
+    # Expected R
+    var expected_R: [32]u8
+    expected_R[0] = 0xe5
+    expected_R[1] = 0x56
+    expected_R[2] = 0x43
+    expected_R[3] = 0x00
+    expected_R[4] = 0xc3
+    expected_R[5] = 0x60
+    expected_R[6] = 0xac
+    expected_R[7] = 0x72
+    expected_R[8] = 0x90
+    expected_R[9] = 0x86
+    expected_R[10] = 0xe2
+    expected_R[11] = 0xcc
+    expected_R[12] = 0x80
+    expected_R[13] = 0x6e
+    expected_R[14] = 0x82
+    expected_R[15] = 0x8a
+    expected_R[16] = 0x84
+    expected_R[17] = 0x87
+    expected_R[18] = 0x7f
+    expected_R[19] = 0x1e
+    expected_R[20] = 0xb8
+    expected_R[21] = 0xe5
+    expected_R[22] = 0xd9
+    expected_R[23] = 0x74
+    expected_R[24] = 0xd8
+    expected_R[25] = 0x73
+    expected_R[26] = 0xe0
+    expected_R[27] = 0x65
+    expected_R[28] = 0x22
+    expected_R[29] = 0x49
+    expected_R[30] = 0x01
+    expected_R[31] = 0x55
+
+    if mem_eq(@R_bytes[0], @expected_R[0], 32) != 1
+        var i: i32 = 0
+        while i < 32
+            if R_bytes[i] != expected_R[i]
+                return 100 + i
+            i += 1
+        return 2
+
+    return 0
+
+# Test R computation for RFC 8032 vector 1
+# Expected R: e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e06522490155
+[[test]]
+fn test_rfc8032_vector1_R_only() -> i32
+    var seed: [32]u8
+    seed[0] = 0x9d
+    seed[1] = 0x61
+    seed[2] = 0xb1
+    seed[3] = 0x9d
+    seed[4] = 0xef
+    seed[5] = 0xfd
+    seed[6] = 0x5a
+    seed[7] = 0x60
+    seed[8] = 0xba
+    seed[9] = 0x84
+    seed[10] = 0x4a
+    seed[11] = 0xf4
+    seed[12] = 0x92
+    seed[13] = 0xec
+    seed[14] = 0x2c
+    seed[15] = 0xc4
+    seed[16] = 0x44
+    seed[17] = 0x49
+    seed[18] = 0xc5
+    seed[19] = 0x69
+    seed[20] = 0x7b
+    seed[21] = 0x32
+    seed[22] = 0x69
+    seed[23] = 0x19
+    seed[24] = 0x70
+    seed[25] = 0x3b
+    seed[26] = 0xac
+    seed[27] = 0x03
+    seed[28] = 0x1c
+    seed[29] = 0xae
+    seed[30] = 0x7f
+    seed[31] = 0x60
+
+    # Step 1: hash = SHA512(seed)
+    var hash: [64]u8
+    sha512(@seed[0], 32, @hash[0])
+
+    # Step 2: r = SHA512(prefix) mod l (empty message)
+    # prefix = hash[32:64]
+    var r_hash: [64]u8
+    var ctx: Sha512
+    sha512_init(@ctx)
+    sha512_update(@ctx, @hash[32], 32)
+    # Empty message, so no more updates
+    sha512_final(@ctx, @r_hash[0])
+
+    sc_reduce(@r_hash[0])
+
+    # Step 3: R = r * B
+    var R: Ge25519
+    ge_scalarmult_base(@R, @r_hash[0])
+
+    var R_bytes: [32]u8
+    ge_tobytes(@R_bytes[0], @R)
+
+    # Expected R from signature
+    var expected_R: [32]u8
+    expected_R[0] = 0xe5
+    expected_R[1] = 0x56
+    expected_R[2] = 0x43
+    expected_R[3] = 0x00
+    expected_R[4] = 0xc3
+    expected_R[5] = 0x60
+    expected_R[6] = 0xac
+    expected_R[7] = 0x72
+    expected_R[8] = 0x90
+    expected_R[9] = 0x86
+    expected_R[10] = 0xe2
+    expected_R[11] = 0xcc
+    expected_R[12] = 0x80
+    expected_R[13] = 0x6e
+    expected_R[14] = 0x82
+    expected_R[15] = 0x8a
+    expected_R[16] = 0x84
+    expected_R[17] = 0x87
+    expected_R[18] = 0x7f
+    expected_R[19] = 0x1e
+    expected_R[20] = 0xb8
+    expected_R[21] = 0xe5
+    expected_R[22] = 0xd9
+    expected_R[23] = 0x74
+    expected_R[24] = 0xd8
+    expected_R[25] = 0x73
+    expected_R[26] = 0xe0
+    expected_R[27] = 0x65
+    expected_R[28] = 0x22
+    expected_R[29] = 0x49
+    expected_R[30] = 0x01
+    expected_R[31] = 0x55
+
+    if mem_eq(@R_bytes[0], @expected_R[0], 32) != 1
+        # Debug: return first differing byte + 100
+        var i: i32 = 0
+        while i < 32
+            if R_bytes[i] != expected_R[i]
+                return 100 + i
+            i += 1
+        return 1
+
+    return 0
+
+# RFC 8032 Test Vector 1 - Empty message sign/verify
+# Secret: 9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60
+# Public: d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+# Message: (empty)
+# Signature: e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555
+#            fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b
+[[test]]
+fn test_rfc8032_vector1_sign() -> i32
+    var seed: [32]u8
+    seed[0] = 0x9d
+    seed[1] = 0x61
+    seed[2] = 0xb1
+    seed[3] = 0x9d
+    seed[4] = 0xef
+    seed[5] = 0xfd
+    seed[6] = 0x5a
+    seed[7] = 0x60
+    seed[8] = 0xba
+    seed[9] = 0x84
+    seed[10] = 0x4a
+    seed[11] = 0xf4
+    seed[12] = 0x92
+    seed[13] = 0xec
+    seed[14] = 0x2c
+    seed[15] = 0xc4
+    seed[16] = 0x44
+    seed[17] = 0x49
+    seed[18] = 0xc5
+    seed[19] = 0x69
+    seed[20] = 0x7b
+    seed[21] = 0x32
+    seed[22] = 0x69
+    seed[23] = 0x19
+    seed[24] = 0x70
+    seed[25] = 0x3b
+    seed[26] = 0xac
+    seed[27] = 0x03
+    seed[28] = 0x1c
+    seed[29] = 0xae
+    seed[30] = 0x7f
+    seed[31] = 0x60
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    # Empty message
+    var msg: [1]u8
+    msg[0] = 0
+
+    # Sign empty message (msg_len = 0)
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 0, @privkey[0])
+
+    # Expected signature from RFC 8032
+    var expected_sig: [64]u8
+    expected_sig[0] = 0xe5
+    expected_sig[1] = 0x56
+    expected_sig[2] = 0x43
+    expected_sig[3] = 0x00
+    expected_sig[4] = 0xc3
+    expected_sig[5] = 0x60
+    expected_sig[6] = 0xac
+    expected_sig[7] = 0x72
+    expected_sig[8] = 0x90
+    expected_sig[9] = 0x86
+    expected_sig[10] = 0xe2
+    expected_sig[11] = 0xcc
+    expected_sig[12] = 0x80
+    expected_sig[13] = 0x6e
+    expected_sig[14] = 0x82
+    expected_sig[15] = 0x8a
+    expected_sig[16] = 0x84
+    expected_sig[17] = 0x87
+    expected_sig[18] = 0x7f
+    expected_sig[19] = 0x1e
+    expected_sig[20] = 0xb8
+    expected_sig[21] = 0xe5
+    expected_sig[22] = 0xd9
+    expected_sig[23] = 0x74
+    expected_sig[24] = 0xd8
+    expected_sig[25] = 0x73
+    expected_sig[26] = 0xe0
+    expected_sig[27] = 0x65
+    expected_sig[28] = 0x22
+    expected_sig[29] = 0x49
+    expected_sig[30] = 0x01
+    expected_sig[31] = 0x55
+    expected_sig[32] = 0x5f
+    expected_sig[33] = 0xb8
+    expected_sig[34] = 0x82
+    expected_sig[35] = 0x15
+    expected_sig[36] = 0x90
+    expected_sig[37] = 0xa3
+    expected_sig[38] = 0x3b
+    expected_sig[39] = 0xac
+    expected_sig[40] = 0xc6
+    expected_sig[41] = 0x1e
+    expected_sig[42] = 0x39
+    expected_sig[43] = 0x70
+    expected_sig[44] = 0x1c
+    expected_sig[45] = 0xf9
+    expected_sig[46] = 0xb4
+    expected_sig[47] = 0x6b
+    expected_sig[48] = 0xd2
+    expected_sig[49] = 0x5b
+    expected_sig[50] = 0xf5
+    expected_sig[51] = 0xf0
+    expected_sig[52] = 0x59
+    expected_sig[53] = 0x5b
+    expected_sig[54] = 0xbe
+    expected_sig[55] = 0x24
+    expected_sig[56] = 0x65
+    expected_sig[57] = 0x51
+    expected_sig[58] = 0x41
+    expected_sig[59] = 0x43
+    expected_sig[60] = 0x8e
+    expected_sig[61] = 0x7a
+    expected_sig[62] = 0x10
+    expected_sig[63] = 0x0b
+
+    # Check R (first 32 bytes)
+    if mem_eq(@sig[0], @expected_sig[0], 32) != 1
+        # Debug: return 100 + first differing byte in R
+        var i: i32 = 0
+        while i < 32
+            if sig[i] != expected_sig[i]
+                return 100 + i
+            i += 1
+        return 1
+
+    # Check s (second 32 bytes)
+    if mem_eq(@sig[32], @expected_sig[32], 32) != 1
+        # Debug: return 200 + first differing byte in s
+        var i: i32 = 32
+        while i < 64
+            if sig[i] != expected_sig[i]
+                return 200 + (i - 32)
+            i += 1
+        return 2
+
+    return 0
+
+# RFC 8032 Test Vector 1 - Verify signature
+[[test]]
+fn test_rfc8032_vector1_verify() -> i32
+    var pubkey: [32]u8
+    pubkey[0] = 0xd7
+    pubkey[1] = 0x5a
+    pubkey[2] = 0x98
+    pubkey[3] = 0x01
+    pubkey[4] = 0x82
+    pubkey[5] = 0xb1
+    pubkey[6] = 0x0a
+    pubkey[7] = 0xb7
+    pubkey[8] = 0xd5
+    pubkey[9] = 0x4b
+    pubkey[10] = 0xfe
+    pubkey[11] = 0xd3
+    pubkey[12] = 0xc9
+    pubkey[13] = 0x64
+    pubkey[14] = 0x07
+    pubkey[15] = 0x3a
+    pubkey[16] = 0x0e
+    pubkey[17] = 0xe1
+    pubkey[18] = 0x72
+    pubkey[19] = 0xf3
+    pubkey[20] = 0xda
+    pubkey[21] = 0xa6
+    pubkey[22] = 0x23
+    pubkey[23] = 0x25
+    pubkey[24] = 0xaf
+    pubkey[25] = 0x02
+    pubkey[26] = 0x1a
+    pubkey[27] = 0x68
+    pubkey[28] = 0xf7
+    pubkey[29] = 0x07
+    pubkey[30] = 0x51
+    pubkey[31] = 0x1a
+
+    var sig: [64]u8
+    sig[0] = 0xe5
+    sig[1] = 0x56
+    sig[2] = 0x43
+    sig[3] = 0x00
+    sig[4] = 0xc3
+    sig[5] = 0x60
+    sig[6] = 0xac
+    sig[7] = 0x72
+    sig[8] = 0x90
+    sig[9] = 0x86
+    sig[10] = 0xe2
+    sig[11] = 0xcc
+    sig[12] = 0x80
+    sig[13] = 0x6e
+    sig[14] = 0x82
+    sig[15] = 0x8a
+    sig[16] = 0x84
+    sig[17] = 0x87
+    sig[18] = 0x7f
+    sig[19] = 0x1e
+    sig[20] = 0xb8
+    sig[21] = 0xe5
+    sig[22] = 0xd9
+    sig[23] = 0x74
+    sig[24] = 0xd8
+    sig[25] = 0x73
+    sig[26] = 0xe0
+    sig[27] = 0x65
+    sig[28] = 0x22
+    sig[29] = 0x49
+    sig[30] = 0x01
+    sig[31] = 0x55
+    sig[32] = 0x5f
+    sig[33] = 0xb8
+    sig[34] = 0x82
+    sig[35] = 0x15
+    sig[36] = 0x90
+    sig[37] = 0xa3
+    sig[38] = 0x3b
+    sig[39] = 0xac
+    sig[40] = 0xc6
+    sig[41] = 0x1e
+    sig[42] = 0x39
+    sig[43] = 0x70
+    sig[44] = 0x1c
+    sig[45] = 0xf9
+    sig[46] = 0xb4
+    sig[47] = 0x6b
+    sig[48] = 0xd2
+    sig[49] = 0x5b
+    sig[50] = 0xf5
+    sig[51] = 0xf0
+    sig[52] = 0x59
+    sig[53] = 0x5b
+    sig[54] = 0xbe
+    sig[55] = 0x24
+    sig[56] = 0x65
+    sig[57] = 0x51
+    sig[58] = 0x41
+    sig[59] = 0x43
+    sig[60] = 0x8e
+    sig[61] = 0x7a
+    sig[62] = 0x10
+    sig[63] = 0x0b
+
+    # Empty message
+    var msg: [1]u8
+    msg[0] = 0
+
+    # Verify should succeed (return 1)
+    let result: i32 = ed25519_verify(@sig[0], @msg[0], 0, @pubkey[0])
+    if result != 1
+        return 1
+
+    return 0
+
+# Test fe_sqrt on a known square
+[[test]]
+fn test_fe_sqrt_simple() -> i32
+    # 4 = 2^2, sqrt(4) = 2
+    var four: Fe25519
+    fe_zero(@four)
+    four.l0 = 4
+
+    var two: Fe25519
+    let result: i32 = fe_sqrt(@two, @four)
+    if result != 0
+        return 1  # Failed to find sqrt
+
+    # Check two^2 == 4
+    var check: Fe25519
+    fe_sq(@check, @two)
+    fe_reduce(@check)
+    if check.l0 != 4
+        return 2
+    if check.l1 != 0
+        return 3
+
+    return 0
+
+# Test that we can encode and decode the base point
+[[test]]
+fn test_encode_decode_basepoint() -> i32
+    var B: Ge25519
+    ge_basepoint(@B)
+
+    var bytes: [32]u8
+    ge_tobytes(@bytes[0], @B)
+
+    var B2: Ge25519
+    if ge_frombytes(@B2, @bytes[0]) != 0
+        return 1
+
+    return 0
+
+# Test that we can generate a pubkey and decode it
+[[test]]
+fn test_encode_decode_pubkey() -> i32
+    var seed: [32]u8
+    seed[0] = 0x9d
+    seed[1] = 0x61
+    seed[2] = 0xb1
+    seed[3] = 0x9d
+    seed[4] = 0xef
+    seed[5] = 0xfd
+    seed[6] = 0x5a
+    seed[7] = 0x60
+    seed[8] = 0xba
+    seed[9] = 0x84
+    seed[10] = 0x4a
+    seed[11] = 0xf4
+    seed[12] = 0x92
+    seed[13] = 0xec
+    seed[14] = 0x2c
+    seed[15] = 0xc4
+    seed[16] = 0x44
+    seed[17] = 0x49
+    seed[18] = 0xc5
+    seed[19] = 0x69
+    seed[20] = 0x7b
+    seed[21] = 0x32
+    seed[22] = 0x69
+    seed[23] = 0x19
+    seed[24] = 0x70
+    seed[25] = 0x3b
+    seed[26] = 0xac
+    seed[27] = 0x03
+    seed[28] = 0x1c
+    seed[29] = 0xae
+    seed[30] = 0x7f
+    seed[31] = 0x60
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    var A: Ge25519
+    if ge_frombytes(@A, @pubkey[0]) != 0
+        return 1
+
+    return 0
+
+# Debug verify by doing it manually step by step
+[[test]]
+fn test_verify_manual_debug() -> i32
+    var seed: [32]u8
+    seed[0] = 0x9d
+    seed[1] = 0x61
+    seed[2] = 0xb1
+    seed[3] = 0x9d
+    seed[4] = 0xef
+    seed[5] = 0xfd
+    seed[6] = 0x5a
+    seed[7] = 0x60
+    seed[8] = 0xba
+    seed[9] = 0x84
+    seed[10] = 0x4a
+    seed[11] = 0xf4
+    seed[12] = 0x92
+    seed[13] = 0xec
+    seed[14] = 0x2c
+    seed[15] = 0xc4
+    seed[16] = 0x44
+    seed[17] = 0x49
+    seed[18] = 0xc5
+    seed[19] = 0x69
+    seed[20] = 0x7b
+    seed[21] = 0x32
+    seed[22] = 0x69
+    seed[23] = 0x19
+    seed[24] = 0x70
+    seed[25] = 0x3b
+    seed[26] = 0xac
+    seed[27] = 0x03
+    seed[28] = 0x1c
+    seed[29] = 0xae
+    seed[30] = 0x7f
+    seed[31] = 0x60
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    # Empty message
+    var msg: [1]u8
+    msg[0] = 0
+
+    # Sign
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 0, @privkey[0])
+
+    # Step 1: Decode public key A
+    var A: Ge25519
+    if ge_frombytes(@A, @pubkey[0]) != 0
+        return 10
+
+    # Step 2: Decode R from signature
+    var R: Ge25519
+    if ge_frombytes(@R, @sig[0]) != 0
+        return 20
+
+    # Step 3: k = SHA512(R || A || msg) mod l
+    var k_hash: [64]u8
+    var ctx: Sha512
+    sha512_init(@ctx)
+    sha512_update(@ctx, @sig[0], 32)  # R
+    sha512_update(@ctx, @pubkey[0], 32)  # A
+    sha512_update(@ctx, @msg[0], 0)
+    sha512_final(@ctx, @k_hash[0])
+    sc_reduce(@k_hash[0])
+
+    # Step 4: [s]B
+    var sB: Ge25519
+    ge_scalarmult_base(@sB, @sig[32])
+
+    # Step 5: [k]A
+    var kA: Ge25519
+    ge_scalarmult(@kA, @k_hash[0], @A)
+
+    # Step 6: -kA
+    var neg_kA: Ge25519
+    ge_neg(@neg_kA, @kA)
+
+    # Step 7: check = sB - kA
+    var check: Ge25519
+    ge_add(@check, @sB, @neg_kA)
+
+    # Step 8: encode check
+    var check_bytes: [32]u8
+    ge_tobytes(@check_bytes[0], @check)
+
+    # Step 9: Compare with R
+    if mem_eq(@check_bytes[0], @sig[0], 32) != 1
+        # Find first differing byte
+        var i: i32 = 0
+        while i < 32
+            if check_bytes[i] != sig[i]
+                return 100 + i
+            i += 1
+        return 30
+
+    return 0
+
+# Test sign then verify with RFC 8032 vector 1
+[[test]]
+fn test_sign_then_verify_rfc8032_v1() -> i32
+    var seed: [32]u8
+    seed[0] = 0x9d
+    seed[1] = 0x61
+    seed[2] = 0xb1
+    seed[3] = 0x9d
+    seed[4] = 0xef
+    seed[5] = 0xfd
+    seed[6] = 0x5a
+    seed[7] = 0x60
+    seed[8] = 0xba
+    seed[9] = 0x84
+    seed[10] = 0x4a
+    seed[11] = 0xf4
+    seed[12] = 0x92
+    seed[13] = 0xec
+    seed[14] = 0x2c
+    seed[15] = 0xc4
+    seed[16] = 0x44
+    seed[17] = 0x49
+    seed[18] = 0xc5
+    seed[19] = 0x69
+    seed[20] = 0x7b
+    seed[21] = 0x32
+    seed[22] = 0x69
+    seed[23] = 0x19
+    seed[24] = 0x70
+    seed[25] = 0x3b
+    seed[26] = 0xac
+    seed[27] = 0x03
+    seed[28] = 0x1c
+    seed[29] = 0xae
+    seed[30] = 0x7f
+    seed[31] = 0x60
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    # Empty message
+    var msg: [1]u8
+    msg[0] = 0
+
+    # Sign
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 0, @privkey[0])
+
+    # Verify the signature we just made
+    let result: i32 = ed25519_verify(@sig[0], @msg[0], 0, @pubkey[0])
+    if result != 1
+        return 1
+
+    return 0
+
+# Test sign/verify round-trip with custom message
+[[test]]
+fn test_ed25519_sign_verify_roundtrip() -> i32
+    # Generate keypair from test seed
+    var seed: [32]u8
+    seed[0] = 0x01
+    seed[1] = 0x02
+    seed[2] = 0x03
+    seed[3] = 0x04
+    seed[4] = 0x05
+    seed[5] = 0x06
+    seed[6] = 0x07
+    seed[7] = 0x08
+    var i: i32 = 8
+    while i < 32
+        seed[i] = (i as u8)
+        i += 1
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    # Test message: "hello"
+    var msg: [5]u8
+    msg[0] = 0x68  # 'h'
+    msg[1] = 0x65  # 'e'
+    msg[2] = 0x6c  # 'l'
+    msg[3] = 0x6c  # 'l'
+    msg[4] = 0x6f  # 'o'
+
+    # Sign the message
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 5, @privkey[0])
+
+    # Verify the signature
+    let result: i32 = ed25519_verify(@sig[0], @msg[0], 5, @pubkey[0])
+    if result != 1
+        return 1
+
+    return 0
+
+# Test that modified message fails verification
+[[test]]
+fn test_ed25519_verify_tampered_msg() -> i32
+    # Generate keypair
+    var seed: [32]u8
+    memzero(@seed[0], 32)
+    seed[0] = 0xaa
+    seed[1] = 0xbb
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    # Sign message "test"
+    var msg: [4]u8
+    msg[0] = 0x74  # 't'
+    msg[1] = 0x65  # 'e'
+    msg[2] = 0x73  # 's'
+    msg[3] = 0x74  # 't'
+
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 4, @privkey[0])
+
+    # Tamper with message
+    msg[0] = 0x54  # 'T' instead of 't'
+
+    # Verify should fail (return 0)
+    let result: i32 = ed25519_verify(@sig[0], @msg[0], 4, @pubkey[0])
+    if result != 0
+        return 1  # Should have failed!
+
+    return 0
+
+# Test that modified signature fails verification
+[[test]]
+fn test_ed25519_verify_tampered_sig() -> i32
+    # Generate keypair
+    var seed: [32]u8
+    memzero(@seed[0], 32)
+    seed[0] = 0xcc
+    seed[1] = 0xdd
+
+    var privkey: [32]u8
+    var pubkey: [32]u8
+    ed25519_keygen(@pubkey[0], @privkey[0], @seed[0])
+
+    # Sign message "data"
+    var msg: [4]u8
+    msg[0] = 0x64  # 'd'
+    msg[1] = 0x61  # 'a'
+    msg[2] = 0x74  # 't'
+    msg[3] = 0x61  # 'a'
+
+    var sig: [64]u8
+    ed25519_sign(@sig[0], @msg[0], 4, @privkey[0])
+
+    # Tamper with signature (modify s component)
+    sig[32] = sig[32] ^ 0x01
+
+    # Verify should fail
+    let result: i32 = ed25519_verify(@sig[0], @msg[0], 4, @pubkey[0])
+    if result != 0
+        return 1  # Should have failed!
+
+    return 0

@@ -4,52 +4,52 @@
 # /wiki/:slug/edit never validated it, so a slug of `"><script>` reached an
 # href unescaped.  Every route now rejects slugs outside the one slug rule
 # (AGAST #2209): 1-128 bytes of '/'-separated [a-z0-9-] segments.
+#
+# The slug API takes and returns StrViews and answers yes/no as bool
+# (AGAST #3461): no (*u8, len) pairs and no 1/0 i32 booleans.
 
-import ritzlib.str { strlen }
+import ritzlib.strview { StrView, strview_from_ptr, strview_len, strview_eq, strview_is_empty }
 
-import slug { extract_slug, slug_valid, slug_from_path }
-import slug { slug_check, SLUG_OK, SLUG_BAD_CHAR, SLUG_EMPTY_SEGMENT, SLUG_RESERVED }
-
-
-fn valid(s: *u8) -> i32
-    return slug_valid(s, strlen(s) as i32)
+import slug { MAX_SLUG, extract_slug, slug_valid, slug_from_path }
+import slug { SlugVerdict, slug_check }
 
 
 [[test]]
 fn test_validate_slug_accepts_lower_digits_hyphen() -> i32
-    if valid(c"hello-world-42") != 1
+    if not slug_valid("hello-world-42")
         return 1
-    if valid(c"a") != 1
+    if not slug_valid("a")
         return 2
     0
 
 
 [[test]]
 fn test_validate_slug_rejects_html_specials() -> i32
-    if valid(c"a\"b") != 0
+    if slug_valid("a\"b")
         return 1
-    if valid(c"<script>") != 0
+    if slug_valid("<script>")
         return 2
-    if valid(c"x>y") != 0
+    if slug_valid("x>y")
         return 3
-    if valid(c"a&b") != 0
+    if slug_valid("a&b")
         return 4
-    if valid(c"it's") != 0
+    if slug_valid("it's")
         return 5
     0
 
 
 [[test]]
 fn test_validate_slug_rejects_other_bytes() -> i32
-    if valid(c"Upper") != 0
+    if slug_valid("Upper")
         return 1
-    if valid(c"..") != 0
+    if slug_valid("..")
         return 2
-    if valid(c"a b") != 0
+    if slug_valid("a b")
         return 3
-    if valid(c"a%22b") != 0
+    if slug_valid("a%22b")
         return 4
-    if slug_valid(c"x", 0) != 0
+    let x: StrView = "x"
+    if slug_valid(strview_from_ptr(x.ptr, 0))
         return 5
     0
 
@@ -59,47 +59,48 @@ fn test_validate_slug_length_cap() -> i32
     var buf: [129]u8
     for i in 0..129
         buf[i] = 'a'
-    if slug_valid(@buf[0], 128) != 1
+    if not slug_valid(strview_from_ptr(@buf[0], 128))
         return 1
-    if slug_valid(@buf[0], 129) != 0
+    if slug_valid(strview_from_ptr(@buf[0], 129))
         return 2
     0
 
 
 [[test]]
 fn test_extract_slug_takes_the_whole_rest_of_the_path() -> i32
-    var out: [128]u8
-    let p = c"/wiki/foo/bar"
-    let n = extract_slug(p, strlen(p) as i32, @out[0], 128)
-    if n != 7
+    let p: StrView = "/wiki/foo/bar"
+    let slug: StrView = extract_slug(p, MAX_SLUG)
+    if not strview_eq(slug, "foo/bar")
         return 1
-    if out[0] != 'f' or out[3] != '/' or out[6] != 'r'
+    # A view into the path, not a copy.
+    if slug.ptr != p.ptr + 6
         return 2
+    if not strview_is_empty(extract_slug("/wiki/foo/bar", 6))
+        return 3
+    if not strview_is_empty(extract_slug("/wik/foo", MAX_SLUG))
+        return 4
     0
 
 
 # The route-level helper: extract, then validate.  A hostile slug in the
-# path is refused (returns -1) rather than handed to a renderer.
+# path is refused (an empty view) rather than handed to a renderer.
 [[test]]
 fn test_slug_from_path_rejects_hostile_slug() -> i32
-    var out: [128]u8
-    let bad = c"/wiki/\"><script>"
-    if slug_from_path(bad, strlen(bad) as i32, @out[0]) != -1
+    if not strview_is_empty(slug_from_path("/wiki/\"><script>"))
         return 1
-    let good = c"/wiki/home/edit"
-    if slug_from_path(good, strlen(good) as i32, @out[0]) != 4
+    if not strview_eq(slug_from_path("/wiki/home/edit"), "home")
         return 2
-    let empty = c"/wiki/"
-    if slug_from_path(empty, strlen(empty) as i32, @out[0]) != -1
+    if not strview_is_empty(slug_from_path("/wiki/"))
         return 3
-    let nested = c"/wiki/language/syntax/edit"
-    if slug_from_path(nested, strlen(nested) as i32, @out[0]) != 15
+    let nested: StrView = slug_from_path("/wiki/language/syntax/edit")
+    if strview_len(nested) != 15
         return 4
-    if out[8] != '/'
+    if not strview_eq(nested, "language/syntax")
         return 5
-    let up = c"/wiki/../etc"
-    if slug_from_path(up, strlen(up) as i32, @out[0]) != -1
+    if not strview_is_empty(slug_from_path("/wiki/../etc"))
         return 6
+    if not strview_eq(slug_from_path("/wiki/home"), "home")
+        return 7
     0
 
 
@@ -115,10 +116,9 @@ fn test_slug_from_path_rejects_overlong() -> i32
     path[5] = '/'
     for i in 6..140
         path[i] = 'a'
-    var out: [128]u8
-    if slug_from_path(@path[0], 140, @out[0]) != -1
+    if not strview_is_empty(slug_from_path(strview_from_ptr(@path[0], 140)))
         return 1
-    if slug_from_path(@path[0], 134, @out[0]) != 128
+    if strview_len(slug_from_path(strview_from_ptr(@path[0], 134))) != MAX_SLUG
         return 2
     0
 
@@ -128,40 +128,54 @@ fn test_slug_from_path_rejects_overlong() -> i32
 # service (services/validation) both call slug_check.
 # ============================================================================
 
-fn check(s: *u8) -> i32
-    return slug_check(s, strlen(s) as i32)
+fn check(s: StrView) -> SlugVerdict
+    return slug_check(s)
 
 
 [[test]]
 fn test_slug_allows_hierarchy() -> i32
-    if valid(c"language/syntax") != 1
+    if not slug_valid("language/syntax")
         return 1
-    if valid(c"stdlib/io/file") != 1
+    if not slug_valid("stdlib/io/file")
         return 2
-    if valid(c"2026-roadmap") != 1
+    if not slug_valid("2026-roadmap")
         return 3
     0
 
 
 [[test]]
 fn test_slug_refuses_empty_segments() -> i32
-    if check(c"/lead") != SLUG_EMPTY_SEGMENT
+    if check("/lead") != SlugVerdict.EmptySegment
         return 1
-    if check(c"trail/") != SLUG_EMPTY_SEGMENT
+    if check("trail/") != SlugVerdict.EmptySegment
         return 2
-    if check(c"a//b") != SLUG_EMPTY_SEGMENT
+    if check("a//b") != SlugVerdict.EmptySegment
         return 3
-    if check(c"/") != SLUG_EMPTY_SEGMENT
+    if check("/") != SlugVerdict.EmptySegment
         return 4
+    0
+
+
+[[test]]
+fn test_slug_check_names_empty_and_too_long() -> i32
+    if check("") != SlugVerdict.Empty
+        return 1
+    var buf: [129]u8
+    for i in 0..129
+        buf[i] = 'a'
+    if check(strview_from_ptr(@buf[0], 129)) != SlugVerdict.TooLong
+        return 2
+    if check(strview_from_ptr(@buf[0], 128)) != SlugVerdict.Ok
+        return 3
     0
 
 
 [[test]]
 fn test_slug_refuses_upper_case() -> i32
     # One page per name: /wiki/Home and /wiki/home are not two pages.
-    if check(c"Home") != SLUG_BAD_CHAR
+    if check("Home") != SlugVerdict.BadChar
         return 1
-    if check(c"language/Syntax") != SLUG_BAD_CHAR
+    if check("language/Syntax") != SlugVerdict.BadChar
         return 2
     0
 
@@ -170,16 +184,16 @@ fn test_slug_refuses_upper_case() -> i32
 fn test_slug_reserves_route_words() -> i32
     # /wiki/new is the create form, and /wiki/<slug>/edit the edit form, so
     # neither can be a page's own name.
-    if check(c"new") != SLUG_RESERVED
+    if check("new") != SlugVerdict.Reserved
         return 1
-    if check(c"a/edit") != SLUG_RESERVED
+    if check("a/edit") != SlugVerdict.Reserved
         return 2
-    if check(c"edit") != SLUG_OK
+    if check("edit") != SlugVerdict.Ok
         return 3
-    if check(c"news") != SLUG_OK
+    if check("news") != SlugVerdict.Ok
         return 4
-    if check(c"a/editor") != SLUG_OK
+    if check("a/editor") != SlugVerdict.Ok
         return 5
-    if check(c"a/new") != SLUG_OK
+    if check("a/new") != SlugVerdict.Ok
         return 6
     0

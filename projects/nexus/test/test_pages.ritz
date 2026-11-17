@@ -4,11 +4,11 @@
 # fixed [16384]u8 / [8192]u8 / [4096]u8 stack buffers with no bounds checks,
 # and a stored page of 8192 `"` (escaped to 6 bytes each) overflowed by ~33 KB.
 
-import ritzlib.strview { StrView }
+import ritzlib.strview { StrView, strview_from_ptr }
 import ritzlib.string { String, string_new, string_drop, string_len, string_contains, string_as_ptr }
 import ritzlib.str { strneq }
 
-import pages { render_view_page, render_titled_view_page, render_edit_page, render_index_page, render_not_found_page, render_error_page, push_headers }
+import pages { render_view_page, render_titled_view_page, render_edit_page, render_index_page, render_not_found_page, render_error_page, push_headers, push_redirect_to_page }
 
 
 # A page body of `n` copies of `"`, in a caller buffer of 8192 bytes.
@@ -17,17 +17,17 @@ fn fill_quotes(buf: *u8, n: i32)
         *(buf + i) = '"'
 
 
-fn view_len(content: *u8, content_len: i32) -> i64
+fn view_len(content: StrView) -> i64
     var s: String = string_new()
-    render_view_page(@&s, c"page", 4, content, content_len)
+    render_view_page(@&s, "page", content)
     let n: i64 = string_len(@s)
     string_drop(@&s)
     return n
 
 
-fn edit_len(content: *u8, content_len: i32) -> i64
+fn edit_len(content: StrView) -> i64
     var s: String = string_new()
-    render_edit_page(@&s, c"page", 4, content, content_len)
+    render_edit_page(@&s, "page", content)
     let n: i64 = string_len(@s)
     string_drop(@&s)
     return n
@@ -39,8 +39,8 @@ fn edit_len(content: *u8, content_len: i32) -> i64
 fn test_view_page_holds_max_escaped_content() -> i32
     var content: [8192]u8
     fill_quotes(@content[0], 8192)
-    let empty: i64 = view_len(@content[0], 0)
-    let full: i64 = view_len(@content[0], 8192)
+    let empty: i64 = view_len(strview_from_ptr(@content[0], 0))
+    let full: i64 = view_len(strview_from_ptr(@content[0], 8192))
     if full - empty != 49152
         return 1
     if full <= 16384
@@ -52,8 +52,8 @@ fn test_view_page_holds_max_escaped_content() -> i32
 fn test_edit_page_holds_max_escaped_content() -> i32
     var content: [8192]u8
     fill_quotes(@content[0], 8192)
-    let empty: i64 = edit_len(@content[0], 0)
-    let full: i64 = edit_len(@content[0], 8192)
+    let empty: i64 = edit_len(strview_from_ptr(@content[0], 0))
+    let full: i64 = edit_len(strview_from_ptr(@content[0], 8192))
     if full - empty != 49152
         return 1
     0
@@ -65,7 +65,7 @@ fn test_view_page_ends_with_footer() -> i32
     var content: [8192]u8
     fill_quotes(@content[0], 8192)
     var s: String = string_new()
-    render_view_page(@&s, c"page", 4, @content[0], 8192)
+    render_view_page(@&s, "page", strview_from_ptr(@content[0], 8192))
     let n: i64 = string_len(@s)
     var rc: i32 = 0
     if n < 14 or strneq(string_as_ptr(@&s) + n - 14, c"</body></html>", 14) == 0
@@ -78,9 +78,8 @@ fn test_view_page_ends_with_footer() -> i32
 # escapes them in both the href and the link text.
 [[test]]
 fn test_index_escapes_stored_slugs() -> i32
-    let slugs = c"ok-page\n\"><script>x\n"
     var s: String = string_new()
-    render_index_page(@&s, slugs, 20)
+    render_index_page(@&s, "ok-page\n\"><script>x\n")
     var rc: i32 = 0
     if string_contains(@s, "<script>")
         rc = 1
@@ -97,7 +96,7 @@ fn test_index_escapes_stored_slugs() -> i32
 [[test]]
 fn test_index_empty_store() -> i32
     var s: String = string_new()
-    render_index_page(@&s, c"", 0)
+    render_index_page(@&s, "")
     var rc: i32 = 0
     if not string_contains(@s, "No pages yet")
         rc = 1
@@ -109,11 +108,11 @@ fn test_index_empty_store() -> i32
 # view and edit pages' hrefs and form action.
 [[test]]
 fn test_view_and_edit_escape_slug_in_href() -> i32
-    let bad = c"a\"b"
+    let bad: StrView = "a\"b"
     var s: String = string_new()
-    render_view_page(@&s, bad, 3, c"x", 1)
-    render_edit_page(@&s, bad, 3, c"x", 1)
-    render_not_found_page(@&s, bad, 3)
+    render_view_page(@&s, bad, "x")
+    render_edit_page(@&s, bad, "x")
+    render_not_found_page(@&s, bad)
     var rc: i32 = 0
     if string_contains(@s, "a\"b")
         rc = 1
@@ -141,7 +140,7 @@ fn test_error_page_has_title_and_message() -> i32
 [[test]]
 fn test_titled_view_heads_the_page_with_the_title_and_escapes_it() -> i32
     var out: String = string_new()
-    render_titled_view_page(@&out, c"home", 4, c"<T>", 3, c"body", 4)
+    render_titled_view_page(@&out, "home", "<T>", "body")
     let ok: bool = string_contains(@out, "<h1>&lt;T&gt;</h1>") and string_contains(@out, "/wiki/home/edit")
     string_drop(@&out)
     if ok
@@ -175,3 +174,15 @@ fn test_every_presenter_status_has_its_own_status_line() -> i32
 [[test]]
 fn test_store_unavailable_has_its_own_status_line() -> i32
     if status_line_is(503, "HTTP/1.1 503 Service Unavailable") then 0 else 1
+
+
+# The 303 after a save names the page's slug, a StrView (AGAST #3461).
+[[test]]
+fn test_redirect_to_page_names_the_slug() -> i32
+    var out: String = string_new()
+    push_redirect_to_page(@&out, "language/syntax")
+    var rc: i32 = 0
+    if not string_contains(@out, "HTTP/1.1 303 See Other\r\nLocation: /wiki/language/syntax\r\n")
+        rc = 1
+    string_drop(@&out)
+    rc
