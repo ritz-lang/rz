@@ -14,6 +14,8 @@ import sha256
 import sha512
 import asn1
 import ritzlib.memory { memzero }
+import ritzlib.strview
+import ritzlib.ct { ct_eq }
 
 # ============================================================================
 # Constants
@@ -202,17 +204,43 @@ fn rsa_parse_pubkey_sequence(data: *u8, len: i32, key: *RsaPublicKey) -> i32
 # PKCS#1 v1.5 Signature Verification
 # ============================================================================
 
-# Verify RSA signature with PKCS#1 v1.5 padding
-# sig = m^e mod n, where m is PKCS#1 padded message
-# Padding format: 0x00 || 0x01 || PS || 0x00 || DigestInfo
-# PS = 0xff bytes (at least 8)
-# DigestInfo = AlgorithmIdentifier || hash
+# EMSA-PKCS1-v1_5 encoding (RFC 8017 §9.2 step 5) into out[0..k):
+#   0x00 || 0x01 || PS (0xff, k - 3 - tLen bytes) || 0x00 || DigestInfo
+# where DigestInfo = prefix[0..prefix_len) || hash[0..hash_len) (tLen bytes).
+# Returns 0, or -1 if k is too short for the 8-byte minimum PS.
+pub fn rsa_pkcs1_v15_encode(hash: *u8, hash_len: i32, prefix: *u8, prefix_len: i32, out: *u8, k: i32) -> i32
+    let t_len: i32 = prefix_len + hash_len
+    let ps_len: i32 = k - 3 - t_len
+    if ps_len < 8
+        return -1
+    out[0] = 0x00
+    out[1] = 0x01
+    var i: i32 = 0
+    while i < ps_len
+        out[2 + i] = 0xff
+        i += 1
+    out[2 + ps_len] = 0x00
+    mem_copy(@out[3 + ps_len], prefix, prefix_len as u64)
+    mem_copy(@out[3 + ps_len + prefix_len], hash, hash_len as u64)
+    return 0
+
+# Verify RSA signature with PKCS#1 v1.5 padding (RSASSA-PKCS1-v1_5-VERIFY,
+# RFC 8017 §8.2.2): m = s^e mod n, EM = I2OSP(m, k), then EM must equal
+# EMSA-PKCS1-v1_5-ENCODE(hash). k fixes the PS length, so there is exactly
+# one valid EM; it is built and compared over all k bytes with ct_eq, so the
+# time taken does not depend on where the padding or hash goes wrong
+# (REVIEW.md M-8, AGAST #2183).
 fn rsa_verify_pkcs1(key: *RsaPublicKey, hash: *u8, hash_len: i32, hash_oid_prefix: *u8, prefix_len: i32, sig: *u8, sig_len: i32) -> i32
     # Signature length must match modulus length
     if sig_len != key.n_len
         return 0
 
-    if key.n_len < RSA_MIN_MODULUS_BYTES
+    if key.n_len < RSA_MIN_MODULUS_BYTES || key.n_len > RSA_MAX_MODULUS_BYTES
+        return 0
+
+    # Expected EM: depends only on public inputs (hash, algorithm, k).
+    var expected: [512]u8
+    if rsa_pkcs1_v15_encode(hash, hash_len, hash_oid_prefix, prefix_len, @expected[0], key.n_len) != 0
         return 0
 
     # Convert signature to BigInt
@@ -238,58 +266,10 @@ fn rsa_verify_pkcs1(key: *RsaPublicKey, hash: *u8, hash_len: i32, hash_oid_prefi
     var em: [512]u8
     bigint_to_bytes_fixed(@m, @em[0], key.n_len)
 
-    # Verify PKCS#1 v1.5 padding: 0x00 || 0x01 || PS || 0x00 || DigestInfo
-    # DigestInfo length = prefix_len + hash_len
-    let digest_info_len: i32 = prefix_len + hash_len
-    let min_ps_len: i32 = 8
-    let min_em_len: i32 = 3 + min_ps_len + digest_info_len
-
-    if key.n_len < min_em_len
+    # Compare all k bytes; no early exit.
+    let k: i64 = key.n_len as i64
+    if !ct_eq(strview_from_ptr(@em[0], k), strview_from_ptr(@expected[0], k))
         return 0
-
-    # Check 0x00 || 0x01
-    if em[0] != 0x00
-        return 0
-    if em[1] != 0x01
-        return 0
-
-    # Find end of PS (first 0x00 after position 2)
-    var ps_end: i32 = 2
-    while ps_end < key.n_len
-        if em[ps_end] == 0x00
-            break
-        if em[ps_end] != 0xff
-            return 0  # PS must be all 0xff
-        ps_end += 1
-
-    if ps_end >= key.n_len
-        return 0  # No 0x00 terminator found
-
-    let ps_len: i32 = ps_end - 2
-    if ps_len < min_ps_len
-        return 0  # PS too short
-
-    # Position after 0x00 separator
-    let digest_info_start: i32 = ps_end + 1
-
-    # Check remaining length
-    if key.n_len - digest_info_start != digest_info_len
-        return 0
-
-    # Verify DigestInfo prefix (algorithm OID)
-    var i: i32 = 0
-    while i < prefix_len
-        if em[digest_info_start + i] != hash_oid_prefix[i]
-            return 0
-        i += 1
-
-    # Verify hash value
-    i = 0
-    while i < hash_len
-        if em[digest_info_start + prefix_len + i] != hash[i]
-            return 0
-        i += 1
-
     return 1  # Signature valid
 
 # ============================================================================

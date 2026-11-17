@@ -582,3 +582,164 @@ fn test_rsa_parse_spki_pubkey_over_4096_rejected() -> i32
     if rsa_parse_public_key(@buf[0], n, @key) == 0
         return 1
     return 0
+
+# ============================================================================
+# EMSA-PKCS1-v1_5 encoding and full-length comparison (AGAST #2183)
+# ============================================================================
+#
+# rsa_verify_pkcs1 builds the expected EM with rsa_pkcs1_v15_encode and
+# compares all k bytes with an OR-accumulator instead of scanning PS, the
+# DigestInfo prefix and the hash with early exits (REVIEW.md M-8). With
+# e = 1, s^e mod n = s, so the "signature" is the EM itself and every byte
+# of it can be corrupted on purpose.
+
+fn fill_test_hash(hash: *u8, len: i32)
+    var i: i32 = 0
+    while i < len
+        hash[i] = (i * 7 + 3) as u8
+        i += 1
+
+[[test]]
+fn test_rsa_pkcs1_encode_layout() -> i32
+    var hash: [32]u8
+    fill_test_hash(@hash[0], 32)
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha256_digest_info_prefix(@prefix[0])
+    var em: [128]u8
+    if rsa_pkcs1_v15_encode(@hash[0], 32, @prefix[0], prefix_len, @em[0], 128) != 0
+        return 1
+    # 00 01 | 74 x ff | 00 | 19-byte prefix | 32-byte hash
+    if em[0] != 0x00 || em[1] != 0x01
+        return 2
+    var i: i32 = 2
+    while i < 76
+        if em[i] != 0xff
+            return 3
+        i += 1
+    if em[76] != 0x00
+        return 4
+    i = 0
+    while i < 19
+        if em[77 + i] != prefix[i]
+            return 5
+        i += 1
+    i = 0
+    while i < 32
+        if em[96 + i] != hash[i]
+            return 6
+        i += 1
+    return 0
+
+[[test]]
+fn test_rsa_pkcs1_encode_min_length() -> i32
+    # k must hold 00 01, at least 8 bytes of PS, 00 and the DigestInfo:
+    # 3 + 8 + 19 + 32 = 62 for SHA-256.
+    var hash: [32]u8
+    fill_test_hash(@hash[0], 32)
+    var prefix: [19]u8
+    let prefix_len: i32 = get_sha256_digest_info_prefix(@prefix[0])
+    var em: [128]u8
+    if rsa_pkcs1_v15_encode(@hash[0], 32, @prefix[0], prefix_len, @em[0], 61) == 0
+        return 1
+    if rsa_pkcs1_v15_encode(@hash[0], 32, @prefix[0], prefix_len, @em[0], 62) != 0
+        return 2
+    if em[9] != 0xff || em[10] != 0x00 || em[11] != 0x30
+        return 3
+    return 0
+
+# 1024-bit key with n = ff..ff and e = 1: any EM (leading 0x00) is < n and
+# verifies as itself.
+fn identity_key(key: *RsaPublicKey)
+    rsa_pubkey_init(key)
+    key.n_len = 128
+    key.e = 1
+    var i: i32 = 0
+    while i < 128
+        key.n[i] = 0xff
+        i += 1
+
+# Verify EM `em` (128 bytes) with byte `pos` XORed with `flip` (pos < 0: no
+# change) as a SHA-256 signature over `hash`.
+fn verify_em_sha256(em: *u8, pos: i32, flip: u8, hash: *u8) -> i32
+    var key: RsaPublicKey
+    identity_key(@key)
+    var sig: [128]u8
+    mem_copy(@sig[0], em, 128)
+    if pos >= 0
+        sig[pos] = sig[pos] ^ flip
+    return rsa_verify_pkcs1_sha256_hash(@key, hash, @sig[0], 128)
+
+[[test]]
+fn test_rsa_pkcs1_verify_identity_em_accepted() -> i32
+    var hash: [64]u8
+    fill_test_hash(@hash[0], 64)
+    var key: RsaPublicKey
+    identity_key(@key)
+    var prefix: [19]u8
+    var em: [128]u8
+    # SHA-256, SHA-384 and SHA-512 DigestInfo layouts all verify.
+    get_sha256_digest_info_prefix(@prefix[0])
+    rsa_pkcs1_v15_encode(@hash[0], 32, @prefix[0], 19, @em[0], 128)
+    if rsa_verify_pkcs1_sha256_hash(@key, @hash[0], @em[0], 128) != 1
+        return 1
+    get_sha384_digest_info_prefix(@prefix[0])
+    rsa_pkcs1_v15_encode(@hash[0], 48, @prefix[0], 19, @em[0], 128)
+    if rsa_verify_pkcs1_sha384_hash(@key, @hash[0], @em[0], 128) != 1
+        return 2
+    get_sha512_digest_info_prefix(@prefix[0])
+    rsa_pkcs1_v15_encode(@hash[0], 64, @prefix[0], 19, @em[0], 128)
+    if rsa_verify_pkcs1_sha512_hash(@key, @hash[0], @em[0], 128) != 1
+        return 3
+    # A SHA-384 EM is not a SHA-256 signature.
+    if rsa_verify_pkcs1_sha256_hash(@key, @hash[0], @em[0], 128) != 0
+        return 4
+    return 0
+
+[[test]]
+fn test_rsa_pkcs1_verify_rejects_each_em_region() -> i32
+    var hash: [32]u8
+    fill_test_hash(@hash[0], 32)
+    var prefix: [19]u8
+    get_sha256_digest_info_prefix(@prefix[0])
+    var em: [128]u8
+    if rsa_pkcs1_v15_encode(@hash[0], 32, @prefix[0], 19, @em[0], 128) != 0
+        return 1
+    if verify_em_sha256(@em[0], -1, 0, @hash[0]) != 1
+        return 2
+    # Leading 0x00 (0x01 keeps the EM below n = ff..ff)
+    if verify_em_sha256(@em[0], 0, 0x01, @hash[0]) != 0
+        return 3
+    # Block type 0x01 (0x02 is the encryption block type)
+    if verify_em_sha256(@em[0], 1, 0x03, @hash[0]) != 0
+        return 4
+    # First, middle and last PS byte
+    if verify_em_sha256(@em[0], 2, 0x01, @hash[0]) != 0
+        return 5
+    if verify_em_sha256(@em[0], 40, 0x80, @hash[0]) != 0
+        return 6
+    if verify_em_sha256(@em[0], 75, 0x01, @hash[0]) != 0
+        return 7
+    # Separator
+    if verify_em_sha256(@em[0], 76, 0x01, @hash[0]) != 0
+        return 8
+    # Last PS byte -> 0x00 moves the separator: PS one short, DigestInfo
+    # shifted right by one.
+    if verify_em_sha256(@em[0], 75, 0xff, @hash[0]) != 0
+        return 9
+    # First and last DigestInfo prefix byte
+    if verify_em_sha256(@em[0], 77, 0x01, @hash[0]) != 0
+        return 10
+    if verify_em_sha256(@em[0], 95, 0x01, @hash[0]) != 0
+        return 11
+    # First and last hash byte
+    if verify_em_sha256(@em[0], 96, 0x01, @hash[0]) != 0
+        return 12
+    if verify_em_sha256(@em[0], 127, 0x01, @hash[0]) != 0
+        return 13
+    # Same EM, different hash
+    var other: [32]u8
+    fill_test_hash(@other[0], 32)
+    other[31] = other[31] ^ 0x01
+    if verify_em_sha256(@em[0], -1, 0, @other[0]) != 0
+        return 14
+    return 0
