@@ -353,11 +353,11 @@ fn another_struct_source(s: *EmitterState, init: *Expr, want: *u8, want_len: i32
             src_len = 7
     if name_eq(src, src_len, want, want_len) == 1
         return 0
-    # AGAST #3441 (R49): of that pair only a `"..."` fits a `Span<u8>` slot, and
-    # it reads as a `Span$u8` here; a StrView value never converts.  The other
-    # way stays a conversion: a local bound to a `"..."` is a `Span$u8` here but
-    # a StrView in ritz0.
-    if is_layout_equiv_pair(src, src_len, want, want_len) == 1 and name_eq(src, src_len, c"StrView", 7) == 0
+    # AGAST #3441 (R49): of the StrView / Span$u8 pair only a `"..."` converts,
+    # either way, and it reads as a `Span$u8` here.  A StrView value never fits
+    # a `Span<u8>` slot, nor a `Span<u8>` value a StrView one (#3564): a local
+    # bound to a `"..."` is a StrView (str_view, above), as in ritz0.
+    if init.kind == EXPR_STRING_LIT and is_layout_equiv_pair(src, src_len, want, want_len) == 1
         return 0
     if find_struct(s, src, src_len) == null or find_struct(s, want, want_len) == null
         return 0
@@ -446,6 +446,10 @@ fn let_check_another_struct_store(s: *EmitterState, stmt: *Stmt)
             return
         want = loc.type_name
         want_len = loc.type_name_len
+        # #3564: `var c = "..."` holds a StrView, as its source reads.
+        if loc.str_view == 1
+            want = c"StrView"
+            want_len = 7
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
         let base: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
         if base == null
@@ -560,15 +564,31 @@ pub fn let_check_stmt(s: *EmitterState, stmt: *Stmt)
         let_check_expr(s, stmt.for_end)
 
 # After emit_var_decl: mark the binding it registered as a `let`, and (#3579)
-# one bound to an unannotated `"..."` as a StrView value.  `before` is
+# an unannotated one bound to a StrView value (init_is_str_view).  `before` is
 # s.local_count before the decl, so a decl that registered nothing never marks
 # an outer binding of the same name.
+# 1 when `e` is a StrView value that ritz1 lowers to a `%Span$u8`: a `"..."`,
+# a `... as StrView` (whose register is its operand's, #2131), or a local
+# marked str_view (#3564: `let b = a` copies what `a` is).
+fn init_is_str_view(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_STRING_LIT
+        return 1
+    if e.kind == EXPR_CAST and e.op == TYPE_STRUCT
+        return name_eq(e.ident_ptr, e.ident_len, c"StrView", 7)
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null and loc.str_view == 1
+            return 1
+    0
+
 pub fn let_mark_decl(s: *EmitterState, stmt: *Stmt, before: i32)
     let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
     if idx < before
         return
     let loc: *LocalVar = local_at(s, idx)
-    if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null and stmt.var_init.kind == EXPR_STRING_LIT
+    if stmt.var_declared_type == TYPE_VOID and init_is_str_view(s, stmt.var_init) == 1
         loc.str_view = 1
     if stmt.var_is_let == 1
         loc.is_let = 1

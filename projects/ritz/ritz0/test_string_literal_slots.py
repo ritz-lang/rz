@@ -380,6 +380,30 @@ REJECTED.update({
                                 4, 12, "field `s` of `H` is `Span<u8>`, not `StrView`"),
 })
 
+# AGAST #3564: nor does a `Span<u8>` value fit a StrView slot. ritz1 kept that
+# way open for a local bound to a `"..."`, which it typed `Span$u8`.
+_SV_RETURNED = "the fn is declared `-> StrView` but its return value is a `Span$u8`"
+REJECTED.update({
+    "span_strview_let": (_fn("v: Span<u8>", "let s: StrView = v\ns.len"), 2, 5,
+                         "`s` is declared `StrView` but its initialiser is a `Span$u8`"),
+    "span_strview_arg": ("fn take(s: StrView) -> i64\n    s.len\n" + _fn("v: Span<u8>", "take(v)"),
+                         4, 10, "parameter `s` is declared `StrView` but its argument is a `Span$u8`"),
+    "span_strview_return": (_fn("v: Span<u8>", "return v", "StrView"), 2, 5, _SV_RETURNED),
+    "span_strview_tail": (_fn("v: Span<u8>", "v", "StrView"), 2, 5, _SV_RETURNED),
+    "span_strview_field": ("struct H\n    s: StrView\n" + _fn("v: Span<u8>", "let h = H { s: v }\nh.s.len"),
+                           4, 20, "field `s` of `H` is `StrView`, not `Span$u8`"),
+})
+# A local bound to a `"..."` is a StrView: it fits each of those StrView slots.
+ACCEPTED["literal_local_strview_slots"] = (
+    "struct H\n    s: StrView\nfn take(s: StrView) -> i64\n    s.len\n"
+    'fn r() -> StrView\n    let a = "ab"\n    return a\n'
+    'fn t() -> StrView\n    let a = "abc"\n    a\n'
+    'fn main() -> i32\n    let a = "abcd"\n    let s: StrView = a\n    let h = H { s: a }\n'
+    # A copy of one is one too, and so is a `var` it is assigned to.
+    '    let b = a\n    var c = "x"\n    c = a\n'
+    "    (s.len + take(a) + r().len + t().len + h.s.len + take(b) + take(c)) as i32\n",
+    4 + 4 + 2 + 3 + 4 + 4 + 4)
+
 # AGAST #3580: StrView is built in, so the rule can't lean on ritzlib.strview.
 # Without it ritz0 typed the literal as a bare `{ ptr, len }`, which no struct
 # check could name: it compiled a fn main doesn't call, and crashed ("Cannot
