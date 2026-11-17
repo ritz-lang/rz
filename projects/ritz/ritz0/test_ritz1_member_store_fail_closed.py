@@ -48,7 +48,10 @@ struct P
 
 # Each maps to (program, diagnostic substring).
 MEMBER = "unhandled EXPR_MEMBER in assignment"
-INDEXED = "unhandled indexed EXPR_MEMBER in assignment"
+# A field the struct doesn't have is R17 rule 5's located error (AGAST #3015),
+# said by Sema since AGAST #3509: the compile stops there, before the emitter's
+# "unhandled EXPR_MEMBER in assignment" that followed it.
+NO_FIELD = "error: `P` has no field `nope`"
 
 UNRESOLVED = {
     # The ticket's local-var repro.
@@ -60,7 +63,7 @@ pub fn main() -> i32
     p.nope = 3
     return 0
 """,
-        MEMBER,
+        NO_FIELD,
     ),
     # The ticket's pointer-param repro.
     "param_unknown_field": (
@@ -72,7 +75,7 @@ fn set(q: *P)
 pub fn main() -> i32
     return 0
 """,
-        MEMBER,
+        NO_FIELD,
     ),
     # `s.f += v` desugars to the same statement kind.
     "compound_unknown_field": (
@@ -83,7 +86,7 @@ pub fn main() -> i32
     p.nope += 3
     return 0
 """,
-        MEMBER,
+        NO_FIELD,
     ),
     # Base is neither a local, a param nor a global.
     "unknown_base": (
@@ -104,7 +107,7 @@ pub fn main() -> i32
     g.nope = 3
     return 0
 """,
-        MEMBER,
+        NO_FIELD,
     ),
     "local_unknown_field_index": (
         STRUCT_P
@@ -114,7 +117,7 @@ pub fn main() -> i32
     p.nope[0] = 3
     return 0
 """,
-        INDEXED,
+        NO_FIELD,
     ),
     # (`a.b.data[2] = 1` with `data: *[4]u8` stood here: an array pointee had no
     # element kind.  LARB R9 makes it element 2's store, and #2329 lowers it; it's
@@ -135,7 +138,7 @@ pub fn main() -> i32
     o.i.nope = 3
     return 0
 """,
-        MEMBER,
+        "error: `In` has no field `nope`",
     ),
     "explicit_deref_unknown_field": (
         STRUCT_P
@@ -146,7 +149,7 @@ fn set(q: *P)
 pub fn main() -> i32
     return 0
 """,
-        MEMBER,
+        NO_FIELD,
     ),
     "array_elem_unknown_field": (
         STRUCT_P
@@ -156,7 +159,7 @@ pub fn main() -> i32
     arr[1].nope = 3
     return 0
 """,
-        MEMBER,
+        NO_FIELD,
     ),
 }
 

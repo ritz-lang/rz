@@ -36,6 +36,14 @@ FAIL = {
 }
 
 
+# Where ritz1's words differ.  `h.nope` is R17 rule 5's located error, said by
+# Sema since AGAST #3509: the compile stops there, before the emitter's sizeof
+# error that followed it.
+RITZ1_NEEDLE = {
+    "unknown_field": "`Holder` has no field `nope`",
+}
+
+
 def _program(body: str) -> str:
     return PRELUDE + "fn main() -> i32\n    var h: Holder\n    h.tag = 0\n" + body
 
@@ -72,6 +80,7 @@ def test_ritz0_rejects_unsizable_operand(tmp_path, name):
 @pytest.mark.parametrize("name", sorted(FAIL))
 def test_ritz1_rejects_unsizable_operand(ritz1_bin, tmp_path, name):
     body, needle = FAIL[name]
+    needle = RITZ1_NEEDLE.get(name, needle)
     _assert_rejected(_compile("ritz1", tmp_path, name, _program(body)), "ritz1", needle)
 
 

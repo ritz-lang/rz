@@ -162,6 +162,9 @@ still run mid-lowering on `*EmitterState`, and
 - `call_check` — a call's arguments fit its callee.
 
 - `deref_field` — `.` through a struct's `Deref` / `DerefMut` (§7.7, R17).
+  Sema also resolves such a `.` into step calls, each annotated
+  (`Expr.deref_step`), before the other checks read the statement; the
+  emitter only lowers them.
 
 - `enum_as_int` — an enum value where an integer is expected (§10.4).
 

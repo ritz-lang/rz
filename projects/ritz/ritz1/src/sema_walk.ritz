@@ -43,6 +43,7 @@ import import_vis    # AGAST #3891
 import ritzlib.str
 import ritzlib.io
 import ritzlib.memory
+import deref_field   # `.` through Deref (AGAST #3015 / #3509)
 
 # AGAST #3891: a use, in the input's own code, of a name that reaches the
 # input only through some module's plain `import` (import_vis.ritz).  A
@@ -75,6 +76,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
         if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_inner_name, arm.pattern_inner_name_len)
             bool_note_arm(sm, arm, scrut)
+            df_note_arm(sm, arm, scrut)   # AGAST #3509
         else if arm.pattern_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_name, arm.pattern_name_len)
             bool_note_arm(sm, arm, scrut)
@@ -86,6 +88,11 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
         # The arm's `let`s stay bound for its trailing expression: `let b =
         # ..` then `b.p()` (AGAST #2237 / #3511); the arm's mark drops them.
         sema_walk_block(sm, arm.body_stmts, 1)
+        # AGAST #3015: a match arm's value, with its binding in scope (an
+        # if-expression's arms were resolved with their statement).  Before
+        # let_check, as the emitter used to run them.
+        if scrut != null and arm.is_pass == 0
+            deref_field_expr(sm, arm.body)
         if arm.is_pass == 0
             let_check_expr(sm, arm.body)   # AGAST #2028: as emit_match_arm_body
         enum_as_int_expr(sm, arm.body)   # AGAST #2136 / #3511
@@ -176,6 +183,9 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
     else
         sema_expr_ty(sm, st.var_init, @t)
     sema_bind_ty(sm, st.var_name, st.var_name_len, @t, st.var_is_let)
+    if st.var_type == TYPE_ARRAY
+        let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+        v.elem = st.var_array_elem_type   # deref_field's receivers (AGAST #3509)
 
 fn sema_bind_param(sm: *Sema, p: *Param)
     var t: SemaTy
@@ -209,6 +219,9 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
     var st: *Stmt = first
     while st != null
         pass_value_check(sm, st)   # AGAST #3759
+        # AGAST #3015 / #3509: `.` through Deref, before any check that reads
+        # members.  pass_value only looks for `pass`, which a step never holds.
+        deref_field_stmt(sm, st)
         let fn_tail: i32 = (st.next == null and sm.cur_fn != null and first == sm.cur_fn.body) as i32
         if fn_tail == 1
             bool_check_tail(sm, st)   # AGAST #2342
@@ -229,6 +242,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             let_note_decl(sm, st)   # AGAST #3504
             eai_note_decl(sm, st)   # AGAST #3511
             narrow_sema_decl(sm, st)
+            df_note_decl(sm, st)   # AGAST #3509
             bool_note_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
             sema_walk_expr(sm, st.var_init)
@@ -239,6 +253,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             while tn != null
                 sema_bind(sm, tn.name, tn.len)
                 tn = tn.next
+            df_note_tuple(sm, st)   # AGAST #3509
         else if st.kind == STMT_FOR
             sema_walk_expr(sm, st.for_start)
             sema_walk_expr(sm, st.for_end)
@@ -246,6 +261,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             sema_bind(sm, st.for_var, st.for_var_len)
             bool_note_for(sm, st)
             let_note_for(sm, st)   # AGAST #2389: an element is a `let`
+            df_note_for(sm, st)   # AGAST #3509
             sema_walk_stmts(sm, st.for_body, 0)
             sm.scope_top = for_mark
         else if st.kind == STMT_IF
@@ -344,6 +360,7 @@ fn sema_seen_before(m: *Module, seen: *HashMapI64, f: *FnDef) -> i32
 pub fn sema_check_module(m: *Module, path: *u8) -> i32
     let sm: *Sema = malloc(sizeof(Sema)) as *Sema
     sema_init(sm, m, path)
+    deref_impls_check(sm)   # AGAST #3015: a `DerefMut` impl needs its `Deref`
     bool_check_globals(sm)   # AGAST #2342: before the fns, as the emitter
     var seen: HashMapI64 = hashmap_i64_with_cap(4096)
     var f: *FnDef = m.functions

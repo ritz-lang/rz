@@ -1005,6 +1005,14 @@ def test_a_pointer_to_an_array_of_vecs_walks_the_vecs(run_with, compiler):
 @pytest.mark.parametrize("name", sorted(NOT_A_HEADER))
 def test_anything_else_is_refused(compile_with, compiler, name):
     comp, ll, _ = compile_with(compiler, name, NOT_A_HEADER[name])
+    if name == "no_field":
+        # R17 rule 5's located error, at the field (AGAST #3015).  Sema says it
+        # since AGAST #3509 and stops there, before the emitter's "not
+        # supported" at the iterable that followed it.
+        out = comp.stdout + comp.stderr
+        assert comp.returncode != 0 and not ll.exists(), out
+        assert "main.ritz:11:16: error: `VH` has no field `nope`" in out, out
+        return
     _is_refused(comp, ll, UNSUPPORTED, NOT_A_HEADER[name])
 
 

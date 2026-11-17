@@ -54,20 +54,25 @@ fn main() -> i32
     n.rotl()
 """
 
-# Both: the unlocated one still earns the summary, counting only itself.
+# Both: the unlocated one still earns the summary, counting only itself.  The
+# located one is an emitter error (an unsupported `for` iterable): `h.0` is
+# Sema's now (AGAST #3509), as is a `let` store (#3504), and a Sema error
+# stops the compile before the emitter.
 _BOTH = """\
-struct Holder
-    n: i32
-
 fn f() -> i32
-    var h = Holder { n: 2 }
-    h.0
+    var q: i32 = 3
+    var t: i32 = 0
+    for x in q
+        t = t + 1
+    t
 
 fn main() -> i32
     return no_such_name
 """
 
-_HAS_NO_FIELD = "unit.ritz:6:7: `Holder` has no field `0`"
+# Said by Sema now (deref_field.ritz, AGAST #3509), in diag's form (#3445).
+_HAS_NO_FIELD = "unit.ritz:6:7: error: `Holder` has no field `0`"
+_FOR_ITERABLE = "unit.ritz:4:14: this `for` iterable is not supported in ritz1"
 _UNKNOWN = "cannot emit: unknown identifier"
 
 # name -> (source, messages that must appear, expected summary line or None)
@@ -80,7 +85,7 @@ CASES = {
         f"error: ritz1 emitted 1 {SUMMARY}",
     ),
     "located_and_unlocated": (
-        _BOTH, [_HAS_NO_FIELD, _UNKNOWN], f"error: ritz1 emitted 1 {SUMMARY}"
+        _BOTH, [_FOR_ITERABLE, _UNKNOWN], f"error: ritz1 emitted 1 {SUMMARY}"
     ),
 }
 
