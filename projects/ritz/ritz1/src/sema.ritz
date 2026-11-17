@@ -29,6 +29,8 @@
 #   check_implicit_narrowing (narrowing.ritz, AGAST #1364 / #3505): a typed
 #     `let` / `var` whose initialiser may not fit.
 #   bool_check_* (bool_check.ritz, AGAST #2342, #3502): `bool` is its own type.
+#   call_check_* (call_check.ritz, AGAST #1629, #3503): a call's callee is
+#     known and its arguments fit it.
 #
 # It still imports emitter_core for pure helpers (name_eq, eprint_bytes,
 # find_impl_method_by_symbol); moving them off emitter_core belongs to #1816's
@@ -79,6 +81,9 @@ struct SemaVar
     shape: *ArrayShape    # an N-D `[N][M]T` local's shape
     inner: i32            # a `**T` local's inner-pointee slot (ptr_ptr_slot_levels)
     elem_pointee: i32     # U of a `[N]*U` local: what `*a[i]` reads
+    # The `name:& T` / `self:&` param this local is, or null: call_check's
+    # lent_local (AGAST #3503; the emitter's LocalVar.is_lent, #2250).
+    lent: *Param
 
 struct Sema
     module: *Module
@@ -264,6 +269,7 @@ pub fn sema_bind_ty(sm: *Sema, name: *u8, len: i32, t: *SemaTy, is_let: i32)
     v.shape = null
     v.inner = TYPE_VOID
     v.elem_pointee = TYPE_VOID
+    v.lent = null
     sm.scope_top = sm.scope_top + 1
 
 # A binding Sema can't type.
@@ -305,6 +311,18 @@ pub fn sema_impl_method(sm: *Sema, type_name: *u8, type_name_len: i32, method: *
         ib = ib.next
     null
 
+# The impl block whose methods hold `f`, or null.
+pub fn sema_impl_of(sm: *Sema, f: *FnDef) -> *ImplBlock
+    var ib: *ImplBlock = sm.module.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            if method == f
+                return ib
+            method = method.next
+        ib = ib.next
+    null
+
 # `a` + `sep` + `b`, heap-allocated; *out_len is its length.
 fn sema_join(a: *u8, a_len: i32, sep: u8, b: *u8, b_len: i32, out_len: *i32) -> *u8
     var n: i32 = a_len + b_len
@@ -325,7 +343,7 @@ fn sema_join(a: *u8, a_len: i32, sep: u8, b: *u8, b_len: i32, out_len: *i32) -> 
     *out_len = n
     buf
 
-fn sema_spec_impl_method(sm: *Sema, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
+pub fn sema_spec_impl_method(sm: *Sema, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
     var n: i32 = 0
     let buf: *u8 = sema_join(type_name, type_name_len, '_', method, method_len, @n)
     let fd: *FnDef = sema_find_fn(sm, buf, n)
@@ -337,7 +355,7 @@ fn sema_has_own_method(sm: *Sema, type_name: *u8, type_name_len: i32, method: *u
         return 1
     (sema_spec_impl_method(sm, type_name, type_name_len, method, method_len) != null) as i32
 
-fn sema_ufcs_fn(sm: *Sema, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
+pub fn sema_ufcs_fn(sm: *Sema, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
     var prefix: *u8 = null
     var prefix_len: i32 = 0
     var suffix_start: i32 = 0 - 1

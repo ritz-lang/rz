@@ -35,6 +35,7 @@ import narrowing     # check_implicit_narrowing (AGAST #3505)
 import generic_method
 import field_slot
 import bool_check
+import call_check    # AGAST #1629, on Sema since #3503
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
@@ -82,12 +83,21 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         sema_walk_expr(sm, e.operand)
     else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
         sema_walk_expr(sm, e.left)
-    else if k == EXPR_CALL or k == EXPR_ARRAY_LIT
-        if k == EXPR_CALL
-            generic_method_check(sm, e)   # LARB R37 (AGAST #3373)
+    else if k == EXPR_CALL
+        # LARB R37 (AGAST #3373), else AGAST #1629 / #3503.
+        if generic_method_check(sm, e) == 0
+            call_check_call(sm, e)
+        # `sizeof(x)` and a non-literal `print(x)` never lower their operand.
+        let mute: i32 = call_check_mutes(e)
+        call_check_mute(mute)
+        sema_walk_list(sm, e.args)
+        call_check_mute(0 - mute)
+    else if k == EXPR_ARRAY_LIT
         sema_walk_list(sm, e.args)
     else if k == EXPR_METHOD
+        # After the receiver, as emit_expr_method lowers it first.
         sema_walk_expr(sm, e.left)
+        call_check_method(sm, e)      # AGAST #1629 / #3503
         sema_walk_list(sm, e.args)
     else if k == EXPR_STRUCT_LIT
         struct_lit_field_check(sm, e)   # LARB R49 (AGAST #3563)
@@ -130,6 +140,9 @@ fn sema_bind_param(sm: *Sema, p: *Param)
         t.pointee = p.param_pointee_type
         t.fn_sig = p.fn_sig
     sema_bind_ty(sm, p.name, p.name_len, @t, 0)
+    if (p.is_borrow == 1 or p.is_self_borrow == 1) and sm.scope_top > 0
+        let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
+        lv.lent = p
 
 fn sema_is_assign(kind: i32) -> i32
     (kind == STMT_ASSIGN or kind == STMT_MEMBER_ASSIGN or kind == STMT_MEMBER_INDEX_ASSIGN or kind == STMT_INDEX_ASSIGN or kind == STMT_LOCAL_FIELD_ASSIGN or kind == STMT_LOCAL_FIELD_INDEX_ASSIGN) as i32

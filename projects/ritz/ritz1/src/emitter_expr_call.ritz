@@ -11,7 +11,6 @@ import emitter_stmt   # the whole-array copy (AGAST #2287)
 import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_expr_arith    # emit_nd_index_ptr (AGAST #3306)
 import narrowing
-import call_check   # call_check_arity (and a private callee, #3419), call_check_kind, call_check_method (AGAST #1629), call_check_boxed (#3420)
 import literal_slot # AGAST #2341
 import index_through # emit_through_elem_ptr (AGAST #2443)
 import monomorph     # array_arg_decode (AGAST #3029)
@@ -595,7 +594,6 @@ fn try_emit_ufcs_method(s: *EmitterState, e: *Expr, type_name: *u8, type_name_le
     if fn_def == null
         return -1
     note_method_callee(s, e, fn_def)   # AGAST #2237
-    call_check_method(s, e, fn_def, 1)   # AGAST #1629: the receiver fills the first param
     return emit_ufcs_call(s, e, fn_def, receiver_reg, recv_is_ptr_of_ptr, type_name, type_name_len)
 
 # The monomorphized UFCS helper `type_name.method` dispatches to
@@ -965,12 +963,9 @@ fn emit_ufcs_call(s: *EmitterState, e: *Expr, fn_def: *FnDef, receiver_reg: i32,
                 else
                     # The newtype box is gone: nothing converts to a struct,
                     # not even a single-field one (LARB R47b, §9.2, #3420).
-                    # call_check's rule A refuses the integers it vouches
-                    # for; this refuses the rest (`a.add(i * 1)`).  A name
-                    # that is no struct (a monomorph's `T` left TYPE_STRUCT)
-                    # takes the i64 as it is.
-                    if find_struct(s, param_ptr.param_type_name, param_ptr.param_type_name_len) != null
-                        call_check_boxed(s, e, j + 2, arg_expr, param_ptr)
+                    # Sema's call_check refused an integer for a real struct
+                    # (AGAST #3503); a name that is no struct (a monomorph's
+                    # `T` left TYPE_STRUCT) takes the i64 as it is.
                     converted_regs[j] = arg_regs[j]
             else
                 converted_regs[j] = arg_regs[j]
@@ -4560,19 +4555,15 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
         # clang refused it, unlocated (AGAST #2447).
         if fn_def == null
             fn_def = find_impl_method_by_symbol(s.module, full_name, full_len)
-        # AGAST #3255: no fn answers the name; refused here, not by the link.
-        # AGAST #3667: a generic call too.  Monomorphization gives every call
-        # of a template its instance, so `nope<i64>(x)` misses only when no
-        # generic `nope` exists; named as ritz0 names it, without `$i64`
-        # (`full_name` starts with the bare name).
+        # AGAST #3255, #3667: Sema's call_check refused a call no fn answers
+        # (AGAST #3503), so one reaching here is a Sema / emitter split.
         if fn_def == null
-            if call_check_known(s, e.span.line, e.span.col, full_name, e.func_name_len) == 1
-                return 0
+            emit_ir_error_begin(s, c"a call Sema passed names no fn: '")
+            emit_ir_error_end(s, full_name, full_len)
+            return 0
         fn_def = lent_self_call_view(s, fn_def)
-    # AGAST #1629: the argument count, then each argument's kind, as ritz0 says them.
-    var args_fit: i32 = 0
-    if fn_def != null and call_check_arity(s, e.span.line, e.span.col, full_name, full_len, fn_def, e.args) == 0
-        args_fit = 1
+    # AGAST #1629: Sema's call_check has judged the argument count and each
+    # argument's kind (AGAST #3503).
 
     # Sized from the argument list (AGAST #1813): a fixed [16] dropped every
     # argument past the 16th.
@@ -4585,8 +4576,6 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     while arg2 != null
         check_struct_ptr_arg(s, e, e.func_name, e.func_name_len, arg_count + 1, arg2, ap)
         check_array_arg(s, e, e.func_name, e.func_name_len, arg_count + 1, arg2, ap)
-        if args_fit == 1
-            call_check_kind(s, full_name, full_len, arg_count + 1, arg2, ap)   # AGAST #1629
         arg_regs[arg_count] = emit_call_arg(s, arg2, ap)
         arg_count += 1
         if ap != null
@@ -6259,8 +6248,6 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 sib = sib.next
             if sm_method != null
                 note_method_callee(s, e, sm_method)   # AGAST #2237
-                if param_is_self(sm_method.params) == 0
-                    call_check_method(s, e, sm_method, 0)   # AGAST #1629: a static call
                 if refuse_array_return(s, e, sm_method) == 1
                     return 0
                 # A receiver is what `self` takes, and a type isn't one, as in
@@ -6922,8 +6909,6 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     if mfn == null and refuse_no_method(s, e, type_name, type_name_len) == 1
         return 0
     note_method_callee(s, e, mfn)   # AGAST #2237
-    if mfn != null
-        call_check_method(s, e, mfn, param_is_self(mfn.params))   # AGAST #1629
     if refuse_array_return(s, e, mfn) == 1
         return 0
     if refuse_receiver_short_of_self(s, recv, mfn, recv_levels) == 1
@@ -7022,34 +7007,9 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                         emit_reg(s, mloc.reg)
                         emit_str(s, c" to i64\n")
                         conv_regs[j] = pti_m
-            else if mp.param_type == TYPE_STRUCT and mp.param_type_name_len > 0 and param_uses_byval(s, mp) == 0
-                # (A large struct is already its byval slot, AGAST #1739.)
-                # An integer-typed arg for a struct param, which the newtype
-                # box used to store into the struct: refused (LARB R47b,
-                # #3420).  Pointers and other structs pass through.
-                var mae2: *Expr = e.args
-                var mk2: i32 = 0
-                while mk2 < j and mae2 != null
-                    mae2 = mae2.next
-                    mk2 = mk2 + 1
-                var is_scalar_int2: i32 = 0
-                # A tagged or user enum, or `usize`, is never a scalar newtype
-                # (param_takes_arg_unboxed).
-                if param_takes_arg_unboxed(mp.param_type_name, mp.param_type_name_len) == 1
-                    mae2 = null
-                # A struct literal, `*r` or a struct-returning (method) call
-                # is already the `%T` aggregate (#1362, AGAST #2413).
-                if arg_is_struct_value(s, mae2) == 1
-                    mae2 = null
-                if mae2 != null
-                    let at2: i32 = get_expr_type(s, mae2)
-                    if at2 == TYPE_I8 or at2 == TYPE_U8 or at2 == TYPE_I16 or at2 == TYPE_U16 or at2 == TYPE_I32 or at2 == TYPE_U32 or at2 == TYPE_I64 or at2 == TYPE_U64
-                        is_scalar_int2 = 1
-                # The newtype box is gone (LARB R47b, §9.2, #3420): an
-                # integer for a by-value struct is refused, as in the UFCS
-                # cascade.  The receiver is argument 1.
-                if is_scalar_int2 == 1 and find_struct(s, mp.param_type_name, mp.param_type_name_len) != null
-                    call_check_boxed(s, e, j + 2, mae2, mp)
+            # An integer for a by-value struct param, which the newtype box
+            # used to store into the struct, is Sema's call_check's to refuse
+            # (LARB R47b, §9.2, #3420; AGAST #3503).
             mp = mp.next
 
     var rtype: i32 = TYPE_I64
