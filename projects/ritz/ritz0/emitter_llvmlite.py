@@ -14089,6 +14089,11 @@ class LLVMEmitter:
                 builtin_span = self._try_emit_builtin_span_method(expr, type_name)
                 if builtin_span is not None:
                     return builtin_span
+                if type_name == 'Span' or type_name.startswith('Span$'):
+                    # ritz1's words, at the method name (AGAST #3764): the
+                    # checker leaves a built-in generic's methods to us.
+                    raise EmitError(ref_rules.no_method(expr.method, type_name),
+                                    expr.name_span or expr.span)
                 raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
             used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 

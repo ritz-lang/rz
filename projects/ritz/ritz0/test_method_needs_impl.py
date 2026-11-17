@@ -127,9 +127,9 @@ pub fn main() -> i32
     ),
 }
 
-# ...but a declared `Span<u8>` is one: ritz1 names it so.  ritz0 raises an
-# unlocated ValueError for it (AGAST #3764), so this row is ritz1's until then.
-RITZ1_REFUSED = {
+# ...but a declared `Span<u8>` is one, and all three name it so. ritz0's
+# emitter raised an unlocated ValueError for it (AGAST #3764).
+SPAN_REFUSED = {
     "span_u8": (
         """\
 pub fn main() -> i32
@@ -279,9 +279,9 @@ def test_a_strview_method_it_lacks_is_refused_as_strview(tmp_path, compiler):
     _assert_refused(compiler, tmp_path, "strview", program, message)
 
 
-@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
-def test_ritz1_refuses_a_declared_span_u8_method_as_span(tmp_path, compiler):
-    program, message = RITZ1_REFUSED["span_u8"]
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_declared_span_u8_method_it_lacks_is_refused_as_span(tmp_path, compiler):
+    program, message = SPAN_REFUSED["span_u8"]
     _assert_refused(compiler, tmp_path, "span_u8", program, message)
 
 
