@@ -23,8 +23,6 @@ from .valet import suite_valet
 # Check id -> the ticket that owns its failure. Delete an entry in the same
 # change that makes its check pass; the run fails (XPASS) until you do.
 XFAILS: dict[str, str] = {
-    # help: exit 0 on --help, usage on stdout, nothing written into cwd
-    "help:ritz-lsp/ritz-lsp": "#3159 ignores --help: starts the server, logs to stderr only, nothing on stdout",
     # hollow entry points (#2460 made the rest honest; sage still runs nothing)
     "hollow.sage_runs_js": "#2787 sage has no interpreter: `sage t.js` exits 1 'not implemented'",
 }

@@ -70,6 +70,10 @@ printf 'Content-Length: 58\r\n\r\n{"jsonrpc":"2.0","id":1,"method":"initialize",
     | ./projects/ritz-lsp/build/debug/ritz-lsp
 ```
 
+`ritz-lsp --help` (or `-h`) prints usage and exits 0 without starting the
+server. `--stdio`, which editors' LSP clients pass, is accepted and is the
+default. Any other argument is a usage error: exit 2, usage on stderr.
+
 ### Vim with coc.nvim
 
 Add to `~/.vim/coc-settings.json`:
