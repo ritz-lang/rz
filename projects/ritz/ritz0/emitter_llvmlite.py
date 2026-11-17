@@ -105,6 +105,50 @@ class UnknownFunction(EmitError, ValueError):
     an address falls back as it did before the location was added."""
 
 
+MATCH_HAS_NO_VALUE = (
+    "this match has no value: its arms don't yield one value type, "
+    "so it can't be used where a value is wanted")
+
+
+class MatchHasNoValue(EmitError, AttributeError):
+    """A `NoValue` read as a value (AGAST #1357), located at its match.
+
+    Also an AttributeError, so `hasattr(v, 'type')` / `getattr(v, 'type',
+    None)` probes still answer "no value" as they did for ir.Undefined; only
+    a consumer that really reads the value's type gets the located error."""
+
+    def __init__(self, span: Optional[rast.Span]):
+        super().__init__(MATCH_HAS_NO_VALUE, span)
+
+
+class NoValue:
+    """What a match with no value yields: its live arms' types can't merge, or
+    an arm ends in a statement (#1321).  Fine as a statement.  It was the bare
+    ir.Undefined, so a consumer in value position (a `let`, an assignment, a
+    `return`, an operand...) died with a raw `'_Undefined' object has no
+    attribute 'type'`.  This carries the match's span, and any attribute read
+    (`.type`, `.get_reference()`...) raises MatchHasNoValue there (#1357)."""
+
+    __slots__ = ("span",)
+
+    def __init__(self, span: Optional[rast.Span]):
+        self.span = span
+
+    def __getattr__(self, name):
+        if name.startswith("__"):
+            raise AttributeError(name)
+        raise MatchHasNoValue(self.span)
+
+    def __repr__(self):
+        return "NoValue"
+
+
+def has_no_value(val) -> bool:
+    """Whether `val` is an expression's "no value": ir.Undefined (a block
+    ending in a statement, a diverging `break` / `return`) or a NoValue."""
+    return val is ir.Undefined or isinstance(val, NoValue)
+
+
 class TempPlace(ValueError):
     """A store or `@` reached a call's by-value result, which is no place
     (AGAST #2518). A ValueError, so a route that only tries for an address
@@ -5963,7 +6007,9 @@ class LLVMEmitter:
                 # position compile clean and silently evaluate to 0.
                 # AGAST #1321 (angelo font.ritz ensure_cmap is the procedure
                 # case); see test_match_mixed_type_arms.py for both directions.
-                if last_val is ir.Undefined:
+                if has_no_value(last_val):
+                    if fn_def.ret_type is not None and isinstance(last_val, NoValue):
+                        raise MatchHasNoValue(last_val.span)  # #1357
                     if fn_def.ret_type is not None:
                         raise EmitError(
                             f"function '{fn_def.name}' declares a return type "
@@ -15089,13 +15135,14 @@ class LLVMEmitter:
     def _check_initialiser_has_value(self, stmt, val) -> None:
         """Reject a typed `let`/`var` whose initialiser yielded no value.
 
-        A match whose live arms have irreconcilable types returns
-        ir.Undefined (#1321). Read as a value it died with a raw
-        `'_Undefined' object has no attribute 'type'` (#1357, #2027).
-        A pointer or bool arm next to a float arm under a float annotation
-        still lands here (#2027, #2093), now as a located error.
+        A match whose live arms have irreconcilable types yields a NoValue
+        (#1321). Read as a value it died with a raw `'_Undefined' object has
+        no attribute 'type'` (#1357, #2027). A pointer or bool arm next to a
+        float arm under a float annotation lands here too (#2027, #2093).
+        Reported at the `let`, naming its annotation: a consumer with no
+        annotation reports the NoValue at its match instead (#1357).
         """
-        if val is not ir.Undefined:
+        if not has_no_value(val):
             return
         raise EmitError(
             f"`{stmt.name}` is declared `{self._format_ritz_type(stmt.type)}` "
@@ -15172,7 +15219,7 @@ class LLVMEmitter:
     def _another_struct_pair(self, val: ir.Value, declared_ty: ir.Type):
         """(declared, actual) struct names when `val` is a struct of another type
         than `declared_ty`, else None (AGAST #2293, #3293)."""
-        if val is ir.Undefined or not isinstance(declared_ty, ir.IdentifiedStructType):
+        if has_no_value(val) or not isinstance(declared_ty, ir.IdentifiedStructType):
             return None
         actual = val.type
         if isinstance(actual, ir.PointerType) and isinstance(actual.pointee, ir.IdentifiedStructType):
@@ -15730,7 +15777,7 @@ class LLVMEmitter:
     # to the annotation (sitofp, via _convert_type); so does `let a: f32 =
     # <f64>` (fptrunc). A match or if that IS the initialiser gets the same
     # conversion per arm, so its arms merge at the annotation's float type
-    # instead of being called irreconcilable (match: ir.Undefined, then a raw
+    # instead of being called irreconcilable (match: no value, once a raw
     # AttributeError in LetStmt) or merged at the "larger" int type (if:
     # `if c then 0 else 1.5` truncated 1.5 to 1). Same rule as ritz1 #1946.
 
@@ -16372,11 +16419,13 @@ class LLVMEmitter:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
             # A match used as a *statement* has arms that produce no value
-            # (an assignment, a `let`, an early return...). Those emit
-            # ir.Undefined, which has no `.type` and cannot be phi'd - the
-            # match simply has no value, so fall through to the dummy below.
+            # (a block ending in a statement). Those emit ir.Undefined (or a
+            # nested match's NoValue), which cannot be phi'd: the match has
+            # no value. It fell through to the `i32 0` dummy below, which a
+            # value consumer read as a silent 0 (#1357); a NoValue is
+            # reported at this match instead, as _emit_integer_match does.
             if not all(hasattr(val, 'type') for val, _ in incoming):
-                incoming = []
+                return NoValue(getattr(expr, "span", None))
             # A float-annotated initialiser fixes the merge type (#2027).
             # #2094: unannotated int + float arms are refused if used.
             merged = self._merge_float_arms(expr, incoming) if incoming else None
@@ -16387,25 +16436,20 @@ class LLVMEmitter:
             # statement match — a phi would mix an integer constant into an
             # enum-typed phi, invalid IR (AGAST #1321, font.ritz ensure_cmap).
             #
-            # Return ir.Undefined rather than falling through to the `i32 0`
-            # dummy at the end of this function, and match what the other two
-            # match emitters do for this same condition. In STATEMENT position
-            # (the case above) nobody consumes the result, so both spellings
-            # work. In VALUE position the dummy was a fail-open: an ill-typed
+            # Return a NoValue rather than falling through to the `i32 0`
+            # dummy at the end of this function, as _emit_integer_match does.
+            # In STATEMENT position nobody consumes the result. In VALUE
+            # position the dummy was a fail-open: an ill-typed
             # `let v: i64 = match s { A(q) => p; B(q) => 7 }` compiled clean
-            # and silently evaluated to 0, where main rejects it with
-            # "Type of #1 arg mismatch". ir.Undefined has no `.type`, so a
-            # value consumer fails loudly instead. See
-            # test_match_mixed_type_arms.py::test_mixed_type_value_match_is_rejected.
-            # The resulting diagnostic is a raw AttributeError — poor, and
-            # tracked with the other bare-traceback exits, but rejecting an
-            # ill-typed program badly beats accepting it silently.
+            # and silently evaluated to 0 (test_match_mixed_type_arms.py).
+            # Reading a NoValue raises MatchHasNoValue, located at this match
+            # (#1357; it was a raw `'_Undefined' ... no attribute 'type'`).
             if incoming and not all(
                     v.type == incoming[0][0].type
                     or (isinstance(v.type, ir.IntType)
                         and isinstance(incoming[0][0].type, ir.IntType))
                     for v, _ in incoming):
-                return ir.Undefined
+                return NoValue(getattr(expr, "span", None))
             if incoming:
                 return self._merge_match_arms(incoming)
 
@@ -16565,13 +16609,14 @@ class LLVMEmitter:
         if arm_values and arm_exit_blocks:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
-            # A live arm yielding ir.Undefined (a block ending in a statement,
+            # A live arm yielding no value (a block ending in a statement,
             # or a unit-typed `?`) makes the match a statement, not a value —
-            # ir.Undefined cannot be a phi incoming, it has no reference.
+            # it cannot be a phi incoming. Read as one, the NoValue is
+            # reported at this match (#1357).
             # AGAST #1321 (angelo hinting interpreter: opcode-dispatch match
             # mixing `self.pop()?` value arms with `self.gs.rp0 = p` tails).
-            if any(val is ir.Undefined for val, _ in incoming):
-                return ir.Undefined
+            if any(has_no_value(val) for val, _ in incoming):
+                return NoValue(getattr(expr, "span", None))
             # A float-annotated initialiser fixes the merge type (#2027).
             # #2094: unannotated int + float arms are refused if used.
             merged = self._merge_float_arms(expr, incoming) if incoming else None
@@ -16588,7 +16633,7 @@ class LLVMEmitter:
                     or (isinstance(v.type, ir.IntType)
                         and isinstance(incoming[0][0].type, ir.IntType))
                     for v, _ in incoming):
-                return ir.Undefined
+                return NoValue(getattr(expr, "span", None))
             if incoming:
                 return self._merge_match_arms(incoming)
 
@@ -17066,7 +17111,7 @@ class LLVMEmitter:
         value meets a declared type: return, tail, annotated let / var, and
         assignment (arguments go through _call_mismatch_message).
         """
-        if val is ir.Undefined or not isinstance(target_ty, ir.IntType):
+        if has_no_value(val) or not isinstance(target_ty, ir.IntType):
             return
         entry = self._enum_entry_of_type(val.type)
         if entry is None:
@@ -17102,7 +17147,7 @@ class LLVMEmitter:
         emitted as `ret %S` and clang refused the IR, unlocated.  Enums go
         through _reject_enum_as_int first, so only a plain struct gets here.
         """
-        if (val is ir.Undefined or not isinstance(target_ty, ir.IntType)
+        if (has_no_value(val) or not isinstance(target_ty, ir.IntType)
                 or not isinstance(val.type, ir.BaseStructType)
                 or not self._names_an_integer(ritz_type)):
             return
@@ -17125,7 +17170,7 @@ class LLVMEmitter:
         if expr.op in ('==', '!='):
             return
         for val, side in ((left, expr.left), (right, expr.right)):
-            if val is ir.Undefined or not isinstance(val.type, ir.BaseStructType):
+            if has_no_value(val) or not isinstance(val.type, ir.BaseStructType):
                 continue
             entry = self._enum_entry_of_type(val.type)
             if entry is not None:
@@ -17142,7 +17187,7 @@ class LLVMEmitter:
         assignment target, whatever its form (local, global, field, index,
         deref).  The target's type is only inferred once `val` is known to be
         an enum, so ordinary assignments pay nothing."""
-        if val is ir.Undefined or self._enum_entry_of_type(val.type) is None:
+        if has_no_value(val) or self._enum_entry_of_type(val.type) is None:
             return
         target_ritz = self._infer_ritz_type(target)
         if target_ritz is None:
