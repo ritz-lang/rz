@@ -1760,12 +1760,23 @@ pub fn valet_handle_tls_connection(task: *Task) -> i32
     # counts bytes sent, not received, so it must never reach the HANDSHAKE
     # state below, which would read it as a recv length (AGAST #2190).
     if task.handler_state == TLS_CONN_STATE_HANDSHAKE_SEND
-        # A short flight cannot be finished by the client, so don't wait on it.
-        if task.io_result != task.write_len
+        if task.io_result <= 0
             prints("[TLS] ERROR: handshake send failed\n")
             tls_task_data_free(tls_data)
             task.user_data = null
             return 1
+        # Short send: the rest of the flight is still in write_buf, from
+        # write_pos on, as in the SEND state (AGAST #3677). A big cert chain
+        # or a small SO_SNDBUF cuts it short; the client can't answer a
+        # flight it hasn't all got, so finish it before waiting on a recv.
+        task.write_pos = task.write_pos + task.io_result
+        if task.write_pos < task.write_len
+            let ret = task_submit_send_buf(tls_data.pool, task, @task.write_buf[task.write_pos], task.write_len - task.write_pos)
+            if ret < 0
+                tls_task_data_free(tls_data)
+                task.user_data = null
+                return 1
+            return -1
         task.handler_state = TLS_CONN_STATE_HANDSHAKE
         let ret = tls_task_recv(task, tls_data)
         if ret < 0

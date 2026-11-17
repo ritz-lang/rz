@@ -34,6 +34,9 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "projects/valet/test/test_tls_socket.sh"
+# Servers one run starts: the main one (PORT), the short-send one (SPORT) and
+# the big-cert-chain one (HPORT, AGAST #3677).
+SERVERS = 3
 
 # A stand-in for valet: reads `-c <config>` (relative to its cwd, as valet
 # does), records "<port> taken|free" for whether a listener was already on the
@@ -114,6 +117,7 @@ def _run(stub: Path, log: Path, **env) -> subprocess.CompletedProcess:
     full = dict(os.environ, VALET=str(stub), STUB_LOG=str(log), CLIENT_TIMEOUT="1")
     full.pop("PORT", None)
     full.pop("SPORT", None)
+    full.pop("HPORT", None)
     full.update(env)
     return subprocess.run(
         ["bash", str(SCRIPT)], env=full, capture_output=True, text=True, timeout=180
@@ -136,10 +140,10 @@ def test_concurrent_runs_never_share_a_port(stub, tmp_path):
     for t in threads:
         t.join()
     starts = [_starts(log) for log in logs]
-    assert all(len(s) == 2 for s in starts), starts
+    assert all(len(s) == SERVERS for s in starts), starts
     assert all(state == "free" for s in starts for _, state in s), starts
     ports = [p for s in starts for p, _ in s]
-    assert len(set(ports)) == 4, f"two servers shared a port: {starts}"
+    assert len(set(ports)) == 2 * SERVERS, f"two servers shared a port: {starts}"
 
 
 def test_second_server_port_is_not_port_plus_one(stub, tmp_path):
@@ -153,7 +157,7 @@ def test_second_server_port_is_not_port_plus_one(stub, tmp_path):
     finally:
         decoy.close()
     starts = _starts(log)
-    assert len(starts) == 2, starts
+    assert len(starts) == SERVERS, starts
     assert all(state == "free" for _, state in starts), starts
 
 
@@ -174,11 +178,15 @@ def test_a_given_port_with_a_listener_is_refused(stub, tmp_path):
 
 
 def test_given_ports_are_used(stub, tmp_path):
-    """PORT and SPORT from the environment are honoured, for a by-hand run."""
-    port, sport = _free_port(), _free_port()
+    """PORT, SPORT and HPORT from the environment are honoured, for a by-hand
+    run."""
+    ports = set()
+    while len(ports) < SERVERS:
+        ports.add(_free_port())
+    port, sport, hport = sorted(ports)
     log = tmp_path / "stub.log"
-    _run(stub, log, PORT=str(port), SPORT=str(sport))
-    assert sorted(p for p, _ in _starts(log)) == sorted([port, sport])
+    _run(stub, log, PORT=str(port), SPORT=str(sport), HPORT=str(hport))
+    assert sorted(p for p, _ in _starts(log)) == [port, sport, hport]
 
 
 if __name__ == "__main__":

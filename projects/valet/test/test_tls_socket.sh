@@ -23,9 +23,11 @@
 #     (AGAST #2197 item 4)
 #   - Responses sent in short sends, under a small SO_SNDBUF, arrive intact
 #     (AGAST #2197 item 5)
+#   - A handshake flight sent in short sends, a big cert chain under a small
+#     SO_SNDBUF, completes (AGAST #3677)
 #
 # Usage: bash projects/valet/test/test_tls_socket.sh  (after ./rz build valet)
-# PORT and SPORT pin the two servers' ports; by default each run picks its own
+# PORT, SPORT and HPORT pin the three servers' ports; by default each run picks its own
 # (see "Ports" below; projects/ritz/tools/test_tls_socket_ports.py).
 #
 # A step in main.yml's build-all job. Exit only 0 or 1: ci_local reads 3 as
@@ -96,7 +98,9 @@ pick_port() {
 }
 PORT="${PORT:-$(pick_port)}"
 SPORT="${SPORT:-$(pick_port "$PORT")}"
-for p in "$PORT" "$SPORT"; do
+HPORT="${HPORT:-$(pick_port "$SPORT")}"
+while [ "$HPORT" = "$PORT" ]; do HPORT="$(pick_port "$SPORT")"; done
+for p in "$PORT" "$SPORT" "$HPORT"; do
     if port_taken "$p"; then
         echo "FAIL: port $p already has a listener; valet's SO_REUSEPORT would share it"
         exit 1
@@ -491,6 +495,92 @@ else
     echo "--- server"; grep "WARN\|ERROR" "$WORK/server_sndbuf.log" | tail -3
 fi
 { kill -9 "$SNDBUF_PID"; wait "$SNDBUF_PID"; } 2>/dev/null
+
+# The handshake flight goes out in short sends too, once the certificate chain
+# outgrows the send buffer. HANDSHAKE_SEND closed the connection on the first
+# short send instead of sending the rest from write_pos (AGAST #3677). Three
+# filler certificates behind the leaf make a ~5.7 KB chain; valet reads at most
+# 8 KiB of PEM, and the chain is 7.9 KB of it.
+echo "=== Test 14: handshake flight in short sends (big cert chain) ==="
+SAN="$(python3 -c "print(','.join('DNS:pad%02d.chain-filler.example.invalid' % i for i in range(40)))")"
+cp "$WORK/cert.pem" "$WORK/chain.pem"
+for i in 1 2 3; do
+    openssl req -new -x509 -key "$WORK/key.pem" -out "$WORK/filler$i.pem" -days 2 \
+        -subj "/CN=Filler CA $i" -addext "subjectAltName=$SAN" 2>/dev/null
+    cat "$WORK/filler$i.pem" >> "$WORK/chain.pem"
+done
+cat > "$WORK/valet_chain.json" <<EOF2
+{"server":{"port":$HPORT,"sndbuf":1024},"tls":{"enabled":true,"cert":"$WORK/chain.pem","key":"$WORK/key.pem"}}
+EOF2
+(cd "$WORK" && exec "$VALET" -c valet_chain.json) > "$WORK/server_chain.log" 2>&1 &
+CHAIN_PID=$!
+for _ in $(seq 1 50); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$HPORT") 2>/dev/null && break
+    sleep 0.1
+done
+OUT="$(timeout "$CLIENT_TIMEOUT" python3 - "$HPORT" <<'EOF2' 2>&1
+import socket, ssl, sys, time
+
+port = int(sys.argv[1])
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+inc, outg = ssl.MemoryBIO(), ssl.MemoryBIO()
+tls = ctx.wrap_bio(inc, outg, server_hostname="localhost")
+sock = socket.socket()
+# A small receive window, and no reading for a while after the ClientHello:
+# the flight backs up behind it and the server's send comes back short.
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+sock.connect(("127.0.0.1", port))
+try:
+    tls.do_handshake()
+except ssl.SSLWantReadError:
+    pass
+sock.sendall(outg.read())  # ClientHello
+time.sleep(0.5)
+flight = 0
+try:
+    while True:
+        try:
+            tls.do_handshake()
+            break
+        except ssl.SSLWantReadError:
+            data = sock.recv(2048)
+            if not data:
+                print("server closed after %d flight bytes" % flight)
+                sys.exit(0)
+            flight += len(data)
+            inc.write(data)
+            time.sleep(0.002)
+except ssl.SSLError as e:
+    print("TLS error after %d flight bytes: %s" % (flight, e))
+    sys.exit(0)
+print("flight bytes: %d" % flight)
+tls.write(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+sock.sendall(outg.read())
+reply = b""
+while True:
+    try:
+        reply += tls.read(16384)
+    except ssl.SSLWantReadError:
+        data = sock.recv(16384)
+        if not data:
+            break
+        inc.write(data)
+    except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+        break
+sys.stdout.write(reply.decode("latin-1"))
+EOF2
+)"
+if grep -q "HTTP/1.1 200" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
+    pass "big cert chain: handshake completed and GET answered ($(grep -o 'flight bytes: [0-9]*' <<<"$OUT"))"
+else
+    fail "big cert chain: handshake did not complete"
+    echo "--- client"; tail -3 <<<"$OUT"
+    echo "--- server"; grep "WARN\|ERROR" "$WORK/server_chain.log" | tail -3
+fi
+{ kill -9 "$CHAIN_PID"; wait "$CHAIN_PID"; } 2>/dev/null
 
 if [ "$FAILED" -ne 0 ]; then
     echo -e "${RED}TLS socket tests failed${NC}"
