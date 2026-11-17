@@ -21,6 +21,8 @@ import ritzlib.sys
 import ritzlib.memory
 import ritzlib.str
 import ritzlib.net
+import ritzlib.gvec
+import ritzlib.span
 
 import cryptosec.x25519
 import cryptosec.chacha20_poly1305
@@ -79,13 +81,45 @@ pub struct EncryptedChannel
     send_nonce: u64
     recv_nonce: u64
 
-    # Receive buffer
-    recv_buf: *u8
+    # Receive buffer: one frame's payload (nonce, ciphertext, tag)
+    recv_buf: Vec<u8>
     recv_len: i32
     recv_cap: i32
 
     # Is this the server side?
     is_server: i32
+
+# ============================================================================
+# Socket I/O (ritzlib.net's Span / Vec forms, AGAST #3835)
+# ============================================================================
+
+# Send all `len` bytes at `data`; false on a write error.
+fn send_bytes(sock: @&Socket, data: *u8, len: i64) -> bool
+    match socket_send_all(sock, span_from_ptr<u8>(data, len))
+        Ok(_) => true
+        Err(_) => false
+
+# Append exactly `n` more bytes from `sock` to `buf`; false at end of
+# stream or on a read error.
+fn recv_exact_into(sock: @&Socket, buf: @&Vec<u8>, n: i64) -> bool
+    let want: i64 = buf.len + n
+    while buf.len < want
+        var got: i64 = 0
+        match socket_recv_into(sock, buf, want - buf.len)
+            Ok(k) => got = k
+            Err(_) => got = 0
+        if got == 0
+            return false
+    true
+
+# Read a 32-byte X25519 public key from `sock` into `key`.
+fn recv_key(sock: @&Socket, key: *u8) -> bool
+    var tmp: Vec<u8> = vec_with_cap<u8>(32)
+    let ok: bool = recv_exact_into(sock, @&tmp, 32)
+    if ok
+        mem_copy(key, tmp.data, 32)
+    vec_drop<u8>(@&tmp)
+    ok
 
 # ============================================================================
 # Channel Lifecycle
@@ -106,8 +140,8 @@ pub fn channel_init_client(ch: *EncryptedChannel, sock: Socket) -> i32
     x25519_pubkey(@ch.public_key[0], @ch.private_key[0])
 
     # Allocate receive buffer
-    ch.recv_buf = malloc(CHANNEL_MAX_MSG_SIZE as i64) as *u8
-    if ch.recv_buf == null
+    ch.recv_buf = vec_with_cap<u8>(CHANNEL_MAX_MSG_SIZE as i64)
+    if ch.recv_buf.data == null
         ch.state = CHANNEL_STATE_ERROR
         ch.last_error = CHANNEL_ERR_BUFFER
         return -1
@@ -131,8 +165,8 @@ pub fn channel_init_server(ch: *EncryptedChannel, sock: Socket) -> i32
     x25519_pubkey(@ch.public_key[0], @ch.private_key[0])
 
     # Allocate receive buffer
-    ch.recv_buf = malloc(CHANNEL_MAX_MSG_SIZE as i64) as *u8
-    if ch.recv_buf == null
+    ch.recv_buf = vec_with_cap<u8>(CHANNEL_MAX_MSG_SIZE as i64)
+    if ch.recv_buf.data == null
         ch.state = CHANNEL_STATE_ERROR
         ch.last_error = CHANNEL_ERR_BUFFER
         return -1
@@ -148,9 +182,7 @@ pub fn channel_free(ch: *EncryptedChannel)
     secure_zero(@ch.send_key[0], 32)
     secure_zero(@ch.recv_key[0], 32)
 
-    if ch.recv_buf != null
-        free(ch.recv_buf)
-        ch.recv_buf = null
+    vec_drop<u8>(@&ch.recv_buf)
 
     # Close socket
     if ch.sock.fd >= 0
@@ -201,21 +233,16 @@ pub fn channel_handshake_client(ch: *EncryptedChannel) -> i32
     ch.state = CHANNEL_STATE_HANDSHAKE
 
     # Send our public key
-    var sent: i64 = socket_send(@ch.sock, @ch.public_key[0], 32)
-    if sent != 32
+    if not send_bytes(@&ch.sock, @ch.public_key[0], 32)
         ch.state = CHANNEL_STATE_ERROR
         ch.last_error = CHANNEL_ERR_IO
         return -2
 
     # Receive server's public key
-    var received: i32 = 0
-    while received < 32
-        var n: i64 = socket_recv(@ch.sock, @ch.peer_public_key[received], (32 - received) as i64)
-        if n <= 0
-            ch.state = CHANNEL_STATE_ERROR
-            ch.last_error = CHANNEL_ERR_IO
-            return -3
-        received += n as i32
+    if not recv_key(@&ch.sock, @ch.peer_public_key[0])
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_IO
+        return -3
 
     # Compute shared secret.  A small-order peer key gives the all-zero
     # secret (RFC 7748 §6.1): x25519 refuses it and writes nothing, so
@@ -248,18 +275,13 @@ pub fn channel_handshake_server(ch: *EncryptedChannel) -> i32
     ch.state = CHANNEL_STATE_HANDSHAKE
 
     # Receive client's public key
-    var received: i32 = 0
-    while received < 32
-        var n: i64 = socket_recv(@ch.sock, @ch.peer_public_key[received], (32 - received) as i64)
-        if n <= 0
-            ch.state = CHANNEL_STATE_ERROR
-            ch.last_error = CHANNEL_ERR_IO
-            return -2
-        received += n as i32
+    if not recv_key(@&ch.sock, @ch.peer_public_key[0])
+        ch.state = CHANNEL_STATE_ERROR
+        ch.last_error = CHANNEL_ERR_IO
+        return -2
 
     # Send our public key
-    var sent: i64 = socket_send(@ch.sock, @ch.public_key[0], 32)
-    if sent != 32
+    if not send_bytes(@&ch.sock, @ch.public_key[0], 32)
         ch.state = CHANNEL_STATE_ERROR
         ch.last_error = CHANNEL_ERR_IO
         return -3
@@ -349,14 +371,10 @@ pub fn channel_send(ch: *EncryptedChannel, data: *u8, len: i32) -> i32
             return -5
 
     # Send message
-    var sent: i32 = 0
-    while sent < msg_len
-        var n: i64 = socket_send(@ch.sock, msg + sent, (msg_len - sent) as i64)
-        if n <= 0
-            free(msg)
-            ch.last_error = CHANNEL_ERR_IO
-            return -4
-        sent += n as i32
+    if not send_bytes(@&ch.sock, msg, msg_len as i64)
+        free(msg)
+        ch.last_error = CHANNEL_ERR_IO
+        return -4
 
     free(msg)
     return len
@@ -368,17 +386,14 @@ pub fn channel_recv(ch: *EncryptedChannel, data: *u8, cap: i32) -> i32
         ch.last_error = CHANNEL_ERR_HANDSHAKE
         return -1
 
-    # Read length prefix (4 bytes)
-    var header: [4]u8
-    var hdr_read: i32 = 0
-    while hdr_read < 4
-        var n: i64 = socket_recv(@ch.sock, @header[hdr_read], (4 - hdr_read) as i64)
-        if n <= 0
-            ch.last_error = CHANNEL_ERR_IO
-            return -2
-        hdr_read += n as i32
+    # Read length prefix (4 bytes) into the front of recv_buf
+    vec_clear<u8>(@&ch.recv_buf)
+    if not recv_exact_into(@&ch.sock, @&ch.recv_buf, 4)
+        ch.last_error = CHANNEL_ERR_IO
+        return -2
 
     # Parse length (big-endian)
+    let header: *u8 = ch.recv_buf.data
     var payload_len: i32 = (header[0] as i32) << 24
     payload_len = payload_len | ((header[1] as i32) << 16)
     payload_len = payload_len | ((header[2] as i32) << 8)
@@ -392,19 +407,16 @@ pub fn channel_recv(ch: *EncryptedChannel, data: *u8, cap: i32) -> i32
         ch.last_error = CHANNEL_ERR_BUFFER
         return -4
 
-    # Read payload
-    var received: i32 = 0
-    while received < payload_len
-        var n: i64 = socket_recv(@ch.sock, ch.recv_buf + received, (payload_len - received) as i64)
-        if n <= 0
-            ch.last_error = CHANNEL_ERR_IO
-            return -5
-        received += n as i32
+    # Read payload over the length prefix
+    vec_clear<u8>(@&ch.recv_buf)
+    if not recv_exact_into(@&ch.sock, @&ch.recv_buf, payload_len as i64)
+        ch.last_error = CHANNEL_ERR_IO
+        return -5
 
     # Extract nonce and parse counter value
     # Nonce format: [4 zeros][8-byte LE counter]
     var nonce: [12]u8
-    mem_copy(@nonce[0], ch.recv_buf, 12)
+    mem_copy(@nonce[0], ch.recv_buf.data, 12)
 
     # Parse nonce counter (bytes 4-11, little-endian)
     var recv_counter: u64 = nonce[4] as u64
@@ -431,7 +443,7 @@ pub fn channel_recv(ch: *EncryptedChannel, data: *u8, cap: i32) -> i32
 
     # Extract ciphertext and tag
     let ct_len: i32 = payload_len - CHANNEL_NONCE_SIZE - CHANNEL_TAG_SIZE
-    var ciphertext: *u8 = ch.recv_buf + CHANNEL_NONCE_SIZE
+    var ciphertext: *u8 = ch.recv_buf.data + CHANNEL_NONCE_SIZE
     var tag: *u8 = ciphertext + ct_len
 
     if ct_len > cap

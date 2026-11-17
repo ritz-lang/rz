@@ -1580,7 +1580,6 @@ struct EpollEvent
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `socket_bind` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Bind; `Err(EINVAL)` for a bad address, else `Err(errno)` |
-| `socket_bind_any` | `fn(sock: *Socket, port: i32) -> i32` | Bind to 0.0.0.0: 0 or -errno |
 | `socket_listen` | `fn(sock: *Socket, backlog: i32) -> i32` | Start listening |
 | `socket_accept` | `fn(sock: *Socket) -> Socket` | Accept (blocking) |
 | `socket_accept_nonblock` | `fn(sock: *Socket) -> Socket` | Accept (non-blocking) |
@@ -1590,13 +1589,10 @@ struct EpollEvent
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `socket_connect` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Connect; `Err(EINVAL)` for a bad address, else `Err(errno)` |
-| `socket_connect_timeout` | `fn(sock: *Socket, addr_str: *u8, port: i32, timeout_ms: i32) -> i32` | 0; -1 error or bad address; -2 timeout; -3 refused |
+| `socket_connect_timeout` | `fn(sock: @&Socket, addr: StrView, port: i32, timeout_ms: i32) -> Result<(), i32>` | Connect within `timeout_ms`; `Err(EINVAL)` bad address, `Err(ETIMEDOUT)`, else `Err(errno)` |
 | `socket_send_all` | `fn(sock: @&Socket, data: Span<u8>) -> Result<i64, i32>` | Send every byte (retries short writes and EINTR) |
 | `socket_send_str` | `fn(sock: @&Socket, s: StrView) -> Result<i64, i32>` | `socket_send_all` for text |
 | `socket_recv_into` | `fn(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>` | Append up to `max` bytes; `Ok(0)` at EOF |
-| `socket_send` | `fn(sock: *Socket, buf: *u8, len: i64) -> i64` | Raw: one write, bytes or -errno |
-| `socket_recv` | `fn(sock: *Socket, buf: *u8, len: i64) -> i64` | Raw: one read, bytes or -errno |
-| `socket_send_string` | `fn(sock: *Socket, s: *String) -> i64` | Send String |
 
 **Epoll Operations**:
 

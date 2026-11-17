@@ -30,10 +30,10 @@
 #   sock.close()
 #
 # Addresses are StrViews (AGAST #1483), and every Err is a positive errno.
-# The pre-existing raw forms (socket_send / socket_recv with (*u8, len),
-# socket_bind_any, socket_connect_timeout) remain only for existing callers;
-# #3835 ports those callers and deletes them.  The sys_* syscall shims stay raw by design: their
-# pointer arguments are the kernel ABI.
+# No entry point takes a raw `*u8` address or buffer (#3835 deleted the
+# socket_send / socket_recv / socket_bind_any forms; tools/test_ritzlib_net_api.py
+# guards it).  The sys_* syscall shims stay raw by design: their pointer
+# arguments are the kernel ABI.
 
 import ritzlib.sys  # For sys_read, sys_write, sys_close, syscallN
 import ritzlib.str  # For memset, strlen
@@ -81,6 +81,7 @@ const SO_RCVTIMEO: i32 = 20
 const SO_SNDTIMEO: i32 = 21
 
 # Errno values relevant to non-blocking connect timeouts
+const ETIMEDOUT: i32 = 110
 const E_INPROGRESS: i32 = 115
 
 # ============================================================================
@@ -365,12 +366,6 @@ fn unit_result(rc: i32) -> Result<(), i32>
         return Err(0 - rc)
     Ok(())
 
-# The raw forms' convention: 0, or a negative errno.
-fn unit_rc(r: Result<(), i32>) -> i32
-    match r
-        Ok(_) => 0
-        Err(e) => 0 - e
-
 # Bind the socket to an IPv4 address and port.  Err(EINVAL) if `addr`
 # isn't a dotted quad (parse_ipv4); otherwise Err(errno) from bind(2),
 # e.g. EADDRINUSE.
@@ -381,10 +376,6 @@ pub fn socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
         None => return Err(EINVAL)
     var sa: SockAddrIn = sockaddr_in(ip, port)
     unit_result(sys_bind(sock.fd, @sa as *u8, 16))
-
-# Bind to any address (0.0.0.0): 0, or a negative errno.
-pub fn socket_bind_any(sock: *Socket, port: i32) -> i32
-    unit_rc(socket_bind(sock, "0.0.0.0", port))
 
 # Listen for connections
 pub fn socket_listen(sock: *Socket, backlog: i32) -> i32
@@ -444,47 +435,37 @@ fn sys_fcntl_get(fd: i32) -> i32
 #      pending errno (ECONNREFUSED, ETIMEDOUT, etc.).
 #   5. Restore the original blocking flags.
 #
-# Returns:
-#    0 on success (connection established).
-#   -1 on syscall errors (socket level, fcntl, etc.).
-#   -2 on connect timeout — kernel didn't resolve within `timeout_ms`.
-#   -3 on connect refused / unreachable / other connect-time errno.
+# Ok(()) once connected, with the socket blocking again.  Err(EINVAL) if
+# `addr` isn't a dotted quad; Err(ETIMEDOUT) if the kernel didn't resolve
+# the connect within `timeout_ms`; otherwise Err(errno) from fcntl,
+# connect, poll or SO_ERROR (e.g. ECONNREFUSED).  Before #3835 this returned
+# -1/-2/-3 categories and lost the errno.
 #
 # This is the standard fix for the "if a half-broken peer is on the port,
 # regular socket_connect() blocks for the kernel's TCP retry timeout
 # (~75s)" failure mode that bit nexus during the G-wedge testing.
-#
-# An `addr_str` that isn't a dotted quad is -1 (before #1483 it connected
-# to whatever the lenient parser made of it).
-pub fn socket_connect_timeout(sock: *Socket, addr_str: *u8, port: i32, timeout_ms: i32) -> i32
+pub fn socket_connect_timeout(sock: @&Socket, addr: StrView, port: i32, timeout_ms: i32) -> Result<(), i32>
     var ip: u32 = 0
-    match parse_ipv4(strview_from_cstr(addr_str))
+    match parse_ipv4(addr)
         Some(a) => ip = a
-        None => return -1
-    var addr: SockAddrIn = sockaddr_in(ip, port)
+        None => return Err(EINVAL)
+    var sa: SockAddrIn = sockaddr_in(ip, port)
 
     # 1. Save current flags and switch to non-blocking
     let orig_flags: i32 = sys_fcntl_get(sock.fd)
     if orig_flags < 0
-        return -1
+        return Err(0 - orig_flags)
 
-    if sys_fcntl_set(sock.fd, orig_flags | O_NONBLOCK_FLAG) < 0
-        return -1
+    let set_rc: i32 = sys_fcntl_set(sock.fd, orig_flags | O_NONBLOCK_FLAG)
+    if set_rc < 0
+        return Err(0 - set_rc)
 
-    # 2. Issue connect.  Expected to return -EINPROGRESS (-115) for TCP.
-    let rc: i32 = sys_connect(sock.fd, @addr as *u8, 16)
-
-    if rc == 0
-        # Connect resolved synchronously (loopback fast path); restore
-        # blocking and return success.
-        sys_fcntl_set(sock.fd, orig_flags)
-        return 0
-
-    # Anything else negative that isn't EINPROGRESS is a hard failure.
-    # Linux returns -EINPROGRESS as -115.
+    # 2. Issue connect.  Expected to return -EINPROGRESS for TCP; 0 is the
+    # loopback fast path, anything else a hard failure.
+    let rc: i32 = sys_connect(sock.fd, @sa as *u8, 16)
     if rc != (0 - E_INPROGRESS)
         sys_fcntl_set(sock.fd, orig_flags)
-        return -3
+        return unit_result(rc)
 
     # 3. Wait for the socket to become writable, with timeout.
     var pfd: PollFd
@@ -500,24 +481,19 @@ pub fn socket_connect_timeout(sock: *Socket, addr_str: *u8, port: i32, timeout_m
     sys_fcntl_set(sock.fd, orig_flags)
 
     if poll_rc == 0
-        return -2  # timeout
-
+        return Err(ETIMEDOUT)
     if poll_rc < 0
-        return -1  # poll syscall error
+        return Err(0 - poll_rc)
 
-    if (pfd.revents & POLLERR) != 0
-        return -3  # connect failed (RST, refused, unreachable)
-
-    # 4. Verify connect actually succeeded via SO_ERROR.
+    # 4. The connect's outcome, POLLERR included, is in SO_ERROR.
     var so_error: i32 = 0
     var optlen: i32 = 4
     let err_rc: i32 = sys_getsockopt(sock.fd, SOL_SOCKET, SO_ERROR, @so_error as *u8, @optlen)
     if err_rc < 0
-        return -1
+        return Err(0 - err_rc)
     if so_error != 0
-        return -3  # actual errno of the failed connect
-
-    return 0
+        return Err(so_error)
+    Ok(())
 
 # Send every byte of `data`, writing again after a short write or EINTR.
 # Ok(data.len), or Err(errno) from the first write that fails (bytes
@@ -549,18 +525,6 @@ pub fn socket_recv_into(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64,
             return Ok(n)
         if n != (0 - EINTR) as i64
             return Err((0 - n) as i32)
-
-# Raw send: one write(2) of `len` bytes; bytes written or a negative errno.
-pub fn socket_send(sock: *Socket, buf: *u8, len: i64) -> i64
-    return sys_write(sock.fd, buf, len)
-
-# Raw receive: one read(2) into `buf`; bytes read, 0 at EOF, or a negative errno.
-pub fn socket_recv(sock: *Socket, buf: *u8, len: i64) -> i64
-    return sys_read(sock.fd, buf, len)
-
-# Send a String
-pub fn socket_send_string(sock: *Socket, s: *String) -> i64
-    return sys_write(sock.fd, string_as_ptr(s), string_len(s))
 
 # ============================================================================
 # Epoll operations (for async/event-driven I/O)

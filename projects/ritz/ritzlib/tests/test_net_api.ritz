@@ -4,6 +4,8 @@
 #   socket_valid(sock: @Socket) -> bool
 #   socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
 #   socket_connect(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
+#   socket_connect_timeout(sock: @&Socket, addr: StrView, port: i32, timeout_ms: i32)
+#       -> Result<(), i32>
 #   socket_send_all(sock: @&Socket, data: Span<u8>) -> Result<i64, i32>
 #   socket_send_str(sock: @&Socket, s: StrView) -> Result<i64, i32>
 #   socket_recv_into(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>
@@ -29,6 +31,7 @@ import ritzlib.net
 const E_BADF: i32 = 9
 const E_INVAL: i32 = 22
 const E_ADDRINUSE: i32 = 98
+const E_TIMEDOUT: i32 = 110
 const E_CONNREFUSED: i32 = 111
 
 # 127.0.0.1 in network byte order, as the kernel stores it: the bytes
@@ -222,9 +225,10 @@ fn test_bind_method() -> i32
     0
 
 [[test]]
-fn test_bind_any_still_binds_every_interface() -> i32
+fn test_bind_any_address_binds_every_interface() -> i32
+    # socket_bind_any is gone (#3835): "0.0.0.0" is how to say it.
     var s: Socket = socket_tcp()
-    assert socket_bind_any(@s, 0) == 0
+    assert unit_ok(socket_bind(@&s, "0.0.0.0", 0)) == 1
     assert bound_addr(@s) == 0
     socket_close(@s)
     0
@@ -263,19 +267,71 @@ fn test_connect_refused_is_positive_errno() -> i32
     socket_close(@c)
     0
 
+# ============================================================================
+# socket_connect_timeout -> Result<(), i32> (AGAST #3835)
+# ============================================================================
+
 [[test]]
-fn test_connect_timeout_raw_form() -> i32
+fn test_connect_timeout_loopback_ok() -> i32
+    var port: i32 = 0
+    var srv: Socket = listen_loopback(@port)
+    assert srv.fd >= 0
+    var c: Socket = socket_tcp()
+    # A slice of a longer literal: the address needs no terminator.
+    assert unit_ok(socket_connect_timeout(@&c, strview_slice("127.0.0.1:x", 0, 9), port, 1000)) == 1
+    # The socket is blocking again afterwards: a send of one byte completes.
+    assert count_of(socket_send_str(@&c, "x")) == 1
+    socket_close(@c)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_connect_timeout_garbage_address_is_einval() -> i32
+    # EINVAL, not a connect to 0.0.0.0, where this very listener (bound to
+    # 127.0.0.1) would have answered.
     var port: i32 = 0
     var srv: Socket = listen_loopback(@port)
     var c: Socket = socket_tcp()
-    assert socket_connect_timeout(@c, c"127.0.0.1", port, 1000) == 0
+    assert unit_err(socket_connect_timeout(@&c, "bogus", port, 1000)) == E_INVAL
     socket_close(@c)
-    # An address that doesn't parse is -1, not a connect to 0.0.0.0, where
-    # this very listener (bound to 127.0.0.1) would have answered.
-    var d: Socket = socket_tcp()
-    assert socket_connect_timeout(@d, c"bogus", port, 1000) == -1
-    socket_close(@d)
     socket_close(@srv)
+    0
+
+[[test]]
+fn test_connect_timeout_refused_is_the_errno() -> i32
+    # The raw form said -3; the errno is ECONNREFUSED.
+    var tmp: Socket = socket_tcp()
+    socket_bind(@&tmp, "127.0.0.1", 0)
+    let port: i32 = bound_port(@tmp)
+    socket_close(@tmp)
+    var c: Socket = socket_tcp()
+    assert unit_err(socket_connect_timeout(@&c, "127.0.0.1", port, 1000)) == E_CONNREFUSED
+    socket_close(@c)
+    0
+
+[[test]]
+fn test_connect_timeout_expiry_is_etimedout() -> i32
+    # A listener with backlog 0 whose accept queue is already full drops
+    # the next SYN, so that connect stays in progress until the timeout.
+    var srv: Socket = socket_tcp()
+    assert unit_ok(socket_bind(@&srv, "127.0.0.1", 0)) == 1
+    socket_listen(@srv, 0)
+    let port: i32 = bound_port(@srv)
+    var a: Socket = socket_tcp()
+    assert unit_ok(socket_connect(@&a, "127.0.0.1", port)) == 1
+    var b: Socket = socket_tcp()
+    assert unit_err(socket_connect_timeout(@&b, "127.0.0.1", port, 100)) == E_TIMEDOUT
+    socket_close(@b)
+    socket_close(@a)
+    socket_close(@srv)
+    0
+
+[[test]]
+fn test_connect_timeout_bad_fd_is_ebadf() -> i32
+    # A failing fcntl is its errno, not a bare -1.
+    var c: Socket = socket_tcp()
+    socket_close(@c)
+    assert unit_err(socket_connect_timeout(@&c, "127.0.0.1", 80, 100)) == E_BADF
     0
 
 [[test]]

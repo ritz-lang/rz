@@ -219,3 +219,78 @@ fn test_handshake_accepts_valid_peer_key() -> i32
     assert ec_all_zero(@srv.send_key[0], 32) == 0
     channel_free(@srv)
     0
+
+# ============================================================================
+# A full round trip over a socketpair (#3835: the channel's I/O runs on
+# ritzlib.net's socket_send_all / socket_recv_into, recv_buf is a Vec<u8>).
+# ============================================================================
+
+fn ec_bytes_eq(a: *u8, b: *u8, n: i32) -> i32
+    var i: i32 = 0
+    while i < n
+        if a[i] != b[i]
+            return 0
+        i += 1
+    return 1
+
+# Handshake `cli` (on sv[0]) with `srv` (on sv[1]) in one thread: the
+# client's key is queued for the server up front, so neither side blocks.
+# The client's own handshake then sends that key a second time; the copy
+# is drained from the server's side before any frame is read.
+fn ec_connected_pair(cli: *EncryptedChannel, srv: *EncryptedChannel) -> i32
+    var sv: [2]i32
+    if ec_socketpair(@sv[0]) < 0
+        return 100
+    var a: Socket
+    a.fd = sv[0]
+    a.family = 1
+    a.socktype = 1
+    var b: Socket
+    b.fd = sv[1]
+    b.family = 1
+    b.socktype = 1
+    if channel_init_client(cli, a) < 0 or channel_init_server(srv, b) < 0
+        return 101
+    if sys_write(sv[0], @cli.public_key[0], 32) != 32
+        return 102
+    if channel_handshake_server(srv) != 0
+        return 103
+    if channel_handshake_client(cli) != 0
+        return 104
+    var stray: [32]u8
+    if sys_read(sv[1], @stray[0], 32) != 32
+        return 105
+    0
+
+[[test]]
+fn test_channel_round_trip_both_ways() -> i32
+    var cli: EncryptedChannel
+    var srv: EncryptedChannel
+    assert ec_connected_pair(@cli, @srv) == 0
+    var out: [64]u8
+    # Two frames back to back: the second recv must not see the first.
+    assert channel_send(@cli, c"hello mausoleum", 15) == 15
+    assert channel_send(@cli, c"second", 6) == 6
+    assert channel_recv(@srv, @out[0], 64) == 15
+    assert ec_bytes_eq(@out[0], c"hello mausoleum", 15) == 1
+    assert channel_recv(@srv, @out[0], 64) == 6
+    assert ec_bytes_eq(@out[0], c"second", 6) == 1
+    assert channel_send(@srv, c"reply", 5) == 5
+    assert channel_recv(@cli, @out[0], 64) == 5
+    assert ec_bytes_eq(@out[0], c"reply", 5) == 1
+    channel_free(@cli)
+    channel_free(@srv)
+    0
+
+[[test]]
+fn test_channel_recv_at_eof_is_io_error() -> i32
+    var cli: EncryptedChannel
+    var srv: EncryptedChannel
+    assert ec_connected_pair(@cli, @srv) == 0
+    socket_close(@cli.sock)
+    var out: [16]u8
+    assert channel_recv(@srv, @out[0], 16) == -2
+    assert srv.last_error == CHANNEL_ERR_IO
+    channel_free(@cli)
+    channel_free(@srv)
+    0
