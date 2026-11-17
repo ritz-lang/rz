@@ -12,8 +12,8 @@ no `param`, so the whole item failed with `cannot parse item starting at
 'fn take'`. That is the first stop for angelo's types, cache, discovery, font
 and loader/ttf modules under `--compiler ritz1`.
 
-ritz1 lexes `:=` as COLON ASSIGN (as it lexes `:&` as COLON AMP), and the new
-alternative builds the same Param as `name: T`. So everything §13 does for a
+ritz1 lexes `:=` as one COLON_EQ token too (AGAST #3911: before, it lexed
+COLON ASSIGN and accepted the spaced `r: = T`), and the new alternative builds the same Param as `name: T`. So everything §13 does for a
 by-value parameter (a Copy type copies, a Drop type moves and is dropped once,
 by the callee) must hold for `:=` too. The Drop cases check that with the
 free-count style of test_ownership_free_count.py: a run that drops twice, or
@@ -86,6 +86,27 @@ pub fn main() -> i32
     let r = R { pos: 4 }
     return take(r) as i32
 """, 4),
+    # A scalar, and a `self:=` receiver (#3249): the unspaced spellings
+    # SPACED_MOVE refuses with a space.
+    "scalar_i64": ("""\
+fn twice(r:= i64) -> i64
+    return r * 2
+
+pub fn main() -> i32
+    return twice(3) as i32
+""", 6),
+    "self_move": ("""\
+struct R
+    pos: i64
+
+impl R
+    fn take(self:= R) -> i64
+        return self.pos
+
+pub fn main() -> i32
+    let r = R { pos: 5 }
+    return r.take() as i32
+""", 5),
     # A Copy struct: `:=` copies it, so the caller's `a` stays usable.
     "free_fn_copy_struct": (POINT + """\
 fn sum(p:= Point) -> i32
@@ -345,3 +366,32 @@ pub fn main() -> i32
 """)
     assert comp.returncode != 0, f"{compiler} accepted `{spelling}`:\n{comp.stdout[-1000:]}"
     assert not ll.exists(), f"{compiler} wrote an artifact for `{spelling}`"
+
+
+# --- the spaced `: =` is not a move parameter (AGAST #3911) ------------------
+
+# ritz0 lexes `:=` as one COLON_EQ token, so `r: = T` is a COLON and then an
+# `=` where a type belongs.  ritz1 lexed `:=` as COLON ASSIGN and accepted both
+# spellings until it got the same token.  name -> (program, line:col of `=`)
+SPACED_MOVE = {
+    "param": (MOVE_FORMS["scalar_i64"][0].replace("r:= i64", "r: = i64"), "1:13"),
+    "param_both_spaced": (MOVE_FORMS["scalar_i64"][0].replace("r:= i64", "r : = i64"), "1:14"),
+    "self": (MOVE_FORMS["self_move"][0].replace("self:= R", "self: = R"), "5:19"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(SPACED_MOVE))
+def test_spaced_move_param_rejected(request, tmp_path, compiler, name):
+    """`r: = T` / `self: = T` get ritz0's "Expected type name" at the `=`."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    program, where = SPACED_MOVE[name]
+    comp, ll = _compile(compiler, tmp_path, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-1000:]}"
+    assert f"main.ritz:{where}:" in out and "Expected type name" in out, (
+        f"{compiler} refused {name} without ritz0's diagnostic at {where}:\n{out[-2000:]}"
+    )
+    assert not ll.exists(), f"{compiler} wrote an artifact for {name}"
