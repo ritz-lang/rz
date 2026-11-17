@@ -875,20 +875,22 @@ fn fmt_example() -> i64
 
 Constant-time comparison for secrets such as passwords and tokens (AGAST #1863).
 `strcmp`/`memcmp` stop at the first differing byte, so their timing reveals
-how much of a guess was right. `ct_bytes_eq` examines every byte of `a`, never
+how much of a guess was right. `ct_eq` examines every byte of `a`, never
 branches on the contents, and reports a length mismatch without an early exit.
 Pass the untrusted input as `a` and the secret as `b`: the running time depends
-only on `a_len`. tome's `AUTH` uses it.
+only on `a.len`. Lengths, not NUL terminators, bound the comparison. tome's
+`AUTH` uses it.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `ct_bytes_eq` | `fn(a: *u8, a_len: i64, b: *u8, b_len: i64) -> bool` | Equal length and contents, in constant time |
+| `ct_eq` | `fn(a: StrView, b: StrView) -> bool` | Equal length and contents, in constant time |
 
 ```ritz
 import ritzlib.ct
+import ritzlib.strview
 
-fn password_ok(given: *u8, given_len: i64) -> bool
-    ct_bytes_eq(given, given_len, c"hunter2", 7)
+fn password_ok(given: StrView) -> bool
+    ct_eq(given, "hunter2")
 ```
 
 ---

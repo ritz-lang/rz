@@ -619,5 +619,25 @@ def test_a_payload_is_judged_by_its_own_instance(tmp_path, compiler):
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_ptr_read_hands_the_caller_ownership(tmp_path, compiler):
-    """5 read, and two drops: the one `eat` took and `t` itself."""
-    assert _run(compiler, tmp_path, "ptr_read", PTR_READ) == 52
+    """5 read, and two drops: the one `eat` took and `t` itself.
+
+    Built as a package, not a lone .ll: ptr_read copies with ritzlib.str's
+    memcpy (AGAST #3452), which only a package build links."""
+    assert _build_package_and_run(compiler, tmp_path, "ptr_read", PTR_READ) == 52
+
+
+def _build_package_and_run(compiler, tmp_path, name, src):
+    """Build `src` with build.py, which links the ritzlib modules it imports."""
+    pkg = tmp_path / f"{name}_{compiler}"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "src" / "main.ritz").write_text(src)
+    (pkg / "ritz.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n\n'
+                                   '[build]\ntarget = "x86_64-linux"\n')
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = subprocess.run(["python3", str(RITZ_ROOT / "build.py"), "build", str(pkg),
+                           "--no-cache", "--compiler", compiler],
+                          cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=600)
+    exe = pkg / "build" / "debug" / name
+    assert proc.returncode == 0 and exe.exists(), \
+        f"{compiler} failed to build {name}:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
+    return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
