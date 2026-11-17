@@ -51,6 +51,7 @@ RITZ1S = ["ritz1", "ritz1_selfhosted"]
 
 HEADER = """\
 import ritzlib.io
+import ritzlib.sys
 import ritzlib.gvec
 
 struct S

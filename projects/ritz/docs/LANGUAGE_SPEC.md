@@ -5438,6 +5438,16 @@ fn main() -> i32
 pub import ritzlib.io           # Re-export the module's pub items
 ```
 
+A plain `import` is private to the file that writes it. `import b` brings in
+what `b` declares and what `b` re-exports with `pub import`, transitively. It
+does not bring in what `b` reaches through its own plain `import c`. A name
+that would reach a file only that way is an error at the use, for example
+"`c_val` is undefined (#3891): it comes from `c`; import it, or have `b` `pub
+import` it" (AGAST #3891; LARB R54 is the same rule for a selective import's
+list). A local of the same name is the local. The built-ins (`StrView`,
+`Option`, `Result`, `Span` and their variants) are everywhere, so they are
+never hidden. ritz1 doesn't check enum and type-alias names yet (#3907).
+
 ---
 
 ## 16. Async/Await

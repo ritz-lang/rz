@@ -38,10 +38,12 @@ import struct_index   # struct_index_errors (AGAST #1635)
 import binder_check   # binder_check_module (AGAST #2407)
 import reachability   # reach_check_module (AGAST #2520)
 import sema_walk      # sema_check_module (AGAST #3462)
+import import_vis     # a plain import is private (AGAST #3891)
 import sema_probe     # RITZ1_SEMA_PROBE (AGAST #3501)
 import emitter
 import fn_cache
 import sha256
+import emitter_core
 
 # =============================================================================
 # Error Reporting Helpers
@@ -1005,6 +1007,9 @@ fn strip_to_interface(m: *Module)
 # Resolve imports recursively, merging into the main module.
 # `m_path` is m's own file (AGAST #2148: check_fn_conflicts' ordering).
 fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrView) -> i32
+    var m_key: String = import_key(m_path)
+    let vm: *VisMod = vis_module(string_as_ptr(@&m_key))
+    string_drop(@&m_key)
     var imp: *ImportDecl = m.imports
     while imp != null
         # Find the import file.
@@ -1021,6 +1026,8 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
 
         # Cycle detection.
         var key: String = import_key(string_as_ptr(@&path))
+        vis_edge(vm, string_as_ptr(@&key), imp)   # AGAST #3891
+        let import_vm: *VisMod = vis_module(string_as_ptr(@&key))
         if was_import_processed(@key) == 1
             string_drop(@&key)
             string_drop(@&path)
@@ -1033,6 +1040,7 @@ fn resolve_imports(m: *Module, m_path: *u8, source_dir: StrView, ritz_path: StrV
             string_drop(@&path)
             return -1
         strip_to_interface(import_module)
+        vis_names(import_vm, import_module)   # before its imports merge in
         if check_fn_dups_in_file(import_module) < 0
             string_drop(@&path)
             return -1
@@ -1255,10 +1263,15 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
     # An import cycle back to this file must not merge it again (as ritz0's
     # resolve() adds the main file to processed_files first): its fns would
     # conflict with themselves (AGAST #2148).
+    var main_key: String = import_key(input_path)
+    let main_vm: *VisMod = vis_module(string_as_ptr(@&main_key))
+    string_drop(@&main_key)
+    vis_names(main_vm, m)   # AGAST #3891: before its imports merge in
     mark_import_processed(import_key(input_path))
     if resolve_imports(m, input_path, source_dir, ritz_path) < 0
         eprintln("Error: Import resolution failed")
         return null
+    vis_compute(main_vm)
 
     m
 

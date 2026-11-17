@@ -28,6 +28,7 @@ from enum_from import rewrite_enum_from
 from emitter_llvmlite import emit as emit_llvmlite, EmitError
 from import_resolver import ImportResolver, ImportError as RitzImportError
 from selective_import import check_selective_imports
+from import_visibility import check_import_visibility
 import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
@@ -226,6 +227,12 @@ def _resolve(ctx: _Compile) -> bool:
     # R54: each name in `import m { … }` is one m defines (AGAST #3466).
     if not _report(check_selective_imports(
             imports, resolver, ctx.source_abs_path), "Error: "):
+        return False
+    # A plain `import` is private: what reaches this file only through
+    # another module's plain import is undefined here (AGAST #3891).
+    if not _report(check_import_visibility(
+            ctx.module.items, resolver, ctx.source_abs_path, module),
+            "Error: "):
         return False
 
     # What `token.Kind` may be qualified by: every module this compile saw.

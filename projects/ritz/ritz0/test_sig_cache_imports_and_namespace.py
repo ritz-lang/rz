@@ -148,12 +148,13 @@ class TestRitz1FastPathChecksImports:
         assert out.read_text() == _cold_ir(a, tmp_path)
 
     def test_transitive_import_change_recompiles(self, tmp_path, cache_dir):
-        """a → m → b: a change two hops away still invalidates a."""
+        """a → m → b: a change two hops away still invalidates a.  m
+        re-exports b (`pub import`), so a sees Rec through it (AGAST #3891)."""
         proj = tmp_path / "proj"
         proj.mkdir()
         b = proj / "b.ritz"
         b.write_text(REC_I32)
-        (proj / "m.ritz").write_text("import b\n\npub fn m_id(x: i32) -> i32\n    x\n")
+        (proj / "m.ritz").write_text("pub import b\n\npub fn m_id(x: i32) -> i32\n    x\n")
         a = proj / "a.ritz"
         a.write_text(A_SRC.replace("import b\n", "import m\n"))
         out = proj / "a.ll"

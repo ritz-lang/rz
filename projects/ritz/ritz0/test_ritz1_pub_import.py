@@ -11,10 +11,10 @@ failed with "cannot parse item starting at 'pub'" (ritz0: exit 0).  That kept
 25 angelo modules, and every module importing them, off ritz1.
 
 Re-export semantics (LANGUAGE_SPEC §15.4): the importer of a module also sees
-the pub items of the modules it `pub import`s.  Both compilers already make
-an import's names visible transitively, so the chain tests pin the visible
-behaviour: a fn declared in `a`, re-exported by `b`, is called from `main`,
-which imports only `b`.  The modules are compiled separately and linked, as
+the pub items of the modules it `pub import`s, and only those: a plain
+import's names don't pass on (AGAST #3891, test_import_private.py).  The
+chain tests pin the visible behaviour: a fn declared in `a`, re-exported by
+`b`, is called from `main`, which imports only `b`.  The modules are compiled separately and linked, as
 build.py does, so the exit code is the value the re-exported fn returned.
 """
 

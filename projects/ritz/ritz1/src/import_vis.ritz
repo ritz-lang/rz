@@ -1,0 +1,246 @@
+# import_vis.ritz - a plain `import` is private (AGAST #3891)
+#
+# LANGUAGE_SPEC §15.1 / §15.4, LARB R54: `import b` brings in what `b`
+# declares and what `b` re-exports with `pub import`.  What `b` reaches only
+# through its own plain `import c` is not brought in.  ritz1 merges every
+# transitive import into one module (codegen needs them), so the rule is a
+# check at the use, as ritz0's import_visibility.py makes it:
+#
+#   main.ritz:4:15: error: `c_val` is undefined (#3891): it comes from `c`; import it, or have `b` `pub import` it
+#
+# resolve_imports records each module it loads (vis_names, before the module's
+# own imports are merged into it) and every import edge (vis_edge), including
+# one to a module already loaded.  vis_compute then marks the visible modules
+# (the input's direct imports, and what they `pub import`, transitively) and
+# tables every name declared only in the others, with the nearest plain
+# import that brings it in (breadth first from the input).  sema_walk asks
+# vis_hidden at each use in the input's own fns.
+#
+# Covered: fns, structs, consts and globals, the items a Module lists.  Enums
+# and type aliases live in the parser's global tables, which don't record a
+# file, so a name of either is never hidden here (ritz0 checks them; AGAST #3907).
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.hash
+import ritzlib.string
+
+import ast
+
+struct VisName
+    name: *u8
+    len: i32
+    next: *VisName
+
+struct VisEdge
+    target: *VisMod
+    shown: *u8        # the import's path as written: `c`, `ritzlib.str`
+    is_pub: i32
+    next: *VisEdge
+
+struct VisMod
+    key: *u8          # the canonical path (import_key)
+    names: *VisName
+    edges: *VisEdge
+    visible: i32
+    reached: i32
+    shown: *u8        # how the nearest importer wrote it
+    via: *u8          # that importer, as it was written; null for the input
+    queued: *VisMod   # the breadth-first queue's link
+    next: *VisMod
+
+# A name of the merged module: hidden, with where it comes from, or visible.
+struct VisEntry
+    name: *u8
+    len: i32
+    hidden: i32
+    origin: *u8
+    via: *u8
+    next: *VisEntry
+
+const VIS_BUCKETS: i32 = 4096
+
+var g_vis_mods: *VisMod = null
+var g_vis_tab: **VisEntry = null
+
+fn vis_copy(p: *u8, len: i64) -> *u8
+    let out: *u8 = malloc(len + 1)
+    memcpy(out, p, len)
+    out[len] = 0
+    out
+
+# The module of canonical path `key`, made on first sight.
+pub fn vis_module(key: *u8) -> *VisMod
+    var vm: *VisMod = g_vis_mods
+    while vm != null
+        if streq(vm.key, key) == 1
+            return vm
+        vm = vm.next
+    vm = malloc(sizeof(VisMod)) as *VisMod
+    vm.key = vis_copy(key, strlen(key))
+    vm.names = null
+    vm.edges = null
+    vm.visible = 0
+    vm.reached = 0
+    vm.shown = null
+    vm.via = null
+    vm.queued = null
+    vm.next = g_vis_mods
+    g_vis_mods = vm
+    vm
+
+fn vis_add_name(vm: *VisMod, name: *u8, len: i32)
+    let n: *VisName = malloc(sizeof(VisName)) as *VisName
+    n.name = name
+    n.len = len
+    n.next = vm.names
+    vm.names = n
+
+# What `m` declares itself: call before its imports are merged into it.
+pub fn vis_names(vm: *VisMod, m: *Module)
+    var f: *FnDef = m.functions
+    while f != null
+        vis_add_name(vm, f.name, f.name_len)
+        f = f.next
+    var s: *StructDef = m.structs
+    while s != null
+        vis_add_name(vm, s.name, s.name_len)
+        s = s.next
+    var c: *ConstEntry = m.constants
+    while c != null
+        vis_add_name(vm, c.name, c.name_len)
+        c = c.next
+    var g: *GlobalVarDef = m.globals
+    while g != null
+        vis_add_name(vm, g.name, g.name_len)
+        g = g.next
+
+# `from`'s import of the module at canonical path `key`, written `imp`.
+pub fn vis_edge(from: *VisMod, key: *u8, imp: *ImportDecl)
+    let e: *VisEdge = malloc(sizeof(VisEdge)) as *VisEdge
+    e.target = vis_module(key)
+    var shown: String = string_new()
+    var seg: *ImportPath = imp.path
+    while seg != null
+        string_push_bytes(@&shown, seg.segment, seg.segment_len as i64)
+        if seg.next != null
+            string_push(@&shown, '.')
+        seg = seg.next
+    e.shown = vis_copy(string_as_ptr(@&shown), string_len(@shown))
+    string_drop(@&shown)
+    e.is_pub = imp.is_pub
+    # Appended, so edges keep source order: the nearest import is the first.
+    e.next = null
+    if from.edges == null
+        from.edges = e
+    else
+        var last: *VisEdge = from.edges
+        while last.next != null
+            last = last.next
+        last.next = e
+
+fn vis_bucket(name: *u8, len: i32) -> i64
+    (fnv1a_str(name, len) % (VIS_BUCKETS as u64)) as i64
+
+fn vis_find(name: *u8, len: i32) -> *VisEntry
+    if g_vis_tab == null
+        return null
+    var e: *VisEntry = g_vis_tab[vis_bucket(name, len)]
+    while e != null
+        if e.len == len and memcmp(e.name, name, len as i64) == 0
+            return e
+        e = e.next
+    null
+
+fn vis_put(name: *u8, len: i32, hidden: i32, origin: *u8, via: *u8)
+    if vis_find(name, len) != null
+        return
+    let e: *VisEntry = malloc(sizeof(VisEntry)) as *VisEntry
+    e.name = name
+    e.len = len
+    e.hidden = hidden
+    e.origin = origin
+    e.via = via
+    let b: i64 = vis_bucket(name, len)
+    e.next = g_vis_tab[b]
+    g_vis_tab[b] = e
+
+fn vis_is_builtin(name: *u8, len: i32) -> i32
+    # Everywhere even where ritzlib declares them (name_resolver's
+    # BUILTIN_TYPES / BUILTIN_GENERICS / BUILTIN_VARIANTS in ritz0).
+    if bytes_eq_cstr(name, len, c"StrView") == 1 or bytes_eq_cstr(name, len, c"Option") == 1
+        return 1
+    if bytes_eq_cstr(name, len, c"Result") == 1 or bytes_eq_cstr(name, len, c"Span") == 1
+        return 1
+    if bytes_eq_cstr(name, len, c"Some") == 1 or bytes_eq_cstr(name, len, c"None") == 1
+        return 1
+    (bytes_eq_cstr(name, len, c"Ok") == 1 or bytes_eq_cstr(name, len, c"Err") == 1) as i32
+
+fn bytes_eq_cstr(p: *u8, len: i32, c: *u8) -> i32
+    if strlen(c) != len as i64
+        return 0
+    (memcmp(p, c, len as i64) == 0) as i32
+
+fn vis_put_all(vm: *VisMod, hidden: i32)
+    var n: *VisName = vm.names
+    while n != null
+        if hidden == 0 or vis_is_builtin(n.name, n.len) == 0
+            vis_put(n.name, n.len, hidden, vm.shown, vm.via)
+        n = n.next
+
+# Table the input's names: `main` is its module, already given its names.
+pub fn vis_compute(main: *VisMod)
+    g_vis_tab = malloc(VIS_BUCKETS as i64 * 8) as **VisEntry
+    memset(g_vis_tab as *u8, 0, VIS_BUCKETS as i64 * 8)
+    # Visible: the input, its direct imports, and their `pub import`s.
+    main.visible = 1
+    var e: *VisEdge = main.edges
+    while e != null
+        e.target.visible = 1
+        e = e.next
+    var grew: i32 = 1
+    while grew == 1
+        grew = 0
+        var vm: *VisMod = g_vis_mods
+        while vm != null
+            if vm.visible == 1
+                var pe: *VisEdge = vm.edges
+                while pe != null
+                    if pe.is_pub == 1 and pe.target.visible == 0
+                        pe.target.visible = 1
+                        grew = 1
+                    pe = pe.next
+            vm = vm.next
+    var vm2: *VisMod = g_vis_mods
+    while vm2 != null
+        if vm2.visible == 1
+            vis_put_all(vm2, 0)
+        vm2 = vm2.next
+    # The rest, breadth first from the input: a name's hint is the nearest
+    # plain import that brings it in.
+    main.reached = 1
+    var head: *VisMod = main
+    var tail: *VisMod = main
+    while head != null
+        var qe: *VisEdge = head.edges
+        while qe != null
+            let t: *VisMod = qe.target
+            if t.reached == 0
+                t.reached = 1
+                t.shown = qe.shown
+                t.via = head.shown
+                tail.queued = t
+                tail = t
+            qe = qe.next
+        if head.visible == 0
+            vis_put_all(head, 1)
+        head = head.queued
+
+# The hidden entry for `name`, or null when it is visible, unknown or no
+# input was tabled.
+pub fn vis_hidden(name: *u8, len: i32) -> *VisEntry
+    let e: *VisEntry = vis_find(name, len)
+    if e == null or e.hidden == 0
+        return null
+    e

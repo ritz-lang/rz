@@ -1348,6 +1348,7 @@ the positive errno (`2` = ENOENT). A path of 4096 bytes or more gives `36`
 
 ```ritz
 import ritzlib.fs
+import ritzlib.sys     # Stat
 import ritzlib.result
 
 fn size_or_minus_one(path: StrView) -> i64

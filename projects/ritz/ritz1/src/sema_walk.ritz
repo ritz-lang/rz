@@ -39,6 +39,33 @@ import call_check    # AGAST #1629, on Sema since #3503
 import let_check   # AGAST #2028 / #3504
 import tail_value    # AGAST #2236, on Sema since #3511
 import enum_as_int   # AGAST #2136, on Sema since #3511
+import import_vis    # AGAST #3891
+import ritzlib.str
+import ritzlib.io
+import ritzlib.memory
+
+# AGAST #3891: a use, in the input's own code, of a name that reaches the
+# input only through some module's plain `import` (import_vis.ritz).  A
+# generic's `$` suffix (`Vec$i32`) is not part of the name written.
+fn sema_vis_use(sm: *Sema, line: i32, col: i32, name: *u8, len: i32)
+    if name == null or len <= 0
+        return
+    if sm.cur_fn == null or (sm.cur_fn.def_file != null and streq(sm.cur_fn.def_file, sm.file) == 0)
+        return
+    var n: i32 = 0
+    while n < len and name[n] != '$'
+        n = n + 1
+    let h: *VisEntry = vis_hidden(name, n)
+    if h == null
+        return
+    sema_error_at(sm, line, col)
+    eprint_char('`')
+    eprint_bytes(name, n)
+    eprints_cstr(c"` is undefined (#3891): it comes from `")
+    eprints_cstr(h.origin)
+    eprints_cstr(c"`; import it, or have `")
+    eprints_cstr(h.via)
+    eprints_cstr(c"` `pub import` it\n")
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
@@ -76,6 +103,12 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     bool_check_expr(sm, e)   # AGAST #2342
     float_check_compare(sm, e)   # AGAST #3607
     let k: i32 = e.kind
+    if k == EXPR_IDENT and sema_is_local(sm, e.ident_ptr, e.ident_len) == 0
+        sema_vis_use(sm, e.span.line, e.span.col, e.ident_ptr, e.ident_len)
+    else if k == EXPR_CALL and sema_is_local(sm, e.func_name, e.func_name_len) == 0
+        sema_vis_use(sm, e.span.line, e.span.col, e.func_name, e.func_name_len)
+    else if k == EXPR_STRUCT_LIT
+        sema_vis_use(sm, e.span.line, e.span.col, e.ident_ptr, e.ident_len)
     if k == EXPR_MATCH or k == EXPR_IF
         sema_walk_expr(sm, e.left)
         var scrut: *Expr = null
@@ -187,6 +220,8 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             let_check_stmt(sm, st)
         sema_enum_as_int(sm, st, first)   # AGAST #2136 / #3511
         if st.kind == STMT_VAR_DECL
+            if st.var_declared_type != TYPE_VOID
+                sema_vis_use(sm, st.span.line, st.span.col, st.var_type_name, st.var_type_name_len)
             bool_check_decl(sm, st)   # AGAST #2342
             sema_walk_expr(sm, st.var_init)
             check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
@@ -271,8 +306,10 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
         return
     sm.scope_top = 0
     sm.cur_fn = f
+    sema_vis_use(sm, f.line, f.col, f.return_type_name, f.return_type_name_len)
     var p: *Param = f.params
     while p != null
+        sema_vis_use(sm, f.line, f.col, p.param_type_name, p.param_type_name_len)
         sema_bind_param(sm, p)
         let_note_param(sm, p)   # AGAST #2250: a `c:& C` holds its referent
         narrow_sema_param(sm, p)
