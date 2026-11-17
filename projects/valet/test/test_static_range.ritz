@@ -1,0 +1,152 @@
+# test/test_static_range.ritz - Range parsing and its 416 (AGAST #1865)
+#
+# parse_range turned "bytes=100-" on a 20-byte file into start 100, end 19,
+# and static_serve_file_full then sent 206 with Content-Length -80.  A range
+# that starts at or past the end of the file is unsatisfiable: 416.
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.memory
+
+import lib.static
+
+fn range_of(hdr: *u8, size: i64) -> RangeResult
+    return parse_range(hdr, strlen(hdr) as i32, size)
+
+# 0 when `hdr` on a `size`-byte file is RANGE_OK start..end.
+fn expect_ok(hdr: *u8, size: i64, start: i64, end: i64) -> i32
+    let r: RangeResult = range_of(hdr, size)
+    if r.valid != RANGE_OK
+        return 1
+    if r.start != start or r.end != end
+        return 2
+    if r.end < r.start or r.end >= size
+        return 3
+    0
+
+[[test]]
+fn test_range_open_ended_past_end_is_unsatisfiable() -> i32
+    if range_of(c"bytes=100-", 20).valid != RANGE_UNSATISFIABLE
+        return 1
+    if range_of(c"bytes=20-", 20).valid != RANGE_UNSATISFIABLE
+        return 2
+    0
+
+[[test]]
+fn test_range_closed_past_end_is_unsatisfiable() -> i32
+    if range_of(c"bytes=20-25", 20).valid != RANGE_UNSATISFIABLE
+        return 1
+    0
+
+[[test]]
+fn test_range_empty_file_is_unsatisfiable() -> i32
+    if range_of(c"bytes=0-", 0).valid != RANGE_UNSATISFIABLE
+        return 1
+    if range_of(c"bytes=-5", 0).valid != RANGE_UNSATISFIABLE
+        return 2
+    if range_of(c"bytes=-0", 20).valid != RANGE_UNSATISFIABLE
+        return 3
+    0
+
+[[test]]
+fn test_range_huge_numbers_do_not_wrap() -> i32
+    # 20 digits overflow an i64: the old parser wrapped them negative.
+    if range_of(c"bytes=99999999999999999999-", 20).valid != RANGE_UNSATISFIABLE
+        return 1
+    if expect_ok(c"bytes=-99999999999999999999", 20, 0, 19) != 0
+        return 2
+    if expect_ok(c"bytes=3-99999999999999999999", 20, 3, 19) != 0
+        return 3
+    0
+
+[[test]]
+fn test_range_in_file() -> i32
+    if expect_ok(c"bytes=0-4", 20, 0, 4) != 0
+        return 1
+    if expect_ok(c"bytes=15-", 20, 15, 19) != 0
+        return 2
+    if expect_ok(c"bytes=10-1000", 20, 10, 19) != 0
+        return 3
+    if expect_ok(c"bytes=-5", 20, 15, 19) != 0
+        return 4
+    if expect_ok(c"bytes=-500", 20, 0, 19) != 0
+        return 5
+    if expect_ok(c"bytes=19-19", 20, 19, 19) != 0
+        return 6
+    0
+
+[[test]]
+fn test_range_invalid_is_ignored() -> i32
+    if range_of(c"bytes=5-2", 20).valid != RANGE_IGNORE
+        return 1
+    if range_of(c"bytes=a-", 20).valid != RANGE_IGNORE
+        return 2
+    if range_of(c"items=0-4", 20).valid != RANGE_IGNORE
+        return 3
+    if range_of(c"bytes=-", 20).valid != RANGE_IGNORE
+        return 4
+    if range_of(c"bytes=4", 20).valid != RANGE_IGNORE
+        return 5
+    0
+
+
+# Drain `fd` into out[0..cap); returns bytes read.
+fn drain(fd: i32, out: *u8, cap: i32) -> i32
+    var total: i32 = 0
+    while total < cap
+        let n: i64 = sys_read(fd, out + total, (cap - total) as i64)
+        if n <= 0
+            break
+        total += n as i32
+    total
+
+fn starts_with(out: *u8, n: i32, want: StrView) -> i32
+    if (n as i64) < want.len
+        return 0
+    var i: i64 = 0
+    while i < want.len
+        if *(out + i) != *(want.ptr + i)
+            return 0
+        i += 1
+    1
+
+# Serve a 20-byte file with `range` into a pipe; the response lands in out.
+fn serve_range(range: *u8, out: *u8, cap: i32) -> i32
+    let path = c"/tmp/valet_test_static_range.txt"
+    let fd: i32 = sys_open3(path, 577, 420)    # O_WRONLY | O_CREAT | O_TRUNC, 0644
+    if fd < 0
+        return -1
+    sys_write(fd, c"0123456789ABCDEFGHIJ", 20)
+    sys_close(fd)
+    var p: [2]i32
+    if sys_pipe(@p[0]) != 0
+        return -2
+    static_serve_file_full(p[1], path, range, strlen(range) as i32, null, 0, 0)
+    sys_close(p[1])
+    let n: i32 = drain(p[0], out, cap)
+    sys_close(p[0])
+    sys_unlink(path)
+    n
+
+[[test]]
+fn test_serve_open_ended_past_end_sends_416() -> i32
+    var buf: [1024]u8
+    let n: i32 = serve_range(c"bytes=100-", @buf[0], 1024)
+    if n <= 0
+        return 90
+    if starts_with(@buf[0], n, "HTTP/1.1 416 ") != 1
+        return 1
+    0
+
+[[test]]
+fn test_serve_in_file_range_sends_206() -> i32
+    var buf: [1024]u8
+    let n: i32 = serve_range(c"bytes=15-", @buf[0], 1024)
+    if n <= 0
+        return 90
+    if starts_with(@buf[0], n, "HTTP/1.1 206 ") != 1
+        return 1
+    if buf[n - 1] != 'J' or buf[n - 5] != 'F'
+        return 2
+    0

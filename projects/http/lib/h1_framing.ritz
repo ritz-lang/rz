@@ -1,0 +1,381 @@
+# lib/h1_framing.ritz - HTTP/1 request framing (AGAST #1865)
+#
+# Where does a request end?  This module answers that one question for a
+# byte stream, and is the only place valet and this package answer it:
+#
+#   h1_frame_request(buf, len, max_body, *H1Frame) -> i64
+#       > 0                  the request is whole: it is the first `total`
+#                            bytes of buf.  Bytes behind it belong to the
+#                            next (pipelined) request; keep them.
+#       H1F_INCOMPLETE       read more and call again with the longer buffer
+#       H1F_BAD_REQUEST      answer 400 and close
+#       H1F_NOT_IMPLEMENTED  answer 501 and close (Transfer-Encoding other
+#                            than exactly "chunked")
+#       H1F_TOO_LARGE        answer 413 and close (body over max_body)
+#
+#   h1_frame_continue(buf, len, max_body, *H1Frame) -> i64
+#       The same, for a buffer that has grown since the last call with this
+#       H1Frame: a known Content-Length is not rescanned, and a chunked body
+#       is walked on from the last whole chunk.  A server reading a big body
+#       one recv at a time calls this, so a body of tiny chunks dripped in
+#       does not cost time quadratic in its size.  h1_frame_init first.
+#
+#   h1_frame_dechunk(buf, *H1Frame) -> i64
+#       Decode a chunked body in place so it sits at buf[headers_end..]
+#       like a Content-Length body; returns its length.  Bytes at and after
+#       `total` are not touched.
+#
+# Rules (RFC 9112 6.1-6.3, 5.1-5.2), strict where leniency lets a proxy
+# and this server disagree on where a request ends (request smuggling):
+#   - Content-Length is 1*DIGIT after optional whitespace, parsed into an
+#     i64.  Anything else (empty, signs, lists, overflow) is a 400.
+#   - Two Content-Length fields are a 400, even when they agree.
+#   - Content-Length together with Transfer-Encoding is a 400.
+#   - Transfer-Encoding must be one field whose value is "chunked"; any
+#     other coding or list is a 501.  An empty value is a 400.
+#   - Whitespace between a field name and its colon, an empty field name,
+#     obs-fold (a line starting with SP/HTAB) and bare CR or LF line
+#     endings are all 400s.
+#
+# The request line is not checked here; a server's request-line parser
+# reports a junk line.  Only the header block's line structure and the
+# body framing are.
+#
+# No imports: valet pulls this file in as a dependency module, so it must
+# not reach for this package's other modules.
+
+
+pub const H1F_INCOMPLETE: i64 = -1
+pub const H1F_BAD_REQUEST: i64 = -2
+pub const H1F_NOT_IMPLEMENTED: i64 = -3
+pub const H1F_TOO_LARGE: i64 = -4
+
+pub const H1F_BODY_NONE: i32 = 0
+pub const H1F_BODY_LENGTH: i32 = 1
+pub const H1F_BODY_CHUNKED: i32 = 2
+
+# A chunk-size line (size, extensions) and the trailer section are bounded
+# so a client can't make the server buffer an endless line.
+const H1F_MAX_CHUNK_LINE: i64 = 4096
+const H1F_MAX_TRAILERS: i64 = 8192
+
+# 15 hex digits is 2^60 - 1: no chunk size can overflow an i64, and no sum
+# of a few of them can either.
+const H1F_MAX_HEX_DIGITS: i32 = 15
+
+pub struct H1Frame
+    # Bytes of the request line and header block, through the empty line.
+    # 0 until the header block is complete.
+    headers_end: i64
+    # Content-Length, or the decoded length of a chunked body (once whole).
+    body_len: i64
+    # Bytes the whole request occupies; -1 while it is not known (a
+    # chunked body still arriving).  Set as soon as the headers give a
+    # Content-Length, so a caller can size a buffer for the rest.
+    total: i64
+    body_kind: i32
+    _pad: i32
+    # Chunked: where the next chunk-size line starts, and the data bytes in
+    # the chunks before it (h1_frame_continue resumes there).
+    walk_pos: i64
+    walk_sum: i64
+
+
+pub fn h1_frame_init(f: *H1Frame)
+    f.headers_end = 0
+    f.body_len = 0
+    f.total = -1
+    f.body_kind = H1F_BODY_NONE
+    f._pad = 0
+    f.walk_pos = 0
+    f.walk_sum = 0
+
+
+# The status code a framing error is answered with, or 0 for anything that
+# is not an error (a length, or H1F_INCOMPLETE).
+pub fn h1_frame_status(code: i64) -> i32
+    if code == H1F_BAD_REQUEST
+        return 400
+    if code == H1F_NOT_IMPLEMENTED
+        return 501
+    if code == H1F_TOO_LARGE
+        return 413
+    return 0
+
+
+fn h1f_lower(c: u8) -> u8
+    if c >= 'A' and c <= 'Z'
+        return c + 32
+    return c
+
+
+fn h1f_is_ows(c: u8) -> i32
+    if c == ' ' or c == '\t'
+        return 1
+    return 0
+
+
+# 1 when buf[start..end) equals the lowercase `word` case-insensitively.
+fn h1f_eq_ci(buf: *u8, start: i64, end: i64, word: *u8, word_len: i64) -> i32
+    if end - start != word_len
+        return 0
+    for i in 0..word_len
+        if h1f_lower(*(buf + start + i)) != *(word + i)
+            return 0
+    return 1
+
+
+fn h1f_hex(c: u8) -> i32
+    if c >= '0' and c <= '9'
+        return (c - '0') as i32
+    if c >= 'a' and c <= 'f'
+        return (c - 'a') as i32 + 10
+    if c >= 'A' and c <= 'F'
+        return (c - 'A') as i32 + 10
+    return -1
+
+
+# Find the end of the line starting at `pos`: the index of its CR, which is
+# followed by LF.  H1F_INCOMPLETE if the buffer ends first, H1F_BAD_REQUEST
+# on a bare CR or LF.
+fn h1f_line_end(buf: *u8, pos: i64, len: i64) -> i64
+    var p: i64 = pos
+    while p < len
+        let c: u8 = *(buf + p)
+        if c == '\n'
+            return H1F_BAD_REQUEST
+        if c == '\r'
+            if p + 1 >= len
+                return H1F_INCOMPLETE
+            if *(buf + p + 1) != '\n'
+                return H1F_BAD_REQUEST
+            return p
+        p += 1
+    return H1F_INCOMPLETE
+
+
+# Parse a Content-Length value buf[start..end): optional whitespace around
+# 1*DIGIT.  Returns the length, or H1F_BAD_REQUEST.
+fn h1f_parse_length(buf: *u8, start: i64, end: i64) -> i64
+    var s: i64 = start
+    var e: i64 = end
+    while s < e and h1f_is_ows(*(buf + s)) == 1
+        s += 1
+    while e > s and h1f_is_ows(*(buf + e - 1)) == 1
+        e -= 1
+    if s == e
+        return H1F_BAD_REQUEST
+    var v: i64 = 0
+    var p: i64 = s
+    while p < e
+        let c: u8 = *(buf + p)
+        if c < '0' or c > '9'
+            return H1F_BAD_REQUEST
+        # (2^63 - 1) / 10: one more digit would overflow.
+        if v > 922337203685477579
+            return H1F_BAD_REQUEST
+        v = v * 10 + (c - '0') as i64
+        p += 1
+    return v
+
+
+# 1 when a Transfer-Encoding value buf[start..end) is exactly "chunked"
+# (case-insensitive, optional whitespace around it), 0 for any other
+# coding or list, -1 when it is empty.
+fn h1f_te_is_chunked(buf: *u8, start: i64, end: i64) -> i32
+    var s: i64 = start
+    var e: i64 = end
+    while s < e and h1f_is_ows(*(buf + s)) == 1
+        s += 1
+    while e > s and h1f_is_ows(*(buf + e - 1)) == 1
+        e -= 1
+    if s == e
+        return -1
+    return h1f_eq_ci(buf, s, e, c"chunked", 7)
+
+
+# Walk a chunked body from f.walk_pos (f.walk_sum data bytes before it).
+# On success returns the index just past it (after the trailer section) and
+# stores the decoded length in f.body_len.  Otherwise an H1F_* error; on
+# H1F_INCOMPLETE, f.walk_pos/walk_sum are left at the last whole chunk.
+fn h1f_walk_chunked(buf: *u8, len: i64, max_body: i64, f: *H1Frame) -> i64
+    var p: i64 = f.walk_pos
+    var sum: i64 = f.walk_sum
+    while 1 == 1
+        f.walk_pos = p
+        f.walk_sum = sum
+        # chunk-size: 1*HEXDIG, leading zeros free.
+        let line_start: i64 = p
+        var size: i64 = 0
+        var digits: i32 = 0
+        var sig: i32 = 0
+        while p < len and h1f_hex(*(buf + p)) >= 0
+            let d: i32 = h1f_hex(*(buf + p))
+            if sig > 0 or d != 0
+                sig += 1
+                if sig > H1F_MAX_HEX_DIGITS
+                    return H1F_BAD_REQUEST
+            size = size * 16 + d as i64
+            digits += 1
+            p += 1
+        if p >= len
+            if p - line_start > H1F_MAX_CHUNK_LINE
+                return H1F_BAD_REQUEST
+            return H1F_INCOMPLETE
+        if digits == 0
+            return H1F_BAD_REQUEST
+        # [ BWS ; chunk-ext ] then CRLF.  Extensions are ignored.
+        let c: u8 = *(buf + p)
+        if c != '\r' and c != ';' and h1f_is_ows(c) == 0
+            return H1F_BAD_REQUEST
+        let eol: i64 = h1f_line_end(buf, p, len)
+        if eol == H1F_INCOMPLETE
+            if len - line_start > H1F_MAX_CHUNK_LINE
+                return H1F_BAD_REQUEST
+            return H1F_INCOMPLETE
+        if eol < 0
+            return eol
+        if eol - line_start > H1F_MAX_CHUNK_LINE
+            return H1F_BAD_REQUEST
+        p = eol + 2
+
+        if size == 0
+            # Trailer section: field lines up to an empty line.
+            let trailers_start: i64 = p
+            while 1 == 1
+                let t_end: i64 = h1f_line_end(buf, p, len)
+                if t_end == H1F_INCOMPLETE
+                    if len - trailers_start > H1F_MAX_TRAILERS
+                        return H1F_BAD_REQUEST
+                    return H1F_INCOMPLETE
+                if t_end < 0
+                    return t_end
+                if t_end == p
+                    f.body_len = sum
+                    return p + 2
+                p = t_end + 2
+                if p - trailers_start > H1F_MAX_TRAILERS
+                    return H1F_BAD_REQUEST
+
+        sum = sum + size
+        if max_body > 0 and sum > max_body
+            return H1F_TOO_LARGE
+        # chunk-data CRLF
+        if len - p < size + 2
+            return H1F_INCOMPLETE
+        p = p + size
+        if *(buf + p) != '\r' or *(buf + p + 1) != '\n'
+            return H1F_BAD_REQUEST
+        p += 2
+    return H1F_BAD_REQUEST
+
+
+pub fn h1_frame_request(buf: *u8, len: i64, max_body: i64, f: *H1Frame) -> i64
+    h1_frame_init(f)
+
+    # The request line: framing only needs where it ends.
+    let rl_end: i64 = h1f_line_end(buf, 0, len)
+    if rl_end < 0
+        return rl_end
+    var p: i64 = rl_end + 2
+
+    var cl_count: i32 = 0
+    var cl: i64 = 0
+    var te_count: i32 = 0
+    var te_chunked: i32 = 0
+    while 1 == 1
+        let eol: i64 = h1f_line_end(buf, p, len)
+        if eol < 0
+            return eol
+        if eol == p
+            p += 2
+            break
+        let first: u8 = *(buf + p)
+        if h1f_is_ows(first) == 1
+            return H1F_BAD_REQUEST          # obs-fold
+        var colon: i64 = p
+        while colon < eol and *(buf + colon) != ':'
+            colon += 1
+        if colon == eol or colon == p
+            return H1F_BAD_REQUEST          # no colon, or no name
+        if h1f_is_ows(*(buf + colon - 1)) == 1
+            return H1F_BAD_REQUEST          # "Name : value"
+        if h1f_eq_ci(buf, p, colon, c"content-length", 14) == 1
+            cl_count += 1
+            if cl_count > 1
+                return H1F_BAD_REQUEST
+            cl = h1f_parse_length(buf, colon + 1, eol)
+            if cl < 0
+                return cl
+        else if h1f_eq_ci(buf, p, colon, c"transfer-encoding", 17) == 1
+            te_count += 1
+            let ch: i32 = h1f_te_is_chunked(buf, colon + 1, eol)
+            if ch < 0
+                return H1F_BAD_REQUEST
+            te_chunked = ch
+        p = eol + 2
+
+    f.headers_end = p
+    if te_count > 0 and cl_count > 0
+        return H1F_BAD_REQUEST
+    if te_count > 0
+        if te_count > 1 or te_chunked == 0
+            return H1F_NOT_IMPLEMENTED
+        f.body_kind = H1F_BODY_CHUNKED
+        f.walk_pos = p
+        f.walk_sum = 0
+        return h1f_walk_chunked_total(buf, len, max_body, f)
+    if cl_count > 0
+        if max_body > 0 and cl > max_body
+            return H1F_TOO_LARGE
+        f.body_kind = H1F_BODY_LENGTH
+        f.body_len = cl
+        f.total = p + cl
+        if len < f.total
+            return H1F_INCOMPLETE
+        return f.total
+    f.total = p
+    return p
+
+
+fn h1f_walk_chunked_total(buf: *u8, len: i64, max_body: i64, f: *H1Frame) -> i64
+    let end: i64 = h1f_walk_chunked(buf, len, max_body, f)
+    if end > 0
+        f.total = end
+    return end
+
+
+pub fn h1_frame_continue(buf: *u8, len: i64, max_body: i64, f: *H1Frame) -> i64
+    if f.headers_end > 0
+        if f.total > 0
+            # Content-Length, no body, or a chunked body already walked.
+            if len < f.total
+                return H1F_INCOMPLETE
+            return f.total
+        if f.body_kind == H1F_BODY_CHUNKED
+            return h1f_walk_chunked_total(buf, len, max_body, f)
+    return h1_frame_request(buf, len, max_body, f)
+
+
+pub fn h1_frame_dechunk(buf: *u8, f: *H1Frame) -> i64
+    if f.body_kind != H1F_BODY_CHUNKED
+        return f.body_len
+    # The frame was already validated: every size line is hex, CRLF-ended.
+    var rd: i64 = f.headers_end
+    var wr: i64 = f.headers_end
+    while 1 == 1
+        var size: i64 = 0
+        while h1f_hex(*(buf + rd)) >= 0
+            size = size * 16 + h1f_hex(*(buf + rd)) as i64
+            rd += 1
+        while *(buf + rd) != '\n'
+            rd += 1
+        rd += 1
+        if size == 0
+            break
+        # wr <= rd always, so a forward copy is safe.
+        for i in 0..size
+            *(buf + wr + i) = *(buf + rd + i)
+        wr += size
+        rd = rd + size + 2
+    return wr - f.headers_end

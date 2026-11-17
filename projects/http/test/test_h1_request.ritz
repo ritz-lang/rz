@@ -6,6 +6,7 @@ import ritzlib.span
 import ritzlib.str
 import lib.types
 import lib.h1_request
+import lib.h1_utils
 
 # ============================================================================
 # Request Line Parsing Tests
@@ -314,4 +315,116 @@ fn test_parse_request_connection_close() -> i32
     if h1_request_is_keep_alive(@req) != 0
         return 2
 
+    return 0
+
+# ============================================================================
+# Framing (AGAST #1865): h1_parse_request decides where a request ends with
+# lib.h1_framing, so it rejects what could be smuggled and decodes chunked.
+# ============================================================================
+
+# Copy a C string into buf so a chunked body can be decoded in place.
+fn copy_in(buf: *u8, s: *u8) -> Span<u8>
+    let n: i64 = strlen(s)
+    for i in 0..n
+        *(buf + i) = *(s + i)
+    var sp: Span<u8>
+    sp.ptr = buf
+    sp.len = n
+    return sp
+
+fn parse_cstr(s: *u8) -> i32
+    var input: Span<u8> = span_from_cstr(s)
+    var req: H1Request
+    return h1_parse_request(@req, @input)
+
+[[test]]
+fn test_parse_request_cl_and_te_is_invalid() -> i32
+    if parse_cstr(c"POST / HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n") != H1_ERR_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_parse_request_duplicate_cl_is_invalid() -> i32
+    if parse_cstr(c"POST / HTTP/1.1\r\nContent-Length: 3\r\nContent-Length: 3\r\n\r\nabc") != H1_ERR_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_parse_request_invalid_cl_is_invalid() -> i32
+    # Was parsed as "no body", leaving "abc" to be read as the next request.
+    if parse_cstr(c"POST / HTTP/1.1\r\nContent-Length: x3\r\n\r\nabc") != H1_ERR_INVALID
+        return 1
+    return 0
+
+[[test]]
+fn test_parse_request_unsupported_te_is_not_implemented() -> i32
+    if parse_cstr(c"POST / HTTP/1.1\r\nTransfer-Encoding: gzip\r\n\r\n") != H1_ERR_NOT_IMPLEMENTED
+        return 1
+    return 0
+
+[[test]]
+fn test_parse_request_cl_is_i64() -> i32
+    var input: Span<u8> = span_from_cstr(c"POST / HTTP/1.1\r\nContent-Length: 9999999999\r\n\r\n")
+    var req: H1Request
+    if h1_parse_request(@req, @input) != H1_ERR_INCOMPLETE
+        return 1
+    if req.content_length != 9999999999
+        return 2
+    return 0
+
+[[test]]
+fn test_parse_request_chunked_body() -> i32
+    var buf: [256]u8
+    var input: Span<u8> = copy_in(@buf[0], c"POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nHello,\r\n7\r\n World!\r\n0\r\n\r\n")
+    var req: H1Request
+    let result: i32 = h1_parse_request(@req, @input)
+    if result as i64 != input.len
+        return 1
+    if req.content_length != 13
+        return 2
+    var expected: Span<u8> = span_from_cstr(c"Hello, World!")
+    if not span_eq(@req.body, @expected)
+        return 3
+    return 0
+
+[[test]]
+fn test_parse_request_body_split_is_incomplete() -> i32
+    let s = c"POST / HTTP/1.1\r\nContent-Length: 13\r\n\r\nHello, World!"
+    var input: Span<u8> = span_from_cstr(s)
+    input.len = input.len - 1
+    var req: H1Request
+    if h1_parse_request(@req, @input) != H1_ERR_INCOMPLETE
+        return 1
+    var buf: [256]u8
+    var chunked: Span<u8> = copy_in(@buf[0], c"POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n6\r\nHello,\r\n0\r\n")
+    if h1_parse_request(@req, @chunked) != H1_ERR_INCOMPLETE
+        return 2
+    return 0
+
+[[test]]
+fn test_parse_request_pipelined_consumes_one() -> i32
+    var input: Span<u8> = span_from_cstr(c"POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcGET /b HTTP/1.1\r\n\r\n")
+    var req: H1Request
+    if h1_parse_request(@req, @input) != 42
+        return 1
+    var expected: Span<u8> = span_from_cstr(c"abc")
+    if not span_eq(@req.body, @expected)
+        return 2
+    return 0
+
+[[test]]
+fn test_parse_request_split_line_is_incomplete() -> i32
+    # A read can end anywhere in the request line or a header name: wait
+    # for more instead of calling it malformed.
+    if parse_cstr(c"POST /u") != H1_ERR_INCOMPLETE
+        return 1
+    if parse_cstr(c"POST") != H1_ERR_INCOMPLETE
+        return 2
+    if parse_cstr(c"POST /u HTTP/1.1\r\nContent-Le") != H1_ERR_INCOMPLETE
+        return 3
+    # A whole line without its parts is still malformed.
+    if parse_cstr(c"POST\r\n\r\n") != H1_ERR_INVALID
+        return 4
+    if parse_cstr(c"POST /u HTTP/1.1\r\nNoColon\r\n\r\n") != H1_ERR_INVALID
+        return 5
     return 0

@@ -38,6 +38,8 @@ E2ES = [
     "projects/valet/test/test_tls_socket.sh",
     # AGAST #3678: plain-HTTP short sends under a small SO_SNDBUF.
     "projects/valet/test/test_short_send.sh",
+    # AGAST #1865: request framing (CL/TE, chunked, pipelining, Range).
+    "projects/valet/test/test_framing.sh",
     # AGAST #2456: the stack smoke gate, same constraints (needs the debug
     # binaries, real servers, must exit 0 or 1 only). A package run as a
     # directory since #3455: its __main__.py calls cli.main().

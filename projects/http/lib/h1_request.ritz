@@ -17,6 +17,7 @@ import ritzlib.str
 import lib.types
 import lib.h1_utils
 import lib.limits
+import lib.h1_framing
 
 # Error codes re-exported from h1_utils for backward compatibility
 
@@ -43,10 +44,10 @@ pub struct H1Request
     header_count: i32
 
     # Parsed header values (for quick access)
-    content_length: i64
+    content_length: i64     # body length; a chunked body's decoded length
     connection_close: i32   # 1 if Connection: close
 
-    # Body (if Content-Length present)
+    # Body (Content-Length or chunked; a chunked body is decoded in place)
     body: Span<u8>
 
 # ============================================================================
@@ -76,9 +77,15 @@ pub fn h1_parse_request_line(req: *H1Request, input: *Span<u8>) -> i32
 
     var pos: i64 = 0
 
+    # The whole line first: a read can end partway through it, which is
+    # more input to wait for, not a malformed line (AGAST #1865).
+    let line_end: i64 = find_crlf(input, 0)
+    if line_end < 0
+        return H1_ERR_INCOMPLETE
+
     # Find first space (end of method)
     let method_end: i64 = find_byte(input, pos, ' ')
-    if method_end < 0
+    if method_end < 0 || method_end > line_end
         return H1_ERR_INVALID
 
     # Parse method
@@ -91,16 +98,13 @@ pub fn h1_parse_request_line(req: *H1Request, input: *Span<u8>) -> i32
 
     # Find second space (end of path)
     let path_end: i64 = find_byte(input, pos, ' ')
-    if path_end < 0
+    if path_end < 0 || path_end > line_end
         return H1_ERR_INVALID
 
     req.path = span_slice<u8>(input, pos, path_end)
     pos = path_end + 1
 
-    # Find CRLF (end of version)
-    let crlf_pos: i64 = find_crlf(input, pos)
-    if crlf_pos < 0
-        return H1_ERR_INCOMPLETE
+    let crlf_pos: i64 = line_end
 
     # Parse version
     var version_span: Span<u8> = span_slice<u8>(input, pos, crlf_pos)
@@ -131,18 +135,19 @@ pub fn h1_parse_header(input: *Span<u8>, name: *Span<u8>, value: *Span<u8>) -> i
         value.len = 0
         return 0  # Signal end of headers
 
-    # Find colon
+    # The whole line first: a read can end mid-name, before the colon, and
+    # that is more input to wait for, not a malformed header (AGAST #1865).
+    let crlf_pos: i64 = find_crlf(input, 0)
+    if crlf_pos < 0
+        return H1_ERR_INCOMPLETE
+
+    # Find colon, on this line
     let colon_pos: i64 = find_byte(input, 0, ':')
-    if colon_pos < 0
+    if colon_pos < 0 || colon_pos > crlf_pos
         return H1_ERR_INVALID
 
     # Extract name (no leading/trailing spaces in header names)
     *name = span_slice<u8>(input, 0, colon_pos)
-
-    # Find CRLF
-    let crlf_pos: i64 = find_crlf(input, colon_pos)
-    if crlf_pos < 0
-        return H1_ERR_INCOMPLETE
 
     # Extract value (skip colon and whitespace)
     var value_start: i64 = colon_pos + 1
@@ -165,7 +170,18 @@ pub fn h1_parse_header(input: *Span<u8>, name: *Span<u8>, value: *Span<u8>) -> i
 # ============================================================================
 
 # Parse complete HTTP/1.x request
-# Returns total bytes consumed on success, negative on error
+# Returns total bytes consumed on success, negative on error:
+#   H1_ERR_INCOMPLETE       more input needed (headers or body still arriving)
+#   H1_ERR_INVALID          malformed, including framing a server must
+#                           reject with 400: Content-Length with
+#                           Transfer-Encoding, duplicate or invalid
+#                           Content-Length (AGAST #1865)
+#   H1_ERR_NOT_IMPLEMENTED  Transfer-Encoding other than "chunked" (501)
+#   H1_ERR_TOO_LARGE        the request does not fit an i32 length
+#   H1_ERR_TOO_MANY_HEADERS
+# Bytes after the returned length belong to the next (pipelined) request.
+# A chunked body is decoded in place: input's bytes between the headers and
+# the returned length are rewritten, so input must be writable then.
 pub fn h1_parse_request(req: *H1Request, input: *Span<u8>) -> i32
     h1_request_init(req)
 
@@ -204,26 +220,36 @@ pub fn h1_parse_request(req: *H1Request, input: *Span<u8>) -> i32
             req.headers[idx].value = value
             req.header_count += 1
 
-            # Check for special headers (use stored refs)
-            if span_eq_cstr_ci(@req.headers[idx].name, c"Content-Length") != 0
-                req.content_length = parse_content_length(@req.headers[idx].value)
-            else if span_eq_cstr_ci(@req.headers[idx].name, c"Connection") != 0
+            if span_eq_cstr_ci(@req.headers[idx].name, c"Connection") != 0
                 if span_eq_cstr_ci(@req.headers[idx].value, c"close") != 0
                     req.connection_close = 1
 
             pos += header_result as i64
             remaining = span_from<u8>(input, pos)
 
-    # Extract body if Content-Length present
-    if req.content_length > 0
-        let body_available: i64 = input.len - pos
-        if body_available < req.content_length
-            return H1_ERR_INCOMPLETE
+    # Where the request ends is lib.h1_framing's call alone, so it is the
+    # same one valet makes (AGAST #1865).
+    var f: H1Frame
+    let total: i64 = h1_frame_request(input.ptr, input.len, 0, @f)
+    if f.body_kind == H1F_BODY_LENGTH
+        req.content_length = f.body_len
+    if total == H1F_INCOMPLETE
+        return H1_ERR_INCOMPLETE
+    if total == H1F_NOT_IMPLEMENTED
+        return H1_ERR_NOT_IMPLEMENTED
+    if total == H1F_TOO_LARGE
+        return H1_ERR_TOO_LARGE
+    if total < 0
+        return H1_ERR_INVALID
+    if total > 2147483647
+        return H1_ERR_TOO_LARGE
 
-        req.body = span_slice<u8>(input, pos, pos + req.content_length)
-        pos += req.content_length
+    let body_len: i64 = h1_frame_dechunk(input.ptr, @f)
+    req.content_length = body_len
+    if body_len > 0
+        req.body = span_slice<u8>(input, f.headers_end, f.headers_end + body_len)
 
-    return pos as i32
+    return total as i32
 
 # ============================================================================
 # Header Access

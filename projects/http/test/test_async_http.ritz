@@ -292,3 +292,94 @@ fn test_async_write_response_empty_body()
     assert ret == ASYNC_OK
     assert conn.write_len > 0  # Headers still written
 
+
+# ============================================================================
+# Framing across reads and pipelining (AGAST #1865)
+# ============================================================================
+
+# Append a C string to the connection's buffer as one read completion.
+fn feed(conn: *AsyncHttpConn, s: *u8) -> i32
+    var n: i32 = 0
+    while *(s + n) != 0
+        n = n + 1
+    if conn.read_pos > 0
+        # A real caller's async_submit_read compacts first; do the same.
+        async_compact_read_buf(conn)
+    for i in 0..n
+        conn.read_buf[conn.read_len + i] = *(s + i)
+    return async_handle_read(conn, n)
+
+fn body_is(conn: *AsyncHttpConn, want: *u8) -> i32
+    var expected: Span<u8> = span_from_cstr(want)
+    if span_eq(@conn.request.body, @expected)
+        return 1
+    return 0
+
+[[test]]
+fn test_async_body_split_across_reads() -> i32
+    var conn: AsyncHttpConn
+    async_http_conn_init(@conn, 5)
+    feed(@conn, c"POST /u HTTP/1.1\r\nContent-Le")
+    if async_try_parse_request(@conn) != ASYNC_ERR_INCOMPLETE
+        return 1
+    feed(@conn, c"ngth: 10\r\n\r\nhello")
+    if async_try_parse_request(@conn) != ASYNC_ERR_INCOMPLETE
+        return 2
+    feed(@conn, c" world")
+    if async_try_parse_request(@conn) != ASYNC_OK
+        return 3
+    if body_is(@conn, c"hello worl") == 0
+        return 4
+    # The byte behind the body is the start of the next request: kept.
+    if conn.read_len != 1
+        return 5
+    return 0
+
+[[test]]
+fn test_async_chunked_split_across_reads() -> i32
+    var conn: AsyncHttpConn
+    async_http_conn_init(@conn, 5)
+    feed(@conn, c"POST /u HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+    if async_try_parse_request(@conn) != ASYNC_ERR_INCOMPLETE
+        return 1
+    feed(@conn, c"lo\r\n6\r\n world\r\n0\r\n\r\n")
+    if async_try_parse_request(@conn) != ASYNC_OK
+        return 2
+    if body_is(@conn, c"hello world") == 0
+        return 3
+    return 0
+
+[[test]]
+fn test_async_pipelined_requests_keep_their_bodies() -> i32
+    var conn: AsyncHttpConn
+    async_http_conn_init(@conn, 5)
+    feed(@conn, c"POST /a HTTP/1.1\r\nContent-Length: 3\r\n\r\nabcPOST /b HTTP/1.1\r\nContent-Length: 3\r\n\r\nxyz")
+    if async_try_parse_request(@conn) != ASYNC_OK
+        return 1
+    # The first request's spans stay valid while it is handled: the second
+    # request's bytes must not have been moved over them yet.
+    if body_is(@conn, c"abc") == 0
+        return 2
+    var p1: Span<u8> = span_from_cstr(c"/a")
+    if not span_eq(@conn.request.path, @p1)
+        return 3
+    if async_try_parse_request(@conn) != ASYNC_OK
+        return 4
+    if body_is(@conn, c"xyz") == 0
+        return 5
+    if conn.read_len != 0
+        return 6
+    return 0
+
+[[test]]
+fn test_async_framing_errors() -> i32
+    var conn: AsyncHttpConn
+    async_http_conn_init(@conn, 5)
+    feed(@conn, c"POST / HTTP/1.1\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+    if async_try_parse_request(@conn) != ASYNC_ERR_PARSE
+        return 1
+    async_http_conn_init(@conn, 5)
+    feed(@conn, c"POST / HTTP/1.1\r\nTransfer-Encoding: br\r\n\r\n")
+    if async_try_parse_request(@conn) != ASYNC_ERR_NOT_IMPLEMENTED
+        return 2
+    return 0

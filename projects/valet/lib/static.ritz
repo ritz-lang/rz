@@ -151,13 +151,38 @@ pub fn path_is_safe(path: *u8, path_len: i32) -> i32
 
 # Range request result
 struct RangeResult
-    valid: i32       # 1 if range is valid, 0 otherwise
+    valid: i32       # RANGE_IGNORE, RANGE_OK or RANGE_UNSATISFIABLE
     start: i64       # Start byte (inclusive)
     end: i64         # End byte (inclusive)
 
+pub const RANGE_IGNORE: i32 = 0          # no usable Range: serve the whole file
+pub const RANGE_OK: i32 = 1              # serve start..end (206)
+pub const RANGE_UNSATISFIABLE: i32 = 2   # no byte of the file is in it (416)
+
+# Positions past this are past the end of any file; parsing stops growing
+# them there instead of overflowing an i64 into a negative offset.
+const RANGE_POS_CAP: i64 = 100000000000000000
+
+
+# Parse a decimal Range position from range_hdr[*pos .. stop), advancing
+# *pos.  Returns -1 on a non-digit; values above RANGE_POS_CAP are capped.
+fn range_number(range_hdr: *u8, pos: *i32, stop: i32, until: u8) -> i64
+    var v: i64 = 0
+    while *pos < stop and *(range_hdr + *pos) != until
+        let c: u8 = *(range_hdr + *pos)
+        if c < '0' or c > '9'
+            return -1
+        if v <= RANGE_POS_CAP
+            v = v * 10 + (c - '0') as i64
+        *pos = *pos + 1
+    return v
+
 
 # Parse Range header value: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"
-# Returns valid=1 if parsed successfully
+# Returns valid=RANGE_OK with start <= end inside the file, RANGE_IGNORE for
+# a header to ignore, or RANGE_UNSATISFIABLE when the range starts at or
+# past the end of the file: "bytes=100-" on a 20-byte file used to come out
+# as start 100, end 19, and a negative Content-Length (AGAST #1865).
 pub fn parse_range(range_hdr: *u8, range_len: i32, file_size: i64) -> RangeResult
     var result: RangeResult
     result.valid = 0
@@ -178,65 +203,50 @@ pub fn parse_range(range_hdr: *u8, range_len: i32, file_size: i64) -> RangeResul
     # Check for suffix range: bytes=-500 (last 500 bytes)
     if *(range_hdr + pos) == '-'
         pos += 1
-        var suffix_len: i64 = 0
-        while pos < range_len
-            let c: u8 = *(range_hdr + pos)
-            if c >= '0' && c <= '9'
-                suffix_len = suffix_len * 10 + (c - '0') as i64
-            else
-                return result  # Invalid char
-            pos += 1
-        if suffix_len == 0
+        if pos >= range_len
             return result
-        if suffix_len > file_size
-            suffix_len = file_size
-        result.start = file_size - suffix_len
+        let suffix_len: i64 = range_number(range_hdr, @pos, range_len, 0)
+        if suffix_len < 0
+            return result  # Invalid char
+        if suffix_len == 0 or file_size == 0
+            result.valid = RANGE_UNSATISFIABLE
+            return result
+        var take: i64 = suffix_len
+        if take > file_size
+            take = file_size
+        result.start = file_size - take
         result.end = file_size - 1
-        result.valid = 1
+        result.valid = RANGE_OK
         return result
 
     # Parse start
-    var start: i64 = 0
-    while pos < range_len && *(range_hdr + pos) != '-'
-        let c: u8 = *(range_hdr + pos)
-        if c >= '0' && c <= '9'
-            start = start * 10 + (c - '0') as i64
-        else
-            return result  # Invalid char
-        pos += 1
+    if pos >= range_len or *(range_hdr + pos) == '-'
+        return result
+    let start: i64 = range_number(range_hdr, @pos, range_len, '-')
+    if start < 0
+        return result  # Invalid char
 
-    if pos >= range_len || *(range_hdr + pos) != '-'
+    if pos >= range_len or *(range_hdr + pos) != '-'
         return result  # No hyphen found
     pos += 1  # Skip hyphen
 
-    # Parse end (optional)
-    if pos >= range_len
-        # Open-ended range: bytes=start-
-        result.start = start
-        result.end = file_size - 1
-        result.valid = 1
-        return result
-
-    var end: i64 = 0
-    while pos < range_len
-        let c: u8 = *(range_hdr + pos)
-        if c >= '0' && c <= '9'
-            end = end * 10 + (c - '0') as i64
-        else
+    var end: i64 = file_size - 1
+    if pos < range_len
+        end = range_number(range_hdr, @pos, range_len, 0)
+        if end < 0
             return result  # Invalid char
-        pos += 1
-
-    # Validate range
-    if start > end
-        return result
+        if start > end
+            return result  # Not a valid range: ignored, per RFC 9110 14.2
+    # Open-ended ("bytes=start-") or not, a range has to start in the file.
     if start >= file_size
+        result.valid = RANGE_UNSATISFIABLE
         return result
     if end >= file_size
         end = file_size - 1
 
     result.start = start
     result.end = end
-    result.valid = 1
+    result.valid = RANGE_OK
     return result
 
 
@@ -538,7 +548,10 @@ pub fn static_serve_file_full(fd: i32, path: *u8, range_hdr: *u8, range_len: i32
 
     if range_hdr != null && range_len > 0
         let range: RangeResult = parse_range(range_hdr, range_len, file_size)
-        if range.valid != 0
+        if range.valid == RANGE_UNSATISFIABLE
+            sys_close(file_fd)
+            return static_send_416(fd, file_size)
+        if range.valid == RANGE_OK
             send_start = range.start
             send_end = range.end
             partial = 1

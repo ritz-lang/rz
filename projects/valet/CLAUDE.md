@@ -234,10 +234,15 @@ Shipped — these were listed as "next steps" here long after they landed:
 6. ~~**Reverse proxy**~~ ✅ `-z/--zeus-socket`
 7. ~~**TLS**~~ ✅ `lib/tls.ritz` via cryptosec; `test/test_tls_socket.sh`
    runs HTTPS against OpenSSL over a real socket in CI's `build-all` job
+8. ~~**Request body framing**~~ ✅ `request_frame` in `lib/request.ritz`, over
+   http's `lib/h1_framing.ritz` (AGAST #1865): Content-Length (i64) and
+   chunked bodies, decoded in place; pipelined requests; 400 for CL with TE
+   or a duplicate or invalid CL, 501 for other Transfer-Encodings;
+   `test/test_framing.sh`. `POST /echo` (stand-alone mode) answers
+   "<body length> <body>" for these tests.
 
 Still open:
 
-- **Request body parsing** — Content-Length, chunked encoding
 - **Graceful shutdown** — signal handling
 
 ## Related Projects

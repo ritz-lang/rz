@@ -23,6 +23,8 @@ pub const ASYNC_ERR_IO: i32 = -3
 pub const ASYNC_ERR_INCOMPLETE: i32 = -4
 pub const ASYNC_ERR_PARSE: i32 = -5
 pub const ASYNC_ERR_CLOSED: i32 = -6
+pub const ASYNC_ERR_NOT_IMPLEMENTED: i32 = -7   # answer 501 (Transfer-Encoding)
+pub const ASYNC_ERR_TOO_LARGE: i32 = -8         # answer 413
 
 
 # Default buffer sizes
@@ -44,8 +46,13 @@ pub const OP_TAG_MASK: i64 = 0xF000000000000000 as i64
 pub struct AsyncHttpConn
     fd: i32                    # Socket file descriptor
     read_buf: [8192]u8         # Receive buffer
-    read_pos: i32              # Current read position
-    read_len: i32              # Valid data length
+    # Unparsed input is read_buf[read_pos .. read_pos + read_len).  The bytes
+    # before read_pos are the request last parsed: its spans point there, so
+    # they are only dropped when the next parse or read compacts the buffer
+    # (AGAST #1865; dropping them at parse time let a pipelined request
+    # overwrite the one being handled).
+    read_pos: i32
+    read_len: i32
     write_buf: [8192]u8        # Send buffer
     write_pos: i32             # Current write position
     write_len: i32             # Data to write
@@ -75,11 +82,24 @@ pub fn async_http_conn_init(conn: *AsyncHttpConn, fd: i32)
 # Submission Helpers
 # ============================================================================
 
+# Drop the already-parsed bytes before read_pos, moving the unparsed ones to
+# the front of read_buf.  Invalidates the spans of the last parsed message.
+pub fn async_compact_read_buf(conn: *AsyncHttpConn)
+    if conn.read_pos == 0
+        return
+    var i: i32 = 0
+    while i < conn.read_len
+        conn.read_buf[i] = conn.read_buf[conn.read_pos + i]
+        i = i + 1
+    conn.read_pos = 0
+
 # Submit a read request for an HTTP connection
 pub fn async_submit_read(ring: *IoUring, conn: *AsyncHttpConn) -> i32
     var sqe: *IoUringSqe = uring_get_sqe(ring)
     if sqe == null
         return ASYNC_ERR_RING_FULL
+
+    async_compact_read_buf(conn)
 
     let buf_ptr: *u8 = @conn.read_buf[conn.read_len]
     let buf_remaining: i32 = DEFAULT_READ_BUF_SIZE - conn.read_len
@@ -190,6 +210,7 @@ pub fn async_op_fd(user_data: i64) -> i32
 
 # Try to parse an HTTP request from the connection's read buffer
 pub fn async_try_parse_request(conn: *AsyncHttpConn) -> i32
+    async_compact_read_buf(conn)
     var buf: Span<u8>
     buf.ptr = @conn.read_buf[0]
     buf.len = conn.read_len as i64
@@ -197,24 +218,22 @@ pub fn async_try_parse_request(conn: *AsyncHttpConn) -> i32
     let ret: i32 = h1_parse_request(@conn.request, @buf)
     if ret == H1_ERR_INCOMPLETE
         return ASYNC_ERR_INCOMPLETE
+    if ret == H1_ERR_NOT_IMPLEMENTED
+        return ASYNC_ERR_NOT_IMPLEMENTED
+    if ret == H1_ERR_TOO_LARGE
+        return ASYNC_ERR_TOO_LARGE
     if ret < 0
         return ASYNC_ERR_PARSE
 
-    # Shift remaining data to beginning of buffer
-    let consumed: i32 = ret
-    var remaining: i32 = conn.read_len - consumed
-    if remaining > 0
-        var i: i32 = 0
-        while i < remaining
-            conn.read_buf[i] = conn.read_buf[consumed + i]
-            i = i + 1
-    conn.read_pos = 0
-    conn.read_len = remaining
+    # Consumed: the bytes behind it (a pipelined next message) stay unparsed.
+    conn.read_pos = ret
+    conn.read_len = conn.read_len - ret
 
     return ASYNC_OK
 
 # Try to parse an HTTP response from the connection's read buffer
 pub fn async_try_parse_response(conn: *AsyncHttpConn) -> i32
+    async_compact_read_buf(conn)
     var buf: Span<u8>
     buf.ptr = @conn.read_buf[0]
     buf.len = conn.read_len as i64
@@ -225,16 +244,9 @@ pub fn async_try_parse_response(conn: *AsyncHttpConn) -> i32
     if ret < 0
         return ASYNC_ERR_PARSE
 
-    # Shift remaining data
-    let consumed: i32 = ret
-    var remaining: i32 = conn.read_len - consumed
-    if remaining > 0
-        var i: i32 = 0
-        while i < remaining
-            conn.read_buf[i] = conn.read_buf[consumed + i]
-            i = i + 1
-    conn.read_pos = 0
-    conn.read_len = remaining
+    # Consumed: the bytes behind it (a pipelined next message) stay unparsed.
+    conn.read_pos = ret
+    conn.read_len = conn.read_len - ret
 
     return ASYNC_OK
 

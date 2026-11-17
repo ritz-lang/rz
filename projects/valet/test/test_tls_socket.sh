@@ -18,6 +18,8 @@
 #   - One record split across two TCP writes (AGAST #2197 item 1)
 #   - A request's two records in one TCP write (AGAST #2197 item 2)
 #   - Headers over the 8 KiB request limit get a 413, not a silent close
+#   - A chunked body across records, then a keep-alive GET; Content-Length
+#     with Transfer-Encoding is a 400 (AGAST #1865)
 #   - A client hanging up mid-handshake does not spin the server
 #   - A client's close_notify is a clean close, not "decrypt failed"
 #     (AGAST #2197 item 4)
@@ -280,6 +282,17 @@ elif mode == "closenotify":
     sock.close()
     sys.stdout.write(reply.decode("latin-1"))
     sys.exit(0)
+elif mode == "chunkedbody":
+    sock.sendall(outg.read())
+    time.sleep(PAUSE)
+    send_record(b"POST /nowhere HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel")
+    send_record(b"lo\r\n0\r\n\r\n")
+    send_record(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+elif mode == "clte":
+    sock.sendall(outg.read())
+    time.sleep(PAUSE)
+    send_record(b"POST /nowhere HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\nGET / HTTP/1.1\r\n\r\n")
 elif mode == "oversized":
     sock.sendall(outg.read())
     time.sleep(PAUSE)
@@ -411,6 +424,30 @@ if grep -q "^HTTP/1.1 413" <<<"$OUT"; then
     pass "oversized headers: 413"
 else
     fail "oversized headers: no 413"
+    echo "--- client"; tail -5 <<<"$OUT"
+    echo "--- server"; tail -5 "$WORK/server.log"
+fi
+
+# The framing a plain request gets, from http's lib/h1_framing.ritz
+# (AGAST #1865): a chunked body is read as part of its request.
+echo "=== Test 10a: chunked body across records, then a keep-alive GET ==="
+OUT="$(raw_client chunkedbody 2>&1)"
+NRESP="$(grep -o "HTTP/1.1 [0-9]" <<<"$OUT" | wc -l)"
+if [ "$NRESP" -eq 2 ] && grep -q "HTTP/1.1 404" <<<"$OUT" && grep -q "Hello, World!" <<<"$OUT"; then
+    pass "chunked body: POST and the GET behind it both answered"
+else
+    fail "chunked body: expected 404 then 200, got $NRESP responses"
+    echo "--- client"; tail -8 <<<"$OUT"
+    echo "--- server"; tail -5 "$WORK/server.log"
+fi
+
+echo "=== Test 10b: Content-Length with Transfer-Encoding ==="
+OUT="$(raw_client clte 2>&1)"
+NRESP="$(grep -o "HTTP/1.1 [0-9]" <<<"$OUT" | wc -l)"
+if grep -q "^HTTP/1.1 400" <<<"$OUT" && [ "$NRESP" -eq 1 ]; then
+    pass "CL+TE: 400, and nothing behind it served"
+else
+    fail "CL+TE: expected one 400, got $NRESP responses"
     echo "--- client"; tail -5 <<<"$OUT"
     echo "--- server"; tail -5 "$WORK/server.log"
 fi

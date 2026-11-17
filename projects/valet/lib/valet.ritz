@@ -30,6 +30,7 @@ import log
 import static
 import compress
 import tls
+import http.h1_framing
 
 
 # ============================================================================
@@ -358,21 +359,22 @@ pub fn ctx_body(buf: *u8, buf_len: i32) -> i32
     if c == null
         return -1
 
-    # Body starts after headers_end in the raw buffer
-    let body_start: i32 = c.req.headers_end
-    let body_len: i32 = c.req.content_length
+    # Body starts after headers_end in the raw buffer (a chunked body was
+    # decoded there, AGAST #1865).
+    let body_start: i64 = c.req.headers_end as i64
+    let body_len: i64 = c.req.content_length
 
     if body_start < 0 or body_len <= 0
         return 0
 
     # Calculate actual length to copy
-    var copy_len: i32 = body_len
-    if copy_len > buf_len
-        copy_len = buf_len
+    var copy_len: i64 = body_len
+    if copy_len > buf_len as i64
+        copy_len = buf_len as i64
 
     # Check we don't read past end of raw buffer
-    if body_start + copy_len > c.raw_len
-        copy_len = c.raw_len - body_start
+    if body_start + copy_len > c.raw_len as i64
+        copy_len = c.raw_len as i64 - body_start
         if copy_len < 0
             return 0
 
@@ -380,7 +382,7 @@ pub fn ctx_body(buf: *u8, buf_len: i32) -> i32
     for i in 0..copy_len
         *(buf + i) = *(c.raw_buf + body_start + i)
 
-    return copy_len
+    return copy_len as i32
 
 
 # 1 when the connection should stay open after answering `req`, the
@@ -806,6 +808,7 @@ const CONN_STATE_PARSE: i32 = 1
 const CONN_STATE_SEND: i32 = 2
 const CONN_STATE_STATIC: i32 = 3  # Serving static file
 const CONN_STATE_PROXY_WAIT: i32 = 4  # Cooperative-yield proxy: wakeup pending
+const CONN_STATE_PIPELINE: i32 = 5  # A NOP's wakeup: frame bytes already in read_buf
 
 # Size of Task.read_buf (ritzlib's TASK_BUFFER_SIZE): the most header bytes a
 # plain request may arrive with, across however many reads (AGAST #2201).
@@ -1068,6 +1071,13 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
 # Returns 1 if static file was handled (caller should transition to keep-alive or close)
 # Returns 0 if not a static path (caller should try routing)
 pub fn valet_try_static(app: *Valet, task: *Task, path: *u8, path_len: i32) -> i32
+    return valet_try_static_raw(app, task, path, path_len, @task.read_buf[0], task.read_len)
+
+
+# valet_try_static for a request in raw[0..raw_len): its headers (Range,
+# If-None-Match) are read there, not from task.read_buf, which can hold the
+# next pipelined request instead (AGAST #1865).
+pub fn valet_try_static_raw(app: *Valet, task: *Task, path: *u8, path_len: i32, raw: *u8, raw_len: i32) -> i32
     # Check if static serving is enabled
     if app.static_root == null
         return 0
@@ -1116,10 +1126,10 @@ pub fn valet_try_static(app: *Valet, task: *Task, path: *u8, path_len: i32) -> i
         return 1
 
     # Check for Range header in the request
-    let range_hdr: HeaderResult = request_find_header(@task.read_buf[0], task.read_len, c"Range", 5)
+    let range_hdr: HeaderResult = request_find_header(raw, raw_len, c"Range", 5)
 
     # Check for If-None-Match header (ETag validation)
-    let if_none_match: HeaderResult = request_find_header(@task.read_buf[0], task.read_len, c"If-None-Match", 13)
+    let if_none_match: HeaderResult = request_find_header(raw, raw_len, c"If-None-Match", 13)
 
     # Serve the file with optional range and ETag support
     var range_ptr: *u8 = null
@@ -1150,22 +1160,47 @@ pub fn valet_task_send(task: *Task, len: i32) -> i32
     return task_send(task, len)
 
 
-# Build a 413 Request Entity Too Large response (Connection: close) in `res`.
-fn valet_build_413(res: *Response)
-    response_status(res, 413)
+# Build a request-error response (Connection: close) in `res`: 413 Request
+# Entity Too Large, or the 400 / 501 a framing error is answered with
+# (AGAST #1865).  Any other code is answered as a 400.
+fn valet_build_error(res: *Response, code: i32)
+    var status: i32 = 400
+    var body: *u8 = c"400 Bad Request\n"
+    var body_len: i32 = 16
+    if code == 413
+        status = 413
+        body = c"413 Request Entity Too Large\n"
+        body_len = 29
+    else if code == 501
+        status = 501
+        body = c"501 Not Implemented\n"
+        body_len = 20
+    response_status(res, status)
     response_header(res, c"Content-Type", c"text/plain")
     response_header(res, c"Connection", c"close")
-    let body = c"413 Request Entity Too Large\n"
-    response_content_length(res, 29)
+    response_content_length(res, body_len as i64)
     response_end_headers(res)
-    response_body(res, body, 29)
+    response_body(res, body, body_len)
+
+
+# Body limit for request_frame: max_request_size, or the buffering ceiling
+# when that is 0 (unlimited).
+fn valet_body_limit(app: *Valet) -> i64
+    if app.max_request_size > 0
+        return app.max_request_size as i64
+    return VALET_MAX_BUFFERED
 
 
 # Helper to send 413 Request Entity Too Large
 pub fn valet_send_413(task: *Task) -> i32
+    return valet_send_error(task, 413)
+
+
+# Send a request-error response (see valet_build_error) and close.
+pub fn valet_send_error(task: *Task, code: i32) -> i32
     var res: Response
     response_init(@res, @task.write_buf[0], 8192)
-    valet_build_413(@res)
+    valet_build_error(@res, code)
     # It says "Connection: close": make the SEND state close (AGAST #2106's
     # saturated count), or a client waiting for EOF would wait forever.
     task.request_count = get_g_app().keepalive_requests
@@ -1178,18 +1213,127 @@ pub fn valet_send_413(task: *Task) -> i32
     return -1
 
 
+# Bytes at the front of task.read_buf the request being handled occupies;
+# 0 when it was read into a heap buffer.  Whatever follows them in read_buf
+# is the next, pipelined, request (AGAST #1865).
+var g_req_consumed: [256]i32
+
+# What request_frame learned of the request being read, per slot, so each
+# recv into a heap buffer resumes the framing instead of redoing it
+# (h1_frame_continue): a big body of tiny chunks would cost quadratic time.
+var g_frames: [256]H1Frame
+
+
+fn valet_frame_slot(task: *Task) -> *H1Frame
+    let idx: i32 = valet_task_slot_idx(task)
+    if idx < 0
+        return null
+    return @g_frames[idx]
+
+
+fn valet_set_consumed(task: *Task, n: i32)
+    let idx: i32 = valet_task_slot_idx(task)
+    if idx >= 0
+        g_req_consumed[idx] = n
+
+
+# Done with a request: drop its bytes and go on to the next one.  Bytes
+# already behind it (pipelined) are framed on a NOP's wakeup — no recv
+# would bring them, the client is waiting for answers — otherwise a recv is
+# submitted.  Returns 0 or -errno, like task_reset_for_recv.
+fn valet_next_request(task: *Task) -> i32
+    var consumed: i32 = 0
+    let idx: i32 = valet_task_slot_idx(task)
+    if idx >= 0
+        consumed = g_req_consumed[idx]
+        g_req_consumed[idx] = 0
+    if g_bigbuf_active > 0
+        let b: *BigBuf = bigbuf_for(task)
+        if b != null and b.mode == BIGBUF_PARSED
+            bigbuf_release(b)
+    let rest: i32 = task.read_len - consumed
+    if rest <= 0
+        return task_reset_for_recv(task)
+    memmove(@task.read_buf[0], @task.read_buf[consumed], rest as i64)
+    task.read_len = rest
+    task.write_len = 0
+    task.write_pos = 0
+    task.handler_state = CONN_STATE_PIPELINE
+    return task_yield(task)
+
+
+# The request isn't whole yet: receive more of it.  `big` is the heap buffer
+# it is being read into, or null for task.read_buf; `f` is what
+# request_frame knew.  Returns the handler convention.
+fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
+    if big != null
+        let room: i64 = big.cap - big.len
+        if room <= 0
+            log_warn(c"Request too large, closing connection")
+            bigbuf_release(big)
+            return valet_send_413(task)
+        if task_recv_buf(task, big.ptr + big.len, room as i32) < 0
+            bigbuf_release(big)
+            return 1
+        return -1
+
+    if f.headers_end == 0
+        # Headers split across reads: read the rest in behind them.
+        if app.max_request_size > 0 && task.read_len > app.max_request_size
+            log_warn(c"Request too large, closing connection")
+            return valet_send_413(task)
+        if task.read_len >= VALET_READ_BUF
+            log_warn(c"Request headers exceed the read buffer")
+            return valet_send_413(task)
+        if task_recv_buf(task, @task.read_buf[task.read_len], VALET_READ_BUF - task.read_len) < 0
+            return 1
+        return -1
+
+    # The body is still on the wire.  A Content-Length says how big a buffer
+    # it needs; a chunked body gets the most it may grow to.
+    var want: i64 = f.total
+    if want < 0
+        want = valet_body_limit(app) + f.headers_end + 4096
+        if want > VALET_MAX_BUFFERED
+            want = VALET_MAX_BUFFERED
+    else if app.max_request_size > 0 && want > app.max_request_size as i64
+        log_warn(c"Request too large, closing connection")
+        return valet_send_413(task)
+    if (f.total >= 0 and want <= VALET_READ_BUF as i64) or (f.total < 0 and task.read_len < VALET_READ_BUF)
+        if task_recv_buf(task, @task.read_buf[task.read_len], VALET_READ_BUF - task.read_len) < 0
+            return 1
+        return -1
+    let nb: *BigBuf = bigbuf_acquire(task, want, BIGBUF_RECV)
+    if nb == null
+        return valet_send_413(task)
+    memcpy(nb.ptr, @task.read_buf[0], task.read_len as i64)
+    nb.len = task.read_len as i64
+    task.read_len = 0
+    if task_recv_buf(task, nb.ptr + nb.len, (nb.cap - nb.len) as i32) < 0
+        bigbuf_release(nb)
+        return 1
+    return -1
+
+
 pub fn valet_handle_connection(task: *Task) -> i32
     # The request being handled: task.read_buf, or a heap buffer when the
     # request outgrew it (AGAST #2104).
     var req_buf: *u8 = @task.read_buf[0]
     var req_len: i32 = 0
+    var body_len: i64 = 0
+    var close_after: i32 = 0
 
-    # State: RECV - read request data
-    if task.handler_state == CONN_STATE_RECV
+    # Bytes received since the last look: a recv's result, or none when a
+    # pipelined request was left in read_buf (valet_next_request).
+    var added: i32 = 0
+    if task.handler_state == CONN_STATE_PIPELINE
+        task.handler_state = CONN_STATE_RECV
+    else if task.handler_state == CONN_STATE_RECV
         if task.io_result == TASK_IO_FRESH
             # Fresh task — never submitted recv.  A previous connection in
             # this pool slot may have died mid-request; drop its buffer.
             bigbuf_release_task(task)
+            valet_set_consumed(task, 0)
             let ret = task_recv(task)
             if ret < 0
                 return 1
@@ -1199,7 +1343,10 @@ pub fn valet_handle_connection(task: *Task) -> i32
             # EOF (0) or error (<0) — connection done.
             bigbuf_release_task(task)
             return 0
+        added = task.io_result
 
+    # State: RECV - read until a whole request is buffered
+    if task.handler_state == CONN_STATE_RECV
         let app: *Valet = get_g_app()
         var big: *BigBuf = null
         if g_bigbuf_active > 0
@@ -1211,62 +1358,74 @@ pub fn valet_handle_connection(task: *Task) -> i32
                     bigbuf_release(big)
                 big = null
 
+        # Append: read_len is 0 for a new request (spawn_task,
+        # task_reset_for_recv), or what is already buffered of this one:
+        # headers not all here yet (AGAST #2201), or a pipelined request
+        # (AGAST #1865).
+        var in_buf: *u8 = @task.read_buf[0]
+        var in_len: i64 = 0
         if big != null
-            # Continuing a request that outgrew read_buf.
-            big.len = big.len + task.io_result as i64
-            if big.len < big.need
-                if task_recv_buf(task, big.ptr + big.len, (big.need - big.len) as i32) < 0
-                    bigbuf_release(big)
-                    return 1
-                return -1
-            big.mode = BIGBUF_PARSED
-            req_buf = big.ptr
-            req_len = big.len as i32
+            big.len = big.len + added as i64
+            in_buf = big.ptr
+            in_len = big.len
         else
-            # Append: read_len is 0 for a new request (spawn_task,
-            # task_reset_for_recv), or the bytes of one whose headers have
-            # not all arrived yet (AGAST #2201).
-            task.read_len = task.read_len + task.io_result
-            req_len = task.read_len
+            task.read_len = task.read_len + added
+            in_len = task.read_len as i64
 
-            # Check request size limit
-            if app.max_request_size > 0 && task.read_len > app.max_request_size
+        # Where does the request end?  http's lib/h1_framing.ritz decides,
+        # for this server and projects/http alike (AGAST #1865).  Reading
+        # into a heap buffer, it picks up where the last recv left it.
+        var local_frame: H1Frame
+        var f: *H1Frame = valet_frame_slot(task)
+        if f == null
+            f = @local_frame
+            h1_frame_init(f)
+        var total: i64 = 0
+        if big != null
+            total = h1_frame_continue(in_buf, in_len, valet_body_limit(app), f)
+        else
+            total = request_frame(in_buf, in_len as i32, valet_body_limit(app), f)
+        if total == H1F_INCOMPLETE
+            return valet_recv_more(task, app, big, f)
+        if total < 0
+            let code: i32 = h1_frame_status(total)
+            if code == 413
                 log_warn(c"Request too large, closing connection")
-                return valet_send_413(task)
+            else
+                log_warn(c"Bad request framing, closing connection")
+            bigbuf_release_task(task)
+            return valet_send_error(task, code)
+        if app.max_request_size > 0 && total > app.max_request_size as i64
+            log_warn(c"Request too large, closing connection")
+            bigbuf_release_task(task)
+            return valet_send_413(task)
 
-            # Body still on the wire?  Keep reading into a heap buffer
-            # until headers_end + Content-Length bytes are in hand.
-            let total: i64 = request_total_len(@task.read_buf[0], task.read_len)
-            if total == -2
-                return valet_send_413(task)
-            if total == -1
-                # Headers split across reads: read the rest in behind them.
-                if task.read_len >= VALET_READ_BUF
-                    log_warn(c"Request headers exceed the read buffer")
-                    return valet_send_413(task)
-                if task_recv_buf(task, @task.read_buf[task.read_len], VALET_READ_BUF - task.read_len) < 0
-                    return 1
-                return -1
-            if total > task.read_len as i64
-                if app.max_request_size > 0 && total > app.max_request_size as i64
-                    log_warn(c"Request too large, closing connection")
-                    return valet_send_413(task)
-                let nb: *BigBuf = bigbuf_acquire(task, total, BIGBUF_RECV)
-                if nb == null
-                    return valet_send_413(task)
-                memcpy(nb.ptr, @task.read_buf[0], task.read_len as i64)
-                nb.len = task.read_len as i64
-                if task_recv_buf(task, nb.ptr + nb.len, (nb.need - nb.len) as i32) < 0
-                    bigbuf_release(nb)
-                    return 1
-                return -1
+        # A chunked body is decoded in place, behind the headers, so a
+        # handler reads it like a Content-Length one.
+        body_len = h1_frame_dechunk(in_buf, f)
+        req_buf = in_buf
+        req_len = total as i32
+
+        # Keep what follows the request (a pipelined one) for
+        # valet_next_request, in read_buf.
+        if big != null
+            big.mode = BIGBUF_PARSED
+            let rest: i64 = big.len - total
+            if rest > VALET_READ_BUF as i64
+                # Too much to keep: answer this one and close.
+                close_after = 1
+                task.read_len = 0
+            else
+                memcpy(@task.read_buf[0], big.ptr + total, rest)
+                task.read_len = rest as i32
+            valet_set_consumed(task, 0)
+        else
+            valet_set_consumed(task, req_len)
 
         task.handler_state = CONN_STATE_PARSE
 
     # State: PARSE - parse request, route, build response
     if task.handler_state == CONN_STATE_PARSE
-        if req_len == 0
-            req_len = task.read_len
         var req: Request
         request_init(@req)
 
@@ -1274,11 +1433,14 @@ pub fn valet_handle_connection(task: *Task) -> i32
         if parsed < 0
             bigbuf_release_task(task)
             return 0
+        req.content_length = body_len
 
         task.request_count += 1
 
         # Get global app pointer
         let app: *Valet = get_g_app()
+        if close_after != 0
+            task.request_count = app.keepalive_requests
 
         # Client won't reuse the connection (HTTP/1.0 without keep-alive,
         # or "Connection: close"): saturate the counter so every
@@ -1289,10 +1451,10 @@ pub fn valet_handle_connection(task: *Task) -> i32
 
         # Check for static file request first (only for GET requests)
         if request_is_get(@req) != 0
-            if valet_try_static(app, task, req.path_ptr, req.path_len) != 0
+            if valet_try_static_raw(app, task, req.path_ptr, req.path_len, req_buf, req_len) != 0
                 # Static file was served - check keep-alive
                 if task.request_count < app.keepalive_requests
-                    let ret = task_reset_for_recv(task)
+                    let ret = valet_next_request(task)
                     if ret < 0
                         tcp_shutdown(task.fd, SHUT_WR)
                         return 0
@@ -1330,7 +1492,7 @@ pub fn valet_handle_connection(task: *Task) -> i32
                 return -1
             # Middleware handled but no response - keep-alive
             if task.request_count < app.keepalive_requests
-                let ret = task_reset_for_recv(task)
+                let ret = valet_next_request(task)
                 if ret < 0
                     tcp_shutdown(task.fd, SHUT_WR)
                     return 0
@@ -1476,7 +1638,7 @@ pub fn valet_handle_connection(task: *Task) -> i32
         # Check keep-alive limit from app config
         let app: *Valet = get_g_app()
         if task.request_count < app.keepalive_requests
-            let ret = task_reset_for_recv(task)
+            let ret = valet_next_request(task)
             if ret < 0
                 tcp_shutdown(task.fd, SHUT_WR)
                 return 0
@@ -1561,11 +1723,15 @@ fn tls_task_recv_app(task: *Task, tls_data: *TlsTaskData) -> i32
 # request count).  Returns the handler convention.
 fn valet_tls_send_413(task: *Task, tls_data: *TlsTaskData) -> i32
     log_warn(c"TLS request too large, closing connection")
+    return valet_tls_send_error(task, tls_data, 413)
+
+# Encrypt and send a request-error response (valet_build_error), then close.
+fn valet_tls_send_error(task: *Task, tls_data: *TlsTaskData, code: i32) -> i32
     tls_data.req_len = 0
     var http_res: [256]u8
     var res: Response
     response_init(@res, @http_res[0], 256)
-    valet_build_413(@res)
+    valet_build_error(@res, code)
     let encrypted_len: i64 = tls_server_write(@tls_data.tls, @http_res[0], res.len as i64, @task.write_buf[0], 8192)
     if encrypted_len <= 0
         tls_task_data_free(tls_data)
@@ -1622,19 +1788,23 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
 
     let req_len: i64 = tls_data.req_len
 
-    # Headers incomplete (-1), or Content-Length bytes still to come: wait
-    # for more records.
-    let total: i64 = request_total_len(@tls_data.req[0], req_len as i32)
-    if total == -2 or total > TLS_REQ_CAP
+    # Where does the request end?  http's lib/h1_framing.ritz decides, as
+    # for plain HTTP (AGAST #1865).  Incomplete: wait for more records.
+    var f: H1Frame
+    let total: i64 = request_frame(@tls_data.req[0], req_len as i32, TLS_REQ_CAP, @f)
+    if total == H1F_TOO_LARGE or f.total > TLS_REQ_CAP
         return valet_tls_send_413(task, tls_data)
-    if total == -1 or total > req_len
+    if total < 0 and total != H1F_INCOMPLETE
+        log_warn(c"TLS: bad request framing, closing connection")
+        return valet_tls_send_error(task, tls_data, h1_frame_status(total))
+    if total == H1F_INCOMPLETE
         # The client closed (AGAST #2197 item 4): a normal hangup, and the
         # rest of a partial request is never coming.
         if tls_data.tls.peer_closed != 0
             tls_task_data_free(tls_data)
             task.user_data = null
             return 0
-        if total == -1 and req_len >= TLS_REQ_CAP
+        if req_len >= TLS_REQ_CAP
             return valet_tls_send_413(task, tls_data)
         let ret = tls_task_recv_app(task, tls_data)
         if ret < 0
@@ -1647,12 +1817,14 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     var req: Request
     request_init(@req)
 
-    let parsed = request_parse(@req, @tls_data.req[0], req_len as i32)
+    let parsed = request_parse(@req, @tls_data.req[0], total as i32)
     if parsed < 0
         log_warn(c"TLS: malformed HTTP request, closing connection")
         tls_task_data_free(tls_data)
         task.user_data = null
         return 0
+    # A chunked body is decoded in place behind the headers.
+    req.content_length = h1_frame_dechunk(@tls_data.req[0], @f)
 
     task.request_count += 1
     # See valet_handle_connection: close after this response unless
@@ -1673,7 +1845,7 @@ fn tls_serve_buffered(task: *Task, tls_data: *TlsTaskData, app: *Valet) -> i32
     handler_ctx.path = req.path_ptr
     handler_ctx.path_len = req.path_len
     handler_ctx.raw_buf = @tls_data.req[0]
-    handler_ctx.raw_len = req_len as i32
+    handler_ctx.raw_len = total as i32
     handler_ctx.task = task
     set_g_ctx(@handler_ctx)
 

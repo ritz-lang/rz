@@ -518,7 +518,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     """run-gate.sh relies on build-all's SETUP ERROR (exit 3) coming only
     from `rz build --all`. The other steps are the valet/zeus/nexus e2e
     (AGAST #2107), the valet HTTPS socket test (#2190), the plain-HTTP
-    split-request (#2201) and short-send (#3678) tests, and the stack smoke
+    split-request (#2201), short-send (#3678) and framing (#1865) tests, and the stack smoke
     gate (#2456), which exit 0 or 1 and never 3 -- test_ci_e2e.py holds them
     to that. The harland boot (#1845) exits 3 too, and only for the same
     reason: a missing tool (QEMU, OVMF, GRUB-EFI, or rz build's own exit 3)
@@ -533,6 +533,7 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/valet/test/test_tls_socket.sh",
         "bash projects/valet/test/test_split_request.sh",
         "bash projects/valet/test/test_short_send.sh",
+        "bash projects/valet/test/test_framing.sh",
         "python3 projects/ritz/tools/smoke_stack",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_tier1_boot.sh",

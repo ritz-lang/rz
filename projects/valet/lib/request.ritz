@@ -5,6 +5,7 @@
 
 import ritzlib.io
 import ritzlib.str
+import http.h1_framing
 
 
 # ============================================================================
@@ -36,7 +37,10 @@ struct Request
 
     # Headers end position (for body access)
     headers_end: i32
-    content_length: i32
+    # Body length: 0 from request_parse; the connection handler sets it from
+    # request_frame once the body is in hand (a chunked one decoded in place
+    # behind the headers), so handlers read headers_end .. + content_length.
+    content_length: i64
 
     # Keep-alive flag
     keep_alive: i32
@@ -121,7 +125,8 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
         return -2  # Malformed
     pos += 2
 
-    # Parse headers - look for end of headers, Content-Length and Connection.
+    # Parse headers - look for the end of headers and Connection.  Where the
+    # body ends is request_frame's call (AGAST #1865).
     #
     # Persistence (RFC 9112 9.3): HTTP/1.1 persists unless the client sends
     # "Connection: close"; HTTP/1.0 persists only with "Connection:
@@ -149,45 +154,6 @@ pub fn request_parse(req: *Request, buf: *u8, len: i32) -> i32
                 conn_close = 1
             if (tok & CONN_TOKEN_KEEP_ALIVE) != 0
                 conn_keep = 1
-
-        # Check for Content-Length header (case-insensitive check for first char)
-        let line_start: i32 = pos
-        let c: u8 = *(buf + pos)
-        if (c == 'C' or c == 'c') and pos + 15 < len
-            # Check "Content-Length:"
-            var is_cl: i32 = 1
-            let cl_name: *u8 = c"content-length"
-            for i in 0..14
-                let ch: u8 = *(buf + pos + i)
-                var lower: u8 = ch
-                if lower >= 'A' and lower <= 'Z'
-                    lower = lower + 32
-                if lower != *(cl_name + i)
-                    is_cl = 0
-                    break
-
-            if is_cl == 1 and *(buf + pos + 14) == ':'
-                # Skip ": " and parse number
-                var vpos: i32 = pos + 15
-                while vpos < len and *(buf + vpos) == ' '
-                    vpos += 1
-
-                # Parse integer.  A value that would overflow i32 is
-                # recorded as -1 (invalid) rather than wrapping into a
-                # plausible-looking size (AGAST #2104).
-                var cl_val: i32 = 0
-                while vpos < len
-                    let d: u8 = *(buf + vpos)
-                    if d >= '0' and d <= '9'
-                        if cl_val >= 0
-                            if cl_val > 214748363
-                                cl_val = -1
-                            else
-                                cl_val = cl_val * 10 + (d - '0') as i32
-                        vpos += 1
-                    else
-                        break
-                req.content_length = cl_val
 
         # Skip to next line
         while pos < len
@@ -264,23 +230,29 @@ fn connection_tokens(buf: *u8, pos: i32, len: i32) -> i32
     return mask
 
 
-# Bytes a complete request occupies: headers_end + Content-Length.
+# Frame the request at the front of buf[0..len): where it ends, and what its
+# body is.  The request line must parse (a junk line is H1F_BAD_REQUEST at
+# once, not a wait for more: AGAST #2201); the rest is http's
+# lib/h1_framing.ritz, shared with projects/http (AGAST #1865).
 #
-# Returns -1 if the header block is not complete yet, -2 if Content-Length
-# is invalid (overflowed / negative), and -3 if the request is malformed, so
-# more input can never complete it.  Used to keep receiving a request that
-# did not fit the first recv: its body (AGAST #2104) or its headers (#2201).
-pub fn request_total_len(buf: *u8, len: i32) -> i64
+# Returns the bytes the request occupies once it is all in buf, or one of
+#   H1F_INCOMPLETE       read more; f.headers_end is set once the header
+#                        block is whole, and f.total once a Content-Length
+#                        says how long the request is
+#   H1F_BAD_REQUEST      answer 400 (malformed, CL+TE, duplicate/invalid CL)
+#   H1F_NOT_IMPLEMENTED  answer 501 (Transfer-Encoding other than chunked)
+#   H1F_TOO_LARGE        answer 413 (body over max_body; <= 0: no limit)
+# Bytes behind the request belong to the next one.
+pub fn request_frame(buf: *u8, len: i32, max_body: i64, f: *H1Frame) -> i64
+    h1_frame_init(f)
     var req: Request
     request_init(@req)
     let parsed: i32 = request_parse(@req, buf, len)
     if parsed == REQ_ERR_INCOMPLETE
-        return -1
+        return H1F_INCOMPLETE
     if parsed < 0
-        return -3
-    if req.content_length < 0
-        return -2
-    return req.headers_end as i64 + req.content_length as i64
+        return H1F_BAD_REQUEST
+    return h1_frame_request(buf, len as i64, max_body, f)
 
 
 # Check if method matches

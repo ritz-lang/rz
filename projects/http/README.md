@@ -16,6 +16,10 @@ HTTP/2 support includes the full binary framing layer with stream multiplexing, 
 - Chunked transfer encoding
 - Keep-alive connection management
 - HTTP pipelining support
+- Request framing (`lib/h1_framing.ritz`): where an HTTP/1 request ends in a
+  byte stream, with i64 Content-Length, chunked bodies, and 400/501 for the
+  ambiguous cases (CL with TE, duplicate or invalid CL, unsupported TE).
+  Valet frames its requests with the same module.
 - HTTP/2 binary framing and stream multiplexing
 - HPACK header compression (HTTP/2)
 - HTTP/2 flow control and server push
