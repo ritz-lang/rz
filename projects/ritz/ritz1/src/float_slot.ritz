@@ -18,9 +18,16 @@
 # NARROW_UNKNOWN when unsure: then the value converts as before (sitofp of the
 # i64 register) and nothing is refused, so a gap here is a missed refusal,
 # never a refused program ritz0 accepts.
+#
+# WHERE IT RUNS (AGAST #3510, #1816).  The source type is a type fact, so
+# Sema finds it: float_slot_check runs at each f32 / f64 slot literal_slot.ritz
+# visits, refuses an inexact source there, and annotates a value whose exact
+# source is unsigned (float_slot_note).  The emitter's int_into_float_slot
+# only reads that annotation to pick `uitofp` over `sitofp`.
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.hashmap
 
 import ast
 import ast_helpers
@@ -29,6 +36,7 @@ import narrowing
 import bool_check
 import bool_kind
 import diag
+import sema
 
 # Is `e` built from integer literals alone (`4000000000`, `-3`, `2 * 3`)?
 # ritz0's _int_literal_only.
@@ -59,28 +67,80 @@ fn fs_exact(src: i32, dst: i32) -> i32
         return if bits <= 32 then 1 else 0
     if bits <= 16 then 1 else 0
 
-# `val_reg`, the i64 register integer expression `value` was emitted into,
-# converted for an f32 / f64 slot of type `dst_ty`.  Refuses an inexact
-# source (see the header) and still returns a register so emission goes on.
-pub fn int_into_float_slot(s: *EmitterState, val_reg: i32, value: *Expr, dst_ty: i32) -> i32
+# Sema's annotation: the values landing in a float slot whose source type is
+# an unsigned integer exact there (u8 / u16 / u32), keyed by the Expr, mapped
+# to that type.  Absent means signed or unknown: `sitofp`, as before.
+var g_fs_unsigned: HashMapI64
+var g_fs_ready: i32 = 0
+
+fn float_slot_note(value: *Expr, src: i32)
+    if g_fs_ready == 0
+        g_fs_unsigned = hashmap_i64_with_cap(256)
+        g_fs_ready = 1
+    hashmap_i64_insert(@&g_fs_unsigned, value as i64, src as i64)
+
+# The unsigned source type Sema noted for `value`, or 0.
+pub fn float_slot_unsigned(value: *Expr) -> i32
+    if g_fs_ready == 0 or value == null
+        return 0
+    hashmap_i64_get(@g_fs_unsigned, value as i64) as i32
+
+# `value` lands in an f32 / f64 slot of type `dst` (a Sema check, AGAST #3510):
+# refuse an inexact integer source (see the header), and note an unsigned one.
+pub fn float_slot_check(sm: *Sema, value: *Expr, dst: i32)
     if value == null or fs_literal_only(value) == 1
-        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
-    let src: i32 = narrow_src_type(s, value)
+        return
+    float_slot_judge(sm, value, narrow_sema_src_type(sm, value), dst)
+
+# `value`, of integer type `src` (or NARROW_*), lands in a float slot `dst`.
+pub fn float_slot_judge(sm: *Sema, value: *Expr, src: i32, dst: i32)
     if src == NARROW_UNKNOWN or src == NARROW_LIT or narrow_int_width(src) <= 1
-        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
-    if fs_exact(src, dst_ty) == 0
-        if bool_report_at(s, fs_report_at(value)) == 1
+        return
+    if fs_exact(src, dst) == 0
+        if bool_sema_report_at(sm, fs_report_at(value)) == 1
             eprints_cstr(c"implicit conversion from `")
             eprints_cstr(narrow_type_name(src))
             eprints_cstr(c"` to `")
-            eprints_cstr(c_float_name(dst_ty))
+            eprints_cstr(c_float_name(dst))
             eprints_cstr(c"` can lose precision: write `<expr> as ")
-            eprints_cstr(c_float_name(dst_ty))
+            eprints_cstr(c_float_name(dst))
             eprints_cstr(c"`\n")
+        return
+    if narrow_is_unsigned(src) == 1
+        float_slot_note(value, src)
+
+# The slot is known where it is declared, but an arm's value may name the
+# arm's binding (`Some(x) => x`), in scope only while the walk is inside the
+# arm: so literal_slot defers the check to the value (float_slot_defer), and
+# sema_walk runs it when it reaches that value (float_slot_due), with the
+# bindings it sees then, as the emitter did.
+var g_fs_pending: HashMapI64
+var g_fs_pending_ready: i32 = 0
+
+pub fn float_slot_defer(value: *Expr, dst: i32)
+    if value == null
+        return
+    if g_fs_pending_ready == 0
+        g_fs_pending = hashmap_i64_with_cap(256)
+        g_fs_pending_ready = 1
+    hashmap_i64_insert(@&g_fs_pending, value as i64, dst as i64)
+
+# `e` is about to be walked: run the check deferred to it, if any.
+pub fn float_slot_due(sm: *Sema, e: *Expr)
+    if g_fs_pending_ready == 0
+        return
+    let dst: i32 = hashmap_i64_get(@g_fs_pending, e as i64) as i32
+    if dst != 0
+        hashmap_i64_remove(@&g_fs_pending, e as i64)
+        float_slot_check(sm, e, dst)
+
+# `val_reg`, the i64 register integer expression `value` was emitted into,
+# converted for an f32 / f64 slot of type `dst_ty`: by `uitofp` when Sema
+# noted an unsigned source (u8 / u16 / u32 sit zero-extended in their i64
+# register), else by `sitofp`.
+pub fn int_into_float_slot(s: *EmitterState, val_reg: i32, value: *Expr, dst_ty: i32) -> i32
+    if float_slot_unsigned(value) == 0
         return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
-    if narrow_is_unsigned(src) == 0
-        return emit_float_coerce(s, val_reg, TYPE_I64, dst_ty)
-    # u8 / u16 / u32 sit zero-extended in their i64 register.
     let r: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, r)
@@ -97,6 +157,7 @@ pub fn int_into_float_slot(s: *EmitterState, val_reg: i32, value: *Expr, dst_ty:
 # (_reject_pointer_into_float; ritz0/test_let_float_pointer.py feeds the same
 # programs to both).  Silent unless bool_kind is sure the value is a pointer.
 # Returns 1 when `value` is a pointer, reported and counted; 0 otherwise.
+# Still on the emitter: an arm next to a float arm has no slot Sema sees (#3892).
 pub fn pointer_into_float(s: *EmitterState, value: *Expr) -> i32
     if value == null or bool_kind(s, value) != BK_PTR
         return 0

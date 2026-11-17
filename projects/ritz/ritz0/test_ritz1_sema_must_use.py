@@ -12,10 +12,11 @@ both compilers, are test_must_use.py).
 THE TESTS
 
 - An error on Sema stops the compile before emission: an emitter-side error
-  later in the same file (a literal that doesn't fit its slot, literal_slot)
+  later in the same file (a fn whose frame is over the stack, frame_limit)
   is no longer printed.  Before the move both were.  (It was an integer `if`
   condition until bool_check moved onto Sema, AGAST #3502, then a write to a
-  `let` until let_check did, AGAST #3504.)
+  `let` until let_check did, AGAST #3504, then a literal that doesn't fit its
+  slot until literal_slot did, AGAST #3510.)
 - One program pins the move's reach to the emitter's, location by location:
   every block kind that reported before still does, an impl method and each
   generic instance included, and a local fn pointer named like the fn still
@@ -60,8 +61,13 @@ STOPS_BEFORE_EMIT = CHECK + """\
 fn main() -> i32
     let n: i32 = 1
     check(n)
-    var m: u8 = 300
+    var m: i32 = huge()
     0
+
+fn huge() -> i32
+    var big: [16777216]u8
+    big[0] = 1
+    big[0] as i32
 """
 
 REACH = CHECK + """\

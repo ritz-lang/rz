@@ -39,6 +39,7 @@ import call_check    # AGAST #1629, on Sema since #3503
 import let_check   # AGAST #2028 / #3504
 import tail_value    # AGAST #2236, on Sema since #3511
 import enum_as_int   # AGAST #2136, on Sema since #3511
+import literal_slot  # AGAST #2341, on Sema since #3510
 import import_vis    # AGAST #3891
 import ritzlib.str
 import ritzlib.io
@@ -147,6 +148,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     sema_probe_record(sm, e)
     bool_check_expr(sm, e)   # AGAST #2342
     float_check_compare(sm, e)   # AGAST #3607
+    if call_check_muted() == 0
+        literal_expr(sm, e)   # AGAST #2341 / #3510: before its operands
     let k: i32 = e.kind
     if k == EXPR_IDENT and sema_is_local(sm, e.ident_ptr, e.ident_len) == 0
         sema_vis_use(sm, e.span.line, e.span.col, e.ident_ptr, e.ident_len)
@@ -178,6 +181,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         let_another_struct_call(sm, e)
         if gm == 0
             call_check_call(sm, e)
+        if call_check_muted() == 0
+            literal_call(sm, e)   # AGAST #2341: after the call's own check
         # `sizeof(x)` and a non-literal `print(x)` never lower their operand.
         let mute: i32 = call_check_mutes(e)
         let in_sizeof: i32 = let_check_sizeof_of(e)   # AGAST #3504
@@ -194,6 +199,8 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         let_check_receiver(sm, e)          # AGAST #2403
         sema_walk_expr(sm, e.left)
         call_check_method(sm, e)      # AGAST #1629 / #3503
+        if call_check_muted() == 0
+            literal_method(sm, e)     # after its receiver, as emit_expr_method
         sema_walk_list(sm, e.args)
     else if k == EXPR_STRUCT_LIT
         struct_lit_field_check(sm, e)   # LARB R49 (AGAST #3563)
@@ -226,6 +233,7 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
     if st.var_type == TYPE_ARRAY
         let v: *SemaVar = @sm.scope[sm.scope_top - 1]
         v.elem = st.var_array_elem_type   # deref_field's receivers (AGAST #3509)
+    sema_index_note_decl(sm, st)
 
 fn sema_bind_param(sm: *Sema, p: *Param)
     var t: SemaTy
@@ -243,6 +251,7 @@ fn sema_bind_param(sm: *Sema, p: *Param)
         # As sema_bind_decl: `ws[i].f` of a `ws: [N]S` param (AGAST #3512).
         let av: *SemaVar = @sm.scope[sm.scope_top - 1]
         av.elem = p.param_array_elem_type
+    sema_index_note_param(sm, p)
     if (p.is_borrow == 1 or p.is_self_borrow == 1) and sm.scope_top > 0
         let lv: *SemaVar = @sm.scope[sm.scope_top - 1]
         lv.lent = p
@@ -281,12 +290,15 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         else
             let_check_stmt(sm, st)
         sema_enum_as_int(sm, st, first)   # AGAST #2136 / #3511
+        if fn_tail == 1
+            literal_fn_tail(sm, st)   # AGAST #2341
         ref_loan_check_stmt(sm, st)   # AGAST #2438 / #3506
         ref_value_check_stmt(sm, st)   # AGAST #3926
         if st.kind == STMT_VAR_DECL
             if st.var_declared_type != TYPE_VOID
                 sema_vis_use(sm, st.span.line, st.span.col, st.var_type_name, st.var_type_name_len)
             bool_check_decl(sm, st)   # AGAST #2342
+            literal_decl(sm, st)      # AGAST #2341
             sema_walk_expr(sm, st.var_init)
             check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
             sema_bind_decl(sm, st)
@@ -339,6 +351,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             bool_check_return(sm, st.return_value)
             if st.return_value != null
                 return_check_another_struct(sm, st.return_value, st.span.line, st.span.col)   # AGAST #3293
+            literal_return(sm, st.return_value)   # AGAST #2341
             sema_walk_expr(sm, st.return_value)
         else if st.kind == STMT_EXPR
             # Only a block's last statement can be its value (AGAST #2137).
@@ -354,6 +367,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             sema_walk_expr(sm, st.if_cond)
         else if sema_is_assign(st.kind) == 1
             bool_check_stmt(sm, st)   # AGAST #2342
+            literal_stmt(sm, st)      # AGAST #2341
             if st.kind == STMT_ASSIGN and st.assign_target_len == 0
                 index_store_check(sm, st.if_cond)   # AGAST #3565
                 sema_walk_expr(sm, st.if_cond)
@@ -425,6 +439,7 @@ pub fn sema_check_module(m: *Module, path: *u8) -> i32
     sema_init(sm, m, path)
     deref_impls_check(sm)   # AGAST #3015: a `DerefMut` impl needs its `Deref`
     bool_check_globals(sm)   # AGAST #2342: before the fns, as the emitter
+    literal_globals(sm)      # AGAST #2341
     var seen: HashMapI64 = hashmap_i64_with_cap(4096)
     var f: *FnDef = m.functions
     while f != null

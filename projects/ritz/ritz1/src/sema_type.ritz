@@ -19,6 +19,7 @@
 # (RITZ1_SEMA_PROBE=1; ritz0/test_ritz1_sema_type.py).
 
 import ritzlib.sys
+import ritzlib.str
 
 import ast
 import ast_helpers
@@ -248,3 +249,248 @@ pub fn sema_expr_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
 pub fn sema_expr_type(sm: *Sema, e: *Expr) -> i32
     var t: SemaTy
     sema_expr_ty(sm, e, @t)
+
+# ---- What `x[i]` holds (AGAST #3510, #1816) ----
+#
+# index_through.ritz lowers `[]` through a pointer or reference (#2440), and
+# the emitter's checks asked it, mid-lowering, what such an element is
+# (through_elem_kind, through_named_elem).  That is a type fact, not codegen:
+# Sema answers it here, from its typed scope, for the slot rules that moved
+# onto it (literal_slot.ritz).  index_through keeps the lowering (the view it
+# spills, the `*(p.data + i)` it fills).
+#
+# An element is described as a slot is: a TYPE_* kind and, for a pointer, its
+# pointee.  TYPE_VOID means "not an element Sema can name": the slot rules
+# then say nothing, as they did when the emitter couldn't type the target.
+#
+# SemaVar.index_elem is the element of a declared `[N]T` local or param, or of the
+# `[N]T` a `*[N]T` / `@[N]T` / `@&[N]T` one points at (sema_index_note_*):
+# the emitter's LocalVar.array_elem_type and its `p#` view (#2330).
+
+fn sx_starts(name: *u8, len: i32, prefix: *u8, prefix_len: i32) -> i32
+    if len <= prefix_len
+        return 0
+    (memcmp(name, prefix, prefix_len as i64) == 0) as i32
+
+# 1 when a struct of this name indexes: a Vec, Span or String (#2440, #2442).
+pub fn name_is_indexable(name: *u8, len: i32) -> i32
+    if name == null
+        return 0
+    if sx_starts(name, len, c"Vec$", 4) == 1 or sx_starts(name, len, c"Span$", 5) == 1
+        return 1
+    name_eq(name, len, c"String", 6)
+
+# The element kind of a Vec, Span or String named `name`, as through_elem_kind
+# answers for one: a String's bytes are u8, a Vec's or Span's the pointee of its
+# `data` / `ptr` field.  TYPE_UNKNOWN when the struct or field isn't found.
+pub fn sema_buffer_elem(sm: *Sema, name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"String", 6) == 1
+        return TYPE_U8
+    let st: *StructDef = sema_find_struct(sm, name, len)
+    if st == null
+        return TYPE_UNKNOWN
+    var idx: i32 = find_field_index(st, c"data", 4)
+    if idx < 0
+        idx = find_field_index(st, c"ptr", 3)
+    if idx < 0
+        return TYPE_UNKNOWN
+    ptr_field_elem_kind(get_field_type(st, idx))
+
+# The element kind of `v[i]` when `v`, of kind `kind` (pointing at `pointee`,
+# naming `name`), is a Vec, Span or String or one level of pointer or
+# reference to one; else TYPE_VOID.  through_named_elem's sees_through /
+# indexes_itself.
+pub fn sema_through_elem(sm: *Sema, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
+    if kind != TYPE_STRUCT
+        if kind != TYPE_PTR and kind != TYPE_REF and kind != TYPE_MUT_REF
+            return TYPE_VOID
+        if pointee != TYPE_STRUCT
+            return TYPE_VOID
+    if name_is_indexable(name, len) == 0
+        return TYPE_VOID
+    sema_buffer_elem(sm, name, len)
+
+# 1 when an array of `elem` named `name` gets the emitter's `p#` view
+# (add_array_view's array_view_elem_ok): a scalar, a pointer, or a known struct.
+fn sx_view_elem_ok(sm: *Sema, elem: i32, name: *u8, len: i32) -> i32
+    if elem == TYPE_STRUCT
+        return (len > 0 and sema_find_struct(sm, name, len) != null) as i32
+    if elem == TYPE_PTR
+        return 1
+    if elem == TYPE_PTR_PTR or elem == TYPE_VOID or elem == TYPE_UNKNOWN or elem == TYPE_ARRAY
+        return 0
+    (primitive_name_len(elem) > 0) as i32
+
+# The slot `name[i]` is, for a local or global `name`: through a Vec, Span,
+# String or `*[N]T` (#2440, #2330), an element of a `[N]T`, or what a `*T`
+# points at.  The emitter's lit_into_element.
+pub fn sema_named_elem(sm: *Sema, name: *u8, len: i32, kind: *i32, pointee: *i32)
+    *kind = TYPE_VOID
+    *pointee = TYPE_VOID
+    let v: *SemaVar = sema_find_local(sm, name, len)
+    if v != null
+        let k: i32 = v.kind
+        if (k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF) and v.index_elem != TYPE_VOID
+            if sx_view_elem_ok(sm, v.index_elem, v.type_name, v.type_name_len) == 1
+                *kind = v.index_elem
+                return
+        let through: i32 = sema_through_elem(sm, k, v.pointee, v.type_name, v.type_name_len)
+        if through != TYPE_VOID
+            *kind = through
+            return
+        if k == TYPE_ARRAY
+            *kind = v.index_elem
+            *pointee = v.elem_pointee
+        else if k == TYPE_PTR
+            *kind = v.pointee
+        return
+    var g: *GlobalVarDef = sm.module.globals
+    while g != null
+        if name_eq(g.name, g.name_len, name, len) == 1
+            if g.var_type == TYPE_ARRAY
+                *kind = g.array_elem_type
+                *pointee = g.array_elem_pointee
+            return
+        g = g.next
+
+# The slot an index target `e` (an EXPR_INDEX) is, as the emitter's
+# lit_into_target typed it: `a[i][j]` over an `a: [N]*T` (#2332), an index
+# through a Vec, Span or String (#2440), `name[i]`, `x.f[i]` over an array
+# field.  A slice is no slot.
+pub fn sema_index_slot(sm: *Sema, e: *Expr, kind: *i32, pointee: *i32)
+    *kind = TYPE_VOID
+    *pointee = TYPE_VOID
+    if e == null or e.kind != EXPR_INDEX or e.left == null or e.right == null or e.right.kind == EXPR_RANGE
+        return
+    let base: *Expr = e.left
+    if base.kind == EXPR_INDEX and base.left != null and base.left.kind == EXPR_IDENT
+        # `a[i][j]`: an `a: [N]*T` element is a pointer, indexed at T (#2332).
+        let av: *SemaVar = sema_find_local(sm, base.left.ident_ptr, base.left.ident_len)
+        if av != null and av.kind == TYPE_ARRAY and av.index_elem == TYPE_PTR and av.elem_pointee != TYPE_VOID
+            *kind = av.elem_pointee
+            return
+        # `v[i][j]` with `v[i]` itself a Vec, Span or String (#2442).
+        if av != null and av.kind != TYPE_ARRAY
+            let outer: i32 = sema_through_elem(sm, av.kind, av.pointee, av.type_name, av.type_name_len)
+            if outer == TYPE_STRUCT
+                sx_struct_elem_slot(sm, av, kind)
+        return
+    if base.kind == EXPR_UNARY and base.op == OP_DEREF and base.operand != null and base.operand.kind == EXPR_IDENT
+        # `(*p)[i]` with `p` a pointer to a Vec, Span or String, or to a `[N]T`.
+        let pv: *SemaVar = sema_find_local(sm, base.operand.ident_ptr, base.operand.ident_len)
+        if pv == null or pv.kind == TYPE_STRUCT
+            return
+        if pv.index_elem != TYPE_VOID and sx_view_elem_ok(sm, pv.index_elem, pv.type_name, pv.type_name_len) == 1
+            *kind = pv.index_elem
+            return
+        *kind = sema_through_elem(sm, pv.kind, pv.pointee, pv.type_name, pv.type_name_len)
+        return
+    if base.kind == EXPR_IDENT
+        sema_named_elem(sm, base.ident_ptr, base.ident_len, kind, pointee)
+        return
+    if base.kind == EXPR_MEMBER
+        var r: SemaTy
+        if sema_expr_ty(sm, base.left, @r) == TYPE_UNKNOWN
+            return
+        let st: *StructDef = sx_recv_struct(sm, @r)
+        if st == null
+            return
+        let idx: i32 = find_field_index(st, base.ident_ptr, base.ident_len)
+        if idx < 0
+            return
+        let f: *StructField = get_field_type(st, idx)
+        if f.field_type == TYPE_ARRAY
+            *kind = f.array_elem_type
+            *pointee = f.array_elem_pointee
+            return
+        # `x.vf[i]` over a Vec, Span or String field, or a pointer to one (#2564).
+        var fp: i32 = TYPE_VOID
+        if f.field_type == TYPE_PTR
+            fp = f.ptr_pointee
+        let through: i32 = sema_through_elem(sm, f.field_type, fp, f.field_type_name, f.field_type_name_len)
+        if through != TYPE_VOID
+            *kind = through
+
+# The struct a receiver of type `r` is, or points at.
+fn sx_recv_struct(sm: *Sema, r: *SemaTy) -> *StructDef
+    if r.kind == TYPE_STRUCT
+        return sema_find_struct(sm, r.name, r.name_len)
+    if (r.kind == TYPE_PTR or r.kind == TYPE_REF or r.kind == TYPE_MUT_REF) and r.pointee == TYPE_STRUCT
+        return sema_find_struct(sm, r.name, r.name_len)
+    null
+
+# `v[i][j]` where `v`'s element is a struct: the element's element, when that
+# struct is itself a Vec, Span or String (index_through_element).
+fn sx_struct_elem_slot(sm: *Sema, v: *SemaVar, kind: *i32)
+    let st: *StructDef = sema_find_struct(sm, v.type_name, v.type_name_len)
+    if st == null or name_eq(v.type_name, v.type_name_len, c"String", 6) == 1
+        return
+    var idx: i32 = find_field_index(st, c"data", 4)
+    if idx < 0
+        idx = find_field_index(st, c"ptr", 3)
+    if idx < 0
+        return
+    let f: *StructField = get_field_type(st, idx)
+    if f.field_type_name_len <= 0 or name_is_indexable(f.field_type_name, f.field_type_name_len) == 0
+        return
+    let inner: i32 = sema_buffer_elem(sm, f.field_type_name, f.field_type_name_len)
+    if inner != TYPE_UNKNOWN
+        *kind = inner
+
+# --- SemaVar.index_elem ----------------------------------------------------------------
+
+fn sx_last(sm: *Sema, name: *u8, len: i32) -> *SemaVar
+    if sm.scope_top <= 0
+        return null
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if v.name != name or v.name_len != len
+        return null
+    v
+
+# The `let` / `var` sema_walk just bound: a written `[N]T` or `*[N]T`, or an
+# unannotated pointer whose initialiser is one (`let q = p`, `p + k`, `@a`).
+pub fn sema_index_note_decl(sm: *Sema, st: *Stmt)
+    let v: *SemaVar = sx_last(sm, st.var_name, st.var_name_len)
+    if v == null
+        return
+    if st.var_declared_type == TYPE_VOID
+        if v.kind == TYPE_PTR or v.kind == TYPE_REF or v.kind == TYPE_MUT_REF
+            # Judged before the name is in scope, as `let q = q` reads the outer q.
+            sm.scope_top = sm.scope_top - 1
+            v.index_elem = sx_init_elem(sm, st.var_init)
+            sm.scope_top = sm.scope_top + 1
+        return
+    if st.var_type == TYPE_ARRAY
+        v.index_elem = st.var_array_elem_type
+    else if (st.var_type == TYPE_PTR or st.var_type == TYPE_REF or st.var_type == TYPE_MUT_REF) and st.var_pointee_type == TYPE_ARRAY
+        v.index_elem = st.var_pointee_array_elem_type
+
+# The element of the `[N]T` initialiser `init` points at: a pointer local
+# that has one, under any `+ k` / `- k`, or `@a` / `@&a` of a `[N]T` local.
+fn sx_init_elem(sm: *Sema, init: *Expr) -> i32
+    var x: *Expr = init
+    while x != null and x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB)
+        x = x.left
+    if x == null
+        return TYPE_VOID
+    if x.kind == EXPR_UNARY and (x.op == OP_ADDR or x.op == OP_ADDR_MUT) and x.operand != null and x.operand.kind == EXPR_IDENT
+        let a: *SemaVar = sema_find_local(sm, x.operand.ident_ptr, x.operand.ident_len)
+        if a != null and a.kind == TYPE_ARRAY
+            return a.index_elem
+        return TYPE_VOID
+    if x.kind != EXPR_IDENT
+        return TYPE_VOID
+    let p: *SemaVar = sema_find_local(sm, x.ident_ptr, x.ident_len)
+    if p == null or p.kind == TYPE_ARRAY
+        return TYPE_VOID
+    p.index_elem
+
+# The param sema_walk just bound.
+pub fn sema_index_note_param(sm: *Sema, p: *Param)
+    let v: *SemaVar = sx_last(sm, p.name, p.name_len)
+    if v == null
+        return
+    if p.param_type == TYPE_ARRAY
+        v.index_elem = p.param_array_elem_type
+    else if (p.param_type == TYPE_PTR or p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF) and p.param_pointee_type == TYPE_ARRAY
+        v.index_elem = p.param_pointee_array_elem_type

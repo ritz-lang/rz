@@ -149,7 +149,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | Module | Responsibility |
 |---|---|
 | `sema` | The `Sema` context: typed scope, name lookup, error reporting. |
-| `sema_type` | Types an expression from the AST and Sema's scope alone. |
+| `sema_type` | Types an expression from the AST and Sema's scope alone, including what `x[i]` holds (index_through's type facts: a Vec, Span, String or `*[N]T` element, an `[N]*T` element's pointee). |
 | `sema_walk` | Walks the module and calls each Sema check. |
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
 
@@ -187,6 +187,9 @@ still run mid-lowering on `*EmitterState`, and
 - `float_compare` — an f32 compared with an f64 asks for `as` (§7.2).
 
 - `float_slot` — an integer into a float slot only where exact (§7.5).
+  Refused on Sema, which notes an exact unsigned source for the emitter's
+  `uitofp` (`float_slot_unsigned`, #3510). `pointer_into_float` still runs
+  mid-lowering (#3892).
 
 - `generic_method` — a free call to a generic impl's method (R37, §5.4).
 
@@ -197,20 +200,24 @@ still run mid-lowering on `*EmitterState`, and
   error at its use. main records each loaded module and import edge before
   merging; `sema_walk` asks `vis_hidden` at each use in the input's own fns.
 
-- `index_through` — `[]` through a pointer or reference (R9).
+- `index_through` — `[]` through a pointer or reference (R9). Its type
+  facts (what `x[i]` holds) are `sema_type`'s, on Sema (#3510); its refusals
+  and other emitter readers are #3893.
 
 - `let_check` — `let` immutability: no write or `@&` through a `let`'s place.
   Its place rule (`let_place`) reads either view through a `LetEnv`:
   ref_check, still on the emitter, asks it about an `@x` of a `let`
   (`let_addr_of_own`).
 
-- `literal_slot` — a literal takes its type from its slot (R3).
+- `literal_slot` — a literal takes its type from its slot (R3). Run on Sema
+  (#3510), it annotates the AST for the emitter: a `"..."` in a `*u8` slot
+  becomes `c"..."`, and a `/` / `%` records its wider slot (`Expr.slot_type`).
 
 - `must_use` — a discarded call to a `[[must_use]]` fn (§17.8).
 
 - `narrowing` — implicit narrowing in a typed let/var. Its rule is also read
-  mid-lowering (float_slot, literal_slot, sizeof), from the emitter's own
-  table of written types.
+  mid-lowering (sizeof), from the emitter's own table of written types;
+  float_slot and literal_slot read it on Sema (`narrow_sema_*`, #3510).
 
 - `ownership` — move checking and drop insertion (§13).
 

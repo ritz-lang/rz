@@ -20,8 +20,9 @@ the generic wording at the if expression.
 THE TESTS
 
 - An error on Sema stops the compile before emission: an emitter-side error
-  later in the same file (a literal that doesn't fit its slot, literal_slot)
-  is no longer printed.  Before the move all three were.
+  later in the same file (a fn whose frame is over the stack, frame_limit)
+  is no longer printed.  Before the move all three were.  (It was a literal
+  that doesn't fit its slot until literal_slot moved onto Sema, AGAST #3510.)
 - One program per check pins its reach to the emitter's, location by
   location.  discarded_array: every receiver shape the emitter typed (a
   param, a member chain, `*p`, `p.f` through a pointer field, an element, a
@@ -59,11 +60,16 @@ fn f(w: W, c: i32) -> i32
             1
     else
         2
-    var m: u8 = 300
+    var m: i32 = huge()
     n
 
 pub fn main() -> i32
     0
+
+fn huge() -> i32
+    var big: [16777216]u8
+    big[0] = 1
+    big[0] as i32
 """
 
 ARRAY_REACH = """\

@@ -20,10 +20,11 @@ THE TEST
 
 One program, both ritz1 compilers.  Its two bool errors sit in places the
 walk had to learn to reach: a `match` statement's scrutinee (`match b + 1`)
-and a struct literal's field (`P { x: true }`).  A literal that doesn't fit
-its slot after them is literal_slot's error, still on the emitter: it is no
-longer printed.  Before the move all three were.  (It was a write to a `let`
-until let_check moved onto Sema too, AGAST #3504.)
+and a struct literal's field (`P { x: true }`).  A fn whose frame is over
+the stack after them is frame_limit's error, a codegen limit that stays on the
+emitter: it is no longer printed.  Before the move all three were.  (It was a
+write to a `let` until #3504, then a literal that doesn't fit its slot until
+#3510.)
 """
 
 import re
@@ -45,8 +46,13 @@ fn main() -> i32
     match b + 1
         _ => 0
     let p: P = P { x: true }
-    var m: u8 = 300
+    var m: i32 = huge()
     0
+
+fn huge() -> i32
+    var big: [16777216]u8
+    big[0] = 1
+    big[0] as i32
 """
 
 WANTED = [

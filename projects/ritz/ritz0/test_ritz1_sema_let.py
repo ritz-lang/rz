@@ -23,10 +23,12 @@ One program, both ritz1 compilers.  It has a let_check error at each place
 the walk calls into let_check (a statement's write and `@&`, an expression
 arm, a receiver lent to `self: **C`, a call's and a method's struct argument,
 a store, a declaration, a `return`, a fn's tail and a method's), in source
-order.  An emitter-side error after them (a literal that doesn't fit its
-slot, literal_slot) is no longer printed: before the move it was.  A fn's tail
-expression is the fn's value, not a statement, but an `@&` of a `let` in it
-is refused as anywhere else (AGAST #3804: the emitter never let-checked it).
+order.  An emitter-side error after them (a fn whose frame is over the stack,
+frame_limit) is no longer printed: before the move it was.  (It was a literal
+that doesn't fit its slot until literal_slot moved onto Sema, AGAST #3510.)  A
+fn's tail expression is the fn's value, not a statement, but an `@&` of a
+`let` in it is refused as anywhere else (AGAST #3804: the emitter never
+let-checked it).
 An `@&` is reported at the `@` (LARB R68, AGAST #3924: every compiler,
 test_let_borrow_at.py); a receiver lent to `self: **C` (42:5) has no `@`,
 so at the receiver.
@@ -91,13 +93,18 @@ fn main() -> i32
     d = p
     let e: D = p
     p.x = 5
-    var m: u8 = 300
+    var m: i32 = huge()
     0
 
 impl D
     fn tail_m(self: *D) -> i64
         let t = Pt { x: 1, y: 2 }
         pt_x(@&t)
+
+fn huge() -> i32
+    var big: [16777216]u8
+    big[0] = 1
+    big[0] as i32
 """
 
 WANTED = [

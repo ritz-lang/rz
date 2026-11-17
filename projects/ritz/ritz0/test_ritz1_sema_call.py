@@ -24,9 +24,10 @@ THE TESTS
 
 One program, both ritz1 compilers: each kind of call error (a static call's,
 a free call's and a method's count, an argument's kind, an unknown fn), then
-a literal that doesn't fit its slot, which is literal_slot's error, still on
-the emitter: it is no longer printed.  Before the move all six were.  (It was
-a write to a `let` until let_check moved onto Sema, AGAST #3504.)
+a fn whose frame is over the stack, which is frame_limit's error, a codegen
+limit that stays on the emitter: it is no longer printed.  Before the move all
+six were.  (It was a write to a `let` until #3504, then a literal that doesn't
+fit its slot until #3510.)
 
 `sizeof(f(1))` never evaluates its operand, so its call isn't judged, as on
 the emitter and in ritz0.
@@ -67,8 +68,13 @@ fn main() -> i32
     let b: i64 = p.get()
     let c: i64 = takes(5)
     let d: i64 = nope(3)
-    var m: u8 = 300
+    var m: i32 = huge()
     0
+
+fn huge() -> i32
+    var big: [16777216]u8
+    big[0] = 1
+    big[0] as i32
 """
 
 WANTED = [
