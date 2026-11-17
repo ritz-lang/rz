@@ -16,10 +16,12 @@
 #   match sock.bind("0.0.0.0", 8080)        # Result<(), i32>
 #       Ok(_) => pass
 #       Err(errno) => ...                   # positive errno; EINVAL = bad address
-#   sock.listen(128)
-#   var client: Socket = sock.accept()
-#   client.send("HTTP/1.1 200 OK\r\n\r\nHello")   # Span<u8>, Result<i64, i32>
-#   client.close()
+#   sock.listen(128)                        # Result<(), i32>
+#   match sock.accept()                     # Result<Socket, i32>
+#       Ok(client) =>
+#           client.send("HTTP/1.1 200 OK\r\n\r\nHello")   # Span<u8>, Result<i64, i32>
+#           client.close()                  # Result<(), i32>
+#       Err(errno) => ...
 #
 #   # Client
 #   var sock: Socket = socket_tcp()
@@ -31,9 +33,11 @@
 #
 # Addresses are StrViews (AGAST #1483), and every Err is a positive errno.
 # No entry point takes a raw `*u8` address or buffer (#3835 deleted the
-# socket_send / socket_recv / socket_bind_any forms; tools/test_ritzlib_net_api.py
-# guards it).  The sys_* syscall shims stay raw by design: their pointer
-# arguments are the kernel ABI.
+# socket_send / socket_recv / socket_bind_any forms), and none takes a raw
+# `*Socket`: a Socket is borrowed `@&Socket`, and close, listen, accept and
+# the option setters return Result, not 0-or-negative-errno (#3880).
+# tools/test_ritzlib_net_api.py guards both.  The sys_* syscall shims stay
+# raw by design: their pointer arguments are the kernel ABI.
 
 import ritzlib.sys  # For sys_read, sys_write, sys_close, syscallN
 import ritzlib.str  # For memset, strlen
@@ -303,30 +307,42 @@ pub fn socket_udp() -> Socket
 pub fn socket_valid(sock: @Socket) -> bool
     sock.fd >= 0
 
-# Close a socket
-pub fn socket_close(sock: *Socket) -> i32
-    if sock.fd >= 0
-        let result: i32 = sys_close(sock.fd)
-        sock.fd = -1
-        return result
-    return 0
+# A syscall's 0-or-negative-errno return as Ok(()) or Err(positive errno).
+fn unit_result(rc: i32) -> Result<(), i32>
+    if rc < 0
+        return Err(0 - rc)
+    Ok(())
 
-# Set socket option (integer value)
-pub fn socket_set_opt_int(sock: *Socket, level: i32, optname: i32, value: i32) -> i32
+# Close the socket and mark it closed (fd = -1), so a second close, or a
+# close of a socket that never opened, is Ok(()) and closes nothing.
+# Err(errno) from close(2); the fd is released either way (Linux frees it
+# even when close reports EINTR or EIO), so it is still marked closed.
+#
+# A mutable borrow, not an owned Socket: the caller keeps the (now closed)
+# handle, which socket_valid then reports as closed (AGAST #3880).
+pub fn socket_close(sock: @&Socket) -> Result<(), i32>
+    if sock.fd < 0
+        return Ok(())
+    let rc: i32 = sys_close(sock.fd)
+    sock.fd = -1
+    unit_result(rc)
+
+# Set an integer socket option.  Err(errno) from setsockopt(2).
+pub fn socket_set_opt_int(sock: @&Socket, level: i32, optname: i32, value: i32) -> Result<(), i32>
     var val: i32 = value
-    return sys_setsockopt(sock.fd, level, optname, @val as *u8, 4)
+    unit_result(sys_setsockopt(sock.fd, level, optname, @val as *u8, 4))
 
 # Enable SO_REUSEADDR
-pub fn socket_set_reuseaddr(sock: *Socket) -> i32
-    return socket_set_opt_int(sock, SOL_SOCKET, SO_REUSEADDR, 1)
+pub fn socket_set_reuseaddr(sock: @&Socket) -> Result<(), i32>
+    socket_set_opt_int(sock, SOL_SOCKET, SO_REUSEADDR, 1)
 
 # Enable SO_REUSEPORT
-pub fn socket_set_reuseport(sock: *Socket) -> i32
-    return socket_set_opt_int(sock, SOL_SOCKET, SO_REUSEPORT, 1)
+pub fn socket_set_reuseport(sock: @&Socket) -> Result<(), i32>
+    socket_set_opt_int(sock, SOL_SOCKET, SO_REUSEPORT, 1)
 
 # Enable TCP_NODELAY (disable Nagle's algorithm)
-pub fn socket_set_nodelay(sock: *Socket) -> i32
-    return socket_set_opt_int(sock, IPPROTO_TCP, TCP_NODELAY, 1)
+pub fn socket_set_nodelay(sock: @&Socket) -> Result<(), i32>
+    socket_set_opt_int(sock, IPPROTO_TCP, TCP_NODELAY, 1)
 
 
 # Set both SO_RCVTIMEO and SO_SNDTIMEO on a socket so subsequent recv/send
@@ -338,18 +354,18 @@ pub fn socket_set_nodelay(sock: *Socket) -> i32
 #       i64 tv_usec;
 #   };
 #
-# Returns 0 on success, negative on the first failing setsockopt.  Pass 0
-# for `timeout_ms` to clear timeouts (sets both fields to zero — kernel
-# treats that as "no timeout").
-pub fn socket_set_io_timeout(sock: *Socket, timeout_ms: i32) -> i32
+# Ok(()), or Err(errno) from the first setsockopt that fails.  Pass 0 for
+# `timeout_ms` to clear timeouts (sets both fields to zero — kernel treats
+# that as "no timeout").
+pub fn socket_set_io_timeout(sock: @&Socket, timeout_ms: i32) -> Result<(), i32>
     var tv: [2]i64
     tv[0] = (timeout_ms / 1000) as i64
     tv[1] = ((timeout_ms % 1000) * 1000) as i64
 
     let r1: i32 = sys_setsockopt(sock.fd, SOL_SOCKET, SO_RCVTIMEO, @tv[0] as *u8, 16)
     if r1 < 0
-        return r1
-    return sys_setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, @tv[0] as *u8, 16)
+        return Err(0 - r1)
+    unit_result(sys_setsockopt(sock.fd, SOL_SOCKET, SO_SNDTIMEO, @tv[0] as *u8, 16))
 
 # A sockaddr_in for `ip` (network byte order) and `port` (host order).
 fn sockaddr_in(ip: u32, port: i32) -> SockAddrIn
@@ -359,12 +375,6 @@ fn sockaddr_in(ip: u32, port: i32) -> SockAddrIn
     addr.addr = ip
     memset(@addr.zero[0], 0, 8)
     addr
-
-# A syscall's 0-or-negative-errno return as Ok(()) or Err(positive errno).
-fn unit_result(rc: i32) -> Result<(), i32>
-    if rc < 0
-        return Err(0 - rc)
-    Ok(())
 
 # Bind the socket to an IPv4 address and port.  Err(EINVAL) if `addr`
 # isn't a dotted quad (parse_ipv4); otherwise Err(errno) from bind(2),
@@ -377,31 +387,33 @@ pub fn socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
     var sa: SockAddrIn = sockaddr_in(ip, port)
     unit_result(sys_bind(sock.fd, @sa as *u8, 16))
 
-# Listen for connections
-pub fn socket_listen(sock: *Socket, backlog: i32) -> i32
-    return sys_listen(sock.fd, backlog)
+# Listen for connections.  Err(errno) from listen(2).
+pub fn socket_listen(sock: @&Socket, backlog: i32) -> Result<(), i32>
+    unit_result(sys_listen(sock.fd, backlog))
 
-# Accept a connection (blocking)
-pub fn socket_accept(sock: *Socket) -> Socket
+# An accept(2)/accept4(2) return as Ok(the connected Socket) or Err(errno).
+fn accepted(fd: i32) -> Result<Socket, i32>
+    if fd < 0
+        return Err(0 - fd)
     var client: Socket
-    var addr: SockAddrIn
-    var addrlen: i32 = 16
-
-    client.fd = sys_accept(sock.fd, @addr as *u8, @addrlen)
+    client.fd = fd
     client.family = AF_INET
     client.socktype = SOCK_STREAM
-    return client
+    Ok(client)
 
-# Accept a connection (non-blocking)
-pub fn socket_accept_nonblock(sock: *Socket) -> Socket
-    var client: Socket
+# Accept a connection (blocking).  Ok(the connected Socket), or Err(errno)
+# from accept(2), e.g. EINVAL if `sock` isn't listening.
+pub fn socket_accept(sock: @&Socket) -> Result<Socket, i32>
     var addr: SockAddrIn
     var addrlen: i32 = 16
+    accepted(sys_accept(sock.fd, @addr as *u8, @addrlen))
 
-    client.fd = sys_accept4(sock.fd, @addr as *u8, @addrlen, SOCK_NONBLOCK)
-    client.family = AF_INET
-    client.socktype = SOCK_STREAM
-    return client
+# Accept a connection without blocking; the accepted Socket is non-blocking
+# too.  Err(EAGAIN) when no connection is pending, else Err(errno).
+pub fn socket_accept_nonblock(sock: @&Socket) -> Result<Socket, i32>
+    var addr: SockAddrIn
+    var addrlen: i32 = 16
+    accepted(sys_accept4(sock.fd, @addr as *u8, @addrlen, SOCK_NONBLOCK))
 
 # Connect to an IPv4 address and port (blocking).  Err(EINVAL) if `addr`
 # isn't a dotted quad; otherwise Err(errno) from connect(2), e.g.
@@ -569,22 +581,22 @@ impl Socket
     pub fn valid(self: @Socket) -> bool
         return socket_valid(self)
 
-    pub fn close(self: *Socket) -> i32
+    pub fn close(self: @&Socket) -> Result<(), i32>
         return socket_close(self)
 
-    pub fn set_reuseaddr(self: *Socket) -> i32
+    pub fn set_reuseaddr(self: @&Socket) -> Result<(), i32>
         return socket_set_reuseaddr(self)
 
-    fn set_nodelay(self: *Socket) -> i32
+    fn set_nodelay(self: @&Socket) -> Result<(), i32>
         return socket_set_nodelay(self)
 
     pub fn bind(self: @&Socket, addr: StrView, port: i32) -> Result<(), i32>
         return socket_bind(self, addr, port)
 
-    pub fn listen(self: *Socket, backlog: i32) -> i32
+    pub fn listen(self: @&Socket, backlog: i32) -> Result<(), i32>
         return socket_listen(self, backlog)
 
-    pub fn accept(self: *Socket) -> Socket
+    pub fn accept(self: @&Socket) -> Result<Socket, i32>
         return socket_accept(self)
 
     pub fn connect(self: @&Socket, addr: StrView, port: i32) -> Result<(), i32>

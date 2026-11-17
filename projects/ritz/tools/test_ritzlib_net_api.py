@@ -13,6 +13,14 @@ deletes the raw forms:
 3. No `pub fn` in net.ritz takes a `*u8` parameter, except the sys_*
    syscall shims, whose pointer arguments are the kernel ABI.
 
+#3880 finishes the job for the Socket handle itself:
+
+4. No fn in net.ritz takes a raw `*Socket`.  close, listen, accept,
+   accept_nonblock, set_opt_int, set_reuseaddr/reuseport/nodelay and
+   set_io_timeout take `@&Socket` and return Result<(), i32> or
+   Result<Socket, i32> (SIGNATURES), not 0-or-negative-errno or a Socket
+   whose fd < 0 means "failed".
+
 These are text checks on the source, so they cost no compile. What the fns
 do is covered by ritzlib/tests/test_net_api.ritz.
 """
@@ -59,13 +67,47 @@ def test_no_raw_u8_parameter_outside_syscall_shims():
     assert offenders == []
 
 
-def test_connect_timeout_signature():
-    m = re.search(r"^pub fn socket_connect_timeout\(.*$", NET.read_text(), re.MULTILINE)
-    assert m, "net.ritz has no `pub fn socket_connect_timeout(`"
-    assert m.group(0).rstrip() == (
-        "pub fn socket_connect_timeout(sock: @&Socket, addr: StrView, port: i32, "
-        "timeout_ms: i32) -> Result<(), i32>"
-    )
+ANY_FN = re.compile(r"^\s*(?:pub\s+)?fn (\w+)\((.*)\)\s*(?:->.*)?$", re.MULTILINE)
+
+
+def test_no_raw_socket_pointer_parameter_outside_syscall_shims():
+    """#3880: no fn in net.ritz, impl methods and private fns included, takes
+    a raw `*Socket`; a Socket is borrowed as `@Socket` or `@&Socket`."""
+    fns = [(m.group(1), m.group(2)) for m in ANY_FN.finditer(NET.read_text())]
+    assert {"socket_close", "close", "accept"} <= {name for name, _ in fns}
+    offenders = [
+        f"{name}({params})"
+        for name, params in fns
+        if not name.startswith("sys_") and re.search(r":\s*\*Socket\b", params)
+    ]
+    assert offenders == []
+
+
+# Every Socket entry point that can fail: a borrowed Socket in, a Result out
+# (#3835 connect_timeout, #3880 the rest).  No 0-or-negative-errno i32 and no
+# Socket with fd < 0 standing for an error.
+SIGNATURES = [
+    "pub fn socket_connect_timeout(sock: @&Socket, addr: StrView, port: i32, "
+    "timeout_ms: i32) -> Result<(), i32>",
+    "pub fn socket_close(sock: @&Socket) -> Result<(), i32>",
+    "pub fn socket_set_opt_int(sock: @&Socket, level: i32, optname: i32, "
+    "value: i32) -> Result<(), i32>",
+    "pub fn socket_set_reuseaddr(sock: @&Socket) -> Result<(), i32>",
+    "pub fn socket_set_reuseport(sock: @&Socket) -> Result<(), i32>",
+    "pub fn socket_set_nodelay(sock: @&Socket) -> Result<(), i32>",
+    "pub fn socket_set_io_timeout(sock: @&Socket, timeout_ms: i32) -> Result<(), i32>",
+    "pub fn socket_listen(sock: @&Socket, backlog: i32) -> Result<(), i32>",
+    "pub fn socket_accept(sock: @&Socket) -> Result<Socket, i32>",
+    "pub fn socket_accept_nonblock(sock: @&Socket) -> Result<Socket, i32>",
+]
+
+
+@pytest.mark.parametrize("sig", SIGNATURES, ids=lambda s: s.split("(")[0][7:])
+def test_signature(sig):
+    head = sig.split("(")[0]
+    m = re.search(rf"^{re.escape(head)}\(.*$", NET.read_text(), re.MULTILINE)
+    assert m, f"net.ritz has no `{head}(`"
+    assert m.group(0).rstrip() == sig
 
 
 @pytest.mark.parametrize("name", DELETED)

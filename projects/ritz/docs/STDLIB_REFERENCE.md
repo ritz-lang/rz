@@ -1565,24 +1565,26 @@ struct EpollEvent
 | `socket_tcp_nonblock` | `fn() -> Socket` | Create non-blocking TCP |
 | `socket_udp` | `fn() -> Socket` | Create UDP socket |
 | `socket_valid` | `fn(sock: @Socket) -> bool` | Holds an open fd |
-| `socket_close` | `fn(sock: *Socket) -> i32` | Close socket |
+| `socket_close` | `fn(sock: @&Socket) -> Result<(), i32>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
 
 **Socket Options**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_set_reuseaddr` | `fn(sock: *Socket) -> i32` | Enable SO_REUSEADDR |
-| `socket_set_reuseport` | `fn(sock: *Socket) -> i32` | Enable SO_REUSEPORT |
-| `socket_set_nodelay` | `fn(sock: *Socket) -> i32` | Disable Nagle |
+| `socket_set_opt_int` | `fn(sock: @&Socket, level: i32, optname: i32, value: i32) -> Result<(), i32>` | setsockopt with an int; `Err(errno)` |
+| `socket_set_reuseaddr` | `fn(sock: @&Socket) -> Result<(), i32>` | Enable SO_REUSEADDR |
+| `socket_set_reuseport` | `fn(sock: @&Socket) -> Result<(), i32>` | Enable SO_REUSEPORT |
+| `socket_set_nodelay` | `fn(sock: @&Socket) -> Result<(), i32>` | Disable Nagle |
+| `socket_set_io_timeout` | `fn(sock: @&Socket, timeout_ms: i32) -> Result<(), i32>` | SO_RCVTIMEO + SO_SNDTIMEO; 0 clears |
 
 **Server Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `socket_bind` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Bind; `Err(EINVAL)` for a bad address, else `Err(errno)` |
-| `socket_listen` | `fn(sock: *Socket, backlog: i32) -> i32` | Start listening |
-| `socket_accept` | `fn(sock: *Socket) -> Socket` | Accept (blocking) |
-| `socket_accept_nonblock` | `fn(sock: *Socket) -> Socket` | Accept (non-blocking) |
+| `socket_listen` | `fn(sock: @&Socket, backlog: i32) -> Result<(), i32>` | Start listening; `Err(errno)` |
+| `socket_accept` | `fn(sock: @&Socket) -> Result<Socket, i32>` | Accept (blocking); `Err(errno)`, e.g. EINVAL if not listening |
+| `socket_accept_nonblock` | `fn(sock: @&Socket) -> Result<Socket, i32>` | Accept without blocking (peer is non-blocking too); `Err(EAGAIN)` if none pending |
 
 **Client Operations**:
 

@@ -130,7 +130,8 @@ pub fn main() -> i32
     return (r + m.cap()) as i32
 """
 
-# 50_http's shape: ritzlib.net Socket methods, incl. a struct-returning one.
+# 50_http's shape: ritzlib.net Socket methods, incl. a struct-returning one
+# (a Result<Socket, i32> since #3880).
 # accept() would block, so it sits on a branch that never runs; the build is
 # what was broken.
 MAIN_SOCKET = """\
@@ -140,10 +141,16 @@ pub fn main() -> i32
     var s: Socket = socket_tcp()
     if not s.valid()
         return 1
-    let r: i32 = s.set_reuseaddr()
+    var r: i32 = 0
+    match s.set_reuseaddr()
+        Ok(_) => r = 0
+        Err(e) => r = e
     if s.fd < -1000
-        var c: Socket = s.accept()
-        c.close()
+        match s.accept()
+            Ok(c) =>
+                var p: Socket = c
+                p.close()
+            Err(_) => pass
     s.close()
     return 40 + r
 """
