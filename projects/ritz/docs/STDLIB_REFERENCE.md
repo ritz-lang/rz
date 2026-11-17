@@ -50,7 +50,8 @@ Ritzlib is built on three core principles:
    - [hashmap](#hashmap) - Hash map for i64 keys
    - [span](#span) - Non-owning memory views
 4. [String Utilities](#string-utilities)
-   - [str](#str) - C-style string operations
+   - [strview](#strview) - Borrowed string views (`StrView`)
+   - [str](#str) - C-string interop
    - [fmt](#fmt) - Integer-to-text digit routines
    - [ct](#ct) - Constant-time comparison of secrets
    - [buf](#buf) - Buffer and parsing utilities
@@ -652,6 +653,115 @@ the same name, and `span_as_strview` / `span_from_strview` convert between the t
 ---
 
 ## String Utilities
+
+### strview
+
+**Module**: `ritzlib.strview`
+
+`StrView` is a borrowed `{ ptr: *u8, len: i64 }` view of UTF-8 bytes, and the
+type of a bare `"..."` literal. It never allocates or frees, is not
+NUL-terminated, and must not outlive the bytes it points at. Use `String`
+(`ritzlib.string`) when you need to own or grow the text. Every function takes
+the view by value; slicing returns a new view of the same bytes.
+
+**Construction / Access**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strview_empty` | `fn() -> StrView` | Empty view (`ptr` null, `len` 0) |
+| `strview_from_ptr` | `fn(ptr: *u8, len: i64) -> StrView` | View `len` bytes at `ptr` |
+| `strview_from_cstr` | `fn(cstr: *u8) -> StrView` | View a NUL-terminated string, without the NUL |
+| `strview_len` | `fn(s: StrView) -> i64` | Length in bytes |
+| `strview_is_empty` | `fn(s: StrView) -> bool` | `len == 0` |
+| `strview_get` | `fn(s: StrView, idx: i64) -> u8` | Byte at `idx` (unchecked) |
+| `strview_as_ptr` | `fn(s: StrView) -> *u8` | Pointer to the first byte |
+
+**Comparison**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strview_eq` | `fn(a: StrView, b: StrView) -> bool` | Same length and bytes |
+| `strview_eq_cstr` | `fn(s: StrView, cstr: *u8) -> bool` | Equal to a C string |
+| `strview_cmp` | `fn(a: StrView, b: StrView) -> i32` | Bytewise order: -1, 0 or 1; a prefix sorts first |
+| `strview_cmp_cstr` | `fn(s: StrView, cstr: *u8) -> i32` | `strview_cmp` against a C string |
+
+**Slicing** (no allocation):
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strview_slice` | `fn(s: StrView, start: i64, end: i64) -> StrView` | Bytes `[start, end)`, bounds clamped to `[0, len]`; empty if `start >= end` |
+| `strview_take` | `fn(s: StrView, n: i64) -> StrView` | First `n` bytes (all if `n >= len`) |
+| `strview_skip` | `fn(s: StrView, n: i64) -> StrView` | Everything after the first `n` bytes |
+| `strview_trim_start` | `fn(s: StrView) -> StrView` | Drop leading space, `\t`, `\n`, `\r` |
+| `strview_trim_end` | `fn(s: StrView) -> StrView` | Drop trailing whitespace |
+| `strview_trim` | `fn(s: StrView) -> StrView` | Both ends |
+| `strview_split_once` | `fn(s: StrView, delim: u8, before:& StrView, after:& StrView) -> i32` | Split at the first `delim` (excluded): 1 if found; 0 and `before = s`, `after` empty if not. Call as `strview_split_once(s, '=', @&k, @&v)` |
+
+**Search**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strview_starts_with` | `fn(s: StrView, prefix: StrView) -> bool` | Prefix test |
+| `strview_starts_with_cstr` | `fn(s: StrView, prefix: *u8) -> bool` | Prefix test against a C string |
+| `strview_ends_with` | `fn(s: StrView, suffix: StrView) -> bool` | Suffix test |
+| `strview_contains` | `fn(haystack: StrView, needle: StrView) -> bool` | Substring test; an empty needle is always found |
+| `strview_find` | `fn(haystack: StrView, needle: StrView) -> i64` | First index of `needle`, or -1 (0 for an empty needle) |
+| `strview_rfind` | `fn(haystack: StrView, needle: StrView) -> i64` | Last index of `needle`, or -1 (`len` for an empty needle) |
+| `strview_find_byte` | `fn(s: StrView, c: u8) -> i64` | First index of byte `c`, or -1 |
+
+**Conversion**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `strview_parse_i64` | `fn(s: StrView) -> Option<i64>` | The whole view as decimal, optional `+`/`-`: `None` for empty, a bare sign, whitespace, junk or overflow. Trim first if needed |
+| `strview_to_cstr` | `fn(s: StrView) -> *u8` | `malloc`ed NUL-terminated copy; caller `free`s it |
+| `strview_as_cstr_unchecked` | `fn(s: StrView) -> *u8` | The pointer as a C string. Only sound if the bytes after the view hold a NUL, as they do for a whole literal; a slice usually doesn't |
+
+**Methods** (`impl StrView`; each calls the `strview_*` function of the same name):
+
+| Method | Function |
+|--------|----------|
+| `s.len()`, `s.is_empty()`, `s.get(i)`, `s.as_ptr()` | `strview_len`, `strview_is_empty`, `strview_get`, `strview_as_ptr` |
+| `s.eq(t)`, `s.eq_cstr(c)`, `s.cmp(t)`, `s.cmp_cstr(c)` | `strview_eq`, `strview_eq_cstr`, `strview_cmp`, `strview_cmp_cstr` |
+| `s.slice(start, end)`, `s.take(n)`, `s.skip(n)` | `strview_slice`, `strview_take`, `strview_skip` |
+| `s.trim()`, `s.trim_start()`, `s.trim_end()` | `strview_trim`, `strview_trim_start`, `strview_trim_end` |
+| `s.starts_with(p)`, `s.ends_with(p)`, `s.contains(t)` | `strview_starts_with`, `strview_ends_with`, `strview_contains` |
+| `s.find(t)`, `s.rfind(t)`, `s.find_byte(c)` | `strview_find`, `strview_rfind`, `strview_find_byte` |
+| `s.to_cstr()`, `s.as_cstr_unchecked()` | `strview_to_cstr`, `strview_as_cstr_unchecked` |
+
+**Example**:
+```ritz
+import ritzlib.option
+import ritzlib.strview
+
+# "key = value" -> the value as an i64, or None
+fn config_int(line: StrView, key: StrView) -> Option<i64>
+    var k: StrView = strview_empty()
+    var v: StrView = strview_empty()
+    if strview_split_once(line, '=', @&k, @&v) == 0
+        return None
+    if not k.trim().eq(key)
+        return None
+    strview_parse_i64(v.trim())
+
+[[test]]
+fn test_strview_example() -> i32
+    let port = match config_int("  port = 8080 ", "port")
+        Some(n) => n
+        None => -1
+    assert port == 8080
+    assert config_int("port = 80x", "port").is_none()
+    let path = strview_from_cstr(c"/usr/lib/libc.so")
+    let base = strview_skip(path, path.rfind("/") + 1)
+    assert base.eq("libc.so")
+    assert path.starts_with("/usr") and path.ends_with(".so")
+    assert strview_cmp("abc", "abd") < 0
+    assert strview_find_byte(path, 'l') == 5
+    assert path.len() == 16
+    0
+```
+
+---
 
 ### str
 
