@@ -122,8 +122,15 @@ load-bearing. There is deliberately no mechanism for exempting a whole file.
 
 ## Real measured timings (for reference)
 
-Numbers taken on the project as of the green-matrix push. Update if the build
-shape changes meaningfully.
+A hand-copied snapshot from the green-matrix push, kept for its matrix rows
+only. **Don't update the compiler rows by hand: measure.** `bench/compile.sh`
+(see `bench/README.md`) times ritz1 from clean, the bootstrap, and cold and
+warm project builds under each of ritz0, ritz1 and ritz1_selfhosted, and
+records the git HEAD and compiler hashes the numbers belong to:
+
+```sh
+bench/compile.sh --compiler ritz0,ritz1 --repeat 3 --json /tmp/compile.json
+```
 
 | Operation | Time |
 |---|---|
@@ -137,7 +144,8 @@ shape changes meaningfully.
 | Matrix selfhost only | 33 s |
 | `--rebuild --tests <pattern>` (nothing changed) | 6.4 s |
 
-The 5× ritz1-vs-ritz0 per-file gap is the underlying bottleneck. Until that's
+The 5× ritz1-vs-ritz0 per-file gap is the underlying bottleneck (the
+"Cold ×ritz0" column of `bench/compile.sh` tracks it per project). Until that's
 addressed the workflow optimisations above are the difference between "5 min
 per cycle" and "30 s per cycle."
 
