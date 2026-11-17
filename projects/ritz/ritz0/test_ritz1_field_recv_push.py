@@ -48,8 +48,8 @@ Every program pushes twice with S.a == 4, then returns the stored a plus the
 count, so each exits 6.
 
 Every cell is a row of one table (test_table_rows.py, AGAST #3889), checked a
-chunk of rows at a time per compiler, a chunk one package build
-(test_ritz1_deref_struct_arg.pkg_build).  A batch holds other rows' receivers,
+chunk of rows at a time per compiler, a chunk one build linking its ritzlib
+(test_table_rows.ritzlib_build).  A batch holds other rows' receivers,
 which can instantiate `vec_push$S` for a row that doesn't: such a row is only
 answered by its batch if its own module, compiled alone, declares everything
 it calls (batching.leans, batching.unbound); otherwise it
@@ -63,7 +63,6 @@ import itertools
 import pytest
 
 import test_table_rows as table_rows
-from test_ritz1_deref_struct_arg import assert_table
 from test_table_rows import Row, Run
 
 pytestmark = pytest.mark.integration
@@ -166,4 +165,4 @@ ROWS = [Row(f"field_receiver_push[{'-'.join(c)}]", ("ritz0", "ritz1"), Run(_prog
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
-    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)
+    table_rows.assert_ritzlib_rows(compiler, table_rows.chunk(ROWS, compiler, chunk), ritz1_bin, tmp_path)

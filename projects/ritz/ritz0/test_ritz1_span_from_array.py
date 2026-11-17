@@ -25,7 +25,7 @@ import pytest
 import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
 from array_rules import ELEMENT_MISMATCH
-from test_ritz1_slice_type import ritzlib_build
+from test_table_rows import ritzlib_build
 from test_row_table import assert_refusals
 from test_table_rows import Row, Run
 
@@ -236,7 +236,7 @@ pub fn main() -> i32
 
 
 # Every row is a row of a table under its old id, less the compiler.  The runs
-# link the ritzlib modules they import (test_ritz1_slice_type.ritzlib_build); the
+# link the ritzlib modules they import (test_table_rows.ritzlib_build); the
 # refusals are test_row_table's, which wants ELEMENT_MISMATCH whole at the `^`,
 # as `_assert_refused` did.
 RUNS = [Row(f"span_from_array[{name}]", table_rows.ALL, Run(*FORMS[name])) for name in sorted(FORMS)]

@@ -18,7 +18,7 @@ with type 'ptr' but expected '%Span$u8'").
 ritz0 is the oracle: each expected exit status is checked against it too.
 
 Every form is a row of one table (test_table_rows.py, AGAST #3889), checked
-per compiler as one package build (test_ritz1_deref_struct_arg.pkg_build).
+per compiler as one build linking the ritzlib it imports (test_table_rows.ritzlib_build).
 A row keeps the id its parametrised test had, less the compiler
 (`test_static_method_span_arg[free_fn-ritz1]` is `static_method_span_arg[free_fn]`
 on ritz1).
@@ -27,7 +27,6 @@ on ritz1).
 import pytest
 
 import test_table_rows as table_rows
-from test_ritz1_deref_struct_arg import assert_table
 from test_table_rows import ALL, Row, Run
 
 pytestmark = pytest.mark.integration
@@ -128,4 +127,4 @@ ROWS = [Row(f"static_method_span_arg[{name}]", ALL, Run(HEAD + FORMS[name][0] + 
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
-    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)
+    table_rows.assert_ritzlib_rows(compiler, table_rows.chunk(ROWS, compiler, chunk), ritz1_bin, tmp_path)

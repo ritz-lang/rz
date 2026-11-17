@@ -26,18 +26,11 @@ compiler over every row.  A row keeps the id its parametrised test had, less
 the compiler, and a failure names each row that failed.
 """
 
-import atexit
-import functools
 import re
-import shutil
-import tempfile
 from pathlib import Path
 
 import pytest
 
-import fast_link
-import ritz0_inproc
-import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
 from test_ritz1_move_param import _compile
 from test_table_rows import Row, Run
@@ -303,61 +296,11 @@ TABLE = [
 ]
 
 
-@functools.cache
-def _closure(roots: tuple) -> tuple:
-    """`roots` and every ritzlib module they import, transitively."""
-    seen, todo = set(), list(roots)
-    while todo:
-        unit = todo.pop()
-        if unit not in seen:
-            seen.add(unit)
-            text = (for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz").read_text()
-            todo += re.findall(r"^import ritzlib\.(\w+)", text, re.MULTILINE)
-    return tuple(sorted(seen))
-
-
-@functools.cache
-def _unit_objects(compiler, ritz1_bin, units: tuple) -> tuple:
-    """`units` compiled by `compiler` to objects, once per process."""
-    work = Path(tempfile.mkdtemp(prefix=f"ritzlib_units_{compiler}_"))
-    atexit.register(shutil.rmtree, work, True)  # process-wide cache: see for_header._objects (#2875)
-    objects = []
-    for unit in units:
-        ll = work / f"{unit}.ll"
-        src = for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz"
-        if compiler == "ritz0":
-            # A library module, as build.py compiles one: without `--no-runtime`
-            # ritz0 makes what isn't `pub` internal (an `impl Drop` method too).
-            comp = ritz0_inproc.run_ritz0([str(src), "-o", str(ll), "--no-runtime"], cwd=work,
-                                          env=for_header.ENV, timeout=300)
-        else:
-            comp = for_header._emit(compiler, ritz1_bin, src, ll)
-        assert comp.returncode == 0, comp.stdout + comp.stderr
-        obj = work / f"{unit}.o"
-        fast_link.clang(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
-        objects.append(str(obj))
-    return tuple(objects)
-
-
-def ritzlib_build(ritz1_bin):
-    """batching.run_rows's `build`: compile the program and link every ritzlib
-    module it imports, transitively, as build.py links a package's; each module
-    compiled once per process by the same compiler, not once per row."""
-    def build(compiler, src, work):
-        roots = tuple(sorted(set(re.findall(r"^import ritzlib\.(\w+)", src.read_text(), re.MULTILINE))))
-        units = tuple(u for u in _closure(roots) if u not in for_header.UNITS)
-        return for_header.batch_build(ritz1_bin, lambda c: _unit_objects(c, ritz1_bin, units))(
-            compiler, src, work)
-    return build
-
-
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
-    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
-                           build=ritzlib_build(ritz1_bin),
-                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
+    table_rows.assert_ritzlib_rows(compiler, table_rows.chunk(TABLE, compiler, chunk), ritz1_bin, tmp_path)
 
 
 def _same_ir_wrong(compiler, work: Path, name: str):

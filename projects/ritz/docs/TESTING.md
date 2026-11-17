@@ -451,10 +451,17 @@ Rules:
    `test_array_store_rule.py` and `test_ritz1_array_pointer_index.py` do
    (AGAST #3517: 3,348 tests to 58, 46 to ~26 CPU-s).  AGAST #3889 did 18
    more (4,988 tests to 133).  The CPU win is largest where each case was its
-   own `build.py` package: a chunk built as ONE package
-   (`pkg_build` in `test_ritz1_deref_struct_arg.py`) took four such files
-   from 167 to 18 CPU-s.  A file whose rows all reach a generic saves little
-   CPU, because #2867's leaning check still compiles each row alone.
+   own `build.py` package: a chunk built as ONE package took four such files
+   from 167 to 18 CPU-s.  Rows that import ritzlib now use
+   `table_rows.assert_ritzlib_rows` (`ritzlib_build`, AGAST #3906): every
+   module a chunk imports is compiled once per process per compiler and
+   linked onto the batch, with no python start or cold build cache per chunk
+   (the same four files: 20 to 5 CPU-s).  `chunks` gives each import set its
+   own chunks when that takes no more chunks than source order does, because
+   a row whose imports differ from its batch's is compiled alone as well
+   (`test_deref_index.py`: 5 to 3 CPU-s).  A file whose rows all reach a
+   generic saves little CPU, because #2867's leaning check still compiles
+   each row alone.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

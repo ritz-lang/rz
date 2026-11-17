@@ -34,7 +34,7 @@ element points at a parameter (`(*T, i32)` -> `tuple_ptr_i32_i32`, #3173;
 
 Every program that runs is a row of one table (test_table_rows.py, AGAST
 #3889, `ROWS`), checked a chunk of rows at a time per compiler, a chunk one
-package build (test_ritz1_deref_struct_arg.pkg_build).  The IR checks stay
+build linking the ritzlib it imports (test_table_rows.ritzlib_build).  The IR checks stay
 tests of their own.
 """
 
@@ -46,7 +46,6 @@ from pathlib import Path
 import pytest
 
 import test_table_rows as table_rows
-from test_ritz1_deref_struct_arg import assert_table
 from test_table_rows import Row, Run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -617,4 +616,4 @@ ROWS = (
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
     """Every program above runs, and exits as it says."""
-    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)
+    table_rows.assert_ritzlib_rows(compiler, table_rows.chunk(ROWS, compiler, chunk), ritz1_bin, tmp_path)

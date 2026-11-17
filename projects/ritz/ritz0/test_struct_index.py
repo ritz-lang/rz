@@ -16,7 +16,7 @@ Each row runs on ritz0, ritz1 and ritz1_selfhosted; refusals must report the sam
 
 The runs and the refusals are each a table per compiler (AGAST #3889): runs
 through test_table_rows, linking the ritzlib modules a row imports
-(test_ritz1_slice_type.ritzlib_build, not a `--no-cache` build.py package per
+(test_table_rows.ritzlib_build, not a `--no-cache` build.py package per
 case); refusals through test_row_table.assert_refusals.  A row keeps the id its
 parametrised test had, less the compiler, and a failure names it.  The missing
 key test checks stderr too, so it stays its own test.
@@ -31,7 +31,7 @@ import test_table_rows as table_rows
 from index_rules import builtin_impl, needs_index, needs_index_mut, needs_writer
 from ref_rules import WRITE_THROUGH_SHARED
 from test_ref_into_value import COMPILERS
-from test_ritz1_slice_type import ritzlib_build
+from test_table_rows import ritzlib_build
 from test_row_table import assert_refusals
 from test_table_rows import Row, Run
 

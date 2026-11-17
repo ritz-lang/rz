@@ -60,21 +60,35 @@ def _emit(compiler, ritz1_bin, src: Path, ll: Path):
 
 
 @functools.cache
-def _objects(compiler, ritz1_bin) -> tuple:
-    """The allocator's objects, compiled by `compiler`, once per process."""
-    work = Path(tempfile.mkdtemp(prefix=f"for_header_{compiler}_"))
+def library_objects(compiler, ritz1_bin, units: tuple) -> tuple:
+    """ritzlib's `units` compiled by `compiler` to objects, once per process.
+
+    Each is a library module, as build.py compiles one: ritz0 gets
+    `--no-runtime`, without which it makes what isn't `pub` internal, so an
+    `impl Drop` method a program calls was an undefined reference (#3906).
+    """
+    work = Path(tempfile.mkdtemp(prefix=f"ritzlib_{compiler}_"))
     # Cached for the whole process, so no test owns it: remove it at exit, or
     # every gate leaves one per compiler per xdist worker in /tmp (#2875).
     atexit.register(shutil.rmtree, work, True)
     objects = []
-    for unit in UNITS:
-        ll = work / f"{unit}.ll"
-        comp = _emit(compiler, ritz1_bin, RITZ_ROOT / "ritzlib" / f"{unit}.ritz", ll)
+    for unit in units:
+        ll, src = work / f"{unit}.ll", RITZ_ROOT / "ritzlib" / f"{unit}.ritz"
+        if compiler == "ritz0":
+            comp = ritz0_inproc.run_ritz0([str(src), "-o", str(ll), "--no-runtime"], cwd=work, env=ENV,
+                                          timeout=300)
+        else:
+            comp = _emit(compiler, ritz1_bin, src, ll)
         assert comp.returncode == 0, comp.stdout + comp.stderr
         obj = work / f"{unit}.o"
         fast_link.clang(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
         objects.append(str(obj))
     return tuple(objects)
+
+
+def _objects(compiler, ritz1_bin) -> tuple:
+    """The allocator's objects, compiled by `compiler`, once per process."""
+    return library_objects(compiler, ritz1_bin, UNITS)
 
 
 @pytest.fixture
@@ -229,6 +243,23 @@ HOLDERS = {
     "array_element": _in_main("vs[1]", FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"),
     "addr_of_array_element": _in_main("@vs[1]", FILL_V + "    var vs: [2]Vec<i32>\n    vs[1] = v\n"),
 }
+
+
+@pytest.mark.integration
+def test_ritz0s_allocator_objects_export_every_function(ritz1_bin):
+    # AGAST #3906: a unit is a library module, as build.py compiles one.  Without
+    # `--no-runtime` ritz0 made what isn't `pub` internal, ritzlib.memory's
+    # helpers and any `impl Drop` method: a program dropping one of its types
+    # had an undefined reference (HashMapI64_drop).  An internal function is a
+    # local `t` symbol in its object.  ritz0 only: ritz1 keeps a Drop method
+    # global by itself, and its objects are what build.py links.
+    local = {}
+    for obj in _objects("ritz0", ritz1_bin):
+        out = subprocess.run(["nm", "--defined-only", obj], capture_output=True, text=True,
+                             check=True).stdout
+        if names := [ln.split()[-1] for ln in out.splitlines() if ln.split()[1:2] == ["t"]]:
+            local[Path(obj).stem] = names
+    assert not local, f"internal functions in the allocator's objects: {local}"
 
 
 @pytest.mark.integration

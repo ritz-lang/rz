@@ -194,8 +194,9 @@ def _array_field(where: str, elem: str) -> Refused:
 
 # ---- the rows: each id is its old test's, less `test_` and the compiler -------
 
-# Rows that import gvec chunk apart from those that import nothing: a row whose
-# imports differ from its batch's is compiled alone as well (AGAST #2867).
+# Rows that import gvec chunk apart from those that import nothing, as
+# table_rows.chunks does every table's (AGAST #3906): a row whose imports
+# differ from its batch's is compiled alone as well (#2867).
 PLAIN = [
     *(Row(f"a_bare_index_is_element_i[{kind}-{position}]", ALL,
           Run(_program(kind, position).replace("(*p)[", "p["), 20)) for kind, position in BARE_ROWS),
@@ -219,13 +220,12 @@ PLAIN = [
 OVER_A_VEC = [Row(f"a_deref_index_one_level_out_over_a_vec[{kind}-{position}]", ALL,
                   Run(_vec_program(kind, position), 20))
               for kind in sorted(VEC_KINDS) for position in sorted(VEC_POSITIONS)]
-GROUPS = {"plain": PLAIN, "vec": OVER_A_VEC}
 TABLE = [*PLAIN, *OVER_A_VEC]
-CHUNKS = [(group, c, i) for group, rows in GROUPS.items() for c, i in table_rows.chunks(rows)]
 
 
-@pytest.mark.parametrize("group,compiler,chunk", CHUNKS, ids=["-".join(map(str, c)) for c in CHUNKS])
-def test_every_row(ritz1_bin, tmp_path, group, compiler, chunk):
-    table_rows.assert_rows(compiler, table_rows.chunk(GROUPS[group], compiler, chunk),
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
                            build=for_header.batch_build(ritz1_bin),
                            compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

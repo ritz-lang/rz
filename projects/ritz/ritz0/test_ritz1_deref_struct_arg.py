@@ -42,7 +42,8 @@ x plus the count, so each exits 6.
 
 Every cell, and the newtype control below, is a row of one table
 (test_table_rows.py, AGAST #3889), checked a chunk of rows at a time per
-compiler: a chunk is one package build (`pkg_build`).  A row keeps the id its
+compiler: a chunk is one build linking the ritzlib its rows import
+(`test_table_rows.ritzlib_build`).  A row keeps the id its
 parametrised test had, less the compiler
 (`test_deref_struct_ptr_as_by_value_arg[ritz1-small-ref-param-into-vec_push-was_broken]`
 is `deref_struct_ptr_as_by_value_arg[small-ref-param-into-vec_push-was_broken]`
@@ -50,15 +51,10 @@ on ritz1), and a failure names each row that failed.
 """
 
 import itertools
-import os
-import shutil
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-import ritz0_inproc
 import test_table_rows as table_rows
 from test_table_rows import ALL, Refused, Row, Run
 
@@ -69,54 +65,6 @@ _BINS = {
     "ritz1": RITZ_ROOT / "ritz1" / "build" / "ritz1",
     "ritz1_selfhosted": RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted",
 }
-
-
-# ---- a table of packages (AGAST #3889) ---------------------------------------
-#
-# Every row here imports ritzlib, and each was a build.py package of its own
-# (~0.6-1 s a row).  As table rows, a chunk of them is ONE package: its main.ritz
-# is the chunk's merged program, and build.py compiles and links it with every
-# module the rows import, as it did each row.  test_ritz1_field_recv_push.py,
-# test_ritz1_static_method_span_arg.py and test_ritz1_tuple_type.py use these too.
-
-def pkg_compile(compiler, src, work):
-    """test_table_rows's `compile`: emit `src`'s module to `work/main.ll` as
-    build.py does (no runtime; ritzlib from RITZ_ROOT), and nothing else."""
-    ll = work / "main.ll"
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    if compiler == "ritz0":
-        comp = ritz0_inproc.run_ritz0([str(src), "-o", str(ll), "--no-runtime"],
-                                      cwd=src.parent, env=env, timeout=300)
-    else:
-        comp = subprocess.run([str(_BINS[compiler]), str(src), "-o", str(ll), "-I", str(RITZ_ROOT)],
-                              cwd=src.parent, env=env, capture_output=True, text=True, timeout=300)
-    return comp.returncode, comp.stdout + comp.stderr
-
-
-def pkg_build(compiler, src, work):
-    """test_table_rows's `build`: `src` as the main.ritz of a package build.py
-    builds, with the cache (TESTING.md rule 4, `_run_pkg` in
-    test_ritz1_builtin_struct_shadow.py).  `work/main.ll` is the module as
-    `pkg_compile` emits it, which batching.run_rows holds each row's against."""
-    code, out = pkg_compile(compiler, src, work)
-    if code != 0:
-        return False, out, None
-    pkg = work / "pkg"
-    (pkg / "src").mkdir(parents=True)
-    shutil.copyfile(src, pkg / "src" / "main.ritz")
-    (pkg / "ritz.toml").write_text('[package]\nname = "main"\nversion = "0.1.0"\n')
-    # TMPDIR: build.py's per-build artifact dir goes under the test's dir, not /tmp.
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT), RITZ_BUILD_CACHE_DIR=str(pkg / ".build-cache"),
-               TMPDIR=str(work))
-    proc = subprocess.run([sys.executable, str(RITZ_ROOT / "build.py"), "build", str(pkg),
-                           "--compiler", compiler],
-                          cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=600)
-    exe = pkg / "build" / "debug" / "main"
-    return proc.returncode == 0 and exe.exists(), proc.stdout + proc.stderr, exe
-
-
-def assert_table(compiler, rows, work):
-    table_rows.assert_rows(compiler, rows, build=pkg_build, compile=pkg_compile, work=work)
 
 
 SIZES = {
@@ -227,4 +175,4 @@ ROWS.append(Row("deref_scalar_ptr_into_newtype_is_refused", ALL,
 @pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
                          ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
 def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
-    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)
+    table_rows.assert_ritzlib_rows(compiler, table_rows.chunk(ROWS, compiler, chunk), ritz1_bin, tmp_path)

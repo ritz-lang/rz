@@ -25,17 +25,11 @@ and tables other files import (`run_with`, `compile_with`, `_string_objects`,
 BOXES, RANGES, WRITES_THROUGH) stay as they were.
 """
 
-import atexit
-import functools
-import shutil
 import subprocess
-import tempfile
-from pathlib import Path
 
 import pytest
 
 import batching
-import fast_link
 
 import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
@@ -52,19 +46,8 @@ RITZ1S = ("ritz1", "ritz1_selfhosted")
 STRING_UNITS = ("string", "strview", "hash")
 
 
-@functools.lru_cache(maxsize=None)
 def _string_objects(compiler, ritz1_bin) -> tuple:
-    work = Path(tempfile.mkdtemp(prefix=f"slice_string_{compiler}_"))
-    atexit.register(shutil.rmtree, work, True)  # process-wide cache: see for_header._objects (#2875)
-    objects = []
-    for unit in STRING_UNITS:
-        ll = work / f"{unit}.ll"
-        comp = for_header._emit(compiler, ritz1_bin, for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz", ll)
-        assert comp.returncode == 0, comp.stdout + comp.stderr
-        obj = work / f"{unit}.o"
-        fast_link.clang(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
-        objects.append(str(obj))
-    return tuple(objects)
+    return for_header.library_objects(compiler, ritz1_bin, STRING_UNITS)
 
 
 @pytest.fixture

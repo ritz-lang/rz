@@ -1487,3 +1487,52 @@ class TestFreestandingIRHasNoLibcCalls:
             "-ffreestanding/-fno-builtin changed the outcome on .ll input "
             f"({sorted(bare)} -> {sorted(flagged)}); they are now "
             "load-bearing and build.py's comment is stale")
+
+
+# ---- a build's artifact dir is under the build cache, not /tmp (AGAST #3906) --
+#
+# compile_binary, compile_library and compile_freestanding_binary each compile
+# a build's modules into a throwaway dir.  It was tempfile.mkdtemp(): /tmp, a
+# tmpfs on the gate hosts, so every package build the suite runs held its .ll
+# and .o files in RAM.  It is a fresh dir under the build cache's (whose root a
+# caller moves with RITZ_BUILD_CACHE_DIR), removed when the build ends.  These
+# stop the build at compile_modules: what's under test is where it compiles.
+
+def _artifact_dir_of(entry, tmp_path, monkeypatch):
+    """(where `entry` compiled, whether it was still there afterwards)."""
+    cache_root, tmp = tmp_path / "cache", tmp_path / "tmp"
+    tmp.mkdir()
+    monkeypatch.setenv("RITZ_BUILD_CACHE_DIR", str(cache_root))
+    monkeypatch.setattr(_build_module, "_build_cache", {})
+    monkeypatch.setattr(_build_module.tempfile, "tempdir", str(tmp))
+    seen = []
+
+    def compile_modules(sources, artifact_dir, **kw):
+        seen.append(artifact_dir)
+        return None  # a failed compile: the build stops here and cleans up
+
+    monkeypatch.setattr(_build_module, "compile_modules", compile_modules)
+    src = tmp_path / "pkg" / "src" / "main.ritz"
+    src.parent.mkdir(parents=True)
+    src.write_text("pub fn main() -> i32\n    0\n")
+    out = tmp_path / "out"
+    out.mkdir()
+    if entry == "bin":
+        got = _build_module.compile_binary("main", src, out, use_cache=False, pkg_dir=src.parent.parent)
+    elif entry == "lib":
+        got = _build_module.compile_library(_build_module.LibraryConfig("main", [src]), out,
+                                            use_cache=False, pkg_dir=src.parent.parent)
+    else:
+        config = _build_module.BinaryConfig("main", src, [], freestanding=True)
+        got = _build_module.compile_freestanding_binary(config, out, src.parent.parent, use_cache=False)
+    assert got is None and len(seen) == 1, (got, seen)
+    return seen[0], cache_root, tmp
+
+
+@pytest.mark.integration    # bin and freestanding run list_deps.py
+@pytest.mark.parametrize("entry", ["bin", "lib", "freestanding"])
+def test_a_builds_artifact_dir_is_under_the_build_cache_not_tmp(entry, tmp_path, monkeypatch):
+    where, cache_root, tmp = _artifact_dir_of(entry, tmp_path, monkeypatch)
+    assert where.is_relative_to(cache_root), f"{entry} compiled in {where}, not under {cache_root}"
+    assert not where.is_relative_to(tmp), f"{entry} compiled in tempfile's dir {where}"
+    assert not where.exists(), f"{entry} left its artifact dir {where} behind"

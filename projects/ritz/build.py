@@ -357,6 +357,20 @@ def get_build_cache(compiler: str = "ritz0") -> BuildCache:
     return _build_cache[compiler]
 
 
+def scratch_dir(cache: BuildCache) -> Path:
+    """A fresh dir for one build's .ll/.o files, under `cache`'s directory.
+
+    Not tempfile.mkdtemp(): /tmp is a tmpfs on the gate hosts, so every
+    package build the ritz0 suite runs held its artifacts in RAM (AGAST
+    #3906).  The cache dir is on disk, and a caller already moves it with
+    RITZ_BUILD_CACHE_DIR (the suite: into the test's own dir).  The caller
+    removes it, as it did the temp dir.
+    """
+    root = cache.cache_dir / "scratch"
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(dir=root))
+
+
 def _verify_ir_enabled() -> bool:
     return os.environ.get("RITZ_VERIFY_IR", "") in ("1", "true", "yes", "on")
 
@@ -1875,7 +1889,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         artifact_dir = ROOT / "build"
         artifact_dir.mkdir(exist_ok=True)
     else:
-        artifact_dir = Path(tempfile.mkdtemp())
+        artifact_dir = scratch_dir(cache)
 
     # Detect main's signature to choose the right runtime
     main_params = detect_main_signature(src_path)
@@ -1996,7 +2010,7 @@ def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool =
     if on_rebuild is not None:
         on_rebuild()
 
-    artifact_dir = ROOT / "build" if keep_artifacts else Path(tempfile.mkdtemp())
+    artifact_dir = ROOT / "build" if keep_artifacts else scratch_dir(cache)
     artifact_dir.mkdir(exist_ok=True)
     try:
         objects = compile_modules(
@@ -2240,7 +2254,7 @@ def compile_freestanding_binary(
         artifact_dir = out_dir / "obj"
         artifact_dir.mkdir(exist_ok=True)
     else:
-        artifact_dir = Path(tempfile.mkdtemp())
+        artifact_dir = scratch_dir(get_build_cache(compiler))
 
     try:
         # Freestanding builds name their source roots absolutely and do not

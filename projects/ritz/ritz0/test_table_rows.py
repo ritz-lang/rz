@@ -30,6 +30,7 @@ The kwargs' order is the id's: list them as the old decorators read bottom-up.
 
 from __future__ import annotations
 
+import functools
 import itertools
 import re
 import subprocess
@@ -111,13 +112,34 @@ def for_compiler(rows, compiler) -> list:
     return [r for r in rows if compiler in r.compilers]
 
 
+def _chunked(rows, compiler, size) -> list:
+    """`compiler`'s rows cut into chunks of `size`, of one import set each if
+    that takes no more chunks (AGAST #3906).
+
+    batching.run_rows compiles alone, as well, each row whose imports differ
+    from its batch's: it could lean on a module only a sibling imports (#2867).
+    A chunk mixing import sets pays that for every row of all but the widest.
+    A chunk more is a batch build more, and a test more, which costs more than
+    a few rows alone (test_slice_through_reference.py's 6), so where one set a
+    chunk takes more chunks, the rows are cut in source order as they were.
+    Sets come in order of first appearance, each in its rows' source order.
+    """
+    mine = for_compiler(rows, compiler)
+    by_imports = {}
+    for row in mine:
+        by_imports.setdefault(frozenset(batching._imports(row.spec.program)), []).append(row)
+    grouped = [group[i:i + size] for group in by_imports.values() for i in range(0, len(group), size)]
+    in_order = [mine[i:i + size] for i in range(0, len(mine), size)]
+    return grouped if len(grouped) <= len(in_order) else in_order
+
+
 def chunks(rows, compilers=ALL, size=CHUNK) -> list:
     """(compiler, chunk index) for each chunk: a pytest parametrisation."""
-    return [(c, i) for c in compilers for i in range(-(-len(for_compiler(rows, c)) // size))]
+    return [(c, i) for c in compilers for i in range(len(_chunked(rows, c, size)))]
 
 
 def chunk(rows, compiler, index, size=CHUNK) -> list:
-    return for_compiler(rows, compiler)[index * size:(index + 1) * size]
+    return _chunked(rows, compiler, size)[index]
 
 
 # ---- checking ---------------------------------------------------------------
@@ -216,6 +238,46 @@ def assert_rows(compiler, rows, **kwargs) -> None:
     """`check`, as one assertion listing every failing row."""
     failures = check(compiler, rows, **kwargs)
     assert not failures, f"{len(failures)} of {len(rows)} rows failed:\n" + "\n".join(failures)
+
+
+# ---- rows that import ritzlib (AGAST #3906) ---------------------------------
+#
+# One way to link what a chunk's rows import, for every table: each ritzlib
+# module they import, transitively, compiled once per process per compiler
+# (for_header.library_objects) and linked onto for_header's batch build.  The
+# other way #3889 grew, each chunk a build.py package of its own, paid a python
+# start and a cold build cache, every module compiled again, per chunk.
+
+_IMPORT = re.compile(r"^import ritzlib\.(\w+)", re.MULTILINE)
+
+
+@functools.cache
+def _closure(roots: tuple) -> tuple:
+    """`roots` and every ritzlib module they import, transitively."""
+    seen, todo = set(), list(roots)
+    while todo:
+        unit = todo.pop()
+        if unit not in seen:
+            seen.add(unit)
+            todo += _IMPORT.findall((for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz").read_text())
+    return tuple(sorted(seen))
+
+
+def ritzlib_build(ritz1_bin):
+    """`check`'s `build`: compile the program and link every ritzlib module it
+    imports, transitively, as build.py links a package's."""
+    def build(compiler, src, work):
+        roots = tuple(sorted(set(_IMPORT.findall(src.read_text()))))
+        units = tuple(u for u in _closure(roots) if u not in for_header.UNITS)
+        return for_header.batch_build(
+            ritz1_bin, lambda c: for_header.library_objects(c, ritz1_bin, units))(compiler, src, work)
+    return build
+
+
+def assert_ritzlib_rows(compiler, rows, ritz1_bin, work: Path) -> None:
+    """`assert_rows` for rows that import ritzlib."""
+    assert_rows(compiler, rows, build=ritzlib_build(ritz1_bin),
+                compile=for_header.batch_compile(ritz1_bin), work=work)
 
 
 # ---- its own tests: a failing row says which, and only it fails ------------
@@ -336,3 +398,71 @@ def test_with_batching_on_a_row_the_batch_passes_is_not_compiled_again(monkeypat
     failures, alone, batched = _stub_check(monkeypatch, tmp_path, rows, "1")
     assert batched == ["run", "refuse"]
     assert alone == [] and failures == []
+
+
+# ---- a chunk is rows of one import set, if that costs no chunk (AGAST #3906) --
+#
+# batching.run_rows compiles alone, as well, every row whose imports differ
+# from its batch's (a row could lean on a module only a sibling imports,
+# #2867).  A chunk mixing import sets paid that for each of them:
+# test_deref_index's were 5.7-6.0 CPU-s, 3.7 grouped.  A chunk more, though,
+# is a batch build more per compiler, dearer than a few rows alone:
+# test_slice_through_reference's 6 rows apart cost CPU-s, not saved them.
+
+def _imports_row(rid, imports):
+    return Row(rid, ALL, Run("".join(f"import ritzlib.{m}\n" for m in imports) + "\n" + GOOD, 7))
+
+
+def _chunk_ids(rows, size):
+    """Each compiler's chunks of `rows`, as row ids."""
+    got = {compiler: [[r.id for r in chunk(rows, compiler, i, size=size)]
+                      for c, i in chunks(rows, size=size) if c == compiler] for compiler in ALL}
+    assert len(set(map(repr, got.values()))) == 1, got   # every compiler has every row
+    return got["ritz1"]
+
+
+@pytest.mark.unit
+def test_a_chunk_holds_rows_of_one_import_set_and_every_row_once():
+    rows = [_imports_row("a1", ["gvec"]), _imports_row("n1", []), _imports_row("a2", ["gvec"]),
+            _imports_row("b1", ["gvec", "str"]), _imports_row("n2", []), _imports_row("a3", ["gvec"]),
+            _imports_row("b2", ["str", "gvec"]), _imports_row("a4", ["gvec"])]
+    # By first appearance, each set in source order and cut at `size`; an
+    # import set is the lines, not their order.
+    got = _chunk_ids(rows, 2)
+    assert got == [["a1", "a2"], ["a3", "a4"], ["n1", "n2"], ["b1", "b2"]], got
+
+
+@pytest.mark.unit
+def test_rows_chunk_in_source_order_where_one_set_a_chunk_takes_more_chunks():
+    # Apart, a1-a3 and n1 are 3 chunks of 2; in order, 2.  The test count stays.
+    rows = [_imports_row("a1", ["gvec"]), _imports_row("a2", ["gvec"]), _imports_row("a3", ["gvec"]),
+            _imports_row("n1", [])]
+    got = _chunk_ids(rows, 2)
+    assert got == [["a1", "a2"], ["a3", "n1"]], got
+
+
+# ---- a table whose rows import ritzlib: `ritzlib_build` (AGAST #3906) ------
+#
+# One way to link what a row imports: every ritzlib module it imports,
+# transitively, compiled once per process per compiler and linked onto
+# for_header's batch build.  #3889's other way, a build.py package per chunk,
+# paid a python and a cold build cache of every module per chunk.
+
+HASHMAP = """\
+import ritzlib.hashmap
+
+pub fn main() -> i32
+    var m = hashmap_i64_new()
+    m.insert(3, 40)
+    m.insert(5, 2)
+    return (m.get(3) + m.get(5)) as i32
+"""
+
+
+@pytest.mark.integration
+def test_a_row_links_every_ritzlib_module_it_imports(ritz1_bin, tmp_path):
+    # ritzlib.hashmap is beyond the allocator's units, and its `impl Drop`
+    # method is not `pub`: ritz0 has to compile it as a library module.
+    rows = [Row("hashmap", ALL, Run(HASHMAP, 42))]
+    for compiler in ALL:
+        assert_ritzlib_rows(compiler, rows, ritz1_bin, tmp_path / compiler)
