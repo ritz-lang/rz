@@ -90,6 +90,12 @@ These are not suggestions:
 language documentation and compiles it with ritz0, the reference compiler. It
 takes about 15 seconds and gates in CI's `bootstrap` job.
 
+"Compiles" means ritz0 exits 0 **and** the `.ll` it wrote parses and passes
+LLVM's verifier (AGAST #1358). A block whose IR is invalid fails as a
+compiler bug. Before this check the documented `token.kind == TokenKind.Ident`
+idiom passed for seven months while emitting `icmp` on a struct, which only
+clang rejected.
+
 The fence info-string is the block's contract:
 
 | Fence | Meaning |

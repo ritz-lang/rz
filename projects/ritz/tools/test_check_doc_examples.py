@@ -355,6 +355,101 @@ def test_expect_runtime_error_fails_when_it_does_not_compile(tmp_path):
     assert "did not compile" in report.failures[0].detail
 
 
+# ---------------------------------------------------------------------------
+# Emitted IR is parsed (AGAST #1358 follow-up 1). For seven months the
+# documented `token.kind == TokenKind.Ident` idiom compiled to .ll with exit 0
+# while the .ll held `icmp eq` on a struct, which clang's parser rejects. A
+# gate that stops at "ritz0 exited 0" cannot see that. ritz0 no longer emits
+# that IR, so a stub compiler stands in for the February one.
+# ---------------------------------------------------------------------------
+
+# Verbatim shape of the IR main @ f336bae emitted for the STYLE.md block.
+INVALID_IR = """\
+%"enum.TokenKind" = type { i8 }
+
+define i32 @main() {
+entry:
+  %a = insertvalue %"enum.TokenKind" undef, i8 0, 0
+  %b = insertvalue %"enum.TokenKind" undef, i8 1, 0
+  %eq = icmp eq %"enum.TokenKind" %a, %b
+  ret i32 0
+}
+"""
+
+VALID_IR = "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+
+
+def _stub_compiler(tmp_path: Path, monkeypatch, ir: str) -> None:
+    """Point the checker at a 'compiler' that exits 0 and writes `ir`."""
+    canned = tmp_path / "canned.ll"
+    canned.write_text(ir)
+    stub = tmp_path / "stub_ritz0.py"
+    stub.write_text(
+        "import shutil, sys\n"
+        f"shutil.copy({str(canned)!r}, sys.argv[sys.argv.index('-o') + 1])\n"
+    )
+    monkeypatch.setattr(C, "RITZ0", stub)
+
+
+@pytest.mark.unit
+def test_verify_ir_rejects_icmp_on_a_struct(tmp_path):
+    ll = tmp_path / "bad.ll"
+    ll.write_text(INVALID_IR)
+    problem = C.verify_ir(ll)
+    assert problem is not None and "icmp" in problem
+
+
+@pytest.mark.unit
+def test_verify_ir_runs_the_verifier_not_just_the_parser(tmp_path):
+    """Parses fine, but %x does not dominate its use. clang rejects it as a
+    broken module, so the gate must too."""
+    ll = tmp_path / "undominated.ll"
+    ll.write_text(
+        "define i32 @f() {\n"
+        "entry:\n  br label %use\n"
+        "use:\n  ret i32 %x\n"
+        "def:\n  %x = add i32 1, 1\n  br label %use\n"
+        "}\n"
+    )
+    problem = C.verify_ir(ll)
+    assert problem is not None and "dominate" in problem
+
+
+@pytest.mark.unit
+def test_verify_ir_accepts_valid_ir(tmp_path):
+    ll = tmp_path / "good.ll"
+    ll.write_text(VALID_IR)
+    assert C.verify_ir(ll) is None
+
+
+@pytest.mark.integration
+def test_block_whose_ir_does_not_parse_fails(tmp_path, monkeypatch):
+    _stub_compiler(tmp_path, monkeypatch, INVALID_IR)
+    doc = write(tmp_path, "```ritz\nfn main() -> i32\n    0\n```\n")
+    report = C.run([doc], jobs=2, verbose=False)
+    assert len(report.failures) == 1, report.results
+    assert "invalid IR" in report.failures[0].detail
+
+
+@pytest.mark.integration
+def test_expect_runtime_error_block_with_invalid_ir_names_the_ir(tmp_path, monkeypatch):
+    """Fails at the IR check, not at clang with a red-herring link error."""
+    _stub_compiler(tmp_path, monkeypatch, INVALID_IR)
+    doc = write(tmp_path, '```ritz expect-runtime-error="x"\nfn main() -> i32\n    0\n```\n')
+    report = C.run([doc], jobs=2, verbose=False)
+    assert len(report.failures) == 1
+    assert "invalid IR" in report.failures[0].detail
+
+
+@pytest.mark.integration
+def test_block_whose_ir_parses_passes_with_stub(tmp_path, monkeypatch):
+    """Control: the stub itself is not what fails the block above."""
+    _stub_compiler(tmp_path, monkeypatch, VALID_IR)
+    doc = write(tmp_path, "```ritz\nfn main() -> i32\n    0\n```\n")
+    report = C.run([doc], jobs=2, verbose=False)
+    assert report.failures == [], [r.detail for r in report.failures]
+
+
 @pytest.mark.integration
 def test_missing_document_is_an_error():
     assert C.main(["does/not/exist.md"]) == 1

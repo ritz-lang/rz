@@ -12,7 +12,9 @@ thing that reports success while asserting nothing.
 This script is the mechanism that can fail.  It extracts every fenced
 ```ritz block from the documents listed on the command line, compiles each
 one with the reference compiler (ritz0), and exits non-zero if any block
-does not do what its fence says it does.
+does not do what its fence says it does.  A block that compiles also has
+its emitted IR parsed and verified (``verify_ir``, AGAST #1358): ritz0
+exiting 0 over invalid IR is a failure, not a pass.
 
 Usage:
     python3 tools/check_doc_examples.py DOC.md [DOC.md ...]
@@ -77,6 +79,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -420,11 +423,50 @@ def compile_block(block: Block, workdir: Path) -> Result:
             return Result(block, ok=False, detail=(
                 "block is marked expect-runtime-error but did not compile:"
                 + _indent_output(output)))
+        if problem := verify_ir(workdir / f"{stem}.ll"):
+            return Result(block, ok=False, detail=_invalid_ir_detail(problem))
         return run_block(block, workdir, stem)
 
     if proc.returncode != 0:
         return Result(block, ok=False, detail=_indent_output(output))
+    if problem := verify_ir(workdir / f"{stem}.ll"):
+        return Result(block, ok=False, detail=_invalid_ir_detail(problem))
     return Result(block, ok=True)
+
+
+# LLVM's global context is not thread-safe and `run` compiles blocks on a
+# thread pool, so every parse goes through this lock.  A parse costs
+# milliseconds; the ritz0 subprocess it follows costs far more.
+_LLVM_LOCK = threading.Lock()
+
+
+def verify_ir(ll: Path) -> str | None:
+    """Parse and verify the IR ritz0 wrote; return the problem, or None.
+
+    AGAST #1358: ritz0 exiting 0 does not mean its output is IR.  For seven
+    months the documented `token.kind == TokenKind.Ident` idiom compiled to
+    a .ll holding `icmp eq` on a struct, which only clang's parser rejects,
+    and this gate reported it "compiled as declared" because it stopped at
+    the exit code.  Parsing is the minimum that makes "compiled" true.
+    """
+    import llvmlite.binding as llvm
+
+    text = ll.read_text(encoding="utf-8")
+    with _LLVM_LOCK:
+        try:
+            module = llvm.parse_assembly(text)
+            module.verify()
+        except RuntimeError as exc:
+            return str(exc).strip() or type(exc).__name__
+        module.close()
+    return None
+
+
+def _invalid_ir_detail(problem: str) -> str:
+    return (
+        "ritz0 exited 0 but emitted invalid IR (a compiler bug, not a doc "
+        "bug; clang would reject this at build time):" + _indent_output(problem)
+    )
 
 
 def run_block(block: Block, workdir: Path, stem: str) -> Result:
