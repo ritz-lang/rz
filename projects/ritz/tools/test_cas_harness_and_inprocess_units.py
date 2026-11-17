@@ -222,9 +222,8 @@ def test_a_harness_that_does_not_compile_is_not_stored(tmp_path, monkeypatch, te
                  "    assert no_such_fn() == 7\n    0\n")
     calls = _spy(monkeypatch, test_runner)
     for _ in range(2):
-        passed, failed, failures = test_runner.run_test_file(str(t))
-        assert (passed, failed) == (0, 1)
-        assert "no_such_fn" in failures[0]
+        with pytest.raises(test_runner.TestBuildError, match="no_such_fn"):
+            test_runner.run_test_file(str(t))
     assert len(calls["harness"]) == 2, "a failed harness compile was served from the store"
     metas = [json.loads(m.read_text()) for m in private_store.rglob("meta/*/*.json")]
     assert metas and not [m for m in metas if m["module"].endswith("#test-table")]
@@ -272,9 +271,10 @@ def test_unit_file_runs_no_ritz0_test_subprocess(tmp_path, monkeypatch, buildpy,
 @needs_clang
 @pytest.mark.parametrize("src, status, line", [
     (TEST_SRC.format(want=8), "fail", "✗ test_b.ritz — 0 passed, 1 failed"),
-    # A harness that does not compile fails each of the file's tests.
+    # A harness that does not compile is compile-failed (AGAST #3795): no
+    # test ran, and the line shown is the compiler's diagnostic.
     ("import b\n\n[[test]]\nfn test_seven() -> i32\n    assert nope() == 7\n    0\n",
-     "fail", "✗ test_b.ritz — 0 passed, 1 failed"),
+     "error", "Unknown function: nope"),
     ("fn helper() -> i32\n    0\n", "empty", "ran 0 tests"),
 ])
 def test_in_process_verdicts_match_the_subprocess_ones(tmp_path, monkeypatch, buildpy,

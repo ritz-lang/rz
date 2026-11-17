@@ -22,6 +22,7 @@ import subprocess
 import tempfile
 import hashlib
 import json
+import re
 import os
 import shutil
 import threading
@@ -830,7 +831,8 @@ def build_test_binary(source_path: str, tmpdir: str,
                                       dependencies, [Path(f) for f in dep_files or []],
                                       compiler)
     if error:
-        return None, error
+        # ritz0 compiled a scratch copy: name the file the user can open.
+        return None, error.replace(harness_path, str(source_path))
 
     # A module both the test and ritzunit import is in both lists once.
     objects = list(dict.fromkeys(dep_objects + runner_objects))
@@ -895,12 +897,38 @@ def run_test_binary(exe_path: str, cwd: Optional[str] = None) -> Tuple[int, int,
     return passed, failed, failures
 
 
+class TestBuildError(Exception):
+    """A test file's binary could not be built, so none of its tests ran.
+
+    Not a test failure (AGAST #3795): charging the compile error to each
+    [[test]] fn printed "0 passed, 7 failed" for a file that did not parse,
+    and build.py read that as assertion failures (the #1345 misreport).
+    """
+
+
+def first_diagnostic(error: str) -> str:
+    """The compiler's first diagnostic in a build error: the line to show.
+
+    The first line that says "error" (ritz1's `file:l:c: error: ...`,
+    ritz0's `Compiler error: file:l:c: ...`), without the "<compiler> failed
+    for <file>: " prefix this module puts on it; else the first line.
+    """
+    lines = [ln.strip() for ln in error.splitlines() if ln.strip()]
+    if not lines:
+        return "(no output)"
+    lines[0] = re.sub(r"^\S+ failed for [^:]+: ", "", lines[0])
+    for line in lines:
+        if re.search(r"error", line, re.IGNORECASE):
+            return line
+    return lines[0]
+
+
 def run_test_file(source_path: str, verbose: bool = False,
                   compiler: str = "ritz0") -> Tuple[int, int, List[str]]:
     """Build `source_path`'s test binary with `compiler` and run it.
 
-    Returns (passed, failed, failure_messages). A file whose binary cannot be
-    built fails every one of its tests with the build error.
+    Returns (passed, failed, failure_messages). Raises TestBuildError, with
+    the build error, if the binary cannot be built.
     """
     tests = find_test_functions(source_path)
     if not tests:
@@ -913,7 +941,7 @@ def run_test_file(source_path: str, verbose: bool = False,
             print(f"  Building test binary for {len(tests)} tests...", flush=True)
         exe_path, error = build_test_binary(source_path, tmpdir, compiler)
         if error:
-            return 0, len(tests), [f"{name}: {error}" for name, _fn in tests]
+            raise TestBuildError(error)
         passed, failed, failures = run_test_binary(exe_path)
         if verbose:
             for f in failures:
@@ -924,15 +952,30 @@ def run_test_file(source_path: str, verbose: bool = False,
             cleanup_scratch_dir(tmpdir)
 
 
+def _print_error(file_path: str, error: str) -> None:
+    """`Error in <file>: <first diagnostic>`, the line build.py shows.
+
+    build.py shows 200 characters of it: the file's directory, spelled out
+    in front of each name, would use most of them.
+    """
+    where = str(Path(file_path).resolve().parent) + os.sep
+    diag = first_diagnostic(error).replace(where, "")
+    print(f"Error in {Path(file_path).name}: {diag}", file=sys.stderr)
+
+
 def run_files(files: List[str], verbose: bool = False, compiler: str = "ritz0") -> int:
     """Run test files; print the report `ritz0 --test` prints; its exit code.
 
-    The report ends with "N passed, M failed", which build.py's
+    The report ends with "N passed, M failed[, K errored]", which build.py's
     classify_test_file reads, so `ritz0 --test` and build.py's in-process
-    unit (AGAST #1915) must share this one printer.
+    unit (AGAST #1915) must share this one printer. A file that did not
+    build, or whose run raised, is one errored file, not failed tests
+    (AGAST #3795); its first diagnostic goes to stderr as "Error in ...",
+    the line build.py shows for a compile-failed file.
     """
     total_passed = 0
     total_failed = 0
+    errored = 0
     all_failures = []
 
     for file_path in files:
@@ -943,19 +986,26 @@ def run_files(files: List[str], verbose: bool = False, compiler: str = "ritz0") 
             total_passed += passed
             total_failed += failed
             all_failures.extend(failures)
+        except TestBuildError as e:
+            _print_error(file_path, str(e))
+            errored += 1
+            all_failures.append(f"{file_path}: did not build: {e}")
         except Exception as e:  # noqa: BLE001 -- the file's verdict, not a crash
-            print(f"Error in {file_path}: {e}", file=sys.stderr)
-            total_failed += 1
+            _print_error(file_path, str(e))
+            errored += 1
             all_failures.append(f"{file_path}: error")
 
-    print(f"\n{total_passed} passed, {total_failed} failed")
+    summary = f"\n{total_passed} passed, {total_failed} failed"
+    if errored:
+        summary += f", {errored} errored"
+    print(summary)
 
     if all_failures:
         print("\nFailures:")
         for f in all_failures:
             print(f"  - {f}")
 
-    return 0 if total_failed == 0 else 1
+    return 0 if total_failed == 0 and errored == 0 else 1
 
 
 def main():

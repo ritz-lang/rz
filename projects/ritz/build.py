@@ -2491,7 +2491,7 @@ def ritz_path_for_tests(caller_path: str) -> str:
     return ":".join([root_str] + kept)
 
 
-_HARNESS_SUMMARY = re.compile(r"(\d+) passed, (\d+) failed")
+_HARNESS_SUMMARY = re.compile(r"(\d+) passed, (\d+) failed(?:, (\d+) errored)?")
 
 
 def classify_test_file(returncode: int, stdout: str) -> tuple[str, int, int]:
@@ -2500,7 +2500,8 @@ def classify_test_file(returncode: int, stdout: str) -> tuple[str, int, int]:
     status is one of:
       pass   exited 0, printed a harness summary, at least one test ran, none failed
       fail   the harness ran and at least one test failed
-      error  non-zero exit or no harness summary: compile, link or crash
+      error  non-zero exit, no harness summary, or "K errored": a file
+             that did not compile or link (AGAST #3795), or a crash
       empty  exited 0 and ran ZERO tests
 
     `empty` is a failure, not a pass (AGAST #1345). `ritz0 --test` prints
@@ -2508,13 +2509,17 @@ def classify_test_file(returncode: int, stdout: str) -> tuple[str, int, int]:
     and this used to be reported as "✓ file — 0 passed". A test file that
     cannot fail cannot be told apart from one that does not exist.
     """
-    passed = failed = 0
+    passed = failed = errored = 0
     seen = False
     for line in stdout.splitlines():
         m = _HARNESS_SUMMARY.search(line)
         if m:  # last matching line wins
             passed, failed = int(m.group(1)), int(m.group(2))
+            errored = int(m.group(3) or 0)
             seen = True
+    # A file that did not build ran no test: not an assertion failure.
+    if errored > 0:
+        return "error", passed, failed
     # Checked BEFORE the exit code: `ritz0 --test` exits 1 when a test fails.
     # The old inline parser tested `returncode != 0` first, so every
     # assertion failure was reported as a compile failure and the Σ line's
