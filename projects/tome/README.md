@@ -78,6 +78,23 @@ cache.subscribe("events:*", fn(channel: *u8, msg: *u8)
 cache.publish("events:login", "user 1 logged in")
 ```
 
+## Source Layout
+
+The embedded store is `lib/tome.ritz`, which only re-exports its parts
+(`import tome.tome` or `import lib.tome` brings in the whole store API):
+
+| Module | Holds |
+|--------|-------|
+| `store_types.ritz` | value tags; List/Set/ZSet/Hash structs and their drops |
+| `store.ritz` | the `Store` table, memory accounting and eviction, strings, TTL |
+| `store_list.ritz` / `store_set.ritz` / `store_zset.ritz` / `store_hash.ritz` | one value type each |
+| `pubsub.ritz` | publish/subscribe |
+
+The server side is `resp.ritz` (RESP protocol), `commands.ritz` (command
+dispatch), `session.ritz` (per-connection state), `server.ritz` (io_uring
+loop), `blocking_server.ritz` / `server_blocking.ritz` (blocking loops),
+`master.ritz` (multi-process master) and `client.ritz` (client).
+
 ## Dependencies
 
 Tome has no required dependencies beyond `ritzlib`. Optional integrations:

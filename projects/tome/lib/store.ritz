@@ -1,0 +1,942 @@
+# lib/store.ritz - Tome key-value store core
+#
+# The Store hash table: entries, memory accounting and eviction, string
+# get/set/del, TTL, C-string wrappers and method syntax.
+
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.drop
+import ritzlib.sys
+import tome.store_types
+
+# ============================================================================
+# Time utilities for TTL
+# ============================================================================
+
+# Get current time as Unix timestamp (seconds since epoch)
+pub fn time_now_secs() -> i64
+    var tv: Timeval
+    let ret: i32 = sys_gettimeofday(@tv, null)
+    if ret < 0
+        return 0
+    return tv.tv_sec
+
+# ============================================================================
+# Entry - A single key-value pair with metadata
+# ============================================================================
+
+struct Entry
+    key: String          # The key (owned string)
+    value: String        # The value (owned string, for VALUE_STRING)
+    value_ptr: *u8       # Pointer to complex value (for LIST, SET, etc.)
+    value_type: i32      # Type tag (VALUE_NONE, VALUE_STRING, etc.)
+    expires_at: i64      # Unix timestamp for expiration (0 = never)
+    last_access: i64     # Unix timestamp of last access (for LRU)
+    state: i32           # 0=empty, 1=occupied, 2=tombstone
+
+# ============================================================================
+# Eviction Policies
+# ============================================================================
+
+const EVICT_NONE: i32 = 0        # No eviction, return error when full
+const EVICT_LRU: i32 = 1         # Evict least recently used keys
+const EVICT_RANDOM: i32 = 2      # Evict random keys
+const EVICT_VOLATILE_LRU: i32 = 3   # Evict LRU among keys with TTL
+const EVICT_VOLATILE_RANDOM: i32 = 4  # Evict random among keys with TTL
+const EVICT_VOLATILE_TTL: i32 = 5    # Evict keys closest to expiration
+
+# ============================================================================
+# Store - The main key-value store
+# ============================================================================
+# Uses open addressing with linear probing (like HashMapI64).
+
+struct Store
+    entries: *Entry      # Array of entries
+    cap: i64             # Capacity (power of 2)
+    len: i64             # Number of occupied entries
+    tombstones: i64      # Number of tombstones
+    used_memory: i64     # Total memory used by keys and values (bytes)
+    maxmemory: i64       # Maximum memory limit (0 = unlimited)
+    eviction_policy: i32 # Eviction policy when maxmemory reached
+    rng_state: u64       # Random state for EVICT_RANDOM
+
+# ============================================================================
+# Drop trait implementation
+# ============================================================================
+
+impl Drop for Store
+    fn drop(self: @&Store)
+        # Free all entries' owned strings, lists, sets, and zsets
+        if self.entries != null
+            for i in 0..self.cap
+                let entry: *Entry = self.entries + i
+                if entry.state == 1  # OCCUPIED
+                    string_drop(@&entry.key)
+                    if entry.value_type == VALUE_STRING
+                        string_drop(@&entry.value)
+                    else if entry.value_type == VALUE_LIST
+                        list_drop(entry.value_ptr as *List)
+                    else if entry.value_type == VALUE_SET
+                        set_drop(entry.value_ptr as *Set)
+                    else if entry.value_type == VALUE_ZSET
+                        zset_drop(entry.value_ptr as *ZSet)
+                    else if entry.value_type == VALUE_HASH
+                        hash_drop(entry.value_ptr as *Hash)
+            free(self.entries as *u8)
+        self.entries = null
+        self.cap = 0
+        self.len = 0
+        self.tombstones = 0
+
+# ============================================================================
+# Constructor
+# ============================================================================
+
+pub fn store_new() -> Store
+    return store_with_cap(16)
+
+pub fn store_with_cap(cap: i64) -> Store
+    var s: Store = Store {
+        entries: null,
+        cap: 0,
+        len: 0,
+        tombstones: 0,
+        used_memory: 0,
+        maxmemory: 0,                # No limit by default
+        eviction_policy: EVICT_NONE,
+        rng_state: 12345             # Initial seed for random eviction
+    }
+
+    # Round up to power of 2
+    var actual_cap: i64 = 16
+    while actual_cap < cap
+        actual_cap *= 2
+
+    let size: i64 = actual_cap * sizeof(Entry)
+    s.entries = malloc(size) as *Entry
+    s.cap = actual_cap
+
+    # Initialize all entries to empty
+    for i in 0..actual_cap
+        let entry: *Entry = s.entries + i
+        entry.state = 0  # EMPTY
+        entry.value_type = VALUE_NONE
+        entry.value_ptr = null
+        entry.expires_at = 0
+        entry.last_access = 0
+
+    return s
+
+# ============================================================================
+# Memory Management
+# ============================================================================
+
+# Calculate memory used by a String
+fn string_memory(s: @String) -> i64
+    return string_len(s) + 1  # Length + null terminator
+
+# Calculate memory used by an entry's value
+fn entry_value_memory(entry: *Entry) -> i64
+    if entry.value_type == VALUE_STRING
+        return string_memory(@entry.value)
+    else if entry.value_type == VALUE_LIST
+        let list: *List = entry.value_ptr as *List
+        if list == null
+            return 0
+        # List memory: struct + nodes + string data
+        var mem: i64 = 24  # List struct
+        var node: *ListNode = list.head
+        while node != null
+            mem += 40  # ListNode struct (String + 2 pointers)
+            mem += string_memory(@node.value)
+            node = node.next
+        return mem
+    else if entry.value_type == VALUE_SET
+        let set: *Set = entry.value_ptr as *Set
+        if set == null
+            return 0
+        # Set memory: struct + entries array + string data
+        var mem: i64 = 32  # Set struct
+        mem += set.cap * 24  # SetEntry array
+        for i in 0..set.cap
+            let se: *SetEntry = set.entries + i
+            if se.state == 1
+                mem += string_memory(@se.value)
+        return mem
+    else if entry.value_type == VALUE_ZSET
+        let zset: *ZSet = entry.value_ptr as *ZSet
+        if zset == null
+            return 0
+        # ZSet memory: struct + skip list nodes + hash entries + strings
+        var mem: i64 = 48  # ZSet struct estimate
+        mem += zset.hash_cap * 32  # Hash entries
+        # Skip list nodes (estimate based on length)
+        mem += zset.len * 64  # Average node size with forward pointers
+        return mem
+    else if entry.value_type == VALUE_HASH
+        let h: *Hash = entry.value_ptr as *Hash
+        if h == null
+            return 0
+        # Hash memory: struct + entries array + string data
+        var mem: i64 = 32  # Hash struct
+        mem += h.cap * 36  # HashEntry array (field + value + state)
+        for i in 0..h.cap
+            let he: *HashEntry = h.entries + i
+            if he.state == 1
+                mem += string_memory(@he.field)
+                mem += string_memory(@he.value)
+        return mem
+    return 0
+
+# Calculate total memory used by an entry
+pub fn entry_memory(entry: *Entry) -> i64
+    var mem: i64 = string_memory(@entry.key)
+    mem += entry_value_memory(entry)
+    return mem
+
+# Simple LCG random number generator
+fn store_random(s: *Store) -> u64
+    s.rng_state = s.rng_state * 6364136223846793005 + 1442695040888963407
+    return s.rng_state
+
+# Set maximum memory limit
+pub fn store_set_maxmemory(s: *Store, bytes: i64)
+    s.maxmemory = bytes
+
+# Set eviction policy
+pub fn store_set_eviction_policy(s: *Store, policy: i32)
+    s.eviction_policy = policy
+
+# Get current memory usage
+pub fn store_memory_usage(s: *Store) -> i64
+    return s.used_memory
+
+# Get maximum memory limit
+pub fn store_get_maxmemory(s: *Store) -> i64
+    return s.maxmemory
+
+# Find a key to evict based on policy. Returns index or -1 if none found.
+fn store_find_evict_candidate(s: *Store) -> i64
+    if s.eviction_policy == EVICT_NONE
+        return -1
+
+    if s.len == 0
+        return -1
+
+    let now: i64 = time_now_secs()
+
+    if s.eviction_policy == EVICT_RANDOM
+        # Random eviction - sample up to 5 keys and pick one
+        var attempts: i32 = 0
+        while attempts < 20
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1
+                return idx
+            attempts += 1
+        return -1
+
+    if s.eviction_policy == EVICT_LRU
+        # LRU - sample 5 keys and evict the oldest access
+        var oldest_idx: i64 = -1
+        var oldest_time: i64 = 9223372036854775807  # i64 max
+        var samples: i32 = 0
+        var attempts: i32 = 0
+        while samples < 5 && attempts < 20
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1
+                if entry.last_access < oldest_time
+                    oldest_time = entry.last_access
+                    oldest_idx = idx
+                samples += 1
+            attempts += 1
+        return oldest_idx
+
+    if s.eviction_policy == EVICT_VOLATILE_LRU
+        # LRU among keys with TTL
+        var oldest_idx: i64 = -1
+        var oldest_time: i64 = 9223372036854775807
+        var samples: i32 = 0
+        var attempts: i32 = 0
+        while samples < 5 && attempts < 50
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1 && entry.expires_at > 0
+                if entry.last_access < oldest_time
+                    oldest_time = entry.last_access
+                    oldest_idx = idx
+                samples += 1
+            attempts += 1
+        return oldest_idx
+
+    if s.eviction_policy == EVICT_VOLATILE_RANDOM
+        # Random among keys with TTL
+        var attempts: i32 = 0
+        while attempts < 50
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1 && entry.expires_at > 0
+                return idx
+            attempts += 1
+        return -1
+
+    if s.eviction_policy == EVICT_VOLATILE_TTL
+        # Evict key closest to expiration
+        var best_idx: i64 = -1
+        var earliest_expire: i64 = 9223372036854775807
+        var samples: i32 = 0
+        var attempts: i32 = 0
+        while samples < 5 && attempts < 50
+            let idx: i64 = (store_random(s) as i64) % s.cap
+            if idx < 0
+                attempts += 1
+                continue
+            let entry: *Entry = s.entries + idx
+            if entry.state == 1 && entry.expires_at > 0
+                if entry.expires_at < earliest_expire
+                    earliest_expire = entry.expires_at
+                    best_idx = idx
+                samples += 1
+            attempts += 1
+        return best_idx
+
+    return -1
+
+# Evict keys until we're under maxmemory. Returns number of keys evicted.
+fn store_evict_if_needed(s: *Store) -> i64
+    if s.maxmemory <= 0
+        return 0  # No limit
+
+    var evicted: i64 = 0
+    while s.used_memory > s.maxmemory
+        let idx: i64 = store_find_evict_candidate(s)
+        if idx < 0
+            break  # Can't evict anything
+
+        let entry: *Entry = s.entries + idx
+        let mem: i64 = entry_memory(entry)
+
+        # Free the entry
+        string_drop(@&entry.key)
+        if entry.value_type == VALUE_STRING
+            string_drop(@&entry.value)
+        else if entry.value_type == VALUE_LIST
+            list_drop(entry.value_ptr as *List)
+        else if entry.value_type == VALUE_SET
+            set_drop(entry.value_ptr as *Set)
+        else if entry.value_type == VALUE_ZSET
+            zset_drop(entry.value_ptr as *ZSet)
+        else if entry.value_type == VALUE_HASH
+            hash_drop(entry.value_ptr as *Hash)
+
+        entry.state = 2  # TOMBSTONE
+        entry.value_type = VALUE_NONE
+        entry.value_ptr = null
+        s.len -= 1
+        s.tombstones += 1
+        s.used_memory -= mem
+        evicted += 1
+
+    return evicted
+
+# ============================================================================
+# Hash function for string keys
+# ============================================================================
+
+# Hash a StrView (uses length, not null-terminator)
+pub fn hash_strview(key: StrView) -> u64
+    var h: u64 = fnv1a_init()
+    for i in 0..key.len
+        h = fnv1a_byte(h, *(key.ptr + i))
+    return h
+
+# Compare a String to a StrView for equality
+pub fn tome_string_eq_strview(s: *String, sv: StrView) -> i32
+    let slen: i64 = string_len(s)
+    if slen != sv.len
+        return 0
+    let sptr: *u8 = string_as_ptr(s)
+    for i in 0..slen
+        if *(sptr + i) != *(sv.ptr + i)
+            return 0
+    return 1
+
+# ============================================================================
+# Find slot for key
+# ============================================================================
+
+pub fn store_find_slot(s: *Store, key: StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0  # EMPTY
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if tome_string_eq_strview(@entry.key, key) == 1
+                return idx  # Found!
+
+        # Linear probe
+        idx = (idx + 1) & mask
+        i += 1
+
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# ============================================================================
+# Grow the store
+# ============================================================================
+
+pub fn store_grow(s: *Store)
+    let old_entries: *Entry = s.entries
+    let old_cap: i64 = s.cap
+
+    # Allocate new table with double capacity
+    let new_cap: i64 = old_cap * 2
+    let size: i64 = new_cap * sizeof(Entry)
+    s.entries = malloc(size) as *Entry
+    s.cap = new_cap
+    s.len = 0
+    s.tombstones = 0
+
+    # Initialize new entries to empty
+    for i in 0..new_cap
+        let entry: *Entry = s.entries + i
+        entry.state = 0
+        entry.value_type = VALUE_NONE
+        entry.value_ptr = null
+        entry.expires_at = 0
+
+    # Rehash all occupied entries from old table
+    for i in 0..old_cap
+        let old_entry: *Entry = old_entries + i
+        if old_entry.state == 1  # OCCUPIED
+            # Find new slot - create StrView from the key string
+            var key_sv: StrView = strview_from_cstr(string_as_ptr(@&old_entry.key))
+            let new_idx: i64 = store_find_slot(s, key_sv)
+            let new_entry: *Entry = s.entries + new_idx
+
+            # Move ownership (shallow copy of String structs and pointers)
+            new_entry.key = old_entry.key
+            new_entry.value = old_entry.value
+            new_entry.value_ptr = old_entry.value_ptr
+            new_entry.value_type = old_entry.value_type
+            new_entry.expires_at = old_entry.expires_at
+            new_entry.state = 1
+            s.len += 1
+
+    # Free old table (but NOT the strings/lists - they were moved)
+    free(old_entries as *u8)
+
+# ============================================================================
+# Core operations
+# ============================================================================
+
+# Set a key to a string value.
+pub fn store_set(s: *Store, key: StrView, value: StrView)
+    # Check load factor and resize if needed (> 75%)
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return
+
+    let entry: *Entry = s.entries + idx
+    let now: i64 = time_now_secs()
+
+    if entry.state == 1  # Update existing
+        # Track old memory
+        let old_mem: i64 = entry_value_memory(entry)
+        # Free old value, set new
+        if entry.value_type == VALUE_STRING
+            string_drop(@&entry.value)
+        entry.value = string_from_strview(value)
+        entry.value_type = VALUE_STRING
+        entry.last_access = now
+        # Update memory tracking
+        let new_mem: i64 = entry_value_memory(entry)
+        s.used_memory += new_mem - old_mem
+    else
+        # New entry
+        if entry.state == 2  # Was tombstone
+            s.tombstones -= 1
+        entry.key = string_from_strview(key)
+        entry.value = string_from_strview(value)
+        entry.value_type = VALUE_STRING
+        entry.expires_at = 0
+        entry.last_access = now
+        entry.state = 1
+        s.len += 1
+        # Track memory
+        s.used_memory += entry_memory(entry)
+
+    # Evict if needed
+    store_evict_if_needed(s)
+
+# Get a value by key. Returns null if not found or expired.
+# NOTE: Returns a borrowed pointer - valid until key is modified/deleted.
+# Implements lazy expiration - expired keys are deleted on access.
+pub fn store_get(s: *Store, key: StrView) -> *u8
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+    let now: i64 = time_now_secs()
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return null
+
+        if entry.state == 1  # OCCUPIED
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration (lazy expiration)
+                if entry.expires_at > 0
+                    if now >= entry.expires_at
+                        # Key has expired - delete it
+                        let mem: i64 = entry_memory(entry)
+                        string_drop(@&entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@&entry.value)
+                        entry.state = 2  # TOMBSTONE
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        s.used_memory -= mem
+                        return null
+
+                # Update access time for LRU
+                entry.last_access = now
+
+                if entry.value_type == VALUE_STRING
+                    return string_as_ptr(@&entry.value)
+                return null
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# Like `store_get` but returns the value as a `StrView` (ptr + len).
+# Necessary for binary-safe values where the caller needs to know the
+# length without scanning for a NUL terminator.  Returns an empty
+# StrView (ptr=null, len=0) on miss / expired / non-string value.
+# Triggers lazy expiration like `store_get`.
+pub fn store_get_strview(s: *Store, key: StrView) -> StrView
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+    let now: i64 = time_now_secs()
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0  # EMPTY - not found
+            return strview_from_ptr(null, 0)
+
+        if entry.state == 1  # OCCUPIED
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration (lazy expiration)
+                if entry.expires_at > 0
+                    if now >= entry.expires_at
+                        let mem: i64 = entry_memory(entry)
+                        string_drop(@&entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@&entry.value)
+                        entry.state = 2  # TOMBSTONE
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        s.used_memory -= mem
+                        return strview_from_ptr(null, 0)
+
+                # Update access time for LRU
+                entry.last_access = now
+
+                if entry.value_type == VALUE_STRING
+                    return strview_from_ptr(string_as_ptr(@&entry.value), string_len(@entry.value))
+                return strview_from_ptr(null, 0)
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return strview_from_ptr(null, 0)
+
+# Check if a key exists (not expired).
+# NOTE: This is a const operation - does not trigger lazy expiration.
+# Use store_get() if you want expired keys to be cleaned up.
+pub fn store_exists(s: *Store, key: StrView) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check if expired
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Expired
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Delete a key. Returns 1 if deleted, 0 if not found.
+pub fn store_del(s: *Store, key: StrView) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Track memory before freeing
+                let mem: i64 = entry_memory(entry)
+                # Free the key and value
+                string_drop(@&entry.key)
+                if entry.value_type == VALUE_STRING
+                    string_drop(@&entry.value)
+                else if entry.value_type == VALUE_LIST
+                    list_drop(entry.value_ptr as *List)
+                else if entry.value_type == VALUE_SET
+                    set_drop(entry.value_ptr as *Set)
+                else if entry.value_type == VALUE_ZSET
+                    zset_drop(entry.value_ptr as *ZSet)
+                else if entry.value_type == VALUE_HASH
+                    hash_drop(entry.value_ptr as *Hash)
+                entry.state = 2  # TOMBSTONE
+                entry.value_type = VALUE_NONE
+                entry.value_ptr = null
+                s.len -= 1
+                s.tombstones += 1
+                s.used_memory -= mem
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get the number of keys in the store.
+pub fn store_len(s: *Store) -> i64
+    return s.len
+
+# Check if the store is empty.
+pub fn store_is_empty(s: *Store) -> i32
+    if s.len == 0
+        return 1
+    return 0
+
+
+# Clear all keys from the store.
+pub fn store_clear(s: *Store)
+    # Delete all entries
+    for i in 0..s.cap
+        let entry: *Entry = s.entries + i
+        if entry.state == 1  # OCCUPIED
+            # Free the key
+            string_drop(@&entry.key)
+            # Free value based on type
+            if entry.value_type == VALUE_STRING
+                string_drop(@&entry.value)
+            else if entry.value_type == VALUE_LIST
+                list_drop(entry.value_ptr as *List)
+            else if entry.value_type == VALUE_SET
+                set_drop(entry.value_ptr as *Set)
+            else if entry.value_type == VALUE_ZSET
+                zset_drop(entry.value_ptr as *ZSet)
+            else if entry.value_type == VALUE_HASH
+                hash_drop(entry.value_ptr as *Hash)
+            entry.state = 0
+    s.len = 0
+    s.tombstones = 0
+    s.used_memory = 0
+
+
+# ============================================================================
+# TTL Operations
+# ============================================================================
+
+# Set a key with an expiration time (in seconds from now).
+# Similar to Redis SETEX.
+pub fn store_setex(s: *Store, key: StrView, value: StrView, ttl_secs: i64)
+    # First, do a normal set
+    store_set(s, key, value)
+
+    # Then find the entry and set expiration
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return  # Not found (shouldn't happen after set)
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                if ttl_secs > 0
+                    entry.expires_at = time_now_secs() + ttl_secs
+                else
+                    entry.expires_at = 0  # No expiration
+                return
+
+        idx = (idx + 1) & mask
+        i += 1
+
+# Set expiration on an existing key. Returns 1 if key exists, 0 otherwise.
+# Similar to Redis EXPIRE.
+pub fn store_expire(s: *Store, key: StrView, ttl_secs: i64) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0  # Key not found
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check if already expired
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        # Lazy delete expired key
+                        string_drop(@&entry.key)
+                        if entry.value_type == VALUE_STRING
+                            string_drop(@&entry.value)
+                        entry.state = 2
+                        entry.value_type = VALUE_NONE
+                        s.len -= 1
+                        s.tombstones += 1
+                        return 0
+
+                if ttl_secs > 0
+                    entry.expires_at = time_now_secs() + ttl_secs
+                else
+                    entry.expires_at = 0  # Remove expiration
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get the remaining TTL for a key in seconds.
+# Returns: -2 if key doesn't exist, -1 if no expiration, >= 0 for TTL.
+# Similar to Redis TTL.
+pub fn store_ttl(s: *Store, key: StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return -2  # Key does not exist
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at == 0
+                    return -1  # Key exists but has no expiration
+
+                let now: i64 = time_now_secs()
+                if now >= entry.expires_at
+                    return -2  # Expired (treat as non-existent)
+
+                return entry.expires_at - now
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return -2
+
+# Remove expiration from a key. Returns 1 if key exists and had TTL, 0 otherwise.
+# Similar to Redis PERSIST.
+pub fn store_persist(s: *Store, key: StrView) -> i32
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check if already expired
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Already expired
+
+                    entry.expires_at = 0
+                    return 1
+                return 0  # No TTL to remove
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Active expiration: scan and delete expired keys.
+# Returns the number of keys deleted.
+# Call this periodically (e.g., every 100ms) for background cleanup.
+pub fn store_expire_sweep(s: *Store) -> i64
+    var deleted: i64 = 0
+    let now: i64 = time_now_secs()
+
+    for i in 0..s.cap
+        let entry: *Entry = s.entries + i
+        if entry.state == 1  # OCCUPIED
+            if entry.expires_at > 0
+                if now >= entry.expires_at
+                    # Delete expired entry
+                    string_drop(@&entry.key)
+                    if entry.value_type == VALUE_STRING
+                        string_drop(@&entry.value)
+                    entry.state = 2  # TOMBSTONE
+                    entry.value_type = VALUE_NONE
+                    s.len -= 1
+                    s.tombstones += 1
+                    deleted += 1
+
+    return deleted
+
+# ============================================================================
+# C-string convenience wrappers
+# ============================================================================
+# These functions accept *u8 (null-terminated C strings) for backward
+# compatibility with existing code. They wrap the *StrView-based API.
+
+pub fn store_set_cstr(s: *Store, key: *u8, value: *u8)
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    store_set(s, key_sv, val_sv)
+
+pub fn store_get_cstr(s: *Store, key: *u8) -> *u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_get(s, key_sv)
+
+pub fn store_del_cstr(s: *Store, key: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_del(s, key_sv)
+
+pub fn store_exists_cstr(s: *Store, key: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_exists(s, key_sv)
+
+pub fn store_setex_cstr(s: *Store, key: *u8, value: *u8, ttl_secs: i64)
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    store_setex(s, key_sv, val_sv, ttl_secs)
+
+pub fn store_expire_cstr(s: *Store, key: *u8, ttl_secs: i64) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_expire(s, key_sv, ttl_secs)
+
+pub fn store_ttl_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_ttl(s, key_sv)
+
+pub fn store_persist_cstr(s: *Store, key: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_persist(s, key_sv)
+
+# ============================================================================
+# Method syntax support
+# ============================================================================
+
+impl Store
+    fn len(self: @Store) -> i64
+        return self.len
+
+    fn is_empty(self: @Store) -> i32
+        if self.len == 0
+            return 1
+        return 0
+
+    fn set(self: @&Store, key: *u8, value: *u8)
+        store_set_cstr(self, key, value)
+
+    fn get(self: @&Store, key: *u8) -> *u8
+        return store_get_cstr(self, key)
+
+    fn exists(self: @Store, key: *u8) -> i32
+        return store_exists_cstr(self, key)
+
+    fn del(self: @&Store, key: *u8) -> i32
+        return store_del_cstr(self, key)
+
+    fn setex(self: @&Store, key: *u8, value: *u8, ttl_secs: i64)
+        store_setex_cstr(self, key, value, ttl_secs)
+
+    fn expire(self: @&Store, key: *u8, ttl_secs: i64) -> i32
+        return store_expire_cstr(self, key, ttl_secs)
+
+    fn ttl(self: @Store, key: *u8) -> i64
+        return store_ttl_cstr(self, key)
+
+    fn persist(self: @&Store, key: *u8) -> i32
+        return store_persist_cstr(self, key)
+
+    fn expire_sweep(self: @&Store) -> i64
+        return store_expire_sweep(self)

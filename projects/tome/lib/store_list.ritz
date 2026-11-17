@@ -1,0 +1,360 @@
+# lib/store_list.ritz - Tome list values
+#
+# Doubly linked list operations and the store_l* commands on a Store.
+
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.drop
+import ritzlib.sys
+import tome.store_types
+import tome.store
+
+# ============================================================================
+# List Operations
+# ============================================================================
+
+# Create a new empty list
+fn list_new() -> *List
+    let list: *List = malloc(sizeof(List)) as *List
+    list.head = null
+    list.tail = null
+    list.len = 0
+    return list
+
+# Push a value to the left (head) of the list. Returns new length.
+fn list_lpush(list: *List, value: StrView) -> i64
+    let node: *ListNode = malloc(sizeof(ListNode)) as *ListNode
+    node.value = string_from_strview(value)
+    node.prev = null
+    node.next = list.head
+
+    if list.head != null
+        list.head.prev = node
+    else
+        # List was empty, new node is also tail
+        list.tail = node
+
+    list.head = node
+    list.len += 1
+    return list.len
+
+# Push a value to the right (tail) of the list. Returns new length.
+fn list_rpush(list: *List, value: StrView) -> i64
+    let node: *ListNode = malloc(sizeof(ListNode)) as *ListNode
+    node.value = string_from_strview(value)
+    node.prev = list.tail
+    node.next = null
+
+    if list.tail != null
+        list.tail.next = node
+    else
+        # List was empty, new node is also head
+        list.head = node
+
+    list.tail = node
+    list.len += 1
+    return list.len
+
+# Pop a value from the left (head). Returns owned string, caller must drop.
+# Returns empty string if list is empty.
+fn list_lpop(list: *List) -> String
+    if list.head == null
+        return string_new()
+
+    let node: *ListNode = list.head
+    let result: String = node.value  # Move ownership
+
+    list.head = node.next
+    if list.head != null
+        list.head.prev = null
+    else
+        list.tail = null
+
+    list.len -= 1
+    free(node as *u8)
+    return result
+
+# Pop a value from the right (tail). Returns owned string, caller must drop.
+# Returns empty string if list is empty.
+fn list_rpop(list: *List) -> String
+    if list.tail == null
+        return string_new()
+
+    let node: *ListNode = list.tail
+    let result: String = node.value  # Move ownership
+
+    list.tail = node.prev
+    if list.tail != null
+        list.tail.next = null
+    else
+        list.head = null
+
+    list.len -= 1
+    free(node as *u8)
+    return result
+
+# Get list length
+fn list_len(list: *List) -> i64
+    if list == null
+        return 0
+    return list.len
+
+# Get element at index (0-based). Returns borrowed pointer, null if out of bounds.
+# Negative indices count from end (-1 = last).
+fn list_index(list: *List, index: i64) -> *u8
+    if list == null || list.len == 0
+        return null
+
+    # Normalize negative index
+    var idx: i64 = index
+    if idx < 0
+        idx = list.len + idx
+
+    if idx < 0 || idx >= list.len
+        return null
+
+    # Traverse from nearest end
+    var node: *ListNode = null
+    if idx <= list.len / 2
+        # Traverse from head
+        node = list.head
+        var i: i64 = 0
+        while i < idx
+            node = node.next
+            i += 1
+    else
+        # Traverse from tail
+        node = list.tail
+        var i: i64 = list.len - 1
+        while i > idx
+            node = node.prev
+            i -= 1
+
+    return string_as_ptr(@&node.value)
+
+# ============================================================================
+# Store List Operations
+# ============================================================================
+
+# Helper: Get or create list for key. Returns null if key exists with wrong type.
+fn store_get_or_create_list(s: *Store, key: StrView) -> *List
+    # Check load factor
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return null
+
+    let entry: *Entry = s.entries + idx
+
+    if entry.state == 1  # Occupied
+        # Check type
+        if entry.value_type == VALUE_LIST
+            return entry.value_ptr as *List
+        # Wrong type
+        return null
+
+    # Create new list
+    let list: *List = list_new()
+    let now: i64 = time_now_secs()
+
+    if entry.state == 2  # Was tombstone
+        s.tombstones -= 1
+
+    entry.key = string_from_strview(key)
+    entry.value_ptr = list as *u8
+    entry.value_type = VALUE_LIST
+    entry.expires_at = 0
+    entry.last_access = now
+    entry.state = 1
+    s.len += 1
+
+    # Track initial memory (key + empty list struct)
+    s.used_memory += entry_memory(entry)
+
+    return list
+
+# Helper: Get existing list for key (read-only). Returns null if not found or wrong type.
+fn store_get_list(s: *Store, key: StrView) -> *List
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null  # Expired
+                if entry.value_type == VALUE_LIST
+                    return entry.value_ptr as *List
+                return null  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# LPUSH: Push value(s) to head of list. Returns new length.
+# Creates list if key doesn't exist.
+pub fn store_lpush(s: *Store, key: StrView, value: StrView) -> i64
+    let list: *List = store_get_or_create_list(s, key)
+    if list == null
+        return -1  # Key exists with wrong type
+    return list_lpush(list, value)
+
+# RPUSH: Push value(s) to tail of list. Returns new length.
+# Creates list if key doesn't exist.
+pub fn store_rpush(s: *Store, key: StrView, value: StrView) -> i64
+    let list: *List = store_get_or_create_list(s, key)
+    if list == null
+        return -1  # Key exists with wrong type
+    return list_rpush(list, value)
+
+# LPOP: Remove and return head element. Returns owned string (caller drops).
+# Returns empty string if key doesn't exist or is empty.
+pub fn store_lpop(s: *Store, key: StrView) -> String
+    let list: *List = store_get_list(s, key)
+    if list == null
+        return string_new()
+    return list_lpop(list)
+
+# RPOP: Remove and return tail element. Returns owned string (caller drops).
+# Returns empty string if key doesn't exist or is empty.
+pub fn store_rpop(s: *Store, key: StrView) -> String
+    let list: *List = store_get_list(s, key)
+    if list == null
+        return string_new()
+    return list_rpop(list)
+
+# LLEN: Get length of list. Returns 0 if key doesn't exist.
+# Returns -1 if key exists with wrong type.
+pub fn store_llen(s: *Store, key: StrView) -> i64
+    # First check if key exists with wrong type
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0  # Key not found
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Expired
+                if entry.value_type == VALUE_LIST
+                    let list: *List = entry.value_ptr as *List
+                    return list.len
+                return -1  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# LINDEX: Get element at index. Returns borrowed pointer, null if out of bounds.
+# Negative indices: -1 = last, -2 = second to last, etc.
+pub fn store_lindex(s: *Store, key: StrView, index: i64) -> *u8
+    let list: *List = store_get_list(s, key)
+    if list == null
+        return null
+    return list_index(list, index)
+
+# LRANGE: Get elements from start to stop (inclusive). Returns array of borrowed pointers.
+# Negative indices supported. Out of range indices are clamped.
+# Caller must free the returned array (but not the strings - they're borrowed).
+# Returns count via out parameter.
+pub fn store_lrange(s: *Store, key: StrView, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+
+    let list: *List = store_get_list(s, key)
+    if list == null || list.len == 0
+        return null
+
+    # Normalize indices
+    var s_idx: i64 = start
+    var e_idx: i64 = stop
+
+    if s_idx < 0
+        s_idx = list.len + s_idx
+    if e_idx < 0
+        e_idx = list.len + e_idx
+
+    # Clamp to valid range
+    if s_idx < 0
+        s_idx = 0
+    if e_idx >= list.len
+        e_idx = list.len - 1
+    if s_idx > e_idx
+        return null
+
+    let count: i64 = e_idx - s_idx + 1
+    let result: **u8 = malloc(count * 8) as **u8  # Array of pointers
+
+    # Traverse to start
+    var node: *ListNode = list.head
+    var i: i64 = 0
+    while i < s_idx
+        node = node.next
+        i += 1
+
+    # Collect elements
+    var j: i64 = 0
+    while j < count && node != null
+        *(result + j) = string_as_ptr(@&node.value)
+        node = node.next
+        j += 1
+
+    *out_count = count
+    return result
+
+# List wrappers
+pub fn store_lpush_cstr(s: *Store, key: *u8, value: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    return store_lpush(s, key_sv, val_sv)
+
+pub fn store_rpush_cstr(s: *Store, key: *u8, value: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var val_sv: StrView = strview_from_cstr(value)
+    return store_rpush(s, key_sv, val_sv)
+
+pub fn store_lpop_cstr(s: *Store, key: *u8) -> String
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_lpop(s, key_sv)
+
+pub fn store_rpop_cstr(s: *Store, key: *u8) -> String
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_rpop(s, key_sv)
+
+pub fn store_llen_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_llen(s, key_sv)
+
+pub fn store_lindex_cstr(s: *Store, key: *u8, idx: i64) -> *u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_lindex(s, key_sv, idx)
+
+pub fn store_lrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_lrange(s, key_sv, start, stop, out_count)

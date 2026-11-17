@@ -1,0 +1,659 @@
+# lib/store_zset.ritz - Tome sorted set values
+#
+# Skip list sorted set operations and the store_z* commands on a Store.
+
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.drop
+import ritzlib.sys
+import tome.store_types
+import tome.store
+
+# ============================================================================
+# Sorted Set Operations
+# ============================================================================
+
+# Simple pseudo-random number generator for skip list levels
+var zset_rand_seed: u64 = 12345
+
+fn zset_rand() -> u64
+    # Linear congruential generator
+    zset_rand_seed = zset_rand_seed * 1103515245 + 12345
+    return zset_rand_seed
+
+# Generate a random level for a new skip list node
+fn zset_random_level() -> i32
+    var level: i32 = 1
+    # Probability P = 0.25 means we promote with 25% chance
+    # We use (rand() & 0xFFFF) < (0xFFFF * 0.25)
+    while (zset_rand() & 0xFFFF) < 16383 && level < ZSET_MAX_LEVEL
+        level += 1
+    return level
+
+# Create a new skip list node
+fn zset_create_node(level: i32, member: *u8, score: i64) -> *ZSetNode
+    let node: *ZSetNode = malloc(sizeof(ZSetNode)) as *ZSetNode
+    node.member = string_from_cstr(member)
+    node.score = score
+    node.level = level
+    # Allocate forward array
+    node.forward = malloc(level * 8) as **ZSetNode
+    for i in 0..level
+        node.forward[i] = null
+    return node
+
+# Create a new sorted set
+fn zset_new() -> *ZSet
+    let zset: *ZSet = malloc(sizeof(ZSet)) as *ZSet
+    zset.level = 1
+    zset.len = 0
+
+    # Create header node (sentinel)
+    zset.header = malloc(sizeof(ZSetNode)) as *ZSetNode
+    zset.header.score = 0
+    zset.header.level = ZSET_MAX_LEVEL
+    zset.header.forward = malloc(ZSET_MAX_LEVEL * 8) as **ZSetNode
+    for i in 0..ZSET_MAX_LEVEL
+        zset.header.forward[i] = null
+
+    # Initialize hash table
+    zset.hash_cap = 16
+    zset.hash_tombstones = 0
+    zset.hash_entries = malloc(zset.hash_cap * sizeof(ZSetHashEntry)) as *ZSetHashEntry
+    for i in 0..zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + i
+        entry.state = 0
+        entry.node = null
+
+    return zset
+
+# Find slot in hash table
+fn zset_hash_find_slot(zset: *ZSet, member: *u8) -> i64
+    let h: u64 = hash_cstr(member)
+    let mask: i64 = zset.hash_cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+        if entry.state == 0  # EMPTY
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_cstr(@entry.member, member)
+                return idx  # Found!
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# Grow hash table
+fn zset_hash_grow(zset: *ZSet)
+    let old_entries: *ZSetHashEntry = zset.hash_entries
+    let old_cap: i64 = zset.hash_cap
+
+    let new_cap: i64 = old_cap * 2
+    zset.hash_entries = malloc(new_cap * sizeof(ZSetHashEntry)) as *ZSetHashEntry
+    zset.hash_cap = new_cap
+    zset.hash_tombstones = 0
+
+    for i in 0..new_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + i
+        entry.state = 0
+        entry.node = null
+
+    # Rehash (count reset since we're rebuilding)
+    var count: i64 = 0
+    for i in 0..old_cap
+        let old_entry: *ZSetHashEntry = old_entries + i
+        if old_entry.state == 1
+            let new_idx: i64 = zset_hash_find_slot(zset, string_as_ptr(@&old_entry.member))
+            let new_entry: *ZSetHashEntry = zset.hash_entries + new_idx
+            new_entry.member = old_entry.member  # Move ownership
+            new_entry.node = old_entry.node
+            new_entry.state = 1
+            count += 1
+
+    free(old_entries as *u8)
+
+# Get node from hash table
+fn zset_hash_get(zset: *ZSet, member: *u8) -> *ZSetNode
+    let h: u64 = hash_cstr(member)
+    let mask: i64 = zset.hash_cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.member, member)
+                return entry.node
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# Add or update member in hash table
+fn zset_hash_set(zset: *ZSet, member: *u8, node: *ZSetNode)
+    # Check load factor
+    let load: i64 = (zset.len + zset.hash_tombstones + 1) * 100 / zset.hash_cap
+    if load > 75
+        zset_hash_grow(zset)
+
+    let idx: i64 = zset_hash_find_slot(zset, member)
+    let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+    if entry.state == 1  # Update existing
+        entry.node = node
+    else
+        if entry.state == 2
+            zset.hash_tombstones -= 1
+        entry.member = string_from_cstr(member)
+        entry.node = node
+        entry.state = 1
+
+# Remove member from hash table
+fn zset_hash_remove(zset: *ZSet, member: *u8)
+    let h: u64 = hash_cstr(member)
+    let mask: i64 = zset.hash_cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < zset.hash_cap
+        let entry: *ZSetHashEntry = zset.hash_entries + idx
+
+        if entry.state == 0
+            return  # Not found
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.member, member)
+                string_drop(@&entry.member)
+                entry.state = 2  # TOMBSTONE
+                zset.hash_tombstones += 1
+                return
+
+        idx = (idx + 1) & mask
+        i += 1
+
+# Compare (score, member) pairs for ordering
+# Returns: -1 if a < b, 0 if equal, 1 if a > b
+fn zset_compare(score_a: i64, member_a: *u8, score_b: i64, member_b: *u8) -> i32
+    if score_a < score_b
+        return -1
+    if score_a > score_b
+        return 1
+    # Scores equal - compare lexicographically
+    return strcmp(member_a, member_b)
+
+# Add member with score to sorted set. Returns 1 if added, 0 if updated.
+pub fn zset_add(zset: *ZSet, member: *u8, score: i64) -> i32
+    # Check if member already exists
+    let existing: *ZSetNode = zset_hash_get(zset, member)
+    if existing != null
+        # Member exists - need to update score
+        if existing.score == score
+            return 0  # No change
+
+        # Need to remove and re-insert with new score
+        zset_remove(zset, member)
+
+    # Find insert position using skip list
+    var update: [16]*ZSetNode  # ZSET_MAX_LEVEL
+    var x: *ZSetNode = zset.header
+
+    var i: i32 = zset.level - 1
+    while i >= 0
+        while x.forward[i] != null
+            let cmp: i32 = zset_compare(x.forward[i].score, string_as_ptr(@&x.forward[i].member), score, member)
+            if cmp >= 0
+                break
+            x = x.forward[i]
+        update[i] = x
+        i -= 1
+
+    # Create new node with random level
+    let level: i32 = zset_random_level()
+    let new_node: *ZSetNode = zset_create_node(level, member, score)
+
+    # Update skip list level if needed
+    if level > zset.level
+        var j: i32 = zset.level
+        while j < level
+            update[j] = zset.header
+            j += 1
+        zset.level = level
+
+    # Insert node at each level
+    var k: i32 = 0
+    while k < level
+        new_node.forward[k] = update[k].forward[k]
+        update[k].forward[k] = new_node
+        k += 1
+
+    zset.len += 1
+
+    # Add to hash table
+    zset_hash_set(zset, member, new_node)
+
+    if existing != null
+        return 0  # Updated
+    return 1  # Added
+
+# Remove member from sorted set. Returns 1 if removed, 0 if not found.
+pub fn zset_remove(zset: *ZSet, member: *u8) -> i32
+    # Find the node
+    let node: *ZSetNode = zset_hash_get(zset, member)
+    if node == null
+        return 0
+
+    let score: i64 = node.score
+
+    # Find position in skip list
+    var update: [16]*ZSetNode
+    var x: *ZSetNode = zset.header
+
+    var i: i32 = zset.level - 1
+    while i >= 0
+        while x.forward[i] != null
+            let cmp: i32 = zset_compare(x.forward[i].score, string_as_ptr(@&x.forward[i].member), score, member)
+            if cmp >= 0
+                break
+            x = x.forward[i]
+        update[i] = x
+        i -= 1
+
+    # Verify we found the right node
+    x = x.forward[0]
+    if x == null || not string_eq_cstr(@x.member, member)
+        return 0  # Not found (shouldn't happen if hash lookup succeeded)
+
+    # Remove from skip list at each level
+    var k: i32 = 0
+    while k < zset.level
+        if update[k].forward[k] == x
+            update[k].forward[k] = x.forward[k]
+        k += 1
+
+    # Update skip list level
+    while zset.level > 1 && zset.header.forward[zset.level - 1] == null
+        zset.level -= 1
+
+    # Remove from hash table
+    zset_hash_remove(zset, member)
+
+    # Free node
+    string_drop(@&x.member)
+    free(x.forward as *u8)
+    free(x as *u8)
+
+    zset.len -= 1
+    return 1
+
+# Get score for member. Returns score via out param, returns 1 if found, 0 if not.
+pub fn zset_score(zset: *ZSet, member: *u8, out_score: @&i64) -> i32
+    let node: *ZSetNode = zset_hash_get(zset, member)
+    if node == null
+        return 0
+    *out_score = node.score
+    return 1
+
+# Get rank of member (0-indexed, lowest score = 0). Returns -1 if not found.
+pub fn zset_rank(zset: *ZSet, member: *u8) -> i64
+    let target: *ZSetNode = zset_hash_get(zset, member)
+    if target == null
+        return -1
+
+    let score: i64 = target.score
+
+    # Count nodes before this one
+    var rank: i64 = 0
+    var x: *ZSetNode = zset.header.forward[0]
+
+    while x != null
+        let cmp: i32 = zset_compare(x.score, string_as_ptr(@&x.member), score, member)
+        if cmp == 0
+            return rank
+        if cmp > 0
+            break  # Shouldn't happen
+        rank += 1
+        x = x.forward[0]
+
+    return -1  # Not found
+
+# Get reverse rank (highest score = 0). Returns -1 if not found.
+pub fn zset_revrank(zset: *ZSet, member: *u8) -> i64
+    let rank: i64 = zset_rank(zset, member)
+    if rank < 0
+        return -1
+    return zset.len - 1 - rank
+
+# Get length
+pub fn zset_len(zset: *ZSet) -> i64
+    if zset == null
+        return 0
+    return zset.len
+
+# Get range by rank [start, stop] (inclusive, 0-indexed).
+# Returns array of borrowed member pointers. Caller must free array.
+pub fn zset_range(zset: *ZSet, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    if zset == null || zset.len == 0
+        return null
+
+    # Normalize indices
+    var s_idx: i64 = start
+    var e_idx: i64 = stop
+
+    if s_idx < 0
+        s_idx = zset.len + s_idx
+    if e_idx < 0
+        e_idx = zset.len + e_idx
+
+    # Clamp
+    if s_idx < 0
+        s_idx = 0
+    if e_idx >= zset.len
+        e_idx = zset.len - 1
+    if s_idx > e_idx
+        return null
+
+    let count: i64 = e_idx - s_idx + 1
+    let result: **u8 = malloc(count * 8) as **u8
+
+    # Skip to start position
+    var node: *ZSetNode = zset.header.forward[0]
+    var i: i64 = 0
+    while i < s_idx && node != null
+        node = node.forward[0]
+        i += 1
+
+    # Collect elements
+    var j: i64 = 0
+    while j < count && node != null
+        *(result + j) = string_as_ptr(@&node.member)
+        node = node.forward[0]
+        j += 1
+
+    *out_count = j
+    return result
+
+# Get reverse range by rank [start, stop] (highest scores first).
+# Returns array of borrowed member pointers. Caller must free array.
+pub fn zset_revrange(zset: *ZSet, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    if zset == null || zset.len == 0
+        return null
+
+    # Normalize indices (in reverse order)
+    var s_idx: i64 = start
+    var e_idx: i64 = stop
+
+    if s_idx < 0
+        s_idx = zset.len + s_idx
+    if e_idx < 0
+        e_idx = zset.len + e_idx
+
+    # Clamp
+    if s_idx < 0
+        s_idx = 0
+    if e_idx >= zset.len
+        e_idx = zset.len - 1
+    if s_idx > e_idx
+        return null
+
+    let count: i64 = e_idx - s_idx + 1
+
+    # Get forward range and reverse it
+    # Forward indices: from (len - 1 - stop) to (len - 1 - start)
+    let fwd_start: i64 = zset.len - 1 - e_idx
+    let fwd_stop: i64 = zset.len - 1 - s_idx
+
+    var fwd_count: i64 = 0
+    let fwd: **u8 = zset_range(zset, fwd_start, fwd_stop, @&fwd_count)
+    if fwd == null
+        return null
+
+    # Reverse the array
+    let result: **u8 = malloc(count * 8) as **u8
+    var i: i64 = 0
+    while i < fwd_count
+        *(result + i) = *(fwd + (fwd_count - 1 - i))
+        i += 1
+
+    free(fwd as *u8)
+    *out_count = fwd_count
+    return result
+
+# ============================================================================
+# Store Sorted Set Operations
+# ============================================================================
+
+# Helper: Get or create zset for key. Returns null if key exists with wrong type.
+fn store_get_or_create_zset(s: *Store, key: StrView) -> *ZSet
+    # Check load factor
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return null
+
+    let entry: *Entry = s.entries + idx
+
+    if entry.state == 1  # Occupied
+        if entry.value_type == VALUE_ZSET
+            return entry.value_ptr as *ZSet
+        return null  # Wrong type
+
+    # Create new zset
+    let zset: *ZSet = zset_new()
+
+    if entry.state == 2  # Was tombstone
+        s.tombstones -= 1
+
+    entry.key = string_from_strview(key)
+    entry.value_ptr = zset as *u8
+    entry.value_type = VALUE_ZSET
+    entry.expires_at = 0
+    entry.state = 1
+    s.len += 1
+
+    return zset
+
+# Helper: Get existing zset for key. Returns null if not found or wrong type.
+fn store_get_zset(s: *Store, key: StrView) -> *ZSet
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null  # Expired
+                if entry.value_type == VALUE_ZSET
+                    return entry.value_ptr as *ZSet
+                return null  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# ZADD: Add member with score. Returns 1 if added, 0 if updated.
+# Creates zset if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_zadd(s: *Store, key: StrView, score: i64, member: StrView) -> i64
+    let zset: *ZSet = store_get_or_create_zset(s, key)
+    if zset == null
+        return -1  # Key exists with wrong type
+    return zset_add(zset, strview_as_ptr(member), score) as i64
+
+# ZREM: Remove member. Returns 1 if removed, 0 if not found.
+# Returns -1 if key exists with wrong type.
+pub fn store_zrem(s: *Store, key: StrView, member: StrView) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        # Check if wrong type
+        let h: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (h as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                return 0
+            if entry.state == 1
+                if tome_string_eq_strview(@entry.key, key) == 1
+                    return -1  # Wrong type
+            idx = (idx + 1) & mask
+            i += 1
+        return 0
+    return zset_remove(zset, strview_as_ptr(member)) as i64
+
+# ZSCORE: Get score for member. Returns 1 if found (score in out param), 0 if not.
+pub fn store_zscore(s: *Store, key: StrView, member: StrView, out_score: @&i64) -> i32
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return 0
+    return zset_score(zset, strview_as_ptr(member), out_score)
+
+# ZRANK: Get rank of member (0-indexed). Returns -1 if not found.
+# Returns -2 if key exists with wrong type.
+pub fn store_zrank(s: *Store, key: StrView, member: StrView) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        # Check if wrong type
+        let h: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (h as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                return -1
+            if entry.state == 1
+                if tome_string_eq_strview(@entry.key, key) == 1
+                    return -2  # Wrong type
+            idx = (idx + 1) & mask
+            i += 1
+        return -1
+    return zset_rank(zset, strview_as_ptr(member))
+
+# ZREVRANK: Get reverse rank (highest score = 0). Returns -1 if not found.
+pub fn store_zrevrank(s: *Store, key: StrView, member: StrView) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return -1
+    return zset_revrank(zset, strview_as_ptr(member))
+
+# ZCARD: Get cardinality. Returns 0 if key doesn't exist, -1 if wrong type.
+pub fn store_zcard(s: *Store, key: StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0
+                if entry.value_type == VALUE_ZSET
+                    let zset: *ZSet = entry.value_ptr as *ZSet
+                    return zset.len
+                return -1  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# ZRANGE: Get range by rank. Returns array of borrowed pointers.
+pub fn store_zrange(s: *Store, key: StrView, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return null
+    return zset_range(zset, start, stop, out_count)
+
+# ZREVRANGE: Get reverse range by rank. Returns array of borrowed pointers.
+pub fn store_zrevrange(s: *Store, key: StrView, start: i64, stop: i64, out_count: @&i64) -> **u8
+    *out_count = 0
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return null
+    return zset_revrange(zset, start, stop, out_count)
+
+# ZSet wrappers
+pub fn store_zadd_cstr(s: *Store, key: *u8, score: i64, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zadd(s, key_sv, score, member_sv)
+
+pub fn store_zrem_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zrem(s, key_sv, member_sv)
+
+pub fn store_zscore_cstr(s: *Store, key: *u8, member: *u8, out_score: @&i64) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zscore(s, key_sv, member_sv, out_score)
+
+pub fn store_zrank_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zrank(s, key_sv, member_sv)
+
+pub fn store_zrevrank_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_zrevrank(s, key_sv, member_sv)
+
+pub fn store_zcard_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_zcard(s, key_sv)
+
+pub fn store_zrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_zrange(s, key_sv, start, stop, out_count)
+
+pub fn store_zrevrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_zrevrange(s, key_sv, start, stop, out_count)

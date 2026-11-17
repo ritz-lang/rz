@@ -1,0 +1,469 @@
+# lib/store_set.ritz - Tome set values
+#
+# Hash set operations and the store_s* commands on a Store.
+
+import ritzlib.memory
+import ritzlib.hash
+import ritzlib.str
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.drop
+import ritzlib.sys
+import tome.store_types
+import tome.store
+
+# ============================================================================
+# Set Operations
+# ============================================================================
+
+# Create a new empty set with initial capacity
+fn set_new() -> *Set
+    return set_with_cap(16)
+
+fn set_with_cap(cap: i64) -> *Set
+    let set: *Set = malloc(sizeof(Set)) as *Set
+    set.entries = null
+    set.cap = 0
+    set.len = 0
+    set.tombstones = 0
+
+    # Round up to power of 2
+    var actual_cap: i64 = 16
+    while actual_cap < cap
+        actual_cap *= 2
+
+    let size: i64 = actual_cap * sizeof(SetEntry)
+    set.entries = malloc(size) as *SetEntry
+    set.cap = actual_cap
+
+    # Initialize all entries to empty
+    for i in 0..actual_cap
+        let entry: *SetEntry = set.entries + i
+        entry.state = 0  # EMPTY
+
+    return set
+
+# Find slot for a value in the set
+fn set_find_slot(set: *Set, value: *u8) -> i64
+    let h: u64 = hash_cstr(value)
+    let mask: i64 = set.cap - 1
+    var idx: i64 = (h as i64) & mask
+    var first_tombstone: i64 = -1
+
+    var i: i64 = 0
+    while i < set.cap
+        let entry: *SetEntry = set.entries + idx
+
+        if entry.state == 0  # EMPTY
+            if first_tombstone >= 0
+                return first_tombstone
+            return idx
+
+        if entry.state == 2  # TOMBSTONE
+            if first_tombstone < 0
+                first_tombstone = idx
+
+        if entry.state == 1  # OCCUPIED
+            if string_eq_cstr(@entry.value, value)
+                return idx  # Found!
+
+        # Linear probe
+        idx = (idx + 1) & mask
+        i += 1
+
+    if first_tombstone >= 0
+        return first_tombstone
+    return -1
+
+# Grow the set when load factor exceeds threshold
+fn set_grow(set: *Set)
+    let old_entries: *SetEntry = set.entries
+    let old_cap: i64 = set.cap
+
+    let new_cap: i64 = old_cap * 2
+    let size: i64 = new_cap * sizeof(SetEntry)
+    set.entries = malloc(size) as *SetEntry
+    set.cap = new_cap
+    set.len = 0
+    set.tombstones = 0
+
+    # Initialize new entries to empty
+    for i in 0..new_cap
+        let entry: *SetEntry = set.entries + i
+        entry.state = 0
+
+    # Rehash all occupied entries
+    for i in 0..old_cap
+        let old_entry: *SetEntry = old_entries + i
+        if old_entry.state == 1  # OCCUPIED
+            let new_idx: i64 = set_find_slot(set, string_as_ptr(@&old_entry.value))
+            let new_entry: *SetEntry = set.entries + new_idx
+            new_entry.value = old_entry.value  # Move ownership
+            new_entry.state = 1
+            set.len += 1
+
+    free(old_entries as *u8)
+
+# Add a member to the set. Returns 1 if added, 0 if already present.
+fn set_add(set: *Set, value: *u8) -> i32
+    # Check load factor and resize if needed (> 75%)
+    let load: i64 = (set.len + set.tombstones + 1) * 100 / set.cap
+    if load > 75
+        set_grow(set)
+
+    let idx: i64 = set_find_slot(set, value)
+    if idx < 0
+        return 0
+
+    let entry: *SetEntry = set.entries + idx
+
+    if entry.state == 1  # Already present
+        return 0
+
+    if entry.state == 2  # Was tombstone
+        set.tombstones -= 1
+
+    entry.value = string_from_cstr(value)
+    entry.state = 1
+    set.len += 1
+    return 1
+
+# Remove a member from the set. Returns 1 if removed, 0 if not found.
+fn set_remove(set: *Set, value: *u8) -> i32
+    let h: u64 = hash_cstr(value)
+    let mask: i64 = set.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < set.cap
+        let entry: *SetEntry = set.entries + idx
+
+        if entry.state == 0
+            return 0  # Not found
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.value, value)
+                string_drop(@&entry.value)
+                entry.state = 2  # TOMBSTONE
+                set.len -= 1
+                set.tombstones += 1
+                return 1
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Check if a value is in the set. Returns 1 if present, 0 if not.
+pub fn set_contains(set: *Set, value: *u8) -> i32
+    let h: u64 = hash_cstr(value)
+    let mask: i64 = set.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < set.cap
+        let entry: *SetEntry = set.entries + idx
+
+        if entry.state == 0
+            return 0  # Not found
+
+        if entry.state == 1
+            if string_eq_cstr(@entry.value, value)
+                return 1  # Found
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# Get the number of members in the set
+pub fn set_len(set: *Set) -> i64
+    if set == null
+        return 0
+    return set.len
+
+# Get all members of the set. Returns array of borrowed pointers.
+# Caller must free the returned array (but not the strings - they're borrowed).
+fn set_members(set: *Set, out_count: @&i64) -> **u8
+    *out_count = 0
+    if set == null || set.len == 0
+        return null
+
+    let result: **u8 = malloc(set.len * 8) as **u8
+    var j: i64 = 0
+
+    for i in 0..set.cap
+        let entry: *SetEntry = set.entries + i
+        if entry.state == 1
+            *(result + j) = string_as_ptr(@&entry.value)
+            j += 1
+
+    *out_count = set.len
+    return result
+
+# ============================================================================
+# Store Set Operations
+# ============================================================================
+
+# Helper: Get or create set for key. Returns null if key exists with wrong type.
+fn store_get_or_create_set(s: *Store, key: StrView) -> *Set
+    # Check load factor
+    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
+    if load > 75
+        store_grow(s)
+
+    let idx: i64 = store_find_slot(s, key)
+    if idx < 0
+        return null
+
+    let entry: *Entry = s.entries + idx
+
+    if entry.state == 1  # Occupied
+        if entry.value_type == VALUE_SET
+            return entry.value_ptr as *Set
+        return null  # Wrong type
+
+    # Create new set
+    let set: *Set = set_new()
+    let now: i64 = time_now_secs()
+
+    if entry.state == 2  # Was tombstone
+        s.tombstones -= 1
+
+    entry.key = string_from_strview(key)
+    entry.value_ptr = set as *u8
+    entry.value_type = VALUE_SET
+    entry.expires_at = 0
+    entry.last_access = now
+    entry.state = 1
+    s.len += 1
+
+    # Track initial memory
+    s.used_memory += entry_memory(entry)
+
+    return set
+
+# Helper: Get existing set for key (read-only). Returns null if not found or wrong type.
+fn store_get_set(s: *Store, key: StrView) -> *Set
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return null
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return null  # Expired
+                if entry.value_type == VALUE_SET
+                    return entry.value_ptr as *Set
+                return null  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return null
+
+# SADD: Add member(s) to set. Returns number of elements added.
+# Creates set if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_sadd(s: *Store, key: StrView, member: StrView) -> i64
+    let set: *Set = store_get_or_create_set(s, key)
+    if set == null
+        return -1  # Key exists with wrong type
+    return set_add(set, strview_as_ptr(member)) as i64
+
+# SREM: Remove member(s) from set. Returns number of elements removed.
+# Returns 0 if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_srem(s: *Store, key: StrView, member: StrView) -> i64
+    let set: *Set = store_get_set(s, key)
+    if set == null
+        # Check if key exists with wrong type
+        let h: u64 = hash_strview(key)
+        let mask: i64 = s.cap - 1
+        var idx: i64 = (h as i64) & mask
+        var i: i64 = 0
+        while i < s.cap
+            let entry: *Entry = s.entries + idx
+            if entry.state == 0
+                return 0  # Key not found
+            if entry.state == 1
+                if tome_string_eq_strview(@entry.key, key) == 1
+                    return -1  # Wrong type
+            idx = (idx + 1) & mask
+            i += 1
+        return 0
+    return set_remove(set, strview_as_ptr(member)) as i64
+
+# SISMEMBER: Check if member is in set. Returns 1 if present, 0 if not.
+# Returns 0 if key doesn't exist.
+pub fn store_sismember(s: *Store, key: StrView, member: StrView) -> i32
+    let set: *Set = store_get_set(s, key)
+    if set == null
+        return 0
+    return set_contains(set, strview_as_ptr(member))
+
+# SCARD: Get cardinality (number of members) of set.
+# Returns 0 if key doesn't exist. Returns -1 if key exists with wrong type.
+pub fn store_scard(s: *Store, key: StrView) -> i64
+    let h: u64 = hash_strview(key)
+    let mask: i64 = s.cap - 1
+    var idx: i64 = (h as i64) & mask
+
+    var i: i64 = 0
+    while i < s.cap
+        let entry: *Entry = s.entries + idx
+
+        if entry.state == 0
+            return 0  # Key not found
+
+        if entry.state == 1
+            if tome_string_eq_strview(@entry.key, key) == 1
+                # Check expiration
+                if entry.expires_at > 0
+                    let now: i64 = time_now_secs()
+                    if now >= entry.expires_at
+                        return 0  # Expired
+                if entry.value_type == VALUE_SET
+                    let set: *Set = entry.value_ptr as *Set
+                    return set.len
+                return -1  # Wrong type
+
+        idx = (idx + 1) & mask
+        i += 1
+
+    return 0
+
+# SMEMBERS: Get all members of set. Returns array of borrowed pointers.
+# Caller must free the returned array (but not the strings - they're borrowed).
+pub fn store_smembers(s: *Store, key: StrView, out_count: @&i64) -> **u8
+    *out_count = 0
+    let set: *Set = store_get_set(s, key)
+    if set == null
+        return null
+    return set_members(set, out_count)
+
+# SUNION: Return union of two sets as a new Set.
+# Returns a new Set that caller must free with set_drop().
+# Returns null if both sets don't exist.
+pub fn store_sunion(s: *Store, key1: StrView, key2: StrView) -> *Set
+    let set1: *Set = store_get_set(s, key1)
+    let set2: *Set = store_get_set(s, key2)
+
+    # If both null, return null
+    if set1 == null && set2 == null
+        return null
+
+    # Create result set for union
+    var result_set: *Set = set_new()
+
+    # Add all from set1
+    if set1 != null
+        for i in 0..set1.cap
+            let entry: *SetEntry = set1.entries + i
+            if entry.state == 1
+                set_add(result_set, string_as_ptr(@&entry.value))
+
+    # Add all from set2
+    if set2 != null
+        for i in 0..set2.cap
+            let entry: *SetEntry = set2.entries + i
+            if entry.state == 1
+                set_add(result_set, string_as_ptr(@&entry.value))
+
+    return result_set
+
+# SINTER: Return intersection of two sets as a new Set.
+# Returns a new Set that caller must free with set_drop().
+# Returns null if either set doesn't exist.
+pub fn store_sinter(s: *Store, key1: StrView, key2: StrView) -> *Set
+    let set1: *Set = store_get_set(s, key1)
+    let set2: *Set = store_get_set(s, key2)
+
+    # If either null, intersection is empty
+    if set1 == null || set2 == null
+        return null
+
+    # Create result set for intersection
+    var result_set: *Set = set_new()
+
+    # Add items from set1 that are also in set2
+    for i in 0..set1.cap
+        let entry: *SetEntry = set1.entries + i
+        if entry.state == 1
+            if set_contains(set2, string_as_ptr(@&entry.value)) == 1
+                set_add(result_set, string_as_ptr(@&entry.value))
+
+    return result_set
+
+# SDIFF: Return set difference (set1 - set2) as a new Set.
+# Returns a new Set that caller must free with set_drop().
+# Returns null if set1 doesn't exist.
+pub fn store_sdiff(s: *Store, key1: StrView, key2: StrView) -> *Set
+    let set1: *Set = store_get_set(s, key1)
+    let set2: *Set = store_get_set(s, key2)
+
+    # If set1 null, difference is empty
+    if set1 == null
+        return null
+
+    # Create result set for difference
+    var result_set: *Set = set_new()
+
+    # Add items from set1 that are NOT in set2
+    for i in 0..set1.cap
+        let entry: *SetEntry = set1.entries + i
+        if entry.state == 1
+            var in_set2: i32 = 0
+            if set2 != null
+                in_set2 = set_contains(set2, string_as_ptr(@&entry.value))
+            if in_set2 == 0
+                set_add(result_set, string_as_ptr(@&entry.value))
+
+    return result_set
+
+# Set wrappers
+pub fn store_sadd_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_sadd(s, key_sv, member_sv)
+
+pub fn store_srem_cstr(s: *Store, key: *u8, member: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_srem(s, key_sv, member_sv)
+
+pub fn store_sismember_cstr(s: *Store, key: *u8, member: *u8) -> i32
+    var key_sv: StrView = strview_from_cstr(key)
+    var member_sv: StrView = strview_from_cstr(member)
+    return store_sismember(s, key_sv, member_sv)
+
+pub fn store_scard_cstr(s: *Store, key: *u8) -> i64
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_scard(s, key_sv)
+
+pub fn store_smembers_cstr(s: *Store, key: *u8, out_count: @&i64) -> **u8
+    var key_sv: StrView = strview_from_cstr(key)
+    return store_smembers(s, key_sv, out_count)
+
+pub fn store_sunion_cstr(s: *Store, key1: *u8, key2: *u8) -> *Set
+    var k1_sv: StrView = strview_from_cstr(key1)
+    var k2_sv: StrView = strview_from_cstr(key2)
+    return store_sunion(s, k1_sv, k2_sv)
+
+pub fn store_sinter_cstr(s: *Store, key1: *u8, key2: *u8) -> *Set
+    var k1_sv: StrView = strview_from_cstr(key1)
+    var k2_sv: StrView = strview_from_cstr(key2)
+    return store_sinter(s, k1_sv, k2_sv)
+
+pub fn store_sdiff_cstr(s: *Store, key1: *u8, key2: *u8) -> *Set
+    var k1_sv: StrView = strview_from_cstr(key1)
+    var k2_sv: StrView = strview_from_cstr(key2)
+    return store_sdiff(s, k1_sv, k2_sv)
