@@ -1175,6 +1175,11 @@ pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, ou
             cand_len = lent.type_name_len
         else
             resolve_expr_struct_name(s, base.operand, @cand, @cand_len)
+        # AGAST #2544: `*@g` / `*((@g) + k)` with a by-value struct global
+        # `var g: S` (or `G<T>`, recorded as its instance `G$T`).
+        # resolve_expr_struct_name types locals only, so this loaded i64.
+        if cand == null
+            addr_global_struct_name(s, base.operand, @cand, @cand_len)
     else if base.kind == EXPR_MEMBER
         let f: *StructField = member_field_def(s, base)
         if f != null and f.field_type == TYPE_PTR
@@ -1206,6 +1211,14 @@ pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, ou
         # AGAST #3443: and `(x as @&S).f` / `(x as @S).f`.
         cand = base.ident_ptr
         cand_len = base.ident_len
+    else if base.kind == EXPR_IF and base == op
+        # AGAST #2544: `*(if c then p else q)` loads what every arm points
+        # at.  Each arm's value is named as a deref operand of its own; an
+        # arm this can't name, or two arms naming different types, leave the
+        # deref unnamed.  (`(if ..) + k` steps its i64 value one byte:
+        # ptr_arith_elem_size has no arm for an if, so it isn't named here.)
+        if_arms_pointee_name(s, base, out_name, out_len)
+        return
     if cand == null or cand_len <= 0
         return
     # `Option$T` / `Result$T,E` are tagged-enum aggregates, not StructDefs.
@@ -1216,6 +1229,55 @@ pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, ou
             return
     *out_name = cand
     *out_len = cand_len
+
+# AGAST #2544: the struct type of `x` when it names a by-value struct global
+# no local shadows; null otherwise.
+fn addr_global_struct_name(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32)
+    if x == null or x.kind != EXPR_IDENT
+        return
+    if find_local_struct_name(s, x.ident_ptr, x.ident_len) != null
+        return
+    let g: *GlobalVarDef = find_global(s, x.ident_ptr, x.ident_len)
+    if g == null or g.var_type != TYPE_STRUCT or g.type_name_len <= 0
+        return
+    *out_name = g.type_name
+    *out_len = g.type_name_len
+
+# AGAST #2544: 1 when `op` is an if-expression some arm of which points at an
+# aggregate, so a deref of it the arms don't agree on is #1505's located error,
+# not a `load i64` clang rejects.
+fn if_arm_names_pointee(s: *EmitterState, op: *Expr) -> i32
+    if op == null or op.kind != EXPR_IF
+        return 0
+    var arm: *MatchArm = op.args as *MatchArm
+    while arm != null
+        var an: *u8 = null
+        var al: i32 = 0
+        deref_pointee_struct_name(s, arm.body, @an, @al)
+        if al > 0
+            return 1
+        arm = arm.next
+    0
+
+# AGAST #2544: the aggregate every arm of the if-expression `e` points at, as
+# deref_pointee_struct_name names each arm's value; nothing unless all agree.
+fn if_arms_pointee_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    var arm: *MatchArm = e.args as *MatchArm
+    var name: *u8 = null
+    var len: i32 = 0
+    while arm != null
+        var an: *u8 = null
+        var al: i32 = 0
+        deref_pointee_struct_name(s, arm.body, @an, @al)
+        if al <= 0
+            return
+        if len > 0 and (al != len or memcmp(an, name, len as i64) != 0)
+            return
+        name = an
+        len = al
+        arm = arm.next
+    *out_name = name
+    *out_len = len
 
 # AGAST #1488: the address of an lvalue, as a `ptr` register, or -1 when
 # `op` is not an lvalue this emitter can address.  Shared by `@` (OP_ADDR,
@@ -2224,7 +2286,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_reg(s, val32)
             emit_str(s, c" to i64\n")
             return result
-        else if deref_type == TYPE_STRUCT
+        else if deref_type == TYPE_STRUCT or if_arm_names_pointee(s, e.operand) == 1
             # AGAST #1505: the pointee is a struct but deref_pointee_struct_name
             # could not name it.  This used to fall back silently to
             # `load i64`, which clang rejects as soon as the value meets a
