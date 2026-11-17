@@ -476,6 +476,34 @@ fn emit_named_struct_array_member_ptr(s: *EmitterState, e: *Expr, result: *Membe
     emit_member_gep_from_ptr(s, result, elem_ptr, st, fidx, field)
     1
 
+# AGAST #3824: the address of field `e.ident` of the struct const `e.left`,
+# when `e.left` names one that is lowered to a `%S` global: the same gate as
+# emit_expr_ident's load of it (struct_const_global).  Leaves
+# `result.success` 0 for any other const, so the caller's error stands.
+fn emit_struct_const_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
+    let ce: *ConstEntry = struct_const_global(s, e.left)
+    if ce == null
+        return
+    let st: *StructDef = find_struct(s, ce.type_name, ce.type_name_len)
+    if st == null
+        return
+    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return
+    let field_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, field_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c", ptr @")
+    emit_name(s, ce.name, ce.name_len)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, field_idx as i64)
+    emit_str(s, c"\n")
+    result.reg = field_ptr
+    result.field = get_field_type(st, field_idx)
+    result.success = 1
+
 pub fn emit_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
     result.reg = 0
     result.field = null
@@ -553,6 +581,15 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                         let qbase: i32 = emit_load_levels(s, qp, ptr_ptr_ident_levels(glob.inner_pointee_type) - 1)
                         emit_member_gep_from_ptr(s, result, qbase, qst, qfield_idx, get_field_type(qst, qfield_idx))
                         return
+        # AGAST #3824: `K.f` with `const K: StrView = "..."`, a struct const
+        # that emit_const_struct_entry lowers to `@K = internal constant %S`
+        # (#189): GEP the field out of that global, as for a `var g: S`.
+        # mausoleum's `DEFAULT_COLLECTION_NAME.ptr` fell to "unhandled
+        # EXPR_MEMBER" here, so mausoleum and nexus did not build on ritz1.
+        else
+            emit_struct_const_member_ptr(s, e, result)
+            if result.success == 1
+                return
 
     # Recursive case: e.left is another EXPR_MEMBER (nested: a.b.c)
     else if e.left.kind == EXPR_MEMBER

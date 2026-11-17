@@ -106,8 +106,31 @@ fn sema_member_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
         return sema_ty_none(t)
     var r: SemaTy
     if sema_expr_ty(sm, e.left, @r) == TYPE_UNKNOWN
-        return sema_ty_none(t)
+        # AGAST #3824: `K.f` on `const K: StrView = "..."`, a `%S` global the
+        # emitter reads fields out of; `let q = K.ptr + 1` typed nothing.
+        # Only the field: a bare `K` stays unknown, as the emitter's
+        # get_expr_type has it as i64.
+        let ce: *ConstEntry = sema_struct_const(sm, e.left)
+        if ce == null
+            return sema_ty_none(t)
+        sema_ty_set(@r, TYPE_STRUCT, ce.type_name, ce.type_name_len, TYPE_VOID, null)
     sema_field_ty(sm, @r, e.ident_ptr, e.ident_len, t)
+
+# AGAST #3824: the const `id` names, if it is a string-initialised struct
+# const (emitter_core's struct_const_global, over Sema's module); else null.
+fn sema_struct_const(sm: *Sema, id: *Expr) -> *ConstEntry
+    if id == null or id.kind != EXPR_IDENT
+        return null
+    if sema_find_local(sm, id.ident_ptr, id.ident_len) != null
+        return null
+    var c: *ConstEntry = sm.module.constants
+    while c != null
+        if name_eq(c.name, c.name_len, id.ident_ptr, id.ident_len) == 1
+            if c.const_type == TYPE_STRUCT and c.type_name_len > 0 and c.value_expr != null and c.value_expr.kind == EXPR_STRING_LIT
+                return c
+            return null
+        c = c.next
+    null
 
 # The type of field `name` of `r`, a struct or a pointer or reference to one
 # (AGAST #3799 reads it for `s.f[i] = v`, whose target is a field name).

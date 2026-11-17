@@ -203,6 +203,9 @@ NOT_TESTS = {
         "[[test_helper]] fns imported by test_assert_operands.ritz; built with "
         "ritz0 for every cell, so ritz1 cells read call-site globals ritz0 "
         "declared (AGAST #1869)",
+    "test_const_struct_member_lib":
+        "`pub const` StrView imported by test_const_struct_member.ritz, whose "
+        "cells read its fields across modules (AGAST #3824)",
 }
 
 # A failing file's units are run one process each, selected by a one-byte
