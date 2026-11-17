@@ -42,6 +42,8 @@ E2ES = [
     "projects/valet/test/test_framing.sh",
     # AGAST #3900: a >8 KB request answered with a >8 KB response.
     "projects/valet/test/test_large_echo.sh",
+    # AGAST #3899: static 416/403 keep-alive vs close on a live connection.
+    "projects/valet/test/test_static_conn.sh",
     # AGAST #2456: the stack smoke gate, same constraints (needs the debug
     # binaries, real servers, must exit 0 or 1 only). A package run as a
     # directory since #3455: its __main__.py calls cli.main().

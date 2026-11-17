@@ -226,7 +226,9 @@ Shipped — these were listed as "next steps" here long after they landed:
 1. ~~**Routing framework**~~ ✅ `lib/router.ritz` — exact, prefix and parameter patterns
 2. ~~**Static file serving**~~ ✅ `valet_static()` in `lib/valet.ritz`; ETag, range
    and directory-listing tests exist (`test/test_etag.sh`, `test_range.sh`,
-   `test_dirlist.sh`)
+   `test_dirlist.sh`); every static response, 403 and 416 included,
+   says the Connection valet will honour (#2117, #3899,
+   `test/test_static_conn.sh`)
 3. ~~**Middleware**~~ ✅ `valet_use()` / named middleware and before-interceptors
    in `lib/valet.ritz`; `test/test_middleware.sh`
 4. ~~**Compression**~~ ✅ `lib/compress.ritz` via squeeze
