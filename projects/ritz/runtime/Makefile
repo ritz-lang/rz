@@ -8,7 +8,6 @@
 #   ritz_start.<arch>.o        - main(argc, argv)
 #   ritz_start_noargs.<arch>.o - main()
 #   ritz_start_envp.<arch>.o   - main(argc, argv, envp)
-#   start.<arch>.o             - v1 ABI: ritz_start(argc, argv, envp) in Ritz
 # each also in a `.harland.` variant for Harland userspace.
 #
 # The object list is DERIVED from the .ll files on disk rather than

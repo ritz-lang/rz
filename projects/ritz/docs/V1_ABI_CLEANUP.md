@@ -5,6 +5,10 @@ worktree `adele-ritz-task-198`.
 **Driver:** AGAST `#198` (with phase subtasks).
 **Estimated scope:** ~5 days of focused work, hard cutover, single branch.
 
+> **2026-11-17 (AGAST #3913):** the v1 entry path was never wired in. Nothing
+> linked `runtime/start*.x86_64.ll` and nothing imported `ritzlib/entry.ritz`;
+> both were deleted. Packages still start through `runtime/ritz_start*.ll`.
+
 **Sexiness lens:** every decision below was made through "no syntax for the
 common case." `pub fn main()` is the most-written program in any language;
 `println("hi")` is the most-written line. Both must be free of ceremony.

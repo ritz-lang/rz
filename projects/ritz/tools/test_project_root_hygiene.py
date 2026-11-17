@@ -177,10 +177,12 @@ def test_no_compiler_output_ir_tracked():
 
 def test_walk_reads_tracked_files():
     # Guard the walk: if listing or reading broke, the content checks above
-    # would pass vacuously.
-    stub = "projects/ritz/runtime/start.x86_64.ll"
-    assert stub in _tracked_regular_files()
-    assert _head(stub, 6) == b"; Ritz"
+    # would pass vacuously. The sample is the build driver itself: a source
+    # file no cleanup can delete (the runtime shim used here first was
+    # removed by #3913).
+    sample = "projects/ritz/build.py"
+    assert sample in _tracked_regular_files()
+    assert _head(sample, 2) == b"#!"
 
 
 def test_no_tracked_symlink_into_a_build_dir():

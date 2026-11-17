@@ -20,7 +20,6 @@ The rows, each able to fail on its own:
     (each picks a different runtime shim);
   - single-file programs that read `__ritz_envp` directly: ritz0's inline
     `_start` per main shape, and ritz1 linked with each Linux shim;
-  - runtime/start.x86_64.ll (the v1 `ritz_start` ABI), linked with a stub;
   - every runtime/*.ll, Harland's included (they can't run here), stores it.
 """
 
@@ -243,23 +242,6 @@ def test_ritz0_inline_start_sets_ritz_envp(request, tmp_path, arity):
 def test_linux_shim_sets_ritz_envp(request, tmp_path, arity):
     rc = _compile_link_run(
         request, tmp_path, "ritz1", _reads_global(arity), objs=[_shim(SHIMS[arity])]
-    )
-    assert rc == 0
-
-
-V1_ENTRY = """\
-extern var __ritz_envp: **u8
-
-pub fn ritz_start(argc: i32, argv: **u8, envp: **u8) -> i32
-    if envp == null or __ritz_envp != envp
-        return 2
-    return 0
-"""
-
-
-def test_v1_start_shim_sets_ritz_envp(request, tmp_path):
-    rc = _compile_link_run(
-        request, tmp_path, "ritz0", V1_ENTRY, objs=[_shim("start")], no_runtime=True
     )
     assert rc == 0
 

@@ -4,7 +4,7 @@
 > for ritzlib, not what exists. Nothing below has been implemented as described.
 >
 > **Current state:** ritzlib is a flat layout of top-level `.ritz` modules plus a
-> few subdirectories (`async/`, `os/`, `lang/`, `tests/`). For what actually exists
+> few subdirectories (`async/`, `os/`, `tests/`). For what actually exists
 > and its real signatures, use `docs/STDLIB_REFERENCE.md` — it is compile-gated,
 > so its examples cannot drift from the compiler. This document is not gated.
 >
@@ -45,7 +45,6 @@ Currently (as of January 2026), ritzlib is a flat collection of 35 modules:
 - `buf.ritz` - Buffer utilities
 - `elf.ritz` - ELF binary format
 - `drop.ritz` - Drop trait
-- `crt0.ritz` - C runtime initialization
 
 **Tests & validation:**
 - `tests/test_*.ritz` - Module test files

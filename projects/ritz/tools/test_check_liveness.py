@@ -13,7 +13,16 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 import check_liveness
-from check_liveness import ENTRY_POINTS, find_orphans, find_strays, project_files
+from check_liveness import (
+    ENTRY_POINTS,
+    RITZLIB_ALLOWLIST,
+    find_orphans,
+    find_ritzlib_orphans,
+    find_strays,
+    project_files,
+    repo_root,
+    ritzlib_dir,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -21,8 +30,10 @@ pytestmark = pytest.mark.unit
 
 
 def tree(tmp_path, sources):
-    """Write `sources` plus stub entry points; return (root, relative files)."""
+    """Write `sources` plus stub entry points and allowlisted ritzlib modules;
+    return (root, relative files)."""
     entries = {f"ritz0/{e}": "" for e in ENTRY_POINTS}
+    entries.update({f"ritzlib/{m}": "" for m in RITZLIB_ALLOWLIST})
     for rel, text in {**entries, **sources}.items():
         path = tmp_path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,9 +182,156 @@ def test_elf_anywhere_is_a_stray(tmp_path, rel):
 
 
 def test_real_tree_is_live():
-    """The guard. Fails `make tools-unit` when ritz0/ grows an orphan."""
+    """The guard. Fails `make tools-unit` when ritz0/ or ritzlib/ grows an
+    orphan."""
     assert find_orphans(ROOT, project_files(ROOT)) == []
     assert find_strays(ROOT, project_files(ROOT, untracked=False)) == []
+    repo = repo_root(ROOT)
+    assert find_ritzlib_orphans(repo, project_files(repo), ritzlib_dir(ROOT, repo)) == []
+
+
+# --- ritzlib (AGAST #3913) ---------------------------------------------------
+#
+# The same rule one level up: a ritzlib module must be reachable from a
+# non-test .ritz file anywhere in the repo.  #1859 found crt0, entry, meta,
+# async.ritz and lang/* alive only in docs or tests.
+
+LIB = "projects/ritz/ritzlib"
+
+
+def lib_orphans(tmp_path, sources, allow=None):
+    for rel, text in sources.items():
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    return find_ritzlib_orphans(tmp_path, sorted(sources), LIB, {} if allow is None else allow)
+
+
+def test_ritzlib_module_nothing_imports_is_an_orphan(tmp_path):
+    assert lib_orphans(tmp_path, {f"{LIB}/crt0.ritz": ""}) == [f"{LIB}/crt0.ritz"]
+
+
+@pytest.mark.parametrize("importer", [
+    "projects/valet/src/main.ritz",
+    "projects/ritz/ritz1/src/main.ritz",
+    "projects/ritz/examples/tier1_basics/03_echo/src/main.ritz",
+])
+def test_ritzlib_module_with_a_production_importer_is_live(tmp_path, importer):
+    assert lib_orphans(tmp_path, {
+        importer: "import ritzlib.sys\n",
+        f"{LIB}/sys.ritz": "",
+    }) == []
+
+
+@pytest.mark.parametrize("line", [
+    "import ritzlib.span\n",
+    "pub import ritzlib.span\n",
+    "import ritzlib.span { Span, span_from_ptr }\n",
+    "import ritzlib.span as sp\n",
+    "    import ritzlib.span\n",
+])
+def test_ritzlib_import_forms(tmp_path, line):
+    assert lib_orphans(tmp_path, {
+        "projects/http/lib/a.ritz": line,
+        f"{LIB}/span.ritz": "",
+    }) == []
+
+
+def test_ritzlib_nested_module_path(tmp_path):
+    """`ritzlib.async.tasks` is async/tasks.ritz; its sibling stays dead."""
+    assert lib_orphans(tmp_path, {
+        "projects/valet/src/main.ritz": "import ritzlib.async.tasks\n",
+        f"{LIB}/async/tasks.ritz": "",
+        f"{LIB}/async/blocking_fs.ritz": "",
+    }) == [f"{LIB}/async/blocking_fs.ritz"]
+
+
+def test_ritzlib_liveness_is_transitive(tmp_path):
+    assert lib_orphans(tmp_path, {
+        "projects/valet/src/main.ritz": "import ritzlib.io\n",
+        f"{LIB}/io.ritz": "import ritzlib.sys\n",
+        f"{LIB}/sys.ritz": "",
+    }) == []
+
+
+def test_ritzlib_orphans_importing_each_other_are_still_orphans(tmp_path):
+    assert lib_orphans(tmp_path, {
+        f"{LIB}/entry.ritz": "import ritzlib.span\n",
+        f"{LIB}/span.ritz": "import ritzlib.entry\n",
+    }) == [f"{LIB}/entry.ritz", f"{LIB}/span.ritz"]
+
+
+@pytest.mark.parametrize("importer", [
+    f"{LIB}/tests/test_heap.ritz",
+    "projects/ritz/ritz0/test/heap_fixture.ritz",
+    "projects/valet/test/test_x.ritz",
+    "projects/ritz/examples/tier5_async/82_heap/test/test_main.ritz",
+    "projects/goliath/tests/integration.ritz",
+])
+def test_ritzlib_test_importer_does_not_keep_a_module_alive(tmp_path, importer):
+    """lang/lexer's one importer was a test (#1859)."""
+    assert lib_orphans(tmp_path, {
+        importer: "import ritzlib.heap\n",
+        f"{LIB}/heap.ritz": "",
+    }) == [f"{LIB}/heap.ritz"]
+
+
+@pytest.mark.parametrize("importer", [
+    "projects/larb/review/snapshot/main.ritz",
+    "projects/ritz/docs/archive/old/main.ritz",
+    "archive/spectree/lib/types.ritz",
+])
+def test_ritzlib_archived_importer_does_not_count(tmp_path, importer):
+    assert lib_orphans(tmp_path, {
+        importer: "import ritzlib.heap\n",
+        f"{LIB}/heap.ritz": "",
+    }) == [f"{LIB}/heap.ritz"]
+
+
+def test_ritzlib_commented_out_import_does_not_count(tmp_path):
+    assert lib_orphans(tmp_path, {
+        "projects/harland/user/lib.ritz": "#   import ritzlib.heap { a }\n",
+        f"{LIB}/heap.ritz": "",
+    }) == [f"{LIB}/heap.ritz"]
+
+
+def test_ritzlib_import_named_only_in_a_doc_does_not_count(tmp_path):
+    """STDLIB_REFERENCE.md showed `import ritzlib.heap` while nothing used it."""
+    assert lib_orphans(tmp_path, {
+        "projects/ritz/docs/STDLIB_REFERENCE.md": "```ritz\nimport ritzlib.heap\n```\n",
+        f"{LIB}/heap.ritz": "",
+    }) == [f"{LIB}/heap.ritz"]
+
+
+def test_ritzlib_allowlisted_orphan_passes_and_keeps_its_imports_alive(tmp_path):
+    assert lib_orphans(tmp_path, {
+        f"{LIB}/testlib.ritz": "import ritzlib.str\n",
+        f"{LIB}/str.ritz": "",
+    }, allow={"testlib.ritz": "test helpers"}) == []
+
+
+def test_ritzlib_allowlisted_module_that_is_missing_is_reported(tmp_path):
+    assert lib_orphans(tmp_path, {}, allow={"gone.ritz": "why"}) == [
+        f"{LIB}/gone.ritz (allowlisted module is missing)"]
+
+
+def test_ritzlib_allowlisted_module_that_became_live_is_reported(tmp_path):
+    """A stale entry would silently cover the module if it died again."""
+    assert lib_orphans(tmp_path, {
+        "projects/valet/src/main.ritz": "import ritzlib.ptr\n",
+        f"{LIB}/ptr.ritz": "",
+    }, allow={"ptr.ritz": "why"}) == [
+        f"{LIB}/ptr.ritz (allowlisted but has a production importer; drop the entry)"]
+
+
+def test_ritzlib_tests_package_is_not_a_module(tmp_path):
+    """ritzlib/tests/ is its own package of test files, not library modules."""
+    assert lib_orphans(tmp_path, {f"{LIB}/tests/helper.ritz": ""}) == []
+
+
+def test_ritzlib_allowlist_entries_each_have_a_reason():
+    assert RITZLIB_ALLOWLIST
+    assert all(reason.strip() for reason in RITZLIB_ALLOWLIST.values())
 
 
 def test_entry_points_each_have_a_reason():
@@ -213,3 +371,24 @@ def test_cli_goes_red_on_a_planted_tracked_elf(tmp_path):
     tracked = subprocess.run(tool, capture_output=True, text=True)
     assert tracked.returncode == 1
     assert "ritz1/ritz1_new" in tracked.stdout
+
+
+@pytest.mark.integration
+def test_cli_goes_red_on_a_planted_ritzlib_orphan(tmp_path):
+    """End to end (AGAST #3913): a ritzlib module only a test imports fails;
+    a production importer anywhere in the repo clears it."""
+    root, _ = tree(tmp_path, {})
+    subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+    tool = [sys.executable, check_liveness.__file__, "--root", str(root)]
+
+    (root / "ritzlib/crt0.ritz").write_text("")
+    (root / "ritzlib/tests").mkdir()
+    (root / "ritzlib/tests/test_crt0.ritz").write_text("import ritzlib.crt0\n")
+    planted = subprocess.run(tool, capture_output=True, text=True, check=False)
+    assert planted.returncode == 1
+    assert "ritzlib/crt0.ritz: no production importer" in planted.stdout
+
+    (root / "examples/x/src").mkdir(parents=True)
+    (root / "examples/x/src/main.ritz").write_text("import ritzlib.crt0\n")
+    cleared = subprocess.run(tool, capture_output=True, text=True, check=False)
+    assert cleared.returncode == 0, cleared.stdout + cleared.stderr

@@ -19,11 +19,17 @@ Also rejects tracked editor and merge backups (*.orig, *.old) and tracked ELF
 binaries anywhere under projects/ritz, which no import graph would see.  The ELF
 check covered only ritz0/ until AGAST #3447 found ritz1/ritz1_new tracked.
 
+The same rule covers ritzlib/ (AGAST #3913): every ritzlib module must be
+reachable from a non-test .ritz file anywhere in the repo, through `import
+ritzlib.x` lines.  #1859 found crt0, entry, meta, async.ritz and lang/* kept
+alive only by docs and tests.  RITZLIB_ALLOWLIST names the exceptions.
+
 Runs in `make tools-unit` through test_check_liveness.py::test_real_tree_is_live.
 """
 
 import argparse
 import ast
+import re
 import subprocess
 import sys
 from pathlib import Path, PurePosixPath
@@ -45,6 +51,26 @@ ENTRY_POINTS = {
 # Non-test Python outside ritz0/ that runs with ritz0/ on sys.path.  "" is the
 # project root itself, non-recursively.
 EXTERNAL_DIRS = ("", "tools", "scripts")
+
+# ritzlib modules (paths under ritzlib/) that no production code imports, each
+# with the reason it stays.  An entry that gains a production importer is
+# reported, so this list cannot outlive its reasons.
+RITZLIB_ALLOWLIST = {
+    "testlib.ritz": "the test assertion library: every importer is a test by design",
+    "ptr.ritz": "ptr_read is LANGUAGE_SPEC §13.2's documented way to move a value "
+                "out of raw memory; only ritz0/test_ref_into_value.py calls it so far",
+}
+
+# A `.ritz` file with one of these as a directory component, or named test_*,
+# is a test: it cannot keep a ritzlib module alive.
+RITZ_TEST_DIRS = {"test", "tests"}
+# Archived or snapshotted code is not production either.  Matches a path
+# component named archive (archive/, docs/archive/) or this prefix.
+RITZ_EXCLUDED_PREFIXES = ("projects/larb/review/",)
+
+# `import ritzlib.a.b`, `pub import ...`, with or without `{ items }` / `as x`.
+# Anchored at line start, so `# import ritzlib.x` in a comment does not count.
+RITZLIB_IMPORT = re.compile(r"^[ \t]*(?:pub[ \t]+)?import[ \t]+ritzlib((?:\.\w+)+)", re.MULTILINE)
 
 BACKUP_SUFFIXES = (".orig", ".old")
 ELF_MAGIC = b"\x7fELF"
@@ -151,6 +177,84 @@ def find_orphans(root, files):
     return sorted(orphans) + [f"{e} (listed entry point is missing)" for e in missing]
 
 
+def repo_root(root):
+    """The git toplevel containing `root` (ritzlib's importers span the repo)."""
+    return Path(subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=root, check=True, capture_output=True, text=True,
+    ).stdout.strip())
+
+
+def ritzlib_dir(root, repo):
+    """`root`'s ritzlib/ as a POSIX path relative to `repo`."""
+    rel = Path(root).resolve().relative_to(Path(repo).resolve())
+    return (PurePosixPath(rel.as_posix()) / "ritzlib").as_posix()
+
+
+def _is_ritz_test(rel):
+    path = PurePosixPath(rel)
+    return path.name.startswith("test_") or bool(RITZ_TEST_DIRS & set(path.parts[:-1]))
+
+
+def _is_ritz_excluded(rel):
+    return "archive" in PurePosixPath(rel).parts[:-1] or rel.startswith(RITZ_EXCLUDED_PREFIXES)
+
+
+def _ritzlib_imports(root, rel):
+    """Dotted names after `ritzlib.` that `rel` imports: {"sys", "async.tasks"}."""
+    text = (Path(root) / rel).read_text(encoding="utf-8", errors="replace")
+    return {m.lstrip(".") for m in RITZLIB_IMPORT.findall(text)}
+
+
+def find_ritzlib_orphans(repo, files, lib, allow=None):
+    """Modules under `lib` that no non-test .ritz file in `files` reaches.
+
+    `files` are relative to `repo`; `lib` is ritzlib/'s path in it.  `allow`
+    (default RITZLIB_ALLOWLIST) maps lib-relative paths to reasons: those
+    modules are roots.  An allowlisted module that is missing, or that
+    production reaches anyway, is reported as a stale entry.
+    """
+    allow = RITZLIB_ALLOWLIST if allow is None else allow
+    prefix = f"{lib}/"
+    modules = {}
+    for rel in files:
+        if rel.startswith(prefix) and rel.endswith(".ritz"):
+            inner = PurePosixPath(rel[len(prefix):])
+            if inner.parts[0] not in RITZ_TEST_DIRS:
+                modules[".".join(inner.with_suffix("").parts)] = rel
+
+    pending = []
+    for rel in files:
+        if (rel.endswith(".ritz") and not rel.startswith(prefix)
+                and not _is_ritz_test(rel) and not _is_ritz_excluded(rel)):
+            pending.extend(_ritzlib_imports(repo, rel))
+    production = set(pending) & modules.keys()
+
+    def reach(start):
+        live, todo = set(), list(start)
+        while todo:
+            module = todo.pop()
+            if module in live or module not in modules:
+                continue
+            live.add(module)
+            todo.extend(_ritzlib_imports(repo, modules[module]))
+        return live
+
+    live_without_allow = reach(production)
+    allowed = {".".join(PurePosixPath(a).with_suffix("").parts) for a in allow}
+    live = reach(production | (allowed & modules.keys()))
+
+    report = sorted(rel for name, rel in modules.items() if name not in live)
+    for entry in sorted(allow):
+        name = ".".join(PurePosixPath(entry).with_suffix("").parts)
+        if name not in modules:
+            report.append(f"{prefix}{entry} (allowlisted module is missing)")
+        elif name in live_without_allow:
+            report.append(f"{prefix}{entry} (allowlisted but has a production importer; "
+                          "drop the entry)")
+    return report
+
+
 def find_strays(root, files):
     """Backup files and ELF binaries anywhere in `files`."""
     strays = []
@@ -173,16 +277,20 @@ def main(argv=None):
     files = project_files(args.root)
     orphans = find_orphans(args.root, files)
     strays = find_strays(args.root, project_files(args.root, untracked=False))
+    repo = repo_root(args.root)
+    repo_files = project_files(repo)
+    lib_orphans = find_ritzlib_orphans(repo, repo_files, ritzlib_dir(args.root, repo))
 
-    for rel in orphans:
-        print(f"{rel}: no production importer")
+    for rel in orphans + lib_orphans:
+        print(rel if rel.endswith(")") else f"{rel}: no production importer")
     for rel in strays:
         print(f"{rel}: backup file or binary; delete it")
-    if orphans or strays:
+    if orphans or strays or lib_orphans:
         print("Import it from production code, delete it, or add it to "
-              "ENTRY_POINTS in tools/check_liveness.py with a reason.")
+              "ENTRY_POINTS / RITZLIB_ALLOWLIST in tools/check_liveness.py with a reason.")
         return 1
     print(f"ritz0 liveness: OK ({sum(f.endswith('.py') for f in files)} Python files read)")
+    print(f"ritzlib liveness: OK ({sum(f.endswith('.ritz') for f in repo_files)} .ritz files read)")
     return 0
 
 

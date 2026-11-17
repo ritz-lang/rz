@@ -55,6 +55,7 @@ LOCAL_MODULES = {
     "exec_tmpdir",
     "likely_tests",
     "ritz1_arch",
+    "ritzlib_modules",
     "run_regression_matrix",
     "ritz1_unit",
     "smoke",
