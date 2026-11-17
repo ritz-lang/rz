@@ -84,6 +84,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'NULL': 40, 'SELF': 41, 'MUT': 42, 'ASSERT': 44, 'FLOAT': 45,  # 43 was PASS: an IDENT now (#3320)
     'TYPE': 46, 'THEN': 47,
     'ASM': 48,  # inline assembly, LANGUAGE_SPEC §18.6 (AGAST #3394)
+    'ASYNC': 49, 'AWAIT': 60,  # parsed, then refused until AGAST #3814 (#1456)
     # Type keywords
     'I8': 50, 'I16': 51, 'I32': 52, 'I64': 53,
     'U8': 54, 'U16': 55, 'U32': 56, 'U64': 57,
@@ -180,6 +181,7 @@ class RitzGenerator:
         groups = [
             (10, 49, 'Keywords'),
             (50, 59, 'Type keywords'),
+            (60, 69, 'Keywords (10-49 is full)'),
             (70, 84, 'Operators'),
             (85, 92, 'Comparison operators'),
             (95, 109, 'Assignment, arrows and ranges'),
