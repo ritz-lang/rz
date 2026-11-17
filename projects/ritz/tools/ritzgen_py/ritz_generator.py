@@ -106,6 +106,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'DOT': 120, 'COMMA': 121, 'COLON': 122, 'SEMICOLON': 123,
     'HASH': 124, 'DBLBRACKET_L': 125, 'DBLBRACKET_R': 126,
     'LBRACKET2': 125, 'RBRACKET2': 126,  # Aliases for double bracket
+    'COLON_AMP': 127,  # `:&`, the borrow sigil (AGAST #1565)
     # Literals
     'IDENT': 130, 'NUMBER': 131, 'STRING': 132, 'CSTRING': 133,
     'SSTRING': 134, 'CHAR': 135,
@@ -208,7 +209,7 @@ class RitzGenerator:
             (85, 92, 'Comparison operators'),
             (95, 109, 'Assignment, arrows and ranges'),
             (110, 115, 'Delimiters'),
-            (120, 126, 'Punctuation'),
+            (120, 127, 'Punctuation'),
             (130, 136, 'Identifiers and literals'),
             (140, 141, 'Whitespace'),
         ]

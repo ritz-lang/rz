@@ -43,6 +43,8 @@ UNIONS = {
     "alias": ("type X = i64 | bool\n", 1, 14),
     # Inline, in a parameter.
     "param": ("fn f(x: i64 | bool) -> i64\n    0\n", 1, 13),
+    # After `:&`, one token since AGAST #1565.
+    "borrow_param": ("fn f(x:& i64 | bool) -> i64\n    0\n", 1, 14),
     # Under a fn type's undelimited return: still the alias's `|`.
     "fn_type_return": ("type F = fn() -> i64 | bool\n", 1, 22),
     # The other type positions, each a different path in ritz1's grammar.

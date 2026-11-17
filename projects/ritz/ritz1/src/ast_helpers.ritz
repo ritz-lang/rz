@@ -727,8 +727,8 @@ fn eprint_qualified_access_removed(p: *Parser, qual: i32)
 # `m.S` as a type: there is no `module.item` access (LANGUAGE_SPEC §15.3,
 # AGAST #2215).  The grammar's type is a bare name, so the parse fails at the
 # first `.`.  If the furthest token reached is a `.` between two IDENTs, and
-# the token before the qualifier starts a type (`:` `->` `as` `*` `@` `&` `<`
-# `,` `]` `=` `(`), return the qualifier's token index; otherwise -1.
+# the token before the qualifier starts a type (`:` `:&` `->` `as` `*` `@` `&`
+# `<` `,` `]` `=` `(`), return the qualifier's token index; otherwise -1.
 fn dotted_type_at(p: *Parser, fail_at: i32) -> i32
     let c: i32 = fail_at
     if c < 2 or c + 1 >= p.token_count
@@ -739,7 +739,7 @@ fn dotted_type_at(p: *Parser, fail_at: i32) -> i32
     if dot.kind != TOK_DOT or qual.kind != TOK_IDENT or name.kind != TOK_IDENT
         return -1
     let k: i32 = (p.tokens + (c - 2)).kind
-    if k == TOK_COLON or k == TOK_ARROW or k == TOK_AS or k == TOK_STAR or k == TOK_AT
+    if k == TOK_COLON or k == TOK_COLON_AMP or k == TOK_ARROW or k == TOK_AS or k == TOK_STAR or k == TOK_AT
         return c - 1
     if k == TOK_AMP or k == TOK_LT or k == TOK_COMMA or k == TOK_RBRACKET or k == TOK_EQ
         return c - 1
@@ -813,7 +813,7 @@ fn union_type_at(p: *Parser, fail_at: i32) -> i32
     if c < 0
         return seen_arrow
     let k: i32 = (p.tokens + c).kind
-    if k == TOK_COLON
+    if k == TOK_COLON or k == TOK_COLON_AMP
         return 1
     if k == TOK_ASSIGN and c >= 2 and (p.tokens + (c - 1)).kind == TOK_IDENT and (p.tokens + (c - 2)).kind == TOK_TYPE
         return 1
@@ -845,6 +845,39 @@ fn type_pattern_at(p: *Parser, fail_at: i32) -> i32
         return 1
     0
 
+# The removed legacy `&T` / `&mut T` type (LANGUAGE_SPEC §3.2, AGAST #1565):
+# no type starts with `&`, so a parse that reached one right after a `:` (or a
+# `:&`, as in `x:&& T`) stopped there.  1 for `&T`, 2 for `&mut T`, else 0.
+# `:&` is one token, so a COLON before the AMP means `name: &T`, which ritz0
+# lexes the same way and refuses with the diagnostic eprint_legacy_amp_type
+# copies.
+fn legacy_amp_type_at(p: *Parser, fail_at: i32) -> i32
+    if fail_at < 1 or fail_at >= p.token_count
+        return 0
+    if (p.tokens + fail_at).kind != TOK_AMP
+        return 0
+    let before: i32 = (p.tokens + (fail_at - 1)).kind
+    if before != TOK_COLON and before != TOK_COLON_AMP
+        return 0
+    if fail_at + 1 < p.token_count and (p.tokens + (fail_at + 1)).kind == TOK_MUT
+        return 2
+    1
+
+# ritz0's wording (parser.py _parse_type_primary), so both compilers give one
+# diagnostic.  `kind` is legacy_amp_type_at's answer.
+fn eprint_legacy_amp_type(p: *Parser, fail_at: i32, kind: i32)
+    parse_error_at(p, fail_at)
+    if kind == 2
+        eprintln_cstr(c"Legacy `&mut T` syntax is no longer supported. Use `@&T` for mutable reference types.")
+        eprintln_cstr(c"  RERITZ migration guide:")
+        eprintln_cstr(c"    - `&mut T` → `@&T` (mutable reference type)")
+        eprints_cstr(c"    - `data: &mut T` → `data:& T` (mutable borrow parameter)")
+    else
+        eprintln_cstr(c"Legacy `&T` reference syntax is no longer supported. Use `@T` for reference types.")
+        eprintln_cstr(c"  RERITZ migration guide:")
+        eprintln_cstr(c"    - `&T` → `@T` (immutable reference type)")
+        eprints_cstr(c"    - `data: &T` → `data: T` (const borrow is the default)")
+
 # Called by the generated anchor-skip recovery in parse_item BEFORE it
 # skips the construct it could not parse.  p.pos is still at the first
 # token of that construct (every failed alternative rewinds to start_pos).
@@ -867,7 +900,10 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
         g_dropped_items = g_dropped_items + 1
         let qual: i32 = qualified_access_at(p, fail_at)
         let dotted: i32 = dotted_type_at(p, fail_at)
-        if qual >= 0
+        let legacy_amp: i32 = legacy_amp_type_at(p, fail_at)
+        if legacy_amp > 0
+            eprint_legacy_amp_type(p, fail_at, legacy_amp)
+        else if qual >= 0
             eprint_qualified_access_removed(p, qual)
         else if dotted >= 0
             eprint_dotted_type_removed(p, dotted)

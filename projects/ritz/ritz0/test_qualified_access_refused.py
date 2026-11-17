@@ -73,6 +73,16 @@ fn f(s: @^m.S) -> i32
 pub fn main() -> i32
     0
 """),
+    # After `:&`, one token since AGAST #1565.
+    "borrow_param_type": ("m.S", """\
+import m
+
+fn f(s:& ^m.S) -> i32
+    s.x
+
+pub fn main() -> i32
+    0
+"""),
     # harland's `"..." as serial.StrView`: a cast's target.
     "cast_type": ("m.S", """\
 import m

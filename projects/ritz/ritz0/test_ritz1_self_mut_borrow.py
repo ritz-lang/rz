@@ -13,10 +13,10 @@ same reason and is fixed alongside it.
 
 The spaced spelling `self: &R` is NOT a valid form. ritz0 lexes `:&` as one
 COLON_AMP token, so `: &R` is the removed legacy `&T` reference type and gets a
-migration diagnostic (see LANGUAGE_SPEC 3.2). ritz1 lexes `:&` as COLON AMP,
-so it cannot tell the two spellings apart and accepts both. That looseness
-already existed for free-function `r: &T` (#1301) and is tracked separately. It
-is pinned below on the ritz0 side only.
+migration diagnostic (see LANGUAGE_SPEC 3.2). ritz1 lexed `:&` as COLON AMP
+and accepted both spellings, for `self` and for free-function `r: &T` (#1301),
+until AGAST #1565 gave it the same COLON_AMP token.  SPACED_LEGACY pins both
+compilers' refusal.
 
 Every runnable program returns 3 only if the receiver really is a mutable
 borrow, meaning the write through `self` is visible in the caller. A fix that
@@ -189,13 +189,53 @@ def test_ritz1_rejects_self_double_amp(ritz1_bin, tmp_path):
     assert not ll.exists(), "ritz1 wrote an artifact for `self:&& R`"
 
 
+# --- the spaced spelling is the removed legacy `&T` type (AGAST #1565) --------
+
+_LEGACY_AMP = "Legacy `&T` reference syntax is no longer supported"
+_LEGACY_AMP_MUT = "Legacy `&mut T` syntax is no longer supported"
+
+# Each row is refused, by both compilers, with ritz0's migration diagnostic.
+# One row per grammar position that took `COLON AMP` before the fix (a self
+# receiver, a free-fn param, a struct field) plus a `let`, whose `: &T` never
+# parsed but had no diagnostic, and `&mut T`, which ritz0 words differently.
+SPACED_LEGACY = {
+    "self_amp": (_program("self: &R"), _LEGACY_AMP),
+    "self_spaced_amp": (_program("self : & R"), _LEGACY_AMP),
+    "param_amp": (WORKING_FORMS["free_fn_colon_amp"].replace("r:& R", "r: &R"), _LEGACY_AMP),
+    "param_amp_mut": (
+        WORKING_FORMS["free_fn_colon_amp"].replace("r:& R", "r: &mut R"),
+        _LEGACY_AMP_MUT,
+    ),
+    "field_amp": (
+        "struct C\n    x: i32\nstruct R\n    ch: &C\n"
+        "pub fn main() -> i32\n    return 3\n",
+        _LEGACY_AMP,
+    ),
+    "let_amp": (
+        "struct R\n    pos: i64\npub fn main() -> i32\n"
+        "    var r: R = R { pos: 3 }\n    let q: &R = @r\n    return q.pos as i32\n",
+        _LEGACY_AMP,
+    ),
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("receiver", ["self: &R", "self : & R"])
-def test_ritz0_rejects_spaced_self_amp(tmp_path, receiver):
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("name", sorted(SPACED_LEGACY))
+def test_rejects_spaced_legacy_amp(request, tmp_path, compiler, name):
     """`: &R` is the removed legacy `&T` type, not the `:&` mutable-borrow form.
 
-    Pins the oracle's answer to "does `self: &R` need the same treatment?" (no).
+    ritz0 lexes `:&` as one COLON_AMP token, so with a space between them the
+    `&` starts a type.  ritz1 lexed COLON AMP either way and took `r: &R` and
+    `self: &R` as borrows (AGAST #1565).  The `:&` spellings stay accepted:
+    BROKEN_FORMS / WORKING_FORMS above run them.
     """
-    comp, _ = _compile("ritz0", tmp_path, "spaced", _program(receiver))
-    assert comp.returncode != 0
-    assert "Legacy `&T` reference syntax" in comp.stdout + comp.stderr
+    if compiler == "ritz1":
+        request.getfixturevalue("ritz1_bin")
+    program, message = SPACED_LEGACY[name]
+    comp, ll = _compile(compiler, tmp_path, name, program)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted {name}:\n{out[-1000:]}"
+    assert message in out, f"{compiler} refused {name} without the legacy diagnostic:\n{out[-2000:]}"
+    if compiler == "ritz1":
+        assert not ll.exists(), f"ritz1 wrote an artifact for {name}"
