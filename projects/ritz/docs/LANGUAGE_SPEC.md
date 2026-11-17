@@ -4560,6 +4560,40 @@ parameter; a method call on `p` that takes `self: @&T` or `self:& T`; and a writ
 R11a). The binding holds that loan to the end of the block it's declared in.
 `@x` held in a `*T` isn't a borrow, and nor is a `self: *T` receiver.
 
+Moving a place, or a part of it, is refused the same way while an `@` of an
+overlapping place is live (LARB R57): what moved would leave the reference behind.
+
+```ritz expect-error="cannot move out of `t` - `t` is already borrowed as immutable"
+struct T
+    x: i32
+
+impl Drop for T
+    fn drop(self: @&T)
+        self.x = 0
+
+fn main() -> i32
+    let t = T { x: 1 }
+    let p = @t
+    let w = t
+    p.x
+```
+
+A `Span<T>` made from a local root is an `@` of that root, for this rule and for
+the one below (LARB R57): `v[a..b]` of a Vec or String in a `Span` slot, which is
+a view of `v` there rather than a copy (§7.8), and `@x` in a `Span` slot. A slice
+of a `Span` views what that Span does, so it lends nothing:
+
+```ritz expect-error="cannot borrow `v` as mutable - `v` is already borrowed as immutable"
+import ritzlib.gvec
+
+fn main() -> i32
+    var v: Vec<i32> = vec_new<i32>()
+    v.push(1)
+    let s: Span<i32> = v[0..1]
+    v.push(2)                       # error: the push may move what s views
+    s[0]
+```
+
 Disjoint fields of one root don't overlap, so they're free while the other is
 borrowed, and two of them can be lent mutably to one call:
 
@@ -4624,8 +4658,10 @@ parameters, and match and loop bindings. A `return` or a function's tail, throug
 `if` and `match` arms, can't give:
 
 - `@x`, `@&x`, `@x.f` or `@x[i]` of a local root, as an `@T`, `@&T` or `*T`;
-- a local reference binding initialised from one of those, over any number of
-  hops;
+- a `Span<T>` of a local root: `@x` or a view `v[a..b]` of a Vec or String, as a
+  `Span<T>` (LARB R57);
+- a local reference or `Span<T>` binding initialised from one of those, over any
+  number of hops;
 - a call returning `@U` or `@&U` that was given a reference to a local root with
   pointee `U`. A `:&` parameter or a receiver is given one when its place is a
   local root of type `U`.
@@ -4677,6 +4713,24 @@ fn same(c: @Counter) -> @Counter
 fn make() -> @Counter
     var c = Counter { n: 1 }
     return same(@c)                 # error: the result may be that reference
+```
+
+```ritz expect-error="cannot return a reference to local `a`: it ends with the fn"
+fn view() -> Span<i32>
+    var a: [3]i32 = [1, 2, 3]
+    return @a                       # error: a Span of a local array
+```
+
+A slice of a `Span` parameter views the caller's storage, so it returns:
+
+```ritz
+fn tail(s: Span<i32>) -> Span<i32>
+    return s[1..s.len]
+
+fn main() -> i32
+    let a: [3]i32 = [1, 2, 3]
+    let t = tail(@a)
+    t[0]
 ```
 
 A `var` counts only while what it holds is definite. Once it's written, or has its
@@ -4736,8 +4790,8 @@ fn main() -> i32
 
 Nothing else is checked, and each of these can still dangle:
 
-- a reference stored in a field or a global, or in a value such as a `Span<T>` or an
-  `Option<@T>`;
+- a reference or a `Span<T>` stored in a field or a global, or a reference in a
+  value such as an `Option<@T>`;
 - a raw pointer after a cast: `@x as *u8`;
 - anything through another function's stored state;
 - a call's result held in a binding, or passed to another call, and a call through

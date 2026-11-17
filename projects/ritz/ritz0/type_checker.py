@@ -1876,6 +1876,15 @@ class TypeChecker:
             return self._referent(expr.expr)
         if isinstance(expr, rast.UnaryOp) and expr.op in ('&', '@', '&mut', '@&'):
             return self._local_root(expr.operand)
+        if isinstance(expr, rast.Index) and isinstance(expr.index, rast.Range):
+            # `v[a..b]` of a Vec or String: in a Span slot, a view of v (LARB
+            # R57); elsewhere a copy, which no reference slot takes. A Span's
+            # slice views what the Span does: a param's is the caller's.
+            base = self._quiet_type(expr.expr)
+            if isinstance(base, rast.NamedType) and (
+                    base.name in ('Vec', 'String') or base.name.startswith('Vec$')):
+                return self._local_root(expr.expr)
+            return None
         if not isinstance(expr, rast.Ident):
             return None
         held = self._local_refs.get(id(self.locals.get(expr.name)))
@@ -1888,9 +1897,15 @@ class TypeChecker:
     def _note_local_ref(self, name: str, root: Optional[str]) -> None:
         """`name` was just bound to a reference to `root`, if there's a root."""
         held = self.locals[name]
-        if root is not None and isinstance(self._resolve_alias(held),
-                                           (rast.PtrType, rast.RefType)):
+        if root is not None and self._is_ref_slot(held):
             self._local_refs[id(held)] = (held, root, self._loop_depth)
+
+    def _is_ref_slot(self, slot: Optional[rast.Type]) -> bool:
+        """Does `slot` hold a reference for R2: a pointer, a reference, or a
+        Span, a view (LARB R57)?"""
+        held = self._resolve_alias(slot) if slot is not None else None
+        return isinstance(held, (rast.PtrType, rast.RefType)) or (
+            held is not None and self._is_span(held))
 
     def _forget_local_ref(self, place: rast.Expr) -> None:
         """`place` is written, or its address may let it be: if it's a `var`, what
@@ -1935,8 +1950,7 @@ class TypeChecker:
         root = self._referent(expr)
         if root is None and isinstance(expr, (rast.Call, rast.MethodCall)):
             root = self._call_referent(expr)
-        if root is not None and isinstance(self._resolve_alias(self._ret_slot()),
-                                           (rast.PtrType, rast.RefType)):
+        if root is not None and self._is_ref_slot(self._ret_slot()):
             self._report_once(expr, ref_rules.returns_local(root))
 
     @staticmethod

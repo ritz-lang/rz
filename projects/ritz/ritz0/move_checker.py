@@ -490,12 +490,14 @@ class MoveChecker(MoveWalk):
 
     def _report(self, name: str, path: Tuple[str, ...], loan: Loan,
                 what: str, span) -> None:
-        """`what` is "assign", "mutable" or "immutable"."""
+        """`what` is "assign", "move", "mutable" or "immutable"."""
         here = self._place_str(name, path)
         held = self._place_str(name, loan.path)
         kind = "mutable" if loan.mutable else "immutable"
         if what == "assign":
             head = f"cannot assign to `{here}`"
+        elif what == "move":
+            head = f"cannot move out of `{here}`"
         else:
             head = f"cannot borrow `{here}` as {what}"
         self.errors.append(OwnershipError(
@@ -512,10 +514,40 @@ class MoveChecker(MoveWalk):
             self._report(place[0], place[1], loan,
                          "assign" if verb == "assign" else "mutable", span)
 
-    def _held_borrows(self, value: Optional[rast.Expr]) -> List[rast.UnaryOp]:
-        """The `@place` and `@&place` a declaration's binding holds: its value,
-        or an arm's tail of an `if` or `match` value."""
-        out: List[rast.UnaryOp] = []
+    def _check_move_borrowed(self, name: str, info: VarInfo, path: Tuple[str, ...], span):
+        """A move of `name`'s `path` conflicts with any live loan of an
+        overlapping place, as a mutable borrow would (LARB R57, R11a). True if
+        it was reported."""
+        loan = self._conflict(info, path, mutable=True)
+        if loan is None:
+            return False
+        self._report(name, path, loan, "move", span)
+        return True
+
+    def _span_view_base(self, value: rast.Expr) -> Optional[rast.Expr]:
+        """`v` of `v[a..b]` when `v` is a Vec or String held by value: in a Span
+        slot the slice is a view of v's storage, not a copy (§7.8), so it lends
+        v (LARB R57). A Span's slice views what the Span does, not the Span."""
+        if not (isinstance(value, rast.Index) and isinstance(value.index, rast.Range)):
+            return None
+        held = self.types.resolve(self._loan_type(value.expr))
+        if isinstance(held, rast.NamedType) and (
+                held.name in ('Vec', 'String') or held.name.startswith('Vec$')):
+            return value.expr
+        return None
+
+    def _is_span_slot(self, declared: Optional[rast.Type]) -> bool:
+        held = self.types.resolve(declared) if declared is not None else None
+        return isinstance(held, rast.NamedType) and (
+            held.name == 'Span' or held.name.startswith('Span$'))
+
+    def _held_borrows(self, value: Optional[rast.Expr],
+                      span_slot: bool = False) -> List[Tuple[rast.Expr, rast.Expr, bool]]:
+        """What a declaration's binding borrows, as (expression, place,
+        mutable): an `@place` or `@&place` its value is, or an arm's tail of an
+        `if` or `match` value is; in a Span slot (`span_slot`) a view
+        `v[a..b]` of a Vec or String too, an `@v` (R57)."""
+        out: List[Tuple[rast.Expr, rast.Expr, bool]] = []
 
         def tail(block):
             if isinstance(block, rast.Block):
@@ -530,7 +562,9 @@ class MoveChecker(MoveWalk):
             if isinstance(e, rast.Grouped):
                 walk(e.expr)
             elif isinstance(e, rast.UnaryOp) and e.op in ('&', '@', '&mut', '@&'):
-                out.append(e)
+                out.append((e, e.operand, e.op in ('&mut', '@&')))
+            elif span_slot and self._span_view_base(e) is not None:
+                out.append((e, self._span_view_base(e), False))
             elif isinstance(e, rast.If):
                 tail(e.then_block)
                 tail(e.else_block)
@@ -547,11 +581,11 @@ class MoveChecker(MoveWalk):
         held = self.types.resolve(declared) if declared is not None else None
         if isinstance(held, rast.PtrType) and not held.shared:
             return
-        for e in self._held_borrows(value):
-            place = self._loan_place(e.operand)
+        for e, operand, mutable in self._held_borrows(value, self._is_span_slot(declared)):
+            place = self._loan_place(operand)
             info = self.scope.lookup(place[0]) if place is not None else None
             if info is not None and info is not holder:
-                info.borrows.append(Loan(e.span, e.op in ('&mut', '@&'), holder, place[1]))
+                info.borrows.append(Loan(e.span, mutable, holder, place[1]))
 
     def _for_loan(self, it: rast.Expr) -> Optional[Tuple[VarInfo, Loan]]:
         """The loan a `for` over `it` holds for its body (LARB R11, AGAST
@@ -927,6 +961,9 @@ class MoveChecker(MoveWalk):
                     f"`{owner.name}` implements Drop",
                     expr.span))
                 return
+        # Not while a loan of an overlapping place is live (LARB R57, R11a).
+        if self._check_move_borrowed(name, info, tuple(path.split('.')), expr.span):
+            return
         info.moved_fields[path] = expr.span
         self._field_moves.add((name, path))
         # The emitter clears the field's drop flag here.

@@ -417,6 +417,9 @@ class MoveWalk:
             if var_info.borrow == rast.Borrow.MUTABLE:
                 self._reject_move_out(expr.span)
                 return
+            # Not while a loan of it is live (LARB R57).
+            if self._check_move_borrowed(expr.name, var_info, (), expr.span):
+                return
             var_info.state = VarState.MOVED
             var_info.move_span = expr.span
             # The emitter clears the binding's drop flag here.
