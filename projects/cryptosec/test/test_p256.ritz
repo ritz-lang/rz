@@ -1831,3 +1831,271 @@ fn test_ecdh_public_time_independent_of_key() -> i32
     light[31] = 1
     hex_2182(c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550", @heavy[0], 32)
     return time_independent_2187(1, @light[0], @heavy[0])
+
+# ============================================================================
+# Constant-time scalar arithmetic mod n (AGAST #3879, REVIEW.md M-10)
+# ============================================================================
+# ecdsa_p256_sign runs the nonce k and the private key d through
+# scalar256_inv / scalar256_mul / scalar256_add, so those (and sub, neg,
+# reduce) must do the same work for every operand: Montgomery reduction with
+# a fixed number of rows and masked final subtractions, not `while cmp >= 0`
+# loops or `if is_zero` shortcuts. Expected values come from Python's
+# arbitrary-precision integers (pow(x, n - 2, n) for the inverses).
+#
+# The vectors pin each masked step: a sum that carries out of 256 bits, one
+# that lands exactly on n, a borrow, -0, unreduced 2^256 - 1 inputs (both
+# 256-bit halves of the product need their own reduction) and a product
+# whose Montgomery result needs the final subtraction.
+
+# The scalar `hex` (64 hex digits), unreduced.
+fn sc_3879(a: *Scalar256, hex: *u8)
+    var b: [32]u8
+    hex_2182(hex, @b[0], 32)
+    scalar256_from_bytes(a, @b[0])
+
+# 0 if a equals the scalar `hex`.
+fn sc_eq_3879(a: *Scalar256, hex: *u8) -> i32
+    var want: Scalar256
+    sc_3879(@want, hex)
+    if scalar256_cmp(a, @want) != 0
+        return 1
+    return 0
+
+fn n_minus_1_3879() -> *u8
+    return c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550"
+
+fn ones_3879() -> *u8
+    return c"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+
+fn x_3879() -> *u8
+    return c"123456789abcdef0fedcba9876543210deadbeefcafebabe0011223344556677"
+
+fn y_3879() -> *u8
+    return c"c0ffee00112233445566778899aabbccddeeff00f00dfacecafed00ddeadbeef"
+
+# 0 if scalar256_mul(a_hex, b_hex) is want_hex, in both operand orders.
+fn mul_expect_3879(a_hex: *u8, b_hex: *u8, want_hex: *u8) -> i32
+    var a: Scalar256
+    var b: Scalar256
+    var c: Scalar256
+    sc_3879(@a, a_hex)
+    sc_3879(@b, b_hex)
+    scalar256_mul(@c, @a, @b)
+    if sc_eq_3879(@c, want_hex) != 0
+        return 1
+    scalar256_mul(@c, @b, @a)
+    if sc_eq_3879(@c, want_hex) != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_scalar_mul_n_minus_1_squared_is_one() -> i32
+    return mul_expect_3879(n_minus_1_3879(), n_minus_1_3879(), c"0000000000000000000000000000000000000000000000000000000000000001")
+
+[[test]]
+fn test_scalar_mul_all_ones_squared() -> i32
+    # (2^256 - 1)^2 mod n: both product halves start at or above n.
+    return mul_expect_3879(ones_3879(), ones_3879(), c"66e12d92f3d956222845b2392b6bec58c0676ef797ecacb06a97e21bb7403945")
+
+[[test]]
+fn test_scalar_mul_unreduced_times_one() -> i32
+    # (2^256 - 1) * 1: the high half is zero, the low half is above n.
+    return mul_expect_3879(ones_3879(), c"0000000000000000000000000000000000000000000000000000000000000001", c"00000000ffffffff00000000000000004319055258e8617b0c46353d039cdaae")
+
+[[test]]
+fn test_scalar_mul_n_times_5_is_zero() -> i32
+    return mul_expect_3879(c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551", c"0000000000000000000000000000000000000000000000000000000000000005", c"0000000000000000000000000000000000000000000000000000000000000000")
+
+[[test]]
+fn test_scalar_mul_random_pair() -> i32
+    return mul_expect_3879(x_3879(), y_3879(), c"1ae9dedc9e3bd7688be7d4f9a55470963c97db1e90790a98a6d19ea8ccbb2301")
+
+[[test]]
+fn test_scalar_mul_mont_result_carries_past_256_bits() -> i32
+    # The high half's Montgomery product comes out at or above 2^256 (bit 256
+    # in the rows' top carry): only the top half of the final mask fixes it.
+    return mul_expect_3879(c"9b810e766ec9d28663ca828dd5f4b3b2e4b06ce60741c7a87ce42c8218072e8c", c"cd447e35b8b6d8fe442e3d437204e52db2221a58008a05a6c4647159c324c985", c"c08e8e17343b68e77293931e130471df97f087d364d54cb99ec03ade969b419c")
+
+[[test]]
+fn test_scalar_mul_mont_result_just_above_n() -> i32
+    # Built with a lattice (rare at random): the high half's Montgomery
+    # product comes out in [n, 2^256) with no top carry, and the low half is
+    # large enough that the final addition cannot absorb the missed n.
+    return mul_expect_3879(c"00000000000000000000000000000009c1838c4359e2f0a607aad7438cccf765", c"ffffffffffffffffffffffffffffffcc3c8ccd8094bdabeea007fff50b6e6923", c"0000000000000000000000000000000001359296f4dfe5375836b6a7963e46da")
+
+[[test]]
+fn test_scalar_mul_low_half_above_n() -> i32
+    # Built with a lattice (rare at random): the low half of the product is
+    # in [n, 2^256) and the high half's contribution is close enough to n
+    # that adding the unreduced low half would need two subtractions of n.
+    return mul_expect_3879(c"0000000000000000000000000000001f1e612f01939614d32cea955089f93760", c"fffffffffffffffffffffffffffffffffffffffff7c5ff574804c8541604aedf", c"0000000000000000000000000000001d01aa5dcc7fa418db141e2cc2fd57a788")
+
+[[test]]
+fn test_scalar_mul_in_place() -> i32
+    # c aliasing an operand, as scalar256_inv's base = base * base does.
+    var a: Scalar256
+    sc_3879(@a, x_3879())
+    var b: Scalar256
+    sc_3879(@b, y_3879())
+    scalar256_mul(@a, @a, @b)
+    return sc_eq_3879(@a, c"1ae9dedc9e3bd7688be7d4f9a55470963c97db1e90790a98a6d19ea8ccbb2301")
+
+[[test]]
+fn test_scalar_add_carry_out_of_256_bits() -> i32
+    # (n-1) + (n-1) = 2n - 2 > 2^256: keep the subtraction because it carried.
+    var a: Scalar256
+    var c: Scalar256
+    sc_3879(@a, n_minus_1_3879())
+    scalar256_add(@c, @a, @a)
+    return sc_eq_3879(@c, c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254f")
+
+[[test]]
+fn test_scalar_add_exactly_n_is_zero() -> i32
+    # (n-1) + 1 = n, no carry: keep the subtraction because it did not borrow.
+    var a: Scalar256
+    var b: Scalar256
+    var c: Scalar256
+    sc_3879(@a, n_minus_1_3879())
+    scalar256_one(@b)
+    scalar256_add(@c, @a, @b)
+    return sc_eq_3879(@c, c"0000000000000000000000000000000000000000000000000000000000000000")
+
+[[test]]
+fn test_scalar_add_below_n_unchanged() -> i32
+    # (n-1) + 0: the subtraction borrows and is dropped.
+    var a: Scalar256
+    var b: Scalar256
+    var c: Scalar256
+    sc_3879(@a, n_minus_1_3879())
+    scalar256_zero(@b)
+    scalar256_add(@c, @a, @b)
+    return sc_eq_3879(@c, n_minus_1_3879())
+
+[[test]]
+fn test_scalar_sub_borrow_wraps() -> i32
+    var a: Scalar256
+    var b: Scalar256
+    var c: Scalar256
+    scalar256_zero(@a)
+    scalar256_one(@b)
+    scalar256_sub(@c, @a, @b)
+    return sc_eq_3879(@c, n_minus_1_3879())
+
+[[test]]
+fn test_scalar_sub_no_borrow() -> i32
+    var a: Scalar256
+    var b: Scalar256
+    var c: Scalar256
+    sc_3879(@a, n_minus_1_3879())
+    scalar256_one(@b)
+    scalar256_sub(@c, @a, @b)
+    return sc_eq_3879(@c, c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc63254f")
+
+[[test]]
+fn test_scalar_neg_zero_is_zero() -> i32
+    var a: Scalar256
+    var c: Scalar256
+    scalar256_zero(@a)
+    sc_3879(@c, ones_3879())
+    scalar256_neg(@c, @a)
+    return sc_eq_3879(@c, c"0000000000000000000000000000000000000000000000000000000000000000")
+
+[[test]]
+fn test_scalar_neg_one_is_n_minus_1() -> i32
+    var a: Scalar256
+    var c: Scalar256
+    scalar256_one(@a)
+    scalar256_neg(@c, @a)
+    return sc_eq_3879(@c, n_minus_1_3879())
+
+[[test]]
+fn test_scalar_reduce_n_is_zero() -> i32
+    var a: Scalar256
+    sc_3879(@a, c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551")
+    scalar256_reduce(@a)
+    return sc_eq_3879(@a, c"0000000000000000000000000000000000000000000000000000000000000000")
+
+[[test]]
+fn test_scalar_reduce_all_ones() -> i32
+    var a: Scalar256
+    sc_3879(@a, ones_3879())
+    scalar256_reduce(@a)
+    return sc_eq_3879(@a, c"00000000ffffffff00000000000000004319055258e8617b0c46353d039cdaae")
+
+[[test]]
+fn test_scalar_reduce_below_n_unchanged() -> i32
+    var a: Scalar256
+    sc_3879(@a, n_minus_1_3879())
+    scalar256_reduce(@a)
+    return sc_eq_3879(@a, n_minus_1_3879())
+
+[[test]]
+fn test_scalar_inv_two() -> i32
+    var a: Scalar256
+    var c: Scalar256
+    scalar256_zero(@a)
+    a.limbs[0] = 2
+    scalar256_inv(@c, @a)
+    return sc_eq_3879(@c, c"7fffffff800000007fffffffffffffffde737d56d38bcf4279dce5617e3192a9")
+
+[[test]]
+fn test_scalar_inv_random_times_self_is_one() -> i32
+    var a: Scalar256
+    var c: Scalar256
+    sc_3879(@a, x_3879())
+    scalar256_inv(@c, @a)
+    if sc_eq_3879(@c, c"212b6c6e3151fed04b4869ac3673a17953b6c3de4ab959e1ed9fe19c766bd35e") != 0
+        return 1
+    scalar256_mul(@c, @c, @a)
+    if sc_eq_3879(@c, c"0000000000000000000000000000000000000000000000000000000000000001") != 0
+        return 2
+    return 0
+
+# scalar256_mul timing, by #2187's method (min of CT_RUNS_2187 interleaved
+# runs per round, 1.5x, fail only if all CT_ROUNDS_2187 rounds miss). One
+# timed run is SC_BATCH_3879 multiplications, so the timer's own cost and
+# resolution are small next to it. 1 * 1 skips every reduction step a
+# branchy reduction can skip; (2^256 - 1)^2 needs all of them.
+#
+# Measured (min of 7, 64 multiplications): the old subtract-loop reduction
+# ran the heavy pair 8.5x slower; a reduction that only skips the high-half
+# fold when it is zero (one `if`), 2.9x; this one, 1.00x. A single final
+# subtraction left as an `if` measures 1.00-1.01x here (these operands rarely
+# take it, and it is a few ns of a ~110 ns multiplication), far below any
+# timing bound: the vectors above pin those masked steps, and REVIEW.md M-10
+# records that their compiled code has no data-dependent jump.
+const SC_BATCH_3879: i32 = 64
+
+[[noinline]]
+fn time_scalar_mul_3879(a: *Scalar256, b: *Scalar256) -> i64
+    var c: Scalar256
+    let t0: i64 = now_nanos()
+    var i: i32 = 0
+    while i < SC_BATCH_3879
+        scalar256_mul(@c, a, b)
+        i += 1
+    return now_nanos() - t0
+
+[[test]]
+fn test_scalar_mul_time_independent_of_operands() -> i32
+    var light: Scalar256
+    var heavy: Scalar256
+    scalar256_one(@light)
+    sc_3879(@heavy, ones_3879())
+    var round: i32 = 0
+    while round < CT_ROUNDS_2187
+        var min_light: i64 = 0x7FFFFFFFFFFFFFFF
+        var min_heavy: i64 = 0x7FFFFFFFFFFFFFFF
+        var i: i32 = 0
+        while i < CT_RUNS_2187
+            let tl: i64 = time_scalar_mul_3879(@light, @light)
+            let th: i64 = time_scalar_mul_3879(@heavy, @heavy)
+            if tl < min_light
+                min_light = tl
+            if th < min_heavy
+                min_heavy = th
+            i += 1
+        if within_ratio_2187(min_light, min_heavy) == 0
+            return 0
+        round += 1
+    return 1

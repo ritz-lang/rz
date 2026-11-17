@@ -204,47 +204,73 @@ fn scalar256_sub_raw(c: *Scalar256, a: *Scalar256, b: *Scalar256) -> u64
     c.limbs[3] = d3b
     return b3a + b3b
 
-# Reduce c to canonical form [0, n)
+# The scalar operations below run in constant time: no branch or memory
+# index depends on an operand, so ecdsa_p256_sign does the same work for
+# every nonce k and private key d (AGAST #3879, REVIEW.md M-10), as the mod-p
+# field operations do for the ladder. A conditional step is computed
+# unconditionally and kept or dropped with a mask: all ones (keep) or all
+# zeros (drop), made from a 0/1 flag as 0 - flag. scalar256_is_zero and
+# scalar256_cmp return early and are for public values only.
+
+# c = mask ? src : c, for mask all ones or all zeros.
+fn scalar256_cmov(c: *Scalar256, src: *Scalar256, mask: u64)
+    c.limbs[0] = (src.limbs[0] & mask) | (c.limbs[0] & ~mask)
+    c.limbs[1] = (src.limbs[1] & mask) | (c.limbs[1] & ~mask)
+    c.limbs[2] = (src.limbs[2] & mask) | (c.limbs[2] & ~mask)
+    c.limbs[3] = (src.limbs[3] & mask) | (c.limbs[3] & ~mask)
+
+# n with every limb ANDed with mask: n or 0.
+fn get_p256_order_masked(n: *Scalar256, mask: u64)
+    get_p256_order(n)
+    n.limbs[0] = n.limbs[0] & mask
+    n.limbs[1] = n.limbs[1] & mask
+    n.limbs[2] = n.limbs[2] & mask
+    n.limbs[3] = n.limbs[3] & mask
+
+# Reduce c in [0, 2^256) to canonical form [0, n): one subtraction of n,
+# kept unless it borrowed (2^256 < 2n, so one is enough).
 pub fn scalar256_reduce(c: *Scalar256)
     var n: Scalar256
     get_p256_order(@n)
-    if scalar256_cmp(c, @n) >= 0
-        scalar256_sub_raw(c, c, @n)
+    var t: Scalar256
+    let borrow: u64 = scalar256_sub_raw(@t, c, @n)
+    scalar256_cmov(c, @t, borrow - 1)
 
-# Modular addition: c = (a + b) mod n
+# Modular addition: c = (a + b) mod n, for a, b < n. The sum is below 2n:
+# keep sum - n when the sum carried out of 256 bits or the subtraction did
+# not borrow.
 pub fn scalar256_add(c: *Scalar256, a: *Scalar256, b: *Scalar256)
     let carry: u64 = scalar256_add_raw(c, a, b)
     var n: Scalar256
     get_p256_order(@n)
-    if carry != 0 || scalar256_cmp(c, @n) >= 0
-        scalar256_sub_raw(c, c, @n)
+    var t: Scalar256
+    let borrow: u64 = scalar256_sub_raw(@t, c, @n)
+    scalar256_cmov(c, @t, 0 - (carry | (borrow ^ 1)))
 
-# Modular subtraction: c = (a - b) mod n
+# Modular subtraction: c = (a - b) mod n: a - b, plus n (or plus 0) when it
+# borrowed.
 pub fn scalar256_sub(c: *Scalar256, a: *Scalar256, b: *Scalar256)
     let borrow: u64 = scalar256_sub_raw(c, a, b)
-    if borrow != 0
-        var n: Scalar256
-        get_p256_order(@n)
-        scalar256_add_raw(c, c, @n)
-
-# Modular negation: c = -a mod n
-pub fn scalar256_neg(c: *Scalar256, a: *Scalar256)
-    if scalar256_is_zero(a) == 1
-        scalar256_zero(c)
-        return
     var n: Scalar256
-    get_p256_order(@n)
-    scalar256_sub_raw(c, @n, a)
+    get_p256_order_masked(@n, 0 - borrow)
+    scalar256_add_raw(c, c, @n)
 
-# Modular multiplication: c = (a * b) mod n
-pub fn scalar256_mul(c: *Scalar256, a: *Scalar256, b: *Scalar256)
-    # Full 512-bit product
-    var prod: [8]u64
+# Modular negation: c = -a mod n, as 0 - a through scalar256_sub, so -0 is 0
+# without a branch on a.
+pub fn scalar256_neg(c: *Scalar256, a: *Scalar256)
+    var z: Scalar256
+    scalar256_zero(@z)
+    scalar256_sub(c, @z, a)
+
+# prod[0..8] = a * b, the full 512-bit product. Row ai's final carry is a
+# plain store into prod[ai + 4], which is still zero (rows before reached
+# ai + 3 at most) and fits a limb: not a carry chain whose length depends on
+# the operands.
+fn scalar256_mul_wide(prod: *u64, a: *Scalar256, b: *Scalar256)
     var i: i32 = 0
     while i < 8
         prod[i] = 0
         i += 1
-
     var ai: i32 = 0
     while ai < 4
         var carry: u64 = 0
@@ -257,19 +283,56 @@ pub fn scalar256_mul(c: *Scalar256, a: *Scalar256, b: *Scalar256)
             carry = add64_carry(prod[idx], lo, carry, @prod[idx])
             carry = carry + hi
             bi += 1
-        var k: i32 = ai + 4
-        while carry != 0 && k < 8
-            carry = add64_carry(prod[k], 0, carry, @prod[k])
-            k += 1
+        prod[ai + 4] = carry
         ai += 1
 
-    # Reduce mod n using Barrett reduction or simple repeated subtraction
+# Montgomery reduction: r = t * 2^-256 mod n, for t (8 limbs, clobbered)
+# below n * 2^256. Four rows each add m * n, m = t[i] * -n^-1 mod 2^64, which
+# clears limb i; row i's carry out of t[i + 4] (top, 0 or 1) is added into
+# t[i + 5] by the next row, and after the last row it is bit 256 of the
+# result. The result (t + M n) / 2^256 is below 2n: keep result - n when top
+# is set or the subtraction did not borrow.
+fn scalar256_mont_reduce(t: *u64, r: *Scalar256)
+    var n: Scalar256
+    get_p256_order(@n)
+    var top: u64 = 0
+    var i: i32 = 0
+    while i < 4
+        # m = t[i] * n0 mod 2^64, n0 = -n^-1 mod 2^64.
+        var m: u64 = 0
+        var m_hi: u64 = 0
+        mul64(t[i], 0xCCD1C8AAEE00BC4F, @m, @m_hi)
+        var carry: u64 = 0
+        var j: i32 = 0
+        while j < 4
+            var lo: u64 = 0
+            var hi: u64 = 0
+            mul64(m, n.limbs[j], @lo, @hi)
+            carry = add64_carry(t[i + j], lo, carry, @t[i + j])
+            carry = carry + hi
+            j += 1
+        top = add64_carry(t[i + 4], carry, top, @t[i + 4])
+        i += 1
+    r.limbs[0] = t[4]
+    r.limbs[1] = t[5]
+    r.limbs[2] = t[6]
+    r.limbs[3] = t[7]
+    var s: Scalar256
+    let borrow: u64 = scalar256_sub_raw(@s, r, @n)
+    scalar256_cmov(r, @s, 0 - (top | (borrow ^ 1)))
+
+# Modular multiplication: c = (a * b) mod n, for any a, b below 2^256.
+pub fn scalar256_mul(c: *Scalar256, a: *Scalar256, b: *Scalar256)
+    var prod: [8]u64
+    scalar256_mul_wide(@prod[0], a, b)
     scalar256_reduce_512(@prod[0], c)
 
-# Reduce 512-bit value mod n
+# Reduce a 512-bit value hi * 2^256 + lo mod n with the same work for every
+# value: hi * 2^256 mod n is the Montgomery product of hi and RR = 2^512 mod n
+# (hi < 2^256 and RR < n, so hi * RR < n * 2^256: scalar256_mont_reduce's
+# bound holds without reducing hi first), plus lo reduced below n so the
+# final scalar256_add's one masked subtraction is enough.
 fn scalar256_reduce_512(prod: *u64, r: *Scalar256)
-    # Simple method: shift and subtract
-    # Copy high 256 bits
     var hi: Scalar256
     hi.limbs[0] = prod[4]
     hi.limbs[1] = prod[5]
@@ -281,88 +344,20 @@ fn scalar256_reduce_512(prod: *u64, r: *Scalar256)
     lo.limbs[1] = prod[1]
     lo.limbs[2] = prod[2]
     lo.limbs[3] = prod[3]
+    scalar256_reduce(@lo)
 
-    var n: Scalar256
-    get_p256_order(@n)
+    # RR = 2^512 mod n
+    #    = 0x66E12D94F3D956202845B2392B6BEC594699799C49BD6FA683244C95BE79EEA2
+    var rr: Scalar256
+    rr.limbs[0] = 0x83244C95BE79EEA2
+    rr.limbs[1] = 0x4699799C49BD6FA6
+    rr.limbs[2] = 0x2845B2392B6BEC59
+    rr.limbs[3] = 0x66E12D94F3D95620
 
-    # Reduce lo first
-    while scalar256_cmp(@lo, @n) >= 0
-        scalar256_sub_raw(@lo, @lo, @n)
-
-    # Process hi bits: for each set bit in hi, add 2^(256+bit_pos) mod n
-    # 2^256 mod n = n - (2^256 - n) = we need to compute 2^256 mod n
-    # n = FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
-    # 2^256 mod n = 2^256 - n = 0x00000000FFFFFFFF00000000000000004319055258E8617B0C46353D039CDAAF
-
-    var pow256_mod_n: Scalar256
-    pow256_mod_n.limbs[0] = 0x0C46353D039CDAAF
-    pow256_mod_n.limbs[1] = 0x4319055258E8617B
-    pow256_mod_n.limbs[2] = 0x0000000000000000
-    pow256_mod_n.limbs[3] = 0x00000000FFFFFFFF
-
-    # Multiply hi by 2^256 mod n
-    if scalar256_is_zero(@hi) != 1
-        var hi_reduced: Scalar256
-        scalar256_mul_simple(@hi_reduced, @hi, @pow256_mod_n, @n)
-        scalar256_add(r, @lo, @hi_reduced)
-    else
-        scalar256_copy(r, @lo)
-
-# Simple multiplication for reduction (already reduced inputs)
-fn scalar256_mul_simple(c: *Scalar256, a: *Scalar256, b: *Scalar256, n: *Scalar256)
-    # Full product
-    var prod: [8]u64
-    var i: i32 = 0
-    while i < 8
-        prod[i] = 0
-        i += 1
-
-    var ai: i32 = 0
-    while ai < 4
-        var carry: u64 = 0
-        var bi: i32 = 0
-        while bi < 4
-            var lo: u64 = 0
-            var hi: u64 = 0
-            mul64(a.limbs[ai], b.limbs[bi], @lo, @hi)
-            let idx: i32 = ai + bi
-            carry = add64_carry(prod[idx], lo, carry, @prod[idx])
-            carry = carry + hi
-            bi += 1
-        var k: i32 = ai + 4
-        while carry != 0 && k < 8
-            carry = add64_carry(prod[k], 0, carry, @prod[k])
-            k += 1
-        ai += 1
-
-    # Direct reduction by repeated subtraction
-    c.limbs[0] = prod[0]
-    c.limbs[1] = prod[1]
-    c.limbs[2] = prod[2]
-    c.limbs[3] = prod[3]
-
-    # Handle overflow from upper limbs
-    var overflow: Scalar256
-    overflow.limbs[0] = prod[4]
-    overflow.limbs[1] = prod[5]
-    overflow.limbs[2] = prod[6]
-    overflow.limbs[3] = prod[7]
-
-    # Reduce lower part
-    while scalar256_cmp(c, n) >= 0
-        scalar256_sub_raw(c, c, n)
-
-    # Add overflow * 2^256 mod n recursively
-    if scalar256_is_zero(@overflow) != 1
-        var pow256: Scalar256
-        pow256.limbs[0] = 0x0C46353D039CDAAF
-        pow256.limbs[1] = 0x4319055258E8617B
-        pow256.limbs[2] = 0x0000000000000000
-        pow256.limbs[3] = 0x00000000FFFFFFFF
-
-        var contrib: Scalar256
-        scalar256_mul_simple(@contrib, @overflow, @pow256, n)
-        scalar256_add(c, c, @contrib)
+    var w: [8]u64
+    scalar256_mul_wide(@w[0], @hi, @rr)
+    scalar256_mont_reduce(@w[0], r)
+    scalar256_add(r, r, @lo)
 
 # Modular inversion: c = a^(-1) mod n using Fermat's Little Theorem
 # a^(-1) = a^(n-2) mod n
@@ -413,6 +408,8 @@ pub fn scalar256_inv(c: *Scalar256, a: *Scalar256)
         var bit: i32 = 0
         while bit < 8
             let b: u8 = (exp[byte_idx] >> bit) & 1
+            # A branch on the public exponent n - 2 only; every step on the
+            # secret a is a constant-time scalar256_mul.
             if b == 1
                 scalar256_mul(@result, @result, @base)
             scalar256_mul(@base, @base, @base)
