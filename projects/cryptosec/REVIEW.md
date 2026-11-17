@@ -285,6 +285,8 @@ Only checks Common Name. RFC 6125/9525 requires SAN checking. All modern CA-issu
 
 **Fix:** Implement constant-time double-and-add using conditional swaps.
 
+> **Status (2026-11, AGAST #2187):** Fixed for the point multiplication. `p256_scalar_mult`, which every secret scalar reaches (`ecdsa_p256_sign`'s nonce, `ecdsa_p256_pubkey_from_privkey`, `p256_ecdh_public` and `p256_ecdh`), does one doubling and one addition per scalar bit and keeps the sum with a masked select, using the complete projective formulas of Renes-Costello-Batina (no identity or P = Q branches). The field operations under it (`fep256_add/sub/neg/reduce`, the `fep256_reduce_512` carry fold, `fep256_mul`'s carries) are branch-free; at -O2 their only jumps are loop counters. `ecdsa_p256_verify` uses `p256_scalar_mult_vartime` for its public scalars. Covered by `test/test_p256.ritz` (`test_ct_mult_*`, `test_ecdh_public_time_independent_of_key`). Still open: the mod-n arithmetic `ecdsa_p256_sign` runs on k and d (`scalar256_mul`'s reduction, `scalar256_add/sub`), AGAST #3879.
+
 ---
 
 ### M-11: `random_range_u64` has modulo bias

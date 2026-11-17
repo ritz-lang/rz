@@ -6,6 +6,7 @@ import ritzlib.sys
 import cryptosec.p256
 import cryptosec.mem
 import ritzlib.memory { memzero }
+import ritzlib.timer { now_nanos }
 
 # ============================================================================
 # Field Element Tests
@@ -1606,3 +1607,227 @@ fn test_ecdsa_sign_wipes_secrets() -> i32
     if stack_holds_2581(@sec.k_inv as *u8, sizeof(Scalar256))
         return 6  # k^-1 left on the stack
     return 0
+
+# ============================================================================
+# Constant-time scalar multiplication (AGAST #2187, REVIEW.md M-10)
+# ============================================================================
+# p256_scalar_mult takes secret scalars (the ECDSA nonce k, the private key in
+# pubkey_from_privkey, the TLS ECDHE key). It must do the same work for every
+# scalar: one doubling and one complete addition per bit, the sum kept or
+# dropped by a masked select. ecdsa_p256_verify's scalars are public and use
+# p256_scalar_mult_vartime.
+#
+# The timing tests compare a scalar of Hamming weight 1 against one of nearly
+# all ones. Double-and-add skips every doubling of the identity and every
+# addition for a zero bit, so the light scalar ran over 100x faster. A ladder
+# that doubles every bit but skips the addition on zero bits still runs the
+# light scalar 2.09x faster (measured). The constant-time ladder runs both at
+# 1.00x.
+#
+# A round takes the minimum of CT_RUNS_2187 interleaved runs of each scalar
+# and passes if the minima are within 1.5x: half again of headroom for noise,
+# still well under the 2.09x of the subtlest branchy ladder. Load only ever
+# adds time, so a constant-time ladder needs just one round where neither side
+# was preempted throughout; a test fails only if all CT_ROUNDS_2187 rounds
+# miss the bound. A branchy ladder misses every round: noise can only shrink
+# its gap by slowing the light scalar, never the reverse. A loaded gate host
+# (#2187: 1.25x over min-of-5 flipped once on a busy 12-core WSL box) cannot
+# fail it, and an unloaded one passes in the first round (about 7 ms).
+
+const CT_RUNS_2187: i32 = 7
+const CT_ROUNDS_2187: i32 = 5
+
+# The scalar `hex` (64 hex digits) times G, as affine (x, y). 0 if identity.
+fn mult_g_2187(x: *FeP256, y: *FeP256, hex: *u8) -> i32
+    var k: [32]u8
+    hex_2182(hex, @k[0], 32)
+    var g: P256Point
+    p256_point_generator(@g)
+    var r: P256Point
+    p256_scalar_mult(@r, @k[0], 32, @g)
+    if p256_point_on_curve(@r) != 1
+        return -1
+    return p256_point_to_affine(@r, x, y)
+
+# 1 if the affine points (ax, ay) and the Jacobian point q are equal.
+fn affine_eq_2187(ax: *FeP256, ay: *FeP256, q: *P256Point) -> i32
+    var qx: FeP256
+    var qy: FeP256
+    if p256_point_to_affine(q, @qx, @qy) != 1
+        return 0
+    if fep256_cmp(ax, @qx) != 0 or fep256_cmp(ay, @qy) != 0
+        return 0
+    return 1
+
+[[test]]
+fn test_ct_mult_zero_is_identity() -> i32
+    var x: FeP256
+    var y: FeP256
+    if mult_g_2187(@x, @y, c"0000000000000000000000000000000000000000000000000000000000000000") != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_ct_mult_order_is_identity() -> i32
+    # The last addition is (n-1)G + G = -G + G: the complete formula's P + (-P).
+    var x: FeP256
+    var y: FeP256
+    if mult_g_2187(@x, @y, c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551") != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_ct_mult_order_minus_one_is_neg_g() -> i32
+    var x: FeP256
+    var y: FeP256
+    if mult_g_2187(@x, @y, c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550") != 1
+        return 1
+    var g: P256Point
+    var neg: P256Point
+    p256_point_generator(@g)
+    p256_point_neg(@neg, @g)
+    if affine_eq_2187(@x, @y, @neg) != 1
+        return 2
+    return 0
+
+[[test]]
+fn test_ct_mult_order_plus_two_is_2g() -> i32
+    # The last addition is (n+1)G + G = G + G: the complete formula's P + P.
+    var x: FeP256
+    var y: FeP256
+    if mult_g_2187(@x, @y, c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632553") != 1
+        return 1
+    var g: P256Point
+    var two: P256Point
+    p256_point_generator(@g)
+    p256_point_double(@two, @g)
+    if affine_eq_2187(@x, @y, @two) != 1
+        return 2
+    return 0
+
+[[test]]
+fn test_ct_mult_all_ones_scalar() -> i32
+    # (2^256 - 1) mod n times G, from Python's reference double-and-add.
+    var x: FeP256
+    var y: FeP256
+    if mult_g_2187(@x, @y, c"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff") != 1
+        return 1
+    var want: [32]u8
+    var got: [32]u8
+    hex_2182(c"f72cbd240e26c0d21b1023179586eb532c6102c49c3677cc1a3d132b9db9d31a", @want[0], 32)
+    fep256_to_bytes(@x, @got[0])
+    if mem_eq(@got[0], @want[0], 32) != 1
+        return 2
+    hex_2182(c"43e4ca77e2a36621dc0dbd91bfe7a5d223250ef0cdca831ee453d93fa83408a7", @want[0], 32)
+    fep256_to_bytes(@y, @got[0])
+    if mem_eq(@got[0], @want[0], 32) != 1
+        return 3
+    return 0
+
+[[test]]
+fn test_ct_mult_of_identity_is_identity() -> i32
+    var o: P256Point
+    p256_point_identity(@o)
+    var k: [32]u8
+    hex_2182(priv_a_2182(), @k[0], 32)
+    var r: P256Point
+    p256_scalar_mult(@r, @k[0], 32, @o)
+    if p256_point_is_identity(@r) != 1
+        return 1
+    return 0
+
+[[test]]
+fn test_vartime_mult_matches_ct_mult() -> i32
+    # A non-generator base with Z != 1, so the Jacobian-to-projective
+    # conversion on entry is exercised too.
+    var g: P256Point
+    p256_point_generator(@g)
+    var base: P256Point
+    p256_point_double(@base, @g)
+    var k: [32]u8
+    hex_2182(priv_b_2182(), @k[0], 32)
+    var a: P256Point
+    var b: P256Point
+    p256_scalar_mult(@a, @k[0], 32, @base)
+    p256_scalar_mult_vartime(@b, @k[0], 32, @base)
+    var ax: FeP256
+    var ay: FeP256
+    if p256_point_to_affine(@a, @ax, @ay) != 1
+        return 1
+    if affine_eq_2187(@ax, @ay, @b) != 1
+        return 2
+    return 0
+
+[[noinline]]
+fn time_mult_2187(k: *u8, base: *P256Point) -> i64
+    var r: P256Point
+    let t0: i64 = now_nanos()
+    p256_scalar_mult(@r, k, 32, base)
+    return now_nanos() - t0
+
+[[noinline]]
+fn time_ecdh_public_2187(k: *u8) -> i64
+    var out: [65]u8
+    let t0: i64 = now_nanos()
+    p256_ecdh_public(@out[0], k)
+    return now_nanos() - t0
+
+# 0 if the two minima are within 1.5x of each other.
+fn within_ratio_2187(a: i64, b: i64) -> i32
+    var lo: i64 = a
+    var hi: i64 = b
+    if a > b
+        lo = b
+        hi = a
+    if hi * 100 > lo * 150
+        return 1
+    return 0
+
+# One timed run of `k`: through p256_scalar_mult on g if via_ecdh is 0,
+# through p256_ecdh_public otherwise.
+fn time_one_2187(via_ecdh: i32, k: *u8, g: *P256Point) -> i64
+    if via_ecdh != 0
+        return time_ecdh_public_2187(k)
+    return time_mult_2187(k, g)
+
+# 0 if, in any of CT_ROUNDS_2187 rounds, the minima of CT_RUNS_2187
+# interleaved runs of `light` and `heavy` are within 1.5x.
+fn time_independent_2187(via_ecdh: i32, light: *u8, heavy: *u8) -> i32
+    var g: P256Point
+    p256_point_generator(@g)
+    var round: i32 = 0
+    while round < CT_ROUNDS_2187
+        var min_light: i64 = 0x7FFFFFFFFFFFFFFF
+        var min_heavy: i64 = 0x7FFFFFFFFFFFFFFF
+        var i: i32 = 0
+        while i < CT_RUNS_2187
+            let tl: i64 = time_one_2187(via_ecdh, light, @g)
+            let th: i64 = time_one_2187(via_ecdh, heavy, @g)
+            if tl < min_light
+                min_light = tl
+            if th < min_heavy
+                min_heavy = th
+            i += 1
+        if within_ratio_2187(min_light, min_heavy) == 0
+            return 0
+        round += 1
+    return 1
+
+[[test]]
+fn test_ct_mult_time_independent_of_scalar_weight() -> i32
+    var light: [32]u8
+    var heavy: [32]u8
+    memzero(@light[0], 32)
+    light[31] = 1
+    hex_2182(c"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", @heavy[0], 32)
+    return time_independent_2187(0, @light[0], @heavy[0])
+
+[[test]]
+fn test_ecdh_public_time_independent_of_key() -> i32
+    # The TLS client's secp256r1 key share (#2182): priv 1 against n - 1.
+    var light: [32]u8
+    var heavy: [32]u8
+    memzero(@light[0], 32)
+    light[31] = 1
+    hex_2182(c"ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550", @heavy[0], 32)
+    return time_independent_2187(1, @light[0], @heavy[0])

@@ -618,55 +618,71 @@ fn fep256_sub_raw(c: *FeP256, a: *FeP256, b: *FeP256) -> u64
 # Reduction modulo p
 # ============================================================================
 
-# Reduce c (possibly >= p) to canonical form [0, p)
-# Uses the special structure of p = 2^256 - 2^224 + 2^192 + 2^96 - 1
+# The field operations below run in constant time: no branch or memory index
+# depends on an operand, so the secret-scalar ladder (p256_scalar_mult) does
+# the same work for every scalar (AGAST #2187, REVIEW.md M-10). A conditional
+# step is computed unconditionally and kept or dropped with a mask: all ones
+# (keep) or all zeros (drop), made from a 0/1 flag as 0 - flag.
+
+# c = mask ? src : c, for mask all ones or all zeros.
+fn fep256_cmov(c: *FeP256, src: *FeP256, mask: u64)
+    c.limbs[0] = (src.limbs[0] & mask) | (c.limbs[0] & ~mask)
+    c.limbs[1] = (src.limbs[1] & mask) | (c.limbs[1] & ~mask)
+    c.limbs[2] = (src.limbs[2] & mask) | (c.limbs[2] & ~mask)
+    c.limbs[3] = (src.limbs[3] & mask) | (c.limbs[3] & ~mask)
+
+# p with every limb ANDed with mask: p or 0.
+fn get_p256_prime_masked(p: *FeP256, mask: u64)
+    get_p256_prime(p)
+    p.limbs[0] = p.limbs[0] & mask
+    p.limbs[1] = p.limbs[1] & mask
+    p.limbs[2] = p.limbs[2] & mask
+    p.limbs[3] = p.limbs[3] & mask
+
+# Reduce c in [0, 2^256) to canonical form [0, p): one subtraction of p,
+# kept unless it borrowed (2^256 < 2p, so one is enough).
 pub fn fep256_reduce(c: *FeP256)
     var p: FeP256
     get_p256_prime(@p)
-
-    # If c >= p, subtract p
-    if fep256_cmp(c, @p) >= 0
-        fep256_sub_raw(c, c, @p)
+    var t: FeP256
+    let borrow: u64 = fep256_sub_raw(@t, c, @p)
+    fep256_cmov(c, @t, borrow - 1)
 
 # ============================================================================
 # Modular Addition: c = (a + b) mod p
 # ============================================================================
 
+# a, b < p, so the sum is below 2p: keep sum - p when the sum carried out of
+# 256 bits or the subtraction did not borrow.
 pub fn fep256_add(c: *FeP256, a: *FeP256, b: *FeP256)
     let carry: u64 = fep256_add_raw(c, a, b)
 
     var p: FeP256
     get_p256_prime(@p)
-
-    # If carry or c >= p, subtract p
-    if carry != 0 || fep256_cmp(c, @p) >= 0
-        fep256_sub_raw(c, c, @p)
+    var t: FeP256
+    let borrow: u64 = fep256_sub_raw(@t, c, @p)
+    fep256_cmov(c, @t, 0 - (carry | (borrow ^ 1)))
 
 # ============================================================================
 # Modular Subtraction: c = (a - b) mod p
 # ============================================================================
 
+# a - b, plus p (or plus 0) when it borrowed.
 pub fn fep256_sub(c: *FeP256, a: *FeP256, b: *FeP256)
     let borrow: u64 = fep256_sub_raw(c, a, b)
-
-    # If borrow, add p
-    if borrow != 0
-        var p: FeP256
-        get_p256_prime(@p)
-        fep256_add_raw(c, c, @p)
+    var p: FeP256
+    get_p256_prime_masked(@p, 0 - borrow)
+    fep256_add_raw(c, c, @p)
 
 # ============================================================================
 # Modular Negation: c = -a mod p = p - a
 # ============================================================================
 
+# 0 - a through fep256_sub, so -0 is 0 without a branch on a.
 pub fn fep256_neg(c: *FeP256, a: *FeP256)
-    if fep256_is_zero(a) == 1
-        fep256_zero(c)
-        return
-
-    var p: FeP256
-    get_p256_prime(@p)
-    fep256_sub_raw(c, @p, a)
+    var z: FeP256
+    fep256_zero(@z)
+    fep256_sub(c, @z, a)
 
 # ============================================================================
 # 64-bit Multiplication Helper (produces 128-bit result)
@@ -734,11 +750,10 @@ pub fn fep256_mul(c: *FeP256, a: *FeP256, b: *FeP256)
             carry = carry + hi
             bi += 1
 
-        # Propagate remaining carry
-        var k: i32 = ai + 4
-        while carry != 0 && k < 8
-            carry = add64_carry(prod[k], 0, carry, @prod[k])
-            k += 1
+        # Row ai's final carry: prod[ai + 4] is still zero (rows before
+        # reached ai + 3 at most) and the carry fits a limb, so it is a plain
+        # store, not a carry chain whose length depends on the operands.
+        prod[ai + 4] = carry
         ai += 1
 
     # Reduce modulo p using the P-256 reduction formula
@@ -884,16 +899,26 @@ fn fep256_reduce_512(prod: *u64, r: *FeP256)
     r.limbs[2] = (acc[4] as u64) | ((acc[5] as u64) << 32)
     r.limbs[3] = (acc[6] as u64) | ((acc[7] as u64) << 32)
 
-    # Handle final carry/borrow
+    # The value is now carry * 2^256 + r, carry in [-4, 4]. Fold carry in
+    # with a fixed number of masked steps: subtract p while carry > 0 (a
+    # borrow out of r takes one off carry), add p while carry < 0 (a carry
+    # out adds one). The extremes of the sum above need at most 5
+    # subtractions and 4 additions; a step whose mask is zero subtracts or
+    # adds 0. Then r < 2^256 and one fep256_reduce makes it canonical.
     var p: FeP256
-    get_p256_prime(@p)
-
-    while carry > 0
-        fep256_sub_raw(r, r, @p)
-        carry -= 1
-    while carry < 0
-        fep256_add_raw(r, r, @p)
-        carry += 1
+    var s: i32 = 0
+    while s < 5
+        let cu: u64 = carry as u64
+        let pos: u64 = ((cu | (0 - cu)) >> 63) & ((cu >> 63) ^ 1)
+        get_p256_prime_masked(@p, 0 - pos)
+        carry -= fep256_sub_raw(r, r, @p) as i64
+        s += 1
+    s = 0
+    while s < 4
+        let neg: u64 = (carry as u64) >> 63
+        get_p256_prime_masked(@p, 0 - neg)
+        carry += fep256_add_raw(r, r, @p) as i64
+        s += 1
 
     # Final reduction to ensure result < p
     fep256_reduce(r)
@@ -1088,6 +1113,8 @@ pub fn p256_point_neg(r: *P256Point, p: *P256Point)
 # ============================================================================
 # Point Doubling: R = 2*P (Jacobian coordinates)
 # ============================================================================
+# Variable time (the identity check): for public points and scalars only. The
+# secret-scalar path uses p256_proj_double below.
 # Using the formula for a = -3:
 # S = 4*X*Y^2
 # M = 3*X^2 + a*Z^4 = 3*(X - Z^2)*(X + Z^2) for a = -3
@@ -1154,6 +1181,8 @@ pub fn p256_point_double(r: *P256Point, p: *P256Point)
 # ============================================================================
 # Point Addition: R = P + Q (Jacobian coordinates)
 # ============================================================================
+# Variable time (identity, P == Q and P == -Q branches): for public points
+# only. The secret-scalar path uses the complete p256_proj_add below.
 # Using the standard formula:
 # U1 = X1*Z2^2, U2 = X2*Z1^2
 # S1 = Y1*Z2^3, S2 = Y2*Z1^3
@@ -1242,9 +1271,183 @@ pub fn p256_point_add(r: *P256Point, p: *P256Point, q: *P256Point)
 # ============================================================================
 # Scalar Multiplication: R = k * P
 # ============================================================================
-# Using double-and-add method
+# p256_scalar_mult is for secret scalars: the ECDSA nonce, a private key, the
+# TLS ECDHE key. It runs in constant time (AGAST #2187, REVIEW.md M-10): for
+# every bit of k, MSB first, one doubling and one addition, the sum kept or
+# dropped by a masked select on the bit. The point operations are the
+# complete formulas of Renes, Costello and Batina, "Complete addition formulas
+# for prime order elliptic curves" (EUROCRYPT 2016), Algorithms 4 and 6 for
+# a = -3. They work in homogeneous projective coordinates (X : Y : Z), x = X/Z
+# and y = Y/Z, identity (0 : 1 : 0), and are correct for every input pair,
+# P + P, P + (-P) and the identity included, so they need no special-case
+# branches. Every field operation they use is constant-time too.
+#
+# p256_scalar_mult_vartime is the old double-and-add over the Jacobian
+# p256_point_double / p256_point_add, whose time depends on k and on the
+# points. It is for public scalars only: ecdsa_p256_verify's u1 and u2.
 
+# dst = mask ? src : dst, for mask all ones or all zeros.
+fn p256_point_cmov(dst: *P256Point, src: *P256Point, mask: u64)
+    fep256_cmov(@dst.x, @src.x, mask)
+    fep256_cmov(@dst.y, @src.y, mask)
+    fep256_cmov(@dst.z, @src.z, mask)
+
+# Jacobian (X, Y, Z) to projective (X*Z : Y : Z^3). The Jacobian identity
+# (Z = 0, Y != 0) becomes (0 : Y : 0), the projective identity.
+fn p256_jacobian_to_proj(r: *P256Point, p: *P256Point)
+    var z2: FeP256
+    fep256_sqr(@z2, @p.z)
+    fep256_mul(@r.x, @p.x, @p.z)
+    fep256_copy(@r.y, @p.y)
+    fep256_mul(@r.z, @z2, @p.z)
+
+# Projective (X : Y : Z) to Jacobian (X*Z, Y*Z^2, Z). The identity keeps Z = 0.
+fn p256_proj_to_jacobian(r: *P256Point, p: *P256Point)
+    var z2: FeP256
+    fep256_sqr(@z2, @p.z)
+    fep256_mul(@r.x, @p.x, @p.z)
+    fep256_mul(@r.y, @p.y, @z2)
+    fep256_copy(@r.z, @p.z)
+
+# R = P + Q, projective, complete (RCB Algorithm 4, a = -3). r may alias p or q.
+fn p256_proj_add(r: *P256Point, p: *P256Point, q: *P256Point)
+    var b: FeP256
+    fep256_set_b(@b)
+    var t0: FeP256
+    var t1: FeP256
+    var t2: FeP256
+    var t3: FeP256
+    var t4: FeP256
+    var x3: FeP256
+    var y3: FeP256
+    var z3: FeP256
+    fep256_mul(@t0, @p.x, @q.x)
+    fep256_mul(@t1, @p.y, @q.y)
+    fep256_mul(@t2, @p.z, @q.z)
+    fep256_add(@t3, @p.x, @p.y)
+    fep256_add(@t4, @q.x, @q.y)
+    fep256_mul(@t3, @t3, @t4)
+    fep256_add(@t4, @t0, @t1)
+    fep256_sub(@t3, @t3, @t4)
+    fep256_add(@t4, @p.y, @p.z)
+    fep256_add(@x3, @q.y, @q.z)
+    fep256_mul(@t4, @t4, @x3)
+    fep256_add(@x3, @t1, @t2)
+    fep256_sub(@t4, @t4, @x3)
+    fep256_add(@x3, @p.x, @p.z)
+    fep256_add(@y3, @q.x, @q.z)
+    fep256_mul(@x3, @x3, @y3)
+    fep256_add(@y3, @t0, @t2)
+    fep256_sub(@y3, @x3, @y3)
+    fep256_mul(@z3, @b, @t2)
+    fep256_sub(@x3, @y3, @z3)
+    fep256_add(@z3, @x3, @x3)
+    fep256_add(@x3, @x3, @z3)
+    fep256_sub(@z3, @t1, @x3)
+    fep256_add(@x3, @t1, @x3)
+    fep256_mul(@y3, @b, @y3)
+    fep256_add(@t1, @t2, @t2)
+    fep256_add(@t2, @t1, @t2)
+    fep256_sub(@y3, @y3, @t2)
+    fep256_sub(@y3, @y3, @t0)
+    fep256_add(@t1, @y3, @y3)
+    fep256_add(@y3, @t1, @y3)
+    fep256_add(@t1, @t0, @t0)
+    fep256_add(@t0, @t1, @t0)
+    fep256_sub(@t0, @t0, @t2)
+    fep256_mul(@t1, @t4, @y3)
+    fep256_mul(@t2, @t0, @y3)
+    fep256_mul(@y3, @x3, @z3)
+    fep256_add(@y3, @y3, @t2)
+    fep256_mul(@x3, @t3, @x3)
+    fep256_sub(@x3, @x3, @t1)
+    fep256_mul(@z3, @t4, @z3)
+    fep256_mul(@t1, @t3, @t0)
+    fep256_add(@z3, @z3, @t1)
+    fep256_copy(@r.x, @x3)
+    fep256_copy(@r.y, @y3)
+    fep256_copy(@r.z, @z3)
+
+# R = 2P, projective, complete (RCB Algorithm 6, a = -3). r may alias p.
+fn p256_proj_double(r: *P256Point, p: *P256Point)
+    var b: FeP256
+    fep256_set_b(@b)
+    var t0: FeP256
+    var t1: FeP256
+    var t2: FeP256
+    var t3: FeP256
+    var x3: FeP256
+    var y3: FeP256
+    var z3: FeP256
+    fep256_sqr(@t0, @p.x)
+    fep256_sqr(@t1, @p.y)
+    fep256_sqr(@t2, @p.z)
+    fep256_mul(@t3, @p.x, @p.y)
+    fep256_add(@t3, @t3, @t3)
+    fep256_mul(@z3, @p.x, @p.z)
+    fep256_add(@z3, @z3, @z3)
+    fep256_mul(@y3, @b, @t2)
+    fep256_sub(@y3, @y3, @z3)
+    fep256_add(@x3, @y3, @y3)
+    fep256_add(@y3, @x3, @y3)
+    fep256_sub(@x3, @t1, @y3)
+    fep256_add(@y3, @t1, @y3)
+    fep256_mul(@y3, @x3, @y3)
+    fep256_mul(@x3, @x3, @t3)
+    fep256_add(@t3, @t2, @t2)
+    fep256_add(@t2, @t2, @t3)
+    fep256_mul(@z3, @b, @z3)
+    fep256_sub(@z3, @z3, @t2)
+    fep256_sub(@z3, @z3, @t0)
+    fep256_add(@t3, @z3, @z3)
+    fep256_add(@z3, @z3, @t3)
+    fep256_add(@t3, @t0, @t0)
+    fep256_add(@t0, @t3, @t0)
+    fep256_sub(@t0, @t0, @t2)
+    fep256_mul(@t0, @t0, @z3)
+    fep256_add(@y3, @y3, @t0)
+    fep256_mul(@t0, @p.y, @p.z)
+    fep256_add(@t0, @t0, @t0)
+    fep256_mul(@z3, @t0, @z3)
+    fep256_sub(@x3, @x3, @z3)
+    fep256_mul(@z3, @t0, @t1)
+    fep256_add(@z3, @z3, @z3)
+    fep256_add(@z3, @z3, @z3)
+    fep256_copy(@r.x, @x3)
+    fep256_copy(@r.y, @y3)
+    fep256_copy(@r.z, @z3)
+
+# The ladder's points: each is a multiple of P whose index is a prefix of k.
+struct P256LadderState
+    base: P256Point
+    acc: P256Point
+    sum: P256Point
+
+# R = k * P in constant time. k is k_len bytes big-endian; k_len is public.
+# k need not be reduced mod n. r may alias p.
 pub fn p256_scalar_mult(r: *P256Point, k: *u8, k_len: i32, p: *P256Point)
+    var st: P256LadderState
+    p256_jacobian_to_proj(@st.base, p)
+    fep256_zero(@st.acc.x)
+    fep256_one(@st.acc.y)
+    fep256_zero(@st.acc.z)
+
+    var byte_idx: i32 = 0
+    while byte_idx < k_len
+        var bit: i32 = 7
+        while bit >= 0
+            p256_proj_double(@st.acc, @st.acc)
+            p256_proj_add(@st.sum, @st.acc, @st.base)
+            let b: u64 = ((k[byte_idx] >> bit) & 1) as u64
+            p256_point_cmov(@st.acc, @st.sum, 0 - b)
+            bit -= 1
+        byte_idx += 1
+
+    p256_proj_to_jacobian(r, @st.acc)
+    secure_zero(@st as *u8, sizeof(P256LadderState))
+
+# R = k * P by double-and-add: variable time, public scalars only (see above).
+pub fn p256_scalar_mult_vartime(r: *P256Point, k: *u8, k_len: i32, p: *P256Point)
     p256_point_identity(r)
 
     # Process scalar from most significant byte to least
@@ -1612,8 +1815,9 @@ pub fn ecdsa_p256_verify(hash: *u8, sig: *EcdsaSignature, pub_key: *P256Point) -
 
     var u1G: P256Point
     var u2Q: P256Point
-    p256_scalar_mult(@u1G, @u1_bytes[0], 32, @G)
-    p256_scalar_mult(@u2Q, @u2_bytes[0], 32, pub_key)
+    # u1, u2 come from the public hash, signature and key: variable time.
+    p256_scalar_mult_vartime(@u1G, @u1_bytes[0], 32, @G)
+    p256_scalar_mult_vartime(@u2Q, @u2_bytes[0], 32, pub_key)
 
     var R_prime: P256Point
     p256_point_add(@R_prime, @u1G, @u2Q)
@@ -1662,9 +1866,8 @@ pub fn ecdsa_p256_pubkey_from_privkey(pub_key: *P256Point, priv_key: *Scalar256)
 # A key share is the uncompressed point 0x04 || X || Y, 65 bytes. The shared
 # secret is the X coordinate of d * Q, 32 bytes big-endian.
 #
-# p256_scalar_mult is not constant-time (REVIEW.md M-10). TLS key shares are
-# ephemeral, one scalar for one exchange, so there is no repeated secret to
-# average timing over; the shared fix belongs in p256_scalar_mult itself.
+# Both take the private scalar through p256_scalar_mult, which is
+# constant-time (AGAST #2187).
 
 # Write the key share for `priv` (32 bytes big-endian, in [1, n-1]) to `out`.
 pub fn p256_ecdh_public(out: *u8, priv: *u8)
