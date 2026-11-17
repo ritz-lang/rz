@@ -46,6 +46,7 @@ import ritzlib.memory
 import deref_field   # `.` through Deref (AGAST #3015 / #3509)
 import discarded_array   # AGAST #3189, on Sema since #3512
 import if_arm_value      # AGAST #1613, on Sema since #3512
+import ref_loan      # §13.5 borrow conflicts (AGAST #2438), on Sema since #3506
 
 # AGAST #3891: a use, in the input's own code, of a name that reaches the
 # input only through some module's plain `import` (import_vis.ritz).  A
@@ -75,6 +76,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
     var arm: *MatchArm = arms
     while arm != null
         let mark: i32 = sm.scope_top
+        ref_loan_enter()   # AGAST #3506: an arm is a block for loans
         if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_inner_name, arm.pattern_inner_name_len)
             bool_note_arm(sm, arm, scrut)
@@ -98,7 +100,10 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
         if arm.is_pass == 0
             let_check_expr(sm, arm.body)   # AGAST #2028: as emit_match_arm_body
         enum_as_int_expr(sm, arm.body)   # AGAST #2136 / #3511
+        if arm.is_pass == 0
+            ref_loan_check_value(sm, arm.body)   # AGAST #3506
         sema_walk_expr(sm, arm.body)
+        ref_loan_leave()
         sm.scope_top = mark
         arm = arm.next
 
@@ -217,7 +222,9 @@ fn sema_is_assign(kind: i32) -> i32
 # nothing, whose last statement is discarded too.
 fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
     let mark: i32 = sm.scope_top
+    ref_loan_enter()   # AGAST #3506: a loan ends with its holder's block
     sema_walk_block(sm, first, void_tail)
+    ref_loan_leave()
     sm.scope_top = mark
 
 # sema_walk_stmts, leaving what the block binds in scope for the caller to drop.
@@ -240,6 +247,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         else
             let_check_stmt(sm, st)
         sema_enum_as_int(sm, st, first)   # AGAST #2136 / #3511
+        ref_loan_check_stmt(sm, st)   # AGAST #2438 / #3506
         if st.kind == STMT_VAR_DECL
             if st.var_declared_type != TYPE_VOID
                 sema_vis_use(sm, st.span.line, st.span.col, st.var_type_name, st.var_type_name_len)
@@ -314,6 +322,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             else if st.kind == STMT_LOCAL_FIELD_INDEX_ASSIGN or st.kind == STMT_MEMBER_INDEX_ASSIGN
                 index_field_scalar_check(sm, st)   # AGAST #3799
             sema_walk_expr(sm, st.assign_value)
+        ref_loan_after(sm, st)   # a declaration holds its `@x` (AGAST #3506)
         st = st.next
 
 # enum_as_int (AGAST #2136 / #3511) on statement `st` of the list `first`:
@@ -341,6 +350,7 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
         bool_note_param(sm, p)
         p = p.next
     eai_begin_fn()
+    ref_loan_begin_fn()
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
     tail_value_check(sm, f)   # AGAST #2236 / #3511, after call_check's notes
     sm.scope_top = 0

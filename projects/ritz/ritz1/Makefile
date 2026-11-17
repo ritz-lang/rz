@@ -59,6 +59,7 @@ SOURCES = \
 	pass_value \
 	generic_method \
 	field_slot \
+	ref_loan \
 	sema_walk \
 	bool_check \
 	bool_kind \

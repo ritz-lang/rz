@@ -216,6 +216,14 @@ still run mid-lowering on `*EmitterState`, and
 
 - `ref_check` — a reference doesn't fit a by-value slot, nor a value a
   reference slot, and an array only fits a slot of its own element type.
+  Its §13.5 borrow conflicts moved to `ref_loan` (#3506); these value checks
+  are #3926's move.
+
+- `ref_loan` — a borrow of a place conflicts with an overlapping loan
+  (§13.5, R11 / R11a). A loan ends with its holder's block: Sema's blocks
+  and match arms (`ref_loan_enter` / `ref_loan_leave`), not the emitter's
+  scopes. A place's steps are typed from Sema's scope and notes (`rl_ty`);
+  what Sema can't type borrows nothing.
 
 - `sema_index_store` — an index store ritz1 can't lower is refused, not
   miscompiled.
