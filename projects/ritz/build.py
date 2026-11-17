@@ -938,14 +938,62 @@ def get_build_profile(config: dict, profile_name: str | None) -> dict:
     return result
 
 
-def get_output_dir(pkg_dir: Path, profile: dict) -> Path:
+def _crosses_foreign_symlink(logical: Path, root: Path) -> bool:
+    """True if `logical` passes through a symlink that is not an ancestor of
+    `root`, i.e. this tree reaches the package through a link another tree
+    may share. A symlink above ROOT (a symlinked home or ~/dev) is common to
+    the whole tree and splits nothing."""
+    root_ancestors = {root, *root.parents}
+    for p in (logical, *logical.parents):
+        if p in root_ancestors:
+            return False
+        if p.is_symlink():
+            return True
+    return False
+
+
+def get_output_dir(pkg_dir: Path, profile: dict, invoked_as: Path | None = None) -> Path:
     """Get output directory for a build profile.
 
     Per RFC #109 §3.1:
     - Debug builds → build/debug/
     - Release builds → build/release/
+
+    AGAST #3818: `invoked_as` is the path the package was named by, before
+    symlinks were resolved. Overlay roots and worktrees that reach one
+    package dir through a symlink would otherwise all link into the one
+    `<pkg>/build/<profile>/<bin>`, and a caller running it right after its
+    build returned could run the OTHER tree's binary. Such a build writes to
+    `ROOT/build/linked/<name>-<hash of the logical path>/<profile>/` instead,
+    a dir no other tree writes even if ROOT/build is itself shared.
     """
+    if invoked_as is not None:
+        logical = Path(os.path.abspath(invoked_as))
+        if not logical.is_dir():
+            logical = logical.parent     # named by its ritz.toml
+        root = Path(os.path.abspath(ROOT))
+        if _crosses_foreign_symlink(logical, root):
+            key = hashlib.sha256(str(logical).encode()).hexdigest()[:12]
+            return root / "build" / "linked" / f"{pkg_dir.name}-{key}" / profile["name"]
     return pkg_dir / "build" / profile["name"]
+
+
+def invoked_package_path(name_or_path: str | None) -> Path | None:
+    """The logical (symlinks unresolved) path a package was named by, for
+    get_output_dir. With no name the package is the cwd, whose getcwd() is
+    already resolved: take $PWD when it names the same directory."""
+    if name_or_path:
+        path = Path(name_or_path)
+        if not path.exists():
+            path = Path.cwd() / name_or_path
+        return Path(os.path.abspath(path)) if path.exists() else None
+    pwd = os.environ.get("PWD")
+    try:
+        if pwd and os.path.samefile(pwd, os.getcwd()):
+            return Path(pwd)
+    except OSError:
+        pass
+    return None
 
 
 # =============================================================================
@@ -2301,7 +2349,7 @@ class PackageBuildResult:
         return "; ".join(parts)
 
 
-def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None, compiler: str = "ritz0") -> PackageBuildResult:
+def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use_cache: bool = True, profile_name: str = None, compiler: str = "ritz0", invoked_as: Path | None = None) -> PackageBuildResult:
     """Build all binaries and libraries in a package.
 
     Args:
@@ -2315,10 +2363,16 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                      instead of ritz0.py. ritz1 has a minimal CLI so we skip the
                      --deps/--sources/--project-root plumbing and rely on -I
                      plus the standard RITZ_PATH for import resolution.
+        invoked_as:  The path the package was named by, symlinks unresolved
+                     (invoked_package_path). Reached through another tree's
+                     symlink, its outputs go to a per-root dir (#3818).
     """
     pkg_name = config["package"]["name"]
     profile = get_build_profile(config, profile_name)
-    out_dir = get_output_dir(pkg_dir, profile)
+    out_dir = get_output_dir(pkg_dir, profile, invoked_as=invoked_as)
+    # Outputs outside the package dir: it is shared with another tree, so
+    # nothing of this build may be written into it (#3818).
+    out_of_pkg = not out_dir.is_relative_to(pkg_dir)
 
     # Create output directory
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -2341,6 +2395,9 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
         print(f"📦 Building {pkg_name} ({profile['name']}) with {len(dependencies)} dependencies...")
     else:
         print(f"📦 Building {pkg_name} ({profile['name']})...")
+    if out_of_pkg:
+        print(f"  ↪ reached through a symlink: outputs go to {out_dir}, "
+              f"not {pkg_dir / 'build'} (#3818)")
 
     # What the compiler resolves imports against: the declared dependencies
     # plus the package's own name (AGAST #1538). Kept separate from
@@ -2449,6 +2506,11 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
             else:
                 print(f"  = {bin_config.name} up to date: {rel_path}")
             built.append(bin_path)
+            if out_of_pkg:
+                # No `<pkg>/<name>` link: the package dir is shared, and a
+                # link there would hand this tree's binary to the other's
+                # `./<name>` (#3818).
+                continue
 
             # RFC convention: maintain a symlink at pkg_dir/<name> pointing at
             # the profile binary. Integration tests in test/*.ritz commonly
@@ -2980,6 +3042,9 @@ def cmd_build(args):
 
     success = True
     setup_only = True   # every failure so far was a missing tool (#2141)
+    # The logical path, for the per-root output dir (#3818). --all globs
+    # under the cwd, so its package paths are already unresolved.
+    invoked_as = None if args.all else invoked_package_path(args.name)
     for pkg_dir, config in targets:
         # A test-only package (`[build] test_only = true`) deliberately declares
         # no [[bin]], so get_binaries() returns [] and build_package() returns an
@@ -2993,7 +3058,8 @@ def cmd_build(args):
             print(f"📦 {config['package']['name']} (test-only, nothing to build)")
             continue
 
-        result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
+        result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler,
+                               invoked_as=invoked_as if invoked_as else pkg_dir)
         # `result.ok` is "every declared binary produced an artifact", NOT
         # "at least one did" — see PackageBuildResult (AGAST #1314).
         if not result.ok:
