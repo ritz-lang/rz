@@ -214,6 +214,47 @@ fn main() -> i32
     ),
 }
 
+# --- colon slices `a[lo:hi]`, `a[:hi]`, `a[lo:]` (AGAST #3766) -------------------
+# ritz0's colon slice (ritz_ast.Slice) is `a[lo..hi]` with a missing end taken
+# as 0 / `a.len()`.  ritz1 parsed only `a[:]`, so ritzlib/tests/
+# test_slice_syntax.ritz failed whole (0/13) under ritz1.
+
+_COLON_VEC = """\
+import ritzlib.memory
+import ritzlib.gvec
+
+fn make() -> Vec<i64>
+    var v: Vec<i64> = vec_new<i64>()
+    v.push(10)
+    v.push(20)
+    v.push(30)
+    v.push(40)
+    return v
+
+fn main() -> i32
+"""
+
+COLON_SLICE = {
+    # [20, 30]: 2 * 10 + 30.
+    "colon_slice_closed": (_COLON_VEC + """\
+    var v: Vec<i64> = make()
+    var s: Vec<i64> = v[1:3]
+    return (s.len() * 10 + s[1]) as i32
+""", 50),
+    # [10, 20, 30]: 3 * 10 + 30.
+    "colon_slice_open_start": (_COLON_VEC + """\
+    var v: Vec<i64> = make()
+    var s: Vec<i64> = v[:3]
+    return (s.len() * 10 + s[2]) as i32
+""", 60),
+    # The open end is the receiver's own length, with postfix ops after it:
+    # [30, 40] has len 2 and [0] 30.
+    "colon_slice_open_end": (_COLON_VEC + """\
+    var v: Vec<i64> = make()
+    return (v[2:].len() * 100 + v[2:][0]) as i32
+""", 230),
+}
+
 # --- monomorph: a bare `T` local in a generic body ------------------------------
 
 GENERIC_LOCAL = {
@@ -252,6 +293,7 @@ PROGRAMS = {
     **REF_TYPE_ARG,
     **QUALIFIED_PATTERN,
     **FULL_SLICE,
+    **COLON_SLICE,
     **GENERIC_LOCAL,
 }
 
@@ -331,6 +373,13 @@ def test_ritz1_qualified_enum_pattern(ritz1_bin, tmp_path, name):
 @pytest.mark.parametrize("name", sorted(FULL_SLICE))
 def test_ritz1_full_slice(ritz1_bin, tmp_path, name):
     """Item 5: `a[:]` died with `cannot parse item`."""
+    _check(_run("ritz1", tmp_path, name), name)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(COLON_SLICE))
+def test_ritz1_colon_slice(ritz1_bin, tmp_path, name):
+    """`a[lo:hi]`, `a[:hi]` and `a[lo:]` died with `unexpected ':'`."""
     _check(_run("ritz1", tmp_path, name), name)
 
 

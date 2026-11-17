@@ -333,7 +333,17 @@ REJECTED.update({
     "cstr_span_field": ("struct H\n    s: Span<u8>\n" + _fn("", 'let h = H { s: c"abc" }\nh.s.len'),
                         4, 20, _not_a("Span<u8>")),
     "cstr_strview_let": (_fn("", 'let s: StrView = c"abc"\ns.len'), 2, 22, _not_a("StrView")),
+    # AGAST #3766: a UFCS helper's receiver is its first param, so the literal
+    # meets the one after it: `strview_cmp(self, other: StrView)`'s `other`.
+    "cstr_strview_ufcs_arg": (_fn("v: StrView", 'v.cmp(c"abc") as i64'), 2, 11, _not_a("StrView")),
 })
+
+# AGAST #3766: ritz1 matched a UFCS method's arguments from the helper's first
+# param when it wasn't named `self`, so `strview_cmp_cstr(s: StrView, cstr: *u8)`
+# met `c"abc"` with its StrView receiver param and refused it, failing all of
+# ritzlib/tests/test_strview.ritz. Compiled, not run: a one-file link has no
+# ritzlib.strview, and ritz0 resolves no free `strview_*` helper of a test's own.
+_UFCS_RECEIVER = 'fn main() -> i32\n    let v: StrView = "abc"\n    v.cmp_cstr(c"abc")\n'
 
 # AGAST #3483 (R62): in a `Span<u8>` slot a `"..."` literal is a `Span<u8>` of its
 # bytes. Each slot checks the length and every byte, past an escape, and exits 42.
@@ -565,6 +575,13 @@ def test_a_literal_fits_an_extern_param(request, tmp_path, compiler):
 def test_a_literal_fits_an_async_param(request, tmp_path):
     # ritz0 only: ritz1 has no `await`, and ritz0's output for this doesn't link yet.
     proc, _ = _compile(request, "ritz0", tmp_path, _ASYNC_ARG)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_ufcs_receiver_is_not_an_argument(request, tmp_path, compiler):
+    proc, _ = _compile(request, compiler, tmp_path, _UFCS_RECEIVER)
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
