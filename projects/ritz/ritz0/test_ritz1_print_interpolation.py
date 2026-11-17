@@ -145,6 +145,8 @@ pub fn main() -> i32
     print("call={twice(x)} sum={x + 1} cmp={x > 3} bool_fn={is_big(x)}\\n")
     print("member={p.x},{p.y} ptr_fn={name()} spaced={ x }\\n")
     show(true, 2)
+    # A keyword literal is not a name: `{true}` is the bool (AGAST #1651).
+    print("lit={true},{false}\\n")
     return 0
 """
 
@@ -196,7 +198,7 @@ def test_placeholder_expressions(tmp_path):
         "exprs",
         EXPRS,
         b"call=42 sum=22 cmp=true bool_fn=true\nmember=3,-4 ptr_fn=ritz spaced=21\n"
-        b"param=true not=true and=true\n",
+        b"param=true not=true and=true\nlit=true,false\n",
     )
 
 
@@ -227,6 +229,9 @@ REJECT = {
     "float": 'let f: f64 = 1.5\n    print("f={f}\\n")',
     "empty": 'print("e={}\\n")',
     "bad_expr": 'print("b={1 +}\\n")',
+    # A keyword is not an identifier (AGAST #1651: ritz0 read `{if}` as a
+    # name and died with a Python traceback).
+    "keyword": 'print("k={if}\\n")',
 }
 
 
@@ -243,6 +248,8 @@ def test_unprintable_is_a_compile_error_in_both(tmp_path, case):
             f"{compiler} accepted unprintable interpolation ({case}):\n"
             f"{comp.stdout[-1000:]}\n{comp.stderr[-1000:]}"
         )
+        # A diagnostic, not a crash: a traceback also exits nonzero.
+        assert "Traceback" not in comp.stderr, comp.stderr[-2000:]
         if compiler == "ritz1":
             # Located: the diagnostic names the print literal's line.
             line = next(

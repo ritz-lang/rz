@@ -7687,7 +7687,9 @@ class LLVMEmitter:
                 ptr, length = self._format_int_digits(value, expr)
                 self._emit_write_syscall(fd_val, ptr, length)
             else:
-                raise ValueError(f"Cannot print value of type {ty}")
+                # A located diagnostic, not a traceback (AGAST #1651).
+                raise EmitError(f"Cannot print value of type {ty}",
+                                getattr(expr, "span", None))
 
     def _emit_write_str(self, ptr: ir.Value, fd: int = 1):
         """Write a null-terminated string to `fd` using strlen + write."""

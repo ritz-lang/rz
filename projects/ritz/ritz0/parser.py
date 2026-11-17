@@ -564,8 +564,10 @@ class Parser:
         if not expr_str:
             raise ParseError("Empty interpolation expression", parent_span)
 
-        # Simple case: just an identifier (most common)
-        if expr_str.isidentifier():
+        # Simple case: just an identifier (most common). A keyword is not one:
+        # `{true}` is the bool literal and `{if}` a located parse error, not
+        # an Ident the emitter later fails to resolve (AGAST #1651).
+        if expr_str.isidentifier() and expr_str not in KEYWORDS:
             return rast.Ident(parent_span, expr_str)
 
         # Complex expression: lex and parse it
