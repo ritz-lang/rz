@@ -341,4 +341,80 @@ train projects/ritz/ritzlib/net.ritz
 log="$(bash "$TR" gate 2>/dev/null)"
 has "$(cat "$log")" "^AFTER=.*train.sh.* pkgs test $tb" "a ritzlib-only train adds the package tests to its gate"
 has "$(pt)" "^PKG PASS +ritz/ritzlib/tests" "a ritzlib-only train tests ritzlib/tests"
+
+# 10. Stacked trains (AGAST #3809).  A train holds at most 8 cars; the next
+# train builds on its tail (`build --next`, or overflow) and lands after it.
+st1() { cat "$(git -C "$T/train" rev-parse --absolute-git-dir)/RZ_TRAIN"; }
+tipof() { sed -nE "s/^TRAIN $1 .*tip=([0-9a-f]{12}).*/\1/p" <<<"$2"; }
+fetch; git -C "$M" checkout -q main; git -C "$M" merge -q --ff-only origin/main
+
+# 10a. Train 2 builds on train 1's tail while train 1 gates, and leaves train
+# 1's worktree and state alone; land takes 1, promotes 2, then lands 2.
+b9="$(git -C "$M" rev-parse origin/main)"
+a1="$(room sa1 s/a1 A1)"; a2="$(room sa2 s/a2 A2)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "sa1:$a1" "sa2:$a2" 2>&1)"
+has "$out" "^TRAIN 1 base=${b9:0:12} .*n=2 gate=needed" "train 1 builds on main"
+t1="$(git -C "$T/train" rev-parse HEAD)"; s1="$(st1)"
+log1="$(bash "$TR" gate)"
+c1="$(room sb1 s/b1 B1)"; c2="$(room sb2 s/b2 B2)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "sb1:$c1" "sb2:$c2" 2>&1)"
+has "$out" "^TRAIN 2 base=${t1:0:12} .*n=2 gate=needed" "build --next stacks train 2 on train 1's tail"
+t2="$(tipof 2 "$out")"
+[[ "$(git -C "$T/train" rev-parse HEAD)" == "$t1" && "$(st1)" == "$s1" ]] \
+    && ok "build --next leaves train 1's worktree and state untouched" \
+    || bad "build --next leaves train 1's worktree and state untouched"
+out="$(bash "$TR" show 2>&1)"
+has "$out" "^== train 2 " "show lists the stacked train"
+out="$(bash "$TR" land "$log1" 2>&1)"
+has "$out" "^MERGED +sa2 " "land takes train 1"
+! grep -q "^MERGED +sb1" <<<"$out" && ok "land leaves train 2 for its own gate" || bad "land leaves train 2 for its own gate"
+has "$out" "^NEXT +base=${t1:0:12} tip=$t2 n=2 gate=needed" "land promotes train 2, its base now main"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$t1" ]] && ok "main is train 1's tail" || bad "main is train 1's tail"
+out="$(bash "$TR" land 2>&1)"; has "$out" "gate needed" "the promoted train still needs its gate"
+log2="$(bash "$TR" gate)"
+[[ "$(sed -n 's/^SHA=//p' "$log2")" == "$t2"* ]] && ok "gate gates the promoted train's tip" \
+    || bad "gate gates the promoted train's tip"
+out="$(bash "$TR" land "$log2" 2>&1)"
+has "$out" "^MERGED +sb2 " "train 2 lands after train 1"
+[[ "$(git -C "$M" rev-parse --short=12 origin/main)" == "$t2" ]] && ok "main is train 2's tail" || bad "main is train 2's tail"
+out="$(bash "$TR" land 2>&1)"; has "$out" "no train built" "nothing left to land"
+
+# 10b. 10 cars: trains of 8 and 2, the second on the first's tail.
+fetch; git -C "$M" checkout -q main; b10="$(git -C "$M" rev-parse origin/main)"
+items=(); for i in 0 1 2 3 4 5 6 7 8 9; do items+=("sc$i:$(room "sc$i" "s/c$i" "C$i")"); done
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "${items[@]}" 2>&1)"
+has "$out" "^TRAIN 1 base=${b10:0:12} .*n=8 gate=needed" "the first 8 cars form train 1"
+tt1="$(tipof 1 "$out")"
+has "$out" "^TRAIN 2 base=$tt1 .*n=2 gate=needed" "cars 9-10 form train 2 on train 1's tail"
+[[ "$(git -C "$M" rev-list --count "$b10..$tt1")" == 8 ]] && ok "train 1 holds 8 commits" || bad "train 1 holds 8 commits"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+[[ "$(grep -c '^MERGED' <<<"$out")" == 8 ]] && ok "landing train 1 merges 8 cars" || bad "landing train 1 merges 8 cars"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+has "$out" "^MERGED +sc9 " "train 2 lands its cars"
+
+# 10c. A car rebased onto an unlanded train commit boards, not BAD.
+fetch; git -C "$M" checkout -q main
+d1="$(room sd1 s/d1 D1)"; d2="$(room sd2 s/d2 D2)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "sd1:$d1" "sd2:$d2" 2>&1)"; td="$(git -C "$T/train" rev-parse HEAD)"
+e="$(room se s/e E "$td")"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "se:$e" 2>&1)"
+has "$out" "^KEPT +se ${e:0:12}" "a car rebased onto the gating train's tail is KEPT"
+has "$out" "^TRAIN 2 .*n=1 gate=not-needed" "its own gate ran on that tree: no gate"
+out="$(bash "$TR" build "sd1:$d1" "sd2:$d2" "se:$e" 2>&1)"
+has "$out" "^KEPT +se ${e:0:12}" "a rebuilt train has the same tail, so it is still KEPT"
+f="$(room sf s/f F)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "sf:$f" "sd1:$d1" "sd2:$d2" "se:$e" 2>&1)"
+has "$out" "^APPLIED +se ${e:0:12}" "a car on re-picked train commits (same patches) is APPLIED"
+out="$(bash "$TR" build "sd1:$d1" "se:$e" 2>&1)"
+has "$out" "^BAD +se .*not in the train" "a car on a commit that isn't in the train is BAD"
+
+# 10d. CONFLICT names the train car and the files.
+fetch; git -C "$M" checkout -q main
+root="$(git -C "$M" rev-list --max-parents=0 origin/main)"
+x="$(room sx s/x X)"; y="$(room sy s/x Y)"; z="$(room sz a ZZ "$root")"
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "sx:$x" "sy:$y" "sz:$z" 2>&1)"
+has "$out" "^CONFLICT +sy ${y:0:12} with sx on s/x$" "CONFLICT names the train car and file"
+has "$out" "^CONFLICT +sz ${z:0:12} with main on a$" "a conflict with no train car names main"
 echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

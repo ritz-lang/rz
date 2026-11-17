@@ -5,26 +5,46 @@
 # on its own base, so instead of each room rebasing and re-gating in turn,
 # rz stacks them on origin/main in queue order and gates only the top.
 #
-#   train.sh build <branch>:<sha> ...   stack the commits on origin/main
-#   train.sh gate                       gate the stack's tip (prints the log)
-#   train.sh land [<log>]               push the gated tip to main
-#   train.sh show                       print the current train
+#   train.sh build <branch>:<sha> ...         stack the cars on origin/main,
+#                                             replacing every train
+#   train.sh build --next <branch>:<sha> ...  keep train 1 (the one gating) and
+#                                             stack these cars on its tail as
+#                                             train 2, replacing trains 2+
+#   train.sh gate                       gate train 1's tail (prints the log)
+#   train.sh land [<log>]               push train 1's tail to main; train 2
+#                                       becomes train 1
+#   train.sh show                       print every train, in landing order
 #   train.sh pkgs list|test <base>      the touched packages' tests (#3363;
 #                                       the gate runs `test` after its jobs)
 #
-# `build` prints one line per item, then a summary:
+# Stacked trains (AGAST #3809): a train holds at most 8 cars (RZ_TRAIN_MAX);
+# car 9 onward start the next train on its tail.  Each train has its own
+# worktree (train 1 first used $RZ_TRAIN_WT, the next free slot <wt>-2, ...)
+# and state file, so building train 2 while train 1 gates leaves train 1's
+# tree and state alone.  Trains gate and land in order: land takes train 1
+# only, and train 2's base, train 1's tail, is then main.  The landing order
+# is the slot list in <common git dir>/RZ_TRAINS.
+#
+# `build` prints one line per item, then a summary per train:
 #   APPLIED  <branch> <sha12> as <new12>   (cherry-picked; same patch)
-#   KEPT     <branch> <sha12>              (already on the base: same SHA)
-#   CONFLICT <branch> <sha12>              (left out; its room must rebase)
+#   KEPT     <branch> <sha12>              (its parent is the tail: same SHA)
+#   CONFLICT <branch> <sha12> with <cars|main> on <files>
+#                                          (left out; its room must rebase)
 #   EMPTY    <branch> <sha12>              (left out; already on main)
 #   BAD      <branch> <sha12>: <why>       (left out; a room mistake)
-#   TRAIN base=<12> tip=<12> n=<applied> gate=<needed|not-needed>
+#   TRAIN <k> base=<12> tip=<12> n=<cars> gate=<needed|not-needed>
+#
+# A car may sit on unlanded train commits (a CONFLICT bounced to "rebase onto
+# <tail>"): its commits over main must be that train's commits, by SHA or by
+# patch, plus its own one.  Picks keep the car's committer date, so a rebuilt
+# train over the same cars has the same SHAs and such a car stays KEPT.
 #
 # rz never resolves a conflict or edits a commit: a CONFLICT is aborted and
 # skipped, and the room gets the turn once the train lands.
 #
 # Env overrides (for tests):
-#   RZ_TRAIN_WT    train worktree      (default ~/dev/ritz-lang/rz-train)
+#   RZ_TRAIN_WT    train 1's worktree  (default ~/dev/ritz-lang/rz-train)
+#   RZ_TRAIN_MAX   cars per train      (default 8)
 #   RZ_MAIN_WT     main checkout       (default ~/dev/ritz-lang/rz)
 #   RZ_TRAIN_NAME  gate name           (default train)
 #   RZ_GATE_SCRIPT run-gate.sh to use  (default: beside this script)
@@ -41,34 +61,101 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 MAIN_WT="${RZ_MAIN_WT:-$HOME/dev/ritz-lang/rz}"
 TRAIN_WT="${RZ_TRAIN_WT:-$HOME/dev/ritz-lang/rz-train}"
+MAX="${RZ_TRAIN_MAX:-8}"
 NAME="${RZ_TRAIN_NAME:-train}"
 GATE="${RZ_GATE_SCRIPT:-$HERE/run-gate.sh}"
 RESERVED="${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}/.train-reserved"
 
 die() { echo "error: $*" >&2; exit 1; }
-g() { git -C "$TRAIN_WT" "$@"; }
+WT="$TRAIN_WT"                      # the train being worked on (use_slot)
+g() { git -C "$WT" "$@"; }
 state() { echo "$(g rev-parse --absolute-git-dir)/RZ_TRAIN"; }
+field() { sed -n "s/^$1=//p" "$2"; }
+
+slot_wt() { if [[ $1 == 1 ]]; then echo "$TRAIN_WT"; else echo "$TRAIN_WT-$1"; fi; }
+use_slot() { WT="$(slot_wt "$1")"; }
+qfile() { echo "$(git -C "$MAIN_WT" rev-parse --path-format=absolute --git-common-dir)/RZ_TRAINS"; }
+# The trains' slots in landing order.  No list yet but a train in slot 1:
+# a train built before stacking existed.
+queue() {
+    local q; q="$(qfile)"
+    if [[ -f "$q" ]]; then cat "$q"
+    elif [[ -e "$TRAIN_WT/.git" ]] \
+        && [[ -f "$(git -C "$TRAIN_WT" rev-parse --absolute-git-dir)/RZ_TRAIN" ]]; then echo 1
+    fi
+}
+front() { local s; s="$(queue | head -1)"; [[ -n "$s" ]] || die "no train built"; use_slot "$s"; }
 
 ensure_worktree() {
-    if [[ ! -e "$TRAIN_WT/.git" ]]; then
-        git -C "$MAIN_WT" fetch -q origin
-        git -C "$MAIN_WT" worktree add -q --detach "$TRAIN_WT" origin/main
+    if [[ ! -e "$WT/.git" ]]; then
+        git -C "$MAIN_WT" worktree add -q --detach "$WT" "$1"
     fi
 }
 
-cmd_build() {
-    [[ $# -ge 1 ]] || die "usage: $0 build <branch>:<sha> ..."
-    ensure_worktree
-    g fetch -q origin
+# start_train <slot> <base>: an empty train on <base> in <slot>'s worktree.
+start_train() {
+    use_slot "$1"; ensure_worktree "$2"
     # A half-finished pick from an interrupted run must not leak in.
     g cherry-pick --abort >/dev/null 2>&1 || true
     g reset -q --hard
-    local base; base="$(g rev-parse origin/main)"
-    g checkout -q --detach "$base"
-    local st; st="$(state)"
-    printf 'BASE=%s\n' "$base" > "$st"
+    g checkout -q --detach "$2"
+    printf 'BASE=%s\n' "$2" > "$(state)"
+    TBASE="$2"; n=0; picked=0; k=$((k + 1)); slots+=("$1")
+}
 
-    local n=0 picked=0 item branch sha full parent count
+# finish_train: the summary.  A later train nothing boarded is dropped.
+finish_train() {
+    local st need=needed; st="$(state)"
+    # Nothing new to test: either nothing applied, or cars kept as-is (their
+    # rooms' gates ran on exactly this tree).
+    [[ $picked -eq 0 ]] && need=not-needed
+    printf 'TIP=%s\nGATE=%s\n' "$(g rev-parse HEAD)" "$need" >> "$st"
+    echo "TRAIN $k base=${TBASE:0:12} tip=$(g rev-parse --short=12 HEAD) n=$n gate=$need"
+    if [[ $n -eq 0 && $k -gt 1 ]]; then
+        rm -f "$st"; unset 'slots[-1]'; echo "         (empty: dropped)"
+    fi
+}
+
+# conflict_with <files>: the cars in the trains so far that touch <files>.
+conflict_with() {
+    local files="$1" b room new hit=() s st
+    for s in "${slots[@]}"; do
+        st="$(git -C "$(slot_wt "$s")" rev-parse --absolute-git-dir)/RZ_TRAIN"
+        while read -r b room new; do
+            if grep -qxF -f <(g diff --name-only "$new^" "$new") <<<"$files"; then hit+=("$b"); fi
+        done < <(field ITEM "$st")
+    done
+    if [[ ${#hit[@]} -eq 0 ]]; then echo main; else (IFS=,; echo "${hit[*]}"); fi
+}
+
+cmd_build() {
+    local next=0
+    if [[ "${1:-}" == --next ]]; then next=1; shift; fi
+    [[ $# -ge 1 ]] || die "usage: $0 build [--next] <branch>:<sha> ..."
+    git -C "$MAIN_WT" fetch -q origin
+    local old=() s base
+    mapfile -t old < <(queue)
+    slots=(); k=0
+    if [[ $next -eq 1 && ${#old[@]} -gt 0 ]]; then
+        # Train 1 is gating: leave its worktree and state alone.
+        use_slot "${old[0]}"
+        base="$(field TIP "$(state)")"
+        [[ "$base" == "$(g rev-parse HEAD)" ]] || die "train 1 moved since build; rebuild it"
+        slots=("${old[0]}"); k=1; old=("${old[@]:1}")
+    else
+        [[ $next -eq 0 ]] || echo "note: no train to stack on; building on origin/main" >&2
+        base="$(git -C "$MAIN_WT" rev-parse origin/main)"
+    fi
+    for s in ${old[@]+"${old[@]}"}; do
+        [[ -e "$(slot_wt "$s")/.git" ]] && rm -f "$(git -C "$(slot_wt "$s")" rev-parse --absolute-git-dir)/RZ_TRAIN"
+    done
+    rm -f "$(qfile)"
+    # The lowest slot not holding a kept train.
+    free_slot() { local i=1; while printf '%s\n' ${slots[@]+"${slots[@]}"} | grep -qx "$i"; do i=$((i + 1)); done; echo "$i"; }
+    start_train "$(free_slot)" "$base"
+    local first_new=$k
+
+    local item branch sha full parent count mb extra files
     for item in "$@"; do
         branch="${item%%:*}"; sha="${item#*:}"
         [[ "$branch" != "$item" && -n "$sha" ]] || die "bad item '$item' (want <branch>:<sha>)"
@@ -79,64 +166,84 @@ cmd_build() {
         if [[ "$(g rev-parse -q --verify "origin/$branch" || true)" != "$full" ]]; then
             echo "BAD      $branch ${full:0:12}: origin/$branch is not this commit"; continue
         fi
-        count="$(g rev-list --count "$(g merge-base origin/main "$full")..$full")"
+        # One commit over main, or over train commits (a car bounced to
+        # rebase onto a train's tail): every commit under it must be in the
+        # trains so far, as an ancestor of the tail or as the same patch.
+        mb="$(g merge-base origin/main "$full")"
+        count="$(g rev-list --count "$mb..$full")"
         if [[ "$count" != 1 ]]; then
-            echo "BAD      $branch ${full:0:12}: $count commits over main, want 1"; continue
+            extra="$(g cherry HEAD "$full^" "$mb" | grep -c '^+' || true)"
+            if [[ "$extra" != 0 ]]; then
+                echo "BAD      $branch ${full:0:12}: $count commits over main, $extra not in the train; want 1 over it"
+                continue
+            fi
+        fi
+        if [[ $n -ge $MAX ]]; then
+            finish_train
+            start_train "$(free_slot)" "$(g rev-parse HEAD)"
         fi
         parent="$(g rev-parse "$full^")"
-        if [[ $n -eq 0 && "$parent" == "$(g rev-parse HEAD)" ]]; then
-            # Already on the base: keep its SHA, so its own gate still counts.
+        if [[ "$parent" == "$(g rev-parse HEAD)" ]]; then
+            # On the tail already: keep its SHA, so its own gate still counts.
             g merge -q --ff-only "$full"
             echo "KEPT     $branch ${full:0:12}"
-            printf 'ITEM=%s %s %s\n' "$branch" "$full" "$full" >> "$st"
+            printf 'ITEM=%s %s %s\n' "$branch" "$full" "$full" >> "$(state)"
             n=$((n + 1)); continue
         fi
-        if ! g cherry-pick --empty=drop "$full" >/dev/null 2>&1; then
+        # The car's committer date: the same car on the same tail is the
+        # same commit, however often the train is rebuilt.
+        if ! GIT_COMMITTER_DATE="$(g log -1 --format=%cd --date=raw "$full")" \
+                g cherry-pick --empty=drop "$full" >/dev/null 2>&1; then
+            files="$(g diff --name-only --diff-filter=U)"
             g cherry-pick --abort >/dev/null 2>&1 || g reset -q --hard
-            echo "CONFLICT $branch ${full:0:12}"; continue
+            echo "CONFLICT $branch ${full:0:12} with $(conflict_with "$files") on $(paste -sd, <<<"$files")"
+            continue
         fi
         # --empty=drop succeeds without a commit when main already has it.
-        if [[ "$(g rev-list --count "$base..HEAD")" -le $n ]]; then
+        if [[ "$(g rev-list --count "$TBASE..HEAD")" -le $n ]]; then
             echo "EMPTY    $branch ${full:0:12}"; continue
         fi
         echo "APPLIED  $branch ${full:0:12} as $(g rev-parse --short=12 HEAD)"
-        printf 'ITEM=%s %s %s\n' "$branch" "$full" "$(g rev-parse HEAD)" >> "$st"
+        printf 'ITEM=%s %s %s\n' "$branch" "$full" "$(g rev-parse HEAD)" >> "$(state)"
         n=$((n + 1)); picked=$((picked + 1))
     done
-
-    local need=needed
-    # Nothing new to test: either nothing applied, or one commit kept as-is
-    # (its room's gate ran on exactly this tree).
-    [[ $picked -eq 0 ]] && need=not-needed
+    finish_train
+    printf '%s\n' "${slots[@]}" > "$(qfile)"
     # No train gate is coming to take over the reservation: let rooms in.
-    [[ $need == not-needed ]] && rm -f "$RESERVED"
-    printf 'TIP=%s\nGATE=%s\n' "$(g rev-parse HEAD)" "$need" >> "$st"
-    echo "TRAIN base=${base:0:12} tip=$(g rev-parse --short=12 HEAD) n=$n gate=$need"
+    if [[ $first_new -eq 1 ]]; then
+        use_slot "${slots[0]}"
+        [[ "$(field GATE "$(state)")" == not-needed ]] && rm -f "$RESERVED"
+    fi
+    return 0
 }
 
 cmd_show() {
-    local st; st="$(state)"
-    [[ -f "$st" ]] || die "no train built"
-    cat "$st"
+    local s i=0
+    [[ -n "$(queue)" ]] || die "no train built"
+    for s in $(queue); do
+        use_slot "$s"; i=$((i + 1))
+        echo "== train $i $WT"
+        cat "$(state)"
+    done
 }
 
 cmd_gate() {
+    front
     local st; st="$(state)"
-    [[ -f "$st" ]] || die "no train built"
-    [[ "$(sed -n 's/^TIP=//p' "$st")" == "$(g rev-parse HEAD)" ]] \
+    [[ "$(field TIP "$st")" == "$(g rev-parse HEAD)" ]] \
         || die "train worktree moved since build; rebuild"
     # Package tests for what the train touches (AGAST #3363); none, and so no
     # extra step, for a compiler-only train.  stdout is only the log path.
     local base pkgs after=""
-    base="$(sed -n 's/^BASE=//p' "$st")"
-    pkgs="$(cd "$TRAIN_WT" && bash "$HERE/train.sh" pkgs list "$base")"
+    base="$(field BASE "$st")"
+    pkgs="$(cd "$WT" && bash "$HERE/train.sh" pkgs list "$base")"
     if [[ -n "$pkgs" ]]; then
         echo "PKGS $(tr '\n' ' ' <<<"$pkgs")" >&2
         after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
     fi
     # Train priority: the next free slot goes to this gate ahead of room
     # gates (run-gate.sh, AGAST #3317).
-    RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$after" "$GATE" "$TRAIN_WT" "$NAME"
+    RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$after" "$GATE" "$WT" "$NAME"
 }
 
 # --- Package tests (AGAST #3363) ------------------------------------------
@@ -281,12 +388,12 @@ cmd_pkgs() {
 }
 
 cmd_land() {
+    front
     local st; st="$(state)"
-    [[ -f "$st" ]] || die "no train built"
     local base tip need
-    base="$(sed -n 's/^BASE=//p' "$st")"
-    tip="$(sed -n 's/^TIP=//p' "$st")"
-    need="$(sed -n 's/^GATE=//p' "$st")"
+    base="$(field BASE "$st")"
+    tip="$(field TIP "$st")"
+    need="$(field GATE "$st")"
     [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train worktree moved since build; rebuild"
     [[ "$tip" != "$base" ]] || die "train is empty; nothing to land"
     if [[ "$need" == needed ]]; then
@@ -298,6 +405,7 @@ cmd_land() {
             || die "gate did not pass ($(grep '^EXIT=' "$log" | tail -1 || echo 'no verdict'))"
     fi
     g fetch -q origin
+    # A stacked train's base is the tail of the train that landed before it.
     [[ "$(g rev-parse origin/main)" == "$base" ]] \
         || die "main moved since the train was built (${base:0:12} -> $(g rev-parse --short=12 origin/main)); rebuild and re-gate"
     # Not forced: GitHub refuses it if main moved in the meantime.
@@ -312,9 +420,19 @@ cmd_land() {
     local b room merged
     while read -r b room merged; do
         echo "MERGED   $b ${room:0:12} as ${merged:0:12}"
-    done < <(sed -n 's/^ITEM=//p' "$st")
+    done < <(field ITEM "$st")
     echo "MAIN     ${tip:0:12}"
     rm -f "$st"
+    # Promote the next train: its base, this train's tail, is main now.
+    local rest; rest="$(queue | tail -n +2)"
+    if [[ -n "$rest" ]]; then
+        printf '%s\n' "$rest" > "$(qfile)"
+        use_slot "$(head -1 <<<"$rest")"; st="$(state)"
+        echo "NEXT     base=$(field BASE "$st" | cut -c1-12) tip=$(field TIP "$st" | cut -c1-12)" \
+            "n=$(field ITEM "$st" | wc -l) gate=$(field GATE "$st")"
+    else
+        rm -f "$(qfile)"
+    fi
 }
 
 case "${1:-}" in
@@ -323,5 +441,5 @@ case "${1:-}" in
     land)  shift; cmd_land "$@" ;;
     pkgs)  shift; cmd_pkgs "$@" ;;
     show)  cmd_show ;;
-    *) echo "usage: $0 build <branch>:<sha> ... | gate | land [<log>] | show | pkgs list|test <base>" >&2; exit 2 ;;
+    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate | land [<log>] | show | pkgs list|test <base>" >&2; exit 2 ;;
 esac

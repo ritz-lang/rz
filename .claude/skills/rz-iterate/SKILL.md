@@ -527,9 +527,12 @@ order and gates only the top of the stack. If that passes, every commit
 below it has passed too, and they all land in one push. This is the one
 gate `rz` runs; it still never edits, rebases or fixes a room's commit.
 
-`.claude/skills/rz-iterate/train.sh` does the git work in its own worktree,
-`~/dev/ritz-lang/rz-train` (created on first use, detached HEAD, never a
-room's). Tests: `bash .claude/skills/rz-iterate/test-train.sh`.
+`.claude/skills/rz-iterate/train.sh` does the git work in its own
+worktrees, one per train in flight: `~/dev/ritz-lang/rz-train`, then
+`rz-train-2`, `rz-train-3`, ... as trains stack (created on first use,
+detached HEAD, never a room's; reused once their train lands). Each train has its own worktree and state,
+so building the next train never touches the one gating. Tests:
+`bash .claude/skills/rz-iterate/test-train.sh`.
 
 **Terms:** a **car** is one room's REAPed commit (one squashed commit),
 cherry-picked onto a train. A **train** is a stack of cars gated once, at
@@ -559,15 +562,10 @@ This is also how Borque's conductor works.
 - **A train fails:** find the culprit by reasoning first, bisection second
   (step 6).
 
-**Until AGAST #3809 lands**, `train.sh` keeps one train and always builds
-on `origin/main`, and it marks a car rebased onto an unlanded tail `BAD`.
-So, while a train gates, don't run `train.sh build`, because it would
-reset the gating train's worktree. Instead, trial-stack the queued cars
-on the gating tail in a throwaway worktree (`git worktree add --detach
-$(mktemp -d) <tail>`, then `git cherry-pick` each car) to find conflicts
-early. Run `train.sh build` for the next train as soon as `land` pushes.
-Until then, bounce a conflicting car to rebase onto `main` once its train
-lands, not onto the unlanded tail.
+`train.sh` numbers trains in landing order: **train 1** is the one gating
+(or about to), train 2 is stacked on its tail, and so on (AGAST #3809).
+`gate` and `land` always act on train 1; `land` then promotes train 2 to
+train 1.
 
 1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it)
    `append_scratchpad_item` immediately, even while a train is gating, then
@@ -578,24 +576,43 @@ lands, not onto the unlanded tail.
    quote `SHA=<12> EXIT=0` from its gate log, and that SHA must be the REAP
    SHA's prefix. Without it, it's a room mistake (step 7). (`train.sh build`
    checks the rest: the branch tip is the REAP SHA, and it's one commit.)
-3. **Build the train** from every unchecked item, oldest first
-   (`get_scratchpad` first, never from memory):
+3. **Build the train** from the unchecked items, oldest first
+   (`get_scratchpad` first, never from memory).
+   **No train gating:** every unchecked item, on `origin/main`:
    ```bash
    .claude/skills/rz-iterate/train.sh build ritz-task-2593:3f42ab80 ritz-task-1844:4b699a83 ...
    ```
-   It prints one line per item (`KEPT`, `APPLIED`, `CONFLICT`, `EMPTY`,
-   `BAD`) and a `TRAIN ... n=<k> gate=<needed|not-needed>` summary.
-   `rz-larb` boards like any room (`rz-larb:<sha>`).
-4. **Gate it, unless `gate=not-needed`** (a lone commit already on `main`:
-   its own gate covers it):
+   **A train is gating:** `--next` keeps train 1 untouched and stacks the
+   given cars on its tail as train 2. Pass every unchecked item that is not
+   in train 1 (`train.sh show` lists train 1's `ITEM`s), and run it again
+   each time a REAP arrives, so a conflict shows up at once; each run
+   rebuilds trains 2+ from scratch (same cars on the same tail give the same
+   SHAs: picks keep the car's committer date):
+   ```bash
+   .claude/skills/rz-iterate/train.sh build --next ritz-task-2601:9c1d03ee ...
+   ```
+   Either way it prints one line per item (`KEPT`, `APPLIED`, `CONFLICT`,
+   `EMPTY`, `BAD`) and one `TRAIN <k> base=<12> tip=<12> n=<cars>
+   gate=<needed|not-needed>` line per train. Past 8 cars it starts the next
+   train on the last one's tail by itself (10 cars: `TRAIN 1 ... n=8`, then
+   `TRAIN 2 base=<train 1's tip> ... n=2`). A car whose branch sits on an
+   unlanded train commit (step 7's bounce) boards: `KEPT` when its parent
+   is the tail it lands on (its own gate ran on that tree), `APPLIED` when
+   it sits on the same patches at other SHAs; `BAD ... not in the train`
+   only if a commit under it is in no train. `rz-larb` boards like any room
+   (`rz-larb:<sha>`).
+4. **Gate train 1, unless `gate=not-needed`** (only cars already on its
+   base or on each other: their own gates cover them). Never gate train 2
+   while train 1 gates: its gate starts when train 1 lands:
    ```bash
    LOG=$(.claude/skills/rz-iterate/train.sh gate)
    .claude/skills/rz-iterate/run-gate.sh --wait "$LOG"    # Bash run_in_background
    ```
    Run the wait with `run_in_background`, so it wakes this room when the gate
    ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
-   (slots, nudges) meanwhile. On a context reset, `train.sh show` prints the
-   train, and the highest-numbered `gate-logs/train-<sha12>-<n>.log` holds the gate. The
+   (slots, nudges, `build --next` for REAPs that arrive) meanwhile. On a
+   context reset, `train.sh show` prints every train (`== train <k>` then
+   its state), and the highest-numbered `gate-logs/train-<sha12>-<n>.log` holds the gate. The
    train gate uses omegalisk's one gate slot. It may wait for a room gate
    that already holds the slot, but it takes the next free one ahead of any
    waiting room gate (`.train-waiting`, #3317; FIFO otherwise, #3364).
@@ -646,10 +663,14 @@ lands, not onto the unlanded tail.
    ```bash
    .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed
    ```
-   It refuses if the log isn't for the train's tip, didn't pass, or `main`
-   moved since the build; then rebuild and re-gate. It pushes the tip to
-   `main` (never forced), fast-forwards `~/dev/ritz-lang/rz`, and prints
-   `MERGED <branch> <room sha12> as <main sha12>` per commit. It also
+   It lands train 1 only. It refuses if the log isn't for train 1's tip,
+   didn't pass, or `main` moved since the build; then rebuild and re-gate.
+   It pushes the tip to `main` (never forced), fast-forwards
+   `~/dev/ritz-lang/rz`, and prints `MERGED <branch> <room sha12> as <main
+   sha12>` per commit. If a train was stacked behind it, it prints `NEXT
+   base=<12> tip=<12> n=<cars> gate=<...>`: that train is train 1 now, its
+   base (the tail just pushed) is `main`, so gate it straight away (step 4),
+   or land it with no log if `gate=not-needed`. It also
    renews the gate's reservation (#3365), so the 10 minutes count from the
    push: build and gate the next train promptly. A `build` with
    `gate=not-needed` drops the reservation; if nothing else is queued, just
@@ -684,18 +705,23 @@ lands, not onto the unlanded tail.
    passes, land it and gate the suspect alone on the new `main`. If no car
    stands out, or the guess was wrong (the train still fails without it),
    fall back to halving. With `k` cars, rebuild with the first `ceil(k/2)`
-   and gate that. If it passes, land it, and the rest ride the next train.
+   and gate that (a plain `build`, which drops every stacked train too;
+   pass their cars after the halved ones and the rest stack behind it as
+   train 2). If it passes, land it, and the rest ride the next train.
    If it fails, halve again. Reasoning only picks which car to drop; `rz`
    still never edits, fixes or debugs a car. A single car that fails on
    top of `main` goes back to its room: check its item and send it one
    line, "rebase onto <main sha7>: your commit fails the gate on top of
    `main`", with the gate's failing lines. Its fixed REAP goes to the back
    of the queue.
-7. **`CONFLICT`:** bounce it now, not after the train lands. Check its item
-   and send its room one line: "your commit conflicts with <conflicting
-   car's ritz-task-id> in the train; rebase onto <tail sha12>, resolve,
-   re-gate and REAP". Use the tail of the train it was trying to board, so
-   the rebased car stacks onto the back of that train. Its next REAP joins
+7. **`CONFLICT`:** bounce it now, not after the train lands. The line names
+   what it hit: `CONFLICT <branch> <sha12> with <car>[,<car>] on
+   <file>[,<file>]` (the train cars touching the conflicted files, or
+   `main` when no train car does). Check its item and send its room one
+   line: "your commit conflicts with <car> on <files> in the train; rebase
+   onto <tail sha12>, resolve, re-gate and REAP". `<tail>` is the `tip=` of
+   the last `TRAIN` line, so the rebased car stacks onto the back of the
+   trains; `build` then accepts it (step 3). Its next REAP joins
    the back of the queue. **`BAD` or a missing gate quote** leave that
    item out too: tell its room which check failed. **`EMPTY`** means the
    patch is already on `main`: check the item, then close and clean up as
