@@ -282,56 +282,18 @@ class Lexer:
                     pchars.append('{')
                     self._advance()
                     self._advance()
+                elif not self._has_placeholder_close(quote):
+                    # No matching } — treat { as literal character
+                    chars.append('{')
+                    pchars.append('{')
+                    self._advance()
                 else:
-                    # Before starting interpolation, verify there's a matching }
-                    # before the closing quote or newline. Without this check,
-                    # strings like "{" would be misinterpreted as interpolation.
-                    has_matching_brace = False
-                    scan_depth = 1
-                    scan_offset = 1
-                    while True:
-                        sc = self._peek(scan_offset)
-                        if sc == '\0' or sc == '\n' or sc == quote:
-                            break
-                        if sc == '{':
-                            scan_depth += 1
-                        elif sc == '}':
-                            scan_depth -= 1
-                            if scan_depth == 0:
-                                has_matching_brace = True
-                                break
-                        scan_offset += 1
-
-                    if not has_matching_brace:
-                        # No matching } — treat { as literal character
-                        chars.append('{')
-                        pchars.append('{')
-                        self._advance()
-                    else:
-                        # Start of interpolation
-                        has_interpolation = True
-                        parts.append(''.join(pchars))
-                        chars = []
-                        pchars = []
-                        self._advance()  # consume '{'
-
-                        # Read expression until matching '}'
-                        expr_chars = []
-                        brace_depth = 1
-                        while brace_depth > 0:
-                            c = self._peek()
-                            if c == '\0' or c == '\n':
-                                raise LexerError("Unterminated interpolation in string", start_span)
-                            if c == '{':
-                                brace_depth += 1
-                            elif c == '}':
-                                brace_depth -= 1
-                                if brace_depth == 0:
-                                    break
-                            expr_chars.append(c)
-                            self._advance()
-                        self._advance()  # consume closing '}'
-                        expr_strs.append(''.join(expr_chars))
+                    # Start of interpolation
+                    has_interpolation = True
+                    parts.append(''.join(pchars))
+                    chars = []
+                    pchars = []
+                    expr_strs.append(self._read_placeholder(start_span))
             elif ch == '}' and quote == '"':
                 # Check for }} (escaped brace)
                 if self._peek(1) == '}':
@@ -382,6 +344,45 @@ class Lexer:
 
         return Token(TokenType.STRING, ''.join(chars), start_span,
                      print_value=''.join(pchars))
+
+    def _has_placeholder_close(self, quote: str) -> bool:
+        """With the lexer on a `{`, is there a matching `}` before the closing
+        quote or the end of the line? Without this check, strings like "{"
+        would be misinterpreted as interpolation."""
+        depth = 1
+        offset = 1
+        while True:
+            sc = self._peek(offset)
+            if sc == '\0' or sc == '\n' or sc == quote:
+                return False
+            if sc == '{':
+                depth += 1
+            elif sc == '}':
+                depth -= 1
+                if depth == 0:
+                    return True
+            offset += 1
+
+    def _read_placeholder(self, start_span: Span) -> str:
+        """Consume `{expr}` (the lexer is on the `{`) and return the raw
+        expression text between the braces."""
+        self._advance()  # consume '{'
+        expr_chars = []
+        depth = 1
+        while True:
+            c = self._peek()
+            if c == '\0' or c == '\n':
+                raise LexerError("Unterminated interpolation in string", start_span)
+            if c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            expr_chars.append(c)
+            self._advance()
+        self._advance()  # consume closing '}'
+        return ''.join(expr_chars)
 
     def _read_escape(self, braces: bool) -> str:
         """Consume the escape at the current position (the char after the

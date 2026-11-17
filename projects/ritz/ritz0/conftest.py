@@ -159,7 +159,6 @@ SMOKE_FILES = (
     "test_parser.py",
     "test_lexer.py",
     "test_const_eval.py",
-    "test_symbol_table.py",
     "test_type_checker.py",
     "test_move_checker.py",
     "test_monomorph.py",

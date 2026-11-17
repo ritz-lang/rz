@@ -82,8 +82,6 @@ ARTIFACT_SKIPS = [
     "SKIPPED [1] test_skipfmt.py:9: ritz1 not found",
     "SKIPPED [1] test_metadata.py:603: No .ritz-cache directory found",
     "SKIPPED [1] test_metadata.py:607: No .ritz-meta files found in cache",
-    "SKIPPED [1] test_symbol_table.py:210: test_level1.ritz not found",
-    "SKIPPED [1] test_symbol_table.py:622: No struct-importing test level found",
     "SKIPPED [2] test_x.py:5: sample program missing",
     "SKIPPED [1] test_x.py:5: Missing fixture file",
     "SKIPPED [1] test_x.py:5: /tmp/x: No such file or directory",
