@@ -174,6 +174,88 @@ def test_real_budget_goes_red_on_one_extra_test_file():
                     f"collapse a matrix into table rows before adding cases"]
 
 
+# --- AGAST #3897: CPU-s normalised by the host's calibration -------------------
+#
+# The same suite measured 1,454.5 CPU-s on toffee and 2,347 on omegalisk.
+# tools/cpu_calibrate.py times a fixed workload on the gate host; its CPU-s
+# over `[calibration] reference_cpu_s` is the host's factor, and every CPU
+# figure is divided by it before it meets a cap.
+
+
+def _cal(tmp_path: Path, cpu_s: float) -> Path:
+    p = tmp_path / "cal.json"
+    p.write_text(json.dumps({"cpu_s": cpu_s, "jobs": 4, "rounds": 3, "samples": [cpu_s]}))
+    return p
+
+
+@pytest.mark.unit
+def test_factor_divides_the_suite_figure_before_the_cap():
+    b = budget(default=1000.0, suite=1100.0)
+    r = report({"test_a.py": 800.0, "test_b.py": 800.0})  # 1,600 raw
+    assert len(ctb.check(r, b)) == 1
+    assert ctb.check(r, b, factor=1.6) == []  # 1,000 normalised
+    errs = ctb.check(r, b, factor=1.4)  # 1,142.9 normalised
+    assert len(errs) == 1
+    assert "1600.0 CPU-s raw" in errs[0] and "1142.9 normalised" in errs[0], errs
+
+
+@pytest.mark.unit
+def test_factor_divides_each_files_figure_before_its_cap():
+    b = budget(default=90.0, suite=1e9,
+               overrides={"test_big.py": {"cpu_s": 200.0, "ticket": 1}})
+    r = report({"test_a.py": 100.0, "test_big.py": 240.0})
+    assert len(ctb.check(r, b)) == 2
+    assert ctb.check(r, b, factor=1.25) == []  # 80 and 192
+    errs = ctb.check(r, b, partial=True, factor=1.05)  # 95.2 and 228.6
+    assert len(errs) == 2 and "95.2" in errs[0] + errs[1]
+
+
+@pytest.mark.unit
+def test_factor_is_measured_over_the_budgets_reference(tmp_path):
+    b = budget()
+    b["calibration"] = {"reference_cpu_s": 2.0}
+    assert ctb.host_factor(b, _cal(tmp_path, 3.2)) == pytest.approx(1.6)
+    assert ctb.host_factor(b, None) == 1.0
+
+
+@pytest.mark.unit
+def test_a_missing_calibration_file_is_an_error_not_factor_one(tmp_path, capsys):
+    """The gate passes --calibration; a calibration that did not run must not
+    quietly grade the suite on the reference host's scale."""
+    rep = tmp_path / "cost.json"
+    rep.write_text(json.dumps(report({"test_a.py": 1.0})))
+    b = tmp_path / "budget.toml"
+    b.write_text("[calibration]\nreference_cpu_s = 2.0\n\n[suite]\ncpu_s = 90.0\n\n"
+                 "[file]\ndefault_cpu_s = 60.0\n")
+    assert ctb.main([str(rep), "--budget", str(b),
+                     "--calibration", str(tmp_path / "absent.json")]) == 2
+    assert "absent.json" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_budget_line_prints_raw_factor_and_normalised(tmp_path, monkeypatch, capsys):
+    monkeypatch.delenv("RITZ_TEST_BUDGET_PARTIAL", raising=False)
+    rep = tmp_path / "cost.json"
+    rep.write_text(json.dumps(report({"test_a.py": 50.0, "test_b.py": 50.0})))
+    b = tmp_path / "budget.toml"
+    b.write_text("[calibration]\nreference_cpu_s = 2.0\n\n[suite]\ncpu_s = 90.0\n\n"
+                 "[file]\ndefault_cpu_s = 60.0\n")
+    cal = _cal(tmp_path, 2.5)  # factor 1.25: 100 raw -> 80 normalised
+    assert ctb.main([str(rep), "--budget", str(b), "--calibration", str(cal)]) == 0
+    out = capsys.readouterr().out
+    assert "100.0 CPU-s raw" in out and "factor 1.250" in out and "80.0 normalised" in out
+    assert "cap 90.0" in out
+    # Uncalibrated, the same report is over the cap, and the line says so.
+    assert ctb.main([str(rep), "--budget", str(b)]) == 1
+    assert "uncalibrated" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_real_budget_names_its_reference_workload_figure():
+    b = ctb.load_budget(ctb.DEFAULT_BUDGET)
+    assert b["calibration"]["reference_cpu_s"] > 0
+
+
 # --- end to end: a planted slow file, red then green -------------------------
 
 PLANTED = '''
@@ -276,6 +358,56 @@ def test_gate_pytest_step_runs_the_budget_check_after_pytest():
     chk = next(i for i, ln in enumerate(lines) if "check_test_budget.py" in ln)
     assert chk > py
     assert "set -o pipefail" in step  # a red pytest still stops the step
+
+
+@pytest.mark.unit
+def test_gate_pytest_step_calibrates_before_pytest_and_checks_with_it():
+    """AGAST #3897: the factor is measured on this host, just before the suite,
+    and the check reads the same file the calibration wrote."""
+    lines = _ritz0_step().splitlines()
+    cal = next(i for i, ln in enumerate(lines) if "cpu_calibrate.py" in ln)
+    py = next(i for i, ln in enumerate(lines) if "-m pytest" in ln)
+    chk = next(i for i, ln in enumerate(lines) if "check_test_budget.py" in ln)
+    assert cal < py < chk
+    out = lines[cal].split("--out", 1)[1].split()[0].lstrip("=")
+    assert f"--calibration {out}" in lines[chk] or f"--calibration={out}" in lines[chk]
+
+
+@pytest.mark.unit
+def test_gate_pytest_step_puts_basetemp_on_disk_and_removes_it():
+    """AGAST #3897: on toffee /tmp is tmpfs, and a /tmp full of tmp_path trees
+    put the host under memory pressure that inflated per-file CPU-s 2-12x.
+    The step makes a fresh directory under ~/.cache (a disk on every gate
+    host and on CI), hands it to --basetemp, and removes it however pytest
+    exits.  Fresh per run: two gates on one host must not share it."""
+    step = _ritz0_step()
+    lines = step.splitlines()
+    py = next(ln for ln in lines if "-m pytest" in ln)
+    assert '--basetemp="$BASETEMP"' in py
+    mk = next(ln for ln in lines if ln.strip().startswith("BASETEMP="))
+    assert "mktemp -d" in mk and "$HOME/.cache/" in mk and "/tmp" not in mk
+    assert lines.index(mk) < lines.index(py)
+    assert any("trap" in ln and 'rm -rf "$BASETEMP"' in ln and "EXIT" in ln
+               for ln in lines[:lines.index(py)])
+
+
+@pytest.mark.integration
+def test_gate_basetemp_snippet_makes_a_fresh_dir_and_removes_it(tmp_path):
+    """The step's BASETEMP/trap lines, run as the step runs them (bash -e):
+    a directory that exists during the run and is gone after, even on failure."""
+    lines = _ritz0_step().splitlines()
+    snippet = "\n".join(ln.strip() for ln in lines
+                        if ln.strip().startswith(("BASETEMP=", "mkdir -p", "trap ")))
+    for tail, rc in (("exit 0", 0), ("false", 1)):
+        seen = tmp_path / f"seen{rc}"
+        script = f'{snippet}\necho "$BASETEMP" > {seen}\ntest -d "$BASETEMP"\n{tail}\n'
+        r = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script],
+                           env={**os.environ, "HOME": str(tmp_path)},
+                           capture_output=True, text=True, timeout=30, check=False)
+        assert r.returncode == rc, r.stderr
+        made = Path(seen.read_text().strip())
+        assert made.is_relative_to(tmp_path / ".cache")
+        assert not made.exists()
 
 
 @pytest.mark.unit

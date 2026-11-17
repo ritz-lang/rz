@@ -2,6 +2,7 @@
 """Hold the ritz0 suite to its time budget (AGAST #3453, LARB review/5 F1).
 
     check_test_budget.py COST_REPORT [--budget tools/test_budget.toml]
+                         [--calibration CPU_CALIBRATION]
 
 COST_REPORT is what `pytest --cost-report=PATH` writes (ritz0/cost_meter.py):
 CPU-seconds per test file.  The budget file sets
@@ -15,8 +16,21 @@ CPU-seconds per test file.  The budget file sets
                             a higher cap for one file, naming the ticket that
                             pays it down; it fails once the file is gone
 
-Exit 1 with one line per breach, 0 when everything fits.  Every limit is
-multiplied by $RITZ_TEST_BUDGET_SCALE (default 1) for a slower machine.
+Exit 1 with one line per breach, 0 when everything fits, 2 when the
+calibration named is missing.  Every limit is multiplied by
+$RITZ_TEST_BUDGET_SCALE (default 1) for a slower machine.
+
+CPU-seconds are not the same number on every host (AGAST #3897: the same suite
+measured 1,454.5 on toffee, 2,347 on omegalisk).  CPU_CALIBRATION is what
+tools/cpu_calibrate.py wrote on this host just before the suite: a fixed
+workload's CPU-s.  Over the budget's
+
+    [calibration] reference_cpu_s   that workload's CPU-s on the host the
+                                    caps were set on
+
+it is the host's factor, and every CPU figure is divided by it before it meets
+a cap.  The budget line prints the raw figure, the factor and the normalised
+one.  Without --calibration the factor is 1 and the line says "uncalibrated".
 
 RITZ_TEST_BUDGET_PARTIAL=1 says the report covers a subset of the suite (the
 gate's likely-failures-first pass, AGAST #3456): only the per-file checks
@@ -47,12 +61,22 @@ def load_budget(path: Path) -> dict:
     return b
 
 
+def host_factor(budget: dict, calibration: Path | None) -> float:
+    """This host's CPU-s over the reference host's, for the same workload."""
+    if calibration is None:
+        return 1.0
+    here = float(json.loads(Path(calibration).read_text())["cpu_s"])
+    return here / float(budget["calibration"]["reference_cpu_s"])
+
+
 def check(report: dict, budget: dict, scale: float = 1.0,
-          partial: bool = False) -> list[str]:
+          partial: bool = False, factor: float = 1.0) -> list[str]:
     """Every breach of `budget` in `report`, as one line each.
 
     `partial`: the report is a subset of the suite, so the suite caps and
     "this override's file is gone" cannot be judged from it.
+    `factor`: the host's calibration (host_factor); CPU figures are divided
+    by it before they meet a cap.
     """
     errs = []
     files = report["files"]
@@ -68,7 +92,7 @@ def check(report: dict, budget: dict, scale: float = 1.0,
                         f"remove it from the budget")
 
     for name, v in sorted(files.items()):
-        cpu = float(v["cpu_s"])
+        cpu = float(v["cpu_s"]) / factor
         o = overrides.get(name)
         limit = float(o["cpu_s"]) * scale if o else default
         if cpu > limit:
@@ -79,10 +103,12 @@ def check(report: dict, budget: dict, scale: float = 1.0,
     if partial:
         return errs
 
-    total = sum(float(v["cpu_s"]) for v in files.values())
+    raw = sum(float(v["cpu_s"]) for v in files.values())
+    total = raw / factor
     cap = float(budget["suite"]["cpu_s"]) * scale
     if total > cap:
-        errs.append(f"suite: {total:.1f} CPU-s over its cap of {cap:.1f}")
+        errs.append(f"suite: {raw:.1f} CPU-s raw / factor {factor:.3f} = "
+                    f"{total:.1f} normalised, over its cap of {cap:.1f}")
 
     # Not scaled: every machine runs the same number of tests.
     max_tests = budget["suite"].get("tests")
@@ -97,21 +123,35 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("report", type=Path)
     ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET)
+    ap.add_argument("--calibration", type=Path, default=None,
+                    help="tools/cpu_calibrate.py's report for this host (AGAST #3897)")
     a = ap.parse_args(argv)
     scale = float(os.environ.get("RITZ_TEST_BUDGET_SCALE", "1") or 1)
     partial = os.environ.get("RITZ_TEST_BUDGET_PARTIAL", "") not in ("", "0")
     report = json.loads(a.report.read_text())
-    errs = check(report, load_budget(a.budget), scale, partial=partial)
+    budget = load_budget(a.budget)
+    if a.calibration is not None and not a.calibration.is_file():
+        print(f"test budget: no calibration at {a.calibration}: "
+              f"tools/cpu_calibrate.py did not run on this host")
+        return 2
+    factor = host_factor(budget, a.calibration)
+    errs = check(report, budget, scale, partial=partial, factor=factor)
     scope = ", partial: per-file checks only" if partial else ""
-    total = sum(float(v["cpu_s"]) for v in report["files"].values())
+    raw = sum(float(v["cpu_s"]) for v in report["files"].values())
+    cal = (f"factor {factor:.3f}" if a.calibration is not None
+           else "factor 1, uncalibrated")
+    cap = float(budget["suite"]["cpu_s"]) * scale
+    figures = (f"{raw:.1f} CPU-s raw, {cal}, {raw / factor:.1f} normalised "
+               f"(cap {cap:.1f})")
     if errs:
-        print(f"test budget: {len(errs)} breach(es) ({a.budget.name}, scale {scale:g}{scope}):")
+        print(f"test budget: {len(errs)} breach(es), {figures} "
+              f"({a.budget.name}, scale {scale:g}{scope}):")
         for e in errs:
             print(f"  {e}")
         print("Size the matrix to the rule and batch it: docs/TESTING.md, "
               "\"What a ritz0 pytest case costs\".")
         return 1
-    print(f"test budget: ok, {total:.1f} CPU-s across {len(report['files'])} files "
+    print(f"test budget: ok, {figures} across {len(report['files'])} files "
           f"({a.budget.name}, scale {scale:g}{scope})")
     return 0
 

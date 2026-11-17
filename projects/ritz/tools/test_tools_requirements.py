@@ -50,6 +50,7 @@ LOCAL_MODULES = {
     "check_no_s_strings",
     "check_test_tempdirs",
     "check_test_budget",
+    "cpu_calibrate",
     "example_tests",
     "exec_tmpdir",
     "likely_tests",
@@ -68,6 +69,7 @@ PACKAGES = ["smoke_stack"]
 # Distribution name -> module name, where they differ.
 DIST_TO_MODULE = {
     "pyyaml": "yaml",
+    "pytest-xdist": "xdist",
 }
 
 

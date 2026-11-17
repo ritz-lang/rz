@@ -475,9 +475,15 @@ Rules:
    suite is over `tools/test_budget.toml`: a default per file, plus
    overrides that each name the ticket paying the file down.  It budgets
    CPU-seconds (the test process and every child it waits for), not wall
-   time, so a busy host doesn't turn it red.  Check locally with
-   `cd ritz0 && python -m pytest ... --cost-report=c.json && python
-   ../tools/check_test_budget.py c.json`.  Over budget?  Batch and resize
+   time, so a busy host doesn't turn it red.  CPU-seconds still differ by
+   host (AGAST #3897: 1,454.5 on toffee, 2,347 on omegalisk for one suite),
+   so the step first runs `tools/cpu_calibrate.py`, a fixed ~5 s workload,
+   and the check divides by the host's factor against
+   `[calibration] reference_cpu_s`: caps are in reference-host CPU-s, and
+   the budget line prints raw, factor and normalised.  Check locally with
+   `cd ritz0 && python ../tools/cpu_calibrate.py --out cal.json && python
+   -m pytest ... --cost-report=c.json && python ../tools/check_test_budget.py
+   c.json --calibration cal.json`.  Over budget?  Batch and resize
    the matrix; raising the number or adding an override needs a ticket.
 8. **A nested pytest loads only what it tests.**  Set
    `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` and name what it needs with `-p`

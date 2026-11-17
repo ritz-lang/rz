@@ -369,7 +369,16 @@ jobs:
       - name: ritz0 unit tests
         run: |
           set -o pipefail
-          python -m pytest -q -rs --disable-plugin-autoload -p xdist -n auto --maxprocesses 8 --dist loadgroup --durations=30 --cost-report=pytest-cost.json | tee pytest-report.txt
+          # AGAST #3897: tmp_path on disk, not a tmpfs /tmp (toffee's), where a
+          # full /tmp put the host under memory pressure that inflated per-file
+          # CPU-s 2-12x.  Fresh per run, so two gates on one host never share it.
+          mkdir -p "$HOME/.cache/ritz-pytest"
+          BASETEMP=$(mktemp -d "$HOME/.cache/ritz-pytest/run.XXXXXX")
+          trap 'rm -rf "$BASETEMP"' EXIT
+          # AGAST #3897: CPU-s differ by host (toffee measures ~0.62x omegalisk).
+          # Time a fixed workload here first; the budget check divides by it.
+          python ../tools/cpu_calibrate.py --out cpu-calibration.json --scratch "$BASETEMP"
+          python -m pytest -q -rs --disable-plugin-autoload -p xdist -n auto --maxprocesses 8 --dist loadgroup --durations=30 --cost-report=pytest-cost.json --basetemp="$BASETEMP" | tee pytest-report.txt
           # Matches the reason only (after "file:line: "), so a file name
           # like test_missing_x.py can't trip it. Environment skips ("clang
           # not on PATH", "valgrind not installed", "CPU lacks AES-NI") are
@@ -379,7 +388,7 @@ jobs:
             echo "::error::a test skipped because a file or build artifact was missing — build it in the test, or assert on it if it is tracked (see AGAST #1327, #1333)"
             exit 1
           fi
-          python ../tools/check_test_budget.py pytest-cost.json
+          python ../tools/check_test_budget.py pytest-cost.json --calibration cpu-calibration.json
         working-directory: projects/ritz/ritz0
 
       # Both steps carry an explicit timeout. GitHub's default is the job-level
