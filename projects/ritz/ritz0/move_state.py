@@ -251,7 +251,7 @@ class MoveTypes:
         """`ty` is a pointer or reference, or a struct, enum, tuple or array
         holding one (AGAST #3215). A type parameter holds none."""
         ty = self.resolve(ty)
-        if isinstance(ty, (rast.PtrType, rast.RefType, rast.SliceType)):
+        if isinstance(ty, (rast.PtrType, rast.RefType)):
             return True
         if isinstance(ty, rast.ArrayType):
             return self.holds_reference(ty.inner, seen)

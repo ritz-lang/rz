@@ -1304,8 +1304,6 @@ class ImportResolver:
             return a.mutable == b.mutable and self._types_equal(a.inner, b.inner)
         if isinstance(a, rast.ArrayType):
             return a.size == b.size and self._types_equal(a.inner, b.inner)
-        if isinstance(a, rast.SliceType):
-            return self._types_equal(a.inner, b.inner)
         return True
 
     def _type_aliases_equal(self, a: rast.TypeAlias, b: rast.TypeAlias) -> bool:

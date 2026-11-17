@@ -16882,8 +16882,6 @@ class LLVMEmitter:
             return ("refmut_" if ty.mutable else "ref_") + suffix(ty.inner)
         elif isinstance(ty, rast.ArrayType):
             return f"arr{ty.size}_{suffix(ty.inner)}"
-        elif isinstance(ty, rast.SliceType):
-            return f"slice_{suffix(ty.inner)}"
         elif isinstance(ty, rast.TupleType):
             if not ty.elements:
                 return "unit"

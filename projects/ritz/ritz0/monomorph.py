@@ -161,8 +161,6 @@ class TypeSubstitution:
             return rast.RefType(ty.span, self.apply(ty.inner), ty.mutable)
         elif isinstance(ty, rast.ArrayType):
             return rast.ArrayType(ty.span, ty.size, self.apply(ty.inner))
-        elif isinstance(ty, rast.SliceType):
-            return rast.SliceType(ty.span, self.apply(ty.inner))
         elif isinstance(ty, rast.FnType):
             new_params = [self.apply(p) for p in ty.params]
             new_ret = self.apply(ty.ret) if ty.ret else None
@@ -226,8 +224,6 @@ def mangle_type_name(ty: rast.Type) -> str:
         return f"ref_{mangle_type_name(ty.inner)}"
     elif isinstance(ty, rast.ArrayType):
         return f"arr{_folded_array_size(ty)}_{mangle_type_name(ty.inner)}"
-    elif isinstance(ty, rast.SliceType):
-        return f"slice_{mangle_type_name(ty.inner)}"
     # Every type below fell through to "unknown" until AGAST #2270, so e.g.
     # `wrap<Result<(), E>>` and `wrap<Result<(i64, i64), E>>` were one
     # instantiation and a valid program was rejected.
@@ -966,8 +962,6 @@ class Monomorphizer:
         elif isinstance(ty, rast.RefType):
             self._visit_type(ty.inner)
         elif isinstance(ty, rast.ArrayType):
-            self._visit_type(ty.inner)
-        elif isinstance(ty, rast.SliceType):
             self._visit_type(ty.inner)
         elif isinstance(ty, rast.FnType):
             for p in ty.params:
@@ -2322,8 +2316,6 @@ class Monomorphizer:
             return rast.RefType(ty.span, self._rewrite_type(ty.inner), ty.mutable)
         elif isinstance(ty, rast.ArrayType):
             return rast.ArrayType(ty.span, ty.size, self._rewrite_type(ty.inner))
-        elif isinstance(ty, rast.SliceType):
-            return rast.SliceType(ty.span, self._rewrite_type(ty.inner))
         elif isinstance(ty, rast.FnType):
             new_params = [self._rewrite_type(p) for p in ty.params]
             new_ret = self._rewrite_type(ty.ret) if ty.ret else None

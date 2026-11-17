@@ -123,9 +123,17 @@ class SliceType(Type):
 
     DEPRECATED as a surface type. `[T]` is sugar for `Span<T>` — both denote
     the same non-owning `{ ptr, len }` view — and the front-end now desugars
-    it at construction time via `make_slice_type()`. Nothing in the pipeline
-    should produce a `SliceType` any more; the node is retained only so that
-    stale pickled/cached ASTs and third-party tooling keep importing cleanly.
+    it at construction time via `make_slice_type()` (AGAST #1285). Nothing in
+    the pipeline produces a `SliceType`: not the parser, not the `[]T` metadata
+    read path, and not a cached `.rzi` interface, whose key hashes this file and
+    the parser, so a pre-desugaring pickle is never returned.
+
+    READ-ONLY, for legacy importers: the class is kept so third-party tooling
+    that names `rast.SliceType` still imports. No pass handles it (AGAST #1294
+    removed every arm), and codegen rejects it: `mangle_type_name`,
+    `_type_to_name_suffix` and `_ritz_type_to_llvm` raise on it. Do not add
+    an arm for it; construct `make_slice_type()` instead.
+    test_slice_type_retired.py pins this.
     """
     inner: Type
 

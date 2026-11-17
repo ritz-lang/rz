@@ -43,7 +43,6 @@ AGREE = [
     pytest.param(rast.RefType(None, I32, False), id="ref"),
     pytest.param(rast.RefType(None, I32, True), id="refmut"),
     pytest.param(rast.ArrayType(None, 4, I32), id="array"),
-    pytest.param(rast.SliceType(None, I32), id="slice"),
     pytest.param(rast.TupleType(None, []), id="unit"),
     pytest.param(rast.TupleType(None, [I32, U8]), id="tuple"),
     pytest.param(rast.FnType(None, [I32], I32), id="fn"),

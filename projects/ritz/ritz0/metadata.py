@@ -136,9 +136,6 @@ def type_to_string(t: rast.Type) -> str:
             size = str(t.size)
         return f"[{size}]{type_to_string(t.inner)}"
 
-    elif isinstance(t, rast.SliceType):
-        return f"[]{type_to_string(t.inner)}"
-
     elif isinstance(t, rast.FnType):
         params = ", ".join(type_to_string(p) for p in t.params)
         ret = type_to_string(t.ret) if t.ret else "void"
