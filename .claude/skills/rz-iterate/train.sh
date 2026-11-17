@@ -150,9 +150,11 @@ cmd_gate() {
 #
 # A touched file belongs to the deepest directory above it with a ritz.toml,
 # so a nested package (projects/ritzunit/inventory) is tested on its own.
-# Skipped: projects/ritz and everything in it (build-all + bootstrap is its
+# Skipped: the projects/ritz package itself (build-all + bootstrap is its
 # gate, so a compiler-only train costs exactly what it did), and rz.toml
-# [workspace.exclude] dirs, which resolve to the package above them.
+# [workspace.exclude] dirs, which resolve to the package above them.  A
+# package nested in projects/ritz (ritzlib/tests) is NOT skipped, and a
+# ritzlib change selects ritzlib/tests (AGAST #3909, below).
 # Except: a change to ritzunit or ritz0/test_runner.py tests every package
 # `rz test --all` sweeps, projects/ritz's included (AGAST #3735, below).
 #
@@ -190,6 +192,13 @@ in_list() {
 ALL_PKGS_PKG=projects/ritzunit
 ALL_PKGS_FILE=projects/ritz/ritz0/test_runner.py
 
+# ritzlib's sources live in the projects/ritz package, which the list drops,
+# but its tests are their own package that ci-local never runs: #3880 broke
+# ritzlib/tests and its ritzlib-only train tested nothing (AGAST #3909).  So a
+# change anywhere under ritzlib selects ritzlib/tests.
+RITZLIB_DIR=projects/ritz/ritzlib
+RITZLIB_TESTS=projects/ritz/ritzlib/tests
+
 # all_pkgs: every package dir `rz test --all` sweeps (rz discover_projects).
 all_pkgs() {
     python3 -c 'import tomllib
@@ -209,6 +218,7 @@ pkgs_list() {
     mapfile -t excl < <(toml_keys 'c.get("workspace", {}).get("exclude", {})')
     touched="$(git diff --name-only "$base" HEAD -- projects/ | while IFS= read -r f; do
         [[ "$f" == "$ALL_PKGS_FILE" ]] && echo "$ALL_PKGS_PKG"
+        [[ "$f" == "$RITZLIB_DIR"/* && -f "$RITZLIB_TESTS/ritz.toml" ]] && echo "$RITZLIB_TESTS"
         d="$(dirname "$f")"
         while [[ "$d" == projects/* ]]; do
             if [[ -f "$d/ritz.toml" ]] && ! in_list "$d" ${excl[@]+"${excl[@]}"}; then
@@ -222,7 +232,8 @@ pkgs_list() {
         all_pkgs
         return
     fi
-    [[ -z "$touched" ]] || grep -vxE 'projects/ritz(/.*)?' <<<"$touched" || true
+    # Only the compiler package itself: a package nested in it is not ci-local's.
+    [[ -z "$touched" ]] || grep -vxF projects/ritz <<<"$touched" || true
 }
 
 pkgs_test() {

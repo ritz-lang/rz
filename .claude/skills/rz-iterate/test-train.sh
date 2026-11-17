@@ -254,6 +254,11 @@ has "$out" "^PKG PASS +ritzunit/inventory" "a nested package is tested by its ow
 train projects/ritz/only
 log="$(bash "$TR" gate 2>/dev/null)"
 has "$(cat "$log")" "^AFTER=$" "a train touching only projects/ritz adds nothing to its gate"
+# No ritzlib/tests package (yet): a ritzlib change has nothing to select.
+train projects/ritz/ritzlib/net.ritz
+out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
+[[ -z "$out" ]] && ok "list: a ritzlib change selects no ritzlib/tests that doesn't exist" \
+    || { bad "list: a ritzlib change selects no ritzlib/tests that doesn't exist"; echo "$out" | sed 's/^/     | /'; }
 
 train projects/prism/FAIL
 out="$(pt)"; rc=$?
@@ -308,4 +313,32 @@ out="$(cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1)"
 [[ "$(tr '\n' ' ' <<<"$out")" == "projects/ritzunit/inventory " ]] \
     && ok "list: a nested package under ritzunit is only itself" \
     || { bad "list: a nested package under ritzunit is only itself"; echo "$out" | sed 's/^/     | /'; }
+
+# 9. Nested packages under projects/ritz (AGAST #3909).  The compiler package
+# projects/ritz is left to build-all + bootstrap, but ci-local runs no package
+# nested in it: #3880 broke ritzlib/tests and its train (ritzlib only) listed
+# nothing under projects/ritz.  A ritzlib change selects ritzlib/tests; any
+# other non-excluded package under projects/ritz is tested as its own.
+# lsr <files...>: pkgs list for a one-room train touching <files>, one line.
+lsr() { train "$@"; (cd "$T/train" && bash "$PK" pkgs list "$tb" 2>&1) | tr '\n' ' '; }
+eq() { [[ "$1" == "$2" ]] && ok "$3" || { bad "$3"; echo "     | got '$1', want '$2'"; }; }
+fetch; git -C "$M" checkout -q --detach origin/main
+mkdir -p "$M/projects/ritz/tools/nested"; echo "[package]" > "$M/projects/ritz/tools/nested/ritz.toml"
+git -C "$M" add -A; git -C "$M" commit -qm "nested ritz package"; git -C "$M" push -q origin HEAD:main
+eq "$(lsr projects/ritz/ritzlib/net.ritz)" "projects/ritz/ritzlib/tests " \
+    "list: a ritzlib source change selects ritzlib/tests"
+eq "$(lsr projects/ritz/ritzlib/sub/deep.ritz)" "projects/ritz/ritzlib/tests " \
+    "list: a change deeper in ritzlib selects ritzlib/tests"
+eq "$(lsr projects/ritz/ritzlib/tests/test_net_api.ritz)" "projects/ritz/ritzlib/tests " \
+    "list: a ritzlib/tests change selects ritzlib/tests"
+eq "$(lsr projects/ritz/ritz0/codegen.py)" "" "list: a ritz0-only change still lists nothing"
+eq "$(lsr projects/ritz/ritzlibx/y.ritz)" "" "list: a sibling dir named like ritzlib isn't ritzlib"
+eq "$(lsr projects/ritz/examples/ex1/src.ritz)" "" \
+    "list: an excluded dir under projects/ritz still lists nothing"
+eq "$(lsr projects/ritz/tools/nested/src.ritz)" "projects/ritz/tools/nested " \
+    "list: any other nested package under projects/ritz is tested as its own"
+train projects/ritz/ritzlib/net.ritz
+log="$(bash "$TR" gate 2>/dev/null)"
+has "$(cat "$log")" "^AFTER=.*train.sh.* pkgs test $tb" "a ritzlib-only train adds the package tests to its gate"
+has "$(pt)" "^PKG PASS +ritz/ritzlib/tests" "a ritzlib-only train tests ritzlib/tests"
 echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
