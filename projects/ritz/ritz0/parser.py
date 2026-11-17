@@ -2554,13 +2554,16 @@ class Parser:
         #       item2,
         #   }
         items = None
+        item_spans = None
         if self._at(TokenType.LBRACE):
             self._advance()
             self._skip_whitespace_tokens()  # Allow newline after {
             items = []
+            item_spans = []
             if not self._at(TokenType.RBRACE):
                 tok = self._expect_ident_or_keyword("Expected item name")
                 items.append(tok.value)
+                item_spans.append(tok.span)
                 self._skip_whitespace_tokens()  # Allow newline after item
                 while self._at(TokenType.COMMA):
                     self._advance()
@@ -2569,6 +2572,7 @@ class Parser:
                         break  # trailing comma
                     tok = self._expect_ident_or_keyword("Expected item name")
                     items.append(tok.value)
+                    item_spans.append(tok.span)
                     self._skip_whitespace_tokens()  # Allow newline after item
             self._expect(TokenType.RBRACE, "Expected '}' after import items")
             # After multiline imports, skip any DEDENT that was generated
@@ -2582,7 +2586,8 @@ class Parser:
             alias_tok = self._expect(TokenType.IDENT, "Expected alias name after 'as'")
             alias = alias_tok.value
 
-        return rast.Import(span, path, alias=alias, items=items, is_pub=is_pub)
+        return rast.Import(span, path, alias=alias, items=items, is_pub=is_pub,
+                           item_spans=item_spans)
 
     def parse_const(self, attrs: list = None, is_pub: bool = False) -> rast.ConstDef:
         """Parse a constant definition: const STDIN: i32 = 0."""

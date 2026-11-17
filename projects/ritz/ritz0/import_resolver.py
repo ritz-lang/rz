@@ -306,6 +306,9 @@ class ImportResolver:
         self.module_exports: Dict[str, ModuleExports] = {}
         # Import aliases: from_file -> {alias -> module_path}
         self.import_aliases: Dict[str, Dict[str, str]] = {}
+        # Every module this resolver loaded, by resolved path: what R54's
+        # selective-import check reads (selective_import.py, AGAST #3466).
+        self.loaded_modules: Dict[str, rast.Module] = {}
         # RFC #109 Phase 2: Dependency mappings for namespace resolution
         self.dependencies: Dict[str, DependencyMapping] = dependencies.copy() if dependencies else {}
         # Auto-detect dependencies from RITZ_PATH entries with ritz.toml
@@ -719,6 +722,7 @@ class ImportResolver:
             else:
                 source = Path(import_path).read_text()
                 imported_module = module_interface.parse_source(source, import_path)
+            self.loaded_modules[import_path] = imported_module
 
             # Process imports in the imported module
             for item in imported_module.items:
@@ -735,6 +739,19 @@ class ImportResolver:
 
         finally:
             self.processing_stack.pop()
+
+    def load_module(self, import_path: str) -> rast.Module:
+        """The module at a resolved import path, as `_process_import`
+        loads it (its interface, or a full parse), loaded at most once."""
+        module = self.loaded_modules.get(import_path)
+        if module is None:
+            if self.use_interfaces:
+                module = module_interface.load_interface(import_path)
+            else:
+                module = module_interface.parse_source(
+                    Path(import_path).read_text(), import_path)
+            self.loaded_modules[import_path] = module
+        return module
 
     def _find_project_root(self, start_dir: Path) -> Optional[Path]:
         """Walk up from start_dir looking for project root indicators.

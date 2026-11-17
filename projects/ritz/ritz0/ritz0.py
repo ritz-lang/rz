@@ -27,6 +27,7 @@ from parser import Parser, ParseError
 from enum_from import rewrite_enum_from
 from emitter_llvmlite import emit as emit_llvmlite, EmitError
 from import_resolver import ImportResolver, ImportError as RitzImportError
+from selective_import import check_selective_imports
 import module_interface
 from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
@@ -220,7 +221,12 @@ def _resolve(ctx: _Compile) -> bool:
     resolver = ImportResolver(
         ctx.project_root, use_cache=False, dependencies=ctx.dependencies,
         source_roots=ctx.source_roots, use_interfaces=module_interface.enabled())
+    imports = [item for item in ctx.module.items if isinstance(item, rast.Import)]
     module = resolver.resolve(ctx.module, ctx.source_path)
+    # R54: each name in `import m { … }` is one m defines (AGAST #3466).
+    if not _report(check_selective_imports(
+            imports, resolver, ctx.source_abs_path), "Error: "):
+        return False
 
     # What `token.Kind` may be qualified by: every module this compile saw.
     ctx.module_names = {Path(f).stem for f in resolver.processed_files}

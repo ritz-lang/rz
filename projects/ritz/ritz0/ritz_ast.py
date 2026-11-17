@@ -1089,6 +1089,9 @@ class Import(Item):
     alias: Optional[str] = None        # Namespace alias: import x as alias
     items: Optional[List[str]] = None  # Selective imports: { item1, item2 }
     is_pub: bool = False               # pub import re-exports items
+    # Where each name in `items` is, for R54's "`x` is not defined in m"
+    # (AGAST #3466). None when the import isn't parsed (cached stubs).
+    item_spans: Optional[List[Span]] = None
 
 
 @dataclass
