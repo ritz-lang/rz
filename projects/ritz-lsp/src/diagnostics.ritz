@@ -30,7 +30,12 @@
 # looks for a relative import there, as it would beside the real file), then
 # the monorepo's projects/ritz for ritzlib.  ritz1 appends $RITZ_PATH.
 #
-# The compile runs on the request loop: a ritz1 that hangs stalls the server.
+# Deadline (#3883):  the compile runs on the request loop, so it is bounded.
+# A ritz1 still running COMPILE_DEADLINE_SECS after it started is killed and
+# reaped, and the document gets one warning that the check timed out instead
+# of its diagnostics.  Its stdout and stderr are drained while it runs, so a
+# chatty ritz1 cannot block on a full pipe.  Rapid didChanges still compile
+# one by one; coalescing them is #3902.
 
 import ritzlib.sys
 import ritzlib.io
@@ -45,12 +50,16 @@ import ritzlib.result
 import ritzlib.process
 import ritzlib.os.env
 import ritzlib.fs
+import ritzlib.timer
 import ritzlib.json
 
 import symbols
 
 const SEV_ERROR: i64 = 1
 const SEV_WARNING: i64 = 2
+
+# How long one ritz1 compile may run before it is killed (#3883).
+const COMPILE_DEADLINE_SECS: i64 = 5
 
 # =============================================================================
 # Paths
@@ -365,19 +374,85 @@ fn spawn_failed(dl: *DiagList, ritz1: @&String, errno: i32)
 fn collect(dl: *DiagList, p: Process, input: @&String, text: *u8, text_len: i64)
     var q: Process = p
     process_close_stdin(@&q)
-    var err: Vec<u8> = process_read_stderr_all(@&q)
-    var out: Vec<u8> = process_read_stdout_all(@&q)
-    let r: ProcessResult = process_wait(@&q)
-    process_cleanup(@&q)
-    add_output(dl, text, text_len, string_as_ptr(input), @err)
-    if dl.count == 0 and not result_success(@r)
-        var m: String = string_from("ritz1 failed with no error message (exit ")
-        string_push_i64(@&m, r.exit_code as i64)
-        string_push_str(@&m, ")")
-        add_cstr(dl, SEV_ERROR, @&m)
-        string_drop(@&m)
+    var err: Vec<u8> = vec_new<u8>()
+    var out: Vec<u8> = vec_new<u8>()
+    let deadline: i64 = now_millis() + COMPILE_DEADLINE_SECS * 1000
+    drain(@&q, @&err, @&out, deadline)
+    match wait_until(@&q, deadline)
+        Some(r) =>
+            add_output(dl, text, text_len, string_as_ptr(input), @err)
+            if dl.count == 0 and not result_success(@r)
+                var m: String = string_from("ritz1 failed with no error message (exit ")
+                string_push_i64(@&m, r.exit_code as i64)
+                string_push_str(@&m, ")")
+                add_cstr(dl, SEV_ERROR, @&m)
+                string_drop(@&m)
+        None =>
+            process_kill(@&q)
+            process_wait(@&q)
+            var m: String = string_from("ritz-lsp: the ritz1 check timed out after ")
+            string_push_i64(@&m, COMPILE_DEADLINE_SECS)
+            string_push_str(@&m, "s and was stopped; no compiler diagnostics")
+            add_cstr(dl, SEV_WARNING, @&m)
+            string_drop(@&m)
+    process_close_pipes(@&q)
     vec_drop<u8>(@&out)
     vec_drop<u8>(@&err)
+
+# Milliseconds left before `deadline` (now_millis() time), at least 0.
+fn ms_left(deadline: i64) -> i32
+    let left: i64 = deadline - now_millis()
+    if left < 0
+        return 0
+    left as i32
+
+# Read q's stderr into `err` and stdout into `out` until both reach EOF or
+# `deadline` passes.  An fd at EOF is closed and set to -1.
+fn drain(q: @&Process, err: @&Vec<u8>, out: @&Vec<u8>, deadline: i64)
+    var fds: [2]PollFd
+    var buf: [4096]u8
+    while q.stderr_fd >= 0 or q.stdout_fd >= 0
+        let left: i32 = ms_left(deadline)
+        if left == 0
+            return
+        fds[0].fd = q.stderr_fd
+        fds[0].events = POLLIN
+        fds[0].revents = 0
+        fds[1].fd = q.stdout_fd
+        fds[1].events = POLLIN
+        fds[1].revents = 0
+        # poll skips an entry whose fd is negative.
+        let rc: i32 = sys_poll(@fds[0], 2, left)
+        if rc < 0 and rc != 0 - EINTR
+            return
+        if rc > 0
+            if fds[0].revents != 0
+                let n: i64 = sys_read(q.stderr_fd, @buf[0], 4096)
+                if n > 0
+                    vec_push_bytes<u8>(err, @buf[0], n)
+                else
+                    sys_close(q.stderr_fd)
+                    q.stderr_fd = -1
+            if fds[1].revents != 0
+                let n: i64 = sys_read(q.stdout_fd, @buf[0], 4096)
+                if n > 0
+                    vec_push_bytes<u8>(out, @buf[0], n)
+                else
+                    sys_close(q.stdout_fd)
+                    q.stdout_fd = -1
+
+# q's result once it exits, or None if it is still running at `deadline`.
+fn wait_until(q: @&Process, deadline: i64) -> Option<ProcessResult>
+    var ts: [2]i64
+    ts[0] = 0
+    ts[1] = 5000000
+    loop
+        match process_try_wait(q)
+            Some(r) => return Some(r)
+            None => 0
+        if ms_left(deadline) == 0
+            return None
+        sys_nanosleep(@ts[0], null)
 
 # The textDocument/publishDiagnostics params for `uri` at `version` into
 # `out`, from a ritz1 compile of `text`.

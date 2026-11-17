@@ -11,6 +11,8 @@
 #   buffer (#2789). A stub ritz1 (via $RITZ1) pins how its stderr becomes
 #   diagnostics; the real ritz1, when it is built, pins the end-to-end
 #   answer and the default lookup next to the monorepo's ritz1.
+# - A ritz1 that hangs is killed at the deadline, reaped, reported as one
+#   "timed out" warning, and the server goes on answering (#3883).
 set -u
 cd "$(dirname "$0")"
 BIN=build/debug/ritz-lsp
@@ -269,6 +271,88 @@ check("stub: -o goes to a scratch file", len(first) >= 3 and first[1] == "-o"
 check("stub: -I puts the document's directory on the import path",
       "-I" in first and str(docdir) in first[first.index("-I") + 1].split(":")[0], repr(first))
 check("stub: nothing written next to the document", sorted(os.listdir(docdir)) == [], repr(os.listdir(docdir)))
+
+# --- a ritz1 that hangs (#3883) ---------------------------------------------
+# The stub records its pid and sleeps, holding stderr open. The server must
+# kill it at its deadline (COMPILE_DEADLINE_SECS, 5s), publish one warning,
+# reap it (checked while the server still runs: an unreaped child stays in
+# /proc as a zombie) and go on answering. Everything here is bounded, so a
+# regression fails in ~12s instead of hanging the suite.
+import select, signal, time
+DEADLINE = 5
+hang_pid = scratch / "hang.pid"
+hang = scratch / "ritz1-hang"
+hang.write_text(f"""#!{sys.executable} -I
+import os, time
+open({str(hang_pid)!r}, "w").write(str(os.getpid()))
+time.sleep(3600)
+""")
+hang.chmod(0o755)
+srv = subprocess.Popen([BIN], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                       stderr=subprocess.DEVNULL, env={**os.environ, "RITZ1": str(hang)})
+got, buf, hover = [], b"", None
+t0 = time.monotonic()
+diag_at = None
+try:
+    srv.stdin.write(b"".join(map(frame, [
+        {"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"processId": None, "rootUri": None, "capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}},
+        did_open(duri, "fn helper() -> i32\n    1\n"),
+        req(2, "textDocument/hover", duri, 0, 4)])))
+    srv.stdin.flush()
+    end = t0 + DEADLINE + 7
+    while hover is None and time.monotonic() < end:
+        if not select.select([srv.stdout], [], [], end - time.monotonic())[0]:
+            break
+        chunk = os.read(srv.stdout.fileno(), 65536)
+        if not chunk:
+            break
+        buf += chunk
+        while (m := re.search(rb"Content-Length: (\d+)\r\n\r\n", buf)) and len(buf) >= m.end() + int(m.group(1)):
+            msg = json.loads(buf[m.end():m.end() + int(m.group(1))])
+            buf = buf[m.end() + int(m.group(1)):]
+            got.append(msg)
+            if msg.get("method") == "textDocument/publishDiagnostics" and diag_at is None:
+                diag_at = time.monotonic() - t0
+            if msg.get("id") == 2:
+                hover = msg
+    pid = int(hang_pid.read_text()) if hang_pid.exists() else None
+    alive = pid is not None and os.path.exists(f"/proc/{pid}")
+    state = ""
+    if alive:
+        try:
+            state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+        except OSError:
+            alive = False
+    d = diags(got)
+    check("hang: one warning that the check timed out",
+          len(d) == 1 and len(d[0]["diagnostics"]) == 1 and d[0]["diagnostics"][0]["severity"] == 2
+          and "timed out" in d[0]["diagnostics"][0]["message"], repr(d))
+    check("hang: published at the deadline, not long after",
+          diag_at is not None and DEADLINE - 1 <= diag_at <= DEADLINE + 3, repr(diag_at))
+    check("hang: a later request is still answered",
+          hover is not None and (hover.get("result") or {}).get("contents") is not None, repr(hover))
+    check("hang: ritz1 ran", pid is not None, "no pid file")
+    check("hang: ritz1 killed and reaped (no process, no zombie)", not alive,
+          f"pid {pid} still in /proc, state {state!r}")
+    if hover is not None:
+        srv.stdin.write(frame({"jsonrpc": "2.0", "id": 99, "method": "shutdown"})
+                        + frame({"jsonrpc": "2.0", "method": "exit"}))
+        srv.stdin.close()
+        try:
+            check("hang: clean exit", srv.wait(timeout=5) == 0, f"exit {srv.returncode}")
+        except subprocess.TimeoutExpired:
+            check("hang: clean exit", False, "server did not exit")
+finally:
+    if srv.poll() is None:
+        srv.kill()
+        srv.wait()
+    if hang_pid.exists():
+        try:
+            os.kill(int(hang_pid.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
 
 # --- diagnostics from the real ritz1 ----------------------------------------
 if REAL_RITZ1.is_file():

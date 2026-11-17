@@ -137,8 +137,10 @@ ritz1 would look beside the real file), then the monorepo's `projects/ritz`
 for `ritzlib`; ritz1 appends `$RITZ_PATH`. A cross-project import that needs
 a `RITZ_PATH` entry needs it in the editor's environment.
 
-The compile runs on the request loop, so a ritz1 that hangs stalls the
-server. Columns are bytes, which equal LSP's UTF-16 columns on ASCII lines.
+The compile runs on the request loop, so it has a deadline (#3883): a ritz1
+still running after 5 seconds (`COMPILE_DEADLINE_SECS`) is killed and the
+document gets one warning that the check timed out. Every open/change still
+compiles in turn; only the latest of a burst would be enough (#3902). Columns are bytes, which equal LSP's UTF-16 columns on ASCII lines.
 
 ## Hover and go-to-definition
 
