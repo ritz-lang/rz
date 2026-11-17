@@ -2021,6 +2021,26 @@ let x: u8 = 200
 let y = x + 300
 ```
 
+#### `f32` meeting `f64`
+
+When an `f32` and an `f64` meet in `+ - * / %`, the `f32` widens to `f64`
+silently and the result is an `f64`. Nothing is lost, because every `f32` is
+exact as an `f64`. A float literal has no width of its own: it takes the other
+operand's, so `y * 2.0` with `y: f32` is an `f32`. So does an expression of
+literals alone, such as `0.0 - 7.0`; on its own it's an `f64`.
+Comparing the two widths is different: see §7.2.
+
+```ritz body
+let y: f32 = 3.0
+let x: f64 = 2.5
+let z = y * x                     # 7.5, an f64: y widens
+let w: f64 = z
+let h = y * 2.0                   # 6.0, an f32: the literal is an f32
+```
+
+To get an `f32` back from `z`, write `z as f32`. (Leaving out the `as` isn't
+refused yet; that's AGAST #3802.)
+
 #### Pointer difference
 
 `p + n` and `p - n` on a `*T` step by whole elements of `T`. `q - p` on two pointers
@@ -2081,6 +2101,34 @@ let big = (a ^ z) > 1      # true: `a ^ z` is a u64
 let half = (a ^ z) / 2     # 9223372036854775804
 let third = (~s) / 3       # 82
 ```
+
+#### `f32` against `f64`
+
+Comparing an `f32` with an `f64` (`== != < <= > >=`) is an error on every
+compiler (AGAST #3607). Each value would widen correctly, but the answer is
+rarely what the writer meant: with `a: f32 = 0.1` and `b: f64 = 0.1`, `a == b`
+is false and `a > b` is true, because `0.1` rounds differently in each width.
+Write `as` to choose the precision the comparison runs in:
+
+```ritz body expect-error="cannot compare `f32` with `f64`: write `as` to choose the precision"
+let a: f32 = 0.1
+let b: f64 = 0.1
+let same = a == b
+```
+
+```ritz body
+let a: f32 = 0.1
+let b: f64 = 0.1
+let in_f32 = a == b as f32        # true: b rounds to a's f32
+let in_f64 = a as f64 == b        # false: a's error shows in f64
+let y: f32 = 0.1
+let lit = y == 0.1                # true: the literal is an f32 here
+```
+
+A float literal, or an expression of literals alone, is never refused, because
+it takes the other operand's type (§7.1). The result of an arithmetic operation has the width §7.1 gives it, so
+`y * x > y`, with `y: f32` and `x: f64`, compares an `f64` with an `f32` and is
+an error too.
 
 ### 7.3 Logical
 
@@ -2277,6 +2325,9 @@ so an unsigned value is never read as negative:
 |---|---|
 | `f64` | `i8` `i16` `i32` `u8` `u16` `u32` |
 | `f32` | `i8` `i16` `u8` `u16` |
+
+For an `f32` meeting an `f64`, see §7.1 (arithmetic widens to `f64`) and §7.2
+(a comparison needs `as`).
 
 ```ritz body
 let x: u32 = 4000000000

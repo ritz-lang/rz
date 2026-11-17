@@ -411,6 +411,10 @@ def _is_float_lit_operand(expr) -> bool:
     """
     while isinstance(expr, rast.UnaryOp) and expr.op == '-':
         expr = expr.operand
+    # AGAST #3607: literals only, `0.0 - 7.0`, is a literal too (the
+    # checker's FloatLitType): it takes the other side's width.
+    if isinstance(expr, rast.BinOp) and expr.op in ('+', '-', '*', '/'):
+        return _is_float_lit_operand(expr.left) and _is_float_lit_operand(expr.right)
     return isinstance(expr, rast.FloatLit)
 
 
@@ -9070,6 +9074,11 @@ class LLVMEmitter:
                     right = self._convert_type(right, left.type)
                 elif _is_float_lit_operand(expr.left):
                     left = self._convert_type(left, right.type)
+                elif expr.op in bool_rules.COMPARISONS:
+                    # §7.2, AGAST #3607: the writer picks the precision.  The
+                    # typing pass refuses it first; this holds without it.
+                    names = ('f32', 'f64') if left.type == self.f32 else ('f64', 'f32')
+                    raise EmitError(float_rules.mixed_float_compare(*names), expr.span)
                 elif left.type == self.f32:
                     left = self.builder.fpext(left, right.type)
                 else:

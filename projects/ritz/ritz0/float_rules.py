@@ -19,3 +19,11 @@ def is_exact(bits: int, float_name: str) -> bool:
 def int_into_float_inexact(src: str, dst: str) -> str:
     return (f"implicit conversion from `{src}` to `{dst}` can lose precision: "
             f"write `<expr> as {dst}`")
+
+
+def mixed_float_compare(left: str, right: str) -> str:
+    """An f32 compared with an f64 (§7.2, AGAST #3607): neither precision is
+    the obvious one, so the writer picks it.  ritz1's float_compare.ritz
+    prints the same words."""
+    return (f"cannot compare `{left}` with `{right}`: "
+            f"write `as` to choose the precision")

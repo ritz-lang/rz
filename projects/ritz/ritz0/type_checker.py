@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 import array_rules
 import bool_rules
 import enum_rules
+import float_rules
 import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
@@ -643,7 +644,11 @@ class TypeChecker:
 
         # Comparison operators return bool
         if expr.op in bool_rules.COMPARISONS:
-            if not self._types_compatible(left_type, right_type):
+            mixed = self._mixed_float_widths(left_type, right_type)
+            if mixed:
+                # §7.2, AGAST #3607: on every compile, not just --check-types.
+                self._slot_error(float_rules.mixed_float_compare(*mixed), expr.span)
+            elif not self._types_compatible(left_type, right_type):
                 self._error(f"cannot compare {self._type_str(left_type)} "
                           f"with {self._type_str(right_type)}", expr.span)
             return rast.NamedType(expr.span, 'bool', [])
@@ -2248,9 +2253,24 @@ class TypeChecker:
 
     def _promote_numeric_types(self, t1: rast.Type, t2: rast.Type) -> rast.Type:
         """Get the common type for two numeric types."""
-        # Simplified: the first type, unless it's a literal the other one fixes.
+        # Simplified: the first type, unless it's a literal the other one fixes,
+        # or an f32 meets an f64, which widens it (§7.1, AGAST #3607).
         # Full implementation would return the "wider" type
+        if self._mixed_float_widths(t1, t2):
+            return rast.NamedType(t1.span, 'f64', [])
         return t2 if isinstance(t1, FloatLitType) else t1
+
+    def _mixed_float_widths(self, t1: rast.Type, t2: rast.Type):
+        """(`t1`'s name, `t2`'s) when one is f32 and the other f64, neither a
+        literal (a literal takes the other side's type), else None."""
+        if isinstance(t1, FloatLitType) or isinstance(t2, FloatLitType):
+            return None
+        t1, t2 = self._resolve_alias(t1), self._resolve_alias(t2)
+        if not (isinstance(t1, rast.NamedType) and isinstance(t2, rast.NamedType)):
+            return None
+        if {t1.name, t2.name} == {'f32', 'f64'}:
+            return t1.name, t2.name
+        return None
 
     def _get_iterator_element_type(self, iter_type: rast.Type) -> rast.Type:
         """Get element type from an iterator type."""

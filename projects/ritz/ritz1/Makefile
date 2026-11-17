@@ -63,6 +63,7 @@ SOURCES = \
 	call_check \
 	literal_slot \
 	float_slot \
+	float_compare \
 	tail_value \
 	reachability \
 	emitter_asm \
