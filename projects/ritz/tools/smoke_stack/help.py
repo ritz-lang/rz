@@ -23,7 +23,7 @@ def _load(name: str, path: Path):
 
 
 def targets_linux(target: str, target_os: str) -> bool:
-    """By target, never by name: harland ELFs (ritzutils cat.elf, rzsh.elf)
+    """By target, never by name: harland ELFs (indium cat.elf, rzsh.elf)
     and the UEFI loader segfault or refuse to exec on Linux."""
     if target_os and target_os != "linux":
         return False

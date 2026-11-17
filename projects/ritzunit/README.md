@@ -10,8 +10,6 @@ Ritzunit is the `main` of every Ritz test binary (LANGUAGE_SPEC.md §17.1). The 
 
 Each test runs in a forked process for complete isolation: a crashing test cannot affect other tests or the runner. Ritzunit supports rich filtering with glob patterns and boolean expressions, and outputs results in human-readable, JSON, or JUnit XML formats for CI/CD integration.
 
-The framework handles ASLR and PIE (position-independent executables) correctly by reading the base address from `/proc/self/maps` before resolving symbol addresses.
-
 ## Features
 
 - Discovery from the compiler's `[[test]]` table - no registration, no `test_` naming rule
@@ -33,11 +31,13 @@ The framework handles ASLR and PIE (position-independent executables) correctly 
 ```bash
 # Run ritzunit's own tests
 ./rz test ritzunit
-
-# The library is available as a dependency in ritz.toml:
-# [dependencies]
-# ritzunit = { path = "../ritzunit" }
 ```
+
+There is nothing to install or declare. `./rz test` links the runner into
+every test binary itself (see Running tests), so a package does not list
+ritzunit in its `[dependencies]` unless it imports a `ritzunit.<module>`
+directly. A declaration it never imports is a false claim, and
+`projects/ritz/tools/test_nested_packages.py` fails on one (AGAST #1875).
 
 ## Usage
 
@@ -45,7 +45,7 @@ Mark tests with `[[test]]`. (`@test` was the old syntax and is no longer
 correct — see `projects/ritz/docs/STYLE.md`.)
 
 ```ritz
-import ritzlib.sys
+import ritzlib.str { strlen }
 
 [[test]]
 fn test_addition() -> i32

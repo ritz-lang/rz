@@ -23,7 +23,9 @@ state, because:
 
 import importlib.machinery
 import importlib.util
+import re
 import subprocess
+import tomllib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -182,6 +184,48 @@ class TestRealWorkspace:
             if pid not in found and not covered:
                 orphans.append(pid)
         assert orphans == []
+
+    # #1875: manifests rotted unnoticed because nothing reads these tables
+    # (tooling.md F8, #1837) and a [dependencies] path that does not exist
+    # is only a stderr warning. tempest pointed at ../ritz/ritzunit and
+    # inventory used [deps] with a path one level short, for months.
+    @staticmethod
+    def _manifests(rz):
+        for pid in sorted(rz.discover_projects()):
+            pkg = WORKSPACE / "projects" / pid
+            if not pkg.is_dir():
+                pkg = WORKSPACE / pid
+            yield pid, pkg, tomllib.loads((pkg / "ritz.toml").read_text())
+
+    def test_no_manifest_uses_an_unread_dependency_table(self, rz):
+        unread = {"deps", "dev-dependencies"}
+        bad = [(pid, sorted(unread & set(cfg))) for pid, _, cfg in self._manifests(rz)
+               if unread & set(cfg)]
+        assert bad == []
+
+    def test_every_dependency_path_exists(self, rz):
+        missing = [(pid, name) for pid, pkg, cfg in self._manifests(rz)
+                   for name, spec in cfg.get("dependencies", {}).items()
+                   if isinstance(spec, dict) and not (pkg / spec.get("path", "\0")).exists()]
+        assert missing == []
+
+    def test_ritzunit_is_declared_only_where_imported(self, rz):
+        # Every test binary links the runner already (ritz0 test_runner.py);
+        # declaring it does nothing, so a declaration is a false claim
+        # unless the package imports ritzunit.<module> itself.
+        unused = []
+        for pid, pkg, cfg in self._manifests(rz):
+            if pid == "ritzunit" or "ritzunit" not in cfg.get("dependencies", {}):
+                continue
+            text = "\n".join(p.read_text(errors="ignore") for p in pkg.rglob("*.ritz")
+                             if "build" not in p.relative_to(pkg).parts)
+            if not re.search(r"^import ritzunit\b", text, re.MULTILINE):
+                unused.append(pid)
+        assert unused == []
+
+    def test_ritz_lsp_declares_ritzlib(self, rz):
+        cfg = {pid: cfg for pid, _, cfg in self._manifests(rz)}["ritz-lsp"]
+        assert "ritzlib" in cfg.get("dependencies", {})
 
     def test_harland_boot_exclusion_is_true(self, rz):
         # Excluded because the parent builds it. Pin that claim so the

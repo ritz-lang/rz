@@ -143,7 +143,7 @@ table listing them here:
 | `hello_gfx` | `projects/prism` → `build/debug/hello_gfx.elf` |
 
 The initramfs packs every package listed in `initramfs.pkgs` (indium, rzsh,
-ritzutils, prism). That file is the one list: the Makefile's
+prism). That file is the one list: the Makefile's
 `build/initramfs.tar` and `run-uefi`, `tools/mkiso.sh` and harland's boot
 tests all read it (AGAST #2759).
 

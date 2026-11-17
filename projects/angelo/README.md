@@ -90,8 +90,7 @@ angelo is to run the `angelo-test` binary:
 
 Font file parser architecture, type definitions and cache design are in place.
 TTF/OTF table parsing, the shaper and the rasterizer are still being
-implemented. For a standalone rasterisation smoke test that writes a PGM image,
-see [angelo-simple](../angelo-simple).
+implemented.
 
 ## License
 

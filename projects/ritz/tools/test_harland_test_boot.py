@@ -92,7 +92,6 @@ PANIC_AFTER_BANNER = (
 USER_ELFS = {
     "indium": "init.elf",
     "rzsh": "rzsh.elf",
-    "ritzutils": "ls.elf",
     "prism": "hello_gfx.elf",
 }
 

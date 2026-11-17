@@ -95,7 +95,7 @@ Each project keeps **library code in `lib/`** and **binary entry points in
 `src/`**. A `[[lib]]` target compiles every module under its `sources` into
 `build/<profile>/lib<name>.a` and implies no binary, so `cryptosec` builds an
 archive and nothing else. A few projects are `test_only = true` in their
-`ritz.toml` (`http`, `spire`, `squeeze`, `spectree`, `ritzunit`) and build
+`ritz.toml` (`http`, `spire`, `squeeze`, `ritzunit`) and build
 nothing at all, `[[lib]]` included — `rz build` correctly reports "nothing to
 build" and exits 0 for those.
 

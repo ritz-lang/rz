@@ -49,10 +49,9 @@ stale, the command to regenerate it is given instead.
 | Project | Description |
 |---|---|
 | **harland** | Microkernel OS — UEFI boot, 4-level paging, SMP scheduler, L4-style IPC |
-| **indium** | Harland distribution — init, userspace utilities, bootable ISO/UEFI images |
+| **indium** | Harland distribution — init, userspace utilities (incl. `cat`, formerly ritzutils), bootable ISO/UEFI images |
 | **prism** | Display server & compositor; currently ships two Harland-target demo binaries, not a server |
 | **angelo** | Font rendering library — TrueType/OpenType parsing and glyph rasterization |
-| **angelo-simple** | Minimal Angelo render smoke test |
 | **iris** | Rendering engine for layout, painting, and hit testing |
 
 ## Browser Stack
@@ -68,9 +67,7 @@ stale, the command to regenerate it is given instead.
 | Project | Description |
 |---|---|
 | **nexus** | Knowledge base & wiki — builds; the binary is a Zeus worker, not a standalone server |
-| **spectree** | Hierarchical spec/planning tree; library + tests only, no binary and no MCP server yet |
 | **rzsh** | Cross-platform shell — builds for both Harland (`rzsh.elf`) and Linux (`rzsh.linux`) |
-| **ritzutils** | Coreutils-style Harland userspace utilities (currently `cat`) |
 
 ## Workspace Tooling
 
@@ -130,7 +127,6 @@ vacuously:
 |---|---|---|
 | valet | 0 | 99 passed, 5 files |
 | squeeze | 0 | 199 passed, 15 files |
-| spectree | 0 | 91 passed, 5 files |
 | sage | 0 | 73 passed, 2 files |
 | iris | 0 | 30 passed, 3 files |
 | ritzunit | 0 | 27 passed, 6 files |
@@ -142,7 +138,6 @@ vacuously:
 | **nexus** | **1** | 3 passed, **3 compile-failed** of 4: `Cannot find module: services.wiki_service` |
 | **tome** | **1** | **0 passed**, 1 compile-failed of 5: `test_server_auth.ritz` exits 2 |
 | **angelo** | **0** | `⚠ No tests found, skipping` — a **false green**. 106 `[[test]]` markers sit in `src/`; `rz test` looks for `test/` or a `[test]` section and finds neither |
-| angelo-simple, ritzutils | 0 | `No tests found` (genuinely have none) |
 | cryptosec, http, mausoleum, zeus, goliath | — | **not completed** within this pass (each runs for many minutes). goliath's own binary `build/debug/goliath-tests` does pass: 33 passed, exit 0 |
 
 None of the four failures is excused: `rz.toml` deliberately has **no**
@@ -156,7 +151,13 @@ The most mature projects are **ritz** (compiler), **cryptosec**, **squeeze**,
 passing suites. **harland** / **indium** (OS), **mausoleum** and **tome** build
 and run but are less complete. The browser stack is the weakest link: **tempest**
 does not compile at all, **lexis** builds but segfaults at startup (#3700), and
-**sage** compiles but ignores its arguments. **nexus** and **spectree** build but have no runnable entry point yet.
+**sage** compiles but ignores its arguments. **nexus** builds but has no runnable entry point yet.
 
 The guiding principle is the **"No Concessions Doctrine"** — fix the language
 rather than work around limitations.
+
+## Archived
+
+`spectree` and `angelo-simple` were taken out of the workspace by AGAST #1875;
+they live under [`archive/`](archive/README.md), which records why. ritzutils
+(one utility, `cat`) was merged into indium.

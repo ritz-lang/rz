@@ -10,7 +10,7 @@ Mausoleum (abbreviated m7m) is the persistence layer for the Ritz ecosystem. It 
 
 The design is inspired by SQLite (embedded, single-file), Git (content-addressable, immutable history), CouchDB (document model, MVCC), Apache Iceberg (snapshot isolation, append-only), and LMDB (memory-mapped, zero-copy reads). Data written to Mausoleum is never truly deleted - every change creates a new version, preserving complete history.
 
-The primary use case is as the persistence backend for Spectree (hierarchical specification trees for AI-assisted development) and Nexus (the Ritz knowledge base wiki).
+The primary use case is as the persistence backend for Nexus (the Ritz knowledge base wiki).
 
 ## Features
 

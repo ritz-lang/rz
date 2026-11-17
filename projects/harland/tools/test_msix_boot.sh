@@ -37,7 +37,7 @@ PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
 ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-120}"
 # Same packages as test_tier1_boot.sh: init's suite spawns all of them.
-USER_PKGS="indium rzsh ritzutils prism"
+USER_PKGS="indium rzsh prism"
 
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }

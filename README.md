@@ -145,11 +145,8 @@ Two directories under `projects/` are deliberately not among them:
 | Project | Description |
 |---------|-------------|
 | **nexus** | Official Ritz wiki — built on the full stack (mausoleum → tome → spire → zeus → valet), serves as living documentation |
-| **spectree** | Specification tree — hierarchical specs and actions that drive each other, planning tool |
 | **indium** | Harland distribution — packaging, installation, system images |
 | **rzsh** | Ritz shell — terminal shell with raw mode input, line editing, history, runs on Linux and Harland |
-| **ritzutils** | Coreutils-style Harland userspace utilities (currently `cat`) |
-| **angelo-simple** | Minimal Angelo render smoke test |
 
 ### Build status
 
@@ -173,7 +170,7 @@ built since AGAST #3689 (2026-11-16), but its binary segfaults at startup
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Applications                              │
-│  nexus  │  spectree  │  tempest  │  rzsh                        │
+│  nexus  │  tempest  │  rzsh                                     │
 ├─────────────────────────────────────────────────────────────────┤
 │                      Web & Network Stack                         │
 │  spire (framework)  │  valet (server)  │  zeus (process runner) │

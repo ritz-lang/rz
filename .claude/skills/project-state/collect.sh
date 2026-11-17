@@ -54,9 +54,9 @@ def sh(*cmd, check=True):
 LAYERS = {
     "1 · Compiler": ["ritz", "ritzlib", "ritzunit", "ritz-lsp", "rzrz"],
     "2 · Kernel": ["harland"],
-    "3 · OS / userland": ["indium", "rzsh", "ritzutils"],
-    "4 · Desktop": ["prism", "angelo", "angelo-simple", "iris"],
-    "5 · Productivity": ["tempest", "lexis", "sage", "nexus", "spectree"],
+    "3 · OS / userland": ["indium", "rzsh"],
+    "4 · Desktop": ["prism", "angelo", "iris"],
+    "5 · Productivity": ["tempest", "lexis", "sage", "nexus"],
     "Foundation · Server & infra": ["valet", "zeus", "spire", "http", "cryptosec",
                                     "squeeze", "mausoleum", "tome", "goliath"],
     "Not a layer (reviews/docs)": ["larb"],

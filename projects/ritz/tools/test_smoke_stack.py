@@ -8,7 +8,7 @@ stack is broken, so those are what these pin, without starting any server:
     a broken precondition is FAIL even under an xfail; an XFAILS entry no
     check ran under is reported, so a rename cannot leave a dead excuse;
   * every xfail cites an AGAST ticket;
-  * binaries are chosen by target, not by name: the harland ELFs (ritzutils
+  * binaries are chosen by target, not by name: the harland ELFs (indium
     cat.elf, rzsh.elf) are out, rzsh.linux and the servers are in;
   * every process it starts is killed by process group, children included,
     and a CLI that hangs is killed at its timeout.
@@ -151,7 +151,6 @@ def test_linux_bins_selects_by_target_not_name():
     ids = {b.check for b in bins}
     assert "help:rzsh/rzsh.linux" in ids
     assert "help:rzsh/rzsh" not in ids              # harland rzsh.elf
-    assert not any(c.startswith("help:ritzutils/") for c in ids)  # harland cat.elf
     assert not any(c.startswith(("help:harland/", "help:indium/")) for c in ids)
     assert "help:prism/prism" in ids                # Linux; its siblings are harland .elfs
     assert "help:prism/prism_demo" not in ids and "help:prism/hello_gfx" not in ids
