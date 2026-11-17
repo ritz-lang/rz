@@ -67,6 +67,29 @@ fn main() -> i32
     0
 """
 
+# An arm's last statement before its value is not the arm's value
+# (AGAST #3515: ritz1 kept the arm's value apart from its statements and
+# took the call for the block's tail).
+IN_MATCH_ARM = CHECK + """\
+fn main() -> i32
+    match 3
+        3 =>
+            check(3)
+            0
+        _ => 0
+"""
+
+IN_IF_EXPR_ARM = CHECK + """\
+fn main() -> i32
+    var n: i32 = 2
+    let v: i32 = if n == 2
+        check(8)
+        1
+    else
+        0
+    v
+"""
+
 USED = CHECK + """\
 fn first() -> i32
     check(1)
@@ -120,6 +143,18 @@ def test_discard_inside_loop_body(request, tmp_path, compiler):
 def test_discard_inside_if_branch(request, tmp_path, compiler):
     _need(compiler, request)
     _assert_located_error(compiler, tmp_path, IN_IF_BRANCH, 10, 9, RULE)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_discard_before_match_arm_value(request, tmp_path, compiler):
+    _need(compiler, request)
+    _assert_located_error(compiler, tmp_path, IN_MATCH_ARM, 10, 13, RULE)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_discard_before_if_expression_arm_value(request, tmp_path, compiler):
+    _need(compiler, request)
+    _assert_located_error(compiler, tmp_path, IN_IF_EXPR_ARM, 10, 9, RULE)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

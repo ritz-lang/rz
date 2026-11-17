@@ -17,10 +17,10 @@ THE TESTS
   until bool_check moved onto Sema too, AGAST #3502.)
 - One program pins the move's reach to the emitter's, location by location:
   every block kind that reported before still does, an impl method and each
-  generic instance included, and what didn't (a match / if-expression arm's
-  last statement before its value, a local fn pointer named like the fn)
-  still doesn't.  ritz0 refuses a discard in a match arm; that gap predates
-  the move and is its own ticket.
+  generic instance included, and a local fn pointer named like the fn still
+  doesn't.  A match / if-expression arm's last statement before its value
+  (49:13, 53:9) did not report before the move either; AGAST #3515 closed
+  that gap, so it reports now, as ritz0 always has.
 
   One report is new: `check(6)` in the `defer` block (37:9).  The emitter
   lowered a defer body at the fn's exit, after `let check: fn(..)` was
@@ -133,7 +133,8 @@ fn main() -> i32
 
 # line:col of each report, one per lowered copy: twice<T> has two instances.
 REACH_WANTED = sorted(["15:9", "19:5", "19:5", "23:5", "28:9", "31:9", "34:9",
-                       "37:9", "42:9", "45:9", "60:17", "68:5"])
+                       "37:9", "42:9", "45:9", "49:13", "53:9", "60:17",
+                       "68:5"])
 
 
 def _reports(comp):
