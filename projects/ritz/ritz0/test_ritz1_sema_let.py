@@ -22,11 +22,12 @@ THE TESTS
 One program, both ritz1 compilers.  It has a let_check error at each place
 the walk calls into let_check (a statement's write and `@&`, an expression
 arm, a receiver lent to `self: **C`, a call's and a method's struct argument,
-a store, a declaration, a `return` and a fn's tail), in source order.  An
-emitter-side error after them (a literal that doesn't fit its slot,
-literal_slot) is no longer printed: before the move it was.  A fn's tail
-expression is the fn's value, not a statement: an `@&` in it was never
-let-checked and still isn't (ritz0 refuses it: AGAST #3804).
+a store, a declaration, a `return`, a fn's tail and a method's), in source
+order.  An emitter-side error after them (a literal that doesn't fit its
+slot, literal_slot) is no longer printed: before the move it was.  A fn's tail
+expression is the fn's value, not a statement, but an `@&` of a `let` in it
+is refused as anywhere else (AGAST #3804: the emitter never let-checked it).
+ritz1 reports an `@&` at the `@`; ritz0 at its operand, two columns on.
 """
 
 import re
@@ -90,11 +91,17 @@ fn main() -> i32
     p.x = 5
     var m: u8 = 300
     0
+
+impl D
+    fn tail_m(self: *D) -> i64
+        let t = Pt { x: 1, y: 2 }
+        pt_x(@&t)
 """
 
 WANTED = [
     ("27:9", "the fn is declared `-> D` but its return value is a `Pt`"),
     ("28:5", "the fn is declared `-> D` but its return value is a `Pt`"),
+    ("32:10", "cannot borrow `let` binding `t` as mutable; declare it `var`"),
     ("38:25", "cannot borrow `let` binding `p` as mutable; declare it `var`"),
     ("42:5", "cannot borrow `let` binding `q` as mutable; declare it `var`"),
     ("43:12", "parameter `d` is declared `D` but its argument is a `Pt`"),
@@ -102,6 +109,7 @@ WANTED = [
     ("46:5", "`d` is declared `D` but the value assigned is a `Pt`"),
     ("47:5", "`e` is declared `D` but its initialiser is a `Pt`"),
     ("48:5", "cannot assign through `let` binding `p`; declare it `var`"),
+    ("55:14", "cannot borrow `let` binding `t` as mutable; declare it `var`"),
 ]
 
 
