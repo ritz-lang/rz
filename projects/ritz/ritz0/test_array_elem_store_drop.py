@@ -432,6 +432,35 @@ def test_store_into_cast_or_arith_base(tmp_path, compiler, name):
     assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
 
 
+# Reading `(e as **T)[i]` loads the `*T` at element i, a pointer's stride, as
+# the store above writes one, evaluating `e` once (6).  ritz1 had no arm for a
+# cast base and read one byte at `e + i` as the pointer: a SIGSEGV
+# (AGAST #3756).  §13.6 orders an assignment's place; a read's isn't pinned.
+CAST_PTR_PTR_LOAD = """\
+var P: i64 = 0
+
+fn base() -> i64
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var x: i32 = 1
+    var y: i32 = 3
+    var z: i32 = 4
+    var ps: [3]*i32 = [@x, @y, @z]
+    P = @ps[0] as i64
+    let r: *i32 = (base() as **i32)[1]
+    let t: *i32 = (P as **i32)[2]
+    D = (D * 10 + *r as i64) * 10 + *t as i64
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_load_from_cast_ptr_ptr_base(tmp_path, compiler):
+    rc = _run(compiler, tmp_path, "cast_pp_load", _source(CAST_PTR_PTR_LOAD, "f()", 634))
+    assert rc == 42, f"{compiler}: D % 200 == {rc}, spec says D == 634"
+
+
 # A scalar base, or pointer arithmetic the store above doesn't type, reached
 # that generic path too; ritz1's Sema refuses it (index_store_check).  An
 # integer base in ritz0's words for `n[i] = v`, on every compiler (ritz0 raised

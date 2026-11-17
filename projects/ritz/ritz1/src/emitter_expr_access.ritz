@@ -761,6 +761,40 @@ pub fn struct_return_as_int_refused(s: *EmitterState, value: *Expr, ret_type: i3
     let msg: *u8 = ctor_join(head, n, name, len, tail, strlen(tail) as i32, @n)
     return struct_value_refused(s, value, msg)
 
+# AGAST #3756: `(e as **T)[i]` reads the `*T` at element i: GEP `ptr` (a
+# pointer's stride) and load a `ptr`, as an i64.  It took the byte path below:
+# one i8 at `e + i`, then dereferenced as a pointer, a SIGSEGV.
+fn emit_cast_ptr_ptr_index(s: *EmitterState, e: *Expr) -> i32
+    let base: i32 = emit_expr(s, e.left)
+    let idx: i32 = emit_expr(s, e.right)
+    let base_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, base)
+    emit_str(s, c" to ptr\n")
+    let elem_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c" = getelementptr ptr, ptr ")
+    emit_reg(s, base_ptr)
+    emit_str(s, c", i64 ")
+    emit_reg(s, idx)
+    emit_str(s, c"\n")
+    let loaded: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, loaded)
+    emit_str(s, c" = load ptr, ptr ")
+    emit_reg(s, elem_ptr)
+    emit_str(s, c"\n")
+    let val: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, val)
+    emit_str(s, c" = ptrtoint ptr ")
+    emit_reg(s, loaded)
+    emit_str(s, c" to i64\n")
+    return val
+
 pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     # AGAST #2440: `p[i]` through a reference or pointer.
     if index_refused(s, e) == 1
@@ -868,6 +902,10 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             var cb_deref: Expr
             elem_index_as_deref(e, @cb_sum, @cb_deref)
             return emit_expr(s, @cb_deref)
+    # AGAST #3756: `(e as **T)[i]` is the `*T` at element i, as
+    # emit_ptr_base_index_store (#3565) stores one.
+    if e.left.kind == EXPR_CAST and e.left.op == TYPE_PTR_PTR and e.right != null and e.right.kind != EXPR_RANGE
+        return emit_cast_ptr_ptr_index(s, e)
     # Check if base is an array, pointer-to-pointer (e.g., argv: **u8), or pointer
     #
     # AGAST #1328: resolve the base through locals THEN globals, and carry the
