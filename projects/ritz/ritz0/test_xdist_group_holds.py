@@ -50,8 +50,13 @@ def _workers_used(tmp_path: Path, mark: str) -> set[str]:
     # nested session must schedule for itself.
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
     env["GROUP_PROBE_DIR"] = str(landed)
+    # AGAST #3898: the installed plugins (django, asyncio, cov, ...) took ~3 s
+    # to load in each of the three processes, most of this file's cost.  Load
+    # only the installed xdist, which is the plugin under test.
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", "-q", "-n", "2", "--dist", "loadgroup",
+        [sys.executable, "-m", "pytest", "-q", "-p", "xdist.plugin",
+         "-n", "2", "--dist", "loadgroup",
          "-p", "no:cacheprovider", "--rootdir", str(session), "test_probe.py"],
         cwd=session, env=env, capture_output=True, text=True, timeout=120,
     )

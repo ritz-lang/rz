@@ -479,6 +479,14 @@ Rules:
    `cd ritz0 && python -m pytest ... --cost-report=c.json && python
    ../tools/check_test_budget.py c.json`.  Over budget?  Batch and resize
    the matrix; raising the number or adding an override needs a ticket.
+8. **A nested pytest loads only what it tests.**  Set
+   `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` and name what it needs with `-p`
+   (`-p xdist.plugin`, `-p spawn_guard`); ritz0's conftest.py loads its own
+   plugins by name.  Autoloading the installed plugins (django, asyncio,
+   cov, ...) cost 3-5 s per process, and one session per case multiplied
+   that.  Run the cases in one session and read each verdict from
+   `--junitxml` (`test_spawn_guard.py`).  AGAST #3898 took four such files
+   from ~120 to ~37 CPU-s.
 
 ---
 

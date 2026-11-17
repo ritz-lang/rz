@@ -97,12 +97,29 @@ def _COPY_IGNORE(directory: str, names: list[str]) -> set[str]:
     return ignored
 
 
+def _nested_env(root: Path) -> dict[str, str]:
+    """This environment for the copy, without this session's PYTEST_*.
+
+    The gate's PYTEST_ADDOPTS names the files it runs, which the copy has
+    too, so inheriting it would run them there instead of TARGET_TEST alone.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env["RITZ_PATH"] = str(root)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    return env
+
+
 def _run_pytest(root: Path) -> subprocess.CompletedProcess:
-    """Run the single parse-error test inside a copied tree, from its own ritz0."""
+    """Run the single parse-error test inside a copied tree, from its own ritz0.
+
+    AGAST #3898: plugin autoload is off.  The installed plugins (django,
+    asyncio, cov, ...) took ~5 s of each ~6 s arm and play no part in it;
+    the copy's conftest.py loads its own plugins by name.
+    """
     return subprocess.run(
         [sys.executable, "-m", "pytest", TARGET_TEST, "-q", "-p", "no:cacheprovider"],
         cwd=root / "ritz0",
-        env=dict(os.environ, RITZ_PATH=str(root)),
+        env=_nested_env(root),
         capture_output=True,
         text=True,
         timeout=1800,

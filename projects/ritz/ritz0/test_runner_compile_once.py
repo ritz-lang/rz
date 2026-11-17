@@ -71,45 +71,49 @@ TEST_SOURCE = textwrap.dedent(
 N_TESTS = 5
 
 
-@pytest.fixture
-def package(tmp_path, monkeypatch):
-    """A minimal package whose only dependency is ritzlib."""
-    monkeypatch.setenv("RITZ_PATH", str(RITZ_DIR))
-    # AGAST #1915: the harness now comes from the artifact store when it has
-    # it. A shared store warmed by an earlier run (or another xdist worker)
-    # would serve it with 0 compiles, so count against a private, empty one.
-    monkeypatch.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
-    (tmp_path / "ritz.toml").write_text(
-        textwrap.dedent(
-            f"""\
-            [package]
-            name = "compile_once"
-            version = "0.1.0"
-            sources = ["test"]
+@pytest.fixture(scope="module")
+def run(tmp_path_factory):
+    """One `run_test_file` over a minimal package, with every command it ran.
 
-            [dependencies]
-            ritzlib = {{ path = "{RITZ_DIR / 'ritzlib'}", sources = ["."] }}
-            """
-        )
-    )
-    (tmp_path / "test").mkdir()
-    test_file = tmp_path / "test" / "test_compile_once.ritz"
-    test_file.write_text(TEST_SOURCE)
-    return test_file
-
-
-@pytest.fixture
-def recorded_commands(monkeypatch):
-    """Record every subprocess command test_runner runs, then run it for real."""
+    Returns `(calls, (passed, failed, failures))`.  AGAST #3898: the run
+    compiles ritzlib and ritzunit into an empty store (~8 s), and each test
+    below only reads it, so they share one instead of paying for three.
+    """
+    tmp_path = tmp_path_factory.mktemp("compile_once")
     calls = []
     real_run = subprocess.run
 
     def recording_run(cmd, *args, **kwargs):
+        """Record every subprocess command test_runner runs, then run it."""
         calls.append(list(map(str, cmd)))
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr(test_runner.subprocess, "run", recording_run)
-    return calls
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("RITZ_PATH", str(RITZ_DIR))
+        # AGAST #1915: the harness now comes from the artifact store when it
+        # has it. A shared store warmed by an earlier run (or another xdist
+        # worker) would serve it with 0 compiles, so count against a private,
+        # empty one.
+        mp.setenv("RITZ_CACHE_DIR", str(tmp_path / "cas"))
+        (tmp_path / "ritz.toml").write_text(
+            textwrap.dedent(
+                f"""\
+                [package]
+                name = "compile_once"
+                version = "0.1.0"
+                sources = ["test"]
+
+                [dependencies]
+                ritzlib = {{ path = "{RITZ_DIR / 'ritzlib'}", sources = ["."] }}
+                """
+            )
+        )
+        (tmp_path / "test").mkdir()
+        test_file = tmp_path / "test" / "test_compile_once.ritz"
+        test_file.write_text(TEST_SOURCE)
+        mp.setattr(test_runner.subprocess, "run", recording_run)
+        result = test_runner.run_test_file(str(test_file))
+    return calls, result
 
 
 def _harness_compiles(calls):
@@ -125,9 +129,9 @@ def _links(calls):
 
 
 @pytest.mark.integration
-def test_test_file_is_compiled_once_regardless_of_test_count(package, recorded_commands):
+def test_test_file_is_compiled_once_regardless_of_test_count(run):
     """The defect itself: N tests used to mean N full compiles and N links."""
-    test_runner.run_test_file(str(package))
+    recorded_commands, _ = run
 
     harness = _harness_compiles(recorded_commands)
     links = _links(recorded_commands)
@@ -142,12 +146,12 @@ def test_test_file_is_compiled_once_regardless_of_test_count(package, recorded_c
 
 
 @pytest.mark.integration
-def test_binary_runs_once_and_ritzunit_forks_per_test(package, recorded_commands):
+def test_binary_runs_once_and_ritzunit_forks_per_test(run):
     """One execution of the binary; isolation is ritzunit's fork per test.
 
     The report has one entry per test, so every test ran, in its own child.
     """
-    passed, failed, _ = test_runner.run_test_file(str(package))
+    recorded_commands, (passed, failed, _) = run
 
     runs = [
         c for c in recorded_commands
@@ -159,7 +163,7 @@ def test_binary_runs_once_and_ritzunit_forks_per_test(package, recorded_commands
 
 
 @pytest.mark.integration
-def test_per_test_verdicts_are_preserved(package):
+def test_per_test_verdicts_are_preserved(run):
     """Each test's verdict is reported against its own name.
 
     Pass/fail counts alone could hide a runner that ran the wrong function for
@@ -167,7 +171,7 @@ def test_per_test_verdicts_are_preserved(package):
     returns 3 from `-> i64`: a non-i32 result fails as 1 (§17.1), it is not
     truncated into an exit status.
     """
-    passed, failed, failures = test_runner.run_test_file(str(package))
+    _, (passed, failed, failures) = run
 
     assert (passed, failed) == (3, 2), failures
     failed_names = sorted(f.split(":", 1)[0] for f in failures)
