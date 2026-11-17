@@ -1,4 +1,4 @@
-# let_check.ritz - `let` immutability (AGAST #2028, ritz0 #2026)
+# let_check.ritz - `let` immutability (AGAST #2028, ritz0 #2026), on Sema
 #
 # A write (`=`, `op=`) or a mutable borrow (`@&`) whose place is a `let`'s
 # own storage is a compile error: the binding itself, a by-value field of
@@ -11,11 +11,20 @@
 # is ritz0/test_let_immutability.py (ritz0/test_ritz1_let_immutability.py
 # runs it through ritz1).
 #
-# A binding is a `let` when its LocalVar has is_let = 1 (emit_stmt copies it
-# from Stmt.var_is_let).  The lookup is by the CURRENT binding of the name,
-# so a `var`, param, range variable or match binding that shadows a `let` is
-# mutable, as in ritz0.  A `for x in <iterable>` element binding is a `let`
-# (emit_for_iterable, AGAST #2389).
+# AGAST #3504 (#1816): the checks run on Sema, from sema_walk.ritz, before
+# emit_module: a refused program never reaches the emitter.  They read
+# Sema's lexical scope, where SemaVar.is_let marks a `let` (and a
+# `for x in <iterable>` element, AGAST #2389), and SemaVar.let_* records the
+# local as the emitter's LocalVar does (let_note_decl / _param / _for).  The
+# lookup is by the CURRENT binding of the name, so a `var`, param, range
+# variable or match binding that shadows a `let` is mutable, as in ritz0.
+# Where Sema can't type a local (let_kind TYPE_UNKNOWN) a check that needs
+# its type stays quiet: a missed refusal is a parity gap, a false one would
+# refuse a valid program.
+#
+# The place rule itself (let_place) is one copy over a LetEnv, which reads
+# either Sema's scope or the emitter's locals: ref_check.ritz, still on the
+# emitter, asks let_addr_of_own / let_error_addr about an `@x` (AGAST #2338).
 #
 # Implicit mutable autoborrows (AGAST #2032, ritz0 #2029) count too: a
 # `self:&` / `self: @&T` receiver or a `name:& T` / `name: @&T` argument
@@ -26,30 +35,52 @@ import ritzlib.io
 
 import ast
 import ast_helpers
-import emitter_core
-import emitter_expr_call   # method_callee_def (AGAST #2032)
-import bool_kind           # bk_method_def (AGAST #3294)
+import emitter_core      # pure helpers: name_eq, find_field_index, ...
+import emitter_expr      # self_struct_levels, ptr_ptr_ident_levels, ...
+import sema
+import sema_type
+import bool_check        # Sema's resolvers: sbk_method_def, sbk_receiver, ...
+import index_through     # name_is_indexable
+
+# Where a place lookup reads: the emitter's locals (s), or Sema's scope (sm).
+struct LetEnv
+    s: *EmitterState
+    sm: *Sema
 
 # The type of the place reached so far along a `let`'s own storage.
 struct LetPlace
     name: *u8            # the `let` binding's name
     name_len: i32
-    kind: i32            # TYPE_* of the place
-    type_name: *u8       # struct name when kind == TYPE_STRUCT
+    kind: i32            # TYPE_* of the place; TYPE_UNKNOWN when Sema can't say
+    type_name: *u8       # struct name when kind == TYPE_STRUCT (or a pointer's pointee)
     type_name_len: i32
     elem: i32            # element TYPE_* when kind == TYPE_ARRAY
     elem_name: *u8       # element struct name when elem == TYPE_STRUCT
     elem_name_len: i32
     is_const: i32        # AGAST #3325: the root is a module `const` array
+    pointee: i32         # the pointee's TYPE_* when kind is a pointer
+    inner: i32           # a `**T` place's inner-pointee slot
+    tuple: i32           # 1 for a nameless tuple's root: its fields are unnamed
+
+fn let_find_struct(env: *LetEnv, name: *u8, len: i32) -> *StructDef
+    if env.s != null
+        return find_struct(env.s, name, len)
+    sema_find_struct(env.sm, name, len)
 
 # AGAST #3325: a module `const A: [N]T = [...]` is read-only data
 # (`internal constant`), so a write into it (`A[i] = v`, `A[i].f = v`) or a
 # mutable borrow of it faulted at run time.  It is a place like a `let`'s,
 # under its own message.  A local or global of the name is what it names.
-fn let_place_const(s: *EmitterState, name: *u8, len: i32, out: *LetPlace) -> i32
-    if find_global(s, name, len) != null
-        return 0
-    let ce: *ConstEntry = find_const_entry(s, name, len)
+fn let_place_const(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
+    var ce: *ConstEntry = null
+    if env.s != null
+        if find_global(env.s, name, len) != null
+            return 0
+        ce = find_const_entry(env.s, name, len)
+    else
+        if sbk_global(env.sm, name, len) != null
+            return 0
+        ce = sbk_const(env.sm, name, len)
     if ce == null or ce.const_type != TYPE_ARRAY
         return 0
     out.name = ce.name
@@ -64,12 +95,36 @@ fn let_place_const(s: *EmitterState, name: *u8, len: i32, out: *LetPlace) -> i32
     return 1
 
 # 1 and fill `out` when `name` is currently bound by a `let`.
-fn let_place_root(s: *EmitterState, name: *u8, len: i32, out: *LetPlace) -> i32
+fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
     out.is_const = 0
-    let idx: i32 = find_local_idx(s, name, len)
+    out.pointee = TYPE_VOID
+    out.inner = TYPE_VOID
+    out.tuple = 0
+    # LocalVar / SemaVar do not record an array's element struct name.
+    # Without it a `.f` past `a[i]` stays permissive (let_place_member
+    # answers 0).
+    out.elem_name = null
+    out.elem_name_len = 0
+    if env.s == null
+        let v: *SemaVar = sema_find_local(env.sm, name, len)
+        if v == null
+            return let_place_const(env, name, len, out)
+        if v.is_let != 1
+            return 0
+        out.name = v.name
+        out.name_len = v.name_len
+        out.kind = v.let_kind
+        out.type_name = v.let_name
+        out.type_name_len = v.let_name_len
+        out.elem = v.let_elem
+        out.pointee = v.let_pointee
+        out.inner = v.inner
+        out.tuple = v.tuple
+        return 1
+    let idx: i32 = find_local_idx(env.s, name, len)
     if idx < 0
-        return let_place_const(s, name, len, out)
-    let loc: *LocalVar = local_at(s, idx)
+        return let_place_const(env, name, len, out)
+    let loc: *LocalVar = local_at(env.s, idx)
     if loc.is_let != 1
         return 0
     out.name = loc.name
@@ -78,18 +133,25 @@ fn let_place_root(s: *EmitterState, name: *u8, len: i32, out: *LetPlace) -> i32
     out.type_name = loc.type_name
     out.type_name_len = loc.type_name_len
     out.elem = loc.array_elem_type
-    # LocalVar does not record an array's element struct name.  Without it a
-    # `.f` past `a[i]` stays permissive (let_place_member answers 0).
-    out.elem_name = null
-    out.elem_name_len = 0
+    out.pointee = loc.pointee_type
+    out.inner = loc.inner_pointee_type
     return 1
 
 # Step `out` into field `field` of a by-value struct.  0 when the place is
 # not a struct value (a pointer, say), so the field lives outside the `let`.
-fn let_place_member(s: *EmitterState, out: *LetPlace, field: *u8, field_len: i32) -> i32
+fn let_place_member(env: *LetEnv, out: *LetPlace, field: *u8, field_len: i32) -> i32
+    if out.kind == TYPE_STRUCT and out.type_name_len <= 0 and out.tuple == 1
+        # `p.0` of `let p = (1, 2)`: the emitter names the tuple's struct
+        # only as it lowers it.  The field is the `let`'s own storage, of a
+        # type Sema doesn't know.
+        out.kind = TYPE_UNKNOWN
+        out.tuple = 0
+        out.type_name = null
+        out.type_name_len = 0
+        return 1
     if out.kind != TYPE_STRUCT or out.type_name_len <= 0
         return 0
-    let st: *StructDef = find_struct(s, out.type_name, out.type_name_len)
+    let st: *StructDef = let_find_struct(env, out.type_name, out.type_name_len)
     if st == null
         return 0
     let fidx: i32 = find_field_index(st, field, field_len)
@@ -104,6 +166,8 @@ fn let_place_member(s: *EmitterState, out: *LetPlace, field: *u8, field_len: i32
     out.elem = fld.array_elem_type
     out.elem_name = fld.array_elem_type_name
     out.elem_name_len = fld.array_elem_type_name_len
+    out.pointee = fld.ptr_pointee
+    out.inner = fld.inner_pointee_type
     return 1
 
 # Step `out` into an element of a by-value array.  0 for a pointer or slice:
@@ -117,20 +181,22 @@ fn let_place_index(out: *LetPlace) -> i32
     out.elem = TYPE_VOID
     out.elem_name = null
     out.elem_name_len = 0
+    out.pointee = TYPE_VOID
+    out.inner = TYPE_VOID
     return 1
 
 # 1 when `e` (an ident / `.f` / `[i]` chain) is a `let`'s own storage.
-fn let_place(s: *EmitterState, e: *Expr, out: *LetPlace) -> i32
+fn let_place(env: *LetEnv, e: *Expr, out: *LetPlace) -> i32
     if e == null
         return 0
     if e.kind == EXPR_IDENT
-        return let_place_root(s, e.ident_ptr, e.ident_len, out)
+        return let_place_root(env, e.ident_ptr, e.ident_len, out)
     if e.kind == EXPR_MEMBER
-        if let_place(s, e.left, out) == 0
+        if let_place(env, e.left, out) == 0
             return 0
-        return let_place_member(s, out, e.ident_ptr, e.ident_len)
+        return let_place_member(env, out, e.ident_ptr, e.ident_len)
     if e.kind == EXPR_INDEX
-        if let_place(s, e.left, out) == 0
+        if let_place(env, e.left, out) == 0
             return 0
         return let_place_index(out)
     return 0
@@ -141,40 +207,430 @@ fn let_eprint_name(name: *u8, len: i32)
         eprint_char(*(name + i))
         i += 1
 
-# `<file>:<line>:<col>: error: <head>`<name>`<tail>`, counted.
-fn let_error(s: *EmitterState, line: i32, col: i32, head: *u8, name: *u8, len: i32, tail: *u8)
-    let file: *u8 = emitter_source_file()
-    if file != null
-        eprints_cstr(file)
+# `<file>:<line>:<col>: error: <head>`<name>`<tail>`, counted on the env's
+# pass.  Sema names the input file, as the emitter did.
+fn let_error(env: *LetEnv, line: i32, col: i32, head: *u8, name: *u8, len: i32, tail: *u8)
+    if env.s != null
+        let file: *u8 = emitter_source_file()
+        if file != null
+            eprints_cstr(file)
+        else
+            eprints_cstr(c"<input>")
+        eprint_char(':')
+        eprint_i64(line as i64)
+        eprint_char(':')
+        eprint_i64(col as i64)
+        eprints_cstr(c": error: ")
+        env.s.error_count = env.s.error_count + 1
     else
-        eprints_cstr(c"<input>")
-    eprint_char(':')
-    eprint_i64(line as i64)
-    eprint_char(':')
-    eprint_i64(col as i64)
-    eprints_cstr(c": error: ")
+        sema_error_at(env.sm, line, col)
     eprints_cstr(head)
     let_eprint_name(name, len)
     eprints_cstr(tail)
-    s.error_count = s.error_count + 1
 
-fn let_error_assign_through(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
+fn let_error_assign_through(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(s, line, col, c"cannot assign through const `", pl.name, pl.name_len, c"`; it is read-only data\n")
+        let_error(env, line, col, c"cannot assign through const `", pl.name, pl.name_len, c"`; it is read-only data\n")
         return
-    let_error(s, line, col, c"cannot assign through `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
+    let_error(env, line, col, c"cannot assign through `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
 
-fn let_error_assign_whole(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
+fn let_error_assign_whole(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(s, line, col, c"cannot assign to const `", pl.name, pl.name_len, c"`; it is read-only data\n")
+        let_error(env, line, col, c"cannot assign to const `", pl.name, pl.name_len, c"`; it is read-only data\n")
         return
-    let_error(s, line, col, c"cannot assign to `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
+    let_error(env, line, col, c"cannot assign to `let` binding `", pl.name, pl.name_len, c"`; declare it `var`\n")
 
-fn let_error_borrow(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
+fn let_error_borrow(env: *LetEnv, line: i32, col: i32, pl: *LetPlace)
     if pl.is_const == 1
-        let_error(s, line, col, c"cannot borrow const `", pl.name, pl.name_len, c"` as mutable; it is read-only data\n")
+        let_error(env, line, col, c"cannot borrow const `", pl.name, pl.name_len, c"` as mutable; it is read-only data\n")
         return
-    let_error(s, line, col, c"cannot borrow `let` binding `", pl.name, pl.name_len, c"` as mutable; declare it `var`\n")
+    let_error(env, line, col, c"cannot borrow `let` binding `", pl.name, pl.name_len, c"` as mutable; declare it `var`\n")
+
+fn let_sema_env(sm: *Sema, env: *LetEnv)
+    env.s = null
+    env.sm = sm
+
+# =============================================================================
+# The emitter's view, for ref_check.ritz (AGAST #2338)
+# =============================================================================
+
+# `e` is `@x` of a `let`'s own storage.  It's the shared form of what
+# let_check_expr refuses, and refused only where it lands in a mutable slot,
+# which ref_check.ritz sees.
+pub fn let_addr_of_own(s: *EmitterState, e: *Expr) -> i32
+    var env: LetEnv
+    env.s = s
+    env.sm = null
+    let_addr_of_own_in(@env, e)
+
+pub fn let_addr_of_own_in(env: *LetEnv, e: *Expr) -> i32
+    if e.kind != EXPR_UNARY or e.op != OP_ADDR
+        return 0
+    var pl: LetPlace
+    let_place(env, e.operand, @pl)
+
+pub fn let_error_addr(s: *EmitterState, e: *Expr)
+    var env: LetEnv
+    env.s = s
+    env.sm = null
+    var pl: LetPlace
+    if let_place(@env, e.operand, @pl) == 1
+        let_error_borrow(@env, e.span.line, e.span.col, @pl)
+
+# =============================================================================
+# Sema's local table: what each binding is (let_note_*)
+# =============================================================================
+
+fn let_last(sm: *Sema) -> *SemaVar
+    if sm.scope_top <= 0
+        return null
+    @sm.scope[sm.scope_top - 1]
+
+# 1 when `e` is a tuple literal nothing has named: `(1, 2)`.
+fn let_tuple_lit(e: *Expr) -> i32
+    if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
+        return 0
+    let fi: *FieldInit = e.args as *FieldInit
+    if fi == null or fi.name_len != 1 or *fi.name != 48  # '0'
+        return 0
+    1
+
+fn let_set_value(kind: i32, name: *u8, name_len: i32, out_kind: *i32, out_name: **u8, out_len: *i32) -> i32
+    if kind == TYPE_STRUCT and name_len <= 0
+        return 0
+    if kind == TYPE_STRUCT or kind == TYPE_BOOL or kind == TYPE_F32 or kind == TYPE_F64 or sema_is_int_kind(kind) == 1
+        *out_kind = kind
+        *out_name = name
+        *out_len = name_len
+        if kind != TYPE_STRUCT
+            *out_name = null
+            *out_len = 0
+        return 1
+    0
+
+# What an untyped `let x = e` holds where sema_expr_ty can't say but the
+# emitter types it anyway: a method's result, an element of an array, a
+# field reached through what Sema's resolvers name, an `if` / `match` arm's
+# value.  1 and the kind (and a struct's name) for a struct or scalar value;
+# 0 otherwise, a pointer included (its pointee isn't recorded here).
+fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *i32, out_name: **u8, out_len: *i32, depth: i32) -> i32
+    if e == null or depth > 8
+        return 0
+    var t: SemaTy
+    let k: i32 = sema_expr_ty(sm, e, @t)
+    if k != TYPE_UNKNOWN
+        return let_set_value(k, t.name, t.name_len, out_kind, out_name, out_len)
+    if e.kind == EXPR_METHOD
+        # StrView.as_bytes() is a `Span$u8` (resolve_expr_struct_name).
+        if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
+            return let_set_value(TYPE_STRUCT, c"Span$u8", 7, out_kind, out_name, out_len)
+        if e.args == null and name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1
+            # `r.unwrap()` of an Option$S / Result$S$E is an S.
+            var un: *u8 = null
+            var ul: i32 = 0
+            sbk_receiver(sm, e, @un, @ul)
+            return let_set_value(TYPE_STRUCT, un, ul, out_kind, out_name, out_len)
+        let fd: *FnDef = sbk_method_def(sm, e)
+        if fd == null
+            return 0
+        return let_set_value(fd.return_type, fd.return_type_name, fd.return_type_name_len, out_kind, out_name, out_len)
+    if e.kind == EXPR_INDEX
+        if e.right != null and e.right.kind == EXPR_RANGE
+            return 0
+        let b: *Expr = e.left
+        if b == null
+            return 0
+        if b.kind == EXPR_IDENT
+            let lv: *SemaVar = sema_find_local(sm, b.ident_ptr, b.ident_len)
+            if lv != null
+                if lv.let_kind != TYPE_ARRAY or lv.let_elem == TYPE_ARRAY
+                    return 0
+                return let_set_value(lv.let_elem, lv.let_name, lv.let_name_len, out_kind, out_name, out_len)
+            let g: *GlobalVarDef = sbk_global(sm, b.ident_ptr, b.ident_len)
+            if g != null and g.var_type == TYPE_ARRAY and g.array_elem_type != TYPE_ARRAY
+                return let_set_value(g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len, out_kind, out_name, out_len)
+            return 0
+        if b.kind == EXPR_MEMBER
+            let f: *StructField = sbk_member_field(sm, b)
+            if f != null and f.field_type == TYPE_ARRAY and f.array_elem_type != TYPE_ARRAY
+                return let_set_value(f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, out_kind, out_name, out_len)
+        return 0
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = sbk_member_field(sm, e)
+        if f == null
+            return 0
+        return let_set_value(f.field_type, f.field_type_name, f.field_type_name_len, out_kind, out_name, out_len)
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        # The first arm with a value says what the merged value is.
+        var arm: *MatchArm = e.args as *MatchArm
+        while arm != null
+            if arm.is_pass == 0 and arm.body != null
+                return let_value_ty(sm, arm.body, out_kind, out_name, out_len, depth + 1)
+            arm = arm.next
+    0
+
+# The `let` / `var` `st` just bound by sema_bind_decl: an array's element,
+# and what an untyped one holds where Sema's typer leaves it unknown and
+# the emitter types it anyway (an array literal, a tuple).
+pub fn let_note_decl(sm: *Sema, st: *Stmt)
+    let v: *SemaVar = let_last(sm)
+    if v == null or name_eq(v.name, v.name_len, st.var_name, st.var_name_len) == 0
+        return
+    if st.var_declared_type != TYPE_VOID
+        if st.var_type == TYPE_ARRAY
+            v.let_elem = st.var_array_elem_type
+        return
+    let init: *Expr = st.var_init
+    if init == null
+        return
+    if let_tuple_lit(init) == 1
+        v.tuple = 1
+    else if v.let_kind == TYPE_UNKNOWN and let_value_ty(sm, init, @v.let_kind, @v.let_name, @v.let_name_len, 0) == 1
+        v.let_pointee = TYPE_VOID
+    else if v.let_kind == TYPE_UNKNOWN and (init.kind == EXPR_ARRAY_LIT or init.kind == EXPR_ARRAY_FILL)
+        # AGAST #2266 / #3014: `[a, b]` / `[x; N]` is an `[N]T` local.
+        var first: *Expr = init.args
+        if init.kind == EXPR_ARRAY_FILL
+            first = init.left
+        var t: SemaTy
+        let ek: i32 = sema_expr_ty(sm, first, @t)
+        v.let_kind = TYPE_ARRAY
+        v.let_elem = ek
+        v.let_name = null
+        v.let_name_len = 0
+        if ek == TYPE_STRUCT
+            v.let_name = t.name
+            v.let_name_len = t.name_len
+
+# A param just bound by sema_bind_param: a `c:& C` holds the pointer to its
+# referent (LocalVar.is_lent, AGAST #2250).
+pub fn let_note_param(sm: *Sema, p: *Param)
+    let v: *SemaVar = let_last(sm)
+    if v == null or p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+        return
+    v.let_kind = TYPE_MUT_REF
+    v.let_name = p.param_type_name
+    v.let_name_len = p.param_type_name_len
+    v.let_pointee = p.param_pointee_type
+    let pt: i32 = p.param_pointee_type
+    if pt == TYPE_STRUCT or pt == TYPE_ARRAY or is_borrow_scalar_kind(pt) == 1
+        v.let_lent = 1
+
+# The element of a Vec, Span or String value (or a pointer to one) of type
+# `name`, through its buffer field as the emitter indexes it: 1 and the
+# element's kind (and struct name) in *out_*, else 0.
+fn let_through_elem(sm: *Sema, kind: i32, pointee: i32, name: *u8, len: i32, out_kind: *i32, out_name: **u8, out_len: *i32) -> i32
+    if kind != TYPE_STRUCT and ((kind != TYPE_PTR and kind != TYPE_REF and kind != TYPE_MUT_REF) or pointee != TYPE_STRUCT)
+        return 0
+    if name == null or len <= 0 or name_is_indexable(name, len) == 0
+        return 0
+    if name_eq(name, len, c"String", 6) == 1
+        *out_kind = TYPE_U8
+        return 1
+    let st: *StructDef = sema_find_struct(sm, name, len)
+    if st == null
+        return 0
+    var idx: i32 = find_field_index(st, c"data", 4)
+    if idx < 0
+        idx = find_field_index(st, c"ptr", 3)
+    if idx < 0
+        return 0
+    let f: *StructField = get_field_type(st, idx)
+    *out_kind = ptr_field_elem_kind(f)
+    *out_name = f.field_type_name
+    *out_len = f.field_type_name_len
+    1
+
+# A `for` variable just bound: an element of `for x in <iterable>` is a
+# `let` (AGAST #2389); a range variable is a `var`.
+pub fn let_note_for(sm: *Sema, st: *Stmt)
+    let v: *SemaVar = let_last(sm)
+    if v == null or st.for_end != null
+        return
+    v.is_let = 1
+    v.let_kind = TYPE_UNKNOWN
+    v.let_name = null
+    v.let_name_len = 0
+    # The iterable is read in the scope outside the loop variable.
+    sm.scope_top = sm.scope_top - 1
+    var e: *Expr = st.for_start
+    if e != null and e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        e = e.operand
+    var kind: i32 = TYPE_UNKNOWN
+    var name: *u8 = null
+    var name_len: i32 = 0
+    var sh: *ArrayShape = null
+    if e != null and e.kind == EXPR_IDENT
+        let lv: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        if lv != null
+            sh = lv.shape
+            if lv.let_kind == TYPE_ARRAY and lv.let_elem != TYPE_ARRAY
+                kind = lv.let_elem
+                name = lv.let_name
+                name_len = lv.let_name_len
+            else
+                # A Vec<S> / Span<S> local (#2389's iterables): its element.
+                let_through_elem(sm, lv.let_kind, lv.let_pointee, lv.let_name, lv.let_name_len, @kind, @name, @name_len)
+        else
+            let g: *GlobalVarDef = sbk_global(sm, e.ident_ptr, e.ident_len)
+            if g != null and g.var_type == TYPE_ARRAY
+                sh = g.array_shape
+                if g.array_elem_type != TYPE_ARRAY
+                    kind = g.array_elem_type
+                    name = g.array_elem_type_name
+                    name_len = g.array_elem_type_name_len
+    else if e != null and e.kind == EXPR_MEMBER
+        let f: *StructField = sbk_member_field(sm, e)
+        if f != null and f.field_type == TYPE_ARRAY
+            sh = f.array_shape
+            if f.array_elem_type != TYPE_ARRAY
+                kind = f.array_elem_type
+                name = f.array_elem_type_name
+                name_len = f.array_elem_type_name_len
+        else if f != null
+            let_through_elem(sm, f.field_type, f.ptr_pointee, f.field_type_name, f.field_type_name_len, @kind, @name, @name_len)
+    sm.scope_top = sm.scope_top + 1
+    # AGAST #2410 / #3379: over an N-D `[N][M]..T` each turn binds a row, an
+    # `[M]T` local, or a plane, whose elements are arrays.
+    if sh != null and sh.rank >= 2
+        v.let_kind = TYPE_ARRAY
+        v.let_elem = TYPE_ARRAY
+        if sh.rank == 2
+            v.let_elem = sh.leaf_type
+            v.let_name = sh.leaf_name
+            v.let_name_len = sh.leaf_name_len
+        return
+    # Only a scalar or a named struct element is typed: a pointer element's
+    # pointee is not recorded here.
+    if kind == TYPE_STRUCT and name_len <= 0
+        return
+    if kind == TYPE_PTR or kind == TYPE_PTR_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF
+        return
+    v.let_kind = kind
+    v.let_name = name
+    v.let_name_len = name_len
+
+# =============================================================================
+# Resolving calls and methods as the emitter does
+# =============================================================================
+
+# The fn a call `e` calls, as find_call_fn: a nameless call's value, a typed
+# fn-pointer local of the name, else the fn.
+fn let_call_fn(sm: *Sema, e: *Expr) -> *FnDef
+    if e.func_name_len == 0
+        return sbk_value_fn_sig(sm, e.left)
+    if e.call_type_suffix_len <= 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+        if v != null and v.fn_sig != null and v.let_kind != TYPE_ARRAY
+            return v.fn_sig
+    sema_call_fn(sm, e)
+
+# 1 when `recv` names no value, so it's the type of a static call.
+fn let_recv_is_type(sm: *Sema, recv: *Expr) -> i32
+    if recv == null or recv.kind != EXPR_IDENT
+        return 0
+    if sema_find_local(sm, recv.ident_ptr, recv.ident_len) != null
+        return 0
+    (sbk_global(sm, recv.ident_ptr, recv.ident_len) == null) as i32
+
+# The type a method receiver names, as the emitter's method_recv_type: a
+# local's or global's type name, a static call's type, a field's type, an
+# element of a const struct array.
+fn let_method_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    if recv == null
+        return null
+    if recv.kind == EXPR_IDENT
+        let v: *SemaVar = sema_find_local(sm, recv.ident_ptr, recv.ident_len)
+        if v != null
+            *out_len = v.let_name_len
+            return v.let_name
+        let g: *GlobalVarDef = sbk_global(sm, recv.ident_ptr, recv.ident_len)
+        if g != null
+            *out_len = g.type_name_len
+            return g.type_name
+        *out_len = recv.ident_len
+        return recv.ident_ptr as *u8
+    if recv.kind == EXPR_MEMBER
+        let f: *StructField = sbk_member_field(sm, recv)
+        if f == null
+            return null
+        *out_len = f.field_type_name_len
+        return f.field_type_name
+    # AGAST #3360: `PS[i].m()` of a const struct array.
+    if recv.kind == EXPR_INDEX and recv.left != null and recv.left.kind == EXPR_IDENT
+        if sema_find_local(sm, recv.left.ident_ptr, recv.left.ident_len) == null and sbk_global(sm, recv.left.ident_ptr, recv.left.ident_len) == null
+            let ce: *ConstEntry = sbk_const(sm, recv.left.ident_ptr, recv.left.ident_len)
+            if ce != null and ce.const_type == TYPE_ARRAY and ce.array_elem_type == TYPE_STRUCT
+                *out_len = ce.array_elem_type_name_len
+                return ce.array_elem_type_name
+    null
+
+# The fn method call `e` dispatches to, as the emitter's method_call_def.
+fn let_method_call_def(sm: *Sema, e: *Expr) -> *FnDef
+    var tlen: i32 = 0
+    let tname: *u8 = let_method_recv_type(sm, e.left, @tlen)
+    if tname == null or tlen <= 0
+        return null
+    sema_method_fn(sm, tname, tlen, e.ident_ptr, e.ident_len)
+
+# =============================================================================
+# `let` immutability
+# =============================================================================
+
+# Pointers between the place and its struct, as local_struct_levels counts
+# a local's; -1 when Sema can't say.
+fn let_place_levels(pl: *LetPlace) -> i32
+    let k: i32 = pl.kind
+    if k == TYPE_STRUCT
+        return 0
+    if k == TYPE_PTR
+        return 1
+    if k == TYPE_PTR_PTR
+        return ptr_ptr_ident_levels(pl.inner)
+    if k == TYPE_REF or k == TYPE_MUT_REF
+        if pl.pointee == TYPE_PTR
+            return 2
+        if pl.pointee == TYPE_PTR_PTR
+            return 1 + ptr_ptr_ident_levels(pl.inner)
+        return 1
+    0 - 1
+
+# 1 when `p`, a `:&` param, borrows the pointer-holding `let` place `pl`
+# itself rather than taking the pointer it holds: borrow_arg_kind's
+# BORROW_PLACE (AGAST #2335), for a place rooted at a by-value `let`.
+fn let_ptr_place_lent(pl: *LetPlace, p: *Param) -> i32
+    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+        return 0
+    # Through an `@T` it is read-only: no borrow (BORROW_SHARED).
+    if pl.kind == TYPE_REF
+        return 0
+    if param_borrows_struct_ptr_ptr(p) == 1
+        if let_place_levels(pl) == ptr_ptr_ident_levels(p.param_inner_pointee_type)
+            return 1
+    if p.param_pointee_type != TYPE_PTR
+        return 0
+    if pl.kind == TYPE_PTR_PTR or pl.pointee == TYPE_PTR
+        return 0
+    if pl.kind != TYPE_PTR and pl.kind != TYPE_MUT_REF
+        return 0
+    # pointer_place_fits.  A `:& *U` param always records its U, and Sema
+    # never records an unknown pointee, so both sides are known here.
+    let want: i32 = p.param_ref_ptr_pointee
+    if want == TYPE_ARRAY and p.param_pointee_array_size > 0
+        return (pl.pointee == TYPE_ARRAY) as i32
+    if want == TYPE_STRUCT or pl.pointee == TYPE_STRUCT
+        return (want == pl.pointee and name_eq(p.param_type_name, p.param_type_name_len, pl.type_name, pl.type_name_len) == 1) as i32
+    (want == pl.pointee) as i32
+
+# 1 when an `[a..b]` slice is on `e`'s path: no place (arg_is_place).
+fn let_path_slices(e: *Expr) -> i32
+    var at: *Expr = e
+    while at != null and (at.kind == EXPR_MEMBER or at.kind == EXPR_INDEX)
+        if at.kind == EXPR_INDEX and at.right != null and at.right.kind == EXPR_RANGE
+            return 1
+        at = at.left
+    0
 
 # AGAST #2032 (ritz0 #2029): an implicit mutable borrow.  `p` is the callee
 # param that `arg` (or a method receiver) binds to.  A `name:& T`,
@@ -182,95 +638,108 @@ fn let_error_borrow(s: *EmitterState, line: i32, col: i32, pl: *LetPlace)
 # which is #2026's explicit `@&` in disguise.  A `let` that *holds* a
 # pointer is passed as that pointer, borrowing the pointee, so stays legal;
 # `@&x` itself is the explicit form, reported by let_check_expr.
-fn let_check_implicit(s: *EmitterState, arg: *Expr, p: *Param)
+fn let_check_implicit(sm: *Sema, arg: *Expr, p: *Param)
     # AGAST #2389: a bare `self:&` is a TYPE_STRUCT param marked is_self_borrow
     # (param_self_lent), the same borrow as `self:& T`.
     if p.param_type != TYPE_MUT_REF and (p.param_type != TYPE_STRUCT or p.is_self_borrow != 1)
         return
+    var env: LetEnv
+    let_sema_env(sm, @env)
     var pl: LetPlace
-    if let_place(s, arg, @pl) == 0
+    if let_place(@env, arg, @pl) == 0
+        return
+    # Sema can't say whether it holds a pointer: no refusal on a guess.
+    if pl.kind == TYPE_UNKNOWN
         return
     # A `let` that holds a pointer passes that pointer, unless `:& *U` borrows
     # its own storage (AGAST #2335).
     if pl.kind == TYPE_PTR or pl.kind == TYPE_PTR_PTR or pl.kind == TYPE_REF or pl.kind == TYPE_MUT_REF
-        if borrow_arg_kind(s, arg, p) != BORROW_PLACE
+        if let_path_slices(arg) == 1 or let_ptr_place_lent(@pl, p) == 0
             return
-    let_error_borrow(s, arg.span.line, arg.span.col, @pl)
+    let_error_borrow(@env, arg.span.line, arg.span.col, @pl)
 
-# AGAST #2403: a receiver lent to a `self: **S` is `@&recv`.
-pub fn let_check_receiver(s: *EmitterState, recv: *Expr)
+# AGAST #2403: a receiver one pointer short of a `self: **S` (or deeper) is
+# lent as `@&recv`: refused when that place is a `let`'s own storage.  A
+# shared `self: @*S` borrows it read-only.  `e` is the method call.
+pub fn let_check_receiver(sm: *Sema, e: *Expr)
+    let recv: *Expr = e.left
+    if recv == null or let_path_slices(recv) == 1
+        return
+    let mfn: *FnDef = sbk_method_def(sm, e)
+    if mfn == null or param_is_self(mfn.params) == 0
+        return
+    let want: i32 = self_struct_levels(mfn.params)
+    if want < 2 or mfn.params.param_type == TYPE_REF
+        return
+    var env: LetEnv
+    let_sema_env(sm, @env)
     var pl: LetPlace
-    if let_place(s, recv, @pl) == 1
-        let_error_borrow(s, recv.span.line, recv.span.col, @pl)
-
-# AGAST #2338: `e` is `@x` of a `let`'s own storage.  It's the shared form of what
-# let_check_expr refuses, and refused only where it lands in a mutable slot, which
-# ref_check.ritz sees.
-pub fn let_addr_of_own(s: *EmitterState, e: *Expr) -> i32
-    if e.kind != EXPR_UNARY or e.op != OP_ADDR
-        return 0
-    var pl: LetPlace
-    let_place(s, e.operand, @pl)
-
-pub fn let_error_addr(s: *EmitterState, e: *Expr)
-    var pl: LetPlace
-    if let_place(s, e.operand, @pl) == 1
-        let_error_borrow(s, e.span.line, e.span.col, @pl)
+    if let_place(@env, recv, @pl) == 0
+        return
+    let levels: i32 = let_place_levels(@pl)
+    if levels < 0 or levels + 1 != want
+        return
+    let_error_borrow(@env, recv.span.line, recv.span.col, @pl)
 
 # Reject every `@&<let place>` in `e`.  Walks only the expression kinds
-# whose children are plain sub-expressions; a match / if / struct-literal
-# expression reuses those slots for other nodes, and their statements and
-# arm bodies are checked when they are emitted (emit_stmt, emit_match_arm_body).
-pub fn let_check_expr(s: *EmitterState, e: *Expr)
+# whose children are plain sub-expressions, as the emitter did: a match /
+# if expression's arms are checked by sema_walk_arms (where emit_match_arm_body
+# checked them), with the arm's bindings in scope; a struct literal's fields
+# are not checked.
+pub fn let_check_expr(sm: *Sema, e: *Expr)
     if e == null
         return
     let k: i32 = e.kind
     if k == EXPR_UNARY
         if e.op == OP_ADDR_MUT
+            var env: LetEnv
+            let_sema_env(sm, @env)
             var pl: LetPlace
-            if let_place(s, e.operand, @pl) == 1
-                let_error_borrow(s, e.span.line, e.span.col, @pl)
-        let_check_expr(s, e.operand)
+            if let_place(@env, e.operand, @pl) == 1
+                let_error_borrow(@env, e.span.line, e.span.col, @pl)
+        let_check_expr(sm, e.operand)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
-        let_check_expr(s, e.left)
-        let_check_expr(s, e.right)
+        let_check_expr(sm, e.left)
+        let_check_expr(sm, e.right)
     else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY
-        let_check_expr(s, e.left)
+        let_check_expr(sm, e.left)
     else if k == EXPR_CALL or k == EXPR_METHOD
         # AGAST #2032: the callee's signature, for implicit `@&` autoborrows.
         var p: *Param = null
         if k == EXPR_METHOD
-            let_check_expr(s, e.left)
-            let m: *FnDef = method_call_def(s, e)
+            let_check_expr(sm, e.left)
+            let m: *FnDef = let_method_call_def(sm, e)
             if m != null
                 p = m.params
                 # `S.make(..)` has no receiver: its params start at the first.
-                if p != null and method_recv_is_type(s, e.left) == 0
-                    let_check_implicit(s, e.left, p)
+                if p != null and let_recv_is_type(sm, e.left) == 0
+                    let_check_implicit(sm, e.left, p)
                     p = p.next
         else
-            let f: *FnDef = find_call_fn(s, e)
+            let f: *FnDef = let_call_fn(sm, e)
             if f != null
                 p = f.params
         var a: *Expr = e.args
         while a != null
-            let_check_expr(s, a)
+            let_check_expr(sm, a)
             if p != null
-                let_check_implicit(s, a, p)
+                let_check_implicit(sm, a, p)
                 p = p.next
             a = a.next
 
 # The write target of an assignment-kind statement, if it is a `let` place.
-fn let_check_write(s: *EmitterState, stmt: *Stmt)
+fn let_check_write(sm: *Sema, stmt: *Stmt)
     let line: i32 = stmt.span.line
     let col: i32 = stmt.span.col
+    var env: LetEnv
+    let_sema_env(sm, @env)
     var pl: LetPlace
     let k: i32 = stmt.kind
     if k == STMT_ASSIGN
         if stmt.assign_target_len > 0
             # `x = v` / `x op= v`: the whole binding.
-            if let_place_root(s, stmt.assign_target, stmt.assign_target_len, @pl) == 1
-                let_error_assign_whole(s, line, col, @pl)
+            if let_place_root(@env, stmt.assign_target, stmt.assign_target_len, @pl) == 1
+                let_error_assign_whole(@env, line, col, @pl)
             return
         # `expr = v`; the target expr is in if_cond.  `*p = v` (EXPR_UNARY)
         # writes the pointee and never matches.
@@ -278,92 +747,193 @@ fn let_check_write(s: *EmitterState, stmt: *Stmt)
         if target == null
             return
         if target.kind == EXPR_IDENT
-            if let_place_root(s, target.ident_ptr, target.ident_len, @pl) == 1
-                let_error_assign_whole(s, line, col, @pl)
+            if let_place_root(@env, target.ident_ptr, target.ident_len, @pl) == 1
+                let_error_assign_whole(@env, line, col, @pl)
             return
         if target.kind == EXPR_MEMBER or target.kind == EXPR_INDEX
-            if let_place(s, target, @pl) == 1
-                let_error_assign_through(s, line, col, @pl)
+            if let_place(@env, target, @pl) == 1
+                let_error_assign_through(@env, line, col, @pl)
         return
     if k == STMT_INDEX_ASSIGN
         # `name[i] = v`
-        if let_place_root(s, stmt.assign_target, stmt.assign_target_len, @pl) == 1
+        if let_place_root(@env, stmt.assign_target, stmt.assign_target_len, @pl) == 1
             if let_place_index(@pl) == 1
-                let_error_assign_through(s, line, col, @pl)
+                let_error_assign_through(@env, line, col, @pl)
         return
     if k == STMT_LOCAL_FIELD_ASSIGN
         # `name.f = v`
-        if let_place_root(s, stmt.var_name, stmt.var_name_len, @pl) == 1
-            if let_place_member(s, @pl, stmt.assign_target, stmt.assign_target_len) == 1
-                let_error_assign_through(s, line, col, @pl)
+        if let_place_root(@env, stmt.var_name, stmt.var_name_len, @pl) == 1
+            if let_place_member(@env, @pl, stmt.assign_target, stmt.assign_target_len) == 1
+                let_error_assign_through(@env, line, col, @pl)
         return
     if k == STMT_LOCAL_FIELD_INDEX_ASSIGN
         # `name.f[i] = v`
-        if let_place_root(s, stmt.var_name, stmt.var_name_len, @pl) == 1
-            if let_place_member(s, @pl, stmt.assign_target, stmt.assign_target_len) == 1
+        if let_place_root(@env, stmt.var_name, stmt.var_name_len, @pl) == 1
+            if let_place_member(@env, @pl, stmt.assign_target, stmt.assign_target_len) == 1
                 if let_place_index(@pl) == 1
-                    let_error_assign_through(s, line, col, @pl)
+                    let_error_assign_through(@env, line, col, @pl)
         return
     # STMT_MEMBER_ASSIGN / STMT_MEMBER_INDEX_ASSIGN are `(*p).f = v`: through
     # a pointer, always legal.
 
-# AGAST #2293: `let d: D = c` / `var d: D = c` with `c` a struct of another
-# type.  It used to reach clang as `store %C ..., %D` (or the `ptr` a `c:& C`
-# reads as).  ritz0's _reject_another_struct gives the same message at the
-# same place (ritz0/let_rules.py).  Only two known structs that differ by name
-# are refused: a cast names its operand's type here, a Span$u8 converts to a
-# StrView (#168) but not back (#3441), and an enum or a name find_struct doesn't know (an
-# alias) is left to the store.
-fn let_check_another_struct(s: *EmitterState, stmt: *Stmt)
-    if stmt.var_declared_type != TYPE_STRUCT
+# =============================================================================
+# A struct of another type (AGAST #2293, #3293, #3294)
+# =============================================================================
+
+# The struct `e` evaluates to, by name, as the emitter's
+# resolve_expr_struct_name names it: a `"..."` is a `Span$u8` there, a
+# struct local, a struct const, an enum variant, a call's or an impl
+# method's struct return, a struct literal.  null/0 when unknown.
+fn let_struct_name(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null
         return
-    var src: *u8 = null
-    var src_len: i32 = 0
-    if another_struct_source(s, stmt.var_init, stmt.var_type_name, stmt.var_type_name_len, @src, @src_len) == 0
+    if e.kind == EXPR_STRING_LIT
+        *out_name = c"Span$u8"
+        *out_len = 7
         return
-    let_error(s, stmt.span.line, stmt.span.col, c"`", stmt.var_name, stmt.var_name_len, c"` is declared `")
-    let_eprint_name(stmt.var_type_name, stmt.var_type_name_len)
-    eprints_cstr(c"` but its initialiser is a `")
-    let_eprint_name(src, src_len)
-    eprints_cstr(c"`\n")
+    if e.kind == EXPR_CAST and e.op == TYPE_STRUCT
+        # AGAST #3004: `r as C` through a reference reads the `C` itself.
+        var t: SemaTy
+        let k: i32 = sema_expr_ty(sm, e.left, @t)
+        if (k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF) and t.pointee == TYPE_STRUCT and name_eq(t.name, t.name_len, e.ident_ptr, e.ident_len) == 1
+            *out_name = e.ident_ptr
+            *out_len = e.ident_len
+            return
+        let_struct_name(sm, e.left, out_name, out_len)
+        return
+    if e.kind == EXPR_METHOD
+        if name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
+            *out_name = c"Span$u8"
+            *out_len = 7
+            return
+        # AGAST #1466: a qualified variant ctor `Opt.Holds(x)` is the enum.
+        let q: *Expr = e.left
+        if q != null and q.kind == EXPR_IDENT and sema_find_local(sm, q.ident_ptr, q.ident_len) == null and sbk_global(sm, q.ident_ptr, q.ident_len) == null
+            let ei: i32 = enum_find(q.ident_ptr, q.ident_len)
+            if ei >= 0 and enum_variant_index(q.ident_ptr, q.ident_len, e.ident_ptr, e.ident_len) >= 0 and enum_is_generic(ei) != 1
+                *out_name = enum_name_at(ei, out_len)
+                return
+        # An impl method on a local receiver: its struct return.
+        if q != null and q.kind == EXPR_IDENT
+            let v: *SemaVar = sema_find_local(sm, q.ident_ptr, q.ident_len)
+            if v != null and v.let_name_len > 0
+                var ib: *ImplBlock = sm.module.impls
+                while ib != null
+                    if name_eq(ib.type_name, ib.type_name_len, v.let_name, v.let_name_len) == 1
+                        var m: *FnDef = ib.methods
+                        while m != null
+                            if name_eq(m.name, m.name_len, e.ident_ptr, e.ident_len) == 1
+                                if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
+                                    *out_name = m.return_type_name
+                                    *out_len = m.return_type_name_len
+                                return
+                            m = m.next
+                        return
+                    ib = ib.next
+        return
+    if e.kind == EXPR_IDENT
+        let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        if v != null and v.let_name_len > 0 and v.let_kind == TYPE_STRUCT
+            *out_name = v.let_name
+            *out_len = v.let_name_len
+            return
+        # AGAST #189: a struct const (`const FOO: StrView = "..."`).
+        let ce: *ConstEntry = sbk_const(sm, e.ident_ptr, e.ident_len)
+        if ce != null and ce.const_type == TYPE_STRUCT and ce.type_name_len > 0
+            *out_name = ce.type_name
+            *out_len = ce.type_name_len
+            return
+        # AGAST #1600: a bare unit variant `B` is a value of its enum.
+        if ce != null or is_builtin_const(e.ident_ptr, e.ident_len) == 1 or v != null
+            return
+        if sbk_global(sm, e.ident_ptr, e.ident_len) != null or sema_find_fn(sm, e.ident_ptr, e.ident_len) != null
+            return
+        var vi: i32 = 0
+        var other: i32 = 0
+        let ei: i32 = enum_of_variant_unique(e.ident_ptr, e.ident_len, @vi, @other)
+        if ei >= 0 and enum_variant_kind(ei, vi) == ENUM_VARIANT_UNIT
+            *out_name = enum_name_at(ei, out_len)
+        return
+    if e.kind == EXPR_CALL
+        # AGAST #1797: a user-enum payload ctor `Holds(x)` is the enum.
+        user_variant_ctor_enum(e, out_name, out_len)
+        if *out_name != null
+            return
+        let fdr: *FnDef = let_call_fn(sm, e)
+        if fdr != null and fdr.return_type == TYPE_STRUCT and fdr.return_type_name_len > 0
+            *out_name = fdr.return_type_name
+            *out_len = fdr.return_type_name_len
+        return
+    if e.kind == EXPR_STRUCT_LIT
+        if e.ident_ptr != null and e.ident_len > 0
+            *out_name = e.ident_ptr as *u8
+            *out_len = e.ident_len
 
 # 1 when `init` is a known struct of another type than the known struct `want`,
 # with its name in `*out` / `*out_len` (AGAST #2293, #3293).
-fn another_struct_source(s: *EmitterState, init: *Expr, want: *u8, want_len: i32, out: **u8, out_len: *i32) -> i32
+fn another_struct_source(sm: *Sema, init: *Expr, want: *u8, want_len: i32, out: **u8, out_len: *i32) -> i32
     if init == null or init.kind == EXPR_CAST
         return 0
     if want == null or want_len <= 0
         return 0
     var src: *u8 = null
     var src_len: i32 = 0
-    resolve_expr_struct_name(s, init, @src, @src_len)
-    # A `c:& C` param is a TYPE_MUT_REF local naming its referent (#2250).
-    let lent: *LocalVar = lent_local(s, init)
-    if src == null and lent != null and lent.var_type == TYPE_MUT_REF
-        src = lent.type_name
-        src_len = lent.type_name_len
+    let_struct_name(sm, init, @src, @src_len)
+    # A `c:& C` param holds its referent (#2250).
+    var lent: *SemaVar = null
+    if init.kind == EXPR_IDENT
+        let lv: *SemaVar = sema_find_local(sm, init.ident_ptr, init.ident_len)
+        if lv != null and lv.let_lent == 1
+            lent = lv
+    if src == null and lent != null and lent.let_kind == TYPE_MUT_REF
+        src = lent.let_name
+        src_len = lent.let_name_len
     if src == null or src_len <= 0
         return 0
-    # AGAST #3579: a local bound to an unannotated `"..."` lowers to the
-    # literal's `%Span$u8` but is a StrView value, as in ritz0.
-    if init.kind == EXPR_IDENT and lent == null
-        let sv: *LocalVar = find_local_struct_name(s, init.ident_ptr, init.ident_len)
-        if sv != null and sv.str_view == 1
-            src = c"StrView"
-            src_len = 7
+    # AGAST #3579 / #3564: a local bound to an unannotated `"..."`, to a
+    # `... as StrView` or to another such local is a StrView value, as in
+    # ritz0: Sema binds it so (sema_expr_ty), where the emitter's local is the
+    # literal's `Span$u8` it marks str_view.
     if name_eq(src, src_len, want, want_len) == 1
         return 0
     # AGAST #3441 (R49): of the StrView / Span$u8 pair only a `"..."` converts,
     # either way, and it reads as a `Span$u8` here.  A StrView value never fits
-    # a `Span<u8>` slot, nor a `Span<u8>` value a StrView one (#3564): a local
-    # bound to a `"..."` is a StrView (str_view, above), as in ritz0.
+    # a `Span<u8>` slot, nor a `Span<u8>` value a StrView one (#3564).
     if init.kind == EXPR_STRING_LIT and is_layout_equiv_pair(src, src_len, want, want_len) == 1
         return 0
-    if find_struct(s, src, src_len) == null or find_struct(s, want, want_len) == null
+    if sema_find_struct(sm, src, src_len) == null or sema_find_struct(sm, want, want_len) == null
         return 0
     *out = src
     *out_len = src_len
     return 1
+
+# `<head>`<name>` is declared `<want>` but <what> is a `<src>``, at (line, col).
+fn let_error_another(sm: *Sema, line: i32, col: i32, head: *u8, name: *u8, len: i32, want: *u8, want_len: i32, what: *u8, src: *u8, src_len: i32)
+    var env: LetEnv
+    let_sema_env(sm, @env)
+    let_error(@env, line, col, head, name, len, c"` is declared `")
+    let_eprint_name(want, want_len)
+    eprints_cstr(what)
+    let_eprint_name(src, src_len)
+    eprints_cstr(c"`\n")
+
+# AGAST #2293: `let d: D = c` / `var d: D = c` with `c` a struct of another
+# type.  It used to reach clang as `store %C ..., %D` (or the `ptr` a `c:& C`
+# reads as).  ritz0's _reject_another_struct gives the same message at the
+# same place (ritz0/let_rules.py).  Only two known structs that differ by name
+# are refused: a cast names its operand's type here, a Span$u8 converts to a
+# StrView (#168) but not back (#3441), and an enum or a name Sema doesn't
+# know (an alias) is left to the store.
+fn let_check_another_struct(sm: *Sema, stmt: *Stmt)
+    if stmt.var_declared_type != TYPE_STRUCT
+        return
+    var src: *u8 = null
+    var src_len: i32 = 0
+    if another_struct_source(sm, stmt.var_init, stmt.var_type_name, stmt.var_type_name_len, @src, @src_len) == 0
+        return
+    let_error_another(sm, stmt.span.line, stmt.span.col, c"`", stmt.var_name, stmt.var_name_len, stmt.var_type_name, stmt.var_type_name_len, c"` but its initialiser is a `", src, src_len)
 
 # `let s: String = "abc"`: 1 when it reported one.  With no `String` in scope
 # (no `import ritzlib.string`, AGAST #3347) the literal has nothing to become:
@@ -372,21 +942,21 @@ fn another_struct_source(s: *EmitterState, init: *Expr, want: *u8, want_len: i32
 # `*u8` in a `*u8` slot, and nothing else converts (LANGUAGE_SPEC 3.5).  ritz1
 # used to say "`s` is declared `String` but its initialiser is a `Span$u8`", at
 # the `let`.  ritz0's _refuse_string_literal gives the same words, at the literal.
-fn let_check_string_lit(s: *EmitterState, stmt: *Stmt) -> i32
+# The compile stops at Sema, so a later `s.len` never reports it again (#3362).
+fn let_check_string_lit(sm: *Sema, stmt: *Stmt) -> i32
     let init: *Expr = stmt.var_init
     if init == null or init.kind != EXPR_STRING_LIT
         return 0
     if name_eq(stmt.var_type_name, stmt.var_type_name_len, c"String", 6) == 0
         return 0
-    if find_struct(s, c"String", 6) != null
-        let_error(s, init.span.line, init.span.col, c"", null, 0, c"a string literal is not a `String`: write `string_from(")
+    var env: LetEnv
+    let_sema_env(sm, @env)
+    if sema_find_struct(sm, c"String", 6) != null
+        let_error(@env, init.span.line, init.span.col, c"", null, 0, c"a string literal is not a `String`: write `string_from(")
         let_eprint_source_quote(init.string_ptr, init.string_len)
         eprints_cstr(c")`\n")
         return 1
-    let_error(s, init.span.line, init.span.col, c"", null, 0, c"`String` is not built in: `import ritzlib.string` to make one from a string literal\n")
-    # AGAST #3362: that names the mistake; a later `s.len` doesn't say it again.
-    s.unknown_struct_name = c"String"
-    s.unknown_struct_name_len = 6
+    let_error(@env, init.span.line, init.span.col, c"", null, 0, c"`String` is not built in: `import ritzlib.string` to make one from a string literal\n")
     return 1
 
 # A literal's bytes as the "..." that writes them: `"`, `\\`, newline, tab, CR
@@ -419,14 +989,17 @@ fn let_eprint_source_quote(p: *u8, n: i32)
 # the bytes of a `C`, read as a `D`, with no error.  ritz0's
 # _reject_another_struct_return gives the same message (ritz0/let_rules.py).
 # (line, col) is the `return`, or the tail value.  1 when refused.
-pub fn return_check_another_struct(s: *EmitterState, e: *Expr, ret_type: i32, line: i32, col: i32) -> i32
-    if ret_type != TYPE_STRUCT
+pub fn return_check_another_struct(sm: *Sema, e: *Expr, line: i32, col: i32) -> i32
+    let f: *FnDef = sm.cur_fn
+    if f == null or f.return_type != TYPE_STRUCT
         return 0
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(s, e, s.ret_type_name, s.ret_type_name_len, @src, @src_len) == 0
+    if another_struct_source(sm, e, f.return_type_name, f.return_type_name_len, @src, @src_len) == 0
         return 0
-    let_error(s, line, col, c"the fn is declared `-> ", s.ret_type_name, s.ret_type_name_len, c"` but its return value is a `")
+    var env: LetEnv
+    let_sema_env(sm, @env)
+    let_error(@env, line, col, c"the fn is declared `-> ", f.return_type_name, f.return_type_name_len, c"` but its return value is a `")
     let_eprint_name(src, src_len)
     eprints_cstr(c"`\n")
     return 1
@@ -435,26 +1008,22 @@ pub fn return_check_another_struct(s: *EmitterState, e: *Expr, ret_type: i32, li
 # of another type than the local or field.  It reached clang as `store %C ...`
 # into the `%D`.  ritz0 reads it back from llvmlite's store complaint
 # (_store_mismatch_message) and gives the same message.
-fn let_check_another_struct_store(s: *EmitterState, stmt: *Stmt)
+fn let_check_another_struct_store(sm: *Sema, stmt: *Stmt)
     var want: *u8 = null
     var want_len: i32 = 0
     if stmt.kind == STMT_ASSIGN
         if stmt.assign_target_len <= 0
             return
-        let loc: *LocalVar = find_local_struct_name(s, stmt.assign_target, stmt.assign_target_len)
-        if loc == null or loc.var_type != TYPE_STRUCT
+        let loc: *SemaVar = sema_find_local(sm, stmt.assign_target, stmt.assign_target_len)
+        if loc == null or loc.let_kind != TYPE_STRUCT
             return
-        want = loc.type_name
-        want_len = loc.type_name_len
-        # #3564: `var c = "..."` holds a StrView, as its source reads.
-        if loc.str_view == 1
-            want = c"StrView"
-            want_len = 7
+        want = loc.let_name
+        want_len = loc.let_name_len
     else if stmt.kind == STMT_LOCAL_FIELD_ASSIGN
-        let base: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
+        let base: *SemaVar = sema_find_local(sm, stmt.var_name, stmt.var_name_len)
         if base == null
             return
-        let st: *StructDef = find_struct(s, base.type_name, base.type_name_len)
+        let st: *StructDef = sema_find_struct(sm, base.let_name, base.let_name_len)
         if st == null
             return
         let idx: i32 = find_field_index(st, stmt.assign_target, stmt.assign_target_len)
@@ -469,126 +1038,107 @@ fn let_check_another_struct_store(s: *EmitterState, stmt: *Stmt)
         return
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(s, stmt.assign_value, want, want_len, @src, @src_len) == 0
+    if another_struct_source(sm, stmt.assign_value, want, want_len, @src, @src_len) == 0
         return
-    if stmt.kind == STMT_ASSIGN
-        let_error(s, stmt.span.line, stmt.span.col, c"`", stmt.assign_target, stmt.assign_target_len, c"` is declared `")
-    else
-        let_error(s, stmt.span.line, stmt.span.col, c"field `", stmt.assign_target, stmt.assign_target_len, c"` is declared `")
-    let_eprint_name(want, want_len)
-    eprints_cstr(c"` but the value assigned is a `")
-    let_eprint_name(src, src_len)
-    eprints_cstr(c"`\n")
+    var head: *u8 = c"`"
+    if stmt.kind != STMT_ASSIGN
+        head = c"field `"
+    let_error_another(sm, stmt.span.line, stmt.span.col, head, stmt.assign_target, stmt.assign_target_len, want, want_len, c"` but the value assigned is a `", src, src_len)
 
 # AGAST #3294: argument `a` for by-value param `p`, a struct of another type.
 # It reached clang as a `%C` passed to the `%D`.  let_another_struct_call /
 # _method pair them, for a call, a fn-pointer call and a method; ritz0's
 # _another_struct_arg_message gives the same message, at the argument.
-pub fn let_check_another_struct_arg(s: *EmitterState, p: *Param, a: *Expr)
+pub fn let_check_another_struct_arg(sm: *Sema, p: *Param, a: *Expr)
     if p.param_type != TYPE_STRUCT or p.is_borrow == 1
         return
     var src: *u8 = null
     var src_len: i32 = 0
-    if another_struct_source(s, a, p.param_type_name, p.param_type_name_len, @src, @src_len) == 0
+    if another_struct_source(sm, a, p.param_type_name, p.param_type_name_len, @src, @src_len) == 0
         return
-    let_error(s, a.span.line, a.span.col, c"parameter `", p.name, p.name_len, c"` is declared `")
-    let_eprint_name(p.param_type_name, p.param_type_name_len)
-    eprints_cstr(c"` but its argument is a `")
-    let_eprint_name(src, src_len)
-    eprints_cstr(c"`\n")
+    let_error_another(sm, a.span.line, a.span.col, c"parameter `", p.name, p.name_len, p.param_type_name, p.param_type_name_len, c"` but its argument is a `", src, src_len)
 
-fn let_another_struct_args(s: *EmitterState, params: *Param, args: *Expr)
+fn let_another_struct_args(sm: *Sema, params: *Param, args: *Expr)
     var p: *Param = params
     var a: *Expr = args
     while p != null and a != null
-        let_check_another_struct_arg(s, p, a)
+        let_check_another_struct_arg(sm, p, a)
         p = p.next
         a = a.next
 
-# A named call's arguments against its callee's params: a fn-pointer local's
-# signature, else the fn.  (bool_check paired them until it moved onto Sema,
-# AGAST #3502; this rule moves with let_check, #3504.)
-pub fn let_another_struct_call(s: *EmitterState, e: *Expr)
-    if e.func_name_len == 0
+# A named call's arguments against its callee's params: a local's fn-pointer
+# signature (a local without one is not checked), else the fn.
+# >0 inside a `sizeof(x)` operand, which emit_expr_call never lowered, so the
+# emitter never paired the arguments of a call there with its params.
+var g_let_sizeof: i32 = 0
+
+# 1 when `e` is `sizeof(x)`: let_check_sizeof brackets its operand.
+pub fn let_check_sizeof_of(e: *Expr) -> i32
+    if e.kind != EXPR_CALL or e.func_name_len == 0
+        return 0
+    name_eq(e.func_name, e.func_name_len, c"sizeof", 6)
+
+pub fn let_check_sizeof(delta: i32)
+    g_let_sizeof = g_let_sizeof + delta
+
+pub fn let_another_struct_call(sm: *Sema, e: *Expr)
+    if e.func_name_len == 0 or g_let_sizeof > 0
         return
-    let idx: i32 = find_local_idx(s, e.func_name, e.func_name_len)
-    if idx >= 0
-        let sig: *FnDef = local_at(s, idx).fn_sig
-        if sig != null
-            let_another_struct_args(s, sig.params, e.args)
+    let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+    if v != null
+        if v.fn_sig != null
+            let_another_struct_args(sm, v.fn_sig.params, e.args)
         return
-    let fd: *FnDef = find_call_fn(s, e)
+    let fd: *FnDef = let_call_fn(sm, e)
     if fd != null
-        let_another_struct_args(s, fd.params, e.args)
+        let_another_struct_args(sm, fd.params, e.args)
 
 # A method call's arguments against its callee's params after the receiver
 # (`self`, or a UFCS helper's first param).
-pub fn let_another_struct_method(s: *EmitterState, e: *Expr)
-    let fd: *FnDef = bk_method_def(s, e)
+pub fn let_another_struct_method(sm: *Sema, e: *Expr)
+    if g_let_sizeof > 0
+        return
+    let fd: *FnDef = sbk_method_def(sm, e)
     if fd == null or fd.params == null
         return
-    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1 or bk_method_is_ufcs(s, e, fd) == 1
-        let_another_struct_args(s, fd.params.next, e.args)
+    var is_ufcs: i32 = 0
+    var tn_len: i32 = 0
+    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
+    if tn != null
+        is_ufcs = sema_is_ufcs_fn(sm, tn, tn_len, e.ident_ptr, e.ident_len, fd)
+    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1 or is_ufcs == 1
+        let_another_struct_args(sm, fd.params.next, e.args)
     else
-        let_another_struct_args(s, fd.params, e.args)
+        let_another_struct_args(sm, fd.params, e.args)
 
-# Check one statement before it is emitted: its own write target, and every
-# `@&` in the expressions it evaluates.  Nested statement lists (if / while /
-# for bodies, match arms) are checked as emit_stmt reaches them, when the
-# bindings in scope are the ones that statement sees.
-pub fn let_check_stmt(s: *EmitterState, stmt: *Stmt)
+# Check one statement, from sema_walk before its expressions are walked and
+# before a `let` / `var` binds its name: its own write target, and every
+# `@&` in the expressions it evaluates.  Nested statement lists are checked
+# as the walk reaches them, with the bindings that statement sees.  A fn's
+# tail expression is not one: the emitter lowered it as the return value.
+pub fn let_check_stmt(sm: *Sema, stmt: *Stmt)
     let k: i32 = stmt.kind
     if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
-        let_check_expr(s, stmt.var_init)
+        let_check_expr(sm, stmt.var_init)
         if k == STMT_VAR_DECL
-            if let_check_string_lit(s, stmt) == 0   # AGAST #3347, LARB R49
-                let_check_another_struct(s, stmt)
+            if let_check_string_lit(sm, stmt) == 0   # AGAST #3347, LARB R49
+                let_check_another_struct(sm, stmt)
         return
     if k == STMT_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        let_check_write(s, stmt)
-        let_check_expr(s, stmt.assign_value)
-        let_check_another_struct_store(s, stmt)   # AGAST #3294
+        let_check_write(sm, stmt)
+        let_check_expr(sm, stmt.assign_value)
+        let_check_another_struct_store(sm, stmt)   # AGAST #3294
         if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-            let_check_expr(s, stmt.while_cond)
+            let_check_expr(sm, stmt.while_cond)
         return
     if k == STMT_RETURN
-        let_check_expr(s, stmt.return_value)
+        let_check_expr(sm, stmt.return_value)
     else if k == STMT_EXPR
-        let_check_expr(s, stmt.expr)
+        let_check_expr(sm, stmt.expr)
     else if k == STMT_IF or k == STMT_ASSERT
-        let_check_expr(s, stmt.if_cond)
+        let_check_expr(sm, stmt.if_cond)
     else if k == STMT_WHILE
-        let_check_expr(s, stmt.while_cond)
+        let_check_expr(sm, stmt.while_cond)
     else if k == STMT_FOR
-        let_check_expr(s, stmt.for_start)
-        let_check_expr(s, stmt.for_end)
-
-# After emit_var_decl: mark the binding it registered as a `let`, and (#3579)
-# an unannotated one bound to a StrView value (init_is_str_view).  `before` is
-# s.local_count before the decl, so a decl that registered nothing never marks
-# an outer binding of the same name.
-# 1 when `e` is a StrView value that ritz1 lowers to a `%Span$u8`: a `"..."`,
-# a `... as StrView` (whose register is its operand's, #2131), or a local
-# marked str_view (#3564: `let b = a` copies what `a` is).
-fn init_is_str_view(s: *EmitterState, e: *Expr) -> i32
-    if e == null
-        return 0
-    if e.kind == EXPR_STRING_LIT
-        return 1
-    if e.kind == EXPR_CAST and e.op == TYPE_STRUCT
-        return name_eq(e.ident_ptr, e.ident_len, c"StrView", 7)
-    if e.kind == EXPR_IDENT
-        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
-        if loc != null and loc.str_view == 1
-            return 1
-    0
-
-pub fn let_mark_decl(s: *EmitterState, stmt: *Stmt, before: i32)
-    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
-    if idx < before
-        return
-    let loc: *LocalVar = local_at(s, idx)
-    if stmt.var_declared_type == TYPE_VOID and init_is_str_view(s, stmt.var_init) == 1
-        loc.str_view = 1
-    if stmt.var_is_let == 1
-        loc.is_let = 1
+        let_check_expr(sm, stmt.for_start)
+        let_check_expr(sm, stmt.for_end)

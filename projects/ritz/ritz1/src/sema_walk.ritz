@@ -36,6 +36,7 @@ import generic_method
 import field_slot
 import bool_check
 import call_check    # AGAST #1629, on Sema since #3503
+import let_check   # AGAST #2028 / #3504
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
@@ -54,6 +55,8 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
         # call there is discarded (AGAST #3515).  With no arm.body the last
         # statement isn't an expression, so the flag changes nothing there.
         sema_walk_stmts(sm, arm.body_stmts, 1)
+        if arm.is_pass == 0
+            let_check_expr(sm, arm.body)   # AGAST #2028: as emit_match_arm_body
         bool_no_value(sm, arm.body)
         sema_walk_expr(sm, arm.body)
         sm.scope_top = mark
@@ -84,18 +87,26 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
         sema_walk_expr(sm, e.left)
     else if k == EXPR_CALL
-        # LARB R37 (AGAST #3373), else AGAST #1629 / #3503.
-        if generic_method_check(sm, e) == 0
+        # LARB R37 (AGAST #3373), else AGAST #1629 / #3503.  let_check's
+        # argument rule first, as emit_expr_call ran it first (#3294 / #3504).
+        let gm: i32 = generic_method_check(sm, e)
+        let_another_struct_call(sm, e)
+        if gm == 0
             call_check_call(sm, e)
         # `sizeof(x)` and a non-literal `print(x)` never lower their operand.
         let mute: i32 = call_check_mutes(e)
+        let in_sizeof: i32 = let_check_sizeof_of(e)   # AGAST #3504
         call_check_mute(mute)
+        let_check_sizeof(in_sizeof)
         sema_walk_list(sm, e.args)
+        let_check_sizeof(0 - in_sizeof)
         call_check_mute(0 - mute)
     else if k == EXPR_ARRAY_LIT
         sema_walk_list(sm, e.args)
     else if k == EXPR_METHOD
         # After the receiver, as emit_expr_method lowers it first.
+        let_another_struct_method(sm, e)   # AGAST #3294
+        let_check_receiver(sm, e)          # AGAST #2403
         sema_walk_expr(sm, e.left)
         call_check_method(sm, e)      # AGAST #1629 / #3503
         sema_walk_list(sm, e.args)
@@ -155,13 +166,21 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
     var st: *Stmt = first
     while st != null
         pass_value_check(sm, st)   # AGAST #3759
-        if st.next == null and sm.cur_fn != null and first == sm.cur_fn.body
+        let fn_tail: i32 = (st.next == null and sm.cur_fn != null and first == sm.cur_fn.body) as i32
+        if fn_tail == 1
             bool_check_tail(sm, st)   # AGAST #2342
+        # AGAST #2028: a fn's tail expression is its return value, not a
+        # statement (the emitter never let-checked it); #3293 judges it.
+        if fn_tail == 1 and st.kind == STMT_EXPR
+            return_check_another_struct(sm, st.expr, st.expr.span.line, st.expr.span.col)
+        else
+            let_check_stmt(sm, st)
         if st.kind == STMT_VAR_DECL
             bool_check_decl(sm, st)   # AGAST #2342
             sema_walk_expr(sm, st.var_init)
             check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
             sema_bind_decl(sm, st)
+            let_note_decl(sm, st)   # AGAST #3504
             narrow_sema_decl(sm, st)
             bool_note_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
@@ -179,6 +198,7 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
             let for_mark: i32 = sm.scope_top
             sema_bind(sm, st.for_var, st.for_var_len)
             bool_note_for(sm, st)
+            let_note_for(sm, st)   # AGAST #2389: an element is a `let`
             sema_walk_stmts(sm, st.for_body, 0)
             sm.scope_top = for_mark
         else if st.kind == STMT_IF
@@ -197,6 +217,8 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
             sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm)
         else if st.kind == STMT_RETURN
             bool_check_return(sm, st.return_value)
+            if st.return_value != null
+                return_check_another_struct(sm, st.return_value, st.span.line, st.span.col)   # AGAST #3293
             sema_walk_expr(sm, st.return_value)
         else if st.kind == STMT_EXPR
             # Only a block's last statement can be its value (AGAST #2137).
@@ -231,6 +253,7 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
     var p: *Param = f.params
     while p != null
         sema_bind_param(sm, p)
+        let_note_param(sm, p)   # AGAST #2250: a `c:& C` holds its referent
         narrow_sema_param(sm, p)
         bool_note_param(sm, p)
         p = p.next

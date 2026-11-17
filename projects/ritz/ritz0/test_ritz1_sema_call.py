@@ -24,8 +24,9 @@ THE TESTS
 
 One program, both ritz1 compilers: each kind of call error (a static call's,
 a free call's and a method's count, an argument's kind, an unknown fn), then
-a `let` written to, which is let_check's error, still on the emitter: it is
-no longer printed.  Before the move all six were.
+a literal that doesn't fit its slot, which is literal_slot's error, still on
+the emitter: it is no longer printed.  Before the move all six were.  (It was
+a write to a `let` until let_check moved onto Sema, AGAST #3504.)
 
 `sizeof(f(1))` never evaluates its operand, so its call isn't judged, as on
 the emitter and in ritz0.
@@ -66,8 +67,7 @@ fn main() -> i32
     let b: i64 = p.get()
     let c: i64 = takes(5)
     let d: i64 = nope(3)
-    let n: i32 = 1
-    n = 2
+    var m: u8 = 300
     0
 """
 

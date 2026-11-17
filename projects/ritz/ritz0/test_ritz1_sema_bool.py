@@ -20,9 +20,10 @@ THE TEST
 
 One program, both ritz1 compilers.  Its two bool errors sit in places the
 walk had to learn to reach: a `match` statement's scrutinee (`match b + 1`)
-and a struct literal's field (`P { x: true }`).  A `let` written to after them
-is let_check's error, still on the emitter: it is no longer printed.  Before
-the move all three were.
+and a struct literal's field (`P { x: true }`).  A literal that doesn't fit
+its slot after them is literal_slot's error, still on the emitter: it is no
+longer printed.  Before the move all three were.  (It was a write to a `let`
+until let_check moved onto Sema too, AGAST #3504.)
 """
 
 import re
@@ -44,8 +45,7 @@ fn main() -> i32
     match b + 1
         _ => 0
     let p: P = P { x: true }
-    let n: i32 = 1
-    n = 2
+    var m: u8 = 300
     0
 """
 

@@ -18,7 +18,6 @@ import emitter_expr
 import emitter_expr_arith    # deref_pointee_struct_name (AGAST #1505)
 import emitter_match
 import narrowing           # narrow_note_decl (AGAST #1364, #3505)
-import let_check           # let_check_stmt / let_mark_decl (AGAST #2028)
 import binder_check        # binder_mark_decl (AGAST #2407)
 import emitter_expr_call   # method_callee_def (AGAST #1798)
 import emitter_print       # emit_assert_stmt (AGAST #1869)
@@ -3343,8 +3342,6 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
         literal_slot(s, stmt.return_value, ret_type, literal_ret_pointee(s.ret_type_name, s.ret_type_name_len))   # AGAST #2341
         literal_view(s, stmt.return_value, ret_type, s.ret_type_name, s.ret_type_name_len)   # AGAST #3440
-        if return_check_another_struct(s, stmt.return_value, ret_type, stmt.span.line, stmt.span.col) == 1
-            return   # AGAST #3293
         if emit_lent_return(s, stmt.return_value, ret_type) == 1   # AGAST #2279
             return
         if ret_type == TYPE_ARRAY and emit_array_return(s, stmt.return_value, ret_array_of(emitter_current_fn())) == 1
@@ -6035,16 +6032,46 @@ fn for_range_unsigned(s: *EmitterState, stmt: *Stmt) -> i32
         return 1
     0
 
+# 1 when `e` is a StrView value that ritz1 lowers to a `%Span$u8`: a `"..."`,
+# a `... as StrView` (whose register is its operand's, #2131), or a local
+# marked str_view (#3564: `let b = a` copies what `a` is).
+fn init_is_str_view(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_STRING_LIT
+        return 1
+    if e.kind == EXPR_CAST and e.op == TYPE_STRUCT
+        return name_eq(e.ident_ptr, e.ident_len, c"StrView", 7)
+    if e.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, e.ident_ptr, e.ident_len)
+        if loc != null and loc.str_view == 1
+            return 1
+    0
+
+# After emit_var_decl: mark the binding it registered as a `let`, and (#3579)
+# an unannotated one bound to a StrView value (init_is_str_view).  `before` is
+# s.local_count before the decl, so a decl that registered nothing never marks
+# an outer binding of the same name.  The `let` rule is Sema's (let_check.ritz,
+# AGAST #3504); LocalVar.is_let is for the emitter's readers: asm operands,
+# ref_check's `@x` of a `let` (let_addr_of_own), and str_view's.
+fn mark_let_local(s: *EmitterState, stmt: *Stmt, before: i32)
+    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
+    if idx < before
+        return
+    let loc: *LocalVar = local_at(s, idx)
+    if stmt.var_declared_type == TYPE_VOID and init_is_str_view(s, stmt.var_init) == 1
+        loc.str_view = 1
+    if stmt.var_is_let == 1
+        loc.is_let = 1
+
 fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
-    # AGAST #2028: reject writes / `@&` into a `let` before emitting them.
-    let_check_stmt(s, stmt)
     literal_stmt(s, stmt)      # AGAST #2341
     # AGAST #2136: an enum value where an integer is expected.
     enum_as_int_stmt(s, stmt, ret_type)
     if stmt.kind == STMT_VAR_DECL
         let locals_before: i32 = s.local_count
         emit_var_decl(s, stmt)
-        let_mark_decl(s, stmt, locals_before)
+        mark_let_local(s, stmt, locals_before)
         binder_mark_decl(s, stmt, locals_before)   # AGAST #2407
         own_decl(s, stmt, locals_before)   # AGAST #2158
     else if stmt.kind == STMT_TUPLE_DECL
