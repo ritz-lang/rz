@@ -136,8 +136,17 @@ def test_child_reads_its_environment(package, tmp_path, args):
 
 
 def test_crash_under_a_short_timeout_is_a_crash(package, tmp_path):
+    """A crash inside an explicit `-t` deadline reads "crash", not "timeout".
+
+    AGAST #3878: `-t 300` raced start-up. Under gate load the child took
+    1076 ms to reach its fault and was SIGKILLed as a timeout. A deadline
+    cannot also guard #2072 (a piped core handler outlasting it): apport
+    takes 1.1-1.8 s, which overlaps a loaded start-up, so no value separates
+    them. test_child_disables_core guards #2072 directly, without a clock.
+    The timeout path has its own tests (test_ritzunit_jobs.py).
+    """
     exe = _binary(package(CRASHER), tmp_path)
-    report = _run(exe, tmp_path, "-t", "300")
+    report = _run(exe, tmp_path, "-t", "3000")
     (test,) = report["tests"]
     assert test["status"] == "crash", report
     assert test["signal"] == 11, report
