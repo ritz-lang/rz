@@ -242,6 +242,9 @@ struct EmitterState
     # 1 once any sret copy/zero is emitted: emit_sret_helpers then defines
     # @__ritz_sret_copy / @__ritz_sret_zero for this module.
     sret_helpers_used: i32
+    # Bit 1 / bit 2 once float `%` calls @__ritz_fmod / @__ritz_fmodf: see
+    # emit_fmod_helpers (AGAST #3817).
+    fmod_helpers_used: i32
     # Tagged-enum context for variant constructors (ritz-task-133).
     # When non-null, `Some(x)` / `Ok(x)` / `None` / `Err(x)` allocas use this
     # struct name instead of falling back to `ret_type_name`.  Set by
@@ -3602,6 +3605,74 @@ pub fn emit_sret_helpers(s: *EmitterState)
     emit_str(s, c"  ret void\n")
     emit_str(s, c"}\n\n")
 
+# Emit `line` with each `#` replaced by `ty`, for emit_fmod_fn's template.
+fn emit_typed_line(s: *EmitterState, line: *u8, ty: *u8)
+    var i: i32 = 0
+    var start: i32 = 0
+    while *(line + i) != 0
+        if *(line + i) == 35
+            vec_push_bytes<u8>(s.out, line + start, (i - start) as i64)
+            emit_str(s, ty)
+            start = i + 1
+        i += 1
+    vec_push_bytes<u8>(s.out, line + start, (i - start) as i64)
+    emit_str(s, c"\n")
+
+# @__ritz_fmod / @__ritz_fmodf: C's fmod, exactly, at float type `ty`.  Float
+# `%` can't be `frem`: x86-64 lowers it to a libm fmod call and Ritz links no
+# libc (AGAST #3817).  Binary long division: double |y| up to just past |x|,
+# then halve back down to |y|, subtracting where it fits (|x| < |y| subtracts
+# nothing).  Each subtraction is
+# exact (Sterbenz: d <= r < 2d) and so is each halving (it retraces a
+# doubling).  Mirrors ritz0's _fmod_helper.
+fn emit_fmod_fn(s: *EmitterState, name: *u8, ty: *u8)
+    emit_str(s, c"define internal ")
+    emit_str(s, ty)
+    emit_str(s, c" @")
+    emit_str(s, name)
+    emit_typed_line(s, c"(# %x, # %y) {", ty)
+    emit_typed_line(s, c"entry:", ty)
+    emit_typed_line(s, c"  %xn = fcmp olt # %x, 0.0", ty)
+    emit_typed_line(s, c"  %xf = fneg # %x", ty)
+    emit_typed_line(s, c"  %ax = select i1 %xn, # %xf, # %x", ty)
+    emit_typed_line(s, c"  %yn = fcmp olt # %y, 0.0", ty)
+    emit_typed_line(s, c"  %yf = fneg # %y", ty)
+    emit_typed_line(s, c"  %ay = select i1 %yn, # %yf, # %y", ty)
+    # y == 0, x infinite, or either NaN: NaN (unordered compares are true).
+    emit_typed_line(s, c"  %yz = fcmp ueq # %ay, 0.0", ty)
+    emit_typed_line(s, c"  %xi = fcmp ueq # %ax, 0x7FF0000000000000", ty)
+    emit_typed_line(s, c"  %bad = or i1 %yz, %xi", ty)
+    emit_typed_line(s, c"  br i1 %bad, label %nan, label %up", ty)
+    emit_typed_line(s, c"nan:", ty)
+    emit_typed_line(s, c"  ret # 0x7FF8000000000000", ty)
+    emit_typed_line(s, c"up:", ty)
+    emit_typed_line(s, c"  %t = phi # [ %ay, %entry ], [ %t2, %up ]", ty)
+    emit_typed_line(s, c"  %t2 = fmul # %t, 2.0", ty)
+    emit_typed_line(s, c"  %more = fcmp ole # %t2, %ax", ty)
+    emit_typed_line(s, c"  br i1 %more, label %up, label %down", ty)
+    emit_typed_line(s, c"down:", ty)
+    emit_typed_line(s, c"  %r = phi # [ %ax, %up ], [ %r2, %down ]", ty)
+    emit_typed_line(s, c"  %d = phi # [ %t, %up ], [ %d2, %down ]", ty)
+    emit_typed_line(s, c"  %ge = fcmp oge # %r, %d", ty)
+    emit_typed_line(s, c"  %rs = fsub # %r, %d", ty)
+    emit_typed_line(s, c"  %r2 = select i1 %ge, # %rs, # %r", ty)
+    emit_typed_line(s, c"  %d2 = fmul # %d, 0.5", ty)
+    emit_typed_line(s, c"  %again = fcmp ogt # %d, %ay", ty)
+    emit_typed_line(s, c"  br i1 %again, label %down, label %done", ty)
+    emit_typed_line(s, c"done:", ty)
+    emit_typed_line(s, c"  %rn = fneg # %r2", ty)
+    emit_typed_line(s, c"  %res = select i1 %xn, # %rn, # %r2", ty)
+    emit_typed_line(s, c"  ret # %res", ty)
+    emit_str(s, c"}\n\n")
+
+# The fmod helpers float `%` called in this module (fmod_helpers_used: 1 for
+# f64, 2 for f32), defined once each.
+pub fn emit_fmod_helpers(s: *EmitterState)
+    if (s.fmod_helpers_used & 1) != 0
+        emit_fmod_fn(s, c"__ritz_fmod", c"double")
+    if (s.fmod_helpers_used & 2) != 0
+        emit_fmod_fn(s, c"__ritz_fmodf", c"float")
+
 # Return from an sret fn given a first-class %T value register.  When `val`
 # is the load of an sret call's slot (`return f()`), copy the slot itself;
 # otherwise spill the value and copy that.
@@ -6344,7 +6415,8 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     else if e.kind == EXPR_BINARY
         # AGAST #1965: float arithmetic is computed at binop_float_width
         # (`y * 2.0` is f32, `y * x` with `x: f64` is f64), not the left type.
-        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV
+        # AGAST #3817: `%` too, or `y % x` read as f32 was fpext'd again.
+        if e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV or e.op == OP_MOD
             let bw: i32 = binop_float_width(s, e)
             if bw != 0
                 return bw

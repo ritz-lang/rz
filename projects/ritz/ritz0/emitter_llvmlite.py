@@ -7539,6 +7539,54 @@ class LLVMEmitter:
         b.ret(start)
         return fn
 
+    def _fmod_helper(self, fty) -> ir.Function:
+        """@__ritz_fmod (double) / @__ritz_fmodf (float): C's fmod, exactly.
+
+        Float `%` can't be `frem`: x86-64 lowers that to a libm fmod call and
+        Ritz links no libc (AGAST #3817). Binary long division instead: double
+        |y| up to just past |x|, then halve back down to |y|, subtracting where
+        it fits (|x| < |y| subtracts nothing). Each subtraction is exact
+        (Sterbenz: d <= r < 2d) and so is each halving (it retraces a
+        doubling), so the result is fmod's. ritz1 emits the same function
+        (emit_fmod_fn, emitter_core.ritz).
+        """
+        name = "__ritz_fmodf" if isinstance(fty, ir.FloatType) else "__ritz_fmod"
+        if name in self.module.globals:
+            return self.module.globals[name]
+        fn = ir.Function(self.module, ir.FunctionType(fty, [fty, fty]), name=name)
+        fn.linkage = "internal"
+        x, y = fn.args
+        entry, nan, up, down, done = (
+            fn.append_basic_block(n) for n in ("entry", "nan", "up", "down", "done"))
+        zero = ir.Constant(fty, 0.0)
+        b = ir.IRBuilder(entry)
+        ax = b.select(b.fcmp_ordered('<', x, zero), b.fneg(x), x)
+        ay = b.select(b.fcmp_ordered('<', y, zero), b.fneg(y), y)
+        # y == 0, x infinite, or either NaN: NaN (unordered compares are true).
+        bad = b.or_(b.fcmp_unordered('==', ay, zero),
+                    b.fcmp_unordered('==', ax, ir.Constant(fty, float('inf'))))
+        b.cbranch(bad, nan, up)
+        b.position_at_end(nan)
+        b.ret(ir.Constant(fty, float('nan')))
+        b.position_at_end(up)
+        t = b.phi(fty)
+        t2 = b.fmul(t, ir.Constant(fty, 2.0))
+        t.add_incoming(ay, entry)
+        t.add_incoming(t2, up)
+        b.cbranch(b.fcmp_ordered('<=', t2, ax), up, down)
+        b.position_at_end(down)
+        r = b.phi(fty)
+        d = b.phi(fty)
+        r2 = b.select(b.fcmp_ordered('>=', r, d), b.fsub(r, d), r)
+        r.add_incoming(ax, up)
+        r.add_incoming(r2, down)
+        d.add_incoming(t, up)
+        d.add_incoming(b.fmul(d, ir.Constant(fty, 0.5)), down)
+        b.cbranch(b.fcmp_ordered('>', d, ay), down, done)
+        b.position_at_end(done)
+        b.ret(b.select(b.fcmp_ordered('<', x, zero), b.fneg(r2), r2))
+        return fn
+
     def _format_strlen_helper(self) -> ir.Function:
         """@__ritz_fmt_strlen(p) -> the length of the NUL-terminated bytes at p."""
         name = "__ritz_fmt_strlen"
@@ -9154,7 +9202,8 @@ class LLVMEmitter:
                 return self.builder.sdiv(left, right)
             elif op == '%':
                 if is_float:
-                    return self.builder.frem(left, right)
+                    # Not `frem`: it lowers to a libm fmod call (AGAST #3817).
+                    return self.builder.call(self._fmod_helper(left.type), [left, right])
                 # Use unsigned remainder for unsigned types
                 if (wider_slot[1] if wider_slot is not None
                         else self._operands_unsigned(expr, left)):

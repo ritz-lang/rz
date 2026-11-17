@@ -63,14 +63,14 @@ pub fn main() -> i32
     let w: f64 = z
     return (w * 2.0) as i32
 """, 15),
-    # `%` is left out: ritz1 lowers float `%` to fadd (AGAST #3798).
+    # Every op, `%` too: ritz1 had it as fadd (#3798), then it needed libm (#3817).
     "both_orders_and_each_op": ("""\
 pub fn main() -> i32
     let y: f32 = 3.0
     let x: f64 = 2.0
-    let s: f64 = (y + x) + (x - y) + (y * x) + (y / x) * 2.0
+    let s: f64 = (y + x) + (x - y) + (y * x) + (y / x) * 2.0 + (y % x) + (x % y) * 2.0
     return s as i32
-""", 13),
+""", 18),
     # §7.2: both spellings choose a precision; 0.1 differs in f32 and f64.
     "as_f32_compares_in_f32": ("""\
 pub fn main() -> i32
