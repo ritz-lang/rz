@@ -379,3 +379,135 @@ def test_unit_missing_binary_is_stale(linked):
     mod, bin_path, srcs, _ = linked
     bin_path.unlink()
     assert not fresh(mod, bin_path, srcs)
+
+
+# ---------------------------------------------------------------------------
+# AGAST #1499: concurrent builds into one output path (two worktrees or
+# overlay roots that reach the same package through a symlink).
+#
+# The manifest used to hash `bin_path` as it was on disk when the manifest
+# was written. If another build's link landed between this build's link and
+# its manifest, the manifest certified the OTHER build's binary as built
+# from THIS build's sources, and every later cached build of this tree
+# served it as "up to date" (`--no-cache` skips the fast path, which is why
+# it looked like a cache bug). The manifest must record the binary this
+# build linked, so a foreign binary on disk never matches it.
+# ---------------------------------------------------------------------------
+
+FOREIGN = b"\x7fELF built by the other tree"
+
+
+def _sha(data: bytes) -> str:
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
+
+
+def _foreign_write_before_manifest(mod, monkeypatch, target_name):
+    """Make another build's output land on `target_name` just before this
+    build writes its manifest: the interleaving the race produces."""
+    real = mod.write_binary_manifest
+
+    def racing(path, provenance, *args, **kwargs):
+        if path.name == target_name:
+            path.write_bytes(FOREIGN)
+        return real(path, provenance, *args, **kwargs)
+
+    monkeypatch.setattr(mod, "write_binary_manifest", racing)
+
+
+def test_race_foreign_binary_before_manifest_is_not_certified(pkg, buildpy, monkeypatch):
+    """compile_binary: a binary another build wrote over ours must not be
+    recorded as ours, so the next cached build relinks instead of serving it."""
+    out_dir = pkg / "build" / "debug"
+    out_dir.mkdir(parents=True)
+    monkeypatch.setenv("RITZ_PATH", str(PKG_DIR))
+    _foreign_write_before_manifest(buildpy, monkeypatch, "exitcode")
+    bin_path = buildpy.compile_binary("exitcode", main_src(pkg), out_dir, pkg_dir=pkg)
+    assert bin_path is not None
+    assert bin_path.read_bytes() == FOREIGN  # the other build won the path
+    recorded = json.loads(buildpy.binary_manifest_path(bin_path).read_text())
+    assert recorded["binary_sha256"] != _sha(FOREIGN), \
+        "manifest certifies the other build's binary as built from these sources"
+
+    monkeypatch.undo()
+    monkeypatch.setenv("RITZ_PATH", str(PKG_DIR))
+    rebuilt = []
+    buildpy.compile_binary("exitcode", main_src(pkg), out_dir, pkg_dir=pkg,
+                           on_rebuild=lambda: rebuilt.append(1))
+    assert rebuilt, "cached build served the other build's binary as up to date"
+    assert bin_path.read_bytes() != FOREIGN
+
+
+def test_race_publish_records_hash_of_linked_file(tmp_path, buildpy):
+    """publish_binary hashes the file this build produced, before it is
+    visible at `bin_path`, and leaves no temp file behind."""
+    a = tmp_path / "a.ritz"
+    a.write_text("x")
+    out = tmp_path / "out"
+    out.mkdir()
+    bin_path = out / "prog"
+    tmp = buildpy.private_output_path(bin_path)
+    assert tmp.parent == bin_path.parent and tmp != bin_path
+    assert buildpy.private_output_path(bin_path) != tmp, "temp names must not collide"
+    tmp.write_bytes(b"ours")
+    prov = buildpy.binary_provenance([a], "ritz0", "H1", PROFILE)
+    buildpy.publish_binary(tmp, bin_path, prov)
+    assert bin_path.read_bytes() == b"ours"
+    assert buildpy.binary_is_up_to_date(bin_path, prov)
+    assert sorted(p.name for p in out.iterdir()) == ["prog", "prog.manifest.json"]
+    # The manifest names our bytes: a later foreign write is never fresh.
+    bin_path.write_bytes(FOREIGN)
+    assert not buildpy.binary_is_up_to_date(bin_path, prov)
+
+
+def test_race_publish_with_foreign_write_before_manifest(tmp_path, buildpy, monkeypatch):
+    """The unit form of the race: a foreign write between publishing the
+    binary and writing its manifest is never certified."""
+    a = tmp_path / "a.ritz"
+    a.write_text("x")
+    bin_path = tmp_path / "prog"
+    tmp = buildpy.private_output_path(bin_path)
+    tmp.write_bytes(b"ours")
+    prov = buildpy.binary_provenance([a], "ritz0", "H1", PROFILE)
+    _foreign_write_before_manifest(buildpy, monkeypatch, "prog")
+    buildpy.publish_binary(tmp, bin_path, prov)
+    assert not buildpy.binary_is_up_to_date(bin_path, prov)
+
+
+def test_race_manifest_temp_names_are_private(tmp_path, buildpy, monkeypatch):
+    """Two builds writing one manifest must not share its temp file: one's
+    os.replace would move the other's half-written file, or fail on a temp
+    that the other already renamed."""
+    a = tmp_path / "a.ritz"
+    a.write_text("x")
+    bin_path = tmp_path / "prog"
+    bin_path.write_bytes(b"ours")
+    prov = buildpy.binary_provenance([a], "ritz0", "H1", PROFILE)
+    seen = []
+    real_replace = os.replace
+
+    def spy(src, dst):
+        seen.append(Path(src).name)
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(buildpy.os, "replace", spy)
+    buildpy.write_binary_manifest(bin_path, prov)
+    buildpy.write_binary_manifest(bin_path, prov)
+    assert len(seen) == 2 and seen[0] != seen[1], seen
+
+
+def test_race_foreign_archive_before_manifest_is_not_certified(tmp_path, buildpy, monkeypatch):
+    """compile_library has the same publish step as compile_binary."""
+    src = tmp_path / "lib" / "util.ritz"
+    src.parent.mkdir()
+    src.write_text("pub fn util_one() -> i32\n    1\n")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+    lib = buildpy.LibraryConfig(name="util", modules=[src])
+    monkeypatch.setenv("RITZ_PATH", str(PKG_DIR))
+    _foreign_write_before_manifest(buildpy, monkeypatch, "libutil.a")
+    archive = buildpy.compile_library(lib, out_dir, pkg_dir=tmp_path)
+    assert archive is not None and archive.read_bytes() == FOREIGN
+    recorded = json.loads(buildpy.binary_manifest_path(archive).read_text())
+    assert recorded["binary_sha256"] != _sha(FOREIGN)
+    assert sorted(p.name for p in out_dir.iterdir()) == ["libutil.a", "libutil.a.manifest.json"]

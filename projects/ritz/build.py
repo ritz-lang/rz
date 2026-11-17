@@ -27,6 +27,7 @@ import argparse
 import tempfile
 import textwrap
 import threading
+import uuid
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -1396,14 +1397,49 @@ def binary_provenance(sources: list[Path], compiler: str, compiler_hash: str, pr
     }
 
 
-def write_binary_manifest(bin_path: Path, provenance: dict) -> None:
-    """Record that `bin_path` (as it is on disk now) came from `provenance`."""
+def private_output_path(path: Path) -> Path:
+    """A temp name next to `path`, unique to this call.
+
+    AGAST #1499: two builds can write one output path (worktrees or overlay
+    roots that reach a package through a symlink). A fixed `<name>.tmp`
+    lets one build rename the other's half-written file, or fail on a temp
+    the other already renamed. Same directory, so `os.replace` is atomic.
+    """
+    return path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex[:12]}.tmp")
+
+
+def write_binary_manifest(bin_path: Path, provenance: dict,
+                          binary_sha256: Optional[str] = None) -> None:
+    """Record that the binary with sha256 `binary_sha256` came from
+    `provenance`. Without it, hash `bin_path` as it is on disk now, which is
+    only right when nothing else can write that path (see publish_binary)."""
     import json
-    record = dict(provenance, binary_sha256=_sha256_file(bin_path))
+    if binary_sha256 is None:
+        binary_sha256 = _sha256_file(bin_path)
+    record = dict(provenance, binary_sha256=binary_sha256)
     manifest = binary_manifest_path(bin_path)
-    tmp = manifest.with_name(manifest.name + ".tmp")
-    tmp.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
-    os.replace(tmp, manifest)
+    tmp = private_output_path(manifest)
+    try:
+        tmp.write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+        os.replace(tmp, manifest)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def publish_binary(built: Path, bin_path: Path, provenance: Optional[dict]) -> None:
+    """Move the file this build produced (`built`, from private_output_path)
+    to `bin_path` and record its provenance.
+
+    AGAST #1499: the hash is taken from `built` before it becomes visible.
+    Hashing `bin_path` afterwards would certify whatever another build wrote
+    there in between as built from THIS build's sources, and every later
+    cached build would serve it. With our own hash, a foreign binary at
+    `bin_path` never matches the manifest, so the next build relinks.
+    """
+    digest = _sha256_file(built)
+    os.replace(built, bin_path)
+    if provenance is not None:
+        write_binary_manifest(bin_path, provenance, binary_sha256=digest)
 
 
 def binary_is_up_to_date(bin_path: Path, provenance: dict) -> bool:
@@ -1806,11 +1842,14 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
         if link_files is None:
             return None
 
-        if not link_hosted(bin_path, runtime_obj, link_files, profile):
-            return None
-
-        if provenance is not None:
-            write_binary_manifest(bin_path, provenance)
+        # Link to a private name, then publish it with its own hash (#1499).
+        linked = private_output_path(bin_path)
+        try:
+            if not link_hosted(linked, runtime_obj, link_files, profile):
+                return None
+            publish_binary(linked, bin_path, provenance)
+        finally:
+            linked.unlink(missing_ok=True)
         return bin_path
     finally:
         # Clean up temp directory if not keeping artifacts
@@ -1924,19 +1963,18 @@ def compile_library(lib: LibraryConfig, out_dir: Path, *, keep_artifacts: bool =
 
         # A fresh archive, then a rename: `ar r` into the old one would keep
         # the members of modules that have since been deleted.
-        tmp_archive = archive.with_name(archive.name + ".tmp")
-        tmp_archive.unlink(missing_ok=True)
-        result = subprocess.run(
-            [archiver, "rcs", str(tmp_archive)] + [str(o) for o in objects],
-            capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"  ✗ {archiver} failed: {result.stderr}", file=sys.stderr)
+        # A private name, so concurrent builds never share it (#1499).
+        tmp_archive = private_output_path(archive)
+        try:
+            result = subprocess.run(
+                [archiver, "rcs", str(tmp_archive)] + [str(o) for o in objects],
+                capture_output=True, text=True)
+            if result.returncode != 0:
+                print(f"  ✗ {archiver} failed: {result.stderr}", file=sys.stderr)
+                return None
+            publish_binary(tmp_archive, archive, provenance)
+        finally:
             tmp_archive.unlink(missing_ok=True)
-            return None
-        os.replace(tmp_archive, archive)
-
-        if provenance is not None:
-            write_binary_manifest(archive, provenance)
         return archive
     finally:
         if not keep_artifacts:
