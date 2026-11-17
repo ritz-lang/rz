@@ -155,6 +155,12 @@ REJECTED = {
                           2, 5, _I2B),
     "tail_if_arms_mix": (_fn("a: bool", "if a\n    let x: i64 = 2\n    x\nelse\n    false", "bool"),
                          6, 9, _B2I),
+    # AGAST #3774: arms agree even when the value is thrown away; only a
+    # valueless (void-call) arm is exempt there (#2046, `discarded_void_arm`).
+    "discarded_if_arms_mix": (_fn("a: bool", "(if a then 5 else true)\n0"), 2, 23, _B2I),
+    "discarded_nested_match_arms_mix": (_fn(
+        "n: i64", "match n\n    0 =>\n        match n\n            1 => true\n"
+                  "            _ => 2\n    _ => 0\n0"), 6, 22, _I2B),
     "let_bool_int": (_fn("", "let b: bool = 2\nif b\n    return 1\n0"), 2, 19, _I2B),
     "var_bool_int": (_fn("", "var b: bool = 2\nif b\n    return 1\n0"), 2, 19, _I2B),
     "let_int_bool": (_fn("a: i64", "let n: i64 = a == 1\nn"), 2, 18, _B2I),
@@ -286,6 +292,11 @@ ACCEPTED = {
     "bool_array": ("fn main() -> i32\n    var a: [2]bool = [false, true]\n"
                    "    if a[1] and not a[0]\n        return 3\n    0\n", 3),
     "bool_const": ("const C: bool = true\nfn main() -> i32\n    if C\n        return 3\n    0\n", 3),
+    # AGAST #2046 / #3774: a thrown-away match may mix a valueless arm (a call
+    # to a fn returning nothing) with valued ones.
+    "discarded_void_arm": ("var g: i32\nfn p()\n    g = 3\nfn main() -> i32\n"
+                           "    let a: bool = true\n    match a\n        true => p()\n"
+                           "        false => 5\n    g\n", 3),
     # AGAST #3001: a `bool` global is one i1 byte, as on ritz0, and reads as the
     # i64 every bool value is; ritz1 stored the i64 as i1 and handed `not`, `and`,
     # a cast and a by-value arg the raw i1 load.
