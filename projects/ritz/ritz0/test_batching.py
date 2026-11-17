@@ -169,6 +169,41 @@ def test_a_row_leans_on_what_it_needs_from_outside_and_the_batch_did_not():
     assert batching.leans("declare i64 @realloc(...)\n", batch) == set()
 
 
+_UNBOUND = '''\
+@.str = private constant [12 x i8] c"call @nope\\00"
+@g = global ptr @"vec_new$i32"
+define i32 @"vec_new$i32"() {
+  %r = call i64 @realloc(ptr null, i64 0)
+  %s = call i64 @"Vec$S_push"(ptr @g, ptr @.str)
+  call void @llvm.memset.p0.i64(ptr null, i8 0, i64 0, i1 false)
+  %t = call i32 @f__r2(i64 %r)
+  ret i32 0
+}
+declare i64 @realloc(...)
+'''
+
+
+@pytest.mark.unit
+def test_unbound_is_what_a_module_calls_and_never_defines_or_declares():
+    # AGAST #3905, #2562's shape: ritz1 emitted `call i64 @Vec$S_push` with no
+    # instance and no declare.  Defined, declared and global names are bound;
+    # an intrinsic is the backend's; a string's text is no symbol.
+    assert batching.unbound(_UNBOUND) == {"Vec$S_push", "f"}
+    assert batching.unbound(_LL) == set()
+
+
+@pytest.mark.unit
+def test_a_row_leans_on_a_symbol_it_calls_and_never_declares():
+    # Batched, a sibling's instance defines `Vec$S_push`, so neither module
+    # declares it and externals can't tell; alone, the row's module is invalid IR.
+    batch = _UNBOUND.replace("declare i64 @realloc(...)\n",
+                             "declare i64 @realloc(...)\ndefine i64 @\"Vec$S_push\"(ptr %v, ptr %x) {\n"
+                             "  ret i64 0\n}\ndefine i32 @f__r2(i64 %p) {\n  ret i32 0\n}\n")
+    assert batching.unbound(batch) == set()
+    assert batching.leans(_UNBOUND, batch) == {"Vec$S_push", "f"}
+    assert batching.leans(batch, batch) == set()
+
+
 _TYPES = '''\
 %H__r1 = type { i8, [0 x i8], [8 x i8] }
 %"Option$i32" = type { i8, [3 x i8], [4 x i8] }
@@ -323,6 +358,55 @@ def test_a_row_that_leans_on_another_rows_instance_gets_no_answer(tmp_path):
     assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None, 5]
 
 
+_PLANT = 'define i64 @planted() {\n  %r = call i64 @"Vec$S_push"(ptr null, i64 4)\n  ret i64 %r\n}\n'
+
+
+def _planting(step, marker):
+    """`step` (a `_build` or `_compile`), with an undeclared call (#2562's shape)
+    planted in the module of any row's own program holding `marker`, before it
+    links.  A batch's (`__row<k>`) is left whole: there a sibling's instance
+    would have served the call."""
+    def planted(compiler, src, work):
+        text = src.read_text()
+        if marker in text and batching._ROW_FN.format(0) not in text:
+            orig = run_ritz0
+
+            def plant_after(args, **kw):
+                comp = orig(args, **kw)
+                ll = Path(args[args.index("-o") + 1])
+                if comp.returncode == 0 and ll.exists():
+                    ll.write_text(ll.read_text() + _PLANT)
+                return comp
+            globals()["run_ritz0"] = plant_after
+            try:
+                return step(compiler, src, work)
+            finally:
+                globals()["run_ritz0"] = orig
+        return step(compiler, src, work)
+    return planted
+
+
+@pytest.mark.integration
+def test_a_row_that_calls_what_it_never_declares_gets_no_answer(tmp_path):
+    # AGAST #3905: alone, row 1's module calls `Vec$S_push` and neither defines
+    # nor declares it (invalid IR); batched, a sibling's instance would serve.
+    compile = _planting(_compile, "+ 4\n")
+    rows = [_row(_vec(n), top=GVEC) for n in (3, 4, 5)]
+    assert batching.run_rows("ritz0", rows, _build, tmp_path, compile=compile) == [3, None, 5]
+
+
+@pytest.mark.integration
+def test_a_row_that_calls_what_it_never_declares_fails_as_its_own(tmp_path):
+    # Not answered by its batch, the row is built alone, and that failure is its.
+    import test_table_rows as table_rows
+    rows = [table_rows.Row(f"vec{n}", table_rows.ALL, table_rows.Run(_row(_vec(n), top=GVEC), n))
+            for n in (3, 4, 5)]
+    failures = table_rows.check("ritz0", rows, build=_planting(_build, "+ 4\n"),
+                                compile=_planting(_compile, "+ 4\n"), work=tmp_path)
+    assert [f.split(":")[0] for f in failures] == ["ritz0 vec4"], failures
+    assert "didn't compile and link" in failures[0], failures
+
+
 def _opt(n):
     return (f"fn f() -> i32\n    let o: Option<i32> = Some({n})\n    match o\n"
             "        Some(v) => v\n        None => 0\n")
@@ -466,6 +550,9 @@ def _nested(tmp_path, *args, batch="1"):
     log, per_row = tmp_path / "batch.log", tmp_path / "per_row.log"
     env = dict(ENV, PYTHONPATH=str(Path(__file__).resolve().parent), RITZ_TEST_BATCH=batch,
                RITZ_TEST_BATCH_LOG=str(log), PER_ROW_LOG=str(per_row))
+    # ci_local's "likely failures first" names this file in PYTEST_ADDOPTS; the
+    # nested pytest, in tmp_path, would look for it there and run nothing.
+    env.pop("PYTEST_ADDOPTS", None)
     proc = subprocess.run(
         ["python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "--disable-plugin-autoload",
          "-p", "xdist", "--basetemp", str(tmp_path / "base"), *args, "test_nested.py"],

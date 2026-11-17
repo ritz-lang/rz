@@ -52,7 +52,7 @@ chunk of rows at a time per compiler, a chunk one package build
 (test_ritz1_deref_struct_arg.pkg_build).  A batch holds other rows' receivers,
 which can instantiate `vec_push$S` for a row that doesn't: such a row is only
 answered by its batch if its own module, compiled alone, declares everything
-it calls (batching.leans, test_ritz1_deref_struct_arg._unbound); otherwise it
+it calls (batching.leans, batching.unbound); otherwise it
 is built alone.  A row keeps the id its parametrised test had, less the
 compiler (`test_field_receiver_push[self_lent-param-small-ritz1]` is
 `field_receiver_push[self_lent-param-small]` on ritz1).

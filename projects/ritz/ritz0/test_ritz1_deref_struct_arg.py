@@ -51,7 +51,6 @@ on ritz1), and a failure names each row that failed.
 
 import itertools
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -91,33 +90,7 @@ def pkg_compile(compiler, src, work):
     else:
         comp = subprocess.run([str(_BINS[compiler]), str(src), "-o", str(ll), "-I", str(RITZ_ROOT)],
                               cwd=src.parent, env=env, capture_output=True, text=True, timeout=300)
-    out = comp.stdout + comp.stderr
-    if comp.returncode == 0 and ll.exists():
-        unbound = _unbound(ll.read_text())
-        if unbound:
-            return 1, out + "\nmain.ll names symbols it neither defines nor declares: " + " ".join(unbound)
-    return comp.returncode, out
-
-
-_BOUND = re.compile(r'^(?:define\b[^@\n]*|declare\b[^@\n]*|)@(?:"((?:[^"\\]|\\.)*)"|([-\w.$]+))',
-                    re.MULTILINE)
-
-# A symbol, or a string's text (a constant's, inline asm's: no symbol in it).
-_TOKEN = re.compile(r'@(?:"((?:[^"\\]|\\.)*)"|([-\w.$]+))|"(?:[^"\\]|\\.)*"')
-
-
-def _unbound(ll):
-    """The `@` symbols `ll` uses but neither defines, declares nor holds as a global.
-
-    batching.leans holds a row's own module to what it declares.  A call ritz1
-    emits to a function it never instantiated, undeclared (`call i64
-    @Vec$S_push`, AGAST #2562), is invalid IR alone, but in a batch a sibling's
-    instance can make the row's code whole; so a row whose own module has one
-    is not answered by its batch, and runs alone.
-    """
-    bound = {q or b for q, b in _BOUND.findall(ll)}
-    used = {q or b for q, b in _TOKEN.findall(ll) if q or b}
-    return sorted(s for s in used - bound if not s.startswith("llvm.") and not s.isdigit())
+    return comp.returncode, comp.stdout + comp.stderr
 
 
 def pkg_build(compiler, src, work):

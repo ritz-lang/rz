@@ -292,7 +292,10 @@ def unrename(text: str) -> str:
 # types it uses without defining.  #2926 measured that: ritz1 lowered a row's
 # `Has(Some(6))` alone to an `alloca %Option$i32` it never defined, which clang
 # refuses ("Cannot allocate unsized type"); batched, another row's definition
-# of `%Option$i32` served it.  Only these rows pay for the second compile: ritz0's, in
+# of `%Option$i32` served it.  And (AGAST #3905) the symbols it uses and never
+# binds at all: #2562's `call i64 @Vec$S_push`, with no instance and no declare,
+# is invalid IR alone and whole beside a sibling that defined the instance.
+# Only these rows pay for the second compile: ritz0's, in
 # process, costs ~120 ms, about what the whole row would have alone.
 
 _SYM = r'@(?:"((?:[^"\\]|\\.)*)"|([-\w.$]+))'
@@ -371,6 +374,25 @@ def externals(ll: str) -> set:
     return {unrename(q or b) for q, b in _DECLARE.findall(ll) if not (q or b).startswith("llvm.")}
 
 
+# What binds a name: a line that defines, declares or holds it (a global, an alias).
+_BOUND = re.compile(rf"^(?:define\b[^@\n]*|declare\b[^@\n]*|){_SYM}", re.MULTILINE)
+# A symbol, or a string's text (a constant's, inline asm's: no symbol in it).
+_TOKEN = re.compile(rf'{_SYM}|"(?:[^"\\]|\\.)*"')
+
+
+def unbound(ll: str) -> set:
+    """The `@` symbols `ll` uses but neither defines, declares nor holds, in the rows' own names.
+
+    AGAST #3905, #2562's shape: ritz1 emitted `call i64 @Vec$S_push` for an
+    instance it never registered, with no declare.  Alone that is invalid IR;
+    in a batch a sibling's instance makes it whole, and `externals` (declares
+    only) can't see it.  LLVM intrinsics are the backend's.
+    """
+    bound = {q or b for q, b in _BOUND.findall(ll)}
+    used = {q or b for q, b in _TOKEN.findall(ll)}
+    return {unrename(s) for s in used - bound if s and not s.startswith("llvm.")}
+
+
 def borrowed_types(row_ll: str, batch_ll: str) -> set:
     """The named types a row's own module uses, doesn't define, and its batch does (#2988).
 
@@ -386,9 +408,12 @@ def borrowed_types(row_ll: str, batch_ll: str) -> set:
 def leans(row_ll: str, batch_ll: str) -> set:
     """What a row's own module needs from outside that its batch's did not.
 
-    Symbols it declares, and named types it uses but only the batch defines.
+    Symbols it declares, symbols it uses and never binds at all (#3905: the
+    batch linked, so it bound every one), and named types it uses but only the
+    batch defines.
     """
-    return (externals(row_ll) - externals(batch_ll)) | borrowed_types(row_ll, batch_ll)
+    return ((externals(row_ll) - externals(batch_ll)) | unbound(row_ll)
+            | borrowed_types(row_ll, batch_ll))
 
 
 def _located(output: str, filename: str):
