@@ -8,6 +8,9 @@ carry a pointer as one; Sema binds the declared type, so it can tell.  ritz0
 refuses each at the `[`, in index_rules.needs_index's words, and ritz1's Sema
 (sema_index_store.ritz, index_scalar_check) now does too.
 
+`s.f[0] = v`, `p.f[0] = v` and `(*p).f[0] = v` on a scalar field, whose target
+is a field name, not an Expr, are refused too (AGAST #3799).
+
 `^` marks where the error lands.  A row in RITZ1_ONLY is one ritz0 raises a
 traceback on (AGAST #3754) instead of refusing.
 """
@@ -34,9 +37,20 @@ ROWS = {
     "read_bool_local": ("bool", "fn f() -> i64\n    var b: bool = true\n    let x: i64 = b^[0] as i64\n    x\n"),
 }
 
+S = "struct S\n    f: u32\n\n"
+
 RITZ1_ONLY = {
     "read_cast": ("i64", "fn f(p: *u8) -> i64\n    (p as i64)^[0]\n"),
     "read_field": ("u32", "struct S\n    f: u32\n\nfn f(s: S) -> u32\n    s.f^[1]\n"),
+    # AGAST #3799: a field-index store's target is a field name, not an Expr
+    # (STMT_LOCAL_FIELD_INDEX_ASSIGN for `s.f[i]` / `p.f[i]`,
+    # STMT_MEMBER_INDEX_ASSIGN for `(*p).f[i]`), and each has an `op=` form.
+    "local_field_store": ("u32", S + "fn f()\n    var s = S { f: 0 }\n    s.f^[0] = 1\n"),
+    "ptr_field_store": ("u32", S + "fn f(p: *S)\n    p.f^[0] = 1\n"),
+    "deref_field_store": ("u32", S + "fn f(p: *S)\n    (*p).f^[0] = 1\n"),
+    "local_field_compound": ("u32", S + "fn f()\n    var s = S { f: 0 }\n    s.f^[0] += 1\n"),
+    "deref_field_compound": ("u32", S + "fn f(p: *S)\n    (*p).f^[0] += 1\n"),
+    "spaced_field_store": ("u32", S + "fn f(p: *S)\n    (*p).f ^[0] = 1\n"),
 }
 
 MAIN = "\npub fn main() -> i32\n    0\n"
