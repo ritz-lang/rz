@@ -102,13 +102,6 @@ def test_nothing_imports_a_retired_module():
 
 
 @pytest.mark.unit
-def test_bootstrap_ritzlib_has_no_link_to_a_retired_module():
-    """ritz1/bootstrap_ritzlib/ mirrors ritzlib/ in symlinks; see test_ritzlib_no_eq."""
-    links = RITZ_ROOT / "ritz1" / "bootstrap_ritzlib"
-    assert [path.name for path in sorted(links.iterdir()) if not path.exists()] == []
-
-
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "line",
     [

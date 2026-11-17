@@ -44,7 +44,6 @@ SHARED_HOST_SCRATCH_SCRIPTS = [
 ]
 SHARED_HOST_SHELL = SHARED_HOST_SCRATCH_SCRIPTS + [
     RITZ / "ritz1" / "Makefile",
-    SCRIPTS / "build_ritz1.sh",
     REPO / "projects" / "ritz-lsp" / "test.sh",
     REPO / "projects" / "nexus" / "deploy" / "scripts" / "deploy.sh",
 ]

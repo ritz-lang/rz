@@ -106,7 +106,7 @@ def _live_files():
     """process.ritz, the ritzlib reference, and every .ritz that imports it.
 
     Only importers: harland's kernel has a `spawn_args` syscall of its own.
-    Symlinks are skipped (ritz1/bootstrap_ritzlib mirrors ritzlib).
+    Symlinks are skipped (a link would repeat its target).
     """
     yield PROCESS
     yield RITZ_ROOT / "docs" / "STDLIB_REFERENCE.md"

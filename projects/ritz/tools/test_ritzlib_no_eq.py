@@ -40,12 +40,6 @@ def test_eq_module_is_deleted():
     assert not (RITZ_ROOT / "ritzlib" / "eq.ritz").exists()
 
 
-def test_bootstrap_symlink_is_deleted():
-    link = RITZ_ROOT / "ritz1" / "bootstrap_ritzlib" / "eq.ritz"
-    # lexists, not exists: a symlink to a deleted file must go as well.
-    assert not link.is_symlink() and not link.exists()
-
-
 def test_ritz1_does_not_link_eq():
     text = (RITZ_ROOT / "ritz1" / "Makefile").read_text()
     m = re.search(r"^RITZLIB_MODULES\s*=(.*)$", text, re.MULTILINE)

@@ -226,8 +226,8 @@ def test_copy_sources_tolerates_dangling_link(tmp_path: Path, pkg: str) -> None:
 
 @pytest.mark.unit
 def test_copy_sources_keeps_tracked_links_inside_the_copy(tmp_path: Path) -> None:
-    # Tracked links (ritz1/bootstrap_ritzlib/*, bootstrap_env/ritzlib) are
-    # relative into ritzlib/; copied as links they resolve in the scratch tree.
+    # A tracked link relative into ritzlib/ (as ritz1/bootstrap_ritzlib/*
+    # were until AGAST #3912), copied as a link, resolves in the scratch tree.
     src = _scratch_src(tmp_path)
     (src / "ritz1" / "io.ritz").symlink_to("../ritzlib/io.ritz")
     _copy_sources(src, tmp_path / "dst")

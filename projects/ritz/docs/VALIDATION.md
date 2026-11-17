@@ -56,25 +56,22 @@ These are not suggestions:
 1. **Never `make clean` to "make sure it works."** Make's dependency tracking
    is correct. If incremental gives different results from clean, that is a
    Makefile bug to file and fix, not paper over.
-2. **Never use `ritz1/compile.sh` for iteration.** It has no dependency
-   tracking and recompiles all 27 source files every time, taking ~40 s for a
-   one-character edit. Use `make -C ritz1 ritz1` instead — same result, ~10 s
-   after a single-file edit.
-3. **Don't combine `compile.sh` and `make`.** They both build `ritz1`. Running
-   one then the other is redundant work.
-4. **Don't bootstrap selfhost unless you actually need to.** Self-hosting takes
+2. **Build `ritz1` with `make -C ritz1 ritz1`.** It is the only build path
+   (`ritz1/compile.sh`, which recompiled every file each time, was deleted
+   by AGAST #3912).
+3. **Don't bootstrap selfhost unless you actually need to.** Self-hosting takes
    3+ minutes (ritz1 compiling itself is ~5× slower per file than ritz0). If
    your change can't possibly affect `ritz1`'s own compiled output (for
    example, you're only adding a grammar rule that ritz1's source doesn't use),
    skip it.
-5. **Never hand-edit `ritz1/src/parser_gen.ritz`.** The grammar (in
+4. **Never hand-edit `ritz1/src/parser_gen.ritz`.** The grammar (in
    `grammars/ritz1.grammar`) is the source of truth. Edit the grammar, then
    regenerate via `tools/ritzgen_py/ritz_generator.py grammars/ritz1.grammar
    --monolithic --output-dir <tmp>` and copy the output. `make matrix` and
    `make matrix-full` run `make regen-check` automatically and refuse to run
    the matrix if drift is detected — but you can also run `make regen-check`
    directly any time to verify.
-6. **Never change documented syntax without running `make check-doc-examples`.**
+5. **Never change documented syntax without running `make check-doc-examples`.**
    Every fenced ` ```ritz ` block in the four documents listed in the Makefile's
    `DOC_EXAMPLE_DOCS` is compiled by ritz0 on every build. This rule exists
    because we once shipped a *bespoke migration diagnostic* — "Legacy `&T`

@@ -158,8 +158,7 @@ Directory order, by risk/benefit:
 3. **`ritz0/test/`** (495 sites). ritz0 tests — scripted rewrite, but
    keep one commit per test-file so a regression points at a single
    change.
-4. **`ritz1/src/`** (1,388 sites) and **`ritz1/bootstrap_ritzlib/`**
-   (90). The self-hosted compiler. Last, because:
+4. **`ritz1/src/`** (1,388 sites). The self-hosted compiler. Last, because:
    * It's the biggest cliff if a rewrite is wrong.
    * ritz1 itself currently treats bare as `*u8`; the audit's "c" bucket
      is already what ritz1 emits, so this phase is largely a

@@ -53,10 +53,8 @@ ritz1/
 ├── src/                 # Compiler source, one module per file (see ARCHITECTURE.md)
 ├── test/                # [[test]] unit suites: `make -C .. ritz1-unit`
 ├── runtime/             # Minimal runtime support
-├── bootstrap_ritzlib/   # Bootstrap ritzlib stubs
 ├── Makefile             # Build system
 ├── mkdeps.py            # Transitive-import .d files for make
-├── compile.sh           # Alternative build script
 ├── ARCHITECTURE.md      # Pipeline, modules, import graph, structural debt
 └── README.md            # This file
 ```

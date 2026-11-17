@@ -121,7 +121,7 @@ IMPORTS_NET = re.compile(r"^\s*import\s+ritzlib\.net\b", re.MULTILINE)
 def _live_files():
     """net.ritz, the ritzlib reference, and every .ritz that imports ritzlib.net.
 
-    Symlinks are skipped (ritz1/bootstrap_ritzlib mirrors ritzlib).
+    Symlinks are skipped (a link would repeat its target).
     """
     yield NET
     yield RITZ_ROOT / "docs" / "STDLIB_REFERENCE.md"

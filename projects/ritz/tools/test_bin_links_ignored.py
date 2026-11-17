@@ -46,8 +46,8 @@ def _tracked_dirs() -> set[str]:
 def bin_link_paths() -> list[str]:
     """`<pkg_dir>/<name>` for every built `[[bin]]`, relative to the workspace.
 
-    Skips bins whose source is not Ritz (projects/ritz's ritz0.py and
-    compile.sh entries: build.py never compiles those) and link paths that
+    Skips bins whose source is not Ritz (projects/ritz's ritz0.py
+    entry: build.py never compiles it) and link paths that
     are tracked directories, where no link can be made.
     """
     tracked_dirs = _tracked_dirs()
