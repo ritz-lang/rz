@@ -28,6 +28,7 @@ import ast
 import ast_helpers
 import emitter_core
 import emitter_expr_call   # method_callee_def (AGAST #2032)
+import bool_kind           # bk_method_def (AGAST #3294)
 
 # The type of the place reached so far along a `let`'s own storage.
 struct LetPlace
@@ -476,8 +477,8 @@ fn let_check_another_struct_store(s: *EmitterState, stmt: *Stmt)
     eprints_cstr(c"`\n")
 
 # AGAST #3294: argument `a` for by-value param `p`, a struct of another type.
-# It reached clang as a `%C` passed to the `%D`.  bool_check_args pairs them,
-# for a call, a fn-pointer call and a method; ritz0's
+# It reached clang as a `%C` passed to the `%D`.  let_another_struct_call /
+# _method pair them, for a call, a fn-pointer call and a method; ritz0's
 # _another_struct_arg_message gives the same message, at the argument.
 pub fn let_check_another_struct_arg(s: *EmitterState, p: *Param, a: *Expr)
     if p.param_type != TYPE_STRUCT or p.is_borrow == 1
@@ -491,6 +492,41 @@ pub fn let_check_another_struct_arg(s: *EmitterState, p: *Param, a: *Expr)
     eprints_cstr(c"` but its argument is a `")
     let_eprint_name(src, src_len)
     eprints_cstr(c"`\n")
+
+fn let_another_struct_args(s: *EmitterState, params: *Param, args: *Expr)
+    var p: *Param = params
+    var a: *Expr = args
+    while p != null and a != null
+        let_check_another_struct_arg(s, p, a)
+        p = p.next
+        a = a.next
+
+# A named call's arguments against its callee's params: a fn-pointer local's
+# signature, else the fn.  (bool_check paired them until it moved onto Sema,
+# AGAST #3502; this rule moves with let_check, #3504.)
+pub fn let_another_struct_call(s: *EmitterState, e: *Expr)
+    if e.func_name_len == 0
+        return
+    let idx: i32 = find_local_idx(s, e.func_name, e.func_name_len)
+    if idx >= 0
+        let sig: *FnDef = local_at(s, idx).fn_sig
+        if sig != null
+            let_another_struct_args(s, sig.params, e.args)
+        return
+    let fd: *FnDef = find_call_fn(s, e)
+    if fd != null
+        let_another_struct_args(s, fd.params, e.args)
+
+# A method call's arguments against its callee's params after the receiver
+# (`self`, or a UFCS helper's first param).
+pub fn let_another_struct_method(s: *EmitterState, e: *Expr)
+    let fd: *FnDef = bk_method_def(s, e)
+    if fd == null or fd.params == null
+        return
+    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1 or bk_method_is_ufcs(s, e, fd) == 1
+        let_another_struct_args(s, fd.params.next, e.args)
+    else
+        let_another_struct_args(s, fd.params, e.args)
 
 # Check one statement before it is emitted: its own write target, and every
 # `@&` in the expressions it evaluates.  Nested statement lists (if / while /

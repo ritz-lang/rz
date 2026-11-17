@@ -59,6 +59,7 @@ SOURCES = \
 	field_slot \
 	sema_walk \
 	bool_check \
+	bool_kind \
 	call_check \
 	literal_slot \
 	float_slot \

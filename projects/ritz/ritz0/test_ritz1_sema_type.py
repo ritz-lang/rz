@@ -26,6 +26,12 @@ it with get_expr_type and bool_kind on the same node.
   expression may disagree.  A floor on the compared count keeps a typer that
   answers "unknown" to everything from passing.  The probe changes no IR (the
   commit compared 457 files with it on and off).
+
+AGAST #3502 moved bool_check onto Sema, judging with sema_bool_kind.  The probe
+also compares that with the emitter's bool_kind on every expression: both sure
+and different is a mismatch; one sure and the other not is a `bk-gap`, a place
+where a bool report would read differently (or not at all).  The corpus holds
+the gaps to a ceiling, so a change can close them but not open new ones.
 """
 
 import os
@@ -138,7 +144,7 @@ UNKNOWN_AT = [
 
 DUMP = re.compile(r"^sema-type: (\d+):(\d+) e(\d+) (-?\d+)(?: (\S+))?$", re.M)
 SUMMARY = re.compile(r"sema-probe: (\d+) compared, (\d+) mismatched, (\d+) lenient, "
-                     r"(\d+) unknown, (\d+) bool-gap")
+                     r"(\d+) unknown, (\d+) bool-gap, (\d+) bk-gap")
 
 
 def _probe_env(value):
@@ -171,6 +177,13 @@ def test_sema_types_each_shape(request, tmp_path, compiler, monkeypatch):
 # that answered unknown everywhere would compare none and disagree with nothing.
 CORPUS_FLOOR = 15000
 
+# Ceiling on bk-gaps over the corpus: 154 at #3502.  Most are a `*p` or `a[i]`
+# Sema can't type, which it leaves unsure where the emitter's get_expr_type
+# guesses i64 (a guess that refused good programs when Sema copied it); the
+# rest a nameless tuple's `let (a, b)`, a field through a generic Deref, ...
+# #3768 closes them: lower it as they go.
+BK_GAP_CEILING = 154
+
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_sema_types_agree_with_the_emitter_on_the_matrix_corpus(request, tmp_path, compiler):
@@ -179,6 +192,7 @@ def test_sema_types_agree_with_the_emitter_on_the_matrix_corpus(request, tmp_pat
     assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
     env = _probe_env("1")
     compared = 0
+    bk_gaps = 0
     mismatches = []
     unsummarised = []
     for src in sorted((RITZ_ROOT / "ritz0" / "test").glob("*.ritz")):
@@ -189,8 +203,10 @@ def test_sema_types_agree_with_the_emitter_on_the_matrix_corpus(request, tmp_pat
         summary = SUMMARY.search(out)
         if summary:
             compared += int(summary.group(1))
+            bk_gaps += int(summary.group(6))
         elif comp.returncode == 0:
             unsummarised.append(src.name)
     assert not mismatches, f"{compiler}: Sema and the emitter disagree:\n" + "\n".join(mismatches)
     assert not unsummarised, f"{compiler}: compiled without a probe summary: {unsummarised}"
     assert compared >= CORPUS_FLOOR, f"{compiler}: only {compared} expressions compared"
+    assert bk_gaps <= BK_GAP_CEILING, f"{compiler}: {bk_gaps} bool-kind gaps, more than {BK_GAP_CEILING}"

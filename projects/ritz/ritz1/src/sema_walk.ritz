@@ -33,6 +33,7 @@ import pass_arm_init   # AGAST #3740
 import narrowing     # check_implicit_narrowing (AGAST #3505)
 import generic_method
 import field_slot
+import bool_check
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
@@ -41,10 +42,13 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
         let mark: i32 = sm.scope_top
         if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_inner_name, arm.pattern_inner_name_len)
+            bool_note_arm(sm, arm, scrut)
         else if arm.pattern_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_name, arm.pattern_name_len)
+            bool_note_arm(sm, arm, scrut)
         narrow_sema_arm(sm, scrut, arm)
         sema_walk_stmts(sm, arm.body_stmts, 0)
+        bool_no_value(sm, arm.body)
         sema_walk_expr(sm, arm.body)
         sm.scope_top = mark
         arm = arm.next
@@ -55,6 +59,7 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     if e == null
         return
     sema_probe_record(sm, e)
+    bool_check_expr(sm, e)   # AGAST #2342
     let k: i32 = e.kind
     if k == EXPR_MATCH or k == EXPR_IF
         sema_walk_expr(sm, e.left)
@@ -78,6 +83,10 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         sema_walk_list(sm, e.args)
     else if k == EXPR_STRUCT_LIT
         struct_lit_field_check(sm, e)   # LARB R49 (AGAST #3563)
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            sema_walk_expr(sm, fi.value)
+            fi = fi.next
 
 fn sema_walk_list(sm: *Sema, first: *Expr)
     var a: *Expr = first
@@ -124,16 +133,21 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
     let mark: i32 = sm.scope_top
     var st: *Stmt = first
     while st != null
+        if st.next == null and sm.cur_fn != null and first == sm.cur_fn.body
+            bool_check_tail(sm, st)   # AGAST #2342
         if st.kind == STMT_VAR_DECL
+            bool_check_decl(sm, st)   # AGAST #2342
             sema_walk_expr(sm, st.var_init)
             pass_arm_init_check(sm, st)
             check_implicit_narrowing(sm, st)   # AGAST #1364 / #3505
             sema_bind_decl(sm, st)
             narrow_sema_decl(sm, st)
+            bool_note_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
             sema_walk_expr(sm, st.var_init)
             sema_bind(sm, st.var_name, st.var_name_len)
             sema_bind(sm, st.assign_target, st.assign_target_len)
+            bool_note_tuple(sm, st)
             var tn: *TupleName = st.tuple_more   # AGAST #109
             while tn != null
                 sema_bind(sm, tn.name, tn.len)
@@ -143,29 +157,39 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
             sema_walk_expr(sm, st.for_end)
             let for_mark: i32 = sm.scope_top
             sema_bind(sm, st.for_var, st.for_var_len)
+            bool_note_for(sm, st)
             sema_walk_stmts(sm, st.for_body, 0)
             sm.scope_top = for_mark
         else if st.kind == STMT_IF
+            bool_check_cond(sm, st.if_cond, c"if condition")
             sema_walk_expr(sm, st.if_cond)
             sema_walk_stmts(sm, st.if_then, 0)
             sema_walk_stmts(sm, st.if_else, 0)
         else if st.kind == STMT_WHILE
+            bool_check_cond(sm, st.while_cond, c"while condition")
             sema_walk_expr(sm, st.while_cond)
             sema_walk_stmts(sm, st.while_body, 0)
         else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
             sema_walk_stmts(sm, st.while_body, 0)
         else if st.kind == STMT_MATCH
+            sema_walk_expr(sm, st.if_cond)
             sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm)
         else if st.kind == STMT_RETURN
+            bool_check_return(sm, st.return_value)
             sema_walk_expr(sm, st.return_value)
         else if st.kind == STMT_EXPR
             # Only a block's last statement can be its value (AGAST #2137).
             if st.next != null or void_tail == 1
                 must_use_check(sm, st.expr)
+            # A fn's last statement is its value; any other's is thrown away.
+            if st.next != null or sm.cur_fn == null or first != sm.cur_fn.body
+                bool_no_value(sm, st.expr)
             sema_walk_expr(sm, st.expr)
         else if st.kind == STMT_ASSERT
+            bool_check_cond(sm, st.if_cond, c"assert condition")
             sema_walk_expr(sm, st.if_cond)
         else if sema_is_assign(st.kind) == 1
+            bool_check_stmt(sm, st)   # AGAST #2342
             if st.kind == STMT_ASSIGN and st.assign_target_len == 0
                 index_store_check(sm, st.if_cond)   # AGAST #3565
                 sema_walk_expr(sm, st.if_cond)
@@ -179,13 +203,16 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
     if f.body == null or fn_is_naked(f) == 1
         return
     sm.scope_top = 0
+    sm.cur_fn = f
     var p: *Param = f.params
     while p != null
         sema_bind_param(sm, p)
         narrow_sema_param(sm, p)
+        bool_note_param(sm, p)
         p = p.next
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
     sm.scope_top = 0
+    sm.cur_fn = null
 
 # 1 when a fn of `f`'s name was walked already: emit_module lowers only the
 # first of a name (was_fn_emitted).  `seen` maps fnv1a(name) to that fn.
@@ -210,6 +237,7 @@ fn sema_seen_before(m: *Module, seen: *HashMapI64, f: *FnDef) -> i32
 pub fn sema_check_module(m: *Module, path: *u8) -> i32
     let sm: *Sema = malloc(sizeof(Sema)) as *Sema
     sema_init(sm, m, path)
+    bool_check_globals(sm)   # AGAST #2342: before the fns, as the emitter
     var seen: HashMapI64 = hashmap_i64_with_cap(4096)
     var f: *FnDef = m.functions
     while f != null

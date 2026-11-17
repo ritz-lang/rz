@@ -17,6 +17,12 @@
 #         emitter sees (Sema runs first).  bool_kind gets those right;
 #         a move that reads widths tightens this rule first.
 #   bool: bk_of_type of Sema's type is bool_kind's, where bool_kind is sure.
+#   bk:   sema_bool_kind, which bool_check judges with on Sema (#3502), is
+#         bool_kind's wherever both are sure.  Where only one is, it is a
+#         `bk-gap`, printed as `sema-probe: bk-gap at ...`: a bool report
+#         there would read differently, or not at all, than the emitter's
+#         did.  ritz0/test_ritz1_sema_type.py holds their count to a ceiling.
+#   A struct literal is lenient: get_expr_type calls it an i64.
 # A broken rule prints `sema-probe: mismatch ...` on stderr.  After emission
 # main prints `sema-probe: <c> compared, <m> mismatched, <l> lenient, <u>
 # unknown, <g> bool-gap`: <g> of the <u> are expressions bool_kind types and
@@ -34,6 +40,7 @@ import emitter_core
 import sema
 import sema_type
 import bool_check
+import bool_kind
 
 var g_sema_probe_on: i32 = 0
 var g_sema_probe_map: HashMapI64
@@ -44,6 +51,8 @@ var g_sema_probe_mismatched: i64 = 0
 var g_sema_probe_unknown: i64 = 0
 var g_sema_probe_lenient: i64 = 0
 var g_sema_probe_bool_gap: i64 = 0
+var g_sema_probe_bk_gap: i64 = 0
+var g_sema_probe_bk: HashMapI64        # e -> sema_bool_kind + 100
 
 # `dump` is 1 for RITZ1_SEMA_PROBE=dump: each record is also printed,
 # `sema-type: <line>:<col> e<expr kind> <type kind>[ <name>]`, so a test can
@@ -53,6 +62,7 @@ pub fn sema_probe_enable(dump: i32)
     g_sema_probe_map = hashmap_i64_with_cap(65536)
     g_sema_probe_local_calls = hashmap_i64_with_cap(256)
     g_sema_probe_local_names = hashmap_i64_with_cap(65536)
+    g_sema_probe_bk = hashmap_i64_with_cap(65536)
 
 pub fn sema_probe_on() -> i32
     g_sema_probe_on
@@ -64,6 +74,7 @@ pub fn sema_probe_record(sm: *Sema, e: *Expr)
     let t: *SemaTy = malloc(sizeof(SemaTy)) as *SemaTy
     sema_expr_ty(sm, e, t)
     hashmap_i64_insert(@&g_sema_probe_map, e as i64, t as i64)
+    hashmap_i64_insert(@&g_sema_probe_bk, e as i64, sema_bool_kind(sm, e) as i64 + 100)
     if g_sema_probe_on == 2
         sema_probe_dump(e, t)
     if e.kind == EXPR_CALL and e.func_name_len > 0 and sema_is_local(sm, e.func_name, e.func_name_len) == 1
@@ -91,6 +102,10 @@ fn sema_probe_dump(e: *Expr, t: *SemaTy)
 fn sema_probe_mismatch(e: *Expr, rule: *u8, sema_k: i32, emit_k: i32)
     g_sema_probe_mismatched = g_sema_probe_mismatched + 1
     eprints_cstr(c"sema-probe: mismatch ")
+    sema_probe_note(e, rule, sema_k, emit_k)
+
+# `<rule> at <file>:<line>:<col> expr kind <k>: sema <s>, emitter <e>`.
+fn sema_probe_note(e: *Expr, rule: *u8, sema_k: i32, emit_k: i32)
     eprints_cstr(rule)
     eprints_cstr(c" at ")
     eprints_cstr(fn_source_file(emitter_current_fn()))
@@ -118,6 +133,15 @@ pub fn sema_probe_expr(s: *EmitterState, e: *Expr)
     let t: *SemaTy = hashmap_i64_get(@g_sema_probe_map, e as i64) as *SemaTy
     if t == null
         return
+    let sbk: i32 = (hashmap_i64_get(@g_sema_probe_bk, e as i64) - 100) as i32
+    let ebk: i32 = bool_kind(s, e)
+    if sbk != ebk
+        if sbk != BK_UNSURE and ebk != BK_UNSURE
+            sema_probe_mismatch(e, c"bk", sbk, ebk)
+            return
+        g_sema_probe_bk_gap = g_sema_probe_bk_gap + 1
+        eprints_cstr(c"sema-probe: ")
+        sema_probe_note(e, c"bk-gap", sbk, ebk)
     if t.kind == TYPE_UNKNOWN
         g_sema_probe_unknown = g_sema_probe_unknown + 1
         let gk: i32 = bool_kind(s, e)
@@ -130,7 +154,8 @@ pub fn sema_probe_expr(s: *EmitterState, e: *Expr)
         if ek != t.kind
             let int_default: i32 = (sema_is_int_kind(t.kind) == 1 and not hashmap_i64_contains(@g_sema_probe_local_names, e as i64)) as i32
             let ref_field: i32 = (e.kind == EXPR_MEMBER and ek == TYPE_PTR and (t.kind == TYPE_REF or t.kind == TYPE_MUT_REF)) as i32
-            if ref_field == 1 or (ek == TYPE_I64 and (int_default == 1 or sema_probe_local_call(e)))
+            let struct_lit: i32 = (e.kind == EXPR_STRUCT_LIT and ek == TYPE_I64) as i32
+            if ref_field == 1 or struct_lit == 1 or (ek == TYPE_I64 and (int_default == 1 or sema_probe_local_call(e)))
                 g_sema_probe_lenient = g_sema_probe_lenient + 1
             else
                 sema_probe_mismatch(e, c"type", t.kind, ek)
@@ -154,4 +179,6 @@ pub fn sema_probe_report()
     eprint_int(g_sema_probe_unknown)
     eprints_cstr(c" unknown, ")
     eprint_int(g_sema_probe_bool_gap)
-    eprints_cstr(c" bool-gap\n")
+    eprints_cstr(c" bool-gap, ")
+    eprint_int(g_sema_probe_bk_gap)
+    eprints_cstr(c" bk-gap\n")

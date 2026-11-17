@@ -12,8 +12,9 @@ both compilers, are test_must_use.py).
 THE TESTS
 
 - An error on Sema stops the compile before emission: an emitter-side error
-  later in the same file (an integer `if` condition, bool_check) is no longer
-  printed.  Before the move both were.
+  later in the same file (a write to a `let`, let_check) is no longer
+  printed.  Before the move both were.  (It was an integer `if` condition
+  until bool_check moved onto Sema too, AGAST #3502.)
 - One program pins the move's reach to the emitter's, location by location:
   every block kind that reported before still does, an impl method and each
   generic instance included, and what didn't (a match / if-expression arm's
@@ -58,8 +59,7 @@ STOPS_BEFORE_EMIT = CHECK + """\
 fn main() -> i32
     let n: i32 = 1
     check(n)
-    if n
-        return 2
+    n = 2
     0
 """
 

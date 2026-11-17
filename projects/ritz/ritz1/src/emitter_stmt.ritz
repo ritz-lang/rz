@@ -26,6 +26,7 @@ import enum_as_int        # enum_as_int_stmt (AGAST #2136)
 import ownership          # move check + drops (AGAST #2158)
 import ref_check          # ref_view (AGAST #2338)
 import bool_check   # AGAST #2342
+import bool_kind
 import literal_slot # AGAST #2341
 import float_slot   # pointer_into_float (AGAST #3626)
 import emitter_asm   # emit_asm_block (AGAST #3395)
@@ -1240,13 +1241,11 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     if stmt.var_init != null
         init_kind = bool_kind(s, stmt.var_init)
         if stmt.var_declared_type != TYPE_VOID
-            bool_check_slot(s, stmt.var_init, stmt.var_declared_type, stmt.var_type_name, stmt.var_type_name_len)
             # AGAST #3626: an if / match init is refused at its pointer arm,
             # by match_arm_float_settle, not here at the `if`.
             let ik: i32 = stmt.var_init.kind
             if (stmt.var_declared_type == TYPE_F64 or stmt.var_declared_type == TYPE_F32) and ik != EXPR_IF and ik != EXPR_MATCH
                 pointer_into_float(s, stmt.var_init)
-            bool_check_array_lit(s, stmt.var_init, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len)
             literal_slot(s, stmt.var_init, stmt.var_declared_type, stmt.var_pointee_type)   # AGAST #2341
             literal_view(s, stmt.var_init, stmt.var_declared_type, stmt.var_type_name, stmt.var_type_name_len)   # AGAST #3440
             if stmt.var_declared_type == TYPE_ARRAY
@@ -3342,7 +3341,6 @@ pub fn set_match_agg_hint(s: *EmitterState, ret_type: i32)
 
 fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     if stmt.return_value != null
-        bool_check_slot(s, stmt.return_value, ret_type, s.ret_type_name, s.ret_type_name_len)
         literal_slot(s, stmt.return_value, ret_type, literal_ret_pointee(s.ret_type_name, s.ret_type_name_len))   # AGAST #2341
         literal_view(s, stmt.return_value, ret_type, s.ret_type_name, s.ret_type_name_len)   # AGAST #3440
         if return_check_another_struct(s, stmt.return_value, ret_type, stmt.span.line, stmt.span.col) == 1
@@ -5326,8 +5324,7 @@ fn emit_nd_array_init_into(s: *EmitterState, sh: *ArrayShape, d: i32, ptr: i32, 
     if d == sh.rank - 1
         # The leaf slot checks emit_var_decl runs on a 1-D initialiser, which
         # see only rows of `[N][M]T`: `300` into a u8, a `"A"` into a `*u8`
-        # (the literal's own `@.str`, #2357), a bool (#2342).
-        bool_check_array_lit(s, e, sh.leaf_type, sh.leaf_name, sh.leaf_name_len)
+        # (the literal's own `@.str`, #2357).  A bool is Sema's (#3502).
         literal_array(s, e, sh.leaf_type, sh.leaf_pointee)
         if e.kind == EXPR_ARRAY_LIT
             emit_array_lit_into(s, ptr, sh.dims[d], sh.leaf_type, sh.leaf_name, sh.leaf_name_len, e)
@@ -5481,7 +5478,6 @@ fn emit_array_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32
     let else_arm: *MatchArm = then_arm.next
     if_arm_check_value(s, then_arm)
     if_arm_check_value(s, else_arm)
-    bool_check_cond(s, value.left, c"if condition")
     let cond: i32 = emit_expr(s, value.left)
     var cond_i1: i32 = cond
     if bool_reg_is_i1(s, value.left) == 0
@@ -5554,7 +5550,6 @@ fn if_array_shape(s: *EmitterState, e: *Expr, out: *ArraySrc, pointee: *i32) -> 
 # tail of a `-> [N]T` fn: as emit_array_if_into, with each block's last
 # statement its value.  A nested `if` / `else` there is a value too.
 pub fn emit_array_stmt_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, st: *Stmt)
-    bool_check_cond(s, st.if_cond, c"if condition")
     let cond: i32 = emit_expr(s, st.if_cond)
     var cond_i1: i32 = cond
     if bool_reg_is_i1(s, st.if_cond) == 0
@@ -6043,7 +6038,6 @@ fn for_range_unsigned(s: *EmitterState, stmt: *Stmt) -> i32
 fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     # AGAST #2028: reject writes / `@&` into a `let` before emitting them.
     let_check_stmt(s, stmt)
-    bool_check_stmt(s, stmt)   # AGAST #2342
     literal_stmt(s, stmt)      # AGAST #2341
     # AGAST #2136: an enum value where an integer is expected.
     enum_as_int_stmt(s, stmt, ret_type)
@@ -6085,7 +6079,6 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_assert_stmt(s, stmt)
     else if stmt.kind == STMT_IF
         let discarded: i32 = if_stmt_is_discarded(s, stmt)   # AGAST #3749
-        bool_check_cond(s, stmt.if_cond, c"if condition")
         let cond: i32 = emit_expr(s, stmt.if_cond)
         # If the condition register is already an i1, use it directly in the
         # br — otherwise coerce i64 -> i1 via `icmp ne ..., 0`.  Without the
@@ -6284,7 +6277,6 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_str(s, c"\n")
 
         begin_block(s, cond_label)
-        bool_check_cond(s, stmt.while_cond, c"while condition")
         let cond: i32 = emit_expr(s, stmt.while_cond)
         # Same i1/i64 handling as STMT_IF — skip the icmp only when the
         # register genuinely is an i1.  `while f()` on a bool-returning f hit

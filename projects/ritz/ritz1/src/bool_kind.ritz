@@ -1,0 +1,322 @@
+# bool_kind.ritz - the emitter's bool kind of an expression (LARB R4, AGAST #2342)
+#
+# What an expression is, as far as `bool` cares (BK_*, bool_check.ritz), read
+# off the emitter's own state mid-lowering: its LocalVar scope, get_expr_type
+# and the receiver resolution the lowering uses.  Codegen reads it (a bool
+# local's i1 store, print's `true` / `false`, a match scrutinee's binding) and
+# so do the checks still on the emitter (call_check, float_slot,
+# literal_slot).  ritz1 can't read a bool off the LLVM type as ritz0 does: a
+# bool value lives in an i64 register (#1646).
+#
+# bool_check's own rules run on Sema (AGAST #3502, #1816) and judge with
+# sema_bool_kind, its port of this onto Sema's scope.  sema_probe.ritz pins the
+# two together on every expression the emitter lowers (RITZ1_SEMA_PROBE=1).
+# This copy goes when the emitter reads types off Sema (#3514).
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import ast_helpers
+import emitter_core
+import emitter_expr_call   # method_callee_def, ufcs_fn_def
+import index_through       # through_named_elem (AGAST #2440)
+import bool_check          # BK_*, bk_of_type, bk_tagged_payload
+
+fn bk_name(s: *EmitterState, name: *u8, len: i32) -> i32
+    let ce: *ConstEntry = find_const_entry(s, name, len)
+    if ce != null
+        return bk_of_type(ce.const_type, ce.type_name, ce.type_name_len)
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        if loc.is_bool == 1
+            return BK_BOOL
+        if loc.bk_unsure == 1
+            return BK_UNSURE
+        return bk_of_type(loc.var_type, loc.type_name, loc.type_name_len)
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g != null
+        return bk_of_type(g.var_type, g.type_name, g.type_name_len)
+    if find_fn(s, name, len) != null
+        return BK_PTR
+    BK_UNSURE
+
+# What `name[i]` is, for a local or global `name`.
+pub fn bk_element(s: *EmitterState, name: *u8, len: i32) -> i32
+    # AGAST #2440: through a pointer or reference, the buffer's element.
+    let through: i32 = through_named_elem(s, name, len)
+    if through != TYPE_VOID
+        return bk_of_type(through, null, 0)
+    let idx: i32 = find_local_idx(s, name, len)
+    if idx >= 0
+        let loc: *LocalVar = local_at(s, idx)
+        if loc.var_type == TYPE_ARRAY
+            return bk_of_type(loc.array_elem_type, loc.type_name, loc.type_name_len)
+        if loc.var_type == TYPE_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+            # `p: *[N]T` indexes T (#2321), not the array.
+            if loc.pointee_type == TYPE_ARRAY
+                return bk_of_type(loc.pointee_array_elem_type, loc.type_name, loc.type_name_len)
+            return bk_of_type(loc.pointee_type, loc.type_name, loc.type_name_len)
+        return BK_UNSURE
+    let g: *GlobalVarDef = find_global(s, name, len)
+    if g == null
+        return BK_UNSURE
+    if g.var_type == TYPE_ARRAY
+        return bk_of_type(g.array_elem_type, g.type_name, g.type_name_len)
+    if g.var_type == TYPE_PTR
+        return bk_of_type(g.pointee_type, g.type_name, g.type_name_len)
+    BK_UNSURE
+
+fn bk_index(s: *EmitterState, e: *Expr) -> i32
+    if e.right != null and e.right.kind == EXPR_RANGE
+        return BK_PTR
+    # AGAST #2768: a full-rank `x[i][j]` over an N-D `[N][M]T` (local, global
+    # or field) is its leaf T.  Its base is an index, not a name, so it fell to
+    # get_expr_type's i64 and `x[1][1] = true` was "cannot use bool as an
+    # integer".
+    var nd_depth: i32 = 0
+    let nd_sh: *ArrayShape = nd_index_shape(s, e, @nd_depth)
+    if nd_sh != null and nd_depth == nd_sh.rank
+        return bk_of_type(nd_sh.leaf_type, nd_sh.leaf_name, nd_sh.leaf_name_len)
+    let base: *Expr = e.left
+    if base.kind == EXPR_IDENT
+        let k: i32 = bk_element(s, base.ident_ptr, base.ident_len)
+        if k != BK_UNSURE
+            return k
+    else if base.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, base)
+        if f != null
+            if f.field_type == TYPE_ARRAY
+                return bk_of_type(f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+            if f.field_type == TYPE_PTR and get_member_pointee_type_exact(s, base) == TYPE_BOOL
+                return BK_BOOL
+    bk_of_type(get_expr_type(s, e), null, 0)
+
+# The first arm with a value: a `return` arm has none, and ritz0's phi skips it.
+fn bk_arms(s: *EmitterState, arms: *MatchArm) -> i32
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 0 and arm.body != null
+            let k: i32 = bool_kind(s, arm.body)
+            if k != BK_UNSURE
+                return k
+        arm = arm.next
+    BK_UNSURE
+
+# What `e?` or `e.unwrap()` gives, for `e` an Option or Result.
+fn bk_payload_of(s: *EmitterState, e: *Expr) -> i32
+    var name: *u8 = null
+    var len: i32 = 0
+    bk_receiver(s, e, @name, @len)
+    if name == null or len <= 0 or is_tagged_enum_type(name, len) == 0
+        return BK_UNSURE
+    bk_tagged_payload(name, len, 0)
+
+# The fn a method call dispatches to, or null.
+pub fn bk_method_def(s: *EmitterState, e: *Expr) -> *FnDef
+    var tn_len: i32 = 0
+    let tn: *u8 = bk_method_recv(s, e, @tn_len)
+    if tn == null
+        return null
+    method_callee_def(s, tn, tn_len, e.ident_ptr, e.ident_len)
+
+# The type name method call `e` dispatches on, or null.
+fn bk_method_recv(s: *EmitterState, e: *Expr, out_len: *i32) -> *u8
+    var tn_len: i32 = 0
+    var tn: *u8 = method_recv_type_name(s, e, @tn_len)
+    if tn == null or tn_len == 0
+        bk_receiver(s, e.left, @tn, @tn_len)
+    if tn == null or tn_len == 0
+        return null
+    *out_len = tn_len
+    tn
+
+fn bk_method(s: *EmitterState, e: *Expr) -> i32
+    if name_eq(e.ident_ptr, e.ident_len, c"is_some", 7) == 1 or name_eq(e.ident_ptr, e.ident_len, c"is_none", 7) == 1
+        return BK_BOOL
+    if name_eq(e.ident_ptr, e.ident_len, c"is_ok", 5) == 1 or name_eq(e.ident_ptr, e.ident_len, c"is_err", 6) == 1
+        return BK_BOOL
+    # The carrier's own methods hand back its payload.
+    if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1 or name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9) == 1 or name_eq(e.ident_ptr, e.ident_len, c"expect", 6) == 1
+        let pk: i32 = bk_payload_of(s, e.left)
+        if pk != BK_UNSURE
+            return pk
+    let fd: *FnDef = bk_method_def(s, e)
+    if fd == null
+        return BK_UNSURE
+    bk_of_fn(fd)
+
+fn bk_call(s: *EmitterState, e: *Expr) -> i32
+    # A call through a local: its signature, not a fn of that name.
+    if e.func_name_len > 0
+        let idx: i32 = find_local_idx(s, e.func_name, e.func_name_len)
+        if idx >= 0
+            let loc: *LocalVar = local_at(s, idx)
+            if loc.fn_sig != null
+                return bk_of_fn(loc.fn_sig)
+            return BK_UNSURE
+    if mem_builtin_id(e.func_name, e.func_name_len) != 0
+        return bk_of_type(get_expr_type(s, e), null, 0)
+    let fd: *FnDef = find_call_fn(s, e)
+    if fd == null
+        return BK_UNSURE
+    bk_of_fn(fd)
+
+# The struct `e` is, or points at, for the receiver forms member_field_def
+# leaves out: `(*p).f`, `a[i].f`, `(x as *S).f`.
+fn bk_receiver(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF
+        bk_receiver(s, e.operand, out_name, out_len)
+    else if e.kind == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB)
+        bk_receiver(s, e.left, out_name, out_len)
+    else if e.kind == EXPR_INDEX
+        bk_receiver(s, e.left, out_name, out_len)
+    else if e.kind == EXPR_CAST and e.ident_len > 0
+        *out_name = e.ident_ptr
+        *out_len = e.ident_len
+    else if e.kind == EXPR_IDENT
+        let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
+        if idx >= 0
+            let loc: *LocalVar = local_at(s, idx)
+            *out_name = loc.type_name
+            *out_len = loc.type_name_len
+        else
+            let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+            if g != null
+                *out_name = g.type_name
+                *out_len = g.type_name_len
+    else if e.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, e)
+        if f != null
+            if f.field_type == TYPE_ARRAY
+                *out_name = f.array_elem_type_name
+                *out_len = f.array_elem_type_name_len
+            else
+                *out_name = f.field_type_name
+                *out_len = f.field_type_name_len
+    else
+        resolve_expr_struct_name(s, e, out_name, out_len)
+
+fn bk_member(s: *EmitterState, e: *Expr) -> i32
+    var f: *StructField = member_field_def(s, e)
+    # `colors.ON`: a const reached through its module.
+    if f == null and e.left.kind == EXPR_IDENT and find_local_idx(s, e.left.ident_ptr, e.left.ident_len) < 0
+        let ce: *ConstEntry = find_const_entry(s, e.ident_ptr, e.ident_len)
+        if ce != null
+            return bk_of_type(ce.const_type, ce.type_name, ce.type_name_len)
+    if f == null
+        var name: *u8 = null
+        var len: i32 = 0
+        bk_receiver(s, e.left, @name, @len)
+        if name == null or len <= 0
+            return BK_UNSURE
+        let st: *StructDef = find_struct(s, name, len)
+        if st == null
+            return BK_UNSURE
+        let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+        if idx < 0
+            return BK_UNSURE
+        f = get_field_type(st, idx)
+    bk_of_type(f.field_type, f.field_type_name, f.field_type_name_len)
+
+# What `e` is, or BK_UNSURE.  See the header.
+pub fn bool_kind(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return BK_UNSURE
+    let k: i32 = e.kind
+    if k == EXPR_INT_LIT
+        if e.lit_kind == LIT_TRUE or e.lit_kind == LIT_FALSE
+            return BK_BOOL
+        if e.lit_kind == LIT_PASS
+            return BK_UNSURE
+        return BK_INT
+    if k == EXPR_CHAR_LIT
+        return BK_INT
+    if k == EXPR_FLOAT_LIT
+        return BK_FLOAT
+    if k == EXPR_CSTRING_LIT or k == EXPR_NIL_LIT
+        return BK_PTR
+    if k == EXPR_STRING_LIT or k == EXPR_STRUCT_LIT or k == EXPR_ARRAY_LIT or k == EXPR_ARRAY_FILL
+        return BK_OTHER
+    if k == EXPR_IDENT
+        return bk_name(s, e.ident_ptr, e.ident_len)
+    if k == EXPR_BINARY
+        if e.op >= OP_EQ and e.op <= OP_OR
+            return BK_BOOL
+        let l: i32 = bool_kind(s, e.left)
+        let r: i32 = bool_kind(s, e.right)
+        if l == BK_BOOL or r == BK_BOOL
+            return BK_BAD
+        if e.op >= OP_BIT_AND and e.op <= OP_SHR
+            return BK_INT
+        return bk_arithmetic(l, r)
+    if k == EXPR_UNARY
+        if e.op == OP_NOT
+            return BK_BOOL
+        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+            return BK_PTR
+        if e.op == OP_NEG or e.op == OP_BIT_NOT
+            let o: i32 = bool_kind(s, e.operand)
+            if o == BK_BOOL
+                return BK_BAD
+            return o
+        # AGAST #2972: `*h` of an integer or `bool` borrow `h:& T` is `h`.
+        if e.op == OP_DEREF and lent_scalar_ident(s, e.operand) != null
+            return bool_kind(s, e.operand)
+        return bk_of_type(get_expr_type(s, e), null, 0)
+    if k == EXPR_CAST
+        return bk_of_type(e.op, e.ident_ptr, e.ident_len)
+    if k == EXPR_MEMBER
+        return bk_member(s, e)
+    if k == EXPR_INDEX
+        return bk_index(s, e)
+    if k == EXPR_CALL
+        return bk_call(s, e)
+    if k == EXPR_METHOD
+        return bk_method(s, e)
+    if k == EXPR_IF or k == EXPR_MATCH
+        return bk_arms(s, e.args as *MatchArm)
+    if k == EXPR_TRY
+        return bk_payload_of(s, e.left)
+    BK_UNSURE
+
+# `path:line:col: error: ` for the expression's leftmost token, for the checks
+# still on the emitter (literal_slot, float_slot).  The same place can be
+# emitted twice: say it once.
+pub fn bool_report_at(s: *EmitterState, e: *Expr) -> i32
+    bool_report_span(s, e.span.line, e.span.col)
+
+fn bool_report_span(s: *EmitterState, line: i32, col: i32) -> i32
+    if s.bool_err_line == line and s.bool_err_col == col
+        return 0
+    s.bool_err_line = line
+    s.bool_err_col = col
+    s.error_count = s.error_count + 1
+    emit_str(s, c"  ; ERROR: bool used as something else\n")
+    eprints_cstr(fn_source_file(emitter_current_fn()))
+    eprint_char(':')
+    eprint_i64(line as i64)
+    eprint_char(':')
+    eprint_i64(col as i64)
+    eprints_cstr(c": error: ")
+    1
+
+# The local just added is a pattern's binding, of kind `k`.  Its slot is an i64
+# whatever the value is, so TYPE_I64 says nothing.
+pub fn bool_note_binding(s: *EmitterState, k: i32)
+    let loc: *LocalVar = local_at(s, s.local_count - 1)
+    loc.is_bool = (k == BK_BOOL) as i32
+    loc.bk_unsure = (k != BK_BOOL and k != BK_INT) as i32
+
+# 1 when `fd`, method call `e`'s callee, is the UFCS helper it dispatches to.
+pub fn bk_method_is_ufcs(s: *EmitterState, e: *Expr, fd: *FnDef) -> i32
+    var tn_len: i32 = 0
+    let tn: *u8 = bk_method_recv(s, e, @tn_len)
+    if tn == null
+        return 0
+    if ufcs_fn_def(s, tn, tn_len, e.ident_ptr, e.ident_len) == fd
+        return 1
+    0
