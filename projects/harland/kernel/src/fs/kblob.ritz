@@ -16,8 +16,14 @@ pub const BLOB_ID_SIZE: i32 = 32
 pub struct KBlobId
     hash: [32]u8
 
-# Initial capacity for blob store (256 to handle large initramfs)
-const INITIAL_CAPACITY: i32 = 256
+# Initial capacity for blob store. Every file write also stores a fresh
+# snapshot of each directory on its path, so initramfs loading needs several
+# slots per file; the store grows (store_grow) past this when it fills.
+const INITIAL_CAPACITY: i32 = 4096
+
+# Bytes allocated per entry: KBlobEntry is 56 bytes (32 hash + 8 ptr +
+# 8 size + 1 bool + 7 padding), rounded up to 64 for alignment.
+const ENTRY_SIZE: u64 = 64
 
 # A stored blob entry
 struct KBlobEntry
@@ -85,11 +91,7 @@ pub fn kblob_id_compute(data: *u8, len: u64) -> KBlobId
 
 # Create a new empty kernel blob store
 pub fn kblob_store_new() -> KBlobStore
-    # Allocate entry array
-    # KBlobEntry is 56 bytes (32 hash + 8 ptr + 8 size + 1 bool + 7 padding)
-    # We allocate 64 bytes per entry to ensure alignment
-    let entry_size: u64 = 64
-    let alloc_size: u64 = entry_size * INITIAL_CAPACITY as u64
+    let alloc_size: u64 = ENTRY_SIZE * INITIAL_CAPACITY as u64
 
     let entries: *KBlobEntry = kalloc(alloc_size) as *KBlobEntry
 
@@ -125,6 +127,38 @@ fn store_find(store: *KBlobStore, id: *KBlobId) -> *KBlobEntry
             return entry
         i = i + 1
     0 as *KBlobEntry
+
+# Double the entry array when every slot is used, keeping all entries (and
+# their slot order). Returns 0, or -1 if the larger array can't be allocated
+# (the store is unchanged).
+fn store_grow(store: *KBlobStore) -> i32
+    let old_capacity: i32 = (*store).capacity
+    var new_capacity: i32 = old_capacity * 2
+    if new_capacity < INITIAL_CAPACITY
+        new_capacity = INITIAL_CAPACITY
+
+    let new_entries: *KBlobEntry = kalloc(ENTRY_SIZE * new_capacity as u64) as *KBlobEntry
+    if new_entries == 0 as *KBlobEntry
+        return -1
+
+    var i: i32 = 0
+    while i < new_capacity
+        let dst: *KBlobEntry = new_entries + i
+        (*dst).used = false
+        if i < old_capacity
+            let src: *KBlobEntry = (*store).entries + i
+            if (*src).used
+                (*dst).id = kblob_id_copy(@(*src).id)
+                (*dst).data = (*src).data
+                (*dst).size = (*src).size
+                (*dst).used = true
+        i = i + 1
+
+    if (*store).entries != 0 as *KBlobEntry
+        kfree((*store).entries as *u8)
+    (*store).entries = new_entries
+    (*store).capacity = new_capacity
+    0
 
 # Check if a blob exists
 pub fn kblob_store_exists(store: *KBlobStore, id: *KBlobId) -> bool
@@ -165,10 +199,13 @@ pub fn kblob_store_put(store: *KBlobStore, data: *u8, size: u64) -> KBlobId
             break
         i = i + 1
 
-    # TODO: Grow array if no free slot
+    # Every slot is used: grow, and take the first new slot.
     if slot == 0 as *KBlobEntry
-        prints("kblob: store full\n" as StrView)
-        return kblob_id_zero()
+        let old_capacity: i32 = (*store).capacity
+        if store_grow(store) != 0
+            prints("kblob: store full (grow failed)\n" as StrView)
+            return kblob_id_zero()
+        slot = (*store).entries + old_capacity
 
     # Allocate storage for data copy
     let data_copy: *u8 = kalloc(size)
