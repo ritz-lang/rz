@@ -43,6 +43,11 @@ ROWS = {
     # AGAST #1318: an untyped binding takes the poll's i32.  Its None type kept
     # `v` out of go_Future while the constructor still set it: "Unknown field v".
     "untyped_let": ("    let v = await fetch(x)\n    v + 1\n", 8),
+    # AGAST #3821: only a let whose value IS the await binds its result.  One
+    # nested in the value took `v` as its result var, so the state stored the
+    # bare 7 in `v` and the `+ 1` was never evaluated.
+    "let_await_plus_one": ("    let v = (await fetch(x)) + 1\n    v\n", 8),
+    "typed_let_one_plus_await": ("    let v: i32 = 1 + await fetch(x)\n    v\n", 8),
 }
 
 
@@ -52,3 +57,21 @@ def test_ritz0_await_point_yields_its_value(tmp_path, name):
     body, want = ROWS[name]
     program = _FETCH + "async fn go(x: i32) -> i32\n" + body + "\n" + _MAIN
     assert _run("ritz0", None, tmp_path, name, program) == want
+
+
+# AGAST #3821: a let around an await runs once.  The body's own let runs in its
+# await's state; one in an arm runs in the final state, which re-walks the arm
+# (a second run answers 27).
+_BUMP = "var CALLS: i32 = 0\n\nfn bump() -> i32\n    CALLS = CALLS + 1\n    0\n\n"
+COUNTED = {
+    "top_level": "    let v: i32 = (await fetch(x)) + bump()\n    v + CALLS * 10\n",
+    "in_if_arm": "    if x > 0\n        let z: i32 = (await fetch(x)) + bump()\n"
+                 + "        z + CALLS * 10\n    else\n        0\n",
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(COUNTED))
+def test_ritz0_let_around_await_runs_once(tmp_path, name):
+    program = _BUMP + _FETCH + "async fn go(x: i32) -> i32\n" + COUNTED[name] + "\n" + _MAIN
+    assert _run("ritz0", None, tmp_path, name, program) == 17

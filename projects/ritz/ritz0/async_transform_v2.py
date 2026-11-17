@@ -63,6 +63,9 @@ class AwaitPoint:
     result_var: str              # Variable to store result (e.g., 'a' for 'let a = await ...')
     result_type: rast.Type       # Type of the result
     span: Optional[rast.Span] = None
+    # Top-level lets whose value this await completes (`let v = (await f(x))
+    # + 1`): its state evaluates them once the result is stored (AGAST #3821).
+    then_lets: List[rast.Stmt] = field(default_factory=list)
 
 
 @dataclass
@@ -108,6 +111,8 @@ class AsyncAnalyzer:
         self.current_locals: Dict[str, rast.Type] = {}
         self.await_index = 0
         self.current_let_target: Optional[Tuple[str, rast.Type]] = None
+        # ids of the async fn body's own statements (AGAST #3821).
+        self.top_level_stmts: Set[int] = set()
         # Declared fns by name, for an untyped `let y = f(x)` (AGAST #3762).
         self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs or {}
 
@@ -173,6 +178,7 @@ class AsyncAnalyzer:
 
         # Walk the function body
         if fn_def.body:
+            self.top_level_stmts = {id(s) for s in fn_def.body.stmts}
             self._analyze_block(fn_def.body)
 
         # With an await, every local is a field of the future, which needs its
@@ -215,11 +221,23 @@ class AsyncAnalyzer:
                 local_type = self._infer_type(stmt.value)
             if local_type is None:
                 self.untyped.append((stmt.name, stmt.span))
-            # Track the let target for await point association
-            self.current_let_target = (stmt.name, local_type)
+            # A let whose value IS the await binds the poll's result to its
+            # name.  An await nested in the value (`(await f(x)) + 1`) gets
+            # its own __await_result_N: binding `v` there stored the bare
+            # poll value and dropped the `+ 1` (AGAST #3821).
+            if isinstance(stmt.value, rast.Await):
+                self.current_let_target = (stmt.name, local_type)
+            first_point = len(self.await_points)
             if stmt.value:
                 self._analyze_expr(stmt.value)
             self.current_let_target = None
+            # The machine runs only the awaits of the body's own statements,
+            # so the state of the value's last await computes the rest.  A let
+            # in a nested block is re-run by the final state already.
+            if (not isinstance(stmt.value, rast.Await)
+                    and len(self.await_points) > first_point
+                    and id(stmt) in self.top_level_stmts):
+                self.await_points[-1].then_lets.append(stmt)
             self.current_locals[stmt.name] = local_type
         elif isinstance(stmt, rast.ExprStmt):
             self._analyze_expr(stmt.expr)
@@ -654,6 +672,11 @@ class TrueAsyncGenerator:
             value=self._make_ident(inner_result_var)
         )
         then_stmts.append(store_result)
+
+        # A let this await completes: `(*self).v = <value>`, its awaits read
+        # from their stored results (AGAST #3821).
+        for let in await_point.then_lets:
+            then_stmts.append(transformer._transform_stmt(let))
 
         # Advance state: (*self).__state = N + 1
         advance_state = rast.AssignStmt(
