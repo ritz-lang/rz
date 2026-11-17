@@ -2660,6 +2660,19 @@ class Parser:
         span = self._current().span
         self._expect(TokenType.TYPE)
         name = self._expect(TokenType.IDENT).value
+        if self._at(TokenType.LT):
+            # AGAST #3813: no generic aliases. Name the construct at the
+            # `<` instead of the bare "Expected EQ, got LT".
+            lt = self._current()
+            params = []
+            offset = 1
+            while self._peek_at(offset, TokenType.IDENT, TokenType.COMMA):
+                if self._peek_at(offset, TokenType.IDENT):
+                    params.append(self._peek(offset).value)
+                offset += 1
+            raise ParseError(
+                "generic type aliases are not supported: "
+                f"`type {name}<{', '.join(params)}>`", lt.span)
         self._expect(TokenType.EQ)
         target = self.parse_type()
         return rast.TypeAlias(span, name, target, is_pub=is_pub)
