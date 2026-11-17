@@ -74,14 +74,88 @@ class AsyncFnAnalysis:
     cross_await_locals: Set[str]      # locals that live across await points
 
 
+class UntypedAsyncLocal(Exception):
+    """An untyped local in an async fn whose type the transform cannot infer
+    (AGAST #3762).  Every local of an async fn that awaits lives in its future
+    struct, which needs the local's type before emission works it out; the
+    emitter reports this located, as an EmitError."""
+
+    def __init__(self, fn_name: str, local: str, span: Optional[rast.Span]):
+        self.span = span
+        super().__init__(
+            f"cannot infer the type of `{local}`, which `{fn_name}`'s future holds "
+            f"across an `await`: give `{local}` a type (`let {local}: T = ...`)")
+
+
+# Operators whose value is a bool, whatever their operands.
+_BOOL_BINOPS = frozenset(('==', '!=', '<', '<=', '>', '>=', '&&', '||', 'and', 'or'))
+_BOOL_UNOPS = frozenset(('!', 'not'))
+_INT_ARITH_OPS = frozenset(('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>'))
+
+
+def _untyped_int_literal(expr: rast.Expr) -> bool:
+    """`5` or `-5`: a literal that takes the other operand's type (LARB R21)."""
+    if isinstance(expr, rast.UnaryOp) and expr.op == '-':
+        expr = expr.operand
+    return isinstance(expr, rast.IntLit)
+
+
 class AsyncAnalyzer:
     """Analyzes an async function to find await points."""
 
-    def __init__(self):
+    def __init__(self, fn_sigs: Optional[Dict[str, rast.FnDef]] = None):
         self.await_points: List[AwaitPoint] = []
         self.current_locals: Dict[str, rast.Type] = {}
         self.await_index = 0
         self.current_let_target: Optional[Tuple[str, rast.Type]] = None
+        # Declared fns by name, for an untyped `let y = f(x)` (AGAST #3762).
+        self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs or {}
+
+    def _infer_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """The type of an untyped local's value, or None when it takes more
+        than the async fn's own signature, its locals and declared fns' return
+        types to tell (AGAST #3762).  Mirrors the emitter's inference for an
+        untyped `let` (`_infer_ritz_type`) on the forms it covers."""
+        span = getattr(expr, 'span', None)
+        if isinstance(expr, rast.IntLit):
+            return rast.NamedType(span, 'i64')
+        if isinstance(expr, rast.BoolLit):
+            return rast.NamedType(span, 'bool')
+        if isinstance(expr, rast.FloatLit):
+            return rast.NamedType(span, 'f64')
+        if isinstance(expr, rast.CharLit):
+            return rast.NamedType(span, 'u8')
+        if isinstance(expr, rast.Ident):
+            return self.current_locals.get(expr.name)
+        if isinstance(expr, rast.Await):
+            # The poll's value (AGAST #1318).
+            return rast.NamedType(span, 'i32')
+        if isinstance(expr, rast.Cast):
+            return expr.target
+        if isinstance(expr, rast.BinOp):
+            if expr.op in _BOOL_BINOPS:
+                return rast.NamedType(span, 'bool')
+            if expr.op not in _INT_ARITH_OPS:
+                return None
+            if (expr.op not in ('<<', '>>') and _untyped_int_literal(expr.left)
+                    and not _untyped_int_literal(expr.right)):
+                return self._infer_type(expr.right)
+            return self._infer_type(expr.left)
+        if isinstance(expr, rast.UnaryOp):
+            if expr.op in _BOOL_UNOPS:
+                return rast.NamedType(span, 'bool')
+            if expr.op in ('-', '~'):
+                return self._infer_type(expr.operand)
+            return None
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident) and not expr.type_args:
+            fn = self.fn_sigs.get(expr.func.name)
+            if fn is None or fn.type_params or expr.func.name in self.current_locals:
+                return None
+            if fn.is_async:
+                # A bare call is the fn's future (AGAST #1395).
+                return rast.NamedType(span, f"{fn.name}_Future")
+            return fn.ret_type
+        return None
 
     def analyze(self, fn_def: rast.FnDef) -> AsyncFnAnalysis:
         """Analyze an async function."""
@@ -91,6 +165,7 @@ class AsyncAnalyzer:
         self.await_points = []
         self.current_locals = {}
         self.await_index = 0
+        self.untyped: List[Tuple[str, Optional[rast.Span]]] = []
 
         # Add parameters as locals
         for param in fn_def.params:
@@ -99,6 +174,12 @@ class AsyncAnalyzer:
         # Walk the function body
         if fn_def.body:
             self._analyze_block(fn_def.body)
+
+        # With an await, every local is a field of the future, which needs its
+        # type (AGAST #3762).  Without one there is no future state to hold.
+        if self.await_points and self.untyped:
+            name, span = self.untyped[0]
+            raise UntypedAsyncLocal(fn_def.name, name, span)
 
         # Compute which locals live across await points
         cross_await = set()
@@ -124,12 +205,16 @@ class AsyncAnalyzer:
     def _analyze_stmt(self, stmt: rast.Stmt):
         """Analyze a statement."""
         if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
-            # An untyped binding of an await (`let v = await f(x)`) holds the
-            # poll's value, an i32 (AGAST #1318).  Left as None, `v` got no
-            # field in the future struct while the constructor still set it.
+            # An untyped binding takes its value's type: an await's is the
+            # poll's i32 (AGAST #1318), anything else's is inferred (#3762).
+            # Left as None, the local got no field in the future struct while
+            # the constructor still set it.  Inferred before the value is
+            # walked, so an await in it is not yet a local.
             local_type = stmt.type
-            if local_type is None and isinstance(stmt.value, rast.Await):
-                local_type = rast.NamedType(span=stmt.span, name='i32')
+            if local_type is None and stmt.value is not None:
+                local_type = self._infer_type(stmt.value)
+            if local_type is None:
+                self.untyped.append((stmt.name, stmt.span))
             # Track the let target for await point association
             self.current_let_target = (stmt.name, local_type)
             if stmt.value:
@@ -732,20 +817,25 @@ class SimpleBodyTransformer:
         return expr
 
 
-def analyze_async_function(fn_def: rast.FnDef) -> AsyncFnAnalysis:
+def analyze_async_function(fn_def: rast.FnDef,
+                           fn_sigs: Optional[Dict[str, rast.FnDef]] = None) -> AsyncFnAnalysis:
     """Convenience function to analyze an async function."""
-    analyzer = AsyncAnalyzer()
+    analyzer = AsyncAnalyzer(fn_sigs)
     return analyzer.analyze(fn_def)
 
 
-def generate_state_machine(fn_def: rast.FnDef, async_functions: Optional[Set[str]] = None) -> AsyncStateMachine:
+def generate_state_machine(fn_def: rast.FnDef, async_functions: Optional[Set[str]] = None,
+                           fn_sigs: Optional[Dict[str, rast.FnDef]] = None) -> AsyncStateMachine:
     """Generate a TRUE state machine for an async function.
 
     Args:
         fn_def: The async function definition to transform
         async_functions: Set of known async function names (for await transformation)
+        fn_sigs: Declared fns by name, to type an untyped `let y = f(x)` (AGAST #3762)
+
+    Raises UntypedAsyncLocal for an untyped local it cannot type.
     """
-    analysis = analyze_async_function(fn_def)
+    analysis = analyze_async_function(fn_def, fn_sigs)
     generator = TrueAsyncGenerator(analysis, async_functions)
     return generator.generate()
 

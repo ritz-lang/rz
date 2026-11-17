@@ -31,7 +31,7 @@ import binder_names
 import type_order
 import match_coverage
 from metadata import type_to_string
-from async_transform_v2 import generate_state_machine, AsyncStateMachine
+from async_transform_v2 import generate_state_machine, AsyncStateMachine, UntypedAsyncLocal
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
@@ -3210,13 +3210,16 @@ class LLVMEmitter:
                 if item.name == 'main':
                     has_async_main = True
 
+        # Declared fns, for the type of an untyped `let y = f(x)` (AGAST #3762).
+        fn_sigs = {item.name: item for item in module.items if isinstance(item, rast.FnDef)}
+
         # Second pass: transform async functions
         for item in module.items:
             if isinstance(item, rast.FnDef) and getattr(item, 'is_async', False):
                 # Transform this async function
                 try:
                     # Pass async_functions so await can recognize calls to async fns
-                    sm = generate_state_machine(item, self.async_functions)
+                    sm = generate_state_machine(item, self.async_functions, fn_sigs)
 
                     # AGAST #3726: the generated items belong to the async
                     # fn's own file.  Without its `source_file` an imported
@@ -3245,6 +3248,9 @@ class LLVMEmitter:
                         new_items.append(sm.constructor_fn)
                         new_items.append(sm.poll_fn)
 
+                except UntypedAsyncLocal as e:
+                    # A source error, located at the `let` (AGAST #3762).
+                    raise EmitError(str(e), e.span) from None
                 except Exception as e:
                     # Fall back to keeping original function if transformation fails
                     # This allows MVP to work while we develop the full transformation

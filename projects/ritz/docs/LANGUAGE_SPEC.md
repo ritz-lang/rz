@@ -5496,9 +5496,54 @@ fn main() -> i32
     r - 5
 ```
 
-Any other untyped local in an `async fn` that awaits (`let y = x + 1`, or
-`let v = (await fetch(x)) + 1`) currently fails to lower, with `Unknown field y
-in struct go_Future`.  Give such a local a type (AGAST #3762).
+Any other untyped local in an `async fn` that awaits also lives in its future,
+so its type is inferred from its value before the fn is lowered (AGAST #3762).
+The value may be a literal (an integer literal is `i64`, as for any untyped
+`let`), a parameter or earlier local, an operator over those (a comparison,
+`&&`, `||` or `!` is `bool`; arithmetic takes its left operand's type, or the
+right's when the left is a bare literal), a cast, an `await` (`i32`), a call to
+a declared non-generic fn (its return type), or a bare call to an `async fn`
+(its future):
+
+```ritz
+async fn fetch(x: i32) -> i32
+    x
+
+async fn go(x: i32) -> i32
+    let y = x + 1
+    let small = x as u8
+    let v: i32 = await fetch(y)
+    v + 1
+
+fn main() -> i32
+    let r: i32 = await go(4)
+    r - r
+```
+
+A value whose type needs more than that, such as a struct field or a method
+call, is refused at the `let`; give such a local a type:
+
+```ritz expect-error="cannot infer the type of `a`, which `go`'s future holds across an `await`: give `a` a type"
+struct Pair
+    a: i32
+    b: i32
+
+async fn fetch(x: i32) -> i32
+    x
+
+async fn go(p: Pair) -> i32
+    let a = p.a
+    let v: i32 = await fetch(a)
+    v
+
+fn main() -> i32
+    let r: i32 = await go(Pair { a: 1, b: 2 })
+    r - 1
+```
+
+ritz0 lowers an `async fn` that awaits to one state per `await` and a final
+state that evaluates the body's tail; a statement that is neither an `await`
+binding nor the tail is not yet run, typed or not (AGAST #3727).
 
 ### 16.3 Runtime
 
