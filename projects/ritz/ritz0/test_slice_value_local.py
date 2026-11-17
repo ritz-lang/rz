@@ -18,6 +18,11 @@ is `lo..hi + 1`.  A String has no `len` field (`t.data.len` is its length), so
 `t.len` is a located refusal, the same on all three.
 
 Through a pointer or reference it's #2448.
+
+AGAST #3889: one table (test_table_rows.py), as in test_slice_through_reference.py.
+Each row has the id its parametrised test had, less the compiler.  The fixtures
+and tables other files import (`run_with`, `compile_with`, `_string_objects`,
+BOXES, RANGES, WRITES_THROUGH) stay as they were.
 """
 
 import atexit
@@ -33,12 +38,14 @@ import batching
 import fast_link
 
 import test_ritz1_for_header as for_header
-from test_index_through_reference import HEADER, _refused
+import test_table_rows as table_rows
+from test_table_rows import Refused, Run, case
+from test_index_through_reference import HEADER
 from deref_rules import no_field
 
 compile_with = for_header.compile_with
 
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+RITZ1S = ("ritz1", "ritz1_selfhosted")
 
 # A String slice calls string_slice, which neither compiler emits into main.ll:
 # it's linked from ritzlib/string, as a program would, with what string needs.
@@ -105,99 +112,74 @@ def _main(setup: str, rng: str, body: str) -> str:
     return f"{HEADER}pub fn main() -> i32\n{setup}    let t = v[{rng}]\n{body}"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rng", sorted(RANGES))
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_the_first_element_of_a_slice(run_with, box, rng, compiler):
+@case(box=sorted(BOXES), rng=sorted(RANGES))
+def the_first_element_of_a_slice(box, rng):
     setup, _, _ = BOXES[box]
     spelled, _, _ = RANGES[rng]
-    assert run_with(compiler, "t0", _main(setup, spelled, "    return t[0] as i32\n")) == 20
+    return Run(_main(setup, spelled, "    return t[0] as i32\n"), 20)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rng", sorted(RANGES))
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_the_last_element_of_a_slice(run_with, box, rng, compiler):
+@case(box=sorted(BOXES), rng=sorted(RANGES))
+def the_last_element_of_a_slice(box, rng):
     setup, _, _ = BOXES[box]
     spelled, length, last = RANGES[rng]
-    body = f"    return t[{length - 1}] as i32\n"
-    assert run_with(compiler, "last", _main(setup, spelled, body)) == last
+    return Run(_main(setup, spelled, f"    return t[{length - 1}] as i32\n"), last)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rng", sorted(RANGES))
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_the_sum_of_a_slice(run_with, box, rng, compiler):
+@case(box=sorted(BOXES), rng=sorted(RANGES))
+def the_sum_of_a_slice(box, rng):
     setup, _, _ = BOXES[box]
     spelled, length, last = RANGES[rng]
     terms = " + ".join(f"t[{i}]" for i in range(length))
-    body = f"    return ({terms}) as i32\n"
-    assert run_with(compiler, "sum", _main(setup, spelled, body)) == sum(range(20, last + 1, 10))
+    return Run(_main(setup, spelled, f"    return ({terms}) as i32\n"), sum(range(20, last + 1, 10)))
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rng", sorted(RANGES))
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_the_length_of_a_slice(run_with, box, rng, compiler):
+@case(box=sorted(BOXES), rng=sorted(RANGES))
+def the_length_of_a_slice(box, rng):
     setup, _, length_of = BOXES[box]
     spelled, length, _ = RANGES[rng]
-    body = f"    return {length_of} as i32\n"
-    assert run_with(compiler, "len", _main(setup, spelled, body)) == length
+    return Run(_main(setup, spelled, f"    return {length_of} as i32\n"), length)
 
 
 # A String's length is `t.data.len`: `t.len` names no field, on all three.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rng", sorted(RANGES))
-def test_the_len_field_of_a_string_slice_is_refused(compile_with, rng, compiler):
+@case(rng=sorted(RANGES))
+def the_len_field_of_a_string_slice_is_refused(rng):
     setup, _, _ = BOXES["String"]
     spelled, _, _ = RANGES[rng]
-    program = _main(setup, spelled, "    return t.len as i32\n")
-    _refused(compile_with, compiler, "string_len", program,
-             no_field("String", "len"))  # §7.7 rule 5(a)
+    return Refused(_main(setup, spelled, "    return t.len as i32\n"),
+                   no_field("String", "len"))  # §7.7 rule 5(a)
 
 
 # `t[0] = 7` lands in t; in v too for a Span, a view, and not for a Vec or a String,
 # copies.  The `let` holds the header: the elements are behind its pointer.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rng", sorted(RANGES))
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_a_write_through_a_slice(run_with, box, rng, compiler):
+@case(box=sorted(BOXES), rng=sorted(RANGES))
+def a_write_through_a_slice(box, rng):
     setup, back, _ = BOXES[box]
     spelled, _, _ = RANGES[rng]
     body = f"    t[0] = 7\n    return (t[0] as i32) * 100 + {back}\n"
     want = 707 if WRITES_THROUGH[box] else 720
-    assert run_with(compiler, "write", _main(setup, spelled, body)) == want % 256
+    return Run(_main(setup, spelled, body), want % 256)
 
 
 # The slice leaves its neighbours alone: a write to t[1] doesn't reach v[1] or
 # v[3], or t[0].
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_a_write_to_a_slice_keeps_its_neighbours(run_with, box, compiler):
+@case(box=sorted(BOXES))
+def a_write_to_a_slice_keeps_its_neighbours(box):
     setup, back, _ = BOXES[box]
     last = back.replace("1", "3")
     body = f"    t[1] = 7\n    return (t[0] as i32) + {back} + {last}\n"
     # t[1] is v[2] in a view: v[1] and v[3] are untouched either way.
-    assert run_with(compiler, "neighbours", _main(setup, "1..3", body)) == 20 + 20 + 40
-
+    return Run(_main(setup, "1..3", body), 20 + 20 + 40)
 
 
 # A slice is a Vec, Span or String local like any other, so it slices again:
 # v[1..4] is 20, 30, 40 and its [1..=2] is 30, 40.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("box", sorted(BOXES))
-def test_a_slice_of_a_slice(run_with, box, compiler):
+@case(box=sorted(BOXES))
+def a_slice_of_a_slice(box):
     setup, _, length_of = BOXES[box]
     body = f"    let u = t[1..=2]\n    return (u[1] as i32) + {length_of.replace('t.', 'u.')} as i32\n"
-    assert run_with(compiler, "twice", _main(setup, "1..4", body)) == 42
+    return Run(_main(setup, "1..4", body), 42)
+
 
 # The local doesn't have to be declared with its type: a Span a plain function
 # returned, or a by-value Span parameter, slices the same way.
@@ -211,13 +193,10 @@ SHAPES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("shape", sorted(SHAPES))
-def test_a_span_slices_however_it_was_bound(run_with, shape, compiler):
+@case(shape=sorted(SHAPES))
+def a_span_slices_however_it_was_bound(shape):
     before, body = SHAPES[shape]
-    program = f"{HEADER}{before}pub fn main() -> i32\n{body}"
-    assert run_with(compiler, shape, program) == 32
+    return Run(f"{HEADER}{before}pub fn main() -> i32\n{body}", 32)
 
 
 # AGAST #2501: a Vec slice into a Span slot is a view of the Vec, not
@@ -233,48 +212,39 @@ def _into_span(rng: str, body: str, before: str = "") -> str:
             f"    let t: Span<i32> = v[{rng}]\n{body}")
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_vec_slice_into_a_span_reads_the_vec(run_with, compiler):
-    program = _into_span("1..3", "    return (t[1] + t.len) as i32\n")
-    assert run_with(compiler, "into_span", program) == 32
+@case()
+def a_vec_slice_into_a_span_reads_the_vec():
+    return Run(_into_span("1..3", "    return (t[1] + t.len) as i32\n"), 32)
 
 
 # A view, so a write through `t` lands in `v` (a copy's wouldn't: 720).
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_write_through_a_vec_slice_into_a_span_lands_in_the_vec(run_with, compiler):
+@case()
+def a_write_through_a_vec_slice_into_a_span_lands_in_the_vec():
     body = "    t[0] = 7\n    return (t[0] as i32) * 100 + *(v.data + 1)\n"
-    assert run_with(compiler, "into_span_write", _into_span("1..3", body)) == 707 % 256
+    return Run(_into_span("1..3", body), 707 % 256)
 
 
 # The Vec can be a by-value field: `b.data[1..3]` is the same view.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_vec_field_slice_into_a_span_reads_the_vec(run_with, compiler):
-    program = (f"{HEADER}struct B\n    data: Vec<i32>\n\npub fn main() -> i32\n{VEC_SETUP}"
+@case()
+def a_vec_field_slice_into_a_span_reads_the_vec():
+    return Run(f"{HEADER}struct B\n    data: Vec<i32>\n\npub fn main() -> i32\n{VEC_SETUP}"
                "    let b = B { data: v }\n    let t: Span<i32> = b.data[1..3]\n"
-               "    return (t[1] + t.len) as i32\n")
-    assert run_with(compiler, "field_into_span", program) == 32
+               "    return (t[1] + t.len) as i32\n", 32)
 
 
 # `lo` appears in both fields, and is evaluated once: idx() runs one time.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_call_in_the_low_bound_of_a_vec_view_runs_once(run_with, compiler):
+@case()
+def a_call_in_the_low_bound_of_a_vec_view_runs_once():
     body = "    return (t[0] + t.len * 10) as i32 + g_calls * 100\n"  # 20 + 2 * 10 + 1 * 100
-    program = _into_span("idx()..3", body, COUNTER)
-    assert run_with(compiler, "into_span_once", program) == (20 + 20 + 100) % 256
+    return Run(_into_span("idx()..3", body, COUNTER), (20 + 20 + 100) % 256)
 
 
 # A call inside the bound isn't the bound itself, so it can't be shared: ritz1
 # refuses rather than run it twice.  ritz0 emits the bound once and takes it.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_a_call_inside_the_low_bound_of_a_vec_view_is_refused_on_ritz1(compile_with, compiler):
-    program = _into_span("idx() + 0..3", "    return t.len as i32\n", COUNTER)
-    _refused(compile_with, compiler, "into_span_nested", program,
-             "this slice of a Vec, Span or String isn't lowered by ritz1")
+@case(compilers=RITZ1S)
+def a_call_inside_the_low_bound_of_a_vec_view_is_refused_on_ritz1():
+    return Refused(_into_span("idx() + 0..3", "    return t.len as i32\n", COUNTER),
+                   "this slice of a Vec, Span or String isn't lowered by ritz1")
 
 
 # AGAST #2877: the same view wherever a Span is expected, not only an annotated
@@ -305,48 +275,39 @@ INTO_SPAN_SITES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", sorted(INTO_SPAN_SITES))
-def test_a_vec_slice_where_a_span_is_expected_is_a_view(run_with, site, compiler):
+@case(site=sorted(INTO_SPAN_SITES))
+def a_vec_slice_where_a_span_is_expected_is_a_view(site):
     before, setup = INTO_SPAN_SITES[site]
     body = ("    t[0] = 7\n"
             "    let back: i32 = *(v.data + 1)\n"
             "    return (t[1] - 30 + t.len as i32 + back * 100 - 700) as i32\n")
-    program = f"{HEADER}{before}pub fn main() -> i32\n{VEC_SETUP}{setup}{body}"
     # t = [20, 30]: t[1] - 30 = 0, t.len = 2, back = 7 through a view.
-    assert run_with(compiler, f"into_span_{site}", program) == 2
+    return Run(f"{HEADER}{before}pub fn main() -> i32\n{VEC_SETUP}{setup}{body}", 2)
 
 
 # `lo` is in both of the view's fields; a call there runs once, as for a let.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_call_in_the_low_bound_of_a_returned_view_runs_once(run_with, compiler):
-    program = (f"{HEADER}{COUNTER}fn view(v:& Vec<i32>) -> Span<i32>\n    return v[idx()..3]\n\n"
+@case()
+def a_call_in_the_low_bound_of_a_returned_view_runs_once():
+    return Run(f"{HEADER}{COUNTER}fn view(v:& Vec<i32>) -> Span<i32>\n    return v[idx()..3]\n\n"
                f"pub fn main() -> i32\n{VEC_SETUP}    let t = view(@&v)\n"
-               "    return (t[0] + t.len * 10) as i32 + g_calls * 100\n")
-    assert run_with(compiler, "return_span_once", program) == (20 + 20 + 100) % 256
+               "    return (t[0] + t.len * 10) as i32 + g_calls * 100\n", (20 + 20 + 100) % 256)
 
 
 # A call inside the bound can't be shared: refused, located, not made a copy
 # (a Vec in the Span return slot, invalid IR).
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_a_call_inside_the_low_bound_of_a_returned_view_is_refused_on_ritz1(compile_with, compiler):
-    program = (f"{HEADER}{COUNTER}fn view(v:& Vec<i32>) -> Span<i32>\n    return v[idx() + 0..3]\n\n"
-               f"pub fn main() -> i32\n{VEC_SETUP}    return view(@&v).len as i32\n")
-    _refused(compile_with, compiler, "return_span_nested", program,
-             "this slice of a Vec, Span or String isn't lowered by ritz1")
+@case(compilers=RITZ1S)
+def a_call_inside_the_low_bound_of_a_returned_view_is_refused_on_ritz1():
+    return Refused(f"{HEADER}{COUNTER}fn view(v:& Vec<i32>) -> Span<i32>\n    return v[idx() + 0..3]\n\n"
+                   f"pub fn main() -> i32\n{VEC_SETUP}    return view(@&v).len as i32\n",
+                   "this slice of a Vec, Span or String isn't lowered by ritz1")
 
 
 # A struct that isn't one of the three has no slice.  ritz1 read it as an address.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_a_slice_of_another_struct_is_refused_on_ritz1(compile_with, compiler):
-    program = (f"{HEADER}pub fn main() -> i32\n    var v = S {{ x: 1, y: 2 }}\n"
-               "    let t = v[0..1]\n    return 0\n")
-    _refused(compile_with, compiler, "struct", program,
-             "a struct can't be sliced (only String, Vec and Span can)")
+@case(compilers=RITZ1S)
+def a_slice_of_another_struct_is_refused_on_ritz1():
+    return Refused(f"{HEADER}pub fn main() -> i32\n    var v = S {{ x: 1, y: 2 }}\n"
+                   "    let t = v[0..1]\n    return 0\n",
+                   "a struct can't be sliced (only String, Vec and Span can)")
 
 
 # A Span<u8> needs no import, and then there's no span_slice: ritz1 builds the
@@ -372,20 +333,33 @@ NO_IMPORT_ROWS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("row", sorted(NO_IMPORT_ROWS))
-def test_a_span_slice_needs_no_import(run_with, row, compiler):
+@case(row=sorted(NO_IMPORT_ROWS))
+def a_span_slice_needs_no_import(row):
     body, want = NO_IMPORT_ROWS[row]
-    assert run_with(compiler, row, NO_IMPORT.format(body=body)) == want % 256
+    return Run(NO_IMPORT.format(body=body), want % 256)
 
 
 # There `lo` is read twice, for the ptr and the len: a call is evaluated once
 # (AGAST #3126; ritz1 refused it).  Read twice, N is 2 and the len 1 or 2.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_call_in_the_bound_is_read_once(run_with, compiler):
+@case()
+def a_call_in_the_bound_is_read_once():
     program = "var N: i64 = 0\n\nfn bump() -> i64\n    N = N + 1\n    return N\n\n" + NO_IMPORT.format(
         body="    let t = v[bump()..3]\n    return (t[0] as i32) + (t.len * 10 + N) as i32\n")
     # t is [20, 30]: 20 + 2 * 10 + 1, and a[1] is 20.
-    assert run_with(compiler, "call", program) == (41 * 100 + 20) % 256
+    return Run(program, (41 * 100 + 20) % 256)
+
+
+TABLE = table_rows.cases(globals())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    # A String slice links ritzlib/string: `strings` is `run_with`'s.
+    def strings(compiler):
+        return _string_objects(compiler, ritz1_bin)
+
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=for_header.batch_build(ritz1_bin, strings),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

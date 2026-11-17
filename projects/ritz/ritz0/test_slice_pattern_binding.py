@@ -14,30 +14,21 @@ matches a helper's variant, as the arm's value, through a `let` in the arm and
 through a `return` in the arm, with the scrutinee a call and a local.
 
 ritz0 is the oracle: every expected status is what ritz0 returns.
+
+AGAST #3889: one table (test_table_rows.py), as in test_slice_through_reference.py.
+Each row has the id its parametrised test had, less the compiler.
 """
 
 import pytest
 
 import test_ritz1_for_header as for_header
 import test_slice_value_local as slice_local
+import test_table_rows as table_rows
+from test_table_rows import Run, case
 from test_index_through_reference import HEADER
-
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = pytest.mark.batched
-
-# #2451's fixtures: compile, link with gvec/span/string, run.
-compile_with = for_header.compile_with
-run_with = slice_local.run_with
-
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 # ritz0's monomorph types a pattern binding by its payload, per arm (#2725), so
 # a pattern-bound Vec's slice instantiates vec_slice<T> on every compiler.
-
-
-def _cells(boxes):
-    """(box, compiler) pairs."""
-    return [(b, c) for b in boxes for c in COMPILERS]
 
 # box -> (its type, how main makes `v` hold 10, 20, 30, 40, an empty one,
 #         t's length, t's element {k}).  A String's element is `t[{k}]` too:
@@ -107,25 +98,18 @@ def _program(box: str, ctor: str, scrutinee: str, position: str, rng: str) -> st
             f"pub fn main() -> i32\n{setup}{bind}{body}")
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("rng", sorted(RANGES))
-@pytest.mark.parametrize("position", sorted(POSITIONS))
-@pytest.mark.parametrize("scrutinee", sorted(SCRUTINEES))
-@pytest.mark.parametrize("ctor", sorted(CTORS))
-@pytest.mark.parametrize("box,compiler", _cells(sorted(BOXES)))
-def test_a_slice_of_a_pattern_binding(run_with, box, ctor, scrutinee, position, rng, compiler):
+@case(box=sorted(BOXES), ctor=sorted(CTORS), scrutinee=sorted(SCRUTINEES),
+      position=sorted(POSITIONS), rng=sorted(RANGES))
+def a_slice_of_a_pattern_binding(box, ctor, scrutinee, position, rng):
     """The slice of the payload: its length and its last element come back."""
     _, length, last = RANGES[rng]
-    program = _program(box, ctor, scrutinee, position, rng)
-    assert run_with(compiler, "pat", program) == length + last
+    return Run(_program(box, ctor, scrutinee, position, rng), length + last)
 
 
 # The slice used in place, never bound: `return x[1..3].len + x[1..3][1]`.
 # ritz1 typed no member of it until #2726 (test_slice_in_place_member.py).
-@pytest.mark.integration
-@pytest.mark.parametrize("ctor", sorted(CTORS))
-@pytest.mark.parametrize("box,compiler", _cells(("Span", "Vec")))
-def test_a_slice_of_a_pattern_binding_returned(run_with, box, ctor, compiler):
+@case(box=("Span", "Vec"), ctor=sorted(CTORS))
+def a_slice_of_a_pattern_binding_returned(box, ctor):
     ty, setup, _, _, _ = BOXES[box]
     ret, make, pat = CTORS[ctor]
     program = (f"{HEADER}enum Got\n    Hit({ty})\n    Miss\n\n"
@@ -135,7 +119,7 @@ def test_a_slice_of_a_pattern_binding_returned(run_with, box, ctor, compiler):
                f"        {pat}(x) =>\n"
                f"            return x[1..3].len as i32 + x[1..3][1] as i32\n"
                f"        _ => return 1\n")
-    assert run_with(compiler, "ret", program) == 32
+    return Run(program, 32)
 
 
 # Two arms bind the same name at different types: each slice is its own arm's.
@@ -149,11 +133,8 @@ SECOND = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("second", sorted(SECOND))
-@pytest.mark.parametrize("first", ["A", "B"])
-def test_a_binding_is_its_own_arms(run_with, first, second, compiler):
+@case(first=["A", "B"], second=sorted(SECOND))
+def a_binding_is_its_own_arms(first, second):
     program = (f"{HEADER}enum Two\n    A(Vec<i32>)\n    B({second})\n\n"
                f"fn pick(v: Vec<i32>, s: {second}, a: i32) -> Two\n"
                "    if a == 1\n        return A(v)\n    B(s)\n\n"
@@ -170,7 +151,7 @@ def test_a_binding_is_its_own_arms(run_with, first, second, compiler):
                "    v.push(10)\n    v.push(20)\n    v.push(30)\n    v.push(40)\n"
                f"{SECOND[second]}"
                f"    return len_of(pick(v, s, {1 if first == 'A' else 0}))\n")
-    assert run_with(compiler, "own", program) == (33 if first == "A" else 61)
+    return Run(program, 33 if first == "A" else 61)
 
 
 # The ticket's program, verbatim: `Some(x) => x[1..3]` over a `[4]u8`.
@@ -187,11 +168,9 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_the_tickets_program(run_with, compiler):
-    assert run_with(compiler, "ticket", TICKET) == 22
-
+@case()
+def the_tickets_program():
+    return Run(TICKET, 22)
 
 
 # Result's T is as many mangled components as its type takes (`Result$Span$u8$i32`
@@ -207,10 +186,8 @@ NESTED = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("nested", sorted(NESTED))
-def test_a_result_payload_after_a_nested_type(run_with, nested, compiler):
+@case(nested=sorted(NESTED))
+def a_result_payload_after_a_nested_type(nested):
     imports, ret, ctor, setup, arg = NESTED[nested]
     program = (f"{imports}fn wrap(s: Span<u8>) -> {ret}\n    {ctor}(s)\n\n"
                f"pub fn main() -> i32\n{setup}"
@@ -219,16 +196,14 @@ def test_a_result_payload_after_a_nested_type(run_with, nested, compiler):
                f"            let t = x[1..3]\n"
                f"            return t.len as i32 * 10 + t[1] as i32\n"
                f"        _ => return 1\n")
-    assert run_with(compiler, "nested", program) == 23
+    return Run(program, 23)
 
 
 # An open end, `x[1:]`: ritz0 takes the end from vec_len<T>, named by the same
 # element type as vec_slice<T> when the binding's Vec<T> is unmangled (#2725).
 # ritz0 only: `x[1:]` is ritz0's colon slice, which ritz1 doesn't parse.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0"])
-@pytest.mark.parametrize("ctor", sorted(CTORS))
-def test_an_open_ended_slice_of_a_pattern_binding(run_with, ctor, compiler):
+@case(compilers=("ritz0",), ctor=sorted(CTORS))
+def an_open_ended_slice_of_a_pattern_binding(ctor):
     ty, setup, _, _, _ = BOXES["Vec"]
     ret, make, pat = CTORS[ctor]
     program = (f"{HEADER}enum Got\n    Hit({ty})\n    Miss\n\n"
@@ -239,4 +214,20 @@ def test_an_open_ended_slice_of_a_pattern_binding(run_with, ctor, compiler):
                f"            let t = x[1:]\n"
                f"            return t.len as i32 + t[2] as i32\n"
                f"        _ => return 1\n")
-    assert run_with(compiler, "open", program) == 43
+    return Run(program, 43)
+
+
+TABLE = table_rows.cases(globals())
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    # #2451's build: link with gvec/span/string, as test_slice_value_local.py's `run_with`.
+    def strings(compiler):
+        return slice_local._string_objects(compiler, ritz1_bin)
+
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=for_header.batch_build(ritz1_bin, strings),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

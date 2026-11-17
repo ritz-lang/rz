@@ -11,21 +11,23 @@
    `let e: *E = ...` was right throughout.
 
 ritz0 is the oracle: every expected status is what ritz0 returns.
+
+The cases are rows of one table (test_table_rows.py, AGAST #3889), not a
+parametrised matrix.  Each row keeps the id its parametrised test had, less
+`test_` and the compiler: `test_an_inferred_scalar_pointer[i32-copy-store-ritz1]`
+is `an_inferred_scalar_pointer[i32-copy-store]` on ritz1.  `test_every_row`
+checks a chunk of rows per compiler, linked with gvec's allocator and
+ritzlib/string as #2451's `run_with` did, and names each row that fails.
 """
 
 import pytest
 
 import test_ritz1_for_header as for_header
 import test_slice_value_local as slice_local
+import test_table_rows as table_rows
+from test_table_rows import ALL, Refused, Row, Run
 
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = pytest.mark.batched
-
-# #2451's fixtures: compile, link with gvec/span/string, run.
-compile_with = for_header.compile_with
-run_with = slice_local.run_with
-
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+pytestmark = pytest.mark.integration
 
 STRING = "import ritzlib.gvec\nimport ritzlib.string\n\n"
 
@@ -62,14 +64,10 @@ HELPERS = (
 )
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(STATICS))
-def test_a_static_call_on_string(run_with, name, compiler):
+def _static(name):
     """`String.m(args)` with no impl method is `string_m(args)`."""
     body, want = STATICS[name]
-    program = f"{STRING}{HELPERS}pub fn main() -> i32\n{body}"
-    assert run_with(compiler, name, program) == want
+    return Run(f"{STRING}{HELPERS}pub fn main() -> i32\n{body}", want)
 
 
 # Neither compiler has these: no `string_with_capacity`, and `Vec` is generic
@@ -84,34 +82,15 @@ REFUSED = {
                             "pub fn main() -> i32\n    f(5)\n"),
 }
 
+# A user type's own static method is called, not a UFCS free fn.
+USER_IMPL = (f"{STRING}struct W\n    n: i32\n\nimpl W\n    fn new() -> W\n        W {{ n: 11 }}\n\n"
+             "fn w_new() -> W\n    W { n: 99 }\n\n"
+             "pub fn main() -> i32\n    let w = W.new()\n    w.n\n")
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_a_static_call_with_no_fn_is_refused(compile_with, name, compiler):
-    program = f"{STRING}{REFUSED[name]}"
-    comp, ll, _ = compile_with(compiler, name, program)
-    assert comp.returncode != 0, f"{compiler} accepted {name}"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_user_impl_still_wins(run_with, compiler):
-    """A user type's own static method is called, not a UFCS free fn."""
-    program = (f"{STRING}struct W\n    n: i32\n\nimpl W\n    fn new() -> W\n        W {{ n: 11 }}\n\n"
-               "fn w_new() -> W\n    W { n: 99 }\n\n"
-               "pub fn main() -> i32\n    let w = W.new()\n    w.n\n")
-    assert run_with(compiler, "user_impl", program) == 11
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_impl_method_on_string_beats_the_ufcs_fn(run_with, compiler):
-    """`impl String { fn shout() }` is called over a free `string_shout()`."""
-    program = (f"{STRING}impl String\n    fn shout() -> i32\n        22\n\n"
+# `impl String { fn shout() }` is called over a free `string_shout()`.
+IMPL_STRING = (f"{STRING}impl String\n    fn shout() -> i32\n        22\n\n"
                "fn string_shout() -> i32\n    33\n\n"
                "pub fn main() -> i32\n    String.shout()\n")
-    assert run_with(compiler, "impl_string", program) == 22
 
 
 PTR_HEADER = (
@@ -184,25 +163,42 @@ def _scalar(ty: str, init: str, use: str) -> str:
     return f"{PTR_HEADER}pub fn main() -> i32\n{body}"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("use", sorted(SCALAR_USES))
-@pytest.mark.parametrize("init", sorted(SCALAR_INITS))
-@pytest.mark.parametrize("ty", SCALAR_TYPES)
-def test_an_inferred_scalar_pointer(run_with, ty, init, use, compiler):
-    """`let e = <*T> ± k` is a `*T`, exactly as if annotated."""
-    got = run_with(compiler, f"{ty}_{init}_{use}", _scalar(ty, init, use))
-    assert got == SCALAR_USES[use][1]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("use", sorted(USES))
-@pytest.mark.parametrize("init", sorted(INITS))
-def test_an_inferred_struct_pointer(run_with, init, use, compiler):
+def _struct(init, use):
     """`let e = <*E> ± k` (or a plain `*E` copy) is a `*E`, as if annotated."""
     init_expr, k = INITS[init]
     body, want = USES[use]
-    program = (f"{PTR_HEADER}pub fn main() -> i32\n{PTR_SETUP}    let e = {init_expr}\n"
-               f"{body.format(k=k)}")
-    assert run_with(compiler, f"{init}_{use}", program) == want(k)
+    return Run(f"{PTR_HEADER}pub fn main() -> i32\n{PTR_SETUP}    let e = {init_expr}\n"
+               f"{body.format(k=k)}", want(k))
+
+
+# ---- the rows: each id is its old test's, less `test_` and the compiler -------
+
+# Rows importing ritzlib.string chunk apart from those importing only gvec: a row
+# whose imports differ from its batch's is compiled alone as well (AGAST #2867).
+ON_STRING = [
+    *(Row(f"a_static_call_on_string[{name}]", ALL, _static(name)) for name in sorted(STATICS)),
+    # Any refusal will do, located or not, as before: the compile just mustn't succeed.
+    *(Row(f"a_static_call_with_no_fn_is_refused[{name}]", ALL,
+          Refused(f"{STRING}{REFUSED[name]}", None, located=False)) for name in sorted(REFUSED)),
+    Row("a_user_impl_still_wins", ALL, Run(USER_IMPL, 11)),
+    Row("an_impl_method_on_string_beats_the_ufcs_fn", ALL, Run(IMPL_STRING, 22)),
+]
+INFERRED = [
+    # `let e = <*T> ± k` is a `*T`, exactly as if annotated.
+    *(Row(f"an_inferred_scalar_pointer[{ty}-{init}-{use}]", ALL,
+          Run(_scalar(ty, init, use), SCALAR_USES[use][1]))
+      for ty in SCALAR_TYPES for init in sorted(SCALAR_INITS) for use in sorted(SCALAR_USES)),
+    *(Row(f"an_inferred_struct_pointer[{init}-{use}]", ALL, _struct(init, use))
+      for init in sorted(INITS) for use in sorted(USES)),
+]
+GROUPS = {"string": ON_STRING, "pointer": INFERRED}
+TABLE = [*ON_STRING, *INFERRED]
+CHUNKS = [(group, c, i) for group, rows in GROUPS.items() for c, i in table_rows.chunks(rows)]
+
+
+@pytest.mark.parametrize("group,compiler,chunk", CHUNKS, ids=["-".join(map(str, c)) for c in CHUNKS])
+def test_every_row(ritz1_bin, tmp_path, group, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(GROUPS[group], compiler, chunk),
+                           build=for_header.batch_build(
+                               ritz1_bin, lambda c: slice_local._string_objects(c, ritz1_bin)),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

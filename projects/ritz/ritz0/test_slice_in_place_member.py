@@ -11,7 +11,7 @@ field of that call's result had no struct:
 `let t = v[1..3]; t.len` was already right.  Each program below reads the
 slice's length and an element straight off `v[lo..hi]`, with v a param or a
 local, in a `return`, a `let` and an `if` condition.  (The pattern-binding
-holder is test_slice_pattern_binding.py's test_a_slice_of_a_pattern_binding_returned.)
+holder is test_slice_pattern_binding.py's a_slice_of_a_pattern_binding_returned rows.)
 
 ritz0 is the oracle: every expected status is what ritz0 returns.
 """

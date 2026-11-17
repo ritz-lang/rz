@@ -11,12 +11,22 @@ Each row runs on ritz0, ritz1 and ritz1_selfhosted, and all three must report
 the same `line:col: message`.
 
 `@x` doesn't fit `@&T` or `:&` (#2339), so an `@&T` slot is only ever given `@&c`.
+
+The matrices are table rows (AGAST #3889): `test_refusals[<compiler>]` and
+`test_runs[<compiler>]` check every row with test_row_table's assert_refusals /
+assert_runs, each under the id its parametrised test had less the compiler
+(`a_value_never_fits_a_reference_slot[lent-mutable-argument]`), and a failure
+names its rows.  A *_GAPS entry is a strict xfail on the ritz1s, as it was.
+
+SITES is imported by test_at_into_mut.py, test_at_is_read_only.py and
+test_at_is_shared.py: keep it.
 """
 
 import pytest
 
 from ref_rules import REF_TO_OTHER_POINTER, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
-from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
+from test_ref_into_value import COMPILERS, _compile, _ids, _main
+from test_row_table import assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 
@@ -295,41 +305,50 @@ def _source(site, slot, binding):
                  "    0\n")
 
 
-def _params(table, gaps):
-    for name in _ids(table):
-        for compiler in COMPILERS:
-            marks = []
-            if compiler != "ritz0" and name in gaps:
-                marks.append(pytest.mark.xfail(strict=True, reason=f"AGAST #{gaps[name]}"))
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
+def _refusal_rows():
+    """{old id less the compiler: (marked program, message)}, and its gaps."""
+    rows, gaps = {}, {}
+    for binding in _ids(BINDINGS):
+        for slot in _ids(SLOT_TYPES):
+            for site in _ids(SITES):
+                name = f"a_value_never_fits_a_reference_slot[{binding}-{slot}-{site}]"
+                rows[name] = (_source(site, slot, binding), MESSAGE[slot])
+                if site in SITE_GAPS:
+                    gaps[name] = SITE_GAPS[site]
+    for shape in _ids(OTHER_SHAPES):
+        name = f"every_shape_of_value_is_refused[{shape}]"
+        body, message = OTHER_SHAPES[shape]
+        rows[name] = (_main(body, "    0\n"), message)
+        if shape in SHAPE_GAPS:
+            gaps[name] = SHAPE_GAPS[shape]
+    # A mutable slot asks for `@&x`, the others for `@x` (R1's table).
+    rows["the_hint_names_the_form_the_slot_takes"] = (
+        _main("fn f(n:& i32) -> @&i32\n    ^n\n", "    0\n"), VALUE_INTO_MUT_REF)
+    return rows, gaps
 
 
-@pytest.mark.parametrize("site,compiler", list(_params(SITES, SITE_GAPS)))
-@pytest.mark.parametrize("slot", _ids(SLOT_TYPES))
-@pytest.mark.parametrize("binding", _ids(BINDINGS))
-def test_a_value_never_fits_a_reference_slot(tmp_path, compiler, site, slot, binding):
-    _assert_refused(compiler, tmp_path, f"{site}_{slot}_{binding}",
-                    _source(site, slot, binding), MESSAGE[slot])
-
-
-@pytest.mark.parametrize("shape,compiler", list(_params(OTHER_SHAPES, SHAPE_GAPS)))
-def test_every_shape_of_value_is_refused(tmp_path, compiler, shape):
-    body, message = OTHER_SHAPES[shape]
-    _assert_refused(compiler, tmp_path, shape, _main(body, "    0\n"), message)
-
-
-@pytest.mark.parametrize("name,compiler", list(_params(EXPLICIT, EXPLICIT_GAPS)))
-def test_the_written_reference_is_the_callers_address(tmp_path, compiler, name):
-    body, entry, want = EXPLICIT[name]
-    assert _run(compiler, tmp_path, name, _main(EXPLICIT_HEAD + body, entry)) == want
+def _run_rows():
+    rows = {f"the_written_reference_is_the_callers_address[{name}]":
+            (_main(EXPLICIT_HEAD + EXPLICIT[name][0], EXPLICIT[name][1]), EXPLICIT[name][2])
+            for name in _ids(EXPLICIT)}
+    gaps = {f"the_written_reference_is_the_callers_address[{name}]": ticket
+            for name, ticket in EXPLICIT_GAPS.items()}
+    return rows, gaps
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_the_hint_names_the_form_the_slot_takes(tmp_path, compiler):
-    """A mutable slot asks for `@&x`, the others for `@x` (R1's table)."""
+def test_refusals(tmp_path, compiler):
+    """Every refusal row, at its `^`, in the whole message; a gap only on the ritz1s."""
     assert "`@&x`" in VALUE_INTO_MUT_REF and "`@x`" in VALUE_INTO_SHARED_REF
-    _assert_refused(compiler, tmp_path, "hint",
-                    _main("fn f(n:& i32) -> @&i32\n    ^n\n", "    0\n"), VALUE_INTO_MUT_REF)
+    rows, gaps = _refusal_rows()
+    assert_refusals(compiler, tmp_path, rows, gaps if compiler != "ritz0" else {})
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_runs(tmp_path, compiler):
+    """The written reference is the caller's address; a gap only on the ritz1s."""
+    rows, gaps = _run_rows()
+    assert_runs(compiler, tmp_path, rows, gaps if compiler != "ritz0" else {})
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

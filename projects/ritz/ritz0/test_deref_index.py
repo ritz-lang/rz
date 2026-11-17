@@ -22,20 +22,23 @@ failed to emit.  A `**[N]*S` `let` local named none either (#3104).
 #3103: on that borrow `p` reads as the caller's `*[3]T` (§13.4), so `p[i]` is
 element i too, as on a `p: *[3]T` param.  ritz1 refused it: "a reference is one
 value, not a buffer".
+
+The cases are rows of one table (test_table_rows.py, AGAST #3889), not a
+parametrised matrix.  Each row keeps the id its parametrised test had, less
+`test_` and the compiler: `test_a_deref_index_is_element_i[pointer-read-ritz1]`
+is `a_deref_index_is_element_i[pointer-read]` on ritz1.  `test_every_row`
+checks a chunk of rows per compiler, linked with gvec's allocator as
+`run_with` did, and names each row that fails.
 """
 
 import pytest
 
 import ref_rules
 import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
+from test_table_rows import ALL, Refused, Row, Run
 
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = pytest.mark.batched
-
-compile_with = for_header.compile_with
-run_with = for_header.run_with
-
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+pytestmark = pytest.mark.integration
 
 # The parameter's type around `[3]T`, how main passes `a`, and whether a write
 # reaches the array.  The `*`-out kinds hold `q: *[3]T = @a` and pass that.
@@ -90,30 +93,11 @@ BARE_KINDS = ("pointer", "borrow_ptr")
 BARE_ROWS = [(k, p) for k in BARE_KINDS for p in POSITIONS]
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind,position", BARE_ROWS)
-def test_a_bare_index_is_element_i(run_with, kind, position, compiler):
-    program = _program(kind, position).replace("(*p)[", "p[")
-    assert run_with(compiler, f"bare_{kind}_{position}", program) == 20
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind,position", ROWS)
-def test_a_deref_index_is_element_i(run_with, kind, position, compiler):
-    assert run_with(compiler, f"{kind}_{position}", _program(kind, position)) == 20
-
-
 # §3.2: an `@[3]T` is read-only, at the place, whichever spelling reaches it.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("position", WRITES)
-def test_a_write_through_a_shared_array_is_refused(compile_with, position, compiler):
-    comp, _, _ = compile_with(compiler, f"shared_{position}", _program("reference", position))
+# Said somewhere in the output, as before: no location is asked of it.
+def _shared_write(position):
     want = ref_rules.BORROW_THROUGH_SHARED if position == "mut_address" else ref_rules.WRITE_THROUGH_SHARED
-    assert comp.returncode != 0
-    assert want in comp.stdout + comp.stderr
+    return Refused(_program("reference", position), want, located=False)
 
 
 # One level out over a Vec: `*q` is the Vec, `(*q).data` its buffer.
@@ -128,18 +112,13 @@ VEC_POSITIONS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("position", sorted(VEC_POSITIONS))
-@pytest.mark.parametrize("kind", sorted(VEC_KINDS))
-def test_a_deref_index_one_level_out_over_a_vec(run_with, kind, position, compiler):
+def _vec_program(kind: str, position: str) -> str:
     around, arg = VEC_KINDS[kind]
     body, ret = VEC_POSITIONS[position]
-    program = (f"import ritzlib.gvec\n\nfn f(q: {around}Vec<i32>) -> i32\n{body}\n"
-               "pub fn main() -> i32\n    var v: Vec<i32> = vec_new<i32>()\n"
-               "    v.push(10)\n    v.push(20)\n    v.push(30)\n    var p: *Vec<i32> = @v\n"
-               f"    return {ret.replace('ARG', arg)}\n")
-    assert run_with(compiler, f"vec_{kind}_{position}", program) == 20
+    return (f"import ritzlib.gvec\n\nfn f(q: {around}Vec<i32>) -> i32\n{body}\n"
+            "pub fn main() -> i32\n    var v: Vec<i32> = vec_new<i32>()\n"
+            "    v.push(10)\n    v.push(20)\n    v.push(30)\n    var p: *Vec<i32> = @v\n"
+            f"    return {ret.replace('ARG', arg)}\n")
 
 
 # #3074: an array of pointers one level out, `p: @*[3]*U`.  `(*p)[i]` is a `*U`, so
@@ -170,27 +149,14 @@ def _ptr_elem_program(kind: str, position: str) -> str:
             + f"pub fn main() -> i32\n{fill}    return {ret.replace('ARG', arg + ', 1')}\n")
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("position", sorted(PTR_ELEM_POSITIONS))
-@pytest.mark.parametrize("kind", sorted(PTR_ELEM_KINDS))
-def test_a_pointer_element_one_level_out_reads_at_its_width(run_with, kind, position, compiler):
-    assert run_with(compiler, f"ptr_elem_{kind}_{position}", _ptr_elem_program(kind, position)) == 20
-
-
 # #3103: `p[i]` on a `p:& *[3]*U` borrow (and a `*[3]*U` param, the control).
 BARE_PTR_ELEM_KINDS = {"pointer": ": *", "borrow_ptr": ":& *"}
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("position", sorted(PTR_ELEM_POSITIONS))
-@pytest.mark.parametrize("kind", sorted(BARE_PTR_ELEM_KINDS))
-def test_a_bare_pointer_element_reads_at_its_width(run_with, kind, position, compiler):
+def _bare_ptr_elem_program(kind: str, position: str) -> str:
     arg = "@a" if kind == "pointer" else "q"
-    program = (_ptr_elem_program("ptr_ptr", position).replace("(*p)[", "p[")
-               .replace("p: **[3]", f"p{BARE_PTR_ELEM_KINDS[kind]}[3]").replace("f(@q, 1)", f"f({arg}, 1)"))
-    assert run_with(compiler, f"bare_ptr_elem_{kind}_{position}", program) == 20
+    return (_ptr_elem_program("ptr_ptr", position).replace("(*p)[", "p[")
+            .replace("p: **[3]", f"p{BARE_PTR_ELEM_KINDS[kind]}[3]").replace("f(@q, 1)", f"f({arg}, 1)"))
 
 
 # #3074: the same through an `@*[3]*U` or `@&*[3]*U` local, named through its type.
@@ -205,30 +171,15 @@ def _ptr_elem_local(around: str, addr: str, body: str) -> str:
             + f"    let r: {around}[3]*W = {addr}\n" + body)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("around,addr", PTR_ELEM_LOCALS)
-def test_a_pointer_element_through_a_ref_ptr_local(run_with, around, addr, compiler):
-    program = _ptr_elem_local(around, addr, "    let x: i64 = (*r)[1].v\n" + SPLIT)
-    assert run_with(compiler, f"ptr_elem_local_{around}", program) == 20
-
-
 # #3104: a store through the `**[3]*W` local reaches b1, not b0 or the slot.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_pointer_element_store_through_a_ptr_ptr_local(run_with, compiler):
-    program = _ptr_elem_local("**", "@q", "    (*r)[1].v = 7\n    return (b1.v + b0.v + b2.v) as i32 + 9\n")
-    assert run_with(compiler, "ptr_elem_local_store_ptr_ptr", program) == 20
+PTR_ELEM_LOCAL_STORE = _ptr_elem_local("**", "@q", "    (*r)[1].v = 7\n    return (b1.v + b0.v + b2.v) as i32 + 9\n")
 
 
 # #3074: `*q` is the array, not its first element: `(*q).v` is refused, on a param
 # and on a local, whether the array holds W or `*W`.  ritz1 read element 0's v
 # through an `@*[3]W` local, and naming `*W` above would have done it for `[3]*W`.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("elem", ["W", "*W"])
-@pytest.mark.parametrize("where", ["param", "local", "borrow", "ptr_ptr_local"])
-def test_a_field_of_the_array_itself_is_refused(compile_with, where, elem, compiler):
+# Any refusal will do, as before.
+def _array_field(where: str, elem: str) -> Refused:
     if where in ("param", "borrow"):
         # #3103: the `q:& *[3]T` borrow, bound as a `*[3]T` local, names no S either.
         around = "q: @*" if where == "param" else "q:& *"
@@ -238,5 +189,43 @@ def test_a_field_of_the_array_itself_is_refused(compile_with, where, elem, compi
         around = "**" if where == "ptr_ptr_local" else "@*"
         program = (W + f"pub fn main() -> i32\n    var a: [3]{elem}\n    var q: *[3]{elem} = @a\n"
                    + f"    let r: {around}[3]{elem} = @q\n    return (*r).v as i32\n")
-    comp, _, _ = compile_with(compiler, f"array_field_{where}_{elem.strip('*')}{len(elem)}", program)
-    assert comp.returncode != 0
+    return Refused(program, None, located=False)
+
+
+# ---- the rows: each id is its old test's, less `test_` and the compiler -------
+
+# Rows that import gvec chunk apart from those that import nothing: a row whose
+# imports differ from its batch's is compiled alone as well (AGAST #2867).
+PLAIN = [
+    *(Row(f"a_bare_index_is_element_i[{kind}-{position}]", ALL,
+          Run(_program(kind, position).replace("(*p)[", "p["), 20)) for kind, position in BARE_ROWS),
+    *(Row(f"a_deref_index_is_element_i[{kind}-{position}]", ALL, Run(_program(kind, position), 20))
+      for kind, position in ROWS),
+    *(Row(f"a_write_through_a_shared_array_is_refused[{position}]", ALL, _shared_write(position))
+      for position in WRITES),
+    *(Row(f"a_pointer_element_one_level_out_reads_at_its_width[{kind}-{position}]", ALL,
+          Run(_ptr_elem_program(kind, position), 20))
+      for kind in sorted(PTR_ELEM_KINDS) for position in sorted(PTR_ELEM_POSITIONS)),
+    *(Row(f"a_bare_pointer_element_reads_at_its_width[{kind}-{position}]", ALL,
+          Run(_bare_ptr_elem_program(kind, position), 20))
+      for kind in sorted(BARE_PTR_ELEM_KINDS) for position in sorted(PTR_ELEM_POSITIONS)),
+    *(Row(f"a_pointer_element_through_a_ref_ptr_local[{around}-{addr}]", ALL,
+          Run(_ptr_elem_local(around, addr, "    let x: i64 = (*r)[1].v\n" + SPLIT), 20))
+      for around, addr in PTR_ELEM_LOCALS),
+    Row("a_pointer_element_store_through_a_ptr_ptr_local", ALL, Run(PTR_ELEM_LOCAL_STORE, 20)),
+    *(Row(f"a_field_of_the_array_itself_is_refused[{where}-{elem}]", ALL, _array_field(where, elem))
+      for where in ("param", "local", "borrow", "ptr_ptr_local") for elem in ("W", "*W")),
+]
+OVER_A_VEC = [Row(f"a_deref_index_one_level_out_over_a_vec[{kind}-{position}]", ALL,
+                  Run(_vec_program(kind, position), 20))
+              for kind in sorted(VEC_KINDS) for position in sorted(VEC_POSITIONS)]
+GROUPS = {"plain": PLAIN, "vec": OVER_A_VEC}
+TABLE = [*PLAIN, *OVER_A_VEC]
+CHUNKS = [(group, c, i) for group, rows in GROUPS.items() for c, i in table_rows.chunks(rows)]
+
+
+@pytest.mark.parametrize("group,compiler,chunk", CHUNKS, ids=["-".join(map(str, c)) for c in CHUNKS])
+def test_every_row(ritz1_bin, tmp_path, group, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(GROUPS[group], compiler, chunk),
+                           build=for_header.batch_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

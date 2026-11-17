@@ -13,16 +13,27 @@ and ritz1 emitted invalid IR for it.
 
 Each row runs on ritz0, ritz1 and ritz1_selfhosted; refusals must report the same
 `line:col: message` on all three, located at the `[`.
+
+The runs and the refusals are each a table per compiler (AGAST #3889): runs
+through test_table_rows, linking the ritzlib modules a row imports
+(test_ritz1_slice_type.ritzlib_build, not a `--no-cache` build.py package per
+case); refusals through test_row_table.assert_refusals.  A row keeps the id its
+parametrised test had, less the compiler, and a failure names it.  The missing
+key test checks stderr too, so it stays its own test.
 """
 
-import os
 import subprocess
 
 import pytest
 
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
 from index_rules import builtin_impl, needs_index, needs_index_mut, needs_writer
 from ref_rules import WRITE_THROUGH_SHARED
-from test_ref_into_value import COMPILERS, RITZ_ROOT, _assert_refused, _run
+from test_ref_into_value import COMPILERS
+from test_ritz1_slice_type import ritzlib_build
+from test_row_table import assert_refusals
+from test_table_rows import Row, Run
 
 pytestmark = pytest.mark.integration
 
@@ -236,33 +247,19 @@ fn bump(t: *Tally)
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(RUNS))
-def test_struct_index_runs(tmp_path, compiler, name):
-    prelude, body = RUNS[name]
-    assert _run(compiler, tmp_path, name, _program(prelude, body)) == 0
+def _build_and_run(ritz1_bin, compiler, tmp_path, src):
+    """Compile `src`, link the ritzlib modules it imports (as build.py would, each
+    compiled once per process), and run it."""
+    work = tmp_path / compiler
+    work.mkdir()
+    (work / "main.ritz").write_text(src)
+    ok, output, exe = ritzlib_build(ritz1_bin)(compiler, work / "main.ritz", work)
+    assert ok, f"{compiler} failed to build:\n{output[-3000:]}"
+    return subprocess.run([str(exe)], capture_output=True, timeout=60, check=False)
 
 
-def _build_and_run(compiler, tmp_path, name, src):
-    """Build `src` as a package, which links the ritzlib modules it imports, and run it."""
-    pkg = tmp_path / f"{name}_{compiler}"
-    (pkg / "src").mkdir(parents=True)
-    (pkg / "src" / "main.ritz").write_text(src)
-    (pkg / "ritz.toml").write_text(f'[package]\nname = "{name}"\nversion = "0.1.0"\n')
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run(["python3", str(RITZ_ROOT / "build.py"), "build", str(pkg),
-                           "--no-cache", "--compiler", compiler],
-                          cwd=RITZ_ROOT, env=env, capture_output=True, text=True, timeout=600)
-    exe = pkg / "build" / "debug" / name
-    assert proc.returncode == 0 and exe.exists(), \
-        f"{compiler} failed to build {name}:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}"
-    return subprocess.run([str(exe)], capture_output=True, timeout=60)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_hashmap_implements_all_three(tmp_path, compiler):
-    """The spec's example: ritzlib's HashMapI64 at K = V = i64."""
-    src = _program("import ritzlib.hashmap\n\n", """\
+# The spec's example: ritzlib's HashMapI64 at K = V = i64.
+HASHMAP = _program("import ritzlib.hashmap\n\n", """\
     var m: HashMapI64 = hashmap_i64_new()
     m[1] = 10
     m[1] += 5
@@ -273,11 +270,25 @@ def test_hashmap_implements_all_three(tmp_path, compiler):
     let v: i64 = *p - 15
     v as i32
 """)
-    assert _build_and_run(compiler, tmp_path, "hashmap", src).returncode == 0
+
+# Every run is a row exiting 0 under its old id, less the compiler; the hashmap
+# row links the ritzlib modules it imports (ritzlib_build).
+RUN_TABLE = [
+    *(Row(f"struct_index_runs[{name}]", table_rows.ALL, Run(_program(*RUNS[name]), 0)) for name in sorted(RUNS)),
+    Row("hashmap_implements_all_three", table_rows.ALL, Run(HASHMAP, 0)),
+]
+
+
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(RUN_TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(RUN_TABLE)])
+def test_every_run(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(RUN_TABLE, compiler, chunk),
+                           build=ritzlib_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_missing_key_ends_the_program(tmp_path, compiler):
+def test_missing_key_ends_the_program(ritz1_bin, tmp_path, compiler):
     """`index` must not return for a missing key: HashMapI64 exits with a message."""
     src = _program("import ritzlib.hashmap\n\n", """\
     var m: HashMapI64 = hashmap_i64_new()
@@ -285,7 +296,7 @@ def test_missing_key_ends_the_program(tmp_path, compiler):
     let v: i64 = m[999]
     0
 """)
-    run = _build_and_run(compiler, tmp_path, "missing", src)
+    run = _build_and_run(ritz1_bin, compiler, tmp_path, src)
     assert run.returncode == 101
     assert b"HashMapI64: key not found: 999" in run.stderr
 
@@ -336,18 +347,22 @@ REFUSALS = {
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(REFUSALS))
-def test_struct_index_refusals(tmp_path, compiler, name):
-    prelude, body, message = REFUSALS[name]
-    _assert_refused(compiler, tmp_path, name, _program(prelude, body), message)
+def _builtin_opt_in(trait):
+    return ("import ritzlib.string\n\nimpl " + trait + " for ^String\n"
+            "    fn index(self: @String, key: i64) -> @u8\n"
+            "        @self.data.data[key]\n\n"
+            "pub fn main() -> i32\n    0\n")
+
+
+# Each refusal's whole message at its `^`, as `_assert_refused` wanted it.
+REFUSAL_TABLE = {
+    **{f"struct_index_refusals[{name}]": (_program(prelude, body), message)
+       for name, (prelude, body, message) in sorted(REFUSALS.items())},
+    **{f"built_in_types_cannot_opt_in[{trait}]": (_builtin_opt_in(trait), builtin_impl(trait, "String"))
+       for trait in ["Index", "IndexMut", "IndexSet"]},
+}
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("trait", ["Index", "IndexMut", "IndexSet"])
-def test_built_in_types_cannot_opt_in(tmp_path, compiler, trait):
-    src = ("import ritzlib.string\n\nimpl " + trait + " for ^String\n"
-           "    fn index(self: @String, key: i64) -> @u8\n"
-           "        @self.data.data[key]\n\n"
-           "pub fn main() -> i32\n    0\n")
-    _assert_refused(compiler, tmp_path, trait, src, builtin_impl(trait, "String"))
+def test_every_refusal(ritz1_bin, tmp_path, compiler):
+    assert_refusals(compiler, tmp_path, REFUSAL_TABLE)

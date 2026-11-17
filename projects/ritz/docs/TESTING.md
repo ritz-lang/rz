@@ -449,7 +449,12 @@ Rules:
    tuple, every part of which must be said.  A grid with holes needs no
    `@case`: list `Row(id, compilers, spec)`s directly, as
    `test_array_store_rule.py` and `test_ritz1_array_pointer_index.py` do
-   (AGAST #3517: 3,348 tests to 58, 46 to ~26 CPU-s).
+   (AGAST #3517: 3,348 tests to 58, 46 to ~26 CPU-s).  AGAST #3889 did 18
+   more (4,988 tests to 133).  The CPU win is largest where each case was its
+   own `build.py` package: a chunk built as ONE package
+   (`pkg_build` in `test_ritz1_deref_struct_arg.py`) took four such files
+   from 167 to 18 CPU-s.  A file whose rows all reach a generic saves little
+   CPU, because #2867's leaning check still compiles each row alone.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

@@ -31,6 +31,11 @@ as a generic struct is: each instantiation substitutes it (`tuple_i32_i32`
 at T = i32) and registers that tuple (AGAST #2975), as does one whose
 element points at a parameter (`(*T, i32)` -> `tuple_ptr_i32_i32`, #3173;
 `(**T, i32)` -> `tuple_ptr_ptr_i32_i32`, #3184).
+
+Every program that runs is a row of one table (test_table_rows.py, AGAST
+#3889, `ROWS`), checked a chunk of rows at a time per compiler, a chunk one
+package build (test_ritz1_deref_struct_arg.pkg_build).  The IR checks stay
+tests of their own.
 """
 
 import os
@@ -40,7 +45,9 @@ from pathlib import Path
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run_pkg
+import test_table_rows as table_rows
+from test_ritz1_deref_struct_arg import assert_table
+from test_table_rows import Row, Run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 
@@ -439,50 +446,41 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize(
-    "compiler,name,program,expected",
-    [
-        ("ritz0", "tuple_infer_let", INFER_LET, 3),
-        ("ritz1", "tuple_infer_let", INFER_LET, 3),
-        ("ritz0", "tuple_infer_if_arm_stmts", INFER_IF_ARM_STMTS, 4),
-        ("ritz1", "tuple_infer_if_arm_stmts", INFER_IF_ARM_STMTS, 4),
-        ("ritz1", "tuple_infer_match_arm_binds", INFER_MATCH_ARM_BINDS, 3),
-    ],
-)
-def test_tuple_with_no_slot_runs(ritz1_bin, tmp_path, compiler, name, program, expected):
-    """The programs ritz1 refused until AGAST #3005 now run, as on ritz0."""
-    assert _run_pkg(compiler, tmp_path, name, program) == expected
+# Every program runs as a table row (AGAST #3889), its id the old
+# parametrised test's less the compiler, and less the program text and exit
+# status pytest spelled out in it: `test_tuple_programs_run[tuple_return-<text>-45-ritz0]`
+# is `tuple_programs_run[tuple_return]` on ritz0.  ROWS is assembled below.
+BOTH = ("ritz0", "ritz1")
 
+# The programs ritz1 refused until AGAST #3005 now run, as on ritz0.  ritz0
+# can't build INFER_MATCH_ARM_BINDS (#3022): ritz1 only.
+NO_SLOT = [
+    ("tuple_infer_let", INFER_LET, 3, BOTH),
+    ("tuple_infer_if_arm_stmts", INFER_IF_ARM_STMTS, 4, BOTH),
+    ("tuple_infer_match_arm_binds", INFER_MATCH_ARM_BINDS, 3, ("ritz1",)),
+]
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize(
-    "name,program,expected",
-    [
-        ("tuple_return", RETURN, 45),
-        ("tuple_box_ticket", TICKET_BOX, 7),
-        ("tuple_generic", GENERIC, 54),
-        ("tuple_wide_nested", WIDE_AND_NESTED, 48),
-        ("tuple_split_if", SPLIT_IF, 108),
-        ("tuple_split_literal", SPLIT_LITERAL, 49),
-        ("tuple_split_match", SPLIT_MATCH, 102),
-        ("tuple_split_once", SPLIT_ONCE, 123),
-        ("tuple_generic_fn", GEN_FN, 21),
-        ("tuple_generic_nested", GEN_NESTED, 123),
-        ("tuple_generic_param", GEN_PARAM, 57),
-        ("tuple_generic_struct", GEN_STRUCT, 34),
-        ("tuple_generic_vec", GEN_VEC, 42),
-        ("tuple_generic_impl_vec", GEN_IMPL_VEC, 69),
-        ("tuple_generic_ptr", GEN_PTR, 28),
-        ("tuple_generic_ref", GEN_REF, 70),
-        ("tuple_generic_ptr_ptr", GEN_PTR_PTR, 16),
-        ("tuple_generic_ptr_ptr_i16", GEN_PTR_PTR_I16, 11),
-        ("tuple_generic_ptr_ptr_deep", GEN_PTR_PTR_DEEP, 11),
-    ],
-)
-def test_tuple_programs_run(ritz1_bin, tmp_path, compiler, name, program, expected):
-    assert _run_pkg(compiler, tmp_path, name, program) == expected
+PROGRAMS = [
+    ("tuple_return", RETURN, 45),
+    ("tuple_box_ticket", TICKET_BOX, 7),
+    ("tuple_generic", GENERIC, 54),
+    ("tuple_wide_nested", WIDE_AND_NESTED, 48),
+    ("tuple_split_if", SPLIT_IF, 108),
+    ("tuple_split_literal", SPLIT_LITERAL, 49),
+    ("tuple_split_match", SPLIT_MATCH, 102),
+    ("tuple_split_once", SPLIT_ONCE, 123),
+    ("tuple_generic_fn", GEN_FN, 21),
+    ("tuple_generic_nested", GEN_NESTED, 123),
+    ("tuple_generic_param", GEN_PARAM, 57),
+    ("tuple_generic_struct", GEN_STRUCT, 34),
+    ("tuple_generic_vec", GEN_VEC, 42),
+    ("tuple_generic_impl_vec", GEN_IMPL_VEC, 69),
+    ("tuple_generic_ptr", GEN_PTR, 28),
+    ("tuple_generic_ref", GEN_REF, 70),
+    ("tuple_generic_ptr_ptr", GEN_PTR_PTR, 16),
+    ("tuple_generic_ptr_ptr_i16", GEN_PTR_PTR_I16, 11),
+    ("tuple_generic_ptr_ptr_deep", GEN_PTR_PTR_DEEP, 11),
+]
 
 
 def _ritz1_ir(ritz1_bin, tmp_path, src_text: str) -> subprocess.CompletedProcess:
@@ -551,14 +549,6 @@ def test_ritz1_substitutes_tuple_over_generic_param(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_destructured_u8_widens_unsigned(ritz1_bin, tmp_path, compiler):
-    """AGAST #3173/#3192: `(*T, i32)` at T = *u8 binds a `**u8`, and a
-    destructured `u8` (generic or not) widens as a u8."""
-    assert _run_pkg(compiler, tmp_path, "tuple_generic_ptr_u8", GEN_PTR_U8) == 11
-
-
-@pytest.mark.integration
 def test_ritz1_substitutes_tuple_element_pointing_at_generic_param(ritz1_bin, tmp_path):
     """AGAST #3173: `(*T, i32)` was refused.  At pp<i32> it is ritz0's
     `tuple_ptr_i32_i32`, `{ptr, i32}`; the template's `tuple_ptr_T_i32` is
@@ -603,15 +593,28 @@ fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize(
-    "name,program,expected",
-    [
-        ("tuple_nested_index", NESTED_INDEX, 9),
-        ("tuple_nested_index_mixed", NESTED_INDEX_MIXED, 11),
-    ],
+NESTED_INDEX_PROGRAMS = [
+    ("tuple_nested_index", NESTED_INDEX, 9),
+    ("tuple_nested_index_mixed", NESTED_INDEX_MIXED, 11),
+]
+
+ROWS = (
+    [Row(f"tuple_with_no_slot_runs[{name}]", compilers, Run(program, want))
+     for name, program, want, compilers in NO_SLOT]
+    + [Row(f"tuple_programs_run[{name}]", BOTH, Run(program, want))
+       for name, program, want in PROGRAMS]
+    # AGAST #3173/#3192: `(*T, i32)` at T = *u8 binds a `**u8`, and a
+    # destructured `u8` (generic or not) widens as a u8.
+    + [Row("destructured_u8_widens_unsigned", BOTH, Run(GEN_PTR_U8, 11))]
+    # AGAST #3232: `p.0.1` is p . 0 . 1, not p . <float 0.1>.
+    + [Row(f"nested_tuple_index_lexes_as_ints[{name}]", BOTH, Run(program, want))
+       for name, program, want in NESTED_INDEX_PROGRAMS]
 )
-def test_nested_tuple_index_lexes_as_ints(ritz1_bin, tmp_path, compiler, name, program, expected):
-    """AGAST #3232: `p.0.1` is p . 0 . 1, not p . <float 0.1>."""
-    assert _run_pkg(compiler, tmp_path, name, program) == expected
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    """Every program above runs, and exits as it says."""
+    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)

@@ -16,13 +16,21 @@ the borrow's `ptr` as the argument and clang refused the IR ("'%.1' defined
 with type 'ptr' but expected '%Span$u8'").
 
 ritz0 is the oracle: each expected exit status is checked against it too.
+
+Every form is a row of one table (test_table_rows.py, AGAST #3889), checked
+per compiler as one package build (test_ritz1_deref_struct_arg.pkg_build).
+A row keeps the id its parametrised test had, less the compiler
+(`test_static_method_span_arg[free_fn-ritz1]` is `static_method_span_arg[free_fn]`
+on ritz1).
 """
 
 import pytest
 
-from test_ritz1_move_param import _run
+import test_table_rows as table_rows
+from test_ritz1_deref_struct_arg import assert_table
+from test_table_rows import ALL, Row, Run
 
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+pytestmark = pytest.mark.integration
 
 HEAD = """\
 import ritzlib.gvec
@@ -113,12 +121,11 @@ fn go(data:= Vec<u8>) -> i32
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(FORMS))
-def test_static_method_span_arg(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    body, expected = FORMS[name]
-    rc = _run(compiler, tmp_path, HEAD + body + MAIN)
-    assert rc == expected, f"{compiler} {name}: exit {rc}, expected {expected}"
+ROWS = [Row(f"static_method_span_arg[{name}]", ALL, Run(HEAD + FORMS[name][0] + MAIN, FORMS[name][1]))
+        for name in sorted(FORMS)]
+
+
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)

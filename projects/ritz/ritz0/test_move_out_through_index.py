@@ -17,6 +17,15 @@ A Vec or Span of a Drop type is refused today on ritz0, in gvec.ritz's generic
 bodies, and on ritz1 in span.ritz's (#2159's question): so the refusals assert the
 `line:col` of this program's own error, and the controls that no such error is
 reported at the marked place.  Arrays behind a pointer are #2330's.
+
+The cases are table rows (test_row_table.py, AGAST #3889), one test per
+compiler, not a parametrised matrix.  Each row keeps the id its parametrised
+test had, less the compiler and `test_`: `test_an_element_does_not_move_out[
+let-Vec-pointer-ritz1]` is `an_element_does_not_move_out[let-Vec-pointer]` on
+ritz1.  The refusals are compiled a chunk at a time and each must report
+exactly MOVE_OUT_OF_REF at its `^`; the controls and copies are compiled on
+their own (an absence or a clean compile is not a batch's to vouch for), and
+every failing row is named.
 """
 
 import re
@@ -24,7 +33,8 @@ import re
 import pytest
 
 from ref_rules import MOVE_OUT_OF_REF
-from test_ref_into_value import COMPILERS, MOVE, _assert_refused, _compile, _located, _main
+from test_ref_into_value import COMPILERS, MOVE, _compile, _located, _main
+from test_row_table import assert_refusals
 
 pytestmark = pytest.mark.integration
 
@@ -89,48 +99,56 @@ def _fill(body, kind, base="Vec"):
     return body.replace("{P}", KINDS[kind]).replace("{B}", base)
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("base", sorted(BASES))
-@pytest.mark.parametrize("site", sorted(MOVES))
-def test_an_element_does_not_move_out(tmp_path, compiler, kind, base, site):
-    body = _fill(MOVES[site], kind, base)
-    _assert_refused(compiler, tmp_path, f"{site}_{base}_{kind}", _src(base, body), MOVE_OUT_OF_REF)
+# ---- the rows: {old id less `test_` and the compiler: ...} --------------------
+
+# Refused with MOVE_OUT_OF_REF, exactly, at the `^`: (marked program, message).
+REFUSALS = {
+    **{f"an_element_does_not_move_out[{site}-{base}-{kind}]":
+       (_src(base, _fill(MOVES[site], kind, base)), MOVE_OUT_OF_REF)
+       for site in sorted(MOVES) for base in sorted(BASES) for kind in sorted(KINDS)},
+    **{f"an_element_does_not_move_out_of_a_lent_param[{site}-{base}]":
+       (_src(base, LENT_MOVES[site].replace("{B}", base)), MOVE_OUT_OF_REF)
+       for site in sorted(LENT_MOVES) for base in sorted(BASES)},
+    **{f"a_by_value_self_does_not_move_out_through_a_deref[{kind}]":
+       (_src("Vec", _fill(DEREF_RECEIVER, kind)), MOVE_OUT_OF_REF) for kind in sorted(KINDS)},
+}
+
+# No MOVE_OUT_OF_REF reported on the `^`'s line: marked programs.
+LEFT_ALONE = {f"what_leaves_the_element_alone[{site}-{base}-{kind}]": _src(base, _fill(NOT_MOVES[site], kind, base))
+              for site in sorted(NOT_MOVES) for base in sorted(BASES) for kind in sorted(KINDS)}
+
+# Compile cleanly: programs.
+COPY_READS = {f"a_copy_element_reads[{site}-{kind}]":
+              "import ritzlib.gvec\n\n" + _main(_fill(COPIES[site], kind), "    0\n")
+              for site in sorted(COPIES) for kind in sorted(KINDS)}
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("base", sorted(BASES))
-@pytest.mark.parametrize("site", sorted(LENT_MOVES))
-def test_an_element_does_not_move_out_of_a_lent_param(tmp_path, compiler, base, site):
-    body = LENT_MOVES[site].replace("{B}", base)
-    _assert_refused(compiler, tmp_path, f"{site}_{base}", _src(base, body), MOVE_OUT_OF_REF)
+def test_every_refusal(tmp_path, compiler):
+    assert_refusals(compiler, tmp_path, REFUSALS)
+
+
+def _wrong_alone(compiler, tmp_path, k, name, marked):
+    """Why row `name` fails compiled on its own, or None."""
+    if name in LEFT_ALONE:
+        src, where = _located(marked)
+        comp, _, _ = _compile(compiler, tmp_path, f"row{k}", src)
+        out = comp.stdout + comp.stderr
+        found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+        line = where.split(":")[0]
+        if [f for f in found if f[0].split(":")[0] == line and f[1] == MOVE_OUT_OF_REF]:
+            return f"reported a move out at line {line}:\n{out[-600:]}"
+        return None
+    comp, ll, _ = _compile(compiler, tmp_path, f"row{k}", marked)
+    if comp.returncode == 0 and ll.exists():
+        return None
+    return f"wanted it to compile, got:\n{(comp.stdout + comp.stderr)[-600:]}"
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-def test_a_by_value_self_does_not_move_out_through_a_deref(tmp_path, compiler, kind):
-    _assert_refused(compiler, tmp_path, f"deref_self_{kind}",
-                    _src("Vec", _fill(DEREF_RECEIVER, kind)), MOVE_OUT_OF_REF)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("base", sorted(BASES))
-@pytest.mark.parametrize("site", sorted(NOT_MOVES))
-def test_what_leaves_the_element_alone(tmp_path, compiler, kind, base, site):
-    src, where = _located(_src(base, _fill(NOT_MOVES[site], kind, base)))
-    comp, _, _ = _compile(compiler, tmp_path, f"{site}_{base}_{kind}", src)
-    out = comp.stdout + comp.stderr
-    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
-    line = where.split(":")[0]
-    assert not [f for f in found if f[0].split(":")[0] == line and f[1] == MOVE_OUT_OF_REF], \
-        f"{compiler}: {site} reported a move out at line {line}:\n{src}\n{out[-2000:]}"
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("kind", sorted(KINDS))
-@pytest.mark.parametrize("site", sorted(COPIES))
-def test_a_copy_element_reads(tmp_path, compiler, kind, site):
-    src = "import ritzlib.gvec\n\n" + _main(_fill(COPIES[site], kind), "    0\n")
-    comp, ll, _ = _compile(compiler, tmp_path, f"{site}_{kind}", src)
-    assert comp.returncode == 0 and ll.exists(), (comp.stdout + comp.stderr)[-2000:]
+def test_what_is_no_move_out(tmp_path, compiler):
+    """The controls and the copy reads, each compiled on its own."""
+    table = {**LEFT_ALONE, **COPY_READS}
+    failures = [f"{name}: {why}" for k, (name, marked) in enumerate(table.items())
+                for why in [_wrong_alone(compiler, tmp_path, k, name, marked)] if why]
+    assert not failures, f"{compiler}: {len(failures)} of {len(table)} rows failed:\n" + "\n".join(failures)

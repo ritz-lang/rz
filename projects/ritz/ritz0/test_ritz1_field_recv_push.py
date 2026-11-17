@@ -46,13 +46,27 @@ type, as it seeds a typed `self: @&T`.
 
 Every program pushes twice with S.a == 4, then returns the stored a plus the
 count, so each exits 6.
+
+Every cell is a row of one table (test_table_rows.py, AGAST #3889), checked a
+chunk of rows at a time per compiler, a chunk one package build
+(test_ritz1_deref_struct_arg.pkg_build).  A batch holds other rows' receivers,
+which can instantiate `vec_push$S` for a row that doesn't: such a row is only
+answered by its batch if its own module, compiled alone, declares everything
+it calls (batching.leans, test_ritz1_deref_struct_arg._unbound); otherwise it
+is built alone.  A row keeps the id its parametrised test had, less the
+compiler (`test_field_receiver_push[self_lent-param-small-ritz1]` is
+`field_receiver_push[self_lent-param-small]` on ritz1).
 """
 
 import itertools
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run_pkg
+import test_table_rows as table_rows
+from test_ritz1_deref_struct_arg import assert_table
+from test_table_rows import Row, Run
+
+pytestmark = pytest.mark.integration
 
 SIZES = {
     "small": ("    a: i32\n    b: f32\n", "S { a: 4, b: 1.0 }"),
@@ -145,10 +159,11 @@ def _program(recv: str, value: str, size: str) -> str:
 
 CELLS = list(itertools.product(RECEIVERS, VALUES, SIZES))
 
+ROWS = [Row(f"field_receiver_push[{'-'.join(c)}]", ("ritz0", "ritz1"), Run(_program(*c), 6))
+        for c in CELLS]
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("recv,value,size", CELLS, ids=["-".join(c) for c in CELLS])
-def test_field_receiver_push(compiler, recv, value, size, tmp_path):
-    prog = _program(recv, value, size)
-    assert _run_pkg(compiler, tmp_path, "frp", prog) == 6, prog
+
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    assert_table(compiler, table_rows.chunk(ROWS, compiler, chunk), tmp_path)

@@ -20,15 +20,25 @@ the same `line:col: message`.
 counts as a borrow is #2371's, and a reference to another type is #2367's and
 #2368's. Nothing here decides those: the `@x` rows ask only that these rules stay
 out of it.
-"""
 
-import subprocess
+The cases are table rows (test_row_table.py and test_table_rows.py, AGAST
+#3889), a few tests per compiler, not a parametrised matrix.  Each row keeps the
+id its parametrised test had, less `test_` and the compiler:
+`test_a_mutating_method_on_a_shared_receiver_is_refused[field-ritz1]` is
+`a_mutating_method_on_a_shared_receiver_is_refused[field]` on ritz1.  Refusals
+and runs are compiled a chunk at a time, each refusal's exact `line:col:
+message` asserted; what must compile, or stay out of these rules, is compiled
+on its own.  Every failing row is named.
+"""
 
 import pytest
 
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
 from ref_rules import BORROW_THROUGH_SHARED, SHARED_INTO_MUT
-from test_ref_into_value import COMPILERS, _assert_refused, _compile, _ids, _main, _run
-from test_ritz1_for_header import _emit as _emit_alloc, _link as _link_alloc
+from test_ref_into_value import COMPILERS, _compile, _ids, _main
+from test_row_table import assert_refusals, assert_runs
+from test_table_rows import ALL, Row, Run
 from test_value_into_ref import SITES
 
 pytestmark = pytest.mark.integration
@@ -271,55 +281,15 @@ def _wrap(body):
     return _main(TYPES + body, "    0\n")
 
 
-def _with_gaps(table, gaps):
-    """Each row on each compiler, a ritz1 gap as a strict xfail citing its ticket."""
-    for site in _ids(table):
-        for compiler in COMPILERS:
-            if site in gaps and compiler != "ritz0":
-                mark = pytest.mark.xfail(strict=True, reason=f"#{gaps[site]}")
-                yield pytest.param(site, compiler, marks=mark)
-            else:
-                yield pytest.param(site, compiler)
+def _gaps(table_id, gaps, compiler):
+    """A ritz1 gap's rows, as strict xfails citing their tickets (ritz0 has none)."""
+    return {} if compiler == "ritz0" else {f"{table_id}[{site}]": ticket for site, ticket in gaps.items()}
 
 
-@pytest.mark.parametrize("site,compiler", list(_with_gaps(VALUES, VALUE_GAPS)))
-def test_a_shared_value_into_a_mutable_slot_is_refused(tmp_path, compiler, site):
-    _assert_refused(compiler, tmp_path, site, _wrap(VALUES[site]), SHARED_INTO_MUT)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", _ids(SITES))
-def test_a_shared_value_at_each_slot_a_mutable_one_can_be(tmp_path, compiler, site):
-    body = SITES[site].replace("{S}", "@&C").replace("{B}", "c: @C")
-    types = ("struct C\n    x: i32\n\nstruct W\n    r: @&C\n\nstruct K\n    n: i32\n\n"
-             "enum E\n    V(@&C)\n    N\n\nimpl K\n    fn take(self: @K, p: @&C) -> i32\n"
-             "        self.n\n\nfn g(p: @&C) -> i32\n    0\n\n")
-    _assert_refused(compiler, tmp_path, site, _main(types + body, "    0\n"), SHARED_INTO_MUT)
-
-
-@pytest.mark.parametrize("site,compiler", list(_with_gaps(RECEIVERS, RECEIVER_GAPS)))
-def test_a_mutating_method_on_a_shared_receiver_is_refused(tmp_path, compiler, site):
-    _assert_refused(compiler, tmp_path, site, _wrap(RECEIVERS[site]), SHARED_INTO_MUT)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", _ids(PLACES))
-def test_a_mutable_borrow_behind_a_shared_reference_is_refused(tmp_path, compiler, site):
-    _assert_refused(compiler, tmp_path, site, _wrap(PLACES[site]), BORROW_THROUGH_SHARED)
-
-
-@pytest.mark.parametrize("site,compiler", list(_with_gaps(ALLOWED, ALLOWED_GAPS)))
-def test_what_r1_keeps_still_runs(tmp_path, compiler, site):
-    fn, call, want = ALLOWED[site]
-    src = _main(TYPES + fn, f"    var c = C {{ x: 1 }}\n    {call}\n    c.x\n")
-    assert _run(compiler, tmp_path, site, src) == want
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", _ids(COMPILES))
-def test_what_r1_keeps_still_compiles(tmp_path, compiler, site):
-    comp, _, _ = _compile(compiler, tmp_path, site, _wrap(COMPILES[site]))
-    assert comp.returncode == 0, comp.stdout + comp.stderr
+# The slot types SITES' rows are written against, with `@&C` as the slot.
+SLOT_TYPES = ("struct C\n    x: i32\n\nstruct W\n    r: @&C\n\nstruct K\n    n: i32\n\n"
+              "enum E\n    V(@&C)\n    N\n\nimpl K\n    fn take(self: @K, p: @&C) -> i32\n"
+              "        self.n\n\nfn g(p: @&C) -> i32\n    0\n\n")
 
 
 # A Vec method whose only use is through a field holding a reference to the Vec,
@@ -342,27 +312,6 @@ HELD = {
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", _ids(HELD))
-def test_a_method_used_only_through_a_held_reference_links(ritz1_bin, tmp_path, compiler, site):
-    fn, body = HELD[site]
-    src, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
-    src.write_text(_main("import ritzlib.gvec\n\n" + fn, "    var v = vec_new<u8>()\n" + body))
-    comp = _emit_alloc(compiler, ritz1_bin, src, ll)
-    assert comp.returncode == 0 and ll.exists(), comp.stdout + comp.stderr
-    link, exe = _link_alloc(compiler, ritz1_bin, ll, tmp_path)
-    assert link.returncode == 0, link.stderr
-    assert subprocess.run([str(exe)], capture_output=True, timeout=60).returncode == 2
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", _ids(NOT_THESE_RULES))
-def test_these_rules_stay_out_of_address_of(tmp_path, compiler, site):
-    comp, _, _ = _compile(compiler, tmp_path, site, _wrap(NOT_THESE_RULES[site]))
-    out = comp.stdout + comp.stderr
-    assert SHARED_INTO_MUT not in out and BORROW_THROUGH_SHARED not in out
-
-
 # An `@&T` reached through an `@T` (#2381): read-only reaches everything behind an
 # `@T`, so passing it on is refused like writing through it. `^` as above.
 MUTABLE_BEHIND = {
@@ -373,7 +322,74 @@ MUTABLE_BEHIND = {
 }
 
 
+# ---- the rows: {old id less `test_` and the compiler: ...} --------------------
+
+def _table(table_id, table, make):
+    return {f"{table_id}[{site}]": make(table[site]) for site in _ids(table)}
+
+
+# (program with `^` where the message must be, the whole message).
+REFUSALS = {
+    **_table("a_shared_value_into_a_mutable_slot_is_refused", VALUES, lambda b: (_wrap(b), SHARED_INTO_MUT)),
+    **_table("a_shared_value_at_each_slot_a_mutable_one_can_be", SITES,
+             lambda b: (_main(SLOT_TYPES + b.replace("{S}", "@&C").replace("{B}", "c: @C"), "    0\n"),
+                        SHARED_INTO_MUT)),
+    **_table("a_mutating_method_on_a_shared_receiver_is_refused", RECEIVERS,
+             lambda b: (_wrap(b), SHARED_INTO_MUT)),
+    **_table("a_mutable_borrow_behind_a_shared_reference_is_refused", PLACES,
+             lambda b: (_wrap(b), BORROW_THROUGH_SHARED)),
+    **_table("a_mutable_reference_behind_a_shared_one_is_refused", MUTABLE_BEHIND,
+             lambda b: (_wrap(b), SHARED_INTO_MUT)),
+}
+
+# (program, exit code).
+RUNS = _table("what_r1_keeps_still_runs", ALLOWED,
+              lambda r: (_main(TYPES + r[0], f"    var c = C {{ x: 1 }}\n    {r[1]}\n    c.x\n"), r[2]))
+
+# Linked with the real allocator, which push needs: each exits 2.
+HELD_ROWS = [Row(f"a_method_used_only_through_a_held_reference_links[{site}]", ALL,
+                 Run(_main("import ritzlib.gvec\n\n" + HELD[site][0],
+                           "    var v = vec_new<u8>()\n" + HELD[site][1]), 2))
+             for site in _ids(HELD)]
+
+# Compiled on its own, each must compile (COMPILES) or report neither of these
+# rules' messages (NOT_THESE_RULES): a batch can't vouch for either.
+COMPILE_ROWS = _table("what_r1_keeps_still_compiles", COMPILES, _wrap)
+STAYS_OUT = _table("these_rules_stay_out_of_address_of", NOT_THESE_RULES, _wrap)
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("site", _ids(MUTABLE_BEHIND))
-def test_a_mutable_reference_behind_a_shared_one_is_refused(tmp_path, compiler, site):
-    _assert_refused(compiler, tmp_path, site, _wrap(MUTABLE_BEHIND[site]), SHARED_INTO_MUT)
+def test_every_refusal(tmp_path, compiler):
+    assert_refusals(compiler, tmp_path, REFUSALS, {
+        **_gaps("a_shared_value_into_a_mutable_slot_is_refused", VALUE_GAPS, compiler),
+        **_gaps("a_mutating_method_on_a_shared_receiver_is_refused", RECEIVER_GAPS, compiler)})
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_what_r1_keeps_still_runs(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, RUNS, _gaps("what_r1_keeps_still_runs", ALLOWED_GAPS, compiler))
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_method_used_only_through_a_held_reference_links(ritz1_bin, tmp_path, compiler):
+    table_rows.assert_rows(compiler, HELD_ROWS, build=for_header.batch_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
+
+
+def _wrong_alone(compiler, tmp_path, k, name, src):
+    """Why row `name` fails compiled on its own, or None."""
+    comp, _, _ = _compile(compiler, tmp_path, f"row{k}", src)
+    out = comp.stdout + comp.stderr
+    if name in COMPILE_ROWS:
+        return None if comp.returncode == 0 else f"wanted it to compile, got:\n{out[-600:]}"
+    if SHARED_INTO_MUT in out or BORROW_THROUGH_SHARED in out:
+        return f"reported by these rules:\n{out[-600:]}"
+    return None
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_what_compiles_alone(tmp_path, compiler):
+    table = {**COMPILE_ROWS, **STAYS_OUT}
+    failures = [f"{name}: {why}" for k, (name, src) in enumerate(table.items())
+                for why in [_wrong_alone(compiler, tmp_path, k, name, src)] if why]
+    assert not failures, f"{compiler}: {len(failures)} of {len(table)} rows failed:\n" + "\n".join(failures)

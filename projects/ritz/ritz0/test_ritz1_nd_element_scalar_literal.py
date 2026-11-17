@@ -18,12 +18,17 @@ which one broke (the return value) on which type and rank.
 AGAST #2768: bool takes the comparison shapes on every rank too.  An N-D bool
 element store (`x[1][1] = true`) was refused "cannot use bool as an integer":
 the element's expression type fell to i64, so bool_check saw an integer slot.
+
+The cases are table rows (AGAST #3889): `test_rows_exit_right[<compiler>]`
+checks every row with test_row_table.assert_runs, each under the id its
+parametrised test had less the compiler (`nd_scalar_element_with_literal[2d-field-f32]`),
+and a failure names its rows.
 """
 
 import pytest
 
-from test_ritz1_array_ptr_element import (  # noqa: F401  (fixtures)
-    COMPILERS, SCALARS, run_with)
+from test_ritz1_array_ptr_element import COMPILERS, SCALARS
+from test_row_table import assert_runs
 
 # Where the array lives: its spelling, what comes before main, and the top of
 # main (`{ty}` is the full array type).
@@ -95,23 +100,17 @@ def _cells():
             yield rank, base
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", NUMERIC)
-@pytest.mark.parametrize("rank,base", list(_cells()))
-def test_nd_scalar_element_with_literal(run_with, rank, base, ty, compiler):
-    """Every numeric scalar, rank and base."""
-    program = _program(rank, base, ty)
-    assert run_with(compiler, f"s_{rank}_{base}_{ty}", program) == 42
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rank,base", list(_cells()))
-def test_bool_element_with_literal(run_with, rank, base, compiler):
-    """bool on every rank and base (#2768)."""
-    program = _program(rank, base, "bool")
-    assert run_with(compiler, f"b_{rank}_{base}", program) == 42
+def _rows():
+    """{old id less the compiler: (program, exit)}."""
+    rows = {}
+    for rank, base in _cells():
+        for ty in NUMERIC:  # every numeric scalar, rank and base
+            rows[f"nd_scalar_element_with_literal[{rank}-{base}-{ty}]"] = (_program(rank, base, ty), 42)
+        # bool on every rank and base (#2768)
+        rows[f"bool_element_with_literal[{rank}-{base}]"] = (_program(rank, base, "bool"), 42)
+    for rank in sorted(TICKET):
+        rows[f"ticket_repro[{rank}]"] = (TICKET[rank], 9)
+    return rows
 
 
 # The ticket's own repro, verbatim, plus its 3-D twin.
@@ -129,6 +128,5 @@ TICKET = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("rank", sorted(TICKET))
-def test_ticket_repro(run_with, rank, compiler):
-    assert run_with(compiler, f"ticket_{rank}", TICKET[rank]) == 9
+def test_rows_exit_right(ritz1_bin, tmp_path, compiler):
+    assert_runs(compiler, tmp_path, _rows())

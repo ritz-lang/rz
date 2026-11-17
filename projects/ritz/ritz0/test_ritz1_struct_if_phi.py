@@ -46,13 +46,20 @@ Not covered: string-literal arms (`"a"` / `"b"`) in a tail `if` of a
 broken on 5fb6e9bd too (`phi i64`): #2563.
 
 Oracle: ritz0 builds and runs every program with the same exit code.
+
+Every case is a row of one table (test_table_rows.py, AGAST #3889), checked a
+chunk at a time on ritz0 and ritz1; a row keeps the id its parametrised test
+had, less the compiler (`struct_if_chain[big-self-three_arm-tail-was_broken]`,
+`ticket_mixed_arms`), and a failure names each row that failed.
 """
 
 import itertools
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run
+import test_table_rows as table_rows
+from test_ref_into_value import _batch_build, _batch_compile
+from test_table_rows import Row, Run
 
 # 8 bytes: fits an i64.
 SMALL = """\
@@ -164,26 +171,13 @@ WAS_BROKEN = {
     if pos == "tail" or kind == "static_call"
 }
 
-MATRIX = [
-    pytest.param(
-        size,
-        kind,
-        chain,
-        pos,
-        id=f"{size}-{kind}-{chain}-{pos}"
-        + ("-was_broken" if (size, kind, chain, pos) in WAS_BROKEN else ""),
-    )
-    for size, kind, chain, pos in itertools.product(SIZES, ARMS, CHAINS, POSITIONS)
-]
+# The old ids, less the compiler: `struct_if_chain[small-param-two_arm-tail-was_broken]`.
+def _chain_id(size, kind, chain, pos):
+    broken = "-was_broken" if (size, kind, chain, pos) in WAS_BROKEN else ""
+    return f"struct_if_chain[{size}-{kind}-{chain}-{pos}{broken}]"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("size,kind,chain,position", MATRIX)
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_struct_if_chain(tmp_path, compiler, size, kind, chain, position):
-    name = f"sip_{size}_{kind}_{chain}_{position}"
-    program = _program(size, kind, chain, position)
-    assert _run(compiler, tmp_path, name, program) == _expected(kind, chain)
+COMPILERS = ("ritz0", "ritz1")
 
 
 # The ticket's program: mixed arms (param, self, static call) in a 3-arm
@@ -208,12 +202,6 @@ pub fn main() -> i32
     let c = a.pick(b)
     return c.w as i32
 """
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_ticket_mixed_arms(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "sip_ticket", TICKET) == 5
 
 
 # A tail `if` whose arms are both matches over struct arms: only the
@@ -253,12 +241,6 @@ pub fn main() -> i32
 """
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_tail_if_with_match_arm(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "sip_match_arm", MATCH_ARM) == 53
-
-
 # A tail `if` whose arms are both nested `if`s: only the nested statement
 # ifs' published phi type (last_if_stmt_agg_name) can type the outer phi.
 NESTED = """\
@@ -287,7 +269,19 @@ pub fn main() -> i32
 """
 
 
+# Every case on ritz0 and ritz1, as before; ritz1_selfhosted never ran these.
+TABLE = [
+    *(Row(_chain_id(size, kind, chain, pos), COMPILERS, Run(_program(size, kind, chain, pos), _expected(kind, chain)))
+      for size, kind, chain, pos in itertools.product(SIZES, ARMS, CHAINS, POSITIONS)),
+    Row("ticket_mixed_arms", COMPILERS, Run(TICKET, 5)),
+    Row("tail_if_with_match_arm", COMPILERS, Run(MATCH_ARM, 53)),
+    Row("tail_if_with_nested_if_arms", COMPILERS, Run(NESTED, 1 + 6 + 18 + 27)),
+]
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_tail_if_with_nested_if_arms(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "sip_nested", NESTED) == 1 + 6 + 18 + 27
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE, COMPILERS),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE, COMPILERS)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=_batch_build, compile=_batch_compile, work=tmp_path)

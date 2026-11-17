@@ -20,6 +20,16 @@ x[0] is in that byte either way.  Every check here compares the whole value.
 Each GRID program runs its checks in order and returns the number of the first
 that failed (see _CHECKS), so a red cell says which path broke.
 
+Every case is a test_table_rows `Row` under the id its parametrised test had,
+less the compiler (`element_is_a_pointer_to_its_own_type[field-bool]`), checked
+64 to a chunk by `test_every_row[<compiler>-<chunk>]` (AGAST #3889).  A failing
+row is named: `ritz1 element_shape[struct_copy]: want exit 0, got 3`.  A refusal
+row that comes with a Python traceback, or clang's "expected 'i64'", isn't one:
+`_compile_clean` hides its location, so the row fails as unlocated.
+
+COMPILERS, RITZ1S, SCALARS and the `compile_with` / `run_with` fixtures are
+imported by a dozen other modules: keep them.
+
 `p[i]` on a pointer TO an array of pointers stays refused (#2347, LARB's call):
 test_ritz1_array_pointer_index.py pins POINTER_ELEMENT.
 """
@@ -28,12 +38,27 @@ from pathlib import Path
 
 import pytest
 
+import test_table_rows as table_rows
 from test_borrow_param_ref_field import _compile, _run
+from test_ref_into_value import _batch_build, _batch_compile
+from test_table_rows import Refused, Row, Run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 RITZ1S = ["ritz1", "ritz1_selfhosted"]
+
+ROWS: list = []  # every case, under its old id less the compiler; TABLE below
+
+
+def _id(test: str, *params) -> str:
+    return f"{test}[{'-'.join(params)}]" if params else test
+
+
+def _runs(test: str, programs: dict, want: int = 0) -> None:
+    """A row per entry of `programs` ({param: program}), exiting `want` on all three."""
+    ROWS.extend(Row(_id(test, name), tuple(COMPILERS), Run(programs[name], want))
+                for name in sorted(programs))
 
 # Three distinct values, then the one the stores write.  Each differs from its
 # neighbours in the low byte AND above it, so neither a narrow nor a wide access
@@ -161,12 +186,9 @@ def run_with(ritz1_bin, tmp_path):
     return go
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("ty", sorted(SCALARS))
-@pytest.mark.parametrize("holder", sorted(HOLDERS))
-def test_element_is_a_pointer_to_its_own_type(run_with, holder, ty, compiler):
-    assert run_with(compiler, f"{holder}_{ty}", _grid_program(holder, ty)) == 0
+ROWS.extend(Row(_id("element_is_a_pointer_to_its_own_type", holder, ty), tuple(COMPILERS),
+                Run(_grid_program(holder, ty), 0))
+            for holder in sorted(HOLDERS) for ty in sorted(SCALARS))
 
 
 def _is(expr: str, want: str = "1") -> str:
@@ -332,11 +354,7 @@ SHAPES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SHAPES))
-def test_element_shape(run_with, name, compiler):
-    assert run_with(compiler, name, SHAPES[name]) == 0
+_runs("element_shape", SHAPES)
 
 
 # AGAST #2376: an element of a `[N]**T` is a `**T`, and `**b[i]` is a T: two
@@ -379,11 +397,7 @@ POINTER_TO_POINTER = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(POINTER_TO_POINTER))
-def test_pointer_to_pointer_element(run_with, name, compiler):
-    assert run_with(compiler, name, POINTER_TO_POINTER[name]) == 0
+_runs("pointer_to_pointer_element", POINTER_TO_POINTER)
 
 
 # The new stride mustn't reach here: `q - p` scaled q as if it were a count.
@@ -397,37 +411,21 @@ DIFFERENCES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(DIFFERENCES))
-def test_difference_of_pointers_is_not_a_stride(run_with, name, compiler):
-    assert run_with(compiler, name, _x(DIFFERENCES[name])) == 2
-
+_runs("difference_of_pointers_is_not_a_stride", {n: _x(p) for n, p in DIFFERENCES.items()}, 2)
 
 # An integer on the right is still a stride.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_minus_a_count_strides_back(run_with, compiler):
-    assert run_with(compiler, "minus", _x("    return " "*(a[0] - 1) as i32 - 1\n")) == 0
-
+ROWS.append(Row("minus_a_count_strides_back", tuple(COMPILERS),
+                Run(_x("    return " "*(a[0] - 1) as i32 - 1\n"), 0)))
 
 # Elements that aren't pointers keep their arithmetic: nothing here has a pointee.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_integer_element_has_no_stride(run_with, compiler):
-    program = "pub fn main() -> i32\n    var a: [2]i32\n    a[1] = 5\n    return a[1] + 1\n"
-    assert run_with(compiler, "integer", program) == 6
-
+ROWS.append(Row("an_integer_element_has_no_stride", tuple(COMPILERS),
+                Run("pub fn main() -> i32\n    var a: [2]i32\n    a[1] = 5\n    return a[1] + 1\n", 6)))
 
 # A store through an element is a store to a T, so a literal has to fit a T.
 # Each of these truncated without a word, or (`a[1][1]`) wrote through the value.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("target", ["*a[1]", "a[1][1]", "*(a[1] + 1)"])
-def test_literal_has_to_fit_the_pointee(compile_with, target, compiler):
-    comp, _, _ = compile_with(compiler, "fit", _x(f"    {target} = 70000\n    return 0\n"))
-    assert comp.returncode != 0
-    assert "does not fit in `i16`" in comp.stdout + comp.stderr
+ROWS.extend(Row(_id("literal_has_to_fit_the_pointee", target), tuple(COMPILERS),
+                Refused(_x(f"    {target} = 70000\n    return 0\n"), "does not fit in `i16`", located=False))
+            for target in ["*a[1]", "a[1][1]", "*(a[1] + 1)"])
 
 
 # The chain through `c[i][j]`, `*(c[i] + j)`.  ritz0 segfaulted (#2380) until
@@ -441,11 +439,7 @@ _INDEXED_ELEMENT = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("form", sorted(_INDEXED_ELEMENT))
-def test_element_of_indexed_element(run_with, form, compiler):
-    assert run_with(compiler, "indexed", _INDEXED_SETUP + _INDEXED_ELEMENT[form]) == 0
+_runs("element_of_indexed_element", {f: _INDEXED_SETUP + b for f, b in _INDEXED_ELEMENT.items()})
 
 
 # AGAST #2379: `a[i][j]` is `*(a[i] + j)`, so `@a[i][j]` is `a[i] + j`, a `*T`.
@@ -471,42 +465,24 @@ ELEMENT_ADDRESSES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ELEMENT_ADDRESSES))
-def test_address_of_element_index_is_the_sum(run_with, name, compiler):
-    assert run_with(compiler, f"addr_{name}", ELEMENT_ADDRESSES[name]) == 0
-
-
-# A range isn't an element, so it has no address either.  ritz0 refuses it with
-# a NotImplementedError traceback (#3088), the ritz1s in words.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_address_of_element_slice_is_refused(compile_with, compiler):
-    # AGAST #3088: ritz0 raised NotImplementedError (Range) from the `@` path.
-    _refused_at(compile_with, compiler, "addr_slice", _x("    let r = @a[1][0..2]\n    return 0\n"),
-                ELEMENT_NOT_SLICED, "9:14")
-
-
-# ritz0 slices no pointer element.  ritz1 took `a[1][0..2]` at stride 1.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_element_is_not_sliced(compile_with, compiler):
-    _refused_at(compile_with, compiler, "slice", _x("    let r = a[1][0..2]\n    return 0\n"),
-                ELEMENT_NOT_SLICED, "9:13")
-
+_runs("address_of_element_index_is_the_sum", ELEMENT_ADDRESSES)
 
 ELEMENT_NOT_SLICED = "an element of an array of pointers can't be sliced (only String, Vec and Span can)"
 
 
-def _refused_at(compile_with, compiler, name, program, message, where):
-    """`program` fails to compile with `message`, at `main.ritz:<where>:`."""
-    comp, _, _ = compile_with(compiler, name, program)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} took {name}"
-    assert "Traceback" not in out, out[-1500:]
-    assert message in out, out[-1500:]
-    assert f"main.ritz:{where}:" in out, out[-1500:]
+def _refused_at(test: str, program: str, message: str, where: tuple, compilers=COMPILERS) -> None:
+    """`program` refused with `message` at `main.ritz:<where>:`, and no traceback (_compile_clean)."""
+    ROWS.append(Row(test, tuple(compilers), Refused(program, message, at=where)))
+
+
+# A range isn't an element, so it has no address either.  ritz0 refused it with
+# a NotImplementedError traceback (#3088), the ritz1s in words.
+_refused_at("address_of_element_slice_is_refused", _x("    let r = @a[1][0..2]\n    return 0\n"),
+            ELEMENT_NOT_SLICED, (9, 14))
+
+# ritz0 slices no pointer element.  ritz1 took `a[1][0..2]` at stride 1.
+_refused_at("an_element_is_not_sliced", _x("    let r = a[1][0..2]\n    return 0\n"),
+            ELEMENT_NOT_SLICED, (9, 13))
 
 
 # AGAST #3088: `@x[lo..hi]` on any other place refuses as `x[lo..hi]` does, at
@@ -532,22 +508,15 @@ ADDR_OF_SLICE = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ADDR_OF_SLICE))
-def test_address_of_a_slice_is_refused_located(compile_with, name, compiler):
-    pre, body, message = ADDR_OF_SLICE[name]
-    program = _x(body + "    return 0\n", pre)
-    line = program.splitlines().index(body.splitlines()[-1]) + 1
-    _refused_at(compile_with, compiler, name, program, message, f"{line}:14")
-
+for _name in sorted(ADDR_OF_SLICE):
+    _pre, _body, _message = ADDR_OF_SLICE[_name]
+    _program = _x(_body + "    return 0\n", _pre)
+    _refused_at(_id("address_of_a_slice_is_refused_located", _name), _program, _message,
+                (_program.splitlines().index(_body.splitlines()[-1]) + 1, 14))
 
 # No store takes a range.  Each compiler says so in its own words.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_element_slice_is_not_a_store_target(compile_with, compiler):
-    comp, _, _ = compile_with(compiler, "slice_store", _x("    a[1][0..2] = 7\n    return 0\n"))
-    assert comp.returncode != 0
+ROWS.append(Row("an_element_slice_is_not_a_store_target", tuple(COMPILERS),
+                Refused(_x("    a[1][0..2] = 7\n    return 0\n"), None, located=False)))
 
 
 _FOR_G = "var g: [2]*i16\n\n"
@@ -564,19 +533,11 @@ FOR_OVER = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(FOR_OVER))
-def test_a_loop_binding_knows_its_pointee(run_with, compiler, name):
-    assert run_with(compiler, name, FOR_OVER[name]) == 0
-
+_runs("a_loop_binding_knows_its_pointee", FOR_OVER)
 
 # AGAST #2542 (was a #2377 known gap): `let c = *a[1]` with `a: [2]*S` is an S.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_inferred_copy_of_a_struct_element_deref(run_with, compiler):
-    program = _s("    let c = *a[1]\n" + _is("c.q", "2"))
-    assert run_with(compiler, "struct_inferred_copy", program) == 0
+ROWS.append(Row("inferred_copy_of_a_struct_element_deref", tuple(COMPILERS),
+                Run(_s("    let c = *a[1]\n" + _is("c.q", "2")), 0)))
 
 
 # AGAST #2377: an untyped `let` of a struct read through a pointer is that struct,
@@ -593,20 +554,12 @@ INFERRED_COPIES = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(INFERRED_COPIES))
-def test_untyped_let_through_a_pointer_is_the_struct(run_with, name, compiler):
-    program = _COPY_MAIN + f"    let c = {INFERRED_COPIES[name]}\n" + _is("c.q", "2")
-    assert run_with(compiler, name, program) == 0
-
+_runs("untyped_let_through_a_pointer_is_the_struct",
+      {n: _COPY_MAIN + f"    let c = {e}\n" + _is("c.q", "2") for n, e in INFERRED_COPIES.items()})
 
 # A copy, not an alias: writing `c` leaves s[1] alone.
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_untyped_let_of_an_element_index_is_a_copy(run_with, compiler):
-    program = _COPY_MAIN + "    var c = a[1][1]\n    c.q = 5\n" + _is("s[1].q + c.q", "7")
-    assert run_with(compiler, "element_index_copy", program) == 0
+ROWS.append(Row("untyped_let_of_an_element_index_is_a_copy", tuple(COMPILERS),
+                Run(_COPY_MAIN + "    var c = a[1][1]\n    c.q = 5\n" + _is("s[1].q + c.q", "7"), 0)))
 
 
 # AGAST #3058: with `b: [2]**S`, `b[1][0]` is `*(b[1] + 0)`, a `*S`, so `let c`
@@ -629,12 +582,7 @@ PTR_PTR_ELEMENT_INDEX = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(PTR_PTR_ELEMENT_INDEX))
-def test_ptr_ptr_element_index_is_a_pointer(run_with, name, compiler):
-    program = _PP_MAIN + PTR_PTR_ELEMENT_INDEX[name]
-    assert run_with(compiler, f"pp_{name}", program) == 0
+_runs("ptr_ptr_element_index_is_a_pointer", {n: _PP_MAIN + b for n, b in PTR_PTR_ELEMENT_INDEX.items()})
 
 
 # A Drop pointee isn't copied out: each compiler refuses it at the read, as
@@ -647,16 +595,10 @@ _DROP_LINE = _DROP_MAIN.count("\n") + 1
 DROP_READS = INFERRED_COPIES
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(DROP_READS))
-def test_untyped_let_does_not_copy_a_drop_pointee(compile_with, name, compiler):
-    program = _DROP_MAIN + f"    let c = {DROP_READS[name]}\n    return c.id\n"
-    comp, _, _ = compile_with(compiler, f"drop_{name}", program)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out
-    assert "cannot move out of a reference" in out, out
-    assert f":{_DROP_LINE}:13" in out, out
+for _name in sorted(DROP_READS):
+    _refused_at(_id("untyped_let_does_not_copy_a_drop_pointee", _name),
+                _DROP_MAIN + f"    let c = {DROP_READS[_name]}\n    return c.id\n",
+                "cannot move out of a reference", (_DROP_LINE, 13))
 
 
 # AGAST #2378: the clone of a generic `a:& [N]*T` took T for the element, so
@@ -676,11 +618,7 @@ GENERIC_PTR_ELEMENT = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(GENERIC_PTR_ELEMENT))
-def test_generic_pointer_element_mut_param(run_with, name, compiler):
-    assert run_with(compiler, f"generic_ptr_{name}", GENERIC_PTR_ELEMENT[name]) == 0
+_runs("generic_pointer_element_mut_param", GENERIC_PTR_ELEMENT)
 
 
 # What it still refuses: another length, or an element that isn't a `*T`.
@@ -690,16 +628,13 @@ GENERIC_PTR_WRONG = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(GENERIC_PTR_WRONG))
-def test_generic_pointer_element_refuses_another_array(compile_with, name, compiler):
-    program = _GENERIC_PTR_FN + "pub fn main() -> i32\n" + _X + GENERIC_PTR_WRONG[name]
-    comp, _, _ = compile_with(compiler, f"generic_ptr_wrong_{name}", program)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out
-    if compiler != "ritz0":
-        assert "the array isn't the one the parameter points at" in out, out
+# Refused by all three; the ritz1s say why.
+for _name in sorted(GENERIC_PTR_WRONG):
+    _program = _GENERIC_PTR_FN + "pub fn main() -> i32\n" + _X + GENERIC_PTR_WRONG[_name]
+    _test = _id("generic_pointer_element_refuses_another_array", _name)
+    ROWS.append(Row(_test, ("ritz0",), Refused(_program, None, located=False)))
+    ROWS.append(Row(_test, tuple(RITZ1S), Refused(
+        _program, "the array isn't the one the parameter points at", located=False)))
 
 
 # AGAST #3052: `p[i]` with `p: *S` is the S at `p + i`, a copy, as `*(p + i)`
@@ -715,11 +650,7 @@ POINTER_INDEX_READS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(POINTER_INDEX_READS))
-def test_pointer_index_reads_the_struct(run_with, name, compiler):
-    assert run_with(compiler, f"ptr_index_{name}", _T_MAIN + POINTER_INDEX_READS[name]) == 0
+_runs("pointer_index_reads_the_struct", {n: _T_MAIN + b for n, b in POINTER_INDEX_READS.items()})
 
 
 # ... and it isn't an i64: ritz1 took `let n: i64 = p[0]` silently.  Each says so
@@ -737,15 +668,12 @@ STRUCT_READS_AS_I64 = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("form", sorted(STRUCT_READS_AS_I64))
-def test_struct_read_through_a_pointer_is_not_an_integer(compile_with, form, compiler):
-    main, init = STRUCT_READS_AS_I64[form]
-    program = main + f"    let n: i64 = {init}\n    return 0\n"
-    message, col = NOT_AN_INTEGER[compiler.removesuffix("_selfhosted")]
-    _refused_at(compile_with, compiler, f"{form}_as_i64", program, message,
-                f"{main.count(chr(10)) + 1}:{col}")
+for _form in sorted(STRUCT_READS_AS_I64):
+    _main, _init = STRUCT_READS_AS_I64[_form]
+    for _who, (_message, _col) in NOT_AN_INTEGER.items():
+        _refused_at(_id("struct_read_through_a_pointer_is_not_an_integer", _form),
+                    _main + f"    let n: i64 = {_init}\n    return 0\n", _message,
+                    (_main.count("\n") + 1, _col), ["ritz0"] if _who == "ritz0" else RITZ1S)
 
 
 # AGAST #3188: nor is it any narrower integer.  ritz1 refused only the i64 lets;
@@ -759,26 +687,16 @@ NARROW_LETS = {
 _COPY_LINE = _COPY_MAIN.count("\n") + 1
 
 
-def _not_an_integer(compile_with, compiler, name, program, col):
-    """Refused, located on `_COPY_LINE`; ritz1 at `col`, in its own words."""
-    comp, _, _ = compile_with(compiler, name, program)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, f"{compiler} took {name}"
-    assert "Traceback" not in out and "expected 'i64'" not in out, out[-1500:]
-    if compiler == "ritz0":
-        assert f"main.ritz:{_COPY_LINE}:" in out, out[-1500:]
-    else:
-        assert "a whole struct is not a value here in ritz1" in out, out[-1500:]
-        assert f"main.ritz:{_COPY_LINE}:{col}:" in out, out[-1500:]
+def _not_an_integer(test, program, col):
+    """Refused on `_COPY_LINE` with no traceback or "expected 'i64'" (_compile_clean);
+    the ritz1s at `col`, in their own words."""
+    ROWS.append(Row(test, ("ritz0",), Refused(program, f"main.ritz:{_COPY_LINE}:")))
+    _refused_at(test, program, "a whole struct is not a value here in ritz1", (_COPY_LINE, col), RITZ1S)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(NARROW_LETS))
-def test_struct_pointee_is_not_a_narrow_integer(compile_with, name, compiler):
-    program = _COPY_MAIN + NARROW_LETS[name] + "    return 0\n"
-    col = NARROW_LETS[name].index("= ") + 3
-    _not_an_integer(compile_with, compiler, f"narrow_{name}", program, col)
+for _name in sorted(NARROW_LETS):
+    _not_an_integer(_id("struct_pointee_is_not_a_narrow_integer", _name),
+                    _COPY_MAIN + NARROW_LETS[_name] + "    return 0\n", NARROW_LETS[_name].index("= ") + 3)
 
 
 # ... nor a number in any other slot: `p[i]` and `a[i][j]` are refused at the
@@ -788,11 +706,32 @@ INDEX_SLOTS = {"returned": ("    return {}\n", 12), "added": ("    return {} + 1
                "cast": ("    return {} as i32\n", 12)}
 
 
+for _slot in sorted(INDEX_SLOTS):
+    for _form in ["p[0]", "a[1][1]"]:
+        _body, _col = INDEX_SLOTS[_slot]
+        _not_an_integer(_id("struct_pointee_index_is_not_a_number", _slot, _form),
+                        _COPY_MAIN + _body.format(_form), _col)
+
+
+def _compile_clean(compiler, src, work):
+    """_batch_compile, but a refusal with a traceback or clang's "expected 'i64'"
+    in it loses its `main.ritz:` locations, so no row is answered by it."""
+    code, out = _batch_compile(compiler, src, work)
+    for bad in ("Traceback", "expected 'i64'"):
+        if bad in out:
+            return code, f"[{bad!r} in the output: no location counts]\n" + out.replace("main.ritz:", "main.ritz?")
+    return code, out
+
+
+TABLE = ROWS
+for _c in COMPILERS:  # one row per id on each compiler
+    _ids = [r.id for r in table_rows.for_compiler(TABLE, _c)]
+    assert len(_ids) == len(set(_ids)), _c
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("form", ["p[0]", "a[1][1]"])
-@pytest.mark.parametrize("slot", sorted(INDEX_SLOTS))
-def test_struct_pointee_index_is_not_a_number(compile_with, slot, form, compiler):
-    body, col = INDEX_SLOTS[slot]
-    program = _COPY_MAIN + body.format(form)
-    _not_an_integer(compile_with, compiler, f"slot_{slot}_{form[0]}", program, col)
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=_batch_build, compile=_compile_clean, work=tmp_path)

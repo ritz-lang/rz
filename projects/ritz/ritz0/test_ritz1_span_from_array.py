@@ -14,13 +14,20 @@ ritz0 is the oracle: each expected exit status is checked against it too.
 
 AGAST #2781 (and #2366 for a parameter): the array's element must be the
 Span's T. MISMATCHED holds the refusals, the same located error on all three.
+
+Each test is now a table per compiler (AGAST #3889): FORMS through
+test_table_rows, MISMATCHED through test_row_table.assert_refusals.  A row
+keeps its old parametrised id, less the compiler, and a failure names it.
 """
 
 import pytest
 
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
 from array_rules import ELEMENT_MISMATCH
-from test_ref_into_value import _assert_refused
-from test_ritz1_move_param import _run
+from test_ritz1_slice_type import ritzlib_build
+from test_row_table import assert_refusals
+from test_table_rows import Row, Run
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
@@ -228,21 +235,26 @@ pub fn main() -> i32
 })
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(MISMATCHED))
-def test_span_from_array_of_other_element_is_refused(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    _assert_refused(compiler, tmp_path, name, MISMATCHED[name], ELEMENT_MISMATCH)
+# Every row is a row of a table under its old id, less the compiler.  The runs
+# link the ritzlib modules they import (test_ritz1_slice_type.ritzlib_build); the
+# refusals are test_row_table's, which wants ELEMENT_MISMATCH whole at the `^`,
+# as `_assert_refused` did.
+RUNS = [Row(f"span_from_array[{name}]", table_rows.ALL, Run(*FORMS[name])) for name in sorted(FORMS)]
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(FORMS))
-def test_span_from_array(request, tmp_path, compiler, name):
+def test_span_from_array_of_other_element_is_refused(request, tmp_path, compiler):
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-    program, expected = FORMS[name]
-    rc = _run(compiler, tmp_path, program)
-    assert rc == expected, f"{compiler} {name}: exit {rc}, expected {expected}"
+    assert_refusals(compiler, tmp_path, {name: (MISMATCHED[name], ELEMENT_MISMATCH)
+                                         for name in sorted(MISMATCHED)})
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(RUNS),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(RUNS)])
+def test_span_from_array(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(RUNS, compiler, chunk),
+                           build=ritzlib_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)

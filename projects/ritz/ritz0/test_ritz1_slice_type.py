@@ -18,14 +18,29 @@ directions. Controls pin `[N]T`, `[N][M]T` and `[N * 2]T`, which share the
 
 ritz0 is the oracle. Each program's expected exit status is checked against
 it, so an oracle change shows up as its own failure.
+
+The exit-code rows are one table (test_table_rows.py, AGAST #3889), checked a
+chunk at a time per compiler, linked with the ritzlib modules they import
+(`ritzlib_build`); the `[T]`-is-`Span<T>` IR comparison is one test per
+compiler over every row.  A row keeps the id its parametrised test had, less
+the compiler, and a failure names each row that failed.
 """
 
+import atexit
+import functools
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 import pytest
 
-from test_ritz1_move_param import _compile, _run
+import fast_link
+import ritz0_inproc
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
+from test_ritz1_move_param import _compile
+from test_table_rows import Row, Run
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
@@ -236,13 +251,6 @@ pub fn main() -> i32
 """, 6),
 }
 
-# Rows that fail on ritz1 and ritz1_selfhosted for a reason other than `[T]`.
-# `Span<T>` written out fails identically (test_slice_and_span_emit_the_same_ir
-# checks that), so each is the named ticket's, not #1614's. Strict: a fix
-# turns the row XPASS, and the gate red until the entry goes.
-RITZ1_GAPS: dict[str, str] = {}
-
-
 def _as_span(program: str) -> str:
     """The same program with every `[T]` written `Span<T>`."""
     return re.sub(r"\[(u8|i32)\]", r"Span<\1>", program)
@@ -282,55 +290,114 @@ pub fn main() -> i32
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SLICE_FORMS))
-def test_slice_type(request, tmp_path, compiler, name):
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    if compiler != "ritz0" and name in RITZ1_GAPS:
-        request.applymarker(pytest.mark.xfail(reason=RITZ1_GAPS[name], strict=True))
-    program, expected = SLICE_FORMS[name]
-    rc = _run(compiler, tmp_path, program)
-    assert rc == expected, f"{compiler} {name}: exit {rc}, expected {expected}"
+# ---- the table ----------------------------------------------------------------
+#
+# Every exit-code row is a test_table_rows Row under its old id, less the
+# compiler.  The programs import ritzlib, so a chunk links what they import
+# (`ritzlib_build`), as build.py would.
+
+TABLE = [
+    *(Row(f"slice_type[{name}]", table_rows.ALL, Run(*SLICE_FORMS[name])) for name in sorted(SLICE_FORMS)),
+    *(Row(f"array_type_controls[{name}]", table_rows.ALL, Run(*CONTROL_FORMS[name]))
+      for name in sorted(CONTROL_FORMS)),
+]
+
+
+@functools.cache
+def _closure(roots: tuple) -> tuple:
+    """`roots` and every ritzlib module they import, transitively."""
+    seen, todo = set(), list(roots)
+    while todo:
+        unit = todo.pop()
+        if unit not in seen:
+            seen.add(unit)
+            text = (for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz").read_text()
+            todo += re.findall(r"^import ritzlib\.(\w+)", text, re.MULTILINE)
+    return tuple(sorted(seen))
+
+
+@functools.cache
+def _unit_objects(compiler, ritz1_bin, units: tuple) -> tuple:
+    """`units` compiled by `compiler` to objects, once per process."""
+    work = Path(tempfile.mkdtemp(prefix=f"ritzlib_units_{compiler}_"))
+    atexit.register(shutil.rmtree, work, True)  # process-wide cache: see for_header._objects (#2875)
+    objects = []
+    for unit in units:
+        ll = work / f"{unit}.ll"
+        src = for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz"
+        if compiler == "ritz0":
+            # A library module, as build.py compiles one: without `--no-runtime`
+            # ritz0 makes what isn't `pub` internal (an `impl Drop` method too).
+            comp = ritz0_inproc.run_ritz0([str(src), "-o", str(ll), "--no-runtime"], cwd=work,
+                                          env=for_header.ENV, timeout=300)
+        else:
+            comp = for_header._emit(compiler, ritz1_bin, src, ll)
+        assert comp.returncode == 0, comp.stdout + comp.stderr
+        obj = work / f"{unit}.o"
+        fast_link.clang(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
+        objects.append(str(obj))
+    return tuple(objects)
+
+
+def ritzlib_build(ritz1_bin):
+    """batching.run_rows's `build`: compile the program and link every ritzlib
+    module it imports, transitively, as build.py links a package's; each module
+    compiled once per process by the same compiler, not once per row."""
+    def build(compiler, src, work):
+        roots = tuple(sorted(set(re.findall(r"^import ritzlib\.(\w+)", src.read_text(), re.MULTILINE))))
+        units = tuple(u for u in _closure(roots) if u not in for_header.UNITS)
+        return for_header.batch_build(ritz1_bin, lambda c: _unit_objects(c, ritz1_bin, units))(
+            compiler, src, work)
+    return build
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(SLICE_FORMS))
-def test_slice_and_span_emit_the_same_ir(request, tmp_path, compiler, name):
-    """`[T]` IS `Span<T>`: spelling every `[T]` out as `Span<T>` changes
-    nothing. Same IR when both compile; the same diagnostics when they don't
-    (the RITZ1_GAPS rows, whose failure is then Span's, not `[T]`'s)."""
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(TABLE),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(TABLE)])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk),
+                           build=ritzlib_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
+
+
+def _same_ir_wrong(compiler, work: Path, name: str):
+    """Why `[T]` and `Span<T>` spellings of SLICE_FORMS[name] differ, or None."""
     program = SLICE_FORMS[name][0]
-    assert _as_span(program) != program, "the rewrite must change something"
+    if _as_span(program) == program:
+        return "the rewrite must change something"
     outs = []
     for sub, text in (("slice", program), ("span", _as_span(program))):
-        d = tmp_path / sub
-        d.mkdir()
+        d = work / name / sub
+        d.mkdir(parents=True)
         comp, ll = _compile(compiler, d, text)
         diag = (comp.stdout + comp.stderr).replace(str(d), "<dir>")
         ir = ll.read_text().replace(str(d), "<dir>") if ll.exists() else None
         outs.append((comp.returncode, ir, diag))
     (rc_a, ir_a, diag_a), (rc_b, ir_b, diag_b) = outs
-    assert "Traceback" not in diag_a + diag_b, diag_a[-2000:] + diag_b[-2000:]
-    assert rc_a == rc_b, f"{compiler} {name}: `[T]` exit {rc_a}, `Span<T>` exit {rc_b}:\n{diag_a[-1500:]}"
-    assert ir_a == ir_b, f"{compiler} {name}: `[T]` and `Span<T>` emit different IR"
-    if ir_a is None:
-        assert diag_a == diag_b, f"{compiler} {name}: different diagnostics"
+    if "Traceback" in diag_a + diag_b:
+        return diag_a[-2000:] + diag_b[-2000:]
+    if rc_a != rc_b:
+        return f"`[T]` exit {rc_a}, `Span<T>` exit {rc_b}:\n{diag_a[-1500:]}"
+    if ir_a != ir_b:
+        return "`[T]` and `Span<T>` emit different IR"
+    if ir_a is None and diag_a != diag_b:
+        return "different diagnostics"
+    return None
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(CONTROL_FORMS))
-def test_array_type_controls(request, tmp_path, compiler, name):
+def test_slice_and_span_emit_the_same_ir(request, tmp_path, compiler):
+    """`[T]` IS `Span<T>`: spelling every `[T]` out as `Span<T>` changes
+    nothing. Same IR when both compile; the same diagnostics when they don't.
+
+    One test per compiler over every SLICE_FORMS row; a failure names each
+    row (`slice_and_span_emit_the_same_ir[<name>]`) and what differed."""
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-    program, expected = CONTROL_FORMS[name]
-    rc = _run(compiler, tmp_path, program)
-    assert rc == expected, f"{compiler} {name}: exit {rc}, expected {expected}"
+    failures = [f"{compiler} slice_and_span_emit_the_same_ir[{name}]: {why}"
+                for name in sorted(SLICE_FORMS) if (why := _same_ir_wrong(compiler, tmp_path, name))]
+    assert not failures, f"{len(failures)} of {len(SLICE_FORMS)} rows failed:\n" + "\n".join(failures)
 
 
 @pytest.mark.integration
