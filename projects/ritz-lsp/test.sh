@@ -10,7 +10,8 @@
 # - ... and on a function the document imports, the same from the imported
 #   file, resolved as ritz1 resolves it, exported names only (#3884).
 # - didOpen / didChange publish diagnostics from a ritz1 compile of the
-#   buffer (#2789). A stub ritz1 (via $RITZ1) pins how its stderr becomes
+#   buffer (#2789), once input pauses: a burst of changes the server has not
+#   yet read compiles once and publishes the last version only (#3902). A stub ritz1 (via $RITZ1) pins how its stderr becomes
 #   diagnostics; the real ritz1, when it is built, pins the end-to-end
 #   answer and the default lookup next to the monorepo's ritz1.
 # - A ritz1 that hangs is killed at the deadline, reaped, reported as one
@@ -86,6 +87,70 @@ def session(msgs, argv=(), env=None, cwd=None):
     for m in re.finditer(rb"Content-Length: (\d+)\r\n\r\n", p.stdout):
         out.append(json.loads(p.stdout[m.end():m.end() + int(m.group(1))]))
     return p.returncode, out
+
+class Live:
+    """A server driven one step at a time. `first` is written into its stdin
+    pipe before it starts, so it reads all of `first` as one burst."""
+    def __init__(self, first, env, cwd=None):
+        r, w = os.pipe()
+        os.write(w, b"".join(map(frame, first)))  # well under the pipe's 64K
+        self.p = subprocess.Popen([BIN], stdin=r, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=env, cwd=cwd)
+        os.close(r)
+        self.w, self.buf, self.out = w, b"", []
+
+    def send(self, *msgs):
+        os.write(self.w, b"".join(map(frame, msgs)))
+
+    def until(self, pred, timeout=15):
+        """Read messages until one satisfies pred; return it (None on timeout)."""
+        import select, time
+        end = time.monotonic() + timeout
+        while True:
+            while (m := re.search(rb"Content-Length: (\d+)\r\n\r\n", self.buf)) \
+                    and len(self.buf) >= m.end() + int(m.group(1)):
+                msg = json.loads(self.buf[m.end():m.end() + int(m.group(1))])
+                self.buf = self.buf[m.end() + int(m.group(1)):]
+                self.out.append(msg)
+                if pred(msg):
+                    return msg
+            left = end - time.monotonic()
+            if left <= 0 or not select.select([self.p.stdout], [], [], left)[0]:
+                return None
+            chunk = os.read(self.p.stdout.fileno(), 65536)
+            if not chunk:
+                return None
+            self.buf += chunk
+
+    def publish(self, timeout=15):
+        return self.until(lambda m: m.get("method") == "textDocument/publishDiagnostics", timeout)
+
+    def finish(self):
+        """shutdown + exit; return the exit code (None if it did not exit)."""
+        self.send({"jsonrpc": "2.0", "id": 99, "method": "shutdown"},
+                  {"jsonrpc": "2.0", "method": "exit"})
+        self.until(lambda m: m.get("id") == 99)
+        os.close(self.w)
+        try:
+            return self.p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.p.kill()
+            self.p.wait()
+            return None
+
+INIT = [{"jsonrpc": "2.0", "id": 1, "method": "initialize",
+         "params": {"processId": None, "rootUri": None, "capabilities": {}}},
+        {"jsonrpc": "2.0", "method": "initialized", "params": {}}]
+
+def stepwise(steps, env, cwd=None):
+    """Each step after the previous step's publish (an editor's pace)."""
+    lv = Live(INIT + [steps[0]], env, cwd)
+    lv.publish()
+    for s in steps[1:]:
+        lv.send(s)
+        lv.publish()  # didClose publishes the empty list
+    rc = lv.finish()
+    return rc, lv.out
 
 def by_id(out):
     return {m["id"]: m for m in out if "id" in m}
@@ -390,15 +455,16 @@ mixed = ("#! {in}:1:1: error: first\n"
          "#! {in}:9:2: error: \"quoted\" \\ msg\n"
          "#exit 1\n")
 silent_fail = "#exit 3\n"
-rc, out = session([did_open(duri, bad, 1), did_change(duri, "fn main() -> i32\n    0\n", 2),
-                   did_change(duri, mixed, 3), did_change(duri, silent_fail, 4),
-                   {"jsonrpc": "2.0", "method": "textDocument/didClose",
-                    "params": {"textDocument": {"uri": duri}}}], env=STUB)
+rc, out = stepwise([did_open(duri, bad, 1), did_change(duri, "fn main() -> i32\n    0\n", 2),
+                    did_change(duri, mixed, 3), did_change(duri, silent_fail, 4),
+                    {"jsonrpc": "2.0", "method": "textDocument/didClose",
+                     "params": {"textDocument": {"uri": duri}}}], env=STUB)
 d = diags(out)
 check("stub: didClose clears the document's diagnostics",
       d[-1:] == [{"uri": duri, "diagnostics": []}], repr(d[-1:]))
 d = d[:-1]
-check("stub: one publishDiagnostics per open/change", len(d) == 4, repr(d))
+check("stub: one publishDiagnostics per open/change sent after the last publish",
+      len(d) == 4, repr(d))
 check("stub: diagnostics name the document's uri", d and all(x.get("uri") == duri for x in d), repr(d))
 check("stub: diagnostics carry the document version",
       [x.get("version") for x in d] == [1, 2, 3, 4], repr([x.get("version") for x in d]))
@@ -428,7 +494,7 @@ check("stub: a failed compile with no error line -> one diagnostic naming the ex
 check("stub: clean exit", rc == 0, f"exit {rc}")
 
 calls = [json.loads(l) for l in log.read_text().splitlines()] if log.exists() else []
-check("stub: ritz1 ran once per open/change", len(calls) == 4, repr(calls))
+check("stub: ritz1 ran once per open/change sent after the last publish", len(calls) == 4, repr(calls))
 calls += [{"argv": [""], "text": ""}] * 4
 first = calls[0]["argv"]
 check("stub: ritz1 compiles the buffer, not the file on disk", calls[0]["text"] == bad, repr(calls[0]))
@@ -457,6 +523,53 @@ check("stub: a byte column after é€😀 becomes a UTF-16 range over the name"
 check("stub: a byte column past the line end stays past it, in units",
       got[1].get("range", {}).get("start") == {"line": 1, "character": u16(mb_line) + 2}, repr(got[1]))
 
+# --- a burst of changes compiles once, for the last version (#3902) ---------
+# Everything up to the first publish is in the server's stdin before it reads
+# any of it: two documents opened, one changed three times, then a hover. The
+# server answers the hover, compiles each document once for its latest text,
+# and publishes that version only. A change sent after that publish still
+# gets its own. The stub records each compile's text.
+log.unlink(missing_ok=True)
+buri = (docdir / "burst.ritz").as_uri()
+ouri = (docdir / "other.ritz").as_uri()
+vtext = lambda v: f"# version {v}\n#! {{in}}:1:1: error: v{v}\n#exit 1\n"
+lv = Live(INIT + [did_open(buri, vtext(1), 1), did_open(ouri, vtext(10), 10),
+                  did_change(buri, vtext(2), 2), did_change(buri, vtext(3), 3),
+                  did_change(buri, vtext(4), 4), req(2, "textDocument/hover", buri, 0, 0)], STUB)
+lv.until(lambda m: m.get("id") == 2)
+if len(diags(lv.out)) < 2:
+    lv.until(lambda m: len(diags(lv.out)) >= 2)
+lv.send(req(3, "textDocument/hover", buri, 0, 0))   # a round trip: nothing else queued
+lv.until(lambda m: m.get("id") == 3)
+burst = diags(lv.out)
+check("burst: one publish per document, for its last version",
+      sorted((x["uri"], x["version"]) for x in burst) == sorted([(buri, 4), (ouri, 10)]),
+      repr([(x["uri"], x["version"]) for x in burst]))
+check("burst: the published diagnostics are the last version's",
+      [x["diagnostics"][0]["message"] for x in burst if x["uri"] == buri] == ["v4"], repr(burst))
+calls = [json.loads(l)["text"] for l in log.read_text().splitlines()] if log.exists() else []
+check("burst: ritz1 ran once per document, on the last text",
+      sorted(calls) == sorted([vtext(4), vtext(10)]), repr(calls))
+kinds = [m.get("id", m.get("method")) for m in lv.out]
+check("burst: a request in the burst is answered before the compiles",
+      2 in kinds and "textDocument/publishDiagnostics" in kinds
+      and kinds.index(2) < kinds.index("textDocument/publishDiagnostics"), repr(kinds))
+lv.send(did_change(buri, vtext(5), 5))
+p5 = (lv.publish() or {}).get("params")
+check("burst: a change after the publish gets its own",
+      p5 is not None and p5.get("version") == 5
+      and (p5.get("diagnostics") or [{}])[0].get("message") == "v5", repr(p5))
+check("burst: clean exit", lv.finish() == 0, "")
+check("burst: nothing else published", len(diags(lv.out)) == 3, repr(diags(lv.out)))
+
+# Every open document is published even if input never pauses: shutdown
+# right behind the burst still gets each one's last version, before its reply.
+rc, out = session([did_open(buri, vtext(1), 1), did_change(buri, vtext(2), 2)], env=STUB)
+kinds = [m.get("id", m.get("method")) for m in out]
+check("burst: shutdown publishes what is still pending, before replying",
+      [(x["uri"], x["version"]) for x in diags(out)] == [(buri, 2)]
+      and kinds[-2:] == ["textDocument/publishDiagnostics", 99], repr(kinds))
+
 # --- a ritz1 that hangs (#3883) ---------------------------------------------
 # The stub records its pid and sleeps, holding stderr open. The server must
 # kill it at its deadline (COMPILE_DEADLINE_SECS, 5s), publish one warning,
@@ -483,8 +596,7 @@ try:
         {"jsonrpc": "2.0", "id": 1, "method": "initialize",
          "params": {"processId": None, "rootUri": None, "capabilities": {}}},
         {"jsonrpc": "2.0", "method": "initialized", "params": {}},
-        did_open(duri, "fn helper() -> i32\n    1\n"),
-        req(2, "textDocument/hover", duri, 0, 4)])))
+        did_open(duri, "fn helper() -> i32\n    1\n")])))
     srv.stdin.flush()
     end = t0 + DEADLINE + 7
     while hover is None and time.monotonic() < end:
@@ -500,6 +612,11 @@ try:
             got.append(msg)
             if msg.get("method") == "textDocument/publishDiagnostics" and diag_at is None:
                 diag_at = time.monotonic() - t0
+                # The request comes after the timed-out compile, not with
+                # the open: a request queued behind a change is answered
+                # before the compile (#3902).
+                srv.stdin.write(frame(req(2, "textDocument/hover", duri, 0, 4)))
+                srv.stdin.flush()
             if msg.get("id") == 2:
                 hover = msg
     pid = int(hang_pid.read_text()) if hang_pid.exists() else None
@@ -545,8 +662,8 @@ if REAL_RITZ1.is_file():
     ruri = (docdir / "real.ritz").as_uri()
     undefined = "fn main() -> i32\n    nope(1)\n"
     uses_ritzlib = 'import ritzlib.io\n\nfn main() -> i32\n    prints_cstr(c"hi\\n")\n    0\n'
-    rc, out = session([did_open(ruri, undefined, 1), did_change(ruri, uses_ritzlib, 2)],
-                      env=env, cwd=str(scratch))
+    rc, out = stepwise([did_open(ruri, undefined, 1), did_change(ruri, uses_ritzlib, 2)],
+                       env=env, cwd=str(scratch))
     d = diags(out) + [{}, {}]
     got = d[0].get("diagnostics") or [{}]
     check("ritz1: a call to an undefined fn is an error at the call",

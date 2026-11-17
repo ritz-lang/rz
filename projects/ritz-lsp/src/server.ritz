@@ -69,6 +69,8 @@ fn handle_shutdown(s: *Server, msg: *LspMessage)
     eprints_cstr(c"[ritz-lsp] Handling shutdown\n")
     s.shutdown_requested = 1
 
+    # Every open document gets its diagnostics, even if input never paused.
+    publish_pending(s)
     build_response(msg.id, c"null", @s.response_buf)
     write_message_vec(@s.response_buf)
 
@@ -103,8 +105,8 @@ fn handle_did_open(s: *Server, msg: *LspMessage)
     eprints_cstr(uri)
     eprints_cstr(c"\n")
 
+    # Marks it dirty; published once input pauses (publish_pending).
     document_open(@s.documents, uri, text, version)
-    publish_diagnostics(s, uri)
 
 # Handle textDocument/didChange
 fn handle_did_change(s: *Server, msg: *LspMessage)
@@ -139,8 +141,8 @@ fn handle_did_change(s: *Server, msg: *LspMessage)
     eprints_cstr(uri)
     eprints_cstr(c"\n")
 
+    # Marks it dirty; a burst of changes compiles once, for the last.
     document_change(@s.documents, uri, text, version)
-    publish_diagnostics(s, uri)
 
 # Handle textDocument/didClose
 fn handle_did_close(s: *Server, msg: *LspMessage)
@@ -173,16 +175,25 @@ fn handle_did_close(s: *Server, msg: *LspMessage)
     build_notification(c"textDocument/publishDiagnostics", s.result_buf.data, @s.response_buf)
     write_message_vec(@s.response_buf)
 
-# textDocument/publishDiagnostics for open document `uri`, from a ritz1
+# textDocument/publishDiagnostics for open document `doc`, from a ritz1
 # compile of its text (diagnostics.ritz).
-fn publish_diagnostics(s: *Server, uri: *u8)
-    let doc: *Document = document_get(@s.documents, uri)
-    if doc == null or doc.content == null
+fn publish_diagnostics(s: *Server, doc: *Document)
+    if doc.content == null
         return
     diagnostics_json(doc.uri, doc.version, doc.content, doc.content_len, @s.result_buf)
     vec_push<u8>(@&s.result_buf, 0)
     build_notification(c"textDocument/publishDiagnostics", s.result_buf.data, @s.response_buf)
     write_message_vec(@s.response_buf)
+
+# Publish every document opened or changed since its last publish, each for
+# its latest version only (#3902). Compiling per didChange would cost a ritz1
+# run per keystroke in a burst before the next request is answered.
+fn publish_pending(s: *Server)
+    loop
+        let doc: *Document = document_take_dirty(@s.documents)
+        if doc == null
+            return
+        publish_diagnostics(s, doc)
 
 # The open document and position a hover/definition request names, or null
 # (the request names no open document). Sets *line / *col.
@@ -279,6 +290,10 @@ pub fn server_run(s: *Server) -> i32
     eprints_cstr(c"[ritz-lsp] Server starting...\n")
 
     loop
+        # Compile only when no more input is waiting: the changes already
+        # queued would replace the text before anyone saw its diagnostics.
+        if not input_pending()
+            publish_pending(s)
         let json_str: *u8 = read_message()
         if json_str == null
             eprints_cstr(c"[ritz-lsp] Connection closed\n")
