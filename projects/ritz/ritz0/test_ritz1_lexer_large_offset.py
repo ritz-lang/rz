@@ -28,12 +28,10 @@ One case per reachable token path, because each path had its own
 green". A mutation run (revert one site, expect exactly its case red) confirms
 four of the five sites are individually covered.
 
-The fifth — the hand-written `c"..."` prefix scanner — CANNOT be covered: a
-`c"` with a closing quote anywhere after it is a TOK_CSTRING by the longest
-match, and one without can never close on its own line. Since AGAST #1821 it
-is lexer_scan_string reached from the identifier `c`, the same function (and
-the same i64 `start`) as the `string-literal` case. The `cstring-literal`
-case below exercises lexer_emit's c"..." path. The exit code
+The fifth — the hand-written `c"..."` prefix scanner — is gone: since AGAST
+#3886 a `c"` goes straight to lexer_scan_string, the same function (and the
+same i64 `start`) as the `string-literal` case, which the `cstring-literal`
+case below reaches through its c"..." prefix. The exit code
 separates "wrong offset" (the defect, 3) from "wrong token kind" (a broken
 probe, 4) — a probe that lexes the wrong thing proves nothing either way.
 
@@ -94,7 +92,7 @@ CASES = [
     pytest.param('c"\\"ab\\" "', 5, "TOK_STRING", id="string-literal"),
     # newline token path
     pytest.param('c"\\nx"', 2, "TOK_NEWLINE", id="newline"),
-    # c"..." literal — matched by lexer_scan_ident, i.e. lexer_emit again
+    # c"..." literal — lexer_scan_string with its two-byte prefix
     pytest.param('c"c\\"ab\\" "', 6, "TOK_CSTRING", id="cstring-literal"),
     # no pattern matches -> single-char error token path
     pytest.param('c"` "', 2, "TOK_ERROR", id="error-token"),

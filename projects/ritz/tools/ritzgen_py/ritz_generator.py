@@ -129,7 +129,7 @@ SCANNED_REGEX_TOKENS = {
     'FLOAT': r'[0-9]+\.[0-9]+',                     # lexer_scan_number
     'STRING': r'"([^"\\]|\\.)*"',                 # lexer_scan_string
     'CHAR': r"'([^'\\]|\\.|\\x[^'\n]*)'",         # lexer_scan_char
-    'CSTRING': r'c"([^"\\]|\\.)*"',               # lexer_cstring_end
+    'CSTRING': r'c"([^"\\]|\\.)*"',               # lexer_scan_string
     'WHITESPACE': r'[ \t\r]+',                      # lexer_next_token
     'COMMENT': r'#[^\n]*',                          # lexer_skip_comment
 }
