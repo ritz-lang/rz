@@ -437,10 +437,12 @@ def test_store_into_cast_or_arith_base(tmp_path, compiler, name):
 # integer base in ritz0's words for `n[i] = v`.  ritz1 only: ritz0 raises a
 # traceback on the integer bases (AGAST #3754) and stores through
 # `(@a[0] + 1)[i]`, which ritz1 is to route (AGAST #3757).
+# The integer bases' error is at the `[` (index_scalar_check, AGAST #3755);
+# the store's own is at the target.
 EXPR_BASE_REFUSED = {
-    "int_arith": ("    (n + 1)[0] = 5\n", "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
-    "int_cast": ("    (n as i64)[0] = 5\n", "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
-    "untyped_arith": ("    (@a[0] + 1)[0] = 5\n",
+    "int_arith": ("    (n + 1)[0] = 5\n", 12, "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
+    "int_cast": ("    (n as i64)[0] = 5\n", 15, "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
+    "untyped_arith": ("    (@a[0] + 1)[0] = 5\n", 6,
                       "can't store through this element: ritz1 stores into `x[i]` here only when `x` "
                       "is a `*T` or `**T` it can type"),
 }
@@ -449,15 +451,16 @@ EXPR_BASE_REFUSED = {
 @pytest.mark.parametrize("compiler", COMPILERS[1:])
 @pytest.mark.parametrize("name", sorted(EXPR_BASE_REFUSED))
 def test_store_into_untyped_base_refused(tmp_path, compiler, name):
-    line, msg = EXPR_BASE_REFUSED[name]
+    line, col, msg = EXPR_BASE_REFUSED[name]
     body = "fn f()\n    var a: [2]i32 = [1, 2]\n    var n: i64 = 0\n" + line
     comp, ll, _ = _compile(compiler, tmp_path, f"expr_base_refused_{name}", _source(body, "f()", 0))
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {line.strip()!r}:\n{out[-1000:]}"
     assert not ll.exists()
     found = re.findall(r"main\.ritz:(\d+:\d+): error: (.*)", out)
-    where = f"{PRELUDE.count(chr(10)) + 4}:6"
+    where = f"{PRELUDE.count(chr(10)) + 4}:{col}"
     assert (where, msg) in found, f"{compiler}: wanted {msg!r} at {where}:\n{out[-2000:]}"
+    assert len(found) == 1, f"{compiler}: reported more than once:\n{out[-2000:]}"
 
 
 # §3.3: a Drop array local needs an initialiser; the error is at the name.

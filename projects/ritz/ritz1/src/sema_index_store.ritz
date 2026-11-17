@@ -18,7 +18,7 @@
 # store through it (isc_base_ok: a local, param, global, field, cast or named
 # call that is a `**T`, or a `*T` with a scalar or known-struct pointee,
 # under any `+ k` / `- k` chain), a base that is
-#   - of an integer, float or bool type, in ritz0's words for `n[i]` (§7.8);
+#   - of an integer, float or bool type (index_scalar_check reports it);
 #   - pointer arithmetic, which no view takes (`(@a[0] + 1)[i]`); or
 #   - a name or call Sema types as a `*T` to such a scalar.
 
@@ -118,12 +118,9 @@ pub fn index_store_check(sm: *Sema, target: *Expr)
         return
     if isc_base_ok(sm, base) == 1
         return
-    let bk: i32 = sema_expr_type(sm, base)
-    if primitive_name_len(bk) > 0
-        sema_error_at(sm, target.span.line, target.span.col)
-        eprints_cstr(c"`")
-        eprints_cstr(primitive_name_from_type(bk))
-        eprints_cstr(c"` can't be indexed: it doesn't implement `Index` (§7.8)\n")
+    # A scalar base is index_scalar_check's, which sema_walk runs on the
+    # target as on any other index (AGAST #3755).
+    if primitive_name_len(sema_expr_type(sm, base)) > 0
         return
     # Pointer arithmetic is no view index_through takes: only
     # emit_ptr_base_index_store stores through it.
@@ -131,3 +128,38 @@ pub fn index_store_check(sm: *Sema, target: *Expr)
         return
     sema_error_at(sm, target.span.line, target.span.col)
     eprints_cstr(c"can't store through this element: ritz1 stores into `x[i]` here only when `x` is a `*T` or `**T` it can type\n")
+
+# AGAST #3755: an index of an integer, float or bool has nothing to index.
+# ritz1 read the value as an address (`var n: i64 = 0` then `n[0] = 5` or
+# `n[0]` SIGSEGVd): the emitter's scalar_local_refused (index_through.ritz)
+# leaves an `i64` / `u64` local alone, since an emitter local may carry a
+# pointer as one, but Sema binds the declared type.  ritz0's words, at the
+# `[`, from _index_through.  A slice (`n[a..b]`) is index_through's to refuse.
+
+# Report `[`-located §7.8 words when `kind` is a scalar; 1 if it reported.
+fn isc_scalar_refused(sm: *Sema, kind: i32, line: i32, col: i32) -> i32
+    if primitive_name_len(kind) == 0
+        return 0
+    sema_error_at(sm, line, col)
+    eprints_cstr(c"`")
+    eprints_cstr(primitive_name_from_type(kind))
+    eprints_cstr(c"` can't be indexed: it doesn't implement `Index` (§7.8)\n")
+    1
+
+# `e`, an EXPR_INDEX read or store target, whose base Sema types as a scalar.
+# sema_walk_expr calls this for every index it visits.
+pub fn index_scalar_check(sm: *Sema, e: *Expr)
+    if e.left == null or e.right == null or e.right.kind == EXPR_RANGE
+        return
+    var line: i32 = e.span.line
+    var col: i32 = e.span.col
+    if e.bracket.line > 0   # index_through's index_bracket_line / _col
+        line = e.bracket.line
+        col = e.bracket.col
+    isc_scalar_refused(sm, sema_expr_type(sm, e.left), line, col)
+
+# `st`, a STMT_INDEX_ASSIGN `n[i] = v` / `n[i] op= v`, whose name Sema types
+# as a scalar.  Its `[` is st.bracket.
+pub fn index_name_scalar_check(sm: *Sema, st: *Stmt)
+    var t: SemaTy
+    isc_scalar_refused(sm, sema_name_ty(sm, st.assign_target, st.assign_target_len, @t), st.bracket.line, st.bracket.col)
