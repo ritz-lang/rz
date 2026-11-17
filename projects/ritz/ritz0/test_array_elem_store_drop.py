@@ -461,6 +461,88 @@ def test_load_from_cast_ptr_ptr_base(tmp_path, compiler):
     assert rc == 42, f"{compiler}: D % 200 == {rc}, spec says D == 634"
 
 
+# Reading `(e as *T)[i]` and `(q + k)[i]` loads element i at the pointee's
+# stride and width, as the stores above write one: a scalar, a `%S` (a copy
+# only) or, through a `**T`, a pointer.  ritz1 read one byte at `base + i`:
+# 300's byte 1, an i64 into a `%S` slot (clang refused it), or a SIGSEGV
+# (AGAST #3833).
+EXPR_BASE_LOAD = {
+    # `base()` is evaluated once (6); element 1 is 7, not byte 1 of 300.
+    "cast_scalar": ("""\
+var P: i64 = 0
+
+fn base() -> i64
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var a: [3]i32 = [300, 7, 9]
+    P = @a[0] as i64
+    let v: i32 = (base() as *i32)[1]
+    D = D * 10 + v as i64
+""", "f()", 67),
+    "cast_struct": ("""\
+struct V
+    x: i64
+    y: i64
+
+var P: i64 = 0
+
+fn f()
+    var a: [2]V = [V { x: 1, y: 2 }, V { x: 3, y: 4 }]
+    P = @a[0] as i64
+    let v: V = (P as *V)[1]
+    D = (D * 10 + v.x) * 10 + v.y
+""", "f()", 34),
+    "arith_scalar": ("""\
+fn f()
+    var a: [3]i32 = [300, 7, 9]
+    let q: *i32 = @a[0]
+    D = D * 10 + (q + 1)[1] as i64
+""", "f()", 9),
+    "arith_pointer": ("""\
+fn f()
+    var x: i32 = 1
+    var y: i32 = 3
+    var z: i32 = 5
+    var ps: [3]*i32 = [@x, @y, @z]
+    let q: **i32 = @ps[0]
+    let r: *i32 = (q + 1)[1]
+    D = D * 10 + *r as i64
+""", "f()", 5),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(EXPR_BASE_LOAD))
+def test_load_from_cast_or_arith_base(tmp_path, compiler, name):
+    body, call, want = EXPR_BASE_LOAD[name]
+    rc = _run(compiler, tmp_path, f"expr_base_load_{name}", _source(body, call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
+
+
+# The `%S` element is a copy only: as an integer it is refused at the element,
+# as `p[i]` with `p: *S` is (AGAST #3188), not handed to clang.
+STRUCT_ELEM_AS_INT = {
+    "ritz0": "cannot cast struct `V` to `i64`: a struct is not an integer "
+             "(read one of its fields, or take its address with @)",
+    "ritz1": "a whole struct is not a value here in ritz1 (copy it into a `let s: S`, or read its fields)",
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_struct_elem_of_cast_base_as_int_refused(tmp_path, compiler):
+    body = "struct V\n    x: i64\n    y: i64\n\nfn f(p: i64)\n    let n: i64 = (p as *V)[1] as i64\n"
+    comp, ll, _ = _compile(compiler, tmp_path, "cast_struct_as_int", _source(body, "f(0)", 0))
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted a whole `%V` as an i64:\n{out[-1000:]}"
+    assert not ll.exists()
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    where = f"{PRELUDE.count(chr(10)) + 6}:19"
+    msg = STRUCT_ELEM_AS_INT[compiler if compiler == "ritz0" else "ritz1"]
+    assert found == [(where, msg)], f"{compiler}: wanted {msg!r} at {where}:\n{out[-2000:]}"
+
+
 # A scalar base, or pointer arithmetic the store above doesn't type, reached
 # that generic path too; ritz1's Sema refuses it (index_store_check).  An
 # integer base in ritz0's words for `n[i] = v`, on every compiler (ritz0 raised
