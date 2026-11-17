@@ -11,8 +11,8 @@ from an identifier receiver, so a `Vec<u8>` field's method had no body.
 
 Covered: a generic `Vec<u8>` field (method via the UFCS `vec_` fallback,
 both by-mut-ref `push` and by-ref `len()`), a user impl method on a field
-(by value `self` and by `@&` mutating `self`), and a nested field
-receiver `o.q.a.get()`.
+(by value `self` and by `@&` mutating `self`), a nested field
+receiver `o.q.a.get()`, a `*Vec<u8>` field, and an un-annotated root.
 
 Oracle: ritz0 builds and runs every program with the same exit code.
 """
@@ -91,12 +91,12 @@ pub fn main() -> i32
     return (n + r.raw.len()) as i32
 """
 
-# ritz1-only cases, hand-derived expectations.  ritz0 is not a usable
-# oracle for either (AGAST #1559):
-#   - it never instantiates `vec_get$u8` for a field of an UN-annotated
-#     `var r = R { ... }` ("No method 'get' found for type 'Vec$u8'");
-#   - it loses a push through a `*Vec<u8>` field (len stays 3, `get(3)`
-#     reads garbage).
+# Two cases ritz0 used to get wrong, so they were ritz1-only with
+# hand-derived values; ritz0 now agrees and checks both (AGAST #1559):
+#   - a push through a `*Vec<u8>` field was lost (len stayed 3, `get(3)`
+#     read garbage) until pointer receivers passed the pointer (#1692);
+#   - `vec_get$u8` was never instantiated for a field of an UN-annotated
+#     `var r = R { ... }` until struct-literal lets were typed (#3064).
 # A `*Vec<u8>` field dispatches through the pointer the field holds, so the
 # push lands in `r.raw`: len 4 (4, 5, 7, 20) * 10 + element 3 (20) = 60.
 VEC_PTR_FIELD = """\
@@ -136,15 +136,12 @@ pub fn main() -> i32
     return (r.raw.len() * 10 + r.raw.get(1) as i64) as i32
 """
 
-RITZ1_ONLY = {
-    "vec_ptr_field": (VEC_PTR_FIELD, 60),
-    "vec_inferred_root": (VEC_INFERRED_ROOT, 42),
-}
-
 CASES = {
     "vec_u8_field": (VEC_FIELD, 35),
     "vec_u8_field_roots": (VEC_FIELD_ROOTS, 20 + 5 + 3),
     "user_impl_field": (USER_FIELD, 42),
+    "vec_ptr_field": (VEC_PTR_FIELD, 60),
+    "vec_inferred_root": (VEC_INFERRED_ROOT, 42),
 }
 
 
@@ -159,11 +156,4 @@ def test_ritz0_oracle(tmp_path, name):
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_ritz1_field_receiver(ritz1_bin, tmp_path, name):
     program, want = CASES[name]
-    assert _run_pkg("ritz1", tmp_path, name, program) == want
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY))
-def test_ritz1_only_field_receiver(ritz1_bin, tmp_path, name):
-    program, want = RITZ1_ONLY[name]
     assert _run_pkg("ritz1", tmp_path, name, program) == want
