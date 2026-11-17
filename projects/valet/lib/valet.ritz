@@ -952,7 +952,12 @@ pub fn valet_proxy_arm_yield(task: *Task, _micros: i64) -> i32
 # buffer instead.  The buffer is mmap'd for the one request or response
 # and unmapped as soon as it is done, so idle connections hold nothing.
 #
-# g_bigbuf_active counts slots with mode != BIGBUF_NONE, so the common
+# A slot has two: g_bigbufs for the request (RECV, then PARSED while the
+# handler reads it) and g_sendbufs for the response (SEND).  One buffer for
+# both meant a handler that asked for a >8 KB response buffer unmapped the
+# >8 KB request it was still reading (AGAST #3900).
+#
+# g_bigbuf_active counts buffers with mode != BIGBUF_NONE, so the common
 # small-request path skips the side-table lookup entirely.
 
 const BIGBUF_NONE: i32 = 0
@@ -974,14 +979,24 @@ pub struct BigBuf
     _pad: i32
 
 var g_bigbufs: [256]BigBuf
+var g_sendbufs: [256]BigBuf
 var g_bigbuf_active: i32 = 0
 
 
+# The task's request buffer (BIGBUF_RECV / BIGBUF_PARSED).
 fn bigbuf_for(task: *Task) -> *BigBuf
     let idx: i32 = valet_task_slot_idx(task)
     if idx < 0
         return null
     return @g_bigbufs[idx]
+
+
+# The task's response buffer (BIGBUF_SEND).
+fn sendbuf_for(task: *Task) -> *BigBuf
+    let idx: i32 = valet_task_slot_idx(task)
+    if idx < 0
+        return null
+    return @g_sendbufs[idx]
 
 
 # Release a task's buffer (if any) and unmap it.
@@ -998,20 +1013,24 @@ fn bigbuf_release(b: *BigBuf)
     b.mode = BIGBUF_NONE
 
 
+# Release both of a task's buffers.
 fn bigbuf_release_task(task: *Task)
     if g_bigbuf_active == 0
         return
     let b: *BigBuf = bigbuf_for(task)
     if b != null
         bigbuf_release(b)
+    let s: *BigBuf = sendbuf_for(task)
+    if s != null
+        bigbuf_release(s)
 
 
-# Map a fresh `size`-byte buffer for `task` in `mode`.  Any previous buffer
-# is released first.  Returns null on failure or if size is out of range.
-fn bigbuf_acquire(task: *Task, size: i64, mode: i32) -> *BigBuf
+# Map a fresh `size`-byte buffer into `b` (bigbuf_for or sendbuf_for) in
+# `mode`.  What `b` held before is released first; the other buffer of the
+# slot is untouched.  Returns null on failure or if size is out of range.
+fn bigbuf_acquire(b: *BigBuf, size: i64, mode: i32) -> *BigBuf
     if size <= 0 or size > VALET_MAX_BUFFERED
         return null
-    let b: *BigBuf = bigbuf_for(task)
     if b == null
         return null
     bigbuf_release(b)
@@ -1035,7 +1054,7 @@ fn bigbuf_acquire(task: *Task, size: i64, mode: i32) -> *BigBuf
 pub fn valet_response_buffer(task: *Task, len: i64) -> *u8
     if len <= 8192
         return @task.write_buf[0]
-    let b: *BigBuf = bigbuf_acquire(task, len, BIGBUF_SEND)
+    let b: *BigBuf = bigbuf_acquire(sendbuf_for(task), len, BIGBUF_SEND)
     if b == null
         return null
     return b.ptr
@@ -1053,7 +1072,7 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
         if valet_task_send(task, len as i32) < 0
             return 1
         return -1
-    let b: *BigBuf = bigbuf_for(task)
+    let b: *BigBuf = sendbuf_for(task)
     if b == null or b.mode != BIGBUF_SEND or b.ptr != buf
         return 1
     b.len = len
@@ -1063,7 +1082,7 @@ pub fn valet_task_send_response(task: *Task, buf: *u8, len: i64) -> i32
     task.write_len = 0
     task.write_pos = 0
     if task_send_buf(task, b.ptr, len as i32) < 0
-        bigbuf_release(b)
+        bigbuf_release_task(task)
         return 1
     return -1
 
@@ -1304,7 +1323,7 @@ fn valet_recv_more(task: *Task, app: *Valet, big: *BigBuf, f: *H1Frame) -> i32
         if task_recv_buf(task, @task.read_buf[task.read_len], VALET_READ_BUF - task.read_len) < 0
             return 1
         return -1
-    let nb: *BigBuf = bigbuf_acquire(task, want, BIGBUF_RECV)
+    let nb: *BigBuf = bigbuf_acquire(bigbuf_for(task), want, BIGBUF_RECV)
     if nb == null
         return valet_send_413(task)
     memcpy(nb.ptr, @task.read_buf[0], task.read_len as i64)
@@ -1605,23 +1624,24 @@ pub fn valet_handle_connection(task: *Task) -> i32
             bigbuf_release_task(task)
             return 1
 
-        # Large response (or a finished large request's buffer)?
+        # Large response, and/or a finished large request's buffer?
         if g_bigbuf_active > 0
-            let b: *BigBuf = bigbuf_for(task)
+            let b: *BigBuf = sendbuf_for(task)
             if b != null and b.mode == BIGBUF_SEND
                 if task.io_result == 0
-                    bigbuf_release(b)
+                    bigbuf_release_task(task)
                     return 1
                 b.pos = b.pos + task.io_result as i64
                 if b.pos < b.len
                     # Short send: resume from where the kernel stopped.
                     if task_send_buf(task, b.ptr + b.pos, (b.len - b.pos) as i32) < 0
-                        bigbuf_release(b)
+                        bigbuf_release_task(task)
                         return 1
                     return -1
                 bigbuf_release(b)
-            else if b != null and b.mode == BIGBUF_PARSED
-                bigbuf_release(b)
+            let r: *BigBuf = bigbuf_for(task)
+            if r != null and r.mode == BIGBUF_PARSED
+                bigbuf_release(r)
 
         # A write_buf response: the rest of it is still in write_buf, from
         # write_pos on. Send it before keep-alive moves on to the next

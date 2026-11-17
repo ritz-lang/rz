@@ -238,7 +238,10 @@ Shipped — these were listed as "next steps" here long after they landed:
    http's `lib/h1_framing.ritz` (AGAST #1865): Content-Length (i64) and
    chunked bodies, decoded in place; pipelined requests; 400 for CL with TE
    or a duplicate or invalid CL, 501 for other Transfer-Encodings;
-   `test/test_framing.sh`. `POST /echo` (stand-alone mode) answers
+   `test/test_framing.sh`. `POST /mirror` (stand-alone mode) returns the
+   body whole through the proxy's continuation path, so a >8 KB request
+   gets a >8 KB response; requests and responses have separate heap
+   buffers (AGAST #3900, `test/test_large_echo.sh`). `POST /echo` answers
    "<body length> <body>" for these tests.
 
 Still open:
