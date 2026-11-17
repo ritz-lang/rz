@@ -44,9 +44,9 @@ struct RitzTest
     name: StrView
     run: fn() -> i32
 
-# Defined by the test file's test-mode compile: stores the entry count and
-# returns the first entry.
-extern fn __ritz_test_table(count: *i64) -> *RitzTest
+# The table itself, `__ritz_test_table`, is defined by the test file's
+# test-mode compile. bin_main.ritz reads it and passes it in: a declaration
+# here would collide with that definition in any test that imports the runner.
 
 # ============================================================================
 # Constants
@@ -69,23 +69,40 @@ const RLIMIT_CORE: i64 = 4
 const CAPTURE_KEEP: i64 = 65536
 
 # ============================================================================
-# CLI Options (Global State)
+# CLI Options
 # ============================================================================
 
-var g_verbose: i32 = 0       # -v: show detailed output
-var g_quiet: i32 = 0         # -q: minimal output
-var g_list_only: i32 = 0     # -l: list tests without running
-var g_filter: *u8 = 0 as *u8 # -f: filter pattern (null = no filter)
-var g_timeout_ms: i64 = 5000 # -t: timeout per test in ms (default 5s)
-var g_no_fork: i32 = 0       # --no-fork: disable fork isolation
-var g_fail_fast: i32 = 0     # --fail-fast: stop on first failure
-var g_shuffle: i32 = 0       # --shuffle: randomize test order
-var g_seed: i64 = 0          # --seed: random seed (0 = auto from time)
-var g_json: i32 = 0          # --json: output in JSON format
-var g_junit: i32 = 0         # --junit: output in JUnit XML format
-var g_color: i32 = 0         # 0=auto, 1=always, -1=never
-var g_jobs: i64 = 1          # -j: tests run at once (forked children)
-var g_core: i32 = 0          # --core: let a crashing test dump core
+struct RunOptions
+    verbose: i32         # -v: show detailed output
+    quiet: i32           # -q: minimal output
+    list_only: i32       # -l: list tests without running
+    filter: *u8          # -f: filter pattern (null = no filter)
+    timeout_ms: i64      # -t: timeout per test in ms
+    no_fork: i32         # --no-fork: disable fork isolation
+    fail_fast: i32       # --fail-fast: stop on first failure
+    shuffle: i32         # --shuffle: randomize test order
+    seed: i64            # --seed: random seed (0 = auto from time)
+    json: i32            # --json: output in JSON format
+    junit: i32           # --junit: output in JUnit XML format
+    jobs: i64            # -j: tests run at once (forked children)
+    core: i32            # --core: let a crashing test dump core
+
+pub fn options_default() -> RunOptions
+    var o: RunOptions
+    o.verbose = 0
+    o.quiet = 0
+    o.list_only = 0
+    o.filter = null
+    o.timeout_ms = 5000
+    o.no_fork = 0
+    o.fail_fast = 0
+    o.shuffle = 0
+    o.seed = 0
+    o.json = 0
+    o.junit = 0
+    o.jobs = 1
+    o.core = 0
+    o
 
 # ============================================================================
 # Timing
@@ -187,8 +204,8 @@ fn capture_take(fd: i32) -> StrView
 # then turns the crash into a timeout. Not dumpable: no handler runs at all.
 # RLIMIT_CORE 0 also stops a plain-file pattern should something make the
 # process dumpable again (an exec, a setuid). --core keeps both as they were.
-fn child_disable_core()
-    if g_core != 0
+fn child_disable_core(opts: @RunOptions)
+    if opts.core != 0
         return
     syscall2(SYS_PRCTL, PR_SET_DUMPABLE, 0)
     var zero: [2]i64
@@ -202,7 +219,7 @@ fn run_test_direct(test: *RitzTest) -> i32
     return run()
 
 # ============================================================================
-# The pool: up to g_jobs forked children at once (-j N, AGAST #1909)
+# The pool: up to opts.jobs forked children at once (-j N, AGAST #1909)
 # ============================================================================
 #
 # The runner blocks SIGCHLD and sleeps in rt_sigtimedwait until a child exits
@@ -243,8 +260,12 @@ fn outcome_fail_to_start(out: *Outcome)
 
 # Fork the test at run-list position `pos` into `slot`. A failed fork records
 # the test as failed at once.
-fn pool_launch(slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: *i64) -> i32
+fn pool_launch(opts: @RunOptions, slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_mask: *i64) -> i32
     capture_reset(slot.capture_fd)
+    # A child without a capture file writes to our stdout: the report so far
+    # must be there first. With one, the report stays buffered.
+    if slot.capture_fd < 0
+        out_flush()
     let pid: i32 = sys_fork()
     if pid < 0
         outcome_fail_to_start(out)
@@ -253,7 +274,9 @@ fn pool_launch(slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_ma
     if pid == 0
         # === Child: the test sees the signal mask the runner started with ===
         sys_rt_sigprocmask(SIG_SETMASK, old_mask, null, 8)
-        child_disable_core()
+        # The report buffered so far is the runner's to write, not the test's.
+        out_discard()
+        child_disable_core(opts)
         if slot.capture_fd >= 0
             sys_dup2(slot.capture_fd, 1)
             sys_dup2(slot.capture_fd, 2)
@@ -264,7 +287,7 @@ fn pool_launch(slot: *PoolSlot, test: *RitzTest, pos: i64, out: *Outcome, old_ma
     slot.pid = pid
     slot.pos = pos
     slot.start_ms = get_time_ms()
-    slot.deadline_ms = slot.start_ms + g_timeout_ms
+    slot.deadline_ms = slot.start_ms + opts.timeout_ms
     slot.killed = 0
     return 1
 
@@ -370,20 +393,20 @@ fn signal_name(sig: i32) -> StrView
 fn print_captured(output: StrView)
     if output.len == 0
         return
-    sys_write(1, output.ptr, output.len)
+    out_str(output)
     if output.ptr[output.len - 1] != 10
-        prints("\n")
+        out_str("\n")
 
 # Report one test's outcome; 1 if it did not pass.
-fn report_outcome(test: *RitzTest, out: *Outcome, summary: *TestSummary) -> i32
+fn report_outcome(opts: @RunOptions, test: *RitzTest, out: *Outcome, summary: *TestSummary) -> i32
     var name: StrView = test.name
     let elapsed: i64 = out.elapsed
     if out.result.status == TEST_RESULT_PASS
-        if g_json != 0
+        if opts.json != 0
             json_record_pass(name, elapsed)
-        else if g_junit != 0
+        else if opts.junit != 0
             junit_record_pass(name, elapsed)
-        else if g_quiet == 0
+        else if opts.quiet == 0
             print_test_pass(name, elapsed)
         summary_record(summary, TEST_PASS, elapsed)
         return 0
@@ -391,27 +414,27 @@ fn report_outcome(test: *RitzTest, out: *Outcome, summary: *TestSummary) -> i32
     var output: StrView = out.output
     if out.result.status == TEST_RESULT_SIGNAL
         var sig_name: StrView = signal_name(out.result.signal)
-        if g_json != 0
+        if opts.json != 0
             json_record_crash(name, elapsed, out.result.signal, output)
-        else if g_junit != 0
+        else if opts.junit != 0
             junit_record_crash(name, elapsed, out.result.signal, sig_name)
         else
             print_test_crash(name, elapsed, out.result.signal, sig_name)
             print_captured(output)
         summary_record(summary, TEST_CRASH, elapsed)
     else if out.result.status == TEST_RESULT_TIMEOUT
-        if g_json != 0
+        if opts.json != 0
             json_record_timeout(name, elapsed, output)
-        else if g_junit != 0
+        else if opts.junit != 0
             junit_record_timeout(name, elapsed)
         else
-            print_test_timeout(name, g_timeout_ms)
+            print_test_timeout(name, opts.timeout_ms)
             print_captured(output)
         summary_record(summary, TEST_TIMEOUT, elapsed)
     else
-        if g_json != 0
+        if opts.json != 0
             json_record_fail(name, elapsed, out.result.exit_code, output)
-        else if g_junit != 0
+        else if opts.junit != 0
             junit_record_fail(name, elapsed, out.result.exit_code)
         else
             print_test_fail(name, elapsed, out.result.exit_code)
@@ -419,9 +442,9 @@ fn report_outcome(test: *RitzTest, out: *Outcome, summary: *TestSummary) -> i32
         summary_record(summary, TEST_FAIL, elapsed)
     return 1
 
-# Run the run list in a pool of up to g_jobs children, reporting in run order.
-fn run_pool(tests: *RitzTest, run: *i64, nrun: i64, outcomes: *Outcome, summary: *TestSummary)
-    var nslots: i64 = g_jobs
+# Run the run list in a pool of up to opts.jobs children, reporting in run order.
+fn run_pool(opts: @RunOptions, tests: *RitzTest, run: *i64, nrun: i64, outcomes: *Outcome, summary: *TestSummary)
+    var nslots: i64 = opts.jobs
     if nslots > nrun
         nslots = nrun
     if nslots <= 0
@@ -445,15 +468,15 @@ fn run_pool(tests: *RitzTest, run: *i64, nrun: i64, outcomes: *Outcome, summary:
         # Fill free slots.
         for i in 0..nslots
             if next < nrun && slots[i].pid == 0
-                if pool_launch(@slots[i], @tests[run[next]], next, @outcomes[next], @old_mask) != 0
+                if pool_launch(opts, @slots[i], @tests[run[next]], next, @outcomes[next], @old_mask) != 0
                     live += 1
                 next += 1
         # Report whatever is finished, in order.
         var stop: i32 = 0
         while reported < next && outcomes[reported].done != 0
-            let failed: i32 = report_outcome(@tests[run[reported]], @outcomes[reported], summary)
+            let failed: i32 = report_outcome(opts, @tests[run[reported]], @outcomes[reported], summary)
             reported += 1
-            if failed != 0 && g_fail_fast != 0
+            if failed != 0 && opts.fail_fast != 0
                 stop = 1
                 break
         if stop != 0
@@ -475,19 +498,22 @@ fn run_pool(tests: *RitzTest, run: *i64, nrun: i64, outcomes: *Outcome, summary:
 # Main Test Runner
 # ============================================================================
 
-# Run every selected test in the table; 0 iff all of them passed, else 1.
-pub fn run_tests() -> i32
-    if g_quiet == 0 && g_json == 0
+# Run every selected test of `tests` (`count` entries); 0 iff all of them
+# passed, else 1. The report is flushed before this returns.
+pub fn run_tests(opts: @RunOptions, tests: *RitzTest, count: i64) -> i32
+    let status: i32 = run_selected(opts, tests, count)
+    out_flush()
+    return status
+
+fn run_selected(opts: @RunOptions, tests: *RitzTest, count: i64) -> i32
+    if opts.quiet == 0 && opts.json == 0
         print_banner()
 
-    var count: i64 = 0
-    let tests: *RitzTest = __ritz_test_table(@count)
-
     if count == 0
-        if g_json != 0
+        if opts.json != 0
             json_print_report(0, 0, 0, 0, 0, 0, 0)
         else
-            prints("No tests found.\n")
+            out_str("No tests found.\n")
         return 0
 
     var order: *i64 = malloc(count * 8) as *i64
@@ -497,26 +523,30 @@ pub fn run_tests() -> i32
     for i in 0..count
         order[i] = i
 
-    if g_shuffle != 0
-        var seed: i64 = g_seed
+    if opts.shuffle != 0
+        var seed: i64 = opts.seed
         if seed == 0
             seed = get_time_us()
         rng_seed(seed)
         shuffle_order(order, count)
-        if g_verbose != 0
-            print("Shuffled tests with seed: {seed}\n")
+        if opts.verbose != 0
+            out_str("Shuffled tests with seed: ")
+            out_int(seed)
+            out_str("\n")
 
-    if g_list_only != 0
-        print("Discovered {count} test(s):\n")
+    if opts.list_only != 0
+        out_str("Discovered ")
+        out_int(count)
+        out_str(" test(s):\n")
         for i in 0..count
             let test: *RitzTest = @tests[order[i]]
-            if matches_filter(test.name.ptr) != 0
-                prints("  ")
-                prints(test.name)
-                prints("\n")
+            if filter_match(opts.filter, test.name.ptr) != 0
+                out_str("  ")
+                out_str(test.name)
+                out_str("\n")
         return 0
 
-    if g_quiet == 0
+    if opts.quiet == 0
         print_suite_header(strview_from_cstr(c"tests"))
 
     # The run list: the selected tests, in run order.
@@ -528,7 +558,7 @@ pub fn run_tests() -> i32
     var nrun: i64 = 0
     var skipped_by_filter: i32 = 0
     for i in 0..count
-        if matches_filter(tests[order[i]].name.ptr) == 0
+        if filter_match(opts.filter, tests[order[i]].name.ptr) == 0
             skipped_by_filter += 1
         else
             run[nrun] = order[i]
@@ -546,9 +576,11 @@ pub fn run_tests() -> i32
     var summary: TestSummary = summary_new()
     let total_start: i64 = get_time_ms()
 
-    if g_no_fork != 0
+    if opts.no_fork != 0
         for k in 0..nrun
             let out: *Outcome = @outcomes[k]
+            # The test writes to our stdout: the report so far goes first.
+            out_flush()
             let start: i64 = get_time_ms()
             let ret: i32 = test_exit_status(run_test_direct(@tests[run[k]]))
             out.elapsed = get_time_ms() - start
@@ -558,21 +590,21 @@ pub fn run_tests() -> i32
             if ret != 0
                 out.result.status = TEST_RESULT_FAIL
             out.output = strview_empty()
-            if report_outcome(@tests[run[k]], out, @summary) != 0 && g_fail_fast != 0
+            if report_outcome(opts, @tests[run[k]], out, @summary) != 0 && opts.fail_fast != 0
                 break
     else
-        run_pool(tests, run, nrun, outcomes, @summary)
+        run_pool(opts, tests, run, nrun, outcomes, @summary)
 
     summary.duration_ms = get_time_ms() - total_start
 
-    if g_json != 0
+    if opts.json != 0
         json_print_report(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, skipped_by_filter, summary.duration_ms)
-    else if g_junit != 0
+    else if opts.junit != 0
         # JUnit combines crashed and timeout as "errors"
         let errors: i32 = summary.crashed + summary.timeout
         junit_print_report(summary.total, summary.passed, summary.failed, errors, summary.duration_ms)
     else
-        if g_quiet == 0
+        if opts.quiet == 0
             print_suite_divider()
             print_suite_summary(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, summary.duration_ms)
         print_grand_summary(summary.total, summary.passed, summary.failed, summary.crashed, summary.timeout, skipped_by_filter, summary.duration_ms)
@@ -589,7 +621,9 @@ pub fn run_exit_status(summary: @TestSummary) -> i32
 # CLI Argument Parsing
 # ============================================================================
 
-fn parse_args(argc: i32, argv: **u8) -> i32
+# Fill `opts` from the command line: 0 to run, 1 if help was shown, -1 on a
+# usage error (reported on stderr).
+pub fn parse_args(argc: i32, argv: **u8, opts: *RunOptions) -> i32
     var parser: ArgParser
     args_init(@parser, c"ritzunit", c"Unit test framework for Ritz")
 
@@ -617,22 +651,22 @@ fn parse_args(argc: i32, argv: **u8) -> i32
         args_print_help(@parser)
         return 1  # Exit without error, but don't run tests
 
-    g_verbose = args_get_flag(@parser, 'v')
-    g_quiet = args_get_flag(@parser, 'q')
-    g_list_only = args_get_flag(@parser, 'l')
-    g_filter = args_get_str(@parser, 'f')
-    g_timeout_ms = args_get_int(@parser, 't')
-    g_no_fork = args_get_flag_long(@parser, c"no-fork")
-    g_core = args_get_flag_long(@parser, c"core")
-    g_fail_fast = args_get_flag(@parser, 'x')
-    g_shuffle = args_get_flag(@parser, 's')
-    g_seed = args_get_int_long(@parser, c"seed")
-    g_json = args_get_flag_long(@parser, c"json")
-    g_jobs = args_get_int(@parser, 'j')
-    if g_jobs < 1
+    opts.verbose = args_get_flag(@parser, 'v')
+    opts.quiet = args_get_flag(@parser, 'q')
+    opts.list_only = args_get_flag(@parser, 'l')
+    opts.filter = args_get_str(@parser, 'f')
+    opts.timeout_ms = args_get_int(@parser, 't')
+    opts.no_fork = args_get_flag_long(@parser, c"no-fork")
+    opts.core = args_get_flag_long(@parser, c"core")
+    opts.fail_fast = args_get_flag(@parser, 'x')
+    opts.shuffle = args_get_flag(@parser, 's')
+    opts.seed = args_get_int_long(@parser, c"seed")
+    opts.json = args_get_flag_long(@parser, c"json")
+    opts.jobs = args_get_int(@parser, 'j')
+    if opts.jobs < 1
         eprints("ritzunit: --jobs must be at least 1\n")
         return -1
-    g_junit = args_get_flag_long(@parser, c"junit")
+    opts.junit = args_get_flag_long(@parser, c"junit")
 
     let force_color: i32 = args_get_flag_long(@parser, c"color")
     let no_color: i32 = args_get_flag_long(@parser, c"no-color")
@@ -641,42 +675,40 @@ fn parse_args(argc: i32, argv: **u8) -> i32
         eprints("ritzunit: --color and --no-color are mutually exclusive\n")
         return -1
 
+    # Color is the reporter's state, not an option of the run.
     if force_color != 0
-        g_color = 1
         set_color_mode(1)
     else if no_color != 0
-        g_color = -1
         set_color_mode(-1)
 
-    if g_verbose != 0 && g_quiet != 0
+    if opts.verbose != 0 && opts.quiet != 0
         eprints("ritzunit: --verbose and --quiet are mutually exclusive\n")
         return -1
 
-    if g_json != 0 && g_junit != 0
+    if opts.json != 0 && opts.junit != 0
         eprints("ritzunit: --json and --junit are mutually exclusive\n")
         return -1
 
     # JSON or JUnit implies quiet and no color
-    if g_json != 0 || g_junit != 0
-        g_quiet = 1
+    if opts.json != 0 || opts.junit != 0
+        opts.quiet = 1
         set_color_mode(-1)
 
     return 0
-
-fn matches_filter(name: *u8) -> i32
-    return filter_match(g_filter, name)
 
 # ============================================================================
 # Entry Point
 # ============================================================================
 
-# The runner's entry point. bin_main.ritz's `main` calls it; it is not `main`
-# itself so a test that imports this module does not define `main`.
-pub fn ritzunit_main(argc: i32, argv: **u8) -> i32
-    let parse_result: i32 = parse_args(argc, argv)
+# The runner's entry point: bin_main.ritz's `main` calls it with the
+# compiler-emitted test table. It is not `main` itself so a test that imports
+# this module does not define `main`.
+pub fn ritzunit_main(argc: i32, argv: **u8, tests: *RitzTest, count: i64) -> i32
+    var opts: RunOptions = options_default()
+    let parse_result: i32 = parse_args(argc, argv, @opts)
     if parse_result != 0
         if parse_result > 0
             return 0  # Help was shown, exit cleanly
         return 1  # Parse error
 
-    return run_tests()
+    return run_tests(@opts, tests, count)

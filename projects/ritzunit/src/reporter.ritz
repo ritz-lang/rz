@@ -5,10 +5,9 @@
 # - Suite grouping with per-suite summaries
 # - Grand total summary
 # - ANSI colors when output is a TTY (auto-detected)
-#
-# Uses RERITZ StrView for all string parameters.
+# - The report buffer every report is written through (out_*)
 
-import ritzlib.io
+import ritzlib.fmt
 import ritzlib.str
 import ritzlib.sys
 import ritzlib.strview
@@ -18,7 +17,6 @@ import ritzlib.strview
 # ============================================================================
 
 const LINE_WIDTH: i32 = 70       # Total width of output line
-const STATUS_WIDTH: i32 = 16     # Width reserved for status (e.g., "OK (123ms)")
 const DOT_MIN: i32 = 3           # Minimum dots between name and status
 
 # IOCTL for checking TTY (TIOCGWINSZ on Linux)
@@ -26,6 +24,69 @@ const TIOCGWINSZ: i64 = 0x5413
 
 # File descriptors
 const STDOUT_FD: i32 = 1
+
+# ============================================================================
+# The report buffer
+# ============================================================================
+#
+# Every report (human, --json, --junit) is written here and reaches stdout in
+# large writes, not one syscall per fragment (AGAST #1910). The runner flushes
+# at the end of a run, and before anything else could write to stdout in
+# between: a test run in the runner's own process (--no-fork), or a child
+# whose output has no capture file.
+
+const OUT_CAP: i64 = 8192
+
+var g_out: [8192]u8
+var g_out_len: i64 = 0
+
+# Write everything buffered to stdout.
+pub fn out_flush()
+    var done: i64 = 0
+    while done < g_out_len
+        let n: i64 = sys_write(STDOUT_FD, @g_out[done], g_out_len - done)
+        if n <= 0
+            break
+        done += n
+    g_out_len = 0
+
+# Drop everything buffered (a test starts from an empty buffer).
+pub fn out_discard()
+    g_out_len = 0
+
+# What is buffered and not yet written.
+pub fn out_pending() -> StrView
+    var v: StrView
+    v.ptr = @g_out[0]
+    v.len = g_out_len
+    v
+
+pub fn out_write(p: *u8, n: i64)
+    if g_out_len + n > OUT_CAP
+        out_flush()
+    if n >= OUT_CAP
+        var done: i64 = 0
+        while done < n
+            let w: i64 = sys_write(STDOUT_FD, p + done, n - done)
+            if w <= 0
+                return
+            done += w
+        return
+    memcpy(@g_out[g_out_len], p, n)
+    g_out_len += n
+
+pub fn out_str(s: StrView)
+    out_write(s.ptr, s.len)
+
+pub fn out_byte(c: u8)
+    var b: [1]u8
+    b[0] = c
+    out_write(@b[0], 1)
+
+pub fn out_int(n: i64)
+    var buf: [20]u8
+    let len: i64 = fmt_i64_into(@buf[0], n)
+    out_write(@buf[0], len)
 
 # ============================================================================
 # Color Detection
@@ -60,7 +121,7 @@ fn init_color()
         g_use_color = isatty(STDOUT_FD)
 
 # Check if we should use colors
-pub fn use_color() -> i32
+fn use_color() -> i32
     init_color()
     return g_use_color
 
@@ -70,32 +131,32 @@ pub fn use_color() -> i32
 fn color_reset()
     if use_color() == 0
         return
-    prints("\e[0m")
+    out_str("\e[0m")
 
 fn color_green()
     if use_color() == 0
         return
-    prints("\e[32m")
+    out_str("\e[32m")
 
 fn color_red()
     if use_color() == 0
         return
-    prints("\e[31m")
+    out_str("\e[31m")
 
 fn color_yellow()
     if use_color() == 0
         return
-    prints("\e[33m")
+    out_str("\e[33m")
 
 fn color_bold()
     if use_color() == 0
         return
-    prints("\e[1m")
+    out_str("\e[1m")
 
 fn color_dim()
     if use_color() == 0
         return
-    prints("\e[2m")
+    out_str("\e[2m")
 
 # ============================================================================
 # Banner and Headers
@@ -104,78 +165,35 @@ fn color_dim()
 # Print the ritzunit banner
 pub fn print_banner()
     color_bold()
-    prints("======================================================================\n")
-    prints("  RITZUNIT v0.1.0 - Test Framework for Ritz\n")
-    prints("======================================================================")
+    out_str("======================================================================\n")
+    out_str("  RITZUNIT v0.1.0 - Test Framework for Ritz\n")
+    out_str("======================================================================")
     color_reset()
-    prints("\n\n")
+    out_str("\n\n")
 
 # Print suite header (suite name)
 pub fn print_suite_header(name: StrView)
-    prints(name)
-    prints("\n")
+    out_str(name)
+    out_str("\n")
 
 # Print suite footer/divider
 pub fn print_suite_divider()
-    prints("  ----------------------------------------------------------------------\n")
+    out_str("  ----------------------------------------------------------------------\n")
 
 # Print grand total divider
-pub fn print_grand_divider()
-    prints("======================================================================\n")
+fn print_grand_divider()
+    out_str("======================================================================\n")
 
 # ============================================================================
 # Right-Aligned Test Result Output
 # ============================================================================
 
 # Print dots to fill space between name and status
-pub fn print_dots(count: i32)
+fn print_dots(count: i32)
     var i: i32 = 0
     while i < count
-        prints(".")
+        out_str(".")
         i += 1
-
-# Print a test result line with right-aligned status
-# Format: "  test_name ........................... STATUS (Xms)"
-pub fn print_test_line(name: StrView, status: StrView, duration_ms: i64)
-    # Calculate lengths first (before passing to prints which moves)
-    let name_len: i64 = name.len
-    let status_len: i64 = status.len
-
-    # Print indent
-    prints("  ")
-
-    # Print test name
-    prints(name)
-    prints(" ")
-
-    # Build status string with time: "OK (123ms)"
-    # Estimate: status + " (" + digits + "ms)"
-    # Max digits for i64 is ~20, but typically 1-5 for ms
-    var time_width: i32 = 7  # " (Xms)" minimum
-    if duration_ms >= 10
-        time_width = 8
-    if duration_ms >= 100
-        time_width = 9
-    if duration_ms >= 1000
-        time_width = 10
-    if duration_ms >= 10000
-        time_width = 11
-
-    let total_status_width: i32 = status_len as i32 + time_width
-
-    # Dots = LINE_WIDTH - indent(2) - name_len - space(1) - status_width
-    var dots: i32 = LINE_WIDTH - 2 - name_len as i32 - 1 - total_status_width
-    if dots < DOT_MIN
-        dots = DOT_MIN
-
-    print_dots(dots)
-
-    # Print status and time
-    prints(" ")
-    prints(status)
-    prints(" (")
-    print_int(duration_ms)
-    prints("ms)\n")
 
 # ============================================================================
 # Test Result Functions
@@ -183,13 +201,13 @@ pub fn print_test_line(name: StrView, status: StrView, duration_ms: i64)
 
 # Print a passing test result
 pub fn print_test_pass(name: StrView, duration_ms: i64)
-    # Calculate length first (before passing to prints which moves)
+    # Calculate length first
     let name_len: i64 = name.len
 
     # Print indent and test name
-    prints("  ")
-    prints(name)
-    prints(" ")
+    out_str("  ")
+    out_str(name)
+    out_str(" ")
     let status_len: i64 = 2  # "OK"
 
     # Build status string with time: "OK (123ms)"
@@ -215,22 +233,22 @@ pub fn print_test_pass(name: StrView, duration_ms: i64)
     color_reset()
 
     # Print status (green) and time
-    prints(" ")
+    out_str(" ")
     color_green()
-    prints("OK")
+    out_str("OK")
     color_reset()
-    prints(" (")
-    print_int(duration_ms)
-    prints("ms)\n")
+    out_str(" (")
+    out_int(duration_ms)
+    out_str("ms)\n")
 
 # Print a failing test result
 pub fn print_test_fail(name: StrView, duration_ms: i64, error_code: i32)
     # Calculate length first
     let name_len: i64 = name.len
 
-    prints("  ")
-    prints(name)
-    prints(" ")
+    out_str("  ")
+    out_str(name)
+    out_str(" ")
     var dots: i32 = LINE_WIDTH - 2 - name_len as i32 - 1 - 20  # "FAIL [code=XX] (Xms)"
     if dots < DOT_MIN
         dots = DOT_MIN
@@ -239,16 +257,16 @@ pub fn print_test_fail(name: StrView, duration_ms: i64, error_code: i32)
     print_dots(dots)
     color_reset()
 
-    prints(" ")
+    out_str(" ")
     color_red()
     color_bold()
-    prints("FAIL")
+    out_str("FAIL")
     color_reset()
-    prints(" [code=")
-    print_int(error_code as i64)
-    prints("] (")
-    print_int(duration_ms)
-    prints("ms)\n")
+    out_str(" [code=")
+    out_int(error_code as i64)
+    out_str("] (")
+    out_int(duration_ms)
+    out_str("ms)\n")
 
 # Print a crashed test result
 pub fn print_test_crash(name: StrView, duration_ms: i64, signal: i32, signal_name: StrView)
@@ -256,9 +274,9 @@ pub fn print_test_crash(name: StrView, duration_ms: i64, signal: i32, signal_nam
     let name_len: i64 = name.len
     let sig_len: i64 = signal_name.len
 
-    prints("  ")
-    prints(name)
-    prints(" ")
+    out_str("  ")
+    out_str(name)
+    out_str(" ")
     var dots: i32 = LINE_WIDTH - 2 - name_len as i32 - 1 - 10 - sig_len as i32  # "CRASH (SIG) (Xms)"
     if dots < DOT_MIN
         dots = DOT_MIN
@@ -267,25 +285,25 @@ pub fn print_test_crash(name: StrView, duration_ms: i64, signal: i32, signal_nam
     print_dots(dots)
     color_reset()
 
-    prints(" ")
+    out_str(" ")
     color_red()
     color_bold()
-    prints("CRASH")
+    out_str("CRASH")
     color_reset()
-    prints(" (")
-    prints(signal_name)
-    prints(") (")
-    print_int(duration_ms)
-    prints("ms)\n")
+    out_str(" (")
+    out_str(signal_name)
+    out_str(") (")
+    out_int(duration_ms)
+    out_str("ms)\n")
 
 # Print a timed out test result
 pub fn print_test_timeout(name: StrView, timeout_ms: i64)
     # Calculate length first
     let name_len: i64 = name.len
 
-    prints("  ")
-    prints(name)
-    prints(" ")
+    out_str("  ")
+    out_str(name)
+    out_str(" ")
     var dots: i32 = LINE_WIDTH - 2 - name_len as i32 - 1 - 18  # "TIMEOUT (XXXXXms)"
     if dots < DOT_MIN
         dots = DOT_MIN
@@ -294,41 +312,14 @@ pub fn print_test_timeout(name: StrView, timeout_ms: i64)
     print_dots(dots)
     color_reset()
 
-    prints(" ")
+    out_str(" ")
     color_yellow()
     color_bold()
-    prints("TIMEOUT")
+    out_str("TIMEOUT")
     color_reset()
-    prints(" (")
-    print_int(timeout_ms)
-    prints("ms)\n")
-
-# Print a skipped test
-pub fn print_test_skip(name: StrView, reason: StrView)
-    # Calculate lengths first
-    let name_len: i64 = name.len
-    let reason_len: i64 = reason.len
-
-    prints("  ")
-    prints(name)
-    prints(" ")
-    var dots: i32 = LINE_WIDTH - 2 - name_len as i32 - 1 - 8  # "SKIP"
-    if dots < DOT_MIN
-        dots = DOT_MIN
-
-    color_dim()
-    print_dots(dots)
-    color_reset()
-
-    prints(" ")
-    color_yellow()
-    prints("SKIP")
-    color_reset()
-    if reason_len > 0
-        prints(" (")
-        prints(reason)
-        prints(")")
-    prints("\n")
+    out_str(" (")
+    out_int(timeout_ms)
+    out_str("ms)\n")
 
 # ============================================================================
 # Suite Summary
@@ -336,31 +327,31 @@ pub fn print_test_skip(name: StrView, reason: StrView)
 
 # Print suite summary line
 pub fn print_suite_summary(total: i32, passed: i32, failed: i32, crashed: i32, timeout: i32, duration_ms: i64)
-    prints("  ")
-    print_int(total as i64)
-    prints(" tests: ")
-    print_int(passed as i64)
-    prints(" passed")
+    out_str("  ")
+    out_int(total as i64)
+    out_str(" tests: ")
+    out_int(passed as i64)
+    out_str(" passed")
 
     if failed > 0
-        prints(", ")
-        print_int(failed as i64)
-        prints(" failed")
+        out_str(", ")
+        out_int(failed as i64)
+        out_str(" failed")
 
     if crashed > 0
-        prints(", ")
-        print_int(crashed as i64)
-        prints(" crashed")
+        out_str(", ")
+        out_int(crashed as i64)
+        out_str(" crashed")
 
     if timeout > 0
-        prints(", ")
-        print_int(timeout as i64)
-        prints(" timeout")
+        out_str(", ")
+        out_int(timeout as i64)
+        out_str(" timeout")
 
     # Right-align total time
-    prints(" (")
-    print_int(duration_ms)
-    prints("ms)\n\n")
+    out_str(" (")
+    out_int(duration_ms)
+    out_str("ms)\n\n")
 
 # ============================================================================
 # Grand Total Summary
@@ -371,56 +362,46 @@ pub fn print_grand_summary(total: i32, passed: i32, failed: i32, crashed: i32, t
     print_grand_divider()
 
     color_bold()
-    prints("TOTAL: ")
+    out_str("TOTAL: ")
     color_reset()
-    print_int(total as i64)
-    prints(" tests")
+    out_int(total as i64)
+    out_str(" tests")
 
-    prints(" | ")
+    out_str(" | ")
     color_green()
-    print_int(passed as i64)
-    prints(" passed")
+    out_int(passed as i64)
+    out_str(" passed")
     color_reset()
 
     if failed > 0
-        prints(" | ")
+        out_str(" | ")
         color_red()
-        print_int(failed as i64)
-        prints(" failed")
+        out_int(failed as i64)
+        out_str(" failed")
         color_reset()
 
     if crashed > 0
-        prints(" | ")
+        out_str(" | ")
         color_red()
-        print_int(crashed as i64)
-        prints(" crashed")
+        out_int(crashed as i64)
+        out_str(" crashed")
         color_reset()
 
     if timeout > 0
-        prints(" | ")
+        out_str(" | ")
         color_yellow()
-        print_int(timeout as i64)
-        prints(" timeout")
+        out_int(timeout as i64)
+        out_str(" timeout")
         color_reset()
 
     if skipped > 0
-        prints(" | ")
+        out_str(" | ")
         color_yellow()
-        print_int(skipped as i64)
-        prints(" skipped")
+        out_int(skipped as i64)
+        out_str(" skipped")
         color_reset()
 
-    prints(" (")
-    print_int(duration_ms)
-    prints("ms)\n")
+    out_str(" (")
+    out_int(duration_ms)
+    out_str("ms)\n")
     print_grand_divider()
-
-# ============================================================================
-# Legacy Functions (for compatibility)
-# ============================================================================
-
-pub fn print_divider()
-    prints("\n")
-
-pub fn print_summary(passed: i32, failed: i32, skipped: i32, duration_ms: i64)
-    print_grand_summary(passed + failed, passed, failed, 0, 0, skipped, duration_ms)

@@ -1,0 +1,202 @@
+# test/test_runner.ritz - the runner: exit statuses, options, a whole run
+#
+# The runner takes the test table as an argument (bin_main.ritz reads the
+# compiler-emitted one), so a test can hand it a table of its own.
+
+import ritzlib.strview
+import ritzunit.types
+import ritzunit.reporter
+import ritzunit.runner
+
+# ============================================================================
+# Exit statuses
+# ============================================================================
+
+[[test]]
+fn a_test_result_survives_as_its_exit_status() -> i32
+    assert test_exit_status(0) == 0
+    assert test_exit_status(1) == 1
+    assert test_exit_status(3) == 3
+    0
+
+[[test]]
+fn a_result_whose_low_byte_is_zero_is_not_a_pass() -> i32
+    # exit(256) reads as exit(0) to the parent.
+    assert test_exit_status(256) == 1
+    assert test_exit_status(512) == 1
+    assert test_exit_status(257) == 257
+    0
+
+[[test]]
+fn a_run_exits_1_iff_anything_did_not_pass() -> i32
+    var s: TestSummary = summary_new()
+    assert run_exit_status(@s) == 0
+    summary_record(@&s, TEST_PASS, 1)
+    assert run_exit_status(@s) == 0
+    var f: TestSummary = summary_new()
+    summary_record(@&f, TEST_FAIL, 1)
+    assert run_exit_status(@f) == 1
+    var c: TestSummary = summary_new()
+    summary_record(@&c, TEST_CRASH, 1)
+    assert run_exit_status(@c) == 1
+    var t: TestSummary = summary_new()
+    summary_record(@&t, TEST_TIMEOUT, 1)
+    assert run_exit_status(@t) == 1
+    0
+
+# ============================================================================
+# Options
+# ============================================================================
+
+[[test]]
+fn defaults_are_one_job_and_five_seconds() -> i32
+    let o: RunOptions = options_default()
+    assert o.jobs == 1
+    assert o.timeout_ms == 5000
+    assert o.filter == null
+    assert o.json == 0 && o.junit == 0 && o.quiet == 0 && o.no_fork == 0
+    0
+
+[[test]]
+fn flags_land_in_the_options() -> i32
+    var argv: [8]*u8
+    argv[0] = c"t"
+    argv[1] = c"--json"
+    argv[2] = c"-j"
+    argv[3] = c"4"
+    argv[4] = c"-t"
+    argv[5] = c"250"
+    argv[6] = c"-f"
+    argv[7] = c"add*"
+    var o: RunOptions = options_default()
+    assert parse_args(8, @argv[0], @o) == 0
+    assert o.json == 1
+    assert o.quiet == 1    # --json implies quiet
+    assert o.jobs == 4
+    assert o.timeout_ms == 250
+    assert strview_eq(strview_from_cstr(o.filter), "add*")
+    0
+
+[[test]]
+fn conflicting_flags_are_rejected() -> i32
+    var argv: [3]*u8
+    argv[0] = c"t"
+    argv[1] = c"--json"
+    argv[2] = c"--junit"
+    var o: RunOptions = options_default()
+    assert parse_args(3, @argv[0], @o) == -1
+    argv[1] = c"-v"
+    argv[2] = c"-q"
+    var p: RunOptions = options_default()
+    assert parse_args(3, @argv[0], @p) == -1
+    0
+
+[[test]]
+fn zero_jobs_is_rejected() -> i32
+    var argv: [3]*u8
+    argv[0] = c"t"
+    argv[1] = c"-j"
+    argv[2] = c"0"
+    var o: RunOptions = options_default()
+    assert parse_args(3, @argv[0], @o) == -1
+    0
+
+# ============================================================================
+# A whole run over a table of our own
+# ============================================================================
+
+fn passes() -> i32
+    0
+
+fn fails() -> i32
+    7
+
+# Passes iff it starts with nothing buffered.
+fn sees_no_buffered_report() -> i32
+    if out_pending().len != 0
+        return 1
+    0
+
+fn table_of(t: *RitzTest, name: StrView, run: fn() -> i32)
+    t.name = name
+    t.run = run
+
+fn quiet_json() -> RunOptions
+    var o: RunOptions = options_default()
+    o.json = 1
+    o.quiet = 1
+    o
+
+[[test]]
+fn a_run_of_passing_tests_exits_0() -> i32
+    var table: [2]RitzTest
+    table_of(@table[0], "p1", passes)
+    table_of(@table[1], "p2", passes)
+    var o: RunOptions = quiet_json()
+    assert run_tests(@o, @table[0], 2) == 0
+    0
+
+[[test]]
+fn a_run_with_a_failure_exits_1() -> i32
+    var table: [2]RitzTest
+    table_of(@table[0], "p", passes)
+    table_of(@table[1], "f", fails)
+    var o: RunOptions = quiet_json()
+    assert run_tests(@o, @table[0], 2) == 1
+    0
+
+[[test]]
+fn the_filter_decides_what_runs() -> i32
+    var table: [2]RitzTest
+    table_of(@table[0], "good", passes)
+    table_of(@table[1], "bad", fails)
+    var o: RunOptions = quiet_json()
+    o.filter = c"good"
+    assert run_tests(@o, @table[0], 2) == 0
+    0
+
+[[test]]
+fn no_fork_runs_in_process_with_the_same_verdict() -> i32
+    var table: [2]RitzTest
+    table_of(@table[0], "p", passes)
+    table_of(@table[1], "f", fails)
+    var o: RunOptions = quiet_json()
+    o.no_fork = 1
+    assert run_tests(@o, @table[0], 2) == 1
+    o.filter = c"p"
+    assert run_tests(@o, @table[0], 2) == 0
+    0
+
+[[test]]
+fn an_empty_table_passes() -> i32
+    var table: [1]RitzTest
+    var o: RunOptions = quiet_json()
+    assert run_tests(@o, @table[0], 0) == 0
+    0
+
+[[test]]
+fn a_child_does_not_inherit_the_buffered_report() -> i32
+    # A child that flushed what it inherited would write the runner's report
+    # a second time.
+    var table: [1]RitzTest
+    table_of(@table[0], "child", sees_no_buffered_report)
+    var o: RunOptions = quiet_json()
+    out_str("buffered by the runner")
+    assert run_tests(@o, @table[0], 1) == 0
+    0
+
+[[test]]
+fn a_summary_counts_each_kind() -> i32
+    var s: TestSummary = summary_new()
+    summary_record(@&s, TEST_PASS, 1)
+    summary_record(@&s, TEST_PASS, 2)
+    summary_record(@&s, TEST_FAIL, 3)
+    summary_record(@&s, TEST_CRASH, 4)
+    summary_record(@&s, TEST_TIMEOUT, 5)
+    assert s.total == 5
+    assert s.passed == 2
+    assert s.failed == 1
+    assert s.crashed == 1
+    assert s.timeout == 1
+    assert s.duration_ms == 15
+    0

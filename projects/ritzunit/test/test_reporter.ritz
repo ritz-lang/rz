@@ -1,0 +1,99 @@
+# test/test_reporter.ritz - the human report, and the buffer every report
+# goes through
+#
+# A report is written to a buffer and flushed in large writes, not one
+# syscall per fragment (AGAST #1910). out_pending() is what is buffered and
+# not yet written, so a report fragment that shows up there was not written
+# on its own. A test child shares this module with the runner it was forked
+# from, so each test first drops what it inherited (out_discard).
+
+import ritzlib.strview
+import ritzunit.assertions
+import ritzunit.reporter
+
+fn plain()
+    set_color_mode(-1)
+    out_discard()
+
+[[test]]
+fn a_passing_line_is_buffered_not_written() -> i32
+    plain()
+    print_test_pass("t", 5)
+    # "  t " + 57 dots + " OK (5ms)\n": the status ends at column 70.
+    var line: StrView = out_pending()
+    assert line.len == 71
+    assert_starts_with_sv(line, "  t ....")
+    assert_str_eq_sv(strview_slice(line, 61, 71), " OK (5ms)\n")
+    0
+
+[[test]]
+fn a_failing_line_names_the_exit_code() -> i32
+    plain()
+    print_test_fail("check_x", 12, 3)
+    var line: StrView = out_pending()
+    assert_starts_with_sv(line, "  check_x ...")
+    assert_contains_sv(line, " FAIL [code=3] (12ms)\n")
+    0
+
+[[test]]
+fn a_crash_line_names_the_signal() -> i32
+    plain()
+    print_test_crash("boom", 1, 11, "SIGSEGV")
+    assert_contains_sv(out_pending(), " CRASH (SIGSEGV) (1ms)\n")
+    0
+
+[[test]]
+fn a_timeout_line_shows_the_deadline() -> i32
+    plain()
+    print_test_timeout("slow", 5000)
+    assert_contains_sv(out_pending(), " TIMEOUT (5000ms)\n")
+    0
+
+[[test]]
+fn the_grand_summary_lists_only_nonzero_kinds() -> i32
+    plain()
+    print_grand_summary(4, 3, 1, 0, 0, 2, 9)
+    var s: StrView = out_pending()
+    assert_contains_sv(s, "TOTAL: 4 tests | 3 passed | 1 failed | 2 skipped (9ms)\n")
+    assert strview_find(s, "crashed") < 0
+    assert strview_find(s, "timeout") < 0
+    0
+
+[[test]]
+fn the_suite_summary_counts_each_kind() -> i32
+    plain()
+    print_suite_summary(5, 1, 1, 2, 1, 7)
+    assert_str_eq_sv(out_pending(), "  5 tests: 1 passed, 1 failed, 2 crashed, 1 timeout (7ms)\n\n")
+    0
+
+[[test]]
+fn color_wraps_the_status_when_forced_on() -> i32
+    set_color_mode(1)
+    out_discard()
+    print_test_pass("t", 0)
+    assert_contains_sv(out_pending(), "\e[32mOK\e[0m")
+    0
+
+[[test]]
+fn fragments_accumulate_until_flushed() -> i32
+    plain()
+    out_str("ab")
+    out_int(-42)
+    out_byte('c')
+    assert_str_eq_sv(out_pending(), "ab-42c")
+    out_discard()
+    assert out_pending().len == 0
+    0
+
+[[test]]
+fn a_report_larger_than_the_buffer_loses_nothing() -> i32
+    plain()
+    # Fill past the buffer: what overflows is written, the rest stays
+    # pending, and the pending tail is the latest bytes.
+    for i in 0..10000
+        out_str("0123456789")
+    var s: StrView = out_pending()
+    assert s.len < 100000
+    assert s.len % 10 == 0
+    assert_str_eq_sv(strview_slice(s, s.len - 10, s.len), "0123456789")
+    0
