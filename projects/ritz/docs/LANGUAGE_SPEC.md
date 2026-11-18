@@ -5270,6 +5270,15 @@ element always holds a value. An array of any rank is dropped element by element
 in index order (`g[0][0]`, `g[0][1]`, … `g[1][0]`), as a rank-1 array is. Both
 compilers do all of this (AGAST #3376, #3377).
 
+A store through an `@&T`, a `:&` parameter, or a place reached through one
+(`p.t = v`, `p.a[i] = v`, `*p = v`, `h = v` on `h:& T`), drops the old value
+in the same order: after `v`, before the store. A mutable borrow always refers
+to a live owned value, so there is no flag to consult. A store through a `*T`
+is a raw write and drops nothing: a raw pointer may point at uninitialised
+memory, as `box_new`'s `*b.ptr = value` into fresh `malloc` does. To replace a
+live value through a `*T`, lend it as `@&T` (LARB R58). ritz0 does this
+(AGAST #3474); ritz1 is AGAST #3475.
+
 An assignment evaluates its place before its value, whatever the place is: a
 binding, a field, an element or a dereference. Every call in the place runs
 first, once each, left to right; `v` runs after them. That covers an

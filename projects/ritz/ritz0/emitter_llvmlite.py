@@ -3238,6 +3238,9 @@ class LLVMEmitter:
         if not getattr(module, 'moves_annotated', False):
             MoveChecker().check(module)
         self.move_types = MoveTypes(module)
+        # The typing pass's table (typed.py), for what only types decide:
+        # whether a store goes through a reference (LARB R58).
+        self.typed = getattr(module, 'typed', None)
 
         # Transform async functions into state machines (before any emission)
         module = self._transform_async_functions(module)
@@ -5123,18 +5126,71 @@ class LLVMEmitter:
             if path_within(fpath, path[1]):
                 self.builder.store(ir.Constant(self.i1, value), flag)
 
+    def _store_reach(self, place: rast.Expr) -> Optional[str]:
+        """How the store target `place` is reached, by the nearest indirection
+        on its way to a root (LARB R58, §13.6), from the typing pass's types:
+        'ref' through an `@&T` (or `@T`) or a `:&` param, 'raw' through a
+        `*T`, 'owned' with none (a binding's own storage), None when a step
+        is untyped or isn't a field, deref or index."""
+        while True:
+            while isinstance(place, rast.Grouped):
+                place = place.expr
+            if isinstance(place, rast.Ident):
+                return 'ref' if self._lent_arg(place) is not None else 'owned'
+            if isinstance(place, (rast.Field, rast.Index)):
+                base = place.expr
+            elif isinstance(place, rast.UnaryOp) and place.op == '*':
+                base = place.operand
+            else:
+                return None
+            ty = self.typed.type_of(base) if self.typed is not None else None
+            if ty is None:
+                return None
+            ty = resolve_alias_in(ty, self.type_aliases)
+            if isinstance(ty, rast.RefType):
+                return 'ref'
+            if isinstance(ty, rast.PtrType):
+                return 'raw'
+            if isinstance(place, rast.UnaryOp):
+                # `*h` on a `h:& T` borrow of a non-pointer T is `h` (#2972).
+                inner = base
+                while isinstance(inner, rast.Grouped):
+                    inner = inner.expr
+                if self._lent_arg(inner) is None:
+                    return None
+            place = base
+
+    def _drop_old_through_ref(self, ptr: ir.Value, ritz_type: rast.Type) -> None:
+        """A store through a reference, once v is evaluated and before it is
+        stored: drop the old value (§13.6, LARB R58). A mutable borrow refers
+        to a live owned value, so there is no flag to consult; one can't be
+        moved out of either (the move checker refuses it)."""
+        if (self.builder.block.is_terminated
+                or not self.move_types.is_move_only(ritz_type)):
+            return
+        self._emit_drop_glue(ptr, ritz_type)
+
     def _drop_old_field(self, target: rast.Field, field_ptr: ir.Value,
                         field_type: rast.Type) -> None:
         """`x.f... = v`, once v is evaluated and before it is stored: drop
-        what is left of the field's old value (§13.6, AGAST #2173). Only a
-        field of a binding that owns its value (its drop flag is set), and
-        only if the field hasn't been moved out (its field flag, AGAST #2171);
-        parts of it that were moved out stay undropped (AGAST #2232). A moved
-        parent needs no check: the move checker rejects the assignment. A
-        store through a pointer drops nothing (AGAST #2179)."""
+        what is left of the field's old value (§13.6, AGAST #2173). Through a
+        reference it always drops (LARB R58); through a `*T` never (a raw
+        write). Otherwise only a field of a binding that owns its value (its
+        drop flag is set), and only if the field hasn't been moved out (its
+        field flag, AGAST #2171); parts of it that were moved out stay
+        undropped (AGAST #2232). A moved parent needs no check: the move
+        checker rejects the assignment."""
         if (self.builder.block.is_terminated
                 or not self.move_types.is_move_only(field_type)):
             return
+        reach = self._store_reach(target)
+        if reach == 'ref':
+            self._emit_drop_glue(field_ptr, field_type)
+            return
+        if reach == 'raw':
+            return
+        # Owned (or a step the typing pass left untyped): the binding's drop
+        # flag decides, and a pointer or reference binding has none.
         path = field_path(target)
         if path is None:
             return
@@ -5160,15 +5216,22 @@ class LLVMEmitter:
     def _drop_old_element(self, target: rast.Index, elem_ptr: ir.Value) -> None:
         """`a[i] = v`, `g[i][j] = v`, `h.a[i] = v`, once v and the index are
         evaluated and before v is stored: drop the element's old value
-        (§13.6, LARB R39, AGAST #3376). As for a field (_drop_old_field),
-        only an element of an array a binding owns: its drop flag is set
-        and, for `h.a[i]`, `h.a` hasn't been moved out. A store through a
-        pointer drops nothing (AGAST #2179). Every element of an owned Drop
-        array holds a value, as such an array must be initialised (§3.3)."""
+        (§13.6, LARB R39, AGAST #3376). As for a field (_drop_old_field):
+        through a reference it always drops (LARB R58), through a `*T`
+        never; otherwise only an element of an array a binding owns: its
+        drop flag is set and, for `h.a[i]`, `h.a` hasn't been moved out.
+        Every element of an owned Drop array holds a value, as such an array
+        must be initialised (§3.3)."""
         if self.builder.block.is_terminated:
             return
         elem_type = self._infer_ritz_type(target)
         if not self.move_types.is_move_only(elem_type):
+            return
+        reach = self._store_reach(target)
+        if reach == 'ref':
+            self._emit_drop_glue(elem_ptr, elem_type)
+            return
+        if reach == 'raw':
             return
         base = target
         while isinstance(base, (rast.Index, rast.Grouped)):
@@ -7496,6 +7559,11 @@ class LLVMEmitter:
                 if name in self.locals:
                     alloca, ty = self.locals[name]
                     val = self._convert_type(val, ty, stmt.value)
+                    slot_type = (self.typed.type_of(stmt.target)
+                                 if self.typed is not None else None)
+                    if self._lent_arg(stmt.target) is not None and slot_type is not None:
+                        # `h = v` on a `h:& T` stores to the caller's T (R58).
+                        self._drop_old_through_ref(alloca, slot_type)
                     self._store_binding(name, alloca, val)
                 elif name in self.globals:
                     gvar, ty = self.globals[name]
@@ -7638,6 +7706,10 @@ class LLVMEmitter:
                 if not isinstance(ptr.type, ir.PointerType):
                     raise EmitError(array_rules.NOT_A_POINTER, stmt.target.span)  # AGAST #2885
                 val = self._convert_type(emit_val(), ptr.type.pointee, stmt.value)
+                if self._store_reach(stmt.target) == 'ref':
+                    slot_type = self.typed.type_of(stmt.target)
+                    if slot_type is not None:
+                        self._drop_old_through_ref(ptr, slot_type)
                 self.builder.store(val, ptr)
             elif isinstance(stmt.target, rast.Field):
                 # Assignment to struct field: obj.field = val
