@@ -158,6 +158,26 @@ pub fn main() -> i32
         return 13
     3
 """,
+    # AGAST #3976: ritz1 lowered `@T[0]` (LARB R48) but gave the `let` no
+    # struct name, so `r.a` was an unlocated "unhandled EXPR_MEMBER".  A
+    # borrow at a constant and a run-time index, read field by field.
+    "struct_borrow": """\
+struct P
+    a: i32
+    b: i64
+
+const T: [2]P = [P { a: 1, b: 7 }, P { a: 2, b: 9 }]
+
+pub fn main() -> i32
+    let r = @T[0]
+    if r.a != 1 or r.b != 7
+        return 10
+    var i: i32 = 1
+    let q = @T[i]
+    if q.a != 2 or q.b != 9
+        return 11
+    3
+""",
     # SHA-256 / SHA-512 round constants: hex with the top bit set.
     "wide_hex": """\
 const K: [3]u32 = [0x428a2f98, 0xb5c0fbcf, 0xc67178f2]
