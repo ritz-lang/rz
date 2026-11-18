@@ -28,9 +28,10 @@ the wrong arity until #3319 lands, so those rows run on ritz1 and
 ritz1_selfhosted only.
 
 A call through a fn pointer is counted against its `fn(..)` type: a local, a
-param, or a nameless callee (`pick()(1, 2)`), which ritz0 accepted until #3333.
-ritz0 calls a nameless one `<expression>`; ritz1 doesn't name it yet (#3348), so
-its rows match the rest of the message.
+param, or a nameless callee (`pick()(1, 2)`, `(hh.f)(1, 2)`), which ritz0
+accepted until #3333.  Every compiler calls a nameless one `<expression>`
+(#3348).  A `fn(..)` type names no params, so ritz1 numbers the one an
+argument missed: "parameter 1 is declared `i32`", never "parameter ``".
 `syscallN` takes N+1 arguments on every compiler (#3334).  An integer into a
 single-field struct param is refused (LARB R47, spec §9.2): its rows are
 test_int_arg_for_struct_param.py's.
@@ -62,6 +63,9 @@ struct T
 
 struct W
     es: Vec<S>
+
+struct HH
+    f: fn(i32) -> i32
 
 impl S
     fn get(self: @S, i: i32) -> i32
@@ -122,7 +126,6 @@ pub fn main() -> i32
 """
 
 ARITY = "`{f}` called with {n} argument(s) but defined with {m}"
-NAMELESS = "` called with {n} argument(s) but defined with {m}"
 WRONG = "argument {n} of `{f}` has the wrong type: "
 PRINT = "{f}() requires a single string literal argument"
 
@@ -152,7 +155,9 @@ REFUSED = {
     "fn_pointer_struct_into_int": ("    let f: fn(i32) -> i32 = inc\n    return f(@s)", WRONG.format(n=1, f="f")),
     "fn_param_too_many": ("    return @h(1, 2)", ARITY.format(f="h", n=2, m=1),
                           "fn via(h: fn(i32) -> i32) -> i32\n"),
-    "nameless_too_many": ("    return @pick()(1, 2)", NAMELESS.format(n=2, m=1)),
+    "nameless_too_many": ("    return @pick()(1, 2)", ARITY.format(f="<expression>", n=2, m=1)),
+    "nameless_field_too_many": ("    return (@hh.f)(1, 2)", ARITY.format(f="<expression>", n=2, m=1),
+                                "fn via_field(hh: HH) -> i32\n"),
     # A `*[N]T` local or field of another element than u8 / i8 (AGAST #3349):
     # ritz1 passed the pointer's i64 where the %StrView goes, and clang refused.
     "array_pointer_wrong_elem_into_strview": ("    let pa: *[7]i32 = pi\n    return sv(@pa)", WRONG.format(n=1, f="sv"),
@@ -272,6 +277,29 @@ def test_a_lent_struct_of_another_type_is_another_struct(compile_with, compiler)
     comp, _, _ = compile_with(compiler, "lent_other_once", HEADER.split("pub fn main")[0]
                               + "fn lent_t(t:& T) -> i32\n    return byval(t)\n\npub fn main() -> i32\n    return 0\n")
     assert "has the wrong type" not in comp.stdout + comp.stderr
+
+
+# A `fn(..)` type names no params: ritz1 numbers the one the argument missed
+# (#3348).  ritz0 spells the rest in llvmlite's types.
+NAMELESS_KIND = {
+    "fn_pointer": ("    let f: fn(i32) -> i32 = inc\n    return f(@s)", "f"),
+    "nameless": ("    return pick()(@s)", "<expression>"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", RITZ1S)
+@pytest.mark.parametrize("name", sorted(NAMELESS_KIND))
+def test_a_param_with_no_name_is_numbered(compile_with, name, compiler):
+    marked, f = NAMELESS_KIND[name]
+    _refused(compile_with, compiler, "nameless_kind_" + name, marked,
+             WRONG.format(n=1, f=f) + "parameter 1 is declared `i32` but its argument is a `S`")
+
+
+@pytest.mark.integration
+def test_ritz0_names_a_nameless_callee_in_a_kind_error(compile_with):
+    _refused(compile_with, "ritz0", "nameless_kind_ritz0", "    return pick()(@s)",
+             WRONG.format(n=1, f="<expression>"))
 
 
 # A pointer to the param's own struct is ref_check's to refuse, in its words
