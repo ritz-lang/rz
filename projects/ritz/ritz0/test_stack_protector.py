@@ -179,17 +179,43 @@ def test_harland_defines_the_guard_and_the_failure_handler(tmp_path):
     assert "__stack_chk_fail" in _define_lines(ir), ir
 
 
-def test_harland_boot_seeds_the_guard_before_kernel_main():
-    """In higher_half_entry (the guard is a higher-half .data symbol), before
-    the first Ritz frame: guard ^= TSC through its absolute address."""
+def _harland_seed_code() -> str:
+    """higher_half_entry up to `call kernel_main`, comments stripped: the
+    window in which the guard must be seeded (every later frame copies it)."""
     boot = (HARLAND / "kernel" / "boot.s").read_text()
     start = boot.find("\nhigher_half_entry:")
     call = boot.find("call kernel_main", start)
     assert 0 <= start < call, "higher_half_entry must call kernel_main"
-    entry = re.sub(r"#.*", "", boot[start:call])
-    assert re.search(r"rdtsc\b.*movabsq\s+\$__stack_chk_guard,\s*(%r\w+)\s*\n"
-                     r"\s*xorq\s+%rax,\s*\(\1\)", entry, re.S), \
-        "boot.s must XOR the TSC into __stack_chk_guard before kernel_main"
+    return re.sub(r"#.*", "", boot[start:call])
+
+
+def test_harland_boot_seeds_the_guard_before_kernel_main():
+    """In higher_half_entry (the guard is a higher-half .data symbol), before
+    the first Ritz frame: guard ^= seed through its absolute address, where
+    the seed always includes the TSC (the fallback when RDRAND is absent)."""
+    entry = _harland_seed_code()
+    m = re.search(r"\brdtsc\b.*movabsq\s+\$__stack_chk_guard,\s*(%r\w+)\s*\n"
+                  r"\s*xorq\s+%r\w+,\s*\(\1\)\s*\n\s*movb\s+\$0,\s*\(\1\)",
+                  entry, re.S)
+    assert m, "boot.s must XOR a TSC-based seed into __stack_chk_guard " \
+              "(low byte cleared) before kernel_main"
+
+
+def test_harland_boot_mixes_rdrand_only_when_cpuid_reports_it():
+    """AGAST #4097: RDRAND is mixed in only behind CPUID.01H:ECX[30] (it
+    raises #UD on CPUs without it), retried while CF=0, and both happen
+    before the guard store."""
+    entry = _harland_seed_code()
+    store = entry.find("$__stack_chk_guard")
+    m = re.search(r"movl\s+\$1,\s*%eax\s*\n\s*cpuid\s*\n\s*btl\s+\$30,\s*%ecx\s*\n"
+                  r"\s*jnc\s+(\w+)", entry)
+    assert m, "RDRAND must be gated on CPUID.01H:ECX bit 30"
+    rd = re.search(r"(\d+):\s*rdrand\s+%r\w+\s*\n\s*jc\s+\w+\s*\n"
+                   r"\s*decl\s+%\w+\s*\n\s*jnz\s+(\d+)b", entry)
+    assert rd and rd.group(1) == rd.group(2), \
+        "RDRAND must retry on CF=0 with a bounded count"
+    assert m.start() < rd.start() < store, \
+        "the CPUID check and RDRAND must precede the guard store"
 
 
 @pytest.mark.skipif(shutil.which("clang") is None, reason="clang not on PATH")

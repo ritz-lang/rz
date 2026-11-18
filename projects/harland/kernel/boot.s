@@ -290,14 +290,30 @@ higher_half_entry:
     call serial_print64
 
     # Seed the stack canary (AGAST #2590, kernel/src/stack_protector.ritz)
-    # before the first Ritz frame stores a copy of it: guard ^= TSC, low
+    # before the first Ritz frame stores a copy of it: guard ^= seed, low
     # byte cleared so a string overrun cannot reproduce it.  The guard is a
     # higher-half .data symbol and this is .boot code, hence movabsq.
+    # seed = TSC, XOR RDRAND when CPUID.01H:ECX[30] says the CPU has it
+    # (AGAST #4097: the boot-time TSC is predictable to a small range).
+    # RDRAND sets CF=0 when its entropy pool is drained; retry up to 10
+    # times (Intel's DRNG guidance) and otherwise fall back to the TSC.
     rdtsc
     shlq $32, %rdx
     orq %rdx, %rax
-    movabsq $__stack_chk_guard, %rcx
-    xorq %rax, (%rcx)
+    movq %rax, %rsi                     # seed = TSC
+    movl $1, %eax
+    cpuid                               # clobbers rbx/rcx/rdx: none live here
+    btl $30, %ecx                       # CF = RDRAND supported
+    jnc 3f
+    movl $10, %ecx
+2:  rdrand %rax
+    jc 4f
+    decl %ecx
+    jnz 2b
+    jmp 3f
+4:  xorq %rax, %rsi                     # seed ^= RDRAND
+3:  movabsq $__stack_chk_guard, %rcx
+    xorq %rsi, (%rcx)
     movb $0, (%rcx)
 
     # Call the Ritz kernel main
