@@ -547,9 +547,9 @@ fn main() -> i32
 """, "expected i64, " + _AS_INT.format("Errno"), "t.ritz:17"),
 })
 
-# The controls: an enum where an enum is expected, an explicit `as`, and an
-# enum-valued tail in a procedure (whose tail is evaluated for effect) all
-# still compile and run.
+# The controls: an enum where an enum is expected and an explicit `as` still
+# compile and run.  (A bare `St.A` tail of a procedure is discarded, so it has
+# no effect: LARB R64, AGAST #3491.)
 ENUM_POSITIONS_OK = _ST + """\
 fn pick(s: St) -> St
     s
@@ -557,11 +557,7 @@ fn pick(s: St) -> St
 fn st() -> St
     return St.B
 
-fn proc()
-    St.A
-
 fn main() -> i32
-    proc()
     var s: St = St.A
     s = pick(st())
     let n: i64 = s as i64

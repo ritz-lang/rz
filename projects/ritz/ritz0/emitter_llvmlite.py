@@ -145,6 +145,10 @@ class NoValue:
         return "NoValue"
 
 
+# A `pass` arm's place in a match's arm values (_fill_pass_arms).
+_PASS_ARM = object()
+
+
 def has_no_value(val) -> bool:
     """Whether `val` is an expression's "no value": ir.Undefined (a block
     ending in a statement, a diverging `break` / `return`) or a NoValue."""
@@ -6433,6 +6437,15 @@ class LLVMEmitter:
                         getattr(fn_def.body.expr, 'span', None))
                     self._reject_another_struct_return(
                         last_val, ret_type, getattr(fn_def.body.expr, 'span', None))
+                # A procedure's tail is discarded (LANGUAGE_SPEC §5.1, LARB
+                # R69): a bool there (a call, or a statement match whose arms
+                # store one beside `_ => pass`) isn't converted into the
+                # dummy return, which refused it as "bool as an integer"
+                # (AGAST #3491).
+                if fn_def.ret_type is None and last_val.type == self.i1:
+                    self._emit_drop_for_all_scopes(exclude_var)
+                    self.builder.ret(ir.Constant(ret_type, 0))
+                    return fn
                 last_val = self._convert_type(last_val, ret_type, fn_def.body.expr)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
@@ -6459,6 +6472,28 @@ class LLVMEmitter:
             self.builder.unreachable()
 
         return fn
+
+    @staticmethod
+    def _ends_in_pass(body) -> bool:
+        """An arm whose value is `pass` (AGAST #3491): see _fill_pass_arms."""
+        while isinstance(body, rast.Block) and body.expr is not None:
+            body = body.expr
+        return isinstance(body, rast.Ident) and body.name == 'pass'
+
+    def _fill_pass_arms(self, arm_values: list) -> list:
+        """A `pass` arm's dummy takes the other arms' type (AGAST #3491).
+
+        A `pass` arm has no value, so its match is a statement: a used one
+        is refused where the `pass` is emitted (PASS_HAS_NO_VALUE).  Its
+        dummy was an i32 0, so `_ => pass` beside arms storing a bool (R64's
+        fix for `_ => 0`) was refused as an integer used as bool.  Now it's
+        the zero of the first other arm's type, and an all-`pass` match keeps
+        the i32 0.  The match still has a value of that type, which a
+        statement `if` chain around it reads (79_ritzlib_json)."""
+        typed = [v for v in arm_values
+                 if v is not _PASS_ARM and not has_no_value(v) and hasattr(v, 'type')]
+        ty = typed[0].type if typed else self.i32
+        return [ir.Constant(ty, None) if v is _PASS_ARM else v for v in arm_values]
 
     @staticmethod
     def _declares_value(fn_def: Optional[rast.FnDef]) -> bool:
@@ -16664,7 +16699,7 @@ class LLVMEmitter:
             # with the exit blocks, so appending a value only for live arms
             # paired a `return` arm's `None` block with the next arm's value
             # and the tail yielded a dummy 0 (AGAST #3318).
-            arm_values.append(arm_val)
+            arm_values.append(_PASS_ARM if self._ends_in_pass(arm.body) else arm_val)
             if not self.builder.block.is_terminated:
                 arm_exit_blocks.append(self.builder.block)
                 self.builder.branch(merge_block)
@@ -16833,6 +16868,7 @@ class LLVMEmitter:
         """The value of an enum match, built in its merge block."""
 
         # Create phi node for the result if arms have values
+        arm_values = self._fill_pass_arms(arm_values)
         if arm_values and arm_exit_blocks:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]
@@ -17095,7 +17131,7 @@ class LLVMEmitter:
             self.has_returned = _saved_arm_returned
             self._end_diverging_arm(arm.body)
             self._pin_arm_unsigned(arm_val)  # `n` still bound (AGAST #3344)
-            arm_values.append(arm_val)
+            arm_values.append(_PASS_ARM if self._ends_in_pass(arm.body) else arm_val)
 
             # Check if the arm already terminated (e.g., with return)
             if not self.builder.block.is_terminated:
@@ -17118,6 +17154,7 @@ class LLVMEmitter:
             self.has_returned = True
 
         # Create phi node for the result if arms have values
+        arm_values = self._fill_pass_arms(arm_values)
         if arm_values and arm_exit_blocks:
             # Filter out terminated blocks (those that returned)
             incoming = [(val, block) for val, block in zip(arm_values, arm_exit_blocks) if block is not None]

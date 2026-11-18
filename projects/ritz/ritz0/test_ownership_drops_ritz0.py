@@ -320,8 +320,8 @@ pub fn main() -> i32
 fn f() -> i32
     var s = P.Two(make(1), make(2))
     match s
-        Two(a, _) => a.id
-        _ => 0
+        Two(a, _) => pass
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -335,7 +335,7 @@ fn f() -> i32
     var s = P.Two(make(1), make(2))
     match s
         Two(a, b) => consume(b)
-        _ => 0
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -821,7 +821,7 @@ fn f()
     var o = Sack { b: Bag { s: Slot.Full(make(1)), k: make(2) } }
     match o.b.s
         Full(t) => consume(t)
-        Empty => 0
+        Empty => pass
 
 pub fn main() -> i32
     f()
@@ -904,24 +904,6 @@ fn f()
     let a = [(t, 1)]
     let b = ([u], 1)
 """, 2),
-    # A statement's literal is a temporary: it drops, and the binding doesn't.
-    "array_statement": ("""
-fn f() -> i32
-    var t = make(1)
-    [t]
-    return 0
-""", 1),
-    "tuple_statement": ("""
-fn f() -> i32
-    var t = make(1)
-    (t, 1)
-    return 0
-""", 1),
-    "array_of_temporaries_statement": ("""
-fn f() -> i32
-    [make(1), make(2)]
-    return 0
-""", 2),
     "tuple_read_through_a_temporary": ("""
 fn f()
     var t = make(1)
@@ -980,7 +962,6 @@ fn f()
 LITERAL_REJECTS = {
     "array": "let a = [t]",
     "tuple": "let a = (t, 1)",
-    "array_statement": "[t]",
 }
 
 
@@ -995,12 +976,35 @@ pub fn main() -> i32
     assert rc == expected, f"{name}: {rc} drops, spec says {expected}"
 
 
-# A void fn's tail value goes nowhere (AGAST #2253): a temporary drops once, a
-# bare binding stays owned and drops once at scope end.
+# A void fn's tail value goes nowhere (AGAST #2253): a call's temporary drops
+# once.
 VOID_TAIL_RUNS = {
     "call": """
 fn f()
     make(1)
+""",
+}
+
+# A literal or a bare binding alone as a statement, or as a void fn's or a
+# statement arm's tail (LARB R69), has no effect (LARB R64, AGAST #3491): ritz0
+# refuses it where #2253 and #2266 had it drop a temporary.
+NO_EFFECT_STATEMENTS = {
+    "array_statement": """
+fn f() -> i32
+    var t = make(1)
+    [t]
+    return 0
+""",
+    "tuple_statement": """
+fn f() -> i32
+    var t = make(1)
+    (t, 1)
+    return 0
+""",
+    "array_of_temporaries_statement": """
+fn f() -> i32
+    [make(1), make(2)]
+    return 0
 """,
     "struct_literal": """
 fn f()
@@ -1048,6 +1052,18 @@ pub fn main() -> i32
     return DROPS
 """)
     assert rc == 1, f"{name}: {rc} drops, spec says 1"
+
+
+@pytest.mark.parametrize("name", sorted(NO_EFFECT_STATEMENTS))
+def test_ritz0_literal_or_binding_alone_has_no_effect(tmp_path, name):
+    comp, _ = _compile(tmp_path, NO_EFFECT_STATEMENTS[name] + """
+pub fn main() -> i32
+    f()
+    return DROPS
+""")
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{name}: accepted:\n{out[-1000:]}"
+    assert "statement has no effect: the value of `" in out, out[-2000:]
 
 
 @pytest.mark.parametrize("name", sorted(LITERAL_REJECTS))

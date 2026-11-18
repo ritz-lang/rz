@@ -25,6 +25,7 @@ import pytest
 
 import fast_link
 
+from no_effect import no_effect_message
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -296,10 +297,11 @@ ACCEPTED = {
                    "    if a[1] and not a[0]\n        return 3\n    0\n", 3),
     "bool_const": ("const C: bool = true\nfn main() -> i32\n    if C\n        return 3\n    0\n", 3),
     # AGAST #2046 / #3774: a thrown-away match may mix a valueless arm (a call
-    # to a fn returning nothing) with valued ones.
+    # to a fn returning nothing) with others; a bare `5` there has no effect
+    # (LARB R64, AGAST #3491), so the other arm is `pass`.
     "discarded_void_arm": ("var g: i32\nfn p()\n    g = 3\nfn main() -> i32\n"
                            "    let a: bool = true\n    match a\n        true => p()\n"
-                           "        false => 5\n    g\n", 3),
+                           "        false => pass\n    g\n", 3),
     # AGAST #3001: a `bool` global is one i1 byte, as on ritz0, and reads as the
     # i64 every bool value is; ritz1 stored the i64 as i1 and handed `not`, `and`,
     # a cast and a by-value arg the raw i1 load.
@@ -402,11 +404,22 @@ def _compile(request, compiler, tmp_path, source, extra=None):
     return proc, ll
 
 
+# A discarded `if`/`match` arm has no value (LARB R69), so there is no mix to
+# judge: a literal arm alone has no effect, and ritz0 says so first (LARB R64,
+# AGAST #3491).  ritz1 keeps #2046's words until it has R64 too (#3492).
+NO_EFFECT_ARMS = {
+    "discarded_if_arms_mix": (2, 23, no_effect_message("true", is_string=False)),
+    "discarded_nested_match_arms_mix": (5, 22, no_effect_message("true", is_string=False)),
+}
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REJECTED))
 def test_a_mixed_bool_is_a_located_error(request, tmp_path, compiler, name):
     source, line, col, message = REJECTED[name]
+    if compiler == "ritz0" and name in NO_EFFECT_ARMS:
+        line, col, message = NO_EFFECT_ARMS[name]
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"

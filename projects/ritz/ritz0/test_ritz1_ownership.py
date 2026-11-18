@@ -674,8 +674,8 @@ pub fn main() -> i32
 pub fn main() -> i32
     var s = Slot.Full(make(1))
     match s
-        Full(t) => 1
-        _ => 0
+        Full(t) => pass
+        _ => pass
     var u = s
     return 0
 """,
@@ -701,8 +701,8 @@ pub fn main() -> i32
     var s = Slot.Full(make(1))
     var u = s
     match s
-        Full(t) => 1
-        _ => 0
+        Full(t) => pass
+        _ => pass
     return 0
 """,
 

@@ -61,19 +61,21 @@ def test_unit_fn_discards_struct_tail(tmp_path):
     assert verify.returncode == 0, f"invalid IR: {verify.stderr}"
 
 
-# Guard: an i32-valued tail in an undeclared-ret fn keeps returning it
-# (existing programs rely on the implicit i32).
+# No return type is a procedure (LANGUAGE_SPEC §5.1): its tail is discarded
+# (LARB R69), so a bare `41 + 1` there has no effect (LARB R64, AGAST #3491).
+# This was a guard that ritz0 returned it as an implicit i32.
 I32_TAIL_IN_UNIT_FN = """\
 fn gives_back()
     41 + 1
 
 fn main() -> i32
-    gives_back() - 42
+    gives_back()
+    0
 """
 
 
-def test_unit_fn_keeps_i32_tail(tmp_path):
+def test_unit_fn_i32_tail_has_no_effect(tmp_path):
     result = _compile(tmp_path, I32_TAIL_IN_UNIT_FN)
-    assert result.returncode == 0, (
-        f"i32-tail guard case failed:\n{result.stderr}"
-    )
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "unit.ritz:2:5: error: statement has no effect: the value of `41 + 1` is discarded" in out, out

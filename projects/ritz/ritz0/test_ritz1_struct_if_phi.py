@@ -212,12 +212,14 @@ MATCH_ARM = """\
 struct B
     w: i32
     h: i32
+fn keep(x: i32) -> i32
+    x
 fn pick(k: i32, o: Option<i32>) -> B
     var t: i32 = 0
     if k == 9
-        t + 1
+        keep(t + 1)
     else
-        t + 2
+        keep(t + 2)
     if k == 0
         match o
             Some(v) => B { w: v + 1, h: 0 }

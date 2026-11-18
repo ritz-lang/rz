@@ -1499,7 +1499,7 @@ fn save(dir: StrView, name: StrView, text: StrView) -> i32
     if not is_dir(dir)
         var made: Result<i32, i32> = mkdir(dir, 493)    # 0755
         match made
-            Ok(_) => 0
+            Ok(_) => pass
             Err(e) => return e
     var path: String = path_join(dir, name)
     var r: Result<i64, i32> = write_file(string_as_view(@path), text)

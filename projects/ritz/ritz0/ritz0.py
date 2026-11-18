@@ -37,6 +37,7 @@ from builtin_types import check_builtin_impls, check_unknown_impl_targets
 from impl_placement import check_impl_placement
 from type_names import check_unknown_type_names
 from reachability import check_reachable
+from no_effect import check_no_effect
 from move_checker import MoveChecker, OwnershipError
 from monomorph import infer_struct_lit_args
 from type_checker import TypeError as RitzTypeError
@@ -322,6 +323,15 @@ def _check_reachable(ctx: _Compile) -> bool:
     return _report(check_reachable(ctx.module, ctx.source_abs_path))
 
 
+def _check_no_effect(ctx: _Compile) -> bool:
+    """A statement with no effect (LARB R64, AGAST #3491). After _type: a
+    discarded expression the typing pass already refused (a whole array
+    alone, #3189) keeps that error, which the emitter reports. Still before
+    monomorphisation, so a generic fn is judged whether or not it's used."""
+    return _report(check_no_effect(ctx.module, ctx.source_abs_path,
+                                   ctx.module.typed))
+
+
 def _check_names(ctx: _Compile) -> bool:
     """`--check-names`: every referenced name is defined."""
     if not ctx.check_names:
@@ -498,6 +508,7 @@ PASSES = (
     _infer_struct_lit_args,
     _type,
     _check_types,
+    _check_no_effect,
     _check_ownership,
     _emit,
 )

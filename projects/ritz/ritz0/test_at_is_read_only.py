@@ -81,7 +81,7 @@ WRITES = {
     "deref_address_of": "fn f(n: i32)\n    ^*(@n) = 3\n",
     "if_body": "fn f(p: @C, b: i32)\n    if b > 0\n        ^p.x = 3\n",
     "while_body": "fn f(p: @C, b: i32)\n    while b > 0\n        ^p.x = 3\n",
-    "match_arm": "fn f(p: @C, b: i32)\n    match b\n        0 => ^p.x = 3\n        _ => p.x\n",
+    "match_arm": "fn f(p: @C, b: i32)\n    match b\n        0 => ^p.x = 3\n        _ => pass\n",
     "generic_instance": "fn g<T>(p: @T, v: T)\n    ^*p = v\n\nfn f(p: @i32)\n    g<i32>(p, 3)\n",
 }
 

@@ -255,10 +255,9 @@ fn make_mixed(a: i32) -> (Tracked, i32)
 """
 
 # Tuple rows ritz1 still misses since it types every tuple (AGAST #3005): a
-# pointer or array element (#3024), a discarded tuple temporary's elements
-# (#3031).
+# pointer or array element (#3024).  #3031's discarded tuple temporary has no
+# effect (LARB R64, AGAST #3491), so its rows bind the tuple instead.
 TUPLE_PTR_ELEM = {"ritz1": 3024, "ritz1_selfhosted": 3024}
-TUPLE_TEMP_GAP = {"ritz1": 3031, "ritz1_selfhosted": 3031}
 
 # name -> (program body, expected exit status, {compiler: gap ticket}).
 # Where a helper returns `DROPS * 10`, the tens digit is the count at that
@@ -517,7 +516,7 @@ fn f() -> i32
     var x = b.e
     match x
         Full(t) => consume(t)
-        Empty => 0
+        Empty => pass
     return 0
 
 pub fn main() -> i32
@@ -583,7 +582,7 @@ pub fn main() -> i32
     "field_element_array_temporary": (SLOT + FIELDS + """\
 fn f() -> i32
     var h = Holder { t: make(1), n: 0 }
-    [h.t]
+    let a = [h.t]
     return 0
 
 pub fn main() -> i32
@@ -594,13 +593,13 @@ pub fn main() -> i32
     "field_element_tuple_temporary": (SLOT + FIELDS + """\
 fn f() -> i32
     var h = Holder { t: make(1), n: 0 }
-    (h.t, 1)
+    let a = (h.t, 1)
     return 0
 
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, TUPLE_TEMP_GAP),
+""", 1, {}),
 
     "field_element_array_binding": (SLOT + FIELDS + """\
 fn f() -> i32
@@ -640,7 +639,7 @@ pub fn main() -> i32
     # A temporary literal drops every element, in index order.
     "array_temporary_drops_each_element": (SLOT + FIELDS + """\
 fn f() -> i32
-    [make(1), make(2)]
+    let a = [make(1), make(2)]
     return 0
 
 pub fn main() -> i32
@@ -1366,7 +1365,7 @@ pub fn main() -> i32
     var p = Pick.A
     match p
         Pick.A => consume(v.w.t)
-        Pick.B => 0
+        Pick.B => pass
 """), 12, {}),
 
     "nested_sibling_readable_after_if": (NESTED3 + """\
@@ -1406,7 +1405,7 @@ fn f()
     var o = OutSlot { s: InSlot { e: Slot.Full(make(1)), u: make(2) } }
     match o.s.e
         Slot.Full(t) => consume(t)
-        Slot.Empty => 0
+        Slot.Empty => pass
 
 pub fn main() -> i32
     f()
@@ -1948,8 +1947,8 @@ pub fn main() -> i32
 fn f() -> i32
     var s = Slot.Full(make(1))
     match s
-        Full(t) => t.id
-        _ => 0
+        Full(t) => pass
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -1961,8 +1960,8 @@ pub fn main() -> i32
 fn f() -> i32
     var s = Slot.Full(make(1))
     match s
-        Empty => 1
-        _ => 2
+        Empty => pass
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -1975,8 +1974,8 @@ pub fn main() -> i32
 fn f() -> i32
     var s = Slot.Full(make(1))
     match s
-        Full(_) => 1
-        Empty => 2
+        Full(_) => pass
+        Empty => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -1990,7 +1989,7 @@ fn f() -> i32
     var s = Slot.Full(make(1))
     match s
         Full(t) => consume(t)
-        _ => 0
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2019,7 +2018,7 @@ pub fn main() -> i32
 fn f() -> i32
     var s = Slot.Full(make(1))
     match s
-        Empty => 1
+        Empty => pass
         _ =>
             return DROPS * 10
     return 99
@@ -2066,8 +2065,8 @@ struct Box2
 fn f() -> i32
     var b = Box2 { s: Slot.Full(make(1)), n: 1 }
     match b.s
-        Full(t) => t.id
-        _ => 0
+        Full(t) => pass
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2082,11 +2081,11 @@ fn full(id: i32) -> Slot
 
 fn f() -> i32
     match full(1)
-        Full(t) => t.id
-        _ => 0
+        Full(t) => pass
+        _ => pass
     match full(2)
-        Empty => 1
-        _ => 2
+        Empty => pass
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2101,8 +2100,8 @@ import ritzlib.option
 fn f() -> i32
     var o: Option<Tracked> = Some(make(1))
     match o
-        Some(t) => t.id
-        None => 0
+        Some(t) => pass
+        None => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2118,8 +2117,8 @@ fn f() -> i32
         if i % 2 == 0
             s = Slot.Full(make(1))
         match s
-            Full(t) => t.id
-            _ => 0
+            Full(t) => pass
+            _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2133,8 +2132,8 @@ pub fn main() -> i32
 fn f() -> i32
     var s = Slot.Full(make(1))
     match @s
-        Full(t) => 1
-        _ => 0
+        Full(t) => pass
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2148,8 +2147,8 @@ pub fn main() -> i32
 fn f() -> i32
     var s = Slot.Full(make(3))
     match @s
-        Full(t) => t.id + look(@t) - 6
-        _ => 0
+        Full(t) => DROPS = DROPS + t.id + look(@t) - 6
+        _ => pass
     return DROPS * 10
 
 pub fn main() -> i32
@@ -2436,7 +2435,7 @@ fn f()
     var p = (Slot.Full(make(1)), make(2))
     match p.0
         Full(t) => consume(t)
-        _ => 0
+        _ => pass
 
 pub fn main() -> i32
     f()
@@ -2447,7 +2446,7 @@ pub fn main() -> i32
 fn f()
     var p = (Slot.Full(make(1)), make(2))
     match p.0
-        _ => 0
+        _ => pass
 
 pub fn main() -> i32
     f()
@@ -2485,13 +2484,13 @@ pub fn main() -> i32
     "tuple_element_into_literal_temporary": (TUPLES + SLOT + """\
 fn f() -> i32
     var p = (make(1), make(2))
-    (p.0, 3)
+    let a = (p.0, 3)
     return 0
 
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, TUPLE_TEMP_GAP),
+""", 2, {}),
 
     # Lending an element takes its address, which moves nothing.
     "tuple_element_lent": (TUPLES + SLOT + """\
@@ -2933,7 +2932,7 @@ pub fn main() -> i32
     var s = Slot.Full(make(1))
     match @s
         Full(t) => consume(t)
-        _ => 0
+        _ => pass
     return DROPS
 """, 8, 28),
     "lent_param_match_payload_returned": (SLOT + """\
@@ -2980,7 +2979,7 @@ pub fn main() -> i32
     var s = Nest.Has(Slot.Full(make(1)))
     match @s
         Has(x) => take_slot(x)
-        _ => 0
+        _ => pass
     return DROPS
 """, 15, 29),
     # A tag-only enum with a Drop impl: move-only, but no aggregate payload.
@@ -3001,7 +3000,7 @@ pub fn main() -> i32
     var s = Nest.Has(Slot.Full(make(1)))
     match @s
         Has(Full(x)) => consume(x)
-        _ => 0
+        _ => pass
     return DROPS
 """
 
@@ -3067,7 +3066,7 @@ pub fn main() -> i32
     "after_move_into_array_literal": ("""\
 pub fn main() -> i32
     var t = make(1)
-    [t]
+    let a = [t]
     return t.id
 """, "t", {}),
 
@@ -3185,7 +3184,7 @@ pub fn main() -> i32
 
     "scalar_part_after_parent_move": (nested_order("""\
     eat_w(v.w)
-    v.w.n
+    let n = v.w.n
 """), "v.w", {}),
 
     # A store into a moved parent doesn't make it an owner again.
@@ -3308,8 +3307,9 @@ pub fn main() -> i32
 pub fn main() -> i32
     var s = Slot.Full(make(1))
     match s
-        Full(t) => consume(t) + consume(t)
-        _ => 0
+        Full(t) =>
+            let k = consume(t) + consume(t)
+        _ => pass
     return 0
 """, "t", {}),
 

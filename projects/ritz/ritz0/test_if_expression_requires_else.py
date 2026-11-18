@@ -290,10 +290,11 @@ OPERAND_POSITIONS = {
         "        1\n"
         "    return x\n"
     ),
-    # The expression is a statement, but its operand is still consumed.
+    # The expression is a statement, but its operand is still consumed.  Each
+    # stores its sum: a bare `*p + …` alone has no effect (LARB R64, #3491).
     "operand_of_an_expr_stmt": (
         "fn g(p: *i32, c: i32)\n"
-        "    *p + if c == 1\n"
+        "    *p = *p + if c == 1\n"
         "        1\n"
         "    p[0] = 3\n"
     ),
@@ -301,21 +302,21 @@ OPERAND_POSITIONS = {
     # but an operand inside it is consumed.
     "operand_in_a_procedure_tail": (
         "fn g(p: *i32, c: i32)\n"
-        "    *p + if c == 1\n"
+        "    *p = *p + if c == 1\n"
         "        1\n"
     ),
     # Tail of a statement `if`'s arm: reached through the arm's block tail.
     "operand_in_a_statement_if_arm": (
         "fn g(p: *i32, c: i32, d: i32)\n"
         "    if d == 1\n"
-        "        *p + if c == 1\n"
+        "        *p = *p + if c == 1\n"
         "            1\n"
         "    p[0] = 3\n"
     ),
     "operand_in_a_while_body_tail": (
         "fn g(p: *i32, c: i32)\n"
         "    while *p < 10\n"
-        "        *p + if c == 1\n"
+        "        *p = *p + if c == 1\n"
         "            1\n"
     ),
     # Result path and operand compose: the `if` is an operand inside the

@@ -257,13 +257,14 @@ fn f(o: Option<i32>) -> i32
 pub fn main() -> i32
     f(None) - 1
 """,
-    # Statement-position match: void arms everywhere, plus a value arm.
+    # Statement-position match: void arms everywhere, plus a value arm (a
+    # call's: a bare `1` there has no effect, LARB R64, AGAST #3491).
     "stmt_match": """\
 pub fn main() -> i32
     let o: Option<i32> = None
     match o
         Some(e) => say(e)
-        None => 1
+        None => take(1)
     0
 """,
     # An if/else arm of a statement match whose branches are void calls.

@@ -510,7 +510,7 @@ NO_LOOP = {
     "option_none_push_get_len": (GVEC + MAIN + "    var v: Vec<Option<i64>> = vec_new<Option<i64>>()\n"
                                  "    let o: Option<i64> = None\n    vec_push<Option<i64>>(@&v, o)\n"
                                  "    let b: Option<i64> = vec_get<Option<i64>>(@v, 0)\n"
-                                 "    match b\n        Some(n) => return 9\n        None => 0\n"
+                                 "    match b\n        Some(n) => return 9\n        None => pass\n"
                                  "    return vec_len<Option<i64>>(@v) as i32\n", 1),
 }
 

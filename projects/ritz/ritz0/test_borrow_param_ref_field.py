@@ -3218,18 +3218,38 @@ def test_ritz0_slot_holds_what_it_is_given(tmp_path, name):
     assert _run("ritz0", None, tmp_path, name, CONTROLS[name]) == 3
 
 
+# A bare `t` or `t.h` whose value is discarded (LARB R69) has no effect, so
+# ritz0 refuses it with R64's words before #2949's move question arises (AGAST
+# #3491).  ritz1 keeps the rows above until it has R64 too (#3492).
+NO_EFFECT_ROWS = {
+    "stmt_mid_block", "stmt_field_tail", "stmt_defer_tail", "stmt_copy_tail",
+    "stmt_tail", "stmt_method_tail", "stmt_while", "stmt_for", "stmt_match_arm",
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(DROP_STORES))
+@pytest.mark.parametrize("name", sorted(set(DROP_STORES) - NO_EFFECT_ROWS))
 def test_ritz0_reference_to_a_drop_type_is_not_a_move(tmp_path, name):
     assert _run("ritz0", None, tmp_path, name, DROP_STORES[name]) == 3
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(MOVE_OUT))
+@pytest.mark.parametrize("name", sorted(set(MOVE_OUT) - NO_EFFECT_ROWS))
 def test_ritz0_by_value_field_is_still_a_move_out(tmp_path, name):
     comp, _, _ = _compile("ritz0", None, tmp_path, name, MOVE_OUT[name])
     assert comp.returncode != 0
     assert "cannot move out of a reference" in comp.stdout + comp.stderr
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(NO_EFFECT_ROWS))
+def test_ritz0_a_bare_reference_alone_has_no_effect(tmp_path, name):
+    src = DROP_STORES.get(name) or MOVE_OUT[name]
+    comp, _, _ = _compile("ritz0", None, tmp_path, name, src)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0
+    assert "statement has no effect: the value of `t" in out, out[-2000:]
+    assert "cannot move out of a reference" not in out, out[-2000:]
 
 
 @pytest.mark.integration
