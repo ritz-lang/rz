@@ -1805,16 +1805,45 @@ class TypeChecker:
         if not isinstance(array, rast.ArrayType):
             return False
         held = self._resolve_alias(array.inner)
-        if self._is_opaque(held):
+        return self._span_element_fits(mangle_generic_name('Span', [held]),
+                                       held, slot) is False
+
+    def _span_view_fits(self, actual: rast.Type, slot: rast.Type) -> bool:
+        """`@a` / `@&a` of an array or a Vec into a `Span<T>` slot: a view of
+        its elements, which the emitter builds as `Span { ptr, len }` (§13,
+        AGAST #3595). Its element must be T; `a` itself is a value and
+        doesn't fit, nor does another generic struct."""
+        if not isinstance(actual, rast.RefType):
             return False
+        held = self._resolve_alias(actual.inner)
+        if isinstance(held, rast.ArrayType):
+            elem = self._resolve_alias(held.inner)
+            view = mangle_generic_name('Span', [elem])
+        elif isinstance(held, rast.NamedType) and held.name == 'Vec' and len(held.args) == 1:
+            elem = self._resolve_alias(held.args[0])
+            view = mangle_generic_name('Span', [elem])
+        elif isinstance(held, rast.NamedType) and held.name.startswith('Vec$'):
+            elem = None                 # monomorphised: `Vec$T` names its element
+            view = 'Span$' + held.name.split('$', 1)[1]
+        else:
+            return False
+        return self._span_element_fits(view, elem, slot) is not False
+
+    def _span_element_fits(self, view: str, elem: Optional[rast.Type],
+                           slot: rast.Type) -> Optional[bool]:
+        """Is `view` (the Span a reference's elements make, spelled `Span$T1`)
+        the `slot`'s Span? None when either element is opaque (a type
+        parameter, `unknown`): nothing to judge."""
+        if elem is not None and self._is_opaque(self._resolve_alias(elem)):
+            return None
         # Monomorphisation has spelled the slot `Span$T`: spell T1 the same way.
         if slot.args:
             if len(slot.args) != 1 or self._is_opaque(self._resolve_alias(slot.args[0])):
-                return False
+                return None
             slot_name = mangle_generic_name('Span', slot.args)
         else:
             slot_name = slot.name
-        return slot_name != mangle_generic_name('Span', [held])
+        return slot_name == view
 
     def _check_value_into_ref(self, expr: rast.Expr, actual: rast.Type,
                               slot: rast.Type) -> None:
@@ -2590,6 +2619,10 @@ class TypeChecker:
                 return False
             return all(self._types_compatible(a, e)
                        for a, e in zip(actual.elements, expected.elements))
+
+        # `@a` of an array or a Vec views its elements: it fits their Span
+        if self._is_span(expected) and self._span_view_fits(actual, expected):
+            return True
 
         # Function pointer types
         if isinstance(actual, rast.FnType) and isinstance(expected, rast.FnType):
