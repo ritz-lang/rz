@@ -8,11 +8,17 @@
 
 set -e
 
-VALET="${VALET:-./valet}"
+VALET="${VALET:-$(dirname "$0")/../build/debug/valet}"
 # A free port, never a fixed one: valet's SO_REUSEPORT would share it (#3694).
 . "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
 PORT="${PORT:-$(pick_port)}"
 require_free_port "$PORT" || exit 1
+
+# Without its load tools this suite used to stop silently at its first load
+# test under set -e; say which is missing instead (#1403).
+for tool in ab curl; do
+    command -v "$tool" >/dev/null || { echo "SETUP ERROR: $tool not installed (ab: apache2-utils)"; exit 1; }
+done
 WORKERS="${WORKERS:-4}"
 
 RED='\033[0;31m'

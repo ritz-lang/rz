@@ -29,8 +29,9 @@ $V --help               # Authoritative option list
 
 # Test
 ./rz test valet         # .ritz files under test/ — exit 0, several minutes
-# Shell suites are not wired into `rz test` (#1403); run them by hand, e.g.
-#   cd projects/valet && VALET=./build/debug/valet bash test/test_workers.sh
+# Shell suites are not wired into `rz test`; run them all with
+#   projects/valet/test/run_all.sh          (see below), or one by hand:
+#   VALET=projects/valet/build/debug/valet bash projects/valet/test/test_workers.sh
 # Each picks a free port via test/lib_ports.sh, never a fixed one: valet's
 # SO_REUSEPORT would let two runs share a port and split connections (#3694).
 # PORT=... pins one; a port that already has a listener is refused.
@@ -45,12 +46,21 @@ and continues with defaults; that warning is not an error.
 
 ### `./test/run_all.sh`
 
-Runs `test_basic.sh`, `test_multishot.sh`, `test_workers.sh` and `test_cli.sh`
-against `build/debug/valet` (override with `VALET=`). The first three need
-`ab` (apache2-utils) and `wrk` on PATH; without them they stop at their first
-load test and the run reports them failed. Until AGAST #1495 the script exited
-1 right after the first suite passed (`set -e` with `((PASSED++))` when
-`PASSED` was 0) and pointed at a `projects/valet/valet` that no longer exists.
+Runs every `test/test_*.sh` (15 suites) against `build/debug/valet` (override
+with `VALET=`) and exits non-zero if any fails. It finds them by glob, so a new
+suite runs without editing it; a suite left out must go in its `EXCLUDED`
+table with a reason (none is today). `./test/run_all.sh --list` prints
+`run <suite>` / `skip <suite> <reason>`. `projects/ritz/tools/test_valet_run_all.py`
+(in the gate's tools-unit) pins all of that, and that the formerly orphaned
+etag, range, dirlist, middleware and json_builder suites start `$VALET` and
+fail against a broken one. Until AGAST #1403 it ran 4 of the 15 by name, and
+three of the others printed responses and exited 0 whatever they said.
+
+`test_basic.sh`, `test_multishot.sh` and `test_workers.sh` need `ab`
+(apache2-utils), and `test_basic.sh` also `wrk`; without them they fail at
+once with `SETUP ERROR: ab not installed`. With both, all 15 pass (~25 s).
+Until AGAST #1495 the script exited 1 right after the first suite passed
+(`set -e` with `((PASSED++))` when `PASSED` was 0).
 
 `test_cli.sh` (also a `build-all` step in CI) pins the command line: a
 non-numeric `--port` / `--workers` is a usage error (`valet: invalid number
