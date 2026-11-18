@@ -27,7 +27,6 @@ only ever signal processes they started themselves.
 import os
 import re
 import shutil
-import socket
 import subprocess
 import time
 from pathlib import Path
@@ -169,16 +168,25 @@ def test_non_numeric_port_override_is_rejected():
 # ── ports ───────────────────────────────────────────────────────────────
 
 
-def test_default_ports_are_free_distinct_and_not_the_old_fixed_set():
+def _ephemeral_range() -> range:
+    """The kernel's ephemeral port range, where a bind to port 0 lands."""
+    lo, hi = Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()
+    return range(int(lo), int(hi) + 1)
+
+
+def test_default_ports_are_kernel_picked_distinct_and_not_the_old_fixed_set():
     r = _run(RUN_SH, "--dry-run")
     assert r.returncode == 0, r.stderr
     ports = _ports(r.stderr)
     assert sorted(ports) == sorted(PORT_VARS), r.stderr
     assert len(set(ports.values())) == len(PORT_VARS)
     assert not set(ports.values()) & {9001, 9002, 9003, 9004, 7777}
-    for port in ports.values():  # still free right after the pick
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", port))
+    # Kernel-picked means inside the ephemeral range.  Never re-bind them to
+    # check they are "still free": that is a TOCTOU race any other process
+    # (another xdist worker, another room) can win between the pick and the
+    # bind, failing with EADDRINUSE on unrelated commits (#4124).
+    ephemeral = _ephemeral_range()
+    assert all(p in ephemeral for p in ports.values()), (ports, ephemeral)
 
 
 def test_port_overrides_are_honoured():
