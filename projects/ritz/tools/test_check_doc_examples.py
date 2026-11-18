@@ -689,6 +689,99 @@ def test_every_real_known_failure_names_a_ticket_and_a_ritz1_compiler():
         assert re.fullmatch(r"[0-9a-f]{12}", digest), digest
 
 
+# KNOWN_FAILURES lives in tools/doc_known_failures/<ticket>.txt (AGAST #3963):
+# fixing a ticket deletes its own file, so two doc-bug fixes never touch the
+# same hunk.
+
+
+def _kf_dir(tmp_path: Path, files: dict[str, str]) -> Path:
+    d = tmp_path / "kf"
+    d.mkdir()
+    for name, text in files.items():
+        (d / name).write_text(text)
+    return d
+
+
+@pytest.mark.unit
+def test_known_failures_load_one_entry_per_line_reason_prefixed_by_the_files_ticket(tmp_path):
+    d = _kf_dir(tmp_path, {
+        "3929.txt": "# LANGUAGE_SPEC.md:246\n"
+                    "ritz1 LANGUAGE_SPEC.md 065c93f07ee5 float literal exponents don't lex\n"
+                    "\n"
+                    "ritz1_selfhosted  LANGUAGE_SPEC.md  065c93f07ee5  float literal exponents don't lex\n",
+        "1295.txt": "ritz1 STDLIB_REFERENCE.md 014099d52fe2 multi-field enum variants\n",
+    })
+    assert C.load_known_failures(d) == {
+        ("ritz1", "LANGUAGE_SPEC.md", "065c93f07ee5"): "#3929: float literal exponents don't lex",
+        ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "065c93f07ee5"):
+            "#3929: float literal exponents don't lex",
+        ("ritz1", "STDLIB_REFERENCE.md", "014099d52fe2"): "#1295: multi-field enum variants",
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("files, needle", [
+    ({"3929.txt": "ritz1 LANGUAGE_SPEC.md 065c93f07ee5\n"}, "3929.txt:1"),  # no reason
+    ({"3929.txt": "ritz1 LANGUAGE_SPEC.md 065c93f07EE5 why\n"}, "3929.txt:1"),  # bad digest
+    ({"3929.txt": "ritz0 LANGUAGE_SPEC.md 065c93f07ee5 why\n"}, "3929.txt:1"),  # not ritz1
+    ({"floats.txt": "ritz1 LANGUAGE_SPEC.md 065c93f07ee5 why\n"}, "floats.txt"),  # no ticket
+    ({"1.txt": "ritz1 A.md 065c93f07ee5 why\n",
+      "2.txt": "ritz1 A.md 065c93f07ee5 why\n"}, "2.txt:1"),  # listed twice
+])
+def test_known_failures_refuse_a_malformed_entry_naming_its_file_and_line(tmp_path, files, needle):
+    with pytest.raises(ValueError, match=re.escape(needle)):
+        C.load_known_failures(_kf_dir(tmp_path, files))
+
+
+@pytest.mark.unit
+def test_a_known_failure_that_now_passes_names_the_file_to_delete_it_from(tmp_path, monkeypatch):
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "accept")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1",
+                   known=_known_for(doc, "#3929: floats"))
+    assert "tools/doc_known_failures/3929.txt" in report.failures[0].detail
+
+
+@pytest.mark.unit
+def test_the_real_list_is_the_checked_in_directory():
+    assert C.KNOWN_FAILURES == C.load_known_failures(C.KNOWN_FAILURES_DIR)
+    assert C.KNOWN_FAILURES_DIR == Path(C.__file__).parent / "doc_known_failures"
+
+
+@pytest.mark.unit
+def test_deleting_neighbouring_tickets_entries_cherry_picks_in_either_order(tmp_path):
+    """The point of #3963: two doc-bug fixes, each deleting its own ticket's
+    entries from the real list, land in either order without a conflict."""
+    import shutil
+    import subprocess
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t",
+                               "-c", "commit.gpgsign=false", *args], cwd=tmp_path / "repo",
+                              capture_output=True, text=True, check=True).stdout.strip()
+
+    (tmp_path / "repo").mkdir()
+    git("init", "-q", "-b", "base")
+    shutil.copytree(C.KNOWN_FAILURES_DIR, tmp_path / "repo" / "kf")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    first, second = sorted((tmp_path / "repo" / "kf").glob("*.txt"))[:2]  # neighbours
+    fixes = []
+    for f in (first, second):
+        git("checkout", "-q", "-b", f"fix-{f.stem}", "base")
+        git("rm", "-q", f"kf/{f.name}")
+        git("commit", "-qm", f"fix {f.stem}")
+        fixes.append(git("rev-parse", "HEAD"))
+    for order in (fixes, fixes[::-1]):
+        git("checkout", "-q", "-B", "train", "base")
+        for sha in order:
+            git("cherry-pick", sha)  # check=True: a conflict raises
+        assert not first.exists() and not second.exists()
+        assert C.load_known_failures(tmp_path / "repo" / "kf") == {
+            k: v for k, v in C.KNOWN_FAILURES.items()
+            if not v.startswith((f"#{first.stem}:", f"#{second.stem}:"))}
+
+
 # The gate's wiring (AGAST #3928): main.yml's bootstrap job is what ci-local,
 # every room gate and every train run.  Same shape as #3805's
 # tools/test_ritzlib_tests_ritz1.py.

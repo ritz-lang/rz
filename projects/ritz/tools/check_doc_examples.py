@@ -133,59 +133,48 @@ RITZ1_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.ll"
 #
 # An entry is held to its claim: if the block passes under that compiler, or
 # no checked block has that digest, the run fails and names the stale entry.
-KNOWN_FAILURES: dict[tuple[str, str, str], str] = {
-    # LANGUAGE_SPEC.md:609
-    ("ritz1", "LANGUAGE_SPEC.md", "167278a25a58"): "#3935: usize and u64 are different generic args",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "167278a25a58"): "#3935: usize and u64 are different generic args",
-    # LANGUAGE_SPEC.md:648
-    ("ritz1", "LANGUAGE_SPEC.md", "95abc5851402"): "#3930: `*mut T` doesn't parse",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "95abc5851402"): "#3930: `*mut T` doesn't parse",
-    # LANGUAGE_SPEC.md:3332
-    ("ritz1", "LANGUAGE_SPEC.md", "81234ed3c9ab"): "#3932: an undeclared field type emits invalid IR",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "81234ed3c9ab"): "#3932: an undeclared field type emits invalid IR",
-    # LANGUAGE_SPEC.md:3525
-    ("ritz1", "LANGUAGE_SPEC.md", "014099d52fe2"): "#1295: multi-field enum variants",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "014099d52fe2"): "#1295: multi-field enum variants",
-    # LANGUAGE_SPEC.md:3667
-    ("ritz1", "LANGUAGE_SPEC.md", "419a1826fb7d"): "#1295: multi-field enum variants",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "419a1826fb7d"): "#1295: multi-field enum variants",
-    # LANGUAGE_SPEC.md:3692
-    ("ritz1", "LANGUAGE_SPEC.md", "a59b32b47b5f"): "#1295: multi-field enum variants",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "a59b32b47b5f"): "#1295: multi-field enum variants",
-    # LANGUAGE_SPEC.md:3961
-    ("ritz1", "LANGUAGE_SPEC.md", "e774da8b4a14"): "#3309: `Type.m()` on a generic impl isn't instantiated",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "e774da8b4a14"): "#3309: `Type.m()` on a generic impl isn't instantiated",
-    # LANGUAGE_SPEC.md:3977
-    ("ritz1", "LANGUAGE_SPEC.md", "20aa669fe4ef"): "#3309: `Type.m()` on a generic impl isn't instantiated",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "20aa669fe4ef"): "#3309: `Type.m()` on a generic impl isn't instantiated",
-    # LANGUAGE_SPEC.md:4651
-    ("ritz1", "LANGUAGE_SPEC.md", "b92c5caa90fc"): "#3473: R57 borrow checks (move while borrowed)",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "b92c5caa90fc"): "#3473: R57 borrow checks (move while borrowed)",
-    # LANGUAGE_SPEC.md:4671
-    ("ritz1", "LANGUAGE_SPEC.md", "d5e720496ce5"): "#3473: R57 borrow checks (Span view is a borrow)",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "d5e720496ce5"): "#3473: R57 borrow checks (Span view is a borrow)",
-    # LANGUAGE_SPEC.md:4803
-    ("ritz1", "LANGUAGE_SPEC.md", "c05c5e7b9c6a"): "#3473: R57 borrow checks (return a view of a local)",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "c05c5e7b9c6a"): "#3473: R57 borrow checks (return a view of a local)",
-    # LANGUAGE_SPEC.md:6308
-    ("ritz1", "LANGUAGE_SPEC.md", "22246d46210c"): "#3933: non-literal print() argument accepted",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "22246d46210c"): "#3933: non-literal print() argument accepted",
-    # STDLIB_REFERENCE.md:357
-    ("ritz1", "STDLIB_REFERENCE.md", "baa9817ce1f7"): "#3934: `heap <expr>` doesn't parse",
-    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "baa9817ce1f7"): "#3934: `heap <expr>` doesn't parse",
-    # STDLIB_REFERENCE.md:455
-    ("ritz1", "STDLIB_REFERENCE.md", "c7949d7a5cce"): "#3932: an undeclared field type emits invalid IR",
-    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "c7949d7a5cce"): "#3932: an undeclared field type emits invalid IR",
-    # STDLIB_REFERENCE.md:1653
-    ("ritz1", "STDLIB_REFERENCE.md", "1ced72f242f7"): "#3932: an undeclared field type emits invalid IR",
-    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "1ced72f242f7"): "#3932: an undeclared field type emits invalid IR",
-    # STDLIB_REFERENCE.md:1703
-    ("ritz1", "STDLIB_REFERENCE.md", "c53f0f72c88f"): "#3932: an undeclared field type emits invalid IR",
-    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "c53f0f72c88f"): "#3932: an undeclared field type emits invalid IR",
-    # STDLIB_REFERENCE.md:2050
-    ("ritz1", "STDLIB_REFERENCE.md", "579ac74f08cf"): "#3932: an undeclared field type emits invalid IR",
-    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "579ac74f08cf"): "#3932: an undeclared field type emits invalid IR",
-}
+#
+# The entries live in tools/doc_known_failures/<ticket>.txt, one per line:
+#
+#     <compiler> <document file name> <digest> <reason, the rest of the line>
+#
+# The file name is the ticket, so the loaded reason is "#<ticket>: <reason>".
+# `#` lines are comments (by convention `# DOC.md:<line>`); blank lines are
+# ignored.  One file per ticket because each fix deletes its own entries: in
+# one shared list, neighbouring deletions conflicted in git (AGAST #3963).
+KNOWN_FAILURES_DIR = Path(__file__).resolve().parent / "doc_known_failures"
+KNOWN_FAILURE_COMPILERS = ("ritz1", "ritz1_selfhosted")
+_KNOWN_LINE_RE = re.compile(
+    r"(?P<compiler>\S+)\s+(?P<doc>\S+)\s+(?P<digest>[0-9a-f]{12})\s+(?P<reason>\S.*)")
+
+
+def load_known_failures(directory: Path) -> dict[tuple[str, str, str], str]:
+    """Read every <ticket>.txt under `directory` into KNOWN_FAILURES' shape.
+
+    Raises ValueError, naming file and line, on a file not named for a ticket,
+    a malformed line, a compiler outside the ritz1 family, or a key listed
+    twice."""
+    known: dict[tuple[str, str, str], str] = {}
+    for path in sorted(directory.glob("*.txt")):
+        if not path.stem.isdigit():
+            raise ValueError(f"{path.name}: name the file for its ticket, e.g. 3929.txt")
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = _KNOWN_LINE_RE.fullmatch(line)
+            if m is None or m["compiler"] not in KNOWN_FAILURE_COMPILERS:
+                raise ValueError(
+                    f"{path.name}:{n}: expected '<{'|'.join(KNOWN_FAILURE_COMPILERS)}> "
+                    f"<doc> <12-hex digest> <reason>', got {line!r}")
+            key = (m["compiler"], m["doc"], m["digest"])
+            if key in known:
+                raise ValueError(f"{path.name}:{n}: {key} is already listed")
+            known[key] = f"#{path.stem}: {m['reason'].rstrip()}"
+    return known
+
+
+KNOWN_FAILURES: dict[tuple[str, str, str], str] = load_known_failures(KNOWN_FAILURES_DIR)
 
 TICKET_RE = re.compile(r"(?:AGAST )?#\d+")
 
@@ -718,9 +707,15 @@ def apply_known_failure(result: Result, compiler: str,
     if result.ok:
         return Result(b, ok=False, detail=(
             f"listed in KNOWN_FAILURES ({reason}) but it now passes under "
-            f"{compiler}. Delete the entry ({compiler!r}, {b.doc.name!r}, "
-            f"{b.digest!r}) from tools/check_doc_examples.py."))
+            f"{compiler}. Delete the line '{compiler} {b.doc.name} {b.digest}' "
+            f"from {_known_file(reason)}."))
     return Result(b, ok=True, known=reason, detail=result.detail)
+
+
+def _known_file(reason: str) -> str:
+    """The data file an entry with this loaded reason came from."""
+    m = re.match(r"#(\d+):", reason)
+    return f"tools/doc_known_failures/{m[1]}.txt" if m else "tools/doc_known_failures/"
 
 
 def stale_known_failures(blocks: list[Block], docs: list[Path], compiler: str,
@@ -736,7 +731,8 @@ def stale_known_failures(blocks: list[Block], docs: list[Path], compiler: str,
         stale.append(Result(ghost, ok=False, detail=(
             f"KNOWN_FAILURES entry ({comp!r}, {doc_name!r}, {digest!r}) -- {reason} -- "
             f"matches no block in {doc_name}: the block was edited or removed. "
-            f"Re-check it under {compiler} and re-key or delete the entry.")))
+            f"Re-check it under {compiler} and re-key or delete the entry in "
+            f"{_known_file(reason)}.")))
     return stale
 
 

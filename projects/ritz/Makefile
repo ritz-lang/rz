@@ -67,7 +67,7 @@ check-doc-examples:
 # AGAST #3928. The same documents under ritz1 and ritz1_selfhosted: a doc
 # example ritz0 accepts and ritz1 refuses (or miscompiles) used to pass the
 # gate. Known ritz1 failures are listed, each naming its ticket, in
-# KNOWN_FAILURES in tools/check_doc_examples.py. ~1 s per compiler once built.
+# tools/doc_known_failures/<ticket>.txt (#3963). ~1 s per compiler once built.
 .PHONY: check-doc-examples-ritz1
 check-doc-examples-ritz1: ritz1-bootstrap
 	@$(PYTHON) tools/check_doc_examples.py --compiler ritz1 $(DOC_EXAMPLE_DOCS)
