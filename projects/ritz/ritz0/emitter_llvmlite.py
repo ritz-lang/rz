@@ -14011,10 +14011,11 @@ class LLVMEmitter:
         ptr = self.builder.extract_value(recv, 0)
         length = self.builder.extract_value(recv, 1)
 
-        if 'Span$u8' in self.struct_types:
-            span_ty = self.struct_types['Span$u8']
-        else:
-            span_ty = ir.LiteralStructType([self.i8.as_pointer(), self.i64])
+        # A `Span<u8>` this module never declared is materialized, as a named
+        # struct with its fields: a bare `{ ptr, i64 }`'s `.len` named no
+        # field, an unlocated ValueError (AGAST #3699).
+        u8_span = rast.NamedType(expr.span, 'Span', [rast.NamedType(expr.span, 'u8', [])])
+        span_ty = self.struct_types[self._ensure_builtin_generic_struct_specialization(u8_span)]
         span = self.builder.insert_value(ir.Constant(span_ty, ir.Undefined), ptr, 0)
         span = self.builder.insert_value(span, length, 1)
         return span

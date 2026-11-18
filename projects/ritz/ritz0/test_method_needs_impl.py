@@ -138,6 +138,15 @@ pub fn main() -> i32
 """,
         no_method("nope", "Span$u8"),
     ),
+    # Nor is `as_bytes` a Span's: it is a StrView's builtin (AGAST #3699).
+    "span_u8_as_bytes": (
+        """\
+pub fn main() -> i32
+    let s: Span<u8> = "abc"
+    s.^as_bytes()
+""",
+        no_method("as_bytes", "Span$u8"),
+    ),
 }
 
 # name -> (program, exit status): what still dispatches.
@@ -280,21 +289,26 @@ def test_a_strview_method_it_lacks_is_refused_as_strview(tmp_path, compiler):
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_declared_span_u8_method_it_lacks_is_refused_as_span(tmp_path, compiler):
-    program, message = SPAN_REFUSED["span_u8"]
-    _assert_refused(compiler, tmp_path, "span_u8", program, message)
+@pytest.mark.parametrize("name", sorted(SPAN_REFUSED))
+def test_a_declared_span_u8_method_it_lacks_is_refused_as_span(tmp_path, compiler, name):
+    program, message = SPAN_REFUSED[name]
+    _assert_refused(compiler, tmp_path, name, program, message)
 
 
-# ritz0's emitter builtin `s.as_bytes()` isn't refused (AGAST #3649); ritz1
-# has no such builtin (AGAST #3699).
-def test_ritz0_strview_as_bytes_still_dispatches(tmp_path):
+# `s.as_bytes()` is a builtin on a StrView, its `Span<u8>`, in all three (AGAST
+# #3649).  ritz1 refused it on an unannotated `"..."`, a StrView in a `%Span$u8`
+# slot; ritz0 raised an unlocated ValueError for the `.len` of a `Span<u8>` this
+# module never declared (AGAST #3699).  4 + 4 + ('d' - 'a').
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_strview_as_bytes_is_its_span(tmp_path, compiler):
     program = """\
 pub fn main() -> i32
     let s = "abcd"
-    let b = s.as_bytes()
-    5
+    let b: Span<u8> = s.as_bytes()
+    let c = s.as_bytes()
+    (b.len + c.len) as i32 + (c[3] - c[0]) as i32
 """
-    assert _run("ritz0", tmp_path, "as_bytes", program) == 5
+    assert _run(compiler, tmp_path, "as_bytes", program) == 11
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
