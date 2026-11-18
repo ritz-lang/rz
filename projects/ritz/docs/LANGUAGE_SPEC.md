@@ -3329,7 +3329,7 @@ Here `K` is `i64` and `V` is `Cell`; an impl chooses its own.
 - **`[]` sees through one level.** `p[k]` on an `@M`, `@&M` or `*M` is `(*p)[k]`, and
   writing needs `IndexMut` or `IndexSet` and a mutable `p`, as above.
 - **For §13.5, `m[k]` is an index step on `m`.** It overlaps every other `m[j]` and `m`
-  itself, so `let r = @m[1]` followed by `m[2] = 5` is refused (R11a).
+  itself, so `let r = @m[1]` followed by `m[2] = 5` or `m[2].f = 5` is refused (R11a).
 - **The built-in types can't opt in.** An `impl Index` for an array, pointer, Vec, Span
   or String is an error, so `[]` on those types keeps one meaning.
 

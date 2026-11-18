@@ -94,6 +94,30 @@ fn key(k: i64) -> i64
 """
 
 
+# An element holding a struct by value (`n[k].c.v`) and a pointer (`n[k].p.v`):
+# a store through `p` writes outside `n` (AGAST #4160).
+NEST = """\
+struct Inner
+    v: i32
+
+struct Outer
+    c: Inner
+    p: *Inner
+
+struct Nest
+    cells: [2]Outer
+
+impl Index for Nest
+    fn index(self: @Nest, key: i64) -> @Outer
+        @self.cells[key]
+
+impl IndexMut for Nest
+    fn index_mut(self: @&Nest, key: i64) -> @&Outer
+        @&self.cells[key]
+
+"""
+
+
 # A generic pair with all three traits, each impl generic (AGAST #2847).
 PAIR = """\
 struct Pair<T>
@@ -196,6 +220,18 @@ RUNS = {
     let v: i32 = g[2].v
     if v != 6 or READS != 1
         return 2
+    0
+"""),
+    # A store through a pointer field of an element writes outside the struct,
+    # so a loan of another element doesn't stand in its way (AGAST #4160).
+    "field_store_through_pointer": (NEST, """\
+    var x: Inner
+    var n: Nest
+    n.cells[0].p = @x
+    let p: @Outer = @n[1]
+    n[0].p.v = 4
+    if x.v != 4 or p.c.v != 0
+        return 1
     0
 """),
     # A struct element read by value is a copy through `index`.
@@ -480,6 +516,17 @@ REFUSALS = {
     "mut_loan_then_compound": (TALLY, "    var t: Tally\n    let q: @&i64 = @&t[1]\n    ^t[2] += 1\n"
                                "    return *q as i32\n",
                                "cannot assign to `t[_]` - `t[_]` is already borrowed as mutable"),
+    # AGAST #4160: `g[2].v = 5` stores through `index_mut`, so it is a write of
+    # `g[_].v`, as `a[2].v = 5` is of an array's; ritz0 and ritz1 saw none.
+    "loan_then_field_store": (GRID, "    var g: Grid\n    let p: @Cell = @g[1]\n    ^g[2].v = 5\n"
+                              "    return p.v\n",
+                              "cannot assign to `g[_].v` - `g[_]` is already borrowed as immutable"),
+    "mut_loan_then_field_compound": (GRID, "    var g: Grid\n    let q: @&Cell = @&g[1]\n"
+                                     "    ^g[2].v += 1\n    return q.v\n",
+                                     "cannot assign to `g[_].v` - `g[_]` is already borrowed as mutable"),
+    "loan_then_nested_field_store": (
+        NEST, "    var n: Nest\n    let p: @Outer = @n[1]\n    ^n[0].c.v = 5\n    return p.c.v\n",
+        "cannot assign to `n[_].c.v` - `n[_]` is already borrowed as immutable"),
 }
 
 

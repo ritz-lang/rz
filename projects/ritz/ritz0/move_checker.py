@@ -319,6 +319,39 @@ class MoveChecker(MoveWalk):
             else:
                 return None
 
+    def _write_place(self, target: rast.Expr) -> Optional['MoveChecker.Place']:
+        """The place a store to `target` writes: _loan_place's, or `m[k].f…`
+        when `m` is a struct indexed through `IndexMut` (§7.8, R11a, AGAST
+        #4160), so `g[2].v = 5` writes `g[_].v` as `a[2].v = 5` does `a[_].v`.
+        Each field's owner must be a struct held by value: a store through a
+        pointer field writes outside `m`. ritz1's twin is ref_loan.ritz
+        rl_index_step for SI_USE_FIELD_STORE."""
+        found = self._loan_place(target)
+        if found is not None:
+            return found
+        fields: List[str] = []
+        e = target
+        while isinstance(e, (rast.Grouped, rast.Field)):
+            if isinstance(e, rast.Field):
+                fields.append(e.field)
+            e = e.expr
+        if not fields or not isinstance(e, rast.Index) or isinstance(e.index, rast.Range):
+            return None
+        owner = self.types.resolve(self._loan_type(e.expr))
+        if not isinstance(owner, rast.NamedType):
+            return None
+        held = self.types.index_mut_target(owner)
+        base = self._loan_place(e) if held is not None else None
+        if base is None:
+            return None
+        for name in reversed(fields):
+            held = self.types.resolve(held)
+            if not (isinstance(held, rast.NamedType) and held.name in self.types.structs
+                    and any(n == name for n, _ in self.types.struct_fields(held))):
+                return None
+            held = self._part_type(held, name)
+        return base[0], base[1] + tuple(reversed(fields))
+
     def _loan_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """_place_type, also through a Vec's element (`vs[1].a`), for the steps
         of a place. Only the loan check reads it. ritz1's is ref_loan_ty."""

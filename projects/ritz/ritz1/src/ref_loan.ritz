@@ -449,6 +449,42 @@ fn rl_index_step(sm: *Sema, e: *Expr)
             rl_add(root, st.place, mutable, RL_ARG)
     else if st.use == SI_USE_ASSIGN or st.use == SI_USE_COMPOUND
         rl_use(sm, st.at.line, st.at.col, root, st.place, 1, 1)
+    else if st.use == SI_USE_FIELD_STORE
+        # `m[k].f… = x` (AGAST #4160): a write of the place `m[k].f…` when
+        # each field's owner is a struct held by value.  `root` is m[k]'s:
+        # rl_root can't type the copied chain above it.
+        var b: SemaTy
+        if rl_store_ty(sm, st.place.left, e, @b) == 1 and b.kind == TYPE_STRUCT
+            rl_use(sm, st.at.line, st.at.col, rl_root(sm, rl_store_index(st.place)), st.place, 1, 1)
+
+# The `m[k]` at the bottom of si_field_place's `m[k].f…` chain `p`.
+fn rl_store_index(p: *Expr) -> *Expr
+    var e: *Expr = p
+    while e.kind == EXPR_MEMBER
+        e = e.left
+    e
+
+# The type of `p`, a step of a `m[k].f…` chain whose `m[k]` is `*call`; 0 when
+# a field's owner isn't a struct held by value: a store through a pointer field
+# writes outside m, as ritz0's MoveChecker._write_place.
+fn rl_store_ty(sm: *Sema, p: *Expr, call: *Expr, out: *SemaTy) -> i32
+    if p.kind != EXPR_MEMBER
+        var d: Expr
+        memset(@d as *u8, 0, sizeof(Expr))
+        d.kind = EXPR_UNARY
+        d.op = OP_DEREF
+        d.operand = call
+        return rs_ty(sm, @d, out)
+    var b: SemaTy
+    if rl_store_ty(sm, p.left, call, @b) == 0 or b.kind != TYPE_STRUCT
+        return 0
+    let st: *StructDef = sema_find_struct(sm, b.name, b.name_len)
+    if st == null
+        return 0
+    let fi: i32 = find_field_index(st, p.ident_ptr, p.ident_len)
+    if fi < 0
+        return 0
+    rs_of_field(get_field_type(st, fi), out)
 
 pub fn rl_expr_ident(e: *Expr, name: *u8, len: i32)
     memset(e as *u8, 0, sizeof(Expr))

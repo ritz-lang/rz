@@ -176,9 +176,12 @@ class MoveTypes:
         self.enums: Dict[str, rast.EnumDef] = {}
         self.aliases: Dict[str, rast.Type] = {}
         self.derefs: Dict[str, rast.ImplBlock] = {}   # `impl Deref for S` (§7.7)
+        self.index_muts: Dict[str, rast.ImplBlock] = {}   # `impl IndexMut for S` (§7.8)
         for item in module.items:
             if isinstance(item, rast.ImplBlock) and item.trait_name == 'Deref':
                 self.derefs[item.type_name] = item
+            if isinstance(item, rast.ImplBlock) and item.trait_name == 'IndexMut':
+                self.index_muts[item.type_name] = item
             if isinstance(item, rast.ImplBlock) and item.trait_name == 'Drop':
                 self.drop_types.add(item.type_name)
             elif isinstance(item, rast.StructDef):
@@ -293,11 +296,20 @@ class MoveTypes:
     def deref_target(self, ty: rast.NamedType) -> Optional[rast.Type]:
         """The T `impl Deref for S` reaches (its `deref`'s `@T`), at `ty`'s
         type arguments; None when S doesn't implement `Deref` (§7.7)."""
-        impl = self.derefs.get(ty.name)
+        return self._lent_target(self.derefs.get(ty.name), 'deref', ty)
+
+    def index_mut_target(self, ty: rast.NamedType) -> Optional[rast.Type]:
+        """The element T `impl IndexMut for S` lends (its `index_mut`'s
+        `@&T`), at `ty`'s type arguments; None without `IndexMut` (§7.8)."""
+        return self._lent_target(self.index_muts.get(ty.name), 'index_mut', ty)
+
+    @staticmethod
+    def _lent_target(impl: Optional[rast.ImplBlock], method: str,
+                     ty: rast.NamedType) -> Optional[rast.Type]:
         if impl is None:
             return None
         for m in impl.methods:
-            if m.name == 'deref' and isinstance(m.ret_type, (rast.RefType, rast.PtrType)):
+            if m.name == method and isinstance(m.ret_type, (rast.RefType, rast.PtrType)):
                 params = [a.name for a in impl.impl_type.args
                           if isinstance(a, rast.NamedType)] if impl.impl_type else []
                 return _subst(m.ret_type.inner, dict(zip(params, ty.args)))

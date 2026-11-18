@@ -214,7 +214,7 @@ class MoveWalk:
         elif not isinstance(stmt.target, rast.Ident):
             self._check_expr(stmt.target, is_move_context=False)
         # A write inside a borrowed place (AGAST #2438, R11a).
-        self._check_mut_use(self._loan_place(stmt.target), stmt.target.span, "assign")
+        self._check_mut_use(self._write_place(stmt.target), stmt.target.span, "assign")
         # After assignment, the target variable becomes owned again
         if isinstance(stmt.target, rast.Ident):
             var_info = self.scope.lookup(stmt.target.name)
