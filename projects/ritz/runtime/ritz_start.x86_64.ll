@@ -23,6 +23,8 @@ target datalayout = ""
 
 declare i32 @main(i32 %argc, i8** %argv, i8** %envp)
 
+; No alignstack(16) "no-builtins" (AGAST #1326): the body is one asm block,
+; so loop-idiom has no loop to rewrite and there is no prologue to align.
 define void @_start() naked {
 entry:
   call void asm sideeffect "

@@ -1489,6 +1489,127 @@ class TestFreestandingIRHasNoLibcCalls:
             "load-bearing and build.py's comment is stale")
 
 
+# ---- an llvm.memset the compiler emits on purpose still links (AGAST #1326) --
+#
+# "no-builtins" (#1313) stops clang SYNTHESISING a libc call from a loop.  It
+# does not stop the backend lowering an intrinsic the compiler emitted on
+# purpose: ritz0 fills a large `[0; N]` / `[b; N]` with llvm.memset, which
+# lowers to `call memset`.  ritz0 answers that with _emit_memset_function.
+# That ran only without --no-runtime, and build.py compiles every module
+# --no-runtime, so a package whose fill had no ritzlib memset to bind to
+# failed to link: `undefined reference to memset`.
+
+# filler.ritz: a module that fills, with no ritzlib import of its own.
+_FILLER_SOURCE = """\
+[[noinline]]
+pub fn pick(p: *u8, i: i64) -> u8
+    *(p + i)
+
+pub fn fill_pick(i: i64) -> u8
+    var big: [65536]u8 = [0; 65536]
+    var ones: [4096]u8 = [7; 4096]
+    pick(@big[0], i * 999) + pick(@ones[0], i)
+"""
+
+# main.ritz per case.  "alone": nothing else defines memset.  "with_ritzlib":
+# ritzlib.str's strong memset is in the same link as filler's helper.
+_FILL_MAINS = {
+    "alone": """\
+import filler
+
+pub fn main(args: Span<StrView>) -> i32
+    fill_pick(args.len as i64) as i32
+""",
+    "with_ritzlib": """\
+import ritzlib.str
+import filler
+
+pub fn main(args: Span<StrView>) -> i32
+    var b: [8]u8 = [1; 8]
+    memset(@b[0], 0, 8)
+    (fill_pick(args.len as i64) + b[3]) as i32
+""",
+}
+
+
+def _require_tools(*tools):
+    import shutil
+    for tool in tools:
+        if shutil.which(tool) is None:
+            pytest.skip(f"{tool} not on PATH")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("case", sorted(_FILL_MAINS))
+def test_a_package_filling_with_llvm_memset_links_freestanding(case, tmp_path, monkeypatch):
+    """build.py's real path: a module's large fill links, and the linked
+    binary has no undefined symbol.  "alone" needs the helper (no other
+    memset); "with_ritzlib" needs it weak (ritzlib.str defines one too).
+
+    Non-vacuous by construction: the binary must CALL memset (so the
+    intrinsic really became a libcall), and that call must be resolved
+    inside the binary.  FAILS at link time when the ritz0 helper is not
+    emitted for a --no-runtime module ("alone": undefined reference) or is
+    not weak ("with_ritzlib": multiple definition).
+    """
+    import subprocess
+    _require_tools("clang", "nm", "objdump")
+    ritz_root = Path(__file__).parent.parent
+    monkeypatch.setenv("RITZ_PATH", str(ritz_root))
+    monkeypatch.setenv("RITZ_BUILD_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(_build_module, "_build_cache", {})
+    src = tmp_path / "pkg" / "src" / "main.ritz"
+    src.parent.mkdir(parents=True)
+    src.write_text(_FILL_MAINS[case])
+    (src.parent / "filler.ritz").write_text(_FILLER_SOURCE)
+    out = tmp_path / "out"
+    out.mkdir()
+
+    binary = _build_module.compile_binary("fill", src, out, use_cache=False,
+                                          pkg_dir=src.parent.parent)
+    assert binary is not None and Path(binary).exists(), (
+        "the build failed: see the link error above.  `undefined reference "
+        "to memset` = no helper; `multiple definition of memset` = helper "
+        "not weak (AGAST #1326)")
+
+    calls = subprocess.run(["objdump", "-d", str(binary)],
+                           capture_output=True, text=True, check=True).stdout
+    assert "<memset>" in calls, (
+        "the binary never calls memset: the fill did not lower to a libcall, "
+        "so this test no longer exercises the intrinsic path")
+    undefined = subprocess.run(["nm", "-u", str(binary)],
+                               capture_output=True, text=True, check=True).stdout
+    assert undefined.strip() == "", f"linked binary has undefined symbols:\n{undefined}"
+    # pick(big, 999) + pick(ones, 1) (+ b[3] == 0): 0 + 7.  Proves the fills.
+    assert subprocess.run([str(binary)]).returncode == 7
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("intrinsic", ["memset", "memcpy"])
+def test_no_builtins_does_not_stop_intrinsic_lowering(intrinsic, tmp_path):
+    """Pins the invariant #1313 left implicit: on a "no-builtins" function a
+    variable-size llvm.memset/llvm.memcpy still lowers to a libc call.
+
+    This is why _emit_memset_function (ritz0) and __ritz_sret_zero (ritz1)
+    are load-bearing.  If a future clang stops lowering here, this fails and
+    the helpers can be reconsidered.
+    """
+    import subprocess
+    _require_tools("clang", "nm")
+    second = "i8 0" if intrinsic == "memset" else "ptr %s"
+    ll = tmp_path / "intrinsic.ll"
+    ll.write_text(
+        f"declare void @llvm.{intrinsic}.p0.i64(ptr, "
+        f"{'i8' if intrinsic == 'memset' else 'ptr'}, i64, i1)\n"
+        f'define void @f(ptr %d, ptr %s, i64 %n) alignstack(16) "no-builtins" {{\n'
+        f"  call void @llvm.{intrinsic}.p0.i64(ptr %d, {second}, i64 %n, i1 false)\n"
+        "  ret void\n}\n")
+    obj = tmp_path / "intrinsic.o"
+    subprocess.run(["clang", "-c", "-O2", "-fPIC", str(ll), "-o", str(obj)],
+                   capture_output=True, text=True, check=True)
+    assert _undefined_libc_symbols(obj) == {intrinsic}
+
+
 # ---- a build's artifact dir is under the build cache, not /tmp (AGAST #3906) --
 #
 # compile_binary, compile_library and compile_freestanding_binary each compile

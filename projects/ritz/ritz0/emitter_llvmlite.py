@@ -3119,8 +3119,12 @@ class LLVMEmitter:
                 and not getattr(self, 'no_runtime', False):
             self._emit_start_function()
 
-        # Emit memset if we used the llvm.memset intrinsic (needed for -nostdlib linking)
-        if hasattr(self, '_memset_fn') and not getattr(self, 'no_runtime', False):
+        # Emit memset if we used the llvm.memset intrinsic (needed for -nostdlib
+        # linking).  --no-runtime too (AGAST #1326): build.py compiles every
+        # module that way, and a module with no ritzlib memset in its link
+        # failed with `undefined reference to memset`.  The helper is weak, so
+        # ritzlib.str's memset or another module's copy coexists with it.
+        if hasattr(self, '_memset_fn'):
             self._emit_memset_function()
 
         # AGAST #2306: no dead large-aggregate load reaches clang.
@@ -3195,6 +3199,17 @@ class LLVMEmitter:
         nothing on .ll input (test_build.py pins this). Emitting the
         attribute here makes the IR self-describing, so it holds for every
         consumer regardless of how it is invoked.
+
+        Not on [[naked]] fns, deliberately (AGAST #1326, decision (b)): the
+        pattern needs `)` then `{`/`!dbg`, and llvmlite prints `naked
+        noinline` in between.  A naked body is asm only by construction
+        (_emit_function_body_inner drops every other statement; ritz1's
+        emit_naked_fn_body likewise), so loop-idiom has no loop to rewrite,
+        and with no prologue alignstack(16) has nothing to align.  ritz1 and
+        runtime/*.ll emit their naked fns and `_start` bare for the same
+        reason.  ritz0's own `_start` does get both, only because it is a
+        plain fn here and made naked later (emit()); either way is harmless.
+        If a naked fn ever lowers a non-asm statement, revisit this.
         """
         import re
 
@@ -6345,6 +6360,12 @@ class LLVMEmitter:
         provide this symbol ourselves.
 
         Signature: void *memset(void *dest, int c, size_t n)
+
+        "no-builtins" (#1313) does not make this unnecessary: it stops clang
+        synthesising a libc call from a loop, not the backend lowering an
+        llvm.memset ritz0 emitted on purpose (test_build.py pins both,
+        AGAST #1326).  Weak linkage: every module of a build that fills may
+        emit one, and ritzlib.str's strong memset wins over all of them.
         """
         # Check if memset already exists (e.g., from ritzlib.str import)
         # If so, skip emitting our version - the user-provided one will work
@@ -6358,6 +6379,7 @@ class LLVMEmitter:
             [self.i8.as_pointer(), self.i32, self.i64]
         )
         memset_fn = ir.Function(self.module, memset_ty, name="memset")
+        memset_fn.linkage = 'weak'
 
         entry = memset_fn.append_basic_block("entry")
         loop = memset_fn.append_basic_block("loop")
