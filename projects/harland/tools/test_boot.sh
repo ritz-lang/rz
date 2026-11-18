@@ -17,6 +17,9 @@
 #        BOOT_TIMEOUT=N seconds for the boot (default 120: TCG boots took
 #                       16-39s at load average 26, and a pass stops early)
 #        KEEP_WORK=DIR  copy the serial log (bios.log) into DIR
+#        SMP=SPEC       QEMU -smp (default: 4 CPUs with sparse APIC IDs
+#                       0,1,2,4; SMP=10,sockets=2,cores=9,maxcpus=18 gives
+#                       APIC ID 16, past the old [16] arrays: #1883)
 #
 # Exit: 0 = pass; 1 = the boot failed (panic, exception, failed suite, no
 #       verdict before the timeout, or a failed build); 3 = a required tool
@@ -81,7 +84,10 @@ qemu-img create -q -f qcow2 "$T/storage.qcow2" 512M \
 echo "Testing kernel boot (BIOS/GRUB, real initramfs)..."
 echo "ISO: $ISO"
 
-# -cpu Haswell-v1 enables BMI1/BMI2 (bextr etc.); -smp 4 starts the APs.
+# -cpu Haswell-v1 enables BMI1/BMI2 (bextr etc.); -smp starts the APs.
+# 2 sockets x 3 cores: core IDs take 2 bits, so the 4 CPUs' APIC IDs are
+# 0,1,2,4, not 0..3; per-CPU state must be indexed by CPU, not APIC ID (#1883).
+SMP="${SMP:-4,sockets=2,cores=3,threads=1,maxcpus=6}"
 : > "$SERIAL_LOG"
 timeout "$TIMEOUT" qemu-system-x86_64 \
     -cpu Haswell-v1 \
@@ -97,7 +103,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     -serial file:"$SERIAL_LOG" \
     -display none \
     -monitor none \
-    -smp 4 \
+    -smp "$SMP" \
     -m 2G \
     -no-reboot >/dev/null 2>&1 &
 pid=$!

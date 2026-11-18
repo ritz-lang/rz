@@ -39,7 +39,8 @@ MOVED_FNS = [
     "get_ap_stack_top", "delay_us", "ap_entry", "ap_setup_trampoline",
     "ap_boot_one", "ap_boot_all", "apic_init_with_mb", "apic_init_from_bootinfo",
 ]
-MOVED_VARS = ["ap_started", "ap_stacks", "ap_count", "bsp_apic_id"]
+# ap_started moved on to arch/x86_64/cpu_map.ritz (#1883: test_harland_cpu_map.py).
+MOVED_VARS = ["ap_stacks", "ap_count", "bsp_apic_id"]
 MOVED_CONST_PREFIXES = ("LAPIC_", "IOAPIC_", "IPI_DELIVERY_", "AP_TRAMPOLINE_ADDR")
 
 # What kernel_main calls; main must import exactly these from the new module.
@@ -118,10 +119,3 @@ def test_2118_forms_survive_the_move():
     for sym in ["ap_trampoline_start", "ap_trampoline_end"]:
         assert re.search(rf"^extern var {sym}: u8$", code, re.M), sym
         assert f"@{sym} as u64" in code, sym
-
-
-def test_ap_started_still_indexed_by_apic_id():
-    # #1883 is out of scope for a pure move: the indexing bug moves as it is.
-    code = _code(APIC)
-    assert "ap_started[my_apic_id as i32] = 1" in code
-    assert "ap_started[apic_id as i32]" in code
