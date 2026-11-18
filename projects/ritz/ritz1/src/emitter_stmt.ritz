@@ -10,6 +10,7 @@ import ritzlib.gvec
 import ritzlib.memory
 
 import ast
+import types           # the one primitive type table (AGAST #1889)
 import index_through
 import ast_helpers
 import tokens_gen
@@ -212,7 +213,7 @@ fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt) -> i32
 
 # 1 for the integer and float kinds an `@T` local can point at by value.
 fn scalar_pointee(t: i32) -> i32
-    (t == TYPE_I32 or t == TYPE_I64 or t == TYPE_U8 or t == TYPE_I8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_I16 or t == TYPE_U64 or t == TYPE_F32 or t == TYPE_F64) as i32
+    (ty_is_int(t) == 1 or t == TYPE_F32 or t == TYPE_F64) as i32
 
 # AGAST #2539: `let r = @q` with `q: *E` or `**E`, E an enum, holds what
 # `let r: **E` / `***E` does: the name, so `**r` loads and stores an %E.  It
@@ -592,7 +593,7 @@ fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
 # `l.dup()`), struct_value_name's other forms.  A narrow int was the same clang
 # error; `let n: i64 = l` was worse, a silent copy of the struct into `n`.
 fn struct_value_int_let_refused(s: *EmitterState, stmt: *Stmt)
-    if int_prim_bits(stmt.var_declared_type) == 0
+    if ty_int_bits(stmt.var_declared_type) == 0
         return
     var name: *u8 = null
     var len: i32 = 0
@@ -1023,9 +1024,9 @@ fn tuple_field_bindable(fld: *StructField) -> i32
     let ft: i32 = fld.field_type
     if ft == TYPE_ARRAY and fld.array_size > 0
         return 1
-    if ft == TYPE_I8 or ft == TYPE_U8 or ft == TYPE_I16 or ft == TYPE_U16
+    if ty_int_in(ft, 8, 16) == 1
         return 1
-    if ft == TYPE_I32 or ft == TYPE_U32 or ft == TYPE_I64 or ft == TYPE_U64
+    if ty_int_in(ft, 32, 64) == 1
         return 1
     if ft == TYPE_F32 or ft == TYPE_F64 or ft == TYPE_BOOL
         return 1
@@ -1101,12 +1102,12 @@ fn tuple_bind_field(s: *EmitterState, fld: *StructField, sname: *u8, slen: i32, 
     if ft == TYPE_STRUCT
         emit_llvm_type_struct(s, TYPE_STRUCT, fld.field_type_name, fld.field_type_name_len)
     else
-        emit_llvm_type(s, slot_type)
+        emit_str(s, ty_value_llvm(slot_type))
     emit_str(s, c"\n  store ")
     if ft == TYPE_STRUCT
         emit_llvm_type_struct(s, TYPE_STRUCT, fld.field_type_name, fld.field_type_name_len)
     else
-        emit_llvm_type(s, slot_type)
+        emit_str(s, ty_value_llvm(slot_type))
     emit_str(s, c" ")
     emit_reg(s, stored)
     emit_str(s, c", ptr ")
@@ -2116,7 +2117,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
         else
             # The spelling every access over the local uses (#1564, #1966).
-            emit_str(s, local_array_elem_llvm(stmt.var_array_elem_type))
+            emit_str(s, elem_mem_llvm(stmt.var_array_elem_type))
         emit_str(s, c"]")
     else
         emit_llvm_type_struct(s, var_type, stmt.var_type_name, stmt.var_type_name_len)
@@ -2306,7 +2307,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         s.ctx_enum_name_len = _saved_ctx_len
         s.ctx_simd_name = _saved_simd
         s.ctx_simd_name_len = _saved_simd_len
-        if var_type == TYPE_I32 or var_type == TYPE_U32
+        if ty_int_bits(var_type) == 32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, trunc)
@@ -2318,7 +2319,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
-        else if var_type == TYPE_U16 or var_type == TYPE_I16
+        else if ty_int_bits(var_type) == 16
             # Truncate i64 (unified value model) to i16 for the slot.
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -2331,7 +2332,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, alloca_reg)
             emit_str(s, c"\n")
-        else if var_type == TYPE_U8 or var_type == TYPE_I8
+        else if ty_int_bits(var_type) == 8
             # Truncate i64 to i8 for byte types
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -2415,7 +2416,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c"\n")
         else
             emit_str(s, c"  store ")
-            emit_llvm_type(s, var_type)
+            emit_str(s, ty_value_llvm(var_type))
             emit_str(s, c" ")
             emit_reg(s, init_reg)
             emit_str(s, c", ptr ")
@@ -2455,7 +2456,7 @@ fn emit_nd_elem_store(s: *EmitterState, stmt: *Stmt, dst: *NdIndexPtr)
         emit_reg(s, dst.reg)
         emit_str(s, c"\n")
         return
-    let ty: *u8 = local_array_elem_llvm(sh.leaf_type)
+    let ty: *u8 = elem_mem_llvm(sh.leaf_type)
     set_match_float_hint(s, stmt.assign_value, sh.leaf_type, null, 0)   # AGAST #4028
     let val: i32 = emit_expr(s, stmt.assign_value)
     var store_val: i32 = val
@@ -2669,7 +2670,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 if emit_float_field_store(s, member_result.reg, field.field_type, val, stmt.assign_value) == 1
                     return
                 # Store value based on field type
-                if field.field_type == TYPE_I32 or field.field_type == TYPE_U32
+                if ty_int_bits(field.field_type) == 32
                     let trunc: i32 = next_reg(s)
                     emit_str(s, c"  ")
                     emit_reg(s, trunc)
@@ -2681,7 +2682,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c", ptr ")
                     emit_reg(s, member_result.reg)
                     emit_str(s, c"\n")
-                else if field.field_type == TYPE_I16 or field.field_type == TYPE_U16
+                else if ty_int_bits(field.field_type) == 16
                     # Narrow field — value reg is always i64 (unified value
                     # model in emit_expr); trunc before store.
                     let trunc: i32 = next_reg(s)
@@ -2695,7 +2696,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c", ptr ")
                     emit_reg(s, member_result.reg)
                     emit_str(s, c"\n")
-                else if field.field_type == TYPE_I8 or field.field_type == TYPE_U8
+                else if ty_int_bits(field.field_type) == 8
                     let trunc: i32 = next_reg(s)
                     emit_str(s, c"  ")
                     emit_reg(s, trunc)
@@ -3008,7 +3009,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             # emit_field_elem_narrow (#2065).
             let fval: i32 = emit_field_elem_narrow(s, val, value_type, stmt.assign_value)
             emit_str(s, c"  store ")
-            emit_str(s, local_array_elem_llvm(value_type))
+            emit_str(s, elem_mem_llvm(value_type))
             emit_str(s, c" ")
             emit_reg(s, fval)
             emit_str(s, c", ptr ")
@@ -3024,7 +3025,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, ptr)
             emit_str(s, c"\n")
-        else if value_type == TYPE_I32 or value_type == TYPE_U32
+        else if ty_int_bits(value_type) == 32
             # i32 store
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3037,7 +3038,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, ptr)
             emit_str(s, c"\n")
-        else if value_type == TYPE_U16 or value_type == TYPE_I16
+        else if ty_int_bits(value_type) == 16
             # i16 store via deref — trunc i64 → i16
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3050,7 +3051,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, ptr)
             emit_str(s, c"\n")
-        else if value_type == TYPE_U8 or value_type == TYPE_I8
+        else if ty_int_bits(value_type) == 8
             # Byte store
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3160,7 +3161,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
         # AGAST #2142: a non-enum local is no enum context for a ctor RHS.
         let assign_raw: i32 = emit_expr_into_slot(s, stmt.assign_value, var_type, null, 0)
         let val: i32 = ptr_slot_value(s, var_type, stmt.assign_value, assign_raw)
-        if var_type == TYPE_I32 or var_type == TYPE_U32
+        if ty_int_bits(var_type) == 32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, trunc)
@@ -3184,7 +3185,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, loc)
             emit_str(s, c"\n")
-        else if var_type == TYPE_U16 or var_type == TYPE_I16
+        else if ty_int_bits(var_type) == 16
             # Truncate i64 (unified value model) back to i16 for the slot.
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3197,7 +3198,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             emit_str(s, c", ptr ")
             emit_reg(s, loc)
             emit_str(s, c"\n")
-        else if var_type == TYPE_U8 or var_type == TYPE_I8
+        else if ty_int_bits(var_type) == 8
             # Truncate i64 to i8 for byte types
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3231,7 +3232,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             if var_type == TYPE_F32 or var_type == TYPE_F64
                 lval = emit_field_elem_narrow(s, val, var_type, stmt.assign_value)
             emit_str(s, c"  store ")
-            emit_llvm_type(s, var_type)
+            emit_str(s, ty_value_llvm(var_type))
             emit_str(s, c" ")
             emit_reg(s, lval)
             emit_str(s, c", ptr ")
@@ -3263,7 +3264,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 return
             set_match_float_hint(s, stmt.assign_value, glob.var_type, null, 0)   # AGAST #4028
             let val: i32 = emit_expr(s, stmt.assign_value)
-            if glob.var_type == TYPE_I32 or glob.var_type == TYPE_U32
+            if ty_int_bits(glob.var_type) == 32
                 let trunc: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, trunc)
@@ -3275,7 +3276,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_str(s, c", ptr @")
                 emit_name(s, glob.name, glob.name_len)
                 emit_str(s, c"\n")
-            else if glob.var_type == TYPE_I16 or glob.var_type == TYPE_U16
+            else if ty_int_bits(glob.var_type) == 16
                 # i16 store via global — trunc i64 → i16 (unified value model).
                 let trunc: i32 = next_reg(s)
                 emit_str(s, c"  ")
@@ -3288,7 +3289,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_str(s, c", ptr @")
                 emit_name(s, glob.name, glob.name_len)
                 emit_str(s, c"\n")
-            else if glob.var_type == TYPE_I8 or glob.var_type == TYPE_U8
+            else if ty_int_bits(glob.var_type) == 8
                 # i8 store via global — trunc i64 → i8.
                 let trunc: i32 = next_reg(s)
                 emit_str(s, c"  ")
@@ -3323,7 +3324,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 if glob.var_type == TYPE_F32 or glob.var_type == TYPE_F64
                     gval = emit_field_elem_narrow(s, val, glob.var_type, stmt.assign_value)
                 emit_str(s, c"  store ")
-                emit_llvm_type(s, glob.var_type)
+                emit_str(s, ty_value_llvm(glob.var_type))
                 emit_str(s, c" ")
                 emit_reg(s, gval)
                 emit_str(s, c", ptr @")
@@ -3477,7 +3478,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             return
         set_match_float_hint(s, stmt.return_value, ret_type, s.ret_type_name, s.ret_type_name_len)
         let val: i32 = emit_expr(s, stmt.return_value)
-        if ret_type == TYPE_I32 or ret_type == TYPE_U32
+        if ty_int_bits(ret_type) == 32
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, trunc)
@@ -3487,7 +3488,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"  ret i32 ")
             emit_reg(s, trunc)
             emit_str(s, c"\n")
-        else if ret_type == TYPE_U16 or ret_type == TYPE_I16
+        else if ty_int_bits(ret_type) == 16
             # Truncate i64 to i16 for narrow return types (e.g. htons / ntohs).
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3498,7 +3499,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"  ret i16 ")
             emit_reg(s, trunc)
             emit_str(s, c"\n")
-        else if ret_type == TYPE_U8 or ret_type == TYPE_I8
+        else if ty_int_bits(ret_type) == 8
             # Truncate i64 to i8 for byte return types
             let trunc: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -3542,7 +3543,7 @@ fn emit_return(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             # AGAST #2074: `return 1.0` from an `-> f32` fn is fptrunc'd.
             let rval: i32 = float_ret_value(s, val, ret_type, stmt.return_value)
             emit_str(s, c"  ret ")
-            emit_llvm_type(s, ret_type)
+            emit_str(s, ty_value_llvm(ret_type))
             emit_str(s, c" ")
             emit_reg(s, rval)
             emit_str(s, c"\n")
@@ -3622,7 +3623,7 @@ fn emit_for_elem_llvm(s: *EmitterState, elem: i32, name: *u8, name_len: i32)
         emit_str(s, c"%")
         emit_name(s, name, name_len)
     else
-        emit_llvm_type(s, elem)
+        emit_str(s, ty_value_llvm(elem))
 
 # AGAST #2388: a slot for the header value `val`, which has no place of its own:
 # a call's result, a literal or a const.  Nothing else can write to it.  The alloca
@@ -3930,7 +3931,7 @@ fn array_init_ptr_pointee(s: *EmitterState, e: *Expr, name: **u8, name_len: *i32
         *name = loc.type_name
         *name_len = loc.type_name_len
         return TYPE_STRUCT
-    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64 or t == TYPE_F32 or t == TYPE_F64
+    if ty_is_int(t) == 1 or t == TYPE_F32 or t == TYPE_F64
         return t
     TYPE_VOID
 
@@ -3949,7 +3950,7 @@ fn scalar_elem_kind(s: *EmitterState, first: *Expr) -> i32
             return TYPE_F32
         return TYPE_F64
     if k == BK_INT
-        if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32 or t == TYPE_U64
+        if ty_is_int(t) == 1
             return t
         return TYPE_I64
     TYPE_VOID
@@ -4631,7 +4632,7 @@ fn emit_ptr_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr
         # i64 arm below: `getelementptr i64` + `store i64 %float`.  A
         # *bool strides and stores one `i1`, as every bool array element
         # is laid out (#2063); it stored an i64 8 bytes apart.
-        let fty: *u8 = local_array_elem_llvm(pointee)
+        let fty: *u8 = elem_mem_llvm(pointee)
         let fval: i32 = emit_field_elem_narrow(s, val_reg, pointee, value)
         emit_str(s, c"  ")
         emit_reg(s, elem_ptr)
@@ -4653,13 +4654,13 @@ fn emit_ptr_elem_store(s: *EmitterState, idx_expr: *Expr, value: *Expr, base_ptr
     # Element type from the pointee kind; unknown/i64/u64 → i64.
     var elem_ty: *u8 = c"i64"
     var narrow: i32 = 0
-    if pointee == TYPE_U8 or pointee == TYPE_I8
+    if ty_int_bits(pointee) == 8
         elem_ty = c"i8"
         narrow = 1
-    else if pointee == TYPE_U16 or pointee == TYPE_I16
+    else if ty_int_bits(pointee) == 16
         elem_ty = c"i16"
         narrow = 1
-    else if pointee == TYPE_U32 or pointee == TYPE_I32
+    else if ty_int_bits(pointee) == 32
         elem_ty = c"i32"
         narrow = 1
     emit_str(s, c"  ")
@@ -4703,7 +4704,7 @@ fn emit_array_field_llvm_type(s: *EmitterState, field: *StructField)
         emit_str(s, c"%")
         emit_name(s, field.array_elem_type_name, field.array_elem_type_name_len)
     else
-        emit_str(s, field_array_elem_llvm(field.array_elem_type))
+        emit_str(s, elem_mem_llvm(field.array_elem_type))
     emit_str(s, c"]")
 
 # Copy `[N x T]` (spelled for `field`) from `src_ptr` over `dst_ptr` as one
@@ -5633,7 +5634,7 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
         # agree with the struct value being stored.
         emit_llvm_type_struct(s, TYPE_STRUCT, field.array_elem_type_name, field.array_elem_type_name_len)
     else
-        emit_str(s, field_array_elem_llvm(et))
+        emit_str(s, elem_mem_llvm(et))
     emit_str(s, c"], ptr ")
     emit_reg(s, field_ptr)
     emit_str(s, c", i64 0, i64 ")
@@ -5657,7 +5658,7 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
         # value into an f32 slot fptrunc'd, as #1973's `p[i] = v` does.
         # f32 failed closed; f64 stored `i64`, which only type-checked while
         # the `x.f[i]` read also bit-loaded an i64.
-        sty = field_array_elem_llvm(et)
+        sty = elem_mem_llvm(et)
         sval = emit_field_elem_narrow(s, val, et, val_expr)
     else if et == TYPE_BOOL
         # An i1 register stores as-is; an i64 bool truncates.
@@ -5672,7 +5673,7 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
     else
         # Integers / pointers at their own width (trunc / inttoptr); i64
         # elements store all 8 bytes.
-        sty = array_elem_llvm(et)
+        sty = elem_mem_llvm(et)
         if (et == TYPE_PTR or et == TYPE_PTR_PTR) and expr_is_ptr_valued(s, val_expr) == 1
             sval = val   # AGAST #3170: `h.a[i] = @&x` into a `[N]*T` field: a `ptr` already
         else
@@ -5708,12 +5709,12 @@ fn emit_ptr_field_index_store(s: *EmitterState, field_slot: i32, field: *StructF
         # value into an f32 slot is fptrunc'd.  bool: `i1` (#2063).
         let typed: i32 = emit_field_elem_narrow(s, val, kind, val_expr)
         emit_str(s, c"  store ")
-        emit_str(s, ptr_field_elem_llvm(kind))
+        emit_str(s, elem_mem_llvm(kind))
         emit_str(s, c" ")
         emit_reg(s, typed)
     else
         # Narrow the i64 value to the element width (trunc / inttoptr).
-        let elem_ty: *u8 = array_elem_llvm(kind)
+        let elem_ty: *u8 = elem_mem_llvm(kind)
         var narrow: i32 = val   # AGAST #3170: `h.f[i] = @&x` into a `**T` field: a `ptr` already
         if (kind != TYPE_PTR and kind != TYPE_PTR_PTR) or expr_is_ptr_valued(s, val_expr) == 0
             narrow = emit_array_elem_narrow(s, val, kind, elem_ty)
@@ -6643,7 +6644,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # AGAST #2048: f32 / f64 fields store float / double.
                     if emit_float_field_store(s, field_ptr, field.field_type, val_reg, stmt.assign_value) == 1
                         lfa_done = 1
-                    else if field.field_type == TYPE_I32 or field.field_type == TYPE_U32
+                    else if ty_int_bits(field.field_type) == 32
                         let trunc: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, trunc)
@@ -6655,7 +6656,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c", ptr ")
                         emit_reg(s, field_ptr)
                         emit_str(s, c"\n")
-                    else if field.field_type == TYPE_I16 or field.field_type == TYPE_U16
+                    else if ty_int_bits(field.field_type) == 16
                         let trunc16: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, trunc16)
@@ -6667,7 +6668,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                         emit_str(s, c", ptr ")
                         emit_reg(s, field_ptr)
                         emit_str(s, c"\n")
-                    else if field.field_type == TYPE_I8 or field.field_type == TYPE_U8
+                    else if ty_int_bits(field.field_type) == 8
                         let trunc8: i32 = next_reg(s)
                         emit_str(s, c"  ")
                         emit_reg(s, trunc8)
@@ -6852,7 +6853,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 emit_str(s, c" x ")
                 # AGAST #1564: every non-struct element uses the alloca's own
                 # spelling (array_elem_llvm); u32/u16/i16 used to fall to i64.
-                let elem_ty: *u8 = local_array_elem_llvm(local.array_elem_type)
+                let elem_ty: *u8 = elem_mem_llvm(local.array_elem_type)
                 if local.array_elem_type == TYPE_STRUCT and local.type_name_len > 0
                     # AGAST #190: struct-array LHS — emit `[N x %T]` so the
                     # GEP and the store agree with the actual element layout.
@@ -6972,7 +6973,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 let gidx: i32 = emit_expr(s, stmt.while_cond)
                 set_match_float_hint(s, stmt.assign_value, glob.array_elem_type, null, 0)   # AGAST #4028
                 let gval: i32 = emit_expr(s, stmt.assign_value)
-                let gty: *u8 = global_array_elem_llvm(glob)
+                let gty: *u8 = elem_mem_llvm(glob.array_elem_type)
                 let gptr: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, gptr)
@@ -6998,7 +6999,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     emit_str(s, c" = inttoptr i64 ")
                     emit_reg(s, gval)
                     emit_str(s, c" to ptr\n")
-                else if get == TYPE_U8 or get == TYPE_I8 or get == TYPE_U16 or get == TYPE_I16 or get == TYPE_U32 or get == TYPE_I32
+                else if ty_int_in(get, 8, 32) == 1
                     gstore = next_reg(s)
                     emit_str(s, c"  ")
                     emit_reg(s, gstore)

@@ -25,6 +25,7 @@ THE ORACLE
 """
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -365,3 +366,167 @@ def test_sizeof_primitive(ritz1_bin, tmp_path, compiler, prim):
     prog = f"pub fn main() -> i32\n    return sizeof({prim}) as i32\n"
     expected = next(size for name, _, size, _ in PRIMS if name == prim)
     assert _run(compiler, tmp_path, f"sizeof_{prim}", prog) == expected
+
+
+# AGAST #1889: the two types.ritz rows the per-primitive tables above don't
+# reach -- `usize` spelled as u64 (ty_from_name; `isize`/`usize` are aliases,
+# #3464) and `@&T` carried as `ptr` in a signature (ty_value_llvm; i64 there
+# makes the call operand mismatch its definition and the IR fails to link).
+ALIASES_AND_MUT_REF = """\
+struct P
+    x: i32
+
+fn pick(p: @&P) -> @&P
+    p
+
+pub fn main() -> i32
+    var a: P
+    a.x = 40
+    let r: @&P = pick(@&a)
+    r.x = r.x + 2
+    if sizeof(usize) != 8 or sizeof(isize) != 8
+        return 1
+    let u: usize = 0
+    let v: usize = u - 1
+    if v < u
+        return 2
+    a.x
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+def test_usize_alias_and_mut_ref_signature(ritz1_bin, tmp_path, compiler):
+    assert _run(compiler, tmp_path, "alias_mutref", ALIASES_AND_MUT_REF) == 42
+
+
+# AGAST #1889 (#1814 FIX step 2): local / global `[3]T` arrays per element
+# type, through the array-literal, array-fill, local index, global index and
+# `*T` element paths -- the ones whose private type ladders were replaced by
+# ritz1/src/types.ritz.  A wrong element width, stride or extension returns a
+# code other than 42.
+def _array_program(t: str, v0: str, v1: str, v2: str) -> str:
+    return f"""\
+var G: [3]{t}
+
+fn second(p: *{t}) -> {t}
+    *(p + 1)
+
+pub fn main() -> i32
+    var lit: [3]{t} = [{v0}, {v1}, {v2}]
+    if lit[0] != {v0}
+        return 1
+    if lit[1] != {v1}
+        return 2
+    if lit[2] != {v2}
+        return 3
+    var fill: [3]{t} = [{v2}; 3]
+    if fill[0] != {v2} or fill[2] != {v2}
+        return 4
+    G[0] = {v0}
+    G[1] = {v1}
+    G[2] = {v2}
+    if G[1] != {v1}
+        return 5
+    if G[2] != {v2}
+        return 6
+    if G[0] != {v0}
+        return 7
+    if second(@lit[0]) != {v1}
+        return 8
+    if second(@G[0]) != {v1}
+        return 9
+    fill[1] = G[1]
+    if fill[1] != {v1} or fill[0] != {v2}
+        return 10
+    return 42
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
+@pytest.mark.parametrize("t,v0,v1,v2", ELEM_VALUES, ids=[e[0] for e in ELEM_VALUES])
+def test_local_and_global_array_element_access(ritz1_bin, tmp_path, compiler, t, v0, v1, v2):
+    assert _run(compiler, tmp_path, f"arr_{t}", _array_program(t, v0, v1, v2)) == 42
+
+
+# AGAST #1889: ritz1 spells every primitive type fact in ONE module,
+# ritz1/src/types.ritz.  These static checks keep the dozen-plus private
+# copies (#1564, #1814, #1966, #2063 were each a copy that missed a type)
+# from growing back.  They read the source; no compiler runs.
+RITZ1_SRC = Path(__file__).resolve().parent.parent / "ritz1" / "src"
+TYPES_RITZ = "types.ritz"
+
+# The ladder functions types.ritz replaced.  None may be defined or called.
+DELETED_LADDERS = [
+    "emit_llvm_type",
+    "array_elem_llvm",
+    "field_array_elem_llvm",
+    "local_array_elem_llvm",
+    "global_array_elem_llvm",
+    "const_array_elem_llvm",
+    "ptr_field_elem_llvm",
+    "narrow_type_name",
+    "narrow_int_width",
+    "narrow_is_unsigned",
+    "int_prim_bits",
+    "int_prim_signed",
+    "prim_name_size",
+]
+
+# `<operand> ==/!= TYPE_I16`: the kinds one operand is compared against.
+_INT_KIND = re.compile(r"([\w.]+)\s*[!=]=\s*TYPE_([IU])(8|16|32|64)\b")
+
+
+def _code_lines():
+    """(file, lineno, code) for every ritz1 source line, comments stripped."""
+    for path in sorted(RITZ1_SRC.glob("*.ritz")):
+        for n, line in enumerate(path.read_text().splitlines(), 1):
+            code = re.sub(r'c?"(?:[^"\\]|\\.)*"', '""', line).split("#", 1)[0]
+            if code.strip():
+                yield path.name, n, code
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", DELETED_LADDERS)
+def test_deleted_type_ladder_stays_deleted(name):
+    hits = [f"{f}:{n}" for f, n, code in _code_lines() if re.search(rf"\b{name}\b", code)]
+    assert not hits, f"{name} is replaced by types.ritz, still used at {hits}"
+
+
+def _ladder_rungs():
+    """Lines outside types.ritz that spell a primitive-type ladder rung:
+    both signednesses of one width (`t == TYPE_I16 or t == TYPE_U16`) or a
+    hand-rolled set of three or more integer kinds (`is_signed`), compared
+    against ONE operand (`a == TYPE_U64 and b == TYPE_I64` is two facts)."""
+    for f, n, code in _code_lines():
+        if f in (TYPES_RITZ, "ast.ritz"):
+            continue
+        by_operand = {}
+        for operand, sign, width in _INT_KIND.findall(code):
+            by_operand.setdefault(operand, set()).add((sign, width))
+        for kinds in by_operand.values():
+            widths = [w for _, w in kinds]
+            if len(kinds) >= 3 or len(widths) != len(set(widths)):
+                yield f"{f}:{n}: {code.strip()}"
+                break
+
+
+@pytest.mark.unit
+def test_no_inline_type_ladders_outside_types_ritz():
+    rungs = list(_ladder_rungs())
+    assert not rungs, (
+        f"{len(rungs)} inline type ladder rung(s); ask types.ritz "
+        "(ty_int_bits / ty_is_signed / ty_mem_llvm / ty_store_size) instead:\n"
+        + "\n".join(rungs[:40])
+    )
+
+
+@pytest.mark.unit
+def test_types_ritz_table_is_complete():
+    """Every primitive kind has a row in each types.ritz function."""
+    text = (RITZ1_SRC / TYPES_RITZ).read_text()
+    for kind in ["I8", "U8", "I16", "U16", "I32", "U32", "I64", "U64"]:
+        assert f"TYPE_{kind}" in text
+    for spelling in ['c"float"', 'c"double"', 'c"i1"', 'c"ptr"']:
+        assert spelling in text

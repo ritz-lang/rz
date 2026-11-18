@@ -4,6 +4,7 @@
 # register index, or 0 on an error path.
 
 import ast
+import types           # the one primitive type table (AGAST #1889)
 import ast_helpers   # is_enum_type (AGAST #2539)
 import emitter_core
 import index_through
@@ -13,7 +14,7 @@ import emitter_stmt          # array_ptr_local (AGAST #2287)
 import emitter_expr_call   # method_call_def (AGAST #1635)
 import ref_check           # ref_temp_call (AGAST #3050)
 import ownership           # own_temp_slot_of, own_lend_temps (AGAST #3050)
-import narrowing           # narrow_int_width (AGAST #3225)
+import narrowing           # emit_narrow_operand (AGAST #3225)
 import emitter_match
 import ritzlib.io
 import ritzlib.str
@@ -558,8 +559,8 @@ pub fn emit_expr_binary(s: *EmitterState, e: *Expr) -> i32
         if wider != TYPE_VOID
             # AGAST #3225: in a wider slot `/` and `%` run at the slot's type,
             # on operands that didn't wrap below it: read back at that type.
-            let wb: i32 = narrow_int_width(wider)
-            let wu: i32 = narrow_is_unsigned(wider)
+            let wb: i32 = ty_bits(wider)
+            let wu: i32 = ty_is_unsigned(wider)
             left_reg = emit_narrow_operand(s, e.left, left_reg, wb, wu)
             scaled_right = emit_narrow_operand(s, e.right, scaled_right, wb, wu)
             if wb == 64 and wu == 1
@@ -817,7 +818,7 @@ fn wider_slot_type(s: *EmitterState, e: *Expr) -> i32
     if e.op != OP_DIV and e.op != OP_MOD
         return TYPE_VOID
     let t: i32 = e.slot_type
-    let bits: i32 = narrow_int_width(t)
+    let bits: i32 = ty_bits(t)
     if bits <= 1
         return TYPE_VOID
     var uns: i32 = 0
@@ -1085,13 +1086,13 @@ fn ptr_distance_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i3
 
 # A scalar kind's LLVM type, as emit_llvm_type spells it; null for any other.
 fn scalar_llvm_name(t: i32) -> *u8
-    if t == TYPE_U8 or t == TYPE_I8
+    if ty_int_bits(t) == 8
         return c"i8"
-    if t == TYPE_U16 or t == TYPE_I16
+    if ty_int_bits(t) == 16
         return c"i16"
-    if t == TYPE_U32 or t == TYPE_I32
+    if ty_int_bits(t) == 32
         return c"i32"
-    if t == TYPE_U64 or t == TYPE_I64
+    if ty_int_bits(t) == 64
         return c"i64"
     if t == TYPE_F32
         return c"float"
@@ -1163,7 +1164,7 @@ pub fn deref_pointee_struct_name(s: *EmitterState, op: *Expr, out_name: **u8, ou
         if f != null and f.field_type == TYPE_PTR
             # make_ptr_prim_field records primitive pointees here.
             let pe: i32 = f.array_elem_type
-            let prim: bool = pe == TYPE_U8 or pe == TYPE_I8 or pe == TYPE_U16 or pe == TYPE_I16 or pe == TYPE_U32 or pe == TYPE_I32 or pe == TYPE_U64 or pe == TYPE_I64
+            let prim: bool = ty_is_int(pe) == 1
             if not prim
                 cand = f.field_type_name
                 cand_len = f.field_type_name_len
@@ -1268,11 +1269,11 @@ fn if_arms_pointee_name(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i3
 # and, for a struct, its name.  AGAST #1908: a struct pointee used to fall
 # to the i8 default, so `@tests[1]` over `*RitzTest` pointed one BYTE in.
 fn emit_ptr_elem_gep_type(s: *EmitterState, pointee_type: i32, name: *u8, name_len: i32)
-    if pointee_type == TYPE_I32 or pointee_type == TYPE_U32
+    if ty_int_bits(pointee_type) == 32
         emit_str(s, c"i32")
-    else if pointee_type == TYPE_I64 or pointee_type == TYPE_U64
+    else if ty_int_bits(pointee_type) == 64
         emit_str(s, c"i64")
-    else if pointee_type == TYPE_I16 or pointee_type == TYPE_U16
+    else if ty_int_bits(pointee_type) == 16
         emit_str(s, c"i16")
     else if pointee_type == TYPE_PTR or pointee_type == TYPE_PTR_PTR
         emit_str(s, c"ptr")
@@ -1433,7 +1434,7 @@ pub fn emit_nd_index_value(s: *EmitterState, e: *Expr, out_reg: *i32) -> i32
         emit_str(s, c"\n")
         *out_reg = sv
         return 1
-    let ty: *u8 = local_array_elem_llvm(sh.leaf_type)
+    let ty: *u8 = elem_mem_llvm(sh.leaf_type)
     let v: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, v)
@@ -1578,7 +1579,7 @@ pub fn emit_const_array_ptr(s: *EmitterState, op: *Expr) -> i32
         if carr.array_elem_type_name_len <= 0 or (carr.value_expr.kind != EXPR_ARRAY_LIT and const_struct_fill_refused(carr) == 0)
             return -1
         return emit_struct_array_elem_ptr(s, carr.name, carr.name_len, carr.array_size, carr.array_elem_type_name, carr.array_elem_type_name_len, op.right)
-    let cty: *u8 = const_array_elem_llvm(carr.array_elem_type)
+    let cty: *u8 = const_elem_llvm(carr.array_elem_type)
     if cty == null
         return -1
     let cidx: i32 = emit_expr(s, op.right)
@@ -1755,7 +1756,7 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                     else
                         # AGAST #1564: the alloca's own element type;
                         # u32/u16/i16 used to stride as i64.
-                        emit_str(s, local_array_elem_llvm(local.array_elem_type))
+                        emit_str(s, elem_mem_llvm(local.array_elem_type))
                     emit_str(s, c"], ptr ")
                     emit_reg(s, local.reg)
                     emit_str(s, c", i64 0, i64 ")
@@ -1842,7 +1843,7 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                     emit_str(s, c" = getelementptr [")
                     emit_int(s, glob_arr.array_size as i64)
                     emit_str(s, c" x ")
-                    emit_str(s, global_array_elem_llvm(glob_arr))
+                    emit_str(s, elem_mem_llvm(glob_arr.array_elem_type))
                     emit_str(s, c"], ptr @")
                     emit_name(s, glob_arr.name, glob_arr.name_len)
                     emit_str(s, c", i64 0, i64 ")
@@ -1972,7 +1973,7 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                             emit_name(s, inner_field_cm.array_elem_type_name, inner_field_cm.array_elem_type_name_len)
                         else
                             # AGAST #1814: the field's declared element type.
-                            emit_str(s, field_array_elem_llvm(inner_field_cm.array_elem_type))
+                            emit_str(s, elem_mem_llvm(inner_field_cm.array_elem_type))
                         emit_str(s, c"], ptr ")
                         emit_reg(s, inner_result_cm.reg)
                         emit_str(s, c", i64 0, i64 ")
@@ -2070,7 +2071,7 @@ pub fn emit_lvalue_ptr(s: *EmitterState, op: *Expr) -> i32
                         emit_name(s, idx_fb_field.array_elem_type_name, idx_fb_field.array_elem_type_name_len)
                     else
                         # AGAST #1814: the field's declared element type.
-                        emit_str(s, field_array_elem_llvm(idx_fb_field.array_elem_type))
+                        emit_str(s, elem_mem_llvm(idx_fb_field.array_elem_type))
                     emit_str(s, c"], ptr ")
                     emit_reg(s, idx_fb.reg)
                     emit_str(s, c", i64 0, i64 ")
@@ -2199,7 +2200,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c"  ")
             emit_reg(s, fresult)
             emit_str(s, c" = load ")
-            emit_str(s, local_array_elem_llvm(deref_type))
+            emit_str(s, elem_mem_llvm(deref_type))
             emit_str(s, c", ptr ")
             emit_reg(s, ptr)
             emit_str(s, c"\n")
@@ -2220,7 +2221,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_reg(s, bval)
             emit_str(s, c" to i64\n")
             return bresult
-        else if deref_type == TYPE_U8 or deref_type == TYPE_I8
+        else if ty_int_bits(deref_type) == 8
             # Load i8 and sign/zero-extend to i64.  AGAST #2021: `*p` on a
             # *i8 sexts, as p[i] does; zext made a negative pointee 0xFD.
             let byte_val: i32 = next_reg(s)
@@ -2239,7 +2240,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_reg(s, byte_val)
             emit_str(s, c" to i64\n")
             return result
-        else if deref_type == TYPE_U16 or deref_type == TYPE_I16
+        else if ty_int_bits(deref_type) == 16
             # Load i16 and sign/zero-extend to i64
             let val16: i32 = next_reg(s)
             emit_str(s, c"  ")
@@ -2257,7 +2258,7 @@ pub fn emit_expr_unary(s: *EmitterState, e: *Expr) -> i32
             emit_reg(s, val16)
             emit_str(s, c" to i64\n")
             return result
-        else if deref_type == TYPE_I32 or deref_type == TYPE_U32
+        else if ty_int_bits(deref_type) == 32
             # Load i32 and sign/zero-extend to i64 (unified value model)
             # Critical: reading i64 from a 4-byte slot reads 4 bytes of
             # adjacent stack/heap = garbage upper half.

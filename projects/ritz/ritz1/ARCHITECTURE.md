@@ -124,6 +124,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `parser_gen` | Recursive-descent parser. Generated. |
 | `ast` | AST node structs (`Expr`, `Stmt`, `FnDef`, `StructDef`, `Module`, ...) and kind constants. |
 | `ast_helpers` | AST constructors the grammar's actions call, the parser arena, type-alias and array-length folding, and AST queries used everywhere downstream. Hand-written (see below). |
+| `types` | The one table of primitive type facts (AGAST #1889): LLVM spelling in memory and as a value, store size, alignment, bit width, signedness, Ritz name, name→kind. Struct/enum kinds answer "unknown"; the emitter's struct table sizes them. |
 | `diag` | Located diagnostics: one `<file>:<line>:<col>: error: <message>` line per error. |
 | `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>_Future`, `<f>`, `<f>_poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |
 | `interp` | Reads `{expr}` placeholders in print strings; re-enters the lexer/parser for each placeholder expression. |
@@ -259,7 +260,7 @@ still run mid-lowering on `*EmitterState`, and
 | Module | Responsibility |
 |---|---|
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
-| `emitter_core` | `EmitterState`, type→LLVM mapping, local/struct/fn lookup, IR text helpers, member-access GEPs. |
+| `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. |
 | `emitter_expr` | `emit_expr` dispatch and struct literals. |
 | `emitter_expr_access`, `emitter_expr_arith`, `emitter_expr_call` | Identifiers/index/member; binary/unary; calls and methods. |
 | `emitter_stmt` | Statements: declarations, assignment, control flow, `for`. |
