@@ -652,14 +652,8 @@ fn unsliceable_message(base_type: i32) -> *u8
 # widen as an array element is.
 fn emit_deref_index(s: *EmitterState, e: *Expr, elem: i32) -> i32
     let ty: *u8 = local_array_elem_llvm(elem)
-    let base: i32 = emit_expr(s, e.left)
+    let base_ptr: i32 = emit_index_base_ptr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
-    let base_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, base_ptr)
-    emit_str(s, c" = inttoptr i64 ")
-    emit_reg(s, base)
-    emit_str(s, c" to ptr\n")
     let ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, ptr)
@@ -769,6 +763,20 @@ pub fn index_store_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_
     *out_len = 0
     *out_pp = 0
     var pp: i32 = 0
+    # AGAST #3757: `@a[i]`, the address of an inline array's element.
+    if x.kind == EXPR_UNARY
+        return addr_elem_root_pointee(s, x, out_name, out_len)
+    # AGAST #3757: `p as @&T` (a `ptr`, #1754) points at T as `p as *T` does;
+    # the parser records a scalar T (cast_tail_new) as it does a struct.
+    if x.kind == EXPR_CAST and x.op == TYPE_MUT_REF
+        let rk: i32 = x.int_val as i32
+        if primitive_name_len(rk) > 0
+            return rk
+        if rk != TYPE_STRUCT or x.ident_len == 0 or find_struct(s, x.ident_ptr, x.ident_len) == null
+            return 0
+        *out_name = x.ident_ptr
+        *out_len = x.ident_len
+        return TYPE_STRUCT
     if x.kind == EXPR_CAST
         pp = (x.op == TYPE_PTR_PTR) as i32
     else if x.kind == EXPR_CALL
@@ -806,6 +814,41 @@ pub fn index_store_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_
         return TYPE_PTR
     ptr_root_pointee(s, x, out_name, out_len)
 
+# AGAST #3757: the element type of `@a[i]` (`@` only, not `@&`) over an
+# inline array (a local, global or field `[N]T`, any rank): its scalar kind,
+# or TYPE_STRUCT with the name written.  0 for anything else (a pointer or
+# view element, a Vec).  `@a[i] + k` strides by it (ptr_arith_elem_size).
+# sema_index_store.ritz's isc_addr_elem_ok accepts a subset (named arrays).
+fn addr_elem_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if x.op != OP_ADDR or x.operand == null or x.operand.kind != EXPR_INDEX
+        return 0
+    var elem: i32 = TYPE_VOID
+    var slot: i32 = TYPE_VOID
+    var name: *u8 = null
+    var len: i32 = 0
+    array_elem_record(s, x.operand, @elem, @slot, @name, @len)
+    if primitive_name_len(elem) > 0
+        return elem
+    if elem != TYPE_STRUCT or name == null or len == 0 or find_struct(s, name, len) == null
+        return 0
+    *out_name = name
+    *out_len = len
+    TYPE_STRUCT
+
+# AGAST #3757: the base `e` of an expression-target index as a `ptr` register:
+# emit_expr's i64 converted, or the `ptr` an `as @&T` cast already is (#1754).
+pub fn emit_index_base_ptr(s: *EmitterState, e: *Expr) -> i32
+    let base: i32 = emit_expr(s, e)
+    if expr_is_ptr_valued(s, e) == 1
+        return base
+    let bptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, bptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, base)
+    emit_str(s, c" to ptr\n")
+    bptr
+
 # AGAST #3565: the pointee of an index store's base `x` when it names a `*T`
 # or `**T` (out_pp): a root index_store_root_pointee types, or pointer
 # arithmetic `y + k` / `y - k` down the left spine of one.  0 otherwise.
@@ -821,20 +864,17 @@ pub fn index_store_base_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_
             *out_pp = 0
             return 0
         root = root.left
+    # An `as @&T` cast is a `ptr`, and a reference does no arithmetic.
+    if root != x and root.kind == EXPR_CAST and root.op == TYPE_MUT_REF
+        return 0
     index_store_root_pointee(s, root, out_name, out_len, out_pp)
 
 # AGAST #3833: `(e as *S)[i]` and `(q + k)[i]` over a `*S`: the `%S` at
 # element i, at a stride of sizeof(S).  A copy only (the caller refuses the
 # rest, whole_struct_elem_refused).
 fn emit_struct_ptr_index(s: *EmitterState, e: *Expr, name: *u8, len: i32) -> i32
-    let base: i32 = emit_expr(s, e.left)
+    let base_ptr: i32 = emit_index_base_ptr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
-    let base_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, base_ptr)
-    emit_str(s, c" = inttoptr i64 ")
-    emit_reg(s, base)
-    emit_str(s, c" to ptr\n")
     let ptr: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, ptr)

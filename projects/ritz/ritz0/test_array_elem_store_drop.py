@@ -421,6 +421,61 @@ fn f()
     (p)[0] = 3
     D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
 """, "f()", 7325),
+    # `(@a[0] + 1)[i]`: arithmetic on an `@T` root (LARB R20), which
+    # Sema refused and ritz1 couldn't type (AGAST #3757).  `@a[0] + 1` names
+    # a[1]; as through any pointer base, the old element isn't dropped.
+    "addr_arith_scalar": ("""\
+fn val(x: i32) -> i32
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [3]i32 = [1, 2, 4]
+    (@a[0] + 1)[idx(1)] = val(3)
+    D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
+""", "f()", 78123),
+    "addr_arith_struct": ("""\
+fn f()
+    var a: [3]S = [S { x: 1 }, S { x: 2 }, S { x: 4 }]
+    (@a[0] + 1)[idx(0)] = mk(3)
+""", "f()", 78134),
+    # A global array root, and a `[N]i64` param's (its own copy: the store
+    # shows in the sum g returns).
+    "addr_arith_global_and_param": ("""\
+var G: [3]u8
+
+fn g(b: [3]i64) -> i64
+    (@b[0] + 2)[0] = 9
+    b[0] + b[1] + b[2]
+
+fn f()
+    G[0] = 1
+    G[1] = 2
+    G[2] = 4
+    (@G[1] + 1)[idx(0)] = 5
+    D = ((D * 10 + G[0] as i64) * 10 + G[1] as i64) * 10 + G[2] as i64
+    let b: [3]i64 = [1, 2, 4]
+    D = D * 100 + g(b)
+""", "f()", 712512),
+    # `(p as @&T)[i]`: a reference cast's pointee, which the parser kept
+    # only for a struct (#3443); ritz1 emitted invalid IR (AGAST #3757).
+    "ref_cast_scalar": ("""\
+fn val(x: i32) -> i32
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [3]i32 = [1, 2, 4]
+    let p: *i32 = @a[0]
+    (p as @&i32)[idx(1)] = val(5)
+    D = ((D * 10 + a[0] as i64) * 10 + a[1] as i64) * 10 + a[2] as i64
+""", "f()", 78154),
+    "ref_cast_struct": ("""\
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    let p: *S = @a[0]
+    (p as @&S)[idx(1)] = mk(3)
+""", "f()", 7813),
 }
 
 
@@ -500,6 +555,13 @@ fn f()
     let q: *i32 = @a[0]
     D = D * 10 + (q + 1)[1] as i64
 """, "f()", 9),
+    # AGAST #3757: the roots the stores above gained, read.
+    "addr_arith_and_ref_cast": ("""\
+fn f()
+    var a: [3]i32 = [300, 7, 9]
+    let p: *i32 = @a[0]
+    D = (D * 10 + (@a[0] + 1)[1] as i64) * 10 + (p as @&i32)[1] as i64
+""", "f()", 97),
     "arith_pointer": ("""\
 fn f()
     var x: i32 = 1
@@ -572,25 +634,18 @@ def test_deref_cast_ptr_ptr_sum(tmp_path, compiler):
     assert rc == 42, f"{compiler}: D % 200 == {rc}, spec says D == 6341"
 
 
-# A scalar base, or pointer arithmetic the store above doesn't type, reached
-# that generic path too; ritz1's Sema refuses it (index_store_check).  An
-# integer base in ritz0's words for `n[i] = v`, on every compiler (ritz0 raised
-# a traceback until AGAST #3754).  `(@a[0] + 1)[i]` is ritz1 only: ritz0 stores
-# through it, which ritz1 is to route (AGAST #3757).
-# The integer bases' error is at the `[` (index_scalar_check, AGAST #3755);
-# the store's own is at the target.
+# A scalar base reached that generic path too: refused in ritz0's words for
+# `n[i] = v`, on every compiler (ritz0 raised a traceback until AGAST #3754),
+# at the `[` (index_scalar_check, AGAST #3755).  `(@a[0] + 1)[i]` was refused
+# here on ritz1 until it stored through it (AGAST #3757, EXPR_BASE).
 EXPR_BASE_REFUSED = {
     "int_arith": ("    (n + 1)[0] = 5\n", 12, "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
     "int_cast": ("    (n as i64)[0] = 5\n", 15, "`i64` can't be indexed: it doesn't implement `Index` (§7.8)"),
-    "untyped_arith": ("    (@a[0] + 1)[0] = 5\n", 6,
-                      "can't store through this element: ritz1 stores into `x[i]` here only when `x` "
-                      "is a `*T` or `**T` it can type"),
 }
 
 
-@pytest.mark.parametrize("compiler, name", [
-    (c, n) for n in sorted(EXPR_BASE_REFUSED)
-    for c in (COMPILERS if n.startswith("int_") else COMPILERS[1:])])
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(EXPR_BASE_REFUSED))
 def test_store_into_untyped_base_refused(tmp_path, compiler, name):
     line, col, msg = EXPR_BASE_REFUSED[name]
     body = "fn f()\n    var a: [2]i32 = [1, 2]\n    var n: i64 = 0\n" + line
