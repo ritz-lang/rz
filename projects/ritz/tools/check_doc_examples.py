@@ -140,9 +140,6 @@ KNOWN_FAILURES: dict[tuple[str, str, str], str] = {
     # LANGUAGE_SPEC.md:648
     ("ritz1", "LANGUAGE_SPEC.md", "95abc5851402"): "#3930: `*mut T` doesn't parse",
     ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "95abc5851402"): "#3930: `*mut T` doesn't parse",
-    # LANGUAGE_SPEC.md:2139
-    ("ritz1", "LANGUAGE_SPEC.md", "dd01bd4981da"): "#3931: `let x = <float> == <float>` typed as the float",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "dd01bd4981da"): "#3931: `let x = <float> == <float>` typed as the float",
     # LANGUAGE_SPEC.md:3332
     ("ritz1", "LANGUAGE_SPEC.md", "81234ed3c9ab"): "#3932: an undeclared field type emits invalid IR",
     ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "81234ed3c9ab"): "#3932: an undeclared field type emits invalid IR",
