@@ -19,6 +19,7 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from pathlib import Path
@@ -638,6 +639,7 @@ jobs:
           echo "pytest ADDOPTS=[$PYTEST_ADDOPTS] PARTIAL=[${{RITZ_TEST_BUDGET_PARTIAL:-}}] INCLUDE=[${{RITZ_COST_REPORT_INCLUDE:-}}]" >> {log}
           echo "{{\\"run\\": \\"$RITZ_TEST_BUDGET_PARTIAL\\"}}" > pytest-cost.json
           : stands in for pytest --cost-report=pytest-cost.json
+          if [ -z "${{RITZ_TEST_BUDGET_PARTIAL:-}}" ] && [ -e {full} ]; then cp {full} pytest-cost.json; fi
           if [ -n "${{RITZ_TEST_BUDGET_PARTIAL:-}}" ] && [ -e {fail} ]; then exit 1; fi
         working-directory: r0
       - name: Late
@@ -649,9 +651,12 @@ jobs:
 def likely(tmp_path, monkeypatch):
     """A gate-shaped workflow; every step appends a line to `log`."""
     log, fail = tmp_path / "log", tmp_path / "fail-prepass"
+    full = tmp_path / "full-step-cost.json"  # the full step's report, if any
     (tmp_path / "r0").mkdir()
     wf = tmp_path / "main.yml"
-    wf.write_text(LIKELY_WF.format(log=log, fail=fail))
+    wf.write_text(LIKELY_WF.format(log=log, fail=fail, full=full))
+    history = tmp_path / "cost-history.json"
+    monkeypatch.setenv("RITZ_TEST_COST_HISTORY", str(history))
     monkeypatch.setattr(ci_local, "WORKFLOW", wf)
     monkeypatch.setattr(ci_local, "REPO_ROOT", tmp_path)
     monkeypatch.setattr(ci_local.likely_tests, "select",
@@ -661,6 +666,8 @@ def likely(tmp_path, monkeypatch):
     class Run:
         def __init__(self):
             self.fail = fail
+            self.full = full
+            self.history = history
 
         def lines(self):
             return log.read_text().splitlines() if log.exists() else []
@@ -678,7 +685,10 @@ def test_likely_files_run_first_with_their_build_then_the_rest(likely, capsys):
         "build", "pytest", "early", "pytest", "late"], likely.lines()
     # The pre-pass: only the likely files, stopping at the first failure; its
     # budget check judges files, not the suite.
-    assert "ADDOPTS=[--maxfail=1 test_a.py emitter/test_b.py]" in first_pytest
+    # AGAST #3623: the files go in as --only-file, never as file arguments:
+    # pytest re-walks the whole directory once per file argument.
+    assert ("ADDOPTS=[--maxfail=1 --only-file=test_a.py "
+            "--only-file=emitter/test_b.py]") in first_pytest
     assert "PARTIAL=[1]" in first_pytest and "INCLUDE=[]" in first_pytest
     # The full step: everything else, with the pre-pass's cost folded in.
     assert "ADDOPTS=[--ignore=test_a.py --ignore=emitter/test_b.py]" in rest
@@ -727,7 +737,7 @@ def test_callers_pytest_addopts_are_kept(likely, monkeypatch):
     monkeypatch.setenv("PYTEST_ADDOPTS", "-x")
     assert ci_local.main(GATE) == 0
     first, rest = [ln for ln in likely.lines() if ln.startswith("pytest")]
-    assert "ADDOPTS=[-x --maxfail=1 test_a.py" in first
+    assert "ADDOPTS=[-x --maxfail=1 --only-file=test_a.py" in first
     assert "ADDOPTS=[-x --ignore=test_a.py" in rest
 
 
@@ -782,6 +792,67 @@ def test_a_stale_cost_report_is_not_folded_in(likely, tmp_path, monkeypatch):
     monkeypatch.setattr(ci_local, "run_step", spy)
     assert ci_local.main(GATE) == 0
     assert set(seen) == {None}
+
+
+# AGAST #3623: a pre-pass whose costly files come last ends on a tail of
+# their slow tests while the other workers idle.  The gate keeps the full
+# step's cost report on the host, and the next gate's pre-pass hands out its
+# files costliest first.
+
+def _report(files: dict[str, float]) -> str:
+    return json.dumps({"wall_s": 1.0, "cpu_s": sum(files.values()), "files": {
+        f: {"tests": 1, "cpu_s": c, "wall_s": c} for f, c in files.items()}})
+
+
+def _prepass_addopts(likely) -> str:
+    return next(ln for ln in likely.lines() if ln.startswith("pytest"))
+
+
+def test_the_pre_pass_hands_out_the_costliest_files_first(likely, capsys):
+    likely.history.write_text(_report({"test_a.py": 1.0, "emitter/test_b.py": 9.0}))
+    assert ci_local.main(GATE) == 0
+    assert ("ADDOPTS=[--maxfail=1 --only-file=emitter/test_b.py "
+            "--only-file=test_a.py]") in _prepass_addopts(likely)
+    assert "costliest first (2 of 2 file(s) costed by" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("history", [None, "{not json", '{"files": []}'])
+def test_without_a_usable_cost_history_the_order_is_the_selections(likely, history):
+    if history is not None:
+        likely.history.write_text(history)
+    assert ci_local.main(GATE) == 0
+    assert ("ADDOPTS=[--maxfail=1 --only-file=test_a.py "
+            "--only-file=emitter/test_b.py]") in _prepass_addopts(likely)
+
+
+def test_a_gate_keeps_the_full_steps_cost_report_for_the_next(likely):
+    likely.full.write_text(_report({"test_a.py": 2.0, "test_c.py": 5.0}))
+    assert ci_local.main(GATE) == 0
+    assert json.loads(likely.history.read_text()) == json.loads(likely.full.read_text())
+
+
+def test_a_full_step_without_a_fresh_report_keeps_the_last_history(
+        likely, tmp_path, monkeypatch):
+    """A report not in cost_meter's shape, and one left in the tree by an
+    earlier run, both leave the host's last good history alone."""
+    likely.history.write_text(_report({"test_a.py": 3.0}))
+    before = likely.history.read_text()
+    assert ci_local.main(GATE) == 0  # the fake's {"run": ""}: not a report
+    assert likely.history.read_text() == before
+
+    stale = tmp_path / "r0" / "pytest-cost.json"
+    real = ci_local.run_step
+
+    def full_step_writes_nothing(step, dry_run=False):
+        if step.name == ci_local.PYTEST_STEP:
+            return 0
+        rc = real(step, dry_run=dry_run)
+        stale.write_text(_report({"stale.py": 1.0}))  # left before the full step
+        return rc
+
+    monkeypatch.setattr(ci_local, "run_step", full_step_writes_nothing)
+    assert ci_local.main(GATE) == 0
+    assert likely.history.read_text() == before
 
 
 # --------------------------------------------------------------------------

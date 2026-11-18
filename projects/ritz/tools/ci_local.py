@@ -88,6 +88,15 @@ checked per file only (RITZ_TEST_BUDGET_PARTIAL) and folded into the full
 step's (RITZ_COST_REPORT_INCLUDE), which is checked whole. `--no-likely-first`
 runs the steps exactly as declared.
 
+The pre-pass's start-up and tail (AGAST #3623). Its files go to pytest as
+`--only-file=` (ritz0/only_files.py), not as file arguments: pytest re-walks
+ritz0/ once per file argument, ~8 s of every worker's collection for 60 files.
+And they are handed out costliest first: the full step's cost report is kept
+at ~/.cache/ritz/pytest-file-cost.json ($RITZ_TEST_COST_HISTORY), and the next
+gate on the host orders its pre-pass by it, so a file of 13 s tests is not the
+tail seven idle workers wait on. No history (CI, a new host) keeps the
+selection's order.
+
 Diff-scoped ritz0 tests (AGAST #4027, Aaron 2026-11-18). `--diff-base <rev>`
 asks tools/ritz0_scope.py whether anything changed since <rev> can reach the
 "ritz0 unit tests" step, the longest in every gate. If nothing can (docs, .claude,
@@ -110,6 +119,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import json
 import os
 import re
 import shlex
@@ -322,6 +332,33 @@ def _with_addopts(step: Step, name: str, extra: list[str], env: dict[str, str]) 
                 llvm_bindir=step.llvm_bindir)
 
 
+def cost_history_path() -> Path:
+    """Where a gate keeps its full ritz0 step's cost report for the next gate
+    on this host (AGAST #3623): beside the artifact store, outside any tree."""
+    return Path(os.environ.get("RITZ_TEST_COST_HISTORY")
+                or Path.home() / ".cache" / "ritz" / "pytest-file-cost.json")
+
+
+def load_costs(report: Path) -> dict[str, float]:
+    """{file: CPU-s} from a cost_meter report; {} if there is none to read."""
+    try:
+        files = json.loads(report.read_text())["files"]
+        return {str(f): float(v["cpu_s"]) for f, v in files.items()}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return {}
+
+
+def keep_cost_history(report: Path) -> None:
+    """Save `report` as the next gate's cost history, if it is one."""
+    if not load_costs(report):
+        return
+    dst = cost_history_path()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
+    shutil.copyfile(report, tmp)
+    os.replace(tmp, dst)
+
+
 def plan_likely_first(steps: list[Step], skip: list[str]) -> tuple[list[Step], Step | None]:
     """(steps to run before the first step, the full pytest step to rewrite).
 
@@ -335,13 +372,24 @@ def plan_likely_first(steps: list[Step], skip: list[str]) -> tuple[list[Step], S
     if not files:
         print("likely failures first: no recently changed ritz0 test files")
         return [], None
+    history = cost_history_path()
+    costs = load_costs(history)
+    if costs:
+        files = likely_tests.costliest_first(files, costs)
+        order = (f"costliest first ({sum(f in costs for f in files)} of {len(files)} "
+                 f"file(s) costed by {history})")
+    else:
+        order = f"in selection order (no cost history at {history})"
     print(f"likely failures first: {len(files)} file(s) from tools/likely_tests.py, "
-          f"then the rest of {PYTEST_STEP!r} without them:")
+          f"{order}, then the rest of {PYTEST_STEP!r} without them:")
     for f in files:
         print(f"  {f}")
     early = [s for s in steps if s.name == PYTEST_PREREQ and s.name not in skip]
     early.append(_with_addopts(pytest_step, PYTEST_STEP + PREPASS_SUFFIX,
-                               ["--maxfail=1", *files],
+                               # AGAST #3623: not as file arguments, which
+                               # pytest collects at ~0.14 s per argument
+                               # per worker (ritz0/only_files.py).
+                               ["--maxfail=1", *(f"--only-file={f}" for f in files)],
                                {"RITZ_TEST_BUDGET_PARTIAL": "1"}))
     rest = _with_addopts(pytest_step, PYTEST_STEP,
                          [f"--ignore={f}" for f in files], {})
@@ -516,7 +564,18 @@ def main(argv: list[str] | None = None) -> int:
             continue
         if s.name in ran_early:
             continue
-        run(rest if rest is not None and s.name == PYTEST_STEP else s)
+        if s.name != PYTEST_STEP:
+            run(s)
+            continue
+        # AGAST #3623: its cost report orders the next gate's pre-pass.
+        report = cost_report_path(s)
+        src = (REPO_ROOT / s.workdir / report).resolve() \
+            if report and not args.dry_run else None
+        if src is not None:
+            src.unlink(missing_ok=True)  # an earlier run's is no measurement
+        run(rest if rest is not None else s)
+        if src is not None and src.is_file():
+            keep_cost_history(src)
     if include_dir:
         shutil.rmtree(include_dir, ignore_errors=True)
 

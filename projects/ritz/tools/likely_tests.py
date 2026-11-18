@@ -33,6 +33,10 @@ Serial files are left out: an `xdist_group` or `slow` file runs on one
 worker, one test at a time, so in a pre-pass it would be the tail the other
 workers wait on.  The full step schedules those first (ritz0/conftest.py).
 
+The selection is newest first; the pre-pass runs it costliest first
+(`costliest_first`, AGAST #3623), by the per-file CPU-s the host's last gate
+measured (tools/ci_local.py keeps that report).
+
     python3 tools/likely_tests.py             # print the selection
 """
 
@@ -85,6 +89,22 @@ def select(root: Path, commits: int = COMMITS, max_files: int = MAX_FILES) -> li
         if len(picked) >= max_files:
             break
     return picked
+
+
+def costliest_first(files: list[str], costs: dict[str, float]) -> list[str]:
+    """`files` in the order the pre-pass should hand them out (AGAST #3623).
+
+    xdist deals tests out in collection order, so a costly file near the end
+    of the list is the tail the other workers idle through: on 3428's gate,
+    test_interface_text.py (57.5 of 137.6 CPU-s, single tests of 13 s) sat
+    29th of 60 and its last tests ran 8 s after six workers had finished.
+    Files `costs` has never seen (new since the gate that measured it) lead,
+    in selection order: they are the likeliest to fail and of unknown cost.
+    The rest follow costliest first, ties in selection order.
+    """
+    new = [f for f in files if f not in costs]
+    known = sorted((f for f in files if f in costs), key=lambda f: -costs[f])
+    return new + known
 
 
 def main() -> int:
