@@ -54,7 +54,12 @@ done
 command -v curl >/dev/null || { echo "FAIL: curl not found" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
-SOCK="$TMP/zeus.sock"
+# zeus.sock gets its own dir under /tmp, not $TMPDIR: a gate's TMPDIR sits
+# deep in its worktree, and a socket path must fit sun_path's 107 bytes or
+# zeus's bind() fails, which shows here only as "zeus socket never appeared"
+# (AGAST #4135).
+SOCK_DIR="$(mktemp -d /tmp/rz_e2e_sock.XXXXXXXX)"
+SOCK="$SOCK_DIR/zeus.sock"
 PIDS=()
 
 # A port that refuses every connection for as long as we run: bound (so
@@ -68,7 +73,7 @@ read -r STORE_PORT <&"${DEAD[0]}"
 cleanup() {
     for p in "${PIDS[@]}"; do kill -9 "$p" 2>/dev/null; done
     wait 2>/dev/null
-    rm -rf "$TMP"
+    rm -rf "$TMP" "$SOCK_DIR"
 }
 trap cleanup EXIT
 

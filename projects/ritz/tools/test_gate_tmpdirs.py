@@ -14,6 +14,10 @@ example's test.sh, and the Makefile:
     every other gate running the same script, and a glob (`rm -f /tmp/*.ll`)
     deletes files other runs own.  Scratch comes from `mktemp -d`, which
     honours $TMPDIR and is unique.
+    The one exception is a unix socket dir (AGAST #4135): a socket path must
+    fit sun_path's 107 bytes, and a gate's TMPDIR sits deep in its worktree,
+    so `SOCK_DIR=$(mktemp -d /tmp/NAME.XXXXXXXX)` alone on its line, still
+    unique, still removed by the script's EXIT trap.
   * no recursive rm of a glob: cleanup removes the one dir a run made, by name.
   * every self-test's scratch dir is a `mktemp -d` and its EXIT trap removes
     that dir -- the only place it is removed.
@@ -41,6 +45,7 @@ SHARED_HOST_SCRATCH_SCRIPTS = [
     REPO / "bench" / "run.sh",
     REPO / "projects" / "mausoleum" / "tools" / "concurrent_test.sh",
     REPO / "projects" / "harland" / "tools" / "test_boot.sh",
+    REPO / "projects" / "nexus" / "test" / "e2e_large_page.sh",
 ]
 SHARED_HOST_SHELL = SHARED_HOST_SCRATCH_SCRIPTS + [
     RITZ / "ritz1" / "Makefile",
@@ -69,21 +74,30 @@ TMP_PATH = re.compile(r"(?<![\w$}./-])/tmp(?![\w.-])")
 RM_GLOB = re.compile(r"\brm\s+(?:-\w*\s+)*-\w*r\w*\b[^;&|]*\*")
 
 
+# The socket-dir exception: a whole line, a *SOCK_DIR variable, a unique
+# mktemp template under /tmp and nothing else (AGAST #4135).
+SOCK_DIR_MKTEMP = re.compile(
+    r'^\s*\w*SOCK_DIR=("?)\$\(mktemp -d /tmp/[\w.-]+\.X{8,}\)\1\s*$'
+)
+
+
 def tmp_violations(text: str):
     """[(line_no, line)] naming a literal /tmp path or rm -r'ing a glob."""
     return [
         (n, line.strip())
         for n, line in enumerate(text.splitlines(), 1)
-        if TMP_PATH.search(_code(line)) or RM_GLOB.search(_code(line))
+        if (TMP_PATH.search(_code(line)) and not SOCK_DIR_MKTEMP.match(_code(line)))
+        or RM_GLOB.search(_code(line))
     ]
 
 
-MKTEMP_VAR = re.compile(r"^\s*(\w+)=\$\(mktemp -d\b[^)]*\)", re.M)
+MKTEMP_VAR = re.compile(r"^\s*(\w+)=\"?\$\(mktemp -d\b[^)]*\)", re.M)
 TRAP_EXIT = re.compile(r"^\s*trap\s+(['\"]?)(.+?)\1\s+EXIT\s*$", re.M)
 
 
 def scratch_owned_by_trap(text: str) -> bool:
-    """True if the script's scratch is a `mktemp -d` whose EXIT trap removes it.
+    """True if the script's scratch is a `mktemp -d` whose EXIT trap removes it
+    -- every such dir, when it takes more than one (a socket dir, #4135).
 
     The trap is either inline (`trap 'rm -rf "$X"' EXIT`) or names a function
     whose body does the removal.  The last EXIT trap is the one in force.
@@ -95,7 +109,7 @@ def scratch_owned_by_trap(text: str) -> bool:
     action = traps[-1][1]
     fn = re.search(rf"^{re.escape(action)}\(\)\s*\{{(.*?)^\}}", text, re.M | re.S)
     body = fn.group(1) if fn else action
-    return any(re.search(rf'rm -rf "\${var}"', body) for var in made)
+    return all(re.search(rf"rm -rf [^\n]*\"\${var}\"", body) for var in made)
 
 
 # --- the detectors are red-capable --------------------------------------------
@@ -108,6 +122,9 @@ def scratch_owned_by_trap(text: str) -> bool:
     "\t@rm -f /tmp/*.ll /tmp/*.o",                 # glob of other runs' files
     'rm -rf "$TMPDIR"/tmp.*',                      # glob cleanup, no literal
     "x=$(mktemp -d /tmp/foo.XXXXXX)",              # template pins /tmp
+    "x=$(mktemp -d /tmp/foo.XXXXXXXX)",            # ...even for a socket, unless SOCK_DIR
+    "SOCK_DIR=/tmp/zeus_sock",                     # SOCK_DIR, but a fixed shared name
+    "SOCK_DIR=$(mktemp -d /tmp/s.XXXXXXXX); rm -f /tmp/x",  # exception covers one mktemp only
 ])
 def test_detector_flags(src):
     assert tmp_violations(src) != []
@@ -120,6 +137,7 @@ def test_detector_flags(src):
     "# a comment may say /tmp",
     'rm -rf "$sandbox"',
     "find . -name x -exec rm -rf {} +",
+    'SOCK_DIR="$(mktemp -d /tmp/rz_e2e_sock.XXXXXXXX)"',  # sun_path (#4135)
 ])
 def test_detector_passes(src):
     assert tmp_violations(src) == []
@@ -134,6 +152,10 @@ def test_trap_ownership_detector():
     assert not scratch_owned_by_trap('S=/tmp/selftest\ntrap \'rm -rf "$S"\' EXIT\n')
     assert not scratch_owned_by_trap('S=$(mktemp -d)\ntrap \'rm -rf "$OTHER"\' EXIT\n')
     assert not scratch_owned_by_trap('S=$(mktemp -d)\n')
+    # Every mktemp dir, quoted or not, must be removed (#4135).
+    two = 'S="$(mktemp -d)"\nK=$(mktemp -d /tmp/k.XXXXXXXX)\n'
+    assert scratch_owned_by_trap(two + 'trap \'rm -rf "$S" "$K"\' EXIT\n')
+    assert not scratch_owned_by_trap(two + 'trap \'rm -rf "$S"\' EXIT\n')
 
 
 # --- the rule, over what the gate actually runs ------------------------------

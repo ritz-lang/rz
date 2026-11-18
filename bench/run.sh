@@ -46,13 +46,17 @@ DRY_RUN=0                # if 1, report ports / orphans / cleanup and exit
 # (AGAST #3201).
 PORT_NAMES=(PORT_DIRECT PORT_STATIC PORT_PROXY PORT_PROXY_DB PORT_MAUSOLEUM)
 
-# Sockets, the mausoleum data dir, logs and wrk output all live in one
-# `mktemp -d`, removed by the EXIT trap (kept with --keep), so two rooms
-# benching on one host never share a path (AGAST #3183).
+# The mausoleum data dir, logs and wrk output live in one `mktemp -d`, and
+# the unix sockets in a second one, both removed by the EXIT trap (kept with
+# --keep), so two rooms benching on one host never share a path (AGAST #3183).
+# The socket dir is under /tmp, not $TMPDIR: a gate's TMPDIR sits deep in its
+# worktree, and a socket path must fit sun_path's 107 bytes or zeus's bind()
+# fails (AGAST #4135).
 T=$(mktemp -d)
-trap 'rm -rf "$T"' EXIT     # until cleanup() below takes over
-SOCK_PROXY="$T/zeus_bench_inmem.sock"
-SOCK_PROXY_DB="$T/zeus_bench_db.sock"
+SOCK_DIR=$(mktemp -d /tmp/rz_bench_sock.XXXXXXXX)
+trap 'rm -rf "$T" "$SOCK_DIR"' EXIT     # until cleanup() below takes over
+SOCK_PROXY="$SOCK_DIR/zeus_bench_inmem.sock"
+SOCK_PROXY_DB="$SOCK_DIR/zeus_bench_db.sock"
 
 DATA_DIR_M7M="$T/m7m_bench_data"
 LOG_DIR="$T/logs"
@@ -147,7 +151,7 @@ own_bench_pids() {
 cleanup() {
     if [[ "$KEEP" == "1" ]]; then
         echo "[bench] --keep: leaving servers running. PIDs: ${PIDS[*]}" >&2
-        echo "[bench] --keep: sockets, data and logs left in $T" >&2
+        echo "[bench] --keep: data and logs left in $T, sockets in $SOCK_DIR" >&2
         return
     fi
     # Only what this run started: the recorded PIDs and their children.
@@ -162,7 +166,7 @@ cleanup() {
             kill -9 "$pid" 2>/dev/null || true
         done
     fi
-    rm -rf "$T"
+    rm -rf "$T" "$SOCK_DIR"
 }
 trap cleanup EXIT
 
@@ -191,6 +195,8 @@ if [[ "$DRY_RUN" == "1" ]]; then
     for name in "${PORT_NAMES[@]}"; do
         echo "[bench] dry-run: port $name=${!name}" >&2
     done
+    echo "[bench] dry-run: socket SOCK_PROXY=$SOCK_PROXY" >&2
+    echo "[bench] dry-run: socket SOCK_PROXY_DB=$SOCK_PROXY_DB" >&2
     echo "[bench] dry-run: no orphaned bench binaries under $BUILD_DIR" >&2
     exit 0
 fi
