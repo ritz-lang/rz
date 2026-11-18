@@ -19,7 +19,8 @@ import io { enable_interrupts, disable_interrupts, halt_loop }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test }
 import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_configured }
 import net.ip { ip_get_gateway, ip_print_config }
-import net.icmp { icmp_ping }
+import net.icmp { icmp_ping, icmp_distinct_reply_count }
+import net.arp { arp_cache_lookup, arp_send_request }
 import loader.elf { test_elf_loader }
 import syscall.runtime.memory { munmap_self_test, mmap_failure_self_test }
 
@@ -268,6 +269,68 @@ pub fn postinit_self_tests(has_boot_info: bool)
 # Diagnostics (after SYSCALL setup)
 # ============================================================================
 
+# The TX burst: more frames than the NIC's 256-entry TX ring holds, sent in
+# back-to-back groups so several are in flight at once (AGAST #4073).
+const NET_TX_BURST: u32 = 300
+const NET_TX_BURST_GROUP: u32 = 4
+
+# Ping the gateway NET_TX_BURST times, NET_TX_BURST_GROUP requests at a time
+# with no wait between them, then poll for that group's replies. Logs
+#   [net] TX burst: sent=S/300 replies=R
+# S counts net_send successes: a driver that never reclaims used TX
+# descriptors runs out of them after 256 sends and fails the rest. R counts
+# distinct reply seqs: a driver that writes every frame into the same TX
+# buffer overwrites a group's earlier requests before the device reads them,
+# so their seqs never come back. tools/test_msix_boot.sh checks both.
+fn network_tx_burst()
+    let gateway: *u8 = ip_get_gateway()
+    var mac: [6]u8
+    var tries: i32 = 0
+    while arp_cache_lookup(gateway, @mac[0]) < 0 and tries < 50
+        arp_send_request(gateway)
+        var p: i32 = 0
+        while p < 100
+            net_poll()
+            p = p + 1
+        tries = tries + 1
+    if arp_cache_lookup(gateway, @mac[0]) < 0
+        prints("[net] TX burst: gateway never answered ARP\n")
+        return
+
+    let base: u32 = icmp_distinct_reply_count()
+    var sent: u32 = 0
+    var n: u32 = 0
+    while n < NET_TX_BURST
+        var g: u32 = 0
+        var group_sent: u32 = 0
+        while g < NET_TX_BURST_GROUP and n < NET_TX_BURST
+            if icmp_ping(gateway) == 0
+                group_sent = group_sent + 1
+            g = g + 1
+            n = n + 1
+        sent = sent + group_sent
+        # Wait (bounded) for this group's replies
+        var polls: i32 = 0
+        while icmp_distinct_reply_count() - base < sent and polls < 2000
+            net_poll()
+            var delay: i32 = 0
+            while delay < 2000
+                delay = delay + 1
+            polls = polls + 1
+    # Late replies
+    var tail: i32 = 0
+    while tail < 200
+        net_poll()
+        tail = tail + 1
+
+    prints("[net] TX burst: sent=")
+    serial_print_dec(sent as u64)
+    prints("/")
+    serial_print_dec(NET_TX_BURST as u64)
+    prints(" replies=")
+    serial_print_dec((icmp_distinct_reply_count() - base) as u64)
+    prints("\n")
+
 fn network_dhcp_ping()
     # Initialize network stack (includes VirtIO-net driver)
     prints("\n=== Initializing Network Stack ===\n")
@@ -319,6 +382,7 @@ fn network_dhcp_ping()
         if net_is_configured()
             prints("\n  Network configured!\n")
             ip_print_config()
+            network_tx_burst()
         else
             prints("\n  DHCP timeout (no response in test window)\n")
     else

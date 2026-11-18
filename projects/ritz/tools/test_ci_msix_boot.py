@@ -78,7 +78,8 @@ def interrupts(n: int) -> str:
 NET_MODERN = r"[virtio-net] Transport: modern (MMIO)\n"
 RX_CAPPED = r"[virtio-net] Queue 0: size=256 (device max 1024)\n"
 DHCP_OK = r"[dhcp] Configured!\n"
-MODERN_OK = NET_MODERN + RX_CAPPED + DHCP_OK
+TX_BURST_OK = r"[net] TX burst: sent=300/300 replies=300\n"
+MODERN_OK = NET_MODERN + RX_CAPPED + DHCP_OK + TX_BURST_OK
 
 
 PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + SUITE_PASSED
@@ -245,6 +246,25 @@ def test_boot_attaches_a_nic_on_user_net_and_an_nvme(tree):
 )
 def test_modern_nic_check_missing_fails(tree, drop, want):
     r = _run(tree, PASSED.replace(drop, ""))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
+
+
+@pytest.mark.parametrize(
+    "burst, want",
+    [
+        ("", "no TX burst result"),
+        # Every send past the 256 TX descriptors failed: none reclaimed
+        (r"[net] TX burst: sent=256/300 replies=256\n", "sent 256 of 300"),
+        # Too small a burst can't cross the ring
+        (r"[net] TX burst: sent=200/200 replies=200\n", "sent 200 of 200"),
+        # All sent, but frames overwritten in a shared TX buffer
+        (r"[net] TX burst: sent=300/300 replies=75\n", "75 distinct replies"),
+    ],
+    ids=["missing", "tx-ring-exhausted", "burst-too-small", "tx-buffer-reused"],
+)
+def test_tx_burst_check_fails(tree, burst, want):
+    r = _run(tree, PASSED.replace(TX_BURST_OK, burst))
     assert r.returncode == 1, r.stdout + r.stderr
     assert want in r.stdout
 
