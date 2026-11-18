@@ -59,11 +59,33 @@ const USER_STACK_BASE: u64 = 0x7FFFFFFEF000  # Lowest page of stack (TOP - 15*PA
 # Kernel-chosen mmaps bump a per-process cursor (FsProc.mmap_next, 0 = not
 # yet used = USER_MMAP_START), so every process's region starts at the same
 # address and one process's mappings don't move another's.
-fn mmap_cursor() -> u64
-    let next: u64 = fs_process_mmap_next()
-    if next == 0
-        return USER_MMAP_START
-    return next
+fn mmap_cursor(num_pages: u64) -> u64
+    return mmap_cursor_pick(fs_process_mmap_next(), num_pages)
+
+# The address a kernel-chosen mmap of num_pages uses, given the cursor value
+# next (0 = USER_MMAP_START). Takes the cursor as an argument so the boot
+# self-test can drive it without a process.
+#
+# The cursor only moves past the cursor's own mappings, so a MAP_FIXED (or
+# hint) mapping can sit ahead of it. vmm_map_page would overwrite such a
+# page's PTE and leak its page (#4142), so the range starts after the last
+# mapped page it would cover, until num_pages free pages in a row are found.
+# Each restart moves addr forward by at least a page. A range that runs past
+# USER_MMAP_END is returned as is: sys_mmap_impl's bounds check gives NoMem.
+fn mmap_cursor_pick(next: u64, num_pages: u64) -> u64
+    var addr: u64 = next
+    if addr == 0
+        addr = USER_MMAP_START
+    var i: u64 = 0
+    while i < num_pages
+        if addr >= USER_MMAP_END or num_pages > (USER_MMAP_END - addr) / PAGE_SIZE
+            return addr
+        if vmm_virt_to_phys(addr + i * PAGE_SIZE) != 0
+            addr = addr + (i + 1) * PAGE_SIZE
+            i = 0
+        else
+            i = i + 1
+    return addr
 
 # ============================================================================
 # User Stack Allocation Helper
@@ -208,7 +230,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         if fs_process_pid() == 0
             prints("[mmap] ERROR: no current process\n")
             return Errno.Srch as i64
-        map_addr = mmap_cursor()
+        map_addr = mmap_cursor(num_pages)
         kernel_chose = true
 
     # Validate address is in user mmap region
@@ -540,6 +562,70 @@ pub fn mmap_overlap_self_test() -> bool
         prints("  mmap overlap test FAILED: munmap did not give every page back\n")
         return false
     prints("  mmap overlap test PASSED!\n")
+    return true
+
+# ============================================================================
+# Boot self-test: the kernel-chosen cursor skips mapped pages (#4142)
+# ============================================================================
+#
+# The cursor (FsProc.mmap_next) only ever moves forward past the cursor's
+# own mappings, so a MAP_FIXED mapping ahead of it was once picked by a later
+# mmap(0, ...), its PTEs overwritten and its pages leaked. mmap_cursor_pick
+# must start the range after the last mapped page it would overlap.
+#
+# Runs after mmap_overlap_self_test, on the same terms: kernel PML4, no
+# process, interrupts off, nothing mapped under USER_MMAP_START. There is no
+# process, so the test passes cursor values to mmap_cursor_pick directly.
+# The live mapping is MMAP_CURSOR_LIVE pages, MMAP_CURSOR_GAP pages past
+# USER_MMAP_START:
+#   - a range that fits in the gap is placed at the cursor;
+#   - a range that would overlap the live pages starts just after them;
+#   - a cursor inside the live pages moves just past them;
+#   - cursor 0 means USER_MMAP_START.
+const MMAP_CURSOR_GAP: u64 = 2
+const MMAP_CURSOR_LIVE: u64 = 3
+
+# One case: true when mmap_cursor_pick(next, num_pages) is want.
+fn mmap_cursor_case(name: StrView, next: u64, num_pages: u64, want: u64) -> bool
+    let got: u64 = mmap_cursor_pick(next, num_pages)
+    if got == want
+        return true
+    prints("  mmap cursor test FAILED: ")
+    prints(name)
+    prints(": got 0x")
+    serial_print_hex(got)
+    prints(" want 0x")
+    serial_print_hex(want)
+    prints("\n")
+    return false
+
+# Returns true when every case picks a free range, false (after saying why)
+# if not.
+pub fn mmap_cursor_self_test() -> bool
+    prints("\nTesting the mmap cursor skips mapped pages...\n")
+    let fixed: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+    let prot: u64 = PROT_READ | PROT_WRITE
+    let start: u64 = USER_MMAP_START
+    let live: u64 = start + MMAP_CURSOR_GAP * PAGE_SIZE
+    let past: u64 = live + MMAP_CURSOR_LIVE * PAGE_SIZE
+    let live_len: u64 = MMAP_CURSOR_LIVE * PAGE_SIZE
+
+    if sys_mmap_impl(live, live_len, prot, fixed) != live as i64
+        prints("  mmap cursor test FAILED: mapping the live pages failed\n")
+        return false
+    var ok: bool = mmap_cursor_case("fits in the gap", start, MMAP_CURSOR_GAP, start)
+    if ok
+        ok = mmap_cursor_case("cursor 0", 0, MMAP_CURSOR_GAP, start)
+    if ok
+        ok = mmap_cursor_case("overlaps the live pages", start, MMAP_CURSOR_GAP + 1, past)
+    if ok
+        ok = mmap_cursor_case("cursor inside the live pages", live + PAGE_SIZE, 1, past)
+    if ok
+        ok = mmap_cursor_case("cursor past the live pages", past, 4, past)
+    sys_munmap_impl(live, live_len)
+    if not ok
+        return false
+    prints("  mmap cursor test PASSED!\n")
     return true
 
 # ============================================================================
