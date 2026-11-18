@@ -121,6 +121,7 @@ package files by paths relative to the package, never `../`.
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.fmt { fmt_i64_into }
 
 # ==== Helpers ====
 
@@ -148,23 +149,8 @@ fn util_exec(argv: **u8, stdin_content: *u8, stdin_len: i64,
     while *(prefix + i) != 0
         path_buf[i] = *(prefix + i)
         i += 1
-    let pid_self: i32 = sys_getpid()
-    var n: i32 = pid_self
-    var d_buf: [16]u8
-    var d_len: i32 = 0
-    if n == 0
-        d_buf[0] = '0'
-        d_len = 1
-    else
-        while n > 0
-            d_buf[d_len] = ((n % 10) + 48) as u8
-            n = n / 10
-            d_len += 1
-        var j: i32 = 0
-        while j < d_len
-            path_buf[i + j] = d_buf[d_len - 1 - j]
-            j += 1
-        i += d_len
+    # The pid's digits via ritzlib.fmt, not a hand-rolled digit loop.
+    i += fmt_i64_into(@path_buf[i], sys_getpid() as i64)
     path_buf[i] = 0
 
     # 2. Write stdin to temp file

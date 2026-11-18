@@ -168,6 +168,9 @@ expect "TE gzip is 501" "$OUT" "^HTTP/1.1 501 "
 echo "=== Test 5: Content-Length body split across writes ==="
 OUT="$(client 'POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 11\r\n\r\nhel' 'lo w' 'orld')"
 expect "split CL body" "$OUT" "^HTTP/1.1 200 " "^11 hello world"
+# The length prefix's smallest value (AGAST #4118: digits via ritzlib.fmt).
+OUT="$(client 'POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 0\r\n\r\n')"
+expect "empty CL body" "$OUT" "^HTTP/1.1 200 " "^0 $"
 
 echo "=== Test 6: chunked body split across writes ==="
 OUT="$(client 'POST /echo HTTP/1.1\r\nHost: x\r\nConnection: close\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhel' 'lo\r\n6;x=y\r\n world\r' '\n0\r\n' 'Trailer: t\r\n\r\n')"
