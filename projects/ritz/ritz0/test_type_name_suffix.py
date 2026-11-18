@@ -4,8 +4,9 @@ AGAST #2742: `_type_to_name_suffix` named NamedType, PtrType and TupleType
 and fell back to `str(ty)` for everything else. `str(ty)` embeds the source
 span, so `Box2<fn(i32) -> i32>` written at two places gave two struct names
 for one type (the #1321 defect, in a different set of types). It also spelled
-`*mut T` as `ptr_T`, while `mangle_type_name` spells `ptrmut_T`, so one type
-had two names depending on which path named it.
+`*mut T` as `ptr_T`, while `mangle_type_name` spelled `ptrmut_T`, so one type
+had two names depending on which path named it.  Both now spell it `ptr_T`:
+`*mut T` is another spelling of `*T` (LARB R74, AGAST #3959).
 
 The suffix now matches `mangle_type_name` for every Type node, except that a
 generic NamedType nested inside keeps the emitter's `Base$args` spelling
@@ -66,9 +67,20 @@ def test_suffix_has_no_span(ty):
 
 
 @pytest.mark.unit
-def test_ptr_mutability_is_spelled():
-    assert suffix(rast.PtrType(None, U8, True)) != suffix(
-        rast.PtrType(None, U8, False))
+def test_ptr_mutability_is_not_spelled():
+    # LARB R74 (AGAST #3959): `*mut T` and `*T` are one type, one name.
+    assert suffix(rast.PtrType(None, U8, True)) == suffix(
+        rast.PtrType(None, U8, False)) == "ptr_u8"
+
+
+@pytest.mark.unit
+def test_import_dedup_treats_mut_ptr_as_ptr():
+    # A struct reached through two imports with `*mut T` in one and `*T` in
+    # the other is one definition, not a conflict (LARB R74, AGAST #3959).
+    from import_resolver import ImportResolver
+    eq = ImportResolver(use_cache=False)._types_equal
+    assert eq(rast.PtrType(None, U8, True), rast.PtrType(None, U8, False))
+    assert not eq(rast.PtrType(None, U8, True), rast.PtrType(None, I32, True))
 
 
 @pytest.mark.unit
@@ -154,8 +166,8 @@ def test_fn_type_option_at_two_spans_one_enum(tmp_path):
     assert '"Option$fn1_i32_ret_i32"' in ll
 
 
-# `Span<*mut u8>` is named by the emitter; it must spell the mutability the
-# way the monomorphizer does (`ptrmut_`), not collapse it into `ptr_`.
+# `Span<*mut u8>` is named by the emitter; it must spell it as the
+# monomorphizer does, and `*mut u8` is `*u8` (LARB R74, AGAST #3959).
 MUT_PTR_SPAN = """\
 fn first(s: Span<*mut u8>) -> i64
     s.len
@@ -166,7 +178,7 @@ fn main() -> i32
 
 
 @pytest.mark.integration
-def test_mut_ptr_span_spells_ptrmut(tmp_path):
+def test_mut_ptr_span_is_the_ptr_span(tmp_path):
     ll = _compile(tmp_path, MUT_PTR_SPAN)
-    assert '"Span$ptrmut_u8"' in ll
-    assert '"Span$ptr_u8"' not in ll
+    assert '"Span$ptr_u8"' in ll
+    assert "ptrmut" not in ll

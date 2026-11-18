@@ -1299,7 +1299,8 @@ class ImportResolver:
         if isinstance(a, rast.NamedType):
             return a.name == b.name
         if isinstance(a, rast.PtrType):
-            return a.mutable == b.mutable and self._types_equal(a.inner, b.inner)
+            # `*mut T` is another spelling of `*T` (LARB R74, AGAST #3959).
+            return self._types_equal(a.inner, b.inner)
         if isinstance(a, rast.RefType):
             return a.mutable == b.mutable and self._types_equal(a.inner, b.inner)
         if isinstance(a, rast.ArrayType):

@@ -21,9 +21,10 @@ class TestMangling:
         assert mangle_type_name(ty) == "ptr_u8"
 
     def test_mangle_ptr_mut_type(self):
+        # `*mut T` is a spelling of `*T` (LARB R74, AGAST #3959).
         inner = rast.NamedType(None, "i32", [])
         ty = rast.PtrType(None, inner, True)
-        assert mangle_type_name(ty) == "ptrmut_i32"
+        assert mangle_type_name(ty) == "ptr_i32"
 
     def test_mangle_generic_name_single(self):
         type_args = [rast.NamedType(None, "i32", [])]

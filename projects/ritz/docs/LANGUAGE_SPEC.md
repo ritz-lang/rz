@@ -640,7 +640,7 @@ let d: f64 = 2.718281828
 | Form | Meaning |
 |------|---------|
 | `*T` | Raw pointer to `T` |
-| `*mut T` | Raw mutable pointer to `T` |
+| `*mut T` | The same type as `*T`, spelled differently: a write through `*T` is already allowed, so `Vec<*mut i32>` is `Vec<*i32>` (LARB R74) |
 | `@T` | Immutable reference to `T` |
 | `@&T` | Mutable reference to `T` |
 | `name:& T` | Mutable-borrow parameter: `name` is the caller's place, of type `T` (§13.4) |

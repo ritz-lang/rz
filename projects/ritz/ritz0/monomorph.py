@@ -205,7 +205,7 @@ def mangle_type_name(ty: rast.Type) -> str:
     Examples:
         i32 -> "i32"
         *u8 -> "ptr_u8"
-        *mut i32 -> "ptrmut_i32"
+        *mut i32 -> "ptr_i32" (LARB R74: `*mut T` is a spelling of `*T`)
         Vec<i32> -> "Vec_i32"
     """
     ty = resolve_alias(ty)
@@ -215,8 +215,8 @@ def mangle_type_name(ty: rast.Type) -> str:
             return f"{ty.name}_{arg_names}"
         return ty.name
     elif isinstance(ty, rast.PtrType):
-        if ty.mutable:
-            return f"ptrmut_{mangle_type_name(ty.inner)}"
+        # `*mut T` is another spelling of `*T` (LARB R74, AGAST #3959): one
+        # type, so one mangled name and one instance.
         return f"ptr_{mangle_type_name(ty.inner)}"
     elif isinstance(ty, rast.RefType):
         if ty.mutable:
@@ -1828,10 +1828,6 @@ class Monomorphizer:
                 inner_name = key[4:]
                 inner = rast.NamedType(None, inner_name, [])
                 result.append(rast.PtrType(None, inner, False))
-            elif key.startswith("ptrmut_"):
-                inner_name = key[7:]
-                inner = rast.NamedType(None, inner_name, [])
-                result.append(rast.PtrType(None, inner, True))
             # Handle reference types
             elif key.startswith("ref_"):
                 inner_name = key[4:]

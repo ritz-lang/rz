@@ -16980,8 +16980,8 @@ class LLVMEmitter:
                 return self._get_specialized_type_name(ty)
             return ty.name
         elif isinstance(ty, rast.PtrType):
-            # `*mut T` and `*T` are distinct types (AGAST #2742).
-            return ("ptrmut_" if ty.mutable else "ptr_") + suffix(ty.inner)
+            # `*mut T` is another spelling of `*T` (LARB R74, AGAST #3959).
+            return "ptr_" + suffix(ty.inner)
         elif isinstance(ty, rast.RefType):
             return ("refmut_" if ty.mutable else "ref_") + suffix(ty.inner)
         elif isinstance(ty, rast.ArrayType):
