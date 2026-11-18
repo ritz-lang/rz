@@ -14,6 +14,14 @@ same located error.
 The accepted half is load-bearing: it is run, not only compiled, so rejecting
 everything fails it, and so does a value whose type a compiler lost. ritz1 keeps a
 bool local in an i64 slot, so losing track of one reads as an integer condition.
+
+The matrices are table rows (AGAST #4141): each row is under the id its
+parametrised case had less the compiler (`a_mixed_bool_is_a_located_error[if_int]`,
+`bool_used_as_bool_compiles_and_runs[bool_local]`, `ritz0_only_bool_shapes[...]`,
+the last on ritz0 only), checked 64 at a time per compiler, and a failure names
+every failing row.  The run rows go through table_rows' batch; the refusal rows
+are each compiled alone, as their cases were, since a batch can't say a
+diagnostic is the only one or that no IR was written.
 """
 
 import os
@@ -24,9 +32,11 @@ from pathlib import Path
 import pytest
 
 import fast_link
+import test_table_rows as table_rows
 
 from no_effect import no_effect_message
 from ritz0_inproc import run_ritz0
+from test_table_rows import Refused, Row, Run, Whole
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -385,25 +395,6 @@ RITZ0_ONLY_ACCEPTED = {
 }
 
 
-def _compile(request, compiler, tmp_path, source, extra=None):
-    src = tmp_path / "unit.ritz"
-    src.write_text(source)
-    for name, text in (extra or {}).items():
-        (tmp_path / name).write_text(text)
-    ll = tmp_path / "unit.ll"
-    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{tmp_path}")
-    if compiler == "ritz0":
-        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
-    else:
-        request.getfixturevalue("ritz1_bin")
-        binary = RITZ1_BUILD / compiler
-        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
-                              env=env, capture_output=True, text=True, timeout=300)
-    return proc, ll
-
-
 # A discarded `if`/`match` arm has no value (LARB R69), so there is no mix to
 # judge: a literal arm alone has no effect, and ritz0 says so first (LARB R64,
 # AGAST #3491).  ritz1 keeps #2046's words until it has R64 too (#3492).
@@ -413,39 +404,113 @@ NO_EFFECT_ARMS = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(REJECTED))
-def test_a_mixed_bool_is_a_located_error(request, tmp_path, compiler, name):
-    source, line, col, message = REJECTED[name]
-    if compiler == "ritz0" and name in NO_EFFECT_ARMS:
-        line, col, message = NO_EFFECT_ARMS[name]
-    proc, ll = _compile(request, compiler, tmp_path, source)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
-    hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(message)}$", out, re.M)
-    assert len(hits) == 1, f"{compiler}, {name}: want one {message!r}:\n{out[-1500:]}"
-    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+def _refusal_rows():
+    """Every row under the id its parametrised test had, less the compiler; a
+    NO_EFFECT_ARMS row is two, ritz0's expecting R64's words."""
+    for name, (source, line, col, message) in sorted(REJECTED.items()):
+        rid = f"a_mixed_bool_is_a_located_error[{name}]"
+        if name not in NO_EFFECT_ARMS:
+            yield Row(rid, tuple(COMPILERS), Refused(source, Whole(message), at=(line, col)))
+            continue
+        r0_line, r0_col, r0_message = NO_EFFECT_ARMS[name]
+        yield Row(rid, ("ritz0",), Refused(source, Whole(r0_message), at=(r0_line, r0_col)))
+        yield Row(rid, tuple(c for c in COMPILERS if c != "ritz0"),
+                  Refused(source, Whole(message), at=(line, col)))
 
 
-def _assert_runs(request, compiler, tmp_path, name, source, code, extra=None):
-    proc, ll = _compile(request, compiler, tmp_path, source, extra)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode == 0 and ll.exists(), f"{compiler}, {name}:\n{out[-1500:]}"
-    exe = tmp_path / "unit"
+REFUSAL_ROWS = list(_refusal_rows())
+RUN_ROWS = ([Row(f"bool_used_as_bool_compiles_and_runs[{name}]", tuple(COMPILERS), Run(*ACCEPTED[name][:2]))
+             for name in sorted(ACCEPTED)]
+            + [Row(f"ritz0_only_bool_shapes[{name}]", ("ritz0",), Run(*RITZ0_ONLY_ACCEPTED[name][:2]))
+               for name in sorted(RITZ0_ONLY_ACCEPTED)])
+# The modules a run row imports from beside it: written next to every program.
+EXTRA = {file: text for table in (ACCEPTED, RITZ0_ONLY_ACCEPTED) for row in table.values()
+         for file, text in (row[2] if len(row) > 2 else {}).items()}
+
+
+def _emit(compiler, src, ll, work):
+    for name, text in EXTRA.items():
+        (work / name).write_text(text)
+    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{work}")
+    if compiler == "ritz0":
+        return run_ritz0([str(src), "-o", str(ll)], cwd=work, env=env, timeout=300)
+    binary = RITZ1_BUILD / compiler
+    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    return subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=work,
+                          env=env, capture_output=True, text=True, timeout=300)
+
+
+def _compile(request, compiler, tmp_path, source):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    src = tmp_path / "unit.ritz"
+    src.write_text(source)
+    ll = tmp_path / "unit.ll"
+    return _emit(compiler, src, ll, tmp_path), ll
+
+
+def _batch_compile(compiler, src, work):
+    """table_rows' `compile`: the module goes to work/<stem>.ll."""
+    proc = _emit(compiler, src, src.with_suffix(".ll"), work)
+    return proc.returncode, proc.stdout + proc.stderr
+
+
+def _batch_build(compiler, src, work):
+    """table_rows' `build`: compile and link as each row once was."""
+    ll = src.with_suffix(".ll")
+    proc = _emit(compiler, src, ll, work)
+    if proc.returncode != 0 or not ll.exists():
+        return False, proc.stdout + proc.stderr, None
+    exe = work / src.stem
     link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
     if compiler != "ritz0":
         link.insert(2, str(RITZ_START))
-    built = fast_link.clang(link, cwd=tmp_path, capture_output=True, text=True)
-    assert built.returncode == 0, f"{compiler}, {name}: link:\n{built.stderr[-1500:]}"
-    assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
+    built = fast_link.clang(link, cwd=work, capture_output=True, text=True)
+    return built.returncode == 0, built.stderr, exe
+
+
+def _refusal_wrong(request, compiler, work, row):
+    """What's wrong with how `compiler` refuses `row`, or None: refused, the one
+    diagnostic at its line:col is its whole message, and no IR written."""
+    proc, ll = _compile(request, compiler, work, row.spec.program)
+    out = proc.stdout + proc.stderr
+    if proc.returncode == 0:
+        return f"accepted it:\n{out[-1500:]}"
+    line, col = row.spec.at
+    message = row.spec.message
+    hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(message)}$", out, re.M)
+    if len(hits) != 1:
+        return f"want one {message!r} at unit.ritz:{line}:{col}, got {len(hits)}:\n{out[-1500:]}"
+    if ll.exists():
+        return "wrote IR"
+    return None
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ACCEPTED))
-def test_bool_used_as_bool_compiles_and_runs(request, tmp_path, compiler, name):
-    _assert_runs(request, compiler, tmp_path, name, *ACCEPTED[name])
+@pytest.mark.parametrize("compiler,index", table_rows.chunks(REFUSAL_ROWS, COMPILERS))
+def test_a_mixed_bool_is_a_located_error(request, tmp_path, compiler, index):
+    """Each row compiled on its own, as its case was: the batch can't say a
+    diagnostic is the only one there, or that no IR was written."""
+    rows = table_rows.chunk(REFUSAL_ROWS, compiler, index)
+    failures = []
+    for k, row in enumerate(rows):
+        work = tmp_path / str(k)
+        work.mkdir()
+        why = _refusal_wrong(request, compiler, work, row)
+        if why:
+            failures.append((row.id, f"{compiler} {row.id}: {why}"))
+    table_rows._assert_none(compiler, failures, len(rows))
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,index", table_rows.chunks(RUN_ROWS, COMPILERS))
+def test_bool_used_as_bool_compiles_and_runs(request, tmp_path, compiler, index):
+    """Every run row, and on ritz0 the ritz0_only_bool_shapes rows too."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    table_rows.assert_rows(compiler, table_rows.chunk(RUN_ROWS, compiler, index),
+                           build=_batch_build, compile=_batch_compile, work=tmp_path)
 
 
 @pytest.mark.integration
@@ -460,12 +525,6 @@ def test_a_bool_global_is_one_byte(request, tmp_path, compiler):
     assert proc.returncode == 0 and ll.exists(), (proc.stdout + proc.stderr)[-1500:]
     decl = re.search(r'^@"?g"? = .*$', ll.read_text(), re.MULTILINE)
     assert decl and re.search(r"\bglobal i1\b", decl.group(0)), decl and decl.group(0)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ0_ONLY_ACCEPTED))
-def test_ritz0_only_bool_shapes(request, tmp_path, name):
-    _assert_runs(request, "ritz0", tmp_path, name, *RITZ0_ONLY_ACCEPTED[name])
 
 
 @pytest.mark.integration

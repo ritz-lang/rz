@@ -14,6 +14,14 @@ error wherever it is, and a non-literal array element narrows only under section
 Every table goes through ritz0, ritz1 and ritz1_selfhosted, which must give the
 same located error. The accepted half is run, not only compiled, so rejecting
 everything fails it, and so does a literal handed over as a `{ ptr, len }` pair.
+
+The matrices are table rows (AGAST #4141): `test_every_row[<compiler>-<chunk>]`
+checks REJECTED and ACCEPTED with test_table_rows' assert_rows, each row under
+the id its parametrised test had less the compiler
+(`test_what_does_not_fit_is_a_located_error[strview_let-ritz0]` is
+`what_does_not_fit_is_a_located_error[strview_let]` on ritz0), and a failure
+names its rows.  `test_check_types_rows` does the same for the two
+`--check-types` lists (`check_types_takes_a_literal_in_a_pointer_slot[let]`).
 """
 
 import os
@@ -25,7 +33,9 @@ import pytest
 
 import batching
 import fast_link
+import test_table_rows as table_rows
 from ritz0_inproc import run_ritz0
+from test_table_rows import Refused, Row, Run
 
 # AGAST #2806: each test's rows share one compile per compiler (batching.py).
 pytestmark = pytest.mark.batched
@@ -471,8 +481,9 @@ def _link_cmd(compiler, ll, exe):
 
 
 def _batch_build(compiler, src, work):
-    """batching.run's `build`: compile and link a batch the way `_assert_runs` does a row."""
-    ll = work / "unit.ll"
+    """batching's `build`: compile and link a batch the way `_assert_runs` does a row,
+    its module `work/<src's stem>.ll`."""
+    ll = work / Path(src).with_suffix(".ll").name
     proc = _emit(compiler, src, ll, work, f"{RITZ_ROOT}:{work}")
     if proc.returncode != 0 or not ll.exists():
         return False, proc.stdout + proc.stderr, None
@@ -482,7 +493,7 @@ def _batch_build(compiler, src, work):
 
 
 def _batch_compile(compiler, src, work):
-    proc = _emit(compiler, src, work / "unit.ll", work, f"{RITZ_ROOT}:{work}")
+    proc = _emit(compiler, src, work / Path(src).with_suffix(".ll").name, work, f"{RITZ_ROOT}:{work}")
     return proc.returncode, proc.stdout + proc.stderr
 
 
@@ -526,17 +537,37 @@ SEMA_FIRST = {
 }
 
 
+def _rejected_rows():
+    """REJECTED as rows, each where it's refused: SEMA_FIRST's on the ritz1s."""
+    for name in sorted(REJECTED):
+        source, line, col, message = REJECTED[name]
+        rid = f"what_does_not_fit_is_a_located_error[{name}]"
+        # The prelude is a line: the row's location is a line on.
+        if name in SEMA_FIRST:
+            yield Row(rid, ("ritz0",), Refused(_PRELUDE + source, message, at=(line + 1, col)))
+            line, col, message = SEMA_FIRST[name]
+            yield Row(rid, COMPILERS[1:], Refused(_PRELUDE + source, message, at=(line + 1, col)))
+        else:
+            yield Row(rid, COMPILERS, Refused(_PRELUDE + source, message, at=(line + 1, col)))
+
+
+# Every REJECTED and ACCEPTED row, checked a chunk at a time per compiler.
+ROWS = list(_rejected_rows()) + [
+    Row(f"what_fits_compiles_and_runs[{name}]", COMPILERS, Run(_PRELUDE + ACCEPTED[name][0],
+                                                                ACCEPTED[name][1]))
+    for name in sorted(ACCEPTED)]
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(REJECTED))
-def test_what_does_not_fit_is_a_located_error(request, tmp_path, compiler, name):
-    source, line, col, message = REJECTED[name]
-    if compiler != "ritz0" and name in SEMA_FIRST:
-        line, col, message = SEMA_FIRST[name]
-    code, output, where = _refusal(request, compiler, tmp_path, source, line, col)
-    assert code != 0, f"{compiler} accepted it:\n{output}"
-    assert message in output, output
-    assert re.search(rf"unit\.ritz:{where}\b", output), output
+@pytest.mark.parametrize("compiler,chunk", table_rows.chunks(ROWS),
+                         ids=[f"{c}-{i}" for c, i in table_rows.chunks(ROWS)])
+def test_every_row(request, tmp_path, compiler, chunk):
+    """Each REJECTED row is refused with its message at its line:col, and each
+    ACCEPTED row compiles, links and exits its code."""
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    table_rows.assert_rows(compiler, table_rows.chunk(ROWS, compiler, chunk),
+                           build=_batch_build, compile=_batch_compile, work=tmp_path)
 
 
 @pytest.mark.integration
@@ -548,14 +579,6 @@ def test_a_strview_is_refused_without_its_import(request, tmp_path, compiler, na
     assert code != 0, f"{compiler} accepted it:\n{output}"
     assert message in output, output
     assert re.search(rf"unit\.ritz:{where}\b", output), output
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ACCEPTED))
-def test_what_fits_compiles_and_runs(request, tmp_path, compiler, name):
-    source, code = ACCEPTED[name]
-    _assert_runs(request, compiler, tmp_path, name, source, code)
 
 
 @pytest.mark.integration
@@ -580,21 +603,33 @@ def _check_types(tmp_path, source):
                      cwd=tmp_path, env=env, timeout=300)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", CHECKED_ACCEPTED)
-def test_check_types_takes_a_literal_in_a_pointer_slot(tmp_path, name):
-    proc = _check_types(tmp_path, ACCEPTED[name][0])
-    assert proc.returncode == 0, proc.stdout + proc.stderr
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", CHECKED_REJECTED)
-def test_check_types_refuses_a_non_literal_in_a_pointer_slot(tmp_path, name):
-    proc = _check_types(tmp_path, REJECTED[name][0])
+def _check_types_wrong(here, accepted, name):
+    """Why `--check-types` gets the row wrong, or None."""
+    here.mkdir()
+    if accepted:
+        proc = _check_types(here, ACCEPTED[name][0])
+        output = proc.stdout + proc.stderr
+        return None if proc.returncode == 0 else f"want it accepted, got:\n{output[-800:]}"
+    proc = _check_types(here, REJECTED[name][0])
     output = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "*u8" in output, output
+    if proc.returncode == 0 or "*u8" not in output:
+        return f"want it refused naming `*u8`, got:\n{output[-800:]}"
     # The checker's own words: the emitter would have refused it anyway.
-    assert "is not a `*u8`" not in output, output
+    if "is not a `*u8`" in output:
+        return f"want the checker's words, not the emitter's, got:\n{output[-800:]}"
+    return None
+
+
+@pytest.mark.integration
+def test_check_types_rows(tmp_path):
+    """A literal in a pointer slot passes `--check-types`; a non-literal is
+    refused in the checker's own words.  Every failing row is named."""
+    rows = ([(f"check_types_takes_a_literal_in_a_pointer_slot[{n}]", True, n) for n in CHECKED_ACCEPTED]
+            + [(f"check_types_refuses_a_non_literal_in_a_pointer_slot[{n}]", False, n)
+               for n in CHECKED_REJECTED])
+    failures = [(rid, f"ritz0 {rid}: {why}") for k, (rid, accepted, name) in enumerate(rows)
+                for why in [_check_types_wrong(tmp_path / str(k), accepted, name)] if why]
+    table_rows._assert_none("ritz0", failures, len(rows))
 
 
 @pytest.mark.integration

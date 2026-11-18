@@ -159,9 +159,8 @@ def test_real_budget_file_loads_and_every_override_names_a_ticket():
 # Collected by `pytest --collect-only -q` under ritz0 once #3517-#3521 had
 # collapsed the eight matrix files (AGAST #3557, at 2c597655): 39,126 -> 29,700.
 # AGAST #3889 collapsed 18 more: 31,171 -> 26,329 (counted on 8eddf0d6).
-# AGAST #4141's temporary raise to 28,500: 27,647 collected on 923ab16f; back
-# to 26,329 / 27,700 when #4141's collapse lands.
-COLLECTED_AT_LAST_CAP = 27_647
+# AGAST #4141 collapsed 7 more, 28,269 -> 24,431 (267f9e0b), under the same 27,700 cap.
+COLLECTED_AT_LAST_CAP = 26_329
 
 
 @pytest.mark.unit

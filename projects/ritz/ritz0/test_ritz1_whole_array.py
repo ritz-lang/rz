@@ -29,6 +29,16 @@ rule at every store.
 Sizes matter: a `[2]i32` fits the 8 bytes that were copied, so the grid below
 runs each route at sizes that fit and at sizes that don't.  ritz0 is the oracle
 for every program.
+
+The matrices are table rows (AGAST #4141): `test_every_row[<compiler>-<chunk>]`
+checks TABLE with test_table_rows' assert_rows, ~64 rows a chunk (_size), each row under
+the id its parametrised test had less the compiler: `test_grid_ritz0[a-b-2]` and
+`test_grid_ritz1[a-b-2]` are row `grid[a-b-2]` on each, `test_ritz0_refuses[x]`
+and `test_ritz1_refuses[x]` are `refuses[x]`, `test_ritz1_matches_ritz0[x]` is
+`matches_ritz0[x]` and `test_ritz1_refusal_names_the_argument[x]` is
+`refusal_names_the_argument[x]`.  A failure names each row that failed.  A
+matches_ritz0 row wants ritz0's answer (ANSWERS) on both compilers, so ritz1
+still has to give ritz0's.
 """
 
 import os
@@ -38,11 +48,12 @@ import subprocess
 import pytest
 
 import batching
+import test_table_rows as table_rows
 from ritz0_inproc import run_ritz0
-from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _run
+from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _batch_build, _batch_compile, _run
+from test_table_rows import Prefix, Refused, Row, Run
 
-# AGAST #2806: each test's rows share one compile per compiler (batching.py).
-pytestmark = pytest.mark.batched
+COMPILERS = ("ritz0", "ritz1")
 
 
 def _ints(values):
@@ -199,16 +210,8 @@ def _grid_id(case):
     return f"{route}-{elem.replace('*', 'p')}-{size}"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("case", GRID, ids=_grid_id)
-def test_grid_ritz0(tmp_path, case):
-    assert _run("ritz0", tmp_path, "g", _program(*case)) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("case", GRID, ids=_grid_id)
-def test_grid_ritz1(ritz1_bin, tmp_path, case):
-    assert _run("ritz1", tmp_path, "g", _program(*case)) == 3
+# Each route, element and size exits 3 on both.
+GRID_ROWS = [Row(f"grid[{_grid_id(case)}]", COMPILERS, Run(_program(*case), 3)) for case in GRID]
 
 
 # Every program here is one ritz0 compiles; ritz1 has to give the same exit code.
@@ -2222,7 +2225,6 @@ pub fn main() -> i32
 
 
 def _compile(compiler, ritz1_bin, tmp_path, name, program):
-    batching.per_row()  # AGAST #2806
     src = tmp_path / f"{name}_{compiler}.ritz"
     src.write_text(program)
     ll = tmp_path / f"{name}_{compiler}.ll"
@@ -2235,11 +2237,17 @@ def _compile(compiler, ritz1_bin, tmp_path, name, program):
     return comp, ll
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(CASES))
-def test_ritz1_matches_ritz0(ritz1_bin, tmp_path, name):
-    want = _run("ritz0", tmp_path, name, CASES[name])
-    assert _run("ritz1", tmp_path, name, CASES[name]) == want
+# ritz0's exit code for each of CASES, the oracle: 3 unless it's here.  A row
+# wants it on both compilers, so ritz1 has to give ritz0's answer.
+ANSWERS = {
+    "arg_many": 10, "arg_mutate_callee": 93, "drop_arg": 22, "generic_local_and_struct": 43,
+    "if_method_tail_chain": 57, "if_targets": 82, "ptr_arith_field_global_value": 33,
+    "ret_struct_elem": 7, "span_field": 7, "span_let_global_field": 177, "strview_reads": 36,
+}
+assert set(ANSWERS) <= set(CASES)
+
+MATCH_ROWS = [Row(f"matches_ritz0[{name}]", COMPILERS, Run(CASES[name], ANSWERS.get(name, 3)))
+              for name in sorted(CASES)]
 
 
 def _gap_params():
@@ -2481,11 +2489,10 @@ def test_ritz1_return_abi_is_ritz0s(ritz1_bin, tmp_path):
     assert _ret_spellings(ll1.read_text()) == want
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(REJECTED))
-def test_ritz0_refuses(tmp_path, name):
-    comp, _ = _compile("ritz0", None, tmp_path, name, REJECTED[name])
-    assert comp.returncode != 0
+# ritz0 refuses each of REJECTED; ritz1 too, saying "error" and writing no .ll
+# (_compile_no_ll).
+REFUSAL_ROWS = [Row(f"refuses[{name}]", (compiler,), Refused(REJECTED[name], want, located=False))
+                for name in sorted(REJECTED) for compiler, want in (("ritz0", None), ("ritz1", "error"))]
 
 
 # A later check would refuse most of these too, without saying where or why.
@@ -2505,22 +2512,55 @@ LOCATED = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(LOCATED))
-def test_ritz1_refusal_names_the_argument(ritz1_bin, tmp_path, name):
-    comp, _ = _compile("ritz1", ritz1_bin, tmp_path, name, REJECTED[name])
-    out = comp.stdout + comp.stderr
-    assert re.search(r"\.ritz:\d+:\d+: error: argument 1 of `g` has the wrong type: ", out), out
-    assert LOCATED[name] in out
+# ritz1 only: a located diagnostic that starts with the argument and says why,
+# printed as an `error:` (AGAST #3621; _compile_no_ll hides one that isn't).
+ARGUMENT_ROWS = [Row(f"refusal_names_the_argument[{name}]", ("ritz1",),
+                     Refused(REJECTED[name], Prefix(f"argument 1 of `g` has the wrong type: {LOCATED[name]}")))
+                 for name in sorted(LOCATED)]
+
+
+def _compile_no_ll(compiler, src, work):
+    """_batch_compile, but a ritz1 refusal that still wrote its .ll loses its
+    "error"s and `main.ritz:` locations, so no refusal row is answered by it;
+    nor is an ARGUMENT_ROWS row by a ritz1 argument diagnostic with no
+    `error: ` label (the table's diagnostic match takes the label as optional)."""
+    code, out = _batch_compile(compiler, src, work)
+    if compiler == "ritz1":
+        out = re.sub(r"(main\.ritz:\d+:\d+: )(argument 1 of `g`)", r"\1[no error: label] \2", out)
+    if compiler != "ritz0" and code != 0 and (work / "main.ll").exists():
+        return code, "[wrote main.ll as it refused: nothing counts]\n" + re.sub(
+            "error", "e-rror", out).replace("main.ritz:", "main.ritz?")
+    return code, out
+
+
+TABLE = GRID_ROWS + MATCH_ROWS + REFUSAL_ROWS + ARGUMENT_ROWS
+for _c in COMPILERS:  # one row per id on each compiler
+    _ids = [r.id for r in table_rows.for_compiler(TABLE, _c)]
+    assert len(_ids) == len(set(_ids)), _c
+
+
+def _one_import_set_a_chunk(compiler, size):
+    return all(len({frozenset(batching._imports(r.spec.program)) for r in table_rows.chunk(TABLE, compiler, i, size)}) == 1
+               for c, i in table_rows.chunks(TABLE, (compiler,), size))
+
+
+def _size(compiler):
+    """The least chunk size from CHUNK at which the `import ritzlib.span` rows
+    get a chunk of their own without costing one (AGAST #3906).  A chunk mixing
+    them with the rest compiles each of the rest alone too: ritz0's 57 were 11 s."""
+    return next((size for size in range(table_rows.CHUNK, 2 * table_rows.CHUNK)
+                 if _one_import_set_a_chunk(compiler, size)), table_rows.CHUNK)
+
+
+SIZE = {c: _size(c) for c in COMPILERS}
+CHUNKS = [chunk for c in COMPILERS for chunk in table_rows.chunks(TABLE, (c,), SIZE[c])]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(REJECTED))
-def test_ritz1_refuses(ritz1_bin, tmp_path, name):
-    comp, ll = _compile("ritz1", ritz1_bin, tmp_path, name, REJECTED[name])
-    assert comp.returncode != 0, comp.stdout + comp.stderr
-    assert not ll.exists()
-    assert "error" in comp.stdout + comp.stderr
+@pytest.mark.parametrize("compiler,chunk", CHUNKS, ids=[f"{c}-{i}" for c, i in CHUNKS])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    table_rows.assert_rows(compiler, table_rows.chunk(TABLE, compiler, chunk, SIZE[compiler]),
+                           build=_batch_build, compile=_compile_no_ll, work=tmp_path)
 
 
 @pytest.mark.integration

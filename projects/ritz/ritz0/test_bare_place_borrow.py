@@ -22,20 +22,34 @@ T, pointers included. It's the language's only implicit borrow.
   an 8-byte store over a 4-byte place, so neighbours check the width.
 - POINTER FAMILY. The ruling's `:&` row keeps `m` and `p`: an `@&T` or `*T` isn't
   a place of `T`, so it passes as the pointer it is. `@x` doesn't fit (#2339).
+
+The matrices are table rows (test_table_rows.py, AGAST #4141), not 716
+parametrised cases.  Each row keeps the id its parametrised test had, less
+`test_` and the compiler: `test_a_place_is_borrowed[int_local-ritz1]` is
+`a_place_is_borrowed[int_local]` on ritz1, `test_a_borrow_does_not_move[ritz0]`
+is `a_borrow_does_not_move`.  `test_every_run[<compiler>-<chunk>]` compiles 64
+run rows as one program per compiler (assert_rows, each row run in its own
+process, every miss compiled alone); `test_every_refusal[<first row>]` compiles
+each refusal row on all three compilers, checks its located error as the old
+test did (the `alike` rows: every compiler's `line:col: message` is ritz0's),
+and names every failing row with its compiler.  TABLE_GAPS and ROUTE_GAPS are
+strict xfails on the ritz1s, as they were.
 """
 
 import os
 import re
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
-import fast_link
-
+import test_ref_into_value as ref_into_value
+import test_table_rows as table_rows
 from array_rules import ref_arith
 from ref_rules import REF_TO_OTHER_TYPE
 from ritz0_inproc import run_ritz0
+from test_table_rows import ALL, Row, Run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -580,19 +594,6 @@ def _compile(compiler, tmp_path, name, src):
     return proc, ll, work
 
 
-def _run(compiler, tmp_path, name, src):
-    comp, ll, work = _compile(compiler, tmp_path, name, src)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode == 0 and ll.exists(), f"{compiler} refused {name}:\n{src}\n{out[-2000:]}"
-    exe = work / "main"
-    cmd = ["clang", "-Wno-override-module", str(ll), "-o", str(exe), "-nostdlib", "-no-pie"]
-    if compiler != "ritz0":
-        cmd.insert(1, str(RITZ_START))
-    link = fast_link.clang(cmd, cwd=work, capture_output=True, text=True)
-    assert link.returncode == 0, f"{compiler}: {name} would not link:\n{link.stderr[-2000:]}"
-    return subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
-
-
 def _error(compiler, tmp_path, name, src):
     """`line:col: message` of the located error `compiler` refuses `src` with."""
     comp, ll, _ = _compile(compiler, tmp_path, name, src)
@@ -606,151 +607,6 @@ def _error(compiler, tmp_path, name, src):
 
 def _main(setup, body):
     return setup + "pub fn main() -> i32\n    var v: i32 = 1\n    " + body + "\n    return 0\n"
-
-
-def _table_params():
-    for name in sorted(TABLE):
-        for compiler in COMPILERS:
-            reason = TABLE_GAPS.get(name) if compiler != "ritz0" else None
-            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
-
-
-@pytest.mark.parametrize("name,compiler", list(_table_params()))
-def test_a_place_is_borrowed(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, TABLE[name]) == 3
-
-
-def _route_params():
-    for name in sorted(ROUTES):
-        for compiler in COMPILERS:
-            reason = ROUTE_GAPS.get(name) if compiler != "ritz0" else None
-            marks = [pytest.mark.xfail(strict=True, reason=reason)] if reason else []
-            yield pytest.param(name, compiler, marks=marks, id=f"{name}-{compiler}")
-
-
-@pytest.mark.parametrize("name,compiler", list(_route_params()))
-def test_each_way_of_calling_borrows(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, ROUTES[name]) == 3
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("t", sorted(WIDTHS))
-def test_a_borrow_writes_its_width(tmp_path, compiler, t):
-    assert _run(compiler, tmp_path, t, WIDTHS[t]) == 3
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(POINTER_FAMILY))
-def test_a_pointer_passes_as_the_pointer_it_is(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, POINTER_FAMILY[name]) == 3
-
-
-@pytest.mark.parametrize("name", sorted(RVALUES))
-def test_an_rvalue_is_refused_alike(tmp_path, name):
-    setup, body = RVALUES[name]
-    src = _main(setup, body)
-    errors = {c: _error(c, tmp_path, name, src) for c in COMPILERS}
-    assert RVALUE in errors["ritz0"], errors
-    assert len(set(errors.values())) == 1, errors
-
-
-@pytest.mark.parametrize("name", sorted(RVALUE_METHODS))
-def test_an_rvalue_is_refused_on_each_way_of_calling(tmp_path, name):
-    setup, body = RVALUE_METHODS[name]
-    src = _main(setup, body)
-    errors = {c: _error(c, tmp_path, name, src) for c in COMPILERS}
-    assert RVALUE in errors["ritz0"], errors
-    assert len(set(errors.values())) == 1, errors
-
-
-@pytest.mark.parametrize("name", sorted(LET_PLACES))
-def test_a_let_place_is_refused_alike(tmp_path, name):
-    setup, body, binding = LET_PLACES[name]
-    src = _main(setup, body)
-    errors = {c: _error(c, tmp_path, name, src) for c in COMPILERS}
-    assert f"cannot borrow `let` binding `{binding}` as mutable" in errors["ritz0"], errors
-    assert len(set(errors.values())) == 1, errors
-
-
-@pytest.mark.parametrize("name", sorted(SHARED_PLACES))
-def test_a_place_behind_an_at_t_is_refused_alike(tmp_path, name):
-    setup, go = SHARED_PLACES[name]
-    src = setup + go + "pub fn main() -> i32\n    return 0\n"
-    errors = {c: _error(c, tmp_path, name, src) for c in COMPILERS}
-    assert SHARED in errors["ritz0"], errors
-    assert len(set(errors.values())) == 1, errors
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(INFERRED_MUT))
-def test_an_inferred_mutable_reference_passes(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, INFERRED_MUT[name]) == 3
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_var_holding_an_at_t_is_refused(tmp_path, compiler):
-    src = (INT_WRITER + C + "pub fn main() -> i32\n    var c: C = C { x: 1, y: 0 }\n"
-           "    var p = @c\n    w(p.x)\n    return c.x\n")
-    assert SHARED in _error(compiler, tmp_path, "var_at", src)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(NOT_SHARED))
-def test_a_nearer_pointer_makes_the_place_writable(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, NOT_SHARED[name]) == 3
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(MISFITS))
-def test_a_place_of_another_type_is_refused(tmp_path, compiler, name):
-    setup, body = MISFITS[name]
-    error = _error(compiler, tmp_path, name, _main(setup, body))
-    assert re.search(r"argument 1 of `w` has the wrong type", error), error
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(METHOD_MISFITS))
-def test_a_method_place_of_another_type_is_refused(tmp_path, compiler, name):
-    setup, body, argno = METHOD_MISFITS[name]
-    error = _error(compiler, tmp_path, name, _main(setup, body))
-    assert f"argument {argno} of `put` has the wrong type" in error, error
-
-
-# A reference to another type, refused on all three since #2368 (it was #2348's
-# on ritz1), and no temporary.
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_an_explicit_borrow_of_another_type_is_no_temporary(tmp_path, compiler):
-    src = INT_WRITER + "pub fn main() -> i32\n    var n: i64 = 1\n    w(@&n)\n    return 0\n"
-    error = _error(compiler, tmp_path, "explicit", src)
-    assert REF_TO_OTHER_TYPE in error and "temporary" not in error, error
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_borrow_does_not_move(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "drops", DROPS) == 3
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_a_borrowed_value_drops_once(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "drop_count", DROP_COUNT) == 3
-
-
-# §13.5 on all three compilers, at one place (#2438).
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ALIASED))
-def test_a_borrow_is_a_mutable_borrow_for_the_borrow_rules(tmp_path, compiler, name):
-    src, needle = ALIASED[name]
-    error = _error(compiler, tmp_path, name, src)
-    assert needle in error, error
-    if compiler != "ritz0":
-        assert error == _error("ritz0", tmp_path, f"{name}_oracle", src)
-
-
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(NOT_ALIASED))
-def test_a_pointer_passed_on_borrows_nothing(tmp_path, compiler, name):
-    assert _run(compiler, tmp_path, name, NOT_ALIASED[name]) == 3
 
 
 # AGAST #3079: an un-annotated `let p = @c` / `@&c` of a struct is an `@C` /
@@ -838,14 +694,112 @@ INFERRED_REFS.update({
 })
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(INFERRED_REFS))
-def test_an_inferred_reference_is_its_kind(tmp_path, compiler, name):
-    src, want = INFERRED_REFS[name]
-    if isinstance(want, int):
-        assert _run(compiler, tmp_path, name, src) == want
-        return
-    got = _error(compiler, tmp_path, name, src)
-    assert want in got, got
-    if compiler != "ritz0":
-        assert got == _error("ritz0", tmp_path, name, src), "located where ritz0 says it"
+
+# ---- the rows: {old id less `test_` and the compiler: ...} (AGAST #4141) ----
+
+def _rows(test_id, table, want=3) -> list:
+    return [Row(f"{test_id}[{name}]", ALL, Run(table[name], want)) for name in sorted(table)]
+
+
+# Each compiles, links and exits as it says: 3 unless the row says otherwise.
+RUN_ROWS = [
+    *_rows("a_place_is_borrowed", TABLE),
+    *_rows("each_way_of_calling_borrows", ROUTES),
+    *_rows("a_borrow_writes_its_width", WIDTHS),
+    *_rows("a_pointer_passes_as_the_pointer_it_is", POINTER_FAMILY),
+    *_rows("an_inferred_mutable_reference_passes", INFERRED_MUT),
+    *_rows("a_nearer_pointer_makes_the_place_writable", NOT_SHARED),
+    Row("a_borrow_does_not_move", ALL, Run(DROPS, 3)),
+    Row("a_borrowed_value_drops_once", ALL, Run(DROP_COUNT, 3)),
+    *_rows("a_pointer_passed_on_borrows_nothing", NOT_ALIASED),
+    *[Row(f"an_inferred_reference_is_its_kind[{name}]", ALL, Run(src, want))
+      for name, (src, want) in sorted(INFERRED_REFS.items()) if isinstance(want, int)],
+]
+
+
+def _gaps(compiler) -> dict:
+    """TABLE_GAPS' and ROUTE_GAPS' rows on the ritz1s, as strict xfails (ritz0 has none)."""
+    if compiler == "ritz0":
+        return {}
+    return {**{f"a_place_is_borrowed[{n}]": t for n, t in TABLE_GAPS.items()},
+            **{f"each_way_of_calling_borrows[{n}]": t for n, t in ROUTE_GAPS.items()}}
+
+
+@pytest.mark.parametrize("compiler,index", table_rows.chunks(RUN_ROWS))
+def test_every_run(tmp_path, compiler, index):
+    table_rows.assert_rows(compiler, table_rows.chunk(RUN_ROWS, compiler, index),
+                           build=ref_into_value._batch_build, compile=ref_into_value._batch_compile,
+                           work=tmp_path, gaps=_gaps(compiler))
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """Each compiler refuses `program` with a located error saying `needle`
+    (and not `absent`); if `alike`, its `line:col: message` is ritz0's."""
+    program: str
+    needle: str
+    alike: bool = False
+    absent: str | None = None
+
+
+def _refusals(test_id, table, make) -> dict:
+    return {f"{test_id}[{name}]": make(table[name]) for name in sorted(table)}
+
+
+REFUSAL_ROWS = {
+    # The same `line:col: message` on all three compilers.
+    **_refusals("an_rvalue_is_refused_alike", RVALUES,
+                lambda r: Refusal(_main(*r), RVALUE, alike=True)),
+    **_refusals("an_rvalue_is_refused_on_each_way_of_calling", RVALUE_METHODS,
+                lambda r: Refusal(_main(*r), RVALUE, alike=True)),
+    **_refusals("a_let_place_is_refused_alike", LET_PLACES,
+                lambda r: Refusal(_main(r[0], r[1]), f"cannot borrow `let` binding `{r[2]}` as mutable",
+                                  alike=True)),
+    **_refusals("a_place_behind_an_at_t_is_refused_alike", SHARED_PLACES,
+                lambda r: Refusal(r[0] + r[1] + "pub fn main() -> i32\n    return 0\n", SHARED, alike=True)),
+    "a_var_holding_an_at_t_is_refused": Refusal(
+        INT_WRITER + C + "pub fn main() -> i32\n    var c: C = C { x: 1, y: 0 }\n"
+        "    var p = @c\n    w(p.x)\n    return c.x\n", SHARED),
+    **_refusals("a_place_of_another_type_is_refused", MISFITS,
+                lambda r: Refusal(_main(*r), "argument 1 of `w` has the wrong type")),
+    # ritz0's method paths convert what they're given, so these need their own check.
+    **_refusals("a_method_place_of_another_type_is_refused", METHOD_MISFITS,
+                lambda r: Refusal(_main(r[0], r[1]), f"argument {r[2]} of `put` has the wrong type")),
+    # A reference to another type, refused on all three since #2368 (it was
+    # #2348's on ritz1), and no temporary.
+    "an_explicit_borrow_of_another_type_is_no_temporary": Refusal(
+        INT_WRITER + "pub fn main() -> i32\n    var n: i64 = 1\n    w(@&n)\n    return 0\n",
+        REF_TO_OTHER_TYPE, absent="temporary"),
+    # §13.5 on all three compilers, at one place (#2438).
+    **_refusals("a_borrow_is_a_mutable_borrow_for_the_borrow_rules", ALIASED,
+                lambda r: Refusal(r[0], r[1], alike=True)),
+    **{f"an_inferred_reference_is_its_kind[{name}]": Refusal(src, want, alike=True)
+       for name, (src, want) in sorted(INFERRED_REFS.items()) if isinstance(want, str)},
+}
+REFUSAL_CHUNK = 27    # rows a test, each compiled by all three compilers
+REFUSAL_IDS = list(REFUSAL_ROWS)
+
+
+def _refusal_wrong(tmp_path, k, row_id, row: Refusal) -> list:
+    """`<compiler> <row id>: <why>` for each compiler the row fails on."""
+    errors, bad = {}, []
+    for compiler in COMPILERS:
+        try:
+            got = errors[compiler] = _error(compiler, tmp_path, f"row{k}", row.program)
+        except AssertionError as e:
+            bad.append(f"{compiler} {row_id}: {str(e)[-600:]}")
+            continue
+        if row.needle not in got:
+            bad.append(f"{compiler} {row_id}: want {row.needle!r}, got {got!r}")
+        if row.absent and row.absent in got:
+            bad.append(f"{compiler} {row_id}: want no {row.absent!r}, got {got!r}")
+        if row.alike and compiler != "ritz0" and errors.get("ritz0", got) != got:
+            bad.append(f"{compiler} {row_id}: want ritz0's {errors['ritz0']!r}, got {got!r}")
+    return bad
+
+
+@pytest.mark.parametrize("index", range(0, len(REFUSAL_IDS), REFUSAL_CHUNK))
+def test_every_refusal(tmp_path, index):
+    ids = REFUSAL_IDS[index:index + REFUSAL_CHUNK]
+    bad = [line for k, rid in enumerate(ids) for line in _refusal_wrong(tmp_path, k, rid, REFUSAL_ROWS[rid])]
+    assert not bad, f"{len(bad)} failures in {len(ids)} rows:\n" + "\n".join(bad)

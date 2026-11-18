@@ -23,6 +23,16 @@ to the integer.
 
 The expected exit codes below come from what each program says, not from a
 compiler.  Every row runs on ritz0, ritz1 and ritz1_selfhosted.
+
+The matrices are table rows (AGAST #4141): `test_refusals[<compiler>-<chunk>]`
+checks REFUSED's and CALLS_REFUSED's rows and `test_runs[<compiler>]` KEPT's,
+each under the id its parametrised test had less the compiler
+(`a_local_cant_take_a_module_values_name[let_over_const]`,
+`what_the_rule_leaves_alone_still_runs[other_case]`), and a failure names its
+rows.  A refusal row is answered by its chunk's batch only if the batch is
+refused, writes no IR and says the row's message exactly once at the row's
+place; anything else is compiled alone and judged as the parametrised test
+did: refused, the message once at line:col, no IR.
 """
 
 import os
@@ -32,9 +42,12 @@ from pathlib import Path
 
 import pytest
 
+import batching
 import fast_link
+import test_table_rows as table_rows
 
 from ritz0_inproc import run_ritz0
+from test_table_rows import Refused, Row, Run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -212,74 +225,117 @@ KEPT = {
 }
 
 
-def _write(tmp_path, source):
-    src = tmp_path / "unit.ritz"
-    src.write_text(source)
-    (tmp_path / "pm.ritz").write_text(_MODULE)
-    return src, tmp_path / "unit.ll"
-
-
-def _compile(request, compiler, tmp_path, source):
-    src, ll = _write(tmp_path, source)
-    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{tmp_path}")
+def _emit(request, compiler, src, work):
+    """Compile `src` beside `pm`; (process, its module's path)."""
+    (work / "pm.ritz").write_text(_MODULE)
+    ll = src.with_suffix(".ll")
+    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{work}")
     if compiler == "ritz0":
-        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=work, env=env, timeout=300)
     else:
         request.getfixturevalue("ritz1_bin")
         binary = RITZ1_BUILD / compiler
         # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
         assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path, env=env,
+        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=work, env=env,
                               capture_output=True, text=True, timeout=300)
     return proc, ll
+
+
+def _compile(request, compiler, tmp_path, source):
+    src = tmp_path / "main.ritz"
+    src.write_text(source)
+    return _emit(request, compiler, src, tmp_path)
 
 
 def _located(compiler, out, line, col, message):
     """ritz1 says `error:` after the place; ritz0 doesn't."""
     sep = "" if compiler == "ritz0" else "error: "
-    return re.findall(rf"unit\.ritz:{line}:{col}: {sep}{re.escape(message)}$", out, re.M)
+    return re.findall(rf"main\.ritz:{line}:{col}: {sep}{re.escape(message)}$", out, re.M)
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_a_local_cant_take_a_module_values_name(request, tmp_path, compiler, name):
-    source, line, col, kind, shown = REFUSED[name]
-    proc, ll = _compile(request, compiler, tmp_path, source)
+# ---- the tables -------------------------------------------------------------
+
+_REFUSE = "a_local_cant_take_a_module_values_name"
+_CALL = "a_local_that_holds_no_fn_cant_be_called"
+_KEEP = "what_the_rule_leaves_alone_still_runs"
+
+# One row per old case, as `Refused(program, message, at=(line, col))`.
+REFUSAL_ROWS = (
+    [Row(f"{_REFUSE}[{name}]", table_rows.ALL, Refused(source, _message(kind, shown), at=(line, col)))
+     for name in sorted(REFUSED) for source, line, col, kind, shown in [REFUSED[name]]]
+    + [Row(f"{_CALL}[{name}]", table_rows.ALL, Refused(source, _call_message("k"), at=(line, col)))
+       for name in sorted(CALLS_REFUSED) for source, line, col in [CALLS_REFUSED[name]]])
+
+RUN_ROWS = [Row(f"{_KEEP}[{name}]", table_rows.ALL, Run(*KEPT[name])) for name in sorted(KEPT)]
+
+
+def _refused_alone(request, compiler, row, work):
+    """The parametrised test's checks on `row` compiled alone: None, or what's wrong."""
+    work.mkdir(parents=True)
+    proc, ll = _compile(request, compiler, work, row.spec.program)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
-    message = _message(kind, shown)
-    hits = _located(compiler, out, line, col, message)
-    assert len(hits) == 1, f"{compiler}, {name}: want one {message!r} at {line}:{col}:\n{out[-1500:]}"
-    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+    line, col = row.spec.at
+    if proc.returncode == 0:
+        return f"accepted:\n{out[-1500:]}"
+    if len(_located(compiler, out, line, col, row.spec.message)) != 1:
+        return f"want one {row.spec.message!r} at {line}:{col}:\n{out[-1500:]}"
+    if ll.exists():
+        return "wrote IR"
+    return None
+
+
+def _refusal_failures(request, compiler, rows, work):
+    """(row id, failure line) for each of `rows` `compiler` doesn't refuse as it says."""
+    def compile(compiler, src, here):
+        proc, ll = _emit(request, compiler, src, here)
+        # A refusal that writes IR is no batch answer: every row goes alone.
+        return (proc.returncode if not ll.exists() else 0), proc.stdout + proc.stderr
+
+    answers = (batching.refuse_rows(
+        compiler, [batching._insert_mark(r.spec.program, r.spec.at) for r in rows], compile,
+        work / "batch") if batching.enabled() else [None] * len(rows))
+    failures = []
+    for k, (row, answer) in enumerate(zip(rows, answers)):
+        if answer is not None and answer[1] is not None:
+            line, col = answer[1].split(":")
+            if len(_located(compiler, answer[0], line, col, row.spec.message)) == 1:
+                continue
+        why = _refused_alone(request, compiler, row, work / "alone" / str(k))
+        if why:
+            failures.append((row.id, f"{compiler} {row.id}: {why}"))
+    return failures
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,index", table_rows.chunks(REFUSAL_ROWS))
+def test_refusals(request, tmp_path, compiler, index):
+    """Each row refused, its message once at its place, no IR, on every compiler."""
+    rows = table_rows.chunk(REFUSAL_ROWS, compiler, index)
+    table_rows._assert_none(compiler, _refusal_failures(request, compiler, rows, tmp_path), len(rows))
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(CALLS_REFUSED))
-def test_a_local_that_holds_no_fn_cant_be_called(request, tmp_path, compiler, name):
-    source, line, col = CALLS_REFUSED[name]
-    proc, ll = _compile(request, compiler, tmp_path, source)
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
-    hits = _located(compiler, out, line, col, _call_message("k"))
-    assert len(hits) == 1, f"{compiler}, {name}: want the call refused at {line}:{col}:\n{out[-1500:]}"
-    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+def test_runs(request, tmp_path, compiler):
+    """Each row compiles, links and exits as it says, on every compiler."""
+    def build(compiler, src, work):
+        proc, ll = _emit(request, compiler, src, work)
+        if proc.returncode != 0 or not ll.exists():
+            return False, proc.stdout + proc.stderr, None
+        exe = work / "main"
+        link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
+        if compiler != "ritz0":
+            link.insert(3, str(RITZ_START))
+        got = fast_link.clang(link, capture_output=True, text=True)
+        return got.returncode == 0, got.stderr, exe
 
+    def compile(compiler, src, work):
+        proc, _ = _emit(request, compiler, src, work)
+        return proc.returncode, proc.stdout + proc.stderr
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(KEPT))
-def test_what_the_rule_leaves_alone_still_runs(request, tmp_path, compiler, name):
-    source, code = KEPT[name]
-    proc, ll = _compile(request, compiler, tmp_path, source)
-    assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-1500:]}"
-    exe = tmp_path / "unit"
-    link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
-    if compiler != "ritz0":
-        link.insert(3, str(RITZ_START))
-    fast_link.clang(link, check=True)
-    assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
+    table_rows.assert_rows(compiler, table_rows.for_compiler(RUN_ROWS, compiler), build=build,
+                           compile=compile, work=tmp_path)
 
 
 @pytest.mark.integration
@@ -303,5 +359,5 @@ def test_the_binder_comes_before_match_coverage(request, tmp_path, compiler):
     proc, _ = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0
-    first = next(line for line in out.splitlines() if "unit.ritz:" in line)
+    first = next(line for line in out.splitlines() if "main.ritz:" in line)
     assert _message("const", "K") in first, out[-1500:]

@@ -27,6 +27,19 @@ element. A whole `a:& [N]T` copies into a field or a local. A move-only referent
 is rejected at each. RITZ1_GAPS lists what's still open.
 
 `@x` doesn't fit a `:&` param (#2339), so one is only ever given `@&x` here.
+
+The matrices are table rows (test_table_rows.py, AGAST #4141), each under the
+id its parametrised test had less `test_` and the compiler
+(`slot_holds_what_it_is_given[stmt_array]`, `an_i64_into_a_pointer_to_pointer_slot_is_refused[let-bare]`).
+`test_every_row[<compiler>-<chunk>]` checks the ritz0/ritz1 rows (PAIR_ROWS)
+with this file's build, `test_every_refusal[<compiler>]` the located refusals
+on all three (REFUSAL_ROWS), and a failure names each row that failed; a
+RITZ1_GAPS entry is a strict xfail on ritz1, as it was.
+test_by_value_slot_of_another_type_is_refused compiles and links each row on
+its own, as before.  A refusal must leave no main.ll (`_no_ll`).
+
+`_compile`, `_run`, `_batch_compile` and RITZ_ROOT are imported by a few dozen
+other modules: keep them.
 """
 
 import os
@@ -44,9 +57,10 @@ from array_rules import ELEMENT_MISMATCH
 from index_rules import needs_index
 from let_rules import (another_struct, another_struct_argument, another_struct_assign,
                        another_struct_field, another_struct_return)
-from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
+from ref_rules import REF_INTO_VALUE, REF_TO_OTHER_TYPE, VALUE_INTO_SHARED_REF
 from ritz0_inproc import run_ritz0
-from test_ref_into_value import COMPILERS, _assert_refused
+import test_ref_into_value as ref_into_value
+from test_ref_into_value import COMPILERS
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
@@ -3260,59 +3274,6 @@ def _run(compiler, ritz1_bin, tmp_path: Path, name: str, program: str) -> int:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(STORES))
-def test_ritz0_ref_field_holds_the_written_reference(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, STORES[name]) == 3
-
-
-@pytest.mark.integration
-def test_ritz0_large_literal_holds_the_written_reference(tmp_path):
-    assert _run("ritz0", None, tmp_path, "large", LARGE_LITERAL) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(CONTROLS))
-def test_ritz0_slot_holds_what_it_is_given(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, CONTROLS[name]) == 3
-
-
-# A bare `t` or `t.h` whose value is discarded (LARB R69) has no effect, so
-# ritz0 refuses it with R64's words before #2949's move question arises (AGAST
-# #3491).  ritz1 keeps the rows above until it has R64 too (#3492).
-NO_EFFECT_ROWS = {
-    "stmt_mid_block", "stmt_field_tail", "stmt_defer_tail", "stmt_copy_tail",
-    "stmt_tail", "stmt_method_tail", "stmt_while", "stmt_for", "stmt_match_arm",
-    "stmt_match_expr_arm", "stmt_match_nested_arm", "stmt_match_block_arm",
-    "stmt_match_block_arm_generic",
-}
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(set(DROP_STORES) - NO_EFFECT_ROWS))
-def test_ritz0_reference_to_a_drop_type_is_not_a_move(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, DROP_STORES[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(set(MOVE_OUT) - NO_EFFECT_ROWS))
-def test_ritz0_by_value_field_is_still_a_move_out(tmp_path, name):
-    comp, _, _ = _compile("ritz0", None, tmp_path, name, MOVE_OUT[name])
-    assert comp.returncode != 0
-    assert "cannot move out of a reference" in comp.stdout + comp.stderr
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(NO_EFFECT_ROWS))
-def test_ritz0_a_bare_reference_alone_has_no_effect(tmp_path, name):
-    src = DROP_STORES.get(name) or MOVE_OUT[name]
-    comp, _, _ = _compile("ritz0", None, tmp_path, name, src)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0
-    assert "statement has no effect: the value of `t" in out, out[-2000:]
-    assert "cannot move out of a reference" not in out, out[-2000:]
-
-
-@pytest.mark.integration
 def test_tempest_document_compiles(tmp_path):
     tempest = RITZ_ROOT.parent / "tempest"
     ll = tmp_path / "document.ll"
@@ -3320,98 +3281,6 @@ def test_tempest_document_compiles(tmp_path):
     comp = run_ritz0(["lib/document.ritz", "--no-runtime", "--project-root", ".",
                       "-o", str(ll)], cwd=tempest, env=env, timeout=300)
     assert comp.returncode == 0 and ll.exists(), comp.stdout[-2000:] + comp.stderr[-2000:]
-
-
-def _ritz1_params(programs: dict) -> list:
-    """Every program, with ritz1's known gaps as strict xfails."""
-    return [pytest.param(name, marks=[pytest.mark.xfail(strict=True, reason=RITZ1_GAPS[name])]
-                         if name in RITZ1_GAPS else [])
-            for name in sorted(programs)]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(NO_IMPLICIT_DEREF))
-def test_a_reference_is_not_its_referent(ritz1_bin, tmp_path, name, compiler):
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, NO_IMPLICIT_DEREF[name])
-    assert comp.returncode != 0
-    assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: (error: )?" + re.escape(REF_INTO_VALUE),
-                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", _ritz1_params(STORES))
-def test_ritz1_ref_field_holds_the_written_reference(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, STORES[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", _ritz1_params(CONTROLS))
-def test_ritz1_slot_holds_what_it_is_given(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, CONTROLS[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(DROP_STORES))
-def test_ritz1_reference_to_a_drop_type_is_not_a_move(ritz1_bin, tmp_path, name):
-    assert _run("ritz1", ritz1_bin, tmp_path, name, DROP_STORES[name]) == 3
-
-
-# Loading the referent would hand one value to two owners, so ritz1 has to
-# refuse here where it used to leave the rejection to clang. The error names a
-# line in the source, which clang's never could.
-@pytest.mark.integration
-@pytest.mark.parametrize("name", _ritz1_params(MOVE_OUT))
-def test_ritz1_by_value_field_is_still_a_move_out(ritz1_bin, tmp_path, name):
-    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, MOVE_OUT[name])
-    assert comp.returncode != 0
-    assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: error: cannot move out of a reference",
-                     comp.stdout + comp.stderr), comp.stdout + comp.stderr
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(POINTER_SLOTS))
-def test_pointer_slot_holds_the_written_reference(ritz1_bin, tmp_path, compiler, name):
-    assert _run(compiler, ritz1_bin, tmp_path, name, POINTER_SLOTS[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", MISMATCHES_BARE)
-def test_a_value_into_a_field_of_another_pointee_is_refused(ritz1_bin, tmp_path, compiler, name):
-    comp, ll, _ = _compile(compiler, ritz1_bin, tmp_path, name, MISMATCHES[name].replace("^", ""))
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out[-2000:]
-    assert not ll.exists()
-    assert re.search(r"main\.ritz:\d+:\d+: (error: )?" + re.escape(VALUE_INTO_SHARED_REF), out), out[-2000:]
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(MISMATCHES))
-def test_a_written_reference_into_a_field_of_another_pointee_is_refused(tmp_path, compiler, name):
-    _assert_refused(compiler, tmp_path, name, MISMATCHES[name].replace("^", "^@"), REF_TO_OTHER_TYPE)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("form,message", [("", VALUE_INTO_SHARED_REF), ("@", REF_TO_OTHER_TYPE)],
-                         ids=["bare", "written"])
-@pytest.mark.parametrize("name", sorted(POINTER_TO_POINTER))
-def test_an_i64_into_a_pointer_to_pointer_slot_is_refused(tmp_path, compiler, name, form, message):
-    program = POINTER_TO_POINTER[name].replace("^", "^" + form) + ENTRY
-    _assert_refused(compiler, tmp_path, f"{name}_{form or 'bare'}", program, message)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(POINTER_INTO_POINTER_TO_POINTER))
-def test_a_pointer_into_a_pointer_to_pointer_slot_is_refused(tmp_path, compiler, name):
-    program = POINTER_INTO_POINTER_TO_POINTER[name] + ENTRY
-    _assert_refused(compiler, tmp_path, name, program, VALUE_INTO_SHARED_REF)
 
 
 # A by-value slot only copies a referent of its own type: reading one as
@@ -3657,19 +3526,6 @@ REFUSED = {
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(REFUSED))
-def test_by_value_slot_of_another_type_is_refused(ritz1_bin, tmp_path, compiler, name):
-    comp, ll, work = _compile(compiler, ritz1_bin, tmp_path, name, REFUSED[name])
-    if comp.returncode != 0:
-        return
-    link = subprocess.run(["clang", str(ll), "-o", str(work / "main"), "-nostdlib",
-                           str(RITZ_START)], cwd=work, capture_output=True, text=True)
-    assert link.returncode != 0
-    assert re.search(r"defined with type|doesn't match function result type", link.stderr), link.stderr
-
-
 # AGAST #2293: a typed `let` or `var` of a struct of another type is refused at
 # the binding, on all three compilers.  ritz0 used to keep `d` a `C` (so only a
 # later `d.a` failed, as "Unknown field 'a' in struct 'C'", and a body that read
@@ -3708,14 +3564,6 @@ pub fn main() -> i32
     return 3
 """,
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ANOTHER_STRUCT_BINDING))
-def test_a_binding_of_another_struct_is_refused_at_the_binding(tmp_path, compiler, name):
-    _assert_refused(compiler, tmp_path, f"binding_{name}", ANOTHER_D + ANOTHER_STRUCT_BINDING[name],
-                    another_struct("d", "D", "C"))
 
 
 # AGAST #3293: a struct of another type returned, by `return` or as the tail, is
@@ -3763,18 +3611,6 @@ impl C
         ^c
 """,
 }
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ANOTHER_STRUCT_RETURN))
-def test_a_struct_of_another_type_returned_is_refused_at_the_return(tmp_path, compiler, name):
-    program = ANOTHER_D + ANOTHER_STRUCT_RETURN[name] + """
-pub fn main() -> i32
-    return 3
-"""
-    _assert_refused(compiler, tmp_path, f"return_{name}", program,
-                    another_struct_return("D", "C"))
 
 
 # AGAST #3294: the same rule at the other slots a value is copied into.  ritz0
@@ -3855,14 +3691,6 @@ pub fn main() -> i32
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(ANOTHER_STRUCT_SLOT))
-def test_a_struct_of_another_type_in_a_by_value_slot_is_refused_at_the_slot(tmp_path, compiler, name):
-    program, message = ANOTHER_STRUCT_SLOT[name]
-    _assert_refused(compiler, tmp_path, f"slot_{name}", ANOTHER_D + program, message)
-
-
 # A written reference returned is the caller's address.
 # test_borrow_param_ref_slot.py has the rest of #2249's slots.
 RETURNS_THE_BORROW = {
@@ -3908,13 +3736,6 @@ pub fn main() -> i32
 }
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-@pytest.mark.parametrize("name", sorted(RETURNS_THE_BORROW))
-def test_returned_reference_is_the_callers_address(ritz1_bin, tmp_path, compiler, name):
-    assert _run(compiler, ritz1_bin, tmp_path, name, RETURNS_THE_BORROW[name]) == 3
-
-
 # The strict xfails say these aren't done; this says what they do meanwhile.
 # Reverting the guard in emit_return turns them back into garbage, which an
 # xfail can't see: a wrong exit code is the failure it expects.
@@ -3928,16 +3749,6 @@ def test_ritz1_refuses_what_it_used_to_miscompile(ritz1_bin, tmp_path, name):
                            str(RITZ_START)], cwd=work, capture_output=True, text=True)
     assert link.returncode != 0
     assert "defined with type" in link.stderr
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(ARRAY_MISMATCH))
-def test_ritz1_array_referent_must_match_its_slot(ritz1_bin, tmp_path, name):
-    program, message = ARRAY_MISMATCH[name]
-    comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, program)
-    assert comp.returncode != 0
-    assert not ll.exists()
-    assert message in comp.stdout + comp.stderr
 
 
 # AGAST #3132: `*r` through a `r:& *T` param is the T the borrowed pointer points
@@ -4007,9 +3818,211 @@ pub fn main() -> i32
 }
 
 
+# ---- the rows (AGAST #4141) ---------------------------------------------------
+#
+# test_table_rows is imported in the tests, not up top: it imports
+# test_ritz1_for_header, which imports test_ritz1_for_iterable, which imports
+# `_compile` / `_run` from here, so whichever of us comes first, a module-level
+# import of it sees the other half-built.  For the same reason the chunks are
+# cut here, CHUNK rows at a time in source order, not by table_rows.chunks.
+
+PAIR = ("ritz0", "ritz1")
+CHUNK = 64  # table_rows.CHUNK; test_every_row checks they agree
+
+MOVE_OUT_OF_A_REFERENCE = "cannot move out of a reference"
+
+
+# A bare `t` or `t.h` whose value is discarded (LARB R69) has no effect, so
+# ritz0 refuses it with R64's words before #2949's move question arises (AGAST
+# #3491).  ritz1 keeps its DROP_STORES / MOVE_OUT rows until it has R64 too
+# (#3492); ritz0's are test_ritz0_a_bare_reference_alone_has_no_effect's.
+NO_EFFECT_ROWS = {
+    "stmt_mid_block", "stmt_field_tail", "stmt_defer_tail", "stmt_copy_tail",
+    "stmt_tail", "stmt_method_tail", "stmt_while", "stmt_for", "stmt_match_arm",
+    "stmt_match_expr_arm", "stmt_match_nested_arm", "stmt_match_block_arm",
+    "stmt_match_block_arm_generic",
+}
+
+
+def _pair_of(name):
+    return ("ritz1",) if name in NO_EFFECT_ROWS else PAIR
+
+
+def _pair_rows():
+    """(row id, compilers, program, kind, expectation) for every row checked on
+    ritz0 and ritz1 with this file's build, in the old tests' order.
+
+    kind "run": the program exits `expectation`; "at": refused, a `main.ritz:`
+    diagnostic starting with `expectation`; "anywhere": refused, saying
+    `expectation` somewhere, located or not.
+    """
+    for name in sorted(STORES):
+        yield f"ref_field_holds_the_written_reference[{name}]", PAIR, STORES[name], "run", 3
+    yield "large_literal_holds_the_written_reference", ("ritz0",), LARGE_LITERAL, "run", 3
+    for name in sorted(CONTROLS):
+        yield f"slot_holds_what_it_is_given[{name}]", PAIR, CONTROLS[name], "run", 3
+    for name in sorted(DROP_STORES):
+        yield (f"reference_to_a_drop_type_is_not_a_move[{name}]", _pair_of(name),
+               DROP_STORES[name], "run", 3)
+    # Loading the referent would hand one value to two owners, so ritz1 has to
+    # refuse here where it used to leave the rejection to clang. The error names a
+    # line in the source, which clang's never could.
+    for name in sorted(MOVE_OUT):
+        yield (f"by_value_field_is_still_a_move_out[{name}]", _pair_of(name),
+               MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE)
+    for name in sorted(NO_IMPLICIT_DEREF):
+        yield f"a_reference_is_not_its_referent[{name}]", PAIR, NO_IMPLICIT_DEREF[name], "at", REF_INTO_VALUE
+    for name in sorted(POINTER_SLOTS):
+        yield f"pointer_slot_holds_the_written_reference[{name}]", PAIR, POINTER_SLOTS[name], "run", 3
+    for name in MISMATCHES_BARE:
+        yield (f"a_value_into_a_field_of_another_pointee_is_refused[{name}]", PAIR,
+               MISMATCHES[name].replace("^", ""), "at", VALUE_INTO_SHARED_REF)
+    for name in sorted(RETURNS_THE_BORROW):
+        yield f"returned_reference_is_the_callers_address[{name}]", PAIR, RETURNS_THE_BORROW[name], "run", 3
+    for name in sorted(ARRAY_MISMATCH):
+        program, message = ARRAY_MISMATCH[name]
+        yield f"ritz1_array_referent_must_match_its_slot[{name}]", ("ritz1",), program, "anywhere", message
+
+
+PAIR_ROWS = list(_pair_rows())
+
+# ritz1's strict xfails: RITZ1_GAPS is keyed by program, across STORES,
+# CONTROLS and MOVE_OUT.
+RITZ1_ROW_GAPS = {f"{test}[{name}]": RITZ1_GAPS[name]
+                  for test, programs in (("ref_field_holds_the_written_reference", STORES),
+                                         ("slot_holds_what_it_is_given", CONTROLS),
+                                         ("by_value_field_is_still_a_move_out", MOVE_OUT))
+                  for name in sorted(programs) if name in RITZ1_GAPS}
+
+
+def _cut(compiler):
+    """`compiler`'s rows of PAIR_ROWS, as near-even chunks of at most CHUNK."""
+    mine = [row for row in PAIR_ROWS if compiler in row[1]]
+    count = -(-len(mine) // CHUNK)
+    size = -(-len(mine) // count)
+    return [mine[i:i + size] for i in range(0, len(mine), size)]
+
+
+PAIR_CHUNKS = [(compiler, i) for compiler in PAIR for i in range(len(_cut(compiler)))]
+
+
+def _spec(kind, program, expectation):
+    from test_table_rows import Prefix, Refused, Run
+    if kind == "run":
+        return Run(program, expectation)
+    if kind == "at":
+        return Refused(program, Prefix(expectation))
+    return Refused(program, expectation, located=False)
+
+
+def _no_ll(compile):
+    """`compile`, but a refusal that leaves a main.ll behind counts as a
+    compile: the per-case tests asserted `not ll.exists()`."""
+    def checked(compiler, src, work):
+        code, output = compile(compiler, src, work)
+        if code != 0 and (work / "main.ll").exists():
+            return 0, output + "\nmain.ll was written, though it was refused"
+        return code, output
+    return checked
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,chunk", PAIR_CHUNKS, ids=[f"{c}-{i}" for c, i in PAIR_CHUNKS])
+def test_every_row(ritz1_bin, tmp_path, compiler, chunk):
+    import test_table_rows as table_rows
+    assert table_rows.CHUNK == CHUNK
+    rows = [table_rows.Row(rid, compilers, _spec(kind, program, expectation))
+            for rid, compilers, program, kind, expectation in _cut(compiler)[chunk]]
+    table_rows.assert_rows(compiler, rows, build=_batch_build(ritz1_bin),
+                           compile=_no_ll(_batch_compile(ritz1_bin)), work=tmp_path,
+                           gaps=RITZ1_ROW_GAPS if compiler == "ritz1" else {})
+
+
+@pytest.mark.integration
+def test_ritz0_a_bare_reference_alone_has_no_effect(tmp_path):
+    """Each row compiled on its own, as its case was: a batch can't say the
+    move-out error is absent, only that something refused."""
+    failures = []
+    for name in sorted(NO_EFFECT_ROWS):
+        src = DROP_STORES.get(name) or MOVE_OUT[name]
+        comp, _, _ = _compile("ritz0", None, tmp_path, name, src)
+        out = comp.stdout + comp.stderr
+        if comp.returncode == 0:
+            why = "accepted it"
+        elif "statement has no effect: the value of `t" not in out:
+            why = "no R64 'statement has no effect'"
+        elif MOVE_OUT_OF_A_REFERENCE in out:
+            why = "said 'cannot move out of a reference' too"
+        else:
+            continue
+        failures.append(f"ritz0 a_bare_reference_alone_has_no_effect[{name}]: {why}:\n{out[-800:]}")
+    assert not failures, (f"ritz0: {len(failures)} of {len(NO_EFFECT_ROWS)} rows failed:\n"
+                          + "\n".join(failures))
+
+
+def _refusal_rows():
+    """{row id: (program with `^` where it's reported, the whole message)}, on
+    all three compilers through test_ref_into_value's build."""
+    rows = {}
+    for name in sorted(MISMATCHES):
+        rows[f"a_written_reference_into_a_field_of_another_pointee_is_refused[{name}]"] = (
+            MISMATCHES[name].replace("^", "^@"), REF_TO_OTHER_TYPE)
+    for name in sorted(POINTER_TO_POINTER):
+        for form_id, form, message in (("bare", "", VALUE_INTO_SHARED_REF), ("written", "@", REF_TO_OTHER_TYPE)):
+            rows[f"an_i64_into_a_pointer_to_pointer_slot_is_refused[{name}-{form_id}]"] = (
+                POINTER_TO_POINTER[name].replace("^", "^" + form) + ENTRY, message)
+    for name in sorted(POINTER_INTO_POINTER_TO_POINTER):
+        rows[f"a_pointer_into_a_pointer_to_pointer_slot_is_refused[{name}]"] = (
+            POINTER_INTO_POINTER_TO_POINTER[name] + ENTRY, VALUE_INTO_SHARED_REF)
+    for name in sorted(ANOTHER_STRUCT_BINDING):
+        rows[f"a_binding_of_another_struct_is_refused_at_the_binding[{name}]"] = (
+            ANOTHER_D + ANOTHER_STRUCT_BINDING[name], another_struct("d", "D", "C"))
+    for name in sorted(ANOTHER_STRUCT_RETURN):
+        rows[f"a_struct_of_another_type_returned_is_refused_at_the_return[{name}]"] = (
+            ANOTHER_D + ANOTHER_STRUCT_RETURN[name] + "\npub fn main() -> i32\n    return 3\n",
+            another_struct_return("D", "C"))
+    for name in sorted(ANOTHER_STRUCT_SLOT):
+        program, message = ANOTHER_STRUCT_SLOT[name]
+        rows[f"a_struct_of_another_type_in_a_by_value_slot_is_refused_at_the_slot[{name}]"] = (
+            ANOTHER_D + program, message)
+    for name in sorted(NOT_INDEXED):
+        type_name, program = NOT_INDEXED[name]
+        rows[f"deref_of_a_pointer_to_a_value_is_not_indexed[{name}]"] = (program, needs_index(type_name))
+    return rows
+
+
+REFUSAL_ROWS = _refusal_rows()
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(NOT_INDEXED))
-def test_deref_of_a_pointer_to_a_value_is_not_indexed(tmp_path, compiler, name):
-    type_name, program = NOT_INDEXED[name]
-    _assert_refused(compiler, tmp_path, name, program, needs_index(type_name))
+def test_every_refusal(tmp_path, compiler):
+    import test_table_rows as table_rows
+    table_rows.assert_refusals(compiler, tmp_path, REFUSAL_ROWS,
+                               compile=_no_ll(ref_into_value._batch_compile))
+
+
+def _not_a_program(compiler, ritz1_bin, tmp_path, name):
+    """Why REFUSED[name] makes a program on `compiler`, or None: refused, or
+    its module won't link as the type it claims."""
+    comp, ll, work = _compile(compiler, ritz1_bin, tmp_path, name, REFUSED[name])
+    if comp.returncode != 0:
+        return None
+    link = subprocess.run(["clang", str(ll), "-o", str(work / "main"), "-nostdlib",
+                           str(RITZ_START)], cwd=work, capture_output=True, text=True)
+    if link.returncode == 0:
+        return "compiled and linked"
+    if not re.search(r"defined with type|doesn't match function result type", link.stderr):
+        return f"wouldn't link, but not for its type:\n{link.stderr[-600:]}"
+    return None
+
+
+# Each compiled on its own, as before: whether clang takes the module is no
+# batch's to say.
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", PAIR)
+def test_by_value_slot_of_another_type_is_refused(ritz1_bin, tmp_path, compiler):
+    failures = [f"{compiler} by_value_slot_of_another_type_is_refused[{name}]: {why}"
+                for name in sorted(REFUSED)
+                for why in [_not_a_program(compiler, ritz1_bin, tmp_path, name)] if why]
+    assert not failures, f"{compiler}: {len(failures)} of {len(REFUSED)} rows failed:\n" + "\n".join(failures)

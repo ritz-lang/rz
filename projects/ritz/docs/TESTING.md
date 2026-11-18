@@ -455,7 +455,10 @@ Rules:
    differ from its batch's is compiled alone as well
    (`test_deref_index.py`: 5 to 3 CPU-s).  A file whose rows all reach a
    generic saves little CPU, because #2867's leaning check still compiles
-   each row alone.
+   each row alone.  AGAST #4141 did 7 more (3,962 tests to 124).  A row
+   that must also prove no `.ll` was written, or that each compiler says
+   what ritz0 says, keeps a small loop that collects every failing row
+   and raises once through `table_rows._assert_none`.
 3. **Link with `fast_link.clang`** when the link is expected to succeed.
    Anything it does not model, and every failure, is answered by real clang,
    so messages are clang's.  Call clang directly when a test asserts that a

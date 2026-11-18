@@ -20,12 +20,22 @@ the same `line:col: message`.
 
 Whether an `@x` held in a `*T` counts as a borrow is #2371's, and a reference to
 another type is #2367's and #2368's. Nothing here decides those.
+
+The matrices are table rows (AGAST #4141): `test_a_reference_to_a_local_is_refused`,
+`test_what_outlives_the_fn_still_runs` and `test_what_the_spec_leaves_unchecked_compiles`
+are one test per compiler, checking every row with test_table_rows's
+assert_refusals / assert_runs under the id its parametrised test had less the
+compiler (`a_reference_to_a_local_is_refused[address_shared]`; an ALLOWED or
+NOT_CHECKED row drops the old id's leading `_`: `what_outlives_the_fn_still_runs[lent_mutable]`),
+and a failure names its rows.  An UNCHECKED_GAPS entry is a strict xfail on the
+ritz1s, as it was.
 """
 
 import pytest
 
 from ref_rules import returns_local
-from test_ref_into_value import COMPILERS, _assert_refused, _ids, _main, _run
+from test_ref_into_value import COMPILERS, _ids, _main, _run
+from test_table_rows import assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 
@@ -332,37 +342,45 @@ def _wrap(body):
     return _main(TYPES + body, "    0\n")
 
 
-def _rows(*tables):
-    for prefix, table, gaps in tables:
-        for site in _ids(table):
-            for compiler in COMPILERS:
-                row = (f"{prefix}_{site}", table[site], compiler)
-                if site in gaps and compiler != "ritz0":
-                    mark = pytest.mark.xfail(strict=True, reason=f"#{gaps[site]}")
-                    yield pytest.param(*row, marks=mark, id=f"{row[0]}-{compiler}")
-                else:
-                    yield pytest.param(*row, id=f"{row[0]}-{compiler}")
+def _refusal_rows():
+    """{old id less the compiler: (marked program, message)}."""
+    return {f"a_reference_to_a_local_is_refused[{prefix}_{site}]": (_wrap(table[site][0]),
+                                                                    returns_local(table[site][1]))
+            for prefix, table in (("address", ADDRESSES), ("landing", LANDINGS),
+                                  ("binding", BINDINGS), ("call", CALLS))
+            for site in _ids(table)}
 
 
-@pytest.mark.parametrize("site,row,compiler", list(_rows(("address", ADDRESSES, {}),
-                                                         ("landing", LANDINGS, {}),
-                                                         ("binding", BINDINGS, {}),
-                                                         ("call", CALLS, {}))))
-def test_a_reference_to_a_local_is_refused(tmp_path, compiler, site, row):
-    body, root = row
-    _assert_refused(compiler, tmp_path, site, _wrap(body), returns_local(root))
+def _allowed_rows():
+    return {f"what_outlives_the_fn_still_runs[{site}]":
+            (_main(TYPES + ALLOWED[site][0], f"    var c = C {{ x: 1 }}\n    {ALLOWED[site][1]}\n    c.x\n"),
+             ALLOWED[site][2])
+            for site in _ids(ALLOWED)}
 
 
-@pytest.mark.parametrize("site,row,compiler", list(_rows(("", ALLOWED, {}))))
-def test_what_outlives_the_fn_still_runs(tmp_path, compiler, site, row):
-    fn, call, want = row
-    src = _main(TYPES + fn, f"    var c = C {{ x: 1 }}\n    {call}\n    c.x\n")
-    assert _run(compiler, tmp_path, site, src) == want
+def _unchecked_rows():
+    """Each runs and exits 0, as the parametrised test asked; and its gaps."""
+    name = "what_the_spec_leaves_unchecked_compiles[{}]".format
+    return ({name(site): (_wrap(NOT_CHECKED[site]), 0) for site in _ids(NOT_CHECKED)},
+            {name(site): ticket for site, ticket in UNCHECKED_GAPS.items()})
 
 
-@pytest.mark.parametrize("site,row,compiler", list(_rows(("", NOT_CHECKED, UNCHECKED_GAPS))))
-def test_what_the_spec_leaves_unchecked_compiles(tmp_path, compiler, site, row):
-    assert _run(compiler, tmp_path, site, _wrap(row)) == 0
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_reference_to_a_local_is_refused(tmp_path, compiler):
+    """Every (a), landing, (b) and (c) row: the whole message, at its `^`."""
+    assert_refusals(compiler, tmp_path, _refusal_rows())
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_what_outlives_the_fn_still_runs(tmp_path, compiler):
+    assert_runs(compiler, tmp_path, _allowed_rows())
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_what_the_spec_leaves_unchecked_compiles(tmp_path, compiler):
+    """A gap is a strict xfail on the ritz1s, as it was."""
+    rows, gaps = _unchecked_rows()
+    assert_runs(compiler, tmp_path, rows, gaps if compiler != "ritz0" else {})
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
