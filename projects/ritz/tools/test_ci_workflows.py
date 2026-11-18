@@ -26,6 +26,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+import re
+
 import pytest
 import yaml
 
@@ -109,19 +111,26 @@ def test_one_ritz_lint():
 
 @pytest.mark.unit
 def test_gate_coverage_is_documented_where_main_yml_points():
-    """main.yml says test-all runs only after the merge and cites the
-    "Gate coverage" section; the section exists and names every job."""
+    """main.yml cites the "Gate coverage" section; the section exists, names
+    every job, and every job runs before a merge (AGAST #3969: test-all
+    too, run-gate.sh's --job list)."""
     main = (WORKFLOWS / "main.yml").read_text()
     assert '"Gate coverage" in .claude/skills/rz-iterate/SKILL.md' in main
     skill = (REPO_ROOT / ".claude" / "skills" / "rz-iterate" / "SKILL.md").read_text()
     head = "### Gate coverage"
     assert head in skill
     section = skill.split(head, 1)[1].split("\n### ", 1)[0]
-    # One table row per main.yml job, and test-all's row says "no".
+    # One table row per main.yml job, each gated before the merge, as
+    # run-gate.sh's `--job` list says.
     rows = {line.split("`")[1]: line for line in section.splitlines()
             if line.startswith("| `")}
-    assert sorted(rows) == sorted(yaml.safe_load(main)["jobs"]), sorted(rows)
-    assert rows["test-all"].split("|")[2].strip().startswith("**no**"), rows["test-all"]
+    jobs = sorted(yaml.safe_load(main)["jobs"])
+    assert sorted(rows) == jobs, sorted(rows)
+    for job, row in rows.items():
+        assert row.split("|")[2].strip().startswith("yes"), row
+    gate = (REPO_ROOT / ".claude/skills/rz-iterate/run-gate.sh").read_text()
+    cmd = next(line for line in gate.splitlines() if line.startswith("CMD="))
+    assert sorted(re.findall(r"--job ([\w-]+)", cmd)) == jobs, cmd
 
 
 @pytest.mark.unit

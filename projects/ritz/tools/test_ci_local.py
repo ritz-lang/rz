@@ -333,9 +333,11 @@ def test_gate_runner_defaults_to_fail_fast():
     assert re.search(r"ci-local ARGS=\S*--fail-fast", cmd_line), cmd_line
 
 
-def test_gate_runner_runs_build_all_and_bootstrap():
+def test_gate_runner_runs_build_all_test_all_and_bootstrap():
     """AGAST #2141: #2124 broke angelo, passed a bootstrap-only gate, and
-    turned main's build-all red. The gate runs both jobs."""
+    turned main's build-all red. The gate runs both jobs. AGAST #3969
+    (Aaron 2026-11-18): it runs main.yml's test-all job too, so a package
+    test break fails the gate instead of CI after the push to main."""
     gate = ci_local.REPO_ROOT / ".claude/skills/rz-iterate/run-gate.sh"
     if not gate.is_file():
         pytest.skip("run-gate.sh is not part of this checkout")
@@ -344,12 +346,14 @@ def test_gate_runner_runs_build_all_and_bootstrap():
     args = re.search(r'ci-local ARGS=\\"([^"\\]*)\\"', cmd_line)
     assert args, cmd_line
     jobs = re.findall(r"--job (\S+)", args.group(1))
-    assert set(jobs) == {"build-all", "bootstrap"}, cmd_line
+    assert set(jobs) == {"build-all", "test-all", "bootstrap"}, cmd_line
+    # The gate runs the job CI runs, not a copy of its command.
+    assert "test-all" in ci_local.jobs_in(ci_local.load_steps())
     # --wait's summary must surface the verdicts: which project broke, and a
     # setup error as itself.
     wait_grep = next(line for line in text.splitlines()
                      if "grep -E" in line and "EXIT" in line)
-    for needle in ("Failed build", "SETUP ERROR"):
+    for needle in ("Failed build", "SETUP ERROR", "^PKG "):
         assert needle in wait_grep, wait_grep
 
 

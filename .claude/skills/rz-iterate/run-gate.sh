@@ -181,7 +181,11 @@ fi
 # (`--skip Smoke`, AGAST #1897) rather than pay ~30 s to run it again.
 # build-all runs first (main.yml order): ~30 s on a warm CAS, so a broken
 # ecosystem package fails before the long bootstrap job (AGAST #2141).
-CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke --job build-all --job bootstrap\"}"
+# test-all (`./rz test --all`) runs next (AGAST #3969, Aaron 2026-11-18): a
+# package test break fails the gate, not CI after the push to main.  It is
+# main.yml's own job, so CI and the gate run the same command, on the CAS
+# build-all just warmed; one `PKG <VERDICT> <id>` line per package.
+CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke --job build-all --job test-all --job bootstrap\"}"
 # A merge train's package tests (AGAST #3363), only once CMD has passed.
 if [[ -n "${RZ_GATE_AFTER:-}" ]]; then CMD="($CMD) && $RZ_GATE_AFTER"; fi
 UNIT="ritz-gate-$NAME"

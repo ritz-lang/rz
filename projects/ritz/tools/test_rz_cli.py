@@ -254,6 +254,33 @@ class TestKnownFailingConfig:
         assert "[ci.known_failing.build]" in out
         assert "[ci.known_failing.test]" not in out
 
+    def test_gate_summary_has_one_verdict_line_per_package(self, rz, capsys):
+        # AGAST #3969: the room gate runs `rz test --all`, and its log must
+        # say what happened to EACH package, in the `PKG <VERDICT> <id>`
+        # form train.sh's package step already prints (run-gate.sh --wait
+        # greps `^PKG `). Passes first, then the lines that matter, so a
+        # FAIL survives the --wait summary's `tail -20`.
+        rz.summarize_gate("test", ["bad", "old", "nomake"],
+                          {"old": "AGAST #1 compile", "stale": "AGAST #2"},
+                          ["ok", "bad", "old", "stale", "nomake", "ok2"],
+                          list_kind="build", setup=["nomake"])
+        pkg = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("PKG ")]
+        assert pkg == [
+            "PKG PASS ok",
+            "PKG PASS ok2",
+            "PKG KNOWN old: AGAST #1 compile",
+            "PKG XPASS stale: excused in [ci.known_failing.build] but passed",
+            "PKG SETUP nomake: a missing tool, not a regression",
+            "PKG FAIL bad",
+        ], pkg
+
+    def test_gate_summary_verdict_lines_on_a_clean_sweep(self, rz, capsys):
+        assert rz.summarize_gate("build", [], {}, ["b", "a"]) == 0
+        pkg = [line for line in capsys.readouterr().out.splitlines()
+               if line.startswith("PKG ")]
+        assert pkg == ["PKG PASS b", "PKG PASS a"]
+
 
 @pytest.mark.unit
 class TestBuildPyRitzPathForTests:

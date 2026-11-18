@@ -28,9 +28,9 @@ Usage
     python3 tools/ci_local.py --list              # what CI declares
     python3 tools/ci_local.py                     # run the `bootstrap` job
     python3 tools/ci_local.py --job build-all
-    python3 tools/ci_local.py --job build-all --job bootstrap   # the room gate
-    python3 tools/ci_local.py --jobs              # every job (slow: test-all
-                                                  # sweeps 26 projects, ~50m)
+    python3 tools/ci_local.py --job build-all --job test-all --job bootstrap
+                                                  # the room gate
+    python3 tools/ci_local.py --jobs              # every job
 
 `bootstrap` is the default because it is the compiler gate -- doc examples,
 tools tests, harness self-tests, ritz0 unit tests, the bootstrap chain, the
@@ -68,9 +68,12 @@ runs, so a renamed step cannot quietly turn the skip into a no-op. Skipped
 steps are listed in the summary.
 
 `--job` is repeatable; the selected jobs run in workflow order. The gate runner
-runs `--job build-all --job bootstrap` (AGAST #2141): bootstrap alone is the
+runs `--job build-all --job test-all --job bootstrap`. Bootstrap alone is the
 compiler gate, but a compiler change can break an ecosystem package -- #2124
-broke angelo, gated green, and turned main's build-all red for nine runs.
+broke angelo, gated green, and turned main's build-all red for nine runs
+(AGAST #2141). test-all (`./rz test --all`, one `PKG <VERDICT> <id>` line per
+package) followed for the same reason: a package test break showed up only in
+CI after the push to main (AGAST #3969).
 
 Likely failures first (AGAST #3456, LARB review/5 tooling F4). The ritz0
 pytest step starts ~6 minutes into a gate, so the 10 of 18 red gates that

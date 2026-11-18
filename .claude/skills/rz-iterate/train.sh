@@ -250,7 +250,11 @@ cmd_gate() {
 # The gate's build-all + bootstrap jobs cover the compiler, not the workspace
 # projects' own tests: #3290's bug landed through a green train and only CI's
 # test-all caught it.  So once those jobs pass, the train gate also runs
-# `train.sh pkgs test <base>` from the train worktree (the tip is HEAD):
+# `train.sh pkgs test <base>` from the train worktree (the tip is HEAD).
+# Since AGAST #3969 the gate runs main.yml's test-all job too, which tests
+# every package before this step, so this step re-runs packages that already
+# passed: a failure stops the gate at test-all, before the PRE-EXISTING base
+# re-run below gets a chance to run.
 #
 #   pkgs list <base>   the package dirs the train touches, one per line
 #   pkgs test <base>   test each; exit 1 on a failure the base doesn't have

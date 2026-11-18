@@ -518,31 +518,46 @@ nothing more than it takes to act on it:
 reap ritz-task-1450 1a2b3c4
 ```
 
-### Gate coverage: what runs before a merge (AGAST #1838)
+### Gate coverage: what runs before a merge (AGAST #1838, #3969)
 
 `.github/workflows/main.yml` is the only workflow, and it runs on push to
 `main`, i.e. **after** the merge. Before the merge, the only check is the gate:
-`make -C projects/ritz ci-local` over main.yml's `build-all` and `bootstrap`
-jobs (room gate and train gate), plus `train.sh pkgs test` on the packages a
-train touches. So:
+`make -C projects/ritz ci-local` over main.yml's `build-all`, `test-all` and
+`bootstrap` jobs (room gate and train gate, both through run-gate.sh's
+default command), plus `train.sh pkgs test` on the packages a train touches.
+So:
 
 | main.yml job | before merge | after merge (CI) |
 |---|---|---|
 | `build-all` (`./rz build --all`) | yes (#2141) | yes |
+| `test-all` (`./rz test --all`) | yes (#3969, Aaron 2026-11-18) | yes |
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
-| `test-all` (`./rz test --all`) | **no**: only touched packages, train gate | yes |
 
-A test-all failure in a package the train didn't touch reaches `main`
-unseen, and CI finds it afterwards. pr.yml (a pull_request workflow that
-never fired, since nothing lands by PR) and the advisory `lint-all` job were
-deleted. ritz-lint is a local pre-commit hook
+`test-all` runs between build-all and bootstrap, in workflow order, on the
+CAS build-all just warmed. It's main.yml's own job, not a copy of its
+command, so the gate and CI can't drift. The sweep prints one verdict line
+per package, `PKG PASS|KNOWN|XPASS|SETUP|FAIL <id>`, with the failures last
+so `run-gate.sh --wait` (`grep '^PKG '`, `tail -20`) shows them.
+`[ci.known_failing.build]` entries stay advisory (`PKG KNOWN`); any other
+failure fails the gate. pr.yml (a pull_request workflow that never fired,
+since nothing lands by PR) and the advisory `lint-all` job were deleted.
+ritz-lint is a local pre-commit hook
 (`projects/ritz/tools/ritz-lint/install-hook.sh`).
 
-Cost measured on bangerang (28 cores, room CPU weight, 2026-11-17):
-`./rz build --all` cold cache 16 s; `./rz test --all` cold 23 s and warm
-8 s. The figure above for omegalisk under a running gate was 142 s.
-Whether to add `test-all` to the gate is Aaron's decision (proposed in the
-#1838 REAP). Until he decides, the table above is the rule.
+Evidence (#3969, 2026-11-18): 5/5 clean `./rz test --all -j 28` runs on main
+472d77bb on bangerang (28/28 packages each time, no flakes; 40 s cold, 9 s
+warm). A planted failing `[[test]]` in a scratch package passed every
+build-all step and failed the room gate at `[Test workspace]`
+(`PKG FAIL zz_plant3969`, EXIT=2).
+
+Added gate wall time: on bangerang (28 cores, gate slice), the
+`[Test workspace]` step took 23.6 s in the gate (a fresh tree, after
+build-all), against a ci-local total of 491 s for a pre-#3969 gate (#1838's).
+On omegalisk: not measured in-gate yet. #1838 measured `rz test --all` at
+142 s there (`-j 6`, room CPU weight, with a gate running: room load, the
+worst case). The first omegalisk train gate after #3969 lands prints the
+in-gate figure (`[Test workspace] END ... <secs>s`). If that's over ~180 s,
+cap `-j` or reuse the cache.
 
 ### Merge trains (Aaron, 2026-11-12)
 
@@ -660,9 +675,11 @@ train 1.
    `rz test --all`), `PKG PRE-EXISTING` (fails on the base too, so it was
    re-run in a temp worktree of the base: not this train's) or `PKG FAIL`
    (passes on the base, or a new package): the gate fails. Treat a
-   `PKG FAIL` like any other red gate. Not the whole `test-all`: it took
-   142 s on omegalisk (`-j 6`, room CPU weight, with a gate running), which
-   would add about 10% to every train, compiler-only ones too.
+   `PKG FAIL` like any other red gate. Since #3969 the gate's own
+   `test-all` job runs every package first, so this step only re-runs
+   packages that already passed. A package failure stops the gate at
+   `[Test workspace]` before the PRE-EXISTING base re-run gets a chance
+   (follow-up: #3970).
    `train.sh pkgs list <base>` (run in the train worktree) previews the set.
    **When the train gate ends, pass or fail, it reserves the slot for the
    next train** (`gate-logs/.train-reserved`, #3427), before it lets go of
@@ -761,7 +778,7 @@ the next merge. Committing to `main` from this room (skill edits and the
 like) needs no message either; it just becomes the next train's base.
 
 GitHub CI: glance at `gh run list -L 3` each turn. Red on an already-known
-failure set is normal (`test-all` has known reds). A **new** failure becomes a
+failure set is normal (`[ci.known_failing.build]` reds). A **new** failure becomes a
 high-priority ticket and a room. Don't block merges on CI.
 
 ## Survey rooms

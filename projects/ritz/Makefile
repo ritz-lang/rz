@@ -166,8 +166,8 @@ smoke-stack:
 #   `make -C projects/ritz ...` from inside projects/ritz/ritz0 -> exit 2
 # Both look like a suite complaining rather than a command that never ran.
 #
-# Defaults to the `bootstrap` job (the compiler gate). `--jobs` runs everything,
-# including the 26-project `test-all` sweep (~50 min).
+# Defaults to the `bootstrap` job (the compiler gate). `--jobs` runs everything.
+# The room gate runs build-all, test-all and bootstrap (run-gate.sh).
 #   make ci-local                       bootstrap
 #   make ci-local ARGS="--list"         what CI declares
 #   make ci-local ARGS="--jobs"         everything
