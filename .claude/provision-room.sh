@@ -74,12 +74,13 @@ set -euo pipefail
 # ~/dev/.venv (most hosts), then ~/dev/nevelis/.venv (omegalisk), if present.
 # "No PATH" includes bash's own fallback, which it sets but doesn't export.
 : "${HOME:=$(getent passwd "$(id -u)" | cut -d: -f6)}"
+# Pure bash: with no PATH yet, there may be no dirname to run.
+_d="${BASH_SOURCE[0]%/*}"; [[ "$_d" != "${BASH_SOURCE[0]}" ]] || _d=.
+# shellcheck source=host-env.sh
+source "$_d/host-env.sh"
+unset _d
 if [[ -z "${PATH:-}" || "$(declare -p PATH)" != "declare -x"* ]]; then
-    PATH=/usr/local/bin:/usr/bin:/bin
-    for _v in "$HOME/dev/nevelis/.venv/bin" "$HOME/dev/.venv/bin"; do
-        [[ -d "$_v" ]] && PATH="$_v:$PATH"
-    done
-    unset _v
+    PATH="$(rz_venv_path /usr/local/bin:/usr/bin:/bin)"
 fi
 export HOME PATH
 

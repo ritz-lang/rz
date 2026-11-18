@@ -106,6 +106,11 @@ REMOTE_WT="${RZ_REMOTE_WT:-dev/ritz-lang/rz-train-remote}"
 REMOTE_GATE="${RZ_REMOTE_GATE:--}"      # - = the train tree's own run-gate.sh
 SSH_RETRY="${RZ_TRAIN_SSH_RETRY:-30}"   # seconds between ssh retries
 WAIT_SLICE="${RZ_TRAIN_WAIT_SLICE:-540}"
+# Pause before re-polling a gate still queued whose --wait slice ended early.
+QUEUED_PAUSE="${RZ_TRAIN_QUEUED_PAUSE:-15}"
+# rz_venv_path, sent to the gate host with REMOTE_SH (AGAST #4025).
+# shellcheck source=../../host-env.sh
+source "$HERE/../../host-env.sh"
 
 die() { echo "error: $*" >&2; exit 1; }
 WT="$TRAIN_WT"                      # the train being worked on (use_slot)
@@ -134,15 +139,40 @@ front() { local s; s="$(queue | head -1)"; [[ -n "$s" ]] || die "no train built"
 # bash has read the whole script by then, so no command can eat it off stdin.
 #   start <repo> <wt> <gate|-> <ref> <tip> <base> <name> <pkgs 0|1>
 #                                  fetch, check out, start the gate; prints
-#                                  the remote log path
-#   wait <wt> <gate|-> <log> <secs> run-gate.sh --wait for at most <secs>
-#                                  (124: still running)
+#                                  the remote log path.  The gate runs on the
+#                                  host's venv (rz_venv_path: a login shell's
+#                                  PATH has none, AGAST #4025), and start
+#                                  refuses before it takes a slot if that
+#                                  python3 can't import pytest
+#   wait <wt> <gate|-> <log> <secs> <pause>
+#                                  run-gate.sh --wait for at most <secs>
+#                                  (124: still running).  A gate with no
+#                                  EXIT yet whose unit is active or whose
+#                                  waiter is queued for a slot is still
+#                                  running, whatever code --wait ended with
+#                                  (AGAST #4025); after an early end, sleep
+#                                  <pause> first so a re-poll can't spin
 #   cat <log>                      the log
 #   stop <name>                    stop the gate's unit, if it runs
 read -r -d '' REMOTE_SH <<'EOF' || true
 set -euo pipefail
 abs() { case "$1" in /*) echo "$1" ;; *) echo "$HOME/$1" ;; esac; }
 gate_of() { if [ "$2" = - ]; then echo "$1/.claude/skills/rz-iterate/run-gate.sh"; else echo "$2"; fi; }
+# alive <log>: the log's gate is still going: its unit (the log's UNIT=) is
+# active, or its line in the gate dir's .gate-queue ("<unit> <pid> ...",
+# run-gate.sh) names a live pid: queued for a slot.
+alive() {
+    local unit q u p rest
+    unit="$(sed -n 's/^UNIT=//p' "$1" | head -1)"
+    [ -n "$unit" ] || return 1
+    systemctl --user is-active -q "$unit" 2>/dev/null && return 0
+    q="$(dirname "$1")/.gate-queue"
+    [ -f "$q" ] || return 1
+    while read -r u p rest; do
+        [ "$u" = "$unit" ] && kill -0 "$p" 2>/dev/null && return 0
+    done < "$q"
+    return 1
+}
 main() {
     # systemd-run --user needs the user bus; a non-login ssh may not set it.
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -151,6 +181,11 @@ main() {
     start)
         local repo wt gate got after=""
         repo="$(abs "$1")"; wt="$(abs "$2")"; gate="$(gate_of "$wt" "$3")"
+        PATH="$(rz_venv_path "$PATH")"; export PATH
+        if ! python3 -c 'import pytest' >/dev/null 2>&1; then
+            echo "error: $(hostname): the gate's python3 ($(command -v python3 || echo none)) can't import pytest; no gate started (PATH=$PATH)" >&2
+            exit 1
+        fi
         git -C "$repo" fetch -q origin "refs/heads/$4"
         got="$(git -C "$repo" rev-parse FETCH_HEAD)"
         [ "$got" = "$5" ] || { echo "error: origin $4 is $got, not the train tip $5" >&2; exit 1; }
@@ -159,8 +194,14 @@ main() {
         [ "$8" = 1 ] && after="bash $(printf %q "$wt/.claude/skills/rz-iterate/train.sh") pkgs test $6"
         RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$after" bash "$gate" "$wt" "$7" ;;
     wait)
-        local rc=0
+        local rc=0 t0
+        t0="$(date +%s)"
         timeout "$4" bash "$(gate_of "$(abs "$1")" "$2")" --wait "$3" >&2 || rc=$?
+        if [ "$rc" != 124 ] && ! grep -q '^EXIT=' "$3" && alive "$3"; then
+            echo "no verdict yet, gate still running or queued (--wait exit $rc)" >&2
+            [ $(( $(date +%s) - t0 )) -ge "$5" ] || sleep "$5"
+            rc=124
+        fi
         exit "$rc" ;;
     cat) cat "$1" ;;
     stop) systemctl --user stop "ritz-gate-$1" 2>/dev/null || true ;;
@@ -175,7 +216,8 @@ EOF
 remote() {
     local host="$1"; shift
     # shellcheck disable=SC2086  # $SSH is a command line
-    $SSH "$host" "bash -l -s -- $(printf '%q ' "$@")" <<<"$REMOTE_SH"
+    $SSH "$host" "bash -l -s -- $(printf '%q ' "$@")" <<<"$(declare -f rz_venv_path)
+$REMOTE_SH"
 }
 
 # discard_spec: drop the current train's speculative gate, if it has one.
@@ -411,7 +453,7 @@ cmd_wait() {
     read -r host ref rlog llog <<<"$spec"
     tip="$(field TIP "$st")"
     while :; do
-        rc=0; remote "$host" wait "$REMOTE_WT" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" || rc=$?
+        rc=0; remote "$host" wait "$REMOTE_WT" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" "$QUEUED_PAUSE" || rc=$?
         [[ $rc -eq 124 ]] && continue                     # still running
         if [[ $rc -eq 255 ]]; then                        # ssh itself failed
             tries=$((tries + 1))

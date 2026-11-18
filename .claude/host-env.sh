@@ -74,3 +74,18 @@ rz_size_bytes() {
     esac
     echo $(("${v%[KMG]}" * mult))
 }
+
+# rz_venv_path <path>: <path> with the gate's venv bin dirs in front, as on a
+# host's own PATH: ~/dev/.venv (most hosts) first, then ~/dev/nevelis/.venv
+# (omegalisk), each only if present.  For a PATH that has no venv on it: a
+# hook's clean environment (provision-room.sh, AGAST #3722) or a remote login
+# shell, whose /etc/profile resets PATH (train.sh's remote gate, AGAST #4025;
+# train.sh sends this function's text to the host with `declare -f`, so keep
+# it self-contained).
+rz_venv_path() {
+    local p="$1" v
+    for v in "$HOME/dev/nevelis/.venv/bin" "$HOME/dev/.venv/bin"; do
+        if [[ -d "$v" ]]; then p="$v:$p"; fi
+    done
+    echo "$p"
+}

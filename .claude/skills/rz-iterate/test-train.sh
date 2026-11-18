@@ -428,20 +428,43 @@ cat > "$T/bin/fakessh" <<'EOF'
 host="$1"; shift
 echo "$host $*" >> "$RZ_TEST_DIR/ssh-log"
 [[ -e "$RZ_TEST_DIR/ssh-down" ]] && { echo "ssh: connect to host $host: refused" >&2; exit 255; }
-exec bash -c "$*"
+# The remote user's own HOME (its venv lives there), and a login shell's
+# PATH: /etc/profile resets it, so no venv on it (AGAST #4025).
+HOME="$RZ_TEST_DIR/rhome" PATH=/usr/local/bin:/usr/bin:/bin exec bash -c "$*"
 EOF
 chmod +x "$T/bin/fakessh"
-# The fake gate can --wait too: exit with the log's verdict.
+# The remote host's gate venv: a python3 whose `import pytest` works unless
+# no-pytest exists.
+mkdir -p "$T/rhome/dev/.venv/bin"
+cat > "$T/rhome/dev/.venv/bin/python3" <<'EOF'
+#!/bin/sh
+[ -e "$RZ_TEST_DIR/no-pytest" ] && { echo "No module named pytest" >&2; exit 1; }
+exit 0
+EOF
+chmod +x "$T/rhome/dev/.venv/bin/python3"
+# The fake gate can --wait too: exit with the log's verdict.  A log with no
+# EXIT is a gate still queued for a slot: while queued-polls holds N > 0,
+# --wait exits RZ_FAKE_QUEUED_RC (not 124: #4025) and counts down; at 0 the
+# gate "ends" with EXIT=0.  The log records the python3 the gate would run.
 cat > "$T/gate.sh" <<'EOF'
 #!/usr/bin/env bash
-if [[ "$1" == --wait ]]; then echo "waited $2" >&2; exit "$(sed -n 's/^EXIT=//p' "$2" | tail -1)"; fi
+if [[ "$1" == --wait ]]; then
+    echo "waited $2" >&2
+    if ! grep -q '^EXIT=' "$2"; then
+        n="$(cat "$RZ_TEST_DIR/queued-polls" 2>/dev/null || echo 0)"
+        if [[ $n -gt 0 ]]; then echo $((n - 1)) > "$RZ_TEST_DIR/queued-polls"; exit "${RZ_FAKE_QUEUED_RC:-1}"; fi
+        [[ -e "$RZ_TEST_DIR/queued-polls" ]] && echo EXIT=0 >> "$2"
+    fi
+    exit "$(sed -n 's/^EXIT=//p' "$2" | tail -1)"
+fi
 log="$RZ_TEST_DIR/gate-$(git -C "$1" rev-parse --short=12 HEAD).log"
-printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" "${RZ_GATE_AFTER:-}" > "$log"
+printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\nPYTHON=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" "${RZ_GATE_AFTER:-}" "$(command -v python3)" > "$log"
 echo "$log"
 EOF
 git clone -q "$T/origin.git" "$T/remote-rz" 2>/dev/null
 export RZ_TRAIN_SSH="$T/bin/fakessh" RZ_TRAIN_REMOTE=hostx RZ_REMOTE_REPO="$T/remote-rz" \
     RZ_REMOTE_WT="$T/remote-train" RZ_REMOTE_GATE="$T/gate.sh" RZ_TRAIN_SSH_RETRY=0 RZ_GATE_SCRIPT="$T/gate.sh"
+export RZ_TRAIN_QUEUED_PAUSE=0
 RW="$T/remote-train"
 oref() { git -C "$M" ls-remote origin "refs/heads/rz-train/$1" | cut -f1; }
 specof() { bash "$TR" show 2>/dev/null | sed -n 's/^SPEC=//p' | head -1; }
@@ -553,4 +576,49 @@ has "$out" "^DISCARDED speculative gate on hostx for ${t2:0:12} " "discard drops
 [[ -z "$(oref "${t2:0:12}")" && -z "$(specof)" ]] && ok "discard deletes the ref and the SPEC line" \
     || bad "discard deletes the ref and the SPEC line"
 out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"; has "$out" "^MERGED +db2 " "the train then gates and lands here"
+
+# 11e. The remote login shell has no venv on PATH (AGAST #4025): the gate
+# runs the host's venv python3, and `start` refuses before taking a slot
+# when that python3 can't import pytest.
+fetch; git -C "$M" checkout -q main
+two ea s/ea; bash "$TR" build "ea1:$c1" "ea2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate)"
+two eb s/eb; bash "$TR" build --next "eb1:$c1" "eb2:$c2" >/dev/null 2>&1
+t2="$(git -C "$T/train-2" rev-parse HEAD)"
+touch "$T/no-pytest"
+out="$(bash "$TR" gate --next 2>&1)"; rc=$?
+rm -f "$T/no-pytest"
+[[ $rc -ne 0 ]] && has "$out" "can.t import pytest" "gate --next refuses a host whose gate python has no pytest" \
+    || bad "gate --next refuses a host whose gate python has no pytest (rc=$rc)"
+[[ ! -e "$T/gate-${t2:0:12}.log" ]] && ok "the no-pytest refusal comes before the gate starts" \
+    || bad "the no-pytest refusal comes before the gate starts"
+[[ -z "$(oref "${t2:0:12}")" && -z "$(specof)" ]] && ok "the no-pytest refusal leaves no rz-train ref or SPEC" \
+    || bad "the no-pytest refusal leaves no rz-train ref or SPEC"
+llog="$(bash "$TR" gate --next 2>/dev/null)"
+rlog="$(specof | cut -d' ' -f3)"
+has "$(cat "$rlog" 2>/dev/null)" "^PYTHON=$T/rhome/dev/\.venv/bin/python3$" \
+    "the remote gate runs with the host's ~/dev/.venv first on PATH"
+
+# 11f. A remote gate still queued for a slot (no EXIT yet, its waiter alive)
+# is still running, whatever code its --wait slice ended with (AGAST #4025).
+sed -i '/^EXIT=/d' "$rlog"
+printf 'UNIT=rz-test-4025-no-such-unit\nWAITING for a gate slot, queue position 2 now\n' >> "$rlog"
+sleep 300 & qpid=$!
+echo "rz-test-4025-no-such-unit $qpid 1 $(date +%s)" > "$(dirname "$rlog")/.gate-queue"
+echo 2 > "$T/queued-polls"; : > "$T/ssh-log"
+out="$(timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" "wait keeps waiting through a queued remote gate's non-124 slice" \
+    || { bad "wait keeps waiting through a queued remote gate's non-124 slice (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+[[ "$(grep -c -- '-- wait ' "$T/ssh-log")" == 3 ]] && ok "wait polled the queued gate until its verdict" \
+    || bad "wait polled the queued gate until its verdict ($(grep -c -- '-- wait ' "$T/ssh-log") polls)"
+# Its waiter gone and still no EXIT: a dead gate, no verdict, not a hang.
+kill "$qpid" 2>/dev/null; wait "$qpid" 2>/dev/null
+sed -i '/^EXIT=/d' "$rlog"; echo 1 > "$T/queued-polls"
+out="$(timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 98 ]] && has "$out" "EXIT=none" "a queued remote gate whose waiter died is no verdict, not a hang" \
+    || bad "a queued remote gate whose waiter died is no verdict, not a hang (rc=$rc)"
+rm -f "$T/queued-polls" "$(dirname "$rlog")/.gate-queue"; echo EXIT=0 >> "$rlog"
+bash "$TR" wait "$llog" >/dev/null 2>&1
+bash "$TR" land "$log1" >/dev/null 2>&1
+out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "^MERGED +eb2 " "the queued-then-passed remote verdict lands"
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
