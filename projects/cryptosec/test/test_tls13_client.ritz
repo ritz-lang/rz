@@ -176,7 +176,7 @@ fn test_client_with_refused_hostname_never_handshakes() -> i32
         return 4
     # Feeding it a ServerHello does not move it on either.
     var sh: [256]u8
-    let sh_len: i64 = build_server_hello_1862(@sh[0], TLS_AES_128_GCM_SHA256)
+    let sh_len: i64 = build_server_hello_1862(@sh[0], @client, TLS_AES_128_GCM_SHA256)
     var out_len: i64 = 0
     if tls_client_process(@client, @sh[0], sh_len, @out[0], 2048, @out_len) != TLS_RESULT_ERROR
         return 5
@@ -522,8 +522,9 @@ fn test_config_pin_cert_bounds() -> i32
         return 5
     return 0
 
-# A plaintext ServerHello record selecting `suite`, with an X25519 key share.
-fn build_server_hello_1862(out: *u8, suite: u16) -> i64
+# A plaintext ServerHello record for `client` selecting `suite`, with an X25519
+# key share, echoing the client's session id.
+fn build_server_hello_1862(out: *u8, client: *TlsClient, suite: u16) -> i64
     var p: i64 = 9  # record header (5) + handshake header (4)
     out[p] = 0x03
     out[p + 1] = 0x03
@@ -533,8 +534,10 @@ fn build_server_hello_1862(out: *u8, suite: u16) -> i64
         out[p + i] = 0x11
         i += 1
     p = p + 32
-    out[p] = 0  # session id
-    p = p + 1
+    let sid_len: u8 = client.client_hello.session_id_len
+    out[p] = sid_len
+    mem_copy(out + p + 1, @client.client_hello.session_id[0], sid_len as u64)
+    p = p + 1 + sid_len as i64
     out[p] = ((suite >> 8) & 0xff) as u8
     out[p + 1] = (suite & 0xff) as u8
     p = p + 2
@@ -588,7 +591,7 @@ fn run_server_hello_1862(suite: u16) -> i32
     if tls_client_start(@client, @out[0], 1024) <= 0
         return -100
     var sh: [256]u8
-    let sh_len: i64 = build_server_hello_1862(@sh[0], suite)
+    let sh_len: i64 = build_server_hello_1862(@sh[0], @client, suite)
     var out_len: i64 = 0
     let r: i32 = tls_client_process(@client, @sh[0], sh_len, @out[0], 1024, @out_len)
     tls_client_free(@client)
@@ -664,7 +667,7 @@ fn run_after_server_hello_2109(client: *TlsClient, rec_len: i64, body: i64) -> i
         return -100
     var buf: [17000]u8
     memzero(@buf[0], 17000)
-    let sh_len: i64 = build_server_hello_1862(@buf[0], TLS_AES_128_GCM_SHA256)
+    let sh_len: i64 = build_server_hello_1862(@buf[0], client, TLS_AES_128_GCM_SHA256)
     buf[sh_len] = 23
     buf[sh_len + 1] = 0x03
     buf[sh_len + 2] = 0x03
@@ -757,7 +760,7 @@ fn run_2116(client: *TlsClient, pre: *u8, pre_len: i64, post: *u8, post_len: i64
         return -100
     var buf: [512]u8
     mem_copy(@buf[0], pre, pre_len as u64)
-    let sh_len: i64 = build_server_hello_1862(@buf[pre_len], TLS_AES_128_GCM_SHA256)
+    let sh_len: i64 = build_server_hello_1862(@buf[pre_len], client, TLS_AES_128_GCM_SHA256)
     mem_copy(@buf[pre_len + sh_len], post, post_len as u64)
     var out_len: i64 = 0
     return tls_client_process(client, @buf[0], pre_len + sh_len + post_len, @out[0], 1024, @out_len)
@@ -1449,6 +1452,20 @@ fn test_retry_refuses_server_hello_with_other_session_id() -> i32
     let r: i32 = past_hrr_2182(@client, 0, 5, @ch2[0], @ch2_len)
     if r != 0
         return r
+    var key: [32]u8
+    x25519_share_2182(@key[0])
+    var rec: [256]u8
+    let m: i64 = sh_2182(@rec[0], @client, TLS_AES_128_GCM_SHA256, GROUP_X25519, @key[0], 32)
+    rec[44] = rec[44] ^ 1
+    return expect_err_2182(@client, @rec[0], m, TLS_ERR_ILLEGAL_PARAMETER)
+
+[[test]]
+fn test_client_refuses_server_hello_with_other_session_id() -> i32
+    # RFC 8446 4.1.3 holds with no HelloRetryRequest before it too (#2188).
+    var client: TlsClient
+    var ch1: [1024]u8
+    if start_2182(@client, @ch1[0]) <= 0
+        return 1
     var key: [32]u8
     x25519_share_2182(@key[0])
     var rec: [256]u8
