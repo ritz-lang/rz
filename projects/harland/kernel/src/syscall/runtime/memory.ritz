@@ -6,7 +6,7 @@
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
 import serial { prints, serial_print_hex, serial_print_dec }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_get_free_pages }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_nx_flag, phys_to_virt }
 import fs.syscall { fs_process_pid, fs_process_mmap_next, fs_process_set_mmap_next }
 import syscall.errno { Errno }
@@ -289,6 +289,64 @@ fn sys_munmap_impl(addr: u64, length: u64) -> i64
     prints("\n")
 
     return 0
+
+# ============================================================================
+# Boot self-test: munmap gives back every page mmap took (#1443)
+# ============================================================================
+#
+# sys_munmap_impl once read vmm_unmap_page's u64 physical address into an
+# i32 and tested it as a 0=success status, so it never freed a page (except
+# one whose address truncated to 0). This maps MUNMAP_TEST_PAGES pages,
+# unmaps them and checks the PMM free count is back where it started.
+#
+# Runs from postinit_self_tests on the kernel PML4, before any process
+# exists, with interrupts off: nothing else allocates in between, so the
+# count is deterministic. PML4[1] (the mmap region) is never shared into
+# user PML4s, and the page tables mmap builds under it stay (munmap frees
+# leaf pages only), so a warm-up mmap/munmap builds them first and the
+# measured round trip allocates leaf pages only.
+const MUNMAP_TEST_PAGES: u64 = 8
+
+# Returns true when every page came back, false (after saying why) if not.
+pub fn munmap_self_test() -> bool
+    prints("\nTesting mmap/munmap page accounting...\n")
+    let flags: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+    let prot: u64 = PROT_READ | PROT_WRITE
+    let length: u64 = MUNMAP_TEST_PAGES * PAGE_SIZE
+
+    # Warm-up: builds the PDPT/PD/PT the measured round trip reuses.
+    if sys_mmap_impl(USER_MMAP_START, length, prot, flags) != USER_MMAP_START as i64
+        prints("  munmap test FAILED: warm-up mmap failed\n")
+        return false
+    sys_munmap_impl(USER_MMAP_START, length)
+
+    let before: u64 = pmm_get_free_pages()
+    if sys_mmap_impl(USER_MMAP_START, length, prot, flags) != USER_MMAP_START as i64
+        prints("  munmap test FAILED: mmap failed\n")
+        return false
+    let mapped: u64 = pmm_get_free_pages()
+    let munmap_result: i64 = sys_munmap_impl(USER_MMAP_START, length)
+    let after: u64 = pmm_get_free_pages()
+
+    prints("  free pages: before=")
+    serial_print_dec(before)
+    prints(" mapped=")
+    serial_print_dec(mapped)
+    prints(" after=")
+    serial_print_dec(after)
+    prints("\n")
+
+    if before - mapped != MUNMAP_TEST_PAGES
+        prints("  munmap test FAILED: mmap did not take exactly the pages it mapped\n")
+        return false
+    if munmap_result != 0 or after != before
+        prints("  munmap test FAILED: munmap did not free the pages it unmapped\n")
+        return false
+    if vmm_virt_to_phys(USER_MMAP_START) != 0
+        prints("  munmap test FAILED: page still mapped after munmap\n")
+        return false
+    prints("  munmap test PASSED!\n")
+    return true
 
 # ============================================================================
 # Memory syscall handlers
