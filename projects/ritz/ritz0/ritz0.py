@@ -34,6 +34,7 @@ import main_abi
 from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
 from builtin_types import check_builtin_impls, check_unknown_impl_targets
+from impl_placement import check_impl_placement
 from reachability import check_reachable
 from move_checker import MoveChecker, OwnershipError
 from monomorph import infer_struct_lit_args
@@ -282,9 +283,11 @@ def _check_impl_targets(ctx: _Compile) -> bool:
     """An `impl` on a built-in type (Span, StrView, Option, Result) no
     module declares (AGAST #3162).  After the merge, so an imported
     `struct Span<T>` makes Span an ordinary struct.  ...and on a type
-    nothing declares or imports (AGAST #3264)."""
+    nothing declares or imports (AGAST #3264).  ...and one outside its
+    type's (or trait's) file, or on one instantiation (LARB R65, #3493)."""
     errors = check_builtin_impls(ctx.module)
     errors += check_unknown_impl_targets(ctx.module)
+    errors += check_impl_placement(ctx.module)
     return _report(errors, "Error: ")
 
 

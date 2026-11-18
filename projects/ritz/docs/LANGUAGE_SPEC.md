@@ -4465,6 +4465,27 @@ i32` are errors at the type: "`i32` is a built-in type; it can't have an
 `impl`" (LARB R36, AGAST #3288). Trait impls on primitives come back with
 trait bounds (#1621) and cross-module impls (#3256).
 
+Where an `impl` lives (LARB R65, AGAST #3493). An inherent `impl T` is in the
+file that declares `T`. A trait impl is in the type's file or the trait's file;
+a trait the compiler knows (`Drop`, `Index`…) counts as the type's file.
+Anywhere else it is an error at the impl's type name: "`Foo` is declared in
+a.ritz: its `impl` must be there (§12.2)". All files share one namespace
+(§15.3), so nothing could say which file's method a call means, and adding an
+import could change it.
+
+An impl covers every instantiation of its type: `impl<T> G<T>`, never
+`impl G<u8>`, and not `impl<T> P<T, T>` or `impl<K> P<K, i32>` either. Each
+type argument is one of the impl's own parameters, each used once:
+
+```ritz expect-error=".ritz:4:6: an impl covers every instantiation of `G`: write `impl<T> G<T>`"
+struct G<T>
+    v: T
+
+impl G<u8>
+    fn get(self: @G<u8>) -> u8
+        self.v
+```
+
 `dyn` stays a reserved keyword (§2.4). Every use of it, in any type position
 or after `as`, is an error located at the `dyn` token, from ritz0, ritz1 and
 ritz1_selfhosted alike (AGAST #1620; runtime polymorphism is AGAST #3251):

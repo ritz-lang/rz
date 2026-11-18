@@ -119,42 +119,53 @@ def test_impl_on_builtin_type_refused(request, tmp_path, compiler, row):
     _assert_refused(compiler, tmp_path, row, PRELUDE + program, message(type_name))
 
 
-# A module's own enum of a built-in's name is ordinary: its impl compiles.
-# (Only compiles: whether a method of an impl on one instantiation is
-# reachable is #3256's question, and is "No method found" today.)
+# A module's own enum of a built-in's name is ordinary: check_builtin_impls
+# lets its impl through.  These rows compiled `impl Option<i32>`, one
+# instantiation, without calling it; LARB R65 (#3493) refuses that shape on
+# any type, so they are now R65's refusal rows, past this file's check.
+# ritz1's half is #3494.
 DECLARED = {
-    "own_option": """\
+    "own_option": ("Option", "impl<T> Option<T>", """\
 enum Option<T>
     Some(T)
     None
 
-impl Option<i32>
+impl ^Option<i32>
     fn zz(self: @Option<i32>) -> i32
         return 7
 
 pub fn main() -> i32
     let o: Option<i32> = Some(3)
     return 0
-""",
-    "own_result": """\
+"""),
+    "own_result": ("Result", "impl<T, E> Result<T, E>", """\
 enum Result<T, E>
     Ok(T)
     Err(E)
 
-impl Speak for Result<i32, i32>
+impl Speak for ^Result<i32, i32>
     fn say(self: @Result<i32, i32>) -> i32
         return 7
 
 pub fn main() -> i32
     let r: Result<i32, i32> = Ok(1)
     return 0
-""",
+"""),
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("row", sorted(DECLARED))
-def test_impl_on_declared_type_of_builtin_name_accepted(request, tmp_path, compiler, row):
+def _declared_params():
+    for row in sorted(DECLARED):
+        for compiler in COMPILERS:
+            marks = ([pytest.mark.xfail(strict=True, reason="#3494")]
+                     if compiler != "ritz0" else [])
+            yield pytest.param(row, compiler, marks=marks, id=f"{row}-{compiler}")
+
+
+@pytest.mark.parametrize("row,compiler", list(_declared_params()))
+def test_impl_on_one_instantiation_of_declared_type_refused(request, tmp_path, compiler, row):
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-    assert _run(compiler, tmp_path, row, PRELUDE + DECLARED[row]) == 0
+    type_name, write, program = DECLARED[row]
+    _assert_refused(compiler, tmp_path, row, PRELUDE + program,
+                    f"an impl covers every instantiation of `{type_name}`: write `{write}`")
