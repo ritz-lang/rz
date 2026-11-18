@@ -2320,13 +2320,14 @@ class LLVMEmitter:
             elem_type = llvm_type.element
 
         # Extract element values
+        is_ptr_array = isinstance(elem_type, ir.PointerType)
         if isinstance(value, rast.ArrayLit):
             elements = []
             for elem in value.elements:
                 if isinstance(elem, rast.StringLit) and is_strview_array:
                     elements.append(self._make_const_strview_value(elem.value, f"{name}.arr", elem_type))
-                elif isinstance(elem, rast.StringLit) and elem.as_ptr:
-                    elements.append(self._const_str_ptr(elem.value))
+                elif is_ptr_array:
+                    elements.append(self._const_ptr_table_elem(name, len(elements), elem, elem_type))
                 elif isinstance(elem, rast.StructLit):
                     elements.append(self._make_const_struct_value(
                         elem, elem_type, f"{name}.arr", (name, len(elements), "")))
@@ -2337,8 +2338,8 @@ class LLVMEmitter:
             if isinstance(value.value, rast.StringLit) and is_strview_array:
                 fill = self._make_const_strview_value(value.value.value, f"{name}.fill", elem_type)
                 elements = [fill] * value.count
-            elif isinstance(value.value, rast.StringLit) and value.value.as_ptr:
-                elements = [self._const_str_ptr(value.value.value)] * value.count
+            elif is_ptr_array:
+                elements = [self._const_ptr_table_elem(name, 0, value.value, elem_type)] * value.count
             else:
                 fill_val = self._fold_const_array_elem(name, 0, value.value, elem_type)
                 elements = [ir.Constant(elem_type, fill_val)] * value.count
@@ -2378,6 +2379,21 @@ class LLVMEmitter:
         if isinstance(expr, rast.StructLit):
             return self._make_const_struct_value(expr, target_type, name_hint)
         raise ValueError(f"Unsupported const expression for target {target_type}: {expr}")
+
+    def _const_ptr_table_elem(self, const_name: str, index: int, elem: rast.Expr,
+                              elem_type: ir.PointerType) -> ir.Constant:
+        """Element `index` of a `const T: [N]*u8` table (AGAST #1866): a
+        `"..."` or `c"..."` points at its NUL-terminated bytes, `null` is null.
+        Anything else, the integer 0 included, is an error at the element,
+        worded as ritz1's `const_ptr_table_error`."""
+        if isinstance(elem, rast.NullLit):
+            return ir.Constant(elem_type, None)
+        if isinstance(elem, (rast.StringLit, rast.CStringLit)) and elem_type == self.i8.as_pointer():
+            return self._const_str_ptr(elem.value)
+        raise EmitError(
+            f"const '{const_name}' element {index} is not a string literal or null",
+            getattr(elem, "span", None),
+        )
 
     def _const_str_ptr(self, value: str) -> ir.Constant:
         """A `*u8` constant for a string literal, NUL-terminated as they all are."""

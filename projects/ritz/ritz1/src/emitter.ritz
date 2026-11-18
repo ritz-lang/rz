@@ -11,6 +11,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.gvec
 import ritzlib.memory
+import diag              # diag_error_at (AGAST #1866)
 
 import ast
 import ast_helpers   # is_enum_type (AGAST #1660)
@@ -3072,32 +3073,67 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
         i = i + 1
     emit_str(s, c"]\n")
 
-# AGAST #2357: one element of a `const A: [N]*T` literal: a string (literal_array
-# retyped "..." already), null, or an integer folding to 0 (`[c"A", 0]`).
-# 1 if it is one of those.
-fn const_ptr_elem_ok(s: *EmitterState, e: *Expr) -> i32
-    if e.kind == EXPR_CSTRING_LIT or e.kind == EXPR_NIL_LIT
-        return 1
-    var v: i64 = 1
-    if const_fold_int(s.module.constants, e, 1, @v) == 1 and v == 0
-        return 1
-    0
+# AGAST #2357 / #1866: one element of a `const A: [N]*u8` table is a string
+# (literal_array retyped "..." already) or null; the integer 0 is not a
+# pointer (LANGUAGE_SPEC §3.3 "Constant tables").  1 if it is one of those.
+fn const_ptr_elem_ok(e: *Expr) -> i32
+    (e.kind == EXPR_CSTRING_LIT or e.kind == EXPR_NIL_LIT) as i32
 
-# `const A: [N]*T = [...]` as `@A = internal constant [N x ptr] [ptr @.str.K, ...]`.
-# An element that is not a string or null is a located error.
+# AGAST #1866: element `idx` of `const A: [N]*u8` is neither a string nor
+# null.  Reported at the element, worded as ritz0's _const_ptr_table_elem.
+fn const_ptr_table_error(s: *EmitterState, c: *ConstEntry, idx: i32, e: *Expr)
+    var line: i32 = e.span.line
+    var col: i32 = e.span.col
+    if line == 0
+        line = c.line
+        col = c.col
+    var file: *u8 = c.def_file
+    if file == null
+        file = c.src_file
+    if file == null
+        file = emitter_source_file()
+    diag_error_at(file, diag_span(line, col))
+    eprints_cstr(c"const '")
+    var i: i32 = 0
+    while i < c.name_len
+        eprint_char(*(c.name + i))
+        i += 1
+    eprints_cstr(c"' element ")
+    eprint_i64(idx as i64)
+    eprints_cstr(c" is not a string literal or null\n")
+    s.error_count = s.error_count + 1
+
+# `ptr @.str.K` for a string element, `ptr null` for null.
+fn emit_const_ptr_elem(s: *EmitterState, e: *Expr)
+    emit_str(s, c"ptr ")
+    if e.kind == EXPR_CSTRING_LIT
+        emit_cstring_const(s, e.string_ptr, e.string_len)
+    else
+        emit_str(s, c"null")
+
+# `const A: [N]*u8 = [...]`, or the fill `= [v; N]`, as
+# `@A = internal constant [N x ptr] [ptr @.str.K, ...]`.  An element that is
+# not a string or null is a located error.
 fn emit_const_ptr_array(s: *EmitterState, c: *ConstEntry)
     if was_global_emitted(s, c.name, c.name_len) == 1
         return
     mark_global_emitted(s, c.name, c.name_len)
+    var fill: *Expr = null
+    var first: *Expr = c.value_expr.args
+    if c.value_expr.kind == EXPR_ARRAY_FILL
+        fill = c.value_expr.left
+        first = fill
     var bad: i32 = 0
-    var fe: *Expr = c.value_expr.args
+    var fe: *Expr = first
     var fi: i32 = 0
     while fe != null
-        if const_ptr_elem_ok(s, fe) == 0
-            const_array_elem_error(s, c, fi)
+        if const_ptr_elem_ok(fe) == 0
+            const_ptr_table_error(s, c, fi, fe)
             bad = 1
         fi = fi + 1
         fe = fe.next
+        if fill != null
+            fe = null
     if bad == 1
         return
     emit_str(s, c"@")
@@ -3105,18 +3141,15 @@ fn emit_const_ptr_array(s: *EmitterState, c: *ConstEntry)
     emit_str(s, c" = internal constant [")
     emit_int(s, c.array_size as i64)
     emit_str(s, c" x ptr] [")
-    var pe: *Expr = c.value_expr.args
     var pi: i32 = 0
-    while pe != null
+    var pe: *Expr = first
+    while pi < c.array_size and pe != null
         if pi > 0
             emit_str(s, c", ")
-        emit_str(s, c"ptr ")
-        if pe.kind == EXPR_CSTRING_LIT
-            emit_cstring_const(s, pe.string_ptr, pe.string_len)
-        else
-            emit_str(s, c"null")
+        emit_const_ptr_elem(s, pe)
+        if fill == null
+            pe = pe.next
         pi = pi + 1
-        pe = pe.next
     emit_str(s, c"]\n")
 
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
@@ -3134,7 +3167,9 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     # array.  It used to emit no global, so `Z[i]` indexed through
     # `inttoptr i64 0`.  Fold `v` once and repeat it for all N elements.
     if is_fill == 1
-        if c.array_elem_type != TYPE_STRUCT
+        if c.array_elem_type == TYPE_PTR
+            emit_const_ptr_array(s, c)   # AGAST #1866: `[c"s"; N]`, `[null; N]`
+        else if c.array_elem_type != TYPE_STRUCT
             emit_const_array_fill_entry(s, c)
         return
     # Primitive-element arrays — `const VALUES: [3]i32 = [2, 3, 5]`.

@@ -283,7 +283,7 @@ def test_ritz1_emits_fill_global(ritz1_bin: Path, tmp_path: Path) -> None:
 
 
 # AGAST #2357: `[N]*u8` elements point at their literals' `@.str`, or are null.
-# ritz0 lowers `"..."` here but not `c"..."` (test_string_literal_slots.py).
+# ritz0 lowers both since AGAST #1866 (test_const_table_literals.py).
 PTR_ELEMENTS = """\
 const T: [3]*u8 = [c"A", c"BC", null]
 
@@ -319,7 +319,8 @@ pub fn main() -> i32
     return T[0]
 """
 
-# AGAST #2357: a pointer element is a string or null; an integer is refused.
+# AGAST #2357: a pointer element is a string or null; an integer is refused
+# (the integer 0 too since #1866, as ritz0 refuses it).
 UNFOLDABLE_PTR = """\
 const T: [2]*u8 = [c"A", 5]
 

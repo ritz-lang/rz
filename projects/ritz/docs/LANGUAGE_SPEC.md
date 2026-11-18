@@ -871,6 +871,70 @@ for i in 0..4
     b[i] = a[i] as i32
 ```
 
+#### Constant tables
+
+A lookup table is a module-level `const` array literal, not a chain of `if`s
+(AGAST #1866). It lives in read-only data and indexes like any array: `T[i]`
+with a run-time `i`, `for x in T`, `let x = T[i]` and `@T[i]` (§4.3). Its
+element type is one of:
+
+- an integer (`[N]u32`, `[N]u64`, ...), each element a constant expression
+  (§4.3), hex literals with the top bit set included;
+- `StrView`, each element a `"..."`;
+- `*u8`, each element a `"..."`, a `c"..."` or `null`; either string points at
+  its NUL-terminated bytes;
+- a struct `S`, each element an `S { ... }` literal whose fields are constants of
+  the field's type: an integer, a `bool`, a float, `null`, a `"..."` into a
+  `StrView` or `Span<u8>` field, a string into a `*u8` field, or a nested struct
+  literal.
+
+```ritz
+import ritzlib.span
+
+struct Status
+    code: i32
+    reason: StrView
+
+const STATUSES: [3]Status = [
+    Status { code: 200, reason: "OK" },
+    Status { code: 404, reason: "Not Found" },
+    Status { code: 503, reason: "Service Unavailable" }
+]
+
+struct Header
+    name: Span<u8>
+    value: Span<u8>
+
+const HEADERS: [2]Header = [
+    Header { name: ":path", value: "/" },
+    Header { name: "age", value: "" }
+]
+
+const DAYS: [2]StrView = ["Mon", "Tue"]
+const ARGV0: [3]*u8 = ["ls", c"cat", null]
+const K: [2]u32 = [0x428a2f98, 0xb5c0fbcf]
+
+fn reason(code: i32) -> StrView
+    for s in STATUSES
+        if s.code == code
+            return s.reason
+    ""
+
+fn main() -> i32
+    let h = HEADERS[1]
+    reason(404).len as i32 + h.name.len as i32 + (K[1] >> 31) as i32 - 13
+```
+
+An integer or `*u8` table can also be a fill, `[v; N]`. A struct table can't:
+write its elements out.
+
+A `*u8` element that is not a string or `null` is an error at the element. A
+pointer is `null`, never the integer `0` (§3.2):
+
+```ritz expect-error="const 'NAMES' element 1 is not a string literal or null"
+const NAMES: [2]*u8 = ["a", 0]
+```
+
 ### 3.4 Slice Types
 
 ```ritz
