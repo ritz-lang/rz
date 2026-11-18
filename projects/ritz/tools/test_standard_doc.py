@@ -31,14 +31,22 @@ STANDARD = RITZ / "docs" / "STANDARD.md"
 MAKEFILE = RITZ / "Makefile"
 MARKERS = ("ENFORCED", "CHECKED", "ADVISORY")
 RULE_RE = re.compile(r"^#### (S-[A-Z]+-\d+) \S")
-STATUS_RE = re.compile(r"^\*\*Status: (\w+)\*\*")
+HEADING_RE = re.compile(r"^#{1,6} ")
+STATUS_RE =re.compile(r"^\*\*Status: (\w+)\*\*")
 
 
 def rules(text):
-    """{rule id: lines of its section}, a section ending at the next heading."""
-    out, cur = {}, None
+    """{rule id: lines of its section}, a section ending at the next heading.
+
+    A heading is a Markdown one (`#{1,6} `) outside a fence: a wrapped prose
+    line starting `#2159 lands` and a fenced `# standard-exempt:` comment both
+    stay in their section (#4134).
+    """
+    out, cur, fenced = {}, None, False
     for line in text.split("\n"):
-        if line.startswith("#"):
+        if line.lstrip().startswith("```"):
+            fenced = not fenced
+        elif not fenced and HEADING_RE.match(line):
             m = RULE_RE.match(line)
             cur = m.group(1) if m else None
             if cur:
@@ -67,6 +75,18 @@ def doc():
 @pytest.fixture(scope="module")
 def sections(doc):
     return rules(doc)
+
+
+def test_a_prose_line_starting_with_a_ticket_ref_stays_in_its_section():
+    """#4134: a wrapped `#2159 lands, ...` line is prose, not a heading."""
+    text = "#### S-X-1 Rule\n**Status: ADVISORY**\n#1234 lands, then\nReport: `k`\n## Next\ngone\n"
+    assert rules(text) == {"S-X-1": ["**Status: ADVISORY**", "#1234 lands, then", "Report: `k`"]}
+
+
+def test_a_hash_line_inside_a_fence_stays_in_its_section():
+    """#4134: a ```text block holds `# standard-exempt:` comments; they aren't headings."""
+    text = "#### S-X-1 Rule\n```text\n# standard-exempt: why\n```\nafter"
+    assert rules(text)["S-X-1"] == ["```text", "# standard-exempt: why", "```", "after"]
 
 
 def test_the_standard_has_rules(sections):

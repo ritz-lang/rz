@@ -530,8 +530,8 @@ and nothing else does. A function that only uses it borrows it (`@x`, `@&x`) and
 doesn't free it. A function that returns it hands ownership to the caller.
 
 `String` and `Vec<T>` don't implement `Drop` yet (AGAST #2159), so they are
-copy types, and copying one copies the owner's pointer, not the buffer. Until
-#2159 lands, the owner calls `string_drop` / `vec_drop` once, usually with a
+copy types, and copying one copies the owner's pointer, not the buffer. Until #2159
+lands, the owner calls `string_drop` / `vec_drop` once, usually with a
 `defer` right after it is made (S-OWN-4), and never keeps a copy past the
 drop. When #2159 lands this rule becomes ENFORCED by S-OWN-3.
 
