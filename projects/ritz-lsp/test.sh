@@ -586,6 +586,31 @@ check("stub: a byte column after é€😀 becomes a UTF-16 range over the name"
 check("stub: a byte column past the line end stays past it, in units",
       got[1].get("range", {}).get("start") == {"line": 1, "character": u16(mb_line) + 2}, repr(got[1]))
 
+# ritz1's line and column are read by ritzlib's strview_parse_i64 (#4040):
+# one that is not an i64 >= 1 leaves the line unlocated (line 0, the whole
+# line as the message). The hand-written loop wrapped 2^64 + 1 round to 1
+# and put the error on the document's first line.
+num_cases = [  # (line:col, located start or None)
+    ("9223372036854775807:1", {"line": 9223372036854775806, "character": 0}),
+    ("0:1", None),
+    ("9223372036854775808:1", None),
+    ("18446744073709551617:1", None),
+    ("1:18446744073709551617", None),
+    ("-9223372036854775808:1", None),
+    ("1x:1", None)]
+num_doc = "".join(f"#! {{in}}:{pos}: error: case {k}\n"
+                  for k, (pos, _) in enumerate(num_cases)) + "#exit 1\n"
+rc, out = session([did_open(duri, num_doc, 1)], env=STUB)
+got = ((diags(out) or [{}])[0].get("diagnostics") or []) + [{}] * len(num_cases)
+for k, (pos, start) in enumerate(num_cases):
+    g = got[k]
+    if start is None:
+        ok = (g.get("range") == rng(0, 0, 0, 0)
+              and g.get("message", "").endswith(f":{pos}: error: case {k}"))
+    else:
+        ok = g.get("range", {}).get("start") == start and g.get("message") == f"case {k}"
+    check(f"stub: line:col {pos} -> {'located' if start else 'unlocated'}", ok, repr(g))
+
 # --- a burst of changes compiles once, for the last version (#3902) ---------
 # Everything up to the first publish is in the server's stdin before it reads
 # any of it: two documents opened, one changed three times, then a hover. The
