@@ -100,6 +100,39 @@ fn f()
         None => D = 0
     D = D * 10 + a[1]
 """, "f()", 783),
+    # As an assignment expression (a match arm), a Drop element's store
+    # drops the old element too: 7, 8, the old 2, then 1 and 3 at the end
+    # (AGAST #3583; ritz0 skipped the drop, D == 7813).
+    "match_arm_store_drops_old_element": ("""\
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    let o: Option<i64> = Some(1)
+    match o
+        Some(k) => a[idx(k)] = mk(3)
+        None => D = 0
+""", "f()", 78213),
+    # h.a[i] = v in a match arm: the old h.a[0] (1) drops at the store.
+    "match_arm_field_array_store_drops_old_element": ("""\
+fn f()
+    var h: H = H { a: [S { x: 1 }, S { x: 2 }], n: 0 }
+    let o: Option<i64> = Some(0)
+    match o
+        Some(k) => h.a[idx(k)] = mk(5)
+        None => D = 0
+""", "f()", 78152),
+    # A field store w.t = v in a match arm drops the old field (1), as the
+    # statement form does (§13.6, AGAST #2173); 3 drops at the end.
+    "match_arm_field_store_drops_old_field": ("""\
+struct W
+    t: S
+
+fn f()
+    var w: W = W { t: S { x: 1 } }
+    let o: Option<i64> = Some(3)
+    match o
+        Some(k) => w.t = mk(k)
+        None => D = 0
+""", "f()", 813),
     # Rank 2 at scope end: index order, g[0][0] .. g[1][1].
     "rank2_scope_end": ("""\
 fn f()

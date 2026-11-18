@@ -136,6 +136,39 @@ fn f()
     var r = Arr { a: [S { x: 1 }, S { x: 2 }] }
     put(@&r)
 """, 8152),
+    # As an assignment expression (a match arm), `*p = v` and `p.t = v`
+    # through a reference drop the old value too (AGAST #3583).
+    "match_arm_deref_through_mut_ref": ("""\
+fn put(p: @&S, o: Option<i64>)
+    match o
+        Some(k) => *p = mk(k)
+        None => D = 0
+
+fn f()
+    var s = S { x: 1 }
+    put(@&s, Some(5))
+""", DROPS),
+    "match_arm_field_through_mut_ref": ("""\
+fn put(p: @&Holder, o: Option<i64>)
+    match o
+        Some(k) => p.t = mk(k)
+        None => D = 0
+
+fn f()
+    var h = Holder { t: S { x: 1 } }
+    put(@&h, Some(5))
+""", DROPS),
+    # Through a `*T` in a match arm: a raw write, nothing drops.
+    "match_arm_deref_through_pointer": ("""\
+fn put(p: *S, o: Option<i64>)
+    match o
+        Some(k) => *p = mk(k)
+        None => D = 0
+
+fn f()
+    var s = S { x: 1 }
+    put(@&s, Some(5))
+""", RAW),
     "deref_through_pointer": ("""\
 fn put(p: *S)
     *p = mk(5)

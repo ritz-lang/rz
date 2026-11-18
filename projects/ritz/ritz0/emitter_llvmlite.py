@@ -11939,9 +11939,34 @@ class LLVMEmitter:
             # For field access, index, dereference: addressed above.
             target_ty = ptr.type.pointee
             val = self._convert_type(val, target_ty)
+            self._drop_old_at(expr.target, ptr)
             self.builder.store(val, ptr)
 
         return val
+
+    def _drop_old_at(self, target: rast.Expr, ptr: ir.Value) -> None:
+        """An assignment expression's store (a match arm's `a[i] = v`,
+        `h.t = v`, `*r = v`), once the place and v are evaluated: drop the old
+        value as the statement form does (§13.6, LARB R39/R58, AGAST #3583).
+        An index drops only an array's element, as the statement form: a
+        Vec's or a pointer's isn't the binding's to drop here."""
+        if isinstance(target, rast.Index):
+            base_ty = self.typed.type_of(target.expr) if self.typed is not None else None
+            if base_ty is not None:
+                base_ty = resolve_alias_in(base_ty, self.type_aliases)
+                if isinstance(base_ty, rast.RefType):
+                    base_ty = resolve_alias_in(base_ty.inner, self.type_aliases)
+            if isinstance(base_ty, rast.ArrayType):
+                self._drop_old_element(target, ptr)
+        elif isinstance(target, rast.Field):
+            field_type = self._infer_ritz_type(target)
+            if field_type is not None:
+                self._drop_old_field(target, ptr, field_type)
+        elif (isinstance(target, rast.UnaryOp) and target.op == '*'
+              and self._store_reach(target) == 'ref'):
+            slot_type = self.typed.type_of(target)
+            if slot_type is not None:
+                self._drop_old_through_ref(ptr, slot_type)
 
     def _lent_arg(self, expr: rast.Expr) -> Optional[ir.Value]:
         """The incoming `*T` if `expr` names a `h:& T` param, or None once a
