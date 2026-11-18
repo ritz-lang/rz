@@ -10487,14 +10487,26 @@ class LLVMEmitter:
         `.a` then met "Unknown field 'a' in struct 'Vec$P'".  The base is
         evaluated once, by the `+`.  A slice, `(*e)[i]`, and every other type are
         left to the paths that already handle them.
+
+        `(*e)[i]` over a `*[N]T`, `@[N]T` or `@&[N]T` is `e[i]`, the place
+        `*((e as *T) + i)`, as `(*p)[i]` on a name is (LARB R9, #2331): `*e`
+        was loaded as a whole array, which nothing could index, and `(*s.p)[i]`
+        and `(*f())[i]` crashed with "Cannot index type" (AGAST #4123).
         """
-        if deref or isinstance(expr.index, rast.Range):
+        if isinstance(expr.index, rast.Range):
             return None
         ty = self._infer_ritz_type(root)
         if ty is not None:
             ty = resolve_alias_in(ty, self.type_aliases)
         if not isinstance(ty, (rast.PtrType, rast.RefType)):
             return None
+        if deref:
+            inner = resolve_alias_in(ty.inner, self.type_aliases)
+            if not isinstance(inner, rast.ArrayType):
+                return None
+            elem = rast.PtrType(expr.span, inner.inner, mutable=False)
+            return rast.UnaryOp(expr.span, '*', rast.BinOp(
+                expr.span, '+', rast.Cast(expr.span, root, elem), expr.index))
         path = self._buffer_field_path(resolve_alias_in(ty.inner, self.type_aliases))
         if path is None:
             return None

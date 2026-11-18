@@ -987,9 +987,9 @@ pub fn main() -> i32
     return get(@g, 1, 2) + p[1][0] + (*q)[1][2] + GG[1][2] + 5
 """,
     # AGAST #3635: a `*[N][M]T` held anywhere else than a param or a typed
-    # local is the same plane pointer: a struct field (ritz0 reads through
-    # `s.p[i][j]` only; a store through it and `(*s.p)[i][j]` crash it, #4123)
-    # ...
+    # local is the same plane pointer: a struct field, read, stored and `+=`
+    # through as `s.p[i][j]` and `(*s.p)[i][j]` (the deref form crashed
+    # ritz0 with "Cannot index type", #4123) ...
     "pointee_field": """\
 struct S
     k: i32
@@ -1012,7 +1012,13 @@ pub fn main() -> i32
     t.p = @g
     if s.p[0][1] != 1 or t.p[1][0] != 3 or s.p[0][2] != 2
         return 2
-    return get(@s, 1, 2) + s.p[1][1] + t.p[1][0] + s.k + t.k + 2
+    s.p[0][0] = 9
+    t.p[1][0] += 2
+    (*s.p)[0][1] = 4
+    (*t.p)[0][2] += 1
+    if g[0][0] != 9 or g[1][0] != 5 or g[0][1] != 4 or g[0][2] != 3
+        return 3
+    return get(@s, 1, 2) + (*t.p)[1][0] + (*s.p)[0][1] - s.p[0][0] + s.k + t.k + 9
 """,
     # ... a global, null until assigned, written through in another fn ...
     "pointee_global": """\
@@ -1055,9 +1061,11 @@ pub fn main() -> i32
     var r: *[2][3]i32 = null
     r = whole()
     r[1][0] = 2
+    (*whole())[0][2] = 1
+    (*whole())[0][2] += 1
     if g[1][2] != 30 or GA[0][1] != 8 or GA[1][0] != 2 or g[0][1] != 0
         return 1
-    return p[1][2] + q[0][1] + r[1][0] + 2
+    return p[1][2] + q[0][1] + r[1][0] + (*whole())[0][2]
 """,
     # ... a `**[N][M]T` local and param: `(*q)[i][j]` is element (i, j) of the
     # array `*q` points at, and `*q` is a `*[N][M]T` ...
