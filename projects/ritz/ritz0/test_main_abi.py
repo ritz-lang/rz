@@ -93,6 +93,13 @@ REFUSED = {
                     main_abi.MSG_SHAPE),
     "ret": ("^pub fn main() -> i64\n    0\n", main_abi.MSG_RET),
     "not_pub": ("^fn main(args: Span<StrView>) -> i32\n    0\n", main_abi.MSG_PUB),
+    # #4018: a diagnostic inside an adapted main names it `main`, not
+    # `__ritz_main`. One row per message that names the enclosing fn (the
+    # frame-limit one is test_frame_limit.py's first row).
+    "gap_names_main": ("pub fn main(args: Span<StrView>) -> i32\n    ^if args.len > 1\n        return 1\n",
+                       "function 'main' declares a return type but can reach its end without producing a value"),
+    "assert_names_main": ("pub fn main()\n    ^assert 1 == 1\n",
+                          "assert is only allowed in [[test]] and [[test_helper]] functions, not in 'main'"),
 }
 
 
