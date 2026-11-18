@@ -4275,14 +4275,13 @@ class LLVMEmitter:
         global variant map, which is whichever specialization registered last
         (AGAST #2207).
 
-        Asks the LLVM function being emitted rather than `current_fn_def`,
-        which still names the enclosing fn inside a closure body.
+        Asks the LLVM function being emitted for its return type.
         """
         expected_enum_name = self._resolve_enum_type_name(
             None, self._fn_ret_type(self.current_fn))
         self._literal_into_slot(self.current_fn_def.ret_type, value)
-        # LARB R43: the LLVM fn's own return type, so a closure's `return`
-        # is not given its enclosing fn's float slot.
+        # LARB R43: a float return marks its literal tails with the LLVM
+        # fn's own return type.
         ret_ll = self._fn_ret_type(self.current_fn)
         if isinstance(ret_ll, (ir.FloatType, ir.DoubleType)):
             self._mark_float_tails(ret_ll, value)
@@ -4619,7 +4618,7 @@ class LLVMEmitter:
     def _scan_let_addresses(self, body) -> None:
         """AGAST #2441: the names whose address a function body takes.
 
-        Taken syntactically over the whole body, closures included, before
+        Taken syntactically over the whole body before
         any of it is emitted, so a `let` read on a loop's later iteration,
         textually before its `@x`, reads the same slot the `@x` names.
         - `@x` / `@&x` of a place rooted at `x`: any `let x`.

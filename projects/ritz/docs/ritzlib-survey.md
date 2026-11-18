@@ -130,7 +130,7 @@ tickets were needed. `77_args` arrived with `d8d79f6` and its blockers (#1487,
 | `51_loadtest` | undefined `String_push_str` | method mangling uses the type name verbatim | #1368 |
 | `56_async_runtime` | undefined `open` at link | syscall builtins unknown to ritz1 | #1516 |
 | `57_fn_ptr` | unknown identifier `double` | function name used as a value | #1503 |
-| `58_closures` | cannot parse `fn test_no_capture` | closures `\|x\| expr` | #1531 |
+| ~~`58_closures`~~ | ~~cannot parse `fn test_no_capture`~~ | ~~closures `\|x\| expr`~~ — **obsolete since #3470** (LARB R56 removed closures; the example now shows named fns and fn-field structs) and no longer allowlisted | #1531, #3470 |
 | `61_true_async` | unhandled `EXPR_MEMBER` | member access on a param named `self` | #1375 |
 | `62_async_compiler` | cannot parse `async` | `async fn` items | #1456 |
 | `63_executor` | cannot parse `fn simple_poll` | function name used as a value; `self` param | #1503, #1375 |
