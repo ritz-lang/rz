@@ -5,8 +5,13 @@ projects/harland/tools/test_msix_boot.sh boots the kernel under OVMF with a
 virtio-net NIC and an NVMe controller. It passes only if the NVMe's MSI-X
 table is found, virtio-net comes up in MSI-X mode, the NIC's interrupt
 counter is > 0, and init's Tier-1 suite still reports ALL TESTS PASSED. The
-NIC is modern-only with a 1024-entry RX queue (AGAST #3576), so it must also
-come up over the MMIO transport, cap that queue at 256 and get a DHCP lease.
+NVMe controller must come up in MSI-X mode too (AGAST #3630): its admin and
+I/O completion queues on vectors, a read of the disk's last 200 sectors with
+interrupts on that returns the pattern the script wrote, an interrupt counter
+> 0, commands that waited for their interrupt and none that completed without
+it. The NIC is modern-only with a 1024-entry RX queue (AGAST #3576), so it
+must also come up over the MMIO transport, cap that queue at 256 and get a
+DHCP lease.
 
 It is a build-all step after the Tier-1 boot, so every room's gate runs it.
 Like that boot (test_ci_harland_boot.py), these tests pin:
@@ -28,6 +33,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import struct
 import subprocess
 import sys
 from pathlib import Path
@@ -82,7 +88,32 @@ TX_BURST_OK = r"[net] TX burst: sent=300/300 replies=300\n"
 MODERN_OK = NET_MODERN + RX_CAPPED + DHCP_OK + TX_BURST_OK
 
 
-PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + SUITE_PASSED
+
+
+def _nvme_pattern_fnv() -> int:
+    """FNV-1a (32-bit) of the last 200 512-byte sectors (32568-32767) of the
+    16 MiB NVMe image the script writes: sector N is ("LBA" + N as u32 LE +
+    "!") * 64, as in test_nvme_boot.sh."""
+    h = 0x811C9DC5
+    for n in range(32568, 32768):
+        for b in (b"LBA" + struct.pack("<I", n) + b"!") * 64:
+            h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+NVME_FNV = _nvme_pattern_fnv()
+NVME_ON = r"[msix] nvme harland-msix: MSI-X on, vectors admin=67 io=68\n"
+NVME_READ = rf"[msix] nvme harland-msix nsid 1: LBA 32568-32767 fnv1a={NVME_FNV}\n"
+
+
+def nvme_interrupts(n: int, missed: int = 0, waited: int = 3) -> str:
+    return (rf"[msix] nvme interrupts: {n}, commands waited: {waited}, "
+            rf"completions without one: {missed}\n")
+
+
+NVME_OK = NVME_ON + NVME_READ + nvme_interrupts(5)
+
+PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + SUITE_PASSED
 
 
 # --------------------------------------------------------------------------
@@ -304,3 +335,46 @@ def test_no_verdict_before_the_timeout_fails(tree):
     r = _run(tree, NVME_TABLE + NIC_ON + interrupts(8))
     assert r.returncode == 1, r.stdout + r.stderr
     assert "did not report ALL TESTS PASSED" in r.stdout
+
+
+# --------------------------------------------------------------------------
+# NVMe in MSI-X mode (AGAST #3630)
+# --------------------------------------------------------------------------
+
+
+def test_nvme_interrupts_pass(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: NVMe is in MSI-X mode" in r.stdout
+    assert "PASS: NVMe delivered 5 MSI-X interrupts, 3 commands waited for theirs, none missed" in r.stdout
+    # The script computed the pattern's fingerprint itself and it matched
+    assert f"PASS: NVMe read LBAs 32568-32767 under MSI-X (fnv1a={NVME_FNV})" in r.stdout
+
+
+@pytest.mark.parametrize(
+    "nvme, want",
+    [
+        # Still polled: no table programmed
+        (NVME_READ + nvme_interrupts(5), "NVMe did not come up in MSI-X mode"),
+        # Entries programmed but nothing delivered (masked, or no IEN on the CQ)
+        (NVME_ON + NVME_READ + nvme_interrupts(0), "NVMe MSI-X interrupt counter is 0, want > 0"),
+        (NVME_ON + NVME_READ, "NVMe MSI-X interrupt counter is missing"),
+        # Some completions only seen by polling: e.g. the I/O CQ without IEN
+        (NVME_ON + NVME_READ + nvme_interrupts(2, 3), "3 NVMe completions arrived without an interrupt"),
+        # Interrupts delivered but the driver never waited for one: still polled
+        (NVME_ON + NVME_READ + nvme_interrupts(5, 0, 0), "no NVMe command waited for its MSI-X interrupt"),
+        # The read under MSI-X failed or returned the wrong data
+        (NVME_ON + nvme_interrupts(5), "no NVMe read under MSI-X"),
+        (NVME_ON + r"[msix] nvme harland-msix nsid 1: LBA 32568-32767 read failed\n" + nvme_interrupts(5),
+         "no NVMe read under MSI-X"),
+        (NVME_ON + r"[msix] nvme harland-msix nsid 1: LBA 32568-32767 fnv1a=12345\n" + nvme_interrupts(5),
+         f"want fnv1a={NVME_FNV}"),
+    ],
+    ids=["polled", "zero-interrupts", "no-counter", "completions-without-interrupt", "never-waited",
+         "no-read", "read-failed", "wrong-data"],
+)
+def test_nvme_msix_check_fails(tree, nvme, want):
+    serial = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + nvme + SUITE_PASSED
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout, r.stdout

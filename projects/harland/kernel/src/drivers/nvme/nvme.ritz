@@ -1,4 +1,4 @@
-# NVMe Driver (polled)
+# NVMe Driver (polled at boot, MSI-X once interrupts are up)
 #
 # Drives NVMe controllers (PCI class 01h, subclass 08h, prog-if 02h): EBS
 # volumes on Nitro EC2 instances, most laptop SSDs and QEMU's `-device nvme`.
@@ -6,8 +6,26 @@
 #
 # Per controller: reset, admin queue, enable, Identify Controller, one I/O
 # completion/submission queue pair (qid 1), then Identify Namespace for each
-# active namespace with 512-byte to 4 KiB LBAs. Completions are polled;
-# interrupts are masked (INTMS, PCI INTx disable). MSI-X is a sibling ticket.
+# active namespace with 512-byte to 4 KiB LBAs.
+#
+# Interrupts (AGAST #3630). nvme_probe runs early, before the APIC is set up
+# and with IF=0, so it polls: INTx is disabled and INTMS masks pin-based
+# interrupts. It does turn MSI-X on, with every table entry masked, before
+# creating the I/O CQ on entry 1 (the admin CQ always uses entry 0): a
+# controller refuses a nonzero vector while MSI-X is off (QEMU: Invalid
+# Interrupt Vector). Masked entries only set their pending bits. Once the
+# APIC is up, nvme_enable_msix gives each controller two IDT vectors from
+# drivers/msix and points entries 0 (admin CQ) and 1 (I/O CQ) at them,
+# unmasking them. Without a usable MSI-X table the I/O CQ uses entry 0 and
+# the controller stays polled.
+#
+# From then on a command issued with IF=1 on the CPU the entries target
+# waits for its queue's vector to fire before reaping the completion; one
+# whose CQE turns up without an interrupt is counted (nvme_irq_missed). The
+# CQE's phase tag stays the ground truth: an IF=0 caller, or another CPU,
+# still polls, and a stale interrupt cannot complete the wrong command.
+# The wait spins on the vector's counter; sleeping (hlt, or blocking the
+# caller) needs a scheduler-aware block layer.
 #
 # The block interface speaks 512-byte sectors whatever the namespace's LBA
 # size (AGAST #4088): a request is widened to whole native LBAs, and a write
@@ -27,12 +45,16 @@
 # Reference: NVM Express Base Specification 1.4, sections 3 (registers),
 # 4 (queues), 5 (admin commands) and the NVM Command Set (read/write).
 
-import io { memory_barrier, read_barrier, cpu_pause }
+import io { memory_barrier, read_barrier, cpu_pause, interrupts_enabled }
 import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
 import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+
+# Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
+extern fn lapic_id() -> u32
 
 # ============================================================================
 # PCI identification
@@ -79,6 +101,14 @@ const NVME_CMD_READ: u32 = 0x02
 const NVME_CNS_NAMESPACE: u32 = 0x00
 const NVME_CNS_CONTROLLER: u32 = 0x01
 
+# Create I/O CQ, CDW11: interrupt vector (MSI-X table entry) in bits 31:16,
+# IEN (bit 1), PC (bit 0, physically contiguous).
+const NVME_CQ_IEN: u32 = 0x2
+const NVME_CQ_PC: u32 = 0x1
+# MSI-X table entries: the admin CQ always signals entry 0; the I/O CQ ours.
+const NVME_MSIX_ADMIN_ENTRY: u16 = 0
+const NVME_MSIX_IO_ENTRY: u16 = 1
+
 const NVME_SQE_SIZE: u64 = 64
 const NVME_CQE_SIZE: u64 = 16
 
@@ -116,6 +146,7 @@ const MAX_NSID_SCAN: u32 = 8
 # ============================================================================
 
 pub struct NvmeController
+    pci: *PciDevice
     bar: u64                # BAR0, mapped through the MMIO window
     db_stride: u64          # Doorbell stride in bytes (4 << CAP.DSTRD)
     depth: u32              # Entries per queue
@@ -132,6 +163,9 @@ pub struct NvmeController
     max_pages: u32          # Pages per command: bounce pages, capped by MDTS
     serial_len: u32
     serial: [20]u8          # Serial number (Identify Controller bytes 4-23)
+    vec: [2]u8              # IDT vector per queue's CQ (0 = polled), [admin, io]
+    irq_cpu: u32            # APIC ID the MSI-X entries target
+    msix: *MsixInfo         # MSI-X table, enabled (entries masked) at probe; null = none
 
 pub struct NvmeNamespace
     ctrl: *NvmeController
@@ -144,6 +178,10 @@ var nvme_ctrl_count: i32 = 0
 var nvme_nss: [8]*NvmeNamespace
 var nvme_ns_count: i32 = 0
 var nvme_probed: i32 = 0
+# Commands that waited for their MSI-X interrupt, and those of them whose
+# interrupt never came (the CQE was found by polling)
+var nvme_irq_waits: u64 = 0
+var nvme_irq_missed: u64 = 0
 
 # ============================================================================
 # Register and memory access
@@ -202,9 +240,23 @@ fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
 # Command submission (polled)
 # ============================================================================
 
-# Submit one command on queue `q` and poll its completion.
+# Submit one command on queue `q` and wait for its completion: its MSI-X
+# interrupt when the controller is in MSI-X mode and this CPU takes it, then
+# the CQE (polled for its phase tag).
 # Returns 0 on success, the NVMe status (positive) on a command error, or -1
 # on timeout.
+# Spin until `vec` has fired more than `irqs` times. Counts a miss when it
+# doesn't within NVME_CMD_SPINS; the caller then finds the CQE by polling.
+fn nvme_wait_irq(vec: u8, irqs: u64)
+    nvme_irq_waits = nvme_irq_waits + 1
+    var spins: u32 = 0
+    while spins < NVME_CMD_SPINS
+        if msix_vector_count(vec) != irqs
+            return
+        cpu_pause()
+        spins = spins + 1
+    nvme_irq_missed = nvme_irq_missed + 1
+
 fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
     let cid: u32 = (*c).next_cid & 0xFFFF
     (*c).next_cid = (*c).next_cid + 1
@@ -230,9 +282,22 @@ fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u6
     (*c).sq_tail[q] = (*c).sq_tail[q] + 1
     if (*c).sq_tail[q] >= (*c).depth
         (*c).sq_tail[q] = 0
-    nvme_doorbell(c, q, 0, (*c).sq_tail[q])
 
-    # Poll the CQE at the head for the expected phase tag (DW3 bit 16).
+    # In MSI-X mode, with interrupts deliverable here, the queue's vector
+    # firing is the completion signal. Its count is sampled before the
+    # doorbell, so the interrupt cannot slip past unseen.
+    let vec: u8 = (*c).vec[q]
+    var irq_wait: bool = false
+    var irqs: u64 = 0
+    if vec != 0 and interrupts_enabled()
+        if lapic_id() == (*c).irq_cpu
+            irq_wait = true
+            irqs = msix_vector_count(vec)
+    nvme_doorbell(c, q, 0, (*c).sq_tail[q])
+    if irq_wait
+        nvme_wait_irq(vec, irqs)
+
+    # Reap the CQE at the head for the expected phase tag (DW3 bit 16).
     var spins: u32 = 0
     while spins < NVME_CMD_SPINS
         let cqe: u64 = (*c).cq[q] + ((*c).cq_head[q] as u64) * NVME_CQE_SIZE
@@ -310,8 +375,13 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     let c: *NvmeController = kalloc(sizeof(NvmeController) as u64) as *NvmeController
     if c == 0 as *NvmeController
         return c
+    (*c).pci = pci
     (*c).bar = bar
     (*c).next_cid = 0
+    (*c).vec[0] = 0
+    (*c).vec[1] = 0
+    (*c).irq_cpu = 0
+    (*c).msix = 0 as *MsixInfo
     (*c).nn = 0
     (*c).serial_len = 0
 
@@ -358,6 +428,7 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
         q = q + 1
 
     # Admin queue, then enable: NVM command set, 4 KiB pages, 64/16-byte entries.
+    # INTMS masks pin-based interrupts while we poll (MSI-X ignores it).
     nvme_w32(c, NVME_REG_INTMS, 0xFFFFFFFF)
     nvme_w32(c, NVME_REG_AQA, (((*c).depth - 1) << 16) | ((*c).depth - 1))
     nvme_w64(c, NVME_REG_ASQ_LO, (*c).sq[0])
@@ -386,10 +457,15 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     if mdts != 0 and mdts < 5 and (1 << mdts) < (*c).max_pages
         (*c).max_pages = 1 << mdts
 
-    # I/O queue pair 1: the CQ first (physically contiguous, interrupts off),
-    # then the SQ bound to it (physically contiguous).
+    # I/O queue pair 1: the CQ first (physically contiguous, interrupts on
+    # MSI-X entry 1, masked until nvme_enable_msix), then the SQ bound to it
+    # (physically contiguous).
+    var io_entry: u32 = 0
+    if nvme_msix_table_on(c) == 0
+        io_entry = NVME_MSIX_IO_ENTRY as u32
     let qsize: u32 = ((*c).depth - 1) << 16
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_CQ, 0, (*c).cq[1], 0, qsize | 1, 1, 0) != 0
+    let cq_flags: u32 = (io_entry << 16) | NVME_CQ_IEN | NVME_CQ_PC
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_CQ, 0, (*c).cq[1], 0, qsize | 1, cq_flags, 0) != 0
         return nvme_fail(c, "create I/O CQ")
     if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_SQ, 0, (*c).sq[1], 0, qsize | 1, (1 << 16) | 1, 0) != 0
         return nvme_fail(c, "create I/O SQ")
@@ -416,6 +492,27 @@ fn fnv1a(h: u64, p: *u8, len: u64) -> u64
         i = i + 1
     return hash
 
+# Read the NVME_PROBE_SECTORS 512-byte sectors of `ns` from `first` and log
+# "LBA <first>-<last> fnv1a=<decimal>", or "LBA <first>-<last> read
+# failed[ (no memory)]" and return -1.
+fn nvme_print_fingerprint(ns: *NvmeNamespace, first: u64) -> i32
+    prints("LBA ")
+    serial_print_dec(first)
+    prints("-")
+    serial_print_dec(first + NVME_PROBE_SECTORS - 1)
+    let probe: *u8 = kalloc(NVME_PROBE_SECTORS * SECTOR_SIZE)
+    if probe == 0 as *u8
+        prints(" read failed (no memory)")
+        return -1
+    if nvme_ns_rw(ns, first, NVME_PROBE_SECTORS as u32, probe, false) != 0
+        kfree(probe)
+        prints(" read failed")
+        return -1
+    prints(" fnv1a=")
+    serial_print_dec(fnv1a(0x811C9DC5, probe, NVME_PROBE_SECTORS * SECTOR_SIZE))
+    kfree(probe)
+    return 0
+
 # Log the namespace, a fingerprint of 512-byte sectors 1-200 and the LBA
 # size, so the boot test can check identify, sector translation and long
 # reads in one call. 100 KiB from sector 1 is more than one command can
@@ -431,17 +528,10 @@ fn nvme_announce(ns: *NvmeNamespace)
     serial_print_dec((*ns).sectors)
     prints(" sectors")
     if (*ns).sectors > NVME_PROBE_SECTORS
-        let probe: *u8 = kalloc(NVME_PROBE_SECTORS * SECTOR_SIZE)
-        if probe == 0 as *u8
-            prints(", LBA 1-200 read failed (no memory)\n")
+        prints(", ")
+        if nvme_print_fingerprint(ns, 1) != 0
+            prints("\n")
             return
-        if nvme_ns_rw(ns, 1, NVME_PROBE_SECTORS as u32, probe, false) != 0
-            kfree(probe)
-            prints(", LBA 1-200 read failed\n")
-            return
-        prints(", LBA 1-200 fnv1a=")
-        serial_print_dec(fnv1a(0x811C9DC5, probe, NVME_PROBE_SECTORS * SECTOR_SIZE))
-        kfree(probe)
     prints(", ")
     serial_print_dec(1 << ((*ns).lba_shift as u64))
     prints("-byte LBAs\n")
@@ -596,3 +686,106 @@ pub fn nvme_ns_read(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i3
 
 pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
     return nvme_ns_rw(ns, sector, count, buf, true)
+
+# ============================================================================
+# MSI-X (AGAST #3630)
+# ============================================================================
+
+# Map c's MSI-X table, mask every entry and turn MSI-X on, so the I/O CQ
+# can name entry 1. Needs no APIC: nothing is delivered until the entries
+# are programmed. Returns 0, or -1 (c.msix stays null) when the controller
+# has no usable table.
+fn nvme_msix_table_on(c: *NvmeController) -> i32
+    let info: *MsixInfo = kalloc(sizeof(MsixInfo) as u64) as *MsixInfo
+    if info == 0 as *MsixInfo
+        return -1
+    # Separate steps: msix_enable must not run on a table msix_probe rejected.
+    var ok: bool = msix_probe((*c).pci, info) == 0
+    if ok
+        ok = (*info).table_size > NVME_MSIX_IO_ENTRY
+    if ok
+        ok = msix_enable(info) == 0
+    if not ok
+        kfree(info as *u8)
+        return -1
+    (*c).msix = info
+    return 0
+
+# Aim c's admin CQ (table entry 0) and I/O CQ (entry 1) at two fresh vectors
+# on this CPU and unmask them. Returns 0 if c is in MSI-X mode; -1 leaves it
+# polled.
+fn nvme_setup_msix(c: *NvmeController) -> i32
+    if (*c).vec[NVME_ADMIN_Q] != 0
+        return 0
+    prints("[msix] nvme ")
+    nvme_print_serial(c)
+    if (*c).msix == 0 as *MsixInfo
+        prints(": no usable MSI-X table, polling\n")
+        return -1
+    let admin: u8 = msix_vector_alloc()
+    let io: u8 = msix_vector_alloc()
+    if admin == 0 or io == 0
+        prints(": out of MSI-X vectors, polling\n")
+        return -1
+    (*c).irq_cpu = lapic_id()
+    msix_set_entry((*c).msix, NVME_MSIX_ADMIN_ENTRY, admin)
+    msix_set_entry((*c).msix, NVME_MSIX_IO_ENTRY, io)
+    (*c).vec[NVME_ADMIN_Q] = admin
+    (*c).vec[NVME_IO_Q] = io
+    prints(": MSI-X on, vectors admin=")
+    serial_print_dec(admin as u64)
+    prints(" io=")
+    serial_print_dec(io as u64)
+    prints("\n")
+    return 0
+
+# Switch every controller nvme_probe brought up to MSI-X. Needs the Local
+# APIC set up; call with interrupts off. Returns how many are on MSI-X.
+pub fn nvme_enable_msix() -> i32
+    var on: i32 = 0
+    var i: i32 = 0
+    while i < nvme_ctrl_count
+        if nvme_setup_msix(nvme_ctrls[i]) == 0
+            on = on + 1
+        i = i + 1
+    return on
+
+# Read the last NVME_PROBE_SECTORS sectors of every namespace on an MSI-X
+# controller and log
+#   [msix] nvme <serial> nsid <N>: LBA <first>-<last> fnv1a=<decimal>
+# Call with interrupts on, so the reads wait for their interrupts. The end
+# of the disk, as persistent storage may have formatted its start by now.
+pub fn nvme_msix_read_check()
+    var i: i32 = 0
+    while i < nvme_ns_count
+        let ns: *NvmeNamespace = nvme_nss[i]
+        let c: *NvmeController = (*ns).ctrl
+        if (*c).vec[NVME_IO_Q] != 0 and (*ns).sectors > NVME_PROBE_SECTORS
+            prints("[msix] nvme ")
+            nvme_print_serial(c)
+            prints(" nsid ")
+            serial_print_dec((*ns).nsid as u64)
+            prints(": ")
+            nvme_print_fingerprint(ns, (*ns).sectors - NVME_PROBE_SECTORS)
+            prints("\n")
+        i = i + 1
+
+# MSI-X interrupts delivered by every NVMe controller so far
+pub fn nvme_irq_count() -> u64
+    var total: u64 = 0
+    var i: i32 = 0
+    while i < nvme_ctrl_count
+        let c: *NvmeController = nvme_ctrls[i]
+        if (*c).vec[NVME_ADMIN_Q] != 0
+            total = total + msix_vector_count((*c).vec[NVME_ADMIN_Q])
+            total = total + msix_vector_count((*c).vec[NVME_IO_Q])
+        i = i + 1
+    return total
+
+# Commands that waited for their MSI-X interrupt
+pub fn nvme_irq_wait_count() -> u64
+    return nvme_irq_waits
+
+# Commands that waited for their MSI-X interrupt and completed without it
+pub fn nvme_irq_missed_count() -> u64
+    return nvme_irq_missed

@@ -1,6 +1,7 @@
 #!/bin/bash
 # Boot Harland under OVMF with a virtio-net NIC and an NVMe controller and
-# check that PCI devices interrupt the kernel through MSI-X (AGAST #1852).
+# check that PCI devices interrupt the kernel through MSI-X (AGAST #1852,
+# NVMe: #3630).
 #
 # The kernel walks every PCI device's capability list at boot and logs each
 # MSI-X table it finds ("[msix] BB:DD.F VVVV:DDDD: N vectors ..."). The
@@ -27,6 +28,16 @@
 #     device is still reading loses a group's earlier requests) (AGAST #4073);
 #   - virtio-net came up in MSI-X mode ("[msix] virtio-net: MSI-X on");
 #   - N > 0: interrupts were really delivered through the table, not polled;
+#   - NVMe came up in MSI-X mode too ("[msix] nvme <serial>: MSI-X on"), its
+#     admin and I/O completion queues on their own vectors (AGAST #3630);
+#   - with interrupts on, it read the last 200 512-byte sectors of its disk,
+#     which this script fills with a known pattern, and logged their FNV-1a
+#     ("[msix] nvme <serial> nsid 1: LBA 32568-32767 fnv1a=H"), matching
+#     the pattern's (100 KiB: two commands, one through a PRP list; the end
+#     of the disk, as persistent storage formats its start during boot);
+#   - "[msix] nvme interrupts: N, commands waited: W, completions without
+#     one: M" has N > 0, W > 0 and M = 0: the driver waited for its MSI-X
+#     vector on every command (W) and every one of them fired (M);
 #   - the kernel took no exception, and init's Tier-1 suite still reports
 #     ALL TESTS PASSED with the NIC and NVMe attached.
 #
@@ -58,6 +69,7 @@ setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 
 command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
 command -v qemu-img >/dev/null || setup_error "qemu-img not found (qemu-utils)"
+command -v python3 >/dev/null || setup_error "python3 not found"
 if [ -n "${OVMF_CODE:-}" ]; then
     [ -f "$OVMF_CODE" ] || setup_error "OVMF firmware not found: $OVMF_CODE"
 else
@@ -96,9 +108,22 @@ python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 cp "$LOADER_EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
-# A blank namespace for the NVMe controller: the kernel only needs to find
-# its MSI-X capability, not read it.
-truncate -s 16M "$WORK/nvme.img"
+# The NVMe disk (16 MiB, 32768 sectors): sector N holds the pattern
+# test_nvme_boot.sh uses, ("LBA" + N as u32 LE + "!") * 64. Prints the
+# FNV-1a (32-bit) of sectors 32568-32767, the bytes the kernel reads under
+# MSI-X.
+want_fnv=$(python3 - "$WORK/nvme.img" <<'EOF'
+import struct, sys
+def sector(n):
+    return (b"LBA" + struct.pack("<I", n) + b"!") * 64
+with open(sys.argv[1], "wb") as f:
+    f.write(b"".join(sector(n) for n in range(32768)))
+h = 0x811C9DC5
+for b in b"".join(sector(n) for n in range(32568, 32768)):
+    h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+print(h)
+EOF
+) || { echo "FAIL: could not write the NVMe disk"; exit 1; }
 
 vars=()
 if [ -n "$OVMF_VARS" ]; then
@@ -197,6 +222,40 @@ if [ -n "$count" ] && [ "$count" -gt 0 ]; then
 else
     echo "FAIL: virtio-net MSI-X interrupt counter is ${count:-missing}, want > 0"
     rc=1
+fi
+if grep -aqE "\[msix\] nvme [^ ]+: MSI-X on" "$SERIAL"; then
+    echo "PASS: NVMe is in MSI-X mode"
+else
+    grep -a "\[msix\] nvme\|\[nvme\]" "$SERIAL" | head -5
+    echo "FAIL: NVMe did not come up in MSI-X mode"
+    rc=1
+fi
+nread=$(grep -aoE "\[msix\] nvme [^ ]+ nsid 1: LBA 32568-32767 fnv1a=[0-9]+" "$SERIAL" | head -1 | sed -nE 's/.*fnv1a=([0-9]+)$/\1/p')
+if [ -z "$nread" ]; then
+    grep -a "\[msix\] nvme .* nsid" "$SERIAL" | head -3
+    echo "FAIL: no NVMe read under MSI-X ([msix] nvme <serial> nsid 1: LBA 32568-32767 fnv1a=H)"
+    rc=1
+elif [ "$nread" != "$want_fnv" ]; then
+    echo "FAIL: NVMe read under MSI-X returned fnv1a=$nread, want fnv1a=$want_fnv"
+    rc=1
+else
+    echo "PASS: NVMe read LBAs 32568-32767 under MSI-X (fnv1a=$want_fnv)"
+fi
+nirq=$(grep -aoE "\[msix\] nvme interrupts: [0-9]+, commands waited: [0-9]+, completions without one: [0-9]+" "$SERIAL" | tail -1)
+n_count=$(echo "$nirq" | sed -nE 's/.*interrupts: ([0-9]+),.*/\1/p')
+n_waited=$(echo "$nirq" | sed -nE 's/.*commands waited: ([0-9]+),.*/\1/p')
+n_missed=$(echo "$nirq" | sed -nE 's/.*without one: ([0-9]+)$/\1/p')
+if [ -z "$n_count" ] || [ "$n_count" -eq 0 ]; then
+    echo "FAIL: NVMe MSI-X interrupt counter is ${n_count:-missing}, want > 0"
+    rc=1
+elif [ "$n_waited" -eq 0 ]; then
+    echo "FAIL: no NVMe command waited for its MSI-X interrupt (polled with $n_count delivered)"
+    rc=1
+elif [ "$n_missed" -ne 0 ]; then
+    echo "FAIL: $n_missed NVMe completions arrived without an interrupt ($n_count delivered)"
+    rc=1
+else
+    echo "PASS: NVMe delivered $n_count MSI-X interrupts, $n_waited commands waited for theirs, none missed"
 fi
 if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
     echo "PASS: init Tier-1 suite: ALL TESTS PASSED"
