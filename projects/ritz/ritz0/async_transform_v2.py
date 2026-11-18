@@ -440,6 +440,29 @@ def _escaping_jump(node) -> Optional[rast.Node]:
     return None
 
 
+def _range_of(it: rast.Expr) -> Optional[rast.Range]:
+    """A `for`'s iterable as the range the emitter loops over (its
+    _normalize_for_iter_expr); None for an array, Vec or other iterable."""
+    if isinstance(it, rast.Range):
+        return it if it.start is not None and it.end is not None else None
+    if isinstance(it, rast.BinOp):
+        if it.op == 'as':
+            return _range_of(it.left)
+        if isinstance(it.left, rast.Range):
+            # `for i in 0..n - 1` parses as (0..n) - 1.
+            r = it.left
+            return _range_of(rast.Range(r.span, r.start, rast.BinOp(it.span, it.op, r.end, it.right), r.inclusive))
+    if isinstance(it, rast.Cast):
+        return _range_of(it.expr)
+    return None
+
+
+def _ungroup(expr: rast.Expr) -> rast.Expr:
+    while isinstance(expr, rast.Grouped):
+        expr = expr.expr
+    return expr
+
+
 _INT_NAMES = frozenset(('i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'isize', 'usize'))
 
 
@@ -487,6 +510,8 @@ class SimpleBodyTransformer:
         self.abi = abi
         self.unit = unit
         self.await_results = await_results if await_results is not None else {}
+        # A name read through another field: an awaiting `for`'s var (#4188).
+        self.renames: Dict[str, str] = {}
 
     def self_field(self, name: str, span) -> rast.Field:
         """(*self).name"""
@@ -519,6 +544,8 @@ class SimpleBodyTransformer:
             # whose right operand awaits): its value is stored.
             return self.self_field(self.await_results[id(node)], node.span)
         if isinstance(node, rast.Ident):
+            if node.name in self.renames:
+                return self.self_field(self.renames[node.name], node.span)
             if node.name in self.fields:
                 return self.self_field(node.name, node.span)
             return node
@@ -616,8 +643,10 @@ class _CfgBuilder:
         self.cur: Optional[int] = None
         self.n_awaits = 0
         self.n_shorts = 0
-        # Fields the lowering adds: awaited futures, await results and
-        # short-circuit values, in the order lowering meets them.
+        self.n_fors = 0
+        # Fields the lowering adds: awaited futures, await results,
+        # short-circuit values and range-`for` vars and ends, in the order
+        # lowering meets them.
         self.extra_fields: List[Tuple[str, rast.Type]] = []
 
     # -- states ------------------------------------------------------------
@@ -715,7 +744,7 @@ class _CfgBuilder:
         elif isinstance(stmt, rast.UnsafeBlock):
             self.lower_value(stmt.body, None, loop)
         elif isinstance(stmt, rast.ForStmt):
-            raise _unplaced("a `for` loop", self._culprit(stmt))
+            self._lower_for(stmt)
         else:
             raise _unplaced("this statement", self._culprit(stmt))
 
@@ -736,6 +765,59 @@ class _CfgBuilder:
             self.lower_value(stmt.body.expr, None, _Loop(head, exit_b))
         if self.cur is not None:
             self.goto(head)
+        self.cur = exit_b
+
+    def _for_type(self, rng: rast.Range) -> Optional[rast.Type]:
+        """An awaiting `for`'s var's type: its start's, unless that is a bare
+        literal (`0..n`) or untold; then its end's.  ritz1's al_for_type."""
+        inf = AsyncAnalyzer(self.gen.fn_sigs)
+        inf.current_locals = dict(self.gen.analysis.all_locals)
+        start, end = _ungroup(rng.start), _ungroup(rng.end)
+        ty = None if _untyped_int_literal(start) else inf._infer_type(start)
+        return ty if ty is not None else inf._infer_type(end)
+
+    def _lower_for(self, stmt: rast.ForStmt):
+        """`for v in a..b` (AGAST #4188): `v` and the end are future fields,
+        `__for_K` and `__for_end_K`, the end evaluated once; then a `while
+        __for_K < __for_end_K` whose `continue` goes to the increment."""
+        rng = _range_of(stmt.iter)
+        if rng is None:
+            raise _unplaced("a `for` over an iterable", self._culprit(stmt))
+        ty = self._for_type(rng)
+        if ty is None:
+            raise AsyncLoweringError(
+                f"cannot infer the type of `{stmt.var}`, which `{self.gen.fn_def.name}`'s future holds "
+                f"across an `await`: cast a bound of its range (`0..(n as i64)`)", stmt.span)
+        k = self.n_fors
+        self.n_fors += 1
+        var = self._add_field(f"__for_{k}", ty)
+        end = self._add_field(f"__for_end_{k}", ty)
+        self.emit(rast.AssignStmt(span=stmt.span, target=self.rw.self_field(var, stmt.span),
+                                  value=self.hoist(rng.start)))
+        self.emit(rast.AssignStmt(span=stmt.span, target=self.rw.self_field(end, stmt.span),
+                                  value=self.hoist(rng.end)))
+        head = self.new_block()
+        self.goto(head)
+        self.cur = head
+        cond = rast.BinOp(span=stmt.span, op='<=' if rng.inclusive else '<',
+                          left=self.rw.self_field(var, stmt.span), right=self.rw.self_field(end, stmt.span))
+        body, incr, exit_b = self.new_block(), self.new_block(), self.new_block()
+        self.branch(cond, body, exit_b)
+        self.cur = body
+        # A nested `for` can't reuse the name, so no outer rename is hidden.
+        self.rw.renames[stmt.var] = var
+        loop = _Loop(incr, exit_b)
+        self.lower_stmts(stmt.body.stmts, loop)
+        if stmt.body.expr is not None:
+            self.lower_value(stmt.body.expr, None, loop)
+        del self.rw.renames[stmt.var]
+        if self.cur is not None:
+            self.goto(incr)
+        self.cur = incr
+        self.emit(rast.AssignStmt(span=stmt.span, target=self.rw.self_field(var, stmt.span), value=rast.BinOp(
+            span=stmt.span, op='+', left=self.rw.self_field(var, stmt.span),
+            right=rast.IntLit(span=stmt.span, value=1))))
+        self.goto(head)
         self.cur = exit_b
 
     # -- values ------------------------------------------------------------

@@ -123,6 +123,29 @@ RUNS = {
     # A `while` condition's right operand is awaited again on every pass.
     "and_rhs_in_while_cond": (_DBL + _go("(n: i32) -> i32", "    var i: i32 = 0\n"
                                          "    while i < 5 && (await dbl(i)) < n\n        i += 1\n    i\n", "(6)"), 3),
+    # A range `for` (AGAST #4188): the loop var and the end are future
+    # fields, the end evaluated once; `continue` increments.
+    "for_body": (_DBL + _go("(n: i32) -> i32", "    var s: i32 = 0\n    for i in 0..n\n"
+                            "        s += await dbl(i)\n    s\n", "(3)"), 6),
+    "for_continue_break_end_once": (_DBL + "var CALLS: i32 = 0\n\nfn lim(n: i32) -> i32\n    CALLS += 1\n    n\n\n"
+                                    + _go("(n: i32) -> i32", "    var s: i32 = 0\n    for i in 1..lim(n)\n"
+                                          "        if i == 2\n            continue\n        if i == 5\n"
+                                          "            break\n        s += await dbl(i)\n    s * 10 + CALLS\n",
+                                          "(9)"), 161),
+    # An awaited bound, `..=`, and sibling loops on one name: two awaiting,
+    # one not.
+    "for_inclusive_await_bound": (_DBL + _go("(n: i32) -> i32",
+                                             "    var s: i32 = 0\n    for i in (await dbl(1))..=n\n"
+                                             "        s += await dbl(i)\n    for i in 0..(2 as i32)\n"
+                                             "        s += await dbl(i)\n    for i in 0..(3 as i32)\n        s += i\n"
+                                             "    s\n", "(4)"), 23),
+    # The loop var survives a Pending poll; the statement ahead runs once.
+    "for_pending_resumes": (_LATER + "async fn go() -> i32\n    CALLS += 1\n    var s: i32 = 0\n"
+                            "    for i in 0..(2 as i32)\n        s += i + await later()\n    s + CALLS * 10\n\n"
+                            + _POLL_GO, 221),
+    # #4013's `__short_K` and #4188's `__for_K` fields in one future.
+    "for_and_rhs": (_DBL + _go("(n: i32) -> i32", "    var s: i32 = 0\n    for i in 0..n\n"
+                               "        if i > 1 && (await dbl(i)) > 4\n            s += i\n    s\n", "(5)"), 7),
     "pending_inner_future_kept": (_LATER + "async fn mid() -> i32\n    CALLS += 1\n    let v: i32 = await later()\n"
                                   "    v\n\nasync fn go() -> i32\n    let v: i32 = await mid()\n"
                                   "    v + CALLS * 10\n\n" + _POLL_GO, 215),
@@ -143,9 +166,15 @@ _UNPLACED = "`await` inside {what} in an async fn is not supported yet (AGAST #4
 REFUSALS = {
     "match_arm": (_DBL + "async fn go(x: i32) -> i32\n    match x\n        0 => ^await dbl(1)\n        _ => 2\n\n"
                   "pub fn main() -> i32\n    await go(0)\n", _UNPLACED.format(what="a `match`")),
-    "for_body": (_DBL + "async fn go(n: i32) -> i32\n    var s: i32 = 0\n    for i in 0..n\n"
-                 "        s += ^await dbl(1)\n    s\n\npub fn main() -> i32\n    await go(3)\n",
-                 _UNPLACED.format(what="a `for` loop")),
+    "for_iterable": (_DBL + "async fn go(q: i32) -> i32\n    var s: i32 = 0\n    for x in q\n"
+                     "        s += ^await dbl(x)\n    s\n\npub fn main() -> i32\n    await go(3)\n",
+                     _UNPLACED.format(what="a `for` over an iterable")),
+    # An awaiting `for`'s var is a future field, which needs a type (#4188).
+    "for_untyped_bound": (_DBL + "struct P\n    n: i32\n\nasync fn go(p: *P) -> i32\n    var s: i32 = 0\n"
+                          "    ^for i in 0..p.n\n        s += await dbl(1)\n    s\n\n"
+                          "pub fn main() -> i32\n    var p: P = P { n: 3 }\n    await go(@p)\n",
+                          "cannot infer the type of `i`, which `go`'s future holds across an `await`: "
+                          "cast a bound of its range (`0..(n as i64)`)"),
     # A defer the machine would split: refused at the `defer` itself.
     "defer_among_states": (_DBL + "async fn go(n: i32) -> i32\n    ^defer n = 0\n    await dbl(n)\n\n"
                            "pub fn main() -> i32\n    await go(3)\n",

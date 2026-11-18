@@ -6249,24 +6249,47 @@ fn main() -> i32
 ```
 
 The right operand of `&&` / `||` runs, with its awaits, only when the left
-one doesn't decide the value.  An `await` inside a `match` arm or a `for` loop
-is refused at the `await`, and a `defer` among the statements the machine splits
-into states is refused at the `defer`, until those forms are lowered
-(AGAST #4013):
+one doesn't decide the value.  A `for` over a range may await in its body or its
+bounds (AGAST #4188): the loop variable and the end live in the future, the end
+evaluated once, and `continue` goes on to the next value:
 
-```ritz expect-error="`await` inside a `for` loop in an async fn is not supported yet (AGAST #4013)"
+```ritz
 async fn dbl(x: i32) -> i32
     x * 2
 
 async fn go(n: i32) -> i32
     var s: i32 = 0
     for i in 0..n
+        if i == 1
+            continue
         s += await dbl(i)
     s
 
 fn main() -> i32
-    let r: i32 = await go(3)
-    r - 6
+    let r: i32 = await go(3)   # 0 + 4
+    r - 4
+```
+
+The loop variable's type is its bounds', as a local's is its value's: a bound
+whose type needs more than that, such as a struct field, is refused at the
+`for`; cast it (`0..(p.n as i32)`).
+
+An `await` inside a `match` arm is refused at the `await`, and a `defer` among
+the statements the machine splits into states is refused at the `defer`, until
+those forms are lowered (AGAST #4013):
+
+```ritz expect-error="`await` inside a `match` in an async fn is not supported yet (AGAST #4013)"
+async fn dbl(x: i32) -> i32
+    x * 2
+
+async fn go(x: i32) -> i32
+    match x
+        0 => await dbl(1)
+        _ => 2
+
+fn main() -> i32
+    let r: i32 = await go(0)
+    r - 2
 ```
 
 ### 16.3 Runtime

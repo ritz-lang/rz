@@ -345,6 +345,14 @@ struct AlBlock
     closed: i32         # 1: ends in a jump or a return
     next: *AlBlock
 
+# A name read through another field: an awaiting `for`'s var (#4188).
+struct AlRename
+    name: *u8
+    len: i32
+    field: *u8
+    flen: i32
+    next: *AlRename
+
 struct AlLoop
     head: *AlBlock      # tests the condition: `continue` goes here
     exit: *AlBlock      # after the loop: `break` goes here
@@ -378,6 +386,8 @@ struct AlFn
     nawaits: i32        # awaits lowered so far
     nshorts: i32        # `&&` / `||` with an awaiting right operand, so far
     extra: *AlLocal     # the fields it adds, in order
+    renames: *AlRename  # innermost first
+    nfors: i32          # awaiting `for`s lowered so far
     errs: i32
 
 fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
@@ -395,6 +405,8 @@ fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
     a.nawaits = 0
     a.nshorts = 0
     a.extra = null
+    a.renames = null
+    a.nfors = 0
     a.errs = 0
 
 fn al_local_find(a: *AlFn, name: *u8, len: i32) -> *AlLocal
@@ -700,6 +712,14 @@ fn al_is_field(a: *AlFn, name: *u8, len: i32) -> i32
         return 0
     (l.is_param == 1 or a.npoints > 0) as i32
 
+fn al_rename_of(a: *AlFn, name: *u8, len: i32) -> *AlRename
+    var r: *AlRename = a.renames
+    while r != null
+        if al_eq(r.name, r.len, name, len) == 1
+            return r
+        r = r.next
+    null
+
 fn al_point_of(a: *AlFn, e: *Expr) -> *AlPoint
     var p: *AlPoint = a.points
     while p != null
@@ -823,6 +843,11 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
         return null
     let k: i32 = e.kind
     if k == EXPR_IDENT
+        let r: *AlRename = al_rename_of(a, e.ident_ptr, e.ident_len)
+        if r != null
+            let m: *Expr = al_self_field(r.field, r.flen, e.span)
+            m.next = e.next
+            return m
         if al_is_field(a, e.ident_ptr, e.ident_len) == 1
             let m: *Expr = al_self_field(e.ident_ptr, e.ident_len, e.span)
             m.next = e.next
@@ -1675,6 +1700,87 @@ fn al_lower_while(a: *AlFn, cond: *Expr, body: *Stmt, span: SrcSpan)
         al_goto(a, head, span)
     a.cur = exit_b
 
+# `5` or `-5`: a literal that takes the other operand's type (LARB R21).
+fn al_untyped_int(e: *Expr) -> i32
+    var x: *Expr = e
+    if x.kind == EXPR_UNARY and x.op == OP_NEG
+        x = x.operand
+    (x.kind == EXPR_INT_LIT and x.lit_kind == LIT_PLAIN) as i32
+
+# An awaiting `for`'s var's type, into `l`: its start's, unless that is a
+# bare literal (`0..n`) or untold; then its end's.  0 if neither tells.
+# ritz0's _CfgBuilder._for_type.
+fn al_for_type(a: *AlFn, s: *Stmt, l: *AlLocal) -> i32
+    if al_untyped_int(s.for_start) == 0 and al_infer(a, s.for_start, l) == 1
+        return 1
+    al_infer(a, s.for_end, l)
+
+# `for v in a..b` (#4188): v and the end are future fields, `__for_K` and
+# `__for_end_K`, the end evaluated once; then a `while __for_K < __for_end_K`
+# whose `continue` goes to the increment.  ritz0's _CfgBuilder._lower_for.
+fn al_lower_for(a: *AlFn, s: *Stmt)
+    let span: SrcSpan = s.span
+    if s.for_end == null
+        al_unplaced(a, c"a `for` over an iterable", al_culprit(s))
+        return
+    var t: AlLocal
+    if al_for_type(a, s, @t) == 0
+        var m: String = string_new()
+        string_push_str(@&m, "cannot infer the type of `")
+        string_push_bytes(@&m, s.for_var, s.for_var_len as i64)
+        string_push_str(@&m, "`, which `")
+        string_push_bytes(@&m, a.f.name, a.f.name_len as i64)
+        string_push_str(@&m, "`'s future holds across an `await`: cast a bound of its range (`0..(n as i64)`)")
+        al_refuse(a, @&m, span)
+        string_drop(@&m)
+        return
+    let k: i32 = a.nfors
+    a.nfors += 1
+    var vl: i32 = 0
+    let var_f: *u8 = al_numbered(c"__for_", k, @vl)
+    var el: i32 = 0
+    let end_f: *u8 = al_numbered(c"__for_end_", k, @el)
+    al_for_type(a, s, al_extra(a, var_f, vl))
+    al_for_type(a, s, al_extra(a, end_f, el))
+    let start: *Expr = al_hoist(a, s.for_start)
+    start.next = null
+    al_emit(a, al_assign_self(var_f, vl, start, span))
+    let end: *Expr = al_hoist(a, s.for_end)
+    end.next = null
+    al_emit(a, al_assign_self(end_f, el, end, span))
+    let head: *AlBlock = al_new_block(a)
+    al_goto(a, head, span)
+    a.cur = head
+    var op: i32 = OP_LT
+    if s.for_inclusive == 1
+        op = OP_LE
+    let cond: *Expr = al_binary(op, al_self_field(var_f, vl, span), al_self_field(end_f, el, span))
+    let body_b: *AlBlock = al_new_block(a)
+    let incr: *AlBlock = al_new_block(a)
+    let exit_b: *AlBlock = al_new_block(a)
+    al_branch(a, cond, body_b, exit_b, span)
+    a.cur = body_b
+    let r: *AlRename = al_zalloc(sizeof(AlRename)) as *AlRename
+    r.name = s.for_var
+    r.len = s.for_var_len
+    r.field = var_f
+    r.flen = vl
+    r.next = a.renames
+    a.renames = r
+    var lp: AlLoop
+    lp.head = incr
+    lp.exit = exit_b
+    var none: AlDest = al_dest(AL_TO_NONE, span)
+    al_lower_list(a, s.for_body, @none, @lp)
+    a.renames = r.next
+    if a.cur != null
+        al_goto(a, incr, span)
+    a.cur = incr
+    let step: *Expr = al_binary(OP_ADD, al_self_field(var_f, vl, span), al_int(1, span))
+    al_emit(a, al_assign_self(var_f, vl, step, span))
+    al_goto(a, head, span)
+    a.cur = exit_b
+
 # The statements `s`; with `d`, the last one is the list's value.
 fn al_lower_list(a: *AlFn, s: *Stmt, d: *AlDest, lp: *AlLoop)
     var cur: *Stmt = s
@@ -1780,7 +1886,7 @@ fn al_lower_stmt(a: *AlFn, s: *Stmt, lp: *AlLoop)
             al_rw_arms(a, s.if_then as *MatchArm)
             al_emit(a, s)
     else if k == STMT_FOR
-        al_unplaced(a, c"a `for` loop", al_culprit(s))
+        al_lower_for(a, s)
     else
         al_unplaced(a, c"this statement", al_culprit(s))
 
