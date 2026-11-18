@@ -34,6 +34,14 @@ REFUSED = {
     "field_void_tail": "fn f(w: *W)\n    ^w.a\n",
     "method_void_tail": "impl W\n    fn g(self: *W)\n        ^self.a\n",
     "deref_void_tail": "fn f(p: *[2]i32)\n    ^*p\n",
+    # An arm's last statement before its value is not the arm's value
+    # (AGAST #3920: ritz1 judged only a statement with a next one, and the
+    # arm's value lives apart from its statements).  As ritz0, the trailing
+    # value of an else-less `if` body is not judged.
+    "field_before_match_arm_value": ("fn f(w: W, c: i32) -> i32\n    match c\n        3 =>\n"
+                                     "            ^w.a\n            1\n        _ => 0\n"),
+    "field_before_if_expr_arm_value": ("fn f(w: W, c: i32) -> i32\n    let v: i32 = if c == 2\n"
+                                       "        ^w.a\n        1\n    else\n        0\n    v\n"),
 }
 
 

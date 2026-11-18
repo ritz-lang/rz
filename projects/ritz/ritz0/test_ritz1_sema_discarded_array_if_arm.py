@@ -26,9 +26,9 @@ THE TESTS
   location.  discarded_array: every receiver shape the emitter typed (a
   param, a member chain, `*p`, `p.f` through a pointer field, an element, a
   call, a call returning a pointer, a method call), a loop body, a void fn's
-  tail and a method's.  Unreported, as before: the last statement of an
-  `if` body and an arm's last statement before its value (the emitter only
-  ever judged a statement with a next one; a gap, AGAST #3920).
+  tail and a method's, and an arm's last statement before its value (AGAST
+  #3920: the emitter only ever judged a statement with a next one).
+  Unreported, as by ritz0: the trailing value of an else-less `if` body.
   if_arm: a nested else-less `if`, an array-valued if (emit_array_if_into),
   a `return if`, the generic wording; an arm that returns is not refused.
 """
@@ -116,10 +116,11 @@ pub fn main() -> i32
     0
 """
 
-# line:col of each report, as the pre-move emitter made them (32:9 and 38:13
-# were never judged; see the docstring).
+# line:col of each report, as ritz0 makes them.  38:13, an arm's statement
+# before its value, joined in AGAST #3920; 32:9, the trailing value of an
+# else-less `if` body, is judged by none of the three (see the docstring).
 ARRAY_WANTED = sorted(["22:5", "23:5", "24:5", "25:6", "26:5", "27:5", "28:5",
-                       "29:5", "34:9", "44:5", "13:9"])
+                       "29:5", "34:9", "38:13", "44:5", "13:9"])
 
 IF_REACH = """\
 fn f(c: i32, d: i32) -> i32
