@@ -43,7 +43,7 @@ SCRIPTS = [
     "projects/valet/test/test_short_send.sh",
     "projects/valet/test/test_tls_socket.sh",
     "projects/nexus/test/e2e_large_page.sh",
-    # By hand.
+    # Only in projects/valet/test/run_all.sh (#1403).
     "projects/valet/test/test_basic.sh",
     "projects/valet/test/test_multishot.sh",
     "projects/valet/test/test_workers.sh",
