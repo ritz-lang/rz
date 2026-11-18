@@ -17223,6 +17223,7 @@ class LLVMEmitter:
         val = self._emit_into_array_slot(expr.expr, expr.target)
 
         target_type = self._ritz_type_to_llvm(expr.target)
+        self._reject_struct_as_struct(val, target_type, expr)
 
         if target_type == self.i1:
             raise EmitError(bool_rules.AS_BOOL_REMOVED, self._value_span(expr))
@@ -17287,6 +17288,32 @@ class LLVMEmitter:
 
         # Use _convert_type for other conversions
         return self._convert_type(val, target_type)
+
+    def _reject_struct_as_struct(self, val: ir.Value, target_type: ir.Type,
+                                 expr: rast.Cast) -> None:
+        """`c as D` or `r as D` (`r` an `@C` / `*C`) with C and D two structs
+        is refused at the `as` (LANGUAGE_SPEC §7.5, LARB R72, AGAST #3012).
+
+        By value _convert_type no-oped, so `d` was C under D's name; through a
+        reference it fell through to the pointer itself, with C's fields.
+        `r as C` (#3004) reads the referent and `@c as *D` is a pointer cast:
+        neither has a struct on both sides."""
+        src = val.type.pointee if isinstance(val.type, ir.PointerType) else val.type
+        if src is target_type:
+            return
+        structs = {id(t) for t in self.struct_types.values()}
+        if id(src) not in structs or id(target_type) not in structs:
+            return
+        src_ritz = self._infer_ritz_type(expr.expr)
+        if isinstance(src_ritz, (rast.RefType, rast.PtrType)):
+            src_ritz = src_ritz.inner
+        src_name = (self._format_ritz_type(src_ritz) if src_ritz is not None
+                    else getattr(src, 'name', str(src)))
+        dst_name = self._format_ritz_type(expr.target)
+        raise EmitError(
+            f"cannot cast `{src_name}` to `{dst_name}`: `as` doesn't convert between "
+            f"structs: build a `{dst_name}` from the fields",
+            expr.as_span or self._value_span(expr))
 
     def _emit_float_to_int_sat(self, val: ir.Value, target_type: ir.IntType,
                                unsigned: bool) -> ir.Value:

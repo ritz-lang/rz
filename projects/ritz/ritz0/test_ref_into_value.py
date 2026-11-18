@@ -301,6 +301,22 @@ COPY_CAST_SITES = {
     "by_value": "fn f(r: @C) -> i32\n    let c: C = *r\n    let d: C = c as C\n    d.x\n",
 }
 
+# `as` between two different structs, by value or through a reference, is a
+# located refusal at the `as` (LARB R72, AGAST #3012).  ritz0 copied by value
+# and, through a reference, bound `d` to the pointer with C's fields; ritz1
+# emitted IR clang refused.  `@` and `*` take one path in ritz0, so one row each
+# for a value and a reference; `@&` adds nothing.
+STRUCT_CASTS = {
+    "by_value": "fn f(c: C) -> i32\n    let d: D = c ^as D\n    d.x\n",
+    "shared": "fn f(r: @C) -> i32\n    let d: D = r ^as D\n    d.x\n",
+    "pointer": "fn f(r: *C) -> i32\n    let d: D = r ^as D\n    d.x\n",
+}
+STRUCT_D = "struct D\n    x: i32\n\n"
+STRUCT_CAST_ERROR = "cannot cast `C` to `D`: `as` doesn't convert between structs: build a `D` from the fields"
+# What R72 leaves legal: an address to another pointer type.
+ADDR_AS_OTHER_POINTER = ("fn f(r: *D) -> i32\n    r.x\n\npub fn main() -> i32\n"
+                         "    var c = C { x: 4 }\n    f(@c as *D)\n")
+
 MATCHES = {
     "deref": "fn f(e: {E}) -> i32\n    match *e\n        V(t) => 4\n        N => 0\n",
     "field": "fn f(w: {W}) -> i32\n    match w.e\n        V(t) => 4\n        N => 0\n",
@@ -566,6 +582,23 @@ def test_a_copy_type_cast_from_a_reference_is_not_this_rule(tmp_path, compiler, 
 def test_a_copy_type_cast_lands_as_the_referent(tmp_path, compiler, site):
     entry = "    var c = C { x: 4 }\n    f(@c)\n"
     assert _run(compiler, tmp_path, f"copy_cast_{site}", COPY + _main(COPY_CAST_SITES[site], entry)) == 4
+
+
+# ritz1's half of R72 is AGAST #4000: strict, so it fails when that lands.
+RITZ1_STRUCT_CAST = pytest.mark.xfail(strict=True, reason="AGAST #4000: ritz1 emits clang-rejected IR")
+
+
+@pytest.mark.parametrize("compiler", [
+    "ritz0", *(pytest.param(c, marks=RITZ1_STRUCT_CAST) for c in COMPILERS[1:])])
+@pytest.mark.parametrize("site", _ids(STRUCT_CASTS))
+def test_as_between_two_structs_is_refused(tmp_path, compiler, site):
+    src = COPY + STRUCT_D + _main(STRUCT_CASTS[site], CALL_F)
+    _assert_refused(compiler, tmp_path, f"struct_cast_{site}", src, STRUCT_CAST_ERROR)
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_address_as_another_struct_pointer_stays_legal(tmp_path, compiler):
+    assert _run(compiler, tmp_path, "addr_as_other_pointer", COPY + STRUCT_D + ADDR_AS_OTHER_POINTER) == 4
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

@@ -2442,6 +2442,27 @@ token that can't continue a type. `|` never continues one (§3.8), so
 `x as u64 | 1` is `(x as u64) | 1`, and `a + b as i64` is `a + (b as i64)`.
 Parenthesise to cast a whole expression: `(a + b) as i64` (LARB R52a).
 
+`as` doesn't convert between two struct types, by value or through a reference,
+even when their fields match: build the other struct from the fields (LARB R72).
+`r as C` with `r` an `@C` or `*C` reads a copy of the referent (§13), and
+`@c as *D` is a pointer cast, so both stay legal.
+
+```ritz expect-error="cannot cast `C` to `D`: `as` doesn't convert between structs: build a `D` from the fields"
+struct C
+    x: i32
+
+struct D
+    x: i32
+
+fn f(r: @C) -> i32
+    let d: D = r as D                # error: write `D { x: r.x }`
+    d.x
+
+fn main() -> i32
+    let c = C { x: 4 }
+    f(@c)
+```
+
 #### `bool` converts to nothing
 
 `bool` is its own type. No `let`, `var`, `return`, tail, argument, field, element
