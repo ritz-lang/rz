@@ -102,6 +102,22 @@ RUNS = {
                         "pub fn go() -> i64\n    defer note(1)\n"
                         "    mk(2).id\n\n"
                         "pub fn main() -> i32\n    go()\n    log as i32\n", 21),
+    # AGAST #4072: a procedure's tail value goes nowhere, so it is a
+    # temporary dropped at the `ret` (§13.6, #2253): the note's 1, then 2.
+    "proc_tail_dropped": ("fn mk(id: i64) -> Noisy\n    Noisy { id: id }\n\n"
+                          "pub fn go()\n    note(1)\n    mk(2)\n\n"
+                          "pub fn main() -> i32\n    go()\n    log as i32\n", 12),
+    # ...and, like a fn's tail temporary, before the defers run: 2 then 1.
+    "proc_tail_before_defer": ("fn mk(id: i64) -> Noisy\n    Noisy { id: id }\n\n"
+                               "pub fn go()\n    defer note(1)\n    mk(2)\n\n"
+                               "pub fn main() -> i32\n    go()\n    log as i32\n", 21),
+    # ...and the same in a method procedure, which ritz1 emits apart.
+    "method_proc_tail_dropped": ("fn mk(id: i64) -> Noisy\n    Noisy { id: id }\n\n"
+                                 "struct Maker\n    n: i64\n\nimpl Maker\n"
+                                 "    fn go(self: @&Maker)\n        defer note(1)\n"
+                                 "        mk(2)\n\n"
+                                 "pub fn main() -> i32\n    var m = Maker { n: 0 }\n"
+                                 "    m.go()\n    log as i32\n", 21),
 }
 
 
