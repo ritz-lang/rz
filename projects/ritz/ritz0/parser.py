@@ -947,12 +947,16 @@ class Parser:
 
     def parse_expr(self, min_prec: int = 0) -> rast.Expr:
         """Parse an expression with Pratt parsing."""
+        grouped = self._at(TokenType.LPAREN)
         left = self.parse_prefix()
 
         # Block expressions (if, match) don't participate in infix parsing
         # They naturally terminate at their closing block, so we shouldn't
-        # look for infix operators like * which would be parsed as multiplication
-        if isinstance(left, (rast.If, rast.Match)):
+        # look for infix operators like * which would be parsed as multiplication.
+        # A parenthesised one is a grouped primary and does (AGAST #4163):
+        # `(if c then a else b) * 2` multiplies.  The grouped primary hands
+        # back the inner node itself, so the `(` is what tells them apart.
+        if isinstance(left, (rast.If, rast.Match)) and not grouped:
             return left
 
         while True:
