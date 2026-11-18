@@ -2411,8 +2411,9 @@ class TypeChecker:
     def _value_fits(self, value: Optional[rast.Expr], actual: rast.Type,
                     expected: rast.Type) -> bool:
         """`value`, of type `actual`, in an `expected` slot. A string literal has
-        no fixed type: it is `*u8` in a `*u8` slot (LARB R3), and nothing else
-        is, so a StrView or String stays a mismatch."""
+        no fixed type: it is `*u8` in a `*u8` slot (LARB R3) and a `Span<u8>` of
+        its bytes in a `Span<u8>` slot (LARB R62, AGAST #3596), and nothing else
+        is, so a StrView, a `c"…"` or a String stays a mismatch."""
         if self._types_compatible(actual, expected):
             return True
         if value is None:
@@ -2420,9 +2421,21 @@ class TypeChecker:
         tails = list(slot_tails(expected, value))
         if not any(isinstance(tail, rast.StringLit) for tail, _ in tails):
             return False
-        return all(self._is_u8_ptr(slot) if isinstance(tail, rast.StringLit)
+        return all(self._is_u8_ptr(slot) or self._is_u8_span(slot)
+                   if isinstance(tail, rast.StringLit)
                    else self._types_compatible(self._infer_type(tail), slot)
                    for tail, slot in tails)
+
+    def _is_u8_span(self, ty: rast.Type) -> bool:
+        """`Span<u8>`, or monomorphisation's `Span$u8` spelling of it."""
+        ty = self._resolve_alias(ty)
+        if not self._is_span(ty):
+            return False
+        if ty.args:
+            return (len(ty.args) == 1 and
+                    mangle_generic_name('Span', [self._resolve_alias(ty.args[0])])
+                    == 'Span$u8')
+        return ty.name == 'Span$u8'
 
     @staticmethod
     def _is_u8_ptr(ty: rast.Type) -> bool:
