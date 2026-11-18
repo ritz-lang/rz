@@ -250,7 +250,10 @@ class ImportResolver:
         # Track which files are currently being processed (for cycle detection)
         self.processing_stack: List[str] = []
         # Collected items from all imports
-        self.structs: Dict[str, rast.StructDef] = {}
+        # Lists, as for functions: a name may have one variant per
+        # [[target_os]] (AGAST #4054). Which one exists is decided after
+        # target_os filtering (resolve_struct_variants).
+        self.structs: Dict[str, List[rast.StructDef]] = {}
         self.enums: Dict[str, rast.EnumDef] = {}
         # Functions stored as lists to support multiple definitions with different
         # [[target_os]] attributes. The correct one is selected after target_os filtering.
@@ -609,7 +612,8 @@ class ImportResolver:
         merged_items = []
 
         # Add all collected items in order: structs, enums, type_aliases, traits, constants, variables, extern_fns, impls, functions
-        merged_items.extend(self.structs.values())
+        for struct_list in self.structs.values():
+            merged_items.extend(struct_list)
         merged_items.extend(self.enums.values())
         merged_items.extend(self.type_aliases.values())
         merged_items.extend(self.traits.values())
@@ -955,7 +959,7 @@ class ImportResolver:
             )
             struct_def.source_file = source_file
             if struct_meta.name not in self.structs:
-                self.structs[struct_meta.name] = struct_def
+                self.structs[struct_meta.name] = [struct_def]
 
         # Register enums
         for enum_meta in meta.enums:
@@ -1074,16 +1078,25 @@ class ImportResolver:
         item.source_file = source_file
 
         if isinstance(item, rast.StructDef):
-            if item.name in self.structs:
-                existing = self.structs[item.name]
-                # Allow duplicate if identical definition
+            # LANGUAGE_SPEC §17.2: a [[target_os]] struct exists only on its
+            # target, so a name may have one variant per target (AGAST
+            # #4054). Two that always coexist -- both ungated, or both gated
+            # to one target -- must be identical (an identical repeat is
+            # dropped). A gated variant beside an ungated one coexists only
+            # on its own target; resolve_struct_variants decides that after
+            # target_os filtering.
+            item_target_os = item.get_attr_value('target_os')
+            variants = self.structs.setdefault(item.name, [])
+            for existing in variants:
+                if existing.get_attr_value('target_os') != item_target_os:
+                    continue
                 if not self._structs_equal(existing, item):
                     raise ImportError(
                         f"Conflicting struct definition for '{item.name}': "
-                        f"defined in both {source_file} and previous import"
+                        f"defined in both {existing.source_file} and {source_file}"
                     )
-            else:
-                self.structs[item.name] = item
+                return
+            variants.append(item)
 
         elif isinstance(item, rast.FnDef):
             # Store functions as lists to support multiple definitions with different
@@ -1215,6 +1228,27 @@ class ImportResolver:
             # Static asserts are collected for compile-time evaluation
             # Only keep asserts from the main module (not imports)
             self.static_asserts.append(item)
+
+    def resolve_struct_variants(self, module: rast.Module) -> rast.Module:
+        """After target_os filtering, at most one definition of each struct
+        name may remain (AGAST #4054): drop identical repeats, and reject a
+        differing pair (a gated variant beside an ungated one on its own
+        target)."""
+        kept: Dict[str, rast.StructDef] = {}
+        items = []
+        for item in module.items:
+            if isinstance(item, rast.StructDef):
+                first = kept.get(item.name)
+                if first is not None:
+                    if not self._structs_equal(first, item):
+                        raise ImportError(
+                            f"Conflicting struct definition for '{item.name}': "
+                            f"defined in both {first.source_file} and {item.source_file}"
+                        )
+                    continue
+                kept[item.name] = item
+            items.append(item)
+        return rast.Module(module.span, items)
 
     def _structs_equal(self, a: rast.StructDef, b: rast.StructDef) -> bool:
         """Check if two struct definitions are equivalent."""
