@@ -46,6 +46,12 @@
 #        QEMU_MEM=SIZE  guest RAM (default 2G; 512M puts every pmm page under
 #                       the low 1 GiB identity map, AGAST #3530; above 4G each
 #                       boot must also pass high_memory, AGAST #4183)
+#        COMPILER=NAME  ritz0, ritz1 or ritz1_selfhosted (AGAST #1848): build
+#                       with `./rz build PKG --compiler NAME`, and require
+#                       every binary the boot loads (kernel, BOOTX64.EFI,
+#                       initramfs ELFs) to have a build manifest naming NAME,
+#                       so a stale build from another compiler can't pass as
+#                       NAME's image. Unset: rz's default, no manifest check.
 #
 # Exit: 0 = pass; 1 = a boot failed (panic, exception, failed suite, no
 #       verdict before the timeout, or a failed build); 2 = bad usage;
@@ -69,6 +75,11 @@ EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 
 case "$MODE" in native|grub|all) ;; *) echo "usage: $0 [native|grub|all]" >&2; exit 2 ;; esac
+COMPILER="${COMPILER:-}"
+case "$COMPILER" in
+    ""|ritz0|ritz1|ritz1_selfhosted) ;;
+    *) echo "usage: COMPILER must be ritz0, ritz1 or ritz1_selfhosted, not '$COMPILER'" >&2; exit 2 ;;
+esac
 
 command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
 # Each boot writes a qcow2 overlay; without qemu-img that read as a boot
@@ -100,7 +111,7 @@ USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
 
 if [ "${SKIP_BUILD:-0}" != "1" ]; then
     for pkg in harland $USER_PKGS; do
-        (cd "$ROOT_DIR" && ./rz build "$pkg")
+        (cd "$ROOT_DIR" && ./rz build "$pkg" ${COMPILER:+--compiler "$COMPILER"})
         brc=$?
         # rz exits EXIT_SETUP when a toolchain binary is missing (lld-link
         # for BOOTX64.EFI): the host's fault, not the code's.
@@ -114,6 +125,29 @@ LOADER_EFI="$HARLAND_DIR/build/debug/BOOTX64.EFI"
 for f in "$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/init.elf"; do
     [ -f "$f" ] || { echo "FAIL: not built: $f"; exit 1; }
 done
+
+# COMPILER set: every binary the boot loads must say COMPILER built it. The
+# manifest (build.py writes BIN.manifest.json beside each output) records the
+# compiler; the build directory does not, so without this SKIP_BUILD, or a
+# build/debug a ritz0 build left behind, would boot and pass as ritz1's image.
+if [ -n "$COMPILER" ]; then
+    BOOT_BINS=("$KERNEL_ELF" "$LOADER_EFI")
+    for pkg in $USER_PKGS; do
+        for f in "$PROJECTS_DIR/$pkg"/build/debug/*.elf; do
+            [ -f "$f" ] && BOOT_BINS+=("$f")
+        done
+    done
+    for f in "${BOOT_BINS[@]}"; do
+        m="$f.manifest.json"
+        [ -f "$m" ] || { echo "FAIL: $(basename "$f") has no build manifest ($m)"; exit 1; }
+        built_by="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("compiler", ""))' "$m" 2>/dev/null)"
+        [ "$built_by" = "$COMPILER" ] || {
+            echo "FAIL: $(basename "$f") was built by ${built_by:-an unknown compiler}, not $COMPILER"
+            exit 1
+        }
+    done
+    echo "PASS: ${#BOOT_BINS[@]} boot binaries built by $COMPILER"
+fi
 
 WORK="$(mktemp -d)"
 # The QEMU monitor sockets get a dir of their own under /tmp, not $TMPDIR:

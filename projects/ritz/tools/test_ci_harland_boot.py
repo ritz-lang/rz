@@ -25,6 +25,7 @@ Run with:
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -464,3 +465,165 @@ def test_missing_build_output_is_a_failure_not_a_setup_error(tree):
     (tree["root"] / "projects/harland/build/debug/harland.elf").unlink()
     r = _run(tree, PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
+
+
+# --------------------------------------------------------------------------
+# AGAST #1848 (M2.2): the boot again, on the image ritz1 builds
+# --------------------------------------------------------------------------
+#
+# main.yml's bootstrap job builds ritz1 and ritz1_selfhosted, so it boots
+# harland twice more, once per compiler, with COMPILER=<name>. COMPILER makes
+# the script build with `./rz build <pkg> --compiler <name>` (unless
+# SKIP_BUILD=1) and requires every binary the boot loads to have a build
+# manifest whose "compiler" is <name>. Without that check, a stale ritz0 build
+# left in build/debug would boot and pass as the "ritz1 image" while ritz1 had
+# built nothing.
+
+COMPILERS = ("ritz1", "ritz1_selfhosted")
+BUILD_STEP = "Build ritz1 + ritz1_selfhosted"
+KERNEL = "projects/harland/build/debug/harland.elf"
+LOADER = "projects/harland/build/debug/BOOTX64.EFI"
+INIT = "projects/indium/build/debug/init.elf"
+
+
+# --------------------------------------------------------------------------
+# Wiring: main.yml's bootstrap job
+# --------------------------------------------------------------------------
+
+
+def _bootstrap() -> list[dict]:
+    spec = yaml.safe_load(ci_local.WORKFLOW.read_text())
+    return spec["jobs"]["bootstrap"]["steps"]
+
+
+def _boot_steps(steps: list[dict]) -> dict[str, int]:
+    """{compiler: index} of the bootstrap steps that boot a ritz1-family image."""
+    found: dict[str, int] = {}
+    for i, s in enumerate(steps):
+        run = str(s.get("run", ""))
+        if BOOT_SCRIPT not in run:
+            continue
+        for c in COMPILERS:
+            if f"COMPILER={c} " in run:
+                assert c not in found, f"two bootstrap steps boot the {c} image"
+                found[c] = i
+    return found
+
+
+def test_bootstrap_boots_each_self_hosted_image_once():
+    found = _boot_steps(_bootstrap())
+    assert sorted(found) == sorted(COMPILERS), found
+
+
+def test_boots_come_after_the_compilers_are_built():
+    steps = _bootstrap()
+    build = [i for i, s in enumerate(steps) if s.get("name") == BUILD_STEP]
+    assert len(build) == 1
+    assert all(i > build[0] for i in _boot_steps(steps).values())
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_boot_step_is_a_real_gate(compiler):
+    """Both boots (native and GRUB), no escape hatch, a bound, and not a step
+    ci_local would skip as setup."""
+    steps = _bootstrap()
+    step = steps[_boot_steps(steps)[compiler]]
+    assert not step.get("continue-on-error", False)
+    assert "|| true" not in step["run"]
+    assert "SKIP_BUILD" not in step["run"], "the step must build with the compiler"
+    assert step.get("working-directory", ".") == "."
+    assert 0 < int(step.get("timeout-minutes", 0)) <= 10
+    assert "test_tier1_boot.sh native" not in step["run"]
+    assert "test_tier1_boot.sh grub" not in step["run"]
+    parsed = [
+        s for s in ci_local.load_steps()
+        if s.job == "bootstrap" and s.name == step["name"]
+    ]
+    assert len(parsed) == 1 and not parsed[0].is_setup
+
+
+def test_boot_tools_installed_in_bootstrap_as_a_setup_step():
+    steps = _bootstrap()
+    installs = [i for i, s in enumerate(steps) if INSTALL_SCRIPT in str(s.get("run", ""))]
+    assert len(installs) == 1
+    assert installs[0] < min(_boot_steps(steps).values())
+    parsed = [
+        s for s in ci_local.load_steps()
+        if s.job == "bootstrap" and INSTALL_SCRIPT in s.run
+    ]
+    assert len(parsed) == 1 and parsed[0].is_setup
+
+
+def test_each_boot_keeps_its_own_serial_logs_and_they_are_uploaded():
+    """native.log/grub.log per compiler: one shared KEEP_WORK would let the
+    second boot overwrite the first's logs."""
+    steps = _bootstrap()
+    dirs = set()
+    for c, i in _boot_steps(steps).items():
+        run = steps[i]["run"]
+        assert f"boot-logs/{c}" in run and "KEEP_WORK=" in run
+        dirs.add(c)
+    assert len(dirs) == len(COMPILERS)
+    last = max(_boot_steps(steps).values())
+    uploads = [
+        s for s in steps[last + 1:]
+        if "actions/upload-artifact" in str(s.get("uses", ""))
+        and "boot-logs" in str(s.get("with", {}).get("path", ""))
+    ]
+    assert len(uploads) == 1 and uploads[0].get("if") == "always()"
+
+
+# --------------------------------------------------------------------------
+# Verdicts: COMPILER in the script, against the stub QEMU
+# --------------------------------------------------------------------------
+
+
+def _manifest(root: Path, rel: str, compiler: str) -> None:
+    Path(f"{root / rel}.manifest.json").write_text(json.dumps({"compiler": compiler}))
+
+
+def _all_built_by(tree, compiler: str) -> None:
+    for rel in (KERNEL, LOADER, INIT):
+        _manifest(tree["root"], rel, compiler)
+
+
+def test_image_built_by_the_compiler_passes(tree):
+    _all_built_by(tree, "ritz1")
+    r = _run(tree, PASSED, env_extra={"COMPILER": "ritz1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: 3 boot binaries built by ritz1" in r.stdout
+
+
+# One row per kind of binary the boot loads: the kernel ELF, the UEFI PE
+# loader and an initramfs user binary are checked by separate paths.
+@pytest.mark.parametrize("rel", [KERNEL, LOADER, INIT], ids=["kernel", "loader", "user"])
+def test_binary_built_by_another_compiler_fails(tree, rel):
+    _all_built_by(tree, "ritz1")
+    _manifest(tree["root"], rel, "ritz0")
+    r = _run(tree, PASSED, env_extra={"COMPILER": "ritz1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert f"FAIL: {Path(rel).name} was built by ritz0, not ritz1" in r.stdout
+
+
+def test_binary_without_a_manifest_fails(tree):
+    _all_built_by(tree, "ritz1")
+    Path(f"{tree['root'] / LOADER}.manifest.json").unlink()
+    r = _run(tree, PASSED, env_extra={"COMPILER": "ritz1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: BOOTX64.EFI has no build manifest" in r.stdout
+
+
+def test_unknown_compiler_is_bad_usage(tree):
+    r = _run(tree, PASSED, env_extra={"COMPILER": "gcc"})
+    assert r.returncode == 2, r.stdout + r.stderr
+
+
+def test_build_passes_the_compiler_to_rz(tree):
+    log = tree["tmp"] / "rz.log"
+    _stub(tree["root"], "rz", f'#!/usr/bin/env bash\necho "$@" >> {log}\n')
+    _all_built_by(tree, "ritz1_selfhosted")
+    r = _run(tree, PASSED, env_extra={"SKIP_BUILD": "0", "COMPILER": "ritz1_selfhosted"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    calls = log.read_text().splitlines()
+    assert calls and calls[0] == "build harland --compiler ritz1_selfhosted"
+    assert all(c.endswith("--compiler ritz1_selfhosted") for c in calls), calls
