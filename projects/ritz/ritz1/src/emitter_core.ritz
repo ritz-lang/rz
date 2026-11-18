@@ -6563,9 +6563,10 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         else if e.op == OP_NOT
             # `not <expr>` lowers to `icmp eq + zext to i64` (see
             # emit_expr_unary), so the value-flavoured result is i64
-            # regardless of operand type.  Returning the operand's type
-            # here would tell STMT_IF "already i1" and skip the i64→i1
-            # icmp coerce, wiring an i64 reg into `br i1 ...`.
+            # regardless of operand type.  (Returning the operand's type once
+            # told STMT_IF "already i1" and skipped the i64→i1 icmp coerce,
+            # wiring an i64 reg into `br i1 ...`; conditions now always
+            # coerce, AGAST #3010.)
             return TYPE_I64
         else if e.op == OP_BIT_NOT
             return TYPE_I64
@@ -6718,61 +6719,6 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
         if umt != 0
             return umt
     TYPE_I64  # Default fallback
-
-# Does emit_expr leave this bool expression in an i1 register?
-#
-# AGAST #1646: ritz1 has ONE convention for bools.  Every bool value lives in
-# an i64 register; i1 exists only at the ABI edges (call args, `ret`, struct
-# field stores) and at `br`, and those sites narrow with `trunc` / `icmp ne`.
-# Bool locals (emit_var_decl) and bool params (emit_bool_param_spill, #1497)
-# live in i64 slots, bool calls / comparisons / `not` / `and` / `or` zext,
-# and bool struct fields zext at the load (emit_expr_member).
-#
-# The one remaining i1 producer is the load of a bool GLOBAL, which still
-# reads its slot as i1 (AGAST #1532 owns bool globals).  Locals and params
-# register as TYPE_I64, so a TYPE_BOOL identifier is that global.  Every site
-# that must pick between "use as i1" and "narrow an i64" asks this one
-# predicate: if / while / assert conditions, bool call args, struct-literal
-# bool field stores and print interpolation.
-#
-# History (AGAST #1367).  Condition sites (STMT_IF, STMT_WHILE) need to know whether the
-# register emit_expr just produced can be fed straight into `br i1`, or whether
-# it must first be narrowed with `icmp ne i64 ..., 0`.  They used to decide
-# that by asking get_expr_type and treating TYPE_BOOL as "already an i1".
-#
-# That is not the same question.  get_expr_type reports the RITZ type; the br
-# needs the LLVM REGISTER WIDTH, and the two disagree wherever emit_expr
-# zero-extends a bool into ritz1's uniform i64 value representation:
-#
-#     %.1 = call i1 @yes()
-#     %.2 = zext i1 %.1 to i64     <- TYPE_BOOL, but the register is i64
-#     br i1 %.2, ...               <- rejected by clang
-#
-# get_expr_type's OP_NOT arm already documents exactly this hazard and works
-# around it by reporting TYPE_I64; that workaround only covers `not`.  Rather
-# than lie about more types, ask the width question directly.
-#
-# The leaking forms below were MEASURED by sweeping every condition shape and
-# classifying the br operand's defining instruction, not derived from reading
-# the emitter — reading it predicted that `b and c` on two bool identifiers
-# would leak, and it does not.  Measured leaking: a call, a *bool deref, and a
-# logical binary whose left operand leaks (get_expr_type delegates EXPR_BINARY
-# to its left, so this mirrors the type it will report).  Measured NOT
-# leaking: bool identifier, bool struct field, bool array element, `and`/`or`
-# over those, comparisons (which report TYPE_I64 and are coerced anyway),
-# `not`, and assert's operand.
-#
-# (That #1367 measurement predates #1646.  Its "bool struct field does not
-# leak" was the i1 field load; `and` / `or` over one only "worked" because a
-# raw field was never their left operand in a passing program: the operator
-# `icmp ne i64`s it, which is invalid IR.  Both now produce i64.)
-pub fn bool_reg_is_i1(s: *EmitterState, e: *Expr) -> i32
-    if get_expr_type(s, e) != TYPE_BOOL
-        return 0
-    # A bool global widens its i1 load to i64 (emit_expr_ident, AGAST #3001),
-    # as a `b:& bool` param, the one TYPE_BOOL local, does (#2994): no bool
-    # value reaches a consumer as a raw i1 now.
-    0
 
 # Get the struct type name for a dereference expression that returns TYPE_STRUCT
 # Returns the field info if found, null otherwise

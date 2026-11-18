@@ -5456,14 +5456,12 @@ fn emit_array_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32
     let else_arm: *MatchArm = then_arm.next
     # Sema refused a valueless arm (if_arm_value.ritz, AGAST #3512).
     let cond: i32 = emit_expr(s, value.left)
-    var cond_i1: i32 = cond
-    if bool_reg_is_i1(s, value.left) == 0
-        cond_i1 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, cond_i1)
-        emit_str(s, c" = icmp ne i64 ")
-        emit_reg(s, cond)
-        emit_str(s, c", 0\n")
+    let cond_i1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cond_i1)
+    emit_str(s, c" = icmp ne i64 ")
+    emit_reg(s, cond)
+    emit_str(s, c", 0\n")
     let then_label: i32 = next_label(s)
     let else_label: i32 = next_label(s)
     let end_label: i32 = next_label(s)
@@ -5528,14 +5526,12 @@ fn if_array_shape(s: *EmitterState, e: *Expr, out: *ArraySrc, pointee: *i32) -> 
 # statement its value.  A nested `if` / `else` there is a value too.
 pub fn emit_array_stmt_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, st: *Stmt)
     let cond: i32 = emit_expr(s, st.if_cond)
-    var cond_i1: i32 = cond
-    if bool_reg_is_i1(s, st.if_cond) == 0
-        cond_i1 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, cond_i1)
-        emit_str(s, c" = icmp ne i64 ")
-        emit_reg(s, cond)
-        emit_str(s, c", 0\n")
+    let cond_i1: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, cond_i1)
+    emit_str(s, c" = icmp ne i64 ")
+    emit_reg(s, cond)
+    emit_str(s, c", 0\n")
     let then_label: i32 = next_label(s)
     let else_label: i32 = next_label(s)
     let end_label: i32 = next_label(s)
@@ -5707,15 +5703,14 @@ fn emit_field_array_elem_store(s: *EmitterState, field_ptr: i32, field: *StructF
         sty = elem_mem_llvm(et)
         sval = emit_field_elem_narrow(s, val, et, val_expr)
     else if et == TYPE_BOOL
-        # An i1 register stores as-is; an i64 bool truncates.
+        # A bool value is an i64 register (AGAST #1646): truncate it.
         sty = c"i1"
-        if bool_reg_is_i1(s, val_expr) == 0
-            sval = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, sval)
-            emit_str(s, c" = trunc i64 ")
-            emit_reg(s, val)
-            emit_str(s, c" to i1\n")
+        sval = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, sval)
+        emit_str(s, c" = trunc i64 ")
+        emit_reg(s, val)
+        emit_str(s, c" to i1\n")
     else
         # Integers / pointers at their own width (trunc / inttoptr); i64
         # elements store all 8 bytes.
@@ -6125,24 +6120,16 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         fr.float_ty = take_match_float_hint(s)
         fr.hint_ty = fr.float_ty
         let cond: i32 = emit_expr(s, stmt.if_cond)
-        # If the condition register is already an i1, use it directly in the
-        # br — otherwise coerce i64 -> i1 via `icmp ne ..., 0`.  Without the
-        # check, `if boolvar` emits `icmp ne i64 %i1reg, 0`, which clang
-        # rejects. (task-99 cluster #2)
-        #
-        # This used to ask `get_expr_type(...) != TYPE_BOOL`, whose comment
-        # claimed "only direct bool identifiers hit this path".  They do not:
-        # a bool-returning CALL also reports TYPE_BOOL while emit_expr zexts
-        # its i1 to i64, so `if f()` wired an i64 into `br i1` and clang
-        # rejected the module.  See bool_reg_is_i1 (AGAST #1367, #1646).
-        var cond_i1: i32 = cond
-        if bool_reg_is_i1(s, stmt.if_cond) == 0
-            cond_i1 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, cond_i1)
-            emit_str(s, c" = icmp ne i64 ")
-            emit_reg(s, cond)
-            emit_str(s, c", 0\n")
+        # Every condition value, a bool included, is an i64 register
+        # (AGAST #1646; a bool global's load too since #3001), so coerce
+        # it to i1 via `icmp ne ..., 0` for the `br`.  Skipping that for a
+        # TYPE_BOOL condition wired an i64 into `br i1` (`if f()`, #1367).
+        let cond_i1: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, c", 0\n")
 
         let then_label: i32 = next_label(s)
         let else_label: i32 = next_label(s)
@@ -6335,17 +6322,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         begin_block(s, cond_label)
         let cond: i32 = emit_expr(s, stmt.while_cond)
-        # Same i1/i64 handling as STMT_IF — skip the icmp only when the
-        # register genuinely is an i1.  `while f()` on a bool-returning f hit
-        # the identical #1367 defect.
-        var cond_i1: i32 = cond
-        if bool_reg_is_i1(s, stmt.while_cond) == 0
-            cond_i1 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, cond_i1)
-            emit_str(s, c" = icmp ne i64 ")
-            emit_reg(s, cond)
-            emit_str(s, c", 0\n")
+        # Narrowed to i1 for the `br`, as STMT_IF does (AGAST #1367).
+        let cond_i1: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, cond_i1)
+        emit_str(s, c" = icmp ne i64 ")
+        emit_reg(s, cond)
+        emit_str(s, c", 0\n")
         own_cond_end(s)   # AGAST #2165: dropped on every evaluation
         emit_str(s, c"  br i1 ")
         emit_reg(s, cond_i1)
