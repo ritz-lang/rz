@@ -58,8 +58,8 @@ stale, the command to regenerate it is given instead.
 
 | Project | Description |
 |---|---|
-| **tempest** | Multi-process web browser integrating the full Ritz stack — **does not compile** (AGAST #1302) |
-| **lexis** | HTML5 & CSS parser — builds, but the binary segfaults at startup (AGAST #3700) |
+| **tempest** | Multi-process web browser integrating the full Ritz stack — builds; browser and tab process scaffolding only (ignores its URL argument) |
+| **lexis** | HTML5 & CSS parser — builds and runs its built-in tokenizer/parser demo |
 | **sage** | JavaScript engine — builds and runs, but does not yet accept a script argument |
 
 ## Applications & Tools
@@ -80,16 +80,17 @@ stale, the command to regenerate it is given instead.
 
 ## Build status (measured 2026-09-12)
 
-`./rz build --all` exits 1. Everything builds except:
+`./rz build --all` exits 1 on a machine without `lld`. Everything builds except:
 
 | Project | Cause |
 |---|---|
-| **harland** | `lld` not installed locally: `Cannot link UEFI target 'bootx64': lld-link not found`. Not excused in `rz.toml` — CI installs lld. |
-| **tempest** | AGAST #1302 — emitter indirection-depth bug (`cannot store IpcChannel to IpcChannel**`) plus a missing `String.as_strview` |
+| **harland** | `lld` not installed locally: `Cannot link UEFI target 'bootx64': lld-link not found`. Not excused in `known-failures/` — CI installs lld. |
 
-`tempest` was excused as a known build failure, so it reported as advisory
-rather than gating (delisted by #3609; excuses now live in `known-failures/`). `lexis` has built since AGAST #3689
-(2026-11-16).
+Which projects are *excused* as known build failures, and why, is stated in one
+place only: the `gate = "build"` entries in `known-failures/`, one file per
+AGAST ticket. This file does not copy those reasons, because copies go stale.
+`tempest` (since AGAST #3609) and `lexis` (since #3689) both build at exit 0,
+re-checked 2026-11-18.
 
 ## Test counts
 
@@ -151,8 +152,8 @@ The most mature projects are **ritz** (compiler), **cryptosec**, **squeeze**,
 **valet**, **zeus** and **ritzunit** — all build clean and have substantial
 passing suites. **harland** / **indium** (OS), **mausoleum** and **tome** build
 and run but are less complete. The browser stack is the weakest link: **tempest**
-does not compile at all, **lexis** builds but segfaults at startup (#3700), and
-**sage** compiles but ignores its arguments. **nexus** builds but has no runnable entry point yet.
+builds but is scaffolding that ignores its URL argument, **lexis** runs only its
+built-in demo, and **sage** compiles but ignores its arguments. **nexus** builds but has no runnable entry point yet.
 
 The guiding principle is the **"No Concessions Doctrine"** — fix the language
 rather than work around limitations.

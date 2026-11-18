@@ -85,8 +85,8 @@ producing `build/debug/iris`, and `./rz test iris` exits 0 with
 
 Render tree construction and block layout are implemented. Full CSS layout
 (flex, grid), layer compositing and Prism IPC integration are still planned.
-Note that iris's upstream, [lexis](../lexis), does not currently compile
-(AGAST #1289), so the parse → layout path cannot be exercised end to end.
+Iris's upstream, [lexis](../lexis), builds but its binary only runs a built-in
+demo, so the parse → layout path is not exercised end to end.
 
 ## License
 

@@ -12,7 +12,7 @@ The HTML tokenizer implements the HTML5 parsing algorithm as a state machine, ha
 
 ## Features
 
-> **Planned/partial.** The list below describes the design. See [Status](#status) — lexis does not currently compile (AGAST #1289).
+> **Planned/partial.** The list below describes the design, not what runs today. See [Status](#status).
 
 - HTML5 streaming tokenizer (state machine)
 - Incremental DOM event emission - render before full load
@@ -30,15 +30,14 @@ The HTML tokenizer implements the HTML5 parsing algorithm as a state machine, ha
 ./rz build lexis
 ```
 
-**This build currently fails (exit 1).** `lexis` does not compile: the ownership
-checker reports 424 "use of moved value" errors across 13 files, the largest
-being `lib/html/tree_builder.ritz`. It is tracked as **AGAST #1289** and is
-listed in `known-failures/` (gate `build`), so `rz build
---all` reports it as an advisory failure rather than gating.
+This builds `build/debug/lexis` (exit 0 since AGAST #3689). The binary is a
+demo: it tokenizes a built-in HTML snippet, parses a built-in stylesheet and
+loads it into the style engine. It takes no input file (`--help` prints usage).
+`./rz test lexis` runs the `.ritz` tests under `test/`.
 
-Consequently there is no `lexis` binary — `projects/lexis/build/debug/` is
-empty, and the `./build/debug/lexis index.html` invocation this README used to
-document cannot work until #1289 is fixed.
+If lexis is ever excused as a known build failure, the reason is stated in one
+place: its `gate = "build"` entry in [`known-failures/`](../../known-failures/).
+This README does not copy it.
 
 ## Usage
 
@@ -75,20 +74,11 @@ Lexis has no required dependencies beyond `ritzlib`. Future integration with Iri
 
 ## Status
 
-**Does not compile.** This is the honest headline; the README previously said
-"Alpha — … in place", which reads as though it builds.
-
-`./rz build lexis` exits 1. The ownership checker reports **424** "use of moved
-value" errors across 13 files — `lib/style/cascade.ritz`, `lib/lexis.ritz`,
-`src/main.ritz` and, largest of all, `lib/html/tree_builder.ritz`. Tracked as
-**AGAST #1289**; cross-check **#1315** (suspected move-checker false positive)
-before changing source, because some of those 424 may not be real defects.
-
-There is no binary, so nothing here can be run or tested end to end. The HTML
-tokenizer, CSS parser and cascade code all exist in `lib/` — the blocker is
-getting them past the move checker, not writing them. Downstream,
-[tempest](../tempest) and [iris](../iris) cannot exercise a real parse until this
-is fixed.
+**Builds; demo binary only.** `./rz build lexis` exits 0 and `./rz test lexis`
+passes (re-checked 2026-11-18). The HTML tokenizer, tree builder, CSS parser and
+cascade code exist in `lib/`, but the binary only runs its built-in demo: it
+cannot parse a file or stream, so [tempest](../tempest) and [iris](../iris) do
+not yet feed it real pages.
 
 ## License
 

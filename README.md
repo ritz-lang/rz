@@ -17,8 +17,8 @@ sudo apt install clang lld python3 make
 `lld` is not optional: harland's UEFI bootloader target (`bootx64`) links with
 `lld-link`, and without it `./rz build --all` fails at exit 1 with
 `Cannot link UEFI target 'bootx64': lld-link not found`. No other project needs
-`lld` — but installing it does not make `build --all` green on its own, because
-`tempest` fails for unrelated compiler reasons. See the
+`lld`. Any other failure `build --all` excuses is listed in
+[`known-failures/`](known-failures/) (gate `build`). See the
 [build status table](#build-status) below.
 
 `clang` 20 or newer is required. This machine has 21.1.8 (with `clang-20` also
@@ -152,19 +152,18 @@ Two directories under `projects/` are deliberately not among them:
 
 The descriptions above state each project's *intent*. For what actually builds
 and runs today, read the project's own README — several are further from their
-description than the table suggests, and two have known build failures:
+description than the table suggests. One has a machine-dependent build
+failure:
 
 | Project | `./rz build` | Note |
 |---|---|---|
 | **harland** | ✗ exit 1 locally | `bootx64` needs `lld`; see Prerequisites |
-| **tempest** | ✗ exit 1 | emitter indirection-depth bug, AGAST #1302 |
 
-`tempest` was excused as a known build failure (excuses now live in
-`known-failures/`; tempest was delisted by #3609), so `./rz build --all`
-reported it as advisory rather than gating. Measured
-2026-09-12; every other project in `./rz list` built at exit 0. `lexis` has
-built since AGAST #3689 (2026-11-16), but its binary segfaults at startup
-(AGAST #3700).
+Which projects are *excused* as known build failures, and why, is stated in one
+place only: the `gate = "build"` entries in [`known-failures/`](known-failures/),
+one file per AGAST ticket. This README does not copy those reasons, because
+copies go stale. `tempest` and `lexis` both build at exit 0 (tempest since
+AGAST #3609, lexis since #3689, re-checked 2026-11-18).
 
 ## Architecture
 
