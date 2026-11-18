@@ -55,8 +55,6 @@ kernel:
 userspace:
 	@echo "=== Building Indium Userspace ==="
 	../../rz build indium
-	@mkdir -p $(BUILD_DIR)/debug
-	@cp build/debug/*.elf $(BUILD_DIR)/debug/ 2>/dev/null || true
 
 # Build bootable ISO with kernel and userspace
 iso: kernel
@@ -249,7 +247,7 @@ test-uefi-gui: kernel
 
 clean:
 	rm -rf $(BUILD_DIR)
-	../../rz clean indium 2>/dev/null || true
+	../../rz clean indium
 
 # ============================================================================
 # Help

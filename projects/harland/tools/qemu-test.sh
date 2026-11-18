@@ -60,7 +60,7 @@ if [ "$USE_ISO" -eq 1 ]; then
     # Build ISO if needed
     if [ ! -f "$ISO_FILE" ] || [ "$KERNEL_ELF" -nt "$ISO_FILE" ]; then
         echo "Building ISO..."
-        "$SCRIPT_DIR/mkiso.sh"
+        make -C "$PROJECT_ROOT" iso
     fi
     echo "Boot method: ISO (Multiboot2)"
     QEMU_CMD=(
