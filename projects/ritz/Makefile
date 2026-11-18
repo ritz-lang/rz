@@ -64,6 +64,15 @@ check-doc-examples:
 	@echo "=== Compiling documentation examples ==="
 	@$(PYTHON) tools/check_doc_examples.py $(DOC_EXAMPLE_DOCS)
 
+# AGAST #3928. The same documents under ritz1 and ritz1_selfhosted: a doc
+# example ritz0 accepts and ritz1 refuses (or miscompiles) used to pass the
+# gate. Known ritz1 failures are listed, each naming its ticket, in
+# KNOWN_FAILURES in tools/check_doc_examples.py. ~1 s per compiler once built.
+.PHONY: check-doc-examples-ritz1
+check-doc-examples-ritz1: ritz1-bootstrap
+	@$(PYTHON) tools/check_doc_examples.py --compiler ritz1 $(DOC_EXAMPLE_DOCS)
+	@$(PYTHON) tools/check_doc_examples.py --compiler ritz1_selfhosted $(DOC_EXAMPLE_DOCS)
+
 # docs/RITZ_TOML_SPEC.md is generated from manifest.py's schema, the one rz
 # and build.py validate every ritz.toml / rz.toml against (AGAST #1837).
 # `manifest-spec` regenerates it; `check-manifest-spec` (CI) fails on drift

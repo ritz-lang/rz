@@ -13,6 +13,7 @@ Run with:  cd projects/ritz && python -m pytest tools/test_check_doc_examples.py
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -472,3 +473,262 @@ def test_compiler_identity_names_the_reference_compiler():
     """A green run must say what it was green against."""
     identity = C.compiler_identity()
     assert "ritz0" in identity
+
+
+# ---------------------------------------------------------------------------
+# --compiler ritz1 / ritz1_selfhosted (AGAST #3928).
+#
+# The gate checked docs with ritz0 alone, so an example ritz1 refuses passed
+# it.  These run against a FAKE ritz1 binary: `make tools-unit` runs before
+# CI's ritz1 build, and a fake pins each behaviour (refuse, crash, accept,
+# bad IR) independently of which ritz1 bugs are open today.
+# ---------------------------------------------------------------------------
+
+# A main that writes "boom" to stderr and returns 3, linked against
+# runtime/ritz_start.x86_64.ll: ritz1 emits no `_start` of its own.
+RUNTIME_ERROR_IR = """\
+@msg = private constant [4 x i8] c"boom"
+
+define i32 @main(i32 %argc, ptr %argv) {
+entry:
+  %r = call i64 asm sideeffect "syscall", "={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}"(i64 1, i64 2, ptr @msg, i64 4)
+  ret i32 3
+}
+"""
+
+FAKE_RITZ1 = {
+    # Refuses everything with a located diagnostic in ritz1's own words.
+    "refuse": "import sys\nsys.stderr.write(sys.argv[1] + ':2:5: error: unexpected thing\\n')\nsys.exit(1)\n",
+    # Dies on a signal: a crash is not a refusal.
+    "crash": "import os, signal\nos.kill(os.getpid(), signal.SIGSEGV)\n",
+    # Exits 1 and says nothing.
+    "silent": "import sys\nsys.exit(1)\n",
+}
+
+
+def _fake_ritz1(tmp_path: Path, monkeypatch, mode: str, ir: str = VALID_IR,
+                name: str = "ritz1") -> Path:
+    """Install an executable stand-in for ritz1 (or ritz1_selfhosted)."""
+    fake = tmp_path / f"fake_{name}"
+    if mode == "accept":
+        canned = tmp_path / f"canned_{name}.ll"
+        canned.write_text(ir)
+        body = ("import shutil, sys\n"
+                f"shutil.copy({str(canned)!r}, sys.argv[sys.argv.index('-o') + 1])\n")
+    else:
+        body = FAKE_RITZ1[mode]
+    fake.write_text(f"#!{sys.executable}\n{body}")
+    fake.chmod(0o755)
+    monkeypatch.setitem(C.COMPILERS, name, (fake, "make it"))
+    return fake
+
+
+GOOD = "```ritz\nfn main() -> i32\n    return 0\n```\n"
+
+
+@pytest.mark.integration
+def test_planted_example_ritz0_accepts_and_ritz1_refuses_fails_the_gate(tmp_path, monkeypatch):
+    """The acceptance case: green under ritz0, red under ritz1."""
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "refuse")
+    assert C.main([str(doc)]) == 0
+    assert C.main(["--compiler", "ritz1", str(doc)]) == 1
+
+
+@pytest.mark.unit
+def test_ritz1_selfhosted_is_checked_with_its_own_binary(tmp_path, monkeypatch):
+    """ritz1 passing must not stand in for ritz1_selfhosted."""
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "accept", name="ritz1")
+    _fake_ritz1(tmp_path, monkeypatch, "refuse", name="ritz1_selfhosted")
+    assert C.main(["--compiler", "ritz1", str(doc)]) == 0
+    assert C.main(["--compiler", "ritz1_selfhosted", str(doc)]) == 1
+
+
+@pytest.mark.unit
+def test_ritz1_gets_the_ritz_root_as_its_import_path(tmp_path):
+    cmd = C.compile_cmd("ritz1", tmp_path / "a.ritz", tmp_path / "a.ll")
+    assert cmd[0] == str(C.COMPILERS["ritz1"][0])
+    assert cmd[-2:] == ["-I", str(C.RITZ_ROOT)]
+
+
+@pytest.mark.unit
+def test_a_missing_ritz1_binary_is_an_error_not_a_skip(tmp_path, monkeypatch, capsys):
+    monkeypatch.setitem(C.COMPILERS, "ritz1", (tmp_path / "nope", "make -C x ritz1-bootstrap"))
+    doc = write(tmp_path, GOOD)
+    assert C.main(["--compiler", "ritz1", str(doc)]) == 1
+    assert "ritz1-bootstrap" in capsys.readouterr().err
+
+
+@pytest.mark.unit
+def test_ritz1_invalid_ir_fails_and_names_ritz1(tmp_path, monkeypatch):
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "accept", ir=INVALID_IR)
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1")
+    assert len(report.failures) == 1
+    assert report.failures[0].detail.startswith("ritz1 exited 0 but emitted invalid IR")
+
+
+EXPECT_ERR = '```ritz body expect-error="Expected IDENT, got MUT"\nlet mut s = 1\n```\n'
+
+
+@pytest.mark.unit
+def test_ritz1_refusing_an_expect_error_block_in_its_own_words_passes(tmp_path, monkeypatch):
+    """ritz0's diagnostic text is not ritz1's; the refusal is what's held."""
+    doc = write(tmp_path, EXPECT_ERR)
+    _fake_ritz1(tmp_path, monkeypatch, "refuse")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1")
+    assert report.failures == [], [r.detail for r in report.failures]
+
+
+@pytest.mark.unit
+def test_ritz1_compiling_an_expect_error_block_fails(tmp_path, monkeypatch):
+    doc = write(tmp_path, EXPECT_ERR)
+    _fake_ritz1(tmp_path, monkeypatch, "accept")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1")
+    assert len(report.failures) == 1
+    assert "COMPILED" in report.failures[0].detail
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["crash", "silent"])
+def test_ritz1_crashing_or_silent_on_an_expect_error_block_fails(tmp_path, monkeypatch, mode):
+    doc = write(tmp_path, EXPECT_ERR)
+    _fake_ritz1(tmp_path, monkeypatch, mode)
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1")
+    assert len(report.failures) == 1
+    assert "not a refusal" in report.failures[0].detail
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("pos, ok", [("2:5", True), ("4:13", False)])
+def test_ritz1_must_point_at_a_pinned_position(tmp_path, monkeypatch, pos, ok):
+    """The fake reports :2:5:; a fence pinning another place fails."""
+    doc = write(tmp_path, f'```ritz expect-error=".ritz:{pos}: whatever ritz0 says"\nfn f()\n```\n')
+    _fake_ritz1(tmp_path, monkeypatch, "refuse")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1")
+    assert (report.failures == []) is ok, [r.detail for r in report.failures]
+
+
+@pytest.mark.integration
+def test_ritz1_expect_runtime_error_links_the_runtime_start(tmp_path, monkeypatch):
+    """ritz1's IR has no `_start`.  Without the runtime, ld enters at `main`
+    and returning from it segfaults: still non-zero, still "boom", so the
+    exit status (main's 3, via the runtime's exit syscall) is what tells."""
+    doc = write(tmp_path, '```ritz expect-runtime-error="boom"\nfn main() -> i32\n    3\n```\n')
+    _fake_ritz1(tmp_path, monkeypatch, "accept", ir=RUNTIME_ERROR_IR)
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1")
+    assert report.failures == [], [r.detail for r in report.failures]
+    assert report.results[0].detail.endswith("(exit 3)"), report.results[0].detail
+
+
+# KNOWN_FAILURES: each entry names an open ticket and is held to its claim.
+
+
+def _known_for(doc: Path, reason: str = "#1: tracked") -> dict:
+    (block,) = C.extract_blocks(doc)
+    return {("ritz1", doc.name, block.digest): reason}
+
+
+@pytest.mark.unit
+def test_a_known_failure_is_reported_with_its_ticket_and_does_not_fail(tmp_path, monkeypatch):
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "refuse")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1", known=_known_for(doc))
+    assert report.failures == []
+    assert [r.known for r in report.known] == ["#1: tracked"]
+
+
+@pytest.mark.unit
+def test_a_known_failure_is_per_compiler(tmp_path, monkeypatch):
+    """An entry for ritz1 does not excuse ritz1_selfhosted."""
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "refuse", name="ritz1_selfhosted")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1_selfhosted",
+                   known=_known_for(doc))
+    assert len(report.failures) == 1
+
+
+@pytest.mark.unit
+def test_a_known_failure_that_now_passes_fails_the_run(tmp_path, monkeypatch):
+    doc = write(tmp_path, GOOD)
+    _fake_ritz1(tmp_path, monkeypatch, "accept")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1", known=_known_for(doc))
+    assert len(report.failures) == 1
+    assert "now passes" in report.failures[0].detail
+
+
+@pytest.mark.unit
+def test_a_known_failure_matching_no_block_fails_the_run(tmp_path, monkeypatch):
+    """An edited block gets a new digest, so its old entry is stale."""
+    doc = write(tmp_path, GOOD)
+    known = _known_for(doc)
+    doc.write_text(GOOD.replace("return 0", "return 1"))
+    _fake_ritz1(tmp_path, monkeypatch, "refuse")
+    report = C.run([doc], jobs=1, verbose=False, compiler="ritz1", known=known)
+    details = [r.detail for r in report.failures]
+    assert len(details) == 2, details  # the edited block, and the stale entry
+    assert any("matches no block" in d for d in details)
+
+
+@pytest.mark.unit
+def test_digest_ignores_position_but_not_content_or_fence(tmp_path):
+    a = C.extract_blocks(write(tmp_path, GOOD, "A.md"))[0]
+    b = C.extract_blocks(write(tmp_path, "prose\n\n" + GOOD, "B.md"))[0]
+    c = C.extract_blocks(write(tmp_path, GOOD.replace("```ritz\n", "```ritz items\n"), "C.md"))[0]
+    assert a.line != b.line and a.digest == b.digest
+    assert a.digest != c.digest
+
+
+@pytest.mark.unit
+def test_every_real_known_failure_names_a_ticket_and_a_ritz1_compiler():
+    for (compiler, doc, digest), reason in C.KNOWN_FAILURES.items():
+        assert compiler in ("ritz1", "ritz1_selfhosted"), (compiler, doc, digest)
+        assert C.TICKET_RE.match(reason), (doc, digest, reason)
+        assert (C.RITZ_ROOT / "docs" / doc).is_file(), doc
+        assert re.fullmatch(r"[0-9a-f]{12}", digest), digest
+
+
+# The gate's wiring (AGAST #3928): main.yml's bootstrap job is what ci-local,
+# every room gate and every train run.  Same shape as #3805's
+# tools/test_ritzlib_tests_ritz1.py.
+
+DOC_TARGET = "check-doc-examples-ritz1"
+
+
+@pytest.mark.unit
+def test_bootstrap_job_checks_doc_examples_under_ritz1_after_the_build():
+    import ci_local
+
+    steps = [s for s in ci_local.load_steps() if s.job == "bootstrap"]
+    runs = [s.run.strip() for s in steps]
+    assert f"make {DOC_TARGET}" in runs, runs
+    assert steps[runs.index(f"make {DOC_TARGET}")].workdir == "projects/ritz"
+    assert runs.index("make ritz1-bootstrap") < runs.index(f"make {DOC_TARGET}")
+    assert "make check-doc-examples" in runs  # ritz0's run stays
+
+
+@pytest.mark.unit
+def test_doc_target_checks_the_same_docs_under_both_ritz1_compilers():
+    import subprocess
+
+    def dry(target: str) -> list[str]:
+        out = subprocess.run(["make", "-n", "--no-print-directory", target], cwd=C.RITZ_ROOT,
+                             capture_output=True, text=True, check=True).stdout
+        return [ln for ln in out.splitlines() if "check_doc_examples.py" in ln]
+
+    ritz1_runs = dry(DOC_TARGET)
+    compilers = sorted(ln.split("--compiler", 1)[1].split()[0] for ln in ritz1_runs)
+    assert compilers == ["ritz1", "ritz1_selfhosted"], ritz1_runs
+    (ritz0_run,) = dry("check-doc-examples")
+    docs = ritz0_run.split("check_doc_examples.py", 1)[1].split()
+    for ln in ritz1_runs:
+        assert ln.split()[-len(docs):] == docs, ln
+
+
+@pytest.mark.unit
+def test_doc_target_builds_both_compilers_first():
+    makefile = (C.RITZ_ROOT / "Makefile").read_text()
+    line = next(ln for ln in makefile.splitlines() if ln.startswith(f"{DOC_TARGET}:"))
+    assert "ritz1-bootstrap" in line.split(":", 1)[1]
+    assert f".PHONY: {DOC_TARGET}" in makefile

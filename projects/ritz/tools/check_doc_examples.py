@@ -20,6 +20,13 @@ Usage:
     python3 tools/check_doc_examples.py DOC.md [DOC.md ...]
     python3 tools/check_doc_examples.py --list DOC.md      # no compiling
     python3 tools/check_doc_examples.py -v DOC.md          # per-block lines
+    python3 tools/check_doc_examples.py --compiler ritz1 DOC.md
+                        # or ritz1_selfhosted; see COMPILERS, KNOWN_FAILURES
+
+Under ritz1 and ritz1_selfhosted (AGAST #3928) every rule below holds but
+one: an ``expect-error`` block must be *refused* with a diagnostic (a crash
+is not a refusal), not refused with ritz0's wording, and where the value pins
+a ``.ritz:L:C`` position ritz1 must point at the same one.
 
 Exit status: 0 when every block behaves as declared, 1 otherwise.
 
@@ -73,6 +80,7 @@ one is built to be uncomfortable to add to.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
 import re
 import shlex
@@ -80,6 +88,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -88,6 +97,103 @@ from pathlib import Path
 # projects/ritz/tools/check_doc_examples.py -> projects/ritz
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ0 = RITZ_ROOT / "ritz0" / "ritz0.py"
+
+# AGAST #3928.  The gate compiled every example with ritz0 alone, so a doc
+# example ritz1 refuses (or miscompiles into invalid IR) passed it.  Each
+# compiler is checked in its own run (`--compiler`); CI's bootstrap job runs
+# all three once ritz1 and ritz1_selfhosted are built.
+#
+# compiler -> (binary, the make target that builds it).  ritz0 is a script
+# run under this interpreter, so it has no binary to be missing.
+COMPILERS: dict[str, tuple[Path | None, str | None]] = {
+    "ritz0": (None, None),
+    "ritz1": (RITZ_ROOT / "ritz1" / "build" / "ritz1", "make -C projects/ritz ritz1-bootstrap"),
+    "ritz1_selfhosted": (
+        RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted",
+        "make -C projects/ritz ritz1-bootstrap",
+    ),
+}
+
+# ritz0 embeds `_start` in a module that has a `main`; ritz1's emitter is
+# never freestanding (build.py: ritz1_compile_cmd), so an
+# expect-runtime-error block it compiled is linked with this entry point.
+RITZ1_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.ll"
+
+# Doc examples a ritz1-family compiler is KNOWN to get wrong, each naming the
+# open ritz1 ticket (under #1828) that tracks the cause.  This is the only way
+# to exempt a block from one compiler; `no-compile` exempts it from all three
+# and says nothing about ritz1.
+#
+# Key: (compiler, document file name, block digest).  The digest is
+# `Block.digest` -- the first 12 hex of the block's SHA-256, fence attributes
+# included -- printed beside every failure.  It is not the line number, so an
+# edit elsewhere in the document does not invalidate the entry; an edit to the
+# block itself does, which is the point: the edited example has to be checked
+# again.  The line in the comment is where the block was when it was listed.
+#
+# An entry is held to its claim: if the block passes under that compiler, or
+# no checked block has that digest, the run fails and names the stale entry.
+KNOWN_FAILURES: dict[tuple[str, str, str], str] = {
+    # LANGUAGE_SPEC.md:246
+    ("ritz1", "LANGUAGE_SPEC.md", "065c93f07ee5"): "#3929: float literal exponents don't lex",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "065c93f07ee5"): "#3929: float literal exponents don't lex",
+    # LANGUAGE_SPEC.md:609
+    ("ritz1", "LANGUAGE_SPEC.md", "167278a25a58"): "#3935: usize and u64 are different generic args",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "167278a25a58"): "#3935: usize and u64 are different generic args",
+    # LANGUAGE_SPEC.md:648
+    ("ritz1", "LANGUAGE_SPEC.md", "95abc5851402"): "#3930: `*mut T` doesn't parse",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "95abc5851402"): "#3930: `*mut T` doesn't parse",
+    # LANGUAGE_SPEC.md:2139
+    ("ritz1", "LANGUAGE_SPEC.md", "dd01bd4981da"): "#3931: `let x = <float> == <float>` typed as the float",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "dd01bd4981da"): "#3931: `let x = <float> == <float>` typed as the float",
+    # LANGUAGE_SPEC.md:3332
+    ("ritz1", "LANGUAGE_SPEC.md", "81234ed3c9ab"): "#3932: an undeclared field type emits invalid IR",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "81234ed3c9ab"): "#3932: an undeclared field type emits invalid IR",
+    # LANGUAGE_SPEC.md:3525
+    ("ritz1", "LANGUAGE_SPEC.md", "014099d52fe2"): "#1295: multi-field enum variants",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "014099d52fe2"): "#1295: multi-field enum variants",
+    # LANGUAGE_SPEC.md:3667
+    ("ritz1", "LANGUAGE_SPEC.md", "419a1826fb7d"): "#1295: multi-field enum variants",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "419a1826fb7d"): "#1295: multi-field enum variants",
+    # LANGUAGE_SPEC.md:3692
+    ("ritz1", "LANGUAGE_SPEC.md", "a59b32b47b5f"): "#1295: multi-field enum variants",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "a59b32b47b5f"): "#1295: multi-field enum variants",
+    # LANGUAGE_SPEC.md:3961
+    ("ritz1", "LANGUAGE_SPEC.md", "e774da8b4a14"): "#3309: `Type.m()` on a generic impl isn't instantiated",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "e774da8b4a14"): "#3309: `Type.m()` on a generic impl isn't instantiated",
+    # LANGUAGE_SPEC.md:3977
+    ("ritz1", "LANGUAGE_SPEC.md", "20aa669fe4ef"): "#3309: `Type.m()` on a generic impl isn't instantiated",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "20aa669fe4ef"): "#3309: `Type.m()` on a generic impl isn't instantiated",
+    # LANGUAGE_SPEC.md:4651
+    ("ritz1", "LANGUAGE_SPEC.md", "b92c5caa90fc"): "#3473: R57 borrow checks (move while borrowed)",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "b92c5caa90fc"): "#3473: R57 borrow checks (move while borrowed)",
+    # LANGUAGE_SPEC.md:4671
+    ("ritz1", "LANGUAGE_SPEC.md", "d5e720496ce5"): "#3473: R57 borrow checks (Span view is a borrow)",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "d5e720496ce5"): "#3473: R57 borrow checks (Span view is a borrow)",
+    # LANGUAGE_SPEC.md:4803
+    ("ritz1", "LANGUAGE_SPEC.md", "c05c5e7b9c6a"): "#3473: R57 borrow checks (return a view of a local)",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "c05c5e7b9c6a"): "#3473: R57 borrow checks (return a view of a local)",
+    # LANGUAGE_SPEC.md:6308
+    ("ritz1", "LANGUAGE_SPEC.md", "22246d46210c"): "#3933: non-literal print() argument accepted",
+    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "22246d46210c"): "#3933: non-literal print() argument accepted",
+    # STDLIB_REFERENCE.md:357
+    ("ritz1", "STDLIB_REFERENCE.md", "baa9817ce1f7"): "#3934: `heap <expr>` doesn't parse",
+    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "baa9817ce1f7"): "#3934: `heap <expr>` doesn't parse",
+    # STDLIB_REFERENCE.md:455
+    ("ritz1", "STDLIB_REFERENCE.md", "c7949d7a5cce"): "#3932: an undeclared field type emits invalid IR",
+    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "c7949d7a5cce"): "#3932: an undeclared field type emits invalid IR",
+    # STDLIB_REFERENCE.md:1653
+    ("ritz1", "STDLIB_REFERENCE.md", "1ced72f242f7"): "#3932: an undeclared field type emits invalid IR",
+    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "1ced72f242f7"): "#3932: an undeclared field type emits invalid IR",
+    # STDLIB_REFERENCE.md:1703
+    ("ritz1", "STDLIB_REFERENCE.md", "c53f0f72c88f"): "#3932: an undeclared field type emits invalid IR",
+    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "c53f0f72c88f"): "#3932: an undeclared field type emits invalid IR",
+    # STDLIB_REFERENCE.md:2050
+    ("ritz1", "STDLIB_REFERENCE.md", "579ac74f08cf"): "#3932: an undeclared field type emits invalid IR",
+    ("ritz1_selfhosted", "STDLIB_REFERENCE.md", "579ac74f08cf"): "#3932: an undeclared field type emits invalid IR",
+}
+
+TICKET_RE = re.compile(r"(?:AGAST )?#\d+")
 
 # Minimum length of a `no-compile` reason.  Not a real semantic check --
 # nothing can stop a determined person writing "because" twice -- but it
@@ -124,9 +230,17 @@ class Block:
     expect_runtime_error: str | None = None
     no_compile_reason: str | None = None
 
+    info: str = ""  # the fence info-string, attributes included
+
     @property
     def where(self) -> str:
         return f"{self.doc}:{self.line}"
+
+    @property
+    def digest(self) -> str:
+        """Stable identity of the block for KNOWN_FAILURES (AGAST #3928)."""
+        payload = f"{self.info.strip()}\n{self.code}".encode()
+        return hashlib.sha256(payload).hexdigest()[:12]
 
 
 @dataclass
@@ -135,6 +249,7 @@ class Result:
     ok: bool
     detail: str = ""
     skipped: bool = False
+    known: str | None = None  # the KNOWN_FAILURES reason, when it applied
 
 
 @dataclass
@@ -151,7 +266,11 @@ class Report:
 
     @property
     def compiled(self) -> list[Result]:
-        return [r for r in self.results if r.ok and not r.skipped]
+        return [r for r in self.results if r.ok and not r.skipped and not r.known]
+
+    @property
+    def known(self) -> list[Result]:
+        return [r for r in self.results if r.known]
 
 
 # ---------------------------------------------------------------------------
@@ -194,7 +313,7 @@ def parse_info_string(info: str, where: str) -> dict[str, str | None]:
 def block_from_fence(doc: Path, line: int, info: str, code: str) -> Block:
     where = f"{doc}:{line}"
     attrs = parse_info_string(info, where)
-    block = Block(doc=doc, line=line, code=code)
+    block = Block(doc=doc, line=line, code=code, info=info)
 
     known = {"body", "items", "expect-error", "expect-runtime-error", "no-compile"}
     unknown = sorted(set(attrs) - known)
@@ -347,7 +466,27 @@ def render(block: Block) -> str:
     return BODY_PREAMBLE + indented + "\n" + BODY_EPILOGUE
 
 
-def compiler_identity() -> str:
+def compile_cmd(compiler: str, src: Path, out: Path) -> list[str]:
+    """The command that compiles one doc example to LLVM IR."""
+    binary, _ = COMPILERS[compiler]
+    if binary is None:
+        return [sys.executable, str(RITZ0), str(src), "-o", str(out)]
+    # ritz1's CLI: <input> -o <output> [-I <ritz root>].  -I is how it finds
+    # `ritzlib.*`, the same root RITZ_PATH names for ritz0.
+    return [str(binary), str(src), "-o", str(out), "-I", str(RITZ_ROOT)]
+
+
+def missing_compiler(compiler: str) -> str | None:
+    """Why `compiler` cannot run, or None.  A missing binary is an error,
+    never a skip: a gate that passes because it had nothing to run is the
+    defect this script exists to prevent."""
+    binary, hint = COMPILERS[compiler]
+    if binary is not None and not binary.is_file():
+        return f"{compiler} is not built ({binary}); run `{hint}` first."
+    return None
+
+
+def compiler_identity(compiler: str = "ritz0") -> str:
     """A human-readable record of *which* compiler validated the docs.
 
     The value goes in the report so a green run names its reference, rather
@@ -363,13 +502,15 @@ def compiler_identity() -> str:
         ).stdout.strip() or "unknown"
     except (OSError, subprocess.SubprocessError):
         pass
-    rel = RITZ0.relative_to(RITZ_ROOT.parent.parent) if RITZ0.is_relative_to(
-        RITZ_ROOT.parent.parent
-    ) else RITZ0
-    return f"ritz0 ({rel}) at {rev}, {sys.executable.rsplit('/', 1)[-1]}"
+    path = COMPILERS[compiler][0] or RITZ0
+    top = RITZ_ROOT.parent.parent
+    rel = path.relative_to(top) if path.is_relative_to(top) else path
+    if compiler == "ritz0":
+        return f"ritz0 ({rel}) at {rev}, {sys.executable.rsplit('/', 1)[-1]}"
+    return f"{compiler} ({rel}) at {rev}"
 
 
-def compile_block(block: Block, workdir: Path) -> Result:
+def compile_block(block: Block, workdir: Path, compiler: str = "ritz0") -> Result:
     if block.no_compile_reason:
         return Result(block, ok=True, skipped=True, detail=block.no_compile_reason)
 
@@ -386,7 +527,7 @@ def compile_block(block: Block, workdir: Path) -> Result:
     env.setdefault("RITZ_PATH", str(RITZ_ROOT))
 
     proc = subprocess.run(
-        [sys.executable, str(RITZ0), str(src), "-o", str(workdir / f"{stem}.ll")],
+        compile_cmd(compiler, src, workdir / f"{stem}.ll"),
         capture_output=True,
         text=True,
         cwd=str(RITZ_ROOT),
@@ -406,6 +547,8 @@ def compile_block(block: Block, workdir: Path) -> Result:
                     f"prose is now wrong, or the fence is."
                 ),
             )
+        if compiler != "ritz0":
+            return ritz1_refusal(block, proc.returncode, output, compiler)
         if block.expect_error not in output:
             return Result(
                 block,
@@ -424,14 +567,43 @@ def compile_block(block: Block, workdir: Path) -> Result:
                 "block is marked expect-runtime-error but did not compile:"
                 + _indent_output(output)))
         if problem := verify_ir(workdir / f"{stem}.ll"):
-            return Result(block, ok=False, detail=_invalid_ir_detail(problem))
-        return run_block(block, workdir, stem)
+            return Result(block, ok=False, detail=_invalid_ir_detail(problem, compiler))
+        return run_block(block, workdir, stem, compiler)
 
     if proc.returncode != 0:
         return Result(block, ok=False, detail=_indent_output(output))
     if problem := verify_ir(workdir / f"{stem}.ll"):
-        return Result(block, ok=False, detail=_invalid_ir_detail(problem))
+        return Result(block, ok=False, detail=_invalid_ir_detail(problem, compiler))
     return Result(block, ok=True)
+
+
+# `.ritz:4:13:` in an expect-error value pins where the diagnostic points.
+POSITION_RE = re.compile(r"\.ritz:(\d+):(\d+):")
+
+
+def ritz1_refusal(block: Block, returncode: int, output: str, compiler: str) -> Result:
+    """Judge an expect-error block that a ritz1-family compiler refused.
+
+    The fence's text is ritz0's diagnostic, and ritz1's wording differs by
+    design (its parser has no `Expected IDENT, got MUT`), so ritz1 is held
+    to what the example *means*: it must refuse the block with a diagnostic,
+    not crash on it, and where the fence pins a `.ritz:L:C` position ritz1's
+    diagnostic must point at the same place.  (AGAST #3928.)
+    """
+    if returncode < 0 or not output:
+        return Result(block, ok=False, detail=(
+            f"block is marked expect-error, and {compiler} refused it without a "
+            f"diagnostic (exit {returncode}): a crash, not a refusal."
+            + _indent_output(output)))
+    if pos := POSITION_RE.search(block.expect_error or ""):
+        want = f".ritz:{pos.group(1)}:{pos.group(2)}:"
+        if want not in output:
+            return Result(block, ok=False, detail=(
+                f"block failed, but {compiler}'s diagnostic does not point at the "
+                f"declared position.\n"
+                f"    expected position: {want}\n"
+                f"    actual: {_indent_output(output)}"))
+    return Result(block, ok=True, detail=f"refused by {compiler} as declared")
 
 
 # LLVM's global context is not thread-safe and `run` compiles blocks on a
@@ -462,23 +634,25 @@ def verify_ir(ll: Path) -> str | None:
     return None
 
 
-def _invalid_ir_detail(problem: str) -> str:
+def _invalid_ir_detail(problem: str, compiler: str = "ritz0") -> str:
     return (
-        "ritz0 exited 0 but emitted invalid IR (a compiler bug, not a doc "
+        f"{compiler} exited 0 but emitted invalid IR (a compiler bug, not a doc "
         "bug; clang would reject this at build time):" + _indent_output(problem)
     )
 
 
-def run_block(block: Block, workdir: Path, stem: str) -> Result:
+def run_block(block: Block, workdir: Path, stem: str, compiler: str = "ritz0") -> Result:
     """Link an expect-runtime-error block freestanding, run it, check stderr.
 
     ritz0 emits its own `_start` for a file with a `main`, so the link needs
     no runtime object and no ritzlib: the same `-nostdlib` link
-    ritz0/test_attr_validation.py uses.
+    ritz0/test_attr_validation.py uses.  ritz1 emits no `_start`, so its
+    output is linked with RITZ1_START.
     """
     exe = workdir / f"{stem}.exe"
+    start = [] if compiler == "ritz0" else [str(RITZ1_START)]
     link = subprocess.run(
-        ["clang", "-Wno-override-module", "-O0", str(workdir / f"{stem}.ll"),
+        ["clang", "-Wno-override-module", "-O0", str(workdir / f"{stem}.ll"), *start,
          "-o", str(exe), "-nostdlib", "-no-pie"],
         capture_output=True, text=True, timeout=120,
     )
@@ -512,7 +686,9 @@ def _indent_output(output: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def run(docs: list[Path], jobs: int, verbose: bool) -> Report:
+def run(docs: list[Path], jobs: int, verbose: bool, compiler: str = "ritz0",
+        known: dict[tuple[str, str, str], str] | None = None) -> Report:
+    known = KNOWN_FAILURES if known is None else known
     blocks: list[Block] = []
     for doc in docs:
         blocks.extend(extract_blocks(doc))
@@ -521,13 +697,53 @@ def run(docs: list[Path], jobs: int, verbose: bool) -> Report:
     with tempfile.TemporaryDirectory(prefix="ritz-doc-examples-") as tmp:
         workdir = Path(tmp)
         with ThreadPoolExecutor(max_workers=jobs) as pool:
-            for result in pool.map(lambda b: compile_block(b, workdir), blocks):
+            for result in pool.map(lambda b: compile_block(b, workdir, compiler), blocks):
+                result = apply_known_failure(result, compiler, known)
                 report.results.append(result)
                 if verbose:
-                    mark = "SKIP" if result.skipped else ("ok" if result.ok else "FAIL")
-                    print(f"  {mark:4} {result.block.where}")
+                    mark = ("SKIP" if result.skipped else "KNOWN" if result.known
+                            else "ok" if result.ok else "FAIL")
+                    print(f"  {mark:5} {result.block.where}")
+    report.results.extend(stale_known_failures(blocks, docs, compiler, known))
     report.results.sort(key=lambda r: (str(r.block.doc), r.block.line))
     return report
+
+
+def apply_known_failure(result: Result, compiler: str,
+                        known: dict[tuple[str, str, str], str]) -> Result:
+    """Hold a KNOWN_FAILURES entry to its claim (AGAST #3928).
+
+    A listed block that fails is reported as known, citing its ticket; a
+    listed block that now passes fails the run, so the entry is deleted when
+    the ritz1 bug is fixed rather than outliving it.
+    """
+    b = result.block
+    reason = known.get((compiler, b.doc.name, b.digest))
+    if reason is None or result.skipped:
+        return result
+    if result.ok:
+        return Result(b, ok=False, detail=(
+            f"listed in KNOWN_FAILURES ({reason}) but it now passes under "
+            f"{compiler}. Delete the entry ({compiler!r}, {b.doc.name!r}, "
+            f"{b.digest!r}) from tools/check_doc_examples.py."))
+    return Result(b, ok=True, known=reason, detail=result.detail)
+
+
+def stale_known_failures(blocks: list[Block], docs: list[Path], compiler: str,
+                         known: dict[tuple[str, str, str], str]) -> list[Result]:
+    """A failure Result per entry naming a checked doc but no block in it."""
+    present = {(b.doc.name, b.digest) for b in blocks}
+    by_name = {d.name: d for d in docs}
+    stale = []
+    for (comp, doc_name, digest), reason in sorted(known.items()):
+        if comp != compiler or doc_name not in by_name or (doc_name, digest) in present:
+            continue
+        ghost = Block(doc=by_name[doc_name], line=0, code="")
+        stale.append(Result(ghost, ok=False, detail=(
+            f"KNOWN_FAILURES entry ({comp!r}, {doc_name!r}, {digest!r}) -- {reason} -- "
+            f"matches no block in {doc_name}: the block was edited or removed. "
+            f"Re-check it under {compiler} and re-key or delete the entry.")))
+    return stale
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -543,6 +759,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--list", action="store_true", help="list blocks; do not compile")
     ap.add_argument("-j", "--jobs", type=int, default=8, help="parallel compiles (default 8)")
     ap.add_argument("-v", "--verbose", action="store_true", help="one line per block")
+    ap.add_argument("--compiler", choices=sorted(COMPILERS), default="ritz0",
+                    help="compiler to check the examples with (default ritz0)")
     args = ap.parse_args(argv)
 
     missing = [d for d in args.docs if not d.is_file()]
@@ -565,8 +783,13 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"{b.where}\t{kind}")
             return 0
 
-        print(f"=== Checking doc examples with {compiler_identity()} ===")
-        report = run(args.docs, jobs=args.jobs, verbose=args.verbose)
+        if why := missing_compiler(args.compiler):
+            print(f"error: {why}", file=sys.stderr)
+            return 1
+        print(f"=== Checking doc examples with {compiler_identity(args.compiler)} ===")
+        started = time.monotonic()
+        report = run(args.docs, jobs=args.jobs, verbose=args.verbose, compiler=args.compiler)
+        elapsed = time.monotonic() - started
     except FenceError as exc:
         print(f"\nFENCE ERROR: {exc}", file=sys.stderr)
         return 1
@@ -576,8 +799,13 @@ def main(argv: list[str] | None = None) -> int:
         for r in report.skips:
             print(f"  {r.block.where}: {r.detail}")
 
+    if report.known:
+        print(f"\n{len(report.known)} block(s) are known {args.compiler} failures:")
+        for r in report.known:
+            print(f"  {r.block.where} [{r.block.digest}]: {r.known}")
+
     for r in report.failures:
-        print(f"\nFAIL {r.block.where}")
+        print(f"\nFAIL {r.block.where} [{args.compiler}, digest {r.block.digest}]")
         print("  " + shlex.quote(str(r.block.doc)) + f" line {r.block.line}")
         print(f"  {r.detail}")
         first = r.block.code.strip().splitlines()[:6]
@@ -587,8 +815,9 @@ def main(argv: list[str] | None = None) -> int:
 
     total = len(report.results)
     print(
-        f"\n{len(report.compiled)}/{total} blocks compiled as declared, "
-        f"{len(report.skips)} opted out, {len(report.failures)} failed."
+        f"\n{args.compiler}: {len(report.compiled)}/{total} blocks compiled as declared, "
+        f"{len(report.skips)} opted out, {len(report.known)} known failures, "
+        f"{len(report.failures)} failed, in {elapsed:.1f}s."
     )
     return 1 if report.failures else 0
 
