@@ -359,6 +359,15 @@ pub struct TlsServer
     peer_closed: i32
     peer_alert: i32
 
+    # A client handshake message after the handshake (AGAST #3679), which may
+    # arrive split across records. Only KeyUpdate is accepted, and it must
+    # end its record, so it never holds more than one 5-byte KeyUpdate.
+    hs_buf: [8]u8
+    hs_len: i64
+    # 1: the client asked for update_requested; send our KeyUpdate before
+    # the next data record.
+    key_update_pending: i32
+
     # Work buffers for handshake (to avoid stack overflow)
     # These are large buffers that would otherwise be on the stack
     cert_buf: [8192]u8        # Certificate serialization buffer
@@ -388,6 +397,8 @@ pub fn tls_server_init(server: *TlsServer, config: *TlsServerConfig) -> i32
     server.handshake_complete = 0
     server.peer_closed = 0
     server.peer_alert = -1
+    server.hs_len = 0
+    server.key_update_pending = 0
 
     # Generate server's ephemeral X25519 key pair
     if random_bytes(@server.x25519_private[0], 32) != 0
@@ -1343,7 +1354,10 @@ pub fn tls_server_take_buffered(server: *TlsServer, out: *u8, out_cap: i64) -> i
     return n
 
 # Encrypt and send application data
-# Returns bytes written to out, or negative on error
+# Returns bytes written to out, or negative on error. After the client's
+# KeyUpdate(update_requested), the output is two records: our KeyUpdate, then
+# the data under the new keys. If out cannot hold both, neither is written and
+# the KeyUpdate stays queued (as cryptosec's tls_client_write, AGAST #3679).
 pub fn tls_server_write(server: *TlsServer, data: *u8, data_len: i64, out: *u8, out_cap: i64) -> i64
     if server.state != TLS_SERVER_STATE_CONNECTED
         return -1
@@ -1351,16 +1365,28 @@ pub fn tls_server_write(server: *TlsServer, data: *u8, data_len: i64, out: *u8, 
     if data_len < 0 || data_len > 16384
         return -1
 
+    var used: i64 = 0
+    if server.key_update_pending != 0
+        # Both records must fit, or neither is written: the KeyUpdate changes
+        # our keys, and a data record that fails after it would be lost.
+        if out_cap < KEY_UPDATE_RECORD_LEN + 5 + data_len + 1 + 16
+            return -1
+        used = server_send_key_update(server, out, out_cap)
+        if used < 0
+            return -1
+
     # Encrypt straight into `out`: the result is the complete record.
-    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, out, server_record_cap(out_cap))
+    let result: i32 = tls_record_state_server_encrypt(@server.write_state, data, data_len as i32, 23, @out[used], server_record_cap(out_cap - used))
     if result < 0
         return -1
-    return result as i64
+    return used + (result as i64)
 
 # Decrypt one record from the client, after the handshake.
 # Returns:
 #   n >= 0                  n bytes of application data, written to out (0
-#                           also when data holds less than one whole record)
+#                           also when data holds less than one whole record,
+#                           or a record with no data: a KeyUpdate, AGAST
+#                           #3679, or an empty application data record)
 #   TLS_SERVER_READ_CLOSED  the client's close_notify: a clean end of stream.
 #                           Later records are ignored (RFC 8446 6.1); writes
 #                           still work until tls_server_close.
@@ -1395,6 +1421,17 @@ pub fn tls_server_read(server: *TlsServer, data: *u8, data_len: i64, out: *u8, o
     if result < 0
         return -1
 
+    # A handshake message split across records must not be interleaved with
+    # other content (RFC 8446 5.1).
+    if inner_type != 22 && server.hs_len != 0
+        return server_fail_read(server, TLS_ERR_UNEXPECTED_MESSAGE)
+
+    if inner_type == 22
+        if server_process_post_handshake(server, @plaintext[0], result as i64) != 0
+            server.state = TLS_SERVER_STATE_ERROR
+            return -1
+        return 0
+
     if inner_type == 21
         return server_process_alert(server, @plaintext[0], result as i64)
 
@@ -1422,6 +1459,104 @@ fn server_process_alert(server: *TlsServer, data: *u8, len: i64) -> i64
         return TLS_SERVER_READ_ALERT
     server.peer_closed = 1
     return TLS_SERVER_READ_CLOSED
+
+# Record `err` and end the connection; tls_server_read's -1.
+fn server_fail_read(server: *TlsServer, err: i32) -> i64
+    server.last_error = err
+    server.state = TLS_SERVER_STATE_ERROR
+    return -1
+
+# Record `err`; the caller ends the connection. Returns -1.
+fn server_hs_fail(server: *TlsServer, err: i32) -> i32
+    server.last_error = err
+    return -1
+
+# The longest client handshake message accepted after the handshake: a
+# KeyUpdate, 4-byte header and 1-byte body.
+const KEY_UPDATE_MSG_LEN: i64 = 5
+
+# Handshake messages from the client after the handshake (RFC 8446 4.6), as
+# the cryptosec client's process_post_handshake (AGAST #3679): KeyUpdate is
+# honoured; anything else is unexpected (the server sends no
+# CertificateRequest, so no post-handshake Certificate may come). A KeyUpdate
+# split across records is put back together. Returns 0 or -1 (with
+# last_error set).
+fn server_process_post_handshake(server: *TlsServer, data: *u8, len: i64) -> i32
+    # No zero-length handshake fragments (RFC 8446 5.1).
+    if len == 0
+        return server_hs_fail(server, TLS_ERR_UNEXPECTED_MESSAGE)
+    # More than one KeyUpdate's worth pending: a longer message, or something
+    # after a KeyUpdate, which must end its record (RFC 8446 5.1).
+    if server.hs_len + len > KEY_UPDATE_MSG_LEN
+        return server_hs_fail(server, TLS_ERR_UNEXPECTED_MESSAGE)
+    mem_copy(@server.hs_buf[server.hs_len], data, len as u64)
+    server.hs_len = server.hs_len + len
+
+    if server.hs_len < 4
+        return 0  # the rest of the header arrives in later records
+    if server.hs_buf[0] != HS_KEY_UPDATE
+        return server_hs_fail(server, TLS_ERR_UNEXPECTED_MESSAGE)
+    let body_len: i64 = ((server.hs_buf[1] as i64) << 16) | ((server.hs_buf[2] as i64) << 8) | (server.hs_buf[3] as i64)
+    if body_len != 1
+        return server_hs_fail(server, TLS_ERR_PARSE_ERROR)
+    if server.hs_len < KEY_UPDATE_MSG_LEN
+        return 0  # the body arrives in the next record
+    server.hs_len = 0
+    return server_process_key_update(server, server.hs_buf[4])
+
+# KeyUpdate (RFC 8446 4.6.3): move reads to the next client secret; on
+# update_requested, queue our own KeyUpdate for the next write. Returns 0 or
+# -1 (with last_error set).
+fn server_process_key_update(server: *TlsServer, request: u8) -> i32
+    if request > 1
+        return server_hs_fail(server, TLS_ERR_ILLEGAL_PARAMETER)
+    let secret: *u8 = @server.key_schedule.client_application_traffic_secret[0]
+    if server_next_traffic_secret(secret) != 0
+        return server_hs_fail(server, TLS_ERR_INVALID_STATE)
+    match tls13_derive_traffic_keys(secret, @server.read_state.client_key[0], 16, @server.read_state.client_iv[0], 12)
+        Ok(_) => pass
+        Err(_) => return server_hs_fail(server, TLS_ERR_INVALID_STATE)
+    server.read_state.client_seq = 0
+    if request == 1
+        server.key_update_pending = 1
+    return 0
+
+# RFC 8446 7.2: application_traffic_secret_N+1 =
+#     HKDF-Expand-Label(application_traffic_secret_N, "traffic upd", "", 32)
+# Replaces `secret` in place. Returns 0 or -1.
+fn server_next_traffic_secret(secret: *u8) -> i32
+    var next: [32]u8
+    match hkdf_expand_label(secret, "traffic upd", 11, null, 0, @next[0], 32)
+        Ok(_) => pass
+        Err(_) => return -1
+    mem_copy(secret, @next[0], 32)
+    secure_zero(@next[0], 32)
+    return 0
+
+# Our KeyUpdate(update_not_requested), header, type byte and tag included.
+const KEY_UPDATE_RECORD_LEN: i64 = 27
+
+# Write KeyUpdate(update_not_requested) under the current keys, then move
+# writes to the next server secret. Returns the record's length, or -1.
+fn server_send_key_update(server: *TlsServer, out: *u8, out_cap: i64) -> i64
+    var msg: [5]u8
+    msg[0] = HS_KEY_UPDATE
+    msg[1] = 0
+    msg[2] = 0
+    msg[3] = 1
+    msg[4] = 0  # update_not_requested
+    let n: i32 = tls_record_state_server_encrypt(@server.write_state, @msg[0], 5, 22, out, server_record_cap(out_cap))
+    if n < 0
+        return -1
+    let secret: *u8 = @server.key_schedule.server_application_traffic_secret[0]
+    if server_next_traffic_secret(secret) != 0
+        return server_fail_read(server, TLS_ERR_INVALID_STATE)
+    match tls13_derive_traffic_keys(secret, @server.write_state.server_key[0], 16, @server.write_state.server_iv[0], 12)
+        Ok(_) => pass
+        Err(_) => return server_fail_read(server, TLS_ERR_INVALID_STATE)
+    server.write_state.server_seq = 0
+    server.key_update_pending = 0
+    return n as i64
 
 # ============================================================================
 # Close Connection

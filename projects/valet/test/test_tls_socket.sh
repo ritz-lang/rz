@@ -23,6 +23,8 @@
 #   - A client hanging up mid-handshake does not spin the server
 #   - A client's close_notify is a clean close, not "decrypt failed"
 #     (AGAST #2197 item 4)
+#   - A client's KeyUpdate, update_requested, is honoured and answered
+#     (AGAST #3679)
 #   - Responses sent in short sends, under a small SO_SNDBUF, arrive intact
 #     (AGAST #2197 item 5)
 #   - A handshake flight sent in short sends, a big cert chain under a small
@@ -467,6 +469,35 @@ elif [ "$AFTER" -ne "$BEFORE" ]; then
     echo "--- server"; grep "WARN\|ERROR" "$WORK/server.log" | tail -3
 else
     pass "close_notify: clean close, no decrypt warning"
+fi
+
+# A client's KeyUpdate (RFC 8446 4.6.3) came back from tls_server_read as -1:
+# the connection died with "TLS decrypt failed" (AGAST #3679). s_client's K
+# command sends KeyUpdate(update_requested), so valet must rekey its reads
+# and send its own KeyUpdate before the next response. Without -ign_eof,
+# which turns s_client's commands off; the sleeps keep stdin open instead.
+echo "=== Test 12b: client KeyUpdate between two requests ==="
+BEFORE="$(grep -c "TLS decrypt failed" "$WORK/server.log")"
+OUT="$({
+    sleep 0.5
+    printf 'GET / HTTP/1.1\r\nHost: localhost\r\n\r\n'
+    sleep 0.5
+    printf 'K\n'
+    sleep 0.5
+    cat "$WORK/request"
+    sleep 0.7
+} | timeout "$CLIENT_TIMEOUT" openssl s_client -connect "127.0.0.1:$PORT" \
+    -tls1_3 -msg 2>&1)"
+AFTER="$(grep -c "TLS decrypt failed" "$WORK/server.log")"
+if [ "$(grep -c "Hello, World!" <<<"$OUT")" -ne 2 ]; then
+    fail "KeyUpdate: the request after it was not answered"
+    echo "--- client"; grep -E "KeyUpdate|HTTP/1.1|Hello" <<<"$OUT" | tail -6
+elif ! grep -q "^<<< TLS 1.3, Handshake \[length 0005\], KeyUpdate" <<<"$OUT"; then
+    fail "KeyUpdate: update_requested got no KeyUpdate back"
+elif [ "$AFTER" -ne "$BEFORE" ]; then
+    fail "KeyUpdate: logged \"TLS decrypt failed\""
+else
+    pass "KeyUpdate: both requests answered, keys updated both ways"
 fi
 
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then

@@ -1385,3 +1385,191 @@ fn test_e2e_client_unknown_inner_type_rejected() -> i32
     tls_client_free(@client)
     tls_server_free(@server)
     return 0
+
+# ============================================================================
+# KeyUpdate from the client (AGAST #3679, RFC 8446 4.6.3)
+# ============================================================================
+# The server mirrors cryptosec's client process_post_handshake: a client
+# KeyUpdate moves reads to the next client secret; update_requested queues
+# the server's own KeyUpdate ahead of its next data record.
+
+# KeyUpdate(request) as one handshake message, into `msg` (5 bytes).
+fn key_update_msg_3679(msg: *u8, request: u8)
+    msg[0] = HS_KEY_UPDATE
+    msg[1] = 0
+    msg[2] = 0
+    msg[3] = 1
+    msg[4] = request
+
+# Move the client's writes to its next application secret, as a client does
+# after sending KeyUpdate (RFC 8446 7.2). 0 on success.
+fn client_rekey_writes_3679(client: *TlsClient) -> i32
+    let secret: *u8 = @client.key_schedule.client_application_traffic_secret[0]
+    var next: [32]u8
+    match hkdf_expand_label(secret, "traffic upd", 11, null, 0, @next[0], 32)
+        Ok(_) => pass
+        Err(_) => return 1
+    mem_copy(secret, @next[0], 32)
+    match tls13_derive_traffic_keys(secret, @client.write_state.client_key[0], 16, @client.write_state.client_iv[0], 12)
+        Ok(_) => pass
+        Err(_) => return 2
+    client.write_state.client_seq = 0
+    return 0
+
+# KeyUpdate(update_not_requested), written by cryptosec's own client: its
+# write puts the KeyUpdate and then the data under the new keys. The server
+# reads the first as no data and decrypts the second with the next keys; its
+# own writes are unchanged.
+[[test]]
+fn test_e2e_client_key_update_rekeys_reads() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    if send_to_server(@client, @server, c"before") != 0
+        return 2
+    client.key_update_pending = 1
+    var rec: [1024]u8
+    let n: i64 = tls_client_write(@client, c"hi", 2, @rec[0], 1024)
+    let ku_len: i64 = 5 + 5 + 1 + 16
+    if n != ku_len + 5 + 2 + 1 + 16
+        return 3
+    var got: [1024]u8
+    if tls_server_read(@server, @rec[0], ku_len, @got[0], 1024) != 0
+        return 4
+    if tls_server_read(@server, @rec[ku_len], n - ku_len, @got[0], 1024) != 2
+        return 5
+    if got[0] != 'h' || got[1] != 'i'
+        return 6
+    # Sequence numbers run on under the new keys, both ways.
+    if send_to_server(@client, @server, c"after") != 0
+        return 7
+    if send_to_client(@server, @client, c"reply") != 0
+        return 8
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+# KeyUpdate(update_requested): the server's next write is its own
+# KeyUpdate(update_not_requested) under the old keys, then the data under the
+# new ones; cryptosec's client reads both. Once only: the write after is a
+# single record.
+[[test]]
+fn test_e2e_client_key_update_requested_updates_writes() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    var msg: [5]u8
+    key_update_msg_3679(@msg[0], 1)
+    if server_read_typed_2197(@client, @server, 22, @msg[0], 5) != 0
+        return 2
+    if client_rekey_writes_3679(@client) != 0
+        return 3
+    var rec: [1024]u8
+    let ku_len: i64 = 5 + 5 + 1 + 16
+    # Too small for both records: neither is written, the KeyUpdate stays.
+    if tls_server_write(@server, c"hi", 2, @rec[0], ku_len + 10) != -1
+        return 4
+    let n: i64 = tls_server_write(@server, c"hi", 2, @rec[0], 1024)
+    if n != ku_len + 5 + 2 + 1 + 16
+        return 5
+    var got: [1024]u8
+    if tls_client_read(@client, @rec[0], ku_len, @got[0], 1024) != 0
+        return 6
+    if tls_client_read(@client, @rec[ku_len], n - ku_len, @got[0], 1024) != 2
+        return 7
+    if got[0] != 'h' || got[1] != 'i'
+        return 8
+    if send_to_client(@server, @client, c"again") != 0
+        return 9
+    if send_to_server(@client, @server, c"after") != 0
+        return 10
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+# A KeyUpdate split across two records is put back together (RFC 8446 5.1).
+[[test]]
+fn test_e2e_client_key_update_split_across_records() -> i32
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return 1
+    var msg: [5]u8
+    key_update_msg_3679(@msg[0], 0)
+    if server_read_typed_2197(@client, @server, 22, @msg[0], 2) != 0
+        return 2
+    if server_read_typed_2197(@client, @server, 22, @msg[2], 3) != 0
+        return 3
+    if client_rekey_writes_3679(@client) != 0
+        return 4
+    if send_to_server(@client, @server, c"after") != 0
+        return 5
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return 0
+
+# One post-handshake record from the client on a fresh connection: `first`
+# bytes of `data` (inner type 22) then, if `second` > 0, `second` bytes of
+# application data. Returns the last tls_server_read result.
+fn post_handshake_verdict_3679(data: *u8, first: i32, second: i32) -> i64
+    var der: [8192]u8
+    var scfg: TlsServerConfig
+    var ccfg: TlsConfig
+    var client: TlsClient
+    var server: TlsServer
+    if alert_setup_2197(@der[0], @scfg, @ccfg, @client, @server) != 0
+        return -100
+    var r: i64 = server_read_typed_2197(@client, @server, 22, data, first)
+    if second > 0 && r == 0
+        r = server_read_typed_2197(@client, @server, 23, c"GET /", second)
+    tls_client_free(@client)
+    tls_server_free(@server)
+    return r
+
+# What the server refuses after the handshake, each as -1.
+[[test]]
+fn test_e2e_client_post_handshake_refusals() -> i32
+    var m: [16]u8
+    # update_requested is 0 or 1 (RFC 8446 4.6.3).
+    key_update_msg_3679(@m[0], 2)
+    if post_handshake_verdict_3679(@m[0], 5, 0) != -1
+        return 1
+    # A KeyUpdate body is one byte: refused at its header.
+    key_update_msg_3679(@m[0], 0)
+    m[3] = 2
+    if post_handshake_verdict_3679(@m[0], 5, 0) != -1
+        return 2
+    # The keys change after a KeyUpdate: nothing may follow it in its record.
+    # Here the first byte of a second KeyUpdate.
+    key_update_msg_3679(@m[0], 0)
+    key_update_msg_3679(@m[5], 0)
+    if post_handshake_verdict_3679(@m[0], 6, 0) != -1
+        return 3
+    # No other handshake message is expected from a client (no
+    # post_handshake_auth was asked for): a second Finished here.
+    m[0] = HS_FINISHED
+    m[1] = 0
+    m[2] = 0
+    m[3] = 1
+    m[4] = 0
+    if post_handshake_verdict_3679(@m[0], 5, 0) != -1
+        return 4
+    # No zero-length handshake fragments (RFC 8446 5.1).
+    if post_handshake_verdict_3679(@m[0], 0, 0) != -1
+        return 5
+    # Half a KeyUpdate, then application data: interleaved (RFC 8446 5.1).
+    key_update_msg_3679(@m[0], 0)
+    if post_handshake_verdict_3679(@m[0], 2, 5) != -1
+        return 6
+    return 0
