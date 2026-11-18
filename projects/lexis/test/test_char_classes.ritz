@@ -1,0 +1,180 @@
+# test/test_char_classes.ritz - char classification + char-compare sites (#1977)
+#
+# #1977 rewrote lexis's numeric char compares (`c >= 48 and c <= 57`,
+# `== 45`, ...) as char literals. These tests pin the behaviour of every
+# rewritten site. The oracles below deliberately spell the ASCII ranges as
+# numbers, independently of the library, so a mistranscribed literal in lib/
+# (e.g. 'F' typed as 'E') fails here.
+#
+# CDO/CDC and '-'-led idents are not covered: the '-' branch of
+# css_tokenizer_next returns a DELIM before reaching them (#4056).
+
+import lib.css.token
+import lib.css.tokenizer { CssTokenizer, css_tokenizer_new, css_tokenizer_next, css_is_whitespace, is_digit, is_hex_digit, is_letter }
+import lib.css.parser { hex_digit }
+import lib.html.tokenizer { is_ascii_alpha, is_ascii_upper, is_ascii_digit, is_ascii_hex, to_lower }
+import lib.style.matching { str_eq_ignore_case, attr_includes_word }
+
+# =============================================================================
+# Oracles (numeric on purpose)
+# =============================================================================
+
+fn in_range(c: i32, lo: i32, hi: i32) -> i32
+    if c >= lo and c <= hi
+        return 1
+    0
+
+fn want_digit(c: i32) -> i32
+    in_range(c, 48, 57)
+
+fn want_upper(c: i32) -> i32
+    in_range(c, 65, 90)
+
+fn want_alpha(c: i32) -> i32
+    if in_range(c, 65, 90) == 1 or in_range(c, 97, 122) == 1
+        return 1
+    0
+
+fn want_hex(c: i32) -> i32
+    if in_range(c, 48, 57) == 1 or in_range(c, 65, 70) == 1 or in_range(c, 97, 102) == 1
+        return 1
+    0
+
+fn want_ws(c: i32) -> i32
+    if c == 32 or c == 9 or c == 10 or c == 13 or c == 12
+        return 1
+    0
+
+# =============================================================================
+# Exhaustive classifier checks over every byte value
+# =============================================================================
+
+[[test]]
+fn test_css_classifiers_all_bytes() -> i32
+    var c: i32 = 0
+    while c < 256
+        let b = c as u8
+        if css_is_whitespace(b) != want_ws(c)
+            return 1
+        if is_digit(b) != want_digit(c)
+            return 2
+        if is_hex_digit(b) != want_hex(c)
+            return 3
+        if is_letter(b) != want_alpha(c)
+            return 4
+        c = c + 1
+    0
+
+[[test]]
+fn test_html_classifiers_all_bytes() -> i32
+    var c: i32 = 0
+    while c < 256
+        let b = c as u8
+        if is_ascii_alpha(b) != want_alpha(c)
+            return 1
+        if is_ascii_upper(b) != want_upper(c)
+            return 2
+        if is_ascii_digit(b) != want_digit(c)
+            return 3
+        if is_ascii_hex(b) != want_hex(c)
+            return 4
+        var want_lower: i32 = c
+        if want_upper(c) == 1
+            want_lower = c + 32
+        if to_lower(b) as i32 != want_lower
+            return 5
+        c = c + 1
+    0
+
+[[test]]
+fn test_css_hex_digit_values() -> i32
+    var c: i32 = 0
+    while c < 256
+        var want: i32 = 0
+        if in_range(c, 48, 57) == 1
+            want = c - 48
+        else if in_range(c, 65, 70) == 1
+            want = c - 55
+        else if in_range(c, 97, 102) == 1
+            want = c - 87
+        if hex_digit(c as u8) as i32 != want
+            return 1
+        c = c + 1
+    0
+
+# =============================================================================
+# style/matching
+# =============================================================================
+
+[[test]]
+fn test_str_eq_ignore_case() -> i32
+    if str_eq_ignore_case("DiV-AZ", "div-az") != 1
+        return 1
+    # '@' (64) and '[' (91) sit just outside A-Z: neither may fold to '`'/'{'.
+    # One char per probe, so a fold on one side cannot hide behind the other.
+    if str_eq_ignore_case("@", "`") != 0
+        return 2
+    if str_eq_ignore_case("[", "{") != 0
+        return 3
+    if str_eq_ignore_case("`", "@") != 0
+        return 4
+    if str_eq_ignore_case("{", "[") != 0
+        return 5
+    0
+
+[[test]]
+fn test_attr_includes_word_splits_on_space() -> i32
+    if attr_includes_word("foo bar baz", "bar") != 1
+        return 1
+    if attr_includes_word("foo-bar", "bar") != 0
+        return 2
+    0
+
+# =============================================================================
+# CSS tokenizer inline sites
+# =============================================================================
+
+fn next_kind(t:& CssTokenizer) -> i32
+    let tok = css_tokenizer_next(t)
+    tok.kind
+
+[[test]]
+fn test_css_hash_id_types() -> i32
+    var t = css_tokenizer_new("#-a #1a")
+    let a = css_tokenizer_next(t)
+    if a.kind != CSS_TOKEN_HASH or a.hash_type != HASH_ID
+        return 1
+    next_kind(t)
+    let b = css_tokenizer_next(t)
+    if b.kind != CSS_TOKEN_HASH or b.hash_type != HASH_UNRESTRICTED
+        return 2
+    0
+
+[[test]]
+fn test_css_url_case_insensitive() -> i32
+    var t = css_tokenizer_new("UrL( a.png ) uRl(x)")
+    if next_kind(t) != CSS_TOKEN_URL
+        return 1
+    next_kind(t)
+    if next_kind(t) != CSS_TOKEN_URL
+        return 2
+    # "urm(" is an ordinary function
+    var u = css_tokenizer_new("urm(x)")
+    if next_kind(u) != CSS_TOKEN_FUNCTION
+        return 3
+    0
+
+[[test]]
+fn test_css_numbers_and_dimensions() -> i32
+    var t = css_tokenizer_new("1.5 +.5 10-x")
+    let a = css_tokenizer_next(t)
+    if a.kind != CSS_TOKEN_NUMBER or a.number_type != NUMBER_FLOAT
+        return 1
+    next_kind(t)
+    let b = css_tokenizer_next(t)
+    if b.kind != CSS_TOKEN_NUMBER or b.number != 0.5
+        return 2
+    next_kind(t)
+    if next_kind(t) != CSS_TOKEN_DIMENSION
+        return 3
+    0
