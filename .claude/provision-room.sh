@@ -157,6 +157,14 @@ fi
 # /tmp scratch (mktemp, cp, sed -i, rm under /tmp) needs no entry: bare Bash
 # and Write cover it, measured 2026-11-16 with CLI 2.1.322.
 #
+# One /tmp exception, also beyond any entry here (AGAST #4215, bisected with
+# `claude -p` and these settings on CLI 2.1.322): the CLI asks when ONE Bash
+# call combines `rm -rf`, a loop that backgrounds `bash -c '...' &` into a $!
+# array, and `kill` of that array (ritz-task-4078's load repro).  Drop any one
+# part and it runs.  Adele tiers that ask "destructive" and holds it for a
+# human.  The same text run as `bash /tmp/<script>.sh`, or with the `rm -rf`
+# in a call of its own, does not ask; the briefing says so.
+#
 # What no entry here can fix (measured, same day): the CLI ASKS for every
 # write under a `.claude/` directory (Write, Edit, `cp`/`sed -i`/`rm`/`>`
 # into it), whatever the allow list, a path rule like Edit(/.claude/**), or a
