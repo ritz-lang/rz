@@ -437,9 +437,11 @@ gate_next() {
 
 # cmd_wait <log>: block until the gate ends; exit with its code.  A remote
 # gate's log is fetched to <log> once it ends; a log for another SHA than its
-# train's tip exits 3.
+# train's tip exits 3.  Only an EXIT= line in that log ends a remote wait: a
+# slice that times out (124) or ends with no EXIT= polls again, and 5 ends
+# with no EXIT= in a row are no verdict (98), never exit 0 (AGAST #4116).
 cmd_wait() {
-    local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 tip
+    local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 nov=0 tip
     for s in $(queue); do
         use_slot "$s"
         spec="$(field SPEC "$(state)")"
@@ -454,16 +456,23 @@ cmd_wait() {
     tip="$(field TIP "$st")"
     while :; do
         rc=0; remote "$host" wait "$REMOTE_WT" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" "$QUEUED_PAUSE" || rc=$?
-        [[ $rc -eq 124 ]] && continue                     # still running
+        if [[ $rc -eq 124 ]]; then nov=0; continue; fi    # still running
         if [[ $rc -eq 255 ]]; then                        # ssh itself failed
             tries=$((tries + 1))
             [[ $tries -lt 5 ]] || die "ssh to $host failed 5 times: no verdict for $log"
             sleep "$SSH_RETRY"; continue
         fi
-        break
+        remote "$host" cat "$rlog" > "$llog.tmp" || { rm -f "$llog.tmp"; die "could not fetch $rlog from $host"; }
+        mv -f "$llog.tmp" "$llog"
+        grep -q '^EXIT=' "$llog" && break
+        # The slice ended but the log has no verdict (AGAST #4116): the gate
+        # may still be running (alive() can miss its unit), so poll again;
+        # only 5 such ends in a row are a dead gate, no verdict (98 below).
+        nov=$((nov + 1))
+        [[ $nov -lt 5 ]] || break
+        echo "no EXIT= yet in $host:$rlog (wait exit $rc): polling again" >&2
+        sleep "$QUEUED_PAUSE"
     done
-    remote "$host" cat "$rlog" > "$llog.tmp" || { rm -f "$llog.tmp"; die "could not fetch $rlog from $host"; }
-    mv -f "$llog.tmp" "$llog"
     if [[ "$(sed -n 's/^SHA=//p' "$llog" | head -1)" != "$tip" ]]; then
         echo "REFUSED: $host's verdict is for $(sed -n 's/^SHA=//p' "$llog" | head -1 | cut -c1-12), not the train tip ${tip:0:12}" >&2
         exit 3
