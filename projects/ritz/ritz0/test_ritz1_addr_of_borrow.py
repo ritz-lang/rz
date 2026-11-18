@@ -915,8 +915,9 @@ fn f(t:& Res) -> i32
     "parenthesised_field": _body("fn f(c:& C) -> i32\n    return (@c).x\n"),
 }
 
-# ritz0 can't compile this one: ritzlib.span brings ritzlib's Vec, which clashes.
-VEC_SPAN = "import ritzlib.span\n" + VEC + """\
+# ritzlib.gvec's Vec<T>: a local one beside it, which this test held until
+# AGAST #4111, is a struct conflict on every compiler.
+VEC_SPAN = "import ritzlib.gvec\nimport ritzlib.span\n\n" + """\
 fn g(p: Span<i32>) -> i32
     return p[1]
 

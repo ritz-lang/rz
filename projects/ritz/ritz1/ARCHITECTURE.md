@@ -251,6 +251,12 @@ still run mid-lowering on `*EmitterState`, and
 - `sema_index_store` — an index store ritz1 can't lower is refused, not
   miscompiled.
 
+- `struct_variants` — same-named structs (§15.3, §17.2, #4111): the parser
+  notes every struct, `[[target_os]]`-filtered or not, with its target and a
+  hash of its tokens; after imports resolve, two differing definitions that
+  always coexist (no gate, or one target), or a gated one beside an ungated
+  one on its own target, are "Conflicting struct definition" as in ritz0.
+
 - `tail_value` — a `-> T` fn must not reach its end without a value. Its
   divergence walk (`tail_stmts_diverge`) is also read by `reachability` and
   `emitter_stmt`.

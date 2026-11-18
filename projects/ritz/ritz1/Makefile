@@ -31,6 +31,7 @@ SOURCES = \
 	parser_gen \
 	interp \
 	struct_index \
+	struct_variants \
 	monomorph \
 	generic_infer \
 	emitter_core \

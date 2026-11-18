@@ -11,9 +11,9 @@ Accepted on all three compilers: twin variants in one file and across two
 imports, each target picking its own layout (`--target-os harland` compiles a
 harland-layout literal that the linux layout would reject).
 
-Rejected by ritz0 (ritz1 does not yet check struct conflicts at all):
-two ungated or two same-target structs that differ, and a gated struct
-beside a differing ungated one, but only on the target where both exist.
+Rejected on all three compilers (AGAST #4111): two ungated or two
+same-target structs that differ, and a gated struct beside a differing
+ungated one, but only on the target where both exist.
 """
 
 import os
@@ -111,11 +111,21 @@ def test_twin_across_imports(compiler, tmp_path):
 
 
 @pytest.mark.integration
-def test_identical_same_target_in_two_imports_accepted(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_identical_same_target_in_two_imports_accepted(compiler, tmp_path):
     """As for ungated structs, an identical repeat is not a conflict."""
     _write(tmp_path, {"ma": LINUX_P, "mb": LINUX_P,
                       "t": "import ma\nimport mb\n\n" + MAINS})
-    _accepted("ritz0", tmp_path, "t")
+    _accepted(compiler, tmp_path, "t")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_identical_repeat_in_one_file_accepted(compiler, tmp_path):
+    """Another line, a comment between, `pub` dropped: still the same P."""
+    _write(tmp_path, {"t": UNGATED_P + "# again\nstruct P\n    u: i64\n\n"
+                      "fn main() -> i32\n    var p: P = P { u: 3 }\n    p.u as i32\n"})
+    _accepted(compiler, tmp_path, "t")
 
 
 # (id, source, target_os) — each must fail with the struct conflict.
@@ -127,23 +137,29 @@ REJECTED = [
     ("other_target_differing", HARLAND_P + '[[target_os = "harland"]]\n'
      "pub struct P\n    b: i64\n\n", "linux"),
     ("gated_beside_ungated", LINUX_P + UNGATED_P, "linux"),
+    # ritz1 keeps one file's items in one list: the conflict must also be
+    # seen when the two definitions come from two imports.
+    ("ungated_across_imports", "import ma\nimport mb\n\n", "linux"),
 ]
 
 
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("src,target_os", [c[1:] for c in REJECTED],
                          ids=[c[0] for c in REJECTED])
-def test_ritz0_conflict_rejected(tmp_path, src, target_os):
-    _write(tmp_path, {"t": src + "fn main() -> i32\n    0\n"})
-    proc, _ = _compile("ritz0", tmp_path, "t", target_os)
+def test_conflict_rejected(compiler, tmp_path, src, target_os):
+    _write(tmp_path, {"ma": UNGATED_P, "mb": "pub struct P\n    v: i32\n\n",
+                      "t": src + "fn main() -> i32\n    0\n"})
+    proc, _ = _compile(compiler, tmp_path, "t", target_os)
     out = proc.stderr + proc.stdout
-    assert proc.returncode != 0, f"ritz0 accepted a conflicting struct:\n{out}"
+    assert proc.returncode != 0, f"{compiler} accepted a conflicting struct:\n{out}"
     assert PREFIX in out, out
 
 
 @pytest.mark.integration
-def test_ritz0_gated_beside_ungated_other_target_accepted(tmp_path):
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_gated_beside_ungated_other_target_accepted(compiler, tmp_path):
     """On harland the linux variant does not exist, so the ungated P stands."""
     _write(tmp_path, {"t": LINUX_P + UNGATED_P +
                       "fn main() -> i32\n    var p: P = P { u: 3 }\n    p.u as i32\n"})
-    _accepted("ritz0", tmp_path, "t", "harland")
+    _accepted(compiler, tmp_path, "t", "harland")
