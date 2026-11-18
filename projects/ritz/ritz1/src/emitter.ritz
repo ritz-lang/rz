@@ -3801,16 +3801,100 @@ fn lower_ref_fields(m: *Module)
         st = st.next
 
 pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
-    var s: EmitterState
-    s.out = out
-    s.reg_counter = 1
-    s.label_counter = 0
-    s.current_label = ENTRY_BLOCK_LABEL   # AGAST #1335
-    s.local_count = 0
-    s.last_expr_model = LAST_EXPR_UNKNOWN   # AGAST #2950
-    s.break_label = -1
-    s.continue_label = -1
-    s.module = m
+    # Built whole (LARB R59, AGAST #3592): an uninitialised move-only `var`
+    # starts moved, and EmitterState is move-only (its HashMapI64 maps have
+    # Drop).  The NameLists, maps and buffers are allocated below.
+    var s: EmitterState = EmitterState {
+        out: out,
+        reg_counter: 1,
+        label_counter: 0,
+        locals: null,
+        locals_cap: 0,
+        local_count: 0,
+        break_label: -1,
+        continue_label: -1,
+        module: m,
+        strings: NameList { names: null, lens: null, count: 0, cap: 0 },
+        externs: NameList { names: null, lens: null, count: 0, cap: 0 },
+        emitted_structs: NameList { names: null, lens: null, count: 0, cap: 0 },
+        late_enums: NameList { names: null, lens: null, count: 0, cap: 0 },
+        late_tuples: NameList { names: null, lens: null, count: 0, cap: 0 },
+        emitted_fns: NameList { names: null, lens: null, count: 0, cap: 0 },
+        emitted_globals: NameList { names: null, lens: null, count: 0, cap: 0 },
+        last_expr_reg: 0,
+        last_expr_label: 0,
+        last_expr_model: LAST_EXPR_UNKNOWN,   # AGAST #2950
+        current_label: ENTRY_BLOCK_LABEL,   # AGAST #1335
+        ret_type_name: null,
+        ret_type_name_len: 0,
+        ret_sret: 0,   # AGAST #1730 — set per fn by emit_fn / emit_impl_method
+        fn_ret_type: TYPE_VOID,   # AGAST #1454 — set per fn like ret_sret
+        sret_last_val: 0,
+        sret_last_slot: 0,
+        sret_helpers_used: 0,
+        fmod_helpers_used: 0,   # AGAST #3817 — see emit_fmod_helpers
+        ctx_enum_name: null,
+        ctx_enum_name_len: 0,
+        ctx_enum_arg: 0,
+        ctx_slot_name: null,   # AGAST #2296
+        ctx_slot_name_len: 0,
+        ctx_slot_set: 0,
+        struct_copy_expr: null,
+        ctx_simd_name: null,
+        ctx_simd_name_len: 0,
+        last_match_agg_name: null,   # AGAST #1666
+        last_match_agg_name_len: 0,
+        last_match_float_ty: 0,   # AGAST #1946
+        last_if_stmt_agg_name: null,   # AGAST #2559
+        last_if_stmt_agg_name_len: 0,
+        match_float_hint: 0,
+        match_agg_hint: null,   # AGAST #3205
+        match_agg_hint_len: 0,
+        match_no_value: 0,   # AGAST #2046
+        if_arm_value: null,   # AGAST #2288
+        if_stmt_discarded: null,   # AGAST #3749
+        void_arm_line: 0,
+        void_arm_col: 0,
+        local_map: HashMapI64 { entries: null, cap: 0, len: 0, tombstones: 0 },
+        global_map: HashMapI64 { entries: null, cap: 0, len: 0, tombstones: 0 },
+        fn_map: HashMapI64 { entries: null, cap: 0, len: 0, tombstones: 0 },
+        struct_map: HashMapI64 { entries: null, cap: 0, len: 0, tombstones: 0 },
+        const_map: HashMapI64 { entries: null, cap: 0, len: 0, tombstones: 0 },
+        error_count: 0,   # AGAST #1369 — see emit_ir_error / the return below
+        unknown_struct_name: null,   # AGAST #3362
+        unknown_struct_name_len: 0,
+        match_scrut_kind: 0,
+        match_scrut_int: 0,
+        match_scrut_str: 0,
+        wanted: null,   # AGAST #2260
+        wanted_count: 0,
+        wanted_cap: 0,
+        print_helpers_used: 0,   # AGAST #1521 — see emit_print_helpers
+        fmt_helpers_used: 0,   # AGAST #1824 — see emit_format_helpers
+        packed_types_emitted: 0,   # AGAST #1918 — see align_packed_accesses
+        narrow_params: null,
+        narrow_decls: [NarrowDecl { name: null, name_len: 0, decl_type: 0, declared: 0, init: null }; 256],
+        narrow_decl_count: 0,
+        narrow_decl_overflow: 0,
+        fn_assert_kind: ASSERT_FN_PLAIN,   # AGAST #1869 — see emit_assert_stmt
+        assert_helpers_used: 0,
+        assert_site_used: 0,
+        assert_cap_expr: null,
+        assert_cap_ok: 0,
+        assert_cap_l: 0,
+        assert_cap_r: 0,
+        assert_file_str: -1,
+        own: null,
+        defer_live: 0,
+        fm: null,
+        fm_count: 0,
+        fm_cap: 0,
+        fm_line: 0,
+        fm_col: 0,
+        fs: null,
+        fs_count: 0,
+        fs_cap: 0
+    }
     locals_init(@s, LOCALS_INIT_CAP)
     own_init(@s)   # AGAST #2158
     namelist_init(@s.strings, STRINGS_INIT_CAP)
@@ -3820,51 +3904,6 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
     namelist_init(@s.late_tuples, 16)   # AGAST #3005
     namelist_init(@s.emitted_fns, 512)
     namelist_init(@s.emitted_globals, 256)
-    s.ctx_enum_name = null
-    s.ctx_enum_name_len = 0
-    s.ctx_enum_arg = 0
-    s.ctx_slot_name = null   # AGAST #2296
-    s.ctx_slot_name_len = 0
-    s.ctx_slot_set = 0
-    s.struct_copy_expr = null
-    s.ctx_simd_name = null
-    s.ctx_simd_name_len = 0
-    s.last_match_agg_name = null   # AGAST #1666
-    s.last_match_agg_name_len = 0
-    s.last_match_float_ty = 0   # AGAST #1946
-    s.last_if_stmt_agg_name = null   # AGAST #2559
-    s.last_if_stmt_agg_name_len = 0
-    s.match_float_hint = 0
-    s.match_agg_hint = null   # AGAST #3205
-    s.match_agg_hint_len = 0
-    s.match_no_value = 0   # AGAST #2046
-    s.if_arm_value = null   # AGAST #2288
-    s.if_stmt_discarded = null   # AGAST #3749
-    s.wanted = null   # AGAST #2260
-    s.wanted_count = 0
-    s.wanted_cap = 0
-    s.void_arm_line = 0
-    s.void_arm_col = 0
-    s.error_count = 0   # AGAST #1369 — see emit_ir_error / the return below
-    s.unknown_struct_name = null   # AGAST #3362
-    s.unknown_struct_name_len = 0
-    s.ret_sret = 0   # AGAST #1730 — set per fn by emit_fn / emit_impl_method
-    s.fn_ret_type = TYPE_VOID   # AGAST #1454 — set per fn like ret_sret
-    s.sret_last_val = 0
-    s.sret_last_slot = 0
-    s.sret_helpers_used = 0
-    s.fmod_helpers_used = 0   # AGAST #3817 — see emit_fmod_helpers
-    s.print_helpers_used = 0   # AGAST #1521 — see emit_print_helpers
-    s.fmt_helpers_used = 0     # AGAST #1824 — see emit_format_helpers
-    s.packed_types_emitted = 0   # AGAST #1918 — see align_packed_accesses
-    s.fn_assert_kind = ASSERT_FN_PLAIN   # AGAST #1869 — see emit_assert_stmt
-    s.assert_helpers_used = 0
-    s.assert_site_used = 0
-    s.assert_cap_expr = null
-    s.assert_cap_ok = 0
-    s.assert_cap_l = 0
-    s.assert_cap_r = 0
-    s.assert_file_str = -1
     # Before build_symbol_maps, so find_struct sees the fallback if added.
     ensure_string_literal_struct(@s, m)
     lower_ref_fields(m)   # AGAST #2041
