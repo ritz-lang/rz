@@ -17,6 +17,7 @@ Loaded by ritz0/conftest.py (`pytest_plugins`); test_spawn_guard.py loads it
 with `-p spawn_guard`.
 """
 
+import contextlib
 import os
 import subprocess
 
@@ -33,6 +34,18 @@ def note_spawn(what: str) -> None:
     """Record a spawn that does not go through Popen (e.g. a forked ritz0)."""
     if _seen is not None:
         _seen.append(what)
+
+
+@contextlib.contextmanager
+def unwatched():
+    """Spawns a plugin makes for its own bookkeeping (read_guard measuring
+    its scope with git, AGAST #4032) are not the test's."""
+    global _seen
+    saved, _seen = _seen, None
+    try:
+        yield
+    finally:
+        _seen = saved
 
 
 def _describe(args) -> str:

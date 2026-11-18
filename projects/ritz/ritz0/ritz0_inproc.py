@@ -204,6 +204,14 @@ def _note_spawn(what: str) -> None:
         guard.note_spawn(what)
 
 
+def _note_exec(args, cwd, env) -> None:
+    """Tell read_guard (if loaded) what the forked child is handed: the hook
+    in this process cannot see the child's reads (AGAST #4032)."""
+    guard = sys.modules.get("read_guard")
+    if guard is not None:
+        guard.note_exec(args, cwd, env)
+
+
 def run_ritz0(args, *, cwd=None, env=None, timeout=None, text=True,
               use_cache=False, check=False) -> subprocess.CompletedProcess:
     """Run `ritz0.py *args` without launching an interpreter (see module doc).
@@ -215,6 +223,7 @@ def run_ritz0(args, *, cwd=None, env=None, timeout=None, text=True,
     _note_spawn("ritz0 (in-process) " + " ".join(args))
     env = dict(os.environ if env is None else env)
     cwd = str(cwd) if cwd is not None else None
+    _note_exec(args, cwd, env)
     plain = _plain_compile(args) if use_cache else None
     key = None
     if plain is not None:

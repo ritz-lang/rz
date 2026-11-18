@@ -264,11 +264,97 @@ def test_a_git_failure_runs(tmp_path):
     assert not d.skip
 
 
+# --------------------------------------------------------------------------
+# What names a package (AGAST #4032).  Measured 2026-11-18, the text scan
+# named all 24 packages, many only from comments, docstrings and
+# tools/smoke_stack (which the step never runs), so a package-only change
+# never skipped.  A mention that can't make the step read a package must
+# not name it; one that can must.  Each row adds one mention of `lonely`,
+# then modifies lonely's source.
+# --------------------------------------------------------------------------
+
+@pytest.mark.parametrize("rel, text", [
+    pytest.param("projects/ritz/ritz0/test_c.py", "x = 1  # see projects/lonely/src\n",
+                 id="py-comment"),
+    pytest.param("projects/ritz/ritz0/test_c.py",
+                 '"""Like projects/lonely/src, but smaller."""\nx = 1\n', id="py-module-docstring"),
+    pytest.param("projects/ritz/ritz0/test_c.py",
+                 'def f():\n    """reads "lonely" once"""\n    return 1\n', id="py-function-docstring"),
+    pytest.param("projects/ritz/tools/smoke_stack/hollow.py", 'P = ROOT / "lonely"\n',
+                 id="smoke-stack-is-never-run"),
+    pytest.param("projects/ritz/ritz0/test/t.ritz", "# ../lonely/src/main.ritz does this too\n",
+                 id="ritz-comment"),
+    pytest.param("projects/ritz/scripts/t.sh", "# ../lonely is not built here\n", id="sh-comment"),
+    pytest.param("projects/ritz/ritz0/test_c.py", 'URL = "lonely://example.com/x"\n',
+                 id="url-scheme"),
+    pytest.param("projects/ritz/ritz0/test_c.py", 'CMD = "lonely --help"\n',
+                 id="command-string"),
+])
+def test_a_mention_that_cannot_read_a_package_does_not_name_it(repo, rel, text):
+    r, _ = repo
+    change(r, (rel, text))
+    head = git(r, "rev-parse", "HEAD")
+    change(r, ("projects/lonely/src/main.ritz", "fn main() -> i32\n    3\n"))
+    d = decide(r, head)
+    assert d.skip, d.lines
+    assert "lonely" not in ritz0_scope.named_packages(r)
+
+
+@pytest.mark.parametrize("rel, text", [
+    pytest.param("projects/ritz/ritz0/test_c.py", 'P = PROJECTS / "lonely"\n', id="py-path"),
+    pytest.param("projects/ritz/ritz0/test_c.py", 'P = f"{PROJECTS}/lonely/src"\n',
+                 id="py-fstring-path"),
+    pytest.param("projects/ritz/ritz0/test_c.py",
+                 'PROG = """\nimport lonely.main\nfn main() -> i32\n    0\n"""\n',
+                 id="ritz-import-in-py-string"),
+    pytest.param("projects/ritz/ritz0/test/t.ritz", "import lonely.main { f }\n",
+                 id="ritz-import"),
+    pytest.param("projects/ritz/scripts/t.sh", "RITZ_PATH=$ROOT/lonely:$ROOT/x\n",
+                 id="sh-search-path"),
+    pytest.param("projects/ritz/ritz0/test_c.py", 'P = PROJECTS / "lonely"\ndef f(:\n',
+                 id="unparsable-py-is-read-raw"),
+])
+def test_a_mention_that_can_read_a_package_names_it(repo, rel, text):
+    r, _ = repo
+    change(r, (rel, text))
+    head = git(r, "rev-parse", "HEAD")
+    change(r, ("projects/lonely/src/main.ritz", "fn main() -> i32\n    3\n"))
+    assert not decide(r, head).skip
+    assert "lonely" in ritz0_scope.named_packages(r)
+
+
 def test_the_real_tree_measures_the_packages_ritz0_tests_read():
-    """The measurement on this repo: packages ritz0's tests open by path are
-    inputs.  If one of these drops out, the scan has stopped seeing them."""
+    """The measurement on this repo (AGAST #4032, strace + an audit hook over
+    a full run): the packages ritz0's tests open by path are inputs.  If one
+    drops out, the scan has stopped seeing them; ritz0/read_guard.py fails
+    the test that reads it on the next full run, too."""
     repo = Path(__file__).resolve().parents[3]
     named = ritz0_scope.named_packages(repo)
-    for pkg in ("harland", "indium", "cryptosec", "larb", "zeus", "tome", "ritzunit"):
+    for pkg in MEASURED_READ:
         assert pkg in named, sorted(named)
     assert "ritz" not in named  # always an input; not a "package" here
+
+
+def test_the_real_tree_skips_a_package_the_step_never_reads():
+    """The point of #4032: measured 2026-11-18, the step reads no file of
+    these but their manifests (and lists their directories: A/D runs).
+    The scan used to name all 24 packages, so none of them ever skipped."""
+    repo = Path(__file__).resolve().parents[3]
+    named = ritz0_scope.named_packages(repo)
+    assert not named & NEVER_READ, sorted(named & NEVER_READ)
+
+
+# The packages the full ritz0 step opened a non-manifest file of, measured
+# 2026-11-18 (AGAST #4032): strace -f over the whole step, attributed per test
+# with an audit hook.  Others reach it only through these packages' manifests.
+MEASURED_READ = ("cryptosec", "harland", "indium", "iris", "larb", "prism",
+                 "ritzunit", "spire", "zeus")
+# Packages it reads only the manifests of (and lists), and that nothing in its
+# sources names: before #4032 each was named by a comment, a docstring, a
+# command string or tools/smoke_stack, and the one lint that read every
+# package's *.ritz now runs in tools/ (test_package_syscall_numbers.py).
+# Others the step never opens stay inputs on purpose: goliath (test_build_lib
+# plans it by path), angelo/mausoleum/lexis/sage (dependencies of named
+# packages), tempest/tome/http/squeeze (a whole string literal "tempest" may
+# be a path, as ("spire", ...) is in test_corpus_import_modules_resolve).
+NEVER_READ = frozenset({"nexus", "ritz-lsp", "rzrz", "rzsh", "valet"})

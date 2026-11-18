@@ -10,10 +10,16 @@ ritz0/: most test_ritz1_*.py files and every COMPILERS-parametrized row run
 ritz1 and ritz1_selfhosted, compile ritzlib and runtime/, import build.py and
 tools/, read main.yml (test_no_artifact_skips), every package manifest
 (test_build_lib), and the packages and docs its tests open by path
-(harland, indium, cryptosec, larb, zeus, tome, ritzunit, KERNEL_CONTRACT.md,
-LANGUAGE_SPEC.md, ...).  Measured 2026-11-18 by grepping the suite for the paths
-it opens; the scan below repeats that measurement on every call, so a test that
-starts reading a package makes the package an input in the same commit.
+(harland, indium, cryptosec, larb, zeus, ritzunit, KERNEL_CONTRACT.md,
+LANGUAGE_SPEC.md, ...).
+
+Measured 2026-11-18 (AGAST #4032): strace -f over a full run, attributed per
+test with an audit hook.  The step opened a non-manifest file in 9 packages
+(cryptosec harland indium iris larb prism ritzunit spire zeus); every other
+package only through its manifest and a directory listing, plus one lint that
+read every package's *.ritz (moved to tools/test_package_syscall_numbers.py).
+The text scan below named all 24, mostly from comments, docstrings and
+tools/smoke_stack, so a package-only change never skipped.
 
 So this is an ALLOWLIST that fails safe.  A gate skips the step only when every
 changed path is in one of these categories:
@@ -21,10 +27,11 @@ changed path is in one of these categories:
   * a Markdown file whose basename no ritz0-step source names (the suite opens
     docs by name and never globs *.md; if a source ever does, every .md is an
     input);
-  * a file MODIFIED (not added or deleted: those can change a build plan) in a
-    package under projects/ that no ritz0-step source names by path, directly
-    or through a named package's manifest, and that is not a manifest itself
-    (test_build_lib reads every ritz.toml);
+  * a file MODIFIED (not added or deleted: those can change a build plan, and
+    the step lists every package's directories) in a package under projects/
+    that no ritz0-step source names, directly or through a named package's
+    manifest, and that is not a manifest itself (test_build_lib reads every
+    ritz.toml);
   * a file under an allowlisted top-level dir (TOP_DIRS) that no ritz0-step
     source names.
 
@@ -33,22 +40,32 @@ top-level dir, no base or a base git can't resolve, an empty diff, a git error.
 CI on main passes no base, so main keeps running the step on every push.
 
 "ritz0-step sources" are the tracked text files under projects/ritz except
-docs/, tools/test_*.py (those run in the tools step, not this one) and this
-file (it names what it allows; the step never runs it), plus
-the manifests of the packages they name.
+docs/, tools/smoke_stack/ (the smoke step runs it), tools/test_*.py (those run
+in the tools step, not this one) and this file (it names what it allows; the
+step never runs it), plus the manifests of the packages they name.  A source
+names a package by a path to it ("pkg", /pkg, pkg/...) or a Ritz import of it
+(`import pkg.x`, also inside a Python string holding a program).  Comments
+and docstrings don't name anything: in Python only string literals that are
+not docstrings are scanned (tokenize; a file that won't tokenize is scanned
+whole), in the other formats a line starting with `#` is dropped.
 
-Known limit: a source that walks projects/ for something other than manifests
-(say every *.ritz) would read an unnamed package without naming it.  None does
-today; the file-set rule (A/D run) and main's CI are the backstops.
+The scan is checked, not trusted: ritz0/read_guard.py fails any ritz0 test
+that opens, or hands a process, a file this module would let a gate skip.  CI
+on main runs the whole step, so a test that starts reading an unnamed package
+fails there on its first push.  What neither sees: a child process (ritz1,
+build.py) reading a package it was not handed by path, through RITZ_PATH.
+The scan's import rule covers that for programs in the step's own sources.
 
     python3 tools/ritz0_scope.py <base>      print the verdict; exit 0 = skip
 """
 
 from __future__ import annotations
 
+import io
 import re
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -68,10 +85,34 @@ _SELF = Path(__file__).name
 # What makes a source file part of the scan.
 _SOURCE_SUFFIXES = {".py", ".sh", ".toml", ".ritz", ".yml", ".yaml", ".ll", ".txt", ".json"}
 _SOURCE_NAMES = {"Makefile"}
+# Formats whose comments are whole lines starting with `#` (AGAST #4032).
+_HASH_COMMENTS = {".sh", ".toml", ".ritz", ".yml", ".yaml", ".txt"}
+_HASH_LINE = re.compile(r"^[ \t]*#.*$", re.M)
+
+# Under projects/ritz but never run by the step (AGAST #4032): the smoke
+# step runs the stack; ritz0's tests only lint its text.
+_NOT_RUN = ("tools/smoke_stack/",)
 
 # A source that reads Markdown by pattern rather than by name.
 _MD_WILDCARD = re.compile(
     r"""\*\.md\b|\}\.md\b|suffix\s*[!=]=\s*['"]\.md|endswith\(\s*['"]\.md""")
+# A Markdown basename a source mentions ends here; _md_names reads back to
+# its start (a leading [\w.-]+ class would cost the literal scan: ~1.3 s).
+_MD_END = re.compile(r"\.md(?![\w-])")
+_MD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
+def _md_names(text: str) -> set[str]:
+    """Every *.md basename in `text`, as a whole word: the name the suite
+    would open it by."""
+    names = set()
+    for m in _MD_END.finditer(text):
+        i = m.start()
+        while i > 0 and (text[i - 1] in _MD_CHARS or text[i - 1].isalnum()):
+            i -= 1
+        if i < m.start():
+            names.add(text[i:m.end()])
+    return names
 
 
 def _named(name: str) -> re.Pattern[str]:
@@ -79,8 +120,21 @@ def _named(name: str) -> re.Pattern[str]:
     return re.compile(r"""["'/]""" + re.escape(name) + r"(?![\w-])")
 
 
-def _basename(name: str) -> re.Pattern[str]:
-    return re.compile(r"(?<![\w.-])" + re.escape(name) + r"(?![\w-])")
+def _refs(names) -> tuple[re.Pattern[str], ...]:
+    """Any of `names` as a path: a whole string or a string's first component
+    ("pkg", "pkg/src"; not "pkg --help"), or after a slash (/pkg, $ROOT/pkg:);
+    or as the root of a Ritz import (`import pkg.x`).  Separate patterns, so
+    each starts on a literal the regex engine can scan for quickly."""
+    alt = "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True))
+    return (re.compile(rf"""["']({alt})(?=["'/])"""),
+            re.compile(rf"/({alt})(?![\w-]|:/)"),
+            # No leading \b: it would cost the literal scan; "reimport x"
+            # naming x errs toward running.
+            re.compile(rf"import[ \t]+({alt})(?![\w-])"))
+
+
+def _found(refs, text: str) -> set[str]:
+    return {n for r in refs for n in r.findall(text)}
 
 
 @dataclass
@@ -90,16 +144,26 @@ class Decision:
     lines: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Scope:
+    """What the ritz0 step's sources reach: everything why_safe needs, so a
+    caller (ritz0/read_guard.py) computes it once."""
+    named: frozenset[str]       # packages under projects/ the step reads
+    md_wild: bool               # a source reads *.md by pattern
+    md_names: frozenset[str]    # .md basenames sources mention
+    named_tops: frozenset[str]  # TOP_DIRS sources name
+
+
 def _git(repo: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(repo), *args], check=True,
                           capture_output=True, text=True).stdout
 
 
-def _sources(repo: Path) -> str:
-    """The text of every ritz0-step source, concatenated."""
+def _source_files(repo: Path) -> list[tuple[str, str]]:
+    """(path, text) of every ritz0-step source."""
     out = _git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
                "--", "projects/ritz")
-    texts = []
+    files = []
     for rel in out.split("\0"):
         if not rel:
             continue
@@ -110,13 +174,77 @@ def _sources(repo: Path) -> str:
         if sub[0] == "tools" and len(sub) == 2 and (
                 p.name.startswith("test_") or p.name == _SELF):
             continue
+        if any("/".join(sub).startswith(d) for d in _NOT_RUN):
+            continue
         if p.suffix not in _SOURCE_SUFFIXES and p.name not in _SOURCE_NAMES:
             continue
         try:
-            texts.append((repo / rel).read_text(errors="replace"))
+            files.append((rel, (repo / rel).read_text(errors="replace")))
         except OSError:
             continue  # deleted in the work tree: not read by anything
-    return "\n".join(texts)
+    return files
+
+
+def _sources(repo: Path) -> str:
+    """The text of every ritz0-step source, concatenated."""
+    return "\n".join(t for _, t in _source_files(repo))
+
+
+def _py_strings(text: str) -> str:
+    """The string literals of Python `text`, less docstrings and other bare
+    string statements: the only place a path or an embedded Ritz import can
+    be.  Comments go too.  Text that won't tokenize is returned whole."""
+    out = []
+    try:
+        toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+    except (tokenize.TokenError, SyntaxError, ValueError):
+        return text
+    skip = {tokenize.NL, tokenize.COMMENT, tokenize.INDENT, tokenize.DEDENT}
+    stmt_start = True  # the next significant token begins a statement
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.type in skip:
+            i += 1
+            continue
+        if t.type == tokenize.STRING and stmt_start:
+            # A statement of only strings (a docstring, implicitly joined or
+            # not) has no effect: drop it.
+            j = i
+            while j < len(toks) and toks[j].type in (tokenize.STRING, tokenize.NL,
+                                                     tokenize.COMMENT):
+                j += 1
+            if j >= len(toks) or toks[j].type in (tokenize.NEWLINE, tokenize.ENDMARKER) \
+                    or toks[j].string == ";":
+                i = j
+                continue
+        if t.type == tokenize.STRING:
+            out.append(t.string)
+        elif t.type == getattr(tokenize, "FSTRING_MIDDLE", -1):
+            out.append(t.string)
+        stmt_start = t.type == tokenize.NEWLINE or t.string == ";" or (
+            t.type == tokenize.OP and t.string == ":" and _ends_line(toks, i))
+        i += 1
+    return "\n".join(out)
+
+
+def _ends_line(toks, i: int) -> bool:
+    """A `:` closing a compound statement's header (`def f():`), so what
+    follows on the next line begins a statement."""
+    j = i + 1
+    while j < len(toks) and toks[j].type == tokenize.COMMENT:
+        j += 1
+    return j < len(toks) and toks[j].type in (tokenize.NEWLINE, tokenize.NL)
+
+
+def _code(rel: str, text: str) -> str:
+    """The part of a source that can make the step read something."""
+    suffix = PurePosixPath(rel).suffix
+    if suffix == ".py":
+        return _py_strings(text)
+    if suffix in _HASH_COMMENTS or PurePosixPath(rel).name in _SOURCE_NAMES:
+        return _HASH_LINE.sub("", text)
+    return text
 
 
 def _packages(repo: Path) -> list[str]:
@@ -130,22 +258,50 @@ def _package_manifests(repo: Path, pkg: str) -> str:
     texts = []
     for p in (repo / "projects" / pkg).rglob("*.toml"):
         if p.name in MANIFESTS and "build" not in p.parts:
-            texts.append(p.read_text(errors="replace"))
+            texts.append(_HASH_LINE.sub("", p.read_text(errors="replace")))
     return "\n".join(texts)
 
 
-def named_packages(repo: Path, sources: str | None = None) -> set[str]:
-    """Packages under projects/ the ritz0 step reads: named by path in its
-    sources, or by a named package's manifest (a dependency), to a fixpoint."""
-    text = _sources(repo) if sources is None else sources
+def _direct(files, pkgs) -> set[str]:
+    """Packages the sources name.  The raw text is searched first (cheap); a
+    file is reduced to its code only when that would name something new."""
+    refs = _refs(pkgs) if pkgs else None
+    named: set[str] = set()
+    if refs is None:
+        return named
+    for rel, text in files:
+        if _found(refs, text) - named:
+            named |= _found(refs, _code(rel, text))
+    return named
+
+
+def named_packages(repo: Path, files=None) -> set[str]:
+    """Packages under projects/ the ritz0 step reads: named in its sources,
+    or by a named package's manifest (a dependency), to a fixpoint."""
+    files = _source_files(repo) if files is None else files
     pkgs = _packages(repo)
-    named = {p for p in pkgs if _named(p).search(text)}
+    named = _direct(files, pkgs)
     frontier = set(named)
     while frontier:
         deps = "\n".join(_package_manifests(repo, p) for p in frontier)
         frontier = {p for p in pkgs if p not in named and _named(p).search(deps)}
         named |= frontier
     return named
+
+
+def scope(repo: Path, files=None) -> Scope:
+    """Measure what the step's sources reach, once."""
+    files = _source_files(repo) if files is None else files
+    raw = "\n".join(t for _, t in files)
+    tops = re.compile(r"""["'/](?:""" + "|".join(re.escape(t) for t in TOP_DIRS)
+                      + r")(?![\w-])")
+    code = "\n".join(_code(r, t) for r, t in files if tops.search(t))
+    return Scope(
+        named=frozenset(named_packages(repo, files)),
+        md_wild=bool(_MD_WILDCARD.search(raw)),
+        md_names=frozenset(_md_names(raw)),
+        named_tops=frozenset(t for t in TOP_DIRS if _named(t).search(code)),
+    )
 
 
 def _changes(repo: Path, base: str) -> list[tuple[str, str]]:
@@ -164,16 +320,14 @@ def _changes(repo: Path, base: str) -> list[tuple[str, str]]:
     return sorted((s, p) for p, s in seen.items())
 
 
-def _why_safe(status: str, path: str, text: str, named: set[str],
-              md_wild: bool) -> str | None:
-    """Why `path` cannot reach the step, or None if it may (the default)."""
+def why_safe(status: str, path: str, sc: Scope) -> str | None:
+    """Why a change (`status` A/M/D) to repo-relative `path` cannot reach the
+    step, or None if it may (the default)."""
     p = PurePosixPath(path)
     if path.startswith(".github/"):
         return None
     if p.suffix == ".md":
-        if md_wild:
-            return None
-        if _basename(p.name).search(text):
+        if sc.md_wild or p.name in sc.md_names:
             return None
         return f"{p.name}: a .md no ritz0-step source names"
     if path.startswith(RITZ):
@@ -181,17 +335,17 @@ def _why_safe(status: str, path: str, text: str, named: set[str],
     top = p.parts[0]
     if top == "projects" and len(p.parts) >= 3:
         pkg = p.parts[1]
-        if pkg in named or p.name in MANIFESTS or status != "M":
+        if pkg in sc.named or p.name in MANIFESTS or status != "M":
             return None
         return f"modified in projects/{pkg}/, which no ritz0-step source reads"
     if top in TOP_DIRS and len(p.parts) >= 2:
-        if _named(top).search(text):
+        if top in sc.named_tops:
             return None
         return f"under {top}/, which no ritz0-step source names"
     return None
 
 
-def inputs_summary(named: set[str]) -> str:
+def inputs_summary(named) -> str:
     pkgs = ",".join(sorted(named))
     return (f"{RITZ}, .github/, root files, every ritz.toml/rz.toml, "
             f"projects/{{{pkgs}}}/, .md files ritz0 sources name")
@@ -207,23 +361,21 @@ def decide(repo: Path, base: str | None) -> Decision:
         return Decision(False, [f"running {STEP}: base {base!r} does not resolve ({e})"])
     try:
         changes = _changes(repo, sha)
-        text = _sources(repo)
-        named = named_packages(repo, text)
+        sc = scope(repo)
     except (subprocess.CalledProcessError, OSError) as e:
         why = f"could not diff against base {sha[:7]} ({e})"
         return Decision(False, [f"running {STEP}: {why}"])
     if not changes:
         why = f"nothing differs from base {sha[:7]} (a skip would prove nothing)"
         return Decision(False, [f"running {STEP}: {why}"])
-    md_wild = bool(_MD_WILDCARD.search(text))
-    why = [(s, p, _why_safe(s, p, text, named, md_wild)) for s, p in changes]
+    why = [(s, p, why_safe(s, p, sc)) for s, p in changes]
     reach = [(s, p) for s, p, w in why if w is None]
     if reach:
         s, p = reach[0]
         more = f" (and {len(reach) - 1} more)" if len(reach) > 1 else ""
         head = f"running {STEP}: {p} ({s}) may reach it{more} (base {sha[:7]})"
         return Decision(False, [head, *(f"  may reach it: {p} ({s})" for s, p in reach)])
-    head = f"SKIPPED {STEP}: no change under {inputs_summary(named)} (base {sha[:7]})"
+    head = f"SKIPPED {STEP}: no change under {inputs_summary(sc.named)} (base {sha[:7]})"
     return Decision(True, [head, *(f"  cannot reach it: {p} ({s}): {w}" for s, p, w in why)])
 
 

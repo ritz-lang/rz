@@ -47,6 +47,7 @@ ENTRY_POINTS = {
     "spawn_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "cost_meter.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "only_files.py": "pytest plugin; conftest.py names it in pytest_plugins",
+    "read_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
 }
 
 # Non-test Python outside ritz0/ that runs with ritz0/ on sys.path.  "" is the

@@ -146,7 +146,7 @@ import batching
 import fast_link
 import ritz0_inproc
 
-pytest_plugins = ["spawn_guard", "cost_meter", "only_files"]
+pytest_plugins = ["spawn_guard", "cost_meter", "only_files", "read_guard"]
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"

@@ -500,6 +500,17 @@ Rules:
    that.  Run the cases in one session and read each verdict from
    `--junitxml` (`test_spawn_guard.py`).  AGAST #3898 took four such files
    from ~120 to ~37 CPU-s.
+9. **Read a package by naming its path, and lint every package in `tools/`.**
+   A gate skips this whole step when no change can reach it
+   (`tools/ritz0_scope.py`), and it finds what can by scanning this step's
+   code for package paths (`PROJECTS / "harland"`, `import zeus.x`; not
+   comments or docstrings).  `ritz0/read_guard.py` fails a test that opens,
+   lists or hands a child a path the scope would skip, naming it: name the
+   package by path in the test.  A check that walks every package (as the
+   syscall-number lint did, AGAST #4032) belongs in `tools/`, whose step
+   always runs; here it would make every package an input, and a
+   package-only gate could never skip ~7 minutes.  `RITZ_READ_GUARD=0`
+   turns the guard off for a local run.
 
 ---
 
