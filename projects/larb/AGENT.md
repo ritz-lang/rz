@@ -425,7 +425,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>
 |----------|----------|
 | Language Spec | `projects/ritz/docs/LANGUAGE_SPEC.md` |
 | Design Decisions | `larb/docs/DESIGN_DECISIONS.md` |
-| Style Guide | `projects/ritz/docs/STYLE.md` |
+| Ritz Standard (idioms and style) | `projects/ritz/docs/STANDARD.md` |
 | Ecosystem Overview | `projects/ritz/docs/ECOSYSTEM.md` |
 | ritzlib Reference | `projects/ritz/docs/STDLIB_REFERENCE.md` |
 

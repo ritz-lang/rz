@@ -17148,7 +17148,7 @@ class LLVMEmitter:
                               right_val: ir.Value) -> Optional[ir.Value]:
         """Lower `==`/`!=` on a payload-less enum to a tag comparison.
 
-        docs/STYLE.md documents `token.kind == TokenKind.Ident` as the idiom
+        docs/STYLE.md (now docs/STANDARD.md) documented `token.kind == TokenKind.Ident` as the idiom
         to prefer over `match` for a single-variant test, and it had never
         worked: ritz0 emitted `icmp eq %"enum.mod.TokenKind"` — invalid IR,
         because `icmp` takes integers and pointers only. It survived because

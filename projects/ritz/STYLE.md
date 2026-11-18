@@ -1,25 +1,11 @@
 # Moved: Ritz Style Guide
 
-This document now lives at [`docs/STYLE.md`](docs/STYLE.md).
+The Ritz standard is now [`docs/STANDARD.md`](docs/STANDARD.md) (AGAST #1344).
 
-It was retired on 2026-09-12. Two style guides were in the tree claiming to be
-canonical; `docs/STYLE.md` is the gated one — it is listed in `DOC_EXAMPLE_DOCS`
-in the Makefile, so every fenced ```ritz block in it is compiled by
-`tools/check_doc_examples.py` on each build. This one, last touched 2026-02-11,
-was not, and only 3 of its 20 examples compiled.
+This file was retired on 2026-09-12 in favour of `docs/STYLE.md`, which was
+itself retired on 2026-11-18 in favour of `docs/STANDARD.md`. This file had
+never been compile-gated, and only 3 of its 20 examples compiled. On every
+point where it disagreed with the gated guide, it was the one that was wrong.
 
-On every point where the two disagreed, this document was the wrong one. It
-taught `&mut Self` method receivers, said bare `"..."` was a heap-allocated
-`String` (it is a `StrView`), listed `s"..."` as implemented (removed by AGAST
-#98, and `make check-no-s-strings` fails the build if one reappears), claimed an
-implicit `String` → `*u8` coercion, showed `println` with `{}` interpolation
-(there is no `println`, and interpolation is a `print`-builtin-only facility),
-showed brace blocks such as `if done { break }` in an indentation-only language,
-and pointed at `examples/48_ritzfmt` for ritzfmt, which actually lives at
-`examples/tier5_async/48_ritzfmt`.
-
-Its only genuinely project-specific content — line length, blank lines and
-section banners — is already covered by [`docs/STYLE.md` §2](docs/STYLE.md#2-formatting).
-
-This stub exists only so that existing links do not break silently. Please update
-your link; nothing further will be added here.
+This stub exists so that old links don't break silently. Update the link;
+nothing more will be added here.

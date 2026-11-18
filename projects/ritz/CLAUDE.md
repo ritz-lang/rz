@@ -111,10 +111,10 @@ have not been:
 
 - `docs/LANGUAGE_SPEC.md` - **the language standard. Start here.**
 - `docs/STDLIB_REFERENCE.md` - ritzlib reference
-- `docs/STYLE.md` - style guide
+- `docs/STANDARD.md` - **the Ritz standard**: idioms (Part I) and conventions (Part II), each rule marked ENFORCED, CHECKED or ADVISORY. `docs/STYLE.md` and `STYLE.md` are pointers to it
 - `docs/ECOSYSTEM.md` - ecosystem overview
 
-These four moved here from `projects/larb/docs/` on 2026-09-03 (AGAST #1311):
+The other three moved here from `projects/larb/docs/` on 2026-09-03 (AGAST #1311):
 living outside `projects/ritz` is why they went seven months without a migration
 pass.
 

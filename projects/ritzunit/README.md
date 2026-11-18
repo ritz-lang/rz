@@ -42,7 +42,7 @@ directly. A declaration it never imports is a false claim, and
 ## Usage
 
 Mark tests with `[[test]]`. (`@test` was the old syntax and is no longer
-correct — see `projects/ritz/docs/STYLE.md`.)
+correct — see `projects/ritz/docs/STANDARD.md`, S-TEST-1.)
 
 ```ritz
 import ritzlib.str { strlen }

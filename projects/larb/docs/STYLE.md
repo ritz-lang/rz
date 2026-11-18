@@ -1,6 +1,6 @@
 # Moved: Ritz Style Guide
 
-This document now lives at [`projects/ritz/docs/STYLE.md`](../../ritz/docs/STYLE.md).
+The Ritz standard now lives at [`projects/ritz/docs/STANDARD.md`](../../ritz/docs/STANDARD.md) (AGAST #1344).
 
 It was moved there on 2026-09-03 (AGAST #1311). It had sat in `projects/larb/docs/`
 since February 2026, describing pre-RERITZ syntax that the compiler rejects outright —

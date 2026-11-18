@@ -56,7 +56,7 @@ check-no-s-strings:
 DOC_EXAMPLE_DOCS := \
 	docs/LANGUAGE_SPEC.md \
 	docs/STDLIB_REFERENCE.md \
-	docs/STYLE.md \
+	docs/STANDARD.md \
 	docs/ECOSYSTEM.md
 
 .PHONY: check-doc-examples

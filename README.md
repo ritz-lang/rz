@@ -192,7 +192,7 @@ built since AGAST #3689 (2026-11-16), but its binary segfaults at startup
 ## Documentation
 
 - [Language Specification](projects/ritz/docs/LANGUAGE_SPEC.md)
-- [Style Guide](projects/ritz/docs/STYLE.md)
+- [Ritz Standard: idioms and style](projects/ritz/docs/STANDARD.md)
 - [Ecosystem Overview](projects/ritz/docs/ECOSYSTEM.md)
 - [Standard Library Reference](projects/ritz/docs/STDLIB_REFERENCE.md)
 - [Stack Matrix — bootstrap layering](docs/STACK_MATRIX.md)

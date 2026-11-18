@@ -61,6 +61,7 @@ LOCAL_MODULES = {
     "ritz1_unit",
     "smoke",
     "smoke_stack",
+    "standard_report",  # docs/STANDARD.md's conformance report (AGAST #1344)
     "ritzgen_py",
 }
 

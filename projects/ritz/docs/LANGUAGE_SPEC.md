@@ -4162,7 +4162,7 @@ fn main() -> i32
 
 `f(a < b, c > (d))` lexes exactly like a call to `a<b, c>(d)`. ritz1 reads a
 list of two or more type arguments as a call only if none of them is a bare
-lowercase identifier: by naming convention (`docs/STYLE.md`: types are
+lowercase identifier: by naming convention (`docs/STANDARD.md` S-NAME-1, S-NAME-2: types are
 PascalCase, variables snake_case) such a name is a value, so
 the example above stays two comparison arguments. ritz0 does not make this
 distinction yet; it always reads `<...>(` as type arguments.
