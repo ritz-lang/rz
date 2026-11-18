@@ -1,0 +1,207 @@
+# ritz1/src/type_name_check.ritz - a type name that names nothing (AGAST #3932)
+#
+# `struct P` / `name: Nope` and `let q: Nope = 0` emitted `%Nope` IR clang
+# refused with no source location ("use of undefined type named 'Nope'").
+# Every compiler now says "unknown type `Nope`" where the name is written,
+# the words #3264 uses for an `impl` on one.  ritz0's half is
+# ritz0/type_names.py.
+#
+# Judged: a struct's fields, a global's type, and a fn's params, return type
+# and annotated `let` / `var` locals, generic templates included (with their
+# own type parameters, and an impl's, in scope).  Known: a struct or enum of
+# the merged module (an import counts), an alias, a primitive, a SIMD vector,
+# a built-in (`StrView`, `Span`, `Option`, `Result`), `Self` and `void`.
+#
+# Only a name the source spells is judged: type_name_written_at locates it
+# (ast_helpers.ritz records each one type_named sees).  A name the compiler
+# builds, such as a generic instance's `Vec$u8`, has no entry; a generic
+# argument (`Option<Nope>`), an enum payload and a cast's type are not judged
+# here yet (AGAST #4021).  Each written name is reported once.
+#
+# A slot is judged only when its name is written after the declaration's own
+# name, on its line (a return type: anywhere after the fn's name).  The parser
+# leaves the last type name it saw in its state, and a slot it doesn't name
+# can inherit it: `f: fn(i64) -> i64` after `-> @&T` kept that `T`, and a
+# `-> *u8` the last name before it.  Such a name was written earlier, so it
+# fails the test; where it was written, it was judged.
+#
+# Runs after imports merge and before monomorphisation, as binder_check does.
+
+import ritzlib.sys
+import ritzlib.io
+import ast
+import ast_helpers
+import diag
+import emitter_core
+
+# The type parameters in scope: the item's own, and an impl's around a method.
+var g_tn_outer: *TypeParam = null
+var g_tn_inner: *TypeParam = null
+
+fn tn_in_params(tp: *TypeParam, name: *u8, len: i32) -> i32
+    var cur: *TypeParam = tp
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return 1
+        cur = cur.next
+    0
+
+fn tn_builtin(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"Self", 4) == 1 or name_eq(name, len, c"void", 4) == 1
+        return 1
+    if name_eq(name, len, c"StrView", 7) == 1 or name_eq(name, len, c"Span", 4) == 1
+        return 1
+    (name_eq(name, len, c"Option", 6) == 1 or name_eq(name, len, c"Result", 6) == 1) as i32
+
+fn tn_declared(m: *Module, name: *u8, len: i32) -> i32
+    var st: *StructDef = m.structs
+    while st != null
+        if name_eq(st.name, st.name_len, name, len) == 1
+            return 1
+        st = st.next
+    (enum_find(name, len) >= 0 or type_alias_declared(name, len) == 1) as i32
+
+fn tn_known(m: *Module, name: *u8, len: i32) -> i32
+    if is_primitive_type_name(name, len) == 1 or is_simd_vector_type_name(name, len) == 1
+        return 1
+    if tn_builtin(name, len) == 1
+        return 1
+    if tn_in_params(g_tn_inner, name, len) == 1 or tn_in_params(g_tn_outer, name, len) == 1
+        return 1
+    tn_declared(m, name, len)
+
+const TN_SCAN_MAX: i64 = 4096
+
+# 1 when `ty` is written after `decl` in the same source: on its line if
+# `same_line`, else within TN_SCAN_MAX bytes.  Never reads past the source's NUL.
+fn tn_written_after(decl: *u8, ty: *u8, same_line: i32) -> i32
+    if decl == null
+        return 0
+    var i: i64 = 0
+    while i < TN_SCAN_MAX
+        if decl + i == ty
+            return 1
+        let c: u8 = *(decl + i)
+        if c == 0 or (same_line == 1 and c == 10)
+            return 0
+        i += 1
+    0
+
+# 1 if the type name at `name`, written after `decl` (tn_written_after), is
+# unknown; reported at the name.
+fn tn_judge(m: *Module, decl: *u8, same_line: i32, name: *u8, len: i32) -> i32
+    if name == null or len <= 0
+        return 0
+    if tn_written_after(decl, name, same_line) == 0
+        return 0
+    if tn_known(m, name, len) == 1
+        return 0
+    let at: *TypeNameAt = type_name_written_at(name)
+    if at == null or at.reported == 1
+        return 0
+    at.reported = 1
+    diag_error_at(at.file, diag_span(at.line, at.col))
+    eprints_cstr(c"unknown type `")
+    sys_write(2, name, len as i64)
+    eprints_cstr(c"`\n")
+    1
+
+fn tn_arms(m: *Module, arms: *MatchArm) -> i32
+    var errors: i32 = 0
+    var arm: *MatchArm = arms
+    while arm != null
+        errors = errors + tn_stmts(m, arm.body_stmts)
+        errors = errors + tn_expr(m, arm.body)
+        arm = arm.next
+    errors
+
+# Only a match or an if/else expression holds statements (binder_check.ritz).
+fn tn_expr(m: *Module, e: *Expr) -> i32
+    if e == null
+        return 0
+    if e.kind == EXPR_MATCH or e.kind == EXPR_IF
+        return tn_arms(m, e.args as *MatchArm)
+    0
+
+fn tn_stmts(m: *Module, first: *Stmt) -> i32
+    var errors: i32 = 0
+    var s: *Stmt = first
+    while s != null
+        if s.kind == STMT_VAR_DECL
+            if s.var_declared_type != TYPE_VOID
+                errors = errors + tn_judge(m, s.var_name, 1, s.var_type_name, s.var_type_name_len)
+            errors = errors + tn_expr(m, s.var_init)
+        else if s.kind == STMT_FOR
+            errors = errors + tn_stmts(m, s.for_body)
+        else if s.kind == STMT_IF
+            errors = errors + tn_expr(m, s.if_cond)
+            errors = errors + tn_stmts(m, s.if_then)
+            errors = errors + tn_stmts(m, s.if_else)
+        else if s.kind == STMT_WHILE
+            errors = errors + tn_expr(m, s.while_cond)
+            errors = errors + tn_stmts(m, s.while_body)
+        else if s.kind == STMT_LOOP or s.kind == STMT_DEFER or s.kind == STMT_UNSAFE
+            errors = errors + tn_stmts(m, s.while_body)
+        else if s.kind == STMT_MATCH
+            errors = errors + tn_arms(m, s.if_then as *MatchArm)
+        else if s.kind == STMT_RETURN
+            errors = errors + tn_expr(m, s.return_value)
+        else if s.kind == STMT_EXPR
+            errors = errors + tn_expr(m, s.expr)
+        else if s.kind == STMT_ASSIGN
+            errors = errors + tn_expr(m, s.assign_value)
+        s = s.next
+    errors
+
+fn tn_fn(m: *Module, f: *FnDef) -> i32
+    g_tn_inner = f.type_params
+    var errors: i32 = tn_judge(m, f.name, 0, f.return_type_name, f.return_type_name_len)
+    var p: *Param = f.params
+    while p != null
+        errors = errors + tn_judge(m, p.name, 1, p.param_type_name, p.param_type_name_len)
+        p = p.next
+    errors = errors + tn_stmts(m, f.body)
+    g_tn_inner = null
+    errors
+
+fn tn_struct(m: *Module, st: *StructDef) -> i32
+    g_tn_inner = st.type_params
+    var errors: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        errors = errors + tn_judge(m, f.name, 1, f.field_type_name, f.field_type_name_len)
+        errors = errors + tn_judge(m, f.name, 1, f.array_elem_type_name, f.array_elem_type_name_len)
+        f = f.next
+    g_tn_inner = null
+    errors
+
+fn tn_global(m: *Module, g: *GlobalVarDef) -> i32
+    var errors: i32 = tn_judge(m, g.name, 1, g.type_name, g.type_name_len)
+    errors = errors + tn_judge(m, g.name, 1, g.pointee_type_name, g.pointee_type_name_len)
+    errors + tn_judge(m, g.name, 1, g.array_elem_type_name, g.array_elem_type_name_len)
+
+# Errors reported; main stops the compile on any.
+pub fn refuse_unknown_type_names(m: *Module) -> i32
+    var errors: i32 = 0
+    var st: *StructDef = m.structs
+    while st != null
+        errors = errors + tn_struct(m, st)
+        st = st.next
+    var g: *GlobalVarDef = m.globals
+    while g != null
+        errors = errors + tn_global(m, g)
+        g = g.next
+    var f: *FnDef = m.functions
+    while f != null
+        errors = errors + tn_fn(m, f)
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        g_tn_outer = ib.type_params
+        var method: *FnDef = ib.methods
+        while method != null
+            errors = errors + tn_fn(m, method)
+            method = method.next
+        g_tn_outer = null
+        ib = ib.next
+    errors

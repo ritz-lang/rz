@@ -50,7 +50,7 @@ input.ritz
   │         a bare call to an async fn is refused (§16.2)
   ▼
 [pre-mono checks]  impls on unknown/built-in types (main), binder_check,
-  │                reachability — judged once per generic fn, used or not
+  │                type_name_check, reachability — judged once per generic fn, used or not
   ▼
 [monomorph] generic_infer fills in type args from call arguments;
   │         monomorph specialises generic fns/structs and (with
@@ -254,6 +254,10 @@ still run mid-lowering on `*EmitterState`, and
 - `tail_value` — a `-> T` fn must not reach its end without a value. Its
   divergence walk (`tail_stmts_diverge`) is also read by `reachability` and
   `emitter_stmt`.
+
+- `type_name_check` — a written type name must name a type: "unknown type
+  `Nope`" at the name (#3932). Run by main over the whole module before
+  monomorphisation; `type_named` records where each name was written.
 
 **Emitter**
 

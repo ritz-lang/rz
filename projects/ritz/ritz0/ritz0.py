@@ -35,6 +35,7 @@ from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
 from builtin_types import check_builtin_impls, check_unknown_impl_targets
 from impl_placement import check_impl_placement
+from type_names import check_unknown_type_names
 from reachability import check_reachable
 from move_checker import MoveChecker, OwnershipError
 from monomorph import infer_struct_lit_args
@@ -302,6 +303,13 @@ def _eval_array_sizes(ctx: _Compile) -> bool:
     return _report(evaluate_array_sizes(ctx.module), "Const eval error: ")
 
 
+def _check_type_names(ctx: _Compile) -> bool:
+    """A written type name nothing declares or imports (AGAST #3932): after
+    the merge, so an import counts, and after _check_impl_targets, which
+    judges an impl's target."""
+    return _report(check_unknown_type_names(ctx.module, ctx.module_names), "Error: ")
+
+
 def _check_binders(ctx: _Compile) -> bool:
     """A local named like a const, global or variant (AGAST #2407). Before
     monomorphisation, so a generic fn is judged whether or not it's used."""
@@ -483,6 +491,7 @@ PASSES = (
     _check_impl_targets,
     _rewrite_enum_from,
     _eval_array_sizes,
+    _check_type_names,
     _check_binders,
     _check_reachable,
     _check_names,

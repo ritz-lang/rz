@@ -478,6 +478,8 @@ struct LineBounds
 Owned, growable UTF-8 string. Always null-terminated for C interop.
 
 ```ritz
+import ritzlib.gvec
+
 struct String
     data: Vec<u8>    # Underlying byte storage
 ```
@@ -555,6 +557,16 @@ struct String
 Hash map for i64 keys and i64 values using open addressing with linear probing.
 
 ```ritz
+enum Slot
+    Empty   # never used
+    Full    # holds a live key/value
+    Tomb    # held a key that was removed
+
+struct HashMapEntryI64
+    key: i64
+    value: i64
+    state: Slot
+
 struct HashMapI64
     entries: *HashMapEntryI64
     cap: i64
@@ -1691,6 +1703,8 @@ own. For many concurrent tasks, use [async.tasks](#asynctasks).
 - `POLL_PENDING`: -1. A poll function returns this while it is suspended; any other value is Ready.
 
 ```ritz
+import ritzlib.uring
+
 struct Runtime
     ring: IoUring
     initialized: i32
@@ -1741,6 +1755,9 @@ Multi-task async executor with io_uring for concurrent servers.
 **Task States**: `TASK_IDLE`, `TASK_WAITING`, `TASK_READY`
 
 ```ritz
+import ritzlib.uring
+import ritzlib.iovec
+
 struct Task
     id: i64
     state: i32
@@ -2088,6 +2105,22 @@ Ritz's clothing (`*u8` strings, `i32` booleans, errors printed from inside
 `args_parse`) and stays only until its callers are ported.
 
 ```ritz
+struct OptDef
+    short_name: u8           # Single char (-v), 0 if none
+    long_name: *u8           # Long name (--verbose), null if none
+    value_name: *u8          # Name of value for help (NUM), null for flags
+    description: *u8         # Help text
+    default_value: *u8       # Default value string, null if required
+    opt_type: i32            # OPT_FLAG or OPT_VALUE
+    is_set: i32              # Was this option provided?
+    value: *u8               # The value (for OPT_VALUE) or "1"/"0" (for OPT_FLAG)
+
+struct PosDef
+    name: *u8                # Name for help (FILE)
+    description: *u8         # Help text
+    min_count: i32           # Minimum required (0 = optional)
+    max_count: i32           # Maximum allowed (-1 = unlimited)
+
 struct ArgParser
     program_name: *u8
     description: *u8
@@ -2356,6 +2389,42 @@ ELF binary format parser for extracting symbols.
 - `STT_NOTYPE`, `STT_FUNC`
 
 ```ritz
+struct Elf64_Ehdr
+    e_ident: [16]u8
+    e_type: i16
+    e_machine: i16
+    e_version: i32
+    e_entry: i64
+    e_phoff: i64
+    e_shoff: i64
+    e_flags: i32
+    e_ehsize: i16
+    e_phentsize: i16
+    e_phnum: i16
+    e_shentsize: i16
+    e_shnum: i16
+    e_shstrndx: i16
+
+struct Elf64_Shdr
+    sh_name: i32
+    sh_type: i32
+    sh_flags: i64
+    sh_addr: i64
+    sh_offset: i64
+    sh_size: i64
+    sh_link: i32
+    sh_info: i32
+    sh_addralign: i64
+    sh_entsize: i64
+
+struct Elf64_Sym
+    st_name: i32
+    st_info: u8
+    st_other: u8
+    st_shndx: i16
+    st_value: i64
+    st_size: i64
+
 struct ElfReader
     data: *u8
     size: i64

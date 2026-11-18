@@ -2730,10 +2730,53 @@ pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
             return TYPE_F32
         if *(name + 0) == 102 and *(name + 1) == 54 and *(name + 2) == 52  # 'f','6','4'
             return TYPE_F64
+    note_type_name_at(p, name)
     # Store the type name in parser state for later retrieval by fn_def_new
     p.last_type_name = name
     p.last_type_name_len = len
     return TYPE_STRUCT
+
+# AGAST #3932: where each type name type_named saw was written, keyed by the
+# name's pointer into the source, which the AST's type-name slots keep.
+# type_name_check.ritz reads it to locate "unknown type `Nope`".  An
+# alternative the parser backtracks out of (`a < b` tried as `a<b>(..)`)
+# leaves its entry behind; nothing in the AST points at it, so it is never
+# looked up.  A name the compiler builds (`Vec$u8`) has no entry.
+struct TypeNameAt
+    name: *u8
+    line: i32
+    col: i32
+    file: *u8
+    reported: i32
+    next: *TypeNameAt
+
+var g_type_name_at: *TypeNameAt = null
+
+fn note_type_name_at(p: *Parser, name: *u8)
+    # The action runs just past the IDENT it names.
+    if p.pos <= 0 or p.pos > p.token_count
+        return
+    let t: *Token = p.tokens + (p.pos - 1)
+    if t.start != name
+        return
+    let at: *TypeNameAt = parser_alloc(p, sizeof(TypeNameAt)) as *TypeNameAt
+    at.name = name
+    at.line = t.line
+    at.col = t.col
+    at.file = parse_file_copy_shared(p)
+    at.reported = 0
+    at.next = g_type_name_at
+    g_type_name_at = at
+
+# Where the type name at `name` was written; null for one no source spells.
+# Linear, so asked only about a name already found unknown.
+pub fn type_name_written_at(name: *u8) -> *TypeNameAt
+    var at: *TypeNameAt = g_type_name_at
+    while at != null
+        if at.name == name
+            return at
+        at = at.next
+    null
 
 # Capture the return type name after parsing return_type but before parsing block.
 # This prevents last_type_name from being overwritten by type_spec calls in the function body.

@@ -313,4 +313,6 @@ def test_ritz0_reads_the_comparison_pair_as_a_call(tmp_path):
         "ritz0", tmp_path, "cmp_ritz0", COMPARISONS["ticket_comparison_pair"]
     )
     assert comp.returncode != 0
-    assert "called with 1 argument" in comp.stdout + comp.stderr
+    # Its type args `<b, c>` name locals, not types: since AGAST #3932 that is
+    # the first error, before the arity one ("called with 1 argument").
+    assert "unknown type `b`" in comp.stdout + comp.stderr

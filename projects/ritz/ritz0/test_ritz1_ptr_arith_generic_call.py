@@ -93,8 +93,11 @@ def test_ptr_ptr_call_results_stride_by_pointer(run_with, compiler):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 def test_unknown_element_size_is_a_located_error(compile_with, compiler):
-    """`get() + i` with `get() -> *Opaque` was a silent raw byte add."""
-    prog = ("extern fn get() -> *Opaque\n\npub fn main() -> i32\n    let i: i64 = 1\n"
+    """`get() + i` with `get() -> *Opaque` was a silent raw byte add.
+
+    An undeclared `Opaque` is "unknown type" at its name since AGAST #3932;
+    a `*void` still has no element size."""
+    prog = ("extern fn get() -> *void\n\npub fn main() -> i32\n    let i: i64 = 1\n"
             "    let p: i64 = (get() + i) as i64\n    return 0\n")
     comp, ll, _ = compile_with(compiler, "opaque", prog)
     assert comp.returncode != 0

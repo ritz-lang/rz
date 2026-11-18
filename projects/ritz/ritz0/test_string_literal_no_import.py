@@ -8,7 +8,9 @@ a bare ValueError (a Python traceback) and ritz1 stored the literal's
 refused with only the unlocated "emitted 1 unlowerable expression(s)".
 
 The rule: all three compilers refuse it at the literal, `file:line:col`, with
-the same words, naming the fix.
+the same words, naming the fix.  Since AGAST #3932 the annotation is refused
+first: `String` names nothing without the import, so the one error is
+"unknown type `String`" at the type's name.
 
 With the import it is refused too (LARB R49, AGAST #3361, #3393): a literal
 is a `StrView`, or a `*u8` in a `*u8` slot, and nothing else converts
@@ -25,7 +27,6 @@ from pathlib import Path
 
 import pytest
 
-from emitter_llvmlite import STRING_LIT_NO_IMPORT
 from ritz0_inproc import run_ritz0
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
@@ -33,7 +34,7 @@ RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
-# The literal is at line 2, column 21 in each row.
+# The type is at line 2, column 12 in each row (the literal at column 21).
 _TAIL = "    0\n"
 REJECTED = {
     "let": 'fn main() -> i32\n    let s: String = "abc"\n' + _TAIL,
@@ -82,10 +83,11 @@ def test_string_literal_without_the_import_is_a_located_error(request, tmp_path,
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
     assert "Traceback" not in out, out
-    # The first diagnostic is ours, at the literal.
-    first = next(ln for ln in out.splitlines() if "error" in ln.lower())
-    assert "unit.ritz:2:21:" in first, f"{compiler}, {name}:\n{out[-1500:]}"
-    assert STRING_LIT_NO_IMPORT in first, f"{compiler}, {name}:\n{out[-1500:]}"
+    # One diagnostic, at the type (AGAST #3932).
+    errors = [ln for ln in out.splitlines() if "error" in ln.lower()]
+    assert len(errors) == 1, f"{compiler}, {name}:\n{out[-1500:]}"
+    assert "unit.ritz:2:12:" in errors[0], f"{compiler}, {name}:\n{out[-1500:]}"
+    assert "unknown type `String`" in errors[0], f"{compiler}, {name}:\n{out[-1500:]}"
 
 
 @pytest.mark.integration

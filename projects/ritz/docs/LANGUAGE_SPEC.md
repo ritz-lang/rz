@@ -3764,7 +3764,12 @@ let c: i64 = match n
 
 ### 9.1 Definition
 
+A field's type is a type in scope: `String` comes from `ritzlib.string`, and a
+type name that names nothing is "unknown type `Nope`" at the name (AGAST #3932).
+
 ```ritz
+import ritzlib.string
+
 struct Point
     x: i32
     y: i32
