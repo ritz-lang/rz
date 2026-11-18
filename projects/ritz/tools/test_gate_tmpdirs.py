@@ -200,3 +200,61 @@ def test_shared_host_script_scratch_is_mktemp_removed_by_its_own_trap():
         "a script run on a shared host takes scratch from `mktemp -d` and "
         f"removes it in its own EXIT trap (AGAST #3183): {offenders}"
     )
+
+
+# --- example programs: no fixed /tmp file name (AGAST #4207) -----------------
+#
+# The gate runs every example binary in regression Stages 1, 3 and 4, and two
+# gates may run on one host at once.  54_async_fs wrote, read and unlinked
+# c"/tmp/ritz_async_test.txt": one run's unlink landed between another's write
+# and read, and Stage 1 went red on commits that never touched it.  An example
+# builds its scratch path at run time -- a /tmp (or $TMPDIR) prefix finished
+# with the pid -- so a string literal may hold a prefix ("/tmp/ritz_x_") but
+# never a complete file name.
+
+# A string literal holding a complete /tmp file name: "/tmp/<name>" whose last
+# character does not leave it open for a pid/suffix (`_`, `-` or `/`).
+RITZ_FIXED_TMP = re.compile(r'"/tmp/[^"]*[^_/"-]"')
+
+
+def ritz_fixed_tmp_names(text: str):
+    """[(line_no, line)] whose code (not a `#` comment) names a fixed /tmp file."""
+    return [
+        (n, line.strip())
+        for n, line in enumerate(text.splitlines(), 1)
+        if not line.lstrip().startswith("#") and RITZ_FIXED_TMP.search(line)
+    ]
+
+
+@pytest.mark.unit
+def test_ritz_fixed_tmp_detector():
+    flagged = [
+        '    let path = c"/tmp/ritz_async_test.txt"',
+        '    open(c"/tmp/nonexistent_file_xyz123.txt", O_RDONLY)',
+        '    let d = "/tmp/ritz_dir"',
+    ]
+    passed = [
+        '    strcpy(buf, c"/tmp/ritz_test_wc_")',            # pid appended
+        '    var s: String = string_from_strview("/tmp/ritz_x-")',
+        '        dir = "/tmp"',                                # a dir, not a file
+        '# Build "/tmp/ritz_test_wc_<pid>.txt" into buf',     # a comment
+    ]
+    assert all(ritz_fixed_tmp_names(s) for s in flagged)
+    assert not any(ritz_fixed_tmp_names(s) for s in passed)
+
+
+@pytest.mark.unit
+def test_examples_name_no_fixed_tmp_file():
+    sources = [
+        f for f in sorted((RITZ / "examples").rglob("*.ritz")) if "/build/" not in str(f)
+    ]
+    assert len(sources) > 100, "the example glob has rotted"
+    offenders = {
+        str(f.relative_to(RITZ)): hits
+        for f in sources
+        if (hits := ritz_fixed_tmp_names(f.read_text()))
+    }
+    assert offenders == {}, (
+        "examples run concurrently on one host: build the scratch path from "
+        f"$TMPDIR and the pid, never a fixed /tmp name (AGAST #4207): {offenders}"
+    )
