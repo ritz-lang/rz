@@ -302,7 +302,43 @@ Proper malloc/free with size classes (no need to track sizes when freeing).
 | `malloc` | `fn(size: i64) -> *u8` | Allocate size bytes |
 | `free` | `fn(ptr: *u8)` | Free pointer (no size needed) |
 | `realloc` | `fn(ptr: *u8, new_size: i64) -> *u8` | Reallocate to new size |
-| `calloc` | `fn(count: i64, size: i64) -> *u8` | Allocate and zero-initialize |
+| `calloc` | `fn(count: i64, size: i64) -> *u8` | Allocate and zero-initialize; null if `count * size` overflows |
+
+#### Page Source
+
+Every allocator above gets its pages from one page source and returns them
+there. The default is the target's anonymous mmap (`sys_mmap_anon` /
+`sys_munmap`). A kernel, which has no mmap, installs its own frame allocator,
+and a test can install one that fails. `map(len)` returns `len` zeroed
+read-write bytes, or a value `mmap_failed` accepts (null or `-errno`); every
+allocator then returns null.
+
+```ritz
+import ritzlib.memory
+
+fn no_pages(len: i64) -> *u8
+    return -12 as *u8          # -ENOMEM
+
+fn give_back(p: *u8, len: i64) -> i32
+    return 0
+
+fn main() -> i32
+    let prev: PageSource = page_source_set(PageSource { map: no_pages, unmap: give_back })
+    let p: *u8 = malloc(8192)  # null: the source had no pages
+    page_source_set(prev)
+    if p == null
+        return 0
+    return 1
+```
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `page_source_set` | `fn(src: PageSource) -> PageSource` | Install `src`; returns the source it replaces |
+| `page_source_get` | `fn() -> PageSource` | The installed source (the mmap default until set) |
+| `mmap_failed` | `fn(p: *u8) -> bool` | True for null and `-errno` (any `p <= 0`) |
+
+Install a source before the first allocation, or restore the previous one
+before anything allocated under it is freed.
 
 The `heap e` expression (see [heap](#heap)) allocates with this `malloc`, so a
 module using it needs `ritzlib.memory` loaded, imported directly or not. ritz1

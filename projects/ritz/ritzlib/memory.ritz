@@ -32,15 +32,73 @@ const ARENA_DEFAULT_SIZE: i64 = 1048576  # 1 MB default
 pub fn mmap_failed(p: *u8) -> bool
     return p as i64 <= 0
 
+# ============================================================================
+# Page source
+# ============================================================================
+# Every allocator here (Arena, the process heap, malloc's slabs and large
+# blocks) gets its memory from one page source and gives it back there. The
+# default is the target's anonymous mmap (sys_mmap_anon / sys_munmap); a
+# kernel, which has no mmap, installs its own frame allocator, and a test can
+# install one that fails (AGAST #1857).
+#
+#   map(len)       len bytes of zeroed read-write memory, or a value for which
+#                  mmap_failed is true (null, or -errno as the kernels return)
+#   unmap(p, len)  give back what one map(len) returned; 0 on success
+#
+# Install a source before the first allocation, or restore the previous one
+# before anything allocated under it is freed: memory goes back to whichever
+# source is installed when it is released.
+pub struct PageSource
+    map: fn(i64) -> *u8
+    unmap: fn(*u8, i64) -> i32
+
+var g_page_source: PageSource
+var g_page_source_installed: bool = false
+
+fn page_unmap_default(p: *u8, len: i64) -> i32
+    return sys_munmap(p, len)
+
+fn page_map_default(len: i64) -> *u8
+    return sys_mmap_anon(len)
+
+# The installed page source (the mmap default until page_source_set).
+pub fn page_source_get() -> PageSource
+    if g_page_source_installed
+        return g_page_source
+    return PageSource { map: page_map_default, unmap: page_unmap_default }
+
+# Install `src` as the page source; returns the one it replaces.
+pub fn page_source_set(src: PageSource) -> PageSource
+    let prev: PageSource = page_source_get()
+    g_page_source = src
+    g_page_source_installed = true
+    return prev
+
+fn page_map(len: i64) -> *u8
+    if not g_page_source_installed
+        return sys_mmap_anon(len)
+    let f: fn(i64) -> *u8 = g_page_source.map
+    return f(len)
+
+fn page_unmap(p: *u8, len: i64) -> i32
+    if not g_page_source_installed
+        return sys_munmap(p, len)
+    let f: fn(*u8, i64) -> i32 = g_page_source.unmap
+    return f(p, len)
+
+# ============================================================================
+# Arena
+# ============================================================================
+
 struct Arena
-    base: *u8       # Base pointer from mmap
+    base: *u8       # Base pointer from the page source
     size: i64       # Total size of arena
     offset: i64     # Current allocation offset (next free byte)
 
 # Create a new arena with the given capacity
 pub fn arena_new(size: i64) -> Arena
     var a: Arena
-    a.base = sys_mmap_anon(size)
+    a.base = page_map(size)
     if mmap_failed(a.base)
         # mmap failed
         a.base = null
@@ -97,7 +155,7 @@ pub fn arena_reset(a: *Arena)
 # Destroy the arena (free the underlying memory)
 pub fn arena_destroy(a: *Arena)
     if a.base != null and a.size > 0
-        sys_munmap(a.base, a.size)
+        page_unmap(a.base, a.size)
     a.base = null
     a.size = 0
     a.offset = 0
@@ -126,7 +184,7 @@ pub fn arena_valid(a: *Arena) -> i32
 pub fn heap_alloc(size: i64) -> *u8
     if size <= 0
         return null
-    let p: *u8 = sys_mmap_anon(size)
+    let p: *u8 = page_map(size)
     if mmap_failed(p)
         return null
     return p
@@ -135,7 +193,7 @@ pub fn heap_alloc(size: i64) -> *u8
 pub fn heap_free(ptr: *u8, size: i64) -> i32
     if ptr == null or size <= 0
         return 0
-    return sys_munmap(ptr, size)
+    return page_unmap(ptr, size)
 
 # Reallocate memory to a new size
 # Note: Requires knowing the old size (limitation of mmap-based approach)
@@ -308,7 +366,7 @@ fn bin_init(bin: *SizeBin, block_size: i64)
 fn bin_new_slab(bin: *SizeBin) -> i32
     # Allocate 64KB slabs for efficiency
     let slab_size: i64 = 65536
-    let slab: *u8 = sys_mmap_anon(slab_size)
+    let slab: *u8 = page_map(slab_size)
     if mmap_failed(slab)
         return -1
     bin.slab = slab
@@ -383,7 +441,7 @@ pub fn malloc(size: i64) -> *u8
         let pages: i64 = (total_size + PAGE_SIZE - 1) / PAGE_SIZE
         let mmap_size: i64 = pages * PAGE_SIZE
 
-        let block: *u8 = sys_mmap_anon(mmap_size)
+        let block: *u8 = page_map(mmap_size)
         if mmap_failed(block)
             return null
 
@@ -417,7 +475,7 @@ pub fn free(ptr: *u8)
         # Large allocation - munmap
         let block: *u8 = (ptr as i64 - HEADER_SIZE) as *u8
         let mmap_size: i64 = 0 - size_class
-        sys_munmap(block, mmap_size)
+        page_unmap(block, mmap_size)
         return
 
     # Small allocation - return to bin
@@ -472,7 +530,13 @@ pub fn realloc(ptr: *u8, new_size: i64) -> *u8
     return new_ptr
 
 # Allocate and zero-initialize
+# Null when count * size does not fit an i64 (it used to wrap: AGAST #1857),
+# or either is negative.
 pub fn calloc(count: i64, size: i64) -> *u8
+    if count < 0 or size < 0
+        return null
+    if size != 0 and count > 9223372036854775807 / size
+        return null
     let total: i64 = count * size
     let ptr: *u8 = malloc(total)
     if ptr != null
