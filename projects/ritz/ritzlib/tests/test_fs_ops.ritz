@@ -9,9 +9,32 @@
 
 import ritzlib.sys
 import ritzlib.fs
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.fmt { fmt_i64_into }
 import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
+
+# "/tmp/ritzlib_<pid>_<name>" into dst (>= 96 bytes); returns dst. The pid
+# keeps concurrent test runs (gate slots, compiler variants) off each other's
+# fixtures (AGAST #4084). ritzlib.testlib's make_sandbox_path does the same,
+# but its pub read_file/write_file collide with ritzlib.fs's.
+fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
+    let head: *u8 = c"/tmp/ritzlib_"
+    let head_len: i64 = strlen(head)
+    memcpy(dst, head, head_len)
+    var i: i64 = head_len + fmt_i64_into(dst + head_len, sys_getpid() as i64)
+    *(dst + i) = '_'
+    i += 1
+    let name_len: i64 = strlen(name)
+    memcpy(dst + i, name, name_len)
+    *(dst + i + name_len) = 0
+    dst
+
+# pid_tmp_path as a StrView.
+fn tmp_view(dst: *u8, name: *u8) -> StrView
+    strview_from_cstr(pid_tmp_path(dst, name))
 
 fn i64_err(r: *Result<i64, i32>) -> i32
     match *r
@@ -69,7 +92,8 @@ fn test_is_dir() -> i32
 
 [[test]]
 fn test_is_file() -> i32
-    let path: StrView = "/tmp/ritzlib_test_fs_ops_file.tmp"
+    var pathbuf: [96]u8
+    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_file.tmp")
     var w: Result<i64, i32> = write_file(path, "x")
     if i64_err(@w) != 0
         return 1
@@ -85,9 +109,10 @@ fn test_is_file() -> i32
 
 [[test]]
 fn test_is_symlink() -> i32
-    let link: StrView = "/tmp/ritzlib_test_fs_ops_link.tmp"
+    var linkbuf: [96]u8
+    let link: StrView = tmp_view(@linkbuf[0], c"fs_ops_link.tmp")
     unlink(link)
-    if sys_symlink(c"/tmp", c"/tmp/ritzlib_test_fs_ops_link.tmp") != 0
+    if sys_symlink(c"/tmp", @linkbuf[0]) != 0
         return 1
     if not is_symlink(link)
         return 2
@@ -105,7 +130,8 @@ fn test_is_symlink() -> i32
 
 [[test]]
 fn test_file_size_ok() -> i32
-    let path: StrView = "/tmp/ritzlib_test_fs_ops_size.tmp"
+    var pathbuf: [96]u8
+    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_size.tmp")
     var w: Result<i64, i32> = write_file(path, "12345")
     if i64_err(@w) != 0
         return 1
@@ -128,7 +154,8 @@ fn test_file_size_err_is_errno() -> i32
 
 [[test]]
 fn test_write_then_read_file() -> i32
-    let path: StrView = "/tmp/ritzlib_test_fs_ops_rw.tmp"
+    var pathbuf: [96]u8
+    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_rw.tmp")
     var w: Result<i64, i32> = write_file(path, "Hello, Result!")
     if i64_ok(@w) != 14
         return 1
@@ -140,7 +167,8 @@ fn test_write_then_read_file() -> i32
 
 [[test]]
 fn test_read_file_missing_is_enoent() -> i32
-    var r: Result<String, i32> = read_file("/tmp/ritzlib_does_not_exist_xyz.tmp")
+    var missingbuf: [96]u8
+    var r: Result<String, i32> = read_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
     if string_err(@r) != 2
         return 1
     0
@@ -158,7 +186,8 @@ fn test_write_file_bad_dir_is_enoent() -> i32
 
 [[test]]
 fn test_mkdir_rmdir() -> i32
-    let path: StrView = "/tmp/ritzlib_test_fs_ops_dir"
+    var pathbuf: [96]u8
+    let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_dir")
     rmdir(path)
     var mk: Result<i32, i32> = mkdir(path, 493)  # 0755
     if unit_err(@mk) != 0
@@ -177,7 +206,8 @@ fn test_mkdir_rmdir() -> i32
 
 [[test]]
 fn test_unlink_missing_is_enoent() -> i32
-    var r: Result<i32, i32> = unlink("/tmp/ritzlib_does_not_exist_xyz.tmp")
+    var missingbuf: [96]u8
+    var r: Result<i32, i32> = unlink(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
     if unit_err(@r) != 2
         return 1
     0
@@ -188,8 +218,10 @@ fn test_unlink_missing_is_enoent() -> i32
 
 [[test]]
 fn test_copy_file() -> i32
-    let src: StrView = "/tmp/ritzlib_test_fs_ops_src.tmp"
-    let dst: StrView = "/tmp/ritzlib_test_fs_ops_dst.tmp"
+    var srcbuf: [96]u8
+    let src: StrView = tmp_view(@srcbuf[0], c"fs_ops_src.tmp")
+    var dstbuf: [96]u8
+    let dst: StrView = tmp_view(@dstbuf[0], c"fs_ops_dst.tmp")
     write_file(src, "Content to copy")
     var c: Result<i64, i32> = copy_file(src, dst, 420)  # 0644
     if i64_ok(@c) != 15
@@ -203,10 +235,13 @@ fn test_copy_file() -> i32
 
 [[test]]
 fn test_copy_file_missing_src_is_enoent() -> i32
-    var c: Result<i64, i32> = copy_file("/tmp/ritzlib_does_not_exist_xyz.tmp", "/tmp/ritzlib_test_fs_ops_never.tmp", 420)
+    var missingbuf: [96]u8
+    var neverbuf: [96]u8
+    let never: StrView = tmp_view(@neverbuf[0], c"fs_ops_never.tmp")
+    var c: Result<i64, i32> = copy_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"), never, 420)
     if i64_err(@c) != 2
         return 1
-    if path_exists("/tmp/ritzlib_test_fs_ops_never.tmp")
+    if path_exists(never)
         return 2
     0
 
