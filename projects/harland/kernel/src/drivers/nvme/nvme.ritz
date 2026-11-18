@@ -1,0 +1,505 @@
+# NVMe Driver (polled)
+#
+# Drives NVMe controllers (PCI class 01h, subclass 08h, prog-if 02h): EBS
+# volumes on Nitro EC2 instances, most laptop SSDs and QEMU's `-device nvme`.
+# AGAST #1850.
+#
+# Per controller: reset, admin queue, enable, Identify Controller, one I/O
+# completion/submission queue pair (qid 1), then Identify Namespace for each
+# active namespace with 512-byte LBAs. Completions are polled; interrupts are
+# masked (INTMS, PCI INTx disable). MSI-X is a sibling ticket.
+#
+# Namespaces are exposed through drivers/virtio/blk (virtio_blk_init_nth
+# hands out NVMe namespaces after the virtio disks), so the filesystem layer
+# reads and writes them with virtio_blk_read/virtio_blk_write, unchanged.
+#
+# Memory: every queue and the bounce buffer is one identity-mapped physical
+# page (pmm_alloc_page), as virtio uses. A data transfer is at most one page
+# (8 sectors) so PRP1 alone describes it; longer requests are split.
+#
+# Reference: NVM Express Base Specification 1.4, sections 3 (registers),
+# 4 (queues), 5 (admin commands) and the NVM Command Set (read/write).
+
+import io { memory_barrier, read_barrier }
+import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
+import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
+import mm.heap { kalloc }
+import mm.vmm { vmm_map_mmio }
+import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+
+# ============================================================================
+# PCI identification
+# ============================================================================
+
+const PCI_SUBCLASS_NVM: u8 = 0x08
+const PCI_PROGIF_NVME: u8 = 0x02
+const PCI_COMMAND_REG: u8 = 0x04
+const PCI_COMMAND_INTX_DISABLE: u16 = 0x0400
+
+# ============================================================================
+# Controller registers (BAR0), NVMe 1.4 section 3.1
+# ============================================================================
+
+const NVME_REG_CAP_LO: u64 = 0x00     # Capabilities, bits 31:0
+const NVME_REG_CAP_HI: u64 = 0x04     # Capabilities, bits 63:32
+const NVME_REG_VS: u64 = 0x08         # Version
+const NVME_REG_INTMS: u64 = 0x0C      # Interrupt mask set
+const NVME_REG_CC: u64 = 0x14         # Controller configuration
+const NVME_REG_CSTS: u64 = 0x1C       # Controller status
+const NVME_REG_AQA: u64 = 0x24        # Admin queue attributes
+const NVME_REG_ASQ_LO: u64 = 0x28     # Admin SQ base
+const NVME_REG_ASQ_HI: u64 = 0x2C
+const NVME_REG_ACQ_LO: u64 = 0x30     # Admin CQ base
+const NVME_REG_ACQ_HI: u64 = 0x34
+const NVME_REG_DOORBELLS: u64 = 0x1000
+
+const NVME_CC_EN: u32 = 0x1
+const NVME_CC_IOSQES_64: u32 = 0x60000    # 2^6 = 64-byte SQ entries (bits 19:16)
+const NVME_CC_IOCQES_16: u32 = 0x400000   # 2^4 = 16-byte CQ entries (bits 23:20)
+const NVME_CSTS_RDY: u32 = 0x1
+const NVME_CSTS_CFS: u32 = 0x2
+
+# ============================================================================
+# Commands
+# ============================================================================
+
+const NVME_ADMIN_CREATE_SQ: u32 = 0x01
+const NVME_ADMIN_CREATE_CQ: u32 = 0x05
+const NVME_ADMIN_IDENTIFY: u32 = 0x06
+const NVME_CMD_WRITE: u32 = 0x01
+const NVME_CMD_READ: u32 = 0x02
+
+const NVME_CNS_NAMESPACE: u32 = 0x00
+const NVME_CNS_CONTROLLER: u32 = 0x01
+
+const NVME_SQE_SIZE: u64 = 64
+const NVME_CQE_SIZE: u64 = 16
+
+# Queue IDs: index 0 is the admin queue pair, index 1 the I/O queue pair.
+const NVME_ADMIN_Q: i32 = 0
+const NVME_IO_Q: i32 = 1
+
+# Entries per queue (capped by CAP.MQES + 1). One page holds 64 SQEs.
+const NVME_QUEUE_DEPTH: u32 = 16
+
+# Sectors per command: one 4 KiB page, so PRP1 alone covers it.
+const NVME_MAX_SECTORS_PER_CMD: u32 = 8
+
+# Polling budgets (iterations; each one reads device memory or a register).
+const NVME_READY_SPINS: u32 = 20000000
+const NVME_CMD_SPINS: u32 = 20000000
+
+const MAX_NVME_CONTROLLERS: i32 = 4
+const MAX_NVME_NAMESPACES: i32 = 8
+# Namespaces per controller we look at (NN can be huge on real arrays).
+const MAX_NSID_SCAN: u32 = 8
+
+# ============================================================================
+# Structures
+# ============================================================================
+
+pub struct NvmeController
+    bar: u64                # BAR0, mapped through the MMIO window
+    db_stride: u64          # Doorbell stride in bytes (4 << CAP.DSTRD)
+    depth: u32              # Entries per queue
+    next_cid: u32           # Next command identifier
+    sq: [2]u64              # SQ base (phys == virt), [admin, io]
+    cq: [2]u64              # CQ base (phys == virt)
+    sq_tail: [2]u32
+    cq_head: [2]u32
+    cq_phase: [2]u32        # Phase tag that marks a new CQE
+    buf: u64                # One-page bounce buffer for identify and data
+    nn: u32                 # Number of namespaces (Identify Controller)
+    serial_len: u32
+    serial: [20]u8          # Serial number (Identify Controller bytes 4-23)
+
+pub struct NvmeNamespace
+    ctrl: *NvmeController
+    nsid: u32
+    _pad: u32
+    sectors: u64            # Size in 512-byte sectors (NSZE)
+
+var nvme_ctrls: [4]*NvmeController
+var nvme_ctrl_count: i32 = 0
+var nvme_nss: [8]*NvmeNamespace
+var nvme_ns_count: i32 = 0
+var nvme_probed: i32 = 0
+
+# ============================================================================
+# Register and memory access
+# ============================================================================
+
+fn nvme_r32(c: *NvmeController, off: u64) -> u32
+    return volatile_load(((*c).bar + off) as *u32)
+
+fn nvme_w32(c: *NvmeController, off: u64, value: u32)
+    volatile_store(((*c).bar + off) as *u32, value)
+
+fn nvme_w64(c: *NvmeController, off_lo: u64, value: u64)
+    nvme_w32(c, off_lo, (value & 0xFFFFFFFF) as u32)
+    nvme_w32(c, off_lo + 4, (value >> 32) as u32)
+
+# Doorbell for queue `q`: SQ tail when is_cq is 0, CQ head when 1.
+fn nvme_doorbell(c: *NvmeController, q: i32, is_cq: u64, value: u32)
+    let off: u64 = NVME_REG_DOORBELLS + ((2 * (q as u64)) + is_cq) * (*c).db_stride
+    memory_barrier()
+    nvme_w32(c, off, value)
+
+fn mem_r32(addr: u64) -> u32
+    return volatile_load(addr as *u32)
+
+fn mem_w32(addr: u64, value: u32)
+    volatile_store(addr as *u32, value)
+
+fn zero_page(addr: u64)
+    var i: u64 = 0
+    while i < PAGE_SIZE
+        *((addr + i) as *u64) = 0
+        i = i + 8
+
+fn alloc_zeroed_page() -> u64
+    let p: u64 = pmm_alloc_page()
+    if p != 0
+        zero_page(p)
+    return p
+
+# Wait until (CSTS & mask) == want. Returns 0, or -1 on timeout or fatal status.
+fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
+    var spins: u32 = 0
+    while spins < NVME_READY_SPINS
+        let csts: u32 = nvme_r32(c, NVME_REG_CSTS)
+        if csts == 0xFFFFFFFF
+            return -1
+        if (csts & mask) == want
+            return 0
+        if want != 0 and (csts & NVME_CSTS_CFS) != 0
+            return -1
+        asm x86_64:
+            pause
+        spins = spins + 1
+    return -1
+
+# ============================================================================
+# Command submission (polled)
+# ============================================================================
+
+# Submit one command on queue `q` and poll its completion.
+# Returns 0 on success, the NVMe status (positive) on a command error, or -1
+# on timeout.
+fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
+    let cid: u32 = (*c).next_cid & 0xFFFF
+    (*c).next_cid = (*c).next_cid + 1
+    if (*c).next_cid > 0xFFFF
+        (*c).next_cid = 0
+
+    # Build the SQE in place: CDW0 = opcode | CID << 16, NSID, PRP1, CDW10-12.
+    let sqe: u64 = (*c).sq[q] + ((*c).sq_tail[q] as u64) * NVME_SQE_SIZE
+    var i: u64 = 0
+    while i < NVME_SQE_SIZE
+        mem_w32(sqe + i, 0)
+        i = i + 4
+    mem_w32(sqe + 0, opc | (cid << 16))
+    mem_w32(sqe + 4, nsid)
+    mem_w32(sqe + 24, (prp1 & 0xFFFFFFFF) as u32)
+    mem_w32(sqe + 28, (prp1 >> 32) as u32)
+    mem_w32(sqe + 40, cdw10)
+    mem_w32(sqe + 44, cdw11)
+    mem_w32(sqe + 48, cdw12)
+
+    (*c).sq_tail[q] = (*c).sq_tail[q] + 1
+    if (*c).sq_tail[q] >= (*c).depth
+        (*c).sq_tail[q] = 0
+    nvme_doorbell(c, q, 0, (*c).sq_tail[q])
+
+    # Poll the CQE at the head for the expected phase tag (DW3 bit 16).
+    var spins: u32 = 0
+    while spins < NVME_CMD_SPINS
+        let cqe: u64 = (*c).cq[q] + ((*c).cq_head[q] as u64) * NVME_CQE_SIZE
+        let dw3: u32 = mem_r32(cqe + 12)
+        if ((dw3 >> 16) & 1) == (*c).cq_phase[q]
+            read_barrier()
+            (*c).cq_head[q] = (*c).cq_head[q] + 1
+            if (*c).cq_head[q] >= (*c).depth
+                (*c).cq_head[q] = 0
+                (*c).cq_phase[q] = (*c).cq_phase[q] ^ 1
+            nvme_doorbell(c, q, 1, (*c).cq_head[q])
+            let status: u32 = (dw3 >> 17) & 0x7FFF
+            if (dw3 & 0xFFFF) != cid
+                prints("[nvme] completion for cid ")
+                serial_print_dec((dw3 & 0xFFFF) as u64)
+                prints(", expected ")
+                serial_print_dec(cid as u64)
+                prints("\n")
+                return -1
+            if status != 0
+                prints("[nvme] command 0x")
+                serial_print_hex(opc as u64)
+                prints(" failed, status 0x")
+                serial_print_hex(status as u64)
+                prints("\n")
+                return status as i32
+            return 0
+        asm x86_64:
+            pause
+        spins = spins + 1
+
+    prints("[nvme] command 0x")
+    serial_print_hex(opc as u64)
+    prints(" timed out\n")
+    return -1
+
+# ============================================================================
+# Controller bring-up
+# ============================================================================
+
+fn nvme_print_serial(c: *NvmeController)
+    var i: u32 = 0
+    while i < (*c).serial_len
+        serial_write_byte((*c).serial[i as i32])
+        i = i + 1
+
+fn nvme_fail(c: *NvmeController, what: StrView) -> *NvmeController
+    prints("[nvme] controller init failed: ")
+    prints(what)
+    prints(" (CSTS=0x")
+    serial_print_hex(nvme_r32(c, NVME_REG_CSTS) as u64)
+    prints(")\n")
+    return 0 as *NvmeController
+
+fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
+    let bar_phys: u64 = (*pci).bar[0]
+    if bar_phys == 0 or (*pci).bar_is_io[0] != 0
+        prints("[nvme] BAR0 is not a memory BAR\n")
+        return 0 as *NvmeController
+
+    pci_enable_memory(pci)
+    pci_enable_bus_master(pci)
+    # Polled driver: keep the INTx line quiet.
+    let cmd: u16 = pci_read_config16((*pci).bus, (*pci).device, (*pci).function, PCI_COMMAND_REG)
+    pci_write_config16((*pci).bus, (*pci).device, (*pci).function, PCI_COMMAND_REG, cmd | PCI_COMMAND_INTX_DISABLE)
+
+    # Registers end at 0x1000; the doorbells we use follow (two queue pairs).
+    var map_len: u64 = 0x4000
+    if (*pci).bar_size[0] != 0 and (*pci).bar_size[0] < map_len
+        map_len = (*pci).bar_size[0]
+    let bar: u64 = vmm_map_mmio(bar_phys, map_len)
+    if bar == 0
+        prints("[nvme] could not map BAR0\n")
+        return 0 as *NvmeController
+
+    let c: *NvmeController = kalloc(sizeof(NvmeController) as u64) as *NvmeController
+    if c == 0 as *NvmeController
+        return c
+    (*c).bar = bar
+    (*c).next_cid = 0
+    (*c).nn = 0
+    (*c).serial_len = 0
+
+    let cap_lo: u32 = nvme_r32(c, NVME_REG_CAP_LO)
+    let cap_hi: u32 = nvme_r32(c, NVME_REG_CAP_HI)
+    (*c).db_stride = 4 << ((cap_hi & 0xF) as u64)
+    if NVME_REG_DOORBELLS + 4 * (*c).db_stride > map_len
+        return nvme_fail(c, "doorbells beyond BAR0")
+    if ((cap_hi >> 16) & 0xF) != 0
+        return nvme_fail(c, "4 KiB pages unsupported (CAP.MPSMIN)")
+    if ((cap_hi >> 5) & 1) == 0
+        return nvme_fail(c, "NVM command set unsupported (CAP.CSS)")
+    (*c).depth = NVME_QUEUE_DEPTH
+    let mqes: u32 = (cap_lo & 0xFFFF) + 1
+    if mqes < (*c).depth
+        (*c).depth = mqes
+
+    # Reset: clear CC.EN and wait for CSTS.RDY to drop.
+    let cc: u32 = nvme_r32(c, NVME_REG_CC)
+    if (cc & NVME_CC_EN) != 0
+        nvme_w32(c, NVME_REG_CC, cc & 0xFFFFFFFE)
+    if nvme_wait_csts(c, NVME_CSTS_RDY, 0) != 0
+        return nvme_fail(c, "reset timed out")
+
+    (*c).sq[0] = alloc_zeroed_page()
+    (*c).cq[0] = alloc_zeroed_page()
+    (*c).sq[1] = alloc_zeroed_page()
+    (*c).cq[1] = alloc_zeroed_page()
+    (*c).buf = alloc_zeroed_page()
+    if (*c).sq[0] == 0 or (*c).cq[0] == 0 or (*c).sq[1] == 0 or (*c).cq[1] == 0 or (*c).buf == 0
+        return nvme_fail(c, "out of pages")
+    var q: i32 = 0
+    while q < 2
+        (*c).sq_tail[q] = 0
+        (*c).cq_head[q] = 0
+        (*c).cq_phase[q] = 1
+        q = q + 1
+
+    # Admin queue, then enable: NVM command set, 4 KiB pages, 64/16-byte entries.
+    nvme_w32(c, NVME_REG_INTMS, 0xFFFFFFFF)
+    nvme_w32(c, NVME_REG_AQA, (((*c).depth - 1) << 16) | ((*c).depth - 1))
+    nvme_w64(c, NVME_REG_ASQ_LO, (*c).sq[0])
+    nvme_w64(c, NVME_REG_ACQ_LO, (*c).cq[0])
+    memory_barrier()
+    nvme_w32(c, NVME_REG_CC, NVME_CC_EN | NVME_CC_IOSQES_64 | NVME_CC_IOCQES_16)
+    if nvme_wait_csts(c, NVME_CSTS_RDY, NVME_CSTS_RDY) != 0
+        return nvme_fail(c, "enable timed out")
+
+    # Identify Controller: serial number (bytes 4-23), NN (bytes 516-519).
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, 0, (*c).buf, NVME_CNS_CONTROLLER, 0, 0) != 0
+        return nvme_fail(c, "identify controller")
+    var i: u32 = 0
+    while i < 20
+        let ch: u8 = *(((*c).buf + 4 + i as u64) as *u8)
+        (*c).serial[i as i32] = ch
+        if ch != 0x20 and ch != 0
+            (*c).serial_len = i + 1
+        i = i + 1
+    (*c).nn = mem_r32((*c).buf + 516)
+
+    # I/O queue pair 1: the CQ first (physically contiguous, interrupts off),
+    # then the SQ bound to it (physically contiguous).
+    let qsize: u32 = ((*c).depth - 1) << 16
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_CQ, 0, (*c).cq[1], qsize | 1, 1, 0) != 0
+        return nvme_fail(c, "create I/O CQ")
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_SQ, 0, (*c).sq[1], qsize | 1, (1 << 16) | 1, 0) != 0
+        return nvme_fail(c, "create I/O SQ")
+
+    prints("[nvme] ")
+    nvme_print_serial(c)
+    prints(": version 0x")
+    serial_print_hex(nvme_r32(c, NVME_REG_VS) as u64)
+    prints(", ")
+    serial_print_dec((*c).nn as u64)
+    prints(" namespace(s), queue depth ")
+    serial_print_dec((*c).depth as u64)
+    prints("\n")
+    return c
+
+# FNV-1a (32-bit) over `len` bytes, continuing from `h`.
+fn fnv1a(h: u64, p: *u8, len: u64) -> u64
+    var hash: u64 = h
+    var i: u64 = 0
+    while i < len
+        hash = ((hash ^ (*(p + i as i64) as u64)) * 0x01000193) & 0xFFFFFFFF
+        i = i + 1
+    return hash
+
+# Log the namespace and a fingerprint of LBAs 1-16 (two 8-sector commands),
+# so the boot test can check identify, LBA addressing and multi-command reads.
+fn nvme_announce(ns: *NvmeNamespace)
+    let c: *NvmeController = (*ns).ctrl
+    prints("[nvme] ")
+    nvme_print_serial(c)
+    prints(" nsid ")
+    serial_print_dec((*ns).nsid as u64)
+    prints(": ")
+    serial_print_dec((*ns).sectors)
+    prints(" sectors")
+    if (*ns).sectors >= 17
+        var h: u64 = 0x811C9DC5
+        var lba: u64 = 1
+        while lba < 17
+            if nvme_cmd(c, NVME_IO_Q, NVME_CMD_READ, (*ns).nsid, (*c).buf, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, NVME_MAX_SECTORS_PER_CMD - 1) != 0
+                prints(", LBA 1-16 read failed\n")
+                return
+            h = fnv1a(h, (*c).buf as *u8, (NVME_MAX_SECTORS_PER_CMD as u64) * 512)
+            lba = lba + NVME_MAX_SECTORS_PER_CMD as u64
+        prints(", LBA 1-16 fnv1a=")
+        serial_print_dec(h)
+    prints("\n")
+
+fn nvme_scan_namespaces(c: *NvmeController)
+    var nsid: u32 = 1
+    while nsid <= (*c).nn and nsid <= MAX_NSID_SCAN and nvme_ns_count < MAX_NVME_NAMESPACES
+        if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, nsid, (*c).buf, NVME_CNS_NAMESPACE, 0, 0) == 0
+            # NSZE (bytes 0-7); FLBAS (byte 26) picks an LBA format at 128 + 4n,
+            # whose LBADS (bits 23:16) is log2 of the LBA size.
+            let nsze: u64 = *((*c).buf as *u64)
+            let flbas: u64 = (*(((*c).buf + 26) as *u8) & 0xF) as u64
+            let lbads: u32 = (mem_r32((*c).buf + 128 + 4 * flbas) >> 16) & 0xFF
+            if nsze != 0 and lbads != 9
+                prints("[nvme] nsid ")
+                serial_print_dec(nsid as u64)
+                prints(": LBA size 2^")
+                serial_print_dec(lbads as u64)
+                prints(" unsupported (512 only)\n")
+            if nsze != 0 and lbads == 9
+                let ns: *NvmeNamespace = kalloc(sizeof(NvmeNamespace) as u64) as *NvmeNamespace
+                if ns != 0 as *NvmeNamespace
+                    (*ns).ctrl = c
+                    (*ns).nsid = nsid
+                    (*ns)._pad = 0
+                    (*ns).sectors = nsze
+                    nvme_nss[nvme_ns_count] = ns
+                    nvme_ns_count = nvme_ns_count + 1
+                    nvme_announce(ns)
+        nsid = nsid + 1
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Find and bring up every NVMe controller and its namespaces, in PCI order.
+# Runs once; later calls return the namespace count found the first time.
+pub fn nvme_probe() -> i32
+    if nvme_probed != 0
+        return nvme_ns_count
+    nvme_probed = 1
+    let n: i32 = pci_get_device_count()
+    var i: i32 = 0
+    while i < n and nvme_ctrl_count < MAX_NVME_CONTROLLERS
+        let pci: *PciDevice = pci_get_device(i)
+        if (*pci).class_code == PCI_CLASS_STORAGE and (*pci).subclass == PCI_SUBCLASS_NVM and (*pci).prog_if == PCI_PROGIF_NVME
+            let c: *NvmeController = nvme_init_controller(pci)
+            if c != 0 as *NvmeController
+                nvme_ctrls[nvme_ctrl_count] = c
+                nvme_ctrl_count = nvme_ctrl_count + 1
+                nvme_scan_namespaces(c)
+        i = i + 1
+    return nvme_ns_count
+
+# The Nth usable namespace across all controllers (0-indexed), or null.
+pub fn nvme_get_namespace(n: i32) -> *NvmeNamespace
+    if n < 0 or n >= nvme_ns_count
+        return 0 as *NvmeNamespace
+    return nvme_nss[n]
+
+pub fn nvme_ns_sectors(ns: *NvmeNamespace) -> u64
+    return (*ns).sectors
+
+# Read or write `count` 512-byte sectors at `sector` through the bounce
+# buffer, at most one page per command. Returns 0, or a negative error.
+fn nvme_ns_rw(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8, write: bool) -> i32
+    if ns == 0 as *NvmeNamespace
+        return -1
+    if sector >= (*ns).sectors or (count as u64) > (*ns).sectors - sector
+        return -1
+    let c: *NvmeController = (*ns).ctrl
+    let dma: *u8 = (*c).buf as *u8
+    var done: u32 = 0
+    while done < count
+        var chunk: u32 = count - done
+        if chunk > NVME_MAX_SECTORS_PER_CMD
+            chunk = NVME_MAX_SECTORS_PER_CMD
+        let bytes: u64 = (chunk as u64) * 512
+        let user: *u8 = buf + ((done as u64) * 512) as i64
+        let lba: u64 = sector + done as u64
+        var j: u64 = 0
+        if write
+            while j < bytes
+                *(dma + j as i64) = *(user + j as i64)
+                j = j + 1
+        var opc: u32 = NVME_CMD_READ
+        if write
+            opc = NVME_CMD_WRITE
+        if nvme_cmd(c, NVME_IO_Q, opc, (*ns).nsid, (*c).buf, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, chunk - 1) != 0
+            return -5
+        if not write
+            j = 0
+            while j < bytes
+                *(user + j as i64) = *(dma + j as i64)
+                j = j + 1
+        done = done + chunk
+    return 0
+
+pub fn nvme_ns_read(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
+    return nvme_ns_rw(ns, sector, count, buf, false)
+
+pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
+    return nvme_ns_rw(ns, sector, count, buf, true)

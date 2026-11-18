@@ -4,10 +4,15 @@
 # This allows reading and writing disk blocks via QEMU's virtual disk.
 #
 # Reference: https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html#x1-2500006
+#
+# This is also the kernel's block-device interface: NVMe namespaces
+# (drivers/nvme) are handed out as block devices after the virtio disks, and
+# virtio_blk_read/virtio_blk_write pass them to the NVMe driver (#1850).
 
 import serial { prints, println, serial_print_hex, serial_print_hex8, serial_print_dec }
 import drivers.pci { PciDevice, pci_find_virtio, pci_find_virtio_nth, VIRTIO_DEVICE_BLOCK }
 import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, vio_init_device, vio_device_ready, vio_get_features, vio_set_features, vio_setup_queue, vio_read_config64, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, VRING_DESC_F_NEXT, VRING_DESC_F_WRITE }
+import drivers.nvme.nvme { NvmeNamespace, nvme_probe, nvme_get_namespace, nvme_ns_sectors, nvme_ns_read, nvme_ns_write }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_virt_to_phys }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
@@ -63,9 +68,9 @@ pub struct VirtioBlkDevice
     block_size: u32             # Logical block size (usually 512)
     features: u32               # Negotiated features
     _padding: u32
+    nvme: *NvmeNamespace        # Non-null: an NVMe namespace, not virtio
 
 # Size constants
-const VIRTIO_BLK_DEVICE_SIZE: u64 = 40   # sizeof(VirtioBlkDevice)
 const VIRTIO_BLK_REQ_HDR_SIZE: u64 = 16  # sizeof(VirtioBlkReqHdr)
 
 # ============================================================================
@@ -107,7 +112,7 @@ pub fn virtio_blk_init_nth(n: i32) -> *VirtioBlkDevice
     # Find the Nth VirtIO block device
     let pci_dev: *PciDevice = pci_find_virtio_nth(VIRTIO_DEVICE_BLOCK, n)
     if pci_dev == 0 as *PciDevice
-        return 0 as *VirtioBlkDevice
+        return blk_init_nvme(n)
 
     # Initialize VirtIO common layer
     let vdev: *VirtioDevice = vio_init_device(pci_dev)
@@ -116,12 +121,13 @@ pub fn virtio_blk_init_nth(n: i32) -> *VirtioBlkDevice
         return 0 as *VirtioBlkDevice
 
     # Allocate block device structure
-    let dev: *VirtioBlkDevice = kalloc(VIRTIO_BLK_DEVICE_SIZE) as *VirtioBlkDevice
+    let dev: *VirtioBlkDevice = kalloc(sizeof(VirtioBlkDevice) as u64) as *VirtioBlkDevice
     if dev == 0 as *VirtioBlkDevice
         println("[virtio-blk] Failed to allocate device")
         return 0 as *VirtioBlkDevice
 
     (*dev).virtio_dev = vdev
+    (*dev).nvme = 0 as *NvmeNamespace
     (*dev).block_size = 512  # Default
 
     # Feature negotiation
@@ -173,6 +179,35 @@ pub fn virtio_blk_init_nth(n: i32) -> *VirtioBlkDevice
     prints(" MB)\n" as StrView)
     return dev
 
+# Block device n when there are fewer than n+1 virtio disks: NVMe namespace
+# n - (number of virtio disks), in PCI then namespace order.
+fn blk_init_nvme(n: i32) -> *VirtioBlkDevice
+    var virtio_count: i32 = 0
+    while pci_find_virtio_nth(VIRTIO_DEVICE_BLOCK, virtio_count) != 0 as *PciDevice
+        virtio_count = virtio_count + 1
+    nvme_probe()
+    let ns: *NvmeNamespace = nvme_get_namespace(n - virtio_count)
+    if ns == 0 as *NvmeNamespace
+        return 0 as *VirtioBlkDevice
+    let dev: *VirtioBlkDevice = kalloc(sizeof(VirtioBlkDevice) as u64) as *VirtioBlkDevice
+    if dev == 0 as *VirtioBlkDevice
+        return dev
+    (*dev).virtio_dev = 0 as *VirtioDevice
+    (*dev).request_queue = 0 as *Virtqueue
+    (*dev).capacity = nvme_ns_sectors(ns)
+    (*dev).block_size = 512
+    (*dev).features = 0
+    (*dev)._padding = 0
+    (*dev).nvme = ns
+    blk_devices[n] = dev
+    blk_device_count = blk_device_count + 1
+    prints("[blk] Device " as StrView)
+    serial_print_dec(n as u64)
+    prints(" is NVMe (" as StrView)
+    serial_print_dec((*dev).capacity / 2048)
+    prints(" MB)\n" as StrView)
+    return dev
+
 # Initialize the first VirtIO block device (backwards compatible)
 pub fn virtio_blk_init() -> *VirtioBlkDevice
     let dev: *VirtioBlkDevice = virtio_blk_init_nth(0)
@@ -213,6 +248,8 @@ fn get_device_index(dev: *VirtioBlkDevice) -> i32
 pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
     if dev == 0 as *VirtioBlkDevice
         return -1
+    if (*dev).nvme != 0 as *NvmeNamespace
+        return nvme_ns_read((*dev).nvme, sector, count, buf)
 
     let dev_idx: i32 = get_device_index(dev)
     let dev_dma_phys: u64 = dma_buffer_phys[dev_idx]
@@ -326,6 +363,8 @@ pub fn virtio_blk_read(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8)
 pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
     if dev == 0 as *VirtioBlkDevice
         return -1
+    if (*dev).nvme != 0 as *NvmeNamespace
+        return nvme_ns_write((*dev).nvme, sector, count, buf)
 
     let dev_idx: i32 = get_device_index(dev)
     let dev_dma_phys: u64 = dma_buffer_phys[dev_idx]
