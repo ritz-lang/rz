@@ -30,6 +30,21 @@ def read_manifest(pkg_dir: Path) -> dict | None:
     return manifest.load(path)
 
 
+def package_sources(config: dict, default: list[str] | None = None) -> list[str] | None:
+    """A package's source roots: its [package] `sources`, as a new list.
+
+    `default` (copied) when the manifest sets none. The one reader of a
+    package's own `sources` (AGAST #3894): it used to be accepted at the top
+    level, under [package] and under [build], and five readers each carried a
+    copy of that fallback chain. The schema now names [package] only and
+    rejects the other two with file:line, so nothing else may look there.
+    """
+    sources = config.get("package", {}).get("sources")
+    if sources is None:
+        return None if default is None else list(default)
+    return [sources] if isinstance(sources, str) else list(sources)
+
+
 @dataclass
 class DependencySpec:
     """Represents a single dependency specification.
@@ -108,13 +123,7 @@ def parse_dependencies(config: dict, pkg_dir: Path, *, warn: bool = True) -> dic
             sources = spec.get("sources")
             if sources is None:
                 dep_config = read_manifest(dep_path)
-                if dep_config is not None:
-                    # Check both top-level and inside [package] (TOML quirk)
-                    sources = dep_config.get("sources")
-                    if sources is None:
-                        sources = dep_config.get("package", {}).get("sources", ["src"])
-                else:
-                    sources = ["src"]
+                sources = package_sources(dep_config or {}, ["src"])
 
             if isinstance(sources, str):
                 sources = [sources]
@@ -150,17 +159,9 @@ def package_import_namespaces(config: dict, pkg_dir: Path) -> dict[str, Dependen
     namespaces = parse_dependencies(config, pkg_dir)
     pkg_name = config.get("package", {}).get("name")
     if pkg_name and pkg_name not in namespaces:
-        sources = config.get("sources")
-        if sources is None:
-            sources = config.get("package", {}).get("sources")
-        if sources is None:
-            sources = config.get("build", {}).get("sources")
-        if sources is None:
-            sources = ["src"]
-        if isinstance(sources, str):
-            sources = [sources]
         namespaces[pkg_name] = DependencySpec(
-            name=pkg_name, path=pkg_dir.resolve(), sources=list(sources))
+            name=pkg_name, path=pkg_dir.resolve(),
+            sources=package_sources(config, ["src"]))
     return namespaces
 
 

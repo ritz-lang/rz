@@ -26,9 +26,9 @@ import bounded_run
 from cache import BuildCache
 import cas
 from manifest import (BinaryConfig, LibraryConfig, SkippedBinary, StrayTestsDirError,
-                      discover_test_files, get_build_profile, package_sources,
+                      discover_test_files, get_build_profile,
                       plan_binaries, wants_convenience_link)
-from resolve import DependencySpec, package_import_namespaces, parse_dependencies
+from resolve import DependencySpec, package_import_namespaces, package_sources, parse_dependencies
 
 
 ROOT = Path(__file__).parent

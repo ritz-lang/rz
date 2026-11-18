@@ -1087,7 +1087,7 @@ def _self_import_package(tmp_path):
         "import lib.b\n\nfn main() -> i32\n    fourteen() - 14\n")
     (pkg / "ritz.toml").write_text(
         f'[package]\nname = "{_SELF_PKG}"\nversion = "0.1.0"\n'
-        '\n[build]\nsources = ["lib", "bin"]\n'
+        'sources = ["lib", "bin"]\n'
         '\n[[bin]]\nname = "selfref"\nentry = "main::main"\n'
     )
     return pkg
@@ -1098,7 +1098,7 @@ class TestSelfNamespace:
 
     @pytest.mark.unit
     def test_own_name_maps_to_own_source_roots(self, tmp_path):
-        config = {"package": {"name": "tome"}, "build": {"sources": ["lib", "test", "bin"]}}
+        config = {"package": {"name": "tome", "sources": ["lib", "test", "bin"]}}
         ns = _build_module.package_import_namespaces(config, tmp_path)
         assert set(ns) == {"tome"}
         assert ns["tome"].path == tmp_path.resolve()

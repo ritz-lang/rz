@@ -24,10 +24,19 @@ Metadata caching:
 from pathlib import Path, PurePath
 from typing import Set, Dict, Iterable, Optional, List
 import os
+import sys
 import ritz_ast as rast
 import module_interface
 from metadata import MetadataCache, extract_metadata, ModuleMetadata
 from emitter.fn_cache import read_current_sig, source_file_hash, check_source_hash
+
+# projects/ritz/resolve.py owns reading a package's `sources` (AGAST #3894).
+# Appended, not prepended, as test_runner._build_module does: projects/ritz
+# modules must not shadow PyPI packages of the same name.
+_RITZ_DIR = str(Path(__file__).resolve().parent.parent)
+if _RITZ_DIR not in sys.path:
+    sys.path.append(_RITZ_DIR)
+from resolve import package_sources  # noqa: E402
 
 
 _CACHED_SPAN = rast.Span("<cached>", 0, 0, 0)
@@ -362,16 +371,7 @@ class ImportResolver:
                 with open(toml_path, "rb") as f:
                     config = tomllib.load(f)
 
-                # Extract sources - check multiple locations
-                sources = config.get("sources")
-                if sources is None:
-                    sources = config.get("package", {}).get("sources")
-                if sources is None:
-                    sources = config.get("build", {}).get("sources")
-                if sources is None:
-                    sources = ["src"]  # default
-                if isinstance(sources, str):
-                    sources = [sources]
+                sources = package_sources(config, ["src"])
 
                 # Register as a dependency
                 self.dependencies[dep_name] = DependencyMapping(

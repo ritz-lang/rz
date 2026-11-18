@@ -25,10 +25,6 @@ Two manifests exist:
 
 A package manifest: `ritz.toml` at the root of every package.
 
-| Key | Type | Default | Read by | Description |
-|---|---|---|---|---|
-| `sources` | string or string list | `["src"]` | `projects/ritz/manifest.py package_sources`<br>`projects/ritz/resolve.py package_import_namespaces` | Source roots, relative to the package. Also accepted under [package] or [build]; the first one present wins, in the order top level, [package], [build]. |
-
 ### `[package]`
 
 Package identity.
@@ -38,7 +34,7 @@ Package identity.
 | `name` | string | **required** | `projects/ritz/manifest.py plan_binaries`<br>`projects/ritz/build_pipeline.py build_package`<br>`projects/ritz/resolve.py package_import_namespaces`<br>`rz cmd_list` | Package name. Also its import namespace and, with no [[bin]] or [[lib]], its binary's name. |
 | `version` | string |  | `rz cmd_list` | Package version, shown by `rz list`. |
 | `description` | string |  | `rz cmd_list` | One line, shown by `rz list`. |
-| `sources` | string or string list |  | `projects/ritz/manifest.py package_sources`<br>`projects/ritz/resolve.py package_import_namespaces` | See top-level `sources`. |
+| `sources` | string or string list | `["src"]` | `projects/ritz/resolve.py package_sources` | Source roots, relative to the package. The only place `sources` is read: one at the top level or under [build] is an error. |
 
 ### `[build]`
 
@@ -46,7 +42,6 @@ Build settings. `opt-level`, `debug` and `lto` are the base every [profile.*] ov
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `sources` | string or string list |  | `projects/ritz/manifest.py package_sources`<br>`projects/ritz/resolve.py package_import_namespaces` | See top-level `sources`. |
 | `test_only` | bool | `false` | `projects/ritz/manifest.py plan_binaries`<br>`projects/ritz/manifest.py discover_test_files` | The package has tests and no binaries or libraries: `build` skips it, `test` runs it. |
 | `opt-level` | integer | `0` | `projects/ritz/manifest.py get_build_profile` | LLVM optimisation level, 0-3. |
 | `debug` | bool | `true` | `projects/ritz/manifest.py get_build_profile` | Emit debug info. |

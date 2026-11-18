@@ -143,8 +143,10 @@ def test_edited_ritz0_recompiles_an_unchanged_source(tmp_path):
     copy = tmp_path / "ritz" / "ritz0"
     shutil.copytree(RITZ0_DIR, copy, ignore=shutil.ignore_patterns(
         "test_*", "test", "__pycache__", ".pytest_cache"))
-    # ritz0 imports the artifact store from beside its own tree.
-    (copy.parent / "cas.py").symlink_to(RITZ0_DIR.parent / "cas.py")
+    # ritz0 imports the artifact store, and resolve.py's package_sources
+    # (with the manifest schema it loads), from beside its own tree.
+    for sibling in ("cas.py", "resolve.py", "manifest.py"):
+        (copy.parent / sibling).symlink_to(RITZ0_DIR.parent / sibling)
     src = tmp_path / "a.ritz"
     src.write_text("fn main() -> i32\n    0\n")
     out = tmp_path / "a.ll"

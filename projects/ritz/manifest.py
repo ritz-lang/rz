@@ -66,6 +66,9 @@ class Table:
     read_by: tuple[str, ...] = ()
     self_named: Table | None = None
     required: bool = False
+    # Root tables only: retired keys, as {table path: {key: where it went}}.
+    # One is still an error, but one that says where the key goes now.
+    moved_from: dict[tuple, dict[str, str]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -100,8 +103,9 @@ CLI_PY = "projects/ritz/build_cli.py"
 RESOLVE = "projects/ritz/resolve.py"
 RZ = "rz"
 
-_SOURCES_READERS = (f"{MANIFEST_PY}::package_sources",
-                    f"{RESOLVE}::package_import_namespaces")
+# A retired `sources` spelling's error (PACKAGE_SCHEMA.moved_from).
+_MOVED_SOURCES = ("`sources` belongs in [package] (AGAST #3894): move it "
+                  "under the [package] header")
 
 _PROFILE_KEYS = {
     "opt-level": Value(INTEGER, "LLVM optimisation level, 0-3.",
@@ -116,12 +120,6 @@ _PROFILE_KEYS = {
 PACKAGE_SCHEMA = Table(
     doc="A package manifest: `ritz.toml` at the root of every package.",
     fields={
-        "sources": Value(
-            STRING_OR_LIST,
-            "Source roots, relative to the package. Also accepted under "
-            "[package] or [build]; the first one present wins, in the order "
-            "top level, [package], [build].",
-            _SOURCES_READERS, default='["src"]'),
         "package": Table(
             "Package identity.",
             {
@@ -135,8 +133,12 @@ PACKAGE_SCHEMA = Table(
                                  (f"{RZ}::cmd_list",)),
                 "description": Value(STRING, "One line, shown by `rz list`.",
                                      (f"{RZ}::cmd_list",)),
-                "sources": Value(STRING_OR_LIST, "See top-level `sources`.",
-                                 _SOURCES_READERS),
+                "sources": Value(
+                    STRING_OR_LIST,
+                    "Source roots, relative to the package. The only place "
+                    "`sources` is read: one at the top level or under [build] "
+                    "is an error.",
+                    (f"{RESOLVE}::package_sources",), default='["src"]'),
             },
             read_by=(f"{MANIFEST_PY}::plan_binaries", f"{RZ}::cmd_list"),
             required=True),
@@ -144,8 +146,6 @@ PACKAGE_SCHEMA = Table(
             "Build settings. `opt-level`, `debug` and `lto` are the base every "
             "[profile.*] overrides.",
             {
-                "sources": Value(STRING_OR_LIST, "See top-level `sources`.",
-                                 _SOURCES_READERS),
                 "test_only": Value(
                     BOOL, "The package has tests and no binaries or libraries: "
                     "`build` skips it, `test` runs it.",
@@ -273,7 +273,9 @@ PACKAGE_SCHEMA = Table(
                                  (f"{MANIFEST_PY}::_declared_test_source_files",)),
             },
             read_by=(f"{MANIFEST_PY}::_declared_test_source_files",)),
-    })
+    },
+    moved_from={(): {"sources": _MOVED_SOURCES},
+                ("build",): {"sources": _MOVED_SOURCES}})
 
 
 WORKSPACE_SCHEMA = Table(
@@ -497,6 +499,9 @@ def validate(data: dict, schema: Table, lines: dict[tuple, int] | None = None
                 check(table.fields[k], v, path + (k,))
             elif table.self_named is not None and k == own_name:
                 check(table.self_named, v, path + (k,))
+            elif k in moved.get(path, {}):
+                err(path + (k,), f"'{_dotted(path + (k,))}' is not read: "
+                                 f"{moved[path][k]}")
             else:
                 allowed = sorted(table.fields)
                 if table.self_named is not None:
@@ -507,6 +512,7 @@ def validate(data: dict, schema: Table, lines: dict[tuple, int] | None = None
             if getattr(node, "required", False) and k not in value:
                 err(path, f"{_where(path)} is missing required key '{k}'")
 
+    moved = schema.moved_from
     check_table(schema, data, ())
     errors.sort(key=lambda e: e[0])
     return errors
@@ -869,20 +875,6 @@ class BinaryPlan:
     libraries: list[LibraryConfig] = field(default_factory=list)
 
 
-def package_sources(config: dict) -> list[str] | None:
-    """The package's source roots: `sources` at the top level, else under
-    [package], else under [build] (TOML puts a key in the table it follows),
-    as a list. None when none of them sets it."""
-    sources = config.get("sources")
-    if sources is None:
-        sources = config.get("package", {}).get("sources")
-    if sources is None:
-        sources = config.get("build", {}).get("sources")
-    if isinstance(sources, str):
-        sources = [sources]
-    return sources
-
-
 def wants_convenience_link(bin_config: BinaryConfig) -> bool:
     """Whether a build links `<pkg>/<name>` to the binary (AGAST #4131).
 
@@ -916,6 +908,7 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
         return plan  # Test-only packages have no binaries
 
     # Package-level sources configuration (RFC #109)
+    from resolve import package_sources  # resolve imports this module
     pkg_sources = package_sources(config)
     if pkg_sources is None:
         pkg_sources = ["src"]  # Default

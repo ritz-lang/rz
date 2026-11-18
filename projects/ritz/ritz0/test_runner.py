@@ -32,30 +32,13 @@ from typing import List, Tuple, Optional, Dict
 from lexer import Lexer
 from parser import Parser
 from import_resolver import collect_all_source_files, DependencyMapping
+from resolve import package_sources  # on sys.path via import_resolver (AGAST #3894)
 import ritz_ast as rast
 
 try:
     import tomllib
 except ImportError:
     import tomli as tomllib  # Python < 3.11
-
-
-def get_sources_from_config(config: dict) -> list:
-    """Extract sources from a ritz.toml config.
-
-    Handles the TOML quirk where sources may be nested under [package]
-    or at top-level or under [build].
-    """
-    sources = config.get("sources")
-    if sources is None:
-        sources = config.get("package", {}).get("sources")
-    if sources is None:
-        sources = config.get("build", {}).get("sources")
-    if sources is None:
-        sources = ["src"]  # default
-    if isinstance(sources, str):
-        sources = [sources]
-    return sources
 
 
 def project_source_roots(project_root: Optional[Path]) -> List[str]:
@@ -74,7 +57,7 @@ def project_source_roots(project_root: Optional[Path]) -> List[str]:
         return []
     with open(toml_path, "rb") as f:
         config = tomllib.load(f)
-    roots = [Path(project_root) / s for s in get_sources_from_config(config)]
+    roots = [Path(project_root) / s for s in package_sources(config, ["src"])]
     return [str(r) for r in roots if r.is_dir()]
 
 
@@ -150,7 +133,7 @@ def parse_project_dependencies(project_root: Path) -> dict:
     # This allows tests to import from their own package using the package name
     pkg_name = config.get("package", {}).get("name")
     if pkg_name:
-        pkg_sources = get_sources_from_config(config)
+        pkg_sources = package_sources(config, ["src"])
         # Check if sources actually exist, otherwise use root
         if pkg_sources == ["src"] and not (project_root / "src").is_dir():
             if (project_root / "lib").is_dir():
@@ -177,7 +160,7 @@ def parse_project_dependencies(project_root: Path) -> dict:
                     if dep_toml.exists():
                         with open(dep_toml, "rb") as f:
                             dep_config = tomllib.load(f)
-                        sources = get_sources_from_config(dep_config)
+                        sources = package_sources(dep_config, ["src"])
                         # Check if sources exist, otherwise use root
                         if sources == ["src"] and not (dep_full_path / "src").is_dir():
                             sources = ["."]
