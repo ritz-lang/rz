@@ -192,7 +192,7 @@ main() {
         if [ -e "$wt/.git" ]; then git -C "$wt" checkout -q -f --detach "$5"
         else git -C "$repo" worktree add -q --detach "$wt" "$5"; fi
         [ "$8" = 1 ] && after="bash $(printf %q "$wt/.claude/skills/rz-iterate/train.sh") pkgs test $6"
-        RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$after" bash "$gate" "$wt" "$7" ;;
+        RZ_GATE_TRAIN=1 RZ_GATE_BASE="$6" RZ_GATE_AFTER="$after" bash "$gate" "$wt" "$7" ;;
     wait)
         local rc=0 t0
         t0="$(date +%s)"
@@ -405,7 +405,7 @@ cmd_gate() {
     fi
     # Train priority: the next free slot goes to this gate ahead of room
     # gates (run-gate.sh, AGAST #3317).
-    RZ_GATE_TRAIN=1 RZ_GATE_AFTER="$after" "$GATE" "$WT" "$NAME"
+    RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$NAME"
 }
 
 # gate_next <host>: gate train 2 on <host> while train 1 gates here (AGAST

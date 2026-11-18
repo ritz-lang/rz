@@ -780,3 +780,128 @@ def test_a_stale_cost_report_is_not_folded_in(likely, tmp_path, monkeypatch):
     monkeypatch.setattr(ci_local, "run_step", spy)
     assert ci_local.main(GATE) == 0
     assert set(seen) == {None}
+
+
+# --------------------------------------------------------------------------
+# AGAST #4027 (Aaron 2026-11-18): a gate that knows its base skips "ritz0 unit
+# tests" when tools/ritz0_scope.py finds no change that can reach it.  Never
+# silently: the SKIPPED line names the inputs and the base.  No --diff-base
+# (CI on main) runs everything, and the decision itself is ritz0_scope's
+# (tools/test_ritz0_scope.py); these pin how ci_local acts on it.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def scope(likely, monkeypatch):
+    """The likely-first gate workflow, with ritz0_scope's verdict stubbed."""
+    calls = []
+
+    def set_verdict(skip: bool):
+        def fake(repo, base):
+            calls.append(base)
+            head = (f"SKIPPED ritz0 unit tests: no change under X (base {base[:7]})"
+                    if skip else f"running ritz0 unit tests: Y may reach it (base {base[:7]})")
+            return ci_local.ritz0_scope.Decision(skip, [head, "  detail"])
+        monkeypatch.setattr(ci_local.ritz0_scope, "decide", fake)
+
+    likely.set_verdict = set_verdict
+    likely.calls = calls
+    return likely
+
+
+BASE = "abcdef1234567890abcdef1234567890abcdef12"
+
+
+def test_a_scoped_skip_runs_neither_the_step_nor_its_pre_pass(scope, capsys):
+    scope.set_verdict(True)
+    assert ci_local.main(GATE + ["--diff-base", BASE]) == 0
+    assert scope.calls == [BASE]
+    # The ritz1 build still runs: later steps need it.
+    assert [ln.split()[0] for ln in scope.lines()] == ["early", "build", "late"]
+    out = capsys.readouterr().out
+    assert "SKIPPED ritz0 unit tests: no change under X (base abcdef1)" in out
+    assert "  detail" in out
+    assert "likely failures first)] START" not in out
+    summary = out[out.index("step timings:"):]
+    assert "skipped (no change since --diff-base can reach it" in summary
+    assert "[bootstrap] ritz0 unit tests" in summary
+
+
+def test_a_scoped_run_runs_the_step_and_says_why(scope, capsys):
+    scope.set_verdict(False)
+    assert ci_local.main(GATE + ["--diff-base", BASE]) == 0
+    assert [ln.split()[0] for ln in scope.lines()] == [
+        "build", "pytest", "early", "pytest", "late"]
+    out = capsys.readouterr().out
+    assert "running ritz0 unit tests: Y may reach it (base abcdef1)" in out
+
+
+def test_without_a_diff_base_nothing_is_scoped(scope, capsys):
+    scope.set_verdict(True)
+    assert ci_local.main(GATE) == 0
+    assert scope.calls == []
+    assert [ln.split()[0] for ln in scope.lines()] == [
+        "build", "pytest", "early", "pytest", "late"]
+    assert "SKIPPED ritz0 unit tests" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("argv", [
+    GATE + ["--skip", "ritz0 unit tests"],
+    ["--fail-fast", "--job", "build-all"],
+])
+def test_no_scope_check_when_the_step_would_not_run(scope, argv):
+    scope.set_verdict(True)
+    assert ci_local.main(argv + ["--diff-base", BASE]) == 0
+    assert scope.calls == []
+
+
+def test_a_real_scope_decision_on_a_real_repo(likely, tmp_path, capsys):
+    """End to end through git: a docs-only change skips; a ritz0 change runs."""
+    import subprocess
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(tmp_path), *a], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (tmp_path / "projects/ritz/ritz0").mkdir(parents=True)
+    (tmp_path / "projects/ritz/ritz0/parser.py").write_text("x = 1\n")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs/guide.md").write_text("# a\n")
+    (tmp_path / ".gitignore").write_text("log\nfail-prepass\nmain.yml\nr0/\n")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    base = git("rev-parse", "HEAD")
+    (tmp_path / "docs/guide.md").write_text("# b\n")
+    git("commit", "-qam", "docs")
+    assert ci_local.main(GATE + ["--diff-base", base]) == 0
+    assert "pytest" not in [ln.split()[0] for ln in likely.lines()]
+    assert "SKIPPED ritz0 unit tests: no change under " in capsys.readouterr().out
+    (tmp_path / "log").unlink()
+    (tmp_path / "projects/ritz/ritz0/parser.py").write_text("x = 2\n")
+    git("commit", "-qam", "ritz0")
+    assert ci_local.main(GATE + ["--diff-base", base]) == 0
+    assert "pytest" in [ln.split()[0] for ln in likely.lines()]
+    assert "projects/ritz/ritz0/parser.py (M) may reach it" in capsys.readouterr().out
+
+
+def test_gate_runner_passes_its_base():
+    """run-gate.sh hands ci_local the base: RZ_GATE_BASE (a train's BASE),
+    else the room's merge-base with origin/main.  train.sh passes its BASE on
+    both the local and the remote gate."""
+    root = ci_local.REPO_ROOT / ".claude/skills/rz-iterate"
+    gate, train = root / "run-gate.sh", root / "train.sh"
+    if not gate.is_file() or not train.is_file():
+        pytest.skip("run-gate.sh is not part of this checkout")
+    text = gate.read_text()
+    cmd_line = next(line for line in text.splitlines() if line.startswith("CMD="))
+    assert "--diff-base $BASE" in cmd_line, cmd_line
+    assert "merge-base origin/main" in text
+    assert "RZ_GATE_BASE" in text
+    calls = [ln for ln in train.read_text().splitlines()
+             if "RZ_GATE_TRAIN=1" in ln and not ln.lstrip().startswith("#")]
+    assert len(calls) == 2, calls
+    for ln in calls:
+        assert "RZ_GATE_BASE=" in ln, ln

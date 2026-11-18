@@ -88,6 +88,15 @@ checked per file only (RITZ_TEST_BUDGET_PARTIAL) and folded into the full
 step's (RITZ_COST_REPORT_INCLUDE), which is checked whole. `--no-likely-first`
 runs the steps exactly as declared.
 
+Diff-scoped ritz0 tests (AGAST #4027, Aaron 2026-11-18). `--diff-base <rev>`
+asks tools/ritz0_scope.py whether anything changed since <rev> can reach the
+"ritz0 unit tests" step, the longest in every gate. If nothing can (docs, .claude,
+...: an allowlist; unknown means run), the step and its likely-first pre-pass
+are skipped with `SKIPPED ritz0 unit tests: no change under <inputs> (base
+<sha7>)` and listed in the summary; otherwise the line says which path may
+reach it. The gate runner passes its base (a room's merge-base with origin/main,
+a train's BASE). No --diff-base, as on CI, runs everything.
+
 Exit code: 0 only if every step it ran exited 0. A step that exits 3
 (EXIT_SETUP: `rz build --all` saying a toolchain binary is missing, e.g.
 lld-link, or the harland boot missing QEMU/OVMF/GRUB-EFI, AGAST #1845)
@@ -116,6 +125,7 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import likely_tests
+import ritz0_scope
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "main.yml"
@@ -392,6 +402,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-likely-first", action="store_true",
                    help="do not run the likely-failing ritz0 test files first "
                         "(AGAST #3456); run every step as declared")
+    p.add_argument("--diff-base", metavar="REV",
+                   help=f"skip {PYTEST_STEP!r} if no change since REV can reach it "
+                        "(tools/ritz0_scope.py; AGAST #4027)")
     p.add_argument("--skip", action="append", default=[], metavar="STEP",
                    help="do not run the step with this exact name (repeatable); "
                         "an unknown name is an error")
@@ -461,8 +474,18 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(f"[{s.job}] {s.name} (exit {rc})")
 
     chosen = [s for s in steps if s.job in selected]
+    # AGAST #4027: a gate that knows its base may leave the ritz0 step out.
+    # Only asked when the step would otherwise run; any doubt means run.
+    scoped_out: list[str] = []
+    if args.diff_base and PYTEST_STEP not in args.skip and \
+            any(s.name == PYTEST_STEP for s in chosen):
+        decision = ritz0_scope.decide(REPO_ROOT, args.diff_base)
+        print("\n".join(decision.lines), flush=True)
+        if decision.skip:
+            scoped_out = [s.name for s in chosen if s.name == PYTEST_STEP]
+    plan_skip = args.skip + scoped_out
     early, rest = ([], None) if args.no_likely_first else \
-        plan_likely_first(chosen, args.skip)
+        plan_likely_first(chosen, plan_skip)
     ran_early = {s.name for s in early}
     include_dir = tempfile.mkdtemp(prefix="ritz-likely-first-") if early else None
     for s in early:
@@ -480,7 +503,11 @@ def main(argv: list[str] | None = None) -> int:
             shutil.move(src, dst)
             rest.env["RITZ_COST_REPORT_INCLUDE"] = str(dst)
 
+    skipped_by_scope: list[str] = []
     for s in chosen:
+        if s.name in scoped_out:
+            skipped_by_scope.append(f"[{s.job}] {s.name}")
+            continue
         if s.name in args.skip:
             skipped_by_request.append(f"[{s.job}] {s.name}")
             continue
@@ -508,6 +535,12 @@ def main(argv: list[str] | None = None) -> int:
         # A gate that skipped a step asserts less than CI; say which.
         print("skipped (--skip):")
         for s in skipped_by_request:
+            print(f"  - {s}")
+    if skipped_by_scope:
+        # A gate that skipped a step asserts less than CI; say which, and why.
+        print(f"skipped (no change since --diff-base can reach it; "
+              f"tools/ritz0_scope.py, AGAST #4027):")
+        for s in skipped_by_scope:
             print(f"  - {s}")
     if skipped:
         # Printed, never silent: see the module docstring.

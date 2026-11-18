@@ -185,7 +185,16 @@ fi
 # package test break fails the gate, not CI after the push to main.  It is
 # main.yml's own job, so CI and the gate run the same command, on the CAS
 # build-all just warmed; one `PKG <VERDICT> <id>` line per package.
-CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke --job build-all --job test-all --job bootstrap\"}"
+#
+# The base (AGAST #4027): ci-local --diff-base skips "ritz0 unit tests" when
+# no change since it can reach that step (tools/ritz0_scope.py; it prints
+# SKIPPED ... (base <sha7>), never silently).  A train passes its BASE as
+# RZ_GATE_BASE; a room gate uses its merge-base with origin/main.  A base
+# that doesn't resolve is dropped, and no base means the step runs.
+BASE="${RZ_GATE_BASE:-}"
+[[ -n "$BASE" ]] || BASE="$(git -C "$WT" merge-base origin/main HEAD 2>/dev/null)" || BASE=""
+BASE="$(git -C "$WT" rev-parse --verify --quiet "${BASE:-none}^{commit}" 2>/dev/null)" || BASE=""
+CMD="${RZ_GATE_CMD:-rm -rf projects/ritz/.regression projects/ritz/ritz1/build && make -C projects/ritz smoke && make -C projects/ritz ci-local ARGS=\"--fail-fast --skip Smoke ${BASE:+--diff-base $BASE }--job build-all --job test-all --job bootstrap\"}"
 # A merge train's package tests (AGAST #3363), only once CMD has passed.
 if [[ -n "${RZ_GATE_AFTER:-}" ]]; then CMD="($CMD) && $RZ_GATE_AFTER"; fi
 UNIT="ritz-gate-$NAME"
@@ -220,7 +229,7 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nCMD=%s\nTMPDIR=%s\n' "$UNIT" "$SHA" "$CMD" "$GATE_TMP" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\n' "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that

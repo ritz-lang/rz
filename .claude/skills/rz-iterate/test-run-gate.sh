@@ -416,6 +416,45 @@ l17="$(RZ_GATE_CMD='test ! -e "$TMPDIR/stale"' gate "$W" t17)"
 check 'grep -qx EXIT=0 "$l17"' "a stale TMPDIR from a killed gate is replaced ($(grep '^EXIT=' "$l17"))"
 check '[[ ! -e "$GT" ]]' "and removed afterwards"
 
+# 18. The diff base (AGAST #4027): ci-local --diff-base skips the ritz0 step
+#     when nothing since the base can reach it.  No origin/main and no
+#     RZ_GATE_BASE: no base, so the default command passes none (step runs).
+#     Built from the default CMD, so unset RZ_GATE_CMD and read the header only.
+base_of() { grep '^BASE=' "$1" | head -1 | cut -d= -f2; }
+cmd_of() { grep '^CMD=' "$1" | head -1; }
+gate_hdr() { env -u RZ_GATE_CMD timeout 30 bash "$G" "$@"; }
+# The default CMD would run make; give the stub tree a make that records argv.
+cat > "$T/bin/make" <<'STUB'
+#!/usr/bin/env bash
+echo "make $*" >> "$RZ_TEST_ORDER.make"
+STUB
+chmod +x "$T/bin/make"
+W18="$T/wt18"
+git init -q "$W18"; echo a > "$W18/a"; git -C "$W18" add a; git -C "$W18" commit -qm init
+B18="$(git -C "$W18" rev-parse HEAD)"
+echo b > "$W18/b"; git -C "$W18" add b; git -C "$W18" commit -qm two
+rm -f "$RZ_TEST_ORDER.make"
+l18="$(gate_hdr "$W18" t18)"
+check '[[ -z "$(base_of "$l18")" ]] && grep -qx "BASE=" "$l18"' "no origin/main, no RZ_GATE_BASE: an empty BASE= line"
+check '! cmd_of "$l18" | grep -q -- --diff-base' "and no --diff-base in the command"
+check 'grep -q "ci-local ARGS=--fail-fast --skip Smoke --job build-all" "$RZ_TEST_ORDER.make"' "make ci-local ran without --diff-base"
+# A room gate: its merge-base with origin/main.
+git -C "$W18" update-ref refs/remotes/origin/main "$B18"
+rm -f "$RZ_TEST_ORDER.make"
+l18="$(gate_hdr "$W18" t18)"
+check '[[ "$(base_of "$l18")" == "$B18" ]]' "a room gate's base is its merge-base with origin/main"
+check 'grep -q -- "--diff-base $B18 --job build-all" "$RZ_TEST_ORDER.make"' "and ci-local gets --diff-base <that sha>"
+# A train: RZ_GATE_BASE wins, resolved to a full sha.
+rm -f "$RZ_TEST_ORDER.make"
+l18="$(RZ_GATE_BASE=HEAD gate_hdr "$W18" t18)"
+H18="$(git -C "$W18" rev-parse HEAD)"
+check '[[ "$(base_of "$l18")" == "$H18" ]]' "RZ_GATE_BASE wins, resolved to a full sha"
+# A base that doesn't resolve is dropped, not passed on: the step runs.
+rm -f "$RZ_TEST_ORDER.make"
+l18="$(RZ_GATE_BASE=no-such-rev gate_hdr "$W18" t18)"
+check '[[ -z "$(base_of "$l18")" ]] && ! grep -q -- --diff-base "$RZ_TEST_ORDER.make"' "an unresolvable RZ_GATE_BASE is dropped"
+rm -f "$T/bin/make"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1
