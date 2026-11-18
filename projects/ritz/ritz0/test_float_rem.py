@@ -66,10 +66,9 @@ ROWS = {
     # -4 % 2 is -0.0: 1 / -0.0 is -inf.
     "negative_zero": _row("1.0 / r(0.0 - 4.0, 2.0) < 0.0 and 1.0 / r(4.0, 0.0 - 2.0) > 0.0", 6),
     # y == 0 or x infinite is NaN; y infinite leaves x.
-    # (`not (n == n)`: Ritz's `!=` is an ordered compare, false on NaN.)
-    "nan_and_inf": _row("not (r(1.0, 0.0) == r(1.0, 0.0)) and not (r(1.0 / 0.0, 2.0) == r(1.0 / 0.0, 2.0)) "
-                        "and r(5.0, 1.0 / 0.0) == 5.0 and not (r(0.0 / 0.0, 2.0) == r(0.0 / 0.0, 2.0)) "
-                        "and not (r(2.0, 0.0 / 0.0) == r(2.0, 0.0 / 0.0))", 7),
+    "nan_and_inf": _row("r(1.0, 0.0) != r(1.0, 0.0) and r(1.0 / 0.0, 2.0) != r(1.0 / 0.0, 2.0) "
+                        "and r(5.0, 1.0 / 0.0) == 5.0 and r(0.0 / 0.0, 2.0) != r(0.0 / 0.0, 2.0) "
+                        "and r(2.0, 0.0 / 0.0) != r(2.0, 0.0 / 0.0)", 7),
     # The widest exponent spread: 2^1000 % 3 is 1, and % the least subnormal is 0.
     "extreme_exponents": _row("r(pow2(1000), 3.0) == 1.0 and r(pow2(1000), tiny()) == 0.0 "
                               "and r(tiny() * 3.0, tiny() * 2.0) == tiny()", 8),

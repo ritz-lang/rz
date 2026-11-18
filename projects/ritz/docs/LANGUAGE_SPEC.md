@@ -2240,6 +2240,20 @@ let half = (a ^ z) / 2     # 9223372036854775804
 let third = (~s) / 3       # 82
 ```
 
+#### NaN
+
+Float comparisons follow IEEE 754, as C's do. A NaN is unordered: `==`, `<`,
+`<=`, `>` and `>=` are false when either side is NaN, and `!=` is true, so
+`!=` is always the negation of `==` and `x != x` tests for NaN (AGAST #3836):
+
+```ritz body
+let n: f64 = 0.0 / 0.0
+let is_nan = n != n         # true
+let differs = n != 1.0      # true
+let same = n == n           # false
+let below = n < 1.0         # false
+```
+
 #### `f32` against `f64`
 
 Comparing an `f32` with an `f64` (`== != < <= > >=`) is an error on every

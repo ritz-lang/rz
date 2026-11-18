@@ -9272,7 +9272,7 @@ class LLVMEmitter:
                 return self.builder.icmp_signed('==', left, right)
             elif op == '!=':
                 if is_float:
-                    return self.builder.fcmp_ordered('!=', left, right)
+                    return self.builder.fcmp_unordered('!=', left, right)
                 enum_cmp = self._try_enum_tag_compare(op, left, right)
                 if enum_cmp is not None:
                     return enum_cmp
