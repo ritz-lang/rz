@@ -92,6 +92,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.gvec
+import ritzlib.hashmap   # HashMapI64 (own_move_only_in)
 import ritzlib.memory
 
 import ast
@@ -536,8 +537,11 @@ fn own_base_len(name: *u8, len: i32) -> i32
 
 # 1 when the type itself has an `impl Drop`.
 fn own_has_drop_impl(s: *EmitterState, name: *u8, len: i32) -> i32
+    own_has_drop_impl_in(s.module, name, len)
+
+fn own_has_drop_impl_in(m: *Module, name: *u8, len: i32) -> i32
     let base_len: i32 = own_base_len(name, len)
-    var ib: *ImplBlock = s.module.impls
+    var ib: *ImplBlock = m.impls
     while ib != null
         if ib.trait_name != null and name_eq(ib.trait_name, ib.trait_name_len, c"Drop", 4) == 1
             if name_eq(ib.type_name, ib.type_name_len, name, base_len) == 1
@@ -546,9 +550,14 @@ fn own_has_drop_impl(s: *EmitterState, name: *u8, len: i32) -> i32
     0
 
 fn own_move_only_depth(s: *EmitterState, name: *u8, len: i32, depth: i32) -> i32
+    own_move_only_in(s.module, @s.struct_map, name, len, depth)
+
+# own_move_only_depth over `m` and a struct map of its (struct_map_find): the
+# emitter's, or Sema's (AGAST #4011).
+fn own_move_only_in(m: *Module, map: *HashMapI64, name: *u8, len: i32, depth: i32) -> i32
     if name == null or len <= 0 or depth > OWN_MAX_DEPTH
         return 0
-    if own_has_drop_impl(s, name, len) == 1
+    if own_has_drop_impl_in(m, name, len) == 1
         return 1
     # Generic arguments: `Vec$Tracked`, `Pair$i32$Tracked`.
     let base_len: i32 = own_base_len(name, len)
@@ -558,10 +567,10 @@ fn own_move_only_depth(s: *EmitterState, name: *u8, len: i32, depth: i32) -> i32
         var j: i32 = start
         while j < len and *(name + j) != 36
             j += 1
-        if j > start and own_move_only_depth(s, name + start, j - start, depth + 1) == 1
+        if j > start and own_move_only_in(m, map, name + start, j - start, depth + 1) == 1
             return 1
         i = j
-    let st: *StructDef = find_struct(s, name, len)
+    let st: *StructDef = struct_map_find(map, m, name, len)
     if st == null
         # A user enum is move-only when a variant's payload is (AGAST #2165).
         let ei: i32 = user_enum_index(name, len)
@@ -569,11 +578,11 @@ fn own_move_only_depth(s: *EmitterState, name: *u8, len: i32, depth: i32) -> i32
             return 0
         var vi: i32 = 0
         while vi < enum_variant_count(ei)
-            if own_fields_move_only(s, enum_variant_fields(ei, vi), depth + 1) == 1
+            if own_fields_move_only_in(m, map, enum_variant_fields(ei, vi), depth + 1) == 1
                 return 1
             vi += 1
         return 0
-    own_fields_move_only(s, st.fields, depth + 1)
+    own_fields_move_only_in(m, map, st.fields, depth + 1)
 
 # The leaf elements of an N-D array shape, when they are structs: 1, with
 # their total count and type.
@@ -606,19 +615,25 @@ fn own_field_array(f: *StructField, out_n: *i32, out_name: **u8, out_len: *i32) 
 
 # 1 when field `f` (of a struct or an enum payload) holds a move-only value.
 fn own_field_move_only(s: *EmitterState, f: *StructField, depth: i32) -> i32
+    own_field_move_only_in(s.module, @s.struct_map, f, depth)
+
+fn own_field_move_only_in(m: *Module, map: *HashMapI64, f: *StructField, depth: i32) -> i32
     if f.field_type == TYPE_STRUCT
-        return own_move_only_depth(s, f.field_type_name, f.field_type_name_len, depth)
+        return own_move_only_in(m, map, f.field_type_name, f.field_type_name_len, depth)
     var n: i32 = 0
     var en: *u8 = null
     var el: i32 = 0
     if own_field_array(f, @n, @en, @el) == 1
-        return own_move_only_depth(s, en, el, depth)
+        return own_move_only_in(m, map, en, el, depth)
     0
 
 fn own_fields_move_only(s: *EmitterState, fields: *StructField, depth: i32) -> i32
+    own_fields_move_only_in(s.module, @s.struct_map, fields, depth)
+
+fn own_fields_move_only_in(m: *Module, map: *HashMapI64, fields: *StructField, depth: i32) -> i32
     var f: *StructField = fields
     while f != null
-        if own_field_move_only(s, f, depth) == 1
+        if own_field_move_only_in(m, map, f, depth) == 1
             return 1
         f = f.next
     0
@@ -642,6 +657,15 @@ pub fn own_type_is_move_only(s: *EmitterState, name: *u8, len: i32) -> i32
     if own_any_drop(s) == 0
         return 0
     own_move_only_depth(s, name, len, 0)
+
+# own_type_is_move_only over `m` and a struct map of its: Sema's (AGAST #4011).
+pub fn own_type_is_move_only_in(m: *Module, map: *HashMapI64, name: *u8, len: i32) -> i32
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.trait_name != null and name_eq(ib.trait_name, ib.trait_name_len, c"Drop", 4) == 1
+            return own_move_only_in(m, map, name, len, 0)
+        ib = ib.next
+    0
 
 # =============================================================================
 # Drop glue
@@ -2839,7 +2863,6 @@ pub fn own_check_stmt(s: *EmitterState, stmt: *Stmt)
     o.fa_cond = 0
     o.fa_path = 0 - 1
     o.fa_mask = 0
-    ref_check_stmt(s, stmt)
     if own_checking(s) == 0
         return
     let k: i32 = stmt.kind
@@ -2928,14 +2951,12 @@ pub fn own_after_stmt(s: *EmitterState, stmt: *Stmt)
 
 # A fn's tail expression is its return value: a move.
 pub fn own_check_tail(s: *EmitterState, e: *Expr)
-    ref_check_value(s, e)
     if own_checking(s) == 0
         return
     own_walk(s, e, 1)
 
 # A match / if-expression arm's value expression.
 pub fn own_check_arm(s: *EmitterState, e: *Expr)
-    ref_check_value(s, e)
     if own_checking(s) == 0
         return
     own_walk(s, e, 1)

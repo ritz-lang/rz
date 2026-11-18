@@ -1670,16 +1670,18 @@ pub fn main() -> i32
     var g: [2][2]i32 = [0; 2]
     return g[1][1]
 """, ":2:", "a row of a multi-dimensional array initializer must be"),
+    # A literal short of its slot's length is LARB R42's error, on Sema since
+    # AGAST #4011: it stops the compile before the emitter's shape refusal.
     "local_initializer_short": ("""\
 pub fn main() -> i32
     var g: [2][2]i32 = [ [1, 2] ]
     return g[1][1]
-""", ":2:", "initializer's shape does not match the local array's"),
+""", ":2:24:", "an array literal of 1 element for a `[2][2]i32`"),
     "local_initializer_short_row": ("""\
 pub fn main() -> i32
     var g: [2][2]i32 = [ [1, 2], [3] ]
     return g[1][1]
-""", ":2:", "initializer's shape does not match the local array's"),
+""", ":2:34:", "an array literal of 1 element for a `[2]i32`"),
     "local_initializer_named_row": ("""\
 pub fn main() -> i32
     var r: [2]i32 = [1, 2]

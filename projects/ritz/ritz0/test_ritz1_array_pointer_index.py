@@ -444,7 +444,9 @@ STRUCT_WRITES = {
 ROWS = {
     "row_element": "fn f(p: @[2][3]i32) -> i32\n    return p[1][2]\n\n",
     "row": "fn f(p: @[2][3]i32) -> i32\n    let r: *i32 = p[1] as *i32\n    return r[2]\n\n",
-    "inferred": "fn f(a:& [2][3]i32) -> i32\n    let p = @a\n    return p[1][2]\n\n",
+    # An `@[2][3]i32` param, not a `:&` one: main's `f(@a)` would be refused
+    # first, on Sema since AGAST #4011 (`@x` doesn't fit a `:&` slot).
+    "inferred": "fn f(a: @[2][3]i32) -> i32\n    let p = a\n    return p[1][2]\n\n",
 }
 
 
@@ -586,7 +588,8 @@ WHOLE_STRUCT_ELEMENT = {
     "inferred_var_copy": _S + "fn f(p: @[3]S) -> i64\n    var q = p\n    return q[1] as i64\n\n" + _SMAIN,
     "inferred_local": _S + "pub fn main() -> i32\n    var a: [3]S\n    let p = @a\n    return p[1] as i32\n",
     "inferred_mut_local": _S + "pub fn main() -> i32\n    var a: [3]S\n    let p = @&a\n    return p[1] as i32\n",
-    "inferred_borrow": _S + "fn f(a:& [3]S) -> i64\n    let p = @a\n    return p[1] as i64\n\n" + _SMAIN,
+    # `@&a` into the `:&`: `@a` is refused first, on Sema since AGAST #4011.
+    "inferred_borrow": _S + "fn f(a:& [3]S) -> i64\n    let p = @a\n    return p[1] as i64\n\n" + _SMUT,
     "inferred_global": _S + "var G: [3]S\n\npub fn main() -> i32\n    let p = @G\n    return p[1] as i32\n",
     "inferred_field": _S + "struct H\n    cs: [3]S\n\npub fn main() -> i32\n    var h: H\n    let p = @h.cs\n    return p[1] as i32\n",
     # AGAST #2993: `let n: i64 = a[1]` on a `[3]S` itself (local, global, field) is

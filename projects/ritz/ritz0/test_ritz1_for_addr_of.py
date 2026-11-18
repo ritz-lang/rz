@@ -241,10 +241,12 @@ def test_address_of_a_field_that_isnt_a_place_is_refused(compile_with, compiler,
     assert comp.returncode != 0
     assert not ll.exists()
     assert "Traceback" not in out, out[-2000:]
-    if compiler != "ritz0":
-        assert "this `for` iterable is not supported in ritz1" in out
-    elif name != "scalar_field":
+    # ritz1's call-temporary check runs on Sema since AGAST #4011, so it stops
+    # the compile with ritz0's words before the emitter's `for` refusal.
+    if name != "scalar_field":
         assert ref_rules.ADDR_OF_TEMP in out, out[-2000:]
+    elif compiler != "ritz0":
+        assert "this `for` iterable is not supported in ritz1" in out
 
 
 # A pointer field of a call's result points at a place that isn't the

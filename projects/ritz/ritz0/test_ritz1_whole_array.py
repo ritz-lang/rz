@@ -2512,10 +2512,23 @@ LOCATED = {
 }
 
 
+# The slot checks, on Sema since AGAST #4011, refuse these arguments first, in
+# ref_rules' and array_rules' words, and stop the compile before the emitter's
+# "argument 1 of `g` has the wrong type".
+LOCATED_ON_SEMA = {
+    "arg_ptr_array": "a value doesn't fit a reference slot: write `@x` to borrow it",
+    "arg_ptr_i32": "a whole array is not a pointer: `@a[0]` points at its first element",
+    "lent_to_ptr": "a value doesn't fit a reference slot: write `@x` to borrow it",
+    "ref_wrong_len": "a value doesn't fit a reference slot: write `@x` to borrow it",
+}
+
+
 # ritz1 only: a located diagnostic that starts with the argument and says why,
-# printed as an `error:` (AGAST #3621; _compile_no_ll hides one that isn't).
+# printed as an `error:` (AGAST #3621; _compile_no_ll hides one that isn't), or
+# LOCATED_ON_SEMA's words where the slot checks refuse the argument first.
 ARGUMENT_ROWS = [Row(f"refusal_names_the_argument[{name}]", ("ritz1",),
-                     Refused(REJECTED[name], Prefix(f"argument 1 of `g` has the wrong type: {LOCATED[name]}")))
+                     Refused(REJECTED[name], Prefix(LOCATED_ON_SEMA[name] if name in LOCATED_ON_SEMA
+                                                    else f"argument 1 of `g` has the wrong type: {LOCATED[name]}")))
                  for name in sorted(LOCATED)]
 
 

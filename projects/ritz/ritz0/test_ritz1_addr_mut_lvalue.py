@@ -296,5 +296,8 @@ pub fn main() -> i32
 """
     comp, ll = _compile("ritz1", tmp_path, "rvalue", program)
     assert comp.returncode != 0, f"ritz1 accepted `@&five()`:\n{comp.stdout[-1000:]}"
-    assert "cannot take mutable address" in comp.stdout + comp.stderr
+    # `@&five()` is an `@&i64` where `bump` takes an `@&C`: the slot check, on
+    # Sema since AGAST #4011, refuses it first and stops the compile before the
+    # emitter's "cannot take mutable address".
+    assert "error: a reference to one type doesn't fit a reference to another" in comp.stdout + comp.stderr
     assert not ll.exists(), "ritz1 wrote an artifact for `@&five()`"

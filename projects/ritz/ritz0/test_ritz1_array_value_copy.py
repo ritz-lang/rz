@@ -176,4 +176,6 @@ def test_array_length_mismatch_fails_closed(ritz1_bin, tmp_path):
         capture_output=True, text=True,
     )
     assert proc.returncode != 0
-    assert "array literal length does not match" in proc.stderr
+    # The slot's own rule (LARB R42), on Sema since AGAST #4011, stops the
+    # compile before the emitter's "array literal length does not match".
+    assert "bad.ritz:3:9: error: an array literal of 2 elements for a `[3]i64`" in proc.stderr, proc.stderr
