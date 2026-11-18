@@ -81,6 +81,19 @@ fn ms(b: bool) -> Span<i32>
 pub fn main() -> i32
     return c32(ms(true)) + c32(ms(false))
 """,
+    # ... and through a typed let's `if` arms: its phi is the slot's Span$T
+    # (AGAST #4194; ritz1 typed it `phi i64`).
+    "typed_let_if_arms": """\
+fn ms(b: bool) -> Span<i32>
+    let s: Span<i32> = if b
+        Span.empty()
+    else
+        Span.empty()
+    return s
+
+pub fn main() -> i32
+    return c32(ms(true)) + c32(ms(false))
+""",
     "typed_let": """\
 pub fn main() -> i32
     let s: Span<i64> = Span.empty()
@@ -216,10 +229,7 @@ pub fn main() -> i32
 
 
 # (compiler, row) -> the open ticket it fails on.  Strict: the fix flips it.
-KNOWN = {
-    # ritz1 types an `if` of `Span.empty()` arms as `phi i64` (AGAST #4194).
-    (c, "tail_if_arms"): "AGAST #4194" for c in ("ritz1", "ritz1_selfhosted")
-}
+KNOWN: dict = {}
 
 
 def _params(table):
