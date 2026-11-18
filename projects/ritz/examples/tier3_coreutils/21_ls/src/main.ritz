@@ -27,7 +27,10 @@ import ritzlib.strview
 import ritzlib.result
 import ritzlib.fs
 import ritzlib.string
-import ritzlib.args
+import ritzlib.option
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
 
 # ============================================================================
 # Options
@@ -366,42 +369,47 @@ fn list_directory(path: *u8, opts: *LsOptions, show_dirname: i32) -> i32
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Initialize argument parser
-    var parser: ArgParser
-    args_init(@parser, c"ls", c"List directory contents")
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("ls", "List directory contents")
+    argspec_switch(@&spec, 'l', "long", "Long listing format")
+    argspec_switch(@&spec, 'a', "all", "Show hidden files (starting with .)")
+    argspec_switch(@&spec, '1', "one-per-line", "One file per line")
+    argspec_switch(@&spec, 'h', "human-readable", "Human-readable sizes (K, M, G)")
+    argspec_switch(@&spec, 'd', "directory", "List directories themselves, not contents")
+    argspec_switch(@&spec, 'F', "classify", "Append indicator (/ for dirs, * for executables)")
+    argspec_positionals(@&spec, "PATH", "Paths to list", 0, ARGS_UNLIMITED)
+    spec
 
-    # Define options
-    args_flag(@parser, 'l', c"long", c"Long listing format")
-    args_flag(@parser, 'a', c"all", c"Show hidden files (starting with .)")
-    args_flag(@parser, '1', c"one-per-line", c"One file per line")
-    args_flag(@parser, 'h', c"human-readable", c"Human-readable sizes (K, M, G)")
-    args_flag(@parser, 'd', c"directory", c"List directories themselves, not contents")
-    args_flag(@parser, 'F', c"classify", c"Append indicator (/ for dirs, * for executables)")
-    args_positional(@parser, c"PATH", c"Paths to list", 0, -1)  # 0 to unlimited
+# "ls: <message>" on stderr; exit status 1, as before the argspec port.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
 
-    # Parse arguments
-    if args_parse(@parser, argc, argv) != 0
-        return 1
+# Positional i as a C string.  A positional is always a whole argv entry, so
+# its view ends at argv's NUL and .ptr is a valid C string.
+fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
+    let v: StrView = span_get<StrView>(pos, i)
+    v.ptr
 
-    # Extract options
+fn ls(p: @ParsedArgs) -> i32
     var opts: LsOptions
-    opts.long_list = args_get_flag(@parser, 'l') as u8
-    opts.show_all = args_get_flag(@parser, 'a') as u8
-    opts.one_per_line = args_get_flag(@parser, '1') as u8
-    opts.human = args_get_flag(@parser, 'h') as u8
-    opts.dir_only = args_get_flag(@parser, 'd') as u8
-    opts.classify = args_get_flag(@parser, 'F') as u8
+    opts.long_list = parsed_switch(p, "long") as u8
+    opts.show_all = parsed_switch(p, "all") as u8
+    opts.one_per_line = parsed_switch(p, "one-per-line") as u8
+    opts.human = parsed_switch(p, "human-readable") as u8
+    opts.dir_only = parsed_switch(p, "directory") as u8
+    opts.classify = parsed_switch(p, "classify") as u8
 
     var result: i32 = 0
-    let num_paths: i32 = parser.positional_count
+    let pos = parsed_positionals(p)
+    let num_paths: i64 = pos.len
 
     if num_paths == 0
         # List current directory
         result = list_directory(c".", @opts, 0)
     else if num_paths == 1
         # Single path
-        let path: *u8 = args_get_positional(@parser, 0)
+        let path: *u8 = positional_cstr(@pos, 0)
 
         # Check if it's a file or directory
         if opts.dir_only != 0
@@ -419,7 +427,7 @@ fn main(argc: i32, argv: **u8) -> i32
     else
         # Multiple paths - show each with header
         for i in 0..num_paths
-            let path: *u8 = args_get_positional(@parser, i)
+            let path: *u8 = positional_cstr(@pos, i)
 
             if i > 0
                 print_char(10)  # Blank line between
@@ -429,3 +437,19 @@ fn main(argc: i32, argv: **u8) -> i32
                 result = 1
 
     return result
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let status = ls(@parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let status: i32 = match argspec_parse(@spec, args_tail(@all))
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status

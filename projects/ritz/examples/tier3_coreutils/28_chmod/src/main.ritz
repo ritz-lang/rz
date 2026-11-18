@@ -24,7 +24,11 @@ import ritzlib.str
 import ritzlib.strview
 import ritzlib.string
 import ritzlib.fs
-import ritzlib.args
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
 
 # Diagnostic helper — see 24_cp.
 fn chmod_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
@@ -186,39 +190,36 @@ fn chmod_recursive(path: *u8, opts: *ChmodOptions) -> i32
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Initialize argument parser
-    var parser: ArgParser
-    args_init(@parser, c"chmod", c"Change file mode bits")
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("chmod", "Change file mode bits")
+    argspec_switch(@&spec, 'v', "verbose", "Output diagnostics for each file")
+    argspec_switch(@&spec, 'R', "recursive", "Change files and directories recursively")
+    # One positional run of at least 2: MODE, then one or more FILEs.
+    argspec_positionals(@&spec, "MODE FILE...", "Mode and files to change", 2, ARGS_UNLIMITED)
+    spec
 
-    # Define flags
-    args_flag(@parser, 'v', c"verbose", c"Output diagnostics for each file")
-    args_flag(@parser, 'R', c"recursive", c"Change files and directories recursively")
+# "chmod: <message>" on stderr; exit status 1, as before the argspec port.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
 
-    # Define positionals: MODE and FILE...
-    # Note: We use a single positional definition that requires at least 2 args
-    # (one MODE + at least one FILE), with unlimited max
-    args_positional(@parser, c"MODE FILE...", c"Mode and files to change", 2, -1)
+# Positional i as a C string.  A positional is always a whole argv entry, so
+# its view ends at argv's NUL and .ptr is a valid C string.
+fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
+    let v: StrView = span_get<StrView>(pos, i)
+    v.ptr
 
-    # Parse arguments
-    if args_parse(@parser, argc, argv) != 0
-        return 1
-
-    # Check we have at least 2 positional args (MODE + at least one FILE)
-    if parser.positional_count < 2
-        eprintln("Usage: chmod [-vR] MODE FILE...")
-        return 1
-
-    # Extract options
+fn chmod_all(p: @ParsedArgs) -> i32
     var opts: ChmodOptions
-    opts.verbose = args_get_flag(@parser, 'v')
-    opts.recursive = args_get_flag(@parser, 'R')
+    opts.verbose = parsed_switch(p, "verbose") as i32
+    opts.recursive = parsed_switch(p, "recursive") as i32
     opts.mode = 0
     opts.mode_add = 0
     opts.mode_remove = 0
 
-    # First positional is MODE
-    let mode_arg: *u8 = args_get_positional(@parser, 0)
+    # First positional is MODE (argspec_parse guarantees at least 2)
+    let pos = parsed_positionals(p)
+    let mode_arg: *u8 = positional_cstr(@pos, 0)
 
     # Parse MODE - try octal first, then symbolic
     let first_char: u8 = *mode_arg
@@ -237,9 +238,9 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # Process FILE arguments (positionals 1 to N)
     var result: i32 = 0
-    var i: i32 = 1
-    while i < parser.positional_count
-        let path: *u8 = args_get_positional(@parser, i)
+    var i: i64 = 1
+    while i < pos.len
+        let path: *u8 = positional_cstr(@pos, i)
         if opts.recursive != 0
             let r: i32 = chmod_recursive(path, @opts)
             if r != 0
@@ -251,3 +252,19 @@ fn main(argc: i32, argv: **u8) -> i32
         i += 1
 
     return result
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let status = chmod_all(@parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let status: i32 = match argspec_parse(@spec, args_tail(@all))
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status

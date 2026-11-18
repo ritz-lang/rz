@@ -40,7 +40,10 @@ fn stat_err2(prefix: StrView, path: *u8, suffix: StrView) -> i32
     eprintln_string(@s)
     string_drop(@&s)
     return 1
-import ritzlib.args
+import ritzlib.option
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
 
 # ============================================================================
 # Options
@@ -201,31 +204,50 @@ fn display_stat(path: *u8, opts: *StatOptions) -> i32
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Set up argument parser
-    var parser: ArgParser
-    args_init(@parser, c"stat", c"Display file status")
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("stat", "Display file status")
+    argspec_switch(@&spec, 'L', "dereference", "Follow symlinks")
+    argspec_positionals(@&spec, "FILE", "File(s) to display status for", 1, ARGS_UNLIMITED)
+    spec
 
-    # Define options
-    args_flag(@parser, 76, c"dereference", c"Follow symlinks")  # 'L'
+# "stat: <message>" on stderr; exit status 1, as before the argspec port.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
 
-    # Define positional arguments (FILE... required, min=1, unlimited max)
-    args_positional(@parser, c"FILE", c"File(s) to display status for", 1, -1)
+# Positional i as a C string.  A positional is always a whole argv entry, so
+# its view ends at argv's NUL and .ptr is a valid C string.
+fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
+    let v: StrView = span_get<StrView>(pos, i)
+    v.ptr
 
-    # Parse arguments
-    if args_parse(@parser, argc, argv) != 0
-        return 1
-
-    # Build options from parsed values
+fn stat_all(p: @ParsedArgs) -> i32
     var opts: StatOptions
-    opts.follow_links = args_get_flag(@parser, 76)  # 'L'
+    opts.follow_links = parsed_switch(p, "dereference") as i32
 
     # Process each file
     var result: i32 = 0
-    for i in 0..parser.positional_count
-        let path: *u8 = args_get_positional(@parser, i)
+    let pos = parsed_positionals(p)
+    for i in 0..pos.len
+        let path: *u8 = positional_cstr(@pos, i)
         let r: i32 = display_stat(path, @opts)
         if r != 0
             result = 1
 
     return result
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let status = stat_all(@parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let status: i32 = match argspec_parse(@spec, args_tail(@all))
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status
