@@ -15,8 +15,9 @@ The checks are structural, at source level:
   main.ritz defines none of them;
 * syscall_table_init still registers the same handlers, each imported from
   the module that defines it;
-* the open handler lives in the module that owns g_child_pid/g_has_parent.
-  Its old save/restore of them around sys_open is gone (#2761: the
+* the open handler lives in the process module (which owned
+  g_child_pid/g_has_parent until AGAST #1882 moved process state into
+  proc/table.ritz). Its old save/restore of them around sys_open is gone (#2761: the
   "corruption" was the syscall stack overrunning .data, not a compiler bug);
 * symbols bound by name from outside Ritz (`call syscall_handler` in
   syscall_entry.s, `extern fn alloc_user_stack` in loader/elf.ritz) stay `pub`;
@@ -66,17 +67,17 @@ AREAS = {
         "alloc_user_stack", "free_user_stack", "sys_mmap_impl", "sys_munmap_impl",
         "sys_mmap_handler", "sys_munmap_handler",
     ],
-    "cwd": ["init_cwd", "sys_getcwd_impl", "sys_chdir_impl", "sys_getcwd_handler", "sys_chdir_handler"],
+    "cwd": ["sys_getcwd_impl", "sys_chdir_impl", "sys_getcwd_handler", "sys_chdir_handler"],
     "input": ["sys_input_poll_impl", "sys_input_read_impl", "sys_input_poll_handler", "sys_input_read_handler"],
     "framebuffer": ["sys_fb_info_impl", "sys_fb_map_impl", "sys_fb_info_handler", "sys_fb_map_handler"],
 }
 
 VARS = {
-    "process": ["g_parent_ctx", "g_parent_frame", "g_has_parent", "g_child_pid", "g_child_pml4",
-                "g_child_exit_code"],
+    # process.ritz's g_parent_ctx/g_parent_frame/g_has_parent/g_child_pid/
+    # g_child_pml4/g_child_exit_code and cwd.ritz's g_cwd/g_cwd_len became
+    # per-process Proc fields (proc/table.ritz) in AGAST #1882.
     # memory.ritz's one global, g_next_mmap_addr, became a per-process cursor
     # (FsProc.mmap_next, fs/syscall.ritz) in AGAST #3530.
-    "cwd": ["g_cwd", "g_cwd_len"],
     # framebuffer.ritz's g_user_fb_mapped/g_user_fb_addr cache was dropped in
     # AGAST #2755: sys_fb_map maps into each calling process.
 }
@@ -92,7 +93,6 @@ CONSTS = {
 # What main.ritz still calls (kernel_main, run_init), by area.
 MAIN_USES = {
     "entry": {"syscall_init"},
-    "cwd": {"init_cwd"},
     "memory": {"alloc_user_stack"},
     "process": {"process_enter_init"},
 }
@@ -218,13 +218,11 @@ def test_table_registers_handlers_imported_from_their_area():
 
 
 def test_sys_open_handler_calls_sys_open_without_the_old_workaround():
-    """The open handler, in the module that owns g_child_pid/g_has_parent,
-    validates the path and returns sys_open's result directly. The save/restore
+    """The open handler, in the process module, validates the path and returns sys_open's result directly. The save/restore
     of those globals that used to wrap the call is gone (#2761): what clobbered
     them was the 4 KiB syscall stack overrunning .data, fixed in
     syscall_entry.s."""
     code = _code(_area("process"))
-    assert {"g_child_pid", "g_has_parent"} <= _vars(code)
     body = _body(code, "sys_open_handler")
     assert re.search(r"return sys_open\(rdi as \*u8, rsi, rdx as i32\)", body), body
     assert "saved_child_pid" not in body and "saved_has_parent" not in body, body

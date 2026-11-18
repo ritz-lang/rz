@@ -182,7 +182,6 @@ def test_kernel_main_keeps_the_boot_order():
     assert "postinit_self_tests(has_boot_info)" in body
     # \b: fs_syscall_init() runs earlier and must not match syscall_init().
     steps = [
-        r"\bscheduler_init\(\)",
         r"\bpostinit_self_tests\(has_boot_info\)",
         re.escape(r'prints("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",

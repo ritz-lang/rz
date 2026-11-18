@@ -15,9 +15,8 @@ Re-port of origin/harland-main 0eda5329, 86f03bb6 and a0e23c79 onto main.
   of RAM).  Freeing either used to put device memory in the free pool.
 * sys_fb_map maps into the calling process every time: the kernel-wide
   "already mapped" cache returned an address the next process never had.
-* The scheduler bounds idle-task creation: CPU index in [0, MAX_CPUS),
-  task_count < MAX_TASKS, a failed stack allocation, and a firmware CPU count
-  clamped to [1, MAX_CPUS].
+* (The scheduler's idle-task bounds went with the unused scheduler, deleted
+  in AGAST #1882; test_harland_process_model.py checks it stays gone.)
 
 The PMM rule is checked by running the real module on the host; the rest is
 structural, with the OVMF Tier-1 boot (tools/test_tier1_boot.sh: init's
@@ -38,7 +37,6 @@ EXCEPTIONS = KERNEL_SRC / "arch" / "x86_64" / "exceptions.ritz"
 PROCESS = KERNEL_SRC / "syscall" / "runtime" / "process.ritz"
 FRAMEBUFFER = KERNEL_SRC / "syscall" / "runtime" / "framebuffer.ritz"
 VMM = KERNEL_SRC / "mm" / "vmm.ritz"
-SCHED = KERNEL_SRC / "sched" / "mod.ritz"
 TIER1_BOOT = HARLAND / "tools" / "test_tier1_boot.sh"
 
 
@@ -162,34 +160,6 @@ def test_init_exit_powers_off():
     init = body.split("resume_user_frame(", 1)[1]
     # fds flushed, then ACPI poweroff; only a failed poweroff halts.
     assert init.index("fs_process_end()") < init.index("acpi_poweroff()") < init.index("halt_loop()")
-
-
-# --- scheduler bounds ---------------------------------------------------------------
-
-def test_create_idle_task_bounds():
-    body = _fn(SCHED, "create_idle_task")
-    lock = body.index("sched_lock()")
-    # CPU index checked before anything indexes cpu_sched
-    assert re.search(r"if cpu_idx < 0 or cpu_idx >= MAX_CPUS\n\s+return -1", body[:lock]), body
-    # task slots, under the lock, before task_count is taken
-    m = re.search(r"if task_count >= MAX_TASKS as u32\n\s+sched_unlock\(\)\n\s+return -1", body)
-    assert m and lock < m.start() < body.index("let task_idx: u32 = task_count"), body
-    # a failed stack allocation gives the slot back, unlocks and fails
-    # before the stack is used
-    m = re.search(r"let stack_phys: u64 = pmm_alloc_page\(\)\n\s+if stack_phys == 0\n"
-                  r"\s+task_count = task_count - 1\n\s+sched_unlock\(\)\n\s+return -1", body)
-    assert m and m.end() < body.index("(*task).stack_base = stack_phys"), body
-
-
-def test_scheduler_init_clamps_the_cpu_count():
-    body = _fn(SCHED, "scheduler_init")
-    assert re.search(r"if cpu_total < 1\n\s+cpu_total = 1", body), body
-    assert re.search(r"if cpu_total > MAX_CPUS\n\s+cpu_total = MAX_CPUS", body), body
-    # the AP loop runs to the clamped count, never num_cpus itself
-    assert re.search(r"while i < cpu_total\n", body), body
-    assert not re.search(r"while i < num_cpus", body), body
-    # a BSP idle task that can't be made fails init
-    assert re.search(r"if create_idle_task\(0\) < 0\n(?:\s+.*\n)*?\s+return -1", body), body
 
 
 # --- indium: the fault test and init's own exit -------------------------------------

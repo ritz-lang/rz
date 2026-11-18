@@ -10,7 +10,7 @@
 import libharland { print_str, print_int }
 import ritzlib.str { strlen }
 import ritzlib.fmt { fmt_i64_into }
-import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_read, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, sys_input_poll, sys_input_read, sys_open, sys_close, O_RDONLY }
+import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_read, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, sys_input_poll, sys_input_read, sys_open, sys_close, O_RDONLY, sys_getcwd }
 
 # ============================================================================
 # Test Infrastructure
@@ -79,9 +79,8 @@ fn run_test_args(path: *u8, name: *u8, argv: **u8, argc: i32, expected: i32) -> 
         g_failed = g_failed + 1
         return 1
 
-# fd isolation (AGAST #2753). init is the parent: a spawned process can't
-# spawn yet (the blocking spawn keeps one saved parent frame), so this runs
-# in init rather than as its own /bin test. init holds /etc/motd as fd 3;
+# fd isolation (AGAST #2753). init is the parent, so this runs in init
+# rather than as its own /bin test. init holds /etc/motd as fd 3;
 # the child (/bin/fd_isolation_child) must get its own fd 3 and leaves it
 # open. Back here, fd 3 must still read /etc/motd and the next open must be
 # 4, and a second run of the child must get fd 3 again: the child's fd did
@@ -100,7 +99,7 @@ fn fd_isolation_steps() -> i32
     let n: i64 = sys_read(fd, @buf[0], 7)
     let next: i32 = sys_open(c"/etc/motd", O_RDONLY)
     # The same child again: its fd 3 must be free, not still held by the
-    # first one (children all run as pid 2).
+    # first one.
     let again: i64 = spawn_and_wait(c"/bin/fd_isolation_child")
     sys_close(fd)
     if next >= 0
@@ -125,6 +124,59 @@ fn fd_isolation_steps() -> i32
         print_str(c") ")
         return 5
     return 0
+
+# Nested spawn (AGAST #1882): init -> rzsh -> script -> command. rzsh
+# changes directory, then runs a script (`rzsh -c`) that runs /bin/exitcode
+# and exits with its status; rzsh exits with the script's. 42 back here
+# means each level resumed after its child exited and read the child's real
+# status: with one saved parent frame, the script's spawn overwrote rzsh's.
+# Then init's cwd must still be "/" (a child's cd is its own) and the child
+# is reaped exactly once. Returns 0 on PASS, else a step number.
+fn nested_spawn_steps() -> i32
+    var argv: [3]*u8
+    argv[0] = c"rzsh"
+    argv[1] = c"-c"
+    argv[2] = c"cd /etc ; rzsh -c 'exitcode ; exit $?' ; exit $?"
+    let pid: i64 = sys_spawn_args(c"/bin/rzsh", @argv[0], 3)
+    if pid <= 0
+        print_str(c"(spawn returned ")
+        print_int(pid)
+        print_str(c") ")
+        return 1
+    let code: i64 = sys_wait(pid as i32)
+    if code != 42
+        print_str(c"(exit ")
+        print_int(code)
+        print_str(c", want 42) ")
+        return 2
+    let again: i64 = sys_wait(pid as i32)
+    if again >= 0
+        print_str(c"(second wait returned ")
+        print_int(again)
+        print_str(c") ")
+        return 3
+    var cwd: [64]u8
+    let n: i64 = sys_getcwd(@cwd[0], 64)
+    if n != 1 or cwd[0] != 47
+        print_str(c"(init's cwd moved: ")
+        if n > 0
+            print_str(@cwd[0])
+        print_str(c") ")
+        return 4
+    return 0
+
+fn run_nested_spawn_test() -> i32
+    print_str(c"[test] nested spawn init->rzsh->script->exitcode ... ")
+    let step: i32 = nested_spawn_steps()
+    if step == 0
+        print_str(c"PASS\n")
+        g_passed = g_passed + 1
+        return 0
+    print_str(c"FAIL (step ")
+    print_int(step as i64)
+    print_str(c")\n")
+    g_failed = g_failed + 1
+    return 1
 
 # Spawn path and return its exit code, or -1000 if it didn't spawn.
 fn spawn_and_wait(path: *u8) -> i64
@@ -413,6 +465,9 @@ fn run_tier1_tests() -> i32
     span_argv[1] = c"alpha"
     span_argv[2] = c"beta-gamma"
     run_test_args(c"/bin/span_args", c"span_args", @span_argv[0], 3, 0)
+
+    # Three levels below init, each resuming after its child (AGAST #1882).
+    run_nested_spawn_test()
 
     run_input_check()
 

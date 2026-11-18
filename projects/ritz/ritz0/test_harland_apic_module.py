@@ -47,7 +47,9 @@ MOVED_CONST_PREFIXES = ("LAPIC_", "IOAPIC_", "IPI_DELIVERY_", "AP_TRAMPOLINE_ADD
 # What kernel_main calls; main must import exactly these from the new module.
 MAIN_USES = {"pic_remap", "apic_init_with_mb", "apic_init_from_bootinfo", "ap_boot_all"}
 
-# Bound by name through `extern fn` from sched/mod.ritz and exceptions.ritz.
+# Bound by name through `extern fn` from exceptions.ritz (sched/mod.ritz was
+# deleted, AGAST #1882; lapic_write and get_ap_stack_top stay pub for a
+# future scheduler).
 EXTERN_BOUND = {"lapic_id", "lapic_eoi", "lapic_write", "get_ap_stack_top"}
 
 
@@ -106,7 +108,7 @@ def test_main_imports_what_it_calls_from_apic():
 def test_extern_bound_symbols_stay_pub():
     fns = _fns(_code(APIC))
     assert all(fns.get(n) for n in EXTERN_BOUND), {n: fns.get(n) for n in EXTERN_BOUND}
-    for rel in ["sched/mod.ritz", "arch/x86_64/exceptions.ritz"]:
+    for rel in ["arch/x86_64/exceptions.ritz"]:
         for name in re.findall(r"^extern fn (\w+)\(", _code(KERNEL_SRC / rel), re.M):
             if name.startswith(("lapic_", "get_ap_")):
                 assert name in EXTERN_BOUND, f"{rel} binds {name}, which apic.ritz must export"

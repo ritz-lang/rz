@@ -575,7 +575,7 @@ def test_exit_releases_the_table_before_the_parent_resumes():
     child, init = body.split("# No parent", 1)
     # child: in the parent's address space, before the parent runs again (the
     # order is #2753's; a flush growing the heap is safe under any CR3, #2761)
-    assert child.index("vmm_switch_pml4(g_parent_ctx.user_pml4)") < child.index("fs_process_end()") \
+    assert child.index("vmm_switch_pml4(parent.pml4)") < child.index("fs_process_end()") \
         < child.index("resume_user_frame(")
     # init exiting: released before the halt
     assert init.index("fs_process_end()") < init.index("halt_loop()")
@@ -586,9 +586,9 @@ def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure(spawn):
     body = _fn(PROCESS, spawn)
     # made before the switch into the child's page table (kalloc may map
     # heap pages through the identity map, which the child's lacks)
-    assert body.index("fs_process_start(g_child_pid)") < body.index("vmm_switch_pml4(child_pml4)")
+    assert body.index("fs_process_start(proc_current_pid())") < body.index("vmm_switch_pml4(child_pml4)")
     # every later failure path gives it back
-    fails = re.findall(r"vmm_switch_pml4\(g_parent_ctx\.user_pml4\)\n(\s+)(\S.*)\n", body)
+    fails = re.findall(r"vmm_switch_pml4\(parent\.pml4\)\n(\s+)(\S.*)\n", body)
     assert fails and all(line == "fs_process_end()" for _, line in fails), fails
 
 

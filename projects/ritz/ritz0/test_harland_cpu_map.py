@@ -10,13 +10,13 @@ Now arch/x86_64/cpu_map.ritz owns the CPU table: MAX_CPUS, num_cpus,
 cpu_apic_ids (u32: room for x2APIC IDs), the APIC ID -> CPU index lookup and
 the per-CPU "started" flags. The MADT parser records CPUs with cpu_map_add, an
 AP flags itself with cpu_map_mark_started(lapic_id()) and the BSP polls
-cpu_map_started(cpu index); the scheduler finds its CpuSched through the same
-lookup.
+cpu_map_started(cpu index). (The scheduler that also looked its CpuSched up
+here was deleted unused by #1882.)
 
 The behaviour test compiles the real cpu_map.ritz (it has no imports and no
 hardware access) into a host program with sparse APIC IDs up to 255; its exit
-code names the failed claim. The source-level tests pin that apic.ritz, the
-ACPI tables and the scheduler go through cpu_map. The runtime check is the
+code names the failed claim. The source-level tests pin that apic.ritz and the
+ACPI tables go through cpu_map. The runtime check is the
 boot with -smp 4 (tools/test_boot.sh, tools/test_tier1_boot.sh).
 """
 
@@ -35,7 +35,6 @@ KERNEL_SRC = RITZ_ROOT.parent / "harland" / "kernel" / "src"
 CPU_MAP = KERNEL_SRC / "arch" / "x86_64" / "cpu_map.ritz"
 APIC = KERNEL_SRC / "arch" / "x86_64" / "apic.ritz"
 TABLES = KERNEL_SRC / "drivers" / "acpi" / "tables.ritz"
-SCHED = KERNEL_SRC / "sched" / "mod.ritz"
 
 # The kernel is built by ritz0 only, so one compiler row (TESTING.md, "What a
 # ritz0 pytest case costs").
@@ -214,7 +213,7 @@ def test_apic_flags_and_polls_by_cpu_index():
 
 
 def test_one_cpu_limit_and_table():
-    for path in (APIC, TABLES, SCHED, KERNEL_SRC / "main.ritz"):
+    for path in (APIC, TABLES, KERNEL_SRC / "main.ritz"):
         code = _code(path)
         rel = path.relative_to(KERNEL_SRC)
         assert not re.search(r"^(?:pub\s+)?const MAX_CPUS\b", code, re.M), f"{rel} defines MAX_CPUS"
@@ -235,12 +234,11 @@ def _max_cpus():
 def test_per_cpu_arrays_are_max_cpus_long():
     """Array lengths must be literals, so each per-CPU array spells MAX_CPUS out.
 
-    sched/mod.ritz bounds cpu_sched by MAX_CPUS; a [16] there with MAX_CPUS = 64
-    is a BSS overflow in scheduler_init (#4184)."""
+    A [16] array with MAX_CPUS = 64 is a BSS overflow once CPU 16 boots (#4184).
+    (sched/mod.ritz's cpu_sched was one; #1882 deleted the unused scheduler.)"""
     n = _max_cpus()
     assert n > 16, "MAX_CPUS still 16: CPUs past 16 are dropped"
-    for path, names in ((CPU_MAP, ("cpu_apic_ids", "cpu_started")), (SCHED, ("cpu_sched",)),
-                        (APIC, ("ap_stack_tops",))):
+    for path, names in ((CPU_MAP, ("cpu_apic_ids", "cpu_started")), (APIC, ("ap_stack_tops",))):
         code = _code(path)
         for name in names:
             m = re.search(rf"^(?:pub\s+)?var {name}: \[(\d+)\]", code, re.M)
@@ -263,9 +261,3 @@ def test_apic_x2apic_mode():
     # Every AP switches its own LAPIC to x2APIC before it reads its ID.
     entry = _body(code, "ap_entry")
     assert entry.index("x2apic_enable_local()") < entry.index("lapic_id()"), entry
-
-
-def test_scheduler_finds_its_cpu_through_the_map():
-    body = _body(_code(SCHED), "get_cpu_sched")
-    assert "cpu_index_of_apic_id(lapic_id())" in body, body
-    assert "cpu_apic_ids" not in body, body

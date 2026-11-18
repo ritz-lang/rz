@@ -66,11 +66,6 @@ def _body(ir, name):
 
 
 @pytest.fixture(scope="module")
-def sched_ir(tmp_path_factory):
-    return _compile(tmp_path_factory, "sched/mod.ritz")
-
-
-@pytest.fixture(scope="module")
 def main_ir(tmp_path_factory):
     return _compile(tmp_path_factory, "main.ritz")
 
@@ -89,20 +84,6 @@ def virtio_ir(tmp_path_factory):
 @pytest.fixture(scope="module")
 def boot_ir(tmp_path_factory):
     return _compile(tmp_path_factory, "main.ritz", boot=True)
-
-
-# --- sched/mod.ritz: the scheduler spinlock -------------------------------
-
-def test_sched_lock_is_atomic_xchg(sched_ir):
-    body = _body(sched_ir, "sched_lock")
-    assert re.search(r'atomicrmw xchg i32\* @"scheduler_lock", i32 \S+ seq_cst', body), body
-    # A `pause` spin hint is fine; the swap itself must not be asm.
-    assert not re.search(r"asm [^\n]*xchg", body), f"sched_lock still swaps in inline asm:\n{body}"
-
-
-def test_sched_unlock_is_atomic_store(sched_ir):
-    body = _body(sched_ir, "sched_unlock")
-    assert re.search(r'store atomic i32 \S+, i32\* @"scheduler_lock" seq_cst', body), body
 
 
 # --- main.ritz and arch/x86_64/apic.ritz: AP counter and linker symbols -----
