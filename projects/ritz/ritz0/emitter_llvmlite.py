@@ -6531,22 +6531,30 @@ class LLVMEmitter:
                 self._temp_frames.append([])
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
                 self._float_slot(fn_def.ret_type, fn_def.body.expr)
-                if fn_def.ret_type is None and isinstance(fn_def.body.expr, rast.If):
-                    # A procedure's tail if/else is a statement (#4070).
-                    last_val = (self._emit_if(fn_def.body.expr, discard=True)
-                                or ir.Constant(self.i32, 0))
-                elif self._is_range_index(fn_def.body.expr):
-                    # AGAST #2877: a Vec slice as a `-> Span<T>` tail is a
-                    # view, as after `return`.
-                    last_val = self._emit_slice_into(fn_def.body.expr, fn_def.ret_type)
-                else:
-                    # #1444: the tail is a `return`, so it gets the #1396
-                    # literal context a `return` gets: `8 << (k & 3)` in a
-                    # `-> i32` fn shifts at i32 either way.
-                    with self._int_slot_context(fn_def.ret_type, fn_def.body.expr):
-                        last_val = self._emit_into_array_slot(
-                            fn_def.body.expr, fn_def.ret_type,
-                            lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
+                # AGAST #4112: the tail lands in the fn's return slot (§13),
+                # so `Span.empty()` there takes its T from `-> Span<T>`, as
+                # after `return`.  A procedure's tail lands nowhere.
+                saved_tail_expected = self.expected_ritz_type
+                self.expected_ritz_type = fn_def.ret_type
+                try:
+                    if fn_def.ret_type is None and isinstance(fn_def.body.expr, rast.If):
+                        # A procedure's tail if/else is a statement (#4070).
+                        last_val = (self._emit_if(fn_def.body.expr, discard=True)
+                                    or ir.Constant(self.i32, 0))
+                    elif self._is_range_index(fn_def.body.expr):
+                        # AGAST #2877: a Vec slice as a `-> Span<T>` tail is
+                        # a view, as after `return`.
+                        last_val = self._emit_slice_into(fn_def.body.expr, fn_def.ret_type)
+                    else:
+                        # #1444: the tail is a `return`, so it gets the #1396
+                        # literal context a `return` gets: `8 << (k & 3)` in a
+                        # `-> i32` fn shifts at i32 either way.
+                        with self._int_slot_context(fn_def.ret_type, fn_def.body.expr):
+                            last_val = self._emit_into_array_slot(
+                                fn_def.body.expr, fn_def.ret_type,
+                                lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
+                finally:
+                    self.expected_ritz_type = saved_tail_expected
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_calls)
                 # AGAST #3205: every arm of the tail left by `return` (`0 =>

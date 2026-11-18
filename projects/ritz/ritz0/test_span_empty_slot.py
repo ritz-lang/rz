@@ -62,6 +62,25 @@ fn ms() -> Span<u8>
 pub fn main() -> i32
     return c8(ms())
 """,
+    # A fn tail is a slot (§13), as after `return` (AGAST #4112).
+    "tail": """\
+fn ms() -> Span<u8>
+    Span.empty()
+
+pub fn main() -> i32
+    return c8(ms())
+""",
+    # ... through an `if` tail's arms too.
+    "tail_if_arms": """\
+fn ms(b: bool) -> Span<i32>
+    if b
+        Span.empty()
+    else
+        Span.empty()
+
+pub fn main() -> i32
+    return c32(ms(true)) + c32(ms(false))
+""",
     "typed_let": """\
 pub fn main() -> i32
     let s: Span<i64> = Span.empty()
@@ -180,6 +199,14 @@ fn ms(b: bool) -> Span<u8>
 pub fn main() -> i32
     return 0
 """, 3),
+    # A procedure's tail is discarded: it lands in no slot (AGAST #4112).
+    "procedure_tail": ("""\
+fn p()
+    Span.empty()
+
+pub fn main() -> i32
+    return 0
+""", 2),
     # A receiver lands in no slot: `-> i32` isn't a Span.
     "receiver": ("""\
 pub fn main() -> i32
@@ -188,8 +215,18 @@ pub fn main() -> i32
 }
 
 
+# (compiler, row) -> the open ticket it fails on.  Strict: the fix flips it.
+KNOWN = {
+    # ritz1 types an `if` of `Span.empty()` arms as `phi i64` (AGAST #4194).
+    (c, "tail_if_arms"): "AGAST #4194" for c in ("ritz1", "ritz1_selfhosted")
+}
+
+
 def _params(table):
-    return [pytest.param(c, n, id=f"{c}-{n}") for n in sorted(table) for c in COMPILERS]
+    return [pytest.param(c, n, id=f"{c}-{n}",
+                         marks=[pytest.mark.xfail(reason=KNOWN[c, n], strict=True)]
+                         if (c, n) in KNOWN else [])
+            for n in sorted(table) for c in COMPILERS]
 
 
 def _compile(request, tmp_path, compiler, program):
