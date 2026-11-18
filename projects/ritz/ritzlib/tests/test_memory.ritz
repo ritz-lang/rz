@@ -612,7 +612,6 @@ fn test_string_as_ptr_failed_reserve_returns_null_without_writing() -> i32
 # reserve is a small malloc, i.e. a 64 KiB slab mmap, that fails. With the
 # address-space limit at 1 byte every new mapping fails with -ENOMEM in this
 # test's own (forked) process; the limit is restored before returning.
-const SYS_PRLIMIT64: i64 = 302
 const RLIMIT_AS: i64 = 9
 
 struct RLimit
@@ -688,6 +687,104 @@ fn test_calloc() -> i32
         assert *(p + i) == 0
 
     free(p)
+    0
+
+# AGAST #1857: count * size wrapped. (2^61 + 1) * 8 is 2^64 + 8, i.e. 8, so
+# calloc handed back an 8-byte block for a 16 EiB request.
+[[test]]
+fn test_calloc_overflow_returns_null() -> i32
+    assert calloc(2305843009213693953, 8) == null
+    assert calloc(8, 2305843009213693953) == null
+    assert calloc(-1, 8) == null
+    assert calloc(8, -1) == null
+    0
+
+# ============================================================================
+# Page source (AGAST #1857)
+# ============================================================================
+# Every allocator in ritzlib.memory gets its pages from one PageSource, which a
+# kernel (or a test) can install in place of the mmap default. One whose map
+# answers -ENOMEM (-12), as Linux and harland both do, makes each allocator
+# return null; a working one serves (and gets back) every page.
+
+var g_src_maps: i32 = 0
+var g_src_unmaps: i32 = 0
+
+fn enomem_map(len: i64) -> *u8
+    g_src_maps += 1
+    return -12 as *u8
+
+fn counting_map(len: i64) -> *u8
+    g_src_maps += 1
+    return sys_mmap_anon(len)
+
+fn counting_unmap(p: *u8, len: i64) -> i32
+    g_src_unmaps += 1
+    return sys_munmap(p, len)
+
+[[test]]
+fn test_page_source_enomem_makes_every_allocator_return_null() -> i32
+    let prev: PageSource = page_source_set(PageSource { map: enomem_map, unmap: counting_unmap })
+    # Class 6 (1040-byte blocks) may hold a slab, or freed blocks, from before
+    # this test: take blocks until the bin needs a new slab. 64 KiB is 63
+    # blocks, so 200 tries always get there.
+    var held: [200]*u8
+    var n: i32 = 0
+    var small: *u8 = malloc(1000)
+    while small != null and n < 200
+        held[n] = small
+        n += 1
+        small = malloc(1000)
+    let large: *u8 = malloc(8192)
+    let zeroed: *u8 = calloc(4, 1024)
+    let h: *u8 = heap_alloc(4096)
+    var a: Arena = arena_new(4096)
+    let maps: i32 = g_src_maps
+    page_source_set(prev)
+    for i in 0..n
+        free(held[i])
+
+    assert small == null
+    assert large == null
+    assert zeroed == null
+    assert h == null
+    assert a.base == null
+    # Each one asked the installed source, not mmap.
+    assert maps == 5
+    0
+
+[[test]]
+fn test_page_source_serves_and_takes_back_pages() -> i32
+    let prev: PageSource = page_source_set(PageSource { map: counting_map, unmap: counting_unmap })
+    let p: *u8 = malloc(8192)
+    assert p != null
+    *(p + 8191) = 9
+    assert *(p + 8191) == 9
+    free(p)
+    var a: Arena = arena_new(4096)
+    assert a.base != null
+    arena_destroy(@a)
+    let maps: i32 = g_src_maps
+    let unmaps: i32 = g_src_unmaps
+    page_source_set(prev)
+
+    assert maps == 2
+    assert unmaps == 2
+    0
+
+[[test]]
+fn test_page_source_set_returns_the_previous_source() -> i32
+    let first: PageSource = page_source_set(PageSource { map: enomem_map, unmap: counting_unmap })
+    let mine: PageSource = page_source_set(first)
+    # The default (mmap) source is back: allocation works again.
+    let p: *u8 = malloc(8192)
+    assert p != null
+    free(p)
+    # And what came back out is the one installed.
+    let f: fn(i64) -> *u8 = mine.map
+    let before: i32 = g_src_maps
+    f(4096)
+    assert g_src_maps == before + 1
     0
 
 [[test]]
