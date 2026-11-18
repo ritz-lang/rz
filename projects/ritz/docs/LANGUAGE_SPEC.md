@@ -1955,6 +1955,16 @@ the compiler names the fn `__ritz_main` and adds that `main` as an adapter
 written in Ritz. It builds the spans once and calls the fn.
 `docs/V1_ABI_CLEANUP.md` has the design.
 
+`main` is the entry point, not a fn to call. A call to a `main` that takes
+spans or returns nothing is an error, at the call:
+
+```ritz expect-error="`main` is the program's entry point and cannot be called"
+pub fn main(args: Span<StrView>) -> i32
+    if args.len > 5
+        return main(args)
+    0
+```
+
 *Transitional:* the C shapes `main(argc: i32, argv: **u8) -> i32` and
 `main(argc: i32, argv: **u8, envp: **u8) -> i32` are still accepted, and so is
 a `main` without `pub` in a C shape, until the workspace migrates (AGAST #203).

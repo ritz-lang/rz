@@ -39,6 +39,7 @@ from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst
 from type_checker import TypeChecker
 from typed import EMITTER_READS, typed_of
 import module_interface
+import main_abi
 from main_abi import display_name
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
@@ -13357,6 +13358,13 @@ class LLVMEmitter:
         # (AGAST #1824). Reserved like print: checked before user functions.
         if fname == 'format_into':
             return self._emit_format_into(call)
+
+        # AGAST #4198: once main took the entry adapter, `main` is the
+        # adapter's (argc, argv, envp); the user's fn is __ritz_main and the
+        # adapter is its only caller. A call to `main` is refused here, in
+        # main_abi's words, not as an arity error against the adapter.
+        if fname == "main" and main_abi.ADAPTED_NAME in self.functions:
+            raise EmitError(main_abi.MSG_CALL, self._call_span(call))
 
         # Look up user-defined function
         if fname in self.functions:

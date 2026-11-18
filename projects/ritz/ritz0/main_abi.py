@@ -44,6 +44,10 @@ MSG_SHAPE = ("`main` must take `()`, `(args: Span<StrView>)` or "
              "`(args: Span<StrView>, env: Span<StrView>)`")
 MSG_RET = "`main` must return `i32` or nothing"
 MSG_PUB = "`main` taking `Span<StrView>` must be `pub`: write `pub fn main(...)`"
+# A call to `main` in a program whose main took the adapter would bind to
+# the adapter's `(argc, argv, envp)`, so it is refused at the call (AGAST
+# #4198). ritz1's twin is call_check.ritz's cc_adapted_main.
+MSG_CALL = "`main` is the program's entry point and cannot be called"
 
 # The runtime half of the entry path, in Ritz: one `mmap` for the views,
 # then a `strlen` per string. Added only for a Span main, so a C-shaped

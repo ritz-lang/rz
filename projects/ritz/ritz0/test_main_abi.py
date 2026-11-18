@@ -72,6 +72,14 @@ pub fn main()
 fn main(argc: i32, argv: **u8) -> void
     let n: i32 = argc
 """, 0),
+    # #4198: a C-shaped main is the C symbol itself, so it may still call
+    # itself; only an adapted main's calls are refused (REFUSED below).
+    "c_recursive": ("""\
+fn main(argc: i32, argv: **u8) -> i32
+    if argc < 5
+        return main(argc + 1, argv)
+    argc
+""", 5),
 }
 
 
@@ -100,6 +108,13 @@ REFUSED = {
                        "function 'main' declares a return type but can reach its end without producing a value"),
     "assert_names_main": ("pub fn main()\n    ^assert 1 == 1\n",
                           "assert is only allowed in [[test]] and [[test_helper]] functions, not in 'main'"),
+    # #4198: a call to an adapted main is refused at the call, in both
+    # shapes that take the adapter; it used to bind to the C adapter and
+    # report "`main` called with 1 argument(s) but defined with 3".
+    "call_span_main": ("pub fn main(args: Span<StrView>) -> i32\n    if args.len > 5\n        return ^main(args)\n    0\n",
+                       main_abi.MSG_CALL),
+    "call_unit_main": ("var n: i32 = 0\n\npub fn main()\n    n = n + 1\n    if n < 3\n        ^main()\n",
+                       main_abi.MSG_CALL),
 }
 
 
@@ -125,7 +140,8 @@ def test_ritz1_says_and_generates_what_ritz0_does():
     """The messages and the runtime text are one spec in two compilers;
     the run/refuse rows above check behaviour, this checks the bytes."""
     ritz1 = _ritz_strings(RITZ1_MAIN_ABI.read_text())
-    for text in (main_abi.MSG_SHAPE, main_abi.MSG_RET, main_abi.MSG_PUB, main_abi.RUNTIME_SOURCE):
+    for text in (main_abi.MSG_SHAPE, main_abi.MSG_RET, main_abi.MSG_PUB, main_abi.MSG_CALL,
+                 main_abi.RUNTIME_SOURCE):
         assert text in ritz1, f"ritz1/src/main_abi.ritz lacks:\n{text}"
 
 
