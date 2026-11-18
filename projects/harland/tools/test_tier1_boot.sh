@@ -116,7 +116,11 @@ for f in "$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/init.elf"
 done
 
 WORK="$(mktemp -d)"
-trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK"' EXIT
+# The QEMU monitor sockets get a dir of their own under /tmp, not $TMPDIR:
+# a gate's TMPDIR sits deep in its worktree, and a socket path past
+# sun_path's 107 bytes stops QEMU from starting at all (AGAST #4177).
+SOCK_DIR="$(mktemp -d /tmp/rz_tier1_mon.XXXXXXXX)"
+trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK" "$SOCK_DIR"' EXIT
 mkdir -p "$WORK/bin"
 for pkg in $USER_PKGS; do
     cp "$PROJECTS_DIR/$pkg"/build/debug/*.elf "$WORK/bin/" 2>/dev/null || true
@@ -143,7 +147,7 @@ boot() {
     # The loop below enforces $TIMEOUT; this one only backs it up, late enough
     # that a hung guest's monitor is still there to report on.
     timeout "$((TIMEOUT + 30))" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m "$MEM" \
-        -display none -no-reboot -monitor "unix:$WORK/$name-mon.sock,server,nowait" \
+        -display none -no-reboot -monitor "unix:$SOCK_DIR/$name-mon.sock,server,nowait" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
         -device "virtio-blk-pci,drive=initramfs$blk_opts" \
@@ -169,7 +173,7 @@ boot() {
         if [ "$key_sent" = 0 ] && grep -aq "\[OK\] VirtIO input device" "$serial"; then
             # A failed send (monitor not up yet) retries next second; a key
             # that never lands is reported by key_received.
-            send_key "$WORK/$name-mon.sock" a 2>/dev/null && key_sent=1
+            send_key "$SOCK_DIR/$name-mon.sock" a 2>/dev/null && key_sent=1
         fi
         grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$serial" && { verdict=1; break; }
         # QEMU exited before a verdict: nothing to dump, the checks report it.
@@ -188,7 +192,7 @@ boot() {
     else
         # Where each vCPU is and whether it is halted (HLT=1) or spinning.
         echo "----- $name boot: no verdict; vCPU state from the QEMU monitor -----"
-        monitor "$WORK/$name-mon.sock" "info registers -a" 2>&1 \
+        monitor "$SOCK_DIR/$name-mon.sock" "info registers -a" 2>&1 \
             | grep -aE '^CPU#|IP=' | paste -d' ' - - | sed 's/^/      /'
     fi
     kill "$pid" 2>/dev/null
