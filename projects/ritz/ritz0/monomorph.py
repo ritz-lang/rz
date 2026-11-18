@@ -39,6 +39,7 @@ from monomorph_core import (  # noqa: F401 -- re-exported: monomorph's public na
     TypeSubstitution, bind_type_params, map_child_nodes, mangle_generic_name,
     mangle_type_name, resolve_alias_in, type_aliases)
 from monomorph_infer import MonoInferMixin
+from trait_bounds import TraitImpls, bound_error
 from monomorph_rewrite import MonoRewriteMixin
 
 
@@ -82,9 +83,11 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         # Maps variable name -> declared type (for current scope)
         self.var_types: Dict[str, rast.Type] = {}
 
-        # Trait implementations: type_name -> set of trait names
-        # e.g., "String" -> {"Drop"}, "Vec$i32" -> {"Drop"}
-        self.trait_impls: Dict[str, Set[str]] = {}
+        # Which types implement which traits, for bound checks (§11.5).
+        self.trait_impls: Optional[TraitImpls] = None
+        # (kind, generic, args key) -> the type args at the instance's first
+        # use, as written: a failed bound is located there (AGAST #3468).
+        self._first_use: Dict[Tuple[str, str, Tuple[str, ...]], List[rast.Type]] = {}
 
         # Mangled type key -> the actual type it was mangled from.
         # Mangling is lossy, so keep the originals for _parse_type_args_key.
@@ -149,7 +152,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         self._typed = typed_of(module)
 
         # Phase 0: Collect trait implementations for bound checking
-        self._collect_trait_impls(module)
+        self.trait_impls = TraitImpls(module.items)
 
         # Phase 1: Collect generic definitions
         self._collect_generics(module)
@@ -172,55 +175,22 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
 
         return rast.Module(module.span, new_items)
 
-    def _collect_trait_impls(self, module: rast.Module) -> None:
-        """Collect all trait implementations for bound checking.
+    def _note_use(self, kind: str, name: str, key: Tuple[str, ...],
+                  type_args: List[rast.Type]) -> None:
+        """Remember the type args an instance is first named with: a failed
+        bound is reported at the one that misses it (§11.5)."""
+        self._first_use.setdefault((kind, name, key), list(type_args))
 
-        Records which types implement which traits, including:
-        - Non-generic impls: impl Drop for String
-        - Generic impls: impl<T> Drop for Box<T> (recorded during specialization)
-        """
-        for item in module.items:
-            if isinstance(item, rast.ImplBlock) and item.trait_name:
-                if not item.type_params:
-                    # Non-generic impl: impl Drop for String
-                    type_name = item.type_name
-                    if type_name not in self.trait_impls:
-                        self.trait_impls[type_name] = set()
-                    self.trait_impls[type_name].add(item.trait_name)
-
-    def _type_implements_trait(self, type_name: str, trait_name: str) -> bool:
-        """Check if a type implements a trait."""
-        return trait_name in self.trait_impls.get(type_name, set())
-
-    def _check_trait_bounds(self, generic_def_name: str, type_params: List[str],
-                            type_args: List[rast.Type], bounds: Dict[str, List[str]],
-                            context: str = "") -> None:
-        """Check that type arguments satisfy their trait bounds.
-
-        Args:
-            generic_def_name: Name of the generic being instantiated (for error messages)
-            type_params: List of type parameter names
-            type_args: List of concrete type arguments
-            bounds: Dict mapping param names to required trait names
-            context: Additional context for error messages
-
-        Raises:
-            TypeError: If a bound is not satisfied
-        """
-        for param, arg in zip(type_params, type_args):
-            required_traits = bounds.get(param, [])
-            if not required_traits:
-                continue  # No bounds on this parameter
-
-            arg_name = mangle_type_name(arg)
-
-            for trait in required_traits:
-                if not self._type_implements_trait(arg_name, trait):
-                    loc = context if context else f"instantiating {generic_def_name}"
-                    raise TypeError(
-                        f"Type '{arg_name}' does not implement trait '{trait}' "
-                        f"required by bound on type parameter '{param}' in {loc}"
-                    )
+    def _check_bounds(self, kind: str, generic: str, params: List[str],
+                      key: Tuple[str, ...], type_args: List[rast.Type],
+                      bounds: dict, owner: Optional[str] = None) -> None:
+        """Raise TraitBoundError when `type_args` miss one of `bounds` (§11.5,
+        LARB R55).  `owner` names the generic in the message when it isn't
+        `generic` itself (an impl's bounds are reported on its type)."""
+        err = bound_error(self.trait_impls, owner or generic, params, type_args, bounds,
+                          self._first_use.get((kind, generic, key)))
+        if err is not None:
+            raise err
 
     def _collect_generics(self, module: rast.Module) -> None:
         """Collect all generic struct, enum, function, and impl block definitions."""
@@ -310,12 +280,14 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             if ty.args and ty.name in self.generic_structs:
                 # This is a generic struct instantiation
                 key = (ty.name, self._type_args_to_key(ty.args))
+                self._note_use('struct', *key, ty.args)
                 if key not in self.struct_instantiations:
                     mangled = mangle_generic_name(ty.name, ty.args)
                     self.struct_instantiations[key] = mangled
             elif ty.args and ty.name in self.generic_enums:
                 # This is a generic enum instantiation
                 key = (ty.name, self._type_args_to_key(ty.args))
+                self._note_use('enum', *key, ty.args)
                 if key not in self.enum_instantiations:
                     mangled = mangle_generic_name(ty.name, ty.args)
                     self.enum_instantiations[key] = mangled
@@ -422,6 +394,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 fn_name = expr.func.name
                 if fn_name in self.generic_functions:
                     key = (fn_name, self._type_args_to_key(expr.type_args))
+                    self._note_use('fn', *key, expr.type_args)
                     if key not in self.function_instantiations:
                         mangled = mangle_generic_name(fn_name, expr.type_args)
                         self.function_instantiations[key] = mangled
@@ -439,6 +412,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             # Check for generic struct instantiation
             if expr.type_args and expr.name in self.generic_structs:
                 key = (expr.name, self._type_args_to_key(expr.type_args))
+                self._note_use('struct', *key, expr.type_args)
                 if key not in self.struct_instantiations:
                     mangled = mangle_generic_name(expr.name, expr.type_args)
                     self.struct_instantiations[key] = mangled
@@ -819,13 +793,9 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 generic_def = self.generic_structs[base_name]
                 type_args = self._parse_type_args_key(type_args_key, generic_def.type_params)
 
-                # Check trait bounds before specializing
-                bounds = getattr(generic_def, 'type_param_bounds', {}) or {}
-                if bounds:
-                    self._check_trait_bounds(
-                        f"struct {base_name}",
-                        generic_def.type_params, type_args, bounds
-                    )
+                # Check trait bounds before specializing (§11.5)
+                self._check_bounds('struct', base_name, generic_def.type_params,
+                                   type_args_key, type_args, generic_def.type_param_bounds)
 
                 mapping = dict(zip(generic_def.type_params, type_args))
                 # A generic struct named in a field (`a: [2]Box<T>`) is an
@@ -842,15 +812,15 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 # Also specialize any generic impl blocks for this struct
                 if base_name in self.generic_impls:
                     for generic_impl in self.generic_impls[base_name]:
+                        # An impl's bounds are on its type's args (§11.5).
+                        self._check_bounds('struct', base_name, generic_impl.type_params,
+                                           type_args_key, type_args,
+                                           generic_impl.type_param_bounds,
+                                           owner=f"impl {base_name}")
                         impl_subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)), struct_manglings)
                         specialized_impl = self._specialize_impl(generic_impl, mangled_name, impl_subst)
                         self.specialized_impls.append(specialized_impl)
 
-                        # Record trait impl for the specialized type
-                        if generic_impl.trait_name:
-                            if mangled_name not in self.trait_impls:
-                                self.trait_impls[mangled_name] = set()
-                            self.trait_impls[mangled_name].add(generic_impl.trait_name)
 
             # Generate specialized enums for new instantiations
             for key in new_enums:
@@ -859,13 +829,9 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 generic_def = self.generic_enums[base_name]
                 type_args = self._parse_type_args_key(type_args_key, generic_def.type_params)
 
-                # Check trait bounds before specializing
-                bounds = getattr(generic_def, 'type_param_bounds', {}) or {}
-                if bounds:
-                    self._check_trait_bounds(
-                        f"enum {base_name}",
-                        generic_def.type_params, type_args, bounds
-                    )
+                # Check trait bounds before specializing (§11.5)
+                self._check_bounds('enum', base_name, generic_def.type_params,
+                                   type_args_key, type_args, generic_def.type_param_bounds)
 
                 subst = TypeSubstitution(dict(zip(generic_def.type_params, type_args)), struct_manglings)
                 specialized = self._specialize_enum(generic_def, mangled_name, subst)
@@ -875,15 +841,15 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 # Also specialize any generic impl blocks for this enum
                 if base_name in self.generic_impls:
                     for generic_impl in self.generic_impls[base_name]:
+                        # An impl's bounds are on its type's args (§11.5).
+                        self._check_bounds('enum', base_name, generic_impl.type_params,
+                                           type_args_key, type_args,
+                                           generic_impl.type_param_bounds,
+                                           owner=f"impl {base_name}")
                         impl_subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)), struct_manglings)
                         specialized_impl = self._specialize_impl(generic_impl, mangled_name, impl_subst)
                         self.specialized_impls.append(specialized_impl)
 
-                        # Record trait impl for the specialized type
-                        if generic_impl.trait_name:
-                            if mangled_name not in self.trait_impls:
-                                self.trait_impls[mangled_name] = set()
-                            self.trait_impls[mangled_name].add(generic_impl.trait_name)
 
             # Generate specialized functions for new instantiations
             for key in new_functions:
@@ -892,13 +858,9 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 generic_def = self.generic_functions[base_name]
                 type_args = self._parse_type_args_key(type_args_key, generic_def.type_params)
 
-                # Check trait bounds before specializing
-                bounds = getattr(generic_def, 'type_param_bounds', {}) or {}
-                if bounds:
-                    self._check_trait_bounds(
-                        f"function {base_name}",
-                        generic_def.type_params, type_args, bounds
-                    )
+                # Check trait bounds before specializing (§11.5)
+                self._check_bounds('fn', base_name, generic_def.type_params,
+                                   type_args_key, type_args, generic_def.type_param_bounds)
 
                 subst = TypeSubstitution(dict(zip(generic_def.type_params, type_args)), struct_manglings)
                 specialized = self._specialize_function(generic_def, mangled_name, subst)
@@ -1295,6 +1257,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                     # Key on the bare substituted args (T -> i32), as every path does (#3342)
                     substituted_type_args = [subst.bare(arg) for arg in expr.type_args]
                     key = (fn_name, self._type_args_to_key(substituted_type_args))
+                    self._note_use('fn', *key, expr.type_args)
                     # If this instantiation doesn't exist yet, add it
                     # This handles transitive generic calls discovered during specialization
                     if key not in self.function_instantiations:
@@ -1317,6 +1280,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 # Key on the bare substituted args (T -> i32), as every path does (#3342)
                 substituted_type_args = [subst.bare(arg) for arg in expr.type_args]
                 key = (struct_name, self._type_args_to_key(substituted_type_args))
+                self._note_use('struct', *key, expr.type_args)
                 # If this instantiation doesn't exist yet, add it
                 if key not in self.struct_instantiations:
                     struct_name = mangle_generic_name(struct_name, substituted_type_args)

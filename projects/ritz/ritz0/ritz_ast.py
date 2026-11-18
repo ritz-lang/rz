@@ -1128,6 +1128,17 @@ class StaticAssert(Item):
     message: Optional[str] = None
 
 
+class BoundName(str):
+    """A trait named in a bound, `T: Area` (§11.5): the name, plus where it
+    is written, since an unknown trait is an error at the bound (AGAST
+    #3468).  A str, so every reader of `type_param_bounds` is unchanged."""
+
+    def __new__(cls, name: str, span=None):
+        self = super().__new__(cls, name)
+        self.span = span
+        return self
+
+
 @dataclass
 class TraitMethodSig(Node):
     """A method signature in a trait definition (no body)."""

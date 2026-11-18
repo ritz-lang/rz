@@ -4471,6 +4471,54 @@ This document claimed until 2026-09-12 that only the first type argument
 mangled — which would have made `Result<i32, StrView>` and `Result<i32, i64>`
 collide. They do not.
 
+### 11.5 Trait Bounds
+
+A type parameter of a fn, struct, enum or impl may name the traits it needs:
+`<T: Area>`, `<K: Hash + Eq>`. There is no `where` clause. A bound is a check,
+made when the generic is instantiated: each type argument needs an impl of each
+trait, exact (`impl Area for Sq`) or through a generic impl (`impl<T> Drop for
+Box<T>` covers every `Box<..>`, §12.2).
+
+```ritz
+trait Area
+    fn area(self: @Self) -> i64
+
+struct Sq
+    s: i64
+
+impl Area for Sq
+    fn area(self: @Sq) -> i64
+        self.s * self.s
+
+fn total<T: Area>(a: @T, b: @T) -> i64
+    a.area() + b.area()
+
+fn main() -> i32
+    let a = Sq { s: 2 }
+    let b = Sq { s: 3 }
+    (total(@a, @b) - 13) as i32
+```
+
+A type argument without the impl is an error at the type argument, or at the
+call when the argument is inferred:
+
+```ritz expect-error=".ritz:9:5: `Nope` doesn't implement `Area`, which `T` of `total` requires"
+trait Area
+    fn area(self: @Self) -> i64
+struct Nope
+    x: i64
+fn total<T: Area>(a: @T) -> i64
+    a.area()
+fn main() -> i32
+    let n = Nope { x: 1 }
+    total(@n) as i32
+```
+
+A bound naming no trait is an error at the bound, used or not: "unknown trait
+`Nonesuch` in the bound on `T`". A bound doesn't change how a method on `T` is
+found: that happens after substitution (§11.4), so `a.area()` on an unbounded
+`T` compiles too, and fails at an instance whose type has no `area` (LARB R55).
+
 ---
 
 ## 12. Traits
@@ -4512,9 +4560,9 @@ fn main() -> i32
 ```
 
 Traits are structural in ritz0: an `impl Trait for Type` block is checked for
-shape and its methods are emitted, but there is no dynamic dispatch, no trait
-bound on a generic parameter, and no `dyn Trait`. Methods are resolved
-statically from the receiver's concrete type.
+shape and its methods are emitted, but there is no dynamic dispatch and no `dyn
+Trait`. Methods are resolved statically from the receiver's concrete type. A
+generic parameter's trait bound is a check at instantiation (§11.5).
 
 An `impl` targets a struct or enum declared in Ritz source. A primitive is a
 built-in type, closed like `Span` (LARB R26), so `impl u8` and `impl Speak for

@@ -37,6 +37,7 @@ from binder_names import check_binders
 from builtin_types import check_builtin_impls, check_unknown_impl_targets
 from impl_placement import check_impl_placement
 from type_names import check_unknown_type_names
+from trait_bounds import check_unknown_bound_traits
 from reachability import check_reachable
 from no_effect import check_no_effect
 from move_checker import MoveChecker, OwnershipError
@@ -308,8 +309,11 @@ def _eval_array_sizes(ctx: _Compile) -> bool:
 def _check_type_names(ctx: _Compile) -> bool:
     """A written type name nothing declares or imports (AGAST #3932): after
     the merge, so an import counts, and after _check_impl_targets, which
-    judges an impl's target."""
-    return _report(check_unknown_type_names(ctx.module, ctx.module_names), "Error: ")
+    judges an impl's target.  ...and a bound naming no trait (§11.5, LARB
+    R55, AGAST #3468), at the bound, whether or not the generic is used."""
+    errors = check_unknown_type_names(ctx.module, ctx.module_names)
+    errors += check_unknown_bound_traits(ctx.module)
+    return _report(errors, "Error: ")
 
 
 def _check_binders(ctx: _Compile) -> bool:

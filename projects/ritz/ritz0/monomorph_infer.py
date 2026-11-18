@@ -10,6 +10,15 @@ import ritz_ast as rast
 from monomorph_core import (GenericInferError, TypeSubstitution, _names_type_param,
                             bind_type_params, resolve_alias)
 
+
+def _at(ty: rast.Type, span) -> rast.Type:
+    """A copy of inferred type arg `ty`, located at the call or literal it
+    was inferred for: nothing wrote it, so an error about it (a failed trait
+    bound, §11.5) is reported there."""
+    ty = copy.deepcopy(ty)
+    ty.span = span
+    return ty
+
 class MonoInferMixin:
     """Monomorphizer methods that fill in omitted type args before instances are
     collected.  Mixed into monomorph.Monomorphizer; reads its state."""
@@ -231,7 +240,7 @@ class MonoInferMixin:
                 raise GenericInferError(
                     f"can't infer `{tp}` for `{lit.name}`: write its type arguments, "
                     f"`{lit.name}<{', '.join(params)}> {{ .. }}`", lit.span)
-        lit.type_args = [copy.deepcopy(bound[tp]) for tp in params]
+        lit.type_args = [_at(bound[tp], lit.span) for tp in params]
 
     def _generic_variant(self, name: str):
         """(enum, variant) when `name` is a variant of a generic user enum and
@@ -325,4 +334,4 @@ class MonoInferMixin:
                 raise GenericInferError(
                     f"can't infer `{tp}` for `{fn_name}`: write `{fn_name}<{tp}>(...)`",
                     call.span)
-        call.type_args = [copy.deepcopy(bound[tp]) for tp in params]
+        call.type_args = [_at(bound[tp], call.span) for tp in params]

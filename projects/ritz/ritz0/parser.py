@@ -376,16 +376,17 @@ class Parser:
     def _parse_trait_bounds(self) -> List[str]:
         """Parse trait bounds: Drop or Drop + Clone + Serialize.
 
-        Returns list of trait names.
+        Returns list of trait names, each a BoundName carrying its span: an
+        unknown trait is an error at the bound (§11.5).
         """
         bounds = []
         trait_tok = self._expect(TokenType.IDENT, "Expected trait name")
-        bounds.append(trait_tok.value)
+        bounds.append(rast.BoundName(trait_tok.value, trait_tok.span))
         # Parse additional bounds with +
         while self._at(TokenType.PLUS):
             self._advance()
             trait_tok = self._expect(TokenType.IDENT, "Expected trait name after '+'")
-            bounds.append(trait_tok.value)
+            bounds.append(rast.BoundName(trait_tok.value, trait_tok.span))
         return bounds
 
     def _can_start_type(self) -> bool:
