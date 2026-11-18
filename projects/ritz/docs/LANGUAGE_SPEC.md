@@ -6490,9 +6490,13 @@ syntax was rejected: `extern` means "defined in another object" in Ritz
 ### 17.8 Must-Use Functions
 
 The result of a call to a `[[must_use]]` fn may not be thrown away. A call is
-discarded when it is an expression statement that is not its block's value:
-any statement but the last of a block, or the last statement of a fn that
-returns nothing. Both compilers reject it, located at the call (AGAST #2137):
+discarded when it is an expression statement that is not its block's value,
+and a block has a value only when it is used as one (LARB R69): any statement
+but the last of a block, the last statement of a fn that returns nothing, and
+the last line of an arm of a statement `match`, a branch of a statement `if`
+or a loop body. A statement `match` or `if` is one whose own value is not
+used. Both compilers reject it, located at the call (AGAST #2137; ritz1 does
+not yet see the arm, branch and loop-body cases, AGAST #3997):
 
 ```
 t.ritz:<line>:<col>: result of [[must_use]] fn '<fn>' is discarded
@@ -6510,8 +6514,21 @@ fn main() -> i32
     0
 ```
 
+The arm `3 => check(3)` below is discarded: the `match` is a statement, so
+its arms have no value (AGAST #3796).
+
+```
+fn main() -> i32
+    var n: i32 = 3
+    match n
+        3 => check(3)     # error: result of [[must_use]] fn 'check' is discarded
+        _ => n = 0
+    0
+```
+
 Binding, assigning, returning or testing the result uses it, as does making
-the call a value-returning block's last line:
+the call a value-returning block's last line, including the last line of an
+arm of a `match` or `if` whose value is used:
 
 ```ritz
 [[must_use]]

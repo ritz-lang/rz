@@ -6405,7 +6405,7 @@ class LLVMEmitter:
             if fn_def.body.expr:
                 # A fn that returns nothing discards its tail (AGAST #2137).
                 if fn_def.ret_type is None:
-                    self._reject_discarded_must_use(fn_def.body.expr)
+                    self._reject_discarded_tail(fn_def.body.expr)
                 # AGAST #1435: operands in the tail are consumed even though
                 # the tail itself is not treated as one (#1429's carve-out,
                 # hence consumed=False). The tail is no statement, so
@@ -6982,8 +6982,9 @@ class LLVMEmitter:
         """Reject `expr`, whose value is discarded, if it calls a
         `[[must_use]]` fn (LANGUAGE_SPEC §17.8, AGAST #2137).
 
-        Callers pass an expression statement (never a block's tail: the
-        parser moves that into `Block.expr`) and a void fn's tail. ritz1
+        `_reject_discarded_tail` passes each expression whose value nobody
+        uses (an expression statement, or the tail of a block that is no
+        value, LARB R69). ritz1
         prints the same words (ritz1/src/emitter_stmt.ritz
         reject_discarded_must_use).
         """
@@ -7003,6 +7004,27 @@ class LLVMEmitter:
         if fn_def is not None and fn_def.has_attr('must_use'):
             raise EmitError(
                 f"result of [[must_use]] fn '{name}' is discarded", expr.span)
+
+    def _reject_discarded_tail(self, expr: Optional[rast.Expr]) -> None:
+        """`_reject_discarded_must_use` for an expression whose value is
+        discarded, and for the tails that value would have come from.
+
+        A block has a value only when it is used as one (LARB R69, AGAST
+        #3796): an arm of a statement `match`, a branch of a statement `if`
+        and a loop body are never values, so their last line is discarded
+        too. Callers pass an expression statement, a void fn's tail or a loop
+        body; the statements before a tail are expression statements already.
+        """
+        if isinstance(expr, rast.Block):
+            self._reject_discarded_tail(expr.expr)
+        elif isinstance(expr, rast.If):
+            self._reject_discarded_tail(expr.then_block)
+            self._reject_discarded_tail(expr.else_block)
+        elif isinstance(expr, rast.Match):
+            for arm in expr.arms:
+                self._reject_discarded_tail(arm.body)
+        else:
+            self._reject_discarded_must_use(expr)
 
     @staticmethod
     def _stmt_value_roots(stmt: rast.Stmt) -> List[tuple]:
@@ -7833,8 +7855,9 @@ class LLVMEmitter:
             return None
 
         elif isinstance(stmt, rast.ExprStmt):
-            # A statement's value is discarded (AGAST #2137).
-            self._reject_discarded_must_use(stmt.expr)
+            # A statement's value is discarded (AGAST #2137), and so are a
+            # statement match/if's arm values (LARB R69, AGAST #3796).
+            self._reject_discarded_tail(stmt.expr)
             # Check if this is an If expression used as statement
             if isinstance(stmt.expr, rast.If):
                 return self._emit_if(stmt.expr)
@@ -7843,9 +7866,12 @@ class LLVMEmitter:
             return self._emit_expr(stmt.expr)
 
         elif isinstance(stmt, rast.WhileStmt):
+            # A loop body is never a value (LARB R69, AGAST #3796).
+            self._reject_discarded_tail(stmt.body)
             return self._emit_while(stmt)
 
         elif isinstance(stmt, rast.ForStmt):
+            self._reject_discarded_tail(stmt.body)
             return self._emit_for(stmt)
 
         elif isinstance(stmt, rast.AssertStmt):
