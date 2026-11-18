@@ -101,3 +101,17 @@ def test_cache_dir_outside_root(buildpy, sandbox, tmp_path, monkeypatch):
     assert elsewhere in cache.cache_dir.parents
     assert _clean(buildpy) == 0
     assert not cache.cache_dir.exists()
+
+
+def test_removes_build_run_outputs(buildpy, sandbox):
+    """`build.py run` links each source under ROOT/build/run/<digest>/
+    (#2252); every pytest session adds some, so clean removes them (#4167)."""
+    root = sandbox.parent
+    run_dir = root / "build" / "run" / "0123456789abcdef"
+    run_dir.mkdir(parents=True)
+    (run_dir / "main").write_text("binary")
+    keep = root / "build" / "notes.txt"
+    keep.write_text("not ours")
+    assert _clean(buildpy) == 0
+    assert not (root / "build" / "run").exists()
+    assert keep.exists()   # only build/run/ is removed, not ROOT/build

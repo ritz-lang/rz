@@ -313,7 +313,9 @@ def cmd_clean(args):
     `<pkg>/build/<profile>/` (get_output_dir), so removing those directories
     removes the build. Anything else under `<pkg>/build/` is left alone.
     A package reached through another tree's symlink builds (and runs its
-    tests) under `ROOT/build/linked/` instead (#3818, #3831): removed whole.
+    tests) under `ROOT/build/linked/` instead (#3818, #3831), and `build.py
+    run` links each source under `ROOT/build/run/<digest>/` (#2252): both
+    removed whole (#4167).
     """
     import shutil
 
@@ -328,10 +330,11 @@ def cmd_clean(args):
                 shutil.rmtree(out_dir)
                 print(f"  🗑 {shown(out_dir)}")
 
-    linked = ROOT / "build" / "linked"
-    if linked.is_dir():
-        shutil.rmtree(linked)
-        print(f"  🗑 {shown(linked)}")
+    for sub in ("linked", "run"):
+        root_out = ROOT / "build" / sub
+        if root_out.is_dir():
+            shutil.rmtree(root_out)
+            print(f"  🗑 {shown(root_out)}")
 
     # Clean pycache
     for pycache in ROOT.rglob("__pycache__"):
