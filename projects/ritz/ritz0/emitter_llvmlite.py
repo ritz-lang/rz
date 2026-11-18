@@ -2003,13 +2003,7 @@ class LLVMEmitter:
                 return variant_ty
         if isinstance(expr, EMITTER_READS):
             return self._typed_type(expr)
-        if isinstance(expr, rast.StringLit):
-            # A "..." in a `*u8` slot is a `*u8` (as_ptr, set by the slot rule
-            # as it emits), else a StrView.
-            if expr.as_ptr:
-                return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
-            return rast.NamedType(expr.span, 'StrView', [])
-        elif isinstance(expr, rast.Ident):
+        if isinstance(expr, rast.Ident):
             # Look up existing type; a local shadows a const of the same name.
             if expr.name in self.ritz_types:
                 return self.ritz_types[expr.name]
@@ -2192,9 +2186,6 @@ class LLVMEmitter:
                 if elem_type:
                     return rast.ArrayType(expr.span, len(expr.elements), elem_type)
             return None
-        elif isinstance(expr, rast.Match):
-            # A move-only arm value (_note_match_result_type, AGAST #2177).
-            return getattr(expr, 'result_ritz_type', None)
         return None
 
     @staticmethod
@@ -17272,8 +17263,6 @@ class LLVMEmitter:
             if scrut_flag is not None:
                 # Falling off the arm drops what its bindings still own.
                 self._leave_drop_scope()
-            if not self.builder.block.is_terminated:
-                self._note_match_result_type(expr, arm.body)
 
             # Remember which block we're in after emitting the body. One value
             # per arm, terminated or not: _enum_match_result zips the values
@@ -17416,22 +17405,6 @@ class LLVMEmitter:
                     "a variant's payload pattern is a name or `_`: match the "
                     "inner value in its own `match`",
                     field_pattern.span or pattern.span)
-
-    def _note_match_result_type(self, expr: rast.Match, body: rast.Expr) -> None:
-        """Record a move-only arm value's type on the match, inferred while
-        the arm's bindings are in scope, so `let u = match s` with
-        `Full(t) => t` owns (and drops) the value (AGAST #2177).
-
-        Also a Vec, Span or String: index sugar on the let reads its ritz
-        type, so `let t = match o` with `Some(x) => x[1..3]` over a String
-        left `t[0]` "Cannot index type: String" (AGAST #2779).  Other lets
-        keep their inference unchanged."""
-        if getattr(expr, 'result_ritz_type', None) is not None:
-            return
-        ty = self._infer_ritz_type(body)
-        if ty is not None and (self._type_implements_drop(ty)
-                               or self._buffer_field_path(ty) is not None):
-            expr.result_ritz_type = ty
 
     def _own_match_scrutinee(self, expr: rast.Match,
                              slot: ir.AllocaInstr) -> Optional[ir.AllocaInstr]:

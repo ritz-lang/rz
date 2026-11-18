@@ -429,6 +429,77 @@ def test_the_checker_types_a_sizeof_value_operand():
     assert _name(table.type_of(cast)) == "u16"
 
 
+U8_PTR_SLOTS = """
+type CStr = *u8
+
+fn take(p: *u8) -> i64
+    0
+
+fn view(v: StrView) -> i64
+    0
+
+fn named(c: bool) -> CStr
+    if c
+        "yes"
+    else
+        "no"
+
+fn main() -> i32
+    take("arg")
+    view("not")
+    let p: *u8 = "let"
+    0
+"""
+
+
+def test_a_string_literal_in_a_u8_ptr_slot_is_a_u8_ptr():
+    """LARB R3: a `"..."` takes `*u8` from a `*u8` slot (an argument, a
+    `let`, an `if`'s tails, through an alias) and is a StrView anywhere
+    else.  The emitter reads this instead of the `as_ptr` its slot rule
+    sets as it emits (#4068)."""
+    module = parse(U8_PTR_SLOTS)
+    table = typed.type_module(module)
+    got = {lit.value: type_to_string(table.type_of(lit))
+           for lit in _nodes(module, rast.StringLit)}
+    assert got == {"arg": "*u8", "not": "StrView", "let": "*u8",
+                   "yes": "*u8", "no": "*u8"}
+
+
+UNKNOWN_FIRST_ARM = """
+fn f(x: i64) -> i32
+    let r = match x
+        1 => mystery()
+        2 =>
+            mystery()
+            return 1
+        _ => 5 as u8
+    let s = match x
+        1 =>
+            return 2
+        _ => 6 as u16
+    let t = match x
+        1 => mystery()
+        _ =>
+            mystery()
+            return 3
+    0
+"""
+
+
+def test_a_match_is_its_first_arm_with_a_known_type():
+    """An arm the pass can't type (`unknown`), or one that leaves (a block
+    ending in `return`, typed void: angelo's hello_world.ritz), doesn't decide
+    the match's type; the next arm with a known type does, as the emitter's
+    _note_match_result_type did: `Ok(s) => s[1..3]` before
+    `Err(e) => span_empty<u8>()` is a Span<u8>, whose bytes widen unsigned
+    (test_issue_slice_generic_payload.ritz, #4068)."""
+    module = parse(UNKNOWN_FIRST_ARM)
+    table = typed.type_module(module)
+    got = [_name(table.type_of(m)) for m in _nodes(module, rast.Match)]
+    # `t` is angelo's inner match: nothing known, so the emitter's own typing.
+    assert got == ["u8", "u16", "unknown"]
+
+
 def _emitter_over(table):
     """An emitter with the table and no aliases: the kinds it reads need no
     other state."""
@@ -443,15 +514,22 @@ def test_the_emitter_takes_the_types_of_the_kinds_it_reads_from_the_table():
     """Retype each node in the table: the emitter answers with the table's
     type, not a rule of its own (an int literal would be its own `i64`, a
     cast its target, a char a `u8`)."""
-    module = parse("fn f(x: u8) -> i64\n    let a = 5\n    let b = x as u16\n    let c = 'c'\n    0\n")
+    module = parse("fn f(x: u8) -> i64\n    let a = 5\n    let b = x as u16\n    let c = 'c'\n"
+                   "    let s = \"s\"\n    let m = match x\n        _ => 1\n    0\n")
     table = typed.type_module(module)
     (lit,) = [e for e in _nodes(module, rast.IntLit) if e.value == 5]
     (cast,) = _nodes(module, rast.Cast)
     (char,) = _nodes(module, rast.CharLit)
-    for node, ty in ((lit, "u32"), (cast, "i8"), (char, "i16")):
+    (string,) = _nodes(module, rast.StringLit)
+    (match,) = _nodes(module, rast.Match)
+    # A "..." the emitter had marked as_ptr, a match with no result_ritz_type:
+    # their old rules would say `*u8` and nothing (#4068).
+    string.as_ptr = True
+    rows = ((lit, "u32"), (cast, "i8"), (char, "i16"), (string, "StrView"), (match, "u64"))
+    for node, ty in rows:
         table.record(node, rast.NamedType(None, ty, []))
     em = _emitter_over(table)
-    assert [_name(em._infer_ritz_type(n)) for n in (lit, cast, char)] == ["u32", "i8", "i16"]
+    assert [_name(em._infer_ritz_type(n)) for n, _ in rows] == [ty for _, ty in rows]
     # Signedness of a cast and a char comes from the table too.
     assert [em._infer_unsigned_expr(n) for n in (cast, char)] == [False, False]
 
@@ -464,10 +542,12 @@ def test_the_emitter_reads_unknown_as_no_type():
     assert _emitter_over(table)._infer_ritz_type(lit) is None
 
 
-def test_the_emitter_has_no_float_inferer():
-    """`_infer_float_expr` only ever called itself; it is gone (#3555)."""
+def test_the_emitter_has_no_rules_the_table_replaced():
+    """`_infer_float_expr` only ever called itself (#3555); a match's type is
+    the table's, not one noted on the node as its arms are emitted (#4068)."""
     from emitter_llvmlite import LLVMEmitter
     assert not hasattr(LLVMEmitter, "_infer_float_expr")
+    assert not hasattr(LLVMEmitter, "_note_match_result_type")
 
 
 def test_the_checker_types_an_untyped_globals_initialiser():

@@ -67,6 +67,7 @@ class SlotInferMixin:
             return ty
         ty = self._infer_type(expr)
         ty = self._slot_variant_type(expr, ty, slot)
+        ty = self._slot_string_type(expr, ty, slot)
         self._check_ref_slot(expr, ty, slot)
         self._check_array_slot(expr, ty, slot)
         self._check_parts(expr, slot)
@@ -100,6 +101,21 @@ class SlotInferMixin:
         builtin = {'Option': ('Some', 'None'), 'Result': ('Ok', 'Err')}
         if name in builtin.get(base.name, ()) or self._declares_variant(base, name):
             return copy.copy(base)
+        return ty
+
+    def _slot_string_type(self, expr: rast.Expr, ty: rast.Type,
+                          slot: Optional[rast.Type]) -> rast.Type:
+        """A `"..."` in a `*u8` slot is a `*u8` (LARB R3), recorded so: the
+        emitter reads it here, not the `as_ptr` its own slot rule sets as it
+        emits (_literal_into_slot, AGAST #4068).  Anything else keeps `ty`."""
+        if not isinstance(expr, rast.StringLit) or slot is None:
+            return ty
+        base = self._resolve_alias(slot)
+        if not (isinstance(base, rast.PtrType) and isinstance(base.inner, rast.NamedType)
+                and base.inner.name == 'u8' and not base.inner.args):
+            return ty
+        ty = rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
+        self.typed.record(expr, ty)
         return ty
 
     def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]) -> None:

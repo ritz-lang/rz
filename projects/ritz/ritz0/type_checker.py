@@ -28,6 +28,7 @@ import ritz_ast as rast
 from monomorph import bind_type_params, mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
 from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
+from tail_value import arm_diverges
 from typed import Typed
 from type_queries import FloatLitType, TypeQueriesMixin
 from type_refs import RefChecksMixin
@@ -1758,7 +1759,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         slot, discarded = self._take_tail_slot(), self._take_discarding()
         match_type = self._infer_type(expr.expr)
 
-        result_type = None
+        result_type, result_leaves = None, False
         for arm in expr.arms:
             self._push_scope()
             self._check_pattern(arm.pattern, match_type)
@@ -1768,8 +1769,15 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                     self._error(f"match guard must be bool", arm.guard.span)
 
             arm_type = self._infer_arm(arm.body, slot, discarded)
-            if result_type is None:
-                result_type, result_body = arm_type, arm.body
+            # The first arm that yields a known type decides (as the
+            # emitter's _note_match_result_type did, #4068): an `unknown` arm
+            # (`s[1..3]` of a generic's Span) or one that leaves (a block
+            # ending in `return`, typed void) says nothing.
+            leaves = arm_diverges(arm.body)
+            if result_type is None or (
+                    (self._is_unknown(result_type) or result_leaves)
+                    and not self._is_unknown(arm_type) and not leaves):
+                result_type, result_body, result_leaves = arm_type, arm.body, leaves
             elif self._value_fits(arm.body, arm_type, result_type):
                 pass
             elif self._value_fits(result_body, result_type, arm_type):

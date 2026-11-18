@@ -17,8 +17,7 @@ beside an ownership error, or refuse an instance, either way.
 Who reads it so far: the type checker (it is the inference), the move
 checker, for every kind it types (MOVE_CHECKER_READS, #3553, #4065),
 monomorph (#3554), and the emitter, for EMITTER_READS (#3555).  The
-emitter's rules for the other kinds (#4066, #4067, #4068) are still to move
-here.
+emitter's rules for the other kinds (#4066, #4067) are still to move here.
 """
 
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -47,17 +46,18 @@ MOVE_CHECKER_READS = (
 # The kinds the emitter takes from the table (LLVMEmitter._typed_type, #3555).
 # Where its old rule said nothing (an `if` with no tail, a tuple with an
 # untyped element) the table may say more; over the matrix corpus, ritz1, the
-# examples and the .ritz tests the emitted IR is byte-identical.  StringLit is
-# not here: the emitter types a "..." in a `*u8` slot `*u8` (as_ptr, set as
-# it emits), a slot rule this pass doesn't know yet (#4068, with Match).  The
+# examples and the .ritz tests the emitted IR is byte-identical.  A "..." in a
+# `*u8` slot is a `*u8` here (LARB R3), and a match is its first arm with a
+# known type, as the emitter's rules said when they were set as it emitted
+# (as_ptr, result_ritz_type; #4068).  The
 # kinds left (Ident, UnaryOp, BinOp, Call, Field, Index, MethodCall, ArrayLit)
 # disagree, mostly in generic instances (#3554); they stay the emitter's
 # (#4066, #4067).
 EMITTER_READS = (
     rast.IntLit, rast.FloatLit, rast.BoolLit, rast.CharLit,
-    rast.CStringLit, rast.NullLit,
+    rast.StringLit, rast.CStringLit, rast.NullLit,
     rast.Cast, rast.StructLit, rast.TupleLit,
-    rast.If, rast.Block, rast.TryOp,
+    rast.If, rast.Block, rast.Match, rast.TryOp,
 )
 
 
