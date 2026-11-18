@@ -985,6 +985,84 @@ pub fn main() -> i32
     var c: C = C { x: 3, y: 0 }
     return f(@c, 0)
 """,
+    # AGAST #3019 (#2940's rows): a `-> @&C` call arm meets an `@&C` local /
+    # field / `@x` arm.  Both are `ptr`, so the join must not deref or spill
+    # either side.  Each row writes through the joined value on both paths.
+    "call_let_if": TYPES + """\
+fn id(r: @&C) -> @&C
+    r
+
+fn go(p: @&C, b: i32)
+    let q: @&C = if b > 0
+        id(p)
+    else
+        p
+    q.x = q.x + 1
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    go(@&c, 1)
+    go(@&c, 0)
+    return c.x
+""",
+    "call_tail_match": TYPES + """\
+fn id(r: @&C) -> @&C
+    r
+
+fn pick(p: @&C, b: i32) -> @&C
+    match b
+        0 => id(p)
+        _ => p
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    let q: @&C = pick(@&c, 0)
+    q.x = q.x + 1
+    let r: @&C = pick(@&c, 1)
+    r.x = r.x + 1
+    return c.x
+""",
+    "call_else_if_field": TYPES + """\
+struct H
+    r: @&C
+
+fn id(r: @&C) -> @&C
+    r
+
+fn go(h: @&H, p: @&C, b: i32)
+    let q: @&C = if b == 0
+        id(p)
+    else if b == 1
+        h.r
+    else
+        p
+    q.x = q.x + 1
+
+pub fn main() -> i32
+    var c: C = C { x: 0, y: 0 }
+    var d: C = C { x: 1, y: 0 }
+    var h: H = H { r: @&d }
+    go(@&h, @&c, 0)
+    go(@&h, @&c, 1)
+    go(@&h, @&c, 2)
+    return c.x + d.x - 1
+""",
+    "call_deref_let_if": TYPES + """\
+fn id(r: @&C) -> @&C
+    r
+
+fn f(p: @&C, b: i32) -> i32
+    let d: C = if b > 0
+        *id(p)
+    else
+        *p
+    d.x
+
+pub fn main() -> i32
+    var c: C = C { x: 1, y: 0 }
+    let s: i32 = f(@&c, 1) + f(@&c, 0)
+    return s + c.x
+""",
 }
 
 
@@ -993,6 +1071,16 @@ pub fn main() -> i32
 @pytest.mark.parametrize("name", sorted(ARM_MODELS))
 def test_an_arm_value_takes_the_phi_model(ritz1_bin, tmp_path, compiler, name):
     assert _run(compiler, ritz1_bin, tmp_path, name, ARM_MODELS[name]) == 3
+
+
+# AGAST #3019: the call-vs-local `@&C` arm joins on the self-hosted build too.
+CALL_ARMS = ("call_let_if", "call_tail_match", "call_else_if_field", "call_deref_let_if")
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", CALL_ARMS)
+def test_ritz1_selfhosted_joins_a_call_arm(tmp_path, name):
+    assert _run_any("ritz1_selfhosted", tmp_path, name, ARM_MODELS[name]) == 3
 
 
 # A variant payload is a reference slot like any other.
