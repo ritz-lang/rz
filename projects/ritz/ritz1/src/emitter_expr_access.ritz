@@ -1391,6 +1391,25 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 emit_reg(s, pf_ptr)
                 emit_str(s, c"\n")
                 return emit_array_elem_widen(s, pf_val, pf_kind, pf_ty)
+            # AGAST #3972: `x.f[i]` with `f: *S`, the whole S by value, as
+            # `p[i]` on a `*S` local is (#3052).  It took the byte path below:
+            # one `load i8`, stored as the %S (lexis's
+            # `rule_entry_new(rule.selectors.selectors[k], ...)`), which
+            # clang refused.  A Vec, Span or String pointee indexes through.
+            else if ptr_field_struct_elem(s, field) == 1
+                if whole_struct_elem_refused(s, e) == 1
+                    return 0
+                let ps_idx: i32 = emit_expr(s, e.right)
+                let ps_ptr: i32 = emit_ptr_field_elem_addr(s, member_result.reg, field, TYPE_STRUCT, ps_idx)
+                let ps_val: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, ps_val)
+                emit_str(s, c" = load ")
+                emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
+                emit_str(s, c", ptr ")
+                emit_reg(s, ps_ptr)
+                emit_str(s, c"\n")
+                return ps_val
             # Port of ritz0 bedc85b: Vec<T> field indexing — s.vec_field[i]
             # The field is a Vec$T struct: { *T data, i64 len, i64 cap }.
             # We already have a ptr to the Vec struct in member_result.reg; load
@@ -2079,7 +2098,9 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
         return 0
     if unknown_struct_member_refused(s, e) == 1   # AGAST #3362
         return 0
-    emit_ir_error(s, c"unhandled EXPR_MEMBER")
+    # AGAST #3972: located, at the member.  It was unlocated, so a package
+    # build named no line (lexis's 9, over 4 files).
+    emit_nd_error(s, e.span.line, e.span.col, c"ritz1 cannot emit: unhandled EXPR_MEMBER")
 
     # Unhandled path — return 0
     return 0

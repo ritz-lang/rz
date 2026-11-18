@@ -536,6 +536,31 @@ fn infer_through_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
     stmt.var_type_name_len = len
     1
 
+# AGAST #3972: S when `@ie` / `@&ie` points at an S, for `ie` = `x[i]` the
+# `[N]S` arms of the let inference don't take: an index through a Vec, Span or
+# String (local or field: `@t.es[i]`), or an element of a `*S` local or field
+# (`@s.rs[i]`).  `let e = @t.es[i]` stayed an i64 with no name, so `e.y_min`
+# was "unhandled EXPR_MEMBER", unlocated (angelo's raster/fill.ritz).  Null
+# when it is none of those.
+fn addr_index_elem_struct(s: *EmitterState, ie: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if index_through(s, ie) != null
+        if index_through_value_struct(s, ie, @name, @len) == 0
+            return null
+    else if ie.left.kind == EXPR_IDENT
+        ptr_local_struct_index(s, ie, @name, @len)
+    else if ie.left.kind == EXPR_MEMBER and ie.right != null and ie.right.kind != EXPR_RANGE
+        let f: *StructField = resolve_member_chain_field(s, ie.left)
+        if ptr_field_struct_elem(s, f) == 1
+            name = f.field_type_name
+            len = f.field_type_name_len
+    if name == null or len <= 0
+        return null
+    *out_len = len
+    name
+
 # AGAST #2592: `let r = ps[i]` with `ps: [N]S` (a local, global or field) is a
 # copy of that S, as `let r: S = ps[i]`.  The slot stayed i64 with no name, so
 # `r.x` was "unhandled EXPR_MEMBER", unlocated.  Returns 1 when it typed the
@@ -1948,6 +1973,10 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                                 if arr_field.field_type == TYPE_ARRAY and arr_field.array_elem_type == TYPE_STRUCT and arr_field.array_elem_type_name_len > 0
                                     addr_pointee = arr_field.array_elem_type_name
                                     addr_pointee_len = arr_field.array_elem_type_name_len
+                        # AGAST #3972: and over a `*S` field, or through a Vec,
+                        # Span or String (`@t.es[i]`, angelo's `@edge_table.edges[k]`).
+                        if addr_pointee == null
+                            addr_pointee = addr_index_elem_struct(s, addr_oper, @addr_pointee_len)
                     # @<chained-member> — pointee = field's struct type
                     else if addr_oper.kind == EXPR_MEMBER
                         let mfield: *StructField = resolve_member_chain_field(s, addr_oper)
@@ -2741,7 +2770,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c"\n")
                 return
             # Fall through to emit error if member access failed
-            emit_ir_error(s, c"unhandled EXPR_MEMBER in assignment")
+            emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"ritz1 cannot emit: unhandled EXPR_MEMBER in assignment")   # AGAST #3972: located
             return
 
         # Check for array field element assignment: s.field[idx] = value
@@ -2767,7 +2796,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 # generic deref store below: that path evaluates `x.f[i]`
                 # as a VALUE and stores through it as an address (segfault
                 # or a wild write).  Refuse rather than miscompile.
-                emit_ir_error(s, c"unhandled indexed EXPR_MEMBER in assignment")
+                emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"ritz1 cannot emit: unhandled indexed EXPR_MEMBER in assignment")   # AGAST #3972: located
                 return
 
         # Deref assignment: *(expr) = value.  As of AGAST #1304

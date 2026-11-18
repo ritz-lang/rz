@@ -961,6 +961,15 @@ fn emit_member_ptr_at(s: *EmitterState, e: *Expr, result: *MemberPtrResult)
                             emit_str(s, c"\n")
                             emit_member_gep_from_ptr(s, result, elem_ptr_pp, elem_st_pp, field_idx_pp, field_pp)
                             return
+                # AGAST #3972: `s.rs[i].k` where `rs: *R` is a pointer field:
+                # element i is `*(s.rs + i)`, an R, as `p[i].k` is for a `*R`
+                # local (#1908).  Every form (read, store, `@`, `@&`) fell
+                # through to "unhandled EXPR_MEMBER" / "cannot take address"
+                # (lexis's `@sheet.rules[i].style_rule`).  A pointer to a Vec,
+                # Span or String indexes through it and is taken above.
+                else if ptr_field_struct_elem(s, inner_field) == 1
+                    if emit_ptr_field_elem_member_ptr(s, e, result, inner_result.reg, inner_field) == 1
+                        return
 
         # Array-of-struct local variable: `let arr: [N]St; arr[i].field`.
         # Earlier this fell through to the generic emit_expr path which
@@ -1111,6 +1120,21 @@ fn emit_array_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResu
         return 0
     # A reference element may come back a `ptr` rather than an i64.
     let elem_ptr: i32 = i64_value_to_ptr(s, e.left, emit_expr(s, e.left))
+    emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
+    1
+
+# AGAST #3972: address of `x.f[i].field` for `e`, where `f` is a `*St` field
+# whose slot is at `field_reg`: load the pointer, GEP one St per index, then
+# the field.  Returns 1 with `result` filled, or 0 if St or the field is unknown.
+fn emit_ptr_field_elem_member_ptr(s: *EmitterState, e: *Expr, result: *MemberPtrResult, field_reg: i32, f: *StructField) -> i32
+    let st: *StructDef = find_struct(s, f.field_type_name, f.field_type_name_len)
+    if st == null
+        return 0
+    let field_idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if field_idx < 0
+        return 0
+    let idx_reg: i32 = emit_expr(s, e.left.right)
+    let elem_ptr: i32 = emit_ptr_field_elem_addr(s, field_reg, f, TYPE_STRUCT, idx_reg)
     emit_member_gep_from_ptr(s, result, elem_ptr, st, field_idx, get_field_type(st, field_idx))
     1
 
