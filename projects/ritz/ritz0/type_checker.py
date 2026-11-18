@@ -375,8 +375,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             else:
                 expr_type = self._infer_into(block.expr, expected_ret)
             if expected_ret and not self._value_fits(block.expr, expr_type, expected_ret):
-                self._error(f"block expression has type {self._type_str(expr_type)}, "
-                          f"expected {self._type_str(expected_ret)}", block.expr.span)
+                self._misfit(block.expr, expr_type, expected_ret,
+                             f"block expression has type {self._type_str(expr_type)}, "
+                             f"expected {self._type_str(expected_ret)}", block.expr.span)
 
     def _check_stmt(self, stmt: rast.Stmt):
         """Type check a statement."""
@@ -388,8 +389,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 self._note_refused_literal(stmt)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
-                        self._error(f"cannot initialize {self._type_str(stmt.type)} "
-                                  f"with {self._type_str(init_type)}", stmt.span)
+                        self._misfit(stmt.value, init_type, stmt.type,
+                                     f"cannot initialize {self._type_str(stmt.type)} "
+                                     f"with {self._type_str(init_type)}", stmt.span)
                     # Its own copy: `_local_refs` tells bindings apart by it.
                     self.locals[stmt.name] = copy.copy(stmt.type)
                 else:
@@ -408,8 +410,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 self._note_refused_literal(stmt)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
-                        self._error(f"cannot initialize {self._type_str(stmt.type)} "
-                                  f"with {self._type_str(init_type)}", stmt.span)
+                        self._misfit(stmt.value, init_type, stmt.type,
+                                     f"cannot initialize {self._type_str(stmt.type)} "
+                                     f"with {self._type_str(init_type)}", stmt.span)
                     self.locals[stmt.name] = self._as_let(stmt.type)
                 else:
                     self.locals[stmt.name] = self._as_let(init_type)
@@ -439,8 +442,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 ret_type = self._infer_into(stmt.value, self._ret_slot())
                 if self.current_fn and self.current_fn.ret_type:
                     if not self._value_fits(stmt.value, ret_type, self.current_fn.ret_type):
-                        self._error(f"return type {self._type_str(ret_type)} doesn't match "
-                                  f"expected {self._type_str(self.current_fn.ret_type)}", stmt.span)
+                        self._misfit(stmt.value, ret_type, self.current_fn.ret_type,
+                                     f"return type {self._type_str(ret_type)} doesn't match "
+                                     f"expected {self._type_str(self.current_fn.ret_type)}", stmt.span)
 
         elif isinstance(stmt, rast.AssignStmt):
             target_type = self._infer_type(stmt.target)
@@ -449,8 +453,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             if isinstance(stmt.target, rast.Ident) and stmt.target.name in self.locals:
                 self._check_local_array_length(stmt, stmt.value, value_type, target_type)
             if not self._value_fits(stmt.value, value_type, target_type):
-                self._error(f"cannot assign {self._type_str(value_type)} "
-                          f"to {self._type_str(target_type)}", stmt.span)
+                self._misfit(stmt.value, value_type, target_type,
+                             f"cannot assign {self._type_str(value_type)} "
+                             f"to {self._type_str(target_type)}", stmt.span)
 
         elif isinstance(stmt, rast.WhileStmt):
             cond_type = self._infer_type(stmt.cond)
@@ -981,8 +986,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                     self._arg_depth -= 1
                     arg_types.append(arg_type)
                 if not self._value_fits(arg, arg_type, param_type):
-                    self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
-                              f"got {self._type_str(arg_type)}", arg.span)
+                    self._misfit(arg, arg_type, param_type,
+                                 f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
+                                 f"got {self._type_str(arg_type)}", arg.span)
         return arg_types
 
     def _call_type_args(self, expr: rast.Call, fn_sig, arg_types) -> Dict[str, rast.Type]:
@@ -1665,8 +1671,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 pairs.append((expected_fields[name], value,
                               None if self._is_unknown(value_type) else self._plain(value_type)))
                 if not self._value_fits(value, value_type, expected_fields[name]):
-                    self._error(f"field '{name}': expected {self._type_str(expected_fields[name])}, "
-                              f"got {self._type_str(value_type)}", value.span)
+                    self._misfit(value, value_type, expected_fields[name],
+                                 f"field '{name}': expected {self._type_str(expected_fields[name])}, "
+                                 f"got {self._type_str(value_type)}", value.span)
 
         if expr.type_args:
             return rast.NamedType(expr.span, expr.name, list(expr.type_args))

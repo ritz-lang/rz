@@ -4,7 +4,7 @@ Split out of type_checker.py to keep it under LARB's file-size limit
 (AGAST #3522)."""
 
 import re
-from typing import Optional
+from typing import Optional, Tuple
 
 import array_rules
 import float_rules
@@ -252,8 +252,9 @@ class TypeQueriesMixin:
         no fixed type: it is `*u8` in a `*u8` slot (LARB R3) and a `Span<u8>` of
         its bytes in a `Span<u8>` slot (LARB R62, AGAST #3596), and nothing else
         is, so a StrView, a `c"…"` or a String stays a mismatch. An integer
-        literal is whichever float its f32 / f64 slot is (§7.5, AGAST #3604)."""
-        if self._types_compatible(actual, expected):
+        literal is whichever float its f32 / f64 slot is (§7.5, AGAST #3604), and
+        any other integer fits one when exact there (§7.5, AGAST #4113)."""
+        if self._type_fits(actual, expected):
             return True
         if value is None:
             return False
@@ -265,8 +266,36 @@ class TypeQueriesMixin:
         return all(self._is_u8_ptr(slot) or self._is_u8_span(slot)
                    if isinstance(tail, rast.StringLit)
                    else (float_rules.int_literal_only(tail) and self._is_float(slot))
-                   or self._types_compatible(self._infer_type(tail), slot)
+                   or self._type_fits(self._infer_type(tail), slot)
                    for tail, slot in tails)
+
+    def _type_fits(self, actual: rast.Type, expected: rast.Type) -> bool:
+        """A value of type `actual` in an `expected` slot: compatible, or an
+        integer exact in its float slot (the emitter's _int_into_float_slot)."""
+        if self._types_compatible(actual, expected):
+            return True
+        pair = self._int_into_float(actual, expected)
+        return pair is not None and float_rules.is_exact(int(pair[0][1:]), pair[1])
+
+    def _int_into_float(self, actual: rast.Type,
+                        expected: rast.Type) -> Optional[Tuple[str, str]]:
+        """(integer, float) type names when an integer meets an f32 / f64 slot."""
+        actual = self._resolve_alias(actual)
+        expected = self._resolve_alias(expected)
+        if (isinstance(actual, rast.NamedType) and actual.name in self.INT_TYPES
+                and self._is_float(expected)):
+            return actual.name, expected.name
+        return None
+
+    def _misfit(self, value: Optional[rast.Expr], actual: rast.Type,
+                expected: rast.Type, message: str, span: Optional[rast.Span]):
+        """Report `value` refused by its slot: an inexact integer into a float
+        in the emitter's words, at the value; anything else as `message`."""
+        pair = self._int_into_float(actual, expected)
+        if pair is not None and value is not None:
+            self._error(float_rules.int_into_float_inexact(*pair), value.span)
+        else:
+            self._error(message, span)
 
     def _is_u8_span(self, ty: rast.Type) -> bool:
         """`Span<u8>`, or monomorphisation's `Span$u8` spelling of it."""
