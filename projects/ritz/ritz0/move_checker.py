@@ -61,6 +61,8 @@ class MoveChecker(MoveWalk):
         # Each expression's type, from the typing pass (typed.py): the
         # kinds in typed.MOVE_CHECKER_READS come from here.
         self.typed: Optional[typed.Typed] = None
+        # The fn being checked: the table is read in it (typed.Typed).
+        self._body: Optional[rast.FnDef] = None
         # Function parameters: name -> params, so an argument lent to an
         # `@T` / `*T` / `:&` parameter (auto-borrow) isn't counted as a move.
         self.fn_params: Dict[str, List[rast.Param]] = {}
@@ -217,36 +219,13 @@ class MoveChecker(MoveWalk):
             return self.globals[expr.name]
         return rast.NamedType(expr.span, 'unknown', [])
 
-    def _type_of_unary(self, expr: rast.UnaryOp) -> rast.Type:
-        if expr.op in ('&', '@'):
-            inner = self._infer_expr_type(expr.operand)
-            return rast.PtrType(expr.span, inner, mutable=False)
-        elif expr.op in ('&mut', '@&'):
-            inner = self._infer_expr_type(expr.operand)
-            return rast.PtrType(expr.span, inner, mutable=True)
-        elif expr.op == '*':
-            inner = self._infer_expr_type(expr.operand)
-            if isinstance(inner, rast.PtrType):
-                return inner.inner
-            return rast.NamedType(expr.span, 'unknown', [])
-        return self._infer_expr_type(expr.operand)
-
-    def _type_of_binop(self, expr: rast.BinOp) -> rast.Type:
-        return self._infer_expr_type(expr.left)
-
     def _type_from_table(self, expr: rast.Expr) -> rast.Type:
-        """The typing pass's type for `expr` (typed.MOVE_CHECKER_READS)."""
-        ty = self.typed.type_of(expr) if self.typed is not None else None
+        """The typing pass's type for `expr` (typed.MOVE_CHECKER_READS), in
+        the body being checked (typed.Typed); `unknown` where the pass
+        didn't type it there (a body it skipped)."""
+        ty = (self.typed.type_of(expr, within=self._body)
+              if self.typed is not None else None)
         return ty if ty is not None else rast.NamedType(expr.span, 'unknown', [])
-
-    def _type_of_array_lit(self, expr: rast.ArrayLit) -> rast.Type:
-        if expr.elements:
-            inner = self._infer_expr_type(expr.elements[0])
-            return rast.ArrayType(expr.span, len(expr.elements), inner)
-        return rast.NamedType(expr.span, 'unknown', [])
-
-    def _type_of_tuple_lit(self, expr: rast.TupleLit) -> rast.Type:
-        return rast.TupleType(expr.span, [self._infer_expr_type(e) for e in expr.elements])
 
     def _variant_value_type(self, expr: rast.Expr) -> Optional[rast.Type]:
         """`E.V` or `E.V(...)`'s enum type, unless `E` is a binding."""
@@ -266,17 +245,6 @@ class MoveChecker(MoveWalk):
         # What its arms give, typed as they were checked (AGAST #2178).
         return (getattr(expr, 'value_type', None)
                 or rast.NamedType(expr.span, 'unknown', []))
-
-    def _type_of_try(self, expr: rast.TryOp) -> rast.Type:
-        # TryOp (?) unwraps Result<T, E> to T or Option<T> to T
-        # Infer the inner type from the expression's Result/Option
-        inner = self._infer_expr_type(expr.expr)
-        if isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option'):
-            # The ok/some type is the first type argument
-            if inner.args:
-                return inner.args[0]
-        # Fallback: return unknown (could be any type)
-        return rast.NamedType(expr.span, 'unknown', [])
 
     def _type_of_method_call(self, expr: rast.MethodCall) -> rast.Type:
         variant = self._variant_value_type(expr)
@@ -306,23 +274,14 @@ class MoveChecker(MoveWalk):
 
     # Every kind _infer_expr_type types, by class (see move_walk.py's
     # EXPR_CHECKS on why `type(expr)` is enough).  The typing pass's kinds
-    # first; the rest are still this checker's own rules (AGAST #3448).
+    # first (AGAST #3448, #3553); the rest are still this checker's own
+    # rules, until the pass types a generic's members at its instance
+    # (#3554).  Index is deliberately absent: `a[i]` stays unknown (#2268).
     EXPR_TYPES = {
         **dict.fromkeys(typed.MOVE_CHECKER_READS, _type_from_table),
-        # Null is a special pointer type (Copy)
-        rast.NullLit: lambda self, e: rast.PtrType(
-            e.span, rast.NamedType(e.span, 'void', []), mutable=False),
         rast.Ident: _type_of_ident,
-        rast.UnaryOp: _type_of_unary,
-        rast.BinOp: _type_of_binop,
-        rast.ArrayLit: _type_of_array_lit,
-        # `[v; n]` is `[n]V`: a fill of a fill of a move-only value is
-        # move-only too, so `[ [r; 1]; 2]` copies `r` (AGAST #3433).
-        rast.ArrayFill: _type_from_table,
-        rast.TupleLit: _type_of_tuple_lit,
         rast.Field: _type_of_field,
         rast.Match: _type_of_match,
-        rast.TryOp: _type_of_try,
         rast.MethodCall: _type_of_method_call,
     }
 
@@ -632,6 +591,7 @@ class MoveChecker(MoveWalk):
 
     def _check_fn_body(self, fn: rast.FnDef):
         self.current_fn_name = fn.name
+        self._body = fn
         self._field_moves = set()
         self._push_scope()
 
@@ -649,6 +609,7 @@ class MoveChecker(MoveWalk):
         self._pop_scope()
         fn.field_moves = self._field_moves
         self.current_fn_name = None
+        self._body = None
 
     # ---- temporaries (AGAST #2161) -------------------------------------------
 

@@ -15,9 +15,9 @@ them (on by default is #3556, #1823), and the slot errors (§13.2, §13.4) are p
 beside an ownership error, or refuse an instance, either way.
 
 Who reads it so far: the type checker (it is the inference), and the move
-checker, for MOVE_CHECKER_READS.  The move checker's own rules for the other
-kinds (#3553), monomorph's inferers (#3554) and the emitter's (#3555) are
-still to move here.
+checker, for MOVE_CHECKER_READS (#3553).  The move checker's rules for
+Ident, Field, Match and MethodCall (#3553, after #3554), monomorph's
+inferers (#3554) and the emitter's (#3555) are still to move here.
 """
 
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -25,15 +25,19 @@ from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
 import ritz_ast as rast
 
 # The kinds the move checker takes from the table (move_checker.EXPR_TYPES).
-# Each answers as its old rule did, or `void` / a variant's enum where that
-# rule said `unknown`; over the matrix corpus and ritz1 no answer changes
-# whether a value is move-only.  The kinds the rules still disagree on
-# (Ident, UnaryOp, BinOp, Field, Index, Match, TryOp, MethodCall, the
-# aggregate literals) stay the move checker's for now (#3553).
+# Each answers as its old rule did, or better (`@x` is a reference, `&T`, not
+# `*T`; `a < b` is a bool); over the matrix corpus, ritz1 and examples no IR
+# changes.  Ident, Field, Match and MethodCall stay the move checker's until
+# the pass types a generic's members at its instance (#3554); Index is
+# deliberately not read (#2268).  ArrayFill `[v; n]` is `[n]V`, so a fill
+# of a fill of a move-only value is move-only too: `[ [r; 1]; 2]` copies `r`
+# (#3433).
 MOVE_CHECKER_READS = (
     rast.IntLit, rast.FloatLit, rast.BoolLit, rast.CharLit,
-    rast.StringLit, rast.CStringLit,
+    rast.StringLit, rast.CStringLit, rast.NullLit,
     rast.Cast, rast.StructLit, rast.Call,
+    rast.UnaryOp, rast.BinOp, rast.TryOp, rast.ArrayLit, rast.ArrayFill,
+    rast.TupleLit,
 )
 
 
@@ -43,21 +47,45 @@ class Typed:
     Keyed by node identity, not equality: two `0` literals are equal
     dataclasses but two entries.  The table holds each node, so an id can't
     be reused by another node while the table lives.
+
+    And keyed by body: monomorph shares each subtree an instance leaves
+    unchanged (monomorph.map_child_nodes), so `v` in a generic body is one
+    node in every instance, typed once per instance.  `type_of(e, within=fn)`
+    is `e`'s type in `fn`; without `within`, the last body's (#3553).
     """
 
     def __init__(self) -> None:
         self._types: Dict[int, Tuple[rast.Expr, rast.Type]] = {}
+        # (id(body), id(expr)) -> (body, expr, type); body None outside one.
+        self._in_body: Dict[Tuple[int, int], Tuple[object, rast.Expr, rast.Type]] = {}
+        # The body `record` files under (`enter`).
+        self._body: Optional[rast.FnDef] = None
         # Every type error the walk found, in order; `.slot` marks the slot
         # errors (TypeChecker._slot_error).
         self.errors: List = []
 
-    def record(self, expr: rast.Expr, ty: rast.Type) -> None:
-        """`expr`'s type is `ty`.  An expression typed twice (a literal's
-        parts, a re-read of a place) keeps the last answer."""
-        self._types[id(expr)] = (expr, ty)
+    def enter(self, body: Optional[rast.FnDef]) -> None:
+        """Record what follows as `body`'s types (None: outside any body)."""
+        self._body = body
 
-    def type_of(self, expr: rast.Expr) -> Optional[rast.Type]:
-        """`expr`'s type, or None if the pass never typed `expr`."""
+    def record(self, expr: rast.Expr, ty: rast.Type,
+               within: Optional[rast.FnDef] = None) -> None:
+        """`expr`'s type is `ty`, in `within` (default: the body entered).
+        An expression typed twice (a literal's parts, a re-read of a place)
+        keeps the last answer."""
+        body = within if within is not None else self._body
+        self._types[id(expr)] = (expr, ty)
+        self._in_body[(id(body), id(expr))] = (body, expr, ty)
+
+    def type_of(self, expr: rast.Expr,
+                within: Optional[rast.FnDef] = None) -> Optional[rast.Type]:
+        """`expr`'s type (in body `within`, if given), or None if the pass
+        never typed `expr` there."""
+        if within is not None:
+            entry = self._in_body.get((id(within), id(expr)))
+            if entry is None or entry[0] is not within or entry[1] is not expr:
+                return None
+            return entry[2]
         entry = self._types.get(id(expr))
         if entry is None or entry[0] is not expr:
             return None

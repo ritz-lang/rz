@@ -322,6 +322,7 @@ class TypeChecker:
         # function of the same name and check against that signature.
         self.current_fn = self.functions.get(
             f"{impl.type_name}_{fn.name}" if impl else fn.name)
+        self.typed.enter(fn)
         self.locals = {}
         self.scope_stack = []
 
@@ -344,6 +345,7 @@ class TypeChecker:
         # Check body
         self._check_block(fn.body, fn.ret_type)
 
+        self.typed.enter(None)
         self.current_fn = None
         self.current_type_params = set()
 
@@ -1499,6 +1501,9 @@ class TypeChecker:
         struct_info = self.structs.get(expr.name)
         if struct_info is None:
             self._error(f"undefined struct: {expr.name}", expr.span)
+            # Its values are typed all the same (typed.py's readers).
+            for _name, value in expr.fields:
+                self._infer_type(value)
             return rast.NamedType(expr.span, expr.name, [])
 
         # Check all fields are provided and have correct types
@@ -1553,8 +1558,8 @@ class TypeChecker:
 
         # Should be Result<T, E> - extract T
         if isinstance(inner_type, rast.NamedType):
-            if inner_type.name.startswith('Result'):
-                # Extract success type from Result<T, E>
+            if inner_type.name.startswith('Result') or inner_type.name == 'Option':
+                # Extract success type from Result<T, E> / Option<T>
                 if inner_type.args:
                     return inner_type.args[0]
 

@@ -51,12 +51,12 @@ def _nodes(module, kind):
     def walk(node):
         if isinstance(node, kind):
             found.append(node)
-        if isinstance(node, list):
+        if isinstance(node, (list, tuple)):
             for x in node:
                 walk(x)
         elif isinstance(node, rast.Node):
             for value in vars(node).values():
-                if isinstance(value, (list, rast.Node)):
+                if isinstance(value, (list, tuple, rast.Node)):
                     walk(value)
 
     walk(module.items)
@@ -190,7 +190,7 @@ def test_the_move_checker_takes_a_calls_type_from_the_table():
     module = parse(DROP_SOURCE)
     table = typed.type_module(module)
     (call,) = [c for c in _nodes(module, rast.Call) if c.func.name == "mystery"]
-    table.record(call, rast.NamedType(None, "Res", []))
+    table.record(call, rast.NamedType(None, "Res", []), within=module.items[-1])
     MoveChecker().check(module)
     assert _name(getattr(call, "drop_temp", None)) == "Res"
 
@@ -217,3 +217,115 @@ def test_the_move_checker_types_an_untyped_module_itself():
 def test_the_move_checker_has_no_rules_of_its_own_for_the_kinds_it_reads():
     for kind in typed.MOVE_CHECKER_READS:
         assert MoveChecker.EXPR_TYPES[kind] is MoveChecker._type_from_table, kind
+
+
+# --- a node shared by two bodies (AGAST #3553) --------------------------------
+
+SHARED_SOURCE = """
+fn a(v: i32) -> i32
+    let w = v
+    w
+
+fn b(v: u8) -> u8
+    let w = v
+    w
+"""
+
+
+def _sharing_bodies():
+    """SHARED_SOURCE with `b` given `a`'s body, as monomorph shares every
+    subtree an instance leaves unchanged (monomorph.map_child_nodes)."""
+    module = parse(SHARED_SOURCE)
+    fn_a, fn_b = module.items
+    fn_b.body = fn_a.body
+    return module, fn_a, fn_b
+
+
+def test_a_node_two_bodies_share_has_each_bodys_type():
+    """Read `within` a body, the table answers for that body, not for
+    whichever body was typed last."""
+    module, fn_a, fn_b = _sharing_bodies()
+    table = typed.type_module(module)
+    (v,) = {id(e): e for e in _nodes(module, rast.Ident) if e.name == "v"}.values()
+    assert _name(table.type_of(v, within=fn_a)) == "i32"
+    assert _name(table.type_of(v, within=fn_b)) == "u8"
+    assert table.type_of(v, within=rast.FnDef(None, "c", [], None, None)) is None
+
+
+def test_the_move_checker_reads_each_body_at_its_own_types():
+    module, fn_a, fn_b = _sharing_bodies()
+    table = typed.type_module(module)
+    (v,) = {id(e): e for e in _nodes(module, rast.Ident) if e.name == "v"}.values()
+    table.record(v, rast.NamedType(None, "u16", []), within=fn_a)
+    checker = MoveChecker()
+    checker.typed = table
+    seen = []
+    for fn in (fn_a, fn_b):
+        checker._body = fn
+        seen.append(_name(checker._type_from_table(v)))
+    assert seen == ["u16", "u8"]
+
+
+# --- the kinds whose rules moved to the table (#3553) -------------------------
+
+def test_the_move_checker_reads_the_table_for_the_non_generic_kinds():
+    """UnaryOp, BinOp, TryOp, the aggregate and null literals: their own
+    rules are gone.  Ident, Field, Match and MethodCall wait for the pass to
+    type a generic's members at its instance (#3554); Index stays unknown on
+    purpose (#2268)."""
+    for kind in (rast.UnaryOp, rast.BinOp, rast.TryOp, rast.ArrayLit,
+                 rast.ArrayFill, rast.TupleLit, rast.NullLit):
+        assert kind in typed.MOVE_CHECKER_READS, kind
+        assert MoveChecker.EXPR_TYPES[kind] is MoveChecker._type_from_table, kind
+    assert rast.Index not in MoveChecker.EXPR_TYPES
+    gone = ("_type_of_unary", "_type_of_binop", "_type_of_try",
+            "_type_of_array_lit", "_type_of_tuple_lit")
+    assert not [n for n in gone if hasattr(MoveChecker, n)]
+
+
+def _checker_on(module):
+    """A MoveChecker reading `module`'s table in its last fn."""
+    checker = MoveChecker()
+    checker.typed = module.typed
+    checker._body = module.items[-1]
+    return checker
+
+
+def test_an_address_of_is_a_reference():
+    """`@x` makes a reference (LANGUAGE_SPEC §13.2): `&Big`, as the typing
+    pass says, where the move checker's own rule said `*Big`.  Only a
+    declared `*T` slot reads it as a pointer (_hold_loans)."""
+    module = parse("struct Big\n    a: i64\n\nfn main() -> i32\n"
+                   "    let b = Big { a: 1 }\n    let p = @b\n    0\n")
+    typed.type_module(module)
+    (addr,) = _nodes(module, rast.UnaryOp)
+    ty = _checker_on(module)._infer_expr_type(addr)
+    assert isinstance(ty, rast.RefType) and not ty.mutable and _name(ty.inner) == "Big"
+
+
+def test_a_comparison_is_a_bool():
+    """`a < b` is a bool, not its left operand's type."""
+    module = parse("fn main() -> i32\n    let a: u16 = 1\n    let c = a < 2\n    0\n")
+    typed.type_module(module)
+    (cmp,) = _nodes(module, rast.BinOp)
+    assert _name(_checker_on(module)._infer_expr_type(cmp)) == "bool"
+
+
+def test_try_on_an_option_gives_its_payload():
+    module = parse("enum Option<T>\n    Some(T)\n    None\n\n"
+                   "fn f(o: Option<u32>) -> Option<u32>\n    let x = o?\n    Some(x)\n")
+    typed.type_module(module)
+    (try_op,) = _nodes(module, rast.TryOp)
+    assert _name(_checker_on(module)._infer_expr_type(try_op)) == "u32"
+
+
+def test_an_undeclared_struct_literals_fields_are_still_typed():
+    """`Nope { ptr: @a }` with no `Nope` declared: the type error is the
+    literal's; its field values are typed all the same, so the move checker
+    still finds `@a` in the table."""
+    module = parse("fn f() -> i32\n    var a: u16 = 1\n"
+                   "    let s = Nope { ptr: @a, len: 3 }\n    0\n")
+    typed.type_module(module)
+    (addr,) = _nodes(module, rast.UnaryOp)
+    ty = _checker_on(module)._infer_expr_type(addr)
+    assert isinstance(ty, rast.RefType) and _name(ty.inner) == "u16"
