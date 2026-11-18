@@ -731,3 +731,49 @@ def test_uninitialised_copy_array_and_drop_struct_accepted(tmp_path, compiler):
     comp, ll, _ = _compile(compiler, tmp_path, "uninit_ok", _source(body, "f()", 4))
     out = comp.stdout + comp.stderr
     assert comp.returncode == 0 and ll.exists(), f"{compiler}:\n{out[-2000:]}"
+
+
+# Storing into an element of a moved-out array is a use of the moved value
+# (AGAST #3434): `h.a` as `a`, though `h` itself still holds `n`.  Each row:
+# body, the moved path, the store's line:col and the move's, both as lines
+# into f's body (1 = its first line); then how many errors.  In the loop the
+# second iteration stores into, then moves, the `h.a` the first one moved.
+MOVED_STORE = {
+    "local": ("""\
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    eat(a)
+    a[0] = S { x: 5 }
+""", "a", (3, 5), (2, 9), 1),
+    "field": ("""\
+    var h: H = H { a: [S { x: 1 }, S { x: 2 }], n: 0 }
+    eat(h.a)
+    h.a[0] = S { x: 5 }
+""", "h.a", (3, 5), (2, 9), 1),
+    "field_in_loop": ("""\
+    var h: H = H { a: [S { x: 1 }, S { x: 2 }], n: 0 }
+    var i: i32 = 0
+    while i < 2
+        h.a[0] = S { x: 5 }
+        eat(h.a)
+        i += 1
+""", "h.a", (4, 9), (5, 13), 2),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(MOVED_STORE))
+def test_store_into_moved_array_refused(tmp_path, compiler, name):
+    body, what, (sl, sc), (ml, mc), errors = MOVED_STORE[name]
+    src = "fn eat(a: [2]S)\n    D = D * 10 + 9\n\nfn f()\n" + body
+    comp, ll, _ = _compile(compiler, tmp_path, f"moved_store_{name}", _source(src, "f()", 0))
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"{compiler} accepted a store into moved `{what}`:\n{out[-1000:]}"
+    assert not ll.exists()
+    assert "Traceback" not in out, out[-2000:]
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    f0 = PRELUDE.count("\n") + 4  # the `fn f()` line
+    msg = f"use of moved value: `{what}` (moved at "
+    hit = [m for loc, m in found if loc == f"{f0 + sl}:{sc}" and m.startswith(msg)
+           and m.endswith(f"main.ritz:{f0 + ml}:{mc})")]
+    assert hit, f"{compiler}: wanted {f0 + sl}:{sc}: {msg}..{f0 + ml}:{mc}):\n{out[-2000:]}"
+    assert len(found) == errors, f"{compiler}: wanted {errors} error(s):\n{out[-2000:]}"
