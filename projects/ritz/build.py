@@ -2680,6 +2680,35 @@ def format_test_summary(n_files: int, tests_passed: int, tests_failed: int,
             f" | {ok} file(s) passed, {tests_passed} tests passed")
 
 
+class StrayTestsDirError(Exception):
+    """A package keeps .ritz files in `tests/`, which discovery never reads.
+
+    Until AGAST #1386, five packages did this (284 [[test]] fns, run by no
+    gate), following an `rz` comment that wrongly said build.py globbed
+    `tests/`. Rather than add a second convention, a stray `tests/*.ritz` is
+    an error that names every file that would otherwise never run.
+    """
+
+    def __init__(self, pkg_dir: Path, files: list[Path]):
+        self.pkg_dir = pkg_dir
+        self.files = files
+        names = "\n".join(f"  {f.relative_to(pkg_dir)}" for f in files)
+        super().__init__(
+            f"{pkg_dir}: {len(files)} .ritz file(s) under tests/ would never "
+            f"run; test discovery reads test/ only. Move them to test/ "
+            f"(git mv) (AGAST #1386):\n{names}")
+
+
+def stray_test_files(pkg_dir: Path) -> list[Path]:
+    """Every .ritz under `pkg_dir/tests/`, sorted; [] when tests/ is absent,
+    holds no .ritz (angelo's fixtures), or is its own package with a
+    ritz.toml (ritzlib's `ritzlib/tests`)."""
+    tests_dir = pkg_dir / "tests"
+    if not tests_dir.is_dir() or (tests_dir / "ritz.toml").exists():
+        return []
+    return sorted(tests_dir.rglob("*.ritz"))
+
+
 def discover_test_files(pkg_dir: Path, config: dict) -> list[Path]:
     """The package's .ritz test files, sorted: test/*.ritz, plus the root's
     test_*.ritz for a `test_only` package.
@@ -2689,6 +2718,9 @@ def discover_test_files(pkg_dir: Path, config: dict) -> list[Path]:
     call this, so the parallel sweep cannot cover a different file set from
     the serial one (AGAST #1809).
     """
+    stray = stray_test_files(pkg_dir)
+    if stray:
+        raise StrayTestsDirError(pkg_dir, stray)
     ritz_tests = []
     test_dir = pkg_dir / "test"
     if test_dir.exists():
@@ -3469,6 +3501,9 @@ def main():
         return commands[args.command](args)
     except manifest.ManifestError as e:
         # file:line, not a traceback: the manifest is the user's to fix.
+        print(f"error: {e}", file=sys.stderr)
+        return 1
+    except StrayTestsDirError as e:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
