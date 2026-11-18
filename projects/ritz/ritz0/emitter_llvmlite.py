@@ -12867,6 +12867,13 @@ class LLVMEmitter:
             another = self._another_struct_arg_message(key, nargs, fname, n, llvm_msg)
             if another is not None:
                 return another
+            # AGAST #1387: a pointer to another struct, which _convert_type
+            # no longer bitcasts, in _check_struct_ptr_arg's (#1948's) words.
+            p = re.search(r"arg mismatch: (.+)\* != (.+)\*$", llvm_msg.strip())
+            pair = p and self._another_struct_names(p.group(1), p.group(2))
+            if pair:
+                return (f"argument {n} of `{fname}` has the wrong type: "
+                        f"*{pair[1]} != *{pair[0]}")
             return (
                 f"argument {n} of `{fname}` has the wrong type: {llvm_msg}"
             )
@@ -12992,7 +12999,7 @@ class LLVMEmitter:
                                 arg, ir.PointerType(expected_llvm), fname, i + 1, lent))
                             continue
                         arg_val = self._emit_expr(arg)
-                        converted_args.append(self._convert_type(arg_val, expected_llvm, arg))
+                        converted_args.append(self._convert_type(arg_val, expected_llvm, arg, arg=True))
                     # AGAST #1739 / #1745: large struct args go byval and a
                     # large struct result via sret, as for a direct call.
                     # AGAST #1879: a `[[callconv]]` fn-type alias's convention.
@@ -13023,7 +13030,7 @@ class LLVMEmitter:
                     self._float_slot(param_type, arg)
             args = [self._emit_expr(arg) for arg in call.args]
             if isinstance(ritz_type, rast.FnType):
-                args = [self._convert_type(a, self._ritz_type_to_llvm(p), arg)
+                args = [self._convert_type(a, self._ritz_type_to_llvm(p), arg, arg=True)
                         for arg, a, p in zip(call.args, args, ritz_type.params)]
                 return self.builder.call(fn_ptr, args,
                                          cconv=_llvm_callconv(ritz_type.callconv),
@@ -13244,7 +13251,7 @@ class LLVMEmitter:
                         return self._emit_into_array_slot(a, slot)
                     val = self._emit_value_arg(arg, param_def.type, emit_plain)
 
-                    val = self._convert_type(val, expected_type, arg)
+                    val = self._convert_type(val, expected_type, arg, arg=True)
                 args.append(val)
 
             return self.builder.call(fn, args)
@@ -13276,7 +13283,7 @@ class LLVMEmitter:
                 val = self._emit_expr(arg)
                 if i < len(fn_type.args):
                     expected_type = fn_type.args[i]
-                    val = self._convert_type(val, expected_type, arg)
+                    val = self._convert_type(val, expected_type, arg, arg=True)
                 args.append(val)
 
             return self.builder.call(fn, args)
@@ -14782,7 +14789,7 @@ class LLVMEmitter:
             converted_args = []
             for i, arg in enumerate(all_args):
                 expected_type = self._fn_param_types(fn)[i]
-                converted = self._convert_type(arg, expected_type, expr.args[i])
+                converted = self._convert_type(arg, expected_type, expr.args[i], arg=True)
                 converted_args.append(converted)
 
             return self._emit_method_call_insn(expr, fn, mangled_name, converted_args, 0)
@@ -14934,7 +14941,8 @@ class LLVMEmitter:
         for i, arg in enumerate(all_args):
             expected_type = self._fn_param_types(fn)[i]
             # all_args[0] is the receiver.
-            converted = self._convert_type(arg, expected_type, expr.args[i - 1] if i else None)
+            converted = self._convert_type(arg, expected_type, expr.args[i - 1] if i else None,
+                                           arg=i > 0)
             converted_args.append(converted)
 
         return self._emit_method_call_insn(expr, fn, mangled_name, converted_args, 1)
@@ -15353,10 +15361,11 @@ class LLVMEmitter:
         return self._int_shape(src, val.type.width < 64)[1]
 
     def _convert_type(self, val: ir.Value, target_type: ir.Type,
-                      at: Optional[rast.Expr] = None) -> ir.Value:
+                      at: Optional[rast.Expr] = None, arg: bool = False) -> ir.Value:
         """Convert a value to the target type if needed. `at` is the expression
         it came from, for callers that emit several before converting any: one
-        SSA value can be two arguments (`s.m(n, n)`)."""
+        SSA value can be two arguments (`s.m(n, n)`). `arg`: `val` is a call
+        argument, whose pointer is held to LARB R71."""
         if val.type == target_type:
             return val
         self._check_bool_slot(val, target_type, at)
@@ -15395,8 +15404,18 @@ class LLVMEmitter:
         if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.PointerType):
             return self.builder.inttoptr(val, target_type)
 
-        # Pointer to pointer (bitcast)
+        # Pointer to pointer (bitcast). At a call argument only what LARB R71
+        # allows: a `*u8` of any pointer, or any pointer of a `*u8` (the same
+        # pointee returned above). Any other pointer goes to the call as it
+        # is, and llvmlite's mismatch is #1366's located "argument N of `f`
+        # has the wrong type" (AGAST #1387). A fn pointer into a fn pointer
+        # isn't R71's: a procedure is emitted `i32 (..)` for a `fn(..)`'s void.
         if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.PointerType):
+            byte_ptr = self.i8.as_pointer()
+            if (arg and val.type != byte_ptr and target_type != byte_ptr
+                    and not (isinstance(val.type.pointee, ir.FunctionType)
+                             and isinstance(target_type.pointee, ir.FunctionType))):
+                return val
             return self.builder.bitcast(val, target_type)
 
         # Auto-deref when a value type is expected and we have a pointer to that value.

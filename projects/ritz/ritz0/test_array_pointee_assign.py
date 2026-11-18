@@ -121,3 +121,56 @@ def test_a_struct_pointer_at_a_call_keeps_its_wrong_type_words(tmp_path):
     )
     _assert_refused("ritz0", tmp_path, "call_struct", marked,
                     "argument 1 of `f` has the wrong type: *C != *D")
+
+
+# AGAST #1387: what the checker leaves to the emitter at a call, a struct
+# pointer the emitter can't trace to a local (here a call's result), reached
+# _convert_type's blanket bitcast and compiled. R71 lets that bitcast make a
+# `*u8` of a pointer or a pointer of a `*u8`, nothing else: any other pointer
+# goes to the call unconverted, and #1366's wrapper names the argument. A
+# call through a fn pointer is the checker's (R71's words), so has no row.
+_GIVE_C = _STRUCTS + "fn give(c: *C) -> *C\n    c\n\n"
+CALL_REFUSED = {
+    "direct": (
+        _GIVE_C + "fn f(p: *D) -> i32\n    0\n\npub fn main() -> i32\n"
+        "    var c = C { x: 3 }\n    return f(^give(@c))\n",
+        "argument 1 of `f` has the wrong type: *C != *D",
+    ),
+    "method": (
+        _GIVE_C + "impl C\n    fn take(self: @C, p: *D) -> i32\n        0\n\n"
+        "pub fn main() -> i32\n    var c = C { x: 3 }\n    return c.take(^give(@c))\n",
+        "argument 2 of `take` has the wrong type: *C != *D",
+    ),
+    "static_method": (
+        _GIVE_C + "impl D\n    fn mk(p: *D) -> i32\n        0\n\n"
+        "pub fn main() -> i32\n    var c = C { x: 3 }\n    return D.mk(^give(@c))\n",
+        "argument 1 of `mk` has the wrong type: *C != *D",
+    ),
+}
+
+# The byte pointer both ways, and a cast, still convert at a call: 42.
+CALL_ACCEPTED = {
+    "into_bytes": (
+        _GIVE_C + "fn f(p: *u8) -> i32\n    let q: *C = p\n    q.x\n\n"
+        "pub fn main() -> i32\n    var c = C { x: 42 }\n    return f(give(@c))\n"
+    ),
+    "from_bytes": (
+        _STRUCTS + "fn bytes(c: *C) -> *u8\n    c\n\nfn f(p: *C) -> i32\n    p.x\n\n"
+        "pub fn main() -> i32\n    var c = C { x: 42 }\n    return f(bytes(@c))\n"
+    ),
+    "cast": (
+        _GIVE_C + "fn f(p: *D) -> i32\n    42\n\npub fn main() -> i32\n"
+        "    var c = C { x: 3 }\n    return f(give(@c) as *D)\n"
+    ),
+}
+
+
+@pytest.mark.parametrize("name", _ids(CALL_REFUSED))
+def test_a_call_argument_pointer_is_not_bitcast(tmp_path, name):
+    marked, message = CALL_REFUSED[name]
+    _assert_refused("ritz0", tmp_path, name, marked, message)
+
+
+@pytest.mark.parametrize("name", _ids(CALL_ACCEPTED))
+def test_a_call_argument_byte_pointer_converts(tmp_path, name):
+    assert _run("ritz0", tmp_path, name, CALL_ACCEPTED[name]) == 42
