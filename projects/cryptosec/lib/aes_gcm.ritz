@@ -416,25 +416,13 @@ pub fn aes_gcm_check_lengths(aad_len: i64, text_len: i64) -> Result<i64, CryptoE
     Ok(text_len)
 
 # =============================================================================
-# AES-128-GCM API
+# GCM bodies (one per direction, for every key size)
 # =============================================================================
-
-pub fn aes128_gcm_init(ctx: *AesGcm128, key: *u8) -> void
-    # Initialize AES key schedule
-    aes128_init(@ctx.aes_ctx, key)
-
-    # Compute hash key H = AES_K(0^128)
-    var zero_block: [16]u8
-    var h_bytes: [16]u8
-    memzero(@zero_block[0], 16)
-    aes128_encrypt_block(@ctx.aes_ctx, @zero_block[0], @h_bytes[0])
-    ctx.h = gf128_from_bytes(@h_bytes[0])
+# rk holds nr + 1 round keys (AES-128: nr = 10, AES-256: nr = 14); h is the
+# hash key. The public entry points below only pick (rk, nr) from their ctx.
 
 # Encrypt pt into ct and write the 16-byte tag. Ok = ciphertext length.
-# Err(InvalidLength) if pt_len or aad_len is negative; Err(MessageTooLong) if
-# pt_len > AES_GCM_MAX_PT_LEN or aad_len > AES_GCM_MAX_AAD_LEN. Either way
-# nothing is read or written.
-pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
+fn gcm_encrypt_rounds(rk: *u8, nr: i32, h: *GF128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
     aes_gcm_check_lengths(aad_len, pt_len)?
 
     var j0: [16]u8
@@ -442,7 +430,7 @@ pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
     var ectr: [16]u8
 
     # Compute J0
-    make_j0(nonce, nonce_len, @ctx.h, @j0[0])
+    make_j0(nonce, nonce_len, h, @j0[0])
 
     # Initialize counter to J0
     mem_copy(@counter[0], @j0[0], 16)
@@ -454,7 +442,7 @@ pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
         inc32(@counter[0])
 
         # Encrypt counter block
-        aes128_encrypt_block(@ctx.aes_ctx, @counter[0], @ectr[0])
+        aes_encrypt_rounds(rk, nr, @counter[0], @ectr[0])
 
         # XOR with plaintext
         var j: i64 = 0
@@ -466,10 +454,10 @@ pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
 
     # Compute authentication tag
     var s: [16]u8
-    ghash(@ctx.h, aad, aad_len, ct, pt_len, @s[0])
+    ghash(h, aad, aad_len, ct, pt_len, @s[0])
 
     # Encrypt J0 to get the tag mask
-    aes128_encrypt_block(@ctx.aes_ctx, @j0[0], @ectr[0])
+    aes_encrypt_rounds(rk, nr, @j0[0], @ectr[0])
 
     # Tag = S XOR E_K(J0)
     i = 0
@@ -480,10 +468,8 @@ pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
     Ok(pt_len)
 
 # Verify the tag, then decrypt ct into pt. Ok = plaintext length.
-# Err(InvalidLength) if ct_len or aad_len is negative, Err(MessageTooLong) if
-# either is past its SP 800-38D limit (either way nothing is read or written);
-# Err(AuthenticationFailed) if the tag does not verify (pt is left untouched).
-pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
+# This frame holds the valid tag and its two halves, so it wipes them (#2771).
+fn gcm_decrypt_rounds(rk: *u8, nr: i32, h: *GF128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
     aes_gcm_check_lengths(aad_len, ct_len)?
 
     var j0: [16]u8
@@ -493,10 +479,10 @@ pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
 
     # Compute expected tag first
     var s: [16]u8
-    ghash(@ctx.h, aad, aad_len, ct, ct_len, @s[0])
+    ghash(h, aad, aad_len, ct, ct_len, @s[0])
 
-    make_j0(nonce, nonce_len, @ctx.h, @j0[0])
-    aes128_encrypt_block(@ctx.aes_ctx, @j0[0], @ectr[0])
+    make_j0(nonce, nonce_len, h, @j0[0])
+    aes_encrypt_rounds(rk, nr, @j0[0], @ectr[0])
 
     var i: i64 = 0
     while i < 16
@@ -521,7 +507,7 @@ pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
     i = 0
     while i < ct_len
         inc32(@counter[0])
-        aes128_encrypt_block(@ctx.aes_ctx, @counter[0], @ectr[0])
+        aes_encrypt_rounds(rk, nr, @counter[0], @ectr[0])
 
         var j: i64 = 0
         while j < 16 && (i + j) < ct_len
@@ -531,6 +517,35 @@ pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8,
         i = i + 16
 
     Ok(ct_len)
+
+# =============================================================================
+# AES-128-GCM API
+# =============================================================================
+
+pub fn aes128_gcm_init(ctx: *AesGcm128, key: *u8) -> void
+    # Initialize AES key schedule
+    aes128_init(@ctx.aes_ctx, key)
+
+    # Compute hash key H = AES_K(0^128)
+    var zero_block: [16]u8
+    var h_bytes: [16]u8
+    memzero(@zero_block[0], 16)
+    aes128_encrypt_block(@ctx.aes_ctx, @zero_block[0], @h_bytes[0])
+    ctx.h = gf128_from_bytes(@h_bytes[0])
+
+# Encrypt pt into ct and write the 16-byte tag. Ok = ciphertext length.
+# Err(InvalidLength) if pt_len or aad_len is negative; Err(MessageTooLong) if
+# pt_len > AES_GCM_MAX_PT_LEN or aad_len > AES_GCM_MAX_AAD_LEN. Either way
+# nothing is read or written.
+pub fn aes128_gcm_encrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
+    gcm_encrypt_rounds(@ctx.aes_ctx.round_keys[0], 10, @ctx.h, nonce, nonce_len, aad, aad_len, pt, pt_len, ct, tag)
+
+# Verify the tag, then decrypt ct into pt. Ok = plaintext length.
+# Err(InvalidLength) if ct_len or aad_len is negative, Err(MessageTooLong) if
+# either is past its SP 800-38D limit (either way nothing is read or written);
+# Err(AuthenticationFailed) if the tag does not verify (pt is left untouched).
+pub fn aes128_gcm_decrypt(ctx: *AesGcm128, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
+    gcm_decrypt_rounds(@ctx.aes_ctx.round_keys[0], 10, @ctx.h, nonce, nonce_len, aad, aad_len, ct, ct_len, tag, pt)
 
 # =============================================================================
 # AES-256-GCM API
@@ -547,82 +562,8 @@ pub fn aes256_gcm_init(ctx: *AesGcm256, key: *u8) -> void
 
 # As aes128_gcm_encrypt, with a 256-bit key.
 pub fn aes256_gcm_encrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, pt: *u8, pt_len: i64, ct: *u8, tag: *u8) -> Result<i64, CryptoError>
-    aes_gcm_check_lengths(aad_len, pt_len)?
-
-    var j0: [16]u8
-    var counter: [16]u8
-    var ectr: [16]u8
-
-    make_j0(nonce, nonce_len, @ctx.h, @j0[0])
-    mem_copy(@counter[0], @j0[0], 16)
-
-    var i: i64 = 0
-    while i < pt_len
-        inc32(@counter[0])
-        aes256_encrypt_block(@ctx.aes_ctx, @counter[0], @ectr[0])
-
-        var j: i64 = 0
-        while j < 16 && (i + j) < pt_len
-            ct[i + j] = pt[i + j] ^ ectr[j]
-            j += 1
-
-        i = i + 16
-
-    var s: [16]u8
-    ghash(@ctx.h, aad, aad_len, ct, pt_len, @s[0])
-    aes256_encrypt_block(@ctx.aes_ctx, @j0[0], @ectr[0])
-
-    i = 0
-    while i < 16
-        tag[i] = s[i] ^ ectr[i]
-        i += 1
-
-    Ok(pt_len)
+    gcm_encrypt_rounds(@ctx.aes_ctx.round_keys[0], 14, @ctx.h, nonce, nonce_len, aad, aad_len, pt, pt_len, ct, tag)
 
 # As aes128_gcm_decrypt, with a 256-bit key.
 pub fn aes256_gcm_decrypt(ctx: *AesGcm256, nonce: *u8, nonce_len: i64, aad: *u8, aad_len: i64, ct: *u8, ct_len: i64, tag: *u8, pt: *u8) -> Result<i64, CryptoError>
-    aes_gcm_check_lengths(aad_len, ct_len)?
-
-    var j0: [16]u8
-    var counter: [16]u8
-    var ectr: [16]u8
-    var computed_tag: [16]u8
-
-    var s: [16]u8
-    ghash(@ctx.h, aad, aad_len, ct, ct_len, @s[0])
-
-    make_j0(nonce, nonce_len, @ctx.h, @j0[0])
-    aes256_encrypt_block(@ctx.aes_ctx, @j0[0], @ectr[0])
-
-    var i: i64 = 0
-    while i < 16
-        computed_tag[i] = s[i] ^ ectr[i]
-        i += 1
-
-    # Constant-time tag comparison. computed_tag = s ^ ectr is the valid tag
-    # for the caller's (aad, ct): wipe all three before either return, or a
-    # stack disclosure turns a rejected forgery into an accepted one (#2771).
-    # ectr is rewritten before every later use. secure_zero, not memzero:
-    # its volatile stores keep -O2 from deleting the wipe of dead locals.
-    let tag_ok: i32 = mem_eq(@computed_tag[0], tag, 16)
-    secure_zero(@computed_tag[0], 16)
-    secure_zero(@s[0], 16)
-    secure_zero(@ectr[0], 16)
-    if tag_ok == 0
-        return Err(CryptoError.AuthenticationFailed)
-
-    mem_copy(@counter[0], @j0[0], 16)
-
-    i = 0
-    while i < ct_len
-        inc32(@counter[0])
-        aes256_encrypt_block(@ctx.aes_ctx, @counter[0], @ectr[0])
-
-        var j: i64 = 0
-        while j < 16 && (i + j) < ct_len
-            pt[i + j] = ct[i + j] ^ ectr[j]
-            j += 1
-
-        i = i + 16
-
-    Ok(ct_len)
+    gcm_decrypt_rounds(@ctx.aes_ctx.round_keys[0], 14, @ctx.h, nonce, nonce_len, aad, aad_len, ct, ct_len, tag, pt)
