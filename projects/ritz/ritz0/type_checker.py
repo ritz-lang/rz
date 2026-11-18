@@ -31,6 +31,14 @@ from monomorph import mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
 from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
 from typed import Typed
+import re
+
+_UNSIGNED_INT = re.compile(r"(?<![\w$])u(8|16|32|64|size)(?![\w$])")
+
+
+def _unsigned_as_signed(key: str) -> str:
+    """A _referent_key spelled as LLVM sees it: `u32` and `i32` are one `i32`."""
+    return _UNSIGNED_INT.sub(r"i\1", key)
 
 
 class FloatLitType(rast.NamedType):
@@ -1822,8 +1830,11 @@ class TypeChecker:
         reference would be reinterpreted. Exactly the same type, not the same
         width (Aaron's ruling on AGAST #2368). After the return check, as
         ritz1's ref_into does, so a reference to a local says that first.
-        A `*T` value into a `*U` isn't judged here: that's still open."""
-        if slot is None or actual is None or not self._is_written_ref(expr):
+        A `*T` value into a `*U` is _check_other_pointee's (LARB R71)."""
+        if slot is None or actual is None:
+            return
+        if not self._is_written_ref(expr):
+            self._check_other_pointee(expr, actual, slot)
             return
         actual = self._resolve_alias(actual)
         slot = self._resolve_alias(slot)
@@ -1837,6 +1848,43 @@ class TypeChecker:
         # `@&h` of a `*C` into `@&*D` was REF_TO_OTHER_POINTER, said first.
         if self._other_referent(actual.inner, slot.inner):
             self._report_once(expr, ref_rules.REF_TO_OTHER_TYPE)
+
+    def _check_other_pointee(self, expr: rast.Expr, actual: rast.Type,
+                             slot: rast.Type) -> None:
+        """A pointer or reference value, not a written `@x`, lands in a
+        pointer or reference slot of another pointee (LARB R71): `*[4]i32`
+        into `*[3]i32`, `*C` into `*D`, `@T` into `@U`. The byte pointer is
+        the way between: a `*T` or `@T` fits a `*u8`, and a `*u8` fits any
+        `*T`. `null` is no pointer type here, so it fits. What the checker
+        can't name (opaque, generic) stays unjudged."""
+        actual = self._resolve_alias(actual)
+        slot = self._resolve_alias(slot)
+        if not isinstance(slot, (rast.PtrType, rast.RefType)) \
+                or not isinstance(actual, (rast.PtrType, rast.RefType)):
+            return
+        if isinstance(slot, rast.PtrType) and (
+                self._is_byte(slot.inner)
+                or (isinstance(actual, rast.PtrType) and self._is_byte(actual.inner))):
+            return
+        # A struct for another struct at a call is #1948's "argument N of `f`
+        # has the wrong type", as for `@x` (_check_other_referent).
+        if self._arg_depth and self._is_struct(actual.inner) and self._is_struct(slot.inner):
+            return
+        if not self._other_referent(actual.inner, slot.inner):
+            return
+        # Into an `@U` or `@&U` param, a pointee of another LLVM type (`@i32`
+        # into `@[2]i32`) is #1948's words too: the emitter compares the
+        # pointer types, and ritz1 refuses it the same way. Left to R71 is
+        # what passes that: a pointee differing only in an integer's sign.
+        if self._arg_depth and isinstance(slot, rast.RefType) and _unsigned_as_signed(
+                self._referent_key(actual.inner)) != _unsigned_as_signed(
+                self._referent_key(slot.inner)):
+            return
+        self._report_once(expr, ref_rules.REF_TO_OTHER_TYPE)
+
+    def _is_byte(self, ty: rast.Type) -> bool:
+        ty = self._resolve_alias(ty)
+        return isinstance(ty, rast.NamedType) and ty.name == 'u8' and not ty.args
 
     def _check_lent_referent(self, arg: rast.Expr, actual: Optional[rast.Type],
                              referent: rast.Type) -> None:

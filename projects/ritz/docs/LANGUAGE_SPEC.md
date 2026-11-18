@@ -750,8 +750,14 @@ A reference refers to exactly one type. `@x` or `@&x` fits an `@U`, `@&U` or
 `*U` slot only when `x` is a `U`: the same type, not one of the same width, so
 `@&n` of a `u32` doesn't fit `@&i32`, and `@&a` of a `[2]u32` doesn't fit
 `a:& [2]i32`. A place passed to a `name:& U` parameter is held to the same rule.
-To reinterpret, cast: `@&n as *i32`. A `*T` value that isn't written as `@x`
-going into a `*U` isn't judged by this rule.
+To reinterpret, cast: `@&n as *i32`.
+
+A pointer or reference *value* is held to the same rule wherever it lands: a
+`let` or `var`, an assignment, an argument or a `return` (LARB R71). A `*T`,
+`@T` or `@&T` fits a `*U`, `@U` or `@&U` slot only when `T` is `U`, so a
+`*[4]i32` doesn't fit `*[3]i32`, a `*[3]i64` doesn't fit `*[3]i32`, and a `*C`
+doesn't fit `*D`. The byte pointer is the way between: any `*T` or `@T` fits a
+`*u8`, a `*u8` fits any `*T`, and `null` fits any pointer.
 
 ```ritz expect-error="a reference to one type doesn't fit a reference to another: cast it with `as`"
 fn widen(n:& i32) -> i32
@@ -774,6 +780,28 @@ fn main() -> i32
     var n: u32 = 1
     bits(@&n)
     n as i32
+```
+
+```ritz expect-error="a reference to one type doesn't fit a reference to another: cast it with `as`"
+fn first(p: *[3]i32) -> i32
+    p[0]
+
+fn main() -> i32
+    var g: [4]i32
+    let q: *[4]i32 = @g
+    first(q)
+```
+
+```ritz
+fn first(p: *[3]i32) -> i32
+    p[0]
+
+fn main() -> i32
+    var g: [4]i32
+    g[0] = 7
+    let q: *[4]i32 = @g
+    let bytes: *u8 = q
+    first(bytes) + first(q as *[3]i32) - 14
 ```
 
 `@T` and `@&T` are types: a parameter of one holds a reference, and reads as one.
