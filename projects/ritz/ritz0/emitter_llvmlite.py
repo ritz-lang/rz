@@ -10633,7 +10633,7 @@ class LLVMEmitter:
         An element of a `[N]*T` is a `*T`, but ritz1 names it for what it is,
         and so does this (AGAST #3088).
         """
-        what = self._unsliceable(base_type)
+        what = self._unsliceable(base_type, self.struct_types)
         if (isinstance(expr.expr, rast.Index) and not isinstance(expr.expr.index, rast.Range)
                 and self._is_pointer_array(self._infer_ritz_type(expr.expr.expr))):
             what = "an element of an array of pointers"
@@ -10645,8 +10645,12 @@ class LLVMEmitter:
                 and isinstance(ty.inner, (rast.PtrType, rast.RefType)))
 
     @staticmethod
-    def _unsliceable(base_type: Optional[rast.Type]) -> str:
-        """What a refused slice's base is, as the refusal names it."""
+    def _unsliceable(base_type: Optional[rast.Type], structs) -> str:
+        """What a refused slice's base is, as the refusal names it.
+
+        A named type is "a struct" only if it is one (`structs`, by name); an
+        `i32` field and the like are "this", as ritz1 words them (AGAST #3146).
+        """
         pointers = (rast.PtrType, rast.RefType)
         if isinstance(base_type, rast.ArrayType):
             return "an array"
@@ -10656,7 +10660,7 @@ class LLVMEmitter:
             if isinstance(base_type.inner, pointers):
                 return "a pointer to a pointer"
             return "a pointer"
-        if isinstance(base_type, rast.NamedType):
+        if isinstance(base_type, rast.NamedType) and base_type.name in structs:
             return "a struct"
         return "this"
 

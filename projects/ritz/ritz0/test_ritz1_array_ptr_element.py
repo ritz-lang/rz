@@ -488,16 +488,15 @@ _refused_at("an_element_is_not_sliced", _x("    let r = a[1][0..2]\n    return 0
 # AGAST #3088: `@x[lo..hi]` on any other place refuses as `x[lo..hi]` does, at
 # the place, where ritz0 raised NotImplementedError.  ritz1 said "unknown
 # expression kind" or "cannot take address", unlocated (AGAST #3145).  An i32
-# field shares only the tail: ritz0 calls it "a struct" (AGAST #3146).
+# field is "this", as ritz1 words it; ritz0 called it "a struct" (AGAST #3146).
 _ADDR_H = "struct H\n    a: [2]*i16\n    p: *i16\n    k: i32\n\n"
-_UNSLICEABLE = "can't be sliced (only String, Vec and Span can)"
 ADDR_OF_SLICE = {
     "array_local": ("", "    let r = @x[0..2]\n", "an array can't be sliced"),
     "pointer_local": ("", "    var p: *i16 = @x[0]\n    let r = @p[0..2]\n", "a pointer can't be sliced"),
     "array_field": (_ADDR_H, "    var h: H\n    let r = @h.a[0..2]\n", "an array can't be sliced"),
     "pointer_field": (_ADDR_H, "    var h: H\n    h.p = @x[0]\n    let r = @h.p[0..2]\n",
                       "a pointer can't be sliced"),
-    "int_field": (_ADDR_H, "    var h: H\n    h.k = 1\n    let r = @h.k[0..2]\n", _UNSLICEABLE),
+    "int_field": (_ADDR_H, "    var h: H\n    h.k = 1\n    let r = @h.k[0..2]\n", "this can't be sliced"),
     # A String slices, but its slice is a new value, with no place to point at.
     "string": ("import ritzlib.string\n\n",
                '    var s: String = string_from("abcd")\n    let r = @s[0..2]\n',

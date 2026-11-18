@@ -41,6 +41,12 @@ FIELD = (f"{HEADER}struct H\n    a: [4]i32\n\npub fn main() -> i32\n"
          "    var h = H { a: [10, 20, 30, 40] }\n    let t = h.a[1..3]\n    return t[0]\n")
 CALL = (f"{HEADER}fn g() -> *i32\n    return null\n\npub fn main() -> i32\n"
         "    let t = g()[1..3]\n    return t[0]\n")
+# AGAST #3146: an i32 field is "this", as ritz1 says; ritz0 called it "a struct".
+INT_FIELD = (f"{HEADER}struct H\n    k: i32\n\npub fn main() -> i32\n"
+             "    var h = H { k: 1 }\n    let t = h.k[0..2]\n    return t[0]\n")
+# A struct that isn't one of the three is still "a struct".
+STRUCT_LOCAL = (f"{HEADER}struct H\n    k: i32\n\npub fn main() -> i32\n"
+                "    var h = H { k: 1 }\n    let t = h[0..2]\n    return 0\n")
 # AGAST #2536: the raw-pointer range typed as an element pointer (#1975) is gone,
 # so a dereferenced or compared one is the same single refusal as a bare one.
 RAW_DEREF = RAW_POINTER.replace("let t = p[1..3]\n    return t[0]", "let t = *(p[1..3])\n    return t")
@@ -71,6 +77,8 @@ CASES = {
     "array": (ARRAY_LOCAL, "an array can't be sliced"),
     "array_inclusive": (INCLUSIVE, "an array can't be sliced"),
     "field": (FIELD, "an array can't be sliced"),
+    "int_field": (INT_FIELD, "this can't be sliced"),
+    "struct_local": (STRUCT_LOCAL, "a struct can't be sliced"),
     "call": (CALL, "a pointer can't be sliced"),
     "raw_pointer": (RAW_POINTER, "a pointer can't be sliced"),
     "raw_pointer_deref": (RAW_DEREF, "a pointer can't be sliced"),
