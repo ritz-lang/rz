@@ -10,8 +10,8 @@ Per file:
   - prism src/main.ritz: already `compositor.mod` (#2195); the prism bin.
   - iris lib/layout/block.ritz: `lib.style.mod`, `lib.tree.mod`; the unused
     `prism.api { Size, Rect }` is gone, and with it `Display` and `Position`,
-    which iris no longer defines (style.display is an i32 DISPLAY_*).  Its
-    body still predates the current language: a follow-up ports it.
+    which iris no longer defines (style.display is an i32 DISPLAY_*).  #4047
+    ported its body; iris test/test_layout_block.ritz builds and runs it.
 
 Resolution only: one parse of each file's import closure, no codegen.
 """

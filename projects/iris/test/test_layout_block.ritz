@@ -1,0 +1,273 @@
+# test/test_layout_block.ritz - Block formatting context layout tests
+#
+# Built through lib.layout.mod, so the module's re-exports compile too.
+
+import ritzlib.sys
+import lib.style.types
+import lib.tree.render_node
+import lib.layout.mod
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+fn px_style(height: f64, margin: f64) -> ComputedStyle
+    var s = computed_style_default()
+    s.height = dimension_px(height)
+    s.margin = edge_sizes_all(margin)
+    s
+
+# Root node `id` with `style`, set as the tree's root
+fn add_root(tree: @&RenderTree, id: u64, style: ComputedStyle)
+    render_tree_insert(tree, render_node_new(node_id_new(id), TAG_DIV, style))
+    render_tree_set_root(tree, node_id_new(id))
+
+# Append node `id` as the last child of `parent`
+fn add_child(tree: @&RenderTree, parent: u64, id: u64, style: ComputedStyle)
+    var node = render_node_new(node_id_new(id), TAG_DIV, style)
+    node.parent = node_id_new(parent)
+    let pid = node_id_new(parent)
+    let p = render_tree_get_mut(tree, @pid)
+    let prev = p.last_child
+    if node_id_is_valid(@prev) == 0
+        p.first_child = node_id_new(id)
+    p.last_child = node_id_new(id)
+    p.child_count = p.child_count + 1
+    if node_id_is_valid(@prev) != 0
+        let last = render_tree_get_mut(tree, @prev)
+        last.next_sibling = node_id_new(id)
+        node.prev_sibling = prev
+    render_tree_insert(tree, node)
+
+fn layout_of(tree: @&RenderTree, id: u64) -> LayoutResult
+    let nid = node_id_new(id)
+    let n = render_tree_get_mut(tree, @nid)
+    n.layout
+
+fn viewport() -> LayoutConstraints
+    layout_constraints_new(800.0, 600.0, 16.0)
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+[[test]]
+fn test_missing_node_is_empty() -> i32
+    var tree = render_tree_new()
+    let c = viewport()
+    let id = node_id_new(7)
+    let r = layout_block(@&tree, @id, @c)
+    if r.width != 0
+        return 1
+    if r.height != 0
+        return 2
+    0
+
+[[test]]
+fn test_auto_width_fills_container() -> i32
+    var tree = render_tree_new()
+    add_root(@&tree, 1, computed_style_default())
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    if r.width != 800
+        return 1
+    if r.height != 0
+        return 2
+    # The result is stored on the node too
+    if layout_of(@&tree, 1).width != 800
+        return 3
+    0
+
+[[test]]
+fn test_auto_width_subtracts_padding_border_margin() -> i32
+    var tree = render_tree_new()
+    var s = computed_style_default()
+    s.padding = edge_sizes_all(5.0)
+    s.margin = edge_sizes_all(10.0)
+    s.border.left.width = 2.0
+    s.border.right.width = 3.0
+    add_root(@&tree, 1, s)
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    # 800 - 2*5 padding - 2*10 margin - 2 - 3 border
+    if r.width != 765
+        return 1
+    if r.padding_left != 5
+        return 2
+    if r.margin_top != 10
+        return 3
+    if r.border_right != 3
+        return 4
+    0
+
+[[test]]
+fn test_explicit_width_kept() -> i32
+    var tree = render_tree_new()
+    var s = computed_style_default()
+    s.width = dimension_percent(25.0)
+    add_root(@&tree, 1, s)
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    if r.width != 200
+        return 1
+    0
+
+[[test]]
+fn test_children_stack_with_collapsed_margins() -> i32
+    var tree = render_tree_new()
+    add_root(@&tree, 1, computed_style_default())
+    add_child(@&tree, 1, 2, px_style(50.0, 10.0))   # margins 10 all round
+    var b = px_style(30.0, 0.0)
+    b.margin.top = dimension_px(20.0)
+    add_child(@&tree, 1, 3, b)
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+
+    let a_layout = layout_of(@&tree, 2)
+    if a_layout.x != 10
+        return 1
+    if a_layout.y != 10
+        return 2
+    if a_layout.width != 780
+        return 3
+    if a_layout.height != 50
+        return 4
+    let b_layout = layout_of(@&tree, 3)
+    # A's bottom margin 10 and B's top margin 20 collapse to 20
+    if b_layout.y != 80
+        return 5
+    if b_layout.x != 0
+        return 6
+    if b_layout.width != 800
+        return 7
+    # 10 + 50 + 20 + 30
+    if r.height != 110
+        return 8
+    0
+
+[[test]]
+fn test_last_child_bottom_margin_counts() -> i32
+    var tree = render_tree_new()
+    add_root(@&tree, 1, computed_style_default())
+    add_child(@&tree, 1, 2, px_style(50.0, 10.0))
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    # 10 + 50 + 10
+    if r.height != 70
+        return 1
+    0
+
+[[test]]
+fn test_child_inside_padding_and_border() -> i32
+    var tree = render_tree_new()
+    var s = computed_style_default()
+    s.padding = edge_sizes_all(4.0)
+    s.border.top.width = 1.0
+    add_root(@&tree, 1, s)
+    var cs = px_style(20.0, 0.0)
+    cs.padding = edge_sizes_all(3.0)
+    add_child(@&tree, 1, 2, cs)
+    add_child(@&tree, 1, 3, px_style(10.0, 0.0))
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    # Positions are content-box relative to the parent's content box
+    let first = layout_of(@&tree, 2)
+    if first.x != 3
+        return 1
+    if first.y != 3
+        return 2
+    if first.width != 786
+        return 3
+    let second = layout_of(@&tree, 3)
+    # first's border box: 3 + 20 + 3
+    if second.y != 26
+        return 4
+    if r.height != 36
+        return 5
+    0
+
+[[test]]
+fn test_explicit_height_overrides_content() -> i32
+    var tree = render_tree_new()
+    add_root(@&tree, 1, px_style(40.0, 0.0))
+    add_child(@&tree, 1, 2, px_style(100.0, 0.0))
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    if r.height != 40
+        return 1
+    0
+
+[[test]]
+fn test_display_none_child_skipped() -> i32
+    var tree = render_tree_new()
+    add_root(@&tree, 1, computed_style_default())
+    add_child(@&tree, 1, 2, px_style(50.0, 0.0))
+    var hidden = px_style(500.0, 30.0)
+    hidden.display = DISPLAY_NONE
+    add_child(@&tree, 1, 3, hidden)
+    add_child(@&tree, 1, 4, px_style(10.0, 0.0))
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    if layout_of(@&tree, 4).y != 50
+        return 1
+    if r.height != 60
+        return 2
+    0
+
+[[test]]
+fn test_nested_blocks_auto_height() -> i32
+    var tree = render_tree_new()
+    add_root(@&tree, 1, computed_style_default())
+    add_child(@&tree, 1, 2, computed_style_default())
+    add_child(@&tree, 2, 3, px_style(25.0, 0.0))
+    add_child(@&tree, 2, 4, px_style(15.0, 0.0))
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    if layout_of(@&tree, 2).height != 40
+        return 1
+    if layout_of(@&tree, 4).y != 25
+        return 2
+    if r.height != 40
+        return 3
+    0
+
+[[test]]
+fn test_margin_collapse_rules() -> i32
+    if margin_collapse(10.0, 20.0) != 20.0
+        return 1
+    if margin_collapse(20.0, 10.0) != 20.0
+        return 2
+    if margin_collapse(0.0 - 10.0, 0.0 - 20.0) != 0.0 - 20.0
+        return 3
+    if margin_collapse(30.0, 0.0 - 10.0) != 20.0
+        return 4
+    if margin_collapse(0.0 - 30.0, 10.0) != 0.0 - 20.0
+        return 5
+    0
+
+[[test]]
+fn test_inline_child_is_empty_for_now() -> i32
+    # No inline formatting context yet: inline-level boxes take no space
+    var tree = render_tree_new()
+    add_root(@&tree, 1, computed_style_default())
+    var span = px_style(500.0, 0.0)
+    span.display = DISPLAY_INLINE
+    add_child(@&tree, 1, 2, span)
+    add_child(@&tree, 1, 3, px_style(10.0, 0.0))
+    let c = viewport()
+    let id = node_id_new(1)
+    let r = layout_block(@&tree, @id, @c)
+    if layout_of(@&tree, 3).y != 0
+        return 1
+    if r.height != 10
+        return 2
+    0
