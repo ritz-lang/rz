@@ -533,8 +533,8 @@ class Await(Expr):
 class HeapExpr(Expr):
     """Heap allocation expression: heap expr.
 
-    Desugars to: heap_new<T>(expr)
-    where T is inferred from the expression type.
+    A raw allocation of type *T (T inferred from expr), freed with free();
+    not a Box<T> (STDLIB_REFERENCE, box).
     """
     expr: Expr
 

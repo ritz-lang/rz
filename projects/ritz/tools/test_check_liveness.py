@@ -265,7 +265,7 @@ def test_ritzlib_orphans_importing_each_other_are_still_orphans(tmp_path):
     f"{LIB}/tests/test_heap.ritz",
     "projects/ritz/ritz0/test/heap_fixture.ritz",
     "projects/valet/test/test_x.ritz",
-    "projects/ritz/examples/tier5_async/82_heap/test/test_main.ritz",
+    "projects/ritz/examples/tier5_async/82_box/test/test_main.ritz",
     "projects/goliath/tests/integration.ritz",
 ])
 def test_ritzlib_test_importer_does_not_keep_a_module_alive(tmp_path, importer):

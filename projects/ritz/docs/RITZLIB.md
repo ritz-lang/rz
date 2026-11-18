@@ -22,7 +22,7 @@ Currently (as of January 2026), ritzlib is a flat collection of 35 modules:
 - `types.ritz` - Fundamental types
 - `span.ritz` - Generic slice type `Span<T>` (similar to `&[T]`)
 - `string.ritz`, `slice.ritz` - String handling
-- `heap.ritz`, `box.ritz` - Memory allocation and Box<T>
+- `memory.ritz`, `box.ritz` - Memory allocation and Box<T>
 - `gvec.ritz` - Growable vector (Vec<T>)
 
 **System interface:**

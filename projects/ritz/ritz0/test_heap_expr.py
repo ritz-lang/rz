@@ -5,14 +5,14 @@ THE DEFECT
 
 `heap` is a keyword in ritz0 (tokens.py; parser.parse_prefix makes a
 HeapExpr): `heap e` mallocs one `T`, stores `e` there and is the `*T`.
-STDLIB_REFERENCE.md (ritzlib.heap) shows `var p = heap 42`.  ritz1's grammar
+STDLIB_REFERENCE.md (then ritzlib.heap, now ritzlib.box) shows `var p = heap 42`.  ritz1's grammar
 had no `heap`, so it lexed as an identifier and stopped at the operand:
 `4:18: error: unexpected '42'` (check-doc-examples under ritz1, #3928).
 
 THE FIX
 
 `heap` is a keyword in ritz1 too (a module path segment still, so
-`import ritzlib.heap` / `import mm.heap` resolve as in ritz0), and
+`import mm.heap` resolves as in ritz0), and
 `heap <unary>` binds like the other prefixes.  It is lowered as a call to
 a compiler-made generic, `fn __heap<T>(v: T) -> *T` (malloc(sizeof(T)),
 store, return), so T comes from generic inference as `f(e)`'s would.
@@ -42,18 +42,19 @@ fn point_new(x: i64, y: i64) -> Point
 """
 
 PROGRAMS = {
-    # The ticket's repro: STDLIB_REFERENCE.md's ritzlib.heap block, which
-    # imports only ritzlib.heap (malloc arrives through its plain import).
+    # The ticket's repro: STDLIB_REFERENCE.md's `heap`-keyword block (in the
+    # ritzlib.box section since #3916 folded ritzlib.heap into box), which
+    # imports only ritzlib.box (malloc arrives through its plain import).
     "stdlib_reference": ("""\
-import ritzlib.heap
+import ritzlib.box
 
-fn heap_demo() -> i64
+fn heap_vs_box() -> i64
     var p = heap 42
-    var q = heap_new<i64>(42)
-    *p + heap_get<i64>(@q)
+    var q = box_new<i64>(42)
+    *p + box_get<i64>(@q)
 
 pub fn main() -> i32
-    heap_demo() as i32
+    heap_vs_box() as i32
 """, 84),
     "int_literal": ("""\
 import ritzlib.memory

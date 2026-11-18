@@ -2547,7 +2547,7 @@ class Parser:
         span = self._current().span
         self._expect(TokenType.IMPORT)
 
-        # Allow keywords in import paths (e.g., ritzlib.heap)
+        # Allow keywords in import paths (e.g., a segment named `heap`)
         first_tok = self._expect_ident_or_keyword("Expected module name")
         path = [first_tok.value]
         while self._at(TokenType.DOT):

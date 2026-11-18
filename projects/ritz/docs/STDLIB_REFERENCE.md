@@ -43,7 +43,6 @@ Ritzlib is built on three core principles:
    - [ptr](#ptr) - Taking a value out of raw memory
    - [memory](#memory) - Allocators (Arena, Heap, malloc/free)
    - [box](#box) - Heap-allocated single values
-   - [heap](#heap) - Heap keyword support
 3. [Collections](#collections)
    - [gvec](#gvec) - Generic dynamic array (`Vec<T>`)
    - [string](#string) - Owned UTF-8 strings
@@ -172,8 +171,8 @@ trait Drop
 ```
 
 Note: `ritzlib/drop.ritz` holds this declaration as a comment, not live code.
-The `impl Drop for T` blocks in `box.ritz`, `heap.ritz`, `hashmap.ritz` and
-`buf.ritz` are live. `String` and `Vec<T>` don't implement `Drop` yet
+The `impl Drop for T` blocks in `box.ritz`, `hashmap.ritz` and `buf.ritz` are
+live. `String` and `Vec<T>` don't implement `Drop` yet
 (AGAST #2159).
 
 The rules are in LANGUAGE_SPEC §13. In short, a type that implements `Drop`,
@@ -344,40 +343,25 @@ struct Box<T>
 **Methods** (via impl):
 - `get`, `as_ptr`, `set`, `valid`
 
----
-
-### heap
-
-**Module**: `ritzlib.heap`
-
-A second single-value owner with the same API as `box`. Despite the name it is
-unrelated to the `heap` keyword: see below. New code should use `box`.
+**The `heap` keyword is not a `Box`.** `heap 42` is a raw allocation
+expression of type `*i64`: dereference it with `*p` and free it with
+`free(p as *u8)`. `box_new<i64>(42)` returns a `Box<i64>`, which is what
+`box_get` / `box_set` / `box_drop` and the `Drop` impl operate on. Passing a
+`heap`-keyword pointer to `box_get` is a type error.
 
 ```ritz
-struct Heap<T>
-    ptr: *T
-```
+import ritzlib.box
 
-**Usage**:
-```ritz
-import ritzlib.heap
-
-fn heap_demo() -> i64
+fn heap_vs_box() -> i64
     var p = heap 42            # `heap` keyword: a bare *i64, deref with `*p`
-    var q = heap_new<i64>(42)  # constructor: a Heap<i64> wrapper
-    *p + heap_get<i64>(@q)
+    var q = box_new<i64>(42)   # constructor: a Box<i64> wrapper
+    *p + box_get<i64>(@q)
 ```
 
-**The two forms are not interchangeable.** The `heap` keyword is a raw
-allocation expression: `heap 42` has type `*i64`, so it is dereferenced with
-`*p` and freed with `free(p as *u8)`. `heap_new<i64>(42)` returns a `Heap<i64>`
-struct, which is what `heap_get` / `heap_set` / `heap_drop` and the `Drop` impl
-operate on. Passing a `heap`-keyword pointer to `heap_get` is a type error.
+ritzlib once also had `ritzlib.heap`, a `Heap<T>` identical to `Box<T>` with a
+`heap_` prefix; it was folded into `box` (AGAST #3916).
 
-**Functions**: Same as `box` module with `heap_` prefix — `heap_new<T>(value: T)
--> Heap<T>`, `heap_get<T>(h: @Heap<T>) -> T`, `heap_as_ptr<T>(h: @Heap<T>) ->
-*T`, `heap_set<T>(h: @&Heap<T>, value: T)`, `heap_drop<T>(h: @&Heap<T>)`,
-`heap_valid<T>(h: @Heap<T>) -> i32`.
+---
 
 ---
 
