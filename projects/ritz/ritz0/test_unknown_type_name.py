@@ -59,6 +59,15 @@ REFUSED = {
     # A generic's parameter is in scope in its own item only, there too.
     "generic_arg_out_of_scope": "struct B<T>\n    v: T\n\nfn f(x: *Option<^T>) -> i32\n    0\n",
     "cast_out_of_scope": "fn g<T>(x: *T) -> i32\n    0\n\nfn f(p: *u8) -> i32\n    let q: *u8 = p as *^T as *u8\n    0\n",
+    # A struct literal's name (AGAST #3993).  ritz1 compiled an unannotated
+    # `let` of one to an uninitialised alloca, and refused one in an argument
+    # with no location ("struct not found for literal").  A struct variant's
+    # name is no type: `Log { level: 4 }` is refused like any other, as ritz0
+    # does, until named variant construction exists.
+    "struct_lit": "fn f() -> i32\n    let a = ^Nope { code: 2 }\n    0\n",
+    "struct_lit_empty": "fn f() -> i32\n    let a = ^Nope {}\n    0\n",
+    "struct_lit_variant": "enum Msg\n    Log\n        level: i32\n    Stop\n\n"
+    "fn g(m: Msg) -> i32\n    0\n\nfn f() -> i32\n    g(^Log { level: 4 })\n",
 }
 
 ROWS = [(c, site) for c in COMPILERS for site in sorted(REFUSED)]

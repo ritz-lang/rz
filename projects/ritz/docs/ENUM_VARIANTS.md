@@ -282,7 +282,7 @@ gated on closing part of that gap.
 | Bare variants | yes | yes |
 | Single-field tuple variants | yes | yes; user enums construct (`Holds(x)`, unqualified) and bind them since #1797 |
 | Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | yes (#1295): every field constructed and bound at its ritz0 offset |
-| Struct variants | this task | parsed and laid out (#1797); constructed and matched positionally (#1295); named forms not yet |
+| Struct variants | this task | parsed and laid out (#1797); constructed and matched positionally (#1295); named forms not yet: every compiler refuses `V { a: 1 }` as "unknown type `V`" and `V { a } =>` as a parse error (#3993) |
 | Payload types retained by parser | yes | yes, in the enum tracker (#1797) |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
 | Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). Non-generic user enums: the same ritz0 layout from the recorded variant fields (#1797); all-unit stays `{ i8 }` |
