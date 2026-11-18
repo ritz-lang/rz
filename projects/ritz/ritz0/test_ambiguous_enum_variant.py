@@ -362,6 +362,9 @@ def _assert_located_error(compiler, comp, ll, src, line, col, msg):
     assert comp.returncode != 0, f"{compiler} accepted it:\n{out[-2000:]}"
     assert not ll.exists(), f"{compiler} wrote output despite the error"
     # ritz0 prints the full path, ritz1 the name as given; both end in this.
+    # ritz1 says `error: ` after the location (diag, AGAST #3445).
+    if compiler != "ritz0" and not msg.startswith("error: "):
+        msg = "error: " + msg
     assert f"{src.name}:{line}:{col}: {msg}" in out, out[-2000:]
 
 

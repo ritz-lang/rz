@@ -147,6 +147,7 @@ def test_a_variant_constructor_takes_every_field(request, tmp_path, compiler, na
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted {ctor}:\n{out[-1500:]}"
-    want = f"unit.ritz:6:{col}: variant `Rect` takes 2 payload value(s), got {got}"
+    sep = "" if compiler == "ritz0" else "error: "   # diag (AGAST #3621)
+    want = f"unit.ritz:6:{col}: {sep}variant `Rect` takes 2 payload value(s), got {got}"
     assert want in out, f"{compiler}, {name}: want {want!r}:\n{out[-1500:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {ctor}"

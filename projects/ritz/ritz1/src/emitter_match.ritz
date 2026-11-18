@@ -47,6 +47,7 @@ import types
 import ast_helpers
 import tokens_gen
 import emitter_core
+import diag                 # diag_error_at (AGAST #3621)
 import emitter_expr
 import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum_ctx
 import emitter_expr_access   # is_ident_none
@@ -615,20 +616,21 @@ pub fn take_match_float_hint(s: *EmitterState) -> i32
 # the arm's own block before its `br`.  Called while
 # the arm's pattern binding is in scope.  Returns the register to record.
 pub fn match_arm_float_settle(s: *EmitterState, arm_body: *Expr, body_reg: i32, result: *MatchResult) -> i32
-    float_arm_settle(s, match_arm_float_ty(s, arm_body), arm_body, body_reg, result)
+    float_arm_settle(s, match_arm_float_ty(s, arm_body), arm_body, arm_body.span, body_reg, result)
 
 # AGAST #3421: match_arm_float_settle for an arm whose value is of float type
 # `aft` (0 if none).  A statement `if`'s arms come here too, and one whose
 # value is a nested statement `if` / `match` has no expression (`arm_body`
 # null): its phi's type is `aft`, and if that is an integer in a float merge,
 # it is the R43 mix (the nested one had the slot too, so it would be float).
-pub fn float_arm_settle(s: *EmitterState, aft: i32, arm_body: *Expr, body_reg: i32, result: *MatchResult) -> i32
+# `at` is the arm's value, where an R43 mix is reported (AGAST #3621).
+pub fn float_arm_settle(s: *EmitterState, aft: i32, arm_body: *Expr, at: SrcSpan, body_reg: i32, result: *MatchResult) -> i32
     if result.float_ty == 0
         if aft == 0
             result.int_arms = result.int_arms + 1
             return body_reg
         if result.int_arms > 0
-            emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+            emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
         result.float_ty = aft
         return body_reg
     if aft == result.float_ty
@@ -636,7 +638,7 @@ pub fn float_arm_settle(s: *EmitterState, aft: i32, arm_body: *Expr, body_reg: i
     if aft != 0
         return emit_float_coerce(s, body_reg, aft, result.float_ty)
     if arm_body == null
-        emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
         return body_reg
     let is_int: bool = is_int_const_type(get_expr_type(s, arm_body)) == 1
     # LARB R43 (#3385): with no float slot (hint_ty 0) the float type came
@@ -644,7 +646,7 @@ pub fn float_arm_settle(s: *EmitterState, aft: i32, arm_body: *Expr, body_reg: i
     # BEFORE the first float arm is above: the rule doesn't depend on order.
     # The slot is known before any arm is emitted, so no pre-pass is needed.
     if is_int and result.hint_ty == 0
-        emit_ir_error(s, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
+        emit_ir_error(s, at, c"match arms yield both an integer and a float value; write the integer arm as a float (`0.0`) or annotate the binding")
         return body_reg
     # AGAST #3313, LARB R43a: an integer arm lands in the float slot as
     # `let a: f64 = x` does (§7.5): a literal or an exact type (i32 into
@@ -654,7 +656,7 @@ pub fn float_arm_settle(s: *EmitterState, aft: i32, arm_body: *Expr, body_reg: i
     # AGAST #3626: a pointer arm is refused where it is, in ritz0's words.
     if pointer_into_float(s, arm_body) == 1
         return body_reg
-    emit_ir_error(s, c"match arm yields a non-numeric value where the other arms yield a float")
+    emit_ir_error(s, arm_body.span, c"match arm yields a non-numeric value where the other arms yield a float")
     body_reg
 
 # AGAST #3696: an arm of a large struct %T writes its value into the
@@ -1082,7 +1084,7 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
 # would leave the array unwritten, and is refused.
 fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
     if arm.is_pass == 1
-        emit_ir_error(s, c"a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
+        emit_ir_error(s, arm.pass_span, c"a `match` arm stored into a whole array has no value (`pass`); give it an `[N]T`")
         return
     if arm.body == null
         return
@@ -1290,17 +1292,8 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
     for vi in 0..n
         if enum_variant_kind(ei, vi) != ENUM_VARIANT_UNIT
             var vf: *StructField = enum_variant_fields(ei, vi)
-            eprints_cstr(c"error: ")
-            let file: *u8 = emitter_source_file()
-            if file != null
-                eprints_cstr(file)
-            else
-                eprints_cstr(c"<input>")
-            eprints_cstr(c":")
-            eprint_int(cast.span.line as i64)
-            eprints_cstr(c":")
-            eprint_int(cast.span.col as i64)
-            eprints_cstr(c": cannot convert enum '")
+            diag_error_at(emitter_source_file(), cast.span)
+            eprints_cstr(c"cannot convert enum '")
             eprint_bytes(en, en_len)
             eprints_cstr(c"' to an integer: variant '")
             eprint_bytes(vf.name, vf.name_len)
@@ -2548,7 +2541,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     else if is_enum == 1 and from_place == 1
         scrut_slot = emit_lvalue_ptr(s, typed)
         if scrut_slot < 0
-            emit_ir_error(s, c"cannot take address of match scrutinee")
+            emit_ir_error(s, scrutinee.span, c"cannot take address of match scrutinee")
             return 0
         scrut_reg = emit_match_place_load(s, scrut_slot, enum_name, enum_name_len)
     else if is_ctor == 1

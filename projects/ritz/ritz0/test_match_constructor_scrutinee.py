@@ -445,7 +445,7 @@ def test_ritz1_refuses_a_payload_it_cannot_name(request, tmp_path, compiler, nam
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-800:]}"
     line = UNNAMED[name].split("\n").index(next(
         text for text in UNNAMED[name].split("\n") if text.startswith("    match "))) + 1
-    hits = re.findall(rf"unit\.ritz:{line}:\d+: {re.escape(_LOCATED)}$", out, re.M)
+    hits = re.findall(rf"unit\.ritz:{line}:\d+: error: {re.escape(_LOCATED)}$", out, re.M)
     assert len(hits) == 1, f"{compiler}, {name}: want one located refusal:\n{out[-800:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {name}"
 

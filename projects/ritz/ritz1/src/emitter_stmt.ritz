@@ -2801,7 +2801,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                     emit_str(s, c"\n")
                 return
             # Fall through to emit error if member access failed
-            emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"ritz1 cannot emit: unhandled EXPR_MEMBER in assignment")   # AGAST #3972: located
+            emit_ir_error(s, target_expr.span, c"unhandled EXPR_MEMBER in assignment")
             return
 
         # Check for array field element assignment: s.field[idx] = value
@@ -2827,7 +2827,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 # generic deref store below: that path evaluates `x.f[i]`
                 # as a VALUE and stores through it as an address (segfault
                 # or a wild write).  Refuse rather than miscompile.
-                emit_nd_error(s, target_expr.span.line, target_expr.span.col, c"ritz1 cannot emit: unhandled indexed EXPR_MEMBER in assignment")   # AGAST #3972: located
+                emit_ir_error(s, target_expr.span, c"unhandled indexed EXPR_MEMBER in assignment")
                 return
 
         # Deref assignment: *(expr) = value.  As of AGAST #1304
@@ -2875,7 +2875,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_array_local_whole_assign(s, emit_array_ptr_value(s, target_expr.operand), arr_dst.size, arr_dst.elem, arr_dst.name, arr_dst.name_len, stmt.assign_value)
                 return
             if stmt.assign_value.kind == EXPR_ARRAY_LIT or stmt.assign_value.kind == EXPR_ARRAY_FILL
-                emit_ir_error(s, c"whole-array store through this pointer is not supported by ritz1 (only a `*[N]T` local, param, field or global, or `p + k` over one)")
+                emit_ir_error(s, stmt.span, c"whole-array store through this pointer is not supported by ritz1 (only a `*[N]T` local, param, field or global, or `p + k` over one)")
                 return
         # Determine the store type. For `*ptr = value` we want the POINTEE
         # type of `ptr` (the destination slot's type), not the value's type.
@@ -3364,7 +3364,7 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 emit_name(s, glob.name, glob.name_len)
                 emit_str(s, c"\n")
         else
-            emit_ir_error_begin(s, c"unknown variable '")
+            emit_ir_error_begin(s, stmt.span, c"unknown variable '")
             emit_ir_error_end(s, stmt.assign_target, stmt.assign_target_len)
 
 # AGAST #1946: when `e` is a match / if expression bound or returned at float
@@ -5058,10 +5058,10 @@ fn emit_array_field_copy_from(s: *EmitterState, field_ptr: i32, field: *StructFi
         src_name = cra.param_type_name
         src_name_len = cra.param_type_name_len
     if src_ptr < 0
-        emit_ir_error(s, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
+        emit_ir_error(s, value.span, c"whole-array assignment to a struct field from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
     if src_size != field.array_size
-        emit_ir_error(s, c"array length does not match the struct field's array length")
+        emit_ir_error(s, value.span, c"array length does not match the struct field's array length")
         return
     if array_store_fits(s, value, src_et, src_name, src_name_len, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len) == 0
         return
@@ -5085,11 +5085,11 @@ fn emit_array_local_copy_from_field(s: *EmitterState, dst_ptr: i32, dst_size: i3
     var mr: MemberPtrResult
     emit_member_ptr(s, value, @mr)
     if mr.success != 1 or mr.field == null or mr.field.field_type != TYPE_ARRAY
-        emit_ir_error(s, c"whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)")
+        emit_ir_error(s, value.span, c"whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)")
         return 1
     let field: *StructField = mr.field
     if field.array_size != dst_size
-        emit_ir_error(s, c"struct field's array length does not match the local array's length")
+        emit_ir_error(s, value.span, c"struct field's array length does not match the local array's length")
         return 1
     if array_store_fits(s, value, field.array_elem_type, field.array_elem_type_name, field.array_elem_type_name_len, dst_et, dst_name, dst_name_len) == 0
         return 1
@@ -5120,7 +5120,7 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
     let cra: *Param = call_ret_array(s, value)
     if cra != null and cra.param_array_shape != null
         if array_shapes_match(cra.param_array_shape, sh) == 0
-            emit_ir_error(s, c"multi-dimensional array initializer's shape does not match the local array's")
+            emit_ir_error(s, value.span, c"multi-dimensional array initializer's shape does not match the local array's")
             return 1
         emit_call_array_store(s, value, cra, dst_ptr)
         return 1
@@ -5130,7 +5130,7 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
         dsh = deref_nd_shape(s, value.operand)
     if dsh != null
         if array_shapes_match(dsh, sh) == 0
-            emit_ir_error(s, c"multi-dimensional array initializer's shape does not match the local array's")
+            emit_ir_error(s, value.span, c"multi-dimensional array initializer's shape does not match the local array's")
             return 1
         var from: i32 = 0
         if plane_ptr_shape(s, value.operand) != null
@@ -5145,7 +5145,7 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
     if src_sh == null
         return 0
     if array_shapes_match(src_sh, sh) == 0
-        emit_ir_error(s, c"multi-dimensional array initializer's shape does not match the local array's")
+        emit_ir_error(s, value.span, c"multi-dimensional array initializer's shape does not match the local array's")
         return 1
     var src_ptr: i32 = -1
     if value.kind == EXPR_INDEX
@@ -5156,7 +5156,7 @@ fn emit_nd_array_init_copy(s: *EmitterState, dst_ptr: i32, sh: *ArrayShape, valu
         var mr: MemberPtrResult
         emit_member_ptr(s, value, @mr)
         if mr.success != 1
-            emit_ir_error(s, c"whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)")
+            emit_ir_error(s, value.span, c"whole-array read into a local array from this member is not supported by ritz1 (only an inline array field)")
             return 1
         src_ptr = mr.reg
     else
@@ -5381,7 +5381,7 @@ pub fn emit_local_array_copy(s: *EmitterState, size: i32, et: i32, name: *u8, na
 # be any `[N x T]`: `*p = a`, `G = a` and a by-value argument come here too.
 pub fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, value: *Expr)
     if value == null
-        emit_ir_error(s, c"whole-array assignment has no value")
+        emit_ir_error(s, value.span, c"whole-array assignment has no value")
         return
     if value.kind == EXPR_IF
         emit_array_if_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value)
@@ -5401,7 +5401,7 @@ pub fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i
                 n = n + 1
                 it = it.next
         if n != dst_size
-            emit_ir_error(s, c"array literal length does not match the local array's length")
+            emit_ir_error(s, value.span, c"array literal length does not match the local array's length")
             return
         if value.kind == EXPR_ARRAY_FILL
             emit_array_fill_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, value.left)
@@ -5419,7 +5419,7 @@ pub fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i
     let cra: *Param = call_ret_array(s, value)
     if cra != null
         if cra.param_array_size != dst_size
-            emit_ir_error(s, c"array length does not match the local array's length")
+            emit_ir_error(s, value.span, c"array length does not match the local array's length")
             return
         if array_store_fits(s, value, cra.param_array_elem_type, cra.param_type_name, cra.param_type_name_len, dst_et, dst_name, dst_name_len) == 0
             return
@@ -5429,7 +5429,7 @@ pub fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i
     if nd_row_src(s, value, @place) == 1
         # AGAST #2517: a row `g[i]`, `x.m[i]`, `mk().m[i]` or `mkp().m[i]`.
         if place.size != dst_size
-            emit_ir_error(s, c"array length does not match the local array's length")
+            emit_ir_error(s, value.span, c"array length does not match the local array's length")
             return
         if array_store_fits(s, value, place.elem, place.name, place.name_len, dst_et, dst_name, dst_name_len) == 0
             return
@@ -5438,10 +5438,10 @@ pub fn emit_array_local_whole_assign(s: *EmitterState, dst_ptr: i32, dst_size: i
         emit_local_array_copy(s, dst_size, dst_et, dst_name, dst_name_len, ndp.reg, dst_ptr)
         return
     if array_place_shape(s, value, @place) == 0
-        emit_ir_error(s, c"whole-array assignment to a local array from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
+        emit_ir_error(s, value.span, c"whole-array assignment to a local array from this value is not supported by ritz1 (only array literals, local arrays, array fields and `*p` for `p: *[N]T`)")
         return
     if place.size != dst_size
-        emit_ir_error(s, c"array length does not match the local array's length")
+        emit_ir_error(s, value.span, c"array length does not match the local array's length")
         return
     if array_store_fits(s, value, place.elem, place.name, place.name_len, dst_et, dst_name, dst_name_len) == 0
         return
@@ -5627,7 +5627,7 @@ fn emit_float_field_store(s: *EmitterState, field_ptr: i32, field_ty: i32, val_r
 pub fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *StructField, value: *Expr)
     let et: i32 = field.array_elem_type
     if value == null
-        emit_ir_error(s, c"whole-array assignment to a struct field has no value")
+        emit_ir_error(s, value.span, c"whole-array assignment to a struct field has no value")
         return
     if value.kind != EXPR_ARRAY_LIT and value.kind != EXPR_ARRAY_FILL
         emit_array_field_copy_from(s, field_ptr, field, value)
@@ -5641,7 +5641,7 @@ pub fn emit_array_field_whole_assign(s: *EmitterState, field_ptr: i32, field: *S
             n = n + 1
             it = it.next
     if n != field.array_size
-        emit_ir_error(s, c"array literal length does not match the struct field's array length")
+        emit_ir_error(s, value.span, c"array literal length does not match the struct field's array length")
         return
     if value.kind == EXPR_ARRAY_FILL
         emit_array_fill_into(s, field_ptr, field.array_size, et, field.array_elem_type_name, field.array_elem_type_name_len, value.left)
@@ -5924,7 +5924,7 @@ fn if_stmt_arm_float_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8, f
     if last.kind == STMT_EXPR and last.expr != null
         return match_arm_float_settle(s, last.expr, reg, fr)
     if last.kind == STMT_IF or last.kind == STMT_MATCH
-        return float_arm_settle(s, s.last_match_float_ty, null, reg, fr)
+        return float_arm_settle(s, s.last_match_float_ty, null, last.span, reg, fr)
     reg
 
 # AGAST #3749: a body with no value (a loop's, an `unsafe` block's), whose
@@ -7169,11 +7169,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # G9b: only an imported, non-generic fn has this body, and those are
         # declared, never defined.  Reaching here means a body the importer
         # instantiates (generic) was stripped: refuse, don't emit `ret 0`.
-        emit_ir_error(s, c"body stripped from an imported module interface (G9b)")
+        emit_ir_error(s, stmt.span, c"body stripped from an imported module interface (G9b)")
     else
         # AGAST #1813: this was an IR comment and exit 0,
         # so the statement silently vanished (the #1369 class).
-        emit_ir_error_kind(s, c"unhandled statement kind ", stmt.kind)
+        emit_ir_error_kind(s, stmt.span, c"unhandled statement kind ", stmt.kind)
 
 # =============================================================================
 # Function Emission

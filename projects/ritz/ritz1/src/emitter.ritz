@@ -66,6 +66,15 @@ fn method_tail_copy_type(method: *FnDef) -> i32
         return TYPE_STRUCT
     TYPE_VOID
 
+# The span of a body's last statement: the value an implicit return returns.
+fn body_tail_span(body: *Stmt) -> SrcSpan
+    var last: *Stmt = body
+    while last != null and last.next != null
+        last = last.next
+    if last == null
+        return diag_span(0, 0)   # no body: no implicit return to report on
+    last.span
+
 # The implicit-return tail shared by emit_fn and emit_impl_method (AGAST #1573).
 #
 # Called after the body loop. `has_explicit_return` is 1 when the body's last
@@ -74,7 +83,10 @@ fn method_tail_copy_type(method: *FnDef) -> i32
 # Before #1573 only emit_fn called this. emit_impl_method emitted nothing, so a
 # non-void method ending in an `if`/loop/`let` closed the function on an
 # unterminated block (`L2:` then `}`), which clang rejects.
-fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_type: i32, ret_type_name: *u8, ret_type_name_len: i32)
+#
+# `tail` is the body's last statement (body_tail_span), where an error about
+# the implicit return's value is reported (AGAST #3445).
+fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_type: i32, ret_type_name: *u8, ret_type_name_len: i32, tail: SrcSpan)
     # A TYPE_STRUCT return that lost its name is declared through emit_llvm_type
     # (emit_impl_method's header does this), so every `ret` below must be too.
     var named_struct: i32 = 0
@@ -113,7 +125,7 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
             if ret_type == TYPE_ARRAY
                 # AGAST #2302: emit_array_return takes a tail statement; this
                 # value (an `if` / `match` arm's, say) is no `[N x T]`.
-                emit_ir_error(s, c"a `-> [N]T` fn's value here is not lowered by ritz1 (return the array from each arm)")
+                emit_ir_error(s, tail, c"a `-> [N]T` fn's value here is not lowered by ritz1 (return the array from each arm)")
             else if ty_int_bits(ret_type) == 32
                 let trunc: i32 = next_reg(s)
                 emit_str(s, c"  ")
@@ -1221,7 +1233,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             emit_stmt(s, stmt, f.return_type)
         stmt = stmt.next
 
-    emit_implicit_return_tail(s, has_explicit_return, f.return_type, f.return_type_name, f.return_type_name_len)
+    emit_implicit_return_tail(s, has_explicit_return, f.return_type, f.return_type_name, f.return_type_name_len, body_tail_span(f.body))
     refuse_huge_frame(s, f, body_start)          # AGAST #3739: before any rewrite
     own_end_fn(s, body_start)                    # AGAST #2158: drops before `ret`
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
@@ -1616,7 +1628,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
 
     # AGAST #1573 — same tail as emit_fn: close the final block if the body
     # did not already end in a `ret`.
-    emit_implicit_return_tail(s, has_explicit_return, method.return_type, method.return_type_name, method.return_type_name_len)
+    emit_implicit_return_tail(s, has_explicit_return, method.return_type, method.return_type_name, method.return_type_name_len, body_tail_span(method.body))
     refuse_huge_frame(s, method, body_start)     # AGAST #3739: before any rewrite
     own_end_fn(s, body_start)                    # AGAST #2158: drops before `ret`
     rewrite_large_struct_copies(s, body_start)   # AGAST #1732
@@ -3535,11 +3547,20 @@ fn is_string_literal_layout(st: *StructDef) -> i32
 
 # Supplies the `{ ptr: *u8, len: i64 }` struct `name` unless the module
 # already defines it; a source definition with another layout is an error.
+# A StructDef records no position, so that error is unlocated: printed as
+# emit_ir_error's message with no file:line:col, and counted by
+# count_unlocated_error for main's summary (AGAST #3257, #3445).
 fn ensure_view_struct(s: *EmitterState, m: *Module, name: *u8, len: i32, err: *u8)
     let existing: *StructDef = find_module_struct(m, name, len)
     if existing != null
         if is_string_literal_layout(existing) == 0
-            emit_ir_error(s, err)
+            emit_str(s, c"  ; ERROR: ")
+            emit_str(s, err)
+            emit_str(s, c"\n")
+            eprints_cstr(c"error: ritz1 cannot emit: ")
+            eprints_cstr(err)
+            eprint_char('\n')
+            count_unlocated_error(s, 1)
         return
     # The monomorph of ritzlib's `struct Span<T> { ptr: *T, len: i64 }` at
     # T = u8, which is also ritzlib.strview's `struct StrView`.
@@ -3653,15 +3674,11 @@ fn test_ret_bits(f: *FnDef) -> i32
             return 64
     0 - 1
 
-# "error: ritz1: [[test]] function 'NAME' <what>", counted like emit_ir_error.
+# "<file>:<line>:1: error: [[test]] function 'NAME' <what>", counted like
+# emit_ir_error.  A FnDef records no column; a [[test]] fn is a top-level
+# item, and a top-level `fn` starts in column 1 (Ritz is indentation-based).
 fn test_fn_error(s: *EmitterState, f: *FnDef, what: *u8)
-    eprints_cstr(c"error: ")
-    let file: *u8 = emitter_source_file()
-    if file != null
-        eprints_cstr(file)
-        eprints_cstr(c":")
-        eprint_int(f.line as i64)
-        eprints_cstr(c": ")
+    diag_error_at(emitter_source_file(), diag_span(f.line, 1))
     eprints_cstr(c"[[test]] function '")
     for i in 0..f.name_len
         eprint_char(*(f.name + i))

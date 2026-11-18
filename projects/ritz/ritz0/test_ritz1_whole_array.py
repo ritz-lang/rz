@@ -2510,7 +2510,7 @@ LOCATED = {
 def test_ritz1_refusal_names_the_argument(ritz1_bin, tmp_path, name):
     comp, _ = _compile("ritz1", ritz1_bin, tmp_path, name, REJECTED[name])
     out = comp.stdout + comp.stderr
-    assert re.search(r"\.ritz:\d+:\d+: argument 1 of `g` has the wrong type: ", out), out
+    assert re.search(r"\.ritz:\d+:\d+: error: argument 1 of `g` has the wrong type: ", out), out
     assert LOCATED[name] in out
 
 

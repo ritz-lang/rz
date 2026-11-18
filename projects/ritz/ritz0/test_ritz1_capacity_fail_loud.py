@@ -458,4 +458,4 @@ def test_emit_stmt_default_arm_is_an_error():
     IR and carried on (the #1369 class). It must go through emit_ir_error."""
     src = (RITZ1_SRC / "emitter_stmt.ritz").read_text()
     assert "TODO: statement kind" not in src
-    assert 'emit_ir_error_kind(s, c"unhandled statement kind "' in src
+    assert 'emit_ir_error_kind(s, stmt.span, c"unhandled statement kind "' in src

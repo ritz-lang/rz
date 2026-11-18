@@ -118,3 +118,50 @@ def test_error_is_file_line_col_error_message(request, tmp_path, compiler, name)
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{err[-1500:]}"
     want = rf"^\S*unit\.ritz:\d+:\d+: error: {re.escape(message)}$"
     assert re.search(want, err, re.MULTILINE), f"{compiler}, {name}: want {want!r}:\n{err[-1500:]}"
+
+
+# AGAST #3621: exact locations for the two parser errors #3445 left short.
+# `trait_decl_refused` printed col 0 (the grammar passed the `fn` token's line
+# only); it is at the `fn` token now, where ritz0 reports it.  The dropped-item
+# tally is about the whole file, so it is `<file>: error: ` (diag_file_error_at)
+# with no line.
+EXACT = {
+    "trait_extern": (
+        ("trait T\n"
+        "    fn f(self) -> i32 = extern\n"
+        "\n"
+        "fn main() -> i32\n"
+        "    0\n"),
+        r"unit\.ritz:2:5: error: trait method 'f' cannot be declaration-only "
+        r"\(= extern\): a trait method is a signature already; drop '= extern'",
+    ),
+    "dropped_tally": (
+        ("struct P\n"
+        "    x: m.S\n"
+        "\n"
+        "fn main() -> i32\n"
+        "    0\n"),
+        r"unit\.ritz: error: 1 top-level item\(s\) failed to parse; "
+        r"refusing to emit a partial module",
+    ),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(EXACT))
+def test_error_is_at_its_exact_place(request, tmp_path, compiler, name):
+    source, want = EXACT[name]
+    (tmp_path / "unit.ritz").write_text(source)
+    request.getfixturevalue("ritz1_bin")
+    binary = RITZ1_BUILD / compiler
+    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    # A relative path, so the prefix is exactly `unit.ritz`.
+    proc = subprocess.run([str(binary), "unit.ritz", "-o", "unit.ll"], check=False,
+                          cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300)
+    err = proc.stderr
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{err[-1500:]}"
+    assert not (tmp_path / "unit.ll").exists(), f"{compiler} wrote IR for {name}"
+    assert re.search(rf"^{want}$", err, re.MULTILINE), f"{compiler}, {name}: want {want!r}:\n{err[-1500:]}"

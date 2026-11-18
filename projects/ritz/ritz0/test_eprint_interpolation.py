@@ -31,6 +31,7 @@ pinned to a literal, so a bug both compilers share cannot pass.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -235,7 +236,7 @@ def test_eprint_rejects_what_print_rejects(tmp_path, case):
             line = next(
                 i for i, text in enumerate(program.splitlines(), 1) if marker in text
             )
-            assert f"line {line}" in comp.stderr, comp.stderr
+            assert re.search(rf"\.ritz:{line}:\d+: error: ", comp.stderr), comp.stderr   # AGAST #3621
 
 
 def test_eprint_cstring_rejection_names_the_fix(tmp_path):

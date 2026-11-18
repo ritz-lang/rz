@@ -80,7 +80,7 @@ def _refusal(source, name, type_text, before):
             break
     else:
         raise AssertionError(f"{before!r} not in source")
-    return (rf"unit\.ritz:{line}:{col}: parameter `{re.escape(name)}` is {_HUGE_BYTES} bytes, "
+    return (rf"unit\.ritz:{line}:{col}: error: parameter `{re.escape(name)}` is {_HUGE_BYTES} bytes, "
             rf"too large to pass by value \(LLVM's byval limit is 4 GiB\); take it by "
             rf"reference: `{re.escape(name)}: @{re.escape(type_text)}` or "
             rf"`{re.escape(name)}: @&{re.escape(type_text)}`$")

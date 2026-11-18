@@ -992,7 +992,7 @@ def test_a_users_as_bytes_is_not_a_span(compile_with, compiler):
                + MAIN + "    var u: U\n    var t: i32 = 0\n    for b in u.as_bytes()\n"
                "        t = t + 1\n    return t\n")
     comp, ll, _ = compile_with(compiler, "user", program)
-    _is_refused(comp, ll, UNSUPPORTED, program)
+    _is_refused(comp, ll, "error: " + UNSUPPORTED, program)
 
 
 # Not a header, whatever it looks like.  ritz0 runs the first, as anything that
@@ -1044,7 +1044,7 @@ def test_anything_else_is_refused(compile_with, compiler, name):
         assert comp.returncode != 0 and not ll.exists(), out
         assert "main.ritz:11:16: error: `VH` has no field `nope`" in out, out
         return
-    _is_refused(comp, ll, UNSUPPORTED, NOT_A_HEADER[name])
+    _is_refused(comp, ll, "error: " + UNSUPPORTED, NOT_A_HEADER[name])
 
 
 _T = "    var t: i32 = 0\n    for x in {it}\n        t = t + 1\n    return t\n"
@@ -1096,7 +1096,7 @@ REFUSED_ELEMENTS = {
 def test_an_element_ritz1_cant_name_is_refused(compile_with, compiler, name):
     program, message = REFUSED_ELEMENTS[name]
     comp, ll, _ = compile_with(compiler, name, program)
-    _is_refused(comp, ll, message, program)
+    _is_refused(comp, ll, "error: " + message, program)
 
 
 # AGAST #3099: an element named by nothing but the Vec, Option$i32 here.  ritz1
@@ -1123,4 +1123,4 @@ REFUSED_HOLDERS = {
 @pytest.mark.parametrize("name", sorted(REFUSED_HOLDERS))
 def test_a_holder_ritz1_doesnt_reach_is_refused(compile_with, compiler, name):
     comp, ll, _ = compile_with(compiler, name, REFUSED_HOLDERS[name])
-    _is_refused(comp, ll, UNSUPPORTED, REFUSED_HOLDERS[name])
+    _is_refused(comp, ll, "error: " + UNSUPPORTED, REFUSED_HOLDERS[name])

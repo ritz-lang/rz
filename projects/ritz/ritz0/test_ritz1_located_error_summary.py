@@ -9,10 +9,15 @@ after any of them.  For a located error, e.g. `h.0` on a named struct
 (#3233: "main.ritz:5:5: `Holder` has no field `0`"), that unlocated line is
 noise after the real diagnostic.
 
-The rule: the summary is printed only when at least one error came from the
-`; ERROR:` comment path (emit_ir_error and friends), which has no location,
-and N counts just those.  The exit status is non-zero and no IR is written
-either way.
+The rule: the summary is printed only when at least one error was printed
+with no file:line:col, and N counts just those.  The exit status is non-zero
+and no IR is written either way.
+
+Since AGAST #3621 the emit_ir_error family (the `; ERROR:` comment path,
+#1369) is located too, at the construct it could not lower, so it earns no
+summary.  What is left unlocated is what has no position to report: a source
+`struct StrView` of the wrong layout (a StructDef records none) and the
+multi-dimensional leak tally.
 
 Rows run through ritz1 and ritz1_selfhosted (ritz0 has no such summary).
 """
@@ -40,31 +45,32 @@ fn main() -> i32
     h.0
 """
 
-# An unlocated one only: the `; ERROR: unknown identifier` site (#1369),
-# which names the identifier (emit_ir_error_begin/_end) ...
-_UNLOCATED = """\
+# The emit_ir_error_begin/_end site (#1369): `unknown identifier`, naming it.
+_UNKNOWN_IDENT = """\
 fn main() -> i32
     return no_such_name
 """
 
 # ... and a plain emit_ir_error: a BitOps method with the wrong arity.
-_UNLOCATED_PLAIN = """\
+_BITOPS_ARITY = """\
 fn main() -> i32
     let n: i32 = 5
     n.rotl()
 """
 
-# Both: the unlocated one still earns the summary, counting only itself.  The
-# located one is an emitter error (an unsupported `for` iterable): `h.0` is
-# Sema's now (AGAST #3509), as is a `let` store (#3504), and a Sema error
-# stops the compile before the emitter.
+# An unlocated one: a StructDef records no position (ensure_view_struct).
+_BAD_STRVIEW = """\
+struct StrView
+    a: i32
+
+fn main() -> i32
+    0
+"""
+
+# Both: the unlocated one still earns the summary, counting only itself.
 _BOTH = """\
-fn f() -> i32
-    var q: i32 = 3
-    var t: i32 = 0
-    for x in q
-        t = t + 1
-    t
+struct StrView
+    a: i32
 
 fn main() -> i32
     return no_such_name
@@ -72,20 +78,27 @@ fn main() -> i32
 
 # Said by Sema now (deref_field.ritz, AGAST #3509), in diag's form (#3445).
 _HAS_NO_FIELD = "unit.ritz:6:7: error: `Holder` has no field `0`"
-_FOR_ITERABLE = "unit.ritz:4:14: this `for` iterable is not supported in ritz1"
-_UNKNOWN = "cannot emit: unknown identifier"
+_STRVIEW = "error: ritz1 cannot emit: struct StrView must be { ptr: *u8, len: i64 }"
 
 # name -> (source, messages that must appear, expected summary line or None)
 CASES = {
     "located_only": (_LOCATED, [_HAS_NO_FIELD], None),
-    "unlocated_only": (_UNLOCATED, [_UNKNOWN], f"error: ritz1 emitted 1 {SUMMARY}"),
-    "unlocated_plain": (
-        _UNLOCATED_PLAIN,
-        ["cannot emit: wrong number of arguments to integer BitOps method"],
-        f"error: ritz1 emitted 1 {SUMMARY}",
+    # AGAST #3621: located, so no summary.
+    "emit_ir_error_begin": (
+        _UNKNOWN_IDENT,
+        ["unit.ritz:2:12: error: ritz1 cannot emit: unknown identifier 'no_such_name'"],
+        None,
     ),
+    "emit_ir_error": (
+        _BITOPS_ARITY,
+        ["unit.ritz:3:5: error: ritz1 cannot emit: wrong number of arguments to integer BitOps method"],
+        None,
+    ),
+    "unlocated_only": (_BAD_STRVIEW, [_STRVIEW], f"error: ritz1 emitted 1 {SUMMARY}"),
     "located_and_unlocated": (
-        _BOTH, [_FOR_ITERABLE, _UNKNOWN], f"error: ritz1 emitted 1 {SUMMARY}"
+        _BOTH,
+        [_STRVIEW, "unit.ritz:5:12: error: ritz1 cannot emit: unknown identifier"],
+        f"error: ritz1 emitted 1 {SUMMARY}",
     ),
 }
 

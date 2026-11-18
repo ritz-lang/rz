@@ -1004,12 +1004,12 @@ def test_ritz0_store_through_borrow_drops(tmp_path, name):
     assert _run("ritz0", None, tmp_path, name, DROPS[name]) == 3
 
 
-WRONG_TYPE = r"main\.ritz:\d+:\d+: argument \d+ of `\w+` has the wrong type"
+WRONG_TYPE = r"main\.ritz:\d+:\d+: (error: )?argument \d+ of `\w+` has the wrong type"
 NOT_THAT_ARRAY = WRONG_TYPE + r": the array isn't the one the parameter points at"
 NOT_AN_ARRAY = WRONG_TYPE + r": the parameter points at an array"
-DEREF_STORE = r"main\.ritz:\d+:\d+: cannot store through `\*a`"
-NOT_A_VALUE = r"main\.ritz:\d+:\d+: a whole array is not a value here"
-NO_SLICE = r"main\.ritz:\d+:\d+: an `a:& \[N\]T` param can't be sliced"
+DEREF_STORE = r"main\.ritz:\d+:\d+: error: cannot store through `\*a`"
+NOT_A_VALUE = r"main\.ritz:\d+:\d+: error: a whole array is not a value here"
+NO_SLICE = r"main\.ritz:\d+:\d+: error: an `a:& \[N\]T` param can't be sliced"
 MOVE_OUT = r"main\.ritz:\d+:\d+: error: cannot move out of a reference"
 
 # ritz0 refuses all of these, and so does ritz1, at the line.  A wrong-sized

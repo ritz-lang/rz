@@ -115,7 +115,7 @@ def test_generic_body_diagnostic_names_source_line(ritz1_bin, tmp_path):
         timeout=300,
     )
     assert proc.returncode != 0, "ritz1 accepted an interpolating c-string"
-    m = re.search(r"cannot emit: line (-?\d+):", proc.stderr)
+    m = re.search(r"span\.ritz:(-?\d+):\d+: error: ritz1 cannot emit: ", proc.stderr)
     assert m, proc.stderr[-2000:]
     assert m.group(1) == "6", (
         f"diagnostic in a cloned generic body names line {m.group(1)}, not 6:\n"

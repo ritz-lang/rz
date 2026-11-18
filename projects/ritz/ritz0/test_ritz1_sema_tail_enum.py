@@ -102,17 +102,22 @@ WANTED = [
     ("39:10", "enum", "argument 1 of `take`: expected u64, found enum 'St'; convert with `as`"),
 ]
 
-ERROR = re.compile(r"(?:error: \S*main\.ritz:(\d+:\d+): (.*))|(?:\S*main\.ritz:(\d+:\d+): error: (.*))")
+# Every error is `<file>:<line>:<col>: error: <msg>` (diag; enum_as_int's
+# used to put `error: ` first, AGAST #3621).
+ERROR = re.compile(r"\S*main\.ritz:(\d+:\d+): error: (.*)")
 
 
 def _errors(out):
     found = []
     for m in ERROR.finditer(out):
-        if m.group(1):
-            found.append((m.group(1), "enum", m.group(2)))
+        msg = m.group(2)
+        if "declares a return type" in msg:
+            kind = "tail"
+        elif "found enum" in msg:
+            kind = "enum"
         else:
-            kind = "tail" if "declares a return type" in m.group(4) else "other"
-            found.append((m.group(3), kind, m.group(4)))
+            kind = "other"
+        found.append((m.group(1), kind, msg))
     return found
 
 

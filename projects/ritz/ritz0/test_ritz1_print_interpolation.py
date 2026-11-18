@@ -33,6 +33,7 @@ expected string, so a bug both compilers share cannot pass either.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -251,11 +252,11 @@ def test_unprintable_is_a_compile_error_in_both(tmp_path, case):
         # A diagnostic, not a crash: a traceback also exits nonzero.
         assert "Traceback" not in comp.stderr, comp.stderr[-2000:]
         if compiler == "ritz1":
-            # Located: the diagnostic names the print literal's line.
+            # Located: the diagnostic is at the print literal (file:line:col, AGAST #3621).
             line = next(
                 i for i, text in enumerate(program.splitlines(), 1) if "print(" in text
             )
-            assert f"line {line}" in comp.stderr, comp.stderr
+            assert re.search(rf"\.ritz:{line}:\d+: error: ", comp.stderr), comp.stderr   # AGAST #3621
 
 
 def test_cstring_braces_outside_print_stay_opaque(tmp_path):

@@ -18,9 +18,11 @@ These tests keep it that way:
   parser arena exhausted ..."` has no file:line:col to give and is not
   covered.)
 
-ALLOWED lists the files not yet ported (the emitter, and with it the
-unlocated emit_ir_error family); it only shrinks.  That port is AGAST
-#3621.
+- the emit_ir_error family (emitter_core.ritz) takes the `span: SrcSpan`
+  of the construct it could not lower, so its `ritz1 cannot emit: ` line is
+  located like every other error (AGAST #3621).
+
+ALLOWED, the files not yet ported, is empty since AGAST #3621.
 """
 
 from __future__ import annotations
@@ -35,17 +37,9 @@ SRC = TOOLS.parent / "ritz1" / "src"
 
 DIAG = "diag.ritz"
 
-# Files still allowed a hand-rolled `error: ` prefix (AGAST #3621).
-ALLOWED: frozenset[str] = frozenset({
-    "emitter.ritz",
-    "emitter_core.ritz",
-    "emitter_expr_access.ritz",
-    "emitter_expr_arith.ritz",
-    "emitter_expr_call.ritz",
-    "emitter_match.ritz",
-    "emitter_print.ritz",
-    "enum_as_int.ritz",
-})
+# Files still allowed a hand-rolled `error: ` prefix.  Empty since AGAST
+# #3621 ported the emitter; it only shrinks, so it stays empty.
+ALLOWED: frozenset[str] = frozenset()
 
 # The ticket's pattern: a bare `error: ` prefix (git grep -E).
 PATTERN = r'eprints_cstr\(c"error: "\)'
@@ -104,3 +98,31 @@ def test_diag_module_prints_the_prefix():
     assert "pub fn diag_error(file: *u8, span: SrcSpan, msg: *u8)" in text
     assert 'c": error: "' in text
 
+
+
+# AGAST #3621: every emit_ir_error* entry point that starts a message takes
+# the span it prints at.  (_end finishes a _begin and prints no prefix.)
+EMIT_IR_ERROR_FNS = ("emit_ir_error", "emit_ir_error_begin", "emit_ir_error_kind")
+
+def emit_ir_error_signatures(text: str) -> dict[str, str]:
+    """name -> parameter list of each `pub fn emit_ir_error*(...)`."""
+    out = {}
+    for m in re.finditer(r"^pub fn (emit_ir_error\w*)\(([^)]*)\)", text, re.M):
+        out[m.group(1)] = m.group(2)
+    return out
+
+
+@pytest.mark.unit
+def test_emit_ir_error_family_takes_a_span():
+    sigs = emit_ir_error_signatures((SRC / "emitter_core.ritz").read_text())
+    for name in EMIT_IR_ERROR_FNS:
+        assert name in sigs, f"{name} not found in emitter_core.ritz"
+        assert "span: SrcSpan" in sigs[name], (
+            f"{name}({sigs[name]}) must take `span: SrcSpan`: an emitter "
+            "error is printed at <file>:<line>:<col> (AGAST #3621)")
+
+
+@pytest.mark.unit
+def test_signature_check_catches_an_unlocated_one():
+    sigs = emit_ir_error_signatures("pub fn emit_ir_error(s: *EmitterState, msg: *u8)\n")
+    assert "span: SrcSpan" not in sigs["emit_ir_error"]
