@@ -146,7 +146,7 @@ def _run(stub: Path, *, attempts=3, fetch_timeout=2, env_extra=None):
     )
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_installs_the_boot_packages_without_recommends(stub):
     r = _run(stub)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -159,7 +159,7 @@ def test_installs_the_boot_packages_without_recommends(stub):
             assert pkg in words, f"{verb} does not name {pkg}"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_stalled_fetch_is_cut_off_and_retried(stub):
     """The 2026-11-18 failure: one slow fetch ate the step's 10 minutes and
     the retry loop never got a second go."""
@@ -170,7 +170,7 @@ def test_a_stalled_fetch_is_cut_off_and_retried(stub):
     assert "timed out" in r.stdout
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_nothing_is_installed_until_a_fetch_completes(stub):
     """dpkg must never run under the fetch timeout or after a failed fetch:
     killing it half way leaves the runner's dpkg state broken."""
@@ -183,7 +183,7 @@ def test_nothing_is_installed_until_a_fetch_completes(stub):
     assert "Failed to fetch" in out  # apt's own reason reaches the log
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_deb_cache_is_used_pruned_and_left_saveable(stub):
     cache = stub / "debs"
     r = _run(stub, env_extra={"BOOT_TOOLS_DEB_CACHE": str(cache)})
@@ -199,7 +199,7 @@ def test_deb_cache_is_used_pruned_and_left_saveable(stub):
     assert not (cache / "lock").exists()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_tilde_cache_path_from_main_yml_is_expanded(stub):
     """A step's env: value is not shell-expanded; main.yml passes the cache
     step's own `~/...` path."""
@@ -209,7 +209,7 @@ def test_tilde_cache_path_from_main_yml_is_expanded(stub):
     assert not (stub / "~").exists()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_without_a_cache_apt_uses_its_own_archives(stub):
     r = _run(stub)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -217,7 +217,7 @@ def test_without_a_cache_apt_uses_its_own_archives(stub):
     assert _calls(stub, "autoclean") == []
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_already_installed_tools_skip_apt(stub):
     assert _run(stub).returncode == 0
     (stub / "fetch-args").unlink()

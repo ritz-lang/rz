@@ -253,6 +253,7 @@ def test_summary_counts_violations_and_exemptions():
     assert summary["null-return"] == {"violations": 0, "exempt": 0}
 
 
+@pytest.mark.integration
 def test_cli_json_and_list(tmp_path):
     (tmp_path / "a.ritz").write_text("pub fn lookup(k: i64) -> *u8\n    return null\n")
     out = subprocess.run(

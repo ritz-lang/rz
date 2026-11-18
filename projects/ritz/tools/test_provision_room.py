@@ -29,6 +29,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 PROVISION = REPO / ".claude" / "provision-room.sh"

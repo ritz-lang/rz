@@ -112,6 +112,7 @@ def test_the_test_runner_gets_this_build_module(buildpy):
     assert buildpy.build_testrun.BUILD_MODULE is buildpy
 
 
+@pytest.mark.integration
 def test_build_py_is_still_the_entry_point(tmp_path):
     r = subprocess.run([sys.executable, str(PKG_DIR / "build.py"), "list"],
                        cwd=tmp_path, capture_output=True, text=True, timeout=60)

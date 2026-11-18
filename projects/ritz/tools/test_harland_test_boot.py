@@ -177,23 +177,27 @@ def _stub_log(tree) -> str:
 # --- the #3437 bug: a panic after the banner ----------------------------------
 
 
+@pytest.mark.integration
 def test_panic_after_the_banner_fails(tree):
     r = _run(tree, PANIC_AFTER_BANNER)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "KERNEL PANIC" in r.stdout and "FAIL" in r.stdout
 
 
+@pytest.mark.integration
 def test_panic_fails_even_if_the_suite_passed(tree):
     r = _run(tree, BANNER + LOADED + PASSED + r"*** KERNEL PANIC: late ***\n")
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_exception_fails_even_if_the_suite_passed(tree):
     r = _run(tree, BANNER + LOADED + r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "EXCEPTION" in r.stdout
 
 
+@pytest.mark.integration
 def test_the_banner_alone_is_not_a_pass(tree):
     """The old ladder's last rung: 'Boot successful (single core)'."""
     r = _run(tree, BANNER + LOADED)
@@ -201,6 +205,7 @@ def test_the_banner_alone_is_not_a_pass(tree):
     assert "ALL TESTS PASSED" in r.stdout  # the FAIL line names what was missing
 
 
+@pytest.mark.integration
 def test_a_hung_boot_fails_and_says_it_timed_out(tree):
     """A boot that never reaches a verdict is a FAIL that names the timeout,
     so a slow host reads differently from a suite that never ran."""
@@ -215,6 +220,7 @@ def test_the_default_timeout_allows_a_loaded_host():
     assert 'TIMEOUT="${BOOT_TIMEOUT:-120}"' in src
 
 
+@pytest.mark.integration
 def test_failed_suite_fails(tree):
     r = _run(
         tree, BANNER + LOADED + r"  Results: 14 passed, 1 failed\n  TESTS FAILED\n"
@@ -222,6 +228,7 @@ def test_failed_suite_fails(tree):
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_good_boot_passes(tree):
     r = _run(tree, BANNER + LOADED + PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -231,17 +238,20 @@ def test_good_boot_passes(tree):
 # --- every CPU -smp starts comes up (#4184) -----------------------------------
 
 
+@pytest.mark.integration
 def test_a_missing_ap_fails_even_if_the_suite_passed(tree):
     r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (2 APs started)\n" + SUITE_ONLY)
     assert r.returncode == 1, r.stdout + r.stderr
     assert '"(3 APs started)"' in r.stdout
 
 
+@pytest.mark.integration
 def test_no_ap_line_fails(tree):
     r = _run(tree, BANNER + LOADED + SUITE_ONLY)
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_the_ap_count_follows_smp_and_plug_cpu(tree):
     """SMP=20,... expects 19 APs; PLUG_CPU cold-plugs one more (APIC ID 256)."""
     r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (19 APs started)\n" + SUITE_ONLY,
@@ -259,6 +269,7 @@ def test_the_ap_count_follows_smp_and_plug_cpu(tree):
 # --- the initramfs is the real one --------------------------------------------
 
 
+@pytest.mark.integration
 def test_boots_the_mkinitramfs_image_of_the_userspace(tree):
     r = _run(tree, BANNER + LOADED + PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -282,6 +293,7 @@ def test_boots_the_mkinitramfs_image_of_the_userspace(tree):
         assert len(creates) == 1 and f"-b {image}" in creates[0], log
 
 
+@pytest.mark.integration
 def test_leaves_no_disk_under_build_for_a_later_run(tree):
     """The blank disk lived at build/initramfs.qcow2 and was reused forever."""
     build = tree["root"] / "projects" / "harland" / "build"
@@ -289,6 +301,7 @@ def test_leaves_no_disk_under_build_for_a_later_run(tree):
     assert sorted(p.name for p in build.iterdir()) == ["harland.iso"]
 
 
+@pytest.mark.integration
 def test_missing_user_build_output_fails(tree):
     (tree["root"] / "projects/indium/build/debug/init.elf").unlink()
     r = _run(tree, BANNER + LOADED + PASSED)
@@ -299,6 +312,7 @@ def test_missing_user_build_output_fails(tree):
 # --- setup errors -------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_missing_qemu_is_a_setup_error(tree):
     r = _run(tree, qemu=False, full_path=False)
     assert r.returncode == EXIT_SETUP, r.stdout + r.stderr

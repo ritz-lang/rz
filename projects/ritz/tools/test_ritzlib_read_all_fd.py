@@ -48,7 +48,7 @@ def test_exactly_one_read_all_fd_in_ritzlib():
     assert owners == ["io.ritz:vec_read_all_fd"], owners
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_no_caller_of_deleted_growbuf_read_all_fd():
     # `read_all_fd(` not preceded by an identifier char (so not
     # vec_read_all_fd) and not by `fn ` (a definition is the other test's job).

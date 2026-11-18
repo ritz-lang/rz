@@ -19,6 +19,7 @@ GRAMMAR = RITZ_ROOT / "grammars" / "ritz1.grammar"
 
 sys.path.insert(0, str(GEN.parent.parent))
 
+import pytest
 from ritzgen_py.grammar_parser import parse_grammar_file  # noqa: E402
 from ritzgen_py.ritz_generator import unmapped_tokens  # noqa: E402
 
@@ -27,6 +28,7 @@ def test_ritz1_grammar_has_an_id_for_every_token():
     assert unmapped_tokens(parse_grammar_file(str(GRAMMAR))) == []
 
 
+@pytest.mark.integration
 def test_generator_fails_on_a_token_with_no_id(tmp_path):
     grammar = GRAMMAR.read_text().replace(
         'TYPE        = "type"\n', 'TYPE        = "type"\nBOGUSKW     = "bogus"\n', 1

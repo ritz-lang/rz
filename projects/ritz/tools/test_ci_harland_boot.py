@@ -279,12 +279,14 @@ def test_setup_exit_code_is_ci_locals():
     assert ci_local.EXIT_SETUP == 3
 
 
+@pytest.mark.integration
 def test_missing_qemu_is_a_setup_error(tree):
     r = _run(tree, qemu=False, qemu_img=False, full_path=False)
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
     assert "SETUP ERROR" in r.stderr and "qemu-system-x86_64" in r.stderr
 
 
+@pytest.mark.integration
 def test_missing_qemu_img_is_a_setup_error(tree):
     """The boot needs qemu-img for its per-boot overlay. Unchecked, its
     absence surfaced as a boot that never reported a verdict: a FAIL."""
@@ -293,12 +295,14 @@ def test_missing_qemu_img_is_a_setup_error(tree):
     assert "SETUP ERROR" in r.stderr and "qemu-img" in r.stderr
 
 
+@pytest.mark.integration
 def test_missing_ovmf_is_a_setup_error(tree):
     r = _run(tree, PASSED, env_extra={"OVMF_CODE": str(tree["tmp"] / "nope.fd")})
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
     assert "SETUP ERROR" in r.stderr and "OVMF" in r.stderr
 
 
+@pytest.mark.integration
 def test_all_tests_passed_passes_and_keeps_the_serial_log(tree):
     keep = tree["tmp"] / "logs"
     keep.mkdir()
@@ -308,6 +312,7 @@ def test_all_tests_passed_passes_and_keeps_the_serial_log(tree):
     assert "ALL TESTS PASSED" in (keep / "native.log").read_text()
 
 
+@pytest.mark.integration
 def test_boot_attaches_a_keyboard_and_a_monitor_socket(tree):
     """The sendkey check needs a modern-only virtio-keyboard-pci and a
     monitor socket to inject the key through (AGAST #3438)."""
@@ -318,6 +323,7 @@ def test_boot_attaches_a_keyboard_and_a_monitor_socket(tree):
     assert "-monitor unix:" in argv
 
 
+@pytest.mark.integration
 def test_native_boot_attaches_a_modern_only_blk_with_1024_entry_queues(tree):
     """Without disable-legacy=on QEMU's virtio-blk is transitional and the
     driver takes the legacy I/O-port path; queue-size=1024 is what makes the
@@ -328,6 +334,7 @@ def test_native_boot_attaches_a_modern_only_blk_with_1024_entry_queues(tree):
     assert "virtio-blk-pci,drive=initramfs,disable-legacy=on,queue-size=1024" in argv
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "blk_line",
     [
@@ -342,12 +349,14 @@ def test_native_blk_not_modern_with_a_256_entry_queue_fails(tree, blk_line):
     assert "virtio-blk did not come up over the modern transport" in r.stdout
 
 
+@pytest.mark.integration
 def test_all_tests_passed_reports_the_power_off(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS (native): init exited and QEMU powered off" in r.stdout
 
 
+@pytest.mark.integration
 def test_qemu_that_never_powers_off_fails(tree):
     """init exited, but the machine hung instead of powering off: QEMU had to
     be stopped (AGAST #2755)."""
@@ -357,6 +366,7 @@ def test_qemu_that_never_powers_off_fails(tree):
     assert "QEMU did not power off after init exited" in r.stdout
 
 
+@pytest.mark.integration
 def test_init_that_never_exits_fails(tree):
     """QEMU exiting is not enough: init itself must have exited."""
     r = _run(tree, BLK_MODERN + PERSIST_OK + KEY_OK + SUITE_PASSED)
@@ -364,6 +374,7 @@ def test_init_that_never_exits_fails(tree):
     assert "FAIL (native): init did not exit" in r.stdout
 
 
+@pytest.mark.integration
 def test_native_boot_attaches_a_slow_persist_disk(tree):
     """A spin-count poll in virtio-blk timed out under host load (AGAST
     #4078); a second disk 100 ms slow per request pins that it waits on time,
@@ -374,6 +385,7 @@ def test_native_boot_attaches_a_slow_persist_disk(tree):
     assert "latency-ns=100000000" in argv and "drive=persist" in argv
 
 
+@pytest.mark.integration
 def test_persistent_storage_that_never_came_up_fails(tree):
     r = _run(
         tree,
@@ -388,6 +400,7 @@ def test_persistent_storage_that_never_came_up_fails(tree):
     assert "persistent storage did not come up" in r.stdout
 
 
+@pytest.mark.integration
 def test_suite_passed_but_key_never_arrived_fails(tree):
     """ALL TESTS PASSED is not enough: init's input check skips without a
     key, so the script itself must see the key reach the kernel and init."""
@@ -397,23 +410,27 @@ def test_suite_passed_but_key_never_arrived_fails(tree):
     assert "injected key A never reached the kernel input queue" in r.stdout
 
 
+@pytest.mark.integration
 def test_keyboard_that_never_came_up_fails(tree):
     r = _run(tree, BLK_MODERN + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "virtio-keyboard-pci did not come up" in r.stdout
 
 
+@pytest.mark.integration
 def test_kernel_panic_fails(tree):
     r = _run(tree, r"[kmain] start\nKERNEL PANIC: planted\n")
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL (native)" in r.stdout
 
 
+@pytest.mark.integration
 def test_exception_fails_even_if_the_suite_passed(tree):
     r = _run(tree, r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_no_verdict_before_the_timeout_fails(tree):
     r = _run(tree, r"[kmain] start\n", poweroff=False)
     assert r.returncode == 1, r.stdout + r.stderr
@@ -421,6 +438,7 @@ def test_no_verdict_before_the_timeout_fails(tree):
     assert "no verdict within 3s (BOOT_TIMEOUT)" in r.stdout
 
 
+@pytest.mark.integration
 def test_serial_log_that_stops_growing_is_a_hang(tree):
     """A hang is a log that stops growing for BOOT_STALL seconds, however
     long the cap: a fixed 60 s cap failed live boots on a loaded host (AGAST
@@ -436,6 +454,7 @@ def test_serial_log_that_stops_growing_is_a_hang(tree):
     assert "serial tail: [kmain] start" in r.stdout
 
 
+@pytest.mark.integration
 def test_failed_suite_fails(tree):
     r = _run(tree, r"  Results: 9 passed, 1 failed\n  TESTS FAILED\n")
     assert r.returncode == 1, r.stdout + r.stderr
@@ -445,6 +464,7 @@ def _stub_rz(tree, rc: int) -> None:
     _stub(tree["root"], "rz", f"#!/usr/bin/env bash\nexit {rc}\n")
 
 
+@pytest.mark.integration
 def test_build_missing_a_toolchain_binary_is_a_setup_error(tree):
     """`rz build` exits EXIT_SETUP when e.g. lld-link is absent; the script
     used to turn that into a FAIL."""
@@ -454,6 +474,7 @@ def test_build_missing_a_toolchain_binary_is_a_setup_error(tree):
     assert "SETUP ERROR" in r.stderr
 
 
+@pytest.mark.integration
 def test_build_failure_is_a_failure(tree):
     _stub_rz(tree, 1)
     r = _run(tree, PASSED, env_extra={"SKIP_BUILD": "0"})
@@ -461,6 +482,7 @@ def test_build_failure_is_a_failure(tree):
     assert "FAIL: build of harland failed" in r.stdout
 
 
+@pytest.mark.integration
 def test_missing_build_output_is_a_failure_not_a_setup_error(tree):
     (tree["root"] / "projects/harland/build/debug/harland.elf").unlink()
     r = _run(tree, PASSED)
@@ -587,6 +609,7 @@ def _all_built_by(tree, compiler: str) -> None:
         _manifest(tree["root"], rel, compiler)
 
 
+@pytest.mark.integration
 def test_image_built_by_the_compiler_passes(tree):
     _all_built_by(tree, "ritz1")
     r = _run(tree, PASSED, env_extra={"COMPILER": "ritz1"})
@@ -596,6 +619,7 @@ def test_image_built_by_the_compiler_passes(tree):
 
 # One row per kind of binary the boot loads: the kernel ELF, the UEFI PE
 # loader and an initramfs user binary are checked by separate paths.
+@pytest.mark.integration
 @pytest.mark.parametrize("rel", [KERNEL, LOADER, INIT], ids=["kernel", "loader", "user"])
 def test_binary_built_by_another_compiler_fails(tree, rel):
     _all_built_by(tree, "ritz1")
@@ -605,6 +629,7 @@ def test_binary_built_by_another_compiler_fails(tree, rel):
     assert f"FAIL: {Path(rel).name} was built by ritz0, not ritz1" in r.stdout
 
 
+@pytest.mark.integration
 def test_binary_without_a_manifest_fails(tree):
     _all_built_by(tree, "ritz1")
     Path(f"{tree['root'] / LOADER}.manifest.json").unlink()
@@ -613,11 +638,13 @@ def test_binary_without_a_manifest_fails(tree):
     assert "FAIL: BOOTX64.EFI has no build manifest" in r.stdout
 
 
+@pytest.mark.integration
 def test_unknown_compiler_is_bad_usage(tree):
     r = _run(tree, PASSED, env_extra={"COMPILER": "gcc"})
     assert r.returncode == 2, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_build_passes_the_compiler_to_rz(tree):
     log = tree["tmp"] / "rz.log"
     _stub(tree["root"], "rz", f'#!/usr/bin/env bash\necho "$@" >> {log}\n')

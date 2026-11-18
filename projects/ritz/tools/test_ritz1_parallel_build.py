@@ -58,7 +58,7 @@ def _ritz1_make_lines(out: str) -> list[str]:
             if re.search(r"\bmake\b.*-C ritz1\b", line)]
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("target", ["ritz1", "ritz1-bootstrap", "_matrix_ritz1_built"])
 def test_makefile_builds_ritz1_with_the_jobs_cap(target):
     lines = _ritz1_make_lines(_dry_run(target, RITZ1_JOBS="3"))
@@ -67,7 +67,7 @@ def test_makefile_builds_ritz1_with_the_jobs_cap(target):
         assert re.search(r"(^|\s)-j3(\s|$)", line), line
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_makefile_default_cap_is_at_most_8():
     lines = _ritz1_make_lines(_dry_run("ritz1"))
     assert lines

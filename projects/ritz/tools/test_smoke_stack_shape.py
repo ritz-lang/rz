@@ -63,7 +63,7 @@ def test_the_monolith_is_gone():
     assert (PKG / "__init__.py").is_file() and (PKG / "__main__.py").is_file()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
 def test_no_package_file_is_git_ignored():
     # The root .gitignore's core-dump rule `core.*` once swallowed a

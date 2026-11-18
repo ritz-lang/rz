@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-pytestmark = pytest.mark.unit
+pytestmark = pytest.mark.integration
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = RITZ_ROOT.parent.parent

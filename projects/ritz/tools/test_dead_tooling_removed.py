@@ -58,7 +58,7 @@ def test_rz_never_shells_out_through_a_shell():
     assert "shell=True" not in RZ_PATH.read_text()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("argv", [["compare"], ["ci", "plan"]])
 def test_rz_rejects_deleted_subcommands(argv):
     r = subprocess.run([sys.executable, str(RZ_PATH), *argv],
@@ -75,7 +75,7 @@ def test_packaging_module_is_gone():
         assert "from packaging import" not in src.read_text(), src.name
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("cmd", ["install", "uninstall", "global-list",
                                  "global-cache", "lock", "vendor"])
 def test_build_py_rejects_packaging_commands(cmd):

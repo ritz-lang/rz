@@ -102,7 +102,7 @@ def violations(hits: set[str], allowed: set[str]) -> list[str]:
     return out
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_no_new_emitter_state_checks():
     problems = violations(grep_hits(), read_allowlist())
     assert not problems, "\n".join(problems)
@@ -164,7 +164,7 @@ def _cross_pick(tmp_path: Path, a: set[str], b: set[str]) -> None:
         assert spacing_violations(f.read_text()) == []
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("pair", range(len(_groups()) - 1))
 def test_two_moves_of_neighbouring_modules_cherry_pick(tmp_path, pair):
     # #1816's usual rooms: each moves one whole module off the emitter.
@@ -172,7 +172,7 @@ def test_two_moves_of_neighbouring_modules_cherry_pick(tmp_path, pair):
     _cross_pick(tmp_path, set(groups[pair]), set(groups[pair + 1]))
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_neighbouring_entries_across_a_module_boundary_cherry_pick(tmp_path):
     # Partial moves: the last entry of one module, the first of the next
     # (pairs of multi-entry groups when there are any, so neither delete
@@ -185,7 +185,7 @@ def test_neighbouring_entries_across_a_module_boundary_cherry_pick(tmp_path):
     _cross_pick(tmp_path, {g[-1]}, {h[0]})
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_must_use_check_is_off_the_emitter():
     # The first move (#3462): must_use runs on Sema, so neither the grep
     # nor the list may name it.
@@ -207,7 +207,7 @@ def test_a_stale_entry_is_refused():
     assert violations({"bar.ritz:bar_check"}, {"bar.ritz:bar_check"}) == []
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_the_pattern_matches_the_ticket_shape(tmp_path):
     # git grep over a scratch repo: the shapes the ticket names, and not
     # a Sema check or a non-check fn on EmitterState.

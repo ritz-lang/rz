@@ -24,6 +24,9 @@ from pathlib import Path
 
 import pytest
 
+# Every test here runs bash/the valet suites (AGAST #4092: spawn_guard).
+pytestmark = pytest.mark.integration
+
 REPO = Path(__file__).resolve().parents[3]
 TEST_DIR = REPO / "projects/valet/test"
 RUN_ALL = TEST_DIR / "run_all.sh"

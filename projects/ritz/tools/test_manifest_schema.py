@@ -70,6 +70,7 @@ def _functions(rel: str) -> dict[str, str]:
 
 # --- liveness and coverage ---------------------------------------------------
 
+@pytest.mark.integration
 def test_every_committed_manifest_validates():
     bad = []
     for f in _committed_manifests():
@@ -80,6 +81,7 @@ def test_every_committed_manifest_validates():
     assert not bad, "manifests the schema rejects:\n" + "\n".join(bad)
 
 
+@pytest.mark.integration
 def test_every_test_sources_dir_exists():
     """A `[test] sources` entry names a directory in its package.
 

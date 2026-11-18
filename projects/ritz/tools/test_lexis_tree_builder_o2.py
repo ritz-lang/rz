@@ -90,6 +90,7 @@ def tree_builder_ll(tmp_path_factory) -> Path:
     return out
 
 
+@pytest.mark.integration
 def test_tree_builder_ll_has_no_first_class_tree_builder(tree_builder_ll):
     bad = [line.strip()[:160] for line in tree_builder_ll.read_text().splitlines()
            if FIRST_CLASS_TB.search(line)]
@@ -101,6 +102,7 @@ def _cap_address_space():
     resource.setrlimit(resource.RLIMIT_AS, (CLANG_MEM_BYTES, CLANG_MEM_BYTES))
 
 
+@pytest.mark.integration
 def test_tree_builder_compiles_at_O2_within_bound(tree_builder_ll):
     obj = tree_builder_ll.with_suffix(".o")
     start = time.monotonic()

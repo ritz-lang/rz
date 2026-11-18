@@ -46,6 +46,7 @@ def _ignored(rel: str) -> bool:
     return r.returncode == 0
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("suffix", COMPILED_SUFFIXES)
 def test_compiled_output_at_project_root_is_ignored(suffix):
     assert _ignored(f"scratch{suffix}"), (
@@ -54,6 +55,7 @@ def test_compiled_output_at_project_root_is_ignored(suffix):
     )
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "rel",
     [
@@ -69,6 +71,7 @@ def test_root_rule_does_not_hide_other_files(rel):
     )
 
 
+@pytest.mark.integration
 def test_no_elf_tracked_at_project_root():
     r = _git("ls-files", "-z", "--", ".")
     assert r.returncode == 0, r.stderr
@@ -142,6 +145,7 @@ def _head(rel: str, n: int) -> bytes:
         return f.read(n)
 
 
+@pytest.mark.integration
 def test_no_elf_tracked_in_repo():
     offenders = [
         rel
@@ -160,6 +164,7 @@ def test_elf_fixtures_exist():
     assert not missing, f"ELF_FIXTURES entries that are not tracked ELF: {missing}"
 
 
+@pytest.mark.integration
 def test_no_merge_or_editor_leftovers_tracked():
     offenders = [
         rel for rel in _tracked_regular_files() if rel.endswith(LEFTOVER_SUFFIXES)
@@ -167,6 +172,7 @@ def test_no_merge_or_editor_leftovers_tracked():
     assert not offenders, f"leftover {LEFTOVER_SUFFIXES} files tracked: {offenders}"
 
 
+@pytest.mark.integration
 def test_no_compiler_output_ir_tracked():
     """Tracked compiler-emitted LLVM IR, whatever its name, is build output."""
     offenders = [
@@ -175,6 +181,7 @@ def test_no_compiler_output_ir_tracked():
     assert not offenders, f"LLVM IR (compiler output) tracked; git rm it: {offenders}"
 
 
+@pytest.mark.integration
 def test_walk_reads_tracked_files():
     # Guard the walk: if listing or reading broke, the content checks above
     # would pass vacuously. The sample is the build driver itself: a source
@@ -185,6 +192,7 @@ def test_walk_reads_tracked_files():
     assert _head(sample, 2) == b"#!"
 
 
+@pytest.mark.integration
 def test_no_tracked_symlink_into_a_build_dir():
     """build.py's convenience links point into build/; they dangle on a clone."""
     offenders = []
@@ -210,6 +218,7 @@ def _repo_ignored(rel: str) -> bool:
     return r.returncode == 0
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "rel",
     [

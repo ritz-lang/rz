@@ -36,7 +36,7 @@ def _make_dry_run(target: str) -> subprocess.CompletedProcess:
     )
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_build_py_has_no_ritz1_tests_command():
     """The skip-everything command is gone; invoking it is an argparse error."""
     result = subprocess.run(
@@ -59,7 +59,7 @@ def test_build_py_has_no_stale_ritz1_test_list():
     assert "not found, skipping" not in source
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_make_ritz1_builds_the_compiler():
     """`make ritz1` delegates to ritz1/Makefile's build, a step that can fail."""
     result = _make_dry_run("ritz1")

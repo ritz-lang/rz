@@ -281,7 +281,7 @@ def regression_dir(tmp_path):
     return tmp_path
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("compiler, unit, status, want", [
     ("ritz1", "tier1_y", "pass", "pass"),
     ("ritz1", "tier1_y", "fail", "hard"),
@@ -297,7 +297,7 @@ def test_cli_verdict(regression_dir, compiler, unit, status, want):
     assert r.stdout.split("\t")[0].strip() == want
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_cli_verdict_names_ticket_and_file(regression_dir):
     known = cli("verdict", "--gate", "regression", "--compiler", "ritz1",
                 "tier1_x", "fail", kf_dir=regression_dir).stdout
@@ -307,7 +307,7 @@ def test_cli_verdict_names_ticket_and_file(regression_dir):
     assert "AGAST #7: why" in xpass and "7.toml" in xpass
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_cli_list_and_check(regression_dir):
     r = cli("list", "--gate", "regression", "--compiler", "ritz1_selfhosted",
             kf_dir=regression_dir)
@@ -315,7 +315,7 @@ def test_cli_list_and_check(regression_dir):
     assert cli("check", kf_dir=regression_dir).returncode == 0
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_cli_fails_closed_on_a_malformed_list(tmp_path):
     """Exit 2 and no verdict: a caller that reads stdout sees no "known"."""
     write(tmp_path, "7.toml", entry(agast=8))
@@ -326,7 +326,7 @@ def test_cli_fails_closed_on_a_malformed_list(tmp_path):
         assert "7.toml" in r.stderr
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_cli_refuses_an_unknown_gate_or_compiler(regression_dir):
     assert cli("list", "--gate", "nope", "--compiler", "ritz1",
                kf_dir=regression_dir).returncode == 2
@@ -339,7 +339,7 @@ def test_cli_refuses_an_unknown_gate_or_compiler(regression_dir):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_deleting_two_tickets_files_cherry_picks_in_either_order(tmp_path):
     """Two fixes, each deleting its own ticket's file, land in either order
     without a conflict: why the list is a directory and not one file."""

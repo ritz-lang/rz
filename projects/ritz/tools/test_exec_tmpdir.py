@@ -109,10 +109,12 @@ def clean_tempfile(monkeypatch):
 
 # ---- probe ---------------------------------------------------------------
 
+@pytest.mark.integration
 def test_probe_passes_in_an_exec_able_dir(tmp_path):
     assert exec_tmpdir.probe(tmp_path) is None
 
 
+@pytest.mark.integration
 def test_probe_really_runs_the_file(tmp_path):
     seen = []
 
@@ -141,12 +143,14 @@ def test_probe_fails_on_an_unwritable_dir(tmp_path):
     assert why is not None and str(missing) in why
 
 
+@pytest.mark.integration
 def test_probe_leaves_nothing_behind(tmp_path):
     exec_tmpdir.probe(tmp_path)
     exec_tmpdir.probe(tmp_path, noexec_exec)
     assert list(tmp_path.iterdir()) == []
 
 
+@pytest.mark.integration
 def test_probe_fails_on_a_real_noexec_mount(noexec_mount):
     mnt = noexec_mount
     why = exec_tmpdir.probe(mnt)
@@ -233,6 +237,7 @@ def test_discovery_tries_dev_shm_and_tmp_before_sys():
 
 # ---- ensure_exec_tmpdir --------------------------------------------------
 
+@pytest.mark.integration
 def test_ensure_changes_nothing_when_tmp_runs_binaries(tmp_path, monkeypatch,
                                                       clean_tempfile):
     monkeypatch.setenv("TMPDIR", str(tmp_path))
@@ -242,6 +247,7 @@ def test_ensure_changes_nothing_when_tmp_runs_binaries(tmp_path, monkeypatch,
     assert not (tmp_path / "fb").exists()
 
 
+@pytest.mark.integration
 def test_ensure_switches_tmpdir_to_the_fallback(tmp_path, monkeypatch, clean_tempfile):
     bad = tmp_path / "noexec-tmp"
     bad.mkdir()
@@ -278,11 +284,13 @@ def cli(*args):
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.integration
 def test_cli_probe_exit_0_in_an_exec_able_dir(tmp_path):
     p = cli("probe", str(tmp_path))
     assert p.returncode == 0, p.stdout + p.stderr
 
 
+@pytest.mark.integration
 def test_cli_probe_is_a_setup_error_naming_the_dir(tmp_path):
     missing = tmp_path / "gone"
     p = cli("probe", str(missing))
@@ -290,6 +298,7 @@ def test_cli_probe_is_a_setup_error_naming_the_dir(tmp_path):
     assert p.stdout.startswith("SETUP ERROR") and str(missing) in p.stdout
 
 
+@pytest.mark.integration
 def test_cli_probe_on_a_real_noexec_mount(noexec_mount):
     mnt = noexec_mount
     p = cli("probe", str(mnt))

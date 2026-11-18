@@ -94,7 +94,7 @@ CASES = [
 ]
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_tier1_monitor_socket_fits_sun_path_under_long_tmpdir(tmp_path):
     script = _tree(tmp_path / "repo")
     tmpdir = tmp_path / ("t" * 50) / ("m" * 50)

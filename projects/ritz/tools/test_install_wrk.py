@@ -105,7 +105,7 @@ def _run(stub: Path, fail_installs: str, attempts: int = 4):
     )
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_first_try_succeeds_without_retrying(stub):
     r = _run(stub, "0")
     assert r.returncode == 0, r.stdout + r.stderr
@@ -113,7 +113,7 @@ def test_first_try_succeeds_without_retrying(stub):
     assert (stub / "bin" / "wrk").exists()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_transient_failures_are_retried_until_wrk_installs(stub):
     # The runners' failure: DNS out for a while, then back.
     r = _run(stub, "2", attempts=4)
@@ -125,7 +125,7 @@ def test_transient_failures_are_retried_until_wrk_installs(stub):
     assert "wrk 4.1.0" in r.stdout
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_permanent_failure_exits_nonzero_and_says_why(stub):
     r = _run(stub, "always", attempts=3)
     assert r.returncode != 0
@@ -139,7 +139,7 @@ def test_permanent_failure_exits_nonzero_and_says_why(stub):
     assert "Temporary failure resolving" in out
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_install_that_leaves_no_wrk_on_path_fails(stub, tmp_path):
     # apt-get exits 0 but no wrk appears: never report success on that.
     (stub / "bin" / "apt-get").write_text("#!/bin/sh\nexit 0\n")
@@ -148,7 +148,7 @@ def test_install_that_leaves_no_wrk_on_path_fails(stub, tmp_path):
     assert "::error" in r.stdout + r.stderr
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_apt_is_non_interactive_and_retries_its_own_fetches(stub):
     r = _run(stub, "0")
     assert r.returncode == 0, r.stdout + r.stderr

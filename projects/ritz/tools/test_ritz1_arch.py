@@ -261,6 +261,7 @@ def test_committed_measurements_fail(tmp_path):
     assert len(out) == 1 and "arch-report" in out[0]
 
 
+@pytest.mark.integration
 def test_check_cli_exit_codes(tmp_path):
     (tmp_path / "src").mkdir()
     for name, text in SRC.items():
@@ -356,6 +357,7 @@ def _cross_pick(repo):
         assert violations(scan(repo / "src"), doc, CYCLE_BASELINE) == []
 
 
+@pytest.mark.integration
 def test_two_moves_on_neighbouring_checks_cherry_pick(repo):
     # #1816's usual room: note its own (neighbouring) entry.
     repo, checks = repo
@@ -364,6 +366,7 @@ def test_two_moves_on_neighbouring_checks_cherry_pick(repo):
     _cross_pick(repo)
 
 
+@pytest.mark.integration
 def test_two_new_checks_in_neighbouring_gaps_cherry_pick(repo):
     repo, checks = repo
     _room(repo, "a", new=checks[3] + "_x", after=checks[3], edit=checks[0])

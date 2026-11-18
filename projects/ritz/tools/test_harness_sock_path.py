@@ -23,6 +23,11 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
+# Every test here runs bench/run.sh or e2e_large_page.sh (AGAST #4092: spawn_guard).
+pytestmark = pytest.mark.integration
+
 REPO = Path(__file__).resolve().parents[3]
 RUN_SH = REPO / "bench" / "run.sh"
 E2E_SH = REPO / "projects" / "nexus" / "test" / "e2e_large_page.sh"

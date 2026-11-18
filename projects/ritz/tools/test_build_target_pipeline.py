@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 PKG_DIR = Path(__file__).resolve().parents[1]
 if str(PKG_DIR) not in sys.path:
     sys.path.insert(0, str(PKG_DIR))
@@ -105,7 +107,6 @@ def _build_kernel(buildpy, pkg, use_cache=False):
         bin_config, out, pkg, use_cache=use_cache, source_roots=["src"])
 
 
-@pytest.mark.unit
 @needs_clang
 def test_freestanding_objects_go_through_the_bounded_compile(
         buildpy, obj_calls, tmp_path, monkeypatch):
@@ -120,7 +121,6 @@ def test_freestanding_objects_go_through_the_bounded_compile(
         assert "-O2" not in flags
 
 
-@pytest.mark.unit
 @needs_clang
 def test_freestanding_reports_every_module_clang_rejects(
         buildpy, tmp_path, monkeypatch, capsys):
@@ -132,7 +132,6 @@ def test_freestanding_reports_every_module_clang_rejects(
     assert buildpy.CLANG_OBJ_FAILURES == 2
 
 
-@pytest.mark.unit
 @needs_clang
 def test_freestanding_object_compile_honours_the_memory_cap(
         buildpy, tmp_path, monkeypatch, capsys):
@@ -145,7 +144,6 @@ def test_freestanding_object_compile_honours_the_memory_cap(
     assert "address space 1 MiB" in capsys.readouterr().err
 
 
-@pytest.mark.unit
 @needs_clang
 def test_hosted_objects_keep_the_hosted_flags(buildpy, obj_calls, tmp_path, monkeypatch):
     _stub_ritz0(tmp_path, monkeypatch, buildpy, GOOD_IR)

@@ -181,6 +181,7 @@ def test_elf_anywhere_is_a_stray(tmp_path, rel):
     assert find_strays(tmp_path, [rel, "notes.md"]) == [rel]
 
 
+@pytest.mark.integration
 def test_real_tree_is_live():
     """The guard. Fails `make tools-unit` when ritz0/ or ritzlib/ grows an
     orphan."""

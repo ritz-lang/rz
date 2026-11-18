@@ -96,7 +96,7 @@ def _hang_with_grandchild(tmp_path) -> list[str]:
     return ["sh", str(script)]
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_captured_hang_returns_though_a_grandchild_holds_the_pipe(tmp_path):
     t0 = time.monotonic()
     r = bounded_run.run(_hang_with_grandchild(tmp_path), timeout=1, env_name="X_T",
@@ -107,7 +107,7 @@ def test_a_captured_hang_returns_though_a_grandchild_holds_the_pipe(tmp_path):
     assert "timed out after 1s (X_T)" in r.stderr
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_merged_output_gets_the_timeout_line(tmp_path):
     r = bounded_run.run(_hang_with_grandchild(tmp_path), timeout=1, env_name="X_T",
                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -115,14 +115,14 @@ def test_merged_output_gets_the_timeout_line(tmp_path):
     assert "timed out after 1s (X_T)" in r.stdout
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_an_uncaptured_hang_is_killed_and_reported(tmp_path, capfd):
     r = bounded_run.run(["sleep", "60"], timeout=1, env_name="X_T")
     assert r.returncode == bounded_run.TIMED_OUT
     assert "timed out after 1s (X_T)" in capfd.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_quick_run_is_unchanged():
     r = bounded_run.run(["sh", "-c", "echo out; echo err >&2; exit 3"], timeout=30,
                         env_name="X_T", capture_output=True, text=True)
@@ -156,7 +156,7 @@ def hung_tools(tmp_path, monkeypatch):
     return bindir
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_hosted_link_fails_the_link(hung_tools, tmp_path, capsys):
     b = _load_build()
     ok = b.link_hosted(tmp_path / "bin", tmp_path / "rt.o", [tmp_path / "a.o"],
@@ -165,7 +165,7 @@ def test_hung_hosted_link_fails_the_link(hung_tools, tmp_path, capsys):
     assert "timed out after 1s (RITZ_STEP_TIMEOUT)" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_freestanding_link_fails_the_link(hung_tools, tmp_path, capsys):
     b = _load_build()
     cfg = b.BinaryConfig(name="k", src_path=tmp_path / "k.ritz", additional_sources=[],
@@ -174,14 +174,14 @@ def test_hung_freestanding_link_fails_the_link(hung_tools, tmp_path, capsys):
     assert "timed out after 1s" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_uefi_link_fails_the_link(hung_tools, tmp_path, capsys):
     b = _load_build()
     assert b.link_uefi("boot", tmp_path / "BOOT.EFI", [tmp_path / "a.o"]) is False
     assert "timed out after 1s" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_assembler_fails_the_build(hung_tools, tmp_path, capsys):
     b = _load_build()
     asm = tmp_path / "boot.s"
@@ -190,7 +190,7 @@ def test_hung_assembler_fails_the_build(hung_tools, tmp_path, capsys):
     assert "timed out after 1s" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_runtime_object_compile_fails(hung_tools, tmp_path, capsys):
     b = _load_build()
     obj = tmp_path / "rt.o"
@@ -199,7 +199,7 @@ def test_hung_runtime_object_compile_fails(hung_tools, tmp_path, capsys):
     assert "timed out after 1s" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_import_scan_fails(tmp_path, monkeypatch, capsys):
     b = _load_build()
     stub = tmp_path / "list_deps_dir"
@@ -211,7 +211,7 @@ def test_hung_import_scan_fails(tmp_path, monkeypatch, capsys):
     assert "timed out after 1s" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_module_compile_fails_the_build(tmp_path, monkeypatch, capsys):
     b = _load_build()
     stub = tmp_path / "ritz0_stub.py"
@@ -226,7 +226,7 @@ def test_hung_module_compile_fails_the_build(tmp_path, monkeypatch, capsys):
     assert "timed out after 1s" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_test_sh_fails(tmp_path, monkeypatch, capsys):
     b = _load_build()
     (tmp_path / "test.sh").write_text("sleep 15\n")
@@ -244,7 +244,7 @@ def _load_rz():
     return mod
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_rz_unit_hang_is_bounded(tmp_path, monkeypatch):
     rz = _load_rz()
     monkeypatch.setenv(bounded_run.CHILD_TIMEOUT_ENV, "1")

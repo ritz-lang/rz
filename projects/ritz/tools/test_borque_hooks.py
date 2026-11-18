@@ -34,6 +34,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 HOOKS = ("provision-room.sh", "host-budget.sh", "host-env.sh")
@@ -211,7 +213,6 @@ def _projects(h: dict) -> dict:
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.unit
 def test_provision_works_from_a_borque_worktree_with_a_clean_env(host):
     # Basics only on PATH: the venv, LLVM and ~/.local/bin come from the hook.
     r = _hook(host, "provision-room.sh", str(host["wt"]), PATH=_basics(host))
@@ -221,7 +222,6 @@ def test_provision_works_from_a_borque_worktree_with_a_clean_env(host):
     assert json.loads(host["cj"].read_text())["oauthAccount"] == {"keep": "me"}
 
 
-@pytest.mark.unit
 def test_provision_works_without_home(host):
     """No HOME: python3 comes from the given PATH, the rest falls back to the passwd entry."""
     llvm = host["llvm"]
@@ -231,7 +231,6 @@ def test_provision_works_without_home(host):
     assert _settings(host).is_file()
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     ("break_it", "reason"),
     [
@@ -278,7 +277,6 @@ def test_provision_refuses_a_host_without_what_a_gate_needs(host, break_it, reas
     assert host["cj"].read_text() == before
 
 
-@pytest.mark.unit
 def test_provision_checks_the_first_python3_on_path(host):
     """omegalisk: the gate's python is ~/dev/nevelis/.venv's, first on PATH
     (run-gate.sh passes PATH on); there is no ~/dev/.venv to look at."""
@@ -295,7 +293,6 @@ def test_provision_checks_the_first_python3_on_path(host):
     assert "llvmlite" in r.stderr and f"{nev}/bin/python3" in r.stderr, r.stderr
 
 
-@pytest.mark.unit
 def test_provision_ignores_a_python3_the_hook_itself_puts_on_path(host):
     """~/.local/bin (a pip --user python3, say) and LLVM's bin dir go on PATH
     for lld-link and qemu only: the gate's python3 is looked up before them."""
@@ -307,7 +304,6 @@ def test_provision_ignores_a_python3_the_hook_itself_puts_on_path(host):
     assert r.returncode == 0, r.stderr
 
 
-@pytest.mark.unit
 def test_provision_default_path_adds_the_venvs_in_order(host):
     """No PATH at all (hostd): ~/dev/.venv/bin, then ~/dev/nevelis/.venv/bin,
     whichever exist, go before the system dirs."""
@@ -322,7 +318,6 @@ def test_provision_default_path_adds_the_venvs_in_order(host):
     assert str(nev) not in r.stderr
 
 
-@pytest.mark.unit
 def test_provision_refuses_without_python3_on_path(host):
     path = str(_basics_dir(host, without=("python3",)))
     r = _hook(host, "provision-room.sh", "--check-host", str(host["wt"]), PATH=path)
@@ -351,7 +346,6 @@ def _noexec_path(h: dict, *dirs: Path | str) -> str:
     return f"{h['venv']}/bin:{shim}"
 
 
-@pytest.mark.unit
 def test_provision_passes_when_only_a_later_scratch_dir_can_exec(host):
     """bangerang: /tmp is noexec for good, but ~/tmp or the gate dir can run a
     binary, and #3704 gives each gate its own TMPDIR there.  One usable dir
@@ -373,7 +367,6 @@ def test_provision_passes_when_only_a_later_scratch_dir_can_exec(host):
         assert not list(d.iterdir()), "the probe must clean up after itself"
 
 
-@pytest.mark.unit
 def test_provision_refuses_when_every_scratch_dir_is_noexec(host):
     noexec = host["home"] / "noexec"
     noexec.mkdir()
@@ -389,7 +382,6 @@ def test_provision_refuses_when_every_scratch_dir_is_noexec(host):
     assert not list(noexec.iterdir())
 
 
-@pytest.mark.unit
 def test_provision_default_scratch_dirs_end_with_home(host):
     """No RZ_EXEC_DIRS, with $TMPDIR and /tmp noexec and no ~/tmp or gate dir:
     $HOME, last in the default list, still lets the room provision."""
@@ -414,7 +406,6 @@ def test_provision_default_scratch_dirs_end_with_home(host):
     assert f"{noexec}:/tmp:{host['home']}/tmp:" in r.stderr, r.stderr
 
 
-@pytest.mark.unit
 def test_provision_check_host_runs_only_the_checks(host):
     """--check-host: ask a host whether it could gate a room, writing nothing."""
     before = host["cj"].read_text()
@@ -437,7 +428,6 @@ def test_provision_check_host_runs_only_the_checks(host):
     assert host["cj"].read_text() == before
 
 
-@pytest.mark.unit
 def test_provision_names_every_problem_on_its_one_line(host):
     (host["llvm"] / "qemu-system-x86_64").unlink()
     (host["home"] / ".local" / "bin" / "lld-link").unlink()
@@ -447,14 +437,12 @@ def test_provision_names_every_problem_on_its_one_line(host):
     assert "qemu-system-x86_64" in r.stderr and "lld-link" in r.stderr
 
 
-@pytest.mark.unit
 def test_provision_host_checks_can_be_turned_off(host):
     (host["llvm"] / "qemu-system-x86_64").unlink()
     r = _hook(host, "provision-room.sh", str(host["wt"]), RZ_PROVISION_HOST_CHECKS="0")
     assert r.returncode == 0, r.stderr
 
 
-@pytest.mark.unit
 def test_provision_remove_and_verify_skip_the_host_checks(host):
     """Teardown must work on a host that has since lost a tool."""
     assert _hook(host, "provision-room.sh", str(host["wt"])).returncode == 0
@@ -483,7 +471,6 @@ def _systemctl(h: dict) -> Path:
     return bin_dir
 
 
-@pytest.mark.unit
 def test_host_budget_installs_and_removes_with_a_clean_env(host):
     path = f"{_systemctl(host)}:/usr/bin:/bin"
     r = _hook(host, "host-budget.sh", ROOM, PATH=path)
@@ -501,7 +488,6 @@ def test_host_budget_installs_and_removes_with_a_clean_env(host):
     assert not dropin.exists()
 
 
-@pytest.mark.unit
 def test_host_budget_keeps_a_given_runtime_dir(host):
     path = f"{_systemctl(host)}:/usr/bin:/bin"
     r = _hook(
@@ -514,7 +500,6 @@ def test_host_budget_keeps_a_given_runtime_dir(host):
     )
 
 
-@pytest.mark.unit
 def test_host_budget_runs_without_home_or_path(host):
     """--verify reads only: no HOME, no PATH, and it still gives a verdict.
 
@@ -540,7 +525,6 @@ def test_host_budget_runs_without_home_or_path(host):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.unit
 def test_borque_profile_and_wrappers():
     r = subprocess.run(
         ["bash", str(REPO / ".borque" / "test-borque.sh")],

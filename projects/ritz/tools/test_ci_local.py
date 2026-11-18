@@ -214,6 +214,7 @@ def three_steps(tmp_path, monkeypatch):
     return marker
 
 
+@pytest.mark.integration
 def test_fail_fast_stops_at_the_first_failing_step(three_steps, capsys):
     """A broken compiler must not cost the whole gate (design §5)."""
     assert ci_local.main(["--fail-fast"]) == 1
@@ -223,12 +224,14 @@ def test_fail_fast_stops_at_the_first_failing_step(three_steps, capsys):
     assert "not run" in out and "Third leaves a marker" in out
 
 
+@pytest.mark.integration
 def test_without_fail_fast_every_step_runs(three_steps):
     """Default keeps per-step semantics: a failure is recorded, later steps run."""
     assert ci_local.main([]) == 1
     assert three_steps.exists()
 
 
+@pytest.mark.integration
 def test_a_real_run_trims_this_tests_store_not_the_shared_one(
         three_steps, private_cas, capsys):
     """AGAST #2792. Fails without `private_cas`: alone, the gc line names
@@ -240,6 +243,7 @@ def test_a_real_run_trims_this_tests_store_not_the_shared_one(
     assert gc == [f"[ritz-cas] gc: removed 0 files, freed 0 bytes from {private_cas}"]
 
 
+@pytest.mark.integration
 def test_each_step_prints_start_and_end_with_duration(three_steps, capsys):
     ci_local.main([])
     out = capsys.readouterr().out
@@ -251,6 +255,7 @@ def test_each_step_prints_start_and_end_with_duration(three_steps, capsys):
             rf"\[{re.escape(name)}\] END {iso}\S* \d+(\.\d+)?s rc={rc}\b", out), out
 
 
+@pytest.mark.integration
 def test_final_timing_table_lists_every_step_run(three_steps, capsys):
     ci_local.main(["--fail-fast"])
     out = capsys.readouterr().out
@@ -265,6 +270,7 @@ def test_final_timing_table_lists_every_step_run(three_steps, capsys):
 # --------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_skip_does_not_run_the_named_step(three_steps, capsys):
     assert ci_local.main(["--skip", "Second fails"]) == 0
     assert three_steps.exists(), "--skip stopped later steps from running"
@@ -275,6 +281,7 @@ def test_skip_does_not_run_the_named_step(three_steps, capsys):
     assert "Second fails" in summary
 
 
+@pytest.mark.integration
 def test_skip_is_repeatable(three_steps, capsys):
     assert ci_local.main(["--skip", "Second fails",
                           "--skip", "Third leaves a marker"]) == 0
@@ -419,11 +426,13 @@ def test_steps_after_the_setup_action_get_the_pinned_bindir(toolchain_wf):
     assert steps["Sees pinned opt"].llvm_bindir == str(toolchain_wf)
 
 
+@pytest.mark.integration
 def test_pinned_toolchain_is_on_path_when_steps_run(toolchain_wf, capsys):
     """The #1907 miss: TestIRVerification needs `opt` on PATH, as in CI."""
     assert ci_local.main([]) == 0, capsys.readouterr().out
 
 
+@pytest.mark.integration
 def test_missing_pinned_bindir_fails_loudly(toolchain_wf, capsys):
     """A gate without the pinned toolchain asserts less than CI: say so."""
     for f in toolchain_wf.iterdir():
@@ -446,7 +455,7 @@ def test_real_bootstrap_job_pins_the_workflow_clang():
     assert pytest_step.llvm_bindir == ci_local.LLVM_BINDIR.format(version=version)
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_step_does_not_inherit_makefile_ritz_path(monkeypatch, tmp_path):
     """AGAST #4150: `make ci-local` exports RITZ_PATH; CI's steps never see it.
 
@@ -494,6 +503,7 @@ def _two_jobs(tmp_path, monkeypatch, a="'true'", b="'true'"):
     monkeypatch.setattr(ci_local, "REPO_ROOT", tmp_path)
 
 
+@pytest.mark.integration
 def test_job_is_repeatable(tmp_path, monkeypatch, capsys):
     _two_jobs(tmp_path, monkeypatch)
     assert ci_local.main(["--job", "alpha", "--job", "beta"]) == 0
@@ -502,6 +512,7 @@ def test_job_is_repeatable(tmp_path, monkeypatch, capsys):
     assert "all steps passed for: alpha, beta" in out
 
 
+@pytest.mark.integration
 def test_repeated_job_runs_in_workflow_order(tmp_path, monkeypatch, capsys):
     _two_jobs(tmp_path, monkeypatch)
     ci_local.main(["--job", "beta", "--job", "alpha"])
@@ -514,6 +525,7 @@ def test_unknown_job_among_several_is_an_error(tmp_path, monkeypatch):
     assert ci_local.main(["--job", "alpha", "--job", "nope"]) == 2
 
 
+@pytest.mark.integration
 def test_setup_only_failure_exits_with_the_setup_code(tmp_path, monkeypatch, capsys):
     _two_jobs(tmp_path, monkeypatch, a="exit 3")
     assert ci_local.main(["--job", "alpha", "--job", "beta"]) == ci_local.EXIT_SETUP == 3
@@ -521,11 +533,13 @@ def test_setup_only_failure_exits_with_the_setup_code(tmp_path, monkeypatch, cap
     assert "SETUP ERROR" in out
 
 
+@pytest.mark.integration
 def test_real_failure_beats_a_setup_error(tmp_path, monkeypatch):
     _two_jobs(tmp_path, monkeypatch, a="exit 3", b="exit 1")
     assert ci_local.main(["--job", "alpha", "--job", "beta"]) == 1
 
 
+@pytest.mark.integration
 def test_setup_error_does_not_stop_fail_fast(tmp_path, monkeypatch, capsys):
     # A missing tool says nothing about the compiler: the bootstrap job
     # still runs, so the gate's verdict on the code is complete.
@@ -541,6 +555,7 @@ def test_setup_error_does_not_stop_fail_fast(tmp_path, monkeypatch, capsys):
 CRASHING_CONFTEST = "def pytest_collection_modifyitems(items):\n    raise RuntimeError('boom')\n"
 
 
+@pytest.mark.integration
 def test_pytest_internalerror_is_a_failure_not_a_setup_error(tmp_path, monkeypatch, capsys):
     # A real pytest crash, not a stub: pins that pytest's code for it is
     # the one build.py uses for a missing tool.
@@ -565,6 +580,7 @@ def test_only_non_pytest_steps_can_report_a_setup_error():
     assert not ci_local.is_setup_exit(step("./rz build --all"), 1)
 
 
+@pytest.mark.integration
 def test_real_ritz0_pytest_step_cannot_report_a_setup_error():
     """The gate's pytest step and its likely-first pre-pass must read exit 3
     as a crash; build-all's `rz build --all` keeps build.py's meaning."""
@@ -697,6 +713,7 @@ def likely(tmp_path, monkeypatch):
 GATE = ["--fail-fast", "--job", "build-all", "--job", "bootstrap"]
 
 
+@pytest.mark.integration
 def test_likely_files_run_first_with_their_build_then_the_rest(likely, capsys):
     assert ci_local.main(GATE) == 0
     first_pytest, rest = [ln for ln in likely.lines() if ln.startswith("pytest")]
@@ -717,6 +734,7 @@ def test_likely_files_run_first_with_their_build_then_the_rest(likely, capsys):
     assert "likely failures first: 2 file(s)" in out
 
 
+@pytest.mark.integration
 def test_the_full_step_folds_in_the_pre_pass_cost_report(likely, monkeypatch):
     seen = {}
     real = ci_local.run_step
@@ -733,6 +751,7 @@ def test_the_full_step_folds_in_the_pre_pass_cost_report(likely, monkeypatch):
     assert '"run": "1"' in seen["include"]
 
 
+@pytest.mark.integration
 def test_a_pre_pass_failure_stops_a_fail_fast_gate(likely, capsys):
     likely.fail.touch()
     assert ci_local.main(GATE) == 1
@@ -744,6 +763,7 @@ def test_a_pre_pass_failure_stops_a_fail_fast_gate(likely, capsys):
         assert name in not_run, not_run
 
 
+@pytest.mark.integration
 def test_without_fail_fast_the_rest_still_runs_without_the_likely_files(likely):
     likely.fail.touch()
     assert ci_local.main(GATE[1:]) == 1
@@ -752,6 +772,7 @@ def test_without_fail_fast_the_rest_still_runs_without_the_likely_files(likely):
     assert "--ignore=test_a.py" in likely.lines()[3]
 
 
+@pytest.mark.integration
 def test_callers_pytest_addopts_are_kept(likely, monkeypatch):
     monkeypatch.setenv("PYTEST_ADDOPTS", "-x")
     assert ci_local.main(GATE) == 0
@@ -760,6 +781,7 @@ def test_callers_pytest_addopts_are_kept(likely, monkeypatch):
     assert "ADDOPTS=[-x --ignore=test_a.py" in rest
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("why, argv, select", [
     ("nothing selected", GATE, []),
     ("opted out", GATE + ["--no-likely-first"], ["test_a.py"]),
@@ -776,6 +798,7 @@ def test_no_pre_pass(likely, monkeypatch, capsys, why, argv, select):
     assert len([ln for ln in likely.lines() if ln == "build"]) <= 1, why
 
 
+@pytest.mark.integration
 def test_a_failed_build_stops_a_fail_fast_gate_before_the_pre_pass(likely, tmp_path):
     wf = tmp_path / "main.yml"
     wf.write_text(wf.read_text().replace("run: echo build >> ", "run: exit 5; echo "))
@@ -795,6 +818,7 @@ def test_real_workflow_has_the_steps_the_pre_pass_runs():
     assert "check_test_budget.py" in step.run
 
 
+@pytest.mark.integration
 def test_a_stale_cost_report_is_not_folded_in(likely, tmp_path, monkeypatch):
     """A pre-pass that dies before writing its report must not hand the full
     step an earlier run's report left in the tree."""
@@ -827,6 +851,7 @@ def _prepass_addopts(likely) -> str:
     return next(ln for ln in likely.lines() if ln.startswith("pytest"))
 
 
+@pytest.mark.integration
 def test_the_pre_pass_hands_out_the_costliest_files_first(likely, capsys):
     likely.history.write_text(_report({"test_a.py": 1.0, "emitter/test_b.py": 9.0}))
     assert ci_local.main(GATE) == 0
@@ -835,6 +860,7 @@ def test_the_pre_pass_hands_out_the_costliest_files_first(likely, capsys):
     assert "costliest first (2 of 2 file(s) costed by" in capsys.readouterr().out
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("history", [None, "{not json", '{"files": []}'])
 def test_without_a_usable_cost_history_the_order_is_the_selections(likely, history):
     if history is not None:
@@ -844,12 +870,14 @@ def test_without_a_usable_cost_history_the_order_is_the_selections(likely, histo
             "--only-file=emitter/test_b.py]") in _prepass_addopts(likely)
 
 
+@pytest.mark.integration
 def test_a_gate_keeps_the_full_steps_cost_report_for_the_next(likely):
     likely.full.write_text(_report({"test_a.py": 2.0, "test_c.py": 5.0}))
     assert ci_local.main(GATE) == 0
     assert json.loads(likely.history.read_text()) == json.loads(likely.full.read_text())
 
 
+@pytest.mark.integration
 def test_a_full_step_without_a_fresh_report_keeps_the_last_history(
         likely, tmp_path, monkeypatch):
     """A report not in cost_meter's shape, and one left in the tree by an
@@ -904,6 +932,7 @@ def scope(likely, monkeypatch):
 BASE = "abcdef1234567890abcdef1234567890abcdef12"
 
 
+@pytest.mark.integration
 def test_a_scoped_skip_runs_neither_the_step_nor_its_pre_pass(scope, capsys):
     scope.set_verdict(True)
     assert ci_local.main(GATE + ["--diff-base", BASE]) == 0
@@ -919,6 +948,7 @@ def test_a_scoped_skip_runs_neither_the_step_nor_its_pre_pass(scope, capsys):
     assert "[bootstrap] ritz0 unit tests" in summary
 
 
+@pytest.mark.integration
 def test_a_scoped_run_runs_the_step_and_says_why(scope, capsys):
     scope.set_verdict(False)
     assert ci_local.main(GATE + ["--diff-base", BASE]) == 0
@@ -928,6 +958,7 @@ def test_a_scoped_run_runs_the_step_and_says_why(scope, capsys):
     assert "running ritz0 unit tests: Y may reach it (base abcdef1)" in out
 
 
+@pytest.mark.integration
 def test_without_a_diff_base_nothing_is_scoped(scope, capsys):
     scope.set_verdict(True)
     assert ci_local.main(GATE) == 0
@@ -937,6 +968,7 @@ def test_without_a_diff_base_nothing_is_scoped(scope, capsys):
     assert "SKIPPED ritz0 unit tests" not in capsys.readouterr().out
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("argv", [
     GATE + ["--skip", "ritz0 unit tests"],
     ["--fail-fast", "--job", "build-all"],
@@ -947,6 +979,7 @@ def test_no_scope_check_when_the_step_would_not_run(scope, argv):
     assert scope.calls == []
 
 
+@pytest.mark.integration
 def test_a_real_scope_decision_on_a_real_repo(likely, tmp_path, capsys):
     """End to end through git: a docs-only change skips; a ritz0 change runs."""
     import subprocess

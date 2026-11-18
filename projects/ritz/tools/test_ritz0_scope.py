@@ -24,6 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ritz0_scope
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 # The tree at the base: a ritz project whose sources name some packages by
 # path (as ritz0's tests name harland, indium, cryptosec, ...) and one
 # Markdown file by basename, plus packages nothing names.

@@ -30,7 +30,7 @@ def _fake_clang(tmp_path: Path, monkeypatch, body: str) -> None:
     monkeypatch.setattr(cas, "_TARGET", None)
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_hung_clang_version_gives_up_within_the_bound(tmp_path, monkeypatch):
     # `sleep` without exec: a grandchild holds stdout open after the
     # shell is killed, so the fix must not read the pipe to EOF either.
@@ -43,7 +43,7 @@ def test_hung_clang_version_gives_up_within_the_bound(tmp_path, monkeypatch):
     assert tid.endswith("/clang-missing"), tid
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_clang_version_first_line_is_the_target(tmp_path, monkeypatch):
     _fake_clang(tmp_path, monkeypatch, "echo 'fake clang 99.0'; echo second")
     assert cas.target_id().endswith("/fake clang 99.0")
