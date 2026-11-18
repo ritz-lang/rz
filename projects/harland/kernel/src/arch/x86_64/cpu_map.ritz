@@ -7,18 +7,27 @@
 # larger EC2 instances and on AMD, so an APIC-ID index runs off a [16] array.
 #
 # MAX_CPUS is the one spelling of the CPU limit; CPUs past it are not used.
+# APIC IDs are 32 bits: x2APIC CPUs (MADT type 9) have IDs past 255 (#4184).
 # No imports, no hardware access: the host tests compile this module as is
 # (projects/ritz/ritz0/test_harland_cpu_map.py).
 
-pub const MAX_CPUS: i32 = 16
+pub const MAX_CPUS: i32 = 64
 
 # CPUs recorded from the MADT, and each one's Local APIC ID.
-# The array sizes are MAX_CPUS (array lengths must be literals).
+# The array sizes are MAX_CPUS (array lengths must be literals); so is
+# every other per-CPU array (sched's cpu_sched, apic's ap_stack_tops), and
+# test_harland_cpu_map.py checks they agree.
 pub var num_cpus: u32 = 0
-pub var cpu_apic_ids: [16]u32
+pub var cpu_apic_ids: [64]u32
 
 # Per-CPU "AP has started" flags, set by the AP itself (ap_entry).
-var cpu_started: [16]u8
+var cpu_started: [64]u8
+
+# MADT entry types that describe a CPU (ACPI 6.5, 5.2.12.2 and 5.2.12.12).
+const MADT_TYPE_LOCAL_APIC: u8 = 0      # 8 bytes: type, len, uid, apic_id(u8), flags(u32)
+const MADT_TYPE_LOCAL_X2APIC: u8 = 9    # 16 bytes: type, len, rsvd(2), x2apic_id(u32), flags(u32), uid(u32)
+# Flags: bit 0 Enabled, bit 1 Online Capable (either means the CPU can run).
+const MADT_CPU_USABLE: u32 = 3
 
 # Forget every CPU (before the MADT is parsed).
 pub fn cpu_map_reset() -> i32
@@ -39,6 +48,50 @@ pub fn cpu_map_add(apic_id: u32) -> i32
     cpu_started[idx] = 0
     num_cpus = num_cpus + 1
     return idx
+
+# A little-endian u32 at p (MADT entries are packed: no alignment).
+fn read_u32_le(p: *u8) -> u32
+    return (*p as u32) | ((*(p + 1) as u32) << 8) | ((*(p + 2) as u32) << 16) | ((*(p + 3) as u32) << 24)
+
+# Record the CPU a MADT entry describes: type 0 (Local APIC) or type 9
+# (Local x2APIC), if it is enabled or online-capable. Returns the CPU's
+# index, or -1 for any other entry, an unusable or short one, or once
+# MAX_CPUS are recorded. A CPU firmware lists twice (as type 0 and as
+# type 9) keeps its first index.
+pub fn cpu_map_add_madt_entry(entry: *u8) -> i32
+    let kind: u8 = *entry
+    let len: u8 = *(entry + 1)
+    var apic_id: u32 = 0
+    var flags: u32 = 0
+    if kind == MADT_TYPE_LOCAL_APIC
+        if len < 8
+            return -1
+        apic_id = *(entry + 3) as u32
+        flags = read_u32_le(entry + 4)
+    else if kind == MADT_TYPE_LOCAL_X2APIC
+        if len < 16
+            return -1
+        apic_id = read_u32_le(entry + 4)
+        flags = read_u32_le(entry + 8)
+    else
+        return -1
+    if (flags & MADT_CPU_USABLE) == 0
+        return -1
+    let known: i32 = cpu_index_of_apic_id(apic_id)
+    if known >= 0
+        return known
+    # CPUs past MAX_CPUS are refused (-1) and left unused.
+    return cpu_map_add(apic_id)
+
+# 1 if a recorded APIC ID doesn't fit xAPIC's 8-bit destination (only
+# x2APIC mode can send it an IPI), else 0.
+pub fn cpu_map_needs_x2apic() -> i32
+    var i: i32 = 0
+    while i < num_cpus as i32 && i < MAX_CPUS
+        if cpu_apic_ids[i] > 255
+            return 1
+        i = i + 1
+    return 0
 
 # The CPU index of the CPU with this APIC ID, or -1 if it isn't recorded.
 pub fn cpu_index_of_apic_id(apic_id: u32) -> i32
