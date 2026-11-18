@@ -2566,6 +2566,28 @@ def ritz_path_for_tests(caller_path: str) -> str:
 _HARNESS_SUMMARY = re.compile(r"(\d+) passed, (\d+) failed(?:, (\d+) errored)?")
 
 
+def failure_lines(stdout: str) -> list[str]:
+    """The "Failures:" block of a `ritz0 --test` report, one line each.
+
+    test_runner.run_files ends its report with "Failures:" and one
+    "  - <test fn>: exited with code N" (or "crashed with signal S",
+    "timeout") per failed test, its output indented under it. build.py
+    echoed only lines containing "FAIL" or "assertion", which none of those
+    contain, so a gate log said "7 passed, 1 failed" and never which test
+    or why (AGAST #4052). Lines lose the report's two-space indent.
+    """
+    lines: list[str] = []
+    in_block = False
+    for line in stdout.splitlines():
+        if line == "Failures:":
+            in_block, lines = True, []  # the last block wins
+        elif in_block and line.startswith("  "):
+            lines.append(line[2:])
+        elif in_block:
+            in_block = False
+    return lines
+
+
 def classify_test_file(returncode: int, stdout: str) -> tuple[str, int, int]:
     """Classify one `ritz0 --test <file>` run as (status, passed, failed).
 
@@ -2892,12 +2914,11 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
             err_first = err_blob.strip().splitlines()[-1] if err_blob.strip() else "(no output)"
         print(f"    ✗ {tfile.name} — {err_first[:200]}")
     elif status == "fail":
-        # Compiled and ran but some assertions failed: surface the failing
-        # harness messages.
+        # Compiled and ran but some tests failed: name each one and how it
+        # failed (AGAST #4052), from the report's "Failures:" block.
         print(f"    ✗ {tfile.name} — {file_passed} passed, {file_failed} failed")
-        for line in result.stdout.splitlines():
-            if "FAIL" in line or "assertion" in line.lower():
-                print(f"        {line}")
+        for line in failure_lines(result.stdout):
+            print(f"        {line}")
     else:
         print(f"    ✓ {tfile.name} — {file_passed} passed")
     return outcome

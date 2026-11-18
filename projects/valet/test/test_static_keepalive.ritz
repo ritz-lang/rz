@@ -15,14 +15,44 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.memory
+import ritzlib.fmt { fmt_i64_into }
 import ritzlib.async.tasks
 
 import lib.request
 import lib.static
 import lib.valet
 
+# /tmp/valet_<pid>_<name> into dst (NUL-terminated); returns dst.  The pid
+# keeps concurrent test runs off each other's files (AGAST #4052); ritzunit
+# forks each test, so each test gets its own.
+fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
+    let head: *u8 = c"/tmp/valet_"
+    let head_len: i64 = strlen(head)
+    memcpy(dst, head, head_len)
+    var i: i64 = head_len + fmt_i64_into(dst + head_len, sys_getpid() as i64)
+    *(dst + i) = '_'
+    i += 1
+    let name_len: i64 = strlen(name)
+    memcpy(dst + i, name, name_len)
+    *(dst + i + name_len) = 0
+    dst
+
+# This process's own fixture root, /tmp/valet_<pid>_static_ka (AGAST #4052).
+# A fixed /tmp path let two concurrent valet test runs (gate slots, compiler
+# variants) O_TRUNC each other's fixture between write and serve.
+var g_root: [128]u8
+
 fn static_root() -> *u8
-    c"/tmp/valet_test_static_ka"
+    pid_tmp_path(@g_root[0], c"static_ka")
+
+# static_root()/<name> into out (NUL-terminated).
+fn under_root(name: *u8, out: *u8)
+    let root_len: i64 = strlen(static_root())
+    memcpy(out, static_root(), root_len)
+    *(out + root_len) = '/'
+    let name_len: i64 = strlen(name)
+    memcpy(out + root_len + 1, name, name_len)
+    *(out + root_len + 1 + name_len) = 0
 
 fn contains(hay: *u8, len: i32, needle: StrView) -> i32
     var i: i32 = 0
@@ -39,14 +69,10 @@ fn contains(hay: *u8, len: i32, needle: StrView) -> i32
 # static_root()/dir/ for the directory listing.  0 on success.
 fn fixture(name: *u8) -> i32
     sys_mkdir(static_root(), 493)                     # 0755; EEXIST is fine
-    sys_mkdir(c"/tmp/valet_test_static_ka/dir", 493)
     var path: [256]u8
-    let root_len: i64 = strlen(static_root())
-    memcpy(@path[0], static_root(), root_len)
-    path[root_len] = '/'
-    let name_len: i64 = strlen(name)
-    memcpy(@path[0] + root_len + 1, name, name_len)
-    path[root_len + 1 + name_len] = 0
+    under_root(c"dir", @path[0])
+    sys_mkdir(@path[0], 493)
+    under_root(name, @path[0])
     # O_WRONLY | O_CREAT | O_TRUNC = 577, mode 0644 = 420
     let fd: i32 = sys_open3(@path[0], 577, 420)
     if fd < 0
@@ -56,6 +82,16 @@ fn fixture(name: *u8) -> i32
     if n != 6
         return 2
     0
+
+# Undo fixture(name): remove the file, dir/ and the root.  Deferred by each
+# test that builds a fixture, so a per-process root does not pile up in /tmp.
+fn teardown(name: *u8)
+    var path: [256]u8
+    under_root(name, @path[0])
+    sys_unlink(@path[0])
+    under_root(c"dir", @path[0])
+    sys_rmdir(@path[0])
+    sys_rmdir(static_root())
 
 # Drain `fd` into out[0..cap); returns bytes read.
 fn drain(fd: i32, out: *u8, cap: i32) -> i32
@@ -117,6 +153,7 @@ fn says_close(out: *u8, n: i32) -> i32
 
 [[test]]
 fn test_static_file_http10_client_gets_close() -> i32
+    defer teardown(c"a.txt")
     if fixture(c"a.txt") != 0
         return 90
     var buf: [2048]u8
@@ -129,6 +166,7 @@ fn test_static_file_http10_client_gets_close() -> i32
 
 [[test]]
 fn test_static_file_connection_close_gets_close() -> i32
+    defer teardown(c"b.txt")
     if fixture(c"b.txt") != 0
         return 90
     var buf: [2048]u8
@@ -139,6 +177,7 @@ fn test_static_file_connection_close_gets_close() -> i32
 
 [[test]]
 fn test_static_file_last_keepalive_request_gets_close() -> i32
+    defer teardown(c"c.txt")
     if fixture(c"c.txt") != 0
         return 90
     var buf: [2048]u8
@@ -150,6 +189,7 @@ fn test_static_file_last_keepalive_request_gets_close() -> i32
 
 [[test]]
 fn test_static_file_http11_keeps_alive() -> i32
+    defer teardown(c"d.txt")
     if fixture(c"d.txt") != 0
         return 90
     var buf: [2048]u8
@@ -199,6 +239,7 @@ fn test_static_304_keeps_alive() -> i32
 
 [[test]]
 fn test_static_directory_http10_client_gets_close() -> i32
+    defer teardown(c"dir/e.txt")
     if fixture(c"dir/e.txt") != 0
         return 90
     var buf: [8192]u8
@@ -237,13 +278,16 @@ fn test_static_404_keeps_alive_and_ends_at_body() -> i32
 # static_serve_file: the plain (no Range/ETag) variant.
 [[test]]
 fn test_static_serve_file_close_and_keep_alive() -> i32
+    defer teardown(c"f.txt")
     if fixture(c"f.txt") != 0
         return 90
+    var fpath: [256]u8
+    under_root(c"f.txt", @fpath[0])
     var buf: [1024]u8
     var p: [2]i32
     if sys_pipe(@p[0]) != 0
         return 91
-    static_serve_file(p[1], c"/tmp/valet_test_static_ka/f.txt", 0)
+    static_serve_file(p[1], @fpath[0], 0)
     sys_close(p[1])
     var n: i32 = drain(p[0], @buf[0], 1024)
     sys_close(p[0])
@@ -251,7 +295,7 @@ fn test_static_serve_file_close_and_keep_alive() -> i32
         return 1
     if sys_pipe(@p[0]) != 0
         return 92
-    static_serve_file(p[1], c"/tmp/valet_test_static_ka/f.txt", 1)
+    static_serve_file(p[1], @fpath[0], 1)
     sys_close(p[1])
     n = drain(p[0], @buf[0], 1024)
     sys_close(p[0])
@@ -266,6 +310,7 @@ fn test_static_serve_file_close_and_keep_alive() -> i32
 
 [[test]]
 fn test_static_416_keeps_alive() -> i32
+    defer teardown(c"h.txt")
     if fixture(c"h.txt") != 0
         return 90
     var buf: [1024]u8
@@ -282,6 +327,7 @@ fn test_static_416_keeps_alive() -> i32
 
 [[test]]
 fn test_static_416_last_keepalive_request_gets_close() -> i32
+    defer teardown(c"i.txt")
     if fixture(c"i.txt") != 0
         return 90
     var buf: [1024]u8
@@ -329,6 +375,7 @@ fn test_static_403_last_keepalive_request_gets_close() -> i32
 # A conditional GET that matches answers 304 through static_serve_file_full.
 [[test]]
 fn test_static_304_via_if_none_match_connection_close_gets_close() -> i32
+    defer teardown(c"g.txt")
     if fixture(c"g.txt") != 0
         return 90
     var buf: [1024]u8
