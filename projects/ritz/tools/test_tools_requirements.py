@@ -54,6 +54,7 @@ LOCAL_MODULES = {
     "example_tests",
     "exec_tmpdir",
     "likely_tests",
+    "python_deps",  # AGAST #2300
     "ritz0_scope",  # tools/ritz0_scope.py, the gate's diff scope (AGAST #4027)
     "ritz1_arch",
     "ritzlib_modules",
