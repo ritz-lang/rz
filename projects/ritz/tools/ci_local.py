@@ -91,8 +91,9 @@ runs the steps exactly as declared.
 Exit code: 0 only if every step it ran exited 0. A step that exits 3
 (EXIT_SETUP: `rz build --all` saying a toolchain binary is missing, e.g.
 lld-link, or the harland boot missing QEMU/OVMF/GRUB-EFI, AGAST #1845)
-is a SETUP ERROR: it does not trip --fail-fast, and if every failure
-was one the run exits 3 -- not 0 (nothing was verified) and not 1 (nothing
+is a SETUP ERROR -- unless the step runs pytest, whose 3 is INTERNALERROR
+(a crashed session) and counts as a failure (AGAST #3624). A SETUP ERROR
+does not trip --fail-fast, and if every failure was one the run exits 3 -- not 0 (nothing was verified) and not 1 (nothing
 regressed). Any other failure exits 1.
 """
 
@@ -128,6 +129,14 @@ DEFAULT_JOB = "bootstrap"
 # A step's exit code for "a toolchain binary is missing" -- rz's and
 # build.py's EXIT_SETUP (AGAST #2141).
 EXIT_SETUP = 3
+
+# pytest exits 3 too, for INTERNALERROR (a conftest or plugin crash), and a
+# step that runs it directly (`pytest ... | tee` under pipefail) passes that
+# straight through. Such a step's 3 is a crash, never a missing tool
+# (AGAST #3624). Matched on the command text, comments included: a false
+# match only makes a setup error count as a failure, the safe direction.
+# `make` steps need no rule: make turns a recipe's 3 into its own 2.
+PYTEST_COMMAND = re.compile(r"\bpytest\b")
 
 # The composite setup action, which pins clang (AGAST #1308; one action for
 # every job since #1838). It is a `uses:` step, so it has no command to run --
@@ -360,6 +369,13 @@ def run_step(step: Step, dry_run: bool = False) -> int:
                           cwd=cwd, env=env).returncode
 
 
+def is_setup_exit(step: Step, rc: int) -> bool:
+    """Whether `rc` is build.py's "a toolchain binary is missing" (EXIT_SETUP)
+    rather than a failure. Not for a step that runs pytest, whose 3 is
+    INTERNALERROR (see PYTEST_COMMAND)."""
+    return rc == EXIT_SETUP and not PYTEST_COMMAND.search(step.run)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     p.add_argument("--job", action="append", default=[],
@@ -438,7 +454,7 @@ def main(argv: list[str] | None = None) -> int:
             return
         rc, secs = timed_step(s, dry_run=args.dry_run)
         timings.append((s.name, secs, rc))
-        if rc == EXIT_SETUP:
+        if is_setup_exit(s, rc):
             # The machine's fault: no verdict on the code, so no fail-fast.
             setup_errors.append(f"[{s.job}] {s.name} (exit {rc})")
         elif rc != 0:

@@ -516,6 +516,50 @@ def test_setup_error_does_not_stop_fail_fast(tmp_path, monkeypatch, capsys):
     assert "[B] START" in capsys.readouterr().out
 
 
+# AGAST #3624: pytest exits 3 too -- INTERNALERROR, a conftest or plugin
+# crash. The ritz0 step passes it straight through (`pytest | tee` under
+# pipefail), so a crashed session read as "a missing tool", skipped
+# --fail-fast and ran the gate on for ~10 minutes.
+CRASHING_CONFTEST = "def pytest_collection_modifyitems(items):\n    raise RuntimeError('boom')\n"
+
+
+def test_pytest_internalerror_is_a_failure_not_a_setup_error(tmp_path, monkeypatch, capsys):
+    # A real pytest crash, not a stub: pins that pytest's code for it is
+    # the one build.py uses for a missing tool.
+    (tmp_path / "conftest.py").write_text(CRASHING_CONFTEST)
+    (tmp_path / "test_x.py").write_text("def test_x():\n    pass\n")
+    _two_jobs(tmp_path, monkeypatch,
+              a=f"'{sys.executable} -m pytest -q -p no:cacheprovider --disable-plugin-autoload'",
+              b="'true'")
+    assert ci_local.main(["--fail-fast", "--job", "alpha", "--job", "beta"]) == 1
+    out = capsys.readouterr().out
+    assert "failed:\n  - [alpha] A (exit 3)" in out and "SETUP ERROR" not in out
+    assert "[B] START" not in out  # --fail-fast stopped the gate
+
+
+def test_only_non_pytest_steps_can_report_a_setup_error():
+    def step(run):
+        return ci_local.Step(job="j", name="n", run=run, workdir=".")
+    assert ci_local.is_setup_exit(step("./rz build --all"), 3)
+    assert ci_local.is_setup_exit(step("bash projects/harland/boot/test.sh"), 3)
+    assert not ci_local.is_setup_exit(step("python -m pytest -q | tee r.txt"), 3)
+    assert not ci_local.is_setup_exit(step("set -e\npytest tools/"), 3)
+    assert not ci_local.is_setup_exit(step("./rz build --all"), 1)
+
+
+def test_real_ritz0_pytest_step_cannot_report_a_setup_error():
+    """The gate's pytest step and its likely-first pre-pass must read exit 3
+    as a crash; build-all's `rz build --all` keeps build.py's meaning."""
+    steps = ci_local.load_steps()
+    ritz0 = next(s for s in steps if s.name == ci_local.PYTEST_STEP)
+    assert not ci_local.is_setup_exit(ritz0, 3)
+    _, rest = ci_local.plan_likely_first([ritz0], [])
+    if rest is not None:
+        assert not ci_local.is_setup_exit(rest, 3)
+    build = next(s for s in steps if s.job == "build-all" and s.run.strip() == "./rz build --all")
+    assert ci_local.is_setup_exit(build, 3)
+
+
 def test_real_build_all_wrk_install_is_a_setup_step():
     """AGAST #2464: CI apt-installs wrk for smoke_stack's stack.wrk_index.
     That is runner setup: ci-local must skip it, not run sudo apt-get."""
