@@ -43,11 +43,6 @@ from trait_bounds import TraitImpls, bound_error
 from monomorph_rewrite import MonoRewriteMixin
 
 
-# Option and Result's payloads when no ritzlib.option / ritzlib.result defines
-# them (the compiler's built-ins): (enum, variant) -> index of its type arg.
-_BUILTIN_PAYLOADS = {('Option', 'Some'): 0, ('Result', 'Ok'): 0, ('Result', 'Err'): 1}
-
-
 class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
     """
     Monomorphizes generic code.
@@ -446,15 +441,9 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             self._visit_expr(expr.expr)
             if expr.ctor_type is not None:
                 self._visit_type(expr.ctor_type)   # its instance (#2437)
-            scrut_type = expr.ctor_type or self._type_of(expr.expr)
             for arm in expr.arms:
-                # AGAST #2725: `Some(x) => x[1..3]` -- x is the payload's type
-                # in this arm, so its slice/index/method sugar registers
-                # vec_slice<T> etc. as a let of that type would.  A later arm
-                # rebinding `x` overwrites it; no other local can reuse the
-                # name in this fn (the name checker refuses it), so nothing
-                # outside the arm reads the entry.
-                self.var_types.update(self._pattern_bindings(arm.pattern, scrut_type))
+                # `Some(x) => x[1..3]`: the table types `x` at the payload's
+                # type, per arm (AGAST #2725, #4099).
                 if arm.guard:
                     self._visit_expr(arm.guard)
                 self._visit_expr(arm.body)
@@ -514,46 +503,6 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
     def _visit_type_child(self, ty: rast.Type) -> rast.Type:
         self._visit_type(ty)
         return ty
-
-    def _variant_payload_types(self, scrut_type: Optional[rast.Type],
-                               variant: str) -> Optional[List[rast.Type]]:
-        """Payload types of `variant` of the scrutinee's enum, substituted at
-        its type args, or None when either is unknown."""
-        while isinstance(scrut_type, (rast.PtrType, rast.RefType)):
-            scrut_type = scrut_type.inner
-        if not isinstance(scrut_type, rast.NamedType):
-            return None
-        enum_def = self.enum_defs.get(scrut_type.name)
-        if enum_def is None:
-            idx = _BUILTIN_PAYLOADS.get((scrut_type.name, variant))
-            if idx is None or idx >= len(scrut_type.args):
-                return None
-            return [scrut_type.args[idx]]
-        for v in enum_def.variants:
-            if v.name != variant:
-                continue
-            if enum_def.type_params and scrut_type.args:
-                subst = TypeSubstitution(dict(zip(enum_def.type_params, scrut_type.args)))
-                return [subst.apply(f) for f in v.fields]
-            return list(v.fields)
-        return None
-
-    def _pattern_bindings(self, pattern: rast.Pattern,
-                          scrut_type: Optional[rast.Type]) -> Dict[str, rast.Type]:
-        """Names a match pattern binds, each at its payload's type (AGAST #2725).
-
-        Only what's known is returned: an untyped binding stays unrecorded, as
-        before, rather than guessed."""
-        out: Dict[str, rast.Type] = {}
-        if isinstance(pattern, rast.IdentPattern):
-            if scrut_type is not None:
-                out[pattern.name] = scrut_type
-        elif isinstance(pattern, rast.VariantPattern) and pattern.fields:
-            payload = self._variant_payload_types(scrut_type, pattern.name)
-            if payload is not None and len(payload) == len(pattern.fields):
-                for sub, ty in zip(pattern.fields, payload):
-                    out.update(self._pattern_bindings(sub, ty))
-        return out
 
     def _register_slice_instantiation(self, expr: rast.SliceExpr) -> None:
         """Register vec_slice<T> instantiation for slice expressions on Vec types."""
@@ -637,10 +586,6 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         node = entry[1] if entry is not None and entry[0] is expr else expr
         ty = self._typed.type_of(node) if self._typed is not None else None
         if ty is None or (isinstance(ty, rast.NamedType) and ty.name == 'unknown'):
-            # A name the table can't type (a pattern's payload binding, `Err(x)`)
-            # has the type its binding declared, if this walk recorded one.
-            if isinstance(expr, rast.Ident):
-                return self.var_types.get(expr.name)
             return None
         if self._instance_subst is not None:
             ty = self._instance_subst.apply(ty)

@@ -268,6 +268,52 @@ fn main() -> i32
     assert _name(table.type_of(_let_value(module, "y"))) == "u16"
 
 
+# A built-in Option / Result the checker doesn't declare (the emitter
+# instantiates it): its variant's payload is the scrutinee's type arg all the
+# same -- Some and Ok take T, Err takes E (AGAST #4099).
+BUILTIN_VARIANT_ROWS = [
+    ("Result<i32, Vec<u16>>", "Ok(x)", "i32"),
+    ("Result<i32, Vec<u16>>", "Err(x)", "Vec<u16>"),
+    ("@Result<i32, Vec<u16>>", "Result.Err(x)", "Vec<u16>"),
+    ("Option<Vec<u16>>", "Some(x)", "Vec<u16>"),
+]
+
+
+def _a_builtin_variant_pattern_binds_its_payload_at_the_scrutinees_args(
+        scrut, pattern, expected):
+    module = parse(VEC + f"""
+fn f(o: {scrut}) -> i32
+    match o
+        {pattern} =>
+            let y = x
+            0
+        _ => 1
+
+fn main() -> i32
+    0
+""")
+    table = typed.type_module(module)
+    assert _name(table.type_of(_let_value(module, "y"))) == expected
+
+
+def _monomorph_slices_an_err_payload_from_the_table_alone():
+    """`Err(x) => x.len()` of a Result<i32, Vec<u16>> instantiates
+    vec_len<u16> from the table's type for `x`: monomorph keeps no binding
+    types of its own to fall back on (AGAST #4099)."""
+    module = parse(VEC + """
+fn f(o: Result<i32, Vec<u16>>) -> i64
+    match o
+        Err(x) => x.len()
+        _ => 0
+
+fn main() -> i32
+    0
+""")
+    assert "vec_len$u16" in _fn_names(monomorphize(module))
+    assert not hasattr(monomorph.Monomorphizer, "_pattern_bindings")
+    assert "var_types" not in inspect.getsource(monomorph.Monomorphizer._type_of)
+
+
 def _an_undefined_structs_literal_still_types_its_values():
     """A built-in struct the checker doesn't declare (`Span`) is one monomorph
     knows: its literal's args bind from its values, so they are typed."""
@@ -317,6 +363,10 @@ def test_the_typing_pass_types_each_row():
     rows = [(f"{value} is {expected}",
              lambda v=value, x=expected: _a_generic_is_typed_at_its_type_args(v, x))
             for value, expected in GENERIC_ROWS]
+    rows += [(f"{pattern} of {scrut} binds {expected}",
+              lambda s=scrut, p=pattern, x=expected:
+              _a_builtin_variant_pattern_binds_its_payload_at_the_scrutinees_args(s, p, x))
+             for scrut, pattern, expected in BUILTIN_VARIANT_ROWS]
     rows += [(check.__name__.lstrip("_"), check) for check in (
         _an_option_or_result_predicate_is_a_bool,
         _a_vec_range_is_a_span_view_in_a_span_slot,
@@ -338,5 +388,6 @@ def test_monomorph_instantiates_each_row():
         _an_instance_body_is_typed_at_its_type_args,
         _monomorph_has_no_inferrers_of_its_own,
         _an_address_of_binds_t_as_a_pointer,
+        _monomorph_slices_an_err_payload_from_the_table_alone,
     )]
     assert _failures(rows) == []

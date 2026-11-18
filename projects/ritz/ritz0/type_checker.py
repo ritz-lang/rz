@@ -1806,9 +1806,14 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                                     sub_pat, subst.apply(field_type) if subst else field_type)
                             break
                     return
-            # An emitter-instantiated variant (`Err(e)`): payload type untracked
+            # An emitter-instantiated Option / Result (undeclared here): its
+            # payload is the scrutinee's type arg all the same, `Err(x)` of a
+            # Result<T, E> an E.  Monomorph reads it from the table: it has
+            # no binding types of its own to fall back on (AGAST #4099).
+            payload = self._builtin_variant_payload(pattern, expected_type)
             for sub_pat in pattern.fields:
-                self._check_pattern(sub_pat, rast.NamedType(pattern.span, 'unknown', []))
+                self._check_pattern(
+                    sub_pat, payload or rast.NamedType(pattern.span, 'unknown', []))
         elif isinstance(pattern, rast.StructPattern):
             struct_info = self.structs.get(pattern.name)
             if struct_info:
@@ -1819,6 +1824,22 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
 
 
+
+    # A built-in variant's payload: the index of its scrutinee's type arg.
+    BUILTIN_VARIANT_PAYLOADS = {('Option', 'Some'): 0, ('Result', 'Ok'): 0,
+                                ('Result', 'Err'): 1}
+
+    def _builtin_variant_payload(self, pattern: rast.VariantPattern,
+                                 expected_type: rast.Type) -> Optional[rast.Type]:
+        """`pattern`'s payload type when the scrutinee is a built-in Option /
+        Result with its type args (`Ok(x)` of Result<T, E> is T), else None."""
+        scrut = self._strip_indirection(expected_type)
+        if not isinstance(scrut, rast.NamedType):
+            return None
+        idx = self.BUILTIN_VARIANT_PAYLOADS.get((scrut.name, pattern.name))
+        if idx is None or idx >= len(scrut.args):
+            return None
+        return copy.copy(scrut.args[idx])
 
     def _error(self, message: str, span: Optional[rast.Span]):
         """Record a type error (reported under --check-types)."""
