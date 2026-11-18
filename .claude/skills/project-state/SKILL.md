@@ -28,7 +28,7 @@ It fetches `origin/main` (use `--no-fetch` to skip) and outputs JSON with:
 | `unmapped_projects` | `projects/*` dirs not in the layer map | fix the map first |
 | `ritz_parts_kloc`, `examples_kloc` | ritz1 / ritzlib split; the regression corpus (not counted as compiler) | table detail |
 | `python_kloc.ritz0` | Python that M1.4 retires (`tooling` is rz/scripts) | compiler detail |
-| `known_failures` | ritz0/ritz1 regression allowlists, matrix expected failures per compiler, `rz.toml` build excuses with their AGAST IDs | compiler, productivity rows |
+| `known_failures` | `known-failures/` (AGAST #1834): ritz0/ritz1 regression entries, matrix entries per compiler, build excuses with their AGAST IDs | compiler, productivity rows |
 | `pace` | commits and `ritz-task-N:` merges per month (committer date), last 7 days, today, total | pace chart |
 | `ci.jobs` | per job on `main`: latest conclusion and the last green SHA in the scanned runs | CI line, corrections |
 | `kernel.boot_gate_ci_files` | `.github` files that run qemu/OVMF; `[]` = **no boot gate** | kernel row |

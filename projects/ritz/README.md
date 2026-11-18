@@ -149,8 +149,8 @@ Until AGAST #1371 the matrix reported "53/53": it ran only the FIRST
 `[[test]]` fn of each of 53 hardcoded files — 53 of 560 test fns. It now runs
 every `[[test]]` fn of every file in `ritz0/test/`. Measured 2026-10-04, exit 0:
 `ritz0 550/564`, `ritz1 381/564`, `ritz1_selfhosted 381/564` (4 skipped on a
-host without SHA-NI). Every failure is listed in `EXPECTED_FAILURES` in
-`tools/run_regression_matrix.py` against its own AGAST ticket, and the list is
+host without SHA-NI). Every failure is listed in `known-failures/<agast>.toml`
+(`gate = "matrix"`) against its own AGAST ticket, and the list is
 strict-xpass — *exit 0 means "nothing unexpected", not "everything passes"*;
 read the gate's summary for the real counts.
 

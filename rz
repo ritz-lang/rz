@@ -24,7 +24,6 @@ Examples:
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +36,11 @@ RITZ_BUILD = WORKSPACE_ROOT / "projects" / "ritz" / "build.py"
 # The dependency resolver build.py uses (AGAST #1835). Standard library only,
 # so importing it does not load the compiler.
 sys.path.insert(0, str(RITZ_BUILD.parent))
+# known_failures: the one known-failures schema and outcome rule, shared with
+# the matrix, regression.sh, example_tests and check_doc_examples (AGAST #1834).
+sys.path.insert(0, str(RITZ_BUILD.parent / "tools"))
+import known_failures
+
 # manifest: the ritz.toml / rz.toml schema every manifest is loaded through
 # (AGAST #1837).
 import manifest
@@ -61,7 +65,7 @@ def discover_projects():
 
     A project id is the package directory relative to projects/, so
     top-level projects keep their bare names ("ritz", "lexis"), which is
-    what [ci.known_failing.build] and `rz build <name>` key on. A nested
+    what a `build` known-failures entry and `rz build <name>` key on. A nested
     member reads "ritz/ritzlib/tests", and a member outside projects/ reads
     "../bench/...". Every caller joins the id onto PROJECTS_DIR, so all three
     resolve the same way.
@@ -216,22 +220,13 @@ def child_env(project_name):
     return env
 
 
-def gate_outcome(failed, known_failing, ran):
-    """Classify an --all sweep against the known-failing list.
-
-    Returns (hard, known, xpass):
-      hard  — failed and NOT excused: these gate.
-      known — failed and excused in [ci.known_failing.*]: advisory, visible.
-      xpass — excused but PASSED: stale exclusion; gates too (strict), so
-              the list can only shrink. Entries not in `ran` are ignored
-              (a project filtered out of this sweep is not an xpass).
-    """
-    ran_set = set(ran)
-    failed_set = set(failed)
-    hard = [p for p in failed if p not in known_failing]
-    known = [p for p in failed if p in known_failing]
-    xpass = [p for p in known_failing if p in ran_set and p not in failed_set]
-    return hard, known, xpass
+def sweep_results(failed, ran):
+    """{project: "pass" | "fail"} for known_failures.outcome, failures first
+    and in `failed` order (the order the verdict lines print in)."""
+    results = {p: "fail" for p in failed}
+    for p in ran:
+        results.setdefault(p, "pass")
+    return results
 
 
 # AGAST #2141: build.py's exit code for "every failure was a missing tool"
@@ -240,29 +235,26 @@ def gate_outcome(failed, known_failing, ran):
 EXIT_SETUP = 3
 
 
-def summarize_gate(kind, failed, known_failing, ran, list_kind=None,
-                   setup=None):
+def summarize_gate(kind, failed, known_failing, ran, setup=None):
     """Print the end-of-sweep gate summary; return the process exit code.
 
     The known-failing list is deliberately NOT continue-on-error: excused
-    failures are printed with their justification (each carries an AGAST
-    task reference — enforced at load time by validate_known_failing and
-    again in tools/test_rz_cli.py), and an excused project that starts
-    passing fails the gate until it is delisted. Strict xpass forces stale
-    entries OUT; it does not prevent new entries being added — additions
-    are a review-time concern.
+    failures are printed with their justification (each cites its AGAST
+    task — enforced at load time by tools/known_failures.py), and an excused
+    project that starts passing fails the gate until it is delisted. Strict
+    xpass forces stale entries OUT; it does not prevent new entries being
+    added — additions are a review-time concern.
 
-    `list_kind` names which rz.toml table the excuses came from, when that
-    differs from the sweep kind (the test sweep consults the BUILD list —
-    see cmd_test for why there is no [ci.known_failing.test]).
+    Both sweeps read the `build` gate's entries (see cmd_test for why there
+    is no test-side excuse).
 
     `setup` names failed projects whose build exited EXIT_SETUP: a missing
     toolchain binary, the machine's fault (AGAST #2141). Unexcused, they are
     listed as SETUP ERROR rather than as failures, and alone make the exit
     EXIT_SETUP; any real failure or xpass still exits 1.
     """
-    list_kind = list_kind or kind
-    hard, known, xpass = gate_outcome(failed, known_failing, ran)
+    o = known_failures.outcome(known_failing, sweep_results(failed, ran))
+    hard, known, xpass = o.hard, list(o.known), o.xpass
     setup_set = set(setup or ())
     setup_err = [p for p in hard if p in setup_set]
     hard = [p for p in hard if p not in setup_set]
@@ -280,8 +272,8 @@ def summarize_gate(kind, failed, known_failing, ran, list_kind=None,
     for p in known:
         print(f"PKG KNOWN {p}: {known_failing[p]}", flush=True)
     for p in xpass:
-        print(f"PKG XPASS {p}: excused in [ci.known_failing.{list_kind}] "
-              f"but passed", flush=True)
+        print(f"PKG XPASS {p}: excused in {KNOWN_WHERE} but passed",
+              flush=True)
     for p in setup_err:
         print(f"PKG SETUP {p}: a missing tool, not a regression", flush=True)
     for p in hard:
@@ -290,16 +282,16 @@ def summarize_gate(kind, failed, known_failing, ran, list_kind=None,
     print(flush=True)
     if known:
         print(f"⚠ {len(known)} known-failing project(s) still failing "
-              f"(advisory, tracked in rz.toml [ci.known_failing.{list_kind}]):",
+              f"(advisory, tracked in {KNOWN_WHERE}):",
               flush=True)
         for p in known:
             print(f"    {p} — {known_failing[p]}", flush=True)
     if xpass:
         print(f"🎉 known-failing project(s) now PASS: {', '.join(xpass)}",
               flush=True)
-        print(f"    Remove them from [ci.known_failing.{list_kind}] in rz.toml "
-              f"(and close the task) — this gate fails until the list is "
-              f"accurate.", flush=True)
+        print("    Remove their entries from known-failures/<agast>.toml "
+              "(and close the task) — this gate fails until the list is "
+              "accurate.", flush=True)
     if setup_err:
         print(f"⚠ SETUP ERROR — not verified on this machine (a missing tool, "
               f"not a regression; see the project's log above): "
@@ -319,38 +311,22 @@ def summarize_gate(kind, failed, known_failing, ran, list_kind=None,
     return 0
 
 
-# An excuse must cite a tracking task by number. Enforced at runtime (below),
-# not only in pytest — `rz` itself refuses a malformed excuse rather than
-# honouring it.
-AGAST_REF_RE = re.compile(r"#\d+")
+# Where the build gate's excuses live, as the summary names it.
+KNOWN_WHERE = 'known-failures/ (gate = "build")'
 
 
-def validate_known_failing(kind, entries):
-    """Validate a [ci.known_failing.<kind>] table; exit(2) on malformed input.
+def known_failing_from_config():
+    """The `build` gate's excuses, {project: "AGAST #n: reason"}, from
+    known-failures/<agast>.toml via tools/known_failures.py (AGAST #1834).
 
-    Rules: the table must map project -> string reason, and every reason
-    must cite an AGAST task as `#<number>`. A bare '#' or a prose excuse
-    without a ticket is rejected — an unjustified exclusion is exactly the
-    fail-open this gate exists to remove.
+    The parser refuses an entry without a ticket, so `rz` refuses a
+    malformed excuse rather than honouring it: exit 2, naming the file.
     """
-    if not isinstance(entries, dict):
-        sys.exit(f"rz.toml [ci.known_failing.{kind}] must be a table of "
-                 f'project = "AGAST #<n> — reason" entries, '
-                 f"got: {entries!r}")
-    for project, reason in entries.items():
-        if not isinstance(reason, str) or not AGAST_REF_RE.search(reason):
-            sys.exit(f"rz.toml [ci.known_failing.{kind}] {project}: "
-                     f"justification must cite an AGAST task number "
-                     f"(e.g. 'AGAST #1321 — why'), got: {reason!r}")
-    return dict(entries)
-
-
-def known_failing_from_config(kind):
-    """Load [ci.known_failing.<kind>] from rz.toml as a validated
-    {project: reason} dict. Exits with an error on malformed entries."""
-    config = load_workspace_config()
-    entries = config.get("ci", {}).get("known_failing", {}).get(kind, {})
-    return validate_known_failing(kind, entries)
+    try:
+        return known_failures.known("build", "any")
+    except known_failures.KnownFailuresError as e:
+        print(f"rz: {e}", file=sys.stderr)
+        sys.exit(2)
 
 
 def run_build(project_name, extra_args=None):
@@ -702,7 +678,7 @@ def cmd_build(args):
         if jobs > 1:
             failed, setup = build_projects_parallel(projects, jobs, extra_args)
             return summarize_gate(
-                "build", failed, known_failing_from_config("build"), projects,
+                "build", failed, known_failing_from_config(), projects,
                 setup=setup)
         failed, setup = [], []
         for project in projects:
@@ -720,7 +696,7 @@ def cmd_build(args):
                 print(f"✗ {project}: build failed (exit {rc})", flush=True)
 
         return summarize_gate(
-            "build", failed, known_failing_from_config("build"), projects,
+            "build", failed, known_failing_from_config(), projects,
             setup=setup)
 
     if not args.project:
@@ -745,7 +721,8 @@ def cmd_test(args):
             failed = test_projects_parallel(projects, jobs, compiler)
         else:
             failed = serial_test_sweep(projects, extra_args, compiler)
-        # There is deliberately NO [ci.known_failing.test]. House rule
+        # There is deliberately NO test-side excuse (known_failures.py
+        # refuses gate = "test"). House rule
         # (scripts/regression.sh): an allowlist may say "this program is
         # known not to compile"; it must never excuse behavioural failure.
         # A test-side excuse would do exactly that. But a project that
@@ -757,8 +734,7 @@ def cmd_test(args):
         # re-exposes any genuine behavioural failure here. Every other
         # test failure gates, always.
         return summarize_gate(
-            "test", failed, known_failing_from_config("build"), projects,
-            list_kind="build")
+            "test", failed, known_failing_from_config(), projects)
 
     if not args.project:
         print("Error: Specify a project or use --all", file=sys.stderr)

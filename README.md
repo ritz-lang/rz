@@ -159,8 +159,9 @@ description than the table suggests, and two have known build failures:
 | **harland** | ✗ exit 1 locally | `bootx64` needs `lld`; see Prerequisites |
 | **tempest** | ✗ exit 1 | emitter indirection-depth bug, AGAST #1302 |
 
-`tempest` is excused in `rz.toml`'s `[ci.known_failing.build]`, so
-`./rz build --all` reports it as advisory rather than gating. Measured
+`tempest` was excused as a known build failure (excuses now live in
+`known-failures/`; tempest was delisted by #3609), so `./rz build --all`
+reported it as advisory rather than gating. Measured
 2026-09-12; every other project in `./rz list` built at exit 0. `lexis` has
 built since AGAST #3689 (2026-11-16), but its binary segfaults at startup
 (AGAST #3700).

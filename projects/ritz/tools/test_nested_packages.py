@@ -158,7 +158,7 @@ class TestRealWorkspace:
         # Strict-xpass only fires for a project that ran, so an excuse for a
         # deleted package is silently ignored and would outlive it forever.
         found = set(rz.discover_projects())
-        stale = sorted(set(rz.known_failing_from_config("build")) - found)
+        stale = sorted(set(rz.known_failing_from_config()) - found)
         assert stale == []
 
     def test_examples_are_left_to_regression_sh(self, rz):

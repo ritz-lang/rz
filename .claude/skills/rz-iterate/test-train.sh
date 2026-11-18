@@ -216,8 +216,12 @@ for d in projects/ritz projects/harland projects/harland/boot projects/ritzunit/
 done
 mkdir -p "$M/projects/prism/src"; echo x > "$M/projects/prism/src/main.ritz"
 touch "$M/projects/oldbad/FAIL" "$M/projects/lexis/FAIL"
-printf '%s\n' '[workspace.exclude]' '"projects/harland/boot" = "built by harland"' \
-    '[ci.known_failing.build]' 'lexis = "AGAST #1 - fake"' > "$M/rz.toml"
+printf '%s\n' '[workspace.exclude]' '"projects/harland/boot" = "built by harland"' > "$M/rz.toml"
+# lexis is excused the real way: the real parser, a fake ticket (AGAST #1834).
+mkdir -p "$M/projects/ritz/tools" "$M/known-failures"
+cp "$HERE/../../../projects/ritz/tools/known_failures.py" "$M/projects/ritz/tools/"
+printf '%s\n' '[[entry]]' 'gate = "build"' 'compiler = "any"' 'unit = "lexis"' \
+    'reason = "fake"' 'agast = 1' > "$M/known-failures/1.toml"
 git -C "$M" add -A; git -C "$M" commit -qm packages; git -C "$M" push -q origin HEAD:main
 printf '%s\n' '#!/usr/bin/env bash' 'echo "testing $1 in $PWD"; [[ ! -e "$1/FAIL" ]]' > "$T/pkgtest.sh"
 chmod +x "$T/pkgtest.sh"; export RZ_PKG_TEST="$T/pkgtest.sh"
@@ -295,7 +299,7 @@ for d in projects/ritzunit projects/ritz/ritzlib/tests projects/ritz/examples/ex
 done
 printf '%s\n' '[workspace]' 'members = ["projects/**", "bench/*"]' '[workspace.exclude]' \
     '"projects/harland/boot" = "built by harland"' '"projects/ritz/examples" = "regression.sh"' \
-    '[ci.known_failing.build]' 'lexis = "AGAST #1 - fake"' > "$M/rz.toml"
+    > "$M/rz.toml"
 git -C "$M" add -A; git -C "$M" commit -qm "workspace members"; git -C "$M" push -q origin HEAD:main
 all="bench/b1 projects/harland projects/lexis projects/oldbad projects/prism projects/ritz projects/ritz-lsp projects/ritz/ritzlib/tests projects/ritzunit projects/ritzunit/inventory "
 for f in projects/ritzunit/src/runner.ritz projects/ritz/ritz0/test_runner.py; do

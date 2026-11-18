@@ -21,7 +21,7 @@ Usage:
     python3 tools/check_doc_examples.py --list DOC.md      # no compiling
     python3 tools/check_doc_examples.py -v DOC.md          # per-block lines
     python3 tools/check_doc_examples.py --compiler ritz1 DOC.md
-                        # or ritz1_selfhosted; see COMPILERS, KNOWN_FAILURES
+                        # or ritz1_selfhosted; see COMPILERS, known_failures
 
 Under ritz1 and ritz1_selfhosted (AGAST #3928) every rule below holds but
 one: an ``expect-error`` block must be *refused* with a diagnostic (a crash
@@ -124,59 +124,28 @@ RITZ1_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.ll"
 # to exempt a block from one compiler; `no-compile` exempts it from all three
 # and says nothing about ritz1.
 #
-# Key: (compiler, document file name, block digest).  The digest is
-# `Block.digest` -- the first 12 hex of the block's SHA-256, fence attributes
-# included -- printed beside every failure.  It is not the line number, so an
-# edit elsewhere in the document does not invalidate the entry; an edit to the
-# block itself does, which is the point: the edited example has to be checked
-# again.  The line in the comment is where the block was when it was listed.
+# They are gate = "doc" entries in known-failures/<agast>.toml at the
+# workspace root, read and classified by tools/known_failures.py (AGAST
+# #1834; one file per ticket since #3963, so each fix deletes its own file):
+#
+#     [[entry]]
+#     gate = "doc"
+#     compiler = "ritz1"                     # or ritz1_selfhosted
+#     unit = "LANGUAGE_SPEC.md 065c93f07ee5" # document file name, block digest
+#     reason = "float literal exponents don't lex"
+#     agast = 3929
+#
+# The digest is `Block.digest` -- the first 12 hex of the block's SHA-256,
+# fence attributes included -- printed beside every failure.  It is not the
+# line number, so an edit elsewhere in the document does not invalidate the
+# entry; an edit to the block itself does, which is the point: the edited
+# example has to be checked again.  By convention a `# DOC.md:<line>` comment
+# above the entry says where the block was when it was listed.
 #
 # An entry is held to its claim: if the block passes under that compiler, or
 # no checked block has that digest, the run fails and names the stale entry.
-#
-# The entries live in tools/doc_known_failures/<ticket>.txt, one per line:
-#
-#     <compiler> <document file name> <digest> <reason, the rest of the line>
-#
-# The file name is the ticket, so the loaded reason is "#<ticket>: <reason>".
-# `#` lines are comments (by convention `# DOC.md:<line>`); blank lines are
-# ignored.  One file per ticket because each fix deletes its own entries: in
-# one shared list, neighbouring deletions conflicted in git (AGAST #3963).
-KNOWN_FAILURES_DIR = Path(__file__).resolve().parent / "doc_known_failures"
-KNOWN_FAILURE_COMPILERS = ("ritz1", "ritz1_selfhosted")
-_KNOWN_LINE_RE = re.compile(
-    r"(?P<compiler>\S+)\s+(?P<doc>\S+)\s+(?P<digest>[0-9a-f]{12})\s+(?P<reason>\S.*)")
-
-
-def load_known_failures(directory: Path) -> dict[tuple[str, str, str], str]:
-    """Read every <ticket>.txt under `directory` into KNOWN_FAILURES' shape.
-
-    Raises ValueError, naming file and line, on a file not named for a ticket,
-    a malformed line, a compiler outside the ritz1 family, or a key listed
-    twice."""
-    known: dict[tuple[str, str, str], str] = {}
-    for path in sorted(directory.glob("*.txt")):
-        if not path.stem.isdigit():
-            raise ValueError(f"{path.name}: name the file for its ticket, e.g. 3929.txt")
-        for n, line in enumerate(path.read_text().splitlines(), 1):
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            m = _KNOWN_LINE_RE.fullmatch(line)
-            if m is None or m["compiler"] not in KNOWN_FAILURE_COMPILERS:
-                raise ValueError(
-                    f"{path.name}:{n}: expected '<{'|'.join(KNOWN_FAILURE_COMPILERS)}> "
-                    f"<doc> <12-hex digest> <reason>', got {line!r}")
-            key = (m["compiler"], m["doc"], m["digest"])
-            if key in known:
-                raise ValueError(f"{path.name}:{n}: {key} is already listed")
-            known[key] = f"#{path.stem}: {m['reason'].rstrip()}"
-    return known
-
-
-KNOWN_FAILURES: dict[tuple[str, str, str], str] = load_known_failures(KNOWN_FAILURES_DIR)
-
-TICKET_RE = re.compile(r"(?:AGAST )?#\d+")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import known_failures as kf
 
 # Minimum length of a `no-compile` reason.  Not a real semantic check --
 # nothing can stop a determined person writing "because" twice -- but it
@@ -221,7 +190,7 @@ class Block:
 
     @property
     def digest(self) -> str:
-        """Stable identity of the block for KNOWN_FAILURES (AGAST #3928)."""
+        """Stable identity of the block for known_failures (AGAST #3928)."""
         payload = f"{self.info.strip()}\n{self.code}".encode()
         return hashlib.sha256(payload).hexdigest()[:12]
 
@@ -232,7 +201,7 @@ class Result:
     ok: bool
     detail: str = ""
     skipped: bool = False
-    known: str | None = None  # the KNOWN_FAILURES reason, when it applied
+    known: str | None = None  # the known-failures cite, when it applied
 
 
 @dataclass
@@ -669,9 +638,16 @@ def _indent_output(output: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def known_unit(block: Block) -> str:
+    """The block's key in a gate = "doc" known-failures entry."""
+    return f"{block.doc.name} {block.digest}"
+
+
 def run(docs: list[Path], jobs: int, verbose: bool, compiler: str = "ritz0",
-        known: dict[tuple[str, str, str], str] | None = None) -> Report:
-    known = KNOWN_FAILURES if known is None else known
+        known: dict[str, kf.Entry] | None = None) -> Report:
+    """`known` is {unit: Entry} for `compiler` (default: the checked-in
+    known-failures/, kf.entries_for("doc", compiler))."""
+    known = kf.entries_for("doc", compiler) if known is None else known
     blocks: list[Block] = []
     for doc in docs:
         blocks.extend(extract_blocks(doc))
@@ -693,46 +669,49 @@ def run(docs: list[Path], jobs: int, verbose: bool, compiler: str = "ritz0",
 
 
 def apply_known_failure(result: Result, compiler: str,
-                        known: dict[tuple[str, str, str], str]) -> Result:
-    """Hold a KNOWN_FAILURES entry to its claim (AGAST #3928).
+                        known: dict[str, kf.Entry]) -> Result:
+    """Hold a known-failures entry to its claim (AGAST #3928), by
+    known_failures.outcome, the one copy of the rule (AGAST #1834).
 
     A listed block that fails is reported as known, citing its ticket; a
     listed block that now passes fails the run, so the entry is deleted when
     the ritz1 bug is fixed rather than outliving it.
     """
     b = result.block
-    reason = known.get((compiler, b.doc.name, b.digest))
-    if reason is None or result.skipped:
+    unit = known_unit(b)
+    e = known.get(unit)
+    if e is None or result.skipped:
         return result
-    if result.ok:
+    o = kf.outcome([unit], {unit: "pass" if result.ok else "fail"})
+    if o.xpass:
         return Result(b, ok=False, detail=(
-            f"listed in KNOWN_FAILURES ({reason}) but it now passes under "
-            f"{compiler}. Delete the line '{compiler} {b.doc.name} {b.digest}' "
-            f"from {_known_file(reason)}."))
-    return Result(b, ok=True, known=reason, detail=result.detail)
+            f"listed in known-failures ({e.cite}) but it now passes under "
+            f"{compiler}. Delete the entry with compiler = \"{compiler}\", "
+            f"unit = \"{unit}\" from {_known_file(e)}."))
+    return Result(b, ok=True, known=e.cite, detail=result.detail)
 
 
-def _known_file(reason: str) -> str:
-    """The data file an entry with this loaded reason came from."""
-    m = re.match(r"#(\d+):", reason)
-    return f"tools/doc_known_failures/{m[1]}.txt" if m else "tools/doc_known_failures/"
+def _known_file(e: kf.Entry) -> str:
+    """The data file an entry came from, as a reader would find it."""
+    return f"known-failures/{e.agast}.toml"
 
 
 def stale_known_failures(blocks: list[Block], docs: list[Path], compiler: str,
-                         known: dict[tuple[str, str, str], str]) -> list[Result]:
+                         known: dict[str, kf.Entry]) -> list[Result]:
     """A failure Result per entry naming a checked doc but no block in it."""
-    present = {(b.doc.name, b.digest) for b in blocks}
+    present = {known_unit(b) for b in blocks}
     by_name = {d.name: d for d in docs}
     stale = []
-    for (comp, doc_name, digest), reason in sorted(known.items()):
-        if comp != compiler or doc_name not in by_name or (doc_name, digest) in present:
+    for unit, e in sorted(known.items()):
+        doc_name, _, digest = unit.partition(" ")
+        if doc_name not in by_name or unit in present:
             continue
         ghost = Block(doc=by_name[doc_name], line=0, code="")
         stale.append(Result(ghost, ok=False, detail=(
-            f"KNOWN_FAILURES entry ({comp!r}, {doc_name!r}, {digest!r}) -- {reason} -- "
+            f"known-failures entry ({compiler!r}, {doc_name!r}, {digest!r}) -- {e.cite} -- "
             f"matches no block in {doc_name}: the block was edited or removed. "
             f"Re-check it under {compiler} and re-key or delete the entry in "
-            f"{_known_file(reason)}.")))
+            f"{_known_file(e)}.")))
     return stale
 
 

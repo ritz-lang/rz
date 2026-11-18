@@ -101,7 +101,7 @@ room until the current one is merged, pushed, and verified.
    Then for each project `P`: `./rz test P`
 
    **Compare against `main`, not against zero.** Several projects have
-   pre-existing compile failures (see `rz.toml [ci.known_failing.build]` and
+   pre-existing compile failures (see `known-failures/`, gate `build` and
    the CI `test-all` set). A residual failure is only acceptable if it is
    present on `main` too, so run the same command on both sides and diff the
    counts. "N failed" is not a verdict; "N failed on both sides" is.

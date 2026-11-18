@@ -18,17 +18,16 @@ What broke and what these tests pin down:
 
 2. The gate itself: build-all/test-all had been red for 12+ runs, which is
    a disabled gate. The replacement is an explicit, named, per-project
-   known-failing list in rz.toml ([ci.known_failing.build] ONLY — there is
-   deliberately no .test list; see TestKnownFailingConfig), each entry
-   mapping project -> justification citing an AGAST task, validated by rz
-   at load time. `gate_outcome` is the pure classification: hard failures
-   gate, known failures are advisory-but-visible, and a known-failing
-   project that PASSES also gates (strict xpass — stale entries are forced
-   out; new entries are a review-time concern).
+   known-failing list: `gate = "build"` entries in known-failures/ (there
+   is deliberately no test gate), each citing an AGAST task, validated at
+   load time by tools/known_failures.py, whose `outcome` is the one
+   classification (AGAST #1834): hard failures gate, known failures are
+   advisory-but-visible, and a known-failing project that PASSES also gates
+   (strict xpass — stale entries are forced out; new entries are a
+   review-time concern).
 """
 
 import importlib.util
-import re
 import sys
 from pathlib import Path
 
@@ -36,9 +35,6 @@ import pytest
 
 # rz is an extensionless executable script three levels up from tools/.
 RZ_PATH = Path(__file__).resolve().parents[3] / "rz"
-
-# A justification must cite a task NUMBER. A bare "#" is not a reference.
-AGAST_REF = re.compile(r"#\d+")
 
 
 @pytest.fixture(scope="module")
@@ -85,119 +81,58 @@ class TestChildEnv:
 
 
 @pytest.mark.unit
-class TestGateOutcome:
-    def test_all_green(self, rz):
-        hard, known, xpass = rz.gate_outcome(
-            failed=[], known_failing={}, ran=["a", "b"]
-        )
-        assert (hard, known, xpass) == ([], [], [])
-
-    def test_unlisted_failure_gates(self, rz):
-        hard, known, xpass = rz.gate_outcome(
-            failed=["b"], known_failing={}, ran=["a", "b"]
-        )
-        assert hard == ["b"]
-        assert known == []
-        assert xpass == []
-
-    def test_known_failure_is_advisory(self, rz):
-        hard, known, xpass = rz.gate_outcome(
-            failed=["b"], known_failing={"b": "AGAST #0 why"}, ran=["a", "b"]
-        )
-        assert hard == []
-        assert known == ["b"]
-        assert xpass == []
-
-    def test_known_failing_that_passes_is_flagged(self, rz):
-        # Strict xpass: a stale exclusion must be removed, not accumulate.
-        hard, known, xpass = rz.gate_outcome(
-            failed=[], known_failing={"b": "AGAST #0 why"}, ran=["a", "b"]
-        )
-        assert hard == []
-        assert known == []
-        assert xpass == ["b"]
-
-    def test_known_failing_not_run_is_ignored(self, rz):
-        # Listing a project that wasn't in this sweep (e.g. filtered out)
-        # must not produce a phantom xpass.
-        hard, known, xpass = rz.gate_outcome(
-            failed=[], known_failing={"zzz": "AGAST #0 why"}, ran=["a"]
-        )
-        assert xpass == []
-
-    def test_mixed(self, rz):
-        hard, known, xpass = rz.gate_outcome(
-            failed=["a", "b"],
-            known_failing={"b": "AGAST #1 x", "c": "AGAST #2 y"},
-            ran=["a", "b", "c", "d"],
-        )
-        assert hard == ["a"]
-        assert known == ["b"]
-        assert xpass == ["c"]
-
-
-@pytest.mark.unit
-class TestKnownFailingValidation:
-    """Validation lives in rz itself (validate_known_failing) — rz refuses
-    a malformed excuse at runtime rather than honouring it. These tests
-    exercise that seam with FIXED inputs, so they are non-vacuous even
-    when the workspace list is empty (a previous revision iterated over
-    the real rz.toml, which had no [ci] section — the loop ran zero times
-    and the 'enforcement' could never fail)."""
-
-    @pytest.mark.parametrize(
-        "bad_reason",
-        [
-            "no ticket reference at all",
-            "#",  # a bare hash is not a task number
-            "see the tracker",
-            "",
-        ],
-    )
-    def test_excuse_without_agast_number_is_rejected(self, rz, bad_reason):
-        with pytest.raises(SystemExit):
-            rz.validate_known_failing("build", {"proj": bad_reason})
-
-    def test_non_string_reason_is_rejected(self, rz):
-        with pytest.raises(SystemExit):
-            rz.validate_known_failing("build", {"proj": 1321})
-
-    def test_non_dict_table_is_rejected(self, rz):
-        with pytest.raises(SystemExit):
-            rz.validate_known_failing("build", ["proj"])
-
-    def test_valid_excuse_is_accepted(self, rz):
-        good = {"proj": "AGAST #1321 — compile failures, tracked"}
-        assert rz.validate_known_failing("build", good) == good
-
-
-@pytest.mark.unit
 class TestKnownFailingConfig:
-    def test_workspace_build_list_validates(self, rz):
-        # The real rz.toml must load through the same runtime validation:
-        # every entry is project -> reason citing an AGAST task number.
-        entries = rz.known_failing_from_config("build")
-        assert isinstance(entries, dict)
-        for project, reason in entries.items():
-            assert AGAST_REF.search(reason), (
-                f"[ci.known_failing.build] {project}: justification must "
-                f"cite an AGAST task number, got: {reason!r}"
-            )
+    """rz reads its excuses through tools/known_failures.py, the one parser
+    and outcome rule (AGAST #1834). The rules themselves (AGAST id, no test
+    gate, strict xpass) are pinned once, in tools/test_known_failures.py;
+    these pin that rz is wired to them."""
 
-    def test_no_test_side_excuse_list_exists(self, rz):
-        # Deliberate design decision (house rule, scripts/regression.sh):
-        # an allowlist may say "known not to compile"; it must never
-        # excuse behavioural failure. The test sweep therefore consults
-        # the BUILD list only (see cmd_test). If someone adds
-        # [ci.known_failing.test], this fails and points them at the rule.
-        config = rz.load_workspace_config()
-        kf = config.get("ci", {}).get("known_failing", {})
-        assert "test" not in kf, (
-            "[ci.known_failing.test] must not exist: excusing a test "
-            "result excuses behavioural failure, which the house rule in "
-            "scripts/regression.sh forbids. Compile-broken projects are "
-            "already excused via [ci.known_failing.build]."
-        )
+    @staticmethod
+    def _kf_dir(tmp_path, monkeypatch, text):
+        (tmp_path / "7.toml").write_text(text)
+        monkeypatch.setenv("RITZ_KNOWN_FAILURES", str(tmp_path))
+
+    def test_build_entries_are_the_excuses(self, rz, tmp_path, monkeypatch):
+        self._kf_dir(tmp_path, monkeypatch,
+                     '[[entry]]\ngate = "build"\ncompiler = "any"\nunit = "lexis"\n'
+                     'reason = "why"\nagast = 7\n'
+                     '[[entry]]\ngate = "matrix"\ncompiler = "ritz1"\nunit = "t"\n'
+                     'reason = "not rz\'s"\nagast = 7\n')
+        assert rz.known_failing_from_config() == {"lexis": "AGAST #7: why"}
+
+    def test_a_malformed_excuse_stops_rz(self, rz, tmp_path, monkeypatch, capsys):
+        # No ticket: rz refuses rather than honouring it.
+        self._kf_dir(tmp_path, monkeypatch,
+                     '[[entry]]\ngate = "build"\ncompiler = "any"\nunit = "lexis"\n'
+                     'reason = "why"\n')
+        with pytest.raises(SystemExit) as e:
+            rz.known_failing_from_config()
+        assert e.value.code == 2
+        assert "7.toml" in capsys.readouterr().err
+
+    def test_the_real_list_loads(self, rz):
+        assert isinstance(rz.known_failing_from_config(), dict)
+
+    def test_summary_classifies_with_the_shared_outcome(self, rz, monkeypatch):
+        calls = []
+        real = rz.known_failures.outcome
+
+        def spy(*a, **k):
+            calls.append(a)
+            return real(*a, **k)
+        monkeypatch.setattr(rz.known_failures, "outcome", spy)
+        rz.summarize_gate("build", ["a"], {}, ["a"])
+        assert calls
+
+    def test_a_synthetic_xpass_fails_both_sweeps(self, rz, tmp_path, monkeypatch):
+        """#1834 acceptance: an excused project that builds fails the gate,
+        through the real loader, for the build and the test sweep."""
+        self._kf_dir(tmp_path, monkeypatch,
+                     '[[entry]]\ngate = "build"\ncompiler = "any"\nunit = "a"\n'
+                     'reason = "why"\nagast = 7\n')
+        for kind in ("build", "test"):
+            assert rz.summarize_gate(kind, [], rz.known_failing_from_config(),
+                                     ["a", "b"]) == 1
 
     def test_gate_summary_exit_codes(self, rz):
         # summarize_gate returns the job exit code: hard failures and
@@ -247,12 +182,11 @@ class TestKnownFailingConfig:
         assert setup == ["harland"]
 
     def test_gate_summary_names_the_source_list(self, rz, capsys):
-        # The test sweep borrows the BUILD list; the summary must point
-        # readers at the table the excuse actually lives in.
-        rz.summarize_gate("test", ["a"], {"a": "AGAST #0 x"}, ["a"], list_kind="build")
+        # The test sweep borrows the BUILD entries; the summary must point
+        # readers at where the excuse actually lives.
+        rz.summarize_gate("test", ["a"], {"a": "AGAST #0 x"}, ["a"])
         out = capsys.readouterr().out
-        assert "[ci.known_failing.build]" in out
-        assert "[ci.known_failing.test]" not in out
+        assert 'known-failures/ (gate = "build")' in out
 
     def test_gate_summary_has_one_verdict_line_per_package(self, rz, capsys):
         # AGAST #3969: the room gate runs `rz test --all`, and its log must
@@ -263,14 +197,14 @@ class TestKnownFailingConfig:
         rz.summarize_gate("test", ["bad", "old", "nomake"],
                           {"old": "AGAST #1 compile", "stale": "AGAST #2"},
                           ["ok", "bad", "old", "stale", "nomake", "ok2"],
-                          list_kind="build", setup=["nomake"])
+                          setup=["nomake"])
         pkg = [line for line in capsys.readouterr().out.splitlines()
                if line.startswith("PKG ")]
         assert pkg == [
             "PKG PASS ok",
             "PKG PASS ok2",
             "PKG KNOWN old: AGAST #1 compile",
-            "PKG XPASS stale: excused in [ci.known_failing.build] but passed",
+            'PKG XPASS stale: excused in known-failures/ (gate = "build") but passed',
             "PKG SETUP nomake: a missing tool, not a regression",
             "PKG FAIL bad",
         ], pkg

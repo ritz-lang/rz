@@ -117,7 +117,7 @@ this machine because `lld` is not installed —
 `Cannot link UEFI target 'bootx64': lld-link not found`. The kernel half
 (`harland.elf`) links fine; only `bootx64` needs lld. This is an environment
 gap, not a code defect, which is why harland is deliberately *not* listed in
-`rz.toml`'s `[ci.known_failing.build]` — CI installs lld and expects harland to
+`known-failures/` — CI installs lld and expects harland to
 pass. Install `lld` and the build goes green.
 
 ## License

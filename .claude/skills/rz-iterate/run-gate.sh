@@ -130,7 +130,7 @@
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
 #     passed a bootstrap-only gate, and main's build-all was red for 9 runs.
-#     `rz build --all` honours rz.toml [ci.known_failing.build].  A missing
+#     `rz build --all` honours the `build` known-failures.  A missing
 #     toolchain binary (harland's bootx64 without lld-link) is reported as
 #     SETUP ERROR (ci_local exit 3; make turns it into 2): not a pass, not a
 #     regression.  --wait prints the line; install the tool and re-gate.

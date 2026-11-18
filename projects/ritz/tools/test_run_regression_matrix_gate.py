@@ -18,13 +18,14 @@ ritz1_selfhosted. The summary printed
 
 and the command exited 0.
 
-The classification mirrors `rz`'s gate_outcome (rz:135), deliberately, because
-that is the discipline the workspace already settled on for build/test sweeps:
+The classification is tools/known_failures.py's outcome(), the one copy of
+the rule every gate uses (AGAST #1834); these tests pin the matrix's wiring
+of it (CPU skips, file vs file::fn keys, per-compiler lists, the exit code):
 
-  hard  — failed and NOT expected. Fails the gate.
-  known — failed and listed in EXPECTED_FAILURES. Advisory, printed with its
-          AGAST reference so it stays visible.
-  xpass — listed in EXPECTED_FAILURES but PASSED. Also fails the gate.
+  hard  — failed and NOT excused. Fails the gate.
+  known — failed and listed in known-failures/<agast>.toml. Advisory, printed
+          with its AGAST reference so it stays visible.
+  xpass — listed but PASSED. Also fails the gate.
 
 The xpass half is the part that keeps the list from rotting. scripts/regression.sh
 carried the same check for years as a warn() that changed nothing, and two
@@ -33,6 +34,7 @@ syntax migration (#1365). A list that cannot go red is a list nobody edits.
 """
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,7 @@ def _load():
 
 
 matrix = _load()
+kf = sys.modules["known_failures"]
 
 
 def _results(**kw):
@@ -55,32 +58,29 @@ def _results(**kw):
     return {name: (status, 0 if status == "pass" else 1, "") for name, status in kw.items()}
 
 
+def _classify(results, known):
+    o = matrix.classify(results, known)
+    return o.hard, sorted(o.known), o.xpass
+
+
+def _entry(compiler, unit, agast=1370):
+    return kf.Entry("matrix", compiler, unit, "why", agast, Path(f"{agast}.toml"))
+
+
 @pytest.mark.unit
 def test_all_passing_is_green():
-    hard, known, xpass = matrix.matrix_outcome(
-        "ritz1", _results(a="pass", b="pass"), {}
-    )
-    assert (hard, known, xpass) == ([], [], [])
+    assert _classify(_results(a="pass", b="pass"), []) == ([], [], [])
 
 
 @pytest.mark.unit
 def test_an_unexpected_failure_is_hard():
     """The case that was silently exiting 0."""
-    hard, known, xpass = matrix.matrix_outcome(
-        "ritz1", _results(a="pass", b="compile-fail"), {}
-    )
-    assert hard == ["b"]
-    assert known == [] and xpass == []
+    assert _classify(_results(a="pass", b="compile-fail"), []) == (["b"], [], [])
 
 
 @pytest.mark.unit
 def test_an_expected_failure_is_advisory_not_hard():
-    hard, known, xpass = matrix.matrix_outcome(
-        "ritz1", _results(a="pass", b="compile-fail"), {("ritz1", "b"): "AGAST #1370"}
-    )
-    assert hard == []
-    assert known == ["b"]
-    assert xpass == []
+    assert _classify(_results(a="pass", b="compile-fail"), ["b"]) == ([], ["b"], [])
 
 
 @pytest.mark.unit
@@ -88,76 +88,72 @@ def test_expected_failure_is_per_compiler():
     """An entry for ritz1 must not excuse ritz1_selfhosted.
 
     ritz1 and its self-compiled twin disagreeing is a self-hosting bug, and
-    regression.sh's allowlist header says such a divergence must go red rather
-    than be recorded. Keying the excuse by (compiler, test) keeps that true
-    here: excusing one does not excuse the other.
+    must go red rather than be recorded. Keying the excuse by (compiler, unit)
+    keeps that true here: excusing one does not excuse the other.
     """
-    expected = {("ritz1", "b"): "AGAST #1370"}
-    hard, _, _ = matrix.matrix_outcome("ritz1_selfhosted", _results(b="compile-fail"), expected)
-    assert hard == ["b"], "a ritz1 excuse leaked into ritz1_selfhosted"
+    outcomes = matrix.classify_all(
+        {"ritz1": _results(b="compile-fail"), "ritz1_selfhosted": _results(b="compile-fail")},
+        [_entry("ritz1", "b")])
+    assert outcomes["ritz1"].hard == []
+    assert outcomes["ritz1_selfhosted"].hard == ["b"], "a ritz1 excuse leaked into ritz1_selfhosted"
 
 
 @pytest.mark.unit
 def test_an_expected_failure_that_passes_is_xpass():
     """Strict-xpass: the entry must be deleted, and until it is, the gate is red."""
-    hard, known, xpass = matrix.matrix_outcome(
-        "ritz1", _results(b="pass"), {("ritz1", "b"): "AGAST #1370"}
-    )
-    assert xpass == ["b"]
-    assert hard == [] and known == []
+    assert _classify(_results(b="pass"), ["b"]) == ([], [], ["b"])
 
 
 @pytest.mark.unit
 def test_xpass_for_a_test_that_did_not_run_is_not_reported():
     """Filtering with --tests must not turn every unselected entry into an xpass."""
-    hard, known, xpass = matrix.matrix_outcome(
-        "ritz1", _results(a="pass"), {("ritz1", "not_selected"): "AGAST #1370"}
-    )
-    assert (hard, known, xpass) == ([], [], [])
+    assert _classify(_results(a="pass"), ["not_selected"]) == ([], [], [])
 
 
 @pytest.mark.unit
 def test_exit_code_is_nonzero_for_hard_and_xpass_only():
-    assert matrix.matrix_exit_code({"ritz1": ([], [], [])}) == 0
-    assert matrix.matrix_exit_code({"ritz1": (["b"], [], [])}) != 0
-    assert matrix.matrix_exit_code({"ritz1": ([], ["b"], [])}) == 0, (
+    O = kf.Outcome
+    assert matrix.matrix_exit_code({"ritz1": O([], {}, [])}) == 0
+    assert matrix.matrix_exit_code({"ritz1": O(["b"], {}, [])}) != 0
+    assert matrix.matrix_exit_code({"ritz1": O([], {"b": "b"}, [])}) == 0, (
         "a known failure is advisory and must not fail the gate"
     )
-    assert matrix.matrix_exit_code({"ritz1": ([], [], ["b"])}) != 0, (
+    assert matrix.matrix_exit_code({"ritz1": O([], {}, ["b"])}) != 0, (
         "an expected failure that starts passing must fail the gate"
     )
     assert matrix.matrix_exit_code(
-        {"ritz0": ([], [], []), "ritz1": (["b"], [], [])}
+        {"ritz0": O([], {}, []), "ritz1": O(["b"], {}, [])}
     ) != 0, "a failure in any compiler must fail the gate"
 
 
 @pytest.mark.unit
-def test_every_expected_failure_entry_names_an_agast_task():
-    """Same rule rz.toml enforces for [ci.known_failing.*].
-
-    An excuse without a ticket is an excuse nobody will ever revisit.
-    """
-    for key, reason in matrix.EXPECTED_FAILURES.items():
-        assert "AGAST #" in reason, f"{key} has no AGAST reference: {reason!r}"
+def test_a_synthetic_xpass_in_the_checked_in_format_fails_the_gate(tmp_path, monkeypatch):
+    """End to end through the real loader: an entry in a known-failures dir
+    (RITZ_KNOWN_FAILURES) for a cell that passes makes the matrix exit 1, and
+    the same cell failing is advisory (exit 0)."""
+    (tmp_path / "9999.toml").write_text(
+        '[[entry]]\ngate = "matrix"\ncompiler = "ritz1"\nunit = "f"\n'
+        'reason = "synthetic"\nagast = 9999\n')
+    monkeypatch.setenv("RITZ_KNOWN_FAILURES", str(tmp_path))
+    passing = matrix.classify_all({"ritz1": _results(**{"f::a": "pass"})})
+    assert passing["ritz1"].xpass == ["f"]
+    assert matrix.matrix_exit_code(passing) == 1
+    failing = matrix.classify_all({"ritz1": _results(**{"f::a": "link-fail"})})
+    assert failing["ritz1"].known == {"f::a": "f"}
+    assert matrix.matrix_exit_code(failing) == 0
 
 
 @pytest.mark.unit
-def test_every_expected_failure_entry_names_a_real_test_and_compiler():
-    """Guards the other rot direction: an entry for a test that no longer
-    exists, or for a compiler name with a typo, would sit here forever
-    excusing nothing while looking like diligence."""
-    valid_compilers = {"ritz0", "ritz1", "ritz1_selfhosted"}
-    discovered = set(matrix.discover_test_files())
-    for compiler, key in matrix.EXPECTED_FAILURES:
-        assert compiler in valid_compilers, f"unknown compiler {compiler!r}"
-        file_name, _, fn = key.partition("::")
-        assert file_name in discovered, (
-            f"{key!r} is excused but {file_name}.ritz is not a discovered test file"
-        )
-        if fn:
-            src = (matrix.TEST_DIR / f"{file_name}.ritz").read_text()
-            units = matrix.units_for(file_name, src)
-            assert key in units, f"{key!r} is excused but is not a unit of {file_name}: {units}"
+def test_every_fn_level_matrix_entry_names_a_real_unit():
+    """known_failures checks an entry's file exists; a `file::fn` key must also
+    be a unit the matrix runs, or it excuses nothing while looking diligent."""
+    for e in kf.load():
+        if e.gate != "matrix" or "::" not in e.unit:
+            continue
+        file_name = e.unit.partition("::")[0]
+        src = (matrix.TEST_DIR / f"{file_name}.ritz").read_text()
+        units = matrix.units_for(file_name, src)
+        assert e.unit in units, f"{e.unit!r} is excused but is not a unit of {file_name}: {units}"
 
 
 # ---------------------------------------------------------------------------
@@ -280,24 +276,21 @@ def test_not_tests_entries_really_have_nothing_to_run():
 @pytest.mark.unit
 def test_fn_level_failure_is_hard_even_when_a_sibling_is_excused():
     results = _results(**{"f::a": "pass", "f::b": "bad-exit", "f::c": "bad-exit"})
-    hard, known, xpass = matrix.matrix_outcome(
-        "ritz1", results, {("ritz1", "f::b"): "AGAST #1"}
-    )
-    assert hard == ["f::c"] and known == ["f::b"] and xpass == []
+    assert _classify(results, ["f::b"]) == (["f::c"], ["f::b"], [])
 
 
 @pytest.mark.unit
 def test_file_level_entry_excuses_build_failures_of_every_unit():
     results = _results(**{"f::a": "compile-fail", "f::b": "compile-fail"})
-    hard, known, xpass = matrix.matrix_outcome("ritz1", results, {("ritz1", "f"): "AGAST #1"})
-    assert hard == [] and known == ["f::a", "f::b"] and xpass == []
+    o = matrix.classify(results, ["f"])
+    assert o.hard == [] and o.known == {"f::a": "f", "f::b": "f"} and o.xpass == []
 
 
 @pytest.mark.unit
 def test_file_level_entry_does_not_excuse_runtime_failures():
     """Otherwise one file-level line becomes a bulk allowlist for every fn."""
     results = _results(**{"f::a": "pass", "f::b": "bad-exit"})
-    hard, known, xpass = matrix.matrix_outcome("ritz1", results, {("ritz1", "f"): "AGAST #1"})
+    hard, _known, xpass = _classify(results, ["f"])
     assert hard == ["f::b"]
     assert xpass == ["f"], "the file now builds, so its file-level entry is stale"
 
@@ -305,16 +298,18 @@ def test_file_level_entry_does_not_excuse_runtime_failures():
 @pytest.mark.unit
 def test_fn_level_entry_xpasses_when_that_fn_passes():
     results = _results(**{"f::a": "pass", "f::b": "pass"})
-    _, _, xpass = matrix.matrix_outcome("ritz1", results, {("ritz1", "f::b"): "AGAST #1"})
+    _, _, xpass = _classify(results, ["f::b"])
     assert xpass == ["f::b"]
 
 
 @pytest.mark.unit
-def test_excuse_for_names_the_matching_entry():
-    exp = {("ritz1", "f"): "file", ("ritz1", "g::b"): "fn"}
-    assert matrix.excuse_for("ritz1", "f::a", "compile-fail", exp) == ("ritz1", "f")
-    assert matrix.excuse_for("ritz1", "g::b", "bad-exit", exp) == ("ritz1", "g::b")
-    assert matrix.excuse_for("ritz1", "f::a", "bad-exit", exp) is None
+def test_known_names_the_matching_entry():
+    """The summary's ⚠ line cites the key that excused each unit: an exact
+    fn key over the file key, and a file key only for build failures."""
+    o = matrix.classify(_results(**{"f::a": "compile-fail", "g::b": "bad-exit",
+                                    "g::c": "compile-fail"}), ["f", "g", "g::b"])
+    assert o.known == {"f::a": "f", "g::b": "g::b", "g::c": "g"}
+    assert _classify(_results(**{"f::a": "bad-exit"}), ["f"])[0] == ["f::a"]
 
 
 @pytest.mark.unit
@@ -362,8 +357,8 @@ def test_a_cpu_skip_is_neither_pass_nor_failure_nor_xpass():
     """A host without SHA-NI cannot run test_shani; that must not read as green
     (pass), red (hard), or make a file-level entry look stale (xpass)."""
     results = _results(**{"f::a": "skip-cpu", "f::b": "skip-cpu"})
-    assert matrix.matrix_outcome("ritz1", results, {("ritz1", "f"): "AGAST #1"}) == ([], [], [])
-    assert matrix.matrix_outcome("ritz1", results, {}) == ([], [], [])
+    assert _classify(results, ["f"]) == ([], [], [])
+    assert _classify(results, []) == ([], [], [])
 
 
 @pytest.mark.unit

@@ -44,12 +44,12 @@ class Bin:
 def linux_bins() -> tuple[list[Bin], dict[str, str]]:
     """Every buildable Linux [[bin]] in the workspace, from the same member
     discovery and binary planning `./rz build --all` uses, plus the
-    {project: reason} of rz.toml [ci.known_failing.build] (those are not built)."""
+    {project: cite} of the `build` known-failures (known-failures/, AGAST #1834) (those are not built)."""
     rz = _load("rz_cli_2456", REPO / "rz")
     if str(PROJECTS / "ritz") not in sys.path:
         sys.path.insert(0, str(PROJECTS / "ritz"))  # build.py imports cache, cas, ...
     build = _load("ritz_buildpy_2456", PROJECTS / "ritz" / "build.py")
-    known = rz.known_failing_from_config("build")
+    known = rz.known_failing_from_config()
     bins = []
     for project in rz.discover_projects():
         pkg = (PROJECTS / project).resolve()
@@ -85,6 +85,6 @@ def suite_help(r: Reporter, tmp: Path) -> None:
         r.broken("help:discovery", f"found only {len(bins)} Linux binaries (expected 20+): discovery is broken")
     for b in bins:
         if b.project in known:
-            r.skip(b.check, f"package not built: rz.toml [ci.known_failing.build] {known[b.project][:60]}")
+            r.skip(b.check, f"package not built: known-failures {known[b.project][:60]}")
             continue
         r.run(b.check, partial(check_help, b, tmp))

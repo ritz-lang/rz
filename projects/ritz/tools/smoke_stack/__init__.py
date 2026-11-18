@@ -29,7 +29,7 @@ does, after `./rz build --all`, using the debug binaries that step built:
 What fails today is a STRICT xfail citing the child ticket that owns the
 bug (XFAILS below). A check that starts passing fails the run (XPASS) until
 its entry is deleted, so fixing a bug forces its xfail out, the same
-strict-xpass rule as rz.toml [ci.known_failing.build]. A broken
+strict-xpass rule as the known-failures/ list. A broken
 precondition (a missing binary, a server that never listens) is a plain
 FAIL even under an xfail: the xfail excuses the named bug, not a different
 breakage that happens to make the same check red.

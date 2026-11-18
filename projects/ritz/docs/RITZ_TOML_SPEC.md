@@ -189,17 +189,3 @@ Defaults for `rz build` / `rz test`.
 |---|---|---|---|---|
 | `parallel` | bool | `true` | `rz resolve_jobs` | `false` runs one job at a time. |
 | `max_jobs` | integer | `os.cpu_count()` | `rz resolve_jobs` | Worker count when `-j` is not given. |
-
-### `[ci]`
-
-CI gate policy.
-
-### `[ci.known_failing]`
-
-Known failures. There is deliberately no `test` table.
-
-### `[ci.known_failing.build]`
-
-Projects whose `rz build --all` failure is advisory. An excused project that passes fails the gate.
-
-Each key is a project id; each value a string: Reason; must cite an AGAST task (`#NNNN`). Read by `rz cmd_build`, `rz cmd_test`.

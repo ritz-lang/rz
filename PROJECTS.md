@@ -72,8 +72,9 @@ stale, the command to regenerate it is given instead.
 ## Workspace Tooling
 
 - **`rz`** — Python CLI for building, testing, running, and managing projects
-- **`rz.toml`** — Workspace manifest: member projects, build settings, and the
-  `[ci.known_failing.build]` exclusion list (every entry cites an AGAST number)
+- **`rz.toml`** — Workspace manifest: member projects and build settings
+- **`known-failures/`** — every failure any gate excuses, one `<agast>.toml`
+  per ticket, read by `projects/ritz/tools/known_failures.py` (AGAST #1834)
 - **Shared `.ritz` modules** — `blob_id`, `blob_store`, `dir_entry`, `error`,
   `namespace`, `path` (from goliath)
 
@@ -86,8 +87,8 @@ stale, the command to regenerate it is given instead.
 | **harland** | `lld` not installed locally: `Cannot link UEFI target 'bootx64': lld-link not found`. Not excused in `rz.toml` — CI installs lld. |
 | **tempest** | AGAST #1302 — emitter indirection-depth bug (`cannot store IpcChannel to IpcChannel**`) plus a missing `String.as_strview` |
 
-`tempest` is listed in `rz.toml`'s `[ci.known_failing.build]`, so it reports
-as advisory rather than gating. `lexis` has built since AGAST #3689
+`tempest` was excused as a known build failure, so it reported as advisory
+rather than gating (delisted by #3609; excuses now live in `known-failures/`). `lexis` has built since AGAST #3689
 (2026-11-16).
 
 ## Test counts
@@ -140,9 +141,9 @@ vacuously:
 | **angelo** | **0** | `⚠ No tests found, skipping` — a **false green**. 106 `[[test]]` markers sit in `src/`; `rz test` looks for `test/` or a `[test]` section and finds neither |
 | cryptosec, http, mausoleum, zeus, goliath | — | **not completed** within this pass (each runs for many minutes). goliath's own binary `build/debug/goliath-tests` does pass: 33 passed, exit 0 |
 
-None of the four failures is excused: `rz.toml` deliberately has **no**
-`[ci.known_failing.test]` section, by design ("a test-side excuse would excuse
-behavioural failure"). These should therefore be gating `rz test --all`.
+None of the four failures is excused: there is deliberately **no** test-side
+excuse (`known-failures/` has no `test` gate, by design: "a test-side excuse
+would excuse behavioural failure"). These should therefore be gating `rz test --all`.
 
 ## Project Maturity
 

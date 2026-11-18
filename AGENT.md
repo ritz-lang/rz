@@ -39,9 +39,9 @@ When you encounter a limitation:
 > "Warnings are the ghosts of future production outages."
 
 - Fix anomalies when discovered, not later
-- Track issues properly in AGAST — `rz.toml` requires every
-  `[ci.known_failing.build]` entry to cite an AGAST task number (`#NNNN`), and
-  that citation is validated at load time
+- Track issues properly in AGAST — every `known-failures/<agast>.toml` entry
+  cites the AGAST task tracking the failure, validated at load time by
+  `projects/ritz/tools/known_failures.py`
 - Test flakiness must be investigated immediately
 - Compiler warnings are bugs to be fixed
 
