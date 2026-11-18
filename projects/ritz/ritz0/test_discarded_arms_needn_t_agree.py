@@ -74,7 +74,7 @@ fn step(op: u8) -> Result<(), i32>
 fn upd(k: i32)
     match k
         1 => get()
-        _ => ()
+        _ => pass
 """,
     # mausoleum lib/recovery.ritz: an if/else-if chain ending a while body.
     "loop_body_tail": """\
@@ -91,7 +91,7 @@ fn scan(m: *M, k: i32)
     "nested_arm": """\
 fn step2(op: u8, c: bool) -> Result<(), i32>
     match op
-        0 => 0
+        0 => pass
         _ =>
             if c
                 pop()?

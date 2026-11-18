@@ -44,6 +44,8 @@ import itertools
 
 import pytest
 
+from no_effect import no_effect_message
+from ritz0_inproc import run_ritz0
 from test_ritz1_builtin_struct_shadow import _run
 
 # Arm i is a literal of length i + 2 ("ab", "abc", "abcd") or the param `p`
@@ -208,7 +210,19 @@ pub fn main() -> i32
 """
 
 
+# ritz1 until it has R64 (#3492): each arm of the discarded `if` has no effect
+# (LARB R64, R69), and ritz0 refuses them (AGAST #3491).
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-def test_non_tail_mixed_arms(tmp_path, compiler):
-    assert _run(compiler, tmp_path, "svp_non_tail", NON_TAIL) == 21
+def test_non_tail_mixed_arms(tmp_path):
+    assert _run("ritz1", tmp_path, "svp_non_tail", NON_TAIL) == 21
+
+
+@pytest.mark.integration
+def test_non_tail_arms_have_no_effect_in_ritz0(tmp_path):
+    src = tmp_path / "svp_non_tail.ritz"
+    src.write_text(NON_TAIL)
+    comp = run_ritz0([str(src), "-o", str(tmp_path / "svp_non_tail.ll")])
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, out
+    assert f":3:9: error: {no_effect_message('\"ab\"', is_string=True)}" in out, out
+    assert f":5:9: error: {no_effect_message('p', is_string=False)}" in out, out

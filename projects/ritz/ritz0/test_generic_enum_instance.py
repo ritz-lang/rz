@@ -30,6 +30,7 @@ import pytest
 
 import batching
 import fast_link
+from no_effect import no_effect_message
 from ritz0_inproc import run_ritz0
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
@@ -447,7 +448,12 @@ def test_a_constructor_no_slot_names_is_refused_at_it(tmp_path, need_ritz1, comp
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, f"{compiler} accepted {name}:\n{src}\n{out}"
     found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
-    assert (where, _no_instance_message(variant)) in found, \
+    # A bare `Empty` alone has no effect (LARB R64, AGAST #3491): ritz0 says
+    # so first; ritz1 keeps the instance words until it has R64 (#3492).
+    wanted = (no_effect_message("Empty", is_string=False)
+              if compiler == "ritz0" and name == "unit_variant_statement"
+              else _no_instance_message(variant))
+    assert (where, wanted) in found, \
         f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
     assert "unknown identifier" not in out, f"{compiler}:\n{out}"
 

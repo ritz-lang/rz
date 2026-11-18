@@ -381,7 +381,7 @@ def test_ritz1_drops_what_the_scrutinee_built_once(request, tmp_path, compiler, 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
 def test_ritz1_moves_a_local_into_the_scrutinee(request, tmp_path, compiler):
-    source = _dropped("let t = make(1)", *_arms("Some(t)", "_ => 2"), "t.id")
+    source = _dropped("let t = make(1)", *_arms("Some(t)", "_ => pass"), "t.id")
     proc, ll = _ritz1(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0 and "use of moved value: `t`" in out, out[-800:]
@@ -530,7 +530,7 @@ def test_ritz0_holds_a_strview_in_a_typed_option(tmp_path, value):
 
 @pytest.mark.integration
 def test_ritz0_moves_a_local_into_the_scrutinee(tmp_path):
-    source = _dropped("let t = make(1)", *_arms("Some(t)", "_ => 2"), "t.id")
+    source = _dropped("let t = make(1)", *_arms("Some(t)", "_ => pass"), "t.id")
     proc, ll = _ritz0(tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0 and "moved" in out, out[-800:]

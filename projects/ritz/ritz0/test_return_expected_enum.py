@@ -93,7 +93,7 @@ REPRO = """\
 fn both(n: i64) -> Result<Page, Er>
     match get(n)
         Some(p) => return Ok(p)
-        None => 0
+        None => pass
     var page: Page = load(n)?
     Ok(page)
 """
@@ -101,7 +101,7 @@ fn both(n: i64) -> Result<Page, Er>
 ERR_IN_ARM = """\
 fn both(n: i64) -> Result<Page, Er>
     match load(n)
-        Ok(p) => 0
+        Ok(p) => pass
         Err(e) => return Err(Er { code: e.code + 1 })
     Ok(Page { id: 7 })
 """
@@ -113,7 +113,7 @@ fn both(n: i64) -> Result<Page, Er>
             match load(p.id)
                 Ok(q) => return Ok(q)
                 Err(e) => return Err(e)
-        None => 0
+        None => pass
     Ok(Page { id: 7 })
 """
 
@@ -125,9 +125,9 @@ fn both(n: i64) -> Result<Page, Er>
                 Ok(q) =>
                     match get(q.id)
                         Some(r) => return Ok(r)
-                        None => 0
+                        None => pass
                 Err(e) => return Err(e)
-        None => 0
+        None => pass
     Ok(Page { id: 7 })
 """
 
@@ -139,7 +139,7 @@ fn both(n: i64) -> Result<Page, Er>
                 return Ok(p)
             else
                 return Err(Er { code: 2 })
-        None => 0
+        None => pass
     Ok(Page { id: 7 })
 """
 
@@ -149,7 +149,7 @@ fn both(n: i64) -> Result<Page, Er>
         Some(p) =>
             let q: i64 = p.id + 2
             return Ok(Page { id: q })
-        None => 0
+        None => pass
     Ok(Page { id: 7 })
 """
 
@@ -158,7 +158,7 @@ fn both(n: i64) -> Result<Page, Er>
     match n
         5 => return Ok(Page { id: 11 })
         6 => return Err(Er { code: 3 })
-        _ => 0
+        _ => pass
     Ok(Page { id: 7 })
 """
 
@@ -171,7 +171,7 @@ fn both(n: i64) -> Result<Page, Er>
                 if i == p.id
                     return Ok(Page { id: i + 20 })
                 i = i + 1
-        None => 0
+        None => pass
     Ok(Page { id: 7 })
 """
 
@@ -200,7 +200,7 @@ fn both(n: i64) -> Result<Page, Er>
             return match load(p.id)
                 Ok(q) => Ok(q)
                 Err(e) => Err(e)
-        None => 0
+        None => pass
     Ok(Page { id: 7 })
 """
 
@@ -267,7 +267,7 @@ struct Big
 fn big(n: i64) -> Result<Big, Er>
     match get(n)
         Some(p) => return Ok(Big { a: p.id, b: 2, c: 3, d: 4, e: 5 })
-        None => 0
+        None => pass
     Err(Er { code: 8 })
 
 """
@@ -295,7 +295,7 @@ fn pick(n: i32) -> Option<Small>
     match n
         1 => return Some(Small { x: 21 })
         2 => return None
-        _ => 0
+        _ => pass
     Some(Small { x: 3 })
 
 fn other() -> Option<Wide>
@@ -322,7 +322,7 @@ GENERIC_FN = (
 fn first<T>(o: Option<T>) -> Result<T, Er>
     match o
         Some(v) => return Ok(v)
-        None => 0
+        None => pass
     Err(Er { code: 4 })
 
 """
@@ -346,7 +346,7 @@ impl Store
     fn fetch(self: @Store, n: i64) -> Result<Page, Er>
         match get(n)
             Some(p) => return Ok(Page { id: p.id + self.base })
-            None => 0
+            None => pass
         Err(Er { code: 2 })
 
 """
@@ -400,7 +400,7 @@ WHOLE_PROGRAMS = {
 UNIT_RESULT_CHECK = """\
 fn check(n: i64) -> Result<(), Er>
     match load(n)
-        Ok(p) => 0
+        Ok(p) => pass
         Err(e) => return Err(e)
     Ok(())
 """
@@ -750,7 +750,7 @@ struct Er
 fn first<T>(o: Option<T>) -> Result<T, Er>
     match o
         Some(v) => return Ok(v)
-        None => 0
+        None => pass
     Err(Er { code: 4 })
 
 fn get(n: i64) -> Option<Page>

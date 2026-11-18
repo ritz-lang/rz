@@ -194,7 +194,7 @@ REJECTED = {
         "    7\n", "g", 6),
     "operand_of_a_named_call": (
         _G + "fn f(n: i64) -> i64\n"
-        "    g(n) + 1\n"
+        "    let x = g(n) + 1\n"
         "    7\n", "g", 4),
     "operand_in_a_condition": (
         _G + "fn f(n: i64) -> i64\n"

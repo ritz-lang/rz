@@ -198,9 +198,13 @@ RITZ1_EXTRA_REJECTED = {
         "        if n > 0 then match n\n"
         "            0 =>\n"
         "                break\n"
-        "            _ => 1\n"
-        "        else 2\n"
-        "        return 3\n", 2),
+        "            _ => k(1)\n"
+        "        else k(2)\n"
+        "        return 3\n"
+        # Calls: a bare `1` / `2` there is discarded, so it has no effect
+        # (LARB R64, AGAST #3491).
+        "fn k(n: i64) -> i64\n"
+        "    n\n", 2),
     "guard_at_the_end_of_a_block_arm": (
         "fn f(n: i64) -> i64\n"
         "    match n\n"

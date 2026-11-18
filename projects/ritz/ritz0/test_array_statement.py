@@ -52,9 +52,10 @@ def test_a_whole_array_alone_is_refused(tmp_path, compiler, site):
                     WHOLE_ARRAY_NOT_A_VALUE)
 
 
-# What the error's alternatives say, alone as statements: they compile and run.
+# What the error's alternatives say: they compile and run.  Each is used, as a
+# bare `a[0]` or `@&a` alone has no effect (LARB R64, AGAST #3491).
 def test_the_written_forms_still_compile(tmp_path):
-    body = ("fn f(a:& [2]i32) -> i32\n    a[0]\n    var c: [2]i32 = a\n    @&a\n"
-            "    c[1]\n")
+    body = ("fn f(a:& [2]i32) -> i32\n    let e: i32 = a[0]\n    var c: [2]i32 = a\n"
+            "    let r = @&a\n    c[1] + e - r[0]\n")
     assert _run("ritz0", tmp_path, "written", _main(body, "    var b: [2]i32 = [1, 3]\n"
                                                          "    f(@&b)\n")) == 3

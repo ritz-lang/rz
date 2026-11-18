@@ -287,7 +287,7 @@ DROPS = {
     "literal": ("(T { x: 1 }).burn()\n    0\n", 1),
     "call_result": ("make().burn()\n    0\n", 1),
     "field": ("var h = H { t: T { x: 1 } }\n    h.t.burn()\n    0\n", 1),
-    "handed_back": ("let t = T { x: 1 }\n    let u = t.keep()\n    u.x\n    0\n", 1),
+    "handed_back": ("let t = T { x: 1 }\n    let u = t.keep()\n    let n = u.x\n    0\n", 1),
     "handed_back_and_burned": ("let t = T { x: 1 }\n    t.keep().burn()\n    0\n", 1),
     "lent_first": ("var t = T { x: 1 }\n    t.peek()\n    t.burn()\n    0\n", 1),
     "lent_only": ("var t = T { x: 1 }\n    t.peek()\n    0\n", 1),

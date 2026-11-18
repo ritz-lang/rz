@@ -57,7 +57,7 @@ def test_compile_file_runs_the_pass_list_in_order():
         "_parse", "_lower_main", "_resolve", "_check_impl_targets", "_rewrite_enum_from",
         "_eval_array_sizes", "_check_type_names", "_check_binders", "_check_reachable",
         "_check_names", "_infer_struct_lit_args", "_type", "_check_types",
-        "_check_ownership", "_emit",
+        "_check_no_effect", "_check_ownership", "_emit",
     ]
 
 

@@ -342,9 +342,10 @@ let a: i32 = 0xDEADBEEF as i32
 
 **Removed in RERITZ:** the `s"..."` prefix. Bare `"..."` now produces exactly
 the `{ ptr, len }` value that `s"..."` used to, so the prefix was redundant
-(AGAST #98). `s"hello"` now lexes as the identifier `s` next to a string:
+(AGAST #98). `s"hello"` now lexes as the identifier `s` next to a string,
+and that string, alone on its line, is a statement with no effect:
 
-```ritz body expect-error="Unknown identifier: s"
+```ritz body expect-error="a string on its own line prints nothing: call print"
 let bad = s"hello"
 ```
 

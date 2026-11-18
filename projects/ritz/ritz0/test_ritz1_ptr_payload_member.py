@@ -50,11 +50,11 @@ ROWS = {
         3,
     ),
     "option_store": (
-        "let o: Option<*Pair> = Some(q)\nmatch o\n    Some(v) => v.a = 7\n    _ => 0\np.a",
+        "let o: Option<*Pair> = Some(q)\nmatch o\n    Some(v) => v.a = 7\n    _ => pass\np.a",
         7,
     ),
     "option_deref_store": (
-        "let o: Option<*Pair> = Some(q)\nmatch o\n    Some(v) => (*v).b = 9\n    _ => 0\np.b",
+        "let o: Option<*Pair> = Some(q)\nmatch o\n    Some(v) => (*v).b = 9\n    _ => pass\np.b",
         9,
     ),
     "option_method": (
@@ -85,7 +85,7 @@ ROWS = {
         2,
     ),
     "enum_store": (
-        "let e: E = E.P(q)\nmatch e\n    E.P(v) => v.b = 8\n    _ => 0\np.b",
+        "let e: E = E.P(q)\nmatch e\n    E.P(v) => v.b = 8\n    _ => pass\np.b",
         8,
     ),
     "enum_shared_read": (
@@ -94,13 +94,13 @@ ROWS = {
     ),
     # Built from `q`; enum_mut_ref_value builds it from an `@&Pair` value.
     "enum_mut_store": (
-        "let e: E = E.M(q)\nmatch e\n    E.M(v) => v.a = 6\n    _ => 0\np.a",
+        "let e: E = E.M(q)\nmatch e\n    E.M(v) => v.a = 6\n    _ => pass\np.a",
         6,
     ),
     # Built from an `@&Pair` / `@Pair` value: ritz1 stored the ptr as an i64 (#3046)
     # and gave `Option<@&Pair>` no payload type (#2384) until #2384.
     "enum_mut_ref_value": (
-        "let e: E = E.M(@&p)\nmatch e\n    E.M(v) => v.a = 6\n    _ => 0\np.a",
+        "let e: E = E.M(@&p)\nmatch e\n    E.M(v) => v.a = 6\n    _ => pass\np.a",
         6,
     ),
     "option_shared_read": (
@@ -108,7 +108,7 @@ ROWS = {
         3,
     ),
     "option_mut_store": (
-        "let o: Option<@&Pair> = Some(@&p)\nmatch o\n    Some(v) => v.a = 4\n    _ => 0\np.a",
+        "let o: Option<@&Pair> = Some(@&p)\nmatch o\n    Some(v) => v.a = 4\n    _ => pass\np.a",
         4,
     ),
     # AGAST #3047: two levels.  `v` is a `**Pair`; `(*v)` is the `*Pair`.
@@ -121,7 +121,7 @@ ROWS = {
         2,
     ),
     "option_ptr_ptr_store": (
-        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) => (*v).a = 7\n    _ => 0\np.a",
+        "let o: Option<**Pair> = Some(@&r)\nmatch o\n    Some(v) => (*v).a = 7\n    _ => pass\np.a",
         7,
     ),
     "result_ptr_ptr_ok": (
@@ -143,11 +143,11 @@ ROWS = {
         23,
     ),
     "enum_ptr_ptr_retarget": (
-        "var p2 = Pair { a: 6, b: 7 }\nlet e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => *v = @&p2\n    _ => 0\nr.a",
+        "var p2 = Pair { a: 6, b: 7 }\nlet e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => *v = @&p2\n    _ => pass\nr.a",
         6,
     ),
     "enum_ptr_ptr_store": (
-        "let e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => (**v).b = 8\n    _ => 0\np.b",
+        "let e: E = E.PP(@&r)\nmatch e\n    E.PP(v) => (**v).b = 8\n    _ => pass\np.b",
         8,
     ),
     # AGAST #3114: a `**Pair` reaches a field through `let w = *v` (w is the
@@ -206,7 +206,7 @@ def test_pointer_payload_member(tmp_path, compiler, row):
 def test_an_at_payload_stays_read_only(tmp_path, compiler):
     """`E.S(v)` over `S(@Pair)` binds an `@Pair`, not a `*Pair`: a write is refused."""
     marked = _program(
-        "let e: E = E.S(@p)\nmatch e\n    E.S(v) => ^v.a = 6\n    _ => 0\np.a"
+        "let e: E = E.S(@p)\nmatch e\n    E.S(v) => ^v.a = 6\n    _ => pass\np.a"
     )
     _assert_refused(
         compiler,

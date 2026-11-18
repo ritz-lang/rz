@@ -30,6 +30,7 @@ import pytest
 
 import fast_link
 
+from no_effect import no_effect_message
 from test_ritz1_builtin_struct_shadow import RITZ_START
 from test_ritz1_print_interpolation import _compile
 from test_sys_syscall_asm import LOCAL_SYSCALL3
@@ -158,8 +159,9 @@ def test_print_and_eprint_still_interpolate(tmp_path):
     _assert_parity(tmp_path, "prints", PRINTS, b"a=7 b=true sum=8\n", b"e=7\n")
 
 
-# A bare literal statement is a value nobody uses: ritz1 prints nothing, so
-# ritz0 must not silently desugar it into a print.
+# A bare literal statement is a value nobody uses: ritz1 prints nothing, and
+# ritz0 must not silently desugar it into a print.  ritz0 now refuses each one,
+# naming print (LARB R64, AGAST #3491); ritz1 does too once it has R64 (#3492).
 BARE = """\
 pub fn main() -> i32
     let a: i64 = 7
@@ -171,4 +173,12 @@ pub fn main() -> i32
 
 
 def test_bare_placeholder_statement_prints_nothing(tmp_path):
-    _assert_parity(tmp_path, "bare", BARE, b"done\n")
+    assert _run("ritz1", tmp_path, "bare", BARE) == (b"done\n", b"")
+
+
+def test_bare_placeholder_statement_is_refused_naming_print(tmp_path):
+    comp, ll = _compile("ritz0", tmp_path, "bare", BARE)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0 and not ll.exists(), out[-2000:]
+    for text in ('"bare{a}\\n"', '"plain\\n"'):
+        assert no_effect_message(text, is_string=True) in out, out[-2000:]
