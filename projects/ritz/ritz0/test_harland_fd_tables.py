@@ -573,8 +573,8 @@ PROCESS = KERNEL_SRC / "syscall" / "runtime" / "process.ritz"
 def test_exit_releases_the_table_before_the_parent_resumes():
     body = _fn(PROCESS, "sys_exit_impl")
     child, init = body.split("# No parent", 1)
-    # child: in the parent's address space (a flush may grow the kernel heap),
-    # before the parent runs again
+    # child: in the parent's address space, before the parent runs again (the
+    # order is #2753's; a flush growing the heap is safe under any CR3, #2761)
     assert child.index("vmm_switch_pml4(g_parent_ctx.user_pml4)") < child.index("fs_process_end()") \
         < child.index("resume_user_frame(")
     # init exiting: released before the halt

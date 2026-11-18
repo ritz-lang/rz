@@ -14,13 +14,22 @@
 #
 # Return value in RAX
 
-.section .data
-# Kernel stack for syscall handling (4KB per CPU - TODO: per-CPU)
+.set SYSCALL_STACK_SIZE, 65536
+.set SYSCALL_STACK_SENTINEL, 0x5359534B53544B21   # "SYSKSTK!"
+
+.section .bss
+# Kernel stack for every syscall, and for the IRQs taken during one (IST=0).
+# One for all CPUs (TODO: per-CPU). In .bss so an overflow can't run into
+# .data: it was 4 KiB in .data directly above g_child_pid and fs_current,
+# and a deep syscall (a write-back flush through knamespace_write) grew down
+# into them (AGAST #2761, #4064). Its lowest quadword holds a sentinel that
+# syscall_stack_check (syscall/stack.ritz) checks at syscall exit.
 .align 16
 syscall_stack:
-    .space 4096
+    .space SYSCALL_STACK_SIZE
 syscall_stack_top:
 
+.section .data
 # Saved user RSP during syscall
 user_rsp_save:
     .quad 0
@@ -455,3 +464,59 @@ harland_syscall:
     ret
 
 .size harland_syscall, . - harland_syscall
+
+# ============================================================================
+# Syscall Stack Sentinel (AGAST #2761)
+# ============================================================================
+
+# void syscall_stack_guard_init(void): write the sentinel at the stack's
+# lowest quadword. Call once, before the first syscall.
+.global syscall_stack_guard_init
+.type syscall_stack_guard_init, @function
+syscall_stack_guard_init:
+    movabsq $SYSCALL_STACK_SENTINEL, %rax
+    movq %rax, syscall_stack(%rip)
+    ret
+.size syscall_stack_guard_init, . - syscall_stack_guard_init
+
+# u64 syscall_stack_guard_intact(void): 1 while the sentinel is untouched,
+# 0 once a syscall (or an IRQ on top of one) has run off the stack's bottom.
+.global syscall_stack_guard_intact
+.type syscall_stack_guard_intact, @function
+syscall_stack_guard_intact:
+    movabsq $SYSCALL_STACK_SENTINEL, %rcx
+    xorl %eax, %eax
+    cmpq %rcx, syscall_stack(%rip)
+    sete %al
+    ret
+.size syscall_stack_guard_intact, . - syscall_stack_guard_intact
+
+# u64 syscall_stack_high_water(void): bytes of the syscall stack ever used,
+# measured as the distance from the top to the lowest non-zero quadword
+# above the sentinel (.bss starts zeroed). A lower bound: a zero word left
+# deep in a frame doesn't count.
+.global syscall_stack_high_water
+.type syscall_stack_high_water, @function
+syscall_stack_high_water:
+    leaq syscall_stack+8(%rip), %rcx
+    leaq syscall_stack_top(%rip), %rdx
+1:
+    cmpq %rdx, %rcx
+    jae 2f
+    cmpq $0, (%rcx)
+    jne 2f
+    addq $8, %rcx
+    jmp 1b
+2:
+    movq %rdx, %rax
+    subq %rcx, %rax
+    ret
+.size syscall_stack_high_water, . - syscall_stack_high_water
+
+# u64 syscall_stack_size(void): the syscall stack's size in bytes.
+.global syscall_stack_size
+.type syscall_stack_size, @function
+syscall_stack_size:
+    movq $SYSCALL_STACK_SIZE, %rax
+    ret
+.size syscall_stack_size, . - syscall_stack_size

@@ -3,9 +3,9 @@
 # Blocking spawn/exit/wait, the running-process state they share, and the
 # syscalls that read it (getpid, yield, acpi_poweroff).
 #
-# The open handler lives here, not in file.ritz, because of the SYS_OPEN
-# WORKAROUND below: it saves and restores g_child_pid/g_has_parent around
-# sys_open, so it moved with the globals it protects (removed by #1877).
+# The open handler lives here, not in file.ritz: it used to save and restore
+# g_child_pid/g_has_parent around sys_open. That guarded against the 4 KiB
+# syscall stack overrunning .data, fixed in syscall_entry.s (#2761).
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
@@ -17,6 +17,7 @@ import mm.uptr { uptr_validate_string, uptr_check_read }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_read }
 import fs.kpath { strview_from_ptr }
 import fs.syscall { sys_open, fs_process_end, fs_process_start }
+import syscall.stack { syscall_stack_check }
 import drivers.acpi.tables { acpi_poweroff }
 import loader.elf { ElfLoadResult, ElfStatus, elf_load }
 import syscall.errno { Errno }
@@ -424,7 +425,7 @@ fn sys_exit_impl(code: i32) -> i64
 
         # Close the fds the child left open (flushing their writes) and free
         # its fd table, so none outlive it; the parent's table is current
-        # again (#2753). After the switch: a flush may grow the kernel heap.
+        # again (#2753).
         fs_process_end()
 
         # Free the child's page table and all its user-space pages
@@ -439,6 +440,10 @@ fn sys_exit_impl(code: i32) -> i64
         var retval: i64 = 2  # Child PID = 2 on success
         if code < 0
             retval = -1  # Error if child exited with negative code
+
+        # exit never returns through syscall_handler, so its stack check
+        # runs here (#2761).
+        syscall_stack_check()
 
         # Resume the parent with every register it had at sys_spawn, not only
         # RIP/RSP: its syscall stub restores RSP from RBP.
@@ -478,21 +483,13 @@ pub fn sys_exit_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return sys_exit_impl(rdi as i32)
 
 # open(path, path_len, flags)
-# WORKAROUND: knamespace_resolve returns a 32-byte struct which triggers
-# a compiler bug that corrupts kernel globals. Save/restore the affected
-# globals around the call. TODO: Fix the Ritz compiler's large struct return.
 pub fn sys_open_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     # SECURITY: Validate path buffer
     if rsi > 0
         let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
         if path_result != 0
             return Errno.Fault as i64
-    let saved_child_pid: u64 = g_child_pid
-    let saved_has_parent: u8 = g_has_parent
-    let result: i64 = sys_open(rdi as *u8, rsi, rdx as i32)
-    g_child_pid = saved_child_pid
-    g_has_parent = saved_has_parent
-    return result
+    return sys_open(rdi as *u8, rsi, rdx as i32)
 
 # spawn(path)
 pub fn sys_spawn_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

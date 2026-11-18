@@ -15,9 +15,9 @@ The checks are structural, at source level:
   main.ritz defines none of them;
 * syscall_table_init still registers the same handlers, each imported from
   the module that defines it;
-* the SYS_OPEN workaround (save/restore g_child_pid and g_has_parent around
-  sys_open; removed later by #1877) moved with the open handler, into the
-  module that owns those globals;
+* the open handler lives in the module that owns g_child_pid/g_has_parent.
+  Its old save/restore of them around sys_open is gone (#2761: the
+  "corruption" was the syscall stack overrunning .data, not a compiler bug);
 * symbols bound by name from outside Ritz (`call syscall_handler` in
   syscall_entry.s, `extern fn alloc_user_stack` in loader/elf.ritz) stay `pub`;
 * main.ritz's SLOC (ritz-metrics) dropped by the size of the move.
@@ -216,26 +216,18 @@ def test_table_registers_handlers_imported_from_their_area():
     assert "syscall_table_init()" in _body(code, "syscall_init")
 
 
-def test_sys_open_workaround_moved_with_the_open_handler():
-    """The open handler saves g_child_pid/g_has_parent, calls sys_open, and
-    restores them (the large-struct-return corruption; removed by #1877), in
-    the module that owns those globals."""
+def test_sys_open_handler_calls_sys_open_without_the_old_workaround():
+    """The open handler, in the module that owns g_child_pid/g_has_parent,
+    validates the path and returns sys_open's result directly. The save/restore
+    of those globals that used to wrap the call is gone (#2761): what clobbered
+    them was the 4 KiB syscall stack overrunning .data, fixed in
+    syscall_entry.s."""
     code = _code(_area("process"))
     assert {"g_child_pid", "g_has_parent"} <= _vars(code)
     body = _body(code, "sys_open_handler")
-    steps = [
-        r"let saved_child_pid: u64 = g_child_pid",
-        r"let saved_has_parent: u8 = g_has_parent",
-        r"let result: i64 = sys_open\(rdi as \*u8, rsi, rdx as i32\)",
-        r"g_child_pid = saved_child_pid",
-        r"g_has_parent = saved_has_parent",
-        r"return result",
-    ]
-    pos = [re.search(s, body) for s in steps]
-    assert all(pos), {s: bool(p) for s, p in zip(steps, pos)}
-    assert [p.start() for p in pos] == sorted(p.start() for p in pos), body
-    # Its comment travelled with it.
-    assert "WORKAROUND" in _area("process").read_text()
+    assert re.search(r"return sys_open\(rdi as \*u8, rsi, rdx as i32\)", body), body
+    assert "saved_child_pid" not in body and "saved_has_parent" not in body, body
+    assert "WORKAROUND" not in _area("process").read_text()
 
 
 @pytest.mark.integration   # runs ritz-metrics in a subprocess (AGAST #1805)

@@ -1,0 +1,111 @@
+# heap_grow_child: deep syscalls that grow the kernel heap, from a child
+# process (AGAST #2761).
+#
+# The kernel heap starts at 256 KiB and lives in the kernel half every address
+# space shares, so it may grow under any CR3. This child writes a 512 KiB file:
+# the kernel's write buffer for it outgrows the whole initial heap, so the
+# heap grows while this child's page table is loaded, and the close flushes
+# it through knamespace_write, one of the deepest call chains a syscall
+# makes. init (under its own CR3) then keeps using the heap.
+#
+# Before #2761 the syscall stack was 4 KiB in .data, directly above the
+# kernel's fs_current and g_child_pid. Creating a file (#4064) or flushing one
+# overflowed it: fd 3's writes went to serial, the reopen failed with Srch,
+# and init's wait answered ECHILD.
+#
+# Steps: create /heap_grow (in /, the one directory every image has; the
+# TAR initramfs of boot/test.sh has no /tmp), write 4 KiB, close;
+# rewrite it with 512 KiB and close; read it all back; leave a second new
+# file open so exit flushes it as well. Exit 0 = PASS.
+
+import libharland { print_str, print_int, sys_open, sys_close, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC }
+import ritzlib.sys { sys_read, sys_write }
+
+const CHUNK: i64 = 4096
+# 512 KiB: twice the kernel heap's initial 256 KiB (harland main.ritz heap_init).
+const TOTAL: i64 = 524288
+# Left open at exit: exit's own flush.
+const LEFT_OPEN: i64 = 16384
+
+fn fail(step: i32, msg: *u8, value: i64) -> i32
+    print_str(c"[heap_grow_child] FAIL: ")
+    print_str(msg)
+    print_int(value)
+    print_str(c"\n")
+    return step
+
+# The byte at file offset `off`.
+fn pattern(off: i64) -> u8
+    return (off % 251) as u8
+
+# Write `total` pattern bytes to fd in CHUNK pieces: 0, or the short count.
+fn write_pattern(fd: i32, total: i64) -> i64
+    var buf: [4096]u8
+    var written: i64 = 0
+    while written < total
+        var i: i64 = 0
+        while i < CHUNK
+            buf[i] = pattern(written + i)
+            i = i + 1
+        let n: i64 = sys_write(fd, @buf[0], CHUNK)
+        if n != CHUNK
+            return n
+        written = written + CHUNK
+    return 0
+
+pub fn main() -> i32
+    # 1. Create the file and flush a first chunk.
+    var fd: i32 = sys_open(c"/heap_grow", O_WRONLY | O_CREAT | O_TRUNC)
+    if fd != 3
+        return fail(1, c"create expected fd 3, got ", fd as i64)
+    let first: i64 = write_pattern(fd, CHUNK)
+    if first != 0
+        return fail(2, c"first write returned ", first)
+    let c1: i32 = sys_close(fd)
+    if c1 != 0
+        return fail(3, c"first close (fd 3 not a file?) returned ", c1 as i64)
+
+    # 2. Rewrite it with 512 KiB: the heap grows under this child's CR3.
+    fd = sys_open(c"/heap_grow", O_WRONLY | O_TRUNC)
+    if fd != 3
+        return fail(4, c"reopen for write expected fd 3, got ", fd as i64)
+    let big: i64 = write_pattern(fd, TOTAL)
+    if big != 0
+        return fail(5, c"512 KiB write returned ", big)
+    let c2: i32 = sys_close(fd)
+    if c2 != 0
+        return fail(6, c"512 KiB close returned ", c2 as i64)
+
+    # 3. Read every byte back.
+    fd = sys_open(c"/heap_grow", O_RDONLY)
+    if fd != 3
+        return fail(7, c"reopen for read expected fd 3, got ", fd as i64)
+    var buf: [4096]u8
+    var off: i64 = 0
+    var n: i64 = sys_read(fd, @buf[0], CHUNK)
+    while n > 0
+        var i: i64 = 0
+        while i < n
+            if buf[i] != pattern(off + i)
+                return fail(9, c"wrong byte at offset ", off + i)
+            i = i + 1
+        off = off + n
+        n = sys_read(fd, @buf[0], CHUNK)
+    if n < 0
+        return fail(8, c"read returned ", n)
+    if off != TOTAL
+        return fail(10, c"read back bytes: ", off)
+    let c3: i32 = sys_close(fd)
+    if c3 != 0
+        return fail(13, c"read close returned ", c3 as i64)
+
+    # 4. A second new file, left open: exit closes and flushes it.
+    fd = sys_open(c"/heap_grow_open", O_WRONLY | O_CREAT | O_TRUNC)
+    if fd != 3
+        return fail(11, c"second create expected fd 3, got ", fd as i64)
+    let tail: i64 = write_pattern(fd, LEFT_OPEN)
+    if tail != 0
+        return fail(12, c"second write returned ", tail)
+
+    print_str(c"[heap_grow_child] PASS: 512 KiB written and read back, one file left open\n")
+    return 0
