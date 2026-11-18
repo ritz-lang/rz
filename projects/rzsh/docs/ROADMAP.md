@@ -144,9 +144,8 @@ Simple ring buffer for history:
 
 ```ritz
 const HISTORY_SIZE: i32 = 100
-const MAX_HISTORY_LINE: i64 = 512
 
-var g_history: [100][512]u8
+var g_history: Vec<String>     # Ring of HISTORY_SIZE entries, any length (#4083)
 var g_history_count: i32 = 0
 var g_history_pos: i32 = 0     # Current position when navigating
 var g_history_next: i32 = 0    # Next slot to write

@@ -3,27 +3,36 @@
 # Simple ring buffer for command history with navigation.
 
 import ritzlib.str { strlen, strcmp }
+import ritzlib.gvec
+import ritzlib.string { String, string_new, string_clear, string_push_bytes, string_as_ptr }
 
 # ============================================================================
 # History configuration
 # ============================================================================
 
 pub const HISTORY_SIZE: i32 = 100
-pub const MAX_HISTORY_LINE: i64 = 512
 
 # ============================================================================
 # History buffer (ring buffer)
 # ============================================================================
 
-# The history buffer stores up to HISTORY_SIZE entries.
+# The history buffer stores up to HISTORY_SIZE entries, each a String of any
+# length (entries were fixed [512]u8 rows that cut a line at byte 511, AGAST
+# #4083). g_history grows one String per slot until it holds HISTORY_SIZE;
+# after that the ring reuses slots, keeping each String's allocation.
 # g_history_write is where the next entry will be written.
 # g_history_count is the number of valid entries.
 # g_history_nav is the current navigation position (for up/down arrows).
 
-var g_history: [100][512]u8
+var g_history: Vec<String>        # Zero-initialised: an empty Vec
 var g_history_write: i32 = 0      # Next slot to write
 var g_history_count: i32 = 0      # Number of valid entries
 var g_history_nav: i32 = -1       # Navigation position (-1 = at prompt)
+
+# The entry in ring slot `slot`, NUL-terminated (null when out of memory).
+# Valid until that slot is next written.
+fn slot_ptr(slot: i32) -> *u8
+    return string_as_ptr(vec_get_ptr<String>(@&g_history, slot as i64))
 
 # ============================================================================
 # Add a line to history
@@ -40,15 +49,23 @@ pub fn history_add(line: *u8)
     # Skip if same as last entry
     if g_history_count > 0
         let last: i32 = (g_history_write + HISTORY_SIZE - 1) % HISTORY_SIZE
-        if strcmp(line, @g_history[last][0]) == 0
+        let prev: *u8 = slot_ptr(last)
+        if prev != null and strcmp(line, prev) == 0
             return
 
-    # Copy line to history buffer
-    var i: i64 = 0
-    while i < len and i < MAX_HISTORY_LINE - 1
-        g_history[g_history_write][i as i32] = *(line + i)
-        i = i + 1
-    g_history[g_history_write][i as i32] = 0
+    # A slot past the end of g_history is new; otherwise reuse its String.
+    if g_history_write as i64 >= g_history.len
+        if vec_push<String>(@&g_history, string_new()) != 0
+            return  # Out of memory: drop the entry
+    let entry: *String = vec_get_ptr<String>(@&g_history, g_history_write as i64)
+    string_clear(entry)
+    if string_push_bytes(entry, line, len) != 0
+        string_clear(entry)
+        return  # Out of memory: the slot stays unused
+    # Reserve the NUL now so slot_ptr cannot fail for this entry.
+    if string_as_ptr(entry) == null
+        string_clear(entry)
+        return
 
     # Advance write pointer
     g_history_write = (g_history_write + 1) % HISTORY_SIZE
@@ -78,7 +95,7 @@ pub fn history_up() -> *u8
     if g_history_nav == -1
         g_history_nav = g_history_count - 1
         let idx: i32 = (g_history_write + HISTORY_SIZE - 1) % HISTORY_SIZE
-        return @g_history[idx][0]
+        return slot_ptr(idx)
 
     # If already at oldest, return null
     if g_history_nav == 0
@@ -87,7 +104,7 @@ pub fn history_up() -> *u8
     # Move to older entry
     g_history_nav = g_history_nav - 1
     let idx: i32 = (g_history_write + HISTORY_SIZE - g_history_count + g_history_nav) % HISTORY_SIZE
-    return @g_history[idx][0]
+    return slot_ptr(idx)
 
 # ============================================================================
 # Navigate down (newer entries)
@@ -110,7 +127,7 @@ pub fn history_down() -> *u8
     # Move to newer entry
     g_history_nav = g_history_nav + 1
     let idx: i32 = (g_history_write + HISTORY_SIZE - g_history_count + g_history_nav) % HISTORY_SIZE
-    return @g_history[idx][0]
+    return slot_ptr(idx)
 
 # ============================================================================
 # Get current navigation position
@@ -136,12 +153,13 @@ pub fn history_get(index: i32) -> *u8
         return null
 
     let idx: i32 = (g_history_write + HISTORY_SIZE - g_history_count + index) % HISTORY_SIZE
-    return @g_history[idx][0]
+    return slot_ptr(idx)
 
 # ============================================================================
 # Clear history
 # ============================================================================
 
+# Slots keep their Strings' storage for reuse.
 pub fn history_clear()
     g_history_write = 0
     g_history_count = 0
