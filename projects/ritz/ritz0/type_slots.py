@@ -6,6 +6,7 @@ import copy
 from typing import List, Optional
 
 import ritz_ast as rast
+from monomorph_core import bind_type_params
 
 
 class SlotInferMixin:
@@ -138,10 +139,75 @@ class SlotInferMixin:
                 self._infer_into(expr.args[0], slot.args[part])
 
     def _check_payload(self, args: List[rast.Expr], enum_name: Optional[str],
-                       variant: str) -> None:
-        """The arguments of `enum_name`'s `variant`, or of an unknown enum's."""
+                       variant: str) -> List[rast.Type]:
+        """The arguments of `enum_name`'s `variant`, or of an unknown enum's;
+        returns their types."""
         enum = self.enums.get(enum_name) if enum_name else None
         found = next((v for v in enum.variants if v.name == variant), None) if enum else None
         fields = found.fields if found is not None else []
-        for i, arg in enumerate(args):
-            self._infer_into(arg, fields[i] if i < len(fields) else None)
+        return [self._infer_into(arg, fields[i] if i < len(fields) else None)
+                for i, arg in enumerate(args)]
+
+    def _variant_type(self, expr: rast.Expr, name: str, args: List[rast.Expr],
+                      arg_types: List[rast.Type]) -> rast.Type:
+        """The type of variant constructor `expr` (`V(args)` or a unit `V`):
+        its enum, and for a generic user enum's (AGAST #4057) the instance it
+        builds, which monomorph reads (`_infer_variant_let`): the written
+        args (`Full<u8>(5)`), else the fn's return type for an untyped let's
+        value when that's an instance of the enum (#2430, #2927), else what
+        the payload binds (§4.4): `Full(5)` is a `Slot<i64>`.  Unbound, it is
+        the bare enum, for monomorph to report located.  A slot whose enum
+        declares the variant overrides this (_slot_variant_type)."""
+        enum_name = self.variant_to_enum[name]
+        bare = rast.NamedType(expr.span, enum_name, [])
+        enum = self.enums.get(enum_name)
+        # Option / Result are the builtin constructors' (#2430); a variant
+        # several enums declare, or named like a fn, is monomorph's to skip.
+        if enum is None or not enum.type_params or enum_name in ('Option', 'Result') \
+                or self.variant_owners.get(name) != 1 or name in self.functions:
+            return bare
+        params = enum.type_params
+        written = getattr(expr, 'type_args', None)
+        if written:
+            if len(written) != len(params):
+                return bare
+            return rast.NamedType(expr.span, enum_name, list(written))
+        ret = self._ret_slot()
+        if id(expr) in self._untyped_let_values and isinstance(ret, rast.NamedType) \
+                and ret.name == enum_name and len(ret.args) == len(params):
+            return ret
+        variant = next(v for v in enum.variants if v.name == name)
+        pairs = [(field, arg, self._binding_type(arg, ty))
+                 for field, arg, ty in zip(variant.fields, args, arg_types)]
+        bound, conflict = bind_type_params(params, pairs, self._resolve_alias)
+        if all(tp in bound and tp not in conflict for tp in params):
+            return rast.NamedType(expr.span, enum_name, [bound[tp] for tp in params])
+        return bare
+
+    def _binding_type(self, arg: rast.Expr, ty: Optional[rast.Type]) -> Optional[rast.Type]:
+        """The type `arg` (typed `ty`) binds a type param as, as monomorph's
+        `_type_of` has it: `@x` / `@&x` a pointer, which mangles `ptr_` (the
+        emitter's spelling, #2335); a tuple literal, or a name an untyped let
+        bound one to, nothing (#3064); None where unknown."""
+        while isinstance(arg, rast.Grouped):
+            arg = arg.expr
+        if isinstance(arg, rast.TupleLit) or (
+                isinstance(arg, rast.Ident) and arg.name in self._tuple_lit_names):
+            return None
+        if isinstance(arg, rast.UnaryOp) and arg.op in ('@', '&', '@&', '&mut'):
+            inner = self._binding_type(arg.operand, self.typed.type_of(arg.operand))
+            if inner is None:
+                return None
+            return rast.PtrType(arg.span, inner, mutable=arg.op in ('@&', '&mut'),
+                                shared=arg.op == '@')
+        return None if self._is_unknown(ty) else self._plain(ty)
+
+    def _note_tuple_lit_let(self, stmt) -> None:
+        """Track whether `stmt` binds its name to an untyped tuple literal."""
+        value = stmt.value
+        while isinstance(value, rast.Grouped):
+            value = value.expr
+        if stmt.type is None and isinstance(value, rast.TupleLit):
+            self._tuple_lit_names.add(stmt.name)
+        else:
+            self._tuple_lit_names.discard(stmt.name)

@@ -103,6 +103,56 @@ GENERIC_ROWS = [
 ]
 
 
+SLOT = "\nenum Slot<T>\n    Full(T)\n    Empty\n"
+
+# A generic user enum's variant constructor is typed at its instance (AGAST
+# #4057), by monomorph's rule for an untyped let's value (#2927): written
+# args, else the fn's return type when it is an instance of the enum (#2430),
+# else what the payload binds (§4.4).  Unbound, it stays bare: monomorph
+# reports that, located.  (fn return type, let value, its type)
+VARIANT_ROWS = [
+    ("i32", "Full(5)", "Slot<i64>"),
+    ("i32", "Full(5 as u16)", "Slot<u16>"),
+    ("i32", "Full<u32>(5)", "Slot<u32>"),
+    ("Slot<u8>", "Full(5)", "Slot<u8>"),
+    ("Slot<u8>", "Empty", "Slot<u8>"),
+    ("i32", "Empty", "Slot"),
+    # the return-type rule is an untyped let's: a scrutinee's payload binds
+    ("Slot<u8>", "match Full(7 as i32)\n        _ => 0", "Slot<i32>"),
+    # as monomorph binds: `@n` as a pointer (mangled `ptr_`), and a tuple
+    # literal, or a name bound to one, as nothing (#3064)
+    ("i32", "Full(@n)", "Slot<*u16>"),
+    ("i32", "Full(t)", "Slot"),
+]
+
+
+def _a_generic_variant_is_typed_at_its_instance(ret, value, expected):
+    module = parse(SLOT + f"\nfn f() -> {ret}\n    let n = 1 as u16\n    let t = (1, 2)\n"
+                   f"    let x = {value}\n    f()\n"
+                   "\nfn main() -> i32\n    0\n")
+    table = typed.type_module(module)
+    x = _let_value(module, "x")
+    assert _name(table.type_of(x.expr if isinstance(x, rast.Match) else x)) == expected
+
+
+def _monomorph_takes_a_variants_instance_from_the_table():
+    """Retype `Full(5)` as a Slot<u32> in the table: the let is then a
+    Slot<u32>.  Monomorph's own rule (the payload's i64) would make it a
+    Slot<i64>; it keeps only the located error for an unbound T."""
+    module = parse(SLOT + "\nfn main() -> i32\n    let s = Full(5)\n    0\n")
+    table = typed.type_module(module)
+    table.record(_let_value(module, "s"), rast.NamedType(None, "Slot", [rast.NamedType(None, "u32", [])]))
+    out = monomorphize(module)
+    assert "Slot$u32" in {item.name for item in out.items}
+    assert "bind_type_params" not in inspect.getsource(monomorph.Monomorphizer._infer_variant_let)
+
+
+def _an_unbound_variant_is_still_monomorphs_located_error():
+    module = parse(SLOT + "\nfn main() -> i32\n    let s = Empty\n    0\n")
+    with pytest.raises(monomorph.GenericInferError, match="can't infer `T` for `Empty`"):
+        monomorphize(module)
+
+
 def _a_generic_is_typed_at_its_type_args(value, expected):
     module = parse(VEC + f"\nfn main() -> i32\n    let x = {value}\n    0\n")
     table = typed.type_module(module)
@@ -367,6 +417,9 @@ def test_the_typing_pass_types_each_row():
               lambda s=scrut, p=pattern, x=expected:
               _a_builtin_variant_pattern_binds_its_payload_at_the_scrutinees_args(s, p, x))
              for scrut, pattern, expected in BUILTIN_VARIANT_ROWS]
+    rows += [(f"{value!r} in a -> {ret} fn is {expected}",
+              lambda r=ret, v=value, x=expected: _a_generic_variant_is_typed_at_its_instance(r, v, x))
+             for ret, value, expected in VARIANT_ROWS]
     rows += [(check.__name__.lstrip("_"), check) for check in (
         _an_option_or_result_predicate_is_a_bool,
         _a_vec_range_is_a_span_view_in_a_span_slot,
@@ -389,5 +442,7 @@ def test_monomorph_instantiates_each_row():
         _monomorph_has_no_inferrers_of_its_own,
         _an_address_of_binds_t_as_a_pointer,
         _monomorph_slices_an_err_payload_from_the_table_alone,
+        _monomorph_takes_a_variants_instance_from_the_table,
+        _an_unbound_variant_is_still_monomorphs_located_error,
     )]
     assert _failures(rows) == []

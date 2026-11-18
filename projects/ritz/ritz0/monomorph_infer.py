@@ -269,46 +269,46 @@ class MonoInferMixin:
             value = value.expr
         if isinstance(value, rast.UnaryOp) and value.op in ('@', '&', '@&', '&mut'):
             value = value.operand
-        return self._infer_variant_let(value, use_ret=False)
+        return self._infer_variant_let(value)
 
-    def _infer_variant_let(self, value: rast.Expr,
-                           use_ret: bool = True) -> Optional[rast.Type]:
+    def _infer_variant_let(self, value: rast.Expr) -> Optional[rast.Type]:
         """The type of an untyped `let s = Full(5)` / `var s = Empty`, `Full`
         a variant of a generic `enum Slot<T>` (AGAST #2927), or None for any
         other initialiser.
 
-        The fn's return type when it is an instance of that enum, as #2430
-        has it for `let o = Some(5)` (unless `use_ret` is False); else the
-        instance the payload binds, by
-        section 4.4's rule for a generic call: `Full(5)` is a `Slot<i64>`.  A
-        type param the payload leaves unbound (any of a unit variant's) is a
-        located error: ritz0 crashed unlocated and ritz1 called `@Full`.
+        The typing pass types the constructor at its instance (AGAST #4057):
+        the fn's return type when it is an instance of that enum, as #2430
+        has it for `let o = Some(5)` (a let's value only: a scrutinee's is
+        what its payload binds), else
+        the instance the payload binds, by section 4.4's rule for a generic
+        call: `Full(5)` is a `Slot<i64>`.  A type param the payload leaves
+        unbound (any of a unit variant's), which the table leaves bare, is a
+        located error here: ritz0 crashed unlocated and ritz1 called `@Full`.
         """
         if isinstance(value, rast.Call) and isinstance(value.func, rast.Ident) \
                 and not value.type_args:
-            name, args = value.func.name, value.args
+            name = value.func.name
         elif isinstance(value, rast.Ident):
-            name, args = value.name, []
+            name = value.name
         else:
             return None
         found = self._generic_variant(name)
         if found is None:
             return None
         enum_def, variant = found
-        ret = self._infer_ret_type if use_ret else None
-        if isinstance(ret, rast.NamedType) and ret.name == enum_def.name \
-                and len(ret.args) == len(enum_def.type_params):
-            return copy.deepcopy(ret)
         params = enum_def.type_params
-        bound, conflict = bind_type_params(
-            params, [(field_type, arg, self._type_of(arg))
-                     for field_type, arg in zip(variant.fields, args)])
-        for tp in params:
-            if tp not in bound or tp in conflict:
-                raise GenericInferError(
-                    f"can't infer `{tp}` for `{name}`: give the binding a type", value.span)
-        return rast.NamedType(value.span, enum_def.name,
-                              [copy.deepcopy(bound[tp]) for tp in params])
+        ty = self._type_of(value)
+        if isinstance(ty, rast.NamedType) and ty.name == enum_def.name \
+                and len(ty.args) == len(params):
+            return copy.deepcopy(ty)
+        # The first param no typed payload names, else (two bind it
+        # differently) the first.
+        args = value.args if isinstance(value, rast.Call) else []
+        tp = next((tp for tp in params
+                   if not any(_names_type_param(f, [tp]) and self._type_of(a) is not None
+                              for f, a in zip(variant.fields, args))), params[0])
+        raise GenericInferError(
+            f"can't infer `{tp}` for `{name}`: give the binding a type", value.span)
 
     def _infer_one_call(self, call: rast.Call) -> None:
         """Bind the type params of a generic `f(args)` from its arguments.

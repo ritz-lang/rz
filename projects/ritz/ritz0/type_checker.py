@@ -122,6 +122,12 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         self._tail_slot: Optional[rast.Type] = None
         # The `if`, `match` or block next inferred is dropped (_infer_discarded).
         self._discarding = False
+        # id() of each untyped let / var's value: a generic variant there
+        # takes the fn's return type when that's its enum's (AGAST #4057).
+        self._untyped_let_values: Set[int] = set()
+        # Names an untyped `let t = (1, 2)` binds in the current fn: a tuple
+        # literal binds no type param (#3064), as monomorph has it.
+        self._tuple_lit_names: Set[str] = set()
         # id(expr) already reported: a literal's elements are inferred twice.
         self._slot_reported: Set[int] = set()
         # Undeclared struct names a `.field` was refused on, or #3347 refused
@@ -339,6 +345,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         self.typed.enter(fn)
         self.locals = {}
         self.scope_stack = []
+        self._tuple_lit_names = set()
 
         # Track type parameters (T, E, etc.) so they're treated as valid types
         self.current_type_params = set(fn.type_params or [])
@@ -382,6 +389,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
     def _check_stmt(self, stmt: rast.Stmt):
         """Type check a statement."""
+        if isinstance(stmt, (rast.VarStmt, rast.LetStmt)) and stmt.type is None \
+                and stmt.value is not None:
+            self._untyped_let_values.add(id(stmt.value))
         if isinstance(stmt, rast.VarStmt):
             if stmt.value:
                 init_type = self._infer_into(stmt.value, stmt.type)
@@ -494,6 +504,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 self._error(f"assert condition must be bool, got {self._type_str(cond_type)}",
                           stmt.condition.span)
 
+        if isinstance(stmt, (rast.VarStmt, rast.LetStmt)):
+            self._note_tuple_lit_let(stmt)
+
     def _infer_type(self, expr: rast.Expr) -> rast.Type:
         """Infer the type of an expression, and record it (typed.py)."""
         ty = self._type_by_kind(expr)
@@ -545,8 +558,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 # Check if it's a unit enum variant
                 if expr.name in self.variant_to_enum:
                     self._check_variant_unambiguous(expr.name, expr.span)
-                    enum_name = self.variant_to_enum[expr.name]
-                    return rast.NamedType(expr.span, enum_name, [])
+                    return self._variant_type(expr, expr.name, [], [])
                 # A type as a receiver: `Errno.Fault`, `Point.new()`
                 if expr.name in self.enums or expr.name in self.structs:
                     return rast.NamedType(expr.span, expr.name, [])
@@ -913,8 +925,8 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 # A bare `V(x)` of a name several enums declare says nothing
                 # about which: _check_parts knows when a slot does.
                 only = self.variant_owners[fn_name] == 1 and '$' not in enum_name
-                self._check_payload(expr.args, enum_name if only else None, fn_name)
-                return rast.NamedType(expr.span, enum_name, [])
+                arg_types = self._check_payload(expr.args, enum_name if only else None, fn_name)
+                return self._variant_type(expr, fn_name, expr.args, arg_types)
 
             # Look up function
             fn_sig = self.functions.get(fn_name)
