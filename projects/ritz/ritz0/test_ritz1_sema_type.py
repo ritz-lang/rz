@@ -27,6 +27,12 @@ it with get_expr_type and bool_kind on the same node.
   answers "unknown" to everything from passing.  The probe changes no IR (the
   commit compared 457 files with it on and off).
 
+AGAST #3810 folded deref_field's receiver typing in: `*p` of a struct
+pointer, a struct element `a[i]`, a method's result, `E.V(..)`, a `:& S` param
+as its S, and the `for`, `V(x)` and `let (a, b)` bindings over them.  Where
+the emitter's get_expr_type has no answer for `*p`, `a[i]` or `x.m()` it
+says i64; the probe takes that as lenient for a struct or pointer.
+
 AGAST #3502 moved bool_check onto Sema, judging with sema_bool_kind.  The probe
 also compares that with the emitter's bool_kind on every expression: both sure
 and different is a mismatch; one sure and the other not is a `bk-gap`, a place
@@ -49,9 +55,9 @@ COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
 # TYPE_* (ritz1/src/ast.ritz) and EXPR_* kinds, for reading the table below.
 UNKNOWN, I32, I64, U8, BOOL, PTR, U16 = -1, 1, 2, 3, 4, 5, 9
-STRUCT, ARRAY, MUT_REF = 100, 101, 103
+STRUCT, ARRAY, REF, MUT_REF = 100, 101, 102, 103
 E_INT, E_IDENT, E_BINARY, E_UNARY, E_CALL, E_CAST, E_MEMBER, E_NIL = 1, 4, 5, 6, 7, 8, 10, 3
-E_INDEX = 9
+E_INDEX, E_METHOD = 9, 12
 
 SHAPES = """\
 const K: i32 = 7
@@ -98,6 +104,40 @@ fn main() -> i32
     if g != null
         return 1
     w as i32 + s - s + v - v + t as i32 - t as i32 + m - m + y - y + r as i32 - r as i32
+
+struct Q
+    v: i32
+
+impl Q
+    fn me(self: @Q) -> @Q
+        self
+
+enum E
+    A(Q)
+    B
+
+fn borrow(x:& Q) -> i32
+    x.v
+
+fn tup() -> (Q, i32)
+    (Q { v: 1 }, 2)
+
+fn recv(pp: *Q) -> i32
+    let d = *pp
+    let e = E.A(d)
+    let m = d.me()
+    let (a, n) = tup()
+    var qs: [2]Q
+    qs[0] = d
+    qs[1] = d
+    var t: i32 = 0
+    for y in qs
+        t = t + y.v
+    let z = qs[0]
+    let r: i32 = match e
+        E.A(w) => w.v
+        E.B => 0
+    d.v + m.v + a.v + n + t + z.v + r
 """
 
 # (line, col, expr kind, Sema's type kind[, name]): what the dump must say.
@@ -131,10 +171,24 @@ WANTED = [
     (40, 24, E_IDENT, I32),            # the scrutinee n
     (42, 8, E_IDENT, PTR),             # global g: *i32
     (42, 13, E_NIL, PTR),              # null
+    # A receiver's shapes, which deref_field typed on its own until #3810:
+    (58, 5, E_IDENT, STRUCT, "Q"),    # x:& Q reads as a Q
+    (64, 13, E_UNARY, STRUCT, "Q"),   # *pp
+    (65, 13, E_METHOD, STRUCT, "E"),  # E.A(d) builds an E
+    (66, 13, E_IDENT, STRUCT, "Q"),   # d, an inferred `let` of *pp
+    (66, 13, E_METHOD, REF, "Q"),     # d.me(): its `-> @Q`
+    (73, 17, E_IDENT, STRUCT, "Q"),   # y, an element of qs: [2]Q
+    (74, 13, E_INDEX, STRUCT, "Q"),   # qs[0]
+    (76, 19, E_IDENT, STRUCT, "Q"),   # w, E.A's payload
+    (78, 11, E_IDENT, REF, "Q"),      # m
+    (78, 17, E_IDENT, STRUCT, "Q"),   # a, the tuple's first field
+    (78, 23, E_IDENT, I32),           # n, its second
+    (78, 31, E_IDENT, STRUCT, "Q"),   # z, an inferred `let` of qs[0]
 ]
 
-# Shapes Sema leaves unknown: an index, a `for` variable, a match-arm binding
-# and a `:&` param (take's `b`, line 13).
+# Shapes Sema leaves unknown: an index of a scalar array (#3510's sema_index
+# types those), a `for` variable over a range, a catch-all arm binding and a
+# scalar `:&` param (take's `b`, line 13: `*b` is how it is read and written).
 UNKNOWN_AT = [
     (36, 18, E_INDEX),                 # arr[1]
     (39, 22, E_IDENT),                 # k
@@ -181,12 +235,14 @@ CORPUS_FLOOR = 15000
 # const array elements, `-> *T` / `-> @T` pointees, `**T` chains, `*@a[i]`,
 # array fields through `*p` and nameless tuples; test_ritz1_sema_bk_gap.py),
 # 40 at #3024 (a nameless tuple's `*T` / `[N]T` element: `*q`, `b[i]`).
-# What's left: a field through a generic Deref (16, #3810's receiver typing),
-# an index through a Vec / Span / StrView field, call or payload (#3510's),
+# 29 at #3810, which types a receiver's `*p`, struct `a[i]`, method results
+# and the `for` / arm / tuple bindings over them (a field through a generic
+# Deref).  What's left: an index through a Vec / Span / StrView field, call or
+# payload (#3510's), a struct match payload's field,
 # `(*(@x)).f` where the emitter is the unsure side, and `K[i]` of a const
 # array of structs, which the emitter's get_expr_type guesses is an i64 (a
 # guess that refused good programs when Sema copied it).  Lower it as they go.
-BK_GAP_CEILING = 40
+BK_GAP_CEILING = 29
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
