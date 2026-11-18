@@ -2765,8 +2765,8 @@ fn emit_global_vars(s: *EmitterState)
 #
 # Each field of a StructLit element is lowered by emit_const_field_value:
 # integer / bool, pointer (null or a string), float and nested struct fields
-# (AGAST #1569, #3651), unit enum variants and one-dimensional arrays of any
-# of those (LARB R75, AGAST #3673); any other field is a located error.  Integer consts
+# (AGAST #1569, #3651), unit enum variants and arrays of any of those, of any
+# rank (LARB R75, AGAST #3673, #4175); any other field is a located error.  Integer consts
 # still take the old fast path via find_const and need no LLVM global.
 
 # Find a FieldInit in a struct literal's FieldInit list by field name.
@@ -2879,7 +2879,8 @@ fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
 #   f64 / f32       a float or integer literal, `-` applied; rounded as at run time
 #   struct          a nested struct literal, recursively; `"..."` is a StrView
 #   enum            a unit variant, `E.V` or `V`: its tag (LARB R75, AGAST #3673)
-#   [N]T            an array literal of N elements, each one a T as above
+#   [N]T            an array literal of N elements, each one a T as above;
+#                   `[N][M]T` one per dimension (AGAST #4175)
 # Any other value or field type is a located error, never a silent 0: the
 # operand is still written, typed, so the line stays well-formed.
 fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
@@ -2921,12 +2922,12 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
         if ei >= 0
             emit_const_unit_variant(s, c, elem_idx, ei, v, path)
             return
-    if ft == TYPE_ARRAY and field.array_shape == null
+    if ft == TYPE_ARRAY
         emit_const_array_field(s, c, elem_idx, field, v, path)
         return
-    # A multi-dimensional array, or anything else ritz1 has no constant form for.
+    # Anything else ritz1 has no constant form for.
     emit_str(s, c"zeroinitializer")
-    const_field_error(s, c, elem_idx, path, c"has a type ritz1 can't lower in a const (integer, bool, float, pointer, enum, struct and one-dimensional array fields are)")
+    const_field_error(s, c, elem_idx, path, c"has a type ritz1 can't lower in a const (integer, bool, float, pointer, enum, struct and array fields are)")
 
 # LARB R75 (AGAST #3673): a unit variant of user enum `ei` -- `E.V`, or a bare
 # `V` -- as `{ i8 <tag> }`, a payload enum's pad and payload bytes zero (the
@@ -2977,37 +2978,32 @@ fn emit_const_unit_variant(s: *EmitterState, c: *ConstEntry, elem_idx: i32, ei: 
         emit_str(s, c" x i8] zeroinitializer")
     emit_str(s, c" }")
 
-# AGAST #3673: a one-dimensional array field `[N]T`'s value, an array literal
-# of exactly N elements, each lowered as a `T` field would be.  An element's
-# path is `a[i]`.
+# AGAST #3673: an array field `[N]T`'s value, an array literal of exactly N
+# elements, each lowered as a `T` field would be.  An element's path is
+# `a[i]`.  AGAST #4175: a multi-dimensional `[N][M]..T` (array_shape) is an
+# array literal per dimension, each leaf a `T`; a path is `a[i][j]`.
 fn emit_const_array_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *StructField, v: *Expr, path: *ConstFieldPath)
-    var count: i32 = 0
-    if v.kind == EXPR_ARRAY_LIT
-        var ce: *Expr = v.args
-        while ce != null
-            count += 1
-            ce = ce.next
-    if v.kind != EXPR_ARRAY_LIT or count != field.array_size
-        emit_str(s, c"zeroinitializer")
-        const_field_error_head(s, c, elem_idx, path)
-        eprints_cstr(c"is not an array literal of ")
-        eprint_i64(field.array_size as i64)
-        eprints_cstr(c" elements\n")
-        return
-    # The element's type, as a field of it: what emit_field_llvm_type and
+    # The leaf element's type, as a field of it: what emit_field_llvm_type and
     # emit_const_value read.
+    let sh: *ArrayShape = field.array_shape
     var el: StructField
     el.name = field.name
     el.name_len = field.name_len
-    el.field_type = field.array_elem_type
-    el.field_type_name = field.array_elem_type_name
-    el.field_type_name_len = field.array_elem_type_name_len
+    if sh != null
+        el.field_type = sh.leaf_type
+        el.field_type_name = sh.leaf_name
+        el.field_type_name_len = sh.leaf_name_len
+        el.ptr_pointee = sh.leaf_pointee
+    else
+        el.field_type = field.array_elem_type
+        el.field_type_name = field.array_elem_type_name
+        el.field_type_name_len = field.array_elem_type_name_len
+        el.ptr_pointee = field.array_elem_pointee
     el.array_size = 0
     el.array_elem_type = TYPE_VOID
     el.array_elem_type_name = null
     el.array_elem_type_name_len = 0
     el.array_elem_pointee = TYPE_VOID
-    el.ptr_pointee = field.array_elem_pointee
     el.field_mut_ref = 0
     el.field_shared_ref = 0
     el.field_inner_ref = 0
@@ -3018,6 +3014,31 @@ fn emit_const_array_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
     el.ptr_array = null
     el.field_ref_ptr_pointee = TYPE_VOID
     el.elem_fn_sig = null
+    if sh != null
+        emit_const_array_dim(s, c, elem_idx, sh, 0, sh.dims[0], @el, v, path)
+    else
+        emit_const_array_dim(s, c, elem_idx, null, 0, field.array_size, @el, v, path)
+
+# Dimension `d` of an array field's value (sh null: a one-dimensional `[n]T`):
+# an array literal of `n` elements, each the next dimension's literal or,
+# at the last one, a leaf `el`.
+fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *ArrayShape, d: i32, n: i32, el: *StructField, v: *Expr, path: *ConstFieldPath)
+    var count: i32 = 0
+    if v.kind == EXPR_ARRAY_LIT
+        var ce: *Expr = v.args
+        while ce != null
+            count += 1
+            ce = ce.next
+    if v.kind != EXPR_ARRAY_LIT or count != n
+        emit_str(s, c"zeroinitializer")
+        const_field_error_head(s, c, elem_idx, path)
+        eprints_cstr(c"is not an array literal of ")
+        eprint_i64(n as i64)
+        eprints_cstr(c" elements\n")
+        return
+    var inner: i32 = 0
+    if sh != null and d + 1 < sh.rank
+        inner = 1
     emit_str(s, c"[")
     var e: *Expr = v.args
     var i: i32 = 0
@@ -3029,9 +3050,14 @@ fn emit_const_array_field(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
         at.up = path
         at.idx = i
         at.at = e
-        emit_field_llvm_type(s, @el)
-        emit_str(s, c" ")
-        emit_const_value(s, c, elem_idx, @el, e, @at)
+        if inner == 1
+            emit_array_shape_llvm(s, sh, d + 1)
+            emit_str(s, c" ")
+            emit_const_array_dim(s, c, elem_idx, sh, d + 1, sh.dims[d + 1], el, e, @at)
+        else
+            emit_field_llvm_type(s, el)
+            emit_str(s, c" ")
+            emit_const_value(s, c, elem_idx, el, e, @at)
         i += 1
         e = e.next
     emit_str(s, c"]")

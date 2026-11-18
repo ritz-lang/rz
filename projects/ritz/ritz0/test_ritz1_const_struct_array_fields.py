@@ -316,6 +316,36 @@ pub fn main() -> i32
     return 3
 """
 
+# A multi-dimensional array field (AGAST #4175): one array literal per
+# dimension, each leaf lowered as a field of its type.  `[[` lexes as an
+# attribute, so a nested literal opens `[ [`.
+ARRAY_2D = """\
+struct In
+    k: i32
+    p: *u8
+
+struct P
+    a: [2][3]i32
+    n: [2][1]In
+    f: [2][2][2]f64
+    s: [1][2]*u8
+
+const T: [1]P = [P { s: [ ["hi", null] ], a: [ [1, -2, 3], [4, 5, -6] ], n: [ [In { k: 7, p: "q" }], [In { k: -8, p: null }] ], f: [ [ [0.5, 1], [2, 3] ], [ [4, 5], [6, -7.5] ] ] }]
+
+pub fn main() -> i32
+    if T[0].a[0][0] != 1 or T[0].a[0][1] != -2 or T[0].a[0][2] != 3
+        return 10
+    if T[0].a[1][0] != 4 or T[0].a[1][1] != 5 or T[0].a[1][2] != -6
+        return 11
+    if T[0].n[0][0].k != 7 or *T[0].n[0][0].p != 'q' or T[0].n[1][0].k != -8 or T[0].n[1][0].p != null
+        return 12
+    if T[0].f[0][0][0] != 0.5 or T[0].f[0][0][1] != 1.0 or T[0].f[1][0][1] != 5.0 or T[0].f[1][1][1] != -7.5
+        return 13
+    if *(T[0].s[0][0] + 1) != 'i' or T[0].s[0][1] != null
+        return 14
+    return 3
+"""
+
 FORMS = {
     "repro": REPRO,
     "pointers": POINTERS,
@@ -327,6 +357,7 @@ FORMS = {
     "f32_precise": F32_PRECISE,
     "enum": ENUM,
     "array": ARRAY,
+    "array_2d": ARRAY_2D,
 }
 
 # ritz1 refuses these literals (see REFUSED's f32_too_many_* rows).
@@ -422,10 +453,11 @@ REFUSED = {
                   "field 'a' is not an array literal of 2 elements"),
     "array_elem": ("struct P\n    a: [2]In\n\nconst T: [1]P = [P { a: [In { a: 1 }, In { a: ^mk() }] }]\n",
                    "field 'a[1].a' is not a constant integer expression"),
-    # Multi-dimensional array fields aren't lowered (AGAST #4175).
-    "array_2d": ("struct P\n    a: [2][2]i32\n\nconst T: [1]P = [P { a: ^[ [1, 2], [3, 4] ] }]\n",
-                 "field 'a' has a type ritz1 can't lower in a const "
-                 "(integer, bool, float, pointer, enum, struct and one-dimensional array fields are)"),
+    # A multi-dimensional one names its inner literals by their indices (AGAST #4175).
+    "array_2d_len": ("struct P\n    a: [2][2]i32\n\nconst T: [1]P = [P { a: [ [1, 2], ^[3] ] }]\n",
+                     "field 'a[1]' is not an array literal of 2 elements"),
+    "array_2d_elem": ("struct P\n    a: [2][2]In\n\nconst T: [1]P = [P { a: [ [In { a: 1 }, In { a: 2 }], [In { a: 3 }, In { a: ^mk() }] ] }]\n",
+                      "field 'a[1][1].a' is not a constant integer expression"),
 }
 
 # The element each row's bad field is in, when it isn't element 0.

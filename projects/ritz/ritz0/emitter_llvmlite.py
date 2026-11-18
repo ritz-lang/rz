@@ -2878,6 +2878,7 @@ class LLVMEmitter:
           struct          a nested struct literal, or `"..."` into a StrView
           enum            a unit variant, `E.V` or `V` (LARB R75, AGAST #3673)
           [N]T            an array literal of N elements, each a T field's value
+                          (T itself an array for `[N][M]T`, AGAST #4175)
         """
         def refuse(why: str):
             const_name, index, path = field_of
@@ -2915,8 +2916,9 @@ class LLVMEmitter:
                     why = f"is not a unit variant of `{named}`"
                 refuse(why)
             return self._const_init_variant(expr, named, llvm_type, refuse_variant)
-        if isinstance(ritz_type, rast.ArrayType) and isinstance(ritz_type.size, int) \
-                and not isinstance(self._resolve_const_field_alias(ritz_type.inner), rast.ArrayType):
+        if isinstance(ritz_type, rast.ArrayType) and isinstance(ritz_type.size, int):
+            # Each element lowers as a field of the inner type: for `[N][M]T`
+            # that's a `[M]T`, one dimension down (AGAST #4175).
             if not isinstance(expr, rast.ArrayLit) or len(expr.elements) != ritz_type.size:
                 refuse(f"is not an array literal of {ritz_type.size} elements")
             const_name, index, path = field_of
@@ -2924,9 +2926,9 @@ class LLVMEmitter:
                 self._const_struct_field(elem, ritz_type.inner, llvm_type.element,
                                          f"{name_hint}.{i}", (const_name, index, f"{path}[{i}]"))
                 for i, elem in enumerate(expr.elements)])
-        # A multi-dimensional array, or anything else ritz1 has no constant form for.
+        # Anything else ritz1 has no constant form for.
         refuse("has a type ritz1 can't lower in a const "
-               "(integer, bool, float, pointer, enum, struct and one-dimensional array fields are)")
+               "(integer, bool, float, pointer, enum, struct and array fields are)")
 
     def _resolve_const_field_alias(self, ty: rast.Type) -> rast.Type:
         """A field typed by a `type` alias lowers as its target."""
