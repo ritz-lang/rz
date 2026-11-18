@@ -34,4 +34,21 @@ got=$(printf 'x\n\ny\n' | ./nl -ba --number-width=2 -n ln)
 usage_error "nl: invalid number 'abc'" ./nl -w abc
 usage_error "nl: invalid body style" ./nl -b x
 
-echo "ok - 7 nl scenarios"
+# --- -w wider than any fixed buffer (AGAST #4136) ---
+# The padding used to be built in a 32-byte stack buffer; -w 100000
+# overran it and crashed.  Each -n format pads differently, and the blank
+# line takes the unnumbered-prefix path.
+W=100000
+for fmt in rn ln rz; do
+  case $fmt in
+    rn) n1=$(printf '%*d' $W 1);  n2=$(printf '%*d' $W 2) ;;
+    ln) n1=$(printf '%-*d' $W 1); n2=$(printf '%-*d' $W 2) ;;
+    rz) n1=$(printf '%0*d' $W 1); n2=$(printf '%0*d' $W 2) ;;
+  esac
+  blank=$(printf '%*s' $W '')
+  got=$(printf 'a\n\nb' | ./nl -w $W -n $fmt) || fail "-w $W -n $fmt: exit $?"
+  [[ "$got" == "$n1"$'\ta\n'"$blank"$'\t\n'"$n2"$'\tb' ]] \
+    || fail "-w $W -n $fmt: wrong output (${#got} bytes)"
+done
+
+echo "ok - 10 nl scenarios"
