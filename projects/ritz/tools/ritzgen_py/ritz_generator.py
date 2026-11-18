@@ -85,6 +85,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'TYPE': 46, 'THEN': 47,
     'ASM': 48,  # inline assembly, LANGUAGE_SPEC §18.6 (AGAST #3394)
     'ASYNC': 49, 'AWAIT': 60,  # parsed, then refused until AGAST #3814 (#1456)
+    'HEAP': 61,  # `heap e`, lowered to __heap_new (AGAST #3934)
     # Type keywords
     'I8': 50, 'I16': 51, 'I32': 52, 'I64': 53,
     'U8': 54, 'U16': 55, 'U32': 56, 'U64': 57,

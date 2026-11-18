@@ -305,6 +305,11 @@ Proper malloc/free with size classes (no need to track sizes when freeing).
 | `realloc` | `fn(ptr: *u8, new_size: i64) -> *u8` | Reallocate to new size |
 | `calloc` | `fn(count: i64, size: i64) -> *u8` | Allocate and zero-initialize |
 
+The `heap e` expression (see [heap](#heap)) allocates with this `malloc`, so a
+module using it needs `ritzlib.memory` loaded, imported directly or not. ritz1
+lowers `heap e` to `__heap_new(e)`, a generic `fn<T>(value: T) -> *T` here;
+it is the compiler's, not for direct use.
+
 **Utility**:
 
 | Function | Signature | Description |

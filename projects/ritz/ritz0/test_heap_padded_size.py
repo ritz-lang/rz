@@ -31,10 +31,11 @@ AGAST #3664: `heap W<P> { .. }`, a generic literal directly under `heap`,
 crashed with "Unknown struct: W": the monomorphizer's instantiation walk never
 entered `heap`.  The `generic_lit*` cases pin it, parenthesised and nested.
 
-ritz1 has no `heap` expression (the keyword is reserved, LANGUAGE_SPEC §2):
-it refuses one at parse time, which is pinned so a future ritz1 `heap` gets
-these tests.  The padded structs ritzlib's generic containers hold (Box<T>,
-Vec<T>, sized by `sizeof(T)`), and the bool fills, run on all three.
+AGAST #3934: ritz1 lowers `heap e` to ritzlib.memory's `__heap_new<T>`,
+which mallocs `sizeof(T)`.  The block canary runs on all three compilers;
+the malloc-size read of the IR is ritz0's (ritz1's size is sizeof's).  The
+padded structs ritzlib's generic containers hold (Box<T>, Vec<T>, sized by
+`sizeof(T)`), and the bool fills, run on all three.
 """
 
 import re
@@ -170,18 +171,6 @@ def run_with(ritz1_bin, tmp_path):
     return go
 
 
-@pytest.fixture
-def compile_with(ritz1_bin, tmp_path):
-    bins = {"ritz1": ritz1_bin, "ritz1_selfhosted": SELFHOSTED_BIN}
-
-    def go(compiler, name, program):
-        if compiler == "ritz0":
-            return _compile("ritz0", None, tmp_path, name, program)
-        return _compile("ritz1", bins[compiler], tmp_path, name, program)
-
-    return go
-
-
 # x86-64 Linux, as clang writes it (test_byval_exact_size.py's oracle, #1744).
 X86_64_DATA_LAYOUT = (
     "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
@@ -219,18 +208,23 @@ def test_ritz0_heap_mallocs_the_padded_size(tmp_path, name):
     assert _malloc_sizes(ll.read_text()) == [HEAPS[name][3]]
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(HEAPS))
-def test_ritz0_heap_store_stays_in_its_block(tmp_path, name):
-    assert _run_pkg("ritz0", tmp_path, name, _heap_program(name)) == 0
+# ritz1's `heap` of an array literal: `__heap_new`'s T is not inferred from
+# one, and a by-value array T is not emitted (AGAST #3986).
+RITZ1_HEAP_GAPS = {"array": 3986}
+
+
+def _block_params():
+    for name in sorted(HEAPS):
+        for compiler in COMPILERS:
+            gap = RITZ1_HEAP_GAPS.get(name) if compiler != "ritz0" else None
+            marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{gap}")] if gap else []
+            yield pytest.param(name, compiler, marks=marks)
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_has_no_heap_expression(compile_with, compiler):
-    comp, ll, _ = compile_with(compiler, "struct", _heap_program("struct"))
-    assert comp.returncode != 0 and not ll.exists()
-    assert "unexpected 'P'" in comp.stdout + comp.stderr
+@pytest.mark.parametrize("name,compiler", list(_block_params()))
+def test_heap_store_stays_in_its_block(tmp_path, compiler, name):
+    assert _run_pkg(compiler, tmp_path, name, _heap_program(name)) == 0
 
 
 # Ritzlib's generic containers of a padded struct, on every compiler.
