@@ -2534,17 +2534,19 @@ class TypeChecker:
         """`value`, of type `actual`, in an `expected` slot. A string literal has
         no fixed type: it is `*u8` in a `*u8` slot (LARB R3) and a `Span<u8>` of
         its bytes in a `Span<u8>` slot (LARB R62, AGAST #3596), and nothing else
-        is, so a StrView, a `c"…"` or a String stays a mismatch."""
+        is, so a StrView, a `c"…"` or a String stays a mismatch. An integer
+        literal is whichever float its f32 / f64 slot is (§7.5, AGAST #3604)."""
         if self._types_compatible(actual, expected):
             return True
         if value is None:
             return False
         tails = list(slot_tails(expected, value))
-        if not any(isinstance(tail, rast.StringLit) for tail, _ in tails):
+        if not any(self._is_slot_typed_literal(tail) for tail, _ in tails):
             return False
         return all(self._is_u8_ptr(slot) or self._is_u8_span(slot)
                    if isinstance(tail, rast.StringLit)
-                   else self._types_compatible(self._infer_type(tail), slot)
+                   else (float_rules.int_literal_only(tail) and self._is_float(slot))
+                   or self._types_compatible(self._infer_type(tail), slot)
                    for tail, slot in tails)
 
     def _is_u8_span(self, ty: rast.Type) -> bool:
@@ -2557,6 +2559,15 @@ class TypeChecker:
                     mangle_generic_name('Span', [self._resolve_alias(ty.args[0])])
                     == 'Span$u8')
         return ty.name == 'Span$u8'
+
+    @staticmethod
+    def _is_slot_typed_literal(tail: rast.Expr) -> bool:
+        """A literal whose type `_value_fits` reads from its slot."""
+        return isinstance(tail, rast.StringLit) or float_rules.int_literal_only(tail)
+
+    def _is_float(self, ty: rast.Type) -> bool:
+        ty = self._resolve_alias(ty)
+        return isinstance(ty, rast.NamedType) and ty.name in ('f32', 'f64')
 
     @staticmethod
     def _is_u8_ptr(ty: rast.Type) -> bool:
