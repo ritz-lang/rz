@@ -2000,6 +2000,41 @@ fn unknown_struct_member_refused(s: *EmitterState, e: *Expr) -> i32
     s.unknown_struct_name_len = loc.type_name_len
     return 1
 
+# AGAST #4155: `p.len` with `p` a `*i32` local or param, or `x.len` with `x` an
+# `i64`: a scalar has no fields.  It fell to "unhandled EXPR_MEMBER" (and ritz0
+# raised a ValueError traceback).  One located error at the base, naming it and
+# its type, in ritz0's words (type_checker.py, _refuse_primitive_member).  A
+# local whose type the emitter only guessed (bk_unsure) is left alone.
+# Returns 1 when `e` is that case.
+pub fn primitive_member_refused(s: *EmitterState, e: *Expr) -> i32
+    if e.left == null or e.left.kind != EXPR_IDENT
+        return 0
+    let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if loc == null or loc.bk_unsure == 1 or loc.type_name_len > 0
+        return 0
+    var sigil: *u8 = c""
+    var scalar: i32 = loc.var_type
+    if loc.var_type == TYPE_PTR
+        sigil = c"*"
+        scalar = loc.pointee_type
+    else if loc.var_type == TYPE_I64 and loc.is_bool == 1
+        scalar = TYPE_BOOL
+    let name: *u8 = primitive_name_from_type(scalar)
+    if name == null
+        return 0
+    emit_str(s, c"  ; ERROR\n")
+    diag_error_at(emitter_source_file(), e.left.span)   # located at the base
+    eprints_cstr(c"`")
+    eprint_bytes(e.left.ident_ptr, e.left.ident_len)
+    eprints_cstr(c"` has type `")
+    eprints_cstr(sigil)
+    eprints_cstr(name)
+    eprints_cstr(c"`, which is not a struct: it has no field `")
+    eprint_bytes(e.ident_ptr, e.ident_len)
+    eprints_cstr(c"`\n")
+    s.error_count = s.error_count + 1
+    return 1
+
 pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
     # expr.field - member access on struct.
     #
@@ -2115,6 +2150,8 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
     if unknown_field_refused(s, e) == 1
         return 0
     if unknown_struct_member_refused(s, e) == 1   # AGAST #3362
+        return 0
+    if primitive_member_refused(s, e) == 1   # AGAST #4155
         return 0
     emit_ir_error(s, e.span, c"unhandled EXPR_MEMBER")
 

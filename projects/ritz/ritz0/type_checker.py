@@ -21,6 +21,7 @@ import copy
 from typing import Dict, List, Optional, Set, Tuple
 from dataclasses import dataclass, field
 import bool_rules
+from builtin_types import PRIMITIVES
 import float_rules
 import ref_rules
 import ritz_ast as rast
@@ -1431,6 +1432,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         if self._refuse_unknown_struct_member(expr, base_type):
             return rast.NamedType(expr.span, 'unknown', [])
 
+        if self._refuse_primitive_member(expr, base_type, inner_type):
+            return rast.NamedType(expr.span, 'unknown', [])
+
         struct_info = self.structs.get(inner_type.name)
         if struct_info is None:
             self._error(f"type {inner_type.name} has no fields", expr.span)
@@ -1504,6 +1508,23 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             self._slot_error(f"`{expr.expr.name}` is a `{name}`, which names no declared "
                              f"struct: it has no field `{expr.field}` (is an import missing?)",
                              expr.expr.span)
+        return True
+
+    def _refuse_primitive_member(self, expr: rast.Field, base_type: rast.Type,
+                                 inner_type: rast.NamedType) -> bool:
+        """`p.len` where `p` is a `*i32`, or `x.len` where `x` is an `i64`
+        (AGAST #4155): a scalar has no fields, so one located error at the
+        base, naming it and its type, in ritz1's words (emitter_expr_access.ritz,
+        primitive_member_refused).  The emitter raised a ValueError traceback.
+        True when `expr` is that case."""
+        resolved = self._resolve_alias(inner_type)
+        if (not isinstance(resolved, rast.NamedType) or resolved.args
+                or resolved.name not in PRIMITIVES or resolved.name in self.structs):
+            return False
+        what = (f"`{expr.expr.name}`" if isinstance(expr.expr, rast.Ident)
+                else "this")
+        self._slot_error(f"{what} has type `{self._type_str(base_type)}`, which is not a "
+                         f"struct: it has no field `{expr.field}`", expr.expr.span)
         return True
 
     def _deref_field(self, ty: rast.NamedType, field: str,

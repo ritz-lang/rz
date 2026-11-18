@@ -60,13 +60,14 @@ MAIN0 = "\nfn main() -> i32\n    0\n"
 
 # row -> (refused program with `^`, message, corrected program)
 ROWS = {
-    # _emit_field_access: a field on a scalar.
+    # A field on a scalar.  The checker's _refuse_primitive_member (#4155)
+    # refuses it before _emit_field_access's raise is reached.
     "field_on_scalar": ("""\
 fn main() -> i32
     let a: i64 = 5
     let b = ^a.x
     0
-""", "Cannot access field on non-struct type: i64", """\
+""", "`a` has type `i64`, which is not a struct: it has no field `x`", """\
 struct P
     x: i64
 
@@ -75,25 +76,26 @@ fn main() -> i32
     let b = a.x
     0
 """),
-    # _emit_field_access: a tuple index on a scalar.
+    # A tuple index on a scalar: refused by the checker too (#4155).
     "tuple_field_on_scalar": ("""\
 fn main() -> i32
     let a: i64 = 1
     let b = ^a.0
     0
-""", "Cannot access tuple field 0 on type: i64", """\
+""", "`a` has type `i64`, which is not a struct: it has no field `0`", """\
 fn main() -> i32
     let a = (1, 2)
     let b = a.0
     0
 """),
-    # _emit_stmt_inner's field store: the target isn't a struct.
+    # A field store whose target isn't a struct: refused by the checker
+    # (#4155) before _emit_stmt_inner's raise.
     "field_assign_on_scalar": ("""\
 fn main() -> i32
     var a: i64 = 1
     ^a.x = 2
     0
-""", "Invalid type for field assignment: i64", """\
+""", "`a` has type `i64`, which is not a struct: it has no field `x`", """\
 struct P
     x: i64
 
