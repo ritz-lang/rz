@@ -17,6 +17,8 @@ import lib.collection
 import cryptosec.x25519
 import cryptosec.random
 import ritzlib.str
+import ritzlib.uring
+import ritzlib.async.tasks
 
 fn sa_all_zero(p: *u8, n: i32) -> i32
     var i: i32 = 0
@@ -208,4 +210,98 @@ fn test_async_get_returns_a_max_size_doc() -> i32
     assert len as i64 == MAX_DOC_SIZE
     # The id was assigned on insert; everything after it is as sent.
     assert memcmp(data + 12, buf + 12, MAX_DOC_SIZE - 12) == 0
+    0
+
+# ============================================================================
+# Short-send resubmission (AGAST #4204)
+# ============================================================================
+#
+# An io_uring send may complete short; replies now reach 36 KiB, past what a
+# socket buffer takes in one go.  m7sp_send_progress (#3638) must send the
+# rest from where the short send stopped.  A real ring sends a 32 KiB reply
+# over a socketpair whose first send is reported as 5000 bytes: the peer
+# must read exactly bytes 5000.. of the reply, and nothing else.
+
+const SA_REPLY_LEN: i32 = 32768
+const SA_SHORT: i32 = 5000
+
+# Read `want` bytes from fd into out, waiting at most 2 s for each part.
+# Returns the bytes read (fewer than `want` if the data stopped coming).
+fn sa_read_all(fd: i32, out: *u8, want: i32) -> i32
+    var got: i32 = 0
+    while got < want
+        var pfd: PollFd
+        pfd.fd = fd
+        pfd.events = POLLIN
+        pfd.revents = 0
+        if sys_poll(@pfd, 1, 2000) <= 0
+            return got
+        let n: i64 = sys_read(fd, out + got as i64, (want - got) as i64)
+        if n <= 0
+            return got
+        got += n as i32
+    got
+
+[[test]]
+fn test_async_short_send_resubmits_the_rest() -> i32
+    var sv: [2]i32
+    # socketpair(AF_UNIX, SOCK_STREAM, 0, sv)
+    assert syscall4(53, 1, 1, 0, @sv[0] as i64) == 0
+    var ring: IoUring
+    assert uring_init(@ring, 8) == 0
+    let pool: *TaskPool = malloc(sizeof(TaskPool) as i64) as *TaskPool
+    task_pool_init(pool, @ring)
+    let task: *Task = @pool.tasks[0]
+    task.id = 4204
+    task.fd = sv[0]
+    task.user_data = pool as *u8
+
+    let reply: *u8 = malloc(SA_REPLY_LEN as i64)
+    var i: i32 = 0
+    while i < SA_REPLY_LEN
+        reply[i] = ((i * 7 + i / 251) & 255) as u8
+        i += 1
+    let s: *M7SPSession = m7sp_session_at(9)
+    s.send_ptr = reply as i64
+    s.send_len = SA_REPLY_LEN
+    s.send_pos = 0
+
+    # The first send went out short: the rest is resubmitted.
+    task.io_result = SA_SHORT
+    assert m7sp_send_progress(task, s) == 1
+    assert s.send_pos == SA_SHORT
+    # The resubmit only queues its SQE; the run loop enters the ring.
+    assert uring_submit(@ring) == 1
+
+    let rest: i32 = SA_REPLY_LEN - SA_SHORT
+    let got: *u8 = malloc(SA_REPLY_LEN as i64)
+    assert sa_read_all(sv[1], got, rest) == rest
+    assert memcmp(got, reply + SA_SHORT as i64, rest as i64) == 0
+
+    let cqe: *IoUringCqe = uring_wait_cqe(@ring)
+    assert cqe != null
+    assert cqe.user_data == 4204
+    assert cqe.res == rest
+    uring_cqe_seen(@ring, cqe)
+
+    # That completion finishes the reply; nothing more is sent.
+    task.io_result = rest
+    assert m7sp_send_progress(task, s) == 0
+    assert uring_submit(@ring) == 0
+    var pfd: PollFd
+    pfd.fd = sv[1]
+    pfd.events = POLLIN
+    pfd.revents = 0
+    assert sys_poll(@pfd, 1, 100) == 0
+
+    # A failed or zero-byte send ends the session.
+    task.io_result = 0
+    assert m7sp_send_progress(task, s) == -1
+
+    uring_destroy(@ring)
+    sys_close(sv[0])
+    sys_close(sv[1])
+    free(got)
+    free(reply)
+    free(pool as *u8)
     0
