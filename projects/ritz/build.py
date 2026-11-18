@@ -911,6 +911,18 @@ def get_build_profile(config: dict, profile_name: str | None) -> dict:
     return result
 
 
+def wants_convenience_link(bin_config: "BinaryConfig") -> bool:
+    """Whether a build links `<pkg>/<name>` to the binary (AGAST #4131).
+
+    The link exists so host tests running with cwd=<pkg> can exec `./<name>`.
+    A freestanding binary (harland, uefi, x86_64-unknown-none) never runs on
+    the host and its consumers copy `build/<profile>/*.elf`, so a link would
+    only leave an untracked file in the package root that every new bin has
+    to gitignore by hand (projects/indium/fault_child blocked room teardown).
+    """
+    return not bin_config.freestanding
+
+
 def _crosses_foreign_symlink(logical: Path, root: Path) -> bool:
     """True if `logical` passes through a symlink that is not an ancestor of
     `root`, i.e. this tree reaches the package through a link another tree
@@ -2595,6 +2607,8 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
                 # No `<pkg>/<name>` link: the package dir is shared, and a
                 # link there would hand this tree's binary to the other's
                 # `./<name>` (#3818).
+                continue
+            if not wants_convenience_link(bin_config):
                 continue
 
             # RFC convention: maintain a symlink at pkg_dir/<name> pointing at
