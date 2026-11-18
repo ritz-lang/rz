@@ -78,6 +78,81 @@ def test_every_syscall_number_in_sys_is_target_gated():
     assert not ungated, "SYS_* in sys.ritz with no [[target_os]]: " + repr(ungated)
 
 
+# --- packages outside ritzlib take their numbers from sys.ritz too (#4121) ----
+
+PROJECTS = RITZ_ROOT.parent
+IMPORTS_SYS = re.compile(r"^import\s+ritzlib\.sys\b", re.M)
+# docs/archive is historical and not built (docs/archive/README.md).
+ARCHIVE = RITZ_ROOT / "docs" / "archive"
+
+# Numbers zeus, ritzunit, cryptosec, mausoleum and nexus used to redeclare
+# ungated; sys.ritz lacked them. x86_64 Linux ABI (arch/x86/entry/syscalls).
+LINUX_ADDED = {
+    "SYS_SENDMSG": 46, "SYS_RECVMSG": 47, "SYS_RT_SIGTIMEDWAIT": 128,
+    "SYS_PRCTL": 157, "SYS_SETRLIMIT": 160, "SYS_FUTEX": 202,
+    "SYS_GETRANDOM": 318, "SYS_MEMFD_CREATE": 319,
+}
+# Harland numbers indium's libharland/cat and prism used to redeclare; the
+# kernel-enum diff in test_harland_syscall_dispatch.py checks their values.
+HARLAND_ADDED = {"SYS_OPEN", "SYS_CLOSE", "SYS_FB_INFO", "SYS_FB_MAP"}
+SYS_VALUE = re.compile(r"^\s*(?:pub\s+)?const\s+(SYS_\w+)\s*:\s*\w+\s*=\s*(\d+)")
+
+
+def _sys_consts_beside_ritzlib_sys(files):
+    """[(path:line, name)] for each `const SYS_*` in a file importing ritzlib.sys."""
+    hits = []
+    for path in files:
+        src = path.read_text()
+        if not IMPORTS_SYS.search(src):
+            continue
+        for n, line in enumerate(src.splitlines(), 1):
+            m = CONST_SYS.match(line)
+            if m:
+                hits.append((f"{path}:{n}", m.group(1)))
+    return hits
+
+
+def _gated_table(src, os_name):
+    """{SYS_NAME: number} for each const directly under [[target_os = os_name]]."""
+    table = {}
+    prev = ""
+    for line in src.splitlines():
+        m = SYS_VALUE.match(line)
+        if m and prev.strip() == f'[[target_os = "{os_name}"]]':
+            table[m.group(1)] = int(m.group(2))
+        if line.strip():
+            prev = line
+    return table
+
+
+@pytest.mark.unit
+def test_no_package_redeclares_syscall_numbers_beside_ritzlib_sys():
+    # The harland kernel keeps its own `enum Syscall`, not ritzlib's table.
+    kernel = PROJECTS / "harland" / "kernel"
+    files = [p for p in sorted(PROJECTS.rglob("*.ritz"))
+             if p != SYS and ARCHIVE not in p.parents and kernel not in p.parents]
+    hits = _sys_consts_beside_ritzlib_sys(files)
+    assert not hits, "const SYS_* beside `import ritzlib.sys`: " + repr(hits)
+
+
+@pytest.mark.unit
+def test_beside_check_sees_a_redeclaration(tmp_path):
+    a = tmp_path / "a.ritz"
+    a.write_text("import ritzlib.sys { syscall1 }\nconst SYS_FB_MAP: i64 = 211\n")
+    b = tmp_path / "b.ritz"   # freestanding: no ritzlib.sys, its own table
+    b.write_text("const SYS_EXIT: i64 = 20\n")
+    hits = _sys_consts_beside_ritzlib_sys([a, b])
+    assert [name for _, name in hits] == ["SYS_FB_MAP"]
+
+
+@pytest.mark.unit
+def test_sys_declares_the_numbers_packages_used_to_redeclare():
+    src = SYS.read_text()
+    linux = _gated_table(src, "linux")
+    assert {k: linux.get(k) for k in LINUX_ADDED} == LINUX_ADDED
+    assert HARLAND_ADDED <= set(_gated_table(src, "harland"))
+
+
 @pytest.mark.unit
 def test_gating_check_sees_an_ungated_const():
     src = ('[[target_os = "linux"]]\nconst SYS_A: i64 = 1\n'
