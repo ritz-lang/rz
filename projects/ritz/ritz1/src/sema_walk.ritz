@@ -76,8 +76,21 @@ fn sema_vis_use(sm: *Sema, line: i32, col: i32, name: *u8, len: i32)
     eprints_cstr(h.via)
     eprints_cstr(c"` `pub import` it\n")
 
-# `scrut` is the match's scrutinee; null for an if-expression's arms.
-fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
+# AGAST #3042: what `owner`, an EXPR_IF / EXPR_MATCH, yields: the struct its
+# arm's value `body` is, typed in the arm's scope, with its bindings and
+# `let`s.  The first arm that types wins: ritz0 types an `if` by its
+# then-branch.  match_scrutinee_type reads it for `match (if c then b else d)`.
+fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
+    if owner == null or owner.value_ty_name != null or arm.is_pass != 0
+        return
+    var t: SemaTy
+    if sema_expr_ty(sm, arm.body, @t) == TYPE_STRUCT and t.name != null and t.name_len > 0
+        owner.value_ty_name = t.name
+        owner.value_ty_name_len = t.name_len
+
+# `scrut` is the match's scrutinee; null for an if-expression's arms.  `owner`
+# is the EXPR_IF / EXPR_MATCH the arms are of; null for a match statement.
+fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr)
     var arm: *MatchArm = arms
     while arm != null
         let mark: i32 = sm.scope_top
@@ -110,6 +123,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
             ref_loan_check_value(sm, arm.body)   # AGAST #3506
             ref_value_check_value(sm, arm.body)   # AGAST #3926
         sema_walk_expr(sm, arm.body)
+        sema_note_arm_value(sm, owner, arm)   # after it: a nested `if`'s own note
         ref_loan_leave()
         sm.scope_top = mark
         arm = arm.next
@@ -135,7 +149,7 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         var scrut: *Expr = null
         if k == EXPR_MATCH
             scrut = e.left
-        sema_walk_arms(sm, scrut, e.args as *MatchArm)
+        sema_walk_arms(sm, scrut, e.args as *MatchArm, e)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
         if k == EXPR_INDEX
             index_scalar_check(sm, e)   # AGAST #3755
@@ -301,7 +315,7 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             sema_walk_stmts(sm, st.while_body, 0)
         else if st.kind == STMT_MATCH
             sema_walk_expr(sm, st.if_cond)
-            sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm)
+            sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm, null)
         else if st.kind == STMT_RETURN
             bool_check_return(sm, st.return_value)
             if st.return_value != null

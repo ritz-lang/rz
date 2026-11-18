@@ -235,34 +235,78 @@ def test_ritz1_types_a_cast_scrutinee_by_its_target(request, tmp_path, compiler)
     assert not ll.exists()
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_refuses_an_arm_two_enums_declare_on_an_untyped_scrutinee(request, tmp_path, compiler):
-    """ritz1 can't type an `if` scrutinee, and `V` is A's and B's: refused, at the arm.
+# AGAST #3042: an `if` scrutinee is typed from its branches, as ritz0 types it,
+# so no arm has to guess its enum.  ritz1 refused the first two ("cannot tell
+# which enum V is of"; #2503 made that refusal located) and lowered the generic
+# one to IR clang rejects.  name -> (source, exit code).
+_IF_BC = "    let b: B = B.Q(4)\n    let c: B = B.V\n"
+IF_SCRUTINEE = {
+    # `V` is A's and B's: the then-branch's `b` says B.
+    "an_arm_two_enums_declare": (
+        _AB2 + _MAIN + _IF_BC + "    match (if true then b else c)\n        V => 1\n        Q(x) => x\n", 4),
+    # The ticket's: a generic enum's instance, `G$i32`.
+    "a_generic_enums_instance": (
+        "enum G<T>\n    Hold(T)\n    Gone\n" + _MAIN + "    let b: G<i32> = Hold(4)\n"
+        "    let c: G<i32> = Gone\n    match (if true then b else c)\n"
+        "        Hold(x) => x\n        Gone => 1\n", 4),
+    # A then-branch Sema can't type (a constructor) leaves it to the else-branch.
+    "only_the_else_branch_typed": (
+        _AB2 + _MAIN + "    let c: B = B.V\n    match (if true then B.Q(4) else c)\n"
+        "        V => 1\n        Q(x) => x\n", 4),
+    # The then-branch is an `if` itself, typed from its own branches; the
+    # else-branch can't say.
+    "a_nested_if": (
+        _AB2 + _MAIN + _IF_BC + "    match (if true then (if false then c else b) else B.V)\n"
+        "        V => 1\n        Q(x) => x\n", 4),
+}
 
-    It took A's, the first declared, and judged B's arms by it.  ritz0 types the
-    value and runs this; ritz1 refused it before too, as "missing P".
-    """
-    source = (_AB2 + _MAIN + "    let b: B = B.Q(4)\n    let c: B = B.V\n"
-              "    match (if true then b else c)\n        V => 1\n        Q(x) => x\n")
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(IF_SCRUTINEE))
+def test_an_if_scrutinee_is_typed_from_its_branches(request, tmp_path, compiler, name):
+    source, code = IF_SCRUTINEE[name]
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    assert proc.returncode == 0, f"{compiler}, {name}:\n{(proc.stdout + proc.stderr)[-1500:]}"
+    exe = tmp_path / "unit"
+    link = ["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"]
+    if compiler != "ritz0":
+        link.insert(3, str(RITZ_START))
+    fast_link.clang(link, check=True)
+    assert subprocess.run([str(exe)], timeout=60).returncode == code, f"{compiler}, {name}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_if_scrutinees_coverage_is_its_enums(request, tmp_path, compiler):
+    """Typed as B, the match that leaves out `Q` is missing B's `Q`, at the match."""
+    source = _AB2 + _MAIN + _IF_BC + "    match (if true then b else c)\n        V => 1\n"
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out[-1500:]
-    message = "cannot tell which enum V is of: A, B declare it"
-    assert re.search(rf"unit\.ritz:11:9: error: {re.escape(message)}", out, re.M), out[-1500:]
+    message = "non-exhaustive match: missing Q"
+    assert len(_located(compiler, out, 10, 5, message)) == 1, out[-1500:]
     assert message in _first(out), out[-1500:]
     assert not ll.exists()
 
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_counts_a_generic_enum_and_its_instance_as_one(request, tmp_path, compiler):
-    """`G` and the `G$i32` ritz1 records for it are one enum: no ambiguity."""
-    source = ("enum G<T>\n    Hold(T)\n    Gone\n" + _MAIN + "    let b: G<i32> = Hold(4)\n"
-              "    let c: G<i32> = Gone\n    match (if true then b else c)\n"
-              "        Hold(x) => x\n        Gone => 1\n")
-    proc, _ = _compile(request, compiler, tmp_path, source)
-    assert "cannot tell which enum" not in proc.stdout + proc.stderr
+def test_ritz1_refuses_an_arm_two_enums_declare_on_an_untyped_scrutinee(request, tmp_path, compiler):
+    """Neither branch types (both are constructors), and `V` is A's and B's: refused, at the arm.
+
+    ritz1 took A's, the first declared, and judged B's arms by it (#2503).
+    ritz0 types the value and runs this.
+    """
+    source = (_AB2 + _MAIN + "    match (if true then B.Q(4) else B.V)\n"
+              "        V => 1\n        Q(x) => x\n")
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    out = proc.stdout + proc.stderr
+    assert proc.returncode != 0, out[-1500:]
+    message = "cannot tell which enum V is of: A, B declare it"
+    assert re.search(rf"unit\.ritz:9:9: error: {re.escape(message)}", out, re.M), out[-1500:]
+    assert message in _first(out), out[-1500:]
+    assert not ll.exists()
 
 
 @pytest.mark.integration
