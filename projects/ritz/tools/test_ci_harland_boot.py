@@ -174,7 +174,10 @@ KEY_OK = (
     r"key event code=30 value=1\n"
 )
 SUITE_PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
-PASSED = KEY_OK + SUITE_PASSED
+# The native boot's virtio-blk is modern-only and offers 1024-entry queues;
+# the driver must take the MMIO transport and cap the queue (AGAST #3576).
+BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
+PASSED = BLK_MODERN + KEY_OK + SUITE_PASSED
 
 
 @pytest.fixture
@@ -303,17 +306,41 @@ def test_boot_attaches_a_keyboard_and_a_monitor_socket(tree):
     assert "-monitor unix:" in argv
 
 
+def test_native_boot_attaches_a_modern_only_blk_with_1024_entry_queues(tree):
+    """Without disable-legacy=on QEMU's virtio-blk is transitional and the
+    driver takes the legacy I/O-port path; queue-size=1024 is what makes the
+    256-entry cap matter (AGAST #3576)."""
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = (tree["tmp"] / "stub.log").read_text()
+    assert "virtio-blk-pci,drive=initramfs,disable-legacy=on,queue-size=1024" in argv
+
+
+@pytest.mark.parametrize(
+    "blk_line",
+    [
+        r"[virtio-blk] Device 0 initialized (64 MB, legacy, queue 256)\n",
+        r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 1024)\n",
+    ],
+    ids=["legacy-transport", "queue-not-capped"],
+)
+def test_native_blk_not_modern_with_a_256_entry_queue_fails(tree, blk_line):
+    r = _run(tree, blk_line + KEY_OK + SUITE_PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "virtio-blk did not come up over the modern transport" in r.stdout
+
+
 def test_suite_passed_but_key_never_arrived_fails(tree):
     """ALL TESTS PASSED is not enough: init's input check skips without a
     key, so the script itself must see the key reach the kernel and init."""
-    r = _run(tree, r"  [OK] VirtIO input device\n" + SUITE_PASSED)
+    r = _run(tree, BLK_MODERN + r"  [OK] VirtIO input device\n" + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS (native): init Tier-1 suite" in r.stdout
     assert "injected key A never reached the kernel input queue" in r.stdout
 
 
 def test_keyboard_that_never_came_up_fails(tree):
-    r = _run(tree, SUITE_PASSED)
+    r = _run(tree, BLK_MODERN + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "virtio-keyboard-pci did not come up" in r.stdout
 

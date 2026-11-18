@@ -6,11 +6,15 @@
 # Two boots, both with the initramfs on a virtio-blk disk and a modern-only
 # virtio-keyboard-pci (no I/O BAR, AGAST #3438):
 #   native  OVMF -> Harland's own BOOTX64.EFI -> kernel.elf. The suite must
-#           report ALL TESTS PASSED.
+#           report ALL TESTS PASSED. Its virtio-blk is modern-only
+#           (disable-legacy=on, AGAST #3576), so the initramfs is read over
+#           the MMIO transport, and offers 1024-entry queues: the driver must
+#           cap the queue at the 256 its rings hold ("queue 256").
 #   grub    OVMF -> standalone GRUB-EFI -> multiboot2 harland.elf. The
 #           kernel takes its framebuffer from the multiboot2 framebuffer tag
 #           (#2143). The display driver must come up and the suite must also
-#           report ALL TESTS PASSED.
+#           report ALL TESTS PASSED. Its virtio-blk is QEMU's default
+#           transitional device, so the legacy I/O-port path stays covered.
 # Each boot also injects `sendkey a` through the QEMU monitor once the kernel
 # logs "[OK] VirtIO input device"; the key must reach the kernel's input queue
 # ("[virtio-input] event type=1 code=30 value=1") and init's input check.
@@ -103,9 +107,11 @@ done
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 
-# boot NAME ESP_DIR: boot one ESP, leaving the serial log in $WORK/NAME.log.
+# boot NAME ESP_DIR BLK_OPTS: boot one ESP with the initramfs disk on
+# virtio-blk-pci,drive=initramfs<BLK_OPTS>, leaving the serial log in
+# $WORK/NAME.log.
 boot() {
-    local name="$1" esp="$2" serial="$WORK/$1.log"
+    local name="$1" esp="$2" blk_opts="$3" serial="$WORK/$1.log"
     local vars=()
     if [ -n "$OVMF_VARS" ]; then
         cp "$OVMF_VARS" "$WORK/$name-vars.fd"
@@ -119,7 +125,7 @@ boot() {
         -display none -no-reboot -monitor "unix:$WORK/$name-mon.sock,server,nowait" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
-        -device virtio-blk-pci,drive=initramfs \
+        -device "virtio-blk-pci,drive=initramfs$blk_opts" \
         -device virtio-keyboard-pci \
         -drive "file=$WORK/$name-initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
         -serial "file:$serial" >/dev/null 2>&1 &
@@ -170,6 +176,18 @@ key_received() {
     return $ok
 }
 
+# blk_transport NAME WANT: pass only if virtio-blk device 0 came up on the
+# WANT transport (modern|legacy) with a 256-entry request queue.
+blk_transport() {
+    if grep -aqE "\[virtio-blk\] Device 0 initialized \([0-9]+ MB, $2, queue 256\)" "$WORK/$1.log"; then
+        echo "PASS ($1): virtio-blk came up over the $2 transport with a 256-entry queue"
+    else
+        grep -a "\[virtio-blk\]" "$WORK/$1.log" | head -5
+        echo "FAIL ($1): virtio-blk did not come up over the $2 transport with a 256-entry queue"
+        return 1
+    fi
+}
+
 # no_exception NAME: fail if the kernel took an exception or panicked.
 no_exception() {
     if grep -aqE "EXCEPTION|KERNEL PANIC" "$WORK/$1.log"; then
@@ -196,8 +214,9 @@ if [ "$MODE" != grub ]; then
     mkdir -p "$WORK/esp-native/EFI/BOOT" "$WORK/esp-native/harland"
     cp "$LOADER_EFI" "$WORK/esp-native/EFI/BOOT/BOOTX64.EFI"
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
-    boot native "$WORK/esp-native"
+    boot native "$WORK/esp-native" ",disable-legacy=on,queue-size=1024"
     all_passed native || rc=1
+    blk_transport native modern || rc=1
     key_received native || rc=1
 fi
 
@@ -213,7 +232,7 @@ EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
         || setup_error "grub-mkstandalone failed"
-    boot grub "$WORK/esp-grub"
+    boot grub "$WORK/esp-grub" ""
     # The framebuffer must come from the multiboot2 tag, not just be absent
     # and tolerated (#2143).
     if grep -aq "\[OK\] Display driver" "$WORK/grub.log"; then
@@ -223,6 +242,7 @@ EOF
         rc=1
     fi
     all_passed grub || rc=1
+    blk_transport grub legacy || rc=1
     key_received grub || rc=1
 fi
 

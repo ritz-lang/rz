@@ -37,6 +37,16 @@ const VIRTIO_PCI_STATUS: u16 = 18          # R/W: Device status (8-bit)
 const VIRTIO_PCI_ISR: u16 = 19             # R: ISR status (8-bit)
 const VIRTIO_PCI_CONFIG: u16 = 20          # Device-specific config starts here
 
+# With MSI-X enabled the legacy header grows by two 16-bit vector registers
+# and the device-specific config moves to 24 (virtio 1.1 §4.1.4.8).
+const VIRTIO_PCI_MSI_CONFIG_VECTOR: u16 = 20   # R/W: config change vector
+const VIRTIO_PCI_MSI_QUEUE_VECTOR: u16 = 22    # R/W: selected queue's vector
+const VIRTIO_PCI_CONFIG_MSIX: u16 = 24
+
+# MSI-X vector register value for "no vector"; a device also reads it back
+# when it can't take the vector it was given.
+pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF
+
 # ============================================================================
 # VirtIO PCI Capability Types (Modern MMIO transport)
 # ============================================================================
@@ -74,6 +84,7 @@ const VIRTIO_MMIO_QUEUE_AVAIL_HI: u32 = 0x2C       # W: Avail ring addr (high)
 const VIRTIO_MMIO_QUEUE_USED_LO: u32 = 0x30        # W: Used ring addr (low)
 const VIRTIO_MMIO_QUEUE_USED_HI: u32 = 0x34        # W: Used ring addr (high)
 const VIRTIO_MMIO_DEVICE_STATUS: u32 = 0x14        # R/W: Device status (8-bit)
+const VIRTIO_MMIO_MSIX_CONFIG: u32 = 0x10          # R/W: Config change MSI-X vector
 
 # VIRTIO_F_VERSION_1 is feature bit 32: bit 0 of feature word 1.
 const VIRTIO_F_VERSION_1_HI: u32 = 1
@@ -96,6 +107,12 @@ pub struct VringDesc
     len: u32            # Length of buffer
     flags: u16          # VRING_DESC_F_* flags
     next: u16           # Index of next descriptor if F_NEXT is set
+
+# The most entries a virtqueue may have: VringAvail/VringUsed and the ring
+# allocation in vio_setup_queue are sized for it. A modern device may offer
+# more (queue_size is R/W there, so vio_setup_queue writes the cap); a legacy
+# device's size is fixed, so one offering more is refused.
+pub const VIRTQ_MAX_SIZE: u16 = 256
 
 # Available ring header + ring entries
 pub struct VringAvail
@@ -168,7 +185,8 @@ pub struct VirtioDevice
     queues: [16]*Virtqueue  # Up to 16 queues per device
     status: u8              # Current device status
     transport: u8           # VIO_TRANSPORT_LEGACY or VIO_TRANSPORT_MMIO
-    _padding: [2]u8
+    msix_on: u8             # 1 once the driver enabled MSI-X (moves legacy config to 24)
+    version_1: u8           # 1 if VIRTIO_F_VERSION_1 was negotiated
     # Modern MMIO transport addresses (from PCI capabilities)
     mmio_common: u64        # Common config MMIO base
     mmio_notify: u64        # Notification MMIO base
@@ -297,6 +315,7 @@ pub fn vio_set_features(dev: *VirtioDevice, features: u32)
         mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, features)
         mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES_SEL as u64, 1)
         mmio_write32(common + VIRTIO_MMIO_DRIVER_FEATURES as u64, dev_hi & VIRTIO_F_VERSION_1_HI)
+        (*dev).version_1 = (dev_hi & VIRTIO_F_VERSION_1_HI) as u8
     else
         vio_write32(dev, VIRTIO_PCI_GUEST_FEATURES, features)
 
@@ -329,6 +348,14 @@ pub fn vio_get_queue_size(dev: *VirtioDevice, queue_idx: u16) -> u16
         return vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
 
 pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
+    return vio_setup_queue_vec(dev, queue_idx, VIRTIO_MSI_NO_VECTOR)
+
+# Set up queue `queue_idx`, signalling MSI-X table entry `msix_vector`
+# (VIRTIO_MSI_NO_VECTOR for none; MSI-X must already be enabled otherwise).
+# The queue gets min(device max, VIRTQ_MAX_SIZE) entries. Returns 0 if the
+# queue doesn't exist, is legacy and larger than VIRTQ_MAX_SIZE, or refuses
+# the vector.
+pub fn vio_setup_queue_vec(dev: *VirtioDevice, queue_idx: u16, msix_vector: u16) -> *Virtqueue
     # Select the queue
     if (*dev).transport == VIO_TRANSPORT_MMIO
         mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SEL as u64, queue_idx)
@@ -343,6 +370,33 @@ pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
         num = vio_read16(dev, VIRTIO_PCI_QUEUE_SIZE)
     if num == 0
         return 0 as *Virtqueue
+    if num > VIRTQ_MAX_SIZE
+        if (*dev).transport != VIO_TRANSPORT_MMIO
+            prints("[virtio] legacy queue ")
+            serial_print_dec(queue_idx as u64)
+            prints(" has ")
+            serial_print_dec(num as u64)
+            prints(" entries, more than the 256 supported\n")
+            return 0 as *Virtqueue
+        # Modern queue_size is R/W: take only what the rings hold (§4.1.4.3)
+        num = VIRTQ_MAX_SIZE
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_SIZE as u64, num)
+
+    # The queue's MSI-X vector, while the queue is selected and before it is
+    # enabled. The device reads back NO_VECTOR if it couldn't take it.
+    if msix_vector != VIRTIO_MSI_NO_VECTOR
+        var got: u16 = 0
+        if (*dev).transport == VIO_TRANSPORT_MMIO
+            mmio_write16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_MSIX_VEC as u64, msix_vector)
+            got = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_QUEUE_MSIX_VEC as u64)
+        else
+            vio_write16(dev, VIRTIO_PCI_MSI_QUEUE_VECTOR, msix_vector)
+            got = vio_read16(dev, VIRTIO_PCI_MSI_QUEUE_VECTOR)
+        if got == VIRTIO_MSI_NO_VECTOR
+            prints("[virtio] queue ")
+            serial_print_dec(queue_idx as u64)
+            prints(" refused its MSI-X vector\n")
+            return 0 as *Virtqueue
 
     # Allocate virtqueue structure
     let vq: *Virtqueue = kalloc(VIRTQUEUE_SIZE) as *Virtqueue
@@ -372,7 +426,7 @@ pub fn vio_setup_queue(dev: *VirtioDevice, queue_idx: u16) -> *Virtqueue
         kfree(vq)
         return 0 as *Virtqueue
 
-    # Allocate additional pages if needed (up to 4 pages for large queues)
+    # Allocate additional pages if needed (3 pages for a VIRTQ_MAX_SIZE queue)
     var extra_page: u64 = 1
     while extra_page < pages_needed
         let next_page: u64 = pmm_alloc_page()
@@ -544,6 +598,8 @@ pub fn vio_init_device(pci_dev: *PciDevice) -> *VirtioDevice
     (*dev).mmio_isr = 0
     (*dev).mmio_device = 0
     (*dev).notify_multiplier = 0
+    (*dev).msix_on = 0
+    (*dev).version_1 = 0
 
     # Try legacy I/O transport first (BAR0 as I/O space)
     if (*pci_dev).bar_is_io[0] != 0
@@ -653,27 +709,62 @@ pub fn vio_device_ready(dev: *VirtioDevice) -> i32
 
     return 0
 
+# Read (and so acknowledge) the ISR status: bit 0 queue interrupt, bit 1
+# config change. 0 on a modern device without an ISR region.
+pub fn vio_read_isr(dev: *VirtioDevice) -> u8
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        if (*dev).mmio_isr == 0
+            return 0
+        return mmio_read8((*dev).mmio_isr)
+    return vio_read8(dev, VIRTIO_PCI_ISR)
+
+# Note that the driver enabled MSI-X on the PCI function: on the legacy
+# transport this moves the device-specific config from offset 20 to 24.
+pub fn vio_note_msix_on(dev: *VirtioDevice)
+    (*dev).msix_on = 1
+
+# Route config-change interrupts to MSI-X table entry `vector`. Returns 0, or
+# -1 if the device read back VIRTIO_MSI_NO_VECTOR (it couldn't take it).
+pub fn vio_set_config_msix_vector(dev: *VirtioDevice, vector: u16) -> i32
+    var got: u16 = 0
+    if (*dev).transport == VIO_TRANSPORT_MMIO
+        mmio_write16((*dev).mmio_common + VIRTIO_MMIO_MSIX_CONFIG as u64, vector)
+        got = mmio_read16((*dev).mmio_common + VIRTIO_MMIO_MSIX_CONFIG as u64)
+    else
+        vio_write16(dev, VIRTIO_PCI_MSI_CONFIG_VECTOR, vector)
+        got = vio_read16(dev, VIRTIO_PCI_MSI_CONFIG_VECTOR)
+    if got == VIRTIO_MSI_NO_VECTOR
+        return -1
+    return 0
+
 # ============================================================================
 # Config Space Access (device-specific configuration)
 # ============================================================================
+
+# I/O port of legacy device-config byte `offset` (it follows the MSI-X
+# vector registers once MSI-X is on)
+fn vio_legacy_config_port(dev: *VirtioDevice, offset: u16) -> u16
+    if (*dev).msix_on != 0
+        return (*dev).io_base + VIRTIO_PCI_CONFIG_MSIX + offset
+    return (*dev).io_base + VIRTIO_PCI_CONFIG + offset
 
 pub fn vio_read_config8(dev: *VirtioDevice, offset: u16) -> u8
     if (*dev).transport == VIO_TRANSPORT_MMIO
         return mmio_read8((*dev).mmio_device + (offset as u64))
     else
-        return inb((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+        return inb(vio_legacy_config_port(dev, offset))
 
 pub fn vio_read_config16(dev: *VirtioDevice, offset: u16) -> u16
     if (*dev).transport == VIO_TRANSPORT_MMIO
         return mmio_read16((*dev).mmio_device + (offset as u64))
     else
-        return inw((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+        return inw(vio_legacy_config_port(dev, offset))
 
 pub fn vio_read_config32(dev: *VirtioDevice, offset: u16) -> u32
     if (*dev).transport == VIO_TRANSPORT_MMIO
         return mmio_read32((*dev).mmio_device + (offset as u64))
     else
-        return inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
+        return inl(vio_legacy_config_port(dev, offset))
 
 pub fn vio_read_config64(dev: *VirtioDevice, offset: u16) -> u64
     var low: u32 = 0
@@ -682,6 +773,6 @@ pub fn vio_read_config64(dev: *VirtioDevice, offset: u16) -> u64
         low = mmio_read32((*dev).mmio_device + (offset as u64))
         high = mmio_read32((*dev).mmio_device + (offset as u64) + 4)
     else
-        low = inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset)
-        high = inl((*dev).io_base + VIRTIO_PCI_CONFIG + offset + 4)
+        low = inl(vio_legacy_config_port(dev, offset))
+        high = inl(vio_legacy_config_port(dev, offset + 4))
     return ((high as u64) << 32) | (low as u64)

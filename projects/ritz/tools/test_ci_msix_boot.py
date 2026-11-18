@@ -4,7 +4,9 @@
 projects/harland/tools/test_msix_boot.sh boots the kernel under OVMF with a
 virtio-net NIC and an NVMe controller. It passes only if the NVMe's MSI-X
 table is found, virtio-net comes up in MSI-X mode, the NIC's interrupt
-counter is > 0, and init's Tier-1 suite still reports ALL TESTS PASSED.
+counter is > 0, and init's Tier-1 suite still reports ALL TESTS PASSED. The
+NIC is modern-only with a 1024-entry RX queue (AGAST #3576), so it must also
+come up over the MMIO transport, cap that queue at 256 and get a DHCP lease.
 
 It is a build-all step after the Tier-1 boot, so every room's gate runs it.
 Like that boot (test_ci_harland_boot.py), these tests pin:
@@ -73,7 +75,13 @@ def interrupts(n: int) -> str:
     return rf"[msix] virtio-net interrupts: {n}\n"
 
 
-PASSED = NVME_TABLE + NIC_ON + interrupts(8) + SUITE_PASSED
+NET_MODERN = r"[virtio-net] Transport: modern (MMIO)\n"
+RX_CAPPED = r"[virtio-net] Queue 0: size=256 (device max 1024)\n"
+DHCP_OK = r"[dhcp] Configured!\n"
+MODERN_OK = NET_MODERN + RX_CAPPED + DHCP_OK
+
+
+PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + SUITE_PASSED
 
 
 # --------------------------------------------------------------------------
@@ -218,33 +226,51 @@ def test_boot_attaches_a_nic_on_user_net_and_an_nvme(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
     argv = (tree["tmp"] / "stub.log").read_text()
-    assert "virtio-net-pci,netdev=net0" in argv
+    assert (
+        "virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024"
+        in argv
+    )
     assert "-netdev user,id=net0" in argv
     assert "-device nvme," in argv
+
+
+@pytest.mark.parametrize(
+    "drop, want",
+    [
+        (NET_MODERN, "was not driven over the modern (MMIO) transport"),
+        (RX_CAPPED, "RX queue was not capped from 1024 to 256"),
+        (DHCP_OK, "DHCP got no lease"),
+    ],
+    ids=["legacy-transport", "queue-not-capped", "no-dhcp-lease"],
+)
+def test_modern_nic_check_missing_fails(tree, drop, want):
+    r = _run(tree, PASSED.replace(drop, ""))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert want in r.stdout
 
 
 def test_zero_interrupts_fails(tree):
     """The NIC in MSI-X mode but nothing delivered: the mutation that drops
     msix_dispatch from irq_handler, or leaves the table entries masked."""
-    r = _run(tree, NVME_TABLE + NIC_ON + interrupts(0) + SUITE_PASSED)
+    r = _run(tree, NVME_TABLE + MODERN_OK + NIC_ON + interrupts(0) + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "counter is 0, want > 0" in r.stdout
 
 
 def test_missing_counter_fails(tree):
-    r = _run(tree, NVME_TABLE + NIC_ON + SUITE_PASSED)
+    r = _run(tree, NVME_TABLE + MODERN_OK + NIC_ON + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "counter is missing" in r.stdout
 
 
 def test_nic_not_in_msix_mode_fails(tree):
-    r = _run(tree, NVME_TABLE + interrupts(3) + SUITE_PASSED)
+    r = _run(tree, NVME_TABLE + MODERN_OK + interrupts(3) + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "did not come up in MSI-X mode" in r.stdout
 
 
 def test_no_nvme_msix_table_fails(tree):
-    r = _run(tree, NIC_ON + interrupts(3) + SUITE_PASSED)
+    r = _run(tree, MODERN_OK + NIC_ON + interrupts(3) + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "NVMe controller" in r.stdout
 

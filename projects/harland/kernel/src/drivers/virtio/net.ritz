@@ -3,52 +3,21 @@
 # Implements a driver for VirtIO network devices (virtio-net).
 # This allows sending and receiving Ethernet frames via QEMU's virtual NIC.
 #
-# Currently uses its own VirtIO implementation (legacy PCI interface).
-# TODO: Refactor to use drivers/virtio/common.ritz like blk.ritz does.
+# Built on drivers/virtio/common.ritz, so it drives the NIC over either PCI
+# transport: legacy (BAR0 I/O ports, QEMU's transitional default) or modern
+# (virtio 1.x MMIO capabilities: disable-legacy=on, real hardware), AGAST #3576.
 #
 # Reference: https://docs.oasis-open.org/virtio/virtio/v1.1/cs01/virtio-v1.1-cs01.html
 
-import io { inb, outb, inw, outw, inl, outl, memory_barrier, read_barrier }
+import io { memory_barrier, read_barrier }
 import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
-import drivers.pci { PciDevice, pci_find_virtio, pci_enable_bus_master, pci_enable_io, VIRTIO_DEVICE_NET }
-import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import drivers.pci { PciDevice, pci_find_virtio, VIRTIO_DEVICE_NET }
 import mm.vmm { vmm_virt_to_phys }
 import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
-
-# ============================================================================
-# VirtIO PCI Legacy Register Offsets (BAR0 I/O space)
-# ============================================================================
-
-const VIRTIO_PCI_HOST_FEATURES: u16 = 0      # 4 bytes - features offered by device
-const VIRTIO_PCI_GUEST_FEATURES: u16 = 4     # 4 bytes - features accepted by driver
-const VIRTIO_PCI_QUEUE_PFN: u16 = 8          # 4 bytes - physical page number of virtqueue
-const VIRTIO_PCI_QUEUE_SIZE: u16 = 12        # 2 bytes - max size of virtqueue
-const VIRTIO_PCI_QUEUE_SEL: u16 = 14         # 2 bytes - current virtqueue selector
-const VIRTIO_PCI_QUEUE_NOTIFY: u16 = 16      # 2 bytes - notify device of queue activity
-const VIRTIO_PCI_DEVICE_STATUS: u16 = 18     # 1 byte - device status register
-const VIRTIO_PCI_ISR_STATUS: u16 = 19        # 1 byte - interrupt status
-const VIRTIO_PCI_CONFIG_OFFSET: u16 = 20     # Device-specific config starts here
-
-# With MSI-X enabled the legacy header grows by two 16-bit vector registers
-# and the device-specific config moves to 24 (virtio 1.1 §4.1.4.8).
-const VIRTIO_MSI_CONFIG_VECTOR: u16 = 20     # 2 bytes - config change vector
-const VIRTIO_MSI_QUEUE_VECTOR: u16 = 22      # 2 bytes - selected queue's vector
-const VIRTIO_PCI_CONFIG_OFFSET_MSIX: u16 = 24
-const VIRTIO_MSI_NO_VECTOR: u16 = 0xFFFF
+import drivers.virtio.common { VirtioDevice, Virtqueue, VringDesc, VIO_TRANSPORT_MMIO, VIRTIO_MSI_NO_VECTOR, VIRTIO_STATUS_FAILED, vio_init_device, vio_add_status, vio_device_ready, vio_get_features, vio_set_features, vio_features_ok, vio_get_queue_size, vio_setup_queue_vec, vio_read_isr, vio_note_msix_on, vio_set_config_msix_vector, vio_read_config8, vio_read_config16, vq_alloc_desc, vq_free_desc, vq_get_desc, vq_submit, vq_notify, vq_has_used, vq_get_used, vq_get_used_len, VRING_DESC_F_WRITE }
 
 # MSI-X table entries this driver uses: config changes, RX queue, TX queue
 const VIRTIO_NET_MSIX_ENTRIES: u16 = 3
-
-# ============================================================================
-# VirtIO Device Status Bits
-# ============================================================================
-
-const VIRTIO_STATUS_ACKNOWLEDGE: u8 = 1      # Guest OS has found the device
-const VIRTIO_STATUS_DRIVER: u8 = 2           # Guest OS knows how to drive the device
-const VIRTIO_STATUS_DRIVER_OK: u8 = 4        # Driver is set up and ready
-const VIRTIO_STATUS_FEATURES_OK: u8 = 8      # Feature negotiation complete
-const VIRTIO_STATUS_DEVICE_NEEDS_RESET: u8 = 64
-const VIRTIO_STATUS_FAILED: u8 = 128         # Something went wrong
 
 # ============================================================================
 # VirtIO-Net Feature Bits
@@ -66,61 +35,9 @@ pub const VIRTIO_NET_F_MRG_RXBUF: u32 = 0x8000   # Driver can merge receive buff
 pub const VIRTIO_NET_F_STATUS: u32 = 0x10000     # Device provides link status
 pub const VIRTIO_NET_F_CTRL_VQ: u32 = 0x20000    # Control virtqueue available
 
-# ============================================================================
-# VirtIO Ring Flags
-# ============================================================================
-
-const VIRTQ_DESC_F_NEXT: u16 = 1             # Buffer continues in next descriptor
-const VIRTQ_DESC_F_WRITE: u16 = 2            # Buffer is write-only (device writes)
-const VIRTQ_DESC_F_INDIRECT: u16 = 4         # Buffer contains indirect descriptors
-
-const VIRTQ_AVAIL_F_NO_INTERRUPT: u16 = 1    # Suppress interrupts
-const VIRTQ_USED_F_NO_NOTIFY: u16 = 1        # Suppress notifications
-
-# ============================================================================
-# VirtIO Descriptor Ring Structures
-# ============================================================================
-
-# VirtQueue Descriptor (16 bytes each)
-struct VirtqDesc
-    addr: u64       # Physical address of buffer
-    len: u32        # Length of buffer
-    flags: u16      # VIRTQ_DESC_F_* flags
-    next: u16       # Index of next descriptor if NEXT flag set
-
-# VirtQueue Available Ring
-struct VirtqAvail
-    flags: u16
-    idx: u16        # Where driver will write next available index
-    ring: u16       # First element of ring[queue_size] array
-
-# VirtQueue Used Element (8 bytes)
-struct VirtqUsedElem
-    id: u32         # Index of start of used descriptor chain
-    len: u32        # Length written by device
-
-# VirtQueue Used Ring
-struct VirtqUsed
-    flags: u16
-    idx: u16        # Where device will write next used index
-    ring: VirtqUsedElem  # First element of ring[queue_size] array
-
-# ============================================================================
-# VirtQueue Runtime State
-# ============================================================================
-
-const VIRTQ_MAX_SIZE: u32 = 256
-
-struct VirtQueue
-    desc: *VirtqDesc
-    avail: *VirtqAvail
-    used: *VirtqUsed
-    size: u16
-    free_head: u16
-    num_free: u16
-    last_used_idx: u16
-    queue_index: u16
-    io_base: u16
+# Device-specific config (virtio 1.1 §5.1.4): mac[6] then status u16
+const VIRTIO_NET_CFG_MAC: u16 = 0
+const VIRTIO_NET_CFG_STATUS: u16 = 6
 
 # ============================================================================
 # VirtIO Network Device State
@@ -128,9 +45,10 @@ struct VirtQueue
 
 pub struct VirtioNetDevice
     pci_dev: *PciDevice
-    io_base: u16
-    rx_queue: VirtQueue
-    tx_queue: VirtQueue
+    vdev: *VirtioDevice     # Common-layer device (either transport)
+    rx_queue: *Virtqueue
+    tx_queue: *Virtqueue
+    hdr_size: u32           # VIRTIO_NET_HDR_SIZE[_V1]
     features: u32
     mac: [6]u8
     initialized: u8
@@ -146,8 +64,12 @@ struct VirtioNetHdr
     gso_size: u16
     csum_start: u16
     csum_offset: u16
+    # num_buffers: u16  # Only with VERSION_1 or MRG_RXBUF
 
+# The legacy header without MRG_RXBUF is 10 bytes; with VIRTIO_F_VERSION_1
+# it always carries num_buffers and is 12 (virtio 1.1 §5.1.6).
 const VIRTIO_NET_HDR_SIZE: u32 = 10
+const VIRTIO_NET_HDR_SIZE_V1: u32 = 12
 
 const VIRTIO_NET_HDR_GSO_NONE: u8 = 0
 const VIRTIO_NET_HDR_GSO_TCPV4: u8 = 1
@@ -183,93 +105,15 @@ var virtio_tx_buffers: [65536]u8  # 32 * 2048 = 64KB
 var virtio_net_msix: MsixInfo
 var virtio_net_msix_on: u8 = 0
 var virtio_net_vectors: [3]u8
-var virtio_net_config_off: u16 = 20   # VIRTIO_PCI_CONFIG_OFFSET[_MSIX]
-
-# ============================================================================
-# Register Access Helpers
-# ============================================================================
-
-fn virtio_read8(dev: *VirtioNetDevice, offset: u16) -> u8
-    return inb((*dev).io_base + offset)
-
-fn virtio_read16(dev: *VirtioNetDevice, offset: u16) -> u16
-    return inw((*dev).io_base + offset)
-
-fn virtio_read32(dev: *VirtioNetDevice, offset: u16) -> u32
-    return inl((*dev).io_base + offset)
-
-fn virtio_write8(dev: *VirtioNetDevice, offset: u16, value: u8)
-    outb((*dev).io_base + offset, value)
-
-fn virtio_write16(dev: *VirtioNetDevice, offset: u16, value: u16)
-    outw((*dev).io_base + offset, value)
-
-fn virtio_write32(dev: *VirtioNetDevice, offset: u16, value: u32)
-    outl((*dev).io_base + offset, value)
-
-# ============================================================================
-# Device Status Management
-# ============================================================================
-
-fn virtio_reset(dev: *VirtioNetDevice)
-    virtio_write8(dev, VIRTIO_PCI_DEVICE_STATUS, 0)
-
-fn virtio_set_status(dev: *VirtioNetDevice, status: u8)
-    virtio_write8(dev, VIRTIO_PCI_DEVICE_STATUS, status)
-
-fn virtio_get_status(dev: *VirtioNetDevice) -> u8
-    return virtio_read8(dev, VIRTIO_PCI_DEVICE_STATUS)
-
-fn virtio_add_status(dev: *VirtioNetDevice, status: u8)
-    let current: u8 = virtio_get_status(dev)
-    virtio_set_status(dev, current | status)
-
-# ============================================================================
-# VirtQueue Memory Layout
-# ============================================================================
-
-fn virtq_size_desc(queue_size: u32) -> u32
-    return queue_size * 16
-
-fn virtq_size_avail(queue_size: u32) -> u32
-    return 6 + (queue_size * 2)
-
-fn virtq_size_used(queue_size: u32) -> u32
-    return 6 + (queue_size * 8)
-
-fn virtq_align_up(size: u64, alignment: u64) -> u64
-    return (size + alignment - 1) & (0 - alignment)
-
-fn virtq_total_size(queue_size: u32) -> u64
-    let desc_avail: u64 = (virtq_size_desc(queue_size) + virtq_size_avail(queue_size)) as u64
-    let desc_avail_aligned: u64 = virtq_align_up(desc_avail, 4096)
-    let used: u64 = virtq_size_used(queue_size) as u64
-    return desc_avail_aligned + used
 
 # ============================================================================
 # VirtQueue Operations
 # ============================================================================
 
-fn virtq_alloc_desc(vq: *VirtQueue) -> i32
-    if (*vq).num_free == 0
-        return -1
-
-    let idx: u16 = (*vq).free_head
-    let desc_ptr: *VirtqDesc = ((*vq).desc as u64 + (idx as u64 * 16)) as *VirtqDesc
-    (*vq).free_head = (*desc_ptr).next
-    (*vq).num_free = (*vq).num_free - 1
-
-    return idx as i32
-
-fn virtq_free_desc(vq: *VirtQueue, idx: u16)
-    let desc_ptr: *VirtqDesc = ((*vq).desc as u64 + (idx as u64 * 16)) as *VirtqDesc
-    (*desc_ptr).next = (*vq).free_head
-    (*desc_ptr).flags = VIRTQ_DESC_F_NEXT
-    (*vq).free_head = idx
-    (*vq).num_free = (*vq).num_free + 1
-
-fn virtq_add_buf(vq: *VirtQueue, addr: u64, len: u32, flags: u16) -> i32
-    let desc_idx: i32 = virtq_alloc_desc(vq)
+# Post one buffer (kernel virtual `addr`) to `vq`. Returns its descriptor
+# index, or -1 if the queue is full or the buffer has no physical address.
+fn virtq_add_buf(vq: *Virtqueue, addr: u64, len: u32, flags: u16) -> i32
+    let desc_idx: i32 = vq_alloc_desc(vq)
     if desc_idx < 0
         return -1
 
@@ -278,149 +122,69 @@ fn virtq_add_buf(vq: *VirtQueue, addr: u64, len: u32, flags: u16) -> i32
         if addr < 0x100000000
             phys_addr = addr
         else
-            virtq_free_desc(vq, desc_idx as u16)
+            vq_free_desc(vq, desc_idx as u16)
             return -1
 
-    let desc_ptr: *VirtqDesc = ((*vq).desc as u64 + (desc_idx as u64 * 16)) as *VirtqDesc
+    let desc_ptr: *VringDesc = vq_get_desc(vq, desc_idx as u16)
     (*desc_ptr).addr = phys_addr
     (*desc_ptr).len = len
     (*desc_ptr).flags = flags
     (*desc_ptr).next = 0
 
-    let avail: *VirtqAvail = (*vq).avail
-    let avail_idx: u16 = (*avail).idx
-    let ring_idx: u16 = avail_idx & ((*vq).size - 1)
-
-    let ring_ptr: *u16 = (avail as u64 + 4 + (ring_idx as u64 * 2)) as *u16
-    *ring_ptr = desc_idx as u16
-
-    memory_barrier()
-
-    (*avail).idx = avail_idx + 1
-
+    vq_submit(vq, desc_idx as u16)
     return desc_idx
 
-fn virtq_kick(vq: *VirtQueue)
+fn virtq_kick(vq: *Virtqueue)
+    # The new avail index must be visible before the device is told
     memory_barrier()
+    vq_notify(vq)
 
-    virtio_write16(@virtio_net, VIRTIO_PCI_QUEUE_NOTIFY, (*vq).queue_index)
-
-fn virtq_has_used(vq: *VirtQueue) -> u8
-    let isr: u8 = virtio_read8(@virtio_net, VIRTIO_PCI_ISR_STATUS)
-
+# Next used descriptor of `vq`, or -1. Reads the ISR first, which deasserts
+# a pending INTx (the polled, non-MSI-X mode).
+fn virtq_get_used(vq: *Virtqueue) -> i32
+    vio_read_isr(virtio_net.vdev)
     read_barrier()
-
-    let used: *VirtqUsed = (*vq).used
-    let device_idx: u16 = (*used).idx
-    let our_idx: u16 = (*vq).last_used_idx
-
-    if device_idx != our_idx
-        return 1
-    return 0
-
-fn virtq_get_used(vq: *VirtQueue) -> i32
-    if virtq_has_used(vq) == 0
+    if not vq_has_used(vq)
         return -1
-
-    let used: *VirtqUsed = (*vq).used
-    let used_idx: u16 = (*vq).last_used_idx
-    let ring_idx: u16 = used_idx & ((*vq).size - 1)
-
-    let elem_ptr: *VirtqUsedElem = (used as u64 + 4 + (ring_idx as u64 * 8)) as *VirtqUsedElem
-    let desc_idx: u32 = (*elem_ptr).id
-
-    (*vq).last_used_idx = used_idx + 1
-
-    return desc_idx as i32
+    return vq_get_used(vq)
 
 # ============================================================================
 # VirtQueue Initialization
 # ============================================================================
 
-fn virtq_init(vq: *VirtQueue, queue_index: u16, mem: *u8, io_base: u16) -> i32
-    virtio_write16(@virtio_net, VIRTIO_PCI_QUEUE_SEL, queue_index)
-    let queue_size: u16 = virtio_read16(@virtio_net, VIRTIO_PCI_QUEUE_SIZE)
-
-    if queue_size == 0
+# Set up queue `queue_index` (0 RX, 1 TX) at up to 256 entries; under MSI-X
+# it signals table entry queue_index + 1 (entry 0 is config).
+fn virtio_net_setup_queue(queue_index: u16) -> *Virtqueue
+    let vdev: *VirtioDevice = virtio_net.vdev
+    let max: u16 = vio_get_queue_size(vdev, queue_index)
+    var vector: u16 = VIRTIO_MSI_NO_VECTOR
+    if virtio_net_msix_on != 0
+        vector = queue_index + 1
+    let vq: *Virtqueue = vio_setup_queue_vec(vdev, queue_index, vector)
+    if vq == 0 as *Virtqueue
         prints("[virtio-net] ERROR: Queue ")
         serial_print_dec(queue_index as u64)
-        prints(" not available\n")
-        return -1
-
-    if queue_size > VIRTQ_MAX_SIZE as u16
-        prints("[virtio-net] WARNING: Queue size ")
-        serial_print_dec(queue_size as u64)
-        prints(" > max\n")
+        prints(" not available (device max ")
+        serial_print_dec(max as u64)
+        prints(")\n")
+        return vq
 
     prints("[virtio-net] Queue ")
     serial_print_dec(queue_index as u64)
     prints(": size=")
-    serial_print_dec(queue_size as u64)
-    prints("\n")
-
-    (*vq).size = queue_size
-    (*vq).queue_index = queue_index
-    (*vq).io_base = io_base
-    (*vq).free_head = 0
-    (*vq).num_free = queue_size
-    (*vq).last_used_idx = 0
-
-    let mem_addr: u64 = mem as u64
-
-    (*vq).desc = mem as *VirtqDesc
-
-    let desc_size: u64 = virtq_size_desc(queue_size as u32) as u64
-    (*vq).avail = (mem_addr + desc_size) as *VirtqAvail
-
-    let desc_avail_size: u64 = desc_size + (virtq_size_avail(queue_size as u32) as u64)
-    let desc_avail_aligned: u64 = virtq_align_up(desc_avail_size, 4096)
-    (*vq).used = (mem_addr + desc_avail_aligned) as *VirtqUsed
-
-    # Zero out the memory
-    var i: u64 = 0
-    while i < 12288
-        *(mem + i as i64) = 0
-        i = i + 1
-
-    # Initialize descriptor chain
-    i = 0
-    while i < queue_size as u64
-        let desc_ptr: *VirtqDesc = ((*vq).desc as u64 + (i * 16)) as *VirtqDesc
-        (*desc_ptr).next = (i + 1) as u16
-        (*desc_ptr).flags = VIRTQ_DESC_F_NEXT
-        i = i + 1
-
-    let last_desc: *VirtqDesc = ((*vq).desc as u64 + ((queue_size as u64 - 1) * 16)) as *VirtqDesc
-    (*last_desc).next = 0
-    (*last_desc).flags = 0
-
-    let phys_addr: u64 = vmm_virt_to_phys(mem_addr)
-    let pfn: u32 = (phys_addr >> 12) as u32
+    serial_print_dec((*vq).num as u64)
+    prints(" (device max ")
+    serial_print_dec(max as u64)
+    prints(")\n")
     prints("[virtio-net]   Queue phys: 0x")
-    serial_print_hex(phys_addr)
-    prints(" PFN: 0x")
-    serial_print_hex(pfn as u64)
+    serial_print_hex((*vq).phys_addr)
     prints("\n")
-
-    virtio_write16(@virtio_net, VIRTIO_PCI_QUEUE_SEL, queue_index)
-    virtio_write32(@virtio_net, VIRTIO_PCI_QUEUE_PFN, pfn)
-
-    # Under MSI-X, queue N signals table entry N + 1 (entry 0 is config).
-    # The device reads back NO_VECTOR if it couldn't take the entry.
-    if virtio_net_msix_on != 0
-        virtio_write16(@virtio_net, VIRTIO_MSI_QUEUE_VECTOR, queue_index + 1)
-        if virtio_read16(@virtio_net, VIRTIO_MSI_QUEUE_VECTOR) == VIRTIO_MSI_NO_VECTOR
-            prints("[virtio-net] ERROR: queue ")
-            serial_print_dec(queue_index as u64)
-            prints(" refused its MSI-X vector\n")
-            return -1
-
-    return 0
+    return vq
 
 # Put the device in MSI-X mode: one IDT vector each for config changes, RX
 # and TX. Must run before anything reads the device-specific config, which
-# moves from offset 20 to 24 once MSI-X is on. Returns 0 if MSI-X is on;
-# -1 leaves the device on (polled) INTx with the config at 20.
+# moves from offset 20 to 24 on the legacy transport once MSI-X is on.
+# Returns 0 if MSI-X is on; -1 leaves the device on (polled) INTx.
 fn virtio_net_setup_msix(pci_dev: *PciDevice) -> i32
     if msix_probe(pci_dev, @virtio_net_msix) != 0
         prints("[msix] virtio-net: no MSI-X capability, polling\n")
@@ -444,9 +208,8 @@ fn virtio_net_setup_msix(pci_dev: *PciDevice) -> i32
         i = i + 1
 
     virtio_net_msix_on = 1
-    virtio_net_config_off = VIRTIO_PCI_CONFIG_OFFSET_MSIX
-    virtio_write16(@virtio_net, VIRTIO_MSI_CONFIG_VECTOR, 0)
-    if virtio_read16(@virtio_net, VIRTIO_MSI_CONFIG_VECTOR) == VIRTIO_MSI_NO_VECTOR
+    vio_note_msix_on(virtio_net.vdev)
+    if vio_set_config_msix_vector(virtio_net.vdev, 0) != 0
         prints("[virtio-net] WARNING: config change vector refused\n")
 
     prints("[msix] virtio-net: MSI-X on, vectors config=")
@@ -476,38 +239,29 @@ pub fn virtio_net_init() -> i32
     serial_print_dec((*pci_dev).function as u64)
     prints("\n")
 
-    pci_enable_bus_master(pci_dev)
-    pci_enable_io(pci_dev)
-
-    if (*pci_dev).bar_is_io[0] == 0
-        prints("[virtio-net] BAR0 is not I/O space\n")
-        return -1
-
-    let io_base: u16 = ((*pci_dev).bar[0] & 0xFFFC) as u16
-    prints("[virtio-net] I/O Base: 0x")
-    serial_print_hex(io_base as u64)
-    prints("\n")
-
     virtio_net.pci_dev = pci_dev
-    virtio_net.io_base = io_base
     virtio_net.initialized = 0
 
-    # Reset device
-    virtio_reset(@virtio_net)
+    # Picks the transport, enables the PCI function, resets the device and
+    # sets ACKNOWLEDGE | DRIVER
+    let vdev: *VirtioDevice = vio_init_device(pci_dev)
+    if vdev == 0 as *VirtioDevice
+        prints("[virtio-net] ERROR: no usable virtio transport\n")
+        return -1
+    virtio_net.vdev = vdev
+    if (*vdev).transport == VIO_TRANSPORT_MMIO
+        prints("[virtio-net] Transport: modern (MMIO)\n")
+    else
+        prints("[virtio-net] Transport: legacy (I/O port 0x")
+        serial_print_hex((*vdev).io_base as u64)
+        prints(")\n")
 
-    # Acknowledge
-    virtio_add_status(@virtio_net, VIRTIO_STATUS_ACKNOWLEDGE)
-
-    # Driver knows how to drive it
-    virtio_add_status(@virtio_net, VIRTIO_STATUS_DRIVER)
-
-    # MSI-X before any device-config read: it moves the config to offset 24
+    # MSI-X before any device-config read: it moves the legacy config to 24
     virtio_net_msix_on = 0
-    virtio_net_config_off = VIRTIO_PCI_CONFIG_OFFSET
     virtio_net_setup_msix(pci_dev)
 
-    # Read device features
-    let device_features: u32 = virtio_read32(@virtio_net, VIRTIO_PCI_HOST_FEATURES)
+    # Read device features (bits 0-31; the common layer handles VERSION_1)
+    let device_features: u32 = vio_get_features(vdev)
     prints("[virtio-net] Device Features: 0x")
     serial_print_hex(device_features as u64)
     prints("\n")
@@ -524,16 +278,21 @@ pub fn virtio_net_init() -> i32
     if (device_features & VIRTIO_NET_F_STATUS) != 0
         accepted_features = accepted_features | VIRTIO_NET_F_STATUS
 
-    virtio_write32(@virtio_net, VIRTIO_PCI_GUEST_FEATURES, accepted_features)
+    vio_set_features(vdev, accepted_features)
     virtio_net.features = accepted_features
+    if vio_features_ok(vdev) != 0
+        vio_add_status(vdev, VIRTIO_STATUS_FAILED)
+        return -1
 
-    virtio_add_status(@virtio_net, VIRTIO_STATUS_FEATURES_OK)
+    virtio_net.hdr_size = VIRTIO_NET_HDR_SIZE
+    if (*vdev).version_1 != 0
+        virtio_net.hdr_size = VIRTIO_NET_HDR_SIZE_V1
 
     # Read MAC address
     if (accepted_features & VIRTIO_NET_F_MAC) != 0
         var i: i32 = 0
         while i < 6
-            virtio_net.mac[i] = virtio_read8(@virtio_net, virtio_net_config_off + (i as u16))
+            virtio_net.mac[i] = vio_read_config8(vdev, VIRTIO_NET_CFG_MAC + (i as u16))
             i = i + 1
         prints("[virtio-net] MAC: ")
         i = 0
@@ -549,35 +308,18 @@ pub fn virtio_net_init() -> i32
             i = i + 1
         prints("\n")
 
-    # Allocate queue memory
-    prints("[virtio-net] Allocating queue memory...\n")
-
-    let rx_queue_phys: u64 = pmm_alloc_page()
-    let rx_queue_phys2: u64 = pmm_alloc_page()
-    let rx_queue_phys3: u64 = pmm_alloc_page()
-    if rx_queue_phys == 0 or rx_queue_phys2 == 0 or rx_queue_phys3 == 0
-        prints("[virtio-net] ERROR: Failed to allocate RX queue memory\n")
-        return -1
-
-    let tx_queue_phys: u64 = pmm_alloc_page()
-    let tx_queue_phys2: u64 = pmm_alloc_page()
-    let tx_queue_phys3: u64 = pmm_alloc_page()
-    if tx_queue_phys == 0 or tx_queue_phys2 == 0 or tx_queue_phys3 == 0
-        prints("[virtio-net] ERROR: Failed to allocate TX queue memory\n")
-        return -1
-
     # Initialize RX queue
     prints("[virtio-net] Initializing RX queue...\n")
-    let rx_result: i32 = virtq_init(@virtio_net.rx_queue, 0, rx_queue_phys as *u8, io_base)
-    if rx_result != 0
-        virtio_add_status(@virtio_net, VIRTIO_STATUS_FAILED)
+    virtio_net.rx_queue = virtio_net_setup_queue(0)
+    if virtio_net.rx_queue == 0 as *Virtqueue
+        vio_add_status(vdev, VIRTIO_STATUS_FAILED)
         return -1
 
     # Initialize TX queue
     prints("[virtio-net] Initializing TX queue...\n")
-    let tx_result: i32 = virtq_init(@virtio_net.tx_queue, 1, tx_queue_phys as *u8, io_base)
-    if tx_result != 0
-        virtio_add_status(@virtio_net, VIRTIO_STATUS_FAILED)
+    virtio_net.tx_queue = virtio_net_setup_queue(1)
+    if virtio_net.tx_queue == 0 as *Virtqueue
+        vio_add_status(vdev, VIRTIO_STATUS_FAILED)
         return -1
 
     # Populate RX buffers
@@ -585,7 +327,7 @@ pub fn virtio_net_init() -> i32
     var buf_idx: u32 = 0
     while buf_idx < VIRTIO_NET_RX_BUFFER_COUNT
         let buf_addr: u64 = (@virtio_rx_buffers[0] as u64) + (buf_idx as u64 * VIRTIO_NET_RX_BUFFER_SIZE as u64)
-        let result: i32 = virtq_add_buf(@virtio_net.rx_queue, buf_addr, VIRTIO_NET_RX_BUFFER_SIZE, VIRTQ_DESC_F_WRITE)
+        let result: i32 = virtq_add_buf(virtio_net.rx_queue, buf_addr, VIRTIO_NET_RX_BUFFER_SIZE, VRING_DESC_F_WRITE)
         if result < 0
             prints("[virtio-net] WARNING: Could only add ")
             serial_print_dec(buf_idx as u64)
@@ -596,13 +338,15 @@ pub fn virtio_net_init() -> i32
     serial_print_dec(buf_idx as u64)
     prints(" RX buffers\n")
 
-    virtq_kick(@virtio_net.rx_queue)
+    # Mark driver ready (a modern device may not be notified before DRIVER_OK)
+    if vio_device_ready(vdev) != 0
+        prints("[virtio-net] ERROR: device needs reset\n")
+        return -1
 
-    # Mark driver ready
-    virtio_add_status(@virtio_net, VIRTIO_STATUS_DRIVER_OK)
+    virtq_kick(virtio_net.rx_queue)
 
     # Check link status
-    let link_status: u16 = virtio_read16(@virtio_net, virtio_net_config_off + 6)
+    let link_status: u16 = vio_read_config16(vdev, VIRTIO_NET_CFG_STATUS)
     prints("[virtio-net] Link status: ")
     if (link_status & 1) != 0
         prints("UP\n")
@@ -628,6 +372,7 @@ pub fn virtio_net_send(data: *u8, len: u32) -> i32
     var tx_buf_idx: u32 = 0
 
     let buf_addr: u64 = (@virtio_tx_buffers[0] as u64) + (tx_buf_idx as u64 * VIRTIO_NET_TX_BUFFER_SIZE as u64)
+    let hdr_size: u32 = virtio_net.hdr_size
 
     # Set up VirtIO-net header
     let hdr: *VirtioNetHdr = buf_addr as *VirtioNetHdr
@@ -637,50 +382,58 @@ pub fn virtio_net_send(data: *u8, len: u32) -> i32
     (*hdr).gso_size = 0
     (*hdr).csum_start = 0
     (*hdr).csum_offset = 0
-
+    if hdr_size > VIRTIO_NET_HDR_SIZE
+        *((buf_addr + VIRTIO_NET_HDR_SIZE as u64) as *u16) = 0   # num_buffers
     # Copy packet data after header
     var i: u32 = 0
     while i < len
-        *((buf_addr + VIRTIO_NET_HDR_SIZE as u64 + i as u64) as *u8) = *(data + i as i64)
+        *((buf_addr + hdr_size as u64 + i as u64) as *u8) = *(data + i as i64)
         i = i + 1
 
-    let total_len: u32 = VIRTIO_NET_HDR_SIZE + len
-    let result: i32 = virtq_add_buf(@virtio_net.tx_queue, buf_addr, total_len, 0)
+    let total_len: u32 = hdr_size + len
+    let result: i32 = virtq_add_buf(virtio_net.tx_queue, buf_addr, total_len, 0)
     if result < 0
         return -1
 
-    virtq_kick(@virtio_net.tx_queue)
+    virtq_kick(virtio_net.tx_queue)
     return 0
 
 pub fn virtio_net_poll(buf: *u8, max_len: u32) -> i32
     if virtio_net.initialized == 0
         return -1
 
-    let desc_idx: i32 = virtq_get_used(@virtio_net.rx_queue)
+    let rxq: *Virtqueue = virtio_net.rx_queue
+    let hdr_size: u32 = virtio_net.hdr_size
+    let desc_idx: i32 = virtq_get_used(rxq)
     if desc_idx < 0
         return 0
 
-    let desc_ptr: *VirtqDesc = (virtio_net.rx_queue.desc as u64 + (desc_idx as u64 * 16)) as *VirtqDesc
+    let desc_ptr: *VringDesc = vq_get_desc(rxq, desc_idx as u16)
     let rx_addr: u64 = (*desc_ptr).addr
-    let rx_len: u32 = (*desc_ptr).len
+    # Bytes the device wrote (header + frame), not the buffer size
+    let rx_len: u32 = vq_get_used_len(rxq)
 
-    if rx_len <= VIRTIO_NET_HDR_SIZE
-        virtq_free_desc(@virtio_net.rx_queue, desc_idx as u16)
+    # The descriptor is reposted below as a fresh one
+    vq_free_desc(rxq, desc_idx as u16)
+
+    if rx_len <= hdr_size
+        if virtq_add_buf(rxq, rx_addr, VIRTIO_NET_RX_BUFFER_SIZE, VRING_DESC_F_WRITE) >= 0
+            virtq_kick(rxq)
         return 0
 
-    let payload_len: u32 = rx_len - VIRTIO_NET_HDR_SIZE
+    let payload_len: u32 = rx_len - hdr_size
     var copy_len: u32 = payload_len
     if copy_len > max_len
         copy_len = max_len
 
     var i: u32 = 0
     while i < copy_len
-        *(buf + i as i64) = *((rx_addr + VIRTIO_NET_HDR_SIZE as u64 + i as u64) as *u8)
+        *(buf + i as i64) = *((rx_addr + hdr_size as u64 + i as u64) as *u8)
         i = i + 1
 
-    let result: i32 = virtq_add_buf(@virtio_net.rx_queue, rx_addr, VIRTIO_NET_RX_BUFFER_SIZE, VIRTQ_DESC_F_WRITE)
+    let result: i32 = virtq_add_buf(rxq, rx_addr, VIRTIO_NET_RX_BUFFER_SIZE, VRING_DESC_F_WRITE)
     if result >= 0
-        virtq_kick(@virtio_net.rx_queue)
+        virtq_kick(rxq)
 
     return copy_len as i32
 

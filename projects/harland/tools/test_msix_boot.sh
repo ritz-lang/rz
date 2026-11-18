@@ -11,6 +11,14 @@
 #
 # Passes only if:
 #   - the NVMe controller (QEMU 1b36:0010) was found to have an MSI-X table;
+#   - virtio-net came up over the modern (MMIO) transport: the NIC is
+#     modern-only (disable-legacy=on, AGAST #3576), so MSI-X and the DHCP
+#     traffic go through the virtio 1.x common config and notify regions;
+#   - its RX queue, offered at 1024 entries (rx_queue_size=1024), was capped
+#     to the 256 the driver's rings hold ("Queue 0: size=256 (device max
+#     1024)");
+#   - frames really crossed the modern NIC: DHCP got a lease ("[dhcp]
+#     Configured!"), which needs the virtio 1.x 12-byte net header both ways;
 #   - virtio-net came up in MSI-X mode ("[msix] virtio-net: MSI-X on");
 #   - N > 0: interrupts were really delivered through the table, not polled;
 #   - the kernel took no exception, and init's Tier-1 suite still reports
@@ -94,14 +102,15 @@ fi
 SERIAL="$WORK/msix.log"
 : > "$SERIAL"
 # romfile= drops the NIC's iPXE option ROM, so OVMF never tries a network
-# boot before the ESP.
+# boot before the ESP. The legacy virtio-net path stays covered by
+# boot/test.sh (test-uefi-boot), whose NIC is QEMU's transitional default.
 timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m 2G \
     -display none -no-reboot -monitor none \
     -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
     -drive "format=raw,file=fat:rw:$WORK/esp" \
     -device virtio-blk-pci,drive=initramfs \
     -drive "file=$WORK/initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
-    -device virtio-net-pci,netdev=net0,romfile= \
+    -device virtio-net-pci,netdev=net0,romfile=,disable-legacy=on,rx_queue_size=1024 \
     -netdev user,id=net0 \
     -device nvme,serial=harland-msix,drive=nvme0 \
     -drive "file=$WORK/nvme.img,format=raw,if=none,id=nvme0" \
@@ -131,6 +140,26 @@ if grep -aiqE "\[msix\] [0-9a-f:.]+ 1b36:0010: [1-9][0-9]* vectors" "$SERIAL"; t
     echo "PASS: NVMe controller's MSI-X table found"
 else
     echo "FAIL: no MSI-X table found on the NVMe controller (1b36:0010)"
+    rc=1
+fi
+if grep -aq "\[virtio-net\] Transport: modern (MMIO)" "$SERIAL"; then
+    echo "PASS: virtio-net is driven over the modern (MMIO) transport"
+else
+    grep -a "\[virtio-net\]" "$SERIAL" | head -5
+    echo "FAIL: virtio-net was not driven over the modern (MMIO) transport"
+    rc=1
+fi
+if grep -aqF "[virtio-net] Queue 0: size=256 (device max 1024)" "$SERIAL"; then
+    echo "PASS: virtio-net's 1024-entry RX queue was capped to 256"
+else
+    echo "FAIL: virtio-net's RX queue was not capped from 1024 to 256"
+    rc=1
+fi
+if grep -aqF "[dhcp] Configured!" "$SERIAL"; then
+    echo "PASS: DHCP got a lease over the modern virtio-net"
+else
+    grep -a "\[dhcp\]\|DHCP" "$SERIAL" | head -5
+    echo "FAIL: DHCP got no lease over the modern virtio-net"
     rc=1
 fi
 if grep -aq "\[msix\] virtio-net: MSI-X on" "$SERIAL"; then
