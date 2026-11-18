@@ -21,7 +21,7 @@ Every program exits 3 when the table reads back right.
 """
 
 import pytest
-from test_ref_into_value import _assert_refused, _ids, _run
+from test_ref_into_value import _assert_refused, _compile, _ids, _run
 
 pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
@@ -198,3 +198,24 @@ def test_ptr_table_element_is_a_string_or_null(tmp_path, compiler, name):
     decl, elem = REFUSED[name]
     src = decl + "\npub fn main() -> i32\n    3\n"
     _assert_refused(compiler, tmp_path, name, src, f"const 'T' element {elem} {PTR_ELEM}")
+
+
+# AGAST #3946: a struct table can't be a fill (§3.3, "write its elements out").
+# ritz0 called the struct literal "not a constant integer expression"; ritz1
+# emitted no global, so `T[i].a` failed later as an unlocated "unhandled
+# EXPR_MEMBER". Both now refuse it at the fill's value.
+STRUCT_FILL = "const 'T': a struct table can't be a fill `[v; N]`: write its elements out"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_struct_table_is_not_a_fill(tmp_path, compiler):
+    src = (
+        "struct P\n    a: i32\n\n"
+        "const T: [2]P = [^P { a: 1 }; 2]\n\n"
+        "pub fn main() -> i32\n    var i: i32 = 1\n    T[i].a\n"
+    )
+    _assert_refused(compiler, tmp_path, "struct_fill", src, STRUCT_FILL)
+    # One message: no unlocated cascade from the read `T[i].a`.
+    comp, _, _ = _compile(compiler, tmp_path, "struct_fill_once", src.replace("^", ""))
+    out = comp.stdout + comp.stderr
+    assert out.count("error") <= 1 and "cannot emit" not in out, out

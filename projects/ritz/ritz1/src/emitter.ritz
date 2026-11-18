@@ -28,6 +28,7 @@ import ref_check         # ref_begin_fn (AGAST #2336)
 import emitter_asm       # emit_naked_fn_body (AGAST #3395)
 import frame_limit       # refuse_huge_frame (AGAST #3739)
 import emitter_expr_access
+import emitter_expr_arith   # const_struct_fill_refused (AGAST #3946)
 import emitter_expr_call
 import ritzlib.hashmap
 
@@ -3079,6 +3080,44 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
 fn const_ptr_elem_ok(e: *Expr) -> i32
     (e.kind == EXPR_CSTRING_LIT or e.kind == EXPR_NIL_LIT) as i32
 
+# AGAST #3946: `const T: [N]S = [S { .. }; N]`.  A struct table can't be a
+# fill (LANGUAGE_SPEC §3.3, "write its elements out").  Reported at the
+# fill's value, worded as ritz0's; it used to emit no global, so a later
+# `T[i].a` failed as an unlocated "unhandled EXPR_MEMBER".
+fn const_struct_fill_error(s: *EmitterState, c: *ConstEntry)
+    var line: i32 = c.line
+    var col: i32 = c.col
+    let v: *Expr = c.value_expr.left
+    if v != null and v.span.line != 0
+        line = v.span.line
+        col = v.span.col
+    var file: *u8 = c.def_file
+    if file == null
+        file = c.src_file
+    if file == null
+        file = emitter_source_file()
+    diag_error_at(file, diag_span(line, col))
+    eprints_cstr(c"const '")
+    var i: i32 = 0
+    while i < c.name_len
+        eprint_char(*(c.name + i))
+        i += 1
+    eprints_cstr(c"': a struct table can't be a fill `[v; N]`: write its elements out\n")
+    s.error_count = s.error_count + 1
+    # A placeholder `[N x %S]` so `T[i].a` lowers (const_struct_fill_refused
+    # lets the readers through) instead of cascading into an unlocated
+    # "unhandled EXPR_MEMBER".  The output is refused, so it is never written.
+    if was_global_emitted(s, c.name, c.name_len) == 1 or c.array_elem_type_name_len <= 0
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+    emit_str(s, c"@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = internal constant [")
+    emit_int(s, c.array_size as i64)
+    emit_str(s, c" x %")
+    emit_name(s, c.array_elem_type_name, c.array_elem_type_name_len)
+    emit_str(s, c"] zeroinitializer\n")
+
 # AGAST #1866: element `idx` of `const A: [N]*u8` is neither a string nor
 # null.  Reported at the element, worded as ritz0's _const_ptr_table_elem.
 fn const_ptr_table_error(s: *EmitterState, c: *ConstEntry, idx: i32, e: *Expr)
@@ -3171,6 +3210,8 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
             emit_const_ptr_array(s, c)   # AGAST #1866: `[c"s"; N]`, `[null; N]`
         else if c.array_elem_type != TYPE_STRUCT
             emit_const_array_fill_entry(s, c)
+        else if const_struct_fill_refused(c) == 1
+            const_struct_fill_error(s, c)   # AGAST #3946
         return
     # Primitive-element arrays — `const VALUES: [3]i32 = [2, 3, 5]`.
     # Required so `for v in VALUES` (iterable form) can reference the

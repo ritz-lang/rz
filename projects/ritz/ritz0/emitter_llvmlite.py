@@ -2340,6 +2340,14 @@ class LLVMEmitter:
                 elements = [fill] * value.count
             elif is_ptr_array:
                 elements = [self._const_ptr_table_elem(name, 0, value.value, elem_type)] * value.count
+            elif isinstance(elem_type, ir.BaseStructType):
+                # AGAST #3946: LANGUAGE_SPEC §3.3. Worded as ritz1's
+                # const_struct_fill_error, at the fill's value.
+                raise EmitError(
+                    f"const '{name}': a struct table can't be a fill `[v; N]`: "
+                    f"write its elements out",
+                    getattr(value.value, "span", None),
+                )
             else:
                 fill_val = self._fold_const_array_elem(name, 0, value.value, elem_type)
                 elements = [ir.Constant(elem_type, fill_val)] * value.count
