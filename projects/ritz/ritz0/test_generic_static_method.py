@@ -18,10 +18,11 @@ says to give the binding a type, never a ValueError.
 this was picked up: a scrutinee constructor takes the instance its payload
 binds (§11.3, AGAST #2437).  One row pins it with ritzlib's Option.
 
-ritz0 only, but for one ritz1 row: ritz1 accepts these programs and emits the
-template's method, uninstantiated (`call %Slot$T @Slot_mk(%T ..)`), which clang
-refuses with no source location.  That's AGAST #3309, pinned by the strict
-xfail below.
+ritz1 accepted these programs and emitted the template's method,
+uninstantiated (`call %Slot$T @Slot_mk(%T ..)`), which clang refused with no
+source location (AGAST #3309).  It now calls the slot's instance's method,
+which monomorph specialises for an enum's instance as for a struct's, and
+refuses the REFUSED rows with ritz0's text at the call.
 """
 
 import os
@@ -123,17 +124,39 @@ def test_static_call_without_an_instance_is_refused_at_it(tmp_path, name):
     assert (where, _message(type_name, "mk")) in found, f"{name}, wanted {where}:\n{out[-2000:]}"
 
 
-@pytest.mark.xfail(strict=True, reason="AGAST #3309: ritz1 calls the uninstantiated template")
-def test_ritz1_runs_a_static_call_on_a_generic_impl(ritz1_bin, tmp_path):
-    """ritz1 builds what ritz0 now builds.  Drop the mark when #3309 lands."""
-    src, code = RUNS["enum_let"]
-    path, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
+# One ritz1 row per slot the instance comes from, and the struct form.
+RITZ1_RUNS = ["ticket_box_let", "enum_let", "enum_alias_let", "enum_argument", "enum_return", "struct_let_u8"]
+
+
+def _compile_ritz1(work, src):
+    path, ll = work / "main.ritz", work / "main.ll"
     path.write_text(src)
-    comp = subprocess.run([str(RITZ1_BUILD / "ritz1"), str(path), "-o", str(ll)], cwd=tmp_path,
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    comp = subprocess.run([str(RITZ1_BUILD / "ritz1"), str(path), "-o", str(ll)], cwd=work, env=env,
                           capture_output=True, text=True, timeout=300)
+    return comp, ll
+
+
+@pytest.mark.parametrize("name", RITZ1_RUNS)
+def test_ritz1_runs_a_static_call_on_a_generic_impl(ritz1_bin, tmp_path, name):
+    """ritz1 calls the slot's instance's method (AGAST #3309)."""
+    src, code = RUNS[name]
+    comp, ll = _compile_ritz1(tmp_path, src)
     assert comp.returncode == 0, comp.stderr[-2000:]
     exe = tmp_path / "main"
     link = fast_link.clang(["clang", "-w", str(RITZ_START), str(ll), "-o", str(exe), "-nostdlib"],
                            cwd=tmp_path, capture_output=True, text=True)
     assert link.returncode == 0, link.stderr[-2000:]
-    assert subprocess.run([str(exe)], timeout=60).returncode == code
+    assert subprocess.run([str(exe)], timeout=60).returncode == code, name
+
+
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_ritz1_refuses_a_static_call_without_an_instance_at_it(ritz1_bin, tmp_path, name):
+    """ritz0's error at the call, not clang's at `%Slot$T` (AGAST #3309)."""
+    src, where = REFUSED[name]
+    comp, _ = _compile_ritz1(tmp_path, src)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0, f"ritz1 accepted {name}:\n{src}\n{out}"
+    type_name = "Cell" if "Cell" in src else "Slot"
+    found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    assert (where, _message(type_name, "mk")) in found, f"{name}, wanted {where}:\n{out[-2000:]}"

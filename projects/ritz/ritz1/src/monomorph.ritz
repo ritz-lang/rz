@@ -799,6 +799,7 @@ fn add_struct_from_mangled_name(m: *Module, name: *u8, len: i32)
     if template == null
         add_builtin_enum_args(m, name, len, dollar_pos)   # AGAST #3021
         add_enum_instance(m, name, len, dollar_pos)   # AGAST #2422
+        add_enum_impl_instance(m, name, len, dollar_pos)   # AGAST #3309
         return  # Not a generic struct we know about
 
     # Create suffix including the '$'
@@ -929,6 +930,25 @@ pub fn add_enum_instance(m: *Module, name: *u8, len: i32, dollar_pos: i32)
             if f.field_type_name != null
                 add_struct_from_mangled_name(m, f.field_type_name, f.field_type_name_len)
             f = f.next
+
+# AGAST #3309: an instance of a generic enum with a generic impl (`Slot$i32`
+# for `impl<T> Slot<T>`) has that impl's methods specialised, as a generic
+# struct's instance has: `Slot.mk(5)` into a `Slot<i32>` calls `Slot$i32_mk`.
+# Queued as a struct instantiation, so specialize_pending_structs does it in
+# the fixpoint, under the same generation cap (find_generic_struct misses an
+# enum, so only the impl part runs).  `Slot$T`, the template's own spelling
+# of its type, is no instance.
+fn add_enum_impl_instance(m: *Module, name: *u8, len: i32, dollar_pos: i32)
+    if enum_find(name, len) < 0 or find_generic_impl(m.impls, name, dollar_pos) == null
+        return
+    let suffix: *u8 = name + dollar_pos
+    let suffix_len: i32 = len - dollar_pos
+    if suffix_len == 2
+        let ch: i32 = *(suffix + 1) as i32
+        if ch >= 65 and ch <= 90
+            if find_concrete_struct(m, suffix + 1, 1) == null and names_concrete_enum(suffix + 1, 1) == 0
+                return
+    add_struct_instantiation(name, dollar_pos, suffix, suffix_len)
 
 # End (exclusive) of the mangled type argument that starts at s[pos]: its
 # first component plus, if that names a generic, one nested argument per
@@ -4699,8 +4719,10 @@ fn specialize_pending_structs(m: *Module, start: i32) -> i32
                 m.structs = specialized
                 collect_struct_types_from_fields(m, specialized.fields)
 
-            # Also specialize impl block methods for this struct
-            specialize_impl_methods(m, name, name_len, suffix, suffix_len)
+        # Specialise the type's generic impls: a struct's, or a generic enum
+        # instance's, which add_enum_impl_instance queued with no struct
+        # template (AGAST #3309).
+        specialize_impl_methods(m, name, name_len, suffix, suffix_len)
 
     si
 
