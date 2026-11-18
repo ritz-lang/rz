@@ -2,7 +2,7 @@
 """`xdist_group` must really keep a group on one worker, on the installed pytest.
 
 Found by AGAST #2251. conftest.py item 5 relies on the "tree" group to serialize
-every test that shares in-tree state, such as projects/ritz/build/main. xdist
+every test that shares in-tree state, such as projects/ritz/.ritz-cache. xdist
 3.8.0 makes a group by writing `item._nodeid`, and pytest 9.2.0 stopped reading
 that attribute (`Node.nodeid` is now `str(self._id)`), so each test became its
 own scope. Nothing reported that: a split group passes unless two tests happen

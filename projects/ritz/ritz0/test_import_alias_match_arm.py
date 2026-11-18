@@ -18,6 +18,7 @@ beside expression-arm bodies compiling.
 """
 
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -26,20 +27,29 @@ from pathlib import Path
 
 import pytest
 
-# xdist_group("tree") (AGAST #1804): `build.py run` writes projects/ritz/build/main at a
-# fixed path and uses the shared .ritz-cache.  Tests in the group
-# run on one xdist worker, one at a time; see conftest.py.
-pytestmark = pytest.mark.xdist_group("tree")
+# No xdist group (AGAST #2252): `build.py run` links each source to its own
+# build/run/<digest>/ (each test's tmp_path is its own source directory), and
+# RITZ_BUILD_CACHE_DIR keeps the build cache in tmp_path, out of the shared
+# .ritz-cache.  Nothing in the tree is written at a path another test uses.
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 BUILD_PY = RITZ_ROOT / "build.py"
-BUILD_BIN = RITZ_ROOT / "build" / "main"  # where `build.py run` leaves main.ritz
+
+_spec = importlib.util.spec_from_file_location("ritz_build_alias_arm", BUILD_PY)
+_build = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_build)
+
+
+def _binary_of(tmp_path: Path) -> Path:
+    """Where `build.py run` leaves `_run(tmp_path, ...)`'s binary."""
+    return _build.run_output_dir(tmp_path / "main.ritz") / "main"
 
 
 def _run(tmp_path: Path, source: str) -> subprocess.CompletedProcess:
     src = tmp_path / "main.ritz"
     src.write_text(source)
-    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT),
+               RITZ_BUILD_CACHE_DIR=str(tmp_path / "build-cache"))
     return subprocess.run(
         [sys.executable, str(BUILD_PY), "run", str(src)],
         cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300,
@@ -55,10 +65,11 @@ def _binary_report(bin_path: Path) -> str:
 
     AGAST #2251: CI saw test_alias_call_inside_an_expression_arm_is_resolved exit
     7, not 11, and this report showed why: the "tree" group had split, so the
-    other test here relinked build/main just before this one ran it. Both tests
-    still share that path, so it stays as the first evidence if something else
-    ever writes there. It reads the file after the run, so a sha256 that differs
-    from the manifest's binary_sha256 means something rewrote the binary. Every
+    other test here relinked the shared build/main just before this one ran it.
+    #2252 gave each source its own output path, so that can no longer happen
+    here; the report stays as the first evidence if anything else ever rewrites
+    a binary. It reads the file after the run, so a sha256 that differs from
+    the manifest's binary_sha256 means something rewrote the binary. Every
     part is best-effort: a report that raised would replace the exit-code failure
     it is there to explain.
     """
@@ -87,7 +98,7 @@ def _binary_report(bin_path: Path) -> str:
 
 
 def _assert_exit(
-    result: subprocess.CompletedProcess, expected: int, bin_path: Path = BUILD_BIN,
+    result: subprocess.CompletedProcess, expected: int, bin_path: Path,
 ) -> None:
     """Assert the exit code, printing `bin_path`'s report first if it is wrong."""
     if result.returncode != expected:
@@ -171,8 +182,8 @@ def test_forensics_read_a_real_build(tmp_path, capsys):
     result = _run(tmp_path, "fn main() -> i32\n    11\n")
     assert result.returncode == 11, result.stderr + result.stdout
     with pytest.raises(AssertionError):
-        _assert_exit(result, 12)
+        _assert_exit(result, 12, _binary_of(tmp_path))
     out = capsys.readouterr().out
-    recorded = json.loads(_manifest_of(BUILD_BIN).read_text())["binary_sha256"]
+    recorded = json.loads(_manifest_of(_binary_of(tmp_path)).read_text())["binary_sha256"]
     assert f"sha256: {recorded}" in out
     assert "<main>:" in out

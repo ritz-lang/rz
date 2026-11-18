@@ -5,6 +5,7 @@ build <pkg>` is the entry point `rz`, the Makefile and the docs use.
 """
 
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 from typing import Optional
@@ -255,6 +256,19 @@ def cmd_ritz_tests(args):
     return result.returncode
 
 
+def run_output_dir(src_path: Path) -> Path:
+    """Where `build.py run` links `src_path`: `build/run/<digest>/` (AGAST #2252).
+
+    The digest is of the source's resolved path, so each file gets its own
+    directory however it was spelled on the command line, and two sources with
+    the same stem (every `<dir>/main.ritz`) no longer share one binary and
+    manifest. Linking to `build/<stem>` made each run relink over the last one,
+    and two runs at once raced on the file (#2251).
+    """
+    digest = hashlib.sha256(str(src_path.resolve()).encode()).hexdigest()[:16]
+    return ROOT / "build" / "run" / digest
+
+
 def cmd_run(args):
     """Compile and run a single .ritz file."""
     src_path = Path(args.file)
@@ -265,9 +279,9 @@ def cmd_run(args):
     keep_artifacts = getattr(args, 'debug', False)
     name = src_path.stem
 
-    # Use build/ directory for output
-    out_dir = ROOT / "build"
-    out_dir.mkdir(exist_ok=True)
+    # Each source gets its own directory, so same-stem sources don't share a binary.
+    out_dir = run_output_dir(src_path)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # AGAST #1382: announce 🔨 only if compile_binary actually rebuilds.
     announced = False

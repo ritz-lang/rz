@@ -62,15 +62,19 @@ AGAST #1392. Two things live here, and they are independent.
    `-n <N> --dist loadgroup`.  A test that WRITES state at a fixed path in
    projects/ritz which another test also uses goes in the "tree" group, so
    the group runs on one worker, one test at a time.  Today that means:
-   * any real `build.py build|run` WITHOUT `--no-cache`: build.py's
-     BuildCache is rooted at projects/ritz (`.ritz-cache{,-ritz1}`) whatever
-     the package path.  #1806 made its writes atomic and its state merges
-     locked, but a compiler-hash change still wipes `objects/` under a lock
-     that readers of cached objects do not take (`--no-cache` bypasses the
-     cache — prefer that);
-   * `build.py run`, which writes projects/ritz/build/<name>;
+   * any real `build.py build|run` that uses the in-tree build cache:
+     build.py's BuildCache is rooted at projects/ritz (`.ritz-cache{,-ritz1}`)
+     whatever the package path.  #1806 made its writes atomic and its state
+     merges locked, but a compiler-hash change still wipes `objects/` under a
+     lock that readers of cached objects do not take (`build --no-cache`
+     bypasses the cache, RITZ_BUILD_CACHE_DIR=<tmp_path> moves it — prefer
+     those);
    * running a nested session's make in the real tree
      (test_ritz1_session_build.py).
+   `build.py run`'s binary is not on the list: since AGAST #2252 it links
+   each source to its own projects/ritz/build/run/<digest>/, so a run of a
+   tmp_path source with RITZ_BUILD_CACHE_DIR set needs no group
+   (test_build_run_output_path.py, test_import_alias_match_arm.py).
    Reading in-tree sources is fine; compiling into tmp_path is fine; sig
    files are per-session (item 3).  A test that copies the tree must skip
    the paths above instead (test_ritz1_bin_staleness.py does).
