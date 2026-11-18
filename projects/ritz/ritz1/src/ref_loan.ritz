@@ -20,10 +20,9 @@
 # ritz0's twin is the loan half of move_checker.py, and
 # ritz0/test_borrow_conflict_all_compilers.py holds all three compilers to it.
 #
-# A place's steps are typed from Sema's scope (rl_ty): what it can't type
-# borrows nothing, rather than refuse a valid program on a guess.  The value
-# checks of ref_check.ritz still run on the emitter (AGAST #3506's second
-# half).
+# A place's steps are typed from Sema's scope (ref_check.ritz's rs_ty, which
+# ref_value.ritz's checks share since AGAST #3926): what it can't type borrows
+# nothing, rather than refuse a valid program on a guess.
 
 import ritzlib.sys
 import ritzlib.io
@@ -38,6 +37,7 @@ import sema
 import sema_type
 import bool_check     # sbk_method_def, sbk_global
 import deref_field    # df_is_step, df_deref_step_recv (AGAST #3015)
+import ref_check      # rs_ty and friends: Sema's place typing (AGAST #3926)
 
 # A loan of a place, held by a binding declared at block depth `depth`.
 # `root` is the place's local's index in Sema's scope, and `place` the borrowed
@@ -123,23 +123,6 @@ fn rl_add(root: i32, place: *Expr, mutable: i32, depth: i32) -> *RefLoan
     RL_COUNT = RL_COUNT + 1
     l
 
-# --- Types of a place's steps ----------------------------------------------------
-#
-# What ref_check's ref_ty_of told the loan check, from Sema's scope: a step's
-# kind (TYPE_*), the struct it is or points at (name), and an array's element
-# kind (pointee).  0 when Sema can't say.
-
-fn rl_is_pointer(kind: i32) -> i32
-    (kind == TYPE_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF) as i32
-
-fn rl_set(out: *SemaTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
-    out.kind = kind
-    out.pointee = pointee
-    out.name = name
-    out.name_len = len
-    out.fn_sig = null
-    1
-
 # The index of the innermost local named `name` in Sema's scope, or -1.
 fn rl_local_idx(sm: *Sema, name: *u8, len: i32) -> i32
     var i: i32 = sm.scope_top - 1
@@ -149,196 +132,6 @@ fn rl_local_idx(sm: *Sema, name: *u8, len: i32) -> i32
             return i
         i = i - 1
     0 - 1
-
-fn rl_local(sm: *Sema, v: *SemaVar, out: *SemaTy) -> i32
-    let p: *Param = v.lent
-    if p != null and p.param_type == TYPE_MUT_REF
-        # `c:& C` (and a free fn's `self:& C`) reads as a `C` (§13.4).
-        return rl_set(out, p.param_pointee_type, TYPE_VOID, p.param_type_name, p.param_type_name_len)
-    var kind: i32 = v.let_kind
-    if kind == TYPE_UNKNOWN and v.recv != null
-        # deref_field's note on a binding Sema leaves untyped (AGAST #3509).
-        return rl_set(out, v.recv.kind, v.recv.pointee, v.recv.name, v.recv.name_len)
-    if kind == TYPE_UNKNOWN or kind == TYPE_PTR_PTR
-        return 0
-    if kind == TYPE_ARRAY
-        var elem: i32 = v.let_elem
-        if elem == TYPE_VOID
-            elem = v.elem
-        return rl_set(out, TYPE_ARRAY, elem, v.let_name, v.let_name_len)
-    if rl_is_pointer(kind) == 1
-        return rl_set(out, kind, v.let_pointee, v.let_name, v.let_name_len)
-    rl_set(out, kind, TYPE_VOID, v.let_name, v.let_name_len)
-
-fn rl_ident(sm: *Sema, name: *u8, len: i32, out: *SemaTy) -> i32
-    let v: *SemaVar = sema_find_local(sm, name, len)
-    if v != null
-        return rl_local(sm, v, out)
-    let g: *GlobalVarDef = sbk_global(sm, name, len)
-    if g == null or g.var_type == TYPE_PTR_PTR
-        return 0
-    if rl_is_pointer(g.var_type) == 1
-        return rl_set(out, g.var_type, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
-    if g.var_type == TYPE_ARRAY
-        return rl_set(out, TYPE_ARRAY, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
-    rl_set(out, g.var_type, TYPE_VOID, g.type_name, g.type_name_len)
-
-# What fn `f` returns, as ref_check's ref_of_fn has it.
-fn rl_fn(f: *FnDef, out: *SemaTy) -> i32
-    if f == null or f.return_type == TYPE_VOID
-        return 0
-    if f.ret_ref != null
-        let r: *Param = f.ret_ref
-        if r.param_type == TYPE_PTR_PTR or r.param_type == TYPE_ARRAY
-            return 0
-        return rl_set(out, r.param_type, r.param_pointee_type, r.param_type_name, r.param_type_name_len)
-    if f.ret_array != null
-        return rl_set(out, TYPE_ARRAY, f.ret_array.elem, f.ret_array.name, f.ret_array.name_len)
-    if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
-        if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
-            return rl_set(out, TYPE_PTR, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
-        return 0
-    rl_set(out, f.return_type, TYPE_VOID, f.return_type_name, f.return_type_name_len)
-
-fn rl_call_fn(sm: *Sema, e: *Expr) -> *FnDef
-    if e.func_name_len > 0 and e.call_type_suffix_len == 0
-        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
-        if v != null
-            return v.fn_sig
-    sema_call_fn(sm, e)
-
-# The field `e` (EXPR_MEMBER) names, on its base's struct or what it points at.
-fn rl_field(sm: *Sema, e: *Expr) -> *StructField
-    var b: SemaTy
-    if rl_ty(sm, e.left, @b) == 0
-        return null
-    if b.kind != TYPE_STRUCT and (rl_is_pointer(b.kind) == 0 or b.pointee != TYPE_STRUCT)
-        return null
-    let st: *StructDef = sema_find_struct(sm, b.name, b.name_len)
-    if st == null
-        return null
-    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-    if idx < 0
-        return null
-    get_field_type(st, idx)
-
-fn rl_of_field(f: *StructField, out: *SemaTy) -> i32
-    let t: i32 = f.field_type
-    if rl_is_pointer(t) == 1
-        var pointee: i32 = f.ptr_pointee
-        if pointee == TYPE_VOID and f.field_type_name_len > 0
-            pointee = TYPE_STRUCT
-        return rl_set(out, t, pointee, f.field_type_name, f.field_type_name_len)
-    if t == TYPE_ARRAY
-        return rl_set(out, TYPE_ARRAY, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
-    if t == TYPE_PTR_PTR
-        return 0
-    rl_set(out, t, TYPE_VOID, f.field_type_name, f.field_type_name_len)
-
-fn rl_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
-    if e == null
-        return 0
-    let k: i32 = e.kind
-    if k == EXPR_IDENT
-        return rl_ident(sm, e.ident_ptr, e.ident_len, out)
-    if k == EXPR_STRING_LIT
-        return rl_set(out, TYPE_STRUCT, TYPE_VOID, c"StrView", 7)
-    if k == EXPR_MEMBER
-        let f: *StructField = rl_field(sm, e)
-        if f == null
-            return 0
-        return rl_of_field(f, out)
-    if k == EXPR_INDEX
-        if e.right != null and e.right.kind == EXPR_RANGE
-            return 0
-        var b: SemaTy
-        if rl_ty(sm, e.left, @b) == 0
-            return 0
-        if b.kind == TYPE_ARRAY
-            if b.pointee == TYPE_VOID or b.pointee == TYPE_UNKNOWN or b.pointee == TYPE_PTR_PTR
-                return 0
-            return rl_set(out, b.pointee, TYPE_VOID, b.name, b.name_len)
-        if rl_is_pointer(b.kind) == 1
-            if b.pointee == TYPE_VOID or rl_is_pointer(b.pointee) == 1 or b.pointee == TYPE_ARRAY or b.pointee == TYPE_PTR_PTR
-                return 0
-            return rl_set(out, b.pointee, TYPE_VOID, b.name, b.name_len)
-        return 0
-    if k == EXPR_UNARY and e.op == OP_DEREF
-        var o: SemaTy
-        if rl_ty(sm, e.operand, @o) == 0
-            return 0
-        if rl_is_pointer(o.kind) == 0
-            *out = o
-            return 1
-        if o.pointee == TYPE_VOID or o.pointee == TYPE_ARRAY or rl_is_pointer(o.pointee) == 1 or o.pointee == TYPE_PTR_PTR
-            return 0
-        return rl_set(out, o.pointee, TYPE_VOID, o.name, o.name_len)
-    if k == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
-        var a: SemaTy
-        if rl_ty(sm, e.operand, @a) == 0
-            return 0
-        if rl_is_pointer(a.kind) == 1
-            return rl_set(out, TYPE_PTR, TYPE_PTR, a.name, a.name_len)
-        return rl_set(out, TYPE_PTR, a.kind, a.name, a.name_len)
-    if k == EXPR_CALL
-        return rl_fn(rl_call_fn(sm, e), out)
-    if k == EXPR_METHOD
-        return rl_fn(rl_method_def(sm, e), out)
-    if k == EXPR_BINARY
-        var l: SemaTy
-        if rl_ty(sm, e.left, @l) == 1 and rl_is_pointer(l.kind) == 1
-            return rl_set(out, l.kind, l.pointee, l.name, l.name_len)
-        return 0
-    if k == EXPR_CAST and e.op == TYPE_PTR
-        return rl_set(out, TYPE_PTR, e.int_val as i32, e.ident_ptr, e.ident_len)
-    0
-
-# The element of the instantiated `Vec$T` `v`, from its `data: *T` field: a
-# struct, or an integer its name spells.  0 otherwise.
-fn rl_vec_elem(sm: *Sema, v: *SemaTy, out: *SemaTy) -> i32
-    if v.name_len <= 4 or *v.name != 'V' or *(v.name + 1) != 'e' or *(v.name + 2) != 'c' or *(v.name + 3) != '$'
-        return 0
-    let vec_st: *StructDef = sema_find_struct(sm, v.name, v.name_len)
-    if vec_st == null
-        return 0
-    let di: i32 = find_field_index(vec_st, c"data", 4)
-    if di < 0
-        return 0
-    let data: *StructField = get_field_type(vec_st, di)
-    if data.field_type != TYPE_PTR or data.field_type_name_len <= 0
-        return 0
-    if sema_find_struct(sm, data.field_type_name, data.field_type_name_len) != null
-        return rl_set(out, TYPE_STRUCT, TYPE_VOID, data.field_type_name, data.field_type_name_len)
-    let k: i32 = primitive_type_from_name(v.name + 4, v.name_len - 4)
-    if sema_is_int_kind(k) == 0
-        return 0
-    rl_set(out, k, TYPE_VOID, null, 0)
-
-# rl_ty, also through a Vec's element (`vs[1].a`), for the steps of a place.
-# As ritz0's MoveChecker._loan_type.
-fn rl_loan_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
-    if e.kind == EXPR_INDEX or e.kind == EXPR_MEMBER
-        var b: SemaTy
-        if rl_loan_ty(sm, e.left, @b) == 1 and b.kind == TYPE_STRUCT
-            if e.kind == EXPR_INDEX
-                if rl_vec_elem(sm, @b, out) == 1
-                    return 1
-            else
-                let st: *StructDef = sema_find_struct(sm, b.name, b.name_len)
-                if st != null
-                    let fi: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
-                    if fi >= 0
-                        return rl_of_field(get_field_type(st, fi), out)
-    rl_ty(sm, e, out)
-
-# The method `e` (EXPR_METHOD) calls, on its receiver's own type, as
-# ref_check's ref_method_def: an element of a Vec is its element's (AGAST
-# #2443).  Else bool_check's resolution, which also knows a static call.
-fn rl_method_def(sm: *Sema, e: *Expr) -> *FnDef
-    var t: SemaTy
-    if e.left != null and rl_loan_ty(sm, e.left, @t) == 1 and t.name_len > 0
-        return sema_method_fn(sm, t.name, t.name_len, e.ident_ptr, e.ident_len)
-    sbk_method_def(sm, e)
 
 # --- Places ----------------------------------------------------------------------
 
@@ -360,7 +153,7 @@ fn rl_root(sm: *Sema, e0: *Expr) -> i32
         if e.kind != EXPR_MEMBER and e.kind != EXPR_INDEX
             return 0 - 1
         var base: SemaTy
-        if rl_loan_ty(sm, e.left, @base) == 0 or rl_is_pointer(base.kind) == 1
+        if rs_loan_ty(sm, e.left, @base) == 0 or ref_is_pointer(base.kind) == 1
             return 0 - 1
         if e.kind == EXPR_INDEX
             if e.right == null or e.right.kind == EXPR_RANGE
@@ -493,7 +286,7 @@ fn rl_lends_place(sm: *Sema, a: *Expr, p: *Param) -> i32
     if a.kind != EXPR_IDENT and a.kind != EXPR_MEMBER and a.kind != EXPR_INDEX
         return 0
     var t: SemaTy
-    if rl_ty(sm, a, @t) == 1 and rl_is_pointer(t.kind) == 1 and p.param_pointee_type != TYPE_PTR
+    if rs_ty(sm, a, @t) == 1 and ref_is_pointer(t.kind) == 1 and p.param_pointee_type != TYPE_PTR
         return 0
     1
 
@@ -501,7 +294,7 @@ fn rl_lends_place(sm: *Sema, a: *Expr, p: *Param) -> i32
 # AGAST #3278: a free call of a method taking `self:& C` (typed, or bare in a
 # non-generic impl) lends its receiver, as emitter_expr_call's
 # lent_self_call_view reads it.
-fn rl_param_lends(sm: *Sema, f: *FnDef, p: *Param) -> i32
+pub fn rl_param_lends(sm: *Sema, f: *FnDef, p: *Param) -> i32
     if p.is_borrow == 1
         return 1
     if p != f.params or param_is_self(p) == 0 or p.is_self_borrow == 0
@@ -545,12 +338,12 @@ fn rl_receiver(sm: *Sema, e: *Expr, p: *Param)
     if p == null or p.param_type != TYPE_MUT_REF
         return
     var t: SemaTy
-    if rl_ty(sm, e.left, @t) == 0 or rl_is_pointer(t.kind) == 1
+    if rs_ty(sm, e.left, @t) == 0 or ref_is_pointer(t.kind) == 1
         return
     rl_use(sm, e.left.span.line, e.left.span.col, rl_root(sm, e.left), e.left, 1, 0)
 
 # 1 when `e` is `E.V(..)` of a user enum `E` (no local or global named E).
-fn rl_qualified_variant(sm: *Sema, e: *Expr) -> i32
+pub fn rl_qualified_variant(sm: *Sema, e: *Expr) -> i32
     let q: *Expr = e.left
     if q == null or q.kind != EXPR_IDENT
         return 0
@@ -587,7 +380,7 @@ fn rl_walk(sm: *Sema, e: *Expr)
             return
         # A call through a `fn(...)` local or param: a local named like a fn
         # is the local, as emit_call calls it (#2407, #2417).
-        let f: *FnDef = rl_call_fn(sm, e)
+        let f: *FnDef = rs_call_fn(sm, e)
         var p: *Param = null
         if f != null
             p = f.params
@@ -598,7 +391,7 @@ fn rl_walk(sm: *Sema, e: *Expr)
             return
         rl_walk(sm, e.left)
         var mp: *Param = null
-        let m: *FnDef = rl_method_def(sm, e)
+        let m: *FnDef = rs_method_def(sm, e)
         if m != null
             # A method found by a looser name, `v.push(x)` for `vec_push(v, x)`,
             # takes the receiver as an argument: its params don't line up, so
@@ -634,20 +427,20 @@ fn rl_walk(sm: *Sema, e: *Expr)
     else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_MATCH or k == EXPR_IF
         rl_walk(sm, e.left)
 
-fn rl_expr_ident(e: *Expr, name: *u8, len: i32)
+pub fn rl_expr_ident(e: *Expr, name: *u8, len: i32)
     memset(e as *u8, 0, sizeof(Expr))
     e.kind = EXPR_IDENT
     e.ident_ptr = name
     e.ident_len = len
 
-fn rl_expr_member(e: *Expr, base: *Expr, name: *u8, len: i32)
+pub fn rl_expr_member(e: *Expr, base: *Expr, name: *u8, len: i32)
     memset(e as *u8, 0, sizeof(Expr))
     e.kind = EXPR_MEMBER
     e.left = base
     e.ident_ptr = name
     e.ident_len = len
 
-fn rl_expr_index(e: *Expr, base: *Expr, index: *Expr)
+pub fn rl_expr_index(e: *Expr, base: *Expr, index: *Expr)
     memset(e as *u8, 0, sizeof(Expr))
     e.kind = EXPR_INDEX
     e.left = base
@@ -708,7 +501,7 @@ fn rl_for_hold(sm: *Sema, stmt: *Stmt)
     while base == null and (e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX)
         if e.kind == EXPR_INDEX
             var t: SemaTy
-            if rl_loan_ty(sm, e.left, @t) == 1 and t.kind != TYPE_ARRAY
+            if rs_loan_ty(sm, e.left, @t) == 1 and t.kind != TYPE_ARRAY
                 base = e.left
         e = e.left
     if base == null

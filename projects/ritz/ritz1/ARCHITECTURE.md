@@ -216,14 +216,22 @@ still run mid-lowering on `*EmitterState`, and
 
 - `ref_check` — a reference doesn't fit a by-value slot, nor a value a
   reference slot, and an array only fits a slot of its own element type.
-  Its §13.5 borrow conflicts moved to `ref_loan` (#3506); these value checks
-  are #3926's move.
+  Its §13.5 borrow conflicts moved to `ref_loan` (#3506), its `@T` read-only
+  writes and return-of-local to `ref_value` (#3926); the slot checks are
+  still to move (#1816). Its place queries (`ref_view_in`,
+  `ref_write_is_shared_in`, `ref_ty_in`) are one copy over a `RefEnv`, the
+  emitter's locals or Sema's scope, and it keeps Sema's place typing
+  (`rs_ty`) and per-binding notes (`RsNote`).
 
 - `ref_loan` — a borrow of a place conflicts with an overlapping loan
   (§13.5, R11 / R11a). A loan ends with its holder's block: Sema's blocks
   and match arms (`ref_loan_enter` / `ref_loan_leave`), not the emitter's
-  scopes. A place's steps are typed from Sema's scope and notes (`rl_ty`);
+  scopes. A place's steps are typed from Sema's scope and notes (`rs_ty`);
   what Sema can't type borrows nothing.
+
+- `ref_value` — `@T` is read-only (§13.3, R1): no write, `@&` or `self: @&T`
+  receiver through an `@T`; a reference to a local doesn't leave its fn
+  (§13.5, R2). Its places are typed by `ref_check`'s `RefEnv` queries.
 
 - `sema_index_store` — an index store ritz1 can't lower is refused, not
   miscompiled.

@@ -1,0 +1,659 @@
+# ritz1/src/ref_value.ritz - ref_check's value checks, on Sema (AGAST #3926)
+#
+# AGAST #3926 (#1816) moves ref_check.ritz's value checks off the emitter.
+# This is its first half: what the walk itself judges, with no slot to land in.
+#
+# `@T` is read-only (LANGUAGE_SPEC §3.2, §13.3, LARB R1, AGAST #2338): a write
+# through an `@T` (`p.f = v`, `p[i] = v`, `*p = v`, through a chain of fields)
+# is an error, and so is `@&` of such a place.  An `@T` doesn't become an `@&T`
+# (AGAST #2374): a method taking `self: @&T` on a receiver reached through an
+# `@T` is.  ritz0's twins are TypeChecker._check_write, _check_borrow and
+# _check_receiver; ritz0/test_at_is_read_only.py and test_at_into_mut.py hold
+# all three compilers to them.
+#
+# A reference to a local doesn't leave its fn (LANGUAGE_SPEC §13.5, LARB R2,
+# AGAST #2340): a `return` or tail of `@x`, of a binding definitely holding one,
+# or of a call returning `@U` / `@&U` that was given one.  Statements are seen
+# in order, as ritz0 sees them: a `var` that's written stops counting there, and
+# a loop can reach that write first.  ritz0's twin is TypeChecker._check_return;
+# ritz0/test_return_local_ref.py holds all three compilers to it.
+#
+# The place queries (ref_view_in, ref_write_is_shared_in, ref_ty_in) are
+# ref_check's, one copy over a RefEnv, which the emitter's codegen and slot
+# checks share.  What Sema's scope doesn't keep (an inferred `let`'s reference
+# kind, a `**`'s nearest level, a `:&`'s caller place, the root a binding
+# refers to) is noted per binding in ref_check's RsNote, here, as the emitter
+# keeps it on LocalVar.  What can't be typed stays unjudged.
+#
+# Still on the emitter (#1816): the slot checks (a reference into a by-value
+# slot and back, `@x` / an `@T` into an `@&T` or `:&` slot, arrays, call
+# temporaries, `[v; n]`).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str     # memset
+
+import ast
+import ast_helpers
+import diag
+import emitter_core   # name_eq, eprint_*
+import emitter_expr   # ptr_ptr_ident_levels
+import sema
+import sema_type
+import deref_field    # df_is_step (AGAST #3015)
+import ref_check      # RefEnv, RefTy, RsNote and the place queries
+import ref_loan       # rl_param_lends, rl_qualified_variant, rl_expr_*
+
+# Where the last error was reported: one report per place.
+var RV_LAST_LINE: i32 = 0
+var RV_LAST_COL: i32 = 0
+# The loops around the statement being checked.
+var RV_LOOPS: i32 = 0
+# What the fn returns; `returned` is 1 when it leaves as a pointer or reference.
+var RV_RET: RefTy
+# The tails of the fn's value, judged as they're reached (with their arms'
+# bindings in scope).
+var RV_TAILS: **Expr = null
+var RV_TAIL_COUNT: i32 = 0
+var RV_TAIL_CAP: i32 = 0
+# A declaration's root, its type, and the reference kind its binding takes,
+# until ref_value_after can give them to the binding.
+var RV_DECL_ROOT: *u8 = null
+var RV_DECL_ROOT_LEN: i32 = 0
+var RV_DECL_TY: RefTy
+var RV_DECL_KIND: i32 = 0
+var RV_DECL_REF: RefTy
+
+fn rv_env(sm: *Sema, env: *RefEnv) -> *RefEnv
+    env.s = null
+    env.sm = sm
+    env
+
+fn rv_first_report(line: i32, col: i32) -> i32
+    if line == RV_LAST_LINE and col == RV_LAST_COL
+        return 0
+    RV_LAST_LINE = line
+    RV_LAST_COL = col
+    1
+
+fn rv_error(sm: *Sema, line: i32, col: i32, msg: *u8) -> i32
+    if rv_first_report(line, col) == 0
+        return 0
+    diag_error_at(sema_file(sm), diag_span(line, col))
+    eprints_cstr(msg)
+    sm.error_count = sm.error_count + 1
+    1
+
+# --- `@T` is read-only -------------------------------------------------------------
+
+fn rv_shared(sm: *Sema, e: *Expr) -> i32
+    var env: RefEnv
+    ref_write_is_shared_in(rv_env(sm, @env), e)
+
+# The statement forms the parser splits a place into, put back together.
+fn rv_writes_shared(sm: *Sema, stmt: *Stmt) -> i32
+    let k: i32 = stmt.kind
+    var root: Expr
+    var member: Expr
+    var element: Expr
+    if k == STMT_ASSIGN
+        if stmt.assign_target_len > 0
+            return 0
+        return rv_shared(sm, stmt.if_cond as *Expr)
+    if k == STMT_INDEX_ASSIGN
+        rl_expr_ident(@root, stmt.assign_target, stmt.assign_target_len)
+        rl_expr_index(@element, @root, null)
+        return rv_shared(sm, @element)
+    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        rl_expr_ident(@root, stmt.var_name, stmt.var_name_len)
+        rl_expr_member(@member, @root, stmt.assign_target, stmt.assign_target_len)
+    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        rl_expr_member(@member, stmt.if_cond as *Expr, stmt.assign_target, stmt.assign_target_len)
+    else
+        return 0
+    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+        return rv_shared(sm, @member)
+    rl_expr_index(@element, @member, null)
+    rv_shared(sm, @element)
+
+fn rv_check_write(sm: *Sema, stmt: *Stmt)
+    if rv_writes_shared(sm, stmt) == 0
+        return
+    # `(*p).f = v` starts at the `(`, and the place at the `*`.
+    var col: i32 = stmt.span.col
+    if stmt.kind == STMT_MEMBER_ASSIGN or stmt.kind == STMT_MEMBER_INDEX_ASSIGN
+        col = col + 1
+    rv_error(sm, stmt.span.line, col, c"cannot write through an `@T`: make it `@&T`\n")
+
+# `e` is a mutable borrow of its operand.
+fn rv_check_borrow(sm: *Sema, e: *Expr)
+    if rv_shared(sm, e.operand) == 1
+        rv_error(sm, e.span.line, e.span.col, c"cannot borrow through an `@T` as mutable: make it `@&T`\n")
+
+# A method taking `self: @&T` writes what its receiver reaches, as `recv.f = v`
+# would: `.` finds the receiver the same way.  `p` is its first param, whatever
+# that's called: a standalone function takes the receiver there too.
+fn rv_check_receiver(sm: *Sema, e: *Expr, p: *Param)
+    if p == null or p.param_type != TYPE_MUT_REF
+        return
+    var member: Expr
+    rl_expr_member(@member, e.left, e.ident_ptr, e.ident_len)
+    if rv_shared(sm, @member) == 1
+        rv_error(sm, e.left.span.line, e.left.span.col, c"an `@T` doesn't fit an `@&T` slot: make it `@&T`\n")
+
+# --- A reference to a local doesn't leave its fn ------------------------------------
+
+fn rv_note_of(sm: *Sema, name: *u8, len: i32) -> *RsNote
+    rs_note(sm, sema_find_local(sm, name, len))
+
+# The local root the place `e` is in, reached with no pointer or reference on the
+# path; null if it's not in one, or Sema can't say.
+fn rv_local_root(sm: *Sema, e0: *Expr) -> *SemaVar
+    var env: RefEnv
+    var e: *Expr = e0
+    while e != null
+        if e.kind == EXPR_IDENT
+            let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+            if v == null
+                return null
+            let n: *RsNote = rs_note(sm, v)
+            if n != null and n.caller_place == 1
+                return null
+            return v
+        if e.kind != EXPR_MEMBER and e.kind != EXPR_INDEX
+            return null
+        var base: RefTy
+        if ref_ty_in(rv_env(sm, @env), e.left, @base) == 0 or ref_is_pointer(base.kind) == 1
+            return null
+        if e.kind == EXPR_INDEX and (base.kind != TYPE_ARRAY or e.right == null or e.right.kind == EXPR_RANGE)
+            return null
+        e = e.left
+    null
+
+# The name of the local root `e` definitely refers to, with its length in `len`:
+# `@x` of one, or a binding that holds such a reference.  Null if there's none.
+fn rv_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
+    if e == null
+        return null
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        let root: *SemaVar = rv_local_root(sm, e.operand)
+        if root == null
+            return null
+        *len = root.name_len
+        return root.name
+    if e.kind != EXPR_IDENT
+        return null
+    let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+    let n: *RsNote = rs_note(sm, v)
+    # A loop can reach a `var`'s later write before this read.
+    if n == null or n.root == null or v.is_let == 0 and RV_LOOPS > n.root_loops
+        return null
+    *len = n.root_len
+    n.root
+
+# What `e`, which rv_referent named a root for, has: a binding keeps it.
+fn rv_referent_ty(sm: *Sema, e: *Expr, out: *RefTy) -> i32
+    if e.kind == EXPR_IDENT
+        let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        if v != null
+            let n: *RsNote = rs_note(sm, v)
+            if n == null
+                return ref_set(out, TYPE_PTR, TYPE_VOID, null, 0)
+            return ref_set(out, TYPE_PTR, n.root_pointee, n.root_name, n.root_name_len)
+    var env: RefEnv
+    ref_ty_in(rv_env(sm, @env), e, out)
+
+# `name` is written, or its address may let it be: if it's a `var`, what it holds
+# is no longer definite.
+fn rv_forget_name(sm: *Sema, name: *u8, len: i32)
+    let v: *SemaVar = sema_find_local(sm, name, len)
+    if v == null or v.is_let == 1
+        return
+    let n: *RsNote = rs_note(sm, v)
+    if n != null
+        n.root = null
+
+fn rv_forget(sm: *Sema, e: *Expr)
+    if e != null and e.kind == EXPR_IDENT
+        rv_forget_name(sm, e.ident_ptr, e.ident_len)
+
+# The local root `a` refers to, if it has `ret`'s pointee.  A `:&` param or a
+# receiver borrows `a` itself when it's that `U`.
+fn rv_gives_referent(sm: *Sema, a: *Expr, lent: i32, ret: *RefTy, len: *i32) -> *u8
+    var t: RefTy
+    let root: *u8 = rv_referent(sm, a, len)
+    if root != null
+        if rv_referent_ty(sm, a, @t) == 1 and ref_same_referent(@t, ret) == 1
+            return root
+        return null
+    if lent == 0
+        return null
+    var env: RefEnv
+    let place: *SemaVar = rv_local_root(sm, a)
+    if place == null or ref_ty_in(rv_env(sm, @env), a, @t) == 0
+        return null
+    var held: RefTy
+    ref_set(@held, TYPE_PTR, t.kind, t.name, t.name_len)
+    if ref_same_referent(@held, ret) == 0
+        return null
+    *len = place.name_len
+    place.name
+
+# The local root a call returning `@U` or `@&U` was given a reference to, with
+# pointee `U`: the result may be that reference, so a raw `*U` return, which no
+# reference has to live through, isn't asked.
+fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
+    var f: *FnDef = null
+    if e.kind == EXPR_METHOD
+        f = rs_method_def(sm, e)
+    else
+        f = sema_call_fn(sm, e)
+    var ret: RefTy
+    if f == null or f.ret_ref == null or ref_of_fn(f, @ret) == 0
+        return null
+    var p: *Param = f.params
+    if p != null and name_eq(p.name, p.name_len, c"self", 4) == 1
+        p = p.next
+    if e.kind == EXPR_METHOD
+        let by_self: *u8 = rv_gives_referent(sm, e.left, 1, @ret, len)
+        if by_self != null
+            return by_self
+    var a: *Expr = e.args
+    while a != null
+        var lent: i32 = 0
+        if p != null
+            lent = p.is_borrow
+            p = p.next
+        let root: *u8 = rv_gives_referent(sm, a, lent, @ret, len)
+        if root != null
+            return root
+        a = a.next
+    null
+
+# 1 when ref_check's `@&T` slot check, still on the emitter, refuses `e` going
+# into the fn's `-> @&T` at this very place (ref_addr_into_mut: any `@x`;
+# ref_shared_into_mut: an `@T`, or an `@&T` reached through one).  That error
+# is the one reported there, as it was when both ran on the emitter with one
+# report per place.
+fn rv_slot_refuses(sm: *Sema, e: *Expr) -> i32
+    if RV_RET.kind != TYPE_MUT_REF
+        return 0
+    if e.kind == EXPR_UNARY and e.op == OP_ADDR
+        return 1
+    var env: RefEnv
+    let view: i32 = ref_view_in(rv_env(sm, @env), e)
+    if view == REF_VIEW_SHARED
+        return 1
+    if view != REF_VIEW_MUT
+        return 0
+    var pointee: Expr
+    memset(@pointee as *u8, 0, sizeof(Expr))
+    pointee.kind = EXPR_UNARY
+    pointee.op = OP_DEREF
+    pointee.operand = e
+    rv_shared(sm, @pointee)
+
+# `e` is a return value or a tail of one.
+fn rv_check_return(sm: *Sema, e: *Expr)
+    if rv_slot_refuses(sm, e) == 1
+        return
+    var len: i32 = 0
+    var root: *u8 = rv_referent(sm, e, @len)
+    if root == null and (e.kind == EXPR_CALL or e.kind == EXPR_METHOD)
+        root = rv_call_referent(sm, e, @len)
+    if root == null or rv_first_report(e.span.line, e.span.col) == 0
+        return
+    diag_error_at(sema_file(sm), diag_span(e.span.line, e.span.col))
+    eprints_cstr(c"cannot return a reference to local `")
+    eprint_bytes(root, len)
+    eprints_cstr(c"`: it ends with the fn\n")
+    sm.error_count = sm.error_count + 1
+
+# --- The fn's tails --------------------------------------------------------------------
+
+fn rv_note(e: *Expr)
+    if RV_TAIL_COUNT == RV_TAIL_CAP
+        let cap: i32 = RV_TAIL_CAP * 2 + 16
+        let grown: **Expr = malloc((cap as i64) * sizeof(*Expr)) as **Expr
+        for i in 0..RV_TAIL_COUNT
+            *(grown + i) = *(RV_TAILS + i)
+        if RV_TAILS != null
+            free(RV_TAILS as *u8)
+        RV_TAILS = grown
+        RV_TAIL_CAP = cap
+    *(RV_TAILS + RV_TAIL_COUNT) = e
+    RV_TAIL_COUNT = RV_TAIL_COUNT + 1
+
+fn rv_note_arms(arms: *MatchArm)
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 0 and arm.body != null
+            rv_note_value(arm.body)
+        else
+            rv_note_stmts(arm.body_stmts)
+        arm = arm.next
+
+fn rv_note_value(e: *Expr)
+    if e == null
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        rv_note_arms(e.args as *MatchArm)
+    else
+        rv_note(e)
+
+# The last statement of `list` is its value.
+fn rv_note_stmts(list: *Stmt)
+    var st: *Stmt = list
+    if st == null
+        return
+    while st.next != null
+        st = st.next
+    if st.kind == STMT_EXPR
+        rv_note_value(st.expr)
+    else if st.kind == STMT_IF
+        rv_note_stmts(st.if_then)
+        rv_note_stmts(st.if_else)
+    else if st.kind == STMT_MATCH
+        rv_note_arms(st.if_then as *MatchArm)
+
+# `e`'s value leaves the fn: an `if` or `match` is judged at each tail.
+fn rv_into_return(sm: *Sema, e: *Expr)
+    if e == null or RV_RET.returned == 0
+        return
+    if e.kind == EXPR_IF or e.kind == EXPR_MATCH
+        rv_note_value(e)
+        return
+    rv_check_return(sm, e)
+
+# `e` is about to be reached as a tail: judge it if it's one of the fn's.
+fn rv_landed(sm: *Sema, e: *Expr)
+    for i in 0..RV_TAIL_COUNT
+        if *(RV_TAILS + i) == e
+            rv_check_return(sm, e)
+            return
+
+# --- The walk -----------------------------------------------------------------------
+
+fn rv_walk_list(sm: *Sema, a0: *Expr)
+    var a: *Expr = a0
+    while a != null
+        rv_walk(sm, a)
+        a = a.next
+
+# A call's arguments, against `f`'s params from `p0`: what a `:&` param is lent
+# may be written (as ref_check's ref_args forgets it).
+fn rv_args(sm: *Sema, a0: *Expr, f: *FnDef, p0: *Param)
+    var a: *Expr = a0
+    var p: *Param = p0
+    while a != null
+        if p != null
+            if p.is_borrow == 1 or f != null and rl_param_lends(sm, f, p) == 1
+                rv_forget(sm, a)
+            p = p.next
+        rv_walk(sm, a)
+        a = a.next
+
+# Every borrow and receiver inside `e`.  An `if` or `match` is its condition
+# here: its arms come through ref_value_check_value and the statement hooks.
+fn rv_walk(sm: *Sema, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_CALL
+        if e.func_name_len == 6 and name_eq(e.func_name, e.func_name_len, c"sizeof", 6) == 1
+            return
+        # AGAST #3015: `S_deref(@b)` made for `b.f` (R17) is a step of the
+        # place `b.f`; it lends nothing itself.
+        if df_is_step(e) == 1
+            let sa: *Expr = e.args
+            if sa != null and sa.kind == EXPR_UNARY and (sa.op == OP_ADDR or sa.op == OP_ADDR_MUT)
+                rv_walk(sm, sa.operand)
+            else
+                rv_walk(sm, sa)
+            return
+        var en: *u8 = null
+        var el: i32 = 0
+        user_variant_ctor_enum(e, @en, @el)
+        if en != null
+            rv_walk_list(sm, e.args)
+            return
+        let f: *FnDef = rs_call_fn(sm, e)
+        var p: *Param = null
+        if f != null
+            p = f.params
+        rv_args(sm, e.args, f, p)
+    else if k == EXPR_METHOD
+        if rl_qualified_variant(sm, e) == 1
+            rv_walk_list(sm, e.args)
+            return
+        rv_walk(sm, e.left)
+        var mp: *Param = null
+        let m: *FnDef = rs_method_def(sm, e)
+        if m != null
+            # A method found by a looser name, `v.push(x)` for `vec_push(v, x)`,
+            # takes the receiver as an argument: its params don't line up.
+            mp = m.params
+            rv_check_receiver(sm, e, mp)
+            if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
+                mp = mp.next
+            else
+                mp = null
+        rv_args(sm, e.args, null, mp)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            rv_walk(sm, fi.value)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        rv_walk_list(sm, e.args)
+    else if k == EXPR_ARRAY_FILL
+        rv_walk(sm, e.left)
+    else if k == EXPR_UNARY
+        if e.op == OP_ADDR_MUT
+            rv_check_borrow(sm, e)
+        if e.op == OP_ADDR_MUT or e.op == OP_ADDR
+            rv_forget(sm, e.operand)
+        rv_walk(sm, e.operand)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        rv_walk(sm, e.left)
+        rv_walk(sm, e.right)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_MATCH or k == EXPR_IF
+        rv_walk(sm, e.left)
+
+# --- What Sema's scope doesn't keep -------------------------------------------------
+
+# T of `[N]T` when a pointer of `kind` to it gets the emitter's `p#` view
+# (add_array_view): a scalar, a pointer, or a struct Sema knows.
+# AGAST #3510 adds SemaVar.index_elem; fold this into it when that lands.
+fn rv_view_elem(sm: *Sema, kind: i32, pointee: i32, size: i32, elem: i32, name: *u8, len: i32) -> i32
+    if pointee != TYPE_ARRAY or size <= 0 or ref_is_pointer(kind) == 0
+        return TYPE_VOID
+    if elem == TYPE_STRUCT
+        if len <= 0 or sema_find_struct(sm, name, len) == null
+            return TYPE_VOID
+        return elem
+    if elem == TYPE_PTR
+        return elem
+    if elem == TYPE_PTR_PTR or elem == TYPE_VOID or elem == TYPE_UNKNOWN or elem == TYPE_ARRAY
+        return TYPE_VOID
+    if primitive_name_len(elem) == 0
+        return TYPE_VOID
+    elem
+
+# What a `:&` param or `self:&` names is the caller's (ref_mark_params).  A
+# by-value `self` is a local root, as any by-value param is (#2393).
+fn rv_caller_place(p: *Param) -> i32
+    (p.is_borrow == 1 or p.is_self_borrow == 1) as i32
+
+fn rv_note_params(sm: *Sema, f: *FnDef)
+    var p: *Param = f.params
+    while p != null
+        let v: *SemaVar = sema_find_local(sm, p.name, p.name_len)
+        if v != null
+            let n: *RsNote = rs_note_new(sm, v)
+            n.inner_ref = p.param_inner_ref
+            n.caller_place = rv_caller_place(p)
+            n.elem = rv_view_elem(sm, p.param_type, p.param_pointee_type, p.param_pointee_array_size, p.param_pointee_array_elem_type, p.param_type_name, p.param_type_name_len)
+            if ref_is_pointer(p.param_type) == 1 and p.param_pointee_type == TYPE_ARRAY and p.param_pointee_array_shape == null
+                n.arr_elem = p.param_pointee_array_elem_type
+        p = p.next
+
+# The binding `stmt` just made, at the top of Sema's scope.
+fn rv_note_decl(sm: *Sema, stmt: *Stmt)
+    if sm.scope_top <= 0
+        return
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if name_eq(v.name, v.name_len, stmt.var_name, stmt.var_name_len) == 0
+        return
+    let n: *RsNote = rs_note_new(sm, v)
+    n.inner_ref = stmt.var_inner_ref
+    n.ref_kind = RV_DECL_KIND
+    n.ref_pointee = RV_DECL_REF.pointee
+    n.ref_name = RV_DECL_REF.name
+    n.ref_name_len = RV_DECL_REF.name_len
+    n.elem = rv_view_elem(sm, stmt.var_type, stmt.var_pointee_type, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type, stmt.var_type_name, stmt.var_type_name_len)
+    if ref_is_pointer(stmt.var_type) == 1 and stmt.var_pointee_type == TYPE_ARRAY and stmt.var_pointee_array_shape == null
+        n.arr_elem = stmt.var_pointee_array_elem_type
+    if RV_DECL_ROOT == null
+        return
+    # An un-annotated `let` holds the `@T`.  `let n: i64 = @c` is a pointer as an
+    # integer: no reference, whatever the binding says.
+    let declared: i32 = stmt.var_declared_type
+    if declared == TYPE_VOID or declared == TYPE_PTR_PTR or ref_is_pointer(declared) == 1
+        n.root = RV_DECL_ROOT
+        n.root_len = RV_DECL_ROOT_LEN
+        n.root_loops = RV_LOOPS
+        n.root_pointee = RV_DECL_TY.pointee
+        n.root_name = RV_DECL_TY.name
+        n.root_name_len = RV_DECL_TY.name_len
+
+# A declaration's initialiser, before its binding exists: what root it refers
+# to, and whether the emitter types an un-annotated binding as a reference
+# (emitter_stmt's let_ref_view / type_ref_view_let, AGAST #3079).
+fn rv_before_decl(sm: *Sema, stmt: *Stmt)
+    RV_DECL_ROOT = rv_referent(sm, stmt.var_init, @RV_DECL_ROOT_LEN)
+    if RV_DECL_ROOT != null and rv_referent_ty(sm, stmt.var_init, @RV_DECL_TY) == 0
+        RV_DECL_TY.pointee = TYPE_VOID
+    RV_DECL_KIND = TYPE_VOID
+    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+        return
+    var env: RefEnv
+    let view: i32 = ref_view_in(rv_env(sm, @env), stmt.var_init)
+    if view == REF_VIEW_SHARED
+        RV_DECL_KIND = TYPE_REF
+    else if view == REF_VIEW_MUT
+        RV_DECL_KIND = TYPE_MUT_REF
+    else
+        return
+    # What it points at, as the inference typed it before the view made it a
+    # reference: `@q` of a `*C` is an `@*C`.
+    if ref_ty_in(rv_env(sm, @env), stmt.var_init, @RV_DECL_REF) == 0 or ref_is_pointer(RV_DECL_REF.kind) == 0
+        ref_set(@RV_DECL_REF, RV_DECL_KIND, TYPE_VOID, null, 0)
+
+# A match arm's payload binding, just bound: an `@T` or `@&T` variant field
+# binds as one (lower_ref_fields made it a `*T` with a flag).  Only a user
+# enum's tuple variant; anything else stays as Sema typed it.
+pub fn ref_value_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
+    if scrut == null or arm.pattern_kind != PAT_VARIANT or arm.pattern_inner_kind != PAT_IDENT or sm.scope_top <= 0
+        return
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if name_eq(v.name, v.name_len, arm.pattern_inner_name, arm.pattern_inner_name_len) == 0
+        return
+    sm.scope_top = sm.scope_top - 1   # the scrutinee is read outside the arm
+    var t: SemaTy
+    df_ty(sm, scrut, @t)
+    sm.scope_top = sm.scope_top + 1
+    if t.kind == TYPE_UNKNOWN or t.name == null or t.name_len <= 0 or user_enum_index(t.name, t.name_len) < 0
+        return
+    let f: *StructField = user_enum_tuple_field(t.name, t.name_len, enum_variant_index(t.name, t.name_len, arm.pattern_name, arm.pattern_name_len))
+    if f == null or f.field_shared_ref == 0 and f.field_mut_ref == 0
+        return
+    let n: *RsNote = rs_note_new(sm, v)
+    n.ref_kind = TYPE_REF
+    if f.field_mut_ref == 1
+        n.ref_kind = TYPE_MUT_REF
+    n.ref_pointee = f.ptr_pointee
+    if n.ref_pointee == TYPE_VOID and f.field_type_name_len > 0
+        n.ref_pointee = TYPE_STRUCT
+    n.ref_name = f.field_type_name
+    n.ref_name_len = f.field_type_name_len
+
+# --- The walk's hooks ----------------------------------------------------------------
+
+# A fn begins, its params bound.
+pub fn ref_value_begin_fn(sm: *Sema, f: *FnDef)
+    RV_LAST_LINE = 0
+    RV_LAST_COL = 0
+    RV_LOOPS = 0
+    RV_TAIL_COUNT = 0
+    RV_DECL_ROOT = null
+    rs_notes_clear()
+    rv_note_params(sm, f)
+    if ref_of_fn(f, @RV_RET) == 0
+        RV_RET.kind = TYPE_VOID
+    # `-> *i32` and `-> **T` name nothing ref_of_fn can, and still leave as pointers.
+    RV_RET.returned = 0
+    if ref_is_pointer(f.return_type) == 1 or f.return_type == TYPE_PTR_PTR
+        RV_RET.returned = 1
+        rv_note_stmts(f.body)
+
+# Statement `stmt`, before the statements nested in it: its own place and
+# values (an `if` or loop's condition, a `for`'s range).
+pub fn ref_value_check_stmt(sm: *Sema, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    rv_check_write(sm, stmt)
+    # What a write's place evaluates on the way: its base and its index.
+    if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_ASSIGN and stmt.assign_target_len == 0
+        rv_walk(sm, stmt.if_cond as *Expr)
+    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        rv_walk(sm, stmt.while_cond)
+    if k == STMT_VAR_DECL
+        rv_walk(sm, stmt.var_init)
+        rv_before_decl(sm, stmt)
+    else if k == STMT_TUPLE_DECL
+        rv_walk(sm, stmt.var_init)
+    else if k == STMT_ASSIGN
+        rv_walk(sm, stmt.assign_value)
+        if stmt.assign_target_len > 0
+            rv_forget_name(sm, stmt.assign_target, stmt.assign_target_len)
+    else if k == STMT_RETURN
+        rv_into_return(sm, stmt.return_value)
+        rv_walk(sm, stmt.return_value)
+    else if k == STMT_EXPR
+        ref_value_check_value(sm, stmt.expr)
+    else if k == STMT_MATCH or k == STMT_IF or k == STMT_ASSERT
+        rv_walk(sm, stmt.if_cond as *Expr)
+    else if k == STMT_WHILE
+        rv_walk(sm, stmt.while_cond)
+        RV_LOOPS = RV_LOOPS + 1
+    else if k == STMT_FOR
+        rv_walk(sm, stmt.for_start)
+        rv_walk(sm, stmt.for_end)
+        RV_LOOPS = RV_LOOPS + 1
+    else if k == STMT_LOOP
+        RV_LOOPS = RV_LOOPS + 1
+    else if k == STMT_ASM
+        # An asm block (§18.6, AGAST #3395) assigns its `out` / `inout` operands.
+        var o: *AsmOperand = stmt.asm_block.operands
+        while o != null
+            if o.dir == ASM_OUT or o.dir == ASM_INOUT
+                rv_forget_name(sm, o.name, o.name_len)
+            o = o.next
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        rv_walk(sm, stmt.assign_value)
+
+# A tail or a match arm's value, its bindings in scope.
+pub fn ref_value_check_value(sm: *Sema, e: *Expr)
+    rv_landed(sm, e)
+    rv_walk(sm, e)
+
+# After statement `stmt` and what's nested in it: a declaration's binding exists
+# now, and a loop is over.
+pub fn ref_value_after(sm: *Sema, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    if k == STMT_WHILE or k == STMT_FOR or k == STMT_LOOP
+        RV_LOOPS = RV_LOOPS - 1
+    if k == STMT_VAR_DECL
+        rv_note_decl(sm, stmt)
+    RV_DECL_ROOT = null

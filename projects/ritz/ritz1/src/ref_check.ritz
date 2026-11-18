@@ -29,12 +29,17 @@
 # ownership.ritz uses ref_ty_of and ref_through for "cannot move out of a
 # reference", which only reaches a program with a Drop in it.
 #
-# `@T` is read-only (AGAST #2338), and doesn't become an `@&T` (AGAST #2374): near
-# the end of this file, and ref_addr_into_mut.  A reference to a local doesn't
-# leave its fn (AGAST #2340): the end of this file.
+# `@T` is read-only (AGAST #2338), and doesn't become an `@&T` (AGAST #2374):
+# a write, an `@&` or a `self: @&T` receiver through an `@T`, and a reference to
+# a local doesn't leave its fn (AGAST #2340): ref_value.ritz's, on Sema since
+# AGAST #3926.  Here, still: `@x` or an `@T` into an `@&T` or `:&` slot
+# (ref_addr_into_mut, ref_shared_into_mut), with the other slot checks.
 #
 # §13.5's borrow conflicts (AGAST #2438) are ref_loan.ritz's, on Sema since
-# AGAST #3506: these value checks are its second half, still to move (#1816).
+# AGAST #3506.  The slot checks above are the rest of #3926, still to move
+# (#1816).  Until they do, the place queries both sides need are one copy over
+# a RefEnv (ref_view_in, ref_write_is_shared_in, ref_ty_in), as let_check's
+# LetEnv: Sema's side reads rs_ty and the RsNote notes kept below.
 
 import ritzlib.sys
 import ritzlib.io
@@ -51,6 +56,9 @@ import emitter_expr
 import emitter_expr_arith
 import ritzlib.memory
 import ritzlib.str
+import sema
+import sema_type
+import bool_check          # sbk_global, sbk_method_def
 
 # What an expression or a slot holds.
 pub struct RefTy
@@ -91,14 +99,8 @@ var REF_TAIL_CAP: i32 = 0
 var REF_RET: RefTy
 var REF_LAST_LINE: i32 = 0
 var REF_LAST_COL: i32 = 0
-# The local root a declaration's initialiser refers to, until ref_after_stmt can
-# give it to the binding, and the loops around the statement being checked.
-var REF_DECL_ROOT: *u8 = null
-var REF_DECL_ROOT_LEN: i32 = 0
-var REF_DECL_TY: RefTy
-var REF_LOOPS: i32 = 0
 
-fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
+pub fn ref_set(out: *RefTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.kind = kind
     out.pointee = pointee
     out.name = name
@@ -180,7 +182,7 @@ fn ref_of_ident(s: *EmitterState, name: *u8, len: i32, out: *RefTy) -> i32
         return ref_set_array(out, g.array_elem_type, g.array_elem_pointee, g.array_elem_type_name, g.array_elem_type_name_len, g.array_shape, g.array_size)
     ref_set(out, g.var_type, 0, g.type_name, g.type_name_len)
 
-fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
+pub fn ref_of_fn(f: *FnDef, out: *RefTy) -> i32
     if f == null or f.return_type == TYPE_VOID
         return 0
     if f.ret_ref != null
@@ -393,6 +395,459 @@ pub fn ref_through(s: *EmitterState, e0: *Expr) -> i32
         if ref_ty_of(s, e, @t) == 1 and ref_is_pointer(t.kind) == 1
             return 1
     0
+
+# --- One copy over either side (AGAST #3926) -------------------------------------
+#
+# ref_check's value checks are moving onto Sema (#1816): the `@T` read-only
+# writes, `@&` borrows and receivers, and return-of-local run there now
+# (ref_value.ritz), the slot checks still here.  The queries both need take a
+# RefEnv, as let_check's LetEnv: the emitter's locals (s) or Sema's scope (sm).
+# Only the leaves differ: a name's binding, a member's field, a call's fn.
+pub struct RefEnv
+    s: *EmitterState
+    sm: *Sema
+
+pub fn ref_env_of(env: *RefEnv, s: *EmitterState, sm: *Sema) -> *RefEnv
+    env.s = s
+    env.sm = sm
+    env
+
+# What Sema can't read off a SemaVar, kept per scope slot by ref_value.ritz's
+# hooks as the emitter keeps it on LocalVar.  A note counts only for the binding
+# it was made for: `name` is that binding's, and a slot reused by another
+# binding (a match arm's, a `for`'s) has none.
+pub struct RsNote
+    name: *u8
+    # TYPE_REF / TYPE_MUT_REF for an un-annotated `let p = @c` / `@&c` (or a
+    # copy of one) the emitter types as a reference (type_ref_view_let), or a
+    # match payload of an `@T` / `@&T` variant field; TYPE_VOID otherwise.  What
+    # it points at stays: an `@*C` of `let p = @q` keeps its `*C`.
+    ref_kind: i32
+    ref_pointee: i32
+    ref_name: *u8
+    ref_name_len: i32
+    inner_ref: i32        # Param.param_inner_ref / Stmt.var_inner_ref (AGAST #2399)
+    # T of the `[N]T` a `*[N]T` / `@[N]T` / `@&[N]T` points at, when the emitter
+    # gives it a `p#` view (add_array_view); TYPE_VOID otherwise.
+    # AGAST #3510 adds SemaVar.index_elem; fold this into it when that lands.
+    elem: i32
+    arr_elem: i32         # that T whether or not it has a view (ref_behind)
+    caller_place: i32     # LocalVar.is_caller_place (ref_mark_params)
+    # LocalVar.ref_root* (AGAST #2340): the local root this binding definitely
+    # refers to, how many loops it was declared in, and what it points at.
+    root: *u8
+    root_len: i32
+    root_loops: i32
+    root_pointee: i32
+    root_name: *u8
+    root_name_len: i32
+
+var RS_NOTES: *RsNote = null
+var RS_NOTE_CAP: i32 = 0
+
+# The note on `v`, a binding in Sema's scope; null if none was made for it.
+pub fn rs_note(sm: *Sema, v: *SemaVar) -> *RsNote
+    if v == null
+        return null
+    let i: i32 = ((v as i64 - sm.scope as i64) / sizeof(SemaVar)) as i32
+    if i < 0 or i >= RS_NOTE_CAP
+        return null
+    let n: *RsNote = RS_NOTES + i
+    if n.name != v.name
+        return null
+    n
+
+# A fresh note on `v`, the binding just made.
+pub fn rs_note_new(sm: *Sema, v: *SemaVar) -> *RsNote
+    let i: i32 = ((v as i64 - sm.scope as i64) / sizeof(SemaVar)) as i32
+    if i >= RS_NOTE_CAP
+        let cap: i32 = i * 2 + 16
+        let grown: *RsNote = malloc((cap as i64) * sizeof(RsNote)) as *RsNote
+        memset(grown as *u8, 0, (cap as i64) * sizeof(RsNote))
+        if RS_NOTES != null
+            memcpy(grown as *u8, RS_NOTES as *u8, (RS_NOTE_CAP as i64) * sizeof(RsNote))
+            free(RS_NOTES as *u8)
+        RS_NOTES = grown
+        RS_NOTE_CAP = cap
+    let n: *RsNote = RS_NOTES + i
+    memset(n as *u8, 0, sizeof(RsNote))
+    n.name = v.name
+    n.ref_kind = TYPE_VOID
+    n.elem = TYPE_VOID
+    n.arr_elem = TYPE_VOID
+    n.root_pointee = TYPE_VOID
+    n
+
+# A fn begins: no note is for any of its bindings yet.
+pub fn rs_notes_clear()
+    if RS_NOTES != null
+        memset(RS_NOTES as *u8, 0, (RS_NOTE_CAP as i64) * sizeof(RsNote))
+
+# ref_ty_of, from either side.
+pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
+    if env.s != null
+        return ref_ty_of(env.s, e, out)
+    var t: SemaTy
+    if rs_ty(env.sm, e, @t) == 0
+        return 0
+    ref_set(out, t.kind, t.pointee, t.name, t.name_len)
+    1
+
+# The field `e` (EXPR_MEMBER) names.
+fn ref_field_in(env: *RefEnv, e: *Expr) -> *StructField
+    if env.s != null
+        return resolve_member_chain_field(env.s, e)
+    rs_field(env.sm, e)
+
+# The fn a call or method `e` calls, as ref_view's of_fn asks.
+fn ref_call_def_in(env: *RefEnv, e: *Expr) -> *FnDef
+    if e.kind == EXPR_METHOD
+        if env.s != null
+            return ref_method_def(env.s, e)
+        return rs_method_def(env.sm, e)
+    if env.s != null
+        return find_call_fn(env.s, e)
+    sema_call_fn(env.sm, e)
+
+# A step `p[i]` that reads through a pointer to an array, a Vec, Span or
+# String: its element's kind.  TYPE_VOID when `e` isn't one (index_through).
+fn ref_through_kind_in(env: *RefEnv, e: *Expr) -> i32
+    if env.s != null
+        let through: *LocalVar = index_through(env.s, e)
+        if through == null
+            return TYPE_VOID
+        return through_elem_kind(env.s, through)
+    rs_through_kind(env.sm, e)
+
+# What a write meets in `*r` with `r: @@S` or `*@&S`, held as an `@*S` / `**S`
+# (AGAST #2399): the `@S` / `@&S` the nearest level was, else 0.
+fn ref_deref_ref_in(env: *RefEnv, r: *Expr) -> i32
+    if r.kind != EXPR_IDENT
+        return 0
+    if env.s != null
+        let dl: i32 = find_local_idx(env.s, r.ident_ptr, r.ident_len)
+        if dl < 0 or local_struct_levels(local_at(env.s, dl)) != 2
+            return 0
+        return local_at(env.s, dl).inner_ref
+    let v: *SemaVar = sema_find_local(env.sm, r.ident_ptr, r.ident_len)
+    if v == null or v.lent != null or rs_levels(v) != 2
+        return 0
+    let n: *RsNote = rs_note(env.sm, v)
+    if n == null
+        return 0
+    n.inner_ref
+
+# --- Sema's side: types of a place's steps -----------------------------------------
+#
+# ref_ty_of's answer from Sema's scope (ref_ty_in's Sema side; ref_loan.ritz's
+# loans read it too, AGAST #3506): a step's kind (TYPE_*), the struct it is or
+# points at (name), and an array's element kind (pointee).  0 when Sema can't
+# say.
+
+pub fn rs_set(out: *SemaTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
+    out.kind = kind
+    out.pointee = pointee
+    out.name = name
+    out.name_len = len
+    out.fn_sig = null
+    1
+
+pub fn rs_local(sm: *Sema, v: *SemaVar, out: *SemaTy) -> i32
+    let n: *RsNote = rs_note(sm, v)
+    if n != null and n.ref_kind != TYPE_VOID
+        return rs_set(out, n.ref_kind, n.ref_pointee, n.ref_name, n.ref_name_len)
+    let p: *Param = v.lent
+    if p != null and p.param_type == TYPE_MUT_REF
+        # `c:& C` (and a free fn's `self:& C`) reads as a `C` (§13.4).
+        return rs_set(out, p.param_pointee_type, TYPE_VOID, p.param_type_name, p.param_type_name_len)
+    var kind: i32 = v.let_kind
+    if kind == TYPE_UNKNOWN and v.recv != null
+        # deref_field's note on a binding Sema leaves untyped (AGAST #3509).
+        return rs_set(out, v.recv.kind, v.recv.pointee, v.recv.name, v.recv.name_len)
+    if kind == TYPE_UNKNOWN or kind == TYPE_PTR_PTR
+        return 0
+    if kind == TYPE_ARRAY
+        var elem: i32 = v.let_elem
+        if elem == TYPE_VOID
+            elem = v.elem
+        return rs_set(out, TYPE_ARRAY, elem, v.let_name, v.let_name_len)
+    if ref_is_pointer(kind) == 1
+        return rs_set(out, kind, v.let_pointee, v.let_name, v.let_name_len)
+    rs_set(out, kind, TYPE_VOID, v.let_name, v.let_name_len)
+
+pub fn rs_ident(sm: *Sema, name: *u8, len: i32, out: *SemaTy) -> i32
+    let v: *SemaVar = sema_find_local(sm, name, len)
+    if v != null
+        return rs_local(sm, v, out)
+    let g: *GlobalVarDef = sbk_global(sm, name, len)
+    if g == null or g.var_type == TYPE_PTR_PTR
+        return 0
+    if ref_is_pointer(g.var_type) == 1
+        return rs_set(out, g.var_type, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
+    if g.var_type == TYPE_ARRAY
+        return rs_set(out, TYPE_ARRAY, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+    rs_set(out, g.var_type, TYPE_VOID, g.type_name, g.type_name_len)
+
+# What fn `f` returns, as ref_check's ref_of_fn has it.
+pub fn rs_fn(f: *FnDef, out: *SemaTy) -> i32
+    if f == null or f.return_type == TYPE_VOID
+        return 0
+    if f.ret_ref != null
+        let r: *Param = f.ret_ref
+        if r.param_type == TYPE_PTR_PTR or r.param_type == TYPE_ARRAY
+            return 0
+        return rs_set(out, r.param_type, r.param_pointee_type, r.param_type_name, r.param_type_name_len)
+    if f.ret_array != null
+        return rs_set(out, TYPE_ARRAY, f.ret_array.elem, f.ret_array.name, f.ret_array.name_len)
+    if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
+        if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
+            return rs_set(out, TYPE_PTR, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
+        return 0
+    rs_set(out, f.return_type, TYPE_VOID, f.return_type_name, f.return_type_name_len)
+
+pub fn rs_call_fn(sm: *Sema, e: *Expr) -> *FnDef
+    if e.func_name_len > 0 and e.call_type_suffix_len == 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+        if v != null
+            return v.fn_sig
+    sema_call_fn(sm, e)
+
+# The field `e` (EXPR_MEMBER) names, on its base's struct or what it points at.
+pub fn rs_field(sm: *Sema, e: *Expr) -> *StructField
+    var b: SemaTy
+    if rs_ty(sm, e.left, @b) == 0
+        return null
+    if b.kind != TYPE_STRUCT and (ref_is_pointer(b.kind) == 0 or b.pointee != TYPE_STRUCT)
+        return null
+    let st: *StructDef = sema_find_struct(sm, b.name, b.name_len)
+    if st == null
+        return null
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return null
+    get_field_type(st, idx)
+
+pub fn rs_of_field(f: *StructField, out: *SemaTy) -> i32
+    let t: i32 = lowered_field_type(f)   # Sema runs before lower_ref_fields
+    if ref_is_pointer(t) == 1
+        var pointee: i32 = f.ptr_pointee
+        if pointee == TYPE_VOID and f.field_type_name_len > 0
+            pointee = TYPE_STRUCT
+        return rs_set(out, t, pointee, f.field_type_name, f.field_type_name_len)
+    if t == TYPE_ARRAY
+        return rs_set(out, TYPE_ARRAY, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+    if t == TYPE_PTR_PTR
+        return 0
+    rs_set(out, t, TYPE_VOID, f.field_type_name, f.field_type_name_len)
+
+pub fn rs_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        return rs_ident(sm, e.ident_ptr, e.ident_len, out)
+    if k == EXPR_STRING_LIT
+        return rs_set(out, TYPE_STRUCT, TYPE_VOID, c"StrView", 7)
+    if k == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, e)
+        if f == null
+            return 0
+        return rs_of_field(f, out)
+    if k == EXPR_INDEX
+        if e.right != null and e.right.kind == EXPR_RANGE
+            return 0
+        var b: SemaTy
+        if rs_ty(sm, e.left, @b) == 0
+            return 0
+        if b.kind == TYPE_ARRAY
+            if b.pointee == TYPE_VOID or b.pointee == TYPE_UNKNOWN or b.pointee == TYPE_PTR_PTR
+                return 0
+            return rs_set(out, b.pointee, TYPE_VOID, b.name, b.name_len)
+        if ref_is_pointer(b.kind) == 1
+            if b.pointee == TYPE_VOID or ref_is_pointer(b.pointee) == 1 or b.pointee == TYPE_ARRAY or b.pointee == TYPE_PTR_PTR
+                return 0
+            return rs_set(out, b.pointee, TYPE_VOID, b.name, b.name_len)
+        return 0
+    if k == EXPR_UNARY and e.op == OP_DEREF
+        var o: SemaTy
+        if rs_ty(sm, e.operand, @o) == 0
+            return 0
+        if ref_is_pointer(o.kind) == 0
+            *out = o
+            return 1
+        if o.pointee == TYPE_ARRAY
+            return rs_behind(sm, e.operand, @o, out)
+        if o.pointee == TYPE_VOID or ref_is_pointer(o.pointee) == 1 or o.pointee == TYPE_PTR_PTR
+            return 0
+        return rs_set(out, o.pointee, TYPE_VOID, o.name, o.name_len)
+    if k == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        var a: SemaTy
+        if rs_ty(sm, e.operand, @a) == 0
+            return 0
+        if ref_is_pointer(a.kind) == 1
+            return rs_set(out, TYPE_PTR, TYPE_PTR, a.name, a.name_len)
+        return rs_set(out, TYPE_PTR, a.kind, a.name, a.name_len)
+    if k == EXPR_CALL
+        return rs_fn(rs_call_fn(sm, e), out)
+    if k == EXPR_METHOD
+        return rs_fn(rs_method_def(sm, e), out)
+    if k == EXPR_BINARY
+        var l: SemaTy
+        if rs_ty(sm, e.left, @l) == 1 and ref_is_pointer(l.kind) == 1
+            return rs_set(out, l.kind, l.pointee, l.name, l.name_len)
+        return 0
+    if k == EXPR_CAST and e.op == TYPE_PTR
+        return rs_set(out, TYPE_PTR, e.int_val as i32, e.ident_ptr, e.ident_len)
+    0
+
+# The element of the instantiated `Vec$T` `v`, from its `data: *T` field: a
+# struct, or an integer its name spells.  0 otherwise.
+pub fn rs_vec_elem(sm: *Sema, v: *SemaTy, out: *SemaTy) -> i32
+    if v.name_len <= 4 or *v.name != 'V' or *(v.name + 1) != 'e' or *(v.name + 2) != 'c' or *(v.name + 3) != '$'
+        return 0
+    let vec_st: *StructDef = sema_find_struct(sm, v.name, v.name_len)
+    if vec_st == null
+        return 0
+    let di: i32 = find_field_index(vec_st, c"data", 4)
+    if di < 0
+        return 0
+    let data: *StructField = get_field_type(vec_st, di)
+    if data.field_type != TYPE_PTR or data.field_type_name_len <= 0
+        return 0
+    if sema_find_struct(sm, data.field_type_name, data.field_type_name_len) != null
+        return rs_set(out, TYPE_STRUCT, TYPE_VOID, data.field_type_name, data.field_type_name_len)
+    let k: i32 = primitive_type_from_name(v.name + 4, v.name_len - 4)
+    if sema_is_int_kind(k) == 0
+        return 0
+    rs_set(out, k, TYPE_VOID, null, 0)
+
+# rs_ty, also through a Vec's element (`vs[1].a`), for the steps of a place.
+# As ritz0's MoveChecker._loan_type.
+pub fn rs_loan_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
+    if e.kind == EXPR_INDEX or e.kind == EXPR_MEMBER
+        var b: SemaTy
+        if rs_loan_ty(sm, e.left, @b) == 1 and b.kind == TYPE_STRUCT
+            if e.kind == EXPR_INDEX
+                if rs_vec_elem(sm, @b, out) == 1
+                    return 1
+            else
+                let st: *StructDef = sema_find_struct(sm, b.name, b.name_len)
+                if st != null
+                    let fi: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+                    if fi >= 0
+                        return rs_of_field(get_field_type(st, fi), out)
+    rs_ty(sm, e, out)
+
+# The method `e` (EXPR_METHOD) calls, on its receiver's own type, as
+# ref_check's ref_method_def: an element of a Vec is its element's (AGAST
+# #2443).  Else bool_check's resolution, which also knows a static call.
+pub fn rs_method_def(sm: *Sema, e: *Expr) -> *FnDef
+    # An element through, `p[i].m()`, is the element's type (index_through_struct).
+    var en: *u8 = null
+    var el: i32 = 0
+    if rs_through_struct(sm, e.left, @en, @el) == 1
+        if en == null
+            return null
+        return sema_method_fn(sm, en, el, e.ident_ptr, e.ident_len)
+    var t: SemaTy
+    if e.left != null and rs_loan_ty(sm, e.left, @t) == 1 and t.name_len > 0
+        return sema_method_fn(sm, t.name, t.name_len, e.ident_ptr, e.ident_len)
+    sbk_method_def(sm, e)
+
+# The `[N]T` behind `e`, a local `*[N]T`, `@[N]T` or `@&[N]T` of type `o`, as
+# ref_behind reads it; 0 for any other pointer: only a local keeps the element.
+fn rs_behind(sm: *Sema, e: *Expr, o: *SemaTy, out: *SemaTy) -> i32
+    if e.kind != EXPR_IDENT
+        return 0
+    let n: *RsNote = rs_note(sm, sema_find_local(sm, e.ident_ptr, e.ident_len))
+    if n == null or n.arr_elem == TYPE_VOID
+        return 0
+    rs_set(out, TYPE_ARRAY, n.arr_elem, o.name, o.name_len)
+
+# index_through_struct on Sema: 1 when `e` is `p[i]` through a Vec, Span or
+# String (or a pointer to one), with the element's struct name in *name (null
+# for a scalar element); 0 when `e` isn't one.
+fn rs_through_struct(sm: *Sema, e: *Expr, name: **u8, len: *i32) -> i32
+    if e == null or e.kind != EXPR_INDEX or e.right == null or e.right.kind == EXPR_RANGE or e.left == null
+        return 0
+    let lk: i32 = e.left.kind
+    if lk != EXPR_IDENT and lk != EXPR_MEMBER and (lk != EXPR_UNARY or e.left.op != OP_DEREF)
+        return 0
+    var t: SemaTy
+    if rs_ty(sm, e.left, @t) == 0
+        return 0
+    if e.left.kind == EXPR_IDENT and t.kind != TYPE_STRUCT and (ref_is_pointer(t.kind) == 0 or t.pointee != TYPE_STRUCT)
+        return 0
+    var k: i32 = TYPE_VOID
+    var n: *u8 = null
+    var l: i32 = 0
+    if let_through_elem(sm, t.kind, t.pointee, t.name, t.name_len, @k, @n, @l) == 0
+        return 0
+    *name = null
+    *len = 0
+    if k == TYPE_STRUCT or k == TYPE_PTR
+        *name = n
+        *len = l
+    1
+
+# local_struct_levels for a Sema binding, which ref_deref_ref_in asks about 2.
+fn rs_levels(v: *SemaVar) -> i32
+    if v.kind == TYPE_PTR_PTR
+        return ptr_ptr_ident_levels(v.inner)
+    if v.kind == TYPE_REF or v.kind == TYPE_MUT_REF
+        if v.pointee == TYPE_PTR
+            return 2
+        if v.pointee == TYPE_PTR_PTR
+            return 1 + ptr_ptr_ident_levels(v.inner)
+        return 1
+    if v.kind == TYPE_PTR
+        return 1
+    0
+
+# The element kind of a Vec, Span or String `t` is or points at; else TYPE_VOID.
+fn rs_buffer_kind(sm: *Sema, t: *SemaTy) -> i32
+    var k: i32 = TYPE_VOID
+    var n: *u8 = null
+    var l: i32 = 0
+    if let_through_elem(sm, t.kind, t.pointee, t.name, t.name_len, @k, @n, @l) == 0
+        return TYPE_VOID
+    k
+
+# index_through's question on Sema: the element kind when `e`, `p[i]` or
+# `(*p)[i]`, reads through a Vec, Span or String (or a pointer to one), a field
+# that is one, or a `*[N]T` local's `p#` view; else TYPE_VOID.
+fn rs_through_kind(sm: *Sema, e: *Expr) -> i32
+    if e.kind != EXPR_INDEX or e.right == null or e.right.kind == EXPR_RANGE or e.left == null
+        return TYPE_VOID
+    if e.left.kind == EXPR_INDEX
+        return TYPE_VOID
+    var root: *Expr = e.left
+    if root.kind == EXPR_UNARY and root.op == OP_DEREF
+        root = root.operand
+    if root == null
+        return TYPE_VOID
+    var t: SemaTy
+    if root.kind != EXPR_IDENT
+        # `x.vf[i]`, a field that is a Vec, Span or String or points at one (#2564).
+        if root == e.left and root.kind == EXPR_MEMBER and rs_ty(sm, root, @t) == 1
+            return rs_buffer_kind(sm, @t)
+        return TYPE_VOID
+    let v: *SemaVar = sema_find_local(sm, root.ident_ptr, root.ident_len)
+    if v == null or rs_ty(sm, root, @t) == 0
+        return TYPE_VOID
+    # `v[i]` on the value itself, but not `(*v)[i]`.
+    if t.kind == TYPE_STRUCT
+        if root != e.left
+            return TYPE_VOID
+        return rs_buffer_kind(sm, @t)
+    if ref_is_pointer(t.kind) == 1 and t.pointee == TYPE_ARRAY
+        let n: *RsNote = rs_note(sm, v)
+        if n == null
+            return TYPE_VOID
+        return n.elem
+    if ref_is_pointer(t.kind) == 1 and t.pointee == TYPE_STRUCT
+        return rs_buffer_kind(sm, @t)
+    TYPE_VOID
 
 # AGAST #2516: the fn being emitted owns the line, and an instance of an
 # imported generic (span.ritz's span_get<T>) carries its module's def_file.
@@ -846,8 +1301,6 @@ fn ref_into(s: *EmitterState, e: *Expr, slot: *RefTy)
     if slot.kind == TYPE_MUT_REF
         ref_addr_into_mut(s, e)
         ref_shared_into_mut(s, e)
-    if slot.returned == 1
-        ref_check_return(s, e)
     if slot.kind == TYPE_VOID
         return
     if slot.kind == TYPE_ARRAY
@@ -974,7 +1427,6 @@ fn ref_args(s: *EmitterState, a0: *Expr, p0: *Param)
             if p.is_borrow == 1
                 ref_addr_into_mut(s, a)
                 ref_lent_referent(s, a, p)
-                ref_forget(s, a)
             else if ref_of_param(p, @slot) == 1
                 ref_into(s, a, @slot)
             p = p.next
@@ -1356,7 +1808,6 @@ fn ref_walk(s: *EmitterState, e: *Expr)
             # the slots go unjudged, as in ritz0.
             mp = m.params
             ref_check_temp_receiver(s, e, mp)
-            ref_check_receiver(s, e, mp)
             if mp != null and name_eq(mp.name, mp.name_len, c"self", 4) == 1
                 mp = mp.next
             else
@@ -1375,10 +1826,6 @@ fn ref_walk(s: *EmitterState, e: *Expr)
     else if k == EXPR_UNARY
         if e.op == OP_ADDR_MUT or e.op == OP_ADDR
             ref_check_temp_addr(s, e)
-        if e.op == OP_ADDR_MUT
-            ref_check_borrow(s, e)
-        if e.op == OP_ADDR_MUT or e.op == OP_ADDR
-            ref_forget(s, e.operand)
         ref_walk(s, e.operand)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
         ref_walk(s, e.left)
@@ -1461,8 +1908,6 @@ pub fn ref_begin_fn(s: *EmitterState, f: *FnDef)
     REF_LAST_COL = 0
     REF_ARRAY_PTR_LINE = 0
     REF_ARRAY_PTR_COL = 0
-    REF_LOOPS = 0
-    REF_DECL_ROOT = null
     ref_mark_params(s, f.params)
     if ref_of_fn(f, @REF_RET) == 0
         REF_RET.kind = TYPE_VOID
@@ -1527,16 +1972,12 @@ fn ref_walk_target(s: *EmitterState, stmt: *Stmt)
 pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
     let k: i32 = stmt.kind
     ref_check_temp_store(s, stmt)
-    ref_check_write(s, stmt)
     ref_walk_target(s, stmt)
     var slot: RefTy
     if k == STMT_VAR_DECL
         if stmt.var_init != null and ref_decl_slot(stmt, @slot) == 1
             ref_into(s, stmt.var_init, @slot)
         ref_walk(s, stmt.var_init)
-        REF_DECL_ROOT = ref_referent(s, stmt.var_init, @REF_DECL_ROOT_LEN)
-        if REF_DECL_ROOT != null and ref_referent_ty(s, stmt.var_init, @REF_DECL_TY) == 0
-            REF_DECL_TY.pointee = TYPE_VOID
     else if k == STMT_TUPLE_DECL
         ref_walk(s, stmt.var_init)
     else if k == STMT_ASSIGN
@@ -1548,8 +1989,6 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
         if known == 1
             ref_into(s, stmt.assign_value, @slot)
         ref_walk(s, stmt.assign_value)
-        if stmt.assign_target_len > 0
-            ref_forget_name(s, stmt.assign_target, stmt.assign_target_len)
     else if k == STMT_RETURN
         ref_into(s, stmt.return_value, @REF_RET)
         ref_walk(s, stmt.return_value)
@@ -1561,15 +2000,9 @@ pub fn ref_check_stmt(s: *EmitterState, stmt: *Stmt)
         ref_walk(s, stmt.if_cond)
     else if k == STMT_WHILE
         ref_walk(s, stmt.while_cond)
-        REF_LOOPS = REF_LOOPS + 1
-    else if k == STMT_ASM
-        ref_check_asm(s, stmt)
     else if k == STMT_FOR
         ref_walk(s, stmt.for_start)
         ref_walk(s, stmt.for_end)
-        REF_LOOPS = REF_LOOPS + 1
-    else if k == STMT_LOOP
-        REF_LOOPS = REF_LOOPS + 1
     else if k == STMT_LOCAL_FIELD_ASSIGN
         var owner: RefTy
         if ref_of_ident(s, stmt.var_name, stmt.var_name_len, @owner) == 1
@@ -1611,18 +2044,31 @@ fn ref_view_of_kind(kind: i32) -> i32
         return REF_VIEW_RAW
     REF_VIEW_VALUE
 
-fn ref_view_of_ident(s: *EmitterState, name: *u8, len: i32) -> i32
-    let idx: i32 = find_local_idx(s, name, len)
-    if idx >= 0
-        let loc: *LocalVar = local_at(s, idx)
-        # `c:& C` is a `C`, and so is a by-value `self`.
-        if loc.is_lent == 1 or loc.holds_lent_ptr == 1
+fn ref_view_of_ident(env: *RefEnv, name: *u8, len: i32) -> i32
+    if env.s != null
+        let idx: i32 = find_local_idx(env.s, name, len)
+        if idx >= 0
+            let loc: *LocalVar = local_at(env.s, idx)
+            # `c:& C` is a `C`, and so is a by-value `self`.
+            if loc.is_lent == 1 or loc.holds_lent_ptr == 1
+                return REF_VIEW_VALUE
+            return ref_view_of_kind(loc.var_type)
+        let g: *GlobalVarDef = find_global(env.s, name, len)
+        if g == null
+            return REF_VIEW_UNKNOWN
+        return ref_view_of_kind(g.var_type)
+    let v: *SemaVar = sema_find_local(env.sm, name, len)
+    if v != null
+        if v.lent != null
             return REF_VIEW_VALUE
-        return ref_view_of_kind(loc.var_type)
-    let g: *GlobalVarDef = find_global(s, name, len)
-    if g == null
+        let n: *RsNote = rs_note(env.sm, v)
+        if n != null and n.ref_kind != TYPE_VOID
+            return ref_view_of_kind(n.ref_kind)
+        return ref_view_of_kind(v.kind)
+    let sg: *GlobalVarDef = sbk_global(env.sm, name, len)
+    if sg == null
         return REF_VIEW_UNKNOWN
-    ref_view_of_kind(g.var_type)
+    ref_view_of_kind(sg.var_type)
 
 fn ref_view_of_fn(f: *FnDef) -> i32
     var t: RefTy
@@ -1633,87 +2079,102 @@ fn ref_view_of_fn(f: *FnDef) -> i32
 # What the value of `e` is, as far as a write through it goes.  An `@T` field is a
 # `*T` by now (lower_ref_fields), and only its flag says otherwise.
 pub fn ref_view(s: *EmitterState, e: *Expr) -> i32
+    var env: RefEnv
+    ref_view_in(ref_env_of(@env, s, null), e)
+
+pub fn ref_view_in(env: *RefEnv, e: *Expr) -> i32
     if e == null
         return REF_VIEW_UNKNOWN
     let k: i32 = e.kind
     if k == EXPR_IDENT
-        return ref_view_of_ident(s, e.ident_ptr, e.ident_len)
+        return ref_view_of_ident(env, e.ident_ptr, e.ident_len)
     if k == EXPR_UNARY and e.op == OP_ADDR
         return REF_VIEW_SHARED
     if k == EXPR_UNARY and e.op == OP_ADDR_MUT
         return REF_VIEW_MUT
     if k == EXPR_MEMBER
-        let f: *StructField = resolve_member_chain_field(s, e)
+        let f: *StructField = ref_field_in(env, e)
         if f == null
             return REF_VIEW_UNKNOWN
         if f.field_shared_ref == 1
             return REF_VIEW_SHARED
         if f.field_mut_ref == 1
             return REF_VIEW_MUT
-        return ref_view_of_kind(f.field_type)
-    if k == EXPR_CALL
-        return ref_view_of_fn(find_call_fn(s, e))
-    if k == EXPR_METHOD
-        return ref_view_of_fn(ref_method_def(s, e))
+        return ref_view_of_kind(lowered_field_type(f))
+    if k == EXPR_CALL or k == EXPR_METHOD
+        return ref_view_of_fn(ref_call_def_in(env, e))
     if k == EXPR_INDEX
         # An element through, `p[i]` or `(*p)[i]`, is its own kind: a `*S` one is the
         # pointer's business, anything else is a place in what `p` reaches (#2443).
-        let through: *LocalVar = index_through(s, e)
-        if through != null
-            return ref_view_of_kind(through_elem_kind(s, through))
+        let through: i32 = ref_through_kind_in(env, e)
+        if through != TYPE_VOID
+            return ref_view_of_kind(through)
     # AGAST #2399: `*r` with `r: @@S` or `*@&S` (held as an `@*S` / `**S`) is the
     # `@S` / `@&S` it was.
-    if k == EXPR_UNARY and e.op == OP_DEREF and e.operand != null and e.operand.kind == EXPR_IDENT
-        let dl: i32 = find_local_idx(s, e.operand.ident_ptr, e.operand.ident_len)
-        if dl >= 0 and local_struct_levels(local_at(s, dl)) == 2
-            let nearest: i32 = local_at(s, dl).inner_ref
-            if nearest == INNER_REF_SHARED
-                return REF_VIEW_SHARED
-            if nearest == INNER_REF_MUT
-                return REF_VIEW_MUT
+    if k == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+        let nearest: i32 = ref_deref_ref_in(env, e.operand)
+        if nearest == INNER_REF_SHARED
+            return REF_VIEW_SHARED
+        if nearest == INNER_REF_MUT
+            return REF_VIEW_MUT
     var t: RefTy
     if k == EXPR_INDEX or k == EXPR_UNARY and e.op == OP_DEREF
         # What holds a pointer keeps its kind, where ref_ty_of has no pointee to give.
         var from: *Expr = e.left
         if k == EXPR_UNARY
             from = e.operand
-        if ref_ty_of(s, from, @t) == 1 and ref_is_pointer(t.pointee) == 1
+        if ref_ty_in(env, from, @t) == 1 and ref_is_pointer(t.pointee) == 1
             return ref_view_of_kind(t.pointee)
-    if ref_ty_of(s, e, @t) == 1
+    if ref_ty_in(env, e, @t) == 1
         return ref_view_of_kind(t.kind)
     REF_VIEW_UNKNOWN
 
 # AGAST #2399: the reference `.` on `e` reaches the struct through last
 # (INNER_REF_*): `p: @@S` or `*@S` is held as an `@*S` / `**S`, whose kind says
 # the nearest level is a `*`.
-fn ref_inner_ref(s: *EmitterState, e: *Expr) -> i32
+fn ref_inner_ref(env: *RefEnv, e: *Expr) -> i32
     if e.kind == EXPR_IDENT
-        let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
-        if idx >= 0
-            return local_at(s, idx).inner_ref
-        let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
-        if g != null
-            return g.inner_ref
+        if env.s != null
+            let idx: i32 = find_local_idx(env.s, e.ident_ptr, e.ident_len)
+            if idx >= 0
+                return local_at(env.s, idx).inner_ref
+            let g: *GlobalVarDef = find_global(env.s, e.ident_ptr, e.ident_len)
+            if g != null
+                return g.inner_ref
+            return 0
+        let v: *SemaVar = sema_find_local(env.sm, e.ident_ptr, e.ident_len)
+        if v != null
+            let n: *RsNote = rs_note(env.sm, v)
+            if n == null
+                return 0
+            return n.inner_ref
+        let sg: *GlobalVarDef = sbk_global(env.sm, e.ident_ptr, e.ident_len)
+        if sg != null
+            return sg.inner_ref
         return 0
     if e.kind == EXPR_MEMBER
-        let f: *StructField = resolve_member_chain_field(s, e)
+        let f: *StructField = ref_field_in(env, e)
         if f != null
             return f.field_inner_ref
     0
 
 # The kind of the field `e` names, or TYPE_VOID.
-fn ref_field_kind(s: *EmitterState, e: *Expr) -> i32
+fn ref_field_kind(env: *RefEnv, e: *Expr) -> i32
     if e.kind != EXPR_MEMBER
         return TYPE_VOID
-    let f: *StructField = resolve_member_chain_field(s, e)
+    let f: *StructField = ref_field_in(env, e)
     if f == null
         return TYPE_VOID
-    f.field_type
+    lowered_field_type(f)
 
 # 1 when writing the place `e` goes through an `@T`.  Walk it from the place to
 # its root: a `*T` ends the walk, since what it points at is the pointer's
 # business, and so does anything the tables can't type.
-fn ref_write_is_shared(s: *EmitterState, e0: *Expr) -> i32
+pub fn ref_write_is_shared(s: *EmitterState, e0: *Expr) -> i32
+    var env: RefEnv
+    ref_write_is_shared_in(ref_env_of(@env, s, null), e0)
+
+pub fn ref_write_is_shared_in(env: *RefEnv, e0: *Expr) -> i32
     var e: *Expr = e0
     while e != null
         var base: *Expr = null
@@ -1723,95 +2184,23 @@ fn ref_write_is_shared(s: *EmitterState, e0: *Expr) -> i32
             base = e.operand
         else
             return 0
-        if e.kind == EXPR_MEMBER and ref_inner_ref(s, base) == INNER_REF_SHARED
+        if e.kind == EXPR_MEMBER and ref_inner_ref(env, base) == INNER_REF_SHARED
             return 1
-        let view: i32 = ref_view(s, base)
+        let view: i32 = ref_view_in(env, base)
         var t: RefTy
-        let known: i32 = ref_ty_of(s, base, @t)
+        let known: i32 = ref_ty_in(env, base, @t)
         if view == REF_VIEW_SHARED
             # `.` reads through every level, so the one nearest the place counts.
             if e.kind == EXPR_MEMBER and known == 1 and (t.pointee == TYPE_PTR or t.pointee == TYPE_PTR_PTR)
                 return 0
             # AGAST #2399: an `@*S` field is a `**S` by now (lower_ref_fields).
-            if e.kind == EXPR_MEMBER and ref_field_kind(s, base) == TYPE_PTR_PTR
+            if e.kind == EXPR_MEMBER and ref_field_kind(env, base) == TYPE_PTR_PTR
                 return 0
             return 1
         if view == REF_VIEW_RAW or view == REF_VIEW_UNKNOWN
             return 0
         e = base
     0
-
-fn ref_expr_ident(e: *Expr, name: *u8, len: i32)
-    memset(e as *u8, 0, sizeof(Expr))
-    e.kind = EXPR_IDENT
-    e.ident_ptr = name
-    e.ident_len = len
-
-fn ref_expr_member(e: *Expr, base: *Expr, name: *u8, len: i32)
-    memset(e as *u8, 0, sizeof(Expr))
-    e.kind = EXPR_MEMBER
-    e.left = base
-    e.ident_ptr = name
-    e.ident_len = len
-
-# An asm block (§18.6, AGAST #3395) reads its `in` / `inout` operands and
-# assigns its `out` / `inout` ones: each write forgets what x referred to, as
-# `x = ..` does (ref_loan.ritz checks it as a write, §13.5).
-fn ref_check_asm(s: *EmitterState, stmt: *Stmt)
-    var o: *AsmOperand = stmt.asm_block.operands
-    while o != null
-        var id: Expr
-        ref_expr_ident(@id, o.name, o.name_len)
-        id.span = o.span
-        if o.dir != ASM_OUT
-            ref_walk(s, @id)
-        if o.dir == ASM_OUT or o.dir == ASM_INOUT
-            ref_forget_name(s, o.name, o.name_len)
-        o = o.next
-
-fn ref_expr_index(e: *Expr, base: *Expr)
-    memset(e as *u8, 0, sizeof(Expr))
-    e.kind = EXPR_INDEX
-    e.left = base
-
-# The statement forms the parser splits a place into, put back together.
-fn ref_stmt_writes_shared(s: *EmitterState, stmt: *Stmt) -> i32
-    let k: i32 = stmt.kind
-    var root: Expr
-    var member: Expr
-    var element: Expr
-    if k == STMT_ASSIGN
-        if stmt.assign_target_len > 0
-            return 0
-        return ref_write_is_shared(s, stmt.if_cond as *Expr)
-    if k == STMT_INDEX_ASSIGN
-        ref_expr_ident(@root, stmt.assign_target, stmt.assign_target_len)
-        ref_expr_index(@element, @root)
-        return ref_write_is_shared(s, @element)
-    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        ref_expr_ident(@root, stmt.var_name, stmt.var_name_len)
-        ref_expr_member(@member, @root, stmt.assign_target, stmt.assign_target_len)
-    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        ref_expr_member(@member, stmt.if_cond as *Expr, stmt.assign_target, stmt.assign_target_len)
-    else
-        return 0
-    if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
-        return ref_write_is_shared(s, @member)
-    ref_expr_index(@element, @member)
-    ref_write_is_shared(s, @element)
-
-fn ref_check_write(s: *EmitterState, stmt: *Stmt)
-    if ref_stmt_writes_shared(s, stmt) == 0
-        return
-    # `(*p).f = v` starts at the `(`, and the place at the `*`.
-    var col: i32 = stmt.span.col
-    if stmt.kind == STMT_MEMBER_ASSIGN or stmt.kind == STMT_MEMBER_INDEX_ASSIGN
-        col = col + 1
-    if ref_first_report(stmt.span.line, col) == 0
-        return
-    ref_eprint_loc(stmt.span.line, col)
-    eprints_cstr(c": error: cannot write through an `@T`: make it `@&T`\n")
-    s.error_count = s.error_count + 1
 
 # `e` lands in an `@&T` or a `:&` param, which `@x` never does (LANGUAGE_SPEC §13.3,
 # AGAST #2339).  Of a `let`, or of a place behind an `@T`, `@&x` wouldn't do either,
@@ -1868,26 +2257,8 @@ fn ref_shared_into_mut(s: *EmitterState, e: *Expr)
     if ref_write_is_shared(s, @pointee) == 1
         ref_error_shared_into_mut(s, e)
 
-# A method taking `self: @&T` writes what its receiver reaches, as `recv.f = v`
-# would: `.` finds the receiver the same way.  `p` is its first param, whatever
-# that's called: a standalone function takes the receiver there too.
-fn ref_check_receiver(s: *EmitterState, e: *Expr, p: *Param)
-    if p == null or p.param_type != TYPE_MUT_REF
-        return
-    var member: Expr
-    ref_expr_member(@member, e.left, e.ident_ptr, e.ident_len)
-    if ref_write_is_shared(s, @member) == 1
-        ref_error_shared_into_mut(s, e.left)
-
-# A reference to a local doesn't leave its fn (LANGUAGE_SPEC §13.5, LARB ruling R2,
-# AGAST #2340).  A check for the definite case: what can't be told stays unjudged.
-# ritz0's twins are TypeChecker._check_return and the fns it calls, ref_rules.py
-# has the wording, and ritz0/test_return_local_ref.py holds all three compilers to
-# them.  Statements are seen in order, as ritz0 sees them: a `var` that's written
-# stops counting there, and a loop can reach that write first (ref_referent).
-
-# What a `:&` param or `self:&` names is the caller's.  A by-value `self` is a
-# local root, as any by-value param is (#2393).
+# What a `:&` param or `self:&` names is the caller's (ownership.ritz reads it).
+# A by-value `self` is a local root, as any by-value param is (#2393).
 fn ref_mark_params(s: *EmitterState, p0: *Param)
     var p: *Param = p0
     while p != null
@@ -1900,101 +2271,10 @@ fn ref_mark_params(s: *EmitterState, p0: *Param)
                 loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # AGAST #2364
         p = p.next
 
-# The local `name` is bound to.  A name is bound once per scope in its fn
-# (#2395), so the latest binding of it is the one in scope.
-fn ref_sole_local(s: *EmitterState, name: *u8, len: i32) -> *LocalVar
-    let idx: i32 = find_local_idx(s, name, len)
-    if idx < 0
-        return null
-    local_at(s, idx)
-
-# The local root the place `e` is in, reached with no pointer or reference on the
-# path; null if it's not in one, or the tables can't say.
-fn ref_local_root(s: *EmitterState, e0: *Expr) -> *LocalVar
-    var e: *Expr = e0
-    while e != null
-        if e.kind == EXPR_IDENT
-            let loc: *LocalVar = ref_sole_local(s, e.ident_ptr, e.ident_len)
-            if loc == null or loc.is_caller_place == 1
-                return null
-            return loc
-        if e.kind != EXPR_MEMBER and e.kind != EXPR_INDEX
-            return null
-        var base: RefTy
-        if ref_ty_of(s, e.left, @base) == 0 or ref_is_pointer(base.kind) == 1
-            return null
-        if e.kind == EXPR_INDEX and (base.kind != TYPE_ARRAY or e.right == null or e.right.kind == EXPR_RANGE)
-            return null
-        e = e.left
-    null
-
-# The name of the local root `e` definitely refers to, with its length in `len`:
-# `@x` of one, or a binding that holds such a reference.  Null if there's none.
-fn ref_referent(s: *EmitterState, e: *Expr, len: *i32) -> *u8
-    if e == null
-        return null
-    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
-        let root: *LocalVar = ref_local_root(s, e.operand)
-        if root == null
-            return null
-        *len = root.name_len
-        return root.name
-    if e.kind != EXPR_IDENT
-        return null
-    let loc: *LocalVar = ref_sole_local(s, e.ident_ptr, e.ident_len)
-    # A loop can reach a `var`'s later write before this read.
-    if loc == null or loc.ref_root == null or loc.is_let == 0 and REF_LOOPS > loc.ref_root_loops
-        return null
-    *len = loc.ref_root_len
-    loc.ref_root
-
-# What `e`, which ref_referent named a root for, has: a binding keeps it.
-fn ref_referent_ty(s: *EmitterState, e: *Expr, out: *RefTy) -> i32
-    if e.kind == EXPR_IDENT
-        let idx: i32 = find_local_idx(s, e.ident_ptr, e.ident_len)
-        if idx >= 0
-            let loc: *LocalVar = local_at(s, idx)
-            return ref_set(out, TYPE_PTR, loc.ref_root_pointee, loc.ref_root_name, loc.ref_root_name_len)
-    ref_ty_of(s, e, out)
-
-# `name` is written, or its address may let it be: if it's a `var`, what it holds
-# is no longer definite.
-fn ref_forget_name(s: *EmitterState, name: *u8, len: i32)
-    let idx: i32 = find_local_idx(s, name, len)
-    if idx < 0
-        return
-    let loc: *LocalVar = local_at(s, idx)
-    if loc.is_let == 0
-        loc.ref_root = null
-
-fn ref_forget(s: *EmitterState, e: *Expr)
-    if e != null and e.kind == EXPR_IDENT
-        ref_forget_name(s, e.ident_ptr, e.ident_len)
-
-# After a statement is emitted: a declaration's binding exists now, and a loop is
-# over.
+# After a statement is emitted: a declaration's binding exists now.
 pub fn ref_after_stmt(s: *EmitterState, stmt: *Stmt)
-    let k: i32 = stmt.kind
-    if k == STMT_WHILE or k == STMT_FOR or k == STMT_LOOP
-        REF_LOOPS = REF_LOOPS - 1
-    if k == STMT_VAR_DECL and stmt.var_ref != null
+    if stmt.kind == STMT_VAR_DECL and stmt.var_ref != null
         ref_keep_ptr_pointee(s, stmt)
-    if k != STMT_VAR_DECL or REF_DECL_ROOT == null
-        return
-    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
-    if idx >= 0
-        let loc: *LocalVar = local_at(s, idx)
-        # An un-annotated `let` stays an i64, holding the `@T`.  `let n: i64 = @c`
-        # is a pointer as an integer: no reference, whatever the local says.
-        let declared: i32 = stmt.var_declared_type
-        if declared == TYPE_VOID or declared == TYPE_PTR_PTR or ref_is_pointer(declared) == 1
-            loc.ref_root = REF_DECL_ROOT
-            loc.ref_root_len = REF_DECL_ROOT_LEN
-            loc.ref_root_loops = REF_LOOPS
-            loc.ref_root_pointee = REF_DECL_TY.pointee
-            loc.ref_root_name = REF_DECL_TY.name
-            loc.ref_root_name_len = REF_DECL_TY.name_len
-    REF_DECL_ROOT = null
 
 # AGAST #2364: the local `stmt` declares keeps its `@&*U`'s U.
 fn ref_keep_ptr_pointee(s: *EmitterState, stmt: *Stmt)
@@ -2003,7 +2283,7 @@ fn ref_keep_ptr_pointee(s: *EmitterState, stmt: *Stmt)
         local_at(s, idx).ref_ptr_pointee = ref_decl_ptr_pointee(stmt)
 
 # `a` and `ret` point at the same type.
-fn ref_same_referent(a: *RefTy, ret: *RefTy) -> i32
+pub fn ref_same_referent(a: *RefTy, ret: *RefTy) -> i32
     if a.pointee != ret.pointee or a.pointee == TYPE_VOID
         return 0
     if a.pointee != TYPE_STRUCT and a.pointee != TYPE_PTR
@@ -2011,77 +2291,6 @@ fn ref_same_referent(a: *RefTy, ret: *RefTy) -> i32
     if a.name_len == 0 or ret.name_len == 0
         return 0
     name_eq(a.name, a.name_len, ret.name, ret.name_len)
-
-# The local root `a` refers to, if it has `ret`'s pointee.  A `:&` param or a
-# receiver borrows `a` itself when it's that `U`.
-fn ref_gives_referent(s: *EmitterState, a: *Expr, lent: i32, ret: *RefTy, len: *i32) -> *u8
-    var t: RefTy
-    let root: *u8 = ref_referent(s, a, len)
-    if root != null
-        if ref_referent_ty(s, a, @t) == 1 and ref_same_referent(@t, ret) == 1
-            return root
-        return null
-    if lent == 0
-        return null
-    let place: *LocalVar = ref_local_root(s, a)
-    if place == null or ref_ty_of(s, a, @t) == 0
-        return null
-    var held: RefTy
-    ref_set(@held, TYPE_PTR, t.kind, t.name, t.name_len)
-    if ref_same_referent(@held, ret) == 0
-        return null
-    *len = place.name_len
-    place.name
-
-# The local root a call returning `@U` or `@&U` was given a reference to, with
-# pointee `U`: the result may be that reference, so a raw `*U` return, which no
-# reference has to live through, isn't asked.
-fn ref_call_referent(s: *EmitterState, e: *Expr, len: *i32) -> *u8
-    var f: *FnDef = null
-    if e.kind == EXPR_METHOD
-        f = ref_method_def(s, e)
-    else
-        f = find_call_fn(s, e)
-    var ret: RefTy
-    if f == null or f.ret_ref == null or ref_of_fn(f, @ret) == 0
-        return null
-    var p: *Param = f.params
-    if p != null and name_eq(p.name, p.name_len, c"self", 4) == 1
-        p = p.next
-    if e.kind == EXPR_METHOD
-        let by_self: *u8 = ref_gives_referent(s, e.left, 1, @ret, len)
-        if by_self != null
-            return by_self
-    var a: *Expr = e.args
-    while a != null
-        var lent: i32 = 0
-        if p != null
-            lent = p.is_borrow
-            p = p.next
-        let root: *u8 = ref_gives_referent(s, a, lent, @ret, len)
-        if root != null
-            return root
-        a = a.next
-    null
-
-fn ref_error_returns_local(s: *EmitterState, e: *Expr, name: *u8, len: i32)
-    if ref_first_report(e.span.line, e.span.col) == 0
-        return
-    ref_eprint_loc(e.span.line, e.span.col)
-    eprints_cstr(c": error: cannot return a reference to local `")
-    for i in 0..len
-        eprint_char(*(name + i))
-    eprints_cstr(c"`: it ends with the fn\n")
-    s.error_count = s.error_count + 1
-
-# `e` is a return value or a tail of one.
-fn ref_check_return(s: *EmitterState, e: *Expr)
-    var len: i32 = 0
-    var root: *u8 = ref_referent(s, e, @len)
-    if root == null and (e.kind == EXPR_CALL or e.kind == EXPR_METHOD)
-        root = ref_call_referent(s, e, @len)
-    if root != null
-        ref_error_returns_local(s, e, root, len)
 
 # The element of the instantiated `Vec$T` `v`, from its `data: *T` field (as
 # emit_vec_elem_member_ptr finds it): a struct or an integer.  0 otherwise.
