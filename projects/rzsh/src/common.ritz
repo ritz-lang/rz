@@ -10,14 +10,7 @@ import ritzlib.sys {
 
 import ritzlib.str { strlen, strcmp }
 import ritzlib.fmt { fmt_i64_into }
-
-# ============================================================================
-# Constants
-# ============================================================================
-
-pub const MAX_LINE: i64 = 512
-pub const MAX_ARGS: i32 = 32
-pub const MAX_PATH: i64 = 256
+import ritzlib.gvec
 
 # ============================================================================
 # String Utilities
@@ -41,92 +34,93 @@ pub fn print_int(n: i64)
     let len: i64 = fmt_i64_into(@buf[0], n)
     sys_write(STDOUT, @buf[0], len)
 
-# Check if character is whitespace
-pub fn is_whitespace(c: u8) -> bool
-    return c == 32 or c == 9 or c == 10 or c == 13
-
 # ============================================================================
 # Line Buffer
 # ============================================================================
 # The line buffer stores the current input line. g_line_len is the total
 # length of the line, g_line_cursor is the current cursor position within
 # the line (for cursor movement with arrow keys).
+#
+# g_line holds g_line_len bytes and a NUL, and grows as keys arrive (it was a
+# fixed [512]u8 that dropped every key past byte 511, AGAST #3529). Growing
+# may move it, so read it through line_ptr() rather than keeping a pointer.
 
-pub var g_line_buffer: [512]u8
+var g_line: Vec<u8>
 pub var g_line_len: i64 = 0       # Total length of line
 pub var g_line_cursor: i64 = 0    # Cursor position within line
 
-# Legacy alias for compatibility
-pub var g_line_pos: i64 = 0
+# Room for `extra` more bytes plus the NUL; false when out of memory.
+fn line_reserve(extra: i64) -> bool
+    return vec_ensure_cap<u8>(@&g_line, g_line_len + extra + 1) == 0
+
+# NUL-terminates the line at g_line_len.
+fn line_terminate()
+    *(g_line.data + g_line_len) = 0
+    g_line.len = g_line_len
+
+# The current line, NUL-terminated. Valid until the next edit.
+pub fn line_ptr() -> *u8
+    if not line_reserve(0)
+        return c""
+    line_terminate()
+    return g_line.data
 
 pub fn line_clear() -> i32
     g_line_len = 0
     g_line_cursor = 0
-    g_line_pos = 0
-    var i: i64 = 0
-    while i < MAX_LINE
-        g_line_buffer[i as i32] = 0
-        i = i + 1
+    if line_reserve(0)
+        line_terminate()
     return 0
 
 # Add character at cursor position (may insert in middle of line)
 pub fn line_add_char(c: u8) -> i32
-    if g_line_len >= MAX_LINE - 1
-        return 0  # Buffer full
+    if not line_reserve(1)
+        return 0  # Out of memory: drop the key
+    let buf: *u8 = g_line.data
 
-    # If cursor is at end, just append
-    if g_line_cursor == g_line_len
-        g_line_buffer[g_line_len as i32] = c
-        g_line_len = g_line_len + 1
-        g_line_cursor = g_line_cursor + 1
-        g_line_pos = g_line_len
-        g_line_buffer[g_line_len as i32] = 0
-        return 0
-
-    # Insert in middle - shift characters right
+    # Shift characters right of the cursor (none when it is at the end)
     var i: i64 = g_line_len
     while i > g_line_cursor
-        g_line_buffer[i as i32] = g_line_buffer[(i - 1) as i32]
+        *(buf + i) = *(buf + i - 1)
         i = i - 1
 
-    g_line_buffer[g_line_cursor as i32] = c
+    *(buf + g_line_cursor) = c
     g_line_len = g_line_len + 1
     g_line_cursor = g_line_cursor + 1
-    g_line_pos = g_line_len
-    g_line_buffer[g_line_len as i32] = 0
+    line_terminate()
     return 0
 
 # Delete character before cursor (backspace)
 pub fn line_backspace() -> i32
     if g_line_cursor == 0
         return 0  # Nothing to delete
+    let buf: *u8 = g_line.data
 
     # Shift characters left from cursor position
     var i: i64 = g_line_cursor - 1
     while i < g_line_len - 1
-        g_line_buffer[i as i32] = g_line_buffer[(i + 1) as i32]
+        *(buf + i) = *(buf + i + 1)
         i = i + 1
 
     g_line_len = g_line_len - 1
     g_line_cursor = g_line_cursor - 1
-    g_line_pos = g_line_len
-    g_line_buffer[g_line_len as i32] = 0
+    line_terminate()
     return 0
 
 # Delete character at cursor (delete key)
 pub fn line_delete() -> i32
     if g_line_cursor >= g_line_len
         return 0  # Nothing to delete
+    let buf: *u8 = g_line.data
 
     # Shift characters left
     var i: i64 = g_line_cursor
     while i < g_line_len - 1
-        g_line_buffer[i as i32] = g_line_buffer[(i + 1) as i32]
+        *(buf + i) = *(buf + i + 1)
         i = i + 1
 
     g_line_len = g_line_len - 1
-    g_line_pos = g_line_len
-    g_line_buffer[g_line_len as i32] = 0
+    line_terminate()
     return 0
 
 # Move cursor left
@@ -153,9 +147,10 @@ pub fn line_cursor_end()
 
 # Kill from cursor to end of line
 pub fn line_kill_to_end()
+    if g_line_cursor >= g_line_len
+        return
     g_line_len = g_line_cursor
-    g_line_pos = g_line_len
-    g_line_buffer[g_line_len as i32] = 0
+    line_terminate()
 
 # Kill from start to cursor
 pub fn line_kill_to_start()
@@ -163,27 +158,29 @@ pub fn line_kill_to_start()
         return
 
     # Shift remaining characters to start
+    let buf: *u8 = g_line.data
     var i: i64 = 0
     while g_line_cursor + i < g_line_len
-        g_line_buffer[i as i32] = g_line_buffer[(g_line_cursor + i) as i32]
+        *(buf + i) = *(buf + g_line_cursor + i)
         i = i + 1
 
     g_line_len = g_line_len - g_line_cursor
     g_line_cursor = 0
-    g_line_pos = g_line_len
-    g_line_buffer[g_line_len as i32] = 0
+    line_terminate()
 
 # Set line content (for history navigation)
 pub fn line_set(s: *u8)
     line_clear()
+    let len: i64 = strlen(s)
+    if not line_reserve(len)
+        return
     var i: i64 = 0
-    while *(s + i) != 0 and i < MAX_LINE - 1
-        g_line_buffer[i as i32] = *(s + i)
+    while i < len
+        *(g_line.data + i) = *(s + i)
         i = i + 1
-    g_line_len = i
-    g_line_cursor = i
-    g_line_pos = i
-    g_line_buffer[i as i32] = 0
+    g_line_len = len
+    g_line_cursor = len
+    line_terminate()
 
 # Get line length
 pub fn line_length() -> i64
@@ -192,34 +189,6 @@ pub fn line_length() -> i64
 # Get cursor position
 pub fn line_cursor_pos() -> i64
     return g_line_cursor
-
-# ============================================================================
-# Command Parsing
-# ============================================================================
-
-pub var g_argv: [32]*u8
-
-pub fn parse_args(line: *u8) -> i32
-    var argc: i32 = 0
-    var i: i64 = 0
-    var in_arg: bool = false
-
-    while *(line + i) != 0 and argc < MAX_ARGS
-        let c: u8 = *(line + i)
-
-        if is_whitespace(c)
-            if in_arg
-                *(line + i) = 0
-                in_arg = false
-        else
-            if not in_arg
-                g_argv[argc] = line + i
-                argc = argc + 1
-                in_arg = true
-
-        i = i + 1
-
-    return argc
 
 # ============================================================================
 # Built-in Commands (platform-agnostic)
@@ -254,10 +223,12 @@ pub fn cmd_help() -> i32
     println(c"External commands are searched for in $PATH.")
     return 0
 
-pub fn cmd_exit(argc: i32) -> i32
+# Builtins take the command's words as argv[0..argc] (argv[argc] is null).
+
+pub fn cmd_exit(argc: i32, argv: **u8) -> i32
     var code: i32 = 0
     if argc > 1
-        let arg: *u8 = g_argv[1]
+        let arg: *u8 = *(argv + 1)
         var i: i64 = 0
         while *(arg + i) != 0
             let c: u8 = *(arg + i)
@@ -275,12 +246,12 @@ pub fn cmd_pid() -> i32
     println(c"")
     return 0
 
-pub fn cmd_echo(argc: i32) -> i32
+pub fn cmd_echo(argc: i32, argv: **u8) -> i32
     var i: i32 = 1
     while i < argc
         if i > 1
             putchar(32)
-        puts(g_argv[i])
+        puts(*(argv + i))
         i = i + 1
     println(c"")
     return 0
