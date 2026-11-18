@@ -1,3 +1,10 @@
+# kernel_main_design (design sketch)
+
+An early design sketch in pre-1.0 pseudo-Ritz, kept for its notes. It is not
+Ritz and nothing compiles it. Until AGAST #3610 it was
+`kernel_main_design.ritz`, and every corpus scan reported it as a parse error.
+
+```text
 # ============================================================================
 # DESIGN DOCUMENT - NOT COMPILABLE CODE
 # ============================================================================
@@ -162,3 +169,4 @@ kernel_main(boot_info: ptr[BootInfo]):
     serial_print("Kernel initialized. Halting.\n")
 
     halt()
+```

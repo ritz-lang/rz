@@ -1,3 +1,10 @@
+# stage1_uefi_design (design sketch)
+
+An early design sketch in pre-1.0 pseudo-Ritz, kept for its notes. It is not
+Ritz and nothing compiles it. Until AGAST #3610 it was
+`stage1_uefi_design.ritz`, and every corpus scan reported it as a parse error.
+
+```text
 # ============================================================================
 # DESIGN DOCUMENT - NOT COMPILABLE CODE
 # ============================================================================
@@ -303,3 +310,4 @@ efi_main(image_handle: u64, system_table: ptr[EfiSystemTable]) -> u64:
 
     # Should never reach here
     return EFI_LOAD_ERROR
+```
