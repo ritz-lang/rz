@@ -289,6 +289,17 @@ higher_half_entry:
     lea msg_higher_half(%rip), %rdi
     call serial_print64
 
+    # Seed the stack canary (AGAST #2590, kernel/src/stack_protector.ritz)
+    # before the first Ritz frame stores a copy of it: guard ^= TSC, low
+    # byte cleared so a string overrun cannot reproduce it.  The guard is a
+    # higher-half .data symbol and this is .boot code, hence movabsq.
+    rdtsc
+    shlq $32, %rdx
+    orq %rdx, %rax
+    movabsq $__stack_chk_guard, %rcx
+    xorq %rax, (%rcx)
+    movb $0, (%rcx)
+
     # Call the Ritz kernel main
     # RDI = Multiboot2 info pointer (still 32-bit physical address)
     movl multiboot_info_ptr(%rip), %edi

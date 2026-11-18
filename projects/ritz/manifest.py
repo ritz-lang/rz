@@ -246,6 +246,13 @@ PACKAGE_SCHEMA = Table(
                             "no-red-zone": Value(BOOL, "Disable the red zone.",
                                                  (f"{BUILD}::plan_binaries",),
                                                  default="false"),
+                            "stack-protector": Value(
+                                BOOL, "Pass the compiler `--stack-protector`: "
+                                "every function but a `[[naked]]` one gets "
+                                "LLVM `sspstrong`. The binary must define "
+                                "`__stack_chk_guard` and `__stack_chk_fail`.",
+                                (f"{BUILD}::plan_binaries",),
+                                default="false"),
                             "pic": Value(BOOL, "Position-independent code.",
                                          (f"{BUILD}::plan_binaries",),
                                          default="false"),

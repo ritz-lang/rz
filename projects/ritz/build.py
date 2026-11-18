@@ -996,6 +996,7 @@ class BinaryConfig:
     asm_files: list[Path] | None = None  # Assembly files to compile
     code_model: str = ""         # LLC code model (e.g., "kernel")
     no_red_zone: bool = False    # Disable red zone (for kernels)
+    stack_protector: bool = False  # Compiler's --stack-protector (AGAST #2590)
     bin_sources: list[str] | None = None  # Per-binary source directories
     pic: bool = False            # Generate position-independent code (for PIE executables)
     link_runtime: bool = False   # Link with Ritz runtime (_start that calls main and sys_exit)
@@ -1228,6 +1229,7 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
             flags_config = nested_config.get("flags", {})
             code_model = flags_config.get("code-model", "")
             no_red_zone = flags_config.get("no-red-zone", False)
+            stack_protector = flags_config.get("stack-protector", False)
             pic = flags_config.get("pic", False)
 
             # Parse runtime linking options
@@ -1250,6 +1252,7 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
                 asm_files=asm_files,
                 code_model=code_model,
                 no_red_zone=no_red_zone,
+                stack_protector=stack_protector,
                 bin_sources=bin_sources,
                 pic=pic,
                 link_runtime=link_runtime,
@@ -1286,7 +1289,8 @@ def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
     - target = "x86_64-none-elf"
     - [bin.NAME.linker] script = "linker.ld"
     - [bin.NAME.asm] files = ["boot.s", "isr.s"]
-    - [bin.NAME.flags] code-model = "kernel", no-red-zone = true
+    - [bin.NAME.flags] code-model = "kernel", no-red-zone = true,
+      stack-protector = true
 
     NOTE: this is a lossy view — targets that were skipped or failed to resolve
     are simply absent. Use plan_binaries() when the difference matters.
@@ -1500,10 +1504,14 @@ class Target:
 
     `clang_flags` are a freestanding target's object flags after `-c`;
     `target_os` selects [[target_os = "..."]] code in the compiler.
+    `stack_protector` passes the compiler's --stack-protector (AGAST #2590):
+    the IR gets `sspstrong`, so the binary must define `__stack_chk_guard`
+    and `__stack_chk_fail`.
     """
     freestanding: bool = False
     clang_flags: Tuple[str, ...] = ()
     target_os: str = ""
+    stack_protector: bool = False
 
     @property
     def obj_flags(self) -> List[str]:
@@ -1515,15 +1523,22 @@ class Target:
     @property
     def key_flags(self) -> Optional[dict]:
         """cas_module_key's `object_flags`: None for the hosted defaults.
-        Unchanged from AGAST #1896, so existing store entries stay valid."""
+        Unchanged from AGAST #1896, so existing store entries stay valid;
+        `stack_protector` appears only when set, for the same reason."""
         if not self.freestanding:
             return None
-        return {"freestanding": True, "target_os": self.target_os,
-                "clang": list(self.clang_flags)}
+        flags = {"freestanding": True, "target_os": self.target_os,
+                 "clang": list(self.clang_flags)}
+        if self.stack_protector:
+            flags["stack_protector"] = True
+        return flags
 
     def compiler_args(self) -> List[str]:
         """Arguments the compiler (ritz0 or ritz1) takes for this target."""
-        return ["--target-os", self.target_os] if self.target_os else []
+        args = ["--target-os", self.target_os] if self.target_os else []
+        if self.stack_protector:
+            args.append("--stack-protector")
+        return args
 
 
 HOSTED = Target()
@@ -2134,7 +2149,8 @@ def freestanding_target(bin_config: BinaryConfig) -> Target:
         if bin_config.no_red_zone:
             clang_flags.append("-mno-red-zone")
     return Target(freestanding=True, clang_flags=tuple(clang_flags),
-                  target_os=bin_config.target_os or "")
+                  target_os=bin_config.target_os or "",
+                  stack_protector=bool(bin_config.stack_protector))
 
 
 _INCBIN = re.compile(r'\.incbin\s+"([^"]+)"')

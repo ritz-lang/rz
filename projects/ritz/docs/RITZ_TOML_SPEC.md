@@ -147,6 +147,7 @@ Code generation.
 |---|---|---|---|---|
 | `code-model` | string | `""` | `projects/ritz/build.py plan_binaries` | LLVM code model (e.g. `kernel`). |
 | `no-red-zone` | bool | `false` | `projects/ritz/build.py plan_binaries` | Disable the red zone. |
+| `stack-protector` | bool | `false` | `projects/ritz/build.py plan_binaries` | Pass the compiler `--stack-protector`: every function but a `[[naked]]` one gets LLVM `sspstrong`. The binary must define `__stack_chk_guard` and `__stack_chk_fail`. |
 | `pic` | bool | `false` | `projects/ritz/build.py plan_binaries` | Position-independent code. |
 
 ### `[test]`

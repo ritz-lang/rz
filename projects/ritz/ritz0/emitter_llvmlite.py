@@ -870,6 +870,8 @@ class LLVMEmitter:
         # AGAST #3738: the span new allocas carry (see frame_too_large).
         self._emit_span: Optional[rast.Span] = None
         self.is_freestanding = target.endswith('-none-elf') or '-none-' in target
+        # --stack-protector (AGAST #2590); see _add_stack_protector.
+        self.stack_protector = False
 
         # LLVM types - integers
         self.i8 = ir.IntType(8)
@@ -3253,7 +3255,7 @@ class LLVMEmitter:
         self.module.triple = self.target
 
         # For freestanding targets (kernel mode), set module flags:
-        # - No stack protector (no __stack_chk_guard available)
+        # - No stack protector unless --stack-protector (_add_stack_protector)
         # - No red zone (interrupt handlers need predictable stack)
         if self.is_freestanding:
             # Add module-level metadata for freestanding flags
@@ -3423,6 +3425,9 @@ class LLVMEmitter:
         # before the struct holding that fn type, or clang refuses it.
         type_order.order_identified_types(self.module.context)
 
+        if self.stack_protector:
+            self._add_stack_protector()
+
         # Generate IR string
         ir_str = str(self.module)
 
@@ -3438,6 +3443,28 @@ class LLVMEmitter:
         lines = ir_str.split('\n')
         lines.insert(0, '; Ritz compiled module')
         return '\n'.join(lines)
+
+    def _add_stack_protector(self) -> None:
+        """Give every function this module defines LLVM's `sspstrong`
+        (--stack-protector, AGAST #2590).
+
+        sspstrong instruments a function with a stack array or an
+        address-taken local: the prologue copies a guard value below the
+        return address and the epilogue calls `__stack_chk_fail` if it
+        changed.  On a `*-none-*` target the guard is the global
+        `__stack_chk_guard`, so the program (harland) defines both.
+
+        It has to be in the IR: build.py runs `clang -c` on emitted .ll, and
+        clang's -fstack-protector-strong is a frontend flag that never sees
+        it (as "no-builtins", see _add_alignstack_to_all_functions).
+
+        A [[naked]] fn is skipped: it has no prologue to store the canary in.
+        Declarations are skipped too: the attribute belongs to the body.
+        """
+        for fn in self.module.functions:
+            if fn.is_declaration or 'naked' in fn.attributes:
+                continue
+            fn.attributes.add('sspstrong')
 
     def _drop_dead_large_loads(self) -> None:
         """Delete every unused `load %T` of a type at the sret threshold.
@@ -6154,13 +6181,11 @@ class LLVMEmitter:
         if fn_def.has_attr('naked'):
             fn.attributes.add('naked')
 
-        # For freestanding targets (kernel mode), add attributes to disable
-        # stack protector and red zone - these require runtime support not
-        # available in kernel/freestanding environments
+        # For freestanding targets (kernel mode), disable the red zone:
+        # interrupts would clobber it.  The stack protector is off unless
+        # --stack-protector asks for it (_add_stack_protector, AGAST #2590).
         if self.is_freestanding:
             fn.attributes.add('noredzone')
-            # Note: "ssp" attributes would enable stack protector; not adding them
-            # means stack protector is disabled by default
 
         # Register function so it can be called from any function body
         self.functions[fn_def.name] = (fn, fn_def)
@@ -18115,7 +18140,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
          target: str = 'x86_64-unknown-linux-gnu',
          target_os: str = 'linux',
          fn_cache_data: Optional[Dict] = None,
-         module_names: Optional[Set[str]] = None) -> Union[str, Tuple[str, Dict[str, str]]]:
+         module_names: Optional[Set[str]] = None,
+         stack_protector: bool = False) -> Union[str, Tuple[str, Dict[str, str]]]:
     """Convenience function to emit a module to LLVM IR.
 
     Args:
@@ -18129,6 +18155,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
         target: Target triple (default: x86_64-unknown-linux-gnu)
                 Use x86_64-none-elf for freestanding/kernel builds.
         target_os: Target OS for conditional compilation (default: linux)
+        stack_protector: If True, every defined function except a [[naked]]
+                         one gets LLVM's sspstrong (AGAST #2590).
         fn_cache_data: Per-function cache data from .ritz.sig (optional).
                        When provided, enables per-fn IR reuse. Functions with
                        matching token hashes will use cached IR instead of
@@ -18181,6 +18209,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
     emitter.generic_types = generic_types
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
+    emitter.stack_protector = stack_protector
     emitter.generic_fn_names = generic_fn_names
     emitter.generic_method_names = generic_method_names
 

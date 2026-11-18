@@ -464,7 +464,7 @@ ritz build --target x86_64-none-elf src/kernel.ritz
 
 Compiler flags:
 - No libc (already true)
-- No stack protector
+- No stack protector unless `[bin.NAME.flags] stack-protector = true` (harland opts in, AGAST #2590)
 - No red zone
 - ELF output
 

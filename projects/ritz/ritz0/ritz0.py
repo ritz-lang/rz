@@ -52,12 +52,13 @@ import ritz_ast as rast
 
 def _compile_mode(no_runtime, check_names, check_ownership, check_types,
                   dependencies, source_roots, project_root, target, target_os,
-                  test_mode) -> dict:
+                  test_mode, stack_protector=False) -> dict:
     """Every compile_file input, besides the sources themselves, that shapes
     the output or whether the compile succeeds (AGAST #2020).
 
     The source-level fast path may only reuse an output built under the same
-    mode.  Covered: the emit flags (no_runtime, test_mode, target, target_os);
+    mode.  Covered: the emit flags (no_runtime, test_mode, target, target_os,
+    stack_protector);
     the import roots, which decide WHICH file an import resolves to (the
     import hashes only vouch for the files the last compile resolved), as
     ImportResolver resolves them; and the checks, since a skip would stand in
@@ -80,6 +81,7 @@ def _compile_mode(no_runtime, check_names, check_ownership, check_types,
         'test_mode': bool(test_mode),
         'target': target,
         'target_os': target_os,
+        'stack_protector': bool(stack_protector),
         'check_names': bool(check_names),
         'check_ownership': bool(check_ownership),
         'check_types': bool(check_types),
@@ -136,6 +138,7 @@ class _Compile:
     target: str = 'x86_64-unknown-linux-gnu'
     target_os: str = 'linux'
     test_mode: bool = False
+    stack_protector: bool = False
     # Set up by compile_file before the passes run.
     source: str = ''
     source_abs_path: str = ''
@@ -423,6 +426,7 @@ def _emit(ctx: _Compile) -> bool:
         source_file=source_path_obj.name, source_dir=source_dir,
         main_source_path=ctx.source_abs_path,
         target=ctx.target, target_os=ctx.target_os, test_mode=ctx.test_mode,
+        stack_protector=ctx.stack_protector,
         # Per-fn IR reuse is keyed on the source alone, so it cannot tell a
         # test-mode compile (no `main`) from a normal one: test mode always
         # emits fresh.
@@ -491,7 +495,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   check_types: bool = False, dependencies: dict = None,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
-                  target_os: str = 'linux', test_mode: bool = False) -> bool:
+                  target_os: str = 'linux', test_mode: bool = False,
+                  stack_protector: bool = False) -> bool:
     """Compile a single Ritz source file to LLVM IR, by running PASSES.
 
     Each .ritz file compiles to one .ll file; imports are resolved and
@@ -502,13 +507,14 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
     try:
         ctx = _Compile(source_path, output_path, no_runtime, check_names,
                        check_ownership, check_types, dependencies, source_roots,
-                       project_root, target, target_os, test_mode)
+                       project_root, target, target_os, test_mode,
+                       stack_protector)
         ctx.source = Path(source_path).read_text()
         ctx.source_abs_path = str(Path(source_path).resolve())
         ctx.mode_key = compile_mode_key(_compile_mode(
             no_runtime, check_names, check_ownership, check_types,
             dependencies, source_roots, project_root, target, target_os,
-            test_mode))
+            test_mode, stack_protector))
         if _up_to_date(ctx):
             print(f"Skipped {source_path} (unchanged)")
             return True
@@ -601,6 +607,10 @@ def main():
     parser.add_argument('--target-os', default='linux',
                         help='Target OS for conditional compilation (default: linux). '
                              'Used with [[target_os = "..."]] attributes.')
+    parser.add_argument('--stack-protector', action='store_true',
+                        help='Give every defined function except a [[naked]] one '
+                             'LLVM\'s sspstrong (AGAST #2590). The program must '
+                             'define __stack_chk_guard and __stack_chk_fail.')
 
     args = parser.parse_args()
 
@@ -676,7 +686,8 @@ def main():
                                project_root=project_root,
                                target=args.target,
                                target_os=args.target_os,
-                               test_mode=args.test_table)
+                               test_mode=args.test_table,
+                               stack_protector=args.stack_protector)
         sys.exit(0 if success else 1)
 
 
