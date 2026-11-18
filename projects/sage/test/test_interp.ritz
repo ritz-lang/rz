@@ -1,0 +1,267 @@
+# Interpreter Tests (AGAST #2787)
+#
+# One case per evaluator rule: each runs a JavaScript program through
+# js_run() and compares what console.log printed (and whether the run
+# failed) with what node prints for the same program.
+
+import ritzlib.io
+import ritzlib.strview
+import ritzlib.gvec
+import src.token
+import src.lexer
+import src.ast
+import src.parser
+import src.interp
+
+# =============================================================================
+# Helpers
+# =============================================================================
+
+# Run `src`; it must succeed and print exactly `want`.
+fn expect_out(src: StrView, want: StrView) -> i32
+    let it = js_run(src)
+    if interp_failed(@it) != 0
+        prints("FAIL: program failed: ")
+        prints(interp_error(@it))
+        prints("\n  source: ")
+        prints(src)
+        prints("\n")
+        return 1
+    let got = interp_output(@it)
+    if strview_eq(got, want) == false
+        prints("FAIL: output mismatch\n  source: ")
+        prints(src)
+        prints("\n  want: [")
+        prints(want)
+        prints("]\n  got:  [")
+        prints(got)
+        prints("]\n")
+        return 1
+    0
+
+# Run `src`; it must fail with an error message containing `want`, after
+# printing exactly `want_out`.
+fn expect_fail(src: StrView, want: StrView, want_out: StrView) -> i32
+    let it = js_run(src)
+    if interp_failed(@it) == 0
+        prints("FAIL: program should have failed\n  source: ")
+        prints(src)
+        prints("\n")
+        return 1
+    let err = interp_error(@it)
+    if strview_contains(err, want) == false
+        prints("FAIL: error lacks [")
+        prints(want)
+        prints("]: [")
+        prints(err)
+        prints("]\n")
+        return 1
+    let got = interp_output(@it)
+    if strview_eq(got, want_out) == false
+        prints("FAIL: output before the error\n  want: [")
+        prints(want_out)
+        prints("]\n  got:  [")
+        prints(got)
+        prints("]\n")
+        return 1
+    0
+
+# =============================================================================
+# The ticket's program, numbers and arithmetic
+# =============================================================================
+
+[[test]]
+fn test_console_log_6_times_7() -> i32
+    expect_out("console.log(6 * 7);\n", "42\n")
+
+[[test]]
+fn test_arithmetic_precedence() -> i32
+    expect_out("console.log(1 + 2 * 3 - 4 / 2, (1 + 2) * 3, 2 ** 3 ** 2, 10 % 3)", "5 9 512 1\n")
+
+[[test]]
+fn test_number_to_string() -> i32
+    expect_out("console.log(0.1 + 0.2, 1 / 3, -0.5, 1e21, 1e-7, 2 ** 53, 123.456, 100)", "0.30000000000000004 0.3333333333333333 -0.5 1e+21 1e-7 9007199254740992 123.456 100\n")
+
+[[test]]
+fn test_number_to_string_17_digits_and_extremes() -> i32
+    expect_out("console.log(2 ** 0.5, 1e16 / 3, 0.07 * 100, 1e100, 5e-324, 123456789012345680000, -0, '' + -0)", "1.4142135623730951 3333333333333333.5 7.000000000000001 1e+100 5e-324 123456789012345680000 -0 0\n")
+
+[[test]]
+fn test_nan_and_infinity() -> i32
+    expect_out("console.log(0 / 0, 1 / 0, -1 / 0, 'x' * 2)", "NaN Infinity -Infinity NaN\n")
+
+[[test]]
+fn test_unary_and_ternary() -> i32
+    expect_out("console.log(!0, -(3), +'4', 5 > 3 ? 'y' : 'n', ~5, void 1)", "true -3 4 y -6 undefined\n")
+
+[[test]]
+fn test_bitwise() -> i32
+    expect_out("console.log(5 & 3, 5 | 3, 5 ^ 3, 1 << 4, -16 >> 2, -1 >>> 28, 4294967297 | 0)", "1 7 6 16 -4 15 1\n")
+
+# =============================================================================
+# Strings
+# =============================================================================
+
+[[test]]
+fn test_string_concat() -> i32
+    expect_out("console.log('a' + \"b\", 'n=' + 42, 1 + '2', 'x' + true + null)", "ab n=42 12 xtruenull\n")
+
+[[test]]
+fn test_string_escapes() -> i32
+    expect_out("console.log('x\\ty\\n\\'q\\'\\\\')", "x\ty\n'q'\\\n")
+
+[[test]]
+fn test_string_compare_and_length() -> i32
+    expect_out("console.log('abc'.length, 'a' < 'b', 'b' < 'a', 'ab' === 'a' + 'b')", "3 true false true\n")
+
+# =============================================================================
+# Values and coercions
+# =============================================================================
+
+[[test]]
+fn test_print_value_kinds() -> i32
+    expect_out("function f() {}\nconsole.log(true, null, undefined, f, function () {})\nconsole.log()", "true null undefined [Function: f] [Function (anonymous)]\n\n")
+
+[[test]]
+fn test_equality() -> i32
+    expect_out("console.log(1 == '1', 1 === '1', null == undefined, null === undefined, 0 / 0 === 0 / 0, 1 != 2)", "true false true false false true\n")
+
+[[test]]
+fn test_typeof() -> i32
+    expect_out("function f() {}\nconsole.log(typeof 1, typeof 'a', typeof undefined, typeof f, typeof null, typeof true, typeof nope)", "number string undefined function object boolean undefined\n")
+
+[[test]]
+fn test_logical_operators() -> i32
+    expect_out("let n = 0;\nfunction bump() { n += 1; return n; }\nconsole.log(0 || 'x', 1 && 2, null ?? 3, 0 ?? 3, false && bump(), true || bump(), n)", "x 2 3 0 false true 0\n")
+
+# =============================================================================
+# Variables
+# =============================================================================
+
+[[test]]
+fn test_let_const_and_assignment_ops() -> i32
+    expect_out("let x = 5;\nconst y = 2;\nx += 3;\nx *= y;\nx -= 1;\nlet z;\nconsole.log(x, z)", "15 undefined\n")
+
+[[test]]
+fn test_update_expressions() -> i32
+    expect_out("let i = 0;\nconsole.log(i++, i, ++i, i--, --i)", "0 1 2 2 0\n")
+
+[[test]]
+fn test_block_scope_shadowing() -> i32
+    expect_out("let x = 1;\n{ let x = 2; console.log(x); }\nconsole.log(x)", "2\n1\n")
+
+[[test]]
+fn test_const_reassign_fails() -> i32
+    expect_fail("const c = 1;\nconsole.log(c);\nc = 2;\nconsole.log('unreached')", "TypeError: Assignment to constant variable", "1\n")
+
+[[test]]
+fn test_undefined_variable_fails() -> i32
+    expect_fail("console.log('before');\nconsole.log(nope)", "ReferenceError: nope is not defined", "before\n")
+
+# =============================================================================
+# Functions
+# =============================================================================
+
+[[test]]
+fn test_function_call() -> i32
+    expect_out("function add(a, b) { return a + b; }\nconsole.log(add(2, 3), add(1))", "5 NaN\n")
+
+[[test]]
+fn test_function_hoisting() -> i32
+    expect_out("console.log(sq(4));\nfunction sq(n) { return n * n; }", "16\n")
+
+[[test]]
+fn test_recursion() -> i32
+    expect_out("function fib(n) { if (n < 2) return n; return fib(n - 1) + fib(n - 2); }\nconsole.log(fib(15))", "610\n")
+
+[[test]]
+fn test_closure() -> i32
+    expect_out("function counter() { let n = 0; return function () { n += 1; return n; }; }\nconst a = counter();\nconst b = counter();\na(); a();\nconsole.log(a(), b())", "3 1\n")
+
+[[test]]
+fn test_function_without_return() -> i32
+    expect_out("function f(a, b) { a = b; }\nconsole.log(f(1, 2))", "undefined\n")
+
+[[test]]
+fn test_call_non_function_fails() -> i32
+    expect_fail("let x = 3;\nx()", "TypeError: x is not a function", "")
+
+[[test]]
+fn test_runaway_recursion_fails() -> i32
+    expect_fail("function r(n) { return r(n + 1); }\nr(0)", "RangeError: Maximum call stack size exceeded", "")
+
+# =============================================================================
+# Control flow
+# =============================================================================
+
+[[test]]
+fn test_if_else() -> i32
+    expect_out("function s(n) { if (n < 0) { return 'neg'; } else if (n === 0) { return 'zero'; } else return 'pos'; }\nconsole.log(s(-1), s(0), s(1))", "neg zero pos\n")
+
+[[test]]
+fn test_while_break_continue() -> i32
+    expect_out("let i = 0;\nlet s = 0;\nwhile (true) { i++; if (i > 10) break; if (i % 2) continue; s += i; }\nconsole.log(s)", "30\n")
+
+[[test]]
+fn test_for_loop() -> i32
+    expect_out("let s = '';\nfor (let i = 0; i < 3; i++) { s = s + i; }\nfor (;;) { break; }\nconsole.log(s)", "012\n")
+
+[[test]]
+fn test_do_while() -> i32
+    expect_out("let i = 10;\ndo { i++; } while (i < 5);\nconsole.log(i)", "11\n")
+
+[[test]]
+fn test_var_is_function_scoped() -> i32
+    expect_out("function f() { if (true) { var v = 7; } return v; }\nconsole.log(f())", "7\n")
+
+# =============================================================================
+# Objects
+# =============================================================================
+
+[[test]]
+fn test_object_properties() -> i32
+    expect_out("let o = {a: 1, 'b': 'x'};\no.c = o.a + 2;\no['a'] = 5;\nconsole.log(o.a, o.c, o['b'], o.z)", "5 3 x undefined\n")
+
+[[test]]
+fn test_console_log_object() -> i32
+    expect_out("console.log({a: 1, b: 'x', c: {d: true}}, {}, 'o: ' + {})", "{ a: 1, b: 'x', c: { d: true } } {} o: [object Object]\n")
+
+[[test]]
+fn test_property_of_undefined_fails() -> i32
+    expect_fail("let o;\no.x", "TypeError: Cannot read properties of undefined", "")
+
+# =============================================================================
+# Exceptions
+# =============================================================================
+
+[[test]]
+fn test_try_catch() -> i32
+    expect_out("try { console.log('in'); throw 'boom'; console.log('no'); } catch (e) { console.log('caught ' + e); } finally { console.log('fin'); }", "in\ncaught boom\nfin\n")
+
+[[test]]
+fn test_finally_keeps_pending_completion() -> i32
+    expect_out("function f() { try { return 'r'; } finally { console.log('f1'); } }\nfunction g() { try { try { throw 'x'; } finally { console.log('f2'); } } catch (e) { return 'caught ' + e; } }\nconsole.log(f(), g())", "f1\nf2\nr caught x\n")
+
+[[test]]
+fn test_catch_runtime_error() -> i32
+    expect_out("try { nope; } catch (e) { console.log(e.name, e.message + '|' + e); }", "ReferenceError nope is not defined|ReferenceError: nope is not defined\n")
+
+[[test]]
+fn test_throw_through_function() -> i32
+    expect_out("function f() { throw 42; }\ntry { f(); } catch (e) { console.log(e + 1); }", "43\n")
+
+[[test]]
+fn test_uncaught_throw_fails() -> i32
+    expect_fail("console.log(1);\nthrow 'boom';\nconsole.log(2)", "Uncaught boom", "1\n")
+
+[[test]]
+fn test_syntax_error_fails() -> i32
+    expect_fail("console.log(1);\nlet = ;", "SyntaxError", "")
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+fn main(argc: i32, argv: **u8) -> i32
+    prints("Running Sage Interpreter Tests...\n")
+    0

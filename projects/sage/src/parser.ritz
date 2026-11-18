@@ -88,13 +88,13 @@ fn parser_expect(p: @&Parser, typ: i32) -> Token
     # Error: unexpected token
     p.had_error = 1
     let tok = parser_current(p)
-    prints("Parse error: expected ")
-    prints(token_type_name(typ))
-    prints(" but got ")
-    prints(token_type_name(tok.typ))
-    prints(" at line ")
-    print_int(tok.line)
-    prints("\n")
+    eprints("Parse error: expected ")
+    eprints(token_type_name(typ))
+    eprints(" but got ")
+    eprints(token_type_name(tok.typ))
+    eprints(" at line ")
+    eprint_int(tok.line)
+    eprints("\n")
     tok
 
 # =============================================================================
@@ -273,34 +273,25 @@ fn is_assignment_op(typ: i32) -> i32
     0
 
 # =============================================================================
-# Simple Expression Parsing (No Recursion Needed)
-# =============================================================================
-
-# Parse function arguments, returns (args_start, args_count) packed in a node
-# This is defined early because it doesn't need parse_expression yet
-fn parse_arguments_simple(p: @&Parser) -> AstNode
-    parser_expect(p, TOKEN_LPAREN)
-    var args: Vec<i64> = vec_new<i64>()
-
-    # For now just handle empty args - we'll fix this later with the full parser
-    parser_expect(p, TOKEN_RPAREN)
-    let args_start: i64 = 0
-    let args_count: i64 = 0
-
-    var result = ast_node_base(0, 0, 0, 0, 0)
-    result.child1 = args_start
-    result.child2 = args_count
-    result
-
-# =============================================================================
 # Primary Expression Parsing
 # =============================================================================
 
-# Parse a primary expression (literals, identifiers)
-# Note: This is a simplified version that doesn't handle parentheses
-# (which would require recursion to parse_expression)
+# Parse a primary expression: a literal, identifier, array or object
+# literal, function expression or parenthesised expression. Elements,
+# values and the parenthesised expression are full expressions.
 fn parse_atom(p: @&Parser) -> i64
     let tok = parser_current(p)
+
+    # Parenthesised expression (so `-(a + b)` and `!(x)` parse too)
+    if tok.typ == TOKEN_LPAREN
+        parser_advance(p)
+        let inner = parse_expression(p, PREC_COMMA)
+        parser_expect(p, TOKEN_RPAREN)
+        return inner
+
+    # Function expression
+    if tok.typ == TOKEN_FUNCTION
+        return parse_function(p, 1)
 
     # Number literal
     if tok.typ == TOKEN_NUMBER
@@ -361,8 +352,7 @@ fn parse_atom(p: @&Parser) -> i64
             if parser_check(p, TOKEN_COMMA) == 1
                 vec_push<i64>(@&elements, NO_CHILD)
             else
-                # For now just parse atoms, not full expressions
-                let elem = parse_atom(p)
+                let elem = parse_expression(p, PREC_ASSIGN)
                 vec_push<i64>(@&elements, elem)
 
             if parser_check(p, TOKEN_RBRACKET) == 0
@@ -401,7 +391,7 @@ fn parse_atom(p: @&Parser) -> i64
             var value_idx: i64 = key_idx
             if parser_check(p, TOKEN_COLON) == 1
                 parser_advance(p)
-                value_idx = parse_atom(p)
+                value_idx = parse_expression(p, PREC_ASSIGN)
 
             vec_push<i64>(@&pairs, value_idx)
             pair_count = pair_count + 1
@@ -429,11 +419,11 @@ fn parse_atom(p: @&Parser) -> i64
 
     # Error: unexpected token
     p.had_error = 1
-    prints("Parse error: unexpected token ")
-    prints(token_type_name(tok.typ))
-    prints(" at line ")
-    print_int(tok.line)
-    prints("\n")
+    eprints("Parse error: unexpected token ")
+    eprints(token_type_name(tok.typ))
+    eprints(" at line ")
+    eprint_int(tok.line)
+    eprints("\n")
     parser_advance(p)
     NO_CHILD
 
@@ -454,7 +444,7 @@ fn parse_postfix_expr(p: @&Parser, left: i64) -> i64
             var args: Vec<i64> = vec_new<i64>()
 
             while parser_check(p, TOKEN_RPAREN) == 0 and parser_is_eof(p) == 0
-                let arg = parse_atom(p)
+                let arg = parse_expression(p, PREC_ASSIGN)
                 vec_push<i64>(@&args, arg)
                 if parser_check(p, TOKEN_RPAREN) == 0
                     parser_expect(p, TOKEN_COMMA)
@@ -487,7 +477,7 @@ fn parse_postfix_expr(p: @&Parser, left: i64) -> i64
         # Computed member access (bracket notation)
         else if tok.typ == TOKEN_LBRACKET
             parser_advance(p)
-            let prop_expr = parse_atom(p)
+            let prop_expr = parse_expression(p, PREC_COMMA)
             let end_tok = parser_expect(p, TOKEN_RBRACKET)
             let start_node = ast_get_node(@p.ast, result)
             let member_node = ast_member(result, prop_expr, 1, start_node.start, end_tok.start + end_tok.length, start_node.line, start_node.column)
@@ -614,19 +604,8 @@ fn parse_unary(p: @&Parser) -> i64
 
 # Parse expression with precedence climbing
 fn parse_expression_impl(p: @&Parser, min_prec: i32) -> i64
-    # Handle parenthesized expressions first (requires recursive call to parse_expression_impl)
-    let tok = parser_current(p)
-    var left: i64 = NO_CHILD
-
-    if tok.typ == TOKEN_LPAREN
-        parser_advance(p)
-        # Recursively parse the inner expression with comma precedence (lowest)
-        left = parse_expression_impl(p, PREC_COMMA)
-        parser_expect(p, TOKEN_RPAREN)
-        # Apply postfix operators
-        left = parse_postfix_expr(p, left)
-    else
-        left = parse_unary(p)
+    # Parenthesised expressions are atoms (parse_atom), reached via parse_unary
+    var left: i64 = parse_unary(p)
 
     while 1 == 1
         let cur = parser_current(p)
@@ -935,7 +914,7 @@ fn parse_try_statement(p: @&Parser) -> i64
     ast_add_node(@&p.ast, node)
 
 # Parse function parameters and body
-fn parse_function_body(p: @&Parser, name_idx: i64) -> i64
+fn parse_function_body(p: @&Parser, name_idx: i64, is_expr: i32) -> i64
     let start_tok = parser_current(p)
     parser_expect(p, TOKEN_LPAREN)
 
@@ -959,10 +938,6 @@ fn parse_function_body(p: @&Parser, name_idx: i64) -> i64
     let params_start = ast_add_children(@&p.ast, @params)
     let end_pos = parser_current(p).start
 
-    var is_expr: i32 = 0
-    if name_idx == NO_CHILD
-        is_expr = 1
-
     let node = ast_function(name_idx, params_start, params_count, body, is_expr, start_tok.start, end_pos, start_tok.line, start_tok.column)
     ast_add_node(@&p.ast, node)
 
@@ -977,7 +952,12 @@ fn parse_function(p: @&Parser, is_expr: i32) -> i64
         let name_node = ast_identifier(name_tok.start, name_tok.length, name_tok.start, name_tok.start + name_tok.length, name_tok.line, name_tok.column)
         name_idx = ast_add_node(@&p.ast, name_node)
 
-    parse_function_body(p, name_idx)
+    # A function in expression position is an expression even when named
+    # (`let f = function g() {}`); a statement without a name is one too.
+    var as_expr: i32 = is_expr
+    if name_idx == NO_CHILD
+        as_expr = 1
+    parse_function_body(p, name_idx, as_expr)
 
 # Parse a single statement (internal implementation)
 fn parse_statement_impl(p: @&Parser) -> i64

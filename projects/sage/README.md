@@ -1,11 +1,11 @@
 # Sage
 
-A JavaScript engine in Ritz, early. **What works today:** a lexer and a
-recursive-descent parser for JavaScript, used as a library (`./rz test sage`:
-73 tests). **There is no interpreter yet** (AGAST #2787): `sage FILE.js` exits 1
-with `not implemented`, and `sage --help` / `--version` are the only commands
-that succeed. The bytecode VM and generational GC described below are the
-design, not code.
+A JavaScript engine in Ritz, early. **What works today:** a lexer, a
+recursive-descent parser and a tree-walking interpreter (AGAST #2787):
+`sage t.js` runs `console.log(6 * 7)` and prints `42`. It covers numbers,
+strings, objects, functions and closures, control flow, exceptions and
+console.log (see [Status](#status) for what it doesn't cover yet). The
+bytecode VM and generational GC described below are the design, not code.
 
 **Part of the [Ritz Ecosystem](../ritz/docs/ECOSYSTEM.md)**
 
@@ -17,7 +17,7 @@ The engine implements the ECMAScript specification, parsing JavaScript source th
 
 ## Features
 
-> **Planned/partial.** The list below describes the design. See [Status](#status) — the binary builds but does not yet execute a script.
+> **Planned/partial.** The list below describes the design. See [Status](#status): today a tree-walking interpreter runs scripts; there is no bytecode, VM or GC.
 
 - ECMAScript-compliant JavaScript execution
 - Register-based bytecode virtual machine
@@ -36,7 +36,7 @@ The engine implements the ECMAScript specification, parsing JavaScript source th
 # Produces projects/sage/build/debug/sage
 ```
 
-See [Usage](#usage) — the binary builds, but cannot execute a script yet.
+See [Usage](#usage).
 
 ## Usage
 
@@ -44,17 +44,19 @@ See [Usage](#usage) — the binary builds, but cannot execute a script yet.
 ./rz build sage
 ./projects/sage/build/debug/sage --help      # usage, exit 0
 ./projects/sage/build/debug/sage --version   # exit 0
-./projects/sage/build/debug/sage t.js        # "not implemented", exit 1
+./projects/sage/build/debug/sage t.js        # runs t.js
 ```
 
-**No script is executed.** `sage FILE.js` checks the file can be opened, then
-exits 1 with `sage: not implemented: executing JavaScript` (AGAST #2460; the
-interpreter is #2787). It used to print a version banner and exit 0 without
-reading the file. No arguments or an unknown option is a usage error (exit 2).
-There is no REPL. `projects/sage/test.sh` pins this behaviour.
+`sage FILE.js` parses the file and runs it; console.log writes to stdout as
+the script runs. Exit 0 means the script ran to the end. A script that does
+not parse, or throws an uncaught exception, exits 1 with the error on stderr,
+e.g. `t.js: Uncaught ReferenceError: nope is not defined` (never exit 0 for
+work not done, #2460). No arguments or an unknown option is a usage error
+(exit 2). There is no REPL. `projects/sage/test.sh` pins this behaviour.
 
-The embedding API and JavaScript below show the intended design; `Engine` does
-not exist yet.
+From Ritz, `js_run(source)` (in `src/interp.ritz`) runs a script and keeps
+its output: `interp_output`, `interp_failed` and `interp_error` read the
+result. The `Engine` API below is the intended design; it does not exist yet.
 
 ```ritz
 # Embedding Sage in a Ritz application
@@ -86,18 +88,30 @@ Sage has no required dependencies beyond `ritzlib`.
 
 ## Status
 
-**Alpha: lexer and parser only, no interpreter.** `./rz build sage` produces
-`build/debug/sage`; running a script exits 1 `not implemented` (above).
+**Alpha: a tree-walking interpreter over the parser's AST.** `src/` holds
+the lexer, parser, AST and `interp.ritz`, the evaluator (AGAST #2787).
 
-The unit tests pass: `./rz test sage` runs the lexer and parser tests
-(73 at 2026-09-12) and `test.sh`, which checks the CLI never exits 0 for a
-script it did not run.
+It supports numbers (printed as node prints them), strings with escapes,
+booleans, null, undefined and objects; arithmetic, comparison, equality,
+logical, bitwise, unary, `typeof`, update and compound assignment operators;
+let/const/var; function declarations (hoisted) and expressions, closures and
+recursion (a runaway recursion is a RangeError); if, while, do-while, for,
+break, continue and return; throw/try/catch/finally with Error objects
+(`e.name`, `e.message`); console.log, console.error and a string's
+`.length`.
 
-Lexer, parser and AST definitions are in `src/`. There is no VM, bytecode
-compiler or interpreter yet (AGAST #2787).
-Core JavaScript execution, full ECMAScript compliance, a garbage collector and
-DOM integration with [tempest](../tempest) are all still ahead. Note the
-`examples/` directory referenced by older docs does not exist.
+Not yet: arrays (#4074), arrow functions (#4075), and `new`, `this`,
+classes, prototypes, for-in/of, switch, labels and the standard built-ins
+such as Math (#4077); each throws `SyntaxError: sage does not support this
+yet`. Numbers beyond 10^22 can print an ulp out (#4076). Nothing is freed:
+there is no GC yet. Full ECMAScript compliance, the bytecode VM, a garbage
+collector and DOM integration with [tempest](../tempest) are all still
+ahead. Note the `examples/` directory referenced by older docs does not
+exist.
+
+The unit tests pass: `./rz test sage` runs the lexer, parser and interpreter
+tests (116 at 2026-11-18) and `test.sh`, which checks `sage t.js` prints 42,
+and that a script that throws or does not parse exits 1.
 
 ## License
 

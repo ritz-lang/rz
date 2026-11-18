@@ -1,9 +1,7 @@
 #!/bin/bash
-# sage's CLI must not report success for work it did not do (AGAST #2460).
-#
-# sage has a lexer and parser but no interpreter (#2787), so running a file
-# must fail with "not implemented" rather than print a banner and exit 0.
-# When #2787 lands, replace the "not implemented" case with a real run.
+# sage's CLI must not report success for work it did not do (AGAST #2460),
+# and `sage FILE.js` runs the script (AGAST #2787): exit 0 only if it ran to
+# the end, exit 1 with the error on stderr if it threw or did not parse.
 set -u
 cd "$(dirname "$0")"
 BIN=build/debug/sage
@@ -27,10 +25,30 @@ expect() {
     echo "ok: $name"
 }
 printf 'console.log(6 * 7);\n' > "$TMP/t.js"
+printf 'console.log("before");\nnope();\n' > "$TMP/throws.js"
+printf 'let = ;\n' > "$TMP/syntax.js"
+# expect_exact NAME WANT_STDOUT -- CMD...: exit 0, stdout exactly WANT_STDOUT
+expect_exact() {
+    local name=$1 want=$2; shift 3
+    local out rc
+    out=$("$@" 2>/dev/null </dev/null); rc=$?
+    if [ $rc -ne 0 ] || [ "$out" != "$want" ]; then
+        echo "FAIL: $name: exit $rc, stdout [$out], want exit 0 and [$want]"; fails=$((fails+1)); return
+    fi
+    echo "ok: $name"
+}
 expect help       0       'usage'           -- "$BIN" --help
 expect version    0       'sage'            -- "$BIN" --version
 expect no_args    nonzero 'usage'           -- "$BIN"
-expect run_file   nonzero 'not implemented' -- "$BIN" "$TMP/t.js"
+expect_exact run_file 42                   -- "$BIN" "$TMP/t.js"
+expect throws     nonzero 'ReferenceError: nope is not defined' -- "$BIN" "$TMP/throws.js"
+# Output before the throw is kept on stdout; the error goes to stderr only.
+if [ "$("$BIN" "$TMP/throws.js" 2>/dev/null </dev/null)" = before ]; then
+    echo "ok: throws_stdout"
+else
+    echo "FAIL: throws_stdout: stdout is not exactly 'before'"; fails=$((fails+1))
+fi
+expect syntax     nonzero 'SyntaxError'     -- "$BIN" "$TMP/syntax.js"
 expect missing    nonzero ''                -- "$BIN" "$TMP/no-such.js"
 expect bad_flag   nonzero 'unknown option'  -- "$BIN" --no-such-flag
 [ $fails -eq 0 ] || { echo "$fails sage CLI check(s) failed"; exit 1; }

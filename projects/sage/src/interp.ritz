@@ -1,0 +1,1856 @@
+# Sage interpreter: a tree-walking evaluator over the parser's AST (AGAST #2787)
+#
+# This is the minimum that makes `sage FILE.js` run a script. The README's
+# register-based bytecode VM and generational GC are the long-term design;
+# this walks the AST directly and frees nothing (no GC yet).
+#
+# Representation
+#   Value      a tagged struct: tag + f64 + two i64 payload words
+#   strings    (start, len) slices of one byte arena, Interp.arena
+#   scopes     Scope records linked to their parent; each holds a linked
+#              list of Binding records (names are slices of the source or
+#              of the arena, see `in_src`)
+#   objects    JsObject records holding an insertion-ordered linked list of
+#              Prop records
+#   functions  FuncRec records: the function's AST node + its closure scope
+#   control    Interp.ctl says how the last statement completed (normal,
+#              return, break, continue, throw); Interp.ret carries the
+#              returned or thrown value
+#
+# Supported: numbers, strings, booleans, null, undefined, objects;
+# arithmetic, comparison, equality, logical, bitwise, unary, typeof,
+# update and (compound) assignment operators; let/const/var; function
+# declarations (hoisted) and expressions, closures, recursion; if, while,
+# do-while, for, break, continue, return; throw/try/catch/finally with
+# Error objects for runtime errors; console.log, console.error, and a
+# string's .length.
+# Not yet (each throws "SyntaxError: sage does not support ..."): arrays
+# (#4074), arrow functions (#4075), and classes, `new`, `this`, for-in/of,
+# labels, switch, delete, `in`, instanceof and built-ins like Math (#4077).
+# `var` is not hoisted (reading one before its declaration is a
+# ReferenceError), and a `for (let ...)` loop shares one binding across
+# iterations (#4077). Numbers needing 10^k, |k| > 22, to print can be an
+# ulp out (#4076).
+
+import ritzlib.io
+import ritzlib.strview
+import ritzlib.gvec
+import src.token
+import src.lexer
+import src.ast
+import src.parser
+
+# =============================================================================
+# Values
+# =============================================================================
+
+const V_UNDEFINED: i32 = 0
+const V_NULL: i32 = 1
+const V_BOOL: i32 = 2      # a = 0 or 1
+const V_NUMBER: i32 = 3    # num
+const V_STRING: i32 = 4    # a = arena start, b = length
+const V_FUNCTION: i32 = 5  # a = FuncRec index
+const V_NATIVE: i32 = 6    # a = NATIVE_* id
+const V_OBJECT: i32 = 7    # a = JsObject index
+
+const NATIVE_CONSOLE_LOG: i64 = 1
+const NATIVE_CONSOLE_ERROR: i64 = 2
+
+struct Value
+    tag: i32
+    num: f64
+    a: i64
+    b: i64
+
+# How the last statement completed
+const CTL_NORMAL: i32 = 0
+const CTL_RETURN: i32 = 1
+const CTL_BREAK: i32 = 2
+const CTL_CONTINUE: i32 = 3
+const CTL_THROW: i32 = 4
+
+# Nested JavaScript calls allowed before "RangeError: Maximum call stack
+# size exceeded". Each JS call costs several native frames; this keeps a
+# runaway recursion well inside the default 8 MB stack.
+const MAX_DEPTH: i64 = 2000
+
+# =============================================================================
+# Interpreter State
+# =============================================================================
+
+struct Binding
+    in_src: i32     # 1: name is source[name..], 0: arena[name..]
+    name: i64
+    name_len: i64
+    value: Value
+    is_const: i32
+    prev: i64       # older binding in the same scope, -1 at the end
+
+struct Scope
+    parent: i64     # -1 for the global scope
+    last: i64       # newest binding, -1 if none
+    is_function: i32  # function or global scope: where `var` declares
+
+struct Prop
+    in_src: i32
+    key: i64
+    key_len: i64
+    value: Value
+    next: i64       # next property in insertion order, -1 at the end
+
+struct JsObject
+    first: i64
+    last: i64
+    is_error: i32   # prints and converts as "name: message"
+
+struct FuncRec
+    node: i64       # AST_FUNCTION_DECL / AST_FUNCTION_EXPR node
+    scope: i64      # closure scope
+
+struct Interp
+    parser: Parser
+    src: *u8
+    src_len: i64
+    arena: Vec<u8>
+    scopes: Vec<Scope>
+    bindings: Vec<Binding>
+    objects: Vec<JsObject>
+    props: Vec<Prop>
+    funcs: Vec<FuncRec>
+    lit_start: Vec<i64>   # per AST node: arena start of a decoded string literal, -1 if not yet
+    lit_len: Vec<i64>
+    line: Vec<u8>         # console.log builds a line here
+    out: Vec<u8>          # what console.log printed (flushed to stdout when echo)
+    err: Vec<u8>          # why the run failed
+    echo: i32
+    failed: i32
+    scope: i64            # current scope
+    global: i64
+    ctl: i32
+    ret: Value            # returned or thrown value
+    depth: i64
+
+# =============================================================================
+# Value Constructors
+# =============================================================================
+
+fn v_undef() -> Value
+    Value { tag: V_UNDEFINED, num: 0.0, a: 0, b: 0 }
+
+fn v_null() -> Value
+    Value { tag: V_NULL, num: 0.0, a: 0, b: 0 }
+
+fn v_bool(b: i32) -> Value
+    var r = Value { tag: V_BOOL, num: 0.0, a: 0, b: 0 }
+    if b != 0
+        r.a = 1
+    r
+
+fn v_num(n: f64) -> Value
+    Value { tag: V_NUMBER, num: n, a: 0, b: 0 }
+
+fn v_str(start: i64, len: i64) -> Value
+    Value { tag: V_STRING, num: 0.0, a: start, b: len }
+
+fn v_tagged(tag: i32, a: i64) -> Value
+    Value { tag: tag, num: 0.0, a: a, b: 0 }
+
+fn f64_nan() -> f64
+    let z: f64 = 0.0
+    z / z
+
+fn f64_inf() -> f64
+    let z: f64 = 0.0
+    1.0 / z
+
+# =============================================================================
+# Byte Buffers and Number Formatting
+# =============================================================================
+
+fn buf_push_sv(buf: @&Vec<u8>, s: StrView)
+    let n = strview_len(s)
+    var i: i64 = 0
+    while i < n
+        vec_push<u8>(buf, strview_get(s, i))
+        i = i + 1
+
+fn buf_push_i64(buf: @&Vec<u8>, n: i64)
+    if n < 0
+        vec_push<u8>(buf, 45)
+        buf_push_i64(buf, 0 - n)
+        return
+    if n >= 10
+        buf_push_i64(buf, n / 10)
+    vec_push<u8>(buf, (48 + n % 10) as u8)
+
+fn i64_pow10(k: i64) -> i64
+    var r: i64 = 1
+    var i: i64 = 0
+    while i < k
+        r = r * 10
+        i = i + 1
+    r
+
+# The rounding error of p = a * b: a * b == p + mul_err(a, b, p) exactly
+# (Dekker: split each factor into 26-bit halves whose products are exact)
+fn mul_err(a: f64, b: f64, p: f64) -> f64
+    let ca: f64 = 134217729.0 * a   # 2^27 + 1
+    let ahi: f64 = ca - (ca - a)
+    let alo: f64 = a - ahi
+    let cb: f64 = 134217729.0 * b
+    let bhi: f64 = cb - (cb - b)
+    let blo: f64 = b - bhi
+    ((ahi * bhi - p) + ahi * blo + alo * bhi) + alo * blo
+
+# round(v * 10^k) to an integer. For |k| <= 22 (10^k exact) the product's
+# rounding error is carried, so 17-digit n rounds from the exact value.
+fn scaled_digits(v: f64, k: i64) -> i64
+    if k > 22 or k < -22
+        return (scale10(v, k) + 0.5) as i64
+    var ak: i64 = k
+    if ak < 0
+        ak = 0 - k
+    let pw: f64 = f64_pow10(ak)
+    var hi: f64 = 0.0
+    var lo: f64 = 0.0
+    if k >= 0
+        hi = v * pw
+        lo = mul_err(v, pw, hi)
+    else
+        hi = v / pw
+        # v - hi * pw exactly, as a fraction of pw
+        let prod: f64 = hi * pw
+        lo = ((v - prod) - mul_err(hi, pw, prod)) / pw
+    let n0: i64 = hi as i64
+    let rem: f64 = (hi - (n0 as f64)) + lo
+    if rem >= 0.5
+        return n0 + 1
+    if rem < -0.5
+        return n0 - 1
+    n0
+
+# v * 10^k with the nearest double to 10^|k|, split in two steps when
+# |k| > 308 (denormals) so the power does not overflow. Exact (one
+# rounding) when |k| <= 22.
+fn scale10(v: f64, k: i64) -> f64
+    if k > 308
+        return (v * f64_pow10(308)) * f64_pow10(k - 308)
+    if k < -308
+        return (v / f64_pow10(308)) / f64_pow10(0 - k - 308)
+    if k >= 0
+        return v * f64_pow10(k)
+    v / f64_pow10(0 - k)
+
+# Append JavaScript's Number::toString of x: the shortest digit string
+# that reads back as x, laid out as ECMA-262 says (plain up to 21 integer
+# digits, 0.000001 and up without an exponent, else d.ddde+N).
+fn buf_push_number(buf: @&Vec<u8>, x: f64)
+    if x != x
+        buf_push_sv(buf, "NaN")
+        return
+    if x == 0.0
+        vec_push<u8>(buf, 48)
+        return
+    var v: f64 = x
+    if v < 0.0
+        vec_push<u8>(buf, 45)
+        v = 0.0 - v
+    if v > 1.7976931348623157e308
+        buf_push_sv(buf, "Infinity")
+        return
+    # Integers below 2^53 are exact as i64
+    if v < 9007199254740992.0
+        let t: i64 = v as i64
+        if (t as f64) == v
+            buf_push_i64(buf, t)
+            return
+
+    # e = floor(log10(v)): 1 <= v / 10^e < 10
+    var e: i64 = 0
+    while e < 400 and scale10(v, 0 - (e + 1)) >= 1.0
+        e = e + 1
+    while e > -400 and scale10(v, 0 - e) < 1.0
+        e = e - 1
+
+    # Fewest significant digits p whose rounding reads back as v. With
+    # p <= 15 and |k| <= 22, n and 10^k are exact, so the read-back is one
+    # correctly rounded operation, the same as parsing the digits. Past
+    # that the scaling rounds too, so n's neighbours are tried as well;
+    # the result can still be an ulp out there (exact needs bignums).
+    var n: i64 = 0
+    var p: i64 = 1
+    var found: i32 = 0
+    while p <= 17 and found == 0
+        let k = p - 1 - e
+        let guess: i64 = scaled_digits(v, k)
+        n = guess
+        # guess first: at 17 digits several neighbours read back as v
+        var t: i64 = 0
+        while t < 3
+            var d: i64 = 0
+            if t == 1
+                d = -1
+            else if t == 2
+                d = 1
+            if guess + d > 0 and scale10((guess + d) as f64, 0 - k) == v
+                n = guess + d
+                found = 1
+                break
+            t = t + 1
+        if found == 0
+            p = p + 1
+    if found == 0
+        p = 17
+
+    # n has p digits, or p + 1 if rounding carried (9.99 -> 10.0)
+    var ndig: i64 = 1
+    while ndig < 19 and n >= i64_pow10(ndig)
+        ndig = ndig + 1
+    let point: i64 = e + 1 + (ndig - p)   # digits before the decimal point
+    while ndig > 1 and n % 10 == 0
+        n = n / 10
+        ndig = ndig - 1
+
+    if ndig <= point and point <= 21
+        buf_push_i64(buf, n)
+        var z: i64 = ndig
+        while z < point
+            vec_push<u8>(buf, 48)
+            z = z + 1
+        return
+    if 0 < point and point <= 21
+        var i: i64 = 0
+        while i < ndig
+            if i == point
+                vec_push<u8>(buf, 46)
+            vec_push<u8>(buf, (48 + (n / i64_pow10(ndig - 1 - i)) % 10) as u8)
+            i = i + 1
+        return
+    if -6 < point and point <= 0
+        buf_push_sv(buf, "0.")
+        var z: i64 = point
+        while z < 0
+            vec_push<u8>(buf, 48)
+            z = z + 1
+        buf_push_i64(buf, n)
+        return
+    # Exponent form
+    var i: i64 = 0
+    while i < ndig
+        if i == 1
+            vec_push<u8>(buf, 46)
+        vec_push<u8>(buf, (48 + (n / i64_pow10(ndig - 1 - i)) % 10) as u8)
+        i = i + 1
+    vec_push<u8>(buf, 101)  # 'e'
+    let ex: i64 = point - 1
+    if ex >= 0
+        vec_push<u8>(buf, 43)
+    buf_push_i64(buf, ex)
+
+# =============================================================================
+# Math helpers for ** with a fractional exponent
+# =============================================================================
+
+fn f64_ln(x: f64) -> f64
+    # x = m * 2^k with m in [1, 2); ln(m) = 2 atanh((m - 1) / (m + 1))
+    var m: f64 = x
+    var k: i64 = 0
+    while m >= 2.0
+        m = m / 2.0
+        k = k + 1
+    while m < 1.0
+        m = m * 2.0
+        k = k - 1
+    let t: f64 = (m - 1.0) / (m + 1.0)
+    let t2: f64 = t * t
+    var term: f64 = t
+    var sum: f64 = 0.0
+    var i: i64 = 1
+    while i < 60
+        sum = sum + term / (i as f64)
+        term = term * t2
+        i = i + 2
+    2.0 * sum + (k as f64) * 0.6931471805599453
+
+fn f64_exp(y: f64) -> f64
+    if y > 709.8
+        return f64_inf()
+    if y < -745.2
+        return 0.0
+    # y = k ln2 + r, |r| <= ln2 / 2
+    let ln2: f64 = 0.6931471805599453
+    var k: i64 = 0
+    if y >= 0.0
+        k = (y / ln2 + 0.5) as i64
+    else
+        k = (y / ln2 - 0.5) as i64
+    let r: f64 = y - (k as f64) * ln2
+    var term: f64 = 1.0
+    var sum: f64 = 1.0
+    var i: i64 = 1
+    while i < 30
+        term = term * r / (i as f64)
+        sum = sum + term
+        i = i + 1
+    while k > 0
+        sum = sum * 2.0
+        k = k - 1
+    while k < 0
+        sum = sum / 2.0
+        k = k + 1
+    sum
+
+# r * r - x without rounding error in r * r
+fn sqr_residual(r: f64, x: f64) -> f64
+    let p: f64 = r * r
+    (p - x) + mul_err(r, r, p)
+
+fn f64_abs(x: f64) -> f64
+    if x < 0.0
+        return 0.0 - x
+    x
+
+# Correctly rounded square root: Newton's iteration, then the neighbour
+# (one ulp either side) whose square is nearest x
+fn f64_sqrt(x: f64) -> f64
+    if x != x or x < 0.0
+        return f64_nan()
+    if x == 0.0 or x > 1.7976931348623157e308
+        return x
+    # Start from a power-of-two estimate
+    var r: f64 = 1.0
+    while r * r < x
+        r = r * 2.0
+    while r * r > x * 4.0
+        r = r / 2.0
+    var i: i64 = 0
+    while i < 80
+        let next: f64 = 0.5 * (r + x / r)
+        if next == r
+            break
+        r = next
+        i = i + 1
+    let step: f64 = r * 1.1102230246251565e-16   # >= half an ulp of r
+    let down: f64 = r - step
+    let up: f64 = r + step
+    var best: f64 = r
+    if f64_abs(sqr_residual(down, x)) < f64_abs(sqr_residual(best, x))
+        best = down
+    if f64_abs(sqr_residual(up, x)) < f64_abs(sqr_residual(best, x))
+        best = up
+    best
+
+fn f64_pow(base: f64, ex: f64) -> f64
+    if ex != ex
+        return f64_nan()
+    if ex == 0.0
+        return 1.0
+    if base != base
+        return f64_nan()
+    # Integer exponent: square-and-multiply (exact where the result is)
+    if ex > -1.0e9 and ex < 1.0e9 and ((ex as i64) as f64) == ex
+        var n: i64 = ex as i64
+        var neg: i32 = 0
+        if n < 0
+            neg = 1
+            n = 0 - n
+        var r: f64 = 1.0
+        var b: f64 = base
+        while n > 0
+            if n % 2 == 1
+                r = r * b
+            b = b * b
+            n = n / 2
+        if neg == 1
+            return 1.0 / r
+        return r
+    if base < 0.0
+        return f64_nan()
+    if ex == 0.5
+        return f64_sqrt(base)
+    if base == 0.0
+        if ex > 0.0
+            return 0.0
+        return f64_inf()
+    f64_exp(ex * f64_ln(base))
+
+# ToInt32 as i64 (wraps modulo 2^32)
+fn to_int32_f(x: f64) -> i64
+    if x != x or x > 1.7976931348623157e308 or x < -1.7976931348623157e308
+        return 0
+    var m: f64 = x % 4294967296.0
+    var t: i64 = m as i64
+    if t < 0
+        t = t + 4294967296
+    if t >= 2147483648
+        t = t - 4294967296
+    t
+
+fn to_uint32_f(x: f64) -> i64
+    var t = to_int32_f(x)
+    if t < 0
+        t = t + 4294967296
+    t
+
+# =============================================================================
+# Construction
+# =============================================================================
+
+fn interp_new(source: StrView, echo: i32) -> Interp
+    let src_ptr = strview_as_ptr(source)
+    let src_len = strview_len(source)
+    Interp {
+        parser: parse(source),
+        src: src_ptr,
+        src_len: src_len,
+        arena: vec_new<u8>(),
+        scopes: vec_new<Scope>(),
+        bindings: vec_new<Binding>(),
+        objects: vec_new<JsObject>(),
+        props: vec_new<Prop>(),
+        funcs: vec_new<FuncRec>(),
+        lit_start: vec_new<i64>(),
+        lit_len: vec_new<i64>(),
+        line: vec_new<u8>(),
+        out: vec_new<u8>(),
+        err: vec_new<u8>(),
+        echo: echo,
+        failed: 0,
+        scope: -1,
+        global: -1,
+        ctl: CTL_NORMAL,
+        ret: v_undef(),
+        depth: 0
+    }
+
+fn node_at(it: @&Interp, idx: i64) -> *AstNode
+    vec_get_ptr<AstNode>(@&it.parser.ast.nodes, idx)
+
+fn child_at(it: @&Interp, start: i64, i: i64) -> i64
+    ast_get_child(@it.parser.ast, start, i)
+
+# Source text of a node (for error messages)
+fn node_text(it: @&Interp, idx: i64) -> StrView
+    let node = node_at(it, idx)
+    var end_pos: i64 = node.end_pos
+    if end_pos > it.src_len
+        end_pos = it.src_len
+    strview_from_ptr(it.src + node.start, end_pos - node.start)
+
+fn ident_text(it: @&Interp, idx: i64) -> StrView
+    let node = node_at(it, idx)
+    strview_from_ptr(it.src + node.str_start, node.str_len)
+
+# =============================================================================
+# Strings
+# =============================================================================
+
+fn str_from_sv(it: @&Interp, s: StrView) -> Value
+    let start = vec_len<u8>(@it.arena)
+    buf_push_sv(@&it.arena, s)
+    v_str(start, strview_len(s))
+
+fn str_view(it: @&Interp, v: Value) -> StrView
+    strview_from_ptr(vec_as_ptr<u8>(@it.arena) + v.a, v.b)
+
+fn str_eq(it: @&Interp, x: Value, y: Value) -> i32
+    if x.b != y.b
+        return 0
+    var i: i64 = 0
+    while i < x.b
+        if vec_get<u8>(@it.arena, x.a + i) != vec_get<u8>(@it.arena, y.a + i)
+            return 0
+        i = i + 1
+    1
+
+# -1, 0, 1 by bytes
+fn str_cmp(it: @&Interp, x: Value, y: Value) -> i32
+    var i: i64 = 0
+    while i < x.b and i < y.b
+        let cx = vec_get<u8>(@it.arena, x.a + i)
+        let cy = vec_get<u8>(@it.arena, y.a + i)
+        if cx < cy
+            return -1
+        if cx > cy
+            return 1
+        i = i + 1
+    if x.b < y.b
+        return -1
+    if x.b > y.b
+        return 1
+    0
+
+fn hex_val(c: u8) -> i64
+    if c >= 48 and c <= 57
+        return (c - 48) as i64
+    if c >= 97 and c <= 102
+        return (c - 87) as i64
+    if c >= 65 and c <= 70
+        return (c - 55) as i64
+    -1
+
+fn push_utf8(buf: @&Vec<u8>, cp: i64)
+    if cp < 128
+        vec_push<u8>(buf, cp as u8)
+    else if cp < 2048
+        vec_push<u8>(buf, (192 + cp / 64) as u8)
+        vec_push<u8>(buf, (128 + cp % 64) as u8)
+    else
+        vec_push<u8>(buf, (224 + cp / 4096) as u8)
+        vec_push<u8>(buf, (128 + (cp / 64) % 64) as u8)
+        vec_push<u8>(buf, (128 + cp % 64) as u8)
+
+# Decode a string literal's escapes into the arena, once per node
+fn string_literal(it: @&Interp, idx: i64) -> Value
+    let cached = vec_get<i64>(@it.lit_start, idx)
+    if cached >= 0
+        return v_str(cached, vec_get<i64>(@it.lit_len, idx))
+    let node = node_at(it, idx)
+    let s = node.str_start
+    let n = node.str_len
+    let start = vec_len<u8>(@it.arena)
+    var i: i64 = 0
+    while i < n
+        let c: u8 = *(it.src + s + i)
+        if c != 92 or i + 1 >= n
+            vec_push<u8>(@&it.arena, c)
+            i = i + 1
+            continue
+        let e: u8 = *(it.src + s + i + 1)
+        i = i + 2
+        if e == 110
+            vec_push<u8>(@&it.arena, 10)      # \n
+        else if e == 116
+            vec_push<u8>(@&it.arena, 9)       # \t
+        else if e == 114
+            vec_push<u8>(@&it.arena, 13)      # \r
+        else if e == 98
+            vec_push<u8>(@&it.arena, 8)       # \b
+        else if e == 102
+            vec_push<u8>(@&it.arena, 12)      # \f
+        else if e == 118
+            vec_push<u8>(@&it.arena, 11)      # \v
+        else if e == 48
+            vec_push<u8>(@&it.arena, 0)       # \0
+        else if e == 10
+            i = i  # line continuation: nothing
+        else if e == 120 and i + 1 < n
+            # \xHH
+            let h1 = hex_val(*(it.src + s + i))
+            let h2 = hex_val(*(it.src + s + i + 1))
+            if h1 >= 0 and h2 >= 0
+                push_utf8(@&it.arena, h1 * 16 + h2)
+                i = i + 2
+            else
+                vec_push<u8>(@&it.arena, e)
+        else if e == 117 and i + 3 < n
+            # \uHHHH
+            var cp: i64 = 0
+            var j: i64 = 0
+            var ok: i32 = 1
+            while j < 4
+                let h = hex_val(*(it.src + s + i + j))
+                if h < 0
+                    ok = 0
+                cp = cp * 16 + h
+                j = j + 1
+            if ok == 1
+                push_utf8(@&it.arena, cp)
+                i = i + 4
+            else
+                vec_push<u8>(@&it.arena, e)
+        else
+            vec_push<u8>(@&it.arena, e)       # \\ \' \" and the rest
+    let len = vec_len<u8>(@it.arena) - start
+    vec_set<i64>(@&it.lit_start, idx, start)
+    vec_set<i64>(@&it.lit_len, idx, len)
+    v_str(start, len)
+
+# =============================================================================
+# Names (bindings and property keys)
+# =============================================================================
+
+fn name_byte(it: @&Interp, in_src: i32, i: i64) -> u8
+    if in_src == 1
+        return *(it.src + i)
+    vec_get<u8>(@it.arena, i)
+
+fn names_eq(it: @&Interp, s1: i32, a1: i64, l1: i64, s2: i32, a2: i64, l2: i64) -> i32
+    if l1 != l2
+        return 0
+    var i: i64 = 0
+    while i < l1
+        if name_byte(it, s1, a1 + i) != name_byte(it, s2, a2 + i)
+            return 0
+        i = i + 1
+    1
+
+fn name_view(it: @&Interp, in_src: i32, start: i64, len: i64) -> StrView
+    if in_src == 1
+        return strview_from_ptr(it.src + start, len)
+    strview_from_ptr(vec_as_ptr<u8>(@it.arena) + start, len)
+
+# =============================================================================
+# Scopes
+# =============================================================================
+
+fn scope_new(it: @&Interp, parent: i64, is_function: i32) -> i64
+    let idx = vec_len<Scope>(@it.scopes)
+    vec_push<Scope>(@&it.scopes, Scope { parent: parent, last: -1, is_function: is_function })
+    idx
+
+# Binding of a name in exactly this scope, -1 if none
+fn scope_find_own(it: @&Interp, scope: i64, in_src: i32, name: i64, len: i64) -> i64
+    let sc = vec_get<Scope>(@it.scopes, scope)
+    var b: i64 = sc.last
+    while b >= 0
+        let bp = vec_get_ptr<Binding>(@&it.bindings, b)
+        if names_eq(it, bp.in_src, bp.name, bp.name_len, in_src, name, len) == 1
+            return b
+        b = bp.prev
+    -1
+
+# Binding visible from `scope`, -1 if none
+fn lookup(it: @&Interp, scope: i64, in_src: i32, name: i64, len: i64) -> i64
+    var s: i64 = scope
+    while s >= 0
+        let b = scope_find_own(it, s, in_src, name, len)
+        if b >= 0
+            return b
+        s = vec_get<Scope>(@it.scopes, s).parent
+    -1
+
+# Declare (or redeclare) a name in `scope`
+fn declare(it: @&Interp, scope: i64, in_src: i32, name: i64, len: i64, value: Value, is_const: i32) -> i64
+    let own = scope_find_own(it, scope, in_src, name, len)
+    if own >= 0
+        let bp = vec_get_ptr<Binding>(@&it.bindings, own)
+        bp.value = value
+        bp.is_const = is_const
+        return own
+    let idx = vec_len<Binding>(@it.bindings)
+    let sp = vec_get_ptr<Scope>(@&it.scopes, scope)
+    let prev = sp.last
+    vec_push<Binding>(@&it.bindings, Binding {
+        in_src: in_src,
+        name: name,
+        name_len: len,
+        value: value,
+        is_const: is_const,
+        prev: prev
+    })
+    let sp2 = vec_get_ptr<Scope>(@&it.scopes, scope)
+    sp2.last = idx
+    idx
+
+fn declare_builtin(it: @&Interp, name: StrView, value: Value)
+    let s = str_from_sv(it, name)
+    declare(it, it.global, 0, s.a, s.b, value, 0)
+
+fn function_scope(it: @&Interp) -> i64
+    var s: i64 = it.scope
+    while s >= 0
+        if vec_get<Scope>(@it.scopes, s).is_function == 1
+            return s
+        s = vec_get<Scope>(@it.scopes, s).parent
+    it.global
+
+# =============================================================================
+# Objects
+# =============================================================================
+
+fn obj_new(it: @&Interp) -> Value
+    let idx = vec_len<JsObject>(@it.objects)
+    vec_push<JsObject>(@&it.objects, JsObject { first: -1, last: -1, is_error: 0 })
+    v_tagged(V_OBJECT, idx)
+
+fn prop_find(it: @&Interp, obj: i64, in_src: i32, key: i64, len: i64) -> i64
+    var p: i64 = vec_get<JsObject>(@it.objects, obj).first
+    while p >= 0
+        let pp = vec_get_ptr<Prop>(@&it.props, p)
+        if names_eq(it, pp.in_src, pp.key, pp.key_len, in_src, key, len) == 1
+            return p
+        p = pp.next
+    -1
+
+fn prop_get(it: @&Interp, obj: i64, in_src: i32, key: i64, len: i64) -> Value
+    let p = prop_find(it, obj, in_src, key, len)
+    if p < 0
+        return v_undef()
+    vec_get<Prop>(@it.props, p).value
+
+fn prop_set(it: @&Interp, obj: i64, in_src: i32, key: i64, len: i64, value: Value)
+    let p = prop_find(it, obj, in_src, key, len)
+    if p >= 0
+        let pp = vec_get_ptr<Prop>(@&it.props, p)
+        pp.value = value
+        return
+    let idx = vec_len<Prop>(@it.props)
+    vec_push<Prop>(@&it.props, Prop { in_src: in_src, key: key, key_len: len, value: value, next: -1 })
+    let op = vec_get_ptr<JsObject>(@&it.objects, obj)
+    if op.last < 0
+        op.first = idx
+    else
+        let lp = vec_get_ptr<Prop>(@&it.props, op.last)
+        lp.next = idx
+    let op2 = vec_get_ptr<JsObject>(@&it.objects, obj)
+    op2.last = idx
+
+fn prop_set_sv(it: @&Interp, obj: i64, key: StrView, value: Value)
+    let k = str_from_sv(it, key)
+    prop_set(it, obj, 0, k.a, k.b, value)
+
+fn prop_get_sv(it: @&Interp, obj: i64, key: StrView) -> Value
+    let k = str_from_sv(it, key)
+    prop_get(it, obj, 0, k.a, k.b)
+
+# =============================================================================
+# Throwing
+# =============================================================================
+
+# Throw a new Error object: name `kind`, message a + b
+fn throw_error(it: @&Interp, kind: StrView, a: StrView, b: StrView)
+    let start = vec_len<u8>(@it.arena)
+    buf_push_sv(@&it.arena, a)
+    buf_push_sv(@&it.arena, b)
+    let msg = v_str(start, vec_len<u8>(@it.arena) - start)
+    let name = str_from_sv(it, kind)
+    let err = obj_new(it)
+    let op = vec_get_ptr<JsObject>(@&it.objects, err.a)
+    op.is_error = 1
+    prop_set_sv(it, err.a, "name", name)
+    prop_set_sv(it, err.a, "message", msg)
+    it.ret = err
+    it.ctl = CTL_THROW
+
+fn throw_unsupported(it: @&Interp, what: StrView)
+    throw_error(it, "SyntaxError", "sage does not support this yet: ", what)
+
+fn threw(it: @&Interp) -> i32
+    if it.ctl == CTL_THROW
+        return 1
+    0
+
+# =============================================================================
+# Conversions
+# =============================================================================
+
+fn to_boolean(it: @&Interp, v: Value) -> i32
+    if v.tag == V_UNDEFINED or v.tag == V_NULL
+        return 0
+    if v.tag == V_BOOL
+        return v.a as i32
+    if v.tag == V_NUMBER
+        if v.num != v.num or v.num == 0.0
+            return 0
+        return 1
+    if v.tag == V_STRING
+        if v.b == 0
+            return 0
+        return 1
+    1
+
+fn is_space(c: u8) -> i32
+    if c == 32 or c == 9 or c == 10 or c == 13 or c == 11 or c == 12
+        return 1
+    0
+
+fn is_digit_byte(c: u8) -> i32
+    if c >= 48 and c <= 57
+        return 1
+    0
+
+# ToNumber of a string: trimmed decimal literal, "" -> 0, else NaN
+fn string_to_number(it: @&Interp, v: Value) -> f64
+    var s: i64 = 0
+    var e: i64 = v.b
+    while s < e and is_space(vec_get<u8>(@it.arena, v.a + s)) == 1
+        s = s + 1
+    while e > s and is_space(vec_get<u8>(@it.arena, v.a + e - 1)) == 1
+        e = e - 1
+    if s == e
+        return 0.0
+    var neg: i32 = 0
+    let c0 = vec_get<u8>(@it.arena, v.a + s)
+    if c0 == 45 or c0 == 43
+        if c0 == 45
+            neg = 1
+        s = s + 1
+    let body = strview_from_ptr(vec_as_ptr<u8>(@it.arena) + v.a + s, e - s)
+    var r: f64 = 0.0
+    if strview_eq(body, "Infinity")
+        r = f64_inf()
+    else
+        # digits [. digits] [e [+-] digits], at least one mantissa digit
+        var i: i64 = s
+        var mant_digits: i64 = 0
+        while i < e and is_digit_byte(vec_get<u8>(@it.arena, v.a + i)) == 1
+            i = i + 1
+            mant_digits = mant_digits + 1
+        if i < e and vec_get<u8>(@it.arena, v.a + i) == 46
+            i = i + 1
+            while i < e and is_digit_byte(vec_get<u8>(@it.arena, v.a + i)) == 1
+                i = i + 1
+                mant_digits = mant_digits + 1
+        if mant_digits == 0
+            return f64_nan()
+        if i < e and (vec_get<u8>(@it.arena, v.a + i) == 101 or vec_get<u8>(@it.arena, v.a + i) == 69)
+            i = i + 1
+            if i < e and (vec_get<u8>(@it.arena, v.a + i) == 43 or vec_get<u8>(@it.arena, v.a + i) == 45)
+                i = i + 1
+            var exp_digits: i64 = 0
+            while i < e and is_digit_byte(vec_get<u8>(@it.arena, v.a + i)) == 1
+                i = i + 1
+                exp_digits = exp_digits + 1
+            if exp_digits == 0
+                return f64_nan()
+        if i != e
+            return f64_nan()
+        r = strview_to_f64(body)
+    if neg == 1
+        return 0.0 - r
+    r
+
+fn to_number(it: @&Interp, v: Value) -> f64
+    if v.tag == V_NUMBER
+        return v.num
+    if v.tag == V_NULL
+        return 0.0
+    if v.tag == V_BOOL
+        return v.a as f64
+    if v.tag == V_STRING
+        return string_to_number(it, v)
+    f64_nan()
+
+fn func_name(it: @&Interp, v: Value) -> StrView
+    if v.tag == V_NATIVE
+        if v.a == NATIVE_CONSOLE_ERROR
+            return "error"
+        return "log"
+    let rec = vec_get<FuncRec>(@it.funcs, v.a)
+    let fnode = node_at(it, rec.node)
+    if fnode.child1 == NO_CHILD
+        return ""
+    ident_text(it, fnode.child1)
+
+# Append ToString(v) to buf
+fn push_to_string(it: @&Interp, buf: @&Vec<u8>, v: Value)
+    if v.tag == V_UNDEFINED
+        buf_push_sv(buf, "undefined")
+    else if v.tag == V_NULL
+        buf_push_sv(buf, "null")
+    else if v.tag == V_BOOL
+        if v.a == 1
+            buf_push_sv(buf, "true")
+        else
+            buf_push_sv(buf, "false")
+    else if v.tag == V_NUMBER
+        buf_push_number(buf, v.num)
+    else if v.tag == V_STRING
+        var i: i64 = 0
+        while i < v.b
+            vec_push<u8>(buf, vec_get<u8>(@it.arena, v.a + i))
+            i = i + 1
+    else if v.tag == V_OBJECT
+        if vec_get<JsObject>(@it.objects, v.a).is_error == 1
+            # Error.prototype.toString: "name: message"
+            push_to_string(it, buf, prop_get_sv(it, v.a, "name"))
+            let msg = prop_get_sv(it, v.a, "message")
+            if msg.tag != V_STRING or msg.b > 0
+                buf_push_sv(buf, ": ")
+                push_to_string(it, buf, msg)
+        else
+            buf_push_sv(buf, "[object Object]")
+    else
+        buf_push_sv(buf, "function ")
+        buf_push_sv(buf, func_name(it, v))
+        buf_push_sv(buf, "() { [code] }")
+
+fn to_string(it: @&Interp, v: Value) -> Value
+    if v.tag == V_STRING
+        return v
+    var tmp = vec_new<u8>()
+    push_to_string(it, @&tmp, v)
+    let start = vec_len<u8>(@it.arena)
+    var i: i64 = 0
+    let n = vec_len<u8>(@tmp)
+    while i < n
+        vec_push<u8>(@&it.arena, vec_get<u8>(@tmp, i))
+        i = i + 1
+    vec_drop<u8>(@&tmp)
+    v_str(start, n)
+
+# console.log's rendering: strings raw at the top level, quoted inside
+# objects; functions as [Function: name]; objects as { k: v } to depth 2
+fn push_inspect(it: @&Interp, buf: @&Vec<u8>, v: Value, depth: i64)
+    if v.tag == V_STRING and depth > 0
+        vec_push<u8>(buf, 39)
+        push_to_string(it, buf, v)
+        vec_push<u8>(buf, 39)
+    else if v.tag == V_FUNCTION or v.tag == V_NATIVE
+        let name = func_name(it, v)
+        if strview_len(name) == 0
+            buf_push_sv(buf, "[Function (anonymous)]")
+        else
+            buf_push_sv(buf, "[Function: ")
+            buf_push_sv(buf, name)
+            buf_push_sv(buf, "]")
+    else if v.tag == V_OBJECT
+        let obj = vec_get<JsObject>(@it.objects, v.a)
+        if obj.is_error == 1
+            push_to_string(it, buf, v)
+        else if obj.first < 0
+            buf_push_sv(buf, "{}")
+        else if depth > 2
+            buf_push_sv(buf, "[Object]")
+        else
+            buf_push_sv(buf, "{ ")
+            var p: i64 = obj.first
+            while p >= 0
+                let pr = vec_get<Prop>(@it.props, p)
+                buf_push_sv(buf, name_view(it, pr.in_src, pr.key, pr.key_len))
+                buf_push_sv(buf, ": ")
+                push_inspect(it, buf, pr.value, depth + 1)
+                if pr.next >= 0
+                    buf_push_sv(buf, ", ")
+                p = pr.next
+            buf_push_sv(buf, " }")
+    else if v.tag == V_NUMBER and v.num == 0.0 and 1.0 / v.num < 0.0
+        buf_push_sv(buf, "-0")   # console.log(-0) shows the sign; String(-0) does not
+    else
+        push_to_string(it, buf, v)
+
+fn type_of(v: Value) -> StrView
+    if v.tag == V_UNDEFINED
+        return "undefined"
+    if v.tag == V_BOOL
+        return "boolean"
+    if v.tag == V_NUMBER
+        return "number"
+    if v.tag == V_STRING
+        return "string"
+    if v.tag == V_FUNCTION or v.tag == V_NATIVE
+        return "function"
+    "object"
+
+# =============================================================================
+# Operators
+# =============================================================================
+
+fn strict_equals(it: @&Interp, x: Value, y: Value) -> i32
+    if x.tag != y.tag
+        return 0
+    if x.tag == V_UNDEFINED or x.tag == V_NULL
+        return 1
+    if x.tag == V_NUMBER
+        if x.num == y.num
+            return 1
+        return 0
+    if x.tag == V_STRING
+        return str_eq(it, x, y)
+    if x.a == y.a
+        return 1
+    0
+
+fn loose_equals(it: @&Interp, x: Value, y: Value) -> i32
+    if x.tag == y.tag
+        return strict_equals(it, x, y)
+    let xn = x.tag == V_UNDEFINED or x.tag == V_NULL
+    let yn = y.tag == V_UNDEFINED or y.tag == V_NULL
+    if xn or yn
+        if xn and yn
+            return 1
+        return 0
+    if x.tag == V_BOOL
+        return loose_equals(it, v_num(x.a as f64), y)
+    if y.tag == V_BOOL
+        return loose_equals(it, x, v_num(y.a as f64))
+    if (x.tag == V_NUMBER and y.tag == V_STRING) or (x.tag == V_STRING and y.tag == V_NUMBER)
+        if to_number(it, x) == to_number(it, y)
+            return 1
+        return 0
+    if x.tag == V_OBJECT or y.tag == V_OBJECT or x.tag == V_FUNCTION or y.tag == V_FUNCTION
+        # Compare an object by its string form with a primitive
+        if x.tag == V_STRING or x.tag == V_NUMBER
+            return loose_equals(it, x, to_string(it, y))
+        if y.tag == V_STRING or y.tag == V_NUMBER
+            return loose_equals(it, to_string(it, x), y)
+    0
+
+fn is_primitive_number_like(v: Value) -> i32
+    if v.tag == V_STRING or v.tag == V_OBJECT or v.tag == V_FUNCTION or v.tag == V_NATIVE
+        return 0
+    1
+
+# Relational comparison: 1 if x < y (or <= when or_equal), 0 otherwise
+# (including when either side is NaN)
+fn less_than(it: @&Interp, x: Value, y: Value, or_equal: i32) -> i32
+    if x.tag == V_STRING and y.tag == V_STRING
+        let c = str_cmp(it, x, y)
+        if c < 0 or (or_equal == 1 and c == 0)
+            return 1
+        return 0
+    let a = to_number(it, x)
+    let b = to_number(it, y)
+    if a < b or (or_equal == 1 and a == b)
+        return 1
+    0
+
+fn shift_right_signed(a: i64, s: i64) -> i64
+    if a < 0
+        return 0 - (((0 - a) - 1) >> s) - 1
+    a >> s
+
+fn binary_op(it: @&Interp, op: i32, x: Value, y: Value) -> Value
+    if op == OP_ADD
+        if is_primitive_number_like(x) == 1 and is_primitive_number_like(y) == 1
+            return v_num(to_number(it, x) + to_number(it, y))
+        let sx = to_string(it, x)
+        let sy = to_string(it, y)
+        let start = vec_len<u8>(@it.arena)
+        var i: i64 = 0
+        while i < sx.b
+            vec_push<u8>(@&it.arena, vec_get<u8>(@it.arena, sx.a + i))
+            i = i + 1
+        i = 0
+        while i < sy.b
+            vec_push<u8>(@&it.arena, vec_get<u8>(@it.arena, sy.a + i))
+            i = i + 1
+        return v_str(start, sx.b + sy.b)
+    if op == OP_SUB
+        return v_num(to_number(it, x) - to_number(it, y))
+    if op == OP_MUL
+        return v_num(to_number(it, x) * to_number(it, y))
+    if op == OP_DIV
+        return v_num(to_number(it, x) / to_number(it, y))
+    if op == OP_MOD
+        let a = to_number(it, x)
+        let b = to_number(it, y)
+        if b == 0.0 or a != a or b != b
+            return v_num(f64_nan())
+        return v_num(a % b)
+    if op == OP_POW
+        return v_num(f64_pow(to_number(it, x), to_number(it, y)))
+    if op == OP_EQ
+        return v_bool(loose_equals(it, x, y))
+    if op == OP_NE
+        return v_bool(1 - loose_equals(it, x, y))
+    if op == OP_STRICT_EQ
+        return v_bool(strict_equals(it, x, y))
+    if op == OP_STRICT_NE
+        return v_bool(1 - strict_equals(it, x, y))
+    if op == OP_LT
+        return v_bool(less_than(it, x, y, 0))
+    if op == OP_GT
+        return v_bool(less_than(it, y, x, 0))
+    if op == OP_LE
+        # a <= b is !(b < a), except that NaN makes both false
+        if x.tag != V_STRING or y.tag != V_STRING
+            let a = to_number(it, x)
+            let b = to_number(it, y)
+            if a != a or b != b
+                return v_bool(0)
+        return v_bool(1 - less_than(it, y, x, 0))
+    if op == OP_GE
+        if x.tag != V_STRING or y.tag != V_STRING
+            let a = to_number(it, x)
+            let b = to_number(it, y)
+            if a != a or b != b
+                return v_bool(0)
+        return v_bool(1 - less_than(it, x, y, 0))
+    let a = to_int32_f(to_number(it, x))
+    let b = to_int32_f(to_number(it, y))
+    if op == OP_BIT_AND
+        return v_num((a & b) as f64)
+    if op == OP_BIT_OR
+        return v_num((a | b) as f64)
+    if op == OP_BIT_XOR
+        return v_num((a ^ b) as f64)
+    let s = to_uint32_f(to_number(it, y)) % 32
+    if op == OP_SHL
+        return v_num(to_int32_f(((a << s) & 4294967295) as f64) as f64)
+    if op == OP_SHR
+        return v_num(shift_right_signed(a, s) as f64)
+    if op == OP_USHR
+        return v_num((to_uint32_f(to_number(it, x)) >> s) as f64)
+    throw_unsupported(it, "the `in` and `instanceof` operators")
+    v_undef()
+
+# Compound assignment operator -> binary operator (0 for = and logical ones)
+fn assign_to_binary(op: i32) -> i32
+    if op == ASSIGN_ADD
+        return OP_ADD
+    if op == ASSIGN_SUB
+        return OP_SUB
+    if op == ASSIGN_MUL
+        return OP_MUL
+    if op == ASSIGN_DIV
+        return OP_DIV
+    if op == ASSIGN_MOD
+        return OP_MOD
+    if op == ASSIGN_POW
+        return OP_POW
+    if op == ASSIGN_BIT_AND
+        return OP_BIT_AND
+    if op == ASSIGN_BIT_OR
+        return OP_BIT_OR
+    if op == ASSIGN_BIT_XOR
+        return OP_BIT_XOR
+    if op == ASSIGN_SHL
+        return OP_SHL
+    if op == ASSIGN_SHR
+        return OP_SHR
+    if op == ASSIGN_USHR
+        return OP_USHR
+    0
+
+# =============================================================================
+# References: reading and writing identifiers and properties
+# =============================================================================
+
+fn read_identifier(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let b = lookup(it, it.scope, 1, node.str_start, node.str_len)
+    if b < 0
+        throw_error(it, "ReferenceError", ident_text(it, idx), " is not defined")
+        return v_undef()
+    vec_get<Binding>(@it.bindings, b).value
+
+fn write_identifier(it: @&Interp, idx: i64, value: Value)
+    let node = node_at(it, idx)
+    let b = lookup(it, it.scope, 1, node.str_start, node.str_len)
+    if b < 0
+        # Sloppy-mode scripts create a global on assignment
+        declare(it, it.global, 1, node.str_start, node.str_len, value, 0)
+        return
+    let bp = vec_get_ptr<Binding>(@&it.bindings, b)
+    if bp.is_const == 1
+        throw_error(it, "TypeError", "Assignment to constant variable.", "")
+        return
+    bp.value = value
+
+# A property key: (in_src, start, len). Evaluates a computed key.
+struct Key
+    in_src: i32
+    start: i64
+    len: i64
+
+fn member_key(it: @&Interp, node: *AstNode) -> Key
+    if node.bool_value == 1
+        let k = to_string(it, eval(it, node.child2))
+        return Key { in_src: 0, start: k.a, len: k.b }
+    let pn = node_at(it, node.child2)
+    Key { in_src: 1, start: pn.str_start, len: pn.str_len }
+
+fn get_property(it: @&Interp, obj: Value, key: Key) -> Value
+    if obj.tag == V_UNDEFINED or obj.tag == V_NULL
+        var what: StrView = "undefined"
+        if obj.tag == V_NULL
+            what = "null"
+        let start = vec_len<u8>(@it.arena)
+        buf_push_sv(@&it.arena, what)
+        buf_push_sv(@&it.arena, " (reading '")
+        buf_push_sv(@&it.arena, name_view(it, key.in_src, key.start, key.len))
+        buf_push_sv(@&it.arena, "')")
+        let detail = strview_from_ptr(vec_as_ptr<u8>(@it.arena) + start, vec_len<u8>(@it.arena) - start)
+        throw_error(it, "TypeError", "Cannot read properties of ", detail)
+        return v_undef()
+    if obj.tag == V_OBJECT
+        return prop_get(it, obj.a, key.in_src, key.start, key.len)
+    if obj.tag == V_STRING
+        if strview_eq(name_view(it, key.in_src, key.start, key.len), "length")
+            return v_num(obj.b as f64)
+    v_undef()
+
+fn read_member(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let obj = eval(it, node.child1)
+    if threw(it) == 1
+        return v_undef()
+    # obj?.prop
+    if node.bool_value == 2 and (obj.tag == V_UNDEFINED or obj.tag == V_NULL)
+        return v_undef()
+    let key = member_key(it, node)
+    if threw(it) == 1
+        return v_undef()
+    get_property(it, obj, key)
+
+fn write_member(it: @&Interp, obj: Value, key: Key, value: Value)
+    if obj.tag == V_UNDEFINED or obj.tag == V_NULL
+        throw_error(it, "TypeError", "Cannot set properties of ", type_of(obj))
+        return
+    if obj.tag == V_OBJECT
+        prop_set(it, obj.a, key.in_src, key.start, key.len, value)
+    # Writes to a primitive's property are ignored (sloppy mode)
+
+# =============================================================================
+# Expressions
+# =============================================================================
+
+fn make_function(it: @&Interp, node_idx: i64, scope: i64) -> Value
+    let idx = vec_len<FuncRec>(@it.funcs)
+    vec_push<FuncRec>(@&it.funcs, FuncRec { node: node_idx, scope: scope })
+    v_tagged(V_FUNCTION, idx)
+
+fn eval_function_expr(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    if node.child1 == NO_CHILD
+        return make_function(it, idx, it.scope)
+    # A named function expression sees its own name
+    let s = scope_new(it, it.scope, 0)
+    let f = make_function(it, idx, s)
+    let name = node_at(it, node.child1)
+    declare(it, s, 1, name.str_start, name.str_len, f, 1)
+    f
+
+fn eval_logical(it: @&Interp, node: *AstNode) -> Value
+    let op = node.int_value
+    let left = eval(it, node.child1)
+    if threw(it) == 1
+        return v_undef()
+    if op == OP_AND
+        if to_boolean(it, left) == 0
+            return left
+    else if op == OP_OR
+        if to_boolean(it, left) == 1
+            return left
+    else
+        if left.tag != V_UNDEFINED and left.tag != V_NULL
+            return left
+    eval(it, node.child2)
+
+fn eval_binary(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let op = node.int_value
+    if op == OP_AND or op == OP_OR or op == OP_NULLISH
+        return eval_logical(it, node)
+    let left = eval(it, node.child1)
+    if threw(it) == 1
+        return v_undef()
+    let right = eval(it, node.child2)
+    if threw(it) == 1
+        return v_undef()
+    binary_op(it, op, left, right)
+
+fn eval_unary(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let op = node.int_value
+    if op == UNARY_TYPEOF
+        # typeof of an undeclared name is "undefined", not an error
+        let operand = node_at(it, node.child1)
+        if operand.tag == AST_IDENTIFIER
+            if lookup(it, it.scope, 1, operand.str_start, operand.str_len) < 0
+                return str_from_sv(it, "undefined")
+        let v = eval(it, node.child1)
+        if threw(it) == 1
+            return v_undef()
+        return str_from_sv(it, type_of(v))
+    if op == UNARY_DELETE
+        throw_unsupported(it, "delete")
+        return v_undef()
+    let v = eval(it, node.child1)
+    if threw(it) == 1
+        return v_undef()
+    if op == UNARY_NEG
+        return v_num(-1.0 * to_number(it, v))   # not 0 - x: -(0) is -0
+    if op == UNARY_POS
+        return v_num(to_number(it, v))
+    if op == UNARY_NOT
+        return v_bool(1 - to_boolean(it, v))
+    if op == UNARY_BIT_NOT
+        return v_num((0 - to_int32_f(to_number(it, v)) - 1) as f64)
+    v_undef()  # void
+
+fn eval_assignment(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let op = node.int_value
+    let tnode = node_at(it, node.child1)
+    let is_member = tnode.tag == AST_MEMBER_EXPR
+    if is_member == false and tnode.tag != AST_IDENTIFIER
+        throw_error(it, "SyntaxError", "Invalid left-hand side in assignment", "")
+        return v_undef()
+
+    # Resolve the target once: obj[key] evaluates obj and key before the value
+    var obj: Value = v_undef()
+    var key = Key { in_src: 0, start: 0, len: 0 }
+    if is_member
+        obj = eval(it, tnode.child1)
+        if threw(it) == 1
+            return v_undef()
+        key = member_key(it, tnode)
+        if threw(it) == 1
+            return v_undef()
+
+    var value: Value = v_undef()
+    if op == ASSIGN_EQ
+        value = eval(it, node.child2)
+    else
+        var current: Value = v_undef()
+        if is_member
+            current = get_property(it, obj, key)
+        else
+            current = read_identifier(it, node.child1)
+        if threw(it) == 1
+            return v_undef()
+        if op == ASSIGN_AND or op == ASSIGN_OR or op == ASSIGN_NULLISH
+            # Logical assignment only assigns when it would not short-circuit
+            let truthy = to_boolean(it, current)
+            if op == ASSIGN_AND and truthy == 0
+                return current
+            if op == ASSIGN_OR and truthy == 1
+                return current
+            if op == ASSIGN_NULLISH and current.tag != V_UNDEFINED and current.tag != V_NULL
+                return current
+            value = eval(it, node.child2)
+        else
+            let rhs = eval(it, node.child2)
+            if threw(it) == 1
+                return v_undef()
+            value = binary_op(it, assign_to_binary(op), current, rhs)
+    if threw(it) == 1
+        return v_undef()
+
+    if is_member
+        write_member(it, obj, key, value)
+    else
+        write_identifier(it, node.child1, value)
+    value
+
+fn eval_update(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let tnode = node_at(it, node.child1)
+    var delta: f64 = 1.0
+    if node.int_value == 2
+        delta = -1.0
+    var old: f64 = 0.0
+    if tnode.tag == AST_IDENTIFIER
+        let cur = read_identifier(it, node.child1)
+        if threw(it) == 1
+            return v_undef()
+        old = to_number(it, cur)
+        write_identifier(it, node.child1, v_num(old + delta))
+    else if tnode.tag == AST_MEMBER_EXPR
+        let obj = eval(it, tnode.child1)
+        if threw(it) == 1
+            return v_undef()
+        let key = member_key(it, tnode)
+        if threw(it) == 1
+            return v_undef()
+        let cur = get_property(it, obj, key)
+        if threw(it) == 1
+            return v_undef()
+        old = to_number(it, cur)
+        write_member(it, obj, key, v_num(old + delta))
+    else
+        throw_error(it, "SyntaxError", "Invalid left-hand side expression in update operation", "")
+        return v_undef()
+    if threw(it) == 1
+        return v_undef()
+    if node.bool_value == 1
+        return v_num(old + delta)
+    v_num(old)
+
+fn eval_object(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let obj = obj_new(it)
+    let start = node.children_start
+    let count = node.children_count
+    var i: i64 = 0
+    while i < count
+        let key_idx = child_at(it, start, i * 2)
+        let val_idx = child_at(it, start, i * 2 + 1)
+        let value = eval(it, val_idx)
+        if threw(it) == 1
+            return v_undef()
+        let kn = node_at(it, key_idx)
+        if kn.tag == AST_STRING_LITERAL
+            let k = string_literal(it, key_idx)
+            prop_set(it, obj.a, 0, k.a, k.b, value)
+        else
+            prop_set(it, obj.a, 1, kn.str_start, kn.str_len, value)
+        i = i + 1
+    obj
+
+fn console_print(it: @&Interp, native: i64, args: @Vec<Value>)
+    vec_clear<u8>(@&it.line)
+    let n = vec_len<Value>(args)
+    var i: i64 = 0
+    while i < n
+        if i > 0
+            vec_push<u8>(@&it.line, 32)
+        push_inspect(it, @&it.line, vec_get<Value>(args, i), 0)
+        i = i + 1
+    vec_push<u8>(@&it.line, 10)
+    let text = strview_from_ptr(vec_as_ptr<u8>(@it.line), vec_len<u8>(@it.line))
+    if native == NATIVE_CONSOLE_ERROR
+        eprints(text)
+        return
+    if it.echo == 1
+        prints(text)
+        return
+    buf_push_sv(@&it.out, text)
+
+fn call_function(it: @&Interp, f: Value, args: @Vec<Value>, callee: i64) -> Value
+    if f.tag == V_NATIVE
+        console_print(it, f.a, args)
+        return v_undef()
+    if f.tag != V_FUNCTION
+        throw_error(it, "TypeError", node_text(it, callee), " is not a function")
+        return v_undef()
+    if it.depth >= MAX_DEPTH
+        throw_error(it, "RangeError", "Maximum call stack size exceeded", "")
+        return v_undef()
+
+    let rec = vec_get<FuncRec>(@it.funcs, f.a)
+    let fnode = node_at(it, rec.node)
+    let scope = scope_new(it, rec.scope, 1)
+    let nparams = fnode.children_count
+    let pstart = fnode.children_start
+    let nargs = vec_len<Value>(args)
+    var i: i64 = 0
+    while i < nparams
+        let pn = node_at(it, child_at(it, pstart, i))
+        var value: Value = v_undef()
+        if i < nargs
+            value = vec_get<Value>(args, i)
+        declare(it, scope, 1, pn.str_start, pn.str_len, value, 0)
+        i = i + 1
+
+    let saved = it.scope
+    it.scope = scope
+    it.depth = it.depth + 1
+    let body = node_at(it, fnode.child2)
+    exec_list(it, body.children_start, body.children_count)
+    it.depth = it.depth - 1
+    it.scope = saved
+
+    if it.ctl == CTL_THROW
+        return v_undef()
+    var result: Value = v_undef()
+    if it.ctl == CTL_RETURN
+        result = it.ret
+    it.ctl = CTL_NORMAL
+    result
+
+fn eval_call(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let callee = node.child1
+    let f = eval(it, callee)
+    if threw(it) == 1
+        return v_undef()
+    var args = vec_new<Value>()
+    let start = node.children_start
+    let count = node.children_count
+    var i: i64 = 0
+    while i < count
+        let v = eval(it, child_at(it, start, i))
+        if threw(it) == 1
+            vec_drop<Value>(@&args)
+            return v_undef()
+        vec_push<Value>(@&args, v)
+        i = i + 1
+    let result = call_function(it, f, @args, callee)
+    vec_drop<Value>(@&args)
+    result
+
+fn eval(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let tag = node.tag
+    if tag == AST_NUMBER_LITERAL
+        return v_num(node.num_value)
+    if tag == AST_STRING_LITERAL
+        return string_literal(it, idx)
+    if tag == AST_BOOLEAN_LITERAL
+        return v_bool(node.bool_value)
+    if tag == AST_NULL_LITERAL
+        return v_null()
+    if tag == AST_UNDEFINED_LITERAL
+        return v_undef()
+    if tag == AST_IDENTIFIER
+        return read_identifier(it, idx)
+    if tag == AST_BINARY_EXPR
+        return eval_binary(it, idx)
+    if tag == AST_UNARY_EXPR
+        return eval_unary(it, idx)
+    if tag == AST_UPDATE_EXPR
+        return eval_update(it, idx)
+    if tag == AST_ASSIGNMENT_EXPR
+        return eval_assignment(it, idx)
+    if tag == AST_CONDITIONAL_EXPR
+        let cond = eval(it, node.child1)
+        if threw(it) == 1
+            return v_undef()
+        if to_boolean(it, cond) == 1
+            return eval(it, node.child2)
+        return eval(it, node.child3)
+    if tag == AST_CALL_EXPR
+        return eval_call(it, idx)
+    if tag == AST_MEMBER_EXPR
+        return read_member(it, idx)
+    if tag == AST_OBJECT_LITERAL
+        return eval_object(it, idx)
+    if tag == AST_FUNCTION_EXPR
+        return eval_function_expr(it, idx)
+    throw_unsupported(it, ast_node_type_name(tag))
+    v_undef()
+
+# =============================================================================
+# Statements
+# =============================================================================
+
+# Function declarations in a statement list are created before it runs
+fn hoist(it: @&Interp, start: i64, count: i64)
+    var i: i64 = 0
+    while i < count
+        let sidx = child_at(it, start, i)
+        let snode = node_at(it, sidx)
+        if snode.tag == AST_FUNCTION_DECL
+            let name = node_at(it, snode.child1)
+            let f = make_function(it, sidx, it.scope)
+            declare(it, it.scope, 1, name.str_start, name.str_len, f, 0)
+        i = i + 1
+
+fn exec_list(it: @&Interp, start: i64, count: i64)
+    hoist(it, start, count)
+    var i: i64 = 0
+    while i < count
+        exec(it, child_at(it, start, i))
+        if it.ctl != CTL_NORMAL
+            return
+        i = i + 1
+
+# Run a statement in a fresh block scope
+fn exec_scoped(it: @&Interp, idx: i64)
+    let saved = it.scope
+    it.scope = scope_new(it, saved, 0)
+    exec(it, idx)
+    it.scope = saved
+
+fn exec_var_decl(it: @&Interp, node: *AstNode)
+    let kind = node.int_value
+    let start = node.children_start
+    let count = node.children_count
+    var i: i64 = 0
+    while i < count
+        let name = node_at(it, child_at(it, start, i * 2))
+        let init = child_at(it, start, i * 2 + 1)
+        if kind == VAR_VAR
+            let target = function_scope(it)
+            let existing = scope_find_own(it, target, 1, name.str_start, name.str_len)
+            if init == NO_CHILD
+                if existing < 0
+                    declare(it, target, 1, name.str_start, name.str_len, v_undef(), 0)
+            else
+                let value = eval(it, init)
+                if threw(it) == 1
+                    return
+                # `var` inside a block assigns the function-scope binding
+                # unless a let/const in between shadows it
+                let visible = lookup(it, it.scope, 1, name.str_start, name.str_len)
+                if visible >= 0 and visible != existing
+                    let bp = vec_get_ptr<Binding>(@&it.bindings, visible)
+                    bp.value = value
+                else
+                    declare(it, target, 1, name.str_start, name.str_len, value, 0)
+        else
+            var value: Value = v_undef()
+            if init != NO_CHILD
+                value = eval(it, init)
+                if threw(it) == 1
+                    return
+            var is_const: i32 = 0
+            if kind == VAR_CONST
+                is_const = 1
+            declare(it, it.scope, 1, name.str_start, name.str_len, value, is_const)
+        i = i + 1
+
+# After a loop body: 1 to stop the loop (break, return, throw)
+fn loop_should_stop(it: @&Interp) -> i32
+    if it.ctl == CTL_BREAK
+        it.ctl = CTL_NORMAL
+        return 1
+    if it.ctl == CTL_CONTINUE
+        it.ctl = CTL_NORMAL
+        return 0
+    if it.ctl != CTL_NORMAL
+        return 1
+    0
+
+fn exec_for(it: @&Interp, node: *AstNode)
+    let saved = it.scope
+    it.scope = scope_new(it, saved, 0)
+    let init = node.child1
+    let cond = node.child2
+    let update = node.child3
+    let body = node.child4
+    if init != NO_CHILD
+        let inode = node_at(it, init)
+        if inode.tag == AST_VAR_DECL
+            exec(it, init)
+        else
+            # `let`: see #4070 (arm ending in a Value call)
+            let _ignored = eval(it, init)
+    while it.ctl == CTL_NORMAL
+        if cond != NO_CHILD
+            let c = eval(it, cond)
+            if threw(it) == 1 or to_boolean(it, c) == 0
+                break
+        exec_scoped(it, body)
+        if loop_should_stop(it) == 1
+            break
+        if update != NO_CHILD
+            let _ignored = eval(it, update)
+    it.scope = saved
+
+fn exec_try(it: @&Interp, node: *AstNode)
+    let catch_param = node.child2
+    let catch_block = node.child3
+    let finally_block = node.child4
+    exec(it, node.child1)
+    if it.ctl == CTL_THROW and catch_block != NO_CHILD
+        it.ctl = CTL_NORMAL
+        let saved = it.scope
+        it.scope = scope_new(it, saved, 0)
+        if catch_param != NO_CHILD
+            let pn = node_at(it, catch_param)
+            declare(it, it.scope, 1, pn.str_start, pn.str_len, it.ret, 0)
+        exec(it, catch_block)
+        it.scope = saved
+    if finally_block != NO_CHILD
+        # finally runs either way; its own abrupt completion wins
+        let saved_ctl = it.ctl
+        let saved_ret = it.ret
+        it.ctl = CTL_NORMAL
+        exec(it, finally_block)
+        if it.ctl == CTL_NORMAL
+            it.ctl = saved_ctl
+            it.ret = saved_ret
+
+fn exec(it: @&Interp, idx: i64)
+    let node = node_at(it, idx)
+    let tag = node.tag
+    if tag == AST_EXPR_STMT
+        # `let`: an if/else arm ending in a Value call miscompiles (#4070)
+        let _ignored = eval(it, node.child1)
+    else if tag == AST_VAR_DECL
+        exec_var_decl(it, node)
+    else if tag == AST_BLOCK_STMT
+        let saved = it.scope
+        it.scope = scope_new(it, saved, 0)
+        exec_list(it, node.children_start, node.children_count)
+        it.scope = saved
+    else if tag == AST_IF_STMT
+        let c = eval(it, node.child1)
+        if threw(it) == 1
+            return
+        if to_boolean(it, c) == 1
+            exec_scoped(it, node.child2)
+        else if node.child3 != NO_CHILD
+            exec_scoped(it, node.child3)
+    else if tag == AST_WHILE_STMT
+        while it.ctl == CTL_NORMAL
+            let c = eval(it, node.child1)
+            if threw(it) == 1 or to_boolean(it, c) == 0
+                break
+            exec_scoped(it, node.child2)
+            if loop_should_stop(it) == 1
+                break
+    else if tag == AST_DO_WHILE_STMT
+        while it.ctl == CTL_NORMAL
+            exec_scoped(it, node.child1)
+            if loop_should_stop(it) == 1
+                break
+            let c = eval(it, node.child2)
+            if threw(it) == 1 or to_boolean(it, c) == 0
+                break
+    else if tag == AST_FOR_STMT
+        exec_for(it, node)
+    else if tag == AST_RETURN_STMT
+        var value: Value = v_undef()
+        if node.child1 != NO_CHILD
+            value = eval(it, node.child1)
+            if threw(it) == 1
+                return
+        it.ret = value
+        it.ctl = CTL_RETURN
+    else if tag == AST_BREAK_STMT or tag == AST_CONTINUE_STMT
+        if node.str_len > 0
+            throw_unsupported(it, "labelled break/continue")
+            return
+        if tag == AST_BREAK_STMT
+            it.ctl = CTL_BREAK
+        else
+            it.ctl = CTL_CONTINUE
+    else if tag == AST_THROW_STMT
+        let value = eval(it, node.child1)
+        if threw(it) == 1
+            return
+        it.ret = value
+        it.ctl = CTL_THROW
+    else if tag == AST_TRY_STMT
+        exec_try(it, node)
+    else if tag == AST_FUNCTION_DECL or tag == AST_EMPTY_STMT or tag == AST_DEBUGGER_STMT
+        # Function declarations were hoisted by exec_list
+        return
+    else
+        throw_unsupported(it, ast_node_type_name(tag))
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+fn run_program(it: @&Interp)
+    if parser_had_error(@it.parser) == 1
+        it.failed = 1
+        buf_push_sv(@&it.err, "SyntaxError: the script did not parse (see the parse errors above)")
+        return
+
+    # One literal-cache slot per AST node
+    let nodes = vec_len<AstNode>(@it.parser.ast.nodes)
+    var i: i64 = 0
+    while i < nodes
+        vec_push<i64>(@&it.lit_start, -1)
+        vec_push<i64>(@&it.lit_len, 0)
+        i = i + 1
+
+    it.global = scope_new(it, -1, 1)
+    it.scope = it.global
+    let console = obj_new(it)
+    prop_set_sv(it, console.a, "log", v_tagged(V_NATIVE, NATIVE_CONSOLE_LOG))
+    prop_set_sv(it, console.a, "error", v_tagged(V_NATIVE, NATIVE_CONSOLE_ERROR))
+    declare_builtin(it, "console", console)
+    declare_builtin(it, "NaN", v_num(f64_nan()))
+    declare_builtin(it, "Infinity", v_num(f64_inf()))
+
+    let root = node_at(it, parser_root(@it.parser))
+    exec_list(it, root.children_start, root.children_count)
+
+    if it.ctl == CTL_THROW
+        it.failed = 1
+        buf_push_sv(@&it.err, "Uncaught ")
+        push_to_string(it, @&it.err, it.ret)
+
+# Run a script, keeping console.log's output in the interpreter
+# (interp_output). For tests.
+pub fn js_run(source: StrView) -> Interp
+    var it = interp_new(source, 0)
+    run_program(@&it)
+    it
+
+# Run a script, writing console.log's output to stdout as it happens
+pub fn js_run_echo(source: StrView) -> Interp
+    var it = interp_new(source, 1)
+    run_program(@&it)
+    it
+
+# 1 if the script threw an uncaught exception or did not parse
+pub fn interp_failed(it: @Interp) -> i32
+    it.failed
+
+# Why the run failed, e.g. "Uncaught ReferenceError: x is not defined"
+pub fn interp_error(it: @Interp) -> StrView
+    strview_from_ptr(vec_as_ptr<u8>(@it.err), vec_len<u8>(@it.err))
+
+# What console.log printed (js_run only; js_run_echo writes it to stdout)
+pub fn interp_output(it: @Interp) -> StrView
+    strview_from_ptr(vec_as_ptr<u8>(@it.out), vec_len<u8>(@it.out))

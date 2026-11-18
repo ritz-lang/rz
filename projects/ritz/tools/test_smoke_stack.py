@@ -23,6 +23,7 @@ Run with:
 from __future__ import annotations
 
 import io
+import inspect
 import re
 import subprocess
 import sys
@@ -121,12 +122,14 @@ def test_every_xfail_belongs_to_a_suite():
 @pytest.mark.unit
 def test_child_tickets_each_have_a_check():
     """#2456's acceptance: every child ticket's repro is one of its checks.
-    A fixed child drops out of this set in the change that deletes its last
-    XFAILS entry (#2457, #2458, #2459, #2460, #2461: their checks are plain
-    passing checks now; #2460's one remaining failure, sage running JS, is
-    #2787's)."""
+    A fixed child drops out of the XFAILS set in the change that fixes it.
+    All of them are fixed (#2457, #2458, #2459, #2460, #2461, and #2787 last:
+    sage runs JS), so their checks are plain passing checks and no XFAILS
+    entry may cite them; the last one's check must still be run."""
     cited = {m for reason in ss.XFAILS.values() for m in re.findall(r"#(\d+)", reason)}
-    assert {"2787"} <= cited
+    assert not cited & {"2457", "2458", "2459", "2460", "2461", "2787"}
+    from smoke_stack import hollow
+    assert '"hollow.sage_runs_js"' in inspect.getsource(hollow.suite_hollow)
 
 
 # --- binaries by target --------------------------------------------------------
