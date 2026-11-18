@@ -120,6 +120,47 @@ fn f()
         Some(k) => h.a[idx(k)] = mk(5)
         None => D = 0
 """, "f()", 78152),
+    # g[i][j] = v in a match arm: i (7), then j (2), then v (8); g[0][1]
+    # then holds 5 (AGAST #3582: ritz0 ran j first, D == 2785).
+    "match_arm_rank2_store_after_indices_and_value": ("""\
+fn jdx(j: i64) -> i64
+    D = D * 10 + 2
+    return j
+
+fn val(x: i64) -> i64
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var g: [1][2]i64 = [ [1, 2] ]
+    let o: Option<i64> = Some(0)
+    match o
+        Some(k) => g[idx(k)][jdx(1)] = val(5)
+        None => D = 0
+    D = D * 10 + g[0][1]
+""", "f()", 7285),
+    # arr()[i] = v in a match arm, `arr` returning a `*i64`: arr() (6), then
+    # i (7), then v (8); a[1] then holds 3 (AGAST #3582).
+    "match_arm_call_base_store_after_index_and_value": ("""\
+var P: *i64 = null
+
+fn arr() -> *i64
+    D = D * 10 + 6
+    return P
+
+fn val(x: i64) -> i64
+    D = D * 10 + 8
+    return x
+
+fn f()
+    var a: [2]i64 = [1, 2]
+    P = @a[0]
+    let o: Option<i64> = Some(1)
+    match o
+        Some(k) => arr()[idx(k)] = val(3)
+        None => D = 0
+    D = D * 10 + a[1]
+""", "f()", 6783),
     # A field store w.t = v in a match arm drops the old field (1), as the
     # statement form does (§13.6, AGAST #2173); 3 drops at the end.
     "match_arm_field_store_drops_old_field": ("""\

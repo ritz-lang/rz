@@ -11479,21 +11479,25 @@ class LLVMEmitter:
                 if self._slice_ritz_type(expr.expr) is not None:
                     raise EmitError("can't take the address of a slice", expr.span)
                 raise self._slice_refusal(expr, self._infer_ritz_type(expr.expr))
-            # arr[i] -> GEP to element
-            index = self._emit_index_value(expr.index)
+            # arr[i] -> GEP to element.  Each route addresses the base
+            # first, then emits the index (index_of), as the AssignStmt
+            # Index arm does: LARB R61, AGAST #3582.
+            def index_of():
+                return self._emit_index_value(expr.index)
+
             if isinstance(expr.expr, rast.Ident):
                 name = expr.expr.name
                 if name in self.locals:
                     alloca, ty = self.locals[name]
                     if isinstance(ty, ir.ArrayType):
                         zero = ir.Constant(self.i32, 0)
-                        return self.builder.gep(alloca, [zero, index])
+                        return self.builder.gep(alloca, [zero, index_of()])
                 elif name in self.globals:
                     gvar, ty = self.globals[name]
                     if isinstance(ty, ir.ArrayType):
                         # Global array - use two-level GEP [0, index] on the global
                         zero = ir.Constant(self.i32, 0)
-                        return self.builder.gep(gvar, [zero, index])
+                        return self.builder.gep(gvar, [zero, index_of()])
                 elif self._is_const_array_name(name):
                     # AGAST #3360: `PS[1].get()` lends the element read-only
                     # (`self: @P`), and `@PS[i]` is an `@P` (LARB R48). Every
@@ -11502,7 +11506,7 @@ class LLVMEmitter:
                     # through.
                     gvar, ty = self.const_arrays[name]
                     zero = ir.Constant(self.i32, 0)
-                    return self.builder.gep(gvar, [zero, index])
+                    return self.builder.gep(gvar, [zero, index_of()])
                 elif name in self.params and rvalue_root:
                     # AGAST #3299: a let-bound array is an SSA value (`let g =
                     # h.m`, `m: [2][3]i32`).  The row `g[i]` of `g[i][j]` is
@@ -11513,7 +11517,7 @@ class LLVMEmitter:
                         slot = self._alloca_in_entry_block(ty, f"{name}.tmp")
                         self.builder.store(val, slot)
                         zero = ir.Constant(self.i32, 0)
-                        return self.builder.gep(slot, [zero, index])
+                        return self.builder.gep(slot, [zero, index_of()])
             # Handle struct field that is an array (e.g., buf.data[0] = x)
             # `mk().q[i]`, `q` a pointer, is no element of the temporary: it
             # takes the pointer route below (AGAST #2518).
@@ -11524,7 +11528,7 @@ class LLVMEmitter:
                     pointee = field_addr.type.pointee
                     if isinstance(pointee, ir.ArrayType):
                         zero = ir.Constant(self.i32, 0)
-                        return self.builder.gep(field_addr, [zero, index])
+                        return self.builder.gep(field_addr, [zero, index_of()])
             # Handle nested array indexing (e.g., arr[i][j] where arr is [N][M]T)
             if isinstance(expr.expr, rast.Index):
                 inner_addr = self._emit_lvalue_addr(expr.expr, rvalue_root)
@@ -11533,10 +11537,10 @@ class LLVMEmitter:
                     if isinstance(pointee, ir.ArrayType):
                         # Inner is array - GEP with [0, index] to get element
                         zero = ir.Constant(self.i32, 0)
-                        return self.builder.gep(inner_addr, [zero, index])
+                        return self.builder.gep(inner_addr, [zero, index_of()])
                     else:
                         # Inner is pointer to element - GEP with [index]
-                        return self.builder.gep(inner_addr, [index])
+                        return self.builder.gep(inner_addr, [index_of()])
             # Vec<T> element as an lvalue (`v[i] = x`, `@v[i]`): the element
             # lives in the Vec's heap buffer, so take the address out of the
             # data pointer rather than the { ptr, len, cap } value.
@@ -11545,11 +11549,13 @@ class LLVMEmitter:
                 zero = ir.Constant(self.i32, 0)
                 data_ptr = self.builder.load(
                     self.builder.gep(vec_addr, [zero, ir.Constant(self.i32, 0)]))
+                index = index_of()
                 if index.type != self.i64:
                     index = self._convert_type(index, self.i64)
                 return self.builder.gep(data_ptr, [index])
 
             base = self._emit_expr(expr.expr)
+            index = index_of()
             if isinstance(base.type, ir.ArrayType) and isinstance(
                     expr.expr, (rast.Call, rast.MethodCall)):
                 # `mka()[1]`, an array returned by value: a read spills it,
