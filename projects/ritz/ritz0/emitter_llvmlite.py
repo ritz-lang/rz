@@ -6442,7 +6442,11 @@ class LLVMEmitter:
                 self._temp_frames.append([])
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
                 self._float_slot(fn_def.ret_type, fn_def.body.expr)
-                if self._is_range_index(fn_def.body.expr):
+                if fn_def.ret_type is None and isinstance(fn_def.body.expr, rast.If):
+                    # A procedure's tail if/else is a statement (#4070).
+                    last_val = (self._emit_if(fn_def.body.expr, discard=True)
+                                or ir.Constant(self.i32, 0))
+                elif self._is_range_index(fn_def.body.expr):
                     # AGAST #2877: a Vec slice as a `-> Span<T>` tail is a
                     # view, as after `return`.
                     last_val = self._emit_slice_into(fn_def.body.expr, fn_def.ret_type)
@@ -7860,7 +7864,7 @@ class LLVMEmitter:
             self._reject_discarded_tail(stmt.expr)
             # Check if this is an If expression used as statement
             if isinstance(stmt.expr, rast.If):
-                return self._emit_if(stmt.expr)
+                return self._emit_if(stmt.expr, discard=True)
             # A bare "{x}" statement is a plain StringLit, not a print
             # (AGAST #2102): only print / eprint interpolate.
             return self._emit_expr(stmt.expr)
@@ -8532,8 +8536,14 @@ class LLVMEmitter:
 
         return result
 
-    def _emit_if(self, if_expr: rast.If):
-        """Emit an if expression/statement. Returns phi value if if-expr has value, else None."""
+    def _emit_if(self, if_expr: rast.If, discard: bool = False):
+        """Emit an if expression/statement. Returns phi value if if-expr has value, else None.
+
+        `discard`: the if's value goes nowhere (a statement, or a procedure's
+        tail), so its arms are not merged and None is returned (AGAST #4070:
+        a unit-call arm's dummy i32 beside a struct arm made an i32 phi fed
+        the struct, which clang refused).
+        """
         cond = self._emit_cond_expr(if_expr.cond)
 
         self._require_bool(cond, if_expr.cond, "if condition")
@@ -8564,7 +8574,7 @@ class LLVMEmitter:
         then_value = None
         if not self.builder.block.is_terminated and if_expr.then_block.expr:
             if isinstance(if_expr.then_block.expr, rast.If):
-                then_value = self._emit_if(if_expr.then_block.expr)
+                then_value = self._emit_if(if_expr.then_block.expr, discard)
             else:
                 then_value = self._emit_expr_with_expected_enum(
                     if_expr.then_block.expr,
@@ -8593,7 +8603,7 @@ class LLVMEmitter:
             # Handle trailing expression in else block - capture value for phi
             if not self.builder.block.is_terminated and if_expr.else_block.expr:
                 if isinstance(if_expr.else_block.expr, rast.If):
-                    else_value = self._emit_if(if_expr.else_block.expr)
+                    else_value = self._emit_if(if_expr.else_block.expr, discard)
                 else:
                     else_value = self._emit_expr_with_expected_enum(
                         if_expr.else_block.expr,
@@ -8678,6 +8688,8 @@ class LLVMEmitter:
 
         # Restore has_returned
         self.has_returned = saved_returned or (then_returned and else_returned)
+        if discard:
+            return None
 
         # Create phi node if both branches have values
         if then_value is not None and else_value is not None:

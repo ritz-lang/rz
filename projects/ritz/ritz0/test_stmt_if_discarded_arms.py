@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""AGAST #4070: a statement if/else's arms are not merged into a phi.
+
+ritz0 lowered an if/else whose value is discarded (an expression
+statement, or the tail of a procedure) as a value: `_emit_if` merged the
+arms' last expressions in a phi.  With one arm ending in a unit call (whose
+dummy value is an i32) and the other in a struct-returning call, the phi
+was typed i32 but fed the struct, and clang refused the IR:
+
+    fn run(flag: i32, out: @&i32)
+        if flag == 1
+            side(out)
+        else
+            mk(out)
+
+Neither arm's value is wanted, so neither reaches a phi.  Each program
+exits 0 only if every arm ran its side effect the right number of times.
+"""
+
+import pytest
+from test_ref_into_value import _run
+
+pytestmark = [pytest.mark.integration, pytest.mark.batched]
+
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+PRELUDE = """\
+struct V
+    tag: i32
+    num: f64
+
+fn mk(out: @&i32) -> V
+    *out = *out + 10
+    V { tag: 1, num: 2.0 }
+
+fn side(out: @&i32)
+    *out = *out + 1
+
+"""
+
+# The if/else is a procedure's tail.
+TAIL = """\
+fn run(flag: i32, out: @&i32)
+    if flag == 1
+        side(out)
+    else
+        mk(out)
+"""
+
+# The if/else is a statement with more after it.
+MID = """\
+fn run(flag: i32, out: @&i32)
+    if flag == 1
+        side(out)
+    else
+        mk(out)
+    *out = *out + 100
+"""
+
+# A nested else-if chain, struct arm first, as the tail.
+NESTED = """\
+fn run(flag: i32, out: @&i32)
+    if flag == 0
+        mk(out)
+    else if flag == 1
+        side(out)
+    else
+        mk(out)
+"""
+
+# The if/else is a statement in a fn that returns a value.
+VALUED = """\
+fn run(flag: i32, out: @&i32) -> i32
+    if flag == 1
+        side(out)
+    else
+        mk(out)
+    7
+"""
+
+MAIN = """
+pub fn main() -> i32
+    var n: i32 = 0
+    run(0, @&n)
+    run(1, @&n)
+    n - {want}
+"""
+
+ROWS = {
+    "tail": (TAIL, 11),
+    "mid": (MID, 211),
+    "nested": (NESTED, 11),
+    "valued": (VALUED, 11),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("row", sorted(ROWS))
+def test_discarded_if_arms_of_differing_types(compiler, row, tmp_path):
+    body, want = ROWS[row]
+    src = PRELUDE + body + MAIN.format(want=want)
+    assert _run(compiler, tmp_path, row, src) == 0
