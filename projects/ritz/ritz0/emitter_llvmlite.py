@@ -8125,6 +8125,17 @@ class LLVMEmitter:
                         and all(self._is_float_arm_convertible(t)
                                 for t in arm_types)):
                     target_type = float_ty
+                # An f32 arm next to a float-literal arm merges at f32: the
+                # literal takes the other side's width (§7.5), so `if d > 0.0
+                # then x / d else 0.0` (x: f32) stays an f32 (AGAST #3802).
+                elif (then_value.type == self.f32
+                        and isinstance(else_value.type, ir.DoubleType)
+                        and self._float_literal_only(if_expr.else_block)):
+                    target_type = self.f32
+                elif (else_value.type == self.f32
+                        and isinstance(then_value.type, ir.DoubleType)
+                        and self._float_literal_only(if_expr.then_block)):
+                    target_type = self.f32
                 # Pick the larger type
                 elif self._type_size(else_value.type) > self._type_size(then_value.type):
                     target_type = else_value.type
@@ -14734,6 +14745,51 @@ class LLVMEmitter:
             return self.builder.uitofp(val, target_type)
         return self.builder.sitofp(val, target_type)
 
+    @staticmethod
+    def _float_literal_only(expr: rast.Expr) -> bool:
+        """Is `expr` a float literal, or a constant expression of literals
+        (`0.1`, `0.0 - 7.5`, `-(1.0 / 3.0)`)?  Such an expression is evaluated
+        as f64 and rounded once into an f32 slot (LARB R70, AGAST #3802)."""
+        if isinstance(expr, (rast.FloatLit, rast.IntLit)):
+            return True
+        if isinstance(expr, rast.Grouped):
+            return LLVMEmitter._float_literal_only(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '-':
+            return LLVMEmitter._float_literal_only(expr.operand)
+        if isinstance(expr, rast.BinOp) and expr.op in ('+', '-', '*', '/', '%'):
+            return (LLVMEmitter._float_literal_only(expr.left)
+                    and LLVMEmitter._float_literal_only(expr.right))
+        # An if / match whose every arm is one of these, as §7.5's integer
+        # narrowing rule allows: the arms merge as f64 before the slot sees them.
+        if isinstance(expr, rast.Block):
+            return (not expr.stmts and expr.expr is not None
+                    and LLVMEmitter._float_literal_only(expr.expr))
+        if isinstance(expr, rast.If):
+            return (expr.else_block is not None
+                    and LLVMEmitter._float_literal_only(expr.then_block)
+                    and LLVMEmitter._float_literal_only(expr.else_block))
+        if isinstance(expr, rast.Match):
+            return all(LLVMEmitter._float_literal_only(arm.body) for arm in expr.arms)
+        return False
+
+    def _f64_into_f32_slot(self, val: ir.Value, target_type: ir.Type,
+                           at: Optional[rast.Expr]) -> ir.Value:
+        """An f64 value landing in an f32 slot (LANGUAGE_SPEC §7.5 "Float
+        narrowing", LARB R70, AGAST #3802): a let/var initialiser, an
+        assignment, an argument, a return, a field, an array element.  Only a
+        float literal or a constant expression of them narrows silently;
+        anything else is an error asking for `as f32`, as an inexact integer
+        into a float is (#2945)."""
+        src = at
+        if src is None:
+            origin = self._value_origin.get(id(val))
+            if origin is not None and origin[0] is val:
+                src = origin[1]
+        if src is None or self._float_literal_only(src):
+            return self.builder.fptrunc(val, target_type)
+        raise EmitError(float_rules.f64_into_f32(),
+                        self._value_span(src))
+
     def _pin_arm_unsigned(self, val) -> None:
         """Record match arm value `val`'s signedness while its bindings are
         in scope (AGAST #3332), for _merge_arms_at_float to convert it by."""
@@ -14778,11 +14834,12 @@ class LLVMEmitter:
             return val
         self._check_bool_slot(val, target_type, at)
 
-        # Floating-point conversions (float <-> double)
+        # Floating-point conversions: f32 widens silently; f64 narrows only
+        # from a literal (LANGUAGE_SPEC §7.5 "Float narrowing", AGAST #3802).
         if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
             return self.builder.fpext(val, target_type)
         if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
-            return self.builder.fptrunc(val, target_type)
+            return self._f64_into_f32_slot(val, target_type, at)
 
         # Integer -> floating-point: only where exact, by the source's
         # signedness (LANGUAGE_SPEC §7.5, AGAST #2945).
@@ -14802,17 +14859,6 @@ class LLVMEmitter:
                 return self.builder.sext(val, target_type)
             elif val.type.width > target_type.width:
                 return self.builder.trunc(val, target_type)
-
-        # Float-width conversions: f32 <-> f64.
-        # Float literals are emitted as f64 so this is needed when storing into
-        # f32 fields/params (e.g. struct lit `Point { x: 2.0 as f32 }`).
-        if isinstance(val.type, (ir.FloatType, ir.DoubleType)) and isinstance(
-            target_type, (ir.FloatType, ir.DoubleType)
-        ):
-            if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
-                return self.builder.fptrunc(val, target_type)
-            if isinstance(val.type, ir.FloatType) and isinstance(target_type, ir.DoubleType):
-                return self.builder.fpext(val, target_type)
 
         # Pointer to integer
         if isinstance(val.type, ir.PointerType) and isinstance(target_type, ir.IntType):
@@ -17169,6 +17215,10 @@ class LLVMEmitter:
         if isinstance(val.type, floats) and isinstance(target_type, ir.IntType):
             unsigned = self._is_unsigned_type(resolve_alias_in(expr.target, self.type_aliases))
             return self._emit_float_to_int_sat(val, target_type, unsigned)
+
+        # f64 <-> f32: `as` is how a non-literal f64 narrows (AGAST #3802).
+        if isinstance(val.type, ir.DoubleType) and isinstance(target_type, ir.FloatType):
+            return self.builder.fptrunc(val, target_type)
 
         # Use _convert_type for other conversions
         return self._convert_type(val, target_type)

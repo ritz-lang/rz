@@ -2176,8 +2176,8 @@ let w: f64 = z
 let h = y * 2.0                   # 6.0, an f32: the literal is an f32
 ```
 
-To get an `f32` back from `z`, write `z as f32`. (Leaving out the `as` isn't
-refused yet; that's AGAST #3802.)
+To get an `f32` back from `z`, write `z as f32`: without the `as`,
+`let n: f32 = z` is an error (§7.5, "Float narrowing").
 
 #### Pointer difference
 
@@ -2512,6 +2512,46 @@ does a `bool` (above):
 let p: *u8 = c"x"
 let a: f64 = p
 ```
+
+#### Float narrowing
+
+An `f32` converts into an `f64` slot silently: every `f32` is exact as an
+`f64`. The other way loses precision, so an `f64` value into an `f32` slot (a
+`let` or `var` initialiser, an assignment, an argument, a `return`, a field,
+an array element) needs `as f32` (LARB R70):
+
+```ritz body expect-error="implicit conversion from `f64` to `f32` can lose precision: write `<expr> as f32`"
+let x: f64 = 2.0
+let n: f32 = x
+```
+
+That includes an `f32` meeting an `f64` in arithmetic, whose result is an
+`f64` (§7.1):
+
+```ritz body expect-error="implicit conversion from `f64` to `f32` can lose precision: write `<expr> as f32`"
+let x: f64 = 2.0
+let y: f32 = 3.0
+let n: f32 = y * x
+```
+
+A float literal is exempt, and so is a constant expression of float literals:
+it's evaluated as an `f64` and rounded to `f32` once. So is an `if` / `match`
+whose every arm is one of these. An `if` with an `f32` arm and a literal arm is
+an `f32`, since the literal takes the other arm's width.
+
+```ritz body
+let x: f64 = 2.0
+let y: f32 = 3.0
+let a: f32 = 0.1
+let b: f32 = 1.0 / 3.0
+let c: f32 = if y > 0.0 then 1.5 else 2.5
+let d = if y > 0.0 then y else 0.0     # an f32
+let e: f32 = d
+let n: f32 = x as f32
+```
+
+ritz0 enforces this (`ritz0/test_f64_into_f32.py`, AGAST #3802); ritz1 still
+narrows silently until AGAST #3998.
 
 #### Implicit narrowing is an error
 

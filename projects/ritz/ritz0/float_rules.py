@@ -27,3 +27,9 @@ def mixed_float_compare(left: str, right: str) -> str:
     prints the same words."""
     return (f"cannot compare `{left}` with `{right}`: "
             f"write `as` to choose the precision")
+
+
+def f64_into_f32() -> str:
+    """A non-literal f64 into an f32 slot (§7.5 "Float narrowing", LARB R70,
+    AGAST #3802): the same words as an inexact integer."""
+    return int_into_float_inexact('f64', 'f32')
