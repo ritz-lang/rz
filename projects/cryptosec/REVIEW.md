@@ -432,6 +432,8 @@ A small-order peer public key (e.g. all zeros) forces the all-zero shared secret
 
 **Fix:** Remove `Sha384` as separate struct. Use `Sha512` as underlying context for both. Implement `sha384_final` as `sha512_final_n(ctx, out, 48)`.
 
+**Resolved (AGAST #2588):** `type Sha384 = Sha512`; one transform, `sha512_reset` (IV) and `sha512_finish(ctx, out, words)` serve both.
+
 ---
 
 #### 2. AES Block Cipher Round Body Extraction (~144 lines)
@@ -441,6 +443,8 @@ A small-order peer public key (e.g. all zeros) forces the all-zero shared secret
 `aes128_encrypt_block` and `aes256_encrypt_block` contain identical 44-line SubBytes+ShiftRows+MixColumns+AddRoundKey round bodies. Same for decrypt (~50 lines). AES-GCM 128/256 encrypt/decrypt loops are near-identical (~50 lines).
 
 **Fix:** Extract `aes_encrypt_round(state, rk)` and `aes_decrypt_round(state, rk)` helpers. Both key sizes call the same helper parameterized by round count.
+
+**Resolved for `aes.ritz` (AGAST #2588):** `aes_encrypt_rounds` / `aes_decrypt_rounds` (software) and `aes_*_rounds_ni` (AES-NI) take the round count. The AES-GCM 128/256 loops remain: AGAST #4086.
 
 ---
 
@@ -452,6 +456,8 @@ A small-order peer public key (e.g. all zeros) forces the all-zero shared secret
 
 **Fix:** Extract parameterized `hmac_generic` inner function. Three public functions become thin wrappers.
 
+**Resolved (AGAST #2588):** shared `hmac_derive_key` / `hmac_pad_block`; HMAC-SHA-384/512 are one `hmac_sha512_family` body.
+
 ---
 
 #### 4. `aes_gcm.ritz` Local `mem_*` Copies (~20 lines, security risk)
@@ -462,6 +468,8 @@ A small-order peer public key (e.g. all zeros) forces the all-zero shared secret
 
 **Fix:** Fix module resolution issue, remove local copies.
 
+**Resolved (AGAST #2588):** the copies are gone; `aes_gcm.ritz` uses `mem_copy` / `mem_eq` (mem.ritz) and ritzlib's `memzero`.
+
 ---
 
 #### 5. RSA / X509 Verification Chain (~159 lines)
@@ -471,6 +479,8 @@ A small-order peer public key (e.g. all zeros) forces the all-zero shared secret
 Three DigestInfo prefix builders (60 lines), three `rsa_verify_pkcs1_*` wrappers, and three `x509_verify_rsa_*` functions can all be unified into a single `hash_alg` dispatch.
 
 **Fix:** Single `rsa_verify_pkcs1_hash(key, hash_alg, data, sig)` with dispatch. Adding SHA-3 support currently requires 9 new functions; after refactor, only 1 case.
+
+**Resolved (AGAST #2588):** `sha2_digest_info_prefix(bits)`, `rsa_verify_pkcs1_sha2[_hash](key, bits, ...)` and one `x509_verify_rsa(cert, key, bits)`; the per-hash public functions are one-line wrappers.
 
 ---
 
@@ -549,9 +559,9 @@ Only `ca_store.ritz` performs heap allocations:
 
 6. `sha256.ritz` — Replace 64-branch `get_k()` with `const` array (~130 lines)
 7. `sha512.ritz` — Replace 80-branch `get_k512()` with `const` array (~162 lines)
-8. `sha512.ritz` — Unify SHA-384/SHA-512 struct + update + final (~125 lines)
-9. `aes.ritz` — Extract round body helpers (~94 lines)
-10. `aes_gcm.ritz` — Remove local `mem_*` copies, fix module import
+8. ~~`sha512.ritz` — Unify SHA-384/SHA-512 struct + update + final (~125 lines)~~ (#2588)
+9. ~~`aes.ritz` — Extract round body helpers (~94 lines)~~ (#2588)
+10. ~~`aes_gcm.ritz` — Remove local `mem_*` copies, fix module import~~ (#2588)
 
 ### Tier 3 — Important but larger scope
 

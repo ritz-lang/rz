@@ -876,3 +876,90 @@ fn test_aes256_gcm_decrypt_fail_wipes_computed_tag() -> i32
     aes256_encrypt_block(@ctx.aes_ctx, @j0[0], @mask[0])
     var unused: AesGcm128
     return check_fail_residue_2771(true, @unused, @ctx, @nonce[0], @ct[0], @tag[0], @mask[0])
+
+# ============================================================================
+# IVs other than 96 bits (AGAST #2588)
+# ============================================================================
+# J0 = GHASH(IV) for any IV length but 12: 60 bytes (GCM spec test case 6,
+# AES-128) and 8 bytes (AES-256), with a 20-byte AAD and a 60-byte text, so
+# the IV, AAD and text all end in a partial block. Expected: Python
+# cryptography.
+
+fn gcm_hex_nibble(c: u8) -> u8
+    if c >= 0x61
+        return c - 0x61 + 10
+    return c - 0x30
+
+fn gcm_hex(hex: *u8, out: *u8, n: i64)
+    var i: i64 = 0
+    while i < n
+        out[i] = (gcm_hex_nibble(hex[i * 2]) << 4) | gcm_hex_nibble(hex[i * 2 + 1])
+        i += 1
+
+[[test]]
+fn test_aes128_gcm_60byte_iv() -> i32
+    var key: [16]u8
+    var iv: [60]u8
+    var aad: [20]u8
+    var pt: [60]u8
+    var exp_ct: [60]u8
+    var exp_tag: [16]u8
+    gcm_hex(c"feffe9928665731c6d6a8f9467308308", @key[0], 16)
+    gcm_hex(c"9313225df88406e5a55909c5aff5269a6a7a9538534f7da1e4c303d2a318a728c3c0c95156809539fcf0e2429a6b525416aedbf5a0de6a57a637b39b", @iv[0], 60)
+    gcm_hex(c"feedfacedeadbeeffeedfacedeadbeefabaddad2", @aad[0], 20)
+    gcm_hex(c"d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", @pt[0], 60)
+    gcm_hex(c"337ebc3ee1510477ee9c146376722f10500dc2bd9fa05dadf5428b4965080501e1e1a09d1291690f871849f73a544288c1488473284acf87e534f806", @exp_ct[0], 60)
+    gcm_hex(c"cf28ab6484e1d3bc886b301756837e52", @exp_tag[0], 16)
+    var ctx: AesGcm128
+    aes128_gcm_init(@ctx, @key[0])
+    var ct: [60]u8
+    var tag: [16]u8
+    if ok_bytes(aes128_gcm_encrypt(@ctx, @iv[0], 60, @aad[0], 20, @pt[0], 60, @ct[0], @tag[0])) != 60
+        return 1
+    if bytes_equal(@ct[0], @exp_ct[0], 60) == 0
+        return 2
+    if bytes_equal(@tag[0], @exp_tag[0], 16) == 0
+        return 3
+    var back: [60]u8
+    if ok_bytes(aes128_gcm_decrypt(@ctx, @iv[0], 60, @aad[0], 20, @ct[0], 60, @tag[0], @back[0])) != 60
+        return 4
+    if bytes_equal(@back[0], @pt[0], 60) == 0
+        return 5
+    iv[59] = iv[59] ^ 0x01
+    if !is_auth_failed(aes128_gcm_decrypt(@ctx, @iv[0], 60, @aad[0], 20, @ct[0], 60, @tag[0], @back[0]))
+        return 6
+    return 0
+
+[[test]]
+fn test_aes256_gcm_8byte_iv() -> i32
+    var key: [32]u8
+    var iv: [8]u8
+    var aad: [20]u8
+    var pt: [60]u8
+    var exp_ct: [60]u8
+    var exp_tag: [16]u8
+    gcm_hex(c"feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308", @key[0], 32)
+    gcm_hex(c"cafebabefacedbad", @iv[0], 8)
+    gcm_hex(c"feedfacedeadbeeffeedfacedeadbeefabaddad2", @aad[0], 20)
+    gcm_hex(c"d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39", @pt[0], 60)
+    gcm_hex(c"c3762df1ca787d32ae47c13bf19844cbaf1ae14d0b976afac52ff7d79bba9de0feb582d33934a4f0954cc2363bc73f7862ac430e64abe499f47c9b1f", @exp_ct[0], 60)
+    gcm_hex(c"3a337dbf46a792c45e454913fe2ea8f2", @exp_tag[0], 16)
+    var ctx: AesGcm256
+    aes256_gcm_init(@ctx, @key[0])
+    var ct: [60]u8
+    var tag: [16]u8
+    if ok_bytes(aes256_gcm_encrypt(@ctx, @iv[0], 8, @aad[0], 20, @pt[0], 60, @ct[0], @tag[0])) != 60
+        return 1
+    if bytes_equal(@ct[0], @exp_ct[0], 60) == 0
+        return 2
+    if bytes_equal(@tag[0], @exp_tag[0], 16) == 0
+        return 3
+    var back: [60]u8
+    if ok_bytes(aes256_gcm_decrypt(@ctx, @iv[0], 8, @aad[0], 20, @ct[0], 60, @tag[0], @back[0])) != 60
+        return 4
+    if bytes_equal(@back[0], @pt[0], 60) == 0
+        return 5
+    tag[15] = tag[15] ^ 0x80
+    if !is_auth_failed(aes256_gcm_decrypt(@ctx, @iv[0], 8, @aad[0], 20, @ct[0], 60, @tag[0], @back[0]))
+        return 6
+    return 0

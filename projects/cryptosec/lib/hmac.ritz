@@ -30,6 +30,41 @@ const HMAC_SHA512_DIGEST_SIZE: u64 = 64
 const HMAC_SHA384_DIGEST_SIZE: u64 = 48
 
 # ============================================================================
+# Shared key schedule
+# ============================================================================
+
+# K' = H(K) if len(K) > block_size, else K; zero-padded to block_size.
+# `bits` (256, 384 or 512) picks H.
+fn hmac_derive_key(bits: i32, key: *u8, key_len: u64, block_size: u64, k_prime: *u8)
+    # Zero the key buffer
+    var i: u64 = 0
+    while i < block_size
+        k_prime[i] = 0
+        i += 1
+
+    # If key is longer than block size, hash it first; the rest stays zero
+    if key_len > block_size
+        if bits == 256
+            sha256(key, key_len, k_prime)
+        else if bits == 384
+            sha384(key, key_len, k_prime)
+        else
+            sha512(key, key_len, k_prime)
+    else
+        # Copy key to k_prime, padding with zeros
+        i = 0
+        while i < key_len
+            k_prime[i] = key[i]
+            i += 1
+
+# out[i] = k_prime[i] ^ pad for i < block_size (pad: ipad 0x36 or opad 0x5c)
+fn hmac_pad_block(k_prime: *u8, pad: u8, block_size: u64, out: *u8)
+    var i: u64 = 0
+    while i < block_size
+        out[i] = k_prime[i] ^ pad
+        i += 1
+
+# ============================================================================
 # HMAC-SHA-256
 # ============================================================================
 
@@ -42,59 +77,25 @@ const HMAC_SHA384_DIGEST_SIZE: u64 = 48
 pub fn hmac_sha256(key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
     # Derived key (K')
     var k_prime: [64]u8
-
-    # Zero the key buffer
-    var i: u64 = 0
-    while i < 64
-        k_prime[i] = 0
-        i += 1
-
-    # If key is longer than block size, hash it first
-    if key_len > 64
-        sha256(key, key_len, @k_prime[0])
-        # k_prime[0..31] now contains H(key), rest is zeros
-    else
-        # Copy key to k_prime, padding with zeros
-        i = 0
-        while i < key_len
-            k_prime[i] = key[i]
-            i += 1
+    hmac_derive_key(256, key, key_len, HMAC_SHA256_BLOCK_SIZE, @k_prime[0])
 
     # Compute inner hash: H((K' XOR ipad) || message)
     var inner_ctx: Sha256
     sha256_init(@inner_ctx)
-
-    # XOR K' with ipad (0x36) and feed to hash
     var ipad_block: [64]u8
-    i = 0
-    while i < 64
-        ipad_block[i] = k_prime[i] ^ 0x36
-        i += 1
-    sha256_update(@inner_ctx, @ipad_block[0], 64)
-
-    # Feed message
+    hmac_pad_block(@k_prime[0], 0x36, HMAC_SHA256_BLOCK_SIZE, @ipad_block[0])
+    sha256_update(@inner_ctx, @ipad_block[0], HMAC_SHA256_BLOCK_SIZE)
     sha256_update(@inner_ctx, data, data_len)
-
-    # Finalize inner hash
     var inner_hash: [32]u8
     sha256_final(@inner_ctx, @inner_hash[0])
 
     # Compute outer hash: H((K' XOR opad) || inner_hash)
     var outer_ctx: Sha256
     sha256_init(@outer_ctx)
-
-    # XOR K' with opad (0x5c) and feed to hash
     var opad_block: [64]u8
-    i = 0
-    while i < 64
-        opad_block[i] = k_prime[i] ^ 0x5c
-        i += 1
-    sha256_update(@outer_ctx, @opad_block[0], 64)
-
-    # Feed inner hash
-    sha256_update(@outer_ctx, @inner_hash[0], 32)
-
-    # Finalize outer hash -> output
+    hmac_pad_block(@k_prime[0], 0x5c, HMAC_SHA256_BLOCK_SIZE, @opad_block[0])
+    sha256_update(@outer_ctx, @opad_block[0], HMAC_SHA256_BLOCK_SIZE)
+    sha256_update(@outer_ctx, @inner_hash[0], HMAC_SHA256_DIGEST_SIZE)
     sha256_final(@outer_ctx, out)
 
     # Zero sensitive data
@@ -104,152 +105,64 @@ pub fn hmac_sha256(key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
     secure_zero(@inner_hash[0], sizeof(inner_hash))
 
 # ============================================================================
-# HMAC-SHA-512
+# HMAC-SHA-512 / HMAC-SHA-384
 # ============================================================================
 
-# Compute HMAC-SHA-512
-# key: pointer to key bytes
-# key_len: length of key in bytes
-# data: pointer to message bytes
-# data_len: length of message in bytes
-# out: pointer to 64-byte output buffer
-pub fn hmac_sha512(key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
-    # Derived key (K') - 128 bytes for SHA-512
+# SHA-384 and SHA-512 share a 128-byte block and one context type
+# (Sha384 = Sha512); `bits` (384 or 512) picks the IV and digest length.
+fn hmac_sha512_family(bits: i32, key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
+    var digest_size: u64 = HMAC_SHA512_DIGEST_SIZE
+    if bits == 384
+        digest_size = HMAC_SHA384_DIGEST_SIZE
+
+    # Derived key (K') - 128 bytes
     var k_prime: [128]u8
-
-    # Zero the key buffer
-    var i: u64 = 0
-    while i < 128
-        k_prime[i] = 0
-        i += 1
-
-    # If key is longer than block size, hash it first
-    if key_len > 128
-        sha512(key, key_len, @k_prime[0])
-        # k_prime[0..63] now contains H(key), rest is zeros
-    else
-        # Copy key to k_prime, padding with zeros
-        i = 0
-        while i < key_len
-            k_prime[i] = key[i]
-            i += 1
+    hmac_derive_key(bits, key, key_len, HMAC_SHA512_BLOCK_SIZE, @k_prime[0])
 
     # Compute inner hash: H((K' XOR ipad) || message)
     var inner_ctx: Sha512
-    sha512_init(@inner_ctx)
-
-    # XOR K' with ipad (0x36) and feed to hash
+    if bits == 384
+        sha384_init(@inner_ctx)
+    else
+        sha512_init(@inner_ctx)
     var ipad_block: [128]u8
-    i = 0
-    while i < 128
-        ipad_block[i] = k_prime[i] ^ 0x36
-        i += 1
-    sha512_update(@inner_ctx, @ipad_block[0], 128)
-
-    # Feed message
+    hmac_pad_block(@k_prime[0], 0x36, HMAC_SHA512_BLOCK_SIZE, @ipad_block[0])
+    sha512_update(@inner_ctx, @ipad_block[0], HMAC_SHA512_BLOCK_SIZE)
     sha512_update(@inner_ctx, data, data_len)
-
-    # Finalize inner hash
     var inner_hash: [64]u8
-    sha512_final(@inner_ctx, @inner_hash[0])
+    if bits == 384
+        sha384_final(@inner_ctx, @inner_hash[0])
+    else
+        sha512_final(@inner_ctx, @inner_hash[0])
 
     # Compute outer hash: H((K' XOR opad) || inner_hash)
     var outer_ctx: Sha512
-    sha512_init(@outer_ctx)
-
-    # XOR K' with opad (0x5c) and feed to hash
-    var opad_block: [128]u8
-    i = 0
-    while i < 128
-        opad_block[i] = k_prime[i] ^ 0x5c
-        i += 1
-    sha512_update(@outer_ctx, @opad_block[0], 128)
-
-    # Feed inner hash
-    sha512_update(@outer_ctx, @inner_hash[0], 64)
-
-    # Finalize outer hash -> output
-    sha512_final(@outer_ctx, out)
-
-    # Zero sensitive data
-    secure_zero(@k_prime[0], sizeof(k_prime))
-    secure_zero(@ipad_block[0], sizeof(ipad_block))
-    secure_zero(@opad_block[0], sizeof(opad_block))
-    secure_zero(@inner_hash[0], sizeof(inner_hash))
-
-# ============================================================================
-# HMAC-SHA-384
-# ============================================================================
-
-# Compute HMAC-SHA-384
-# key: pointer to key bytes
-# key_len: length of key in bytes
-# data: pointer to message bytes
-# data_len: length of message in bytes
-# out: pointer to 48-byte output buffer
-pub fn hmac_sha384(key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
-    # Derived key (K') - 128 bytes for SHA-384 (same as SHA-512)
-    var k_prime: [128]u8
-
-    # Zero the key buffer
-    var i: u64 = 0
-    while i < 128
-        k_prime[i] = 0
-        i += 1
-
-    # If key is longer than block size, hash it first
-    if key_len > 128
-        sha384(key, key_len, @k_prime[0])
-        # k_prime[0..47] now contains H(key), rest is zeros
+    if bits == 384
+        sha384_init(@outer_ctx)
     else
-        # Copy key to k_prime, padding with zeros
-        i = 0
-        while i < key_len
-            k_prime[i] = key[i]
-            i += 1
-
-    # Compute inner hash: H((K' XOR ipad) || message)
-    var inner_ctx: Sha384
-    sha384_init(@inner_ctx)
-
-    # XOR K' with ipad (0x36) and feed to hash
-    var ipad_block: [128]u8
-    i = 0
-    while i < 128
-        ipad_block[i] = k_prime[i] ^ 0x36
-        i += 1
-    sha384_update(@inner_ctx, @ipad_block[0], 128)
-
-    # Feed message
-    sha384_update(@inner_ctx, data, data_len)
-
-    # Finalize inner hash
-    var inner_hash: [48]u8
-    sha384_final(@inner_ctx, @inner_hash[0])
-
-    # Compute outer hash: H((K' XOR opad) || inner_hash)
-    var outer_ctx: Sha384
-    sha384_init(@outer_ctx)
-
-    # XOR K' with opad (0x5c) and feed to hash
+        sha512_init(@outer_ctx)
     var opad_block: [128]u8
-    i = 0
-    while i < 128
-        opad_block[i] = k_prime[i] ^ 0x5c
-        i += 1
-    sha384_update(@outer_ctx, @opad_block[0], 128)
-
-    # Feed inner hash
-    sha384_update(@outer_ctx, @inner_hash[0], 48)
-
-    # Finalize outer hash -> output
-    sha384_final(@outer_ctx, out)
+    hmac_pad_block(@k_prime[0], 0x5c, HMAC_SHA512_BLOCK_SIZE, @opad_block[0])
+    sha512_update(@outer_ctx, @opad_block[0], HMAC_SHA512_BLOCK_SIZE)
+    sha512_update(@outer_ctx, @inner_hash[0], digest_size)
+    if bits == 384
+        sha384_final(@outer_ctx, out)
+    else
+        sha512_final(@outer_ctx, out)
 
     # Zero sensitive data
     secure_zero(@k_prime[0], sizeof(k_prime))
     secure_zero(@ipad_block[0], sizeof(ipad_block))
     secure_zero(@opad_block[0], sizeof(opad_block))
     secure_zero(@inner_hash[0], sizeof(inner_hash))
+
+# Compute HMAC-SHA-512 (out: 64 bytes)
+pub fn hmac_sha512(key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
+    hmac_sha512_family(512, key, key_len, data, data_len, out)
+
+# Compute HMAC-SHA-384 (out: 48 bytes)
+pub fn hmac_sha384(key: *u8, key_len: u64, data: *u8, data_len: u64, out: *u8)
+    hmac_sha512_family(384, key, key_len, data, data_len, out)
 
 # ============================================================================
 # Idiomatic StrView API

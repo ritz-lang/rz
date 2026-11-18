@@ -273,22 +273,30 @@ fn rsa_verify_pkcs1(key: *RsaPublicKey, hash: *u8, hash_len: i32, hash_oid_prefi
     return 1  # Signature valid
 
 # ============================================================================
-# SHA-256 Signature Verification
+# PKCS#1 v1.5 with SHA-256 / SHA-384 / SHA-512
 # ============================================================================
 
-# DigestInfo for SHA-256:
+# DigestInfo for SHA-2 hash `bits` (256, 384 or 512):
 # SEQUENCE {
 #   SEQUENCE {
-#     OID 2.16.840.1.101.3.4.2.1 (sha256)
+#     OID 2.16.840.1.101.3.4.2.{1,2,3} (sha256, sha384, sha512)
 #     NULL
 #   }
-#   OCTET STRING (32 bytes hash)
+#   OCTET STRING (hash_len bytes)
 # }
-# DER: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20
-
-pub fn get_sha256_digest_info_prefix(out: *u8) -> i32
+# DER: 30 <0x11 + hash_len> 30 0d 06 09 60 86 48 01 65 03 04 02 <oid> 05 00 04 <hash_len>
+# Writes the 19-byte prefix to out and returns its length.
+fn sha2_digest_info_prefix(bits: i32, out: *u8) -> i32
+    var hash_len: u8 = 32
+    var oid: u8 = 0x01
+    if bits == 384
+        hash_len = 48
+        oid = 0x02
+    else if bits == 512
+        hash_len = 64
+        oid = 0x03
     out[0] = 0x30
-    out[1] = 0x31
+    out[1] = 0x11 + hash_len
     out[2] = 0x30
     out[3] = 0x0d
     out[4] = 0x06
@@ -301,117 +309,60 @@ pub fn get_sha256_digest_info_prefix(out: *u8) -> i32
     out[11] = 0x03
     out[12] = 0x04
     out[13] = 0x02
-    out[14] = 0x01
+    out[14] = oid
     out[15] = 0x05
     out[16] = 0x00
     out[17] = 0x04
-    out[18] = 0x20
+    out[18] = hash_len
     return 19
 
-# Verify RSA-SHA256 signature (PKCS#1 v1.5)
-# Returns 1 if valid, 0 if invalid
-pub fn rsa_verify_pkcs1_sha256(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
-    # Hash the message
-    var hash: [32]u8
-    sha256(msg, msg_len, @hash[0])
+pub fn get_sha256_digest_info_prefix(out: *u8) -> i32
+    return sha2_digest_info_prefix(256, out)
 
-    # Get DigestInfo prefix
+pub fn get_sha384_digest_info_prefix(out: *u8) -> i32
+    return sha2_digest_info_prefix(384, out)
+
+pub fn get_sha512_digest_info_prefix(out: *u8) -> i32
+    return sha2_digest_info_prefix(512, out)
+
+# Verify a PKCS#1 v1.5 signature over a pre-computed SHA-2 `bits` hash.
+# Returns 1 if valid, 0 if invalid.
+pub fn rsa_verify_pkcs1_sha2_hash(key: *RsaPublicKey, bits: i32, hash: *u8, sig: *u8, sig_len: i32) -> i32
     var prefix: [19]u8
-    let prefix_len: i32 = get_sha256_digest_info_prefix(@prefix[0])
+    let prefix_len: i32 = sha2_digest_info_prefix(bits, @prefix[0])
+    return rsa_verify_pkcs1(key, hash, bits / 8, @prefix[0], prefix_len, sig, sig_len)
 
-    return rsa_verify_pkcs1(key, @hash[0], 32, @prefix[0], prefix_len, sig, sig_len)
+# Verify a PKCS#1 v1.5 SHA-2 `bits` signature over a message.
+# Returns 1 if valid, 0 if invalid.
+pub fn rsa_verify_pkcs1_sha2(key: *RsaPublicKey, bits: i32, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
+    var hash: [64]u8
+    if bits == 256
+        sha256(msg, msg_len, @hash[0])
+    else if bits == 384
+        sha384(msg, msg_len, @hash[0])
+    else
+        sha512(msg, msg_len, @hash[0])
+    return rsa_verify_pkcs1_sha2_hash(key, bits, @hash[0], sig, sig_len)
+
+# Verify RSA-SHA256 signature (PKCS#1 v1.5)
+pub fn rsa_verify_pkcs1_sha256(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
+    return rsa_verify_pkcs1_sha2(key, 256, msg, msg_len, sig, sig_len)
 
 # Verify RSA-SHA256 signature with pre-computed hash
 pub fn rsa_verify_pkcs1_sha256_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig_len: i32) -> i32
-    var prefix: [19]u8
-    let prefix_len: i32 = get_sha256_digest_info_prefix(@prefix[0])
-    return rsa_verify_pkcs1(key, hash, 32, @prefix[0], prefix_len, sig, sig_len)
-
-# ============================================================================
-# SHA-384 Signature Verification
-# ============================================================================
-
-# DigestInfo for SHA-384:
-# DER: 30 41 30 0d 06 09 60 86 48 01 65 03 04 02 02 05 00 04 30
-
-pub fn get_sha384_digest_info_prefix(out: *u8) -> i32
-    out[0] = 0x30
-    out[1] = 0x41
-    out[2] = 0x30
-    out[3] = 0x0d
-    out[4] = 0x06
-    out[5] = 0x09
-    out[6] = 0x60
-    out[7] = 0x86
-    out[8] = 0x48
-    out[9] = 0x01
-    out[10] = 0x65
-    out[11] = 0x03
-    out[12] = 0x04
-    out[13] = 0x02
-    out[14] = 0x02
-    out[15] = 0x05
-    out[16] = 0x00
-    out[17] = 0x04
-    out[18] = 0x30
-    return 19
+    return rsa_verify_pkcs1_sha2_hash(key, 256, hash, sig, sig_len)
 
 pub fn rsa_verify_pkcs1_sha384(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
-    var hash: [48]u8
-    sha384(msg, msg_len, @hash[0])
-
-    var prefix: [19]u8
-    let prefix_len: i32 = get_sha384_digest_info_prefix(@prefix[0])
-
-    return rsa_verify_pkcs1(key, @hash[0], 48, @prefix[0], prefix_len, sig, sig_len)
+    return rsa_verify_pkcs1_sha2(key, 384, msg, msg_len, sig, sig_len)
 
 pub fn rsa_verify_pkcs1_sha384_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig_len: i32) -> i32
-    var prefix: [19]u8
-    let prefix_len: i32 = get_sha384_digest_info_prefix(@prefix[0])
-    return rsa_verify_pkcs1(key, hash, 48, @prefix[0], prefix_len, sig, sig_len)
-
-# ============================================================================
-# SHA-512 Signature Verification
-# ============================================================================
-
-# DigestInfo for SHA-512:
-# DER: 30 51 30 0d 06 09 60 86 48 01 65 03 04 02 03 05 00 04 40
-
-pub fn get_sha512_digest_info_prefix(out: *u8) -> i32
-    out[0] = 0x30
-    out[1] = 0x51
-    out[2] = 0x30
-    out[3] = 0x0d
-    out[4] = 0x06
-    out[5] = 0x09
-    out[6] = 0x60
-    out[7] = 0x86
-    out[8] = 0x48
-    out[9] = 0x01
-    out[10] = 0x65
-    out[11] = 0x03
-    out[12] = 0x04
-    out[13] = 0x02
-    out[14] = 0x03
-    out[15] = 0x05
-    out[16] = 0x00
-    out[17] = 0x04
-    out[18] = 0x40
-    return 19
+    return rsa_verify_pkcs1_sha2_hash(key, 384, hash, sig, sig_len)
 
 pub fn rsa_verify_pkcs1_sha512(key: *RsaPublicKey, msg: *u8, msg_len: i64, sig: *u8, sig_len: i32) -> i32
-    var hash: [64]u8
-    sha512(msg, msg_len, @hash[0])
-
-    var prefix: [19]u8
-    let prefix_len: i32 = get_sha512_digest_info_prefix(@prefix[0])
-
-    return rsa_verify_pkcs1(key, @hash[0], 64, @prefix[0], prefix_len, sig, sig_len)
+    return rsa_verify_pkcs1_sha2(key, 512, msg, msg_len, sig, sig_len)
 
 pub fn rsa_verify_pkcs1_sha512_hash(key: *RsaPublicKey, hash: *u8, sig: *u8, sig_len: i32) -> i32
-    var prefix: [19]u8
-    let prefix_len: i32 = get_sha512_digest_info_prefix(@prefix[0])
-    return rsa_verify_pkcs1(key, hash, 64, @prefix[0], prefix_len, sig, sig_len)
+    return rsa_verify_pkcs1_sha2_hash(key, 512, hash, sig, sig_len)
 
 # ============================================================================
 # RSASSA-PSS Signature Verification (RFC 8017 §8.1.2, §9.1.2)

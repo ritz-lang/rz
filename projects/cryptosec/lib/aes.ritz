@@ -178,20 +178,10 @@ pub fn aes128_init(ctx: *Aes128, key: *u8) -> void
         curr[3] = prev[3] ^ temp3
 
         # Remaining 3 words
-        curr[4] = prev[4] ^ curr[0]
-        curr[5] = prev[5] ^ curr[1]
-        curr[6] = prev[6] ^ curr[2]
-        curr[7] = prev[7] ^ curr[3]
-
-        curr[8] = prev[8] ^ curr[4]
-        curr[9] = prev[9] ^ curr[5]
-        curr[10] = prev[10] ^ curr[6]
-        curr[11] = prev[11] ^ curr[7]
-
-        curr[12] = prev[12] ^ curr[8]
-        curr[13] = prev[13] ^ curr[9]
-        curr[14] = prev[14] ^ curr[10]
-        curr[15] = prev[15] ^ curr[11]
+        var j: i32 = 4
+        while j < 16
+            curr[j] = prev[j] ^ curr[j - 4]
+            j += 1
 
         i += 1
 
@@ -218,20 +208,11 @@ pub fn aes256_init(ctx: *Aes256, key: *u8) -> void
         curr[2] = prev[2] ^ temp2
         curr[3] = prev[3] ^ temp3
 
-        curr[4] = prev[4] ^ curr[0]
-        curr[5] = prev[5] ^ curr[1]
-        curr[6] = prev[6] ^ curr[2]
-        curr[7] = prev[7] ^ curr[3]
-
-        curr[8] = prev[8] ^ curr[4]
-        curr[9] = prev[9] ^ curr[5]
-        curr[10] = prev[10] ^ curr[6]
-        curr[11] = prev[11] ^ curr[7]
-
-        curr[12] = prev[12] ^ curr[8]
-        curr[13] = prev[13] ^ curr[9]
-        curr[14] = prev[14] ^ curr[10]
-        curr[15] = prev[15] ^ curr[11]
+        # Remaining 3 words
+        var j: i32 = 4
+        while j < 16
+            curr[j] = prev[j] ^ curr[j - 4]
+            j += 1
 
         # Second 4 words: SubWord only (no rotation)
         if i < 7
@@ -245,20 +226,11 @@ pub fn aes256_init(ctx: *Aes256, key: *u8) -> void
             curr[18] = prev[18] ^ sub2
             curr[19] = prev[19] ^ sub3
 
-            curr[20] = prev[20] ^ curr[16]
-            curr[21] = prev[21] ^ curr[17]
-            curr[22] = prev[22] ^ curr[18]
-            curr[23] = prev[23] ^ curr[19]
-
-            curr[24] = prev[24] ^ curr[20]
-            curr[25] = prev[25] ^ curr[21]
-            curr[26] = prev[26] ^ curr[22]
-            curr[27] = prev[27] ^ curr[23]
-
-            curr[28] = prev[28] ^ curr[24]
-            curr[29] = prev[29] ^ curr[25]
-            curr[30] = prev[30] ^ curr[26]
-            curr[31] = prev[31] ^ curr[27]
+            # Remaining 3 words of the second half
+            j = 20
+            while j < 32
+                curr[j] = prev[j] ^ curr[j - 4]
+                j += 1
 
         i += 1
 
@@ -291,609 +263,159 @@ fn inv_mix_column(s0: u8, s1: u8, s2: u8, s3: u8, out: *u8) -> void
     out[3] = gf_mul(0x0b, s0) ^ gf_mul(0x0d, s1) ^ gf_mul(0x09, s2) ^ gf_mul(0x0e, s3)
 
 # ============================================================================
-# AES Encryption (Single Block)
+# AES Encryption / Decryption (Single Block)
 # ============================================================================
+# One body for every key size: rk holds nr + 1 16-byte round keys (AES-128:
+# nr = 10, AES-256: nr = 14).
+
+# SubBytes + ShiftRows: out[i] = sbox(state[SHIFT_ROWS[i]])
+const SHIFT_ROWS: [16]u8 = [0, 5, 10, 15, 4, 9, 14, 3, 8, 13, 2, 7, 12, 1, 6, 11]
+
+# InvShiftRows + InvSubBytes: out[i] = inv_sbox(state[INV_SHIFT_ROWS[i]])
+const INV_SHIFT_ROWS: [16]u8 = [0, 13, 10, 7, 4, 1, 14, 11, 8, 5, 2, 15, 12, 9, 6, 3]
+
+fn aes_encrypt_rounds(rk: *u8, nr: i32, input: *u8, output: *u8) -> void
+    var state: [16]u8
+    var temp: [16]u8
+
+    # Initial AddRoundKey
+    var i: i32 = 0
+    while i < 16
+        state[i] = input[i] ^ rk[i]
+        i += 1
+
+    # nr - 1 main rounds
+    var round: i32 = 1
+    while round < nr
+        let rki: *u8 = rk + (round * 16)
+
+        # SubBytes + ShiftRows into temp
+        i = 0
+        while i < 16
+            temp[i] = sbox(state[SHIFT_ROWS[i] as i64])
+            i += 1
+
+        # MixColumns + AddRoundKey, one column at a time
+        var mcol: [4]u8
+        var c: i32 = 0
+        while c < 16
+            mix_column(temp[c], temp[c + 1], temp[c + 2], temp[c + 3], @mcol[0])
+            state[c] = mcol[0] ^ rki[c]
+            state[c + 1] = mcol[1] ^ rki[c + 1]
+            state[c + 2] = mcol[2] ^ rki[c + 2]
+            state[c + 3] = mcol[3] ^ rki[c + 3]
+            c += 4
+
+        round += 1
+
+    # Final round (no MixColumns)
+    let final_rk: *u8 = rk + (nr * 16)
+    i = 0
+    while i < 16
+        output[i] = sbox(state[SHIFT_ROWS[i] as i64]) ^ final_rk[i]
+        i += 1
+
+fn aes_decrypt_rounds(rk: *u8, nr: i32, input: *u8, output: *u8) -> void
+    var state: [16]u8
+    var temp: [16]u8
+
+    # Initial AddRoundKey with last round key
+    var i: i32 = 0
+    while i < 16
+        state[i] = input[i] ^ rk[nr * 16 + i]
+        i += 1
+
+    # nr - 1 main rounds (in reverse)
+    var round: i32 = nr - 1
+    while round >= 1
+        let rki: *u8 = rk + (round * 16)
+
+        # InvShiftRows + InvSubBytes, then AddRoundKey, into temp
+        i = 0
+        while i < 16
+            temp[i] = inv_sbox(state[INV_SHIFT_ROWS[i] as i64]) ^ rki[i]
+            i += 1
+
+        # InvMixColumns, one column at a time
+        var imcol: [4]u8
+        var c: i32 = 0
+        while c < 16
+            inv_mix_column(temp[c], temp[c + 1], temp[c + 2], temp[c + 3], @imcol[0])
+            state[c] = imcol[0]
+            state[c + 1] = imcol[1]
+            state[c + 2] = imcol[2]
+            state[c + 3] = imcol[3]
+            c += 4
+
+        round -= 1
+
+    # Final round (no InvMixColumns)
+    i = 0
+    while i < 16
+        output[i] = inv_sbox(state[INV_SHIFT_ROWS[i] as i64]) ^ rk[i]
+        i += 1
 
 pub fn aes128_encrypt_block(ctx: *Aes128, input: *u8, output: *u8) -> void
-    var state: [16]u8
-    var temp: [16]u8
-    let rk: *u8 = @ctx.round_keys[0]
-
-    # Initial AddRoundKey
-    var i: i32 = 0
-    while i < 16
-        state[i] = input[i] ^ rk[i]
-        i += 1
-
-    # 9 main rounds
-    var round: i32 = 1
-    while round <= 9
-        let rki: *u8 = rk + (round * 16)
-
-        # SubBytes + ShiftRows into temp
-        temp[0] = sbox(state[0])
-        temp[1] = sbox(state[5])
-        temp[2] = sbox(state[10])
-        temp[3] = sbox(state[15])
-
-        temp[4] = sbox(state[4])
-        temp[5] = sbox(state[9])
-        temp[6] = sbox(state[14])
-        temp[7] = sbox(state[3])
-
-        temp[8] = sbox(state[8])
-        temp[9] = sbox(state[13])
-        temp[10] = sbox(state[2])
-        temp[11] = sbox(state[7])
-
-        temp[12] = sbox(state[12])
-        temp[13] = sbox(state[1])
-        temp[14] = sbox(state[6])
-        temp[15] = sbox(state[11])
-
-        # MixColumns + AddRoundKey
-        var mcol: [4]u8
-        mix_column(temp[0], temp[1], temp[2], temp[3], @mcol[0])
-        state[0] = mcol[0] ^ rki[0]
-        state[1] = mcol[1] ^ rki[1]
-        state[2] = mcol[2] ^ rki[2]
-        state[3] = mcol[3] ^ rki[3]
-
-        mix_column(temp[4], temp[5], temp[6], temp[7], @mcol[0])
-        state[4] = mcol[0] ^ rki[4]
-        state[5] = mcol[1] ^ rki[5]
-        state[6] = mcol[2] ^ rki[6]
-        state[7] = mcol[3] ^ rki[7]
-
-        mix_column(temp[8], temp[9], temp[10], temp[11], @mcol[0])
-        state[8] = mcol[0] ^ rki[8]
-        state[9] = mcol[1] ^ rki[9]
-        state[10] = mcol[2] ^ rki[10]
-        state[11] = mcol[3] ^ rki[11]
-
-        mix_column(temp[12], temp[13], temp[14], temp[15], @mcol[0])
-        state[12] = mcol[0] ^ rki[12]
-        state[13] = mcol[1] ^ rki[13]
-        state[14] = mcol[2] ^ rki[14]
-        state[15] = mcol[3] ^ rki[15]
-
-        round += 1
-
-    # Final round (no MixColumns)
-    let final_rk: *u8 = rk + 160
-
-    output[0] = sbox(state[0]) ^ final_rk[0]
-    output[1] = sbox(state[5]) ^ final_rk[1]
-    output[2] = sbox(state[10]) ^ final_rk[2]
-    output[3] = sbox(state[15]) ^ final_rk[3]
-
-    output[4] = sbox(state[4]) ^ final_rk[4]
-    output[5] = sbox(state[9]) ^ final_rk[5]
-    output[6] = sbox(state[14]) ^ final_rk[6]
-    output[7] = sbox(state[3]) ^ final_rk[7]
-
-    output[8] = sbox(state[8]) ^ final_rk[8]
-    output[9] = sbox(state[13]) ^ final_rk[9]
-    output[10] = sbox(state[2]) ^ final_rk[10]
-    output[11] = sbox(state[7]) ^ final_rk[11]
-
-    output[12] = sbox(state[12]) ^ final_rk[12]
-    output[13] = sbox(state[1]) ^ final_rk[13]
-    output[14] = sbox(state[6]) ^ final_rk[14]
-    output[15] = sbox(state[11]) ^ final_rk[15]
+    aes_encrypt_rounds(@ctx.round_keys[0], 10, input, output)
 
 pub fn aes256_encrypt_block(ctx: *Aes256, input: *u8, output: *u8) -> void
-    var state: [16]u8
-    var temp: [16]u8
-    let rk: *u8 = @ctx.round_keys[0]
-
-    # Initial AddRoundKey
-    var i: i32 = 0
-    while i < 16
-        state[i] = input[i] ^ rk[i]
-        i += 1
-
-    # 13 main rounds
-    var round: i32 = 1
-    while round <= 13
-        let rki: *u8 = rk + (round * 16)
-
-        # SubBytes + ShiftRows into temp
-        temp[0] = sbox(state[0])
-        temp[1] = sbox(state[5])
-        temp[2] = sbox(state[10])
-        temp[3] = sbox(state[15])
-
-        temp[4] = sbox(state[4])
-        temp[5] = sbox(state[9])
-        temp[6] = sbox(state[14])
-        temp[7] = sbox(state[3])
-
-        temp[8] = sbox(state[8])
-        temp[9] = sbox(state[13])
-        temp[10] = sbox(state[2])
-        temp[11] = sbox(state[7])
-
-        temp[12] = sbox(state[12])
-        temp[13] = sbox(state[1])
-        temp[14] = sbox(state[6])
-        temp[15] = sbox(state[11])
-
-        # MixColumns + AddRoundKey
-        var mcol: [4]u8
-        mix_column(temp[0], temp[1], temp[2], temp[3], @mcol[0])
-        state[0] = mcol[0] ^ rki[0]
-        state[1] = mcol[1] ^ rki[1]
-        state[2] = mcol[2] ^ rki[2]
-        state[3] = mcol[3] ^ rki[3]
-
-        mix_column(temp[4], temp[5], temp[6], temp[7], @mcol[0])
-        state[4] = mcol[0] ^ rki[4]
-        state[5] = mcol[1] ^ rki[5]
-        state[6] = mcol[2] ^ rki[6]
-        state[7] = mcol[3] ^ rki[7]
-
-        mix_column(temp[8], temp[9], temp[10], temp[11], @mcol[0])
-        state[8] = mcol[0] ^ rki[8]
-        state[9] = mcol[1] ^ rki[9]
-        state[10] = mcol[2] ^ rki[10]
-        state[11] = mcol[3] ^ rki[11]
-
-        mix_column(temp[12], temp[13], temp[14], temp[15], @mcol[0])
-        state[12] = mcol[0] ^ rki[12]
-        state[13] = mcol[1] ^ rki[13]
-        state[14] = mcol[2] ^ rki[14]
-        state[15] = mcol[3] ^ rki[15]
-
-        round += 1
-
-    # Final round (no MixColumns)
-    let final_rk: *u8 = rk + 224
-
-    output[0] = sbox(state[0]) ^ final_rk[0]
-    output[1] = sbox(state[5]) ^ final_rk[1]
-    output[2] = sbox(state[10]) ^ final_rk[2]
-    output[3] = sbox(state[15]) ^ final_rk[3]
-
-    output[4] = sbox(state[4]) ^ final_rk[4]
-    output[5] = sbox(state[9]) ^ final_rk[5]
-    output[6] = sbox(state[14]) ^ final_rk[6]
-    output[7] = sbox(state[3]) ^ final_rk[7]
-
-    output[8] = sbox(state[8]) ^ final_rk[8]
-    output[9] = sbox(state[13]) ^ final_rk[9]
-    output[10] = sbox(state[2]) ^ final_rk[10]
-    output[11] = sbox(state[7]) ^ final_rk[11]
-
-    output[12] = sbox(state[12]) ^ final_rk[12]
-    output[13] = sbox(state[1]) ^ final_rk[13]
-    output[14] = sbox(state[6]) ^ final_rk[14]
-    output[15] = sbox(state[11]) ^ final_rk[15]
-
-# ============================================================================
-# AES Decryption (Single Block)
-# ============================================================================
+    aes_encrypt_rounds(@ctx.round_keys[0], 14, input, output)
 
 pub fn aes128_decrypt_block(ctx: *Aes128, input: *u8, output: *u8) -> void
-    var state: [16]u8
-    var temp: [16]u8
-    let rk: *u8 = @ctx.round_keys[0]
-
-    # Initial AddRoundKey with last round key
-    var i: i32 = 0
-    while i < 16
-        state[i] = input[i] ^ rk[160 + i]
-        i += 1
-
-    # 9 main rounds (in reverse)
-    var round: i32 = 9
-    while round >= 1
-        let rki: *u8 = rk + (round * 16)
-
-        # InvShiftRows + InvSubBytes into temp
-        temp[0] = inv_sbox(state[0])
-        temp[1] = inv_sbox(state[13])
-        temp[2] = inv_sbox(state[10])
-        temp[3] = inv_sbox(state[7])
-
-        temp[4] = inv_sbox(state[4])
-        temp[5] = inv_sbox(state[1])
-        temp[6] = inv_sbox(state[14])
-        temp[7] = inv_sbox(state[11])
-
-        temp[8] = inv_sbox(state[8])
-        temp[9] = inv_sbox(state[5])
-        temp[10] = inv_sbox(state[2])
-        temp[11] = inv_sbox(state[15])
-
-        temp[12] = inv_sbox(state[12])
-        temp[13] = inv_sbox(state[9])
-        temp[14] = inv_sbox(state[6])
-        temp[15] = inv_sbox(state[3])
-
-        # AddRoundKey
-        var j: i32 = 0
-        while j < 16
-            temp[j] = temp[j] ^ rki[j]
-            j += 1
-
-        # InvMixColumns
-        var imcol: [4]u8
-        inv_mix_column(temp[0], temp[1], temp[2], temp[3], @imcol[0])
-        state[0] = imcol[0]
-        state[1] = imcol[1]
-        state[2] = imcol[2]
-        state[3] = imcol[3]
-
-        inv_mix_column(temp[4], temp[5], temp[6], temp[7], @imcol[0])
-        state[4] = imcol[0]
-        state[5] = imcol[1]
-        state[6] = imcol[2]
-        state[7] = imcol[3]
-
-        inv_mix_column(temp[8], temp[9], temp[10], temp[11], @imcol[0])
-        state[8] = imcol[0]
-        state[9] = imcol[1]
-        state[10] = imcol[2]
-        state[11] = imcol[3]
-
-        inv_mix_column(temp[12], temp[13], temp[14], temp[15], @imcol[0])
-        state[12] = imcol[0]
-        state[13] = imcol[1]
-        state[14] = imcol[2]
-        state[15] = imcol[3]
-
-        round -= 1
-
-    # Final round (no InvMixColumns)
-    output[0] = inv_sbox(state[0]) ^ rk[0]
-    output[1] = inv_sbox(state[13]) ^ rk[1]
-    output[2] = inv_sbox(state[10]) ^ rk[2]
-    output[3] = inv_sbox(state[7]) ^ rk[3]
-
-    output[4] = inv_sbox(state[4]) ^ rk[4]
-    output[5] = inv_sbox(state[1]) ^ rk[5]
-    output[6] = inv_sbox(state[14]) ^ rk[6]
-    output[7] = inv_sbox(state[11]) ^ rk[7]
-
-    output[8] = inv_sbox(state[8]) ^ rk[8]
-    output[9] = inv_sbox(state[5]) ^ rk[9]
-    output[10] = inv_sbox(state[2]) ^ rk[10]
-    output[11] = inv_sbox(state[15]) ^ rk[11]
-
-    output[12] = inv_sbox(state[12]) ^ rk[12]
-    output[13] = inv_sbox(state[9]) ^ rk[13]
-    output[14] = inv_sbox(state[6]) ^ rk[14]
-    output[15] = inv_sbox(state[3]) ^ rk[15]
+    aes_decrypt_rounds(@ctx.round_keys[0], 10, input, output)
 
 pub fn aes256_decrypt_block(ctx: *Aes256, input: *u8, output: *u8) -> void
-    var state: [16]u8
-    var temp: [16]u8
-    let rk: *u8 = @ctx.round_keys[0]
-
-    # Initial AddRoundKey with last round key
-    var i: i32 = 0
-    while i < 16
-        state[i] = input[i] ^ rk[224 + i]
-        i += 1
-
-    # 13 main rounds (in reverse)
-    var round: i32 = 13
-    while round >= 1
-        let rki: *u8 = rk + (round * 16)
-
-        # InvShiftRows + InvSubBytes into temp
-        temp[0] = inv_sbox(state[0])
-        temp[1] = inv_sbox(state[13])
-        temp[2] = inv_sbox(state[10])
-        temp[3] = inv_sbox(state[7])
-
-        temp[4] = inv_sbox(state[4])
-        temp[5] = inv_sbox(state[1])
-        temp[6] = inv_sbox(state[14])
-        temp[7] = inv_sbox(state[11])
-
-        temp[8] = inv_sbox(state[8])
-        temp[9] = inv_sbox(state[5])
-        temp[10] = inv_sbox(state[2])
-        temp[11] = inv_sbox(state[15])
-
-        temp[12] = inv_sbox(state[12])
-        temp[13] = inv_sbox(state[9])
-        temp[14] = inv_sbox(state[6])
-        temp[15] = inv_sbox(state[3])
-
-        # AddRoundKey
-        var j: i32 = 0
-        while j < 16
-            temp[j] = temp[j] ^ rki[j]
-            j += 1
-
-        # InvMixColumns
-        var imcol: [4]u8
-        inv_mix_column(temp[0], temp[1], temp[2], temp[3], @imcol[0])
-        state[0] = imcol[0]
-        state[1] = imcol[1]
-        state[2] = imcol[2]
-        state[3] = imcol[3]
-
-        inv_mix_column(temp[4], temp[5], temp[6], temp[7], @imcol[0])
-        state[4] = imcol[0]
-        state[5] = imcol[1]
-        state[6] = imcol[2]
-        state[7] = imcol[3]
-
-        inv_mix_column(temp[8], temp[9], temp[10], temp[11], @imcol[0])
-        state[8] = imcol[0]
-        state[9] = imcol[1]
-        state[10] = imcol[2]
-        state[11] = imcol[3]
-
-        inv_mix_column(temp[12], temp[13], temp[14], temp[15], @imcol[0])
-        state[12] = imcol[0]
-        state[13] = imcol[1]
-        state[14] = imcol[2]
-        state[15] = imcol[3]
-
-        round -= 1
-
-    # Final round (no InvMixColumns)
-    output[0] = inv_sbox(state[0]) ^ rk[0]
-    output[1] = inv_sbox(state[13]) ^ rk[1]
-    output[2] = inv_sbox(state[10]) ^ rk[2]
-    output[3] = inv_sbox(state[7]) ^ rk[3]
-
-    output[4] = inv_sbox(state[4]) ^ rk[4]
-    output[5] = inv_sbox(state[1]) ^ rk[5]
-    output[6] = inv_sbox(state[14]) ^ rk[6]
-    output[7] = inv_sbox(state[11]) ^ rk[7]
-
-    output[8] = inv_sbox(state[8]) ^ rk[8]
-    output[9] = inv_sbox(state[5]) ^ rk[9]
-    output[10] = inv_sbox(state[2]) ^ rk[10]
-    output[11] = inv_sbox(state[15]) ^ rk[11]
-
-    output[12] = inv_sbox(state[12]) ^ rk[12]
-    output[13] = inv_sbox(state[9]) ^ rk[13]
-    output[14] = inv_sbox(state[6]) ^ rk[14]
-    output[15] = inv_sbox(state[3]) ^ rk[15]
+    aes_decrypt_rounds(@ctx.round_keys[0], 14, input, output)
 
 # ============================================================================
 # AES-NI Hardware Accelerated Implementation
 # ============================================================================
+# Uses the same round_keys buffer as the software implementation; a round key
+# is two i64s, so round r's key starts at rk_ptr + 2 * r.
+# The trailing `return`s work around AGAST #4085 (ritz0 miscompiles a `-> void`
+# fn whose last statement is simd_storeu).
 
-# AES-128 encryption using AES-NI
-# Note: This uses the same round_keys buffer as the software implementation
+fn aes_encrypt_rounds_ni(rk_ptr: *i64, nr: i32, input: *u8, output: *u8) -> void
+    # Load input block, initial round key addition
+    var state: v2i64 = simd_loadu(input as *i64)
+    state = simd_xor(state, simd_loadu(rk_ptr))
+
+    # nr - 1 main rounds with aesenc
+    var round: i32 = 1
+    while round < nr
+        state = aesenc(state, simd_loadu(rk_ptr + round * 2))
+        round += 1
+
+    # Final round with aesenclast
+    state = aesenclast(state, simd_loadu(rk_ptr + nr * 2))
+    simd_storeu(output as *i64, state)
+    return
+
+# For decryption, intermediate round keys need InvMixColumns applied (aesimc)
+fn aes_decrypt_rounds_ni(rk_ptr: *i64, nr: i32, input: *u8, output: *u8) -> void
+    # Load input block, initial round key addition (with last round key)
+    var state: v2i64 = simd_loadu(input as *i64)
+    state = simd_xor(state, simd_loadu(rk_ptr + nr * 2))
+
+    # nr - 1 main rounds with aesdec (using aesimc-transformed keys)
+    var round: i32 = nr - 1
+    while round >= 1
+        state = aesdec(state, aesimc(simd_loadu(rk_ptr + round * 2)))
+        round -= 1
+
+    # Final round with aesdeclast (no InvMixColumns, so no aesimc)
+    state = aesdeclast(state, simd_loadu(rk_ptr))
+    simd_storeu(output as *i64, state)
+    return
+
 pub fn aes128_encrypt_block_ni(ctx: *Aes128, input: *u8, output: *u8) -> void
-    var rk_ptr: *i64 = @ctx.round_keys[0] as *i64
+    aes_encrypt_rounds_ni(@ctx.round_keys[0] as *i64, 10, input, output)
 
-    # Load input block
-    var state: v2i64 = simd_loadu(input as *i64)
-
-    # Initial round key addition
-    var rk0: v2i64 = simd_loadu(rk_ptr)
-    state = simd_xor(state, rk0)
-
-    # 9 main rounds with aesenc
-    var rk1: v2i64 = simd_loadu(rk_ptr + 2)
-    state = aesenc(state, rk1)
-
-    var rk2: v2i64 = simd_loadu(rk_ptr + 4)
-    state = aesenc(state, rk2)
-
-    var rk3: v2i64 = simd_loadu(rk_ptr + 6)
-    state = aesenc(state, rk3)
-
-    var rk4: v2i64 = simd_loadu(rk_ptr + 8)
-    state = aesenc(state, rk4)
-
-    var rk5: v2i64 = simd_loadu(rk_ptr + 10)
-    state = aesenc(state, rk5)
-
-    var rk6: v2i64 = simd_loadu(rk_ptr + 12)
-    state = aesenc(state, rk6)
-
-    var rk7: v2i64 = simd_loadu(rk_ptr + 14)
-    state = aesenc(state, rk7)
-
-    var rk8: v2i64 = simd_loadu(rk_ptr + 16)
-    state = aesenc(state, rk8)
-
-    var rk9: v2i64 = simd_loadu(rk_ptr + 18)
-    state = aesenc(state, rk9)
-
-    # Final round with aesenclast
-    var rk10: v2i64 = simd_loadu(rk_ptr + 20)
-    state = aesenclast(state, rk10)
-
-    # Store output
-    simd_storeu(output as *i64, state)
-    return
-
-# AES-128 decryption using AES-NI
-# Note: For decryption, intermediate round keys need InvMixColumns applied (aesimc)
 pub fn aes128_decrypt_block_ni(ctx: *Aes128, input: *u8, output: *u8) -> void
-    var rk_ptr: *i64 = @ctx.round_keys[0] as *i64
+    aes_decrypt_rounds_ni(@ctx.round_keys[0] as *i64, 10, input, output)
 
-    # Load input block
-    var state: v2i64 = simd_loadu(input as *i64)
-
-    # Initial round key addition (with last round key)
-    var rk10: v2i64 = simd_loadu(rk_ptr + 20)
-    state = simd_xor(state, rk10)
-
-    # 9 main rounds with aesdec (using aesimc-transformed keys)
-    var rk9: v2i64 = simd_loadu(rk_ptr + 18)
-    rk9 = aesimc(rk9)
-    state = aesdec(state, rk9)
-
-    var rk8: v2i64 = simd_loadu(rk_ptr + 16)
-    rk8 = aesimc(rk8)
-    state = aesdec(state, rk8)
-
-    var rk7: v2i64 = simd_loadu(rk_ptr + 14)
-    rk7 = aesimc(rk7)
-    state = aesdec(state, rk7)
-
-    var rk6: v2i64 = simd_loadu(rk_ptr + 12)
-    rk6 = aesimc(rk6)
-    state = aesdec(state, rk6)
-
-    var rk5: v2i64 = simd_loadu(rk_ptr + 10)
-    rk5 = aesimc(rk5)
-    state = aesdec(state, rk5)
-
-    var rk4: v2i64 = simd_loadu(rk_ptr + 8)
-    rk4 = aesimc(rk4)
-    state = aesdec(state, rk4)
-
-    var rk3: v2i64 = simd_loadu(rk_ptr + 6)
-    rk3 = aesimc(rk3)
-    state = aesdec(state, rk3)
-
-    var rk2: v2i64 = simd_loadu(rk_ptr + 4)
-    rk2 = aesimc(rk2)
-    state = aesdec(state, rk2)
-
-    var rk1: v2i64 = simd_loadu(rk_ptr + 2)
-    rk1 = aesimc(rk1)
-    state = aesdec(state, rk1)
-
-    # Final round with aesdeclast (no InvMixColumns, so no aesimc)
-    var rk0: v2i64 = simd_loadu(rk_ptr)
-    state = aesdeclast(state, rk0)
-
-    # Store output
-    simd_storeu(output as *i64, state)
-    return
-
-# AES-256 encryption using AES-NI
 pub fn aes256_encrypt_block_ni(ctx: *Aes256, input: *u8, output: *u8) -> void
-    var rk_ptr: *i64 = @ctx.round_keys[0] as *i64
+    aes_encrypt_rounds_ni(@ctx.round_keys[0] as *i64, 14, input, output)
 
-    # Load input block
-    var state: v2i64 = simd_loadu(input as *i64)
-
-    # Initial round key addition
-    var rk0: v2i64 = simd_loadu(rk_ptr)
-    state = simd_xor(state, rk0)
-
-    # 13 main rounds with aesenc
-    var rk1: v2i64 = simd_loadu(rk_ptr + 2)
-    state = aesenc(state, rk1)
-
-    var rk2: v2i64 = simd_loadu(rk_ptr + 4)
-    state = aesenc(state, rk2)
-
-    var rk3: v2i64 = simd_loadu(rk_ptr + 6)
-    state = aesenc(state, rk3)
-
-    var rk4: v2i64 = simd_loadu(rk_ptr + 8)
-    state = aesenc(state, rk4)
-
-    var rk5: v2i64 = simd_loadu(rk_ptr + 10)
-    state = aesenc(state, rk5)
-
-    var rk6: v2i64 = simd_loadu(rk_ptr + 12)
-    state = aesenc(state, rk6)
-
-    var rk7: v2i64 = simd_loadu(rk_ptr + 14)
-    state = aesenc(state, rk7)
-
-    var rk8: v2i64 = simd_loadu(rk_ptr + 16)
-    state = aesenc(state, rk8)
-
-    var rk9: v2i64 = simd_loadu(rk_ptr + 18)
-    state = aesenc(state, rk9)
-
-    var rk10: v2i64 = simd_loadu(rk_ptr + 20)
-    state = aesenc(state, rk10)
-
-    var rk11: v2i64 = simd_loadu(rk_ptr + 22)
-    state = aesenc(state, rk11)
-
-    var rk12: v2i64 = simd_loadu(rk_ptr + 24)
-    state = aesenc(state, rk12)
-
-    var rk13: v2i64 = simd_loadu(rk_ptr + 26)
-    state = aesenc(state, rk13)
-
-    # Final round with aesenclast
-    var rk14: v2i64 = simd_loadu(rk_ptr + 28)
-    state = aesenclast(state, rk14)
-
-    # Store output
-    simd_storeu(output as *i64, state)
-    return
-
-# AES-256 decryption using AES-NI
 pub fn aes256_decrypt_block_ni(ctx: *Aes256, input: *u8, output: *u8) -> void
-    var rk_ptr: *i64 = @ctx.round_keys[0] as *i64
-
-    # Load input block
-    var state: v2i64 = simd_loadu(input as *i64)
-
-    # Initial round key addition (with last round key)
-    var rk14: v2i64 = simd_loadu(rk_ptr + 28)
-    state = simd_xor(state, rk14)
-
-    # 13 main rounds with aesdec (using aesimc-transformed keys)
-    var rk13: v2i64 = simd_loadu(rk_ptr + 26)
-    rk13 = aesimc(rk13)
-    state = aesdec(state, rk13)
-
-    var rk12: v2i64 = simd_loadu(rk_ptr + 24)
-    rk12 = aesimc(rk12)
-    state = aesdec(state, rk12)
-
-    var rk11: v2i64 = simd_loadu(rk_ptr + 22)
-    rk11 = aesimc(rk11)
-    state = aesdec(state, rk11)
-
-    var rk10: v2i64 = simd_loadu(rk_ptr + 20)
-    rk10 = aesimc(rk10)
-    state = aesdec(state, rk10)
-
-    var rk9: v2i64 = simd_loadu(rk_ptr + 18)
-    rk9 = aesimc(rk9)
-    state = aesdec(state, rk9)
-
-    var rk8: v2i64 = simd_loadu(rk_ptr + 16)
-    rk8 = aesimc(rk8)
-    state = aesdec(state, rk8)
-
-    var rk7: v2i64 = simd_loadu(rk_ptr + 14)
-    rk7 = aesimc(rk7)
-    state = aesdec(state, rk7)
-
-    var rk6: v2i64 = simd_loadu(rk_ptr + 12)
-    rk6 = aesimc(rk6)
-    state = aesdec(state, rk6)
-
-    var rk5: v2i64 = simd_loadu(rk_ptr + 10)
-    rk5 = aesimc(rk5)
-    state = aesdec(state, rk5)
-
-    var rk4: v2i64 = simd_loadu(rk_ptr + 8)
-    rk4 = aesimc(rk4)
-    state = aesdec(state, rk4)
-
-    var rk3: v2i64 = simd_loadu(rk_ptr + 6)
-    rk3 = aesimc(rk3)
-    state = aesdec(state, rk3)
-
-    var rk2: v2i64 = simd_loadu(rk_ptr + 4)
-    rk2 = aesimc(rk2)
-    state = aesdec(state, rk2)
-
-    var rk1: v2i64 = simd_loadu(rk_ptr + 2)
-    rk1 = aesimc(rk1)
-    state = aesdec(state, rk1)
-
-    # Final round with aesdeclast (no InvMixColumns, so no aesimc)
-    var rk0: v2i64 = simd_loadu(rk_ptr)
-    state = aesdeclast(state, rk0)
-
-    # Store output
-    simd_storeu(output as *i64, state)
-    return
+    aes_decrypt_rounds_ni(@ctx.round_keys[0] as *i64, 14, input, output)
