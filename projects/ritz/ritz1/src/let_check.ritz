@@ -100,9 +100,9 @@ fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
     out.pointee = TYPE_VOID
     out.inner = TYPE_VOID
     out.tuple = 0
-    # LocalVar / SemaVar do not record an array's element struct name.
-    # Without it a `.f` past `a[i]` stays permissive (let_place_member
-    # answers 0).
+    # LocalVar does not record an array's element struct name; SemaVar's
+    # let_name does.  Without it a `.f` past `a[i]` stays permissive
+    # (let_place_member answers 0).
     out.elem_name = null
     out.elem_name_len = 0
     if env.s == null
@@ -120,6 +120,10 @@ fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
         out.pointee = v.let_pointee
         out.inner = v.inner
         out.tuple = v.tuple
+        # AGAST #3399: a 1-D array's let_name is its element struct.
+        if v.let_kind == TYPE_ARRAY and v.let_elem == TYPE_STRUCT
+            out.elem_name = v.let_name
+            out.elem_name_len = v.let_name_len
         return 1
     let idx: i32 = find_local_idx(env.s, name, len)
     if idx < 0
@@ -552,7 +556,13 @@ fn let_method_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
         *out_len = recv.ident_len
         return recv.ident_ptr as *u8
     if recv.kind == EXPR_MEMBER
-        let f: *StructField = sbk_member_field(sm, recv)
+        var f: *StructField = sbk_member_field(sm, recv)
+        # AGAST #3399: `xs[i].f.m()`, a field of an array's struct element.
+        if f == null and recv.left != null and recv.left.kind == EXPR_INDEX
+            var en: i32 = 0
+            let es: *u8 = let_index_struct(sm, recv.left, @en)
+            if es != null
+                f = sbk_struct_field(sm, es, en, recv.ident_ptr, recv.ident_len)
         if f == null
             return null
         *out_len = f.field_type_name_len
@@ -564,7 +574,52 @@ fn let_method_recv_type(sm: *Sema, recv: *Expr, out_len: *i32) -> *u8
             if ce != null and ce.const_type == TYPE_ARRAY and ce.array_elem_type == TYPE_STRUCT
                 *out_len = ce.array_elem_type_name_len
                 return ce.array_elem_type_name
+    # AGAST #3399: `xs[i].m()` of a local, global or field array's struct
+    # element, and `g[i][j].m()` of an N-D one's.
+    if recv.kind == EXPR_INDEX
+        return let_index_struct(sm, recv, out_len)
     null
+
+# The struct an element `e` (an EXPR_INDEX) of an array is, or null: a 1-D
+# array's as let_value_ty types it, an N-D `[N][M]..S` array's when `e`
+# indexes every dimension.
+fn let_index_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    var kind: i32 = TYPE_UNKNOWN
+    var name: *u8 = null
+    var name_len: i32 = 0
+    if let_value_ty(sm, e, @kind, @name, @name_len, 0) == 1
+        if kind != TYPE_STRUCT or name_len <= 0
+            return null
+        *out_len = name_len
+        return name
+    # Down the index chain to the N-D array it starts at.
+    var depth: i32 = 0
+    var at: *Expr = e
+    while at != null and at.kind == EXPR_INDEX
+        if at.right == null or at.right.kind == EXPR_RANGE
+            return null
+        depth = depth + 1
+        at = at.left
+    if at == null
+        return null
+    var sh: *ArrayShape = null
+    if at.kind == EXPR_IDENT
+        let lv: *SemaVar = sema_find_local(sm, at.ident_ptr, at.ident_len)
+        if lv != null
+            sh = lv.shape
+        else
+            let g: *GlobalVarDef = sbk_global(sm, at.ident_ptr, at.ident_len)
+            if g != null and g.var_type == TYPE_ARRAY
+                sh = g.array_shape
+    else if at.kind == EXPR_MEMBER
+        let f: *StructField = sbk_member_field(sm, at)
+        if f != null and f.field_type == TYPE_ARRAY
+            sh = f.array_shape
+    if sh == null or sh.rank != depth or sh.leaf_type != TYPE_STRUCT or sh.leaf_name_len <= 0
+        return null
+    *out_len = sh.leaf_name_len
+    sh.leaf_name
 
 # The fn method call `e` dispatches to, as the emitter's method_call_def.
 fn let_method_call_def(sm: *Sema, e: *Expr) -> *FnDef

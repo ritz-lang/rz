@@ -90,6 +90,9 @@ REJECTED = [
     ("large-array-field-elem", "let b: Big = big_new()\nb.data[7] = 3", "b", "assign"),
     ("large-mut-borrow", "let b: Big = big_new()\nlet q: *Big = @&b", "b", "borrow"),
     ("large-mut-borrow-elem", "let b: Big = big_new()\nlet q: *u8 = @&b.data[3]", "b", "borrow"),
+    # AGAST #3399: a field of a `let` array's struct element.
+    ("array-elem-field", "let xs = [Pt { x: 1, y: 2 }]\nxs[0].x = 3", "xs", "assign"),
+    ("array-elem-field-borrow", "let xs: [1]Pt = [Pt { x: 1, y: 2 }]\nlet q: *i64 = @&xs[0].x", "xs", "borrow"),
 ]
 
 
@@ -115,6 +118,7 @@ ACCEPTED = [
      "match o\n    Some(v) => p.x = v\n    None => p.y = 0"),
     ("var-array-elem", "var a: [4]i64 = [1, 2, 3, 4]\na[0] = 9"),
     ("var-tuple-elem", "var p = (1, 2)\np.0 = 3"),  # AGAST #2283
+    ("var-array-elem-field", "var xs = [Pt { x: 1, y: 2 }]\nxs[0].x = 3\nlet q: *i64 = @&xs[0].y"),  # AGAST #3399
     ("var-mut-borrow", "var p = Pt { x: 1, y: 2 }\nlet q: *Pt = @&p\nq.x = 5"),
     ("var-large", "var b: Big = big_new()\nb.n = 3\nb.data[1] = 2\nlet q: *Big = @&b"),
     # Through a pointer held in a `let`: the pointee is written.
@@ -230,6 +234,9 @@ struct Wrap
     pt: Pt
     pp: *Pt
 
+struct Row
+    pts: [2]Pt
+
 """
 
 
@@ -259,6 +266,16 @@ IMPLICIT_REJECTED = [
     ("arg-large", "let b: Big = big_new()\nset_big(b)", "b"),
     ("arg-large-field", "let b: Big = big_new()\nset(b.pt)", "b"),
     ("arg-scalar", "let k: i64 = 4\nset_i64(k)", "k"),
+    # AGAST #3399: an element of a `let` array, as receiver or argument.
+    ("recv-array-elem", "let xs: [2]Pt = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]\nxs[1].bump()", "xs"),
+    ("recv-array-elem-untyped", "let xs = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]\nxs[0].nudge()", "xs"),
+    ("recv-array-2d-elem",
+     "let g: [2][2]Pt = [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ]\ng[1][0].bump()",
+     "g"),
+    ("recv-field-array-elem",
+     "let r = Row { pts: [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }] }\nr.pts[1].bump_ref()", "r"),
+    ("recv-array-elem-field", "let ws = [Wrap { pt: Pt { x: 1, y: 2 }, pp: null }]\nws[0].pt.bump()", "ws"),
+    ("arg-array-elem", "let xs: [2]Pt = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]\nset(xs[1])", "xs"),
 ]
 
 
@@ -296,6 +313,12 @@ IMPLICIT_ACCEPTED = [
      "var v = Pt { x: 1, y: 2 }\nlet w = Wrap { pt: Pt { x: 0, y: 0 }, pp: @&v }\nw.pp.bump()\nset(w.pp)"),
     # Rvalues are spilled to a fresh temp.
     ("rvalue-recv", "Pt { x: 1, y: 2 }.bump()"),
+    # AGAST #3399: a `var` array's element; a shared receiver of a `let` one.
+    ("recv-var-array-elem",
+     "var g: [2][2]Pt = [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ]\n"
+     "g[1][0].bump()\nvar r = Row { pts: [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }] }\nr.pts[1].bump()"),
+    ("recv-var-array-elem-field", "var ws = [Wrap { pt: Pt { x: 1, y: 2 }, pp: null }]\nws[0].pt.bump()"),
+    ("recv-let-array-elem-shared", "let xs: [2]Pt = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]\nlet n = xs[1].peek()"),
 ]
 
 
