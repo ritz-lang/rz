@@ -8,17 +8,24 @@
 # Usage:
 #   ./tools/mkiso.sh              # Create ISO
 #   ./tools/mkiso.sh --clean      # Remove ISO build files
+#
+# Every package in initramfs.pkgs must build and produce an ELF: a missing
+# binary (rzsh, say) fails the build instead of leaving a thinner image
+# (AGAST #1871). RZ_CLI, PKGS_ROOT, KERNEL_ELF and BUILD_DIR may be set in the
+# environment; projects/ritz/tools/test_harland_userland.py uses them to run
+# this script against fake packages.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 HARLAND_DIR="$PROJECT_ROOT/../harland"
-BUILD_DIR="$PROJECT_ROOT/build"
-RZ_CLI="$PROJECT_ROOT/../../rz"
+BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build}"
+RZ_CLI="${RZ_CLI:-$PROJECT_ROOT/../../rz}"
+PKGS_ROOT="${PKGS_ROOT:-$PROJECT_ROOT/..}"
 
 # Kernel is built by harland project
-KERNEL_ELF="$HARLAND_DIR/build/debug/harland.elf"
+KERNEL_ELF="${KERNEL_ELF:-$HARLAND_DIR/build/debug/harland.elf}"
 ISO_DIR="$BUILD_DIR/isodir"
 ISO_FILE="$BUILD_DIR/indium.iso"
 INITRAMFS="$BUILD_DIR/initramfs.qcow2"
@@ -62,15 +69,17 @@ INITRAMFS_BIN="$BUILD_DIR/initramfs-bin"
 rm -rf "$INITRAMFS_BIN" && mkdir -p "$INITRAMFS_BIN"
 for pkg in $(sed -e 's/#.*//' "$PROJECT_ROOT/initramfs.pkgs"); do
     echo "=== Building $pkg ==="
-    "$RZ_CLI" build "$pkg"
-    cp "$PROJECT_ROOT/../$pkg/build/debug/"*.elf "$INITRAMFS_BIN/"
+    "$RZ_CLI" build "$pkg" || { echo "Error: $pkg failed to build"; exit 1; }
+    elfs=("$PKGS_ROOT/$pkg/build/debug/"*.elf)
+    [ -f "${elfs[0]}" ] || { echo "Error: $pkg built no ELFs"; exit 1; }
+    cp "${elfs[@]}" "$INITRAMFS_BIN/"
     echo ""
 done
 
 # List what we're including
 echo ""
 echo "=== Userspace binaries ==="
-ls -la "$INITRAMFS_BIN/"*.elf 2>/dev/null || echo "(none found)"
+ls -la "$INITRAMFS_BIN/"*.elf
 echo ""
 
 # ============================================================================
@@ -98,6 +107,10 @@ cat > "$ISO_DIR/boot/grub/grub.cfg" << 'EOF'
 
 set timeout=0
 set default=0
+
+# Load GOP/VBE drivers so GRUB can honour the kernel's multiboot2
+# framebuffer request (#2143)
+insmod all_video
 
 menuentry "Indium (Harland Kernel)" {
     multiboot2 /boot/harland.elf
