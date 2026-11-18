@@ -8,6 +8,11 @@
 #   RZ_ROOMS_MEMORY_HIGH=28G   ritz-rooms.slice MemoryHigh, all rooms together
 #   RZ_ROOMS_MEMORY_MAX=32G    ritz-rooms.slice MemoryMax,  all rooms together
 #   RZ_GATE_SLOTS=2            gates run-gate.sh lets run at once on this host
+#   RZ_TEST_BUDGET_SCALE=1.5   the gate's ritz0 suite budget (check_test_budget.py)
+#                              times this, for a host slower than its calibration
+#                              shows (AGAST #4004, #4138).  run-gate.sh passes it
+#                              to the gate; main.yml hands it to the budget check
+#                              alone, never to pytest
 #
 # Every key is optional; a missing key (or no file at all) keeps the script's
 # default, which is sized for omegalisk's 15.6 GiB VM (7G / 8G / 1).  Only
@@ -54,14 +59,27 @@ rz_host_env_load() {
                     return 1
                 }
                 ;;
+            RZ_TEST_BUDGET_SCALE)
+                rz_budget_scale_ok "$val" || {
+                    echo "error: $RZ_HOST_ENV_FILE:$n: $key must be a number > 0 like 1.5: '$val'" >&2
+                    return 1
+                }
+                ;;
             *)
                 echo "error: $RZ_HOST_ENV_FILE:$n: unknown key $key" \
-                    "(known: RZ_ROOMS_MEMORY_HIGH RZ_ROOMS_MEMORY_MAX RZ_GATE_SLOTS)" >&2
+                    "(known: RZ_ROOMS_MEMORY_HIGH RZ_ROOMS_MEMORY_MAX RZ_GATE_SLOTS" \
+                    "RZ_TEST_BUDGET_SCALE)" >&2
                 return 1
                 ;;
         esac
         HOST_ENV[$key]="$val"
     done < "$RZ_HOST_ENV_FILE"
+}
+
+# rz_budget_scale_ok <v>: is <v> a plain decimal > 0 (1, 1.5, 0.75)?  Exponents,
+# signs and inf/nan are refused: check_test_budget.py's float() would take them.
+rz_budget_scale_ok() {
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ && "$1" =~ [1-9] ]]
 }
 
 # rz_size_bytes 28G -> 30064771072 (K/M/G are powers of 1024, as in systemd).

@@ -172,6 +172,17 @@ if [[ ! "$SLOTS" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: RZ_GATE_SLOTS must be a whole number >= 1: '$SLOTS'" >&2
     exit 2
 fi
+# The ritz0 suite budget's scale on this host (AGAST #4138): host.env's
+# RZ_TEST_BUDGET_SCALE, or the same name in this script's environment.  The
+# unit gets it under that name; main.yml's ritz0 step turns it into
+# RITZ_TEST_BUDGET_SCALE for check_test_budget.py alone.  Never set
+# RITZ_TEST_BUDGET_SCALE host-wide (#4004 did, with systemctl set-environment):
+# every pytest inherits it, and tools/test_check_test_budget.py went red.
+BUDGET_SCALE="${RZ_TEST_BUDGET_SCALE:-${HOST_ENV[RZ_TEST_BUDGET_SCALE]:-}}"
+if [[ -n "$BUDGET_SCALE" ]] && ! rz_budget_scale_ok "$BUDGET_SCALE"; then
+    echo "error: RZ_TEST_BUDGET_SCALE must be a number > 0 like 1.5: '$BUDGET_SCALE'" >&2
+    exit 2
+fi
 # Wipe ritz1/build too: a gate is a verdict on the commit, not on whatever
 # objects an earlier base left behind.  Reusing it is how #1497 got 30 bogus
 # failures from stale struct layouts (AGAST #1659).
@@ -229,7 +240,8 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\n' "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nBUDGET_SCALE=%s\n' \
+    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$BUDGET_SCALE" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that
@@ -462,6 +474,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_TREE="$TREE" \
     --setenv=RZ_TMPDIR="$GATE_TMP" --setenv=RZ_PROBE="$PROBE" \
     --setenv=RZ_STARVE="${RZ_GATE_STARVE:-2700}" \
+    --setenv=RZ_TEST_BUDGET_SCALE="$BUDGET_SCALE" \
     /bin/bash "$SCRIPT"
 
 echo "$LOG"

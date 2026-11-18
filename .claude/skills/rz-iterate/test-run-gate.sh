@@ -455,6 +455,24 @@ l18="$(RZ_GATE_BASE=no-such-rev gate_hdr "$W18" t18)"
 check '[[ -z "$(base_of "$l18")" ]] && ! grep -q -- --diff-base "$RZ_TEST_ORDER.make"' "an unresolvable RZ_GATE_BASE is dropped"
 rm -f "$T/bin/make"
 
+# AGAST #4138: host.env's RZ_TEST_BUDGET_SCALE reaches the gate's command as
+# RZ_TEST_BUDGET_SCALE (main.yml hands it to the budget check alone), never
+# as RITZ_TEST_BUDGET_SCALE, which pytest would inherit.  Logged in the header.
+probe='echo "SCALE=[${RZ_TEST_BUDGET_SCALE:-}] RITZ=[${RITZ_TEST_BUDGET_SCALE:-}]"'
+l19="$(RZ_GATE_CMD="$probe" gate "$W" t19)"
+check 'grep -qx "SCALE=\[\] RITZ=\[\]" "$l19" && grep -qx "BUDGET_SCALE=" "$l19"' "no host.env key: the command sees no scale"
+printf 'RZ_GATE_SLOTS=1\nRZ_TEST_BUDGET_SCALE=1.5\n' > "$T/scale.env"
+l19="$(RZ_HOST_ENV="$T/scale.env" RZ_GATE_CMD="$probe" gate "$W" t19)"
+check 'grep -qx "SCALE=\[1.5\] RITZ=\[\]" "$l19"' "host.env's scale reaches the command as RZ_TEST_BUDGET_SCALE only"
+check 'grep -qx "BUDGET_SCALE=1.5" "$l19"' "the log header names the scale"
+l19="$(RZ_HOST_ENV="$T/scale.env" RZ_TEST_BUDGET_SCALE=2 RZ_GATE_CMD="$probe" gate "$W" t19)"
+check 'grep -qx "SCALE=\[2\] RITZ=\[\]" "$l19"' "RZ_TEST_BUDGET_SCALE in the caller's env overrides host.env"
+out="$(RZ_TEST_BUDGET_SCALE=fast RZ_GATE_CMD="$probe" gate "$W" t19 2>&1)"; rc=$?
+check '[[ $rc -eq 2 ]] && [[ "$out" == *RZ_TEST_BUDGET_SCALE* ]]' "a malformed override is refused (rc=$rc)"
+printf 'RZ_TEST_BUDGET_SCALE=0\n' > "$T/scale0.env"
+out="$(RZ_HOST_ENV="$T/scale0.env" RZ_GATE_CMD="$probe" gate "$W" t19 2>&1)"; rc=$?
+check '[[ $rc -eq 2 ]] && [[ "$out" == *host.env* || "$out" == *scale0.env* ]]' "a zero scale in host.env is refused (rc=$rc)"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

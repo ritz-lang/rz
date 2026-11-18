@@ -124,6 +124,19 @@ stays here; remote hosts only run rooms.
   slice is rewritten, and `.claude/host-budget.sh --verify <room>` prints the
   values in effect and where they came from. An unknown key or bad value is
   an error in both scripts, never a silent default.
+- **A slow host's suite budget: `RZ_TEST_BUDGET_SCALE=1.5` in `host.env`**
+  (AGAST #4138, for #4004's budget false reds). This is a number > 0, and
+  `host.env` refuses anything else. The gate's ritz0 suite budget
+  (`tools/check_test_budget.py`, `[suite] cpu_s` and every per-file cap) is
+  multiplied by it on that host. `run-gate.sh` puts it in the gate unit's
+  environment and logs it in the header (`BUDGET_SCALE=`). main.yml's ritz0
+  step then takes it out of the environment and hands it to the budget check
+  alone, as `RITZ_TEST_BUDGET_SCALE`, so no pytest sees it. `RZ_TEST_BUDGET_SCALE`
+  in the caller's environment overrides the file for one gate. **Never
+  `systemctl --user set-environment RITZ_TEST_BUDGET_SCALE=...`** (what #4004
+  did at 17:35Z on 2026-11-18). Every process in every unit inherits it.
+  `tools/test_check_test_budget.py` now deletes it per test, but other tests
+  may not.
 - **One room's memory: `.claude/host-budget.sh --room-memory <room> <high>
   <max>`** (AGAST #3971), e.g. `--room-memory ritz-task-3965 10G 12G`, and
   `--clear-room-memory <room>` to go back to 3500M / 5G. **Only with Aaron's

@@ -372,6 +372,11 @@ def test_verify_reports_the_values_in_effect(tmp_path):
         "RZ_ROOMS_MEMORY_HIGH=40G\nRZ_ROOMS_MEMORY_MAX=32G\n",  # high > max
         "RZ_ROOMS_MEMORY_HIGH=9G\n",  # high > default max 8G
         "RZ_GATE_SLOTS=0\n",
+        "RZ_TEST_BUDGET_SCALE=0\n",  # AGAST #4138: a scale must be > 0
+        "RZ_TEST_BUDGET_SCALE=0.0\n",
+        "RZ_TEST_BUDGET_SCALE=-1.5\n",
+        "RZ_TEST_BUDGET_SCALE=1.5x\n",
+        "RZ_TEST_BUDGET_SCALE=\n",
     ],
 )
 def test_bad_config_is_refused_and_writes_nothing(tmp_path, text):
@@ -383,6 +388,18 @@ def test_bad_config_is_refused_and_writes_nothing(tmp_path, text):
     assert not (tmp_path / "units").exists()
     assert not (tmp_path / "pwned").exists()
     assert _budget(tmp_path, env, "--verify", ROOM).returncode != 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("scale", ["1.5", "2", "0.75", "10"])
+def test_config_accepts_a_test_budget_scale(tmp_path, scale):
+    """AGAST #4138: RZ_TEST_BUDGET_SCALE is the gate's budget-check scale
+    (run-gate.sh passes it on); the room budget ignores it."""
+    env = _env(tmp_path)
+    _host_env(tmp_path, HUBURGHT_ENV + f"RZ_TEST_BUDGET_SCALE={scale}\n")
+    r = _budget(tmp_path, env, ROOM)
+    assert r.returncode == 0, r.stderr
+    assert _props(_paths(tmp_path)[0])["MemoryMax"] == "32G"
 
 
 @pytest.mark.unit

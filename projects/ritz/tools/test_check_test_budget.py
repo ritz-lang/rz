@@ -39,6 +39,19 @@ sys.path.insert(0, str(TOOLS))
 
 import check_test_budget as ctb
 
+BUDGET_ENV = ("RITZ_TEST_BUDGET_SCALE", "RITZ_TEST_BUDGET_PARTIAL")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_budget_env(monkeypatch):
+    """AGAST #4138: these tests assert on scale-1, whole-suite output, so a
+    host's budget settings must not reach them.  `systemctl --user
+    set-environment RITZ_TEST_BUDGET_SCALE=1.5` once put the scale in every
+    gate unit's environment, and this file went red on huburght (`cap 135.0`
+    where it wanted `cap 90.0`).  A test that wants a setting sets it."""
+    for k in BUDGET_ENV:
+        monkeypatch.delenv(k, raising=False)
+
 
 def report(files: dict[str, float], wall: float = 10.0) -> dict:
     """A cost report as cost_meter writes it: per-file CPU-seconds."""
@@ -459,6 +472,77 @@ def test_partial_is_read_from_the_environment(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("RITZ_TEST_BUDGET_PARTIAL", "1")
     assert ctb.main([str(rep), "--budget", str(b)]) == 0
     assert "partial" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_scale_is_read_from_the_environment(tmp_path, monkeypatch, capsys):
+    """RITZ_TEST_BUDGET_SCALE multiplies the caps main() checks and prints."""
+    rep = tmp_path / "cost.json"
+    rep.write_text(json.dumps(report({"test_a.py": 50.0, "test_b.py": 50.0})))
+    b = tmp_path / "budget.toml"
+    b.write_text("[suite]\ncpu_s = 90.0\n\n[file]\ndefault_cpu_s = 60.0\n")
+    assert ctb.main([str(rep), "--budget", str(b)]) == 1  # 100 > 90
+    assert "cap 90.0" in capsys.readouterr().out
+    monkeypatch.setenv("RITZ_TEST_BUDGET_SCALE", "1.5")
+    assert ctb.main([str(rep), "--budget", str(b)]) == 0  # 100 <= 135
+    out = capsys.readouterr().out
+    assert "cap 135.0" in out and "scale 1.5" in out
+
+
+@pytest.mark.integration
+def test_this_file_passes_with_a_host_budget_in_the_environment(tmp_path):
+    """AGAST #4138, end to end: the two tests that went red on huburght, run
+    in a pytest whose environment carries a host's scale and the partial flag."""
+    ids = [f"{__file__}::test_budget_line_prints_raw_factor_and_normalised",
+           f"{__file__}::test_partial_is_read_from_the_environment"]
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider",
+         "--rootdir", str(PKG), *ids],
+        cwd=PKG, capture_output=True, text=True, timeout=120, check=False,
+        env={**os.environ, "RITZ_TEST_BUDGET_SCALE": "1.5",
+             "RITZ_TEST_BUDGET_PARTIAL": "1"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "2 passed" in r.stdout
+
+
+def _run_ritz0_step_scale_lines(tmp_path: Path, env: dict) -> dict[str, dict]:
+    """The ritz0 step's scale handling, run as the step runs it, with `python`
+    a stand-in that records the environment each command would see.  Returns
+    {"pytest": env, "budget": env}."""
+    lines = [ln.strip() for ln in _ritz0_step().splitlines()]
+    keep = [ln for ln in lines if not ln.startswith("#") and (
+        "BUDGET_SCALE" in ln or "-m pytest" in ln or "check_test_budget.py" in ln)]
+    stub = ('python() { case "$*" in *"-m pytest"*) n=pytest ;; '
+            '*check_test_budget.py*) n=budget ;; *) n=other ;; esac; '
+            'env > "$OUT/$n.env"; }')
+    script = stub + "\n" + "\n".join(keep) + "\n"
+    base = {k: v for k, v in os.environ.items()
+            if k not in ("RZ_TEST_BUDGET_SCALE", *BUDGET_ENV)}
+    r = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", script], cwd=tmp_path,
+                       env={**base, "OUT": str(tmp_path), **env},
+                       capture_output=True, text=True, timeout=30, check=False)
+    assert r.returncode == 0, r.stderr
+    seen = {}
+    for n in ("pytest", "budget"):
+        pairs = (ln.split("=", 1) for ln in (tmp_path / f"{n}.env").read_text().splitlines()
+                 if "=" in ln)
+        seen[n] = {k: v for k, v in pairs if "TEST_BUDGET" in k}
+    return seen
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("env, scale", [
+    ({}, "1"),                                          # CI, most hosts
+    ({"RZ_TEST_BUDGET_SCALE": "1.5"}, "1.5"),           # host.env via run-gate.sh
+    ({"RITZ_TEST_BUDGET_SCALE": "1.5"}, "1.5"),         # set-environment, as #4004 did
+    ({"RZ_TEST_BUDGET_SCALE": "2", "RITZ_TEST_BUDGET_SCALE": "1.5"}, "2"),
+])
+def test_gate_budget_scale_reaches_the_budget_check_only(tmp_path, env, scale):
+    """AGAST #4138: a host's scale applies to the budget line, never to pytest,
+    whose tests assert on scale-1 output."""
+    seen = _run_ritz0_step_scale_lines(tmp_path, env)
+    assert seen["pytest"] == {}, seen
+    assert seen["budget"] == {"RITZ_TEST_BUDGET_SCALE": scale}, seen
 
 
 def _session(tmp_path: Path, files: list[str], out: Path, env: dict) -> None:
