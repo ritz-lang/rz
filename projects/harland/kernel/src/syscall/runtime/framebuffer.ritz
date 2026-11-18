@@ -7,7 +7,7 @@
 
 import serial { prints, serial_print_hex, serial_print_dec }
 import mm.pmm { PAGE_SIZE }
-import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, vmm_map_page }
+import mm.vmm { PTE_WRITABLE, PTE_USER, PTE_WRITE_THROUGH, PTE_DEVICE, vmm_map_page }
 import mm.uptr { uptr_check_write }
 import drivers.display.mod { SimpleFramebuffer, display_get_framebuffer, display_available }
 import syscall.errno { Errno }
@@ -32,10 +32,6 @@ import syscall.errno { Errno }
 
 # Framebuffer info structure size: 8 + 4 + 4 + 4 + 1 + 1 + 2 = 24 bytes
 const FBINFO_SIZE: u64 = 24
-
-# Global framebuffer mapping for userspace
-var g_user_fb_mapped: u8 = 0
-var g_user_fb_addr: u64 = 0
 
 # sys_fb_info: Get framebuffer information
 # Args: info_buf pointer to 24-byte FbInfo structure
@@ -83,9 +79,8 @@ fn sys_fb_map_impl() -> i64
     if fb == 0 as *SimpleFramebuffer
         return Errno.NoDev as i64
 
-    # If already mapped, return the existing address
-    if g_user_fb_mapped != 0
-        return g_user_fb_addr as i64
+    # Mapped into the calling process every time: a kernel-wide "already
+    # mapped" cache handed the next process an address it never had (#2755).
 
     # Calculate framebuffer size
     let fb_size: u64 = ((*fb).pitch as u64) * ((*fb).height as u64)
@@ -101,8 +96,9 @@ fn sys_fb_map_impl() -> i64
         let phys_addr: u64 = (*fb).base + (i * PAGE_SIZE)
         let virt_addr: u64 = user_fb_virt + (i * PAGE_SIZE)
 
-        # Map with write-through caching and user-accessible
-        let result: i32 = vmm_map_page(virt_addr, phys_addr, PTE_WRITABLE | PTE_USER | PTE_WRITE_THROUGH)
+        # Map with write-through caching and user-accessible. PTE_DEVICE:
+        # the frame is MMIO, so the process's exit must not free it (#2755).
+        let result: i32 = vmm_map_page(virt_addr, phys_addr, PTE_WRITABLE | PTE_USER | PTE_WRITE_THROUGH | PTE_DEVICE)
         if result != 0
             prints("[fb_map] Failed to map page ")
             serial_print_dec(i as i64)
@@ -110,9 +106,6 @@ fn sys_fb_map_impl() -> i64
             return Errno.NoMem as i64
 
         i = i + 1
-
-    g_user_fb_mapped = 1
-    g_user_fb_addr = user_fb_virt
 
     prints("[fb_map] Mapped ")
     serial_print_dec(num_pages as i64)

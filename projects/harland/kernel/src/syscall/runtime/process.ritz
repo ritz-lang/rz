@@ -17,7 +17,7 @@ import mm.uptr { uptr_validate_string, uptr_check_read }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_read }
 import fs.kpath { strview_from_ptr }
 import fs.syscall { sys_open, fs_process_end, fs_process_start }
-import syscall.stack { syscall_stack_check }
+import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
 import loader.elf { ElfLoadResult, ElfStatus, elf_load }
 import syscall.errno { Errno }
@@ -26,6 +26,7 @@ import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
 # External assembly functions (syscall_entry.s, user_entry) for user context
 extern fn jump_to_userspace(entry: u64, stack: u64)
 extern fn syscall_save_user_frame(dst: *u64)
+extern fn syscall_stack_size() -> u64
 extern fn resume_user_frame(frame: *u64, retval: i64)
 extern fn jump_to_userspace_with_args(entry: u64, stack: u64, argc: i64, argv: u64)
 
@@ -451,12 +452,37 @@ fn sys_exit_impl(code: i32) -> i64
 
         # Never reached
 
-    # No parent - this is init exiting or a system halt. Its fds are closed
-    # (and their writes flushed) like any process's (#2753).
+    # No parent - this is init exiting. Its fds are closed (and their writes
+    # flushed) like any process's (#2753), then the machine powers off
+    # through ACPI S5 (#2755): under QEMU the VM exits instead of hanging.
     fs_process_end()
-    prints(" - halting system\n")
+    # init's exit doesn't return through syscall_handler either: panic, not
+    # power off as if fine, if a syscall ran off the syscall stack (#2761),
+    # and report how deep any went.
+    syscall_stack_check()
+    prints("[exit] syscall stack peak ")
+    serial_print_dec(syscall_stack_used())
+    prints(" of ")
+    serial_print_dec(syscall_stack_size())
+    prints(" bytes\n")
+    prints("[exit] init exited with code ")
+    if code < 0
+        prints("-")
+        serial_print_dec((0 - code) as u64)
+    else
+        serial_print_dec(code as u64)
+    prints(", powering off\n")
+    acpi_poweroff()
+    # Only reached if the poweroff failed.
+    prints("[exit] ACPI poweroff failed, halting system\n")
     halt_loop()
     return 0
+
+# Terminate the running process with `status`, as if it had called
+# exit(status): its parent resumes, or init's exit powers off. The exception
+# handler calls this for a fault taken in ring 3 (#2755). Never returns.
+pub fn process_kill_current(status: i32) -> i64
+    return sys_exit_impl(status)
 
 # sys_wait: Wait for a child process to exit
 # For blocking spawn, the child has already exited by the time spawn returns.

@@ -7,6 +7,7 @@ import io { halt_loop }
 import serial { StrView, prints, serial_print, serial_print_hex, serial_print_dec, serial_poll, serial_drain_output }
 import mm.vmm { vmm_debug_page_tables }
 import drivers.msix { msix_dispatch }
+import syscall.runtime.process { process_kill_current, current_pid }
 
 # External functions from main.ritz
 extern fn ring_dump() -> i32
@@ -182,14 +183,46 @@ pub fn exception_name(vector: u8) -> *u8
         return c"Control Protection"
     return c"Unknown"
 
+# The faulting address of the last page fault.
+fn read_cr2() -> u64
+    var cr2: u64 = 0
+    var cr2_ptr: *u64 = @cr2
+    asm x86_64:
+        movq %cr2, %rax
+        movq {cr2_ptr}, %rcx
+        movq %rax, (%rcx)
+    return cr2
+
 # ============================================================================
 # Exception Handler
 # ============================================================================
 #
 # Called from isr_stubs.s when a CPU exception occurs (vectors 0-31).
-# Prints diagnostic information and halts the system.
+# A fault taken in ring 3 kills only the running process (#2755): it exits
+# with status 128 + vector and its parent resumes (init's exit powers off).
+# A kernel-mode exception prints diagnostic information and halts.
 
 pub fn exception_handler(frame: *InterruptFrame) -> i32
+    # CPL of the interrupted code: ring 3 is user mode. This line must not
+    # print "EXCEPTION" or "PANIC": the boot tests read those as a kernel
+    # failure.
+    if ((*frame).cs & 3) == 3
+        prints("[fault] PID ")
+        serial_print_dec(current_pid() as u64)
+        prints(": ")
+        serial_print(exception_name((*frame).vector as u8))
+        prints(" (vector ")
+        serial_print_dec((*frame).vector)
+        prints(") at RIP ")
+        serial_print_hex((*frame).rip)
+        if (*frame).vector == 14
+            prints(" CR2 ")
+            serial_print_hex(read_cr2())
+        prints(", killing the process\n")
+        process_kill_current(128 + ((*frame).vector as i32))
+        # Never reached: the parent resumed, or the machine powered off.
+        return 0
+
     prints("\n!!! EXCEPTION !!!\n")
     prints("Vector: ")
     serial_print_hex((*frame).vector)
@@ -221,12 +254,7 @@ pub fn exception_handler(frame: *InterruptFrame) -> i32
 
     # For page faults, print CR2 and decode error code
     if (*frame).vector == 14
-        var cr2: u64 = 0
-        var cr2_ptr: *u64 = @cr2
-        asm x86_64:
-            movq %cr2, %rax
-            movq {cr2_ptr}, %rcx
-            movq %rax, (%rcx)
+        let cr2: u64 = read_cr2()
         prints("CR2: ")
         serial_print_hex(cr2)
         prints(" (fault address)\n")
