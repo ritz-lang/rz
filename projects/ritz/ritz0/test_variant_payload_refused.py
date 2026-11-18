@@ -9,13 +9,13 @@ every value of that variant:
         Some(0) => 1
         _ => 2          # f(Some(5)) gave 1
 
-Compiling the test is #1291's decision tree. Until then ritz0 refuses a literal
-there, at the pattern. A type there is no pattern at all since LARB R52 (#3409):
-ritz0's parser refuses it at the pattern. The expected exit codes below come from what each
-program says, not from a compiler.
-
-ritz1's grammar takes only a name there, so it refuses every literal with a parse
-error.
+A variant's payload pattern is a name or `_` (LARB R76, AGAST #4001), so a
+literal there is refused on all three compilers at the literal, with the message
+test_nested_pattern_diagnostic.py pins for a nested variant pattern too (that file
+holds R76's parity rows, `Some(0)` among them). ritz1's grammar takes only a name
+there; its parse recovery gives the failure ritz0's words. A type there is no
+pattern at all since LARB R52 (#3409): ritz0's parser refuses it at the pattern.
+The expected exit codes below come from what each program says, not from a compiler.
 
 A name there only binds. §8.2 used to make one a test when it named an integer
 const or a variant of the payload's enum (#2350, #2405), and a binding otherwise,
@@ -49,7 +49,8 @@ _Q = _C + "enum Q\n    One(i32)\n    Hold(C)\n    Text(StrView)\n    Z\n"
 _S = _C + "enum S\n    V\n        x: i32\n    U\n        c: C\n    W\n"
 _K = "const K: i32 = 0\n"
 _SLOT = "enum Slot<T>\n    Full(T)\n    Empty\n"
-_HINT = " — bind it to a name, then test the name in the arm body"
+_R76 = ("a variant's payload pattern is a name or `_`: "
+        "match the inner value in its own `match`")
 # Every test compiles beside this module, so a row can import it.
 _MODULE = ("pub const MK: i32 = 0\nconst HIDDEN: i32 = 1\npub enum MC\n    MR\n    MG\n"
            "pub fn in_module<T>(x: T, o: Option<i32>) -> i32\n    match o\n"
@@ -95,9 +96,9 @@ _LOCAL = "let o: Option<i32> = Some(5)"
 _GENERIC = "fn f<T>(o: Option<T>) -> i32\n    match o\n        {} => 1\n        _ => 2\n"
 
 
-# name -> (source, line, col, the pattern as shown, its variant)
+# name -> (source, line, col, the pattern as shown, its variant). `Some(0)` itself
+# is test_nested_pattern_diagnostic.py's, on all three compilers.
 LITERALS = {
-    "int": (_opt("i32", "Some(0)", "5"), 3, 14, "0", "Some"),
     "int_equal_to_the_payload": (_opt("i32", "Some(5)", "5"), 3, 14, "5", "Some"),
     "bool_true": (_opt("bool", "Some(true)", "false"), 3, 14, "true", "Some"),
     "bool_false": (_opt("bool", "Some(false)", "true"), 3, 14, "false", "Some"),
@@ -400,18 +401,28 @@ def _ritz1(request, compiler, tmp_path, source):
     return proc, ll
 
 
+# name -> why ritz1's parse stops before this row's literal, so its refusal is
+# the plain parse error there (test_ritz1_cannot_parse_a_payload_that_tests).
+LITERAL_NOT_REACHED_ON_RITZ1 = {
+    "second_field": "its grammar takes one field in a variant, so it stops at the `,`",
+}
+
+
 @pytest.mark.integration
+@pytest.mark.parametrize("compiler", ["ritz0"] + RITZ1S)
 @pytest.mark.parametrize("name", sorted(REFUSED))
-def test_ritz0_refuses_a_payload_that_tests(tmp_path, name):
-    source, line, col, shown, variant = REFUSED[name]
-    proc, ll = _ritz0(tmp_path, source)
+def test_a_literal_payload_is_refused(request, tmp_path, compiler, name):
+    """R76: one message at the literal, and no IR."""
+    if compiler != "ritz0" and name in LITERAL_NOT_REACHED_ON_RITZ1:
+        return
+    source, line, col, _, _ = REFUSED[name]
+    proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0, f"ritz0 accepted {name}:\n{out[-1500:]}"
-    message = (f"a variant payload can only be bound, not tested: "
-               f"'{shown}' in '{variant}(...)'{_HINT}")
-    hits = re.findall(rf"unit\.ritz:{line}:{col}: {re.escape(message)}$", out, re.M)
-    assert len(hits) == 1, f"{name}: want one {message!r}:\n{out[-1500:]}"
-    assert not ll.exists(), f"ritz0 wrote IR for {name}"
+    assert proc.returncode != 0, f"{compiler} accepted {name}:\n{out[-1500:]}"
+    sep = "" if compiler == "ritz0" else "error: "
+    hits = re.findall(rf"unit\.ritz:{line}:{col}: {sep}{re.escape(_R76)}$", out, re.M)
+    assert len(hits) == 1, f"{compiler}, {name}: want one {_R76!r}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
 
 
 @pytest.mark.integration
@@ -437,16 +448,8 @@ def test_ritz0_still_runs_a_payload_that_binds(tmp_path, name):
 
 
 @pytest.mark.integration
-def test_a_nested_variant_keeps_its_own_message(tmp_path):
-    """`Some(Some(x))` is #1291's, and says so."""
-    proc, _ = _ritz0(tmp_path, _opt("Option<i32>", "Some(Some(x))", "None"))
-    out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "Nested variant patterns are not supported" in out, out
-
-
-@pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-@pytest.mark.parametrize("name", sorted({**LITERALS, **TYPES}))
+@pytest.mark.parametrize("name", sorted({**TYPES, **{n: LITERALS[n] for n in LITERAL_NOT_REACHED_ON_RITZ1}}))
 def test_ritz1_cannot_parse_a_payload_that_tests(request, tmp_path, compiler, name):
     """Goes red when ritz1 learns one, which must then refuse it or compile it."""
     proc, ll = _ritz1(request, compiler, tmp_path, {**LITERALS, **TYPES}[name][0])

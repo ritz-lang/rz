@@ -16622,21 +16622,7 @@ class LLVMEmitter:
                 # earlier pass rejects, so report it here against the pattern's
                 # own span instead of letting a bare ValueError escape.
                 self._require_enum_variant(enum_name, pattern.name, pattern.span)
-                # Nested variant patterns (`Ok(Simple(x))`) are not supported:
-                # only one pattern level is compiled. Without this check the
-                # inner pattern silently binds nothing and the arm body fails
-                # with `Unknown identifier: x` — a red herring pointing
-                # nowhere near the construct. Name it and locate it instead.
-                # AGAST #1321 (angelo font.ritz).
-                for field_pattern in pattern.fields:
-                    if isinstance(field_pattern, rast.VariantPattern):
-                        raise EmitError(
-                            f"Nested variant patterns are not supported: "
-                            f"'{pattern.name}({field_pattern.name}(...))' — "
-                            f"match on '{pattern.name}(inner)' first, then "
-                            f"match 'inner' in a second match expression",
-                            field_pattern.span or pattern.span)
-                self._refuse_payload_tests(pattern)
+                self._refuse_payload_pattern(pattern)
                 tag_val = self._get_enum_variant_tag(enum_name, pattern.name)
                 switch.add_case(ir.Constant(self.i8, tag_val), arm_block)
             elif isinstance(pattern, rast.IdentPattern):
@@ -16846,32 +16832,23 @@ class LLVMEmitter:
                 f"variant '{pattern.name}' has {has} {noun}, but this pattern "
                 f"lists {len(pattern.fields)}", pattern.span)
 
-    def _refuse_payload_tests(self, pattern: rast.VariantPattern) -> None:
-        """A payload is bound, never tested (AGAST #2350, LANGUAGE_SPEC §8.2).
+    def _refuse_payload_pattern(self, pattern: rast.VariantPattern) -> None:
+        """A variant's payload pattern is a name or `_` (LARB R76; §8.2).
 
-        The switch above reads the tag alone, so a test inside a variant was
-        dropped and `Some(0)` took every `Some`. Compiling it is #1291's
-        decision tree; until then, say so at the pattern.
+        The switch above reads the tag alone, so anything inside a variant
+        that would test its payload was dropped: `Some(0)` took every `Some`
+        (#2350), and `Ok(Simple(x))` bound nothing and failed later with the
+        red herring `Unknown identifier: x` (#1321). Both are refused at the
+        inner pattern, with the message ritz1's parse recovery gives too.
+        A name named like a const or variant was refused already, by
+        binder_names (R12, AGAST #2407).
         """
         for field_pattern in pattern.fields:
-            shown = self._payload_test_text(field_pattern)
-            if shown is not None:
+            if not isinstance(field_pattern, (rast.WildcardPattern, rast.IdentPattern)):
                 raise EmitError(
-                    f"a variant payload can only be bound, not tested: "
-                    f"'{shown}' in '{pattern.name}(...)' — bind it to a name, "
-                    f"then test the name in the arm body",
+                    "a variant's payload pattern is a name or `_`: match the "
+                    "inner value in its own `match`",
                     field_pattern.span or pattern.span)
-
-    def _payload_test_text(self, field_pattern: rast.Pattern) -> Optional[str]:
-        """How `field_pattern` reads if it tests its payload, else None."""
-        # A name only binds: binder_names refused one named like a const or a
-        # variant before anything was emitted (AGAST #2407).
-        if isinstance(field_pattern, (rast.WildcardPattern, rast.IdentPattern)):
-            return None
-        value = getattr(field_pattern, 'value', None)
-        if isinstance(value, bool):
-            return 'true' if value else 'false'
-        return f'"{value}"' if isinstance(value, str) else str(value)
 
     def _note_match_result_type(self, expr: rast.Match, body: rast.Expr) -> None:
         """Record a move-only arm value's type on the match, inferred while

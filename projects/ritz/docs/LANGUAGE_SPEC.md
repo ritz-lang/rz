@@ -3536,21 +3536,36 @@ fn main() -> i32
         None => 0
 ```
 
-A pattern inside a variant takes the payload: it is a binding or `_`. One that
-would test the payload is a compile error at that pattern, because the arm is
-chosen by the variant alone. That covers a literal and a type. A name only
-binds, so one named like a `const`, a global or a variant is the binder error
-of §4.3, whatever the payload's type. Bind the payload and test it in the arm
-body:
+A variant's payload pattern is a name or `_`. A nested variant pattern
+(`Ok(Simple(x))`) or a literal payload pattern (`Some(0)`) is an error: match
+the inner value in its own `match`. The arm is chosen by the variant alone, so
+the error is at the inner pattern (LARB R76). A type there is no pattern
+either (§3.8). A name only binds, so one named like a `const`, a global or a
+variant is the binder error of §4.3, whatever the payload's type.
 
-```ritz expect-error="a variant payload can only be bound, not tested: '0' in 'Some(...)'"
-fn f(o: Option<i32>) -> i32
+```ritz expect-error="a variant's payload pattern is a name or `_`: match the inner value in its own `match`"
+fn f(o: Option<Option<i32>>) -> i32
     match o
-        Some(0) => 1
-        _ => 2
+        Some(Some(x)) => x
+        _ => 0
 
 fn main() -> i32
-    f(Some(5))
+    f(Some(Some(5)))
+```
+
+Bind the payload and match it, or test it, in the arm body:
+
+```ritz
+fn f(o: Option<Option<i32>>) -> i32
+    match o
+        Some(inner) =>
+            match inner
+                Some(x) => x
+                None => 0
+        None => 0
+
+fn main() -> i32
+    f(Some(Some(5)))
 ```
 
 A variant pattern with a field list lists every field of its variant, in

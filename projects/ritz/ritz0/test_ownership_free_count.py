@@ -2998,12 +2998,10 @@ fn g(s:& Flagged) -> i32
 """ + TAIL, 18, 36),
 }
 
-# AGAST #3329: a nested payload pattern (`Has(Full(x))`) binds nothing yet:
-# ritz0 refuses it ("Nested variant patterns are not supported", #1291) and
-# ritz1 can't parse it. Under a match that owns nothing, x would be a copy
-# the owner still drops, so this goes red when nested patterns compile: lend
-# the nested bindings then, as _lend_payload / own_match_payload lend the
-# direct ones, and move this row into LENT_PAYLOAD_ROWS (AGAST #3339).
+# AGAST #3329: a nested payload pattern (`Has(Full(x))`) under a match that
+# owns nothing. It isn't a Ritz pattern: a variant's payload pattern is a name
+# or `_` (LARB R76, which closed #1291), so all three compilers refuse it at
+# the inner pattern, ahead of any ownership question.
 NESTED_LENT_PAYLOAD = SLOT + NESTED_SLOT + """\
 pub fn main() -> i32
     var s = Nest.Has(Slot.Full(make(1)))
@@ -3572,13 +3570,14 @@ def test_move_out_of_a_non_owning_match_payload_rejected(request, tmp_path, comp
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_nested_payload_of_a_non_owning_match_still_refused(request, tmp_path, compiler):
-    """Goes red when nested patterns compile: see NESTED_LENT_PAYLOAD."""
+    """R76: refused at the inner pattern, `Full` (line 15, column 13 of the body)."""
     _ritz1(request, compiler)
     out, why = _refusal(compiler, tmp_path, NESTED_LENT_PAYLOAD)
     assert why is None, f"{compiler} {why}"
-    # Refused at the nested pattern (line 15 of the body), not elsewhere.
     at = PRELUDE.count("\n") + 15
-    assert f":{at}:" in out, out[-2000:]
+    message = ("a variant's payload pattern is a name or `_`: "
+               "match the inner value in its own `match`")
+    assert f":{at}:13: " in out and message in out, out[-2000:]
 
 
 @pytest.mark.integration

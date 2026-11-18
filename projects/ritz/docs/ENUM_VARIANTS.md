@@ -324,8 +324,9 @@ tracker side-table rather than an AST node.
 
 ## 7. Related issues
 
-- **#1291** — nested variant patterns bind silently to nothing. Same subsystem
-  (match lowering). Not addressed here.
+- **#1291** — nested variant patterns. Out of spec (LARB R76): a variant's
+  payload pattern is a name or `_`, and all three compilers refuse
+  `Ok(Simple(x))` and `Some(0)` at the inner pattern (#4001).
 - **#1279** — incremental-cache staleness. `ritz1`'s `.ll` cache keys on source
   content plus a compiler fingerprint; see `docs/STALE_LL_CACHE_TRAP.md`. Any
   emitter change invalidates it, but always confirm with a clean

@@ -847,6 +847,63 @@ fn type_pattern_at(p: *Parser, fail_at: i32) -> i32
         return 1
     0
 
+# LARB R76 (AGAST #4001): a variant's payload pattern is a name or `_`
+# (LANGUAGE_SPEC §8.2).  ritz1's grammar takes only a name there, so a nested
+# variant pattern (`Ok(Simple(x))`) already fails to parse at its own `(` and
+# a literal (`Some(0)`) at the literal; these give that failure ritz0's words.
+
+fn is_literal_tok(k: i32) -> i32
+    if k == TOK_NUMBER or k == TOK_FLOAT or k == TOK_STRING or k == TOK_CSTRING or k == TOK_CHAR
+        return 1
+    if k == TOK_TRUE or k == TOK_FALSE
+        return 1
+    0
+
+# 1 if the token at `lparen` opens an arm's variant pattern: `V(` or `E.V(`
+# at the start of a line whose `)` is followed by `=>`.
+fn arm_variant_open_at(p: *Parser, lparen: i32) -> i32
+    if lparen < 2 or lparen >= p.token_count
+        return 0
+    if (p.tokens + lparen).kind != TOK_LPAREN or (p.tokens + (lparen - 1)).kind != TOK_IDENT
+        return 0
+    var c: i32 = lparen - 2
+    if (p.tokens + c).kind == TOK_DOT
+        if c < 2 or (p.tokens + (c - 1)).kind != TOK_IDENT
+            return 0
+        c = c - 2
+    let before: i32 = (p.tokens + c).kind
+    if before != TOK_NEWLINE and before != TOK_INDENT and before != TOK_DEDENT
+        return 0
+    # Across the pattern, to the `)` that closes this `(`, then the `=>`.
+    var depth: i32 = 0
+    var i: i32 = lparen
+    while i < p.token_count
+        let k: i32 = (p.tokens + i).kind
+        if k == TOK_NEWLINE
+            return 0
+        if k == TOK_LPAREN
+            depth = depth + 1
+        if k == TOK_RPAREN
+            depth = depth - 1
+            if depth == 0
+                if i + 1 < p.token_count and (p.tokens + (i + 1)).kind == TOK_FAT_ARROW
+                    return 1
+                return 0
+        i = i + 1
+    0
+
+# Where the payload pattern that stopped the parse at `fail_at` starts, or -1:
+# the literal itself, or the inner variant's name before the `(` it failed at.
+fn payload_pattern_at(p: *Parser, fail_at: i32) -> i32
+    if fail_at < 3 or fail_at >= p.token_count
+        return -1
+    let k: i32 = (p.tokens + fail_at).kind
+    if is_literal_tok(k) == 1 and arm_variant_open_at(p, fail_at - 1) == 1
+        return fail_at
+    if k == TOK_LPAREN and (p.tokens + (fail_at - 1)).kind == TOK_IDENT and arm_variant_open_at(p, fail_at - 2) == 1
+        return fail_at - 1
+    -1
+
 # The removed legacy `&T` / `&mut T` type (LANGUAGE_SPEC §3.2, AGAST #1565):
 # no type starts with `&`, so a parse that reached one right after a `:` (or a
 # `:&`, as in `x:&& T`) stopped there.  1 for `&T`, 2 for `&mut T`, else 0.
@@ -931,6 +988,9 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
         else if type_pattern_at(p, fail_at) == 1
             parse_error_at(p, fail_at)
             eprints_cstr(c"a type isn't a pattern")
+        else if payload_pattern_at(p, fail_at) >= 0
+            parse_error_at(p, payload_pattern_at(p, fail_at))
+            eprints_cstr(c"a variant's payload pattern is a name or `_`: match the inner value in its own `match`")
         else
             parse_error_at(p, fail_at)
             eprints_cstr(c"unexpected ")
