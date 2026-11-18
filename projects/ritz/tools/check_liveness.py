@@ -57,6 +57,9 @@ EXTERNAL_DIRS = ("", "tools", "scripts")
 # reported, so this list cannot outlive its reasons.
 RITZLIB_ALLOWLIST = {
     "testlib.ritz": "the test assertion library: every importer is a test by design",
+    "args.ritz": "the deprecated ArgParser API (#1448): its last production caller, "
+                 "valet, moved to argspec in #1495; deleting it with its tests and "
+                 "goldens is #4046",
     "ptr.ritz": "ptr_read is LANGUAGE_SPEC §13.2's documented way to move a value "
                 "out of raw memory; only ritz0/test_ref_into_value.py calls it so far",
 }

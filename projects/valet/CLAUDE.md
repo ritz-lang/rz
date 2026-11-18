@@ -43,19 +43,18 @@ wrk -t4 -c100 -d10s http://localhost:8080/
 With no `valet.json` present the server prints `config: cannot open valet.json`
 and continues with defaults; that warning is not an error.
 
-### Do not use `./test/run_all.sh`
+### `./test/run_all.sh`
 
-It **exits 1 while printing "All tests passed!"** — the "All tests passed!" line
-comes from the inner `test_basic.sh`, and then `run_all.sh` dies before running
-`test_multishot.sh` or `test_workers.sh`. Cause: the script uses `set -e`
-together with `((PASSED++))`; when `PASSED` is 0 that arithmetic command's exit
-status is 1, so `set -e` kills the script right after the first test *passes*.
-A shell bug, not a test failure. Use `./rz test valet`, or invoke the individual
-`test/test_*.sh` scripts directly:
+Runs `test_basic.sh`, `test_multishot.sh`, `test_workers.sh` and `test_cli.sh`
+against `build/debug/valet` (override with `VALET=`). The first three need
+`ab` (apache2-utils) and `wrk` on PATH; without them they stop at their first
+load test and the run reports them failed. Until AGAST #1495 the script exited
+1 right after the first suite passed (`set -e` with `((PASSED++))` when
+`PASSED` was 0) and pointed at a `projects/valet/valet` that no longer exists.
 
-```bash
-cd projects/valet && VALET=./build/debug/valet bash test/test_basic.sh
-```
+`test_cli.sh` (also a `build-all` step in CI) pins the command line: a
+non-numeric `--port` / `--workers` is a usage error (`valet: invalid number
+'abc'`, exit 1) rather than the silent 0 the old ArgParser produced.
 
 ## Architecture
 
@@ -86,7 +85,7 @@ lib/tls.ritz            TLS 1.3 termination (via cryptosec)
 | `async/tasks.ritz` | TaskPool, TaskServer, event loop |
 | `uring.ritz` | io_uring syscall wrappers |
 | `async_net.ritz` | TCP socket helpers |
-| `args.ritz` | CLI argument parsing |
+| `argspec.ritz` | CLI argument parsing (`build_spec` in `src/main.ritz`) |
 
 ## Routing Framework
 

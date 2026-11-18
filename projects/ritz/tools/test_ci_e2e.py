@@ -44,6 +44,8 @@ E2ES = [
     "projects/valet/test/test_large_echo.sh",
     # AGAST #3899: static 416/403 keep-alive vs close on a live connection.
     "projects/valet/test/test_static_conn.sh",
+    # AGAST #1495: valet's command line (argspec usage errors, paths, help).
+    "projects/valet/test/test_cli.sh",
     # AGAST #2456: the stack smoke gate, same constraints (needs the debug
     # binaries, real servers, must exit 0 or 1 only). A package run as a
     # directory since #3455: its __main__.py calls cli.main().

@@ -8,7 +8,7 @@
 set -e
 
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VALET="${VALET:-$(dirname $DIR)/valet}"
+VALET="${VALET:-$(dirname "$DIR")/build/debug/valet}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,9 +39,9 @@ run_test() {
     echo "----------------------------------------"
 
     if VALET="$VALET" bash "$test_script"; then
-        ((PASSED++))
+        PASSED=$((PASSED + 1))
     else
-        ((FAILED++))
+        FAILED=$((FAILED + 1))
     fi
 }
 
@@ -52,6 +52,7 @@ chmod +x "$DIR"/*.sh
 run_test "$DIR/test_basic.sh"
 run_test "$DIR/test_multishot.sh"
 run_test "$DIR/test_workers.sh"
+run_test "$DIR/test_cli.sh"
 
 # Summary
 echo ""
