@@ -164,3 +164,26 @@ def test_monomorph_clone_writes_stay_in_bounds(ritz1_bin, tmp_path):
         "ritz1 wrote out of bounds while monomorphizing:\n" + err[-4000:]
     )
     assert proc.returncode == 0, err[-4000:]
+
+
+# AGAST #1695: any single struct node (`as *T`, T a type name) allocated
+# with a size that is not spelled with sizeof(), e.g. `parser_alloc(p, 48)
+# as *StructDef` or `malloc(SOME_BYTES) as *AliasEntry`.  Pointer arrays
+# (`as **T`, sized `n * 8`) and byte buffers (`as *u8`) are not nodes.
+STRUCT_ALLOC = re.compile(
+    r"\b(?:malloc|calloc|realloc|parser_alloc)\((?P<args>[^#]*)\)\s+as\s+\*(?P<ty>[A-Z]\w*)\b"
+)
+
+
+@pytest.mark.unit
+def test_no_literal_sized_struct_allocs():
+    """Every single-struct allocation in ritz1/src is sized with sizeof()."""
+    offenders = []
+    for path in sorted(RITZ1_SRC.glob("*.ritz")):
+        for lineno, line in enumerate(path.read_text().splitlines(), 1):
+            m = STRUCT_ALLOC.search(line.split("#", 1)[0])
+            if m and f"sizeof({m.group('ty')})" not in m.group("args"):
+                offenders.append(f"{path.name}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "struct allocated without sizeof(T) (use sizeof):\n" + "\n".join(offenders)
+    )
