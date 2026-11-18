@@ -41,8 +41,10 @@ MSG_PUB = "`main` taking `Span<StrView>` must be `pub`: write `pub fn main(...)`
 # The runtime half of the entry path, in Ritz: one `mmap` for the views,
 # then a `strlen` per string. Added only for a Span main, so a C-shaped
 # program pays nothing. SYS_mmap is 9, PROT_READ|PROT_WRITE is 3,
-# MAP_PRIVATE|MAP_ANONYMOUS is 0x22. The mmap is Linux's (Harland: #200
-# follow-up).
+# MAP_PRIVATE|MAP_ANONYMOUS is 0x22. The mmap is Linux's, and serves
+# Harland too: its mmap is also 9, has the same flag values and reads the
+# first four arguments (indium's span_args boots it in init's Tier-1 suite,
+# AGAST #4019).
 RUNTIME_SOURCE = """\
 fn __ritz_views(n: i64, p: **u8) -> Span<StrView>
     var r: i64 = 9

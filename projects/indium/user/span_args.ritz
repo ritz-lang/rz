@@ -1,0 +1,58 @@
+# span_args - the Ritz-native `main` on Harland (AGAST #4019)
+#
+# Run by init's Tier-1 suite as `span_args alpha beta-gamma`. Its `main`
+# takes `Span<StrView>`, so the compiler adds the adapter `main` (#200,
+# ritz0/main_abi.py) whose __ritz_views mmaps the views with Linux's six
+# syscall-9 arguments; Harland's mmap reads the first four and its PROT_*
+# and MAP_* values are Linux's. Exit 0 only if:
+#   - args holds the three strings, byte for byte (the mmap worked and the
+#     views point at the kernel's argv)
+#   - env is empty: the kernel passes envp = NULL, and __ritz_env counts 0
+#     (and still mmaps)
+#   - _start called main with a 16-aligned rsp (#200 dropped the old
+#     shim's `subq $8`). Every Ritz fn is alignstack(16), so rsp in a Ritz
+#     body is aligned whatever its caller did; what _start did shows in the
+#     frame chain instead. This main is the adapter's callee, so (%rbp) is
+#     the adapter `main`'s rbp, which is _start's call-site rsp - 16.
+# Each failure has its own exit code.
+
+import ritzlib.sys { sys_write, STDOUT }
+
+fn put(s: StrView)
+    sys_write(STDOUT, s.ptr, s.len)
+
+fn same(a: StrView, b: StrView) -> bool
+    if a.len != b.len
+        return false
+    var i: i64 = 0
+    while i < a.len
+        if a.ptr[i] != b.ptr[i]
+            return false
+        i = i + 1
+    true
+
+pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32
+    var start_frame: i64 = 0
+    asm x86_64 (out start_frame):
+        movq (%rbp), {start_frame}
+    put("span_args:")
+    var i: i64 = 0
+    while i < args.len
+        put(" [")
+        put(args[i])
+        put("]")
+        i = i + 1
+    put("\n")
+    if args.len != 3
+        return 10
+    if not same(args[0], "span_args")
+        return 11
+    if not same(args[1], "alpha")
+        return 12
+    if not same(args[2], "beta-gamma")
+        return 13
+    if env.len != 0
+        return 14
+    if (start_frame & 15) != 0
+        return 15
+    0
