@@ -32,12 +32,10 @@ _NOT_FLOAT = "global 'g' is not a float type but has a float initializer"
 
 # name -> (source, line, column, message prefix)
 REJECTED = {
-    "binary": ("var g: i32 = 1 + 2\n" + _MAIN, 1, 14, _NON_CONST),
     "bool_into_int": ("var g: i32 = true\n" + _MAIN, 1, 14, _B2I),
     "not_of_a_global": ("var x: bool\nvar g: bool = not x\n" + _MAIN, 2, 15, _NON_CONST),
     "neg_of_a_global": ("var x: i32\nvar g: i32 = -x\n" + _MAIN, 2, 14, _NON_CONST),
     "bit_not_of_a_global": ("var x: i32\nvar g: i32 = ~x\n" + _MAIN, 2, 14, _NON_CONST),
-    "cast_of_binary": ("var g: i64 = (1 + 2) as i64\n" + _MAIN, 1, 15, _NON_CONST),
     # AGAST #1539: a char / float initializer folds, but only into a slot of
     # its kind.  ritz1 located the float misfits at column 1 until #3680.
     "float_into_int": ("var g: i32 = 1.5\n" + _MAIN, 1, 14, _NOT_FLOAT),
@@ -47,9 +45,6 @@ REJECTED = {
     "float_into_bool": ("var g: bool = 1.5\n" + _MAIN, 1, 15, "cannot use a float as bool"),
     "char_into_bool": ("var g: bool = 'A'\n" + _MAIN, 1, 15, "cannot use an integer as bool"),
     "bit_not_float": ("var g: f64 = ~1.5\n" + _MAIN, 1, 14, _NON_CONST),
-    # AGAST #1540 / #3702: an integer or bool const folds (run in
-    # test_ritz1_global_var_init.py), a float const does not.
-    "float_const": ("const F: f64 = 1.5\nvar g: f64 = F\n" + _MAIN, 2, 14, _NON_CONST),
 }
 
 
@@ -93,6 +88,32 @@ def test_ritz0_null_into_an_integer_global_is_a_located_error(request, tmp_path)
     assert proc.returncode != 0 and "ValueError" not in out, out[-1500:]
     assert re.search(r"unit\.ritz:1:14: (?:error: )?global 'g' .*null", out), out[-1500:]
     assert not ll.exists()
+
+
+# LARB R60 (§4.3): arithmetic and a float const are constant initialisers.
+# ritz0 lowers them since #3479 (test_const_init_r60.py runs them); ritz1 and
+# ritz1_selfhosted still refuse them, located, until #3480.
+# name -> (source, line, column)
+_R60_RITZ1_REFUSES = {
+    "binary": ("var g: i32 = 1 + 2\n" + _MAIN, 1, 14),
+    "cast_of_binary": ("var g: i64 = (1 + 2) as i64\n" + _MAIN, 1, 15),
+    "float_const": ("const F: f64 = 1.5\nvar g: f64 = F\n" + _MAIN, 2, 14),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(_R60_RITZ1_REFUSES))
+def test_r60_initializer_is_ritz0s_until_ritz1_lands_it(request, tmp_path, compiler, name):
+    source, line, col = _R60_RITZ1_REFUSES[name]
+    proc, ll = _compile(request, compiler, tmp_path, source)
+    out = proc.stdout + proc.stderr
+    if compiler == "ritz0":
+        assert proc.returncode == 0 and ll.exists(), f"ritz0 refused {name}:\n{out[-1500:]}"
+        return
+    assert proc.returncode != 0, f"{compiler} accepted {name}: #3480 landed, run it instead"
+    hits = re.findall(rf"unit\.ritz:{line}:{col}: (?:error: )?{re.escape(_NON_CONST)}", out)
+    assert len(hits) == 1, f"{compiler}, {name}:\n{out[-1500:]}"
 
 
 # ritz1-only: ritz0 lowers a non-zero f32 global, and calls `null` in a
@@ -156,10 +177,12 @@ def test_an_untyped_global_var_is_an_error_at_the_eq(request, tmp_path, compiler
 @pytest.mark.parametrize("source", ["let g = true\n", "let g: bool = true\n"])
 def test_ritz0_a_module_level_let_is_refused(request, tmp_path, source):
     """No compiler has a module-level `let` (R38 names one; it isn't an item),
-    so typed or not it stays a located refusal at the `let`."""
+    so typed or not it stays a located refusal at the `let`: since LARB R60
+    (#3479) ritz0's says so, where it was the parse error "Expected item"."""
     proc, ll = _compile(request, "ritz0", tmp_path, source + _MAIN)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, out[-1500:]
     assert "Traceback" not in out, out[-1500:]
-    assert re.search(r"unit\.ritz:1:1: ", out), out[-1500:]
+    assert re.search(r"unit\.ritz:1:1: there is no module-level `let`", out), out[-1500:]
+    assert "Parse error" not in out, out[-1500:]
     assert not ll.exists()

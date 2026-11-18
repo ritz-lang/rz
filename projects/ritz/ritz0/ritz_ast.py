@@ -1086,6 +1086,9 @@ class VarDef(Item):
     is_extern: bool = False
     # Where the `=` is, for R38's "a global needs a type" (AGAST #3374).
     eq_span: Optional[Span] = None
+    # `let g = ...` at module level (LARB R60, §4.3): parsed so it can be
+    # refused at the `let` with a located error, never a parse error.
+    is_let: bool = False
 
 
 @dataclass

@@ -2636,10 +2636,12 @@ class Parser:
         value = self.parse_expr()
         return rast.ConstDef(span, name, const_type, value, is_pub=is_pub, attrs=attrs or [])
 
-    def parse_var_def(self, is_pub: bool = False) -> rast.VarDef:
-        """Parse a module-level variable: var counter: i32 = 0."""
+    def parse_var_def(self, is_pub: bool = False,
+                      keyword: TokenType = TokenType.VAR) -> rast.VarDef:
+        """Parse a module-level variable: var counter: i32 = 0.  With
+        `keyword=LET`, the `let` the emitter refuses (LARB R60)."""
         span = self._current().span
-        self._expect(TokenType.VAR)
+        self._expect(keyword)
         name = self._expect(TokenType.IDENT).value
 
         var_type = None
@@ -2657,7 +2659,8 @@ class Parser:
         if var_type is None and value is None:
             raise ParseError("Module-level variable must have a type annotation or initializer", span)
 
-        return rast.VarDef(span, name, var_type, value, is_pub=is_pub, eq_span=eq_span)
+        return rast.VarDef(span, name, var_type, value, is_pub=is_pub, eq_span=eq_span,
+                           is_let=keyword == TokenType.LET)
 
     def parse_extern_var(self, is_pub: bool = False) -> rast.VarDef:
         """`extern var NAME: T` (LANGUAGE_SPEC §5.3, AGAST #1879).
@@ -2941,6 +2944,10 @@ class Parser:
             if attrs:
                 raise ParseError("Attributes not allowed on module-level variables (yet)", self._current().span)
             return self.parse_var_def(is_pub=is_pub)
+        if self._at(TokenType.LET):
+            # LARB R60: there is no module-level `let`.  Parsed as a global,
+            # and refused at the `let` by the emitter (`is_let`).
+            return self.parse_var_def(is_pub=is_pub, keyword=TokenType.LET)
         if self._at(TokenType.TYPE):
             self._check_attrs_apply(attrs, "type")
             alias = self.parse_type_alias(is_pub=is_pub)

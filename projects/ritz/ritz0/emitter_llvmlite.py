@@ -237,9 +237,37 @@ _STR_AS_PTR = {
     'String': "a String is not a `*u8`: write `string_as_ptr(@&s)`",
 }
 
-# A global initializer ritz0 cannot fold (AGAST #3027), in ritz1's words.
-_GLOBAL_NON_CONSTANT = ("has a non-constant initializer; ritz0 lowers only literals, "
-                        "unary -/~/not of one, null and casts of those")
+# An initializer that isn't a constant initialiser (LANGUAGE_SPEC §4.3, LARB
+# R60; AGAST #3027 for the first half, ritz1's words).
+_GLOBAL_NON_CONSTANT = ("has a non-constant initializer: a constant initialiser is a "
+                        "literal, a const, arithmetic or a cast of those, a unit enum "
+                        "variant, or an array or struct literal of them (§4.3)")
+_CONST_PAYLOAD_VARIANT = "is a variant with a payload, which isn't a constant initialiser"
+
+
+@dataclass(frozen=True)
+class _ConstSite:
+    """Where in a module-level value's initialiser a part is (LARB R60), for
+    its errors: `global 'g'`, `const 'C' element 2`, `global 'g' field 'n.k'`."""
+    what: str
+    element: Optional[int] = None
+    path: str = ""
+
+    def field(self, name: str) -> "_ConstSite":
+        return replace(self, path=f"{self.path}.{name}" if self.path else name)
+
+    def at(self, index: int) -> "_ConstSite":
+        if self.path:  # an array inside a field: `field 'xs[1]'`
+            return replace(self, path=f"{self.path}[{index}]")
+        return replace(self, element=index)
+
+    def __str__(self) -> str:
+        text = self.what
+        if self.element is not None:
+            text += f" element {self.element}"
+        if self.path:
+            text += f" field '{self.path}'"
+        return text
 
 SRET_MIN_BYTES = 256
 # LLVM refuses a byval param whose type is this big or bigger (AGAST #3668).
@@ -897,6 +925,10 @@ class LLVMEmitter:
         # What a local may not be named: binder_names.module_values (AGAST #2407).
         self._module_values: Dict[str, str] = {}
         self.const_arrays: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
+        # LARB R60: struct and enum consts, lowered to read-only data (kept in
+        # const_arrays, as R48 has a const array) once scalar consts fold.
+        self._pending_const_data: Dict[str, rast.ConstDef] = {}
+        self._lowering_const_data: Set[str] = set()
         # name -> declared Ritz type of a scalar const. The LLVM type in
         # self.constants drops signedness, so without this a `const M: u8 =
         # 200` was widened with sext (200 -> -56) at its use sites (#2170).
@@ -2280,7 +2312,10 @@ class LLVMEmitter:
                             else bool_rules.INTEGER)
                     raise EmitError(bool_rules.bool_into_slot(kind), var_def.value.span)
                 else:
-                    raise self._global_init_error(var_def, _GLOBAL_NON_CONSTANT)
+                    # LARB R60: arithmetic, a float const, an array, fill,
+                    # struct or StrView literal, a unit variant (R75), a const.
+                    gvar.initializer = self._const_init(
+                        var_def.value, ritz_ty, _ConstSite(f"global '{var_def.name}'"))
             else:
                 # Zero initialize
                 gvar.initializer = ir.Constant(ty, None)  # zeroinitializer
@@ -2293,6 +2328,225 @@ class LLVMEmitter:
         # Store in lookup table
         self.globals[var_def.name] = (gvar, ty)
         self.ritz_types[var_def.name] = ritz_ty
+
+    # =========================================================================
+    # Constant initialisers (LANGUAGE_SPEC §4.3, LARB R60 / R75, AGAST #3479)
+    # =========================================================================
+    #
+    # One rule for a const's value and a global var's initialiser: a literal
+    # (int, float, bool, char, "..."), a const, arithmetic or a cast of
+    # constant initialisers, a unit enum variant, or an array or struct
+    # literal of them.  `_const_init` lowers one against its declared type to
+    # the ir.Constant written into the module; nothing runs before `main`.
+
+    def _const_init(self, expr: rast.Expr, ritz_type: rast.Type,
+                    site: _ConstSite) -> ir.Constant:
+        """The constant `expr` is in a slot of `ritz_type`, or a located error
+        naming `site`."""
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        ritz_type = self._resolve_const_field_alias(ritz_type)
+        llvm_type = self._ritz_type_to_llvm(ritz_type)
+
+        def refuse(why: str):
+            raise EmitError(f"{site} {why}", getattr(expr, "span", None))
+
+        if isinstance(expr, rast.Ident) and self._is_const_data(expr.name):
+            # A const's value: a struct, enum or array const is read-only
+            # data whose initializer is that value.
+            gvar = self._const_data_global(expr.name)
+            if gvar.type.pointee != llvm_type:
+                refuse(f"names const `{expr.name}`, which is not a "
+                       f"`{self._show_type(ritz_type)}`")
+            return gvar.initializer
+        if isinstance(llvm_type, ir.IntType):
+            return self._const_init_int(expr, llvm_type, refuse)
+        if isinstance(llvm_type, (ir.FloatType, ir.DoubleType)):
+            value = self._fold_float_init(expr)
+            if value is None:
+                refuse(_GLOBAL_NON_CONSTANT)
+            return ir.Constant(llvm_type, value)
+        if isinstance(llvm_type, ir.PointerType):
+            if isinstance(expr, rast.NullLit):
+                return ir.Constant(llvm_type, None)
+            if (isinstance(expr, (rast.StringLit, rast.CStringLit))
+                    and llvm_type.pointee == self.i8):
+                return self._const_str_ptr(expr.value)
+            if isinstance(expr, rast.Cast):
+                # `4096 as *u8`: the address (AGAST #1539); 0 is null.
+                addr = ConstEvaluator(self._known_int_consts(),
+                                      self._u64_const_names()).try_evaluate(expr.expr)
+                if addr is not None:
+                    if addr == 0:
+                        return ir.Constant(llvm_type, None)
+                    return ir.Constant(self.i64, addr).inttoptr(llvm_type)
+            refuse("is not a constant pointer (null, a string literal or an address cast)")
+        if isinstance(expr, rast.StringLit) and self._is_strview_llvm_type(llvm_type):
+            return self._make_const_strview_value(expr.value, "cinit", llvm_type)
+        if isinstance(ritz_type, rast.ArrayType) and isinstance(llvm_type, ir.ArrayType):
+            return self._const_init_array(expr, ritz_type, llvm_type, site, refuse)
+        if isinstance(ritz_type, rast.NamedType) and not ritz_type.args:
+            if ritz_type.name in self.enum_types:
+                return self._const_init_variant(expr, ritz_type.name, llvm_type, refuse)
+            if ritz_type.name in self.struct_fields:
+                return self._const_init_struct(expr, ritz_type.name, llvm_type, site, refuse)
+        refuse(_GLOBAL_NON_CONSTANT)
+
+    def _const_init_int(self, expr: rast.Expr, llvm_type: ir.IntType, refuse) -> ir.Constant:
+        """An integer or bool slot: folded by the const evaluator, so `K * 2 + 1`,
+        `(1 + 2) as i64` and `'A' + 1` are constants; wrapped to the width."""
+        if llvm_type == self.i1:
+            bit = self._fold_bool_global_init(expr)
+            if bit is None:
+                refuse(_GLOBAL_NON_CONSTANT)
+            return ir.Constant(llvm_type, bit)
+        if isinstance(expr, rast.BoolLit):
+            raise EmitError(bool_rules.bool_into_slot(bool_rules.INTEGER), expr.span)
+        try:
+            value = ConstEvaluator(self._known_int_consts(),
+                                   self._u64_const_names()).evaluate(expr)
+        except ConstEvalError:
+            if self._fold_float_init(expr) is not None:
+                refuse("is not a float type but has a float initializer")
+            refuse(_GLOBAL_NON_CONSTANT)
+        return ir.Constant(llvm_type, self._wrap_to_int_type(value, llvm_type))
+
+    def _fold_float_init(self, expr: rast.Expr) -> Optional[float]:
+        """A float slot's constant, or None: a float or integer literal, a
+        numeric const, `-`, `+ - * /` and casts of those.  Each literal is the
+        double nearest it, as Python's float() gives (ritz-task-2787)."""
+        if isinstance(expr, rast.Grouped):
+            return self._fold_float_init(expr.expr)
+        if isinstance(expr, rast.FloatLit):
+            return float(expr.value)
+        if isinstance(expr, (rast.IntLit, rast.CharLit)) and not isinstance(expr.value, bool):
+            return float(expr.value)
+        if isinstance(expr, rast.Ident) and expr.name in self.constants:
+            value, ty = self.constants[expr.name]
+            if isinstance(value, bool) or ty == self.i1:
+                return None
+            return float(value)
+        if isinstance(expr, rast.Cast):
+            return self._fold_float_init(expr.expr)
+        if isinstance(expr, rast.UnaryOp) and expr.op == '-':
+            inner = self._fold_float_init(expr.operand)
+            return None if inner is None else -inner
+        if isinstance(expr, rast.BinOp) and expr.op in ('+', '-', '*', '/'):
+            left = self._fold_float_init(expr.left)
+            right = self._fold_float_init(expr.right)
+            if left is None or right is None:
+                return None
+            if expr.op == '+':
+                return left + right
+            if expr.op == '-':
+                return left - right
+            if expr.op == '*':
+                return left * right
+            if right == 0.0:
+                return None
+            return left / right
+        return None
+
+    def _const_init_array(self, expr: rast.Expr, ritz_type: rast.ArrayType,
+                          llvm_type: ir.ArrayType, site: _ConstSite, refuse) -> ir.Constant:
+        """`[a, b, c]` of exactly N constants, or the fill `[v; N]`."""
+        count = llvm_type.count
+        if isinstance(expr, rast.ArrayLit):
+            if len(expr.elements) != count:
+                refuse(f"is an array literal of {len(expr.elements)} elements for a "
+                       f"{self._show_type(ritz_type)}")
+            return ir.Constant(llvm_type, [
+                self._const_init(elem, ritz_type.inner, site.at(i))
+                for i, elem in enumerate(expr.elements)])
+        if isinstance(expr, rast.ArrayFill):
+            if expr.count != count:
+                refuse(f"is a fill of {expr.count} elements for a {self._show_type(ritz_type)}")
+            fill = self._const_init(expr.value, ritz_type.inner, site.at(0))
+            return ir.Constant(llvm_type, [fill] * count)
+        refuse(_GLOBAL_NON_CONSTANT)
+
+    def _const_init_struct(self, expr: rast.Expr, name: str, llvm_type: ir.Type,
+                           site: _ConstSite, refuse) -> ir.Constant:
+        """`S { f: v, ... }`: every field, each a constant of its own type."""
+        if not isinstance(expr, rast.StructLit):
+            refuse(_GLOBAL_NON_CONSTANT)
+        if expr.name != name:
+            refuse(f"is a `{expr.name}` literal for a `{name}`")
+        given = dict(expr.fields)
+        declared = self.struct_fields[name]
+        for field_name, _ in expr.fields:
+            if not any(field_name == f for f, _ in declared):
+                refuse(f"names field '{field_name}', which `{name}` doesn't have")
+        values = []
+        for field_name, field_type in declared:
+            if field_name not in given:
+                refuse(f"has no value for field '{field_name}'")
+            values.append(self._const_init(given[field_name], field_type, site.field(field_name)))
+        return ir.Constant(llvm_type, values)
+
+    def _const_init_variant(self, expr: rast.Expr, enum_name: str, llvm_type: ir.Type,
+                            refuse) -> ir.Constant:
+        """A unit variant `E.V` (LARB R75): its tag, the payload bytes zero.
+        A variant with a payload is refused, constructed or not."""
+        variant, constructed = None, False
+        if isinstance(expr, rast.MethodCall) and isinstance(expr.expr, rast.Ident) \
+                and expr.expr.name == enum_name:
+            variant, constructed = expr.method, True        # `E.V(x)`
+        elif isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            variant, constructed = expr.func.name, True     # `V(x)`
+        elif (isinstance(expr, rast.Field) and isinstance(expr.expr, rast.Ident)
+                and expr.expr.name == enum_name):
+            variant = expr.field                            # `E.V`
+        elif isinstance(expr, rast.Ident):
+            variant = expr.name                             # `V`
+        if variant is None or not self._has_enum_variant(enum_name, variant):
+            refuse(_GLOBAL_NON_CONSTANT)
+        if constructed or self._get_enum_variant(enum_name, variant).fields:
+            refuse(_CONST_PAYLOAD_VARIANT)
+        tag = ir.Constant(self.i8, self._get_enum_variant_tag(enum_name, variant))
+        return ir.Constant(llvm_type, [tag] + [ir.Constant(t, None) for t in llvm_type.elements[1:]])
+
+    def _names_enum(self, ty: rast.Type) -> bool:
+        """Is `ty` (through any alias) a non-generic enum?"""
+        ty = self._resolve_const_field_alias(ty)
+        return isinstance(ty, rast.NamedType) and not ty.args and ty.name in self.enum_types
+
+    def _is_const_data(self, name: str) -> bool:
+        """Is `name` a const kept as read-only data (an array, struct or enum
+        const), lowered or still pending?"""
+        return name in self.const_arrays or name in self._pending_const_data
+
+    def _const_data_global(self, name: str) -> ir.GlobalVariable:
+        """The read-only global of struct or enum const `name`, lowering it
+        now if no one has yet: a const may name one declared later."""
+        if name in self.const_arrays:
+            return self.const_arrays[name][0]
+        item = self._pending_const_data[name]
+        if name in self._lowering_const_data:
+            raise EmitError(f"const '{name}': value is not a constant expression "
+                            f"(circular definition)", item.value.span)
+        self._lowering_const_data.add(name)
+        value = self._const_init(item.value, item.type, _ConstSite(f"const '{name}'"))
+        self._lowering_const_data.discard(name)
+        gvar = ir.GlobalVariable(self.module, value.type, name=name)
+        gvar.global_constant = True
+        gvar.linkage = "internal"
+        gvar.initializer = value
+        # LARB R60: read-only data like a const array (R48), so every write
+        # and `@&` of it, or a place inside it, is refused as one's is.
+        self.const_arrays[name] = (gvar, value.type)
+        self.ritz_types[name] = item.type
+        del self._pending_const_data[name]
+        return gvar
+
+    def _refuse_drop_const(self, item: rast.ConstDef) -> None:
+        """LARB R60: a const of a type with `Drop` is an error (§4.3).
+        Nothing drops it: it lives until the process exits.  A global `var`'s
+        half waits on migrating the 11 globals that have one (AGAST #4079)."""
+        if not self.move_types.is_move_only(item.type):
+            return
+        raise EmitError(f"const '{item.name}' has type `{self._show_type(item.type)}`, "
+                        f"which has Drop: a module-level value is never dropped", item.span)
 
     def _emit_const_array(self, name: str, ritz_type: rast.Type, value: rast.Expr) -> None:
         """Emit a module-level constant array as a global.
@@ -2325,7 +2579,15 @@ class LLVMEmitter:
 
         # Extract element values
         is_ptr_array = isinstance(elem_type, ir.PointerType)
-        if isinstance(value, rast.ArrayLit):
+        # LARB R60 / R75: a float or enum element (`[1.0e1, 0.1]`,
+        # `[Color.Red, ...]`) is a constant initialiser like any other.
+        shared = (isinstance(ritz_type, rast.ArrayType)
+                  and (isinstance(elem_type, (ir.FloatType, ir.DoubleType))
+                       or isinstance(elem_type, ir.ArrayType)
+                       or self._names_enum(ritz_type.inner)))
+        if shared and isinstance(value, (rast.ArrayLit, rast.ArrayFill)):
+            elements = list(self._const_init(value, ritz_type, _ConstSite(f"const '{name}'")).constant)
+        elif isinstance(value, rast.ArrayLit):
             elements = []
             for elem in value.elements:
                 if isinstance(elem, rast.StringLit) and is_strview_array:
@@ -3037,6 +3299,13 @@ class LLVMEmitter:
         const_exprs = []
         global_vars = []
         for item in module.items:
+            if isinstance(item, rast.VarDef) and item.is_let:
+                # LARB R60 (§4.3): module-level values are `const` and `var`.
+                raise EmitError(f"there is no module-level `let`: declare `const "
+                                f"{item.name}` for a value, or `var {item.name}` for a "
+                                f"global that changes", item.span)
+            if isinstance(item, rast.ConstDef):
+                self._refuse_drop_const(item)
             if isinstance(item, rast.ConstDef):
                 ty = self._ritz_type_to_llvm(item.type)
                 self.const_ritz_types[item.name] = item.type
@@ -3066,6 +3335,11 @@ class LLVMEmitter:
                 elif isinstance(item.value, rast.StringLit):
                     # String constant - emit as global StrView
                     self._emit_const_strview(item.name, item.value.value)
+                elif isinstance(ty, ir.BaseStructType):
+                    # LARB R60 / R75: `const C: P = P { ... }`, `const E: Color =
+                    # Color.Blue`: read-only data, lowered once every scalar
+                    # const is folded (_const_data_global).
+                    self._pending_const_data[item.name] = item
                 else:
                     # `-1`, `2 + 3`, `K * 2`, `-1 as i64`, ...: folded once
                     # every literal const is known (AGAST #2150).
@@ -3076,11 +3350,15 @@ class LLVMEmitter:
                 self._declare_extern(item)
         self._fold_scalar_consts(const_exprs)
         # After every scalar const is folded, so `var g: i32 = MAX` reads
-        # MAX's value even when MAX is declared later or derived (#3702).
-        for item in global_vars:
-            self._emit_global_var(item)
+        # MAX's value even when MAX is declared later or derived (#3702),
+        # and before the globals, which may name any const (LARB R60).
         for item in const_arrays:
             self._emit_const_array(item.name, item.type, item.value)
+        for name in list(self._pending_const_data):
+            if name in self._pending_const_data:
+                self._const_data_global(name)
+        for item in global_vars:
+            self._emit_global_var(item)
 
         # Fourth pass: process traits and impl blocks
         # Traits just store method signatures for validation
@@ -9146,6 +9424,11 @@ class LLVMEmitter:
             if name in self.globals:
                 gvar, ty = self.globals[name]
                 return self.builder.load(gvar)
+
+            # A struct or enum const (LARB R60): a copy of its read-only data.
+            if self._is_const_array_name(name) and not isinstance(
+                    self.const_arrays[name][1], ir.ArrayType):
+                return self.builder.load(self.const_arrays[name][0])
 
             # Handle nil keyword (null pointer literal)
             if name == "nil":

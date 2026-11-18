@@ -1315,6 +1315,64 @@ into its read-only data (LARB R48, AGAST #3359). `@&A[i]` stays an error, since
 a const is never a place you can write. A `const` scalar has no storage, so
 `@N` of one is an error.
 
+#### Constant initialisers
+
+Module-level values are `const` and `var`; there is no module-level `let`
+(`let g: i64 = 1` at module level is an error at the `let`). A global `var`
+needs its type (above), and its initialiser, like a const's, is a *constant
+initialiser* (LARB R60, R75; AGAST #3479):
+
+- a literal: an integer, float, bool or char, `"…"` (a `StrView`, or a `*u8`
+  in a `*u8` slot), `c"…"`, or `null` in a pointer slot;
+- a const;
+- arithmetic or a cast of constant initialisers (`K * 2 + 1`, `F * 2.0`,
+  `(1 + 2) as i64`, `4096 as *u8`);
+- a unit enum variant (`Color.Blue`); a variant with a payload is an error;
+- an array literal (`[a, b, c]`, exactly `N` elements) or fill (`[v; N]`), or
+  a struct literal (every field), of constant initialisers.
+
+Each part is typed against its slot (§13.2), as a `let`'s would be, and each
+float literal is the `f64` nearest it. No call runs before `main`: an
+initialiser that calls a fn, or reads a global `var`, is an error at it. A
+global with no initialiser is zeroed.
+
+```ritz
+struct Limits
+    lo: i64
+    hi: f64
+    name: StrView
+
+enum Mode
+    Fast
+    Safe
+
+const K: i64 = 4
+const SCALE: f64 = 1.5
+const DEFAULT: Limits = Limits { lo: K * 2, hi: SCALE * 2.0, name: "std" }
+const MODE: Mode = Mode.Safe
+
+var counter: i64 = K * 2 + 1
+var weights: [3]f64 = [0.5, SCALE, 1.0e3]
+var limits: Limits = DEFAULT
+var mode: Mode = Mode.Fast
+
+fn main() -> i32
+    counter = counter + limits.lo     # 9 + 8
+    match MODE
+        Mode.Fast => 1
+        Mode.Safe => (counter - 17) as i32
+```
+
+A struct or enum const is read-only data, like a const array: `C.f` and `C`
+read it, `@C` is an `@S` into it, and `@&C`, `C.f = v` and a borrow of it
+through a `self:&` method are errors. A const isn't a pattern: an arm naming
+a struct or enum const is refused as any binder taking a const's name is
+(below); match the variant itself.
+
+A const of a type with `Drop`, or one holding a type with `Drop`, is an error
+at the `const`: nothing would ever drop it. The same rule for a global `var`
+is pending AGAST #4079, which first migrates the globals that have one.
+
 #### One meaning per name
 
 A local binding can't take the name of a module-level value that a bare read
