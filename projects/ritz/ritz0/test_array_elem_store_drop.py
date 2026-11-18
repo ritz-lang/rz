@@ -543,6 +543,35 @@ def test_struct_elem_of_cast_base_as_int_refused(tmp_path, compiler):
     assert found == [(where, msg)], f"{compiler}: wanted {msg!r} at {where}:\n{out[-2000:]}"
 
 
+# `*((e as **T) + k)` reads the same `*T` as `(e as **T)[k]`: the sum strides
+# a pointer's width and the deref loads a pointer (AGAST #3834; ritz1 loaded
+# from `e + k` bytes, a SIGSEGV).  `*(e as **T)` is element 0.
+CAST_PTR_PTR_DEREF = """\
+var P: i64 = 0
+
+fn base() -> i64
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var x: i32 = 1
+    var y: i32 = 3
+    var z: i32 = 4
+    var ps: [3]*i32 = [@x, @y, @z]
+    P = @ps[0] as i64
+    let r: *i32 = *((base() as **i32) + 1)
+    let t: *i32 = *((P as **i32) + 2)
+    let u: *i32 = *(P as **i32)
+    D = ((D * 10 + *r as i64) * 10 + *t as i64) * 10 + *u as i64
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_deref_cast_ptr_ptr_sum(tmp_path, compiler):
+    rc = _run(compiler, tmp_path, "cast_pp_deref", _source(CAST_PTR_PTR_DEREF, "f()", 6341))
+    assert rc == 42, f"{compiler}: D % 200 == {rc}, spec says D == 6341"
+
+
 # A scalar base, or pointer arithmetic the store above doesn't type, reached
 # that generic path too; ritz1's Sema refuses it (index_store_check).  An
 # integer base in ritz0's words for `n[i] = v`, on every compiler (ritz0 raised
