@@ -137,3 +137,20 @@ def test_serial_files_are_left_to_the_full_step(repo):
     (repo / R0 / "test_slow.py").write_text(
         "import pytest\n@pytest.mark.slow\ndef test_x(): pass\n")
     assert likely_tests.select(repo) == ["test_plain.py"]
+
+
+# AGAST #3623: the pre-pass hands out its costly files first, so their tests
+# are not the tail seven idle workers wait on.  Costs come from the last
+# gate on the host; a file it never saw (new since) leads, being both the
+# likeliest to fail and of unknown cost.
+def test_costliest_first_new_files_then_known_by_cost():
+    files = ["new_b.py", "cheap.py", "new_a.py", "dear.py", "mid.py", "mid2.py"]
+    costs = {"cheap.py": 0.5, "dear.py": 57.5, "mid.py": 4.0, "mid2.py": 4.0,
+             "gone.py": 99.0}
+    assert likely_tests.costliest_first(files, costs) == [
+        "new_b.py", "new_a.py", "dear.py", "mid.py", "mid2.py", "cheap.py"]
+
+
+def test_costliest_first_without_costs_keeps_the_order():
+    files = ["b.py", "a.py", "c.py"]
+    assert likely_tests.costliest_first(files, {}) == files

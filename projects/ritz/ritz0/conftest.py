@@ -123,6 +123,11 @@ AGAST #1392. Two things live here, and they are independent.
    another row's import or generic instance is compiled alone too, and gets
    no batched answer if it does (AGAST #2867).  RITZ_TEST_BATCH=0 turns it
    off.
+
+12. `--only-file=PATH` (AGAST #3623, ritz0/only_files.py) — collect only the
+   listed files, in the listed order.  The gate's likely-first pre-pass uses
+   it: as 60 file arguments the same files cost every xdist worker ~8 s of
+   collection, since pytest re-walks this directory once per file argument.
 """
 
 import os
@@ -137,7 +142,7 @@ import batching
 import fast_link
 import ritz0_inproc
 
-pytest_plugins = ["spawn_guard", "cost_meter"]
+pytest_plugins = ["spawn_guard", "cost_meter", "only_files"]
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
