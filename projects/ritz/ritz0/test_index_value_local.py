@@ -316,6 +316,16 @@ def an_undeclared_span_still_reads():
     return Run(program, 7)
 
 
+# The same read through a borrowed receiver: `as_bytes()` on an `@StrView` param,
+# bound to a local whose `.len` is read too (#3699 broke `b.len` in ritz0).
+@case()
+def a_borrowed_strview_as_bytes_reads():
+    program = ("import ritzlib.strview\n\nfn f(s: @StrView) -> i64\n    let b = s.as_bytes()\n"
+               "    b.len + (b[1] - b[0]) as i64\n\npub fn main() -> i32\n"
+               "    let s: StrView = \"ABC\"\n    return f(@s) as i32 + 3\n")
+    return Run(program, 7)
+
+
 TABLE = table_rows.cases(globals())
 
 
