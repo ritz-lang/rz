@@ -414,7 +414,11 @@ def run_step(step: Step, dry_run: bool = False) -> int:
         # The 127/2 class of failure, named rather than left to a shell.
         print(f"  ERROR: working-directory does not exist: {cwd}", file=sys.stderr)
         return 2
-    env = {**os.environ, **step.env}
+    # The Makefile's `export RITZ_PATH` reaches us through `make ci-local`;
+    # CI's runner has none, so a step that needs ritzlib must say so itself.
+    # Inheriting it let the gate pass a test CI failed (AGAST #4150).
+    inherited = {k: v for k, v in os.environ.items() if k != "RITZ_PATH"}
+    env = {**inherited, **step.env}
     if step.llvm_bindir:
         if not Path(step.llvm_bindir).is_dir():
             # CI's action fails here too. Running on without it would skip

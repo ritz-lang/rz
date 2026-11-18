@@ -29,7 +29,11 @@ RITZ1 = ROOT / "projects/ritz/ritz1"
 
 # (project root, source roots, target, files) per package.
 GROUPS = {
-    "harland_kfree": (HARLAND, ["kernel/src"], "x86_64-none-elf", [
+    # ROOT/projects/ritz holds ritzlib (serial.ritz imports ritzlib.fmt,
+    # #1957): harland's build gets it from RITZ_PATH, which CI doesn't set
+    # for pytest (AGAST #4150).
+    "harland_kfree": (HARLAND, ["kernel/src", str(ROOT / "projects/ritz")],
+                      "x86_64-none-elf", [
         "kernel/src/drivers/display/framebuffer.ritz",
         "kernel/src/drivers/virtio/blk.ritz",
         "kernel/src/drivers/virtio/common.ritz",

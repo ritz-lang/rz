@@ -446,6 +446,23 @@ def test_real_bootstrap_job_pins_the_workflow_clang():
     assert pytest_step.llvm_bindir == ci_local.LLVM_BINDIR.format(version=version)
 
 
+@pytest.mark.unit
+def test_step_does_not_inherit_makefile_ritz_path(monkeypatch, tmp_path):
+    """AGAST #4150: `make ci-local` exports RITZ_PATH; CI's steps never see it.
+
+    Leaking it made the gate pass a test that resolves ritzlib only through
+    RITZ_PATH, while CI failed it.  A step's own `env:` may still set it.
+    """
+    monkeypatch.setenv("RITZ_PATH", "/leaked/from/make")
+    out = tmp_path / "seen"
+    run = f'printf "%s" "${{RITZ_PATH-unset}}" > {out}'
+    assert ci_local.run_step(ci_local.Step("j", "n", run, ".")) == 0
+    assert out.read_text() == "unset"
+    step = ci_local.Step("j", "n", run, ".", env={"RITZ_PATH": "/declared"})
+    assert ci_local.run_step(step) == 0
+    assert out.read_text() == "/declared"
+
+
 def test_real_verify_ir_steps_carry_their_env():
     verified = [s.name for s in ci_local.load_steps()
                 if s.job == "bootstrap" and s.env.get("RITZ_VERIFY_IR") == "1"]
