@@ -145,9 +145,11 @@ def test_serial_logs_are_uploaded_on_pass_and_fail():
 # Verdicts: the script against a stub QEMU
 # --------------------------------------------------------------------------
 
-# Writes $FAKE_SERIAL to the `-serial file:PATH` it was given, then idles
-# until killed (the script kills QEMU once a verdict appears, and `timeout`
-# kills it otherwise). Every argv goes to $STUB_LOG.
+# Writes $FAKE_SERIAL to the `-serial file:PATH` it was given. With
+# $FAKE_POWEROFF=1 it then exits 0, as QEMU does when the guest powers off
+# through ACPI (init's exit, AGAST #2755); otherwise it idles until killed
+# (the script stops QEMU once it has had POWEROFF_WAIT seconds after the
+# verdict, and `timeout` kills it otherwise). Every argv goes to $STUB_LOG.
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
 prev=""
@@ -155,6 +157,7 @@ for a in "$@"; do
     if [ "$prev" = "-serial" ]; then printf '%b' "$FAKE_SERIAL" > "${a#file:}"; fi
     prev="$a"
 done
+if [ "${FAKE_POWEROFF:-0}" = 1 ]; then sleep 1; exit 0; fi
 sleep 30
 """
 QEMU_IMG_STUB = """#!/usr/bin/env bash
@@ -177,7 +180,9 @@ SUITE_PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
-PASSED = BLK_MODERN + KEY_OK + SUITE_PASSED
+# init exits after the suite, and the kernel powers off (AGAST #2755).
+INIT_EXIT = r"[exit] init exited with code 0, powering off\n"
+PASSED = BLK_MODERN + KEY_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -228,6 +233,7 @@ def _run(
     full_path=True,
     env_extra=None,
     mode="native",
+    poweroff=True,
 ) -> subprocess.CompletedProcess:
     stubs = tree["stubs"]
     if qemu:
@@ -249,6 +255,8 @@ def _run(
         "OVMF_CODE": str(tree["ovmf"]),
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
         "FAKE_SERIAL": serial,
+        "FAKE_POWEROFF": "1" if poweroff else "0",
+        "POWEROFF_WAIT": "2",
         **(env_extra or {}),
     }
     return subprocess.run(
@@ -325,9 +333,31 @@ def test_native_boot_attaches_a_modern_only_blk_with_1024_entry_queues(tree):
     ids=["legacy-transport", "queue-not-capped"],
 )
 def test_native_blk_not_modern_with_a_256_entry_queue_fails(tree, blk_line):
-    r = _run(tree, blk_line + KEY_OK + SUITE_PASSED)
+    r = _run(tree, blk_line + KEY_OK + SUITE_PASSED + INIT_EXIT)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "virtio-blk did not come up over the modern transport" in r.stdout
+
+
+def test_all_tests_passed_reports_the_power_off(tree):
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS (native): init exited and QEMU powered off" in r.stdout
+
+
+def test_qemu_that_never_powers_off_fails(tree):
+    """init exited, but the machine hung instead of powering off: QEMU had to
+    be stopped (AGAST #2755)."""
+    r = _run(tree, PASSED, poweroff=False)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS (native): init Tier-1 suite" in r.stdout
+    assert "QEMU did not power off after init exited" in r.stdout
+
+
+def test_init_that_never_exits_fails(tree):
+    """QEMU exiting is not enough: init itself must have exited."""
+    r = _run(tree, BLK_MODERN + KEY_OK + SUITE_PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (native): init did not exit" in r.stdout
 
 
 def test_suite_passed_but_key_never_arrived_fails(tree):

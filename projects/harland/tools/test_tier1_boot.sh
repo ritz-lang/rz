@@ -18,6 +18,8 @@
 # Each boot also injects `sendkey a` through the QEMU monitor once the kernel
 # logs "[OK] VirtIO input device"; the key must reach the kernel's input queue
 # ("[virtio-input] event type=1 code=30 value=1") and init's input check.
+# init's exit powers the machine off (#2755): after the verdict QEMU must
+# exit by itself, with status 0, instead of hanging until it is stopped.
 #
 # Each ESP is a QEMU vvfat directory, so the only tools needed are
 # qemu-system-x86_64, OVMF, grub-mkstandalone (x86_64-efi) and python3.
@@ -28,6 +30,8 @@
 #        BOOT_TIMEOUT=N seconds per boot (default 60)
 #        KEEP_WORK=DIR  copy each boot's serial log (NAME.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
+#        POWEROFF_WAIT=N seconds QEMU gets to power off after the verdict
+#                       (default 15)
 #        QEMU_MEM=SIZE  guest RAM (default 2G; 512M puts every pmm page under
 #                       the low 1 GiB identity map, AGAST #3530)
 #
@@ -130,8 +134,7 @@ boot() {
         -drive "file=$WORK/$name-initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
         -serial "file:$serial" >/dev/null 2>&1 &
     local pid=$!
-    local key_sent=0
-    # init halts after the suite, so stop QEMU once a verdict line appears.
+    local key_sent=0 verdict=0
     for _ in $(seq 1 "$TIMEOUT"); do
         sleep 1
         if [ "$key_sent" = 0 ] && grep -aq "\[OK\] VirtIO input device" "$serial"; then
@@ -139,11 +142,22 @@ boot() {
             # that never lands is reported by key_received.
             send_key "$WORK/$name-mon.sock" a 2>/dev/null && key_sent=1
         fi
-        grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$serial" && { sleep 1; break; }
+        grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$serial" && { verdict=1; break; }
         kill -0 "$pid" 2>/dev/null || break
     done
+    # init's exit powers the machine off through ACPI (#2755), so after the
+    # verdict QEMU should exit by itself; give it POWEROFF_WAIT seconds, then
+    # stop it. Its exit status is 0 only for a guest power-off (124: timeout
+    # stopped it, 143: we did); powered_off checks it.
+    if [ "$verdict" = 1 ]; then
+        for _ in $(seq 1 "${POWEROFF_WAIT:-15}"); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+        done
+    fi
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
+    echo $? > "$WORK/$name.qemu-rc"
     echo "----- $name boot: Tier-1 suite output (tail) -----"
     sed -n '/Running Tier 1 Test Suite/,$p' "$serial" | grep -aE '^\[test\]|PASS|FAIL|Results|EXCEPTION|RIP|RSP' | tail -30
 }
@@ -197,6 +211,22 @@ no_exception() {
     fi
 }
 
+# powered_off NAME: pass only if init exited and QEMU then exited by itself
+# (ACPI S5 power-off) instead of hanging until it was stopped (#2755).
+powered_off() {
+    local log="$WORK/$1.log" qrc
+    qrc="$(cat "$WORK/$1.qemu-rc" 2>/dev/null)"
+    if ! grep -aq "\[exit\] init exited with code" "$log"; then
+        echo "FAIL ($1): init did not exit"
+        return 1
+    fi
+    if [ "$qrc" != 0 ]; then
+        echo "FAIL ($1): QEMU did not power off after init exited (exit status ${qrc:-none})"
+        return 1
+    fi
+    echo "PASS ($1): init exited and QEMU powered off"
+}
+
 # all_passed NAME: pass only if the kernel took no exception and the suite
 # reported ALL TESTS PASSED.
 all_passed() {
@@ -218,6 +248,7 @@ if [ "$MODE" != grub ]; then
     all_passed native || rc=1
     blk_transport native modern || rc=1
     key_received native || rc=1
+    powered_off native || rc=1
 fi
 
 if [ "$MODE" != native ]; then
@@ -244,6 +275,7 @@ EOF
     all_passed grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
+    powered_off grub || rc=1
 fi
 
 exit $rc

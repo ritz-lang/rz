@@ -77,7 +77,8 @@ VARS = {
     # memory.ritz's one global, g_next_mmap_addr, became a per-process cursor
     # (FsProc.mmap_next, fs/syscall.ritz) in AGAST #3530.
     "cwd": ["g_cwd", "g_cwd_len"],
-    "framebuffer": ["g_user_fb_mapped", "g_user_fb_addr"],
+    # framebuffer.ritz's g_user_fb_mapped/g_user_fb_addr cache was dropped in
+    # AGAST #2755: sys_fb_map maps into each calling process.
 }
 
 CONSTS = {
