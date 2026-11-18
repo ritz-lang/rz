@@ -345,7 +345,8 @@ def test_indium_user_sys_numbers_match_kernel():
     kernel's `enum Syscall` number: a private table can't send Yield as Spawn."""
     scanned = {p.name: _ritzlib_harland_numbers(p.read_text()) for p in INDIUM_USER.glob("*.ritz")}
     # Not vacuous: the scan reaches the programs that still declare numbers.
-    assert {"SYS_OPEN", "SYS_CLOSE"} <= set(scanned["libharland.ritz"]), scanned
+    # libharland declared SYS_OPEN/SYS_CLOSE until #1871 moved them to ritzlib.
+    assert not scanned["libharland.ritz"], scanned
     assert scanned["minimal_syscall.ritz"] == {"SYS_EXIT": 20}, scanned
     assert scanned["portable_hello.ritz"] == {"SYS_WRITE": 1, "SYS_EXIT": 20}, scanned
     drift = _indium_drift()
