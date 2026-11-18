@@ -75,12 +75,6 @@ _RITZ1_TWINS = {
     # --- codegen, runtime failures ---
 }
 
-# Files no compiler can build: they target draft features (LARB-0013) that
-# exist in no implementation. Listed for all three compilers.
-_ALL_COMPILERS = {
-    "test_level42": "AGAST #1626 — `[[cfg(...)]]` is implemented nowhere",
-}
-
 # ritz0 alone can't build these; ritz1 and ritz1_selfhosted run them.
 EXPECTED_FAILURES[("ritz0", "test_tuple_infer_match")] = (
     "AGAST #3022 — `let (x, y) = match <enum>` with tuple arms crashes ritz0's emitter"
@@ -89,9 +83,6 @@ EXPECTED_FAILURES[("ritz0", "test_tuple_infer_match")] = (
 for _key, _reason in _RITZ1_TWINS.items():
     EXPECTED_FAILURES[("ritz1", _key)] = _reason
     EXPECTED_FAILURES[("ritz1_selfhosted", _key)] = _reason
-for _key, _reason in _ALL_COMPILERS.items():
-    for _c in ("ritz0", "ritz1", "ritz1_selfhosted"):
-        EXPECTED_FAILURES[(_c, _key)] = _reason
 
 
 def ritz1_make_jobs():
