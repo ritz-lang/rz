@@ -1195,7 +1195,9 @@ fn main() -> i32
 
 A `StrView` also has the built-in method `as_bytes()`, which needs no import:
 `s.as_bytes()` is a `Span<u8>` of the same bytes, with no copy, valid as long
-as `s`'s bytes are (AGAST #3599). It takes no arguments. The result is a
+as `s`'s bytes are (AGAST #3599). It takes no arguments. The receiver may
+be a borrow: on `s: @StrView` or `s: @&StrView`, `s.as_bytes()` is the same
+`Span<u8>` (AGAST #3699, #4176). The result is a
 `Span<u8>` value, so pass it as itself: `@bytes` is an `@Span<u8>`, and a
 `Span<u8>` slot refuses it (no auto-deref, LARB R1):
 
