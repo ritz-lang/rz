@@ -159,11 +159,10 @@ ROUTES = {
     "generic_pointer_to_byte": GENERIC_WRITER + "pub fn main() -> i32\n    var a: u8 = 1\n"
                                "    var b: u8 = 3\n    var p: *u8 = @a\n    w<*u8>(p, @b)\n"
                                "    return *p as i32\n",
-    # The space is #2355: ritz1 won't close `w<*B<i32>>`.
     "generic_pointer_to_generic": "struct B<T>\n    v: T\n\n" + GENERIC_WRITER +
                                   "pub fn main() -> i32\n    var b1: B<i32> = B<i32> { v: 1 }\n"
                                   "    var b3: B<i32> = B<i32> { v: 3 }\n    var p: *B<i32> = @b1\n"
-                                  "    w<*B<i32> >(p, @b3)\n    return p.v\n",
+                                  "    w<*B<i32>>(p, @b3)\n    return p.v\n",
     "generic_pointer_to_float": GENERIC_WRITER + "pub fn main() -> i32\n    var a: f64 = 1.0\n"
                                 "    var b: f64 = 3.0\n    var p: *f64 = @a\n    w<*f64>(p, @b)\n    return *p as i32\n",
     "generic_pointer_to_pointer": C + GENERIC_WRITER + "pub fn main() -> i32\n" + GOOD +
