@@ -1252,6 +1252,30 @@ let x: i32 = 42       # Explicit type
 let y = 100           # Type inferred (i64)
 ```
 
+A `(…)` pattern destructures a tuple, one name per element, in order; `_`
+binds nothing:
+
+```ritz body
+let (a, _, c) = (1, 2, 3)   # a is 1, c is 3
+```
+
+It destructures tuples only. A named struct is read by its fields: binding
+them by position would silently rebind every name after a field added to the
+struct (LARB R67). There is no named-field pattern yet.
+
+```ritz expect-error="`Bounds` is a struct, not a tuple: read its fields"
+struct Bounds
+    x_min: i32
+    y_min: i32
+    x_max: i32
+    y_max: i32
+
+fn main() -> i32
+    let b = Bounds { x_min: 0, y_min: 1, x_max: 2, y_max: 3 }
+    let (_, y_min, _, y_max) = b    # write `let y_min = b.y_min`
+    y_max - y_min
+```
+
 Immutable bindings cannot be reassigned, whole or with a compound operator
 (`x += 1`):
 

@@ -26,7 +26,8 @@ One per path that reads the names, each able to fail on its own:
   * a call's tuple, by the emitter, with a u8 element (widened unsigned) and
     four names (a tail of two);
   * `_` among them, in the tail and before it;
-  * a tuple local and a named struct (positional, as ritz0 binds it);
+  * a tuple local and a named struct (positional; ritz0 refuses the
+    struct under LARB R67, so that row is ritz1's until #3500);
   * a literal, and if / match arms of literals: tuple_split_decl;
   * an if arm with a statement before its tuple: the emitter's if path;
   * a generic fn's `(T, T, T)`;
@@ -96,9 +97,14 @@ def _program(body: str) -> str:
     return FNS + EXTRA + "pub fn main() -> i32\n" + "".join(f"    {ln}\n" for ln in body.splitlines())
 
 
+# LARB R67: ritz0 refuses `named_struct` (a `(…)` pattern on a struct,
+# test_tuple_pattern_tuples_only.py); ritz1 still runs it until #3500.
+RUN_ROWS = [(compiler, name) for compiler in COMPILERS for name in sorted(RUNS)
+            if (compiler, name) != ("ritz0", "named_struct")]
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(RUNS))
+@pytest.mark.parametrize("compiler,name", RUN_ROWS)
 def test_destructure_of_n_names_runs(run_with, compiler, name):
     body, want = RUNS[name]
     assert run_with(compiler, name, _program(body)) == want

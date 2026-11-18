@@ -13,8 +13,9 @@ inferred `let` had no struct type to bind.  The global (#1553) and field
 `let` takes the element's struct.  `let (a, b) = ps[1]` (#2574) names its
 struct through index_elem_struct_name.
 
-ritz0 is the oracle: every row runs on all three compilers and must exit 0.
-Each program returns the number of the first check that failed.
+ritz0 is the oracle: every row runs on all three compilers and must exit 0,
+except the destructure form, which ritz0 refuses under LARB R67.  Each
+program returns the number of the first check that failed.
 """
 
 import pytest
@@ -94,9 +95,14 @@ def _program(holder: str, ty: str, form: str) -> str:
                            body=body)
 
 
+# LARB R67: ritz0 refuses the destructure form (a `(…)` pattern on a struct,
+# test_tuple_pattern_tuples_only.py); ritz1 still runs it until #3500.
+FORM_ROWS = [(form, compiler) for form in sorted(FORMS) for compiler in COMPILERS
+             if (form, compiler) != ("destructure", "ritz0")]
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("form", sorted(FORMS))
+@pytest.mark.parametrize("form,compiler", FORM_ROWS)
 @pytest.mark.parametrize("ty", sorted(TYPES))
 @pytest.mark.parametrize("holder", sorted(HOLDERS))
 def test_struct_element_by_value(run_with, holder, ty, form, compiler):

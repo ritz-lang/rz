@@ -14,7 +14,10 @@ registered or specialised, and the emitter found no `mk$i16`. `let p = ...`
 worked because LetStmt was walked. ritz1 ran the tuple form.
 
 Each program checks a generic free fn and a generic impl's method with i16,
-i64 and f32, on all three compilers, and returns 0 or the failing check.
+i64 and f32, and returns 0 or the failing check.  Under LARB R67 ritz0
+refuses them (a `(…)` pattern on a struct), so they run on ritz1 and
+ritz1_selfhosted only; ritz0's #2593 path is test_tuple_pattern_tuples_only.py's
+`three_in_generic` row, a generic call returning a tuple.
 """
 
 from pathlib import Path
@@ -25,7 +28,10 @@ from test_borrow_param_ref_field import _run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
-COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+# LARB R67: every program here destructures a struct, which ritz0 now refuses
+# (test_tuple_pattern_tuples_only.py covers its generic and tuple paths).
+# ritz1 still runs them until #3500 refuses them too.
+COMPILERS = ["ritz1", "ritz1_selfhosted"]
 
 
 @pytest.fixture
@@ -33,8 +39,6 @@ def run_with(ritz1_bin, tmp_path):
     bins = {"ritz1": ritz1_bin, "ritz1_selfhosted": SELFHOSTED_BIN}
 
     def go(compiler, name, program):
-        if compiler == "ritz0":
-            return _run("ritz0", None, tmp_path, name, program)
         return _run("ritz1", bins[compiler], tmp_path, name, program)
     return go
 

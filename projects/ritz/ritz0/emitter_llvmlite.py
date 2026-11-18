@@ -7463,10 +7463,16 @@ class LLVMEmitter:
             # Emit the tuple expression
             tuple_val = self._emit_expr(stmt.value)
 
-            # Extract each element and bind to the corresponding name
-            # Accept both LiteralStructType (tuples) and IdentifiedStructType
-            # (named structs) — positional destructure of a struct maps names to
-            # fields in declaration order.
+            # LARB R67 (AGAST #3499): a `(…)` pattern destructures tuples
+            # only.  A tuple is a literal struct; a named struct is identified,
+            # and binding its fields by position would rebind them silently
+            # when one is added.  Refused at the `(`, before the arity check
+            # (3 fields, 2 names was an unlocated ValueError).
+            struct = (self._get_struct_name_from_type(tuple_val.type)
+                      if isinstance(tuple_val.type, ir.IdentifiedStructType) else None)
+            if struct is not None:
+                raise EmitError(let_rules.tuple_pattern_on_struct(struct.split('$', 1)[0]),
+                                stmt.paren_span or getattr(stmt, 'span', None))
             if not isinstance(tuple_val.type, ir.BaseStructType):
                 raise ValueError(f"Cannot destructure non-tuple type: {tuple_val.type}")
 
@@ -7482,14 +7488,6 @@ class LLVMEmitter:
             tuple_ritz = self._infer_ritz_type(stmt.value, tuple_val)
             elem_ritz = (tuple_ritz.elements if isinstance(tuple_ritz, rast.TupleType)
                          and len(tuple_ritz.elements) == len(elements) else None)
-            # AGAST #3217: positional destructure of a struct takes each
-            # name's type from the struct's fields, in declaration order.  A
-            # generic struct arrives here already named by its specialization
-            # (`G<u8>` is `G$u8`), whose fields hold the substituted types.
-            if isinstance(tuple_ritz, rast.NamedType):
-                fields = self.struct_fields.get(tuple_ritz.name)
-                if fields is not None and len(fields) == len(elements):
-                    elem_ritz = [ftype for _, ftype in fields]
             for i, name in enumerate(stmt.names):
                 elem_val = self.builder.extract_value(tuple_val, i)
                 self._bind_let(name, elem_val, elem_val.type)

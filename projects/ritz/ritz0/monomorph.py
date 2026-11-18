@@ -1999,7 +1999,7 @@ class Monomorphizer:
             # sizeof(T)), so it must be specialized too (AGAST #1928).
             return rast.LetTupleStmt(stmt.span, stmt.names,
                                      self._specialize_expr(stmt.value, subst),
-                                     stmt.name_spans)
+                                     stmt.name_spans, stmt.paren_span)
         elif isinstance(stmt, rast.ExprStmt):
             return rast.ExprStmt(stmt.span, self._specialize_expr(stmt.expr, subst))
         elif isinstance(stmt, rast.AssignStmt):

@@ -2644,27 +2644,8 @@ pub fn main() -> i32
     return DROPS
 """, 2, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
 
-    # A struct source destructures positionally, by field order.
-    "struct_destructure_moved": (TUPLES + SLOT + """\
-fn f()
-    var h = Holder { t: make(1), n: 2 }
-    let (a, b) = h
-    consume(a)
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, {}),
-
-    "struct_destructure_kept": (TUPLES + SLOT + """\
-fn f()
-    var h = Holder { t: make(1), n: 2 }
-    let (a, b) = h
-
-pub fn main() -> i32
-    f()
-    return DROPS
-""", 1, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
+    # A struct source no longer destructures: a `(…)` pattern is tuples only
+    # (LARB R67, test_tuple_pattern_tuples_only.py).
 
     "tuple_destructure_call": (TUPLES + SLOT + """\
 fn f()

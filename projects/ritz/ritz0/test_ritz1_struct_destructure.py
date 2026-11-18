@@ -13,9 +13,13 @@ so an i16 (or i8, f32, ...) field was stored into the i64 slot as it was and
 clang refused the IR.  angelo's font.ritz:112 hits both.
 
 Each name now gets its field's own type, the slot an annotated
-`let a: i16 = p.x` would get.  ritz0 is the oracle: every row runs on all
-three compilers and must exit 0.  Each program returns the number of the
+`let a: i16 = p.x` would get.  Each program returns the number of the
 first check that failed, so a red cell names the path.
+
+LARB R67 refuses all of this: a `(…)` pattern destructures tuples only.
+ritz0 refuses it (test_tuple_pattern_tuples_only.py, AGAST #3499), so these
+rows run on ritz1 and ritz1_selfhosted alone, and the "ritz0 gives N" notes
+below are what it gave before.  #3500 turns them into ritz1's refusal rows.
 
 The tuple return type `-> (i32, i32)` is #1526, not this ticket.
 """
@@ -23,7 +27,7 @@ The tuple return type `-> (i32, i32)` is #1526, not this ticket.
 import pytest
 
 from test_ritz1_array_ptr_element import (  # noqa: F401  (fixtures)
-    COMPILERS, RITZ1S, compile_with, run_with)
+    RITZ1S, compile_with, run_with)
 
 # (field type, k, v).  P is built as { x: v + k, y: v }.  The values differ
 # above the low byte and are negative where the type is signed, so a field
@@ -99,7 +103,7 @@ def _program(ty: str, source: str) -> str:
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("ty", sorted(TYPES))
 @pytest.mark.parametrize("source", sorted(SOURCES))
 def test_destructure_binds_each_field_at_its_type(run_with, source, ty, compiler):
@@ -136,7 +140,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 def test_ticket_program(run_with, compiler):
     assert run_with(compiler, "ticket", TICKET) == 43 + 15 + 15
 
@@ -196,7 +200,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 def test_mixed_field_types(run_with, compiler):
     assert run_with(compiler, "mixed", MIXED) == 0
 
@@ -233,7 +237,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 def test_struct_from_a_field_global_or_pointer(run_with, compiler):
     assert run_with(compiler, "places", PLACES) == 20
 
@@ -280,7 +284,7 @@ NAMED = {
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("name", sorted(NAMED))
 def test_named_struct_runs_like_ritz0(run_with, name, compiler):
     prog = _NAMED_PRE + NAMED[name] + "    return a + b\n"
@@ -314,7 +318,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("name", sorted(INDEXED))
 def test_array_element_destructures(run_with, name, compiler):
     prog = _INDEXED_PRE + INDEXED[name] + "    return a + b\n"
@@ -352,13 +356,13 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 def test_array_field_runs_like_ritz0(run_with, compiler):
     assert run_with(compiler, "array_field", ARRAY_FIELD) == 7
 
 
 # A field ritz1 still can't bind (`@` here; `@&` and fn-typed are refused
-# the same way) is refused, located.  ritz0 runs it (7): #2864.
+# the same way) is refused, located.  ritz0 ran it (7) before R67.
 REF_FIELD = """\
 struct Q
     r: @i32
@@ -379,15 +383,6 @@ def test_ref_field_is_a_located_error(compile_with, compiler):
     out = comp.stdout + comp.stderr
     assert comp.returncode != 0, out
     assert ":8:5: ritz1 can't destructure a field of this type" in out, out
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
-def test_ref_field_runs_like_ritz0(request, run_with, compiler):
-    if compiler != "ritz0":
-        request.applymarker(pytest.mark.xfail(
-            strict=True, reason="AGAST #2864: ritz1 refuses an `@` field"))
-    assert run_with(compiler, "ref_field", REF_FIELD) == 7
 
 
 # #3217: a destructured field widens by its field's type.  ritz0 bound each
@@ -421,7 +416,7 @@ WIDEN = {"u8": "200", "i8": "-5", "u16": "40000"}
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 @pytest.mark.parametrize("ty", sorted(WIDEN))
 def test_destructured_field_widens_by_its_type(run_with, ty, compiler):
     prog = _WIDEN.format(t=ty, v=WIDEN[ty])
@@ -444,6 +439,6 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("compiler", RITZ1S)
 def test_ticket_3217_program(run_with, compiler):
     assert run_with(compiler, "ticket_3217", TICKET_3217) == 11

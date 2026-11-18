@@ -34,3 +34,13 @@ def another_struct_field(field: str, declared: str, actual: str) -> str:
 def another_struct_argument(param: str, declared: str, actual: str) -> str:
     """`g(<a struct of type actual>)` for a `param: declared` parameter (AGAST #3294)."""
     return f"parameter `{param}` is declared `{declared}` but its argument is a `{actual}`"
+
+
+def tuple_pattern_on_struct(struct: str) -> str:
+    """`let (a, b) = s` where `s` is a named struct (LARB R67, AGAST #3499).
+
+    A `(…)` pattern destructures tuples only: binding a struct's fields by
+    position silently rebinds them when a field is added.  `struct` is the
+    struct's name without type arguments.
+    """
+    return f"`{struct}` is a struct, not a tuple: read its fields"

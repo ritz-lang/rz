@@ -654,6 +654,8 @@ class LetTupleStmt(Stmt):
     value: Expr
     # Where each name is (AGAST #2407).
     name_spans: List[Span] = field(default_factory=list, compare=False, repr=False)
+    # Where the pattern's `(` is: R67's refusal points there (AGAST #3499).
+    paren_span: Optional[Span] = field(default=None, compare=False, repr=False)
 
 
 @dataclass

@@ -1905,6 +1905,7 @@ class Parser:
 
         # Check for tuple destructuring: let (a, b, ...) = expr
         if self._at(TokenType.LPAREN):
+            paren_span = self._current().span
             self._advance()
             names = []
             name_spans = []
@@ -1919,7 +1920,7 @@ class Parser:
             self._expect(TokenType.RPAREN)
             self._expect(TokenType.EQ)
             value = self.parse_expr()
-            return rast.LetTupleStmt(span, names, value, name_spans)
+            return rast.LetTupleStmt(span, names, value, name_spans, paren_span)
 
         # Regular binding
         name_tok = self._expect(TokenType.IDENT)
