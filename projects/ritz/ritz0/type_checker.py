@@ -160,6 +160,10 @@ class TypeChecker:
         # How many enums declare each variant: an instance of a generic enum
         # shares its variants' names with every other instance.
         self.variant_owners: Dict[str, int] = {}
+        # The concrete (non-generic) enums declaring each variant: two make a
+        # bare use of it ambiguous (AGAST #2039, the emitter's
+        # variant_declarers).
+        self.variant_declarers: Dict[str, List[str]] = {}
         # `impl Deref for S`: S's name -> (the impl's S<..> arguments, `deref`'s
         # target T). `s.f` is T's `f` when S has none (LANGUAGE_SPEC §7.7).
         self.deref_targets: Dict[str, Tuple[List[rast.Type], rast.Type]] = {}
@@ -252,6 +256,10 @@ class TypeChecker:
         for variant in enum.variants:
             self.variant_to_enum[variant.name] = enum.name
             self.variant_owners[variant.name] = self.variant_owners.get(variant.name, 0) + 1
+            if not enum.type_params and '$' not in enum.name:
+                declarers = self.variant_declarers.setdefault(variant.name, [])
+                if enum.name not in declarers:  # an import cycle registers it twice
+                    declarers.append(enum.name)
 
     def _register_function(self, fn: rast.FnDef):
         """Register function signature."""
@@ -525,6 +533,7 @@ class TypeChecker:
             if ty is None:
                 # Check if it's a unit enum variant
                 if expr.name in self.variant_to_enum:
+                    self._check_variant_unambiguous(expr.name, expr.span)
                     enum_name = self.variant_to_enum[expr.name]
                     return rast.NamedType(expr.span, enum_name, [])
                 # A type as a receiver: `Errno.Fault`, `Point.new()`
@@ -882,6 +891,7 @@ class TypeChecker:
 
             # Check if it's an enum variant constructor
             if fn_name in self.variant_to_enum:
+                self._check_variant_unambiguous(fn_name, expr.func.span)
                 enum_name = self.variant_to_enum[fn_name]
                 # A bare `V(x)` of a name several enums declare says nothing
                 # about which: _check_parts knows when a slot does.
@@ -1656,6 +1666,7 @@ class TypeChecker:
             self._tail_slot = None
             return ty
         ty = self._infer_type(expr)
+        ty = self._slot_variant_type(expr, ty, slot)
         self._check_ref_slot(expr, ty, slot)
         self._check_array_slot(expr, ty, slot)
         self._check_parts(expr, slot)
@@ -1664,6 +1675,43 @@ class TypeChecker:
             self._check_return(expr)
         self._check_other_referent(expr, ty, slot)
         return ty
+
+    def _slot_variant_type(self, expr: rast.Expr, ty: rast.Type,
+                           slot: Optional[rast.Type]) -> rast.Type:
+        """A bare variant `V` or `V(..)` in a slot whose enum declares `V` is
+        the slot's variant, as the emitter builds it (AGAST #3602):
+        variant_to_enum holds the last enum to declare the name, so an
+        `enum Display` with a `None` made every `None` Display's.  Option and
+        Result are the emitter's own, so their slots declare their variants
+        with or without ritzlib's enum in scope.  Anything else keeps `ty`."""
+        if isinstance(expr, rast.Ident):
+            name = expr.name
+        elif isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name = expr.func.name
+        else:
+            return ty
+        # No local can be named like a variant (AGAST #2407), so the name is
+        # the variant.
+        if slot is None or name not in self.variant_to_enum:
+            return ty
+        base = self._resolve_alias(slot)
+        if not isinstance(base, rast.NamedType):
+            return ty
+        builtin = {'Option': ('Some', 'None'), 'Result': ('Ok', 'Err')}
+        if name in builtin.get(base.name, ()) or self._declares_variant(base, name):
+            return copy.copy(base)
+        return ty
+
+    def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]) -> None:
+        """A bare variant two or more concrete user enums declare is an error
+        wherever it appears (AGAST #2039), with the emitter's text: the two
+        alphabetically-first declarers.  Match arms resolve against the
+        scrutinee and don't come here."""
+        declarers = self.variant_declarers.get(name, ())
+        if len(declarers) >= 2:
+            a, b = sorted(declarers)[:2]
+            self._error(f"ambiguous enum variant '{name}': declared by enum '{a}' and "
+                        f"enum '{b}'; qualify it, e.g. '{a}.{name}'", span)
 
     def _check_parts(self, expr: rast.Expr, slot: Optional[rast.Type]) -> None:
         """The elements of a literal or the payload of a variant landing in
