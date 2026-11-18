@@ -129,8 +129,8 @@ def test_every_field_binds(tmp_path, request, compiler):
     assert subprocess.run([str(exe)], timeout=60, check=False).returncode == 5
 
 
-# AGAST #1295: a constructor takes one value per field too.  ritz1 says so at
-# the first value; ritz0 still accepts a short or long list (AGAST #3992).
+# AGAST #1295: a constructor takes one value per field too, said at the first
+# value.  ritz0 zipped the two and built a short or long list silently (#3992).
 CTOR_ROWS = {
     "short": ("Rect(1)", 18, 1),
     "long": ("Rect(1, 2, 3)", 18, 3),
@@ -140,7 +140,7 @@ CTOR_ROWS = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler,name", [
-    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(CTOR_ROWS) for c in ALL[1:]])
+    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(CTOR_ROWS) for c in ALL])
 def test_a_variant_constructor_takes_every_field(request, tmp_path, compiler, name):
     ctor, col, got = CTOR_ROWS[name]
     source = f"enum Shape\n    Circle(i64)\n    Rect(i64, i64)\n\nfn main() -> i32\n    let s = {ctor}\n    0\n"

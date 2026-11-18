@@ -4016,6 +4016,7 @@ class LLVMEmitter:
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
         variant = self._get_enum_variant(enum_name, variant_name)
+        self._require_payload_count(variant_name, variant, args)
 
         # Allocate stack space for the enum
         # AGAST #1734: in the entry block, so a ctor in a loop body
@@ -4264,6 +4265,7 @@ class LLVMEmitter:
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
         variant = self._get_enum_variant(enum_name, variant_name)
+        self._require_payload_count(variant_name, variant, args)
 
         # Allocate stack space for the enum
         # AGAST #1734: in the entry block, so a ctor in a loop body
@@ -16800,6 +16802,21 @@ class LLVMEmitter:
             raise EmitError(
                 f"variant '{pattern.name}' has {has} {noun}, but this pattern "
                 f"lists {len(pattern.fields)}", pattern.span)
+
+    def _require_payload_count(self, variant_name: str, variant, args: List[rast.Expr]) -> None:
+        """A variant constructor takes one value per field (AGAST #3992).
+
+        The constructors zip the two, so `Rect(1)` on `Rect(i64, i64)` left
+        the second field unwritten and `Rect(1, 2, 3)` dropped the third, both
+        silently. The constructor twin of _require_field_count, said at the
+        first value with ritz1's message (#1295). As in ritz1, a bare variant
+        and a call with no values have no list to count.
+        """
+        has = len(variant.fields)
+        if has and args and len(args) != has:
+            raise EmitError(
+                f"variant `{variant_name}` takes {has} payload value(s), "
+                f"got {len(args)}", args[0].span)
 
     def _refuse_payload_pattern(self, pattern: rast.VariantPattern) -> None:
         """A variant's payload pattern is a name or `_` (LARB R76; §8.2).
