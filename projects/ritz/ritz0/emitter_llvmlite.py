@@ -12583,7 +12583,11 @@ class LLVMEmitter:
                 elif isinstance(arg, rast.InterpString):
                     # Handle interpolated string - desugar to print calls
                     return self._emit_interp_string_print(arg, out_fd)
-            raise ValueError(f"{fname}() requires a single string literal argument")
+            # AGAST #3933: located, at the argument (at the call when there
+            # isn't exactly one), as ritz1's call_check says it.
+            at = call.args[0] if len(call.args) == 1 else call
+            raise EmitError(f"{fname}() requires a single string literal argument",
+                            getattr(at, "span", None) or getattr(call, "span", None))
 
         # format_into(sink, "...") -- print's literal, appended to a buffer
         # (AGAST #1824). Reserved like print: checked before user functions.

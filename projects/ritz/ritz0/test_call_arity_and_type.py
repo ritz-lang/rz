@@ -124,6 +124,7 @@ pub fn main() -> i32
 ARITY = "`{f}` called with {n} argument(s) but defined with {m}"
 NAMELESS = "` called with {n} argument(s) but defined with {m}"
 WRONG = "argument {n} of `{f}` has the wrong type: "
+PRINT = "{f}() requires a single string literal argument"
 
 # name -> (line with `@` at the column the error names, message[, extra]).
 # Each line is main's next statement; main then returns 0.  With `extra`, it's
@@ -158,6 +159,12 @@ REFUSED = {
                                               "fn sv_i32(pi: *[7]i32) -> i64\n"),
     "array_pointer_field_wrong_elem_into_strview": ("    return sv(@c.pi)", WRONG.format(n=1, f="sv"),
                                                     "fn sv_field(c: C) -> i64\n"),
+    # print / eprint take one string literal, nothing else (AGAST #3933,
+    # LANGUAGE_SPEC's expect-error): refused at the argument, or at the call
+    # when there isn't exactly one.  ritz1 printed nothing for a non-literal.
+    "print_non_literal": ('    let v = "hi"\n    print(@v)', PRINT.format(f="print")),
+    "eprint_non_literal": ("    eprint(@p)", PRINT.format(f="eprint")),
+    "print_two_args": ('    @print("a", "b")', PRINT.format(f="print")),
 }
 
 # ritz0 raises IndexError on these (#3319).
