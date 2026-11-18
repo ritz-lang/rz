@@ -34,7 +34,7 @@ from dataclasses import dataclass
 import copy
 import dataclasses
 import ritz_ast as rast
-from ufcs import UFCS_NON_GENERIC_PREFIXES
+from typed import Typed, typed_of, type_bodies
 
 
 class GenericInferError(Exception):
@@ -197,6 +197,73 @@ def resolve_alias_in(ty: rast.Type, aliases: Dict[str, rast.Type]) -> rast.Type:
     return ty
 
 
+def is_int_literal(expr) -> bool:
+    """`3` or `-3`: an argument that binds a bare `T` only when nothing else
+    does (LANGUAGE_SPEC §4.4)."""
+    return (isinstance(expr, rast.IntLit)
+            or (isinstance(expr, rast.UnaryOp) and expr.op == '-'
+                and isinstance(expr.operand, rast.IntLit)))
+
+
+def unify_type_params(param: rast.Type, arg: rast.Type, params: List[str],
+                      bound: Dict[str, rast.Type], conflict: Set[str],
+                      resolve=None) -> None:
+    """Match a param type against an argument type, binding `params` in
+    `bound`; a param bound to two different types goes in `conflict`.
+    Matched structurally: `T`, `@T`, `*T`, `Vec<T>`, `[N]T`, tuples."""
+    resolve = resolve or resolve_alias
+    param = resolve(param)
+    arg = resolve(arg)
+    if isinstance(param, rast.NamedType) and param.name in params and not param.args:
+        prev = bound.get(param.name)
+        if prev is None:
+            bound[param.name] = arg
+        elif mangle_type_name(resolve(prev)) != mangle_type_name(arg):
+            conflict.add(param.name)
+        return
+    ptrs = (rast.PtrType, rast.RefType)
+    if isinstance(param, ptrs) and isinstance(arg, ptrs):
+        unify_type_params(param.inner, arg.inner, params, bound, conflict, resolve)
+    elif isinstance(param, rast.NamedType) and isinstance(arg, rast.NamedType):
+        if param.name == arg.name and len(param.args) == len(arg.args):
+            for p, a in zip(param.args, arg.args):
+                unify_type_params(p, a, params, bound, conflict, resolve)
+    elif isinstance(param, rast.ArrayType) and isinstance(arg, rast.ArrayType):
+        unify_type_params(param.inner, arg.inner, params, bound, conflict, resolve)
+    elif isinstance(param, rast.TupleType) and isinstance(arg, rast.TupleType):
+        if len(param.elements) == len(arg.elements):
+            for p, a in zip(param.elements, arg.elements):
+                unify_type_params(p, a, params, bound, conflict, resolve)
+
+
+def bind_type_params(params: List[str], pairs, resolve=None):
+    """(bound, conflict): the type params `params` that the arguments bind.
+
+    `pairs` is (param type, argument, argument's type or None) per argument,
+    by section 4.4's rule for a generic call: each argument binds each T its
+    parameter's type mentions, and an integer literal binds a bare `T` only
+    when no other argument binds T (`vec_push(@&v, 3)` on a Vec<i32> is
+    vec_push<i32>)."""
+    resolve = resolve or resolve_alias
+    bound: Dict[str, rast.Type] = {}
+    conflict: Set[str] = set()
+    literal: Dict[str, rast.Type] = {}
+    for param_type, arg, arg_type in pairs:
+        if param_type is None:
+            continue
+        if is_int_literal(arg):
+            p = resolve(param_type)
+            if (isinstance(p, rast.NamedType) and p.name in params and not p.args
+                    and arg_type is not None):
+                literal.setdefault(p.name, arg_type)
+            continue
+        if arg_type is not None:
+            unify_type_params(param_type, arg_type, params, bound, conflict, resolve)
+    for name, ty in literal.items():
+        bound.setdefault(name, ty)
+    return bound, conflict
+
+
 def mangle_type_name(ty: rast.Type) -> str:
     """Generate a mangled name component for a type.
 
@@ -327,7 +394,7 @@ class Monomorphizer:
         # Mangling is lossy, so keep the originals for _parse_type_args_key.
         self.type_args_by_key: Dict[str, rast.Type] = {}
 
-        # Non-generic function name -> definition (for return-type inference).
+        # Non-generic function name -> definition (a call's literal slots).
         self.fn_signatures: Dict[str, rast.FnDef] = {}
 
         # All struct definitions by name (for field-type inference).
@@ -338,7 +405,7 @@ class Monomorphizer:
         self.enum_defs: Dict[str, rast.EnumDef] = {}
 
         # Non-generic impl methods: type name -> method name -> definition
-        # (for return-type inference of `var v = b.items()`, AGAST #2095).
+        # (a method call's literal slots).
         self.impl_methods: Dict[str, Dict[str, rast.FnDef]] = {}
 
         # Expected type of the value currently being visited (return type or
@@ -350,6 +417,19 @@ class Monomorphizer:
         # The slot of each args-less generic struct literal, by id (§9.2).
         self._lit_slots: Dict[int, rast.Type] = {}
         self._infer_ret_type: Optional[rast.Type] = None
+
+        # Each expression's type comes from the typing pass's table (AGAST
+        # #3554).  An instance's body is a copy: `_origin` maps each node
+        # _specialize_expr built to the template node it copies (a leaf is
+        # shared, not copied), and `_instance_subst` is the instance's
+        # substitution while _scan_for_new_instantiations walks it.
+        self._typed: Optional[Typed] = None
+        self._origin: Dict[int, Tuple[rast.Expr, rast.Expr]] = {}
+        self._instance_subst: Optional['TypeSubstitution'] = None
+        # Names an untyped `let t = (1, 2)` binds: a tuple literal is
+        # untyped to inference (#3064), as ritz1 has it, though the table
+        # types it.  Per fn, as var_types is.
+        self._tuple_lit_names: Set[str] = set()
 
     def _type_to_key(self, ty: rast.Type) -> str:
         """Convert a type to a string key for deduplication."""
@@ -370,6 +450,8 @@ class Monomorphizer:
 
     def monomorphize(self, module: rast.Module) -> rast.Module:
         """Monomorphize a module, returning a new module with generics specialized."""
+        self._typed = typed_of(module)
+
         # Phase 0: Collect trait implementations for bound checking
         self._collect_trait_impls(module)
 
@@ -498,6 +580,7 @@ class Monomorphizer:
         if fn.body is None:
             return
         self.var_types = {}
+        self._tuple_lit_names = set()
         self._infer_ret_type = fn.ret_type
         # The slot each args-less generic struct literal fills, by id (§9.2):
         # filled top-down here and by _mark_lit_slots, read by
@@ -513,6 +596,7 @@ class Monomorphizer:
                 self.var_types[param.name] = param_type
         self._infer_walk(fn.body)
         self.var_types = {}
+        self._tuple_lit_names = set()
 
     def _infer_walk(self, node) -> None:
         """Visit `node` in source order: a let's value before its name is
@@ -539,12 +623,13 @@ class Monomorphizer:
                 continue
             self._infer_walk(getattr(node, f.name))
         if isinstance(node, (rast.LetStmt, rast.VarStmt)):
+            self._note_tuple_lit_let(node)
             if node.type is None and node.value is not None:
                 node.type = self._infer_variant_let(node.value)
             if node.type is not None:
                 self.var_types[node.name] = node.type
             elif node.value is not None:
-                inferred = self._infer_arg_type(node.value)
+                inferred = self._type_of(node.value)
                 if inferred is not None:
                     self.var_types[node.name] = inferred
         elif isinstance(node, rast.Call):
@@ -616,7 +701,7 @@ class Monomorphizer:
                     self._mark_lit_slot(arg, subst.apply(param.type) if subst else param.type)
         elif isinstance(node, rast.MethodCall):
             # A plain impl's method: its params after `self`.
-            recv = self._infer_value_type(node.expr)
+            recv = self._type_of(node.expr)
             while isinstance(recv, (rast.PtrType, rast.RefType)):
                 recv = recv.inner
             if isinstance(recv, rast.NamedType):
@@ -680,25 +765,9 @@ class Monomorphizer:
             return
         params, fields = found
         field_types = dict(fields)
-        bound: Dict[str, rast.Type] = {}
-        conflict: Set[str] = set()
-        literal: Dict[str, rast.Type] = {}
-        for name, value in lit.fields:
-            field_type = field_types.get(name)
-            if field_type is None:
-                continue
-            if (isinstance(value, rast.IntLit)
-                    or (isinstance(value, rast.UnaryOp) and value.op == '-'
-                        and isinstance(value.operand, rast.IntLit))):
-                p = resolve_alias(field_type)
-                if isinstance(p, rast.NamedType) and p.name in params and not p.args:
-                    literal.setdefault(p.name, self._infer_arg_type(value))
-                continue
-            value_type = self._infer_arg_type(value)
-            if value_type is not None:
-                self._unify(field_type, value_type, params, bound, conflict)
-        for tp, ty in literal.items():
-            bound.setdefault(tp, ty)
+        bound, conflict = bind_type_params(
+            params, [(field_types.get(name), value, self._type_of(value))
+                     for name, value in lit.fields])
         for tp in params:
             if tp not in bound or tp in conflict:
                 raise GenericInferError(
@@ -764,66 +833,15 @@ class Monomorphizer:
                 and len(ret.args) == len(enum_def.type_params):
             return copy.deepcopy(ret)
         params = enum_def.type_params
-        bound: Dict[str, rast.Type] = {}
-        conflict: Set[str] = set()
-        literal: Dict[str, rast.Type] = {}
-        for field_type, arg in zip(variant.fields, args):
-            if (isinstance(arg, rast.IntLit)
-                    or (isinstance(arg, rast.UnaryOp) and arg.op == '-'
-                        and isinstance(arg.operand, rast.IntLit))):
-                p = resolve_alias(field_type)
-                if isinstance(p, rast.NamedType) and p.name in params and not p.args:
-                    literal.setdefault(p.name, self._infer_arg_type(arg))
-                continue
-            arg_type = self._infer_arg_type(arg)
-            if arg_type is not None:
-                self._unify(field_type, arg_type, params, bound, conflict)
-        for tp, ty in literal.items():
-            bound.setdefault(tp, ty)
+        bound, conflict = bind_type_params(
+            params, [(field_type, arg, self._type_of(arg))
+                     for field_type, arg in zip(variant.fields, args)])
         for tp in params:
             if tp not in bound or tp in conflict:
                 raise GenericInferError(
                     f"can't infer `{tp}` for `{name}`: give the binding a type", value.span)
         return rast.NamedType(value.span, enum_def.name,
                               [copy.deepcopy(bound[tp]) for tp in params])
-
-    def _infer_arg_type(self, expr: rast.Expr) -> Optional[rast.Type]:
-        """The type of a call argument, or None when it can't be told here.
-        Literals take their default type, as `let x = <literal>` gives them."""
-        if isinstance(expr, rast.IntLit):
-            return rast.NamedType(expr.span, 'i64', [])
-        if isinstance(expr, rast.FloatLit):
-            return rast.NamedType(expr.span, 'f64', [])
-        if isinstance(expr, rast.BoolLit):
-            return rast.NamedType(expr.span, 'bool', [])
-        if isinstance(expr, rast.CharLit):
-            return rast.NamedType(expr.span, 'u8', [])
-        if isinstance(expr, rast.StringLit):
-            return rast.NamedType(expr.span, 'StrView', [])
-        if isinstance(expr, rast.Cast):
-            return expr.target
-        if isinstance(expr, rast.Grouped):
-            return self._infer_arg_type(expr.expr)
-        if isinstance(expr, rast.UnaryOp) and expr.op == '-':
-            return self._infer_arg_type(expr.operand)
-        if isinstance(expr, rast.UnaryOp) and expr.op in ('!', 'not'):
-            return rast.NamedType(expr.span, 'bool', [])
-        if isinstance(expr, rast.UnaryOp) and expr.op in ('@', '&', '@&', '&mut'):
-            inner = self._infer_arg_type(expr.operand)
-            if inner is None:
-                return None
-            return rast.PtrType(expr.span, inner, mutable=expr.op in ('@&', '&mut'),
-                                shared=expr.op == '@')
-        if isinstance(expr, rast.BinOp):
-            if expr.op in ('==', '!=', '<', '<=', '>', '>=', '&&', '||', 'and', 'or'):
-                return rast.NamedType(expr.span, 'bool', [])
-            left = self._infer_arg_type(expr.left)
-            if isinstance(expr.left, rast.IntLit) or left is None:
-                right = self._infer_arg_type(expr.right)
-                if right is not None and not isinstance(expr.right, rast.IntLit):
-                    return right
-            return left
-        return self._infer_value_type(expr)
 
     def _infer_one_call(self, call: rast.Call) -> None:
         """Bind the type params of a generic `f(args)` from its arguments.
@@ -841,24 +859,9 @@ class Monomorphizer:
         if fn_def is None or fn_name in self.var_types:
             return
         params = fn_def.type_params
-        bound: Dict[str, rast.Type] = {}
-        conflict: Set[str] = set()
-        literal: Dict[str, rast.Type] = {}
-        for param, arg in zip(fn_def.params, call.args):
-            if param.type is None:
-                continue
-            if (isinstance(arg, rast.IntLit)
-                    or (isinstance(arg, rast.UnaryOp) and arg.op == '-'
-                        and isinstance(arg.operand, rast.IntLit))):
-                p = resolve_alias(param.type)
-                if isinstance(p, rast.NamedType) and p.name in params and not p.args:
-                    literal.setdefault(p.name, self._infer_arg_type(arg))
-                continue
-            arg_type = self._infer_arg_type(arg)
-            if arg_type is not None:
-                self._unify(param.type, arg_type, params, bound, conflict)
-        for name, ty in literal.items():
-            bound.setdefault(name, ty)
+        bound, conflict = bind_type_params(
+            params, [(param.type, arg, self._type_of(arg))
+                     for param, arg in zip(fn_def.params, call.args)])
         for tp in params:
             if tp not in bound or tp in conflict:
                 raise GenericInferError(
@@ -866,34 +869,11 @@ class Monomorphizer:
                     call.span)
         call.type_args = [copy.deepcopy(bound[tp]) for tp in params]
 
-    def _unify(self, param: rast.Type, arg: rast.Type, params: List[str],
-               bound: Dict[str, rast.Type], conflict: Set[str]) -> None:
-        """Match a param type against an argument type, binding type params."""
-        param = resolve_alias(param)
-        arg = resolve_alias(arg)
-        if isinstance(param, rast.NamedType) and param.name in params and not param.args:
-            prev = bound.get(param.name)
-            if prev is None:
-                bound[param.name] = arg
-            elif mangle_type_name(resolve_alias(prev)) != mangle_type_name(arg):
-                conflict.add(param.name)
-            return
-        ptrs = (rast.PtrType, rast.RefType)
-        if isinstance(param, ptrs) and isinstance(arg, ptrs):
-            self._unify(param.inner, arg.inner, params, bound, conflict)
-        elif isinstance(param, rast.NamedType) and isinstance(arg, rast.NamedType):
-            if param.name == arg.name and len(param.args) == len(arg.args):
-                for p, a in zip(param.args, arg.args):
-                    self._unify(p, a, params, bound, conflict)
-        elif isinstance(param, rast.ArrayType) and isinstance(arg, rast.ArrayType):
-            self._unify(param.inner, arg.inner, params, bound, conflict)
-        elif isinstance(param, rast.TupleType) and isinstance(arg, rast.TupleType):
-            if len(param.elements) == len(arg.elements):
-                for p, a in zip(param.elements, arg.elements):
-                    self._unify(p, a, params, bound, conflict)
-
     def _find_instantiations(self, module: rast.Module) -> None:
         """Walk the AST to find all generic instantiations."""
+        if self._typed is None:
+            # Called without monomorphize() (a unit test of this phase).
+            self._typed = typed_of(module)
         for item in module.items:
             self._visit_item(item)
 
@@ -907,6 +887,7 @@ class Monomorphizer:
                 return
             # Clear variable types for new function scope
             self.var_types = {}
+            self._tuple_lit_names = set()
             # Register parameter types
             for param in item.params:
                 self._visit_type(param.type)
@@ -986,13 +967,15 @@ class Monomorphizer:
         if isinstance(stmt, rast.LetStmt):
             if stmt.type:
                 self._visit_type(stmt.type)
+                self._tuple_lit_names.discard(stmt.name)
                 # Track variable type
                 self.var_types[stmt.name] = stmt.type
                 self.expected_type = stmt.type
             elif stmt.value is not None:
                 # No explicit type — try to infer from the rhs so that subsequent
                 # method calls (`v.push(...)`) can register UFCS instantiations.
-                inferred = self._infer_value_type(stmt.value)
+                self._note_tuple_lit_let(stmt)
+                inferred = self._type_of(stmt.value)
                 if inferred is not None:
                     self.var_types[stmt.name] = inferred
                     # Treat the inferred type like a real annotation so that
@@ -1004,10 +987,12 @@ class Monomorphizer:
         elif isinstance(stmt, rast.VarStmt):
             if stmt.type:
                 self._visit_type(stmt.type)
+                self._tuple_lit_names.discard(stmt.name)
                 # Track variable type
                 self.var_types[stmt.name] = stmt.type
             elif stmt.value is not None:
-                inferred = self._infer_value_type(stmt.value)
+                self._note_tuple_lit_let(stmt)
+                inferred = self._type_of(stmt.value)
                 if inferred is not None:
                     self.var_types[stmt.name] = inferred
                     self._visit_type(inferred)
@@ -1103,7 +1088,7 @@ class Monomorphizer:
             self._visit_expr(expr.expr)
             if expr.ctor_type is not None:
                 self._visit_type(expr.ctor_type)   # its instance (#2437)
-            scrut_type = expr.ctor_type or self._infer_value_type(expr.expr)
+            scrut_type = expr.ctor_type or self._type_of(expr.expr)
             for arm in expr.arms:
                 # AGAST #2725: `Some(x) => x[1..3]` -- x is the payload's type
                 # in this arm, so its slice/index/method sugar registers
@@ -1214,7 +1199,7 @@ class Monomorphizer:
 
     def _register_slice_instantiation(self, expr: rast.SliceExpr) -> None:
         """Register vec_slice<T> instantiation for slice expressions on Vec types."""
-        var_type = self._infer_value_type(expr.expr)
+        var_type = self._type_of(expr.expr)
         while isinstance(var_type, (rast.PtrType, rast.RefType)):
             var_type = var_type.inner
         if not isinstance(var_type, rast.NamedType):
@@ -1237,7 +1222,7 @@ class Monomorphizer:
         `v[i]` on a Vec<T> desugars to `vec_get<T>(&v, i)` in the emitter — so
         the monomorphizer needs to specialize vec_get<T> alongside the call.
         """
-        var_type = self._infer_value_type(expr.expr)
+        var_type = self._type_of(expr.expr)
         while isinstance(var_type, (rast.PtrType, rast.RefType)):
             var_type = var_type.inner
         if not isinstance(var_type, rast.NamedType):
@@ -1251,207 +1236,57 @@ class Monomorphizer:
                     mangled = mangle_generic_name('vec_get', type_args)
                     self.function_instantiations[key] = mangled
 
-    def _infer_value_type(self, expr: rast.Expr) -> Optional[rast.Type]:
-        """Infer the Ritz type of an expression for var/let bindings without
-        an explicit type annotation. Limited to patterns that gate UFCS
-        method-instantiation registration (e.g. `var v = vec_new<u16>()`).
-        """
-        # A plain variable: whatever we recorded for it.
-        if isinstance(expr, rast.Ident):
-            return self.var_types.get(expr.name)
+    def _note_tuple_lit_let(self, stmt) -> None:
+        """Track whether `stmt` binds its name to an untyped tuple literal."""
+        value = stmt.value
+        while isinstance(value, rast.Grouped):
+            value = value.expr
+        if stmt.type is None and isinstance(value, rast.TupleLit):
+            self._tuple_lit_names.add(stmt.name)
+        else:
+            self._tuple_lit_names.discard(stmt.name)
 
-        # `*p`, `(*p)`: what `p` points at, so `(*p)[lo..hi]` on a `*Vec<T>`
-        # registers vec_slice<T> as `p[lo..hi]` does (AGAST #2448).
+    def _type_of(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """`expr`'s type, from the typing pass's table (module.typed, AGAST
+        #3554), or None where the table has none or says `unknown`.
+
+        In an instance's body (_scan_for_new_instantiations) a node is a copy
+        of, or shared with, the template's, and the template's type is taken
+        at the instance's type args.  Two answers are the node's own:
+        - a struct literal is the instance its args name; an args-less one's
+          are only filled in after the table was made (§9.2);
+        - `@x` / `@&x` is a pointer, which `T` binds as `*X` and mangles
+          `ptr_` (the emitter's spelling, AGAST #2335), not the `@X` the
+          table has.
+        """
+        if isinstance(expr, rast.StructLit):
+            struct_def = self.struct_defs.get(expr.name)
+            if struct_def is None or len(struct_def.type_params or []) != len(expr.type_args):
+                return None
+            return rast.NamedType(expr.span, expr.name, list(expr.type_args))
         if isinstance(expr, rast.Grouped):
-            return self._infer_value_type(expr.expr)
-        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
-            inner = self._infer_value_type(expr.operand)
-            if isinstance(inner, (rast.PtrType, rast.RefType)):
-                return inner.inner
+            return self._type_of(expr.expr)
+        if isinstance(expr, rast.TupleLit) or (
+                isinstance(expr, rast.Ident) and expr.name in self._tuple_lit_names):
             return None
-        # `let p = @v`: a pointer to v, as the emitter's _infer_ritz_type has it,
-        # so `p[lo..hi]` registers vec_slice<T> (AGAST #2448).
         if isinstance(expr, rast.UnaryOp) and expr.op in ('@', '&', '@&', '&mut'):
-            inner = self._infer_value_type(expr.operand)
+            inner = self._type_of(expr.operand)
             if inner is None:
                 return None
             return rast.PtrType(expr.span, inner, mutable=expr.op in ('@&', '&mut'),
                                 shared=expr.op == '@')
-
-        # `D { .. }` is a D, and `Box<i32> { .. }` a Box<i32>, so an
-        # un-annotated `let t = D { .. }` binds T in `take(@t)` (AGAST #3064).
-        # A generic struct's literal without args (`Cell { v: 3 }`) has them
-        # by now: _infer_struct_lit_args filled them in (§9.2, #3407).
-        if isinstance(expr, rast.StructLit):
-            struct_def = self.struct_defs.get(expr.name)
-            if struct_def is None:
-                return None
-            if len(struct_def.type_params or []) != len(expr.type_args):
-                return None
-            return rast.NamedType(expr.span, expr.name, list(expr.type_args))
-
-        # Field access: resolve the base struct and look the field up. This is
-        # what makes `self.edges.push(x)` register vec_push<Edge>.
-        if isinstance(expr, rast.Field):
-            base_type = self._infer_value_type(expr.expr)
-            while isinstance(base_type, (rast.PtrType, rast.RefType)):
-                base_type = base_type.inner
-            if isinstance(base_type, rast.NamedType):
-                struct_def = self.struct_defs.get(base_type.name)
-                if struct_def is not None:
-                    for field_name, field_type in struct_def.fields:
-                        if field_name == expr.field:
-                            if struct_def.type_params and base_type.args:
-                                subst = TypeSubstitution(dict(zip(
-                                    struct_def.type_params, base_type.args)))
-                                return subst.apply(field_type)
-                            return field_type
+        entry = self._origin.get(id(expr))
+        node = entry[1] if entry is not None and entry[0] is expr else expr
+        ty = self._typed.type_of(node) if self._typed is not None else None
+        if ty is None or (isinstance(ty, rast.NamedType) and ty.name == 'unknown'):
+            # A name the table can't type (a pattern's payload binding, `Err(x)`)
+            # has the type its binding declared, if this walk recorded one.
+            if isinstance(expr, rast.Ident):
+                return self.var_types.get(expr.name)
             return None
-
-        # Direct call to a generic function with explicit type args:
-        #   vec_new<u16>() -> Vec<u16>
-        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
-            fn_name = expr.func.name
-            fn_def = self.generic_functions.get(fn_name)
-            if (fn_def and fn_def.ret_type and expr.type_args
-                    and len(fn_def.type_params) == len(expr.type_args)):
-                mapping = {
-                    tp: ta for tp, ta in zip(fn_def.type_params, expr.type_args)
-                }
-                subst = TypeSubstitution(mapping=mapping)
-                return subst.apply(fn_def.ret_type)
-            # Plain call to a known non-generic function: use its return type.
-            plain = self.fn_signatures.get(fn_name)
-            if plain is not None and plain.ret_type is not None:
-                return plain.ret_type
-
-        # `a[:]` / `a[i:j]` / `a[i..j]` on a Vec<T> lowers to vec_slice<T>: a Vec<T>.
-        if (isinstance(expr, rast.SliceExpr)
-                or (isinstance(expr, rast.Index) and isinstance(expr.index, rast.Range))):
-            base_type = self._infer_value_type(expr.expr)
-            while isinstance(base_type, (rast.PtrType, rast.RefType)):
-                base_type = base_type.inner
-            if (isinstance(base_type, rast.NamedType)
-                    and base_type.name == 'Vec' and base_type.args):
-                return base_type
-            return None
-
-        # `v[i]`: the element, so `v[1].get(1)` on a Vec<Vec<i32>> registers
-        # vec_get<i32> (AGAST #2519).  `[]` sees through one `*`/`@`/`@&` to a
-        # Vec, Span, String or array (LARB R9); a `*T` to anything else is a raw
-        # buffer whose element is T.  This also types an un-annotated
-        # `let w = v[i]`, which is the element there too.
-        if isinstance(expr, rast.Index):
-            return self._element_type(self._infer_value_type(expr.expr))
-
-        # Any other method call: the return type of the function it resolves
-        # to (AGAST #2095).  Without this `var s = a.slice(0, n)` stays
-        # untyped and a generic method reached only through `s` (`s.pop()`)
-        # is never instantiated.
-        if isinstance(expr, rast.MethodCall):
-            inferred = self._infer_method_call_type(expr)
-            if inferred is not None:
-                return inferred
-
-        # `expr.unwrap()` / `expr.expect(..)` / `expr.unwrap_or(..)` on a
-        # Result<T, E> or Option<T> yields T. Without this the binding type is
-        # unknown and later generic sugar on it (e.g. `v[i]` -> vec_get<T>)
-        # never gets instantiated.
-        if isinstance(expr, rast.MethodCall) and expr.method in (
-                'unwrap', 'expect', 'unwrap_or', 'unwrap_or_default'):
-            recv_type = self._infer_value_type(expr.expr)
-            while isinstance(recv_type, (rast.PtrType, rast.RefType)):
-                recv_type = recv_type.inner
-            if (isinstance(recv_type, rast.NamedType)
-                    and recv_type.name in ('Result', 'Option')
-                    and recv_type.args):
-                return recv_type.args[0]
-        return None
-
-    @staticmethod
-    def _element_type(base: Optional[rast.Type]) -> Optional[rast.Type]:
-        """The type of `b[i]` for a `b` of type `base`, or None if unknown."""
-
-        def of(t: Optional[rast.Type]) -> Optional[rast.Type]:
-            if isinstance(t, rast.ArrayType):
-                return t.inner
-            if isinstance(t, rast.NamedType):
-                if t.name in ('Vec', 'Span') and len(t.args) == 1:
-                    return t.args[0]
-                if t.name == 'String' and not t.args:
-                    return rast.NamedType(t.span, 'u8')
-            return None
-
-        direct = of(base)
-        if direct is not None:
-            return direct
-        if isinstance(base, (rast.PtrType, rast.RefType)):
-            # One level: `p[i]` is `(*p)[i]` when the pointee is indexable.
-            through = of(base.inner)
-            if through is not None:
-                return through
-            # Otherwise only a raw `*T` is a buffer; a reference is one value.
-            if isinstance(base, rast.PtrType) and not base.shared:
-                return base.inner
-        return None
-
-    def _infer_method_call_type(self, expr: rast.MethodCall) -> Optional[rast.Type]:
-        """Return type of `recv.method(..)`, or None if it can't be resolved.
-
-        Covers UFCS on a built-in generic receiver (`Vec<T>.slice` ->
-        vec_slice<T>, substituted at the receiver's type args) and methods of
-        a user impl block on the receiver's struct (generic or not).
-        """
-        # AGAST #2575: a static-style call on a non-generic ritzlib type with
-        # no impl method, `String.from(x)`, is the free fn `string_from(x)`
-        # (the emitter's #1321 fallback), so `var t = String.from(..)` is a
-        # String and `t.data.push(..)` registers vec_push<u8>.  A binding of
-        # that name is a value, not the type.
-        # AGAST #3495: with the method in the type's impl (ritzlib's `impl
-        # String`, LARB R66), the impl method's return types it instead.
-        if (isinstance(expr.expr, rast.Ident)
-                and expr.expr.name in UFCS_NON_GENERIC_PREFIXES
-                and expr.expr.name not in self.var_types):
-            method = self.impl_methods.get(expr.expr.name, {}).get(expr.method)
-            if method is not None:
-                return method.ret_type
-            free = self.fn_signatures.get(
-                UFCS_NON_GENERIC_PREFIXES[expr.expr.name] + expr.method)
-            if free is not None:
-                return free.ret_type
-        recv_type = self._infer_value_type(expr.expr)
-        while isinstance(recv_type, (rast.PtrType, rast.RefType)):
-            recv_type = recv_type.inner
-        if not isinstance(recv_type, rast.NamedType):
-            return None
-
-        def resolve(ret: Optional[rast.Type], params: List[str]) -> Optional[rast.Type]:
-            if ret is None:
-                return None
-            if isinstance(ret, rast.NamedType) and ret.name == 'Self' and not ret.args:
-                return recv_type
-            if not params:
-                return ret
-            if len(params) != len(recv_type.args):
-                return None
-            return TypeSubstitution(dict(zip(params, recv_type.args))).apply(ret)
-
-        # User impl block on the receiver's type.
-        method = self.impl_methods.get(recv_type.name, {}).get(expr.method)
-        if method is not None:
-            return resolve(method.ret_type, [])
-        for impl in self.generic_impls.get(recv_type.name, []):
-            for m in impl.methods:
-                if m.name == expr.method and not m.type_params:
-                    return resolve(m.ret_type, impl.type_params)
-
-        # UFCS on a built-in generic type: Vec<T>.m() -> vec_m<T>.
-        prefix = self.TYPE_TO_UFCS_PREFIX.get(recv_type.name)
-        if prefix is not None and recv_type.args:
-            fn_def = self.generic_functions.get(f"{prefix}{expr.method}")
-            if fn_def is not None:
-                return resolve(fn_def.ret_type, fn_def.type_params)
-        return None
+        if self._instance_subst is not None:
+            ty = self._instance_subst.apply(ty)
+        return ty
 
     def _register_method_instantiation(self, expr: rast.MethodCall) -> None:
         """Register UFCS function instantiation for method calls on generic types.
@@ -1477,7 +1312,7 @@ class Monomorphizer:
                                                   expected.args)
             return
 
-        var_type = self._infer_value_type(expr.expr)
+        var_type = self._type_of(expr.expr)
 
         # Unwrap pointer/reference types: &Vec<T>, *Vec<T>, &mut Vec<T> -> Vec<T>
         while isinstance(var_type, rast.RefType):
@@ -1766,7 +1601,11 @@ class Monomorphizer:
         The call has been rewritten to use the mangled name, but we also need to
         check if the instantiation exists and add it if not.
         """
-        self._visit_item(fn)
+        saved, self._instance_subst = self._instance_subst, fn.instance_subst
+        try:
+            self._visit_item(fn)
+        finally:
+            self._instance_subst = saved
 
     def _generate_specializations(self) -> None:
         """Generate specialized versions for all found instantiations."""
@@ -1912,6 +1751,7 @@ class Monomorphizer:
         # Don't preserve source_file so _should_emit_body returns True
         new_fn.is_monomorphized = True
         new_fn.instance_args = list(subst.mapping.values())
+        new_fn.instance_subst = subst
         return new_fn
 
     def _specialize_impl(self, generic_impl: rast.ImplBlock, mangled_type_name: str,
@@ -2032,7 +1872,16 @@ class Monomorphizer:
                                    subst.apply)
 
     def _specialize_expr(self, expr: rast.Expr, subst: TypeSubstitution) -> rast.Expr:
-        """Specialize an expression by substituting types and rewriting names."""
+        """Specialize an expression by substituting types and rewriting names;
+        a copy remembers the template node it copies (_type_of)."""
+        new = self._specialize_expr_node(expr, subst)
+        if new is not expr and new is not None:
+            entry = self._origin.get(id(expr))
+            origin = entry[1] if entry is not None and entry[0] is expr else expr
+            self._origin[id(new)] = (new, origin)
+        return new
+
+    def _specialize_expr_node(self, expr: rast.Expr, subst: TypeSubstitution) -> rast.Expr:
         if expr is None:
             return None
 
@@ -2542,18 +2391,21 @@ def infer_struct_lit_args(module: rast.Module) -> None:
         fns = []
         for item in module.items:
             if isinstance(item, rast.FnDef):
-                fns.append((item, None, None))
+                fns.append((item, None))
             elif isinstance(item, rast.ImplBlock):
-                fns.extend((m, item.type_name, item.type_params) for m in item.methods)
-        for fn, impl_name, impl_params in fns:
+                fns.extend((m, item) for m in item.methods)
+        for fn, impl in fns:
             lits = [lit for lit in _struct_lits(fn.body)
                     if mono._argless_struct(lit) is not None]
             if not lits:
                 continue
             memo: dict = {}
             twin = copy.deepcopy(fn, memo)
+            # This runs before the typing pass: the twin is typed on its own.
+            mono._typed = type_bodies(module, [(twin, impl)])
             try:
-                mono._infer_in_fn(twin, impl_name, impl_params)
+                mono._infer_in_fn(twin, impl.type_name if impl else None,
+                                  impl.type_params if impl else None)
             except GenericInferError:
                 pass
             for lit in lits:

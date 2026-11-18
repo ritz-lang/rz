@@ -9,7 +9,7 @@ on `module.typed`.  It runs on every compile, as `ritz0._type`, not only under
 reported (turning them on by default is #1823).  The move checker takes the
 types of literals, casts, struct literals and calls from the table; its own
 rules for those kinds are gone.  So does the emitter, for typed.EMITTER_READS
-(#3555).  Monomorph still infers for itself (#3554).
+(#3555), and so does monomorph (#3554, test_monomorph_reads_typed.py).
 
 Every case but one parses a few lines in-process, in milliseconds; the
 win64 call case compiles once.

@@ -15,9 +15,9 @@ them (on by default is #3556, #1823), and the slot errors (§13.2, §13.4) are p
 beside an ownership error, or refuse an instance, either way.
 
 Who reads it so far: the type checker (it is the inference), the move
-checker, for MOVE_CHECKER_READS (#3553), and the emitter, for EMITTER_READS.
-The move checker's rules for Ident, Field, Match and MethodCall (#3553, after
-#3554), monomorph's inferers (#3554) and the emitter's for the other kinds
+checker, for MOVE_CHECKER_READS (#3553), monomorph (#3554), and the emitter,
+for EMITTER_READS (#3555).  The move checker's rules for Ident, Field, Match
+and MethodCall (#3553, after #3554) and the emitter's for the other kinds
 (#4066, #4067, #4068) are still to move here.
 """
 
