@@ -16,6 +16,7 @@ import drivers.nvme.nvme { NvmeNamespace, nvme_probe, nvme_get_namespace, nvme_n
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_virt_to_phys }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import io { rdtsc }
 
 # ============================================================================
 # VirtIO Block Feature Bits
@@ -33,6 +34,12 @@ const VIRTIO_BLK_F_CONFIG_WCE: u32 = 2048 # Writeback mode available
 # ============================================================================
 # VirtIO Block Request Types
 # ============================================================================
+
+# How long a request may take before it is reported as timed out, in TSC
+# cycles: 10^10 is 2 s at 5 GHz, 3.3 s at 3 GHz, 10 s at 1 GHz. A spin count
+# (1M polls, ~40 ms under TCG) timed out on a loaded host, and every later
+# request then read the stale completion as an error (AGAST #4078).
+const REQUEST_TIMEOUT_TSC: u64 = 10000000000
 
 pub const VIRTIO_BLK_T_IN: u32 = 0        # Read from device
 pub const VIRTIO_BLK_T_OUT: u32 = 1       # Write to device
@@ -258,18 +265,24 @@ fn get_device_index(dev: *VirtioBlkDevice) -> i32
         i = i + 1
     return 0  # Fall back to device 0
 
-# Wait for device dev_idx's request whose chain starts at `head`, then take its
-# used entry and free the chain. Returns true once it has completed. On a
+# Poll vq until the device returns a used buffer: true once it has, false if
+# REQUEST_TIMEOUT_TSC cycles pass first.
+fn wait_used(vq: *Virtqueue) -> bool
+    let start: u64 = rdtsc()
+    while not vq_has_used(vq)
+        if rdtsc() - start > REQUEST_TIMEOUT_TSC
+            return false
+    return true
+
+# Wait (up to wait_used's TSC deadline) for device dev_idx's request whose
+# chain starts at `head`, then take its used entry and free the chain. Returns true once it has completed. On a
 # timeout the request stays in flight (blk_inflight), and the next call on the
 # device finishes it in blk_reclaim before touching the DMA buffer.
 fn blk_complete(dev_idx: i32, vq: *Virtqueue, head: u16) -> bool
-    var timeout: u32 = 1000000
-    while not vq_has_used(vq)
-        timeout = timeout - 1
-        if timeout == 0
-            blk_inflight[dev_idx] = true
-            blk_inflight_head[dev_idx] = head
-            return false
+    if not wait_used(vq)
+        blk_inflight[dev_idx] = true
+        blk_inflight_head[dev_idx] = head
+        return false
 
     # One request at a time per device, so this used entry is `head`'s.
     vq_get_used(vq)

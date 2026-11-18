@@ -180,9 +180,12 @@ SUITE_PASSED = r"[test] hello ... PASS (exit=0)\n  Results: 10 passed, 0 failed\
 # The native boot's virtio-blk is modern-only and offers 1024-entry queues;
 # the driver must take the MMIO transport and cap the queue (AGAST #3576).
 BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
+# The native boot's persistent store sits on a disk that answers every
+# request 100 ms late; it must still come up (AGAST #4078).
+PERSIST_OK = r"\r  [OK] Persistent storage (0 blobs)\n"
 # init exits after the suite, and the kernel powers off (AGAST #2755).
 INIT_EXIT = r"[exit] init exited with code 0, powering off\n"
-PASSED = BLK_MODERN + KEY_OK + SUITE_PASSED + INIT_EXIT
+PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -333,7 +336,7 @@ def test_native_boot_attaches_a_modern_only_blk_with_1024_entry_queues(tree):
     ids=["legacy-transport", "queue-not-capped"],
 )
 def test_native_blk_not_modern_with_a_256_entry_queue_fails(tree, blk_line):
-    r = _run(tree, blk_line + KEY_OK + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, blk_line + PERSIST_OK + KEY_OK + SUITE_PASSED + INIT_EXIT)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "virtio-blk did not come up over the modern transport" in r.stdout
 
@@ -355,9 +358,33 @@ def test_qemu_that_never_powers_off_fails(tree):
 
 def test_init_that_never_exits_fails(tree):
     """QEMU exiting is not enough: init itself must have exited."""
-    r = _run(tree, BLK_MODERN + KEY_OK + SUITE_PASSED)
+    r = _run(tree, BLK_MODERN + PERSIST_OK + KEY_OK + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL (native): init did not exit" in r.stdout
+
+
+def test_native_boot_attaches_a_slow_persist_disk(tree):
+    """A spin-count poll in virtio-blk timed out under host load (AGAST
+    #4078); a second disk 100 ms slow per request pins that it waits on time,
+    not on polls."""
+    r = _run(tree, PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    argv = (tree["tmp"] / "stub.log").read_text()
+    assert "latency-ns=100000000" in argv and "drive=persist" in argv
+
+
+def test_persistent_storage_that_never_came_up_fails(tree):
+    r = _run(
+        tree,
+        BLK_MODERN
+        + r"[virtio-blk] Read timeout\n  [!!] Persistent storage (persist_init failed)\n"
+        + KEY_OK
+        + SUITE_PASSED
+        + INIT_EXIT,
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS (native): init Tier-1 suite" in r.stdout
+    assert "persistent storage did not come up" in r.stdout
 
 
 def test_suite_passed_but_key_never_arrived_fails(tree):
@@ -387,9 +414,25 @@ def test_exception_fails_even_if_the_suite_passed(tree):
 
 
 def test_no_verdict_before_the_timeout_fails(tree):
-    r = _run(tree, r"[kmain] start\n")
+    r = _run(tree, r"[kmain] start\n", poweroff=False)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "did not report ALL TESTS PASSED" in r.stdout
+    assert "no verdict within 3s (BOOT_TIMEOUT)" in r.stdout
+
+
+def test_serial_log_that_stops_growing_is_a_hang(tree):
+    """A hang is a log that stops growing for BOOT_STALL seconds, however
+    long the cap: a fixed 60 s cap failed live boots on a loaded host (AGAST
+    #4078), so the cap went up and this is what catches a real hang."""
+    r = _run(
+        tree,
+        r"[kmain] start\n",
+        poweroff=False,
+        env_extra={"BOOT_STALL": "2", "BOOT_TIMEOUT": "20"},
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "hung: serial output stopped for 2s (BOOT_STALL)" in r.stdout
+    assert "serial tail: [kmain] start" in r.stdout
 
 
 def test_failed_suite_fails(tree):

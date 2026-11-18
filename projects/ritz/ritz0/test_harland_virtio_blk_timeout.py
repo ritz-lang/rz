@@ -275,6 +275,15 @@ pub fn fake_dev_write_sector() -> u64
 pub fn fake_dev_write_byte() -> u8
     g_write_byte
 
+# blk.ritz waits on a TSC deadline (AGAST #4078). A held request must time out
+# at once, so this clock jumps 1e9 cycles per read: a deadline of N cycles
+# passes after about N / 1e9 polls, however fast the host runs.
+var g_tsc: u64 = 0
+
+pub fn rdtsc() -> u64
+    g_tsc = g_tsc + 1000000000
+    g_tsc
+
 pub fn outb(port: u16, value: u8) -> i32
     if port == BASE + 18
         g_status = value

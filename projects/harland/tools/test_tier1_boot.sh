@@ -21,13 +21,24 @@
 # init's exit powers the machine off (#2755): after the verdict QEMU must
 # exit by itself, with status 0, instead of hanging until it is stopped.
 #
+# The native boot's second virtio-blk disk (the persistent store) answers every
+# request 100 ms late. A spin-count poll gave up after ~40 ms of TCG time, and
+# far less on a loaded host (AGAST #4078), so the store must still come up.
+#
+# A boot fails as a hang when its serial log stops growing for BOOT_STALL
+# seconds, not after a fixed time: on a host at load ~100 a TCG boot ran 10x
+# slower and overran a fixed 60 s, though it was still making progress
+# (AGAST #4078). A hung boot prints the vCPUs' state from the QEMU monitor.
+#
 # Each ESP is a QEMU vvfat directory, so the only tools needed are
 # qemu-system-x86_64, OVMF, grub-mkstandalone (x86_64-efi) and python3.
 # mtools, mkfs.vfat and xorriso are not needed.
 #
 # Usage: tools/test_tier1_boot.sh [native|grub|all]   (default: all)
 #        SKIP_BUILD=1   use the existing build/debug outputs
-#        BOOT_TIMEOUT=N seconds per boot (default 60)
+#        BOOT_STALL=N   fail a boot whose serial log is idle N seconds (default 90;
+#                       OVMF + GRUB print nothing for 20 s at a tenth of a core)
+#        BOOT_TIMEOUT=N cap on each boot, however busy its log (default 600)
 #        KEEP_WORK=DIR  copy each boot's serial log (NAME.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #        POWEROFF_WAIT=N seconds QEMU gets to power off after the verdict
@@ -49,7 +60,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 HARLAND_DIR="$(dirname "$SCRIPT_DIR")"
 PROJECTS_DIR="$(dirname "$HARLAND_DIR")"
 ROOT_DIR="$(dirname "$PROJECTS_DIR")"
-TIMEOUT="${BOOT_TIMEOUT:-60}"
+TIMEOUT="${BOOT_TIMEOUT:-600}"
+STALL="${BOOT_STALL:-90}"
 MEM="${QEMU_MEM:-2G}"
 MODE="${1:-all}"
 
@@ -112,11 +124,13 @@ done
 python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 
-# boot NAME ESP_DIR BLK_OPTS: boot one ESP with the initramfs disk on
-# virtio-blk-pci,drive=initramfs<BLK_OPTS>, leaving the serial log in
-# $WORK/NAME.log.
+# boot NAME ESP_DIR BLK_OPTS [QEMU_ARG...]: boot one ESP with the initramfs
+# disk on virtio-blk-pci,drive=initramfs<BLK_OPTS> and any extra QEMU_ARGs,
+# leaving the serial log in $WORK/NAME.log. Fails (returns 1) if the boot
+# reached no verdict: its log went idle for $STALL s, or it ran $TIMEOUT s.
 boot() {
     local name="$1" esp="$2" blk_opts="$3" serial="$WORK/$1.log"
+    shift 3
     local vars=()
     if [ -n "$OVMF_VARS" ]; then
         cp "$OVMF_VARS" "$WORK/$name-vars.fd"
@@ -126,26 +140,42 @@ boot() {
     # A fresh qcow2 overlay per boot keeps each boot from seeing what the
     # other one wrote.
     qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/initramfs.qcow2" "$WORK/$name-initramfs.qcow2"
-    timeout "$TIMEOUT" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m "$MEM" \
+    # The loop below enforces $TIMEOUT; this one only backs it up, late enough
+    # that a hung guest's monitor is still there to report on.
+    timeout "$((TIMEOUT + 30))" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m "$MEM" \
         -display none -no-reboot -monitor "unix:$WORK/$name-mon.sock,server,nowait" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
         -device "virtio-blk-pci,drive=initramfs$blk_opts" \
         -device virtio-keyboard-pci \
         -drive "file=$WORK/$name-initramfs.qcow2,format=qcow2,if=none,id=initramfs" \
-        -serial "file:$serial" >/dev/null 2>&1 &
+        "$@" -serial "file:$serial" >/dev/null 2>&1 &
     local pid=$!
-    local key_sent=0 verdict=0
-    for _ in $(seq 1 "$TIMEOUT"); do
+    local key_sent=0 verdict=0 stalled=0 size=0 last_size=-1
+    local start=$SECONDS last_change=$SECONDS
+    # Stop polling once a verdict line appears (QEMU then powers off, below).
+    # $SECONDS, not a count of iterations: each one takes longer than 1 s on
+    # a loaded host.
+    while [ $((SECONDS - start)) -lt "$TIMEOUT" ]; do
         sleep 1
+        size=$(stat -c %s "$serial")
+        if [ "$size" != "$last_size" ]; then
+            last_size=$size
+            last_change=$SECONDS
+        elif [ $((SECONDS - last_change)) -ge "$STALL" ]; then
+            stalled=1
+            break
+        fi
         if [ "$key_sent" = 0 ] && grep -aq "\[OK\] VirtIO input device" "$serial"; then
             # A failed send (monitor not up yet) retries next second; a key
             # that never lands is reported by key_received.
             send_key "$WORK/$name-mon.sock" a 2>/dev/null && key_sent=1
         fi
         grep -aqE "ALL TESTS PASSED|TESTS FAILED|KERNEL PANIC" "$serial" && { verdict=1; break; }
-        kill -0 "$pid" 2>/dev/null || break
+        # QEMU exited before a verdict: nothing to dump, the checks report it.
+        kill -0 "$pid" 2>/dev/null || { verdict=1; break; }
     done
+    local elapsed=$((SECONDS - start))
     # init's exit powers the machine off through ACPI (#2755), so after the
     # verdict QEMU should exit by itself; give it POWEROFF_WAIT seconds, then
     # stop it. Its exit status is 0 only for a guest power-off (124: timeout
@@ -155,12 +185,49 @@ boot() {
             kill -0 "$pid" 2>/dev/null || break
             sleep 1
         done
+    else
+        # Where each vCPU is and whether it is halted (HLT=1) or spinning.
+        echo "----- $name boot: no verdict; vCPU state from the QEMU monitor -----"
+        monitor "$WORK/$name-mon.sock" "info registers -a" 2>&1 \
+            | grep -aE '^CPU#|IP=' | paste -d' ' - - | sed 's/^/      /'
     fi
     kill "$pid" 2>/dev/null
     wait "$pid" 2>/dev/null
     echo $? > "$WORK/$name.qemu-rc"
     echo "----- $name boot: Tier-1 suite output (tail) -----"
     sed -n '/Running Tier 1 Test Suite/,$p' "$serial" | grep -aE '^\[test\]|PASS|FAIL|Results|EXCEPTION|RIP|RSP' | tail -30
+    [ "$verdict" = 1 ] && return 0
+    echo "      serial tail: $(tail -c 200 "$serial" | tr -s '\r\n' '  ')"
+    if [ "$stalled" = 1 ]; then
+        echo "FAIL ($name): hung: serial output stopped for ${STALL}s (BOOT_STALL), ${elapsed}s into the boot"
+    else
+        echo "FAIL ($name): no verdict within ${TIMEOUT}s (BOOT_TIMEOUT), serial output still growing"
+    fi
+    return 1
+}
+
+# monitor SOCK CMD...: run each CMD on the QEMU monitor socket SOCK and print
+# what it answers.
+monitor() {
+    python3 - "$@" <<'PY'
+import socket, sys, time
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(5)
+s.connect(sys.argv[1])
+for cmd in sys.argv[2:]:
+    s.sendall((cmd + "\n").encode())
+    time.sleep(1)
+out = b""
+try:
+    while True:
+        d = s.recv(65536)
+        if not d:
+            break
+        out += d
+except socket.timeout:
+    pass
+sys.stdout.write(out.decode(errors="replace"))
+PY
 }
 
 # send_key SOCK KEY: type KEY on the guest's keyboard through the QEMU
@@ -199,6 +266,18 @@ blk_transport() {
     else
         grep -a "\[virtio-blk\]" "$WORK/$1.log" | head -5
         echo "FAIL ($1): virtio-blk did not come up over the $2 transport with a 256-entry queue"
+        return 1
+    fi
+}
+
+# slow_disk NAME: pass only if the persistent store came up on the second
+# virtio-blk disk, whose every request takes 100 ms (AGAST #4078).
+slow_disk() {
+    if grep -aq "\[OK\] Persistent storage" "$WORK/$1.log"; then
+        echo "PASS ($1): persistent storage came up on a disk with 100 ms request latency"
+    else
+        grep -aE "\[virtio-blk\] (Read|Write) timeout|persist:|Persistent storage" "$WORK/$1.log" | head -5
+        echo "FAIL ($1): persistent storage did not come up on a disk with 100 ms request latency"
         return 1
     fi
 }
@@ -274,9 +353,12 @@ if [ "$MODE" != grub ]; then
     mkdir -p "$WORK/esp-native/EFI/BOOT" "$WORK/esp-native/harland"
     cp "$LOADER_EFI" "$WORK/esp-native/EFI/BOOT/BOOTX64.EFI"
     cp "$KERNEL_ELF" "$WORK/esp-native/harland/kernel.elf"
-    boot native "$WORK/esp-native" ",disable-legacy=on,queue-size=1024"
+    boot native "$WORK/esp-native" ",disable-legacy=on,queue-size=1024" \
+        -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
+        -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     all_passed native || rc=1
     blk_transport native modern || rc=1
+    slow_disk native || rc=1
     key_received native || rc=1
     powered_off native || rc=1
     [ "$HIGH_MEM" = 1 ] && { high_memory native || rc=1; }
@@ -294,7 +376,7 @@ EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
         || setup_error "grub-mkstandalone failed"
-    boot grub "$WORK/esp-grub" ""
+    boot grub "$WORK/esp-grub" "" || rc=1
     # The framebuffer must come from the multiboot2 tag, not just be absent
     # and tolerated (#2143).
     if grep -aq "\[OK\] Display driver" "$WORK/grub.log"; then
