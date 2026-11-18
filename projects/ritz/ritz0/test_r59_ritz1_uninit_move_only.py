@@ -83,3 +83,28 @@ def test_emit_module_builds_emitter_state_whole(tmp_path, uninit_move_only):
     """emitter.ritz (with its imports) has no uninitialised move-only `var`."""
     _check(EMITTER, tmp_path / "emitter.ll", no_runtime=True)
     assert sorted(set(uninit_move_only)) == []
+
+
+NEXUS = RITZ_ROOT.parent / "nexus"
+
+
+@pytest.mark.integration
+def test_nexus_worlds_are_built_whole(tmp_path, monkeypatch, uninit_move_only):
+    """nexus's World/App tests build the value whole before `world_open(@w)`
+    / `app_new(@app)` borrow it (AGAST #4158: 31 sites before)."""
+    # What `rz test nexus` hands build.py: the package's import namespaces,
+    # and every package it reaches on RITZ_PATH (spire's `tome.*`).
+    from import_resolver import DependencyMapping
+    from resolve import (dependency_package_dirs, package_import_namespaces,
+                         read_manifest)
+    config = read_manifest(NEXUS)
+    deps = {name: DependencyMapping(name=name, path=Path(spec.path),
+                                    sources=spec.sources)
+            for name, spec in package_import_namespaces(config, NEXUS).items()}
+    path = [str(p.resolve()) for p in dependency_package_dirs(NEXUS)[1:]]
+    monkeypatch.setenv("RITZ_PATH", ":".join(path + [str(RITZ_ROOT)]))
+    for name in ("test_wiki_service", "test_presenters", "test_wiki_app"):
+        _check(NEXUS / "test" / f"{name}.ritz", tmp_path / f"{name}.ll",
+               dependencies=deps, source_roots=["src", "."],
+               project_root=str(NEXUS), test_mode=True)
+    assert sorted(set(uninit_move_only)) == []
