@@ -99,6 +99,17 @@ fn g(a: [2]Res)
 fn f(r: Res)
     g(^[r; 2])
 """,
+    # The value is itself a fill: `[Res; 1]` is move-only too, so the outer
+    # fill copies one Res into each row (AGAST #3433). ritz0 checked only the
+    # innermost fill.
+    "nested_fill": """\
+fn f()
+    var g: [2][1]Res = ^[ [Res { h: 1 }; 1]; 2]
+""",
+    "nested_fill_binding": """\
+fn f(r: Res)
+    let g: [3][1]Res = ^[ [r; 1]; 3]
+""",
     # Checked per instance: `T` is `Res` here.
     "generic_instance": """\
 fn g<T>(t: T)
@@ -168,6 +179,21 @@ pub fn main() -> i32
     a = [make_c(); 2]
     return a[0].x + a[1].x
 """, 12),
+    # A one-row fill of a one-element fill moves the value once (AGAST #3433).
+    "nested_one_by_one": (DEFS + """
+fn f() -> i32
+    let g: [1][1]Res = [ [Res { h: 4 }; 1]; 1]
+    return g[0][0].h
+
+pub fn main() -> i32
+    let h = f()
+    return h * 10 + DROPS
+""", 41),
+    "nested_copy": (DEFS + """
+pub fn main() -> i32
+    let g: [2][3]C = [ [C { x: 2 }; 3]; 2]
+    return g[1][2].x + g[0][0].x
+""", 4),
     "generic_struct_instance": (DEFS + """
 fn g<T>(t: T) -> T
     let a: [2]T = [t; 2]

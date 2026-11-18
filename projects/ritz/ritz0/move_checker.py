@@ -316,6 +316,9 @@ class MoveChecker(MoveWalk):
         rast.UnaryOp: _type_of_unary,
         rast.BinOp: _type_of_binop,
         rast.ArrayLit: _type_of_array_lit,
+        # `[v; n]` is `[n]V`: a fill of a fill of a move-only value is
+        # move-only too, so `[ [r; 1]; 2]` copies `r` (AGAST #3433).
+        rast.ArrayFill: _type_from_table,
         rast.TupleLit: _type_of_tuple_lit,
         rast.Field: _type_of_field,
         rast.Match: _type_of_match,
