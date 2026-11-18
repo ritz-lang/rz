@@ -1,58 +1,59 @@
 """
 True Async Function Transformation for ritz0 (v2)
 
-Transforms async functions into proper state machines that:
-1. Return Poll<T> encoding: -1 = Pending, >=0 = Ready(value)
-2. Switch on state field to resume at correct point
-3. Poll inner futures and propagate Pending
+An async fn becomes three items:
 
-Example transformation:
+    struct fetch_Future             # __state, the params, every local, and
+        __state: i32                # each awaited future / await result
+        ...
+    fn fetch(x: i32) -> fetch_Future            # the future in state 0
+    fn fetch_poll(self: *fetch_Future) -> i32   # run to Pending or Ready
 
-    # Source
-    async fn fetch(x: i32) -> i32
-        let a = await get_value(x)
-        let b = await get_other(a)
-        a + b
+With no await the poll runs the body once: Ready at once.  With one, the body
+is lowered to a control-flow graph of states (AGAST #3727), and the poll is a
+dispatch loop over them:
 
-    # Transformed to:
-    struct fetch_Future
-        state: i32
-        x: i32
-        a: i32
-        b: i32
-        # Inner futures stored inline for simple cases
+    async fn sum_to(n: i32) -> i32
+        var s: i32 = 0
+        var i: i32 = 0
+        while i < n
+            s += await dbl(i)
+            i += 1
+        s
 
-    fn fetch(x: i32) -> fetch_Future
-        fetch_Future { state: 0, x: x, a: 0, b: 0 }
+    fn sum_to_poll(self: *sum_to_Future) -> i32
+        while true
+            if (*self).__state == 0           # entry
+                (*self).s = 0
+                (*self).i = 0
+                (*self).__state = 1
+                continue
+            if (*self).__state == 1           # loop head
+                if (*self).i < (*self).n  { state = 2 } else { state = 4 }
+                continue
+            if (*self).__state == 2           # build the awaited future
+                (*self).__future_0 = dbl((*self).i)
+                (*self).__state = 3
+                continue
+            if (*self).__state == 3           # resume point: poll it
+                let __poll_0: i32 = dbl_poll(@(*self).__future_0)
+                if __poll_0 == -1
+                    return -1                 # Pending: resume here next poll
+                (*self).s = (*self).s + __poll_0
+                (*self).i = (*self).i + 1
+                (*self).__state = 1
+                continue
+            if (*self).__state == 4
+                return (*self).s              # Ready
+        -1
 
-    fn fetch_poll(self: *fetch_Future) -> i32
-        # State 0: Start, call first await
-        if (*self).state == 0
-            let inner_result = get_value_poll(...)
-            if inner_result == -1  # Pending
-                return -1
-            (*self).a = inner_result
-            (*self).state = 1
-
-        # State 1: After first await, call second
-        if (*self).state == 1
-            let inner_result = get_other_poll(...)
-            if inner_result == -1
-                return -1
-            (*self).b = inner_result
-            (*self).state = 2
-
-        # State 2: Complete
-        return (*self).a + (*self).b
+How a poll answers (Pending / Ready) is PollAbi's alone (LARB R78/R79, #3728).
 """
 
-from dataclasses import dataclass, field
+import copy
+from dataclasses import dataclass, field, fields
 from typing import List, Dict, Set, Optional, Tuple
 import ritz_ast as rast
-
-
-# Poll encoding: -1 = Pending, value >= 0 = Ready(value)
-POLL_PENDING = -1
 
 
 @dataclass
@@ -60,12 +61,7 @@ class AwaitPoint:
     """Represents a single await expression in an async function."""
     index: int                    # 0-based index of this await
     expr: rast.Await             # The await expression
-    result_var: str              # Variable to store result (e.g., 'a' for 'let a = await ...')
-    result_type: rast.Type       # Type of the result
     span: Optional[rast.Span] = None
-    # Top-level lets whose value this await completes (`let v = (await f(x))
-    # + 1`): its state evaluates them once the result is stored (AGAST #3821).
-    then_lets: List[rast.Stmt] = field(default_factory=list)
 
 
 @dataclass
@@ -110,9 +106,6 @@ class AsyncAnalyzer:
         self.await_points: List[AwaitPoint] = []
         self.current_locals: Dict[str, rast.Type] = {}
         self.await_index = 0
-        self.current_let_target: Optional[Tuple[str, rast.Type]] = None
-        # ids of the async fn body's own statements (AGAST #3821).
-        self.top_level_stmts: Set[int] = set()
         # Declared fns by name, for an untyped `let y = f(x)` (AGAST #3762).
         self.fn_sigs: Dict[str, rast.FnDef] = fn_sigs or {}
 
@@ -178,7 +171,6 @@ class AsyncAnalyzer:
 
         # Walk the function body
         if fn_def.body:
-            self.top_level_stmts = {id(s) for s in fn_def.body.stmts}
             self._analyze_block(fn_def.body)
 
         # With an await, every local is a field of the future, which needs its
@@ -187,12 +179,9 @@ class AsyncAnalyzer:
             name, span = self.untyped[0]
             raise UntypedAsyncLocal(fn_def.name, name, span)
 
-        # Compute which locals live across await points
-        cross_await = set()
-        for i, ap in enumerate(self.await_points):
-            # All locals defined before this await that are used after it
-            for var_name in self.current_locals.keys():
-                cross_await.add(var_name)
+        # With an await, every local lives in the future: a state ends at
+        # each await, and a loop or branch may reach any local from another.
+        cross_await = set(self.current_locals) if self.await_points else set()
 
         return AsyncFnAnalysis(
             fn_def=fn_def,
@@ -221,23 +210,8 @@ class AsyncAnalyzer:
                 local_type = self._infer_type(stmt.value)
             if local_type is None:
                 self.untyped.append((stmt.name, stmt.span))
-            # A let whose value IS the await binds the poll's result to its
-            # name.  An await nested in the value (`(await f(x)) + 1`) gets
-            # its own __await_result_N: binding `v` there stored the bare
-            # poll value and dropped the `+ 1` (AGAST #3821).
-            if isinstance(stmt.value, rast.Await):
-                self.current_let_target = (stmt.name, local_type)
-            first_point = len(self.await_points)
             if stmt.value:
                 self._analyze_expr(stmt.value)
-            self.current_let_target = None
-            # The machine runs only the awaits of the body's own statements,
-            # so the state of the value's last await computes the rest.  A let
-            # in a nested block is re-run by the final state already.
-            if (not isinstance(stmt.value, rast.Await)
-                    and len(self.await_points) > first_point
-                    and id(stmt) in self.top_level_stmts):
-                self.await_points[-1].then_lets.append(stmt)
             self.current_locals[stmt.name] = local_type
         elif isinstance(stmt, rast.ExprStmt):
             self._analyze_expr(stmt.expr)
@@ -253,35 +227,21 @@ class AsyncAnalyzer:
             self._analyze_block(stmt.body)
         elif isinstance(stmt, rast.DeferStmt):
             self._analyze_block(stmt.body)
+        elif isinstance(stmt, rast.ForStmt):
+            self._analyze_expr(stmt.iter)
+            self._analyze_block(stmt.body)
+        elif isinstance(stmt, rast.UnsafeBlock):
+            self._analyze_block(stmt.body)
+        elif isinstance(stmt, rast.AssertStmt):
+            self._analyze_expr(stmt.condition)
 
     def _analyze_expr(self, expr: rast.Expr):
         """Analyze an expression, recording await points."""
         if isinstance(expr, rast.Await):
-            # Found an await point!  An await nested in the awaited expression
-            # (`await g(await f(x))`) runs first: record it first, so points
-            # are in evaluation order and each state reads its earlier ones.
-            let_target = self.current_let_target
-            self.current_let_target = None
+            # An await nested in the awaited expression runs first.
             self._analyze_expr(expr.expr)
-
-            result_var = f"__await_result_{self.await_index}"
-            result_type = rast.NamedType(span=rast.Span(0,0,0,0), name='i32')
-
-            # If we're in a let statement, use that variable name
-            if let_target:
-                result_var, result_type = let_target
-            else:
-                # Add synthetic result variable to locals so it gets a field
-                self.current_locals[result_var] = result_type
-
-            ap = AwaitPoint(
-                index=self.await_index,
-                expr=expr,
-                result_var=result_var,
-                result_type=result_type,
-                span=getattr(expr, 'span', None)
-            )
-            self.await_points.append(ap)
+            self.await_points.append(AwaitPoint(index=self.await_index, expr=expr,
+                                                span=getattr(expr, 'span', None)))
             self.await_index += 1
 
         elif isinstance(expr, rast.BinOp):
@@ -313,8 +273,10 @@ class AsyncAnalyzer:
         elif isinstance(expr, rast.Cast):
             self._analyze_expr(expr.expr)
         elif isinstance(expr, rast.Match):
-            self._analyze_expr(expr.value)
+            self._analyze_expr(expr.expr)
             for arm in expr.arms:
+                if arm.guard:
+                    self._analyze_expr(arm.guard)
                 if arm.body:
                     self._analyze_expr(arm.body)
         elif isinstance(expr, rast.StructLit):
@@ -338,14 +300,546 @@ class AsyncStateMachine:
     num_states: int
 
 
+class AsyncLoweringError(Exception):
+    """An async fn body the state machine can't lower (AGAST #3727): an await
+    in a place it has no resume point for yet (#4013).  Located; the emitter
+    reports it as an EmitError."""
+
+    def __init__(self, message: str, span: Optional[rast.Span]):
+        self.span = span
+        super().__init__(message)
+
+
+def _unplaced(what: str, span: Optional[rast.Span]) -> AsyncLoweringError:
+    return AsyncLoweringError(
+        f"`await` inside {what} in an async fn is not supported yet (AGAST #4013)", span)
+
+
+class PollAbi:
+    """How a poll fn answers: Pending, or Ready with a value.
+
+    The state machine asks only this, so the poll-return encoding can change
+    without touching it (LARB R78/R79: #3728 moves Ready/Pending to a bool
+    header field).  Today a poll returns an i32: -1 is Pending, anything else
+    is Ready with that value."""
+
+    RET_TYPE = 'i32'
+
+    def __init__(self, span: rast.Span):
+        self.span = span
+
+    def _pending_value(self) -> rast.Expr:
+        return rast.BinOp(span=self.span, op='-', left=rast.IntLit(span=self.span, value=0),
+                          right=rast.IntLit(span=self.span, value=1))
+
+    def is_pending(self, answer: rast.Expr) -> rast.Expr:
+        """Whether an inner poll's `answer` is Pending."""
+        return rast.BinOp(span=self.span, op='==', left=answer, right=self._pending_value())
+
+    def pending(self) -> rast.Stmt:
+        """Return Pending from this poll."""
+        return rast.ReturnStmt(span=self.span, value=self._pending_value())
+
+    def unreachable(self) -> rast.Expr:
+        """The poll's value after its dispatch loop, which never ends."""
+        return self._pending_value()
+
+    def ready(self, value: rast.Expr, span: rast.Span) -> rast.Stmt:
+        """Return Ready(value) from this poll."""
+        return rast.ReturnStmt(span=span, value=value)
+
+    def ready_expr(self, value: Optional[rast.Expr], span: rast.Span) -> rast.Expr:
+        """`return` as an expression (a match arm's), Ready(value)."""
+        return rast.ReturnExpr(span=span, value=value)
+
+
+def _child_nodes(node):
+    """`node`'s direct children, in field (evaluation) order: expressions,
+    statements and blocks, not types or patterns."""
+    for f in fields(node):
+        val = getattr(node, f.name)
+        items = val if isinstance(val, (list, tuple)) else (val,)
+        for item in items:
+            # A struct literal's field is a (name, value) pair.
+            if isinstance(item, tuple):
+                item = item[-1]
+            if isinstance(item, rast.Node) and not isinstance(item, (rast.Type, rast.Pattern)):
+                yield item
+
+
+def _first_await(node) -> Optional[rast.Await]:
+    if isinstance(node, rast.Await):
+        return node
+    for child in _child_nodes(node):
+        found = _first_await(child)
+        if found is not None:
+            return found
+    return None
+
+
+def _has_await(node) -> bool:
+    return _first_await(node) is not None
+
+
+def _escaping_jump(node) -> Optional[rast.Node]:
+    """A `break` / `continue` in `node` that leaves it for an enclosing loop."""
+    if isinstance(node, (rast.BreakStmt, rast.ContinueStmt, rast.BreakExpr, rast.ContinueExpr)):
+        return node
+    if isinstance(node, (rast.WhileStmt, rast.ForStmt)):
+        return None  # its own jumps are its own
+    for child in _child_nodes(node):
+        found = _escaping_jump(child)
+        if found is not None:
+            return found
+    return None
+
+
+_INT_NAMES = frozenset(('i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'isize', 'usize'))
+
+
+def _zero_of(ty: Optional[rast.Type], span) -> Optional[rast.Expr]:
+    """A scalar type's zero: 0, false or a null pointer; None for any other."""
+    if isinstance(ty, rast.PtrType):
+        return rast.NullLit(span=span)
+    if isinstance(ty, rast.NamedType) and ty.name in _INT_NAMES:
+        return rast.IntLit(span=span, value=0)
+    if isinstance(ty, rast.NamedType) and ty.name == 'bool':
+        return rast.BoolLit(span=span, value=False)
+    return None
+
+
+def _pattern_names(pat) -> Set[str]:
+    """The names a match pattern binds."""
+    if isinstance(pat, rast.IdentPattern):
+        return {pat.name}
+    names: Set[str] = set()
+    if isinstance(pat, rast.VariantPattern):
+        for sub in pat.fields:
+            names |= _pattern_names(sub)
+    elif isinstance(pat, rast.StructPattern):
+        for _, sub in pat.fields:
+            names |= _pattern_names(sub)
+    return names
+
+
+class SimpleBodyTransformer:
+    """Rewrites async fn code to run inside its poll fn.
+
+    A name that lives in the future struct (a param; with an await, every
+    local) reads and writes `(*self).name`, wherever it appears: a `while`
+    condition, an assignment's target, a match arm (AGAST #3727: only
+    let/var/return/expression statements were rewritten, so `while i < n` with
+    a param `n` was "Unknown identifier: n").  A let of such a local is an
+    assignment to its field.  An await already driven by a state reads its
+    stored result, and a `return` is the poll's Ready.
+    """
+
+    def __init__(self, fields: Set[str], local_fields: Set[str], abi: PollAbi, unit: bool,
+                 await_results: Optional[Dict[int, str]] = None):
+        self.fields = set(fields)
+        self.local_fields = local_fields
+        self.abi = abi
+        self.unit = unit
+        self.await_results = await_results if await_results is not None else {}
+
+    def self_field(self, name: str, span) -> rast.Field:
+        """(*self).name"""
+        return rast.Field(
+            span=span,
+            expr=rast.UnaryOp(span=span, op='*', operand=rast.Ident(span=span, name='self')),
+            field=name
+        )
+
+    def _shadowed(self, names: Set[str], node):
+        """`node` rewritten with `names` (a pattern's or a `for`'s own) left alone."""
+        hidden = names & self.fields
+        self.fields -= hidden
+        try:
+            return self._rewrite_fields(node)
+        finally:
+            self.fields |= hidden
+
+    def rewrite(self, node):
+        if isinstance(node, list):
+            out = [self.rewrite(n) for n in node]
+            return [n for n in out if n is not None]
+        if isinstance(node, tuple):
+            return tuple(self.rewrite(n) for n in node)
+        if not isinstance(node, rast.Node) or isinstance(node, (rast.Type, rast.Pattern)):
+            return node
+
+        if isinstance(node, rast.Ident):
+            if node.name in self.fields:
+                return self.self_field(node.name, node.span)
+            return node
+        if isinstance(node, rast.Await):
+            # A state drove it: its result is stored.
+            if id(node) in self.await_results:
+                return self.self_field(self.await_results[id(node)], node.span)
+            return self.rewrite(node.expr)
+        if isinstance(node, (rast.LetStmt, rast.VarStmt)) and node.name in self.local_fields:
+            # The local lives in the future struct.  One with no value is
+            # zeroed if a scalar, as it always was (ritz1 alike); an array or
+            # struct (`var buf: [32]u8`) is only its field.
+            if node.value is None:
+                value = _zero_of(node.type, node.span)
+                if value is None:
+                    return None
+            else:
+                value = self.rewrite(node.value)
+            return rast.AssignStmt(span=node.span, target=self.self_field(node.name, node.span), value=value)
+        if isinstance(node, rast.ReturnStmt):
+            return self.ready(self.rewrite(node.value) if node.value else None, node.span)
+        if isinstance(node, rast.ReturnExpr):
+            value = self.rewrite(node.value) if node.value else None
+            if self.unit:
+                value = rast.IntLit(span=node.span, value=0)
+            return self.abi.ready_expr(value, node.span)
+        if isinstance(node, rast.MatchArm):
+            return self._shadowed(_pattern_names(node.pattern), node)
+        if isinstance(node, rast.ForStmt):
+            new = copy.copy(node)
+            new.iter = self.rewrite(node.iter)
+            new.body = self._shadowed({node.var}, node.body)
+            return new
+        return self._rewrite_fields(node)
+
+    def _rewrite_fields(self, node):
+        new = copy.copy(node)
+        for f in fields(node):
+            val = getattr(node, f.name)
+            if isinstance(val, list) and val and isinstance(val[0], tuple):
+                # A struct literal's (name, value) pairs.
+                setattr(new, f.name, [(k, self.rewrite(v)) for k, v in val])
+            else:
+                setattr(new, f.name, self.rewrite(val))
+        return new
+
+    def ready(self, value: Optional[rast.Expr], span) -> rast.Stmt:
+        """`return value` from the async fn: Ready(value), Ready(0) for a unit fn."""
+        if self.unit or value is None:
+            value = rast.IntLit(span=span, value=0)
+        return self.abi.ready(value, span)
+
+    # The names earlier callers used.
+    def transform(self, block: rast.Block) -> rast.Block:
+        return self.rewrite(block)
+
+    def _transform_expr(self, expr: rast.Expr) -> rast.Expr:
+        return self.rewrite(expr)
+
+    def _transform_stmt(self, stmt: rast.Stmt) -> Optional[rast.Stmt]:
+        return self.rewrite(stmt)
+
+
+@dataclass
+class _Loop:
+    head: int   # the state that tests the condition: `continue` goes here
+    exit: int   # the state after the loop: `break` goes here
+
+
+class _CfgBuilder:
+    """Lowers an async fn body that awaits to a control-flow graph of states.
+
+    Each state is a straight run of statements that ends by jumping to
+    another state (`(*self).__state = N; continue` in the poll's dispatch
+    loop), returning Ready, or returning Pending at a resume point.  An await
+    is its own state: it polls the awaited future, kept in the future struct,
+    and returns Pending until it is Ready, so the next poll resumes there.
+    Everything between awaits runs in the states that reach it, once (AGAST
+    #3727: the old lowering ran each await once, in order, and then only the
+    body's tail).  Loops and branches are ordinary edges between states, so
+    an await in a `while` runs on every pass and only the taken arm's do.
+
+    A statement with no await (and no `break`/`continue` out of a loop that
+    has one) is kept whole, rewritten in place: no state is spent on it.
+    """
+
+    def __init__(self, gen: 'TrueAsyncGenerator', rewriter: SimpleBodyTransformer):
+        self.gen = gen
+        self.rw = rewriter
+        self.abi = rewriter.abi
+        self.span = gen.dummy_span
+        self.blocks: List[List[rast.Stmt]] = []
+        self.closed: Set[int] = set()
+        self.cur: Optional[int] = None
+        self.n_awaits = 0
+        # Fields the lowering adds: awaited futures and await results.
+        self.extra_fields: List[Tuple[str, rast.Type]] = []
+
+    # -- states ------------------------------------------------------------
+
+    def new_block(self) -> int:
+        self.blocks.append([])
+        return len(self.blocks) - 1
+
+    def _at(self) -> int:
+        """The open state, or a fresh (unreachable) one after a jump."""
+        if self.cur is None:
+            self.cur = self.new_block()
+        return self.cur
+
+    def emit(self, stmt: Optional[rast.Stmt]):
+        if stmt is not None:
+            self.blocks[self._at()].append(stmt)
+
+    def _close(self, *stmts: rast.Stmt):
+        b = self._at()
+        self.blocks[b].extend(stmts)
+        self.closed.add(b)
+        self.cur = None
+
+    def _set_state(self, target: int) -> rast.Stmt:
+        return rast.AssignStmt(span=self.span, target=self.rw.self_field('__state', self.span),
+                               value=rast.IntLit(span=self.span, value=target))
+
+    def goto(self, target: int):
+        self._close(self._set_state(target), rast.ContinueStmt(span=self.span))
+
+    def branch(self, cond: rast.Expr, then_b: int, else_b: int):
+        jump = rast.If(span=self.span, cond=cond,
+                       then_block=rast.Block(span=self.span, stmts=[self._set_state(then_b)], expr=None),
+                       else_block=rast.Block(span=self.span, stmts=[self._set_state(else_b)], expr=None))
+        self._close(rast.ExprStmt(span=self.span, expr=jump), rast.ContinueStmt(span=self.span))
+
+    def ret(self, value: Optional[rast.Expr], span):
+        self._close(self.rw.ready(value, span))
+
+    def _add_field(self, name: str, ty: rast.Type) -> str:
+        self.extra_fields.append((name, ty))
+        self.rw.fields.add(name)
+        return name
+
+    # -- statements --------------------------------------------------------
+
+    def lower_body(self, body: rast.Block):
+        self.cur = self.new_block()  # state 0
+        self.lower_stmts(body.stmts, None)
+        if body.expr is not None:
+            self.lower_value(body.expr, ('return',), None)
+        if self.cur is not None:
+            # Off the end: a unit fn's Ready(0) (the old lowering's 0 too).
+            self.ret(None, self.span)
+
+    def lower_stmts(self, stmts: List[rast.Stmt], loop: Optional[_Loop]):
+        for stmt in stmts:
+            self.lower_stmt(stmt, loop)
+
+    def _needs_lowering(self, node, loop: Optional[_Loop]) -> bool:
+        return _has_await(node) or (loop is not None and _escaping_jump(node) is not None)
+
+    def lower_stmt(self, stmt: rast.Stmt, loop: Optional[_Loop]):
+        if isinstance(stmt, rast.DeferStmt):
+            # Its block's exit is spread over states: it would run as its
+            # state ends, not as the block does.
+            raise AsyncLoweringError(
+                "`defer` in an async fn that awaits is not supported yet (AGAST #4013)", stmt.span)
+        if not self._needs_lowering(stmt, loop):
+            self.emit(self.rw.rewrite(stmt))
+            if isinstance(stmt, rast.ReturnStmt):
+                self.closed.add(self._at())
+                self.cur = None
+            return
+
+        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
+            self.lower_value(stmt.value, ('field', stmt.name, stmt.span), loop)
+        elif isinstance(stmt, rast.AssignStmt):
+            target = self.hoist(stmt.target)
+            self.lower_value(stmt.value, ('assign', stmt, target), loop)
+        elif isinstance(stmt, rast.ReturnStmt):
+            if stmt.value is None:
+                self.ret(None, stmt.span)
+            else:
+                self.lower_value(stmt.value, ('return',), loop)
+        elif isinstance(stmt, rast.ExprStmt):
+            self.lower_value(stmt.expr, None, loop)
+        elif isinstance(stmt, rast.WhileStmt):
+            self._lower_while(stmt)
+        elif isinstance(stmt, rast.BreakStmt):
+            self.goto(loop.exit)
+        elif isinstance(stmt, rast.ContinueStmt):
+            self.goto(loop.head)
+        elif isinstance(stmt, rast.UnsafeBlock):
+            self.lower_value(stmt.body, None, loop)
+        elif isinstance(stmt, rast.ForStmt):
+            raise _unplaced("a `for` loop", self._culprit(stmt))
+        else:
+            raise _unplaced("this statement", self._culprit(stmt))
+
+    def _culprit(self, node) -> Optional[rast.Span]:
+        found = _first_await(node) or _escaping_jump(node) or node
+        return found.span
+
+    def _lower_while(self, stmt: rast.WhileStmt):
+        head = self.new_block()
+        self.goto(head)
+        self.cur = head
+        cond = self.hoist(stmt.cond)  # its awaits re-run on every pass
+        body, exit_b = self.new_block(), self.new_block()
+        self.branch(cond, body, exit_b)
+        self.cur = body
+        self.lower_stmts(stmt.body.stmts, _Loop(head, exit_b))
+        if stmt.body.expr is not None:
+            self.lower_value(stmt.body.expr, None, _Loop(head, exit_b))
+        if self.cur is not None:
+            self.goto(head)
+        self.cur = exit_b
+
+    # -- values ------------------------------------------------------------
+
+    def lower_value(self, expr: rast.Expr, dest, loop: Optional[_Loop]):
+        """Evaluate `expr` into `dest`: None (discarded), ('return',),
+        ('field', local, span) or ('assign', stmt, target)."""
+        while isinstance(expr, rast.Grouped):
+            expr = expr.expr
+        if not self._needs_lowering(expr, loop):
+            self.deliver(self.rw.rewrite(expr), dest)
+        elif isinstance(expr, rast.If):
+            cond = self.hoist(expr.cond)
+            then_b, else_b, join = self.new_block(), self.new_block(), self.new_block()
+            self.branch(cond, then_b, else_b)
+            self.cur = then_b
+            self.lower_value(expr.then_block, dest, loop)
+            if self.cur is not None:
+                self.goto(join)
+            self.cur = else_b
+            if expr.else_block is not None:
+                self.lower_value(expr.else_block, dest, loop)
+            if self.cur is not None:
+                self.goto(join)
+            self.cur = join
+        elif isinstance(expr, rast.Block):
+            self.lower_stmts(expr.stmts, loop)
+            if expr.expr is not None:
+                self.lower_value(expr.expr, dest, loop)
+            elif dest == ('return',) and self.cur is not None:
+                self.ret(None, expr.span)
+        elif isinstance(expr, rast.Await):
+            self.lower_await(expr, dest)
+        elif not _has_await(expr):
+            # Only a jump out of the loop, from somewhere it can't be a state edge.
+            raise AsyncLoweringError(
+                "`break` / `continue` inside a `match` of an async fn's loop that awaits "
+                "is not supported yet (AGAST #4013)", _escaping_jump(expr).span)
+        else:
+            self.deliver(self.hoist(expr), dest)
+
+    def deliver(self, value: rast.Expr, dest):
+        if dest is None:
+            # A value nobody reads: keep it only for its effects.
+            if not isinstance(value, (rast.IntLit, rast.Field, rast.Ident)):
+                self.emit(rast.ExprStmt(span=value.span, expr=value))
+        elif dest[0] == 'return':
+            if self.rw.unit:
+                self.deliver(value, None)
+            self.ret(value, value.span)
+        elif dest[0] == 'field':
+            _, name, span = dest
+            self.emit(rast.AssignStmt(span=span, target=self.rw.self_field(name, span), value=value))
+        else:
+            _, stmt, target = dest
+            new = copy.copy(stmt)
+            new.target, new.value = target, value
+            self.emit(new)
+
+    def hoist(self, expr: rast.Expr) -> rast.Expr:
+        """Drive each await in `expr` in its own state, in evaluation order,
+        storing its result; then `expr` rewritten to read the results."""
+        self._hoist(expr, None)
+        return self.rw.rewrite(expr)
+
+    def _hoist(self, node, under: Optional[str]):
+        if isinstance(node, rast.Await):
+            if under is not None:
+                raise _unplaced(under, node.span)
+            # An await in the awaited expression runs first.
+            tmp = self._add_field(f"__await_result_{self.n_awaits}", self.gen._make_named_type(PollAbi.RET_TYPE))
+            self.lower_await(node, ('field', tmp, node.span))
+            self.rw.await_results[id(node)] = tmp
+            return
+        if isinstance(node, rast.If):
+            self._hoist(node.cond, under)
+            for arm in (node.then_block, node.else_block):
+                if arm is not None:
+                    self._hoist(arm, under or "an `if` inside an expression")
+            return
+        if isinstance(node, rast.Match):
+            self._hoist(node.expr, under)
+            for arm in node.arms:
+                self._hoist(arm, under or "a `match`")
+            return
+        if isinstance(node, rast.BinOp) and node.op in ('&&', '||', 'and', 'or'):
+            self._hoist(node.left, under)
+            op = {'and': '&&', 'or': '||'}.get(node.op, node.op)
+            self._hoist(node.right, under or f"the right of `{op}`")
+            return
+        if isinstance(node, rast.Block):
+            under = under or "a block inside an expression"
+        for child in _child_nodes(node):
+            self._hoist(child, under)
+
+    def lower_await(self, aw: rast.Await, dest):
+        """`await inner` into `dest`: a resume point.
+
+        An async fn's call builds its future into a field once; the resume
+        state polls it, so a Pending one is polled again on the next poll, not
+        rebuilt.  Any other awaited expression is a poll itself, and is
+        evaluated again at each poll until it is Ready."""
+        k = self.n_awaits
+        self.n_awaits += 1
+        inner = aw.expr
+        while isinstance(inner, rast.Grouped):
+            inner = inner.expr
+        answer = f"__poll_{k}"
+        if self.gen._is_async_call(inner):
+            fn_name = inner.func.name
+            fut = self._add_field(f"__future_{k}", self.gen._make_named_type(f"{fn_name}_Future"))
+            args = [self.hoist(a) for a in inner.args]
+            # The call keeps its source spans: it is the user's call of `foo`,
+            # so a private `foo` of another file is refused here, at `foo`
+            # (#3925, LARB R45a).  `foo_poll` is the compiler's own call.
+            self.emit(rast.AssignStmt(
+                span=self.span, target=self.rw.self_field(fut, self.span),
+                value=rast.Call(span=inner.span, func=rast.Ident(span=inner.func.span, name=fn_name), args=args)))
+            polled = rast.Call(span=self.span, func=rast.Ident(span=self.span, name=f"{fn_name}_poll"),
+                               args=[rast.UnaryOp(span=self.span, op='@',
+                                                  operand=self.rw.self_field(fut, self.span))])
+        else:
+            polled = self.hoist(inner)
+        resume = self.new_block()
+        self.goto(resume)
+        self.cur = resume
+        self.emit(rast.LetStmt(span=self.span, name=answer,
+                               type=self.gen._make_named_type(PollAbi.RET_TYPE), value=polled))
+        self.emit(rast.ExprStmt(span=self.span, expr=rast.If(
+            span=self.span, cond=self.abi.is_pending(rast.Ident(span=self.span, name=answer)),
+            then_block=rast.Block(span=self.span, stmts=[self.abi.pending()], expr=None), else_block=None)))
+        self.deliver(rast.Ident(span=self.span, name=answer), dest)
+
+    # -- the poll body -----------------------------------------------------
+
+    def dispatch(self) -> rast.Block:
+        """`while true` over `if (*self).__state == N` for each state."""
+        arms = []
+        for i, stmts in enumerate(self.blocks):
+            if i not in self.closed:
+                stmts = stmts + [self.abi.pending()]  # unreachable: nothing jumps here
+            arms.append(rast.ExprStmt(span=self.span, expr=rast.If(
+                span=self.span,
+                cond=rast.BinOp(span=self.span, op='==', left=self.rw.self_field('__state', self.span),
+                                right=rast.IntLit(span=self.span, value=i)),
+                then_block=rast.Block(span=self.span, stmts=stmts, expr=None), else_block=None)))
+        loop = rast.WhileStmt(span=self.span, cond=rast.BoolLit(span=self.span, value=True),
+                              body=rast.Block(span=self.span, stmts=arms, expr=None))
+        return rast.Block(span=self.span, stmts=[loop], expr=self.abi.unreachable())
+
+
 class TrueAsyncGenerator:
     """
-    Generates TRUE state machine code for an async function.
-
-    Unlike the MVP, this generates:
-    1. poll() returns i32 with -1 = Pending, value = Ready(value)
-    2. State machine with if/else chain for each state
-    3. Proper suspension on await
+    Generates the state machine for an async function: its future struct
+    (state, params, locals, inner futures), a constructor that stands for the
+    fn, and `NAME_poll`, which runs the body from its current state to the
+    next Pending await or to its end (Ready).
 
     When async_functions is provided, recognizes calls to async functions
     and generates proper foo() + foo_poll() sequences.
@@ -357,47 +851,51 @@ class TrueAsyncGenerator:
         self.dummy_span = rast.Span(0, 0, 0, 0)
         # Set of known async function names (for await transformation)
         self.async_functions = async_functions or set()
+        self.abi = PollAbi(self.dummy_span)
 
     def generate(self) -> AsyncStateMachine:
         """Generate the complete state machine."""
-        future_struct = self._generate_future_struct()
-        constructor_fn = self._generate_constructor()
-        poll_fn = self._generate_poll_fn()
+        param_names = [p.name for p in self.fn_def.params]
+        # Locals live in the future only when there is an await to live across.
+        local_fields = ({n for n in self.analysis.cross_await_locals if n not in param_names}
+                        if self.analysis.await_points else set())
+        rewriter = SimpleBodyTransformer(set(param_names) | local_fields, local_fields, self.abi,
+                                         unit=self.fn_def.ret_type is None)
+
+        extra: List[Tuple[str, rast.Type]] = []
+        if not self.analysis.await_points:
+            body = self._straight_body(rewriter)
+            num_states = 1
+        else:
+            cfg = _CfgBuilder(self, rewriter)
+            cfg.lower_body(self.fn_def.body)
+            body = cfg.dispatch()
+            extra = cfg.extra_fields
+            num_states = len(cfg.blocks)
+
+        fields_ = [('__state', self._make_named_type('i32'))]
+        fields_ += [(p.name, p.type) for p in self.fn_def.params]
+        for name in sorted(local_fields):
+            ty = self.analysis.all_locals.get(name)
+            if ty is not None:
+                fields_.append((name, ty))
+        fields_ += extra
+        future_name = f"{self.fn_def.name}_Future"
+        future_struct = rast.StructDef(span=self.dummy_span, name=future_name, fields=fields_)
 
         return AsyncStateMachine(
             original_fn=self.fn_def,
             future_struct=future_struct,
-            constructor_fn=constructor_fn,
-            poll_fn=poll_fn,
-            num_states=len(self.analysis.await_points) + 1
+            constructor_fn=self._generate_constructor(future_name),
+            poll_fn=self._generate_poll_fn(future_name, body),
+            num_states=num_states
         )
 
     def _make_named_type(self, name: str) -> rast.NamedType:
         return rast.NamedType(span=self.dummy_span, name=name)
 
-    def _make_ptr_type(self, inner: rast.Type) -> rast.PtrType:
-        return rast.PtrType(span=self.dummy_span, inner=inner, mutable=True)
-
-    def _make_int(self, value: int) -> rast.IntLit:
-        return rast.IntLit(span=self.dummy_span, value=value)
-
     def _make_ident(self, name: str) -> rast.Ident:
         return rast.Ident(span=self.dummy_span, name=name)
-
-    def _make_self_field(self, field_name: str) -> rast.Field:
-        """Generate (*self).field_name"""
-        return rast.Field(
-            span=self.dummy_span,
-            expr=rast.UnaryOp(
-                span=self.dummy_span,
-                op='*',
-                operand=self._make_ident('self')
-            ),
-            field=field_name
-        )
-
-    def _make_binop(self, op: str, left: rast.Expr, right: rast.Expr) -> rast.BinOp:
-        return rast.BinOp(span=self.dummy_span, op=op, left=left, right=right)
 
     def _is_async_call(self, expr: rast.Expr) -> bool:
         """Check if expr is a call to a known async function."""
@@ -405,60 +903,19 @@ class TrueAsyncGenerator:
             return expr.func.name in self.async_functions
         return False
 
-    def _generate_future_struct(self) -> rast.StructDef:
-        """Generate the Future struct definition."""
-        fields = []
+    def _generate_constructor(self, future_name: str) -> rast.FnDef:
+        """The fn itself: its future, in state 0 with its params.  The other
+        fields (locals, inner futures) are written before they are read."""
+        span = self.dummy_span
+        fut = '__fut'
 
-        # State field (use __state to avoid collision with user params named 'state')
-        fields.append(('__state', self._make_named_type('i32')))
+        def fut_field(name):
+            return rast.Field(span=span, expr=self._make_ident(fut), field=name)
 
-        # Parameter fields
+        stmts: List[rast.Stmt] = [rast.VarStmt(span=span, name=fut, type=self._make_named_type(future_name), value=None)]
+        stmts.append(rast.AssignStmt(span=span, target=fut_field('__state'), value=rast.IntLit(span=span, value=0)))
         for param in self.fn_def.params:
-            fields.append((param.name, param.type))
-
-        # Cross-await locals (results of awaits)
-        param_names = {p.name for p in self.fn_def.params}
-        for var_name in sorted(self.analysis.cross_await_locals):
-            if var_name not in param_names:
-                var_type = self.analysis.all_locals.get(var_name)
-                if var_type:
-                    fields.append((var_name, var_type))
-
-        struct_name = f"{self.fn_def.name}_Future"
-        return rast.StructDef(
-            span=self.dummy_span,
-            name=struct_name,
-            fields=fields
-        )
-
-    def _generate_constructor(self) -> rast.FnDef:
-        """Generate constructor function that returns the Future struct."""
-        future_name = f"{self.fn_def.name}_Future"
-
-        # Build struct literal fields
-        struct_fields = []
-        struct_fields.append(('__state', self._make_int(0)))
-
-        for param in self.fn_def.params:
-            struct_fields.append((param.name, self._make_ident(param.name)))
-
-        # Initialize cross-await locals with 0
-        param_names = {p.name for p in self.fn_def.params}
-        for var_name in sorted(self.analysis.cross_await_locals):
-            if var_name not in param_names:
-                struct_fields.append((var_name, self._make_int(0)))
-
-        struct_lit = rast.StructLit(
-            span=self.dummy_span,
-            name=future_name,
-            fields=struct_fields
-        )
-
-        body = rast.Block(
-            span=self.dummy_span,
-            stmts=[],
-            expr=struct_lit
-        )
+            stmts.append(rast.AssignStmt(span=span, target=fut_field(param.name), value=self._make_ident(param.name)))
 
         # The constructor stands for the async fn itself, so it carries its
         # declaration span: a privacy refusal's note points there (#3925).
@@ -467,383 +924,38 @@ class TrueAsyncGenerator:
             name=self.fn_def.name,
             params=self.fn_def.params,
             ret_type=self._make_named_type(future_name),
-            body=body,
+            body=rast.Block(span=span, stmts=stmts, expr=self._make_ident(fut)),
             is_async=False
         )
 
-    def _generate_poll_fn(self) -> rast.FnDef:
-        """Generate poll function with proper state machine.
-
-        Returns i32: -1 = Pending, value >= 0 = Ready(value)
-
-        Structure:
-            if (*self).state == 0
-                # Initial state - execute up to first await
-                ...
-            if (*self).state == 1
-                # After first await - execute to second await
-                ...
-            # Final state - return result
-            return final_value
-        """
-        future_name = f"{self.fn_def.name}_Future"
-        poll_fn_name = f"{self.fn_def.name}_poll"
-
+    def _generate_poll_fn(self, future_name: str, body: rast.Block) -> rast.FnDef:
+        """`NAME_poll(self: *NAME_Future)`, answering as PollAbi says."""
         self_param = rast.Param(
             span=self.dummy_span,
             name='self',
-            type=self._make_ptr_type(self._make_named_type(future_name))
+            type=rast.PtrType(span=self.dummy_span, inner=self._make_named_type(future_name), mutable=True)
         )
-
-        # Return type is i32 (Poll encoding)
-        ret_type = self._make_named_type('i32')
-
-        # Generate the state machine body
-        body = self._generate_state_machine_body()
-
         return rast.FnDef(
             span=self.dummy_span,
-            name=poll_fn_name,
+            name=f"{self.fn_def.name}_poll",
             params=[self_param],
-            ret_type=ret_type,
+            ret_type=self._make_named_type(PollAbi.RET_TYPE),
             body=body,
             is_async=False
         )
 
-    def _generate_state_machine_body(self) -> rast.Block:
-        """Generate the state machine body with if/else for each state."""
-        stmts = []
-
-        # If no await points, just execute and return the result
-        if not self.analysis.await_points:
-            # Transform body to access params through self
-            transformer = SimpleBodyTransformer(self.analysis, self.fn_def)
-            transformed = transformer.transform(self.fn_def.body)
-            # AGAST #1395: a unit `async fn` (`async fn f()`, even an empty
-            # body) still has an i32 poll; Ready is 0.  Without a tail the poll
-            # could reach its end with no value, and ritz0 refused `f` outright
-            # -- awaited or not.  A unit fn's tail (`pass` parses as one) is a
-            # statement, so it is demoted ahead of the 0.
-            if self.fn_def.ret_type is None:
-                tail = transformed.expr
-                if tail is not None and not (isinstance(tail, rast.Ident) and tail.name == 'pass'):
-                    transformed.stmts.append(rast.ExprStmt(span=tail.span, expr=tail))
-                transformed.expr = self._make_int(0)
-            return transformed
-
-        # Generate state checks for each await point
-        for i, await_point in enumerate(self.analysis.await_points):
-            state_check = self._generate_state_handler(i, await_point)
-            stmts.append(state_check)
-
-        # Final state: compute and return the result
-        final_expr = self._generate_final_return()
-        # AGAST #1395: a unit fn's tail is a statement; its poll is Ready(0).
+    def _straight_body(self, rewriter: SimpleBodyTransformer) -> rast.Block:
+        """A body with no await runs whole on the first poll: Ready at once."""
+        transformed = rewriter.rewrite(self.fn_def.body)
+        # AGAST #1395: a unit `async fn` (`async fn f()`, even an empty
+        # body) still has an i32 poll; Ready is 0.  A unit fn's tail (`pass`
+        # parses as one) is a statement, so it is demoted ahead of the 0.
         if self.fn_def.ret_type is None:
-            if not (isinstance(final_expr, rast.IntLit)
-                    or (isinstance(final_expr, rast.Ident) and final_expr.name == 'pass')):
-                stmts.append(rast.ExprStmt(span=self.dummy_span, expr=final_expr))
-            final_expr = self._make_int(0)
-
-        return rast.Block(
-            span=self.dummy_span,
-            stmts=stmts,
-            expr=final_expr
-        )
-
-    def _generate_state_handler(self, state_index: int, await_point: AwaitPoint) -> rast.ExprStmt:
-        """Generate handler for a specific state.
-
-        if (*self).state == N
-            # For async function calls: foo(x) + foo_poll(&future)
-            # For other expressions: call directly
-
-            # Check for Pending:
-            # if __inner_result == -1
-            #     return -1
-
-            # Store result
-            (*self).result_var = __inner_result
-
-            # Advance state
-            (*self).state = N + 1
-
-        Note: Ritz uses `If` as expression, wrapped in `ExprStmt` for use as statement.
-        """
-        then_stmts = []
-
-        # Get the inner expression (what's being awaited)
-        inner_expr = await_point.expr.expr
-
-        # Transform inner_expr to access parameters through self
-        # e.g., `x` becomes `(*self).x`
-        transformer = SimpleBodyTransformer(self.analysis, self.fn_def)
-
-        inner_result_var = f"__inner_result_{state_index}"
-
-        # Check if this is a call to an async function
-        if self._is_async_call(inner_expr):
-            # Async function call: need to call foo(args) then foo_poll(&future)
-            fn_name = inner_expr.func.name
-            future_var = f"__future_{state_index}"
-            future_type_name = f"{fn_name}_Future"
-
-            # Transform arguments to access through self
-            transformed_args = [transformer._transform_expr(arg) for arg in inner_expr.args]
-
-            # var __future_N: foo_Future = foo(args)
-            # The call keeps its source spans: it is the user's call of
-            # `foo`, so a private `foo` of another file is refused here,
-            # at `foo` (#3925, LARB R45a).  `foo_poll` below is the
-            # compiler's own call and stays unchecked.
-            create_future = rast.VarStmt(
-                span=self.dummy_span,
-                name=future_var,
-                type=self._make_named_type(future_type_name),
-                value=rast.Call(
-                    span=inner_expr.span,
-                    func=rast.Ident(span=inner_expr.func.span, name=fn_name),
-                    args=transformed_args
-                )
-            )
-            then_stmts.append(create_future)
-
-            # let __inner_result: i32 = foo_poll(&__future_N)
-            poll_call = rast.LetStmt(
-                span=self.dummy_span,
-                name=inner_result_var,
-                type=self._make_named_type('i32'),
-                value=rast.Call(
-                    span=self.dummy_span,
-                    func=self._make_ident(f"{fn_name}_poll"),
-                    args=[rast.UnaryOp(
-                        span=self.dummy_span,
-                        op='&',
-                        operand=self._make_ident(future_var)
-                    )]
-                )
-            )
-            then_stmts.append(poll_call)
-        else:
-            # Not an async function - call directly (existing behavior)
-            transformed_inner_expr = transformer._transform_expr(inner_expr)
-
-            # let __inner_result: i32 = inner_expr (transformed)
-            inner_call = rast.LetStmt(
-                span=self.dummy_span,
-                name=inner_result_var,
-                type=self._make_named_type('i32'),
-                value=transformed_inner_expr
-            )
-            then_stmts.append(inner_call)
-
-        # Check for Pending and propagate
-        # if __inner_result == -1
-        #     return -1
-        # Using rast.If (expression) wrapped in ExprStmt
-        pending_check_if = rast.If(
-            span=self.dummy_span,
-            cond=self._make_binop(
-                '==',
-                self._make_ident(inner_result_var),
-                # -1 for Pending
-                rast.BinOp(
-                    span=self.dummy_span,
-                    op='-',
-                    left=self._make_int(0),
-                    right=self._make_int(1)
-                )
-            ),
-            then_block=rast.Block(
-                span=self.dummy_span,
-                stmts=[rast.ReturnStmt(
-                    span=self.dummy_span,
-                    value=rast.BinOp(
-                        span=self.dummy_span,
-                        op='-',
-                        left=self._make_int(0),
-                        right=self._make_int(1)
-                    )
-                )],
-                expr=None
-            ),
-            else_block=None
-        )
-        then_stmts.append(rast.ExprStmt(span=self.dummy_span, expr=pending_check_if))
-
-        # Store result: (*self).result_var = __inner_result
-        store_result = rast.AssignStmt(
-            span=self.dummy_span,
-            target=self._make_self_field(await_point.result_var),
-            value=self._make_ident(inner_result_var)
-        )
-        then_stmts.append(store_result)
-
-        # A let this await completes: `(*self).v = <value>`, its awaits read
-        # from their stored results (AGAST #3821).
-        for let in await_point.then_lets:
-            then_stmts.append(transformer._transform_stmt(let))
-
-        # Advance state: (*self).__state = N + 1
-        advance_state = rast.AssignStmt(
-            span=self.dummy_span,
-            target=self._make_self_field('__state'),
-            value=self._make_int(state_index + 1)
-        )
-        then_stmts.append(advance_state)
-
-        # Build the if expression (not statement) and wrap in ExprStmt
-        state_cond = self._make_binop(
-            '==',
-            self._make_self_field('__state'),
-            self._make_int(state_index)
-        )
-
-        state_if = rast.If(
-            span=self.dummy_span,
-            cond=state_cond,
-            then_block=rast.Block(
-                span=self.dummy_span,
-                stmts=then_stmts,
-                expr=None
-            ),
-            else_block=None
-        )
-
-        return rast.ExprStmt(span=self.dummy_span, expr=state_if)
-
-    def _generate_final_return(self) -> rast.Expr:
-        """Generate the final return expression.
-
-        Transform the original body's return expression to use self.field
-        for any variables that were stored across awaits.
-        """
-        # Each await in it reads its stored result (AGAST #3011): a tail
-        # `await f(x)` lowered to `f(x)`, the future, before.
-        transformer = SimpleBodyTransformer(self.analysis, self.fn_def)
-        body = self.fn_def.body
-        if body.expr:
-            return transformer._transform_expr(body.expr)
-        # `return await f(x)` as the last statement: its value, not 0.
-        if body.stmts and isinstance(body.stmts[-1], rast.ReturnStmt) and body.stmts[-1].value:
-            return transformer._transform_expr(body.stmts[-1].value)
-
-        # Default: return 0
-        return self._make_int(0)
-
-
-class SimpleBodyTransformer:
-    """Simple transformer that replaces cross-await vars with self.field."""
-
-    def __init__(self, analysis: AsyncFnAnalysis, fn_def: rast.FnDef):
-        self.analysis = analysis
-        self.fn_def = fn_def
-        self.dummy_span = rast.Span(0, 0, 0, 0)
-        self.cross_await_vars = analysis.cross_await_locals
-        self.param_names = {p.name for p in fn_def.params}
-        # An await already driven by an earlier state -> its result field.
-        self.await_results = {id(ap.expr): ap.result_var for ap in analysis.await_points}
-
-    def transform(self, block: rast.Block) -> rast.Block:
-        new_stmts = [self._transform_stmt(s) for s in block.stmts]
-        new_expr = self._transform_expr(block.expr) if block.expr else None
-        return rast.Block(span=block.span, stmts=new_stmts, expr=new_expr)
-
-    def _self_field(self, name: str, span) -> rast.Field:
-        """(*self).name"""
-        return rast.Field(
-            span=span,
-            expr=rast.UnaryOp(span=span, op='*', operand=rast.Ident(span=span, name='self')),
-            field=name
-        )
-
-    def _transform_stmt(self, stmt: rast.Stmt) -> rast.Stmt:
-        if isinstance(stmt, (rast.LetStmt, rast.VarStmt)) and stmt.name in self.cross_await_vars:
-            # The local lives in the future struct, where its uses read it.
-            value = self._transform_expr(stmt.value) if stmt.value else rast.IntLit(span=stmt.span, value=0)
-            return rast.AssignStmt(span=stmt.span, target=self._self_field(stmt.name, stmt.span), value=value)
-        if isinstance(stmt, rast.LetStmt):
-            new_value = self._transform_expr(stmt.value) if stmt.value else None
-            return rast.LetStmt(
-                span=stmt.span,
-                name=stmt.name,
-                type=stmt.type,
-                value=new_value
-            )
-        elif isinstance(stmt, rast.ReturnStmt):
-            new_value = self._transform_expr(stmt.value) if stmt.value else None
-            return rast.ReturnStmt(span=stmt.span, value=new_value)
-        elif isinstance(stmt, rast.ExprStmt):
-            return rast.ExprStmt(span=stmt.span, expr=self._transform_expr(stmt.expr))
-        return stmt
-
-    def _transform_expr(self, expr: rast.Expr) -> rast.Expr:
-        if expr is None:
-            return None
-
-        if isinstance(expr, rast.Await):
-            # A state already drove it: its result is stored (AGAST #3011).
-            if id(expr) in self.await_results:
-                return self._self_field(self.await_results[id(expr)], expr.span)
-            return self._transform_expr(expr.expr)
-
-        elif isinstance(expr, rast.If):
-            return rast.If(
-                span=expr.span,
-                cond=self._transform_expr(expr.cond),
-                then_block=self.transform(expr.then_block),
-                # an `else if` may be an If, not a Block
-                else_block=self._transform_expr(expr.else_block) if expr.else_block else None
-            )
-
-        elif isinstance(expr, rast.Block):
-            return self.transform(expr)
-
-        elif isinstance(expr, rast.Ident):
-            # If this is a cross-await variable or parameter, access through self
-            if expr.name in self.cross_await_vars or expr.name in self.param_names:
-                return rast.Field(
-                    span=expr.span,
-                    expr=rast.UnaryOp(
-                        span=expr.span,
-                        op='*',
-                        operand=rast.Ident(span=expr.span, name='self')
-                    ),
-                    field=expr.name
-                )
-            return expr
-
-        elif isinstance(expr, rast.BinOp):
-            return rast.BinOp(
-                span=expr.span,
-                op=expr.op,
-                left=self._transform_expr(expr.left),
-                right=self._transform_expr(expr.right)
-            )
-
-        elif isinstance(expr, rast.UnaryOp):
-            return rast.UnaryOp(
-                span=expr.span,
-                op=expr.op,
-                operand=self._transform_expr(expr.operand)
-            )
-
-        elif isinstance(expr, rast.Call):
-            new_args = [self._transform_expr(a) for a in expr.args]
-            new_func = expr.func
-            if not isinstance(expr.func, rast.Ident):
-                new_func = self._transform_expr(expr.func)
-            return rast.Call(span=expr.span, func=new_func, args=new_args)
-
-        elif isinstance(expr, rast.Cast):
-            return rast.Cast(
-                span=expr.span,
-                expr=self._transform_expr(expr.expr),
-                target=expr.target,
-                as_span=expr.as_span
-            )
-
-        return expr
+            tail = transformed.expr
+            if tail is not None and not (isinstance(tail, rast.Ident) and tail.name == 'pass'):
+                transformed.stmts.append(rast.ExprStmt(span=tail.span, expr=tail))
+            transformed.expr = rast.IntLit(span=self.dummy_span, value=0)
+        return transformed
 
 
 def analyze_async_function(fn_def: rast.FnDef,
@@ -906,10 +1018,9 @@ async fn fetch(x: i32) -> i32
 
     analysis = analyze_async_function(fn)
     assert len(analysis.await_points) == 1
-    assert analysis.await_points[0].result_var == 'a'
 
     sm = generate_state_machine(fn)
-    assert sm.num_states == 2  # state 0 + 1 await
+    assert sm.num_states == 2  # entry, and the await's resume point
     print("✓ Await test passed")
 
 

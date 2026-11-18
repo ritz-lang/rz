@@ -31,7 +31,7 @@ import binder_names
 import type_order
 import match_coverage
 from metadata import type_to_string
-from async_transform_v2 import generate_state_machine, AsyncStateMachine, UntypedAsyncLocal
+from async_transform_v2 import generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
@@ -3316,8 +3316,9 @@ class LLVMEmitter:
                         new_items.append(sm.constructor_fn)
                         new_items.append(sm.poll_fn)
 
-                except UntypedAsyncLocal as e:
-                    # A source error, located at the `let` (AGAST #3762).
+                except (UntypedAsyncLocal, AsyncLoweringError) as e:
+                    # A source error, located at the `let` (AGAST #3762) or
+                    # the await it can't place (#3727).
                     raise EmitError(str(e), e.span) from None
                 except Exception as e:
                     # Fall back to keeping original function if transformation fails

@@ -193,14 +193,15 @@ def test_bare_async_call_refused_as_ritz0(ritz1_bin, tmp_path, name):
 def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path):
     """#3726: an imported async fn is declared in its importer, defined in its
     file.  The importer allocates its future, so it lays it out from the fn's
-    body as the defining file does: `go_Future` holds __state, x, a and b (16
-    bytes), which an import stripped to its interface would not know."""
+    body as the defining file does: `go_Future` holds __state, x, a and b, and
+    the two `fetch_Future`s it awaits (#3727; 32 bytes), which an import
+    stripped to its interface would not know."""
     extra = {"a.ritz": "pub async fn fetch(x: i32) -> i32\n    x + 1\n\n"
                        "pub async fn go(x: i32) -> i32\n    let a: i32 = await fetch(x)\n"
                        "    let b: i32 = await fetch(a)\n    b\n"}
     program = "import a\n\nasync fn main() -> i32\n    let r: i32 = await go(40)\n    r + sizeof(go_Future) as i32\n"
-    assert _run_pkg("ritz0", tmp_path, "imp_async", program, extra) == 58
-    assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 58
+    assert _run_pkg("ritz0", tmp_path, "imp_async", program, extra) == 74
+    assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 74
 
 
 PRIVATE_ASYNC_CALLERS = {

@@ -23,15 +23,14 @@
 #                                                   self.__state = 1
 #                                               self.a + 1
 #
-#   * Each `await` is a state, in evaluation order (an await nested in the
-#     awaited call first).  An await of an async fn builds its future and
-#     polls it; of anything else, evaluates it.  Its result goes to the let
-#     it initialises, else to a field `__await_result_N`.  A top-level let
-#     whose value merely contains awaits is computed in its last await's
-#     state (#3821).  The final state is the body's tail (or last `return`
-#     value).  As in ritz0, with an await in the body every local lives in
-#     the future and no other statement runs; without one the whole body is
-#     the poll, its params read through `self`.
+#   * With no await the whole body is the poll, its params read through
+#     `self`: Ready at once.  With one, every local lives in the future and
+#     the body is a graph of states (AGAST #3727): the poll is a dispatch loop
+#     over them, each await a resume point that returns Pending and is
+#     resumed there by the next poll, wherever it is (a loop, an arm).  The
+#     awaited future lives in the future, so it is polled again, not rebuilt.
+#     ritz0's _CfgBuilder step for step, so the fields come in its order:
+#     __state, params, locals by name, then each await's result / future.
 #   * The poll answers i32 (a `-> i64` fn's value narrows, as a return
 #     does anywhere); a unit fn is Ready(0).
 #   * `async fn main` is `__main_future` + `main_poll`, and a sync `main`
@@ -324,27 +323,68 @@ struct AlLocal
     span: SrcSpan
     next: *AlLocal
 
-struct AlLet
-    stmt: *Stmt
-    next: *AlLet
-
+# An await a state drove, and the field its result is stored in.
 struct AlPoint
     await_expr: *Expr
-    result: *u8         # the field its result is stored in
+    result: *u8
     result_len: i32
-    then_lets: *AlLet   # top-level lets whose value it completes (#3821)
     next: *AlPoint
+
+struct AlBlock
+    idx: i32
+    head: *Stmt
+    closed: i32         # 1: ends in a jump or a return
+    next: *AlBlock
+
+struct AlLoop
+    head: *AlBlock      # tests the condition: `continue` goes here
+    exit: *AlBlock      # after the loop: `break` goes here
+
+# Where a value goes.
+const AL_TO_NONE: i32 = 0      # discarded
+const AL_TO_RETURN: i32 = 1    # the poll's Ready
+const AL_TO_FIELD: i32 = 2     # self.<name>
+const AL_TO_ASSIGN: i32 = 3    # the assignment `stmt`, with this value
+
+struct AlDest
+    kind: i32
+    name: *u8
+    len: i32
+    stmt: *Stmt
+    span: SrcSpan
 
 struct AlFn
     f: *FnDef
     file: *u8
     locals: *AlLocal
     points: *AlPoint
-    npoints: i32
-    let_target: *Stmt   # the let whose value IS the await being walked
-    top: *Stmt          # the body's statement being walked, if top-level
+    npoints: i32        # the awaits in the body
     untyped: *Stmt      # the first local whose type can't be inferred
     sync: i32           # 1: lowering awaits of a sync fn, not an async body
+    # The state machine (#3727)
+    blocks: *AlBlock
+    last_block: *AlBlock
+    nblocks: i32
+    cur: *AlBlock       # the open state; null after a jump
+    nawaits: i32        # awaits lowered so far
+    extra: *AlLocal     # the fields it adds, in order
+    errs: i32
+
+fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
+    a.f = f
+    a.file = al_file(f)
+    a.locals = null
+    a.points = null
+    a.npoints = 0
+    a.untyped = null
+    a.sync = sync
+    a.blocks = null
+    a.last_block = null
+    a.nblocks = 0
+    a.cur = null
+    a.nawaits = 0
+    a.extra = null
+    a.errs = 0
 
 fn al_local_find(a: *AlFn, name: *u8, len: i32) -> *AlLocal
     var l: *AlLocal = a.locals
@@ -514,26 +554,7 @@ fn al_an_decl(a: *AlFn, s: *Stmt, top: i32)
         typed = 1
     else if a.untyped == null
         a.untyped = s
-    let direct: i32 = (s.var_init != null and s.var_init.kind == EXPR_AWAIT) as i32
-    if direct == 1
-        a.let_target = s
-    let first: i32 = a.npoints
     al_an_expr(a, s.var_init)
-    a.let_target = null
-    if direct == 0 and a.npoints > first and top == 1
-        # Its last await's state computes it (#3821).
-        var p: *AlPoint = a.points
-        while p.next != null
-            p = p.next
-        let entry: *AlLet = al_zalloc(sizeof(AlLet)) as *AlLet
-        entry.stmt = s
-        if p.then_lets == null
-            p.then_lets = entry
-        else
-            var q: *AlLet = p.then_lets
-            while q.next != null
-                q = q.next
-            q.next = entry
     let l: *AlLocal = al_local(a, s.var_name, s.var_name_len, s.span)
     if typed == 1
         l.ty = t.ty
@@ -582,28 +603,7 @@ fn al_an_expr(a: *AlFn, e: *Expr)
         return
     let k: i32 = e.kind
     if k == EXPR_AWAIT
-        # An await nested in the awaited expression runs first: recorded
-        # first, so each state reads the ones before it.
-        let target: *Stmt = a.let_target
-        a.let_target = null
         al_an_expr(a, e.operand)
-        let p: *AlPoint = al_zalloc(sizeof(AlPoint)) as *AlPoint
-        p.await_expr = e
-        if target != null
-            p.result = target.var_name
-            p.result_len = target.var_name_len
-        else
-            var n: i32 = 0
-            p.result = al_numbered(c"__await_result_", a.npoints, @n)
-            p.result_len = n
-            al_set_scalar(al_local(a, p.result, n, e.span), TYPE_I32)
-        if a.points == null
-            a.points = p
-        else
-            var q: *AlPoint = a.points
-            while q.next != null
-                q = q.next
-            q.next = p
         a.npoints += 1
     else if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
         al_an_expr(a, e.left)
@@ -803,6 +803,55 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
         e.args = al_rw_list(a, e.args)
     e
 
+# A scalar local's zero (0, false, null); null for an array or struct.
+fn al_zero_of(a: *AlFn, s: *Stmt) -> *Expr
+    let l: *AlLocal = al_local_find(a, s.var_name, s.var_name_len)
+    if l == null or l.ty == TYPE_STRUCT or l.ty == TYPE_ARRAY
+        return null
+    if l.ty == TYPE_PTR or l.ty == TYPE_PTR_PTR
+        return al_expr(EXPR_NIL_LIT, s.span)
+    let z: *Expr = al_int(0, s.span)
+    if l.ty == TYPE_BOOL
+        z.lit_kind = LIT_FALSE
+    z
+
+fn al_rw_part(a: *AlFn, e: *Expr, hoist: i32) -> *Expr
+    if hoist == 1
+        return al_hoist(a, e)
+    al_rw_expr(a, e)
+
+# An assignment's target, rewritten (and with `hoist`, its awaits driven
+# first): a name held in the future is written through `self`, whatever the
+# assignment's form (#3727: `n[i] = v`, `p.f = v`).
+fn al_rw_target(a: *AlFn, s: *Stmt, hoist: i32)
+    let k: i32 = s.kind
+    if k == STMT_ASSIGN
+        if s.assign_target == null
+            s.if_cond = al_rw_part(a, s.if_cond, hoist)
+        else if al_is_field(a, s.assign_target, s.assign_target_len) == 1
+            s.kind = STMT_MEMBER_ASSIGN
+            s.if_cond = al_ident(c"self", 4, s.span)
+            s.bracket = s.span
+    else if k == STMT_MEMBER_ASSIGN
+        s.if_cond = al_rw_part(a, s.if_cond, hoist)
+    else if k == STMT_MEMBER_INDEX_ASSIGN
+        s.if_cond = al_rw_part(a, s.if_cond, hoist)
+        s.while_cond = al_rw_part(a, s.while_cond, hoist)
+    else if k == STMT_INDEX_ASSIGN
+        s.while_cond = al_rw_part(a, s.while_cond, hoist)
+        if al_is_field(a, s.assign_target, s.assign_target_len) == 1
+            s.kind = STMT_MEMBER_INDEX_ASSIGN
+            s.if_cond = al_ident(c"self", 4, s.span)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        if k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+            s.while_cond = al_rw_part(a, s.while_cond, hoist)
+        if al_is_field(a, s.var_name, s.var_name_len) == 1
+            s.if_cond = al_self_field(s.var_name, s.var_name_len, s.span)
+            if k == STMT_LOCAL_FIELD_ASSIGN
+                s.kind = STMT_MEMBER_ASSIGN
+            else
+                s.kind = STMT_MEMBER_INDEX_ASSIGN
+
 fn al_rw_stmts(a: *AlFn, s: *Stmt) -> *Stmt
     var head: *Stmt = null
     var prev: *Stmt = null
@@ -824,17 +873,19 @@ fn al_rw_stmt(a: *AlFn, s: *Stmt) -> *Stmt
     if k == STMT_VAR_DECL
         s.var_init = al_rw_expr(a, s.var_init)
         if al_is_field(a, s.var_name, s.var_name_len) == 1
-            # The local lives in the future, where its uses read it.
+            # The local lives in the future, where its uses read it.  One with
+            # no value is zeroed if a scalar; an array or struct is only its
+            # field (ritz0 alike).
             var v: *Expr = s.var_init
             if v == null
-                v = al_int(0, s.span)
+                v = al_zero_of(a, s)
+                if v == null
+                    s.kind = STMT_STRIPPED
+                    return s
             return al_assign_self(s.var_name, s.var_name_len, v, s.span)
-    else if k == STMT_ASSIGN
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        al_rw_target(a, s, 0)
         s.assign_value = al_rw_expr(a, s.assign_value)
-        if s.assign_target == null
-            s.if_cond = al_rw_expr(a, s.if_cond)
-        else if al_is_field(a, s.assign_target, s.assign_target_len) == 1
-            return al_assign_self(s.assign_target, s.assign_target_len, s.assign_value, s.span)
     else if k == STMT_RETURN
         s.return_value = al_rw_expr(a, s.return_value)
         if a.sync == 0
@@ -858,22 +909,694 @@ fn al_rw_stmt(a: *AlFn, s: *Stmt) -> *Stmt
     else if k == STMT_MATCH
         s.if_cond = al_rw_expr(a, s.if_cond)
         al_rw_arms(a, s.if_then as *MatchArm)
-    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
-        s.if_cond = al_rw_expr(a, s.if_cond)
-        if k == STMT_MEMBER_INDEX_ASSIGN
-            s.while_cond = al_rw_expr(a, s.while_cond)
-        s.assign_value = al_rw_expr(a, s.assign_value)
-    else if k == STMT_INDEX_ASSIGN
-        s.while_cond = al_rw_expr(a, s.while_cond)
-        s.assign_value = al_rw_expr(a, s.assign_value)
-    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
-        s.assign_value = al_rw_expr(a, s.assign_value)
     else if k == STMT_ASSERT
         s.if_cond = al_rw_expr(a, s.if_cond)
     s
 
 # ---------------------------------------------------------------------------
-# The state machine
+# How a poll answers: Pending, or Ready with a value
+# ---------------------------------------------------------------------------
+#
+# The state machine asks only these, so the poll-return encoding can change
+# without touching it (LARB R78/R79: #3728 moves Ready/Pending to a bool
+# header field).  Today a poll returns an i32: -1 is Pending, anything else is
+# Ready with that value.  ritz0's PollAbi.
+
+# Whether an inner poll's `answer` is Pending.
+fn al_poll_is_pending(answer: *Expr) -> *Expr
+    al_binary(OP_EQ, answer, al_pending(answer.span))
+
+# Return Pending from this poll.
+fn al_poll_pending_stmt(span: SrcSpan) -> *Stmt
+    al_return(al_pending(span), span)
+
+# Return Ready(v) from this poll.
+fn al_poll_ready(v: *Expr, span: SrcSpan) -> *Stmt
+    al_return(v, span)
+
+# ---------------------------------------------------------------------------
+# The state machine (AGAST #3727): the body as a graph of states
+# ---------------------------------------------------------------------------
+#
+# Each state is a straight run of statements that ends by jumping to another
+# state (`self.__state = N` + `continue` in the poll's dispatch loop),
+# returning Ready, or returning Pending at a resume point.  An await is its
+# own state: it polls the awaited future, kept in the future struct, and
+# returns Pending until it is Ready, so the next poll resumes there.  Loops and
+# branches are edges between states, so an await in a `while` runs on every
+# pass and only the taken arm's do.  A statement with no await (and no
+# `break` / `continue` out of a loop that has one) is kept whole, rewritten in
+# place.  ritz0's _CfgBuilder, step for step: the fields it adds (await results,
+# awaited futures) come in the same order, so the futures' layouts agree.
+
+fn al_dest(kind: i32, span: SrcSpan) -> AlDest
+    var d: AlDest
+    d.kind = kind
+    d.name = null
+    d.len = 0
+    d.stmt = null
+    d.span = span
+    d
+
+fn al_true(span: SrcSpan) -> *Expr
+    let e: *Expr = al_int(1, span)
+    e.lit_kind = LIT_TRUE
+    e
+
+fn al_copy_stmt(s: *Stmt) -> *Stmt
+    let c: *Stmt = al_zalloc(sizeof(Stmt)) as *Stmt
+    let src: *u8 = s as *u8
+    let dst: *u8 = c as *u8
+    var i: i64 = 0
+    while i < sizeof(Stmt)
+        *(dst + i) = *(src + i)
+        i += 1
+    c.next = null
+    c
+
+# A field the lowering adds, after the locals: an await result or a future.
+fn al_extra(a: *AlFn, name: *u8, len: i32) -> *AlLocal
+    let l: *AlLocal = al_zalloc(sizeof(AlLocal)) as *AlLocal
+    l.name = name
+    l.len = len
+    if a.extra == null
+        a.extra = l
+    else
+        var cur: *AlLocal = a.extra
+        while cur.next != null
+            cur = cur.next
+        cur.next = l
+    l
+
+# The await `e`'s result is stored in self.<name>.
+fn al_add_point(a: *AlFn, e: *Expr, name: *u8, len: i32)
+    let p: *AlPoint = al_zalloc(sizeof(AlPoint)) as *AlPoint
+    p.await_expr = e
+    p.result = name
+    p.result_len = len
+    p.next = a.points
+    a.points = p
+
+# -- what a statement holds -------------------------------------------------
+
+fn al_await_in_list(e: *Expr) -> *Expr
+    var cur: *Expr = e
+    while cur != null
+        let r: *Expr = al_await_in(cur)
+        if r != null
+            return r
+        cur = cur.next
+    null
+
+fn al_await_in_arms(arm: *MatchArm) -> *Expr
+    var cur: *MatchArm = arm
+    while cur != null
+        var r: *Expr = al_await_in_stmts(cur.body_stmts)
+        if r == null
+            r = al_await_in(cur.body)
+        if r != null
+            return r
+        cur = cur.next
+    null
+
+# The first await in `e`, in evaluation order.
+fn al_await_in(e: *Expr) -> *Expr
+    if e == null
+        return null
+    let k: i32 = e.kind
+    if k == EXPR_AWAIT
+        return e
+    var r: *Expr = null
+    if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
+        r = al_await_in(e.left)
+        if r == null
+            r = al_await_in(e.right)
+    else if k == EXPR_UNARY
+        r = al_await_in(e.operand)
+    else if k == EXPR_CALL
+        if e.func_name == null
+            r = al_await_in(e.left)
+        if r == null
+            r = al_await_in_list(e.args)
+    else if k == EXPR_METHOD
+        r = al_await_in(e.left)
+        if r == null
+            r = al_await_in_list(e.args)
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        r = al_await_in(e.left)
+    else if k == EXPR_IF or k == EXPR_MATCH
+        r = al_await_in(e.left)
+        if r == null
+            r = al_await_in_arms(e.args as *MatchArm)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null and r == null
+            r = al_await_in(fi.value)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        r = al_await_in_list(e.args)
+    r
+
+fn al_await_in_stmts(s: *Stmt) -> *Expr
+    var cur: *Stmt = s
+    while cur != null
+        let r: *Expr = al_await_in_stmt(cur)
+        if r != null
+            return r
+        cur = cur.next
+    null
+
+fn al_await_in_stmt(s: *Stmt) -> *Expr
+    let k: i32 = s.kind
+    var r: *Expr = null
+    if k == STMT_VAR_DECL
+        r = al_await_in(s.var_init)
+    else if k == STMT_EXPR
+        r = al_await_in(s.expr)
+    else if k == STMT_RETURN
+        r = al_await_in(s.return_value)
+    else if k == STMT_IF
+        r = al_await_in(s.if_cond)
+        if r == null
+            r = al_await_in_stmts(s.if_then)
+        if r == null
+            r = al_await_in_stmts(s.if_else)
+    else if k == STMT_WHILE
+        r = al_await_in(s.while_cond)
+        if r == null
+            r = al_await_in_stmts(s.while_body)
+    else if k == STMT_FOR
+        r = al_await_in(s.for_start)
+        if r == null
+            r = al_await_in(s.for_end)
+        if r == null
+            r = al_await_in_stmts(s.for_body)
+    else if k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
+        r = al_await_in_stmts(s.while_body)
+    else if k == STMT_MATCH
+        r = al_await_in(s.if_cond)
+        if r == null
+            r = al_await_in_arms(s.if_then as *MatchArm)
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        if k != STMT_INDEX_ASSIGN and k != STMT_LOCAL_FIELD_ASSIGN and k != STMT_LOCAL_FIELD_INDEX_ASSIGN
+            r = al_await_in(s.if_cond)
+        if r == null and k != STMT_ASSIGN and k != STMT_MEMBER_ASSIGN and k != STMT_LOCAL_FIELD_ASSIGN
+            r = al_await_in(s.while_cond)
+        if r == null
+            r = al_await_in(s.assign_value)
+    else if k == STMT_ASSERT
+        r = al_await_in(s.if_cond)
+    r
+
+# A `break` / `continue` in `s` that leaves it for an enclosing loop.
+fn al_jump_in_arms(arm: *MatchArm) -> *Stmt
+    var cur: *MatchArm = arm
+    while cur != null
+        let r: *Stmt = al_jump_in_stmts(cur.body_stmts)
+        if r != null
+            return r
+        cur = cur.next
+    null
+
+fn al_jump_in_expr(e: *Expr) -> *Stmt
+    if e != null and (e.kind == EXPR_IF or e.kind == EXPR_MATCH)
+        return al_jump_in_arms(e.args as *MatchArm)
+    null
+
+fn al_jump_in_stmts(s: *Stmt) -> *Stmt
+    var cur: *Stmt = s
+    while cur != null
+        let r: *Stmt = al_jump_in_stmt(cur)
+        if r != null
+            return r
+        cur = cur.next
+    null
+
+fn al_jump_in_stmt(s: *Stmt) -> *Stmt
+    let k: i32 = s.kind
+    if k == STMT_BREAK or k == STMT_CONTINUE
+        return s
+    if k == STMT_IF
+        let r: *Stmt = al_jump_in_stmts(s.if_then)
+        if r != null
+            return r
+        return al_jump_in_stmts(s.if_else)
+    if k == STMT_DEFER or k == STMT_UNSAFE
+        return al_jump_in_stmts(s.while_body)
+    if k == STMT_MATCH
+        return al_jump_in_arms(s.if_then as *MatchArm)
+    if k == STMT_EXPR
+        return al_jump_in_expr(s.expr)
+    if k == STMT_VAR_DECL
+        return al_jump_in_expr(s.var_init)
+    null   # a loop's own jumps are its own
+
+fn al_needs(s: *Stmt, lp: *AlLoop) -> i32
+    if al_await_in_stmt(s) != null
+        return 1
+    (lp != null and al_jump_in_stmt(s) != null) as i32
+
+fn al_needs_expr(e: *Expr, lp: *AlLoop) -> i32
+    if al_await_in(e) != null
+        return 1
+    (lp != null and al_jump_in_expr(e) != null) as i32
+
+# -- refusals ---------------------------------------------------------------
+
+# The first error only, as ritz0 stops at its first.
+fn al_refuse(a: *AlFn, m: @&String, span: SrcSpan)
+    if a.errs == 0
+        diag_error_buf(a.file, span, m)
+    a.errs += 1
+
+fn al_unplaced(a: *AlFn, what: *u8, span: SrcSpan)
+    var m: String = string_new()
+    string_push_str(@&m, "`await` inside ")
+    string_push_bytes(@&m, what, al_clen(what) as i64)
+    string_push_str(@&m, " in an async fn is not supported yet (AGAST #4013)")
+    al_refuse(a, @&m, span)
+    string_drop(@&m)
+
+fn al_jump_in_match(a: *AlFn, span: SrcSpan)
+    var m: String = string_new()
+    string_push_str(@&m, "`break` / `continue` inside a `match` of an async fn's loop that awaits is not supported yet (AGAST #4013)")
+    al_refuse(a, @&m, span)
+    string_drop(@&m)
+
+# Where a refused statement is: its first await, else its jump, else itself.
+fn al_culprit(s: *Stmt) -> SrcSpan
+    let e: *Expr = al_await_in_stmt(s)
+    if e != null
+        return e.span
+    let j: *Stmt = al_jump_in_stmt(s)
+    if j != null
+        return j.span
+    s.span
+
+# -- states -----------------------------------------------------------------
+
+fn al_new_block(a: *AlFn) -> *AlBlock
+    let b: *AlBlock = al_zalloc(sizeof(AlBlock)) as *AlBlock
+    b.idx = a.nblocks
+    a.nblocks += 1
+    if a.last_block == null
+        a.blocks = b
+    else
+        a.last_block.next = b
+    a.last_block = b
+    b
+
+# The open state, or a fresh (unreachable) one after a jump.
+fn al_at(a: *AlFn) -> *AlBlock
+    if a.cur == null
+        a.cur = al_new_block(a)
+    a.cur
+
+fn al_emit(a: *AlFn, s: *Stmt)
+    if s == null
+        return
+    s.next = null
+    let b: *AlBlock = al_at(a)
+    b.head = al_append(b.head, s)
+
+fn al_close(a: *AlFn)
+    let b: *AlBlock = al_at(a)
+    b.closed = 1
+    a.cur = null
+
+fn al_set_state(n: i32, span: SrcSpan) -> *Stmt
+    al_assign_self(c"__state", 7, al_int(n as i64, span), span)
+
+fn al_goto(a: *AlFn, target: *AlBlock, span: SrcSpan)
+    al_emit(a, al_set_state(target.idx, span))
+    al_emit(a, al_stmt(STMT_CONTINUE, span))
+    al_close(a)
+
+fn al_branch(a: *AlFn, cond: *Expr, then_b: *AlBlock, else_b: *AlBlock, span: SrcSpan)
+    let s: *Stmt = al_if(cond, al_set_state(then_b.idx, span), span)
+    s.if_else = al_set_state(else_b.idx, span)
+    al_emit(a, s)
+    al_emit(a, al_stmt(STMT_CONTINUE, span))
+    al_close(a)
+
+# `return v` from the async fn: Ready(v), Ready(0) for a unit fn.
+fn al_ret(a: *AlFn, v: *Expr, span: SrcSpan)
+    var value: *Expr = v
+    if value == null or a.f.return_type == TYPE_VOID
+        value = al_int(0, span)
+    al_emit(a, al_poll_ready(value, span))
+    al_close(a)
+
+# -- values -----------------------------------------------------------------
+
+# Drive each await in `e` in its own state, in evaluation order, storing its
+# result; then `e` rewritten to read the results.
+fn al_hoist(a: *AlFn, e: *Expr) -> *Expr
+    if e == null
+        return null
+    al_hoist_walk(a, e, null)
+    al_rw_expr(a, e)
+
+fn al_hoist_list(a: *AlFn, e: *Expr) -> *Expr
+    var cur: *Expr = e
+    while cur != null
+        al_hoist_walk(a, cur, null)
+        cur = cur.next
+    al_rw_list(a, e)
+
+fn al_hoist_arms(a: *AlFn, arm: *MatchArm, under: *u8)
+    var cur: *MatchArm = arm
+    while cur != null
+        let s: *Expr = al_await_in_stmts(cur.body_stmts)
+        if s != null
+            al_unplaced(a, under, s.span)
+        al_hoist_walk(a, cur.body, under)
+        cur = cur.next
+
+# `under`: what the await would be inside, which has no state edge for it
+# (null: nothing).
+fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_AWAIT
+        if under != null
+            al_unplaced(a, under, e.span)
+            return
+        var n: i32 = 0
+        let tmp: *u8 = al_numbered(c"__await_result_", a.nawaits, @n)
+        al_set_scalar(al_extra(a, tmp, n), TYPE_I32)
+        var d: AlDest = al_dest(AL_TO_FIELD, e.span)
+        d.name = tmp
+        d.len = n
+        al_lower_await(a, e, @d)
+        al_add_point(a, e, tmp, n)
+    else if k == EXPR_IF or k == EXPR_MATCH
+        al_hoist_walk(a, e.left, under)
+        var u: *u8 = under
+        if u == null
+            if k == EXPR_IF
+                u = c"an `if` inside an expression"
+            else
+                u = c"a `match`"
+        al_hoist_arms(a, e.args as *MatchArm, u)
+    else if k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR)
+        al_hoist_walk(a, e.left, under)
+        var u: *u8 = under
+        if u == null
+            if e.op == OP_AND
+                u = c"the right of `&&`"
+            else
+                u = c"the right of `||`"
+        al_hoist_walk(a, e.right, u)
+    else if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
+        al_hoist_walk(a, e.left, under)
+        al_hoist_walk(a, e.right, under)
+    else if k == EXPR_UNARY
+        al_hoist_walk(a, e.operand, under)
+    else if k == EXPR_CALL or k == EXPR_METHOD
+        if k == EXPR_METHOD or e.func_name == null
+            al_hoist_walk(a, e.left, under)
+        var arg: *Expr = e.args
+        while arg != null
+            al_hoist_walk(a, arg, under)
+            arg = arg.next
+    else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        al_hoist_walk(a, e.left, under)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            al_hoist_walk(a, fi.value, under)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        var el: *Expr = e.args
+        while el != null
+            al_hoist_walk(a, el, under)
+            el = el.next
+
+# `await inner` into `d`: a resume point.  An async fn's call builds its
+# future into a field once, and the resume state polls it, so a Pending one
+# is polled again on the next poll, not rebuilt.  Anything else awaited is a
+# poll itself, evaluated again at each poll until it is Ready.
+fn al_lower_await(a: *AlFn, aw: *Expr, d: *AlDest)
+    let k: i32 = a.nawaits
+    a.nawaits += 1
+    let span: SrcSpan = aw.span
+    let inner: *Expr = aw.operand
+    var anl: i32 = 0
+    let answer: *u8 = al_numbered(c"__poll_", k, @anl)
+    var polled: *Expr = null
+    let g: *AlAsync = al_call_of_async(inner)
+    if g != null
+        var fl: i32 = 0
+        let fut: *u8 = al_numbered(c"__future_", k, @fl)
+        var tl: i32 = 0
+        let fut_ty: *u8 = al_join(g.name, g.len, c"_Future", 7, @tl)
+        al_set_struct(al_extra(a, fut, fl), fut_ty, tl)
+        let args: *Expr = al_hoist_list(a, inner.args)
+        # The user's call of g, at its own span: a private g of another file
+        # is refused here (#3925).  g_poll is the compiler's own call.
+        al_emit(a, al_assign_self(fut, fl, al_call(g.name, g.len, args, inner.span), span))
+        var pl: i32 = 0
+        let poll: *u8 = al_join(g.name, g.len, c"_poll", 5, @pl)
+        let addr: *Expr = al_expr(EXPR_UNARY, span)
+        addr.op = OP_ADDR
+        addr.operand = al_self_field(fut, fl, span)
+        polled = al_call(poll, pl, addr, span)
+    else
+        polled = al_hoist(a, inner)
+        polled.next = null
+    let resume: *AlBlock = al_new_block(a)
+    al_goto(a, resume, span)
+    a.cur = resume
+    al_emit(a, al_decl(answer, anl, TYPE_I32, null, 0, polled, 1, a.file, span))
+    al_emit(a, al_if(al_poll_is_pending(al_ident(answer, anl, span)), al_poll_pending_stmt(span), span))
+    al_deliver(a, al_ident(answer, anl, span), d)
+
+fn al_deliver(a: *AlFn, v: *Expr, d: *AlDest)
+    v.next = null
+    if d.kind == AL_TO_NONE
+        # A value nobody reads: kept only for its effects.
+        if v.kind != EXPR_INT_LIT and v.kind != EXPR_MEMBER and v.kind != EXPR_IDENT
+            al_emit(a, al_expr_stmt(v))
+    else if d.kind == AL_TO_RETURN
+        if a.f.return_type == TYPE_VOID
+            var none: AlDest = al_dest(AL_TO_NONE, v.span)
+            al_deliver(a, v, @none)
+        al_ret(a, v, v.span)
+    else if d.kind == AL_TO_FIELD
+        al_emit(a, al_assign_self(d.name, d.len, v, d.span))
+    else
+        let s: *Stmt = al_copy_stmt(d.stmt)
+        s.assign_value = v
+        al_emit(a, s)
+
+# A then/else arm of an EXPR_IF: its statements, then its value.
+fn al_lower_arm(a: *AlFn, arm: *MatchArm, d: *AlDest, lp: *AlLoop)
+    var none: AlDest = al_dest(AL_TO_NONE, d.span)
+    al_lower_list(a, arm.body_stmts, @none, lp)
+    if arm.body != null and arm.is_pass == 0
+        al_lower_value(a, arm.body, d, lp)
+    else if d.kind == AL_TO_RETURN and a.cur != null
+        al_ret(a, null, d.span)
+
+# Evaluate `e` into `d`.
+fn al_lower_value(a: *AlFn, e: *Expr, d: *AlDest, lp: *AlLoop)
+    if al_needs_expr(e, lp) == 0
+        al_deliver(a, al_rw_expr(a, e), d)
+    else if e.kind == EXPR_IF
+        let cond: *Expr = al_hoist(a, e.left)
+        let then_arm: *MatchArm = e.args as *MatchArm
+        let then_b: *AlBlock = al_new_block(a)
+        let else_b: *AlBlock = al_new_block(a)
+        let join: *AlBlock = al_new_block(a)
+        al_branch(a, cond, then_b, else_b, e.span)
+        a.cur = then_b
+        al_lower_arm(a, then_arm, d, lp)
+        if a.cur != null
+            al_goto(a, join, e.span)
+        a.cur = else_b
+        if then_arm.next != null
+            al_lower_arm(a, then_arm.next, d, lp)
+        if a.cur != null
+            al_goto(a, join, e.span)
+        a.cur = join
+    else if e.kind == EXPR_AWAIT
+        al_lower_await(a, e, d)
+    else if al_await_in(e) == null
+        # Only a jump out of the loop, from where it can't be a state edge.
+        al_jump_in_match(a, al_jump_in_expr(e).span)
+    else
+        al_deliver(a, al_hoist(a, e), d)
+
+# An `if` statement; with `d`, each branch's last statement is its value.
+fn al_lower_if(a: *AlFn, s: *Stmt, d: *AlDest, lp: *AlLoop)
+    let cond: *Expr = al_hoist(a, s.if_cond)
+    let then_b: *AlBlock = al_new_block(a)
+    let else_b: *AlBlock = al_new_block(a)
+    let join: *AlBlock = al_new_block(a)
+    al_branch(a, cond, then_b, else_b, s.span)
+    a.cur = then_b
+    al_lower_list(a, s.if_then, d, lp)
+    if a.cur != null
+        al_goto(a, join, s.span)
+    a.cur = else_b
+    al_lower_list(a, s.if_else, d, lp)
+    if a.cur != null
+        al_goto(a, join, s.span)
+    a.cur = join
+
+# `while cond` (`loop`: cond null): the condition's awaits re-run each pass.
+fn al_lower_while(a: *AlFn, cond: *Expr, body: *Stmt, span: SrcSpan)
+    let head: *AlBlock = al_new_block(a)
+    al_goto(a, head, span)
+    a.cur = head
+    var c: *Expr = null
+    if cond == null
+        c = al_true(span)
+    else
+        c = al_hoist(a, cond)
+    let body_b: *AlBlock = al_new_block(a)
+    let exit_b: *AlBlock = al_new_block(a)
+    al_branch(a, c, body_b, exit_b, span)
+    a.cur = body_b
+    var lp: AlLoop
+    lp.head = head
+    lp.exit = exit_b
+    var none: AlDest = al_dest(AL_TO_NONE, span)
+    al_lower_list(a, body, @none, @lp)
+    if a.cur != null
+        al_goto(a, head, span)
+    a.cur = exit_b
+
+# The statements `s`; with `d`, the last one is the list's value.
+fn al_lower_list(a: *AlFn, s: *Stmt, d: *AlDest, lp: *AlLoop)
+    var cur: *Stmt = s
+    while cur != null
+        let nxt: *Stmt = cur.next
+        if nxt == null and d.kind != AL_TO_NONE
+            al_lower_tail(a, cur, d, lp)
+        else
+            al_lower_stmt(a, cur, lp)
+        cur = nxt
+
+fn al_lower_tail(a: *AlFn, s: *Stmt, d: *AlDest, lp: *AlLoop)
+    if s.kind == STMT_EXPR
+        al_lower_value(a, s.expr, d, lp)
+        return
+    if s.kind == STMT_IF and s.if_else != null
+        al_lower_if(a, s, d, lp)
+        return
+    if s.kind == STMT_MATCH and al_needs(s, lp) == 0
+        # Its arms' values go to `d` in place.
+        s.if_cond = al_rw_expr(a, s.if_cond)
+        al_rw_arms(a, s.if_then as *MatchArm)
+        al_deliver_arms(a, s.if_then as *MatchArm, d)
+        al_emit(a, s)
+        if d.kind == AL_TO_RETURN and a.cur != null
+            al_ret(a, null, s.span)
+        return
+    al_lower_stmt(a, s, lp)
+    if d.kind == AL_TO_RETURN and a.cur != null
+        al_ret(a, null, s.span)
+
+# Each arm's value `v` becomes the statement that puts it in `d`.
+fn al_deliver_arms(a: *AlFn, arm: *MatchArm, d: *AlDest)
+    var cur: *MatchArm = arm
+    while cur != null
+        if cur.body != null and cur.is_pass == 0
+            let held: *AlBlock = a.cur
+            let tmp: *AlBlock = al_zalloc(sizeof(AlBlock)) as *AlBlock
+            a.cur = tmp
+            al_deliver(a, cur.body, d)
+            a.cur = held
+            cur.body_stmts = al_append(cur.body_stmts, tmp.head)
+            cur.body = null
+            cur.is_pass = 1
+        cur = cur.next
+
+fn al_lower_stmt(a: *AlFn, s: *Stmt, lp: *AlLoop)
+    let k: i32 = s.kind
+    if k == STMT_DEFER
+        # Its block's exit is spread over states: it would run as its state
+        # ends, not as the block does.
+        var m: String = string_new()
+        string_push_str(@&m, "`defer` in an async fn that awaits is not supported yet (AGAST #4013)")
+        al_refuse(a, @&m, s.span)
+        string_drop(@&m)
+        return
+    if al_needs(s, lp) == 0
+        al_emit(a, al_rw_stmt(a, s))
+        if k == STMT_RETURN
+            al_close(a)
+        return
+    if k == STMT_VAR_DECL
+        var d: AlDest = al_dest(AL_TO_FIELD, s.span)
+        d.name = s.var_name
+        d.len = s.var_name_len
+        al_lower_value(a, s.var_init, @d, lp)
+    else if k == STMT_ASSIGN or k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN or k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        al_rw_target(a, s, 1)
+        var d: AlDest = al_dest(AL_TO_ASSIGN, s.span)
+        d.stmt = s
+        al_lower_value(a, s.assign_value, @d, lp)
+    else if k == STMT_RETURN
+        if s.return_value == null
+            al_ret(a, null, s.span)
+        else
+            var d: AlDest = al_dest(AL_TO_RETURN, s.span)
+            al_lower_value(a, s.return_value, @d, lp)
+    else if k == STMT_EXPR
+        var d: AlDest = al_dest(AL_TO_NONE, s.span)
+        al_lower_value(a, s.expr, @d, lp)
+    else if k == STMT_IF
+        var d: AlDest = al_dest(AL_TO_NONE, s.span)
+        al_lower_if(a, s, @d, lp)
+    else if k == STMT_WHILE
+        al_lower_while(a, s.while_cond, s.while_body, s.span)
+    else if k == STMT_LOOP
+        al_lower_while(a, null, s.while_body, s.span)
+    else if k == STMT_BREAK
+        al_goto(a, lp.exit, s.span)
+    else if k == STMT_CONTINUE
+        al_goto(a, lp.head, s.span)
+    else if k == STMT_UNSAFE
+        var d: AlDest = al_dest(AL_TO_NONE, s.span)
+        al_lower_list(a, s.while_body, @d, lp)
+    else if k == STMT_MATCH
+        if al_await_in_arms(s.if_then as *MatchArm) != null
+            al_unplaced(a, c"a `match`", al_await_in_arms(s.if_then as *MatchArm).span)
+        else if al_await_in(s.if_cond) == null
+            al_jump_in_match(a, al_jump_in_stmt(s).span)
+        else
+            s.if_cond = al_hoist(a, s.if_cond)
+            al_rw_arms(a, s.if_then as *MatchArm)
+            al_emit(a, s)
+    else if k == STMT_FOR
+        al_unplaced(a, c"a `for` loop", al_culprit(s))
+    else
+        al_unplaced(a, c"this statement", al_culprit(s))
+
+# The poll's body: `while true` over `if self.__state == N` for each state.
+fn al_dispatch(a: *AlFn, span: SrcSpan) -> *Stmt
+    var arms: *Stmt = null
+    var b: *AlBlock = a.blocks
+    while b != null
+        var body: *Stmt = b.head
+        if b.closed == 0
+            body = al_append(body, al_poll_pending_stmt(span))   # unreachable
+        let cond: *Expr = al_binary(OP_EQ, al_self_field(c"__state", 7, span), al_int(b.idx as i64, span))
+        arms = al_append(arms, al_if(cond, body, span))
+        b = b.next
+    # It never ends (no `break`), so nothing follows it: ritz1 knows a `while
+    # true` diverges, and would refuse anything after it as unreachable.
+    let w: *Stmt = al_stmt(STMT_WHILE, span)
+    w.while_cond = al_true(span)
+    w.while_body = arms
+    w
+
+# ---------------------------------------------------------------------------
+# The future, its constructor and its poll
 # ---------------------------------------------------------------------------
 
 fn al_field_of(l: *AlLocal) -> *StructField
@@ -934,6 +1657,12 @@ fn al_future_struct(a: *AlFn, name: *u8, len: i32) -> *StructDef
                 last.next = al_field_of(best)
                 last = last.next
                 placed = best
+    # Then the state machine's own: await results and awaited futures.
+    var x: *AlLocal = a.extra
+    while x != null
+        last.next = al_field_of(x)
+        last = last.next
+        x = x.next
     let s: *StructDef = al_zalloc(sizeof(StructDef)) as *StructDef
     s.name = name
     s.name_len = len
@@ -965,49 +1694,13 @@ fn al_constructor(a: *AlFn, name: *u8, len: i32, fut: *u8, fut_len: i32) -> *FnD
     lit.args = head as *Expr
     al_fn(f, name, len, f.params, TYPE_STRUCT, fut, fut_len, al_expr_stmt(lit))
 
-# One await's state:
-#     if self.__state == N
-#         [var __future_N: g_Future = g(args)]
-#         let __inner_result_N: i32 = g_poll(@__future_N)   (or the awaited expr)
-#         if __inner_result_N == 0 - 1
-#             return 0 - 1
-#         self.<result> = __inner_result_N
-#         <the lets it completes>
-#         self.__state = N + 1
-fn al_state(a: *AlFn, p: *AlPoint, n: i32) -> *Stmt
-    let span: SrcSpan = p.await_expr.span
-    var rl: i32 = 0
-    let res: *u8 = al_numbered(c"__inner_result_", n, @rl)
-    let inner: *Expr = p.await_expr.operand
-    var body: *Stmt = null
-    let g: *AlAsync = al_call_of_async(inner)
-    if g != null
-        var fl: i32 = 0
-        let fut_var: *u8 = al_numbered(c"__future_", n, @fl)
-        var tl: i32 = 0
-        let fut_ty: *u8 = al_join(g.name, g.len, c"_Future", 7, @tl)
-        var pl: i32 = 0
-        let poll: *u8 = al_join(g.name, g.len, c"_poll", 5, @pl)
-        let args: *Expr = al_rw_list(a, inner.args)
-        body = al_decl(fut_var, fl, TYPE_STRUCT, fut_ty, tl, al_call(g.name, g.len, args, inner.span), 0, null, span)
-        body = al_append(body, al_decl(res, rl, TYPE_I32, null, 0, al_call(poll, pl, al_addr_of(fut_var, fl, span), span), 1, a.file, span))
-    else
-        body = al_decl(res, rl, TYPE_I32, null, 0, al_rw_expr(a, inner), 1, a.file, span)
-    let pending: *Stmt = al_return(al_pending(span), span)
-    body = al_append(body, al_if(al_binary(OP_EQ, al_ident(res, rl, span), al_pending(span)), pending, span))
-    body = al_append(body, al_assign_self(p.result, p.result_len, al_ident(res, rl, span), span))
-    var l: *AlLet = p.then_lets
-    while l != null
-        let st: *Stmt = al_rw_stmt(a, l.stmt)
-        st.next = null
-        body = al_append(body, st)
-        l = l.next
-    body = al_append(body, al_assign_self(c"__state", 7, al_int((n + 1) as i64, span), span))
-    let cond: *Expr = al_binary(OP_EQ, al_self_field(c"__state", 7, span), al_int(n as i64, span))
-    al_if(cond, body, span)
-
-fn al_is_lit(e: *Expr) -> i32
-    (e != null and e.kind == EXPR_INT_LIT) as i32
+# The body with an await, as states; state 0 is its entry.
+fn al_lower_body(a: *AlFn, span: SrcSpan)
+    a.cur = al_new_block(a)
+    var d: AlDest = al_dest(AL_TO_RETURN, span)
+    al_lower_list(a, a.f.body, @d, null)
+    if a.cur != null
+        al_ret(a, null, span)   # off the end: Ready(0)
 
 # `fn <f>_poll(self: *<f>_Future) -> i32`
 fn al_poll(a: *AlFn, name: *u8, len: i32, fut: *u8, fut_len: i32) -> *FnDef
@@ -1021,37 +1714,8 @@ fn al_poll(a: *AlFn, name: *u8, len: i32, fut: *u8, fut_len: i32) -> *FnDef
         if unit == 1
             body = al_append(body, al_expr_stmt(al_int(0, span)))   # Ready(0)
     else
-        var p: *AlPoint = a.points
-        var n: i32 = 0
-        while p != null
-            body = al_append(body, al_state(a, p, n))
-            n += 1
-            p = p.next
-        # The final state: the body's tail, or its last `return`'s value.
-        let last: *Stmt = al_last(f.body)
-        var value: *Expr = null
-        var tail: *Stmt = null
-        if last != null and last.kind == STMT_EXPR
-            value = al_rw_expr(a, last.expr)
-        else if last != null and last.kind == STMT_RETURN and last.return_value != null
-            value = al_rw_expr(a, last.return_value)
-        else if last != null and (last.kind == STMT_IF or last.kind == STMT_MATCH)
-            tail = al_rw_stmt(a, last)
-            tail.next = null
-        if unit == 1
-            if value != null and al_is_lit(value) == 0
-                body = al_append(body, al_expr_stmt(value))
-            if tail != null
-                body = al_append(body, tail)
-            body = al_append(body, al_expr_stmt(al_int(0, span)))
-        else if tail != null
-            body = al_append(body, tail)
-        else
-            if value == null
-                value = al_int(0, span)
-            else
-                value.next = null
-            body = al_append(body, al_expr_stmt(value))
+        al_lower_body(a, span)
+        body = al_dispatch(a, span)
     let self_p: *Param = al_zalloc(sizeof(Param)) as *Param
     self_p.name = c"self"
     self_p.name_len = 4
@@ -1116,15 +1780,7 @@ fn al_analyse(a: *AlFn) -> i32
 # the fn list, after `prev` (null: at the head).  0, or the errors reported.
 fn al_lower_fn(m: *Module, prev: *FnDef, f: *FnDef) -> i32
     var a: AlFn
-    a.f = f
-    a.file = al_file(f)
-    a.locals = null
-    a.points = null
-    a.npoints = 0
-    a.let_target = null
-    a.top = null
-    a.untyped = null
-    a.sync = 0
+    al_fn_init(@a, f, 0)
     if f.type_params != null
         diag_error_name(a.file, diag_span(f.line, f.col), c"async fn '", f.name, f.name_len, c"' is generic, which ritz1 can't lower to a state machine")
         return 1
@@ -1135,6 +1791,10 @@ fn al_lower_fn(m: *Module, prev: *FnDef, f: *FnDef) -> i32
     let fut: *u8 = al_join(f.name, f.name_len, c"_Future", 7, @fl)
     var pl: i32 = 0
     let poll_name: *u8 = al_join(f.name, f.name_len, c"_poll", 5, @pl)
+    # The poll first: its state machine adds fields to the future.
+    let poll: *FnDef = al_poll(@a, poll_name, pl, fut, fl)
+    if a.errs > 0
+        return a.errs
     let st: *StructDef = al_future_struct(@a, fut, fl)
     var sl: *StructDef = m.structs
     if sl == null
@@ -1149,7 +1809,6 @@ fn al_lower_fn(m: *Module, prev: *FnDef, f: *FnDef) -> i32
         ctor = al_constructor(@a, c"__main_future", 13, fut, fl)
     else
         ctor = al_constructor(@a, f.name, f.name_len, fut, fl)
-    let poll: *FnDef = al_poll(@a, poll_name, pl, fut, fl)
     ctor.next = poll
     poll.next = f.next
     if is_main == 1
@@ -1291,15 +1950,7 @@ fn al_sync_fn(f: *FnDef)
     if f.body == null
         return
     var a: AlFn
-    a.f = f
-    a.file = al_file(f)
-    a.locals = null
-    a.points = null
-    a.npoints = 0
-    a.let_target = null
-    a.top = null
-    a.untyped = null
-    a.sync = 1
+    al_fn_init(@a, f, 1)
     f.body = al_rw_stmts(@a, f.body)
 
 # ---------------------------------------------------------------------------

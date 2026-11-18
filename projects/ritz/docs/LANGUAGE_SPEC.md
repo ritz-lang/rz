@@ -5796,9 +5796,51 @@ fn main() -> i32
     r - 1
 ```
 
-ritz0 lowers an `async fn` that awaits to one state per `await` and a final
-state that evaluates the body's tail; a statement that is neither an `await`
-binding nor the tail is not yet run, typed or not (AGAST #3727).
+An `async fn` that awaits runs as written: its body is lowered to a state
+machine over its control flow (AGAST #3727), and each `await` is a point the
+fn suspends at (its poll answers Pending) and resumes at on the next poll,
+wherever it is.  An `await` in a loop runs on every pass, only the taken arm
+of an `if` runs its awaits, and every statement between them runs once:
+
+```ritz
+async fn dbl(x: i32) -> i32
+    x * 2
+
+async fn sum_doubles(n: i32) -> i32
+    var sum: i32 = 0
+    var i: i32 = 0
+    while i < n
+        if i == 2
+            i += 1
+            continue
+        sum += await dbl(i)
+        i += 1
+    sum
+
+fn main() -> i32
+    let r: i32 = await sum_doubles(4)   # 0 + 2 + 6
+    r - 8
+```
+
+An `await` inside a `match` arm, a `for` loop or the right of `&&` / `||` is
+refused at the `await`, and a `defer` among the statements the machine splits
+into states is refused at the `defer`, until those forms are lowered
+(AGAST #4013):
+
+```ritz expect-error="`await` inside a `for` loop in an async fn is not supported yet (AGAST #4013)"
+async fn dbl(x: i32) -> i32
+    x * 2
+
+async fn go(n: i32) -> i32
+    var s: i32 = 0
+    for i in 0..n
+        s += await dbl(i)
+    s
+
+fn main() -> i32
+    let r: i32 = await go(3)
+    r - 6
+```
 
 ### 16.3 Runtime
 

@@ -108,7 +108,6 @@ def test_ticket_program_compiles(tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.batched
-@pytest.mark.xfail(strict=True, reason="AGAST #3727: the state machine skips a non-await `let`")
 def test_ticket_program_runs(tmp_path):
     src = _go("    let y = x + 1\n    let v: i32 = await fetch(y)\n    v + 1\n") + _MAIN
     assert _run("ritz0", None, tmp_path, "ticket_run", src) == 9

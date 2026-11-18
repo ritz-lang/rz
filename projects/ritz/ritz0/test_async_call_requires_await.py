@@ -68,14 +68,10 @@ def test_awaited_async_call_runs(tmp_path, name):
     assert _run("ritz0", None, tmp_path, name, program) == want
 
 
-# 55_async_state_machine's test_loop_await, moved here when #1395 added its
-# missing `await`s.  The example then compiled, so it could no longer be
-# allowlisted (strict xpass) and a test.sh failure has no allowlist by design
-# (rz.toml).  The state machine runs each await once, in its own state, and
-# its final state evaluates only the body's TAIL: `sum += await` in a loop is
-# never re-run and the `+=` never executes, so this answers 0, not 20.  When
-# #3727 passes this row, restore test_loop_await in 55 and
-# test_async_write_read in 54 (removed by #3726), and delete this.
+# 55_async_state_machine's test_loop_await, which #1395 pinned here as a
+# strict xfail: the state machine ran each await once and evaluated only the
+# body's tail, so this answered 0.  #3727 made the poll a state machine over the
+# whole body; 55 has its test_loop_await back, and this row stays as ritz0's.
 _LOOP_AWAIT = ("async fn dbl(x: i32) -> i32\n    x * 2\n\n"
                "async fn loop_await(n: i32) -> i32\n    var sum: i32 = 0\n    var i: i32 = 0\n"
                "    while i < n\n        sum += await dbl(i)\n        i += 1\n    sum\n\n"
@@ -83,7 +79,6 @@ _LOOP_AWAIT = ("async fn dbl(x: i32) -> i32\n    x * 2\n\n"
 
 
 @pytest.mark.integration
-@pytest.mark.xfail(strict=True, reason="AGAST #3727: async transform drops statements after an await and loops")
 def test_await_in_a_loop_reruns_each_iteration(tmp_path):
     assert _run("ritz0", None, tmp_path, "loop_await", _LOOP_AWAIT) == 20
 
