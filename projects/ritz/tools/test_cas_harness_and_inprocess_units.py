@@ -230,7 +230,11 @@ def test_a_harness_that_does_not_compile_is_not_stored(tmp_path, monkeypatch, te
 
 
 @pytest.mark.unit
-def test_harness_key_names_the_compiler_and_differs_from_the_module_key(tmp_path, buildpy):
+def test_harness_key_names_the_compiler_and_differs_from_the_module_key(tmp_path, monkeypatch,
+                                                                         buildpy):
+    # A key folds in cas.target_id(), whose first call runs `clang --version`;
+    # pin it so this pure test starts no process (AGAST #3807, spawn_guard).
+    monkeypatch.setattr(cas, "_TARGET", "test-os/test-machine/test-clang")
     src = tmp_path / "test_x.ritz"
     src.write_text("[[test]]\nfn test_x() -> i32\n    0\n")
     k0 = buildpy.cas_harness_key(src, [], "ritz0")
@@ -332,7 +336,8 @@ def test_in_process_unit_times_out(tmp_path, monkeypatch, buildpy, test_runner, 
     assert "TIMEOUT after 1s" in capsys.readouterr().out
 
 
-@pytest.mark.unit
+# integration: it runs the ritz0 stub as a real subprocess (AGAST #3807).
+@pytest.mark.integration
 def test_off_the_main_thread_the_unit_runs_as_a_subprocess(tmp_path, monkeypatch, buildpy):
     """SIGALRM (the in-process timeout) only works on the main thread."""
     pkg, t = _pkg(tmp_path)
@@ -345,3 +350,30 @@ def test_off_the_main_thread_the_unit_runs_as_a_subprocess(tmp_path, monkeypatch
     th.start()
     th.join()
     assert out["r"] == {"status": "pass", "passed": 1, "failed": 0}
+
+
+# --- the tiers hold under spawn_guard ----------------------------------------
+
+
+@pytest.mark.integration
+def test_unit_tier_starts_no_process_under_spawn_guard(tmp_path):
+    """This file's non-integration tests pass with ritz0's spawn guard loaded.
+
+    `make tools-unit` runs tools/ in its own session, without ritz0/conftest.py,
+    so nothing there enforces AGAST #1805's rule. A mixed local run such as
+    `pytest ritz0/test_x.py tools/<this file>` loads the guard, and two `unit`
+    tests here failed it (AGAST #3807): one ran a ritz0 stub as a subprocess,
+    the other paid cas.target_id()'s `clang --version`. One nested session,
+    the guard loaded by name as ritz0/test_spawn_guard.py does.
+    """
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
+    env["PYTHONPATH"] = str(RITZ0_DIR)
+    env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    r = subprocess.run(
+        [sys.executable, "-m", "pytest", "-q", "-p", "spawn_guard", "-p", "no:cacheprovider",
+         "-m", "not integration", str(Path(__file__).resolve())],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=300,
+    )
+    assert r.returncode == 0, r.stdout[-4000:] + r.stderr[-2000:]
+    assert " passed" in r.stdout and "deselected" in r.stdout, r.stdout
