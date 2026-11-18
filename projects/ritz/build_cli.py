@@ -13,7 +13,7 @@ import bounded_run
 import manifest
 from build_pipeline import (EXIT_SETUP, RITZ0, ROOT, build_package, compile_binary,
                             get_build_cache, get_output_dir, invoked_package_path)
-from build_testrun import run_test_sh, run_tests, unit_file, unit_plan
+from build_testrun import run_test_sh, run_tests, test_run_dir, unit_file, unit_plan
 from manifest import (StrayTestsDirError, find_all_packages, find_package_at, find_package_by_name_or_path,
                       find_packages, get_build_profile, plan_binaries)
 
@@ -159,6 +159,17 @@ def cmd_test(args):
             print("Usage: ritz test [path] or ritz test --all", file=sys.stderr)
             return 1
 
+    # As cmd_build (#3818): a package reached through another tree's
+    # symlink builds into a per-root dir, and its tests run in a per-root
+    # shadow of the package, test_run_dir (AGAST #3831). --all globs under
+    # the cwd, so its package paths are already unresolved.
+    invoked_as = None if args.all else invoked_package_path(args.name)
+
+    def run_dir(pkg_dir: Path, config: dict, invoked: Optional[Path]) -> Path:
+        out_dir = get_output_dir(pkg_dir, get_build_profile(config, profile_name),
+                                 invoked_as=invoked)
+        return test_run_dir(pkg_dir, config, out_dir)
+
     unit = _test_unit_mode(args)
     if unit:
         if len(targets) != 1 or args.all:
@@ -169,25 +180,31 @@ def cmd_test(args):
         if unit == "plan":
             return unit_plan(pkg_dir, config, Path(args.unit_plan),
                              keep_artifacts=keep_artifacts, use_cache=use_cache,
-                             profile_name=profile_name, compiler=compiler)
+                             profile_name=profile_name, compiler=compiler,
+                             invoked_as=invoked_as)
+        # Same package path as the --unit-plan that built it, so the same
+        # run dir; recomputed rather than read from the plan.
         if unit == "file":
-            return unit_file(pkg_dir, Path(args.unit_file),
+            return unit_file(run_dir(pkg_dir, config, invoked_as), Path(args.unit_file),
                              Path(args.unit_result), compiler)
-        return 0 if run_test_sh(pkg_dir) else 1
+        return 0 if run_test_sh(run_dir(pkg_dir, config, invoked_as)) else 1
 
     all_passed = True
     for pkg_dir, config in targets:
+        invoked = invoked_as if invoked_as else pkg_dir
         # Check if this is a test-only package
         is_test_only = config.get("build", {}).get("test_only", False)
 
         if is_test_only:
             # For test-only packages, run tests directly without building a binary
             print(f"📦 {config['package']['name']} (test-only)")
-            if not run_tests(pkg_dir, config, compiler):
+            if not run_tests(pkg_dir, config, compiler,
+                             run_dir=run_dir(pkg_dir, config, invoked)):
                 all_passed = False
         else:
             # Normal package: build then test
-            result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler)
+            result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts, use_cache=use_cache, profile_name=profile_name, compiler=compiler,
+                                   invoked_as=invoked)
 
             # A partial build is a build failure: running the test suite
             # against a package whose main binary does not exist reports on a
@@ -201,7 +218,8 @@ def cmd_test(args):
                 print(f"  ✗ Failed to build {config['package']['name']}: {result.summary()}",
                       file=sys.stderr)
                 all_passed = False
-            elif not run_tests(pkg_dir, config, compiler):
+            elif not run_tests(pkg_dir, config, compiler,
+                               run_dir=run_dir(pkg_dir, config, invoked)):
                 all_passed = False
 
     if keep_artifacts:
@@ -280,6 +298,8 @@ def cmd_clean(args):
     build_package writes every binary, `lib<name>.a` and manifest into
     `<pkg>/build/<profile>/` (get_output_dir), so removing those directories
     removes the build. Anything else under `<pkg>/build/` is left alone.
+    A package reached through another tree's symlink builds (and runs its
+    tests) under `ROOT/build/linked/` instead (#3818, #3831): removed whole.
     """
     import shutil
 
@@ -293,6 +313,11 @@ def cmd_clean(args):
             if out_dir.is_dir():
                 shutil.rmtree(out_dir)
                 print(f"  🗑 {shown(out_dir)}")
+
+    linked = ROOT / "build" / "linked"
+    if linked.is_dir():
+        shutil.rmtree(linked)
+        print(f"  🗑 {shown(linked)}")
 
     # Clean pycache
     for pycache in ROOT.rglob("__pycache__"):

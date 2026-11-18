@@ -19,7 +19,7 @@ from typing import Optional
 import bounded_run
 from build_pipeline import (RITZ0, build_package, relay_compiler_warnings,
                             test_env_for_files)
-from manifest import discover_test_files
+from manifest import discover_test_files, plan_binaries, wants_convenience_link
 
 
 _HARNESS_SUMMARY = re.compile(r"(\d+) passed, (\d+) failed(?:, (\d+) errored)?")
@@ -340,8 +340,56 @@ def summarize_file_outcomes(outcomes: list[dict]) -> str:
     )
 
 
+def _replace_symlink(link: Path, target: str) -> None:
+    """Point `link` at `target`, atomically (a parallel unit of the same
+    run may be reading the dir)."""
+    try:
+        if os.readlink(link) == target:
+            return
+    except OSError:
+        pass
+    tmp = link.with_name(f".{link.name}.{os.getpid()}.tmp")
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(target)
+    os.replace(tmp, link)
+
+
+def test_run_dir(pkg_dir: Path, config: dict, out_dir: Path) -> Path:
+    """The cwd a package's test files and test.sh run in (AGAST #3831).
+
+    Integration tests fork/exec `./<name>` from cwd, so a plain package runs
+    in pkg_dir, where build_package linked `<pkg>/<name>` to its binary.
+
+    A package reached through another tree's symlink builds into a per-root
+    `out_dir` outside pkg_dir and gets no `<pkg>/<name>` link (#3818): the
+    package dir is shared, and the link there would be whichever tree built
+    last. Its tests run in `<out_dir>/../cwd-<profile>/` instead, a shadow
+    of the package holding one symlink per package entry (not `build/`, nor
+    a binary's `<name>`) plus `<name>` -> this root's binary. Nothing of
+    this run is written into the shared dir; files a test writes in its cwd
+    land in the shadow.
+    """
+    if out_dir.is_relative_to(pkg_dir):
+        return pkg_dir
+    run_dir = out_dir.parent / f"cwd-{out_dir.name}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    binaries = {b.name for b in plan_binaries(pkg_dir, config).buildable
+                if wants_convenience_link(b)}
+    wanted = {name: str(out_dir / name) for name in binaries}
+    for entry in pkg_dir.iterdir():
+        if entry.name != "build" and entry.name not in wanted:
+            wanted[entry.name] = str(entry)
+    for name, target in wanted.items():
+        _replace_symlink(run_dir / name, target)
+    for stale in run_dir.iterdir():   # entries the package no longer has
+        if stale.is_symlink() and stale.name not in wanted:
+            stale.unlink(missing_ok=True)
+    return run_dir
+
+
 def run_test_sh(pkg_dir: Path) -> bool:
-    """Run pkg_dir/test.sh (caller checks it exists); print its verdict."""
+    """Run pkg_dir/test.sh (caller checks it exists) with cwd pkg_dir, which
+    is test_run_dir's dir; print its verdict."""
     print(f"  🧪 Running test.sh...")
     result = bounded_run.child(
         ["bash", str(pkg_dir / "test.sh")],
@@ -359,8 +407,10 @@ def run_test_sh(pkg_dir: Path) -> bool:
     return False
 
 
-def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
-    """Run tests for a package with `compiler`.
+def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0",
+              run_dir: Optional[Path] = None) -> bool:
+    """Run tests for a package with `compiler`, with cwd `run_dir`
+    (test_run_dir; default pkg_dir).
 
     Every test binary is built by `compiler`: the test file in test mode,
     its dependencies and ritzunit (AGAST #1908). Before that, ritz1 had no
@@ -369,6 +419,7 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
     """
     all_passed = True
     tests_found = False
+    run_dir = run_dir or pkg_dir
 
     ritz_tests = discover_test_files(pkg_dir, config)
 
@@ -387,7 +438,7 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
         # across the workspace via --unit-file; AGAST #1809.)
         test_env = test_env_for_files()
         timeout = per_file_timeout()
-        outcomes = [run_test_file(t, pkg_dir, test_env, timeout, compiler)
+        outcomes = [run_test_file(t, run_dir, test_env, timeout, compiler)
                     for t in ritz_tests]
         if any(o["status"] != "pass" for o in outcomes):
             all_passed = False
@@ -396,7 +447,7 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
     # Run test.sh if it exists
     if (pkg_dir / "test.sh").exists():
         tests_found = True
-        if not run_test_sh(pkg_dir):
+        if not run_test_sh(run_dir):
             all_passed = False
 
     if not tests_found:
@@ -428,8 +479,12 @@ def run_tests(pkg_dir: Path, config: dict, compiler: str = "ritz0") -> bool:
 
 def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
               keep_artifacts: bool, use_cache: bool,
-              profile_name: Optional[str], compiler: str) -> int:
+              profile_name: Optional[str], compiler: str,
+              invoked_as: Optional[Path] = None) -> int:
     """Build step of a package's test run; writes the plan JSON.
+
+    `invoked_as` is build_package's: through a foreign symlink the build goes
+    to a per-root dir, and the units run in test_run_dir (AGAST #3831).
 
     Mirrors cmd_test's per-package build branch and run_tests' preamble:
     a failed build runs nothing (built=false), and test.sh still runs.
@@ -442,7 +497,7 @@ def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
     else:
         result = build_package(pkg_dir, config, keep_artifacts=keep_artifacts,
                                use_cache=use_cache, profile_name=profile_name,
-                               compiler=compiler)
+                               compiler=compiler, invoked_as=invoked_as)
         if not result.ok:
             print(f"  ✗ Failed to build {pkg_name}: {result.summary()}",
                   file=sys.stderr)
@@ -460,11 +515,12 @@ def unit_plan(pkg_dir: Path, config: dict, plan_path: Path, *,
     return 0 if built else 1
 
 
-def unit_file(pkg_dir: Path, tfile: Path, result_path: Path,
+def unit_file(run_dir: Path, tfile: Path, result_path: Path,
               compiler: str = "ritz0") -> int:
-    """Run one test file; write its run_test_file outcome as JSON."""
+    """Run one test file with cwd `run_dir` (test_run_dir); write its
+    run_test_file outcome as JSON."""
     import json
-    outcome = run_test_file(tfile, pkg_dir, test_env_for_files(),
+    outcome = run_test_file(tfile, run_dir, test_env_for_files(),
                             per_file_timeout(), compiler)
     result_path.write_text(json.dumps(outcome))
     return 0 if outcome["status"] == "pass" else 1

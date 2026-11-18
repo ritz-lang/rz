@@ -110,6 +110,13 @@ code. The template below is the pattern from `tier2_stdlib/11_grep/test`
 — validated stable across 50+ runs after the harness gotchas (next
 section) were sorted.
 
+Tests run with cwd = the package dir, where the build links `./<name>` to
+the binary. A package reached through another tree's symlink (an overlay
+root's `examples -> …/examples`) builds into `ROOT/build/linked/` instead,
+and its tests run in a per-root shadow of the package whose `./<name>` is
+that root's binary (AGAST #3818, #3831); `build.py clean` removes it. Open
+package files by paths relative to the package, never `../`.
+
 ```ritz
 import ritzlib.sys
 import ritzlib.io
