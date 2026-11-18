@@ -121,7 +121,68 @@ RITZ1_EXTRA_REJECTED.update({
     "if_block_literal_first":      (_IF.format(t="i32", a="0", b="x"), None),
     "if_block_i64_arm":            (_IF.format(t="i32", a="x", b="five()"), None),
 })
+
+# AGAST #1688: shapes ritz1 used to answer NARROW_UNKNOWN for.  Each one in
+# both tables: the rejection proves the type is now read, the acceptance that
+# it is read right (not merely "wide").  _DECLS goes before the function.
+_DECLS = """\
+struct In
+    v: i64
+    w: i32
+
+struct Out
+    i: In
+
+struct S
+    k: i32
+
+impl S
+    fn wide(self: @S) -> i64
+        return 5
+    fn narrow(self: @S) -> i32
+        return 5
+
+var G64: i64 = 0
+var G32: i32 = 0
+
+fn opt64() -> Option<i64>
+    Some(5)
+
+fn opt32() -> Option<i32>
+    Some(5)
+
+"""
+_P = "x: i32, o: Order"
+_TRY = _DECLS + "fn f() -> Option<i32>\n    let n: {t} = {e}?\n    Some(0)\n"
+RITZ1_EXTRA_REJECTED.update({
+    # An unannotated local is its initialiser's type, a literal's an i64.
+    "unannotated_local_of_i64":     ("let a = big()\n    let n: i32 = a", None),
+    "unannotated_local_of_literal": ("var a = 5\n    let n: i32 = a", None),
+    "unannotated_local_if_literal_arm": (
+        "let a = if x > 0\n        x\n    else\n        0\n    let n: i32 = a", None),
+    "index_of_i64_array":  ("var a: [4]i64\n    let n: i32 = a[0]", None),
+    "index_through_i64_pointer": ("let n: i32 = p[0]", _P + ", p: *i64"),
+    "deref_of_i64_pointer": ("let n: i32 = *p", _P + ", p: *i64"),
+    "method_returning_i64": ("let n: i32 = s.wide()", _P + ", s: *S", _DECLS),
+    "unwrap_of_i64_option": ("let n: i32 = opt64().unwrap()", None, _DECLS),
+    "try_of_i64_option":    _TRY.format(t="i32", e="opt64()"),
+    "i64_global":           ("let n: i32 = G64", None, _DECLS),
+    "member_two_levels_i64": ("let n: i32 = q.i.v", _P + ", q: *Out", _DECLS),
+})
 RITZ1_EXTRA_ACCEPTED = {
+    "unannotated_local_of_i8": ("let a = 5 as i8\n    let n: i32 = a", None),
+    "unannotated_local_match_literal_arm": (
+        "let a = match o\n        Gray => x\n        RGB => 0\n        BGR => 1\n"
+        "    let n: i32 = a", None),
+    "index_of_i32_array":  ("var a: [4]i32\n    let n: i32 = a[0]", None),
+    "index_through_u8_pointer": ("let n: u8 = p[0]", _P + ", p: *u8"),
+    "deref_of_i32_pointer": ("let n: i32 = *p", _P + ", p: *i32"),
+    "method_returning_i32": ("let n: i32 = s.narrow()", _P + ", s: *S", _DECLS),
+    "unwrap_of_i32_option": ("let n: i32 = opt32().unwrap()", None, _DECLS),
+    "try_of_i32_option":    _TRY.format(t="i32", e="opt32()"),
+    "i32_global":           ("let n: i32 = G32", None, _DECLS),
+    "member_two_levels_i32": ("let n: i32 = q.i.w", _P + ", q: *Out", _DECLS),
+
     "if_block_literal_operand": (_IF.format(t="i32", a="x + 1", b="x"), None),
     "if_block_literal_left_operand": (_IF.format(t="i32", a="1 + x", b="x"), None),
     "shift_count_literal_under_shr": ("let n: u8 = (y << 4) >> 4", "y: u8"),
@@ -150,11 +211,19 @@ RITZ1_EXTRA_ACCEPTED = {
 }
 
 
+def _extra_body(entry):
+    """(stmt, body) of a table entry: `(stmt, params[, decls])`, or a whole
+    program after PRELUDE (a `?` needs its own fn's return type)."""
+    if isinstance(entry, str):
+        return entry, entry
+    stmt, params, decls = (tuple(entry) + ("",))[:3]
+    return stmt, decls + (RULE._fn(stmt, params) if params else RULE._fn(stmt))
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(RITZ1_EXTRA_REJECTED))
 def test_ritz1_extra_shapes_rejected_by_both(ritz1_bin, tmp_path, name):
-    stmt, params = RITZ1_EXTRA_REJECTED[name]
-    body = RULE._fn(stmt, params) if params else RULE._fn(stmt)
+    stmt, body = _extra_body(RITZ1_EXTRA_REJECTED[name])
     r0 = RULE._compile(tmp_path, body)
     assert r0.returncode != 0 and "implicit narrowing:" in r0.stderr, (
         f"{name}: ritz0 is the oracle and accepted it -- fix the case:\n{r0.stderr[-800:]}")
@@ -166,8 +235,7 @@ def test_ritz1_extra_shapes_rejected_by_both(ritz1_bin, tmp_path, name):
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(RITZ1_EXTRA_ACCEPTED))
 def test_ritz1_extra_shapes_accepted_by_both(ritz1_bin, tmp_path, name):
-    stmt, params = RITZ1_EXTRA_ACCEPTED[name]
-    body = RULE._fn(stmt, params) if params else RULE._fn(stmt)
+    stmt, body = _extra_body(RITZ1_EXTRA_ACCEPTED[name])
     r0 = RULE._compile(tmp_path, body)
     assert r0.returncode == 0, (
         f"{name}: ritz0 is the oracle and rejected it -- fix the case:\n{r0.stderr[-800:]}")
