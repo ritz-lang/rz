@@ -203,21 +203,53 @@ def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path):
     assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 58
 
 
+PRIVATE_ASYNC_CALLERS = {
+    # (main.ritz, line:col of `fetch` at the call)
+    "await": ("import a\n\nasync fn main() -> i32\n    let v: i32 = await fetch(41)\n    v\n",
+              "4:24"),
+    # A bare call is the constructor; ritz0 crashed on its dummy span (#3925).
+    "bare": ("import a\n\nfn main() -> i32\n    let f: fetch_Future = fetch(41)\n    0\n",
+             "4:27"),
+}
+
+
 @pytest.mark.integration
-def test_private_async_fn_refused_once(ritz1_bin, tmp_path):
-    """A private async fn awaited from another file is refused once, at the
-    call, by its own name (#3413) -- not again for its generated poll.  ritz0
-    lets it through (#3925)."""
+@pytest.mark.parametrize("caller", sorted(PRIVATE_ASYNC_CALLERS))
+def test_private_async_fn_refused_once(ritz1_bin, tmp_path, caller):
+    """A private async fn called or awaited from another file is refused
+    once, at the call, by its own name (#3413) -- not again for its
+    generated poll -- by both compilers, at the same line:col (#3925)."""
+    program, at = PRIVATE_ASYNC_CALLERS[caller]
+    pkg = tmp_path / "priv"
+    (pkg / "src").mkdir(parents=True)
+    (pkg / "src" / "a.ritz").write_text("async fn fetch(x: i32) -> i32\n    x + 1\n")
+    (pkg / "src" / "main.ritz").write_text(program)
+    where = {}
+    for compiler in ("ritz0", "ritz1"):
+        res = _compile_file(compiler, tmp_path, pkg / "src" / "main.ritz")
+        assert res.returncode != 0, (compiler, res.stderr)
+        errors = [ln for ln in res.stderr.splitlines() if "private to" in ln]
+        assert len(errors) == 1, (compiler, res.stderr)
+        m = re.search(r"main\.ritz:(\d+:\d+):( error:)? `fetch` is private to a\.ritz; "
+                      r"mark it `pub` \(#3413\)", errors[0])
+        assert m, (compiler, res.stderr)
+        where[compiler] = m.group(1)
+    assert where == {"ritz0": at, "ritz1": at}, where
+
+
+@pytest.mark.integration
+def test_private_async_fn_poll_is_exempt(ritz1_bin, tmp_path):
+    """The generated `fetch_poll` has no declaration of its own: neither
+    compiler refuses a cross-file call to it, and ritz0 no longer crashes
+    on its spanless definition (#3925)."""
     pkg = tmp_path / "priv"
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "a.ritz").write_text("async fn fetch(x: i32) -> i32\n    x + 1\n")
     (pkg / "src" / "main.ritz").write_text(
-        "import a\n\nasync fn main() -> i32\n    let v: i32 = await fetch(41)\n    v\n")
-    res = _compile_file("ritz1", tmp_path, pkg / "src" / "main.ritz")
-    assert res.returncode != 0, res.stderr
-    errors = [ln for ln in res.stderr.splitlines() if ": error: " in ln]
-    assert len(errors) == 1, res.stderr
-    assert re.search(r"main\.ritz:4:\d+: error: `fetch` is private to a\.ritz", errors[0]), res.stderr
+        "import a\n\nfn main() -> i32\n    fetch_poll(0 as *fetch_Future)\n")
+    for compiler in ("ritz0", "ritz1"):
+        res = _compile_file(compiler, tmp_path, pkg / "src" / "main.ritz")
+        assert res.returncode == 0, (compiler, res.stderr)
 
 
 @pytest.mark.integration

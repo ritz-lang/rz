@@ -5627,14 +5627,21 @@ class LLVMEmitter:
         elsewhere), monomorph instances and compiler-generated fns (no
         declaration of their own to mark), and a callee whose file isn't
         known. A note line gives the declaration: a basename alone is
-        ambiguous across packages."""
+        ambiguous across packages.
+
+        An async fn's poll fn (`fetch_poll`) has no source position of its
+        own (async_transform_v2's dummy span): it is unchecked, so a private
+        async fn is refused once, at the call of `fetch` -- its constructor,
+        which keeps the declaration's span -- as ritz1 does (#3925)."""
         callee_def = getattr(callee_def, 'declared_method', callee_def)
         if (callee_def is None or span is None
                 or not isinstance(callee_def, rast.FnDef)
                 or callee_def.is_pub
                 or getattr(callee_def, 'is_decl', False)
                 or getattr(callee_def, 'is_monomorphized', False)
-                or getattr(callee_def, 'generated', False)):
+                or getattr(callee_def, 'generated', False)
+                or callee_def.span is None
+                or not isinstance(callee_def.span.file, str)):
             return
         # An import carries `source_file`; this file's own fns don't, and
         # their span names the file.
@@ -5648,7 +5655,7 @@ class LLVMEmitter:
         message = (f"`{display}` is private to "
                    f"{os.path.basename(callee_file)}; mark it `pub` (#3413)")
         decl = callee_def.span
-        if decl is not None and not decl.file.startswith('<'):
+        if not decl.file.startswith('<'):
             message += (f"\n{callee_file}:{decl.line}:{decl.column}: note: "
                         f"`{display}` is declared here")
         raise EmitError(message, span)

@@ -460,8 +460,10 @@ class TrueAsyncGenerator:
             expr=struct_lit
         )
 
+        # The constructor stands for the async fn itself, so it carries its
+        # declaration span: a privacy refusal's note points there (#3925).
         return rast.FnDef(
-            span=self.dummy_span,
+            span=self.fn_def.span,
             name=self.fn_def.name,
             params=self.fn_def.params,
             ret_type=self._make_named_type(future_name),
@@ -590,13 +592,17 @@ class TrueAsyncGenerator:
             transformed_args = [transformer._transform_expr(arg) for arg in inner_expr.args]
 
             # var __future_N: foo_Future = foo(args)
+            # The call keeps its source spans: it is the user's call of
+            # `foo`, so a private `foo` of another file is refused here,
+            # at `foo` (#3925, LARB R45a).  `foo_poll` below is the
+            # compiler's own call and stays unchecked.
             create_future = rast.VarStmt(
                 span=self.dummy_span,
                 name=future_var,
                 type=self._make_named_type(future_type_name),
                 value=rast.Call(
-                    span=self.dummy_span,
-                    func=self._make_ident(fn_name),
+                    span=inner_expr.span,
+                    func=rast.Ident(span=inner_expr.func.span, name=fn_name),
                     args=transformed_args
                 )
             )
