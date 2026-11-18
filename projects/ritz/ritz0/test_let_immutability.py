@@ -248,6 +248,9 @@ struct Wrap
 struct Row
     pts: [2]Pt
 
+struct Nest
+    w: Wrap
+
 """
 
 
@@ -267,6 +270,10 @@ IMPLICIT_REJECTED = [
     # AGAST #2389: a bare `self:&` is the same borrow as `self:& Pt`.
     ("recv-small-bare", "let p = Pt { x: 1, y: 2 }\np.nudge()", "p"),
     ("recv-large-field-bare", "let b: Big = big_new()\nb.pt.nudge()", "b"),
+    # AGAST #3983: a field of a small `let`, and one two fields down.
+    ("recv-small-field-bare", "let w = Wrap { pt: Pt { x: 1, y: 2 }, pp: null }\nw.pt.nudge()", "w"),
+    ("recv-nested-field-bare",
+     "let n = Nest { w: Wrap { pt: Pt { x: 1, y: 2 }, pp: null } }\nn.w.pt.nudge()", "n"),
     ("recv-large", "let b: Big = big_new()\nb.bump()", "b"),
     ("recv-large-nested-field", "let b: Big = big_new()\nb.pt.bump()", "b"),
     ("recv-small-field", "let w = Wrap { pt: Pt { x: 1, y: 2 }, pp: null }\nw.pt.bump()", "w"),
