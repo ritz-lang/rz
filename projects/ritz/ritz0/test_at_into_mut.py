@@ -135,6 +135,8 @@ VALUES = {
     "in_a_field_target": "fn f(r: @C)\n    pc(^r).x = 3\n",
     "in_a_deref_target": "fn f(r: @i32)\n    *pi(^r) = 3\n",
     "in_an_index": "fn f(r: @C, a: @&[2]i32)\n    var b: [2]i32 = [0, 0]\n    b[mb(^r)] = 3\n",
+    # #4162: a cast says what the value is, here an `@C`, whatever it was cast from.
+    "cast": "fn f(p: *C) -> i32\n    mb(^p as @C)\n",
 }
 
 # ritz1 spells `Option<@&C>` as `Option$refmut_C` (#2384), so the payload is judged.
@@ -231,6 +233,7 @@ ALLOWED = {
     "mutable_into_mutable": ("fn g(m: @&C) -> i32\n    mb(m)\n", "g(@&c)", 3),
     "mutable_into_pointer": ("fn g(m: @&C) -> i32\n    pb(m)\n", "g(@&c)", 3),
     "pointer_into_mutable": ("fn g(p: *C) -> i32\n    mb(p)\n", "g(@&c)", 3),
+    "pointer_cast_to_mutable": ("fn g(p: *C) -> i32\n    mb(p as @&C)\n", "g(@&c)", 3),
     "pointer_into_shared": ("fn g(p: *C) -> i32\n    sb(p)\n", "g(@&c)", 1),
     "shared_held_in_a_pointer": ("fn g(r: @C) -> i32\n    let p: *C = r\n    mb(p)\n",
                                  "g(@c)", 3),
