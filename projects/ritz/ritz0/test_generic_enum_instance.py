@@ -411,13 +411,22 @@ def test_an_uninferable_constructor_is_refused_at_it(tmp_path, need_ritz1, compi
 
 # AGAST #3021: a generic enum's bare constructor whose slot names no instance
 # of it is refused at the constructor.  ritz1 lowered it to a call to an
-# undeclared `@Full`, and the link failed with no location.  ritz0 crashes
-# (`Unknown function: Full`): AGAST #3128.
-# name -> (main's body, line:col of the constructor)
+# undeclared `@Full`, and the link failed with no location.  ritz0 crashed
+# (`Unknown function: Full`, `Unknown identifier: Empty`, `Unknown function:
+# Some` for an untyped `let`), or, with a `Slot<i32>` elsewhere in the
+# program, built that instance whatever the slot: AGAST #3128.
+# name -> (fns before main, main's body, line:col of the constructor)
+H = "fn h(x: i64) -> i64\n    x\n"
 NO_INSTANCE = {
-    "non_enum_slot": ("    let a: i64 = Full(6)\n    0\n", "5:18"),
-    "another_builtins_payload": ("    let a: Option<i32> = Some(Full(6))\n    0\n", "5:31"),
-    "unit_variant_non_enum_slot": ("    let a: i64 = Empty\n    0\n", "5:18"),
+    "non_enum_slot": ("", "    let a: i64 = Full(6)\n    0\n", "5:18"),
+    "another_builtins_payload": ("", "    let a: Option<i32> = Some(Full(6))\n    0\n", "5:31"),
+    "unit_variant_non_enum_slot": ("", "    let a: i64 = Empty\n    0\n", "5:18"),
+    "statement": ("", "    Full(6)\n    0\n", "5:5"),
+    "unit_variant_statement": ("", "    Empty\n    0\n", "5:5"),
+    "non_enum_param": (H, "    h(Full(6))\n    0\n", "7:7"),
+    "untyped_builtins_payload": ("", "    let a = Some(Full(6))\n    0\n", "5:18"),
+    # Another `Slot<i32>` in the program is no slot for this one: ritz0 built it.
+    "statement_with_an_instance_elsewhere": (F, "    Full(6)\n    0\n", "9:5"),
 }
 
 
@@ -425,13 +434,13 @@ def _no_instance_message(variant):
     return f"can't infer the `Slot` instance `{variant}` builds: give its slot a `Slot<...>` type"
 
 
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(NO_INSTANCE))
 def test_a_constructor_no_slot_names_is_refused_at_it(tmp_path, need_ritz1, compiler, name):
     need_ritz1(compiler)
-    body, where = NO_INSTANCE[name]
+    fns, body, where = NO_INSTANCE[name]
     variant = "Empty" if "unit" in name else "Full"
-    src = SLOT + "fn main() -> i32\n" + body
+    src = SLOT + fns + "fn main() -> i32\n" + body
     path, ll = tmp_path / "main.ritz", tmp_path / "main.ll"
     path.write_text(src)
     comp = _emit(compiler, path, ll, tmp_path)

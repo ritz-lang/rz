@@ -3499,6 +3499,31 @@ class LLVMEmitter:
             return declarers[0]
         return self.variant_to_enum[name]
 
+    def _refuse_no_instance(self, expr: rast.Expr) -> None:
+        """A bare constructor (`Full(6)`, `Empty`) of a generic user enum
+        reaching here has no slot naming an instance of it: those take
+        _emit_enum_variant_with_type.  Refuse it at the constructor, as ritz1
+        (AGAST #3021, #3128); ritz0 raised `Unknown function: Full`, or built
+        whichever `Slot<..>` instance the program had.  `Some(Full(6))` with no
+        Option instance to build is refused at its `Full` the same way."""
+        while isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name = expr.func.name
+            if name not in ('Some', 'Ok', 'Err') or name in self.variant_to_enum:
+                break
+            expr = next((a for a in expr.args if isinstance(a, (rast.Call, rast.Ident))), None)
+        if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
+            name = expr.func.name
+        elif isinstance(expr, rast.Ident):
+            name = expr.name
+        else:
+            return
+        if self.variant_declarers.get(name):
+            return  # a concrete enum declaring it builds it (_bare_variant_enum)
+        for enum_name, variants in getattr(self, 'generic_types', {}).items():
+            if name in variants and enum_name not in ('Option', 'Result'):
+                raise EmitError(f"can't infer the `{enum_name}` instance `{name}` builds: "
+                                f"give its slot a `{enum_name}<...>` type", expr.span)
+
     def _check_variant_unambiguous(self, name: str, span: Optional[rast.Span]):
         """Reject a bare variant name two or more user enums declare (AGAST #2039).
 
@@ -9110,6 +9135,7 @@ class LLVMEmitter:
                 return ir.Constant(self.i32, 0)
 
             # Check if this is a unit variant (enum variant without parentheses)
+            self._refuse_no_instance(expr)
             if name in self.variant_to_enum:
                 self._check_variant_unambiguous(name, expr.span)
                 # Get the variant and check if it's a unit variant (no fields)
@@ -12500,6 +12526,7 @@ class LLVMEmitter:
         fname = call.func.name
 
         # Handle enum variant constructors: Some(x), None, Ok(v), Err(e)
+        self._refuse_no_instance(call)
         if fname in self.variant_to_enum:
             self._check_variant_unambiguous(fname, call.func.span)
             return self._emit_enum_variant_constructor(fname, call.args)
