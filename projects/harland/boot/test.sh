@@ -20,11 +20,16 @@
 #                         the clock starts, and a headless run stops QEMU as
 #                         soon as a verdict line (ALL TESTS PASSED, TESTS
 #                         FAILED, a panic or exception) appears.
-#   SKIP_BUILD=1          use the existing build outputs; build nothing
+#   SKIP_BUILD=1          use the existing build outputs; build nothing.
+#                         Otherwise harland and every package in
+#                         indium/initramfs.pkgs are built, and the initramfs
+#                         holds every ELF those packages built (--interactive
+#                         boots indium's init_interactive as /bin/init)
 #   OVMF_CODE=F           OVMF firmware to use (default: search the usual paths)
 #
 # Exit: 0 = pass; 1 = the boot failed or stopped below UEFI_MIN_MILESTONE;
-#       3 = a required tool is missing: a SETUP ERROR, as test_tier1_boot.sh.
+#       3 = a required tool is missing or a build failed: a SETUP ERROR, as
+#           test_tier1_boot.sh.
 
 set -e
 
@@ -61,9 +66,7 @@ DEBUG_ELF="$HARLAND_DIR/build/debug/harland.elf"
 
 if [ ! -f "$DEBUG_ELF" ] && [ "${SKIP_BUILD:-}" != 1 ]; then
     echo "Building harland..."
-    cd "$HARLAND_DIR/../.."
-    ./rz build harland
-    cd "$SCRIPT_DIR"
+    (cd "$HARLAND_DIR/../.." && ./rz build harland) || setup_error "build of harland failed"
 fi
 
 # Always copy from debug/ to avoid stale cached builds
@@ -127,9 +130,15 @@ SERIAL_LOG="$WORK/serial.log"
 INITRAMFS="$HARLAND_DIR/build/initramfs.qcow2"
 STORAGE="$HARLAND_DIR/build/storage-test.qcow2"
 
-# Indium and Prism directories
-INDIUM_DIR="$HARLAND_DIR/../indium"
-PRISM_DIR="$HARLAND_DIR/../prism"
+PROJECTS_DIR="$(cd "$HARLAND_DIR/.." && pwd)"
+ROOT_DIR="$(dirname "$PROJECTS_DIR")"
+
+# The packages in the initramfs: indium/initramfs.pkgs, the one list shared
+# with indium's Makefile, tools/mkiso.sh and tools/test_tier1_boot.sh
+# (AGAST #2759, #3615). init's suite spawns rzsh and prism's hello_gfx as
+# well as indium's binaries.
+USER_PKGS="$(sed -e 's/#.*//' "$PROJECTS_DIR/indium/initramfs.pkgs" | xargs)"
+[ -n "$USER_PKGS" ] || setup_error "no packages in $PROJECTS_DIR/indium/initramfs.pkgs"
 
 # Always recreate test storage disk (fresh for each test run)
 echo "Creating test storage disk (512MB)..."
@@ -139,26 +148,21 @@ qemu-img create -f qcow2 "$STORAGE" 512M >/dev/null
 if [ "${SKIP_BUILD:-}" != 1 ]; then
     # Build the Ritz runtime (required for harland userspace binaries)
     echo "Building ritz runtime..."
-    make -C "$HARLAND_DIR/../ritz/runtime" >/dev/null 2>&1 || {
+    make -C "$PROJECTS_DIR/ritz/runtime" >/dev/null 2>&1 || {
         echo "  Building runtime..."
-        make -C "$HARLAND_DIR/../ritz/runtime"
+        make -C "$PROJECTS_DIR/ritz/runtime" || setup_error "build of the ritz runtime failed"
     }
 
-    # Build indium userspace (init, hello, true, false, etc.)
-    echo "Building indium userspace..."
-    cd "$HARLAND_DIR/../.."
-    ./rz build indium 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
-    cd "$SCRIPT_DIR"
-
-    # Build prism (includes prism_demo)
-    echo "Building prism..."
-    cd "$HARLAND_DIR/../.."
-    ./rz build prism 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
-
-    # Build rzsh (Ritz shell)
-    echo "Building rzsh..."
-    ./rz build rzsh 2>&1 | grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true
-    cd "$SCRIPT_DIR"
+    # A failed build is a SETUP ERROR: booting the binaries an earlier build
+    # left behind would test something else (#3615).
+    for pkg in $USER_PKGS; do
+        echo "Building $pkg..."
+        # grep exits 1 when it filters every line: keep that out of
+        # PIPESTATUS[0], which is rz's.
+        (cd "$ROOT_DIR" && ./rz build "$pkg") 2>&1 \
+            | { grep -v "^  Compiling\|^  Assembling\|^  ⚡" || true; }
+        [ "${PIPESTATUS[0]}" -eq 0 ] || setup_error "build of $pkg failed"
+    done
 fi
 
 # Always rebuild initramfs with all binaries
@@ -170,14 +174,15 @@ mkdir -p "$INITRAMFS_TMP/bin"
 mkdir -p "$INITRAMFS_TMP/etc"
 mkdir -p "$INITRAMFS_TMP/var/log"
 
-# Copy all indium binaries
-echo "  Copying indium binaries..."
-for elf in "$INDIUM_DIR/build/debug"/*.elf; do
-    if [ -f "$elf" ]; then
+# Every ELF the listed packages build, as /bin/NAME
+for pkg in $USER_PKGS; do
+    echo "  Copying $pkg binaries..."
+    for elf in "$PROJECTS_DIR/$pkg/build/debug"/*.elf; do
+        [ -f "$elf" ] || continue
         name=$(basename "$elf" .elf)
         cp "$elf" "$INITRAMFS_TMP/bin/$name"
         echo "    /bin/$name"
-    fi
+    done
 done
 
 # For interactive mode, replace init with init_interactive
@@ -186,24 +191,6 @@ if [ "$INTERACTIVE" = true ]; then
         echo "  Using init_interactive for interactive mode"
         cp "$INITRAMFS_TMP/bin/init_interactive" "$INITRAMFS_TMP/bin/init"
     fi
-fi
-
-# Copy prism binaries
-if [ -f "$PRISM_DIR/build/debug/prism_demo.elf" ]; then
-    cp "$PRISM_DIR/build/debug/prism_demo.elf" "$INITRAMFS_TMP/bin/prism_demo"
-    echo "    /bin/prism_demo"
-fi
-
-if [ -f "$PRISM_DIR/build/debug/hello_gfx.elf" ]; then
-    cp "$PRISM_DIR/build/debug/hello_gfx.elf" "$INITRAMFS_TMP/bin/hello_gfx"
-    echo "    /bin/hello_gfx"
-fi
-
-# Copy rzsh
-RZSH_DIR="$HARLAND_DIR/../rzsh"
-if [ -f "$RZSH_DIR/build/debug/rzsh.elf" ]; then
-    cp "$RZSH_DIR/build/debug/rzsh.elf" "$INITRAMFS_TMP/bin/rzsh"
-    echo "    /bin/rzsh"
 fi
 
 # Create /etc/hostname
