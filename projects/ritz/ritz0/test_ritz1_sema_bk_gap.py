@@ -33,8 +33,8 @@ THE TESTS
 
 One program of integer conditions, one per shape, each wanting "must be bool,
 got an integer", not "cannot tell"; and one of `bool`s in the same shapes
-(but `KS[i]`, which ritz1's emitter can't index as a `const [N]bool`), which
-must compile.  Both failed before the change, row by row.
+(`KS[i]` too since #3949, when ritz1's emitter learnt to index a
+`const [N]bool`), which must compile.  Both failed before the change, row by row.
 """
 
 import re
@@ -88,8 +88,8 @@ fn main() -> i32
         (V, 2)
 """
 
-# One `if` per shape.  ritz1's emitter can't index a `const [N]bool` ("a whole
-# array is not a value here"), so `KS[1]` is the integer program's only.
+# One `if` per shape.  Both programs have every one: `KS[1]` of a `const [N]bool`
+# was the integer program's only until #3949.
 CONDITIONS = [
     "KS[1]",            # a const array's element
     "p[1]",             # `let p = pt()`, pt() -> *T
@@ -139,7 +139,7 @@ def test_an_integer_of_each_shape_is_reported_as_one(request, tmp_path, compiler
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_bool_of_each_shape_is_a_condition(request, tmp_path, compiler):
     request.getfixturevalue("ritz1_bin")
-    src, _ = _program("bool", "false", [c for c in CONDITIONS if not c.startswith("KS")])
+    src, _ = _program("bool", "false", CONDITIONS)
     comp, ll, _ = _compile(compiler, tmp_path, "bk_gap_bool", src)
     out = comp.stdout + comp.stderr
     assert comp.returncode == 0 and ll.exists(), f"{compiler} refused it:\n{out}"

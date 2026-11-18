@@ -137,6 +137,27 @@ pub fn main() -> i32
         return 10
     3
 """,
+    # AGAST #3949: ritz1 refused `KS[i]` of a `const [N]bool` ("a whole array
+    # is not a value here"); `[N]u8` always indexed.  A list and a fill, read
+    # into a `let`, as a condition and at a run-time index.
+    "bool_elem": """\
+const KS: [2]bool = [true, false]
+const KF: [3]bool = [true; 3]
+
+pub fn main() -> i32
+    let b: bool = KS[1]
+    if b
+        return 10
+    if not KS[0]
+        return 11
+    var i: i32 = 1
+    if KS[i] or not KF[i]
+        return 12
+    let c = KS[0]
+    if not c
+        return 13
+    3
+""",
     # SHA-256 / SHA-512 round constants: hex with the top bit set.
     "wide_hex": """\
 const K: [3]u32 = [0x428a2f98, 0xb5c0fbcf, 0xc67178f2]
