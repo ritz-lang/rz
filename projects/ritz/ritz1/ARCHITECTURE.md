@@ -190,7 +190,7 @@ still run mid-lowering on `*EmitterState`, and
 
 - `generic_method` — a free call to a generic impl's method (R37, §5.4).
 
-- `if_arm_value` — an if-expression arm must end in a value (§6.1, #1613).
+- `if_arm_value` — an if-expression arm must end in a value (§6.1, #1613), only where the value is wanted: a match statement's arms are statements (#3980).
 
 - `import_vis` — a plain `import` is private (§15.4, R54, #3891): a name
   that reaches the input only through another module's plain `import` is an

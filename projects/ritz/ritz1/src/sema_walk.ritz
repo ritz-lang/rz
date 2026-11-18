@@ -90,7 +90,8 @@ fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
 
 # `scrut` is the match's scrutinee; null for an if-expression's arms.  `owner`
 # is the EXPR_IF / EXPR_MATCH the arms are of; null for a match statement.
-fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr)
+# `discard`: the match / if's value is discarded, so its arms' are (#3980).
+fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discard: i32)
     var arm: *MatchArm = arms
     while arm != null
         let mark: i32 = sm.scope_top
@@ -130,6 +131,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr)
         if arm.is_pass == 0
             ref_loan_check_value(sm, arm.body)   # AGAST #3506
             ref_value_check_value(sm, arm.body)   # AGAST #3926
+        if_arm_discard_next(discard)
         sema_walk_expr(sm, arm.body)
         sema_note_arm_value(sm, owner, arm)   # after it: a nested `if`'s own note
         ref_loan_leave()
@@ -139,6 +141,7 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr)
 # Every sub-expression, for the probe; a match or an if/else expression's
 # arms hold statements.
 fn sema_walk_expr(sm: *Sema, e: *Expr)
+    let discard: i32 = if_arm_take_discard()   # AGAST #3980
     if e == null
         return
     sema_probe_record(sm, e)
@@ -152,12 +155,13 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
     else if k == EXPR_STRUCT_LIT
         sema_vis_use(sm, e.span.line, e.span.col, e.ident_ptr, e.ident_len)
     if k == EXPR_MATCH or k == EXPR_IF
-        if_arm_check(sm, e)   # AGAST #1613 / #3512: both arms, before the condition
+        if discard == 0
+            if_arm_check(sm, e)   # AGAST #1613 / #3512: both arms, before the condition
         sema_walk_expr(sm, e.left)
         var scrut: *Expr = null
         if k == EXPR_MATCH
             scrut = e.left
-        sema_walk_arms(sm, scrut, e.args as *MatchArm, e)
+        sema_walk_arms(sm, scrut, e.args as *MatchArm, e, discard)
     else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
         if k == EXPR_INDEX
             index_scalar_check(sm, e)   # AGAST #3755
@@ -258,6 +262,7 @@ fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
 
 # sema_walk_stmts, leaving what the block binds in scope for the caller to drop.
 fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
+    let tail_value: i32 = if_arm_take_tail()   # AGAST #3980
     var st: *Stmt = first
     while st != null
         pass_value_check(sm, st)   # AGAST #3759
@@ -313,17 +318,23 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         else if st.kind == STMT_IF
             bool_check_cond(sm, st.if_cond, c"if condition")
             sema_walk_expr(sm, st.if_cond)
+            let in_tail: i32 = (tail_value == 1 and st.next == null) as i32
+            if_arm_want_tail(in_tail)
             sema_walk_stmts(sm, st.if_then, 0)
+            if_arm_want_tail(in_tail)
             sema_walk_stmts(sm, st.if_else, 0)
         else if st.kind == STMT_WHILE
             bool_check_cond(sm, st.while_cond, c"while condition")
             sema_walk_expr(sm, st.while_cond)
             sema_walk_stmts(sm, st.while_body, 0)
         else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
+            if_arm_want_tail((st.kind == STMT_UNSAFE and tail_value == 1 and st.next == null) as i32)
             sema_walk_stmts(sm, st.while_body, 0)
         else if st.kind == STMT_MATCH
             sema_walk_expr(sm, st.if_cond)
-            sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm, null)
+            # AGAST #3980: its arms are values only if it is the block's.
+            let discard_m: i32 = (tail_value == 0 or st.next != null) as i32
+            sema_walk_arms(sm, st.if_cond, st.if_then as *MatchArm, null, discard_m)
         else if st.kind == STMT_RETURN
             bool_check_return(sm, st.return_value)
             if st.return_value != null
@@ -383,6 +394,7 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
     eai_begin_fn()
     ref_loan_begin_fn()
     ref_value_begin_fn(sm, f)   # AGAST #3926
+    if_arm_want_tail((f.return_type != TYPE_VOID) as i32)   # AGAST #3980
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
     tail_value_check(sm, f)   # AGAST #2236 / #3511, after call_check's notes
     sm.scope_top = 0
