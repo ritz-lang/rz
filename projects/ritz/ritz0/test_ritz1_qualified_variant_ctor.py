@@ -465,7 +465,7 @@ pub fn main() -> i32
     return 0
 """,
         ":11:",
-        "takes 1 payload",
+        "variant `Holds` takes 1 payload value(s), got 0",
     ),
     "unit_variant_with_payload": (
         OPT
@@ -475,7 +475,7 @@ pub fn main() -> i32
     return 0
 """,
         ":11:",
-        "takes no payload",
+        "variant `Vacant` takes 0 payload value(s), got 1",
     ),
 }
 

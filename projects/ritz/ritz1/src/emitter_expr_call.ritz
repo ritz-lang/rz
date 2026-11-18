@@ -2741,6 +2741,11 @@ fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
         # of is refused here; it called an undeclared `@Full`.  A fn of that
         # name is still the call.
         if find_fn(s, e.func_name, e.func_name_len) == null
+            # AGAST #4153: `Z(1)` / `One()`, a variant given the wrong count.
+            var mei: i32 = 0
+            var mvi: i32 = 0
+            if user_variant_ctor_miscounted(e, @mei, @mvi) == 1
+                return emit_payload_count_refusal(s, mei, mvi, e)
             return emit_no_instance_error(s, e.func_name, e.func_name_len, e.span)
         return 0
     var vi: i32 = 0
@@ -2758,16 +2763,15 @@ fn emit_qualified_variant_ctor(s: *EmitterState, e: *Expr, ei: i32, vi: i32) -> 
     var en_len: i32 = 0
     let en: *u8 = enum_name_at(ei, @en_len)
     let kind: i32 = enum_variant_kind(ei, vi)
-    if kind == ENUM_VARIANT_UNIT
-        if e.args != null
-            return emit_qualified_variant_error(s, e, c"takes no payload")
-        return emit_variant_build(s, en, en_len, vi, null)
     # AGAST #1295: a tuple variant, or a struct one built positionally, takes
-    # one value per field (emit_variant_build counts them, located).
+    # one value per field (emit_variant_build counts them, located); a unit
+    # variant none.  The rest is the count's error, as unqualified (#4153).
+    if kind == ENUM_VARIANT_UNIT
+        if e.args == null
+            return emit_variant_build(s, en, en_len, vi, null)
+        return emit_payload_count_refusal(s, ei, vi, e)
     if e.args == null
-        if enum_variant_field_count(ei, vi) == 1
-            return emit_qualified_variant_error(s, e, c"takes 1 payload value")
-        return emit_qualified_variant_error(s, e, c"takes one payload value per field")
+        return emit_payload_count_refusal(s, ei, vi, e)
     return emit_variant_build(s, en, en_len, vi, e.args)
 
 # The struct or enum a variant payload's register holds, null/0 for an i64-width
@@ -3078,6 +3082,39 @@ fn emit_variant_load(s: *EmitterState, slot: i32, enum_name: *u8, enum_name_len:
     emit_str(s, c"\n")
     result
 
+# "variant `V` takes N payload value(s), got M" for variant `vi` of enum `ei`
+# given the list `args`: at its first value, else at `call` (AGAST #4153).
+fn emit_payload_count_error(s: *EmitterState, ei: i32, vi: i32, args: *Expr, call: SrcSpan)
+    var na: i32 = 0
+    var a: *Expr = args
+    while a != null
+        na += 1
+        a = a.next
+    var at: SrcSpan = call
+    if args != null
+        at = args.span
+    emit_nd_error_begin(s, at.line, at.col)
+    eprints_cstr(c"variant `")
+    var vn_len: i32 = 0
+    let vn: *u8 = enum_variant_name(ei, vi, @vn_len)
+    eprint_bytes(vn, vn_len)
+    eprints_cstr(c"` takes ")
+    eprint_int(enum_variant_field_count(ei, vi) as i64)
+    eprints_cstr(c" payload value(s), got ")
+    eprint_int(na as i64)
+    eprints_cstr(c"\n")
+
+# The call `e` to variant `vi` of enum `ei`, refused with the count (AGAST
+# #4153).  Returns an i64 zero so the rest of the fn still emits; the error
+# stops the output.
+fn emit_payload_count_refusal(s: *EmitterState, ei: i32, vi: i32, e: *Expr) -> i32
+    emit_payload_count_error(s, ei, vi, e.args, e.span)
+    let z: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, z)
+    emit_str(s, c" = add i64 0, 0  ; miscounted variant payload (error)\n")
+    return z
+
 # Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
 # zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
 # where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
@@ -3094,16 +3131,7 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
             na += 1
             a = a.next
         if nf > 0 and na != nf
-            emit_nd_error_begin(s, payload_expr.span.line, payload_expr.span.col)
-            eprints_cstr(c"variant `")
-            var vn_len: i32 = 0
-            let vn: *u8 = enum_variant_name(ei, tag, @vn_len)
-            eprint_bytes(vn, vn_len)
-            eprints_cstr(c"` takes ")
-            eprint_int(nf as i64)
-            eprints_cstr(c" payload value(s), got ")
-            eprint_int(na as i64)
-            eprints_cstr(c"\n")
+            emit_payload_count_error(s, ei, tag, payload_expr, payload_expr.span)
         if nf > 1 and na == nf
             # Evaluated left to right, each straight into its field.
             let mslot: i32 = emit_variant_slot(s, enum_name, enum_name_len, tag)

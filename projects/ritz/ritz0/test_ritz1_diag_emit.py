@@ -50,10 +50,17 @@ ROWS = {
         "fn main() -> i32\n    let a: [3]i32 = [1, 2, 3]\n    let b: i64 = a\n    0\n",
         "3:18", "a whole array is not a value here (index it, copy it into an array "
         "of the same type, or take its address with @)", []),
-    # emit_qualified_variant_error
+    # emit_qualified_variant_error (a miscounted `E.B(3)` is payload_count's
+    # since AGAST #4153; a generic enum's qualified value still lands here)
     "qualified_variant": (
+        _SLOT + "fn main() -> i32\n    let a: Slot<i32> = Slot.Full(3)\n    0\n",
+        "6:24", "'Slot.Full' is a variant of a generic enum: a qualified generic enum "
+        "value is not supported (ritz0 rejects it too); write the unqualified form, "
+        "e.g. Some(x) / Ok(x) / None", []),
+    # emit_payload_count_error, at the first value (AGAST #4153)
+    "payload_count": (
         _PAYLOAD_E + "fn main() -> i32\n    let a: E = E.B(3)\n    0\n",
-        "6:16", "'E.B' takes no payload", []),
+        "6:20", "variant `B` takes 0 payload value(s), got 1", []),
     # emit_module_item_error
     "module_item": (
         "fn helper() -> i32\n    1\n\nfn main() -> i32\n    return util.helper()\n",

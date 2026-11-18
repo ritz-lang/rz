@@ -4176,7 +4176,8 @@ class LLVMEmitter:
                 return variant
         raise self._err(f"Unknown variant {variant_name} in enum {enum_name}")
 
-    def _emit_enum_variant_constructor(self, variant_name: str, args: List[rast.Expr]) -> ir.Value:
+    def _emit_enum_variant_constructor(self, variant_name: str, args: List[rast.Expr],
+                                       call_span=None) -> ir.Value:
         """Emit code to construct an enum variant value.
 
         For Some(42):
@@ -4196,7 +4197,7 @@ class LLVMEmitter:
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
         variant = self._get_enum_variant(enum_name, variant_name)
-        self._require_payload_count(variant_name, variant, args)
+        self._require_payload_count(variant_name, variant, args, call_span)
 
         # Allocate stack space for the enum
         # AGAST #1734: in the entry block, so a ctor in a loop body
@@ -4311,7 +4312,7 @@ class LLVMEmitter:
         """
         if isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident):
             variant_name = expr.func.name
-            return self._emit_enum_variant_constructor_for_type(variant_name, expr.args, enum_type_name)
+            return self._emit_enum_variant_constructor_for_type(variant_name, expr.args, enum_type_name, expr.span)
         elif isinstance(expr, rast.Ident):
             # Unit variant without parens
             return self._emit_enum_variant_constructor_for_type(expr.name, [], enum_type_name)
@@ -4432,7 +4433,8 @@ class LLVMEmitter:
         finally:
             self.expected_ritz_type = saved
 
-    def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str) -> ir.Value:
+    def _emit_enum_variant_constructor_for_type(self, variant_name: str, args: List[rast.Expr], enum_name: str,
+                                                call_span=None) -> ir.Value:
         """Emit code to construct an enum variant for a specific enum type.
 
         This is like _emit_enum_variant_constructor but uses the specified
@@ -4444,7 +4446,7 @@ class LLVMEmitter:
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
         variant = self._get_enum_variant(enum_name, variant_name)
-        self._require_payload_count(variant_name, variant, args)
+        self._require_payload_count(variant_name, variant, args, call_span)
 
         # Allocate stack space for the enum
         # AGAST #1734: in the entry block, so a ctor in a loop body
@@ -13271,7 +13273,7 @@ class LLVMEmitter:
         self._refuse_no_instance(call)
         if fname in self.variant_to_enum:
             self._check_variant_unambiguous(fname, call.func.span)
-            return self._emit_enum_variant_constructor(fname, call.args)
+            return self._emit_enum_variant_constructor(fname, call.args, call.span)
 
         # Handle __builtin_alloca
         if fname == '__builtin_alloca':
@@ -14803,7 +14805,7 @@ class LLVMEmitter:
                     and enum_name not in self.params
                     and self._has_enum_variant(enum_name, expr.method)):
                 return self._emit_enum_variant_constructor_for_type(
-                    expr.method, expr.args, enum_name)
+                    expr.method, expr.args, enum_name, expr.span)
 
         # First, check if the receiver is an lvalue (identifier, field, index)
         # If so, get its address for auto-borrowing when method expects *Self
@@ -17371,20 +17373,22 @@ class LLVMEmitter:
                 f"variant '{pattern.name}' has {has} {noun}, but this pattern "
                 f"lists {len(pattern.fields)}", pattern.span)
 
-    def _require_payload_count(self, variant_name: str, variant, args: List[rast.Expr]) -> None:
+    def _require_payload_count(self, variant_name: str, variant, args: List[rast.Expr],
+                               call_span=None) -> None:
         """A variant constructor takes one value per field (AGAST #3992).
 
         The constructors zip the two, so `Rect(1)` on `Rect(i64, i64)` left
         the second field unwritten and `Rect(1, 2, 3)` dropped the third, both
         silently. The constructor twin of _require_field_count, said at the
-        first value with ritz1's message (#1295). As in ritz1, a bare variant
-        and a call with no values have no list to count.
+        first value with ritz1's message (#1295). `call_span` is the call's,
+        None for a bare `Z`: a call's list is counted whatever its length, so
+        `Z(1)` and `One()` are refused at the call too (#4153).
         """
         has = len(variant.fields)
-        if has and args and len(args) != has:
+        if (call_span or args) and len(args) != has:
             raise EmitError(
                 f"variant `{variant_name}` takes {has} payload value(s), "
-                f"got {len(args)}", args[0].span)
+                f"got {len(args)}", args[0].span if args else call_span)
 
     def _refuse_payload_pattern(self, pattern: rast.VariantPattern) -> None:
         """A variant's payload pattern is a name or `_` (LARB R76; §8.2).

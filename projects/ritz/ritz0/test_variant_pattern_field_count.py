@@ -131,10 +131,17 @@ def test_every_field_binds(tmp_path, request, compiler):
 
 # AGAST #1295: a constructor takes one value per field too, said at the first
 # value.  ritz0 zipped the two and built a short or long list silently (#3992).
+# name -> (constructor, column, variant, has, got).  AGAST #4153: a bare variant
+# given values, and a payload variant given none, said at the call: ritz0 dropped
+# `Dot(1)`'s value and left `Rect()`'s fields unwritten, and ritz1 said
+# "Unknown function".
 CTOR_ROWS = {
-    "short": ("Rect(1)", 18, 1),
-    "long": ("Rect(1, 2, 3)", 18, 3),
-    "qualified_short": ("Shape.Rect(1)", 24, 1),
+    "short": ("Rect(1)", 18, "Rect", 2, 1),
+    "long": ("Rect(1, 2, 3)", 18, "Rect", 2, 3),
+    "qualified_short": ("Shape.Rect(1)", 24, "Rect", 2, 1),
+    "values_to_a_bare_variant": ("Dot(1)", 17, "Dot", 0, 1),
+    "none_to_a_payload_variant": ("Rect()", 13, "Rect", 2, 0),
+    "qualified_none_to_a_payload_variant": ("Shape.Rect()", 13, "Rect", 2, 0),
 }
 
 
@@ -142,12 +149,12 @@ CTOR_ROWS = {
 @pytest.mark.parametrize("compiler,name", [
     pytest.param(c, n, id=f"{c}-{n}") for n in sorted(CTOR_ROWS) for c in ALL])
 def test_a_variant_constructor_takes_every_field(request, tmp_path, compiler, name):
-    ctor, col, got = CTOR_ROWS[name]
-    source = f"enum Shape\n    Circle(i64)\n    Rect(i64, i64)\n\nfn main() -> i32\n    let s = {ctor}\n    0\n"
+    ctor, col, variant, has, got = CTOR_ROWS[name]
+    source = f"enum Shape\n    Circle(i64)\n    Rect(i64, i64)\n    Dot\n\nfn main() -> i32\n    let s = {ctor}\n    0\n"
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted {ctor}:\n{out[-1500:]}"
     sep = "" if compiler == "ritz0" else "error: "   # diag (AGAST #3621)
-    want = f"unit.ritz:6:{col}: {sep}variant `Rect` takes 2 payload value(s), got {got}"
+    want = f"unit.ritz:7:{col}: {sep}variant `{variant}` takes {has} payload value(s), got {got}"
     assert want in out, f"{compiler}, {name}: want {want!r}:\n{out[-1500:]}"
     assert not ll.exists(), f"{compiler} wrote IR for {ctor}"
