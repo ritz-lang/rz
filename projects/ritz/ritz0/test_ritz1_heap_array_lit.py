@@ -8,7 +8,9 @@ padded-size canary):
 
 - generic_infer bound no T from an array literal.  It now binds the `[N]E`
   ritz0 does (gi_array_lit_type): for `heap`, and since AGAST #4159 for an
-  ordinary call's argument too, as ritz0 has since #3554 (`call_*`).
+  ordinary call's argument too, as ritz0 has since #3554 (`call_*`).  Since
+  AGAST #4178 a nested literal binds `[N][M]E` (`call_nested`), and a by-value
+  `[N][M]E` param takes a nested literal or fill.
 - The instance's `let p: *T` at T = `[N]S` names S (monomorph, #2832), and
   the let bound any named `*X` as a `*S` struct pointer, so `*p = value`
   refused the array: "a whole array is not a value here".  `instance_store`.
@@ -39,6 +41,9 @@ fn put<T>(value: T) -> *T
 
 fn size<T>(value: T) -> i64
     sizeof(T) as i64
+
+fn corner(m: [2][2]i64) -> i64
+    m[1][0]
 
 """
 
@@ -91,6 +96,20 @@ PROGRAMS = {
         "        return 1\n"
         "    0\n"
     ),
+    # AGAST #4178: a nested literal is `[2][2]i64` (32 bytes), inferred or
+    # written, as ritz0's ArrayLit rule recurses into the first element.
+    "call_nested": (
+        "    if size([ [1, 2], [3, 4] ]) != 32\n"
+        "        return 1\n"
+        "    if size<[2][2]i64>([ [1, 2], [3, 4] ]) != 32\n"
+        "        return 2\n"
+        "    let x: i32 = 3\n"
+        "    if size([ [x, 5], [6, 7], [8, 9] ]) != 24\n"
+        "        return 3\n"
+        "    if corner([ [1, 2], [x as i64, 4] ]) != 3 or corner([ [7; 2]; 2]) != 7\n"
+        "        return 4\n"
+        "    0\n"
+    ),
 }
 
 
@@ -101,18 +120,3 @@ def test_heap_array_holds_its_elements(tmp_path, compiler, name):
     program = HEAD + "pub fn main() -> i32\n" + PROGRAMS[name]
     assert _run_pkg(compiler, tmp_path, name, program) == 0
 
-
-# A nested literal binds no T on ritz1: a `[2][2]i64` type argument has no
-# spelling there, written or inferred, where ritz0 binds it.  Strict, so
-# closing the gap flips these red (AGAST #4178).
-NESTED = HEAD + "pub fn main() -> i32\n    let n = size([ [1, 2], [3, 4] ])\n    0\n"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
-def test_ritz1_nested_array_literal_binds_no_t(tmp_path, ritz1_bin, compiler):
-    binary = {"ritz1": ritz1_bin, "ritz1_selfhosted": SELFHOSTED_BIN}[compiler]
-    comp, _, _ = _compile(compiler, binary, tmp_path, "nested", NESTED)
-    out = comp.stdout + comp.stderr
-    assert comp.returncode != 0, out
-    assert "can't infer `T` for `size`" in out, out
