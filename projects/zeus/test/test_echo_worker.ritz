@@ -14,7 +14,7 @@ import zeus.control
 import zeus.ring
 import zeus.arena
 import zeus.worker
-import zeus.echo_handler { echo_serve_request }
+import zeus.echo_handler { echo_serve_request, echo_parse_args }
 
 # Put a request for `path` (NUL-terminated) in the next request slot,
 # with the path in that slot's arena partition, as valet does.
@@ -167,4 +167,48 @@ fn test_echo_full_ring_leaves_request_unacked() -> i32
 
     worker_destroy(@ctx)
     shm_destroy(@region)
+    return 0
+
+# ============================================================================
+# echo_worker <shm_size> <worker_id> (AGAST #4038)
+# ============================================================================
+# The old inline digit loops wrapped on overflow and read any byte as a
+# digit.  echo_parse_args takes shm_size in 1..i64::MAX and worker_id in
+# 0..i32::MAX, and leaves both outputs alone on failure.
+
+fn echo_reads(size_s: *u8, id_s: *u8, want_size: i64, want_id: i32) -> bool
+    var size: i64 = 77
+    var id: i32 = 77
+    return echo_parse_args(size_s, id_s, @size, @id) == 1 and size == want_size and id == want_id
+
+fn echo_rejects(size_s: *u8, id_s: *u8) -> bool
+    var size: i64 = 77
+    var id: i32 = 77
+    return echo_parse_args(size_s, id_s, @size, @id) == 0 and size == 77 and id == 77
+
+[[test]]
+fn test_echo_parse_args_reads() -> i32
+    assert echo_reads(c"2097152", c"3", 2097152, 3)
+    assert echo_reads(c"9223372036854775807", c"0", 9223372036854775807, 0)
+    assert echo_reads(c"1", c"2147483647", 1, 2147483647)
+    return 0
+
+[[test]]
+fn test_echo_parse_args_bad_shm_size() -> i32
+    # Old loop: i64::MAX + 1 wrapped to i64::MIN; '-' and 'k' read as digits
+    assert echo_rejects(c"9223372036854775808", c"0")
+    assert echo_rejects(c"-9223372036854775808", c"0")
+    assert echo_rejects(c"0", c"0")
+    assert echo_rejects(c"64k", c"0")
+    assert echo_rejects(c"", c"0")
+    return 0
+
+[[test]]
+fn test_echo_parse_args_bad_worker_id() -> i32
+    # Old loop: 2147483648 wrapped to i32::MIN
+    assert echo_rejects(c"4096", c"2147483648")
+    assert echo_rejects(c"4096", c"9223372036854775808")
+    assert echo_rejects(c"4096", c"-1")
+    assert echo_rejects(c"4096", c"-9223372036854775808")
+    assert echo_rejects(c"4096", c"x")
     return 0
