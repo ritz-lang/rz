@@ -241,8 +241,9 @@ CORPUS_FLOOR = 15000
 # payload (#3510's), a struct match payload's field,
 # `(*(@x)).f` where the emitter is the unsure side, and `K[i]` of a const
 # array of structs, which the emitter's get_expr_type guesses is an i64 (a
-# guess that refused good programs when Sema copied it).  Lower it as they go.
-BK_GAP_CEILING = 29
+# guess that refused good programs when Sema copied it).  28 at #3974, which
+# types `c?` as its Ok / Some struct.  Lower it as they go.
+BK_GAP_CEILING = 28
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
