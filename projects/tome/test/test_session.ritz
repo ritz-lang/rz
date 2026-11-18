@@ -139,3 +139,59 @@ fn test_session_oversized_request_closes() -> i32
         return 2
     session_free(s)
     return 0
+
+
+# A set whose SMEMBERS reply is `n` bulk strings of 100 bytes (108 each).
+fn fill_set(store: *Store, n: i32)
+    var member: [104]u8
+    memset(@member[0], 97, 100)
+    member[100] = 0
+    for i in 0..n
+        member[0] = (48 + i / 100) as u8
+        member[1] = (48 + (i / 10) % 10) as u8
+        member[2] = (48 + i % 10) as u8
+        store_sadd_cstr(store, c"big", @member[0])
+
+
+[[test]]
+fn test_session_big_reply_waits_for_flush() -> i32
+    # A ~54 KiB reply fits the output buffer only once the ~20 KiB ECHO
+    # reply queued ahead of it has gone out (AGAST #3068).
+    var store: Store = store_new()
+    fill_set(@store, 500)
+    let s: *Session = session_new(@store, null)
+    feed(s, c"*2\r\n$4\r\nECHO\r\n$20000\r\n")
+    memset(session_recv_ptr(s), 98, 20000)
+    session_received(s, 20000)
+    feed(s, c"\r\nSMEMBERS big\r\n")
+    if session_process(s) != 1
+        return 1
+    if session_pending_len(s) != 20000 + 10
+        return 2
+    session_sent(s, session_pending_len(s))
+    if session_process(s) != 1
+        return 3
+    if session_pending_len(s) != 6 + 500 * 108
+        return 4
+    if *session_pending_ptr(s) != 42  # '*'
+        return 5
+    session_free(s)
+    return 0
+
+
+[[test]]
+fn test_session_too_large_reply_errors() -> i32
+    # ~75 KiB can never fit: an error, and the connection carries on.
+    var store: Store = store_new()
+    fill_set(@store, 700)
+    let s: *Session = session_new(@store, null)
+    feed(s, c"SMEMBERS big\r\nPING\r\n")
+    if session_process(s) != 2
+        return 1
+    if output_is(s, c"-ERR reply too large\r\n+PONG\r\n") != 0
+        return 2
+    session_sent(s, session_pending_len(s))
+    if session_should_close(s) != 0
+        return 3
+    session_free(s)
+    return 0

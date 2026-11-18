@@ -30,9 +30,9 @@ import lib.commands
 
 pub const SESSION_IN_CAP: i64 = 65536
 pub const SESSION_OUT_CAP: i64 = 65536
-# Room a command may need for its reply.  No handler bounds-checks its
-# writes, so a command only runs while this much output space is free
-# (a GET of the largest SET value, 8 KiB, fits with plenty to spare).
+# Output space that must be free before a command runs.  Handlers
+# bounds-check their replies (AGAST #3068), so this is not a safety limit:
+# it keeps the common small replies from being retried (see below).
 const SESSION_OUT_RESERVE: i64 = 24576
 
 
@@ -141,6 +141,13 @@ pub fn session_process(s: *Session) -> i32
         var ctx: CommandContext
         cmd_ctx_init_auth(@ctx, s.store, @s.out_buf[0] + s.out_len, (SESSION_OUT_CAP - s.out_len) as i32, s.password, s.is_authenticated)
         cmd_dispatch(@ctx, @parser.command)
+        if ctx.overflow != 0 and s.out_len > 0
+            # The reply did not fit beside the replies already queued:
+            # drop it, send those, and run the command again with the
+            # whole buffer.  Safe because only read-only commands (ECHO,
+            # LRANGE, SMEMBERS, H*) can produce a reply bigger than
+            # SESSION_OUT_RESERVE; any write's reply fits in the reserve.
+            break
         s.is_authenticated = ctx.is_authenticated
         s.out_len += ctx.resp_len as i64
         consumed += parser.pos

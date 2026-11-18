@@ -504,3 +504,76 @@ fn test_cmd_incr_rejects() -> i32
     if reply_is(@store, c"INCR\r\n", c"-ERR wrong number of arguments for 'incr' command\r\n") != 0
         return 10
     return 0
+
+
+# ============================================================================
+# Replies stay inside resp_cap (AGAST #3068)
+# ============================================================================
+# A 64-byte cap inside a 128-byte buffer: every byte past the cap is a
+# canary that a reply overrunning resp_cap would clobber.
+
+const SMALL_CAP: i32 = 64
+const TOO_LARGE: *u8 = c"-ERR reply too large\r\n"
+
+fn exec_capped(store: *Store, input: *u8, buf: *u8) -> i32
+    memset(buf, 33, 128)  # '!'
+    var parser: RespParser
+    resp_parser_init(@parser, input, strlen(input))
+    if resp_parse(@parser) != RESP_OK
+        return 1
+    var ctx: CommandContext
+    cmd_ctx_init(@ctx, store, buf, SMALL_CAP)
+    cmd_dispatch(@ctx, @parser.command)
+    for i in SMALL_CAP..128
+        if *(buf + i) != 33
+            return 2  # wrote past resp_cap
+    if ctx.resp_len != strlen(TOO_LARGE) as i32
+        return 3
+    if memcmp(buf, TOO_LARGE, strlen(TOO_LARGE)) != 0
+        return 4
+    return 0
+
+
+[[test]]
+fn test_cmd_collection_reply_respects_cap() -> i32
+    var store: Store = store_new()
+    var name: [4]u8
+    name[0] = 109  # 'm'
+    name[2] = 0
+    for i in 0..20
+        name[1] = (97 + i) as u8
+        store_sadd_cstr(@store, c"s", @name[0])
+        store_rpush_cstr(@store, c"l", @name[0])
+        store_hset_cstr(@store, c"h", @name[0], @name[0])
+    var buf: [128]u8
+    if exec_capped(@store, c"SMEMBERS s\r\n", @buf[0]) != 0
+        return 1
+    if exec_capped(@store, c"LRANGE l 0 -1\r\n", @buf[0]) != 0
+        return 2
+    if exec_capped(@store, c"HKEYS h\r\n", @buf[0]) != 0
+        return 3
+    if exec_capped(@store, c"HVALS h\r\n", @buf[0]) != 0
+        return 4
+    if exec_capped(@store, c"HGETALL h\r\n", @buf[0]) != 0
+        return 5
+    return 0
+
+
+[[test]]
+fn test_cmd_bulk_reply_respects_cap() -> i32
+    var store: Store = store_new()
+    var buf: [128]u8
+    let big: *u8 = c"ECHO aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n"
+    if exec_capped(@store, big, @buf[0]) != 0
+        return 1
+    # A reply that fits is untouched by the check.
+    memset(@buf[0], 0, 128)
+    var parser: RespParser
+    resp_parser_init(@parser, c"ECHO hi\r\n", 9)
+    resp_parse(@parser)
+    var ctx: CommandContext
+    cmd_ctx_init(@ctx, @store, @buf[0], SMALL_CAP)
+    cmd_dispatch(@ctx, @parser.command)
+    if strcmp(@buf[0], c"$2\r\nhi\r\n") != 0
+        return 2
+    return 0

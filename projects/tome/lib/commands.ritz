@@ -45,6 +45,7 @@ struct CommandContext
     resp_cap: i32       # Capacity of buffer
     password: *u8       # Required password (null = no auth required)
     is_authenticated: i32   # 1 if client is authenticated, 0 otherwise
+    overflow: i32       # 1 if the reply did not fit resp_cap (see ctx_too_large)
 
 
 # Initialize command context (no auth - backwards compatible)
@@ -55,6 +56,7 @@ pub fn cmd_ctx_init(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32)
     ctx.resp_cap = cap
     ctx.password = null
     ctx.is_authenticated = 1  # No auth required = already authenticated
+    ctx.overflow = 0
 
 
 # Initialize command context with authentication
@@ -65,30 +67,94 @@ pub fn cmd_ctx_init_auth(ctx: *CommandContext, store: *Store, buf: *u8, cap: i32
     ctx.resp_cap = cap
     ctx.password = password
     ctx.is_authenticated = is_authenticated
+    ctx.overflow = 0
 
+
+# Every reply goes through these helpers, and each one checks that the
+# whole reply fits resp_cap before writing a byte of it (AGAST #3068: list
+# replies such as SMEMBERS had no bound and ran off the end of the buffer).
+# A reply that does not fit becomes ctx_too_large's error instead.
+
+# Upper bound on a RESP frame with `len` payload bytes: a type byte, up to
+# 20 length digits plus a sign, and two CRLFs.
+const RESP_FRAME_OVERHEAD: i64 = 26
+
+fn ctx_fits(ctx: *CommandContext, payload: i64) -> bool
+    return payload + RESP_FRAME_OVERHEAD <= ctx.resp_cap as i64
+
+# Answer "-ERR reply too large" and flag the overflow.  A session that has
+# other replies queued uses the flag to retry the command once they are
+# sent (session_process), so only replies bigger than the whole output
+# buffer reach the client as this error.
+fn ctx_too_large(ctx: *CommandContext)
+    ctx.overflow = 1
+    let err: StrView = "ERR reply too large"
+    if ctx_fits(ctx, err.len)
+        ctx.resp_len = resp_write_error_sv(ctx.resp_buf, err)
+    else
+        ctx.resp_len = 0
 
 # Write response helpers (C-string versions - for FFI compatibility)
 fn ctx_write_simple(ctx: *CommandContext, s: *u8)
+    if not ctx_fits(ctx, strlen(s))
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_simple(ctx.resp_buf, s)
 
 fn ctx_write_error(ctx: *CommandContext, s: *u8)
+    if not ctx_fits(ctx, strlen(s))
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_error(ctx.resp_buf, s)
 
 # Write response helpers (StrView versions - preferred)
 fn ctx_write_simple_sv(ctx: *CommandContext, s: StrView)
+    if not ctx_fits(ctx, s.len)
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_simple_sv(ctx.resp_buf, s)
 
 fn ctx_write_error_sv(ctx: *CommandContext, s: StrView)
+    if not ctx_fits(ctx, s.len)
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_error_sv(ctx.resp_buf, s)
 
 fn ctx_write_int(ctx: *CommandContext, n: i64)
+    if not ctx_fits(ctx, 0)
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_i64(ctx.resp_buf, n)
 
 fn ctx_write_bulk(ctx: *CommandContext, data: *u8, len: i64)
+    if not ctx_fits(ctx, len)
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_bulk(ctx.resp_buf, data, len)
 
 fn ctx_write_null(ctx: *CommandContext)
+    if not ctx_fits(ctx, 0)
+        ctx_too_large(ctx)
+        return
     ctx.resp_len = resp_write_null(ctx.resp_buf)
+
+# Write an array of `count` bulk strings (NUL-terminated items), then free
+# the `items` array (the strings are borrowed).  The size of the whole reply
+# is checked before anything is written.
+fn ctx_write_bulk_array(ctx: *CommandContext, items: **u8, count: i64)
+    var need: i64 = RESP_FRAME_OVERHEAD
+    for i in 0..count
+        need += strlen(*(items + i)) + RESP_FRAME_OVERHEAD
+    if need > ctx.resp_cap as i64
+        ctx_too_large(ctx)
+    else
+        var pos: i32 = resp_write_array(ctx.resp_buf, count)
+        for i in 0..count
+            let v: *u8 = *(items + i)
+            pos += resp_write_bulk(ctx.resp_buf + pos, v, strlen(v))
+        ctx.resp_len = pos
+    if items != null
+        free(items as *u8)
 
 
 # ============================================================================
@@ -203,7 +269,7 @@ fn cmd_incr(ctx: *CommandContext, cmd: *RespCommand, delta: i64, name: *u8) -> i
     if cmd.argc != 2
         var err: [96]u8
         argc_error(@err[0], name)
-        ctx.resp_len = resp_write_error(ctx.resp_buf, @err[0])
+        ctx_write_error(ctx, @err[0])
         return CMD_ERR_ARGC
     return incr_by(ctx, cmd, delta)
 
@@ -213,7 +279,7 @@ fn cmd_incrby(ctx: *CommandContext, cmd: *RespCommand, sign: i64, name: *u8) -> 
     if cmd.argc != 3
         var err: [96]u8
         argc_error(@err[0], name)
-        ctx.resp_len = resp_write_error(ctx.resp_buf, @err[0])
+        ctx_write_error(ctx, @err[0])
         return CMD_ERR_ARGC
     var by: i64 = 0
     let arg: *RespArg = @cmd.args[2]
@@ -544,17 +610,7 @@ fn cmd_lrange(ctx: *CommandContext, cmd: *RespCommand) -> i32
     var count: i64 = 0
     let results: **u8 = store_lrange(ctx.store, key_sv, start, stop, @&count)
 
-    # Write array response
-    var pos: i32 = resp_write_array(ctx.resp_buf, count)
-    for i in 0..count
-        let v: *u8 = *(results + i)
-        let vlen: i64 = strlen(v)
-        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
-    ctx.resp_len = pos
-
-    # Free the results array (strings are borrowed, not owned)
-    if results != null
-        free(results as *u8)
+    ctx_write_bulk_array(ctx, results, count)
     return CMD_OK
 
 
@@ -675,16 +731,7 @@ fn cmd_smembers(ctx: *CommandContext, cmd: *RespCommand) -> i32
     var count: i64 = 0
     let results: **u8 = store_smembers(ctx.store, key_sv, @&count)
 
-    # Write array response
-    var pos: i32 = resp_write_array(ctx.resp_buf, count)
-    for i in 0..count
-        let v: *u8 = *(results + i)
-        let vlen: i64 = strlen(v)
-        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
-    ctx.resp_len = pos
-
-    if results != null
-        free(results as *u8)
+    ctx_write_bulk_array(ctx, results, count)
     return CMD_OK
 
 
@@ -834,15 +881,7 @@ fn cmd_hkeys(ctx: *CommandContext, cmd: *RespCommand) -> i32
     var count: i64 = 0
     let results: **u8 = store_hkeys(ctx.store, key_sv, @&count)
 
-    var pos: i32 = resp_write_array(ctx.resp_buf, count)
-    for i in 0..count
-        let v: *u8 = *(results + i)
-        let vlen: i64 = strlen(v)
-        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
-    ctx.resp_len = pos
-
-    if results != null
-        free(results as *u8)
+    ctx_write_bulk_array(ctx, results, count)
     return CMD_OK
 
 
@@ -860,15 +899,7 @@ fn cmd_hvals(ctx: *CommandContext, cmd: *RespCommand) -> i32
     var count: i64 = 0
     let results: **u8 = store_hvals(ctx.store, key_sv, @&count)
 
-    var pos: i32 = resp_write_array(ctx.resp_buf, count)
-    for i in 0..count
-        let v: *u8 = *(results + i)
-        let vlen: i64 = strlen(v)
-        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
-    ctx.resp_len = pos
-
-    if results != null
-        free(results as *u8)
+    ctx_write_bulk_array(ctx, results, count)
     return CMD_OK
 
 
@@ -887,16 +918,7 @@ fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
     # store_hgetall returns interleaved key,val,key,val...
     let results: **u8 = store_hgetall(ctx.store, key_sv, @&count)
 
-    # Response is array of count elements (already interleaved)
-    var pos: i32 = resp_write_array(ctx.resp_buf, count)
-    for i in 0..count
-        let v: *u8 = *(results + i)
-        let vlen: i64 = strlen(v)
-        pos += resp_write_bulk(ctx.resp_buf + pos, v, vlen)
-    ctx.resp_len = pos
-
-    if results != null
-        free(results as *u8)
+    ctx_write_bulk_array(ctx, results, count)
     return CMD_OK
 
 
