@@ -307,21 +307,16 @@ pub fn main() -> i32
 """,
 }
 
-ALL_RUNNABLE = {**BROKEN_FORMS, **WORKING_FORMS}
-
-# --- ritz1-only forms --------------------------------------------------------
-# ritz0 lowers only a `"..."` here, not `c"..."` (#2357; ritz1 points both at
-# the literal's `@.str`), so there is no oracle: the program checks its own
-# value and returns 3 when it matches.
-
-RITZ1_ONLY_BROKEN_FORMS = {
-    "cstring": """\
+# A `c"..."` initializer: ritz1 since #2357, ritz0 since #3051. Both point it
+# at the literal's `@.str`; the program checks its own value and returns 3.
+BROKEN_FORMS["cstring"] = """\
 var g: *u8 = c"A"
 
 pub fn main() -> i32
     return (*g as i32) - 62
-""",
-}
+"""
+
+ALL_RUNNABLE = {**BROKEN_FORMS, **WORKING_FORMS}
 
 # The #1540 forms, also run on ritz1_selfhosted.
 FORMS_1540 = ("const_ident", "const_negative", "const_later_derived", "const_bool")
@@ -533,13 +528,6 @@ def test_ritz1_global_starts_at_initializer(ritz1_bin, tmp_path, name):
 def test_ritz1_zero_and_absent_initializers(ritz1_bin, tmp_path, name):
     """Zero/null/absent initializers worked by accident before; pin them."""
     assert _run("ritz1", tmp_path, name, WORKING_FORMS[name]) == 3
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(RITZ1_ONLY_BROKEN_FORMS))
-def test_ritz1_only_global_starts_at_initializer(ritz1_bin, tmp_path, name):
-    """A c-string initializer; before the fix it read 0."""
-    assert _run("ritz1", tmp_path, name, RITZ1_ONLY_BROKEN_FORMS[name]) == 3
 
 
 @pytest.mark.integration

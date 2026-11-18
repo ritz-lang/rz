@@ -201,6 +201,19 @@ pub fn main() -> i32
     return T[0] + 6
 """
 
+# AGAST #2357: `[N]*u8` elements point at their literals' `@.str`, or are null.
+PTR_ELEMENTS = """\
+const T: [3]*u8 = [c"A", c"BC", null]
+
+pub fn main() -> i32
+    if T[2] != null
+        return 1
+    return (*T[1] as i32) - 63
+"""
+
+# ritz0 lowers `c"..."` elements too since AGAST #3051, so they join FORMS.
+FORMS["ptr_elems"] = PTR_ELEMENTS
+
 RITZ0_ONLY_FORMS = {
     "cast_char": CAST_CHAR,
     "trunc_div": TRUNC_DIV,
@@ -280,24 +293,6 @@ def test_ritz1_emits_fill_global(ritz1_bin: Path, tmp_path: Path) -> None:
     ir = ll.read_text()
     assert "@T = internal constant [4 x i32] [i32 3, i32 3, i32 3, i32 3]" in ir, ir
     assert "inttoptr i64 0" not in ir, ir
-
-
-# AGAST #2357: `[N]*u8` elements point at their literals' `@.str`, or are null.
-# ritz0 lowers both since AGAST #1866 (test_const_table_literals.py).
-PTR_ELEMENTS = """\
-const T: [3]*u8 = [c"A", c"BC", null]
-
-pub fn main() -> i32
-    if T[2] != null
-        return 1
-    return (*T[1] as i32) - 63
-"""
-
-
-@pytest.mark.integration
-def test_ritz1_pointer_elements(ritz1_bin: Path, tmp_path: Path) -> None:
-    rc = _run("ritz1", tmp_path, "ptr_elems", PTR_ELEMENTS)
-    assert rc == 3, f"ritz1 build of ptr_elems exited {rc}, expected 3"
 
 
 # --- unfoldable elements are errors, not a silent 0 ---------------------------

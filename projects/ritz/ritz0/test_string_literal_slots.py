@@ -301,6 +301,9 @@ ACCEPTED = {
     # literal's own `@.str` (#2357).
     "global": ('var G: *u8 = "A"\nfn main() -> i32\n    *G as i32\n', 65),
     "const_element": ('const A: [2]*u8 = ["A", "B"]\nfn main() -> i32\n    *A[1] as i32\n', 66),
+    # The `c"..."` spelling of both is the same `*u8` (AGAST #3051).
+    "global_c": ('var G: *u8 = c"A"\nfn main() -> i32\n    *G as i32\n', 65),
+    "const_element_c": ('const A: [2]*u8 = [c"A", c"B"]\nfn main() -> i32\n    *A[1] as i32\n', 66),
 }
 
 
