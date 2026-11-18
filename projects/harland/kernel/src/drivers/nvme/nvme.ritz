@@ -24,8 +24,10 @@
 # whose CQE turns up without an interrupt is counted (nvme_irq_missed). The
 # CQE's phase tag stays the ground truth: an IF=0 caller, or another CPU,
 # still polls, and a stale interrupt cannot complete the wrong command.
-# The wait spins on the vector's counter; sleeping (hlt, or blocking the
-# caller) needs a scheduler-aware block layer.
+# The wait sleeps in hlt (cli, check the vector's counter, sti;hlt), with a
+# one-shot LAPIC timer as its watchdog, so the CPU idles until the interrupt
+# and still gives up if it never comes (AGAST #4212). Blocking the caller so
+# another thread runs needs a wait queue, which the kernel does not have yet.
 #
 # The block interface speaks 512-byte sectors whatever the namespace's LBA
 # size (AGAST #4088): a request is widened to whole native LBAs, and a write
@@ -45,7 +47,7 @@
 # Reference: NVM Express Base Specification 1.4, sections 3 (registers),
 # 4 (queues), 5 (admin commands) and the NVM Command Set (read/write).
 
-import io { memory_barrier, read_barrier, cpu_pause, interrupts_enabled }
+import io { memory_barrier, read_barrier, cpu_pause, interrupts_enabled, disable_interrupts, enable_interrupts, sti_hlt }
 import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
 import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count }
 import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
@@ -55,6 +57,10 @@ import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 
 # Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
 extern fn lapic_id() -> u32
+# One-shot LAPIC timer that wakes a hlt waiting for a vector (apic.ritz)
+extern fn lapic_watchdog_arm(ticks: u32) -> i32
+extern fn lapic_watchdog_expired() -> bool
+extern fn lapic_watchdog_stop() -> i32
 
 # ============================================================================
 # PCI identification
@@ -136,6 +142,12 @@ const NVME_PROBE_SECTORS: u64 = 200
 const NVME_READY_SPINS: u32 = 20000000
 const NVME_CMD_SPINS: u32 = 20000000
 
+# An interrupt wait gives up after NVME_IRQ_WATCHDOG_ROUNDS runs of the LAPIC
+# watchdog, each NVME_IRQ_WATCHDOG_TICKS of bus clock / 16 (~0.27 s at
+# QEMU's 1 GHz APIC bus, longer on hardware's slower ones).
+const NVME_IRQ_WATCHDOG_TICKS: u32 = 0x01000000
+const NVME_IRQ_WATCHDOG_ROUNDS: u32 = 4
+
 const MAX_NVME_CONTROLLERS: i32 = 4
 const MAX_NVME_NAMESPACES: i32 = 8
 # Namespaces per controller we look at (NN can be huge on real arrays).
@@ -182,6 +194,8 @@ var nvme_probed: i32 = 0
 # interrupt never came (the CQE was found by polling)
 var nvme_irq_waits: u64 = 0
 var nvme_irq_missed: u64 = 0
+# hlts those waits slept in until an interrupt woke the CPU
+var nvme_irq_halts: u64 = 0
 
 # ============================================================================
 # Register and memory access
@@ -245,17 +259,30 @@ fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
 # the CQE (polled for its phase tag).
 # Returns 0 on success, the NVMe status (positive) on a command error, or -1
 # on timeout.
-# Spin until `vec` has fired more than `irqs` times. Counts a miss when it
-# doesn't within NVME_CMD_SPINS; the caller then finds the CQE by polling.
+# Sleep until `vec` has fired more than `irqs` times. Called with IF=1.
+# Each round checks the counter with interrupts off and then does sti;hlt,
+# so an interrupt landing between the check and the hlt still wakes it. Any
+# interrupt wakes it; the LAPIC watchdog bounds the wait. Counts a miss when
+# the vector doesn't fire within NVME_IRQ_WATCHDOG_ROUNDS watchdog runs; the
+# caller then finds the CQE by polling. Returns with IF=1, the timer masked.
 fn nvme_wait_irq(vec: u8, irqs: u64)
     nvme_irq_waits = nvme_irq_waits + 1
-    var spins: u32 = 0
-    while spins < NVME_CMD_SPINS
+    var rounds: u32 = 0
+    lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
+    while true
+        disable_interrupts()
         if msix_vector_count(vec) != irqs
-            return
-        cpu_pause()
-        spins = spins + 1
-    nvme_irq_missed = nvme_irq_missed + 1
+            break
+        if lapic_watchdog_expired()
+            rounds = rounds + 1
+            if rounds >= NVME_IRQ_WATCHDOG_ROUNDS
+                nvme_irq_missed = nvme_irq_missed + 1
+                break
+            lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
+        nvme_irq_halts = nvme_irq_halts + 1
+        sti_hlt()
+    lapic_watchdog_stop()
+    enable_interrupts()
 
 fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
     let cid: u32 = (*c).next_cid & 0xFFFF
@@ -789,3 +816,7 @@ pub fn nvme_irq_wait_count() -> u64
 # Commands that waited for their MSI-X interrupt and completed without it
 pub fn nvme_irq_missed_count() -> u64
     return nvme_irq_missed
+
+# hlts the interrupt waits slept in (0 means they never had to sleep)
+pub fn nvme_irq_halt_count() -> u64
+    return nvme_irq_halts

@@ -38,6 +38,9 @@
 #   - "[msix] nvme interrupts: N, commands waited: W, completions without
 #     one: M" has N > 0, W > 0 and M = 0: the driver waited for its MSI-X
 #     vector on every command (W) and every one of them fired (M);
+#   - "[msix] nvme waits halted: H" has H > 0: those waits slept in hlt
+#     (cli/check/sti;hlt, so the wakeup cannot be missed) instead of
+#     spinning on the vector's counter (AGAST #4212);
 #   - the kernel took no exception, and init's Tier-1 suite still reports
 #     ALL TESTS PASSED with the NIC and NVMe attached.
 #
@@ -256,6 +259,13 @@ elif [ "$n_missed" -ne 0 ]; then
     rc=1
 else
     echo "PASS: NVMe delivered $n_count MSI-X interrupts, $n_waited commands waited for theirs, none missed"
+fi
+n_halted=$(grep -aoE "\[msix\] nvme waits halted: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
+if [ -z "$n_halted" ] || [ "$n_halted" -eq 0 ]; then
+    echo "FAIL: NVMe interrupt waits never halted (${n_halted:-no count logged}): they spin instead of sleeping"
+    rc=1
+else
+    echo "PASS: NVMe interrupt waits halted $n_halted times instead of spinning"
 fi
 if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
     echo "PASS: init Tier-1 suite: ALL TESTS PASSED"

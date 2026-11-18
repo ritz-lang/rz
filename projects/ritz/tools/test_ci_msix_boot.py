@@ -111,7 +111,9 @@ def nvme_interrupts(n: int, missed: int = 0, waited: int = 3) -> str:
             rf"completions without one: {missed}\n")
 
 
-NVME_OK = NVME_ON + NVME_READ + nvme_interrupts(5)
+# The interrupt waits slept in hlt rather than spinning (AGAST #4212)
+NVME_HALTED = r"[msix] nvme waits halted: 3\n"
+NVME_OK = NVME_ON + NVME_READ + nvme_interrupts(5) + NVME_HALTED
 
 PASSED = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + NVME_OK + SUITE_PASSED
 
@@ -347,6 +349,7 @@ def test_nvme_interrupts_pass(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS: NVMe is in MSI-X mode" in r.stdout
     assert "PASS: NVMe delivered 5 MSI-X interrupts, 3 commands waited for theirs, none missed" in r.stdout
+    assert "PASS: NVMe interrupt waits halted 3 times instead of spinning" in r.stdout
     # The script computed the pattern's fingerprint itself and it matched
     assert f"PASS: NVMe read LBAs 32568-32767 under MSI-X (fnv1a={NVME_FNV})" in r.stdout
 
@@ -363,6 +366,8 @@ def test_nvme_interrupts_pass(tree):
         (NVME_ON + NVME_READ + nvme_interrupts(2, 3), "3 NVMe completions arrived without an interrupt"),
         # Interrupts delivered but the driver never waited for one: still polled
         (NVME_ON + NVME_READ + nvme_interrupts(5, 0, 0), "no NVMe command waited for its MSI-X interrupt"),
+        # Waited, but spun on the counter instead of sleeping in hlt
+        (NVME_ON + NVME_READ + nvme_interrupts(5), "NVMe interrupt waits never halted"),
         # The read under MSI-X failed or returned the wrong data
         (NVME_ON + nvme_interrupts(5), "no NVMe read under MSI-X"),
         (NVME_ON + r"[msix] nvme harland-msix nsid 1: LBA 32568-32767 read failed\n" + nvme_interrupts(5),
@@ -371,7 +376,7 @@ def test_nvme_interrupts_pass(tree):
          f"want fnv1a={NVME_FNV}"),
     ],
     ids=["polled", "zero-interrupts", "no-counter", "completions-without-interrupt", "never-waited",
-         "no-read", "read-failed", "wrong-data"],
+         "never-halted", "no-read", "read-failed", "wrong-data"],
 )
 def test_nvme_msix_check_fails(tree, nvme, want):
     serial = NVME_TABLE + MODERN_OK + NIC_ON + interrupts(8) + nvme + SUITE_PASSED
