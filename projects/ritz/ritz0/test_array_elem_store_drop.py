@@ -280,11 +280,51 @@ fn f()
     let p: *i32 = arr()[1]
     D = D * 10 + *p as i64
 """, "f()", 63),
+    # A call index: base (6), then index (7), LARB R61.  ritz0 ran the index
+    # first (AGAST #3562): 762.
+    "index_order": ("""\
+var P: *i32 = null
+
+fn arr() -> *i32
+    D = D * 10 + 6
+    return P
+
+fn f()
+    var a: [3]i32 = [1, -3, 4]
+    P = @a[0]
+    let v: i64 = arr()[idx(1)] as i64
+    D = D * 10 + (v + 5)
+""", "f()", 672),
+    # The same through a method's `*i32` result.
+    "method_index_order": ("""\
+var P: *i32 = null
+
+struct B
+    n: i32
+
+impl B
+    fn arr(self: @B) -> *i32
+        D = D * 10 + 6
+        return P
+
+fn f()
+    var a: [3]i32 = [1, -3, 4]
+    P = @a[0]
+    var b: B = B { n: 0 }
+    let v: i64 = b.arr()[idx(1)] as i64
+    D = D * 10 + (v + 5)
+""", "f()", 672),
 }
 
 
-@pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(CALL_BASE_LOAD))
+# ritz1 reads 0 through a method's `*T` result (AGAST #4060).
+LOAD_GAPS = {("method_index_order", "ritz1"): 4060, ("method_index_order", "ritz1_selfhosted"): 4060}
+
+
+@pytest.mark.parametrize("name,compiler", [
+    pytest.param(n, c, marks=[pytest.mark.xfail(strict=True, reason=f"AGAST #{LOAD_GAPS[n, c]}")]
+                 if (n, c) in LOAD_GAPS else [])
+    for n in sorted(CALL_BASE_LOAD) for c in COMPILERS])
 def test_load_from_call_result(tmp_path, compiler, name):
     body, call, want = CALL_BASE_LOAD[name]
     rc = _run(compiler, tmp_path, f"call_load_{name}", _source(body, call, want))

@@ -10004,6 +10004,11 @@ class LLVMEmitter:
                 end=slice_end,
             ))
 
+        # LARB R61: base, then index.  A call base (`arr()[idx(1)]`,
+        # `b.arr()[idx(1)]`) runs first; every route below re-emits it and
+        # gets this value back (AGAST #3562).
+        if isinstance(expr.expr, (rast.Call, rast.MethodCall)):
+            self._evaluate_once(expr.expr)
         index = self._emit_index_value(expr.index)
 
         # Special handling for identifiers that are arrays
