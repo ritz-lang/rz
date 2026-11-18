@@ -26,6 +26,7 @@ from lexer import Lexer, LexerError
 from parser import Parser, ParseError
 from enum_from import rewrite_enum_from
 from emitter_llvmlite import emit as emit_llvmlite, EmitError
+from instantiate import check_instances, monomorphize_module, raise_instance_errors
 from import_resolver import ImportResolver, ImportError as RitzImportError
 from selective_import import check_selective_imports
 from import_visibility import check_import_visibility
@@ -342,7 +343,7 @@ def _check_names(ctx: _Compile) -> bool:
 def _infer_struct_lit_args(ctx: _Compile) -> bool:
     """A generic struct literal's left-out type args (§9.2, AGAST #3407):
     before the checkers, so the move checker sees `Box2 { v: d }` as
-    the Box2<D> it is.  The rest of monomorphisation runs in _emit."""
+    the Box2<D> it is.  The rest of monomorphisation is _monomorph's."""
     infer_struct_lit_args(ctx.module)
     return True
 
@@ -378,6 +379,24 @@ def _check_ownership(ctx: _Compile) -> bool:
     # The rest after it, as ritz1 prints them (#3189).
     _report(slot_errors, "Type error: ")
     return False
+
+
+def _monomorph(ctx: _Compile) -> bool:
+    """Monomorphise (instantiate.monomorphize_module): one copy of each
+    generic per type args used, the templates dropped.  In test mode the
+    file's own `main` goes too: the runner supplies it (§17.1)."""
+    ctx.module = monomorphize_module(ctx.module, ctx.test_mode)
+    return True
+
+
+def _check_instances(ctx: _Compile) -> bool:
+    """Judge each generic instance (instantiate.check_instances): the
+    typing pass again over what this .ll defines, at each `T`, then the
+    move checker per instance.  Reported as the emitter used to, from
+    inside emit(): one "Compiler error:" (AGAST #3523)."""
+    raise_instance_errors(check_instances(
+        ctx.module, ctx.module_names, ctx.source_abs_path))
+    return True
 
 
 def _fn_cache(ctx: _Compile) -> tuple:
@@ -432,8 +451,8 @@ def _invalidate_dependents(ctx: _Compile, changed_sigs) -> None:
 
 
 def _emit(ctx: _Compile) -> bool:
-    """Monomorphise and emit IR (emitter_llvmlite.emit), write the .ll, then
-    the .ritz.sig cache.
+    """Emit IR (emitter_llvmlite.emit), write the .ll, then the .ritz.sig
+    cache.
 
     Always separate compilation: each source file -> one .ll file.
     Functions from the current file: define (full body).  Functions from
@@ -453,8 +472,7 @@ def _emit(ctx: _Compile) -> bool:
         # test-mode compile (no `main`) from a normal one: test mode always
         # emits fresh.
         # The adapter's `main` is not the source's: no per-fn reuse either.
-        fn_cache_data=None if ctx.test_mode or ctx.main_lowered else fn_cache_data,
-        module_names=ctx.module_names)
+        fn_cache_data=None if ctx.test_mode or ctx.main_lowered else fn_cache_data)
 
     if fn_cache_data is not None and isinstance(emit_result, tuple):
         ir, emitted_fn_ir = emit_result
@@ -492,8 +510,10 @@ def _emit(ctx: _Compile) -> bool:
 # (LARB review/5 N2, AGAST #3449).  The order is load-bearing: the lowering
 # passes (_rewrite_enum_from, _eval_array_sizes) run between the first checks,
 # and _infer_struct_lit_args, monomorph's first step, runs before the typing
-# pass (_type) the type and ownership checks read; the rest of monomorphisation, and the checks that
-# judge each generic instance, still run inside emitter_llvmlite.emit.
+# pass (_type) the type and ownership checks read.  The rest of
+# monomorphisation (_monomorph) and the checks that judge each generic
+# instance (_check_instances) run after the source-level checks, so emit()
+# takes a monomorphised module (AGAST #3523).
 PASSES = (
     _parse,
     _lower_main,
@@ -510,6 +530,8 @@ PASSES = (
     _check_types,
     _check_no_effect,
     _check_ownership,
+    _monomorph,
+    _check_instances,
     _emit,
 )
 

@@ -8,7 +8,7 @@ type checker's inference and leaves a `Typed` side table, keyed by node, on
 `module.typed`; the passes after it read the table instead of inferring.
 
 It runs on every compile (ritz0._type), before the ownership pass, and again
-on the monomorphised module the emitter emits (emitter_llvmlite.emit), so an
+on the monomorphised module the emitter emits (ritz0._check_instances), so an
 instance of a generic body is typed at its concrete `T`.  The type errors it
 finds are kept on the table: `--check-types` decides whether ritz0 prints
 them (on by default is #3556, #1823), and the slot errors (§13.2, §13.4) are printed

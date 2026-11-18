@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from lexer import Lexer
 from parser import Parser
 from emitter_llvmlite import LLVMEmitter, emit
+from instantiate import prepare
 import ritz_ast as rast
 
 
@@ -32,7 +33,7 @@ class TestRERITZIntegration:
         tokens = lexer.tokenize()
         parser = Parser(tokens)
         module = parser.parse_module()
-        return emit(module, no_runtime=True)
+        return emit(prepare(module), no_runtime=True)
 
     def parse_module(self, source: str) -> rast.Module:
         """Helper to parse source to AST."""

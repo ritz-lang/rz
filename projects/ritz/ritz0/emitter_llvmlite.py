@@ -36,7 +36,7 @@ from async_transform_v2 import (generate_state_machine, AsyncStateMachine, Untyp
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
-from typed import EMITTER_READS, type_module, typed_of
+from typed import EMITTER_READS, typed_of
 import module_interface
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
@@ -857,6 +857,46 @@ SYSCALL_WRITE = 1
 SYSCALL_EXIT_LINUX = 60
 SYSCALL_EXIT_HARLAND = 20
 
+
+def defines_body(item: rast.Item, source_file: Optional[str],
+                 cached_fn_names: Set[str] = frozenset()) -> bool:
+    """Does the .ll for `source_file` emit `item`'s body?
+
+    With separate compilation (source_file set), only items from that file
+    have bodies; items from other files are declared (external linkage).
+    Not a fn in `cached_fn_names`: its cached IR is spliced in afterwards.
+    """
+    # `fn ... = extern` (AGAST #1900): defined in another object, so
+    # declared exactly as an imported definition is.
+    if getattr(item, 'is_decl', False):
+        return False
+    # If no source file tracking, emit all bodies (legacy behavior)
+    if source_file is None:
+        return True
+    # If item has no source_file set, it's from the main file
+    item_source = getattr(item, 'source_file', None)
+    if item_source is None:
+        return getattr(item, 'name', None) not in cached_fn_names
+    return item_source == source_file
+
+
+def inline_import(item: rast.Item, source_file: Optional[str]) -> bool:
+    """Is `item` an imported fn the .ll for `source_file` defines
+    available_externally, so -O2 can inline it there?
+    (module_interface.inline_import_eligible, AGAST #3585.)"""
+    if source_file is None or not isinstance(item, rast.FnDef):
+        return False
+    if getattr(item, 'source_file', None) in (None, source_file):
+        return False
+    return module_interface.inline_import_eligible(item)
+
+
+def emits_definition(item: rast.Item, source_file: Optional[str],
+                     cached_fn_names: Set[str] = frozenset()) -> bool:
+    """Does the .ll for `source_file` define `item`, its own or an inline import?"""
+    return defines_body(item, source_file, cached_fn_names) or inline_import(item, source_file)
+
+
 class LLVMEmitter:
     """
     Emits LLVM IR from a Ritz AST using llvmlite.
@@ -1073,6 +1113,8 @@ class LLVMEmitter:
 
         # Separate compilation support
         self._current_source_file: Optional[str] = None  # Set in emit_module
+        # Fns whose cached IR emit() splices in: no body emitted (per-fn cache).
+        self._cached_fn_names: Set[str] = set()
 
         # Struct layout registry (computed field offsets with proper alignment)
         self.struct_registry = StructRegistry()
@@ -5959,17 +6001,12 @@ class LLVMEmitter:
 
     def _inline_import(self, item: rast.Item) -> bool:
         """Is `item` an imported fn this module defines available_externally,
-        so -O2 can inline it here?  (module_interface.inline_import_eligible,
-        AGAST #3585.)"""
-        if self._current_source_file is None or not isinstance(item, rast.FnDef):
-            return False
-        if getattr(item, 'source_file', None) in (None, self._current_source_file):
-            return False
-        return module_interface.inline_import_eligible(item)
+        so -O2 can inline it here?  (inline_import, AGAST #3585.)"""
+        return inline_import(item, self._current_source_file)
 
     def _emits_definition(self, item: rast.Item) -> bool:
         """Does this module define `item`, its own or an inline import?"""
-        return self._should_emit_body(item) or self._inline_import(item)
+        return emits_definition(item, self._current_source_file, self._cached_fn_names)
 
     def _emit_inline_import(self, fn_def: rast.FnDef) -> None:
         """Define imported `fn_def` `available_externally` (AGAST #3585): a
@@ -5981,41 +6018,9 @@ class LLVMEmitter:
         fn.linkage = 'available_externally'
 
     def _should_emit_body(self, item: rast.Item) -> bool:
-        """Check if we should emit a function body for this item.
-
-        With separate compilation enabled (source_file set), we only emit
-        bodies for items from the current source file. Items from other
-        files are declared but not defined (external linkage).
-
-        Per-fn IR cache: if _cached_fn_names contains this function name,
-        skip body emission — cached IR will be spliced in post-processing.
-
-        Args:
-            item: The AST item to check
-
-        Returns:
-            True if the function body should be emitted
-        """
-        # `fn ... = extern` (AGAST #1900): defined in another object, so
-        # declared exactly as an imported definition is.
-        if getattr(item, 'is_decl', False):
-            return False
-
-        # If no source file tracking, emit all bodies (legacy behavior)
-        if self._current_source_file is None:
-            return True
-
-        # If item has no source_file set, it's from the main file
-        item_source = getattr(item, 'source_file', None)
-        if item_source is None:
-            # Check per-fn IR cache: skip if cached IR available
-            fn_name = getattr(item, 'name', None)
-            if fn_name and hasattr(self, '_cached_fn_names') and fn_name in self._cached_fn_names:
-                return False
-            return True
-
-        # Emit body only if item is from the current source file
-        return item_source == self._current_source_file
+        """Does this module emit `item`'s body (defines_body)?  Not a fn
+        whose cached IR is spliced in afterwards (_cached_fn_names)."""
+        return defines_body(item, self._current_source_file, self._cached_fn_names)
 
     def _check_private_call(self, callee_def, display: str, span) -> None:
         """AGAST #3418 (LARB R45a, #3413): a call to a fn or method declared
@@ -18098,12 +18103,16 @@ def emit(module: rast.Module, no_runtime: bool = False,
          target: str = 'x86_64-unknown-linux-gnu',
          target_os: str = 'linux',
          fn_cache_data: Optional[Dict] = None,
-         module_names: Optional[Set[str]] = None,
          stack_protector: bool = False) -> Union[str, Tuple[str, Dict[str, str]]]:
-    """Convenience function to emit a module to LLVM IR.
+    """Emit a monomorphised, instance-checked module to LLVM IR.
+
+    `module` is what ritz0.PASSES' _monomorph and _check_instances leave
+    (instantiate.py, AGAST #3523); a caller with only a parsed module runs
+    instantiate.prepare first.
 
     Args:
-        module: The Ritz AST module to emit
+        module: The Ritz AST module to emit, monomorphised: its `.generics`
+                (instantiate.Generics) and `.typed` set
         no_runtime: If True, don't emit _start and runtime
         source_file: Source filename for debug info (default: unknown.ritz)
         source_dir: Source directory for debug info (default: .)
@@ -18125,51 +18134,22 @@ def emit(module: rast.Module, no_runtime: bool = False,
             where emitted_fn_ir is {fn_name: ir_block} for cache storage
         Otherwise: ir_str only (backward compatible)
     """
-    # Monomorphize generics before emission. Note the generic fn names first:
-    # monomorph drops their definitions, and a call that names one without
-    # type args deserves a better error than "Unknown function" (#1968).
-    from monomorph import monomorphize, GenericInferError
-    generic_fn_names = {item.name for item in module.items
-                        if isinstance(item, rast.FnDef) and item.is_generic()}
-    # §7.7 rule 1: a `DerefMut` needs a `Deref` reaching the same T.
-    for message, where in deref_rules.impl_errors(module.items):
-        raise EmitError(message, where)
-    # And each generic struct's arity: an error spells `Wrap$H` as `Wrap<H>` (§7.7).
-    generic_arity = {item.name: len(item.type_params) for item in module.items
-                     if isinstance(item, rast.StructDef) and item.type_params}
-    # Each generic impl's methods by the free name R10 would give them, which
-    # they don't have (§5.4, LARB R37, AGAST #3372): `W_bump` -> its words.
-    generic_method_names = {f"{item.type_name}_{m.name}": (m.name, item.type_name, item.type_params)
-                            for item in module.items
-                            if isinstance(item, rast.ImplBlock) and item.type_params
-                            for m in item.methods}
-    # Each generic struct and enum, by its variants (none for a struct): monomorph
-    # drops the templates, and `Slot.mk(5)` names one (AGAST #2185).
-    generic_types = {item.name: frozenset(v.name for v in getattr(item, 'variants', ()))
-                     for item in module.items
-                     if isinstance(item, (rast.StructDef, rast.EnumDef)) and item.type_params}
-    try:
-        module = monomorphize(module)
-    except GenericInferError as e:
-        # `f(args)` whose args don't determine f's T (AGAST #1982).
-        raise EmitError(str(e)) from None
-
-    # Test mode (§17.1): the runner supplies `main`, so the file's own goes.
-    if test_mode:
-        module.items = [item for item in module.items
-                        if not (isinstance(item, rast.FnDef) and item.name == 'main')]
+    generics = getattr(module, 'generics', None)
+    if generics is None:
+        raise ValueError("emit() takes a monomorphised module: "
+                         "run instantiate.prepare (or ritz0.PASSES) first")
 
     # Note: target_os filtering happens earlier in compile_file() before name resolution
 
     emitter = LLVMEmitter(source_file=source_file, source_dir=source_dir, target=target,
                           target_os=target_os)
-    emitter._generic_arity = generic_arity
-    emitter.generic_types = generic_types
+    emitter._generic_arity = generics.arity
+    emitter.generic_types = generics.types
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
     emitter.stack_protector = stack_protector
-    emitter.generic_fn_names = generic_fn_names
-    emitter.generic_method_names = generic_method_names
+    emitter.generic_fn_names = generics.fn_names
+    emitter.generic_method_names = generics.method_names
 
     # Configure per-fn cache: tells emitter which functions to skip
     cached_fn_ir = {}
@@ -18184,18 +18164,6 @@ def emit(module: rast.Module, no_runtime: bool = False,
                 cached_fn_ir[fn_name] = ir_text
         # Tell emitter which functions to skip body emission for
         emitter._cached_fn_names = set(cached_fn_ir.keys())
-    else:
-        emitter._cached_fn_names = set()
-
-    # The typing pass over what is emitted (typed.py, AGAST #3448), so a
-    # generic body is typed, and its slots judged, at each `T` it's
-    # instantiated with: a reference in a by-value slot or a value in a
-    # reference slot (§13.2, §13.4, AGAST #2336, #2337).
-    emitter._current_source_file = main_source_path
-    slot_errors = type_module(module, module_names, emitter._emits_definition).slot_errors
-    slot_errors += MoveChecker().check_instances(module)
-    if slot_errors:
-        raise EmitError('\n'.join(str(e) for e in slot_errors))
 
     # Always use separate compilation - pass source path to control body emission
     if main_source_path:

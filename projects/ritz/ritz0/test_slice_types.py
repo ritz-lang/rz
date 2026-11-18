@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import ritz_ast as rast  # noqa: E402
 from emitter_llvmlite import EmitError, emit  # noqa: E402
+from instantiate import prepare  # noqa: E402
 from lexer import Lexer  # noqa: E402
 from parser import Parser  # noqa: E402
 
@@ -40,7 +41,7 @@ def parse(source: str) -> rast.Module:
 
 def compile_to_ir(source: str) -> str:
     """Compile ritz source all the way to LLVM IR text."""
-    return emit(parse(source), no_runtime=True)
+    return emit(prepare(parse(source)), no_runtime=True)
 
 
 def assert_is_span(ty: rast.Type, inner_name: str) -> None:

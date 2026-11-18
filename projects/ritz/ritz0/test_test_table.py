@@ -28,6 +28,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from emitter_llvmlite import EmitError, emit  # noqa: E402
+from instantiate import prepare  # noqa: E402
 from lexer import Lexer  # noqa: E402
 from parser import Parser  # noqa: E402
 
@@ -53,7 +54,7 @@ fn test_wide() -> i64
 
 def _ir(src: str, test_mode: bool) -> str:
     module = Parser(Lexer(src, "t.ritz").tokenize()).parse_module()
-    return emit(module, test_mode=test_mode, source_file="t.ritz")
+    return emit(prepare(module, test_mode), test_mode=test_mode, source_file="t.ritz")
 
 
 def _table_names(ir: str) -> list:
