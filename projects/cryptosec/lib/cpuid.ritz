@@ -43,6 +43,16 @@ const CPUID_EBX_SHA: i32 = 29        # Bit 29: SHA extensions
 # Leaf 7, EBX bits for AVX-512
 const CPUID_EBX_AVX512F: i32 = 16    # Bit 16: AVX-512 Foundation
 
+# XCR0 (read with XGETBV, ecx = 0): the state components the OS saves and
+# restores, i.e. the ones it has enabled. OSXSAVE only says XGETBV exists.
+const XCR0_SSE: i32 = 0x2            # Bit 1: XMM state
+const XCR0_YMM: i32 = 0x4            # Bit 2: upper halves of YMM
+const XCR0_OPMASK: i32 = 0x20        # Bit 5: AVX-512 k0-k7
+const XCR0_ZMM_HI256: i32 = 0x40     # Bit 6: upper halves of ZMM0-15
+const XCR0_HI16_ZMM: i32 = 0x80      # Bit 7: ZMM16-31
+const XCR0_AVX_MASK: i32 = XCR0_SSE | XCR0_YMM
+const XCR0_AVX512_MASK: i32 = XCR0_AVX_MASK | XCR0_OPMASK | XCR0_ZMM_HI256 | XCR0_HI16_ZMM
+
 # ============================================================================
 # Cached Feature Flags
 # ============================================================================
@@ -57,6 +67,7 @@ var g_has_avx2: i32 = 0
 var g_has_avx512f: i32 = 0
 var g_has_pclmulqdq: i32 = 0
 var g_has_osxsave: i32 = 0
+var g_xcr0: i32 = 0
 
 # ============================================================================
 # Low-level CPUID Access
@@ -81,6 +92,18 @@ pub fn cpuid_raw(leaf: i32, subleaf: i32, out_eax: *i32, out_ebx: *i32, out_ecx:
 # do_cpuid: the same, kept as the older public name.
 pub fn do_cpuid(leaf: i32, subleaf: i32, eax: *i32, ebx: *i32, ecx: *i32, edx: *i32)
     cpuid_raw(leaf, subleaf, eax, ebx, ecx, edx)
+
+# XGETBV: reads extended control register `xcr` (ecx) into edx:eax. Only
+# legal when CPUID.1:ECX.OSXSAVE is set (#UD otherwise). Returns the low 32
+# bits, which hold every XCR0 bit this file looks at (AGAST #4127).
+[[inline]]
+pub fn xgetbv_lo(xcr: i32) -> i32
+    var a: i32 = 0
+    var c: i32 = xcr
+    var d: i32 = 0
+    asm x86_64 (out a: rax, inout c: rcx, out d: rdx):
+        xgetbv
+    return a
 
 # ============================================================================
 # Feature Detection (Internal)
@@ -119,6 +142,7 @@ fn cpuid_init()
         # OSXSAVE: ECX bit 27 (needed to verify OS supports AVX state)
         if ((ecx >> CPUID_ECX_OSXSAVE) & 1) == 1
             g_has_osxsave = 1
+            g_xcr0 = xgetbv_lo(0)
 
     # Leaf 7: Extended features (AVX2, SHA-NI, AVX-512F)
     if max_leaf >= 7
@@ -136,7 +160,42 @@ fn cpuid_init()
         if ((ebx >> CPUID_EBX_AVX512F) & 1) == 1
             g_has_avx512f = 1
 
+    # Keep only what the OS has enabled in XCR0 (AGAST #4127), so every
+    # getter and cpu_detect_features agree. AVX-512 first: it reads the raw
+    # AVX/AVX2 bits.
+    g_has_avx512f = cpu_avx512_usable(g_has_avx, g_has_avx2, g_has_osxsave, g_xcr0, g_has_avx512f)
+    g_has_avx2 = cpu_avx2_usable(g_has_avx, g_has_osxsave, g_xcr0, g_has_avx2)
+    g_has_avx = cpu_avx_usable(g_has_avx, g_has_osxsave, g_xcr0)
+
     g_cpuid_initialized = 1
+
+# ============================================================================
+# Usability Predicates (pure, so they can be tested without the CPU at hand)
+# ============================================================================
+
+# AVX is usable when the CPU has it, XGETBV exists (OSXSAVE) and the OS has
+# enabled SSE and YMM state in XCR0 (AGAST #4127).
+pub fn cpu_avx_usable(has_avx: i32, has_osxsave: i32, xcr0: i32) -> i32
+    if has_avx == 0 || has_osxsave == 0
+        return 0
+    if (xcr0 & XCR0_AVX_MASK) != XCR0_AVX_MASK
+        return 0
+    return 1
+
+# AVX2 uses the same YMM state as AVX.
+pub fn cpu_avx2_usable(has_avx: i32, has_osxsave: i32, xcr0: i32, has_avx2: i32) -> i32
+    if cpu_avx_usable(has_avx, has_osxsave, xcr0) == 0
+        return 0
+    return has_avx2
+
+# AVX-512F also needs AVX2 (GitHub #149 L-7, AGAST #2586) and the opmask,
+# ZMM_Hi256 and Hi16_ZMM state enabled in XCR0 (AGAST #4127).
+pub fn cpu_avx512_usable(has_avx: i32, has_avx2: i32, has_osxsave: i32, xcr0: i32, has_avx512f: i32) -> i32
+    if cpu_avx2_usable(has_avx, has_osxsave, xcr0, has_avx2) == 0
+        return 0
+    if (xcr0 & XCR0_AVX512_MASK) != XCR0_AVX512_MASK
+        return 0
+    return has_avx512f
 
 # ============================================================================
 # Public Feature Detection API
@@ -152,31 +211,23 @@ pub fn cpu_has_sha_ni() -> i32
     cpuid_init()
     return g_has_sha_ni
 
-# Check if CPU supports AVX (256-bit SIMD, needed for AVX2)
+# Check if CPU supports AVX (256-bit SIMD, needed for AVX2) and the OS has
+# enabled YMM state
 pub fn cpu_has_avx() -> i32
     cpuid_init()
     return g_has_avx
 
 # Check if CPU supports AVX2 (256-bit integer SIMD)
+# cpuid_init has already masked it by AVX, OSXSAVE and XCR0.
 pub fn cpu_has_avx2() -> i32
     cpuid_init()
-    # AVX2 requires AVX and OS support (OSXSAVE)
-    if g_has_avx == 0 || g_has_osxsave == 0
-        return 0
     return g_has_avx2
 
-# AVX-512F is usable only when AVX, AVX2 and OS support (OSXSAVE) are all
-# there too (GitHub #149 L-7, AGAST #2586). Pure, so it can be tested
-# without the CPU at hand.
-pub fn cpu_avx512_usable(has_avx: i32, has_avx2: i32, has_osxsave: i32, has_avx512f: i32) -> i32
-    if has_avx == 0 || has_avx2 == 0 || has_osxsave == 0
-        return 0
-    return has_avx512f
-
-# Check if CPU supports AVX-512F (512-bit SIMD foundation)
+# Check if CPU supports AVX-512F (512-bit SIMD foundation); cpuid_init has
+# already masked it by AVX2, OSXSAVE and XCR0.
 pub fn cpu_has_avx512() -> i32
     cpuid_init()
-    return cpu_avx512_usable(g_has_avx, g_has_avx2, g_has_osxsave, g_has_avx512f)
+    return g_has_avx512f
 
 # Check if CPU supports PCLMULQDQ (carryless multiply for GHASH)
 pub fn cpu_has_pclmulqdq() -> i32
