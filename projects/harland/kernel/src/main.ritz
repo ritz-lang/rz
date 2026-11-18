@@ -15,8 +15,8 @@
 import io { halt_loop }
 import serial { StrView, serial_init, prints, serial_print_hex, serial_print_dec, serial_enable_rx }
 import drivers.pci { pci_init }
-import mm.pmm { PAGE_SIZE, Mb2BootInfo, HARLAND_BOOT_MAGIC, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel }
-import mm.vmm { vmm_init, vmm_flush_tlb_all, vmm_reserve_page_tables, vmm_init_physmap }
+import mm.pmm { PAGE_SIZE, Mb2BootInfo, HARLAND_BOOT_MAGIC, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel, pmm_bitmap_phys, pmm_bitmap_size }
+import mm.vmm { vmm_init, vmm_flush_tlb_all, vmm_reserve_page_tables, vmm_init_physmap, phys_to_virt }
 import mm.heap { KERNEL_VIRT_BASE, heap_init, heap_get_used, heap_check }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
 # import mm.shm { ShmRegion, ShmMapping, shm_create, ... }
@@ -312,8 +312,11 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
 
     # Initialize Physical Memory Manager based on boot protocol
     klog(c"  [..] Physical memory")
+    # The bitmap is carved out of RAM below 1 GiB, sized from the memory map's
+    # highest usable address (AGAST #4183); pmm_ok is false when it can't be.
+    var pmm_ok: bool = false
     if boot_protocol == BOOT_PROTOCOL_HARLAND
-        pmm_init_from_bootinfo(harland_boot_info)
+        pmm_ok = pmm_init_from_bootinfo(harland_boot_info, kernel_phys_end()) == 0
         pmm_reserve_kernel(kernel_phys_end())
         # The UEFI bootloader may place the kernel and its boot structures
         # outside the legacy 1-2MB window. Reserve those concrete regions
@@ -324,14 +327,19 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         let mmap_entries: u64 = (*harland_boot_info).memory_map_entries as u64
         if mmap_entries > 0 and (*harland_boot_info).memory_map != 0 as *HarlandMemEntry
             pmm_mark_region_used((*harland_boot_info).memory_map as u64, mmap_entries * 24)  # sizeof(HarlandMemEntry)
-        klog(c"\r  [OK] Physical memory\n")
     else if boot_protocol == BOOT_PROTOCOL_MULTIBOOT2
         let mb_info: *Mb2BootInfo = boot_info_addr as *Mb2BootInfo
-        pmm_init_from_multiboot(mb_info)
+        pmm_ok = pmm_init_from_multiboot(mb_info, kernel_phys_end()) == 0
         pmm_reserve_kernel(kernel_phys_end())
+        # apic_init_with_mb reads the info block long after the first
+        # allocation: keep its pages out of the pool.
+        pmm_mark_region_used(boot_info_addr, (*mb_info).total_size as u64)
+    if boot_protocol == BOOT_PROTOCOL_UNKNOWN
+        klog(c"\r  [!!] Physical memory (no boot info)\n")
+    else if pmm_ok
         klog(c"\r  [OK] Physical memory\n")
     else
-        klog(c"\r  [!!] Physical memory (no boot info)\n")
+        klog(c"\r  [!!] Physical memory (no bitmap)\n")
 
     if has_boot_info
         # Print memory statistics
@@ -341,6 +349,12 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         let total_mb: u64 = (pmm_get_total_pages() * 4) / 1024
         serial_print_dec(total_mb)
         prints(" MB)\n")
+
+        prints("      Bitmap:      ")
+        serial_print_dec(pmm_bitmap_size() / 1024)
+        prints(" KB at ")
+        serial_print_hex(pmm_bitmap_phys())
+        prints("\n")
 
         prints("      Free pages:  ")
         serial_print_dec(pmm_get_free_pages())
@@ -365,6 +379,10 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     # allocations after the reserve are low pages the boot identity map covers.
     if vmm_init_physmap() != 0
         klog(c"  [!!] Physmap (page tables above 1 GiB unreachable)\n")
+    else if boot_protocol == BOOT_PROTOCOL_HARLAND
+        # The identity map now stops at 4 GiB, and firmware may have put
+        # BootInfo above it (AGAST #4183): reach it through the physmap.
+        harland_boot_info = phys_to_virt(boot_info_addr) as *HarlandBootInfo
 
     # Initialize Kernel Heap
     klog(c"  [..] Kernel heap")

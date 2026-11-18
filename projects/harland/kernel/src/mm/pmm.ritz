@@ -5,7 +5,7 @@
 #
 # This is the foundation of memory management - VMM and heap depend on it.
 
-import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
+import serial { prints, serial_print_dec }
 
 # ============================================================================
 # Page Constants (shared with VMM and heap)
@@ -14,11 +14,15 @@ import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
 pub const PAGE_SIZE: u64 = 4096
 pub const PAGE_SHIFT: u64 = 12
 
-# Maximum memory we support: 4GB (fits in 128KB bitmap)
-# 4GB = 4294967296 bytes = 1048576 pages
-# 1048576 pages / 8 bits per byte = 131072 bytes = 128KB
-pub const MAX_MEMORY: u64 = 4294967296
-pub const MAX_PAGES: u64 = 1048576
+# The bitmap is sized at boot from the memory map's highest usable address
+# (AGAST #4183; until then a fixed 128 KiB array capped RAM at 4 GiB). Its
+# ceiling is what the physmap can reach: PML4[256], 512 GiB, a 16 MiB bitmap.
+pub const PMM_MAX_PAGES: u64 = 134217728
+
+# The bitmap is reached through the identity map, which every address space
+# has below 1 GiB (the boot map on Multiboot2, process PML4s): it must end
+# there.
+const PMM_BITMAP_LIMIT: u64 = 0x40000000
 
 # ============================================================================
 # Multiboot2 Information Structures (for memory map parsing)
@@ -141,12 +145,20 @@ pub const BOOT_PROTOCOL_HARLAND: u32 = 2
 # PMM State
 # ============================================================================
 
-# Bitmap: 1 bit per page, 1 = free, 0 = used
-# 1048576 pages / 8 bits per byte = 131072 bytes = 128KB
-var pmm_bitmap: [131072]u8
+# Bitmap: 1 bit per page, 1 = free, 0 = used. Lives at pmm_bitmap_addr
+# (identity-mapped) and tracks pmm_bitmap_pages pages.
+var pmm_bitmap_addr: u64 = 0
+var pmm_bitmap_pages: u64 = 0
 var pmm_total_pages: u64 = 0
 var pmm_free_pages: u64 = 0
 var pmm_initialized: u8 = 0
+
+# Allocation hints (AGAST #4183), instead of scanning from page 0 / the top
+# on every allocation:
+#   no page in [1, pmm_next_free) is free  (pmm_alloc_page starts there)
+#   no page at or above pmm_high_free is free  (pmm_alloc_page_high, down)
+var pmm_next_free: u64 = 1
+var pmm_high_free: u64 = 0
 
 # OOM injection for boot self-tests (AGAST #3552). While armed, each
 # allocation spends one unit of budget, and once it is spent every
@@ -154,83 +166,122 @@ var pmm_initialized: u8 = 0
 var pmm_fail_armed: u8 = 0
 var pmm_fail_budget: u64 = 0
 
+# Ranges the boot paths must not put the bitmap on (kernel image, boot
+# info, memory map, ...), and the bitmap site the scan picked.
+const PMM_AVOID_MAX: u64 = 8
+var pmm_avoid_base: [8]u64
+var pmm_avoid_end: [8]u64
+var pmm_avoid_count: u64 = 0
+var pmm_site: u64 = 0
+
 # ============================================================================
 # Internal Bitmap Operations
 # ============================================================================
 
+fn pmm_byte(page: u64) -> *u8
+    return (pmm_bitmap_addr + page / 8) as *u8
+
 # Set a bit (mark page as free)
 fn pmm_set_bit(page: u64) -> i32
-    let byte_idx: u64 = page / 8
-    let bit_idx: u8 = (page % 8) as u8
-    pmm_bitmap[byte_idx as i32] = pmm_bitmap[byte_idx as i32] | (1 << bit_idx)
+    let b: *u8 = pmm_byte(page)
+    *b = *b | (1 << (page % 8) as u8)
     return 0
 
 # Clear a bit (mark page as used)
 fn pmm_clear_bit(page: u64) -> i32
-    let byte_idx: u64 = page / 8
-    let bit_idx: u8 = (page % 8) as u8
-    pmm_bitmap[byte_idx as i32] = pmm_bitmap[byte_idx as i32] & ~(1 << bit_idx)
+    let b: *u8 = pmm_byte(page)
+    *b = *b & ~(1 << (page % 8) as u8)
     return 0
 
 # Test if a bit is set (page is free)
 fn pmm_test_bit(page: u64) -> bool
-    let byte_idx: u64 = page / 8
-    let bit_idx: u8 = (page % 8) as u8
-    return (pmm_bitmap[byte_idx as i32] & (1 << bit_idx)) != 0
+    return (*pmm_byte(page) & (1 << (page % 8) as u8)) != 0
+
+fn pmm_page_up(a: u64) -> u64
+    return (a + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1)
 
 # ============================================================================
 # PMM Initialization
 # ============================================================================
 
-# Initialize the PMM - mark everything as used initially
-pub fn pmm_init() -> i32
-    var i: i32 = 0
-    while i < 131072
-        pmm_bitmap[i] = 0
+# Bytes of bitmap (whole pages) for RAM ending at top.
+fn pmm_bitmap_bytes_for(top: u64) -> u64
+    var pages: u64 = top / PAGE_SIZE
+    if pages > PMM_MAX_PAGES
+        pages = PMM_MAX_PAGES
+    return pmm_page_up((pages + 7) / 8)
+
+# Start tracking max_pages pages with the bitmap at `bitmap`, every page
+# used. The boot paths call it with a bitmap they carved out of RAM; tests
+# pass their own.
+pub fn pmm_init(bitmap: *u8, max_pages: u64) -> i32
+    var pages: u64 = max_pages
+    if pages > PMM_MAX_PAGES
+        pages = PMM_MAX_PAGES
+    pmm_bitmap_addr = bitmap as u64
+    pmm_bitmap_pages = pages
+    let bytes: u64 = (pages + 7) / 8
+    var i: u64 = 0
+    while i < bytes
+        let b: *u8 = (pmm_bitmap_addr + i) as *u8
+        *b = 0
         i = i + 1
     pmm_total_pages = 0
     pmm_free_pages = 0
+    pmm_next_free = 1
+    pmm_high_free = 0
     pmm_initialized = 1
     return 0
 
+# Physical address of the bitmap (0 before a boot path set one up).
+pub fn pmm_bitmap_phys() -> u64
+    return pmm_bitmap_addr
+
+# Bytes the bitmap spans.
+pub fn pmm_bitmap_size() -> u64
+    return (pmm_bitmap_pages + 7) / 8
+
 # Mark a range of physical memory as available
 pub fn pmm_mark_region_free(base: u64, length: u64) -> i32
-    let start_page: u64 = (base + PAGE_SIZE - 1) / PAGE_SIZE
-    let end_page: u64 = (base + length) / PAGE_SIZE
-
-    if start_page >= MAX_PAGES
+    if pmm_initialized == 0
+        return -1
+    var start_page: u64 = (base + PAGE_SIZE - 1) / PAGE_SIZE
+    var end_page: u64 = (base + length) / PAGE_SIZE
+    if end_page > pmm_bitmap_pages
+        end_page = pmm_bitmap_pages
+    # Keep physical page 0 permanently unavailable so address 0
+    # remains an unambiguous allocation-failure sentinel (#2749).
+    if start_page == 0
+        start_page = 1
+    if start_page >= end_page
         return 0
 
     var page: u64 = start_page
     while page < end_page
-        if page >= MAX_PAGES
-            break
-        # Keep physical page 0 permanently unavailable so address 0
-        # remains an unambiguous allocation-failure sentinel (#2749).
-        if page == 0
-            page = page + 1
-            continue
-        pmm_set_bit(page)
-        pmm_free_pages = pmm_free_pages + 1
+        if not pmm_test_bit(page)
+            pmm_set_bit(page)
+            pmm_free_pages = pmm_free_pages + 1
         page = page + 1
 
     if end_page > pmm_total_pages
-        if end_page > MAX_PAGES
-            pmm_total_pages = MAX_PAGES
-        else
-            pmm_total_pages = end_page
-
+        pmm_total_pages = end_page
+    if start_page < pmm_next_free
+        pmm_next_free = start_page
+    if end_page > pmm_high_free
+        pmm_high_free = end_page
     return 0
 
 # Mark a range of physical memory as used (reserved)
 pub fn pmm_mark_region_used(base: u64, length: u64) -> i32
+    if pmm_initialized == 0
+        return -1
     let start_page: u64 = base / PAGE_SIZE
-    let end_page: u64 = (base + length + PAGE_SIZE - 1) / PAGE_SIZE
+    var end_page: u64 = (base + length + PAGE_SIZE - 1) / PAGE_SIZE
+    if end_page > pmm_bitmap_pages
+        end_page = pmm_bitmap_pages
 
     var page: u64 = start_page
     while page < end_page
-        if page >= MAX_PAGES
-            break
         if pmm_test_bit(page)
             pmm_clear_bit(page)
             if pmm_free_pages > 0
@@ -274,15 +325,21 @@ pub fn pmm_alloc_page() -> u64
     if pmm_free_pages == 0
         return 0
 
-    # Linear search for free page; page 0 is never handed out (#2749)
-    var page: u64 = 1
+    # Search up from the hint; page 0 is never handed out (#2749). Whole
+    # used bytes are skipped 8 pages at a time.
+    var page: u64 = pmm_next_free
     while page < pmm_total_pages
+        if (page % 8) == 0 and *pmm_byte(page) == 0
+            page = page + 8
+            continue
         if pmm_test_bit(page)
             pmm_clear_bit(page)
             pmm_free_pages = pmm_free_pages - 1
+            pmm_next_free = page + 1
             return page * PAGE_SIZE
         page = page + 1
 
+    pmm_next_free = pmm_total_pages
     return 0
 
 # Allocate a single physical page, searching down from the top of RAM.
@@ -299,14 +356,21 @@ pub fn pmm_alloc_page_high() -> u64
     if pmm_free_pages == 0
         return 0
 
-    var page: u64 = pmm_total_pages
+    var page: u64 = pmm_high_free
+    if page > pmm_total_pages
+        page = pmm_total_pages
     while page > 1
+        if (page % 8) == 0 and *pmm_byte(page - 8) == 0
+            page = page - 8
+            continue
         page = page - 1
         if pmm_test_bit(page)
             pmm_clear_bit(page)
             pmm_free_pages = pmm_free_pages - 1
+            pmm_high_free = page
             return page * PAGE_SIZE
 
+    pmm_high_free = 0
     return 0
 
 # Free a physical page
@@ -318,8 +382,6 @@ pub fn pmm_free_page(addr: u64) -> i32
         return -1
 
     let page: u64 = addr / PAGE_SIZE
-    if page >= MAX_PAGES
-        return -1
     # Past the top of the RAM the PMM manages (MMIO such as a framebuffer):
     # never the PMM's to free (#2755). Its bit is clear like an allocated
     # page's, so without this it would enter the free pool.
@@ -331,6 +393,10 @@ pub fn pmm_free_page(addr: u64) -> i32
 
     pmm_set_bit(page)
     pmm_free_pages = pmm_free_pages + 1
+    if page < pmm_next_free
+        pmm_next_free = page
+    if page >= pmm_high_free
+        pmm_high_free = page + 1
     return 0
 
 # ============================================================================
@@ -348,10 +414,69 @@ pub fn pmm_get_total_pages() -> u64
 # Boot Protocol Initialization
 # ============================================================================
 
-# Parse Multiboot2 memory map and initialize PMM
-pub fn pmm_init_from_multiboot(mb_info: *Mb2BootInfo) -> i32
-    pmm_init()
+# Both boot paths walk their memory map three times: for the highest usable
+# address (the bitmap's size), for a bitmap site, and to mark RAM free.
+const PMM_PASS_TOP: u32 = 0
+const PMM_PASS_SITE: u32 = 1
+const PMM_PASS_FREE: u32 = 2
 
+var pmm_scan_top: u64 = 0
+
+fn pmm_avoid_reset(kernel_phys_end: u64)
+    pmm_avoid_count = 0
+    pmm_site = 0
+    pmm_scan_top = 0
+    # The low 1 MiB and the kernel image at 1 MiB (pmm_reserve_kernel's
+    # window, never less than 2 MiB).
+    var end: u64 = kernel_phys_end
+    if end < 0x200000
+        end = 0x200000
+    pmm_avoid(0, end)
+
+# Keep the bitmap off [base, base + length).
+fn pmm_avoid(base: u64, length: u64)
+    if length == 0 or pmm_avoid_count >= PMM_AVOID_MAX
+        return
+    pmm_avoid_base[pmm_avoid_count as i32] = base & ~(PAGE_SIZE - 1)
+    pmm_avoid_end[pmm_avoid_count as i32] = pmm_page_up(base + length)
+    pmm_avoid_count = pmm_avoid_count + 1
+
+# Take [cand, cand + size) of usable [base, base + length) for the bitmap if
+# nothing is there yet, it ends below PMM_BITMAP_LIMIT and it misses every
+# avoided range.
+fn pmm_try_site(base: u64, length: u64, size: u64)
+    if pmm_site != 0
+        return
+    var end: u64 = (base + length) & ~(PAGE_SIZE - 1)
+    if end > PMM_BITMAP_LIMIT
+        end = PMM_BITMAP_LIMIT
+    var cand: u64 = pmm_page_up(base)
+    var moved: bool = true
+    while moved
+        moved = false
+        var i: u64 = 0
+        while i < pmm_avoid_count
+            let a_base: u64 = pmm_avoid_base[i as i32]
+            let a_end: u64 = pmm_avoid_end[i as i32]
+            if cand < a_end and cand + size > a_base
+                cand = a_end
+                moved = true
+            i = i + 1
+        if cand >= end
+            return
+    if cand + size <= end
+        pmm_site = cand
+
+fn pmm_visit_usable(base: u64, length: u64, pass: u32, size: u64)
+    if pass == PMM_PASS_TOP
+        if base + length > pmm_scan_top
+            pmm_scan_top = base + length
+    else if pass == PMM_PASS_SITE
+        pmm_try_site(base, length, size)
+    else
+        pmm_mark_region_free(base, length)
+
+fn pmm_mb2_pass(mb_info: *Mb2BootInfo, pass: u32, size: u64)
     let info_end: u64 = (mb_info as u64) + (*mb_info).total_size as u64
     var tag_ptr: u64 = (mb_info as u64) + 8
 
@@ -371,18 +496,13 @@ pub fn pmm_init_from_multiboot(mb_info: *Mb2BootInfo) -> i32
                 let entry: *Mb2MmapEntry = entry_ptr as *Mb2MmapEntry
 
                 if (*entry).entry_type == MB2_MEMORY_AVAILABLE
-                    pmm_mark_region_free((*entry).base_addr, (*entry).length)
+                    pmm_visit_usable((*entry).base_addr, (*entry).length, pass, size)
 
                 entry_ptr = entry_ptr + entry_size as u64
 
         tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
 
-    return 0
-
-# Initialize PMM from Harland boot info (UEFI boot path)
-pub fn pmm_init_from_bootinfo(info: *HarlandBootInfo) -> i32
-    pmm_init()
-
+fn pmm_bootinfo_pass(info: *HarlandBootInfo, pass: u32, size: u64)
     let num_entries: u32 = (*info).memory_map_entries
     let mmap: *HarlandMemEntry = (*info).memory_map
     var i: u32 = 0
@@ -391,10 +511,62 @@ pub fn pmm_init_from_bootinfo(info: *HarlandBootInfo) -> i32
         let entry: *HarlandMemEntry = (mmap as u64 + (i as u64 * 24)) as *HarlandMemEntry
 
         if (*entry).mem_type == HARLAND_MEM_USABLE
-            pmm_mark_region_free((*entry).base, (*entry).length)
+            pmm_visit_usable((*entry).base, (*entry).length, pass, size)
 
         i = i + 1
 
+# Size and place the bitmap for RAM ending at pmm_scan_top (the TOP pass
+# ran), or report why not. Returns the bitmap's size in bytes, 0 on failure.
+fn pmm_bitmap_size_from_top() -> u64
+    if pmm_scan_top == 0
+        prints("[pmm] no usable memory in the memory map\n")
+        return 0
+    return pmm_bitmap_bytes_for(pmm_scan_top)
+
+fn pmm_start_bitmap(size: u64) -> i32
+    if pmm_site == 0
+        prints("[pmm] no room below 1 GiB for a ")
+        serial_print_dec(size / 1024)
+        prints(" KiB bitmap\n")
+        return -1
+    var pages: u64 = pmm_scan_top / PAGE_SIZE
+    pmm_init(pmm_site as *u8, pages)
+    return 0
+
+# Parse the Multiboot2 memory map and initialize the PMM. kernel_phys_end is
+# main's linker-derived image end (pmm_reserve_kernel's): the bitmap stays
+# off the image and the info block. Returns 0, or -1 (PMM left unusable).
+pub fn pmm_init_from_multiboot(mb_info: *Mb2BootInfo, kernel_phys_end: u64) -> i32
+    pmm_avoid_reset(kernel_phys_end)
+    pmm_avoid(mb_info as u64, (*mb_info).total_size as u64)
+    pmm_mb2_pass(mb_info, PMM_PASS_TOP, 0)
+    let size: u64 = pmm_bitmap_size_from_top()
+    if size == 0
+        return -1
+    pmm_mb2_pass(mb_info, PMM_PASS_SITE, size)
+    if pmm_start_bitmap(size) != 0
+        return -1
+    pmm_mb2_pass(mb_info, PMM_PASS_FREE, 0)
+    pmm_mark_region_used(pmm_site, size)
+    return 0
+
+# Initialize the PMM from Harland boot info (UEFI boot path). The bitmap
+# stays off the image, the boot info, its memory map and the PML4.
+pub fn pmm_init_from_bootinfo(info: *HarlandBootInfo, kernel_phys_end: u64) -> i32
+    pmm_avoid_reset(kernel_phys_end)
+    pmm_avoid(info as u64, PAGE_SIZE)
+    pmm_avoid((*info).memory_map as u64, (*info).memory_map_entries as u64 * 24)
+    pmm_avoid((*info).kernel_phys, (*info).kernel_size)
+    pmm_avoid((*info).pml4_phys, PAGE_SIZE)
+    pmm_bootinfo_pass(info, PMM_PASS_TOP, 0)
+    let size: u64 = pmm_bitmap_size_from_top()
+    if size == 0
+        return -1
+    pmm_bootinfo_pass(info, PMM_PASS_SITE, size)
+    if pmm_start_bitmap(size) != 0
+        return -1
+    pmm_bootinfo_pass(info, PMM_PASS_FREE, 0)
+    pmm_mark_region_used(pmm_site, size)
     return 0
 
 # Reserve kernel memory regions (call after pmm_init_from_multiboot or

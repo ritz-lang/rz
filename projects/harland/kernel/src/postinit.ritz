@@ -7,8 +7,8 @@
 # them later.
 
 import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
-import mm.pmm { pmm_alloc_page, pmm_free_page }
-import mm.vmm { PTE_WRITABLE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages }
+import mm.vmm { PTE_WRITABLE, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, phys_to_virt }
 import mm.heap { kalloc, kfree, heap_get_free }
 import ipc.message { Message, MSG_FLAG_NONE }
 import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send, channel_recv }
@@ -246,6 +246,63 @@ fn ipc_self_test()
     # Note: channel_debug_print causes page fault - skipped for now
     # channel_debug_print()
 
+# RAM above 4 GiB (AGAST #4183): pmm hands out pages from the top of RAM and
+# the kernel reaches them through the physmap. Takes HIGH_TEST_PAGES pages
+# with pmm_alloc_page_high (the topmost free ones), writes a pattern to the
+# first and last word of each through phys_to_virt, reads them all back and
+# frees them. A physmap that stops short of top-of-RAM faults here; a pmm
+# that drops RAM above 4 GiB hands out a low page. Logs
+#   [pmm] above-4G self-test: <n> pages from 0x... PASSED
+# or "skipped" when the machine has no RAM above 4 GiB. False on failure.
+const FOUR_GIB: u64 = 0x100000000
+const HIGH_TEST_PAGES: i32 = 16
+
+fn pmm_high_memory_self_test() -> bool
+    if pmm_get_total_pages() * PAGE_SIZE <= FOUR_GIB
+        prints("[pmm] above-4G self-test: skipped (no RAM above 4 GiB)\n")
+        return true
+    let free_before: u64 = pmm_get_free_pages()
+    var pages: [16]u64
+    var ok: bool = true
+    var i: i32 = 0
+    while i < HIGH_TEST_PAGES
+        pages[i] = pmm_alloc_page_high()
+        if pages[i] < FOUR_GIB
+            prints("[pmm] above-4G self-test: got page ")
+            serial_print_hex(pages[i])
+            prints("\n")
+            ok = false
+        else
+            let first: *u64 = phys_to_virt(pages[i]) as *u64
+            let last: *u64 = phys_to_virt(pages[i] + PAGE_SIZE - 8) as *u64
+            *first = pages[i] ^ 0x5A5A5A5A5A5A5A5A
+            *last = ~pages[i]
+        i = i + 1
+    i = 0
+    while i < HIGH_TEST_PAGES
+        if pages[i] >= FOUR_GIB
+            let first: *u64 = phys_to_virt(pages[i]) as *u64
+            let last: *u64 = phys_to_virt(pages[i] + PAGE_SIZE - 8) as *u64
+            if *first != (pages[i] ^ 0x5A5A5A5A5A5A5A5A) or *last != ~pages[i]
+                prints("[pmm] above-4G self-test: readback mismatch at ")
+                serial_print_hex(pages[i])
+                prints("\n")
+                ok = false
+        if pages[i] != 0
+            pmm_free_page(pages[i])
+        i = i + 1
+    if pmm_get_free_pages() != free_before
+        prints("[pmm] above-4G self-test: pages leaked\n")
+        ok = false
+    if not ok
+        return false
+    prints("[pmm] above-4G self-test: ")
+    serial_print_dec(HIGH_TEST_PAGES as u64)
+    prints(" pages from 0x")
+    serial_print_hex(pages[0])
+    prints(" PASSED\n")
+    return true
+
 # Memory and IPC self-tests, in boot order.
 pub fn postinit_self_tests(has_boot_info: bool)
     if has_boot_info
@@ -263,6 +320,11 @@ pub fn postinit_self_tests(has_boot_info: bool)
         if not mmap_failure_self_test()
             prints("\n*** KERNEL PANIC ***\n")
             prints("mmap failure self-test failed\n")
+            halt_loop()
+        # RAM above 4 GiB is allocatable and reachable (#4183).
+        if not pmm_high_memory_self_test()
+            prints("\n*** KERNEL PANIC ***\n")
+            prints("pmm above-4G self-test failed\n")
             halt_loop()
         # mmap over a live mapping must not leak the pages it covers (#4114).
         if not mmap_overlap_self_test()

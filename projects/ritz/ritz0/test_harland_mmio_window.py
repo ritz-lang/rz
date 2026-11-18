@@ -39,6 +39,8 @@ import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page }
 import mm.vmm { PTE_PRESENT, PTE_ADDR_MASK, MMIO_WINDOW_BASE, vmm_pml4_phys, vmm_init_mmio_window, vmm_create_user_pml4, vmm_read_pml4_entry }
 
 var g_mem: [266240]u8
+# Tracks the low 1 GiB, where g_mem is (#4183: the caller supplies the bitmap).
+var g_bm: [32768]u8
 
 fn zero_page(p: u64) -> i32
     var i: u64 = 0
@@ -51,7 +53,7 @@ fn main() -> i32
     # The window is the slot this test pins.
     if ((MMIO_WINDOW_BASE >> 39) & 511) != 257
         return 1
-    pmm_init()
+    pmm_init(@g_bm[0], 262144)
     pmm_mark_region_free(@g_mem[0] as u64, 266240)
     let kpml4: u64 = pmm_alloc_page()
     if kpml4 == 0

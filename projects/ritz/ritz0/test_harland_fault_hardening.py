@@ -61,8 +61,11 @@ PMM_OWN_FRAMES = """\
 import ritzlib.option
 import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_get_total_pages }
 
+# A 4 GiB bitmap (the boot paths size theirs from the memory map, #4183).
+var bm: [131072]u8
+
 fn main() -> i32
-    pmm_init()
+    pmm_init(@bm[0], 1048576)
     # RAM is pages 0..7 (page 0 stays out of the pool).
     pmm_mark_region_free(0, 8 * PAGE_SIZE)
     if pmm_get_total_pages() != 8 or pmm_get_free_pages() != 7

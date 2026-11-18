@@ -561,59 +561,73 @@ fn efi_allocate_pages(alloc_type: u32, mem_type: u32, pages: u64, addr: *u64) ->
 var pml4_addr: u64 = 0
 var pdpt_identity_addr: u64 = 0
 var pdpt_highhalf_addr: u64 = 0
-var pd_addr: u64 = 0
-var pd_extra_addr: u64 = 0     # For 1-2GB range
-var pd_extra2_addr: u64 = 0    # For 2-3GB range
-var pd_extra3_addr: u64 = 0    # For 3-4GB range
-var detected_memory_mb: u64 = 0  # Total usable memory in MB
+var pd_addr: u64 = 0            # First of map_gbs PDs, one per GiB (0-1GB first)
+var detected_memory_mb: u64 = 0  # Top of RAM in MB, rounded up to 256 MB
+
+# Identity-mapped GiBs, one PD each: up to top of RAM, not 4 GiB (AGAST
+# #4183). Firmware loads this image and its data (BootInfo, the memory map)
+# wherever it likes; with -m 6G OVMF put them at 0x140000000, and a 4 GiB
+# map faulted on the first instruction after the CR3 switch. One identity
+# PDPT holds 512.
+const MAX_MAP_GBS: u64 = 512
+var map_gbs: u64 = 0
+
+# MB of memory to identity map: top of RAM, never less than 256 MB.
+fn memory_to_map_mb() -> u64
+    var mb: u64 = detected_memory_mb
+    if mb < 256
+        mb = 256
+    if mb > MAX_MAP_GBS * 1024
+        mb = MAX_MAP_GBS * 1024
+    return mb
 
 fn allocate_page_tables() -> i32
     prints("  Allocating page tables...\n")
-    # We need:
-    # - 1 page for PML4
-    # - 1 page for PDPT (identity, covers 0-512GB)
-    # - 1 page for PDPT (higher-half)
-    # - Up to 4 pages for PDs (each covers 1GB with 2MB pages)
-    # Total: 7 pages for up to 4GB mapping
+    # PML4, the identity PDPT, the higher-half PDPT, then one PD per GiB.
+    map_gbs = (memory_to_map_mb() + 1023) / 1024
+    let pages: u64 = 3 + map_gbs
     var addr: u64 = 0
-    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, 7, @addr)
+    var status: u64 = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, pages, @addr)
     if status != EFI_SUCCESS
         prints("    ERROR: Failed to allocate page tables\n")
         return -1
     pml4_addr = addr
     pdpt_identity_addr = addr + 0x1000
     pdpt_highhalf_addr = addr + 0x2000
-    pd_addr = addr + 0x3000         # 0-1GB
-    pd_extra_addr = addr + 0x4000   # 1-2GB
-    pd_extra2_addr = addr + 0x5000  # 2-3GB
-    pd_extra3_addr = addr + 0x6000  # 3-4GB
+    pd_addr = addr + 0x3000
     prints("    PML4 at ")
     serial_print_hex(pml4_addr)
     prints("\n")
-    # Zero all 7 pages
     var p: *u64 = pml4_addr as *u64
-    var i: i32 = 0
-    while i < 3584  # 7 pages * 512 entries
+    var i: u64 = 0
+    while i < pages * 512
         *p = 0
         p = p + 1
         i = i + 1
     return 0
+
+# Whether any RAM (is_ram_type) overlaps the 2 MB chunk at base, by the
+# memory map get_memory_map last read.
+fn chunk_has_ram(base: u64) -> bool
+    let num_entries: u64 = memory_map_size / memory_map_desc_size
+    var i: u64 = 0
+    while i < num_entries
+        let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
+        if is_ram_type(desc.mem_type)
+            let end: u64 = desc.physical_start + desc.number_of_pages * 4096
+            if desc.physical_start < base + 0x200000 and end > base
+                return true
+        i = i + 1
+    return false
 
 fn setup_page_tables() -> i32
     prints("  Setting up page tables based on detected memory...\n")
     let flags: u64 = PTE_PRESENT | PTE_WRITABLE
     let huge_flags: u64 = PTE_PRESENT | PTE_WRITABLE | PTE_HUGE
 
-    # Determine how much memory to map based on detected usable memory
-    # We cap at 4GB since we're using 32-bit addressing limits in some places
-    var memory_to_map_mb: u64 = detected_memory_mb
-    if memory_to_map_mb > 4096
-        memory_to_map_mb = 4096
-    if memory_to_map_mb < 256
-        memory_to_map_mb = 256  # Minimum 256MB
-
+    let mapped_mb: u64 = memory_to_map_mb()
     prints("    Will map ")
-    serial_print_dec(memory_to_map_mb)
+    serial_print_dec(mapped_mb)
     prints(" MB of memory\n")
 
     # PML4[0] -> pdpt_identity (for identity mapping)
@@ -624,107 +638,35 @@ fn setup_page_tables() -> i32
     let pml4_511: *u64 = (pml4_addr + 511 * 8) as *u64
     *pml4_511 = pdpt_highhalf_addr | flags
 
-    # Set up identity PDPT entries for each GB we need to map
-    # PDPT[0] -> pd_addr (0-1GB)
-    let pdpt_id_0: *u64 = pdpt_identity_addr as *u64
-    *pdpt_id_0 = pd_addr | flags
+    # Identity PDPT[g] -> PD g, whose 2 MB pages map GiB g up to mapped_mb
+    # (the rest of the last PD stays empty, as before). Above 1 GiB only
+    # chunks holding RAM: the PCI hole below 4 GiB (framebuffer, LAPIC,
+    # I/O APIC) stays unmapped, so the kernel can map its 4 KiB device
+    # pages there (vmm_map_page refuses to split a 2 MB page).
+    let huge_pages: u64 = mapped_mb / 2
+    var g: u64 = 0
+    while g < map_gbs
+        let pd_g: u64 = pd_addr + g * 0x1000
+        let pdpt_e: *u64 = (pdpt_identity_addr + g * 8) as *u64
+        *pdpt_e = pd_g | flags
+        var e: u64 = 0
+        while e < 512 and g * 512 + e < huge_pages
+            let chunk: u64 = (g * 512 + e) * 0x200000
+            if g == 0 or chunk_has_ram(chunk)
+                let pde: *u64 = (pd_g + e * 8) as *u64
+                *pde = chunk | huge_flags
+            e = e + 1
+        g = g + 1
 
-    # PDPT[1] -> pd_extra_addr (1-2GB) if needed
-    if memory_to_map_mb > 1024
-        let pdpt_id_1: *u64 = (pdpt_identity_addr + 8) as *u64
-        *pdpt_id_1 = pd_extra_addr | flags
-
-    # PDPT[2] -> pd_extra2_addr (2-3GB) if needed
-    if memory_to_map_mb > 2048
-        let pdpt_id_2: *u64 = (pdpt_identity_addr + 16) as *u64
-        *pdpt_id_2 = pd_extra2_addr | flags
-
-    # PDPT[3] -> pd_extra3_addr (3-4GB) if needed
-    if memory_to_map_mb > 3072
-        let pdpt_id_3: *u64 = (pdpt_identity_addr + 24) as *u64
-        *pdpt_id_3 = pd_extra3_addr | flags
-
-    # Higher-half mapping: PDPT[510] -> pd_addr
+    # Higher-half mapping: PDPT[510] -> the first PD
     # The kernel at 0xFFFFFFFF80000000 only needs the first 1GB (where kernel lives)
     let pdpt_hh_510: *u64 = (pdpt_highhalf_addr + 510 * 8) as *u64
     *pdpt_hh_510 = pd_addr | flags
 
-    # Fill first PD (0-1GB) with 2MB huge pages
-    var pd: *u64 = pd_addr as *u64
-    var phys: u64 = 0
-    var pages_in_first_gb: i32 = 512  # Full 1GB
-    if memory_to_map_mb < 1024
-        pages_in_first_gb = (memory_to_map_mb / 2) as i32  # MB / 2MB per page
-    var j: i32 = 0
-    while j < pages_in_first_gb
-        *pd = phys | huge_flags
-        pd = pd + 1
-        phys = phys + 0x200000
-        j = j + 1
-    # Zero remaining entries in first PD
-    while j < 512
-        *pd = 0
-        pd = pd + 1
-        j = j + 1
-
-    # Fill second PD (1-2GB) if needed
-    if memory_to_map_mb > 1024
-        pd = pd_extra_addr as *u64
-        phys = 0x40000000  # 1GB
-        var pages_in_second_gb: i32 = 512
-        if memory_to_map_mb < 2048
-            pages_in_second_gb = ((memory_to_map_mb - 1024) / 2) as i32
-        j = 0
-        while j < pages_in_second_gb
-            *pd = phys | huge_flags
-            pd = pd + 1
-            phys = phys + 0x200000
-            j = j + 1
-        while j < 512
-            *pd = 0
-            pd = pd + 1
-            j = j + 1
-
-    # Fill third PD (2-3GB) if needed
-    if memory_to_map_mb > 2048
-        pd = pd_extra2_addr as *u64
-        phys = 0x80000000  # 2GB
-        var pages_in_third_gb: i32 = 512
-        if memory_to_map_mb < 3072
-            pages_in_third_gb = ((memory_to_map_mb - 2048) / 2) as i32
-        j = 0
-        while j < pages_in_third_gb
-            *pd = phys | huge_flags
-            pd = pd + 1
-            phys = phys + 0x200000
-            j = j + 1
-        while j < 512
-            *pd = 0
-            pd = pd + 1
-            j = j + 1
-
-    # Fill fourth PD (3-4GB) if needed
-    if memory_to_map_mb > 3072
-        pd = pd_extra3_addr as *u64
-        phys = 0xC0000000  # 3GB
-        var pages_in_fourth_gb: i32 = 512
-        if memory_to_map_mb < 4096
-            pages_in_fourth_gb = ((memory_to_map_mb - 3072) / 2) as i32
-        j = 0
-        while j < pages_in_fourth_gb
-            *pd = phys | huge_flags
-            pd = pd + 1
-            phys = phys + 0x200000
-            j = j + 1
-        while j < 512
-            *pd = 0
-            pd = pd + 1
-            j = j + 1
-
     prints("    Identity map: 0-")
-    serial_print_dec(memory_to_map_mb)
+    serial_print_dec(mapped_mb)
     prints("MB -> 0-")
-    serial_print_dec(memory_to_map_mb)
+    serial_print_dec(mapped_mb)
     prints("MB\n")
     prints("    Higher-half:  0xFFFFFFFF80000000 -> 0-1GB\n")
     return 0
@@ -745,6 +687,10 @@ var memory_map_size: u64 = 16384
 var memory_map_key: u64 = 0
 var memory_map_desc_size: u64 = 0
 var memory_map_desc_version: u32 = 0
+
+# RAM, as opposed to MMIO or firmware-reserved ranges.
+fn is_ram_type(t: u32) -> bool
+    return (t >= EFI_LOADER_CODE and t <= EFI_CONVENTIONAL_MEMORY) or t == EFI_ACPI_RECLAIM_MEMORY or t == EFI_ACPI_MEMORY_NVS
 
 fn get_memory_map() -> i32
     prints("  Getting memory map...\n")
@@ -770,7 +716,9 @@ fn get_memory_map() -> i32
         let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
         if desc.mem_type == EFI_CONVENTIONAL_MEMORY
             usable_pages = usable_pages + desc.number_of_pages
-            # Track highest address to know how much to map
+        # Track the top of RAM to know how much to map: any RAM, since this
+        # image and its data (LoaderCode/LoaderData) must be mapped too.
+        if is_ram_type(desc.mem_type)
             let region_end: u64 = desc.physical_start + (desc.number_of_pages * 4096)
             if region_end > highest_usable_addr
                 highest_usable_addr = region_end
@@ -1044,8 +992,11 @@ fn init_graphics() -> i32
 # Global BootInfo struct that will be passed to kernel
 var boot_info: BootInfo
 
-# Memory map entries for BootInfo (max 128 entries)
-var boot_memory_map: [128]MemoryMapEntry
+# Memory map entries for BootInfo: every descriptor memory_map_buffer can
+# hold (16384 / 48 = 341). 128 dropped the top of RAM, sorted last, on a
+# -m 6G OVMF's 135-entry map (AGAST #4183).
+const BOOT_MEMORY_MAP_MAX: u32 = 384
+var boot_memory_map: [384]MemoryMapEntry
 var boot_memory_map_count: u32 = 0
 
 fn convert_efi_memory_type(efi_type: u32) -> u32
@@ -1068,7 +1019,7 @@ fn build_boot_info() -> i32
     boot_memory_map_count = 0
 
     var i: u64 = 0
-    while i < num_entries && boot_memory_map_count < 128
+    while i < num_entries && boot_memory_map_count < BOOT_MEMORY_MAP_MAX
         let desc: *EfiMemoryDescriptor = (@memory_map_buffer[0] + i * memory_map_desc_size) as *EfiMemoryDescriptor
 
         # Only include usable and ACPI reclaimable memory in our map

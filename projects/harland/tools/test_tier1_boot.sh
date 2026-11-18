@@ -33,7 +33,8 @@
 #        POWEROFF_WAIT=N seconds QEMU gets to power off after the verdict
 #                       (default 15)
 #        QEMU_MEM=SIZE  guest RAM (default 2G; 512M puts every pmm page under
-#                       the low 1 GiB identity map, AGAST #3530)
+#                       the low 1 GiB identity map, AGAST #3530; above 4G each
+#                       boot must also pass high_memory, AGAST #4183)
 #
 # Exit: 0 = pass; 1 = a boot failed (panic, exception, failed suite, no
 #       verdict before the timeout, or a failed build); 2 = bad usage;
@@ -227,6 +228,33 @@ powered_off() {
     echo "PASS ($1): init exited and QEMU powered off"
 }
 
+# mem_mib SIZE: QEMU's -m SIZE (e.g. 512M, 6G, 6144) in MiB.
+mem_mib() {
+    case "$1" in
+        *[gG]) echo $(( ${1%[gG]} * 1024 )) ;;
+        *[mM]) echo "${1%[mM]}" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+# high_memory NAME: with more than 4 GiB of guest RAM, pmm must count more
+# than 4 GiB free and the kernel's above-4G self-test must pass: it takes
+# pages from the top of RAM and touches them through the physmap (#4183).
+high_memory() {
+    local log="$WORK/$1.log" free_mb
+    free_mb="$(grep -aoE 'Free pages: +[0-9]+ \([0-9]+ MB\)' "$log" | head -1 | sed -E 's/.*\(([0-9]+) MB\)/\1/')"
+    if [ -z "$free_mb" ] || [ "$free_mb" -le 4096 ]; then
+        echo "FAIL ($1): pmm reports ${free_mb:-no} MB free with $MEM of RAM (want > 4096)"
+        return 1
+    fi
+    if ! grep -aqE '\[pmm\] above-4G self-test: [0-9]+ pages from 0x[0-9A-Fa-f]+ PASSED' "$log"; then
+        grep -a '\[pmm\]' "$log" | head -5
+        echo "FAIL ($1): above-4G self-test did not pass"
+        return 1
+    fi
+    echo "PASS ($1): $free_mb MB free; pages above 4 GiB allocated and touched through the physmap"
+}
+
 # all_passed NAME: pass only if the kernel took no exception and the suite
 # reported ALL TESTS PASSED.
 all_passed() {
@@ -239,6 +267,8 @@ all_passed() {
 }
 
 rc=0
+HIGH_MEM=0
+[ "$(mem_mib "$MEM")" -gt 4096 ] 2>/dev/null && HIGH_MEM=1
 
 if [ "$MODE" != grub ]; then
     mkdir -p "$WORK/esp-native/EFI/BOOT" "$WORK/esp-native/harland"
@@ -249,6 +279,7 @@ if [ "$MODE" != grub ]; then
     blk_transport native modern || rc=1
     key_received native || rc=1
     powered_off native || rc=1
+    [ "$HIGH_MEM" = 1 ] && { high_memory native || rc=1; }
 fi
 
 if [ "$MODE" != native ]; then
@@ -276,6 +307,7 @@ EOF
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
     powered_off grub || rc=1
+    [ "$HIGH_MEM" = 1 ] && { high_memory grub || rc=1; }
 fi
 
 exit $rc
