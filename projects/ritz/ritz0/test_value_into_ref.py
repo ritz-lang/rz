@@ -13,7 +13,7 @@ the same `line:col: message`.
 `@x` doesn't fit `@&T` or `:&` (#2339), so an `@&T` slot is only ever given `@&c`.
 
 The matrices are table rows (AGAST #3889): `test_refusals[<compiler>]` and
-`test_runs[<compiler>]` check every row with test_row_table's assert_refusals /
+`test_runs[<compiler>]` check every row with test_table_rows's assert_refusals /
 assert_runs, each under the id its parametrised test had less the compiler
 (`a_value_never_fits_a_reference_slot[lent-mutable-argument]`), and a failure
 names its rows.  A *_GAPS entry is a strict xfail on the ritz1s, as it was.
@@ -24,9 +24,14 @@ test_at_is_shared.py: keep it.
 
 import pytest
 
-from ref_rules import REF_TO_OTHER_POINTER, REF_TO_OTHER_TYPE, VALUE_INTO_MUT_REF, VALUE_INTO_SHARED_REF
+from ref_rules import (
+    REF_TO_OTHER_POINTER,
+    REF_TO_OTHER_TYPE,
+    VALUE_INTO_MUT_REF,
+    VALUE_INTO_SHARED_REF,
+)
 from test_ref_into_value import COMPILERS, _compile, _ids, _main
-from test_row_table import assert_refusals, assert_runs
+from test_table_rows import assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 

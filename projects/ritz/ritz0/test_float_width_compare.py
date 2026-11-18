@@ -13,7 +13,7 @@ literal takes the other side's type, so `y == 0.1` compares in f32.
 
 Before this ticket ritz0's `--check-types` refused the comparison and nothing
 else did: ritz0's default compile and both ritz1s fpext'd and compared.  Each
-row is one compile per compiler, as a table (test_row_table.py): six operators
+row is one compile per compiler, as a table (test_table_rows.py): six operators
 in both orders, the widened result of an arithmetic op meeting f32, and the
 programs that must still run.
 """
@@ -24,7 +24,7 @@ import pytest
 
 from float_rules import mixed_float_compare
 from test_ref_into_value import COMPILERS
-from test_row_table import assert_refusals, assert_runs
+from test_table_rows import assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 

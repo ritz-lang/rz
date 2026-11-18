@@ -17,14 +17,14 @@ is unchanged, as is the tail of a `-> T` fn (#1429's "can reach its end
 without producing a value", pinned by test_fn_tail_requires_value.py).
 
 ritz1 puts `error: ` before the message, as diag.ritz does.  The forms are
-one table per compiler (test_row_table.py, docs/TESTING.md): 66 cases
+one table per compiler (test_table_rows.py, docs/TESTING.md): 66 cases
 were over the suite's test budget.
 """
 
 import pytest
 
 from test_ref_into_value import COMPILERS, _compile
-from test_row_table import assert_refusals, assert_runs
+from test_table_rows import assert_refusals, assert_runs
 
 MESSAGE = (
     "`pass` has no value, so it can't be used where a value is wanted; "

@@ -18,8 +18,8 @@ through the local, so a copy instead of a pointer exits wrong.
 
 import pytest
 
-from test_row_table import assert_runs
 from test_ref_into_value import COMPILERS
+from test_table_rows import assert_runs
 
 pytestmark = pytest.mark.integration
 

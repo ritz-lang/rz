@@ -16,7 +16,7 @@ AGAST #2781 (and #2366 for a parameter): the array's element must be the
 Span's T. MISMATCHED holds the refusals, the same located error on all three.
 
 Each test is now a table per compiler (AGAST #3889): FORMS through
-test_table_rows, MISMATCHED through test_row_table.assert_refusals.  A row
+test_table_rows, MISMATCHED through test_table_rows.assert_refusals.  A row
 keeps its old parametrised id, less the compiler, and a failure names it.
 """
 
@@ -25,9 +25,7 @@ import pytest
 import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
 from array_rules import ELEMENT_MISMATCH
-from test_table_rows import ritzlib_build
-from test_row_table import assert_refusals
-from test_table_rows import Row, Run
+from test_table_rows import Row, Run, assert_refusals, ritzlib_build
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
@@ -237,7 +235,7 @@ pub fn main() -> i32
 
 # Every row is a row of a table under its old id, less the compiler.  The runs
 # link the ritzlib modules they import (test_table_rows.ritzlib_build); the
-# refusals are test_row_table's, which wants ELEMENT_MISMATCH whole at the `^`,
+# refusals are test_table_rows's, which wants ELEMENT_MISMATCH whole at the `^`,
 # as `_assert_refused` did.
 RUNS = [Row(f"span_from_array[{name}]", table_rows.ALL, Run(*FORMS[name])) for name in sorted(FORMS)]
 

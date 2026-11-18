@@ -1,23 +1,27 @@
-"""A matrix of small programs as one table per compiler (AGAST #3519, #3453 F1).
+"""A matrix of small programs as one table per compiler (AGAST #3518, #3519, #3566).
 
 A helper with its own tests, as test_ritz1_for_header.py is: a `test_` module
 so tools/check_liveness.py counts it as test code.  Import it as
-`import test_table_rows as table_rows`.
+`import test_table_rows as table_rows`.  It is the one table helper: #3566
+folded #3518's test_row_table.py into it.
 
 A parametrised matrix pays pytest's per-test cost once per row: collection,
 xdist dispatch and reporting, and under `batched` a record-mode replay of
 every sibling.  2,070 rows of test_index_through_reference.py and
 test_slice_through_reference.py were 99 CPU-s.  A table pays it once per
-chunk.  The rows are data, each chunk's rows compile as one program per
-compiler (batching.run_rows / refuse_rows, so the leaning checks of AGAST
-#2867 still hold), and every row is asserted by name.
+test.  The rows are data, compiled as one program per compiler and chunk
+(batching.run_rows / refuse_rows, so the leaning checks of AGAST #2867 still
+hold), each run row in its own process, and every row is asserted by name.
 
 **A batch only ever passes a row.**  A row the batch can't answer, or answers
 wrong, is compiled on its own, and that answer is the row's: a failure is
 always the row's own compile, as `batched` promised.  It names the row (the
 id the parametrised test had, less its compiler), what it wanted and what
-it got, and the test goes on to the rest of the chunk, so one broken rule
-lists every row it breaks.
+it got, and the test goes on to the rest of the rows, so one broken rule
+lists every row it breaks (the first `SHOWN` with their detail, the rest by
+name).  `RITZ_TEST_BATCH=0` compiles every row on its own.
+
+Two ways in, one checker (`check`):
 
     @case(box=sorted(BOXES), kind=sorted(KINDS))    # id: the_first_element[Vec-pointer]
     def the_first_element(box, kind):
@@ -26,6 +30,24 @@ lists every row it breaks.
     TABLE = cases(globals())    # every @case in the module, in source order
 
 The kwargs' order is the id's: list them as the old decorators read bottom-up.
+A grid with holes lists `Row(id, compilers, spec)`s instead.  `chunks` /
+`chunk` cut a table into `test_every_row[<compiler>-<chunk>]` tests, and
+`assert_rows(compiler, rows, build=, compile=, work=)` takes the build that
+links what the rows need (`ritzlib_build`).
+
+Or a dict per table, checked in one test per compiler with
+test_ref_into_value.py's build unless `build=` / `compile=` say otherwise:
+
+    assert_runs(compiler, tmp_path, {name: (program, exit code)}, gaps)
+    assert_refusals(compiler, tmp_path, {name: (program with `^`, message)}, gaps)
+
+A refusal's `^` is where its message must be reported, the whole message
+unless it's a `Prefix`; a program without a `^` must report it, as a prefix,
+somewhere in its own lines.
+
+`gaps` maps a row id to the AGAST ticket it is a known gap of: such a row must
+fail (a strict xfail), and one that passes fails the table until the entry is
+dropped.
 """
 
 from __future__ import annotations
@@ -40,9 +62,12 @@ from pathlib import Path
 import pytest
 
 import batching
+import test_ref_into_value as ref_into_value
 import test_ritz1_for_header as for_header
 
 ALL = ("ritz0", "ritz1", "ritz1_selfhosted")
+
+SHOWN = 20  # failing rows reported with their detail; the rest are named
 
 # Rows per chunk: one compile of each chunk per compiler.  batching.CHUNK's 48 is
 # for rows of one function; a table's rows share less, so a merge renames more.
@@ -56,13 +81,23 @@ class Run:
     want: int
 
 
+class Prefix(str):
+    """A `Refused` message that one diagnostic, at `at` if the row has one,
+    starts with."""
+
+
+class Whole(str):
+    """A `Refused` message that one diagnostic, at `at` if the row has one, is."""
+
+
 @dataclass(frozen=True)
 class Refused:
     """The compiler refuses the program.
 
     `message` is in what it says (a tuple: every one of them is; None: any
-    refusal will do); `located`, some diagnostic is at a `main.ritz:` line;
-    `at`, (line, col) is where one is.
+    refusal will do; a `Prefix` or a `Whole`: one `main.ritz:` diagnostic, at
+    `at` if there is one, starts with it or is it); `located`, some diagnostic
+    is at a `main.ritz:` line; `at`, (line, col) is where one is.
     """
     program: str
     message: str | tuple | None
@@ -172,8 +207,24 @@ def _run_alone(compiler, row, build, work) -> str | None:
     return None if got == want else f"want exit {want}, got {got}"
 
 
+_DIAGNOSTIC = re.compile(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)")
+
+
+def _said_wrong(message, out: str, at: str | None) -> str | None:
+    """Why no diagnostic in `out`, at `at` if not None, is the `Whole`
+    `message` (starts with it, a `Prefix`), or None."""
+    whole = isinstance(message, Whole)
+    if any(where == at or at is None for where, text in _DIAGNOSTIC.findall(out)
+           if (text == message if whole else text.startswith(message))):
+        return None
+    how = "a diagnostic" if whole else "a diagnostic starting"
+    return f"want {how} {str(message)!r} at {f'main.ritz:{at}' if at else 'any line'}, got:\n{_tail(out)}"
+
+
 def _refusal_wrong(spec: Refused, out: str, at: str | None) -> str | None:
     """What a refusal's diagnostics `out` lack, or None.  `at` is "line:col" to find."""
+    if isinstance(spec.message, (Prefix, Whole)):
+        return _said_wrong(spec.message, out, at)
     wanted = (spec.message,) if isinstance(spec.message, str) else spec.message or ()
     missing = [m for m in wanted if m not in out]
     if missing:
@@ -196,48 +247,121 @@ def _refused_alone(compiler, row, compile, work) -> str | None:
     return _refusal_wrong(spec, out, "{}:{}".format(*spec.at) if spec.at else None)
 
 
-def check(compiler, rows, *, build, compile, work: Path) -> list:
+def _batched(rows, size, answer) -> list:
+    """`answer(chunk, index)` over `rows`, `size` (None: all) at a time; all
+    None when batching is off (RITZ_TEST_BATCH=0, AGAST #3901)."""
+    if not batching.enabled():
+        return [None] * len(rows)
+    size = size or len(rows) or 1
+    got = []
+    for index, start in enumerate(range(0, len(rows), size)):
+        got += answer(rows[start:start + size], index)
+    return got
+
+
+def _verdict(compiler, row, why, gaps) -> str | None:
+    """The row's failure line, or None: a gap must fail, any other row pass."""
+    gap = gaps.get(row.id)
+    if gap and why is None:
+        return f"{compiler} {row.id}: passes, but is listed as a gap of AGAST #{gap}: drop the entry"
+    if not gap and why:
+        return f"{compiler} {row.id}: {why}"
+    return None
+
+
+def _failures(compiler, rows, *, build, compile, work: Path, gaps=None, size=None) -> list:
+    """(row id, failure line) for each row of `rows` failing on `compiler`, in order."""
+    gaps = gaps or {}
+    runs = [k for k, r in enumerate(rows) if isinstance(r.spec, Run)]
+    refusals = [k for k, r in enumerate(rows) if isinstance(r.spec, Refused)]
+    whys = {}
+    answers = _batched(runs, size, lambda part, i: batching.run_rows(
+        compiler, [rows[k].spec.program for k in part], build, work / "run" / str(i), compile=compile))
+    for k, code in zip(runs, answers):
+        row = rows[k]
+        whys[k] = None if code == row.spec.want else _run_alone(compiler, row, build, work)
+    answers = _batched(refusals, size, lambda part, i: batching.refuse_rows(
+        compiler, [batching._insert_mark(rows[k].spec.program, rows[k].spec.at) if rows[k].spec.at
+                   else rows[k].spec.program for k in part], compile, work / "refuse" / str(i)))
+    for k, answer in zip(refusals, answers):
+        row = rows[k]
+        if (answer is not None and (row.spec.at is None or answer[1] is not None)
+                and _refusal_wrong(row.spec, answer[0], answer[1]) is None):
+            whys[k] = None
+        else:
+            whys[k] = _refused_alone(compiler, row, compile, work)
+    return [(rows[k].id, bad) for k in sorted(whys)
+            for bad in [_verdict(compiler, rows[k], whys[k], gaps)] if bad]
+
+
+def check(compiler, rows, *, build, compile, work: Path, gaps=None, size=None) -> list:
     """One line per row of `rows` that fails on `compiler`: "<compiler> <id>: <why>".
 
     `build` and `compile` are batching.run_rows's: `build(compiler, src, work) ->
     (ok, output, exe)` compiles and links, `compile(compiler, src, work) ->
-    (rc, output)` only compiles, its module in `work/main.ll`.
+    (rc, output)` only compiles, its module in `work/main.ll`.  `gaps` is
+    {row id: AGAST ticket} of rows that must fail; `size` batches the rows
+    that many at a time (None: all in one).
 
     Under RITZ_TEST_BATCH=0 (batching.enabled() false) nothing is batched: the
     batch answers None for every row, so each is compiled alone (AGAST #3901).
     """
-    failures = []
-    runs = [r for r in rows if isinstance(r.spec, Run)]
-    refusals = [r for r in rows if isinstance(r.spec, Refused)]
-    batch = batching.enabled()
-    if runs:
-        got = (batching.run_rows(compiler, [r.spec.program for r in runs], build, work / "run",
-                                 compile=compile)
-               if batch else [None] * len(runs))
-        for row, code in zip(runs, got):
-            if code != row.spec.want:
-                why = _run_alone(compiler, row, build, work)
-                if why:
-                    failures.append(f"{compiler} {row.id}: {why}")
-    if refusals:
-        programs = [batching._insert_mark(r.spec.program, r.spec.at) if r.spec.at else r.spec.program
-                    for r in refusals]
-        got = (batching.refuse_rows(compiler, programs, compile, work / "refuse")
-               if batch else [None] * len(refusals))
-        for row, answer in zip(refusals, got):
-            if (answer is not None and (row.spec.at is None or answer[1] is not None)
-                    and _refusal_wrong(row.spec, answer[0], answer[1]) is None):
-                continue
-            why = _refused_alone(compiler, row, compile, work)
-            if why:
-                failures.append(f"{compiler} {row.id}: {why}")
-    return failures
+    return [bad for _, bad in _failures(compiler, rows, build=build, compile=compile, work=work,
+                                        gaps=gaps, size=size)]
+
+
+def _assert_none(compiler, failures, total) -> None:
+    """Fail naming every failing row: the first `SHOWN` with their detail."""
+    if not failures:
+        return
+    rest = [rid for rid, _ in failures[SHOWN:]]
+    tail = f"\n...and {len(rest)} more: {', '.join(rest)}" if rest else ""
+    raise AssertionError(f"{compiler}: {len(failures)} of {total} rows failed:\n"
+                         + "\n".join(bad for _, bad in failures[:SHOWN]) + tail)
 
 
 def assert_rows(compiler, rows, **kwargs) -> None:
     """`check`, as one assertion listing every failing row."""
-    failures = check(compiler, rows, **kwargs)
-    assert not failures, f"{len(failures)} of {len(rows)} rows failed:\n" + "\n".join(failures)
+    _assert_none(compiler, _failures(compiler, rows, **kwargs), len(rows))
+
+
+# ---- a table as a dict, one test per compiler (AGAST #3518) ----------------
+
+def _caret(marked: str):
+    """`marked` without its `^`, and the `^`'s (line, col) (None without one)."""
+    if "^" not in marked:
+        return marked, None
+    before = marked[:marked.index("^")]
+    return marked.replace("^", "", 1), (before.count("\n") + 1, len(before) - before.rfind("\n"))
+
+
+def _refusal(marked, message) -> Refused:
+    """A dict row's `Refused`: the whole message (or a `Prefix`) at its `^`;
+    without a `^`, the message as a prefix on some line of its own."""
+    program, at = _caret(marked)
+    if isinstance(message, str) and not isinstance(message, (Prefix, Whole)):
+        message = Whole(message) if at else Prefix(message)
+    return Refused(program, message, at=at)
+
+
+def _assert_table(compiler, tmp_path, table, gaps, build, compile) -> None:
+    assert_rows(compiler, table, build=build or ref_into_value._batch_build,
+                compile=compile or ref_into_value._batch_compile, work=tmp_path, gaps=gaps,
+                size=batching.CHUNK)
+
+
+def assert_runs(compiler, tmp_path, rows, gaps=None, *, build=None, compile=None) -> None:
+    """Every row of `rows` ({name: (program, exit code)}) exits as it says on
+    `compiler`; `build` / `compile` default to test_ref_into_value.py's."""
+    _assert_table(compiler, tmp_path, [Row(n, (compiler,), Run(*rows[n])) for n in rows],
+                  gaps, build, compile)
+
+
+def assert_refusals(compiler, tmp_path, rows, gaps=None, *, build=None, compile=None) -> None:
+    """Every row of `rows` ({name: (program with `^` at the spot, message)})
+    is refused there on `compiler` (see `_refusal`)."""
+    _assert_table(compiler, tmp_path, [Row(n, (compiler,), _refusal(*rows[n])) for n in rows],
+                  gaps, build, compile)
 
 
 # ---- rows that import ritzlib (AGAST #3906) ---------------------------------
@@ -400,6 +524,49 @@ def test_with_batching_on_a_row_the_batch_passes_is_not_compiled_again(monkeypat
     assert alone == [] and failures == []
 
 
+
+@pytest.mark.unit
+def test_a_table_is_batched_size_rows_at_a_time(monkeypatch, tmp_path):
+    # assert_runs / assert_refusals batch batching.CHUNK rows a compile, as #3518's did.
+    sizes = []
+    monkeypatch.setenv("RITZ_TEST_BATCH", "1")
+    monkeypatch.setattr(batching, "run_rows", lambda c, programs, *a, **k: sizes.append(len(programs))
+                        or [7] * len(programs))
+    rows = [Row(f"r{i}", ALL, Run(GOOD, 7)) for i in range(5)]
+    assert check("ritz1", rows, build=None, compile=None, work=tmp_path, size=2) == []
+    assert sizes == [2, 2, 1]
+
+
+@pytest.mark.integration    # runs /bin/true and /bin/false
+def test_a_dict_table_builds_with_the_build_it_is_given(monkeypatch, tmp_path):
+    # `build=` / `compile=` replace test_ref_into_value's: a String row links ritzlib.
+    monkeypatch.setenv("RITZ_TEST_BATCH", "0")
+    built = []
+
+    def build(compiler, src, work):
+        built.append((compiler, src.read_text()))
+        return True, "", Path("/bin/true")
+
+    def compile(compiler, src, work):
+        built.append((compiler, src.read_text()))
+        return 1, "main.ritz:2:18: error: nope"
+
+    assert_runs("ritz0", tmp_path / "runs", {"runs": (GOOD, 0)}, build=build, compile=compile)
+    assert_refusals("ritz0", tmp_path / "refusals", {"refused": (BAD.replace("true", "^true"), "nope")},
+                    build=build, compile=compile)
+    assert built == [("ritz0", GOOD), ("ritz0", BAD)]
+
+
+@pytest.mark.unit
+def test_a_refusal_row_wants_it_located_unless_told_not_to(monkeypatch, tmp_path):
+    monkeypatch.setenv("RITZ_TEST_BATCH", "0")
+    rows = [Row("located", ALL, Refused(BAD, "nope")),
+            Row("anywhere", ALL, Refused(BAD, "nope", located=False))]
+    failures = check("ritz1", rows, build=None, compile=lambda c, src, work: (1, "error: nope"),
+                     work=tmp_path)
+    assert [f.split(":")[0] for f in failures] == ["ritz1 located"], failures
+    assert "want it located" in failures[0]
+
 # ---- a chunk is rows of one import set, if that costs no chunk (AGAST #3906) --
 #
 # batching.run_rows compiles alone, as well, every row whose imports differ
@@ -466,3 +633,72 @@ def test_a_row_links_every_ritzlib_module_it_imports(ritz1_bin, tmp_path):
     rows = [Row("hashmap", ALL, Run(HASHMAP, 42))]
     for compiler in ALL:
         assert_ritzlib_rows(compiler, rows, ritz1_bin, tmp_path / compiler)
+
+
+# ---- a dict table: rows named, gaps strict, refusals where `^` is (#3518) --
+#
+# Through test_ref_into_value.py's build, as `assert_runs` / `assert_refusals`
+# are called; ritz1 only, as above.
+
+MAIN = "pub fn main() -> i32\n    {}\n"
+# Same `f` spelled differently per row: the batch renames it, and each row
+# still answers for itself.
+F = "fn f() -> i32\n    return {}\n\n" + MAIN.format("return f()")
+REFUSED = MAIN.format("let x: i32 = ^true\n    return 0")
+
+
+def _failure(call):
+    with pytest.raises(AssertionError) as exc:
+        call()
+    return str(exc.value)
+
+
+def _named(failure):
+    """The rows a table's failure names, with their detail or past it."""
+    detailed = re.findall(r"^ritz1 (\w+): ", failure, re.MULTILINE)
+    past = re.search(r"\.\.\.and \d+ more: (.*)$", failure)
+    return detailed + (past.group(1).split(", ") if past else [])
+
+
+@pytest.mark.integration
+def test_a_run_table_names_each_failing_row(tmp_path):
+    rows = {"right": (MAIN.format(3), 3), "wrong": (MAIN.format(4), 5),
+            "gap_that_passes": (MAIN.format(6), 6), "gap_that_fails": (MAIN.format(7), 8),
+            "f3": (F.format(3), 3), "f4": (F.format(4), 3), "unbuilt": (REFUSED.replace("^", ""), 0)}
+    gaps = {"gap_that_passes": 101, "gap_that_fails": 102}
+    got = _failure(lambda: assert_runs("ritz1", tmp_path, rows, gaps))
+    assert got.startswith("ritz1: 4 of 7 rows failed"), got
+    assert _named(got) == ["wrong", "gap_that_passes", "f4", "unbuilt"], got
+    assert "ritz1 wrong: want exit 5, got 4" in got
+    assert "ritz1 f4: want exit 3, got 4" in got
+    assert "ritz1 unbuilt: want exit 0, but it didn't compile and link" in got
+    assert "ritz1 gap_that_passes: passes, but is listed as a gap of AGAST #101" in got
+
+
+@pytest.mark.integration
+def test_a_refusal_table_names_each_failing_row(tmp_path):
+    shared = "struct C\n    x: i32\n\nfn g(p: @C)\n    {}p.x = 3\n\n" + MAIN.format(0)
+    message = "cannot write through an `@T`: make it `@&T`"
+    rows = {"refused_there": (shared.format("^"), message),
+            "refused_elsewhere": (shared.format("") + "    ^0\n", message),
+            "part_there": (shared.format("^"), message[:-1]),
+            "prefix_there": (REFUSED, Prefix("")),
+            "anywhere": (REFUSED.replace("^", ""), ""),
+            "prefix_elsewhere": (REFUSED.replace("^true", "true^"), Prefix("")),
+            "accepted": (MAIN.format(0), "")}
+    got = _failure(lambda: assert_refusals("ritz1", tmp_path, rows))
+    assert got.startswith("ritz1: 4 of 7 rows failed"), got
+    assert _named(got) == ["refused_elsewhere", "part_there", "prefix_elsewhere", "accepted"], got
+    assert f"ritz1 refused_elsewhere: want a diagnostic {message!r} at main.ritz:9:5" in got
+    assert "ritz1 part_there: want a diagnostic " in got   # the whole message, unless a Prefix
+    assert "ritz1 prefix_elsewhere: want a diagnostic starting '' at main.ritz:2:22" in got
+    assert "ritz1 accepted: want it refused" in got
+
+
+@pytest.mark.unit
+def test_a_long_failure_names_the_rows_past_its_detail():
+    failures = [(f"r{i}", f"ritz1 r{i}: want exit 0, got 1") for i in range(SHOWN + 2)]
+    got = _failure(lambda: _assert_none("ritz1", failures, 30))
+    assert got.startswith(f"ritz1: {SHOWN + 2} of 30 rows failed"), got
+    assert f"ritz1 r{SHOWN - 1}: want exit 0" in got and f"ritz1 r{SHOWN}: want" not in got
+    assert got.endswith(f"...and 2 more: r{SHOWN}, r{SHOWN + 1}")

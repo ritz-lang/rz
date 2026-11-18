@@ -7,14 +7,14 @@ with a raw `'_Undefined' object has no attribute 'type'` traceback that named
 no source position.  The emitters now return a sentinel carrying the match's
 span, and reading it as a value reports there, at the `match`.
 
-One row per consumer kind (test_row_table.py, docs/TESTING.md).  ritz0 only:
+One row per consumer kind (test_table_rows.py, docs/TESTING.md).  ritz0 only:
 this is ritz0's emitter-as-type-checker error surface.  A call argument has
 no row: a match cannot open inside `(` (the parser refuses it first).
 """
 
 import pytest
 
-from test_row_table import assert_refusals, assert_runs
+from test_table_rows import assert_refusals, assert_runs
 
 MESSAGE = (
     "this match has no value: its arms don't yield one value type, "

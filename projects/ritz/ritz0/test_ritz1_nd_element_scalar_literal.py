@@ -20,7 +20,7 @@ element store (`x[1][1] = true`) was refused "cannot use bool as an integer":
 the element's expression type fell to i64, so bool_check saw an integer slot.
 
 The cases are table rows (AGAST #3889): `test_rows_exit_right[<compiler>]`
-checks every row with test_row_table.assert_runs, each under the id its
+checks every row with test_table_rows.assert_runs, each under the id its
 parametrised test had less the compiler (`nd_scalar_element_with_literal[2d-field-f32]`),
 and a failure names its rows.
 """
@@ -28,7 +28,7 @@ and a failure names its rows.
 import pytest
 
 from test_ritz1_array_ptr_element import COMPILERS, SCALARS
-from test_row_table import assert_runs
+from test_table_rows import assert_runs
 
 # Where the array lives: its spelling, what comes before main, and the top of
 # main (`{ty}` is the full array type).

@@ -12,8 +12,8 @@ strict xfail citing its ticket.
 
 import pytest
 
-from test_row_table import assert_refusals, assert_runs
 from test_ref_into_value import COMPILERS
+from test_table_rows import assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 
@@ -315,7 +315,7 @@ SHARED_NEAREST = {
 }
 
 
-# AGAST #3518: each table is one test per compiler, a row per case (test_row_table.py).
+# AGAST #3518: each table is one test per compiler, a row per case (test_table_rows.py).
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_member_through_levels(tmp_path, compiler):
     assert_runs(compiler, tmp_path, ROWS)

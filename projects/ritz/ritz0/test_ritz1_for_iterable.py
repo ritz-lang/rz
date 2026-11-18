@@ -24,10 +24,8 @@ from pathlib import Path
 import pytest
 
 import fast_link
-
 import ritz0_inproc
 from test_borrow_param_ref_field import _compile, _run
-from test_row_table import assert_runs
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
@@ -978,10 +976,11 @@ RANK3 = {
 }
 
 
-# One table per compiler (test_row_table.py), not a parametrised matrix.
+# One table per compiler (test_table_rows.py), not a parametrised matrix.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_plane_binding_walks_a_rank3_array(tmp_path, compiler):
+    from test_table_rows import assert_runs  # #3566: it imports for_header, which imports this
     assert_runs(compiler, tmp_path, RANK3)
 
 
@@ -1104,10 +1103,11 @@ PLANES = {
 }
 
 
-# One table per compiler (test_row_table.py), not a parametrised matrix.
+# One table per compiler (test_table_rows.py), not a parametrised matrix.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_plane_binding_is_an_nd_array(tmp_path, compiler):
+    from test_table_rows import assert_runs  # #3566: as above
     assert_runs(compiler, tmp_path, PLANES)
 
 

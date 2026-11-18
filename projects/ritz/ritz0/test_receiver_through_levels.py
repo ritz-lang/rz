@@ -17,8 +17,8 @@ in test_member_through_levels.py (#2398).
 import pytest
 
 from ref_rules import MOVE_OUT_OF_REF
-from test_row_table import assert_refusals, assert_runs
 from test_ref_into_value import COMPILERS
+from test_table_rows import assert_refusals, assert_runs
 
 pytestmark = pytest.mark.integration
 
@@ -323,7 +323,7 @@ RITZ1_GAPS = {}
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}
 
 
-# AGAST #3518: each table is one test per compiler, a row per case (test_row_table.py).
+# AGAST #3518: each table is one test per compiler, a row per case (test_table_rows.py).
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_receiver_through_levels(tmp_path, compiler):
     assert_runs(compiler, tmp_path, ROWS, GAPS[compiler])

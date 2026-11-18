@@ -25,7 +25,7 @@ struct; this has what's different for the others:
 `@x` doesn't fit an `@&T` or a `:&` (#2339): neither gets one here.
 
 The rows are tables, not a parametrised matrix (AGAST #3520): one test per
-compiler runs every row it holds in batched compiles (test_row_table.py), and a
+compiler runs every row it holds in batched compiles (test_table_rows.py), and a
 failure names each row that missed, what it wanted and what it got.  Which
 compilers a table runs on is the same as when each row was its own test.
 """
@@ -39,7 +39,7 @@ from ref_rules import (
     VALUE_INTO_SHARED_REF,
 )
 from test_ref_into_value import COMPILERS
-from test_row_table import Prefix, assert_refusals, assert_runs
+from test_table_rows import Prefix, assert_refusals, assert_runs
 
 INTS = ["i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64"]
 FLOATS = ["f32", "f64"]

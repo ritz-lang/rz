@@ -41,7 +41,7 @@ from pathlib import Path
 import pytest
 
 from test_ref_into_value import _compile
-from test_row_table import assert_runs
+from test_table_rows import assert_runs
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SRC = RITZ_ROOT / "ritz1" / "src"

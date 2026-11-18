@@ -17,13 +17,13 @@ Expected values come from the program; ritz0 agrees on every row.
 
 Every row exits 0.  The rows are one table, not a parametrised matrix (AGAST
 #3520): one test per compiler runs them all in batched compiles
-(test_row_table.py), and a failure names each row that missed and what it got.
+(test_table_rows.py), and a failure names each row that missed and what it got.
 """
 
 import pytest
 
 from test_ritz1_array_ptr_element import COMPILERS, SCALARS
-from test_row_table import assert_runs
+from test_table_rows import assert_runs
 
 # 1-3 load, 4-5 store, 6-7 compound, 8 the value a `let` copies out.  `{amp}` is
 # `@` or `@&`, `x` the three scalars, and q points at x[0].

@@ -23,7 +23,7 @@ from __future__ import annotations
 import pytest
 
 from test_ref_into_value import COMPILERS
-from test_row_table import assert_refusals, assert_runs
+from test_table_rows import assert_refusals, assert_runs
 
 # dbl is Ready on its first poll with twice its argument.
 _DBL = "async fn dbl(x: i32) -> i32\n    x * 2\n\n"

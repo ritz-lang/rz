@@ -21,7 +21,7 @@ counts as a borrow is #2371's, and a reference to another type is #2367's and
 #2368's. Nothing here decides those: the `@x` rows ask only that these rules stay
 out of it.
 
-The cases are table rows (test_row_table.py and test_table_rows.py, AGAST
+The cases are table rows (test_table_rows.py, AGAST
 #3889), a few tests per compiler, not a parametrised matrix.  Each row keeps the
 id its parametrised test had, less `test_` and the compiler:
 `test_a_mutating_method_on_a_shared_receiver_is_refused[field-ritz1]` is
@@ -37,8 +37,7 @@ import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
 from ref_rules import BORROW_THROUGH_SHARED, SHARED_INTO_MUT
 from test_ref_into_value import COMPILERS, _compile, _ids, _main
-from test_row_table import assert_refusals, assert_runs
-from test_table_rows import ALL, Row, Run
+from test_table_rows import ALL, Row, Run, assert_refusals, assert_runs
 from test_value_into_ref import SITES
 
 pytestmark = pytest.mark.integration

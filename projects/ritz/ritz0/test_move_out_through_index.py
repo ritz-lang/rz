@@ -18,7 +18,7 @@ bodies, and on ritz1 in span.ritz's (#2159's question): so the refusals assert t
 `line:col` of this program's own error, and the controls that no such error is
 reported at the marked place.  Arrays behind a pointer are #2330's.
 
-The cases are table rows (test_row_table.py, AGAST #3889), one test per
+The cases are table rows (test_table_rows.py, AGAST #3889), one test per
 compiler, not a parametrised matrix.  Each row keeps the id its parametrised
 test had, less the compiler and `test_`: `test_an_element_does_not_move_out[
 let-Vec-pointer-ritz1]` is `an_element_does_not_move_out[let-Vec-pointer]` on
@@ -34,7 +34,7 @@ import pytest
 
 from ref_rules import MOVE_OUT_OF_REF
 from test_ref_into_value import COMPILERS, MOVE, _compile, _located, _main
-from test_row_table import assert_refusals
+from test_table_rows import assert_refusals
 
 pytestmark = pytest.mark.integration
 
