@@ -63,6 +63,11 @@ pub struct CaStore
 # Arena Helpers (inline for CA store)
 # ============================================================================
 
+# sys_mmap is the raw syscall: it fails with -errno (-4095..-1), not just -1.
+fn ca_mmap_failed(p: *u8) -> bool
+    let v: i64 = p as i64
+    return v < 0 && v >= -4095
+
 # Allocate from store's arena
 fn ca_arena_alloc(store: *CaStore, size: i64) -> *u8
     if size <= 0
@@ -102,7 +107,7 @@ pub fn ca_store_init(store: *CaStore)
 
     # Allocate arena
     store.arena_base = sys_mmap(0, CA_STORE_ARENA_SIZE, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
-    if store.arena_base == (-1) as *u8
+    if ca_mmap_failed(store.arena_base)
         store.arena_base = null
         store.arena_size = 0
     else
@@ -134,21 +139,29 @@ pub fn ca_store_add_cert_der(store: *CaStore, der_data: *u8, der_len: i64) -> i3
     if store.cert_count >= CA_STORE_MAX_CERTS
         return 0
 
+    # Every failure below gives back what this call took from the arena
+    # (GitHub #149 L-1, AGAST #2586): a bundle of unparseable certificates
+    # must not use the arena up.
+    let arena_mark: i64 = store.arena_offset
+
     # Allocate certificate struct
     let cert: *X509Certificate = ca_alloc_cert(store)
     if cert == null
+        store.arena_offset = arena_mark
         return 0
 
     # We need to copy DER data to arena since x509_parse_certificate stores
     # pointers into the DER buffer (for tbs_data, der_data fields)
     let der_copy: *u8 = ca_arena_alloc(store, der_len)
     if der_copy == null
+        store.arena_offset = arena_mark
         return 0
     mem_copy(der_copy, der_data, der_len as u64)
 
     # Parse certificate
     let result: i32 = x509_parse_certificate(der_copy, der_len as u64, cert)
     if result != 0
+        store.arena_offset = arena_mark
         return 0
 
     # Add to store
@@ -185,15 +198,7 @@ pub fn ca_store_load_pem_bundle(store: *CaStore, pem_data: *u8, pem_len: i64) ->
             break
 
         # Check if this is a certificate
-        if entry.type_len != 11
-            continue
-        if entry.type_label[0] != 'C' || entry.type_label[1] != 'E' || entry.type_label[2] != 'R'
-            continue
-        if entry.type_label[3] != 'T' || entry.type_label[4] != 'I' || entry.type_label[5] != 'F'
-            continue
-        if entry.type_label[6] != 'I' || entry.type_label[7] != 'C' || entry.type_label[8] != 'A'
-            continue
-        if entry.type_label[9] != 'T' || entry.type_label[10] != 'E'
+        if pem_label_is_certificate(@entry.type_label[0], entry.type_len) != 1
             continue
 
         # Add certificate to store
@@ -230,12 +235,18 @@ pub fn ca_store_load_pem_file(store: *CaStore, path: *u8, path_len: i32) -> i32
         sys_close(fd)
         return -1
 
+    # An empty bundle holds no certificates. mmap of length 0 is EINVAL, so
+    # it must not get that far (GitHub #149 L-2, AGAST #2586).
+    if size == 0
+        sys_close(fd)
+        return 0
+
     # Seek back to start
     sys_lseek(fd, 0, 0)  # SEEK_SET
 
     # Allocate buffer for file content
     let file_buf: *u8 = sys_mmap(0, size, PROT_READ_WRITE, MAP_PRIVATE_ANON, -1, 0)
-    if file_buf == (-1) as *u8
+    if ca_mmap_failed(file_buf)
         sys_close(fd)
         return -1
 

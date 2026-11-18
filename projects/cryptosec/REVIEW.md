@@ -379,7 +379,7 @@ Algorithmically unacceptable for large RSA-sized bigints (2048+ bits). Critical 
 
 Eight mutable global variables cache CPU feature detection results with no atomic initialization.
 
-**Fix:** Document thread-safety assumption or use atomic initialization.
+**Fix:** Document thread-safety assumption or use atomic initialization. **Open: AGAST #4126.**
 
 ---
 
@@ -389,7 +389,7 @@ Eight mutable global variables cache CPU feature detection results with no atomi
 
 Both branches of the if/else execute identical code (SHA-256 init). SHA-384 is not actually supported.
 
-**Fix:** Implement SHA-384 branch or document that only SHA-256 suites are supported.
+**Fix:** Implement SHA-384 branch or document that only SHA-256 suites are supported. **Fixed #2586:** it returns -1 for any suite but the two SHA-256 ones.
 
 ---
 
@@ -407,16 +407,16 @@ A small-order peer public key (e.g. all zeros) forces the all-zero shared secret
 
 | # | Finding | File |
 |---|---------|------|
-| L-1 | Arena partial-allocation waste on cert parse failure | `ca_store.ritz:138-156` |
-| L-2 | `ca_store_load_pem_file` passes `size=0` to `sys_mmap` for empty files | `ca_store.ritz:237` |
-| L-3 | BigInt intermediates not zeroed in `bigint_mod_exp` | `bigint.ritz` |
+| L-1 | Arena partial-allocation waste on cert parse failure. **Fixed #2586:** a failed add rolls the arena back | `ca_store.ritz:138-156` |
+| L-2 | `ca_store_load_pem_file` passes `size=0` to `sys_mmap` for empty files. **Fixed #2586:** an empty file loads 0 certs; mmap errors are checked as -errno | `ca_store.ritz:237` |
+| L-3 | BigInt intermediates not zeroed in `bigint_mod_exp`. **Fixed #2586** | `bigint.ritz` |
 | L-4 | ECDSA/Ed25519 X.509 verification returns 0 (fail-safe but undocumented). **Fixed #2109:** ECDSA-SHA256/384 (P-256 issuers; P-384 issuers since #2115) and Ed25519 verified | `x509_verify.ritz:42-46` |
-| L-5 | `GRND_NONBLOCK`/`GRND_RANDOM` constants defined but unused | `random.ritz:25-26` |
-| L-6 | `fe_reduce` in x25519 uses non-constant-time nested branches | `x25519.ritz:248-253` |
-| L-7 | `cpu_has_avx512` doesn't check AVX2 prerequisite | `cpuid.ritz:165` |
-| L-8 | `pem_parse_certificate` only checks first 2 bytes ("CE") of type label | `pem.ritz:292-307` |
-| L-9 | Various naming issues (`sha512_new` suggests ready-to-use but isn't) | `sha512.ritz` |
-| L-10 | `x25519_pubkey` unnecessary zeroing loop for basepoint | `x25519.ritz:689-697` |
+| L-5 | `GRND_NONBLOCK`/`GRND_RANDOM` constants defined but unused. **Fixed #2586:** removed | `random.ritz:25-26` |
+| L-6 | `fe_reduce` in x25519 uses non-constant-time nested branches. **Fixed #2586:** branch-free masks | `x25519.ritz:248-253` |
+| L-7 | `cpu_has_avx512` doesn't check AVX2 prerequisite. **Fixed #2586** (XCR0 check still missing: AGAST #4127) | `cpuid.ritz:165` |
+| L-8 | `pem_parse_certificate` only checks first 2 bytes ("CE") of type label. **Fixed #2586:** whole label compared | `pem.ritz:292-307` |
+| L-9 | Various naming issues (`sha512_new` suggests ready-to-use but isn't). **Fixed #2586:** `sha512_new`/`sha384_new` return initialised contexts | `sha512.ritz` |
+| L-10 | `x25519_pubkey` unnecessary zeroing loop for basepoint. **Not a defect (#2586):** locals are not zero-initialised (only globals are), so the loop is needed | `x25519.ritz:689-697` |
 
 ---
 
