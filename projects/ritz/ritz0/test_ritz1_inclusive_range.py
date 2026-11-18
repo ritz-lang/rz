@@ -43,7 +43,7 @@ PROGRAMS = {
 fn main() -> i32
     var s: i32 = 0
     for i in 1..=10
-        s += i
+        s += i as i32
     return s
 """,
         55,
@@ -54,7 +54,7 @@ fn main() -> i32
 fn main() -> i32
     var s: i32 = 0
     for i in 1..10
-        s += i
+        s += i as i32
     return s
 """,
         45,
@@ -100,7 +100,7 @@ fn main() -> i32
     for i in 1..=100
         if i == 3
             break
-        s += i
+        s += i as i32
     return s
 """,
         75,

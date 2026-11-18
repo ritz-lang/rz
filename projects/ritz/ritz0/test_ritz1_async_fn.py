@@ -125,7 +125,7 @@ RUNS = {
                           + _main("    let r: i32 = await twice(3)\n    r\n"), 12),
     # `async fn main` awaiting a chain of async fns, an i64 one among them.
     "async_main_chain": ("async fn c(x: i32) -> i64\n    (x * 3) as i64\n\n"
-                         "async fn b(x: i32) -> i32\n    let v: i32 = await c(x)\n    v + 1\n\n"
+                         "async fn b(x: i32) -> i32\n    let v: i64 = await c(x)\n    (v + 1) as i32\n\n"
                          "async fn main() -> i32\n    let v: i32 = await b(4)\n    v\n", 13),
     "pub_and_attributed": ("pub async fn f() -> i32\n    1\n\n[[inline]]\nasync fn a() -> i32\n    2\n\n"
                            + _main("    let x: i32 = await f()\n    let y: i32 = await a()\n    x + y\n"), 3),

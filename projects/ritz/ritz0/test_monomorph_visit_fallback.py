@@ -49,12 +49,12 @@ CASES = {
     "tuple": """\
 fn main() -> i32
     let t = (W<i64> { tag: 1, v: 40 }, 1)
-    t.0.tag as i32 + t.0.v as i32 + t.1
+    t.0.tag as i32 + t.0.v as i32 + t.1 as i32
 """,
     "tuple_nested": """\
 fn main() -> i32
     let t = (W<W<i64>> { tag: 1, v: W<i64> { tag: 2, v: 38 } }, 1)
-    t.0.tag as i32 + t.0.v.tag as i32 + t.0.v.v as i32 + t.1
+    t.0.tag as i32 + t.0.v.tag as i32 + t.0.v.v as i32 + t.1 as i32
 """,
     # A `?` operand: TryOp's operand was never entered, so neither the
     # generic call `pass<W<i64>>` nor the literal it is passed was found.
@@ -113,7 +113,7 @@ fn main() -> i32
     "grouped_in_tuple": """\
 fn main() -> i32
     let t = ((W<i64> { tag: 2, v: 40 }), 0)
-    t.0.tag as i32 + t.0.v as i32 + t.1
+    t.0.tag as i32 + t.0.v as i32 + t.1 as i32
 """,
 }
 

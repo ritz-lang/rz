@@ -962,7 +962,8 @@ pub fn main() -> i32
     "lent_temp_in_if_expr": (LENT + """\
 pub fn main() -> i32
     let c: i32 = 1
-    let v = if c == 1 then look(@make(3)) else 0
+    let zero: i32 = 0
+    let v = if c == 1 then look(@make(3)) else zero
     return v * 10 + DROPS
 """, 31, {}),
 
@@ -1035,7 +1036,7 @@ pub fn main() -> i32
     # Iterations 0 and 1 drop at the end of the body; iteration 2 on `break`.
     "break": ("""\
 fn f()
-    var i = 0
+    var i: i32 = 0
     while i < 5
         var t = make(i)
         if i == 2
@@ -1050,7 +1051,7 @@ pub fn main() -> i32
     # Four iterations, two of which leave by `continue`.
     "continue": ("""\
 fn f()
-    var i = 0
+    var i: i32 = 0
     while i < 4
         i = i + 1
         var t = make(i)
@@ -1208,7 +1209,7 @@ pub fn main() -> i32
     "loop_move_reassigned": ("""\
 fn f()
     var t = make(0)
-    var i = 0
+    var i: i32 = 0
     while i < 3
         consume(t)
         i = i + 1
@@ -1725,7 +1726,7 @@ pub fn main() -> i32
     "field_move_in_loop_reassigned": ("""\
 fn f()
     var h = Holder { t: make(0), n: 0 }
-    var i = 0
+    var i: i32 = 0
     while i < 3
         consume(h.t)
         i = i + 1
@@ -1774,7 +1775,7 @@ pub fn main() -> i32
     # consume drops id 0, iteration 1's scope end id 1.
     "field_move_fresh_each_iteration": ("""\
 fn f()
-    var i = 0
+    var i: i32 = 0
     while i < 2
         var h = Holder { t: make(i), n: 0 }
         if i == 0
@@ -1856,7 +1857,7 @@ pub fn main() -> i32
     "field_assign_in_loop": ("""\
 fn f()
     var h = Holder { t: make(0), n: 0 }
-    var i = 1
+    var i: i32 = 1
     while i < 4
         h.t = make(i)
         i = i + 1
@@ -2164,7 +2165,7 @@ fn peek(s: @Slot) -> i32
 
 fn f() -> i32
     var s = Nest.Has(Slot.Full(make(1)))
-    var r = 0
+    var r: i32 = 0
     match @s
         Has(x) => r = peek(@x)
         _ => r = 0

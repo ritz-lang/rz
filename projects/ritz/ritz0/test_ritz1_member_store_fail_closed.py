@@ -208,7 +208,7 @@ pub fn main() -> i32
     ops.h = 9
     ops.n = 40
     ops.p = @x
-    ops.n += *ops.p
+    ops.n += (*ops.p) as i32
     if ops.c == 255 and ops.a == 7 and ops.h == 9
         return ops.n
     return 1

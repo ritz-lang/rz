@@ -165,7 +165,7 @@ pub fn main() -> i32
     let c = match pick(@b, false)
         Some(s) => 50
         None => 7
-    return a + c
+    return a + c as i32
 """, 17),
     "result_arg": (CROSS + """\
 fn read_n(data: [u8], n: i64) -> Result<[u8], i32>
@@ -197,7 +197,7 @@ pub fn main() -> i32
     let b = match take_prefix(@buf, 9)
         Some(s) => 50
         None => 7
-    return a + b
+    return a + b as i32
 """, 13),
     "result_payload": ("import ritzlib.result\n" + SPAN + """\
 fn read_slice(data: [u8], n: i64) -> Result<[u8], i32>

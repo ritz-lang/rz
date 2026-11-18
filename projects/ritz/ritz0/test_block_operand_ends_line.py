@@ -168,7 +168,7 @@ def test_infix_at_line_start_after_if_operand_is_not_absorbed(op):
 # --- the programs run ---------------------------------------------------------
 
 MATCH_PROGRAM = """\
-fn g(p: *i32, c: i32) -> i32
+fn g(p: *i64, c: i32) -> i64
     let x = 5 + match c
         1 => 1
         _ => 2
@@ -176,7 +176,7 @@ fn g(p: *i32, c: i32) -> i32
     -x
 
 fn main() -> i32
-    var v: i32 = 0
+    var v: i64 = 0
     if g(@&v, 2) != -7
         return 1
     if v != 7
@@ -187,7 +187,7 @@ fn main() -> i32
 """
 
 IF_PROGRAM = """\
-fn g(p: *i32, c: i32) -> i32
+fn g(p: *i64, c: i32) -> i64
     let x = 5 + if c == 1
         1
     else
@@ -196,7 +196,7 @@ fn g(p: *i32, c: i32) -> i32
     -x
 
 fn main() -> i32
-    var v: i32 = 0
+    var v: i64 = 0
     if g(@&v, 2) != -7
         return 1
     if v != 7

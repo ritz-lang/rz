@@ -324,7 +324,7 @@ fn main() -> i32
     # A loop that ends in nothing: the #2520 migration's shape.
     "loop_ends_fn": ("""\
 fn g() -> i32
-    var i = 0
+    var i: i32 = 0
     loop
         i = i + 1
         if i == 3
@@ -335,7 +335,7 @@ fn main() -> i32
     # A loop whose `break` (nested in an if) leaves it: code after it runs.
     "loop_with_break_then_code": ("""\
 fn main() -> i32
-    var i = 0
+    var i: i32 = 0
     loop
         i = i + 1
         if i == 4
@@ -345,7 +345,7 @@ fn main() -> i32
     # A `break` in an `unsafe` block leaves the loop around it.
     "loop_left_from_an_unsafe_block_then_code": ("""\
 fn main() -> i32
-    var i = 0
+    var i: i32 = 0
     loop
         i = i + 1
         unsafe
@@ -356,7 +356,7 @@ fn main() -> i32
     # Only the literal `true` makes a `while` infinite.
     "while_cond_then_code": ("""\
 fn main() -> i32
-    var i = 0
+    var i: i32 = 0
     while i < 3
         i = i + 1
     i + 4
@@ -367,7 +367,7 @@ enum E
     A
     B
 fn f(e: E) -> i32
-    var r = 0
+    var r: i32 = 0
     match e
         A => return 1
         B => r = 2

@@ -97,7 +97,7 @@ fn sum(a: i32, b: i32, c: i32) -> i32
     c
 
 pub fn main() -> i32
-    let x = 10 +
+    let x: i32 = 10 +
     20
     sum(x, 0, 12)
 """

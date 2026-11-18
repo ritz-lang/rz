@@ -201,8 +201,8 @@ KEPT = {
         "fn main() -> i32\n    f(Some(1), Some(2))\n", 21),
     # ...two loops in a row.
     "two_fors_bind_i": (
-        "fn main() -> i32\n    var s: i32 = 0\n    for i in 0..3\n        s = s + i\n"
-        "    for i in 0..4\n        s = s + i * 10\n    s\n", 63),
+        "fn main() -> i32\n    var s: i32 = 0\n    for i in 0..3\n        s = s + i as i32\n"
+        "    for i in 0..4\n        s = s + (i * 10) as i32\n    s\n", 63),
     # ...a loop's body, each time round.
     "let_in_a_loop_body": (
         "fn main() -> i32\n    var s: i32 = 0\n    for i in 0..3\n        let t: i32 = (i * 2) as i32\n"

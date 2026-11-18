@@ -56,19 +56,19 @@ def _on(scrutinee, *arms, before=""):
 
 # Each of the four, whichever arm comes first.
 VARIANTS = {
-    "some": (_on("Some(5)", "Some(v) => v", "_ => 2"), 5),
-    "some_both_arms": (_on("Some(5)", "Some(v) => v", "None => 2"), 5),
-    "some_after_none": (_on("Some(5)", "None => 2", "Some(v) => v"), 5),
+    "some": (_on("Some(5)", "Some(v) => v as i32", "_ => 2"), 5),
+    "some_both_arms": (_on("Some(5)", "Some(v) => v as i32", "None => 2"), 5),
+    "some_after_none": (_on("Some(5)", "None => 2", "Some(v) => v as i32"), 5),
     "none": (_on("None", "Some(v) => 1", "None => 3"), 3),
     "none_by_wildcard": (_on("None", "Some(v) => 1", "_ => 3"), 3),
-    "ok": (_on("Ok(5)", "Ok(v) => v", "Err(e) => 2"), 5),
-    "ok_by_wildcard": (_on("Ok(5)", "Ok(v) => v", "_ => 2"), 5),
-    "err": (_on("Err(5)", "Ok(v) => 1", "Err(e) => e"), 5),
-    "err_after_wildcard_arm": (_on("Err(5)", "Err(e) => e", "_ => 1"), 5),
-    "in_parens": (_on("(Some(5))", "Some(v) => v", "_ => 2"), 5),
-    "borrowed": (_on("@Some(5)", "Some(v) => v", "_ => 2"), 5),
+    "ok": (_on("Ok(5)", "Ok(v) => v as i32", "Err(e) => 2"), 5),
+    "ok_by_wildcard": (_on("Ok(5)", "Ok(v) => v as i32", "_ => 2"), 5),
+    "err": (_on("Err(5)", "Ok(v) => 1", "Err(e) => e as i32"), 5),
+    "err_after_wildcard_arm": (_on("Err(5)", "Err(e) => e as i32", "_ => 1"), 5),
+    "in_parens": (_on("(Some(5))", "Some(v) => v as i32", "_ => 2"), 5),
+    "borrowed": (_on("@Some(5)", "Some(v) => v as i32", "_ => 2"), 5),
     "as_a_statement": (_MAIN + "    var r: i32 = 0\n    match Some(5)\n        Some(v) =>\n"
-                       "            r = v\n        _ =>\n            r = 2\n    r\n", 5),
+                       "            r = v as i32\n        _ =>\n            r = 2\n    r\n", 5),
     # None of these read the value, so they ran before.
     "only_a_wildcard": (_on("Some(5)", "_ => 7"), 7),
     "none_only_a_wildcard": (_on("None", "_ => 3"), 3),
@@ -127,7 +127,7 @@ PAYLOADS = {
                        before="let x: i32 = 5"), 5),
     "bool_local": (_on("Some(x)", "Some(v) => v as i32 + 4", "_ => 2",
                        before="let x: bool = true"), 5),
-    "if_expression": (_on("Some(if x > 1 then 5 else 6)", "Some(v) => v", "_ => 2",
+    "if_expression": (_on("Some(if x > 1 then 5 else 6)", "Some(v) => v as i32", "_ => 2",
                           before="let x: i32 = 2"), 5),
     "struct_param": (_P + "fn f(p: Pair) -> i32\n    match Some(p)\n        Some(v) => v.a + v.b\n"
                      "        _ => 2\n" + _MAIN + "    f(Pair { a: 2, b: 3 })\n", 5),

@@ -152,7 +152,7 @@ fn code(s: Shade) -> i32
     let r = match s
         Shade.Light => 2
         Shade.Dark => 40
-    return r
+    return r as i32
 
 fn main() -> i32
     return code(Shade.Light) + code(Shade.Dark)

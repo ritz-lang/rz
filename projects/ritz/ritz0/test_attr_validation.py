@@ -319,7 +319,7 @@ fn plain<T>(x: T) -> T
     x
 
 fn main() -> i32
-    hint(1) + always(2) + never(3) + plain(4)
+    (hint(1) + always(2) + never(3) + plain(4)) as i32
 """
 
 

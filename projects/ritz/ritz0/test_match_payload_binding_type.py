@@ -25,7 +25,7 @@ WRAP = {"u8": (200, 72), "i8": (100, -28), "u16": (40000, 7232), "i16": (20000, 
 
 
 def _arm(pattern, ty):
-    return f"        {pattern} => sizeof(v) as i32 * 10 + (if ((v + v) / 2) == {WRAP[ty][1]} then 1 else 0)\n"
+    return f"        {pattern} => sizeof(v) as i32 * 10 + (if ((v + v) / 2) == {WRAP[ty][1]} then 1 else 0) as i32\n"
 
 
 def _tagged(ty, slot, ctor, other):

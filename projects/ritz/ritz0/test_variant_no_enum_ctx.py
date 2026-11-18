@@ -56,6 +56,8 @@ def _match(scr, *arms):
 
 
 _SOME = ("Some(v) => v", "_ => 2")
+# A literal payload makes an Option<i64>, so its arm narrows explicitly (AGAST #1444).
+_SOME_I64 = ("Some(v) => v as i32", "_ => 2")
 _NONE = ("Some(v) => 1", "None => 3")
 
 # 1: an array literal's elements build the element's enum.
@@ -95,15 +97,15 @@ INDEX_ASSIGN = {
 
 # 2, 3: an if / match expression's arms build one enum, named by the arms.
 ARMS = {
-    "if_some": (_body("let o = if true then Some(5) else None", *_match("o", *_SOME)), 5),
+    "if_some": (_body("let o = if true then Some(5) else None", *_match("o", *_SOME_I64)), 5),
     "if_none": (_body("let o = if false then Some(5) else None", *_match("o", *_NONE)), 3),
     "if_none_arm_first": (_body("let o = if false then None else Some(5)",
-                                *_match("o", *_SOME)), 5),
+                                *_match("o", *_SOME_I64)), 5),
     "if_else_if": (_body("let o = if false then None else if true then Some(5) else None",
-                         *_match("o", *_SOME)), 5),
+                         *_match("o", *_SOME_I64)), 5),
     "if_u8_payload": (_body("let x: u8 = 200", "let o = if true then Some(x) else None",
                             *_match("o", "Some(v) => v as i32", "_ => 2")), 200),
-    "if_var": (_body("var o = if true then Some(5) else None", *_match("o", *_SOME)), 5),
+    "if_var": (_body("var o = if true then Some(5) else None", *_match("o", *_SOME_I64)), 5),
     "if_ok": (_body("let r = if true then Ok(5) else Err(2)",
                     *_match("r", "Ok(v) => v as i32", "Err(e) => 2")), 5),
     # Err's payload names E, not the first arm's T.
@@ -111,11 +113,11 @@ ARMS = {
         _body('let r = if false then Ok(5) else Err("abc")',
               *_match("r", "Ok(v) => 1", "Err(e) => e.len as i32")), 3),
     "match_some": (_body("let o = match 1", "    1 => Some(5)", "    _ => None",
-                         *_match("o", *_SOME)), 5),
+                         *_match("o", *_SOME_I64)), 5),
     "match_none": (_body("let o = match 2", "    1 => Some(5)", "    _ => None",
                          *_match("o", *_NONE)), 3),
     "match_block_arm": (_body("let o = match 1", "    1 =>", "        let x: i64 = 4",
-                              "        Some(x + 1)", "    _ => None", *_match("o", *_SOME)), 5),
+                              "        Some(x + 1)", "    _ => None", *_match("o", *_SOME_I64)), 5),
     # The fn's return type is the arms' family: `o` is that enum, as #2430's let.
     "if_returned_as_the_fns_enum": (
         "fn f(c: i32) -> Option<i32>\n    let o = if c == 1 then Some(5) else None\n    o\n"

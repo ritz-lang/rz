@@ -473,7 +473,7 @@ ARRAY_FAMILY = {
                            + _A + "    return f(@a)\n"),
     "local_pointer": MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="p"),
     "deref": MAIN + _A + "    var p: *[2]i32 = @a\n" + _SUM_V.format(it="*p"),
-    "literal": MAIN + _SUM_V.format(it="[1, 3]"),
+    "literal": MAIN + _SUM_V.format(it="[1 as i32, 3 as i32]"),
     "row": MAIN + "    var m: [2][2]i32\n" + _fill("m[1]", (1, 3)) + _SUM_V.format(it="m[1]"),
 }
 
@@ -893,7 +893,7 @@ def test_a_loop_over_a_reference_does_not_grow_the_stack(run_with, compiler):
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_literals_slot_does_not_grow_the_stack(run_with, compiler):
-    program = (MAIN + "    var t: i32 = 0\n    var i: i32 = 0\n    while i < 2000000\n"
+    program = (MAIN + "    var t: i64 = 0\n    var i: i32 = 0\n    while i < 2000000\n"
                "        for v in [1, 2, 4]\n            t = t + v\n        i = i + 1\n"
                "    if t != 14000000\n        return 1\n    return 0\n")
     assert run_with(compiler, "stack_lit", program) == 0

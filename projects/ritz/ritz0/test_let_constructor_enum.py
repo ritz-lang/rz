@@ -58,18 +58,18 @@ def _bound(kw, ctor, *arms):
 BOUND = {}
 for _kw in ("let", "var"):
     BOUND.update({
-        f"{_kw}_some": (_bound(_kw, "Some(5)", "Some(v) => v", "_ => 2"), 5),
-        f"{_kw}_some_none_arm_first": (_bound(_kw, "Some(5)", "None => 2", "Some(v) => v"), 5),
+        f"{_kw}_some": (_bound(_kw, "Some(5)", "Some(v) => v as i32", "_ => 2"), 5),
+        f"{_kw}_some_none_arm_first": (_bound(_kw, "Some(5)", "None => 2", "Some(v) => v as i32"), 5),
         f"{_kw}_none": (_bound(_kw, "None", "Some(v) => 1", "None => 3"), 3),
-        f"{_kw}_ok": (_bound(_kw, "Ok(5)", "Ok(v) => v", "Err(e) => 2"), 5),
-        f"{_kw}_err": (_bound(_kw, "Err(5)", "Ok(v) => 1", "Err(e) => e"), 5),
+        f"{_kw}_ok": (_bound(_kw, "Ok(5)", "Ok(v) => v as i32", "Err(e) => 2"), 5),
+        f"{_kw}_err": (_bound(_kw, "Err(5)", "Ok(v) => 1", "Err(e) => e as i32"), 5),
     })
 
 # The payload's type is the enum's.
 PAYLOADS = {
     "wider_than_i32": (_body("let x: i64 = 4294967301", "let o = Some(x)", "match o",
                              "    Some(v) => (v / 1073741824) as i32", "    _ => 2"), 4),
-    "i32_local": (_body("let x: i32 = 5", "let o = Some(x)", "match o", "    Some(v) => v",
+    "i32_local": (_body("let x: i32 = 5", "let o = Some(x)", "match o", "    Some(v) => v as i32",
                         "    _ => 2"), 5),
     "u8_local": (_body("let x: u8 = 200", "let o = Some(x)", "match o",
                        "    Some(v) => v as i32", "    _ => 2"), 200),

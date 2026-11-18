@@ -90,7 +90,7 @@ def test_names_resolved_by_parser():
 BARE = {
     "usize": ("let x = usize\nx as i32", "Unknown identifier: usize"),
     "isize": ("let x = 1 + isize\nx as i32", "Unknown identifier: isize"),
-    "local_named_usize": ("let usize = 0\nusize", None),
+    "local_named_usize": ("let usize: i32 = 0\nusize", None),
 }
 
 

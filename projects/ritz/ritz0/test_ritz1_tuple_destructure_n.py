@@ -71,13 +71,13 @@ RUNS = {
                      "return w + q as i32 + v", 207),
     "tuple_local": ("let t: (i32, i32, i32) = (4, 5, 6)\nlet (a, b, c) = t\nreturn a * 100 + b * 10 + c", 456 % 256),
     "named_struct": ("let p: P = P { a: 1, b: 2, c: 3 }\nlet (pa, pb, pc) = p\nreturn pa * 100 + pb * 10 + pc", 123),
-    "literal": ("let (m0, m1, m2) = (1, 2, 3)\nreturn m0 * 100 + m1 * 10 + m2", 123),
+    "literal": ("let (m0, m1, m2) = (1, 2, 3)\nreturn (m0 * 100 + m1 * 10 + m2) as i32", 123),
     "if_literals": ("let k: i32 = 1\nlet (a, _, c) = if k == 1\n    (10, 20, 30)\nelse\n    (40, 50, 60)\n"
-                    "return a + c", 40),
+                    "return (a + c) as i32", 40),
     "match_literals": ("let k: i32 = 2\nlet (a, b, c) = match k\n    1 => (1, 2, 3)\n    _ => (4, 5, 6)\n"
-                       "return a * 100 + b * 10 + c", 456 % 256),
+                       "return (a * 100 + b * 10 + c) as i32", 456 % 256),
     "if_arm_stmts": ("let k: i32 = 0\nlet (a, b, c) = if k == 1\n    (1, 2, 3)\nelse\n    let q: i32 = 7\n"
-                     "    (q, 8, 9)\nreturn a * 100 + b * 10 + c", 789 % 256),
+                     "    (q, 8, 9)\nreturn (a * 100 + b * 10 + c) as i32", 789 % 256),
     "generic": ("let (a, b, c) = trip<i32>(5)\nreturn a + b + c", 15),
 }
 

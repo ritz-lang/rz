@@ -255,7 +255,7 @@ pub fn main() -> i32
     s.tail = 20
     for r in 0..2
         for c in 0..3
-            s.m[r][c] = r * 3 + c + 1
+            s.m[r][c] = (r * 3 + c + 1) as i32
     var sum: i32 = 0
     for r in 0..2
         for c in 0..3
@@ -323,7 +323,7 @@ pub fn main() -> i32
     s.tag = 5
     for r in 0..3
         for c in 0..2
-            put(@s, r, c, (r * 2 + c) as i64)
+            put(@s, r as i32, c as i32, (r * 2 + c) as i64)
     let q: *M = @s
     q.m[2][1] = 30
     if s.m[2][1] != 30 or get(@s, 2, 0) != 4 or q.m[0][1] != 1
@@ -354,8 +354,8 @@ pub fn main() -> i32
     a.b.x = 2
     for i in 0..2
         for j in 0..2
-            a.b.m[i][j] = i * 2 + j
-            go.b.m[i][j] = 10 + i * 2 + j
+            a.b.m[i][j] = (i * 2 + j) as i32
+            go.b.m[i][j] = (10 + i * 2 + j) as i32
             for k in 0..2
                 a.b.t[i][j][k] = (i * 4 + j * 2 + k) as u16
     a.b.m[1][1] += 10
@@ -422,7 +422,7 @@ pub fn main() -> i32
     h.k = 2
     for i in 0..2
         for j in 0..2
-            h.m[i][j].x = i * 2 + j
+            h.m[i][j].x = (i * 2 + j) as i32
             h.m[i][j].y = 10
     h.m[1][1].y = 30
     let px: *i32 = @h.m[1][0].x
@@ -444,9 +444,9 @@ pub fn main() -> i32
     var arr: [2]M
     for i in 0..2
         for j in 0..3
-            arr[0].m[i][j] = 100 + i * 3 + j
-            arr[1].m[i][j] = i * 3 + j
-            ga[2].m[i][j] = 50 + i * 3 + j
+            arr[0].m[i][j] = (100 + i * 3 + j) as i32
+            arr[1].m[i][j] = (i * 3 + j) as i32
+            ga[2].m[i][j] = (50 + i * 3 + j) as i32
     arr[1].m[1][2] = 40
     arr[1].m[0][1] += 5
     if arr[0].m[1][2] != 105 or arr[1].m[0][1] != 6 or arr[1].m[1][1] != 4
@@ -1002,7 +1002,7 @@ pub fn main() -> i32
     var g: [2][3]i32
     for i in 0..2
         for j in 0..3
-            g[i][j] = i * 3 + j
+            g[i][j] = (i * 3 + j) as i32
     var s: S = S { k: 1, p: @g }
     let q: *[2][3]i32 = s.p
     q[1][2] = 30
@@ -1101,8 +1101,8 @@ pub fn main() -> i32
     var g: [2][3]i32
     for i in 0..2
         for j in 0..3
-            g[i][j] = i * 3 + j
-            GA[i][j] = 10 + i * 3 + j
+            g[i][j] = (i * 3 + j) as i32
+            GA[i][j] = (10 + i * 3 + j) as i32
     let p: *[2][3]i32 = @g
     let c: [2][3]i32 = *p
     let c2 = *p
@@ -1194,7 +1194,7 @@ pub fn main() -> i32
 pub fn main() -> i32
     var g: [6]i32
     for i in 0..6
-        g[i] = i
+        g[i] = i as i32
     let p = @g as *[2][3]i32
     p[1][2] = 30
     let q: *[2][3]i32 = @g as *[2][3]i32
@@ -1237,7 +1237,7 @@ pub fn main() -> i32
     for i in 0..2
         for j in 0..2
             for k in 0..3
-                g[i][j][k] = 6 * i + 3 * j + k
+                g[i][j][k] = (6 * i + 3 * j + k) as i32
     let p: *[2][3]i32 = @g[0]
     let c = *(p + 1)
     g[1][1][2] = 0
@@ -1251,7 +1251,7 @@ pub fn main() -> i32
     var g: [2][3]i32
     for i in 0..2
         for j in 0..3
-            g[i][j] = i * 3 + j
+            g[i][j] = (i * 3 + j) as i32
     var h: [2][3]i32
     let p: *[2][3]i32 = @g
     h = *p
@@ -1340,7 +1340,7 @@ pub fn main() -> i32
     var g: [2][3]i32
     for i in 0..2
         for j in 0..3
-            g[i][j] = i * 3 + j
+            g[i][j] = (i * 3 + j) as i32
     let t = sum(g)
     if g[0][0] != 0 or t != 15
         return 1
@@ -1378,7 +1378,7 @@ fn mk(k: i32) -> [2][3]i32
     var g: [2][3]i32
     for i in 0..2
         for j in 0..3
-            g[i][j] = k * (i * 3 + j)
+            g[i][j] = (k * (i * 3 + j)) as i32
     return g
 
 fn at(a: [2][3]i32, i: i32, j: i32) -> i32
@@ -1399,7 +1399,7 @@ fn mk(k: i32) -> [16][32]i32
     var g: [16][32]i32
     for i in 0..16
         for j in 0..32
-            g[i][j] = k * (i * 32 + j)
+            g[i][j] = (k * (i * 32 + j)) as i32
     return g
 
 fn bump(a: [16][32]i32) -> i32
