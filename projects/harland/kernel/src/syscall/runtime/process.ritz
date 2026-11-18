@@ -99,6 +99,15 @@ fn elf_status_errno(s: ElfStatus) -> i64
         MapFailed => Errno.NoMem as i64
         _ => Errno.NoExec as i64
 
+# Undo a spawn that failed after it made the child current: the parent is
+# the running process again, under its own pid (AGAST #2762: getpid in the
+# parent returned the half-made child's 2), and there is no child to clean
+# up on exit.
+fn spawn_undo(parent_pid: u64)
+    g_has_parent = 0
+    g_child_pid = parent_pid
+    g_child_pml4 = 0
+
 # sys_spawn: Load and execute a binary from the filesystem
 # This is a BLOCKING spawn - we save parent state, run child, and when
 # child exits, we restore parent state and return with child's exit code.
@@ -128,6 +137,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     g_parent_ctx.user_rflags = get_syscall_user_rflags()
     syscall_save_user_frame(@g_parent_frame[0])
     g_parent_ctx.user_pml4 = vmm_get_current_pml4()  # Save parent's page table
+    let parent_pid: u64 = g_child_pid
     g_has_parent = 1
     g_child_pid = 2  # Simple: parent=1, child=2
 
@@ -135,7 +145,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     # This copies kernel mappings but starts with empty user space
     let child_pml4: u64 = vmm_create_user_pml4()
     if child_pml4 == 0
-        g_has_parent = 0
+        spawn_undo(parent_pid)
         return Errno.NoMem as i64
 
     g_child_pml4 = child_pml4  # Save for cleanup on exit
@@ -155,8 +165,7 @@ fn sys_spawn_impl(path: *u8) -> i64
     let fs_result: i32 = fs_process_start(g_child_pid)
     if fs_result != 0
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return fs_result as i64
 
     # Switch to child's address space for ELF loading
@@ -174,8 +183,7 @@ fn sys_spawn_impl(path: *u8) -> i64
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         fs_process_end()
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return elf_status_errno(load_result.error)
 
     # Allocate 64KB user stack (16 pages)
@@ -184,8 +192,7 @@ fn sys_spawn_impl(path: *u8) -> i64
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         fs_process_end()
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return Errno.NoMem as i64
 
     # Jump to child! This does NOT return.
@@ -241,6 +248,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     g_parent_ctx.user_rflags = get_syscall_user_rflags()
     syscall_save_user_frame(@g_parent_frame[0])
     g_parent_ctx.user_pml4 = vmm_get_current_pml4()
+    let parent_pid: u64 = g_child_pid
     g_has_parent = 1
     g_child_pid = 2
 
@@ -248,7 +256,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     let child_pml4: u64 = vmm_create_user_pml4()
     if child_pml4 == 0
         prints("[spawn_args] Failed to create child page table\n")
-        g_has_parent = 0
+        spawn_undo(parent_pid)
         return Errno.NoMem as i64
 
     g_child_pml4 = child_pml4
@@ -270,15 +278,13 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     if total_string_bytes > 4096
         prints("[spawn_args] argv too large\n")
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return Errno.TooBig as i64
 
     if argc > 64
         prints("[spawn_args] too many arguments\n")
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return Errno.TooBig as i64
 
     # Copy all strings into argv_copy
@@ -303,8 +309,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     if fs_result != 0
         prints("[spawn_args] No fd table for the child\n")
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return fs_result as i64
 
     # Switch to child's address space
@@ -319,8 +324,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         fs_process_end()
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return elf_status_errno(load_result.error)
 
     # Allocate 64KB user stack (16 pages)
@@ -330,8 +334,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         vmm_switch_pml4(g_parent_ctx.user_pml4)
         fs_process_end()
         vmm_free_pml4(child_pml4)
-        g_has_parent = 0
-        g_child_pml4 = 0
+        spawn_undo(parent_pid)
         return Errno.NoMem as i64
 
     # Set up the stack with argv data
