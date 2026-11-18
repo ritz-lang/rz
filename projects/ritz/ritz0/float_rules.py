@@ -7,6 +7,8 @@ else needs an explicit `as`.  ritz1's float_slot.ritz has the same table and
 prints the same words.
 """
 
+import ritz_ast as rast
+
 # Float type name -> the widest integer, in bits, every value of which it holds.
 EXACT_BITS = {'f64': 32, 'f32': 16}
 
@@ -14,6 +16,26 @@ EXACT_BITS = {'f64': 32, 'f32': 16}
 def is_exact(bits: int, float_name: str) -> bool:
     """Is every `bits`-wide integer exact in `float_name`?"""
     return bits <= EXACT_BITS[float_name]
+
+
+# The integer operators a literal-only expression may be built with.
+_INT_ARITH_OPS = ('+', '-', '*', '/', '%', '&', '|', '^', '<<', '>>')
+
+
+def int_literal_only(expr) -> bool:
+    """Is `expr` built from integer literals alone (`4000000000`, `-3`,
+    `2 * 3`)?  Literals are not held to §7.5's exactness rule (#2945): one
+    takes its float slot's type, in the emitter and the typing pass alike
+    (#3604).  ritz1's fs_literal_only is this."""
+    if isinstance(expr, (rast.IntLit, rast.CharLit)):
+        return True
+    if isinstance(expr, rast.Grouped):
+        return int_literal_only(expr.expr)
+    if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
+        return int_literal_only(expr.operand)
+    if isinstance(expr, rast.BinOp) and expr.op in _INT_ARITH_OPS:
+        return int_literal_only(expr.left) and int_literal_only(expr.right)
+    return False
 
 
 def int_into_float_inexact(src: str, dst: str) -> str:
