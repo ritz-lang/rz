@@ -173,6 +173,14 @@ def _pkg(tmp_path, *, target_os="", flags=""):
     return pkg
 
 
+def _forget_binary(pkg):
+    """Drop the linked kernel and its manifest, as a fresh worktree has none.
+    Otherwise an unchanged kernel is up to date (AGAST #3632) and its next
+    build never reaches the store these tests are about."""
+    for f in (pkg / "build" / "debug").glob("kern.elf*"):
+        f.unlink()
+
+
 def _build(buildpy, monkeypatch, pkg, *extra):
     monkeypatch.setattr(sys, "argv", ["build.py", "build", str(pkg), "--compiler", "ritz0",
                                       *extra])
@@ -185,6 +193,7 @@ def test_second_freestanding_build_compiles_nothing(buildpy, ritz0, tmp_path, mo
     pkg = _pkg(tmp_path)
     _build(buildpy, monkeypatch, pkg)
     assert ritz0.calls == 1
+    _forget_binary(pkg)
     _build(buildpy, monkeypatch, pkg)
     assert ritz0.calls == 1, "an unchanged freestanding module was compiled again"
     assert buildpy.cas.STATS.hits >= 1
@@ -196,6 +205,7 @@ def test_a_hit_puts_the_stored_object_where_the_link_reads_it(
         buildpy, ritz0, tmp_path, monkeypatch, private_store):
     pkg = _pkg(tmp_path)
     _build(buildpy, monkeypatch, pkg)
+    _forget_binary(pkg)
     _build(buildpy, monkeypatch, pkg, "--debug")  # --debug keeps build/debug/obj
     assert ritz0.calls == 1
     kept = list((pkg / "build" / "debug" / "obj").glob("kern_*.o"))

@@ -318,6 +318,10 @@ def test_freestanding_build_rebuilds_when_gc_wins_after_the_hit(
         buildpy.main()  # the link outcome (ld.lld present?) is irrelevant here
 
     build()
+    # A fresh worktree has no linked kernel; with one, an unchanged kernel
+    # is up to date (AGAST #3632) and never reaches the store.
+    for f in (pkg / "build" / "debug").glob("kern.elf*"):
+        f.unlink()
     hits = _gc_after_every_hit(monkeypatch)
     build()
     assert hits, "the second build should have hit the store"

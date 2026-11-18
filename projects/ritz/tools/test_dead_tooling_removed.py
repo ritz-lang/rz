@@ -70,7 +70,9 @@ def test_rz_rejects_deleted_subcommands(argv):
 @pytest.mark.unit
 def test_packaging_module_is_gone():
     assert not (PKG_DIR / "packaging.py").exists()
-    assert "from packaging import" not in BUILD_PY.read_text()
+    # build.py and the modules it was split into (AGAST #3632).
+    for src in sorted(PKG_DIR.glob("build*.py")):
+        assert "from packaging import" not in src.read_text(), src.name
 
 
 @pytest.mark.unit

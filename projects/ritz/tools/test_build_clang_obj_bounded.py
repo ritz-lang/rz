@@ -296,5 +296,7 @@ def test_bounds_have_safe_defaults_and_ignore_garbage(buildpy, monkeypatch):
 @pytest.mark.unit
 def test_no_silent_fallback_remains_in_build_py():
     # Grep guard: the only -O2 object compile is the bounded helper's.
-    src = (PKG_DIR / "build.py").read_text()
+    # build_pipeline.py holds build.py's compile code since AGAST #3632.
+    src = "".join((PKG_DIR / f).read_text() for f in (
+        "build.py", "build_pipeline.py", "build_testrun.py", "build_cli.py", "manifest.py"))
     assert src.count('"-O2"') == 1, "a second, unbounded clang -O2 call appeared"

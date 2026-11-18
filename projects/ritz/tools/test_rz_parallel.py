@@ -16,6 +16,7 @@ test runs a real temp package through both paths and compares verdict lines.
 import importlib.machinery
 import importlib.util
 import json
+import os
 import sys
 import threading
 import time
@@ -169,15 +170,20 @@ class TestRunPool:
         assert sorted(seen) == ["child0", "child1", "child2", "child3", "root"]
 
     def test_unit_captures_stdout_and_stderr_in_order(self, rz):
+        # One pipe carries both streams, so their order is the child's. The
+        # child is hermetic (AGAST #3632): -I -S and a bare environment, so
+        # nothing but its own two lines can reach that pipe (it inherited the
+        # test's environment, site hooks included, and failed once under
+        # host load at 25). The message shows what did arrive.
         u = rz.Unit(project="x", order=(0,), sched=(0,), kind="build",
-                    cmd=[sys.executable, "-c",
+                    cmd=[sys.executable, "-I", "-S", "-c",
                          "import sys; print('out', flush=True); "
                          "print('err', file=sys.stderr, flush=True); "
                          "sys.exit(3)"],
-                    env=None)
+                    env={"PATH": os.environ.get("PATH", "")})
         rz.run_unit(u)
-        assert u.rc == 3
-        assert u.output.splitlines() == ["out", "err"]
+        assert u.rc == 3, u.output
+        assert u.output.splitlines() == ["out", "err"], repr(u.output)
 
 
 # --------------------------------------------------------------------------

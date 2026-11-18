@@ -53,7 +53,8 @@ def test_build_py_has_no_ritz1_tests_command():
 @pytest.mark.unit
 def test_build_py_has_no_stale_ritz1_test_list():
     """No hardcoded list of ritz1 test files that can silently go missing."""
-    source = BUILD_PY.read_text()
+    # build.py and the modules it was split into (AGAST #3632).
+    source = "".join(p.read_text() for p in sorted(RITZ_ROOT.glob("build*.py")))
     assert "RITZ1_TESTS" not in source
     assert "not found, skipping" not in source
 

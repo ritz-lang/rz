@@ -27,7 +27,7 @@ A package manifest: `ritz.toml` at the root of every package.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `sources` | string or string list | `["src"]` | `projects/ritz/build.py plan_binaries`<br>`projects/ritz/build.py build_package`<br>`projects/ritz/resolve.py package_import_namespaces` | Source roots, relative to the package. Also accepted under [package] or [build]; the first one present wins, in the order top level, [package], [build]. |
+| `sources` | string or string list | `["src"]` | `projects/ritz/manifest.py package_sources`<br>`projects/ritz/resolve.py package_import_namespaces` | Source roots, relative to the package. Also accepted under [package] or [build]; the first one present wins, in the order top level, [package], [build]. |
 
 ### `[package]`
 
@@ -35,10 +35,10 @@ Package identity.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `name` | string | **required** | `projects/ritz/build.py plan_binaries`<br>`projects/ritz/build.py build_package`<br>`projects/ritz/resolve.py package_import_namespaces`<br>`rz cmd_list` | Package name. Also its import namespace and, with no [[bin]] or [[lib]], its binary's name. |
+| `name` | string | **required** | `projects/ritz/manifest.py plan_binaries`<br>`projects/ritz/build_pipeline.py build_package`<br>`projects/ritz/resolve.py package_import_namespaces`<br>`rz cmd_list` | Package name. Also its import namespace and, with no [[bin]] or [[lib]], its binary's name. |
 | `version` | string |  | `rz cmd_list` | Package version, shown by `rz list`. |
 | `description` | string |  | `rz cmd_list` | One line, shown by `rz list`. |
-| `sources` | string or string list |  | `projects/ritz/build.py plan_binaries`<br>`projects/ritz/build.py build_package`<br>`projects/ritz/resolve.py package_import_namespaces` | See top-level `sources`. |
+| `sources` | string or string list |  | `projects/ritz/manifest.py package_sources`<br>`projects/ritz/resolve.py package_import_namespaces` | See top-level `sources`. |
 
 ### `[build]`
 
@@ -46,11 +46,11 @@ Build settings. `opt-level`, `debug` and `lto` are the base every [profile.*] ov
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `sources` | string or string list |  | `projects/ritz/build.py plan_binaries`<br>`projects/ritz/build.py build_package`<br>`projects/ritz/resolve.py package_import_namespaces` | See top-level `sources`. |
-| `test_only` | bool | `false` | `projects/ritz/build.py plan_binaries`<br>`projects/ritz/build.py discover_test_files` | The package has tests and no binaries or libraries: `build` skips it, `test` runs it. |
-| `opt-level` | integer | `0` | `projects/ritz/build.py get_build_profile` | LLVM optimisation level, 0-3. |
-| `debug` | bool | `true` | `projects/ritz/build.py get_build_profile` | Emit debug info. |
-| `lto` | bool | `false` | `projects/ritz/build.py get_build_profile` | Link-time optimisation. |
+| `sources` | string or string list |  | `projects/ritz/manifest.py package_sources`<br>`projects/ritz/resolve.py package_import_namespaces` | See top-level `sources`. |
+| `test_only` | bool | `false` | `projects/ritz/manifest.py plan_binaries`<br>`projects/ritz/manifest.py discover_test_files` | The package has tests and no binaries or libraries: `build` skips it, `test` runs it. |
+| `opt-level` | integer | `0` | `projects/ritz/manifest.py get_build_profile` | LLVM optimisation level, 0-3. |
+| `debug` | bool | `true` | `projects/ritz/manifest.py get_build_profile` | Emit debug info. |
+| `lto` | bool | `false` | `projects/ritz/manifest.py get_build_profile` | Link-time optimisation. |
 
 ### `[profile]`
 
@@ -62,9 +62,9 @@ The default profile.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `opt-level` | integer | `0` | `projects/ritz/build.py get_build_profile` | LLVM optimisation level, 0-3. |
-| `debug` | bool | `true` | `projects/ritz/build.py get_build_profile` | Emit debug info. |
-| `lto` | bool | `false` | `projects/ritz/build.py get_build_profile` | Link-time optimisation. |
+| `opt-level` | integer | `0` | `projects/ritz/manifest.py get_build_profile` | LLVM optimisation level, 0-3. |
+| `debug` | bool | `true` | `projects/ritz/manifest.py get_build_profile` | Emit debug info. |
+| `lto` | bool | `false` | `projects/ritz/manifest.py get_build_profile` | Link-time optimisation. |
 
 ### `[profile.release]`
 
@@ -72,9 +72,9 @@ The default profile.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `opt-level` | integer | `0` | `projects/ritz/build.py get_build_profile` | LLVM optimisation level, 0-3. |
-| `debug` | bool | `true` | `projects/ritz/build.py get_build_profile` | Emit debug info. |
-| `lto` | bool | `false` | `projects/ritz/build.py get_build_profile` | Link-time optimisation. |
+| `opt-level` | integer | `0` | `projects/ritz/manifest.py get_build_profile` | LLVM optimisation level, 0-3. |
+| `debug` | bool | `true` | `projects/ritz/manifest.py get_build_profile` | Emit debug info. |
+| `lto` | bool | `false` | `projects/ritz/manifest.py get_build_profile` | Link-time optimisation. |
 
 ### `[dependencies]`
 
@@ -99,8 +99,8 @@ One library.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `name` | string | **required** | `projects/ritz/build.py plan_binaries` | Library name (archived as lib<name>). |
-| `sources` | string or string list |  | `projects/ritz/build.py plan_binaries` | Source roots; a `!path` entry excludes a file. Defaults to the package's `sources`. |
+| `name` | string | **required** | `projects/ritz/manifest.py plan_binaries` | Library name (archived as lib<name>). |
+| `sources` | string or string list |  | `projects/ritz/manifest.py plan_binaries` | Source roots; a `!path` entry excludes a file. Defaults to the package's `sources`. |
 
 ### `[[bin]]`
 
@@ -110,14 +110,14 @@ One binary. Its source is `entry`, else `path`, else src/<name>.ritz.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `name` | string | **required** | `projects/ritz/build.py plan_binaries` | Binary name. |
-| `entry` | string |  | `projects/ritz/build.py plan_binaries` | `"module::function"`, resolved under `sources`. |
-| `path` | string |  | `projects/ritz/build.py plan_binaries` | Source file, relative to the package. A non-.ritz path is listed and skipped. |
-| `sources` | string or string list |  | `projects/ritz/build.py plan_binaries` | Source roots for this binary. Defaults to the package's. |
-| `freestanding` | bool | `false` | `projects/ritz/build.py plan_binaries` | No libc, no runtime. |
-| `target` | string | `""` | `projects/ritz/build.py plan_binaries` | LLVM target triple. Empty means the host. |
-| `target_os` | string | `""` | `projects/ritz/build.py plan_binaries` | Target OS for platform-specific modules (e.g. `harland`, `uefi`). |
-| `link_runtime` | bool | `false` | `projects/ritz/build.py plan_binaries` | Link the Ritz runtime's _start. |
+| `name` | string | **required** | `projects/ritz/manifest.py plan_binaries` | Binary name. |
+| `entry` | string |  | `projects/ritz/manifest.py plan_binaries` | `"module::function"`, resolved under `sources`. |
+| `path` | string |  | `projects/ritz/manifest.py plan_binaries` | Source file, relative to the package. A non-.ritz path is listed and skipped. |
+| `sources` | string or string list |  | `projects/ritz/manifest.py plan_binaries` | Source roots for this binary. Defaults to the package's. |
+| `freestanding` | bool | `false` | `projects/ritz/manifest.py plan_binaries` | No libc, no runtime. |
+| `target` | string | `""` | `projects/ritz/manifest.py plan_binaries` | LLVM target triple. Empty means the host. |
+| `target_os` | string | `""` | `projects/ritz/manifest.py plan_binaries` | Target OS for platform-specific modules (e.g. `harland`, `uefi`). |
+| `link_runtime` | bool | `false` | `projects/ritz/manifest.py plan_binaries` | Link the Ritz runtime's _start. |
 
 ### `[bin.NAME]`
 
@@ -129,7 +129,7 @@ Linking.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `script` | string |  | `projects/ritz/build.py plan_binaries` | Linker script, relative to the package. |
+| `script` | string |  | `projects/ritz/manifest.py plan_binaries` | Linker script, relative to the package. |
 
 ### `[bin.NAME.asm]`
 
@@ -137,7 +137,7 @@ Assembly.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `files` | string list |  | `projects/ritz/build.py plan_binaries` | Assembly files to assemble and link in. |
+| `files` | string list |  | `projects/ritz/manifest.py plan_binaries` | Assembly files to assemble and link in. |
 
 ### `[bin.NAME.flags]`
 
@@ -145,10 +145,10 @@ Code generation.
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `code-model` | string | `""` | `projects/ritz/build.py plan_binaries` | LLVM code model (e.g. `kernel`). |
-| `no-red-zone` | bool | `false` | `projects/ritz/build.py plan_binaries` | Disable the red zone. |
-| `stack-protector` | bool | `false` | `projects/ritz/build.py plan_binaries` | Pass the compiler `--stack-protector`: every function but a `[[naked]]` one gets LLVM `sspstrong`. The binary must define `__stack_chk_guard` and `__stack_chk_fail`. |
-| `pic` | bool | `false` | `projects/ritz/build.py plan_binaries` | Position-independent code. |
+| `code-model` | string | `""` | `projects/ritz/manifest.py plan_binaries` | LLVM code model (e.g. `kernel`). |
+| `no-red-zone` | bool | `false` | `projects/ritz/manifest.py plan_binaries` | Disable the red zone. |
+| `stack-protector` | bool | `false` | `projects/ritz/manifest.py plan_binaries` | Pass the compiler `--stack-protector`: every function but a `[[naked]]` one gets LLVM `sspstrong`. The binary must define `__stack_chk_guard` and `__stack_chk_fail`. |
+| `pic` | bool | `false` | `projects/ritz/manifest.py plan_binaries` | Position-independent code. |
 
 ### `[test]`
 
@@ -156,7 +156,7 @@ Test discovery. `rz test` always runs test/*.ritz, the package's own test_*.ritz
 
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
-| `sources` | string list |  | `projects/ritz/build.py _declared_test_source_files` | Extra directories searched (recursively) for `[[test]]` modules. |
+| `sources` | string list |  | `projects/ritz/manifest.py _declared_test_source_files` | Extra directories searched (recursively) for `[[test]]` modules. |
 
 ## rz.toml
 
