@@ -1318,6 +1318,7 @@ pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u
         if type_params == null
             impl_name_bare_self(mt, type_name, type_len)
         mt = mt.next
+    tn_claim_impl(type_params, methods)   # AGAST #4021
     return ib
 
 # AGAST #3249: `Self` in a method's params and return type is the impl's
@@ -1538,6 +1539,7 @@ pub fn global_var_new(p: *Parser, name: *u8, len: i32, var_type: i32, init_expr:
     g.col = col
     g.next = null
     g.is_extern = 0
+    tn_claim(p, null, null)   # AGAST #4021
     g
 
 # AGAST #1554: the S of a `var g: *S`, `@S` or `@&S` global, or null.  It is
@@ -1739,6 +1741,7 @@ pub fn fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i32, bod
     f.is_pub = 0   # AGAST #3419: fn_pub sets it for a `pub fn`
     f.col = col
     f.extern_decl = 0   # AGAST #3419: decl_fn_def_new sets it
+    tn_claim(p, f.type_params, f)   # AGAST #4021
     return f
 
 # Extern function declaration (no body) - forward declaration
@@ -1800,6 +1803,7 @@ pub fn extern_fn_def_new(p: *Parser, name: *u8, len: i32, params: *Param, ret: i
     f.is_pub = 0   # AGAST #3419: fn_pub sets it for a `pub fn`
     f.col = col
     f.extern_decl = 0   # AGAST #3419: decl_fn_def_new sets it
+    tn_claim(p, f.type_params, f)   # AGAST #4021
     return f
 
 # =============================================================================
@@ -2303,6 +2307,7 @@ pub fn generic_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypePar
     f.is_pub = 0   # AGAST #3419: fn_pub sets it for a `pub fn`
     f.col = col
     f.extern_decl = 0   # AGAST #3419: decl_fn_def_new sets it
+    tn_claim(p, f.type_params, f)   # AGAST #4021
     return f
 
 # Generic struct definition (with type parameters)
@@ -2313,6 +2318,7 @@ pub fn generic_struct_def_new(p: *Parser, name: *u8, len: i32, type_params: *Typ
     s.fields = fields
     s.next = null
     s.type_params = type_params  # Generic type parameters (field at end to preserve layout)
+    tn_claim(p, type_params, null)   # AGAST #4021
     return s
 
 # Grammar action for the field-less `[pub] struct S` (AGAST #2955).  It fails
@@ -2770,6 +2776,107 @@ fn note_type_name_at(p: *Parser, name: *u8)
     at.reported = 0
     at.next = g_type_name_at
     g_type_name_at = at
+
+# AGAST #4021: a type name written where the AST keeps no source spelling:
+# a generic argument (the slot holds the mangled `Option$Nope`), an enum
+# payload (enums have no AST node), an alias's target and a cast's type.
+# Each is noted as it parses, and the item it sits in claims the notes when
+# its action runs (items end after their contents), with the type parameters
+# in scope there: a fn's (and, for a method, its impl's, which
+# impl_block_new adds), a struct's or an enum's; an alias's or a global's
+# none.  type_name_check.ritz judges each note in its scope.
+#
+# A note is the IDENT a type ended with (`Nope` of `*Nope`); one type_named
+# did not record (a primitive, an alias's name) is never reported.
+struct TnNote
+    name: *u8
+    len: i32
+    next: *TnNote
+
+struct TnScope
+    inner: *TypeParam   # the item's own type parameters
+    outer: *TypeParam   # a method's impl's
+    notes: *TnNote
+    fn_def: *FnDef      # the method impl_block_new looks for, else null
+    next: *TnScope
+
+var g_tn_pending: *TnNote = null   # noted, no item has claimed them yet
+var g_tn_scopes: *TnScope = null
+var g_tn_enum_params: *TypeParam = null   # the enum being parsed
+
+fn tn_note(p: *Parser, name: *u8, len: i32)
+    if p.skip_item != 0 or name == null or len <= 0
+        return
+    let n: *TnNote = parser_alloc(p, sizeof(TnNote)) as *TnNote
+    n.name = name
+    n.len = len
+    n.next = g_tn_pending
+    g_tn_pending = n
+
+# The token `back` before p.pos when it is an IDENT (the type just parsed
+# ended with a name), else null.
+fn tn_last_written(p: *Parser, back: i32) -> *Token
+    let i: i32 = p.pos - back
+    if i < 0 or i >= p.token_count
+        return null
+    let t: *Token = p.tokens + i
+    if t.kind != TOK_IDENT
+        return null
+    t
+
+# Note the type that ended `back` tokens before p.pos, if it ended with a name.
+fn tn_note_last(p: *Parser, back: i32)
+    let t: *Token = tn_last_written(p, back)
+    if t != null
+        tn_note(p, t.start, t.len)
+
+# The item whose action is running claims every pending note.
+fn tn_claim(p: *Parser, inner: *TypeParam, f: *FnDef)
+    if g_tn_pending == null
+        return
+    let s: *TnScope = parser_alloc(p, sizeof(TnScope)) as *TnScope
+    s.inner = inner
+    s.outer = null
+    s.notes = g_tn_pending
+    s.fn_def = f
+    s.next = g_tn_scopes
+    g_tn_scopes = s
+    g_tn_pending = null
+
+# impl_block_new: its methods see its type parameters.  A method's scope is
+# near the list's head: methods claim just before their impl's action runs.
+fn tn_claim_impl(params: *TypeParam, methods: *FnDef)
+    if params == null
+        return
+    var f: *FnDef = methods
+    while f != null
+        var s: *TnScope = g_tn_scopes
+        while s != null and s.fn_def != f
+            s = s.next
+        if s != null
+            s.outer = params
+        f = f.next
+
+# cast_type_end_check: a cast's type ran on into a comparison (`a as Id < b,
+# c > d`), so the generic arguments noted after the `as` are values: drop them.
+fn tn_drop_after_as(p: *Parser)
+    var i: i32 = p.pos - 1
+    while i >= 0 and (p.tokens + i).kind != TOK_AS
+        i = i - 1
+    if i < 0
+        return
+    let as_at: *u8 = (p.tokens + i).start
+    while g_tn_pending != null and (g_tn_pending.name as i64) > (as_at as i64)
+        g_tn_pending = g_tn_pending.next
+
+pub fn tn_scopes() -> *TnScope
+    g_tn_scopes
+
+# The driver's alias re-parse (main.ritz) builds every module afresh.
+pub fn tn_notes_reset()
+    g_tn_pending = null
+    g_tn_scopes = null
+    g_tn_enum_params = null
 
 # Where the type name at `name` was written; null for one no source spells.
 # Linear, so asked only about a name already found unknown.
@@ -3914,6 +4021,10 @@ fn type_alias_kind_has_state(kind: i32) -> i32
 pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
     if p.skip_item != 0
         return kind
+    # AGAST #4021: the target, before NEWLINE, judged even if the alias is
+    # never used (a use replays it, and is judged as the target).
+    tn_note_last(p, 2)
+    tn_claim(p, null, null)
     var e: *AliasEntry = type_alias_find(name, len)
     if e == null
         if g_alias_table == null
@@ -4096,6 +4207,11 @@ struct GenericArg
     name: *u8
     name_len: i32
     next: *GenericArg
+    # AGAST #4021: the name the argument ends with as written (`Nope` of
+    # `*Nope`), which type_generic_with_saved notes; null when it ends with
+    # no name (`Vec<T>`, whose own arguments were noted).
+    written: *u8
+    written_len: i32
 
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
@@ -4138,6 +4254,12 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
         ga.name = null
         ga.name_len = 0
     ga.next = null
+    ga.written = null
+    ga.written_len = 0
+    let t: *Token = tn_last_written(p, 1)
+    if t != null
+        ga.written = t.start
+        ga.written_len = t.len
     return ga
 
 # Spelling of a primitive type argument, as ritz0 mangles it (its type
@@ -4468,6 +4590,10 @@ fn mangle_generic_args(p: *Parser, base_name: *u8, base_len: i32, ga: *GenericAr
 # from the arguments captured by capture_first_generic_arg.  Returns
 # TYPE_STRUCT with the name in p.last_type_name, like type_generic.
 pub fn type_generic_with_saved(p: *Parser, base_name: *u8, base_len: i32, ga: *GenericArg) -> i32
+    var cur: *GenericArg = ga
+    while cur != null
+        tn_note(p, cur.written, cur.written_len)   # AGAST #4021
+        cur = cur.next
     var len: i32 = 0
     p.last_type_name = mangle_generic_args(p, base_name, base_len, ga, @len)
     p.last_type_name_len = len
@@ -6705,17 +6831,22 @@ pub fn block_ended_check(p: *Parser) -> i32
 # (`a as Sz < b, c > d` read as `Sz<b, c>`): fail, and cast_type retries the
 # bare name.  ritz0's _OPERAND_START is the same set.
 pub fn cast_type_end_check(p: *Parser) -> i32
-    if p.pos >= p.token_count
-        return 0
-    let k: i32 = (p.tokens + p.pos).kind
-    if k == TOK_IDENT or k == TOK_NUMBER or k == TOK_FLOAT or k == TOK_STRING
-        p.error = 1
-    else if k == TOK_CSTRING or k == TOK_CHAR or k == TOK_TRUE or k == TOK_FALSE
-        p.error = 1
-    else if k == TOK_NULL or k == TOK_NIL or k == TOK_SELF or k == TOK_LPAREN
-        p.error = 1
-    else if k == TOK_LBRACKET or k == TOK_AT or k == TOK_NOT or k == TOK_BANG or k == TOK_TILDE
-        p.error = 1
+    if p.pos < p.token_count
+        let k: i32 = (p.tokens + p.pos).kind
+        if k == TOK_IDENT or k == TOK_NUMBER or k == TOK_FLOAT or k == TOK_STRING
+            p.error = 1
+        else if k == TOK_CSTRING or k == TOK_CHAR or k == TOK_TRUE or k == TOK_FALSE
+            p.error = 1
+        else if k == TOK_NULL or k == TOK_NIL or k == TOK_SELF or k == TOK_LPAREN
+            p.error = 1
+        else if k == TOK_LBRACKET or k == TOK_AT or k == TOK_NOT or k == TOK_BANG or k == TOK_TILDE
+            p.error = 1
+    # AGAST #4021: a cast's type is noted; one that ran on into a comparison
+    # drops the arguments it noted.
+    if p.error != 0
+        tn_drop_after_as(p)
+    else
+        tn_note_last(p, 1)
     return 0
 
 pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
@@ -7602,6 +7733,8 @@ pub fn enum_def_skip(p: *Parser) -> i32
 # enum_def's action: as enum_def_skip, latching `pub` for the enum just
 # parsed (its generated `from` is `pub` iff it is, LANGUAGE_SPEC §10.4).
 pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
+    tn_claim(p, g_tn_enum_params, null)   # AGAST #4021
+    g_tn_enum_params = null
     if g_enum_count > 0
         *(g_enum_pub + g_enum_count - 1) = is_pub
     return 0
@@ -7737,7 +7870,8 @@ pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
     return enum_def_start_impl(name, len, 0)
 
 # `enum Name<T>`: as enum_def_start, flagged generic (AGAST #1797).
-pub fn enum_def_start_generic(p: *Parser, name: *u8, len: i32) -> i32
+pub fn enum_def_start_generic(p: *Parser, name: *u8, len: i32, params: *TypeParam) -> i32
+    g_tn_enum_params = params   # AGAST #4021: in scope in its payloads
     return enum_def_start_impl(name, len, 1)
 
 # `enum E: T` (LANGUAGE_SPEC §10.4): as enum_def_start, with representation
@@ -7773,6 +7907,9 @@ pub fn enum_variant_record_tuple(p: *Parser, name: *u8, len: i32, ty: i32, line:
 # (struct name, pointee, array shape) right after THIS type_spec, before the
 # next one overwrites it.  Named by enum_variant_record_tuple_n.
 pub fn variant_type_field(p: *Parser, ty: i32) -> *StructField
+    # AGAST #4021: noted here for `A(T)` too, which enum_variant tries as
+    # `A(T, ..)` first: this rule parses T before the missing comma fails it.
+    tn_note_last(p, 1)
     let f: *StructField = field_new(p, null, 0, ty, 0, 0)
     f.next = null
     return f

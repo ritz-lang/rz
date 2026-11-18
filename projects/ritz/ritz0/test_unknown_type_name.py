@@ -44,23 +44,29 @@ REFUSED = {
     "generic_fn": "fn f<T>(x: *T, y: *^Nope) -> i32\n    0\n",
     # A generic's parameter is in scope only in its own item.
     "param_out_of_scope": "struct B<T>\n    v: T\n\nfn f(x: *^T) -> i32\n    0\n",
-}
-
-# ritz0 refuses these; ritz1 doesn't judge them yet (AGAST #4021).
-RITZ1_GAPS = {
+    # A name written where ritz1's AST keeps no source spelling (AGAST #4021):
+    # a generic argument (mangled `Option$Nope`), an enum payload (no enum
+    # node), an unused alias's target and a cast's type.
     "generic_arg": "struct P\n    a: Option<^Nope>\n",
+    "generic_arg_nested": "fn f(x: *Option<Option<*^Nope>>) -> i32\n    0\n",
+    "generic_arg_let": "fn f() -> i32\n    var q: *Option<^Nope> = null\n    0\n",
     "enum_payload": "enum E\n    A(^Nope)\n    B\n",
+    "enum_payload_n": "enum E\n    A(i32, *^Nope)\n    B\n",
     "alias_target": "type X = ^Nope\n",
+    "alias_target_ptr": "type X = *^Nope\n",
     "cast": "fn f(p: *u8) -> i32\n    let q: *u8 = p as *^Nope as *u8\n    0\n",
+    "cast_generic": "fn f(p: *u8) -> i32\n    let q: *u8 = p as *Option<^Nope> as *u8\n    0\n",
+    # A generic's parameter is in scope in its own item only, there too.
+    "generic_arg_out_of_scope": "struct B<T>\n    v: T\n\nfn f(x: *Option<^T>) -> i32\n    0\n",
+    "cast_out_of_scope": "fn g<T>(x: *T) -> i32\n    0\n\nfn f(p: *u8) -> i32\n    let q: *u8 = p as *^T as *u8\n    0\n",
 }
 
 ROWS = [(c, site) for c in COMPILERS for site in sorted(REFUSED)]
-ROWS += [("ritz0", site) for site in sorted(RITZ1_GAPS)]
 
 
 @pytest.mark.parametrize("compiler,site", ROWS)
 def test_an_unknown_type_name_is_refused(tmp_path, compiler, site):
-    marked = REFUSED.get(site) or RITZ1_GAPS[site]
+    marked = REFUSED[site]
     name = re.search(r"\^(\w+)", marked).group(1)
     _assert_refused(compiler, tmp_path, site, marked + MAIN, f"unknown type `{name}`")
 
@@ -96,6 +102,17 @@ KNOWN = (
     "fn raw(p: *u8) -> *u8\n    p\n\n"
     "impl Later\n    fn me(self: *Self) -> *Self\n        self\n\n"
     "fn first<T>(x: *T) -> T\n    let y: T = *x\n    y\n\n"
+    # The positions AGAST #4021 judges, each with its item's own `T`: a
+    # generic argument, a generic enum's payload, an alias's target, a cast.
+    "enum Opt<T>\n    Has(*T)\n    Two(i32, Option<T>)\n    Not\n\n"
+    "type BoxI = Box<i32>\n\ntype PL = *Later\n\n"
+    "struct Wrap<T>\n    o: Option<*T>\n\n"
+    "impl<T> Wrap<T>\n    fn raw(self: *Wrap<T>) -> *u8\n"
+    "        let q: *Option<*T> = null\n        self as *Wrap<T> as *u8\n\n"
+    "fn second<T>(x: *T) -> *u8\n    x as *Option<T> as *u8\n\n"
+    # A comparison after a cast: `b` and `c` are values, not `Id<b, c>`.
+    "fn two(x: bool, y: bool) -> i32\n    0\n\n"
+    "fn cmp(a: i32, b: i32, c: i32, d: i32) -> i32\n    two(a as Id < b, c > d)\n\n"
     "pub fn main() -> i32\n    var l: Later = Later { x: 3 }\n"
     "    let p: *Later = l.me()\n    var b: Box<i32> = Box<i32> { v: p.x }\n"
     "    first<i32>(@b.v)\n"
