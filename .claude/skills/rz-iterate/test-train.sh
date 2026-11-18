@@ -417,4 +417,140 @@ fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" build "sx:$x" "sy:$y" "sz:$z" 2>&1)"
 has "$out" "^CONFLICT +sy ${y:0:12} with sx on s/x$" "CONFLICT names the train car and file"
 has "$out" "^CONFLICT +sz ${z:0:12} with main on a$" "a conflict with no train car names main"
-echo; [[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
+
+# 11. Speculative gates (AGAST #3988): train 2 gates on a remote host, on
+# train 1's tail, while train 1 gates here.  The remote side is a clone of
+# origin; the fake ssh runs the command line locally the way sshd would
+# (one string, re-parsed by a shell), and the fake gate stands in for the
+# remote run-gate.sh (RZ_FAKE_EXIT picks its verdict).
+cat > "$T/bin/fakessh" <<'EOF'
+#!/usr/bin/env bash
+host="$1"; shift
+echo "$host $*" >> "$RZ_TEST_DIR/ssh-log"
+[[ -e "$RZ_TEST_DIR/ssh-down" ]] && { echo "ssh: connect to host $host: refused" >&2; exit 255; }
+exec bash -c "$*"
+EOF
+chmod +x "$T/bin/fakessh"
+# The fake gate can --wait too: exit with the log's verdict.
+cat > "$T/gate.sh" <<'EOF'
+#!/usr/bin/env bash
+if [[ "$1" == --wait ]]; then echo "waited $2" >&2; exit "$(sed -n 's/^EXIT=//p' "$2" | tail -1)"; fi
+log="$RZ_TEST_DIR/gate-$(git -C "$1" rev-parse --short=12 HEAD).log"
+printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" "${RZ_GATE_AFTER:-}" > "$log"
+echo "$log"
+EOF
+git clone -q "$T/origin.git" "$T/remote-rz" 2>/dev/null
+export RZ_TRAIN_SSH="$T/bin/fakessh" RZ_TRAIN_REMOTE=hostx RZ_REMOTE_REPO="$T/remote-rz" \
+    RZ_REMOTE_WT="$T/remote-train" RZ_REMOTE_GATE="$T/gate.sh" RZ_TRAIN_SSH_RETRY=0 RZ_GATE_SCRIPT="$T/gate.sh"
+RW="$T/remote-train"
+oref() { git -C "$M" ls-remote origin "refs/heads/rz-train/$1" | cut -f1; }
+specof() { bash "$TR" show 2>/dev/null | sed -n 's/^SPEC=//p' | head -1; }
+# two <prefix> <file>: two cars, one each, on the current main.  Sets c1 c2.
+two() { c1="$(room "$1"1 "$2"1 X1)"; c2="$(room "$1"2 "$2"2 X2)"; fetch; git -C "$M" checkout -q main; }
+
+# 11a. N and N+1 both pass: land N, then N+1 with the remote verdict.
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" gate --next 2>&1)"; has "$out" "no train" "gate --next with no trains refuses"
+two pa s/pa; bash "$TR" build "pa1:$c1" "pa2:$c2" >/dev/null 2>&1
+out="$(bash "$TR" gate --next 2>&1)"; has "$out" "no train 2" "gate --next with no train 2 refuses"
+log1="$(bash "$TR" gate)"
+two pb projects/prism/src/pb; out="$(bash "$TR" build --next "pb1:$c1" "pb2:$c2" 2>&1)"
+t2="$(git -C "$T/train-2" rev-parse HEAD)"; t1="$(git -C "$T/train" rev-parse HEAD)"
+llog="$(bash "$TR" gate --next 2>"$T/err")"; rc=$?
+[[ $rc -eq 0 && "$llog" == "$RZ_GATE_DIR/"*"@hostx.log" ]] && ok "gate --next prints a local log path for the remote gate" \
+    || { bad "gate --next prints a local log path (rc=$rc, '$llog')"; sed 's/^/     | /' "$T/err"; }
+[[ "$(oref "${t2:0:12}")" == "$t2" ]] && ok "the train 2 tail is pushed to refs/heads/rz-train/<tip12>" \
+    || bad "the train 2 tail is pushed to refs/heads/rz-train/<tip12>"
+[[ "$(git -C "$RW" rev-parse HEAD 2>/dev/null)" == "$t2" ]] && ok "the remote train worktree is at train 2's tip" \
+    || bad "the remote train worktree is at train 2's tip"
+rlog="$(specof | cut -d' ' -f3)"
+has "$(cat "$rlog" 2>/dev/null)" "^TRAIN=1$" "the remote gate has train priority (RZ_GATE_TRAIN=1)"
+has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*remote-train/.claude/skills/rz-iterate/train.sh pkgs test $t1$" \
+    "the remote gate tests train 2's packages against its base, train 1's tail"
+out="$(bash "$TR" gate --next 2>&1)"; has "$out" "already" "a third train can't gate: at most 2 in flight"
+out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(sed -n 's/^SHA=//p' "$llog" 2>/dev/null)" == "$t2" ]] && ok "wait fetches the remote verdict into the local log" \
+    || { bad "wait fetches the remote verdict (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+# A REAP that arrives while both gate rides train 3, not into train 2.
+c3="$(room pc1 s/pc1 X)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "pc1:$c3" 2>&1)"
+has "$out" "^TRAIN 3 base=${t2:0:12} " "build --next keeps a speculatively gating train 2 and stacks train 3"
+[[ "$(git -C "$T/train-2" rev-parse HEAD)" == "$t2" && -n "$(specof)" ]] && ok "train 2 and its remote gate are untouched" \
+    || bad "train 2 and its remote gate are untouched"
+out="$(bash "$TR" land "$log1" 2>&1)"
+has "$out" "^NEXT .*tip=${t2:0:12} .*spec=$llog" "land names the promoted train's remote verdict"
+out="$(bash "$TR" gate 2>&1)"; has "$out" "train.sh wait" "gate refuses a train already gating remotely"
+out="$(bash "$TR" land "$llog" 2>&1)"
+has "$out" "^MERGED +pb2 " "train 2 lands on the remote verdict"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$t2" ]] && ok "main is train 2's tail" || bad "main is train 2's tail"
+[[ -z "$(oref "${t2:0:12}")" ]] && ok "landing deletes the rz-train ref" || bad "landing deletes the rz-train ref"
+
+# 11b. N fails: N+1's verdict is discarded, N+1 rebuilt on the new base.
+fetch; git -C "$M" checkout -q main
+two fa s/fa; bash "$TR" build "fa1:$c1" "fa2:$c2" >/dev/null 2>&1; fa1="$c1"
+log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate)"
+two fb s/fb; bash "$TR" build --next "fb1:$c1" "fb2:$c2" >/dev/null 2>&1; fb1="$c1"; fb2="$c2"
+t2="$(git -C "$T/train-2" rev-parse HEAD)"
+llog="$(bash "$TR" gate --next 2>/dev/null)"; bash "$TR" wait "$llog" >/dev/null 2>&1
+out="$(bash "$TR" land "$log1" 2>&1)"; has "$out" "did not pass" "a failed train 1 doesn't land"
+: > "$T/ssh-log"
+out="$(bash "$TR" build "fa1:$fa1" 2>&1)"
+has "$out" "^DISCARDED .*@hostx.log" "rebuilding drops train 2's speculative verdict"
+[[ -z "$(oref "${t2:0:12}")" ]] && ok "a discard deletes the rz-train ref" || bad "a discard deletes the rz-train ref"
+grep -q "^hostx bash -l -s -- stop train" "$T/ssh-log" && ok "a discard stops the remote gate" || bad "a discard stops the remote gate"
+out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "discarded" "wait refuses a discarded remote gate" || bad "wait refuses a discarded remote gate (rc=$rc)"
+n1="$(git -C "$T/train" rev-parse HEAD)"
+out="$(bash "$TR" build --next "fb1:$fb1" "fb2:$fb2" 2>&1)"
+has "$out" "^TRAIN 2 base=${n1:0:12} " "N+1 is rebuilt on the new train 1's tail"
+nt2="$(git -C "$T/train-2" rev-parse HEAD)"
+[[ "$nt2" != "$t2" ]] && ok "the rebuilt N+1 has a new tip" || bad "the rebuilt N+1 has a new tip"
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "another commit" "the old speculative verdict can't land the rebuilt N+1"
+llog="$(bash "$TR" gate --next 2>&1)"; has "$llog" "no train 2" "after the land, the rebuilt train is train 1"
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+
+# 11c. N passes, N+1 fails: land N, then bisect N+1.
+fetch; git -C "$M" checkout -q main
+two ca s/ca; bash "$TR" build "ca1:$c1" "ca2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate)"
+two cb s/cb; bash "$TR" build --next "cb1:$c1" "cb2:$c2" >/dev/null 2>&1; cb1="$c1"; cb2="$c2"
+t2="$(git -C "$T/train-2" rev-parse HEAD)"
+llog="$(RZ_FAKE_EXIT=1 bash "$TR" gate --next 2>/dev/null)"
+bash "$TR" wait "$llog" >/dev/null 2>&1; rc=$?
+[[ $rc -eq 1 ]] && ok "wait exits with the remote gate's failure" || bad "wait exits with the remote gate's failure (rc=$rc)"
+out="$(bash "$TR" land "$log1" 2>&1)"; has "$out" "^MERGED +ca2 " "train 1 lands though train 2 failed"
+out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "did not pass" "the failed train 2 doesn't land"
+out="$(bash "$TR" build "cb1:$cb1" 2>&1)"
+has "$out" "^DISCARDED " "the bisect rebuild drops the failed speculative gate"
+[[ -z "$(oref "${t2:0:12}")" ]] && ok "the bisect deletes the rz-train ref" || bad "the bisect deletes the rz-train ref"
+m="$(git -C "$M" rev-parse origin/main)"
+has "$out" "^TRAIN 1 base=${m:0:12} .*n=1 gate=needed" "the first half gates as train 1, on main (train 1's tail)"
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+
+# 11d. A remote verdict for another SHA is refused, and ssh failures are no verdict.
+fetch; git -C "$M" checkout -q main
+two da s/da; bash "$TR" build "da1:$c1" "da2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate)"
+two db s/db; bash "$TR" build --next "db1:$c1" "db2:$c2" >/dev/null 2>&1
+llog="$(bash "$TR" gate --next 2>/dev/null)"
+touch "$T/ssh-down"
+out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -ne 0 && ! -e "$llog" ]] && has "$out" "hostx" "an unreachable host is no verdict" \
+    || bad "an unreachable host is no verdict (rc=$rc)"
+rm -f "$T/ssh-down"
+rlog="$(specof | cut -d' ' -f3)"
+sed -i "s/^SHA=.*/SHA=$(git -C "$M" rev-parse origin/main)/" "$rlog"
+out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "not the train tip" "wait refuses a remote verdict for another SHA" \
+    || bad "wait refuses a remote verdict for another SHA (rc=$rc)"
+bash "$TR" land "$log1" >/dev/null 2>&1
+out="$(bash "$TR" land "$llog" 2>&1)"
+has "$out" "another commit" "land refuses a remote verdict whose SHA isn't the train tip"
+t2="$(bash "$TR" show | sed -n 's/^TIP=//p' | head -1)"
+out="$(bash "$TR" discard 2>&1)"
+has "$out" "^DISCARDED speculative gate on hostx for ${t2:0:12} " "discard drops a dead host's speculative gate"
+[[ -z "$(oref "${t2:0:12}")" && -z "$(specof)" ]] && ok "discard deletes the ref and the SPEC line" \
+    || bad "discard deletes the ref and the SPEC line"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"; has "$out" "^MERGED +db2 " "the train then gates and lands here"
+echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

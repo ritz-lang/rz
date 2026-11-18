@@ -219,7 +219,12 @@ stays here; remote hosts only run rooms.
   chungus to their LAN IPs, which don't resolve by name here, and sets
   `BatchMode yes`. If a host's DHCP lease moves, update the IP there. Use
   ssh only to look (`uptime`, `systemctl --user status`, logs); changes on
-  a host still go through its host room's verbs.
+  a host still go through its host room's verbs. **One exception:**
+  `train.sh gate --next` / `wait` / a discarding `build` run the
+  speculative train gate over this ssh (AGAST #3988; "Merge trains" step
+  4b). They touch only `~/dev/ritz-lang/rz-train-remote` (a detached
+  worktree of the host's `~/dev/ritz-lang/rz`), `run-gate.sh`'s own gate
+  dir and the `ritz-gate-train` unit; never run those by hand.
 - **Push by refspec on remote hosts.** Plain `git fetch` / `git push` work
   on every host (the `ssh -F /dev/null` workaround from toffee 2026-11-11 is
   no longer needed; don't put it in briefings). Remote rooms push with the
@@ -604,9 +609,13 @@ This is also how Borque's conductor works.
   away, with every queued car, and gates it.
 - **A train is gating:** REAPs that arrive form the **next** train, stacked
   on the gating train's tail, not on `main`. Build it as cars arrive so a
-  conflict shows up at once. When the gating train lands, its tail *is*
-  `main`, and the next train's gate starts on its own tail. So one gate
-  tests every car that queued while the last train gated.
+  conflict shows up at once. **Gate it at once on a remote host,
+  speculatively** (AGAST #3988, step 4b): it is tested on the gating
+  train's tail while that train is still being tested. If the first train
+  passes, both land in order. If it fails, the second train's verdict is
+  thrown away and it is rebuilt and re-gated on the new base. **At most 2
+  trains in flight** (one here, one remote); REAPs that arrive while both
+  gate form train 3, which gates once train 1 lands.
 - **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
   with C): bounce E to its room with the exact commit to rebase onto, the
   tail (D's train SHA), not `main`. The room resolves the conflict on D,
@@ -635,8 +644,10 @@ train 1.
    .claude/skills/rz-iterate/train.sh build ritz-task-2593:3f42ab80 ritz-task-1844:4b699a83 ...
    ```
    **A train is gating:** `--next` keeps train 1 untouched and stacks the
-   given cars on its tail as train 2. Pass every unchecked item that is not
-   in train 1 (`train.sh show` lists train 1's `ITEM`s), and run it again
+   given cars on its tail as train 2. If train 2 is gating speculatively
+   (its state has a `SPEC=` line, step 4b) `--next` keeps it too and stacks
+   the cars on *its* tail as train 3. Pass every unchecked item that is not
+   in a kept train (`train.sh show` lists each train's `ITEM`s), and run it again
    each time a REAP arrives, so a conflict shows up at once; each run
    rebuilds trains 2+ from scratch (same cars on the same tail give the same
    SHAs: picks keep the car's committer date):
@@ -654,12 +665,57 @@ train 1.
    only if a commit under it is in no train. `rz-larb` boards like any room
    (`rz-larb:<sha>`).
 4. **Gate train 1, unless `gate=not-needed`** (only cars already on its
-   base or on each other: their own gates cover them). Never gate train 2
-   while train 1 gates: its gate starts when train 1 lands:
+   base or on each other: their own gates cover them). Train 2 gates
+   remotely at the same time (4b):
    ```bash
    LOG=$(.claude/skills/rz-iterate/train.sh gate)
-   .claude/skills/rz-iterate/run-gate.sh --wait "$LOG"    # Bash run_in_background
+   .claude/skills/rz-iterate/train.sh wait "$LOG"    # Bash run_in_background
    ```
+   (`train.sh wait` on a local log is `run-gate.sh --wait`.)
+
+   **4b. Gate train 2 speculatively on a remote host** (AGAST #3988) as soon
+   as `build --next` prints `TRAIN 2 ... gate=needed`, while train 1 gates:
+   ```bash
+   LOG2=$(.claude/skills/rz-iterate/train.sh gate --next)   # huburght; or: gate --next <host>
+   .claude/skills/rz-iterate/train.sh wait "$LOG2"         # Bash run_in_background
+   ```
+   omegalisk can't take two gates (15 GB WSL), so train 2 runs on a host
+   in `~/.ssh/rz_hosts` (default huburght, `RZ_TRAIN_REMOTE`; 2 gate
+   slots, 47 GB). **The contract**, all in `train.sh` (header and
+   `REMOTE_SH`):
+   1. `gate --next` pushes train 2's tail to origin
+      `refs/heads/rz-train/<tip12>`, then runs `ssh -F ~/.ssh/rz_hosts
+      <host> bash -l -s -- start ...` with the script on stdin. On the host
+      it fetches that ref into `~/dev/ritz-lang/rz`, refuses unless it is
+      exactly the tip, checks it out detached in
+      `~/dev/ritz-lang/rz-train-remote` (created on first use), and starts
+      **that tree's** `run-gate.sh` with `RZ_GATE_TRAIN=1` (train priority,
+      FIFO and reservation on that host, #3317/#3364/#3427, against that
+      host's own room gates) and the package tests (#3363) as
+      `RZ_GATE_AFTER`. It records `SPEC=<host> <ref> <remote log> <local
+      log>` in train 2's state and prints the local log path,
+      `gate-logs/train-<tip12>-<n>@<host>.log`. stderr says `SPEC train 2
+      tip=<12> on <host>: <remote log>`.
+   2. `wait <local log>` runs the host's `run-gate.sh --wait` over ssh in
+      9-minute slices (an ssh failure retries 5 times, 30 s apart, then is
+      **no verdict**, exit 1), copies the remote log to the local path,
+      and checks its `SHA=` is train 2's tip (else `REFUSED`, exit 3). It
+      prints `gate <log> SHA=<12> EXIT=<rc>` and exits with the gate's
+      code. `land` then checks `SHA=<tip>` and `EXIT=0` exactly as for a
+      local log.
+   3. The ref is deleted when the train lands, or when a `build` replaces
+      the train (a `DISCARDED speculative gate on <host> ...` line, which
+      also stops the host's `ritz-gate-train` unit).
+
+   Refusals: no train 2 (`gate` is for train 1), `gate=not-needed` (land
+   it after train 1), or train 2 already gating (**at most 2 in flight**).
+   `gate` refuses a train 1 that is gating remotely (`train.sh wait` its
+   log). If the host can't start the gate (`the remote gate on <host> did
+   not start`), let train 2 gate here after train 1 lands, as before. If a
+   remote gate dies or the host goes away, rebuild with the same cars (a
+   plain `build` of trains 1 and 2: same cars on the same tail give the
+   same tips) and gate again. Landing still goes strictly in order: train
+   2 lands only after train 1, on its own verdict.
    Run the wait with `run_in_background`, so it wakes this room when the gate
    ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
    (slots, nudges, `build --next` for REAPs that arrive) meanwhile. On a
@@ -724,7 +780,10 @@ train 1.
    sha12>` per commit. If a train was stacked behind it, it prints `NEXT
    base=<12> tip=<12> n=<cars> gate=<...>`: that train is train 1 now, its
    base (the tail just pushed) is `main`, so gate it straight away (step 4),
-   or land it with no log if `gate=not-needed`. It also
+   or land it with no log if `gate=not-needed`. If it was gating remotely
+   (4b) the line ends `spec=<local log>`: don't gate it again, `train.sh
+   wait` that log (if not done yet) and land it with that log. Then gate
+   the new train 2, if any, with `gate --next` (4b). It also
    renews the gate's reservation (#3365), so the 10 minutes count from the
    push: build and gate the next train promptly. A `build` with
    `gate=not-needed` drops the reservation; if nothing else is queued, just
@@ -752,7 +811,8 @@ train 1.
    not nothing; a `+` line is fine only if `<main sha12>`'s subject matches
    the branch tip's. The slot is free once the host answers `TORNDOWN`.
 6. **Gate fails: reason first, then bisect.** Read the failing lines
-   (`run-gate.sh --wait` prints them) against each car's diff
+   (`train.sh wait` / `run-gate.sh --wait` prints them; a remote gate's
+   whole log is the fetched `...@<host>.log`) against each car's diff
    (`git show --stat <car>`, then the hunks near the failure): which car
    touches the failing test, file, compiler stage or package? If one car
    is the clear suspect, rebuild the train without it and gate that. If it
@@ -768,6 +828,16 @@ train 1.
    line, "rebase onto <main sha7>: your commit fails the gate on top of
    `main`", with the gate's failing lines. Its fixed REAP goes to the back
    of the queue.
+   **With two trains in flight** (AGAST #3988): if **train 1 fails**,
+   train 2's verdict is worthless whatever it says (its base was train 1's
+   tail). Don't wait for it: the plain `build` for the bisect replaces
+   train 2, prints `DISCARDED speculative gate ...`, stops the remote gate
+   and deletes its ref. Pass train 2's cars after the halved ones as usual,
+   so they stack on the new tail, and gate them with `gate --next` again.
+   If **train 1 passes and train 2 fails**, land train 1 (step 5), then
+   bisect train 2 (now train 1) as above. A stale verdict can't land
+   anything by mistake: it names the old tip, and `land` refuses a log for
+   another commit.
 7. **`CONFLICT`:** bounce it now, not after the train lands. The line names
    what it hit: `CONFLICT <branch> <sha12> with <car>[,<car>] on
    <file>[,<file>]` (the train cars touching the conflicted files, or
