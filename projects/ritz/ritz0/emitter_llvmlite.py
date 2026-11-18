@@ -16475,6 +16475,37 @@ class LLVMEmitter:
             self._reject_pointer_into_float(val, float_ty)
         return self._merge_arms_at_float(incoming, float_ty)
 
+    def _unify_tuple_arms(self, incoming: list) -> list:
+        """Tuple arms of a match retyped to the first live arm's tuple type.
+
+        AGAST #3022: an untyped integer literal is an i64, so `Some(v) =>
+        (v, 1)` (v: i32) and `None => (5, 6)` yield `{i32, i64}` and
+        `{i64, i64}`: no single phi type, and the match read as having no
+        value. As in ritz1 (#3005), the first arm fixes the tuple type and
+        a later arm of the same arity converts to it, element by element,
+        in its own exit block before that block's branch to the merge.
+        Anything else (not all tuples, arities differ) is left as it was.
+        """
+        if not incoming:
+            return incoming
+        first = incoming[0][0].type
+        if not isinstance(first, ir.LiteralStructType) or not all(
+                isinstance(v.type, ir.LiteralStructType)
+                and len(v.type.elements) == len(first.elements)
+                for v, _ in incoming):
+            return incoming
+        if all(v.type == first for v, _ in incoming):
+            return incoming
+        merge_block = self.builder.block
+        unified = []
+        for val, block in incoming:
+            if val.type != first:
+                self.builder.position_before(block.terminator)
+                val = self._convert_type(val, first)
+            unified.append((val, block))
+        self.builder.position_at_end(merge_block)
+        return unified
+
     def _merge_match_arms(self, incoming: list) -> ir.Value:
         """Build the merge phi for a value-producing match.
 
@@ -16928,6 +16959,7 @@ class LLVMEmitter:
             # and silently evaluated to 0 (test_match_mixed_type_arms.py).
             # Reading a NoValue raises MatchHasNoValue, located at this match
             # (#1357; it was a raw `'_Undefined' ... no attribute 'type'`).
+            incoming = self._unify_tuple_arms(incoming)  # AGAST #3022
             if incoming and not all(
                     v.type == incoming[0][0].type
                     or (isinstance(v.type, ir.IntType)
@@ -17205,6 +17237,7 @@ class LLVMEmitter:
             # phi would put an integer constant into an enum-typed phi —
             # invalid IR (AGAST #1321, angelo font.ritz ensure_cmap).
             # All-integer mixes are fine: they widen below / convert.
+            incoming = self._unify_tuple_arms(incoming)  # AGAST #3022
             if incoming and not all(
                     v.type == incoming[0][0].type
                     or (isinstance(v.type, ir.IntType)

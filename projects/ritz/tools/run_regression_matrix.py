@@ -75,10 +75,6 @@ _RITZ1_TWINS = {
     # --- codegen, runtime failures ---
 }
 
-# ritz0 alone can't build these; ritz1 and ritz1_selfhosted run them.
-EXPECTED_FAILURES[("ritz0", "test_tuple_infer_match")] = (
-    "AGAST #3022 — `let (x, y) = match <enum>` with tuple arms crashes ritz0's emitter"
-)
 
 for _key, _reason in _RITZ1_TWINS.items():
     EXPECTED_FAILURES[("ritz1", _key)] = _reason

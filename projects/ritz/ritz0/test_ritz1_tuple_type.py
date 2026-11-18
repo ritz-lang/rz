@@ -429,7 +429,7 @@ pub fn main() -> i32
     f(true) + f(false)
 """
 
-# A match arm binding a name its tuple reads; ritz0 can't build it (#3022).
+# A match arm binding a name its tuple reads (ritz0 since #3022).
 # f(Some(2)) + f(None) = 3 + 0.
 INFER_MATCH_ARM_BINDS = """\
 import ritzlib.option
@@ -452,11 +452,11 @@ pub fn main() -> i32
 BOTH = ("ritz0", "ritz1")
 
 # The programs ritz1 refused until AGAST #3005 now run, as on ritz0.  ritz0
-# can't build INFER_MATCH_ARM_BINDS (#3022): ritz1 only.
+# builds INFER_MATCH_ARM_BINDS since #3022.
 NO_SLOT = [
     ("tuple_infer_let", INFER_LET, 3, BOTH),
     ("tuple_infer_if_arm_stmts", INFER_IF_ARM_STMTS, 4, BOTH),
-    ("tuple_infer_match_arm_binds", INFER_MATCH_ARM_BINDS, 3, ("ritz1",)),
+    ("tuple_infer_match_arm_binds", INFER_MATCH_ARM_BINDS, 3, BOTH),
 ]
 
 PROGRAMS = [
