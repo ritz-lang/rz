@@ -5466,8 +5466,23 @@ class LLVMEmitter:
                 continue
             ty = self._sret_struct_type(self._ritz_type_to_llvm(p))
             if ty is not None:
+                self._refuse_huge_fn_type_byval(fn_type, i, ty)
                 byval[i] = ty
         return byval
+
+    def _refuse_huge_fn_type_byval(self, fn_type: rast.FnType, i: int, ty: ir.Type) -> None:
+        """Refuse a call through a fn type whose by-value param `i` is past
+        LLVM's byval limit (AGAST #3690): _refuse_huge_byval's rule and words
+        for a fn-pointer type, at the type as written (an alias's `fn(` for a
+        call through the alias).  An uncalled fn type is a plain `ptr`."""
+        size = _abi_size_align(ty)[0]
+        if size < BYVAL_MAX_BYTES:
+            return
+        t = type_to_string(fn_type.params[i])
+        raise EmitError(
+            f"parameter #{i + 1} of this fn type is {size} bytes, too large to pass by "
+            f"value (LLVM's byval limit is 4 GiB); take it by reference: `@{t}` or `@&{t}`",
+            fn_type.span)
 
     def _fn_type_sret(self, fn_type: rast.FnType) -> Optional[ir.Type]:
         """The struct a Ritz fn-pointer type returns via sret, or None: what

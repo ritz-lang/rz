@@ -3550,6 +3550,78 @@ pub fn param_byval_bytes(s: *EmitterState, p: *Param) -> i64
     var align: i64 = 8
     array_param_size_align(s, p, @align)
 
+# AGAST #3668: LLVM's verifier refuses a `byval` type whose alloc size is
+# 2^32 bytes or more ("huge 'byval' arguments are unsupported").  ritz1 wrote
+# that IR and exited 0, so clang crashed later with no source location.
+pub const BYVAL_MAX_BYTES: i64 = 4294967296
+
+# Append `n` bytes of `src` to `buf` at `*at`.
+pub fn hb_put(buf: *u8, at: *i64, src: *u8, n: i64)
+    memcpy(buf + *at, src, n)
+    *at = *at + n
+
+pub fn hb_puts(buf: *u8, at: *i64, src: *u8)
+    hb_put(buf, at, src, strlen(src))
+
+# A Ritz leaf type `T` of kind `t`, a struct named `name`.  "?" when unknown.
+pub fn hb_put_leaf(buf: *u8, at: *i64, t: i32, name: *u8, name_len: i32)
+    let prim: *u8 = primitive_name_from_type(t)
+    if prim != null
+        hb_puts(buf, at, prim)
+    else if name != null and name_len > 0
+        hb_put(buf, at, name, name_len as i64)
+    else
+        hb_puts(buf, at, c"?")
+
+# The param's type as written: `H`, or `[1073741825]i32` for an array.
+pub fn hb_put_param_type(buf: *u8, at: *i64, p: *Param)
+    if p.param_type != TYPE_ARRAY
+        hb_put(buf, at, p.param_type_name, p.param_type_name_len as i64)
+        return
+    var num: [24]u8 = [0; 24]
+    itoa(p.param_array_size as i64, @num[0])
+    hb_puts(buf, at, c"[")
+    hb_puts(buf, at, @num[0])
+    hb_puts(buf, at, c"]")
+    if p.param_array_elem_type == TYPE_PTR
+        hb_puts(buf, at, c"*")
+        hb_put_leaf(buf, at, p.param_array_elem_pointee, p.param_type_name, p.param_type_name_len)
+        return
+    hb_put_leaf(buf, at, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
+
+# AGAST #3690: a call through a fn type whose by-value param `p` (the
+# `n`th, 1-based) is past LLVM's byval limit is refused at the type's `fn`
+# token (sig.line / sig.col; an alias's own, for a call through it), in
+# ritz0's words.  An uncalled fn type is a plain `ptr`: nothing to refuse.
+# Returns 1 when it refused.
+pub fn refuse_huge_fn_type_byval(s: *EmitterState, sig: *FnDef) -> i32
+    var refused: i32 = 0
+    var n: i32 = 1
+    var p: *Param = sig.params
+    while p != null
+        let bytes: i64 = param_byval_bytes(s, p)
+        if bytes >= BYVAL_MAX_BYTES and refused == 0
+            let buf: *u8 = malloc(320 + 2 * (p.param_type_name_len as i64))
+            var at: i64 = 0
+            var num: [24]u8 = [0; 24]
+            itoa(n as i64, @num[0])
+            hb_puts(buf, @at, c"parameter #")
+            hb_puts(buf, @at, @num[0])
+            hb_puts(buf, @at, c" of this fn type is ")
+            itoa(bytes, @num[0])
+            hb_puts(buf, @at, @num[0])
+            hb_puts(buf, @at, c" bytes, too large to pass by value (LLVM's byval limit is 4 GiB); take it by reference: `@")
+            hb_put_param_type(buf, @at, p)
+            hb_puts(buf, @at, c"` or `@&")
+            hb_put_param_type(buf, @at, p)
+            hb_puts(buf, @at, c"`")
+            *(buf + at) = 0
+            emit_nd_error(s, sig.line, sig.col, buf)
+            refused = 1
+        n += 1
+        p = p.next
+    refused
+
 # The `[N x T]` value type of the array `p` holds (its allocas and loads).
 # AGAST #3634: a `[N][M]..T` is the nested `[N x [M x T]]`, as ritz0 spells it.
 pub fn emit_array_value_llvm_type(s: *EmitterState, p: *Param)
