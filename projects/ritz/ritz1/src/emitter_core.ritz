@@ -5502,6 +5502,15 @@ pub fn ptr_root_pointee(s: *EmitterState, x: *Expr, out_name: **u8, out_len: *i3
     *out_len = name_len
     TYPE_STRUCT
 
+# The FnDef a call `f()` (find_call_fn) or, AGAST #4060, a method call
+# `b.m()` (method_call_def) dispatches to; null for any other expression.
+pub fn call_fn_def(s: *EmitterState, x: *Expr) -> *FnDef
+    if x.kind == EXPR_CALL
+        return find_call_fn(s, x)
+    if x.kind == EXPR_METHOD
+        return method_call_def(s, x)
+    null
+
 # ptr_root_pointee for a callee `fd` (a fn or, AGAST #3528, a method)
 # returning `*T`: TYPE_STRUCT (name written) for a `*S`, the primitive kind for
 # a scalar `*T`, else 0 (fd null, or not a `*T` return).
@@ -5747,12 +5756,13 @@ pub fn ptr_arith_elem_size(s: *EmitterState, e: *Expr) -> i64
         # strides by sizeof(T) (sizeof(S) for `**S`, 8 for `***T`), whatever
         # the base: local, param, global or struct field.
         return deref_ptr_ptr_stride(s, e)
-    if e.kind == EXPR_CALL
+    if e.kind == EXPR_CALL or e.kind == EXPR_METHOD
         # AGAST #2540: `f() + k` with `f() -> *T` strides by sizeof(T).  It
         # was a raw byte add, so `*(ident(p) + 2)` on a `*i32` read 2 bytes
         # in.  capture_fn_return_type names a primitive pointee ("i32") on
         # return_type_name (#1984); a struct pointee names the struct.
-        let fd: *FnDef = find_call_fn(s, e)
+        # AGAST #4060: and `b.m() + k`, a method returning `*T` / `**T`.
+        let fd: *FnDef = call_fn_def(s, e)
         if fd == null
             return 0
         if fd.return_type == TYPE_PTR_PTR
@@ -6200,10 +6210,11 @@ fn inline_ptr_pointee(s: *EmitterState, p: *Expr) -> i32
     if p.kind == EXPR_BINARY and (p.op == OP_ADD or p.op == OP_SUB) and p.left != null
         # AGAST #2540: `*(f() + k)` / `*((x as *T) + k)` point at the same T
         # as their left operand; ptr_arith_elem_size steps by its size.
+        # AGAST #4060: and `*(b.m() + k)`, a `-> *T` method.  It loaded an i64.
         if is_ptr_distance(s, p) == 1
             return TYPE_VOID
         let lk: i32 = p.left.kind
-        if lk == EXPR_CALL or lk == EXPR_CAST or lk == EXPR_BINARY
+        if lk == EXPR_CALL or lk == EXPR_METHOD or lk == EXPR_CAST or lk == EXPR_BINARY
             return inline_ptr_pointee(s, p.left)
         return TYPE_VOID
     if p.kind == EXPR_CAST and p.op == TYPE_PTR and p.int_val != (TYPE_VOID as i64)

@@ -317,17 +317,38 @@ fn f()
 }
 
 
-# ritz1 reads 0 through a method's `*T` result (AGAST #4060).
-LOAD_GAPS = {("method_index_order", "ritz1"): 4060, ("method_index_order", "ritz1_selfhosted"): 4060}
-
-
-@pytest.mark.parametrize("name,compiler", [
-    pytest.param(n, c, marks=[pytest.mark.xfail(strict=True, reason=f"AGAST #{LOAD_GAPS[n, c]}")]
-                 if (n, c) in LOAD_GAPS else [])
-    for n in sorted(CALL_BASE_LOAD) for c in COMPILERS])
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(CALL_BASE_LOAD))
 def test_load_from_call_result(tmp_path, compiler, name):
     body, call, want = CALL_BASE_LOAD[name]
     rc = _run(compiler, tmp_path, f"call_load_{name}", _source(body, call, want))
+    assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
+
+
+# `b.arr()[i]`: the same, through a method's `*T` / `**T` result.  ritz1
+# missed the method base (AGAST #4060) and read a byte at `b.arr() + i`:
+# `b.arr()[1]` over a `*i32` read 0.  CALL_BASE_LOAD's rows with a free
+# `arr()`, made a method of `B`.
+def _arr_as_method(body):
+    """`fn arr() -> T` (one level in) as `impl B`'s `fn arr(self: @B) -> T`."""
+    body = re.sub(r"^fn arr\(\) -> (.*)$", r"struct B\n    n: i32\n\nimpl B\n    fn arr(self: @B) -> \1",
+                  body, flags=re.MULTILINE)
+    return re.sub(r"^    D = D \* 10 \+ 6\n    return ([PQ])$", r"        D = D * 10 + 6\n        return \1",
+                  body, flags=re.MULTILINE)
+
+
+def _method_load_base(body):
+    body = re.sub(r"^(    let .* = )arr\(\)\[", r"    var b: B = B { n: 0 }\n\1b.arr()[",
+                  _arr_as_method(body), flags=re.MULTILINE)
+    assert "b.arr()[" in body and "impl B" in body, body
+    return body
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(n for n, (b, _, _) in CALL_BASE_LOAD.items() if "\nfn arr() ->" in b))
+def test_load_from_method_result(tmp_path, compiler, name):
+    body, call, want = CALL_BASE_LOAD[name]
+    rc = _run(compiler, tmp_path, f"method_load_{name}", _source(_method_load_base(body), call, want))
     assert rc == 42, f"{compiler}: {name}: D % 200 == {rc}, spec says D == {want}"
 
 
@@ -350,11 +371,7 @@ def test_struct_load_from_call_result_is_a_copy_only(tmp_path, compiler):
 # missed the method base (AGAST #3528) and stored through the VALUE of
 # `b.arr()[i]`: a SIGSEGV.  CALL_BASE's rows, with `arr` a method of `B`.
 def _method_base(body):
-    body = re.sub(r"^fn arr\(\) -> (.*)$", r"struct B\n    n: i32\n\nimpl B\n    fn arr(self: @B) -> \1",
-                  body, flags=re.M)
-    body = re.sub(r"^    D = D \* 10 \+ 6\n    return ([PQ])$", r"        D = D * 10 + 6\n        return \1",
-                  body, flags=re.M)
-    body = body.replace("    arr()[", "    var b: B = B { n: 0 }\n    b.arr()[")
+    body = _arr_as_method(body).replace("    arr()[", "    var b: B = B { n: 0 }\n    b.arr()[")
     assert "b.arr()[" in body and "impl B" in body, body
     return body
 
