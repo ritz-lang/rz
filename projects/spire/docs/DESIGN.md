@@ -159,7 +159,7 @@ pub fn repo_find_by_id(repo: *WikiPageRepository, id: *Uuid) -> Option<WikiPage>
     # (Mausoleum query syntax TBD)
     db_query_one(repo.db, "wiki_pages", id)
 
-pub fn repo_find_by_slug(repo: *WikiPageRepository, slug: *StrView) -> Option<WikiPage>
+pub fn repo_find_by_slug(repo: *WikiPageRepository, slug: StrView) -> Option<WikiPage>
     # Slugs are indexed, so this is efficient
     db_query_by_field(repo.db, "wiki_pages", "slug", slug)
 
@@ -168,10 +168,10 @@ pub fn repo_find_children(repo: *WikiPageRepository, parent_id: *Uuid) -> Vec<Wi
 
 pub fn repo_create(repo:& WikiPageRepository, page:& WikiPage) -> RepoResult<WikiPage>
     # Validate slug uniqueness
-    match repo_find_by_slug(repo, &string_as_strview(&page.slug))
+    match repo_find_by_slug(repo, string_as_strview(&page.slug))
         Some(_) =>
             let msg: StrView = "Page with this slug already exists"
-            Err(DuplicateKey(string_from_strview(&msg)))
+            Err(DuplicateKey(string_from_strview(msg)))
         None =>
             let result = db_insert(repo.db, "wiki_pages", page)
             # Invalidate cache
@@ -277,7 +277,7 @@ pub fn service_error_from_repo(err: RepoError) -> ServiceError
     match err
         NotFound(msg) => NotFoundError(msg)
         DuplicateKey(msg) => ConflictError(msg)
-        _ => InternalError(string_from_strview(&"Database error"))
+        _ => InternalError(string_from_strview("Database error"))
 ```
 
 ### Nexus Example: WikiService
@@ -310,9 +310,9 @@ pub fn wiki_service_new(
 pub fn service_create_page(
     svc:& WikiService,
     author_id: *Uuid,
-    slug: *StrView,
-    title: *StrView,
-    content: *StrView,
+    slug: StrView,
+    title: StrView,
+    content: StrView,
     parent_id: Option<Uuid>
 ) -> ServiceResult<WikiPage>
     # === VALIDATION ===
@@ -373,7 +373,7 @@ pub fn service_update_page(
     editor_id: *Uuid,
     title: Option<StrView>,
     content: Option<StrView>,
-    message: *StrView
+    message: StrView
 ) -> ServiceResult<WikiPage>
     # Fetch existing page
     let existing = match repo_find_by_id(svc.page_repo, page_id)
@@ -409,10 +409,10 @@ pub fn service_update_page(
 
     var updated: WikiPage = existing
     match title
-        Some(t) => updated.title = string_from_strview(&t)
+        Some(t) => updated.title = string_from_strview(t)
         None => ()
     match content
-        Some(c) => updated.content = string_from_strview(&c)
+        Some(c) => updated.content = string_from_strview(c)
         None => ()
     updated.author_id = *editor_id
     updated.version = updated.version + 1
@@ -425,7 +425,7 @@ pub fn service_update_page(
 # Get page with children for navigation
 pub fn service_get_page_with_nav(
     svc: *WikiService,
-    slug: *StrView
+    slug: StrView
 ) -> ServiceResult<PageWithNav>
     let page = match repo_find_by_slug(svc.page_repo, slug)
         Some(p) => p
@@ -466,7 +466,7 @@ fn build_breadcrumbs(svc: *WikiService, page: *WikiPage) -> Vec<BreadcrumbItem>
     crumbs
 
 # Validate slug format: lowercase alphanumeric with hyphens
-fn validate_slug_format(slug: *StrView) -> i32
+fn validate_slug_format(slug: StrView) -> i32
     var i: i64 = 0
     while i < slug.len
         let c: u8 = *(slug.ptr + i)
@@ -547,7 +547,7 @@ pub fn register_page_routes(router:& Router, state: *AppState)
 fn page_show(req: *Request, state: *AppState) -> Response
     let slug = request_param(req, "slug")
 
-    match service_get_page_with_nav(state.wiki_service, &slug)
+    match service_get_page_with_nav(state.wiki_service, slug)
         Ok(page_nav) =>
             # Render HTML
             let html = render_page(&page_nav)
@@ -566,7 +566,7 @@ fn page_edit_form(req: *Request, state: *AppState) -> Response
 
     let slug = request_param(req, "slug")
 
-    match repo_find_by_slug(state.wiki_service.page_repo, &slug)
+    match repo_find_by_slug(state.wiki_service.page_repo, slug)
         Some(page) =>
             let html = render_page_edit(&page, None)  # No errors
             var resp = response_ok()
@@ -590,7 +590,7 @@ fn page_edit_submit(req: *Request, state: *AppState) -> Response
     let message = form_get_or(&form, "message", "Updated page")
 
     # Get page ID from slug
-    let page = match repo_find_by_slug(state.wiki_service.page_repo, &slug)
+    let page = match repo_find_by_slug(state.wiki_service.page_repo, slug)
         Some(p) => p
         None => return response_not_found()
 
@@ -601,7 +601,7 @@ fn page_edit_submit(req: *Request, state: *AppState) -> Response
         &user.id,
         Some(title),
         Some(content),
-        &message
+        message
     )
         Ok(updated) =>
             # Redirect to view page
@@ -624,7 +624,7 @@ fn page_edit_submit(req: *Request, state: *AppState) -> Response
 fn api_page_get(req: *Request, state: *AppState) -> Response
     let slug = request_param(req, "slug")
 
-    match service_get_page_with_nav(state.wiki_service, &slug)
+    match service_get_page_with_nav(state.wiki_service, slug)
         Ok(page_nav) =>
             var resp = response_ok()
             let json = json_encode_page(&page_nav.page)
@@ -838,7 +838,7 @@ pub struct JsonKeyValue
     value: JsonValue
 
 # Parse JSON string to JsonValue
-pub fn json_parse(input: *StrView) -> Result<JsonValue, JsonError>
+pub fn json_parse(input: StrView) -> Result<JsonValue, JsonError>
     # ... parser implementation
 
 # Encode JsonValue to string
@@ -852,7 +852,7 @@ pub struct JsonBuilder
 pub fn json_object() -> JsonBuilder
     JsonBuilder { value: Object(vec_new<JsonKeyValue>()) }
 
-pub fn json_builder_set(builder:& JsonBuilder, key: *StrView, value: JsonValue)
+pub fn json_builder_set(builder:& JsonBuilder, key: StrView, value: JsonValue)
     match builder.value
         Object(pairs) =>
             var kv: JsonKeyValue
@@ -891,7 +891,7 @@ pub fn json_encode_page(page: *WikiPage) -> String
     json_builder_build(&builder)
 
 # Decoding request body
-pub fn json_decode_create_page(input: *StrView) -> Result<CreatePageRequest, JsonError>
+pub fn json_decode_create_page(input: StrView) -> Result<CreatePageRequest, JsonError>
     let value = json_parse(input)?
 
     match value
@@ -926,24 +926,24 @@ pub struct FormField
 
 pub fn form_parse(req: *Request) -> Form
     let body = request_body_str(req)
-    parse_urlencoded(&body)
+    parse_urlencoded(body)
 
-pub fn form_get(form: *Form, name: *StrView) -> Option<StrView>
+pub fn form_get(form: *Form, name: StrView) -> Option<StrView>
     var i: i64 = 0
     while i < vec_len<FormField>(&form.fields)
         let field = vec_get_ptr<FormField>(&form.fields, i)
         let field_name = string_as_strview(&field.name)
-        if strview_eq(&field_name, name)
+        if strview_eq(field_name, name)
             return Some(string_as_strview(&field.value))
         i += 1
     None
 
-pub fn form_get_or(form: *Form, name: *StrView, default: *StrView) -> StrView
+pub fn form_get_or(form: *Form, name: StrView, default: StrView) -> StrView
     match form_get(form, name)
         Some(v) => v
-        None => *default
+        None => default
 
-fn parse_urlencoded(input: *StrView) -> Form
+fn parse_urlencoded(input: StrView) -> Form
     var form: Form
     form.fields = vec_new<FormField>()
 
@@ -977,7 +977,7 @@ pub struct Html
 pub fn html_new() -> Html
     Html { content: string_new() }
 
-pub fn html_raw(content: *StrView) -> Html
+pub fn html_raw(content: StrView) -> Html
     Html { content: string_from_strview(content) }
 
 # Element builder
@@ -991,7 +991,7 @@ pub struct Attr
     name: String
     value: String
 
-pub fn el(tag: *StrView) -> Element
+pub fn el(tag: StrView) -> Element
     var elem: Element
     elem.tag = string_from_strview(tag)
     elem.attrs = vec_new<Attr>()
@@ -999,19 +999,19 @@ pub fn el(tag: *StrView) -> Element
     elem.text = None
     elem
 
-pub fn el_class(elem:& Element, class: *StrView)
+pub fn el_class(elem:& Element, class: StrView)
     var attr: Attr
-    attr.name = string_from_strview(&"class")
+    attr.name = string_from_strview("class")
     attr.value = string_from_strview(class)
     vec_push<Attr>(&elem.attrs, attr)
 
-pub fn el_attr(elem:& Element, name: *StrView, value: *StrView)
+pub fn el_attr(elem:& Element, name: StrView, value: StrView)
     var attr: Attr
     attr.name = string_from_strview(name)
     attr.value = string_from_strview(value)
     vec_push<Attr>(&elem.attrs, attr)
 
-pub fn el_text(elem:& Element, text: *StrView)
+pub fn el_text(elem:& Element, text: StrView)
     elem.text = Some(string_from_strview(text))
 
 pub fn el_child(elem:& Element, child: Html)
@@ -1022,16 +1022,16 @@ pub fn el_render(elem: *Element) -> Html
 
     # Opening tag
     string_push_str(&html.content, "<")
-    string_push_str(&html.content, &string_as_strview(&elem.tag))
+    string_push_str(&html.content, string_as_strview(&elem.tag))
 
     # Attributes
     var i: i64 = 0
     while i < vec_len<Attr>(&elem.attrs)
         let attr = vec_get_ptr<Attr>(&elem.attrs, i)
         string_push_str(&html.content, " ")
-        string_push_str(&html.content, &string_as_strview(&attr.name))
+        string_push_str(&html.content, string_as_strview(&attr.name))
         string_push_str(&html.content, "=\"")
-        html_escape_into(&html.content, &string_as_strview(&attr.value))
+        html_escape_into(&html.content, string_as_strview(&attr.value))
         string_push_str(&html.content, "\"")
         i += 1
 
@@ -1040,19 +1040,19 @@ pub fn el_render(elem: *Element) -> Html
     # Text content
     match elem.text
         Some(t) =>
-            html_escape_into(&html.content, &string_as_strview(&t))
+            html_escape_into(&html.content, string_as_strview(&t))
         None => ()
 
     # Children
     i = 0
     while i < vec_len<Html>(&elem.children)
         let child = vec_get_ptr<Html>(&elem.children, i)
-        string_push_str(&html.content, &string_as_strview(&child.content))
+        string_push_str(&html.content, string_as_strview(&child.content))
         i += 1
 
     # Closing tag
     string_push_str(&html.content, "</")
-    string_push_str(&html.content, &string_as_strview(&elem.tag))
+    string_push_str(&html.content, string_as_strview(&elem.tag))
     string_push_str(&html.content, ">")
 
     html
@@ -1078,7 +1078,7 @@ pub fn render_page(page_nav: *PageWithNav) -> StrView
         let crumb = vec_get_ptr<BreadcrumbItem>(&page_nav.breadcrumbs, i)
         var link = el("a")
         el_attr(&link, "href", &format_str("/wiki/{}", &crumb.slug))
-        el_text(&link, &string_as_strview(&crumb.title))
+        el_text(&link, string_as_strview(&crumb.title))
         el_child(&breadcrumbs, el_render(&link))
         # Add separator
         if i < vec_len<BreadcrumbItem>(&page_nav.breadcrumbs) - 1
@@ -1088,13 +1088,13 @@ pub fn render_page(page_nav: *PageWithNav) -> StrView
 
     # Title
     var h1 = el("h1")
-    el_text(&h1, &string_as_strview(&page.title))
+    el_text(&h1, string_as_strview(&page.title))
     el_child(&container, el_render(&h1))
 
     # Content (rendered markdown)
     var content = el("div")
     el_class(&content, "content")
-    let rendered_md = markdown_to_html(&string_as_strview(&page.content))
+    let rendered_md = markdown_to_html(string_as_strview(&page.content))
     el_child(&content, html_raw(&rendered_md))
     el_child(&container, el_render(&content))
 
@@ -1113,7 +1113,7 @@ pub fn render_page(page_nav: *PageWithNav) -> StrView
             var li = el("li")
             var link = el("a")
             el_attr(&link, "href", &format_str("/wiki/{}", &child.slug))
-            el_text(&link, &string_as_strview(&child.title))
+            el_text(&link, string_as_strview(&child.title))
             el_child(&li, el_render(&link))
             el_child(&ul, el_render(&li))
             i += 1
@@ -1121,7 +1121,7 @@ pub fn render_page(page_nav: *PageWithNav) -> StrView
         el_child(&container, el_render(&children))
 
     # Wrap in layout
-    layout(&string_as_strview(&page.title), el_render(&container))
+    layout(string_as_strview(&page.title), el_render(&container))
 ```
 
 ---
