@@ -490,3 +490,70 @@ fn test_restart_reuses_pages_freed_before_it() -> i32
         rc = 12
     rm_dir_flat(@path[0])
     rc
+
+# AGAST #4205: nothing of an uncommitted write reaches data.m7m.  A rewrite
+# blanks the old overflow chain to free pages; if the buffer pool evicted
+# those (and the new leaf) to data.m7m before the commit and the process then
+# died, the committed leaf would point at free pages, and the next large
+# insert would be handed them.  Churn the pool so every unpinned frame is a
+# candidate, "crash" before any commit, and the committed document is whole,
+# both at reopen and after a new large document reuses whatever is free.
+[[test]]
+fn test_crash_before_commit_keeps_evicted_chain() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"nosteal")
+    rm_dir_flat(@path[0])
+
+    var s: *Storage = open_store(@path[0])
+    if s == null
+        return 1
+    var col: Collection
+    if collection_open_storage(@col, s, 1) != ERR_OK
+        return 2
+    var a: DocumentId
+    if put_big(@col, @a, MAX_DOC_SIZE - 100, 1, true) != ERR_OK
+        return 3
+    if collection_commit(@col, s) != ERR_OK
+        return 4
+    storage_destroy(s)
+
+    s = open_store(@path[0])
+    if s == null or collection_open_storage(@col, s, 1) != ERR_OK
+        return 5
+    let free_before: i64 = buffer_pool_free_page_count(storage_pool(s))
+    # Rewrite `a` small: its chain goes back to the free list, uncommitted.
+    if put_big(@col, @a, 100, 2, false) != ERR_OK
+        return 6
+    if buffer_pool_free_page_count(storage_pool(s)) <= free_before
+        return 7
+    # Read twice the pool's worth of other pages: every frame that may be
+    # evicted is.
+    let pool: *BufferPool = storage_pool(s)
+    let base: i64 = buffer_pool_page_count(pool) + 16
+    var p: i64 = 0
+    while p < 2 * buffer_pool_num_frames(pool) as i64
+        let page_opt = storage_fetch_page(s, base + p)
+        if option_is_none<*Page>(@page_opt) == 1
+            return 8
+        storage_unpin_page(s, base + p, 0)
+        p += 1
+    # No commit, no close: the process "dies" here.
+
+    s = open_store(@path[0])
+    if s == null or collection_open_storage(@col, s, 1) != ERR_OK
+        return 9
+    var rc: i32 = 0
+    if has_big(@col, @a, MAX_DOC_SIZE - 100, 1) == 0
+        rc = 10
+    var b: DocumentId
+    if rc == 0 and put_big(@col, @b, MAX_DOC_SIZE - 100, 3, true) != ERR_OK
+        rc = 11
+    if rc == 0 and collection_commit(@col, s) != ERR_OK
+        rc = 12
+    if rc == 0 and has_big(@col, @a, MAX_DOC_SIZE - 100, 1) == 0
+        rc = 13
+    if rc == 0 and has_big(@col, @b, MAX_DOC_SIZE - 100, 3) == 0
+        rc = 14
+    storage_destroy(s)
+    rm_dir_flat(@path[0])
+    rc

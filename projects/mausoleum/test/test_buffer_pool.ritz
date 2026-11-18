@@ -565,3 +565,136 @@ fn test_buffer_pool_reclaims_free_pages_of_a_file() -> i32
     buffer_pool_destroy(pool)
     sys_unlink(@path[0])
     0
+
+# ============================================================================
+# No-steal (AGAST #4205): with buffer_pool_set_no_steal on, a page dirtied
+# since the last buffer_pool_mark_logged (the WAL commit) is never evicted,
+# so nothing uncommitted reaches the data file.
+# ============================================================================
+
+fn bp_tmp_path(path: *u8, tag: *u8)
+    let head: *u8 = c"/tmp/mausoleum_bp_"
+    var n: i64 = strlen(head)
+    memcpy(path, head, n)
+    let t: i64 = strlen(tag)
+    memcpy(path + n, tag, t)
+    n += t
+    path[n] = 95  # '_'
+    n += 1
+    n += fmt_i64_into(path + n, sys_getpid() as i64)
+    path[n] = 0
+    sys_unlink(path)
+
+fn bp_file_size(path: *u8) -> i64
+    var st: Stat
+    if sys_stat(path, @st as *u8) != 0
+        return -1
+    st.st_size
+
+# Fetch page `id` and unpin it clean; 1 if it could be fetched.
+fn bp_touch(pool: *BufferPool, id: i64) -> i32
+    let page_opt = buffer_pool_fetch(pool, id)
+    if option_is_none<*Page>(@page_opt) == 1
+        return 0
+    buffer_pool_unpin(pool, id, 0)
+    1
+
+[[test]]
+fn test_buffer_pool_no_steal_keeps_unlogged_pages() -> i32
+    var path: [96]u8
+    bp_tmp_path(@path[0], c"nosteal")
+    let pool: *BufferPool = bp_new(4)
+    if pool == null or buffer_pool_open(pool, @path[0]) != ERR_OK
+        return 90
+    buffer_pool_set_no_steal(pool, 1)
+    # Page 0, dirty and not yet logged, survives a churn through the pool.
+    if bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW) != 0
+        return 1
+    for i in 0..8
+        if bp_touch(pool, 10 + i as i64) == 0
+            return 2
+    if bp_file_size(@path[0]) != 0
+        return 3
+    # So does page 0 re-dirtied by an unpin after it was logged.
+    buffer_pool_mark_logged(pool)
+    let page_opt = buffer_pool_fetch(pool, 0)
+    if option_is_none<*Page>(@page_opt) == 1
+        return 4
+    buffer_pool_unpin(pool, 0, 1)
+    for i in 0..8
+        if bp_touch(pool, 20 + i as i64) == 0
+            return 5
+    if bp_file_size(@path[0]) != 0
+        return 6
+    # Every frame dirty and unlogged: a miss finds no frame instead of
+    # writing one out.
+    for i in 0..3
+        if bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW) < 0
+            return 7
+    if bp_touch(pool, 30) != 0
+        return 8
+    if bp_file_size(@path[0]) != 0
+        return 9
+    # Once logged, they may be evicted (written back) again.
+    buffer_pool_mark_logged(pool)
+    if bp_touch(pool, 30) == 0
+        return 10
+    if bp_file_size(@path[0]) != PAGE_SIZE
+        return 11
+    buffer_pool_destroy(pool)
+    sys_unlink(@path[0])
+    0
+
+# A freshly allocated page is unlogged even if its caller unpins it clean;
+# a page written out by a flush is clean and may be evicted again.
+[[test]]
+fn test_buffer_pool_no_steal_alloc_and_flush() -> i32
+    var path: [96]u8
+    bp_tmp_path(@path[0], c"nosteal2")
+    let pool: *BufferPool = bp_new(4)
+    if pool == null or buffer_pool_open(pool, @path[0]) != ERR_OK
+        return 90
+    buffer_pool_set_no_steal(pool, 1)
+    let page_opt = buffer_pool_alloc(pool, PAGE_MAGIC_OVERFLOW)
+    if option_is_none<*Page>(@page_opt) == 1
+        return 1
+    buffer_pool_unpin(pool, 0, 0)
+    for i in 0..8
+        if bp_touch(pool, 10 + i as i64) == 0
+            return 2
+    if bp_file_size(@path[0]) != 0
+        return 3
+    # Fill the pool with unlogged pages, then flush them: no longer pinned
+    # down, so a miss finds a frame.
+    for i in 0..3
+        if bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW) < 0
+            return 4
+    if bp_touch(pool, 30) != 0
+        return 5
+    if buffer_pool_flush_all(pool) != ERR_OK
+        return 6
+    if bp_touch(pool, 30) == 0
+        return 7
+    buffer_pool_destroy(pool)
+    sys_unlink(@path[0])
+    0
+
+# Without no-steal (a pool with no WAL behind it) dirty pages are written
+# back on eviction as before.
+[[test]]
+fn test_buffer_pool_steal_writes_back_dirty_victims() -> i32
+    var path: [96]u8
+    bp_tmp_path(@path[0], c"steal")
+    let pool: *BufferPool = bp_new(4)
+    if pool == null or buffer_pool_open(pool, @path[0]) != ERR_OK
+        return 90
+    if bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW) != 0
+        return 1
+    for i in 0..8
+        if bp_touch(pool, 10 + i as i64) == 0
+            return 2
+    if bp_file_size(@path[0]) != PAGE_SIZE
+        return 3
+    buffer_pool_destroy(pool)
+    sys_unlink(@path[0])
+    0

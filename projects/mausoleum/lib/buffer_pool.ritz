@@ -13,6 +13,10 @@
 # - LRU list for eviction candidates (unpinned pages)
 # - Pages are read from disk on cache miss
 # - Dirty pages are written back on eviction or explicit flush
+# - No-steal (AGAST #4205, buffer_pool_set_no_steal): the WAL is redo-only,
+#   so a page changed since the last WAL commit must not reach the data file.
+#   Such a page ("unlogged") is never an eviction victim; once
+#   buffer_pool_mark_logged says the WAL holds it, it may be written back.
 
 import ritzlib.sys
 import ritzlib.str
@@ -38,6 +42,7 @@ struct Frame
     page_id: i64                # Page ID (-1 if unused)
     pin_count: i32              # Number of active references
     dirty: i32                  # Has page been modified?
+    unlogged: i32               # Dirtied since the last buffer_pool_mark_logged
     lru_prev: i32               # Previous frame in LRU list (-1 if none)
     lru_next: i32               # Next frame in LRU list (-1 if none)
     hash_next: i32              # Next frame in hash bucket chain (-1 if none)
@@ -63,6 +68,7 @@ struct BufferPool
     free_ids: *i64
     free_count: i64
     free_cap: i64
+    no_steal: i32               # Never evict an unlogged page (AGAST #4205)
 
 # ============================================================================
 # Buffer Pool Creation/Destruction
@@ -102,6 +108,7 @@ pub fn buffer_pool_new(num_frames: i32) -> Option<*BufferPool>
         frame.page_id = INVALID_PAGE_ID
         frame.pin_count = 0
         frame.dirty = 0
+        frame.unlogged = 0
         frame.lru_prev = -1
         frame.lru_next = -1
         frame.hash_next = -1
@@ -127,6 +134,7 @@ pub fn buffer_pool_new(num_frames: i32) -> Option<*BufferPool>
     pool.free_ids = null
     pool.free_count = 0
     pool.free_cap = 0
+    pool.no_steal = 0
 
     return Some(pool)
 
@@ -272,7 +280,8 @@ fn get_free_frame(pool: *BufferPool) -> i32
     var victim_idx: i32 = pool.lru_tail
     while victim_idx >= 0
         let victim: *Frame = get_frame(pool, victim_idx)
-        if victim.pin_count == 0
+        # Under no-steal a page the WAL does not hold yet stays (#4205).
+        if victim.pin_count == 0 and (pool.no_steal == 0 or victim.unlogged == 0)
             # Found eviction candidate
             lru_remove(pool, victim_idx)
             hash_remove(pool, victim_idx, victim.page_id)
@@ -286,7 +295,7 @@ fn get_free_frame(pool: *BufferPool) -> i32
 
         victim_idx = victim.lru_prev
 
-    # No evictable frames (all pinned)
+    # No evictable frames (all pinned, or unlogged under no-steal)
     return -1
 
 # ============================================================================
@@ -405,6 +414,7 @@ pub fn buffer_pool_fetch(pool: *BufferPool, page_id: i64) -> Option<*Page>
     frame.page_id = page_id
     frame.pin_count = 1
     frame.dirty = 0
+    frame.unlogged = 0
 
     # Add to hash table
     hash_insert(pool, frame_idx, page_id)
@@ -424,6 +434,7 @@ pub fn buffer_pool_unpin(pool: *BufferPool, page_id: i64, dirty: i32)
 
     if dirty != 0
         frame.dirty = 1
+        frame.unlogged = 1
 
     if frame.pin_count > 0
         frame.pin_count -= 1
@@ -457,6 +468,7 @@ pub fn buffer_pool_alloc(pool: *BufferPool, page_type: i32) -> Option<*Page>
     frame.page_id = page_id
     frame.pin_count = 1
     frame.dirty = 1  # New page needs to be written
+    frame.unlogged = 1
 
     # Add to hash table
     hash_insert(pool, frame_idx, page_id)
@@ -485,6 +497,7 @@ fn alloc_free_page(pool: *BufferPool, page_type: i32) -> Option<*Page>
     frame.page_id = page_id
     frame.pin_count = 1
     frame.dirty = 1
+    frame.unlogged = 1
     return Some(@frame.page)
 
 # Put `page_id` on the free list.
@@ -605,6 +618,7 @@ pub fn buffer_pool_put_page(pool: *BufferPool, page_id: i64, image: *u8) -> i32
         let frame: *Frame = get_frame(pool, frame_idx)
         memcpy(@frame.page as *u8, image, PAGE_SIZE)
         frame.dirty = 1
+        frame.unlogged = 0   # The image came from the WAL.
         buffer_pool_reserve_page_id(pool, page_id)
         return ERR_OK
 
@@ -616,10 +630,27 @@ pub fn buffer_pool_put_page(pool: *BufferPool, page_id: i64, image: *u8) -> i32
     frame.page_id = page_id
     frame.pin_count = 0
     frame.dirty = 1
+    frame.unlogged = 0   # The image came from the WAL.
     hash_insert(pool, frame_idx, page_id)
     lru_add(pool, frame_idx)
     buffer_pool_reserve_page_id(pool, page_id)
     return ERR_OK
+
+# Turn no-steal on (1) or off (0).  Storage turns it on: with it a page
+# changed since the last buffer_pool_mark_logged is never evicted, so a
+# miss with every unpinned frame in that state fails (None / ERR_NO_MEMORY)
+# instead of writing an uncommitted page to the data file (AGAST #4205).
+pub fn buffer_pool_set_no_steal(pool: *BufferPool, on: i32)
+    if pool != null
+        pool.no_steal = on
+
+# Every dirty page is now in a committed WAL transaction: each may be
+# evicted (written back) again.  storage_wal_commit calls this.
+pub fn buffer_pool_mark_logged(pool: *BufferPool)
+    if pool == null
+        return
+    for i in 0..pool.num_frames
+        get_frame(pool, i).unlogged = 0
 
 # Number of frames (for iterating with buffer_pool_dirty_page).
 pub fn buffer_pool_num_frames(pool: *BufferPool) -> i32
@@ -670,6 +701,7 @@ pub fn buffer_pool_flush_frame(pool: *BufferPool, frame_idx: i32) -> i32
     let err: i32 = write_page(pool, frame)
     if err == ERR_OK
         frame.dirty = 0
+        frame.unlogged = 0
 
     return err
 
