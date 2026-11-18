@@ -152,6 +152,9 @@ class TypeChecker:
         # How many enums declare each variant: an instance of a generic enum
         # shares its variants' names with every other instance.
         self.variant_owners: Dict[str, int] = {}
+        # `impl Deref for S`: S's name -> (the impl's S<..> arguments, `deref`'s
+        # target T). `s.f` is T's `f` when S has none (LANGUAGE_SPEC §7.7).
+        self.deref_targets: Dict[str, Tuple[List[rast.Type], rast.Type]] = {}
 
         # Current context
         self.locals: Dict[str, rast.Type] = {}  # local variables
@@ -273,6 +276,12 @@ class TypeChecker:
             type_params=method.type_params or [],
             lent=self._lent_params(method)
         )
+        # DerefMut's target is Deref's (rule 1, deref_rules.impl_errors), so
+        # `deref` alone answers both a read and a write of `s.f`.
+        if (impl.trait_name == 'Deref' and method.name == 'deref'
+                and isinstance(method.ret_type, (rast.RefType, rast.PtrType))):
+            args = impl.impl_type.args if isinstance(impl.impl_type, rast.NamedType) else []
+            self.deref_targets[impl.type_name] = (list(args), method.ret_type.inner)
 
     @staticmethod
     def _lent_params(fn) -> Set[int]:
@@ -1251,6 +1260,12 @@ class TypeChecker:
             if field_name == expr.field:
                 return field_type
 
+        # Not S's own: through `Deref`, its target's (§7.7). The emitter words
+        # rule 5's errors (deref_rules.py), a write through only `Deref` too.
+        target = self._deref_field(inner_type, expr.field)
+        if target is not None:
+            return target
+
         self._error(f"struct '{struct_info.name}' has no field '{expr.field}'", expr.span)
         return rast.NamedType(expr.span, 'unknown', [])
 
@@ -1295,6 +1310,46 @@ class TypeChecker:
                              f"struct: it has no field `{expr.field}` (is an import missing?)",
                              expr.expr.span)
         return True
+
+    def _deref_field(self, ty: rast.NamedType, field: str,
+                     depth: int = 0) -> Optional[rast.Type]:
+        """The type of `field` reached through `ty`'s `Deref` (a `Deref`
+        target's own `Deref` too), or None when no target has it."""
+        found = self.deref_targets.get(ty.name)
+        if found is None or depth > 8:
+            return None
+        impl_args, target = found
+        # `impl<U> Deref for W<U>` on a `W<Point>`: U is Point.
+        subst = {a.name: b for a, b in zip(impl_args, ty.args)
+                 if isinstance(a, rast.NamedType) and not a.args}
+        target = self._strip_indirection(self._subst_type(target, subst))
+        if self._is_opaque(target):
+            return rast.NamedType(ty.span, 'unknown', [])
+        if not isinstance(target, rast.NamedType):
+            return None
+        info = self.structs.get(target.name)
+        for name, field_type in (info.fields if info else []):
+            if name == field:
+                return field_type
+        return self._deref_field(target, field, depth + 1)
+
+    @classmethod
+    def _subst_type(cls, ty: rast.Type, subst: Dict[str, rast.Type]) -> rast.Type:
+        """`ty` with each type parameter named in `subst` replaced."""
+        if not subst:
+            return ty
+        if isinstance(ty, rast.NamedType):
+            if not ty.args:
+                return subst.get(ty.name, ty)
+            return rast.NamedType(ty.span, ty.name,
+                                  [cls._subst_type(a, subst) for a in ty.args])
+        if hasattr(ty, 'inner'):
+            out = copy.copy(ty)
+            out.inner = cls._subst_type(ty.inner, subst)
+            return out
+        if isinstance(ty, rast.TupleType):
+            return rast.TupleType(ty.span, [cls._subst_type(t, subst) for t in ty.elements])
+        return ty
 
     def _check_index(self, expr: rast.Index) -> rast.Type:
         """Type check index operation."""
