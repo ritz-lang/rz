@@ -19,6 +19,12 @@
 #     1024)");
 #   - frames really crossed the modern NIC: DHCP got a lease ("[dhcp]
 #     Configured!"), which needs the virtio 1.x 12-byte net header both ways;
+#   - the NIC kept sending past its 256-entry TX ring: after DHCP the kernel
+#     pings the gateway 300 times in back-to-back groups of 4 and logs
+#     "[net] TX burst: sent=S/300 replies=R". S must be 300 (a driver that
+#     never reclaims used TX descriptors fails every send after 256) and
+#     R > 256 (R counts distinct reply seqs; one that reuses a TX buffer the
+#     device is still reading loses a group's earlier requests) (AGAST #4073);
 #   - virtio-net came up in MSI-X mode ("[msix] virtio-net: MSI-X on");
 #   - N > 0: interrupts were really delivered through the table, not polled;
 #   - the kernel took no exception, and init's Tier-1 suite still reports
@@ -161,6 +167,23 @@ else
     grep -a "\[dhcp\]\|DHCP" "$SERIAL" | head -5
     echo "FAIL: DHCP got no lease over the modern virtio-net"
     rc=1
+fi
+burst=$(grep -aoE "\[net\] TX burst: sent=[0-9]+/[0-9]+ replies=[0-9]+" "$SERIAL" | tail -1)
+b_sent=$(echo "$burst" | sed -nE 's/.*sent=([0-9]+)\/.*/\1/p')
+b_total=$(echo "$burst" | sed -nE 's/.*sent=[0-9]+\/([0-9]+) .*/\1/p')
+b_replies=$(echo "$burst" | sed -nE 's/.*replies=([0-9]+)$/\1/p')
+if [ -z "$burst" ]; then
+    grep -a "\[net\] TX burst" "$SERIAL" | head -3
+    echo "FAIL: no TX burst result ([net] TX burst: sent=S/N replies=R)"
+    rc=1
+elif [ "$b_total" -le 256 ] || [ "$b_sent" -ne "$b_total" ]; then
+    echo "FAIL: TX burst sent $b_sent of $b_total frames, want all of more than 256"
+    rc=1
+elif [ "$b_replies" -le 256 ]; then
+    echo "FAIL: TX burst got $b_replies distinct replies to $b_sent pings, want > 256"
+    rc=1
+else
+    echo "PASS: TX burst sent $b_sent/$b_total frames, $b_replies distinct replies"
 fi
 if grep -aq "\[msix\] virtio-net: MSI-X on" "$SERIAL"; then
     echo "PASS: virtio-net is in MSI-X mode"
