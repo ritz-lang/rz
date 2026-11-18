@@ -514,14 +514,15 @@ class SimpleBodyTransformer:
         if not isinstance(node, rast.Node) or isinstance(node, (rast.Type, rast.Pattern)):
             return node
 
+        if id(node) in self.await_results:
+            # A state drove it (an await, or a short-circuit `&&` / `||`
+            # whose right operand awaits): its value is stored.
+            return self.self_field(self.await_results[id(node)], node.span)
         if isinstance(node, rast.Ident):
             if node.name in self.fields:
                 return self.self_field(node.name, node.span)
             return node
         if isinstance(node, rast.Await):
-            # A state drove it: its result is stored.
-            if id(node) in self.await_results:
-                return self.self_field(self.await_results[id(node)], node.span)
             return self.rewrite(node.expr)
         if isinstance(node, (rast.LetStmt, rast.VarStmt)) and node.name in self.local_fields:
             # The local lives in the future struct.  One with no value is
@@ -614,7 +615,9 @@ class _CfgBuilder:
         self.closed: Set[int] = set()
         self.cur: Optional[int] = None
         self.n_awaits = 0
-        # Fields the lowering adds: awaited futures and await results.
+        self.n_shorts = 0
+        # Fields the lowering adds: awaited futures, await results and
+        # short-circuit values, in the order lowering meets them.
         self.extra_fields: List[Tuple[str, rast.Type]] = []
 
     # -- states ------------------------------------------------------------
@@ -744,6 +747,12 @@ class _CfgBuilder:
             expr = expr.expr
         if not self._needs_lowering(expr, loop):
             self.deliver(self.rw.rewrite(expr), dest)
+            if (isinstance(expr, rast.Block) and expr.expr is None and expr.stmts
+                    and isinstance(expr.stmts[-1], rast.ReturnStmt) and self.cur is not None):
+                # An arm emitted whole that ends in `return` is Ready: no
+                # jump may follow it (an `if (await f()) > 0` arm, #4013).
+                self.closed.add(self.cur)
+                self.cur = None
         elif isinstance(expr, rast.If):
             cond = self.hoist(expr.cond)
             then_b, else_b, join = self.new_block(), self.new_block(), self.new_block()
@@ -817,14 +826,42 @@ class _CfgBuilder:
                 self._hoist(arm, under or "a `match`")
             return
         if isinstance(node, rast.BinOp) and node.op in ('&&', '||', 'and', 'or'):
+            if under is None and _has_await(node.right):
+                self._short_circuit(node)
+                return
             self._hoist(node.left, under)
-            op = {'and': '&&', 'or': '||'}.get(node.op, node.op)
-            self._hoist(node.right, under or f"the right of `{op}`")
+            self._hoist(node.right, under)
             return
         if isinstance(node, rast.Block):
             under = under or "a block inside an expression"
         for child in _child_nodes(node):
             self._hoist(child, under)
+
+    def _short_circuit(self, node: rast.BinOp):
+        """`l && r` / `l || r` whose `r` awaits (AGAST #4013): `r`, and its
+        awaits, run only when `l` doesn't decide the value.
+
+            __short_K = l
+            if __short_K { -> R } else { -> J }    # `||`: the arms swap
+          R: __short_K = r                         # r's awaits in states
+          J: ... the expression reads __short_K"""
+        self._hoist(node.left, None)
+        tmp = self._add_field(f"__short_{self.n_shorts}", self.gen._make_named_type('bool'))
+        self.n_shorts += 1
+        self.emit(rast.AssignStmt(span=node.span, target=self.rw.self_field(tmp, node.span),
+                                  value=self.rw.rewrite(node.left)))
+        rhs, join = self.new_block(), self.new_block()
+        known = self.rw.self_field(tmp, self.span)
+        if node.op in ('&&', 'and'):
+            self.branch(known, rhs, join)
+        else:
+            self.branch(known, join, rhs)
+        self.cur = rhs
+        self.emit(rast.AssignStmt(span=node.span, target=self.rw.self_field(tmp, node.span),
+                                  value=self.hoist(node.right)))
+        self.goto(join)
+        self.cur = join
+        self.rw.await_results[id(node)] = tmp
 
     def lower_await(self, aw: rast.Await, dest):
         """`await inner` into `dest`: a resume point.

@@ -6208,8 +6208,9 @@ fn main() -> i32
     r - 8
 ```
 
-An `await` inside a `match` arm, a `for` loop or the right of `&&` / `||` is
-refused at the `await`, and a `defer` among the statements the machine splits
+The right operand of `&&` / `||` runs, with its awaits, only when the left
+one doesn't decide the value.  An `await` inside a `match` arm or a `for` loop
+is refused at the `await`, and a `defer` among the statements the machine splits
 into states is refused at the `defer`, until those forms are lowered
 (AGAST #4013):
 

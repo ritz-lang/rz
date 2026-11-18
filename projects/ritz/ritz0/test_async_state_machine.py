@@ -48,6 +48,9 @@ _POLL_GO = ("pub fn main() -> i32\n    var f: go_Future = go()\n    var pends: i
 _AB = ("var A: i32 = 0\nvar B: i32 = 0\n\n"
        "async fn a() -> i32\n    A += 1\n    1\n\nasync fn b() -> i32\n    B += 1\n    2\n\n")
 
+_BUMP = "fn bump(x: i32) -> i32\n    B += 1\n    x\n\n"
+_AND_RHS = "    if c && bump(await a()) > 0\n        return B * 10 + A\n    A + B\n"
+
 # name -> (program, exit code)
 RUNS = {
     # The ticket's table.
@@ -109,6 +112,17 @@ RUNS = {
                                  "    v + CALLS * 10\n\n" + _POLL_GO, 215),
     # The inner future is kept in go's: mid's statement ahead of its own
     # pending await runs once, not on every poll of go.
+    # AGAST #4013: the right of `&&` / `||` awaits only when it is evaluated,
+    # through a bool field: A counts a()'s runs, B b()'s.
+    # bump counts into B: the right operand runs once, not again where the
+    # condition reads its value.
+    "and_rhs_runs": (_AB + _BUMP + _go("(c: bool) -> i32", _AND_RHS, "(true)"), 11),
+    "and_rhs_short": (_AB + _BUMP + _go("(c: bool) -> i32", _AND_RHS, "(false)"), 0),
+    "or_rhs_short_let": (_AB + _go("(c: bool) -> i32", "    let v: bool = c || (await b()) > 1\n    if v\n"
+                                   "        return 10 + B\n    B\n", "(true)"), 10),
+    # A `while` condition's right operand is awaited again on every pass.
+    "and_rhs_in_while_cond": (_DBL + _go("(n: i32) -> i32", "    var i: i32 = 0\n"
+                                         "    while i < 5 && (await dbl(i)) < n\n        i += 1\n    i\n", "(6)"), 3),
     "pending_inner_future_kept": (_LATER + "async fn mid() -> i32\n    CALLS += 1\n    let v: i32 = await later()\n"
                                   "    v\n\nasync fn go() -> i32\n    let v: i32 = await mid()\n"
                                   "    v + CALLS * 10\n\n" + _POLL_GO, 215),
@@ -136,8 +150,6 @@ REFUSALS = {
     "defer_among_states": (_DBL + "async fn go(n: i32) -> i32\n    ^defer n = 0\n    await dbl(n)\n\n"
                            "pub fn main() -> i32\n    await go(3)\n",
                            "`defer` in an async fn that awaits is not supported yet (AGAST #4013)"),
-    "and_rhs": (_DBL + "async fn go(c: bool) -> i32\n    if c && (^await dbl(1)) > 0\n        return 1\n    0\n\n"
-                "pub fn main() -> i32\n    await go(true)\n", _UNPLACED.format(what="the right of `&&`")),
 }
 
 
