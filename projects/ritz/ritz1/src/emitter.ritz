@@ -2112,6 +2112,24 @@ fn emit_tagged_enum_arg_decls(s: *EmitterState, name: *u8, len: i32)
     if e != null
         emit_tagged_enum_decl_once(s, e, e_len)
 
+# The instances a signature names: its return's and each param's, and those
+# of any fn type among them (`look: fn(u16) -> Option<O>`, `-> fn() -> ..`).
+# AGAST #3979: a fn type's own signature went unscanned, so an instance only
+# it named was undeclared and `alloca %Option$O` an unsized type clang refused.
+# `sig` is a fn's, or a fn type's (the parser builds both as FnDefs).
+fn emit_tagged_enum_sig_decls(s: *EmitterState, sig: *FnDef)
+    if sig == null
+        return
+    if sig.return_type == TYPE_STRUCT or sig.return_type == TYPE_PTR or sig.return_type == TYPE_REF or sig.return_type == TYPE_MUT_REF
+        emit_tagged_enum_decl_once(s, sig.return_type_name, sig.return_type_name_len)
+    emit_tagged_enum_sig_decls(s, sig.ret_fn_sig)
+    var p: *Param = sig.params
+    while p != null
+        if p.param_type == TYPE_STRUCT or p.param_type == TYPE_PTR or p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
+            emit_tagged_enum_decl_once(s, p.param_type_name, p.param_type_name_len)
+        emit_tagged_enum_sig_decls(s, p.fn_sig)
+        p = p.next
+
 # Walk every fn / param / var-decl type name in the module and emit a
 # tagged-enum struct decl for each unique Result$/Option$ instantiation.
 # Must run AFTER emit_struct_types so user-declared types get dibs on the
@@ -2123,13 +2141,7 @@ fn emit_tagged_enum_types(s: *EmitterState)
         # produced fns like `option_is_none$ptr_Page(opt: *Option$ptr_Page)`
         # get their `%Option$ptr_Page` decl emitted.  Original code only
         # looked at TYPE_STRUCT params/returns and missed pointer-to-enum.
-        if f.return_type == TYPE_STRUCT or f.return_type == TYPE_PTR or f.return_type == TYPE_REF or f.return_type == TYPE_MUT_REF
-            emit_tagged_enum_decl_once(s, f.return_type_name, f.return_type_name_len)
-        var p: *Param = f.params
-        while p != null
-            if p.param_type == TYPE_STRUCT or p.param_type == TYPE_PTR or p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
-                emit_tagged_enum_decl_once(s, p.param_type_name, p.param_type_name_len)
-            p = p.next
+        emit_tagged_enum_sig_decls(s, f)
         # Walk body for let-bindings with explicit enum types
         emit_tagged_enum_scan_stmts(s, f.body)
         f = f.next
@@ -2140,13 +2152,7 @@ fn emit_tagged_enum_types(s: *EmitterState)
     while ib != null
         var meth: *FnDef = ib.methods
         while meth != null
-            if meth.return_type == TYPE_STRUCT or meth.return_type == TYPE_PTR or meth.return_type == TYPE_REF or meth.return_type == TYPE_MUT_REF
-                emit_tagged_enum_decl_once(s, meth.return_type_name, meth.return_type_name_len)
-            var mp: *Param = meth.params
-            while mp != null
-                if mp.param_type == TYPE_STRUCT or mp.param_type == TYPE_PTR or mp.param_type == TYPE_REF or mp.param_type == TYPE_MUT_REF
-                    emit_tagged_enum_decl_once(s, mp.param_type_name, mp.param_type_name_len)
-                mp = mp.next
+            emit_tagged_enum_sig_decls(s, meth)
             emit_tagged_enum_scan_stmts(s, meth.body)
             meth = meth.next
         ib = ib.next
@@ -2161,6 +2167,8 @@ fn emit_tagged_enum_types(s: *EmitterState)
             while fld != null
                 emit_tagged_enum_decl_once(s, fld.field_type_name, fld.field_type_name_len)
                 emit_tagged_enum_decl_once(s, fld.array_elem_type_name, fld.array_elem_type_name_len)
+                emit_tagged_enum_sig_decls(s, fld.fn_sig)        # AGAST #3979
+                emit_tagged_enum_sig_decls(s, fld.elem_fn_sig)
                 fld = fld.next
         fst = fst.next
 
@@ -2222,6 +2230,7 @@ fn emit_tagged_enum_scan_stmts(s: *EmitterState, body: *Stmt)
             # undeclared, its alloca was an unsized type clang refused.
             if st.var_type == TYPE_STRUCT or st.var_type == TYPE_PTR or st.var_type == TYPE_REF or st.var_type == TYPE_MUT_REF or st.var_type == TYPE_ARRAY
                 emit_tagged_enum_decl_once(s, st.var_type_name, st.var_type_name_len)
+            emit_tagged_enum_sig_decls(s, st.var_fn_sig)   # AGAST #3979: `let f: fn() -> Result<P, i32>`
         else if st.kind == STMT_IF
             emit_tagged_enum_scan_stmts(s, st.if_then)
             if st.if_else != null
