@@ -23,7 +23,10 @@
 # Exit only 0 or 1.
 
 VALET="${VALET:-$(dirname "$0")/../build/debug/valet}"
-PORT="${PORT:-9190}"
+# A free port, never a fixed one: valet's SO_REUSEPORT would share it (#3694).
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
+PORT="${PORT:-$(pick_port)}"
+require_free_port "$PORT" || exit 1
 CLIENT_TIMEOUT="${CLIENT_TIMEOUT:-5}"
 
 RED='\033[0;31m'

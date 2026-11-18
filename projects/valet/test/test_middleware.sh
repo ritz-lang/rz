@@ -5,7 +5,10 @@ set -e
 # Find valet relative to test script
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 VALET_BIN="$SCRIPT_DIR/../valet"
-PORT=8099
+# A free port, never a fixed one: valet's SO_REUSEPORT would share it (#3694).
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
+PORT="${PORT:-$(pick_port)}"
+require_free_port "$PORT" || exit 1
 
 echo "=== Middleware & Catch-all Tests ==="
 

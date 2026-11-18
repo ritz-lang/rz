@@ -9,7 +9,10 @@
 set -e
 
 VALET="${VALET:-./valet}"
-PORT="${PORT:-9102}"
+# A free port, never a fixed one: valet's SO_REUSEPORT would share it (#3694).
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
+PORT="${PORT:-$(pick_port)}"
+require_free_port "$PORT" || exit 1
 WORKERS="${WORKERS:-4}"
 
 RED='\033[0;31m'

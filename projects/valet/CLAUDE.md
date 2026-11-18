@@ -31,6 +31,9 @@ $V --help               # Authoritative option list
 ./rz test valet         # .ritz files under test/ — exit 0, several minutes
 # Shell suites are not wired into `rz test` (#1403); run them by hand, e.g.
 #   cd projects/valet && VALET=./build/debug/valet bash test/test_workers.sh
+# Each picks a free port via test/lib_ports.sh, never a fixed one: valet's
+# SO_REUSEPORT would let two runs share a port and split connections (#3694).
+# PORT=... pins one; a port that already has a listener is refused.
 
 # Benchmark
 $V -p 8080 &

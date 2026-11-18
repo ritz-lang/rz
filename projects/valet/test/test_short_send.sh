@@ -63,23 +63,10 @@ fi
 
 # valet sets SO_REUSEPORT: a fixed port could share a listener with another
 # copy of this script (a gate and a room's mutant), so pick an unused one
-# below the ephemeral range, as test_tls_socket.sh does (AGAST #3685).
-port_taken() {
-    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
-}
-pick_port() {
-    local p
-    while :; do
-        p=$((10000 + RANDOM % 22000))
-        ! port_taken "$p" && break
-    done
-    echo "$p"
-}
+# below the ephemeral range (lib_ports.sh, AGAST #3685, #3694).
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
 PORT="${PORT:-$(pick_port)}"
-if port_taken "$PORT"; then
-    echo "FAIL: port $PORT already has a listener; valet's SO_REUSEPORT would share it"
-    exit 1
-fi
+require_free_port "$PORT" || exit 1
 
 # The smallest send buffer (the kernel raises 1024 to its 4608 minimum): a
 # 3500-byte response no longer fits in one send once the client stops reading.

@@ -38,6 +38,13 @@ ZEUS="${ZEUS:-$ROOT/projects/zeus/build/debug/zeus}"
 VALET="${VALET:-$ROOT/projects/valet/build/debug/valet}"
 NEXUS="${NEXUS:-$ROOT/projects/nexus/build/debug/nexus}"
 
+# valet's port: a free one below the ephemeral range, never shared. valet sets
+# SO_REUSEPORT, so a second valet on the same port would split connections
+# with ours (AGAST #3694, projects/valet/test/lib_ports.sh).
+. "$ROOT/projects/valet/test/lib_ports.sh"
+PORT="${PORT:-$(pick_port)}"
+require_free_port "$PORT" || exit 1
+
 for b in "$ZEUS" "$VALET" "$NEXUS"; do
     if [[ ! -x "$b" ]]; then
         echo "FAIL: missing binary $b (build zeus, valet and nexus first)" >&2
@@ -48,7 +55,6 @@ command -v curl >/dev/null || { echo "FAIL: curl not found" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
 SOCK="$TMP/zeus.sock"
-PORT="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1",0)); print(s.getsockname()[1])')"
 PIDS=()
 
 # A port that refuses every connection for as long as we run: bound (so

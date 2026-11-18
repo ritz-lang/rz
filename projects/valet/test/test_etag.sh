@@ -1,7 +1,10 @@
 #!/bin/bash
 # Test ETag/If-None-Match caching
 
-PORT=8712
+# A free port, never a fixed one: valet's SO_REUSEPORT would share it (#3694).
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
+PORT="${PORT:-$(pick_port)}"
+require_free_port "$PORT" || exit 1
 SCRIPT_DIR="$(dirname "$0")"
 cd "$SCRIPT_DIR/.."
 

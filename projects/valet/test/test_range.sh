@@ -1,7 +1,10 @@
 #!/bin/bash
 # Test range requests
 
-PORT=8711
+# A free port, never a fixed one: valet's SO_REUSEPORT would share it (#3694).
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
+PORT="${PORT:-$(pick_port)}"
+require_free_port "$PORT" || exit 1
 cd "$(dirname "$0")/.."
 
 # Create a larger test file

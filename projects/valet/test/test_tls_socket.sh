@@ -87,29 +87,14 @@ fi
 # valet on the same port (AGAST #3685). Two copies of this script at once, in
 # two gate slots or a gate and a room, must never share a port, so each picks
 # random unused ones below the kernel's ephemeral range (32768 on), where no
-# client socket's local port can be. PORT and SPORT can still be given by hand,
-# but a port that already has a listener is refused, not shared.
-port_taken() {
-    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
-}
-pick_port() {
-    local p
-    while :; do
-        p=$((10000 + RANDOM % 22000))
-        [ "$p" != "$1" ] && ! port_taken "$p" && break
-    done
-    echo "$p"
-}
+# client socket's local port can be (lib_ports.sh, shared since #3694). PORT,
+# SPORT and HPORT can still be given by hand, but a port that already has a
+# listener is refused, not shared.
+. "$(dirname "${BASH_SOURCE[0]}")/lib_ports.sh"
 PORT="${PORT:-$(pick_port)}"
 SPORT="${SPORT:-$(pick_port "$PORT")}"
-HPORT="${HPORT:-$(pick_port "$SPORT")}"
-while [ "$HPORT" = "$PORT" ]; do HPORT="$(pick_port "$SPORT")"; done
-for p in "$PORT" "$SPORT" "$HPORT"; do
-    if port_taken "$p"; then
-        echo "FAIL: port $p already has a listener; valet's SO_REUSEPORT would share it"
-        exit 1
-    fi
-done
+HPORT="${HPORT:-$(pick_port "$PORT" "$SPORT")}"
+require_free_port "$PORT" "$SPORT" "$HPORT" || exit 1
 
 openssl genpkey -algorithm ed25519 -out "$WORK/key.pem" 2>/dev/null
 openssl req -new -x509 -key "$WORK/key.pem" -out "$WORK/cert.pem" -days 2 \
