@@ -8,11 +8,14 @@ on `module.typed`.  It runs on every compile, as `ritz0._type`, not only under
 `--check-types`; that flag now only decides whether its type errors are
 reported (turning them on by default is #1823).  The move checker takes the
 types of literals, casts, struct literals and calls from the table; its own
-rules for those kinds are gone.  Monomorph and the emitter still infer for
-themselves (follow-up tickets).
+rules for those kinds are gone.  So does the emitter, for typed.EMITTER_READS
+(#3555).  Monomorph still infers for itself (#3554).
 
-No compiles: every case parses a few lines in-process, in milliseconds.
+Every case but one parses a few lines in-process, in milliseconds; the
+win64 call case compiles once.
 """
+
+import pytest
 
 import ritz0
 import ritz_ast as rast
@@ -329,3 +332,107 @@ def test_an_undeclared_struct_literals_fields_are_still_typed():
     (addr,) = _nodes(module, rast.UnaryOp)
     ty = _checker_on(module)._infer_expr_type(addr)
     assert isinstance(ty, rast.RefType) and _name(ty.inner) == "u16"
+
+
+# --- the emitter (#3555) -----------------------------------------------------
+
+WIN64_CALL = """
+[[callconv = "win64"]]
+type Svc2 = fn(u64, u64) -> u64
+
+fn call_it(p: u64) -> u64
+    (p as Svc2)(1, 2)
+"""
+
+
+def test_the_checker_types_an_indirect_calls_callee():
+    """`(p as Svc2)(...)`: the emitter reads the callee cast's type for the
+    call's callconv, so the pass has to have typed it."""
+    module = parse(WIN64_CALL)
+    table = typed.type_module(module)
+    (cast,) = _nodes(module, rast.Cast)
+    assert _name(table.type_of(cast)) == "Svc2"
+    assert table.errors == []
+
+
+@pytest.mark.integration
+def test_a_call_through_a_cast_to_a_win64_alias_stays_win64cc(tmp_path):
+    """The harland UEFI loader's shape: the emitter takes the callee's
+    callconv from the table, and a callee the pass never typed lost
+    `win64cc`, so the call used the SysV registers."""
+    from ritz0_inproc import run_ritz0
+    src = tmp_path / "main.ritz"
+    src.write_text(WIN64_CALL + "\npub fn main() -> i32\n    0\n")
+    ll = tmp_path / "main.ll"
+    result = run_ritz0([str(src), "-o", str(ll)], cwd=str(tmp_path))
+    assert result.returncode == 0, result.stderr
+    calls = [l for l in ll.read_text().splitlines() if " = call " in l and "(i64 1, i64 2)" in l]
+    assert len(calls) == 1 and "call win64cc i64" in calls[0], calls
+
+
+def test_the_checker_types_an_option_try_as_its_payload():
+    """`o?` on an `Option<T>` is a `T`, as on a `Result<T, E>`: the emitter
+    registers `let v = o?` for its scope-end drop by that type (#2264)."""
+    module = parse("fn f(o: Option<u16>) -> Option<u16>\n    let v = o?\n    Some(v)\n")
+    table = typed.type_module(module)
+    (try_op,) = _nodes(module, rast.TryOp)
+    assert _name(table.type_of(try_op)) == "u16"
+
+
+def test_the_checker_types_a_sizeof_value_operand():
+    module = parse("fn f(x: u8) -> i64\n    sizeof(x as u16)\n")
+    table = typed.type_module(module)
+    (cast,) = _nodes(module, rast.Cast)
+    assert _name(table.type_of(cast)) == "u16"
+
+
+def _emitter_over(table):
+    """An emitter with the table and no aliases: the kinds it reads need no
+    other state."""
+    from emitter_llvmlite import LLVMEmitter
+    em = LLVMEmitter.__new__(LLVMEmitter)
+    em.typed = table
+    em.type_aliases = {}
+    return em
+
+
+def test_the_emitter_takes_the_types_of_the_kinds_it_reads_from_the_table():
+    """Retype each node in the table: the emitter answers with the table's
+    type, not a rule of its own (an int literal would be its own `i64`, a
+    cast its target, a char a `u8`)."""
+    module = parse("fn f(x: u8) -> i64\n    let a = 5\n    let b = x as u16\n    let c = 'c'\n    0\n")
+    table = typed.type_module(module)
+    (lit,) = [e for e in _nodes(module, rast.IntLit) if e.value == 5]
+    (cast,) = _nodes(module, rast.Cast)
+    (char,) = _nodes(module, rast.CharLit)
+    for node, ty in ((lit, "u32"), (cast, "i8"), (char, "i16")):
+        table.record(node, rast.NamedType(None, ty, []))
+    em = _emitter_over(table)
+    assert [_name(em._infer_ritz_type(n)) for n in (lit, cast, char)] == ["u32", "i8", "i16"]
+    # Signedness of a cast and a char comes from the table too.
+    assert [em._infer_unsigned_expr(n) for n in (cast, char)] == [False, False]
+
+
+def test_the_emitter_reads_unknown_as_no_type():
+    module = parse("fn f() -> i64\n    let a = 5\n    0\n")
+    table = typed.type_module(module)
+    (lit,) = [e for e in _nodes(module, rast.IntLit) if e.value == 5]
+    table.record(lit, rast.NamedType(None, "unknown", []))
+    assert _emitter_over(table)._infer_ritz_type(lit) is None
+
+
+def test_the_emitter_has_no_float_inferer():
+    """`_infer_float_expr` only ever called itself; it is gone (#3555)."""
+    from emitter_llvmlite import LLVMEmitter
+    assert not hasattr(LLVMEmitter, "_infer_float_expr")
+
+
+def test_the_checker_types_an_untyped_globals_initialiser():
+    """`var g = 'A'` is refused, naming the type to write (`u8`): the emitter
+    reads that type off the table (test_global_init_rejected.py)."""
+    module = parse("var g = 'A'\nvar h = -5\n\nfn main() -> i32\n    0\n")
+    table = typed.type_module(module)
+    (char,) = _nodes(module, rast.CharLit)
+    (neg,) = _nodes(module, rast.UnaryOp)
+    assert [_name(table.type_of(n)) for n in (char, neg)] == ["u8", "i64"]
+    assert table.errors == []
