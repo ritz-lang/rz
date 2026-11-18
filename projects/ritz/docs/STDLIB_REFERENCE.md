@@ -2268,7 +2268,10 @@ digits, a short `\u`, a surrogate without its other half, or any other
 escape (`\q`, `\x41`) fail with `JSON_ERR_INVALID_ESCAPE` at the escape's
 backslash. `\u0000` is kept in a string value (`str_len` and
 `json_get_string` count it) but rejected in an object key, which is stored as
-a NUL-terminated `*u8`.
+a NUL-terminated `*u8`. A raw control character (U+0000–U+001F) inside a
+string, key or value, fails with `JSON_ERR_CONTROL_CHAR` at that byte: RFC
+8259 requires them escaped. Tabs and newlines between tokens are whitespace
+and stay legal.
 
 **Value Access**:
 

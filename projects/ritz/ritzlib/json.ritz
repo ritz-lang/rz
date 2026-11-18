@@ -60,6 +60,8 @@ const JSON_ERR_EXPECTED_BRACE: i32 = 5
 const JSON_ERR_OUT_OF_MEMORY: i32 = 6
 const JSON_ERR_INVALID_ESCAPE: i32 = 7   # escape RFC 8259 lacks (\q), bad \uXXXX hex,
                                          # unpaired surrogate, or \u0000 in a key
+const JSON_ERR_CONTROL_CHAR: i32 = 8     # raw U+0000-U+001F inside a string (RFC 8259
+                                         # §7 requires them escaped); pos = that byte
 
 # Error type for JSON parsing
 struct JsonError
@@ -297,6 +299,8 @@ fn jp_decode_u(src: *u8, pos: i64, end: i64, used: *i64) -> i32
 # as a NUL-terminated *u8 with no length (JsonValue.keys), so \u0000 is rejected
 # there: json_get_field would otherwise match {"a\u0000b": 1} on "a".  A string
 # value keeps \u0000: str_len counts it and json_get_string returns all bytes.
+# A raw U+0000-U+001F byte is JSON_ERR_CONTROL_CHAR in keys and values alike
+# (AGAST #3941), so no raw NUL reaches a key either.
 fn jp_parse_string(p: *JsonParser, is_key: i32) -> *JsonValue
     if jp_peek(p) != 34  # '"'
         return null
@@ -314,6 +318,12 @@ fn jp_parse_string(p: *JsonParser, is_key: i32) -> *JsonValue
         let ch: i32 = jp_peek(p)
         if ch == '"'  # closing quote
             break
+        if ch < 0x20
+            # RFC 8259 §7: U+0000-U+001F must be escaped.  Copying one raw
+            # would also let a raw NUL truncate a key, as \u0000 did (#3918).
+            # p.pos is already at the byte, which is where the error points.
+            p.err = JSON_ERR_CONTROL_CHAR
+            return null
         if ch == '\\'  # backslash
             jp_advance(p)
             if p.pos < p.len
@@ -618,6 +628,8 @@ pub fn json_error_message(code: i32) -> StrView
         return "out of memory"
     if code == JSON_ERR_INVALID_ESCAPE
         return "invalid escape"
+    if code == JSON_ERR_CONTROL_CHAR
+        return "control character in string"
     return "unknown error"
 
 # =============================================================================

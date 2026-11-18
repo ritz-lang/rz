@@ -3,7 +3,9 @@
 # ritzlib.json (AGAST #1459).  Pins json's CURRENT behaviour, quirks included:
 #   - json_parse2 reports every failure as code 1 (JSON_ERR_UNEXPECTED_CHAR),
 #     except an invalid escape (\q, or a malformed \uXXXX): code 7
-#     (JSON_ERR_INVALID_ESCAPE) at its backslash (AGAST #3914, #3918);
+#     (JSON_ERR_INVALID_ESCAPE) at its backslash (AGAST #3914, #3918), and
+#     a raw control character inside a string: code 8 (JSON_ERR_CONTROL_CHAR)
+#     at that byte (AGAST #3941);
 #     pos is where the parser stopped (end of input for "[1, 2" and "\"open");
 #   - numbers are integers: -1.25 parses as -125, -0012 as -12;
 #   - input after the first value is ignored: "[1] x" parses as [1];
@@ -113,6 +115,9 @@ trailing input (accepted): ok [1]
 bad \u escape: error: code=7 pos=2 msg=invalid escape
   legacy: ok=0 pos=2 error=JSON parse error
   failed: 1
+raw tab in string: error: code=8 pos=3 msg=control character in string
+  legacy: ok=0 pos=3 error=JSON parse error
+  failed: 1
 message 0: unknown error
 message 1: unexpected character
 message 2: unterminated string
@@ -121,7 +126,8 @@ message 4: expected ']'
 message 5: expected '}'
 message 6: out of memory
 message 7: invalid escape
-message 8: unknown error
+message 8: control character in string
+message 9: unknown error
 GOLDEN
 )
 out=$(./json_walk </dev/null); rc=$?
