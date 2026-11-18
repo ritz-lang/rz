@@ -13,6 +13,7 @@ import ritzlib.hash
 import ritzlib.hashmap
 
 import ast
+import types           # the one primitive type table (AGAST #1889)
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 import index_through # index_through (AGAST #2440)
 import tokens_gen
@@ -1136,9 +1137,9 @@ pub fn nth_arg(args: *Expr, j: i32) -> *Expr
 # The ident-only half of expr_is_ptr_valued: the shape `*x` / `*x = v` see.
 # The integer kinds a `:&` borrow binds as a plain local (AGAST #1644).
 pub fn is_borrow_scalar_kind(t: i32) -> i32
-    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16
+    if ty_int_in(t, 8, 16) == 1
         return 1
-    if t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
+    if ty_int_in(t, 32, 64) == 1
         return 1
     return 0
 
@@ -2141,21 +2142,35 @@ pub fn build_symbol_maps(s: *EmitterState)
             hashmap_i64_insert(@&s.const_map, kc, ce as i64)
         ce = ce.next
 
-# AGAST #1504: the LLVM element type of a global `var g: [N]T`, exactly as
-# emit_globals declares it (`@g = weak_odr global [N x <this>]`). Index
-# lowering GEPs `[N x <this>], ptr @g, i64 0, i64 idx` and loads/stores at this
-# width, so the declaration and every access must agree. It differs from
-# emit_llvm_type, which lowers pointers to i64 and bool to i1. Struct elements
-# are not covered here; the declaration names `%T` for those.  AGAST #1970:
-# f32 / f64 elements are `float` / `double`, as for a local array (#1966);
-# they were `i64`, so `g[i] = 2.5` stored `store i64 %double`.
 # AGAST #1509: times a multi-dimensional array's TYPE_ARRAY element reached
-# a 1-D element-type helper (field_array_elem_llvm), i.e. an N-D array use
-# ritz1 does not lower.  Reported (and failed) by emit_module.
+# a 1-D element-type helper (elem_mem_llvm), i.e. an N-D array use ritz1 does
+# not lower.  Reported (and failed) by emit_module.
 var g_nd_elem_leaks: i32 = 0
 
 pub fn nd_elem_leaks() -> i32
     g_nd_elem_leaks
+
+# The LLVM type of ONE element of a non-struct `[N]T` -- a local, global or
+# const array, a struct field array, or the pointee of a `*T` -- and so of
+# every GEP / load / store over it: types.ritz's memory spelling (ritz0's
+# layout).  AGAST #1889: this replaced six ladders (array_elem_llvm,
+# field_/local_/global_array_elem_llvm, ptr_field_elem_llvm, and the
+# local-array index arms) that each knew a different subset of the
+# primitives (#1564 u16/i16/u32, #1814 fields, #1966 f32/f64, #2063 bool).
+# A struct element is spelled `%T` by its caller; anything else unknown is
+# an i64 slot.
+pub fn elem_mem_llvm(t: i32) -> *u8
+    if t == TYPE_ARRAY
+        # AGAST #1509: every lowered N-D access goes through
+        # emit_nd_index_ptr / emit_array_shape_llvm; anything else used to
+        # treat the inner array as one i64 and miscompile silently.
+        # emit_module turns the count into a hard error.
+        g_nd_elem_leaks = g_nd_elem_leaks + 1
+        return c"i64"
+    let m: *u8 = ty_mem_llvm(t)
+    if m == null
+        return c"i64"
+    m
 
 # AGAST #1509: the LLVM type of `sh` from dimension `from` inward:
 # `[4 x [8 x i8]]` for `[4][8]u8` from 0, `[8 x i8]` from 1, and the bare
@@ -2171,77 +2186,25 @@ pub fn emit_array_shape_llvm(s: *EmitterState, sh: *ArrayShape, from: i32)
     if sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0
         emit_llvm_type_struct(s, TYPE_STRUCT, sh.leaf_name, sh.leaf_name_len)
     else
-        emit_str(s, local_array_elem_llvm(sh.leaf_type))
+        emit_str(s, elem_mem_llvm(sh.leaf_type))
     d = from
     while d < sh.rank
         emit_str(s, c"]")
         d = d + 1
 
-pub fn global_array_elem_llvm(g: *GlobalVarDef) -> *u8
-    return local_array_elem_llvm(g.array_elem_type)
-
-# The LLVM element type of a non-struct `[N]T` array, global or local. It is
-# the spelling both emit_globals and emit_var_decl's `alloca [N x T]` use, so
-# every GEP / load / store over the array must use it too. AGAST #1564: the
-# local-array index arms kept their own i8/i32/i64/ptr chains, so a local
-# `[N]u32` / `[N]u16` / `[N]i16` was addressed as `[N x i64]` over a narrower
-# alloca — 8-byte strides and stores that overran it.
-pub fn array_elem_llvm(t: i32) -> *u8
-    if t == TYPE_I32 or t == TYPE_U32
-        return c"i32"
-    if t == TYPE_U8 or t == TYPE_I8
-        return c"i8"
-    if t == TYPE_U16 or t == TYPE_I16
-        return c"i16"
-    if t == TYPE_PTR or t == TYPE_PTR_PTR
-        return c"ptr"
-    return c"i64"
-
-# The LLVM element type of a non-struct `[N]T` STRUCT FIELD. This is the
-# spelling emit_field_llvm_type declares the field with, so it must match
-# ritz0's (the cross-compiler struct ABI) and every GEP over the field must
-# use it. AGAST #1814: the field ladder lacked u16/i16/u32/f32/f64/bool, so
-# `a: [4]u16` was declared `[4 x i64]` (32 bytes) while sizeof counted 8.
-pub fn field_array_elem_llvm(t: i32) -> *u8
-    if t == TYPE_ARRAY
-        # AGAST #1509: a multi-dimensional array reached a 1-D element path.
-        # Every lowered N-D access goes through emit_nd_index_ptr and
-        # emit_array_shape_llvm; anything else used to treat the inner
-        # array as one i64 and miscompile silently.  emit_module turns the
-        # count into a hard error.
-        g_nd_elem_leaks = g_nd_elem_leaks + 1
-        return c"i64"
-    if t == TYPE_F32
-        return c"float"
-    if t == TYPE_F64
-        return c"double"
-    if t == TYPE_BOOL
-        return c"i1"
-    return array_elem_llvm(t)
-
-# The LLVM element type of a LOCAL `[N]T` array (`alloca [N x <this>]`) and
-# therefore of every GEP / load / store over it: f32 / f64 elements are real
-# `float` / `double`, as for a struct field (ritz0's layout).  AGAST #1966:
-# they were `i64` slots, so `let a: [3]f32 = [1.0, 2.0, 3.5]` stored
-# `store i64 %double`.  AGAST #2063: a bool element is an `i1` too, so a
-# `*bool` has ONE pointee layout whether it points into a local / global
-# `[N]bool` or a bool field (it kept an i64 slot, and `p[i]` strode 8
-# bytes into a field array or 1 byte into a local one).  A global `[N]T`
-# uses it too (global_array_elem_llvm, #1970).
-pub fn local_array_elem_llvm(t: i32) -> *u8
-    return field_array_elem_llvm(t)
-
-# Widen an array element just loaded as `ty` (array_elem_llvm(t)) to the i64
+# Widen an array element just loaded as `ty` (elem_mem_llvm(t)) to the i64
 # every expression value is carried in: zext unsigned, sext signed, ptrtoint
 # pointers. i64 elements are returned as-is.  A bool element (`i1`, #2063)
 # is zero-extended.
 pub fn emit_array_elem_widen(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
     var op: *u8 = null
-    if t == TYPE_U8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_BOOL
-        op = c" = zext "
-    else if t == TYPE_I8 or t == TYPE_I16 or t == TYPE_I32
+    if ty_bits(t) == 64
+        return val
+    if ty_is_signed(t) == 1
         op = c" = sext "
-    else if t == TYPE_PTR or t == TYPE_PTR_PTR
+    else if ty_bits(t) > 0
+        op = c" = zext "   # unsigned, and bool's i1 (#2063)
+    else if ty_is_ptr(t) == 1
         op = c" = ptrtoint "
     if op == null
         return val
@@ -2259,7 +2222,7 @@ pub fn emit_array_elem_widen(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
 # element type `ty` (trunc ints, inttoptr pointers). i64 is returned as-is.
 pub fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i32
     var op: *u8 = null
-    if t == TYPE_U8 or t == TYPE_I8 or t == TYPE_U16 or t == TYPE_I16 or t == TYPE_U32 or t == TYPE_I32
+    if ty_int_in(t, 8, 32) == 1
         op = c" = trunc i64 "
     else if t == TYPE_PTR or t == TYPE_PTR_PTR
         op = c" = inttoptr i64 "
@@ -2293,9 +2256,9 @@ pub fn ptr_field_elem_kind(field: *StructField) -> i32
     if field.field_type_name_len > 0
         return TYPE_STRUCT
     let t: i32 = field.array_elem_type
-    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16
+    if ty_int_in(t, 8, 16) == 1
         return t
-    if t == TYPE_I32 or t == TYPE_U32 or t == TYPE_I64 or t == TYPE_U64
+    if ty_int_in(t, 32, 64) == 1
         return t
     if t == TYPE_F32 or t == TYPE_F64 or t == TYPE_BOOL
         return t
@@ -2309,14 +2272,6 @@ pub fn ptr_field_struct_elem(s: *EmitterState, f: *StructField) -> i32
     if f == null or f.field_type != TYPE_PTR or ptr_field_elem_kind(f) != TYPE_STRUCT
         return 0
     (find_struct(s, f.field_type_name, f.field_type_name_len) != null) as i32
-
-# AGAST #2053: the LLVM type of ONE pointee of a pointer field, for a `kind`
-# from ptr_field_elem_kind: `float` / `double` for f32 / f64 (a local `[N]f64`
-# is `double` too since #1966), integers / pointers at their own width.
-# array_elem_llvm spells f32 / f64 as i64, which is not what the pointer
-# points at.
-pub fn ptr_field_elem_llvm(kind: i32) -> *u8
-    return local_array_elem_llvm(kind)
 
 # AGAST #1596: address of element `idx` (an i64 register) through the
 # pointer held in a struct field. `field_slot` points AT the field; the
@@ -2337,45 +2292,13 @@ pub fn emit_ptr_field_elem_addr(s: *EmitterState, field_slot: i32, field: *Struc
     if kind == TYPE_STRUCT
         emit_llvm_type_struct(s, TYPE_STRUCT, field.field_type_name, field.field_type_name_len)
     else
-        emit_str(s, ptr_field_elem_llvm(kind))
+        emit_str(s, elem_mem_llvm(kind))
     emit_str(s, c", ptr ")
     emit_reg(s, base)
     emit_str(s, c", i64 ")
     emit_reg(s, idx)
     emit_str(s, c"\n")
     return elem_ptr
-
-pub fn emit_llvm_type(s: *EmitterState, t: i32)
-    if t == TYPE_VOID
-        emit_str(s, c"void")
-    else if t == TYPE_I32 or t == TYPE_U32
-        emit_str(s, c"i32")
-    else if t == TYPE_I64
-        emit_str(s, c"i64")
-    else if t == TYPE_U8
-        emit_str(s, c"i8")
-    else if t == TYPE_I8
-        emit_str(s, c"i8")
-    else if t == TYPE_U16 or t == TYPE_I16
-        emit_str(s, c"i16")
-    else if t == TYPE_U64
-        emit_str(s, c"i64")
-    else if t == TYPE_F32
-        emit_str(s, c"float")
-    else if t == TYPE_F64
-        emit_str(s, c"double")
-    else if t == TYPE_BOOL
-        emit_str(s, c"i1")
-    else if t == TYPE_PTR
-        emit_str(s, c"i64")  # Pointers passed as i64
-    else if t == TYPE_PTR_PTR
-        emit_str(s, c"i64")  # Double pointers also i64
-    else if t == TYPE_REF
-        emit_str(s, c"i64")  # References are i64 at LLVM level
-    else if t == TYPE_MUT_REF
-        emit_str(s, c"ptr")  # Mutable references are pointers at LLVM level
-    else
-        emit_str(s, c"i64")
 
 # Centralised float-type predicate for arith / cmp / cast dispatch.
 # Returns 1 for TYPE_F32/F64 OR for the legacy TYPE_STRUCT+name="f32"/"f64"
@@ -2640,7 +2563,7 @@ pub fn mangled_type_size_align(s: *EmitterState, name: *u8, len: i32, align: *i6
         return 0
     if is_unit_arg(name, len) == 1
         return 0   # measured: zero bytes (tagged_enum_layout tells it apart)
-    let ps: i64 = prim_name_size(name, len)
+    let ps: i64 = ty_store_size(ty_from_name(name, len))
     if ps > 0
         *align = ps
         return ps
@@ -2967,7 +2890,7 @@ pub fn tagged_enum_scalar_bits(s: *EmitterState, name: *u8, len: i32, variant: i
 # bool, a float, a pointer, an aggregate.
 pub fn tagged_enum_narrow_int_type(s: *EmitterState, name: *u8, len: i32, variant: i32) -> i32
     let t: i32 = tagged_enum_int_type(s, name, len, variant)
-    if t == TYPE_I64 or t == TYPE_U64
+    if ty_int_bits(t) == 64
         return 0
     t
 
@@ -3006,9 +2929,9 @@ pub fn tagged_enum_int_type_in(structs: *HashMapI64, m: *Module, name: *u8, len:
             t = TYPE_I64
         else if name_eq(c, c_len, c"u64", 3) == 1
             t = TYPE_U64
-    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32
+    if ty_int_in(t, 8, 32) == 1
         return t
-    if t == TYPE_I64 or t == TYPE_U64
+    if ty_int_bits(t) == 64
         return t
     0
 
@@ -3280,29 +3203,9 @@ pub fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
         # have dedicated tokens for primitive types — they're parsed as
         # generic struct-name annotations. Map them back to LLVM
         # primitives so signatures/calls match.
-        if name_eq(name, name_len, c"i8", 2) == 1 or name_eq(name, name_len, c"u8", 2) == 1
-            emit_str(s, c"i8")
-            return
-        if name_eq(name, name_len, c"i16", 3) == 1 or name_eq(name, name_len, c"u16", 3) == 1
-            emit_str(s, c"i16")
-            return
-        if name_eq(name, name_len, c"i32", 3) == 1 or name_eq(name, name_len, c"u32", 3) == 1
-            emit_str(s, c"i32")
-            return
-        if name_eq(name, name_len, c"i64", 3) == 1 or name_eq(name, name_len, c"u64", 3) == 1
-            emit_str(s, c"i64")
-            return
-        if name_eq(name, name_len, c"f32", 3) == 1
-            emit_str(s, c"float")
-            return
-        if name_eq(name, name_len, c"f64", 3) == 1
-            emit_str(s, c"double")
-            return
-        if name_eq(name, name_len, c"bool", 4) == 1
-            emit_str(s, c"i1")
-            return
-        if name_eq(name, name_len, c"usize", 5) == 1 or name_eq(name, name_len, c"isize", 5) == 1
-            emit_str(s, c"i64")
+        let prim: i32 = ty_from_name(name, name_len)
+        if prim != TYPE_VOID
+            emit_str(s, ty_mem_llvm(prim))
             return
         if name_eq(name, name_len, c"void", 4) == 1
             # `-> void` parses as TYPE_STRUCT with name "void" because the
@@ -3322,7 +3225,7 @@ pub fn emit_llvm_type_struct(s: *EmitterState, t: i32, name: *u8, name_len: i32)
         emit_str(s, c"%")
         emit_name(s, name, name_len)
     else
-        emit_llvm_type(s, t)
+        emit_str(s, ty_value_llvm(t))
 
 # =============================================================================
 # AGAST #168: layout-equivalence coercion for Span$u8 ↔ StrView.
@@ -3502,7 +3405,7 @@ pub fn emit_local_array_llvm_type(s: *EmitterState, size: i32, et: i32, name: *u
         emit_str(s, c"%")
         emit_name(s, name, name_len)
     else
-        emit_str(s, local_array_elem_llvm(et))
+        emit_str(s, elem_mem_llvm(et))
     emit_str(s, c"]")
 
 # AGAST #2306 / #3181 — large by-value ARRAYS are `ptr byval` / `ptr sret`.
@@ -4847,7 +4750,7 @@ pub fn try_emit_span_to_i64_arg(s: *EmitterState, arg_e: *Expr, param_type: i32,
     # / TYPE_REF emit i64 (see emit_llvm_type); TYPE_I64 / TYPE_U64 are i64
     # directly.  TYPE_MUT_REF emits `ptr` so it has its own inttoptr branch
     # in the cascade — skip here to avoid double-handling.
-    if param_type != TYPE_PTR and param_type != TYPE_PTR_PTR and param_type != TYPE_REF and param_type != TYPE_I64 and param_type != TYPE_U64
+    if ty_int_bits(param_type) != 64 and param_type != TYPE_PTR and param_type != TYPE_PTR_PTR and param_type != TYPE_REF
         return -1
     if arg_e == null
         return -1
@@ -5004,21 +4907,6 @@ fn get_struct_align_by_name(s: *EmitterState, name: *u8, name_len: i32) -> i64
         f = f.next
     return max_align
 
-# Byte size of the primitive type spelled `name` (`sizeof(u16)` = 2), or 0
-# when `name` is not a primitive (a struct name, to be measured instead).
-pub fn prim_name_size(name: *u8, len: i32) -> i64
-    if name_eq(name, len, c"u8", 2) == 1 or name_eq(name, len, c"i8", 2) == 1 or name_eq(name, len, c"bool", 4) == 1
-        return 1
-    if name_eq(name, len, c"u16", 3) == 1 or name_eq(name, len, c"i16", 3) == 1
-        return 2
-    if name_eq(name, len, c"u32", 3) == 1 or name_eq(name, len, c"i32", 3) == 1 or name_eq(name, len, c"f32", 3) == 1
-        return 4
-    if name_eq(name, len, c"u64", 3) == 1 or name_eq(name, len, c"i64", 3) == 1 or name_eq(name, len, c"f64", 3) == 1
-        return 8
-    if name_eq(name, len, c"usize", 5) == 1 or name_eq(name, len, c"isize", 5) == 1
-        return 8
-    return 0
-
 # Natural size of one value of kind `t` (a TYPE_* primitive, or TYPE_STRUCT
 # named `name`), with its alignment written to `*align`. AGAST #1814: bool
 # and f32 were sized 8 and nested structs aligned to 8, so sizeof disagreed
@@ -5079,7 +4967,7 @@ pub fn ptr_pointee_size(s: *EmitterState, pointee: i32, name: *u8, name_len: i32
             return get_struct_size_by_name(s, name, name_len)
         # AGAST #2411: `usize` / `isize` parse as a struct name, so a
         # `Vec$usize.data + i` had no size.  A primitive's name is its size.
-        let ps: i64 = prim_name_size(name, name_len)
+        let ps: i64 = ty_store_size(ty_from_name(name, name_len))
         if ps > 0
             return ps
         # AGAST #2411: and `Vec$C.data + i` over a non-generic user enum
@@ -5088,17 +4976,7 @@ pub fn ptr_pointee_size(s: *EmitterState, pointee: i32, name: *u8, name_len: i32
         if uei >= 0
             return user_enum_size(s, uei)
         return 0
-    if pointee == TYPE_U8 or pointee == TYPE_I8 or pointee == TYPE_BOOL
-        return 1
-    if pointee == TYPE_U16 or pointee == TYPE_I16
-        return 2
-    if pointee == TYPE_U32 or pointee == TYPE_I32 or pointee == TYPE_F32
-        return 4
-    if pointee == TYPE_U64 or pointee == TYPE_I64 or pointee == TYPE_F64
-        return 8
-    if pointee == TYPE_PTR or pointee == TYPE_PTR_PTR
-        return 8
-    return 0
+    return ty_store_size(pointee)
 
 # "pointer arithmetic on '<name>': element size unknown" — a counted error,
 # so main refuses to write the output.  Returns 1 only so the caller can
@@ -5723,9 +5601,9 @@ pub fn deref_index_elem(s: *EmitterState, e: *Expr) -> i32
     if e.right != null and e.right.kind == EXPR_RANGE
         return TYPE_VOID
     let t: i32 = deref_ptr_ptr_elem_type(s, e.left)
-    if t == TYPE_I8 or t == TYPE_U8 or t == TYPE_I16 or t == TYPE_U16 or t == TYPE_I32 or t == TYPE_U32
+    if ty_int_in(t, 8, 32) == 1
         return t
-    if t == TYPE_I64 or t == TYPE_U64 or t == TYPE_F32 or t == TYPE_F64 or t == TYPE_BOOL
+    if ty_int_bits(t) == 64 or t == TYPE_F32 or t == TYPE_F64 or t == TYPE_BOOL
         return t
     return TYPE_VOID
 
@@ -5980,9 +5858,9 @@ pub fn get_member_pointee_type_exact(s: *EmitterState, e: *Expr) -> i32
     # gave bogus offsets and the lexer matched no patterns.
     if field != null and field.field_type == TYPE_PTR
         let pe: i32 = field.array_elem_type
-        if pe == TYPE_U8 or pe == TYPE_I8 or pe == TYPE_U16 or pe == TYPE_I16
+        if ty_int_in(pe, 8, 16) == 1
             return pe
-        if pe == TYPE_U32 or pe == TYPE_I32 or pe == TYPE_U64 or pe == TYPE_I64
+        if ty_int_in(pe, 32, 64) == 1
             return pe
         # AGAST #2053: a `*f32` / `*f64` / `*bool` field.  These fell to
         # the unknown case, so `*r.p` loaded `i8` (the u8 guess) and
@@ -6415,13 +6293,13 @@ pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: *u8)
     s.error_count = s.error_count + 1
 
 pub fn mem_int_type_bits(t: i32) -> i32
-    if t == TYPE_I8 or t == TYPE_U8
+    if ty_int_bits(t) == 8
         return 8
-    if t == TYPE_I16 or t == TYPE_U16
+    if ty_int_bits(t) == 16
         return 16
-    if t == TYPE_I32 or t == TYPE_U32
+    if ty_int_bits(t) == 32
         return 32
-    if t == TYPE_I64 or t == TYPE_U64
+    if ty_int_bits(t) == 64
         return 64
     0
 
@@ -6530,11 +6408,9 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 return TYPE_PTR  # **u8 indexed gives *u8
             else if base_type == TYPE_PTR
                 # Element type of *T indexing is the pointee when recorded.
-                if pointee == TYPE_I32 or pointee == TYPE_U32 or pointee == TYPE_I16 or pointee == TYPE_U16 or pointee == TYPE_I64 or pointee == TYPE_U64 or pointee == TYPE_I8
-                    return pointee
                 # AGAST #1973: `p[i]` through a *f32 / *f64 loads a `float` /
                 # `double`.
-                if pointee == TYPE_F32 or pointee == TYPE_F64
+                if ty_is_int(pointee) == 1 or ty_is_float(pointee) == 1
                     return pointee
                 return TYPE_U8   # *u8 (or unrecorded pointee) indexed gives u8
             else if base_type == TYPE_ARRAY
@@ -6793,22 +6669,9 @@ fn get_deref_struct_type(s: *EmitterState, e: *Expr) -> *StructField
 # =============================================================================
 
 pub fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
-    if f.field_type == TYPE_I32 or f.field_type == TYPE_U32
-        emit_str(s, c"i32")
-    else if f.field_type == TYPE_I64
-        emit_str(s, c"i64")
-    else if f.field_type == TYPE_U8 or f.field_type == TYPE_I8
-        emit_str(s, c"i8")
-    else if f.field_type == TYPE_U16 or f.field_type == TYPE_I16
-        emit_str(s, c"i16")
-    else if f.field_type == TYPE_F32
-        emit_str(s, c"float")
-    else if f.field_type == TYPE_F64
-        emit_str(s, c"double")
-    else if f.field_type == TYPE_BOOL
-        emit_str(s, c"i1")
-    else if f.field_type == TYPE_PTR or f.field_type == TYPE_PTR_PTR
-        emit_str(s, c"ptr")
+    let prim: *u8 = ty_mem_llvm(f.field_type)
+    if prim != null
+        emit_str(s, prim)
     else if f.field_type == TYPE_STRUCT
         # Primitive types parsed as struct names (parser has no dedicated
         # tokens) — route through emit_llvm_type_struct for consistent
@@ -6831,7 +6694,7 @@ pub fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
             emit_str(s, c"%")
             emit_name(s, f.array_elem_type_name, f.array_elem_type_name_len)
         else
-            emit_str(s, field_array_elem_llvm(f.array_elem_type))
+            emit_str(s, elem_mem_llvm(f.array_elem_type))
         emit_str(s, c"]")
     else
         emit_str(s, c"i64")

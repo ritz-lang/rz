@@ -10,6 +10,7 @@ import ritzlib.gvec
 import ritzlib.memory
 
 import ast
+import types           # the one primitive type table (AGAST #1889)
 import tokens_gen
 import ast_helpers   # global_pointee_struct (AGAST #1554)
 import emitter_core
@@ -1587,7 +1588,7 @@ fn emit_expr_try(s: *EmitterState, e: *Expr) -> i32
 fn int_as_enum_refused(s: *EmitterState, e: *Expr) -> i32
     if e.op != TYPE_STRUCT or e.ident_len <= 0 or enum_find(e.ident_ptr, e.ident_len) < 0
         return 0
-    if int_prim_bits(get_expr_type(s, e.left)) == 0
+    if ty_int_bits(get_expr_type(s, e.left)) == 0
         return 0
     var en: *u8 = null
     var en_len: i32 = 0
@@ -1841,7 +1842,7 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
                 emit_str(s, c" = sitofp i64 ")
             emit_reg(s, cast_src)
             emit_str(s, c" to ")
-            emit_llvm_type(s, target_ty)
+            emit_str(s, ty_value_llvm(target_ty))
             emit_str(s, c"\n")
             return r
         if src_is_float == 1 and dst_is_float == 1
@@ -1871,19 +1872,19 @@ fn emit_expr_body(s: *EmitterState, e: *Expr) -> i32
         # zext if either side is unsigned, sext only if both are signed.
         # A non-int-primitive side (bool, pointer, enum, unknown) counts as
         # signed 64-bit; a non-int target (bool, ptr, ...) passes through.
-        let dst_bits: i32 = int_prim_bits(target_ty)
+        let dst_bits: i32 = ty_int_bits(target_ty)
         if dst_bits == 0
             return cast_src
-        var src_bits: i32 = int_prim_bits(src_ty)
-        var src_signed: i32 = int_prim_signed(src_ty)
+        var src_bits: i32 = ty_int_bits(src_ty)
+        var src_signed: i32 = ty_is_signed(src_ty)
         if src_bits == 0
             src_bits = 64
             src_signed = 1
         var w: i32 = dst_bits
-        var signed: i32 = int_prim_signed(target_ty)
+        var signed: i32 = ty_is_signed(target_ty)
         if src_bits < dst_bits
             w = src_bits
-            signed = src_signed * int_prim_signed(target_ty)
+            signed = src_signed * ty_is_signed(target_ty)
         if w == 64
             return cast_src
         let narrow: i32 = next_reg(s)
@@ -2183,7 +2184,7 @@ pub fn int_to_float_slot(s: *EmitterState, val_reg: i32, dst_ty: i32, value: *Ex
     val_reg
 
 fn is_int_ty(t: i32) -> i32
-    if t == TYPE_I64 or t == TYPE_I32 or t == TYPE_I16 or t == TYPE_I8 or t == TYPE_U64 or t == TYPE_U32 or t == TYPE_U16 or t == TYPE_U8
+    if ty_is_int(t) == 1
         return 1
     0
 
@@ -2285,13 +2286,13 @@ pub fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem
     let fill_arr_size: i32 = arr_size
     var fill_elem_llvm: *u8 = c"i64"
     var fill_elem_bytes: i32 = 8
-    if fill_elem_ty == TYPE_I32 or fill_elem_ty == TYPE_U32
+    if ty_int_bits(fill_elem_ty) == 32
         fill_elem_llvm = c"i32"
         fill_elem_bytes = 4
-    else if fill_elem_ty == TYPE_U8 or fill_elem_ty == TYPE_I8
+    else if ty_int_bits(fill_elem_ty) == 8
         fill_elem_llvm = c"i8"
         fill_elem_bytes = 1
-    else if fill_elem_ty == TYPE_U16 or fill_elem_ty == TYPE_I16
+    else if ty_int_bits(fill_elem_ty) == 16
         fill_elem_llvm = c"i16"
         fill_elem_bytes = 2
     else if fill_elem_ty == TYPE_PTR or fill_elem_ty == TYPE_PTR_PTR
@@ -2300,7 +2301,7 @@ pub fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem
     var field_scalar: i32 = 0
     if array_elem_typed_scalar(fill_elem_ty) == 1
         field_scalar = 1
-        fill_elem_llvm = field_array_elem_llvm(fill_elem_ty)
+        fill_elem_llvm = elem_mem_llvm(fill_elem_ty)
         if fill_elem_ty == TYPE_BOOL
             fill_elem_bytes = 1
         else if fill_elem_ty == TYPE_F32
@@ -2362,7 +2363,7 @@ pub fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem
     var fill_narrow: i32 = fill_val_reg
     if field_scalar == 1
         fill_narrow = emit_field_elem_narrow(s, fill_val_reg, fill_elem_ty, fill_val)
-    else if fill_elem_ty == TYPE_U8 or fill_elem_ty == TYPE_I8
+    else if ty_int_bits(fill_elem_ty) == 8
         let t8: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, t8)
@@ -2370,7 +2371,7 @@ pub fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem
         emit_reg(s, fill_val_reg)
         emit_str(s, c" to i8\n")
         fill_narrow = t8
-    else if fill_elem_ty == TYPE_U16 or fill_elem_ty == TYPE_I16
+    else if ty_int_bits(fill_elem_ty) == 16
         let t16: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, t16)
@@ -2378,7 +2379,7 @@ pub fn emit_array_fill_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem
         emit_reg(s, fill_val_reg)
         emit_str(s, c" to i16\n")
         fill_narrow = t16
-    else if fill_elem_ty == TYPE_I32 or fill_elem_ty == TYPE_U32
+    else if ty_int_bits(fill_elem_ty) == 32
         let t32: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, t32)
@@ -2525,13 +2526,13 @@ pub fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_
         is_struct = 1
     var elem_llvm: *u8 = c"i64"
     var needs_trunc: i32 = 0
-    if elem_ty == TYPE_I32 or elem_ty == TYPE_U32
+    if ty_int_bits(elem_ty) == 32
         elem_llvm = c"i32"
         needs_trunc = 1
-    else if elem_ty == TYPE_U8 or elem_ty == TYPE_I8
+    else if ty_int_bits(elem_ty) == 8
         elem_llvm = c"i8"
         needs_trunc = 1
-    else if elem_ty == TYPE_U16 or elem_ty == TYPE_I16
+    else if ty_int_bits(elem_ty) == 16
         elem_llvm = c"i16"
         needs_trunc = 1
     else if elem_ty == TYPE_PTR or elem_ty == TYPE_PTR_PTR
@@ -2539,7 +2540,7 @@ pub fn emit_array_lit_into(s: *EmitterState, base_reg: i32, arr_size: i32, elem_
     var field_scalar: i32 = 0
     if array_elem_typed_scalar(elem_ty) == 1
         field_scalar = 1
-        elem_llvm = field_array_elem_llvm(elem_ty)
+        elem_llvm = elem_mem_llvm(elem_ty)
     var idx: i32 = 0
     var it: *Expr = lit.args
     while it != null and idx < arr_size
@@ -2709,14 +2710,14 @@ pub fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: 
     var stored: i32 = val_reg
     var store_ty: *u8 = null
     var trunc_ty: *u8 = null
-    if ft == TYPE_I64 or ft == TYPE_U64
+    if ty_int_bits(ft) == 64
         # AGAST #2064: u64 is already an i64 register; no trunc needed.
         store_ty = c"i64"
-    else if ft == TYPE_I32 or ft == TYPE_U32
+    else if ty_int_bits(ft) == 32
         trunc_ty = c"i32"
-    else if ft == TYPE_I16 or ft == TYPE_U16
+    else if ty_int_bits(ft) == 16
         trunc_ty = c"i16"
-    else if ft == TYPE_I8 or ft == TYPE_U8
+    else if ty_int_bits(ft) == 8
         trunc_ty = c"i8"
     else if ft == TYPE_BOOL
         if bool_reg_is_i1(s, value) == 1

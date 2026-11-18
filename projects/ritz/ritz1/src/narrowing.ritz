@@ -47,6 +47,7 @@ import ritzlib.sys
 import ritzlib.io
 
 import ast
+import types           # the one primitive type table (AGAST #1889)
 import ast_helpers
 import emitter_core
 import sema
@@ -83,7 +84,7 @@ pub fn narrow_note_decl(s: *EmitterState, stmt: *Stmt)
         s.narrow_decl_overflow = 1
         return
     var t: i32 = NARROW_UNKNOWN
-    if narrow_int_width(stmt.var_declared_type) > 0
+    if ty_bits(stmt.var_declared_type) > 0
         t = stmt.var_declared_type
     let idx: i32 = s.narrow_decl_count
     s.narrow_decls[idx].name = stmt.var_name
@@ -125,7 +126,7 @@ fn narrow_sema_note(sm: *Sema, name: *u8, len: i32, t: i32)
     if v.name != name or v.name_len != len
         return
     v.narrow = 0
-    if narrow_int_width(t) > 0
+    if ty_bits(t) > 0
         v.narrow = t
 
 pub fn narrow_sema_param(sm: *Sema, p: *Param)
@@ -172,47 +173,9 @@ fn narrow_sema_payload(sm: *Sema, scrut: *Expr, arm: *MatchArm) -> i32
 # Types
 # =============================================================================
 
-# Bit width of an integer (or bool) type kind; 0 for anything else.
-pub fn narrow_int_width(t: i32) -> i32
-    if t == TYPE_BOOL
-        return 1
-    if t == TYPE_I8 or t == TYPE_U8
-        return 8
-    if t == TYPE_I16 or t == TYPE_U16
-        return 16
-    if t == TYPE_I32 or t == TYPE_U32
-        return 32
-    if t == TYPE_I64 or t == TYPE_U64
-        return 64
-    0
-
-pub fn narrow_is_unsigned(t: i32) -> i32
-    if t == TYPE_U8 or t == TYPE_U16 or t == TYPE_U32 or t == TYPE_U64
-        return 1
-    0
-
-pub fn narrow_type_name(t: i32) -> *u8
-    if t == TYPE_I8
-        return c"i8"
-    if t == TYPE_U8
-        return c"u8"
-    if t == TYPE_I16
-        return c"i16"
-    if t == TYPE_U16
-        return c"u16"
-    if t == TYPE_I32
-        return c"i32"
-    if t == TYPE_U32
-        return c"u32"
-    if t == TYPE_U64
-        return c"u64"
-    if t == TYPE_BOOL
-        return c"bool"
-    c"i64"
-
 # A type kind if it is an integer/bool, else NARROW_UNKNOWN.
 pub fn narrow_known(t: i32) -> i32
-    if narrow_int_width(t) > 0
+    if ty_bits(t) > 0
         return t
     NARROW_UNKNOWN
 
@@ -294,7 +257,7 @@ fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
 # A global's TYPE_I64 may be the parser's default for a missing annotation,
 # so only a narrower (necessarily written) type is trusted.
 fn narrow_global_type(g: *GlobalVarDef) -> i32
-    let gw: i32 = narrow_int_width(g.var_type)
+    let gw: i32 = ty_bits(g.var_type)
     if gw > 1 and gw < 64
         return g.var_type
     NARROW_UNKNOWN
@@ -383,7 +346,7 @@ fn narrow_join(a: i32, b: i32) -> i32
         return a
     if a == TYPE_BOOL or b == TYPE_BOOL
         return NARROW_UNKNOWN
-    if narrow_int_width(b) > narrow_int_width(a)
+    if ty_bits(b) > ty_bits(a)
         return b
     a
 
@@ -554,7 +517,7 @@ fn narrow_const_value(env: *NarrowEnv, e: *Expr, whole: i32, out: *i64) -> i32
         let ce: *ConstEntry = narrow_env_const(env, e.ident_ptr, e.ident_len)
         if ce == null or ce.fold_state != CONST_FOLD_DONE
             return 0
-        let w: i32 = narrow_int_width(ce.const_type)
+        let w: i32 = ty_bits(ce.const_type)
         if w < 8
             return 0
         if w < 64 and whole == 0
@@ -687,8 +650,8 @@ fn narrow_provable_range(env: *NarrowEnv, e: *Expr, whole: i32, lo: *i64, hi: *i
     0
 
 pub fn narrow_fits(v: i64, t: i32) -> i32
-    let w: i32 = narrow_int_width(t)
-    if narrow_is_unsigned(t) == 1
+    let w: i32 = ty_bits(t)
+    if ty_is_unsigned(t) == 1
         return (v >= 0 and v <= ((1 as i64) << w) - 1) as i32
     let half: i64 = (1 as i64) << (w - 1)
     (v >= 0 - half and v <= half - 1) as i32
@@ -739,11 +702,11 @@ pub fn narrow_unproven(s: *EmitterState, init: *Expr, decl: i32) -> i32
     narrow_unproven_in(@env, init, decl)
 
 fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
-    let dw: i32 = narrow_int_width(decl)
+    let dw: i32 = ty_bits(decl)
     if init == null or dw <= 1 or dw >= 64
         return 0
     let src: i32 = narrow_src_type_in(env, init, 0)
-    if src == NARROW_UNKNOWN or src == NARROW_LIT or narrow_int_width(src) <= dw
+    if src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= dw
         return 0
     var lo: i64 = 0
     var hi: i64 = 0
@@ -764,14 +727,14 @@ fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
     eprints_cstr(c": error: implicit narrowing: `")
     narrow_eprint_name(stmt.var_name, stmt.var_name_len)
     eprints_cstr(c"` is declared `")
-    eprints_cstr(narrow_type_name(decl))
+    eprints_cstr(ty_name(decl))
     eprints_cstr(c"` but its initialiser has type `")
-    eprints_cstr(narrow_type_name(src))
+    eprints_cstr(ty_name(src))
     eprints_cstr(c"`, and the compiler cannot prove the value fits. Write `<expr> as ")
-    eprints_cstr(narrow_type_name(decl))
+    eprints_cstr(ty_name(decl))
     eprints_cstr(c"` if truncation is intended, or declare `")
     narrow_eprint_name(stmt.var_name, stmt.var_name_len)
     eprints_cstr(c"` as `")
-    eprints_cstr(narrow_type_name(src))
+    eprints_cstr(ty_name(src))
     eprints_cstr(c"`\n")
     sm.error_count = sm.error_count + 1

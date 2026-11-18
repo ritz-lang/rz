@@ -23,6 +23,7 @@ SOURCES = \
 	lexer_scan_gen \
 	lexer_nfa \
 	ast \
+	types \
 	diag \
 	ast_helpers \
 	async_lower \
