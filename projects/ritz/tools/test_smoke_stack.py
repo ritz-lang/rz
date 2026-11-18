@@ -331,3 +331,33 @@ def test_resp_encoding():
 def test_unknown_suite_is_an_error_exit_1(capsys):
     assert ss.main(["nope"]) == 1
     assert "unknown suite" in capsys.readouterr().err
+
+
+# --- unix socket paths fit sun_path (#4100) -----------------------------------
+
+@pytest.mark.unit
+def test_unix_socket_path_over_sun_path_is_broken_naming_its_length():
+    # 107 bytes + NUL fills sun_path[108]; one more and bind() fails, which
+    # zeus showed only as "never created zeus.sock" after START_TIMEOUT.
+    fits = Path("/" + "a" * 106)
+    assert ss.unix_socket_path(fits) == fits
+    with pytest.raises(ss.Broken, match=r"socket path too long: 108 bytes"):
+        ss.unix_socket_path(Path("/" + "a" * 107))
+
+
+@pytest.mark.unit
+def test_stack_socket_binds_whatever_tmpdir(tmp_path):
+    # A gate named ritz-task-1871 put <TMPDIR>/smoke_stack_XXXXXXXX/stack/
+    # zeus.sock at 108 bytes. The socket lives in a short dir of its own.
+    import socket
+    import shutil
+
+    from smoke_stack.stack import StackCtx
+    work = tmp_path / ("t" * 120) / "smoke_stack_XXXXXXXX" / "stack"
+    ctx = StackCtx(ss.Procs(tmp_path), work, Path("m7m"), Path("zeus"), Path("valet"), Path("nexus"))
+    try:
+        assert len(bytes(ctx.sock)) <= 107
+        with socket.socket(socket.AF_UNIX) as s:
+            s.bind(str(ctx.sock))
+    finally:
+        shutil.rmtree(ctx.sock_dir)

@@ -76,6 +76,7 @@ from .harness import (
     http_req,
     run_cmd,
     short,
+    unix_socket_path,
     wait_listening,
     wait_path,
 )
@@ -108,6 +109,7 @@ __all__ = [
     "run_cmd",
     "short",
     "targets_linux",
+    "unix_socket_path",
     "wait_listening",
     "wait_path",
 ]

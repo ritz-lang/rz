@@ -13,6 +13,7 @@ import socket
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -254,6 +255,27 @@ def wait_path(p: subprocess.Popen, path: Path, timeout: float = START_TIMEOUT) -
             return
         time.sleep(0.05)
     raise Broken(f"{p.label} never created {path.name}: {log_tail(p)}")  # type: ignore[attr-defined]
+
+
+SUN_PATH_MAX = 107  # sockaddr_un.sun_path is 108 bytes, NUL included
+
+
+def unix_socket_path(path: Path) -> Path:
+    """path, if bind() can take it; else Broken naming its length.
+
+    An over-long path makes the server's bind() fail, which a harness only
+    sees as a socket that never appears, START_TIMEOUT later (#4100)."""
+    n = len(os.fsencode(path))
+    if n > SUN_PATH_MAX:
+        raise Broken(f"unix socket path too long: {n} bytes > {SUN_PATH_MAX} (sun_path): {path}")
+    return path
+
+
+def short_sock_dir() -> Path:
+    """A fresh dir for unix sockets under /tmp, not $TMPDIR: a gate's TMPDIR
+    sits deep in its worktree and left zeus.sock ~10 bytes of headroom
+    (#4100). The caller removes it."""
+    return Path(tempfile.mkdtemp(prefix="smoke_", dir="/tmp"))
 
 
 def run_cmd(argv: list[str], cwd: Path, stdin: bytes | None = None,

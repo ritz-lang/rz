@@ -16,6 +16,7 @@ from __future__ import annotations
 import http.client
 import os
 import re
+import shutil
 import signal
 import subprocess
 import time
@@ -39,6 +40,8 @@ from .harness import (
     log_text,
     run_cmd,
     short,
+    short_sock_dir,
+    unix_socket_path,
     wait_listening,
     wait_path,
 )
@@ -62,6 +65,8 @@ class StackCtx:
     # A second mausoleum, --no-encryption, for MAUSOLEUM_PLAINTEXT (#2466).
     plain_port: int = field(default_factory=free_port)
     slug: str = field(default_factory=lambda: f"smoke-{os.getpid()}")
+    # zeus.sock's dir: short whatever TMPDIR is (#4100); suite_stack removes it.
+    sock_dir: Path = field(default_factory=short_sock_dir)
     zeus_proc: subprocess.Popen | None = None  # the first stack's zeus
     created: bool = False
 
@@ -75,7 +80,7 @@ class StackCtx:
 
     @property
     def sock(self) -> Path:
-        return self.work / "zeus.sock"
+        return unix_socket_path(self.sock_dir / "zeus.sock")
 
     @property
     def store_env(self) -> dict[str, str]:
@@ -396,6 +401,13 @@ def suite_stack(r: Reporter, procs: Procs, tmp: Path) -> None:
     except Broken as e:
         r.broken("stack.start", str(e))
         return
+    try:
+        _suite_stack(r, ctx)
+    finally:
+        shutil.rmtree(ctx.sock_dir, ignore_errors=True)
+
+
+def _suite_stack(r: Reporter, ctx: StackCtx) -> None:
     ctx.data.mkdir(parents=True)
     ctx.plain_data.mkdir()
     try:
