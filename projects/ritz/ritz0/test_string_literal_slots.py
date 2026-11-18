@@ -378,6 +378,12 @@ REJECTED.update({
                            4, 20, "field `s` of `H` is `Span<u8>`, not `StrView`"),
     "strview_span_field_tail": ("struct H\n    s: Span<u8>\n" + _fn("v: StrView", "H { s: v }", "H"),
                                 4, 12, "field `s` of `H` is `Span<u8>`, not `StrView`"),
+    # AGAST #3428: nor another instance of the field's own generic struct.  An
+    # instance is named mangled on each side, as ritz0 names it; only the
+    # built-in `Span<u8>` is spelled as written (ritz1 printed `Box2<u8>`).
+    "other_instance_field": ("struct Box2<X>\n    v: X\nstruct Outer\n    b: Box2<u8>\n"
+                             + _fn("", "let o = Outer { b: Box2<i64> { v: 300 } }\no.b.v as i64"),
+                             6, 24, "field `b` of `Outer` is `Box2$u8`, not `Box2$i64`"),
 })
 
 # AGAST #3564: nor does a `Span<u8>` value fit a StrView slot. ritz1 kept that
