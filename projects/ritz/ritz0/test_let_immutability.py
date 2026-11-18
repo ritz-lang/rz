@@ -42,6 +42,9 @@ struct Holder
     p: *Pt
     buf: *u8
 
+struct Grid
+    cells: [2][2]Pt
+
 fn big_new() -> Big
     var b: Big
     b.n = 1
@@ -92,7 +95,11 @@ REJECTED = [
     ("large-mut-borrow-elem", "let b: Big = big_new()\nlet q: *u8 = @&b.data[3]", "b", "borrow"),
     # AGAST #3399: a field of a `let` array's struct element.
     ("array-elem-field", "let xs = [Pt { x: 1, y: 2 }]\nxs[0].x = 3", "xs", "assign"),
-    ("array-elem-field-borrow", "let xs: [1]Pt = [Pt { x: 1, y: 2 }]\nlet q: *i64 = @&xs[0].x", "xs", "borrow"),
+    ("array-elem-field-borrow", "let xs: [1]Pt = [Pt { x: 1, y: 2 }]\nlet q: *i64 = @&xs[0].x", "xs", "borrow"),    # AGAST #4071: a field of a fully indexed N-D `let` array's struct element.
+    ("array-2d-elem-field", "let g: [2][2]Pt = [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ]\ng[1][0].x = 7", "g", "assign"),
+    ("array-2d-elem-field-borrow", "let g: [2][2]Pt = [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ]\nlet q: *i64 = @&g[0][1].y", "g", "borrow"),
+    ("array-3d-elem-field", "let g: [2][2][2]Pt = [ [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ], [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ] ]\ng[1][0][1].x = 7", "g", "assign"),
+    ("field-array-2d-elem-field", "let r = Grid { cells: [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ] }\nr.cells[1][0].x = 7", "r", "assign"),
 ]
 
 
@@ -119,6 +126,10 @@ ACCEPTED = [
     ("var-array-elem", "var a: [4]i64 = [1, 2, 3, 4]\na[0] = 9"),
     ("var-tuple-elem", "var p = (1, 2)\np.0 = 3"),  # AGAST #2283
     ("var-array-elem-field", "var xs = [Pt { x: 1, y: 2 }]\nxs[0].x = 3\nlet q: *i64 = @&xs[0].y"),  # AGAST #3399
+    # AGAST #4071: a `var` N-D array's element field; a `let` N-D array of pointers.
+    ("var-array-2d-elem-field", "var g: [2][2]Pt = [ [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }], [Pt { x: 5, y: 6 }, Pt { x: 7, y: 8 }] ]\ng[1][0].x = 7"),
+    ("let-ptr-array-2d-elem-field",
+     "var v = Pt { x: 1, y: 2 }\nlet g: [2][2]*Pt = [ [@&v, @&v], [@&v, @&v] ]\ng[1][0].x = 7"),
     ("var-mut-borrow", "var p = Pt { x: 1, y: 2 }\nlet q: *Pt = @&p\nq.x = 5"),
     ("var-large", "var b: Big = big_new()\nb.n = 3\nb.data[1] = 2\nlet q: *Big = @&b"),
     # Through a pointer held in a `let`: the pointee is written.
@@ -275,6 +286,9 @@ IMPLICIT_REJECTED = [
     ("recv-field-array-elem",
      "let r = Row { pts: [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }] }\nr.pts[1].bump_ref()", "r"),
     ("recv-array-elem-field", "let ws = [Wrap { pt: Pt { x: 1, y: 2 }, pp: null }]\nws[0].pt.bump()", "ws"),
+    # AGAST #4071: a field of a fully indexed N-D `let` array's element.
+    ("recv-array-2d-elem-field",
+     "let g: [2][2]Wrap = [ [Wrap { pt: Pt { x: 1, y: 2 }, pp: null }, Wrap { pt: Pt { x: 1, y: 2 }, pp: null }], [Wrap { pt: Pt { x: 1, y: 2 }, pp: null }, Wrap { pt: Pt { x: 1, y: 2 }, pp: null }] ]\ng[1][0].pt.bump()", "g"),
     ("arg-array-elem", "let xs: [2]Pt = [Pt { x: 1, y: 2 }, Pt { x: 3, y: 4 }]\nset(xs[1])", "xs"),
 ]
 

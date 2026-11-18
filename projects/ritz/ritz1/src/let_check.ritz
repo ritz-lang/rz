@@ -61,6 +61,10 @@ struct LetPlace
     pointee: i32         # the pointee's TYPE_* when kind is a pointer
     inner: i32           # a `**T` place's inner-pointee slot
     tuple: i32           # 1 for a nameless tuple's root: its fields are unnamed
+    # AGAST #4071: an N-D `[N][M]..T` array place's shape, and how many of its
+    # dimensions the path has indexed; null / 0 for a 1-D array or a non-array.
+    shape: *ArrayShape
+    depth: i32
 
 fn let_find_struct(env: *LetEnv, name: *u8, len: i32) -> *StructDef
     if env.s != null
@@ -94,12 +98,20 @@ fn let_place_const(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
     out.is_const = 1
     return 1
 
+# `sh` when it is an N-D shape (rank >= 2), else null.
+fn let_nd_shape(sh: *ArrayShape) -> *ArrayShape
+    if sh == null or sh.rank < 2
+        return null
+    sh
+
 # 1 and fill `out` when `name` is currently bound by a `let`.
 fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
     out.is_const = 0
     out.pointee = TYPE_VOID
     out.inner = TYPE_VOID
     out.tuple = 0
+    out.shape = null
+    out.depth = 0
     # LocalVar does not record an array's element struct name; SemaVar's
     # let_name does.  Without it a `.f` past `a[i]` stays permissive
     # (let_place_member answers 0).
@@ -124,6 +136,9 @@ fn let_place_root(env: *LetEnv, name: *u8, len: i32, out: *LetPlace) -> i32
         if v.let_kind == TYPE_ARRAY and v.let_elem == TYPE_STRUCT
             out.elem_name = v.let_name
             out.elem_name_len = v.let_name_len
+        # AGAST #4071: an N-D array's element struct is its shape's leaf.
+        if v.let_kind == TYPE_ARRAY
+            out.shape = let_nd_shape(v.shape)
         return 1
     let idx: i32 = find_local_idx(env.s, name, len)
     if idx < 0
@@ -172,6 +187,10 @@ fn let_place_member(env: *LetEnv, out: *LetPlace, field: *u8, field_len: i32) ->
     out.elem_name_len = fld.array_elem_type_name_len
     out.pointee = fld.ptr_pointee
     out.inner = fld.inner_pointee_type
+    out.shape = null
+    out.depth = 0
+    if fld.field_type == TYPE_ARRAY
+        out.shape = let_nd_shape(fld.array_shape)
     return 1
 
 # Step `out` into an element of a by-value array.  0 for a pointer or slice:
@@ -179,6 +198,23 @@ fn let_place_member(env: *LetEnv, out: *LetPlace, field: *u8, field_len: i32) ->
 fn let_place_index(out: *LetPlace) -> i32
     if out.kind != TYPE_ARRAY
         return 0
+    # AGAST #4071: an N-D array stays an array until the path indexes every
+    # dimension, then is its leaf `T`: `g[1][0]` of `[2][2]Pt` is a Pt.
+    if out.shape != null
+        out.depth = out.depth + 1
+        if out.depth < out.shape.rank
+            return 1
+        out.kind = out.shape.leaf_type
+        out.type_name = out.shape.leaf_name
+        out.type_name_len = out.shape.leaf_name_len
+        out.pointee = out.shape.leaf_pointee
+        out.shape = null
+        out.depth = 0
+        out.elem = TYPE_VOID
+        out.elem_name = null
+        out.elem_name_len = 0
+        out.inner = TYPE_VOID
+        return 1
     out.kind = out.elem
     out.type_name = out.elem_name
     out.type_name_len = out.elem_name_len
