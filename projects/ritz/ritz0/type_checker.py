@@ -1400,7 +1400,12 @@ class TypeChecker:
     def _check_pattern(self, pattern: rast.Pattern, expected_type: rast.Type):
         """Type check a pattern and bind variables."""
         if isinstance(pattern, rast.IdentPattern):
-            self.locals[pattern.name] = copy.copy(expected_type)
+            # A bare `None` parses as an IdentPattern. When the scrutinee's
+            # enum declares that name it is a variant case and binds nothing,
+            # as the emitter takes it; bound, it shadowed the variant in the
+            # arm's body with the scrutinee's type (AGAST #3605).
+            if not self._declares_variant(expected_type, pattern.name):
+                self.locals[pattern.name] = copy.copy(expected_type)
         elif isinstance(pattern, rast.VariantPattern):
             # Look up variant - use qualifier if provided, otherwise fall back to lookup
             enum_name = None
@@ -2093,6 +2098,14 @@ class TypeChecker:
         if expr.name in self.structs or expr.name in self.enums:
             return expr.name
         return None
+
+    def _declares_variant(self, ty: rast.Type, name: str) -> bool:
+        """Does the enum under `ty`'s indirection declare a variant `name`?"""
+        base = self._strip_indirection(ty)
+        if not isinstance(base, rast.NamedType):
+            return False
+        info = self.enums.get(base.name)
+        return info is not None and any(v.name == name for v in info.variants)
 
     def _strip_indirection(self, ty: rast.Type) -> rast.Type:
         """The type under any pointers, references and aliases."""
