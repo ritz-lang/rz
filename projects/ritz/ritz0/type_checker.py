@@ -1647,6 +1647,12 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         # Check all fields are provided and have correct types
         provided_fields = {name: value for name, value in expr.fields}
         expected_fields = {name: ty for name, ty in struct_info.fields}
+        # A spelled-out `Box2<u8> { v: .. }`: its fields at those args, so `v`
+        # is a u8 and a T in it is that field's error (AGAST #3424).
+        params = struct_info.type_params or []
+        if params and expr.type_args and len(expr.type_args) == len(params):
+            subst = TypeSubstitution(dict(zip(params, expr.type_args)))
+            expected_fields = {name: subst.apply(ty) for name, ty in expected_fields.items()}
 
         for field_name in provided_fields:
             if field_name not in expected_fields:
@@ -1667,7 +1673,6 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         # An args-less generic literal is the instance its fields bind (§9.2
         # rule 2, as monomorph infers it; AGAST #3554); unbound, it's left bare
         # for monomorph to report.
-        params = struct_info.type_params or []
         bound, conflict = bind_type_params(params, pairs, self._resolve_alias)
         if params and all(tp in bound and tp not in conflict for tp in params):
             return rast.NamedType(expr.span, expr.name, [bound[tp] for tp in params])

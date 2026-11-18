@@ -12408,10 +12408,11 @@ class LLVMEmitter:
             field_val = self._emit_into_array_slot(field_expr, expected_type)
         field_ty = self._ritz_type_to_llvm(expected_type)
         field_val = self._convert_type(field_val, field_ty, field_expr)
-        if (field_val.type != field_ty
-                and isinstance(field_ty, (ir.BaseStructType, ir.ArrayType))):
-            # _convert_type passes an aggregate through unchanged; insertvalue
-            # would refuse it with an llvmlite TypeError (AGAST #1293).
+        if field_val.type != field_ty:
+            # _convert_type passes what it can't convert through unchanged:
+            # an aggregate into an aggregate field (AGAST #1293), or into a
+            # scalar one (`S { v: T { .. } }` with `v: u8`, #3424).
+            # insertvalue would refuse either with an llvmlite TypeError.
             got = self._get_struct_name_from_type(field_val.type) or str(field_val.type)
             raise EmitError(f"field `{field_name}` of `{struct_name}` is "
                             f"`{type_to_string(expected_type)}`, not `{got}`",
