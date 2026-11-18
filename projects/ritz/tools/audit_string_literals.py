@@ -73,13 +73,6 @@ CALL_SIG: dict[str, dict[int, str]] = {
     "eprints":       {0: "s"},
     "eprintln":      {0: "s"},
 
-    # args_init(parser, name, desc) -- both strings are shown to the user
-    # via *u8 usage observed in tier3 coreutils
-    "args_init":       {1: "c", 2: "c"},
-    "args_flag":       {2: "c", 3: "c"},
-    "args_option":     {2: "c", 3: "c"},
-    "args_positional": {1: "c", 2: "c"},
-
     # Panics / asserts -- today panic takes *u8
     "panic":      {0: "c"},
     "panic_cstr": {0: "c"},

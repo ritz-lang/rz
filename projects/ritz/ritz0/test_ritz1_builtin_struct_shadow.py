@@ -40,8 +40,9 @@ THE TESTS
   * layout: a program defines `struct Transition` with the built-in's field
     NAMES in a different ORDER; the first declared field must sit at offset 0.
     Name-lookup alone cannot pass this — only the source layout can.
-  * import: programs that take these structs from ritzlib (ArgParser, String,
+  * import: programs that take these structs from ritzlib (String,
     Vec<LineBounds>) must still compile and run — the copies are not needed.
+    (ArgParser was imported here too until AGAST #4046 deleted ritzlib/args.ritz.)
   * static: emitter*.ritz contains no hard-coded `%Name = type` layout for a
     struct that has a source definition.
 """
@@ -253,18 +254,6 @@ def test_ritz1_transition_uses_source_layout(ritz1_bin, tmp_path):
 
 # --- the copies are not needed: imported layouts still work ---------------
 
-ARGPARSER_IMPORTED = """\
-import ritzlib.memory
-import ritzlib.args
-
-fn main() -> i32
-    var p: ArgParser
-    p.option_count = 3
-    p.pos_def_count = 4
-    p.positional_count = 35
-    return p.option_count + p.pos_def_count + p.positional_count
-"""
-
 STRING_IMPORTED = """\
 import ritzlib.memory
 import ritzlib.string
@@ -353,7 +342,6 @@ fn main() -> i32
 
 
 IMPORTED = {
-    "argparser": (ARGPARSER_IMPORTED, 42),
     "string": (STRING_IMPORTED, 42),
     "vec_linebounds": (VEC_LINEBOUNDS_IMPORTED, 42),
     "vec_i16_inferred": (VEC_I16_INFERRED, 42),

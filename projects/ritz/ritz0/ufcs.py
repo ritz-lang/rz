@@ -7,15 +7,14 @@ The emitter dispatches on this, and the type checker needs the same answer: a
 from typing import Optional
 
 # UFCS prefixes for non-generic ritzlib types: `b.len()` on a Buffer calls
-# `buf_len(@b)`. NOT the lowercased type name (Buffer -> buf_, ArgParser ->
-# args_). ritz1 carries a copy of this table in
-# ritz1/src/emitter_expr_call.ritz (ufcs_non_generic_prefix);
+# `buf_len(@b)`. NOT the lowercased type name (Buffer -> buf_). ritz1
+# carries a copy of this table in ritz1/src/ast_helpers.ritz
+# (ufcs_non_generic_prefix);
 # test_ritz1_ufcs_prefix.py asserts the two agree (AGAST #1368).
 UFCS_NON_GENERIC_PREFIXES = {
     'String': 'string_',
     'GrowBuf': 'growbuf_',
     'Buffer': 'buf_',
-    'ArgParser': 'args_',
 }
 
 

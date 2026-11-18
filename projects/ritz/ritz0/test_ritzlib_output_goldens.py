@@ -2,19 +2,14 @@
 
 #1642 turned ritzlib's hand-rolled prints/eprints/print_int chains into single
 print/eprint interpolations.  Output must stay byte-identical, on the same fd,
-with the same exit status.  ritzlib/tests/test_{argspec,args,env}_output.ritz
-pin most of it under ritz0; this file covers the two things they can't:
+with the same exit status.  ritzlib/tests/test_{argspec,env}_output.ritz
+pin most of it under ritz0; this file covers what they can't.
 
-* (ritzlib/testing.ritz's assertion helpers were pinned here until AGAST
-  #1869 deleted the module: `assert` itself now prints both operands; see
-  ritz0/test/test_assert_operands.ritz.)
-* ritzlib/args.ritz is compiled by ritz1 for every example that imports it, so
-  its converted printers are also built with `--compiler ritz1` and both
-  binaries must print the same pinned bytes.  The cases are the ones in
-  ritzlib/tests/test_args_output.ritz (read from that file, so they can't
-  drift apart).  argspec and os/env are not here: ritz1 cannot compile either
-  module yet (ritz1's old regression allowlist, in git history; env_must's block
-  match arm, #1454).
+(ritzlib/testing.ritz's assertion helpers were pinned here until AGAST #1869
+deleted the module: `assert` itself now prints both operands; see
+ritz0/test/test_assert_operands.ritz.  The deprecated ritzlib/args.ritz
+printers were pinned here under both compilers until AGAST #4046 deleted the
+module.)
 
 AGAST #1684 did the same to timer, iovec, lang/tokens and elf.  ritz1
 compiles all four, so the timer/iovec cases from
@@ -80,85 +75,6 @@ def _check(exe: Path, args, env_extra, want_rc, want_out, want_err, label):
     assert run.stdout == want_out, f"{label} stdout: {run.stdout!r}"
     assert run.stderr == want_err, f"{label} stderr: {run.stderr!r}"
     assert run.returncode == want_rc, f"{label} exit {run.returncode}"
-
-
-# ---------------------------------------------------------------------------
-# ritzlib/args.ritz (ritz0 and ritz1)
-# ---------------------------------------------------------------------------
-
-
-def _args_program() -> str:
-    """test_args_output.ritz's case functions, driven by argv[1] instead of fork."""
-    src = (RITZ_ROOT / "ritzlib" / "tests" / "test_args_output.ritz").read_text()
-    cases = src[src.index("fn setup(") : src.index("fn run_body(")]
-    return (
-        "import ritzlib.sys\nimport ritzlib.io\nimport ritzlib.args\n\n"
-        + cases
-        + """fn main(argc: i32, argv: **u8) -> i32
-    let which: u8 = *(*(argv + 1))
-    if which == '1'
-        return case_long_errors()
-    if which == '2'
-        return case_short_errors()
-    if which == '3'
-        return case_positional_errors()
-    case_help()
-"""
-    )
-
-
-# case -> (exit status, stdout, stderr).
-ARGS_CASES = {
-    "1": (
-        4,
-        b"",
-        b"prog: unknown option '--bogus'\n"
-        b"prog: option '--verbose' doesn't accept a value\n"
-        b"prog: unknown option '--bogus'\n"
-        b"prog: option '--count' requires a value\n",
-    ),
-    # #1683: the option char goes to stderr with the rest of the message.
-    "2": (2, b"", b"prog: unknown option '-z'\nprog: option '-n' requires a value\n"),
-    "3": (
-        2,
-        b"",
-        b"prog: missing required argument 'FILE'\nprog: too many arguments\n",
-    ),
-    "4": (
-        0,
-        b"Usage: prog [OPTIONS] FILE...\n\nDoes things\n\nOptions:\n"
-        b"  -v, --verbose\n        Say more\n"
-        b"  -q\n        Quiet\n"
-        b"  -n, --count=NUM\n        How many (default: 10)\n"
-        b"      --name=S\n        Who\n"
-        b"  -x\n        Short value (default: 3)\n"
-        b"\nArguments:\n  FILE\n        Input files\n"
-        b"Usage: bare [OPTIONS] [ARG...]\n\nArguments:\n  ARG\n        An arg\n",
-        b"",
-    ),
-}
-
-
-@pytest.fixture(scope="module", params=["ritz0", "ritz1"])
-def agold(request, tmp_path_factory) -> Path:
-    if request.param == "ritz1":
-        request.getfixturevalue("ritz1_bin")
-    pkg = tmp_path_factory.mktemp(f"agold_{request.param}")
-    return _build(pkg, "agold", _args_program(), request.param)
-
-
-@pytest.mark.parametrize("case", sorted(ARGS_CASES))
-def test_args_output_is_byte_exact(agold, case):
-    want_rc, want_out, want_err = ARGS_CASES[case]
-    _check(
-        agold,
-        [case],
-        {},
-        want_rc,
-        want_out,
-        want_err,
-        f"args case {case} ({agold.parent})",
-    )
 
 
 # ---------------------------------------------------------------------------

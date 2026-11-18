@@ -3,13 +3,14 @@ through the same type -> function-prefix table as ritz0.
 
 THE DEFECT
 
-ritzlib's String / Buffer / ArgParser "methods" are free functions with a
+ritzlib's String / Buffer "methods" are free functions with a
 prefix that is NOT always the lowercased type name:
 
     String    -> string_       (string_push_str)
     GrowBuf   -> growbuf_
     Buffer    -> buf_          (.lower() would give buffer_   -- wrong)
-    ArgParser -> args_         (.lower() would give argparser_ -- wrong)
+
+(ArgParser -> args_ was a fourth row until AGAST #4046 deleted ritzlib/args.ritz.)
 
 ritz0 reaches them through `_find_method_fallback`. ritz1 had the generic
 half of that table (Vec$ -> vec_, Span$ -> span_) but not the non-generic
@@ -28,7 +29,7 @@ MEASURED (ritz1 before/after, 84 examples/ entry files, symbols matching
 
 THE TESTS
 
-  * runtime cases (ritz0 is the oracle): String, Buffer and ArgParser method
+  * runtime cases (ritz0 is the oracle): String and Buffer method
     calls -- on a local, through a pointer parameter, and through a struct
     field -- build, link and compute the right answer; Vec$u8.len() still
     does (generic-table coverage).
@@ -141,19 +142,6 @@ fn main() -> i32
     return 42
 """
 
-# ArgParser -> args_ : the second entry that disproves the .lower() rule.
-ARGPARSER_METHODS = """\
-import ritzlib.args
-
-fn main() -> i32
-    var p: ArgParser
-    p.init(c"prog", c"test")
-    p.flag('v', c"verbose", c"be loud")
-    if p.get_flag('v') != 0
-        return 1
-    return 42
-"""
-
 # Generic half of the table: Vec$u8.len() and a vec_ method.
 VEC_METHODS = """\
 import ritzlib.gvec
@@ -190,7 +178,6 @@ CASES = {
     "string_methods": (STRING_METHODS, 42),
     "string_receiver_kinds": (STRING_RECEIVER_KINDS, 42),
     "buffer_methods": (BUFFER_METHODS, 42),
-    "argparser_methods": (ARGPARSER_METHODS, 42),
     "vec_methods": (VEC_METHODS, 42),
     "impl_wins": (IMPL_WINS, 7),
 }
@@ -269,6 +256,5 @@ def test_prefix_tables_agree():
     r1 = _ritz1_table()
     r0 = dict(emitter_llvmlite.UFCS_NON_GENERIC_PREFIXES)
     assert r1 == r0
-    # The two entries that disprove the .lower() rule must be present.
+    # The entry that disproves the .lower() rule must be present.
     assert r0["Buffer"] == "buf_"
-    assert r0["ArgParser"] == "args_"

@@ -348,7 +348,7 @@ import ritzlib.io
 ```
 
 ### Phase 2: Argument Parsing
-Examples with option parsing should use `ritzlib.args`:
+Examples with option parsing should use `ritzlib.argspec`:
 
 **Pattern to replace:**
 ```ritz
@@ -363,12 +363,14 @@ while i < argc
 
 ```ritz
 # NEW: Declarative parsing
-import ritzlib.args
+import ritzlib.argspec
 
-var parser: ArgParser
-args_init(&parser, "prog", "Description")
-args_flag(&parser, 'v', "verbose", "Enable verbose")
-args_parse(&parser, argc, argv)
+var all = args_from_argv(argc, argv)
+var spec = argspec_new("prog", "Description")
+argspec_switch(@&spec, 'v', "verbose", "Enable verbose")
+match argspec_parse(@spec, args_tail(@all))
+    Ok(p) => run(p)
+    Err(e) => fail(@spec, e)
 ```
 
 ### Estimated Effort

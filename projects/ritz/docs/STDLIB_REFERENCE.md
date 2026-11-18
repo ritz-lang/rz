@@ -72,7 +72,6 @@ Ritzlib is built on three core principles:
 9. [Process Management](#process-management)
    - [process](#process) - Subprocess spawning
    - [argspec](#argspec) - Argument parsing
-   - [args](#args) - Argument parsing (deprecated)
    - [os.env](#osenv) - Environment variables
 10. [Utilities](#utilities)
     - [timer](#timer) - High-precision timing
@@ -2002,8 +2001,9 @@ struct ProcessResult
 
 **Module**: `ritzlib.argspec`
 
-Command-line parsing, the idiomatic way (AGAST #1448); replaces the deprecated
-[args](#args).  `examples/tier2_stdlib/77_args` exercises every function.
+Command-line parsing, the idiomatic way (AGAST #1448).  It replaced the
+`ritzlib.args` ArgParser API, deleted in #4046.  `examples/tier2_stdlib/77_args`
+exercises every function.
 
 Arguments are `StrView`s pointing into argv (nothing is copied), the spec is a
 struct holding a `Vec<ArgFlag>`, lookups return `Option`, and parse failures
@@ -2088,106 +2088,8 @@ fn main(argc: i32, argv: **u8) -> i32
     status
 ```
 
-ritz1 cannot compile this module yet (#1487, #1488, #1497, #1498; see the
-`77_args` entry of ritz1's old regression allowlist, in git history).  That is also why it is a
-separate module rather than part of `args`: ritz1 compiles every function of an
-imported module, so housing it in `args.ritz` would break every `args` caller
-under ritz1.
-
----
-
-### args
-
-**Module**: `ritzlib.args`
-
-**Deprecated** — use [argspec](#argspec) in new code.  `ArgParser` is C in
-Ritz's clothing (`*u8` strings, `i32` booleans, errors printed from inside
-`args_parse`) and stays only until its callers are ported.
-
-```ritz
-struct OptDef
-    short_name: u8           # Single char (-v), 0 if none
-    long_name: *u8           # Long name (--verbose), null if none
-    value_name: *u8          # Name of value for help (NUM), null for flags
-    description: *u8         # Help text
-    default_value: *u8       # Default value string, null if required
-    opt_type: i32            # OPT_FLAG or OPT_VALUE
-    is_set: i32              # Was this option provided?
-    value: *u8               # The value (for OPT_VALUE) or "1"/"0" (for OPT_FLAG)
-
-struct PosDef
-    name: *u8                # Name for help (FILE)
-    description: *u8         # Help text
-    min_count: i32           # Minimum required (0 = optional)
-    max_count: i32           # Maximum allowed (-1 = unlimited)
-
-struct ArgParser
-    program_name: *u8
-    description: *u8
-    options: [32]OptDef
-    option_count: i32
-    pos_defs: [8]PosDef
-    pos_def_count: i32
-    positionals: [256]*u8
-    positional_count: i32
-```
-
-**Setup**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `args_init` | `fn(parser: *ArgParser, program: *u8, desc: *u8)` | Initialize |
-| `args_flag` | `fn(parser: *ArgParser, short: u8, long: *u8, desc: *u8)` | Add flag |
-| `args_option` | `fn(parser: *ArgParser, short: u8, long: *u8, value_name: *u8, desc: *u8, default: *u8)` | Add option |
-| `args_positional` | `fn(parser: *ArgParser, name: *u8, desc: *u8, min: i32, max: i32)` | Add positional |
-
-**Parsing**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `args_parse` | `fn(parser: *ArgParser, argc: i32, argv: **u8) -> i32` | Parse arguments |
-
-**Value Retrieval**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `args_get_flag` | `fn(parser: *ArgParser, short: u8) -> i32` | Get flag by short name |
-| `args_get_flag_long` | `fn(parser: *ArgParser, long: *u8) -> i32` | Get flag by long name |
-| `args_get_str` | `fn(parser: *ArgParser, short: u8) -> *u8` | Get string option |
-| `args_get_str_long` | `fn(parser: *ArgParser, long: *u8) -> *u8` | Get string by long name |
-| `args_get_int` | `fn(parser: *ArgParser, short: u8) -> i64` | Get integer option |
-| `args_get_int_long` | `fn(parser: *ArgParser, long: *u8) -> i64` | Get integer by long name |
-| `args_get_positional` | `fn(parser: *ArgParser, idx: i32) -> *u8` | Get positional arg |
-| `args_is_set` | `fn(parser: *ArgParser, short: u8) -> i32` | Check if option was provided |
-
-**Help**:
-
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `args_print_usage` | `fn(parser: *ArgParser)` | Print usage |
-| `args_print_help` | `fn(parser: *ArgParser)` | Print full help |
-
-**Example**:
-```ritz
-import ritzlib.args
-
-fn main(argc: i32, argv: **u8) -> i32
-    var parser: ArgParser
-    args_init(@parser, c"myprogram", c"Description")
-    args_flag(@parser, 'v', c"verbose", c"Enable verbose output")
-    args_option(@parser, 'n', c"count", c"NUM", c"Number of items", c"10")
-    args_positional(@parser, c"FILE", c"Input file(s)", 0, -1)
-
-    if args_parse(@parser, argc, argv) != 0
-        return 1
-
-    let verbose: i32 = args_get_flag(@parser, 'v')
-    let count: i64 = args_get_int(@parser, 'n')
-    verbose + count as i32
-```
-
-Every `args_*` string parameter is a `*u8`, so the literals must be written
-`c"..."`; a bare `"..."` is a `StrView` and will not type-check here.
+ritz1 compiles this module: `77_args` and the tier2 examples ported to it in
+#1490 build and pass under ritz1 and ritz1_selfhosted.
 
 ---
 
