@@ -81,10 +81,13 @@ REACH = {
     "inferred_let": ("fn f(d: C)\n    let p = @d\n    p.x = 3\n", "3:5", WRITE),
     # So is one copied from an `@C` field, a `*C` by now with a flag.
     "let_from_field": ("fn f(h: H)\n    let p = h.r\n    p.x = 3\n", "3:5", WRITE),
-    # An element through an `@[2]C`'s `p#` view (RsNote.elem).
+    # An element through an `@[2]C`'s `p#` view (sema_view_elem).
     "element_field": ("fn f(p: @[2]C)\n    p[1].x = 3\n", "2:5", WRITE),
     # And through a declared local's.
     "declared_element_field": ("fn f(p: @[2]C)\n    let q: @[2]C = p\n    q[1].x = 3\n", "3:5", WRITE),
+    # ...and of an un-annotated `let` that holds one (SemaVar.index_elem, #3985).
+    "inferred_element_field": ("fn f(p: @[2]C)\n    let q = p\n    q[1].x = 3\n", "3:5", WRITE),
+    "inferred_addr_element_field": ("fn f(a: [2]C)\n    let q = @a\n    q[1].x = 3\n", "3:5", WRITE),
     # `*p` of an `@[3]i32` is its `[3]i32` (RsNote.arr_elem).
     "deref_element": ("fn f(p: @[3]i32)\n    (*p)[1] = 7\n", "2:6", WRITE),
     # `*r` of an `@@C`, held as an `@*C`, is the `@C` it was (RsNote.inner_ref).
@@ -163,6 +166,9 @@ def test_the_emitter_runs_neither_rule():
         assert gone not in ref, f"ref_check.ritz still has {gone}: ref_value.ritz runs it, on Sema"
     core = (SRC / "emitter_core.ritz").read_text()
     assert "ref_root" not in core, "LocalVar still keeps ref_root: Sema's RsNote does"
+    # AGAST #3985: a `p#` view's element is SemaVar.index_elem's, not a second copy.
+    assert "fn rv_view_elem" not in (SRC / "ref_value.ritz").read_text()
+    assert "    elem: i32" not in ref, "RsNote still keeps a `p#` view's elem: SemaVar.index_elem has it"
     walk = (SRC / "sema_walk.ritz").read_text()
     for hook in ("ref_value_begin_fn", "ref_value_check_stmt", "ref_value_check_value", "ref_value_after"):
         assert hook in walk, f"sema_walk doesn't call {hook}"
