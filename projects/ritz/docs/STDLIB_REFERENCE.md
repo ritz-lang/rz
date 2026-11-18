@@ -742,6 +742,10 @@ the view by value; slicing returns a new view of the same bytes.
 | `s.find(t)`, `s.rfind(t)`, `s.find_byte(c)` | `strview_find`, `strview_rfind`, `strview_find_byte` |
 | `s.to_cstr()`, `s.as_cstr_unchecked()` | `strview_to_cstr`, `strview_as_cstr_unchecked` |
 
+`s.as_bytes()` is not in this table: it is a compiler built-in, with no
+`strview_*` function behind it, and works without importing this module. It is
+a `Span<u8>` of the view's bytes, with no copy (LANGUAGE_SPEC §3.5).
+
 **Example**:
 ```ritz
 import ritzlib.option
