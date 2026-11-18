@@ -17,11 +17,16 @@
 # trailing bytes, a blob whose bytes don't hash to its id, a root that isn't
 # one of its blobs) is refused with ERR_CORRUPT_BLOB rather than half loaded.
 #
-# Saving writes `<path>.tmp` and renames it over `<path>`, so a reader never
-# sees a half-written store. Two writers racing still lose one's update: there
-# is no lock.
+# Saving writes `<path>.tmp.<pid>` and renames it over `<path>`, so a reader
+# never sees a half-written store, and two savers never share a temp file.
+#
+# A read-modify-write (open, change, save) must hold file_store_lock for its
+# whole span, or two writers racing both load the old store and the second
+# rename drops the first one's update (#3882). The lock is flock(2) on a
+# `<path>.lock` sidecar: the store itself can't carry it, since each save
+# renames a new inode over it. Plain readers need no lock.
 
-import ritzlib.sys { sys_open, sys_open3, sys_read, sys_write, sys_close, sys_lseek, sys_rename, sys_unlink, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
+import ritzlib.sys { sys_open, sys_open3, sys_flock, sys_getpid, LOCK_EX, sys_read, sys_write, sys_close, sys_lseek, sys_rename, sys_unlink, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
 import ritzlib.strview { StrView }
 import goliath.blob_id { BlobId, blob_id_compute, blob_id_eq, blob_id_from_hash, blob_id_copy, blob_id_is_zero }
 import goliath.blob_store { MemoryBlobStore, memory_store_put, memory_store_exists, memory_store_count, memory_store_capacity, memory_store_slot_used, memory_store_slot_id, memory_store_slot_data, memory_store_slot_size }
@@ -58,6 +63,31 @@ fn fs_path_cstr(path: StrView, suffix: *u8, buf: *u8) -> bool
         j = j + 1
     *(buf + i + j) = 0
     true
+
+# `path` + ".tmp." + the decimal pid + NUL into `buf` (FS_PATH_BUF bytes):
+# a temp name no other live process will pick.
+fn fs_tmp_path_cstr(path: StrView, buf: *u8) -> bool
+    var suffix: [32]u8
+    let prefix: *u8 = c".tmp."
+    var n: i64 = 0
+    while *(prefix + n) != 0
+        suffix[n] = *(prefix + n)
+        n = n + 1
+    var digits: [16]u8
+    var d: i64 = 0
+    var pid: i64 = sys_getpid() as i64
+    if pid <= 0
+        return false
+    while pid > 0
+        digits[d] = (48 + pid % 10) as u8
+        pid = pid / 10
+        d = d + 1
+    while d > 0
+        d = d - 1
+        suffix[n] = digits[d]
+        n = n + 1
+    suffix[n] = 0
+    fs_path_cstr(path, @suffix[0], buf)
 
 fn fs_magic_byte(i: i64) -> u8
     *(c"GOLIATHS" + i)
@@ -219,7 +249,7 @@ fn fs_save_to_fd(fd: i32, ns: *Namespace) -> bool
 pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
     var cpath: [4096]u8
     var ctmp: [4096]u8
-    if not fs_path_cstr(path, c"", @cpath[0]) or not fs_path_cstr(path, c".tmp", @ctmp[0])
+    if not fs_path_cstr(path, c"", @cpath[0]) or not fs_tmp_path_cstr(path, @ctmp[0])
         return ERR_PATH_TOO_LONG
 
     # O_WRONLY | O_CREAT | O_TRUNC, mode 0644
@@ -234,3 +264,30 @@ pub fn file_store_save(path: StrView, ns: *Namespace) -> ErrorCode
         sys_unlink(@ctmp[0])
         return ERR_IO_ERROR
     ERR_OK
+
+# ============================================================================
+# Lock
+# ============================================================================
+
+# Take the exclusive writer lock for the store at `path`, waiting for any
+# other holder. Returns the lock's fd (>= 0) for file_store_unlock, or
+# -ERR_PATH_TOO_LONG / -ERR_IO_ERROR as a negative ErrorCode. Creates
+# `<path>.lock` (empty, mode 0644) if missing and leaves it in place: removing
+# it would let a waiter lock an unlinked inode while a newcomer locks a new one.
+pub fn file_store_lock(path: StrView) -> i32
+    var clock: [4096]u8
+    if not fs_path_cstr(path, c".lock", @clock[0])
+        return -(ERR_PATH_TOO_LONG as i32)
+    # O_RDWR | O_CREAT | O_CLOEXEC, mode 0644
+    let fd: i32 = sys_open3(@clock[0], 2 + 64 + 524288, 420)
+    if fd < 0
+        return -(ERR_IO_ERROR as i32)
+    if sys_flock(fd, LOCK_EX) != 0
+        sys_close(fd)
+        return -(ERR_IO_ERROR as i32)
+    fd
+
+# Release a lock from file_store_lock (closing its fd drops the flock).
+pub fn file_store_unlock(fd: i32)
+    if fd >= 0
+        sys_close(fd)

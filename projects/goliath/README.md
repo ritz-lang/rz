@@ -60,12 +60,13 @@ goliath ls /notes.txt                  # just that file's line
 status: 0 done, 1 failed (not found, unreadable, corrupt store), 2 usage.
 
 The store file (`src/file_store.ritz`) holds every blob and the namespace
-root. It is read whole and written back whole (to `<store>.tmp`, then renamed
-over the store). A file that isn't a complete, intact store is refused, never
+root. It is read whole and written back whole (to `<store>.tmp.<pid>`, then
+renamed over the store). `put` holds an exclusive `flock` on `<store>.lock`
+from load to save, so concurrent `put`s queue up rather than lose each other's
+updates (#3882). A file that isn't a complete, intact store is refused, never
 half-read. Each blob is checked against its id on load. Limits for now: the
 root directory holds 256 entries; every `put` keeps the superseded root
-directory blob, so the store grows until garbage collection lands (#1881); two `put`s
-at once can lose one of them (there is no lock: #3882).
+directory blob, so the store grows until garbage collection lands (#1881).
 
 ### Library
 

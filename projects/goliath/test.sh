@@ -99,4 +99,32 @@ cp "$TMP/good" "$GOLIATH_STORE"
 truncate -s -1 "$GOLIATH_STORE"
 expect ls_truncated nonzero 'corrupt'        -- "$BIN" ls /
 
+# Concurrent puts to one store all land (#3882). Each put is a whole-file
+# read-modify-write, so without a lock the last rename drops the others'
+# blobs and links while every put still exits 0.
+export GOLIATH_STORE=$TMP/race/store
+mkdir -p "$TMP/race"
+N=12
+for k in $(seq $N); do printf 'race file %s\n' "$k" > "$TMP/race/f$k"; done
+pids=()
+for k in $(seq $N); do "$BIN" put "$TMP/race/f$k" > "$TMP/race/out$k" 2>&1 & pids+=($!); done
+for k in $(seq $N); do
+    wait "${pids[$((k-1))]}" || fail "race put f$k: exit $?: $(cat "$TMP/race/out$k")"
+done
+n=$("$BIN" ls / 2>&1 | grep -cE ' f[0-9]+$')
+[ "$n" = $N ] && echo "ok: race_ls" || fail "after $N concurrent puts ls / shows $n: $("$BIN" ls / 2>&1)"
+for k in $(seq $N); do
+    id=$(cat "$TMP/race/out$k")
+    "$BIN" get "$id" 2>/dev/null | cmp -s - "$TMP/race/f$k" || { fail "race get f$k ($id)"; break; }
+done
+leftover=$(ls "$TMP/race" | grep -c '\.tmp')
+[ "$leftover" = 0 ] && echo "ok: race_no_tmp" || fail "temp files left: $(ls "$TMP/race")"
+# Each save writes its own temp file (<store>.tmp.<pid>), not a shared
+# <store>.tmp that two writers could interleave into: a squatter there
+# doesn't stop a put
+mkdir "$GOLIATH_STORE.tmp"
+printf 'after the squatter\n' > "$TMP/race/late"
+expect put_tmp_taken 0     '^[0-9a-f]{64}$'  -- "$BIN" put "$TMP/race/late"
+expect ls_tmp_taken  0     ' late$'          -- "$BIN" ls /late
+
 [ $fails -eq 0 ] || { echo "$fails goliath CLI check(s) failed"; exit 1; }
