@@ -6167,8 +6167,16 @@ fn checksum() -> u8
     0
 ```
 
-ritz1 does not yet parse the comma-separated form or implement `[[naked]]`.
-It rejects both with a located error.
+`[[a, b]]` means `[[a]]` and `[[b]]`, and a trailing comma is allowed. Each
+entry is checked on its own, and an error is located at that entry
+(AGAST #1919):
+
+```ritz
+[[packed, target_os = "linux"]]
+struct Wire
+    tag: u8
+    len: u32
+```
 
 ### 17.1 Test Attribute
 

@@ -173,6 +173,12 @@ fn main() -> i32
     0
 """
 
+UNKNOWN_IN_LIST = """\
+[[test, frobnicate]]
+fn main() -> i32
+    0
+"""
+
 ERRORS = {
     # name: (source, line, col, needles)
     "unknown_bare": (UNKNOWN_BARE, 4, 3, ["unknown attribute", "frobnicate"]),
@@ -184,6 +190,8 @@ ERRORS = {
     "packed_with_value": (PACKED_WITH_VALUE, 1, 3, ["packed", "value"]),
     "test_helper_on_struct": (TEST_HELPER_ON_STRUCT, 1, 3, ["test_helper", "fn"]),
     "test_helper_with_value": (TEST_HELPER_WITH_VALUE, 1, 3, ["test_helper", "value"]),
+    # Each name in a comma list is judged, and located, on its own (#1919).
+    "unknown_in_list": (UNKNOWN_IN_LIST, 1, 9, ["unknown attribute", "frobnicate"]),
 }
 
 
@@ -234,6 +242,37 @@ fn main() -> i32
 def test_known_attributes_compile(request, tmp_path, compiler):
     _need(compiler, request)
     assert _run(compiler, tmp_path, KNOWN_OK) == 7
+
+
+# `[[a, b]]` is `[[a]] [[b]]` (LANGUAGE_SPEC §17, AGAST #1919): every entry
+# applies: dropping packed makes sizeof(P) 16, dropping target_os leaves two
+# which()s.  A trailing comma is accepted, as ritz0 accepts it.  The gated twin
+# is a fn, not a struct: ritz0 rejects same-named gated structs (#4054).
+ATTR_LIST = """\
+[[packed, target_os = "linux"]]
+struct P
+    a: u8
+    b: u64
+
+[[inline, target_os = "linux",]]
+fn which() -> i32
+    1
+
+[[target_os = "harland", inline]]
+fn which() -> i32
+    2
+
+fn main() -> i32
+    if sizeof(P) != 9
+        return 1
+    which() + 41
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_comma_separated_attribute_list(request, tmp_path, compiler):
+    _need(compiler, request)
+    assert _run(compiler, tmp_path, ATTR_LIST) == 42
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
