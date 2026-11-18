@@ -123,6 +123,13 @@ ALLOWED = {
                                    "fn g(p: @C)\n    (p as *C).up()\n", "g(@c)"),
     "cast_to_shared_receiver": ("impl C\n    fn get(self: @C) -> i32\n        self.x + 2\n\n"
                                 "fn g(p: *C) -> i32\n    (p as @C).get()\n", "c.x = g(@&c)"),
+    # A field of the method's result (#4180).
+    "deref_receiver_result_field": ("fn g(p: *C) -> i32\n    (*p).me().x + 2\n", "c.x = g(@&c)"),
+    "cast_receiver_result_field": ("fn g(p: *C) -> i32\n    (p as @C).me().x + 2\n", "c.x = g(@&c)"),
+    "deref_receiver_result_arg": ("fn g(p: *C) -> i32\n    same((*p).me()).x + 2\n", "c.x = g(@&c)"),
+    "cast_receiver_result_arg": ("fn g(p: *C) -> i32\n    same((p as @C).me()).x + 2\n", "c.x = g(@&c)"),
+    "deref_receiver_result_deref": ("fn g(p: *C) -> i32\n    let d: C = *(*p).me()\n    d.x + 2\n", "c.x = g(@&c)"),
+    "cast_receiver_result_deref": ("fn g(p: *C) -> i32\n    let d: C = *(p as @C).me()\n    d.x + 2\n", "c.x = g(@&c)"),
 }
 
 # ritz1 couldn't lower `(p as *C).x = 3` (#2373); it does now.
