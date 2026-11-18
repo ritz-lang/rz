@@ -11124,6 +11124,15 @@ class LLVMEmitter:
             if isinstance(val.type, ir.PointerType):
                 return val
             return self._lend_temp_slot(expr, val)
+        elif isinstance(expr, rast.Cast):
+            # AGAST #3586: `(p as @&S).arr[i] = v` / `(p as *S).arr[i] = v`.
+            # A cast to a pointer or reference is the address of what it
+            # points at, so its value is the base's place.  A cast to a
+            # non-pointer is a value with no place.
+            val = self._emit_expr(expr)
+            if isinstance(val.type, ir.PointerType):
+                return val
+            raise ValueError(f"Cannot get address of a cast to {val.type}")
         else:
             raise ValueError(f"Cannot get address of: {type(expr)}")
 
