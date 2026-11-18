@@ -2870,6 +2870,47 @@ fn tn_note_last(p: *Parser, back: i32)
     if t != null
         tn_note(p, t.start, t.len)
 
+# AGAST #4171: a generic call's type argument `g<Nope>(3)` / `g<*Nope>(p)` /
+# `g<@Nope>(r)` is a bare token (type_name), never a type_spec, so type_named
+# neither saw nor located it: locate it here and note it.
+fn tn_note_tok(p: *Parser, tok: Token)
+    if p.skip_item != 0 or tok.kind != TOK_IDENT
+        return
+    note_type_name_written(p, tok.start, tok.line, tok.col)
+    tn_note(p, tok.start, tok.len)
+
+# AGAST #4171: a generic call's full argument list `g<i32, *Nope>(3)`.  Each
+# argument is a type_spec (type_named located it), but only
+# type_generic_with_saved noted them.
+fn tn_note_args(p: *Parser, ga: *GenericArg)
+    var cur: *GenericArg = ga
+    while cur != null
+        tn_note(p, cur.written, cur.written_len)
+        cur = cur.next
+
+# AGAST #4171: a struct-style variant's fields (`A` / `    x: Nope`) have no
+# StructDef for type_name_check.ritz to walk; the enum claims these notes.
+# A slot counts only if its name is written on the field's own line, after
+# the field's name, as tn_struct judges a struct's: `f: fn(i64) -> i64`
+# after `-> @&T` keeps that `T` (test_unknown_type_name.py KNOWN's `CbE`),
+# which was judged where it was written.
+fn tn_note_slot(p: *Parser, field: *u8, name: *u8, len: i32)
+    if field == null or name == null or (name as i64) <= (field as i64)
+        return
+    var c: *u8 = field
+    while (c as i64) < (name as i64)
+        if *c == 10 or *c == 0
+            return
+        c = c + 1
+    tn_note(p, name, len)
+
+fn tn_note_fields(p: *Parser, fields: *StructField)
+    var f: *StructField = fields
+    while f != null
+        tn_note_slot(p, f.name, f.field_type_name, f.field_type_name_len)
+        tn_note_slot(p, f.name, f.array_elem_type_name, f.array_elem_type_name_len)
+        f = f.next
+
 # The item whose action is running claims every pending note.
 fn tn_claim(p: *Parser, inner: *TypeParam, f: *FnDef)
     if g_tn_pending == null
@@ -6931,6 +6972,7 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
     op.args = args
     # Type suffix: "$" + type_name (an alias spelled as its target, #2037).
     var len: i32 = 0
+    tn_note_tok(p, type_tok)   # AGAST #4171
     op.call_type_suffix = generic_tok_suffix(p, null, 0, type_tok, @len)
     op.call_type_suffix_len = len
     op.next = null
@@ -6949,6 +6991,7 @@ pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     op.args = args
     # Type suffix: "$ptr_" + type_name (an alias spelled as its target, #2037).
     var len: i32 = 0
+    tn_note_tok(p, type_tok)   # AGAST #4171
     op.call_type_suffix = generic_tok_suffix(p, c"ptr_", 4, type_tok, @len)
     op.call_type_suffix_len = len
     op.next = null
@@ -6961,6 +7004,7 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
+    tn_note_args(p, ga)   # AGAST #4171
     # "" + "$" + arg → "$<arg>", from the same speller as type annotations.
     var len: i32 = 0
     op.call_type_suffix = mangle_generic_args(p, null, 0, ga, @len)
@@ -7004,6 +7048,7 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
             p.error = 1
             return null
         cur = cur.next
+    tn_note_args(p, ga)   # AGAST #4171: a call, not a comparison
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
@@ -7991,6 +8036,7 @@ fn nd_payload_reject(fields: *StructField, line: i32, col: i32)
 # `Name` + an indented field block (AGAST #1797): the fields are the payload.
 pub fn enum_variant_record_struct(p: *Parser, name: *u8, len: i32, fields: *StructField, line: i32, col: i32) -> i32
     nd_payload_reject(fields, line, col)
+    tn_note_fields(p, fields)   # AGAST #4171
     return enum_variant_record_impl(p, name, len, ENUM_VARIANT_STRUCT, fields, 0, 0, 0, line, col)
 
 # `Name = N` / `Name = -N` (LANGUAGE_SPEC §10.4): a unit variant with an
@@ -8530,6 +8576,7 @@ pub fn postfix_generic_call_ref(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     op.args = args
     # "$ref_" + type_name (an alias spelled as its target, #2037).
     var len: i32 = 0
+    tn_note_tok(p, type_tok)   # AGAST #4171
     op.call_type_suffix = generic_tok_suffix(p, c"ref_", 4, type_tok, @len)
     op.call_type_suffix_len = len
     op.next = null

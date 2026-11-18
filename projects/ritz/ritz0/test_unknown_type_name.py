@@ -68,6 +68,15 @@ REFUSED = {
     "struct_lit_empty": "fn f() -> i32\n    let a = ^Nope {}\n    0\n",
     "struct_lit_variant": "enum Msg\n    Log\n        level: i32\n    Stop\n\n"
     "fn g(m: Msg) -> i32\n    0\n\nfn f() -> i32\n    g(^Log { level: 4 })\n",
+    # AGAST #4171: a struct-style variant's field (no StructDef to walk) and
+    # a generic call's type argument (a bare token, never a type_spec).
+    "variant_field": "enum E\n    A\n        x: ^Nope\n    B\n",
+    "variant_field_ptr": "enum E\n    A\n        a: i32\n        x: *^Nope\n    B\n",
+    "generic_call": "fn g<T>(x: i64) -> i64\n    x\n\nfn f() -> i64\n    g<^Nope>(3)\n",
+    "generic_call_ptr": "fn g<T>(x: *T) -> i32\n    0\n\nfn f(p: *u8) -> i32\n    g<*^Nope>(null)\n",
+    "generic_call_ref": "fn g<T>(x: @T) -> i32\n    0\n\nfn f(p: @i32) -> i32\n    g<@^Nope>(p)\n",
+    "generic_call_array": "fn g<T>(x: i64) -> i64\n    x\n\nfn f() -> i64\n    g<[2]^Nope>(3)\n",
+    "generic_call_list":"fn g<T, U>(x: i64) -> i64\n    x\n\nfn f() -> i64\n    g<i32, *^Nope>(3)\n",
 }
 
 ROWS = [(c, site) for c in COMPILERS for site in sorted(REFUSED)]
@@ -108,6 +117,7 @@ KNOWN = (
     # after it must not inherit it (the gate's first false positive).
     "    fn at(self: @&Box<T>) -> @&T\n        @&self.v\n\n"
     "struct Cb\n    f: fn(i64) -> i64\n\n"
+    "enum CbE\n    V\n        f: fn(i64) -> i64\n    W\n\n"
     "fn raw(p: *u8) -> *u8\n    p\n\n"
     "impl Later\n    fn me(self: *Self) -> *Self\n        self\n\n"
     "fn first<T>(x: *T) -> T\n    let y: T = *x\n    y\n\n"
@@ -119,6 +129,10 @@ KNOWN = (
     "impl<T> Wrap<T>\n    fn raw(self: *Wrap<T>) -> *u8\n"
     "        let q: *Option<*T> = null\n        self as *Wrap<T> as *u8\n\n"
     "fn second<T>(x: *T) -> *u8\n    x as *Option<T> as *u8\n\n"
+    # AGAST #4171: a struct-style variant's fields, and a generic call's
+    # type argument naming the caller's own `T`.
+    "enum Shape<T>\n    Pt\n        x: *T\n        l: *Later\n    Nil\n\n"
+    "fn third<T>(x: *T) -> T\n    first<T>(x)\n\n"
     # A comparison after a cast: `b` and `c` are values, not `Id<b, c>`.
     "fn two(x: bool, y: bool) -> i32\n    0\n\n"
     "fn cmp(a: i32, b: i32, c: i32, d: i32) -> i32\n    two(a as Id < b, c > d)\n\n"
