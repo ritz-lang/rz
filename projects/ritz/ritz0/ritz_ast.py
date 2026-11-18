@@ -340,10 +340,16 @@ class QualifiedIdent(Expr):
 
 @dataclass
 class BinOp(Expr):
-    """Binary operation: a + b, a && b, etc."""
+    """Binary operation: a + b, a && b, etc.
+
+    `a +% b` is `BinOp('+', wrapping=True)`, and so for `-%` and `*%` (LARB
+    R63, AGAST #3485): every rule for `+` applies to it, and the few that
+    differ (a wider slot doesn't widen it; it needs integers) read the flag.
+    """
     op: str
     left: Expr
     right: Expr
+    wrapping: bool = False
 
 
 @dataclass

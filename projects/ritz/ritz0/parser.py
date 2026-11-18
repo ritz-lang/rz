@@ -172,6 +172,13 @@ def resolve_type_name(name: str) -> str:
     return TYPE_NAME_SYNONYMS.get(name, name)
 
 
+# LARB R63 (#3485): `+%` `-%` `*%` and their `op=` forms are their plain
+# operator with `wrapping=True` (ritz_ast.BinOp).
+_WRAPPING_OPS = {TokenType.PLUSPCT: '+', TokenType.MINUSPCT: '-', TokenType.STARPCT: '*'}
+_WRAPPING_ASSIGN_OPS = {TokenType.PLUSPCTEQ: '+', TokenType.MINUSPCTEQ: '-',
+                        TokenType.STARPCTEQ: '*'}
+
+
 class Parser:
     """
     Parser for Ritz source code.
@@ -915,7 +922,10 @@ class Parser:
         TokenType.RSHIFT: 8,     # >>
         TokenType.PLUS: 9,       # +
         TokenType.MINUS: 9,      # -
+        TokenType.PLUSPCT: 9,    # +% (wrapping, LARB R63)
+        TokenType.MINUSPCT: 9,   # -%
         TokenType.STAR: 10,      # *
+        TokenType.STARPCT: 10,   # *%
         TokenType.SLASH: 10,     # /
         TokenType.PERCENT: 10,   # %
         # Ranges bind loosest of all the binary operators (as in Rust), so
@@ -972,7 +982,11 @@ class Parser:
                 left = rast.Range(left.span, left, right, True)  # inclusive=True
             else:
                 right = self.parse_expr(prec)
-                left = rast.BinOp(left.span, op_tok.value, left, right)
+                wrap_op = _WRAPPING_OPS.get(op_tok.type)
+                if wrap_op is not None:
+                    left = rast.BinOp(left.span, wrap_op, left, right, wrapping=True)
+                else:
+                    left = rast.BinOp(left.span, op_tok.value, left, right)
 
         return left
 
@@ -1816,9 +1830,14 @@ class Parser:
 
         # Check for assignment
         if self._at(TokenType.EQ, TokenType.PLUSEQ, TokenType.MINUSEQ,
-                    TokenType.STAREQ, TokenType.SLASHEQ):
+                    TokenType.STAREQ, TokenType.SLASHEQ, *_WRAPPING_ASSIGN_OPS):
             op_tok = self._advance()
             value = self.parse_expr()
+            wrap_op = _WRAPPING_ASSIGN_OPS.get(op_tok.type)
+            if wrap_op is not None:
+                # `x +%= y` is `x = x +% y`.
+                value = rast.BinOp(span, wrap_op, expr, value, wrapping=True)
+                return rast.AssignStmt(span, expr, value, wrap_op)
             if op_tok.type != TokenType.EQ:
                 # Desugar += to = ... + ...
                 op = {

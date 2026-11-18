@@ -2178,6 +2178,35 @@ let x: u8 = 200
 let y = x + 300
 ```
 
+#### Wrapping operators
+
+`+%`, `-%` and `*%` add, subtract and multiply, wrapping on overflow at their
+operands' type (LARB R63). Write them where wrapping is the point: hashes, crypto
+rounds, PRNGs. Each has an `op=` form: `x +%= y` is `x = x +% y`. They bind as
+`+`, `-` and `*` do, and type as `+` does (R21): the operands and the result are
+the operand type, and a literal takes the other operand's type. Unlike `+`, they
+aren't widened by a wider slot: `let w: u16 = a +% b` with `a, b: u8` wraps at 8
+bits, as you asked. They take integers only, so a float or a pointer operand is
+an error.
+
+```ritz body
+let a: u8 = 200
+let b: u8 = 100
+let s = a +% b                     # 44, a u8
+let w: u16 = a +% b                # 44: a wider slot doesn't widen it
+let d = b -% a                     # 156
+var h: u32 = 2166136261
+h = (h ^ 97) *% 16777619           # one FNV-1a step
+h +%= 1
+let k: i32 = 2147483647
+let m = k +% 1                     # -2147483648
+```
+
+```ritz expect-error="`+%` wraps an integer, and `f64` isn't one"
+fn f(x: f64) -> f64
+    x +% 1.0
+```
+
 #### `f32` meeting `f64`
 
 When an `f32` and an `f64` meet in `+ - * / %`, the `f32` widens to `f64`

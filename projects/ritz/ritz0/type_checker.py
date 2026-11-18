@@ -670,6 +670,15 @@ class TypeChecker:
                           expr.right.span)
             return rast.NamedType(expr.span, 'bool', [])
 
+        # `+%` `-%` `*%` (LARB R63, AGAST #3485) wrap an integer: otherwise
+        # typed as `+` is, below.  Refused on every compile, like a slot error.
+        if expr.wrapping:
+            for side in (left_type, right_type):
+                if not self._is_int_or_opaque(side):
+                    self._slot_error(f"`{expr.op}%` wraps an integer, and "
+                                     f"`{self._type_str(side)}` isn't one", expr.span)
+                    return side
+
         # Arithmetic operators
         if expr.op in ('+', '-', '*', '/', '%'):
             # Pointer/reference arithmetic: ptr + int or ptr - int

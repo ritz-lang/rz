@@ -11622,6 +11622,10 @@ class LLVMEmitter:
             node = stack.pop()
             if isinstance(node, rast.Grouped):
                 stack.append(node.expr)
+            elif isinstance(node, rast.BinOp) and node.wrapping:
+                # `+%` asked to wrap at its operand type (LARB R63, #3485): the
+                # slot doesn't widen it, or anything below it, as for a cast.
+                self._slot_arith[id(node)] = None
             elif isinstance(node, rast.BinOp) and node.op in self._SLOT_ARITH_OPS:
                 self._slot_arith[id(node)] = shape
                 stack.append(node.left)

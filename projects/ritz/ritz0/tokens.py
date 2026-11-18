@@ -101,6 +101,13 @@ class TokenType(Enum):
     MINUSEQ = auto()       # -=
     STAREQ = auto()        # *=
     SLASHEQ = auto()       # /=
+    # Wrapping arithmetic and its op= forms (LARB R63, AGAST #3485).
+    PLUSPCT = auto()       # +%
+    MINUSPCT = auto()      # -%
+    STARPCT = auto()       # *%
+    PLUSPCTEQ = auto()     # +%=
+    MINUSPCTEQ = auto()    # -%=
+    STARPCTEQ = auto()     # *%=
     COLONCOLON = auto()    # ::
     LSHIFT = auto()        # <<
     RSHIFT = auto()        # >>

@@ -623,6 +623,17 @@ class Lexer:
         if ch == '|' and next_ch == '|':
             self._advance()
             return Token(TokenType.PIPEPIPE, '||', start_span)
+        # `+%` `-%` `*%` and `+%=` `-%=` `*%=`: wrapping arithmetic (LARB R63,
+        # AGAST #3485).  `%` is never a prefix, so `a +% b` can't mean `a + %b`.
+        if ch in '+-*' and next_ch == '%':
+            self._advance()
+            if self._peek() == '=':
+                self._advance()
+                kind = {'+': TokenType.PLUSPCTEQ, '-': TokenType.MINUSPCTEQ,
+                        '*': TokenType.STARPCTEQ}[ch]
+                return Token(kind, ch + '%=', start_span)
+            kind = {'+': TokenType.PLUSPCT, '-': TokenType.MINUSPCT, '*': TokenType.STARPCT}[ch]
+            return Token(kind, ch + '%', start_span)
         if ch == '+' and next_ch == '=':
             self._advance()
             return Token(TokenType.PLUSEQ, '+=', start_span)

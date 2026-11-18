@@ -2097,7 +2097,8 @@ class Monomorphizer:
         elif isinstance(expr, rast.BinOp):
             return rast.BinOp(expr.span, expr.op,
                              self._specialize_expr(expr.left, subst),
-                             self._specialize_expr(expr.right, subst))
+                             self._specialize_expr(expr.right, subst),
+                             wrapping=expr.wrapping)
         elif isinstance(expr, rast.UnaryOp):
             return rast.UnaryOp(expr.span, expr.op,
                                self._specialize_expr(expr.operand, subst))
@@ -2402,7 +2403,8 @@ class Monomorphizer:
         elif isinstance(expr, rast.BinOp):
             return rast.BinOp(expr.span, expr.op,
                              self._rewrite_expr(expr.left),
-                             self._rewrite_expr(expr.right))
+                             self._rewrite_expr(expr.right),
+                             wrapping=expr.wrapping)
         elif isinstance(expr, rast.UnaryOp):
             return rast.UnaryOp(expr.span, expr.op,
                                self._rewrite_expr(expr.operand))
