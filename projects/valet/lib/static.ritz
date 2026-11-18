@@ -17,6 +17,8 @@ import ritzlib.str
 import ritzlib.fs
 import ritzlib.memory
 import ritzlib.fmt
+import ritzlib.option
+import ritzlib.strview { StrView, strview_from_ptr, strview_parse_i64 }
 
 import lib.log
 
@@ -159,23 +161,28 @@ pub const RANGE_IGNORE: i32 = 0          # no usable Range: serve the whole file
 pub const RANGE_OK: i32 = 1              # serve start..end (206)
 pub const RANGE_UNSATISFIABLE: i32 = 2   # no byte of the file is in it (416)
 
-# Positions past this are past the end of any file; parsing stops growing
-# them there instead of overflowing an i64 into a negative offset.
-const RANGE_POS_CAP: i64 = 100000000000000000
+# A position one past i64::MAX saturates to it: past the end of any file.
+const RANGE_POS_MAX: i64 = 9223372036854775807
 
 
 # Parse a decimal Range position from range_hdr[*pos .. stop), advancing
-# *pos.  Returns -1 on a non-digit; values above RANGE_POS_CAP are capped.
+# *pos to `until` or `stop`.  Returns -1 for an empty field or one with a
+# non-digit (a sign included: strview_parse_i64 takes one, a Range does
+# not); a value past i64::MAX is RANGE_POS_MAX (AGAST #4037).
 fn range_number(range_hdr: *u8, pos: *i32, stop: i32, until: u8) -> i64
-    var v: i64 = 0
+    let begin: i32 = *pos
     while *pos < stop and *(range_hdr + *pos) != until
         let c: u8 = *(range_hdr + *pos)
         if c < '0' or c > '9'
             return -1
-        if v <= RANGE_POS_CAP
-            v = v * 10 + (c - '0') as i64
         *pos = *pos + 1
-    return v
+    if *pos == begin
+        return -1
+    let field: StrView = strview_from_ptr(range_hdr + begin, (*pos - begin) as i64)
+    # Digits only, so None here is out of range.
+    match strview_parse_i64(field)
+        Some(v) => v
+        None => RANGE_POS_MAX
 
 
 # Parse Range header value: "bytes=start-end" or "bytes=start-" or "bytes=-suffix"

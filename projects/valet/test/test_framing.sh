@@ -204,6 +204,29 @@ expect "open-ended Range in the file is 206" "$OUT" "^HTTP/1.1 206 " "Content-Le
 OUT="$(client 'GET /static/range.txt HTTP/1.1\r\nHost: x\r\nRange: bytes=10-1000\r\nConnection: close\r\n\r\n')"
 expect "Range end clamped to the file" "$OUT" "^HTTP/1.1 206 " "Content-Length: 10" "Content-Range: bytes 10-19/20"
 
+echo "=== Test 11: /bytes/:n counts ==="
+# n parses through strview_parse_i64 and is range-checked (AGAST #4037). An
+# i64-sized count used to overflow the 15-byte parameter buffer and come
+# back as "Missing byte count".
+bytes_ok() {
+    OUT="$(client "GET /bytes/$1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")"
+    expect "/bytes/$1 is 200" "$OUT" "^HTTP/1.1 200 " "Content-Length: $2"
+}
+bytes_bad() {
+    OUT="$(client "GET /bytes/$1 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")"
+    expect "/bytes/$1 is 400" "$OUT" "^HTTP/1.1 400 " "Bad byte count"
+}
+bytes_ok 0 0
+bytes_ok 3500 3500
+bytes_ok 000000000000000000007 7
+bytes_bad 3501
+bytes_bad 9223372036854775807
+bytes_bad 9223372036854775808
+bytes_bad -9223372036854775808
+bytes_bad -1
+bytes_bad +5
+bytes_bad 12a
+
 if ! kill -0 "$SERVER_PID" 2>/dev/null; then
     fail "server exited during the run"
 fi
