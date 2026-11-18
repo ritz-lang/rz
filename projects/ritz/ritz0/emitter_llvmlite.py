@@ -6580,7 +6580,7 @@ class LLVMEmitter:
                     self._emit_drop_for_all_scopes(exclude_var)
                     self.builder.ret(ir.Constant(ret_type, 0))
                     return fn
-                if fn_def.ret_type is not None:
+                if self._declares_value(fn_def):
                     self._reject_enum_as_int(
                         last_val, ret_type, fn_def.ret_type,
                         getattr(fn_def.body.expr, 'span', None))
@@ -6596,7 +6596,7 @@ class LLVMEmitter:
                 # store one beside `_ => pass`) isn't converted into the
                 # dummy return, which refused it as "bool as an integer"
                 # (AGAST #3491).
-                if fn_def.ret_type is None and last_val.type == self.i1:
+                if not self._declares_value(fn_def) and last_val.type == self.i1:
                     self._emit_drop_for_all_scopes(exclude_var)
                     self.builder.ret(ir.Constant(ret_type, 0))
                     return fn
@@ -6607,7 +6607,7 @@ class LLVMEmitter:
                 # struct-valued tail (e.g. `self.entries.pop()`) was emitted
                 # as `ret %Struct` in an i32 function — invalid IR (AGAST
                 # #1321, angelo cache.ritz evict_lru).
-                if fn_def.ret_type is None and last_val.type != ret_type:
+                if not self._declares_value(fn_def) and last_val.type != ret_type:
                     self._emit_drop_for_all_scopes(exclude_var)
                     self.builder.ret(ir.Constant(ret_type, 0))
                 else:
