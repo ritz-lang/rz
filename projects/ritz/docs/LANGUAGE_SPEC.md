@@ -6270,6 +6270,21 @@ Both compilers emit a naked function as LLVM `naked noinline`: its `asm`
 blocks, then `unreachable`. It is never inlined, because the block's own `ret`
 would return from the caller.
 
+A generic function may be `[[naked]]`; every instance of it is naked. The
+`asm` is the same text for each instance, so it must suit every type the
+function is instantiated at.
+
+```ritz
+[[naked]]
+fn ident<T>(a: T) -> T
+    asm x86_64:
+        movq %rdi, %rax
+        retq
+
+fn use_ident() -> i64
+    ident(7)
+```
+
 ### 17.6 Inlining Attributes
 
 `[[inline]]` asks for a function to be inlined, `[[always_inline]]`

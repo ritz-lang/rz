@@ -69,7 +69,7 @@ def _run(compiler: str, tmp_path: Path, src: str, opt: str = "-O0") -> int:
     exe = tmp_path / f"t_{compiler}"
     link_cmd = ["clang", "-Wno-override-module", opt, str(ll), "-o", str(exe),
                 "-nostdlib", "-no-pie"]
-    if compiler == "ritz1":
+    if compiler in ("ritz1", "ritz1_selfhosted"):
         link_cmd.insert(1, str(RITZ_START))
     link = fast_link.clang(link_cmd, capture_output=True, text=True)
     assert link.returncode == 0, f"{compiler} IR did not link:\n{link.stderr[-2000:]}"
@@ -638,3 +638,54 @@ def test_ritz1_naked_has_no_prologue_and_runs_at_O2(ritz1_bin, tmp_path):
     assert "alloca" not in body and "store" not in body, body
     assert "unreachable" in body, body
     assert _run("ritz1", tmp_path, NAKED, "-O2") == 42
+
+
+# AGAST #3633: a generic `[[naked]]` fn's instances are naked too (§17.5).
+# ritz1's fn_copy_instance_attrs copied only callconv / test_helper / must_use
+# and the inline family (#1961), so `nk$i64` was checked and emitted as an
+# ordinary fn: "can reach its end without producing a value".
+GENERIC_NAKED = """\
+[[naked]]
+fn nk<T>(a: T) -> T
+    asm x86_64:
+        movq %rdi, %rax
+        retq
+
+fn main() -> i32
+    nk(42) as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+def test_naked_reaches_generic_instances(request, tmp_path, compiler):
+    _need(compiler, request)
+    ir = _ir(compiler, tmp_path, GENERIC_NAKED)
+    defs = re.findall(r'^define [^\n]*@"?nk\b[^\n]*\n.*?^}', ir, re.M | re.S)
+    assert len(defs) == 1, f"{compiler}: instances of nk: {defs}"
+    body = defs[0]
+    header = body.splitlines()[0]
+    attrs = header + " ".join(
+        (re.search(rf"^attributes #{g} = \{{(.*)\}}", ir, re.M) or [None, ""])[1]
+        for g in re.findall(r"#(\d+)", header))
+    assert re.search(r"\bnaked\b", attrs) and re.search(r"\bnoinline\b", attrs), header
+    assert "alloca" not in body and "store" not in body, body
+    assert "unreachable" in body, body
+    # Inlined at -O2, the asm's own `ret` would return from main (#1917).
+    assert _run(compiler, tmp_path, GENERIC_NAKED, "-O2") == 42
+
+
+GENERIC_NAKED_NON_ASM = """\
+[[naked]]
+fn nk<T>(a: T) -> T
+    a
+
+fn main() -> i32
+    nk(1) as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
+def test_generic_naked_body_must_be_asm(request, tmp_path, compiler):
+    # The instance is judged as a naked fn, at the template's statement.
+    _need(compiler, request)
+    _assert_located_error(compiler, tmp_path, GENERIC_NAKED_NON_ASM, 3, 5, "naked", "asm")
