@@ -3467,9 +3467,9 @@ pub fn emit_sret_attr(s: *EmitterState, name: *u8, len: i32)
 # the same reason #1730 fixed for returns.  It was also not the C ABI: LLVM
 # splits a first-class aggregate argument into one scalar per leaf, while C
 # passes a large struct in memory.  `ptr byval(%T) align 8` is exactly what
-# clang emits for a C `struct T` param on x86-64 SysV (Ritz structs are at
-# most 8-aligned).  The callee binds the param to the byval pointer, which it
-# owns; the caller spills the argument into a fresh slot right after
+# clang emits for a C `struct T` param on x86-64 SysV (a struct aligned past
+# 8, one of `v4i64`, takes its own alignment: AGAST #3656).  The callee
+# binds the param to the byval pointer, which it owns; the caller spills the argument into a fresh slot right after
 # evaluating it (emit_call_arg), so rewrite_large_struct_copies (#1732)
 # turns that spill into a pointer-to-pointer copy.  Uses the sret threshold,
 # so small structs, tagged enums and primitives keep their ABI.
@@ -3478,11 +3478,18 @@ pub fn param_uses_byval(s: *EmitterState, p: *Param) -> i32
         return 0
     struct_ret_uses_sret(s, p.param_type, p.param_type_name, p.param_type_name_len)
 
-# `ptr byval(%T) align 8` — what the definition, declare and every call carry.
+# `ptr byval(%T) align A` — what the definition, declare and every call
+# carry.  A is 8, or %T's own alignment when that is more: a struct of
+# `v4i64` is 32-aligned, and clang gives an over-aligned C struct its type's
+# alignment (AGAST #3656).  ritz0's _byval_align writes the same A.
 fn emit_byval_attr(s: *EmitterState, name: *u8, len: i32)
     emit_str(s, c"ptr byval(%")
     emit_name(s, name, len)
-    emit_str(s, c") align 8")
+    emit_str(s, c") align ")
+    var a: i64 = get_struct_align_by_name(s, name, len)
+    if a < 8
+        a = 8
+    emit_int(s, a)
 
 # Emit the LLVM type `[N x T]` of a 1-D local array (element struct `name`).
 # The spelling matches emit_var_decl's alloca, so a copy loads and stores
@@ -4962,6 +4969,17 @@ pub fn field_array_size_align(s: *EmitterState, f: *StructField, align: *i64) ->
     return n * elem_size_align(s, sh.leaf_type, sh.leaf_name, sh.leaf_name_len, align)
 
 pub fn elem_size_align(s: *EmitterState, t: i32, name: *u8, name_len: i32, align: *i64) -> i64
+    # AGAST #3656: a SIMD vector (`v4i64`) is `<4 x i64>`.  On x86-64 its
+    # size is rounded up to a power of two and it is aligned to that size
+    # (<4 x i64>: 32, 32), as ritz0's _abi_size_align measures it.  It used
+    # to fall to get_struct_size_by_name's 8/8 for an unresolved name.
+    if t == TYPE_STRUCT and name_len > 0 and is_simd_vector_type_name(name, name_len) == 1
+        let vbytes: i64 = (simd_vector_elem_bits(name, name_len) as i64) * (simd_vector_elem_count(name, name_len) as i64) / 8
+        var vsz: i64 = 1
+        while vsz < vbytes
+            vsz = vsz * 2
+        *align = vsz
+        return vsz
     if t == TYPE_STRUCT and name_len > 0
         *align = get_struct_align_by_name(s, name, name_len)
         return get_struct_size_by_name(s, name, name_len)
@@ -6732,7 +6750,11 @@ pub fn emit_field_llvm_type(s: *EmitterState, f: *StructField)
         emit_str(s, c"[")
         emit_int(s, f.array_size as i64)
         emit_str(s, c" x ")
-        if f.array_elem_type == TYPE_STRUCT
+        if f.array_elem_type == TYPE_STRUCT and is_simd_vector_type_name(f.array_elem_type_name, f.array_elem_type_name_len) == 1
+            # AGAST #3656: `[8]v4i64` is `[8 x <4 x i64>]`; no `%v4i64`
+            # type is declared, so `%v4i64` would not assemble.
+            emit_simd_vector_type(s, f.array_elem_type_name, f.array_elem_type_name_len)
+        else if f.array_elem_type == TYPE_STRUCT
             # Emit struct type reference: %StructName
             emit_str(s, c"%")
             emit_name(s, f.array_elem_type_name, f.array_elem_type_name_len)

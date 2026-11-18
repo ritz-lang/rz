@@ -255,7 +255,8 @@ BYVAL_MAX_BYTES = 1 << 32
 # sret this IS an ABI change (a first-class aggregate arg is split into one
 # scalar per leaf), so both compilers changed together.
 #
-#   * _new_function: the physical param is a pointer with byval + align 8;
+#   * _new_function: the physical param is a pointer with byval + align 8
+#     (the struct's own alignment when more, AGAST #3656, _byval_align);
 #     _fn_param_types still answers the logical %T.
 #   * _SretAwareBuilder.call: a %T arg is passed as a pointer to its bytes:
 #     the load's own source when nothing since the load can write memory
@@ -377,11 +378,14 @@ def frame_too_large(fn_name: str, fn: ir.Function, limit: int = FRAME_LIMIT_BYTE
 
 
 def _byval_align(ty: ir.Type) -> int:
-    """The `align` of a byval param of `ty`: 8 for a struct (#1739), the
-    element's natural alignment for an array (#2306)."""
+    """The `align` of a byval param of `ty`: 8 for a struct (#1739), or the
+    struct's own alignment when that is more (a struct of `v4i64` is
+    32-aligned, and clang gives an over-aligned C struct its type's
+    alignment, AGAST #3656); the element's natural alignment for an array
+    (#2306)."""
     if isinstance(ty, ir.ArrayType):
         return _abi_size_align(ty)[1]
-    return BYVAL_ALIGN
+    return max(BYVAL_ALIGN, _abi_size_align(ty)[1])
 
 # An LLVM parameter list, allowing one level of nested parens for typed
 # attributes such as `sret(%T)`. The regexes over `define`/`declare` lines

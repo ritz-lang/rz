@@ -144,6 +144,15 @@ CASES = {
         "    v.a[58] = k\n    v.o = Some((k + 1) as i64)\n    v.b = (k + 2) as u8\n",
         "v.a[58] == k and option_is(v.o, (k + 1) as i64) and v.b == (k + 2) as u8",
     ),
+    # SIMD vector fields (AGAST #3656): `v4i64` is 32 bytes, 32-aligned, so
+    # V is 256 B and byval at align 32.  ritz1 sized a vector field 8/8 and
+    # spelled it `%v4i64`, an undeclared type.
+    "V": (
+        "    a: [8]v4i64\n",
+        256,
+        "    v_set(@v, 0, k as i64)\n    v_set(@v, 31, (k + 1) as i64)\n",
+        "v_get(@v, 0) == k as i64 and v_get(@v, 31) == (k + 1) as i64",
+    ),
 }
 
 HELPERS = """\
@@ -156,6 +165,14 @@ fn option_is(o: Option<i64>, n: i64) -> bool
     match o
         Some(x) => x == n
         None => false
+
+fn v_set(v: *V, i: i32, n: i64)
+    let p: *i64 = v as *i64
+    p[i] = n
+
+fn v_get(v: *V, i: i32) -> i64
+    let p: *i64 = v as *i64
+    p[i]
 """
 
 
@@ -303,7 +320,8 @@ def test_ritz0_layout_walk_matches_llvm(ty):
 
 @pytest.fixture(scope="module")
 def size_table(ritz1_bin, tmp_path_factory):
-    """{compiler: {struct: (LLVM alloc size, passed byval?)}}."""
+    """{compiler: {struct: (LLVM alloc size, passed byval?, byval align,
+    LLVM ABI align)}}."""
     td = llvm.create_target_data(X86_64_DATA_LAYOUT)
     table = {}
     for compiler in COMPILERS:
@@ -312,13 +330,17 @@ def size_table(ritz1_bin, tmp_path_factory):
         ).read_text()
         module = llvm.parse_assembly(text)
         globals_ = {g.name: g for g in module.global_variables}
-        table[compiler] = {
-            n: (
-                td.get_abi_size(globals_[f"g_{n}"].global_value_type),
-                "byval" in _header(text, f"t_{n}"),
+        table[compiler] = {}
+        for n in CASES:
+            ty = globals_[f"g_{n}"].global_value_type
+            header = _header(text, f"t_{n}")
+            m = re.search(r"byval\([^)]*\) align (\d+)", header)
+            table[compiler][n] = (
+                td.get_abi_size(ty),
+                "byval" in header,
+                int(m.group(1)) if m else None,
+                td.get_abi_alignment(ty),
             )
-            for n in CASES
-        }
     return table
 
 
@@ -326,7 +348,7 @@ def size_table(ritz1_bin, tmp_path_factory):
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_struct_sizes_are_the_llvm_alloc_sizes(size_table, compiler):
     """Every compiler lays each struct out as LLVM does on x86-64."""
-    got = {n: size for n, (size, _) in size_table[compiler].items()}
+    got = {n: row[0] for n, row in size_table[compiler].items()}
     assert got == {n: c[1] for n, c in CASES.items()}
 
 
@@ -334,8 +356,20 @@ def test_struct_sizes_are_the_llvm_alloc_sizes(size_table, compiler):
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_byval_iff_alloc_size_reaches_threshold(size_table, compiler):
     """A param is byval exactly when its LLVM alloc size is >= 256 bytes."""
-    got = {n: byval for n, (_, byval) in size_table[compiler].items()}
+    got = {n: row[1] for n, row in size_table[compiler].items()}
     assert got == {n: c[1] >= 256 for n, c in CASES.items()}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_byval_align_is_at_least_the_struct_align(size_table, compiler):
+    """A byval struct is `align max(8, alignof T)`, as clang passes an
+    over-aligned C struct (AGAST #3656): V's 32, not 8."""
+    got = {n: row[2] for n, row in size_table[compiler].items() if row[1]}
+    want = {
+        n: max(8, row[3]) for n, row in size_table[compiler].items() if row[1]
+    }
+    assert got == want
 
 
 @pytest.mark.integration
