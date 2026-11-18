@@ -173,7 +173,7 @@ def test_help_xfails_name_real_binaries():
 
 # --- the stack's own store (AGAST #3065) ---------------------------------------
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_start_adds_env_to_the_inherited_environment(tmp_path, monkeypatch):
     # zeus gets MAUSOLEUM_PORT this way and passes it on to nexus.
     monkeypatch.setenv("SMOKE_INHERITED", "kept")
@@ -224,7 +224,7 @@ def dead_within(pid: int, deadline: float = 2.0) -> bool:
         time.sleep(0.02)
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_dead_within_counts_a_zombie_as_dead():
     # Our own unreaped child is a zombie: kill -0 still says alive (the #3674
     # flake), dead_within must say dead at once.
@@ -240,7 +240,7 @@ def test_dead_within_counts_a_zombie_as_dead():
         p.wait()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_dead_within_reports_a_live_process_after_the_deadline():
     p = subprocess.Popen(["sleep", "60"])
     try:
@@ -251,7 +251,7 @@ def test_dead_within_reports_a_live_process_after_the_deadline():
         p.kill()
         p.wait()
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_stop_kills_the_whole_group(tmp_path):
     procs = ss.Procs(tmp_path)
     # A parent that ignores SIGTERM and a background child: the zeus shape.
@@ -261,7 +261,7 @@ def test_stop_kills_the_whole_group(tmp_path):
     assert procs.survivors() == []
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_kill_all_leaves_nothing(tmp_path):
     procs = ss.Procs(tmp_path)
     for i in range(3):
@@ -271,7 +271,7 @@ def test_kill_all_leaves_nothing(tmp_path):
     assert procs.survivors() == []
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_run_cmd_times_out_and_kills_the_group(tmp_path):
     marker = tmp_path / "child.pid"
     t = time.monotonic()
@@ -282,7 +282,7 @@ def test_run_cmd_times_out_and_kills_the_group(tmp_path):
     assert dead_within(pid), "the hung command's child survived its timeout"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_run_cmd_interrupted_kills_the_group(tmp_path):
     """A SIGTERM to the gate arrives as an exception inside communicate();
     the CLI it was waiting on must not outlive it."""
@@ -306,7 +306,7 @@ def test_run_cmd_interrupted_kills_the_group(tmp_path):
     assert dead_within(pid), "the interrupted command survived"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_wait_listening_rejects_a_process_that_dies(tmp_path):
     procs = ss.Procs(tmp_path)
     p = procs.start("dies", ["sh", "-c", "echo bind failed; exit 3"], tmp_path)

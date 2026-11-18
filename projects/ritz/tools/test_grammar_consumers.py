@@ -70,6 +70,7 @@ def unconsumed_grammars(root, files):
     return orphans
 
 
+@pytest.mark.integration
 def test_every_grammar_has_a_consumer():
     assert unconsumed_grammars(RITZ, tracked_files(RITZ)) == []
 

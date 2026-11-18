@@ -434,7 +434,7 @@ def test_run_file_builds_when_every_flag_is_present(tmp_path, name):
         matrix.run_file(name, "ritz0", "/nonexistent", deps, {}, tmp_path)
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_harness_lowers_and_runs_under_ritz0(tmp_path):
     """End to end on ritz0: every fn is selected, a failing fn's code is its own,
     and an i32 of 256 does not exit 0."""

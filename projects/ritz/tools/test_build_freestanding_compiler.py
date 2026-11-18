@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 PKG_DIR = Path(__file__).resolve().parents[1]
 
 # Records argv plus RITZ_PATH, then either fails or writes a trivial IR module
@@ -140,7 +142,6 @@ def _text(capsys):
 # --- the acceptance test from the ticket -----------------------------------
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 def test_failing_ritz1_fails_the_freestanding_build(
     buildpy, stubs, fs_pkg, monkeypatch, capsys, compiler
@@ -157,7 +158,6 @@ def test_failing_ritz1_fails_the_freestanding_build(
     assert "ritz0 failed" not in text
 
 
-@pytest.mark.unit
 def test_ritz1_command_matches_hosted_path(buildpy, stubs, fs_pkg, monkeypatch):
     # Same CLI shape as compile_binary: `<bin> <src> -o <ll> -I <ROOT> --dep ...`, with
     # RITZ_PATH carrying ROOT and ROOT.parent. No ritz0-only flags.
@@ -185,7 +185,6 @@ def test_ritz1_command_matches_hosted_path(buildpy, stubs, fs_pkg, monkeypatch):
     ]
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 def test_ritz1_is_passed_target_os(
     buildpy, stubs, fs_pkg_target_os, monkeypatch, capsys, compiler
@@ -208,7 +207,6 @@ def test_ritz1_is_passed_target_os(
     assert "does not support freestanding target_os" not in text
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("compiler", ["ritz1", "ritz1_selfhosted"])
 def test_ritz1_failure_with_target_os_still_fails(
     buildpy, stubs, fs_pkg_target_os, monkeypatch, capsys, compiler
@@ -219,7 +217,6 @@ def test_ritz1_failure_with_target_os_still_fails(
     assert f"✗ {compiler} failed for 1 source file" in _text(capsys)
 
 
-@pytest.mark.unit
 def test_missing_ritz1_binary_fails(buildpy, stubs, fs_pkg, monkeypatch, capsys):
     stubs.set_ritz1(fail=False, exists=False)
     rc = _build(buildpy, monkeypatch, fs_pkg, "ritz1")
@@ -233,7 +230,6 @@ def test_missing_ritz1_binary_fails(buildpy, stubs, fs_pkg, monkeypatch, capsys)
 # --- ritz0 unchanged --------------------------------------------------------
 
 
-@pytest.mark.unit
 def test_ritz0_freestanding_command_unchanged(
     buildpy, stubs, fs_pkg_target_os, monkeypatch
 ):
@@ -248,7 +244,6 @@ def test_ritz0_freestanding_command_unchanged(
     assert argv[argv.index("--target-os") + 1] == "harland"
 
 
-@pytest.mark.unit
 def test_ritz0_failure_still_fails(buildpy, stubs, fs_pkg, monkeypatch, capsys):
     stubs.set_ritz0(fail=True)
     rc = _build(buildpy, monkeypatch, fs_pkg, "ritz0")

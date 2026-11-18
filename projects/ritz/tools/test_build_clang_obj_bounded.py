@@ -158,7 +158,7 @@ def _gone(pid: int) -> bool:
         return True
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_gone_treats_a_pid_reaped_between_open_and_read_as_gone(monkeypatch):
     # #3152: a process reaped after open() of /proc/<pid>/stat but before
     # read() makes read() raise ProcessLookupError (ESRCH). Pin that window:
@@ -179,7 +179,7 @@ def test_gone_treats_a_pid_reaped_between_open_and_read_as_gone(monkeypatch):
 # --- the acceptance tests from the ticket ----------------------------------
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_passing_o2_compile_succeeds_with_zero_failures(buildpy, fake_clang, pkg,
                                                         monkeypatch, capsys):
     rc = _build(buildpy, monkeypatch, pkg)
@@ -188,7 +188,7 @@ def test_passing_o2_compile_succeeds_with_zero_failures(buildpy, fake_clang, pkg
     assert buildpy.CLANG_OBJ_FAILURES == 0
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_failing_o2_compile_fails_the_build_loudly(buildpy, fake_clang, pkg,
                                                    monkeypatch, capsys):
     fake_clang.mode("fail")
@@ -208,7 +208,7 @@ def test_failing_o2_compile_fails_the_build_loudly(buildpy, fake_clang, pkg,
     assert "Linking" not in text, "a failed object compile must stop before the link"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_clang_crash_report_shows_the_cause_not_just_stack_frames(
         buildpy, fake_clang, pkg, monkeypatch, capsys):
     """AGAST #1736: CI showed only the last 20 stack frames of a clang crash,
@@ -227,7 +227,7 @@ def test_clang_crash_report_shows_the_cause_not_just_stack_frames(
     assert text.count("libLLVM.so.21.1") < 40, "should not dump every stack frame"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_o2_timeout_fires_and_kills_the_process_group(buildpy, fake_clang, pkg,
                                                       monkeypatch, capsys):
     fake_clang.mode("sleep")
@@ -264,7 +264,7 @@ def test_o2_timeout_fires_and_kills_the_process_group(buildpy, fake_clang, pkg,
     assert _gone(grandchild), "timed-out clang's child still running (group not killed)"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_o2_compile_is_address_space_capped(buildpy, fake_clang, pkg,
                                             monkeypatch, capsys):
     fake_clang.mode("hog")

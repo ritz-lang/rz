@@ -187,7 +187,7 @@ def _build(buildpy, monkeypatch, pkg, *extra):
     return buildpy.main() or 0  # the link outcome (no ld.lld here?) is irrelevant
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_second_freestanding_build_compiles_nothing(buildpy, ritz0, tmp_path, monkeypatch):
     pkg = _pkg(tmp_path)
@@ -199,7 +199,7 @@ def test_second_freestanding_build_compiles_nothing(buildpy, ritz0, tmp_path, mo
     assert buildpy.cas.STATS.hits >= 1
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_a_hit_puts_the_stored_object_where_the_link_reads_it(
         buildpy, ritz0, tmp_path, monkeypatch, private_store):
@@ -214,7 +214,7 @@ def test_a_hit_puts_the_stored_object_where_the_link_reads_it(
     assert kept[0].read_bytes() == stored[0].read_bytes()
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_editing_the_source_recompiles(buildpy, ritz0, tmp_path, monkeypatch):
     pkg = _pkg(tmp_path)
@@ -224,7 +224,7 @@ def test_editing_the_source_recompiles(buildpy, ritz0, tmp_path, monkeypatch):
     assert ritz0.calls == 2
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_target_os_is_part_of_the_key(buildpy, ritz0, tmp_path, monkeypatch):
     # [[target_os]] conditional compilation: the same source is a different
@@ -234,7 +234,7 @@ def test_target_os_is_part_of_the_key(buildpy, ritz0, tmp_path, monkeypatch):
     assert ritz0.calls == 2
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_clang_object_flags_are_part_of_the_key(buildpy, ritz0, tmp_path, monkeypatch):
     _build(buildpy, monkeypatch, _pkg(tmp_path))
@@ -242,7 +242,7 @@ def test_clang_object_flags_are_part_of_the_key(buildpy, ritz0, tmp_path, monkey
     assert ritz0.calls == 2
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_a_hosted_object_of_the_same_source_is_not_reused(
         buildpy, ritz0, tmp_path, monkeypatch):
@@ -254,7 +254,7 @@ def test_a_hosted_object_of_the_same_source_is_not_reused(
     assert ritz0.calls == 2, "a hosted (-O2, no --target) object was linked into a kernel"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_a_failed_compile_fails_the_build_and_is_not_stored(
         buildpy, ritz0, tmp_path, monkeypatch, capsys):
@@ -268,7 +268,7 @@ def test_a_failed_compile_fails_the_build_and_is_not_stored(
     assert [f[2] for f in buildpy.cas.STATS.failed] == ["ext/kern.ritz"] * 2
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_clang
 def test_no_cache_always_compiles(buildpy, ritz0, tmp_path, monkeypatch):
     pkg = _pkg(tmp_path)

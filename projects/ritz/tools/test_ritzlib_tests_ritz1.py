@@ -16,6 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import ci_local
+import pytest
 
 RITZ = Path(__file__).resolve().parent.parent
 TARGET = "ritzlib-tests-ritz1"
@@ -37,6 +38,7 @@ def test_bootstrap_job_runs_the_target_after_both_compilers_are_built():
     assert runs.index("make ritz1-bootstrap") < runs.index(f"make {TARGET}")
 
 
+@pytest.mark.integration
 def test_target_runs_ritzlib_tests_under_both_ritz1_compilers():
     # A dry run shows what the target would execute: one `rz test` of
     # ritz/ritzlib/tests per compiler, and never ritz0's default (the train's

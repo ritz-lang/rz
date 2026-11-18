@@ -74,7 +74,7 @@ print(path.read_bytes().decode(), built)
 """
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_concurrent_processes_on_one_key_build_once(tmp_path, private_store):
     builds = tmp_path / "builds"
     go = tmp_path / "go"

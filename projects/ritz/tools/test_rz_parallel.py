@@ -169,6 +169,7 @@ class TestRunPool:
         rz.run_pool(2, [_unit(rz, "root", (0,))], on_done)
         assert sorted(seen) == ["child0", "child1", "child2", "child3", "root"]
 
+    @pytest.mark.integration
     def test_unit_captures_stdout_and_stderr_in_order(self, rz):
         # One pipe carries both streams, so their order is the child's. The
         # child is hermetic (AGAST #3632): -I -S and a bare environment, so

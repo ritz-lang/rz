@@ -143,7 +143,7 @@ c.save()
 """
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_concurrent_processes_all_land(tmp_path):
     """Eight processes building at once, as regression.sh's pool does."""
     names = [f"m{i}" for i in range(8)]

@@ -44,12 +44,14 @@ def bin_paths() -> list[tuple[str, str, str]]:
     return out
 
 
+@pytest.mark.integration
 def test_walk_finds_path_bins():
     # Guard the walk: an empty list would pass the real test vacuously.
     names = {(m, n) for m, n, _ in bin_paths()}
     assert ("projects/ritz/ritz.toml", "ritz0") in names
 
 
+@pytest.mark.integration
 def test_every_bin_path_is_a_tracked_file():
     tracked = set(_tracked())
     missing = [f"{m}: [[bin]] {n} -> {p}" for m, n, p in bin_paths()

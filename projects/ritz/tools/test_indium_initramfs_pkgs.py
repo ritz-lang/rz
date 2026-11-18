@@ -112,6 +112,7 @@ def test_consumers_read_the_shared_list(consumer: Path):
         )
 
 
+@pytest.mark.integration
 @pytest.mark.skipif(shutil.which("make") is None, reason="make not installed")
 def test_make_initramfs_builds_and_packs_the_listed_packages():
     out = subprocess.run(

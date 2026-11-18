@@ -468,7 +468,7 @@ def test_main_returns_zero_on_a_good_document(tmp_path):
     assert C.main([str(doc)]) == 0
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_compiler_identity_names_the_reference_compiler():
     """A green run must say what it was green against."""
     identity = C.compiler_identity()
@@ -535,7 +535,7 @@ def test_planted_example_ritz0_accepts_and_ritz1_refuses_fails_the_gate(tmp_path
     assert C.main(["--compiler", "ritz1", str(doc)]) == 1
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ritz1_selfhosted_is_checked_with_its_own_binary(tmp_path, monkeypatch):
     """ritz1 passing must not stand in for ritz1_selfhosted."""
     doc = write(tmp_path, GOOD)
@@ -560,7 +560,7 @@ def test_a_missing_ritz1_binary_is_an_error_not_a_skip(tmp_path, monkeypatch, ca
     assert "ritz1-bootstrap" in capsys.readouterr().err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ritz1_invalid_ir_fails_and_names_ritz1(tmp_path, monkeypatch):
     doc = write(tmp_path, GOOD)
     _fake_ritz1(tmp_path, monkeypatch, "accept", ir=INVALID_IR)
@@ -572,7 +572,7 @@ def test_ritz1_invalid_ir_fails_and_names_ritz1(tmp_path, monkeypatch):
 EXPECT_ERR = '```ritz body expect-error="Expected IDENT, got MUT"\nlet mut s = 1\n```\n'
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ritz1_refusing_an_expect_error_block_in_its_own_words_passes(tmp_path, monkeypatch):
     """ritz0's diagnostic text is not ritz1's; the refusal is what's held."""
     doc = write(tmp_path, EXPECT_ERR)
@@ -581,7 +581,7 @@ def test_ritz1_refusing_an_expect_error_block_in_its_own_words_passes(tmp_path, 
     assert report.failures == [], [r.detail for r in report.failures]
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_ritz1_compiling_an_expect_error_block_fails(tmp_path, monkeypatch):
     doc = write(tmp_path, EXPECT_ERR)
     _fake_ritz1(tmp_path, monkeypatch, "accept")
@@ -590,7 +590,7 @@ def test_ritz1_compiling_an_expect_error_block_fails(tmp_path, monkeypatch):
     assert "COMPILED" in report.failures[0].detail
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("mode", ["crash", "silent"])
 def test_ritz1_crashing_or_silent_on_an_expect_error_block_fails(tmp_path, monkeypatch, mode):
     doc = write(tmp_path, EXPECT_ERR)
@@ -600,7 +600,7 @@ def test_ritz1_crashing_or_silent_on_an_expect_error_block_fails(tmp_path, monke
     assert "not a refusal" in report.failures[0].detail
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @pytest.mark.parametrize("pos, ok", [("2:5", True), ("4:13", False)])
 def test_ritz1_must_point_at_a_pinned_position(tmp_path, monkeypatch, pos, ok):
     """The fake reports :2:5:; a fence pinning another place fails."""
@@ -634,7 +634,7 @@ def _known_for(doc: Path, compiler: str = "ritz1", reason: str = "tracked",
     return kf.entries_for("doc", compiler, [e])
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_known_failure_is_reported_with_its_ticket_and_does_not_fail(tmp_path, monkeypatch):
     doc = write(tmp_path, GOOD)
     _fake_ritz1(tmp_path, monkeypatch, "refuse")
@@ -643,7 +643,7 @@ def test_a_known_failure_is_reported_with_its_ticket_and_does_not_fail(tmp_path,
     assert [r.known for r in report.known] == ["AGAST #1: tracked"]
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_known_failure_is_per_compiler(tmp_path, monkeypatch):
     """An entry for ritz1 does not excuse ritz1_selfhosted."""
     doc = write(tmp_path, GOOD)
@@ -653,7 +653,7 @@ def test_a_known_failure_is_per_compiler(tmp_path, monkeypatch):
     assert len(report.failures) == 1
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_known_failure_that_now_passes_fails_the_run(tmp_path, monkeypatch):
     doc = write(tmp_path, GOOD)
     _fake_ritz1(tmp_path, monkeypatch, "accept")
@@ -662,7 +662,7 @@ def test_a_known_failure_that_now_passes_fails_the_run(tmp_path, monkeypatch):
     assert "now passes" in report.failures[0].detail
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_known_failure_matching_no_block_fails_the_run(tmp_path, monkeypatch):
     """An edited block gets a new digest, so its old entry is stale."""
     doc = write(tmp_path, GOOD)
@@ -684,7 +684,7 @@ def test_digest_ignores_position_but_not_content_or_fence(tmp_path):
     assert a.digest != c.digest
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_known_failure_that_now_passes_names_the_file_to_delete_it_from(tmp_path, monkeypatch):
     doc = write(tmp_path, GOOD)
     _fake_ritz1(tmp_path, monkeypatch, "accept")
@@ -693,7 +693,7 @@ def test_a_known_failure_that_now_passes_names_the_file_to_delete_it_from(tmp_pa
     assert "known-failures/3929.toml" in report.failures[0].detail
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_a_synthetic_xpass_in_the_checked_in_format_fails_the_run(tmp_path, monkeypatch):
     """End to end through the real loader (RITZ_KNOWN_FAILURES): with no
     `known` argument the run reads the directory, and a listed block that
@@ -731,7 +731,7 @@ def test_bootstrap_job_checks_doc_examples_under_ritz1_after_the_build():
     assert "make check-doc-examples" in runs  # ritz0's run stays
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_doc_target_checks_the_same_docs_under_both_ritz1_compilers():
     import subprocess
 

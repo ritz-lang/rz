@@ -89,7 +89,7 @@ def _text(capsys):
     return out.out + out.err
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_missing_lld_link_exits_with_the_setup_code(buildpy, tmp_path, monkeypatch, capsys):
     pkg = _make_pkg(tmp_path, [("bootx64", "boot", "x86_64-unknown-uefi")])
     rc = _build(buildpy, monkeypatch, pkg)
@@ -100,7 +100,7 @@ def test_missing_lld_link_exits_with_the_setup_code(buildpy, tmp_path, monkeypat
     assert "SETUP ERROR" in text and "bootx64" in text
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_setup_miss_does_not_mask_a_real_failure(buildpy, tmp_path, monkeypatch, capsys):
     pkg = _make_pkg(tmp_path, [("bootx64", "boot", "x86_64-unknown-uefi"),
                                ("kern", "broken", "x86_64-unknown-uefi")])

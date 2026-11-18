@@ -114,6 +114,7 @@ def built42(pkg):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_repro_a_content_change_with_older_mtime_rebuilds(built42):
     """REPRO A (verbatim): cp -p / tar -x / git ops leave an older mtime."""
     sh("sed -i 's/return 42/return 7/' src/main.ritz", built42)
@@ -122,6 +123,7 @@ def test_repro_a_content_change_with_older_mtime_rebuilds(built42):
     assert run_exit(built42) == 7
 
 
+@pytest.mark.integration
 def test_repro_b_equal_mtime_same_second_edit_rebuilds(built42):
     """REPRO B (verbatim): a source edited in the same second as the link.
 
@@ -134,6 +136,7 @@ def test_repro_b_equal_mtime_same_second_edit_rebuilds(built42):
     assert run_exit(built42) == 99
 
 
+@pytest.mark.integration
 def test_repro_b_exactly_equal_nanosecond_mtime_rebuilds(built42):
     """REPRO B, strict form: source mtime identical to the binary's, to the ns."""
     set_return(built42, 13)
@@ -143,6 +146,7 @@ def test_repro_b_exactly_equal_nanosecond_mtime_rebuilds(built42):
     assert run_exit(built42) == 13
 
 
+@pytest.mark.integration
 def test_repro_c_matching_sig_does_not_forgive_binary_built_from_other_content(pkg):
     """REPRO C: the .ritz.sig describes the SOURCE, not the BINARY.
 
@@ -168,6 +172,7 @@ def test_repro_c_matching_sig_does_not_forgive_binary_built_from_other_content(p
     assert run_exit(pkg) == 8
 
 
+@pytest.mark.integration
 def test_control_edit_with_newer_mtime_rebuilds(built42):
     """CONTROL: plain edit (mtime strictly newer) was always caught."""
     set_return(built42, 7)
@@ -182,6 +187,7 @@ def test_control_edit_with_newer_mtime_rebuilds(built42):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_noop_rebuild_is_up_to_date_and_says_so(built42):
     before = binary(built42).stat().st_mtime_ns
     out = build(built42)
@@ -191,6 +197,7 @@ def test_noop_rebuild_is_up_to_date_and_says_so(built42):
     assert "Linking" not in out
 
 
+@pytest.mark.integration
 def test_touch_without_content_change_stays_up_to_date(built42):
     """mtime is only ever a reason to look, never a verdict: a bare touch
     (content identical) must not force a relink."""
@@ -202,6 +209,7 @@ def test_touch_without_content_change_stays_up_to_date(built42):
     assert "up to date" in out
 
 
+@pytest.mark.integration
 def test_real_rebuild_prints_hammer_and_check(built42):
     set_return(built42, 3)
     out = build(built42)
@@ -209,6 +217,7 @@ def test_real_rebuild_prints_hammer_and_check(built42):
     assert run_exit(built42) == 3
 
 
+@pytest.mark.integration
 def test_binary_from_other_compiler_is_rebuilt(built42):
     """#1360 grammar: a binary some OTHER compiler produced must not satisfy
     this compiler's build. Simulated by rewriting the manifest's compiler, as
@@ -223,6 +232,7 @@ def test_binary_from_other_compiler_is_rebuilt(built42):
     assert binary(built42).stat().st_mtime_ns != before
 
 
+@pytest.mark.integration
 def test_binary_without_manifest_is_rebuilt(built42):
     """A binary left by an older build.py (or an aborted run) has no
     provenance and must not be trusted, however new its mtime (#1401)."""
@@ -234,6 +244,7 @@ def test_binary_without_manifest_is_rebuilt(built42):
     assert run_exit(built42) == 21
 
 
+@pytest.mark.integration
 def test_failed_build_still_names_its_target(built42):
     """Deferring the 🔨 line must not orphan an error: a build that fails
     before committing to a rebuild (here, import resolution on a parse
@@ -248,6 +259,7 @@ def test_failed_build_still_names_its_target(built42):
     assert "up to date" not in r.stdout
 
 
+@pytest.mark.integration
 def test_manifest_written_next_to_binary(built42):
     manifest = binary(built42).with_name("exitcode.manifest.json")
     data = json.loads(manifest.read_text())
@@ -415,6 +427,7 @@ def _foreign_write_before_manifest(mod, monkeypatch, target_name):
     monkeypatch.setattr(mod, "write_binary_manifest", racing)
 
 
+@pytest.mark.integration
 def test_race_foreign_binary_before_manifest_is_not_certified(pkg, buildpy, monkeypatch):
     """compile_binary: a binary another build wrote over ours must not be
     recorded as ours, so the next cached build relinks instead of serving it."""
@@ -496,6 +509,7 @@ def test_race_manifest_temp_names_are_private(tmp_path, buildpy, monkeypatch):
     assert len(seen) == 2 and seen[0] != seen[1], seen
 
 
+@pytest.mark.integration
 def test_race_foreign_archive_before_manifest_is_not_certified(tmp_path, buildpy, monkeypatch):
     """compile_library has the same publish step as compile_binary."""
     src = tmp_path / "lib" / "util.ritz"

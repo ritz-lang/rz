@@ -32,6 +32,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 REPO = Path(__file__).resolve().parents[3]
 SCRIPT = REPO / "projects/valet/test/test_tls_socket.sh"
 # Servers one run starts: the main one (PORT), the short-send one (SPORT) and

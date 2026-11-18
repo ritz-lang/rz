@@ -108,6 +108,7 @@ def _lib(snippet: str) -> subprocess.CompletedProcess:
 # --- lib_ports.sh -----------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_pick_port_skips_a_port_with_a_listener():
     """With RANDOM seeded, pick_port's first candidate is known; a listener
     there makes it move on to a free port. (pick_port runs directly, not in
@@ -126,6 +127,7 @@ def test_pick_port_skips_a_port_with_a_listener():
         decoy.close()
 
 
+@pytest.mark.integration
 def test_pick_port_avoids_the_ports_it_is_given():
     """pick_port A B never returns A or B, so one run's servers differ."""
     seed = random.randrange(1, 30000)
@@ -135,6 +137,7 @@ def test_pick_port_avoids_the_ports_it_is_given():
     assert int(r.stdout) != first
 
 
+@pytest.mark.integration
 def test_require_free_port_refuses_a_shared_port():
     port = _unused_port()
     free = _unused_port()
@@ -162,6 +165,7 @@ def test_script_has_no_fixed_port(script):
     assert not FIXED.search(text), f"{script} fixes a port: {FIXED.search(text).group(0)}"
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("script", SCRIPTS)
 def test_script_refuses_a_given_port_with_a_listener(script, tmp_path):
     """PORT set by hand to a port a valet already listens on fails at once,

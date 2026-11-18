@@ -33,6 +33,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092)
+
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
 BUDGET = REPO / ".claude" / "host-budget.sh"
@@ -127,7 +129,6 @@ def _paths(tmp_path: Path, room: str = ROOM):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.unit
 def test_install_writes_slices_and_room_dropin(tmp_path):
     env = _env(tmp_path)
     r = _budget(tmp_path, env, ROOM)
@@ -148,14 +149,12 @@ def test_install_writes_slices_and_room_dropin(tmp_path):
     assert dp["OOMPolicy"] == "continue"
 
 
-@pytest.mark.unit
 def test_install_reloads_systemd(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
     assert "systemctl --user daemon-reload" in _calls(tmp_path)
 
 
-@pytest.mark.unit
 def test_install_is_idempotent(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -169,7 +168,6 @@ def test_install_is_idempotent(tmp_path):
     assert "systemctl --user daemon-reload" not in _calls(tmp_path)
 
 
-@pytest.mark.unit
 def test_install_repairs_a_stale_dropin(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -183,7 +181,6 @@ def test_install_repairs_a_stale_dropin(tmp_path):
     assert "systemctl --user daemon-reload" in _calls(tmp_path)
 
 
-@pytest.mark.unit
 def test_verify(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, "--verify", ROOM).returncode != 0
@@ -194,7 +191,6 @@ def test_verify(tmp_path):
     assert _calls(tmp_path).count("systemctl --user daemon-reload") == 1
 
 
-@pytest.mark.unit
 def test_verify_rejects_a_stale_dropin(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -202,7 +198,6 @@ def test_verify_rejects_a_stale_dropin(tmp_path):
     assert _budget(tmp_path, env, "--verify", ROOM).returncode != 0
 
 
-@pytest.mark.unit
 def test_remove_drops_only_the_room(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -218,7 +213,6 @@ def test_remove_drops_only_the_room(tmp_path):
     assert _budget(tmp_path, env, "--remove", ROOM).returncode == 0
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("bad", ["", "../etc", "a/b", "x@y", "-rf", "a b"])
 def test_rejects_unsafe_room_names(tmp_path, bad):
     env = _env(tmp_path)
@@ -229,7 +223,6 @@ def test_rejects_unsafe_room_names(tmp_path, bad):
     )
 
 
-@pytest.mark.unit
 def test_budget_fits_two_rooms_and_a_gate(tmp_path):
     """The installed caps, plus the gate's measured peak, leave headroom."""
     env = _env(tmp_path)
@@ -302,7 +295,6 @@ def _host_env(tmp_path: Path, text: str) -> None:
     (tmp_path / "host.env").write_text(text)
 
 
-@pytest.mark.unit
 def test_no_config_writes_todays_files_byte_for_byte(tmp_path):
     env = _env(tmp_path)
     assert not Path(env["RZ_HOST_ENV"]).exists()
@@ -314,7 +306,6 @@ def test_no_config_writes_todays_files_byte_for_byte(tmp_path):
     assert dropin.read_bytes() == GOLDEN_DROPIN.encode()
 
 
-@pytest.mark.unit
 def test_config_sets_the_rooms_slice_memory(tmp_path):
     env = _env(tmp_path)
     _host_env(tmp_path, HUBURGHT_ENV)
@@ -329,7 +320,6 @@ def test_config_sets_the_rooms_slice_memory(tmp_path):
     assert dropin.read_text() == GOLDEN_DROPIN
 
 
-@pytest.mark.unit
 def test_config_with_one_key_keeps_the_other_default(tmp_path):
     env = _env(tmp_path)
     _host_env(tmp_path, "RZ_ROOMS_MEMORY_MAX=12G\n")
@@ -338,7 +328,6 @@ def test_config_with_one_key_keeps_the_other_default(tmp_path):
     assert (rp["MemoryHigh"], rp["MemoryMax"]) == ("7G", "12G")
 
 
-@pytest.mark.unit
 def test_verify_reports_the_values_in_effect(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -364,7 +353,6 @@ def test_verify_reports_the_values_in_effect(tmp_path):
     assert env["RZ_HOST_ENV"] in r.stdout
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "text",
     [
@@ -394,7 +382,6 @@ def test_bad_config_is_refused_and_writes_nothing(tmp_path, text):
     assert _budget(tmp_path, env, "--verify", ROOM).returncode != 0
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("scale", ["1.5", "2", "0.75", "10"])
 def test_config_accepts_a_test_budget_scale(tmp_path, scale):
     """AGAST #4138: RZ_TEST_BUDGET_SCALE is the gate's budget-check scale
@@ -406,7 +393,6 @@ def test_config_accepts_a_test_budget_scale(tmp_path, scale):
     assert _props(_paths(tmp_path)[0])["MemoryMax"] == "32G"
 
 
-@pytest.mark.unit
 def test_remove_works_despite_a_bad_config(tmp_path):
     """Reaping a room must not depend on the host's config parsing."""
     env = _env(tmp_path)
@@ -453,7 +439,6 @@ def _effective(tmp_path: Path, room: str = ROOM) -> dict[str, str]:
     return out
 
 
-@pytest.mark.unit
 def test_runtime_set_property_is_what_used_to_lose(tmp_path):
     """The bug, as the merge model sees it: set-property's 50-Memory*.conf
     sorts before 50-ritz-host-budget.conf, so the budget's 5G wins."""
@@ -465,7 +450,6 @@ def test_runtime_set_property_is_what_used_to_lose(tmp_path):
     assert _effective(tmp_path)["MemoryMax"] == "5G"
 
 
-@pytest.mark.unit
 def test_room_memory_survives_daemon_reload_then_remove(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -505,7 +489,6 @@ def test_room_memory_survives_daemon_reload_then_remove(tmp_path):
     assert "systemctl --user daemon-reload" in _calls(tmp_path)
 
 
-@pytest.mark.unit
 def test_remove_keeps_other_runtime_dropins(tmp_path):
     """--remove deletes its own file only, not e.g. a host's hand-made one."""
     env = _env(tmp_path)
@@ -518,7 +501,6 @@ def test_remove_keeps_other_runtime_dropins(tmp_path):
     assert other.exists()
 
 
-@pytest.mark.unit
 def test_clear_room_memory_keeps_the_budget(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -539,7 +521,6 @@ def test_clear_room_memory_keeps_the_budget(tmp_path):
     assert _calls(tmp_path) == []
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "args, why",
     [
@@ -564,14 +545,12 @@ def test_room_memory_refuses_bad_values_and_writes_nothing(tmp_path, args, why):
     assert _calls(tmp_path) == []
 
 
-@pytest.mark.unit
 def test_room_memory_may_equal_the_slice_cap(tmp_path):
     env = _env(tmp_path)
     r = _budget(tmp_path, env, "--room-memory", ROOM, "8G", "8G")
     assert r.returncode == 0, r.stderr
 
 
-@pytest.mark.unit
 def test_room_memory_rejects_unsafe_room_names(tmp_path):
     env = _env(tmp_path)
     r = _budget(tmp_path, env, "--room-memory", "../x", "4G", "6G")
@@ -579,7 +558,6 @@ def test_room_memory_rejects_unsafe_room_names(tmp_path):
     assert not (tmp_path / "control").exists()
 
 
-@pytest.mark.unit
 def test_verify_reports_the_room_override(tmp_path):
     env = _env(tmp_path)
     assert _budget(tmp_path, env, ROOM).returncode == 0
@@ -674,7 +652,6 @@ def test_room_memory_against_the_real_user_manager(tmp_path):
 # --------------------------------------------------------------------------
 
 
-@pytest.mark.unit
 def test_run_gate_starts_in_the_gate_slice(tmp_path):
     wt = tmp_path / "wt"
     wt.mkdir()
@@ -785,7 +762,6 @@ def _kill_gates(tmp_path: Path) -> None:
             pass
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize(
     "host_env, env_slots, slots",
     [
@@ -812,7 +788,6 @@ def test_run_gate_runs_the_configured_number_of_gates(
         _kill_gates(tmp_path)
 
 
-@pytest.mark.unit
 @pytest.mark.parametrize("text", ["RZ_GATE_SLOTS=0\n", "RZ_GATE_SLOTS=two\n"])
 def test_run_gate_refuses_a_bad_config(tmp_path, text):
     wt = _git_worktree(tmp_path)

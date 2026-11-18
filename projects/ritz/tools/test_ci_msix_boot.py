@@ -184,36 +184,42 @@ def _run(tree, serial: str = "", *, qemu=True, qemu_img=True, full_path=True,
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.integration
 def test_missing_qemu_is_a_setup_error(tree):
     r = _run(tree, qemu=False, qemu_img=False, full_path=False)
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
     assert "SETUP ERROR" in r.stderr and "qemu-system-x86_64" in r.stderr
 
 
+@pytest.mark.integration
 def test_missing_qemu_img_is_a_setup_error(tree):
     r = _run(tree, qemu_img=False, full_path=False)
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
     assert "SETUP ERROR" in r.stderr and "qemu-img" in r.stderr
 
 
+@pytest.mark.integration
 def test_missing_ovmf_is_a_setup_error(tree):
     r = _run(tree, PASSED, env_extra={"OVMF_CODE": str(tree["tmp"] / "nope.fd")})
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
     assert "SETUP ERROR" in r.stderr and "OVMF" in r.stderr
 
 
+@pytest.mark.integration
 def test_build_missing_a_toolchain_binary_is_a_setup_error(tree):
     _stub(tree["root"], "rz", f"#!/usr/bin/env bash\nexit {ci_local.EXIT_SETUP}\n")
     r = _run(tree, PASSED, env_extra={"SKIP_BUILD": "0"})
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_build_failure_is_a_failure(tree):
     _stub(tree["root"], "rz", "#!/usr/bin/env bash\nexit 1\n")
     r = _run(tree, PASSED, env_extra={"SKIP_BUILD": "0"})
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_all_checks_pass_and_the_serial_log_is_kept(tree):
     keep = tree["tmp"] / "logs"
     keep.mkdir()
@@ -223,6 +229,7 @@ def test_all_checks_pass_and_the_serial_log_is_kept(tree):
     assert "interrupts: 8" in (keep / "msix.log").read_text()
 
 
+@pytest.mark.integration
 def test_boot_attaches_a_nic_on_user_net_and_an_nvme(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -235,6 +242,7 @@ def test_boot_attaches_a_nic_on_user_net_and_an_nvme(tree):
     assert "-device nvme," in argv
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "drop, want",
     [
@@ -250,6 +258,7 @@ def test_modern_nic_check_missing_fails(tree, drop, want):
     assert want in r.stdout
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     "burst, want",
     [
@@ -269,6 +278,7 @@ def test_tx_burst_check_fails(tree, burst, want):
     assert want in r.stdout
 
 
+@pytest.mark.integration
 def test_zero_interrupts_fails(tree):
     """The NIC in MSI-X mode but nothing delivered: the mutation that drops
     msix_dispatch from irq_handler, or leaves the table entries masked."""
@@ -277,29 +287,34 @@ def test_zero_interrupts_fails(tree):
     assert "counter is 0, want > 0" in r.stdout
 
 
+@pytest.mark.integration
 def test_missing_counter_fails(tree):
     r = _run(tree, NVME_TABLE + MODERN_OK + NIC_ON + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "counter is missing" in r.stdout
 
 
+@pytest.mark.integration
 def test_nic_not_in_msix_mode_fails(tree):
     r = _run(tree, NVME_TABLE + MODERN_OK + interrupts(3) + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "did not come up in MSI-X mode" in r.stdout
 
 
+@pytest.mark.integration
 def test_no_nvme_msix_table_fails(tree):
     r = _run(tree, MODERN_OK + NIC_ON + interrupts(3) + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "NVMe controller" in r.stdout
 
 
+@pytest.mark.integration
 def test_exception_fails_even_if_everything_else_passed(tree):
     r = _run(tree, r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_no_verdict_before_the_timeout_fails(tree):
     r = _run(tree, NVME_TABLE + NIC_ON + interrupts(8))
     assert r.returncode == 1, r.stdout + r.stderr

@@ -44,6 +44,10 @@ def private_store(tmp_path, monkeypatch):
     monkeypatch.delenv("RITZ_NO_KEY_MEMO", raising=False)
     monkeypatch.delenv("RITZ_VERIFY_IR", raising=False)
     monkeypatch.setattr(cas, "STATS", cas.Stats())
+    # A key folds in cas.target_id(), whose first call in a process runs
+    # `clang --version`: pin it, or whichever pure test computes a key first
+    # starts a process (AGAST #4092, spawn_guard).
+    monkeypatch.setattr(cas, "_TARGET", "test-os/test-machine/test-clang")
     return root
 
 

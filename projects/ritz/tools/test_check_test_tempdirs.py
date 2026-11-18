@@ -125,6 +125,7 @@ def test_only_test_files_are_scanned(tmp_path):
     assert sorted(str(p) for p, _, _ in find_violations(tmp_path)) == ["conftest.py", "test_a.py"]
 
 
+@pytest.mark.integration
 def test_cli_exit_codes(tmp_path):
     (tmp_path / "test_ok.py").write_text("x = 1\n")
     assert subprocess.run([sys.executable, str(CHECK), str(tmp_path)], check=False).returncode == 0

@@ -100,6 +100,7 @@ def test_tests_dir_that_is_its_own_package_is_fine(tmp_path, buildpy):
     assert buildpy.stray_test_files(pkg) == []
 
 
+@pytest.mark.integration
 def test_cli_fails_loudly_without_traceback(tmp_path):
     pkg = make_pkg(tmp_path)
     write(pkg / "tests" / "test_a.ritz")

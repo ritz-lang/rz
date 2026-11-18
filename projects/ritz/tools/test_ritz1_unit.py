@@ -13,6 +13,7 @@ from pathlib import Path
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pytest
 import ritz1_unit
 
 RITZ = ritz1_unit.RITZ_ROOT
@@ -33,6 +34,7 @@ def fake(outcomes: dict):
     return run
 
 
+@pytest.mark.integration
 def test_zero_files_fails(tmp_path, capsys):
     run = fake({})
     assert ritz1_unit.main(["--dir", str(tmp_path)], run=run) == 1
@@ -40,6 +42,7 @@ def test_zero_files_fails(tmp_path, capsys):
     assert "found 0 test files" in capsys.readouterr().out
 
 
+@pytest.mark.integration
 def test_one_file_not_passing_fails_the_run(tmp_path, capsys):
     for n in ("test_a.ritz", "test_b.ritz"):
         (tmp_path / n).write_text("")
@@ -54,6 +57,7 @@ def test_one_file_not_passing_fails_the_run(tmp_path, capsys):
     assert "1 of 2 files did not pass: test_b.ritz" in capsys.readouterr().out
 
 
+@pytest.mark.integration
 def test_all_passing_passes(tmp_path, capsys):
     (tmp_path / "test_a.ritz").write_text("")
     assert (
@@ -73,6 +77,7 @@ def test_unwritten_outcome_is_an_error_not_a_pass(tmp_path, monkeypatch):
     assert out["status"] == "error"
 
 
+@pytest.mark.integration
 def test_a_file_with_no_test_fn_fails_end_to_end(tmp_path):
     """Real build.py: a file with no [[test]] fn is a failure, not 0 passed."""
     (tmp_path / "test_empty.ritz").write_text("fn main() -> i32\n  0\n")

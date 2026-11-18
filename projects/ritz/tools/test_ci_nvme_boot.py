@@ -213,12 +213,14 @@ def _run(tree, serial: str = "", *, persist=True, qemu=True,
                           capture_output=True, text=True, timeout=60)
 
 
+@pytest.mark.integration
 def test_missing_qemu_is_a_setup_error(tree):
     r = _run(tree, qemu=False)
     assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
     assert "SETUP ERROR" in r.stderr and "qemu-system-x86_64" in r.stderr
 
 
+@pytest.mark.integration
 def test_all_checks_pass_on_two_nvme_disks_and_no_virtio_blk(tree):
     keep = tree["tmp"] / "logs"
     keep.mkdir()
@@ -234,6 +236,7 @@ def test_all_checks_pass_on_two_nvme_disks_and_no_virtio_blk(tree):
     assert "virtio-blk" not in argv
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("line", [
     pytest.param(nvme_line(fnv=_pattern_fnv() ^ 1), id="wrong-data"),
     pytest.param(nvme_line(sectors=8191), id="wrong-size"),
@@ -245,12 +248,14 @@ def test_bad_or_missing_pattern_read_fails(tree, line):
     assert "FAIL: harland-data" in r.stdout
 
 
+@pytest.mark.integration
 def test_initramfs_not_loaded_fails(tree):
     r = _run(tree, nvme_line() + PERSIST + SUITE_PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "initramfs did not load" in r.stdout
 
 
+@pytest.mark.integration
 def test_persist_magic_missing_from_the_image_fails(tree):
     """The kernel says persist came up, but nothing reached the disk: the
     mutation that drops the NVMe write command's doorbell."""
@@ -259,11 +264,13 @@ def test_persist_magic_missing_from_the_image_fails(tree):
     assert "persistent storage did not come up" in r.stdout
 
 
+@pytest.mark.integration
 def test_exception_fails_even_if_everything_else_passed(tree):
     r = _run(tree, r"EXCEPTION: #GP\nRIP=0x1\nCR2=0\n" + PASSED)
     assert r.returncode == 1, r.stdout + r.stderr
 
 
+@pytest.mark.integration
 def test_no_verdict_before_the_timeout_fails(tree):
     r = _run(tree, nvme_line() + INITRAMFS + PERSIST)
     assert r.returncode == 1, r.stdout + r.stderr

@@ -122,7 +122,7 @@ def test_predicate_bodies_return_no_int_literals():
     assert bad == [], bad
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_no_int_comparisons_against_predicates():
     """Callers must not compare a (now bool) predicate against 1 / 0."""
     names = "|".join(fn for fns in PREDICATES.values() for fn in fns)
@@ -145,7 +145,7 @@ def test_no_int_comparisons_against_predicates():
     assert hits == [], hits
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_string_push_strview_alias_gone_with_callers():
     tracked = subprocess.run(
         ["git", "ls-files", "*.ritz"],
@@ -165,7 +165,7 @@ def test_string_push_strview_alias_gone_with_callers():
     assert hits == [], hits
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 def test_no_span_strview_duplicate_clusters(tmp_path):
     out = tmp_path / "m.json"
     subprocess.run(

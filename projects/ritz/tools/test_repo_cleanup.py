@@ -42,6 +42,7 @@ def rz():
     return mod
 
 
+@pytest.mark.integration
 def test_no_transcripts_or_generated_assets_are_tracked():
     # The ticket's acceptance command (a), verbatim.
     files = subprocess.run(

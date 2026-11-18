@@ -104,7 +104,7 @@ def build(buildpy, kernel, monkeypatch):
     return Builds(buildpy, kernel, monkeypatch)
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_toolchain
 def test_a_freestanding_binary_records_its_provenance(build):
     elf = build()
@@ -116,7 +116,7 @@ def test_a_freestanding_binary_records_its_provenance(build):
     assert record["target"]["objects"]["clang"][0] == "--target=x86_64-unknown-none"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_toolchain
 def test_an_unchanged_kernel_is_not_rebuilt(build):
     elf = build()
@@ -126,7 +126,7 @@ def test_an_unchanged_kernel_is_not_rebuilt(build):
     assert elf.read_bytes() == before
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_toolchain
 @pytest.mark.parametrize("change", ["source", "asm", "incbin", "linker_script",
                                     "flags", "pic", "binary", "manifest"])
@@ -162,7 +162,7 @@ def test_a_change_rebuilds(build, change):
     assert build.rebuilds == 2, f"a {change} change did not rebuild"
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_toolchain
 def test_no_cache_always_rebuilds(build):
     build()
@@ -170,7 +170,7 @@ def test_no_cache_always_rebuilds(build):
     assert build.rebuilds == 2
 
 
-@pytest.mark.unit
+@pytest.mark.integration
 @needs_toolchain
 def test_build_package_says_up_to_date(buildpy, kernel, capsys):
     config = {"package": {"name": "fs_pkg"},

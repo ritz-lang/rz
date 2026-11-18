@@ -170,18 +170,21 @@ def results(json_path: Path) -> list:
 # ── CLI ────────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 def test_help_prints_usage(fake):
     r = run(fake, "--help")
     assert r.returncode == 0, r.stderr
     assert "--compiler" in r.stdout and "--repeat" in r.stdout
 
 
+@pytest.mark.integration
 def test_unknown_compiler_is_rejected(fake):
     r = run(fake, "--compiler", "ritz0,ritz2", "--dry-run")
     assert r.returncode == 2
     assert "ritz2" in r.stderr
 
 
+@pytest.mark.integration
 def test_defaults_sweep_all_three_compilers_and_six_projects(fake):
     r = run(fake, "--dry-run")
     assert r.returncode == 0, r.stderr
@@ -193,6 +196,7 @@ def test_defaults_sweep_all_three_compilers_and_six_projects(fake):
 # ── The compiler sweep ─────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 def test_each_requested_compiler_builds_each_project(fake, tmp_path):
     out = tmp_path / "c.json"
     r = run(
@@ -220,6 +224,7 @@ def test_each_requested_compiler_builds_each_project(fake, tmp_path):
     assert swept == set(built)
 
 
+@pytest.mark.integration
 def test_cold_purges_project_but_keeps_ritzlib_primed(fake):
     r = run(
         fake,
@@ -255,6 +260,7 @@ def test_cold_purges_project_but_keeps_ritzlib_primed(fake):
         }, warm
 
 
+@pytest.mark.integration
 def test_benchmark_never_touches_the_shared_cas(fake, tmp_path):
     shared = tmp_path / "shared-cas"
     r = run(
@@ -271,6 +277,7 @@ def test_benchmark_never_touches_the_shared_cas(fake, tmp_path):
     assert {e["cas"] for e in rz_log(fake)} != {str(shared)}
 
 
+@pytest.mark.integration
 def test_failed_build_is_reported_not_swallowed(fake, tmp_path):
     out = tmp_path / "c.json"
     r = run(
@@ -294,6 +301,7 @@ def test_failed_build_is_reported_not_swallowed(fake, tmp_path):
 # ── Output ─────────────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 def test_json_and_markdown_table(fake, tmp_path):
     out = tmp_path / "c.json"
     r = run(
@@ -331,6 +339,7 @@ def test_json_and_markdown_table(fake, tmp_path):
     assert len(rows) == 2
 
 
+@pytest.mark.integration
 def test_help_smoke_status_is_recorded(fake, tmp_path):
     out = tmp_path / "c.json"
     r = run(
@@ -353,6 +362,7 @@ def test_help_smoke_status_is_recorded(fake, tmp_path):
 # ── ritz1 rebuild and bootstrap timing ─────────────────────────────────────
 
 
+@pytest.mark.integration
 def test_bootstrap_uses_real_target_and_keeps_ritzlib_objects(fake, tmp_path):
     out = tmp_path / "c.json"
     r = run(
@@ -391,6 +401,7 @@ def test_shellcheck_clean():
     assert r.returncode == 0, r.stdout
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("bad", ["0", "x", "-1"])
 def test_repeat_must_be_positive(fake, bad):
     r = run(fake, "--repeat", bad, "--dry-run")

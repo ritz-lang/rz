@@ -13,8 +13,8 @@ It observes behaviour rather than grepping source, so a spawn hidden in a
 helper imported from another module is caught, and a pure test in a module
 that merely imports `subprocess` is not flagged.
 
-Loaded by ritz0/conftest.py (`pytest_plugins`); test_spawn_guard.py loads it
-with `-p spawn_guard`.
+Loaded by ritz0/conftest.py and tools/conftest.py (`pytest_plugins`; tools/
+since AGAST #4092); test_spawn_guard.py loads it with `-p spawn_guard`.
 """
 
 import os

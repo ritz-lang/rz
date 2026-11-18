@@ -142,10 +142,12 @@ def decoy(tmp_path):
 # ── syntax and arguments ────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 def test_script_parses():
     subprocess.run(["bash", "-n", str(RUN_SH)], check=True)
 
 
+@pytest.mark.integration
 def test_help_documents_port_overrides_and_dry_run():
     r = _run(RUN_SH, "--help")
     assert r.returncode == 0, r.stderr
@@ -153,12 +155,14 @@ def test_help_documents_port_overrides_and_dry_run():
     assert "BENCH_PORT_" in r.stdout
 
 
+@pytest.mark.integration
 def test_bad_argument_exits_2():
     r = _run(RUN_SH, "--no-such-flag")
     assert r.returncode == 2
     assert "unknown arg" in r.stderr
 
 
+@pytest.mark.integration
 def test_non_numeric_port_override_is_rejected():
     r = _run(RUN_SH, "--dry-run", BENCH_PORT_DIRECT="ninety")
     assert r.returncode == 2
@@ -174,6 +178,7 @@ def _ephemeral_range() -> range:
     return range(int(lo), int(hi) + 1)
 
 
+@pytest.mark.integration
 def test_default_ports_are_kernel_picked_distinct_and_not_the_old_fixed_set():
     r = _run(RUN_SH, "--dry-run")
     assert r.returncode == 0, r.stderr
@@ -189,6 +194,7 @@ def test_default_ports_are_kernel_picked_distinct_and_not_the_old_fixed_set():
     assert all(p in ephemeral for p in ports.values()), (ports, ephemeral)
 
 
+@pytest.mark.integration
 def test_port_overrides_are_honoured():
     want = {v: 20101 + i for i, v in enumerate(PORT_VARS)}
     r = _run(
@@ -223,6 +229,7 @@ def test_listed_pids_reads_only_pid_lists_not_substrings():
     assert _listed_pids(abort) == {38870, 3887}
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("server", SERVERS)
 def test_guard_ignores_another_worktrees_server(worktrees, decoy, server):
     room_a, room_b = worktrees
@@ -233,6 +240,7 @@ def test_guard_ignores_another_worktrees_server(worktrees, decoy, server):
     assert other.poll() is None
 
 
+@pytest.mark.integration
 def test_guard_still_aborts_on_this_worktrees_own_orphan(worktrees, decoy):
     room_a, _ = worktrees
     mine = decoy(room_a, "zeus")
@@ -245,6 +253,7 @@ def test_guard_still_aborts_on_this_worktrees_own_orphan(worktrees, decoy):
 # ── cleanup ─────────────────────────────────────────────────────────────
 
 
+@pytest.mark.integration
 def test_cleanup_would_kill_nothing_it_did_not_start(worktrees, decoy):
     room_a, room_b = worktrees
     other = decoy(room_b, "valet")
@@ -259,6 +268,7 @@ def test_cleanup_has_no_name_pattern_kill():
     assert not re.search(r"\b(pkill|killall)\b", code)
 
 
+@pytest.mark.integration
 def test_pid_tree_covers_recorded_pid_and_descendants_only(decoy, worktrees):
     """pid_tree (what cleanup kills) is the recorded PID's whole subtree."""
     other = decoy(worktrees[1], "valet")
