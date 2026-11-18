@@ -3315,6 +3315,21 @@ fn main() -> i32
     p[0]
 ```
 
+`StrView` isn't one of the built-ins, so `s[i]` on one is the same error (read a byte
+with `s.ptr[i]`):
+
+```ritz expect-error="`StrView` can't be indexed: it doesn't implement `Index` (§7.8)"
+fn count_spaces(s: StrView) -> i64
+    var n: i64 = 0
+    for i in 0..s.len
+        if s[i] == ' '
+            n += 1
+    n
+
+fn main() -> i32
+    count_spaces("a b c") as i32
+```
+
 ```ritz expect-error="`m[k] = v` needs `IndexSet` or `IndexMut`, and `Lookup` implements only `Index`"
 struct Lookup
     n: [2]i64
