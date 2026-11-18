@@ -117,6 +117,10 @@ ADDR_SLOTS = {
     "mutable": "fn f(e: C) -> i32\n    var d = e\n    val(^@&d)\n",
     "field": "fn f(w: W) -> i32\n    val(^@w.c)\n",
     "method_argument": "fn f(d: C) -> i32\n    d.plus(^@d)\n",
+    # An inferred `let b = t.as_bytes()` is a Span<u8> as much as an annotated
+    # one: ritz1 lowers the call inline, with no FnDef to type it (AGAST #4132).
+    "inferred_as_bytes": "fn g(b: Span<u8>) -> i32\n    b.len() as i32\n\n"
+                         "fn f(t: StrView) -> i32\n    let b = t.as_bytes()\n    g(^@b)\n",
 }
 
 # A method of a ritzlib type, dispatched to a free fn that takes the receiver

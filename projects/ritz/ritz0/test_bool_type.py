@@ -63,6 +63,9 @@ REJECTED = {
                  "if condition must be bool, got a float"),
     "if_struct": (_S + _fn("s: S", "if s\n    return 1\n0"), 5, 8,
                   "if condition must be bool, got a struct or enum"),
+    # ritz1 lowers StrView.as_bytes() inline, with no FnDef to type it (AGAST #4132).
+    "if_inferred_as_bytes": (_fn("t: StrView", "let b = t.as_bytes()\nif b\n    return 1\n0"), 3, 8,
+                             "if condition must be bool, got a struct or enum"),
     "else_if_int": (_fn("n: i64", "if n > 0\n    return 1\nelse if n\n    return 2\n0"),
                     4, 13, f"if condition {_INT_COND}"),
     "if_value_int": (_fn("n: i64", "let v: i64 = if n\n    1\nelse\n    2\nv"), 2, 21,
