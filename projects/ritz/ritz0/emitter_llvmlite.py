@@ -6051,10 +6051,12 @@ class LLVMEmitter:
                 # specialization instead of an arbitrary one from variant_to_enum.
                 expected_enum_name = self._resolve_enum_type_name(fn_def.ret_type, ret_type)
                 self._procedure_calls = set()
-                # A procedure's tail value goes nowhere: a temporary, dropped
-                # with the scopes by _emit_drop_for_all_scopes (AGAST #2253).
-                if fn_def.ret_type is None:
-                    self._temp_frames.append([])
+                # The tail's temporaries (and a procedure's tail value, which
+                # goes nowhere, AGAST #2253) drop at the `ret`, before the
+                # defers: _emit_drop_for_all_scopes drops the temp frames
+                # first (§13.6 then §13.7, AGAST #2854).  The frame is
+                # cleared with the fn's state (`_temp_frames.clear()`).
+                self._temp_frames.append([])
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
                 self._float_slot(fn_def.ret_type, fn_def.body.expr)
                 if self._is_range_index(fn_def.body.expr):

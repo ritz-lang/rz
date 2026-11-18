@@ -96,6 +96,12 @@ RUNS = {
                           "pub fn go() -> i64\n    defer note(1)\n"
                           "    return mk(2).id\n\n"
                           "pub fn main() -> i32\n    go()\n    log as i32\n", 21),
+    # AGAST #2854: the same for a fn's tail expression, which is its
+    # return value: the temporary's 2, then the defer's 1.
+    "tail_temp_first": ("fn mk(id: i64) -> Noisy\n    Noisy { id: id }\n\n"
+                        "pub fn go() -> i64\n    defer note(1)\n"
+                        "    mk(2).id\n\n"
+                        "pub fn main() -> i32\n    go()\n    log as i32\n", 21),
 }
 
 
