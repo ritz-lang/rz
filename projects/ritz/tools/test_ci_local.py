@@ -617,6 +617,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_msix_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_nvme_boot.sh",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
+        "bash projects/harland/tools/test_nvme_boot.sh",
     ]
 
 

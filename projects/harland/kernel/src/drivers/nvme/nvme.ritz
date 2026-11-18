@@ -6,16 +6,23 @@
 #
 # Per controller: reset, admin queue, enable, Identify Controller, one I/O
 # completion/submission queue pair (qid 1), then Identify Namespace for each
-# active namespace with 512-byte LBAs. Completions are polled; interrupts are
-# masked (INTMS, PCI INTx disable). MSI-X is a sibling ticket.
+# active namespace with 512-byte to 4 KiB LBAs. Completions are polled;
+# interrupts are masked (INTMS, PCI INTx disable). MSI-X is a sibling ticket.
+#
+# The block interface speaks 512-byte sectors whatever the namespace's LBA
+# size (AGAST #4088): a request is widened to whole native LBAs, and a write
+# that does not cover them all reads the span first (read-modify-write).
 #
 # Namespaces are exposed through drivers/virtio/blk (virtio_blk_init_nth
 # hands out NVMe namespaces after the virtio disks), so the filesystem layer
 # reads and writes them with virtio_blk_read/virtio_blk_write, unchanged.
 #
-# Memory: every queue and the bounce buffer is one identity-mapped physical
-# page (pmm_alloc_page), as virtio uses. A data transfer is at most one page
-# (8 sectors) so PRP1 alone describes it; longer requests are split.
+# Memory: every queue, the identify buffer and the PRP list is one
+# identity-mapped physical page (pmm_alloc_page), as virtio uses. Data goes
+# through NVME_BOUNCE_PAGES bounce pages, which need not be contiguous: PRP1
+# names the first, PRP2 the second when a transfer spans two pages, or the
+# PRP list page holding the rest when it spans more. A command moves at most
+# max_pages pages (the bounce pages, capped by MDTS); longer requests split.
 #
 # Reference: NVM Express Base Specification 1.4, sections 3 (registers),
 # 4 (queues), 5 (admin commands) and the NVM Command Set (read/write).
@@ -23,7 +30,7 @@
 import io { memory_barrier, read_barrier }
 import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
 import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
-import mm.heap { kalloc }
+import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 
@@ -82,8 +89,18 @@ const NVME_IO_Q: i32 = 1
 # Entries per queue (capped by CAP.MQES + 1). One page holds 64 SQEs.
 const NVME_QUEUE_DEPTH: u32 = 16
 
-# Sectors per command: one 4 KiB page, so PRP1 alone covers it.
-const NVME_MAX_SECTORS_PER_CMD: u32 = 8
+# Data bounce pages: 64 KiB per command at most. Their PRP list (at most 15
+# entries) fits one page, so lists never chain.
+const NVME_BOUNCE_PAGES: u32 = 16
+
+# The block interface's sector size; namespaces may use larger LBAs.
+const SECTOR_SIZE: u64 = 512
+# LBA sizes supported: 2^9 to 2^12 bytes, so an LBA never crosses a page.
+const NVME_MIN_LBADS: u32 = 9
+const NVME_MAX_LBADS: u32 = 12
+
+# Sectors 1-200 are read and fingerprinted when a namespace comes up.
+const NVME_PROBE_SECTORS: u64 = 200
 
 # Polling budgets (iterations; each one reads device memory or a register).
 const NVME_READY_SPINS: u32 = 20000000
@@ -108,16 +125,19 @@ pub struct NvmeController
     sq_tail: [2]u32
     cq_head: [2]u32
     cq_phase: [2]u32        # Phase tag that marks a new CQE
-    buf: u64                # One-page bounce buffer for identify and data
+    buf: u64                # One page for identify data
+    bounce: [16]u64         # NVME_BOUNCE_PAGES data pages (phys == virt)
+    prp_list: u64           # PRP list page, for transfers over two pages
     nn: u32                 # Number of namespaces (Identify Controller)
+    max_pages: u32          # Pages per command: bounce pages, capped by MDTS
     serial_len: u32
     serial: [20]u8          # Serial number (Identify Controller bytes 4-23)
 
 pub struct NvmeNamespace
     ctrl: *NvmeController
     nsid: u32
-    _pad: u32
-    sectors: u64            # Size in 512-byte sectors (NSZE)
+    lba_shift: u32          # log2 of the LBA size (LBADS), 9-12
+    sectors: u64            # Size in 512-byte sectors (NSZE << (lba_shift - 9))
 
 var nvme_ctrls: [4]*NvmeController
 var nvme_ctrl_count: i32 = 0
@@ -186,13 +206,13 @@ fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
 # Submit one command on queue `q` and poll its completion.
 # Returns 0 on success, the NVMe status (positive) on a command error, or -1
 # on timeout.
-fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
+fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
     let cid: u32 = (*c).next_cid & 0xFFFF
     (*c).next_cid = (*c).next_cid + 1
     if (*c).next_cid > 0xFFFF
         (*c).next_cid = 0
 
-    # Build the SQE in place: CDW0 = opcode | CID << 16, NSID, PRP1, CDW10-12.
+    # Build the SQE in place: CDW0 = opcode | CID << 16, NSID, PRP1, PRP2, CDW10-12.
     let sqe: u64 = (*c).sq[q] + ((*c).sq_tail[q] as u64) * NVME_SQE_SIZE
     var i: u64 = 0
     while i < NVME_SQE_SIZE
@@ -202,6 +222,8 @@ fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, cdw10: u
     mem_w32(sqe + 4, nsid)
     mem_w32(sqe + 24, (prp1 & 0xFFFFFFFF) as u32)
     mem_w32(sqe + 28, (prp1 >> 32) as u32)
+    mem_w32(sqe + 32, (prp2 & 0xFFFFFFFF) as u32)
+    mem_w32(sqe + 36, (prp2 >> 32) as u32)
     mem_w32(sqe + 40, cdw10)
     mem_w32(sqe + 44, cdw11)
     mem_w32(sqe + 48, cdw12)
@@ -321,8 +343,15 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     (*c).sq[1] = alloc_zeroed_page()
     (*c).cq[1] = alloc_zeroed_page()
     (*c).buf = alloc_zeroed_page()
-    if (*c).sq[0] == 0 or (*c).cq[0] == 0 or (*c).sq[1] == 0 or (*c).cq[1] == 0 or (*c).buf == 0
+    (*c).prp_list = alloc_zeroed_page()
+    if (*c).sq[0] == 0 or (*c).cq[0] == 0 or (*c).sq[1] == 0 or (*c).cq[1] == 0 or (*c).buf == 0 or (*c).prp_list == 0
         return nvme_fail(c, "out of pages")
+    var b: i32 = 0
+    while b < NVME_BOUNCE_PAGES as i32
+        (*c).bounce[b] = alloc_zeroed_page()
+        if (*c).bounce[b] == 0
+            return nvme_fail(c, "out of pages")
+        b = b + 1
     var q: i32 = 0
     while q < 2
         (*c).sq_tail[q] = 0
@@ -340,8 +369,9 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     if nvme_wait_csts(c, NVME_CSTS_RDY, NVME_CSTS_RDY) != 0
         return nvme_fail(c, "enable timed out")
 
-    # Identify Controller: serial number (bytes 4-23), NN (bytes 516-519).
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, 0, (*c).buf, NVME_CNS_CONTROLLER, 0, 0) != 0
+    # Identify Controller: serial number (bytes 4-23), MDTS (byte 77), NN
+    # (bytes 516-519).
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, 0, (*c).buf, 0, NVME_CNS_CONTROLLER, 0, 0) != 0
         return nvme_fail(c, "identify controller")
     var i: u32 = 0
     while i < 20
@@ -351,13 +381,19 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
             (*c).serial_len = i + 1
         i = i + 1
     (*c).nn = mem_r32((*c).buf + 516)
+    # MDTS: the largest transfer is 2^MDTS minimum pages (CAP.MPSMIN is 4 KiB,
+    # checked above); 0 means no limit.
+    (*c).max_pages = NVME_BOUNCE_PAGES
+    let mdts: u32 = *(((*c).buf + 77) as *u8) as u32
+    if mdts != 0 and mdts < 5 and (1 << mdts) < (*c).max_pages
+        (*c).max_pages = 1 << mdts
 
     # I/O queue pair 1: the CQ first (physically contiguous, interrupts off),
     # then the SQ bound to it (physically contiguous).
     let qsize: u32 = ((*c).depth - 1) << 16
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_CQ, 0, (*c).cq[1], qsize | 1, 1, 0) != 0
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_CQ, 0, (*c).cq[1], 0, qsize | 1, 1, 0) != 0
         return nvme_fail(c, "create I/O CQ")
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_SQ, 0, (*c).sq[1], qsize | 1, (1 << 16) | 1, 0) != 0
+    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_SQ, 0, (*c).sq[1], 0, qsize | 1, (1 << 16) | 1, 0) != 0
         return nvme_fail(c, "create I/O SQ")
 
     prints("[nvme] ")
@@ -368,7 +404,9 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     serial_print_dec((*c).nn as u64)
     prints(" namespace(s), queue depth ")
     serial_print_dec((*c).depth as u64)
-    prints("\n")
+    prints(", ")
+    serial_print_dec(((*c).max_pages as u64) * PAGE_SIZE / 1024)
+    prints(" KiB per command\n")
     return c
 
 # FNV-1a (32-bit) over `len` bytes, continuing from `h`.
@@ -380,8 +418,11 @@ fn fnv1a(h: u64, p: *u8, len: u64) -> u64
         i = i + 1
     return hash
 
-# Log the namespace and a fingerprint of LBAs 1-16 (two 8-sector commands),
-# so the boot test can check identify, LBA addressing and multi-command reads.
+# Log the namespace, a fingerprint of 512-byte sectors 1-200 and the LBA
+# size, so the boot test can check identify, sector translation and long
+# reads in one call. 100 KiB from sector 1 is more than one command can
+# move: 64 KiB (a PRP list) then the rest on 512-byte LBAs, and seven
+# commands at an LBA offset on 4 KiB ones under the test's 16 KiB MDTS.
 fn nvme_announce(ns: *NvmeNamespace)
     let c: *NvmeController = (*ns).ctrl
     prints("[nvme] ")
@@ -391,41 +432,45 @@ fn nvme_announce(ns: *NvmeNamespace)
     prints(": ")
     serial_print_dec((*ns).sectors)
     prints(" sectors")
-    if (*ns).sectors >= 17
-        var h: u64 = 0x811C9DC5
-        var lba: u64 = 1
-        while lba < 17
-            if nvme_cmd(c, NVME_IO_Q, NVME_CMD_READ, (*ns).nsid, (*c).buf, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, NVME_MAX_SECTORS_PER_CMD - 1) != 0
-                prints(", LBA 1-16 read failed\n")
-                return
-            h = fnv1a(h, (*c).buf as *u8, (NVME_MAX_SECTORS_PER_CMD as u64) * 512)
-            lba = lba + NVME_MAX_SECTORS_PER_CMD as u64
-        prints(", LBA 1-16 fnv1a=")
-        serial_print_dec(h)
-    prints("\n")
+    if (*ns).sectors > NVME_PROBE_SECTORS
+        let probe: *u8 = kalloc(NVME_PROBE_SECTORS * SECTOR_SIZE)
+        if probe == 0 as *u8
+            prints(", LBA 1-200 read failed (no memory)\n")
+            return
+        if nvme_ns_rw(ns, 1, NVME_PROBE_SECTORS as u32, probe, false) != 0
+            kfree(probe)
+            prints(", LBA 1-200 read failed\n")
+            return
+        prints(", LBA 1-200 fnv1a=")
+        serial_print_dec(fnv1a(0x811C9DC5, probe, NVME_PROBE_SECTORS * SECTOR_SIZE))
+        kfree(probe)
+    prints(", ")
+    serial_print_dec(1 << ((*ns).lba_shift as u64))
+    prints("-byte LBAs\n")
 
 fn nvme_scan_namespaces(c: *NvmeController)
     var nsid: u32 = 1
     while nsid <= (*c).nn and nsid <= MAX_NSID_SCAN and nvme_ns_count < MAX_NVME_NAMESPACES
-        if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, nsid, (*c).buf, NVME_CNS_NAMESPACE, 0, 0) == 0
-            # NSZE (bytes 0-7); FLBAS (byte 26) picks an LBA format at 128 + 4n,
-            # whose LBADS (bits 23:16) is log2 of the LBA size.
+        if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, nsid, (*c).buf, 0, NVME_CNS_NAMESPACE, 0, 0) == 0
+            # NSZE (bytes 0-7, in LBAs); FLBAS (byte 26) picks an LBA format
+            # at 128 + 4n, whose LBADS (bits 23:16) is log2 of the LBA size.
             let nsze: u64 = *((*c).buf as *u64)
             let flbas: u64 = (*(((*c).buf + 26) as *u8) & 0xF) as u64
             let lbads: u32 = (mem_r32((*c).buf + 128 + 4 * flbas) >> 16) & 0xFF
-            if nsze != 0 and lbads != 9
+            let supported: bool = lbads >= NVME_MIN_LBADS and lbads <= NVME_MAX_LBADS
+            if nsze != 0 and not supported
                 prints("[nvme] nsid ")
                 serial_print_dec(nsid as u64)
                 prints(": LBA size 2^")
                 serial_print_dec(lbads as u64)
-                prints(" unsupported (512 only)\n")
-            if nsze != 0 and lbads == 9
+                prints(" unsupported (512 to 4096 bytes only)\n")
+            if nsze != 0 and supported
                 let ns: *NvmeNamespace = kalloc(sizeof(NvmeNamespace) as u64) as *NvmeNamespace
                 if ns != 0 as *NvmeNamespace
                     (*ns).ctrl = c
                     (*ns).nsid = nsid
-                    (*ns)._pad = 0
-                    (*ns).sectors = nsze
+                    (*ns).lba_shift = lbads
+                    (*ns).sectors = nsze << ((lbads - NVME_MIN_LBADS) as u64)
                     nvme_nss[nvme_ns_count] = ns
                     nvme_ns_count = nvme_ns_count + 1
                     nvme_announce(ns)
@@ -463,39 +508,89 @@ pub fn nvme_get_namespace(n: i32) -> *NvmeNamespace
 pub fn nvme_ns_sectors(ns: *NvmeNamespace) -> u64
     return (*ns).sectors
 
+# One read or write of `nlb` LBAs at `lba`, moving `bytes` bytes at byte
+# offset `off` of the bounce pages (off + bytes <= max_pages * PAGE_SIZE).
+# PRP1 is the first page plus the offset; PRP2 is the second page, or the
+# PRP list of every page after the first.
+fn nvme_io(c: *NvmeController, opc: u32, nsid: u32, off: u64, bytes: u64, lba: u64, nlb: u32) -> i32
+    let first: u64 = off / PAGE_SIZE
+    let last: u64 = (off + bytes - 1) / PAGE_SIZE
+    let prp1: u64 = (*c).bounce[first as i32] + (off % PAGE_SIZE)
+    var prp2: u64 = 0
+    if last == first + 1
+        prp2 = (*c).bounce[last as i32]
+    if last > first + 1
+        var k: u64 = first + 1
+        while k <= last
+            *(((*c).prp_list + (k - first - 1) * 8) as *u64) = (*c).bounce[k as i32]
+            k = k + 1
+        prp2 = (*c).prp_list
+    return nvme_cmd(c, NVME_IO_Q, opc, nsid, prp1, prp2, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, nlb - 1)
+
+# Copy `len` bytes between `user` and byte offset `off` of the bounce pages,
+# which are not contiguous: into the bounce pages when to_bounce.
+fn nvme_bounce_copy(c: *NvmeController, off: u64, user: *u8, len: u64, to_bounce: bool)
+    var i: u64 = 0
+    while i < len
+        let o: u64 = off + i
+        let in_page: u64 = o % PAGE_SIZE
+        var n: u64 = PAGE_SIZE - in_page
+        if n > len - i
+            n = len - i
+        let page: *u8 = ((*c).bounce[(o / PAGE_SIZE) as i32] + in_page) as *u8
+        let u: *u8 = user + i as i64
+        var j: u64 = 0
+        if to_bounce
+            while j < n
+                *(page + j as i64) = *(u + j as i64)
+                j = j + 1
+        else
+            while j < n
+                *(u + j as i64) = *(page + j as i64)
+                j = j + 1
+        i = i + n
+
 # Read or write `count` 512-byte sectors at `sector` through the bounce
-# buffer, at most one page per command. Returns 0, or a negative error.
+# pages. Each command covers whole native LBAs, at most max_pages pages; the
+# wanted sectors start `head` bytes into its first LBA. A write that leaves
+# part of its first or last LBA uncovered reads the span first and writes
+# the sectors over it (read-modify-write). Returns 0, or a negative error.
 fn nvme_ns_rw(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8, write: bool) -> i32
     if ns == 0 as *NvmeNamespace
         return -1
     if sector >= (*ns).sectors or (count as u64) > (*ns).sectors - sector
         return -1
     let c: *NvmeController = (*ns).ctrl
-    let dma: *u8 = (*c).buf as *u8
-    var done: u32 = 0
-    while done < count
-        var chunk: u32 = count - done
-        if chunk > NVME_MAX_SECTORS_PER_CMD
-            chunk = NVME_MAX_SECTORS_PER_CMD
-        let bytes: u64 = (chunk as u64) * 512
-        let user: *u8 = buf + ((done as u64) * 512) as i64
-        let lba: u64 = sector + done as u64
-        var j: u64 = 0
+    let shift: u64 = (*ns).lba_shift as u64
+    let lba_size: u64 = 1 << shift
+    let sectors_per_lba: u64 = lba_size / SECTOR_SIZE
+    let max_bytes: u64 = ((*c).max_pages as u64) * PAGE_SIZE
+    var opc: u32 = NVME_CMD_READ
+    if write
+        opc = NVME_CMD_WRITE
+    let total: u64 = count as u64
+    var done: u64 = 0
+    while done < total
+        let s: u64 = sector + done
+        let lba: u64 = s / sectors_per_lba
+        let head: u64 = (s % sectors_per_lba) * SECTOR_SIZE
+        var bytes: u64 = (total - done) * SECTOR_SIZE
+        if head + bytes > max_bytes
+            bytes = max_bytes - head
+        # Whole LBAs from `lba` that hold the head and the wanted bytes.
+        let span: u64 = (head + bytes + lba_size - 1) & ~(lba_size - 1)
+        let nlb: u32 = (span >> shift) as u32
+        let user: *u8 = buf + (done * SECTOR_SIZE) as i64
         if write
-            while j < bytes
-                *(dma + j as i64) = *(user + j as i64)
-                j = j + 1
-        var opc: u32 = NVME_CMD_READ
-        if write
-            opc = NVME_CMD_WRITE
-        if nvme_cmd(c, NVME_IO_Q, opc, (*ns).nsid, (*c).buf, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, chunk - 1) != 0
+            if span != bytes
+                if nvme_io(c, NVME_CMD_READ, (*ns).nsid, 0, span, lba, nlb) != 0
+                    return -5
+            nvme_bounce_copy(c, head, user, bytes, true)
+        if nvme_io(c, opc, (*ns).nsid, 0, span, lba, nlb) != 0
             return -5
         if not write
-            j = 0
-            while j < bytes
-                *(user + j as i64) = *(dma + j as i64)
-                j = j + 1
-        done = done + chunk
+            nvme_bounce_copy(c, head, user, bytes, false)
+        done = done + bytes / SECTOR_SIZE
     return 0
 
 pub fn nvme_ns_read(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
