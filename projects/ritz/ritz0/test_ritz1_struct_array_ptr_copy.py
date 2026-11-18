@@ -64,6 +64,9 @@ SOURCES = {
     "deref_inferred_r": "    var q: *[3]S = @x\n    let r = @q\n    let p{pann} = *r\n",
     "deref_annotated_r": "    var q: *[3]S = @x\n    let r: **[3]S = @q\n    let p{pann} = *r\n",
     "deref_mut_r": "    var q: *[3]S = @x\n    let r = @&q\n    let p{pann} = *r\n",
+    # #4154: a cast names S only in the annotation, which the parser latched in
+    # var_pointee_array_elem_name (#3663) and nothing outside monomorph read.
+    "cast": "    let p{pann} = @&x as *[3]S\n",
 }
 
 
@@ -396,3 +399,37 @@ def test_struct_array_pointer_pointer_local_elements(run_with, source, compiler)
     checks = _CHECKS.replace("p[", "(*r)[").replace("let p2 = p", "let p2 = *r")
     program = _S + "pub fn main() -> i32\n" + _FILL + setup + checks
     assert run_with(compiler, f"ptr_ptr_local_{source}", program) == 0
+
+
+# AGAST #4154, the ticket's program: `malloc(48) as *[2]P` there, a stack buffer
+# here (no ritzlib), S with padding.  ritz1 bound `p` with no `p#` view:
+# "unhandled EXPR_MEMBER in assignment"; and `*p = v` was "an array only fits a
+# slot of the same element type".
+_CAST_TICKET = """\
+struct P
+    a: u8
+    b: i64
+    c: u8
+
+pub fn main() -> i32
+    var buf: [6]i64
+    let p: *[2]P = @&buf as *[2]P
+    p[1].b = 55
+    if p[1].b != 55
+        return 2
+    p[0].c = 7
+    if p[0].c + p[1].b as u8 != 62
+        return 3
+    var v: [2]P
+    v[1].b = 9
+    *p = v
+    if p[1].b != 9
+        return 4
+    0
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_struct_array_pointer_cast_ticket(run_with, compiler):
+    assert run_with(compiler, "cast_ticket", _CAST_TICKET) == 0
