@@ -62,6 +62,8 @@ impl C
         self.x
     fn bump(self: @&C)
         self.x = 3
+    fn nudge(self:&)
+        self.x = 3
 
 fn same(r: @C) -> @C
     r
@@ -155,6 +157,13 @@ RECEIVERS = {
     "generic_impl": "struct B<T>\n    v: T\n\nimpl<T> B<T>\n    fn set(self: @&B<T>, v: T)\n"
                     "        self.v = v\n\nfn f(r: @B<i32>)\n    ^r.set(3)\n",
     "lent_self": "impl C\n    fn lb(self:& C)\n        self.x = 3\n\nfn f(r: @C)\n    ^r.lb()\n",
+    # #3983: a bare `self:&` is the same borrow (#2389), on the receiver or a field
+    # of it, followed to its root however deep.
+    "bare_self": "fn f(r: @C)\n    ^r.nudge()\n",
+    "bare_self_behind": "fn f(p: @W)\n    ^p.c.nudge()\n",
+    "bare_self_nested": "struct V\n    w: W\n\nfn f(p: @V)\n    ^p.w.c.nudge()\n",
+    "bare_self_of_address": "fn f()\n    var d = W { c: C { x: 1 }, a: [1, 2] }\n    (^@d).c.nudge()\n",
+    "bare_self_let_shared": "fn f(d: W)\n    let p = @d\n    ^p.c.nudge()\n",
     "trait_method": "trait Tr\n    fn tm(self: @&Self)\n\nimpl Tr for C\n    fn tm(self: @&C)\n"
                     "        self.x = 3\n\nfn f(r: @C)\n    ^r.tm()\n",
     "standalone": "import ritzlib.string\n\nfn f(s: @String)\n    ^s.as_ptr()\n",
@@ -229,6 +238,8 @@ ALLOWED = {
                                 "var h = H { r: null, m: null, q: @&c }\n    g(@h)", 3),
     "receiver_shared_self": ("fn g(r: @C) -> i32\n    r.get()\n", "g(@c)", 1),
     "receiver_mutable": ("fn g(m: @&C)\n    m.bump()\n", "g(@&c)", 3),
+    "receiver_mutable_bare_self": ("struct V\n    w: W\n\nfn g(m: @&V)\n    m.w.c.nudge()\n",
+                                   "var v = V { w: W { c: c, a: [1, 2] } }\n    g(@&v)\n    c.x = v.w.c.x", 3),
     "receiver_pointer": ("fn g(p: *C)\n    p.bump()\n", "g(@&c)", 3),
     "receiver_shared_standalone": ("import ritzlib.gvec\n\nfn g(v: @Vec<u8>) -> i64\n    v.len()\n",
                                    "var v = vec_new<u8>()\n    c.x = g(@v) as i32 + 1", 1),
