@@ -93,20 +93,45 @@ FORMS = {
                     "    p\n\n"
                     "fn main() -> i32\n"
                     "    return g(c\"x\") as i32\n", 2, 5),
+    # AGAST #4199: ritz0's other no-slot merge (a match) and its other
+    # return paths (a statement, and a `return` arm), each its own check.
+    "noslot_match": ("fn f(n: i64) -> i32\n"
+                     "    let p: *u8 = c\"x\"\n"
+                     "    let a = match n\n"
+                     "        0 => 1.5\n"
+                     "        _ => p\n"
+                     "    return a as i32\n\n"
+                     "fn main() -> i32\n"
+                     "    return f(1)\n", 5, 14),
+    # Used or not: a statement if, with no value to type, is refused too.
+    "noslot_stmt_if": ("fn h() -> f64\n"
+                       "    1.5\n\n"
+                       "fn q() -> *u8\n"
+                       "    c\"x\"\n\n"
+                       "fn f(n: i64) -> i32\n"
+                       "    if n > 2 then h() else q()\n"
+                       "    0\n\n"
+                       "fn main() -> i32\n"
+                       "    return f(1)\n", 8, 28),
+    "return_stmt": ("fn g(p: *u8) -> f64\n"
+                    "    return p\n\n"
+                    "fn main() -> i32\n"
+                    "    return g(c\"x\") as i32\n", 2, 12),
+    "return_arm": ("fn g(n: i64, p: *u8) -> f64\n"
+                   "    match n\n"
+                   "        0 => return p\n"
+                   "        _ => 1.5\n\n"
+                   "fn main() -> i32\n"
+                   "    return g(1, c\"x\") as i32\n", 3, 21),
 }
 
 # ritz1 and ritz1_selfhosted: forms with no located refusal yet (none since
 # AGAST #3626).
 RITZ1_GAPS = {}
 
-# ritz0: forms it doesn't refuse yet.  Each compiles (rc 0) to IR clang
-# rejects (`phi i8* [..], [0x3ff8...]`, `ret double %p`).
-RITZ0_GAPS = {
-    "arm_block_local": "ritz0 locates it at 4:1, not at the `q` (AGAST #4199)",
-    "noslot_if_else": "ritz0 merges an unannotated if at its then-arm's type (AGAST #4199)",
-    "noslot_if_then": "ritz0 merges an unannotated if at its then-arm's type (AGAST #4199)",
-    "return_slot": "ritz0 checks a let / var / arm merge, not a return (AGAST #4199)",
-}
+# ritz0: forms it doesn't refuse yet (none since AGAST #4199, which refused
+# the no-slot merges and returns that compiled to IR clang rejects).
+RITZ0_GAPS = {}
 
 
 def _compile(compiler, tmp_path, source):

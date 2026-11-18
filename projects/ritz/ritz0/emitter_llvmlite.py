@@ -6604,6 +6604,8 @@ class LLVMEmitter:
                     self._emit_drop_for_all_scopes(exclude_var)
                     self.builder.ret(ir.Constant(ret_type, 0))
                     return fn
+                # #4199: `-> f64` with tail `p` emitted `ret double %p`.
+                self._reject_pointer_into_float(last_val, ret_type, fn_def.body.expr)
                 last_val = self._convert_type(last_val, ret_type, fn_def.body.expr)
                 # A fn with no declared return type is a procedure: its tail
                 # expression is evaluated for effect only. _convert_type
@@ -7499,6 +7501,7 @@ class LLVMEmitter:
                 self._reject_struct_as_int(val, ret_type, ret_ritz, stmt.value, ret_span)
                 self._reject_another_struct_return(val, ret_type, getattr(stmt, 'span', None) or ret_span)
                 self._check_return_narrowing(stmt.value, val, ret_type, ret_ritz)
+                self._reject_pointer_into_float(val, ret_type, stmt.value)  # #4199
                 val = self._convert_type(val, ret_type, stmt.value)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
@@ -8790,6 +8793,11 @@ class LLVMEmitter:
                 # 1.5 to 1 (#2094).
                 if float_ty is None:
                     self._reject_mixed_int_float_arms(if_expr, arm_types)
+                    # #4199: unannotated, by size `then 1.5 else p` merged
+                    # at i8* too: a float arm makes it a float merge.
+                    self._reject_pointer_beside_float([
+                        (then_value, if_expr.then_block.expr),
+                        (else_value, if_expr.else_block.expr)])
                 else:
                     # #2093: by size, `then p else 1.5` merged at i8*.
                     self._reject_pointer_into_float(
@@ -12115,6 +12123,7 @@ class LLVMEmitter:
             self._reject_struct_as_int(ret_val, ret_type, ret_ritz, expr.value, ret_span)
             self._reject_another_struct_return(ret_val, ret_type, getattr(expr, 'span', None) or ret_span)
             self._check_return_narrowing(expr.value, ret_val, ret_type, ret_ritz)
+            self._reject_pointer_into_float(ret_val, ret_type, expr.value)  # #4199
             ret_val = self._convert_type(ret_val, ret_type)
             self._emit_drop_for_all_scopes()
             self.builder.ret(ret_val)
@@ -16947,8 +16956,28 @@ class LLVMEmitter:
         if at is None:
             origin = self._value_origin.get(id(val))
             at = origin[1] if origin is not None and origin[0] is val else None
+        # #4199: an arm block's value is its tail (`let q: *u8 ...` then
+        # `q`), reported there rather than at the block's first line.
+        while isinstance(at, rast.Block) and at.expr is not None:
+            at = at.expr
         raise EmitError(self.POINTER_AS_FLOAT,
                         self._value_span(at) if at is not None else None)
+
+    def _reject_pointer_beside_float(self, arms: list) -> None:
+        """Refuse a pointer arm of an unannotated merge with a float arm.
+
+        `arms` is (value, located expr or None). With no float slot ritz0
+        merged by size, so `if c then 1.5 else p` built `phi i8*` over a
+        double (#4199); a float arm fixes the merge as a float, as ritz1's
+        Sema does, and the pointer is #2093's error at the pointer. Used or
+        not: ritz1 refuses a statement-position merge too.
+        """
+        float_tys = [v.type for v, _ in arms
+                     if isinstance(v.type, (ir.FloatType, ir.DoubleType))]
+        if not float_tys:
+            return
+        for val, at in arms:
+            self._reject_pointer_into_float(val, float_tys[0], at)
 
     def _merge_value_used(self, node) -> bool:
         """Whether the value of match / if `node` is used (#2046, #2094)."""
@@ -16979,6 +17008,7 @@ class LLVMEmitter:
         float_ty = self._float_merge_type(expr)
         if float_ty is None:
             self._reject_mixed_int_float_arms(expr, [v.type for v, _ in incoming])
+            self._reject_pointer_beside_float([(v, None) for v, _ in incoming])
             return None
         for val, _ in incoming:
             self._reject_pointer_into_float(val, float_ty)
