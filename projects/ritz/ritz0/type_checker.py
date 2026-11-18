@@ -1510,6 +1510,8 @@ class TypeChecker:
         """Type check struct literal."""
         struct_info = self.structs.get(expr.name)
         if struct_info is None:
+            struct_info = self._builtin_span_struct(expr)
+        if struct_info is None:
             self._error(f"undefined struct: {expr.name}", expr.span)
             # Its values are typed all the same (typed.py's readers).
             for _name, value in expr.fields:
@@ -1532,6 +1534,21 @@ class TypeChecker:
                               f"got {self._type_str(value_type)}", value.span)
 
         return rast.NamedType(expr.span, expr.name, list(expr.type_args) if expr.type_args else [])
+
+    @staticmethod
+    def _builtin_span_struct(expr: rast.StructLit) -> Optional[StructInfo]:
+        """`Span<T> { ptr, len }` with no `struct Span` in the program: the
+        built-in `{ ptr: *T, len: i64 }` at the literal's own `T` (AGAST
+        #3597), the struct the emitter builds for it
+        (`_ensure_builtin_generic_struct_specialization`).  It needs its type
+        argument, as the emitter does."""
+        if expr.name != 'Span' or len(expr.type_args or []) != 1:
+            return None
+        elem = expr.type_args[0]
+        return StructInfo('Span', [
+            ('ptr', rast.PtrType(expr.span, elem, mutable=False)),
+            ('len', rast.NamedType(expr.span, 'i64', [])),
+        ])
 
     def _check_match(self, expr: rast.Match) -> rast.Type:
         """Type check match expression."""
@@ -2382,6 +2399,11 @@ class TypeChecker:
         if not isinstance(expr, rast.Ident) or self._lookup_var(expr.name) is not None:
             return None
         if expr.name in self.structs or expr.name in self.enums:
+            return expr.name
+        # `Span.empty()`: the built-in Span, typed by the emitter from its
+        # slot (AGAST #3597); its methods are the emitter's.  (A local
+        # `Span` returned None above, as in _builtin_type_receiver.)
+        if expr.name == 'Span':
             return expr.name
         return None
 
