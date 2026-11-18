@@ -15,8 +15,8 @@ cannot reach every shape:
   `>>`-closed generic call type argument, and the right-shift / comparison
   expressions that must NOT become generics.
 * multi-parameter generic structs (AGAST #1574): `HashMap<Key,
-  Vec<Connection>>` fields, `Pair<i64, Vec<i64>> { ... }` literals, `>>` in
-  impl headers, and plain `Pair<i64, i32>`. ritz1 used to mangle and
+  Vec<Connection>>` fields, `Pair<i64, Vec<i64>> { ... }` literals and
+  plain `Pair<i64, i32>`. ritz1 used to mangle and
   substitute on the FIRST type argument only (`%Pair$i64 = type {i64,
   %B$i64}`); it now mangles on every argument (`Pair$i64_i32` in the IR,
   AGAST #3446) and substitutes every parameter.
@@ -32,6 +32,7 @@ import pytest
 import fast_link
 
 from ritz0_inproc import run_ritz0
+from test_ref_into_value import _assert_refused
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -441,23 +442,6 @@ pub fn main() -> i32
     let u: Triple<i64, i32, i64> = same<i64>(t)
     return (u.a + u.b as i64 + u.c) as i32
 """,
-    # `>>` in an impl header. The method is compiled but not called: neither
-    # compiler dispatches `b2.seven()` to an impl on a concrete instantiation
-    # (ritz0: "No method 'seven' found for type 'Box$Box_i64'").
-    "impl_header": BOX
-    + """\
-impl Box<Box<i64>>
-    fn seven(self: *Box<Box<i64>>) -> i32
-        return 7
-
-pub fn main() -> i32
-    var b1: Box<i64>
-    b1.v = 7
-    var b2: Box<Box<i64>>
-    b2.v = b1
-    let o1: Box<i64> = b2.v
-    return o1.v as i32
-""",
 }
 
 
@@ -556,3 +540,30 @@ def test_multi_arg_names_join_args_with_underscore(ritz1_bin, tmp_path, compiler
 def test_ritz1_runs_spec_mangled_multi_arg(ritz1_bin, tmp_path):
     """3 + 1 + 1 + 2: the `_`-spelled instances still link and run."""
     assert _run("ritz1", tmp_path, "spec_mangle_run", SPEC_MANGLE) == EXPECTED
+
+
+# `>>` in an impl header: the only such header names one instantiation
+# (`impl Box<Box<i64>>`), which LARB R65 refuses (#3493), so the header is
+# parsed through to that error, at the impl's type name. This row compiled the
+# method without calling it: neither compiler dispatched to an impl on one
+# instantiation. ritz1's refusal is #3494.
+IMPL_HEADER = BOX + """\
+impl ^Box<Box<i64>>
+    fn seven(self: *Box<Box<i64>>) -> i32
+        return 7
+
+pub fn main() -> i32
+    return 0
+"""
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", [
+    "ritz0",
+    pytest.param("ritz1", marks=pytest.mark.xfail(strict=True, reason="#3494")),
+])
+def test_impl_header_closing_with_shr_is_one_instantiation(request, tmp_path, compiler):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    _assert_refused(compiler, tmp_path, "impl_header", IMPL_HEADER,
+                    "an impl covers every instantiation of `Box`: write `impl<T> Box<T>`")
