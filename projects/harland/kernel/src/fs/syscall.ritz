@@ -5,7 +5,7 @@
 
 import serial { StrView, prints }
 import fs.vfs { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
-import fs.fd { FdTable, FileDescriptor, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_get }
+import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
 import syscall.errno { Errno }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_resolve, knamespace_read, knamespace_write, knamespace_exists, knamespace_mkdir }
 import fs.kblob { KBlobStore, KBlobId, kblob_id_is_zero, kblob_id_copy, kblob_store_get, kblob_store_get_size, kblob_get_store }
@@ -74,13 +74,16 @@ fn fs_current_proc() -> *FsProc
         return 0 as *FsProc
     fs_procs[fs_current]
 
-# p's open file at fd, or null if fd is not an open file of p.
+# p's open file at fd, or null if fd is not an open file of p. A dup'd fd
+# has no FsFile of its own: it shares its owner's (fd_owner), so dups see
+# one position and one write buffer, as POSIX dup does (AGAST #2786).
 fn fs_file(p: *FsProc, fd: i32) -> *FsFile
     if p == 0 as *FsProc or fd < 3 or fd >= MAX_FDS
         return 0 as *FsFile
-    if fd_get(@(*p).table, fd) == 0 as *FileDescriptor
+    let owner_fd: i32 = fd_owner(@(*p).table, fd)
+    if owner_fd < 0
         return 0 as *FsFile
-    @(*p).files[fd]
+    @(*p).files[owner_fd]
 
 # A process starts running: give it an empty fd table and make it current.
 # 0, Errno.Again (FS_MAX_PROCS live already) or Errno.NoMem.
@@ -247,6 +250,18 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     fd as i64
 
 # ============================================================================
+# sys_dup - A second fd for an open file
+# ============================================================================
+#
+# The new fd shares fd's FsFile (see fs_file). Not in the syscall table yet.
+
+pub fn sys_dup(fd: i32) -> i64
+    let p: *FsProc = fs_current_proc()
+    if fs_file(p, fd) == 0 as *FsFile
+        return Errno.BadF as i64
+    fd_dup(@(*p).table, fd) as i64
+
+# ============================================================================
 # sys_close - Close a file descriptor
 # ============================================================================
 
@@ -256,10 +271,18 @@ pub fn sys_close(fd: i32) -> i64
         return Errno.BadF as i64
     fs_close_file(p, fd) as i64
 
-# Flush fd's pending writes, release its state and free the fd: 0, or the
-# flush's Errno. Shared by sys_close and fs_process_end.
+# Free fd. Its open file's state goes only with the file's last fd: then
+# flush its pending writes and release it (0, or the flush's Errno). While
+# other fds share it, it stays; if fd owned it, it moves to the fd that
+# fd_free makes the new owner. Shared by sys_close and fs_process_end.
 fn fs_close_file(p: *FsProc, fd: i32) -> i32
-    let f: *FsFile = @(*p).files[fd]
+    let owner_fd: i32 = fd_owner(@(*p).table, fd)
+    if fd_refs(@(*p).table, fd) > 1
+        if owner_fd == fd
+            fs_file_move(@(*p).files[fd], @(*p).files[fd_heir(@(*p).table, fd)])
+        fd_free(@(*p).table, fd)
+        return 0
+    let f: *FsFile = @(*p).files[owner_fd]
     let flush_result: i32 = fs_flush_write_buffer(f)
     if (*f).path != 0 as *u8
         kfree((*f).path)
@@ -268,6 +291,19 @@ fn fs_close_file(p: *FsProc, fd: i32) -> i32
     (*f).position = 0
     fd_free(@(*p).table, fd)
     flush_result
+
+# Move an open file's state from one fd's slot to another's.
+fn fs_file_move(src: *FsFile, dst: *FsFile)
+    (*dst).blob_id = kblob_id_copy(@(*src).blob_id)
+    (*dst).data_ptr = (*src).data_ptr
+    (*dst).size = (*src).size
+    (*dst).position = (*src).position
+    (*dst).flags = (*src).flags
+    (*dst).wbuf = (*src).wbuf
+    (*dst).wbuf_size = (*src).wbuf_size
+    (*dst).wbuf_cap = (*src).wbuf_cap
+    (*dst).path = (*src).path
+    (*dst).path_len = (*src).path_len
 
 # ============================================================================
 # sys_read - Read from a file

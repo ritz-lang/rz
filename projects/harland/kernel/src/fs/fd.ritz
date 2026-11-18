@@ -6,7 +6,7 @@
 # fd_get looks one up and fd_dup makes a second fd for the same open file
 # (ref-counted on the owning slot). The table only tracks which fds exist;
 # what an fd refers to lives with its owner (fs/syscall.ritz keeps a
-# per-process FsFile array indexed by fd).
+# per-process FsFile array indexed by owner fd: fd_owner, fd_heir).
 
 import syscall.errno { Errno }
 
@@ -115,14 +115,7 @@ pub fn fd_free(table: *FdTable, fd: i32) -> i32
 
     # The owner, with dups left: the first dup becomes the owner.
     if refs > 0
-        var heir: i32 = -1
-        var i: i32 = 3
-        while i < MAX_FDS
-            let c: *FileDescriptor = fd_slot(table, i)
-            if i != fd and (*c).used != 0 and (*c).target_fd == owner_fd
-                heir = i
-                break
-            i = i + 1
+        let heir: i32 = fd_heir(table, fd)
         if heir < 0
             return Errno.BadF as i32
         let h: *FileDescriptor = fd_slot(table, heir)
@@ -141,22 +134,50 @@ pub fn fd_free(table: *FdTable, fd: i32) -> i32
     (*table).ref_counts[owner_fd] = 0
     return 0
 
-# The descriptor that owns fd's open file, or null if fd is not open.
-pub fn fd_get(table: *FdTable, fd: i32) -> *FileDescriptor
+# The fd that owns fd's open file (fd itself unless fd is a dup), or -1 if
+# fd is not open. Per-fd state kept outside the table (fs/syscall.ritz's
+# FsFile) lives at the owner's index, so every dup of a file shares it.
+pub fn fd_owner(table: *FdTable, fd: i32) -> i32
     if table == 0 as *FdTable
-        return 0 as *FileDescriptor
+        return -1
     if fd < 0 or fd >= MAX_FDS
-        return 0 as *FileDescriptor
+        return -1
     let slot: *FileDescriptor = fd_slot(table, fd)
     if (*slot).used == 0
-        return 0 as *FileDescriptor
+        return -1
     let owner_fd: i32 = (*slot).target_fd
     if owner_fd < 0 or owner_fd >= MAX_FDS
+        return -1
+    if (*fd_slot(table, owner_fd)).used == 0
+        return -1
+    return owner_fd
+
+# How many fds refer to fd's open file (1 unless it is dup'd), or 0 if fd is
+# not open.
+pub fn fd_refs(table: *FdTable, fd: i32) -> i32
+    let owner_fd: i32 = fd_owner(table, fd)
+    if owner_fd < 0
+        return 0
+    return table.ref_counts[owner_fd]
+
+# The fd that takes over owner_fd's open file when owner_fd is freed with
+# dups left (the lowest of them), or -1 if it has none. fd_free hands
+# ownership to exactly this fd, so a caller can move per-fd state first.
+pub fn fd_heir(table: *FdTable, owner_fd: i32) -> i32
+    var i: i32 = 3
+    while i < MAX_FDS
+        let c: *FileDescriptor = fd_slot(table, i)
+        if i != owner_fd and (*c).used != 0 and (*c).target_fd == owner_fd
+            return i
+        i = i + 1
+    return -1
+
+# The descriptor that owns fd's open file, or null if fd is not open.
+pub fn fd_get(table: *FdTable, fd: i32) -> *FileDescriptor
+    let owner_fd: i32 = fd_owner(table, fd)
+    if owner_fd < 0
         return 0 as *FileDescriptor
-    let owner: *FileDescriptor = fd_slot(table, owner_fd)
-    if (*owner).used == 0
-        return 0 as *FileDescriptor
-    return owner
+    return fd_slot(table, owner_fd)
 
 # A new fd for old_fd's open file, or an Errno.
 pub fn fd_dup(table: *FdTable, old_fd: i32) -> i32

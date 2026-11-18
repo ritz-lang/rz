@@ -503,6 +503,61 @@ def test_process_holds_253_fds(compiler, tmp_path):
     assert rc == 0, f"{compiler}: {CAPACITY_CLAIMS.get(rc, f'exit {rc}')}"
 
 
+# A dup'd fd shares its original's open file (AGAST #2786): the same blob and
+# one position (POSIX dup), whichever fd closes first; pending writes flush
+# once, when the last fd closes; a dup left open at exit is closed too; and
+# nothing is freed twice. stdio and unopened fds don't dup. sys_dup is not
+# in the syscall table yet; this pins what wiring it will expose.
+DUP = FS_PRELUDE + """\
+fn main() -> i32
+    let base: i64 = heap_live()
+    if fs_process_start(1) != 0
+        return 1
+    if sys_open(c"/a", 2, O_RDONLY) != 3 or sys_dup(3) != 4
+        return 2
+    if not reads(4, c"al", 2) or not reads(3, c"pha", 3)
+        return 3
+    if sys_close(3) != 0 or is_fs_fd(3)
+        return 4
+    if sys_lseek(4, 0, SEEK_SET) != 0 or not reads(4, c"alpha", 5)
+        return 5
+    if sys_close(4) != 0 or is_fs_fd(4) or sys_close(4) != Errno.BadF as i64
+        return 6
+    if sys_open(c"/w", 2, O_WRONLY | O_CREAT) != 3 or sys_dup(3) != 4
+        return 7
+    if sys_fs_write(3, c"he", 2) != 2 or sys_fs_write(4, c"llo", 3) != 3
+        return 8
+    let writes: i32 = stub_writes()
+    if sys_close(4) != 0 or stub_writes() != writes
+        return 9
+    if sys_close(3) != 0 or stub_writes() != writes + 1 or not stub_holds(c"/w", 2, c"hello", 5)
+        return 10
+    if sys_dup(1) != Errno.BadF as i64 or sys_dup(9) != Errno.BadF as i64
+        return 11
+    if sys_open(c"/a", 2, O_RDONLY) != 3 or sys_dup(3) != 4
+        return 12
+    if fs_process_end() != 2 or heap_live() != base
+        return 13
+    0
+"""
+
+DUP_CLAIMS = {1: "init gets a table", 2: "open /a as 3, dup as 4",
+              3: "the dup reads the same file at one shared position",
+              4: "the original closes", 5: "the dup still reads after the original closed",
+              6: "the dup closes, once", 7: "open /w as 3, dup as 4",
+              8: "both fds write", 9: "closing one fd does not flush",
+              10: "the last close flushes both writes once",
+              11: "stdio and unopened fds don't dup",
+              12: "open /a and dup it again", 13: "exit closes both; nothing leaked or double-freed"}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_dup_shares_the_open_file(compiler, tmp_path):
+    rc = _run(compiler, tmp_path, DUP, FS_MODULES)
+    assert rc == 0, f"{compiler}: {DUP_CLAIMS.get(rc, f'exit {rc}')}"
+
+
 # --- where the process layer calls fs ---------------------------------------------
 
 def _fn(path, name):
