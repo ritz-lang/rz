@@ -4990,6 +4990,8 @@ fn main() -> i32
 
 An rvalue has no address, so `@f()` and `@"text"` are refused: bind it to a local
 first. A whole array is the same for a `Span<T>`: `@a` fits and `a` doesn't.
+A `Vec<T>` is too: `@v` (or `@&v`) is a `Span<T>` of its elements, and `v` itself
+doesn't fit. Either way the element must be `T` (AGAST #3595).
 
 ```ritz expect-error="a value doesn't fit a reference slot: write `@x` to borrow it"
 import ritzlib.span
@@ -5000,6 +5002,19 @@ fn total(s: Span<i32>) -> i64
 fn main() -> i32
     var a: [2]i32 = [1, 2]
     total(a) as i32                 # error: write total(@a)
+```
+
+```ritz
+import ritzlib.gvec
+
+fn total(s: Span<u8>) -> i64
+    s.len
+
+fn main() -> i32
+    var a: [2]u8 = [1, 2]
+    var v = vec_new<u8>()
+    v.push(3)
+    (total(@a) + total(@v) - 3) as i32
 ```
 
 A `name:& *U` parameter follows the same rule at `T` = `*U`: `h` is a `*U`, and
