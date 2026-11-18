@@ -5,8 +5,8 @@
 
 `make ritz1-unit` runs this, and it is a step of CI's bootstrap job, so the
 gate runs it (AGAST #1556).  The files test ritz1/src modules directly
-(lexer_nfa.ritz, ...) by importing them: RITZ_PATH gets ritz1/src, so
-`import lexer_nfa` resolves as it does when ritz1 is built.
+(lexer.ritz, ...) by importing them: RITZ_PATH gets ritz1/src, so
+`import lexer` resolves as it does when ritz1 is built.
 
 Each file runs through `build.py test <ritz1> --unit-file`, the same per-file
 unit `rz test` uses.  That classifies a file that runs zero tests as a

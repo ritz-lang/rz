@@ -22,7 +22,7 @@ This document outlines the ideal architecture for the Ritz parser system. The go
 | `emit_min.ritz` | 982 | OK | Minimal emitter for bootstrap |
 | `ir.ritz` | 751 | OK | IR types and operations |
 | `emitter.ritz` | 696 | OK | Full emitter (unused in bootstrap) |
-| `lexer_nfa.ritz` | 990 | OK | Direct-coded lexer (AGAST #1821; no NFA, the name stayed) |
+| `lexer.ritz` | 990 | OK | Direct-coded lexer (no NFA since AGAST #1821; renamed by #3887) |
 | `ast.ritz` | 333 | ✅ | AST types and constants |
 | `main.ritz` | 242 | ✅ | Entry point |
 | `layout.ritz` | 143 | ✅ | Struct layout computation |
@@ -132,7 +132,7 @@ ast_helpers/
                               ↓ uses
 ┌─────────────────────────────────────────────────────────────────┐
 │                          LEXER LAYER                            │
-│  lexer_nfa.ritz - Direct-coded scanner (hand-written)           │
+│  lexer.ritz - Direct-coded scanner (hand-written)               │
 └─────────────────────────────────────────────────────────────────┘
                               ↓ produces tokens
 ┌─────────────────────────────────────────────────────────────────┐

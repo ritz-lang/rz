@@ -1,9 +1,9 @@
 """The generated token_new must keep the token's source pointer (AGAST #3888).
 
 It took `pos: i64`, dropped it, and set `start: null`, so only tokens that
-went through lexer_nfa's lexer_token (which patched `start` afterwards) said
+went through lexer.ritz's lexer_token (which patched `start` afterwards) said
 where they were; INDENT, DEDENT, EOF and lexer_fail's errors kept null.
-token_new now takes the pointer itself.  ritz1/test/test_lexer_nfa.ritz
+token_new now takes the pointer itself.  ritz1/test/test_lexer.ritz
 checks the lexer's tokens; this checks the generator emits that shape.
 """
 

@@ -113,7 +113,7 @@ HAND_WRITTEN_TOKEN_IDS = {
     'IDENT': 130, 'NUMBER': 131, 'STRING': 132, 'CSTRING': 133,
     'SSTRING': 134, 'CHAR': 135,
     # One raw line of an `asm` block's body (AGAST #3394).  No pattern: the
-    # lexer makes it in its asm body mode (lexer_nfa.ritz lexer_asm_line).
+    # lexer makes it in its asm body mode (lexer.ritz lexer_asm_line).
     'ASM_LINE': 136,
     # Whitespace
     'WHITESPACE': 140, 'COMMENT': 141,
@@ -123,7 +123,7 @@ HAND_WRITTEN_TOKEN_IDS = {
 # Grammar tokens the lexer makes itself, never by matching a pattern.
 SCANNER_SKIP_TOKENS = frozenset({'EOF', 'ERROR', 'SKIP', 'NEWLINE', 'INDENT', 'DEDENT', 'ASM_LINE'})
 
-# The regex tokens ritz1/src/lexer_nfa.ritz scans by hand, exactly as the
+# The regex tokens ritz1/src/lexer.ritz scans by hand, exactly as the
 # grammar spells them (AGAST #1821).  The generator refuses any other
 # pattern: a changed regex needs its scan_* function changed with it.
 SCANNED_REGEX_TOKENS = {
@@ -863,7 +863,7 @@ class RitzGenerator:
     # file it lexed (557 KB of stack each) and simulate it by recursive
     # backtracking.  Now the generator does the work once: the literal tokens
     # become two direct-coded functions, and the regex tokens are checked
-    # against the hand-written scanners in lexer_nfa.ritz that implement them.
+    # against the hand-written scanners in lexer.ritz that implement them.
 
     def _scanner_tokens(self):
         """Split the grammar's lexable tokens into (keywords, operators).
@@ -887,7 +887,7 @@ class RitzGenerator:
                         f"token {tok.name} = /{tok.pattern}/: ritz1's scanner has no "
                         f"code for this pattern (it implements {sorted(SCANNED_REGEX_TOKENS)} "
                         "as written in SCANNED_REGEX_TOKENS). Change the scan_* function "
-                        "in ritz1/src/lexer_nfa.ritz and SCANNED_REGEX_TOKENS together."
+                        "in ritz1/src/lexer.ritz and SCANNED_REGEX_TOKENS together."
                     )
                 continue
             text = tok.pattern
@@ -933,7 +933,7 @@ class RitzGenerator:
         self._emit('#')
         self._emit("# The grammar's literal tokens, direct-coded.  Its regex tokens (IDENT,")
         self._emit('# NUMBER, FLOAT, STRING, CHAR, CSTRING, WHITESPACE, COMMENT) are')
-        self._emit("# scanned by hand in lexer_nfa.ritz; the generator refuses a grammar")
+        self._emit("# scanned by hand in lexer.ritz; the generator refuses a grammar")
         self._emit('# whose patterns differ from the ones those functions implement.')
         self._emit('')
         self._emit('import tokens_gen')

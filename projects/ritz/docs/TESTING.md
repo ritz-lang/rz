@@ -528,7 +528,7 @@ projects/ritz/
 ├── ritz1/
 │   └── test/
 │       └── test_*.ritz       # unit suites for ritz1/src modules (nfa, regex,
-│                             #   lexer_nfa): `make ritz1-unit`, a bootstrap
+│                             #   lexer): `make ritz1-unit`, a bootstrap
 │                             #   gate step; red on zero tests (AGAST #1556)
 └── examples/
     └── tier{1..5}_*/*/

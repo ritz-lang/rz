@@ -19,7 +19,7 @@ shallower is an error at that line, with ritz0's message.
 THE FIX
 
 ritz1's lexer marks the line after one that ends in an operator as a
-continuation (lexer_nfa.ritz `cont_line`): no INDENT / DEDENT, and a shallower
+continuation (lexer.ritz `cont_line`): no INDENT / DEDENT, and a shallower
 one is refused.  ritz0 decides `>` / `>>` in its parser; ritz1's lexer
 can't, so a line ending in `>` / `>>` that holds a declaration keyword (`fn`,
 `struct`, `enum`, `impl`, `trait`, `type`, `extern`) ends a generic list, not

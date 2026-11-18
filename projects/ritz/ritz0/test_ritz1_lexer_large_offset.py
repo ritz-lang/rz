@@ -54,12 +54,12 @@ RITZ1_SRC = RITZ_ROOT / "ritz1" / "src"
 
 # The lexer and everything it transitively imports. ritz0 compiles one module
 # at a time, so each is compiled and linked explicitly.
-LOCAL_MODULES = ["tokens_gen", "lexer_scan_gen", "lexer_nfa"]
+LOCAL_MODULES = ["tokens_gen", "lexer_scan_gen", "lexer"]
 RITZLIB_MODULES = ["memory", "strview", "sys", "str", "fmt"]  # str imports fmt (itoa)
 
 PROBE_HEAD = """\
 import tokens_gen
-import lexer_nfa
+import lexer
 
 # Returns start-minus-2^32 (0 when the position survived), or -1 if the lexer
 # produced a different token kind than the case expects.
@@ -86,7 +86,7 @@ fn main() -> i32
 
 # (id, source bytes as a c-string literal, length, expected token kind)
 CASES = [
-    # lexer_nfa.ritz — the generic path (lexer_emit)
+    # lexer.ritz — the generic path (lexer_emit)
     pytest.param('c"abc "', 4, "TOK_IDENT", id="ident-generic-path"),
     # string literal path: `let start` and the derived `len`
     pytest.param('c"\\"ab\\" "', 5, "TOK_STRING", id="string-literal"),

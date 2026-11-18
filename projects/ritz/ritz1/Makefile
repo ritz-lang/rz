@@ -21,7 +21,7 @@ SRC_DIR = src
 SOURCES = \
 	tokens_gen \
 	lexer_scan_gen \
-	lexer_nfa \
+	lexer \
 	ast \
 	types \
 	diag \
