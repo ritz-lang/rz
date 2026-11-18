@@ -241,6 +241,25 @@ let sized = 100u16      # Typed suffix
 There is no octal literal form. `0o77` lexes as `0` followed by the identifier
 `o77` and fails at name resolution.
 
+#### Digit Separators
+
+A `_` may separate two digits of a numeric literal, decimal, hex or binary:
+`1_000_000`, `0xFFFF_FFFF`. It has no value. It may not start or end the
+digits, follow the `0x`/`0b` prefix, stand next to another `_`, or touch a
+`.`, exponent or type suffix (LARB R73).
+
+```ritz body
+let million = 1_000_000         # 1000000
+let mask = 0xFFFF_FFFF as u64   # 4294967295
+let bits = 0b1010_0101          # 165
+let big = 1_000u64              # before a suffix: digits, then the suffix
+let f = 1_000.2_5e1_0           # each digit run of a float may be grouped
+```
+
+A misplaced `_` is a lexical error at that `_`: `1_`, `1__0`, `0x_FF`, `1_.5`,
+`1._5`, `1_e5`, `1e_5`, `1_u8`, and `0b1_2` (`2` is no binary digit). A `_`
+must also have a digit of the literal's own base on each side.
+
 #### Float Literals
 
 ```ritz body

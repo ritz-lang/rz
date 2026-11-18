@@ -467,6 +467,26 @@ class Lexer:
             return suffix
         return None
 
+    # LANGUAGE_SPEC §2.6, LARB R73 (AGAST #3584): a `_` only ever stands
+    # between two digits.  ritz1's lexer_check_separators says the same.
+    SEPARATOR_MESSAGE = "`_` must stand between two digits of a numeric literal"
+
+    def _check_separators(self, start_pos: int, start_span: Span, digits: str):
+        """Refuse a `_` in source[start_pos:self.pos] that isn't between two
+        of `digits`: one that starts or ends the digits, follows the `0x` /
+        `0b` prefix, stands by another `_`, or touches a `.`, an exponent or
+        a suffix.  The scan loops take every `_` they meet, so each of those
+        is inside the span, and the error is at it.  A literal is one line.
+        """
+        for i in range(start_pos, self.pos):
+            if self.source[i] != '_':
+                continue
+            before, after = self.source[i - 1], self.source[i + 1:i + 2]
+            if before not in digits or not after or after not in digits:
+                at = Span(self.filename, start_span.line,
+                          start_span.column + (i - start_pos), 1)
+                raise LexerError(self.SEPARATOR_MESSAGE, at)
+
     def _lex_number(self) -> Token:
         """Lex a number literal (int or float)."""
         start_span = self._span()
@@ -480,6 +500,7 @@ class Lexer:
                 self._advance()  # x
                 while self._peek() in '0123456789abcdefABCDEF_':
                     self._advance()
+                self._check_separators(start_pos, start_span, '0123456789abcdefABCDEF')
                 text = self.source[start_pos:self.pos].replace('_', '')
                 try:
                     value = int(text, 16)
@@ -492,6 +513,7 @@ class Lexer:
                 self._advance()  # b
                 while self._peek() in '01_':
                     self._advance()
+                self._check_separators(start_pos, start_span, '01')
                 text = self.source[start_pos:self.pos].replace('_', '')
                 try:
                     value = int(text, 2)
@@ -508,28 +530,33 @@ class Lexer:
         # `p.0.1` is the path p . 0 . 1, not p . FLOAT(0.1) (AGAST #2284).
         # Rust splits the float token in its parser for the same reason.
         if self.last_token_type == TokenType.DOT:
+            self._check_separators(start_pos, start_span, '0123456789')
             text = self.source[start_pos:self.pos].replace('_', '')
             return Token(TokenType.INT, int(text), start_span)
 
-        # Check for float
+        # Check for float.  `1._5` takes the `_` in, for _check_separators to
+        # refuse: a `_` may not touch the `.` (`1.e5` stays `1 . e5`).
         is_float = False
-        if self._peek() == '.' and self._peek(1).isdigit():
+        if self._peek() == '.' and (self._peek(1).isdigit() or
+                                    (self._peek(1) == '_' and self._peek(2).isdigit())):
             is_float = True
             self._advance()  # .
             while self._peek().isdigit() or self._peek() == '_':
                 self._advance()
 
-        # Check for exponent
+        # Check for exponent.  A `_` straight after `e` or its sign is taken
+        # in too, and refused by _check_separators, not as a missing digit.
         if self._peek() in 'eE':
             is_float = True
             self._advance()
             if self._peek() in '+-':
                 self._advance()
-            if not self._peek().isdigit():
+            if not (self._peek().isdigit() or self._peek() == '_'):
                 raise LexerError("Expected digit after exponent", self._span())
             while self._peek().isdigit() or self._peek() == '_':
                 self._advance()
 
+        self._check_separators(start_pos, start_span, '0123456789')
         text = self.source[start_pos:self.pos].replace('_', '')
 
         suffix = self._lex_number_suffix()

@@ -602,6 +602,17 @@ fn lexer_run(lex: *Lexer, at: i64, class: i32) -> i64
     n = n + 1
   n
 
+# How many bytes from `at` on are in `class` or a `_` (a digit separator,
+# LANGUAGE_SPEC §2.6, AGAST #3584).  Every `_` a number's digits run into is
+# taken in, wherever it stands, for lexer_check_separators to place.
+fn lexer_run_sep(lex: *Lexer, at: i64, class: i32) -> i64
+  var n: i64 = 0
+  var c: i32 = lexer_at(lex, at)
+  while c == 95 or lexer_in_class(c, class) == 1                 # _
+    n = n + 1
+    c = lexer_at(lex, at + n)
+  n
+
 # IDENT /[a-zA-Z_][a-zA-Z0-9_]*/, or the keyword (lexer_keyword) it spells.
 # A `c` straight before `"` never gets here: it is lexer_scan_string's.
 # Returns the kind, its length in *out_len.
@@ -626,7 +637,7 @@ fn lexer_exponent(lex: *Lexer, at: i64) -> i64
   let sign: i32 = lexer_at(lex, at + 1)
   if sign == 43 or sign == 45                                    # + -
     n = 2
-  let digits: i64 = lexer_run(lex, at + n, CLASS_DIGIT)
+  let digits: i64 = lexer_run_sep(lex, at + n, CLASS_DIGIT)
   if digits == 0
     return -1 - n
   n + digits
@@ -637,14 +648,20 @@ fn lexer_exponent(lex: *Lexer, at: i64) -> i64
 # `1e-5`.  `1.e5` has no fraction, so it is `1` `.` `e5`.  After `.` (a tuple
 # index) there is no exponent, as ritz0.  An `e` with no digit after it (and
 # its sign) is LEX_NO_EXP_DIGIT.  Suffixes are lexer_number_suffix's.
+# Each digit run also takes in every `_` it meets (lexer_run_sep, AGAST
+# #3584); lexer_check_separators refuses the misplaced ones.
 fn lexer_scan_number(lex: *Lexer, out_len: *i32) -> i32
   let at: i64 = lex.pos
-  let digits: i64 = lexer_run(lex, at, CLASS_DIGIT)
+  let digits: i64 = lexer_run_sep(lex, at, CLASS_DIGIT)
   var mant: i64 = digits
   if lexer_at(lex, at + digits) == 46                            # .
-    let frac: i64 = lexer_run(lex, at + digits + 1, CLASS_DIGIT)
-    if frac > 0
-      mant = digits + 1 + frac
+    # A fraction starts with a digit, or a `_` before one (`1._5`, taken in
+    # to be refused); `1.e5` and `0.._n` have none.
+    var f: i64 = at + digits + 1
+    if lexer_at(lex, f) == 95                                    # _
+      f = f + 1
+    if lexer_in_class(lexer_at(lex, f), CLASS_DIGIT) == 1
+      mant = digits + 1 + lexer_run_sep(lex, at + digits + 1, CLASS_DIGIT)
   var exp: i64 = 0
   if lex.last_kind != TOK_DOT
     exp = lexer_exponent(lex, at + mant)
@@ -658,9 +675,9 @@ fn lexer_scan_number(lex: *Lexer, out_len: *i32) -> i32
   if lexer_at(lex, at) == 48                                     # 0
     var radix: i64 = 0
     if lexer_at(lex, at + 1) == 120                              # 0x
-      radix = lexer_run(lex, at + 2, CLASS_HEX)
+      radix = lexer_run_sep(lex, at + 2, CLASS_HEX)
     else if lexer_at(lex, at + 1) == 98                          # 0b
-      radix = lexer_run(lex, at + 2, CLASS_BIN)
+      radix = lexer_run_sep(lex, at + 2, CLASS_BIN)
     if radix > 0 and radix + 2 > n
       n = radix + 2
   *out_len = n as i32
@@ -785,7 +802,7 @@ fn lexer_token(lex: *Lexer, kind: i32, start: i64, len: i32, line: i32, col: i32
 #   `2.5f32` + `x`, a parse error either way.
 fn lexer_number_suffix(lex: *Lexer, kind: i32, len: *i32) -> i32
   if kind == TOK_FLOAT and lex.last_kind == TOK_DOT
-    *len = lexer_run(lex, lex.pos, CLASS_DIGIT) as i32
+    *len = lexer_run_sep(lex, lex.pos, CLASS_DIGIT) as i32
     return TOK_NUMBER
   let at: i64 = lex.pos + *len
   if kind == TOK_NUMBER
@@ -821,6 +838,53 @@ fn lexer_int_suffix(lex: *Lexer, at: i64) -> i32
   if ext > 0 and lexer_in_class(lexer_at(lex, at + ext), CLASS_IDENT) == 1
     return 0                     # part of a longer identifier: `usize_max`
   ext
+
+# LANGUAGE_SPEC §2.6, LARB R73 (AGAST #3584): a `_` in a number stands
+# between two digits, of its base.  One that starts or ends the digits,
+# follows `0x` / `0b`, stands by another `_`, or touches a `.`, an exponent or
+# a suffix is a lexer error at it, in ritz0's words (lexer._check_separators).
+# lexer_run_sep took every `_` the digits ran into, so each is in the `len`
+# bytes from lex.pos.  Returns 1 with the error in *err.
+fn lexer_check_separators(lex: *Lexer, len: i32, err: *Token) -> i32
+  let at: i64 = lex.pos
+  var class: i32 = CLASS_DIGIT
+  if lexer_at(lex, at) == 48 and lexer_at(lex, at + 1) == 120     # 0x
+    class = CLASS_HEX
+  else if lexer_at(lex, at) == 48 and lexer_at(lex, at + 1) == 98 # 0b
+    class = CLASS_BIN
+  var i: i64 = 0
+  while i < len as i64
+    if lexer_at(lex, at + i) == 95                                 # _
+      if lexer_in_class(lexer_at(lex, at + i - 1), class) == 0 or lexer_in_class(lexer_at(lex, at + i + 1), class) == 0
+        lex.pos = at + i
+        lex.col = lex.col + i as i32
+        lexer_fail(lex, err, c"`_` must stand between two digits of a numeric literal")
+        return 1
+    i = i + 1
+  0
+
+# A number token's text less its `_` separators, in its own allocation, so
+# every reader of the literal's text (parse_int, the 2^64 check, a float's
+# digits, a suffix) sees the plain digits.  A token without one is untouched.
+fn lexer_drop_separators(tok: *Token)
+  var n: i32 = 0
+  for i in 0..tok.len
+    if *(tok.start + i) != 95
+      n = n + 1
+  if n == tok.len
+    return
+  let out: *u8 = malloc((n as i64) + 1)
+  if out == null
+    return
+  var j: i32 = 0
+  for i in 0..tok.len
+    let b: u8 = *(tok.start + i)
+    if b != 95
+      *(out + j) = b
+      j = j + 1
+  *(out + n) = 0
+  tok.start = out
+  tok.len = n
 
 # Track bracket depth for a token of `kind` at `start` (no NEWLINE / INDENT /
 # DEDENT inside brackets).  Returns 1 with a fatal error in *err when they
@@ -909,7 +973,13 @@ fn lexer_scan_token(lex: *Lexer) -> Token
   if kind < 0
     return lexer_bad_byte(lex)
   kind = lexer_number_suffix(lex, kind, @len)
-  lexer_emit(lex, kind, len)
+  if kind == TOK_NUMBER or kind == TOK_FLOAT
+    if lexer_check_separators(lex, len, @tok) == 1
+      return tok
+  tok = lexer_emit(lex, kind, len)
+  if kind == TOK_NUMBER or kind == TOK_FLOAT
+    lexer_drop_separators(@tok)
+  tok
 
 # Skip a run of [ \t\r] (the grammar's WHITESPACE).
 fn lexer_skip_blanks(lex: *Lexer)
