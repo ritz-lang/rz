@@ -2823,58 +2823,150 @@ fn tuple_slot_def(s: *EmitterState, name: *u8, len: i32, n: i32) -> *StructDef
         return null
     st
 
-# Element `v`'s type as a tuple field: its kind in *out_ty, a struct's name in
-# *out_name / *out_len.  Returns its spelling's length (ritz0's
-# mangle_type_name: a struct's name, a primitive's), with the spelling in
-# *spell, or 0 when ritz1 can't type it (a pointer, an array, a struct it
-# can't name).
-fn tuple_elem_type(s: *EmitterState, v: *Expr, out_ty: *i32, out_name: **u8, out_len: *i32, spell: **u8) -> i32
-    *out_name = null
-    *out_len = 0
-    if v.kind == EXPR_STRUCT_LIT
-        *out_ty = TYPE_STRUCT
-        *out_name = v.ident_ptr
-        *out_len = v.ident_len
-    else if bool_kind(s, v) == BK_BOOL
-        *out_ty = TYPE_BOOL
+# "<prefix><body>", malloc'd; its length in *out_len.
+fn tuple_spell_join(prefix: *u8, plen: i32, body: *u8, blen: i32, out_len: *i32) -> *u8
+    let nm: *u8 = malloc((plen + blen + 1) as i64)
+    memcpy(nm, prefix, plen as i64)
+    memcpy(nm + plen, body, blen as i64)
+    *(nm + plen + blen) = 0
+    *out_len = plen + blen
+    nm
+
+# AGAST #3024: a `*T` element (`let t = (p, 1)`, p a `*i32` local, param,
+# field, call or cast): f is the `*T` field an annotated `(*T, ..)` parses
+# to (ptr_pointee T; a primitive T also in array_elem_type, #1304; a struct
+# T named by field_type_name), spelled "ptr_" T as ritz0's mangle_type_name
+# spells it.  0 when the pointee is not one ritz1 can name.
+fn tuple_elem_ptr(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> i32
+    var pn: *u8 = null
+    var pl: i32 = 0
+    let pt: i32 = ptr_root_pointee(s, v, @pn, @pl)
+    if pt == 0
+        return 0
+    f.field_type = TYPE_PTR
+    f.ptr_pointee = pt
+    if pt == TYPE_STRUCT
+        f.field_type_name = pn
+        f.field_type_name_len = pl
     else
-        *out_ty = get_expr_type(s, v)
-        let t: i32 = *out_ty
-        if t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF or t == TYPE_ARRAY
+        f.array_elem_type = pt
+        pl = primitive_arg_spelling(pt, @pn)
+        if pl <= 0
             return 0
+    var n: i32 = 0
+    *spell = tuple_spell_join(c"ptr_", 4, pn, pl, @n)
+    n
+
+# AGAST #3024: a one-dimensional `[N]T` element (a local's or a field's
+# array): f takes its size and element as an annotated `([N]T, ..)` field
+# does, spelled "arr" N "_" T as ritz0 spells it (T a primitive, a struct,
+# or "ptr_" + either).  0 for any other array (an N-D one, an unnamed
+# element).
+fn tuple_elem_array(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> i32
+    if v.kind == EXPR_IDENT
+        let loc: *LocalVar = find_local_struct_name(s, v.ident_ptr, v.ident_len)
+        if loc == null or loc.var_type != TYPE_ARRAY or loc.array_shape != null
+            return 0
+        f.array_size = loc.array_size
+        f.array_elem_type = loc.array_elem_type
+        f.array_elem_pointee = loc.array_elem_pointee
+        f.array_elem_type_name = loc.type_name
+        f.array_elem_type_name_len = loc.type_name_len
+    else if v.kind == EXPR_MEMBER
+        let fld: *StructField = member_field_def(s, v)
+        if fld == null or fld.field_type != TYPE_ARRAY or fld.array_shape != null
+            return 0
+        f.array_size = fld.array_size
+        f.array_elem_type = fld.array_elem_type
+        f.array_elem_pointee = fld.array_elem_pointee
+        f.array_elem_type_name = fld.array_elem_type_name
+        f.array_elem_type_name_len = fld.array_elem_type_name_len
+    else
+        return 0
+    if f.array_size <= 0
+        return 0
+    var ptr: i32 = 0
+    var leaf: i32 = f.array_elem_type
+    if leaf == TYPE_PTR
+        ptr = 4
+        leaf = f.array_elem_pointee
+    var en: *u8 = null
+    var el: i32 = 0
+    if leaf == TYPE_STRUCT
+        en = f.array_elem_type_name
+        el = f.array_elem_type_name_len
+    else
+        el = primitive_arg_spelling(leaf, @en)
+    if el <= 0 or en == null
+        return 0
+    if ptr == 4
+        en = tuple_spell_join(c"ptr_", 4, en, el, @el)
+    # "arr" + up to 10 digits + "_"
+    let pre: *u8 = malloc(16)
+    memcpy(pre, c"arr", 3)
+    var pl: i32 = 3 + write_dec_i32(pre + 3, f.array_size)
+    *(pre + pl) = 95  # '_'
+    pl = pl + 1
+    f.field_type = TYPE_ARRAY
+    var n: i32 = 0
+    *spell = tuple_spell_join(pre, pl, en, el, @n)
+    n
+
+# Element `v`'s type as a tuple field: written into f (kind, a struct's name,
+# a pointer's pointee, an array's size and element) as the parse writes an
+# annotated tuple's field.  Returns its spelling's length (ritz0's
+# mangle_type_name: a struct's name, a primitive's, "ptr_i32", "arr3_i32"),
+# with the spelling in *spell, or 0 when ritz1 can't type it (a `**T`, a
+# reference, an N-D array, a struct it can't name).
+fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> i32
+    f.field_type_name = null
+    f.field_type_name_len = 0
+    f.ptr_pointee = TYPE_VOID
+    f.array_elem_pointee = TYPE_VOID
+    f.inner_pointee_type = TYPE_VOID
+    if v.kind == EXPR_STRUCT_LIT
+        f.field_type = TYPE_STRUCT
+        f.field_type_name = v.ident_ptr
+        f.field_type_name_len = v.ident_len
+    else if bool_kind(s, v) == BK_BOOL
+        f.field_type = TYPE_BOOL
+    else
+        let t: i32 = get_expr_type(s, v)
+        if t == TYPE_PTR
+            return tuple_elem_ptr(s, v, f, spell)
+        if t == TYPE_ARRAY
+            return tuple_elem_array(s, v, f, spell)
+        if t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF
+            return 0
+        f.field_type = t
         # A struct or enum value names its type even where get_expr_type
         # says i64 (`Slot.Full(x)`, a variant ctor).
-        tuple_decl_struct_name(s, v, out_name, out_len)
-        if *out_len > 0
-            *out_ty = TYPE_STRUCT
-    if *out_ty == TYPE_STRUCT
-        *spell = *out_name
-        return *out_len
-    primitive_arg_spelling(*out_ty, spell)
+        var nm: *u8 = null
+        var nl: i32 = 0
+        tuple_decl_struct_name(s, v, @nm, @nl)
+        if nl > 0
+            f.field_type = TYPE_STRUCT
+            f.field_type_name = nm
+            f.field_type_name_len = nl
+    if f.field_type == TYPE_STRUCT
+        *spell = f.field_type_name
+        return f.field_type_name_len
+    primitive_arg_spelling(f.field_type, spell)
 
-# A tuple struct `name` with the given element types, registered as the
-# parse registers a struct, and queued for emit_late_enum_types.
-fn tuple_struct_new(s: *EmitterState, name: *u8, len: i32, tys: *i32, names: **u8, lens: *i32, n: i32) -> *StructDef
-    var fields: *StructField = null
-    var last: *StructField = null
-    for i in 0..n
-        let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
+# A tuple struct `name` over the element fields `fields` (named "0", "1",
+# .. here), registered as the parse registers a struct, and queued for
+# emit_late_enum_types.
+fn tuple_struct_new(s: *EmitterState, name: *u8, len: i32, fields: *StructField) -> *StructDef
+    var i: i32 = 0
+    var f: *StructField = fields
+    while f != null
         let nm: *u8 = malloc(12)
         let nlen: i32 = write_dec_i32(nm, i)
         *(nm + nlen) = 0
         f.name = nm
         f.name_len = nlen
-        f.field_type = *(tys + i)
-        f.field_type_name = *(names + i)
-        f.field_type_name_len = *(lens + i)
-        f.ptr_pointee = TYPE_VOID
-        f.array_elem_pointee = TYPE_VOID
-        f.inner_pointee_type = TYPE_VOID
-        if last == null
-            fields = f
-        else
-            last.next = f
-        last = f
+        i = i + 1
+        f = f.next
     let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
     st.name = name
     st.name_len = len
@@ -2891,11 +2983,10 @@ fn tuple_struct_new(s: *EmitterState, name: *u8, len: i32, tys: *i32, names: **u
 # nameless tuples first).  Returns 1 once named; 0 after a located error.
 fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
     let n: i32 = tuple_lit_arity(e)
-    let tys: *i32 = malloc((n as i64) * 4) as *i32
-    let names: **u8 = malloc((n as i64) * 8) as **u8
-    let lens: *i32 = malloc((n as i64) * 4) as *i32
     let spells: **u8 = malloc((n as i64) * 8) as **u8
     let spell_lens: *i32 = malloc((n as i64) * 4) as *i32
+    var fields: *StructField = null
+    var last: *StructField = null
     var total: i32 = 5  # "tuple"
     var i: i32 = 0
     var fi: *FieldInit = e.args as *FieldInit
@@ -2905,13 +2996,19 @@ fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
             e.ident_ptr = c"(untyped)"
             e.ident_len = 9
             return 0
+        let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
         var sp: *u8 = null
-        let sl: i32 = tuple_elem_type(s, v, tys + i, names + i, lens + i, @sp)
+        let sl: i32 = tuple_elem_type(s, v, f, @sp)
         if sl == 0
-            emit_nd_error(s, v.span.line, v.span.col, c"ritz1 can't infer the type of this tuple element (a pointer, an array, or a value whose struct it can't name): give the tuple a type, as `let t: (A, B) = ..` (AGAST #3024)")
+            emit_nd_error(s, v.span.line, v.span.col, c"ritz1 can't infer the type of this tuple element (a `**T`, a reference, an N-D array, or a value whose type it can't name): give the tuple a type, as `let t: (A, B) = ..`")
             e.ident_ptr = c"(untyped)"
             e.ident_len = 9
             return 0
+        if last == null
+            fields = f
+        else
+            last.next = f
+        last = f
         *(spells + i) = sp
         *(spell_lens + i) = sl
         total = total + 1 + sl
@@ -2926,7 +3023,7 @@ fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
         pos = pos + 1 + *(spell_lens + j)
     *(name + pos) = 0
     if find_struct(s, name, pos) == null
-        tuple_struct_new(s, name, pos, tys, names, lens, n)
+        tuple_struct_new(s, name, pos, fields)
     e.ident_ptr = name
     e.ident_len = pos
     1

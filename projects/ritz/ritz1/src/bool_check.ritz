@@ -302,6 +302,10 @@ fn sbk_index(sm: *Sema, e: *Expr) -> i32
         if k != BK_UNSURE
             return k
     else if base.kind == EXPR_MEMBER
+        # AGAST #3024: `t.0[i]` of a nameless tuple's `[N]T` element.
+        let tk: i32 = sbk_tuple_elem(sm, base)
+        if tk != BK_UNSURE
+            return tk
         # AGAST #3768: through what sbk_receiver names, too: `(*p).arr[i]`.
         let f: *StructField = sbk_member_field(sm, base)
         if f != null
@@ -743,6 +747,11 @@ fn sbk_deref(sm: *Sema, e: *Expr) -> i32
         let rv: *SemaVar = sema_find_local(sm, o.ident_ptr, o.ident_len)
         if rv != null and rv.elem_bk != BK_NONE and (rv.pointee == TYPE_VOID or rv.pointee == TYPE_UNKNOWN)
             return rv.elem_bk
+    # AGAST #3024: `*(t.0)` of a nameless tuple's `*T` element.
+    if o.kind == EXPR_MEMBER
+        let tk: i32 = sbk_tuple_elem(sm, o)
+        if tk != BK_UNSURE
+            return tk
     let pt: i32 = sbk_pointee(sm, o)
     # `*@x` of a struct reads as an i64 to the emitter; `*p` of a `*S` a struct.
     if pt == TYPE_STRUCT and o.kind != EXPR_UNARY
@@ -1011,6 +1020,7 @@ fn sbk_tuple_lit(sm: *Sema, e: *Expr) -> *SemaTupleNote
         note.name[i] = name
         note.name_len[i] = len
         note.sub[i] = sbk_tuple_of(sm, fi.value)
+        note.elem[i] = sbk_value_elem(sm, fi.value)
         i += 1
         fi = fi.next
     note
@@ -1058,6 +1068,28 @@ fn sbk_tuple_of(sm: *Sema, e: *Expr) -> *SemaTupleNote
         arm = arm.next
     null
 
+# AGAST #3024: what `*x` / `x[i]` reads for the tuple element `x`, as a
+# `let` bound to it would note it: a local's or global's element (sbk_element),
+# or a tuple element's own (`(t.0, 1)`); BK_NONE where Sema can't say.
+fn sbk_value_elem(sm: *Sema, x: *Expr) -> i32
+    var k: i32 = BK_UNSURE
+    if x.kind == EXPR_IDENT
+        k = sbk_element(sm, x.ident_ptr, x.ident_len)
+    else if x.kind == EXPR_MEMBER
+        k = sbk_tuple_elem(sm, x)
+    if k == BK_UNSURE
+        return BK_NONE
+    k
+
+# AGAST #3024: what `*m` / `m[i]` reads for `m` an element of a nameless
+# tuple (`t.0`), else BK_UNSURE.
+fn sbk_tuple_elem(sm: *Sema, m: *Expr) -> i32
+    let tn: *SemaTupleNote = sbk_tuple_of(sm, m.left)
+    let ti: i32 = sbk_tuple_index(tn, m.ident_ptr, m.ident_len)
+    if ti < 0 or tn.elem[ti] == BK_NONE
+        return BK_UNSURE
+    tn.elem[ti]
+
 # Element `name` ("0", "1", ..) of `tn`, or -1.
 fn sbk_tuple_index(tn: *SemaTupleNote, name: *u8, len: i32) -> i32
     if tn == null or len != 1
@@ -1071,6 +1103,8 @@ fn sbk_tuple_index(tn: *SemaTupleNote, name: *u8, len: i32) -> i32
 # (Sema binds it untyped) and its own note.
 fn sbk_tuple_bind(v: *SemaVar, tn: *SemaTupleNote, i: i32)
     v.bk_tuple = tn.sub[i]
+    if tn.elem[i] != BK_NONE
+        v.elem_bk = tn.elem[i]   # AGAST #3024
     if v.kind == TYPE_UNKNOWN and tn.name[i] != null and tn.name_len[i] > 0
         v.type_name = tn.name[i]
         v.type_name_len = tn.name_len[i]

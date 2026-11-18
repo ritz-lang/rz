@@ -179,13 +179,14 @@ CORPUS_FLOOR = 15000
 
 # Ceiling on bk-gaps over the corpus: 154 at #3502, 42 at #3768 (which typed
 # const array elements, `-> *T` / `-> @T` pointees, `**T` chains, `*@a[i]`,
-# array fields through `*p` and nameless tuples; test_ritz1_sema_bk_gap.py).
+# array fields through `*p` and nameless tuples; test_ritz1_sema_bk_gap.py),
+# 40 at #3024 (a nameless tuple's `*T` / `[N]T` element: `*q`, `b[i]`).
 # What's left: a field through a generic Deref (16, #3810's receiver typing),
 # an index through a Vec / Span / StrView field, call or payload (#3510's),
 # `(*(@x)).f` where the emitter is the unsure side, and `K[i]` of a const
 # array of structs, which the emitter's get_expr_type guesses is an i64 (a
 # guess that refused good programs when Sema copied it).  Lower it as they go.
-BK_GAP_CEILING = 42
+BK_GAP_CEILING = 40
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

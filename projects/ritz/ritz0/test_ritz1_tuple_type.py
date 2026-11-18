@@ -521,17 +521,39 @@ def test_ritz1_mangles_and_lays_out_tuples_as_ritz0(ritz1_bin, tmp_path):
 
 
 @pytest.mark.integration
-def test_ritz1_rejects_tuple_element_it_cannot_type(ritz1_bin, tmp_path):
-    """A tuple with no tuple type is typed from its elements (AGAST #3005);
-    an element ritz1 can't spell as a tuple field (a pointer) is a located
-    error at that element, not a struct literal of an unnamed type."""
+def test_ritz1_infers_tuple_of_pointer_and_array_as_ritz0(ritz1_bin, tmp_path):
+    """AGAST #3024: a tuple with no tuple type whose element is a `*T` or a
+    `[N]T` is typed from it (#3005 refused it), spelled as ritz0's
+    mangle_type_name spells it: `(p, 1)` is `tuple_ptr_i32_i64`, `(q, 1)`
+    `tuple_ptr_P_i64`, `(a, 1)` `tuple_arr3_i32_i64`."""
     proc = _ritz1_ir(
         ritz1_bin,
         tmp_path,
-        "fn f(p: *u8) -> i32\n    let t = (p, 1)\n    0\n\npub fn main() -> i32\n    f(null)\n",
+        "struct P\n    x: i32\n\n"
+        "fn f(p: *i32, q: *P) -> i32\n"
+        "    let a: [3]i32 = [1, 2, 3]\n"
+        "    let t = (p, 1)\n    let u = (q, 1)\n    let w = (a, 1)\n    0\n\n"
+        "pub fn main() -> i32\n    f(null, null)\n",
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    ir = proc.ir
+    assert re.search(r"^%tuple_ptr_i32_i64 = type \{\s*ptr,\s*i64\s*\}$", ir, re.M), ir[:3000]
+    assert re.search(r"^%tuple_ptr_P_i64 = type \{\s*ptr,\s*i64\s*\}$", ir, re.M), ir[:3000]
+    assert re.search(r"^%tuple_arr3_i32_i64 = type \{\s*\[3 x i32\],\s*i64\s*\}$", ir, re.M), ir[:3000]
+
+
+@pytest.mark.integration
+def test_ritz1_rejects_tuple_element_it_cannot_type(ritz1_bin, tmp_path):
+    """An element ritz1 still can't spell as a tuple field (a `**T`) is a
+    located error at that element, not a struct literal of an unnamed
+    type."""
+    proc = _ritz1_ir(
+        ritz1_bin,
+        tmp_path,
+        "fn f(p: **u8) -> i32\n    let t = (p, 1)\n    0\n\npub fn main() -> i32\n    f(null)\n",
     )
     assert proc.returncode != 0
-    assert re.search(r"t\.ritz:2:14: .*tuple element.*#3024", proc.stderr), proc.stderr[-2000:]
+    assert re.search(r"t\.ritz:2:14: .*tuple element", proc.stderr), proc.stderr[-2000:]
 
 
 @pytest.mark.integration
