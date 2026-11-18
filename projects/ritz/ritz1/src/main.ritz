@@ -45,6 +45,7 @@ import sema_probe     # RITZ1_SEMA_PROBE (AGAST #3501)
 import emitter
 import fn_cache
 import sha256
+import iface_text   # interface texts ritz1 writes (AGAST #2113)
 import emitter_core
 
 # =============================================================================
@@ -861,45 +862,16 @@ fn merge_module_into(m: *Module, other: *Module)
 # The key holds the source's bytes only, never a path or a compiler, so an
 # import is lexed and parsed from its interface whenever one is stored,
 # under the import's real path for diagnostics.  On a miss the source is
-# parsed, as before; ritz1 writing the text itself is #2113.
+# parsed, and ritz1 stores its text (iface_text.ritz, AGAST #2113) for the
+# next compile, byte-identical to the one ritz0 writes.
+#
+# The file-level fast path records each import by its interface text
+# (dep_record_note below), so a body-only edit of an import that keeps its
+# text keeps the importer's sig valid (fn_cache sig_deps_unchanged).
 #
 # RITZ1_PARSE_LOG=<file> appends the path of every *source* this process
 # lexes and parses (the main file included, interface texts not), like
 # ritz0's RITZ0_PARSE_LOG.
-
-# The store path of the interface text of a module with these bytes, or an
-# empty String if there is no store root.  Caller owns it.
-fn iface_text_path(src: *u8, len: i64) -> String
-    var out: String = string_new()
-    let explicit: StrView = env_get_or("RITZ_CACHE_DIR", strview_empty())
-    let home: StrView = env_get_or("HOME", strview_empty())
-    if explicit.len > 0
-        # cas.py expands a leading `~` (Path.expanduser).
-        if *(explicit.ptr) == '~' and (explicit.len == 1 or *(explicit.ptr + 1) == '/')
-            if home.len == 0
-                return out
-            string_push_bytes(@&out, home.ptr, home.len)
-            string_push_bytes(@&out, explicit.ptr + 1, explicit.len - 1)
-        else
-            string_push_bytes(@&out, explicit.ptr, explicit.len)
-    else
-        if home.len == 0
-            return out
-        string_push_bytes(@&out, home.ptr, home.len)
-        string_push_str(@&out, "/.cache/ritz/cas")
-    var inner: [64]u8
-    sha256_hex(src, len, @inner[0])
-    var pre: String = string_from("ritz-iface-text-v1\n")
-    string_push_bytes(@&pre, @inner[0], 64)
-    var k: [64]u8
-    sha256_hex(string_as_ptr(@&pre), string_len(@pre) as i64, @k[0])
-    string_drop(@&pre)
-    string_push_str(@&out, "/objects/")
-    string_push_bytes(@&out, @k[0], 2)
-    string_push(@&out, '/')
-    string_push_bytes(@&out, @k[0], 64)
-    string_push_str(@&out, ".rzi.ritz")
-    out
 
 # The stored interface text of a module with these bytes (NUL-terminated,
 # like read_file), or an empty Vec when none is stored.
@@ -1035,6 +1007,12 @@ fn load_and_parse(path: @&String) -> *Module
         err2("Lexer errors in: ", path_ptr)
         return null
 
+    # A miss: the interface text, from the tokens as the lexer made them.
+    var made: Vec<u8> = vec_new<u8>()
+    var made_ok: i32 = 0
+    if text.len == 0 and iface_text_build(src.data, src.len - 1, tokens.data, tokens.len, @&made) == 0
+        made_ok = 1
+
     # Name the file in parse diagnostics (AGAST #1301).
     parser_set_source_file(path_ptr)
     let first_ei: i32 = enum_count()
@@ -1042,13 +1020,24 @@ fn load_and_parse(path: @&String) -> *Module
     if mod == null
         err2("Parse error in: ", path_ptr)
         return null
+    # The cached IR depends on the interface text (AGAST #1807, #2113): the
+    # one read, or the one stored now.  If none could be stored, on the
+    # source's bytes, which fn_cache's check reads when there is no text.
+    var dep_buf: *u8 = src.data
+    var dep_len: i64 = src.len - 1
     if text.len > 0
         iface_fix_extern_decls(mod, lex_buf, lex_len, src.data, src.len - 1)   # AGAST #3419
+        dep_buf = text.data
+        dep_len = text.len - 1
+    else if made_ok == 1
+        # Stored only once the source has parsed, as ritz0 does.
+        if iface_text_store(src.data, src.len - 1, made.data, made.len) == 0
+            dep_buf = made.data
+            dep_len = made.len
     if add_enum_from_fns(mod, first_ei, path_ptr) < 0
         return null
 
-    # The cached IR depends on these exact bytes (AGAST #1807).
-    dep_record_note(path_ptr, src.data, src.len - 1)
+    dep_record_note(path_ptr, dep_buf, dep_len)
 
     # Keep the lexed buffer alive: AST nodes point into it.
     keep_source_alive(lex_buf)
@@ -1191,6 +1180,10 @@ struct CliArgs
     # `--test-table` (AGAST #1908): compile as the root of a test binary
     # (LANGUAGE_SPEC §17.1), as ritz0's --test-table does.
     test_table: i32
+    # `--iface-text` (AGAST #2113): write the input's interface text to the
+    # output path instead of compiling it (ritz0/test_interface_text.py
+    # compares it with ritz0's over the corpus).
+    iface_text: i32
     # Every `--dep <name>=<dir>` (AGAST #3825), in order, `:`-joined; null
     # and 0 when there is none.  See g_dep_ptr.
     deps_ptr: *u8
@@ -1231,6 +1224,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     args.dash_dash = 0
     args.target_os = strview_from_cstr(c"linux")
     args.test_table = 0
+    args.iface_text = 0
     args.deps_ptr = null
     args.deps_len = 0
 
@@ -1264,6 +1258,7 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
     #                      `-I` like gcc's: prepends to the lookup list.
     #   --target-os <os>   see CliArgs.target_os.
     #   --test-table       see CliArgs.test_table.
+    #   --iface-text       see CliArgs.iface_text.
     #   --dep <name>=<dir> repeatable; see try_open_import.
     # Anything else is ignored, as it always has been.
     var dash_i_view: StrView
@@ -1277,6 +1272,9 @@ fn parse_cli(argc: i32, argv: **u8) -> CliArgs
         let is_dep: bool = strview_eq_cstr(opt, c"--dep")
         if strview_eq_cstr(opt, c"--test-table")
             args.test_table = 1
+            i = i + 1
+        else if strview_eq_cstr(opt, c"--iface-text")
+            args.iface_text = 1
             i = i + 1
         else if is_dep
             if i + 1 >= argc or dep_entry_ok(argv[i + 1]) == 0
@@ -1360,7 +1358,7 @@ fn drop_local_main(m: *Module)
         f = next
 
 fn print_usage()
-    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--test-table] [--dep <name>=<dir>]...")
+    eprintln("Usage: ritz1 <input.ritz> -o <output.ll> [-I <ritz_path>] [--target-os <os>] [--test-table] [--iface-text] [--dep <name>=<dir>]...")
     eprintln("       ritz1 -- <input.ritz>")
 
 # Parse the main file's tokens, mark its fns local, and resolve (parse and
@@ -1439,6 +1437,19 @@ fn main(argc: i32, argv: **u8) -> i32
     var src: Vec<u8> = read_file(args.input_path)
     if src.len == 0
         return 1
+
+    # The interface text alone: lexed, never parsed (AGAST #2113).
+    if args.iface_text == 1
+        var itoks: Vec<Token> = vec_with_cap<Token>(24000)
+        if tokenize(args.input_path, src.data, src.len - 1, @itoks) > 0
+            return 1
+        var itext: Vec<u8> = vec_new<u8>()
+        if iface_text_build(src.data, src.len - 1, itoks.data, itoks.len, @&itext) < 0
+            err2("Error: a declared fn has no body lines in: ", args.input_path)
+            return 1
+        if write_file(args.output_path, itext.data, itext.len) < 0
+            return 1
+        return 0
 
     # File-level fast path: if the sig records this source, this compiler
     # identity and unchanged imports, and the .ll is current (or can be

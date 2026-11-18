@@ -1,0 +1,391 @@
+# ritz1/src/iface_text.ritz - interface texts, written by ritz1 (AGAST #2113)
+#
+# An import's interface as Ritz source (G9c, AGAST #1901): the module with
+# every fn an importer doesn't need the body of turned into a declaration-only
+# `fn ... = extern` (#1900), its body lines emptied, so every kept line and
+# column is the source's.  ritz0 defines the format (ritz0/module_interface.py
+# "Interface text"); this module produces BYTE-IDENTICAL text, which
+# ritz0/test_interface_text.py checks over the whole ritzlib + ritz1 corpus:
+#
+#   - a fn is declared unless it is generic, async, [[test]], already a
+#     declaration (`= extern`), a trait's (default or not), or a method of a
+#     generic impl (`impl<...>`) -- ritz0's _fns_to_declare / body_needed;
+#   - its header is kept up to its last token (a trailing comment goes), and
+#     ` = extern` is appended;
+#   - its body is emptied: the lines after the header up to the last line,
+#     before the next code line indented no deeper than the fn's own line,
+#     that is indented deeper.  Blank and comment-only lines don't end it;
+#   - everything else is the source, byte for byte.
+#
+# Which fns to declare is decided from the TOKENS, not the parsed Module:
+# ritz1's parser drops a fn gated out by `[[target_os = ...]]` (ast_helpers
+# check_target_os_filter), but the text is keyed on the source bytes alone,
+# so it must not depend on the target; ritz0 declares every gated fn too.
+#
+# The store and its key are main.ritz's (iface_text_path); this module is the
+# pure function source + tokens -> text.
+
+import ritzlib.sys
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.strview
+import ritzlib.os.env
+import tokens_gen
+import lexer_nfa
+import sha256
+
+struct IfaceScan
+    toks: *Token
+    n: i64
+    src: *u8
+    len: i64
+    starts: *i64     # byte offset of each line (1-based line k at starts[k - 1])
+    count: i32       # number of lines, as Python's str.split("\n") counts them
+    cut: *i64        # per line: -1 to keep it, else the bytes kept before " = extern"
+    blank: *u8       # per line: 1 if emptied (a declared fn's body line)
+    err: i32         # 1 if a declared fn had no body lines (ritz0: ValueError)
+
+fn it_kind(s: *IfaceScan, i: i64) -> i32
+    if i >= s.n
+        return TOK_EOF
+    (s.toks + i).kind
+
+fn it_layout(k: i32) -> i32
+    if k == TOK_NEWLINE or k == TOK_INDENT or k == TOK_DEDENT or k == TOK_EOF
+        return 1
+    0
+
+# Line `k` (1-based): its first byte and its length, without the '\n'.
+fn it_line_ptr(s: *IfaceScan, k: i32) -> *u8
+    s.src + *(s.starts + (k - 1))
+
+fn it_line_len(s: *IfaceScan, k: i32) -> i64
+    let start: i64 = *(s.starts + (k - 1))
+    if k < s.count
+        return *(s.starts + k) - 1 - start
+    s.len - start
+
+# Leading spaces of line `k` (spaces only, as ritz0's _indent).
+fn it_indent(s: *IfaceScan, k: i32) -> i64
+    let p: *u8 = it_line_ptr(s, k)
+    let n: i64 = it_line_len(s, k)
+    var i: i64 = 0
+    while i < n and *(p + i) == ' '
+        i = i + 1
+    i
+
+# Whitespace Python's str.rstrip() strips, as bytes: ASCII \t\n\v\f\r, the
+# separators \x1c-\x1f and space.  (Non-ASCII spaces never end a header.)
+fn it_is_space(c: u8) -> i32
+    if c == ' ' or (c >= 9 and c <= 13) or (c >= 28 and c <= 31)
+        return 1
+    0
+
+# ritz0's _code_end: where line `k`'s trailing comment (if any) starts,
+# right-trimmed.  Quotes ('"' and '\'') hide a '#'; '\\' escapes in them.
+fn it_code_end(s: *IfaceScan, k: i32) -> i64
+    let p: *u8 = it_line_ptr(s, k)
+    let n: i64 = it_line_len(s, k)
+    var quote: u8 = 0
+    var i: i64 = 0
+    while i < n
+        let c: u8 = *(p + i)
+        if quote != 0
+            if c == '\\'
+                i = i + 1
+            else if c == quote
+                quote = 0
+        else if c == '"' or c == '\''
+            quote = c
+        else if c == '#'
+            break
+        i = i + 1
+    if i > n
+        i = n
+    while i > 0 and it_is_space(*(p + i - 1)) == 1
+        i = i - 1
+    i
+
+# Declare the fn whose `fn` is on line `fn_line` and whose header ends on
+# line `head` (ritz0's interface_text loop body).
+fn it_declare(s: *IfaceScan, fn_line: i32, head: i32)
+    let base: i64 = it_indent(s, fn_line)
+    var end: i32 = head
+    var k: i32 = head + 1
+    while k <= s.count
+        let ind: i64 = it_indent(s, k)
+        let n: i64 = it_line_len(s, k)
+        if ind < n and *(it_line_ptr(s, k) + ind) != '#'
+            if ind <= base
+                break
+            end = k
+        k = k + 1
+    if end == head
+        s.err = 1
+        return
+    *(s.cut + (head - 1)) = it_code_end(s, head)
+    var j: i32 = head + 1
+    while j <= end
+        *(s.blank + (j - 1)) = 1
+        j = j + 1
+
+# Index of the token ending the logical line at `i`: its NEWLINE, or a
+# DEDENT/EOF.  The lexer emits no layout tokens inside brackets.
+fn it_line_end(s: *IfaceScan, i: i64) -> i64
+    var j: i64 = i
+    while j < s.n
+        let k: i32 = it_kind(s, j)
+        if k == TOK_NEWLINE or k == TOK_DEDENT or k == TOK_EOF
+            return j
+        j = j + 1
+    j
+
+fn it_skip_newlines(s: *IfaceScan, i: i64) -> i64
+    var j: i64 = i
+    while it_kind(s, j) == TOK_NEWLINE
+        j = j + 1
+    j
+
+# Skip the item starting at `i`: its line, and the indented block under it.
+fn it_skip_item(s: *IfaceScan, i: i64) -> i64
+    var j: i64 = it_line_end(s, i)
+    if it_kind(s, j) != TOK_NEWLINE
+        return j
+    j = it_skip_newlines(s, j + 1)
+    if it_kind(s, j) != TOK_INDENT
+        return j
+    var depth: i32 = 1
+    j = j + 1
+    while depth > 0 and j < s.n and it_kind(s, j) != TOK_EOF
+        let k: i32 = it_kind(s, j)
+        if k == TOK_INDENT
+            depth = depth + 1
+        else if k == TOK_DEDENT
+            depth = depth - 1
+        j = j + 1
+    j
+
+# 1 if the token at `i` is the identifier `test`.
+fn it_is_test(s: *IfaceScan, i: i64) -> i32
+    let t: *Token = s.toks + i
+    if t.kind != TOK_IDENT or t.len != 4
+        return 0
+    if *(t.start) == 't' and *(t.start + 1) == 'e' and *(t.start + 2) == 's' and *(t.start + 3) == 't'
+        return 1
+    0
+
+# Skip the `[[...]]` attribute lists at `i` (and the newlines after each, as
+# ritz0's parse_attrs); *has_test = 1 if one of them names `test`.
+fn it_skip_attrs(s: *IfaceScan, i: i64, has_test: *i32) -> i64
+    var j: i64 = i
+    while it_kind(s, j) == TOK_LBRACKET2
+        j = j + 1
+        var at_name: i32 = 1
+        while j < s.n
+            let k: i32 = it_kind(s, j)
+            if k == TOK_EOF or (k == TOK_RBRACKET and it_kind(s, j + 1) == TOK_RBRACKET)
+                break
+            if at_name == 1 and it_is_test(s, j) == 1
+                *has_test = 1
+            at_name = (k == TOK_COMMA) as i32
+            j = j + 1
+        if it_kind(s, j) == TOK_RBRACKET
+            j = j + 2
+        j = it_skip_newlines(s, j)
+    j
+
+# The fn whose `fn` token is at `i`; `keep` = 1 if it keeps its body anyway
+# (async, [[test]], in a generic impl).  Marks its lines if it is declared.
+fn it_fn(s: *IfaceScan, i: i64, keep: i32)
+    let e: i64 = it_line_end(s, i)
+    var last: i64 = i
+    var j: i64 = i
+    while j < e
+        if it_layout(it_kind(s, j)) == 0
+            last = j
+        j = j + 1
+    let generic: i32 = (it_kind(s, i + 2) == TOK_LT) as i32
+    let decl: i32 = (it_kind(s, last) == TOK_EXTERN) as i32
+    if keep == 0 and generic == 0 and decl == 0
+        it_declare(s, (s.toks + i).line, (s.toks + last).line)
+
+# The items from `i` to the end of the enclosing block (its DEDENT, consumed)
+# or the file.  `in_impl` = 1 inside an impl; `keep` = 1 inside a generic one.
+fn it_block(s: *IfaceScan, i: i64, in_impl: i32, keep: i32) -> i64
+    var j: i64 = i
+    while s.err == 0
+        j = it_skip_newlines(s, j)
+        let k0: i32 = it_kind(s, j)
+        if k0 == TOK_EOF
+            return j
+        if k0 == TOK_DEDENT
+            return j + 1
+        var has_test: i32 = 0
+        j = it_skip_attrs(s, j, @has_test)
+        var is_async: i32 = 0
+        if it_kind(s, j) == TOK_PUB
+            j = j + 1
+        if it_kind(s, j) == TOK_ASYNC
+            is_async = 1
+            j = j + 1
+        let k: i32 = it_kind(s, j)
+        if k == TOK_FN
+            it_fn(s, j, keep | is_async | has_test)
+            j = it_skip_item(s, j)
+        else if k == TOK_IMPL and in_impl == 0
+            let generic: i32 = (it_kind(s, j + 1) == TOK_LT) as i32
+            var b: i64 = it_line_end(s, j)
+            if it_kind(s, b) == TOK_NEWLINE
+                b = it_skip_newlines(s, b + 1)
+            if it_kind(s, b) == TOK_INDENT
+                j = it_block(s, b + 1, 1, generic)
+            else
+                j = b
+        else
+            j = it_skip_item(s, j)
+    j
+
+# The interface text of src[0..len), lexed into `toks` (`n` of them, the EOF
+# included), appended to *out.  Returns 0, or -1 if ritz0 would refuse it too
+# (a declared fn with no body lines): nothing is appended then.
+pub fn iface_text_build(src: *u8, len: i64, toks: *Token, n: i64, out: @&Vec<u8>) -> i32
+    var count: i32 = 1
+    for a in 0..len
+        if *(src + a) == '\n'
+            count = count + 1
+    var s: IfaceScan = IfaceScan { toks: toks, n: n, src: src, len: len, starts: null, count: count, cut: null, blank: null, err: 0 }
+    s.starts = malloc((count as i64) * 8) as *i64
+    s.cut = malloc((count as i64) * 8) as *i64
+    s.blank = malloc(count as i64)
+    *(s.starts) = 0
+    var line: i32 = 1
+    for b in 0..len
+        if *(src + b) == '\n'
+            *(s.starts + line) = b + 1
+            line = line + 1
+    for c in 0..count
+        *(s.cut + c) = -1
+        *(s.blank + c) = 0
+    it_block(@s, 0, 0, 0)
+    var rc: i32 = 0
+    if s.err != 0
+        rc = -1
+    else
+        var k: i32 = 1
+        while k <= count
+            if k > 1
+                vec_push<u8>(out, '\n')
+            let cut: i64 = *(s.cut + (k - 1))
+            if *(s.blank + (k - 1)) == 1
+                k = k + 1
+                continue
+            if cut >= 0
+                vec_push_bytes<u8>(out, it_line_ptr(@s, k), cut)
+                vec_push_bytes<u8>(out, c" = extern", 9)
+            else
+                vec_push_bytes<u8>(out, it_line_ptr(@s, k), it_line_len(@s, k))
+            k = k + 1
+    free(s.starts as *u8)
+    free(s.cut as *u8)
+    free(s.blank)
+    rc
+
+# The store path of the interface text of a module with these bytes, or an
+# empty String if there is no store root.  Caller owns it.
+pub fn iface_text_path(src: *u8, len: i64) -> String
+    var out: String = string_new()
+    let explicit: StrView = env_get_or("RITZ_CACHE_DIR", strview_empty())
+    let home: StrView = env_get_or("HOME", strview_empty())
+    if explicit.len > 0
+        # cas.py expands a leading `~` (Path.expanduser).
+        if *(explicit.ptr) == '~' and (explicit.len == 1 or *(explicit.ptr + 1) == '/')
+            if home.len == 0
+                return out
+            string_push_bytes(@&out, home.ptr, home.len)
+            string_push_bytes(@&out, explicit.ptr + 1, explicit.len - 1)
+        else
+            string_push_bytes(@&out, explicit.ptr, explicit.len)
+    else
+        if home.len == 0
+            return out
+        string_push_bytes(@&out, home.ptr, home.len)
+        string_push_str(@&out, "/.cache/ritz/cas")
+    var inner: [64]u8
+    sha256_hex(src, len, @inner[0])
+    var pre: String = string_from("ritz-iface-text-v1\n")
+    string_push_bytes(@&pre, @inner[0], 64)
+    var k: [64]u8
+    sha256_hex(string_as_ptr(@&pre), string_len(@pre) as i64, @k[0])
+    string_drop(@&pre)
+    string_push_str(@&out, "/objects/")
+    string_push_bytes(@&out, @k[0], 2)
+    string_push(@&out, '/')
+    string_push_bytes(@&out, @k[0], 64)
+    string_push_str(@&out, ".rzi.ritz")
+    out
+
+# Make every missing directory of `path` up to its last '/' (mkdir -p of
+# its parent).  Errors are left to the open that follows.
+fn it_mkdirs(path: *u8, len: i64)
+    let buf: *u8 = malloc(len + 1)
+    memcpy(buf, path, len)
+    *(buf + len) = 0
+    var i: i64 = 1
+    while i < len
+        if *(buf + i) == '/'
+            *(buf + i) = 0
+            sys_mkdir(buf, 493)   # 0755
+            *(buf + i) = '/'
+        i = i + 1
+    free(buf)
+
+# Store the interface text of the module with these source bytes, as ritz0's
+# cas._atomic_write does: a temp file in the entry's directory, renamed over
+# the entry, so a reader never sees a torn text.  Returns 0 if it was
+# stored, -1 if not (no store root, or an I/O error).
+pub fn iface_text_store(src: *u8, len: i64, text: *u8, text_len: i64) -> i32
+    var path: String = iface_text_path(src, len)
+    if string_len(@path) == 0
+        string_drop(@&path)
+        return -1
+    it_mkdirs(string_as_ptr(@&path), string_len(@path))
+    var tmp: String = string_new()
+    string_push_bytes(@&tmp, string_as_ptr(@&path), string_len(@path))
+    string_push_str(@&tmp, ".tmp.")
+    string_push_i64(@&tmp, sys_getpid() as i64)
+    let fd: i32 = sys_open3(string_as_ptr(@&tmp), O_WRONLY + O_CREAT + O_TRUNC, 420)
+    var rc: i32 = -1
+    if fd >= 0
+        var off: i64 = 0
+        while off < text_len
+            let w: i64 = sys_write(fd, text + off, text_len - off)
+            if w <= 0
+                break
+            off = off + w
+        sys_close(fd)
+        if off == text_len and sys_rename(string_as_ptr(@&tmp), string_as_ptr(@&path)) == 0
+            rc = 0
+        else
+            sys_unlink(string_as_ptr(@&tmp))
+    string_drop(@&tmp)
+    string_drop(@&path)
+    rc
+
+# The interface text of src[0..len), lexed here (fn_cache re-derives an
+# import's text when none is stored for its current source).  Returns 0, or
+# -1 on a lexer error or a text ritz0 would refuse.
+pub fn iface_text_derive(src: *u8, len: i64, out: @&Vec<u8>) -> i32
+    var lex: Lexer
+    lexer_init(@lex, src, len)
+    var toks: Vec<Token> = vec_with_cap<Token>(4096)
+    while 1 == 1
+        let tok: Token = lexer_next(@lex)
+        let kind: i32 = tok.kind
+        vec_push<Token>(@&toks, tok)
+        if kind == TOK_ERROR
+            return -1
+        if kind == TOK_EOF
+            break
+    iface_text_build(src, len, toks.data, toks.len, out)

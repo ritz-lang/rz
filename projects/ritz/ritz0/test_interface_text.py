@@ -22,6 +22,7 @@ import copy
 import hashlib
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -340,3 +341,182 @@ class TestRitz1:
         assert _parsed(log) == [str(main)]
         _ritz1(main, tmp_path / "cold.ll", tmp_path / "empty")
         assert (tmp_path / "warm.ll").read_text() == (tmp_path / "cold.ll").read_text()
+
+
+# ---------------------------------------------------------------------------
+# ritz1 writes it (AGAST #2113)
+# ---------------------------------------------------------------------------
+#
+# ritz1/src/iface_text.ritz produces the text from the tokens; `ritz1 <src>
+# -o <out> --iface-text` writes it without compiling.  It must be byte for
+# byte ritz0's, or the two compilers would store different texts under one
+# key (the key holds the source bytes only).
+
+
+def _ritz1_text(binary: Path, src: Path, out: Path) -> str:
+    r = subprocess.run([str(binary), str(src), "-o", str(out), "--iface-text"],
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return out.read_text()
+
+
+# One case per clause of the rule (the corpus test below covers the volume).
+WRITER_CASES = {
+    "lib": LIB,  # plain fn, plain impl method; generic fn and generic impl kept
+    "test_async_trait_extern_decl": (
+        "[[test]]\nfn test_x() -> i32\n    0\n\n"
+        "async fn go() -> i32\n    1\n\n"
+        "pub async fn go2() -> i32\n    2\n\n"
+        "trait T\n    fn f(self: *Self) -> i32\n\n"
+        "extern fn write(fd: i32, p: *u8, n: i64) -> i64\n\n"
+        "pub fn d(x: i32) -> i32 = extern\n"),
+    # ritz1's parser drops a gated-out fn; the text, keyed on the source
+    # alone, must still declare it (whatever --target-os is).
+    "target_os": ('[[target_os = "macos"]]\npub fn f() -> i32\n    1\n\n'
+                  '[[target_os = "linux"]]\npub fn f() -> i32\n    2\n'),
+    "attrs": ("[[inline]] pub fn f() -> i32\n    42\n\n"
+              "[[must_use, noinline]]\n\npub fn g() -> i32\n    43\n"),
+    "header": ("fn f(cb: fn(i32) -> i32, a: *[4]i32) -> *[2]i32  # 'quoted # not' \"x#\"\n"
+               "    a as *[2]i32\n"),
+    "multiline_params": "fn f(\n    a: i32,\n    b: i32\n) -> i32\n    a + b\n",
+    "body_comments": ("fn f() -> i32\n    let x: i32 = 1\n\n# col-0 note\n    x\n"
+                      "# about g\n\nfn g() -> i32\n    2\n"),
+    "no_trailing_newline": "const C: i32 = 1\nfn f() -> i32\n    1",
+    "impl_trait_for": ("struct S\n    x: i32\n\ntrait Tr\n    fn m(self: *Self) -> i32\n\n"
+                       "impl Tr for S\n    [[inline]]\n    pub fn m(self: *S) -> i32\n"
+                       "        self.x\n\n    fn n(self: *S) -> i32\n        0\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(WRITER_CASES))
+def test_ritz1_text_equals_ritz0(name, ritz1_bin, tmp_path):
+    src = tmp_path / f"{name}.ritz"
+    src.write_text(WRITER_CASES[name])
+    want = _text(WRITER_CASES[name])
+    assert _ritz1_text(RITZ1_BUILD / "ritz1", src, tmp_path / "out") == want
+
+
+@pytest.mark.integration
+def test_ritz1_text_equals_ritz0_across_corpus(ritz1_bin, tmp_path):
+    """Byte-identical over the whole ritzlib + ritz1 corpus."""
+    checked = 0
+    for path in CORPUS:
+        src = path.read_text()
+        try:
+            want = _text(src)
+        except Exception:
+            continue  # doesn't parse in ritz0
+        got = _ritz1_text(RITZ1_BUILD / "ritz1", path, tmp_path / "out")
+        assert got == want, path
+        checked += 1
+    assert checked > 50
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("compiler")
+class TestRitz1Stores:
+    def test_cold_compile_stores_ritz0_text(self, proj, tmp_path):
+        """A miss stores the import's text, ritz0's bytes, atomically (no
+        temp file left); the main file is not an import and stores none."""
+        store = tmp_path / "store"
+        _ritz1(proj / "main.ritz", tmp_path / "m.ll", store)
+        lib = proj / "lib.ritz"
+        assert _text_path(store, lib.read_bytes()).read_text() == _text(LIB)
+        assert [p.name for p in store.rglob("*.tmp.*")] == []
+        assert not _text_path(store, (proj / "main.ritz").read_bytes()).exists()
+
+    def test_next_compile_reads_it(self, proj, tmp_path):
+        store = tmp_path / "store"
+        _ritz1(proj / "main.ritz", tmp_path / "a.ll", store)
+        for d in store.iterdir():  # the sigs, else the file-level fast path
+            if d.name != "objects":
+                shutil.rmtree(d)
+        log = tmp_path / "parse.log"
+        _ritz1(proj / "main.ritz", tmp_path / "b.ll", store, log)
+        assert _parsed(log) == [str(proj / "main.ritz")]
+        assert (tmp_path / "a.ll").read_text() == (tmp_path / "b.ll").read_text()
+
+
+@pytest.mark.integration
+def test_ritz1_closure_texts_equal_ritz0s(ritz1_bin, tmp_path, monkeypatch):
+    """ritz1's own closure, cold: every import's stored text is ritz0's."""
+    from import_resolver import collect_all_source_files
+    main = RITZ_DIR / "ritz1" / "src" / "main.ritz"
+    monkeypatch.setenv("RITZ_PATH", str(RITZ_DIR))
+    closure = [Path(p) for p in collect_all_source_files(str(main))
+               if Path(p).resolve() != main.resolve()]
+    store = tmp_path / "store"
+    _ritz1(main, tmp_path / "m.ll", store)
+    for p in closure:
+        stored = _text_path(store, p.read_bytes())
+        assert stored.read_text() == _text(p.read_text()), p
+    assert len(closure) > 20
+
+
+# ---------------------------------------------------------------------------
+# ritz1's fast path records interface texts (AGAST #2113)
+# ---------------------------------------------------------------------------
+#
+# The sig records each import by its interface text, so an import edit that
+# keeps the text keeps the importer's file-level fast path.
+
+SKIPPED = "Skipped (unchanged)"
+
+
+def _ritz1_run(main: Path, out: Path, store: Path) -> str:
+    env = dict(os.environ, RITZ_PATH=str(RITZ_DIR), RITZ_CACHE_DIR=str(store))
+    r = subprocess.run([str(RITZ1_BUILD / "ritz1"), str(main), "-o", str(out)],
+                       capture_output=True, text=True, cwd=str(main.parent),
+                       env=env, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return r.stdout
+
+
+@pytest.mark.integration
+class TestFastPathOnInterface:
+    @pytest.fixture
+    def warm(self, proj, tmp_path, ritz1_bin):
+        store = tmp_path / "store"
+        out = tmp_path / "m.ll"
+        assert SKIPPED not in _ritz1_run(proj / "main.ritz", out, store)
+        return proj / "lib.ritz", out, store
+
+    def test_body_edit_keeps_fast_path(self, proj, warm):
+        """No text is stored for the edited source: the check derives it."""
+        lib, out, store = warm
+        ir = out.read_text()
+        lib.write_text(LIB.replace("    y * 2\n", "    y * 3\n"))
+        assert not _text_path(store, lib.read_bytes()).exists()
+        assert SKIPPED in _ritz1_run(proj / "main.ritz", out, store)
+        assert out.read_text() == ir
+
+    def test_stored_text_is_what_is_compared(self, proj, warm, monkeypatch):
+        """With a text stored for the edited source (build.py's ritz0 stores
+        it before ritz1 runs), that text is compared: one that differs from
+        the recorded one recompiles."""
+        lib, out, store = warm
+        lib.write_text(LIB.replace("    y * 2\n", "    y * 3\n"))
+        _warm([lib], store, monkeypatch)
+        assert SKIPPED in _ritz1_run(proj / "main.ritz", out, store)
+        p = _text_path(store, lib.read_bytes())
+        p.write_text(p.read_text().replace("    b: i64\n", "    b: i64\n    c: i8\n", 1))
+        assert SKIPPED not in _ritz1_run(proj / "main.ritz", out, store)
+
+    def test_header_edit_recompiles(self, proj, warm):
+        lib, out, store = warm
+        lib.write_text(LIB + "\npub fn extra() -> i64\n    1\n")
+        assert SKIPPED not in _ritz1_run(proj / "main.ritz", out, store)
+
+    def test_kept_body_edit_recompiles(self, proj, warm):
+        """A generic fn's body is in the text: editing it changes the IR."""
+        lib, out, store = warm
+        lib.write_text(LIB.replace("pub fn ident<T>(x: T) -> T\n    x\n",
+                                   "pub fn ident<T>(x: T) -> T\n    let z: T = x\n    z\n"))
+        assert SKIPPED not in _ritz1_run(proj / "main.ritz", out, store)
+
+    def test_line_shift_recompiles(self, proj, warm):
+        """A body edit that adds a line moves every later line of the text."""
+        lib, out, store = warm
+        lib.write_text(LIB.replace("    y * 2\n", "    let z: i64 = y\n    z * 2\n"))
+        assert SKIPPED not in _ritz1_run(proj / "main.ritz", out, store)

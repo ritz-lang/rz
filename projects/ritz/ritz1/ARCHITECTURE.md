@@ -78,7 +78,8 @@ loads (`strip_to_interface`): bodies are kept only for generic fns and methods
 the importer may instantiate, and for async fns (their locals lay out the
 future the importer allocates), so a body-only edit to an import does not change
 the importer's IR. An import may be read from its cached interface text
-instead of its source (`load_and_parse`, `fn_cache`).
+instead of its source (`load_and_parse`, `fn_cache`); on a miss ritz1 stores
+that text itself (`iface_text`).
 
 ## Where a new check goes
 
@@ -135,6 +136,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `main` | CLI, the pipeline above, import resolution and merging, duplicate fn/const detection. |
 | `fn_cache` | Sig file per source: a snapshot of emitted IR plus what it depends on; the no-op rebuild fast path. |
 | `sha256` | SHA-256 for interface-text store keys shared with ritz0. |
+| `iface_text` | The interface text an import is parsed from (`<t>.rzi.ritz`), built from the tokens on a miss, byte-identical to ritz0's (module_interface.interface_text), and stored atomically; fn_cache's sig records imports by it, so a body-only edit of an import keeps the fast path (AGAST #2113). |
 
 **Generics**
 

@@ -71,6 +71,7 @@ import ritzlib.option
 import ritzlib.result
 import ritzlib.json
 import ritzlib.os.env
+import iface_text   # iface_text_path, iface_text_derive (AGAST #2113)
 
 
 # ============================================================================
@@ -574,9 +575,15 @@ fn sig_data_add_miss(sd: *SigData, path: *u8, path_len: i64) -> i32
 # ============================================================================
 #
 # main.ritz's import resolver calls `dep_record_note()` for every file it
-# loads, with the exact bytes it is about to parse — so the hash describes
+# loads, with the exact bytes this compile saw of it — so the hash describes
 # what this compile actually saw, not what is on disk by the time the sig is
 # written.  The record is moved into the outgoing sig by `sig_take_deps()`.
+#
+# Those bytes are the import's interface text (AGAST #2113), the one parsed
+# or the one stored on a miss: all the importer's IR depends on.  So an edit
+# of an import that keeps its text (a body edit that moves no line) keeps
+# the importer's sig.  Only when no text could be stored are they the
+# source's: sig_deps_unchanged accepts either.
 #
 # It also calls `dep_record_miss()` for every candidate it probes and misses
 # before a hit (AGAST #2030).
@@ -972,9 +979,35 @@ pub fn write_sig_file(sig_path: *u8, sd: *SigData) -> i32
 # File-level fast path
 # ============================================================================
 
-# 1 when every dependency recorded in `sd` still has the recorded content.
-# A sig with no record at all (`has_deps == 0`) answers 0.  An unreadable or
-# empty dependency also answers 0: failing closed costs one recompile.
+# 1 if the interface text of the source bytes buf[0..sz) hashes to `want`
+# (AGAST #2113): the stored one, else derived here (lexed, not parsed, so
+# not stored: ritz0 and load_and_parse store only a text whose source parses).
+fn dep_text_matches(buf: *u8, sz: i64, want: u64) -> i32
+    var path: String = iface_text_path(buf, sz)
+    var tsz: i64 = 0
+    var text: *u8 = null
+    if string_len(@path) > 0
+        text = read_file_to_buf(string_as_ptr(@&path), @tsz)
+    string_drop(@&path)
+    var h: u64 = 0
+    if text != null
+        h = fnv1a_bytes(text, tsz)
+        free(text)
+    else
+        var made: Vec<u8> = vec_new<u8>()
+        if iface_text_derive(buf, sz, @&made) < 0
+            return 0
+        h = fnv1a_bytes(made.data, made.len)
+    if h == want
+        return 1
+    0
+
+# 1 when every dependency recorded in `sd` still has the recorded content:
+# its source unchanged, or the interface text stored for its current source
+# the recorded one (dep_record_note).  A sig with no record at all
+# (`has_deps == 0`) answers 0.  An unreadable or empty dependency, or a
+# changed one whose text can't be derived, also answers 0: failing closed
+# costs one recompile.
 fn sig_deps_unchanged(sd: *SigData) -> i32
     if sd.has_deps == 0
         return 0
@@ -984,9 +1017,14 @@ fn sig_deps_unchanged(sd: *SigData) -> i32
         let buf: *u8 = read_file_to_buf(*(sd.dep_paths + i), @sz)
         if buf == null
             return 0
-        let h: u64 = fnv1a_bytes(buf, sz)
+        let want: u64 = *(sd.dep_hashes + i)
+        var same: i32 = 0
+        if fnv1a_bytes(buf, sz) == want
+            same = 1
+        else
+            same = dep_text_matches(buf, sz, want)
         free(buf)
-        if h != *(sd.dep_hashes + i)
+        if same == 0
             return 0
         i = i + 1
     return 1

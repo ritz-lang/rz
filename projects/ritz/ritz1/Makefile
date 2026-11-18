@@ -73,6 +73,7 @@ SOURCES = \
 	emitter_asm \
 	emitter_stmt \
 	emitter \
+	iface_text \
 	fn_cache \
 	sha256 \
 	main_abi \
