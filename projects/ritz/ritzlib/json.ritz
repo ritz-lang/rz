@@ -58,7 +58,8 @@ const JSON_ERR_EXPECTED_COLON: i32 = 3
 const JSON_ERR_EXPECTED_BRACKET: i32 = 4
 const JSON_ERR_EXPECTED_BRACE: i32 = 5
 const JSON_ERR_OUT_OF_MEMORY: i32 = 6
-const JSON_ERR_INVALID_ESCAPE: i32 = 7   # malformed \uXXXX: bad hex, unpaired surrogate
+const JSON_ERR_INVALID_ESCAPE: i32 = 7   # escape RFC 8259 lacks (\q), bad \uXXXX hex,
+                                         # unpaired surrogate, or \u0000 in a key
 
 # Error type for JSON parsing
 struct JsonError
@@ -175,7 +176,7 @@ fn jp_parse_value(p: *JsonParser) -> *JsonValue
 
     # String
     if ch == '"'  # '"'
-        return jp_parse_string(p)
+        return jp_parse_string(p, 0)
 
     # Number (including negative)
     if ch == '-' or (ch >= '0' and ch <= '9')  # '-' or digit
@@ -262,8 +263,8 @@ fn jp_put_utf8(dst: *u8, cp: i32) -> i64
     *(dst + 3) = (0x80 | (cp & 0x3F)) as u8
     return 4
 
-# Fail a string parse on a malformed \u escape: report JSON_ERR_INVALID_ESCAPE
-# at `at`, the offset of the escape's backslash.
+# Fail a string parse on an invalid escape: report JSON_ERR_INVALID_ESCAPE at
+# `at`, the offset of the escape's backslash.
 fn jp_bad_escape(p: *JsonParser, str: *u8, at: i64) -> *JsonValue
     free(str)
     p.err = JSON_ERR_INVALID_ESCAPE
@@ -292,7 +293,11 @@ fn jp_decode_u(src: *u8, pos: i64, end: i64, used: *i64) -> i32
     *used = 11
     return 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
 
-fn jp_parse_string(p: *JsonParser) -> *JsonValue
+# Parse the string at p.pos.  `is_key` != 0 for an object key, which is kept
+# as a NUL-terminated *u8 with no length (JsonValue.keys), so \u0000 is rejected
+# there: json_get_field would otherwise match {"a\u0000b": 1} on "a".  A string
+# value keeps \u0000: str_len counts it and json_get_string returns all bytes.
+fn jp_parse_string(p: *JsonParser, is_key: i32) -> *JsonValue
     if jp_peek(p) != 34  # '"'
         return null
     jp_advance(p)  # Skip opening quote
@@ -341,7 +346,7 @@ fn jp_parse_string(p: *JsonParser) -> *JsonValue
                 if esc == 'u'
                     var used: i64 = 0
                     let cp: i32 = jp_decode_u(p.src, src_pos, end, @used)
-                    if cp < 0
+                    if cp < 0 or (cp == 0 and is_key != 0)
                         return jp_bad_escape(p, str, src_pos - 1)
                     dst_pos += jp_put_utf8(str + dst_pos, cp)
                     src_pos += used
@@ -363,7 +368,8 @@ fn jp_parse_string(p: *JsonParser) -> *JsonValue
                     else if esc == '\\'  # '\'
                         *(str + dst_pos) = 92
                     else
-                        *(str + dst_pos) = esc as u8  # Unknown escape, copy as-is
+                        # RFC 8259 has no other escape: "\q" is an error, not "q".
+                        return jp_bad_escape(p, str, src_pos - 1)
                     dst_pos += 1
                     src_pos += 1
         else
@@ -489,7 +495,7 @@ fn jp_parse_object(p: *JsonParser) -> *JsonValue
             jp_skip_ws(p)
 
             # Parse key (must be string)
-            let key_val: *JsonValue = jp_parse_string(p)
+            let key_val: *JsonValue = jp_parse_string(p, 1)
             if key_val == null
                 vec_drop<u8>(@&keys_vec)
                 vec_drop<u8>(@&vals_vec)
@@ -611,7 +617,7 @@ pub fn json_error_message(code: i32) -> StrView
     if code == JSON_ERR_OUT_OF_MEMORY
         return "out of memory"
     if code == JSON_ERR_INVALID_ESCAPE
-        return "invalid \\u escape"
+        return "invalid escape"
     return "unknown error"
 
 # =============================================================================
@@ -705,7 +711,7 @@ pub fn json_emit_value(v: *JsonValue, buf: *Vec<u8>) -> i32
         itoa(v.num_val, @num_buf[0])
         vec_push_str(buf, @num_buf[0])
     else if v.kind == JSON_STRING
-        json_emit_string(v.str_val, buf)
+        json_emit_bytes(v.str_val, v.str_len, buf)
     else if v.kind == JSON_ARRAY
         vec_push<u8>(buf, 91)  # '['
         for i in 0..v.count
@@ -724,11 +730,15 @@ pub fn json_emit_value(v: *JsonValue, buf: *Vec<u8>) -> i32
         vec_push<u8>(buf, 125)  # '}'
     return 0
 
-pub fn json_emit_string(s: *u8, buf: *Vec<u8>) -> i32
+# Emit s[0..len) as a JSON string literal.  Length-driven, so an embedded NUL
+# (a decoded \u0000) is written as \u0000 rather than ending the string.
+# Control characters U+0000-U+001F, which RFC 8259 forbids raw inside a
+# string, are written as \n \t \r \b \f or \u00XX.
+pub fn json_emit_bytes(s: *u8, len: i64, buf: *Vec<u8>) -> i32
     vec_push<u8>(buf, 34)  # '"'
     if s != null
         var i: i64 = 0
-        while *(s + i) != 0
+        while i < len
             let ch: u8 = *(s + i)
             if ch == '"'  # '"'
                 vec_push<u8>(buf, 92)  # '\'
@@ -745,11 +755,33 @@ pub fn json_emit_string(s: *u8, buf: *Vec<u8>) -> i32
             else if ch == '\r'  # '\r'
                 vec_push<u8>(buf, 92)
                 vec_push<u8>(buf, 114)
+            else if ch == 8  # backspace
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 98)   # 'b'
+            else if ch == 12  # form feed
+                vec_push<u8>(buf, 92)
+                vec_push<u8>(buf, 102)  # 'f'
+            else if ch < 32  # other control characters: \u00XX
+                vec_push_str(buf, c"\\u00")
+                vec_push<u8>(buf, jp_hex_digit(ch >> 4))
+                vec_push<u8>(buf, jp_hex_digit(ch & 15))
             else
                 vec_push<u8>(buf, ch)
             i += 1
     vec_push<u8>(buf, 34)  # '"'
     return 0
+
+# Lowercase hex digit for 0..15.
+fn jp_hex_digit(d: u8) -> u8
+    if d < 10
+        return d + 48   # '0'
+    return d + 87       # 'a' - 10
+
+# Emit NUL-terminated `s` as a JSON string literal (see json_emit_bytes).
+pub fn json_emit_string(s: *u8, buf: *Vec<u8>) -> i32
+    if s == null
+        return json_emit_bytes(s, 0, buf)
+    return json_emit_bytes(s, strlen(s), buf)
 
 # The JSON text of `v`; the caller owns the String (string_drop).
 pub fn json_to_string(v: *JsonValue) -> String

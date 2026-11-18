@@ -2264,8 +2264,11 @@ struct JsonError
 
 Strings are decoded to UTF-8: `\n \t \r \b \f \/ \" \\` and `\uXXXX`, with a
 surrogate pair (`😀`) combined into one 4-byte sequence. Bad hex
-digits, a short `\u`, or a surrogate without its other half fail with
-`JSON_ERR_INVALID_ESCAPE` at the escape's backslash.
+digits, a short `\u`, a surrogate without its other half, or any other
+escape (`\q`, `\x41`) fail with `JSON_ERR_INVALID_ESCAPE` at the escape's
+backslash. `\u0000` is kept in a string value (`str_len` and
+`json_get_string` count it) but rejected in an object key, which is stored as
+a NUL-terminated `*u8`.
 
 **Value Access**:
 
@@ -2285,7 +2288,8 @@ digits, a short `\u`, or a surrogate without its other half fail with
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `json_emit_value` | `fn(v: *JsonValue, buf: *Vec<u8>) -> i32` | Emit to buffer |
-| `json_emit_string` | `fn(s: *u8, buf: *Vec<u8>) -> i32` | Emit string |
+| `json_emit_bytes` | `fn(s: *u8, len: i64, buf: *Vec<u8>) -> i32` | Emit `s[0..len)` as a string; control characters as `\b \f \n \r \t` or `\u00XX` |
+| `json_emit_string` | `fn(s: *u8, buf: *Vec<u8>) -> i32` | `json_emit_bytes` up to the first NUL |
 | `json_to_string` | `fn(v: *JsonValue) -> String` | JSON text; caller owns (`string_drop`) |
 
 **Error Messages**:
