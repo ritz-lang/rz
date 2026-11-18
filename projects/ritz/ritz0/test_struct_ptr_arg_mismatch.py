@@ -184,10 +184,21 @@ def test_struct_ptr_arg_mismatch_rejected(compiler, case, tmp_path):
     assert proc.returncode != 0, f"{compiler} accepted a struct-pointer mismatch ({case}):\n{out}"
     assert re.search(rf"t\.ritz:{line}\b", out), (
         f"{compiler}: diagnostic not located at t.ritz:{line}:\n{out[-2000:]}")
+    # ritz1's slot check, on Sema since AGAST #4011, refuses an `@x` argument
+    # first, in ritz0's referent words, and stops the compile before the
+    # emitter's call check names the callee and argument.
+    if compiler != "ritz0" and re.search(rf"t\.ritz:{line}:\d+: error: " + re.escape(OTHER_REFERENT), out):
+        assert case in SLOT_FIRST, f"{compiler}: {case} is refused by the slot check:\n{out[-2000:]}"
+        return
+    assert case not in SLOT_FIRST or compiler == "ritz0", f"{compiler}: {case} isn't the slot check's:\n{out[-2000:]}"
     assert callee in out, f"{compiler}: diagnostic does not name `{callee}`:\n{out[-2000:]}"
     assert re.search(rf"argument {argno}\b", out), (
         f"{compiler}: diagnostic does not name argument {argno}:\n{out[-2000:]}")
     assert "wrong type" in out, f"{compiler}: rejected, but not as a type mismatch:\n{out[-2000:]}"
+
+
+SLOT_FIRST = {"addr_of_local", "growbuf_as_vec", "member", "method", "mut_ref", "ufcs"}
+OTHER_REFERENT = "a reference to one type doesn't fit a reference to another: cast it with `as`"
 
 
 # Controls: the same call shapes with the right struct.

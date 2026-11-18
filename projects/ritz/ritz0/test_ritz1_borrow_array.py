@@ -1460,10 +1460,45 @@ def test_ritz0_refuses(tmp_path, name):
     assert comp.returncode != 0, "ritz0 now takes this: it isn't a refusal to match"
 
 
+# These `@x` arguments are refused first by the slot checks, on Sema since
+# AGAST #4011 (ref_rules' words), which stop the compile before the emitter's
+# "argument N has the wrong type".
+OTHER_TYPE = "a reference to one type doesn't fit a reference to another: cast it with `as`"
+SHARED_INTO_MUT = "`@x` is shared and doesn't fit an `@&T` or `:&` slot: write `@&x`"
+REFUSED_ON_SEMA = {
+    "address_of_element": OTHER_TYPE,
+    "address_of_nested_element": OTHER_TYPE,
+    "address_of_scalar": OTHER_TYPE,
+    "address_of_scalar_field": OTHER_TYPE,
+    "address_of_struct": OTHER_TYPE,
+    "flat_into_nested": OTHER_TYPE,
+    "fn_value_argument": OTHER_TYPE,
+    "method_argument": OTHER_TYPE,
+    "nested_field_wrong": OTHER_TYPE,
+    "nested_into_flat": OTHER_TYPE,
+    "nested_reference_param_wrong": OTHER_TYPE,
+    "nested_same_bytes": OTHER_TYPE,
+    "nested_wrong_leaf": OTHER_TYPE,
+    "nested_wrong_shape": OTHER_TYPE,
+    "wrong_element": OTHER_TYPE,
+    "wrong_length_address": OTHER_TYPE,
+    "wrong_length_mut_reference_param": OTHER_TYPE,
+    "wrong_length_pass_on_address": OTHER_TYPE,
+    "wrong_length_reference_param": OTHER_TYPE,
+    "wrong_length_shared_address": OTHER_TYPE,
+    "wrong_struct_element": OTHER_TYPE,
+    "borrowed_scalar": SHARED_INTO_MUT,
+    "borrowed_struct": SHARED_INTO_MUT,
+    "nested_deref_address_wrong": SHARED_INTO_MUT,
+}
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_ritz1_refuses_at_the_line(ritz1_bin, tmp_path, name):
     pattern, program = REFUSED[name]
+    if name in REFUSED_ON_SEMA:
+        pattern = r"main\.ritz:\d+:\d+: error: " + re.escape(REFUSED_ON_SEMA[name])
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + program)
     assert comp.returncode != 0
     assert not ll.exists()
@@ -1681,7 +1716,9 @@ BARE_ARRAY = r"a (whole|multi-dimensional) array is not a value"
 def test_ritz1_refuses_a_bare_array_as_an_address(ritz1_bin, tmp_path, name):
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + LAX[name])
     assert comp.returncode != 0 and not ll.exists()
-    assert re.search(BARE_ARRAY, comp.stdout + comp.stderr), comp.stdout + comp.stderr
+    # `a as *i32` is a cast of a value to a pointer (AGAST #2370), on Sema since #4011.
+    pattern = BARE_ARRAY if name != "cast_to_pointer" else re.escape("a value doesn't fit a reference slot: write `@x` to borrow it")
+    assert re.search(pattern, comp.stdout + comp.stderr), comp.stdout + comp.stderr
 
 
 # AGAST #2323: a pointer to no array is refused into `:& [N]T`, as ritz0 refuses it.

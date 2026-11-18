@@ -3831,6 +3831,12 @@ CHUNK = 64  # table_rows.CHUNK; test_every_row checks they agree
 
 MOVE_OUT_OF_A_REFERENCE = "cannot move out of a reference"
 
+# ritz1 refuses `[t; 2]` first by `[v; n]`'s own rule, on Sema since AGAST
+# #4011, which stops the compile before the emitter's move check.
+MOVE_OUT_SEMA_FIRST = {
+    "array_fill": "`[v; n]` copies `v` into every element: a move-only value fills one, `[v; 1]`",
+}
+
 
 # A bare `t` or `t.h` whose value is discarded (LARB R69) has no effect, so
 # ritz0 refuses it with R64's words before #2949's move question arises (AGAST
@@ -3868,8 +3874,12 @@ def _pair_rows():
     # refuse here where it used to leave the rejection to clang. The error names a
     # line in the source, which clang's never could.
     for name in sorted(MOVE_OUT):
-        yield (f"by_value_field_is_still_a_move_out[{name}]", _pair_of(name),
-               MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE)
+        rid = f"by_value_field_is_still_a_move_out[{name}]"
+        if name in MOVE_OUT_SEMA_FIRST:
+            yield rid, ("ritz0",), MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE
+            yield rid, ("ritz1",), MOVE_OUT[name], "at", MOVE_OUT_SEMA_FIRST[name]
+            continue
+        yield rid, _pair_of(name), MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE
     for name in sorted(NO_IMPLICIT_DEREF):
         yield f"a_reference_is_not_its_referent[{name}]", PAIR, NO_IMPLICIT_DEREF[name], "at", REF_INTO_VALUE
     for name in sorted(POINTER_SLOTS):

@@ -179,6 +179,8 @@ def test_neighbouring_entries_across_a_module_boundary_cherry_pick(tmp_path):
     # empties its group).
     groups = _groups()
     pairs = list(itertools.pairwise(groups))
+    if not pairs:
+        pytest.skip("one module's group is left: no module boundary to cross")
     g, h = next(((g, h) for g, h in pairs if len(g) > 1 and len(h) > 1), pairs[0])
     _cross_pick(tmp_path, {g[-1]}, {h[0]})
 

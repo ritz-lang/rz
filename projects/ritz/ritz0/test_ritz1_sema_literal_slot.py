@@ -25,8 +25,9 @@ One program, both ritz1 compilers: a literal that doesn't fit each kind of
 slot (a return, a fn's tail arm, a `let`, an assignment, an element through a
 `[N]*T` element and through a `*[N]T`, a call's and a method's argument, a
 field, R21's operand, an array element), a `c"..."` in a StrView; then a
-`*[2][3]i32` given a `*[2][4]i32`, which is ref_check's error, still on the
-emitter: it is no longer printed.  Before the move it was.  The literal inside
+`*[2][3]i32` given a `*[2][4]i32`, ref_check's slot error: on the emitter it
+was no longer printed after these, and since AGAST #4011 it is Sema's, so it
+is again, in walk order.  The literal inside
 `sizeof(..)` is never lowered, so it isn't judged, as on the emitter.
 """
 
@@ -96,6 +97,7 @@ WANTED = [
     ("34:29", "`300` does not fit in `u8`"),
     ("35:23", 'a `c"..."` literal is a `*u8`, not a `StrView`: write a plain `"..."` literal'),
     ("36:26", "`999` does not fit in `u8`"),
+    ("39:26", "a reference to one type doesn't fit a reference to another: cast it with `as`"),
 ]
 
 

@@ -209,7 +209,7 @@ still run mid-lowering on `*EmitterState`, and
 
 - `let_check` — `let` immutability: no write or `@&` through a `let`'s place.
   Its place rule (`let_place`) reads either view through a `LetEnv`:
-  ref_check, still on the emitter, asks it about an `@x` of a `let`
+  `ref_value` asks it about an `@x` of a `let` in an `@&T` slot
   (`let_addr_of_own`).
 
 - `literal_slot` — a literal takes its type from its slot (R3). Run on Sema
@@ -229,14 +229,15 @@ still run mid-lowering on `*EmitterState`, and
 - `reachability` — code that can never run is refused. Run by main over the
   whole module before monomorphisation.
 
-- `ref_check` — a reference doesn't fit a by-value slot, nor a value a
-  reference slot, and an array only fits a slot of its own element type.
-  Its §13.5 borrow conflicts moved to `ref_loan` (#3506), its `@T` read-only
-  writes and return-of-local to `ref_value` (#3926); the slot checks are
-  still to move (#1816). Its place queries (`ref_view_in`,
-  `ref_write_is_shared_in`, `ref_ty_in`) are one copy over a `RefEnv`, the
-  emitter's locals or Sema's scope, and it keeps Sema's place typing
-  (`rs_ty`) and per-binding notes (`RsNote`).
+- `ref_check` — the reference queries both sides ask; its checks have all
+  moved to Sema: §13.5 borrow conflicts to `ref_loan` (#3506), the rest to
+  `ref_value` (#3926, #4011). Its place queries (`ref_ty_in`, `ref_view_in`,
+  `ref_write_is_shared_in`, `ref_temp_call_in`) are one copy over a `RefEnv`,
+  the emitter's locals or Sema's scope; on Sema a binding is read from the
+  image of the `LocalVar` the emitter will make for it (`RsNote.loc`). It
+  keeps Sema's place typing (`rs_ty`) and per-binding notes (`RsNote`), and
+  what the emitter still asks (`ref_ty_of`, `ref_through`, `ref_temp_call`,
+  "cannot move out of a reference").
 
 - `ref_loan` — a borrow of a place conflicts with an overlapping loan
   (§13.5, R11 / R11a). A loan ends with its holder's block: Sema's blocks
@@ -246,7 +247,11 @@ still run mid-lowering on `*EmitterState`, and
 
 - `ref_value` — `@T` is read-only (§13.3, R1): no write, `@&` or `self: @&T`
   receiver through an `@T`; a reference to a local doesn't leave its fn
-  (§13.5, R2). Its places are typed by `ref_check`'s `RefEnv` queries.
+  (§13.5, R2). And the slot checks (§13.2-13.4, R1, R5, R42): a reference
+  doesn't fit a by-value slot, nor a value a reference slot, nor `@x` or an
+  `@T` an `@&T` / `:&` one; an array only fits a slot of its own element
+  type and length; a call's temporary isn't a place; `[v; n]` of a move-only
+  v. Its places are typed by `ref_check`'s `RefEnv` queries.
 
 - `sema_index_store` — an index store ritz1 can't lower is refused, not
   miscompiled.

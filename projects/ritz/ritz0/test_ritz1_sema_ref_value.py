@@ -6,8 +6,8 @@ ref_check.ritz judged its value checks as the emitter lowered each
 statement.  This moves the half the walk itself judges onto Sema
 (ref_value.ritz): a write, an `@&` or a `self: @&T` receiver through an `@T`
 (LANGUAGE_SPEC §13.3, LARB R1, AGAST #2338 / #2374), and a reference to a
-local leaving its fn (§13.5, LARB R2, AGAST #2340).  The slot checks stay on
-the emitter for now (#1816).  The place queries both sides need
+local leaving its fn (§13.5, LARB R2, AGAST #2340).  The slot checks followed
+(#4011, test_ritz1_sema_ref_slot.py).  The place queries both sides need
 (ref_view_in, ref_write_is_shared_in, ref_ty_in) are one copy over a RefEnv,
 and what Sema's scope doesn't keep is noted per binding (ref_check's RsNote).
 
