@@ -846,8 +846,12 @@ class _CfgBuilder:
             # The call keeps its source spans: it is the user's call of `foo`,
             # so a private `foo` of another file is refused here, at `foo`
             # (#3925, LARB R45a).  `foo_poll` is the compiler's own call.
+            # The build takes the await's span: the emitter locates code per
+            # statement, and a call with no !dbg location makes LLVM strip
+            # the module's debug info (#3800).  The resume state is emitted
+            # next, so `foo_poll` inherits the location.
             self.emit(rast.AssignStmt(
-                span=self.span, target=self.rw.self_field(fut, self.span),
+                span=aw.span, target=self.rw.self_field(fut, self.span),
                 value=rast.Call(span=inner.span, func=rast.Ident(span=inner.func.span, name=fn_name), args=args)))
             polled = rast.Call(span=self.span, func=rast.Ident(span=self.span, name=f"{fn_name}_poll"),
                                args=[rast.UnaryOp(span=self.span, op='@',
@@ -874,7 +878,8 @@ class _CfgBuilder:
         resume = self.new_block()
         self.goto(resume)
         self.cur = resume
-        self.emit(rast.LetStmt(span=self.span, name=answer,
+        # The await's span locates the poll source's call (#3800).
+        self.emit(rast.LetStmt(span=aw.span, name=answer,
                                type=self.gen._make_named_type(PollAbi.EXPR_TYPE), value=polled))
         self.emit(rast.ExprStmt(span=self.span, expr=rast.If(
             span=self.span, cond=self.abi.expr_is_pending(rast.Ident(span=self.span, name=answer)),
