@@ -32,7 +32,7 @@ VERDICT = HARLAND / "boot" / "uefi_verdict.sh"
 
 # mm/pmm imports serial, whose `asm x86_64:` blocks only ritz0 parses
 # (AGAST #1455/#1825), and ritz0 is what `rz build harland` uses.
-PMM_MODULES = ["mm.pmm", "serial", "io"]
+PMM_MODULES = ["mm.pmm", "serial", "io", "ritzlib.fmt"]  # serial imports ritzlib.fmt (#1957)
 
 # Exit code i names the i-th failing check.
 PMM_PAGE_ZERO = """\

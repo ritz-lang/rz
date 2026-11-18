@@ -101,7 +101,10 @@ def _run(compiler, tmp_path, src, modules):
     """Compile `src` and each harland module (own object each, as a build does), link, run."""
     objs = []
     for mod in modules:
-        text = (KERNEL_SRC / (mod.replace(".", "/") + ".ritz")).read_text()
+        # ritzlib.* (e.g. ritzlib.fmt, which serial.ritz imports, #1957) lives
+        # under the ritz tree; every other module is a harland kernel module.
+        root = RITZ_ROOT if mod.startswith("ritzlib.") else KERNEL_SRC
+        text = (root / (mod.replace(".", "/") + ".ritz")).read_text()
         extra = ("--no-runtime",) if compiler == "ritz0" else ()
         objs.append(str(_compile(compiler, tmp_path, text, mod.replace(".", "_"), extra)))
     objs.insert(0, str(_compile(compiler, tmp_path, src, "t")))
