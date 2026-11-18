@@ -125,8 +125,23 @@ class TestShape:
         assert _text(src) == "fn f() -> i32 = extern\n\n"
 
     def test_attribute_on_header_line(self):
-        src = "[[inline]] pub fn f() -> i32\n    42\n"
-        assert _text(src) == "[[inline]] pub fn f() -> i32 = extern\n\n"
+        src = "[[noinline]] pub fn f() -> i32\n    42\n"
+        assert _text(src) == "[[noinline]] pub fn f() -> i32 = extern\n\n"
+
+    def test_pub_inline_fn_is_kept(self):
+        """A free pub [[inline]] / [[always_inline]] fn keeps its body, so an
+        importer can define it available_externally (AGAST #3585).  The rule
+        is on the tokens, like ritz1's writer: g, which calls, keeps its body
+        too (the importer declares it, inline_import_eligible); a private
+        one does not."""
+        src = ("[[inline]]\npub fn f(x: i64) -> i64\n    x + 1\n"
+               "[[inline]]\npub fn g(x: i64) -> i64\n    f(x)\n"
+               "[[target_os = \"linux\", always_inline]] pub fn h() -> i64\n    2\n"
+               "[[inline]]\nfn p(x: i64) -> i64\n    x\n")
+        assert _text(src) == ("[[inline]]\npub fn f(x: i64) -> i64\n    x + 1\n"
+                              "[[inline]]\npub fn g(x: i64) -> i64\n    f(x)\n"
+                              "[[target_os = \"linux\", always_inline]] pub fn h() -> i64\n    2\n"
+                              "[[inline]]\nfn p(x: i64) -> i64 = extern\n\n")
 
     def test_body_comments_and_blank_lines(self):
         """Blank and comment-only lines -- even at column 0 -- don't end a
@@ -195,8 +210,8 @@ class TestStore:
         """The language-neutral key ritz1 recomputes (main.ritz iface_text_path)."""
         src = b"fn f() -> i32\n    1\n"
         inner = hashlib.sha256(src).hexdigest()
-        want = hashlib.sha256(f"ritz-iface-text-v1\n{inner}".encode()).hexdigest()
-        assert mi.TEXT_SCHEMA == "ritz-iface-text-v1"
+        want = hashlib.sha256(f"ritz-iface-text-v2\n{inner}".encode()).hexdigest()
+        assert mi.TEXT_SCHEMA == "ritz-iface-text-v2"
         assert mi.text_key(src) == want
 
     def test_interface_hash_writes_text(self, proj, store):
@@ -382,6 +397,14 @@ WRITER_CASES = {
     "body_comments": ("fn f() -> i32\n    let x: i32 = 1\n\n# col-0 note\n    x\n"
                       "# about g\n\nfn g() -> i32\n    2\n"),
     "no_trailing_newline": "const C: i32 = 1\nfn f() -> i32\n    1",
+    # AGAST #3585: a free pub [[inline]] fn keeps its body, eligible or not;
+    # a private one or a method does not.
+    "inline_kept": ("[[inline]]\npub fn f(x: i64) -> i64\n    x + 1\n\n"
+                    "[[always_inline]] pub fn g(x: i64) -> i64\n    f(x)\n\n"
+                    '[[target_os = "linux", inline]]\npub fn h() -> i64\n    2\n\n'
+                    "[[inline]]\nfn p(x: i64) -> i64\n    x\n\n"
+                    "struct S\n    x: i64\n\nimpl S\n    [[inline]]\n    pub fn m(self: *S) -> i64\n"
+                    "        self.x\n"),
     "impl_trait_for": ("struct S\n    x: i32\n\ntrait Tr\n    fn m(self: *Self) -> i32\n\n"
                        "impl Tr for S\n    [[inline]]\n    pub fn m(self: *S) -> i32\n"
                        "        self.x\n\n    fn n(self: *S) -> i32\n        0\n"),

@@ -631,6 +631,123 @@ pub fn fn_is_naked(f: *FnDef) -> i32
         return 1
     0
 
+# 1 if a module interface keeps free fn `f`'s body: `pub` and marked
+# [[inline]] or [[always_inline]], eligible or not (AGAST #3585).  A rule on
+# the tokens, so iface_text.ritz writes the same text without a Module;
+# ritz0's module_interface.inline_kept.  fn_inline_import below decides
+# whether the importer defines it.
+pub fn fn_inline_kept(f: *FnDef) -> i32
+    if f.is_pub == 0
+        return 0
+    if (item_attr_bits(f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
+        return 0
+    1
+
+# AGAST #3585: 1 if an importer may define `f` `available_externally`, so
+# -O2 inlines it across modules without LTO (`syscallN`, ritzlib.sys).  The
+# rule is ritz0's (module_interface.inline_import_eligible, which explains
+# it): a free `pub` fn marked [[inline]] / [[always_inline]], not generic,
+# async, naked, generated or a declaration, whose body names only its params
+# and its own locals, through the statements and expressions ii_stmts
+# accepts.  Anything else (a call, a module var, a const) could be private
+# to the defining module, which the importer cannot link to.  ritz1 also
+# refuses an if-expression and a field or index store; ritz0 inlines those,
+# which only costs ritz1 the inlining.  Its body is kept (fn_inline_kept);
+# emitter.ritz emit_fn defines it.
+pub fn fn_inline_import(f: *FnDef) -> i32
+    if (item_attr_bits(f as *u8) & (ATTR_INLINE | ATTR_ALWAYS_INLINE)) == 0
+        return 0
+    if f.is_pub == 0 or f.type_params != null or f.is_async != 0 or f.from_generated != 0
+        return 0
+    if f.body == null or fn_is_decl(f) == 1 or fn_is_naked(f) == 1
+        return 0
+    if f.body.kind == STMT_STRIPPED
+        return 0
+    ii_stmts(f, f.body)
+
+fn ii_same(a: *u8, alen: i32, b: *u8, blen: i32) -> i32
+    if alen != blen
+        return 0
+    var i: i32 = 0
+    while i < alen
+        if *(a + i) != *(b + i)
+            return 0
+        i = i + 1
+    1
+
+# 1 if `name` is one of `f`'s params or a let / var anywhere in `body`.
+fn ii_named(f: *FnDef, name: *u8, len: i32) -> i32
+    var p: *Param = f.params
+    while p != null
+        if ii_same(p.name, p.name_len, name, len) == 1
+            return 1
+        p = p.next
+    ii_declares(f.body, name, len)
+
+fn ii_declares(st: *Stmt, name: *u8, len: i32) -> i32
+    var s: *Stmt = st
+    while s != null
+        if s.kind == STMT_VAR_DECL and ii_same(s.var_name, s.var_name_len, name, len) == 1
+            return 1
+        if s.kind == STMT_IF
+            if ii_declares(s.if_then, name, len) == 1 or ii_declares(s.if_else, name, len) == 1
+                return 1
+        if s.kind == STMT_WHILE and ii_declares(s.while_body, name, len) == 1
+            return 1
+        s = s.next
+    0
+
+fn ii_stmts(f: *FnDef, st: *Stmt) -> i32
+    var s: *Stmt = st
+    while s != null
+        let k: i32 = s.kind
+        if k == STMT_VAR_DECL
+            if s.var_init != null and ii_expr(f, s.var_init) == 0
+                return 0
+        else if k == STMT_ASSIGN
+            if ii_named(f, s.assign_target, s.assign_target_len) == 0 or ii_expr(f, s.assign_value) == 0
+                return 0
+        else if k == STMT_RETURN
+            if s.return_value != null and ii_expr(f, s.return_value) == 0
+                return 0
+        else if k == STMT_EXPR
+            if ii_expr(f, s.expr) == 0
+                return 0
+        else if k == STMT_IF
+            if ii_expr(f, s.if_cond) == 0 or ii_stmts(f, s.if_then) == 0 or ii_stmts(f, s.if_else) == 0
+                return 0
+        else if k == STMT_WHILE
+            if ii_expr(f, s.while_cond) == 0 or ii_stmts(f, s.while_body) == 0
+                return 0
+        else if k == STMT_ASM
+            var o: *AsmOperand = s.asm_block.operands
+            while o != null
+                if o.dir != ASM_CLOBBER and ii_named(f, o.name, o.name_len) == 0
+                    return 0
+                o = o.next
+        else if k != STMT_BREAK and k != STMT_CONTINUE
+            return 0
+        s = s.next
+    1
+
+fn ii_expr(f: *FnDef, e: *Expr) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_INT_LIT or k == EXPR_CHAR_LIT or k == EXPR_FLOAT_LIT or k == EXPR_NIL_LIT
+        return 1
+    if k == EXPR_IDENT
+        return ii_named(f, e.ident_ptr, e.ident_len)
+    if k == EXPR_BINARY or k == EXPR_INDEX
+        if ii_expr(f, e.left) == 0
+            return 0
+        return ii_expr(f, e.right)
+    if k == EXPR_UNARY
+        return ii_expr(f, e.operand)
+    if k == EXPR_CAST or k == EXPR_MEMBER
+        return ii_expr(f, e.left)
+    0
+
 # LLVM fn attribute text for `f`'s inline attribute (with a leading space),
 # or "" when it has none.
 pub fn fn_inline_attr(f: *FnDef) -> *u8

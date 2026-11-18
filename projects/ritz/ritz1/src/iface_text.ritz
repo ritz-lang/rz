@@ -176,9 +176,21 @@ fn it_is_test(s: *IfaceScan, i: i64) -> i32
         return 1
     0
 
+# 1 if token `i` is the identifier `inline` or `always_inline`.
+fn it_is_inline(s: *IfaceScan, i: i64) -> i32
+    let t: *Token = s.toks + i
+    if t.kind != TOK_IDENT
+        return 0
+    if t.len == 6 and memcmp(t.start, c"inline", 6) == 0
+        return 1
+    if t.len == 13 and memcmp(t.start, c"always_inline", 13) == 0
+        return 1
+    0
+
 # Skip the `[[...]]` attribute lists at `i` (and the newlines after each, as
-# ritz0's parse_attrs); *has_test = 1 if one of them names `test`.
-fn it_skip_attrs(s: *IfaceScan, i: i64, has_test: *i32) -> i64
+# ritz0's parse_attrs); *has_test = 1 if one of them names `test`,
+# *has_inline = 1 if one names `inline` or `always_inline`.
+fn it_skip_attrs(s: *IfaceScan, i: i64, has_test: *i32, has_inline: *i32) -> i64
     var j: i64 = i
     while it_kind(s, j) == TOK_LBRACKET2
         j = j + 1
@@ -189,6 +201,8 @@ fn it_skip_attrs(s: *IfaceScan, i: i64, has_test: *i32) -> i64
                 break
             if at_name == 1 and it_is_test(s, j) == 1
                 *has_test = 1
+            if at_name == 1 and it_is_inline(s, j) == 1
+                *has_inline = 1
             at_name = (k == TOK_COMMA) as i32
             j = j + 1
         if it_kind(s, j) == TOK_RBRACKET
@@ -197,7 +211,7 @@ fn it_skip_attrs(s: *IfaceScan, i: i64, has_test: *i32) -> i64
     j
 
 # The fn whose `fn` token is at `i`; `keep` = 1 if it keeps its body anyway
-# (async, [[test]], in a generic impl).  Marks its lines if it is declared.
+# (async, [[test]], in a generic impl, a free pub [[inline]] fn).  Marks its lines if it is declared.
 fn it_fn(s: *IfaceScan, i: i64, keep: i32)
     let e: i64 = it_line_end(s, i)
     var last: i64 = i
@@ -223,16 +237,23 @@ fn it_block(s: *IfaceScan, i: i64, in_impl: i32, keep: i32) -> i64
         if k0 == TOK_DEDENT
             return j + 1
         var has_test: i32 = 0
-        j = it_skip_attrs(s, j, @has_test)
+        var has_inline: i32 = 0
+        j = it_skip_attrs(s, j, @has_test, @has_inline)
         var is_async: i32 = 0
+        var is_pub: i32 = 0
         if it_kind(s, j) == TOK_PUB
+            is_pub = 1
             j = j + 1
         if it_kind(s, j) == TOK_ASYNC
             is_async = 1
             j = j + 1
         let k: i32 = it_kind(s, j)
         if k == TOK_FN
-            it_fn(s, j, keep | is_async | has_test)
+            # A free pub [[inline]] / [[always_inline]] fn keeps its body:
+            # an importer may define it available_externally (AGAST #3585,
+            # ritz0 module_interface.inline_kept).
+            let inline_kept: i32 = has_inline & is_pub & (in_impl == 0) as i32
+            it_fn(s, j, keep | is_async | has_test | inline_kept)
             j = it_skip_item(s, j)
         else if k == TOK_IMPL and in_impl == 0
             let generic: i32 = (it_kind(s, j + 1) == TOK_LT) as i32
@@ -314,7 +335,7 @@ pub fn iface_text_path(src: *u8, len: i64) -> String
         string_push_str(@&out, "/.cache/ritz/cas")
     var inner: [64]u8
     sha256_hex(src, len, @inner[0])
-    var pre: String = string_from("ritz-iface-text-v1\n")
+    var pre: String = string_from("ritz-iface-text-v2\n")
     string_push_bytes(@&pre, @inner[0], 64)
     var k: [64]u8
     sha256_hex(string_as_ptr(@&pre), string_len(@pre) as i64, @k[0])

@@ -27,6 +27,7 @@ ld -dynamic-linker /lib64/ld-linux-x86-64.so.2 -lc -o grep \
 With `--separate`:
 - Functions from the main source file: emitted with `define` (full body)
 - Functions from imported modules: emitted with `declare` only (external reference)
+- Except an imported `pub` `[[inline]]` / `[[always_inline]]` fn whose body names only its params and locals (`syscallN` in ritzlib.sys): defined `available_externally`, so -O2 inlines it without LTO and no symbol is emitted for it (AGAST #3585, `module_interface.inline_import_eligible`; ritz1 `fn_inline_import`). The interface keeps the body of every free `pub` `[[inline]]` / `[[always_inline]]` fn, eligible or not (`inline_kept`, a token rule ritz1's `iface_text.ritz` writer shares)
 - Struct types: fully defined in all modules (required by LLVM)
 - Constants: inlined at compile time
 - Extern functions: declared in all modules that use them

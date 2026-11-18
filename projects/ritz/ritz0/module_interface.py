@@ -68,6 +68,7 @@ interfaces off (full parse of every import, the pre-G9 behaviour).
 from __future__ import annotations
 
 import copy
+import dataclasses
 import enum
 import hashlib
 import io
@@ -162,7 +163,90 @@ def body_needed(fn: rast.FnDef, impl: Optional[rast.ImplBlock] = None) -> bool:
     """Does an importer need this fn's body? See the module docstring."""
     if fn.type_params or getattr(fn, "is_async", False):
         return True
+    if impl is None and inline_kept(fn):
+        return True
     return bool(impl is not None and impl.type_params)
+
+
+# ============================================================================
+# Imported inline fns (AGAST #3585)
+# ============================================================================
+#
+# build.py compiles each module on its own, so an importer only declares an
+# imported fn, and -O2 has no body to inline: `syscallN` (ritzlib.sys,
+# `[[inline]]` asm since #3397) was a call in every other module.  An
+# importer now *defines* an eligible imported fn `available_externally`
+# (emitter_llvmlite._inline_import; ritz1/src/emitter.ritz emit_fn): -O2 may
+# inline it, and no symbol is emitted for it, the defining module's stays.
+#
+# Eligible: a free `pub` fn marked `[[inline]]` or `[[always_inline]]`, not
+# generic, async, naked, a declaration or a [[test]], whose body names only
+# its params and its own locals.  Inlined, any other name -- a fn called, a
+# module var, a const -- might be one private (internal) to the defining
+# module, which the importer cannot link to; so a body holding one, or any
+# construct outside the short list below, stays a `declare`.  ritz1's
+# fn_inline_import (ritz1/src/ast_helpers.ritz) is the same rule; it also
+# refuses an if-*expression* (`let x = if ..`), which only costs ritz1 the
+# inlining.
+#
+# The interface keeps the body of a wider set, inline_kept: every free `pub`
+# fn marked `[[inline]]` or `[[always_inline]]`, eligible or not
+# (body_needed).  That rule reads off the tokens, so ritz1's writer
+# (ritz1/src/iface_text.ritz) produces the same text without a parsed
+# module; an ineligible fn's body is only parsed, the importer declares it.
+# TEXT_SCHEMA names this rule.
+
+
+def inline_kept(fn: rast.FnDef) -> bool:
+    """Does the interface keep free fn `fn`'s body for inlining? (AGAST #3585)"""
+    return bool(fn.is_pub and (fn.has_attr("inline") or fn.has_attr("always_inline")))
+
+_INLINE_EXPRS = (rast.Ident, rast.IntLit, rast.FloatLit, rast.CharLit, rast.BoolLit,
+                 rast.NullLit, rast.Grouped, rast.BinOp, rast.UnaryOp, rast.Cast,
+                 rast.Index, rast.Field, rast.If, rast.Block)
+_INLINE_STMTS = (rast.LetStmt, rast.VarStmt, rast.ExprStmt, rast.AssignStmt,
+                 rast.ReturnStmt, rast.WhileStmt, rast.BreakStmt, rast.ContinueStmt,
+                 rast.AsmStmt)
+
+
+def inline_import_eligible(fn: rast.FnDef) -> bool:
+    """May an importer define `fn` available_externally? (AGAST #3585)"""
+    if not (fn.has_attr("inline") or fn.has_attr("always_inline")):
+        return False
+    if (not fn.is_pub or fn.type_params or fn.is_async or fn.is_extern
+            or getattr(fn, "is_decl", False) or getattr(fn, "generated", False)
+            or fn.has_attr("naked") or fn.has_attr("test")):
+        return False
+    body = fn.body
+    if body is None or not (body.stmts or body.expr is not None):
+        return False   # a stripped or metadata-only fn has no body to give
+    names = {p.name for p in fn.params}
+    for node in _walk(body):
+        if isinstance(node, (rast.LetStmt, rast.VarStmt)):
+            names.add(node.name)
+    for node in _walk(body):
+        if not isinstance(node, _INLINE_EXPRS + _INLINE_STMTS):
+            return False
+        if isinstance(node, rast.Ident) and node.name not in names:
+            return False
+        if isinstance(node, rast.AsmStmt) and any(o.name not in names for o in node.operands):
+            return False
+    return True
+
+
+def _walk(node):
+    """`node` and every Expr / Stmt under it (types are not walked)."""
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        yield n
+        for f in dataclasses.fields(n):
+            v = getattr(n, f.name)
+            for c in (v if isinstance(v, list) else [v]):
+                if isinstance(c, (rast.Expr, rast.Stmt)):
+                    stack.append(c)
+                elif isinstance(c, rast.Node) and not isinstance(c, rast.Type):
+                    stack.append(c)   # a pattern, an arm: never eligible
 
 
 def _stripped(fn: rast.FnDef) -> rast.FnDef:
@@ -220,7 +304,7 @@ def strip_module(module: rast.Module) -> rast.Module:
 # TEXT_SCHEMA changes whenever the stripping rule does. ritz1 must use
 # the same constant (ritz1/src/main.ritz IFACE_TEXT_SCHEMA).
 
-TEXT_SCHEMA = "ritz-iface-text-v1"
+TEXT_SCHEMA = "ritz-iface-text-v2"   # v2: keeps inline_kept bodies (#3585)
 TEXT_EXT = "rzi.ritz"
 
 

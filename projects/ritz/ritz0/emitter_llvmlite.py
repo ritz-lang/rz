@@ -36,6 +36,7 @@ from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
 from typed import type_module
+import module_interface
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
 
@@ -3388,6 +3389,8 @@ class LLVMEmitter:
             if isinstance(item, rast.FnDef):
                 if self._should_emit_body(item):
                     self._emit_function_body(item)
+                elif self._inline_import(item):
+                    self._emit_inline_import(item)
 
         # Seventh pass: emit all impl block method bodies
         self._emit_impl_methods()
@@ -6003,6 +6006,29 @@ class LLVMEmitter:
         self.functions[extern.name] = (fn, extern)
 
         return fn
+
+    def _inline_import(self, item: rast.Item) -> bool:
+        """Is `item` an imported fn this module defines available_externally,
+        so -O2 can inline it here?  (module_interface.inline_import_eligible,
+        AGAST #3585.)"""
+        if self._current_source_file is None or not isinstance(item, rast.FnDef):
+            return False
+        if getattr(item, 'source_file', None) in (None, self._current_source_file):
+            return False
+        return module_interface.inline_import_eligible(item)
+
+    def _emits_definition(self, item: rast.Item) -> bool:
+        """Does this module define `item`, its own or an inline import?"""
+        return self._should_emit_body(item) or self._inline_import(item)
+
+    def _emit_inline_import(self, fn_def: rast.FnDef) -> None:
+        """Define imported `fn_def` `available_externally` (AGAST #3585): a
+        body for the optimiser only.  The defining module still emits the
+        symbol, so a call -O2 doesn't inline (or -O0) links to that.  No
+        debug info: its DISubprogram belongs to the defining module's."""
+        self.current_di_scope = None
+        fn = self._emit_function_body(fn_def)
+        fn.linkage = 'available_externally'
 
     def _should_emit_body(self, item: rast.Item) -> bool:
         """Check if we should emit a function body for this item.
@@ -18232,7 +18258,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
     # instantiated with: a reference in a by-value slot or a value in a
     # reference slot (§13.2, §13.4, AGAST #2336, #2337).
     emitter._current_source_file = main_source_path
-    slot_errors = type_module(module, module_names, emitter._should_emit_body).slot_errors
+    slot_errors = type_module(module, module_names, emitter._emits_definition).slot_errors
     slot_errors += MoveChecker().check_instances(module)
     if slot_errors:
         raise EmitError('\n'.join(str(e) for e in slot_errors))
