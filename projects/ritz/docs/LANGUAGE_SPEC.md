@@ -1192,6 +1192,34 @@ fn main() -> i32
     1
 ```
 
+A `StrView` also has the built-in method `as_bytes()`, which needs no import:
+`s.as_bytes()` is a `Span<u8>` of the same bytes, with no copy, valid as long
+as `s`'s bytes are (AGAST #3599). It takes no arguments. The result is a
+`Span<u8>` value, so pass it as itself: `@bytes` is an `@Span<u8>`, and a
+`Span<u8>` slot refuses it (no auto-deref, LARB R1):
+
+```ritz
+fn first(b: Span<u8>) -> i32
+    b[0] as i32
+
+fn main() -> i32
+    let text: StrView = "A"
+    let bytes = text.as_bytes()
+    if bytes.len != 1
+        return 1
+    first(bytes) - 65
+```
+
+```ritz expect-error="doesn't fit a by-value slot: drop the `@`"
+fn first(b: Span<u8>) -> i32
+    b[0] as i32
+
+fn main() -> i32
+    let text: StrView = "A"
+    let bytes = text.as_bytes()
+    first(@bytes) - 65
+```
+
 ### 3.6 Compound Types
 
 See sections on [Structs](#9-structs) and [Enums](#10-enums).

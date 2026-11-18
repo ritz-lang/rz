@@ -1034,6 +1034,8 @@ class TypeChecker:
                 return rast.NamedType(expr.span, 'unknown', [])
             # ritzlib's own `impl StrView` declares some (AGAST #3154).
             self._check_value_args(expr, receiver)
+            if self._is_strview_as_bytes(receiver, expr):
+                return self._span_of_u8(expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
         type_name = self._get_type_name(receiver)
 
@@ -1174,6 +1176,19 @@ class TypeChecker:
         return (method not in self.STRVIEW_BUILTINS
                 and f"StrView_{method}" not in self.functions
                 and find_ufcs_function(self.functions, 'StrView', method) is None)
+
+    @staticmethod
+    def _is_strview_as_bytes(receiver: rast.Type, expr: rast.MethodCall) -> bool:
+        """Is `expr` the emitter's built-in `s.as_bytes()` on a StrView (by
+        value or through a pointer, `receiver` already stripped)? It is a
+        `Span<u8>` of the view's bytes (LANGUAGE_SPEC §3.5, AGAST #3599).
+        With arguments the emitter refuses it, so it gets no type here."""
+        return (isinstance(receiver, rast.NamedType) and receiver.name == 'StrView'
+                and expr.method == 'as_bytes' and not expr.args)
+
+    @staticmethod
+    def _span_of_u8(span) -> rast.Type:
+        return rast.NamedType(span, 'Span', [rast.NamedType(span, 'u8', [])])
 
     def _is_generic_instance_without(self, receiver: rast.Type, method: str) -> bool:
         """Is `receiver` an instance of a user generic struct or enum
