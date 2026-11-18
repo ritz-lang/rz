@@ -6237,10 +6237,10 @@ class LLVMEmitter:
         """
         # We need to emit this as raw IR text since llvmlite doesn't support naked functions
         # This will be appended after the module is stringified
-        # Test mode: the runner's `main(argc, argv)` lives in another object.
-        num_params = len(self.main_fn_def.params) if self.main_fn_def else 2
-        main_takes_args = num_params >= 2
-        main_takes_envp = num_params >= 3
+        # One entry path (docs/V1_ABI_CLEANUP.md, AGAST #200): every `main`
+        # is called as `main(argc, argv, envp)`. A C-shaped `main()` or
+        # `main(argc, argv)` ignores the extra registers (SysV), and a
+        # Ritz-native main is reached through the adapter main_abi.py adds.
 
         # Exit syscall number depends on target OS
         if self.target_os == 'harland':
@@ -6258,57 +6258,26 @@ class LLVMEmitter:
         block = start_fn.append_basic_block(name="entry")
         builder = ir.IRBuilder(block)
 
-        # Emit inline asm - llvmlite's inline asm support is limited
-        # We'll use the call asm sideeffect approach
-        #
-        # Stack layout at _start:
+        # Stack layout at _start on Linux:
         #   (%rsp)     = argc
         #   8(%rsp)    = argv[0]
         #   ...          argv[argc] = NULL
         #   ...          envp[0], envp[1], ..., NULL
+        # so envp = argv + (argc+1)*8. Harland passes argc/argv/envp in
+        # RDI/RSI/RDX already.
         #
-        # For 3-arg main: envp = &argv[argc+1] = argv + (argc+1)*8
-        #
-        # Every shape also stores envp in `__ritz_envp` (AGAST #3737), which
+        # envp is also stored in `__ritz_envp` (AGAST #3737), which
         # ritzlib.os.env reads first: /proc/self/environ is closed to a
         # process that isn't dumpable.  Same as the runtime/*.ll shims.
         self._define_ritz_envp()
-        store_envp = "    movq %rdx, __ritz_envp(%rip)"
         if self.target_os == 'harland':
-            # Harland passes argc/argv in RDI/RSI and envp in RDX (NULL today).
-            envp_asm = store_envp
+            load_args = ""
         else:
-            envp_asm = ("    movq (%rsp), %rdi\n"
-                        "    leaq 16(%rsp,%rdi,8), %rdx\n" + store_envp)
-        if main_takes_envp:
-            # 3-argument main(argc, argv, envp)
-            asm_str = f"""
-{envp_asm}
-    movq (%rsp), %rdi
-    leaq 8(%rsp), %rsi
-    leaq 8(%rsi,%rdi,8), %rdx
-    andq $$-16, %rsp
-    call main
-    movq %rax, %rdi
-    movq $${exit_syscall}, %rax
-    syscall
-  """
-        elif main_takes_args:
-            # 2-argument main(argc, argv)
-            asm_str = f"""
-{envp_asm}
-    movq (%rsp), %rdi
-    leaq 8(%rsp), %rsi
-    andq $$-16, %rsp
-    call main
-    movq %rax, %rdi
-    movq $${exit_syscall}, %rax
-    syscall
-  """
-        else:
-            # 0-argument main()
-            asm_str = f"""
-{envp_asm}
+            load_args = ("    movq (%rsp), %rdi\n"
+                         "    leaq 8(%rsp), %rsi\n"
+                         "    leaq 8(%rsi,%rdi,8), %rdx\n")
+        asm_str = f"""
+{load_args}    movq %rdx, __ritz_envp(%rip)
     andq $$-16, %rsp
     call main
     movq %rax, %rdi

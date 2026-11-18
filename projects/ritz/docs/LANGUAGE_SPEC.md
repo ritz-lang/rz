@@ -1744,6 +1744,60 @@ the fn takes it as a parameter: `s.f(s.k, x)` (LARB R41,
 [§5.5](#55-function-pointer-types)). `examples/tier5_async/58_closures` shows
 both forms.
 
+### 5.7 The Entry Point: `main`
+
+A program starts at its `pub fn main`, in one of three shapes (AGAST #198):
+
+```ritz
+pub fn main()
+    let greeting: StrView = "hello"
+```
+
+```ritz
+pub fn main(args: Span<StrView>) -> i32
+    if args.len < 2
+        return 1
+    0
+```
+
+```ritz
+pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32
+    env.len as i32
+```
+
+`args[0]` is the program's name. Each `env` element is one `KEY=VALUE`.
+Most programs read the environment through `ritzlib.os.env` instead and
+never take `env`. With `-> i32` the value is the exit status; without it,
+`main` returns 0.
+
+Any other parameter list or return type is an error, at `main`:
+
+```ritz expect-error="`main` must take `()`, `(args: Span<StrView>)` or `(args: Span<StrView>, env: Span<StrView>)`"
+pub fn main(n: i64) -> i32
+    0
+```
+
+```ritz expect-error="`main` must return `i32` or nothing"
+pub fn main() -> i64
+    0
+```
+
+```ritz expect-error="`main` taking `Span<StrView>` must be `pub`: write `pub fn main(...)`"
+fn main(args: Span<StrView>) -> i32
+    0
+```
+
+There is one entry path. The runtime's `_start` calls the C symbol
+`main(argc, argv, envp)`. For a `main` that takes spans or returns nothing,
+the compiler names the fn `__ritz_main` and adds that `main` as an adapter
+written in Ritz. It builds the spans once and calls the fn.
+`docs/V1_ABI_CLEANUP.md` has the design.
+
+*Transitional:* the C shapes `main(argc: i32, argv: **u8) -> i32` and
+`main(argc: i32, argv: **u8, envp: **u8) -> i32` are still accepted, and so is
+a `main` without `pub` in a C shape, until the workspace migrates (AGAST #203).
+Both are removed in #204.
+
 ---
 
 ## 6. Control Flow

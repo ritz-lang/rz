@@ -4,11 +4,11 @@
 # marshals the kernel's exec stack into the shape `main` expects, and calls
 # sys_exit with the result. The `.o` files are gitignored build products.
 #
-# Current shims:
-#   ritz_start.<arch>.o        - main(argc, argv)
-#   ritz_start_noargs.<arch>.o - main()
-#   ritz_start_envp.<arch>.o   - main(argc, argv, envp)
-# each also in a `.harland.` variant for Harland userspace.
+# There is one entry path (docs/V1_ABI_CLEANUP.md, AGAST #200):
+#   ritz_start.<arch>.o          - calls main(argc, argv, envp), Linux
+#   ritz_start.harland.<arch>.o  - the same for Harland userspace
+# A `main` of any accepted shape links against it; the compiler adapts a
+# Ritz-native `main(args: Span<StrView>, ...)`.
 #
 # The object list is DERIVED from the .ll files on disk rather than
 # hand-maintained. The previous version listed six rules explicitly, so the

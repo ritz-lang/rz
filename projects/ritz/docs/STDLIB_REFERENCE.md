@@ -1214,35 +1214,46 @@ struct Stat
 
 ### Program entry
 
-No ritzlib module is involved. `_start` comes from one of two places: a
-package built by `build.py` links the runtime shim object for `main`'s arity
-(`runtime/ritz_start_noargs`, `ritz_start` or `ritz_start_envp`, a `.o` built
-from the `.ll` of the same name), and a single file compiled by ritz0 gets an
-inline `_start` emitted by the compiler.
+No ritzlib module is involved. There is one entry path
+(`docs/V1_ABI_CLEANUP.md`): one `_start` calls `main(argc, argv, envp)`. A
+package built by `build.py` links it as `runtime/ritz_start.<arch>.o`, built
+from the `.ll` of the same name, and a single file compiled by ritz0 gets the
+same `_start` inline.
 
-**Main Function Variants** — pick exactly one; each is shown as a complete
-program because each block here is compiled:
+**`main`**: pick one shape. Each is a complete program because each block
+here is compiled:
 
 ```ritz
-fn main() -> i32                                    # 0-arg
-    0
+pub fn main()                                       # returns 0
+    let x: i32 = 1
 ```
 
 ```ritz
-fn main(argc: i32, argv: **u8) -> i32               # 2-arg
-    argc
+pub fn main(args: Span<StrView>) -> i32             # args[0] is the program
+    args.len as i32
 ```
 
 ```ritz
-fn main(argc: i32, argv: **u8, envp: **u8) -> i32   # 3-arg
-    argc
+pub fn main(args: Span<StrView>, env: Span<StrView>) -> i32   # env is "KEY=VALUE"
+    env.len as i32
 ```
 
-Either `_start`:
-1. Aligns the stack to 16 bytes
-2. Extracts argc, argv, envp from the stack, and stores envp in `__ritz_envp`
+`-> i32` is optional on each: without it `main` returns 0. A `main` taking
+`Span<StrView>` must be `pub`. Most code reads the environment with
+`ritzlib.os.env` (`env_get`, `env_get_or`) and doesn't take `env` at all.
+The compiler adds a small adapter `main(argc, argv, envp)`, written in Ritz,
+that builds the spans and calls yours, and refuses any other parameter list
+or return type.
+
+The C shapes `main(argc: i32, argv: **u8) -> i32` and
+`main(argc: i32, argv: **u8, envp: **u8) -> i32` are still accepted while the
+workspace migrates (AGAST #203). They are removed in #204.
+
+`_start`:
+1. Extracts argc, argv, envp from the stack, and stores envp in `__ritz_envp`
    (which `ritzlib.os.env` reads)
-3. Calls `main`
+2. Aligns the stack to 16 bytes
+3. Calls `main(argc, argv, envp)`
 4. Passes its return value to the exit syscall
 
 ---

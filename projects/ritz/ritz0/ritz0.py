@@ -30,6 +30,7 @@ from import_resolver import ImportResolver, ImportError as RitzImportError
 from selective_import import check_selective_imports
 from import_visibility import check_import_visibility
 import module_interface
+import main_abi
 from name_resolver import resolve_names, NameError as RitzNameError
 from binder_names import check_binders
 from builtin_types import check_builtin_impls, check_unknown_impl_targets
@@ -143,6 +144,8 @@ class _Compile:
     module: Optional[rast.Module] = None
     source_hashes: Optional[tuple] = None
     original_import_paths: List[str] = field(default_factory=list)
+    # _lower_main: this file's main took the entry adapter
+    main_lowered: bool = False
     # _resolve
     module_names: Set[str] = field(default_factory=set)
     import_hashes: dict = field(default_factory=dict)
@@ -211,6 +214,20 @@ def _parse(ctx: _Compile) -> bool:
     ctx.original_import_paths = [
         '.'.join(item.path) for item in module.items if isinstance(item, rast.Import)]
     ctx.module = module
+    return True
+
+
+def _lower_main(ctx: _Compile) -> bool:
+    """The entry ABI (main_abi.py, AGAST #200): refuse a `main` of no
+    accepted shape; give a Ritz-native one its C-entry adapter. Before
+    _resolve, so the adapter is checked and emitted like any fn. Not in
+    test mode: the runner supplies `main` and the file's own is dropped."""
+    if ctx.test_mode:
+        return True
+    before = main_abi.find_main(ctx.module)
+    if not _report(main_abi.lower_main(ctx.module, ctx.source_path)):
+        return False
+    ctx.main_lowered = before is not None and before.name != "main"
     return True
 
 
@@ -409,7 +426,8 @@ def _emit(ctx: _Compile) -> bool:
         # Per-fn IR reuse is keyed on the source alone, so it cannot tell a
         # test-mode compile (no `main`) from a normal one: test mode always
         # emits fresh.
-        fn_cache_data=None if ctx.test_mode else fn_cache_data,
+        # The adapter's `main` is not the source's: no per-fn reuse either.
+        fn_cache_data=None if ctx.test_mode or ctx.main_lowered else fn_cache_data,
         module_names=ctx.module_names)
 
     if fn_cache_data is not None and isinstance(emit_result, tuple):
@@ -452,6 +470,7 @@ def _emit(ctx: _Compile) -> bool:
 # judge each generic instance, still run inside emitter_llvmlite.emit.
 PASSES = (
     _parse,
+    _lower_main,
     _resolve,
     _check_impl_targets,
     _rewrite_enum_from,

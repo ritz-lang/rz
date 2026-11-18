@@ -37,6 +37,7 @@ import generic_infer   # infer_generic_calls (AGAST #1982)
 import struct_index   # struct_index_errors (AGAST #1635)
 import binder_check   # binder_check_module (AGAST #2407)
 import async_lower    # async_lower_module (AGAST #3814)
+import main_abi       # the program entry ABI (AGAST #200)
 import reachability   # reach_check_module (AGAST #2520)
 import sema_walk      # sema_check_module (AGAST #3462)
 import import_vis     # a plain import is private (AGAST #3891)
@@ -224,6 +225,50 @@ fn add_enum_from_fns(m: *Module, first_ei: i32, path: *u8) -> i32
     while gf != null
         gf.from_generated = 1
         gf = gf.next
+    merge_module_into(m, gm)
+    0
+
+# =============================================================================
+# The program entry ABI (AGAST #200, main_abi.ritz)
+# =============================================================================
+
+# 1 under --test-table: the runner supplies `main` and the file's own is
+# dropped, so lower_main leaves it alone (ritz0's _lower_main skips test mode).
+var g_test_table: i32 = 0
+
+# Check this file's `main`; if it needs the entry adapter, rename it
+# `__ritz_main` and parse the adapter (plus the span runtime for a Span main)
+# into `m`, as if written in the source.  Runs on the input file's module
+# right after its parse, before its fns are marked local and before imports
+# merge (ritz0 runs _lower_main before _resolve), so the generated fns are
+# local and go through every later pass like any other.  An async main is
+# left to async_lower, which gives it its own synchronous wrapper.  Returns
+# -1 on an error (already reported); the module is unchanged then.
+fn lower_main(m: *Module, path: *u8) -> i32
+    if g_test_table == 1
+        return 0
+    let f: *FnDef = main_abi_find(m)
+    if f == null or f.is_async == 1
+        return 0
+    if main_abi_check(f, path) > 0
+        return -1
+    if main_abi_needs_adapter(f) == 0
+        return 0
+    var text: String = string_new()
+    main_abi_source(f, @&text)
+    let gen: *u8 = string_as_ptr(@&text)
+    let gen_len: i64 = string_len(@text)
+    var tokens: Vec<Token> = vec_with_cap<Token>(1024)
+    if tokenize(path, gen, gen_len, @tokens) > 0
+        err2("Lexer errors in the generated main adapter of: ", path)
+        return -1
+    let gm: *Module = parse_tokens(@tokens)
+    if gm == null
+        err2("Parse error in the generated main adapter of: ", path)
+        return -1
+    # The AST slices the text: it lives as long as the compile.
+    keep_source_alive(gen)
+    main_abi_rename(f)
     merge_module_into(m, gm)
     0
 
@@ -1330,6 +1375,8 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
         return null
     if add_enum_from_fns(m, first_ei, input_path) < 0
         return null
+    if lower_main(m, input_path) < 0
+        return null
     if check_fn_dups_in_file(m) < 0
         return null
 
@@ -1385,6 +1432,7 @@ fn main(argc: i32, argv: **u8) -> i32
     # roots (see cache_fingerprint in fn_cache.ritz).
     g_dep_ptr = args.deps_ptr
     g_dep_len = args.deps_len
+    g_test_table = args.test_table   # lower_main (AGAST #200)
     let cache_fp: u64 = cache_fingerprint(args.target_os.ptr, args.target_os.len, args.ritz_path.ptr, args.ritz_path.len, args.input_path, args.deps_ptr, args.deps_len)
 
     # Read source file

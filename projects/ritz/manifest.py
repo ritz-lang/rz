@@ -223,9 +223,6 @@ PACKAGE_SCHEMA = Table(
                     "link_runtime": Value(BOOL, "Link the Ritz runtime's _start.",
                                           (f"{BUILD}::plan_binaries",),
                                           default="false"),
-                    "main_args": Value(INTEGER, "Arguments main() takes: 0, 2 "
-                                       "or 3.", (f"{BUILD}::plan_binaries",),
-                                       default="0"),
                 },
                 self_named=Table(
                     "`[bin.NAME]`, where NAME is this entry's `name`: "

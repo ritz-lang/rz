@@ -17,7 +17,7 @@ RITZ_ROOT = THIS_FILE.parent.parent          # projects/ritz
 ROOT = RITZ_ROOT.parent.parent               # worktree root
 RITZ_PATH_ENV = str(RITZ_ROOT)
 TEST_DIR = RITZ_ROOT / "ritz0/test"
-RUNTIME_O = RITZ_ROOT / "runtime/ritz_start_envp.x86_64.o"
+RUNTIME_O = RITZ_ROOT / "runtime/ritz_start.x86_64.o"
 
 RITZ0 = [sys.executable, str(RITZ_ROOT / "ritz0/ritz0.py")]
 RITZ1 = str(RITZ_ROOT / "ritz1/build/ritz1")

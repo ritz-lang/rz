@@ -1,0 +1,220 @@
+# main_abi.ritz - the program entry ABI (docs/V1_ABI_CLEANUP.md, AGAST #200)
+#
+# ritz1's half of ritz0/main_abi.py; read that module's docstring for the
+# design.  In short: the runtime's only `_start` calls the C symbol
+# `main(argc, argv, envp)`.  A C-shaped `main` -- `()`, `(argc: i32, argv:
+# **u8)` or `(argc, argv, envp)` -- returning `i32` *is* that symbol.  The
+# Ritz-native shapes
+#
+#     pub fn main()
+#     pub fn main(args: Span<StrView>)
+#     pub fn main(args: Span<StrView>, env: Span<StrView>)
+#
+# (each with or without `-> i32`) are renamed `__ritz_main`, and an adapter
+# `main(argc, argv, envp) -> i32` written in Ritz builds the spans and calls
+# it.  A `main` with no return type takes the adapter even with no params:
+# ritz1 emits a return-less fn as `define void`, so before #200 such a
+# program exited with whatever was left in rax.
+#
+# The messages, the adapter text and RUNTIME_SOURCE are byte-identical to
+# ritz0's (MSG_SHAPE, MSG_RET, MSG_PUB, adapter_source, RUNTIME_SOURCE), so
+# both compilers refuse the same mains in the same words and give the same
+# program.  This module decides and writes the text; main.ritz's lower_main
+# lexes and parses it with ritz1's own front end and merges the fns into the
+# input file's module (as add_enum_from_fns does for `E.from`).
+#
+# ritz1's AST keeps a type as a kind plus side-channel names, not ritz0's
+# type tree, so the shape test reads those: `Span<StrView>` is the struct
+# kind named `Span$StrView` (as is its sugar `[StrView]`, which ritz0 also
+# desugars to Span<StrView>), `**u8` is TYPE_PTR_PTR whose innermost pointee
+# is u8 at depth 2.  Type aliases are already replayed by the parser, so an
+# alias of `i32` or `Span<StrView>` is accepted here where ritz0 (which sees
+# the alias name) refuses it; `-> void` likewise reads as no return type.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.string
+
+import ast
+import ast_helpers
+import diag
+
+# The shapes `main_abi_shape` answers (ritz0's 'c', 'span' and None).
+pub const MAIN_SHAPE_NONE: i32 = 0
+pub const MAIN_SHAPE_C: i32 = 1
+pub const MAIN_SHAPE_SPAN: i32 = 2
+
+fn ma_eq(a: *u8, alen: i32, b: *u8, blen: i32) -> i32
+    if alen != blen or a == null
+        return 0
+    var i: i32 = 0
+    while i < alen
+        if *(a + i) != *(b + i)
+            return 0
+        i += 1
+    1
+
+# `Span<StrView>` (or `[StrView]`): the mangled generic struct name.
+fn ma_is_span_strview(p: *Param) -> i32
+    if p.param_type != TYPE_STRUCT
+        return 0
+    ma_eq(p.param_type_name, p.param_type_name_len, c"Span$StrView", 12)
+
+# `**u8`: exactly two plain-pointer levels over u8 (`***u8` packs a depth
+# into the slot, `*@u8` marks an inner reference).
+fn ma_is_ptr_ptr_u8(p: *Param) -> i32
+    (p.param_type == TYPE_PTR_PTR and p.param_inner_pointee_type == TYPE_U8 and p.param_inner_ref == INNER_REF_NONE) as i32
+
+# MAIN_SHAPE_C for a C-shaped param list, MAIN_SHAPE_SPAN for a Ritz-native
+# one, MAIN_SHAPE_NONE if neither (ritz0's shape()).
+pub fn main_abi_shape(f: *FnDef) -> i32
+    var n: i32 = 0
+    var all_span: i32 = 1
+    var p: *Param = f.params
+    while p != null
+        if ma_is_span_strview(p) == 0
+            all_span = 0
+        n += 1
+        p = p.next
+    if n == 0
+        return MAIN_SHAPE_C
+    if all_span == 1 and n <= 2
+        return MAIN_SHAPE_SPAN
+    if (n == 2 or n == 3) and f.params.param_type == TYPE_I32
+        var q: *Param = f.params.next
+        while q != null
+            if ma_is_ptr_ptr_u8(q) == 0
+                return MAIN_SHAPE_NONE
+            q = q.next
+        return MAIN_SHAPE_C
+    MAIN_SHAPE_NONE
+
+# This file's own `main` (the first top-level fn of that name), or null.
+# Called on the input file's module before its imports merge, as ritz0's
+# find_main runs before _resolve.
+pub fn main_abi_find(m: *Module) -> *FnDef
+    var f: *FnDef = m.functions
+    while f != null
+        if ma_eq(f.name, f.name_len, c"main", 4) == 1
+            return f
+        f = f.next
+    null
+
+# Report this `main`'s entry-ABI error, if any, at its declaration, as
+# `file:line:col: error: <msg>` (ritz0's check_main).  Returns the count.
+pub fn main_abi_check(f: *FnDef, path: *u8) -> i32
+    let at: SrcSpan = diag_span(f.line, f.col)
+    let kind: i32 = main_abi_shape(f)
+    # A written `fn main(..) = extern` is ritz0's is_decl; ritz1 has no
+    # separate `extern fn` spelling, so fn_is_decl covers both.
+    if kind == MAIN_SHAPE_NONE or f.type_params != null or fn_is_decl(f) == 1
+        diag_error(path, at, c"`main` must take `()`, `(args: Span<StrView>)` or `(args: Span<StrView>, env: Span<StrView>)`")
+        return 1
+    if f.return_type != TYPE_VOID and f.return_type != TYPE_I32
+        diag_error(path, at, c"`main` must return `i32` or nothing")
+        return 1
+    if kind == MAIN_SHAPE_SPAN and f.is_pub == 0
+        diag_error(path, at, c"`main` taking `Span<StrView>` must be `pub`: write `pub fn main(...)`")
+        return 1
+    0
+
+pub fn main_abi_needs_adapter(f: *FnDef) -> i32
+    (main_abi_shape(f) == MAIN_SHAPE_SPAN or f.return_type == TYPE_VOID) as i32
+
+fn ma_param_count(f: *FnDef) -> i32
+    var n: i32 = 0
+    var p: *Param = f.params
+    while p != null
+        n += 1
+        p = p.next
+    n
+
+# The `main` the C entry calls (ritz0's adapter_source): it calls
+# `__ritz_main` (the user's main) with what it takes, and returns its i32,
+# or 0 if it returns nothing.  For a Span main with params, RUNTIME_SOURCE
+# follows after a blank line, as in ritz0's lower_main.
+pub fn main_abi_source(f: *FnDef, out: @&String)
+    let span: i32 = (main_abi_shape(f) == MAIN_SHAPE_SPAN) as i32
+    let n: i32 = ma_param_count(f)
+    var call: String = string_from("__ritz_main(")
+    var i: i32 = 0
+    while i < n
+        if i > 0
+            string_push_str(@&call, ", ")
+        if span == 1
+            if i == 0
+                string_push_str(@&call, "__ritz_args(argc, argv)")
+            else
+                string_push_str(@&call, "__ritz_env(envp)")
+        else
+            if i == 0
+                string_push_str(@&call, "argc")
+            else if i == 1
+                string_push_str(@&call, "argv")
+            else
+                string_push_str(@&call, "envp")
+        i += 1
+    string_push_str(@&call, ")")
+    string_push_str(out, "pub fn main(argc: i32, argv: **u8, envp: **u8) -> i32\n")
+    if f.return_type != TYPE_VOID
+        string_push_str(out, "    return ")
+        string_push_cstr(out, string_as_ptr(@&call))
+        string_push_str(out, "\n")
+    else
+        string_push_str(out, "    ")
+        string_push_cstr(out, string_as_ptr(@&call))
+        string_push_str(out, "\n    0\n")
+    string_drop(@&call)
+    if span == 1 and n > 0
+        string_push_str(out, "\n")
+        main_abi_runtime_source(out)
+
+# ritz0's RUNTIME_SOURCE, byte for byte: the runtime half of the entry path,
+# in Ritz.  One `mmap` for the views, then a `strlen` per string.  Added
+# only for a Span main, so a C-shaped program pays nothing.  SYS_mmap is 9,
+# PROT_READ|PROT_WRITE is 3, MAP_PRIVATE|MAP_ANONYMOUS is 0x22.  The mmap
+# is Linux's (Harland: #200 follow-up).
+fn main_abi_runtime_source(out: @&String)
+    string_push_str(out, "fn __ritz_views(n: i64, p: **u8) -> Span<StrView>\n")
+    string_push_str(out, "    var r: i64 = 9\n")
+    string_push_str(out, "    var addr: i64 = 0\n")
+    string_push_str(out, "    var size: i64 = n * 16 + 16\n")
+    string_push_str(out, "    var prot: i64 = 3\n")
+    string_push_str(out, "    var flags: i64 = 34\n")
+    string_push_str(out, "    var fd: i64 = -1\n")
+    string_push_str(out, "    var off: i64 = 0\n")
+    string_push_str(out, "    asm x86_64 (inout r: rax, in addr: rdi, in size: rsi, in prot: rdx, in flags: r10, in fd: r8, in off: r9, clobber rcx, clobber r11):\n")
+    string_push_str(out, "        syscall\n")
+    string_push_str(out, "    var out: Span<StrView>\n")
+    string_push_str(out, "    out.ptr = null\n")
+    string_push_str(out, "    out.len = 0\n")
+    string_push_str(out, "    if r < 0\n")
+    string_push_str(out, "        return out\n")
+    string_push_str(out, "    let views: *StrView = r as *StrView\n")
+    string_push_str(out, "    var i: i64 = 0\n")
+    string_push_str(out, "    while i < n\n")
+    string_push_str(out, "        let s: *u8 = p[i]\n")
+    string_push_str(out, "        var k: i64 = 0\n")
+    string_push_str(out, "        while s[k] != 0\n")
+    string_push_str(out, "            k = k + 1\n")
+    string_push_str(out, "        views[i].ptr = s\n")
+    string_push_str(out, "        views[i].len = k\n")
+    string_push_str(out, "        i = i + 1\n")
+    string_push_str(out, "    out.ptr = views\n")
+    string_push_str(out, "    out.len = n\n")
+    string_push_str(out, "    out\n")
+    string_push_str(out, "\n")
+    string_push_str(out, "fn __ritz_args(argc: i32, argv: **u8) -> Span<StrView>\n")
+    string_push_str(out, "    __ritz_views(argc as i64, argv)\n")
+    string_push_str(out, "\n")
+    string_push_str(out, "fn __ritz_env(envp: **u8) -> Span<StrView>\n")
+    string_push_str(out, "    var n: i64 = 0\n")
+    string_push_str(out, "    if envp != null\n")
+    string_push_str(out, "        while envp[n] != null\n")
+    string_push_str(out, "            n = n + 1\n")
+    string_push_str(out, "    __ritz_views(n, envp)\n")
+
+# Give the user's main its adapted name; the adapter takes `main`.
+pub fn main_abi_rename(f: *FnDef)
+    f.name = c"__ritz_main"   # ritz0's ADAPTED_NAME
+    f.name_len = 11

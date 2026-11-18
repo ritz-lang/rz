@@ -36,6 +36,10 @@ input.ritz
 [parse]     parser_gen (generated recursive descent) calls ast_helpers to
   │         build the AST (ast). Errors are located via diag.
   ▼
+[entry]     main_abi: check the file's `main` (§5.7); a Span main or one
+  │         with no return type is renamed `__ritz_main` and gets the Ritz
+  │         adapter `main(argc, argv, envp)`, parsed in as if written
+  ▼
 [imports]   main.resolve_imports: find each import next to the importer or on
   │         RITZ_PATH, lex+parse it (or read its cached interface text),
   │         strip it to its interface, merge it into the one Module.
@@ -127,6 +131,7 @@ an entry here, and every entry names a module that exists (`--check`).
 
 | Module | Responsibility |
 |---|---|
+| `main_abi` | The program entry ABI (§5.7, AGAST #200): which shape `main` is, its three refusals, and the text of the adapter and span runtime (byte-identical to ritz0/main_abi.py). main.lower_main parses that text into the file's module before its fns are marked local. |
 | `main` | CLI, the pipeline above, import resolution and merging, duplicate fn/const detection. |
 | `fn_cache` | Sig file per source: a snapshot of emitted IR plus what it depends on; the no-op rebuild fast path. |
 | `sha256` | SHA-256 for interface-text store keys shared with ritz0. |

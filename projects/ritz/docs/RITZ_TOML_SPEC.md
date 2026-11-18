@@ -118,7 +118,6 @@ One binary. Its source is `entry`, else `path`, else src/<name>.ritz.
 | `target` | string | `""` | `projects/ritz/build.py plan_binaries` | LLVM target triple. Empty means the host. |
 | `target_os` | string | `""` | `projects/ritz/build.py plan_binaries` | Target OS for platform-specific modules (e.g. `harland`, `uefi`). |
 | `link_runtime` | bool | `false` | `projects/ritz/build.py plan_binaries` | Link the Ritz runtime's _start. |
-| `main_args` | integer | `0` | `projects/ritz/build.py plan_binaries` | Arguments main() takes: 0, 2 or 3. |
 
 ### `[bin.NAME]`
 

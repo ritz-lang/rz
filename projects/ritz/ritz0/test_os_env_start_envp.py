@@ -177,9 +177,6 @@ fn has_marker(envp: **u8) -> i32
 
 SAME_AS_ENVP = "    if envp != __ritz_envp\n        return 4\n"
 
-SHIMS = {0: "ritz_start_noargs", 2: "ritz_start", 3: "ritz_start_envp"}
-
-
 def _reads_global(arity: int) -> str:
     return READS_GLOBAL.replace("@MAIN@", MAINS[arity]).replace(
         "@CHECK_ENVP@", SAME_AS_ENVP if arity == 3 else ""
@@ -240,8 +237,9 @@ def test_ritz0_inline_start_sets_ritz_envp(request, tmp_path, arity):
 
 @pytest.mark.parametrize("arity", sorted(MAINS))
 def test_linux_shim_sets_ritz_envp(request, tmp_path, arity):
+    """One `_start` for every shape of `main` (AGAST #200)."""
     rc = _compile_link_run(
-        request, tmp_path, "ritz1", _reads_global(arity), objs=[_shim(SHIMS[arity])]
+        request, tmp_path, "ritz1", _reads_global(arity), objs=[_shim("ritz_start")]
     )
     assert rc == 0
 

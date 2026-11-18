@@ -53,9 +53,9 @@ RUNTIME_DIR = ROOT / "runtime"
 # Architecture-specific runtime files
 import platform
 ARCH = platform.machine()  # e.g., 'x86_64'
-RITZ_START = RUNTIME_DIR / f"ritz_start.{ARCH}.o"           # main(argc, argv)
-RITZ_START_NOARGS = RUNTIME_DIR / f"ritz_start_noargs.{ARCH}.o"  # main()
-RITZ_START_ENVP = RUNTIME_DIR / f"ritz_start_envp.{ARCH}.o"      # main(argc, argv, envp)
+# The one `_start` (docs/V1_ABI_CLEANUP.md, AGAST #200): it calls
+# main(argc, argv, envp) whatever shape `main` is written in.
+RITZ_START = RUNTIME_DIR / f"ritz_start.{ARCH}.o"
 
 
 # =============================================================================
@@ -665,43 +665,6 @@ def report_compile_failures(failures: List[Tuple[Path, str]], compiler: str) -> 
     print(file=sys.stderr)
 
 
-def detect_main_signature(source_path: Path) -> int:
-    """Detect main function's parameter count from source file.
-
-    Returns:
-        0: main() - no arguments
-        2: main(argc, argv) - argc and argv
-        3: main(argc, argv, envp) - includes envp
-    """
-    from lexer import Lexer
-    from parser import Parser
-    import ritz_ast as rast
-
-    try:
-        source = source_path.read_text()
-        lexer = Lexer(source, str(source_path))
-        tokens = lexer.tokenize()
-        parser = Parser(tokens)
-        module = parser.parse_module()
-
-        for item in module.items:
-            if isinstance(item, rast.FnDef) and item.name == 'main':
-                return len(item.params)
-        return 0  # No main found, assume no args
-    except Exception:
-        return 0  # On error, default to no args
-
-
-def get_runtime_object(num_params: int) -> Path:
-    """Get the appropriate runtime object file for main's signature."""
-    if num_params >= 3:
-        return RITZ_START_ENVP
-    elif num_params >= 2:
-        return RITZ_START
-    else:
-        return RITZ_START_NOARGS
-
-
 def ensure_runtime_object(obj_path: Path) -> bool:
     """Build a runtime `_start` object from its tracked `.ll` if needed.
 
@@ -1036,7 +999,6 @@ class BinaryConfig:
     bin_sources: list[str] | None = None  # Per-binary source directories
     pic: bool = False            # Generate position-independent code (for PIE executables)
     link_runtime: bool = False   # Link with Ritz runtime (_start that calls main and sys_exit)
-    main_args: int = 0           # Number of args main() takes (0, 2, or 3) for runtime selection
 
     def __post_init__(self):
         if self.asm_files is None:
@@ -1270,9 +1232,7 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
 
             # Parse runtime linking options
             # link_runtime: bool - link with Ritz runtime (_start)
-            # main_args: int - number of args main() takes (0, 2, or 3)
             link_runtime = bin_entry.get("link_runtime", False)
-            main_args = bin_entry.get("main_args", 0)
 
             # Per-binary source directories
             bin_sources = bin_entry.get("sources", [])
@@ -1293,7 +1253,6 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
                 bin_sources=bin_sources,
                 pic=pic,
                 link_runtime=link_runtime,
-                main_args=main_args,
             ))
     elif "lib" not in config:
         # Default: single binary with package name
@@ -1869,8 +1828,7 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     try:
         provenance = binary_provenance(
             all_sources, compiler, cache._get_current_compiler_hash(), profile,
-            runtime=[ll for o in (RITZ_START_NOARGS, RITZ_START, RITZ_START_ENVP)
-                     if (ll := o.with_suffix(".ll")).exists()])
+            runtime=[ll for ll in (RITZ_START.with_suffix(".ll"),) if ll.exists()])
     except OSError:
         provenance = None
     if (use_cache and provenance is not None and not compiler_changed
@@ -1891,9 +1849,8 @@ def compile_binary(name: str, src_path: Path, out_dir: Path, additional_sources:
     else:
         artifact_dir = scratch_dir(cache)
 
-    # Detect main's signature to choose the right runtime
-    main_params = detect_main_signature(src_path)
-    runtime_obj = get_runtime_object(main_params)
+    # One entry path: the same `_start` whatever shape `main` has.
+    runtime_obj = RITZ_START
 
     # Build the runtime object on demand — it is derived from a tracked .ll.
     if not ensure_runtime_object(runtime_obj):
@@ -2124,10 +2081,8 @@ def assemble_objects(asm_files: list[Path], pkg_dir: Path,
 def freestanding_runtime_object(bin_config: BinaryConfig) -> Optional[Path]:
     """The _start shim a link_runtime [[bin]] links first: it calls main()
     and then sys_exit(). None once a failure has been reported."""
-    # Determine the runtime variant based on main_args and target_os
-    runtime_variant = {3: "ritz_start_envp", 2: "ritz_start"}.get(
-        bin_config.main_args, "ritz_start_noargs")
-    # Choose OS-specific runtime
+    # One `_start` per OS; it calls main(argc, argv, envp) (AGAST #200).
+    runtime_variant = "ritz_start"
     if bin_config.target_os == "harland":
         runtime_suffix = ".harland.x86_64.o"
     else:

@@ -75,6 +75,7 @@ SOURCES = \
 	emitter \
 	fn_cache \
 	sha256 \
+	main_abi \
 	main
 
 # ritzlib modules needed by ritz1
@@ -92,9 +93,9 @@ LL_FILES = $(patsubst %,$(BUILD_DIR)/%.ll,$(SOURCES))
 OBJ_FILES = $(patsubst %,$(BUILD_DIR)/%.o,$(SOURCES))
 RITZLIB_OBJ = $(patsubst %,$(BUILD_DIR)/ritzlib_%.o,$(RITZLIB_MODULES))
 
-# Runtime - entry point that calls main(argc, argv) and handles exit.
-# ritz1 reads RITZ_PATH through ritzlib.os.env (/proc/self/environ), so it no
-# longer takes envp and does not need ritz_start_envp (AGAST #1750).
+# Runtime - the one entry point (AGAST #200): calls main(argc, argv, envp)
+# and handles exit. ritz1's main(argc, argv) ignores envp; it reads RITZ_PATH
+# through ritzlib.os.env (AGAST #1750).
 RUNTIME = ../runtime/ritz_start.x86_64.o
 
 # The runtime .o files are gitignored build products of tracked .ll sources.

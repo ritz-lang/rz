@@ -173,13 +173,11 @@ build_ritz_lsp() {
     fi
 
     # Build runtime objects if needed
-    if [ ! -f "ritz/runtime/ritz_start_noargs.$(uname -m).o" ]; then
+    if [ ! -f "ritz/runtime/ritz_start.$(uname -m).o" ]; then
         info "Building runtime objects..."
         cd ritz/runtime
         if command -v clang &> /dev/null; then
             clang -c -o ritz_start.$(uname -m).o ritz_start.$(uname -m).ll 2>/dev/null || true
-            clang -c -o ritz_start_noargs.$(uname -m).o ritz_start_noargs.$(uname -m).ll 2>/dev/null || true
-            clang -c -o ritz_start_envp.$(uname -m).o ritz_start_envp.$(uname -m).ll 2>/dev/null || true
         else
             error "clang not found. Please install clang to build ritz-lsp."
         fi

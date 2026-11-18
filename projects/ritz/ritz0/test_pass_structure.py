@@ -50,9 +50,11 @@ def _file_sloc(name: str) -> int:
 
 def test_compile_file_runs_the_pass_list_in_order():
     """The order is the old compile_file's, statement for statement: a pass
-    that moved would change which error a broken program reports first."""
+    that moved would change which error a broken program reports first.
+    _lower_main (AGAST #200) is new: the entry adapter must exist before
+    _resolve so it is checked and emitted like any fn."""
     assert [p.__name__ for p in ritz0.PASSES] == [
-        "_parse", "_resolve", "_check_impl_targets", "_rewrite_enum_from",
+        "_parse", "_lower_main", "_resolve", "_check_impl_targets", "_rewrite_enum_from",
         "_eval_array_sizes", "_check_binders", "_check_reachable",
         "_check_names", "_infer_struct_lit_args", "_type", "_check_types",
         "_check_ownership", "_emit",
