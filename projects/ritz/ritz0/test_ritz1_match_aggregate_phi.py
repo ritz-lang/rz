@@ -156,6 +156,31 @@ pub fn main() -> i32
     let b = option_unwrap_or<i64>(@s, 99)
     (a + b) as i32
 """,
+    # AGAST #4168: a struct-valued match / if as the only struct arm of a
+    # match statement; the outer phi was i64 over the nested one's %Res.
+    "i_nested_arm_struct": """\
+struct Res
+    h: i32
+
+fn mk(h: i32) -> Res
+    Res { h: h }
+
+fn f(k: i32) -> i32
+    match k
+        0 => match k
+            0 => mk(1)
+            _ => pass
+        _ => pass
+    match k
+        0 =>
+            if k == 0
+                mk(2)
+        _ => pass
+    k
+
+pub fn main() -> i32
+    f(0) + f(42)
+""",
 }
 
 

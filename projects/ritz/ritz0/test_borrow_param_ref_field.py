@@ -2675,7 +2675,7 @@ fn f(t:& Res, k: i32)
         0 => match k
             0 => t
             _ => pass
-        _ => Res { h: 9 }
+        _ => pass
     let z: i32 = k
 
 pub fn main() -> i32
