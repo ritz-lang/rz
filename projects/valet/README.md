@@ -6,7 +6,7 @@ High-performance async HTTP server for Ritz, built on Linux io_uring for minimal
 
 ## Overview
 
-Valet is the HTTP server layer of the Ritz ecosystem. It achieves high throughput by building directly on Linux io_uring for asynchronous I/O, eliminating per-request syscall overhead. Requests are handled with zero-copy parsing and vectored I/O responses.
+Valet is the HTTP server layer of the Ritz ecosystem. It achieves high throughput by building directly on Linux io_uring for asynchronous I/O, eliminating per-request syscall overhead. Requests are handled with zero-copy parsing.
 
 Valet supports multi-process deployment with `SO_REUSEPORT` for kernel-level load balancing across worker processes. It integrates with squeeze for HTTP Content-Encoding compression and cryptosec for TLS 1.3 HTTPS support.
 
@@ -16,7 +16,6 @@ In the full Ritz application stack, Valet sits at the bottom as the raw HTTP/TCP
 
 - Async I/O built on Linux io_uring - minimal syscall overhead
 - Zero-copy HTTP/1.1 request parsing
-- Vectored I/O responses via writev
 - Multi-process workers with SO_REUSEPORT load balancing
 - HTTP keep-alive connection reuse
 - Multishot accept for kernel 5.19+ (single syscall for all connections)

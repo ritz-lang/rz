@@ -28,7 +28,7 @@ $V -z /run/zeus/zeus.sock   # Reverse-proxy to a zeus daemon
 $V --help               # Authoritative option list
 
 # Test
-./rz test valet         # .ritz files under test/ (10 files, 151 tests on 2026-11-03) — exit 0, several minutes
+./rz test valet         # .ritz files under test/ — exit 0, several minutes
 # Shell suites are not wired into `rz test` (#1403); run them by hand, e.g.
 #   cd projects/valet && VALET=./build/debug/valet bash test/test_workers.sh
 
@@ -63,7 +63,7 @@ src/main.ritz           Entry point, CLI parsing, route registration
 lib/valet.ritz          High-level Valet API, connection handler, global context
 lib/router.ritz         URL routing (exact, prefix, parameter patterns)
 lib/request.ritz        Zero-copy HTTP request parser
-lib/response.ritz       Response builder (buffer + vectored I/O)
+lib/response.ritz       Response builder (fixed buffer)
 lib/static.ritz         Static file serving
 lib/compress.ritz       gzip/deflate response compression (via squeeze)
 lib/config.ritz         valet.json config loading
@@ -83,7 +83,6 @@ lib/tls.ritz            TLS 1.3 termination (via cryptosec)
 | `async/tasks.ritz` | TaskPool, TaskServer, event loop |
 | `uring.ritz` | io_uring syscall wrappers |
 | `async_net.ritz` | TCP socket helpers |
-| `iovec.ritz` | Vectored I/O builder |
 | `args.ritz` | CLI argument parsing |
 
 ## Routing Framework
@@ -195,7 +194,7 @@ only if you have a reason to. Neither `.build/` nor a project-local
 - **SO_REUSEPORT**: Multiple workers share listening socket
 - **TCP_NODELAY**: Disable Nagle for low latency
 - **Keep-alive**: Up to 100 requests per connection
-- **Zero-copy responses**: Vectored I/O points to .rodata strings
+- **Static response constants**: `S_*` spans with precomputed lengths, no strlen
 
 Throughput, measured 2026-09-12 by `test/test_basic.sh` (`wrk`, single worker,
 debug build, localhost): **28,108** and **34,850 req/s** across two runs. The
