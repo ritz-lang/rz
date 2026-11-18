@@ -25,9 +25,10 @@
 # it is not sure, it answers NARROW_UNKNOWN and the check stays silent.  A
 # missed rejection is a parity gap; a false rejection would refuse a program
 # ritz0 accepts, which the regression suite would (rightly) fail on.  In
-# particular an unannotated local is NOT trusted -- the parser defaults it to
-# TYPE_I64 whatever its initialiser is -- so identifiers resolve through the
-# WRITTEN annotations, never through an inferred type.
+# The parser defaults an unannotated local to TYPE_I64 whatever its
+# initialiser is, so that default is never read.  Sema records the type
+# narrow_src_type infers for the initialiser instead (narrow_sema_decl, AGAST
+# #1688): ritz0 sizes the local's slot from the value it emits, the same width.
 #
 # WHERE IT RUNS (AGAST #3505, #1816).  check_implicit_narrowing is a Sema
 # check: sema_walk calls it on every `let` / `var`, before the name is bound,
@@ -52,6 +53,7 @@ import ast_helpers
 import emitter_core
 import sema
 import sema_type
+import bool_check   # sbk_method_def, sbk_receiver (AGAST #1688)
 
 # narrow_src_type results that are not a TYPE_* kind.
 # Positive and far from every TYPE_* kind (consts must be plain literals).
@@ -132,9 +134,28 @@ fn narrow_sema_note(sm: *Sema, name: *u8, len: i32, t: i32)
 pub fn narrow_sema_param(sm: *Sema, p: *Param)
     narrow_sema_note(sm, p.name, p.name_len, p.param_type)
 
-# A `let` / `var`: its annotation, or nothing for an unannotated one.
+# A `let` / `var`: its annotation, else (AGAST #1688) its initialiser's
+# type, as ritz0 sizes an unannotated local's slot from the value it emits.
+# A bare literal is an i64 there: `let a = 5` then `let n: i32 = a` is refused.
 pub fn narrow_sema_decl(sm: *Sema, st: *Stmt)
-    narrow_sema_note(sm, st.var_name, st.var_name_len, st.var_declared_type)
+    if st.var_declared_type != TYPE_VOID
+        narrow_sema_note(sm, st.var_name, st.var_name_len, st.var_declared_type)
+        return
+    if sm.scope_top <= 0
+        return
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if v.name != st.var_name or v.name_len != st.var_name_len
+        return
+    # Judged before the name is in scope, as `let a = a` reads the outer a.
+    var env: NarrowEnv
+    env.s = null
+    env.sm = sm
+    sm.scope_top = sm.scope_top - 1
+    var t: i32 = narrow_src_type_in(@env, st.var_init, 0)
+    sm.scope_top = sm.scope_top + 1
+    if t == NARROW_LIT
+        t = TYPE_I64
+    narrow_sema_note(sm, st.var_name, st.var_name_len, t)
 
 # A match arm's binding (AGAST #3345 / #3358, as the emitter's
 # narrow_note_binding): a payload `Some(x)` has the payload's integer type, a
@@ -219,10 +240,14 @@ fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
             if v.narrow == 0
                 return NARROW_UNKNOWN
             return v.narrow
+        # Every global's type is written (the parser refuses an untyped one,
+        # #3375), so an i64 / u64 global is trusted here (AGAST #1688).
         var sg: *GlobalVarDef = env.sm.module.globals
         while sg != null
             if name_eq(sg.name, sg.name_len, name, len) == 1
-                return narrow_global_type(sg)
+                if ty_is_int(sg.var_type) == 1
+                    return sg.var_type
+                return NARROW_UNKNOWN
             sg = sg.next
         return NARROW_UNKNOWN
     let s: *EmitterState = env.s
@@ -254,8 +279,8 @@ fn narrow_env_name_type(env: *NarrowEnv, name: *u8, len: i32) -> i32
         return narrow_global_type(g)
     NARROW_UNKNOWN
 
-# A global's TYPE_I64 may be the parser's default for a missing annotation,
-# so only a narrower (necessarily written) type is trusted.
+# The emitter's view keeps its narrower-than-64-bit rule for a global (its
+# codegen readers, sizeof and a match scrutinee, never needed more).
 fn narrow_global_type(g: *GlobalVarDef) -> i32
     let gw: i32 = ty_bits(g.var_type)
     if gw > 1 and gw < 64
@@ -332,6 +357,44 @@ pub fn narrow_sema_call_fn(sm: *Sema, e: *Expr) -> *FnDef
             return v.fn_sig
     sema_call_fn(sm, e)
 
+# AGAST #1688: what Sema knows of `p[i]`, `*p`, `x.m()` and `e?`, the
+# element, pointee, return or payload type, read only through Sema's view.
+fn narrow_sema_place_type(sm: *Sema, e: *Expr) -> i32
+    let k: i32 = e.kind
+    if k == EXPR_INDEX
+        if e.right == null or e.right.kind == EXPR_RANGE
+            return NARROW_UNKNOWN
+        var kind: i32 = TYPE_VOID
+        var pointee: i32 = TYPE_VOID
+        sema_index_slot(sm, e, @kind, @pointee)
+        return narrow_known(kind)
+    if k == EXPR_UNARY
+        var t: SemaTy
+        let pk: i32 = sema_expr_ty(sm, e.operand, @t)
+        if pk == TYPE_PTR or pk == TYPE_REF or pk == TYPE_MUT_REF
+            return narrow_known(t.pointee)
+        return NARROW_UNKNOWN
+    if k == EXPR_METHOD
+        # `.unwrap()` / `.unwrap_or(d)` is the carrier's intrinsic, no FnDef.
+        if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1 or name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9) == 1
+            return narrow_sema_payload_of(sm, e.left)
+        let fd: *FnDef = sbk_method_def(sm, e)
+        if fd == null
+            return NARROW_UNKNOWN
+        return narrow_known(fd.return_type)
+    if k == EXPR_TRY
+        return narrow_sema_payload_of(sm, e.left)
+    NARROW_UNKNOWN
+
+# The Ok / Some payload's integer type of an Option / Result `carrier`.
+fn narrow_sema_payload_of(sm: *Sema, carrier: *Expr) -> i32
+    var name: *u8 = null
+    var len: i32 = 0
+    sbk_receiver(sm, carrier, @name, @len)
+    if name == null or len <= 0 or is_tagged_enum_type(name, len) == 0
+        return NARROW_UNKNOWN
+    narrow_known(tagged_enum_int_type_in(@sm.struct_map, sm.module, name, len, 0))
+
 # The type ritz0 would give an arithmetic result: the wider operand, with a
 # bare literal adopting the other side (#1396).  Two literals stay i64 in
 # ritz0 (#1445), so `2 << 8` is an i64 that the constant rule must clear.
@@ -400,7 +463,15 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
     if k == EXPR_CAST
         return narrow_known(e.op)
     if k == EXPR_MEMBER
-        return narrow_env_member_type(env, e)
+        let mt: i32 = narrow_env_member_type(env, e)
+        if mt == NARROW_UNKNOWN and env.sm != null
+            # `a.b.c`: Sema types the chain; a field's type is always written.
+            return narrow_known(sema_expr_type(env.sm, e))
+        return mt
+    if env.sm != null and (k == EXPR_INDEX or k == EXPR_METHOD or k == EXPR_TRY)
+        return narrow_sema_place_type(env.sm, e)
+    if env.sm != null and k == EXPR_UNARY and e.op == OP_DEREF
+        return narrow_sema_place_type(env.sm, e)
     if k == EXPR_BINARY
         if e.op >= OP_EQ and e.op <= OP_OR
             return TYPE_BOOL
