@@ -25,11 +25,17 @@
 #   --no-fork        Disable fork isolation (run tests in main process)
 #   --core           Let a crashing test dump core (default: it cannot)
 #   -h, --help       Show help message
+#
+# `--help` prints the full list; parse_args builds it with ritzlib.argspec.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
-import ritzlib.args
+import ritzlib.option
+import ritzlib.result
+import ritzlib.span
+import ritzlib.gvec
+import ritzlib.argspec
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.os.env
@@ -621,55 +627,103 @@ pub fn run_exit_status(summary: @TestSummary) -> i32
 # CLI Argument Parsing
 # ============================================================================
 
+# The command line ritzunit accepts. Order is the --help order.
+fn runner_spec() -> ArgSpec
+    var spec = argspec_new("ritzunit", "Unit test framework for Ritz")
+    argspec_switch(@&spec, 'v', "verbose", "Show detailed output")
+    argspec_switch(@&spec, 'q', "quiet", "Minimal output - only failures and summary")
+    argspec_switch(@&spec, 'l', "list", "List tests without running them")
+    argspec_switch(@&spec, 'h', "help", "Show this help message")
+    argspec_option(@&spec, 'f', "filter", "EXPR", "Filter tests by EXPR (glob, @attr, bool)", None)
+    argspec_option(@&spec, 't', "timeout", "MS", "Timeout per test in milliseconds", Some("5000"))
+    argspec_switch(@&spec, 0, "no-fork", "Disable fork isolation (run tests in main process)")
+    argspec_switch(@&spec, 0, "core", "Let a crashing test dump core (default: it cannot)")
+    argspec_switch(@&spec, 'x', "fail-fast", "Stop on first test failure")
+    argspec_switch(@&spec, 's', "shuffle", "Randomize test execution order")
+    argspec_option(@&spec, 0, "seed", "N", "Random seed for shuffling (0 = auto)", Some("0"))
+    argspec_option(@&spec, 'j', "jobs", "N", "Run up to N tests at once, each in its own child", Some("1"))
+    argspec_switch(@&spec, 0, "json", "Output results in JSON format")
+    argspec_switch(@&spec, 0, "junit", "Output results in JUnit XML format")
+    argspec_switch(@&spec, 0, "color", "Force colored output (even when not a TTY)")
+    argspec_switch(@&spec, 0, "no-color", "Disable colored output")
+    spec
+
+# RunOptions keeps its flags as i32.
+fn switch_flag(p: @ParsedArgs, name: StrView) -> i32
+    if parsed_switch(p, name)
+        return 1
+    0
+
+# A usage error, reported on stderr: parse_args' -1.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    -1
+
+fn store_i64(out: *i64, n: i64) -> i32
+    *out = n
+    0
+
+# Option `name`'s value (given or default) as an i64 into *out: 0, or -1 on a
+# value that is not a number.
+fn int_option(spec: @ArgSpec, p: @ParsedArgs, name: StrView, out: *i64) -> i32
+    match parsed_int(p, name)
+        Ok(n) => store_i64(out, n)
+        Err(e) => usage_error(spec, e)
+
+# The filter as RunOptions holds it: null when not given. A value is a view
+# into argv (`-f EXPR`, or the tail of `--filter=EXPR`), so its bytes end at
+# argv's own NUL and `.ptr` is a C string.
+fn filter_cstr(v: Option<StrView>) -> *u8
+    match v
+        Some(s) => s.ptr
+        None => null
+
 # Fill `opts` from the command line: 0 to run, 1 if help was shown, -1 on a
-# usage error (reported on stderr).
+# usage error (reported on stderr). ritzunit takes no positional arguments.
 pub fn parse_args(argc: i32, argv: **u8, opts: *RunOptions) -> i32
-    var parser: ArgParser
-    args_init(@parser, c"ritzunit", c"Unit test framework for Ritz")
+    var all = args_from_argv(argc, argv)
+    var spec = runner_spec()
+    let args = args_tail(@all)
+    let status: i32 = match argspec_parse(@spec, args)
+        Ok(p) => options_from(@spec, p, opts)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status
 
-    args_flag(@parser, 'v', c"verbose", c"Show detailed output")
-    args_flag(@parser, 'q', c"quiet", c"Minimal output - only failures and summary")
-    args_flag(@parser, 'l', c"list", c"List tests without running them")
-    args_flag(@parser, 'h', c"help", c"Show this help message")
-    args_option(@parser, 'f', c"filter", c"EXPR", c"Filter tests by EXPR (glob, @attr, bool)", null)
-    args_option(@parser, 't', c"timeout", c"MS", c"Timeout per test in milliseconds", c"5000")
-    args_flag(@parser, 0, c"no-fork", c"Disable fork isolation (run tests in main process)")
-    args_flag(@parser, 0, c"core", c"Let a crashing test dump core (default: it cannot)")
-    args_flag(@parser, 'x', c"fail-fast", c"Stop on first test failure")
-    args_flag(@parser, 's', c"shuffle", c"Randomize test execution order")
-    args_option(@parser, 0, c"seed", c"N", c"Random seed for shuffling (0 = auto)", c"0")
-    args_option(@parser, 'j', c"jobs", c"N", c"Run up to N tests at once, each in its own child", c"1")
-    args_flag(@parser, 0, c"json", c"Output results in JSON format")
-    args_flag(@parser, 0, c"junit", c"Output results in JUnit XML format")
-    args_flag(@parser, 0, c"color", c"Force colored output (even when not a TTY)")
-    args_flag(@parser, 0, c"no-color", c"Disable colored output")
+fn options_from(spec: @ArgSpec, p: ParsedArgs, opts: *RunOptions) -> i32
+    var parsed = p
+    let status = fill_options(spec, @parsed, opts)
+    parsed_drop(@&parsed)
+    status
 
-    if args_parse(@parser, argc, argv) != 0
-        return -1
-
-    if args_get_flag(@parser, 'h') != 0
-        args_print_help(@parser)
+fn fill_options(spec: @ArgSpec, p: @ParsedArgs, opts: *RunOptions) -> i32
+    if parsed_switch(p, "help")
+        argspec_print_help(spec)
         return 1  # Exit without error, but don't run tests
 
-    opts.verbose = args_get_flag(@parser, 'v')
-    opts.quiet = args_get_flag(@parser, 'q')
-    opts.list_only = args_get_flag(@parser, 'l')
-    opts.filter = args_get_str(@parser, 'f')
-    opts.timeout_ms = args_get_int(@parser, 't')
-    opts.no_fork = args_get_flag_long(@parser, c"no-fork")
-    opts.core = args_get_flag_long(@parser, c"core")
-    opts.fail_fast = args_get_flag(@parser, 'x')
-    opts.shuffle = args_get_flag(@parser, 's')
-    opts.seed = args_get_int_long(@parser, c"seed")
-    opts.json = args_get_flag_long(@parser, c"json")
-    opts.jobs = args_get_int(@parser, 'j')
+    opts.verbose = switch_flag(p, "verbose")
+    opts.quiet = switch_flag(p, "quiet")
+    opts.list_only = switch_flag(p, "list")
+    opts.filter = filter_cstr(parsed_value(p, "filter"))
+    if int_option(spec, p, "timeout", @opts.timeout_ms) != 0
+        return -1
+    opts.no_fork = switch_flag(p, "no-fork")
+    opts.core = switch_flag(p, "core")
+    opts.fail_fast = switch_flag(p, "fail-fast")
+    opts.shuffle = switch_flag(p, "shuffle")
+    if int_option(spec, p, "seed", @opts.seed) != 0
+        return -1
+    opts.json = switch_flag(p, "json")
+    if int_option(spec, p, "jobs", @opts.jobs) != 0
+        return -1
     if opts.jobs < 1
         eprints("ritzunit: --jobs must be at least 1\n")
         return -1
-    opts.junit = args_get_flag_long(@parser, c"junit")
+    opts.junit = switch_flag(p, "junit")
 
-    let force_color: i32 = args_get_flag_long(@parser, c"color")
-    let no_color: i32 = args_get_flag_long(@parser, c"no-color")
+    let force_color: i32 = switch_flag(p, "color")
+    let no_color: i32 = switch_flag(p, "no-color")
 
     if force_color != 0 && no_color != 0
         eprints("ritzunit: --color and --no-color are mutually exclusive\n")
