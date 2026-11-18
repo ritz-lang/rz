@@ -2642,7 +2642,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
+""", 2, {}),
 
     # A struct source no longer destructures: a `(…)` pattern is tuples only
     # (LARB R67, test_tuple_pattern_tuples_only.py).
@@ -2654,7 +2654,20 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 2, {"ritz1": 3033, "ritz1_selfhosted": 3033}),
+""", 2, {}),
+
+    # AGAST #3033: a name past the second (the tail) owns its element too.
+    "tuple_destructure_call_three": (TUPLES + SLOT + """\
+fn make_three() -> (Tracked, Tracked, Tracked)
+    return (make(1), make(2), make(3))
+
+fn f()
+    let (a, b, c) = make_three()
+
+pub fn main() -> i32
+    f()
+    return DROPS
+""", 3, {}),
 
     "tuple_element_assigned_back": (TUPLES + SLOT + """\
 fn f()
@@ -3034,7 +3047,7 @@ pub fn main() -> i32
     let (a, b) = make_pair(1, 2)
     consume(a)
     return a.id
-""", "a", {"ritz1": 3033, "ritz1_selfhosted": 3033}),
+""", "a", {}),
 
     "after_move_into_callee": ("""\
 pub fn main() -> i32
