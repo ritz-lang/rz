@@ -182,6 +182,47 @@ def test_impl_on_alias_refused(request, tmp_path, compiler, row):
                     "`Id` is a type alias for `Foo`: write `impl Foo`")
 
 
+# A target that is no plain name is spelled as written, as ritz0's
+# type_to_string prints it (#3625): ritz1's alias table keeps a pointer,
+# array or generic instance only in replay form (pointee kind, mangled
+# `Box$u8`), and said "`Id` is a type alias: write `impl` on the type it
+# names".  name -> (target, alias line).
+ALIAS_SPELLED_ROWS = {
+    "pointer": ("*Foo", "type Id = *Foo"),
+    "array": ("[4]u8", "type Id = [4]u8"),
+    "generic": ("Box<u8>", "type Id = Box<u8>"),
+    # Spaced as type_to_string spaces it: after `,`, around `->`, between
+    # two words, nowhere else.
+    "fn_type": ("fn(*mut Foo, u8) -> i32", "type Id = fn( *mut Foo,u8 )->i32"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("row", sorted(ALIAS_SPELLED_ROWS))
+def test_impl_on_alias_spells_target(request, tmp_path, compiler, row):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    target, alias = ALIAS_SPELLED_ROWS[row]
+    program = f"""\
+struct Foo
+    x: i32
+
+struct Box<T>
+    v: T
+
+{alias}
+
+impl ^Id
+    fn zz(self: @Id) -> i32
+        return 7
+
+pub fn main() -> i32
+    return 0
+"""
+    _assert_refused(compiler, tmp_path, f"alias_spelled_{row}", PRELUDE + program,
+                    f"`Id` is a type alias for `{target}`: write `impl {target}`")
+
+
 # Known, and only compiled: a blanket impl's methods' reachability is
 # R15/R17's.
 COMPILES = {

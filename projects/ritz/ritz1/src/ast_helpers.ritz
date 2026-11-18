@@ -3668,6 +3668,8 @@ struct AliasEntry
     ptr_depth: i32         # AGAST #1924
     array_shape: *ArrayShape  # AGAST #1509
     fn_sig: *FnDef         # AGAST #1879: a fn type's signature (type_fn)
+    spelling: *u8          # AGAST #3625: the target as written (type_alias_spell)
+    spelling_len: i32
 
 const MAX_TYPE_ALIASES: i32 = 1024
 
@@ -3760,25 +3762,69 @@ pub fn type_alias_declared(name: *u8, len: i32) -> i32
     0
 
 # AGAST #3369: how the type an alias names is written, for "write `impl
-# Foo`" (LARB R35), with its length in *out_len.  A plain struct/enum name or
-# a primitive; null for a target the table keeps only in replay form (a
-# pointer, array, ref, fn type, or a generic instance mangled as `Vec$u8`).
+# Foo`" (LARB R35), with its length in *out_len; null if it wasn't recorded.
+# The alias's own tokens (#3625), since the table keeps a pointer, array or
+# generic instance (`Box$u8`) only in replay form.
 pub fn type_alias_target_spelling(name: *u8, len: i32, out_len: *i32) -> *u8
     let e: *AliasEntry = type_alias_find(name, len)
     if e == null
         return null
-    if e.kind == TYPE_STRUCT and e.type_name != null
-        var i: i32 = 0
-        while i < e.type_name_len
-            if *(e.type_name + i) == 36  # '$': a mangled generic instance
-                return null
-            i = i + 1
-        *out_len = e.type_name_len
-        return e.type_name
-    let prim: *u8 = primitive_name_from_type(e.kind)
-    if prim != null
-        *out_len = primitive_name_len(e.kind)
-    prim
+    *out_len = e.spelling_len
+    e.spelling
+
+# 1 if `c` is a letter, digit or `_`.
+fn alias_word_char(c: u8) -> i32
+    if (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or (c >= '0' and c <= '9') or c == '_'
+        return 1
+    0
+
+# 1 if `t` is `->`.
+fn alias_tok_arrow(t: *Token) -> i32
+    if t.len == 2 and *t.start == '-' and *(t.start + 1) == '>'
+        return 1
+    0
+
+# AGAST #3625: the target of the alias whose name token starts at `name`,
+# spelled from its tokens as ritz0's type_to_string prints it: `*Foo`,
+# `[4]u8`, `Box<u8, i32>`, `*mut Foo`, `fn(i32) -> i32`.  A space after `,`,
+# around `->` and between two words; none elsewhere.  The type's tokens run
+# from after the name's `=` to the item's NEWLINE, just before p.pos.
+fn type_alias_spell(p: *Parser, name: *u8, out_len: *i32) -> *u8
+    var i: i32 = p.pos - 1
+    while i >= 0 and (*(p.tokens + i)).start != name
+        i = i - 1
+    if i < 0
+        return null
+    let first: i32 = i + 2   # past the name and `=`
+    var last: i32 = p.pos - 1
+    while last >= first and (*(p.tokens + last)).kind == TOK_NEWLINE
+        last = last - 1
+    var cap: i32 = 0
+    var k: i32 = first
+    while k <= last
+        cap = cap + (*(p.tokens + k)).len + 2
+        k = k + 1
+    let buf: *u8 = malloc((cap + 1) as i64)
+    var n: i32 = 0
+    k = first
+    while k <= last
+        let t: *Token = p.tokens + k
+        if k > first
+            let prev: *Token = p.tokens + (k - 1)
+            let pc: u8 = *(prev.start + prev.len - 1)
+            let words: i32 = alias_word_char(pc) & alias_word_char(*t.start)
+            if words == 1 or pc == ',' or alias_tok_arrow(t) == 1 or alias_tok_arrow(prev) == 1
+                *(buf + n) = ' '
+                n = n + 1
+        var j: i32 = 0
+        while j < t.len
+            *(buf + n) = *(t.start + j)
+            n = n + 1
+            j = j + 1
+        k = k + 1
+    *(buf + n) = 0
+    *out_len = n
+    buf
 
 # Does replaying this kind need the side-channel state?  Primitive kinds
 # carry everything in the kind itself, and type_spec's primitive
@@ -3831,6 +3877,9 @@ pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
     # with the alias calls typed (and with the alias's [[callconv]]).
     e.fn_sig = g_alias_fn_sig
     g_alias_fn_sig = null
+    var slen: i32 = 0
+    e.spelling = type_alias_spell(p, name, @slen)
+    e.spelling_len = slen
     if e.fn_sig != null and (g_attr_bits & ATTR_WIN64) != 0
         item_attr_record(e.fn_sig as *u8, ATTR_WIN64)
     return kind
