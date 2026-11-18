@@ -208,9 +208,9 @@ def test_ritz0_heap_mallocs_the_padded_size(tmp_path, name):
     assert _malloc_sizes(ll.read_text()) == [HEAPS[name][3]]
 
 
-# ritz1's `heap` of an array literal: `__heap_new`'s T is not inferred from
-# one, and a by-value array T is not emitted (AGAST #3986).
-RITZ1_HEAP_GAPS = {"array": 3986}
+# HEAPS rows ritz1 can't build yet, each with its ticket (none today: the
+# `array` row was AGAST #3986, test_ritz1_heap_array_lit.py).
+RITZ1_HEAP_GAPS: dict[str, int] = {}
 
 
 def _block_params():
