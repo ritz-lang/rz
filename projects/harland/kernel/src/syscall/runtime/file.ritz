@@ -13,6 +13,10 @@ import fs.kpath { strview_from_ptr }
 import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_lseek, sys_mkdir, is_fs_fd }
 import syscall.errno { Errno }
 import syscall.runtime.process { syscall_strlen }
+import mm.heap { kalloc, kfree }
+
+# Most entries one readdir returns.
+const READDIR_MAX: i32 = 64
 
 # sys_readdir: List directory contents
 # Returns bytes written to buffer as null-terminated strings
@@ -25,11 +29,15 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     let path_len: i64 = syscall_strlen(dir_path)
     let path_view: StrView = strview_from_ptr(dir_path, path_len)
 
-    # Allocate entries array on stack (max 64)
-    var entries: [64]KDirEntry
-    let count: i32 = knamespace_list(ns, path_view, @entries[0], 64)
+    # The entries go on the heap: 64 of them are ~21 KiB, which on the
+    # syscall stack once overran it (AGAST #1877).
+    let entries: *KDirEntry = kalloc(sizeof(KDirEntry) as u64 * READDIR_MAX as u64) as *KDirEntry
+    if entries == 0 as *KDirEntry
+        return Errno.NoMem as i64
+    let count: i32 = knamespace_list(ns, path_view, entries, READDIR_MAX)
 
     if count < 0
+        kfree(entries as *u8)
         return count as i64  # an Errno: NoEnt or NotDir
 
     # Copy names to buffer as null-terminated strings
@@ -37,7 +45,7 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
     var i: i32 = 0
 
     while i < count
-        let entry: *KDirEntry = @entries[i]
+        let entry: *KDirEntry = entries + i as i64
 
         # Find name length
         var name_len: i32 = (*entry).name_len as i32
@@ -63,6 +71,7 @@ fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
 
         i = i + 1
 
+    kfree(entries as *u8)
     return bytes_written
 
 # ============================================================================

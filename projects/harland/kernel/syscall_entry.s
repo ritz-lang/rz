@@ -19,12 +19,20 @@
 
 .section .bss
 # Kernel stack for every syscall, and for the IRQs taken during one (IST=0).
-# One for all CPUs (TODO: per-CPU). In .bss so an overflow can't run into
+# One for all CPUs: APs halt in ap_entry and never enter ring 3 (per-CPU
+# stacks: AGAST #4192). In .bss so an overflow can't run into
 # .data: it was 4 KiB in .data directly above g_child_pid and fs_current,
 # and a deep syscall (a write-back flush through knamespace_write) grew down
 # into them (AGAST #2761, #4064). Its lowest quadword holds a sentinel that
 # syscall_stack_check (syscall/stack.ritz) checks at syscall exit.
-.align 16
+#
+# Below it, syscall_stack_guard: one page that syscall_stack_init unmaps
+# (AGAST #1877), so the first write past the bottom faults at once. #PF and
+# #DF run on IST1 (idt.ritz), so the fault handler has a stack of its own and
+# reports "syscall stack overflow" (exceptions.ritz).
+.align 4096
+syscall_stack_guard:
+    .space 4096
 syscall_stack:
     .space SYSCALL_STACK_SIZE
 syscall_stack_top:
@@ -520,3 +528,12 @@ syscall_stack_size:
     movq $SYSCALL_STACK_SIZE, %rax
     ret
 .size syscall_stack_size, . - syscall_stack_size
+
+# u64 syscall_stack_guard_page(void): address of the guard page below the
+# syscall stack (page-aligned, unmapped by syscall_stack_init).
+.global syscall_stack_guard_page
+.type syscall_stack_guard_page, @function
+syscall_stack_guard_page:
+    leaq syscall_stack_guard(%rip), %rax
+    ret
+.size syscall_stack_guard_page, . - syscall_stack_guard_page
