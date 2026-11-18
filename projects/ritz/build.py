@@ -1540,6 +1540,22 @@ def discover_modules(src_path: Path, *, project_root: Path,
     """Every module `src_path` imports, transitively, imports first and
     `src_path` last (ritz0/list_deps.py, in a subprocess). None once an
     import resolution failure has been reported."""
+    result = _list_deps(src_path, project_root=project_root,
+                        dependencies=dependencies, source_roots=source_roots)
+    if result.returncode != 0:
+        print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
+        _REACHED.incomplete = True
+        return None
+    modules = _listed_modules(result.stdout)
+    _REACHED.modules.update(modules)
+    return modules
+
+
+def _list_deps(src_path: Path, *, project_root: Path,
+               dependencies: dict[str, DependencySpec] = None,
+               source_roots: list[str] = None,
+               env: dict = None) -> subprocess.CompletedProcess:
+    """ritz0/list_deps.py on `src_path`: its import closure, one per line."""
     cmd = [sys.executable, str(RITZ0_DIR / "list_deps.py"), str(src_path),
            "--project-root", str(project_root)]
     if dependencies:
@@ -1547,11 +1563,88 @@ def discover_modules(src_path: Path, *, project_root: Path,
     if source_roots:
         cmd.extend(["--sources", json.dumps(source_roots)])
     # The environment carries RITZ_PATH for import resolution.
-    result = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
-    if result.returncode != 0:
-        print(f"  ✗ import resolution failed: {result.stderr}", file=sys.stderr)
-        return None
-    return [Path(f.strip()) for f in result.stdout.strip().split('\n') if f.strip()]
+    return subprocess.run(cmd, capture_output=True, text=True,
+                          env=env if env is not None else os.environ)
+
+
+def _listed_modules(stdout: str) -> list[Path]:
+    return [Path(f.strip()) for f in stdout.strip().split('\n') if f.strip()]
+
+
+def test_reached_modules(pkg_dir: Path, config: dict, *,
+                         dependencies: dict[str, DependencySpec] = None,
+                         source_roots: list[str] = None) -> set[Path]:
+    """Every module the package's test files import, transitively.
+
+    `rz test` compiles these, so none is silently uncompiled: sage's lexer
+    and parser are a library only its tests use (AGAST #2210). Resolved as
+    `ritz0 --test` runs a test file: from pkg_dir, with the test RITZ_PATH.
+    A test file whose imports do not resolve adds nothing: `rz test`
+    already fails it with the reason.
+    """
+    try:
+        tests = discover_test_files(pkg_dir, config)
+    except StrayTestsDirError:
+        return set()
+    env = test_env_for_files()
+    reached: set[Path] = set()
+    for tfile in tests:
+        result = _list_deps(tfile, project_root=pkg_dir, dependencies=dependencies,
+                            source_roots=source_roots, env=env)
+        if result.returncode == 0:
+            reached.update(_listed_modules(result.stdout))
+    return reached
+
+
+class _ReachedModules:
+    """Every module a target of the package being built reached (AGAST #2210).
+
+    discover_modules adds each import closure and build_package the [[lib]]
+    modules; build_package then reports the src/ modules missing from it.
+    `incomplete` once any import resolution failed: the closure that failed
+    is unknown, so nothing may then be called an orphan.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        self.modules: set[Path] = set()
+        self.incomplete = False
+
+
+_REACHED = _ReachedModules()
+
+
+def _nested_package_dirs(src_dir: Path) -> list[Path]:
+    """Dirs under `src_dir` holding their own ritz.toml: another package."""
+    return [m.parent for m in src_dir.rglob("ritz.toml")]
+
+
+def orphaned_modules(pkg_dir: Path, reached) -> list[Path]:
+    """The pkg_dir/src/**/*.ritz modules no target compiled, sorted.
+
+    `rz build` compiles only what an entry point imports, so a module
+    nothing imports is never compiled and the build stays green: nexus's
+    repos/, presenters/ and wiki_service could not even parse, unnoticed
+    (AGAST #2210). Not orphans: `reached` (compared resolved), a module
+    with a [[test]] fn (`rz test` compiles it, AGAST #3279) and a nested
+    package's files.
+    """
+    src_dir = pkg_dir / "src"
+    if not src_dir.is_dir():
+        return []
+    seen = {Path(p).resolve() for p in reached}
+    nested = _nested_package_dirs(src_dir)
+    orphans = []
+    for f in sorted(src_dir.rglob("*.ritz")):
+        if f.resolve() in seen or any(f.is_relative_to(d) for d in nested):
+            continue
+        text = f.read_text(encoding="utf-8", errors="replace")
+        if any(line.strip() == "[[test]]" for line in text.splitlines()):
+            continue
+        orphans.append(f)
+    return orphans
 
 
 def module_compile_cmd(compiler: str, src: Path, ll_path: Path, target: Target, *,
@@ -2294,6 +2387,9 @@ class PackageBuildResult:
     # missing from this machine (AGAST #2141). Still failures -- `ok` is
     # False -- but the environment's fault, not the code's.
     setup_failed: list[str] = field(default_factory=list)
+    # src/ modules no target compiled (AGAST #2210). Reported, never a
+    # failure: `ok` ignores them.
+    orphans: list[Path] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -2383,6 +2479,7 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
     failed = [u.name for u in plan.unresolved]
     setup_failed = []       # subset of `failed`: missing tool only (#2141)
     _SETUP_MISSES.clear()   # a miss belongs to the package that recorded it
+    _REACHED.reset()        # as is a reached module (#2210)
 
     def note_failure(target: str) -> None:
         print(f"\n  ✗ Failed to build {target}")
@@ -2540,9 +2637,45 @@ def build_package(pkg_dir: Path, config: dict, keep_artifacts: bool = False, use
         else:
             print(f"  = {target} up to date: {display_path(archive)}")
             built.append(archive)
+        _REACHED.modules.update(lib.modules)
 
+    orphans = report_orphans(pkg_dir, attempted=bool(binaries or plan.libraries),
+                             display_path=display_path,
+                             test_reached=lambda: test_reached_modules(
+                                 pkg_dir, config, dependencies=namespaces,
+                                 source_roots=source_roots))
     return PackageBuildResult(built=built, failed=failed, skipped=plan.skipped,
-                              setup_failed=setup_failed)
+                              setup_failed=setup_failed, orphans=orphans)
+
+
+def report_orphans(pkg_dir: Path, *, attempted: bool, display_path,
+                   test_reached=lambda: set()) -> list[Path]:
+    """Print the src/ modules this build did not compile; return them.
+
+    A report, not a failure (AGAST #2210): the gate's `rz build --all`
+    stays a verdict on what is built, and an orphan is listed on every
+    build until it is wired in or deleted. Silent when nothing was
+    compiled (a test-only or script-only package). `test_reached()` gives
+    the modules test files import; it is called only if a candidate is
+    left, so a package with no orphan resolves no test file.
+    """
+    if not attempted:
+        return []
+    if _REACHED.incomplete:
+        print("  ⚠ orphan check skipped: an import resolution failed, so "
+              "which src/ modules are compiled is unknown")
+        return []
+    orphans = orphaned_modules(pkg_dir, _REACHED.modules)
+    if orphans:
+        orphans = orphaned_modules(pkg_dir, _REACHED.modules | test_reached())
+    if orphans:
+        n = len(orphans)
+        print(f"  ⚠ {n} module{'s' if n != 1 else ''} under src/ "
+              f"{'are' if n != 1 else 'is'} not compiled: no target or test "
+              f"imports {'them' if n != 1 else 'it'} (AGAST #2210)")
+        for f in orphans:
+            print(f"    - {display_path(f)}")
+    return orphans
 
 
 def ritz_path_for_tests(caller_path: str) -> str:
@@ -2893,26 +3026,8 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
               f"(a test file that cannot fail is not a test)")
     elif status == "error":
         # Compile / link / runtime failure before harness summary
-        err_blob = (result.stderr or "") + (result.stdout or "")
-        # Try to surface the most actionable line
-        err_first = ""
-        for line in err_blob.splitlines():
-            # Case-insensitive "error" so compiler diagnostics like
-            # "Error in <file>: ..." match. The old tag list required
-            # a literal "error:", missed them, and fell through to the
-            # last line of output — which for a compile failure is the
-            # content-free "  - <file>: error" harness summary line
-            # (AGAST #1324).
-            low = line.lower()
-            if any(tag in low for tag in (
-                "cannot select", "fatal error", "error", "valueerror:",
-                "unknown function", "illegal instruction", "segmentation fault",
-            )):
-                err_first = line.strip()
-                break
-        if not err_first:
-            err_first = err_blob.strip().splitlines()[-1] if err_blob.strip() else "(no output)"
-        print(f"    ✗ {tfile.name} — {err_first[:200]}")
+        err_first = compile_failure_reason(result.stdout, result.stderr)
+        print(f"    ✗ {tfile.name} — {err_first}")
     elif status == "fail":
         # Compiled and ran but some tests failed: name each one and how it
         # failed (AGAST #4052), from the report's "Failures:" block.
@@ -2922,6 +3037,59 @@ def run_test_file(tfile: Path, pkg_dir: Path, test_env: dict,
     else:
         print(f"    ✓ {tfile.name} — {file_passed} passed")
     return outcome
+
+
+_DID_NOT_BUILD = re.compile(r"^\s*- .*?: did not build: (.+)$")
+_HARNESS_SUMMARY_LINE = re.compile(r"^\s*\d+ passed, \d+ failed")
+# Long enough for an absolute path plus the message: the harness's reason
+# names the file absolutely, and under a gate tree's pytest tmpdir the path
+# alone passed the old 200-char cut, dropping the diagnostic (AGAST #2210).
+_REASON_MAX = 1000
+
+
+def _compile_failure_reason(stdout: str, stderr: str) -> str:
+    """The most actionable line of a test file that did not build or run.
+
+    In order: the first line on stderr naming an error, case-insensitively,
+    so the compiler's "Error in <file>: ..." matches (AGAST #1324, #3795);
+    the harness's own `- <file>: did not build: <diagnostic>` line, since
+    stderr does not always carry the diagnostic (a ritz1 child writes to
+    fd 2 directly, past an in-process redirect) (AGAST #2210); the first
+    such line on stdout; the last line. The harness's "0 passed, 0 failed,
+    1 errored" summary names no reason and is never taken.
+    """
+    stdout, stderr = stdout or "", stderr or ""
+
+    def first_error_line(text: str) -> str:
+        for line in text.splitlines():
+            if _HARNESS_SUMMARY_LINE.match(line):
+                continue
+            low = line.lower()
+            if any(tag in low for tag in (
+                "cannot select", "fatal error", "error", "valueerror:",
+                "unknown function", "illegal instruction", "segmentation fault",
+            )):
+                return line.strip()
+        return ""
+
+    reason = first_error_line(stderr)
+    if reason:
+        return reason
+    for line in stdout.splitlines():
+        m = _DID_NOT_BUILD.match(line)
+        if m:
+            return m.group(1).strip()
+    reason = first_error_line(stdout)
+    if reason:
+        return reason
+    blob = (stderr + stdout).strip()
+    return blob.splitlines()[-1] if blob else "(no output)"
+
+
+def compile_failure_reason(stdout: str, stderr: str) -> str:
+    """_compile_failure_reason, cut to _REASON_MAX (one huge line, e.g. an
+    IR dump, must not flood the test listing)."""
+    return _compile_failure_reason(stdout, stderr)[:_REASON_MAX]
 
 
 def summarize_file_outcomes(outcomes: list[dict]) -> str:
