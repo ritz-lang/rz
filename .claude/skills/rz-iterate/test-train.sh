@@ -615,12 +615,28 @@ out="$(timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
     || { bad "wait keeps waiting through a queued remote gate's non-124 slice (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
 [[ "$(grep -c -- '-- wait ' "$T/ssh-log")" == 3 ]] && ok "wait polled the queued gate until its verdict" \
     || bad "wait polled the queued gate until its verdict ($(grep -c -- '-- wait ' "$T/ssh-log") polls)"
-# Its waiter gone and still no EXIT: a dead gate, no verdict, not a hang.
 kill "$qpid" 2>/dev/null; wait "$qpid" 2>/dev/null
-sed -i '/^EXIT=/d' "$rlog"; echo 1 > "$T/queued-polls"
+
+# 11g. A remote gate's slice is no verdict until its log has EXIT= (AGAST
+# #4116: `wait` printed EXIT=none mid-gate).  Two slices that time out (124)
+# and then EXIT=0: wait keeps waiting.
+polls() { grep -c -- '-- wait ' "$T/ssh-log"; }
+sed -i '/^EXIT=/d' "$rlog"; echo 2 > "$T/queued-polls"; : > "$T/ssh-log"
+out="$(RZ_FAKE_QUEUED_RC=124 timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(polls)" == 3 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" "wait keeps waiting through two timed-out (124) slices to EXIT=0" \
+    || { bad "wait keeps waiting through two timed-out (124) slices to EXIT=0 (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# A slice that ends 0 while the log has no EXIT= (the gate still running, its
+# unit missed by alive()) is polled again, not printed as EXIT=none.
+sed -i '/^EXIT=/d' "$rlog"; echo 1 > "$T/queued-polls"; : > "$T/ssh-log"
+out="$(RZ_FAKE_QUEUED_RC=0 timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(polls)" == 2 && "$out" != *EXIT=none* ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" "a slice that ends 0 with no EXIT= in the log is polled again" \
+    || { bad "a slice that ends 0 with no EXIT= in the log is polled again (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# Its waiter gone and never an EXIT: a dead gate, no verdict (non-zero), not
+# a hang, after 5 polls.
+sed -i '/^EXIT=/d' "$rlog"; echo 99 > "$T/queued-polls"; : > "$T/ssh-log"
 out="$(timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
-[[ $rc -eq 98 ]] && has "$out" "EXIT=none" "a queued remote gate whose waiter died is no verdict, not a hang" \
-    || bad "a queued remote gate whose waiter died is no verdict, not a hang (rc=$rc)"
+[[ $rc -eq 98 && "$(polls)" == 5 ]] && has "$out" "EXIT=none" "a remote gate that dies with no verdict exits 98 after 5 polls, not a hang" \
+    || bad "a remote gate that dies with no verdict exits 98 after 5 polls, not a hang (rc=$rc, $(polls) polls)"
 rm -f "$T/queued-polls" "$(dirname "$rlog")/.gate-queue"; echo EXIT=0 >> "$rlog"
 bash "$TR" wait "$llog" >/dev/null 2>&1
 bash "$TR" land "$log1" >/dev/null 2>&1
