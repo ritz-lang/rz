@@ -136,53 +136,64 @@ impl Interpreter
 
         Ok(())
 
-    # Execute a single instruction
+    # Execute a single instruction. Dispatch walks the opcode families in
+    # turn; each family fn returns Ok(true) when it handled the opcode.
+    # Opcodes no family handles are skipped (a full implementation would
+    # handle all ~200).
     fn execute_instruction(self:&, opcode: u8, program: Span<u8>) -> Result<(), StrView>
-        # Push instructions
+        if self.exec_push(opcode, program)?
+            return Ok(())
+        if self.exec_stack(opcode)?
+            return Ok(())
+        if self.exec_arith(opcode)?
+            return Ok(())
+        if self.exec_logic(opcode)?
+            return Ok(())
+        if self.exec_gstate(opcode)?
+            return Ok(())
+        if self.exec_storage(opcode)?
+            return Ok(())
+        self.exec_flow(opcode, program)?
+        Ok(())
+
+    # Push family: PUSHB[n], PUSHW[n], NPUSHB, NPUSHW
+    fn exec_push(self:&, opcode: u8, program: Span<u8>) -> Result<bool, StrView>
         if opcode >= 0xB0 and opcode <= 0xB7
-            # PUSHB[n]: push n+1 bytes
-            let n = (opcode - 0xB0 + 1) as usize
-            for i in 0..n
-                let byte = program[self.pc] as i32
-                self.push(byte)?
-                self.pc = self.pc + 1
-            return Ok(())
-
-        if opcode >= 0xB8 and opcode <= 0xBF
-            # PUSHW[n]: push n+1 words
-            let n = (opcode - 0xB8 + 1) as usize
-            for i in 0..n
-                let hi = program[self.pc] as i32
-                let lo = program[self.pc + 1] as i32
-                let raw = (hi << 8) | lo
-                # Sign extend
-                let word = if raw > 32767 then raw - 65536 else raw
-                self.push(word)?
-                self.pc = self.pc + 2
-            return Ok(())
-
-        if opcode == NPUSHB
+            self.push_bytes((opcode - 0xB0 + 1) as usize, program)?
+        else if opcode >= 0xB8 and opcode <= 0xBF
+            self.push_words((opcode - 0xB8 + 1) as usize, program)?
+        else if opcode == NPUSHB
             let n = program[self.pc] as usize
             self.pc = self.pc + 1
-            for i in 0..n
-                let byte = program[self.pc] as i32
-                self.push(byte)?
-                self.pc = self.pc + 1
-            return Ok(())
-
-        if opcode == NPUSHW
+            self.push_bytes(n, program)?
+        else if opcode == NPUSHW
             let n = program[self.pc] as usize
             self.pc = self.pc + 1
-            for i in 0..n
-                let hi = program[self.pc] as i32
-                let lo = program[self.pc + 1] as i32
-                let raw = (hi << 8) | lo
-                let word = if raw > 32767 then raw - 65536 else raw
-                self.push(word)?
-                self.pc = self.pc + 2
-            return Ok(())
+            self.push_words(n, program)?
+        else
+            return Ok(false)
+        Ok(true)
 
-        # Stack operations
+    # Push n unsigned bytes from the instruction stream
+    fn push_bytes(self:&, n: usize, program: Span<u8>) -> Result<(), StrView>
+        for i in 0..n
+            self.push(program[self.pc] as i32)?
+            self.pc = self.pc + 1
+        Ok(())
+
+    # Push n sign-extended big-endian words from the instruction stream
+    fn push_words(self:&, n: usize, program: Span<u8>) -> Result<(), StrView>
+        for i in 0..n
+            let hi = program[self.pc] as i32
+            let lo = program[self.pc + 1] as i32
+            let raw = (hi << 8) | lo
+            let word = if raw > 32767 then raw - 65536 else raw
+            self.push(word)?
+            self.pc = self.pc + 2
+        Ok(())
+
+    # Stack family: POP, DUP, SWAP, CLEAR, DEPTH
+    fn exec_stack(self:&, opcode: u8) -> Result<bool, StrView>
         match opcode
             POP => self.pop()?
             DUP =>
@@ -196,8 +207,12 @@ impl Interpreter
                 self.push(b)?
             CLEAR => self.stack.clear()
             DEPTH => self.push(self.stack.len() as i32)?
+            _ => return Ok(false)
+        Ok(true)
 
-            # Arithmetic
+    # Arithmetic family (F26Dot6): ADD, SUB, MUL, DIV, ABS, NEG, FLOOR, CEILING
+    fn exec_arith(self:&, opcode: u8) -> Result<bool, StrView>
+        match opcode
             ADD =>
                 let a = self.pop()?
                 let b = self.pop()?
@@ -230,109 +245,78 @@ impl Interpreter
             CEILING =>
                 let v = self.pop()?
                 self.push((v + 63) & (~63 as i32))?
+            _ => return Ok(false)
+        Ok(true)
 
-            # Comparisons
-            LT =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if b < a then 1 else 0)?
-            LTEQ =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if b <= a then 1 else 0)?
-            GT =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if b > a then 1 else 0)?
-            GTEQ =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if b >= a then 1 else 0)?
-            EQ =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if a == b then 1 else 0)?
-            NEQ =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if a != b then 1 else 0)?
-            AND =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if a != 0 and b != 0 then 1 else 0)?
-            OR =>
-                let a = self.pop()?
-                let b = self.pop()?
-                self.push(if a != 0 or b != 0 then 1 else 0)?
-            NOT =>
-                let v = self.pop()?
-                self.push(if v == 0 then 1 else 0)?
+    # Comparison and logic family: LT, LTEQ, GT, GTEQ, EQ, NEQ, AND, OR, NOT
+    fn exec_logic(self:&, opcode: u8) -> Result<bool, StrView>
+        if opcode == NOT
+            let v = self.pop()?
+            self.push(if v == 0 then 1 else 0)?
+            return Ok(true)
+        if not is_binary_logic_op(opcode)
+            return Ok(false)
+        let a = self.pop()?
+        let b = self.pop()?
+        let r = match opcode
+            LT => b < a
+            LTEQ => b <= a
+            GT => b > a
+            GTEQ => b >= a
+            EQ => a == b
+            NEQ => a != b
+            AND => a != 0 and b != 0
+            _ => a != 0 or b != 0  # OR
+        self.push(if r then 1 else 0)?
+        Ok(true)
 
-            # Graphics state
-            SRP0 =>
-                let p = self.pop()? as u16
-                self.gs.rp0 = p
-            SRP1 =>
-                let p = self.pop()? as u16
-                self.gs.rp1 = p
-            SRP2 =>
-                let p = self.pop()? as u16
-                self.gs.rp2 = p
-            SLOOP =>
-                let n = self.pop()? as u32
-                self.gs.loop_count = n
+    # Graphics state and measurement family: SRP0-2, SLOOP, MPPEM, MPS
+    fn exec_gstate(self:&, opcode: u8) -> Result<bool, StrView>
+        match opcode
+            SRP0 => self.gs.rp0 = self.pop()? as u16
+            SRP1 => self.gs.rp1 = self.pop()? as u16
+            SRP2 => self.gs.rp2 = self.pop()? as u16
+            SLOOP => self.gs.loop_count = self.pop()? as u32
+            MPPEM => self.push(self.ppem as i32)?
+            # Point size - approximate as ppem
+            MPS => self.push(self.ppem as i32)?
+            _ => return Ok(false)
+        Ok(true)
 
-            # CVT access
+    # Storage family: RCVT, WCVTP (control value table), RS, WS (storage
+    # area). Out-of-range reads yield 0; out-of-range writes are dropped.
+    fn exec_storage(self:&, opcode: u8) -> Result<bool, StrView>
+        match opcode
             RCVT =>
                 let idx = self.pop()? as usize
-                if idx < self.cvt.len()
-                    self.push(self.cvt[idx])?
-                else
-                    self.push(0)?
+                self.push(if idx < self.cvt.len() then self.cvt[idx] else 0)?
             WCVTP =>
                 let val = self.pop()?
                 let idx = self.pop()? as usize
                 if idx < self.cvt.len()
                     self.cvt[idx] = val
-
-            # Storage access
             RS =>
                 let idx = self.pop()? as usize
-                if idx < self.storage.len()
-                    self.push(self.storage[idx])?
-                else
-                    self.push(0)?
+                self.push(if idx < self.storage.len() then self.storage[idx] else 0)?
             WS =>
                 let val = self.pop()?
                 let idx = self.pop()? as usize
                 if idx < self.storage.len()
                     self.storage[idx] = val
+            _ => return Ok(false)
+        Ok(true)
 
-            # Measurements
-            MPPEM =>
-                self.push(self.ppem as i32)?
-            MPS =>
-                # Point size - approximate as ppem
-                self.push(self.ppem as i32)?
-
-            # Control flow
+    # Control flow family: IF, ELSE, EIF
+    fn exec_flow(self:&, opcode: u8, program: Span<u8>) -> Result<bool, StrView>
+        match opcode
             IF =>
-                let cond = self.pop()?
-                if cond == 0
+                if self.pop()? == 0
                     self.skip_to_else_or_eif(program)?
-            ELSE =>
-                # If we reach ELSE during execution, skip to EIF
-                self.skip_to_eif(program)?
-            EIF =>
-                pass  # End of conditional block
-
-            # Default: unimplemented instruction
-            _ =>
-                # For now, just skip unknown instructions
-                # A full implementation would handle all ~200 opcodes
-                pass
-
-        Ok(())
+            # Reaching ELSE during execution means the then-branch ran: skip to EIF
+            ELSE => self.skip_to_eif(program)?
+            EIF => pass  # End of conditional block
+            _ => return Ok(false)
+        Ok(true)
 
     # Stack helpers
     fn push(self:&, value: i32) -> Result<(), StrView>
@@ -397,6 +381,10 @@ impl Interpreter
             let n = program[self.pc] as usize
             self.pc = self.pc + 1 + n * 2
 
+# The two-operand comparison/logic opcodes exec_logic handles (NOT is unary)
+fn is_binary_logic_op(opcode: u8) -> bool
+    (opcode >= LT and opcode <= NEQ) or opcode == AND or opcode == OR
+
 # Tests
 
 [[test]]
@@ -456,4 +444,130 @@ fn test_interpreter_comparison() -> i32
     interp.execute(@program).unwrap()
     assert interp.pop().unwrap() == 1  # true
 
+    0
+
+# Per-family dispatch tests (AGAST #3939): each opcode family routed out of
+# execute_instruction has a test that goes red if its routing breaks.
+
+[[test]]
+fn test_interpreter_push_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    let program: [11]u8 = [
+        0xB8, 0xFF, 0xFE,     # PUSHW[1] 0xFFFE -> -2 (sign extended)
+        0x40, 2, 7, 9,        # NPUSHB 2: 7, 9
+        0x41, 1, 0x01, 0x00   # NPUSHW 1: 256
+    ]
+    interp.execute(@program).unwrap()
+    assert interp.pop().unwrap() == 256
+    assert interp.pop().unwrap() == 9
+    assert interp.pop().unwrap() == 7
+    assert interp.pop().unwrap() == -2
+    0
+
+[[test]]
+fn test_interpreter_stack_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    let program: [8]u8 = [
+        0xB2, 5, 6, 7,  # PUSHB[3]
+        0x23,           # SWAP -> 5 7 6
+        0x20,           # DUP  -> 5 7 6 6
+        0x21,           # POP  -> 5 7 6
+        0x24            # DEPTH -> 5 7 6 3
+    ]
+    interp.execute(@program).unwrap()
+    assert interp.pop().unwrap() == 3
+    assert interp.pop().unwrap() == 6
+    assert interp.pop().unwrap() == 7
+    assert interp.pop().unwrap() == 5
+    let clear_prog: [5]u8 = [0xB1, 1, 2, 0x22, 0x24]  # CLEAR, DEPTH
+    interp.execute(@clear_prog).unwrap()
+    assert interp.pop().unwrap() == 0
+    0
+
+[[test]]
+fn test_interpreter_arith_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    let program: [12]u8 = [
+        0xB1, 100, 30, 0x61,  # SUB -> 70
+        0xB1, 128, 64, 0x62,  # DIV -> 128*64/64 = 128
+        0xB0, 100, 0x66,      # FLOOR -> 64
+        0x65                  # NEG -> -64
+    ]
+    interp.execute(@program).unwrap()
+    assert interp.pop().unwrap() == -64
+    assert interp.pop().unwrap() == 128
+    assert interp.pop().unwrap() == 70
+    let ceil_prog: [3]u8 = [0xB0, 65, 0x67]  # CEILING -> 128
+    interp.execute(@ceil_prog).unwrap()
+    assert interp.pop().unwrap() == 128
+    let div0: [4]u8 = [0xB1, 5, 0, 0x62]
+    assert interp.execute(@div0).is_err()
+    0
+
+[[test]]
+fn test_interpreter_logic_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    let program: [13]u8 = [
+        0xB1, 1, 0, 0x5A,  # AND -> 0
+        0x5C,              # NOT -> 1
+        0xB1, 4, 4, 0x54,  # EQ -> 1
+        0xB1, 0, 3, 0x5B   # OR -> 1
+    ]
+    interp.execute(@program).unwrap()
+    assert interp.stack.len() == 3
+    assert interp.pop().unwrap() == 1
+    assert interp.pop().unwrap() == 1
+    assert interp.pop().unwrap() == 1
+    0
+
+[[test]]
+fn test_interpreter_storage_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    var cvt = vec_new<i32>()
+    cvt.push(0)
+    cvt.push(0)
+    interp.init(cvt, 4, 0)
+    let program: [17]u8 = [
+        0xB1, 2, 99, 0x42,  # WS storage[2] = 99
+        0xB0, 2, 0x43,      # RS storage[2]
+        0xB1, 1, 77, 0x44,  # WCVTP cvt[1] = 77
+        0xB0, 1, 0x45,      # RCVT cvt[1]
+        0xB0, 9, 0x43       # RS out of range -> 0
+    ]
+    interp.execute(@program).unwrap()
+    assert interp.pop().unwrap() == 0
+    assert interp.pop().unwrap() == 77
+    assert interp.pop().unwrap() == 99
+    0
+
+[[test]]
+fn test_interpreter_gstate_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    interp.set_size(12)
+    let program: [6]u8 = [
+        0xB1, 3, 4,  # PUSHB[2] 3, 4
+        0x10,        # SRP0 <- 4
+        0x17,        # SLOOP <- 3
+        0x4B         # MPPEM -> 12
+    ]
+    interp.execute(@program).unwrap()
+    assert interp.gs.rp0 == 4
+    assert interp.gs.loop_count == 3
+    assert interp.pop().unwrap() == 12
+    0
+
+[[test]]
+fn test_interpreter_flow_family() -> i32
+    var interp = Interpreter.new(HintingMode.Normal)
+    # IF false: skip the then-branch (its PUSHB data byte is IF's opcode,
+    # which must not count as nesting), run the else-branch.
+    let skip_prog: [9]u8 = [0xB0, 0, 0x58, 0xB0, 0x58, 0x1B, 0xB0, 7, 0x59]
+    interp.execute(@skip_prog).unwrap()
+    assert interp.stack.len() == 1
+    assert interp.pop().unwrap() == 7
+    # IF true: run the then-branch, skip the else-branch.
+    let take_prog: [9]u8 = [0xB0, 1, 0x58, 0xB0, 5, 0x1B, 0xB0, 6, 0x59]
+    interp.execute(@take_prog).unwrap()
+    assert interp.stack.len() == 1
+    assert interp.pop().unwrap() == 5
     0
