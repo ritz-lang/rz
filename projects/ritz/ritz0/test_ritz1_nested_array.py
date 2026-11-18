@@ -986,6 +986,171 @@ pub fn main() -> i32
         return 3
     return get(@g, 1, 2) + p[1][0] + (*q)[1][2] + GG[1][2] + 5
 """,
+    # AGAST #3635: a `*[N][M]T` held anywhere else than a param or a typed
+    # local is the same plane pointer: a struct field (ritz0 reads through
+    # `s.p[i][j]` only; a store through it and `(*s.p)[i][j]` crash it, #4123)
+    # ...
+    "pointee_field": """\
+struct S
+    k: i32
+    p: *[2][3]i32
+
+fn get(s: *S, i: i32, j: i32) -> i32
+    return s.p[i][j]
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = i * 3 + j
+    var s: S = S { k: 1, p: @g }
+    let q: *[2][3]i32 = s.p
+    q[1][2] = 30
+    var t: S = S { k: 2, p: null }
+    if t.p != null
+        return 1
+    t.p = @g
+    if s.p[0][1] != 1 or t.p[1][0] != 3 or s.p[0][2] != 2
+        return 2
+    return get(@s, 1, 2) + s.p[1][1] + t.p[1][0] + s.k + t.k + 2
+""",
+    # ... a global, null until assigned, written through in another fn ...
+    "pointee_global": """\
+var GA: [2][3]i32
+var gp: *[2][3]i32 = null
+
+fn bump(i: i32, j: i32)
+    gp[i][j] += 1
+
+pub fn main() -> i32
+    if gp != null
+        return 1
+    gp = @GA
+    gp[1][2] = 30
+    (*gp)[0][1] = 7
+    bump(0, 1)
+    if GA[1][2] != 30 or GA[0][1] != 8 or GA[1][1] != 0
+        return 2
+    return gp[1][2] + (*gp)[0][1] + 4
+""",
+    # ... a return type, held typed, inferred (`let q = whole()`) and assigned ...
+    "pointee_return": """\
+var GA: [2][3]i32
+
+fn at(g: *[2][3]i32) -> *[2][3]i32
+    return g
+
+fn whole() -> *[2][3]i32
+    return @GA
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = 0
+    let p: *[2][3]i32 = at(@g)
+    p[1][2] = 30
+    let q = whole()
+    q[0][1] = 8
+    var r: *[2][3]i32 = null
+    r = whole()
+    r[1][0] = 2
+    if g[1][2] != 30 or GA[0][1] != 8 or GA[1][0] != 2 or g[0][1] != 0
+        return 1
+    return p[1][2] + q[0][1] + r[1][0] + 2
+""",
+    # ... a `**[N][M]T` local and param: `(*q)[i][j]` is element (i, j) of the
+    # array `*q` points at, and `*q` is a `*[N][M]T` ...
+    "pointee_ptr_ptr": """\
+fn set(pp: **[2][3]i32, v: i32)
+    (*pp)[1][1] = v
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = 0
+    var p: *[2][3]i32 = @g
+    var q: **[2][3]i32 = @p
+    (*q)[1][2] = 30
+    let r: *[2][3]i32 = *q
+    r[0][1] = 5
+    set(@p, 4)
+    var n: **[2][3]i32 = null
+    if n != null
+        return 1
+    if g[1][2] != 30 or g[0][1] != 5 or g[1][1] != 4 or g[0][2] != 0
+        return 2
+    return g[1][2] + g[0][1] + g[1][1] + 3
+""",
+    # ... and `let c = *p` copies the whole `[N][M]T`, typed or not, through a
+    # local, a global, a field, a call and a `**`: later stores to `g` and `GA`
+    # don't reach the copies, and `c[i][j]` indexes the copy's shape, not a
+    # flat `[6]i32`.
+    "pointee_deref_copy": """\
+var GA: [2][3]i32
+var gp: *[2][3]i32 = null
+
+struct H
+    p: *[2][3]i32
+
+fn mk() -> *[2][3]i32
+    return @GA
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = i * 3 + j
+            GA[i][j] = 10 + i * 3 + j
+    let p: *[2][3]i32 = @g
+    let c: [2][3]i32 = *p
+    let c2 = *p
+    gp = @GA
+    let d = *gp
+    let h: H = H { p: @g }
+    let e = *h.p
+    let f = *mk()
+    var q: **[2][3]i32 = @p
+    let k = **q
+    g[1][2] = 0
+    GA[1][2] = 0
+    if c[1][2] != 5 or d[1][2] != 15 or e[1][2] != 5 or f[1][2] != 15 or k[1][2] != 5 or c2[1][2] != 5 or c2[1][0] != 3
+        return 1
+    return c[1][1] + d[0][1] + mk()[0][2] + 15
+""",
+    # ... a step `*(p + k)` copies the plane k past p's ...
+    "pointee_deref_copy_step": """\
+pub fn main() -> i32
+    var g: [2][2][3]i32
+    for i in 0..2
+        for j in 0..2
+            for k in 0..3
+                g[i][j][k] = 6 * i + 3 * j + k
+    let p: *[2][3]i32 = @g[0]
+    let c = *(p + 1)
+    g[1][1][2] = 0
+    return c[1][2] + c[0][0] + 25
+""",
+    # ... and `h = *p` assigns the whole array, into a local and a global.
+    "pointee_deref_assign": """\
+var GH: [2][3]i32
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = i * 3 + j
+    var h: [2][3]i32
+    let p: *[2][3]i32 = @g
+    h = *p
+    GH = *p
+    g[1][2] = 0
+    let k: [2][3]i32 = *(p + 0)
+    if h[1][2] != 5 or GH[1][2] != 5 or h[0][1] != 1 or k[1][2] != 0
+        return 1
+    return h[1][2] + GH[1][1] + h[1][0] + 30
+""",
     # ... rank 3 (`[2][3][4]u8`, cell 12i + 4j + k), a struct leaf through a
     # param (`q[i][1].a`, `(*q)[i][0].b`), and an uninitialised local assigned.
     "pointee_3d_struct_leaf": """\
@@ -1289,33 +1454,22 @@ def test_ritz1_nested_array(ritz1_bin, tmp_path, name):
 # error naming the source line, never a silent `[N x i64]` (AGAST #1509).
 # `needle` is the `:line:` the error must name.
 FAIL_CLOSED = {
-    # AGAST #2098: a `*[N][M]T` param or local is lowered (RUNNABLE
-    # "pointee"); every other site that holds one is still refused.
-    "pointee_field": ("""\
-struct S
-    p: *[2][3]i32
-
+    # AGAST #2098 / #3635: a `*[N][M]T` param, local, field, global, return
+    # and `**[N][M]T` local or param are lowered (RUNNABLE "pointee*"); an
+    # array of them and a cast to one still go through type_ptr, refused (#4122).
+    "pointee_array_elem": ("""\
 pub fn main() -> i32
+    var g: [2][3]i32
+    var a: [2]*[2][3]i32
+    a[0] = @g
     return 0
-""", ":2:", "multi-dimensional array type is not supported as a pointee"),
-    "pointee_ptr_ptr": ("""\
+""", ":3:", "multi-dimensional array type is not supported as a pointee"),
+    "pointee_cast": ("""\
 pub fn main() -> i32
-    var q: **[2][3]i32 = null
+    var g: [6]i32
+    let p = @g as *[2][3]i32
     return 0
-""", ":2:", "multi-dimensional array type is not supported as a pointee"),
-    "pointee_global": ("""\
-var gp: *[2][3]i32 = null
-
-pub fn main() -> i32
-    return 0
-""", ":1:", "multi-dimensional array type is not supported as a pointee"),
-    "pointee_return": ("""\
-fn f(x: *u8) -> *[2][3]i32
-    return null
-
-pub fn main() -> i32
-    return 0
-""", ":1:", "multi-dimensional array type is not supported as a pointee"),
+""", ":3:", "multi-dimensional array type is not supported as a pointee"),
     # ... an address of another shape, or of a 1-D array, as ritz0 refuses it.
     "pointee_shape_mismatch": ("""\
 pub fn main() -> i32
@@ -1331,16 +1485,22 @@ pub fn main() -> i32
     var g: [6]i32
     return f(@g)
 """, ":6:", "a reference to one type doesn't fit a reference to another"),
-    # ... and a copy of the whole array behind one: ritz1's `[N]T` copy would be
-    # the flat `[N*M]T`.
-    "pointee_deref_copy": ("""\
+    # AGAST #3635: `let c = *p` copies, but not move-only elements out from
+    # behind the pointer, as ritz0 refuses it.
+    "pointee_deref_copy_move_only": ("""\
+struct S
+    x: i32
+
+impl Drop for S
+    fn drop(self:& S)
+        self.x = 0
+
 pub fn main() -> i32
-    var g: [2][3]i32
-    g[1][2] = 40
-    let p: *[2][3]i32 = @g
+    var g: [1][2]S = [ [S { x: 1 }, S { x: 2 }] ]
+    let p: *[1][2]S = @g
     let c = *p
-    return c[1][2]
-""", ":5:", "copying the multi-dimensional array a pointer points at"),
+    return c[0][1].x
+""", ":11:", "moves its move-only elements out from behind the pointer"),
     # AGAST #2097: field_new keeps an N-D shape now, but an enum payload
     # binding has no N-D lowering (`A(g) => g[1][2]` loaded the payload as
     # an i64 and indexed it as a byte pointer), so both payload forms stay

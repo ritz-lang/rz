@@ -431,12 +431,24 @@ param -> *Param
     # AGAST #3930: `*mut T` (LANGUAGE_SPEC §5) is `*T`, as in ritz0, here and
     # at every other `STAR type_spec`.
     | IDENT COLON STAR MUT type_spec { param_new(p, $1.start, $1.len, type_ptr_nd(p, $5), $1.line, $1.col) }
+    # AGAST #3635: and `name: **[N][M]T`, whose `*name` is the `*[N][M]T`.
+    # Before `STAR type_spec`, whose type_spec would take the inner `*`.
+    | IDENT COLON STAR STAR type_spec { param_new(p, $1.start, $1.len, type_ptr_nd(p, type_ptr_nd(p, $5)), $1.line, $1.col) }
     | IDENT COLON STAR type_spec { param_new(p, $1.start, $1.len, type_ptr_nd(p, $4), $1.line, $1.col) }
     | IDENT COLON type_spec { param_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
     ;
 
 return_type -> i32
-    : ARROW type_spec { capture_fn_return_type(p, $2) }
+    : ARROW ptr_nd_type { capture_fn_return_type(p, $2) }   # AGAST #3635
+    | ARROW type_spec { capture_fn_return_type(p, $2) }
+    ;
+
+# AGAST #3635: `*T` / `*mut T` where an N-D T `[N][M]..T` is lowered
+# (type_ptr_nd): a field, a global and a return type record its shape
+# (ptr_array_of_last).  Tried before type_spec at each of those sites.
+ptr_nd_type -> i32
+    : STAR MUT type_spec { type_ptr_nd(p, $3) }
+    | STAR type_spec { type_ptr_nd(p, $2) }
     ;
 
 # Struct definition (with optional generic params)
@@ -472,6 +484,8 @@ struct_field -> *StructField
     # lib/tab_renderer.ritz (AGAST #1598).
     : name COLON_AMP type_spec NEWLINE
       { field_new(p, $1.start, $1.len, type_mut_ref(p, $3), $1.line, $1.col) }
+    | name COLON ptr_nd_type NEWLINE   # AGAST #3635: `p: *[N][M]T`
+      { field_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
     | name COLON type_spec NEWLINE
       { field_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
     ;
@@ -545,13 +559,13 @@ global_var_def -> *GlobalVarDef
       { extern_var_init_refused(p, $3.start, $3.len, $1.line, $1.col) }
     | PUB EXTERN VAR IDENT COLON type_spec NEWLINE
       { extern_var_new(p, $4.start, $4.len, $6, $1.line, $1.col) }
-    | VAR IDENT COLON type_spec ASSIGN expr NEWLINE
+    | VAR IDENT COLON global_type ASSIGN expr NEWLINE
       { global_var_new(p, $2.start, $2.len, $4, $6, $1.line, $1.col) }
-    | VAR IDENT COLON type_spec NEWLINE
+    | VAR IDENT COLON global_type NEWLINE
       { global_var_new(p, $2.start, $2.len, $4, 0 as *Expr, $1.line, $1.col) }
-    | PUB VAR IDENT COLON type_spec ASSIGN expr NEWLINE
+    | PUB VAR IDENT COLON global_type ASSIGN expr NEWLINE
       { global_var_new(p, $3.start, $3.len, $5, $7, $1.line, $1.col) }
-    | PUB VAR IDENT COLON type_spec NEWLINE
+    | PUB VAR IDENT COLON global_type NEWLINE
       { global_var_new(p, $3.start, $3.len, $5, 0 as *Expr, $1.line, $1.col) }
     # `var g = true` (LARB R38, spec §4.3, #3375): a global's type is written,
     # never read off its initializer.  Parsed only to refuse it, located at
@@ -560,6 +574,12 @@ global_var_def -> *GlobalVarDef
       { global_var_untyped_refused(p, $2.start, $2.len, $4, $3.line, $3.col, $1.line, $1.col) }
     | PUB VAR IDENT ASSIGN expr NEWLINE
       { global_var_untyped_refused(p, $3.start, $3.len, $5, $4.line, $4.col, $1.line, $1.col) }
+    ;
+
+# AGAST #3635: a global's type, `*[N][M]T` included (ptr_nd_type).
+global_type -> i32
+    : ptr_nd_type { $1 }
+    | type_spec { $1 }
     ;
 
 module_path -> *ImportPath
@@ -981,6 +1001,8 @@ var_stmt -> *Stmt
     # AGAST #3930: the same for `var p: *mut [N][M]T`.
     | VAR binding_name COLON STAR MUT type_spec NEWLINE
       { stmt_named(stmt_var_decl(p, $2.start, $2.len, capture_var_type(p, type_ptr_nd(p, $6)), 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
+    | VAR binding_name COLON STAR STAR type_spec NEWLINE   # AGAST #3635
+      { stmt_named(stmt_var_decl(p, $2.start, $2.len, capture_var_type(p, type_ptr_nd(p, type_ptr_nd(p, $6))), 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
     | VAR binding_name COLON STAR type_spec NEWLINE
       { stmt_named(stmt_var_decl(p, $2.start, $2.len, capture_var_type(p, type_ptr_nd(p, $5)), 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
     | VAR binding_name COLON type_spec NEWLINE
@@ -993,6 +1015,7 @@ var_stmt -> *Stmt
 # This prevents the type name from being clobbered when parsing the initializer expression
 var_type -> i32
     : STAR MUT type_spec { capture_var_type(p, type_ptr_nd(p, $3)) }   # AGAST #3930
+    | STAR STAR type_spec { capture_var_type(p, type_ptr_nd(p, type_ptr_nd(p, $3))) }   # AGAST #3635
     | STAR type_spec { capture_var_type(p, type_ptr_nd(p, $2)) }   # AGAST #2098
     | type_spec { capture_var_type(p, $1) }
     ;

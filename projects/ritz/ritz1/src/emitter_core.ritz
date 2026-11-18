@@ -4601,21 +4601,64 @@ pub fn nd_struct_leaf(s: *EmitterState, e: *Expr) -> *StructDef
 # nd_array_name_shape: that one says the name IS an array (whole-array
 # assignment, argument dims), which a pointer isn't.
 # AGAST #2098: `*q` too, the whole `[M][N]..T` q points at, so `(*q)[i][j]` is
-# `q[i][j]` (plane_ptr_ident gives the q to load).
+# `q[i][j]`.
+#
+# AGAST #3635: and a `*[N][M]..T` held elsewhere: a field `s.p`, a global `gp`
+# or a call `f()` (base_ptr_array, which records the shape), or `*` of one;
+# and `*r`, r a `**[N][M]..T` local or param (r itself is no plane pointer).
+# emit_plane_ptr loads the pointer each of these is.
 pub fn plane_ptr_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
-    let q: *Expr = plane_ptr_ident(e)
-    if q == null or q.kind != EXPR_IDENT
+    if e == null
         return null
-    let lv: *LocalVar = find_local_struct_name(s, q.ident_ptr, q.ident_len)
-    if lv == null
+    var x: *Expr = e
+    var deref: i32 = 0
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+        x = e.operand
+        deref = 1
+    if x.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if lv != null
+            if lv.var_type == TYPE_PTR_PTR and deref == 0
+                return null
+            return lv.pointee_array_shape
+    let pa: *Param = base_ptr_array(s, x)
+    if pa == null or pa.param_type != TYPE_PTR
         return null
-    lv.pointee_array_shape
+    pa.param_pointee_array_shape
 
-# AGAST #2098: the q of a `*q` base, else `e` itself.
-pub fn plane_ptr_ident(e: *Expr) -> *Expr
-    if e != null and e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null and e.operand.kind == EXPR_IDENT
-        return e.operand
-    e
+# AGAST #2098 / #3635: the `ptr` a plane_ptr_shape base `e` is, in a register:
+# a local's slot loaded (twice for `*r`, r a `**`), else `e` (or the X of a
+# `*X`) evaluated.
+pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
+    var x: *Expr = e
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+        x = e.operand
+    if x.kind == EXPR_IDENT
+        let lv: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
+        if lv != null
+            var r: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, r)
+            emit_str(s, c" = load ptr, ptr ")
+            emit_reg(s, lv.reg)
+            emit_str(s, c"\n")
+            if lv.var_type == TYPE_PTR_PTR
+                let r2: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, r2)
+                emit_str(s, c" = load ptr, ptr ")
+                emit_reg(s, r)
+                emit_str(s, c"\n")
+                r = r2
+            return r
+    let v: i32 = emit_expr(s, x)
+    let ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr)
+    emit_str(s, c" = inttoptr i64 ")
+    emit_reg(s, v)
+    emit_str(s, c" to ptr\n")
+    ptr
 
 # AGAST #2570: the plane `e`, an index chain two or more short of its N-D
 # array's rank, names: the dims after the chain, and the leaf.  `@x[i]` with
