@@ -431,6 +431,42 @@ def test_a_literal_arm_takes_the_declared_type(tmp_path):
 
 
 @pytest.mark.unit
+def test_a_literal_arm_takes_the_type_of_every_narrowing_slot(tmp_path):
+    """AGAST #4164: #1444's slots, not just let / var / return.
+
+    An assignment, a call argument and a fn's tail are narrowing-checked too,
+    so a literal arm merged at i64 there was a round-trip that loses no bits.
+    (`m += if ...` is `m = m + (if ...)`: an if under an operator, which keeps
+    its i64 arms as it does in a `let`.)
+    """
+    ir_text = _emit_ir(tmp_path, (
+        "fn take_i32(v: i32) -> i32\n"
+        "    v\n"
+        "\n"
+        "fn assign(a: i32, b: i32) -> i32\n"
+        "    var m: i32 = b\n"
+        "    m = if a < b then a else 255\n"
+        "    m\n"
+        "\n"
+        "fn arg(a: i32, b: i32) -> i32\n"
+        "    take_i32(if a < b then a else 255)\n"
+        "\n"
+        "fn tail(a: i32, b: i32) -> i32\n"
+        "    if a < b then a else 255\n"
+        "\n"
+        "fn take_u32(v: u32) -> u32\n"
+        "    v\n"
+        "\n"
+        "fn arg_u32(a: u32, b: u32) -> u32\n"
+        "    take_u32(if a < b then a else 4000000000)\n"
+    ))
+    # arg_u32: the arm fits the slot only read as unsigned.
+    for fn in ("assign", "arg", "tail", "arg_u32"):
+        body = _body(ir_text, fn)
+        assert _no_round_trip(body), f"{fn}: an arm was computed in i64: {body}"
+
+
+@pytest.mark.unit
 def test_an_operator_in_an_arm_takes_the_declared_type(tmp_path):
     """`1 << n` in an arm is #1396's left-literal shift, in the slot's width."""
     ir_text = _emit_ir(tmp_path, (
@@ -511,7 +547,22 @@ def test_literal_arms_give_the_same_answers(tmp_path):
         "    let m: i8 = if a < 0 then -128 else a\n"
         "    return m\n"
         "\n"
+        "fn id8(v: i8) -> i8\n"
+        "    v\n"
+        "\n"
+        "fn assign(a: i8) -> i8\n"
+        "    var m: i8 = a\n"
+        "    m = if a < 0 then -128 else a\n"
+        "    m\n"
+        "\n"
+        "fn tail(a: i8) -> i8\n"
+        "    id8(if a < 0 then -128 else a)\n"
+        "\n"
         "fn main() -> i32\n"
+        "    if assign(-1) != -128 or assign(9) != 9\n"
+        "        return 7\n"
+        "    if tail(-1) != -128 or tail(9) != 9\n"
+        "        return 8\n"
         "    if clamp(1000) != 255\n"
         "        return 1\n"
         "    if clamp(-5) != -5\n"

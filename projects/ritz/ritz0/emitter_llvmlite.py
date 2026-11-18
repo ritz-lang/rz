@@ -959,8 +959,9 @@ class LLVMEmitter:
         # assigned, checked by _convert_type when it truncates that value.
         self._assign_narrowing = None
         # #1444: id(phi) -> (phi, its arms before an if/match merge widened them).
-        # And id(BinOp) -> the width of the assignment/argument slot it feeds.
-        self._slot_ctx_widths: Dict[int, int] = {}
+        # And id(BinOp or literal arm) -> (width, unsigned) of the assignment /
+        # argument / fn-tail slot it feeds (#4164: the arm needs the sign).
+        self._slot_ctx_widths: Dict[int, Tuple[int, bool]] = {}
         self._int_merges: Dict[int, Tuple[ir.Value, list]] = {}
 
         # Symbol tables
@@ -1785,14 +1786,26 @@ class LLVMEmitter:
         not fit keeps its i64 and meets the slot's fit check or #1393's
         narrowing check, as it did. The arms merge at the wider of their
         types, so a literal at the slot's width never narrows its sibling.
+
+        AGAST #4164: an assignment, `op=`, call argument or fn tail names its
+        arms in `_slot_ctx_widths` (`_int_slot_context`); a let / var /
+        return through `_literal_ctx_nodes` and the declared type.
         """
         value = self._untyped_int_literal(expr)
         if value is None or isinstance(value, bool):
             return None
-        want = self._expected_int_width()
-        if want is None:
+        slot = self._slot_ctx_widths.get(id(expr))
+        if slot is not None:
+            want, unsigned = slot
+            if want <= 1:
+                return None      # a bool slot: `1` there is still an integer
+        elif id(expr) in getattr(self, '_literal_ctx_nodes', ()):
+            want = self._expected_int_width()
+            if want is None:
+                return None
+            unsigned = self._is_unsigned_type(self.expected_ritz_type)
+        else:
             return None
-        unsigned = self._is_unsigned_type(self.expected_ritz_type)
         if not self._int_literal_fits(value, want, unsigned):
             return None
         return ir.Constant(ir.IntType(want), value)
@@ -1819,15 +1832,18 @@ class LLVMEmitter:
         mask | (1 << r)` with `mask, r: i32` shifts at i32, as `let m: i32 =
         mask | (1 << r)` does, so the two are held to the same §7.5 rule. Keyed
         by node rather than ambient, so a `let` nested in `value` keeps its own.
+        #1445's literal arms come with it (AGAST #4164): `m = if a < b then a
+        else 255` merges at i32, as the `let` does.
         """
         width = self._slot_width(slot) if slot is not None and value is not None else None
         if width is None or width >= 64:
             yield
             return
+        ctx = (width, self._is_unsigned_type(slot))
         saved = {}
         for node in self._arith_context_nodes(value):
             saved[node] = self._slot_ctx_widths.get(node)
-            self._slot_ctx_widths[node] = width
+            self._slot_ctx_widths[node] = ctx
         try:
             yield
         finally:
@@ -1916,7 +1932,8 @@ class LLVMEmitter:
         """
         # An assignment's or argument's slot (#1444, `_int_slot_context`)
         # names its own nodes and width; otherwise the declared type in scope.
-        want = self._slot_ctx_widths.get(id(expr))
+        slot = self._slot_ctx_widths.get(id(expr))
+        want = slot[0] if slot is not None else None
         if want is None:
             want = self._expected_int_width()
             if want is None:
@@ -9709,8 +9726,8 @@ class LLVMEmitter:
 
     def _emit_expr_core(self, expr: rast.Expr) -> ir.Value:
         """Emit an expression (_emit_expr, before temporaries)."""
-        if id(expr) in getattr(self, '_literal_ctx_nodes', ()):
-            # AGAST #1445: a literal arm of an if / match in a typed slot.
+        if id(expr) in self._slot_ctx_widths or id(expr) in getattr(self, '_literal_ctx_nodes', ()):
+            # AGAST #1445 / #4164: a literal arm of an if / match in a typed slot.
             arm = self._literal_at_slot_width(expr)
             if arm is not None:
                 return arm
