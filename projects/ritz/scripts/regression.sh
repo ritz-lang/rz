@@ -1517,9 +1517,23 @@ differential_worker() {
     local RUN_SANDBOX RUN_PORT RUN_TIMEOUT
     example_run_settings "$example_dir" "$name" "$idx"
 
-    # Check if we have Stage 1 results to compare against
+    # No Stage 1 baseline (ritz0 cannot compile it): there is nothing to diff
+    # the output against, and inventing a baseline would be worse than not
+    # comparing.  But the compiler is still ASKED to compile it, and its
+    # accept/reject goes into Stage 5's record.  This used to skip before
+    # compile_with (AGAST #1341), so neither ritz1 nor ritz1_selfhosted ever
+    # saw these examples, they were absent from both accept sets, and a
+    # divergence on them could not turn Stage 5 red.  No allowlist is
+    # consulted: a rejection here is expected (ritz0 rejects it too) and is a
+    # skip either way; only Stage 5 judges it, by comparing the two compilers.
     if [[ ! -f "$BUILD_DIR/stage1_${name}.exit" ]]; then
-        warn "$name: no Stage 1 baseline"
+        local outcome=accepted
+        if injected_selfhosted_reject "$DIFF_COMPILER" "$name" ||
+           ! compile_with "$DIFF_COMPILER" "$example_dir" "$bin" 2>/dev/null; then
+            outcome=rejected
+        fi
+        record_compile_outcome "$DIFF_COMPILER" "$name" "$outcome"
+        warn "$name: no Stage 1 baseline; $DIFF_LABEL $outcome it (recorded for Stage 5, output not compared)"
         _verdict "$out" skip
         return 0
     fi
@@ -1726,6 +1740,18 @@ run_stage4() {
 # means "the two compilers agree on what they accept", never "the compiler
 # is correct".  Shrinking the known-failures lists is what narrows the blind
 # spot; nothing inside this function can.
+#
+# A second door into the same blind spot, now closed (AGAST #1341): an
+# example with no ritz0 baseline was skipped by Stages 3/4 before either
+# compiler was even ASKED to compile it, so it was absent from both sets
+# without anyone having rejected it.  On 2026-09-04 that hid 9 of 80
+# examples while this line printed "fixed point holds (53 examples)".  The
+# workers now compile such examples for the record, and this stage fails if
+# any corpus example lacks an accepted/rejected outcome from either compiler.
+# The pass line names the whole corpus and its split, so "rejected by both"
+# (the blind spot above) is a number in every log rather than a comment here.
+# scripts/test-regression-nobaseline.sh builds a divergence on a no-baseline
+# example and asserts this stage goes red.
 run_stage5() {
     log "STAGE 5: self-hosting fixed-point check (ritz1 vs ritz1_selfhosted)"
     echo "----------------------------------------"
@@ -1742,15 +1768,48 @@ run_stage5() {
         return 0
     fi
 
+    # The denominator (AGAST #1341).  This line used to say "fixed point holds
+    # (N examples)" with N = |accept set|, which on 2026-09-04 was 53 of an
+    # 80-example corpus and never said so.  Now every corpus example must have
+    # an outcome, accepted or rejected, from BOTH compilers.  One that does
+    # not was never asked, and agreement about it is not evidence of anything,
+    # so a gap fails here rather than shrinking the count.
+    local corpus="$BUILD_DIR/stage5_corpus" d k
+    while IFS= read -r d; do
+        example_key "$d"
+    done < <(get_examples) | sort -u > "$corpus"
+    local total unasked=0
+    total=$(grep -c . "$corpus" || true)
+    local c
+    for c in ritz1 ritz1_selfhosted; do
+        while IFS= read -r k; do
+            [[ -n "$k" ]] || continue
+            fail "$k: never compiled by $c (no accept/reject recorded); Stage 5 cannot vouch for it"
+            unasked=$((unasked + 1))
+        done < <(comm -23 "$corpus" <(sort -u "$BUILD_DIR/acceptset_$c.accepted" \
+                                             "$BUILD_DIR/acceptset_$c.rejected"))
+    done
+    if [[ $unasked -gt 0 ]]; then
+        STAGE_RESULTS+=("Stage 5: FAILED - $unasked example/compiler pair(s) of $total examples never compiled")
+        TOTAL_FAILED=$((TOTAL_FAILED + unasked))
+        return 1
+    fi
+
     local only_a only_b
     only_a=$(comm -23 <(sort -u "$a") <(sort -u "$b"))
     only_b=$(comm -13 <(sort -u "$a") <(sort -u "$b"))
 
     if [[ -z "$only_a" && -z "$only_b" ]]; then
-        local n
+        # Every example has an outcome from both and the accept sets match,
+        # so accepted + rejected == total.  "Without a baseline" counts the
+        # examples Stages 3/4 could only compile, not compare.
+        local n nobase=0
         n=$(sort -u "$a" | grep -c . || true)
-        success "ritz1 and ritz1_selfhosted accept an identical set of $n examples"
-        STAGE_RESULTS+=("Stage 5: fixed point holds ($n examples, sets identical)")
+        while IFS= read -r k; do
+            [[ -f "$BUILD_DIR/stage1_${k}.exit" ]] || nobase=$((nobase + 1))
+        done < "$corpus"
+        success "ritz1 and ritz1_selfhosted agree on all $total examples: $n accepted by both, $((total - n)) rejected by both"
+        STAGE_RESULTS+=("Stage 5: fixed point holds over all $total examples ($n accepted by both, $((total - n)) rejected by both; $nobase without a ritz0 baseline, compile-checked only)")
         TOTAL_PASSED=$((TOTAL_PASSED + 1))
         return 0
     fi

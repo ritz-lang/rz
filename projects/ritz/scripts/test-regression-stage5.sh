@@ -36,13 +36,36 @@ trap 'rm -rf "$BUILD_DIR"' EXIT
 TESTS_RUN=0
 TESTS_FAILED=0
 
-# Put Stage 5 in a known starting state with the given accept sets.
+# Stage 5 checks the sets against the corpus (AGAST #1341), so give it a
+# synthetic one: an example per key, keyed by its bare name.
+EXAMPLES_DIR="$BUILD_DIR/examples"
+
+# Put Stage 5 in a known starting state with the given accept sets.  The
+# corpus is every key either set names, plus $CORPUS_EXTRA; each compiler
+# rejected whatever corpus key it did not accept (as Stages 3/4 record it),
+# except keys in $UNASKED_<compiler>, which it was never asked about.
 # Args: $1=newline-separated ritz1 accepts, $2=same for ritz1_selfhosted,
 #       $3(optional)="no-ran" to omit the stage-ran markers.
+CORPUS_EXTRA=""
+UNASKED_ritz1=""
+UNASKED_ritz1_selfhosted=""
 setup_sets() {
     rm -f "$BUILD_DIR"/acceptset_*
+    rm -rf "$EXAMPLES_DIR"
     printf '%s\n' "$1" | grep -v '^$' > "$BUILD_DIR/acceptset_ritz1.accepted" || true
     printf '%s\n' "$2" | grep -v '^$' > "$BUILD_DIR/acceptset_ritz1_selfhosted.accepted" || true
+    : >> "$BUILD_DIR/acceptset_ritz1.rejected"; : >> "$BUILD_DIR/acceptset_ritz1_selfhosted.rejected"
+    local k c unasked
+    for k in $(printf '%s\n%s\n%s\n' "$1" "$2" "$CORPUS_EXTRA" | grep -v '^$' | sort -u); do
+        mkdir -p "$EXAMPLES_DIR/$k/src"
+        : > "$EXAMPLES_DIR/$k/src/main.ritz"
+        for c in ritz1 ritz1_selfhosted; do
+            unasked="UNASKED_$c"
+            grep -qxF "$k" "$BUILD_DIR/acceptset_$c.accepted" && continue
+            [[ " ${!unasked} " == *" $k "* ]] && continue
+            echo "$k" >> "$BUILD_DIR/acceptset_$c.rejected"
+        done
+    done
     if [[ "${3:-}" != "no-ran" ]]; then
         echo 1 > "$BUILD_DIR/acceptset_ritz1.ran"
         echo 1 > "$BUILD_DIR/acceptset_ritz1_selfhosted.ran"
@@ -132,6 +155,45 @@ fi
 # A legitimate zero-accept run (stages ran, nothing compiled) is agreement.
 setup_sets '' ''
 expect "both stages ran and accepted nothing is agreement" 0 0
+
+# The denominator (AGAST #1341).  The pass line names the whole corpus and
+# splits it, rather than quoting |accept set| as though it were the corpus.
+CORPUS_EXTRA=$'x\ny'
+setup_sets $'a\nb\nc' $'a\nb\nc'
+expect "agreement with some rejected by both passes" 0 0
+TESTS_RUN=$((TESTS_RUN + 1))
+want="Stage 5: fixed point holds over all 5 examples (3 accepted by both, 2 rejected by both; 5 without a ritz0 baseline, compile-checked only)"
+if [[ "${STAGE_RESULTS[*]}" == "$want" ]]; then
+    echo "ok: the pass line states its denominator"
+else
+    echo "FAIL: want: $want"
+    echo "      got:  ${STAGE_RESULTS[*]}"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+# Baselines change the "without a ritz0 baseline" count, and nothing else.
+for k in a b c x; do echo 0 > "$BUILD_DIR/stage1_$k.exit"; done
+expect "baselines do not change the verdict" 0 0
+TESTS_RUN=$((TESTS_RUN + 1))
+if [[ "${STAGE_RESULTS[*]}" == *"; 1 without a ritz0 baseline,"* ]]; then
+    echo "ok: examples without a baseline are counted"
+else
+    echo "FAIL: want 1 without a baseline, got: ${STAGE_RESULTS[*]}"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
+fi
+rm -f "$BUILD_DIR"/stage1_*
+
+# An example one compiler was never asked about is not agreement, even when
+# the accept sets match.  Before #1341 this was the no-baseline skip in
+# Stages 3/4: absent from both sets, so the sets agreed and Stage 5 was green.
+UNASKED_ritz1="y"
+setup_sets $'a\nb\nc' $'a\nb\nc'
+expect "an example ritz1 was never asked about fails" 1 1
+UNASKED_ritz1_selfhosted="x y"
+setup_sets $'a\nb\nc' $'a\nb\nc'
+expect "every never-asked example/compiler pair is counted" 1 3
+UNASKED_ritz1=""
+UNASKED_ritz1_selfhosted=""
+CORPUS_EXTRA=""
 
 echo "================="
 if [[ $TESTS_FAILED -eq 0 ]]; then
