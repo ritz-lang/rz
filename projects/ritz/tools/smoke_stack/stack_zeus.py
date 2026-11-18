@@ -1,6 +1,7 @@
 """stack, zeus on its own: SIGTERM/SIGINT/SIGKILL to zeus alone stops its
 workers in 2 s; kill -9 of one worker: zeus respawns it in 2 s, and a SIGHUP
-hot reload reaps it; zeus logs each line in one write(2).
+hot reload reaps it; a SIGHUP hot reload stops and replaces every worker;
+zeus logs each line in one write(2).
 
 Each check starts `zeus -f -w 2 nexus` with no valet or store in front of it
 (zeus_alone) from the stack suite's StackCtx.
@@ -154,6 +155,44 @@ def reload_reaps_dead_worker(ctx: StackCtx) -> None:
         ctx.procs.stop(z, signal.SIGKILL)
 
 
+def _children(pid: int) -> list[int]:
+    """Every process whose parent is pid, zombies included."""
+    kids = []
+    for d in Path("/proc").iterdir():
+        if not d.name.isdigit():
+            continue
+        try:
+            stat = (d / "stat").read_text()
+        except OSError:
+            continue
+        if int(stat.rsplit(")", 1)[1].split()[1]) == pid:
+            kids.append(int(d.name))
+    return sorted(kids)
+
+
+def reload_replaces_workers(ctx: StackCtx) -> None:
+    # #3084: SIGHUP only set WORKER_STATE_STOPPING in each control block,
+    # which nexus never reads, waited 500 ms and spawned the new worker on
+    # the re-prepared shm anyway: 2 old + 2 new nexus children, the old
+    # ones never signalled or reaped. After the reload zeus must have
+    # exactly -w children, none of them an original worker.
+    z, pids = zeus_alone(ctx)
+    try:
+        os.kill(z.pid, signal.SIGHUP)
+        deadline = time.monotonic() + 5.0
+        while "zeus: hot reload complete" not in log_text(z):
+            if time.monotonic() > deadline:
+                raise CheckFailed(f"SIGHUP: no 'hot reload complete' in 5 s: {log_tail(z, 4)}")
+            time.sleep(0.05)
+        kids = _children(z.pid)
+        stale = sorted(set(kids) & set(pids))
+        if len(kids) != 2 or stale:
+            raise CheckFailed(f"SIGHUP: zeus has children {kids} after 'hot reload complete' "
+                              f"(want 2, none of the originals {pids}; still there: {stale})")
+    finally:
+        ctx.procs.stop(z, signal.SIGKILL)
+
+
 def zeus_writes_and_lines(z: subprocess.Popen) -> tuple[int, int]:
     """(write syscalls zeus has made, lines zeus has logged), read consistently."""
     while True:
@@ -209,4 +248,5 @@ CHECKS = (("zeus_term_stops_workers", term_stops_workers),
           ("zeus_kill9_stops_workers", kill9_stops_workers),
           ("zeus_respawns_killed_worker", respawns_killed_worker),
           ("zeus_reload_reaps_dead_worker", reload_reaps_dead_worker),
+          ("zeus_reload_replaces_workers", reload_replaces_workers),
           ("zeus_log_one_write_per_line", log_one_write_per_line))

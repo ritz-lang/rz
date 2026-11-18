@@ -409,6 +409,27 @@ fn stop_workers(ctx: *DaemonContext)
             mark_reaped(slot, i)
         i = i + 1
 
+# Stop and reap one worker before its slot is reused (AGAST #3084): SIGTERM,
+# up to 1s to exit, then SIGKILL and wait. Spawning the replacement on the
+# same shm while the old process still runs leaves both on the same rings,
+# and the old pid, overwritten in the slot, is never reaped.
+fn stop_worker(slot: *WorkerSlot, idx: i32)
+    sys_kill(slot.pid, SIGTERM)
+    var polls: i32 = 0
+    while polls < STOP_GRACE_POLLS
+        if worker_exited(slot)
+            mark_reaped(slot, idx)
+            return
+        sleep_10ms()
+        polls = polls + 1
+    print_str(c"zeus: worker ")
+    print_i32(idx)
+    print_str(c" ignored SIGTERM, killing\n")
+    sys_kill(slot.pid, SIGKILL)
+    var status: i32 = 0
+    sys_wait4(slot.pid, @status, 0, null)
+    mark_reaped(slot, idx)
+
 # Initiate hot reload - restart all workers one by one
 fn initiate_hot_reload(ctx: *DaemonContext)
     var i: i32 = 0
@@ -419,20 +440,10 @@ fn initiate_hot_reload(ctx: *DaemonContext)
             continue
 
         if slot.state == WORKER_SLOT_RUNNING
-            # Signal worker to stop gracefully
+            # The control-block request is advisory (nexus never reads it);
+            # stop_worker's SIGTERM is what ends the old process.
             daemon_request_worker_stop(ctx, i)
-
-            # Wait briefly for worker to exit (non-blocking check)
-            var attempts: i32 = 0
-            while attempts < 50  # ~500ms total
-                if worker_exited(slot)
-                    break
-                # Sleep 10ms
-                var tv: [2]i64
-                tv[0] = 0       # seconds
-                tv[1] = 10000000  # nanoseconds (10ms)
-                syscall2(35, @tv[0] as i64, 0)  # SYS_NANOSLEEP
-                attempts = attempts + 1
+            stop_worker(slot, i)
 
             # Respawn worker
             print_str(c"zeus: reloading worker ")
