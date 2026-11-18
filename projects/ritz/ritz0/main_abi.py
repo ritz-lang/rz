@@ -33,6 +33,13 @@ import ritz_ast as rast
 
 ADAPTED_NAME = "__ritz_main"
 
+
+def display_name(name: str) -> str:
+    """The name a diagnostic shows for fn `name`: the user wrote `main`, so an
+    adapted main is `main`, not `__ritz_main` (AGAST #4018). ritz1's twin is
+    diag.ritz's fn_display_name."""
+    return "main" if name == ADAPTED_NAME else name
+
 MSG_SHAPE = ("`main` must take `()`, `(args: Span<StrView>)` or "
              "`(args: Span<StrView>, env: Span<StrView>)`")
 MSG_RET = "`main` must return `i32` or nothing"

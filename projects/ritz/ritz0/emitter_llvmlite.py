@@ -39,6 +39,7 @@ from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst
 from type_checker import TypeChecker
 from typed import EMITTER_READS, typed_of
 import module_interface
+from main_abi import display_name
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
 
@@ -6353,7 +6354,7 @@ class LLVMEmitter:
         finally:
             self.ritz_types = saved_ritz_types
             self._emit_span = None
-        err = frame_too_large(fn_def.name, fn)
+        err = frame_too_large(display_name(fn_def.name), fn)
         if err is not None:
             raise err
         return fn
@@ -6580,7 +6581,7 @@ class LLVMEmitter:
                         raise MatchHasNoValue(last_val.span)  # #1357
                     if fn_def.ret_type is not None:
                         raise EmitError(
-                            f"function '{fn_def.name}' declares a return type "
+                            f"function '{display_name(fn_def.name)}' declares a return type "
                             f"but its trailing expression produces no value "
                             f"(match arms have irreconcilable types, or are "
                             f"statements)",
@@ -6713,7 +6714,7 @@ class LLVMEmitter:
         gap = value_gap(fn_def.body, yields_nothing)
         if gap is not None:
             raise EmitError(
-                f"function '{fn_def.name}' declares a return type but can "
+                f"function '{display_name(fn_def.name)}' declares a return type but can "
                 f"reach its end without producing a value",
                 getattr(gap, 'span', None) or getattr(fn_def, 'span', None))
 
@@ -9367,7 +9368,7 @@ class LLVMEmitter:
         """
         fn_name = self.current_fn_def.name if self.current_fn_def else "unknown"
         # A generic helper's instance is `name$T...`; report the source name.
-        fn_name = fn_name.split("$", 1)[0]
+        fn_name = display_name(fn_name.split("$", 1)[0])
         if not (self.in_test_fn or self.in_test_helper):
             raise EmitError(
                 "assert is only allowed in [[test]] and [[test_helper]] "

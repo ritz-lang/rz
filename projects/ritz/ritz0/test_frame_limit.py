@@ -59,12 +59,13 @@ fn fill(r: *Rule) -> i32
     r.a[0] = 1
     0
 
-fn main() -> i32
+pub fn main(args: Span<StrView>) -> i32
     var small: [16]u8 = [0; 16]
     var rules: [16384]Rule
     fill(@&rules[0])
     0
 """, line=10, col=5, size=16 * MIB, fn="main")
+    # An adapted main (#200) is still named `main`, not `__ritz_main` (#4018).
     # The whole message, ritz0's words on every compiler (the total depends
     # on each compiler's own temporaries, so it is matched by shape).
     assert re.search(
