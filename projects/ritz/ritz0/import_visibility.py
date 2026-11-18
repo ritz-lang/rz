@@ -121,6 +121,13 @@ class _HiddenUses(NameResolver):
             self._use(expr.func.name, expr.func.span)
         elif isinstance(expr, rast.TypeExpr):
             self._check_type(expr.ty)
+        elif (isinstance(expr, rast.Call) and isinstance(expr.func, rast.Ident)
+              and expr.func.name == 'sizeof'):
+            # #3981: sizeof's operand is a type that reads as an expression
+            # (`sizeof(K)`), or one parsed as a type (`sizeof([2]K)`), and
+            # name_resolver skips it: check it as an annotation's type is.
+            for arg in expr.args:
+                self._check_expr(arg, scope)
         elif isinstance(expr, rast.InterpString):
             for part in expr.exprs:
                 self._check_expr(part, scope)

@@ -81,6 +81,28 @@ pub fn main() -> i32
 """
 
 
+# sizeof's operand is a type, and a use of its name (#3981): bare, and as an
+# array element type. (No compiler folds sizeof in a const initialiser, and an
+# array length can't hold one, so a function body is the only place.)
+MAIN_SIZEOF = """\
+import b
+
+pub fn main() -> i32
+    if sizeof(CS) <= 0
+        return 9
+    sizeof([2]CS) as i32
+"""
+
+# Not a hidden name but no name at all: an error, not a guess at its size
+# (valet's test once said sizeof "falls back to 8" for one).
+MAIN_SIZEOF_UNKNOWN = """\
+import b
+
+pub fn main() -> i32
+    sizeof(Nope) as i32
+"""
+
+
 def _compile(compiler, tmp_path, b_pub, main_src):
     """Compile main.ritz over the chain; (exit code, error lines), each line
     as `main.ritz:L:C: message`, whichever compiler's prefix it had."""
@@ -102,7 +124,8 @@ def _compile(compiler, tmp_path, b_pub, main_src):
                               text=True, timeout=120, check=False)
     errors = []
     for line in proc.stderr.splitlines():
-        line = line.removeprefix("Error: ")
+        for prefix in ("Error: ", "Compiler error: ", "error: "):
+            line = line.removeprefix(prefix)
         if line.startswith("main.ritz:"):
             errors.append(line.replace(": error: ", ": ", 1))
     return proc.returncode, errors
@@ -140,3 +163,25 @@ def test_a_pub_import_passes_its_names_on(tmp_path, compiler):
 def test_a_local_or_a_builtin_is_not_hidden(tmp_path, compiler):
     rc, errors = _compile(compiler, tmp_path, False, MAIN_NOT_HIDDEN)
     assert (rc, errors) == (0, [])
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_sizeof_of_a_hidden_type_is_undefined(tmp_path, compiler):
+    """#3981: ritz0 let `sizeof(CS)` through where it refused `let s: CS`."""
+    rc, errors = _compile(compiler, tmp_path, False, MAIN_SIZEOF)
+    assert rc != 0
+    assert errors[:1] == [_hidden(4, 15, "CS")], errors
+    assert all("`CS` is undefined (#3891)" in e for e in errors), errors
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_sizeof_through_a_pub_import_compiles(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, True, MAIN_SIZEOF)
+    assert (rc, errors) == (0, [])
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_sizeof_of_an_unknown_name_is_an_error(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, False, MAIN_SIZEOF_UNKNOWN)
+    assert rc != 0
+    assert errors == ["main.ritz:4:12: sizeof: unknown type or value `Nope`"]
