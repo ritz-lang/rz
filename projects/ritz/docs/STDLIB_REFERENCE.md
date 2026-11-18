@@ -2032,7 +2032,7 @@ fn main(argc: i32, argv: **u8) -> i32
 ```
 
 ritz1 cannot compile this module yet (#1487, #1488, #1497, #1498; see the
-`77_args` entry in `scripts/regression-known-failures-ritz1.txt`).  That is also why it is a
+`77_args` entry of ritz1's old regression allowlist, in git history).  That is also why it is a
 separate module rather than part of `args`: ritz1 compiles every function of an
 imported module, so housing it in `args.ritz` would break every `args` caller
 under ritz1.

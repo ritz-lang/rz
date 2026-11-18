@@ -7,7 +7,6 @@ itself runs as its own ci-local step ("Example [[test]] suites").
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
 
@@ -98,10 +97,3 @@ def test_gate_runs_it():
 
     steps = [s for s in ci_local.load_steps() if s.job == "bootstrap"]
     assert any("make example-tests" in s.run for s in steps)
-
-
-def test_known_failing_entries_cite_a_ticket_and_name_a_real_file():
-    # A loop, not a parametrize: an empty list must not turn into a skip.
-    for path, reason in sorted(et.KNOWN_FAILING.items()):
-        assert re.search(r"#\d+", reason), f"{path}: reason must cite #NNNN"
-        assert (EXAMPLES / path).is_file(), f"{path}: no such file"

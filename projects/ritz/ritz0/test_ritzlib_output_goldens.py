@@ -13,7 +13,7 @@ pin most of it under ritz0; this file covers the two things they can't:
   binaries must print the same pinned bytes.  The cases are the ones in
   ritzlib/tests/test_args_output.ritz (read from that file, so they can't
   drift apart).  argspec and os/env are not here: ritz1 cannot compile either
-  module yet (scripts/regression-known-failures-ritz1.txt; env_must's block
+  module yet (ritz1's old regression allowlist, in git history; env_must's block
   match arm, #1454).
 
 AGAST #1684 did the same to timer, iovec, lang/tokens and elf.  ritz1

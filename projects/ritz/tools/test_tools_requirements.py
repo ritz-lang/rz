@@ -52,6 +52,7 @@ LOCAL_MODULES = {
     "check_test_budget",
     "cpu_calibrate",
     "example_tests",
+    "known_failures",  # tools/known_failures.py, the known-failures schema (AGAST #1834)
     "exec_tmpdir",
     "likely_tests",
     "python_deps",  # AGAST #2300

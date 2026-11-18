@@ -19,8 +19,8 @@ on a pool of -j workers. test.sh is NOT run: regression.sh already runs it
 three times over.
 
 Verdict (judge()):
-  * a file that did not pass and is not in KNOWN_FAILING fails the gate;
-  * a KNOWN_FAILING file that passes fails the gate (strict xpass), as does
+  * a file that did not pass and is not excused fails the gate;
+  * an excused file that passes fails the gate (strict xpass), as does
     an entry for a file that no longer exists, so an excuse cannot outlive
     its failure;
   * the floor: every test/*.ritz on disk, found by a plain walk that does not
@@ -49,11 +49,11 @@ RITZ_ROOT = Path(__file__).resolve().parent.parent
 EXAMPLES = RITZ_ROOT / "examples"
 BUILD_PY = RITZ_ROOT / "build.py"
 
-# Example test files that fail today, each citing the AGAST ticket that
-# tracks the failure. Keys are relative to examples/. Every entry must cite
-# #NNNN and name a file on disk (tools/test_example_tests.py); one that
-# starts passing fails the gate until it is removed here.
-KNOWN_FAILING: dict[str, str] = {}
+# Example test files that fail today are gate = "examples", compiler =
+# "ritz0" entries in known-failures/<agast>.toml (unit: the file, relative to
+# examples/), read and classified by tools/known_failures.py (AGAST #1834).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import known_failures as kf
 
 
 def test_files_on_disk(examples: Path) -> set[str]:
@@ -77,21 +77,24 @@ def judge(disk: set[str], ran: dict[str, str], known: dict[str, str]) -> list[st
     "build-failed" when its package did not build and it never ran.
     """
     problems = []
+    o = kf.outcome(known, ran)
     for f in sorted(disk - ran.keys()):
         problems.append(
             f"{f}: on disk but did not run (no package "
             f"discovers it: missing ritz.toml?)"
         )
     for f, status in sorted(ran.items()):
-        if status != "pass" and f not in known:
+        if f in o.hard:
             problems.append(f"{f}: {status}")
-        elif status == "pass" and f in known:
+        elif f in o.xpass:
             problems.append(
-                f"{f}: passes, so its KNOWN_FAILING entry "
-                f"({known[f]}) is stale: remove it"
+                f"{f}: passes, so its known-failures entry "
+                f"({known[f]}) is stale: delete it from known-failures/"
             )
     for f in sorted(known.keys() - disk):
-        problems.append(f"{f}: KNOWN_FAILING entry ({known[f]}) is stale: no such file")
+        problems.append(
+            f"{f}: known-failures entry ({known[f]}) is stale: no such file"
+        )
     return problems
 
 
@@ -171,9 +174,10 @@ def main(argv: list[str] | None = None) -> int:
             ran.update(statuses)
 
     disk = test_files_on_disk(EXAMPLES)
-    problems = judge(disk, ran, KNOWN_FAILING)
+    known = kf.known("examples", "ritz0")
+    problems = judge(disk, ran, known)
     passed = sum(1 for s in ran.values() if s == "pass")
-    excused = sorted(f for f, s in ran.items() if s != "pass" and f in KNOWN_FAILING)
+    excused = sorted(f for f, s in ran.items() if s != "pass" and f in known)
     print()
     print(
         f"Example [[test]] files: {len(disk)} on disk, {len(ran)} ran "
@@ -181,7 +185,7 @@ def main(argv: list[str] | None = None) -> int:
         f"{len(excused)} known-failing, {time.monotonic() - t0:.0f}s"
     )
     for f in excused:
-        print(f"  known-failing {f}: {ran[f]} ({KNOWN_FAILING[f]})")
+        print(f"  known-failing {f}: {ran[f]} ({known[f]})")
     if problems:
         print(f"FAIL: {len(problems)} problem(s):")
         for p in problems:

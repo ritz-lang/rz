@@ -120,28 +120,20 @@ unmapped = [p for p in projects if p not in mapped]
 
 
 # --- known failures (the allowlists ARE the roadmap, ROADMAP.md §46) --------
-def list_entries(path):
-    try:
-        with open(path) as fh:
-            return [l.strip() for l in fh if l.strip() and not l.lstrip().startswith("#")]
-    except FileNotFoundError:
-        return None
-
-kf0 = list_entries("projects/ritz/scripts/regression-known-failures.txt")
-kf1 = list_entries("projects/ritz/scripts/regression-known-failures-ritz1.txt")
-
-matrix = {}
+# One schema since AGAST #1834: known-failures/<agast>.toml, parsed by
+# projects/ritz/tools/known_failures.py.
+kf0 = kf1 = None
+matrix, build_excuses = {}, {}
 try:
     sys.path.insert(0, "projects/ritz/tools")
-    import run_regression_matrix as m  # noqa: E402  (repo code, data only)
-    matrix = dict(collections.Counter(k[0] for k in m.EXPECTED_FAILURES))
+    import known_failures as kfm  # noqa: E402  (repo code, data only)
+    kf_all = kfm.load()
+    kf0 = [e.unit for e in kf_all if (e.gate, e.compiler) == ("regression", "ritz0")]
+    kf1 = [e.unit for e in kf_all if (e.gate, e.compiler) == ("regression", "ritz1")]
+    matrix = dict(collections.Counter(e.compiler for e in kf_all if e.gate == "matrix"))
+    build_excuses = {e.unit: f"#{e.agast}" for e in kf_all if e.gate == "build"}
 except Exception as e:  # report, don't guess
     matrix = {"error": f"{type(e).__name__}: {e}"}
-
-with open("rz.toml", "rb") as fh:
-    rz = tomllib.load(fh)
-build_excuses = {k: (re.findall(r"#\d+", v) or ["?"])[0]
-                 for k, v in rz.get("ci", {}).get("known_failing", {}).get("build", {}).items()}
 
 # --- pace: commits and ticket branches merged, per month --------------------
 pace = collections.OrderedDict()

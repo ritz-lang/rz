@@ -33,7 +33,7 @@ The HTML tokenizer implements the HTML5 parsing algorithm as a state machine, ha
 **This build currently fails (exit 1).** `lexis` does not compile: the ownership
 checker reports 424 "use of moved value" errors across 13 files, the largest
 being `lib/html/tree_builder.ritz`. It is tracked as **AGAST #1289** and is
-listed in the workspace manifest's `[ci.known_failing.build]`, so `rz build
+listed in `known-failures/` (gate `build`), so `rz build
 --all` reports it as an advisory failure rather than gating.
 
 Consequently there is no `lexis` binary — `projects/lexis/build/debug/` is

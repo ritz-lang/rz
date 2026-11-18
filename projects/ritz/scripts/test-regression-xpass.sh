@@ -1,34 +1,25 @@
 #!/bin/bash
-# Self-test for the known-failure allowlists and their strict-xpass rule —
-# AGAST #1365.
+# Self-test for regression.sh's known-failure judgement and its strict-xpass
+# rule — AGAST #1365, rewired onto known-failures/ by AGAST #1834.
 #
-# regression.sh keeps two allowlists of examples a compiler cannot build:
+# regression.sh asks tools/known_failures.py (the one parser and outcome rule
+# every gate shares) about `gate = "regression"` entries in
+# known-failures/<agast>.toml.  ritz1_selfhosted shares ritz1's entries.
 #
-#     regression-known-failures.txt        (ritz0)
-#     regression-known-failures-ritz1.txt  (ritz1 and ritz1_selfhosted, shared)
+# An entry is a claim about the compiler, and claims go stale: the compiler
+# learns to build the example and the entry stays, so the suite keeps
+# skipping a test that would now pass.  That was detected and then thrown
+# away once: the check called warn(), so 74_async_tiers and 75_tier2_uring sat
+# listed as "unmigrated against the current async framework" when they were
+# really two `&x` -> `@x` migrations.  report_xpass() makes it a hard failure.
+# (Entries naming examples that do not exist, and the AGAST-id rule, are the
+# parser's job: tools/test_known_failures.py.)
 #
-# An entry is a claim about the compiler. Claims go stale, and this repo has
-# now had four allowlists rot silently (#1327, #1333, #1359, and this one).
-# The two failure modes are:
-#
-#   (a) the entry names an example that no longer exists — dead weight that
-#       reads as compiler debt forever;
-#   (b) the compiler learns to build the example and the entry stays — the
-#       suite keeps skipping a test that would now pass.
-#
-# (b) was already detected and then thrown away: the check existed but called
-# warn(), so the run stayed green and nothing forced the delisting. That is
-# how 74_async_tiers and 75_tier2_uring sat listed as "unmigrated against the
-# current async framework" when they were really two `&x` -> `@x` address-of
-# migrations, missed by the pass that did every other example on their ladder.
-# report_xpass() makes it a hard failure.
-#
-# This file proves both floors can actually go red. A floor that has never
+# This file proves the floors can actually go red.  A floor that has never
 # been observed failing is indistinguishable from no floor at all.
 #
-# Hermetic: sources regression.sh as a library, compiles nothing, runs in well
-# under a second. The one non-hermetic assertion (entries name real examples)
-# reads the real allowlists deliberately — that IS the thing being checked.
+# Hermetic: sources regression.sh as a library, points RITZ_KNOWN_FAILURES at
+# a synthetic directory, compiles nothing.
 #
 # Exit codes: 0 all assertions held, 1 otherwise.
 
@@ -64,152 +55,119 @@ check() {
     return 1
 }
 
-echo "regression.sh allowlist / strict-xpass self-test"
-echo "==============================================="
+echo "regression.sh known-failure / strict-xpass self-test"
+echo "======================================================="
 
-# ---------------------------------------------------------------------------
-# known_failures_file: ritz1 and ritz1_selfhosted MUST share one file.
-#
-# Not cosmetic. The shared file is what makes it impossible to hide a
-# ritz1 vs ritz1_selfhosted divergence by listing the example under only one
-# of them — see the header of regression-known-failures-ritz1.txt.
-# ---------------------------------------------------------------------------
-f_ritz0=$(known_failures_file ritz0)
-f_ritz1=$(known_failures_file ritz1)
-f_self=$(known_failures_file ritz1_selfhosted)
+KF="$SCRATCH/known-failures"
+mkdir -p "$KF"
+cat > "$KF/1365.toml" <<'EOF'
+[[entry]]
+gate = "regression"
+compiler = "ritz0"
+unit = "tier1_basics_01_hello"
+reason = "synthetic ritz0 entry"
+agast = 1365
 
-check "ritz0 uses the ritz0 allowlist" \
-    "regression-known-failures.txt" "$(basename "$f_ritz0")"
-check "ritz1 uses the ritz1 allowlist" \
-    "regression-known-failures-ritz1.txt" "$(basename "$f_ritz1")"
-check "ritz1_selfhosted SHARES ritz1's allowlist" "$f_ritz1" "$f_self"
-
-# ---------------------------------------------------------------------------
-# is_known_failure: exact whole-line match, comments and blanks stripped.
-# ---------------------------------------------------------------------------
-LIST="$SCRATCH/list.txt"
-cat > "$LIST" <<'EOF'
-# a comment
-tier1_basics_01_hello
-
-tier5_async_47_lisp
-#tier9_commented_out
-partial_name_prefix
+[[entry]]
+gate = "regression"
+compiler = "ritz1"
+unit = "tier5_async_47_lisp"
+reason = "synthetic ritz1 entry"
+agast = 1365
 EOF
+export RITZ_KNOWN_FAILURES="$KF"
 
-# Point the helper at our synthetic list by shadowing known_failures_file.
-known_failures_file() { echo "$LIST"; }
-
-is_known_failure ritz0 "tier1_basics_01_hello"
-check "a listed entry is a known failure" 0 $?
-
-is_known_failure ritz0 "tier9_never_listed"
-check "an unlisted entry is not a known failure" 1 $?
-
-is_known_failure ritz0 "tier9_commented_out"
-check "a commented-out entry is NOT honoured" 1 $?
-
-is_known_failure ritz0 "tier5_async_47_lisp"
-check "trailing whitespace on an entry is tolerated" 0 $?
-
-# grep -qxF, not -qF: a substring must not match. Without -x, "partial_name"
-# would match the line "partial_name_prefix" and silently excuse an example
-# nobody listed.
-is_known_failure ritz0 "partial_name"
-check "a strict PREFIX of an entry does not match" 1 $?
-
-is_known_failure ritz0 ""
-check "the empty key does not match a blank line" 1 $?
-
-# ---------------------------------------------------------------------------
-# report_xpass: names the compiler, the example, and the file to edit.
-#
-# The message is the entire remedy — the operator has to know which of two
-# files to open. A message that says only "remove it" sends them looking.
-# ---------------------------------------------------------------------------
-out=$(report_xpass ritz0 "tier1_basics_01_hello" 2>&1)
-
-case "$out" in
-    *tier1_basics_01_hello*) got_name=yes ;;
-    *)                       got_name=no ;;
-esac
-check "xpass message names the example" yes "$got_name"
-
-case "$out" in
-    *COMPILES*) got_why=yes ;;
-    *)          got_why=no ;;
-esac
-check "xpass message says the example COMPILES" yes "$got_why"
-
-case "$out" in
-    *list.txt*) got_file=yes ;;
-    *)          got_file=no ;;
-esac
-check "xpass message names the file to edit" yes "$got_file"
-
-# Restore the real resolver before the on-disk assertions below.
-unset -f known_failures_file
-known_failures_file() {
-    case "$1" in
-        ritz1|ritz1_selfhosted) echo "$SCRIPT_DIR/regression-known-failures-ritz1.txt" ;;
-        *)                      echo "$SCRIPT_DIR/regression-known-failures.txt" ;;
-    esac
+# Capture what the helpers report: fail/warn print, _verdict writes a file.
+# Run each in a subshell so a helper's state can't leak between cases.
+judge_fail() {   # $1=compiler $2=key -> "<verdict>|<output>"
+    local out="$SCRATCH/r.$RANDOM" msg
+    msg=$(judge_compile_failure "$1" "$2" "$1" "$out" 2>&1)
+    printf '%s|%s' "$(cat "$out.verdict" 2>/dev/null || echo none)" "$msg"
 }
-
-# ---------------------------------------------------------------------------
-# Floor (a): every entry in the REAL allowlists names an example that exists.
-#
-# An example key is its path under examples/ with '/' flattened to '_', which
-# is ambiguous to invert (tier5_async_47_lisp could be tier5/async_47_lisp).
-# So resolve the same way the harness does: enumerate real directories, derive
-# each one's key, and require every listed key to be in that set.
-# ---------------------------------------------------------------------------
-real_keys=$(cd "$RITZ_ROOT/examples" 2>/dev/null && \
-    { ls -d -- */ tier*/*/ 2>/dev/null || true; } | \
-    sed 's|/$||' | tr '/' '_' | sort -u)
-
-entries_of() {
-    sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$1"
+judge_pass() {   # $1=compiler $2=key -> "<rc>|<verdict>|<output>"
+    local out="$SCRATCH/r.$RANDOM" msg rc
+    msg=$(report_xpass "$1" "$2" "$out" 2>&1); rc=$?
+    printf '%s|%s|%s' "$rc" "$(cat "$out.verdict" 2>/dev/null || echo none)" "$msg"
 }
+has() { case "$1" in *"$2"*) echo yes ;; *) echo no ;; esac; }
 
-for f in "$(known_failures_file ritz0)" "$(known_failures_file ritz1)"; do
-    missing=""
-    while IFS= read -r key; do
-        [[ -n "$key" ]] || continue
-        grep -qxF "$key" <<< "$real_keys" || missing="$missing $key"
-    done < <(entries_of "$f")
-    check "every entry in $(basename "$f") names an example that exists" \
-        "" "$missing"
-done
+# _verdict's on-disk name: check it rather than assume it.
+_vprobe="$SCRATCH/probe"; _verdict "$_vprobe" skip
+check "_verdict writes <prefix>.verdict (the harness this test reads)" \
+    skip "$(cat "$_vprobe.verdict" 2>/dev/null)"
+
+# --- compile failed ---------------------------------------------------------
+r=$(judge_fail ritz0 tier1_basics_01_hello)
+check "listed + compile failed -> skip" skip "${r%%|*}"
+check "the skip cites the AGAST ticket" yes "$(has "$r" "AGAST #1365")"
+
+r=$(judge_fail ritz0 tier9_never_listed)
+check "unlisted + compile failed -> fail" fail "${r%%|*}"
+
+r=$(judge_fail ritz0 tier5_async_47_lisp)
+check "a ritz1 entry does not excuse ritz0" fail "${r%%|*}"
+
+r=$(judge_fail ritz1 tier5_async_47_lisp)
+check "listed ritz1 + compile failed -> skip" skip "${r%%|*}"
+r=$(judge_fail ritz1_selfhosted tier5_async_47_lisp)
+check "ritz1_selfhosted SHARES ritz1's entry" skip "${r%%|*}"
+
+r=$(judge_fail ritz0 tier1_basics)
+check "a strict PREFIX of an entry does not match" fail "${r%%|*}"
+
+# --- compiled -------------------------------------------------------------
+r=$(judge_pass ritz0 tier9_never_listed)
+check "unlisted + compiles -> not an xpass, no verdict" "1|none" \
+    "$(cut -d'|' -f1-2 <<<"$r")"
+
+r=$(judge_pass ritz0 tier1_basics_01_hello)
+check "listed + compiles -> xpass, verdict fail" "0|fail" \
+    "$(cut -d'|' -f1-2 <<<"$r")"
+check "xpass message names the example" yes "$(has "$r" tier1_basics_01_hello)"
+check "xpass message says the example COMPILES" yes "$(has "$r" COMPILES)"
+check "xpass message names the file to edit" yes "$(has "$r" "1365.toml")"
+
+r=$(judge_pass ritz1_selfhosted tier5_async_47_lisp)
+check "ritz1_selfhosted xpasses on ritz1's entry" "0|fail" \
+    "$(cut -d'|' -f1-2 <<<"$r")"
+
+# --- fail closed ------------------------------------------------------------
+# A malformed list (here: an entry with no agast) makes the CLI exit 2 with
+# nothing on stdout.  A listed failure must then FAIL, not skip.
+cp "$KF/1365.toml" "$SCRATCH/1365.good"
+printf '\n[[entry]]\ngate = "regression"\ncompiler = "ritz0"\nunit = "x"\nreason = "no ticket"\n' \
+    >> "$KF/1365.toml"
+r=$(judge_fail ritz0 tier1_basics_01_hello)
+check "a malformed list fails closed (listed failure -> fail)" fail "${r%%|*}"
+cp "$SCRATCH/1365.good" "$KF/1365.toml"
+
+_real_cli="$KNOWN_FAILURES_CLI"; KNOWN_FAILURES_CLI="$SCRATCH/no-such-cli.py"
+r=$(judge_fail ritz0 tier1_basics_01_hello)
+KNOWN_FAILURES_CLI="$_real_cli"
+check "a missing CLI fails closed (listed failure -> fail)" fail "${r%%|*}"
 
 # ---------------------------------------------------------------------------
-# Floor (b): the xpass check is WIRED AS A FAILURE at all three call sites.
+# Floor (b): the xpass check is WIRED AS A FAILURE at both call sites.
 #
-# This is a source-level assertion rather than a behavioural one, and that is
-# a deliberate trade-off: exercising the real call sites means compiling the
-# corpus with three compilers, which is the ~20-minute suite this self-test
-# exists to stay out of. What it pins is precisely the regression that
-# happened — the check being present but advisory. If someone downgrades
-# report_xpass back to warn(), or adds a fourth stage that only warns, this
-# goes red in under a second.
+# Source-level rather than behavioural, deliberately: exercising the real
+# call sites means compiling the corpus with three compilers, the ~20-minute
+# suite this self-test exists to stay out of.  What it pins is precisely the
+# regression that happened — the check present but advisory.
 # ---------------------------------------------------------------------------
 rs="$SCRIPT_DIR/regression.sh"
 
 # Two call sites since #1806: Stage 1's judge, and the differential worker
 # that Stages 3 and 4 share (run_compare_stage since #1838).
-check "every stage's code path calls report_xpass" 2 \
-    "$(grep -cE '^\s*report_xpass ' "$rs")"
+check "every stage's code path checks for an xpass and stops on one" 2 \
+    "$(grep -cE '^\s*report_xpass .* "\$out" && return 0$' "$rs")"
+check "every stage's code path judges compile failures the same way" 2 \
+    "$(grep -cE '^\s*judge_compile_failure ' "$rs")"
 check "Stages 3 and 4 both go through the shared differential worker" 2 \
     "$(grep -cE '^\s*run_compare_stage [34] ritz1(_selfhosted)? ' "$rs")"
-
-check "no stage still only warns about an allowlisted example that compiles" 0 \
+check "no stage still only warns about a listed example that compiles" 0 \
     "$(grep -cE 'warn .*(but COMPILES|allowlist but)' "$rs")"
-
-# Each report_xpass must be followed by a fail verdict -- printing a failure
-# while the example still counts as passed is the same non-gate in a
-# different costume.
-check "every report_xpass records a fail verdict" 2 \
-    "$(grep -A 1 -E '^\s*report_xpass ' "$rs" | grep -cE '_verdict "\$out" fail')"
+check "the old private-list helpers are gone" 0 \
+    "$(grep -cE 'is_known_failure|known_failures_file|regression-known-failures[-a-z0-9]*\.txt"' "$rs")"
 
 echo
 echo "-----------------------------------------------"

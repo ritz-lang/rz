@@ -499,8 +499,9 @@ cmd_wait() {
 #
 # One verdict line per package:
 #   PKG PASS <id>
-#   PKG KNOWN <id>: ...         fails, excused in [ci.known_failing.build] as
-#                               `rz test --all` excuses it: advisory
+#   PKG KNOWN <id>: ...         fails, excused by a `build` entry in
+#                               known-failures/ as `rz test --all` excuses
+#                               it: advisory
 #   PKG PRE-EXISTING <id>: ...  fails on the base too: not this train's doing
 #   PKG FAIL <id>: ...          fails here, passes on the base (or is new)
 #
@@ -578,7 +579,10 @@ pkgs_list() {
 pkgs_test() {
     local base="$1" test="${RZ_PKG_TEST:-./rz test}" p id rc brc rc_all=0 pkgs known
     mapfile -t pkgs < <(pkgs_list "$base")
-    mapfile -t known < <(toml_keys 'c.get("ci", {}).get("known_failing", {}).get("build", {})')
+    # The excused ids, from the one known-failures parser (AGAST #1834).  A
+    # malformed list exits 2 with nothing on stdout: no excuses (fail closed).
+    mapfile -t known < <(python3 projects/ritz/tools/known_failures.py list \
+        --gate build --compiler any | cut -f1)
     BASE_WT=""
     trap '[[ -z "$BASE_WT" ]] || { git worktree remove --force "$BASE_WT/tree" >/dev/null 2>&1; rm -rf "$BASE_WT"; git worktree prune; }' EXIT
     echo "=== Train package tests (AGAST #3363): ${#pkgs[@]} package(s) vs base ${base:0:12}"
@@ -590,7 +594,7 @@ pkgs_test() {
         if [[ $rc -eq 0 ]]; then echo "PKG PASS $id"; continue; fi
         # Exact id match: a nested package isn't excused by its parent's entry.
         if printf '%s\n' ${known[@]+"${known[@]}"} | grep -qxF -- "$id"; then
-            echo "PKG KNOWN $id: exit $rc, excused in rz.toml [ci.known_failing.build] (advisory)"
+            echo "PKG KNOWN $id: exit $rc, excused in known-failures/ (gate = \"build\", advisory)"
             continue
         fi
         if ! git cat-file -e "$base:$p/ritz.toml" 2>/dev/null; then

@@ -252,8 +252,9 @@ main, and the gate fails if any `[[test]]` line on disk did not become an
 executed unit. Files using ISA extensions the host lacks (`REQUIRES_CPU`) are
 reported as skipped, never as passes.
 
-`EXPECTED_FAILURES` is strict-xpass and keyed `(compiler, "file")` or
-`(compiler, "file::fn")`. A file-level entry excuses only build failures
+Known failures are `gate = "matrix"` entries in the workspace's
+`known-failures/<agast>.toml`, classified by `tools/known_failures.py`. They
+are strict-xpass and keyed by compiler and `unit = "file"` or `"file::fn"`. A file-level entry excuses only build failures
 (compile/asm/link), which hit every fn at once; a runtime failure needs a
 per-fn entry. Each entry cites the AGAST ticket for its root cause.
 

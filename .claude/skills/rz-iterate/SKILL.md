@@ -582,7 +582,7 @@ CAS build-all just warmed. It's main.yml's own job, not a copy of its
 command, so the gate and CI can't drift. The sweep prints one verdict line
 per package, `PKG PASS|KNOWN|XPASS|SETUP|FAIL <id>`, with the failures last
 so `run-gate.sh --wait` (`grep '^PKG '`, `tail -20`) shows them.
-`[ci.known_failing.build]` entries stay advisory (`PKG KNOWN`); any other
+`build` entries in `known-failures/` stay advisory (`PKG KNOWN`); any other
 failure fails the gate. pr.yml (a pull_request workflow that never fired,
 since nothing lands by PR) and the advisory `lint-all` job were deleted.
 ritz-lint is a local pre-commit hook
@@ -766,7 +766,7 @@ train 1.
    every test binary, and #2072, ritzunit-only, broke ritzlib/tests and
    zeus through a green train. Each package gets one line, and
    `--wait` shows them:
-   `PKG PASS`, `PKG KNOWN` (in `[ci.known_failing.build]`: advisory, as in
+   `PKG PASS`, `PKG KNOWN` (a `build` entry in `known-failures/`: advisory, as in
    `rz test --all`), `PKG PRE-EXISTING` (fails on the base too, so it was
    re-run in a temp worktree of the base: not this train's) or `PKG FAIL`
    (passes on the base, or a new package): the gate fails. Treat a
@@ -887,7 +887,7 @@ the next merge. Committing to `main` from this room (skill edits and the
 like) needs no message either; it just becomes the next train's base.
 
 GitHub CI: glance at `gh run list -L 3` each turn. Red on an already-known
-failure set is normal (`[ci.known_failing.build]` reds). A **new** failure becomes a
+failure set is normal (`known-failures/` reds). A **new** failure becomes a
 high-priority ticket and a room. Don't block merges on CI.
 
 ## Survey rooms
@@ -903,7 +903,7 @@ and reaping it means only cleanup.
 Done when all five hold on `main`:
 
 1. **ritz1's known-failure list is empty**:
-   `projects/ritz/scripts/regression-known-failures-ritz1.txt` (20 entries at
+   `known-failures/` has no `regression` ritz1 entries (20 entries at
    the time of writing).
 2. **ritz1 builds every package ritz0 builds** (`./rz build --all` with ritz1).
 3. **ritz1 rejects everything ritz0 rejects**: same diagnostics for the

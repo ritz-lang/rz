@@ -310,25 +310,6 @@ WORKSPACE_SCHEMA = Table(
                                   default="os.cpu_count()"),
             },
             read_by=(f"{RZ}::resolve_jobs",)),
-        "ci": Table(
-            "CI gate policy.",
-            {
-                "known_failing": Table(
-                    "Known failures. There is deliberately no `test` table.",
-                    {
-                        "build": Map(
-                            "Projects whose `rz build --all` failure is advisory. "
-                            "An excused project that passes fails the gate.",
-                            "project id",
-                            Value(STRING, "Reason; must cite an AGAST task "
-                                  "(`#NNNN`).",
-                                  (f"{RZ}::known_failing_from_config",)),
-                            # The kind is a parameter: its callers name it.
-                            (f"{RZ}::cmd_build", f"{RZ}::cmd_test")),
-                    },
-                    read_by=(f"{RZ}::known_failing_from_config",)),
-            },
-            read_by=(f"{RZ}::known_failing_from_config",)),
     })
 
 

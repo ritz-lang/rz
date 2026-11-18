@@ -31,7 +31,7 @@ commands are in the next section and they are the same ones CI runs.
 | What is being worked on, what is blocked, why | **AGAST** — the task tracker. Not any file in this repo. |
 | Does the compiler work, right now | `make -C projects/ritz ci-local` — runs CI's job list, in CI's order, except that the recently changed ritz0 test files run first (`tools/likely_tests.py`, AGAST #3456) |
 | Which examples does each compiler accept | `projects/ritz/scripts/regression.sh` — the 5-stage differential suite |
-| Which failures are known and excused | `projects/ritz/scripts/regression-known-failures.txt` (ritz0) and `projects/ritz/scripts/regression-known-failures-ritz1.txt` (ritz1 / ritz1_selfhosted) |
+| Which failures are known and excused | `known-failures/<agast>.toml` at the workspace root, one file per ticket, read by `projects/ritz/tools/known_failures.py` for every gate (the regression suite's are `gate = "regression"`; ritz1 entries cover ritz1_selfhosted) |
 | What the language *is* | `docs/LANGUAGE_SPEC.md` — the normative standard, and its examples are compiled by CI |
 | How to build and test a package | the workspace-root `./rz` CLI, and `projects/ritz/build.py` |
 
@@ -45,10 +45,10 @@ Two notes that save time:
 
 ### The allowlists are the real roadmap
 
-`regression-known-failures*.txt` is the most honest statement of remaining work in
+`known-failures/` is the most honest statement of remaining work in
 the repo: an entry is a claim that the *compiler* cannot yet handle an example.
-Both files are strict in both directions — an allowlisted example that starts
-compiling fails the suite, so the lists cannot quietly rot green.
+Every entry is strict in both directions — a listed example that starts
+compiling fails its gate, so the list cannot quietly rot green.
 
 Read their header comments before trusting an entry. Several entries have been
 delisted after turning out to be bugs in the *example*, not the compiler, and the
@@ -97,7 +97,7 @@ reconnect them.
 |---|---|---|
 | **0. Fast iteration** | epic #1801 | A smoke tier catches "fully broken" in ≤ 2 min; the full gate takes ≤ 12 min uncontended; every module is compiled once per (content, compiler, flags). Design: `projects/larb/review/4/fast-iteration.md`. This track goes first, because every other track pays for the gate. |
 | **1. Self-hosted language** | epic #46 | ritz1 is *the* compiler, and ritz0 is only used for bootstrap. |
-| &nbsp;&nbsp;M1.1 ritz1 parity | #1828 | `regression-known-failures-ritz1.txt` and the matrix's ritz1 expected-failures are empty, and every package that builds under ritz0 builds under ritz1. |
+| &nbsp;&nbsp;M1.1 ritz1 parity | #1828 | `known-failures/` has no ritz1 entries for the `regression` or `matrix` gates, and every package that builds under ritz0 builds under ritz1. |
 | &nbsp;&nbsp;M1.2 One language | #1829 | The spec, ritz0 and ritz1 agree. Every ritz0-only feature (asm, closures, `dyn`, trait bounds, …) is either specified and ported, or removed. Ownership and Drop are decided. ritz0's type checker is on by default. |
 | &nbsp;&nbsp;M1.3 Structural quality | #1830 → #1812 | The LARB v4 compiler findings are closed: a sema phase, a typed IR builder, one type table, no silent capacity limits. |
 | &nbsp;&nbsp;M1.4 ritz1 by default | #1831 | `rz` builds with ritz1. ritz0 only builds stage-1 and acts as the differential oracle. |

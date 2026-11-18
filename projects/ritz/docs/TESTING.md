@@ -337,7 +337,7 @@ make -C projects/ritz matrix-full     # full bootstrap + matrix, ~1m 40s
 
 `example-tests` (`tools/example_tests.py`) runs each example's `test/*.ritz`
 but not its `test.sh`, which `scripts/regression.sh` runs. A failure that
-is not in its `KNOWN_FAILING` list (each entry citing a ticket) fails it, a
+is not listed in `known-failures/<agast>.toml` (`gate = "examples"`) fails it, a
 listed file that passes fails it, and so does a `test/*.ritz` on disk that no
 `ritz.toml` discovers. A new example's `test/` needs a `ritz.toml` beside it,
 even a `test_only = true` one.

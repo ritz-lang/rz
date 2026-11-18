@@ -372,11 +372,11 @@ class TestGateWiring:
                             calls.setdefault("bpar", (projects, jobs)) and
                             (list(failed), []))
         monkeypatch.setattr(rz, "known_failing_from_config",
-                            lambda kind: calls.setdefault("kf", kind) and
+                            lambda: calls.setdefault("kf", "build") and
                             {"q": "AGAST #1 — x"})
 
-        def gate(kind, f, kf, ran, list_kind=None, setup=None):
-            calls["gate"] = (kind, f, kf, ran, list_kind)
+        def gate(kind, f, kf, ran, setup=None):
+            calls["gate"] = (kind, f, kf, ran)
             return 0
         monkeypatch.setattr(rz, "summarize_gate", gate)
         args = rz.build_parser().parse_args(argv)
@@ -390,7 +390,7 @@ class TestGateWiring:
         assert calls["par"] == (["p", "q"], 4)
         assert calls["kf"] == "build"
         assert calls["gate"] == ("test", ["q"], {"q": "AGAST #1 — x"},
-                                 ["p", "q"], "build")
+                                 ["p", "q"])
 
     def test_parallel_build_sweep_feeds_gate(self, rz, monkeypatch):
         calls = self._run(rz, monkeypatch, ["build", "--all", "-j", "3"],

@@ -116,8 +116,8 @@ across 12 test files — the tests are where most of spire currently lives. But
   (`test_model_uuid.ritz`).
 
 These are real failures, not environment problems, and they are not excused
-anywhere in `rz.toml` — note that `rz.toml` deliberately has no
-`[ci.known_failing.test]` section, so this should be gating.
+anywhere — note that `known-failures/` deliberately has no
+`test` gate, so this should be gating.
 
 `ritz.toml` sets `test_only = true` with no `[[bin]]`, so `./rz build spire`
 correctly reports "nothing to build" and exits 0 — on all three compilers. Do

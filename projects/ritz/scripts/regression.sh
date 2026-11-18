@@ -306,32 +306,46 @@ get_examples() {
     } | sort -u
 }
 
-# Examples ritz0 is known not to compile yet, one key per line (`#` comments
-# allowed).  These are reported and excluded rather than failing the suite —
-# but anything NOT on the list that fails to compile is a hard failure.
+# Examples a compiler is known not to compile yet: `gate = "regression"`
+# entries in known-failures/<agast>.toml (workspace root), unit = the example
+# key.  Listed failures are reported and skipped; anything NOT listed that
+# fails to compile is a hard failure.  The one parser and the one outcome rule
+# live in tools/known_failures.py (AGAST #1834); this file only asks it.
 #
 # Previously every ritz0 compile failure was a silent `skip`, so the suite
-# could not go red no matter how much broke.  The allowlist is the difference
-# between "we know about these" and "we assert nothing".
-# One file per compiler: ritz0 and ritz1 have genuinely different gaps, and a
-# shared list would let a ritz1 regression hide behind a ritz0 entry.
+# could not go red no matter how much broke.  The list is the difference
+# between "we know about these" and "we assert nothing".  ritz0 and ritz1 have
+# separate entries: a shared list would let a ritz1 regression hide behind a
+# ritz0 entry.
 #
-# ritz1_selfhosted deliberately shares ritz1's list, and that sharing is SAFE
-# only because of Stage 5.  The reasoning matters, so read it before changing
-# either the file layout or the resolution below.
+# Rules carried over from the old regression-known-failures*.txt headers:
+#   * Compile failures only.  A behavioural difference (stdout or exit code
+#     against the ritz0 baseline) is never listed: that is a miscompile, and
+#     stages 3 and 4 exist to make miscompiles impossible to ignore.
+#   * An entry is a claim about the compiler.  Verify the example is real and
+#     know why it fails before listing it; an anonymous error is not evidence
+#     about whose bug it is.  The list should shrink.
+#   * "Cannot compile" is decided by clang, so entries are calibrated against
+#     the pinned clang/LLVM (docs/TOOLCHAIN.md).  Re-seeding against an
+#     unpinned clang produces a list that is wrong on every other machine.
 #
-# The header of the allowlist files states the design rule: compile failures
-# may be allowlisted, behavioural mismatches never.  That rule was written for
-# ritz0-vs-ritzN *behaviour*.  It said nothing about ritz1-vs-ritz1_selfhosted
-# *compile* divergence — and because both stages resolved to the same file,
-# each stage independently skipped a listed entry.  "ritz1 accepts it,
-# ritz1_selfhosted rejects it" was therefore indistinguishable from "both are
-# known-broken": the divergence never reached a comparison and the suite exited
-# 0.  Real instance (CI 33679700130, commit eef15af): stage 3 reported 50
-# passed / 35 skipped, stage 4 reported 49 passed / 36 skipped, and the single
-# example in the difference — tier5_async_49_ritzgen — compiled under ritz1 and
-# failed under the compiler ritz1 had built from its own source.  The
-# self-hosting fixed point was not reached and the gate said 🎉.
+# ritz1_selfhosted deliberately shares ritz1's entries (the parser maps it to
+# ritz1 and refuses a ritz1_selfhosted-only regression entry), and that
+# sharing is SAFE only because of Stage 5.  The reasoning matters, so read it
+# before changing either.
+#
+# The design rule is: compile failures may be listed, behavioural mismatches
+# never.  That rule was written for ritz0-vs-ritzN *behaviour*.  It said
+# nothing about ritz1-vs-ritz1_selfhosted *compile* divergence — and because
+# both stages resolved to the same list, each stage independently skipped a
+# listed entry.  "ritz1 accepts it, ritz1_selfhosted rejects it" was therefore
+# indistinguishable from "both are known-broken": the divergence never reached
+# a comparison and the suite exited 0.  Real instance (CI 33679700130, commit
+# eef15af): stage 3 reported 50 passed / 35 skipped, stage 4 reported 49
+# passed / 36 skipped, and the single example in the difference —
+# tier5_async_49_ritzgen — compiled under ritz1 and failed under the compiler
+# ritz1 had built from its own source.  The self-hosting fixed point was not
+# reached and the gate said 🎉.
 #
 # An allowlist may say "this program is known not to compile."  It must never
 # be able to say "these two compilers may disagree."  Stage 5 enforces exactly
@@ -342,34 +356,17 @@ get_examples() {
 # example to the list, or removing it, cannot change the Stage 5 verdict by
 # construction.  A red Stage 5 is a self-hosting bug in the compiler.
 #
-# RITZ_REGRESSION_RITZ1_ALLOWLIST replaces the ritz1 / ritz1_selfhosted list
-# with another file.  It exists for scripts/prove-stage5-divergence.sh only
-# (see "Stage 5 proof hooks" below); the gate never sets it.
-known_failures_file() {
-    case "$1" in
-        ritz1|ritz1_selfhosted)
-            echo "${RITZ_REGRESSION_RITZ1_ALLOWLIST:-$SCRIPT_DIR/regression-known-failures-ritz1.txt}" ;;
-        *)                      echo "$SCRIPT_DIR/regression-known-failures.txt" ;;
-    esac
-}
+# RITZ_KNOWN_FAILURES (a directory) replaces known-failures/ for every gate;
+# the module honours it.  scripts/prove-stage5-divergence.sh and the shell
+# tests set it; the gate never does.
+KNOWN_FAILURES_CLI="$ROOT_DIR/tools/known_failures.py"
 
-# Args: $1=compiler, $2=example key
-is_known_failure() {
-    local f
-    f=$(known_failures_file "$1")
-    [[ -f "$f" ]] || return 1
-    grep -qxF "$2" <(sed 's/#.*//; s/[[:space:]]*$//; /^$/d' "$f")
-}
-
-# Strict xpass: an allowlisted example that COMPILES fails the stage.
+# Strict xpass: a listed example that COMPILES fails the stage.
 #
 # This used to be a warn().  A warning does not force anything: the entry stays,
 # the suite stays green, and the list drifts from the compiler it claims to
 # describe.  That is the same "advisory gate is not a gate" shape main.yml
-# rejects for continue-on-error, and this file's own header already asserts the
-# stricter rule -- "The list should shrink" -- without enforcing it.  rz.toml's
-# [ci.known_failing.build] has enforced strict-xpass all along; this list, which
-# guards the compiler corpus, was the weaker of the two.
+# rejects for continue-on-error.
 #
 # Discovered 2026-09-07 (AGAST #1365): 74_async_tiers and 75_tier2_uring were
 # allowlisted as "async/uring corpus -- unmigrated against the current async
@@ -378,9 +375,45 @@ is_known_failure() {
 # member of the same ladder, was migrated and is not on the list.  Two lines of
 # sed made both compile.  Nothing told anyone, because the check only warned.
 #
-# Args: $1=compiler, $2=example key.  Returns 0 if this is an xpass.
+# Args: $1=compiler, $2=example key, $3=pass|fail (did it compile).
+# -S: stdlib only, skips site-packages start-up (~15% of the ~0.1 s CPU a call
+# costs; one call per compiled example per stage).
+# Prints the CLI's line: `pass`, `hard`, `known<TAB><cite>` or
+# `xpass<TAB><cite><TAB><file>`.  Prints `hard` when the CLI itself fails (a
+# malformed list, a bad argument), so a broken list fails closed.
+known_verdict() {
+    local v
+    if ! v=$(python3 -S "$KNOWN_FAILURES_CLI" verdict --gate regression \
+                 --compiler "$1" "$2" "$3") || [[ -z "$v" ]]; then
+        echo "known_failures.py failed for $1 $2; failing closed" >&2
+        v=hard
+    fi
+    printf '%s\n' "$v"
+}
+
+# A compile failure: skip it if listed, fail it otherwise.
+# Args: $1=compiler, $2=example key, $3=label, $4=result prefix
+judge_compile_failure() {
+    local v
+    v=$(known_verdict "$1" "$2" fail)
+    if [[ "${v%%$'\t'*}" == known ]]; then
+        warn "$2: $3 compile failed (known, ${v#known$'\t'})"
+        _verdict "$4" skip
+    else
+        fail "$2: $3 compile failed"
+        _verdict "$4" fail
+    fi
+}
+
+# A compile success: true (and the stage fails) when it is an xpass.
+# Args: $1=compiler, $2=example key, $3=result prefix
 report_xpass() {
-    fail "$2: on the $1 known-failure allowlist but COMPILES — delete the line in $(basename "$(known_failures_file "$1")")"
+    local v cite file
+    v=$(known_verdict "$1" "$2" pass)
+    [[ "${v%%$'\t'*}" == xpass ]] || return 1
+    IFS=$'\t' read -r _ cite file <<<"$v"
+    fail "$2: listed as a known $1 compile failure ($cite) but COMPILES — delete the entry in $file"
+    _verdict "$3" fail
 }
 
 # --- Differential accept-set recording (feeds Stage 5) ----------------------
@@ -1248,20 +1281,10 @@ stage1_judge() {
         # that was never produced.  The compile failure itself is reported
         # (or allowlisted) here.
         : > "$out.nocompile"
-        if is_known_failure ritz0 "$name"; then
-            warn "$name: ritz0 compile failed (known, allowlisted)"
-            _verdict "$out" skip
-        else
-            fail "$name: ritz0 compile failed"
-            _verdict "$out" fail
-        fi
+        judge_compile_failure ritz0 "$name" ritz0 "$out"
         return 0
     fi
-    if is_known_failure ritz0 "$name"; then
-        report_xpass ritz0 "$name"
-        _verdict "$out" fail
-        return 0
-    fi
+    report_xpass ritz0 "$name" "$out" && return 0
 
     # Correctness gate: the example's own test.sh, if it ships one.
     #
@@ -1489,7 +1512,8 @@ run_stage2() {
 # text-patch a copy of this file at Stage 4's compile line, and rotted when
 # that line moved here.  Two env vars replace the patch:
 #
-#   RITZ_REGRESSION_RITZ1_ALLOWLIST           see known_failures_file
+#   RITZ_KNOWN_FAILURES                       a known-failures directory
+#                                             (see known_verdict)
 #   RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT  an example key; ritz1_selfhosted
 #                                             rejects it without compiling
 #
@@ -1541,21 +1565,11 @@ differential_worker() {
     if injected_selfhosted_reject "$DIFF_COMPILER" "$name" ||
        ! compile_with "$DIFF_COMPILER" "$example_dir" "$bin" 2>/dev/null; then
         record_compile_outcome "$DIFF_COMPILER" "$name" rejected
-        if is_known_failure "$DIFF_COMPILER" "$name"; then
-            warn "$name: $DIFF_LABEL compile failed (known, allowlisted)"
-            _verdict "$out" skip
-        else
-            fail "$name: $DIFF_LABEL compile failed"
-            _verdict "$out" fail
-        fi
+        judge_compile_failure "$DIFF_COMPILER" "$name" "$DIFF_LABEL" "$out"
         return 0
     fi
     record_compile_outcome "$DIFF_COMPILER" "$name" accepted
-    if is_known_failure "$DIFF_COMPILER" "$name"; then
-        report_xpass "$DIFF_COMPILER" "$name"
-        _verdict "$out" fail
-        return 0
-    fi
+    report_xpass "$DIFF_COMPILER" "$name" "$out" && return 0
 
     # Correctness gate, then the differential.  Same shape as Stage 1: a
     # ritz1-built binary must satisfy the example's own assertions AND
@@ -1866,7 +1880,7 @@ echo "🎭 Ritz Regression Test Suite"
 echo "======================================"
 echo ""
 # A proof hook left set would quietly change what this run measures.
-for _hook in RITZ_REGRESSION_RITZ1_ALLOWLIST RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT; do
+for _hook in RITZ_KNOWN_FAILURES RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT; do
     [[ -n "${!_hook:-}" ]] && warn "$_hook=${!_hook} is set: a Stage 5 proof run, not a real one"
 done
 unset _hook

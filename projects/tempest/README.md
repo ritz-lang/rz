@@ -42,7 +42,7 @@ Tempest demonstrates the Ritz ecosystem end-to-end: from raw TCP bytes arriving 
 - `No method 'as_strview' found for type 'String'`
 
 Tracked as **AGAST #1302** (with the no-file-no-line reporting half as #1384),
-and listed in the workspace manifest's `[ci.known_failing.build]`, so `rz build
+and listed in `known-failures/` (gate `build`), so `rz build
 --all` reports it as an advisory failure rather than gating.
 
 Consequently there is no `tempest` binary — `projects/tempest/build/debug/` is

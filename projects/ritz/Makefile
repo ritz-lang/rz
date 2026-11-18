@@ -66,8 +66,8 @@ check-doc-examples:
 
 # AGAST #3928. The same documents under ritz1 and ritz1_selfhosted: a doc
 # example ritz0 accepts and ritz1 refuses (or miscompiles) used to pass the
-# gate. Known ritz1 failures are listed, each naming its ticket, in
-# tools/doc_known_failures/<ticket>.txt (#3963). ~1 s per compiler once built.
+# gate. Known ritz1 failures are gate = "doc" entries in the workspace's
+# known-failures/<ticket>.toml (#3963, #1834). ~1 s per compiler once built.
 .PHONY: check-doc-examples-ritz1
 check-doc-examples-ritz1: ritz1-bootstrap
 	@$(PYTHON) tools/check_doc_examples.py --compiler ritz1 $(DOC_EXAMPLE_DOCS)
@@ -110,8 +110,8 @@ arch-report:
 # Every examples/**/test/*.ritz [[test]] suite, with ritz0 (AGAST #3729).
 # rz.toml keeps examples out of `rz test --all`, and regression.sh runs each
 # example's test.sh but never its test/*.ritz, so until this target nothing
-# ran them. Fails on an unlisted failure, on a stale KNOWN_FAILING entry, and
-# if fewer files ran than exist on disk. See tools/example_tests.py.
+# ran them. Fails on an unlisted failure, on a stale known-failures entry
+# (gate = "examples"), and if fewer files ran than exist on disk. See tools/example_tests.py.
 .PHONY: example-tests
 example-tests:
 	@echo "=== Running example [[test]] suites ==="

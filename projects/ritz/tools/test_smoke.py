@@ -111,8 +111,9 @@ def test_checked_in_canary_list_passes_against_disk():
 def test_canaries_are_not_expected_failures():
     # A canary that is allowed to fail cannot report "broken".
     canaries = set(smoke.load_canaries(smoke.CANARY_FILE))
-    for _compiler, key in matrix.EXPECTED_FAILURES:
-        assert key.partition("::")[0] not in canaries, key
+    for e in matrix.kf.load():
+        if e.gate == "matrix":
+            assert e.unit.partition("::")[0] not in canaries, e
 
 
 # --------------------------------------------------------------------------

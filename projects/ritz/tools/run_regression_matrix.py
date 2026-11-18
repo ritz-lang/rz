@@ -11,6 +11,7 @@ from pathlib import Path
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 import exec_tmpdir  # noqa: E402  (AGAST #3704)
+import known_failures as kf  # AGAST #1834
 
 THIS_FILE = Path(__file__).resolve()
 RITZ_ROOT = THIS_FILE.parent.parent          # projects/ritz
@@ -38,47 +39,21 @@ RITZLIB_MODULES = ["sys", "io", "str", "fmt", "strview", "string", "hash", "memo
                    "gvec", "drop", "option", "result", "hashmap",
                    "span"]
 
-# Cells that are known to fail, keyed by (compiler, test) so an excuse for
-# ritz1 never silently covers ritz1_selfhosted — the two disagreeing is a
-# self-hosting bug, and scripts/regression.sh's allowlist header is explicit
-# that such a divergence must go red rather than be recorded.
+# Cells that are known to fail live in known-failures/<agast>.toml at the
+# workspace root, as gate = "matrix" entries keyed by (compiler, unit), and are
+# classified by tools/known_failures.py, the one copy of the hard / known /
+# xpass rule (AGAST #1834).  An excuse for ritz1 never covers ritz1_selfhosted:
+# the two disagreeing is a self-hosting bug, so each needs its own entry and,
+# if the twins diverge, the passing one turns xpass and the gate goes red.
 #
-# Every entry must name an AGAST task (enforced by
-# tools/test_run_regression_matrix_gate.py), and the list is STRICT-XPASS: a
-# cell listed here that starts passing fails the gate until the line is
-# deleted. That is the rule from rz.toml's [ci.known_failing.*] and, since
-# AGAST #1365, from scripts/regression.sh too. An allowlist that cannot go red
-# is an allowlist nobody edits — #1365 found two entries blaming the async
-# framework for what was really a syntax migration.
-EXPECTED_FAILURES = {}
-
-# AGAST #1371 — what the matrix found once it ran every [[test]] fn of every
-# file instead of fns[0] of 53. Each failure was triaged to a root cause and
-# ticketed individually; stale tests (assert c"msg", printf-style prints,
-# string_from(c"..."), a String Drop bound, a named asm label) were MIGRATED,
-# not listed. What remains is below, one ticket per root cause.
-#
-# Keys: "file" excuses build failures only (compile/asm/link — they hit every
-# fn at once); "file::fn" excuses one fn's runtime failure. A file with several
+# Keys: "file" excuses build failures only (compile/asm/link -- they hit every
+# fn at once); "file::fn" excuses one fn's runtime failure.  A file with several
 # causes cites the first blocker and names the rest, so whoever fixes the first
 # sees the entry go stale (xpass) or keep failing for a listed reason.
-#
-# These hold for ritz1 AND ritz1_selfhosted, which fail identically today, so
-# they are written once and expanded per compiler. That does not let one
-# excuse the other: each is still its own key, and if the twins ever diverge
-# the passing one turns xpass and the gate goes red.
-_RITZ1_TWINS = {
-    # --- grammar / missing features ---
-    "test_trait_bounds":
-        "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
-        "(multi-arg generic calls)",
-    # --- codegen, runtime failures ---
-}
-
-
-for _key, _reason in _RITZ1_TWINS.items():
-    EXPECTED_FAILURES[("ritz1", _key)] = _reason
-    EXPECTED_FAILURES[("ritz1_selfhosted", _key)] = _reason
+# STRICT-XPASS: an entry that starts passing fails the gate until it is
+# deleted.  An allowlist that cannot go red is an allowlist nobody edits --
+# #1365 found two entries blaming the async framework for what was really a
+# syntax migration.
 
 
 def ritz1_make_jobs():
@@ -104,44 +79,27 @@ def rebuild_ritz1(env):
         env=env, timeout=600).returncode
 
 
-def matrix_outcome(compiler, results, expected):
-    """Classify one compiler's results against the expected-failure list.
+def classify(results, known):
+    """One compiler's results against its excused keys, via known_failures.
 
-    Mirrors rz's gate_outcome (rz:135) so the workspace has one grammar for
-    this, not two that drift.
-
-    Returns (hard, known, xpass), each a sorted list of test names:
-      hard  — failed and not expected. Fails the gate.
-      known — failed and expected. Advisory; printed with its AGAST reference.
-      xpass — expected to fail but passed. Also fails the gate, so the entry
-              gets deleted rather than accumulating.
-
-    Only tests that actually RAN are considered, so `--tests <regex>` cannot
-    turn every unselected entry into a spurious xpass.
+    `results` maps unit -> (status, code, info); `known` is the excused keys
+    (kf.known("matrix", compiler)).  Units the host CPU skipped are dropped
+    first, so they are neither pass, failure nor xpass, and only units that
+    RAN count, so `--tests <regex>` makes no spurious xpass.  Returns a
+    known_failures.Outcome with sorted hard/xpass and a unit-sorted known
+    {unit: excusing key}.
     """
-    hard, known, xpass = [], [], []
-    results = {u: r for u, r in results.items() if r[0] not in SKIP_STATUSES}
-    for unit, (status, _code, _info) in results.items():
-        if status == "pass":
-            continue
-        if excuse_for(compiler, unit, status, expected):
-            known.append(unit)
-        else:
-            hard.append(unit)
-    # Strict-xpass, per entry. A per-fn entry is stale once that fn passes; a
-    # file-level entry is stale once the file builds (every unit ran past the
-    # build stage) — remaining runtime failures then need per-fn entries.
-    for c, key in expected:
-        if c != compiler:
-            continue
-        if "::" in key:
-            if key in results and results[key][0] == "pass":
-                xpass.append(key)
-            continue
-        units = [r for u, r in results.items() if u == key or u.startswith(key + "::")]
-        if units and not any(r[0] in BUILD_STATUSES for r in units):
-            xpass.append(key)
-    return sorted(hard), sorted(known), sorted(xpass)
+    ran = {u: r[0] for u, r in results.items() if r[0] not in SKIP_STATUSES}
+    o = kf.outcome(known, ran, scope=kf.matrix_scope, covers=kf.matrix_covers)
+    return kf.Outcome(sorted(o.hard), dict(sorted(o.known.items())), sorted(o.xpass))
+
+
+def classify_all(results, entries=None):
+    """{compiler: Outcome} for every compiler in `results`, each against its
+    own gate = "matrix" entries (default: the checked-in known-failures/)."""
+    if entries is None:
+        entries = kf.load()
+    return {c: classify(r, kf.known("matrix", c, entries)) for c, r in results.items()}
 
 
 def matrix_exit_code(outcomes):
@@ -152,10 +110,7 @@ def matrix_exit_code(outcomes):
     in nearly every commit message in this repo, and a CI step — exited 0 with
     red cells in its own printed summary.
     """
-    for hard, _known, xpass in outcomes.values():
-        if hard or xpass:
-            return 1
-    return 0
+    return 0 if all(o.ok for o in outcomes.values()) else 1
 
 
 # ---------------------------------------------------------------------------
@@ -197,9 +152,9 @@ NOT_TESTS = {
 SELECTOR_BASE = 33
 MAX_FNS_PER_FILE = 126 - SELECTOR_BASE + 1
 
-# Statuses produced before anything executes. A file-level EXPECTED_FAILURES
-# entry may only excuse these — a runtime failure needs a per-fn entry.
-BUILD_STATUSES = frozenset({"compile-fail", "asm-fail", "link-fail", "deps-fail"})
+# Statuses produced before anything executes.  A file-level known-failures
+# entry may only excuse these -- a runtime failure needs a per-fn entry.
+BUILD_STATUSES = kf.MATRIX_BUILD_STATUSES
 
 # Not run because the host CPU cannot execute the file's instructions. Printed
 # on every run; never a pass, never a failure, never makes an entry xpass.
@@ -345,22 +300,6 @@ def build_harness(src, fns):
             "    let ritz_matrix_k: i32 = ritz_matrix_sel[0] as i32\n"
             + "\n".join(arms) + "\n"
             "    126\n")
-
-
-def excuse_for(compiler, unit, status, expected):
-    """The EXPECTED_FAILURES key that excuses this failing unit, or None.
-
-    A per-fn entry excuses any failure of that fn. A file-level entry excuses
-    only build-stage failures, which by nature hit every fn in the file at once
-    and cannot be attributed to one; letting it cover runtime failures would
-    make a single line a bulk allowlist for the whole file.
-    """
-    if (compiler, unit) in expected:
-        return (compiler, unit)
-    file_name = unit.partition("::")[0]
-    if status in BUILD_STATUSES and (compiler, file_name) in expected:
-        return (compiler, file_name)
-    return None
 
 
 def floor_violations(srcs, results):
@@ -801,30 +740,28 @@ def main():
         # AGAST #1372 — classify, report, and let the outcome reach the exit
         # code. AGAST #1371 — plus the floor: what ran must cover what is on
         # disk, or the gate is red no matter how green the cells are.
-        outcomes = {
-            cname: matrix_outcome(cname, results[cname], EXPECTED_FAILURES)
-            for cname, _ in compilers
-        }
+        entries = kf.load()
+        outcomes = classify_all({cname: results[cname] for cname, _ in compilers}, entries)
         floor = floor_violations(srcs, results)
         print("\n=== Gate ===")
-        for cname, (hard, known, xpass) in outcomes.items():
-            if hard:
+        for cname, o in outcomes.items():
+            if o.hard:
                 by_file = {}
-                for u in hard:
+                for u in o.hard:
                     by_file.setdefault(u.partition("::")[0], []).append(u)
-                print(f"  ✗ {cname}: {len(hard)} unexpected failure(s) in {len(by_file)} file(s):")
+                print(f"  ✗ {cname}: {len(o.hard)} unexpected failure(s) in {len(by_file)} file(s):")
                 for f, us in sorted(by_file.items()):
                     st = sorted({results[cname][u][0] for u in us})
                     print(f"      {f}: {len(us)} fn [{', '.join(st)}]")
+            es = kf.entries_for("matrix", cname, entries)
             excused = {}
-            for u in known:
-                key = excuse_for(cname, u, results[cname][u][0], EXPECTED_FAILURES)
+            for u, key in o.known.items():
                 excused.setdefault(key, []).append(u)
             for key, us in sorted(excused.items()):
-                print(f"  ⚠ {cname}: {key[1]} ({len(us)} fn) — {EXPECTED_FAILURES[key]}")
-            for t in xpass:
-                print(f"  ✗ {cname}: {t} is in EXPECTED_FAILURES but no longer fails "
-                      f"that way — delete or narrow that entry in tools/run_regression_matrix.py")
+                print(f"  ⚠ {cname}: {key} ({len(us)} fn) — {es[key].cite}")
+            for t in o.xpass:
+                print(f"  ✗ {cname}: {t} is listed in known-failures/{es[t].agast}.toml but "
+                      f"no longer fails that way — delete or narrow that entry")
         for v in floor:
             print(f"  ✗ floor: {v}")
         rc = matrix_exit_code(outcomes)

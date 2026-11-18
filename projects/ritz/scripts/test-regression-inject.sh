@@ -2,7 +2,7 @@
 # Self-test for regression.sh's Stage 5 proof hooks (AGAST #3200).
 #
 # scripts/prove-stage5-divergence.sh proves end to end that a ritz1 vs
-# ritz1_selfhosted divergence which an allowlist silences in Stage 4 still
+# ritz1_selfhosted divergence which a known-failure entry silences in Stage 4 still
 # turns the suite red at Stage 5.  It used to get there by text-patching a
 # copy of regression.sh at Stage 4's compile line.  Stage 4 was refactored
 # into differential_worker, the line vanished, the patcher raised, and --
@@ -11,14 +11,16 @@
 # after a minute and a half of irrelevant work.
 #
 # The proof now drives two env-var hooks in regression.sh instead:
-#   RITZ_REGRESSION_RITZ1_ALLOWLIST          replaces the ritz1 /
-#                                            ritz1_selfhosted allowlist file
+#   RITZ_KNOWN_FAILURES                      replaces known-failures/ (a
+#                                            directory; tools/known_failures.py
+#                                            honours it for every gate)
 #   RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT ritz1_selfhosted rejects this
 #                                            example key without compiling it
 #
 # What must hold:
 #   * unset, neither hook changes anything (the gate never sets them)
-#   * the allowlist hook covers ritz1 and ritz1_selfhosted and nothing else
+#   * a ritz1 entry in the replacement covers ritz1 and ritz1_selfhosted and
+#     nothing else
 #   * the reject hook rejects exactly its example, under ritz1_selfhosted
 #     only, and the rejection reaches Stage 5's raw accept set
 #   * the proof exits 2 at once, without running a suite, when the
@@ -34,7 +36,7 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # The gate's environment must not leak in and pre-set a hook.
-unset RITZ_REGRESSION_RITZ1_ALLOWLIST RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT
+unset RITZ_KNOWN_FAILURES RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT
 
 export RITZ_REGRESSION_LIB_ONLY=1
 # shellcheck source=/dev/null
@@ -88,31 +90,27 @@ compiled()   { grep -qxF "$1 $2" "$COMPILE_LOG" 2>/dev/null; }
 not()        { ! "$@"; }
 eq()         { [[ "$1" == "$2" ]]; }
 
-REAL_RITZ1_LIST="$SCRIPT_DIR/regression-known-failures-ritz1.txt"
-REAL_RITZ0_LIST="$SCRIPT_DIR/regression-known-failures.txt"
+verdict()    { known_verdict "$1" "$2" fail | cut -f1; }
 
 echo "Hooks unset: regression.sh behaves as before"
-check "ritz1 uses the real ritz1 allowlist" \
-      eq "$(known_failures_file ritz1)" "$REAL_RITZ1_LIST"
-check "ritz1_selfhosted uses the real ritz1 allowlist" \
-      eq "$(known_failures_file ritz1_selfhosted)" "$REAL_RITZ1_LIST"
-check "ritz0 uses the real ritz0 allowlist" \
-      eq "$(known_failures_file ritz0)" "$REAL_RITZ0_LIST"
+check "the real list does not excuse the victim (ritz1)" \
+      eq "$(verdict ritz1 "$VICTIM")" hard
+check "the real list does not excuse the victim (ritz1_selfhosted)" \
+      eq "$(verdict ritz1_selfhosted "$VICTIM")" hard
 worker ritz1_selfhosted "$VICTIM_DIR"
 check "ritz1_selfhosted compiles the example" compiled ritz1_selfhosted 01_hello
 check "and records it accepted" recorded ritz1_selfhosted "$VICTIM" accepted
 
-echo "RITZ_REGRESSION_RITZ1_ALLOWLIST"
-export RITZ_REGRESSION_RITZ1_ALLOWLIST="$SCRATCH/synthetic.txt"
-echo "$VICTIM" > "$RITZ_REGRESSION_RITZ1_ALLOWLIST"
-check "ritz1 reads the replacement list" \
-      eq "$(known_failures_file ritz1)" "$SCRATCH/synthetic.txt"
-check "ritz1_selfhosted reads the replacement list" \
-      eq "$(known_failures_file ritz1_selfhosted)" "$SCRATCH/synthetic.txt"
-check "ritz0 still reads its own list" \
-      eq "$(known_failures_file ritz0)" "$REAL_RITZ0_LIST"
-check "is_known_failure consults it" is_known_failure ritz1_selfhosted "$VICTIM"
-unset RITZ_REGRESSION_RITZ1_ALLOWLIST
+echo "RITZ_KNOWN_FAILURES"
+export RITZ_KNOWN_FAILURES="$SCRATCH/known-failures"
+mkdir -p "$RITZ_KNOWN_FAILURES"
+printf '[[entry]]\ngate = "regression"\ncompiler = "ritz1"\nunit = "%s"\nreason = "synthetic"\nagast = 3200\n' \
+    "$VICTIM" > "$RITZ_KNOWN_FAILURES/3200.toml"
+check "ritz1 reads the replacement list" eq "$(verdict ritz1 "$VICTIM")" known
+check "ritz1_selfhosted reads ritz1's entry in it" \
+      eq "$(verdict ritz1_selfhosted "$VICTIM")" known
+check "ritz0 is not excused by a ritz1 entry" eq "$(verdict ritz0 "$VICTIM")" hard
+unset RITZ_KNOWN_FAILURES
 
 echo "RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT"
 export RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT="$VICTIM"
@@ -142,7 +140,7 @@ PROVE_RC=$?
 check "the proof exits 2" eq "$PROVE_RC" 2
 check "without running the suite" not test -e "$SCRATCH/suite-ran"
 check "and names the missing hook" \
-      grep -qE 'no RITZ_REGRESSION_[A-Z0-9_]+ hook' "$SCRATCH/prove.log"
+      grep -qE 'no RITZ_[A-Z0-9_]+ hook' "$SCRATCH/prove.log"
 
 echo ""
 echo "$TESTS_RUN checks, $TESTS_FAILED failed"

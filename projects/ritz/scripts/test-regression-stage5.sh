@@ -126,18 +126,25 @@ expect "example accepted by selfhosted but not ritz1 fails" 1 1
 setup_sets $'a\nb\nc\nd' $'a\nz'
 expect "all divergent examples are counted" 1 4
 
-# An allowlisted example still fails Stage 5.  This is the whole point: the
+# A listed example still fails Stage 5.  This is the whole point: the
 # allowlist is the mechanism that hid the original bug, so listing an entry
-# must not change this verdict.  tier5_async_49_ritzgen is genuinely on
-# regression-known-failures-ritz1.txt, so if Stage 5 consulted the allowlist at
-# all this case would pass and the assertion below would catch it.
+# must not change this verdict.  tier5_async_49_ritzgen (the original CI
+# instance) is listed for ritz1 in a synthetic known-failures directory, so if
+# Stage 5 consulted the list at all this case would pass and the assertion
+# below would catch it.
+export RITZ_KNOWN_FAILURES="$BUILD_DIR/known-failures"
+mkdir -p "$RITZ_KNOWN_FAILURES"
+printf '[[entry]]\ngate = "regression"\ncompiler = "ritz1"\nunit = "tier5_async_49_ritzgen"\nreason = "synthetic"\nagast = 3200\n' \
+    > "$RITZ_KNOWN_FAILURES/3200.toml"
 setup_sets $'tier5_async_49_ritzgen' ''
-if is_known_failure ritz1 tier5_async_49_ritzgen; then
-    expect "allowlisted example still fails Stage 5 (no escape hatch)" 1 1
+if [[ "$(known_verdict ritz1_selfhosted tier5_async_49_ritzgen fail | cut -f1)" == known ]]; then
+    expect "listed example still fails Stage 5 (no escape hatch)" 1 1
 else
-    echo "SKIP: tier5_async_49_ritzgen no longer allowlisted;" \
-         "pick another listed entry to keep this assertion meaningful"
+    echo "FAIL: the synthetic entry did not excuse tier5_async_49_ritzgen;" \
+         "this assertion would prove nothing"
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 fi
+unset RITZ_KNOWN_FAILURES
 
 # Two stages that never ran produce two empty sets, which compare equal.  That
 # must be reported as "not checked", never as a pass -- a green assembled from

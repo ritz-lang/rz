@@ -121,7 +121,7 @@ class TestWorkspaceMembers:
             assert f"../bench/regressions/2026-05-04/{name}" in found
 
     def test_top_level_projects_keep_their_bare_names(self, rz):
-        # [ci.known_failing.build] and every `rz build <name>` invocation key
+        # `build` known-failures units and every `rz build <name>` invocation key
         # on the bare directory name; that must not change.
         found = rz.discover_projects()
         assert "ritz" in found and "lexis" in found

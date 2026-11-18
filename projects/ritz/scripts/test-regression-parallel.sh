@@ -55,9 +55,8 @@ mkdir -p "$ROOT_DIR/ritz0" "$ROOT_DIR/ritzlib" "$ROOT_DIR/runtime" \
          "$ROOT_DIR/ritz1/build" "$BUILD_DIR" "$EXAMPLES_DIR"
 echo "# fake ritz0" > "$ROOT_DIR/ritz0/ritz0.py"
 echo "fn lib() -> i32" > "$ROOT_DIR/ritzlib/lib.ritz"
-# An empty allowlist pair, so no real entry can match a synthetic key.
-KNOWN="$SCRATCH/known.txt"; : > "$KNOWN"
-known_failures_file() { echo "$KNOWN"; }
+# An empty known-failures directory, so no real entry can match a synthetic key.
+export RITZ_KNOWN_FAILURES="$SCRATCH/known-failures"; mkdir -p "$RITZ_KNOWN_FAILURES"
 
 COMPILES="$SCRATCH/compiles.log"
 

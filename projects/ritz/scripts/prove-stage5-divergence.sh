@@ -17,10 +17,11 @@
 #
 #   1. RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT makes ritz1_selfhosted reject
 #      one example that plainly compiles under both.
-#   2. RITZ_REGRESSION_RITZ1_ALLOWLIST points the suite at a temporary
-#      allowlist = the real list + that example.  Stage 4 therefore reports
-#      the rejection as a benign "known, allowlisted" SKIP and contributes
-#      zero failures -- precisely the situation in which the old gate exited 0.
+#   2. RITZ_KNOWN_FAILURES points the suite at a temporary copy of
+#      known-failures/ plus a `regression` ritz1 entry for that example
+#      (ritz1 entries cover ritz1_selfhosted).  Stage 4 therefore reports the
+#      rejection as a benign "known, AGAST #..." SKIP and contributes zero
+#      failures -- precisely the situation in which the old gate exited 0.
 #   3. Assert the suite now exits 1, and that Stage 5 is what made it red.
 #
 # This used to text-patch a copy of regression.sh at Stage 4's compile line.
@@ -36,9 +37,8 @@
 #
 # Exit codes: 0 PROVEN, 1 NOT PROVEN, 2 could not set the proof up.
 #
-# Nothing tracked is modified: the synthetic allowlist is a temporary file,
-# removed on exit.  The real regression-known-failures-*.txt files are never
-# written to.  PROVE_STAGE5_REGRESSION_SH overrides the suite under test
+# Nothing tracked is modified: the synthetic list is a temporary directory,
+# removed on exit.  The real known-failures/ is never written to.  PROVE_STAGE5_REGRESSION_SH overrides the suite under test
 # (scripts/test-regression-inject.sh uses it).
 set -uo pipefail
 
@@ -57,7 +57,7 @@ setup_error() { echo "SETUP ERROR: $*" >&2; exit 2; }
 # The suite must have both hooks, or nothing below would inject anything and
 # the run would be the clean suite -- the exact rot this guards against.
 [[ -f "$REGRESSION_SH" ]] || setup_error "$REGRESSION_SH not found"
-for hook in RITZ_REGRESSION_RITZ1_ALLOWLIST RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT; do
+for hook in RITZ_KNOWN_FAILURES RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT; do
     grep -qF "$hook" "$REGRESSION_SH" ||
         setup_error "$REGRESSION_SH has no $hook hook -- update this proof"
 done
@@ -72,36 +72,44 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 T=$(mktemp -d) || setup_error "mktemp -d failed"
 trap 'rm -rf "$T"' EXIT
-TMP_ALLOW="$T/synthetic-allowlist.txt"
+TMP_KF="$T/known-failures"
 LOG="$T/synthetic-run.log"
 
-# --- 1. synthetic allowlist: the real ritz1 list, plus the victim -----------
-{ cat "$SCRIPT_DIR/regression-known-failures-ritz1.txt" && echo "$VICTIM"; } \
-    > "$TMP_ALLOW" || setup_error "could not write $TMP_ALLOW"
+# --- 1. synthetic list: the real known-failures/, plus the victim -----------
+# Filed under this proof's own ticket (AGAST #3200); appended, in case the
+# real directory has a 3200.toml.
+REAL_KF="$(cd "$ROOT_DIR/../.." && pwd)/known-failures"
+[[ -d "$REAL_KF" ]] || setup_error "$REAL_KF not found"
+cp -r "$REAL_KF" "$TMP_KF" &&
+    printf '\n[[entry]]\ngate = "regression"\ncompiler = "ritz1"\nunit = "%s"\nreason = "prove-stage5-divergence.sh synthetic entry"\nagast = 3200\n' \
+        "$VICTIM" >> "$TMP_KF/3200.toml" ||
+    setup_error "could not write $TMP_KF"
+RITZ_KNOWN_FAILURES="$TMP_KF" python3 "$ROOT_DIR/tools/known_failures.py" check ||
+    setup_error "the synthetic known-failures list does not parse"
 
 # --- 2. run it ---------------------------------------------------------------
 if [[ $INJECT -eq 1 ]]; then
     echo "Running the suite with a synthetic ritz1/ritz1_selfhosted divergence on:"
-    echo "  $VICTIM  (rejected by ritz1_selfhosted, and allowlisted so Stage 4 skips it)"
+    echo "  $VICTIM  (rejected by ritz1_selfhosted, and listed so Stage 4 skips it)"
 else
-    echo "CONTROL: running the suite with $VICTIM allowlisted but NOT rejected;"
+    echo "CONTROL: running the suite with $VICTIM listed but NOT rejected;"
     echo "  Stage 5 should pass and this proof should report NOT PROVEN."
 fi
 echo ""
 cd "$ROOT_DIR" || setup_error "cd $ROOT_DIR failed"
 rm -rf .regression
 if [[ $INJECT -eq 1 ]]; then
-    RITZ_REGRESSION_RITZ1_ALLOWLIST="$TMP_ALLOW" \
+    RITZ_KNOWN_FAILURES="$TMP_KF" \
     RITZ_REGRESSION_INJECT_SELFHOSTED_REJECT="$VICTIM" \
         "$REGRESSION_SH" > "$LOG" 2>&1
 else
-    RITZ_REGRESSION_RITZ1_ALLOWLIST="$TMP_ALLOW" \
+    RITZ_KNOWN_FAILURES="$TMP_KF" \
         "$REGRESSION_SH" > "$LOG" 2>&1
 fi
 rc=$?
 
 echo "--- relevant output -------------------------------------------------"
-grep -E "Stage [345]:|$VICTIM|fixed point|allowlist|regression tests" "$LOG" || true
+grep -E "Stage [345]:|$VICTIM|fixed point|allowlist|known|regression tests" "$LOG" || true
 echo "--- exit code: $rc --------------------------------------------------"
 echo ""
 
@@ -112,8 +120,8 @@ check() {
 }
 
 check "suite exits non-zero"                      "[[ $rc -ne 0 ]]"
-check "Stage 4 reports the victim as allowlisted" \
-      "grep -q '$VICTIM: self-hosted ritz1 compile failed (known, allowlisted)' '$LOG'"
+check "Stage 4 reports the victim as a known failure" \
+      "grep -q '$VICTIM: self-hosted ritz1 compile failed (known, AGAST #3200: ' '$LOG'"
 check "Stage 4 itself records zero failures"      "grep -q 'Stage 4: .* 0 failed' '$LOG'"
 check "Stage 5 is the stage that failed"          "grep -q 'Stage 5: FAILED' '$LOG'"
 check "Stage 5 names the divergent example"       \
