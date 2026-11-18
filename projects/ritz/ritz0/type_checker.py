@@ -29,7 +29,7 @@ import ritz_ast as rast
 from tail_value import slot_tails
 from monomorph import mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
-from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS
+from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
 from typed import Typed
 
 
@@ -114,6 +114,9 @@ class TypeChecker:
         self._tail_slot: Optional[rast.Type] = None
         # id(expr) already reported: a literal's elements are inferred twice.
         self._slot_reported: Set[int] = set()
+        # Undeclared struct names a `.field` was refused on, or #3347 refused
+        # at a string literal: each is reported once (AGAST #3404).
+        self._unknown_structs: Set[str] = set()
         # The types `let` bindings of the current fn hold, each its own copy, so
         # that a name is a `let` when its current type is one of them. A `var` or
         # pattern binding copies what it infers, or `var d = c` would be `c`'s.
@@ -346,6 +349,7 @@ class TypeChecker:
                 init_type = self._infer_into(stmt.value, stmt.type)
                 self._check_local_array_length(stmt, stmt.value, init_type, stmt.type)
                 root = self._referent(stmt.value)
+                self._note_refused_literal(stmt)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
@@ -365,6 +369,7 @@ class TypeChecker:
                 init_type = self._infer_into(stmt.value, stmt.type)
                 self._check_local_array_length(stmt, stmt.value, init_type, stmt.type)
                 root = self._referent(stmt.value)
+                self._note_refused_literal(stmt)
                 if stmt.type:
                     if not self._value_fits(stmt.value, init_type, stmt.type):
                         self._error(f"cannot initialize {self._type_str(stmt.type)} "
@@ -1228,6 +1233,9 @@ class TypeChecker:
             self._error(f"cannot access field on {self._type_str(base_type)}", expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
 
+        if self._refuse_unknown_struct_member(expr, base_type):
+            return rast.NamedType(expr.span, 'unknown', [])
+
         struct_info = self.structs.get(inner_type.name)
         if struct_info is None:
             self._error(f"type {inner_type.name} has no fields", expr.span)
@@ -1240,6 +1248,48 @@ class TypeChecker:
 
         self._error(f"struct '{struct_info.name}' has no field '{expr.field}'", expr.span)
         return rast.NamedType(expr.span, 'unknown', [])
+
+    def _undeclared_struct(self, ty: rast.Type) -> Optional[str]:
+        """The name `ty` gives, when it names no type at all: no struct, enum
+        or alias of the module (an import counts), nothing built in, and no
+        type parameter in scope.  None for any other type, and for a generic
+        instance: a global's `Vec<T>` keeps its bare name `Vec` after monomorph
+        has named the instance (the gate's rzsh build)."""
+        ty = self._resolve_alias(ty)
+        if (not isinstance(ty, rast.NamedType) or ty.args or '.' in ty.name
+                or self._is_opaque(ty)):
+            return None
+        if (ty.name in self.structs or ty.name in self.enums
+                or ty.name in self.type_aliases or ty.name in NameResolver.BUILTIN_TYPES):
+            return None
+        return ty.name
+
+    def _note_refused_literal(self, stmt) -> None:
+        """`let s: String = "abc"` with no type `String`: the emitter refuses
+        the literal (AGAST #3347), and that is the mistake to report, so a
+        `.field` on `s` says nothing more (as ritz1 does, #3362)."""
+        if stmt.type is not None and isinstance(stmt.value, rast.StringLit):
+            name = self._undeclared_struct(stmt.type)
+            if name is not None:
+                self._unknown_structs.add(name)
+
+    def _refuse_unknown_struct_member(self, expr: rast.Field, base_type: rast.Type) -> bool:
+        """`s.len` where the local or param `s` is a `Foo` and nothing declares
+        `Foo` (AGAST #3404): one located error at `s`, in ritz1's words
+        (emitter_expr_access.ritz, unknown_struct_member_refused, #3362),
+        once per type name.  The emitter raised a ValueError traceback on it.
+        True when `expr` is that case, reported now or before."""
+        if not isinstance(expr.expr, rast.Ident) or self._lookup_var(expr.expr.name) is None:
+            return False
+        name = self._undeclared_struct(base_type)
+        if name is None:
+            return False
+        if name not in self._unknown_structs:
+            self._unknown_structs.add(name)
+            self._slot_error(f"`{expr.expr.name}` is a `{name}`, which names no declared "
+                             f"struct: it has no field `{expr.field}` (is an import missing?)",
+                             expr.expr.span)
+        return True
 
     def _check_index(self, expr: rast.Index) -> rast.Type:
         """Type check index operation."""

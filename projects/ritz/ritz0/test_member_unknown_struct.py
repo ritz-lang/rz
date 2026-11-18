@@ -8,20 +8,24 @@ all a `var s: Foo` or a `s: String` param got.
 
 The rule: a member access on a local whose struct type is undeclared is one
 located error at the base, naming the type, given once per type name; a type
-that #3347 already refused at a literal is not reported again.  ritz1 only:
-ritz0 raises a ValueError on these (AGAST #3404).
+that #3347 already refused at a literal is not reported again.  ritz0 raised a
+ValueError traceback on these, with no location (AGAST #3404); its checker now
+gives ritz1's error.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from ritz0_inproc import run_ritz0
+
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 
-COMPILERS = ["ritz1", "ritz1_selfhosted"]
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 UNKNOWN = "names no declared struct"
 
@@ -41,21 +45,27 @@ TICKET = ('pub fn main() -> i32\n    let s: String = "abc"\n'
 
 
 def _compile(request, compiler, tmp_path, source):
-    request.getfixturevalue("ritz1_bin")
-    binary = RITZ1_BUILD / compiler
-    # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
-    assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
     src = tmp_path / "unit.ritz"
     src.write_text(source)
     ll = tmp_path / "unit.ll"
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
-    proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
-                          env=env, capture_output=True, text=True, timeout=300, check=False)
+    if compiler == "ritz0":
+        proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    else:
+        request.getfixturevalue("ritz1_bin")
+        binary = RITZ1_BUILD / compiler
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+        proc = subprocess.run([str(binary), str(src), "-o", str(ll)], cwd=tmp_path,
+                              env=env, capture_output=True, text=True, timeout=300, check=False)
     out = proc.stdout + proc.stderr
     # 1, a refusal: not 0 (accepted) and not a signal (a crash after the error).
     assert proc.returncode == 1, f"{compiler} exited {proc.returncode}:\n{out[-1500:]}"
     assert not ll.exists(), f"{compiler} wrote IR"
-    return [ln for ln in out.splitlines() if "error" in ln.lower()]
+    # A located line counts though it lacks "error": ritz0 prints each slot
+    # error after the first on a line of its own.
+    return [ln for ln in out.splitlines()
+            if "error" in ln.lower() or re.search(r"unit\.ritz:\d+:\d+:", ln)]
 
 
 @pytest.mark.integration
@@ -74,3 +84,25 @@ def test_a_string_refused_at_its_literal_is_not_reported_again(request, tmp_path
     errors = _compile(request, compiler, tmp_path, TICKET)
     assert len(errors) == 1, f"{compiler}: {errors}"
     assert "unit.ritz:2:21:" in errors[0], errors
+
+
+# Declared types the rule must leave alone (the gate's rzsh build, #3404): a
+# global generic instance, whose bare name `Vec` monomorph turns into an
+# instance, and a local one.  ritz0's own rule; ritz1's reads only locals.
+ACCEPTED = {
+    "global_generic": ("import ritzlib.gvec\n\nvar g: Vec<i64>\n\n"
+                       "fn main() -> i32\n    let n: i64 = g.len\n    0\n"),
+    "local_generic": ("import ritzlib.gvec\n\nfn main() -> i32\n"
+                      "    var v: Vec<i64> = vec_new<i64>()\n    let n: i64 = v.len\n    0\n"),
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("name", sorted(ACCEPTED))
+def test_member_on_a_declared_generic_instance_compiles(tmp_path, name):
+    src = tmp_path / "unit.ritz"
+    src.write_text(ACCEPTED[name])
+    ll = tmp_path / "unit.ll"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = run_ritz0([str(src), "-o", str(ll)], cwd=tmp_path, env=env, timeout=300)
+    assert proc.returncode == 0 and ll.exists(), proc.stdout + proc.stderr
