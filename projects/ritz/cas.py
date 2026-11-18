@@ -177,6 +177,9 @@ def file_sha256(path: Path) -> str:
 
 _TARGET: Optional[str] = None
 
+# Seconds `clang --version` may take before target_id() gives up on it.
+CLANG_VERSION_TIMEOUT: float = 30
+
 
 def target_id() -> str:
     """OS, machine and clang version: what `clang -c` output depends on."""
@@ -187,7 +190,15 @@ def target_id() -> str:
         try:
             with subprocess.Popen(["clang", "--version"], stdout=subprocess.PIPE,
                                   stderr=subprocess.DEVNULL, text=True) as proc:
-                out, _ = proc.communicate(timeout=30)
+                try:
+                    out, _ = proc.communicate(timeout=CLANG_VERSION_TIMEOUT)
+                except subprocess.TimeoutExpired:
+                    # Kill it here: Popen.__exit__ wait()s with no bound, so
+                    # a hung clang would otherwise outlive the timeout
+                    # (AGAST #4148). Not communicate() again: a grandchild
+                    # may still hold the pipe open.
+                    proc.kill()
+                    raise
             clang = out.splitlines()[0].strip() if out else "clang-unknown"
         except (OSError, subprocess.SubprocessError):
             clang = "clang-missing"
