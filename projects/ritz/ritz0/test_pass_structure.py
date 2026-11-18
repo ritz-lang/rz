@@ -98,8 +98,17 @@ def test_move_checker_functions_are_within_the_n2_thresholds(name):
     assert over == [], over
 
 
-def test_move_checker_file_is_under_1500_sloc():
-    assert _file_sloc("move_checker.py") < 1500
+@pytest.mark.parametrize("name", [
+    "move_checker.py",
+    # 1,868 and 2,314 SLOC before AGAST #3522 moved inference and rewriting
+    # into monomorph_infer / monomorph_rewrite / monomorph_core, and slot
+    # typing, reference rules and type queries into type_slots / type_refs /
+    # type_queries.
+    "monomorph.py",
+    "type_checker.py",
+])
+def test_file_is_under_1500_sloc(name):
+    assert _file_sloc(name) < 1500
 
 
 def _node_kinds(base):
