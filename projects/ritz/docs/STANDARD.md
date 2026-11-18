@@ -896,6 +896,26 @@ buf[0] = 'a'
 count += 1
 ```
 
+#### S-INIT-2 An integer narrows only with `as`
+
+**Status: ENFORCED**
+
+An unannotated integer binding is `i64`: `var i = 0` holds an `i64`, not an
+`i32`. Putting an `i64` in a narrower integer slot is an error unless the value
+is provably lossless (LANGUAGE_SPEC §7.5, #1393). Annotate the binding,
+`var i: i32 = 0`, or narrow on purpose with `<expr> as i32`.
+
+ritz0 and ritz1 refuse it in a typed `let` or `var` initialiser. ritz1 doesn't
+yet refuse an *unannotated* source like `var i = 0` (#1688). An assignment, a
+call argument and a `return` still narrow silently: ritz0 until #1444, ritz1
+until #4081. Write the `as` there too.
+
+```ritz body expect-error="implicit narrowing: `n` is declared `i32` but its initialiser has type `i64`"
+var i: i64 = 0
+i += 1
+let n: i32 = i
+```
+
 ---
 
 ## Changing this standard
