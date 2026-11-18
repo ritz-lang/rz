@@ -41,8 +41,10 @@
 # reports a junk line.  Only the header block's line structure and the
 # body framing are.
 #
-# No imports: valet pulls this file in as a dependency module, so it must
-# not reach for this package's other modules.
+# Imports ritzlib only: valet pulls this file in as a dependency module, so
+# it must not reach for this package's other modules.
+
+import ritzlib.strview
 
 
 pub const H1F_INCOMPLETE: i64 = -1
@@ -154,6 +156,18 @@ fn h1f_line_end(buf: *u8, pos: i64, len: i64) -> i64
     return H1F_INCOMPLETE
 
 
+# buf[0..len) as a decimal i64, 1*DIGIT only: no sign, no whitespace,
+# within i64 (ritzlib's strview_parse_i64, #4036).  Returns the value, or -1.
+# h1_utils' parse_content_length reads response lengths with it too.
+pub fn h1_parse_decimal(buf: *u8, len: i64) -> i64
+    # strview_parse_i64 takes a leading '-' or '+'; a length has none.
+    if len <= 0 or *buf < '0' or *buf > '9'
+        return -1
+    match strview_parse_i64(strview_from_ptr(buf, len))
+        Some(n) => n
+        None => -1
+
+
 # Parse a Content-Length value buf[start..end): optional whitespace around
 # 1*DIGIT.  Returns the length, or H1F_BAD_REQUEST.
 fn h1f_parse_length(buf: *u8, start: i64, end: i64) -> i64
@@ -163,19 +177,9 @@ fn h1f_parse_length(buf: *u8, start: i64, end: i64) -> i64
         s += 1
     while e > s and h1f_is_ows(*(buf + e - 1)) == 1
         e -= 1
-    if s == e
+    let v: i64 = h1_parse_decimal(buf + s, e - s)
+    if v < 0
         return H1F_BAD_REQUEST
-    var v: i64 = 0
-    var p: i64 = s
-    while p < e
-        let c: u8 = *(buf + p)
-        if c < '0' or c > '9'
-            return H1F_BAD_REQUEST
-        # (2^63 - 1) / 10: one more digit would overflow.
-        if v > 922337203685477579
-            return H1F_BAD_REQUEST
-        v = v * 10 + (c - '0') as i64
-        p += 1
     return v
 
 
@@ -327,6 +331,9 @@ pub fn h1_frame_request(buf: *u8, len: i64, max_body: i64, f: *H1Frame) -> i64
         return h1f_walk_chunked_total(buf, len, max_body, f)
     if cl_count > 0
         if max_body > 0 and cl > max_body
+            return H1F_TOO_LARGE
+        # The headers plus the body would not fit an i64 (i64::MAX parses).
+        if cl > 9223372036854775807 - p
             return H1F_TOO_LARGE
         f.body_kind = H1F_BODY_LENGTH
         f.body_len = cl
