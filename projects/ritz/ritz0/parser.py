@@ -956,6 +956,14 @@ class Parser:
             return left
 
         while True:
+            # A block operand (`5 + if c` … `else` … `2`, `-match x` …) ends
+            # in a DEDENT with no NEWLINE after it, so the next line's first
+            # token comes straight after it.  That line is a new statement
+            # (§2.2: a line that doesn't end in an operator ends it), even
+            # when it starts with `-` or `*` (AGAST #3435).
+            if self.pos > 0 and self.tokens[self.pos - 1].type == TokenType.DEDENT:
+                break
+
             prec = self._infix_precedence()
             if prec <= min_prec:
                 break
