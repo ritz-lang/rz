@@ -37,6 +37,8 @@ struct Client
     send_buf: *MessageBuffer  # Send buffer
     recv_buf: Vec<u8>         # Receive buffer; .len = bytes held (plaintext path only)
     last_error: i32           # Last error code
+    last_errno: i32           # errno of the last failed connect (0 if none);
+                              # see client_last_errno
     txn_active: i32           # Transaction active flag
 
     # Encryption state.  When `encrypted == 1`, send_message/recv_message
@@ -92,6 +94,7 @@ pub fn client_new() -> *Client
         free(client as *u8)
         return null
     client.last_error = PROTO_OK
+    client.last_errno = 0
     client.txn_active = 0
 
     # Encryption defaults to off.  client_connect leaves it that way;
@@ -141,15 +144,21 @@ pub fn client_free(client: *Client)
 const DEFAULT_CONNECT_TIMEOUT_MS: i32 = 5000
 
 # Connect to a server (with a 5-second connect timeout)
-pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, collection_len: i32) -> i32
+#
+# `host` must be a dotted-quad IPv4 address.  Returns 0 on success or a
+# negative step code; on -4 (TCP connect failed) client_last_errno says why
+# (ETIMEDOUT, ECONNREFUSED, EINVAL for a host that isn't a dotted quad).
+pub fn client_connect(client: *Client, host: StrView, port: i32, collection: StrView) -> i32
     if client == null
         return -1
     if client.connected != 0
         return -2  # Already connected
+    client.last_errno = 0
 
-    # Create socket
+    # Create socket (fd is -errno on failure)
     client.sock = socket_tcp()
     if client.sock.fd < 0
+        client.last_errno = 0 - client.sock.fd
         client.last_error = PROTO_ERR_DISCONNECTED
         return -3
 
@@ -158,7 +167,9 @@ pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, co
 
     # Connect to server with a bounded timeout.  An Err carries the errno
     # (ETIMEDOUT, ECONNREFUSED, EINVAL for a host that isn't a dotted quad).
-    if not connect_bounded(@&client.sock, host, port)
+    let connect_errno: i32 = connect_bounded(@&client.sock, host, port)
+    if connect_errno != 0
+        client.last_errno = connect_errno
         socket_close(@&client.sock)
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
@@ -174,7 +185,7 @@ pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, co
     # Send CONNECT message
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_connect(client.send_buf, req_id, collection, collection_len)
+    build_connect(client.send_buf, req_id, collection.ptr, collection.len as i32)
 
     let send_result: i32 = send_message(client)
     if send_result < 0
@@ -232,21 +243,26 @@ pub fn client_connect(client: *Client, host: *u8, port: i32, collection: *u8, co
 # nonce][ct][16 tag] framing), but build_connect / msgreader_init operate
 # on the plaintext payload — exactly the same shape the plain client uses.
 # So the protocol layer is identical; only the framing differs.
-pub fn client_connect_encrypted(client: *Client, host: *u8, port: i32, collection: *u8, collection_len: i32) -> i32
+# Return codes and client_last_errno as for client_connect.
+pub fn client_connect_encrypted(client: *Client, host: StrView, port: i32, collection: StrView) -> i32
     if client == null
         return -1
     if client.connected != 0
         return -2  # Already connected
+    client.last_errno = 0
 
-    # Create socket
+    # Create socket (fd is -errno on failure)
     client.sock = socket_tcp()
     if client.sock.fd < 0
+        client.last_errno = 0 - client.sock.fd
         client.last_error = PROTO_ERR_DISCONNECTED
         return -3
 
     socket_set_nodelay(@&client.sock)
 
-    if not connect_bounded(@&client.sock, host, port)
+    let connect_errno: i32 = connect_bounded(@&client.sock, host, port)
+    if connect_errno != 0
+        client.last_errno = connect_errno
         socket_close(@&client.sock)
         client.sock.fd = -1
         client.last_error = PROTO_ERR_DISCONNECTED
@@ -281,7 +297,7 @@ pub fn client_connect_encrypted(client: *Client, host: *u8, port: i32, collectio
     # Send protocol-level CONNECT (encrypted via channel_send)
     let req_id: i32 = client.next_request_id
     client.next_request_id += 1
-    build_connect(client.send_buf, req_id, collection, collection_len)
+    build_connect(client.send_buf, req_id, collection.ptr, collection.len as i32)
 
     if send_message(client) < 0
         client.encrypted = 0
@@ -378,15 +394,25 @@ pub fn client_last_error(client: *Client) -> i32
         return PROTO_ERR_INTERNAL
     return client.last_error
 
+# errno behind the last failed client_connect / client_connect_encrypted
+# (ETIMEDOUT, ECONNREFUSED, EINVAL, ...) when it failed creating or
+# connecting the TCP socket; 0 otherwise, or for a null client.  Reset at
+# the start of every connect attempt.
+pub fn client_last_errno(client: *Client) -> i32
+    if client == null
+        return 0
+    return client.last_errno
+
 # ============================================================================
 # Internal helpers
 # ============================================================================
 
-# Connect `sock` to `host`:`port` within DEFAULT_CONNECT_TIMEOUT_MS.
-fn connect_bounded(sock: @&Socket, host: *u8, port: i32) -> bool
-    match socket_connect_timeout(sock, strview_from_cstr(host), port, DEFAULT_CONNECT_TIMEOUT_MS)
-        Ok(_) => true
-        Err(_) => false
+# Connect `sock` to `host`:`port` within DEFAULT_CONNECT_TIMEOUT_MS: 0 once
+# connected, else the errno from socket_connect_timeout.
+fn connect_bounded(sock: @&Socket, host: StrView, port: i32) -> i32
+    match socket_connect_timeout(sock, host, port, DEFAULT_CONNECT_TIMEOUT_MS)
+        Ok(_) => 0
+        Err(e) => e
 
 # One read into the free tail of recv_buf (plaintext path): bytes read,
 # 0 at end of stream, or -errno.
