@@ -128,7 +128,7 @@ SCANNER_SKIP_TOKENS = frozenset({'EOF', 'ERROR', 'SKIP', 'NEWLINE', 'INDENT', 'D
 SCANNED_REGEX_TOKENS = {
     'IDENT': r'[a-zA-Z_][a-zA-Z0-9_]*',             # lexer_scan_ident
     'NUMBER': r'0x[0-9a-fA-F]+|0b[01]+|[0-9]+',     # lexer_scan_number
-    'FLOAT': r'[0-9]+\.[0-9]+',                     # lexer_scan_number
+    'FLOAT': r'[0-9]+\.[0-9]+([eE][+-]?[0-9]+)?|[0-9]+[eE][+-]?[0-9]+',  # lexer_scan_number
     'STRING': r'"([^"\\]|\\.)*"',                 # lexer_scan_string
     'CHAR': r"'([^'\\]|\\.|\\x[^'\n]*)'",         # lexer_scan_char
     'CSTRING': r'c"([^"\\]|\\.)*"',               # lexer_scan_string

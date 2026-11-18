@@ -134,9 +134,6 @@ RITZ1_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.ll"
 # An entry is held to its claim: if the block passes under that compiler, or
 # no checked block has that digest, the run fails and names the stale entry.
 KNOWN_FAILURES: dict[tuple[str, str, str], str] = {
-    # LANGUAGE_SPEC.md:246
-    ("ritz1", "LANGUAGE_SPEC.md", "065c93f07ee5"): "#3929: float literal exponents don't lex",
-    ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "065c93f07ee5"): "#3929: float literal exponents don't lex",
     # LANGUAGE_SPEC.md:609
     ("ritz1", "LANGUAGE_SPEC.md", "167278a25a58"): "#3935: usize and u64 are different generic args",
     ("ritz1_selfhosted", "LANGUAGE_SPEC.md", "167278a25a58"): "#3935: usize and u64 are different generic args",

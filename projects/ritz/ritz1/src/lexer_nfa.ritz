@@ -611,16 +611,49 @@ fn lexer_scan_ident(lex: *Lexer, out_len: *i32) -> i32
   *out_len = n as i32
   lexer_keyword(lex.src + at, n)
 
-# NUMBER /0x[0-9a-fA-F]+|0b[01]+|[0-9]+/ or FLOAT /[0-9]+\.[0-9]+/, whichever
-# is longer (they never tie).  Suffixes are lexer_number_suffix's.
+# lexer_match's kind for a number whose exponent has no digit (`1e`, `1e+`,
+# `2.0e-x`): *out_len is the offset of the byte where the digit should be.
+const LEX_NO_EXP_DIGIT: i32 = -2
+
+# The length of the exponent `[eE][+-]?[0-9]+` at `at`; 0 if no `e`/`E` is
+# there, -1 - (offset of the missing digit) when no digit follows the
+# `e` and its sign.  As ritz0, an `e` after the digits is always an exponent.
+fn lexer_exponent(lex: *Lexer, at: i64) -> i64
+  let c: i32 = lexer_at(lex, at)
+  if c != 101 and c != 69                                        # e E
+    return 0
+  var n: i64 = 1
+  let sign: i32 = lexer_at(lex, at + 1)
+  if sign == 43 or sign == 45                                    # + -
+    n = 2
+  let digits: i64 = lexer_run(lex, at + n, CLASS_DIGIT)
+  if digits == 0
+    return -1 - n
+  n + digits
+
+# NUMBER /0x[0-9a-fA-F]+|0b[01]+|[0-9]+/ or FLOAT, whichever is longer (they
+# never tie).  FLOAT is digits then a fraction `\.[0-9]+`, an exponent
+# `[eE][+-]?[0-9]+`, or both (AGAST #3929), as ritz0 lexes it: `2.0e10`,
+# `1e-5`.  `1.e5` has no fraction, so it is `1` `.` `e5`.  After `.` (a tuple
+# index) there is no exponent, as ritz0.  An `e` with no digit after it (and
+# its sign) is LEX_NO_EXP_DIGIT.  Suffixes are lexer_number_suffix's.
 fn lexer_scan_number(lex: *Lexer, out_len: *i32) -> i32
   let at: i64 = lex.pos
   let digits: i64 = lexer_run(lex, at, CLASS_DIGIT)
+  var mant: i64 = digits
   if lexer_at(lex, at + digits) == 46                            # .
     let frac: i64 = lexer_run(lex, at + digits + 1, CLASS_DIGIT)
     if frac > 0
-      *out_len = (digits + 1 + frac) as i32
-      return TOK_FLOAT
+      mant = digits + 1 + frac
+  var exp: i64 = 0
+  if lex.last_kind != TOK_DOT
+    exp = lexer_exponent(lex, at + mant)
+  if exp < 0
+    *out_len = (mant - 1 - exp) as i32
+    return LEX_NO_EXP_DIGIT
+  if mant > digits or exp > 0
+    *out_len = (mant + exp) as i32
+    return TOK_FLOAT
   var n: i64 = digits
   if lexer_at(lex, at) == 48                                     # 0
     var radix: i64 = 0
@@ -867,6 +900,12 @@ fn lexer_scan_token(lex: *Lexer) -> Token
     return lexer_scan_string(lex, TOK_CSTRING, 2)
   var len: i32 = 0
   var kind: i32 = lexer_match(lex, @len)
+  if kind == LEX_NO_EXP_DIGIT
+    # ritz0's error, at the byte where the exponent's digit should be.
+    lex.pos = lex.pos + len as i64
+    lex.col = lex.col + len
+    lexer_fail(lex, @tok, c"Expected digit after exponent")
+    return tok
   if kind < 0
     return lexer_bad_byte(lex)
   kind = lexer_number_suffix(lex, kind, @len)
