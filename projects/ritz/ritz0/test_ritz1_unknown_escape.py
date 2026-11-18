@@ -7,7 +7,7 @@ ritz0: ``Lexer error: b.ritz:2:22: Unknown escape sequence '\\x'``
 ritz1 (before): compiled, cooking the literal to ``axC3b`` -- the backslash of
 an unknown escape was dropped and the next byte kept, so the program saw 'x'.
 
-ROOT CAUSE: every escape-cooking site in ritz1 (lexer_nfa.ritz's plain-string
+ROOT CAUSE: every escape-cooking site in ritz1 (lexer.ritz's plain-string
 scanner, the c"..." scanners, and expr_char for char literals) ended its
 if/else chain with "unknown escape -> emit the literal char".
 

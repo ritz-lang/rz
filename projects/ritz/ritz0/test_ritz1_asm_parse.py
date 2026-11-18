@@ -4,7 +4,7 @@ Step 1 of #1619 for ritz1: the front end only.
 
 * `asm` is a keyword, so `let asm = 1` is refused where ritz0 refuses it.
 * An `asm` body is text, not Ritz: each indented line reaches the parser
-  whole (lexer_nfa.ritz asm body mode), so `$3`, `%rcx`, `(%rax)`, a quote
+  whole (lexer.ritz asm body mode), so `$3`, `%rcx`, `(%rax)`, a quote
   and `{{`/`}}` all survive.  A `#` comment is dropped.
 * The clauses, `(in|out|inout NAME (: REG)? | clobber REG, ...)`, parse.
 * Every §18.6 error that needs no types is reported, located (ERRORS).

@@ -44,7 +44,7 @@ def decode_escape(text: str, i: int, braces: bool) -> tuple:
 
     The one escape table for `_lex_string`, `_lex_cstring` and `_cook_plain`
     (AGAST #3450 noted the ladder was copied per literal kind). ritz1's twin
-    is lexer_nfa.ritz `lexer_cook_escape_at`; the two must agree.
+    is lexer.ritz `lexer_cook_escape_at`; the two must agree.
 
     AGAST #1872 added `\e` (ESC) and `\xNN`: exactly two hex digits, either
     case, and at most 0x7F. A literal is UTF-8 text, so a lone byte above
@@ -99,7 +99,7 @@ class Lexer:
         self.last_token_type: TokenType = None  # Track last token for regex detection
         # The current line's indentation.
         self.line_indent = 0
-        # asm body mode (LANGUAGE_SPEC §18.6, AGAST #3396; ritz1's lexer_nfa
+        # asm body mode (LANGUAGE_SPEC §18.6, AGAST #3396; ritz1's lexer.ritz
         # has the same).  An `asm` block's body is text, not Ritz:
         # `movq $3, %rcx` must reach the parser whole.  From an `asm` token
         # to the end of its line the lexer is in 'header' (newlines inside
@@ -114,7 +114,7 @@ class Lexer:
         self.asm_body = False       # the body's INDENT has been pushed
         # Open ( [ { (spec §2.2, AGAST #3426).  Inside them a line break and
         # the next line's indentation are whitespace: no NEWLINE, INDENT or
-        # DEDENT (ritz1's lexer_nfa bracket_depth).  `[[` opens two, as the
+        # DEDENT (ritz1 lexer.ritz's bracket_depth).  `[[` opens two, as the
         # parser closes it with two `]`.  This also lets an asm header's
         # clause list span lines (#3396).
         self.bracket_depth = 0

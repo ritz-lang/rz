@@ -3,7 +3,7 @@
 ritz1 used to rebuild a regex NFA from the grammar's token definitions for
 every file it lexed. Now the generator emits lexer_scan_gen.ritz once: a
 keyword lookup and an operator matcher for the literal tokens, while the
-regex tokens are scanned by hand in ritz1/src/lexer_nfa.ritz. These tests pin
+regex tokens are scanned by hand in ritz1/src/lexer.ritz. These tests pin
 the contract between the two: every literal token is emitted, and a grammar
 the hand-written scanner does not implement is refused, never generated into
 a lexer that silently lexes something else.
