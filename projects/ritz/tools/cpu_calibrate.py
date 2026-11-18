@@ -2,6 +2,8 @@
 """How many CPU-seconds a fixed workload costs on this host (AGAST #3897).
 
     cpu_calibrate.py --out PATH [--jobs N] [--rounds R] [--scratch DIR]
+    cpu_calibrate.py --out PATH --factor F
+    cpu_calibrate.py --runs N [--jobs N] [--rounds R] [--budget TOML]
 
 cost_meter's CPU-seconds are not portable: at ef9a7e2b the same ritz0 suite
 measured 1,454.5 CPU-s on toffee and 2,347 on omegalisk (1.6x).  One cap in
@@ -34,12 +36,25 @@ more CPU-s on the same work, and the suite pays that too.  `--rounds` repeats
 it after one uncounted warm-up; the figure is the median round's CPU-s per
 copy.  Out: {"cpu_s", "jobs",
 "rounds", "samples"} as JSON, and one line for the log.  A few seconds wall.
+
+A few seconds just before a ~20-minute suite is a reading of how busy the box
+is right now, too: skronk (normally ~1.67) read 1.054 and 1.072 under load and
+failed two gates whose tests all passed (AGAST #4172).  So a host can fix its
+factor instead, as host.env's RZ_CPU_FACTOR:
+
+* `--factor F` writes {"factor": F, "fixed": true} and times nothing;
+  check_test_budget.py takes F as it stands.  The gate passes it when the
+  host has one.
+* `--runs N` is how to find F, once, on an idle box: N whole calibrations,
+  each over the budget's reference_cpu_s, and their median, printed as the
+  RZ_CPU_FACTOR= line to copy into host.env.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import shutil
 import statistics
@@ -47,7 +62,10 @@ import subprocess
 import sys
 import tempfile
 import threading
+import tomllib
 from pathlib import Path
+
+DEFAULT_BUDGET = Path(__file__).resolve().parent / "test_budget.toml"
 
 # main.yml's `--maxprocesses 8`.
 MAX_PROCESSES = 8
@@ -192,15 +210,61 @@ def summarise(samples: list[float]) -> float:
     return statistics.median(samples)
 
 
+def positive_factor(v: str) -> float:
+    """argparse type for --factor: a finite number > 0, as host-env.sh checks."""
+    try:
+        f = float(v)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not a number: {v!r}") from None
+    if not math.isfinite(f) or f <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite number > 0: {v!r}")
+    return f
+
+
+def host_factor_runs(runs: int, jobs: int, rounds: int, scratch: Path | None,
+                     budget: Path) -> tuple[list[float], float]:
+    """`runs` whole calibrations as factors over the budget's reference, and
+    their median: the value for host.env's RZ_CPU_FACTOR."""
+    ref = float(tomllib.loads(budget.read_text())["calibration"]["reference_cpu_s"])
+    factors = [round(measure(jobs, rounds, scratch)["cpu_s"] / ref, 4)
+               for _ in range(runs)]
+    return factors, summarise(factors)
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--out", type=Path, required=True)
+    ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--jobs", type=int, default=None,
                     help="copies at once (default: the suite's xdist worker count)")
     ap.add_argument("--rounds", type=int, default=5)
     ap.add_argument("--scratch", type=Path, default=None,
                     help="where the copies work (default: $TMPDIR)")
+    ap.add_argument("--factor", type=positive_factor, default=None,
+                    help="this host's fixed factor (host.env's RZ_CPU_FACTOR, "
+                         "AGAST #4172): written as is, nothing is timed")
+    ap.add_argument("--runs", type=int, default=None,
+                    help="measure the factor N times and print the median, "
+                         "for host.env's RZ_CPU_FACTOR (run on an idle box)")
+    ap.add_argument("--budget", type=Path, default=DEFAULT_BUDGET,
+                    help="test_budget.toml, for --runs' reference_cpu_s")
     a = ap.parse_args(argv)
+    if a.runs is not None:
+        if a.runs < 1 or a.factor is not None:
+            ap.error("--runs takes N >= 1 and no --factor")
+        factors, med = host_factor_runs(a.runs, a.jobs or default_jobs(), a.rounds,
+                                        a.scratch, a.budget)
+        print(f"cpu factor: {' '.join(f'{f:.3f}' for f in factors)}, "
+              f"median of {a.runs} runs")
+        print(f"RZ_CPU_FACTOR={med:.3f}")
+        return 0
+    if a.out is None:
+        ap.error("--out is required (unless --runs)")
+    if a.factor is not None:
+        a.out.parent.mkdir(parents=True, exist_ok=True)
+        a.out.write_text(json.dumps({"factor": a.factor, "fixed": True}) + "\n")
+        print(f"cpu calibration: fixed factor {a.factor:.3f} (RZ_CPU_FACTOR), "
+              f"not measured -> {a.out}")
+        return 0
     r = measure(a.jobs or default_jobs(), a.rounds, a.scratch)
     a.out.parent.mkdir(parents=True, exist_ok=True)
     a.out.write_text(json.dumps(r) + "\n")

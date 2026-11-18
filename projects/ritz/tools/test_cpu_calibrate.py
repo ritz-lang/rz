@@ -98,3 +98,46 @@ def test_cli_writes_the_report(tmp_path):
 def test_median_of_rounds_ignores_one_outlier():
     assert cal.summarise([1.0, 1.1, 9.0]) == pytest.approx(1.1)
     assert cal.summarise([2.0]) == 2.0
+
+
+# --- a host's fixed factor (AGAST #4172) -------------------------------------------
+#
+# A few seconds of workload just before a ~20-minute suite read 1.054 on skronk
+# (normally ~1.67) when the box was busy, and failed two gates whose tests all
+# passed.  A host can pin its factor (host.env's RZ_CPU_FACTOR, measured once
+# on an idle box with --runs); the gate then passes --factor and nothing is
+# timed.
+
+
+@pytest.mark.unit
+def test_fixed_factor_is_written_without_measuring(tmp_path, monkeypatch, capsys):
+    def boom(*a, **k):
+        raise AssertionError("a fixed factor must not run the workload")
+    monkeypatch.setattr(cal, "measure", boom)
+    out = tmp_path / "cal.json"
+    assert cal.main(["--out", str(out), "--factor", "1.67"]) == 0
+    assert json.loads(out.read_text()) == {"factor": 1.67, "fixed": True}
+    assert "fixed factor 1.670" in capsys.readouterr().out
+
+
+@pytest.mark.unit
+def test_fixed_factor_must_be_a_finite_number_above_zero(tmp_path):
+    for bad in ("0", "-1.5", "nan", "inf", "fast"):
+        with pytest.raises(SystemExit):
+            cal.main(["--out", str(tmp_path / "cal.json"), "--factor", bad])
+    assert not (tmp_path / "cal.json").exists()
+
+
+@pytest.mark.unit
+def test_runs_prints_each_factor_and_the_median_for_host_env(tmp_path, monkeypatch, capsys):
+    """`--runs N` is how a host measures its RZ_CPU_FACTOR once, idle: N full
+    calibrations, each over the budget's reference, and their median."""
+    seq = iter([3.0, 9.0, 3.4])  # reference 2.0: factors 1.5, 4.5, 1.7
+    monkeypatch.setattr(cal, "measure",
+                        lambda jobs, rounds, scratch=None: {"cpu_s": next(seq)})
+    b = tmp_path / "budget.toml"
+    b.write_text("[calibration]\nreference_cpu_s = 2.0\n")
+    assert cal.main(["--runs", "3", "--jobs", "1", "--budget", str(b)]) == 0
+    out = capsys.readouterr().out
+    assert "1.500" in out and "4.500" in out and "1.700" in out
+    assert "RZ_CPU_FACTOR=1.700" in out.splitlines()[-1]

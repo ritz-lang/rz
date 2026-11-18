@@ -484,7 +484,10 @@ Rules:
    the budget line prints raw, factor and normalised.  Check locally with
    `cd ritz0 && python ../tools/cpu_calibrate.py --out cal.json && python
    -m pytest ... --cost-report=c.json && python ../tools/check_test_budget.py
-   c.json --calibration cal.json`.  Over budget?  Batch and resize
+   c.json --calibration cal.json`.  A host whose live reading is noisy
+   fixes its factor instead (host.env's `RZ_CPU_FACTOR`, AGAST #4172;
+   measure it idle with `cpu_calibrate.py --runs 5`): the step passes
+   `--factor` and nothing is timed.  Over budget?  Batch and resize
    the matrix; raising the number or adding an override needs a ticket.
 8. **A nested pytest loads only what it tests.**  Set
    `PYTEST_DISABLE_PLUGIN_AUTOLOAD=1` and name what it needs with `-p`

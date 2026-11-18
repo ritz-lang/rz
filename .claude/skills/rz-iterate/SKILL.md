@@ -138,6 +138,27 @@ stays here; remote hosts only run rooms.
   did at 17:35Z on 2026-11-18). Every process in every unit inherits it.
   `tools/test_check_test_budget.py` now deletes it per test, but other tests
   may not.
+- **A host's fixed CPU factor: `RZ_CPU_FACTOR=1.67` in `host.env`** (AGAST
+  #4172). The suite budget divides raw CPU-s by a host factor. Without this
+  key, `tools/cpu_calibrate.py` measures that factor for a few seconds just
+  before a ~20-minute suite, and a busy box gives a misleading reading:
+  skronk (~1.67) read 1.054 and failed two gates whose tests all passed.
+  With the key, nothing is measured and the value is used as it stands. It
+  must be a number > 0, checked like the scale. Measure it once, on an idle
+  box, from `projects/ritz/ritz0`:
+  `python ../tools/cpu_calibrate.py --runs 5`. It prints each run's factor
+  and a last line `RZ_CPU_FACTOR=<median>` to copy into `host.env`. Measure
+  again after a CPU, kernel, Python or clang change.
+  `run-gate.sh` puts the value in the unit's environment and logs its source
+  in the header: `CPU_FACTOR=1.67 (host.env)`, `(environment)` or
+  `CPU_FACTOR=(measured)`. main.yml's ritz0 step passes it to
+  `cpu_calibrate.py --factor` and unsets it before pytest runs. The budget
+  line then says `factor 1.670 fixed` rather than `measured`.
+  `RZ_CPU_FACTOR` in the caller's environment overrides the file for one
+  gate. `host-budget.sh --verify` prints `cpu factor=`.
+  **Add the key only once every room on the host is based on a commit with
+  #4172.** An older `host-env.sh` rejects unknown keys (#4138), so those
+  rooms can't gate until they rebase.
 - **One room's memory: `.claude/host-budget.sh --room-memory <room> <high>
   <max>`** (AGAST #3971), e.g. `--room-memory ritz-task-3965 10G 12G`, and
   `--clear-room-memory <room>` to go back to 3500M / 5G. **Only with Aaron's

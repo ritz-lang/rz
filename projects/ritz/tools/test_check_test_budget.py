@@ -265,6 +265,73 @@ def test_budget_line_prints_raw_factor_and_normalised(tmp_path, monkeypatch, cap
     assert "uncalibrated" in capsys.readouterr().out
 
 
+# --- AGAST #4172: a host's fixed factor --------------------------------------------
+#
+# cpu_calibrate.py --factor F (host.env's RZ_CPU_FACTOR) writes {"factor": F,
+# "fixed": true} and times nothing; the check takes F as it stands.
+
+
+def _fixed(tmp_path: Path, factor: float) -> Path:
+    p = tmp_path / "fixed.json"
+    p.write_text(json.dumps({"factor": factor, "fixed": True}))
+    return p
+
+
+@pytest.mark.unit
+def test_fixed_factor_is_used_as_is_not_over_the_reference(tmp_path):
+    b = budget()
+    b["calibration"] = {"reference_cpu_s": 2.0}
+    assert ctb.host_factor(b, _fixed(tmp_path, 1.67)) == pytest.approx(1.67)
+
+
+@pytest.mark.unit
+def test_budget_line_says_whether_the_factor_was_fixed_or_measured(tmp_path, capsys):
+    """skronk's false red: 1,330.4 raw / 1.054 measured = 1,262.8 > 1,260.  At
+    its fixed 1.67 the same report fits."""
+    rep = tmp_path / "cost.json"
+    rep.write_text(json.dumps(report({"test_a.py": 665.2, "test_b.py": 665.2})))
+    b = tmp_path / "budget.toml"
+    b.write_text("[calibration]\nreference_cpu_s = 2.0\n\n[suite]\ncpu_s = 1260.0\n\n"
+                 "[file]\ndefault_cpu_s = 1000.0\n")
+    assert ctb.main([str(rep), "--budget", str(b),
+                     "--calibration", str(_cal(tmp_path, 2.108))]) == 1
+    assert "factor 1.054 measured" in capsys.readouterr().out
+    assert ctb.main([str(rep), "--budget", str(b),
+                     "--calibration", str(_fixed(tmp_path, 1.67))]) == 0
+    assert "factor 1.670 fixed" in capsys.readouterr().out
+
+
+def _run_ritz0_step_factor_lines(tmp_path: Path, env: dict) -> dict[str, str]:
+    """The ritz0 step's RZ_CPU_FACTOR handling, run as the step runs it, with
+    `python` a stand-in.  Returns {"calibrate": its argv, "pytest": the
+    RZ_CPU_FACTOR pytest would inherit}."""
+    lines = [ln.strip() for ln in _ritz0_step().splitlines()]
+    keep = [ln for ln in lines if not ln.startswith("#") and (
+        "CPU_FACTOR" in ln or "-m pytest" in ln or "cpu_calibrate.py" in ln)]
+    stub = ('python() { case "$*" in *"-m pytest"*) '
+            'echo "${RZ_CPU_FACTOR-unset}" > "$OUT/pytest" ;; '
+            '*cpu_calibrate.py*) echo "$*" > "$OUT/calibrate" ;; esac; }')
+    base = {k: v for k, v in os.environ.items() if k != "RZ_CPU_FACTOR"}
+    r = subprocess.run(["bash", "-e", "-o", "pipefail", "-c", stub + "\n" + "\n".join(keep)],
+                       cwd=tmp_path, env={**base, "OUT": str(tmp_path),
+                                          "BASETEMP": str(tmp_path), **env},
+                       capture_output=True, text=True, timeout=30, check=False)
+    assert r.returncode == 0, r.stderr
+    return {n: (tmp_path / n).read_text().strip() for n in ("calibrate", "pytest")}
+
+
+@pytest.mark.integration
+def test_gate_cpu_factor_reaches_the_calibration_only(tmp_path):
+    """AGAST #4172: run-gate.sh passes RZ_CPU_FACTOR in; the step hands it to
+    cpu_calibrate.py as --factor and takes it out of pytest's environment.
+    Without it the step calibrates live, as before."""
+    seen = _run_ritz0_step_factor_lines(tmp_path, {"RZ_CPU_FACTOR": "1.67"})
+    assert seen["calibrate"].endswith("--factor 1.67"), seen
+    assert seen["pytest"] == "unset", seen
+    seen = _run_ritz0_step_factor_lines(tmp_path, {})
+    assert "--factor" not in seen["calibrate"], seen
+
+
 @pytest.mark.unit
 def test_real_budget_names_its_reference_workload_figure():
     b = ctb.load_budget(ctb.DEFAULT_BUDGET)

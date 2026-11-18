@@ -183,6 +183,24 @@ if [[ -n "$BUDGET_SCALE" ]] && ! rz_budget_scale_ok "$BUDGET_SCALE"; then
     echo "error: RZ_TEST_BUDGET_SCALE must be a number > 0 like 1.5: '$BUDGET_SCALE'" >&2
     exit 2
 fi
+# This host's fixed CPU factor for that budget (AGAST #4172): RZ_CPU_FACTOR in
+# this script's environment (one gate), else host.env's.  The unit gets it
+# under that name; main.yml's ritz0 step hands it to cpu_calibrate.py as
+# --factor, never to pytest.  Unset, the step measures the factor live.
+if [[ -n "${RZ_CPU_FACTOR:-}" ]]; then
+    CPU_FACTOR="$RZ_CPU_FACTOR" CPU_FACTOR_FROM="environment"
+else
+    CPU_FACTOR="${HOST_ENV[RZ_CPU_FACTOR]:-}" CPU_FACTOR_FROM="host.env"
+fi
+if [[ -n "$CPU_FACTOR" ]] && ! rz_budget_scale_ok "$CPU_FACTOR"; then
+    echo "error: RZ_CPU_FACTOR must be a number > 0 like 1.67: '$CPU_FACTOR'" >&2
+    exit 2
+fi
+if [[ -n "$CPU_FACTOR" ]]; then
+    CPU_FACTOR_HDR="$CPU_FACTOR ($CPU_FACTOR_FROM)"
+else
+    CPU_FACTOR_HDR="(measured)"
+fi
 # Wipe ritz1/build too: a gate is a verdict on the commit, not on whatever
 # objects an earlier base left behind.  Reusing it is how #1497 got 30 bogus
 # failures from stale struct layouts (AGAST #1659).
@@ -240,8 +258,8 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nBUDGET_SCALE=%s\n' \
-    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$BUDGET_SCALE" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\n' \
+    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that
@@ -475,6 +493,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=RZ_TMPDIR="$GATE_TMP" --setenv=RZ_PROBE="$PROBE" \
     --setenv=RZ_STARVE="${RZ_GATE_STARVE:-2700}" \
     --setenv=RZ_TEST_BUDGET_SCALE="$BUDGET_SCALE" \
+    --setenv=RZ_CPU_FACTOR="$CPU_FACTOR" \
     /bin/bash "$SCRIPT"
 
 echo "$LOG"

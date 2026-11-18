@@ -346,9 +346,10 @@ def test_verify_reports_the_values_in_effect(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "MemoryHigh=7G MemoryMax=8G" in r.stdout
     assert "gate slots=1" in r.stdout
+    assert "cpu factor=measured" in r.stdout  # AGAST #4172: no key, live calibration
     assert "no host config" in r.stdout
 
-    _host_env(tmp_path, HUBURGHT_ENV)
+    _host_env(tmp_path, HUBURGHT_ENV + "RZ_CPU_FACTOR=1.67\n")
     # The installed slice is now stale against the host's config.
     r = _budget(tmp_path, env, "--verify", ROOM)
     assert r.returncode != 0
@@ -359,6 +360,7 @@ def test_verify_reports_the_values_in_effect(tmp_path):
     assert r.returncode == 0, r.stderr
     assert "MemoryHigh=28G MemoryMax=32G" in r.stdout
     assert "gate slots=2" in r.stdout
+    assert "cpu factor=1.67" in r.stdout
     assert env["RZ_HOST_ENV"] in r.stdout
 
 
@@ -377,6 +379,8 @@ def test_verify_reports_the_values_in_effect(tmp_path):
         "RZ_TEST_BUDGET_SCALE=-1.5\n",
         "RZ_TEST_BUDGET_SCALE=1.5x\n",
         "RZ_TEST_BUDGET_SCALE=\n",
+        "RZ_CPU_FACTOR=0\n",  # AGAST #4172: a factor must be > 0 (shared check)
+        "RZ_CPU_FACTOR=fast\n",
     ],
 )
 def test_bad_config_is_refused_and_writes_nothing(tmp_path, text):

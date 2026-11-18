@@ -473,6 +473,21 @@ printf 'RZ_TEST_BUDGET_SCALE=0\n' > "$T/scale0.env"
 out="$(RZ_HOST_ENV="$T/scale0.env" RZ_GATE_CMD="$probe" gate "$W" t19 2>&1)"; rc=$?
 check '[[ $rc -eq 2 ]] && [[ "$out" == *host.env* || "$out" == *scale0.env* ]]' "a zero scale in host.env is refused (rc=$rc)"
 
+# AGAST #4172: host.env's RZ_CPU_FACTOR (a host's fixed CPU factor) reaches the
+# gate's command as RZ_CPU_FACTOR (main.yml hands it to cpu_calibrate.py as
+# --factor, never to pytest); the caller's env overrides the file.  The header
+# says where the factor comes from.
+probe='echo "FACTOR=[${RZ_CPU_FACTOR:-}]"'
+l20="$(RZ_GATE_CMD="$probe" gate "$W" t20)"
+check 'grep -qx "FACTOR=\[\]" "$l20" && grep -qx "CPU_FACTOR=(measured)" "$l20"' "no RZ_CPU_FACTOR: the command sees none and the header says measured"
+printf 'RZ_GATE_SLOTS=1\nRZ_CPU_FACTOR=1.67\n' > "$T/factor.env"
+l20="$(RZ_HOST_ENV="$T/factor.env" RZ_GATE_CMD="$probe" gate "$W" t20)"
+check 'grep -qx "FACTOR=\[1.67\]" "$l20" && grep -qx "CPU_FACTOR=1.67 (host.env)" "$l20"' "host.env's factor reaches the command and the header"
+l20="$(RZ_HOST_ENV="$T/factor.env" RZ_CPU_FACTOR=2 RZ_GATE_CMD="$probe" gate "$W" t20)"
+check 'grep -qx "FACTOR=\[2\]" "$l20" && grep -qx "CPU_FACTOR=2 (environment)" "$l20"' "RZ_CPU_FACTOR in the caller's env overrides host.env"
+out="$(RZ_CPU_FACTOR=1e3 RZ_GATE_CMD="$probe" gate "$W" t20 2>&1)"; rc=$?
+check '[[ $rc -eq 2 ]] && [[ "$out" == *RZ_CPU_FACTOR* ]]' "a malformed factor override is refused (rc=$rc)"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

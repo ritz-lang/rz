@@ -32,6 +32,10 @@ it is the host's factor, and every CPU figure is divided by it before it meets
 a cap.  The budget line prints the raw figure, the factor and the normalised
 one.  Without --calibration the factor is 1 and the line says "uncalibrated".
 
+A host with a fixed factor (host.env's RZ_CPU_FACTOR, AGAST #4172) has
+cpu_calibrate.py --factor write {"factor": F, "fixed": true} instead; F is the
+factor as it stands, and the line says "fixed" rather than "measured".
+
 RITZ_TEST_BUDGET_PARTIAL=1 says the report covers a subset of the suite (the
 gate's likely-failures-first pass, AGAST #3456): only the per-file checks
 apply.  The full step's report folds that subset back in, and is checked whole.
@@ -65,8 +69,16 @@ def host_factor(budget: dict, calibration: Path | None) -> float:
     """This host's CPU-s over the reference host's, for the same workload."""
     if calibration is None:
         return 1.0
-    here = float(json.loads(Path(calibration).read_text())["cpu_s"])
-    return here / float(budget["calibration"]["reference_cpu_s"])
+    cal = json.loads(Path(calibration).read_text())
+    if cal.get("fixed"):
+        return float(cal["factor"])
+    return float(cal["cpu_s"]) / float(budget["calibration"]["reference_cpu_s"])
+
+
+def factor_is_fixed(calibration: Path | None) -> bool:
+    """Was the factor set by the host (RZ_CPU_FACTOR), not measured?"""
+    return calibration is not None and bool(
+        json.loads(Path(calibration).read_text()).get("fixed"))
 
 
 def check(report: dict, budget: dict, scale: float = 1.0,
@@ -138,7 +150,8 @@ def main(argv: list[str] | None = None) -> int:
     errs = check(report, budget, scale, partial=partial, factor=factor)
     scope = ", partial: per-file checks only" if partial else ""
     raw = sum(float(v["cpu_s"]) for v in report["files"].values())
-    cal = (f"factor {factor:.3f}" if a.calibration is not None
+    how = "fixed" if factor_is_fixed(a.calibration) else "measured"
+    cal = (f"factor {factor:.3f} {how}" if a.calibration is not None
            else "factor 1, uncalibrated")
     cap = float(budget["suite"]["cpu_s"]) * scale
     figures = (f"{raw:.1f} CPU-s raw, {cal}, {raw / factor:.1f} normalised "

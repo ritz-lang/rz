@@ -13,6 +13,11 @@
 #                              shows (AGAST #4004, #4138).  run-gate.sh passes it
 #                              to the gate; main.yml hands it to the budget check
 #                              alone, never to pytest
+#   RZ_CPU_FACTOR=1.67         this host's CPU factor for that budget, fixed
+#                              (AGAST #4172).  Unset: cpu_calibrate.py measures
+#                              it for a few seconds before each suite, which a
+#                              busy box misreads (skronk: 1.054 for ~1.67).
+#                              Measure it once, idle: cpu_calibrate.py --runs 5
 #
 # Every key is optional; a missing key (or no file at all) keeps the script's
 # default, which is sized for omegalisk's 15.6 GiB VM (7G / 8G / 1).  Only
@@ -59,7 +64,7 @@ rz_host_env_load() {
                     return 1
                 }
                 ;;
-            RZ_TEST_BUDGET_SCALE)
+            RZ_TEST_BUDGET_SCALE | RZ_CPU_FACTOR)
                 rz_budget_scale_ok "$val" || {
                     echo "error: $RZ_HOST_ENV_FILE:$n: $key must be a number > 0 like 1.5: '$val'" >&2
                     return 1
@@ -68,7 +73,7 @@ rz_host_env_load() {
             *)
                 echo "error: $RZ_HOST_ENV_FILE:$n: unknown key $key" \
                     "(known: RZ_ROOMS_MEMORY_HIGH RZ_ROOMS_MEMORY_MAX RZ_GATE_SLOTS" \
-                    "RZ_TEST_BUDGET_SCALE)" >&2
+                    "RZ_TEST_BUDGET_SCALE RZ_CPU_FACTOR)" >&2
                 return 1
                 ;;
         esac
@@ -77,7 +82,8 @@ rz_host_env_load() {
 }
 
 # rz_budget_scale_ok <v>: is <v> a plain decimal > 0 (1, 1.5, 0.75)?  Exponents,
-# signs and inf/nan are refused: check_test_budget.py's float() would take them.
+# signs and inf/nan are refused: Python's float() would take them.  Checks
+# RZ_TEST_BUDGET_SCALE and RZ_CPU_FACTOR alike.
 rz_budget_scale_ok() {
     [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ && "$1" =~ [1-9] ]]
 }
