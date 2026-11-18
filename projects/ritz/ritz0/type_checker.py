@@ -708,13 +708,27 @@ class TypeChecker:
 
         # Arithmetic operators
         if expr.op in ('+', '-', '*', '/', '%'):
+            # Pointer difference, LANGUAGE_SPEC §7.1 (AGAST #3600): `q - p` on two
+            # `*T` is their distance in elements, an i64.  A reference operand
+            # (`@T`, `@&T`, or the `@x` that infers one) falls through to the
+            # error below (LARB R16); two pointee types are the emitter's
+            # refusal (#2957), which runs on every compile.
+            if (expr.op == '-' and self._is_raw_ptr(left_type)
+                    and self._is_raw_ptr(right_type)):
+                return rast.NamedType(expr.span, 'i64', [])
             # Pointer/reference arithmetic: ptr + int or ptr - int
-            if isinstance(left_type, (rast.PtrType, rast.RefType)) and self._is_int_or_opaque(right_type):
+            if (expr.op in ('+', '-')
+                    and isinstance(left_type, (rast.PtrType, rast.RefType))
+                    and self._is_int_or_opaque(right_type)):
                 # Return as pointer type for arithmetic result
                 if isinstance(left_type, rast.RefType):
                     return rast.PtrType(expr.span, left_type.inner, mutable=left_type.mutable)
                 return left_type
-            if isinstance(right_type, (rast.PtrType, rast.RefType)) and self._is_int_or_opaque(left_type):
+            # int + ptr; `int - ptr` names nothing, but an operand this pass
+            # can't judge (a type parameter, `unknown`) may be a pointer
+            if ((expr.op == '+' or self._is_opaque(self._resolve_alias(left_type)))
+                    and isinstance(right_type, (rast.PtrType, rast.RefType))
+                    and self._is_int_or_opaque(left_type)):
                 if isinstance(right_type, rast.RefType):
                     return rast.PtrType(expr.span, right_type.inner, mutable=right_type.mutable)
                 return right_type
@@ -2353,6 +2367,11 @@ class TypeChecker:
 
     def _is_bool_or_opaque(self, ty: rast.Type) -> bool:
         return self._is_bool_type(ty) or self._is_opaque(self._resolve_alias(ty))
+
+    def _is_raw_ptr(self, ty: rast.Type) -> bool:
+        """A `*T`.  This pass types `@x` / `@&x` as a RefType; PtrType's
+        `shared` / `mut_ref` marks are monomorph's and the emitter's."""
+        return isinstance(self._resolve_alias(ty), rast.PtrType)
 
     def _is_int_or_opaque(self, ty: rast.Type) -> bool:
         return self._is_integer_type(ty) or self._is_opaque(self._resolve_alias(ty))
