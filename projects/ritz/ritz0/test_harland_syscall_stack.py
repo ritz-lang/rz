@@ -110,3 +110,86 @@ def test_check_panics_and_runs_where_syscalls_leave_the_kernel():
     assert exit_body.index("syscall_stack_check()") < exit_body.index(
         "resume_user_frame("
     ), exit_body
+
+
+# ---------------------------------------------------------------------------
+# AGAST #1877: an unmapped guard page under the stack, and no big locals on
+# syscall paths. The sentinel only notices an overflow when the syscall
+# returns; the guard page faults on the first write past the bottom, and #PF
+# runs on IST1, so the fault is reported instead of corrupting .bss.
+# ---------------------------------------------------------------------------
+
+VMM = KERNEL / "src" / "mm" / "vmm.ritz"
+EXCEPTIONS = KERNEL / "src" / "arch" / "x86_64" / "exceptions.ritz"
+IDT = KERNEL / "src" / "arch" / "x86_64" / "idt.ritz"
+INDIUM = RITZ0_DIR.parents[1] / "indium"
+
+
+def test_guard_page_sits_directly_below_the_stack():
+    asm = _asm()
+    # A whole page, page-aligned, in .bss, then the stack: an overflow of
+    # syscall_stack writes into syscall_stack_guard first.
+    assert re.search(
+        r"^\.align 4096\s*\nsyscall_stack_guard:\s*\n\s*\.space 4096\s*\n"
+        r"syscall_stack:",
+        asm,
+        re.MULTILINE,
+    ), "no page-aligned 4 KiB syscall_stack_guard directly below syscall_stack"
+    assert _section_of(asm, "syscall_stack_guard") == ".bss"
+    assert re.search(r"^\.global syscall_stack_guard_page$", asm, re.MULTILINE)
+    page = asm[
+        asm.index("\nsyscall_stack_guard_page:") : asm.index(
+            ".size syscall_stack_guard_page"
+        )
+    ]
+    assert "leaq syscall_stack_guard(%rip), %rax" in page
+
+
+def test_init_unmaps_the_guard_page_and_checks_it():
+    init = _body(STACK.read_text(), "syscall_stack_init")
+    assert "syscall_stack_guard_init()" in init
+    assert init.index("vmm_unmap_kernel_page(") < init.index("vmm_virt_to_phys(")
+    # Still mapped after the unmap: a boot-time panic, which the boot tests catch.
+    assert "KERNEL PANIC" in init
+
+
+def test_vmm_unmap_kernel_page_splits_a_2mib_page():
+    unmap = _body(VMM.read_text(), "vmm_unmap_kernel_page")
+    # The kernel image is mapped with 2 MiB pages (boot_highhalf.s, the UEFI
+    # loader): split the one holding the page into a page table first.
+    assert "PTE_HUGE" in unmap and "vmm_split_huge_pd_entry(" in unmap
+    split = _body(VMM.read_text(), "vmm_split_huge_pd_entry")
+    assert "vmm_alloc_table()" in split and "while" in split
+    assert "vmm_flush_tlb_all()" in unmap
+
+
+def test_page_fault_on_the_guard_page_reports_the_overflow():
+    exc = EXCEPTIONS.read_text()
+    handler = _body(exc, "exception_handler")
+    assert "syscall_stack_guard_hit(" in handler
+    hit = _body(STACK.read_text(), "syscall_stack_guard_hit")
+    assert "syscall_stack_guard_page()" in hit
+    assert "KERNEL PANIC: syscall stack overflow" in handler
+    # #PF and #DF run on IST1, so the fault handler never uses the overflowed
+    # stack.
+    idt = IDT.read_text()
+    for vec in (8, 14):
+        assert re.search(rf"idt_set_gate\({vec}, isr_stub_{vec} as u64, cs, 1,", idt), vec
+
+
+def test_no_big_locals_on_syscall_paths():
+    # The ticket's grep: no [64]KDirEntry (~21 KiB) and no [NNNN]u8 locals
+    # (spawn_args' 4 KiB argv copy) in the syscall runtime.
+    big = re.compile(r"^\s+var \w+: \[(?:64\]KDirEntry|\d{4,}\]u8)", re.MULTILINE)
+    for src in sorted(RUNTIME.glob("*.ritz")):
+        hits = big.findall(src.read_text())
+        assert not hits, f"{src.name}: {hits}"
+
+
+def test_tier1_runs_the_readdir_and_open_child():
+    init = (INDIUM / "user" / "init.ritz").read_text()
+    assert 'run_test(c"/bin/readdir64_child", c"readdir64", 0)' in init
+    toml = (INDIUM / "ritz.toml").read_text()
+    assert 'name = "readdir64_child"' in toml
+    child = (INDIUM / "user" / "readdir64_child.ritz").read_text()
+    assert "sys_readdir(" in child and "100" in child and "64" in child

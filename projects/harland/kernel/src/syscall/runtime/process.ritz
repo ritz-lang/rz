@@ -59,6 +59,16 @@ var g_child_pid: u64 = 1           # Current PID (1 = init)
 var g_child_pml4: u64 = 0          # Child's page table (for cleanup)
 var g_child_exit_code: i64 = 0     # Exit code from child
 
+# spawn_args' copy of the parent's argv, made before it switches to the
+# child's page table (AGAST #1877: 5 KiB that used to be syscall-stack
+# locals). Static: spawn doesn't nest (one child at a time) and one CPU runs
+# syscalls, and each spawn_args fills them afresh before reading them.
+const SPAWN_ARGV_BYTES: i64 = 4096
+const SPAWN_ARGV_MAX: i32 = 64
+var g_spawn_argv_copy: [4096]u8
+var g_spawn_argv_offsets: [64]i64     # offset of each arg in g_spawn_argv_copy
+var g_spawn_child_argv: [64]u64       # each arg's address on the child's stack
+
 # External functions from syscall_entry.s for accessing user context
 extern fn get_syscall_user_rip() -> u64
 extern fn get_syscall_user_rsp() -> u64
@@ -272,34 +282,30 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         total_string_bytes = total_string_bytes + syscall_strlen(arg) + 1  # +1 for null
         i = i + 1
 
-    # Allocate temporary kernel buffer to hold copies of argv strings
-    # For simplicity, use a static buffer (max 4KB of arguments)
-    var argv_copy: [4096]u8
-    var argv_offsets: [64]i64  # Store offset of each arg in argv_copy
-
-    if total_string_bytes > 4096
+    # Copy the argv strings to g_spawn_argv_copy (max 4 KiB, 64 args)
+    if total_string_bytes > SPAWN_ARGV_BYTES
         prints("[spawn_args] argv too large\n")
         vmm_free_pml4(child_pml4)
         spawn_undo(parent_pid)
         return Errno.TooBig as i64
 
-    if argc > 64
+    if argc > SPAWN_ARGV_MAX
         prints("[spawn_args] too many arguments\n")
         vmm_free_pml4(child_pml4)
         spawn_undo(parent_pid)
         return Errno.TooBig as i64
 
-    # Copy all strings into argv_copy
+    # Copy all strings into g_spawn_argv_copy
     var copy_pos: i64 = 0
     i = 0
     while i < argc
-        argv_offsets[i] = copy_pos
+        g_spawn_argv_offsets[i] = copy_pos
         let arg: *u8 = *(argv + i)
         var j: i64 = 0
         while *(arg + j) != 0
-            argv_copy[(copy_pos + j) as i32] = *(arg + j)
+            g_spawn_argv_copy[(copy_pos + j) as i32] = *(arg + j)
             j = j + 1
-        argv_copy[(copy_pos + j) as i32] = 0  # Null terminate
+        g_spawn_argv_copy[(copy_pos + j) as i32] = 0  # Null terminate
         copy_pos = copy_pos + j + 1
         i = i + 1
 
@@ -358,14 +364,13 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
 
     # Copy argv strings to child stack
     i = 0
-    var child_argv_ptrs: [64]u64
     var dst_offset: i64 = 0
     while i < argc
-        child_argv_ptrs[i] = strings_base + (dst_offset as u64)
-        let src_offset: i64 = argv_offsets[i]
+        g_spawn_child_argv[i] = strings_base + (dst_offset as u64)
+        let src_offset: i64 = g_spawn_argv_offsets[i]
         var j: i64 = 0
-        while argv_copy[(src_offset + j) as i32] != 0
-            *((strings_base + dst_offset as u64 + j as u64) as *u8) = argv_copy[(src_offset + j) as i32]
+        while g_spawn_argv_copy[(src_offset + j) as i32] != 0
+            *((strings_base + dst_offset as u64 + j as u64) as *u8) = g_spawn_argv_copy[(src_offset + j) as i32]
             j = j + 1
         *((strings_base + dst_offset as u64 + j as u64) as *u8) = 0
         dst_offset = dst_offset + j + 1
@@ -380,7 +385,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     # Write argv pointers
     i = 0
     while i < argc
-        *((child_argv + (i as u64) * 8) as *u64) = child_argv_ptrs[i]
+        *((child_argv + (i as u64) * 8) as *u64) = g_spawn_child_argv[i]
         i = i + 1
     # NULL terminator
     *((child_argv + (argc as u64) * 8) as *u64) = 0
@@ -397,7 +402,7 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
     # Debug: print first arg
     if argc > 0
         prints("[spawn_args] argv[0] = ")
-        prints_str(child_argv_ptrs[0] as *u8)
+        prints_str(g_spawn_child_argv[0] as *u8)
         prints("\n")
 
     prints("[spawn_args] Jumping to child with args...\n\n")
