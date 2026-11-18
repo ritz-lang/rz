@@ -614,7 +614,6 @@ class MoveWalk:
         else:
             self._check_expr(arm.body, is_move_context=is_move_context)
             left = isinstance(arm.body, (rast.BreakExpr, rast.ContinueExpr, rast.ReturnExpr))
-        self._note_arm_type(match, arm)
         self._pop_scope()
         return left
 

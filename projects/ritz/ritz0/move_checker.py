@@ -44,13 +44,6 @@ class MoveChecker(MoveWalk):
     - Detect multiple mutable borrows (within same scope)
     """
 
-    # Primitive scalar names. Only `_infer_expr_type`'s `read_*` heuristic
-    # still needs them: move-vs-copy is decided by MoveTypes (LANGUAGE_SPEC
-    # §13.1), not by a list (AGAST #2157; the list was #1489 and #1548).
-    PRIMITIVES = {
-        'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'bool', 'f32', 'f64',
-    }
-
     def __init__(self):
         self.scope: Scope = Scope()
         self.errors: List[OwnershipError] = []
@@ -196,28 +189,15 @@ class MoveChecker(MoveWalk):
         return not self.types.is_move_only(ty)
 
     def _infer_expr_type(self, expr: rast.Expr) -> rast.Type:
-        """Infer the type of an expression for ownership checking, by its
-        kind (EXPR_TYPES); `unknown` for a kind with no entry.
+        """`expr`'s type for ownership checking: the typing pass's, for the
+        kinds it answers (EXPR_TYPES); `unknown` for any other kind.
 
-        Returns a basic type so we can determine if it's Copy.
-        This doesn't need to be as complete as the type checker - just enough
-        to identify Copy types like pointers and primitives.
-        """
+        Only move-vs-copy (LANGUAGE_SPEC §13.1) and a few shapes (an array, a
+        tuple, a struct to destructure) are read from it."""
         infer = self.EXPR_TYPES.get(type(expr))
         if infer is None:
             return rast.NamedType(expr.span, 'unknown', [])
         return infer(self, expr)
-
-    def _type_of_ident(self, expr: rast.Ident) -> rast.Type:
-        info = self.scope.lookup(expr.name)
-        if info:
-            return info.ritz_type
-        # A module-level `var` (AGAST #2269) has its declared type. Nothing
-        # tracks the global itself: it is never dropped, so a move-only
-        # value can't be moved out of it (LARB R34, _check_global_move_out).
-        if expr.name in self.globals:
-            return self.globals[expr.name]
-        return rast.NamedType(expr.span, 'unknown', [])
 
     def _type_from_table(self, expr: rast.Expr) -> rast.Type:
         """The typing pass's type for `expr` (typed.MOVE_CHECKER_READS), in
@@ -227,63 +207,11 @@ class MoveChecker(MoveWalk):
               if self.typed is not None else None)
         return ty if ty is not None else rast.NamedType(expr.span, 'unknown', [])
 
-    def _variant_value_type(self, expr: rast.Expr) -> Optional[rast.Type]:
-        """`E.V` or `E.V(...)`'s enum type, unless `E` is a binding."""
-        return self.types.variant_value_type(
-            expr, lambda n: self.scope.lookup(n) is not None)
-
-    def _type_of_field(self, expr: rast.Field) -> rast.Type:
-        variant = self._variant_value_type(expr)
-        if variant is not None:
-            return variant
-        # What the field declares (AGAST #2243): the emitter types the
-        # binding from that too.
-        return (self._field_path_type(expr)
-                or rast.NamedType(expr.span, 'unknown', []))
-
-    def _type_of_match(self, expr: rast.Match) -> rast.Type:
-        # What its arms give, typed as they were checked (AGAST #2178).
-        return (getattr(expr, 'value_type', None)
-                or rast.NamedType(expr.span, 'unknown', []))
-
-    def _type_of_method_call(self, expr: rast.MethodCall) -> rast.Type:
-        variant = self._variant_value_type(expr)
-        if variant is not None:
-            return variant
-        # What the method declares, on the receiver's own type (AGAST
-        # #2257): the emitter types the binding from that too.
-        declared = self._method_return_type(expr)
-        if declared is not None:
-            return declared
-        # Otherwise (a builtin, a UFCS fallback), go by the method's name.
-        method = expr.method
-        # Common methods that return Copy types
-        if method in ('len', 'cap', 'count', 'size', 'is_empty', 'is_some', 'is_none',
-                      'is_ok', 'is_err', 'contains', 'unwrap_or'):
-            # These typically return usize, i64, or bool - all Copy
-            return rast.NamedType(expr.span, 'i64', [])
-        # read_* methods return Result<primitive>
-        if method.startswith('read_'):
-            type_suffix = method[5:]  # e.g., "u16", "u32", "i8", etc.
-            if type_suffix in self.PRIMITIVES:
-                return rast.NamedType(expr.span, 'Result', [
-                    rast.NamedType(expr.span, type_suffix, [])
-                ])
-        # Fallback to unknown
-        return rast.NamedType(expr.span, 'unknown', [])
-
     # Every kind _infer_expr_type types, by class (see move_walk.py's
-    # EXPR_CHECKS on why `type(expr)` is enough).  The typing pass's kinds
-    # first (AGAST #3448, #3553); the rest are still this checker's own
-    # rules, until the pass types a generic's members at its instance
-    # (#3554).  Index is deliberately absent: `a[i]` stays unknown (#2268).
-    EXPR_TYPES = {
-        **dict.fromkeys(typed.MOVE_CHECKER_READS, _type_from_table),
-        rast.Ident: _type_of_ident,
-        rast.Field: _type_of_field,
-        rast.Match: _type_of_match,
-        rast.MethodCall: _type_of_method_call,
-    }
+    # EXPR_CHECKS on why `type(expr)` is enough): all from the typing pass
+    # (AGAST #3448, #3553, #4065).  Index is deliberately absent: `a[i]`
+    # stays unknown (#2268).
+    EXPR_TYPES = dict.fromkeys(typed.MOVE_CHECKER_READS, _type_from_table)
 
     def _destructured_types(self, value: rast.Expr, n: int) -> List[rast.Type]:
         """The types `let (x1, ..., xn) = value` gives its n names: the
@@ -972,28 +900,6 @@ class MoveChecker(MoveWalk):
             return self._receiver_type(expr.operand)
         return self.types.resolve(self._field_path_type(expr))
 
-    def _method_return_type(self, call: rast.MethodCall) -> Optional[rast.Type]:
-        """The type `call` returns, for `Type.method()` or `value.method()`,
-        looked up on the receiver's own type with the impl's type parameters
-        replaced by the receiver's arguments. None when the type doesn't
-        declare the method or its impls disagree on the return type."""
-        recv = call.expr
-        if isinstance(recv, rast.Ident) and self.scope.lookup(recv.name) is None:
-            ty = rast.NamedType(recv.span, recv.name, [])
-        else:
-            ty = self._receiver_type(recv)
-        while isinstance(ty, (rast.PtrType, rast.RefType)):
-            ty = self.types.resolve(ty.inner)
-        if not isinstance(ty, rast.NamedType):
-            return None
-        rets: Dict[str, rast.Type] = {}
-        for m in self.type_methods.get((ty.name, call.method), []):
-            subst = dict(zip(self.method_impl[id(m)].type_params, ty.args))
-            subst['Self'] = ty
-            ret = _subst(m.ret_type, subst)
-            rets[_type_key(ret)] = ret
-        return next(iter(rets.values())) if len(rets) == 1 else None
-
     def _method_takes_self(self, call: rast.MethodCall) -> bool:
         """Does `call` take its receiver by value? `self:= T`, `self: T` and
         bare `self` do. The method is looked up on the receiver's own type,
@@ -1212,21 +1118,6 @@ class MoveChecker(MoveWalk):
                 if info is not None:
                     info.ritz_type = fty
                     arm.takes_payload = True
-
-    def _note_arm_type(self, match: rast.Match, arm: rast.MatchArm) -> None:
-        """While `arm`'s bindings are in scope, type its value: the first arm
-        that types gives `match.value_type`, so `let u = match s ...` is
-        move-checked like any binding (AGAST #2178)."""
-        if getattr(match, 'value_type', None) is not None:
-            return
-        value = arm.body
-        while isinstance(value, rast.Block):
-            value = value.expr
-        if value is None:
-            return
-        ty = self._infer_expr_type(value)
-        if not (isinstance(ty, rast.NamedType) and ty.name == 'unknown'):
-            match.value_type = ty
 
     def _lent_scrutinee_type(self, scrut: rast.Expr) -> Optional[rast.Type]:
         """The type of a match scrutinee that something else owns, or None:

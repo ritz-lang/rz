@@ -269,21 +269,21 @@ def test_the_move_checker_reads_each_body_at_its_own_types():
     assert seen == ["u16", "u8"]
 
 
-# --- the kinds whose rules moved to the table (#3553) -------------------------
+# --- the kinds whose rules moved to the table (#3553, #4065) -----------------
 
-def test_the_move_checker_reads_the_table_for_the_non_generic_kinds():
-    """UnaryOp, BinOp, TryOp, the aggregate and null literals: their own
-    rules are gone.  Ident, Field, Match and MethodCall wait for the pass to
-    type a generic's members at its instance (#3554); Index stays unknown on
-    purpose (#2268)."""
+def test_the_move_checker_reads_the_table_for_every_kind_it_types():
+    """Every kind the move checker types comes from the table: its own
+    rules (and the `read_*` / `len` name heuristic) are gone.  Index stays
+    unknown on purpose (#2268)."""
     for kind in (rast.UnaryOp, rast.BinOp, rast.TryOp, rast.ArrayLit,
-                 rast.ArrayFill, rast.TupleLit, rast.NullLit):
+                 rast.ArrayFill, rast.TupleLit, rast.NullLit,
+                 rast.Ident, rast.Field, rast.Match, rast.MethodCall):
         assert kind in typed.MOVE_CHECKER_READS, kind
-        assert MoveChecker.EXPR_TYPES[kind] is MoveChecker._type_from_table, kind
+    assert set(MoveChecker.EXPR_TYPES) == set(typed.MOVE_CHECKER_READS)
     assert rast.Index not in MoveChecker.EXPR_TYPES
-    gone = ("_type_of_unary", "_type_of_binop", "_type_of_try",
-            "_type_of_array_lit", "_type_of_tuple_lit")
-    assert not [n for n in gone if hasattr(MoveChecker, n)]
+    rules = [n for n in vars(MoveChecker) if n.startswith("_type_of_")]
+    assert rules == []
+    assert not hasattr(MoveChecker, "PRIMITIVES")
 
 
 def _checker_on(module):
@@ -332,6 +332,49 @@ def test_an_undeclared_struct_literals_fields_are_still_typed():
     (addr,) = _nodes(module, rast.UnaryOp)
     ty = _checker_on(module)._infer_expr_type(addr)
     assert isinstance(ty, rast.RefType) and _name(ty.inner) == "u16"
+
+
+OPTION = "enum Option<T>\n    Some(T)\n    None\n\nstruct Big\n    a: i64\n\n"
+
+
+def test_a_payload_binding_has_its_payloads_type():
+    """`Some(b) => b`: the move checker's scope gave a payload binding no
+    type; the table types it at the scrutinee's `T`."""
+    module = parse(OPTION + "fn f(o: Option<Big>) -> i64\n"
+                   "    match o\n        Some(b) => b.a\n        None => 0\n")
+    typed.type_module(module)
+    b = next(e for e in _nodes(module, rast.Ident) if e.name == "b")
+    assert _name(_checker_on(module)._infer_expr_type(b)) == "Big"
+
+
+def test_a_match_is_typed_without_walking_its_arms():
+    """A match's type is the table's, not one the walk notes on the node
+    while its arms are in scope (`value_type`, AGAST #2178)."""
+    module = parse(OPTION + "fn f(o: Option<Big>) -> Big\n"
+                   "    match o\n        Some(b) => b\n        None => Big { a: 0 }\n")
+    typed.type_module(module)
+    (match,) = _nodes(module, rast.Match)
+    assert _name(_checker_on(module)._infer_expr_type(match)) == "Big"
+
+
+def test_a_generic_method_is_typed_at_its_receivers_arguments():
+    """`o.get()` on an `Option<Big>`: the impl's `T` is the receiver's
+    `Big` (#3554), with no name heuristic behind it."""
+    module = parse(OPTION + "impl<T> Option<T>\n    fn get(self) -> T\n"
+                   "        match self\n            Some(v) => v\n"
+                   "            None => panic(c\"none\")\n\n"
+                   "fn f(o: Option<Big>) -> i64\n    let b = o.get()\n    b.a\n")
+    typed.type_module(module)
+    (call,) = _nodes(module, rast.MethodCall)
+    assert _name(_checker_on(module)._infer_expr_type(call)) == "Big"
+
+
+def test_a_field_is_its_declared_type():
+    module = parse("struct Pair\n    big: Big\n    n: u8\n\nstruct Big\n    a: i64\n\n"
+                   "fn f(p: Pair) -> u8\n    let n = p.n\n    n\n")
+    typed.type_module(module)
+    field = next(e for e in _nodes(module, rast.Field) if e.field == "n")
+    assert _name(_checker_on(module)._infer_expr_type(field)) == "u8"
 
 
 # --- the emitter (#3555) -----------------------------------------------------

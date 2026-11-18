@@ -15,10 +15,10 @@ them (on by default is #3556, #1823), and the slot errors (§13.2, §13.4) are p
 beside an ownership error, or refuse an instance, either way.
 
 Who reads it so far: the type checker (it is the inference), the move
-checker, for MOVE_CHECKER_READS (#3553), monomorph (#3554), and the emitter,
-for EMITTER_READS (#3555).  The move checker's rules for Ident, Field, Match
-and MethodCall (#3553, after #3554) and the emitter's for the other kinds
-(#4066, #4067, #4068) are still to move here.
+checker, for every kind it types (MOVE_CHECKER_READS, #3553, #4065),
+monomorph (#3554), and the emitter, for EMITTER_READS (#3555).  The
+emitter's rules for the other kinds (#4066, #4067, #4068) are still to move
+here.
 """
 
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -28,9 +28,11 @@ import ritz_ast as rast
 # The kinds the move checker takes from the table (move_checker.EXPR_TYPES).
 # Each answers as its old rule did, or better (`@x` is a reference, `&T`, not
 # `*T`; `a < b` is a bool); over the matrix corpus, ritz1 and examples no IR
-# changes.  Ident, Field, Match and MethodCall stay the move checker's until
-# the pass types a generic's members at its instance (#3554); Index is
-# deliberately not read (#2268).  ArrayFill `[v; n]` is `[n]V`, so a fill
+# changes.  Ident, Field, Match and MethodCall followed once the pass typed
+# a generic's members at its instance (#3554, #4065): a payload binding, a
+# match and a generic method are typed where the old rules said `unknown`, and
+# the method-name heuristic (`len` is i64) is gone.  Index is deliberately not
+# read (#2268).  ArrayFill `[v; n]` is `[n]V`, so a fill
 # of a fill of a move-only value is move-only too: `[ [r; 1]; 2]` copies `r`
 # (#3433).
 MOVE_CHECKER_READS = (
@@ -39,6 +41,7 @@ MOVE_CHECKER_READS = (
     rast.Cast, rast.StructLit, rast.Call,
     rast.UnaryOp, rast.BinOp, rast.TryOp, rast.ArrayLit, rast.ArrayFill,
     rast.TupleLit,
+    rast.Ident, rast.Field, rast.Match, rast.MethodCall,
 )
 
 # The kinds the emitter takes from the table (LLVMEmitter._typed_type, #3555).
