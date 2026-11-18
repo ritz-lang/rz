@@ -517,7 +517,14 @@ fn hoist_line_len(p: *u8, end: *u8) -> i64
 #
 # Nothing wrote memory since the load, so the bytes at SRC still ARE the
 # loaded value.  (Two %T objects cannot partially overlap, and an exact
-# overlap copies onto itself.)  The load is left dead for -O2 to delete.
+# overlap copies onto itself.)
+#
+# The load is then dead, and so is the one the emitter writes after every
+# sret call whose result is copied or discarded.  AGAST #3952: such a load
+# must not reach clang either.  -O2 does not delete it before IPSCCP and
+# InstCombine expand it per leaf.  spire's presenter, with ~20 dead
+# `load %Response` (a [65536 x i8] body each), ran clang -O1/-O2 past 300 s
+# and out of memory.  drop_dead_large_loads removes them.
 
 # The scanning lives in ll_copy_scan.ritz; here we only decide whether %T is
 # large and emit the replacement.  Returns 1 when `line` was replaced.
@@ -555,6 +562,58 @@ fn rewrite_large_struct_copies(s: *EmitterState, body_start: i64)
             vec_push_bytes<u8>(s.out, p, ll)
         p = p + ll
     free(base)
+    drop_dead_large_loads(s, body_start)
+
+# AGAST #3952: `  %.N = load %T, ptr SRC` for a large struct %T (the sret
+# threshold) whose %.N is used nowhere else in the body.  Returns N, or -1.
+fn dead_large_load_reg(s: *EmitterState, p: *u8, len: i64, uses: *i32, cap: i32) -> i32
+    var e: i64 = 0
+    let r: i32 = ll_dot_reg_at(p, len, 2, @e)
+    if r < 0 or r >= cap or *(uses + r) != 1
+        return 0 - 1
+    if ll_starts_with(p, 2, c"  ") == 0 or ll_starts_with(p + e, len - e, c" = load %") == 0
+        return 0 - 1
+    let t: i64 = e + 9
+    let comma: i64 = ll_find(p, len, t, 44)
+    if comma <= t or ll_starts_with(p + comma, len - comma, c", ptr ") == 0
+        return 0 - 1
+    if struct_ret_uses_sret(s, TYPE_STRUCT, p + t, (comma - t) as i32) == 0
+        return 0 - 1
+    r
+
+# Drop every dead large-struct load from the body (see the #1732 comment
+# above).  A plain `load` has no side effect, so dropping an unused one is
+# exact.  `uses[N]` counts every `%.N` in the body, its definition included,
+# so 1 means "defined and never read".
+fn drop_dead_large_loads(s: *EmitterState, body_start: i64)
+    let n: i64 = s.out.len - body_start
+    if n <= 0
+        return
+    let cap: i32 = s.reg_counter + 1
+    let uses: *i32 = malloc((cap as i64) * 4) as *i32
+    memzero(uses as *u8, (cap as i64) * 4)
+    let base: *u8 = malloc(n)
+    memcpy(base, s.out.data + body_start, n)
+    var i: i64 = 0
+    while i < n
+        var e: i64 = 0
+        let r: i32 = ll_dot_reg_at(base, n, i, @e)
+        if r >= 0
+            if r < cap
+                *(uses + r) = *(uses + r) + 1
+            i = e
+        else
+            i += 1
+    let end: *u8 = base + n
+    s.out.len = body_start
+    var p: *u8 = base
+    while p < end
+        let ll: i64 = ll_line_len(p, end)
+        if dead_large_load_reg(s, p, ll, uses, cap) < 0
+            vec_push_bytes<u8>(s.out, p, ll)
+        p = p + ll
+    free(base)
+    free(uses as *u8)
 
 # AGAST #1918 — packed-field loads and stores say `align 1`.
 #
