@@ -2234,17 +2234,20 @@ class Parser:
         return rast.Attr(name_tok.value, args, value, span=name_tok.span)
 
     def parse_fn(self, attrs: List[rast.Attr] = None, is_async: bool = False, is_pub: bool = False,
-                 impl_type: rast.Type = None) -> rast.FnDef:
+                 impl_type: rast.Type = None, start: Span = None) -> rast.FnDef:
         """Parse a function definition.
 
         Args:
             impl_type: If parsing inside an impl block, the implementing type.
                        This allows bare 'self' parameter syntax.
+            start: The span of the declaration's first token (`pub` or
+                   `async`) when the caller consumed it; ritz1 locates a fn
+                   there, so the "declared here" note does too (#3953).
         """
         if attrs is None:
             attrs = []
         self._check_attrs_apply(attrs, "fn")
-        span = self._current().span
+        span = start if start is not None else self._current().span
         self._expect(TokenType.FN)
         name_tok = self._expect(TokenType.IDENT)
 
@@ -2814,6 +2817,7 @@ class Parser:
             # Parse any attributes on the method
             attrs = self.parse_attrs()
             # Check for pub fn in impl block
+            method_start = self._current().span
             method_is_pub = False
             if self._at(TokenType.PUB):
                 method_is_pub = True
@@ -2823,7 +2827,8 @@ class Parser:
             if self._at(TokenType.ASYNC):
                 self._advance()
                 is_async = True
-            method = self.parse_fn(attrs, is_async=is_async, is_pub=method_is_pub, impl_type=self_type)
+            method = self.parse_fn(attrs, is_async=is_async, is_pub=method_is_pub,
+                                   impl_type=self_type, start=method_start)
             # AGAST #2258: `Self` in an impl method's signature is the impl's
             # type. Nothing downstream resolved the name, so `self:= Self`
             # lowered as i8 and crashed the emitter, and MoveTypes didn't see
@@ -2869,6 +2874,7 @@ class Parser:
         attrs = self.parse_attrs()
 
         # Check for 'pub' keyword (visibility marker)
+        start = self._current().span  # a fn starts at `pub`/`async` (#3953)
         is_pub = False
         if self._at(TokenType.PUB):
             is_pub = True
@@ -2879,10 +2885,10 @@ class Parser:
             self._advance()
             if not self._at(TokenType.FN):
                 raise ParseError("Expected 'fn' after 'async'", self._current().span)
-            return self.parse_fn(attrs, is_async=True, is_pub=is_pub)
+            return self.parse_fn(attrs, is_async=True, is_pub=is_pub, start=start)
 
         if self._at(TokenType.FN):
-            return self.parse_fn(attrs, is_pub=is_pub)
+            return self.parse_fn(attrs, is_pub=is_pub, start=start)
         if self._at(TokenType.EXTERN) and self._peek_at(1, TokenType.VAR):
             if attrs:
                 raise ParseError("Attributes not allowed on extern var", attrs[0].span)

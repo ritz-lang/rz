@@ -234,6 +234,12 @@ def test_private_async_fn_refused_once(ritz1_bin, tmp_path, caller):
                       r"mark it `pub` \(#3413\)", errors[0])
         assert m, (compiler, res.stderr)
         where[compiler] = m.group(1)
+        # The note points at the declaration, which starts at `async`, not
+        # at `fn` (#3953: ritz0 said a.ritz:1:7, ritz1 a.ritz:1:1).
+        notes = [ln for ln in res.stderr.splitlines() if "is declared here" in ln]
+        assert len(notes) == 1, (compiler, res.stderr)
+        assert re.search(r"a\.ritz:1:1:( note:)? `fetch` is declared here", notes[0]), \
+            (compiler, res.stderr)
     assert where == {"ritz0": at, "ritz1": at}, where
 
 

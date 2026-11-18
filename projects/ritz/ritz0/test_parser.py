@@ -2060,3 +2060,19 @@ class TestInterpolationScope:
         with pytest.raises(ParseError):
             self._body('    print("{a +}")\n')
 
+
+
+class TestFnDeclSpan:
+    """A fn's span starts at its first token, `pub` or `async`, as in
+    ritz1's parse_fn_def; the "declared here" note reads it (#3953)."""
+
+    @pytest.mark.parametrize("head", ["fn", "pub fn", "async fn", "pub async fn"])
+    def test_top_level(self, head):
+        fn = parse(f"{head} f() -> i32\n    0\n").items[0]
+        assert (fn.span.line, fn.span.column) == (1, 1)
+
+    @pytest.mark.parametrize("head", ["fn", "pub fn", "async fn", "pub async fn"])
+    def test_impl_method(self, head):
+        src = f"struct P\n    x: i32\n\nimpl P\n    {head} m(self) -> i32\n        0\n"
+        block = next(i for i in parse(src).items if isinstance(i, rast.ImplBlock))
+        assert (block.methods[0].span.line, block.methods[0].span.column) == (5, 5)

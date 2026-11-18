@@ -276,10 +276,13 @@ def interface_text(source: str, tokens: list, module: rast.Module) -> str:
     closes = (TokenType.RPAREN, TokenType.RBRACKET)
     layout = (TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT, TokenType.EOF)
     at = {(t.span.line, t.span.column): i for i, t in enumerate(tokens)
-          if t.type == TokenType.FN}
+          if t.type in (TokenType.FN, TokenType.PUB, TokenType.ASYNC)}
     lines = source.split("\n")
     for fn in _fns_to_declare(module):
+        # A fn's span starts at its `pub`/`async` (#3953); the header at `fn`.
         i = at[(fn.span.line, fn.span.column)]
+        while tokens[i].type != TokenType.FN:
+            i += 1
         # The header: from `fn` to the first NEWLINE outside brackets.
         depth, last = 0, tokens[i]
         for t in tokens[i:]:
