@@ -29,7 +29,7 @@ import pytest
 import test_ritz1_for_header as for_header
 import test_table_rows as table_rows
 from index_rules import builtin_impl, needs_index, needs_index_mut, needs_writer
-from ref_rules import WRITE_THROUGH_SHARED
+from ref_rules import WRITE_THROUGH_SHARED, lent_temp_escapes
 from test_ref_into_value import COMPILERS
 from test_table_rows import Row, Run, assert_refusals, ritzlib_build
 
@@ -90,6 +90,33 @@ impl IndexSet for Tally
 fn key(k: i64) -> i64
     KEYS += 1
     k
+
+"""
+
+
+# A generic pair with all three traits, each impl generic (AGAST #2847).
+PAIR = """\
+struct Pair<T>
+    a: [2]T
+
+var READS: i32 = 0
+var WRITES: i32 = 0
+var SETS: i32 = 0
+
+impl<T> Index for Pair<T>
+    fn index(self: @Pair<T>, key: i64) -> @T
+        READS += 1
+        @self.a[key]
+
+impl<T> IndexMut for Pair<T>
+    fn index_mut(self: @&Pair<T>, key: i64) -> @&T
+        WRITES += 1
+        @&self.a[key]
+
+impl<T> IndexSet for Pair<T>
+    fn index_set(self: @&Pair<T>, key: i64, value: T)
+        SETS += 1
+        self.a[key] = value
 
 """
 
@@ -242,6 +269,81 @@ fn bump(t: *Tally)
         return 2
     0
 """),
+    # R11a: a read of `t[k]` beside a shared loan of `t[_]` borrows nothing.
+    "loan_then_read": (TALLY, """\
+    var t: Tally
+    t.n[1] = 4
+    t.n[2] = 3
+    let p: @i64 = @t[1]
+    let v: i64 = t[2]
+    if *p + v != 7
+        return 1
+    0
+"""),
+    # AGAST #2847: a generic impl is found for each instantiation, by value
+    # and through a reference.
+    "generic": (PAIR + """\
+fn bump(p: @&Pair<i32>)
+    p[0] += 2
+
+""", """\
+    var p: Pair<i64>
+    p[1] = 7
+    p[1] += 3
+    let v: i64 = p[1]
+    if v != 10 or p.a[1] != 10
+        return 1
+    if SETS != 1 or WRITES != 1 or READS != 1
+        return 2
+    var q: Pair<i32>
+    q.a[0] = 1
+    bump(@&q)
+    if q[0] != 3
+        return 3
+    0
+"""),
+    # AGAST #2847: the base is any expression of the struct's type: a call
+    # result, a global, `(*p)`.
+    "call_base": (TALLY + """\
+var STORE: Tally
+
+fn mk() -> *Tally
+    @STORE
+
+""", """\
+    mk()[2] = 6
+    mk()[2] += 1
+    let v: i64 = mk()[2]
+    if v != 7 or STORE.n[2] != 7
+        return 1
+    if SETS != 1 or WRITES != 1 or READS != 1
+        return 2
+    0
+"""),
+    "global_base": (TALLY + "var G: Tally\n\n", """\
+    G[1] = 5
+    G[1] += 2
+    let v: i64 = G[1]
+    if v != 7 or G.n[1] != 7
+        return 1
+    if SETS != 1 or WRITES != 1 or READS != 1
+        return 2
+    0
+"""),
+    "deref_base": (TALLY + """\
+fn work(p: *Tally) -> i64
+    (*p)[1] = 5
+    (*p)[1] += 2
+    (*p)[1]
+
+""", """\
+    var t: Tally
+    if work(@t) != 7 or t.n[1] != 7
+        return 1
+    if SETS != 1 or WRITES != 1 or READS != 1
+        return 2
+    0
+"""),
 }
 
 
@@ -342,6 +444,42 @@ REFUSALS = {
         "impl Index for Box1\n    fn index(self: @Box1, key: i64) -> @C\n        @self.c\n\n",
         "    var b: Box1\n    b^[0].v = 1\n    0\n",
         needs_index_mut("m[k].f = x", "Box1", ["Index"])),
+    # AGAST #2847: at the `[` itself, whatever comes between it and the base.
+    "spaced_read": (POINT, "    var p: Point\n    let v: i32 = p ^[0]\n    0\n",
+                    needs_index("Point")),
+    "spaced_assign": (LOOKUP, "    var m: Lookup\n    m ^[0] = 1\n    0\n",
+                      needs_writer("Lookup", ["Index"])),
+    "spaced_field_assign": (LOOKUP + "struct Holder\n    m: Lookup\n\n",
+                            "    var h: Holder\n    h.m ^[0] = 1\n    0\n",
+                            needs_writer("Lookup", ["Index"])),
+    # AGAST #2847: any base expression, as on ritz0.
+    "call_base": (POINT + "fn mk() -> Point\n    Point { x: 1 }\n\n",
+                  "    let v: i32 = mk()^[0]\n    0\n", needs_index("Point")),
+    # A by-value call's result is a temporary, which `index` would lend
+    # (Aaron's ruling on AGAST #3215).
+    "call_base_temporary": (TALLY + "fn mk() -> Tally\n    var t: Tally\n    t\n\n",
+                            "    let v: i64 = ^mk()[2]\n    0\n", lent_temp_escapes("@mk()")),
+    "global_base": (LOOKUP + "var G: Lookup\n\n", "    G^[0] = 1\n    0\n",
+                    needs_writer("Lookup", ["Index"])),
+    "deref_base": (LOOKUP + "fn put(p: *Lookup)\n    (*p)^[0] += 1\n\n", "    0\n",
+                   needs_index_mut("m[k] op= x", "Lookup", ["Index"])),
+    # AGAST #2847: a generic impl counts, and only the traits it implements.
+    "generic_index_only": (
+        "struct Only<T>\n    a: [2]T\n\n"
+        "impl<T> Index for Only<T>\n    fn index(self: @Only<T>, key: i64) -> @T\n        @self.a[key]\n\n",
+        "    var m: Only<i64>\n    let v: i64 = m[0]\n    m^[0] = v\n    0\n",
+        needs_writer("Only<i64>", ["Index"])),
+    # R11a: `@t[1]` is a loan of `t[_]` once it's an `index` call, so a store
+    # into another element of `t` overlaps it.
+    "loan_then_store": (TALLY, "    var t: Tally\n    let p: @i64 = @t[1]\n    ^t[2] = 5\n"
+                        "    return *p as i32\n",
+                        "cannot assign to `t[_]` - `t[_]` is already borrowed as immutable"),
+    "loan_then_borrow_mut": (TALLY, "    var t: Tally\n    let p: @i64 = @t[1]\n"
+                             "    let q: @&i64 = ^@&t[2]\n    return (*p + *q) as i32\n",
+                             "cannot borrow `t[_]` as mutable - `t[_]` is already borrowed as immutable"),
+    "mut_loan_then_compound": (TALLY, "    var t: Tally\n    let q: @&i64 = @&t[1]\n    ^t[2] += 1\n"
+                               "    return *q as i32\n",
+                               "cannot assign to `t[_]` - `t[_]` is already borrowed as mutable"),
 }
 
 

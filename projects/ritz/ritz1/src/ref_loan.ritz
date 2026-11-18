@@ -38,6 +38,7 @@ import sema_type
 import bool_check     # sbk_method_def, sbk_global
 import deref_field    # df_is_step, df_deref_step_recv (AGAST #3015)
 import ref_check      # rs_ty and friends: Sema's place typing (AGAST #3926)
+import struct_index   # SI_USE_* (AGAST #2847)
 
 # A loan of a place, held by a binding declared at block depth `depth`.
 # `root` is the place's local's index in Sema's scope, and `place` the borrowed
@@ -389,6 +390,9 @@ fn rl_walk(sm: *Sema, e: *Expr)
         if rl_qualified_variant(sm, e) == 1
             rl_walk_list(sm, e.args)
             return
+        if e.index_step != null
+            rl_index_step(sm, e)
+            return
         rl_walk(sm, e.left)
         var mp: *Param = null
         let m: *FnDef = rs_method_def(sm, e)
@@ -426,6 +430,25 @@ fn rl_walk(sm: *Sema, e: *Expr)
         rl_walk(sm, e.right)
     else if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_TRY or k == EXPR_MATCH or k == EXPR_IF
         rl_walk(sm, e.left)
+
+# `m[k]` on a struct that monomorph made `m.index(k)`, `m.index_mut(k)` or
+# `m.index_set(k, v)` (§7.8, AGAST #2847): a borrow or a write of the place
+# `m[k]`, as ritz0's move checker sees it before lowering (R11a: `[k]` is an
+# index step).  A read borrows nothing; its receiver isn't one either.
+fn rl_index_step(sm: *Sema, e: *Expr)
+    rl_walk(sm, e.left)
+    rl_walk_list(sm, e.args)
+    let st: *IndexStep = e.index_step
+    if st.place == null
+        return
+    let root: i32 = rl_root(sm, st.place)
+    if st.addr == 1
+        # `@m[k]` / `@&m[k]`, as the `@x` of rl_walk.
+        let mutable: i32 = (st.use == SI_USE_ADDR_MUT) as i32
+        if rl_use(sm, e.span.line, e.span.col, root, st.place, mutable, 0) == 1 and RL_IN_ARGS > 0
+            rl_add(root, st.place, mutable, RL_ARG)
+    else if st.use == SI_USE_ASSIGN or st.use == SI_USE_COMPOUND
+        rl_use(sm, st.at.line, st.at.col, root, st.place, 1, 1)
 
 pub fn rl_expr_ident(e: *Expr, name: *u8, len: i32)
     memset(e as *u8, 0, sizeof(Expr))
@@ -538,6 +561,12 @@ fn rl_hold(sm: *Sema, e: *Expr)
             if e.op == OP_ADDR_MUT
                 mutable = 1
             rl_add(root, e.operand, mutable, RL_DEPTH)
+    else if e.kind == EXPR_METHOD and e.index_step != null and e.index_step.addr == 1
+        # `@m[k]` / `@&m[k]` on a struct, now its `index` / `index_mut` call.
+        let st: *IndexStep = e.index_step
+        let sroot: i32 = rl_root(sm, st.place)
+        if sroot >= 0
+            rl_add(sroot, st.place, (st.use == SI_USE_ADDR_MUT) as i32, RL_DEPTH)
     else if e.kind == EXPR_IF or e.kind == EXPR_MATCH
         var arm: *MatchArm = e.args as *MatchArm
         while arm != null

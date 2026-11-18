@@ -57,12 +57,28 @@ fn si_name_eq(a: *u8, a_len: i32, b: *u8, b_len: i32) -> i32
         return 1
     0
 
-# The traits `type_name` implements, from the module's non-generic impls.
+# The length of `name` up to its first `$`: `Pair` of `Pair$i64`.
+fn si_head_len(name: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < len and *(name + i) != '$'
+        i += 1
+    i
+
+# The traits `type_name` implements.  A monomorphised `Pair$i64` takes them
+# from the generic impls of `Pair` too (`impl<T> Index for Pair<T>`, AGAST
+# #2847): the parser records such an impl's type as its bare name.
 pub fn si_traits(m: *Module, type_name: *u8, type_len: i32) -> i32
+    let head: i32 = si_head_len(type_name, type_len)
     var mask: i32 = 0
     var ib: *ImplBlock = m.impls
     while ib != null
-        if ib.trait_name != null and ib.type_params == null and si_name_eq(ib.type_name, ib.type_name_len, type_name, type_len) == 1
+        var hit: i32 = 0
+        if ib.trait_name != null
+            if ib.type_params == null
+                hit = si_name_eq(ib.type_name, ib.type_name_len, type_name, type_len)
+            else if head < type_len
+                hit = si_name_eq(ib.type_name, ib.type_name_len, type_name, head)
+        if hit == 1
             if si_name_eq(ib.trait_name, ib.trait_name_len, c"Index", 5) == 1
                 mask = mask | SI_INDEX
             else if si_name_eq(ib.trait_name, ib.trait_name_len, c"IndexMut", 8) == 1
@@ -72,19 +88,90 @@ pub fn si_traits(m: *Module, type_name: *u8, type_len: i32) -> i32
         ib = ib.next
     mask
 
-# 1 when the module (imports merged) declares a non-generic struct `name`, or
-# `name` is `StrView`: the compiler knows it without `import ritzlib.strview`,
-# so `s[i]` on one has no StructDef here and was lowered as an array index,
-# into invalid IR (AGAST #4063).  It isn't one of §7.8's built-ins.
+# How many type parameters the generic struct `head` declares, 0 for any
+# other name.
+fn si_arity(m: *Module, head: *u8, len: i32) -> i32
+    var st: *StructDef = m.structs
+    while st != null
+        if st.type_params != null and si_name_eq(st.name, st.name_len, head, len) == 1
+            var n: i32 = 0
+            var tp: *TypeParam = st.type_params
+            while tp != null
+                n += 1
+                tp = tp.next
+            return n
+        st = st.next
+    0
+
+# 1 when the module (imports merged) declares a struct `name`: a non-generic
+# one, or `Pair$i64` of a generic `Pair` (AGAST #2847).  Or `name` is
+# `StrView`: the compiler knows it without `import ritzlib.strview`, so `s[i]`
+# on one has no StructDef here and was lowered as an array index, into
+# invalid IR (AGAST #4063).  It isn't one of §7.8's built-ins.
 pub fn si_is_struct(m: *Module, name: *u8, len: i32) -> i32
     if si_name_eq(name, len, c"StrView", 7) == 1
         return 1
+    let head: i32 = si_head_len(name, len)
     var st: *StructDef = m.structs
     while st != null
-        if st.type_params == null and si_name_eq(st.name, st.name_len, name, len) == 1
+        if st.type_params == null
+            if si_name_eq(st.name, st.name_len, name, len) == 1
+                return 1
+        else if head < len and si_name_eq(st.name, st.name_len, name, head) == 1
             return 1
         st = st.next
     0
+
+# Copy the type at `*pos` of the mangled `name` into `out` (at `*at`) as the
+# source spells it.  0 when the arities can't account for the name.
+fn si_show_take(m: *Module, name: *u8, len: i32, pos: *i32, out: *u8, at: *i32) -> i32
+    let start: i32 = *pos
+    var end: i32 = start
+    while end < len and *(name + end) != '$'
+        end += 1
+    if end == start
+        return 0
+    memcpy(out + *at, name + start, (end - start) as i64)
+    *at = *at + end - start
+    *pos = end
+    let n: i32 = si_arity(m, name + start, end - start)
+    if n == 0
+        return 1
+    *(out + *at) = '<'
+    *at = *at + 1
+    var k: i32 = 0
+    while k < n
+        if *pos >= len
+            return 0
+        *pos = *pos + 1   # the `$`
+        if k > 0
+            *(out + *at) = ','
+            *(out + *at + 1) = ' '
+            *at = *at + 2
+        if si_show_take(m, name, len, pos, out, at) == 0
+            return 0
+        k += 1
+    *(out + *at) = '>'
+    *at = *at + 1
+    1
+
+# A monomorphised type name as the source spells it: `Pair$i64` is
+# `Pair<i64>`, `Pair$i64$i32` `Pair<i64, i32>` (ritz0: deref_rules.display,
+# AGAST #2847).  Any other name is itself.
+pub fn si_shown(m: *Module, name: *u8, len: i32, out_len: *i32) -> *u8
+    *out_len = len
+    if si_head_len(name, len) == len
+        return name
+    # Each `$` becomes at most `, ` and the closing `>`: three bytes.
+    let out: *u8 = malloc((len * 3 + 1) as i64)
+    var pos: i32 = 0
+    var at: i32 = 0
+    if si_show_take(m, name, len, @pos, out, @at) == 0 or pos != len
+        free(out)
+        return name
+    *(out + at) = 0
+    *out_len = at
+    out
 
 # `Vec$T`, `Span$T` and `String` index as the language says (§7.8).
 pub fn si_built_in(name: *u8, len: i32) -> i32
@@ -176,6 +263,20 @@ pub fn si_refuse_write_through(line: i32, col: i32)
     si_error_at(line, col)
     eprintln_cstr(c"cannot write through an `@T`: make it `@&T`")
 
+# `m[k]` on a by-value call's result `base`: `@base` (`@&base` when
+# `mutable`) would lend a temporary to `index` / `index_mut`, which return a
+# reference into it.  ritz0's ref_rules.lent_temp_escapes words, at `base`
+# (AGAST #2847; Aaron's ruling on AGAST #3215).
+pub fn si_refuse_lent(base: *Expr, mutable: i32)
+    si_error_at(base.span.line, base.span.col)
+    eprints_cstr(c"this call returns a reference, and `")
+    if mutable == 1
+        eprints_cstr(c"@&")
+    else
+        eprints_cstr(c"@")
+    diag_eprint_lent(base)
+    eprints_cstr(c"` lends a temporary that's dropped when the call returns: bind it to a local first\n")
+
 # A fresh, zeroed Expr.
 pub fn si_new_expr(kind: i32, line: i32, col: i32) -> *Expr
     let e: *Expr = malloc(sizeof(Expr)) as *Expr
@@ -194,6 +295,21 @@ pub fn si_method(recv: *Expr, method: *u8, method_len: i32, args: *Expr, line: i
     call.ident_len = method_len
     call.args = args
     call
+
+# Note `call`, made for `m[k]` (`place`) used as `use`, for ref_loan (R11a).
+# `addr` is 1 when the call is `@m[k]` / `@&m[k]` itself; `line:col` is a
+# store's statement.  A field store (`m[k].f = x`) borrows nothing, as on
+# ritz0, whose move checker sees no write there.
+pub fn si_mark(call: *Expr, place: *Expr, use: i32, addr: i32, line: i32, col: i32)
+    let st: *IndexStep = malloc(sizeof(IndexStep)) as *IndexStep
+    st.place = place
+    if use == SI_USE_FIELD_STORE
+        st.place = null
+    st.use = use
+    st.addr = addr
+    st.at.line = line
+    st.at.col = col
+    call.index_step = st
 
 # `*e`.
 pub fn si_deref(e: *Expr, line: i32, col: i32) -> *Expr

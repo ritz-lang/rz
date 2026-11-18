@@ -177,7 +177,7 @@ def temp_root(expr: rast.Expr) -> Optional[rast.Expr]:
 def _render_lent(expr: rast.Expr) -> str:
     """`expr` as written, for naming a lent argument (`@make(5)`, AGAST
     #3215). Names, integers, calls, fields, elements and `@` / `@&` print
-    as themselves, anything else as `..`. ritz1's ref_eprint_lent agrees."""
+    as themselves, anything else as `..`. ritz1's diag_eprint_lent agrees."""
     if isinstance(expr, rast.Ident):
         return expr.name
     if isinstance(expr, rast.IntLit):
@@ -9921,7 +9921,8 @@ class LLVMEmitter:
             return None
         name, _, _, traits = info
         where = expr.bracket or expr.span
-        refused = index_rules.message(traits, name, use)
+        # `Pair$i64` is `Pair<i64>` in the source (AGAST #2847).
+        refused = index_rules.message(traits, self._show_type(name), use)
         if refused is not None:
             raise EmitError(refused, where)
         mutable = use != "read"
@@ -9953,7 +9954,7 @@ class LLVMEmitter:
             self.builder.store(self._convert_type(val, ptr.type.pointee, value), ptr)
             return True
         name, _, _, traits = self._struct_index_base(target)
-        refused = index_rules.message(traits, name, "assign")
+        refused = index_rules.message(traits, self._show_type(name), "assign")
         if refused is not None:
             raise EmitError(refused, target.bracket or target.span)
         if "IndexSet" in traits:
