@@ -1,0 +1,176 @@
+# BlockStore - a goliath image on a block device (AGAST #1881)
+#
+# The kernel's persistent filesystem: the same image goliath.file_store keeps
+# in a host file (goliath.image), behind a one-sector superblock, on any
+# device that reads and writes 512-byte sectors. The device is a BlockDevice
+# (an opaque handle and two functions), so the kernel passes its virtio-blk
+# driver and a test passes a RAM disk.
+#
+# Layout (integers little-endian):
+#
+#     sector 0     superblock
+#                    0  magic      "GOLIATHB"   8 bytes
+#                    8  version    u32 = 1
+#                    12 sector     u32 = 512
+#                    16 image_len  u64          bytes of image from sector 1
+#                    24 zero to the end of the sector
+#     sector 1..   the image, zero padded to a whole sector
+#
+# Save writes the image first and the superblock last. Free space needs no
+# map: the store is in memory and the image holds only live blobs, so a
+# deleted file's blobs are gone from the next save.
+#
+# Not yet crash-safe: a save cut short leaves an image that fails its hashes
+# (ERR_CORRUPT_BLOB) rather than the previous one (two image slots would fix
+# that: AGAST follow-up).
+
+import goliath.alloc { Allocator, allocator_alloc, allocator_free }
+import goliath.blob_store { MemoryBlobStore, memory_store_allocator }
+import goliath.namespace { Namespace, namespace_store }
+import goliath.image { ImageSink, image_size, image_write, image_load, image_put_le, image_get_le }
+import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_CORRUPT_BLOB, ERR_IO_ERROR, ERR_OUT_OF_SPACE }
+
+pub const BLOCK_SECTOR_SIZE: i64 = 512
+pub const BLOCK_STORE_VERSION: u32 = 1
+
+# Sectors per device call when loading (one page)
+const BLOCK_IO_SECTORS: u32 = 8
+
+# A device of `sectors` 512-byte sectors. read / write(dev, lba, count, buf)
+# move `count` sectors at `lba` to / from `buf` and return 0 on success.
+pub struct BlockDevice
+    dev: *u8
+    sectors: u64
+    read: fn(*u8, u64, u32, *u8) -> i32
+    write: fn(*u8, u64, u32, *u8) -> i32
+
+fn dev_read(d: *BlockDevice, lba: u64, count: u32, buf: *u8) -> bool
+    let f: fn(*u8, u64, u32, *u8) -> i32 = (*d).read
+    f((*d).dev, lba, count, buf) == 0
+
+fn dev_write(d: *BlockDevice, lba: u64, count: u32, buf: *u8) -> bool
+    let f: fn(*u8, u64, u32, *u8) -> i32 = (*d).write
+    f((*d).dev, lba, count, buf) == 0
+
+fn block_magic_byte(i: i64) -> u8
+    *(c"GOLIATHB" + i)
+
+# Sectors holding `len` bytes
+fn sectors_for(len: u64) -> u64
+    (len + BLOCK_SECTOR_SIZE as u64 - 1) / BLOCK_SECTOR_SIZE as u64
+
+# ============================================================================
+# Save
+# ============================================================================
+
+# An ImageSink filling one sector at a time
+struct SectorWriter
+    dev: *BlockDevice
+    lba: u64
+    fill: i64
+    sector: [512]u8
+
+fn writer_flush(w: *SectorWriter) -> bool
+    if (*w).fill == 0
+        return true
+    while (*w).fill < BLOCK_SECTOR_SIZE
+        (*w).sector[(*w).fill] = 0
+        (*w).fill = (*w).fill + 1
+    if not dev_write((*w).dev, (*w).lba, 1, @(*w).sector[0])
+        return false
+    (*w).lba = (*w).lba + 1
+    (*w).fill = 0
+    true
+
+fn writer_write(ctx: *u8, data: *u8, len: i64) -> bool
+    let w: *SectorWriter = ctx as *SectorWriter
+    var i: i64 = 0
+    while i < len
+        (*w).sector[(*w).fill] = *(data + i)
+        (*w).fill = (*w).fill + 1
+        i = i + 1
+        if (*w).fill == BLOCK_SECTOR_SIZE and not writer_flush(w)
+            return false
+    true
+
+# Write `ns` (its whole store) to `dev`. ERR_OK, ERR_OUT_OF_SPACE (the image
+# doesn't fit; the device is untouched) or ERR_IO_ERROR.
+pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
+    let len: u64 = image_size(ns)
+    if 1 + sectors_for(len) > (*dev).sectors
+        return ERR_OUT_OF_SPACE
+
+    var w: SectorWriter
+    w.dev = dev
+    w.lba = 1
+    w.fill = 0
+    var sink: ImageSink = ImageSink { ctx: @w as *u8, write: writer_write }
+    if not image_write(ns, @sink) or not writer_flush(@w)
+        return ERR_IO_ERROR
+
+    var sb: [512]u8
+    var i: i64 = 0
+    while i < BLOCK_SECTOR_SIZE
+        sb[i] = 0
+        i = i + 1
+    i = 0
+    while i < 8
+        sb[i] = block_magic_byte(i)
+        i = i + 1
+    image_put_le(@sb[8], BLOCK_STORE_VERSION as u64, 4)
+    image_put_le(@sb[12], BLOCK_SECTOR_SIZE as u64, 4)
+    image_put_le(@sb[16], len, 8)
+    if not dev_write(dev, 0, 1, @sb[0])
+        return ERR_IO_ERROR
+    ERR_OK
+
+# ============================================================================
+# Load
+# ============================================================================
+
+# Load the image on `dev` into the empty `store` and set `ns_out` to its
+# namespace.
+#
+#   ERR_OK
+#   ERR_NOT_FOUND     no goliath superblock: a blank (or foreign) device;
+#                     the caller starts an empty namespace (namespace_new)
+#   ERR_CORRUPT_BLOB  a goliath superblock, but the image isn't whole
+#   ERR_IO_ERROR / ERR_OUT_OF_SPACE
+pub fn block_store_load(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
+    if (*dev).sectors < 1
+        return ERR_NOT_FOUND
+    var sb: [512]u8
+    if not dev_read(dev, 0, 1, @sb[0])
+        return ERR_IO_ERROR
+    var i: i64 = 0
+    while i < 8
+        if sb[i] != block_magic_byte(i)
+            return ERR_NOT_FOUND
+        i = i + 1
+    if image_get_le(@sb[8], 4) as u32 != BLOCK_STORE_VERSION
+        return ERR_CORRUPT_BLOB
+    if image_get_le(@sb[12], 4) != BLOCK_SECTOR_SIZE as u64
+        return ERR_CORRUPT_BLOB
+    let len: u64 = image_get_le(@sb[16], 8)
+    let sectors: u64 = sectors_for(len)
+    if len == 0 or 1 + sectors > (*dev).sectors
+        return ERR_CORRUPT_BLOB
+
+    let alloc: *Allocator = memory_store_allocator(store)
+    let buf_len: i64 = (sectors * BLOCK_SECTOR_SIZE as u64) as i64
+    let buf: *u8 = allocator_alloc(alloc, buf_len)
+    if buf == null
+        return ERR_OUT_OF_SPACE
+    var done: u64 = 0
+    while done < sectors
+        var n: u32 = BLOCK_IO_SECTORS
+        if sectors - done < n as u64
+            n = (sectors - done) as u32
+        if not dev_read(dev, 1 + done, n, buf + (done * BLOCK_SECTOR_SIZE as u64) as i64)
+            allocator_free(alloc, buf, buf_len)
+            return ERR_IO_ERROR
+        done = done + n as u64
+
+    let rc: ErrorCode = image_load(buf, len as i64, store, ns_out)
+    allocator_free(alloc, buf, buf_len)
+    rc

@@ -127,4 +127,20 @@ printf 'after the squatter\n' > "$TMP/race/late"
 expect put_tmp_taken 0     '^[0-9a-f]{64}$'  -- "$BIN" put "$TMP/race/late"
 expect ls_tmp_taken  0     ' late$'          -- "$BIN" ls /late
 
+# Freestanding core (AGAST #1881): the kernel builds goliath, so only the
+# hosted glue (hosted.ritz: the default allocator; file_store.ritz: a host
+# file; main.ritz: the CLI) may use the hosted ritzlib. The rest takes its
+# memory from an Allocator and its disk from a BlockDevice.
+HOSTED_OK="main.ritz hosted.ritz file_store.ritz"
+core=0
+for f in src/*.ritz; do
+    case " $HOSTED_OK " in *" $(basename "$f") "*) continue;; esac
+    core=$((core+1))
+    hits=$(grep -nE '^import ritzlib\.(sys|memory|io|fs|process)\b|\bsys_[a-z]' "$f")
+    [ -z "$hits" ] || fail "$f is goliath core but uses the hosted ritzlib: $hits"
+done
+[ "$core" -ge 8 ] && echo "ok: freestanding_core ($core modules)" || fail "freestanding check saw only $core core modules"
+# cryptosec's SHA-256 (BlobIds) is part of that core
+grep -qE '^import ritzlib\.sys\b' ../cryptosec/lib/sha256.ritz && fail "cryptosec/lib/sha256.ritz imports ritzlib.sys"
+
 [ $fails -eq 0 ] || { echo "$fails goliath CLI check(s) failed"; exit 1; }

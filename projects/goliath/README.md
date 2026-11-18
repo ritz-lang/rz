@@ -1,9 +1,13 @@
 # Goliath
 
 Content-addressable filesystem for Harland, as a Ritz library and a CLI.
-**What works today:** SHA-256 blob ids, an in-memory blob store
-(put/get/exists/delete), a store persisted in one host file, a VirtIO-backed
-store, and a path namespace (`./rz test goliath`: 46 tests plus `test.sh`).
+**What works today:** SHA-256 blob ids, a reference-counted in-memory blob
+store, a path namespace (write/mkdir/delete at any depth; deleting a file
+frees its blobs), and one on-disk image format kept in a host file
+(`file_store`) or on a block device (`block_store`). The core builds
+freestanding: memory comes from an `Allocator`, disks are a `BlockDevice`,
+and only `hosted.ritz`, `file_store.ritz` and the CLI use the hosted ritzlib
+(AGAST #1881). Run `./rz test goliath` for the current test count.
 The `goliath` binary stores files and reads them back: `goliath put FILE`
 prints the file's blob id, `goliath get ID` writes the blob to stdout, and
 `goliath ls PATH` lists the namespace (AGAST #2788).
@@ -97,11 +101,8 @@ let content = store.get(blob_id)
 # Snapshot - just copies the namespace, not the data
 let snapshot_ns = ns.snapshot()
 
-# Delete from namespace (blob stays in store until GC)
+# Delete from namespace: blobs nothing else names are freed at once
 ns.remove("/hello.txt")
-
-# Garbage collect unreferenced blobs
-store.gc(ns.all_blob_ids())
 ```
 
 ## Dependencies
@@ -110,13 +111,14 @@ store.gc(ns.all_blob_ids())
 
 ## Status
 
-**Alpha, with a passing suite.** `./rz test goliath` runs 5 test files
-(46 tests) and `test.sh`, which drives the CLI end to end against a temp
-store. Run it to get today's numbers.
+**Alpha, with a passing suite.** `./rz test goliath` runs the `test/` files
+and `test.sh`, which drives the CLI end to end against a temp store and
+checks the core stays freestanding. Run it to get today's numbers.
 
-Core blob store (put/get/exists), the host-file store, namespaces and path
-handling are implemented. Garbage collection and snapshot support are still
-planned. The CLI has no `mkdir` yet, so `put` only fills `/`.
+Implemented: the blob store with reference counting, namespaces (nested
+write/mkdir/delete), the image format on a host file or block device.
+Snapshots are still planned. The CLI has no `mkdir` yet, so `put` only fills
+`/`.
 
 ## License
 

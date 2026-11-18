@@ -1,0 +1,263 @@
+# A goliath image on a block device, and goliath on an injected allocator
+# (AGAST #1881). The device here is a RAM disk behind the same BlockDevice
+# interface the kernel's virtio-blk driver fills in.
+
+import ritzlib.memory { heap_alloc, heap_free }
+import ritzlib.strview { StrView }
+import ritzlib.span { Span, span_from_ptr }
+import goliath.alloc { Allocator }
+import goliath.blob_id { BlobId }
+import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_free, memory_store_count, memory_store_get, memory_store_get_size }
+import goliath.hosted { memory_store_new }
+import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve }
+import goliath.block_store { BlockDevice, block_store_save, block_store_load, BLOCK_SECTOR_SIZE }
+import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_CORRUPT_BLOB, ERR_IO_ERROR, ERR_OUT_OF_SPACE }
+
+# ---------------------------------------------------------------------------
+# RAM disk
+# ---------------------------------------------------------------------------
+
+struct RamDisk
+    data: *u8
+    sectors: u64
+    fail_io: bool
+
+fn ram_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    if (*d).fail_io or lba + count as u64 > (*d).sectors
+        return -5
+    let base: *u8 = (*d).data + (lba * 512) as i64
+    var i: i64 = 0
+    while i < count as i64 * 512
+        *(buf + i) = *(base + i)
+        i = i + 1
+    0
+
+fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    let d: *RamDisk = dev as *RamDisk
+    if (*d).fail_io or lba + count as u64 > (*d).sectors
+        return -5
+    let base: *u8 = (*d).data + (lba * 512) as i64
+    var i: i64 = 0
+    while i < count as i64 * 512
+        *(base + i) = *(buf + i)
+        i = i + 1
+    0
+
+# A zeroed (blank) disk of `sectors` sectors
+fn ram_new(sectors: u64) -> RamDisk
+    RamDisk { data: heap_alloc((sectors * 512) as i64), sectors: sectors, fail_io: false }
+
+fn ram_device(d: *RamDisk) -> BlockDevice
+    BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write }
+
+fn ram_free(d: *RamDisk)
+    heap_free((*d).data, ((*d).sectors * 512) as i64)
+
+fn write_text(ns: *Namespace, path: StrView, text: *u8, len: i64) -> ErrorCode
+    let data: Span<u8> = span_from_ptr<u8>(text, len)
+    namespace_write(ns, path, @data)
+
+fn reads_back(ns: *Namespace, path: StrView, want: *u8, len: i64) -> bool
+    let got: Span<u8> = namespace_read(ns, path)
+    if got.ptr == null or got.len != len
+        return false
+    var i: i64 = 0
+    while i < len
+        if *(got.ptr + i) != *(want + i)
+            return false
+        i = i + 1
+    true
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+# Save, "reboot" (a fresh store), load: the tree is all there, nested paths
+# included, and a deleted file stays deleted.
+[[test]]
+fn test_block_store_survives_reboot() -> i32
+    var disk: RamDisk = ram_new(256)
+    var dev: BlockDevice = ram_device(@disk)
+
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_mkdir(@ns, "/etc") == ERR_OK
+    assert write_text(@ns, "/etc/motd", c"hello harland", 13) == ERR_OK
+    assert write_text(@ns, "/etc/gone", c"bye", 3) == ERR_OK
+    assert namespace_delete(@ns, "/etc/gone") == ERR_OK
+    assert write_text(@ns, "/top", c"t", 1) == ERR_OK
+    let blobs: i32 = memory_store_count(@store)
+    assert block_store_save(@dev, @ns) == ERR_OK
+    memory_store_free(@store)
+
+    var store2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    assert block_store_load(@dev, @store2, @ns2) == ERR_OK
+    assert reads_back(@ns2, "/etc/motd", c"hello harland", 13)
+    assert reads_back(@ns2, "/top", c"t", 1)
+    assert not namespace_exists(@ns2, "/etc/gone")
+    assert memory_store_count(@store2) == blobs
+    # The loaded tree is live: change it and round-trip again
+    assert write_text(@ns2, "/etc/motd", c"v2", 2) == ERR_OK
+    assert block_store_save(@dev, @ns2) == ERR_OK
+    memory_store_free(@store2)
+
+    var store3: MemoryBlobStore = memory_store_new()
+    var ns3: Namespace
+    assert block_store_load(@dev, @store3, @ns3) == ERR_OK
+    assert reads_back(@ns3, "/etc/motd", c"v2", 2)
+    memory_store_free(@store3)
+    ram_free(@disk)
+    0
+
+# A blank device has no filesystem; a damaged one is refused, not half read;
+# an image too big for the device is not written at all.
+[[test]]
+fn test_block_store_refuses_blank_damaged_and_full() -> i32
+    var disk: RamDisk = ram_new(64)
+    var dev: BlockDevice = ram_device(@disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    assert block_store_load(@dev, @store, @ns) == ERR_NOT_FOUND
+
+    ns = namespace_new(@store)
+    assert write_text(@ns, "/f", c"payload", 7) == ERR_OK
+    assert block_store_save(@dev, @ns) == ERR_OK
+
+    # One flipped byte in the image (sector 1 onwards)
+    *((disk.data) + 512 + 100) = *((disk.data) + 512 + 100) ^ 1
+    var s2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace
+    assert block_store_load(@dev, @s2, @ns2) == ERR_CORRUPT_BLOB
+    memory_store_free(@s2)
+
+    # I/O errors surface as such
+    disk.fail_io = true
+    assert block_store_save(@dev, @ns) == ERR_IO_ERROR
+    var s3: MemoryBlobStore = memory_store_new()
+    assert block_store_load(@dev, @s3, @ns2) == ERR_IO_ERROR
+    memory_store_free(@s3)
+    disk.fail_io = false
+
+    # 8 KiB of content can't fit a 4-sector device; the device is untouched
+    var tiny: RamDisk = ram_new(4)
+    var tdev: BlockDevice = ram_device(@tiny)
+    let big: *u8 = heap_alloc(8192)
+    let big_span: Span<u8> = span_from_ptr<u8>(big, 8192)
+    assert namespace_write(@ns, "/big", @big_span) == ERR_OK
+    assert block_store_save(@tdev, @ns) == ERR_OUT_OF_SPACE
+    assert *(tiny.data) == 0
+    heap_free(big, 8192)
+
+    memory_store_free(@store)
+    ram_free(@tiny)
+    ram_free(@disk)
+    0
+
+# ---------------------------------------------------------------------------
+# Allocator injection
+# ---------------------------------------------------------------------------
+
+var g_outstanding: i64 = 0
+var g_budget: i64 = 0
+
+fn counting_alloc(len: i64) -> *u8
+    if g_outstanding + len > g_budget
+        return null
+    g_outstanding = g_outstanding + len
+    heap_alloc(len)
+
+fn counting_free(p: *u8, len: i64) -> i32
+    g_outstanding = g_outstanding - len
+    heap_free(p, len)
+
+fn counting() -> Allocator
+    Allocator { alloc: counting_alloc, free: counting_free }
+
+# Every byte goliath takes comes from its allocator and goes back to it:
+# after a workload with overwrites and deletes, freeing the store returns
+# the allocator to zero.
+[[test]]
+fn test_all_memory_goes_through_the_allocator() -> i32
+    g_outstanding = 0
+    g_budget = 1 << 30
+    var store: MemoryBlobStore = memory_store_new_in(counting())
+    assert g_outstanding > 0
+    var ns: Namespace = namespace_new(@store)
+    assert namespace_mkdir(@ns, "/a") == ERR_OK
+    assert namespace_mkdir(@ns, "/a/b") == ERR_OK
+    var k: i32 = 0
+    var buf: [4]u8
+    while k < 100
+        buf[0] = k as u8
+        assert write_text(@ns, "/a/b/f", @buf[0], 1) == ERR_OK
+        assert write_text(@ns, "/a/g", @buf[0], 1) == ERR_OK
+        k = k + 1
+    assert namespace_delete(@ns, "/a/g") == ERR_OK
+    memory_store_free(@store)
+    assert g_outstanding == 0
+    0
+
+# Out of memory is an error, not a crash or a lost write
+[[test]]
+fn test_out_of_memory_is_reported() -> i32
+    g_outstanding = 0
+    g_budget = 1 << 30
+    var store: MemoryBlobStore = memory_store_new_in(counting())
+    var ns: Namespace = namespace_new(@store)
+    assert write_text(@ns, "/kept", c"kept", 4) == ERR_OK
+    g_budget = g_outstanding
+    assert write_text(@ns, "/new", c"new", 3) == ERR_OUT_OF_SPACE
+    assert not namespace_exists(@ns, "/new")
+    assert reads_back(@ns, "/kept", c"kept", 4)
+    g_budget = 1 << 30
+    memory_store_free(@store)
+    assert g_outstanding == 0
+    0
+
+# A file whose bytes are exactly a directory blob is the same blob. Deleting
+# the directory must not free what the file still names, and deleting both
+# frees everything.
+[[test]]
+fn test_file_equal_to_a_directory_blob() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let empty: i32 = memory_store_count(@store)
+    assert namespace_mkdir(@ns, "/d") == ERR_OK
+    assert write_text(@ns, "/d/f", c"inner", 5) == ERR_OK
+    var dir_id: BlobId = namespace_resolve(@ns, "/d")
+    let dir_size: u64 = memory_store_get_size(@store, @dir_id)
+    let copy: *u8 = heap_alloc(dir_size as i64)
+    let src: *u8 = memory_store_get(@store, @dir_id)
+    var i: u64 = 0
+    while i < dir_size
+        *(copy + i) = *(src + i)
+        i = i + 1
+    assert write_text(@ns, "/copy", copy, dir_size as i64) == ERR_OK
+    assert namespace_delete(@ns, "/d/f") == ERR_OK
+    assert namespace_delete(@ns, "/d") == ERR_OK
+    assert reads_back(@ns, "/copy", copy, dir_size as i64)
+    assert namespace_delete(@ns, "/copy") == ERR_OK
+    assert memory_store_count(@store) == empty
+    heap_free(copy, dir_size as i64)
+
+    # Bytes that parse as a directory but were never stored as one hold no
+    # references: dropping such a file mustn't release what they name.
+    assert write_text(@ns, "/x", c"x content", 9) == ERR_OK
+    var root_id: BlobId = namespace_resolve(@ns, "/")
+    let root_size: u64 = memory_store_get_size(@store, @root_id)
+    let old_root: *u8 = heap_alloc(root_size as i64)
+    let root_src: *u8 = memory_store_get(@store, @root_id)
+    i = 0
+    while i < root_size
+        *(old_root + i) = *(root_src + i)
+        i = i + 1
+    # Replace the root (freeing that blob), then store its bytes as a file
+    assert write_text(@ns, "/y", c"y", 1) == ERR_OK
+    assert write_text(@ns, "/fake", old_root, root_size as i64) == ERR_OK
+    assert namespace_delete(@ns, "/fake") == ERR_OK
+    assert reads_back(@ns, "/x", c"x content", 9)
+    heap_free(old_root, root_size as i64)
+    memory_store_free(@store)
+    0

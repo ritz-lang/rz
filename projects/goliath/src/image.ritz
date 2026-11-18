@@ -1,0 +1,146 @@
+# Image - goliath's one on-disk format (AGAST #1881)
+#
+# A namespace and every blob its store holds, as one byte string. The host
+# file the CLI keeps (goliath.file_store) is an image; a block device
+# (goliath.block_store) holds one behind a one-sector superblock.
+#
+# Format (integers little-endian):
+#
+#     0   magic    "GOLIATHS"           8 bytes
+#     8   version  u32 = 1
+#     12  count    u32                  number of blobs that follow
+#     16  root     BlobId               the namespace's root directory blob
+#     48  blobs    count x { id: BlobId, size: u64, data: [size]u8 }
+#
+# An image that doesn't match this exactly (bad magic or version, cut short,
+# trailing bytes, a blob whose bytes don't hash to its id, a root that isn't
+# one of its blobs, a directory naming a blob it doesn't hold) is refused
+# with ERR_CORRUPT_BLOB rather than half loaded. Loading recounts references
+# and frees any blob the tree doesn't reach.
+
+import goliath.blob_id { BlobId, blob_id_compute, blob_id_eq, blob_id_from_hash, blob_id_is_zero }
+import goliath.blob_store { MemoryBlobStore, memory_store_put, memory_store_exists, memory_store_count, memory_store_capacity, memory_store_slot_used, memory_store_slot_id, memory_store_slot_data, memory_store_slot_size }
+import goliath.namespace { Namespace, namespace_root, namespace_store, namespace_open_whole }
+import goliath.error { ErrorCode, ERR_OK, ERR_CORRUPT_BLOB, ERR_OUT_OF_SPACE }
+
+pub const IMAGE_VERSION: u32 = 1
+pub const IMAGE_HEADER_SIZE: i64 = 48
+pub const IMAGE_BLOB_HEADER_SIZE: i64 = 40
+
+# Where image_write sends its bytes: write(ctx, data, len), false on error
+pub struct ImageSink
+    ctx: *u8
+    write: fn(*u8, *u8, i64) -> bool
+
+fn image_magic_byte(i: i64) -> u8
+    *(c"GOLIATHS" + i)
+
+pub fn image_put_le(buf: *u8, value: u64, width: i64)
+    var i: i64 = 0
+    while i < width
+        *(buf + i) = ((value >> (i * 8) as u64) & 255) as u8
+        i = i + 1
+
+pub fn image_get_le(buf: *u8, width: i64) -> u64
+    var v: u64 = 0
+    var i: i64 = width - 1
+    while i >= 0
+        v = (v << 8) | *(buf + i) as u64
+        i = i - 1
+    v
+
+fn sink_write(sink: *ImageSink, data: *u8, len: i64) -> bool
+    if len == 0
+        return true
+    let f: fn(*u8, *u8, i64) -> bool = (*sink).write
+    f((*sink).ctx, data, len)
+
+# Bytes image_write will send for `ns`
+pub fn image_size(ns: *Namespace) -> u64
+    let store: *MemoryBlobStore = namespace_store(ns)
+    var total: u64 = IMAGE_HEADER_SIZE as u64
+    var slot: i32 = 0
+    while slot < memory_store_capacity(store)
+        if memory_store_slot_used(store, slot)
+            total = total + IMAGE_BLOB_HEADER_SIZE as u64 + memory_store_slot_size(store, slot)
+        slot = slot + 1
+    total
+
+# Send `ns` and its store's blobs to `sink`. False if the sink failed.
+pub fn image_write(ns: *Namespace, sink: *ImageSink) -> bool
+    let store: *MemoryBlobStore = namespace_store(ns)
+    var header: [48]u8
+    var i: i64 = 0
+    while i < 8
+        header[i] = image_magic_byte(i)
+        i = i + 1
+    image_put_le(@header[8], IMAGE_VERSION as u64, 4)
+    image_put_le(@header[12], memory_store_count(store) as u64, 4)
+    var root: BlobId = namespace_root(ns)
+    i = 0
+    while i < 32
+        header[16 + i] = root.hash[i]
+        i = i + 1
+    if not sink_write(sink, @header[0], IMAGE_HEADER_SIZE)
+        return false
+
+    var blob_header: [40]u8
+    var slot: i32 = 0
+    while slot < memory_store_capacity(store)
+        if memory_store_slot_used(store, slot)
+            var id: BlobId = memory_store_slot_id(store, slot)
+            let size: u64 = memory_store_slot_size(store, slot)
+            var j: i64 = 0
+            while j < 32
+                blob_header[j] = id.hash[j]
+                j = j + 1
+            image_put_le(@blob_header[32], size, 8)
+            if not sink_write(sink, @blob_header[0], IMAGE_BLOB_HEADER_SIZE)
+                return false
+            if not sink_write(sink, memory_store_slot_data(store, slot), size as i64)
+                return false
+        slot = slot + 1
+    true
+
+# Fill the empty `store` from the `len`-byte image at `buf` and set `ns_out`
+# to its namespace. ERR_OK, ERR_CORRUPT_BLOB or ERR_OUT_OF_SPACE.
+pub fn image_load(buf: *u8, len: i64, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
+    if len < IMAGE_HEADER_SIZE
+        return ERR_CORRUPT_BLOB
+    var i: i64 = 0
+    while i < 8
+        if *(buf + i) != image_magic_byte(i)
+            return ERR_CORRUPT_BLOB
+        i = i + 1
+    if image_get_le(buf + 8, 4) as u32 != IMAGE_VERSION
+        return ERR_CORRUPT_BLOB
+    let count: u64 = image_get_le(buf + 12, 4)
+    var root: BlobId = blob_id_from_hash(buf + 16)
+
+    var off: i64 = IMAGE_HEADER_SIZE
+    var k: u64 = 0
+    while k < count
+        if len - off < IMAGE_BLOB_HEADER_SIZE
+            return ERR_CORRUPT_BLOB
+        var id: BlobId = blob_id_from_hash(buf + off)
+        let size: u64 = image_get_le(buf + off + 32, 8)
+        off = off + IMAGE_BLOB_HEADER_SIZE
+        if size > (len - off) as u64
+            return ERR_CORRUPT_BLOB
+        let data: *u8 = buf + off
+        # Content addressing: the bytes must still be the ones named
+        var actual: BlobId = blob_id_compute(data, size)
+        if not blob_id_eq(@actual, @id)
+            return ERR_CORRUPT_BLOB
+        var stored: BlobId = memory_store_put(store, data, size)
+        if blob_id_is_zero(@stored)
+            return ERR_OUT_OF_SPACE
+        off = off + size as i64
+        k = k + 1
+    if off != len
+        return ERR_CORRUPT_BLOB
+    if not memory_store_exists(store, @root)
+        return ERR_CORRUPT_BLOB
+    if not namespace_open_whole(store, @root, ns_out)
+        return ERR_CORRUPT_BLOB
+    ERR_OK

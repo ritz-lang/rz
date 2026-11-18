@@ -71,10 +71,17 @@ pub trait BlobStore
 
 ## On-Disk Format
 
-### Superblock (block 0)
+Implemented (AGAST #1881): one format, the **image** (`src/image.ritz`): a
+`GOLIATHS` header naming the root directory blob, then every live blob as
+`{ id, size, bytes }`. A host file holds one image (`src/file_store.ritz`);
+a block device holds one from sector 1 behind a `GOLIATHB` superblock in
+sector 0 (`src/block_store.ritz`). Loading verifies every blob's hash and
+that the tree is whole. The store is in memory between loads and saves, so
+the image carries only live blobs and needs no allocation bitmap.
 
-```
-Offset  Size  Field
+The extent / bitmap / blob-index layout this section used to sketch is a
+possible later format for stores too big to hold in memory.
+
 ------  ----  -----
 0x00    8     Magic: "GOLIATH\0"
 0x08    4     Version (1)
@@ -198,26 +205,12 @@ fn restore(ns: &mut Namespace, snap: &NamespaceSnapshot)
 
 ## Garbage Collection
 
-Unreferenced blobs are cleaned up by GC:
-
-```ritz
-fn garbage_collect(store: &mut BlobStore, namespaces: &[Namespace])
-    # Mark phase: walk all namespaces, mark reachable blobs
-    let reachable: HashSet<BlobID> = HashSet.new()
-
-    for ns in namespaces
-        mark_reachable(store, ns.root, &mut reachable)
-
-    # Sweep phase: delete unreferenced blobs
-    for blob_id in store.all_blob_ids()
-        if !reachable.contains(blob_id)
-            store.delete(blob_id)
-```
-
-GC can run:
-- **Online**: Background thread, incremental
-- **Offline**: During mount, full sweep
-- **Never**: Keep all history forever (if space allows)
+Implemented (AGAST #1881) as reference counting (`src/blob_store.ritz`,
+`src/namespace.ritz`): a blob is held once per directory entry naming it and
+the root once by the namespace. A directory blob takes its children's
+references when first stored, and drops them when its own last reference
+goes, so replacing the root frees everything only the old tree reached.
+Loading an image recounts by marking from the root and sweeps the rest.
 
 ---
 

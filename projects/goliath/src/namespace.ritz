@@ -1,48 +1,97 @@
 # Namespace - Path to Content Mapping
 #
-# A namespace maps human-readable paths to BlobIDs.
-# Uses StrView for all path parameters.
+# A namespace maps paths to BlobIDs. Directories are blobs too (see
+# goliath.dir_entry for their format), so the whole tree is a Merkle tree
+# hanging off one root blob.
+#
+# Changing a file changes its directory's blob, which changes that
+# directory's entry in its parent, and so on up: every write, mkdir or delete
+# rewrites the directories from the changed entry up to the root and then
+# repoints the root (AGAST #1881: it used to rewrite only the parent and
+# repoint the root only when the parent *was* the root, so a write below the
+# root returned ERR_OK and was lost).
+#
+# Reclamation is by reference count (goliath.blob_store): a blob is held once
+# per directory entry naming it (in a live directory blob) and the root once
+# by the namespace. A new directory blob takes a reference on each child; a
+# directory blob whose last reference goes drops its children's. So when the
+# root is replaced, everything only the old tree reached is freed, and
+# deleting a file frees its blob unless other entries share its content.
+#
+# A store holds one namespace.
 
-import ritzlib.sys { sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS }
 import ritzlib.strview { StrView, strview_empty }
-import ritzlib.span { Span, span_from_ptr }
-import goliath.blob_id { BlobId, blob_id_zero, blob_id_eq, blob_id_is_zero, blob_id_copy }
-import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size, memory_store_put }
-import goliath.dir_entry { DirEntry, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size }
-import goliath.path { path_is_absolute, path_is_root, path_parent, path_basename, path_validate, PathIter, path_iter_new, path_iter_next }
-import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_ALREADY_EXISTS, ERR_INVALID_PATH, ERR_OUT_OF_SPACE, ERR_NOT_A_FILE, ERR_PERMISSION_DENIED }
+import ritzlib.span { Span, span_from_ptr, span_empty }
+import goliath.alloc { Allocator, allocator_alloc, allocator_free }
+import goliath.blob_id { BlobId, blob_id_zero, blob_id_is_zero, blob_id_copy }
+import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size, memory_store_get_span, memory_store_put, memory_store_refs, memory_store_retain, memory_store_release, memory_store_allocator, memory_store_mark_begin, memory_store_mark, memory_store_sweep, memory_store_hold_children, memory_store_holds_children }
+import goliath.dir_entry { DirEntry, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size, dir_entry_at, dir_entry_disk_size, DIR_HEADER_SIZE }
+import goliath.path { path_is_absolute, path_is_root, path_validate, PathIter, path_iter_new, path_iter_next }
+import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_ALREADY_EXISTS, ERR_INVALID_PATH, ERR_OUT_OF_SPACE, ERR_NOT_A_FILE, ERR_NOT_A_DIRECTORY, ERR_DIRECTORY_NOT_EMPTY, ERR_PERMISSION_DENIED }
 
 # Maximum entries per directory
-const MAX_DIR_ENTRIES: i32 = 256
+pub const MAX_DIR_ENTRIES: i32 = 256
 
-# Namespace - maps paths to content
 pub struct Namespace
     store: *MemoryBlobStore
     root: BlobId
 
-# Create a new empty namespace
+# ============================================================================
+# Construction
+# ============================================================================
+
+# A new namespace over `store` with an empty root directory. (Out of memory
+# leaves a zero root, which every lookup treats as missing.)
 pub fn namespace_new(store: *MemoryBlobStore) -> Namespace
-    var root_data: [4]u8
-    root_data[0] = 0
-    root_data[1] = 0
-    root_data[2] = 0
-    root_data[3] = 0
+    var ns: Namespace = Namespace { store: store, root: blob_id_zero() }
+    ns.root = put_empty_dir(@ns)
+    ns
 
-    let root_id: BlobId = memory_store_put(store, @root_data[0], 4)
-
-    Namespace {
-        store: store,
-        root: root_id
-    }
-
-# A namespace over `store` whose root directory is the blob `root`
-# (e.g. one loaded from a file: see file_store.ritz). The caller checks that
-# `root` is in `store`.
+# A namespace over `store` whose root directory is the blob `root`: a store
+# just loaded (goliath.image). Recounts every blob's references from the tree
+# `root` reaches and frees what it doesn't reach. See namespace_recount for
+# a loader that needs to know the tree is whole.
 pub fn namespace_open(store: *MemoryBlobStore, root: *BlobId) -> Namespace
-    Namespace {
-        store: store,
-        root: blob_id_copy(root)
-    }
+    var ns: Namespace = Namespace { store: store, root: blob_id_copy(root) }
+    namespace_recount(@ns)
+    ns
+
+# namespace_open for a loader: false (and `ns_out` untouched) if the tree
+# names a blob the store doesn't hold, or a directory that isn't one.
+pub fn namespace_open_whole(store: *MemoryBlobStore, root: *BlobId, ns_out: *Namespace) -> bool
+    var ns: Namespace = Namespace { store: store, root: blob_id_copy(root) }
+    if namespace_recount(@ns) != 0
+        return false
+    *ns_out = ns
+    true
+
+# Recount (mark from the root, sweep the rest). The number of blobs the tree
+# names that the store doesn't hold, or that aren't well-formed directories
+# where a directory is named: 0 for a whole tree.
+pub fn namespace_recount(ns: *Namespace) -> i32
+    memory_store_mark_begin((*ns).store)
+    let missing: i32 = mark_tree(ns, @(*ns).root, true)
+    memory_store_sweep((*ns).store)
+    missing
+
+fn mark_tree(ns: *Namespace, id: *BlobId, is_dir: bool) -> i32
+    if memory_store_mark((*ns).store, id) == 0
+        return 1
+    if not is_dir
+        return 0
+    let count: i32 = read_dir_count(ns, id)
+    if count < 0
+        return 1
+    # First time here as a directory: its entries hold references
+    if not memory_store_hold_children((*ns).store, id)
+        return 0
+    var missing: i32 = 0
+    var i: i32 = 0
+    while i < count
+        var entry: DirEntry = read_dir_entry(ns, id, i)
+        missing = missing + mark_tree(ns, @entry.blob_id, dir_entry_is_dir(@entry))
+        i = i + 1
+    missing
 
 # The store this namespace keeps its blobs in
 pub fn namespace_store(ns: *Namespace) -> *MemoryBlobStore
@@ -52,87 +101,261 @@ pub fn namespace_store(ns: *Namespace) -> *MemoryBlobStore
 pub fn namespace_root(ns: *Namespace) -> BlobId
     blob_id_copy(@(*ns).root)
 
-# Read directory entry count
+# ============================================================================
+# Directory blobs
+# ============================================================================
+
+# Entry count of a directory blob; -1 if it isn't stored or is too short to
+# hold its entries.
 fn read_dir_count(ns: *Namespace, dir_id: *BlobId) -> i32
     let data: *u8 = memory_store_get((*ns).store, dir_id)
-    if data == 0 as *u8
+    if data == null
         return -1
-    let count_ptr: *u32 = data as *u32
-    *count_ptr as i32
+    let size: u64 = memory_store_get_size((*ns).store, dir_id)
+    if size < DIR_HEADER_SIZE as u64
+        return -1
+    let count: u32 = *(data as *u32)
+    if count > MAX_DIR_ENTRIES as u32 or dir_serialized_size(count) > size
+        return -1
+    count as i32
 
-# Read directory entry at index
+# Entry `index` (< read_dir_count) of a directory blob
 fn read_dir_entry(ns: *Namespace, dir_id: *BlobId, index: i32) -> DirEntry
     let data: *u8 = memory_store_get((*ns).store, dir_id)
-    let entry_offset: i32 = 4 + index * 320
-    dir_entry_deserialize(data + entry_offset)
+    dir_entry_deserialize(dir_entry_at(data, index))
 
-# Find entry in directory by name
+# Index of the entry called `name`, or -1
 fn find_entry_in_dir(ns: *Namespace, dir_id: *BlobId, name: StrView) -> i32
     let count: i32 = read_dir_count(ns, dir_id)
-    if count < 0
-        return -1
-
     var i: i32 = 0
     while i < count
         var entry: DirEntry = read_dir_entry(ns, dir_id, i)
         if dir_entry_name_eq(@entry, name)
             return i
         i = i + 1
-
     -1
 
-# Resolve a path to its BlobId
+# Store a directory blob; the caller gets one reference. A directory blob not
+# stored before takes a reference on each blob its entries name.
+fn put_dir(ns: *Namespace, data: *u8, size: u64) -> BlobId
+    var id: BlobId = memory_store_put((*ns).store, data, size)
+    if blob_id_is_zero(@id)
+        return id
+    if memory_store_hold_children((*ns).store, @id)
+        let count: i32 = read_dir_count(ns, @id)
+        var i: i32 = 0
+        while i < count
+            var entry: DirEntry = read_dir_entry(ns, @id, i)
+            memory_store_retain((*ns).store, @entry.blob_id)
+            i = i + 1
+    id
+
+fn put_empty_dir(ns: *Namespace) -> BlobId
+    var empty: [4]u8
+    empty[0] = 0
+    empty[1] = 0
+    empty[2] = 0
+    empty[3] = 0
+    put_dir(ns, @empty[0], DIR_HEADER_SIZE as u64)
+
+# Drop one reference to `id`. The last reference to a directory blob drops
+# its entries' references first (and so on down).
+fn release(ns: *Namespace, id: *BlobId)
+    if memory_store_refs((*ns).store, id) == 1 and memory_store_holds_children((*ns).store, id)
+        let count: i32 = read_dir_count(ns, id)
+        var i: i32 = 0
+        while i < count
+            var entry: DirEntry = read_dir_entry(ns, id, i)
+            release(ns, @entry.blob_id)
+            i = i + 1
+    memory_store_release((*ns).store, id)
+
+# A copy of directory `dir` with entry `name` set to `child` (or removed,
+# when `child` is null), stored, with one reference for the caller. Zero and
+# *err set on failure.
+fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_is_dir: bool, size: u64, err: *ErrorCode) -> BlobId
+    let old_count: i32 = read_dir_count(ns, dir)
+    if old_count < 0
+        *err = ERR_NOT_FOUND
+        return blob_id_zero()
+    let idx: i32 = find_entry_in_dir(ns, dir, name)
+    var new_count: i32 = old_count
+    if child == null
+        if idx < 0
+            *err = ERR_NOT_FOUND
+            return blob_id_zero()
+        new_count = old_count - 1
+    else if idx < 0
+        new_count = old_count + 1
+    if new_count > MAX_DIR_ENTRIES
+        *err = ERR_OUT_OF_SPACE
+        return blob_id_zero()
+
+    let alloc: *Allocator = memory_store_allocator((*ns).store)
+    let new_size: u64 = dir_serialized_size(new_count as u32)
+    let buf: *u8 = allocator_alloc(alloc, new_size as i64)
+    if buf == null
+        *err = ERR_OUT_OF_SPACE
+        return blob_id_zero()
+    *(buf as *u32) = new_count as u32
+
+    # Entries keep their order: a replaced entry stays where it was, a new
+    # one goes last
+    let old: *u8 = memory_store_get((*ns).store, dir)
+    let entry_size: i64 = dir_entry_disk_size()
+    var out: i32 = 0
+    var i: i32 = 0
+    while i < old_count
+        if i == idx
+            if child != null
+                write_entry(buf, out, name, child, child_is_dir, size)
+                out = out + 1
+        else
+            let src: *u8 = dir_entry_at(old, i)
+            let dst: *u8 = dir_entry_at(buf, out)
+            var b: i64 = 0
+            while b < entry_size
+                *(dst + b) = *(src + b)
+                b = b + 1
+            out = out + 1
+        i = i + 1
+    if child != null and idx < 0
+        write_entry(buf, out, name, child, child_is_dir, size)
+
+    var id: BlobId = put_dir(ns, buf, new_size)
+    allocator_free(alloc, buf, new_size as i64)
+    if blob_id_is_zero(@id)
+        *err = ERR_OUT_OF_SPACE
+    id
+
+fn write_entry(buf: *u8, index: i32, name: StrView, child: *BlobId, is_dir: bool, size: u64)
+    var entry: DirEntry
+    if is_dir
+        entry = dir_entry_dir(name, child)
+    else
+        entry = dir_entry_file(name, child, size)
+    dir_entry_serialize(@entry, dir_entry_at(buf, index))
+
+# ============================================================================
+# Rewriting a path
+# ============================================================================
+
+const OP_WRITE: i32 = 0
+const OP_MKDIR: i32 = 1
+const OP_DELETE: i32 = 2
+
+# What to do to the last component of a path
+struct Change
+    op: i32
+    id: BlobId      # OP_WRITE / OP_MKDIR: the blob to link (caller holds a ref)
+    size: u64
+
+# The directory `dir` with the rest of the path (from `iter`) changed: a new
+# directory blob with one reference for the caller, or zero and *err.
+fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: *ErrorCode) -> BlobId
+    var name: StrView = strview_empty()
+    if not path_iter_next(iter, @name)
+        *err = ERR_INVALID_PATH
+        return blob_id_zero()
+    var peek: PathIter = *iter
+    var next: StrView = strview_empty()
+    let last: bool = not path_iter_next(@peek, @next)
+    let idx: i32 = find_entry_in_dir(ns, dir, name)
+
+    if not last
+        # An intermediate directory: rewrite below it, then relink it here
+        if idx < 0
+            *err = ERR_NOT_FOUND
+            return blob_id_zero()
+        var entry: DirEntry = read_dir_entry(ns, dir, idx)
+        if not dir_entry_is_dir(@entry)
+            *err = ERR_NOT_A_DIRECTORY
+            return blob_id_zero()
+        var sub: BlobId = rewrite(ns, @entry.blob_id, iter, change, err)
+        if blob_id_is_zero(@sub)
+            return sub
+        var id: BlobId = dir_with(ns, dir, name, @sub, true, 0, err)
+        release(ns, @sub)
+        return id
+
+    if (*change).op == OP_DELETE
+        if idx < 0
+            *err = ERR_NOT_FOUND
+            return blob_id_zero()
+        var target: DirEntry = read_dir_entry(ns, dir, idx)
+        if dir_entry_is_dir(@target) and read_dir_count(ns, @target.blob_id) != 0
+            *err = ERR_DIRECTORY_NOT_EMPTY
+            return blob_id_zero()
+        return dir_with(ns, dir, name, null, false, 0, err)
+
+    if idx >= 0
+        var existing: DirEntry = read_dir_entry(ns, dir, idx)
+        if (*change).op == OP_MKDIR
+            *err = ERR_ALREADY_EXISTS
+            return blob_id_zero()
+        if dir_entry_is_dir(@existing)
+            *err = ERR_NOT_A_FILE
+            return blob_id_zero()
+    dir_with(ns, dir, name, @(*change).id, (*change).op == OP_MKDIR, (*change).size, err)
+
+# Apply `change` at `path` and repoint the root at the result
+fn commit(ns: *Namespace, path: StrView, change: *Change) -> ErrorCode
+    var err: ErrorCode = ERR_OK
+    var iter: PathIter = path_iter_new(path)
+    var new_root: BlobId = rewrite(ns, @(*ns).root, @iter, change, @err)
+    if blob_id_is_zero(@new_root)
+        return err
+    var old_root: BlobId = blob_id_copy(@(*ns).root)
+    (*ns).root = new_root
+    release(ns, @old_root)
+    ERR_OK
+
+fn check_path(path: StrView) -> ErrorCode
+    if not path_validate(path)
+        return ERR_INVALID_PATH
+    ERR_OK
+
+# ============================================================================
+# Public API
+# ============================================================================
+
+# Resolve a path to its BlobId (zero if it doesn't exist)
 pub fn namespace_resolve(ns: *Namespace, path: StrView) -> BlobId
+    var is_dir: bool = false
+    resolve_kind(ns, path, @is_dir)
+
+# namespace_resolve, and whether the path names a directory
+fn resolve_kind(ns: *Namespace, path: StrView, is_dir_out: *bool) -> BlobId
+    *is_dir_out = false
     if not path_is_absolute(path)
         return blob_id_zero()
-
-    if path_is_root(path)
-        return blob_id_copy(@(*ns).root)
-
-    # Walk the path using iterator
-    var current_dir: BlobId = blob_id_copy(@(*ns).root)
+    var current: BlobId = blob_id_copy(@(*ns).root)
+    var current_is_dir: bool = true
     var iter: PathIter = path_iter_new(path)
-    var component: StrView
-    var last_component: StrView = strview_empty()
-
-    while path_iter_next(@iter, @component)
-        # If we had a previous component, it must have been a directory
-        if last_component.len > 0
-            let entry_idx: i32 = find_entry_in_dir(ns, @current_dir, last_component)
-            if entry_idx < 0
-                return blob_id_zero()
-            var entry: DirEntry = read_dir_entry(ns, @current_dir, entry_idx)
-            if not dir_entry_is_dir(@entry)
-                return blob_id_zero()
-            current_dir = blob_id_copy(@entry.blob_id)
-
-        last_component = component
-
-    # Find the final component
-    if last_component.len == 0
-        return blob_id_copy(@current_dir)
-
-    let entry_idx: i32 = find_entry_in_dir(ns, @current_dir, last_component)
-    if entry_idx < 0
-        return blob_id_zero()
-
-    var entry: DirEntry = read_dir_entry(ns, @current_dir, entry_idx)
-    blob_id_copy(@entry.blob_id)
+    var name: StrView = strview_empty()
+    while path_iter_next(@iter, @name)
+        if not current_is_dir
+            return blob_id_zero()
+        let idx: i32 = find_entry_in_dir(ns, @current, name)
+        if idx < 0
+            return blob_id_zero()
+        var entry: DirEntry = read_dir_entry(ns, @current, idx)
+        current = blob_id_copy(@entry.blob_id)
+        current_is_dir = dir_entry_is_dir(@entry)
+    *is_dir_out = current_is_dir
+    current
 
 # Check if a path exists
 pub fn namespace_exists(ns: *Namespace, path: StrView) -> bool
     var id: BlobId = namespace_resolve(ns, path)
     not blob_id_is_zero(@id)
 
-# Read file content as Span<u8>
+# Read file content as Span<u8> (empty, null ptr, if it doesn't exist)
 pub fn namespace_read(ns: *Namespace, path: StrView) -> Span<u8>
     var id: BlobId = namespace_resolve(ns, path)
     if blob_id_is_zero(@id)
-        return span_from_ptr<u8>(0 as *u8, 0)
-
-    let data: *u8 = memory_store_get((*ns).store, @id)
-    let size: u64 = memory_store_get_size((*ns).store, @id)
-    span_from_ptr<u8>(data, size as i64)
+        return span_empty<u8>()
+    memory_store_get_span((*ns).store, @id)
 
 # Get file size
 pub fn namespace_file_size(ns: *Namespace, path: StrView) -> u64
@@ -141,172 +364,63 @@ pub fn namespace_file_size(ns: *Namespace, path: StrView) -> u64
         return 0
     memory_store_get_size((*ns).store, @id)
 
-# Write/create a file
+# Write/create a file. Its directory must exist; a directory can't be
+# overwritten (ERR_NOT_A_FILE).
 pub fn namespace_write(ns: *Namespace, path: StrView, data: @Span<u8>) -> ErrorCode
-    if not path_validate(path)
-        return ERR_INVALID_PATH
-
+    let rc: ErrorCode = check_path(path)
+    if rc != ERR_OK
+        return rc
     if path_is_root(path)
         return ERR_NOT_A_FILE
-
-    # Get parent and basename
-    let parent_path: StrView = path_parent(path)
-    let base_name: StrView = path_basename(path)
-
-    if base_name.len == 0
-        return ERR_INVALID_PATH
-
-    # Find parent directory
-    var parent_id: BlobId
-    if parent_path.len == 0
-        parent_id = blob_id_copy(@(*ns).root)
-    else
-        parent_id = namespace_resolve(ns, parent_path)
-        if blob_id_is_zero(@parent_id)
-            return ERR_NOT_FOUND
-
-    # Store the file content
-    var file_id: BlobId = memory_store_put((*ns).store, data.ptr, data.len as u64)
-    if blob_id_is_zero(@file_id)
+    var change: Change = Change { op: OP_WRITE, id: blob_id_zero(), size: data.len as u64 }
+    change.id = memory_store_put((*ns).store, data.ptr, data.len as u64)
+    if blob_id_is_zero(@change.id)
         return ERR_OUT_OF_SPACE
-
-    # Update parent directory
-    update_dir_entry(ns, @parent_id, base_name, @file_id, data.len as u64, false)
+    let result: ErrorCode = commit(ns, path, @change)
+    # The new directory holds its own reference now (or the write failed)
+    release(ns, @change.id)
+    result
 
 # Create a directory
 pub fn namespace_mkdir(ns: *Namespace, path: StrView) -> ErrorCode
-    if not path_validate(path)
-        return ERR_INVALID_PATH
-
+    let rc: ErrorCode = check_path(path)
+    if rc != ERR_OK
+        return rc
     if path_is_root(path)
         return ERR_ALREADY_EXISTS
-
-    if namespace_exists(ns, path)
-        return ERR_ALREADY_EXISTS
-
-    # Get parent and basename
-    let parent_path: StrView = path_parent(path)
-    let base_name: StrView = path_basename(path)
-
-    if base_name.len == 0
-        return ERR_INVALID_PATH
-
-    # Find parent directory
-    var parent_id: BlobId
-    if parent_path.len == 0
-        parent_id = blob_id_copy(@(*ns).root)
-    else
-        parent_id = namespace_resolve(ns, parent_path)
-        if blob_id_is_zero(@parent_id)
-            return ERR_NOT_FOUND
-
-    # Create empty directory blob
-    var empty_dir: [4]u8
-    empty_dir[0] = 0
-    empty_dir[1] = 0
-    empty_dir[2] = 0
-    empty_dir[3] = 0
-
-    var dir_id: BlobId = memory_store_put((*ns).store, @empty_dir[0], 4)
-    if blob_id_is_zero(@dir_id)
+    var change: Change = Change { op: OP_MKDIR, id: put_empty_dir(ns), size: 0 }
+    if blob_id_is_zero(@change.id)
         return ERR_OUT_OF_SPACE
+    let result: ErrorCode = commit(ns, path, @change)
+    release(ns, @change.id)
+    result
 
-    update_dir_entry(ns, @parent_id, base_name, @dir_id, 0, true)
-
-# Helper: update a directory with a new or modified entry
-fn update_dir_entry(ns: *Namespace, dir_id: *BlobId, name: StrView, blob_id: *BlobId, size: u64, is_dir: bool) -> ErrorCode
-    let old_data: *u8 = memory_store_get((*ns).store, dir_id)
-    if old_data == 0 as *u8
-        return ERR_NOT_FOUND
-
-    let count_ptr: *u32 = old_data as *u32
-    let old_count: i32 = *count_ptr as i32
-
-    let existing_idx: i32 = find_entry_in_dir(ns, dir_id, name)
-
-    var new_count: i32
-    if existing_idx >= 0
-        new_count = old_count
-    else
-        new_count = old_count + 1
-
-    if new_count > MAX_DIR_ENTRIES
-        return ERR_OUT_OF_SPACE
-
-    # Allocate new directory blob
-    let new_size: u64 = dir_serialized_size(new_count as u32)
-    let prot: i32 = PROT_READ + PROT_WRITE
-    let flags: i32 = MAP_PRIVATE + MAP_ANONYMOUS
-    let new_data: *u8 = sys_mmap(0, new_size as i64, prot, flags, -1, 0)
-
-    let new_count_ptr: *u32 = new_data as *u32
-    *new_count_ptr = new_count as u32
-
-    # Copy existing entries (except the one we're replacing)
-    var write_idx: i32 = 0
-    var i: i32 = 0
-    while i < old_count
-        if i != existing_idx
-            var entry: DirEntry = read_dir_entry(ns, dir_id, i)
-            dir_entry_serialize(@entry, new_data + 4 + write_idx * 320)
-            write_idx = write_idx + 1
-        i = i + 1
-
-    # Add the new/updated entry
-    var new_entry: DirEntry
-    if is_dir
-        new_entry = dir_entry_dir(name, blob_id)
-    else
-        new_entry = dir_entry_file(name, blob_id, size)
-
-    dir_entry_serialize(@new_entry, new_data + 4 + write_idx * 320)
-
-    # Store new directory blob
-    var new_dir_id: BlobId = memory_store_put((*ns).store, new_data, new_size)
-    sys_munmap(new_data, new_size as i64)
-
-    if blob_id_is_zero(@new_dir_id)
-        return ERR_OUT_OF_SPACE
-
-    # Update root if this was root directory
-    if blob_id_eq(dir_id, @(*ns).root)
-        (*ns).root = blob_id_copy(@new_dir_id)
-
-    ERR_OK
-
-# Delete a file or empty directory
+# Delete a file or an empty directory, freeing the blobs nothing else holds.
+# ERR_NOT_FOUND, ERR_DIRECTORY_NOT_EMPTY, or ERR_PERMISSION_DENIED for "/".
 pub fn namespace_delete(ns: *Namespace, path: StrView) -> ErrorCode
-    if not path_validate(path)
-        return ERR_INVALID_PATH
-
+    let rc: ErrorCode = check_path(path)
+    if rc != ERR_OK
+        return rc
     if path_is_root(path)
         return ERR_PERMISSION_DENIED
+    var change: Change = Change { op: OP_DELETE, id: blob_id_zero(), size: 0 }
+    commit(ns, path, @change)
 
-    # TODO: Implement deletion
-    ERR_NOT_FOUND
-
-# List directory contents
+# List directory contents: copies up to `max_entries` entries, returns the
+# directory's entry count (-1 if `path` isn't a directory).
 pub fn namespace_list(ns: *Namespace, path: StrView, entries: *DirEntry, max_entries: i32) -> i32
-    var dir_id: BlobId
-
-    if path_is_root(path)
-        dir_id = blob_id_copy(@(*ns).root)
-    else
-        dir_id = namespace_resolve(ns, path)
-        if blob_id_is_zero(@dir_id)
-            return -1
-
+    var is_dir: bool = false
+    var dir_id: BlobId = resolve_kind(ns, path, @is_dir)
+    if blob_id_is_zero(@dir_id) or not is_dir
+        return -1
     let count: i32 = read_dir_count(ns, @dir_id)
     if count < 0
         return -1
-
     var copy_count: i32 = count
     if copy_count > max_entries
         copy_count = max_entries
-
     var i: i32 = 0
     while i < copy_count
         *(entries + i) = read_dir_entry(ns, @dir_id, i)
         i = i + 1
-
     count

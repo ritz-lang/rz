@@ -112,84 +112,96 @@ pub fn dir_entry_name_eq(entry: *DirEntry, name: StrView) -> bool
     true
 
 # Serialized directory (list of entries stored as a blob)
-# Format:
+# Format (integers little-endian):
 #   u32: entry count
-#   DirEntry[]: entries
+#   DiskDirEntry[]: entries
+#
+# DiskDirEntry is the on-disk entry. It is all bytes (alignment 1, no
+# padding), so sizeof(DiskDirEntry) is its exact serialized size (320) and
+# the same on every target, and its field order is its byte layout. The
+# in-memory DirEntry has padding, so it is never written out directly.
+pub struct DiskDirEntry
+    name: [256]u8       # NUL-padded: bytes past name_len are zero
+    name_len: u8
+    kind: u8
+    blob_id: [32]u8
+    size: [8]u8
+    created: [8]u8
+    modified: [8]u8
+    mode: [4]u8
+    _reserved: [2]u8
+
+# Bytes before the first entry of a directory blob (its u32 count)
+pub const DIR_HEADER_SIZE: i64 = 4
+
+# Serialized size of one entry
+pub fn dir_entry_disk_size() -> i64
+    sizeof(DiskDirEntry)
 
 # Calculate serialized size of a directory
 pub fn dir_serialized_size(entry_count: u32) -> u64
-    4 + (entry_count as u64 * 320)  # sizeof(DirEntry) ~ 320 bytes
+    (DIR_HEADER_SIZE + entry_count as i64 * sizeof(DiskDirEntry)) as u64
 
-# Serialize a directory entry to bytes
+# Entry `index` of the directory blob at `data`
+pub fn dir_entry_at(data: *u8, index: i32) -> *u8
+    data + DIR_HEADER_SIZE + index as i64 * sizeof(DiskDirEntry)
+
+fn put_le(out: *u8, value: u64, width: i64)
+    var i: i64 = 0
+    while i < width
+        *(out + i) = ((value >> (i * 8) as u64) & 255) as u8
+        i = i + 1
+
+fn get_le(data: *u8, width: i64) -> u64
+    var v: u64 = 0
+    var i: i64 = width - 1
+    while i >= 0
+        v = (v << 8) | *(data + i) as u64
+        i = i - 1
+    v
+
+# Serialize a directory entry to the sizeof(DiskDirEntry) bytes at `out`.
+# Deterministic: equal entries give equal bytes (so equal directories give
+# equal blobs, which content addressing depends on).
 pub fn dir_entry_serialize(entry: *DirEntry, out: *u8)
-    # Name (256 bytes)
+    let d: *DiskDirEntry = out as *DiskDirEntry
+    let len: i32 = (*entry).name_len as i32
     var i: i32 = 0
     while i < 256
-        *(out + i) = (*entry).name[i]
+        if i < len
+            (*d).name[i] = (*entry).name[i]
+        else
+            (*d).name[i] = 0
         i = i + 1
-
-    # name_len (1 byte)
-    *(out + 256) = (*entry).name_len
-
-    # kind (1 byte)
-    *(out + 257) = (*entry).kind
-
-    # blob_id (32 bytes)
+    (*d).name_len = (*entry).name_len
+    (*d).kind = (*entry).kind
     i = 0
     while i < 32
-        *(out + 258 + i) = (*entry).blob_id.hash[i]
+        (*d).blob_id[i] = (*entry).blob_id.hash[i]
         i = i + 1
+    put_le(@(*d).size[0], (*entry).metadata.size, 8)
+    put_le(@(*d).created[0], (*entry).metadata.created, 8)
+    put_le(@(*d).modified[0], (*entry).metadata.modified, 8)
+    put_le(@(*d).mode[0], (*entry).metadata.mode as u64, 4)
+    (*d)._reserved[0] = 0
+    (*d)._reserved[1] = 0
 
-    # metadata (24 bytes)
-    # size: u64 at offset 290
-    let size_ptr: *u64 = (out + 290) as *u64
-    *size_ptr = (*entry).metadata.size
-
-    # created: u64 at offset 298
-    let created_ptr: *u64 = (out + 298) as *u64
-    *created_ptr = (*entry).metadata.created
-
-    # modified: u64 at offset 306
-    let modified_ptr: *u64 = (out + 306) as *u64
-    *modified_ptr = (*entry).metadata.modified
-
-    # mode: u32 at offset 314
-    let mode_ptr: *u32 = (out + 314) as *u32
-    *mode_ptr = (*entry).metadata.mode
-
-# Deserialize a directory entry from bytes
+# Deserialize a directory entry from the bytes at `data`
 pub fn dir_entry_deserialize(data: *u8) -> DirEntry
+    let d: *DiskDirEntry = data as *DiskDirEntry
     var entry: DirEntry
-
-    # Name (256 bytes)
     var i: i32 = 0
     while i < 256
-        entry.name[i] = *(data + i)
+        entry.name[i] = (*d).name[i]
         i = i + 1
-
-    # name_len
-    entry.name_len = *(data + 256)
-
-    # kind
-    entry.kind = *(data + 257)
-
-    # blob_id
+    entry.name_len = (*d).name_len
+    entry.kind = (*d).kind
     i = 0
     while i < 32
-        entry.blob_id.hash[i] = *(data + 258 + i)
+        entry.blob_id.hash[i] = (*d).blob_id[i]
         i = i + 1
-
-    # metadata
-    let size_ptr: *u64 = (data + 290) as *u64
-    entry.metadata.size = *size_ptr
-
-    let created_ptr: *u64 = (data + 298) as *u64
-    entry.metadata.created = *created_ptr
-
-    let modified_ptr: *u64 = (data + 306) as *u64
-    entry.metadata.modified = *modified_ptr
-
-    let mode_ptr: *u32 = (data + 314) as *u32
-    entry.metadata.mode = *mode_ptr
-
+    entry.metadata.size = get_le(@(*d).size[0], 8)
+    entry.metadata.created = get_le(@(*d).created[0], 8)
+    entry.metadata.modified = get_le(@(*d).modified[0], 8)
+    entry.metadata.mode = get_le(@(*d).mode[0], 4) as u32
     entry
