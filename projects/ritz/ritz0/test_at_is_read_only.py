@@ -82,6 +82,9 @@ WRITES = {
     "if_body": "fn f(p: @C, b: i32)\n    if b > 0\n        ^p.x = 3\n",
     "while_body": "fn f(p: @C, b: i32)\n    while b > 0\n        ^p.x = 3\n",
     "match_arm": "fn f(p: @C, b: i32)\n    match b\n        0 => ^p.x = 3\n        _ => pass\n",
+    # A cast to `@C` is as read-only as an `@C` param (#4058).
+    "cast_to_shared": "fn f(p: *C)\n    (^p as @C).x = 3\n",
+    "cast_to_shared_element": "fn f(p: *W)\n    (^p as @W).a[1] = 3\n",
     "generic_instance": "fn g<T>(p: @T, v: T)\n    ^*p = v\n\nfn f(p: @i32)\n    g<i32>(p, 3)\n",
 }
 
@@ -110,6 +113,9 @@ ALLOWED = {
     "deref_pointer_behind_a_shared_reference": ("fn g(p: @*i32)\n    **p = 3\n",
                                                 "var q: *i32 = @&c.x\n    g(@q)"),
     "cast_to_a_pointer": ("fn g(p: @C)\n    (p as *C).x = 3\n", "g(@c)"),
+    "cast_to_a_mutable_reference": ("fn g(p: *C)\n    (p as @&C).x = 3\n", "g(@&c)"),
+    "cast_to_a_mutable_reference_element": ("fn g(p: *W)\n    (p as @&W).a[1] = 3\n",
+                                            "var w = W { c: c, a: [1, 2] }\n    g(@&w)\n    c.x = w.a[1]"),
 }
 
 # ritz1 couldn't lower `(p as *C).x = 3` (#2373); it does now.
