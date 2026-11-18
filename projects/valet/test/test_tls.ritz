@@ -615,3 +615,134 @@ fn test_tls_server_refuses_x25519_share_one() -> i32
         key[i] = 0
     key[0] = 1
     return run_x25519_share_2580(@key[0])
+
+# ============================================================================
+# Key schedule derivations fail the handshake (#3612)
+# ============================================================================
+# tls_server_derive_handshake_keys / _application_keys take the traffic
+# key/iv lengths as a seam (production passes 16/12, AES-128-GCM); an
+# out-of-range length makes cryptosec refuse with Err(InvalidLength), which
+# must put the server in ERROR with no keys written, never carry on.
+
+[[test_helper]]
+fn kdf_server_3612(server: *TlsServer, cfg: *TlsServerConfig, th: *u8)
+    tls_server_config_init(cfg)
+    tls_server_init(server, cfg)
+    for i in 0..32
+        server.shared_secret[i] = (i + 1) as u8
+        th[i] = (0x80 + i) as u8
+    # Sentinel: a refused derivation must leave the write keys alone.
+    for i in 0..32
+        server.key_schedule.client_write_key[i] = 0xAA
+        server.key_schedule.server_write_key[i] = 0xAA
+    for i in 0..12
+        server.key_schedule.client_write_iv[i] = 0xAA
+        server.key_schedule.server_write_iv[i] = 0xAA
+
+[[test_helper]]
+fn kdf_keys_untouched_3612(server: *TlsServer) -> bool
+    for i in 0..32
+        if server.key_schedule.client_write_key[i] != 0xAA || server.key_schedule.server_write_key[i] != 0xAA
+            return false
+    for i in 0..12
+        if server.key_schedule.client_write_iv[i] != 0xAA || server.key_schedule.server_write_iv[i] != 0xAA
+            return false
+    return true
+
+[[test_helper]]
+fn kdf_refused_3612(server: *TlsServer, rc: i32) -> i32
+    if rc != TLS_RESULT_ERROR
+        return 1
+    if server.state != TLS_SERVER_STATE_ERROR
+        return 2
+    if server.last_error != TLS_ERR_KEY_DERIVATION
+        return 3
+    if not kdf_keys_untouched_3612(server)
+        return 4
+    return 0
+
+[[test]]
+fn test_tls_server_handshake_keys_ok_3612() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    var th: [32]u8
+    kdf_server_3612(@server, @cfg, @th[0])
+    let state0: i32 = server.state
+
+    # Reference: the same derivation straight from cryptosec.
+    var ks: TLS13KeySchedule
+    mem_copy(@ks as *u8, @server.key_schedule as *u8, sizeof(TLS13KeySchedule))
+    assert tls13_key_schedule_derive_handshake(@ks, @server.shared_secret[0], 32, @th[0]).is_ok()
+    assert tls13_key_schedule_derive_handshake_keys(@ks, 16, 12).is_ok()
+
+    let rc: i32 = tls_server_derive_handshake_keys(@server, @th[0], 16, 12)
+    let same: i32 = mem_eq(@ks as *u8, @server.key_schedule as *u8, sizeof(TLS13KeySchedule))
+    let state: i32 = server.state
+    tls_server_free(@server)
+    assert rc == 0
+    assert state == state0
+    assert same == 1
+    return 0
+
+[[test]]
+fn test_tls_server_handshake_key_len_refused_3612() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    var th: [32]u8
+    kdf_server_3612(@server, @cfg, @th[0])
+    let r: i32 = kdf_refused_3612(@server, tls_server_derive_handshake_keys(@server, @th[0], 33, 12))
+    tls_server_free(@server)
+    return r
+
+[[test]]
+fn test_tls_server_handshake_iv_len_refused_3612() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    var th: [32]u8
+    kdf_server_3612(@server, @cfg, @th[0])
+    let r: i32 = kdf_refused_3612(@server, tls_server_derive_handshake_keys(@server, @th[0], 16, -1))
+    tls_server_free(@server)
+    return r
+
+[[test]]
+fn test_tls_server_application_keys_ok_3612() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    var th: [32]u8
+    kdf_server_3612(@server, @cfg, @th[0])
+    assert tls_server_derive_handshake_keys(@server, @th[0], 16, 12) == 0
+    let state0: i32 = server.state
+
+    var ks: TLS13KeySchedule
+    mem_copy(@ks as *u8, @server.key_schedule as *u8, sizeof(TLS13KeySchedule))
+    assert tls13_key_schedule_derive_application(@ks, @th[0]).is_ok()
+    assert tls13_key_schedule_derive_application_keys(@ks, 16, 12).is_ok()
+
+    let rc: i32 = tls_server_derive_application_keys(@server, @th[0], 16, 12)
+    let same: i32 = mem_eq(@ks as *u8, @server.key_schedule as *u8, sizeof(TLS13KeySchedule))
+    let state: i32 = server.state
+    tls_server_free(@server)
+    assert rc == 0
+    assert state == state0
+    assert same == 1
+    return 0
+
+[[test]]
+fn test_tls_server_application_key_len_refused_3612() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    var th: [32]u8
+    kdf_server_3612(@server, @cfg, @th[0])
+    let r: i32 = kdf_refused_3612(@server, tls_server_derive_application_keys(@server, @th[0], 33, 12))
+    tls_server_free(@server)
+    return r
+
+[[test]]
+fn test_tls_server_application_iv_len_refused_3612() -> i32
+    var cfg: TlsServerConfig
+    var server: TlsServer
+    var th: [32]u8
+    kdf_server_3612(@server, @cfg, @th[0])
+    let r: i32 = kdf_refused_3612(@server, tls_server_derive_application_keys(@server, @th[0], 16, 13))
+    tls_server_free(@server)
+    return r

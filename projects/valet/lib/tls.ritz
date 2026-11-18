@@ -60,6 +60,8 @@ pub const TLS_ERR_NO_COMMON_CIPHER: i32 = -11
 pub const TLS_ERR_NO_CERTIFICATE: i32 = -12
 pub const TLS_ERR_NO_PRIVATE_KEY: i32 = -13
 pub const TLS_ERR_RNG_FAILED: i32 = -14
+# A TLS 1.3 key schedule derivation refused (Err) (#3612)
+pub const TLS_ERR_KEY_DERIVATION: i32 = -15
 
 # tls_server_read results besides a byte count and -1 (AGAST #2197), as the
 # cryptosec client's TLS_READ_CLOSED (#2191):
@@ -889,6 +891,45 @@ pub fn serialize_finished(server: *TlsServer, out: *u8, cap: i64) -> i64
     return 36
 
 # ============================================================================
+# Key Schedule Derivations (#3612)
+# ============================================================================
+
+# AES-128-GCM traffic key / IV lengths (the only suite valet offers, #1862)
+const TLS_AES128_GCM_KEY_LEN: i32 = 16
+const TLS_AES128_GCM_IV_LEN: i32 = 12
+
+# A refused derivation fails the handshake; never carry on with keys the key
+# schedule did not write (#3612).
+fn tls_server_kdf_refused(server: *TlsServer) -> i32
+    server.last_error = TLS_ERR_KEY_DERIVATION
+    server.state = TLS_SERVER_STATE_ERROR
+    return TLS_RESULT_ERROR
+
+# Handshake secrets from shared_secret + transcript_hash (ClientHello..
+# ServerHello), then the handshake traffic keys. key_len/iv_len are a seam
+# for the Err path; production passes TLS_AES128_GCM_KEY/IV_LEN.
+# Returns 0, or TLS_RESULT_ERROR with the server in ERROR.
+pub fn tls_server_derive_handshake_keys(server: *TlsServer, transcript_hash: *u8, key_len: i32, iv_len: i32) -> i32
+    match tls13_key_schedule_derive_handshake(@server.key_schedule, @server.shared_secret[0], 32, transcript_hash)
+        Ok(_) => pass
+        Err(_) => return tls_server_kdf_refused(server)
+    match tls13_key_schedule_derive_handshake_keys(@server.key_schedule, key_len, iv_len)
+        Ok(_) => pass
+        Err(_) => return tls_server_kdf_refused(server)
+    return 0
+
+# Application secrets from transcript_hash (ClientHello..server Finished),
+# then the application traffic keys. Same contract as above.
+pub fn tls_server_derive_application_keys(server: *TlsServer, transcript_hash: *u8, key_len: i32, iv_len: i32) -> i32
+    match tls13_key_schedule_derive_application(@server.key_schedule, transcript_hash)
+        Ok(_) => pass
+        Err(_) => return tls_server_kdf_refused(server)
+    match tls13_key_schedule_derive_application_keys(@server.key_schedule, key_len, iv_len)
+        Ok(_) => pass
+        Err(_) => return tls_server_kdf_refused(server)
+    return 0
+
+# ============================================================================
 # Main Processing Function
 # ============================================================================
 
@@ -1104,10 +1145,9 @@ pub fn build_server_flight(server: *TlsServer, out: *u8, out_cap: i64, out_len: 
     prints("[BUILD_SF] deriving keys\n")
     var th: [32]u8
     transcript_hash(@server.transcript, @th[0])
-    prints("[BUILD_SF] calling tls13_key_schedule_derive_handshake\n")
-    tls13_key_schedule_derive_handshake(@server.key_schedule, @server.shared_secret[0], 32, @th[0])
-    prints("[BUILD_SF] calling tls13_key_schedule_derive_handshake_keys\n")
-    tls13_key_schedule_derive_handshake_keys(@server.key_schedule, 16, 12)  # AES-128-GCM
+    prints("[BUILD_SF] calling tls_server_derive_handshake_keys\n")
+    if tls_server_derive_handshake_keys(server, @th[0], TLS_AES128_GCM_KEY_LEN, TLS_AES128_GCM_IV_LEN) != 0
+        return TLS_RESULT_ERROR
 
     # Initialize record states
     prints("[BUILD_SF] init record states\n")
@@ -1316,8 +1356,8 @@ pub fn process_client_finished(server: *TlsServer, out: *u8, out_cap: i64, out_l
     # the server Finished, which is expected_transcript, not the client
     # Finished above.
     prints("[PROC_CF] deriving application keys\n")
-    tls13_key_schedule_derive_application(@server.key_schedule, @expected_transcript[0])
-    tls13_key_schedule_derive_application_keys(@server.key_schedule, 16, 12)
+    if tls_server_derive_application_keys(server, @expected_transcript[0], TLS_AES128_GCM_KEY_LEN, TLS_AES128_GCM_IV_LEN) != 0
+        return TLS_RESULT_ERROR
 
     # Reset record states for application data
     tls_record_state_set_keys(@server.read_state, @server.key_schedule.client_write_key[0], @server.key_schedule.client_write_iv[0], @server.key_schedule.server_write_key[0], @server.key_schedule.server_write_iv[0], 16)
