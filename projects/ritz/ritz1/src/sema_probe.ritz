@@ -22,7 +22,10 @@
 #         `bk-gap`, printed as `sema-probe: bk-gap at ...`: a bool report
 #         there would read differently, or not at all, than the emitter's
 #         did.  ritz0/test_ritz1_sema_type.py holds their count to a ceiling.
-#   A struct literal is lenient: get_expr_type calls it an i64.
+#   A struct literal is lenient: get_expr_type calls it an i64.  So is a
+#   struct or pointer Sema types on `*p`, `a[i]` or `x.m()` (a receiver's
+#   shapes, AGAST #3810), where get_expr_type falls to its i64 default; the
+#   bool rule, which bool_kind answers from that default, is skipped there.
 # A broken rule prints `sema-probe: mismatch ...` on stderr.  After emission
 # main prints `sema-probe: <c> compared, <m> mismatched, <l> lenient, <u>
 # unknown, <g> bool-gap`: <g> of the <u> are expressions bool_kind types and
@@ -129,6 +132,15 @@ fn sema_probe_local_call(e: *Expr) -> bool
         return false
     hashmap_i64_contains(@g_sema_probe_local_calls, e as i64)
 
+# True for `*p`, `a[i]` or `x.m()` that Sema types a struct or a pointer:
+# get_expr_type's i64 there is its default, not a type (AGAST #3810).
+fn sema_probe_aggregate_default(e: *Expr, k: i32) -> bool
+    if k != TYPE_STRUCT and k != TYPE_PTR and k != TYPE_REF and k != TYPE_MUT_REF
+        return false
+    if e.kind == EXPR_UNARY
+        return e.op == OP_DEREF
+    e.kind == EXPR_INDEX or e.kind == EXPR_METHOD
+
 # emit_expr, on entry: compare the record for `e` with the emitter's view.
 pub fn sema_probe_expr(s: *EmitterState, e: *Expr)
     let t: *SemaTy = hashmap_i64_get(@g_sema_probe_map, e as i64) as *SemaTy
@@ -156,8 +168,11 @@ pub fn sema_probe_expr(s: *EmitterState, e: *Expr)
             let int_default: i32 = (sema_is_int_kind(t.kind) == 1 and not hashmap_i64_contains(@g_sema_probe_local_names, e as i64)) as i32
             let ref_field: i32 = (e.kind == EXPR_MEMBER and ek == TYPE_PTR and (t.kind == TYPE_REF or t.kind == TYPE_MUT_REF)) as i32
             let struct_lit: i32 = (e.kind == EXPR_STRUCT_LIT and ek == TYPE_I64) as i32
-            if ref_field == 1 or struct_lit == 1 or (ek == TYPE_I64 and (int_default == 1 or sema_probe_local_call(e)))
+            let aggregate: i32 = (ek == TYPE_I64 and sema_probe_aggregate_default(e, t.kind)) as i32
+            if ref_field == 1 or struct_lit == 1 or aggregate == 1 or (ek == TYPE_I64 and (int_default == 1 or sema_probe_local_call(e)))
                 g_sema_probe_lenient = g_sema_probe_lenient + 1
+                if aggregate == 1
+                    return   # bool_kind reads the same default (an int)
             else
                 sema_probe_mismatch(e, c"type", t.kind, ek)
                 return

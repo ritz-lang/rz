@@ -12,10 +12,11 @@ other check reads it, each call it makes carries its annotation
 (Expr.deref_step: the method and the place it lends, which ref_check reads),
 and the emitter only lowers it.  deref_impls_check runs first in sema_check_module.
 
-Sema leaves some bindings untyped (AGAST #3501's scope): a `for` variable, a
+Sema left some bindings untyped (AGAST #3501's scope): a `for` variable, a
 match-arm or tuple binding, an inferred `let`, a `:&` param.  The emitter typed
-them, so deref_field notes what `.` on each sees (SemaVar.recv), as bool_check
-notes its kinds.
+them, so deref_field noted what `.` on each saw (SemaVar.recv).  AGAST #3810
+folded those shapes into sema_expr_ty and has sema_walk bind each typed;
+deref_field reads sema_expr_ty alone.
 
 The rule's own words are test_ritz1_box_field.py's, on all three compilers.
 The commit compared every file of ritz0/test, ritzlib, examples and ritz1/src,
@@ -110,37 +111,37 @@ _MAIN = ("pub fn main() -> i32\n    var h: H\n    h.k = 9\n    h.f = dbl\n"
 # name -> (the fns before main, main's rest, what it returns).  Each `.` on the
 # receiver reaches H's `k` (or `get`) through Box's Deref.
 REACH = {
-    # A `for` variable over an array: df_note_for.
+    # A `for` variable over an array: sema_bind_for over sema_elem_ty.
     "for_variable": ("", ("    var bs: [2]Box<H>\n    bs[0] = b\n    bs[1] = b\n    var t: i64 = 0\n"
                          "    for x in bs\n        t = t + x.k\n    t as i32\n"), 18),
     # A fn field called on a `for` variable (R41's rewrite, same typing).
     "fn_field_on_a_for_variable": ("", ("    var hs: [2]H\n    hs[0] = h\n    hs[1] = h\n    var t: i64 = 0\n"
                                        "    for y in hs\n        t = t + y.f(1)\n    t as i32\n"), 4),
     # A match arm's payload binding, the scrutinee an inferred `let` of `E.V(..)`:
-    # df_note_arm, df_note_decl and df_ty's enum constructor.
+    # sema_arm_payload_ty, and sema_expr_ty's `E.V(..)` for the `let`.
     "match_payload": ("", ("    let o = Opt.Some(b)\n    let r: i64 = match o\n"
                           "        Opt.Some(x) => x.k + x.get()\n        Opt.Non => 1\n    r as i32\n"), 18),
     # A payload binding read as an `if` value's arm, inside a match statement.
     "match_statement_payload": ("", ("    let o = Opt.Some(b)\n    var r: i64 = 0\n    match o\n"
                                     "        Opt.Some(x) =>\n            r = if x.k > 1\n                x.k\n"
                                     "            else\n                0\n        Opt.Non => r = 1\n    r as i32\n"), 9),
-    # An `Option<Box<H>>`'s `Some(x)`: a tagged payload (df_tagged_payload).
+    # An `Option<Box<H>>`'s `Some(x)`: a tagged payload (sema_tagged_payload).
     "option_payload": ("fn mo(b: Box<H>) -> Option<Box<H>>\n    Some(b)\n\n",
                        ("    let o = mo(b)\n    let r: i64 = match o\n        Some(x) => x.k\n"
                        "        None => 1\n    r as i32\n"), 9),
-    # A tuple binding: df_note_tuple.
+    # A tuple binding: sema_bind_tuple.
     "tuple_binding": ("", "    let (c, n) = two(b)\n    (c.k as i32) + n\n", 10),
-    # An inferred `let` of an element: df_note_decl over df_elem_ty.
+    # An inferred `let` of an element: sema_expr_ty's `a[i]` (sema_elem_ty).
     "inferred_element": ("", ("    var bs: [2]Box<H>\n    bs[0] = b\n    let c = bs[0]\n"
                              "    c.k as i32\n"), 9),
     # An inferred `let` of an element of a `@Vec<Box<H>>`: the Vec's element,
-    # not the Vec (df_elem_ty through a reference).
+    # not the Vec (sema_elem_ty through a reference).
     "inferred_vec_element_through_reference": (
         ("struct Vec<T>\n    data: *T\n    len: i64\n    cap: i64\n\n"
         "fn g(v: @Vec<Box<H>>) -> i64\n    let c = v[0]\n    c.k\n\n"),
         ("    var arr: [1]Box<H>\n    arr[0] = b\n    var v: Vec<Box<H>>\n    v.data = @arr[0]\n"
         "    v.len = 1\n    v.cap = 1\n    g(@v) as i32\n"), 9),
-    # `x:& Box<H>` reads as a Box (df_param_of): `x.k += 1` steps through deref_mut.
+    # `x:& Box<H>` reads as a Box (sema_bind_param): `x.k += 1` steps through deref_mut.
     "borrow_param": ("fn f(x:& Box<H>) -> i64\n    x.k += 1\n    x.k + x.get()\n\n",
                      "    f(b) as i32\n", 20),
 }
@@ -165,3 +166,17 @@ def test_the_emitter_rewrites_nothing():
     core = (SRC / "emitter_core.ritz").read_text()
     assert not re.search(r"^import deref_field\b", core, re.MULTILINE), \
         "emitter_core does not import deref_field (#1816)"
+
+
+@pytest.mark.unit
+def test_deref_field_types_its_receivers_with_sema_expr_ty():
+    # AGAST #3810: `.`'s receiver is typed by sema_expr_ty, and sema_walk
+    # binds the locals it used to leave untyped; deref_field keeps no typer
+    # (df_ty) or notes (SemaVar.recv, df_note_*) of its own.
+    df = (SRC / "deref_field.ritz").read_text()
+    for name in ("fn df_ty(", "fn df_elem_ty(", "df_note_", "v.recv"):
+        assert name not in df, f"deref_field.ritz still has {name}"
+    sema = (SRC / "sema.ritz").read_text()
+    assert not re.search(r"^\s+recv: \*SemaTy", sema, re.MULTILINE), "SemaVar.recv is gone"
+    walk = (SRC / "sema_walk.ritz").read_text()
+    assert "df_note_" not in walk, "sema_walk binds the types itself"

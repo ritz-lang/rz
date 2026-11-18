@@ -10,10 +10,12 @@
 # not zero the fields one statement kind leaves unset, so only the fields
 # each kind sets are read.
 #
-# It binds each local with its declared type (AGAST #3501): a param's, a
-# `let` / `var`'s annotation or else its initialiser's sema_expr_ty.  A `for`
-# variable, a tuple binding, a match-arm binding and a `:&` param are bound
-# TYPE_UNKNOWN for now.  It visits every sub-expression of a statement, so
+# It binds each local with its declared type (AGAST #3501): a param's (a `:&
+# S` param's struct S), a `let` / `var`'s annotation or else its initialiser's
+# sema_expr_ty, a `for` variable an element of what it iterates, a `V(x)` arm
+# binding V's payload and a `let (a, b)` binding its field (AGAST #3810).  A
+# range's `for` variable, a catch-all arm binding and a scalar `:&` param are
+# bound TYPE_UNKNOWN.  It visits every sub-expression of a statement, so
 # RITZ1_SEMA_PROBE (sema_probe.ritz) can pin sema_expr_ty against the
 # emitter's typing on each.
 
@@ -74,9 +76,10 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
     while arm != null
         let mark: i32 = sm.scope_top
         if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
-            sema_bind(sm, arm.pattern_inner_name, arm.pattern_inner_name_len)
+            var pt: SemaTy
+            sema_arm_payload_ty(sm, arm, scrut, @pt)   # AGAST #3810
+            sema_bind_ty(sm, arm.pattern_inner_name, arm.pattern_inner_name_len, @pt, 0)
             bool_note_arm(sm, arm, scrut)
-            df_note_arm(sm, arm, scrut)   # AGAST #3509
         else if arm.pattern_kind == PAT_IDENT
             sema_bind(sm, arm.pattern_name, arm.pattern_name_len)
             bool_note_arm(sm, arm, scrut)
@@ -184,12 +187,51 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
     sema_bind_ty(sm, st.var_name, st.var_name_len, @t, st.var_is_let)
     if st.var_type == TYPE_ARRAY
         let v: *SemaVar = @sm.scope[sm.scope_top - 1]
-        v.elem = st.var_array_elem_type   # deref_field's receivers (AGAST #3509)
+        v.elem = st.var_array_elem_type   # sema_elem_ty (AGAST #3509 / #3810)
+
+# `for x in it`: x is an element of `it` (or of what `@it` / `@&it` points
+# at), read outside the loop's binding; a range's x is left unknown.
+fn sema_bind_for(sm: *Sema, st: *Stmt)
+    var t: SemaTy
+    sema_ty_unknown(@t)
+    if st.for_end == null
+        var it: *Expr = st.for_start
+        if it != null and it.kind == EXPR_UNARY and (it.op == OP_ADDR or it.op == OP_ADDR_MUT)
+            it = it.operand
+        sema_elem_ty(sm, it, @t)
+    sema_bind_ty(sm, st.for_var, st.for_var_len, @t, 0)
+
+# `let (a, b, ..) = init`: each binding is its field of init's tuple struct,
+# typed before any is bound.
+fn sema_bind_tuple(sm: *Sema, st: *Stmt)
+    var tup: SemaTy
+    sema_expr_ty(sm, st.var_init, @tup)
+    var t: SemaTy
+    sema_tuple_field_ty(sm, @tup, 0, @t)
+    sema_bind_ty(sm, st.var_name, st.var_name_len, @t, 0)
+    sema_tuple_field_ty(sm, @tup, 1, @t)
+    sema_bind_ty(sm, st.assign_target, st.assign_target_len, @t, 0)
+    bool_note_tuple(sm, st)
+    var i: i32 = 2
+    var tn: *TupleName = st.tuple_more   # AGAST #109
+    while tn != null
+        sema_tuple_field_ty(sm, @tup, i, @t)
+        sema_bind_ty(sm, tn.name, tn.len, @t, 0)
+        tn = tn.next
+        i += 1
 
 fn sema_bind_param(sm: *Sema, p: *Param)
     var t: SemaTy
-    if p.is_borrow == 1
-        # `x:& T` reads its T, not the reference it holds: not typed yet.
+    if p.is_borrow == 1 and p.param_pointee_type == TYPE_STRUCT
+        # `x:& S` reads as its S for `.` (§13.4), as ref_check's ref_of_local
+        # has it.  A scalar `h:& T` is still read and written as `*h`, which
+        # bool_check judges off the param itself: left unknown.
+        t.kind = TYPE_STRUCT
+        t.name = p.param_type_name
+        t.name_len = p.param_type_name_len
+        t.pointee = TYPE_VOID
+        t.fn_sig = null
+    else if p.is_borrow == 1
         sema_ty_unknown(@t)
     else
         t.kind = p.param_type
@@ -243,26 +285,17 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             let_note_decl(sm, st)   # AGAST #3504
             eai_note_decl(sm, st)   # AGAST #3511
             narrow_sema_decl(sm, st)
-            df_note_decl(sm, st)   # AGAST #3509
             bool_note_decl(sm, st)
         else if st.kind == STMT_TUPLE_DECL
             sema_walk_expr(sm, st.var_init)
-            sema_bind(sm, st.var_name, st.var_name_len)
-            sema_bind(sm, st.assign_target, st.assign_target_len)
-            bool_note_tuple(sm, st)
-            var tn: *TupleName = st.tuple_more   # AGAST #109
-            while tn != null
-                sema_bind(sm, tn.name, tn.len)
-                tn = tn.next
-            df_note_tuple(sm, st)   # AGAST #3509
+            sema_bind_tuple(sm, st)
         else if st.kind == STMT_FOR
             sema_walk_expr(sm, st.for_start)
             sema_walk_expr(sm, st.for_end)
             let for_mark: i32 = sm.scope_top
-            sema_bind(sm, st.for_var, st.for_var_len)
+            sema_bind_for(sm, st)
             bool_note_for(sm, st)
             let_note_for(sm, st)   # AGAST #2389: an element is a `let`
-            df_note_for(sm, st)   # AGAST #3509
             sema_walk_stmts(sm, st.for_body, 0)
             sm.scope_top = for_mark
         else if st.kind == STMT_IF

@@ -9,8 +9,16 @@
 # then globals, then consts), calls (through a local's fn signature, else
 # sema_call_fn), comparisons and logical operators, `not` / `-` / `@`, casts,
 # member access on a struct or a pointer to one, arithmetic whose operands
-# agree, and a struct literal (for bool_check, #3502).  Anything else is
+# agree, and a struct literal (for bool_check, #3502).  And a receiver's
+# shapes, which deref_field typed on its own until AGAST #3810: `*p` of a
+# pointer to a struct, a struct element `a[i]` (sema_elem_ty), a method call's
+# result and `E.V(..)`.  (A deref step's `S_deref(..)` is a call like any
+# other, found by its symbol.)  Anything else is
 # TYPE_UNKNOWN until a check move needs it.
+#
+# sema_walk binds what it can type with these: sema_elem_ty a `for x in a`
+# variable, sema_arm_payload_ty a `V(x)` arm binding, sema_tuple_field_ty a
+# `let (a, b)` binding.
 #
 # A bool is TYPE_BOOL here, where the emitter's LocalVar and get_expr_type say
 # TYPE_I64 (its bool slot, #1646).  sema_probe.ritz pins the answers against
@@ -92,12 +100,16 @@ fn sema_call_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
         return sema_ty_none(t)
     sema_fn_ret_ty(fd, t)
 
-# The struct a receiver of kind `r` is, or points at.
-fn sema_recv_struct(sm: *Sema, r: *SemaTy) -> *StructDef
+fn sema_is_ptr_kind(k: i32) -> i32
+    (k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF) as i32
+
+# The struct a receiver of kind `r` is, or points at.  A fn's `-> @T` keeps no
+# pointee kind: its name says it is a struct.
+pub fn sema_recv_struct(sm: *Sema, r: *SemaTy) -> *StructDef
     if r.kind == TYPE_STRUCT
         return sema_find_struct(sm, r.name, r.name_len)
-    if r.kind == TYPE_PTR or r.kind == TYPE_REF or r.kind == TYPE_MUT_REF
-        if r.pointee == TYPE_STRUCT
+    if sema_is_ptr_kind(r.kind) == 1
+        if r.pointee == TYPE_STRUCT or r.pointee == TYPE_VOID
             return sema_find_struct(sm, r.name, r.name_len)
     null
 
@@ -197,7 +209,174 @@ fn sema_unary_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
         if ok == TYPE_UNKNOWN or ok == TYPE_PTR or ok == TYPE_PTR_PTR or ok == TYPE_REF or ok == TYPE_MUT_REF or ok == TYPE_ARRAY
             return sema_ty_set(t, kind, null, 0, TYPE_VOID, null)
         return sema_ty_set(t, kind, o.name, o.name_len, ok, null)
+    if e.op == OP_DEREF
+        # `*p` of a pointer or reference to a struct: the struct.
+        var o: SemaTy
+        sema_expr_ty(sm, e.operand, @o)
+        if sema_is_ptr_kind(o.kind) == 1 and sema_recv_struct(sm, @o) != null
+            return sema_ty_set(t, TYPE_STRUCT, o.name, o.name_len, TYPE_VOID, null)
     sema_ty_none(t)
+
+# --- A receiver's shapes (AGAST #3810) -------------------------------------
+
+# A struct element of `b` (`b[i]`, or what `for x in b` binds): of a `[N]S`
+# local, global or field, of a `*S`, or of a Vec$S (through a `@Vec<S>` /
+# `*Vec<S>` too).  Unknown for any other element.
+pub fn sema_elem_ty(sm: *Sema, b: *Expr, t: *SemaTy) -> i32
+    if b == null
+        return sema_ty_none(t)
+    if b.kind == EXPR_IDENT
+        let v: *SemaVar = sema_find_local(sm, b.ident_ptr, b.ident_len)
+        if v != null and v.kind == TYPE_ARRAY
+            if v.elem == TYPE_STRUCT and v.type_name_len > 0
+                return sema_ty_set(t, TYPE_STRUCT, v.type_name, v.type_name_len, TYPE_VOID, null)
+            if sema_is_ptr_kind(v.elem) == 1 and v.type_name_len > 0
+                return sema_ty_set(t, v.elem, v.type_name, v.type_name_len, TYPE_STRUCT, null)
+            return sema_ty_none(t)
+        if v == null
+            var g: *GlobalVarDef = sm.module.globals
+            while g != null
+                if name_eq(g.name, g.name_len, b.ident_ptr, b.ident_len) == 1
+                    if g.var_type == TYPE_ARRAY and g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
+                        return sema_ty_set(t, TYPE_STRUCT, g.array_elem_type_name, g.array_elem_type_name_len, TYPE_VOID, null)
+                    g = null
+                else
+                    g = g.next
+    if b.kind == EXPR_MEMBER and b.left != null
+        var r: SemaTy
+        sema_expr_ty(sm, b.left, @r)
+        let st: *StructDef = sema_recv_struct(sm, @r)
+        if st != null
+            let fi: i32 = find_field_index(st, b.ident_ptr, b.ident_len)
+            if fi >= 0
+                let f: *StructField = get_field_type(st, fi)
+                if f.field_type == TYPE_ARRAY
+                    if f.array_elem_type == TYPE_STRUCT and f.array_elem_type_name_len > 0
+                        return sema_ty_set(t, TYPE_STRUCT, f.array_elem_type_name, f.array_elem_type_name_len, TYPE_VOID, null)
+                    return sema_ty_none(t)
+    var bt: SemaTy
+    sema_expr_ty(sm, b, @bt)
+    # A Vec's element is what its `data: *T` points at.
+    let held: i32 = (bt.kind == TYPE_STRUCT or (sema_is_ptr_kind(bt.kind) == 1 and bt.pointee == TYPE_STRUCT)) as i32
+    if held == 1 and bt.name_len > 4 and name_eq(bt.name, 4, c"Vec$", 4) == 1
+        let vst: *StructDef = sema_find_struct(sm, bt.name, bt.name_len)
+        if vst != null
+            let di: i32 = find_field_index(vst, c"data", 4)
+            if di >= 0
+                let df: *StructField = get_field_type(vst, di)
+                if df.field_type == TYPE_PTR and df.field_type_name_len > 0
+                    return sema_ty_set(t, TYPE_STRUCT, df.field_type_name, df.field_type_name_len, TYPE_VOID, null)
+        return sema_ty_none(t)
+    if sema_is_ptr_kind(bt.kind) == 1 and bt.pointee == TYPE_STRUCT and bt.name_len > 0
+        return sema_ty_set(t, TYPE_STRUCT, bt.name, bt.name_len, TYPE_VOID, null)
+    sema_ty_none(t)
+
+fn sema_index_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
+    if e.right != null and e.right.kind == EXPR_RANGE
+        return sema_ty_none(t)
+    sema_elem_ty(sm, e.left, t)
+
+# `x.m(..)`: the method's result, on a struct or a pointer to one; `E.V(..)`
+# builds the enum E.
+fn sema_method_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
+    let el: *Expr = e.left
+    if el == null
+        return sema_ty_none(t)
+    if el.kind == EXPR_IDENT and sema_find_local(sm, el.ident_ptr, el.ident_len) == null and user_enum_index(el.ident_ptr, el.ident_len) >= 0
+        return sema_ty_set(t, TYPE_STRUCT, el.ident_ptr, el.ident_len, TYPE_VOID, null)
+    var r: SemaTy
+    sema_expr_ty(sm, el, @r)
+    let st: *StructDef = sema_recv_struct(sm, @r)
+    if st == null
+        return sema_ty_none(t)
+    let fd: *FnDef = sema_method_fn(sm, st.name, st.name_len, e.ident_ptr, e.ident_len)
+    if fd == null
+        return sema_ty_none(t)
+    sema_fn_ret_ty(fd, t)
+
+fn sema_struct_ty(st: *StructDef, t: *SemaTy) -> i32
+    if st == null
+        return sema_ty_none(t)
+    sema_ty_set(t, TYPE_STRUCT, st.name, st.name_len, TYPE_VOID, null)
+
+# The struct named `name`, unless it is a generic's template: a monomorphised
+# name (`Span$u8`) never names one, so `Result$Span$u8$i32` splits after `u8`.
+fn sema_find_concrete(sm: *Sema, name: *u8, len: i32) -> *StructDef
+    let st: *StructDef = sema_find_struct(sm, name, len)
+    if st != null and st.type_params != null
+        return null
+    st
+
+# The struct an `Option$S` carries in Some, or a `Result$S$E` in Ok / Err (its
+# shortest `$`-split naming structs on both sides is taken); null otherwise.
+fn sema_tagged_payload(sm: *Sema, name: *u8, len: i32, is_err: i32) -> *StructDef
+    var d: i32 = 0
+    while d < len and *(name + d) != '$'
+        d += 1
+    if d >= len
+        return null
+    let sfx: *u8 = name + d + 1
+    let sfx_len: i32 = len - d - 1
+    if name_eq(name, d, c"Option", 6) == 1
+        if is_err == 1
+            return null
+        return sema_find_concrete(sm, sfx, sfx_len)
+    if name_eq(name, d, c"Result", 6) == 0
+        return null
+    var cut: i32 = 0
+    while cut < sfx_len
+        if *(sfx + cut) == '$'
+            let ok: *StructDef = sema_find_concrete(sm, sfx, cut)
+            if ok != null or cut + 1 < sfx_len
+                if is_err == 0 and ok != null
+                    return ok
+                if is_err == 1
+                    let er: *StructDef = sema_find_concrete(sm, sfx + cut + 1, sfx_len - cut - 1)
+                    if er != null
+                        return er
+        cut += 1
+    null
+
+# A match arm's binding `V(x)` on `scrut`: V's payload.  Unknown for a
+# catch-all name, as the emitter left it: a `match` on a struct value is
+# refused (by ritz0 too), and typing one only lets `.` reach unlowerable IR.
+pub fn sema_arm_payload_ty(sm: *Sema, arm: *MatchArm, scrut: *Expr, t: *SemaTy) -> i32
+    if scrut == null or arm.pattern_kind != PAT_VARIANT or arm.pattern_inner_kind != PAT_IDENT
+        return sema_ty_none(t)
+    var s: SemaTy
+    sema_expr_ty(sm, scrut, @s)
+    if s.kind == TYPE_UNKNOWN or s.name == null or s.name_len <= 0
+        return sema_ty_none(t)
+    if is_tagged_enum_type(s.name, s.name_len) == 1
+        var is_err: i32 = 0
+        if name_eq(arm.pattern_name, arm.pattern_name_len, c"Err", 3) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"None", 4) == 1
+            is_err = 1
+        return sema_struct_ty(sema_tagged_payload(sm, s.name, s.name_len, is_err), t)
+    if user_enum_index(s.name, s.name_len) >= 0
+        let uf: *StructField = user_enum_tuple_field(s.name, s.name_len, enum_variant_index(s.name, s.name_len, arm.pattern_name, arm.pattern_name_len))
+        if uf != null
+            var pointee: i32 = TYPE_VOID
+            if uf.field_type == TYPE_PTR
+                pointee = uf.ptr_pointee
+            return sema_ty_set(t, uf.field_type, uf.field_type_name, uf.field_type_name_len, pointee, uf.fn_sig)
+    sema_ty_none(t)
+
+# Field `i` of the tuple struct `tup` (a `let (a, b, ..)`'s initialiser's type).
+pub fn sema_tuple_field_ty(sm: *Sema, tup: *SemaTy, i: i32, t: *SemaTy) -> i32
+    let st: *StructDef = sema_recv_struct(sm, tup)
+    if st == null
+        return sema_ty_none(t)
+    var f: *StructField = st.fields
+    var k: i32 = 0
+    while f != null and k < i
+        f = f.next
+        k += 1
+    if f == null
+        return sema_ty_none(t)
+    var pointee: i32 = TYPE_VOID
+    if f.field_type == TYPE_PTR
+        pointee = f.ptr_pointee
+    sema_ty_set(t, f.field_type, f.field_type_name, f.field_type_name_len, pointee, f.fn_sig)
 
 # The type of `e` into `t`, returning its kind; TYPE_UNKNOWN when Sema can't
 # say.  `e` may be null.
@@ -237,6 +416,10 @@ pub fn sema_expr_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
         return sema_call_ty(sm, e, t)
     if k == EXPR_MEMBER
         return sema_member_ty(sm, e, t)
+    if k == EXPR_INDEX
+        return sema_index_ty(sm, e, t)
+    if k == EXPR_METHOD
+        return sema_method_ty(sm, e, t)
     sema_ty_none(t)
 
 # The kind of `e`: a TYPE_*, or TYPE_UNKNOWN.
