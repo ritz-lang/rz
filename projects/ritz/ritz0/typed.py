@@ -14,10 +14,11 @@ finds are kept on the table: `--check-types` decides whether ritz0 prints
 them (on by default is #3556, #1823), and the slot errors (§13.2, §13.4) are printed
 beside an ownership error, or refuse an instance, either way.
 
-Who reads it so far: the type checker (it is the inference), and the move
-checker, for MOVE_CHECKER_READS (#3553).  The move checker's rules for
-Ident, Field, Match and MethodCall (#3553, after #3554), monomorph's
-inferers (#3554) and the emitter's (#3555) are still to move here.
+Who reads it so far: the type checker (it is the inference), the move
+checker, for MOVE_CHECKER_READS (#3553), and the emitter, for EMITTER_READS.
+The move checker's rules for Ident, Field, Match and MethodCall (#3553, after
+#3554), monomorph's inferers (#3554) and the emitter's for the other kinds
+(#4066, #4067, #4068) are still to move here.
 """
 
 from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple
@@ -38,6 +39,22 @@ MOVE_CHECKER_READS = (
     rast.Cast, rast.StructLit, rast.Call,
     rast.UnaryOp, rast.BinOp, rast.TryOp, rast.ArrayLit, rast.ArrayFill,
     rast.TupleLit,
+)
+
+# The kinds the emitter takes from the table (LLVMEmitter._typed_type, #3555).
+# Where its old rule said nothing (an `if` with no tail, a tuple with an
+# untyped element) the table may say more; over the matrix corpus, ritz1, the
+# examples and the .ritz tests the emitted IR is byte-identical.  StringLit is
+# not here: the emitter types a "..." in a `*u8` slot `*u8` (as_ptr, set as
+# it emits), a slot rule this pass doesn't know yet (#4068, with Match).  The
+# kinds left (Ident, UnaryOp, BinOp, Call, Field, Index, MethodCall, ArrayLit)
+# disagree, mostly in generic instances (#3554); they stay the emitter's
+# (#4066, #4067).
+EMITTER_READS = (
+    rast.IntLit, rast.FloatLit, rast.BoolLit, rast.CharLit,
+    rast.CStringLit, rast.NullLit,
+    rast.Cast, rast.StructLit, rast.TupleLit,
+    rast.If, rast.Block, rast.TryOp,
 )
 
 

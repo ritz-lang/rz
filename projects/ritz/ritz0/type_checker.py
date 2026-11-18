@@ -40,6 +40,14 @@ def _unsigned_as_signed(key: str) -> str:
     """A _referent_key spelled as LLVM sees it: `u32` and `i32` are one `i32`."""
     return _UNSIGNED_INT.sub(r"i\1", key)
 
+# `sizeof(v)` operands typed as values, for the emitter (#3555): the kinds
+# that can't spell a type.
+SIZEOF_VALUE_OPERANDS = (
+    rast.IntLit, rast.FloatLit, rast.BoolLit, rast.CharLit,
+    rast.CStringLit, rast.NullLit,
+    rast.Cast, rast.StructLit, rast.TupleLit,
+)
+
 
 class FloatLitType(rast.NamedType):
     """A float literal's type: f64, unless its context makes it an f32."""
@@ -237,6 +245,11 @@ class TypeChecker:
         for item in module.items:
             if isinstance(item, (rast.VarDef, rast.ConstDef)) and item.value is not None:
                 self._check_global_literal(item.value, item.type)
+                # An untyped one is refused, naming its initialiser's type
+                # (LARB R38), which the emitter reads off the table (#3555).
+                # Quietly: the refusal is the error.
+                if item.type is None:
+                    self._quiet_type(item.value)
 
     def _register_struct(self, struct: rast.StructDef):
         """Register struct definition."""
@@ -829,6 +842,12 @@ class TypeChecker:
             if fn_name == 'sizeof':
                 if len(expr.args) != 1:
                     self._error("sizeof() requires exactly 1 type argument", expr.span)
+                # A value operand the emitter reads the type of (#3555):
+                # `sizeof('a')`, `sizeof(x as u16)`.  A name may spell a
+                # type, so only kinds that can't.  Quietly: the checker
+                # never looked there, so --check-types reports nothing new.
+                elif isinstance(expr.args[0], SIZEOF_VALUE_OPERANDS):
+                    self._quiet_type(expr.args[0])
                 return rast.NamedType(expr.span, 'i64', [])
 
             # typeof(expr) -> type info (returns i64 type id for now)
@@ -934,7 +953,10 @@ class TypeChecker:
             return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
 
         else:
-            # Indirect call - just infer args
+            # Indirect call: type the callee for the table, since the emitter
+            # reads a `(p as EfiFn2)(...)` cast's callconv off it (#3555),
+            # and the args.
+            self._quiet_type(expr.func)
             for arg in expr.args:
                 self._infer_type(arg)
             return rast.NamedType(expr.span, 'unknown', [])
@@ -1583,10 +1605,10 @@ class TypeChecker:
         """Type check try operator (?)."""
         inner_type = self._infer_type(expr.expr)
 
-        # Should be Result<T, E> - extract T
+        # Result<T, E> or Option<T>: the Ok / Some payload T.  The
+        # emitter's drop of `var t = try_make(1)?` needs it (#2264, #3555).
         if isinstance(inner_type, rast.NamedType):
             if inner_type.name.startswith('Result') or inner_type.name == 'Option':
-                # Extract success type from Result<T, E> / Option<T>
                 if inner_type.args:
                     return inner_type.args[0]
 

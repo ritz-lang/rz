@@ -36,7 +36,7 @@ from async_transform_v2 import (generate_state_machine, AsyncStateMachine, Untyp
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
-from typed import type_module
+from typed import EMITTER_READS, type_module, typed_of
 import module_interface
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 
@@ -1819,6 +1819,14 @@ class LLVMEmitter:
         return rast.FnType(span, [p.type for p in fn_def.params], fn_def.ret_type,
                            getattr(fn_def, 'callconv', None), lent)
 
+    def _typed_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        """`expr`'s type as the typing pass found it (typed.py), or None
+        where it found none: an expression it never typed, or `unknown`."""
+        ty = self.typed.type_of(expr)
+        if isinstance(ty, rast.NamedType) and ty.name == 'unknown' and not ty.args:
+            return None
+        return ty
+
     def _infer_ritz_type(self, expr: rast.Expr, llvm_val: ir.Value = None) -> Optional[rast.Type]:
         """Infer a Ritz type from an expression, for signedness tracking.
 
@@ -1831,26 +1839,14 @@ class LLVMEmitter:
                 expr, lambda n: n in self.locals or n in self.params)
             if variant_ty is not None:
                 return variant_ty
-        if isinstance(expr, rast.IntLit):
-            # Integer literals default to i64 (signed)
-            return rast.NamedType(expr.span, 'i64', [])
-        elif isinstance(expr, rast.FloatLit):
-            return rast.NamedType(expr.span, 'f64', [])
-        elif isinstance(expr, rast.BoolLit):
-            return rast.NamedType(expr.span, 'bool', [])
-        elif isinstance(expr, rast.CharLit):
-            return rast.NamedType(expr.span, 'u8', [])
-        elif isinstance(expr, rast.StringLit):
+        if isinstance(expr, EMITTER_READS):
+            return self._typed_type(expr)
+        if isinstance(expr, rast.StringLit):
+            # A "..." in a `*u8` slot is a `*u8` (as_ptr, set by the slot rule
+            # as it emits), else a StrView.
             if expr.as_ptr:
                 return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
-            # "hello" -> StrView (zero-copy view)
             return rast.NamedType(expr.span, 'StrView', [])
-        elif isinstance(expr, rast.CStringLit):
-            return rast.PtrType(expr.span, rast.NamedType(expr.span, 'u8', []), mutable=False)
-        # Note: SpanStringLit (s"...") was removed in AGAST #98 — bare
-        # StringLit now produces StrView (see above).
-        elif isinstance(expr, rast.NullLit):
-            return rast.NamedType(expr.span, 'null', [])
         elif isinstance(expr, rast.Ident):
             # Look up existing type; a local shadows a const of the same name.
             if expr.name in self.ritz_types:
@@ -2028,42 +2024,15 @@ class LLVMEmitter:
                 if isinstance(base_type, rast.PtrType):
                     return base_type.inner
             return None
-        elif isinstance(expr, rast.Cast):
-            return expr.target
-        elif isinstance(expr, rast.StructLit):
-            return rast.NamedType(expr.span, expr.name, [])
         elif isinstance(expr, rast.ArrayLit):
             if expr.elements:
                 elem_type = self._infer_ritz_type(expr.elements[0])
                 if elem_type:
                     return rast.ArrayType(expr.span, len(expr.elements), elem_type)
             return None
-        elif isinstance(expr, rast.TupleLit):
-            # For drop tracking of a tuple of move-only values (AGAST #2161).
-            elems = [self._infer_ritz_type(e) for e in expr.elements]
-            if expr.elements and all(e is not None for e in elems):
-                return rast.TupleType(expr.span, elems)
-            return None
-        elif isinstance(expr, rast.TryOp):
-            # `x?` is the Ok / Some payload, as the move checker types it.
-            # Without this `var t = try_make(1)?` recorded no type, so the
-            # binding was never registered for a scope-end drop (AGAST #2264).
-            inner = self._infer_ritz_type(expr.expr)
-            if (isinstance(inner, rast.NamedType) and inner.name in ('Result', 'Option')
-                    and inner.args):
-                return inner.args[0]
-            return None
         elif isinstance(expr, rast.Match):
             # A move-only arm value (_note_match_result_type, AGAST #2177).
             return getattr(expr, 'result_ritz_type', None)
-        elif isinstance(expr, rast.If):
-            if expr.then_block and expr.then_block.expr:
-                return self._infer_ritz_type(expr.then_block.expr)
-            return None
-        elif isinstance(expr, rast.Block):
-            if expr.expr:
-                return self._infer_ritz_type(expr.expr)
-            return rast.NamedType(expr.span, 'void', [])
         return None
 
     @staticmethod
@@ -3242,9 +3211,10 @@ class LLVMEmitter:
         if not getattr(module, 'moves_annotated', False):
             MoveChecker().check(module)
         self.move_types = MoveTypes(module)
-        # The typing pass's table (typed.py), for what only types decide:
-        # whether a store goes through a reference (LARB R58).
-        self.typed = getattr(module, 'typed', None)
+        # Each expression's type, from the typing pass emit() ran on this
+        # module (typed.py); the kinds in typed.EMITTER_READS are read here,
+        # as is whether a store goes through a reference (LARB R58).
+        self.typed = typed_of(module)
 
         # Transform async functions into state machines (before any emission)
         module = self._transform_async_functions(module)
@@ -15840,9 +15810,10 @@ class LLVMEmitter:
         when widening integers, and whether to use icmp_unsigned vs icmp_signed
         for comparisons.
         """
-        # Character literals are u8 (unsigned)
-        if isinstance(expr, rast.CharLit):
-            return True
+        # A char or a cast: the typing pass's type (a char is a u8, a cast is
+        # its target).
+        if isinstance(expr, (rast.CharLit, rast.Cast)):
+            return self._is_unsigned_type(self._typed_type(expr))
 
         # Identifier - check stored type
         if isinstance(expr, rast.Ident):
@@ -15852,10 +15823,6 @@ class LLVMEmitter:
             if expr.name in self.constants and expr.name in self.const_ritz_types:
                 return self._is_unsigned_type(self.const_ritz_types[expr.name])
             return False
-
-        # Cast expression - check the target type (what we're casting TO)
-        if isinstance(expr, rast.Cast):
-            return self._is_unsigned_type(expr.target)
 
         # Dereference of pointer to unsigned type
         if isinstance(expr, rast.UnaryOp) and expr.op == '*':
@@ -16007,51 +15974,6 @@ class LLVMEmitter:
             is_neg, self.builder.fsub(recv, half),
             self.builder.fadd(recv, half))
         return _trunc(adj)
-
-    def _infer_float_expr(self, expr: rast.Expr) -> bool:
-        """Check if an expression produces a floating-point type.
-
-        This is used to determine whether to use float operations (fadd, fmul, etc.)
-        vs integer operations (add, mul, etc.).
-        """
-        # Float literals are always f64
-        if isinstance(expr, rast.FloatLit):
-            return True
-
-        # Identifier - check stored type
-        if isinstance(expr, rast.Ident):
-            if expr.name in self.ritz_types:
-                ritz_type = self.ritz_types[expr.name]
-                if isinstance(ritz_type, rast.NamedType):
-                    return ritz_type.name in ('f32', 'f64')
-            return False
-
-        # Cast expression - check the target type
-        if isinstance(expr, rast.Cast):
-            if isinstance(expr.target, rast.NamedType):
-                return expr.target.name in ('f32', 'f64')
-            return False
-
-        # Binary operation - if either operand is float, result is float
-        if isinstance(expr, rast.BinOp):
-            return self._infer_float_expr(expr.left) or self._infer_float_expr(expr.right)
-
-        # Field access - check field type
-        if isinstance(expr, rast.FieldAccess):
-            if isinstance(expr.expr, rast.Ident):
-                struct_name = expr.expr.name
-                if struct_name in self.ritz_types:
-                    ritz_type = self.ritz_types[struct_name]
-                    if isinstance(ritz_type, rast.NamedType):
-                        struct_name = ritz_type.name
-                if struct_name in self.struct_fields:
-                    for field_name, field_type in self.struct_fields[struct_name]:
-                        if field_name == expr.field:
-                            if isinstance(field_type, rast.NamedType):
-                                return field_type.name in ('f32', 'f64')
-            return False
-
-        return False
 
     def _emit_match(self, expr: rast.Match) -> ir.Value:
         """Emit a match expression.
