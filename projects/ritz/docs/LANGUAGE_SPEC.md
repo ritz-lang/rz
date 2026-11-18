@@ -5862,6 +5862,40 @@ fn main() -> i32
     0
 ```
 
+**The poll contract** (LARB R78, AGAST #3728).  An `async fn f` with params
+`P` and declared result type `T` becomes three items:
+
+- `struct f_Future`, which starts with `__state: i32` and then `__result: T`.
+  A unit fn's future has no `__result`.  Next come the params, and then
+  whatever the body keeps across an `await`.
+- `fn f(P) -> f_Future`, which builds the future in its first state and runs
+  none of the body.
+- `fn f_poll(self: *f_Future) -> bool`, which runs the body until it either
+  suspends or finishes.  It answers `false` while Pending.  Once the body has
+  finished it writes the result into `__result` and answers `true`.
+
+An executor polls a future through a pointer, with no knowledge of `T`, until
+the poll answers `true`, and then reads `__result` if it wants the value.
+The result is kept whole whatever its type: an `i64` above 2^31, a pointer, a
+struct, or a `-1` that is a genuine answer and not Pending.
+
+```ritz
+async fn neg() -> i32
+    0 - 1
+
+async fn big() -> i64
+    5000000000
+
+fn main() -> i32
+    var f: neg_Future = neg()
+    while !neg_poll(@f)
+        pass
+    let b: i64 = await big()
+    if b != 5000000000
+        return 1
+    f.__result + 1
+```
+
 ### 16.2 Await
 
 **Calling an `async fn` requires `await`, whatever its body does** (decided
@@ -5911,11 +5945,12 @@ fn main() -> i32
 ```
 
 Keeping the future is still allowed.  `var p: f_Future = f(args)` hands it to
-an executor that polls it with `f_poll(@p)` (see `examples/tier5_async/64_async_io`).
+an executor that polls it with `f_poll(@p)` until that is `true`, then reads
+`p.__result` (see the poll contract in §16.1, and `examples/tier5_async/64_async_io`).
 
 An awaited value may be bound without a type (AGAST #1318).  Inside an
-`async fn` the binding lives in the fn's future, as an `i32`, the type its
-poll returns:
+`async fn` the binding lives in the fn's future, with the awaited fn's
+declared result type (LARB R78):
 
 ```ritz
 async fn fetch(x: i32) -> i32
@@ -5935,7 +5970,8 @@ so its type is inferred from its value before the fn is lowered (AGAST #3762).
 The value may be a literal (an integer literal is `i64`, as for any untyped
 `let`), a parameter or earlier local, an operator over those (a comparison,
 `&&`, `||` or `!` is `bool`; arithmetic takes its left operand's type, or the
-right's when the left is a bare literal), a cast, an `await` (`i32`), a call to
+right's when the left is a bare literal), a cast, an `await` of an `async fn`
+(that fn's result type), a call to
 a declared non-generic fn (its return type), or a bare call to an `async fn`
 (its future):
 
@@ -5977,7 +6013,7 @@ fn main() -> i32
 
 An `async fn` that awaits runs as written: its body is lowered to a state
 machine over its control flow (AGAST #3727), and each `await` is a point the
-fn suspends at (its poll answers Pending) and resumes at on the next poll,
+fn suspends at (its poll answers `false`) and resumes at on the next poll,
 wherever it is.  An `await` in a loop runs on every pass, only the taken arm
 of an `if` runs its awaits, and every statement between them runs once:
 

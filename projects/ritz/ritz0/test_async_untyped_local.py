@@ -30,7 +30,9 @@ from test_borrow_param_ref_field import _batch_compile, _compile, _run
 _FETCH = "async fn fetch(x: i32) -> i32\n    x\n\n"
 _TWICE = "fn twice(n: i32) -> i32\n    n * 2\n\n"
 _PAIR = "struct Pair\n    a: i32\n    b: i32\n\n"
-_MAIN = "pub fn main() -> i32\n    var f: go_Future = go(7)\n    return go_poll(@f)\n"
+# One poll: true with the value in `__result` (LARB R78, #3728); 99 if Pending.
+_MAIN = ("pub fn main() -> i32\n    var f: go_Future = go(7)\n    if go_poll(@f)\n"
+         "        return f.__result\n    99\n")
 
 
 def _go(body: str, params: str = "x: i32") -> str:

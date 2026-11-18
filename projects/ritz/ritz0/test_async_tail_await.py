@@ -20,7 +20,9 @@ pytestmark = pytest.mark.batched
 
 # fetch is Ready with its argument on the first poll; main polls go once.
 _FETCH = "async fn fetch(x: i32) -> i32\n    x\n\n"
-_MAIN = "pub fn main() -> i32\n    var f: go_Future = go(7)\n    return go_poll(@f)\n"
+# One poll: true with the value in `__result` (LARB R78, #3728); 99 if Pending.
+_MAIN = ("pub fn main() -> i32\n    var f: go_Future = go(7)\n    if go_poll(@f)\n"
+         "        return f.__result\n    99\n")
 
 # name -> (go's body, go_poll's value for x = 7)
 ROWS = {

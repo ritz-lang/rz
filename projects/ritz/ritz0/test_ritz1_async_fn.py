@@ -95,17 +95,17 @@ RUNS = {
                           "    else\n        await dbl(0 - x)\n\n"
                           + _main("    let a: i32 = await pick(5)\n    let b: i32 = await pick(0 - 7)\n"
                                   "    a * 10 + b\n"), 114),
-    # Pending propagates out of the poll; the executor polls again.
-    "pending_polled_by_hand": (_TICK + _main("    var f: waits_Future = waits()\n"
-                                             "    var r: i32 = waits_poll(@f)\n    var polls: i32 = 1\n"
-                                             "    while r == 0 - 1\n        r = waits_poll(@f)\n"
-                                             "        polls = polls + 1\n    r + polls * 50\n"), 181),
+    # Pending propagates out of the poll (false); the executor polls again,
+    # and reads the value from the future once the poll is true (R78, #3728).
+    "pending_polled_by_hand": (_TICK + _main("    var f: waits_Future = waits()\n    var polls: i32 = 1\n"
+                                             "    while !waits_poll(@f)\n        polls = polls + 1\n"
+                                             "    f.__result + polls * 50\n"), 181),
     # `await` in a sync fn polls until Ready.
     "pending_awaited_in_sync_fn": (_TICK + _main("    let v: i32 = await waits()\n    v + g_n\n"), 34),
     # #3821: the let's value is computed once its await's result is stored.
     "await_inside_let_value": (_DBL + "async fn plus(x: i32) -> i32\n    let v: i32 = (await dbl(x)) + 1\n"
                                "    v * 2\n\n" + _main("    let r: i32 = await plus(5)\n    r\n"), 22),
-    # #1318: an untyped await binding takes the poll's i32.  (A non-await `let`
+    # #1318: an untyped await binding takes the awaited fn's result type (R78).  (A non-await `let`
     # ahead of the first await never runs under ritz0's machine, so none here: #3023.)
     "untyped_locals": ("async fn fetch(x: i32) -> i32\n    x\n\n"
                        "async fn go(x: i32) -> i32\n    let v = await fetch(x + 1)\n    v + 1\n\n"
@@ -193,15 +193,16 @@ def test_bare_async_call_refused_as_ritz0(ritz1_bin, tmp_path, name):
 def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path):
     """#3726: an imported async fn is declared in its importer, defined in its
     file.  The importer allocates its future, so it lays it out from the fn's
-    body as the defining file does: `go_Future` holds __state, x, a and b, and
-    the two `fetch_Future`s it awaits (#3727; 32 bytes), which an import
-    stripped to its interface would not know."""
+    body as the defining file does: `go_Future` holds __state, __result (R78,
+    #3728), x, a and b, and the two `fetch_Future`s it awaits (#3727), each
+    __state, __result and x (44 bytes), which an import stripped to its
+    interface would not know."""
     extra = {"a.ritz": "pub async fn fetch(x: i32) -> i32\n    x + 1\n\n"
                        "pub async fn go(x: i32) -> i32\n    let a: i32 = await fetch(x)\n"
                        "    let b: i32 = await fetch(a)\n    b\n"}
     program = "import a\n\nasync fn main() -> i32\n    let r: i32 = await go(40)\n    r + sizeof(go_Future) as i32\n"
-    assert _run_pkg("ritz0", tmp_path, "imp_async", program, extra) == 74
-    assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 74
+    assert _run_pkg("ritz0", tmp_path, "imp_async", program, extra) == 86
+    assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 86
 
 
 PRIVATE_ASYNC_CALLERS = {
@@ -253,7 +254,7 @@ def test_private_async_fn_poll_is_exempt(ritz1_bin, tmp_path):
     (pkg / "src").mkdir(parents=True)
     (pkg / "src" / "a.ritz").write_text("async fn fetch(x: i32) -> i32\n    x + 1\n")
     (pkg / "src" / "main.ritz").write_text(
-        "import a\n\nfn main() -> i32\n    fetch_poll(0 as *fetch_Future)\n")
+        "import a\n\nfn main() -> i32\n    fetch_poll(0 as *fetch_Future) as i32\n")
     for compiler in ("ritz0", "ritz1"):
         res = _compile_file(compiler, tmp_path, pkg / "src" / "main.ritz")
         assert res.returncode == 0, (compiler, res.stderr)

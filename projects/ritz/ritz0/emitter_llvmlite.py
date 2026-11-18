@@ -31,7 +31,8 @@ import binder_names
 import type_order
 import match_coverage
 from metadata import type_to_string
-from async_transform_v2 import generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError
+from async_transform_v2 import (generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError,
+                                PollAbi)
 from const_eval import ConstEvaluator, ConstEvalError
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
@@ -3613,7 +3614,7 @@ class LLVMEmitter:
                         new_items.append(sm.poll_fn)
 
                         # Generate sync main wrapper
-                        main_wrapper = self._generate_async_main_wrapper()
+                        main_wrapper = self._generate_async_main_wrapper(item.ret_type is not None)
                         new_items.append(main_wrapper)
                     else:
                         new_items.append(sm.constructor_fn)
@@ -3635,91 +3636,37 @@ class LLVMEmitter:
         # Return modified module
         return rast.Module(items=new_items, span=module.span)
 
-    def _generate_async_main_wrapper(self) -> rast.FnDef:
+    def _generate_async_main_wrapper(self, has_result: bool) -> rast.FnDef:
         """Generate a synchronous main wrapper for async main.
 
-        Generates:
+        Generates (LARB R78: the poll answers bool, the value is the future's):
             fn main() -> i32
                 var future: main_Future = __main_future()
-                while true
-                    let result: i32 = main_poll(&future)
-                    if result >= 0
-                        return result
+                while !main_poll(&future)
+                    pass
+                future.__result                 # 0 for a unit main
         """
-        dummy_span = rast.Span(0, 0, 0, 0)
+        span = rast.Span(0, 0, 0, 0)
 
-        # var future: main_Future = __main_future()
+        def future():
+            return rast.Ident(span=span, name='future')
+
         future_init = rast.VarStmt(
-            span=dummy_span,
-            name='future',
-            type=rast.NamedType(span=dummy_span, name='main_Future'),
-            value=rast.Call(
-                span=dummy_span,
-                func=rast.Ident(span=dummy_span, name='__main_future'),
-                args=[]
-            )
-        )
-
-        # let result: i32 = main_poll(&future)
-        poll_call = rast.LetStmt(
-            span=dummy_span,
-            name='result',
-            type=rast.NamedType(span=dummy_span, name='i32'),
-            value=rast.Call(
-                span=dummy_span,
-                func=rast.Ident(span=dummy_span, name='main_poll'),
-                args=[rast.UnaryOp(
-                    span=dummy_span,
-                    op='&',
-                    operand=rast.Ident(span=dummy_span, name='future')
-                )]
-            )
-        )
-
-        # if result >= 0: return result
-        check_ready = rast.If(
-            span=dummy_span,
-            cond=rast.BinOp(
-                span=dummy_span,
-                op='>=',
-                left=rast.Ident(span=dummy_span, name='result'),
-                right=rast.IntLit(span=dummy_span, value=0)
-            ),
-            then_block=rast.Block(
-                span=dummy_span,
-                stmts=[rast.ReturnStmt(
-                    span=dummy_span,
-                    value=rast.Ident(span=dummy_span, name='result')
-                )],
-                expr=None
-            ),
-            else_block=None
-        )
-
-        # while true { poll; check }
+            span=span, name='future', type=rast.NamedType(span=span, name='main_Future'),
+            value=rast.Call(span=span, func=rast.Ident(span=span, name='__main_future'), args=[]))
+        poll = rast.Call(span=span, func=rast.Ident(span=span, name='main_poll'),
+                         args=[rast.UnaryOp(span=span, op='&', operand=future())])
         poll_loop = rast.WhileStmt(
-            span=dummy_span,
-            cond=rast.BoolLit(span=dummy_span, value=True),
-            body=rast.Block(
-                span=dummy_span,
-                stmts=[poll_call, rast.ExprStmt(span=dummy_span, expr=check_ready)],
-                expr=None
-            )
-        )
-
-        # Function body
-        body = rast.Block(
-            span=dummy_span,
-            stmts=[future_init, poll_loop],
-            expr=None
-        )
-
+            span=span, cond=rast.UnaryOp(span=span, op='!', operand=poll),
+            body=rast.Block(span=span, stmts=[rast.ContinueStmt(span=span)], expr=None))
+        result = (PollAbi(span).result_field(future(), span) if has_result
+                  else rast.IntLit(span=span, value=0))
         return rast.FnDef(
-            span=dummy_span,
+            span=span,
             name='main',
             params=[],
-            ret_type=rast.NamedType(span=dummy_span, name='i32'),
-            body=body,
+            ret_type=rast.NamedType(span=span, name='i32'),
+            body=rast.Block(span=span, stmts=[future_init, poll_loop], expr=result),
             is_async=False
         )
 
@@ -11705,12 +11652,12 @@ class LLVMEmitter:
     def _emit_await_poll_loop(self, fn_name: str, args: list) -> ir.Value:
         """Generate a poll loop for awaiting an async function outside async context.
 
-        Equivalent to:
+        Equivalent to (LARB R78: the poll answers bool, the value is the
+        future's `__result`):
             var future = fn_name(args)
-            while true
-                let result = fn_name_poll(&future)
-                if result >= 0
-                    return result
+            while !fn_name_poll(&future)
+                pass
+            future.__result                     # i32 0 for a unit fn
         """
         future_type_name = f"{fn_name}_Future"
         poll_fn_name = f"{fn_name}_poll"
@@ -11754,18 +11701,18 @@ class LLVMEmitter:
         # Poll loop body
         self.builder.position_at_end(loop_block)
 
-        # Call poll: result = fn_name_poll(&future)
-        poll_result = self.builder.call(poll_fn, [future_alloca], name="poll_result")
+        # Call poll: ready = fn_name_poll(&future)
+        ready = self.builder.call(poll_fn, [future_alloca], name="poll_ready")
+        is_ready = self.builder.icmp_unsigned('!=', ready, ir.Constant(ready.type, 0), name="is_ready")
+        self.builder.cbranch(is_ready, done_block, loop_block)
 
-        # Check if ready: result >= 0
-        pending = ir.Constant(self.i32, -1)
-        is_pending = self.builder.icmp_signed('==', poll_result, pending, name="is_pending")
-        self.builder.cbranch(is_pending, loop_block, done_block)
-
-        # Done block - return the result
+        # Done: the value is the future's result field; a unit fn has none.
         self.builder.position_at_end(done_block)
-
-        return poll_result
+        if PollAbi.RESULT not in [name for name, _ in self.struct_fields.get(future_type_name, [])]:
+            return ir.Constant(self.i32, 0)
+        idx = self._get_struct_field_index(future_type_name, PollAbi.RESULT)
+        result_ptr = self.builder.gep(future_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+        return self.builder.load(result_ptr, name="await_result")
 
     def _emit_heap_expr(self, heap_expr: rast.HeapExpr) -> ir.Value:
         """Emit a heap expression: heap expr.
