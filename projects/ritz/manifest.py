@@ -94,20 +94,22 @@ Node = Value | Table | Map | Array
 
 
 # Reader locations, as "<repo-relative file>::<function>".
-BUILD = "projects/ritz/build.py"
+MANIFEST_PY = "projects/ritz/manifest.py"
+PIPELINE_PY = "projects/ritz/build_pipeline.py"
+CLI_PY = "projects/ritz/build_cli.py"
 RESOLVE = "projects/ritz/resolve.py"
 RZ = "rz"
 
-_SOURCES_READERS = (f"{BUILD}::plan_binaries", f"{BUILD}::build_package",
+_SOURCES_READERS = (f"{MANIFEST_PY}::package_sources",
                     f"{RESOLVE}::package_import_namespaces")
 
 _PROFILE_KEYS = {
     "opt-level": Value(INTEGER, "LLVM optimisation level, 0-3.",
-                       (f"{BUILD}::get_build_profile",), default="0"),
+                       (f"{MANIFEST_PY}::get_build_profile",), default="0"),
     "debug": Value(BOOL, "Emit debug info.",
-                   (f"{BUILD}::get_build_profile",), default="true"),
+                   (f"{MANIFEST_PY}::get_build_profile",), default="true"),
     "lto": Value(BOOL, "Link-time optimisation.",
-                 (f"{BUILD}::get_build_profile",), default="false"),
+                 (f"{MANIFEST_PY}::get_build_profile",), default="false"),
 }
 
 
@@ -126,7 +128,7 @@ PACKAGE_SCHEMA = Table(
                 "name": Value(
                     STRING, "Package name. Also its import namespace and, "
                     "with no [[bin]] or [[lib]], its binary's name.",
-                    (f"{BUILD}::plan_binaries", f"{BUILD}::build_package",
+                    (f"{MANIFEST_PY}::plan_binaries", f"{PIPELINE_PY}::build_package",
                      f"{RESOLVE}::package_import_namespaces", f"{RZ}::cmd_list"),
                     required=True),
                 "version": Value(STRING, "Package version, shown by `rz list`.",
@@ -136,7 +138,7 @@ PACKAGE_SCHEMA = Table(
                 "sources": Value(STRING_OR_LIST, "See top-level `sources`.",
                                  _SOURCES_READERS),
             },
-            read_by=(f"{BUILD}::plan_binaries", f"{RZ}::cmd_list"),
+            read_by=(f"{MANIFEST_PY}::plan_binaries", f"{RZ}::cmd_list"),
             required=True),
         "build": Table(
             "Build settings. `opt-level`, `debug` and `lto` are the base every "
@@ -147,24 +149,24 @@ PACKAGE_SCHEMA = Table(
                 "test_only": Value(
                     BOOL, "The package has tests and no binaries or libraries: "
                     "`build` skips it, `test` runs it.",
-                    (f"{BUILD}::plan_binaries", f"{BUILD}::discover_test_files"),
+                    (f"{MANIFEST_PY}::plan_binaries", f"{MANIFEST_PY}::discover_test_files"),
                     default="false"),
                 **_PROFILE_KEYS,
             },
-            read_by=(f"{BUILD}::plan_binaries", f"{BUILD}::get_build_profile")),
+            read_by=(f"{MANIFEST_PY}::plan_binaries", f"{MANIFEST_PY}::get_build_profile")),
         "profile": Table(
             "Per-profile overrides of [build] `opt-level`, `debug` and `lto`. "
             "There are two profiles: `--release` selects `release`, anything "
             "else `debug`.",
             {
                 "debug": Table("The default profile.", dict(_PROFILE_KEYS),
-                               read_by=(f"{BUILD}::get_build_profile",)),
+                               read_by=(f"{MANIFEST_PY}::get_build_profile",)),
                 "release": Table("`build` / `test --release`.",
                                  dict(_PROFILE_KEYS),
-                                 read_by=(f"{BUILD}::cmd_build",
-                                          f"{BUILD}::cmd_test")),
+                                 read_by=(f"{CLI_PY}::cmd_build",
+                                          f"{CLI_PY}::cmd_test")),
             },
-            read_by=(f"{BUILD}::get_build_profile",)),
+            read_by=(f"{MANIFEST_PY}::get_build_profile",)),
         "dependencies": Map(
             "Packages this one imports. Each is put on RITZ_PATH and its "
             "dependencies are followed transitively.",
@@ -186,13 +188,13 @@ PACKAGE_SCHEMA = Table(
             "A package with [[lib]] and no [[bin]] builds no binary.",
             Table("One library.", {
                 "name": Value(STRING, "Library name (archived as lib<name>).",
-                              (f"{BUILD}::plan_binaries",), required=True),
+                              (f"{MANIFEST_PY}::plan_binaries",), required=True),
                 "sources": Value(
                     STRING_OR_LIST, "Source roots; a `!path` entry excludes a "
                     "file. Defaults to the package's `sources`.",
-                    (f"{BUILD}::plan_binaries",)),
+                    (f"{MANIFEST_PY}::plan_binaries",)),
             }),
-            (f"{BUILD}::plan_binaries",)),
+            (f"{MANIFEST_PY}::plan_binaries",)),
         "bin": Array(
             "A binary. With neither [[bin]] nor [[lib]] the package builds one "
             "binary named after it, from `main::main` under its sources.",
@@ -201,27 +203,27 @@ PACKAGE_SCHEMA = Table(
                 "src/<name>.ritz.",
                 {
                     "name": Value(STRING, "Binary name.",
-                                  (f"{BUILD}::plan_binaries",), required=True),
+                                  (f"{MANIFEST_PY}::plan_binaries",), required=True),
                     "entry": Value(STRING, '`"module::function"`, resolved under '
-                                   "`sources`.", (f"{BUILD}::plan_binaries",)),
+                                   "`sources`.", (f"{MANIFEST_PY}::plan_binaries",)),
                     "path": Value(STRING, "Source file, relative to the package. "
                                   "A non-.ritz path is listed and skipped.",
-                                  (f"{BUILD}::plan_binaries",)),
+                                  (f"{MANIFEST_PY}::plan_binaries",)),
                     "sources": Value(STRING_OR_LIST, "Source roots for this "
                                      "binary. Defaults to the package's.",
-                                     (f"{BUILD}::plan_binaries",)),
+                                     (f"{MANIFEST_PY}::plan_binaries",)),
                     "freestanding": Value(BOOL, "No libc, no runtime.",
-                                          (f"{BUILD}::plan_binaries",),
+                                          (f"{MANIFEST_PY}::plan_binaries",),
                                           default="false"),
                     "target": Value(STRING, "LLVM target triple. Empty means "
-                                    "the host.", (f"{BUILD}::plan_binaries",),
+                                    "the host.", (f"{MANIFEST_PY}::plan_binaries",),
                                     default='""'),
                     "target_os": Value(STRING, "Target OS for platform-specific "
                                        "modules (e.g. `harland`, `uefi`).",
-                                       (f"{BUILD}::plan_binaries",),
+                                       (f"{MANIFEST_PY}::plan_binaries",),
                                        default='""'),
                     "link_runtime": Value(BOOL, "Link the Ritz runtime's _start.",
-                                          (f"{BUILD}::plan_binaries",),
+                                          (f"{MANIFEST_PY}::plan_binaries",),
                                           default="false"),
                 },
                 self_named=Table(
@@ -231,34 +233,34 @@ PACKAGE_SCHEMA = Table(
                         "linker": Table("Linking.", {
                             "script": Value(STRING, "Linker script, relative "
                                             "to the package.",
-                                            (f"{BUILD}::plan_binaries",)),
-                        }, read_by=(f"{BUILD}::plan_binaries",)),
+                                            (f"{MANIFEST_PY}::plan_binaries",)),
+                        }, read_by=(f"{MANIFEST_PY}::plan_binaries",)),
                         "asm": Table("Assembly.", {
                             "files": Value(STRING_LIST, "Assembly files to "
                                            "assemble and link in.",
-                                           (f"{BUILD}::plan_binaries",)),
-                        }, read_by=(f"{BUILD}::plan_binaries",)),
+                                           (f"{MANIFEST_PY}::plan_binaries",)),
+                        }, read_by=(f"{MANIFEST_PY}::plan_binaries",)),
                         "flags": Table("Code generation.", {
                             "code-model": Value(STRING, "LLVM code model "
                                                 "(e.g. `kernel`).",
-                                                (f"{BUILD}::plan_binaries",),
+                                                (f"{MANIFEST_PY}::plan_binaries",),
                                                 default='""'),
                             "no-red-zone": Value(BOOL, "Disable the red zone.",
-                                                 (f"{BUILD}::plan_binaries",),
+                                                 (f"{MANIFEST_PY}::plan_binaries",),
                                                  default="false"),
                             "stack-protector": Value(
                                 BOOL, "Pass the compiler `--stack-protector`: "
                                 "every function but a `[[naked]]` one gets "
                                 "LLVM `sspstrong`. The binary must define "
                                 "`__stack_chk_guard` and `__stack_chk_fail`.",
-                                (f"{BUILD}::plan_binaries",),
+                                (f"{MANIFEST_PY}::plan_binaries",),
                                 default="false"),
                             "pic": Value(BOOL, "Position-independent code.",
-                                         (f"{BUILD}::plan_binaries",),
+                                         (f"{MANIFEST_PY}::plan_binaries",),
                                          default="false"),
-                        }, read_by=(f"{BUILD}::plan_binaries",)),
+                        }, read_by=(f"{MANIFEST_PY}::plan_binaries",)),
                     })),
-            (f"{BUILD}::plan_binaries",)),
+            (f"{MANIFEST_PY}::plan_binaries",)),
         "test": Table(
             "Test discovery. `rz test` always runs test/*.ritz, the "
             "package's own test_*.ritz and test.sh, plus every module with a "
@@ -268,9 +270,9 @@ PACKAGE_SCHEMA = Table(
             {
                 "sources": Value(STRING_LIST, "Extra directories searched "
                                  "(recursively) for `[[test]]` modules.",
-                                 (f"{BUILD}::_declared_test_source_files",)),
+                                 (f"{MANIFEST_PY}::_declared_test_source_files",)),
             },
-            read_by=(f"{BUILD}::_declared_test_source_files",)),
+            read_by=(f"{MANIFEST_PY}::_declared_test_source_files",)),
     })
 
 
@@ -530,6 +532,633 @@ def load(path) -> dict:
     """Read, parse and validate a ritz.toml or rz.toml."""
     path = Path(path)
     return loads(path.read_text(encoding="utf-8"), path)
+
+
+
+# ---------------------------------------------------------------------------
+# Package targets: [[bin]], [[lib]] and the build profile (AGAST #3632)
+#
+# What a loaded manifest asks to build. Moved here from build.py, next to
+# the schema that validated the same keys. RFC #109 Phase 1: entry point
+# resolution, source discovery, build profiles.
+# ---------------------------------------------------------------------------
+
+def resolve_entry_point(entry: str, pkg_dir: Path, sources: list[str]) -> tuple[Path, str] | None:
+    """Resolve entry = "module::function" to (file_path, function_name).
+
+    Per RFC #109 §2.4:
+    - Parse entry = "path.to.module::function"
+    - Convert module path to file: path/to/module.ritz
+    - Search in sources directories
+    - Return (file_path, function_name) or None if not found
+
+    Examples:
+        main::main          → src/main.ritz, fn main()
+        http.server::run    → src/http/server.ritz, fn run()
+        tools.cli::main     → src/tools/cli.ritz, fn main()
+    """
+    if "::" not in entry:
+        return None
+
+    module_path, fn_name = entry.rsplit("::", 1)
+
+    # Convert module path (dots) to file path (slashes)
+    # main → main.ritz
+    # http.server → http/server.ritz
+    file_rel_path = module_path.replace(".", "/") + ".ritz"
+
+    # Search in each source directory
+    for src_spec in sources:
+        # Handle exclusion patterns (skip them for search)
+        if src_spec.startswith("!"):
+            continue
+
+        # Normalize source spec to directory
+        src_dir = pkg_dir / src_spec.split("*")[0].rstrip("/")
+        if not src_dir.is_dir():
+            continue
+
+        candidate = src_dir / file_rel_path
+        if candidate.exists():
+            return (candidate, fn_name)
+
+    return None
+
+
+def detect_main_function(source_path: Path) -> str | None:
+    """Detect the main function name in a source file.
+
+    Used for backward compatibility with path = "file.ritz" syntax.
+    Returns "main" if found, or None.
+    """
+    from lexer import Lexer
+    from parser import Parser
+    import ritz_ast as rast
+
+    try:
+        source = source_path.read_text()
+        lexer = Lexer(source, str(source_path))
+        tokens = lexer.tokenize()
+        parser = Parser(tokens)
+        module = parser.parse_module()
+
+        for item in module.items:
+            if isinstance(item, rast.FnDef) and item.name == 'main':
+                return 'main'
+        return None
+    except Exception:
+        return None
+
+
+def discover_sources(pkg_dir: Path, sources: list[str] | None) -> list[Path]:
+    """Discover source files based on sources configuration.
+
+    Per RFC #109 §2.2:
+    - Directory entries expand to dir/**/*.ritz
+    - Explicit globs are used as-is
+    - Exclusion patterns (!path) filter out matching files
+    - Default: ["src"] if src/ exists, else ["."]
+
+    Args:
+        pkg_dir: Package directory (where ritz.toml is)
+        sources: List of source specs, or None for default
+
+    Returns:
+        List of .ritz file paths
+    """
+    import fnmatch
+
+    # Handle default
+    if sources is None:
+        if (pkg_dir / "src").is_dir():
+            sources = ["src"]
+        else:
+            sources = ["."]
+
+    include_patterns = []
+    exclude_patterns = []
+
+    for spec in sources:
+        if spec.startswith("!"):
+            # Exclusion pattern
+            exclude_patterns.append(spec[1:])
+        else:
+            include_patterns.append(spec)
+
+    # Collect all matching files
+    all_files = set()
+    for pattern in include_patterns:
+        pattern_path = pkg_dir / pattern
+
+        if pattern_path.is_dir():
+            # Directory → recursive glob
+            for f in pattern_path.rglob("*.ritz"):
+                all_files.add(f)
+        elif "*" in pattern:
+            # Explicit glob pattern
+            for f in pkg_dir.glob(pattern):
+                if f.is_file() and f.suffix == ".ritz":
+                    all_files.add(f)
+        else:
+            # Single file
+            if pattern_path.exists() and pattern_path.suffix == ".ritz":
+                all_files.add(pattern_path)
+
+    # Apply exclusions
+    result = []
+    for f in sorted(all_files):
+        excluded = False
+        rel_path = str(f.relative_to(pkg_dir))
+        for excl in exclude_patterns:
+            # Match against relative path
+            excl_path = pkg_dir / excl
+            if excl_path.is_dir():
+                # Exclude entire directory
+                if str(f).startswith(str(excl_path)):
+                    excluded = True
+                    break
+            elif fnmatch.fnmatch(rel_path, excl) or fnmatch.fnmatch(rel_path, excl + "/**"):
+                excluded = True
+                break
+        if not excluded:
+            result.append(f)
+
+    return result
+
+
+def get_build_profile(config: dict, profile_name: str | None) -> dict:
+    """Get build profile settings.
+
+    Per RFC #109 §2.3:
+    - Profiles inherit from [build] section
+    - Override with [profile.debug] or [profile.release]
+    - Default profile is "debug"
+
+    Returns dict with:
+        name: str - profile name
+        opt_level: int - optimization level (0-3)
+        debug: bool - include debug info
+        lto: bool - link-time optimization
+    """
+    # Defaults
+    result = {
+        "name": profile_name or "debug",
+        "opt_level": 0,
+        "debug": True,
+        "lto": False,
+    }
+
+    # Inherit from [build] section
+    if "build" in config:
+        build = config["build"]
+        if "opt-level" in build:
+            result["opt_level"] = build["opt-level"]
+        if "debug" in build:
+            result["debug"] = build["debug"]
+        if "lto" in build:
+            result["lto"] = build["lto"]
+
+    # Apply profile-specific overrides
+    # When profile_name is None, default to "debug" profile
+    effective_profile_name = profile_name or "debug"
+    if "profile" in config:
+        profile = config["profile"].get(effective_profile_name, {})
+        if "opt-level" in profile:
+            result["opt_level"] = profile["opt-level"]
+        if "debug" in profile:
+            result["debug"] = profile["debug"]
+        if "lto" in profile:
+            result["lto"] = profile["lto"]
+
+    return result
+
+
+@dataclass
+class BinaryConfig:
+    """Complete configuration for a binary target.
+
+    Supports both standard hosted builds and freestanding kernel builds.
+    """
+    name: str                    # Binary name
+    src_path: Path               # Main source file
+    additional_sources: list[Path]  # Extra sources (deprecated)
+    freestanding: bool = False   # If True, no runtime, custom linker
+    target: str = ""             # Target triple (e.g., "x86_64-none-elf")
+    target_os: str = ""          # Target OS for conditional compilation (e.g., "harland", "linux")
+    linker_script: Path | None = None  # Custom linker script
+    asm_files: list[Path] | None = None  # Assembly files to compile
+    code_model: str = ""         # LLC code model (e.g., "kernel")
+    no_red_zone: bool = False    # Disable red zone (for kernels)
+    stack_protector: bool = False  # Compiler's --stack-protector (AGAST #2590)
+    bin_sources: list[str] | None = None  # Per-binary source directories
+    pic: bool = False            # Generate position-independent code (for PIE executables)
+    link_runtime: bool = False   # Link with Ritz runtime (_start that calls main and sys_exit)
+
+    def __post_init__(self):
+        if self.asm_files is None:
+            self.asm_files = []
+        if self.bin_sources is None:
+            self.bin_sources = []
+
+
+@dataclass
+class LibraryConfig:
+    """A [[lib]] target: every module under its sources, and no binary.
+
+    `modules` is what `sources` matched, not what an entry point imports, so a
+    module nothing imports is still compiled.
+    """
+    name: str
+    modules: list[Path]
+
+
+# =============================================================================
+# End RFC #109 Phase 2
+# =============================================================================
+
+
+def find_package_at(path: Path) -> tuple[Path, dict] | None:
+    """Find a package at the given path (looks for ritz.toml)."""
+    path = path.resolve()
+
+    # If path is a file, look in its parent directory
+    if path.is_file():
+        path = path.parent
+
+    # Look for ritz.toml in this directory
+    toml_path = path / "ritz.toml"
+    if toml_path.exists():
+        return (path, load(toml_path))
+
+    return None
+
+
+def find_package_by_name_or_path(name_or_path: str) -> tuple[Path, dict] | None:
+    """Find a package by name or path.
+
+    Tries in order:
+    1. If it's a path to a directory with ritz.toml, use that
+    2. If it's a path to a ritz.toml file, use its directory
+    3. Look in current directory for matching subdirectory
+    """
+    path = Path(name_or_path)
+
+    # Try as direct path
+    if path.exists():
+        return find_package_at(path)
+
+    # Try as subdirectory of current working directory
+    cwd = Path.cwd()
+    subdir = cwd / name_or_path
+    if subdir.exists():
+        return find_package_at(subdir)
+
+    return None
+
+
+def find_all_packages(search_dir: Path = None) -> list[tuple[Path, dict]]:
+    """Find all packages with ritz.toml files under search_dir.
+
+    Defaults to current working directory if not specified.
+    """
+    if search_dir is None:
+        search_dir = Path.cwd()
+
+    search_dir = search_dir.resolve()
+    packages = []
+
+    # Search for all ritz.toml files recursively
+    for toml_path in sorted(search_dir.glob("**/ritz.toml")):
+        packages.append((toml_path.parent, load(toml_path)))
+
+    return packages
+
+
+def find_packages() -> list[tuple[Path, dict]]:
+    """Find all packages - searches from current directory."""
+    return find_all_packages()
+
+
+@dataclass
+class SkippedBinary:
+    """A declared [[bin]] that this build deliberately does not compile.
+
+    A skip is only legitimate when it is *named*: which target, and why. An
+    empty/short binary list must never be inferred to mean "nothing to do" —
+    that is how a missing binary passes for a successful build.
+    """
+    name: str
+    reason: str
+
+
+@dataclass
+class BinaryPlan:
+    """What plan_binaries() decided about every declared target in a package.
+
+    Four disjoint buckets, and every declared target lands in exactly one:
+
+    - buildable:  binaries to compile; each must produce an artifact
+    - libraries:  [[lib]] targets to compile; each must produce an archive
+    - skipped:    deliberately not compiled, with a stated reason (success)
+    - unresolved: declared as a Ritz target but its source could not be found
+                  (failure — a target we were asked for and cannot deliver)
+    """
+    buildable: list[BinaryConfig]
+    skipped: list[SkippedBinary]
+    unresolved: list[SkippedBinary]
+    libraries: list[LibraryConfig] = field(default_factory=list)
+
+
+def package_sources(config: dict) -> list[str] | None:
+    """The package's source roots: `sources` at the top level, else under
+    [package], else under [build] (TOML puts a key in the table it follows),
+    as a list. None when none of them sets it."""
+    sources = config.get("sources")
+    if sources is None:
+        sources = config.get("package", {}).get("sources")
+    if sources is None:
+        sources = config.get("build", {}).get("sources")
+    if isinstance(sources, str):
+        sources = [sources]
+    return sources
+
+
+def wants_convenience_link(bin_config: BinaryConfig) -> bool:
+    """Whether a build links `<pkg>/<name>` to the binary (AGAST #4131).
+
+    The link exists so host tests running with cwd=<pkg> can exec `./<name>`.
+    A freestanding binary (harland, uefi, x86_64-unknown-none) never runs on
+    the host and its consumers copy `build/<profile>/*.elf`, so a link would
+    only leave an untracked file in the package root that every new bin has
+    to gitignore by hand (projects/indium/fault_child blocked room teardown).
+    """
+    return not bin_config.freestanding
+
+
+def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
+    """Resolve every declared target into the buckets of a BinaryPlan.
+
+    get_binaries() returns only the buildable bucket, which is all most callers
+    need. Anything deciding whether a *package* built must use this instead, so
+    that a target dropped during resolution is visibly accounted for rather
+    than silently absent from the list.
+
+    A package with neither [[bin]] nor [[lib]] gets one binary named after it,
+    from main.ritz under its sources. A package with [[lib]] and no [[bin]] has
+    no binary at all (AGAST #1340).
+    """
+    plan = BinaryPlan(buildable=[], skipped=[], unresolved=[])
+    binaries = plan.buildable
+
+    # Check if this is a test-only package
+    is_test_only = config.get("build", {}).get("test_only", False)
+    if is_test_only:
+        return plan  # Test-only packages have no binaries
+
+    # Package-level sources configuration (RFC #109)
+    pkg_sources = package_sources(config)
+    if pkg_sources is None:
+        pkg_sources = ["src"]  # Default
+
+    # [[lib]] sections. `sources` overrides the package's, as it does for
+    # [[bin]]: zeus's package sources include test/, which is not library code.
+    for lib_entry in config.get("lib", []):
+        lib_sources = lib_entry.get("sources", pkg_sources)
+        if isinstance(lib_sources, str):
+            lib_sources = [lib_sources]
+        modules = discover_sources(pkg_dir, lib_sources)
+        if modules:
+            plan.libraries.append(LibraryConfig(lib_entry["name"], modules))
+        else:
+            # A library that compiles nothing must not pass for a built one.
+            plan.unresolved.append(SkippedBinary(
+                lib_entry["name"], f"[[lib]] has no .ritz modules under {lib_sources}"))
+
+    # Check for [[bin]] sections
+    if "bin" in config:
+        for bin_entry in config["bin"]:
+            name = bin_entry["name"]
+
+            # RFC #109: entry = "module::function"
+            if "entry" in bin_entry:
+                entry = bin_entry["entry"]
+                # Use bin-specific sources if provided, else package-level
+                bin_sources_list = bin_entry.get("sources", pkg_sources)
+                if isinstance(bin_sources_list, str):
+                    bin_sources_list = [bin_sources_list]
+                result = resolve_entry_point(entry, pkg_dir, bin_sources_list)
+                if result is None:
+                    # Not a skip: the package declares a Ritz binary whose
+                    # source we cannot find. Record it as unresolved so the
+                    # package build fails instead of quietly building N-1.
+                    print(f"  ⚠ Could not resolve entry point: {entry}", file=sys.stderr)
+                    plan.unresolved.append(SkippedBinary(
+                        name, f"could not resolve entry point '{entry}'"))
+                    continue
+                src_path, _fn_name = result
+            # Legacy: path = "src/main.ritz"
+            elif "path" in bin_entry:
+                src_path = pkg_dir / bin_entry["path"]
+                # Legitimate skip: a [[bin]] pointing at a .py/.sh script is
+                # not something this compiler builds. Named, not inferred.
+                if not src_path.suffix == ".ritz":
+                    plan.skipped.append(SkippedBinary(
+                        name, f"not a Ritz source ({src_path.name})"))
+                    continue
+            # Default: src/{name}.ritz
+            else:
+                src_path = pkg_dir / "src" / f"{name}.ritz"
+
+            # Get additional sources if specified (legacy, deprecated)
+            additional_sources = []
+            if "sources" in bin_entry and isinstance(bin_entry["sources"], list):
+                # Check if these are paths or directory specs
+                for src in bin_entry["sources"]:
+                    src_path_check = pkg_dir / src
+                    if src_path_check.is_file():
+                        additional_sources.append(src_path_check)
+
+            # Parse freestanding build options
+            freestanding = bin_entry.get("freestanding", False)
+            target = bin_entry.get("target", "")
+            target_os = bin_entry.get("target_os", "")
+
+            # Parse [bin.NAME.linker] section
+            # TOML puts [bin.harland.linker] as bin_entry["harland"]["linker"]
+            nested_config = bin_entry.get(name, {})
+            linker_config = nested_config.get("linker", {})
+            linker_script = None
+            if linker_config.get("script"):
+                linker_script = pkg_dir / linker_config["script"]
+
+            # Parse [bin.NAME.asm] section
+            asm_config = nested_config.get("asm", {})
+            asm_files = []
+            for asm_file in asm_config.get("files", []):
+                asm_files.append(pkg_dir / asm_file)
+
+            # Parse [bin.NAME.flags] section
+            flags_config = nested_config.get("flags", {})
+            code_model = flags_config.get("code-model", "")
+            no_red_zone = flags_config.get("no-red-zone", False)
+            stack_protector = flags_config.get("stack-protector", False)
+            pic = flags_config.get("pic", False)
+
+            # Parse runtime linking options
+            # link_runtime: bool - link with Ritz runtime (_start)
+            link_runtime = bin_entry.get("link_runtime", False)
+
+            # Per-binary source directories
+            bin_sources = bin_entry.get("sources", [])
+            if isinstance(bin_sources, str):
+                bin_sources = [bin_sources]
+
+            binaries.append(BinaryConfig(
+                name=name,
+                src_path=src_path,
+                additional_sources=additional_sources,
+                freestanding=freestanding,
+                target=target,
+                target_os=target_os,
+                linker_script=linker_script,
+                asm_files=asm_files,
+                code_model=code_model,
+                no_red_zone=no_red_zone,
+                stack_protector=stack_protector,
+                bin_sources=bin_sources,
+                pic=pic,
+                link_runtime=link_runtime,
+            ))
+    elif "lib" not in config:
+        # Default: single binary with package name
+        name = config["package"]["name"]
+        result = resolve_entry_point("main::main", pkg_dir, pkg_sources)
+        if result is None:
+            plan.unresolved.append(SkippedBinary(
+                name, f"no main.ritz under sources {pkg_sources}; "
+                      "declare a [[bin]] or a [[lib]]"))
+        else:
+            binaries.append(BinaryConfig(
+                name=name,
+                src_path=result[0],
+                additional_sources=[],
+            ))
+
+    return plan
+
+
+def get_binaries(pkg_dir: Path, config: dict) -> list[BinaryConfig]:
+    """Get list of BinaryConfig objects for all buildable binary targets.
+
+    Returns empty list for test-only packages (no binary to build).
+
+    Supports both RFC #109 syntax and legacy syntax:
+    - RFC #109: entry = "module::main"  → resolves to src/module.ritz
+    - Legacy:   path = "src/main.ritz"  → direct file path
+
+    Also supports freestanding builds with:
+    - freestanding = true
+    - target = "x86_64-none-elf"
+    - [bin.NAME.linker] script = "linker.ld"
+    - [bin.NAME.asm] files = ["boot.s", "isr.s"]
+    - [bin.NAME.flags] code-model = "kernel", no-red-zone = true,
+      stack-protector = true
+
+    NOTE: this is a lossy view — targets that were skipped or failed to resolve
+    are simply absent. Use plan_binaries() when the difference matters.
+    """
+    return plan_binaries(pkg_dir, config).buildable
+
+
+
+# ---------------------------------------------------------------------------
+# Package tests: which .ritz files `test` runs (moved from build.py, #3632)
+# ---------------------------------------------------------------------------
+
+class StrayTestsDirError(Exception):
+    """A package keeps .ritz files in `tests/`, which discovery never reads.
+
+    Until AGAST #1386, five packages did this (284 [[test]] fns, run by no
+    gate), following an `rz` comment that wrongly said build.py globbed
+    `tests/`. Rather than add a second convention, a stray `tests/*.ritz` is
+    an error that names every file that would otherwise never run.
+    """
+
+    def __init__(self, pkg_dir: Path, files: list[Path]):
+        self.pkg_dir = pkg_dir
+        self.files = files
+        names = "\n".join(f"  {f.relative_to(pkg_dir)}" for f in files)
+        super().__init__(
+            f"{pkg_dir}: {len(files)} .ritz file(s) under tests/ would never "
+            f"run; test discovery reads test/ only. Move them to test/ "
+            f"(git mv) (AGAST #1386):\n{names}")
+
+
+def stray_test_files(pkg_dir: Path) -> list[Path]:
+    """Every .ritz under `pkg_dir/tests/`, sorted; [] when tests/ is absent,
+    holds no .ritz (angelo's fixtures), or is its own package with a
+    ritz.toml (ritzlib's `ritzlib/tests`)."""
+    tests_dir = pkg_dir / "tests"
+    if not tests_dir.is_dir() or (tests_dir / "ritz.toml").exists():
+        return []
+    return sorted(tests_dir.rglob("*.ritz"))
+
+
+def discover_test_files(pkg_dir: Path, config: dict) -> list[Path]:
+    """The package's .ritz test files, sorted: test/*.ritz, plus the root's
+    test_*.ritz for a `test_only` package.
+
+    The single owner of test-file discovery. `run_tests` (serial) and the
+    `--unit-plan` entry point that `rz test --all -j N` schedules from both
+    call this, so the parallel sweep cannot cover a different file set from
+    the serial one (AGAST #1809).
+    """
+    stray = stray_test_files(pkg_dir)
+    if stray:
+        raise StrayTestsDirError(pkg_dir, stray)
+    ritz_tests = []
+    test_dir = pkg_dir / "test"
+    if test_dir.exists():
+        ritz_tests.extend(test_dir.glob("*.ritz"))
+    if config.get("build", {}).get("test_only", False):
+        ritz_tests.extend(pkg_dir.glob("test_*.ritz"))
+    ritz_tests.extend(_declared_test_source_files(pkg_dir, config))
+    return sorted(set(ritz_tests))  # Dedupe and sort
+
+
+def _declared_test_source_files(pkg_dir: Path, config: dict) -> list[Path]:
+    """Files under src/ and `[test] sources` dirs that define a `[[test]]` fn.
+
+    For packages that keep [[test]] fns inside their modules rather than in
+    test/ (angelo, prism). `ritz0 --test` runs only the given file's own
+    [[test]] fns, so each such module is its own test file. Dirs are searched
+    recursively; a module with no `[[test]]` line is not taken, since it
+    would report "ran 0 tests" and fail. Until AGAST #3279 build.py read no
+    key for this and angelo's tests ran under no gate.
+
+    src/ is always searched: a [[test]] fn written there runs (or fails the
+    package), whether or not ritz.toml mentions it. #3279 made it opt-in, so
+    prism's src/text tests still ran nowhere (AGAST #1873).
+
+    Only the `[test]` table adds dirs. ritz.toml has no `[[test]]` array:
+    the two that existed (goliath, spire) were read by nothing and their
+    modules already ran from test/, so AGAST #1837 removed them, and the
+    manifest schema now rejects one.
+    """
+    test_cfg = config.get("test")
+    dirs = ["src"]
+    if isinstance(test_cfg, dict):
+        dirs += test_cfg.get("sources", [])
+    found = []
+    for rel in dict.fromkeys(dirs):
+        d = pkg_dir / rel
+        if not d.is_dir():
+            continue
+        for f in d.rglob("*.ritz"):
+            text = f.read_text(encoding="utf-8", errors="replace")
+            if any(line.strip() == "[[test]]" for line in text.splitlines()):
+                found.append(f)
+    return found
 
 
 # ---------------------------------------------------------------------------

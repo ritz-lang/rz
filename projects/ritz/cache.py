@@ -187,11 +187,11 @@ def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
 def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
     """Fingerprint the compiler; part of every CAS key and import-scan store.
 
-    ``ritz0``: build.py and resolve.py plus every ``.py`` under ``ritz0/``
-    except tests and bytecode caches (the source tree is the artifact).
-    ``ritz1`` / ``ritz1_selfhosted``: build.py and resolve.py plus the binary
-    under ``ritz1/build/``; a
-    missing binary returns the sentinel ``"<compiler>-missing"`` so state
+    ``ritz0``: build.py, resolve.py, build_pipeline.py and manifest.py plus
+    every ``.py`` under ``ritz0/`` except tests and bytecode caches (the
+    source tree is the artifact).
+    ``ritz1`` / ``ritz1_selfhosted``: those four files plus the binary
+    under ``ritz1/build/``; a missing binary returns the sentinel ``"<compiler>-missing"`` so state
     recorded without it is invalidated once it appears.
     """
     h = hashlib.sha256()
@@ -204,12 +204,17 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
     if build_driver.is_file():
         h.update(b"build-driver\x00")
         _hash_file_into(h, build_driver)
-    # resolve.py was part of build.py until AGAST #1835: it decides the
-    # --deps every module is compiled with.
-    resolver = project_root / "resolve.py"
-    if resolver.is_file():
-        h.update(b"build-driver-resolve\x00")
-        _hash_file_into(h, resolver)
+    # These were part of build.py until AGAST #1835 / #3632: resolve.py
+    # decides the --deps every module is compiled with, build_pipeline.py
+    # owns the flags and links, manifest.py what each [[bin]] is built as.
+    # (build_testrun.py and build_cli.py produce no artefact.)
+    for tag, name in ((b"build-driver-resolve", "resolve.py"),
+                      (b"build-driver-pipeline", "build_pipeline.py"),
+                      (b"build-driver-manifest", "manifest.py")):
+        driver = project_root / name
+        if driver.is_file():
+            h.update(tag + b"\x00")
+            _hash_file_into(h, driver)
 
     if compiler == "ritz0":
         ritz0_root = project_root / "ritz0"

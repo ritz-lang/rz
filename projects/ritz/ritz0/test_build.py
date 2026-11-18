@@ -598,18 +598,25 @@ class TestCacheWholesaleInvalidation:
         h2 = compute_compiler_hash(tmp_path, "ritz1")
         assert h1 != h2, "ritz1 binary edit did not change fingerprint"
 
-    @pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
-    def test_build_drivers_resolver_is_fingerprinted(self, tmp_path, compiler):
-        """resolve.py decides the --deps every module is compiled with. It
-        was part of build.py, which is fingerprinted, until AGAST #1835 moved
-        it out; an edit to it must still rebuild."""
+    @pytest.mark.parametrize("compiler,driver", [
+        ("ritz0", "resolve.py"), ("ritz1", "resolve.py"),
+        # AGAST #3632: build.py's flags, links and [[bin]] parsing moved here.
+        ("ritz0", "build_pipeline.py"), ("ritz1", "build_pipeline.py"),
+        ("ritz0", "manifest.py"), ("ritz1", "manifest.py"),
+    ])
+    def test_build_drivers_resolver_is_fingerprinted(self, tmp_path, compiler, driver):
+        """resolve.py decides the --deps every module is compiled with;
+        build_pipeline.py owns the clang flags and the links, manifest.py
+        what each [[bin]] is built as. Each was part of build.py, which is
+        fingerprinted, until AGAST #1835 / #3632 moved it out; an edit to one
+        must still rebuild."""
         from cache import compute_compiler_hash
 
         (tmp_path / "ritz0").mkdir()
         (tmp_path / "ritz0" / "ritz0.py").write_text("# x")
         (tmp_path / "ritz1" / "build").mkdir(parents=True)
         (tmp_path / "ritz1" / "build" / "ritz1").write_bytes(b"binary")
-        resolver = tmp_path / "resolve.py"
+        resolver = tmp_path / driver
         resolver.write_text("# v1")
         h1 = compute_compiler_hash(tmp_path, compiler)
         resolver.write_text("# v2")

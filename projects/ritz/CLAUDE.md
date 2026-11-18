@@ -59,7 +59,12 @@ ritz/
 ├── ritz1/           # Self-hosted compiler (Ritz)
 ├── ritzlib/         # Standard library
 ├── examples/        # Example programs
-├── build.py         # Build system
+├── build.py         # Build system entry point; re-exports the modules below
+├── build_pipeline.py  # compile, link, archive, provenance, build_package
+├── build_testrun.py   # test files, per-file runs, rz's test units
+├── build_cli.py       # cmd_* and main
+├── manifest.py      # ritz.toml schema; [[bin]]/[[lib]]/test planning
+├── bounded_run.py   # every build subprocess's timeout (RITZ_STEP_TIMEOUT, RITZ_CHILD_TIMEOUT)
 └── Makefile
 ```
 
