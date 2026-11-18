@@ -30,6 +30,8 @@ import diag
 import sema
 import sema_type
 import ritzlib.memory
+import ritzlib.hashmap
+import ritzlib.str
 
 # What an expression is, as far as this rule cares.
 const BK_UNSURE: i32 = 0
@@ -202,9 +204,14 @@ pub fn sbk_element(sm: *Sema, name: *u8, len: i32) -> i32
             return bk_of_type(through, null, 0)
         if v.elem_bk != BK_NONE
             return v.elem_bk
-        return BK_UNSURE
+        return sbk_of_ty(sbk_named_pointee(v.kind, v.pointee, v.type_name, v.type_name_len), null, 0)
     let g: *GlobalVarDef = sbk_global(sm, name, len)
     if g == null
+        # AGAST #3768: `K[i]` of `const K: [N]T`, a scalar T.  A struct T
+        # stays unsure: the emitter's get_expr_type calls it an i64.
+        let ce: *ConstEntry = sbk_const(sm, name, len)
+        if ce != null and ce.const_type == TYPE_ARRAY and ce.array_elem_type != TYPE_STRUCT
+            return bk_of_type(ce.array_elem_type, ce.array_elem_type_name, ce.array_elem_type_name_len)
         return BK_UNSURE
     if g.var_type == TYPE_ARRAY
         return bk_of_type(g.array_elem_type, g.type_name, g.type_name_len)
@@ -213,6 +220,17 @@ pub fn sbk_element(sm: *Sema, name: *u8, len: i32) -> i32
     if g.var_type == TYPE_PTR_PTR
         return BK_PTR
     BK_UNSURE
+
+# AGAST #3768: the primitive a `*T` of kind `k` points at when Sema left its
+# pointee untyped and `name` spells it: a `-> *i32` call's return names its
+# pointee "i32" (#1984), as `let p = pi()` binds it.  Else TYPE_UNKNOWN.
+fn sbk_named_pointee(k: i32, pointee: i32, name: *u8, len: i32) -> i32
+    if k != TYPE_PTR or (pointee != TYPE_VOID and pointee != TYPE_UNKNOWN)
+        return TYPE_UNKNOWN
+    let p: i32 = primitive_type_from_name(name, len)
+    if p == 0
+        return TYPE_UNKNOWN
+    p
 
 # The element kind of `v[i]` when `v` indexes through a Vec, Span or String
 # (or one level of pointer to one), else TYPE_VOID: through_named_elem.
@@ -302,7 +320,8 @@ fn sbk_index(sm: *Sema, e: *Expr) -> i32
         if k != BK_UNSURE
             return k
     else if base.kind == EXPR_MEMBER
-        let f: *StructField = sbk_field(sm, base)
+        # AGAST #3768: through what sbk_receiver names, too: `(*p).arr[i]`.
+        let f: *StructField = sbk_member_field(sm, base)
         if f != null
             if f.field_type == TYPE_ARRAY
                 return bk_of_type(f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
@@ -579,6 +598,11 @@ fn sbk_struct_field(sm: *Sema, name: *u8, len: i32, field: *u8, field_len: i32) 
     null
 
 fn sbk_member(sm: *Sema, e: *Expr) -> i32
+    # AGAST #3768: `t.1` of a local bound to a nameless tuple.
+    let tn: *SemaTupleNote = sbk_tuple_of(sm, e.left)
+    let ti: i32 = sbk_tuple_index(tn, e.ident_ptr, e.ident_len)
+    if ti >= 0
+        return tn.bk[ti]
     var f: *StructField = sbk_field(sm, e)
     # `colors.ON`: a const reached through its module.
     if f == null and e.left.kind == EXPR_IDENT and sema_find_local(sm, e.left.ident_ptr, e.left.ident_len) == null
@@ -615,6 +639,24 @@ fn sbk_pointee(sm: *Sema, e: *Expr) -> i32
             if af != null and af.field_type == TYPE_ARRAY and af.array_elem_type == TYPE_PTR
                 return af.array_elem_pointee
         return TYPE_UNKNOWN
+    # AGAST #3768: `*f()` / `*x.m()` of a `-> *T` / `-> @T` with T a scalar
+    # (inline_ptr_pointee): `m[k]` is `*m.index(k)` through `impl Index`.
+    if k == EXPR_CALL or k == EXPR_METHOD
+        var fd: *FnDef = null
+        if k == EXPR_METHOD
+            fd = sbk_method_def(sm, e)
+        else if e.func_name_len > 0 and sema_find_local(sm, e.func_name, e.func_name_len) == null
+            fd = sema_call_fn(sm, e)
+        if fd == null
+            return TYPE_UNKNOWN
+        if fd.return_type == TYPE_PTR
+            let rp: i32 = primitive_type_from_name(fd.return_type_name, fd.return_type_name_len)
+            if rp != 0
+                return rp
+        let rr: i32 = ret_ref_scalar_pointee(fd)
+        if rr != TYPE_VOID
+            return rr
+        return TYPE_UNKNOWN
     if k == EXPR_CAST
         if e.op == TYPE_PTR_PTR
             return TYPE_PTR
@@ -643,23 +685,28 @@ fn sbk_pointee(sm: *Sema, e: *Expr) -> i32
         let tk: i32 = sema_expr_ty(sm, e, @t)
         if tk == TYPE_PTR_PTR
             return TYPE_PTR
+        let np: i32 = sbk_named_pointee(tk, t.pointee, t.name, t.name_len)
+        if np != TYPE_UNKNOWN
+            return np
         if tk == TYPE_PTR or tk == TYPE_REF or tk == TYPE_MUT_REF
             return t.pointee
     TYPE_UNKNOWN
 
-# How many pointer levels `x` has, counted only from 2 up (ptr_levels_of): a
-# `**T` / `***T` local, global or field, through `+ n` and `*`.  0 otherwise.
-fn sbk_ptr_levels(sm: *Sema, x: *Expr) -> i32
+# How many pointer levels `x` has (ptr_levels_of): a `**T` / `***T` local,
+# global or field, through `+ n` and `*`, down to 1 under a `*` (`*pp`, which
+# `*` reads a T from; AGAST #3768).  0 otherwise.  `*out_slot` is the root's
+# inner-pointee slot, whose innermost pointee is that T.
+fn sbk_ptr_depth(sm: *Sema, x: *Expr, out_slot: *i32) -> i32
     if x == null
         return 0
     if x.kind == EXPR_BINARY
         if x.op == OP_ADD or x.op == OP_SUB
-            return sbk_ptr_levels(sm, x.left)
+            return sbk_ptr_depth(sm, x.left, out_slot)
         return 0
     if x.kind == EXPR_UNARY
         if x.op != OP_DEREF
             return 0
-        let sub: i32 = sbk_ptr_levels(sm, x.operand)
+        let sub: i32 = sbk_ptr_depth(sm, x.operand, out_slot)
         if sub < 2
             return 0
         return sub - 1
@@ -685,6 +732,7 @@ fn sbk_ptr_levels(sm: *Sema, x: *Expr) -> i32
     let levels: i32 = ptr_ptr_slot_levels(slot)
     if levels < 2
         return 0
+    *out_slot = slot
     levels
 
 # `*e`: its pointee's kind.  A pointee Sema can't type is unsure: the emitter's
@@ -697,9 +745,13 @@ fn sbk_deref(sm: *Sema, e: *Expr) -> i32
         let v: *SemaVar = sema_find_local(sm, o.ident_ptr, o.ident_len)
         if v != null and v.kind == TYPE_UNKNOWN and (v.bk == BK_BOOL or v.bk == BK_INT)
             return v.bk
-    # `*p` of a `**T` (or deeper) is a pointer.
-    if sbk_ptr_levels(sm, o) >= 2
+    # `*p` of a `**T` (or deeper) is a pointer; `*(*pp + k)` its T.
+    var slot: i32 = TYPE_VOID
+    let depth: i32 = sbk_ptr_depth(sm, o, @slot)
+    if depth >= 2
         return BK_PTR
+    if depth == 1 and ptr_ptr_slot_inner(slot) != TYPE_STRUCT
+        return sbk_of_ty(ptr_ptr_slot_inner(slot), null, 0)
     # `*r` of `let r = @x`, whose pointee Sema leaves untyped.
     if o.kind == EXPR_IDENT
         let rv: *SemaVar = sema_find_local(sm, o.ident_ptr, o.ident_len)
@@ -720,6 +772,12 @@ fn sbk_deref(sm: *Sema, e: *Expr) -> i32
     if pt == TYPE_PTR or pt == TYPE_PTR_PTR or pt == TYPE_REF or pt == TYPE_MUT_REF
         return BK_PTR
     if pt == TYPE_UNKNOWN or pt == TYPE_VOID
+        # AGAST #3768: `*@a[i]` reads what `a[i]` is, a scalar (not a struct,
+        # which the emitter's get_expr_type calls an i64).
+        if o.kind == EXPR_UNARY and (o.op == OP_ADDR or o.op == OP_ADDR_MUT)
+            let ik: i32 = sema_bool_kind(sm, o.operand)
+            if ik == BK_INT or ik == BK_BOOL or ik == BK_FLOAT or ik == BK_PTR
+                return ik
         return BK_UNSURE
     BK_INT
 
@@ -829,6 +887,8 @@ pub fn bool_note_decl(sm: *Sema, st: *Stmt)
                 v.elem_bk = sema_bool_kind(sm, init.args)
             else if init.kind == EXPR_ARRAY_FILL
                 v.elem_bk = sema_bool_kind(sm, init.left)
+            # AGAST #3768: `let t = (a, b)`: its elements, for `t.1` / `let (x, y) = t`.
+            v.bk_tuple = sbk_tuple_of(sm, init)
             sm.scope_top = sm.scope_top + 1
             if rname != null and rlen > 0
                 v.type_name = rname
@@ -890,40 +950,144 @@ pub fn bool_note_param(sm: *Sema, p: *Param)
         v.elem_bk = BK_PTR
 
 # The two bindings of `let (a, b) = init` sema_walk just bound: the elements
-# of a tuple literal (an if / match init's first arm's), else the fields of
-# the struct it destructures.
+# of the nameless tuple it destructures (sbk_tuple_of), else the fields of the
+# struct it does.
 pub fn bool_note_tuple(sm: *Sema, st: *Stmt)
     if sm.scope_top < 2 or st.var_init == null
         return
-    var lit: *Expr = st.var_init
-    if lit.kind == EXPR_IF or lit.kind == EXPR_MATCH
-        var arm: *MatchArm = lit.args as *MatchArm
-        while arm != null and (arm.is_pass == 1 or arm.body == null)
-            arm = arm.next
-        lit = null
-        if arm != null
-            lit = arm.body
     sm.scope_top = sm.scope_top - 2
+    let note: *SemaTupleNote = sbk_tuple_of(sm, st.var_init)
     var k0: i32 = BK_UNSURE
     var k1: i32 = BK_UNSURE
-    if lit != null and lit.kind == EXPR_STRUCT_LIT and lit.ident_len == 0
-        let fi: *FieldInit = lit.args as *FieldInit
-        if fi != null and fi.next != null
-            k0 = sema_bool_kind(sm, fi.value)
-            k1 = sema_bool_kind(sm, fi.next.value)
-    else if lit != null
-        var name: *u8 = null
-        var len: i32 = 0
-        sbk_receiver(sm, lit, @name, @len)
-        let ts: *StructDef = sema_find_struct(sm, name, len)
-        if ts != null and ts.fields != null and ts.fields.next != null
-            k0 = bk_of_type(ts.fields.field_type, ts.fields.field_type_name, ts.fields.field_type_name_len)
-            k1 = bk_of_type(ts.fields.next.field_type, ts.fields.next.field_type_name, ts.fields.next.field_type_name_len)
+    if note != null
+        if note.n >= 2
+            k0 = note.bk[0]
+            k1 = note.bk[1]
+    else
+        var lit: *Expr = st.var_init
+        if lit.kind == EXPR_IF or lit.kind == EXPR_MATCH
+            var arm: *MatchArm = lit.args as *MatchArm
+            while arm != null and (arm.is_pass == 1 or arm.body == null)
+                arm = arm.next
+            lit = null
+            if arm != null
+                lit = arm.body
+        if lit != null and (lit.kind != EXPR_STRUCT_LIT or lit.ident_len != 0)
+            var name: *u8 = null
+            var len: i32 = 0
+            sbk_receiver(sm, lit, @name, @len)
+            let ts: *StructDef = sema_find_struct(sm, name, len)
+            if ts != null and ts.fields != null and ts.fields.next != null
+                k0 = bk_of_type(ts.fields.field_type, ts.fields.field_type_name, ts.fields.field_type_name_len)
+                k1 = bk_of_type(ts.fields.next.field_type, ts.fields.next.field_type_name, ts.fields.next.field_type_name_len)
     sm.scope_top = sm.scope_top + 2
     let a: *SemaVar = @sm.scope[sm.scope_top - 2]
     a.bk = k0
     let b: *SemaVar = @sm.scope[sm.scope_top - 1]
     b.bk = k1
+    if note != null and note.n >= 2
+        sbk_tuple_bind(a, note, 0)
+        sbk_tuple_bind(b, note, 1)
+
+# --- Nameless tuples (AGAST #3768) ---------------------------------------------
+#
+# Sema binds `let t = (a, b)` and `let (x, y) = t` untyped: the emitter names
+# the tuple's struct at emit time (tuple_lit_name).  bool_check notes each
+# nameless tuple literal's elements when the walk reaches it, in its own scope
+# (an `if` arm's `let q = 3` then `(q, 1)` sees its q), and the locals bound to
+# one carry the note (SemaVar.bk_tuple).
+
+var g_sbk_tuples_on: i32 = 0
+var g_sbk_tuples: HashMapI64       # a nameless tuple literal -> its *SemaTupleNote
+
+fn sbk_is_tuple_lit(e: *Expr) -> i32
+    if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
+        return 0
+    let fi: *FieldInit = e.args as *FieldInit
+    (fi != null and fi.name_len == 1 and *fi.name == '0') as i32
+
+# The note on nameless tuple literal `e`, its elements judged in the scope now.
+fn sbk_tuple_lit(sm: *Sema, e: *Expr) -> *SemaTupleNote
+    var n: i32 = 0
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null and n < SEMA_TUPLE_MAX
+        n += 1
+        fi = fi.next
+    let note: *SemaTupleNote = malloc(sizeof(SemaTupleNote)) as *SemaTupleNote
+    note.n = n
+    var i: i32 = 0
+    fi = e.args as *FieldInit
+    while i < n
+        note.bk[i] = sema_bool_kind(sm, fi.value)
+        var name: *u8 = null
+        var len: i32 = 0
+        sbk_receiver(sm, fi.value, @name, @len)
+        note.name[i] = name
+        note.name_len[i] = len
+        note.sub[i] = sbk_tuple_of(sm, fi.value)
+        i += 1
+        fi = fi.next
+    note
+
+# bool_check_struct_lit, on a nameless tuple literal: note it in its scope.
+fn sbk_note_tuple_lit(sm: *Sema, e: *Expr)
+    if sbk_is_tuple_lit(e) == 0
+        return
+    if g_sbk_tuples_on == 0
+        g_sbk_tuples = hashmap_i64_with_cap(1024)
+        g_sbk_tuples_on = 1
+    let note: *SemaTupleNote = sbk_tuple_lit(sm, e)
+    if note != null
+        hashmap_i64_insert(@&g_sbk_tuples, e as i64, note as i64)
+
+# The note on the nameless tuple `e` is: a literal, a local bound to one, an
+# element of one (`t.0`), or an `if` / `match` whose arms are (its first
+# arm's, as sbk_arms).  Null for anything else.
+fn sbk_tuple_of(sm: *Sema, e: *Expr) -> *SemaTupleNote
+    if e == null
+        return null
+    if sbk_is_tuple_lit(e) == 1
+        if g_sbk_tuples_on == 1 and hashmap_i64_contains(@g_sbk_tuples, e as i64)
+            return hashmap_i64_get(@g_sbk_tuples, e as i64) as *SemaTupleNote
+        return sbk_tuple_lit(sm, e)
+    if e.kind == EXPR_IDENT
+        let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+        if v == null
+            return null
+        return v.bk_tuple
+    if e.kind == EXPR_MEMBER
+        let tn: *SemaTupleNote = sbk_tuple_of(sm, e.left)
+        let ti: i32 = sbk_tuple_index(tn, e.ident_ptr, e.ident_len)
+        if ti < 0
+            return null
+        return tn.sub[ti]
+    if e.kind != EXPR_IF and e.kind != EXPR_MATCH
+        return null
+    var arm: *MatchArm = e.args as *MatchArm
+    while arm != null
+        if arm.is_pass == 0 and arm.body != null
+            let an: *SemaTupleNote = sbk_tuple_of(sm, arm.body)
+            if an != null
+                return an
+        arm = arm.next
+    null
+
+# Element `name` ("0", "1", ..) of `tn`, or -1.
+fn sbk_tuple_index(tn: *SemaTupleNote, name: *u8, len: i32) -> i32
+    if tn == null or len != 1
+        return 0 - 1
+    let i: i32 = *name as i32 - 48
+    if i < 0 or i >= tn.n
+        return 0 - 1
+    i
+
+# Binding `v` of a destructure takes element `i` of `tn`: the struct it names
+# (Sema binds it untyped) and its own note.
+fn sbk_tuple_bind(v: *SemaVar, tn: *SemaTupleNote, i: i32)
+    v.bk_tuple = tn.sub[i]
+    if v.kind == TYPE_UNKNOWN and tn.name[i] != null and tn.name_len[i] > 0
+        v.type_name = tn.name[i]
+        v.type_name_len = tn.name_len[i]
 
 # A `for` variable: an integer over a range, an element over `for x in a`.
 pub fn bool_note_for(sm: *Sema, st: *Stmt)
@@ -1299,6 +1463,7 @@ pub fn bool_check_method(sm: *Sema, e: *Expr)
 
 # `S { f: v, .. }`: each value lands in its field.
 pub fn bool_check_struct_lit(sm: *Sema, e: *Expr)
+    sbk_note_tuple_lit(sm, e)
     let st: *StructDef = sema_find_struct(sm, e.ident_ptr, e.ident_len)
     if st == null
         return

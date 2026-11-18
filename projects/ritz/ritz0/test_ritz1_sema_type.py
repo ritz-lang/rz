@@ -177,12 +177,15 @@ def test_sema_types_each_shape(request, tmp_path, compiler, monkeypatch):
 # that answered unknown everywhere would compare none and disagree with nothing.
 CORPUS_FLOOR = 15000
 
-# Ceiling on bk-gaps over the corpus: 154 at #3502.  Most are a `*p` or `a[i]`
-# Sema can't type, which it leaves unsure where the emitter's get_expr_type
-# guesses i64 (a guess that refused good programs when Sema copied it); the
-# rest a nameless tuple's `let (a, b)`, a field through a generic Deref, ...
-# #3768 closes them: lower it as they go.
-BK_GAP_CEILING = 154
+# Ceiling on bk-gaps over the corpus: 154 at #3502, 42 at #3768 (which typed
+# const array elements, `-> *T` / `-> @T` pointees, `**T` chains, `*@a[i]`,
+# array fields through `*p` and nameless tuples; test_ritz1_sema_bk_gap.py).
+# What's left: a field through a generic Deref (16, #3810's receiver typing),
+# an index through a Vec / Span / StrView field, call or payload (#3510's),
+# `(*(@x)).f` where the emitter is the unsure side, and `K[i]` of a const
+# array of structs, which the emitter's get_expr_type guesses is an i64 (a
+# guess that refused good programs when Sema copied it).  Lower it as they go.
+BK_GAP_CEILING = 42
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
