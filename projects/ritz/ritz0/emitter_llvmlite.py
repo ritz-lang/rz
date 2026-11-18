@@ -15570,6 +15570,13 @@ class LLVMEmitter:
         # Emit the match expression
         match_val = self._emit_expr(expr.expr)
 
+        # A StrView compares with string literal arms (§8.2, AGAST #1876);
+        # nothing else takes one.
+        strview_ty = self.struct_types.get('StrView')
+        if strview_ty is not None and match_val.type == strview_ty:
+            return self._emit_strview_match(expr, match_val)
+        self._refuse_string_arms(expr)
+
         # Check if matching on an enum type. `match @place` (angelo's
         # `match @self.cmap`) matches the enum the borrow addresses:
         # _emit_enum_match loads through a pointer-to-enum. Since #2124 `@x`
@@ -16549,21 +16556,114 @@ class LLVMEmitter:
             self.builder.position_at_end(default_block)
             self.builder.unreachable()
 
+        def binds(pattern):
+            return (isinstance(pattern, rast.IdentPattern)
+                    and pattern.name not in self.constants)
+
+        return self._emit_scalar_arm_bodies(expr, match_val, arm_blocks, merge_block,
+                                            binds, self._infer_ritz_type(expr.expr))
+
+    STRING_PATTERN_NEEDS_STRVIEW = "a string pattern needs a StrView scrutinee"
+
+    def _refuse_string_arms(self, expr: rast.Match) -> None:
+        """A `"..."` arm compares a StrView, so on anything else it is an error
+        at the arm (AGAST #1876). A `*u8` or `String` scrutinee converts first:
+        `strview_from_cstr(p)`, `string_as_view(@s)`."""
+        for arm in expr.arms:
+            pattern = arm.pattern
+            if isinstance(pattern, rast.LitPattern) and isinstance(pattern.value, str):
+                raise EmitError(self.STRING_PATTERN_NEEDS_STRVIEW,
+                                pattern.span or arm.span)
+
+    def _emit_strview_match(self, expr: rast.Match, match_val: ir.Value) -> ir.Value:
+        """Emit a match on a StrView with string literal arms (§8.2, AGAST #1876).
+
+        match name
+            "html" => 1
+            _ => 0
+
+        Each literal arm tests the length, then (only if that is equal, so no
+        byte past the end is read) every byte; the arms are tried in order and
+        the first catch-all ends the chain. Like an integer, a StrView needs a
+        catch-all, and a name never compares here: an integer const tests only
+        an integer, so every name binds the StrView. ritz1's twin is
+        emit_str_pattern_test in emitter_match.ritz.
+        """
+        for arm in expr.arms:
+            pattern = arm.pattern
+            if isinstance(pattern, rast.LitPattern) and not isinstance(pattern.value, str):
+                message = self._PATTERN_NEEDS[rast.LitPattern]
+                if isinstance(pattern.value, bool):
+                    message = "a `true` or `false` pattern needs a bool scrutinee"
+                raise EmitError(message, pattern.span or arm.span)
+        self._resolve_module_consts(expr)
+        self._refuse_pattern_kind(expr, rast.VariantPattern)
+        self._refuse_arm_names(expr, lambda name: False)
+        self._require_covered(expr, match_coverage.scalar_gap(expr.arms, ()))
+        self._require_reachable(expr, lambda arms: match_coverage.scalar_gap(arms, ()),
+                                match_coverage.scalar_test({}))
+
+        arm_blocks = [self.current_fn.append_basic_block(f"match.arm.{i}")
+                      for i in range(len(expr.arms))]
+        merge_block = self.current_fn.append_basic_block("match.merge")
+        ptr = self.builder.extract_value(match_val, 0)
+        length = self.builder.extract_value(match_val, 1)
+        for i, arm in enumerate(expr.arms):
+            pattern = arm.pattern
+            if not isinstance(pattern, rast.LitPattern):
+                # A catch-all; reachability refused any arm after it.
+                self.builder.branch(arm_blocks[i])
+                break
+            data = pattern.value.encode('utf-8')
+            nxt = self.current_fn.append_basic_block(f"match.next.{i}")
+            same_len = self.builder.icmp_signed(
+                '==', length, ir.Constant(length.type, len(data)))
+            if not data:
+                self.builder.cbranch(same_len, arm_blocks[i], nxt)
+            else:
+                cmp_block = self.current_fn.append_basic_block(f"match.bytes.{i}")
+                self.builder.cbranch(same_len, cmp_block, nxt)
+                self.builder.position_at_end(cmp_block)
+                equal = None
+                for k, byte in enumerate(data):
+                    at = self.builder.gep(ptr, [ir.Constant(self.i64, k)])
+                    hit = self.builder.icmp_unsigned(
+                        '==', self.builder.load(at), ir.Constant(self.i8, byte))
+                    equal = hit if equal is None else self.builder.and_(equal, hit)
+                self.builder.cbranch(equal, arm_blocks[i], nxt)
+            self.builder.position_at_end(nxt)
+        else:
+            # Coverage demands a catch-all, so this is never reached.
+            self.builder.unreachable()
+
+        def binds(pattern):
+            return isinstance(pattern, rast.IdentPattern)
+
+        return self._emit_scalar_arm_bodies(expr, match_val, arm_blocks, merge_block,
+                                            binds, rast.NamedType(None, 'StrView', []))
+
+    def _emit_scalar_arm_bodies(self, expr: rast.Match, match_val: ir.Value,
+                                arm_blocks: list, merge_block, binds,
+                                scrut_ritz) -> ir.Value:
+        """Emit the arm bodies of an integer or StrView match and merge them.
+
+        The caller has branched to `arm_blocks[i]` when arm i is taken.
+        `binds(pattern)` says whether the arm binds the scrutinee to its
+        name, which then has Ritz type `scrut_ritz`.
+        """
         # Emit each arm body
         arm_values = []
         arm_exit_blocks = []
-        scrut_ritz = self._infer_ritz_type(expr.expr)
 
         for i, (arm, arm_block) in enumerate(zip(expr.arms, arm_blocks)):
             self.builder.position_at_end(arm_block)
             pattern = arm.pattern
 
             # Bind identifier pattern to the match value
-            binds = (isinstance(pattern, rast.IdentPattern)
-                     and pattern.name not in self.constants)
-            if binds:
+            arm_binds = binds(pattern)
+            if arm_binds:
                 # Bind the match value to the pattern name for use in the arm body
-                self.params[pattern.name] = (match_val, int_type)
+                self.params[pattern.name] = (match_val, match_val.type)
                 # The binding has the scrutinee's Ritz type, so a u32 `n`
                 # reads unsigned in the arm (AGAST #3344). No outer name can
                 # share it: a local can't rebind one, nor take a global's.
@@ -16593,7 +16693,7 @@ class LLVMEmitter:
                 arm_exit_blocks.append(None)
 
             # Clean up bound pattern variable
-            if binds:
+            if arm_binds:
                 del self.params[pattern.name]
                 self.ritz_types.pop(pattern.name, None)
 

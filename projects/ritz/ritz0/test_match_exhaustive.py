@@ -503,11 +503,7 @@ NOT_AN_INTEGER = {
     "integer_on_an_option": (_OPT + "fn f(o: Option<i64>) -> i64\n    match o\n        5 => 1\n"
                              "        _ => 2\n" + _MAIN, 4, 9),
 }
-# ritz1 parses no string pattern.
-NOT_AN_INTEGER_RITZ0_ONLY = {
-    "string_on_an_enum": (_C + "fn f(c: C) -> i64\n    match c\n        \"hi\" => 1\n"
-                          "        _ => 2\n" + _MAIN, 7, 9),
-}
+# A string arm on an enum: test_match_strview.py (AGAST #1876).
 _LITERAL_NEEDS_INTEGER = "a literal pattern needs an integer scrutinee"
 
 # An imported const's bare name in an arm compares; it is not a fresh binding
@@ -676,14 +672,6 @@ def test_a_literal_pattern_needs_an_integer_scrutinee(request, tmp_path, compile
     source, line, col = NOT_AN_INTEGER[name]
     proc, ll = _compile(request, compiler, tmp_path, source, {})
     _assert_error(proc, ll, compiler, name, line, col, _LITERAL_NEEDS_INTEGER)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(NOT_AN_INTEGER_RITZ0_ONLY))
-def test_ritz0_only_literal_patterns_need_an_integer_scrutinee(request, tmp_path, name):
-    source, line, col = NOT_AN_INTEGER_RITZ0_ONLY[name]
-    proc, ll = _compile(request, "ritz0", tmp_path, source, {})
-    _assert_error(proc, ll, "ritz0", name, line, col, _LITERAL_NEEDS_INTEGER)
 
 
 @pytest.mark.integration

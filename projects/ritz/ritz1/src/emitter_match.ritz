@@ -851,7 +851,19 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     # scrutinee, as in ritz0 (LANGUAGE_SPEC §8.2).  Not a const (that arm
     # compares) and not `None` (the tagged-enum null test above).
     if arm.pattern_kind == PAT_IDENT and (enum_name == null or enum_name_len == 0)
-        if find_const_entry(s, arm.pattern_name, arm.pattern_name_len) == null and is_ident_none_name(arm.pattern_name, arm.pattern_name_len) == 0
+        if s.match_scrut_str == 1
+            # AGAST #1876: a name over a StrView binds the StrView.
+            let str_reg: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, str_reg)
+            emit_str(s, c" = alloca %StrView  ; match binding\n")
+            emit_str(s, c"  store %StrView ")
+            emit_reg(s, scrut_reg)
+            emit_str(s, c", ptr ")
+            emit_reg(s, str_reg)
+            emit_str(s, c"\n")
+            add_local_struct(s, arm.pattern_name, arm.pattern_name_len, str_reg, TYPE_STRUCT, c"StrView", 7)
+        else if find_const_entry(s, arm.pattern_name, arm.pattern_name_len) == null and is_ident_none_name(arm.pattern_name, arm.pattern_name_len) == 0
             let bind_reg: i32 = next_reg(s)
             emit_str(s, c"  ")
             emit_reg(s, bind_reg)
@@ -1014,6 +1026,80 @@ fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
 
 # Emit one arm's condition + body.  `scrut_slot` is an alloca holding the
 # scrutinee struct (when enum_name is non-null), or 0 for scalar scrutinees.
+# AGAST #1876: does the StrView in `scrut_reg` equal a PAT_STR arm's bytes?
+# The length first: unequal, it branches to `miss` (the next arm); equal, a
+# block compares every byte, none past the end, and its i1 is returned for
+# emit_match_arm's branch.  ritz0's twin is _emit_strview_match.
+fn emit_str_pattern_test(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, miss: i32) -> i32
+    let len_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, len_reg)
+    emit_str(s, c" = extractvalue %StrView ")
+    emit_reg(s, scrut_reg)
+    emit_str(s, c", 1\n")
+    let same_len: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, same_len)
+    emit_str(s, c" = icmp eq i64 ")
+    emit_reg(s, len_reg)
+    emit_str(s, c", ")
+    emit_int(s, arm.pattern_name_len as i64)
+    emit_str(s, c"\n")
+    if arm.pattern_name_len == 0
+        return same_len
+    let bytes_label: i32 = next_label(s)
+    emit_str(s, c"  br i1 ")
+    emit_reg(s, same_len)
+    emit_str(s, c", label %")
+    emit_label(s, bytes_label)
+    emit_str(s, c", label %")
+    emit_label(s, miss)
+    emit_str(s, c"\n")
+    begin_block(s, bytes_label)
+    let ptr_reg: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, ptr_reg)
+    emit_str(s, c" = extractvalue %StrView ")
+    emit_reg(s, scrut_reg)
+    emit_str(s, c", 0\n")
+    var acc: i32 = 0
+    for k in 0..arm.pattern_name_len
+        let at_reg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, at_reg)
+        emit_str(s, c" = getelementptr i8, ptr ")
+        emit_reg(s, ptr_reg)
+        emit_str(s, c", i64 ")
+        emit_int(s, k as i64)
+        emit_str(s, c"\n")
+        let byte_reg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, byte_reg)
+        emit_str(s, c" = load i8, ptr ")
+        emit_reg(s, at_reg)
+        emit_str(s, c"\n")
+        let hit: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, hit)
+        emit_str(s, c" = icmp eq i8 ")
+        emit_reg(s, byte_reg)
+        emit_str(s, c", ")
+        emit_int(s, *(arm.pattern_name + k) as i64)
+        emit_str(s, c"\n")
+        if acc == 0
+            acc = hit
+        else
+            let both: i32 = next_reg(s)
+            emit_str(s, c"  ")
+            emit_reg(s, both)
+            emit_str(s, c" = and i1 ")
+            emit_reg(s, acc)
+            emit_str(s, c", ")
+            emit_reg(s, hit)
+            emit_str(s, c"\n")
+            acc = both
+    acc
+
 fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: *u8, enum_name_len: i32, result: *MatchResult, arm_index: i32, end_label: i32)
     let body_label: i32 = next_label(s)
     let next_label_id: i32 = next_label(s)
@@ -1031,6 +1117,8 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
         emit_str(s, c", ")
         emit_int(s, arm.pattern_int)
         emit_str(s, c"\n")
+    else if arm.pattern_kind == PAT_STR
+        cond_reg = emit_str_pattern_test(s, arm, scrut_reg, next_label_id)
     else if arm.pattern_kind == PAT_WILDCARD
         always_true = 1
     else if arm.pattern_kind == PAT_IDENT
@@ -1374,6 +1462,16 @@ fn match_scrutinee_is_scalar(s: *EmitterState, scr: *Expr) -> i32
         let fld: *StructField = resolve_member_chain_field(s, scr)
         return (fld != null and fld.field_type != TYPE_STRUCT) as i32
     0
+
+# AGAST #1876: 1 when `scr` is a StrView, the one scrutinee a string arm
+# compares.  A `*u8` or a String is converted by the caller (§8.2).
+fn match_scrutinee_is_strview(s: *EmitterState, scr: *Expr) -> i32
+    if scr.kind == EXPR_STRING_LIT
+        return 1
+    var name: *u8 = null
+    var len: i32 = 0
+    match_scrutinee_type(s, scr, @name, @len)
+    (name != null and name_eq(name, len, c"StrView", 7) == 1) as i32
 
 fn enum_declares_variant(ei: i32, name: *u8, len: i32) -> i32
     for vi in 0..enum_variant_count(ei)
@@ -1799,6 +1897,8 @@ fn match_arm_is_catch_all(s: *EmitterState, arm: *MatchArm) -> i32
         return 1
     if arm.pattern_kind != PAT_IDENT
         return 0
+    if s.match_scrut_str == 1   # an integer const tests only an integer (#1876)
+        return 1
     let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
     if ce != null and is_int_const_type(ce.const_type) == 1
         return 0
@@ -1915,6 +2015,10 @@ fn match_arm_name_tests(s: *EmitterState, arm: *MatchArm, ei: i32, builtin: i32)
         return (name_eq(arm.pattern_name, arm.pattern_name_len, c"Some", 4) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"None", 4) == 1) as i32
     if builtin == MATCH_RESULT
         return (name_eq(arm.pattern_name, arm.pattern_name_len, c"Ok", 2) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"Err", 3) == 1) as i32
+    # On a StrView no name tests (AGAST #1876): an integer const compares only
+    # an integer, so there it binds, and binder_report refuses it.
+    if s.match_scrut_str == 1
+        return 0
     # An integer const, which is_int_const_type takes a bool for: ritz0 compares
     # neither a bool const nor a float one.
     let ce: *ConstEntry = find_const_entry(s, arm.pattern_name, arm.pattern_name_len)
@@ -2059,6 +2163,8 @@ fn match_arms_test_same(s: *EmitterState, a: *MatchArm, b: *MatchArm, ei: i32, b
         return name_eq(a.pattern_name, a.pattern_name_len, b.pattern_name, b.pattern_name_len)
     if a.pattern_kind == PAT_BOOL or b.pattern_kind == PAT_BOOL
         return (a.pattern_kind == b.pattern_kind and a.pattern_int == b.pattern_int) as i32
+    if a.pattern_kind == PAT_STR or b.pattern_kind == PAT_STR   # AGAST #1876
+        return (a.pattern_kind == b.pattern_kind and name_eq(a.pattern_name, a.pattern_name_len, b.pattern_name, b.pattern_name_len) == 1) as i32
     var va: i64 = 0
     var vb: i64 = 0
     if match_arm_int_value(s, a, @va) == 0 or match_arm_int_value(s, b, @vb) == 0
@@ -2081,6 +2187,18 @@ fn match_arm_int_value(s: *EmitterState, arm: *MatchArm, out: *i64) -> i32
         *out = ce.value
         return 1
     0
+
+# `file:line:col: error: <what>` at `at`, one error counted (AGAST #1876).
+fn match_report_at(s: *EmitterState, at: SrcSpan, what: *u8, ir_note: *u8)
+    eprints_cstr(fn_source_file(emitter_current_fn()))
+    eprint_char(':')
+    eprint_i64(at.line as i64)
+    eprint_char(':')
+    eprint_i64(at.col as i64)
+    eprints_cstr(c": error: ")
+    eprints_cstr(what)
+    emit_str(s, ir_note)
+    s.error_count = s.error_count + 1
 
 fn match_report_unreachable(s: *EmitterState, arm: *MatchArm, cover: *MatchArm)
     eprints_cstr(fn_source_file(emitter_current_fn()))
@@ -2147,10 +2265,12 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     # enum its arms name, `Ok(v)` beside a user `enum E { Ok(i32), Bad }` said
     # E, and the match was "non-exhaustive: missing Bad".
     let named_builtin: bool = name != null and is_tagged_enum_type(name, len) == 1
-    if ei < 0 and not named_builtin
+    # AGAST #1876: a StrView is no enum, whatever its arms name.
+    let is_str: bool = s.match_scrut_str == 1
+    if ei < 0 and not named_builtin and not is_str
         ei = match_arms_enum(s, scrutinee, arms)
     var builtin: i32 = 0
-    if ei < 0
+    if ei < 0 and not is_str
         if name != null and is_tagged_enum_type(name, len) == 1
             builtin = MATCH_RESULT
             if *name == 'O'
@@ -2170,7 +2290,7 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
     # AGAST #2409: on a scalar no enum is in play, so a variant pattern (`Some(v)`,
     # `R(v)`, a qualified `C.G`, which is the one PAT_IDENT with no
     # pattern_span) tests nothing: `R(v)` took every value, as ritz0 dropped it.
-    let scalar: bool = ei < 0 and builtin == 0 and match_scrutinee_is_scalar(s, scrutinee) == 1
+    let scalar: bool = ei < 0 and builtin == 0 and (is_str or match_scrutinee_is_scalar(s, scrutinee) == 1)
     var arm: *MatchArm = arms
     while arm != null
         let qualified: bool = arm.pattern_kind == PAT_IDENT and arm.pattern_span.line == 0
@@ -2192,6 +2312,13 @@ fn match_check_coverage(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, enu
             return
         # AGAST #3002: a literal compares an integer, so on an enum (`5 =>` on a
         # `C` or an Option) it compared the `%C` aggregate to an i64.
+        # AGAST #1876: a string arm compares a StrView, and a StrView only that.
+        if arm.pattern_kind == PAT_STR and not is_str
+            match_report_at(s, arm.head_span, c"a string pattern needs a StrView scrutinee\n", c"  ; ERROR: string pattern on a non-StrView scrutinee\n")
+            return
+        if arm.pattern_kind == PAT_INT_LIT and is_str
+            match_report_at(s, arm.head_span, c"a literal pattern needs an integer scrutinee\n", c"  ; ERROR: literal pattern on a StrView scrutinee\n")
+            return
         if arm.pattern_kind == PAT_INT_LIT and ei >= 0
             eprints_cstr(fn_source_file(emitter_current_fn()))
             eprint_char(':')
@@ -2269,9 +2396,13 @@ pub fn emit_match_into(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span
     # AGAST #3358: ... and the same integer type.
     let outer_int: i32 = s.match_scrut_int
     s.match_scrut_int = narrow_known(narrow_src_type(s, scrutinee))
+    # AGAST #1876: ... and whether string arms compare it.
+    let outer_str: i32 = s.match_scrut_str
+    s.match_scrut_str = match_scrutinee_is_strview(s, scrutinee)
     let result: i32 = emit_match_arms(s, scrutinee, arms, span, into)
     s.match_scrut_kind = outer_kind
     s.match_scrut_int = outer_int
+    s.match_scrut_str = outer_str
     result
 
 fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan, into: *ArrayInto) -> i32

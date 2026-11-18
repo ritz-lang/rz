@@ -3040,7 +3040,7 @@ error naming what is missing. A `match` covers its scrutinee when it has:
 - for an enum, generic enums included, an arm for every variant; or
 - for a `bool`, both `true` and `false`.
 
-An integer or string scrutinee needs a catch-all. A guarded arm never counts
+An integer or `StrView` scrutinee needs a catch-all. A guarded arm never counts
 towards coverage, though no guard parses yet.
 
 ```ritz expect-error="non-exhaustive match: missing a catch-all"
@@ -3179,6 +3179,45 @@ fn main() -> i32
         0 => prints("zero\n")
         1 => prints("one\n")
         _ => prints("many\n")
+    0
+```
+
+A string literal pattern compares a `StrView` scrutinee, byte for byte: the
+lengths are equal and so is every byte (AGAST #1876). Like an integer, a
+`StrView` needs a catch-all, and a repeated literal is an unreachable arm
+(§8.1). A name in an arm always binds the `StrView`, since an integer `const`
+compares only an integer.
+
+```ritz
+enum Tag
+    Html
+    Body
+    Unknown
+
+fn tag_from_name(name: StrView) -> Tag
+    match name
+        "html" => Tag.Html
+        "body" => Tag.Body
+        _ => Tag.Unknown
+
+fn main() -> i32
+    match tag_from_name("body")
+        Tag.Body => 0
+        _ => 1
+```
+
+Only a `StrView` takes a string pattern. A `*u8` or a `String` scrutinee is
+a compile error at the pattern: convert it first, with `strview_from_cstr(p)`
+or `string_as_view(@s)`. A `StrView` takes no integer, `bool` or variant
+pattern.
+
+```ritz expect-error="a string pattern needs a StrView scrutinee"
+fn f(p: *u8) -> i32
+    match p
+        "html" => 1
+        _ => 0
+
+fn main() -> i32
     0
 ```
 
