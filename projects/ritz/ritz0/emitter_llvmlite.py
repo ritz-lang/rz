@@ -95,10 +95,30 @@ class EmitError(Exception):
 
     def __init__(self, message: str, span: Optional[rast.Span] = None):
         self.span = span
+        self.message = message
         if span:
             super().__init__(f"{span.file}:{span.line}:{span.column}: {message}")
         else:
             super().__init__(message)
+
+
+class SourceError(EmitError, ValueError):
+    """A source error found by an emitter helper (AGAST #1390): an unknown
+    struct, field, variant or variable, a builtin's arity, `?` on a non-Result.
+
+    These were 129 bare ValueError raises that reached the user as a
+    Python traceback naming no file. Raised through `Emitter._err`, which
+    locates them at the innermost expression being emitted. Still a
+    ValueError, so a route that only *tries* (an lvalue address before
+    spilling an rvalue, a type lookup that says nothing on failure) falls
+    back exactly as it did before the location was added."""
+
+
+class InternalError(ValueError):
+    """An emitter invariant broke: a layout not computed, an operator the
+    parser cannot produce. A compiler bug, never the user's, so it is *not*
+    an EmitError: it still surfaces as a traceback (AGAST #1390). A
+    ValueError for the same fallback reason as SourceError."""
 
 
 class UnknownFunction(EmitError, ValueError):
@@ -734,7 +754,7 @@ class StructLayout:
         for f in self.fields:
             if f.name == name:
                 return f.index
-        raise ValueError(f"Unknown field '{name}' in struct '{self.name}'")
+        raise InternalError(f"Unknown field '{name}' in struct '{self.name}'")
 
 
 class StructRegistry:
@@ -780,7 +800,7 @@ class StructRegistry:
             return self._layouts[name]
 
         if name not in self._pending:
-            raise ValueError(f"Unknown struct: {name}")
+            raise InternalError(f"Unknown struct: {name}")
 
         fields = self._pending[name]
         field_layouts = []
@@ -834,21 +854,21 @@ class StructRegistry:
         """Get field index by name. Raises if struct/field not found."""
         layout = self._layouts.get(struct_name)
         if layout is None:
-            raise ValueError(f"Struct '{struct_name}' layout not computed")
+            raise InternalError(f"Struct '{struct_name}' layout not computed")
         return layout.get_field_index(field_name)
 
     def get_size(self, struct_name: str) -> int:
         """Get total size of a struct in bytes."""
         layout = self._layouts.get(struct_name)
         if layout is None:
-            raise ValueError(f"Struct '{struct_name}' layout not computed")
+            raise InternalError(f"Struct '{struct_name}' layout not computed")
         return layout.size
 
     def get_alignment(self, struct_name: str) -> int:
         """Get alignment of a struct."""
         layout = self._layouts.get(struct_name)
         if layout is None:
-            raise ValueError(f"Struct '{struct_name}' layout not computed")
+            raise InternalError(f"Struct '{struct_name}' layout not computed")
         return layout.alignment
 
 
@@ -1138,6 +1158,12 @@ class LLVMEmitter:
         # These functions need alignstack(16) attribute to ensure proper stack alignment
         # for SIMD load/store operations (movaps requires 16-byte aligned addresses)
         self.simd_functions: Set[str] = set()
+
+    def _err(self, message: str, span: Optional[rast.Span] = None) -> SourceError:
+        """A source error at `span`, else at the innermost expression or
+        statement being emitted (`_emit_span`, AGAST #3738). `raise
+        self._err(...)` is every emitter user error's shape (AGAST #1390)."""
+        return SourceError(message, span or self._emit_span)
 
     def _struct_layout_on_demand(self, name: str) -> Optional[StructLayout]:
         """Layout of struct `name`, computing it now if it is only declared."""
@@ -1509,7 +1535,7 @@ class LLVMEmitter:
             element_types = [self._ritz_type_to_llvm(elem) for elem in ty.elements]
             return ir.LiteralStructType(element_types)
         else:
-            raise ValueError(f"Unknown type: {ty}")
+            raise InternalError(f"Unknown type: {ty}")
 
     def _ensure_strview_type(self) -> ir.Type:
         """Materialize the built-in `StrView` struct: `{ *u8, i64 }`."""
@@ -2379,7 +2405,7 @@ class LLVMEmitter:
             # declared, never read off its initializer (§4.3).
             raise self._untyped_global_error(var_def)
         else:
-            raise ValueError(f"Module-level var '{var_def.name}' needs type or initializer")
+            raise self._err(f"Module-level var '{var_def.name}' needs type or initializer", var_def.span)
 
         # Create the global variable
         gvar = ir.GlobalVariable(self.module, ty, name=var_def.name)
@@ -2682,7 +2708,8 @@ class LLVMEmitter:
             elem_type = strview_ty
         else:
             if not isinstance(llvm_type, ir.ArrayType):
-                raise ValueError(f"Const array '{name}' must have array type, got {llvm_type}")
+                raise self._err(f"Const array '{name}' must have array type, got {llvm_type}",
+                                value.span)
             elem_type = llvm_type.element
 
         # Extract element values
@@ -2726,7 +2753,7 @@ class LLVMEmitter:
                 fill_val = self._fold_const_array_elem(name, 0, value.value, elem_type)
                 elements = [ir.Constant(elem_type, fill_val)] * value.count
         else:
-            raise ValueError(f"Const array '{name}' must be array literal or fill")
+            raise self._err(f"Const array '{name}' must be array literal or fill", value.span)
 
         # Create the constant array value
         const_array = ir.Constant(llvm_type, elements)
@@ -2760,7 +2787,7 @@ class LLVMEmitter:
             return self._const_str_ptr(expr.value)
         if isinstance(expr, rast.StructLit):
             return self._make_const_struct_value(expr, target_type, name_hint)
-        raise ValueError(f"Unsupported const expression for target {target_type}: {expr}")
+        raise self._err(f"Unsupported const expression for target {target_type}: {expr}", expr.span)
 
     def _const_ptr_table_elem(self, const_name: str, index: int, elem: rast.Expr,
                               elem_type: ir.PointerType) -> ir.Constant:
@@ -2810,14 +2837,14 @@ class LLVMEmitter:
         ritz1's are (`_const_struct_field`).
         """
         if expr.name not in self.struct_fields:
-            raise ValueError(f"Unknown struct in const literal: {expr.name}")
+            raise self._err(f"Unknown struct in const literal: {expr.name}", expr.span)
 
         field_exprs = {fname: fexpr for fname, fexpr in expr.fields}
         field_types = self.struct_fields[expr.name]
         field_constants = []
         for field_name, field_ritz_type in field_types:
             if field_name not in field_exprs:
-                raise ValueError(f"Missing field '{field_name}' in const struct literal {expr.name}")
+                raise self._err(f"Missing field '{field_name}' in const struct literal {expr.name}", expr.span)
             field_llvm_type = self._ritz_type_to_llvm(field_ritz_type)
             field_expr = field_exprs[field_name]
             hint = f"{name_hint}.{field_name}"
@@ -4072,7 +4099,7 @@ class LLVMEmitter:
         or 2 if padding is present (tag at 0, padding at 1, data at 2).
         """
         if enum_name not in self.enum_types:
-            raise ValueError(f"Unknown enum type: {enum_name}")
+            raise self._err(f"Unknown enum type: {enum_name}")
 
         enum_type, variants = self.enum_types[enum_name]
 
@@ -4087,7 +4114,7 @@ class LLVMEmitter:
 
         if not has_data:
             # No data buffer (all unit variants)
-            raise ValueError(f"Enum {enum_name} has no data buffer")
+            raise InternalError(f"Enum {enum_name} has no data buffer")
 
         # If max_align > 1, we need padding after the 1-byte tag
         tag_size = 1
@@ -4099,12 +4126,12 @@ class LLVMEmitter:
     def _get_enum_variant_tag(self, enum_name: str, variant_name: str) -> int:
         """Get the tag value for an enum variant."""
         if enum_name not in self.enum_types:
-            raise ValueError(f"Unknown enum type: {enum_name}")
+            raise self._err(f"Unknown enum type: {enum_name}")
         _, variants = self.enum_types[enum_name]
         for i, variant in enumerate(variants):
             if variant.name == variant_name:
                 return i
-        raise ValueError(f"Unknown variant {variant_name} in enum {enum_name}")
+        raise self._err(f"Unknown variant {variant_name} in enum {enum_name}")
 
     def _has_enum_variant(self, enum_name: str, variant_name: str) -> bool:
         """Is `variant_name` a declared variant of `enum_name`?
@@ -4139,12 +4166,12 @@ class LLVMEmitter:
     def _get_enum_variant(self, enum_name: str, variant_name: str) -> rast.Variant:
         """Get the Variant object for an enum variant."""
         if enum_name not in self.enum_types:
-            raise ValueError(f"Unknown enum type: {enum_name}")
+            raise self._err(f"Unknown enum type: {enum_name}")
         _, variants = self.enum_types[enum_name]
         for variant in variants:
             if variant.name == variant_name:
                 return variant
-        raise ValueError(f"Unknown variant {variant_name} in enum {enum_name}")
+        raise self._err(f"Unknown variant {variant_name} in enum {enum_name}")
 
     def _emit_enum_variant_constructor(self, variant_name: str, args: List[rast.Expr]) -> ir.Value:
         """Emit code to construct an enum variant value.
@@ -4409,7 +4436,7 @@ class LLVMEmitter:
         enum type rather than looking up variant_to_enum.
         """
         if enum_name not in self.enum_types:
-            raise ValueError(f"Unknown enum type: {enum_name}")
+            raise self._err(f"Unknown enum type: {enum_name}")
 
         enum_type, variants = self.enum_types[enum_name]
         tag = self._get_enum_variant_tag(enum_name, variant_name)
@@ -4580,15 +4607,18 @@ class LLVMEmitter:
         # Try struct registry first (preferred - has computed layout)
         layout = self.struct_registry.get_layout(struct_name)
         if layout:
-            return layout.get_field_index(field_name)
+            found = layout.get_field(field_name)
+            if found is None:
+                raise self._err(f"Unknown field '{field_name}' in struct '{struct_name}'")
+            return found.index
 
         # Fallback to legacy struct_fields dict
         if struct_name not in self.struct_fields:
-            raise ValueError(f"Unknown struct: {struct_name}")
+            raise self._err(f"Unknown struct: {struct_name}")
         for i, (name, _) in enumerate(self.struct_fields[struct_name]):
             if name == field_name:
                 return i
-        raise ValueError(f"Unknown field '{field_name}' in struct '{struct_name}'")
+        raise self._err(f"Unknown field '{field_name}' in struct '{struct_name}'")
 
     def _get_struct_name_from_type(self, ty: ir.Type) -> Optional[str]:
         """Get the struct name from an LLVM type."""
@@ -7633,11 +7663,11 @@ class LLVMEmitter:
                 raise EmitError(let_rules.tuple_pattern_on_struct(struct.split('$', 1)[0]),
                                 stmt.paren_span or getattr(stmt, 'span', None))
             if not isinstance(tuple_val.type, ir.BaseStructType):
-                raise ValueError(f"Cannot destructure non-tuple type: {tuple_val.type}")
+                raise self._err(f"Cannot destructure non-tuple type: {tuple_val.type}")
 
             elements = tuple_val.type.elements
             if len(stmt.names) != len(elements):
-                raise ValueError(f"Tuple destructuring mismatch: expected {len(elements)} "
+                raise self._err(f"Tuple destructuring mismatch: expected {len(elements)} "
                                f"elements, got {len(stmt.names)} names")
 
             # AGAST #3192: each name takes its element's Ritz type, as a
@@ -7730,7 +7760,7 @@ class LLVMEmitter:
                     val = self._convert_type(val, ty, stmt.value)
                     self.builder.store(val, gvar)
                 else:
-                    raise ValueError(f"Unknown variable: {name}")
+                    raise self._err(f"Unknown variable: {name}")
             elif isinstance(stmt.target, rast.Index):
                 # Assignment to indexed location: arr[i] = val
                 through = self._index_through(stmt.target)
@@ -7852,7 +7882,7 @@ class LLVMEmitter:
                     if isinstance(ty, rast.NamedType) and ty.name in index_rules.SCALARS:
                         raise EmitError(index_rules.needs_index(ty.name),
                                         stmt.target.bracket or stmt.target.span)
-                    raise ValueError(f"Cannot index type: {base.type}")
+                    raise self._err(f"Cannot index type: {base.type}")
             elif isinstance(stmt.target, rast.UnaryOp) and stmt.target.op == '*':
                 # Assignment to dereferenced pointer: *ptr = val
                 # AGAST #2972: on a `h:& T` borrow of a non-pointer T, `h`
@@ -7909,7 +7939,7 @@ class LLVMEmitter:
                     # Value-type struct - need to get address from lvalue
                     struct_ptr = self._emit_lvalue_addr(stmt.target.expr)
                 else:
-                    raise ValueError(f"Invalid type for field assignment: {struct_val.type}")
+                    raise self._err(f"Invalid type for field assignment: {struct_val.type}")
                 # The place is addressed: now `v` (LARB R61, AGAST #1740).
                 val = emit_val()
                 pointee_type = struct_ptr.type.pointee
@@ -7918,7 +7948,7 @@ class LLVMEmitter:
                 elif isinstance(pointee_type, ir.BaseStructType):
                     struct_name = self._get_struct_name_from_type(pointee_type)
                     if not struct_name:
-                        raise ValueError("Cannot determine struct type for field assignment")
+                        raise self._err("Cannot determine struct type for field assignment")
                     idx = self._get_struct_field_index(struct_name, stmt.target.field)
                     _, field_type = self.struct_fields[struct_name][idx]
                     field_llvm_type = self._ritz_type_to_llvm(field_type)
@@ -7927,7 +7957,7 @@ class LLVMEmitter:
                     self._drop_old_field(stmt.target, field_ptr, field_type)
                     self.builder.store(val, field_ptr)
                 else:
-                    raise ValueError(f"Cannot assign field on non-struct pointer: {pointee_type}")
+                    raise self._err(f"Cannot assign field on non-struct pointer: {pointee_type}")
             else:
                 raise NotImplementedError(f"Assignment to: {type(stmt.target)}")
             return None
@@ -9647,7 +9677,7 @@ class LLVMEmitter:
             # The parser builds an InterpString only as print / eprint's
             # argument, which _emit_call lowers itself (AGAST #2102). Reaching
             # here means some pass moved one out of that position.
-            raise ValueError(f"internal: InterpString outside print/eprint (line {expr.span.line})")
+            raise InternalError(f"internal: InterpString outside print/eprint (line {expr.span.line})")
 
         elif isinstance(expr, rast.CharLit):
             # Character literal is a u8 constant
@@ -9729,7 +9759,7 @@ class LLVMEmitter:
                 # Return the function as a pointer value
                 return fn
 
-            raise ValueError(f"Unknown identifier: {name}")
+            raise self._err(f"Unknown identifier: {name}")
 
         elif isinstance(expr, rast.BinOp):
             op = expr.op
@@ -9941,7 +9971,7 @@ class LLVMEmitter:
                     return self.builder.lshr(left, right)
                 return self.builder.ashr(left, right)
             else:
-                raise ValueError(f"Unknown operator: {op}")
+                raise InternalError(f"Unknown operator: {op}")
 
         elif isinstance(expr, rast.Call):
             return self._emit_lending_call(expr, self._emit_call)
@@ -9978,14 +10008,9 @@ class LLVMEmitter:
             return self._emit_tuple_lit(expr)
 
         elif isinstance(expr, rast.Field):
-            try:
-                return self._emit_field_access(expr)
-            except ValueError as err:
-                # AGAST #2451: `t.len` on a String names no field.  The struct
-                # layout raises it unlocated; it's the user's error, so say where.
-                if str(err).startswith("Unknown field"):
-                    raise EmitError(str(err), expr.span) from None
-                raise
+            # AGAST #2451: `t.len` on a String names no field. The lookup
+            # locates it itself now (#1390), at this expression.
+            return self._emit_field_access(expr)
 
         elif isinstance(expr, rast.Cast):
             return self._emit_cast(expr)
@@ -10650,12 +10675,12 @@ class LLVMEmitter:
                                 elem_ty = base_ritz_type.args[0]
                                 elem_type_name = self._type_to_name_suffix(elem_ty)
                             else:
-                                raise ValueError("Vec type without element type")
+                                raise self._err("Vec type without element type")
 
                         # Build vec_get call: vec_get$T(&v, i)
                         fn_name = f"vec_get${elem_type_name}"
                         if fn_name not in self.functions:
-                            raise ValueError(f"Vec indexing requires {fn_name} to be defined")
+                            raise self._err(f"Vec indexing requires {fn_name} to be defined")
 
                         fn, _ = self.functions[fn_name]
                         # Get pointer to vec
@@ -10669,7 +10694,7 @@ class LLVMEmitter:
                     elif type_name == 'String':
                         fn_name = "string_get"
                         if fn_name not in self.functions:
-                            raise ValueError(f"String indexing requires {fn_name} to be defined")
+                            raise self._err(f"String indexing requires {fn_name} to be defined")
 
                         fn, _ = self.functions[fn_name]
                         # Get pointer to string
@@ -10797,7 +10822,7 @@ class LLVMEmitter:
                 ptr = self.builder.gep(base, [index])
                 return self.builder.load(ptr)
         else:
-            raise ValueError(f"Cannot index type: {base.type}")
+            raise self._err(f"Cannot index type: {base.type}")
 
     def _slice_ritz_type(self, base: rast.Expr) -> Optional[rast.Type]:
         """The type of `base[lo..hi]`, as _emit_slice builds it (AGAST #2451).
@@ -10955,7 +10980,7 @@ class LLVMEmitter:
         """Emit string slice: s[1:5] → string_slice(&s, 1, 5)."""
         fn_name = "string_slice"
         if fn_name not in self.functions:
-            raise ValueError(f"String slicing requires {fn_name} to be defined "
+            raise self._err(f"String slicing requires {fn_name} to be defined "
                              "(import ritzlib.string)")
 
         fn, _ = self.functions[fn_name]
@@ -10978,7 +11003,7 @@ class LLVMEmitter:
             # Get length via string_len
             len_fn_name = "string_len"
             if len_fn_name not in self.functions:
-                raise ValueError(f"String slicing requires {len_fn_name} to be defined")
+                raise self._err(f"String slicing requires {len_fn_name} to be defined")
             len_fn, _ = self.functions[len_fn_name]
             end = self.builder.call(len_fn, [str_ptr])
 
@@ -10995,11 +11020,11 @@ class LLVMEmitter:
             # (AGAST #2725): spell T as monomorph mangled vec_slice<T>.
             elem_type_name = mangle_type_name(base_ritz_type.args[0])
         else:
-            raise ValueError("Vec type without element type")
+            raise self._err("Vec type without element type")
 
         fn_name = f"vec_slice${elem_type_name}"
         if fn_name not in self.functions:
-            raise ValueError(f"Vec slicing requires {fn_name} to be defined")
+            raise self._err(f"Vec slicing requires {fn_name} to be defined")
 
         fn, _ = self.functions[fn_name]
         vec_ptr = self._emit_lvalue_addr(expr.expr)
@@ -11021,7 +11046,7 @@ class LLVMEmitter:
             # Get length via vec_len$T
             len_fn_name = f"vec_len${elem_type_name}"
             if len_fn_name not in self.functions:
-                raise ValueError(f"Vec slicing requires {len_fn_name} to be defined")
+                raise self._err(f"Vec slicing requires {len_fn_name} to be defined")
             len_fn, _ = self.functions[len_fn_name]
             end = self.builder.call(len_fn, [vec_ptr])
 
@@ -11076,7 +11101,7 @@ class LLVMEmitter:
             return base_ritz_type.args[0]
         if type_name.startswith('Vec$'):
             return rast.NamedType(base_ritz_type.span, type_name[4:], [])
-        raise ValueError("Vec type without element type")
+        raise self._err("Vec type without element type")
 
     @staticmethod
     def _is_range_index(expr: rast.Expr) -> bool:
@@ -11106,7 +11131,7 @@ class LLVMEmitter:
         """Emit a struct literal: MyStruct { field: value, ... }."""
         struct_name = expr.name
         if struct_name not in self.struct_types:
-            raise ValueError(f"Unknown struct: {struct_name}")
+            raise self._err(f"Unknown struct: {struct_name}")
 
         struct_type = self.struct_types[struct_name]
         field_info = self.struct_fields[struct_name]
@@ -11125,7 +11150,7 @@ class LLVMEmitter:
                 val = self._convert_type(val, llvm_type)
                 values.append(val)
             else:
-                raise ValueError(f"Missing field {field_name} in struct literal")
+                raise self._err(f"Missing field {field_name} in struct literal")
 
         # Create struct aggregate
         result = ir.Constant(struct_type, ir.Undefined)
@@ -11142,7 +11167,7 @@ class LLVMEmitter:
             expected = self._expected_array()
             if isinstance(expected, rast.ArrayType):
                 return ir.Constant(self._ritz_type_to_llvm(expected), None)
-            raise ValueError(
+            raise self._err(
                 "Empty array literal needs a declared array type "
                 "(e.g. `let a: [0]u8 = []`)")
 
@@ -11177,7 +11202,7 @@ class LLVMEmitter:
             elem_type = self._ritz_type_to_llvm(expected.inner)
             declared_count = expected.size
             if isinstance(declared_count, int) and len(values) > declared_count:
-                raise ValueError(
+                raise self._err(
                     f"Array literal has {len(values)} elements but the declared "
                     f"type holds {declared_count}")
 
@@ -11210,7 +11235,7 @@ class LLVMEmitter:
         - For large arrays: Use memset for byte fills, or store loop for others
         """
         if expr.count <= 0:
-            raise ValueError("Array fill count must be positive")
+            raise self._err("Array fill count must be positive")
 
         # Emit the value once. Like a literal, a fill takes its element type
         # from the slot: `[0; 16]` into `[16]u8` is a [16 x i8] (LARB R5).
@@ -11542,7 +11567,7 @@ class LLVMEmitter:
                 # (#3337), so this address is only ever read through.
                 return self.const_arrays[name][0]
             else:
-                raise ValueError(f"Unknown variable: {name}")
+                raise self._err(f"Unknown variable: {name}")
         elif isinstance(expr, rast.UnaryOp) and expr.op == '*':
             # *ptr -> return ptr itself
             ptr = self._emit_expr(expr.operand)
@@ -11667,7 +11692,7 @@ class LLVMEmitter:
                     # took a whole `[N]T`.
                     return self.builder.gep(base, [ir.Constant(self.i32, 0), index])
                 return self.builder.gep(base, [index])
-            raise ValueError(f"Cannot index type: {base.type}")
+            raise self._err(f"Cannot index type: {base.type}")
         elif isinstance(expr, rast.Field):
             # A field S doesn't have, through S's `Deref` / `DerefMut` (§7.7).
             derefed = self._deref_field(expr, self._deref_use(rvalue_root))
@@ -11726,9 +11751,9 @@ class LLVMEmitter:
             val = self._emit_expr(expr)
             if isinstance(val.type, ir.PointerType):
                 return val
-            raise ValueError(f"Cannot get address of a cast to {val.type}")
+            raise self._err(f"Cannot get address of a cast to {val.type}")
         else:
-            raise ValueError(f"Cannot get address of: {type(expr)}")
+            raise self._err(f"Cannot get address of: {type(expr)}")
 
     _ADDR_OPS_ALL = ('&', '@', '&mut', '@&')
 
@@ -11838,7 +11863,7 @@ class LLVMEmitter:
         struct_name = (self._get_struct_name_from_type(pointee)
                        if isinstance(pointee, ir.BaseStructType) else None)
         if not struct_name:
-            raise ValueError(f"Cannot access field on type: {ptr.type}")
+            raise self._err(f"Cannot access field on type: {ptr.type}")
         idx = self._get_struct_field_index(struct_name, field)
         return self.builder.gep(ptr, [zero, ir.Constant(self.i32, idx)])
 
@@ -11879,16 +11904,16 @@ class LLVMEmitter:
         # Get LLVM types
         future_llvm_type = self.struct_types.get(future_type_name)
         if future_llvm_type is None:
-            raise ValueError(f"Unknown Future type: {future_type_name}")
+            raise InternalError(f"Unknown Future type: {future_type_name}")
 
         # Get the poll function
         if poll_fn_name not in self.functions:
-            raise ValueError(f"Unknown poll function: {poll_fn_name}")
+            raise InternalError(f"Unknown poll function: {poll_fn_name}")
         poll_fn, _ = self.functions[poll_fn_name]
 
         # Get the constructor function
         if fn_name not in self.functions:
-            raise ValueError(f"Unknown async function: {fn_name}")
+            raise InternalError(f"Unknown async function: {fn_name}")
         constructor_fn, constructor_def = self.functions[fn_name]
 
         # Emit arguments with type conversion (int literals default to i64)
@@ -11963,7 +11988,7 @@ class LLVMEmitter:
                 malloc_fn = ir.Function(self.module, ir.FunctionType(
                     ir.PointerType(ir.IntType(8)), [self.i64]), name="malloc")
         if malloc_fn is None:
-            raise ValueError("heap requires ritzlib.memory (malloc not found)")
+            raise self._err("heap requires ritzlib.memory (malloc not found)")
         raw_ptr = self.builder.call(malloc_fn, [size_val], name="heap_ptr")
 
         # Cast to *T
@@ -12116,7 +12141,7 @@ class LLVMEmitter:
                 val = self._convert_type(val, ty)
                 self.builder.store(val, gvar)
             else:
-                raise ValueError(f"Unknown variable: {name}")
+                raise self._err(f"Unknown variable: {name}")
 
         else:
             # For field access, index, dereference: addressed above.
@@ -12436,7 +12461,7 @@ class LLVMEmitter:
                     # LARB R48: a const scalar is inlined; it has no storage.
                     raise EmitError(ref_rules.CONST_SCALAR_ADDR.format(name), expr.span)
                 else:
-                    raise ValueError(f"Unknown variable: {name}")
+                    raise self._err(f"Unknown variable: {name}")
             elif isinstance(expr.operand, rast.Index):
                 # For &arr[i] or &arr[i][j], use _emit_lvalue_addr which handles all cases
                 # including nested array indexing
@@ -12501,7 +12526,7 @@ class LLVMEmitter:
             return self.builder.xor(operand, all_ones)
 
         else:
-            raise ValueError(f"Unknown unary operator: {expr.op}")
+            raise InternalError(f"Unknown unary operator: {expr.op}")
 
     def _emit_struct_lit(self, expr: rast.StructLit) -> ir.Value:
         """Emit a struct literal: MyStruct { field1: value1, field2: value2 }."""
@@ -12555,7 +12580,7 @@ class LLVMEmitter:
             name = self._ensure_builtin_generic_struct_specialization(ty)
             return self.struct_types[name], self.struct_fields[name]
         if expr.name not in self.struct_types:
-            raise ValueError(f"Unknown struct: {expr.name}")
+            raise self._err(f"Unknown struct: {expr.name}")
         return self.struct_types[expr.name], self.struct_fields[expr.name]
 
     @staticmethod
@@ -12565,7 +12590,8 @@ class LLVMEmitter:
         out = []
         for field_name, field_expr in expr.fields:
             if field_name not in field_indices:
-                raise ValueError(f"Unknown field {field_name} in struct {expr.name}")
+                raise SourceError(f"Unknown field {field_name} in struct {expr.name}",
+                                  getattr(field_expr, 'span', None) or expr.span)
             out.append((field_indices[field_name], field_expr))
         return out
 
@@ -12807,7 +12833,7 @@ class LLVMEmitter:
             if enum_name in self.enum_types:
                 variant = self._get_enum_variant(enum_name, expr.field)
                 if variant.fields:
-                    raise ValueError(
+                    raise self._err(
                         f"Variant '{enum_name}.{expr.field}' requires constructor args"
                     )
                 return self._emit_enum_variant_constructor_for_type(expr.field, [], enum_name)
@@ -12838,7 +12864,7 @@ class LLVMEmitter:
             # Fallback: try extractvalue on any struct-like type
             if isinstance(struct_val.type, ir.BaseStructType):
                 return self.builder.extract_value(struct_val, index)
-            raise ValueError(f"Cannot access tuple field {index} on type: {struct_val.type}")
+            raise self._err(f"Cannot access tuple field {index} on type: {struct_val.type}")
 
         # Optimization: if the inner expression is a local variable, use GEP directly
         # instead of loading the entire struct then extracting a field.
@@ -12877,10 +12903,10 @@ class LLVMEmitter:
                     # Load the field value
                     return self.builder.load(field_ptr)
                 else:
-                    raise ValueError(f"Cannot determine struct type for pointer")
+                    raise self._err(f"Cannot determine struct type for pointer")
             elif isinstance(pointee_type, ir.PointerType):
                 # Pointers that don't end at a struct (taken off above).
-                raise ValueError(f"Cannot access field on double pointer: {pointee_type}")
+                raise self._err(f"Cannot access field on double pointer: {pointee_type}")
             else:
                 # LLVM type doesn't tell us the struct type - try Ritz type info
                 ritz_type = self._infer_ritz_type(expr.expr)
@@ -12900,7 +12926,7 @@ class LLVMEmitter:
                             idx = self._get_struct_field_index(struct_name, expr.field)
                             field_ptr = self.builder.gep(typed_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
                             return self.builder.load(field_ptr)
-                raise ValueError(f"Cannot access field on non-struct pointer: {pointee_type}")
+                raise self._err(f"Cannot access field on non-struct pointer: {pointee_type}")
         elif isinstance(struct_val.type, ir.BaseStructType):
             # Value of struct type: extract the field
             struct_name = self._get_struct_name_from_type(struct_val.type)
@@ -12913,9 +12939,9 @@ class LLVMEmitter:
                 idx = self._get_struct_field_index(struct_name, expr.field)
                 return self.builder.extract_value(struct_val, idx)
             else:
-                raise ValueError(f"Cannot determine struct type for value")
+                raise self._err(f"Cannot determine struct type for value")
         else:
-            raise ValueError(f"Cannot access field on non-struct type: {struct_val.type}")
+            raise self._err(f"Cannot access field on non-struct type: {struct_val.type}")
 
     # llvmlite raises TypeError from ir.CallInstr.__init__ when a call's
     # arguments do not match the callee's signature. Its message is the only
@@ -13105,7 +13131,7 @@ class LLVMEmitter:
                     elif fname in self.params:
                         fn_ptr, _ = self.params[fname]
                     else:
-                        raise ValueError(f"Function pointer '{fname}' not found in locals or params")
+                        raise InternalError(f"Function pointer '{fname}' not found in locals or params")
 
                     # Emit and convert arguments
                     for i, (arg, param_type) in enumerate(zip(call.args, ritz_type.params)):
@@ -13395,10 +13421,10 @@ class LLVMEmitter:
             if extern_def.varargs:
                 # For varargs, at least the fixed params must be provided
                 if len(call.args) < expected_arg_count:
-                    raise ValueError(f"Extern function '{fname}' requires at least {expected_arg_count} args, got {len(call.args)}")
+                    raise self._err(f"Extern function '{fname}' requires at least {expected_arg_count} args, got {len(call.args)}")
             else:
                 if len(call.args) != expected_arg_count:
-                    raise ValueError(f"Extern function '{fname}' called with {len(call.args)} args but declared with {expected_arg_count} params")
+                    raise self._err(f"Extern function '{fname}' called with {len(call.args)} args but declared with {expected_arg_count} params")
 
             # Declare the extern function in LLVM if not already done
             if fname not in self.module.globals:
@@ -13430,7 +13456,7 @@ class LLVMEmitter:
         # reached by a call it skips, e.g. through a local that shadows the
         # fn's name; name the fix rather than "Unknown function" (#1968).
         if fname in getattr(self, 'generic_fn_names', ()):
-            raise ValueError(
+            raise self._err(
                 f"generic function `{fname}` needs explicit type arguments here: "
                 f"write `{fname}<T>(...)`")
         # `W_bump(w)` of a method of `impl<T> W<T>`: only a non-generic
@@ -13479,7 +13505,7 @@ class LLVMEmitter:
             # simd_load(ptr: *T) -> vec<N, T>
             # Aligned load (16-byte for SSE2, 32-byte for AVX2)
             if len(args) != 1:
-                raise ValueError("simd_load() requires exactly 1 argument (pointer)")
+                raise self._err("simd_load() requires exactly 1 argument (pointer)")
             ptr = self._emit_expr(args[0])
             # Determine vector type from pointer element type
             if isinstance(ptr.type, ir.PointerType):
@@ -13496,7 +13522,7 @@ class LLVMEmitter:
                     }
                     vec_type = type_map.get(expected.name)
                     if vec_type is None:
-                        raise ValueError(f"simd_load: unsupported expected type {expected.name}")
+                        raise self._err(f"simd_load: unsupported expected type {expected.name}")
                     is_avx2 = expected.name in ('v32i8', 'v16i16', 'v8i32', 'v4i64')
                 else:
                     # Default to 128-bit vectors (SSE2)
@@ -13509,21 +13535,21 @@ class LLVMEmitter:
                     elif elem_type == self.i64:
                         vec_type = v2i64
                     else:
-                        raise ValueError(f"simd_load: unsupported element type {elem_type}")
+                        raise self._err(f"simd_load: unsupported element type {elem_type}")
                 # Cast pointer to vector pointer type
                 vec_ptr = self.builder.bitcast(ptr, ir.PointerType(vec_type))
                 # Aligned load (16-byte for SSE2, 32-byte for AVX2)
                 load_instr = self.builder.load(vec_ptr)
                 load_instr.align = 32 if is_avx2 else 16
                 return load_instr
-            raise ValueError("simd_load() requires a pointer argument")
+            raise self._err("simd_load() requires a pointer argument")
 
         elif fname == 'simd_loadu':
             # simd_loadu(ptr: *T) -> vec<N, T>
             # Unaligned load (align=1)
             # Determines SSE2 (128-bit) vs AVX2 (256-bit) from expected type context
             if len(args) != 1:
-                raise ValueError("simd_loadu() requires exactly 1 argument (pointer)")
+                raise self._err("simd_loadu() requires exactly 1 argument (pointer)")
             ptr = self._emit_expr(args[0])
             if isinstance(ptr.type, ir.PointerType):
                 elem_type = ptr.type.pointee
@@ -13539,7 +13565,7 @@ class LLVMEmitter:
                     }
                     vec_type = type_map.get(expected.name)
                     if vec_type is None:
-                        raise ValueError(f"simd_loadu: unsupported expected type {expected.name}")
+                        raise self._err(f"simd_loadu: unsupported expected type {expected.name}")
                 else:
                     # Default to SSE2 128-bit vectors based on element type
                     if elem_type == self.i8:
@@ -13551,18 +13577,18 @@ class LLVMEmitter:
                     elif elem_type == self.i64:
                         vec_type = v2i64
                     else:
-                        raise ValueError(f"simd_loadu: unsupported element type {elem_type}")
+                        raise self._err(f"simd_loadu: unsupported element type {elem_type}")
                 vec_ptr = self.builder.bitcast(ptr, ir.PointerType(vec_type))
                 load_instr = self.builder.load(vec_ptr)
                 load_instr.align = 1  # Unaligned
                 return load_instr
-            raise ValueError("simd_loadu() requires a pointer argument")
+            raise self._err("simd_loadu() requires a pointer argument")
 
         elif fname == 'simd_store':
             # simd_store(ptr: *T, val: vec<N, T>)
             # Aligned 16-byte store
             if len(args) != 2:
-                raise ValueError("simd_store() requires 2 arguments (pointer, value)")
+                raise self._err("simd_store() requires 2 arguments (pointer, value)")
             ptr = self._emit_expr(args[0])
             val = self._emit_expr(args[1])
             if isinstance(ptr.type, ir.PointerType) and isinstance(val.type, ir.VectorType):
@@ -13570,13 +13596,13 @@ class LLVMEmitter:
                 store_instr = self.builder.store(val, vec_ptr)
                 store_instr.align = 16
                 return store_instr
-            raise ValueError("simd_store() requires (pointer, vector) arguments")
+            raise self._err("simd_store() requires (pointer, vector) arguments")
 
         elif fname == 'simd_storeu':
             # simd_storeu(ptr: *T, val: vec<N, T>)
             # Unaligned store
             if len(args) != 2:
-                raise ValueError("simd_storeu() requires 2 arguments (pointer, value)")
+                raise self._err("simd_storeu() requires 2 arguments (pointer, value)")
             ptr = self._emit_expr(args[0])
             val = self._emit_expr(args[1])
             if isinstance(ptr.type, ir.PointerType) and isinstance(val.type, ir.VectorType):
@@ -13584,39 +13610,39 @@ class LLVMEmitter:
                 store_instr = self.builder.store(val, vec_ptr)
                 store_instr.align = 1  # Unaligned
                 return store_instr
-            raise ValueError("simd_storeu() requires (pointer, vector) arguments")
+            raise self._err("simd_storeu() requires (pointer, vector) arguments")
 
         elif fname == 'simd_extract':
             # simd_extract(vec: vec<N, T>, idx: i32) -> T
             if len(args) != 2:
-                raise ValueError("simd_extract() requires 2 arguments (vector, index)")
+                raise self._err("simd_extract() requires 2 arguments (vector, index)")
             vec = self._emit_expr(args[0])
             idx = self._emit_expr(args[1])
             if isinstance(vec.type, ir.VectorType):
                 return self.builder.extract_element(vec, idx)
-            raise ValueError("simd_extract() requires a vector argument")
+            raise self._err("simd_extract() requires a vector argument")
 
         elif fname == 'simd_insert':
             # simd_insert(vec: vec<N, T>, idx: i32, val: T) -> vec<N, T>
             if len(args) != 3:
-                raise ValueError("simd_insert() requires 3 arguments (vector, index, value)")
+                raise self._err("simd_insert() requires 3 arguments (vector, index, value)")
             vec = self._emit_expr(args[0])
             idx = self._emit_expr(args[1])
             val = self._emit_expr(args[2])
             if isinstance(vec.type, ir.VectorType):
                 return self.builder.insert_element(vec, val, idx)
-            raise ValueError("simd_insert() requires a vector argument")
+            raise self._err("simd_insert() requires a vector argument")
 
         elif fname == 'simd_shuffle':
             # simd_shuffle(a: vec<N, T>, b: vec<N, T>, mask_vals...)
             # Variadic: mask indices follow the two vectors
             # Example: simd_shuffle(a, b, 0, 1, 2, 3) for identity shuffle
             if len(args) < 3:
-                raise ValueError("simd_shuffle() requires at least 3 arguments (vec, vec, mask...)")
+                raise self._err("simd_shuffle() requires at least 3 arguments (vec, vec, mask...)")
             vec_a = self._emit_expr(args[0])
             vec_b = self._emit_expr(args[1])
             if not isinstance(vec_a.type, ir.VectorType):
-                raise ValueError("simd_shuffle() first argument must be a vector")
+                raise self._err("simd_shuffle() first argument must be a vector")
             # Build mask from remaining args (must be constants)
             mask_vals = []
             for i, mask_arg in enumerate(args[2:]):
@@ -13624,7 +13650,7 @@ class LLVMEmitter:
                 if isinstance(mask_val, ir.Constant):
                     mask_vals.append(int(mask_val.constant))
                 else:
-                    raise ValueError(f"simd_shuffle() mask index {i} must be a constant")
+                    raise self._err(f"simd_shuffle() mask index {i} must be a constant")
             # Create mask as constant vector
             mask_type = ir.VectorType(self.i32, len(mask_vals))
             mask = ir.Constant(mask_type, mask_vals)
@@ -13635,12 +13661,12 @@ class LLVMEmitter:
             # Sum of absolute differences: psadbw intrinsic
             # Returns two 64-bit sums (low and high halves)
             if len(args) != 2:
-                raise ValueError("simd_sad() requires 2 arguments (vec<16, i8>, vec<16, i8>)")
+                raise self._err("simd_sad() requires 2 arguments (vec<16, i8>, vec<16, i8>)")
             vec_a = self._emit_expr(args[0])
             vec_b = self._emit_expr(args[1])
             # Ensure both are v16i8
             if vec_a.type != v16i8 or vec_b.type != v16i8:
-                raise ValueError("simd_sad() requires vec<16, i8> arguments")
+                raise self._err("simd_sad() requires vec<16, i8> arguments")
             # Get or declare llvm.x86.sse2.psad.bw intrinsic
             intrinsic_name = 'llvm.x86.sse2.psad.bw'
             if intrinsic_name in self.module.globals:
@@ -13663,7 +13689,7 @@ class LLVMEmitter:
             # IMPORTANT: imm8 MUST be a compile-time constant (immarg constraint)
             # Result is 128-bit carryless product in v2i64.
             if len(args) != 3:
-                raise ValueError("simd_clmul() requires 3 arguments (v2i64, v2i64, imm8)")
+                raise self._err("simd_clmul() requires 3 arguments (v2i64, v2i64, imm8)")
             vec_a = self._emit_expr(args[0])
             vec_b = self._emit_expr(args[1])
 
@@ -13676,17 +13702,17 @@ class LLVMEmitter:
             elif isinstance(imm_arg, rast.Cast) and isinstance(imm_arg.expr, rast.IntLit):
                 imm_value = imm_arg.expr.value
             else:
-                raise ValueError("simd_clmul() imm8 must be a compile-time constant integer literal")
+                raise self._err("simd_clmul() imm8 must be a compile-time constant integer literal")
 
             # Validate range
             if imm_value < 0 or imm_value > 255:
-                raise ValueError(f"simd_clmul() imm8 must be 0-255, got {imm_value}")
+                raise self._err(f"simd_clmul() imm8 must be 0-255, got {imm_value}")
 
             imm = ir.Constant(self.i8, imm_value)
 
             # Ensure vectors are v2i64
             if vec_a.type != v2i64 or vec_b.type != v2i64:
-                raise ValueError("simd_clmul() requires v2i64 arguments")
+                raise self._err("simd_clmul() requires v2i64 arguments")
 
             # Get or declare llvm.x86.pclmulqdq intrinsic
             intrinsic_name = 'llvm.x86.pclmulqdq'
@@ -13701,13 +13727,13 @@ class LLVMEmitter:
             # simd_add(a: vec<N, T>, b: vec<N, T>) -> vec<N, T>
             # Vector integer addition (works for both SSE2 and AVX2)
             if len(args) != 2:
-                raise ValueError("simd_add() requires 2 arguments (vector, vector)")
+                raise self._err("simd_add() requires 2 arguments (vector, vector)")
             vec_a = self._emit_expr(args[0])
             vec_b = self._emit_expr(args[1])
             if not isinstance(vec_a.type, ir.VectorType) or not isinstance(vec_b.type, ir.VectorType):
-                raise ValueError("simd_add() requires vector arguments")
+                raise self._err("simd_add() requires vector arguments")
             if vec_a.type != vec_b.type:
-                raise ValueError("simd_add() requires vectors of the same type")
+                raise self._err("simd_add() requires vectors of the same type")
             # LLVM add instruction works on vectors
             return self.builder.add(vec_a, vec_b)
 
@@ -13715,13 +13741,13 @@ class LLVMEmitter:
             # simd_xor(a: vec<N, T>, b: vec<N, T>) -> vec<N, T>
             # Vector XOR (works for both SSE2 and AVX2)
             if len(args) != 2:
-                raise ValueError("simd_xor() requires 2 arguments (vector, vector)")
+                raise self._err("simd_xor() requires 2 arguments (vector, vector)")
             vec_a = self._emit_expr(args[0])
             vec_b = self._emit_expr(args[1])
             if not isinstance(vec_a.type, ir.VectorType) or not isinstance(vec_b.type, ir.VectorType):
-                raise ValueError("simd_xor() requires vector arguments")
+                raise self._err("simd_xor() requires vector arguments")
             if vec_a.type != vec_b.type:
-                raise ValueError("simd_xor() requires vectors of the same type")
+                raise self._err("simd_xor() requires vectors of the same type")
             # LLVM xor instruction works on vectors
             return self.builder.xor(vec_a, vec_b)
 
@@ -13731,10 +13757,10 @@ class LLVMEmitter:
             # Implemented as: (v << n) | (v >> (bits - n))
             # Note: n must be a compile-time constant for optimal codegen
             if len(args) != 2:
-                raise ValueError("simd_rotl() requires 2 arguments (vector, shift)")
+                raise self._err("simd_rotl() requires 2 arguments (vector, shift)")
             vec = self._emit_expr(args[0])
             if not isinstance(vec.type, ir.VectorType):
-                raise ValueError("simd_rotl() requires a vector argument")
+                raise self._err("simd_rotl() requires a vector argument")
 
             # Extract shift amount (must be constant for efficient codegen)
             shift_arg = args[1]
@@ -13743,7 +13769,7 @@ class LLVMEmitter:
             elif isinstance(shift_arg, rast.Cast) and isinstance(shift_arg.expr, rast.IntLit):
                 shift_amount = shift_arg.expr.value
             else:
-                raise ValueError("simd_rotl() shift amount must be a compile-time constant")
+                raise self._err("simd_rotl() shift amount must be a compile-time constant")
 
             # Determine element bit width
             elem_type = vec.type.element
@@ -13756,7 +13782,7 @@ class LLVMEmitter:
             elif elem_type == self.i8:
                 bits = 8
             else:
-                raise ValueError(f"simd_rotl() unsupported element type {elem_type}")
+                raise self._err(f"simd_rotl() unsupported element type {elem_type}")
 
             # Create broadcast vectors for shift amounts
             num_elems = vec.type.count
@@ -13773,7 +13799,7 @@ class LLVMEmitter:
             # Uses inline assembly to execute XGETBV instruction
             # Returns XCR register value (edx:eax combined as u64)
             if len(args) != 1:
-                raise ValueError("xgetbv() requires 1 argument (xcr)")
+                raise self._err("xgetbv() requires 1 argument (xcr)")
             xcr = self._emit_expr(args[0])
 
             # Convert to i32 if needed
@@ -13810,7 +13836,7 @@ class LLVMEmitter:
             # One round of AES encryption (ShiftRows, SubBytes, MixColumns, AddRoundKey)
             # Accepts v4i32 or v2i64 (both are 128-bit vectors)
             if len(args) != 2:
-                raise ValueError("aesenc() requires 2 arguments (state, key)")
+                raise self._err("aesenc() requires 2 arguments (state, key)")
             state = self._emit_expr(args[0])
             key = self._emit_expr(args[1])
 
@@ -13823,7 +13849,7 @@ class LLVMEmitter:
                 state_i64 = state
                 key_i64 = key
             else:
-                raise ValueError("aesenc() requires v4i32 or v2i64 arguments")
+                raise self._err("aesenc() requires v4i32 or v2i64 arguments")
 
             intrinsic_name = 'llvm.x86.aesni.aesenc'
             if intrinsic_name in self.module.globals:
@@ -13841,7 +13867,7 @@ class LLVMEmitter:
             # aesenclast(state, key) -> same type as input
             # Final round of AES encryption (ShiftRows, SubBytes, AddRoundKey - no MixColumns)
             if len(args) != 2:
-                raise ValueError("aesenclast() requires 2 arguments (state, key)")
+                raise self._err("aesenclast() requires 2 arguments (state, key)")
             state = self._emit_expr(args[0])
             key = self._emit_expr(args[1])
 
@@ -13853,7 +13879,7 @@ class LLVMEmitter:
                 state_i64 = state
                 key_i64 = key
             else:
-                raise ValueError("aesenclast() requires v4i32 or v2i64 arguments")
+                raise self._err("aesenclast() requires v4i32 or v2i64 arguments")
 
             intrinsic_name = 'llvm.x86.aesni.aesenclast'
             if intrinsic_name in self.module.globals:
@@ -13870,7 +13896,7 @@ class LLVMEmitter:
             # aesdec(state, key) -> same type as input
             # One round of AES decryption (InvShiftRows, InvSubBytes, InvMixColumns, AddRoundKey)
             if len(args) != 2:
-                raise ValueError("aesdec() requires 2 arguments (state, key)")
+                raise self._err("aesdec() requires 2 arguments (state, key)")
             state = self._emit_expr(args[0])
             key = self._emit_expr(args[1])
 
@@ -13882,7 +13908,7 @@ class LLVMEmitter:
                 state_i64 = state
                 key_i64 = key
             else:
-                raise ValueError("aesdec() requires v4i32 or v2i64 arguments")
+                raise self._err("aesdec() requires v4i32 or v2i64 arguments")
 
             intrinsic_name = 'llvm.x86.aesni.aesdec'
             if intrinsic_name in self.module.globals:
@@ -13899,7 +13925,7 @@ class LLVMEmitter:
             # aesdeclast(state, key) -> same type as input
             # Final round of AES decryption (InvShiftRows, InvSubBytes, AddRoundKey - no InvMixColumns)
             if len(args) != 2:
-                raise ValueError("aesdeclast() requires 2 arguments (state, key)")
+                raise self._err("aesdeclast() requires 2 arguments (state, key)")
             state = self._emit_expr(args[0])
             key = self._emit_expr(args[1])
 
@@ -13911,7 +13937,7 @@ class LLVMEmitter:
                 state_i64 = state
                 key_i64 = key
             else:
-                raise ValueError("aesdeclast() requires v4i32 or v2i64 arguments")
+                raise self._err("aesdeclast() requires v4i32 or v2i64 arguments")
 
             intrinsic_name = 'llvm.x86.aesni.aesdeclast'
             if intrinsic_name in self.module.globals:
@@ -13929,7 +13955,7 @@ class LLVMEmitter:
             # AES Inverse MixColumns (for computing decryption round keys)
             # Accepts v4i32 or v2i64 (both are 128-bit vectors)
             if len(args) != 1:
-                raise ValueError("aesimc() requires 1 argument (key)")
+                raise self._err("aesimc() requires 1 argument (key)")
             key = self._emit_expr(args[0])
 
             input_type = key.type
@@ -13938,7 +13964,7 @@ class LLVMEmitter:
             elif input_type == v2i64:
                 key_i64 = key
             else:
-                raise ValueError("aesimc() requires v4i32 or v2i64 argument")
+                raise self._err("aesimc() requires v4i32 or v2i64 argument")
 
             intrinsic_name = 'llvm.x86.aesni.aesimc'
             if intrinsic_name in self.module.globals:
@@ -13962,7 +13988,7 @@ class LLVMEmitter:
             # is rejected at compile time with a Ritz-level error rather than
             # producing IR that LLVM will refuse to assemble.
             if len(args) != 2:
-                raise ValueError("aeskeygenassist() requires 2 arguments (key, rcon)")
+                raise self._err("aeskeygenassist() requires 2 arguments (key, rcon)")
             key = self._emit_expr(args[0])
 
             input_type = key.type
@@ -13971,7 +13997,7 @@ class LLVMEmitter:
             elif input_type == v2i64:
                 key_i64 = key
             else:
-                raise ValueError("aeskeygenassist() requires v4i32 or v2i64 first argument")
+                raise self._err("aeskeygenassist() requires v4i32 or v2i64 first argument")
 
             # Resolve rcon as a compile-time constant.  We accept any AST form
             # whose final integer value can be determined statically (a bare
@@ -13989,7 +14015,7 @@ class LLVMEmitter:
                 if isinstance(lit, int):
                     rcon_const = ir.Constant(i8, lit & 0xFF)
                 else:
-                    raise ValueError(
+                    raise self._err(
                         "aeskeygenassist() second arg (rcon) must be a compile-time integer constant; "
                         "LLVM's @llvm.x86.aesni.aeskeygenassist requires an i8 immediate."
                     )
@@ -14015,12 +14041,12 @@ class LLVMEmitter:
             # cdgh = state words c,d,g,h; abef = state words a,b,e,f
             # wk = message schedule word + round constant (only low 64 bits used)
             if len(args) != 3:
-                raise ValueError("sha256rnds2() requires 3 arguments (cdgh, abef, wk)")
+                raise self._err("sha256rnds2() requires 3 arguments (cdgh, abef, wk)")
             cdgh = self._emit_expr(args[0])
             abef = self._emit_expr(args[1])
             wk = self._emit_expr(args[2])
             if cdgh.type != v4i32 or abef.type != v4i32 or wk.type != v4i32:
-                raise ValueError("sha256rnds2() requires v4i32 arguments")
+                raise self._err("sha256rnds2() requires v4i32 arguments")
 
             intrinsic_name = 'llvm.x86.sha256rnds2'
             if intrinsic_name in self.module.globals:
@@ -14035,11 +14061,11 @@ class LLVMEmitter:
             # SHA-256 message schedule transformation (part 1)
             # Computes sigma0 and adds to message words
             if len(args) != 2:
-                raise ValueError("sha256msg1() requires 2 arguments (w0, w1)")
+                raise self._err("sha256msg1() requires 2 arguments (w0, w1)")
             w0 = self._emit_expr(args[0])
             w1 = self._emit_expr(args[1])
             if w0.type != v4i32 or w1.type != v4i32:
-                raise ValueError("sha256msg1() requires v4i32 arguments")
+                raise self._err("sha256msg1() requires v4i32 arguments")
 
             intrinsic_name = 'llvm.x86.sha256msg1'
             if intrinsic_name in self.module.globals:
@@ -14054,11 +14080,11 @@ class LLVMEmitter:
             # SHA-256 message schedule transformation (part 2)
             # Computes sigma1 and completes message expansion
             if len(args) != 2:
-                raise ValueError("sha256msg2() requires 2 arguments (w0, w1)")
+                raise self._err("sha256msg2() requires 2 arguments (w0, w1)")
             w0 = self._emit_expr(args[0])
             w1 = self._emit_expr(args[1])
             if w0.type != v4i32 or w1.type != v4i32:
-                raise ValueError("sha256msg2() requires v4i32 arguments")
+                raise self._err("sha256msg2() requires v4i32 arguments")
 
             intrinsic_name = 'llvm.x86.sha256msg2'
             if intrinsic_name in self.module.globals:
@@ -14111,7 +14137,7 @@ class LLVMEmitter:
         if method == 'rotl':
             # llvm.fshl.i32(a, a, b) = funnel shift left = rotate left when a == a
             if len(expr.args) != 1:
-                raise ValueError(f"rotl() requires exactly 1 argument")
+                raise self._err(f"rotl() requires exactly 1 argument")
             shift_amount = self._emit_expr(expr.args[0])
             # Convert shift amount to same type as receiver
             shift_amount = self.builder.zext(shift_amount, llvm_type) if shift_amount.type.width < bits else shift_amount
@@ -14124,7 +14150,7 @@ class LLVMEmitter:
         elif method == 'rotr':
             # llvm.fshr.i32(a, a, b) = funnel shift right = rotate right when a == a
             if len(expr.args) != 1:
-                raise ValueError(f"rotr() requires exactly 1 argument")
+                raise self._err(f"rotr() requires exactly 1 argument")
             shift_amount = self._emit_expr(expr.args[0])
             shift_amount = self.builder.zext(shift_amount, llvm_type) if shift_amount.type.width < bits else shift_amount
             shift_amount = self.builder.trunc(shift_amount, llvm_type) if shift_amount.type.width > bits else shift_amount
@@ -14135,7 +14161,7 @@ class LLVMEmitter:
         elif method == 'clz':
             # llvm.ctlz.i32(x, is_zero_poison) -> count leading zeros
             if len(expr.args) != 0:
-                raise ValueError(f"clz() takes no arguments")
+                raise self._err(f"clz() takes no arguments")
             fn_type = ir.FunctionType(llvm_type, [llvm_type, ir.IntType(1)])
             intrinsic = self.module.declare_intrinsic('llvm.ctlz', [llvm_type], fnty=fn_type)
             # is_zero_poison = false (return bit width for zero input)
@@ -14146,7 +14172,7 @@ class LLVMEmitter:
         elif method == 'ctz':
             # llvm.cttz.i32(x, is_zero_poison) -> count trailing zeros
             if len(expr.args) != 0:
-                raise ValueError(f"ctz() takes no arguments")
+                raise self._err(f"ctz() takes no arguments")
             fn_type = ir.FunctionType(llvm_type, [llvm_type, ir.IntType(1)])
             intrinsic = self.module.declare_intrinsic('llvm.cttz', [llvm_type], fnty=fn_type)
             result = self.builder.call(intrinsic, [receiver, ir.Constant(ir.IntType(1), 0)])
@@ -14155,7 +14181,7 @@ class LLVMEmitter:
         elif method == 'popcnt':
             # llvm.ctpop.i32(x) -> population count
             if len(expr.args) != 0:
-                raise ValueError(f"popcnt() takes no arguments")
+                raise self._err(f"popcnt() takes no arguments")
             fn_type = ir.FunctionType(llvm_type, [llvm_type])
             intrinsic = self.module.declare_intrinsic('llvm.ctpop', [llvm_type], fnty=fn_type)
             result = self.builder.call(intrinsic, [receiver])
@@ -14164,7 +14190,7 @@ class LLVMEmitter:
         elif method == 'swap_bytes':
             # llvm.bswap.i32(x) -> byte swap
             if len(expr.args) != 0:
-                raise ValueError(f"swap_bytes() takes no arguments")
+                raise self._err(f"swap_bytes() takes no arguments")
             if bits < 16:
                 # bswap not defined for i8, just return the value
                 return receiver
@@ -14236,7 +14262,7 @@ class LLVMEmitter:
         if expr.method != 'as_bytes':
             return None
         if expr.args:
-            raise ValueError("as_bytes() takes no arguments")
+            raise self._err("as_bytes() takes no arguments")
 
         recv = receiver_probe if receiver_probe is not None else self._emit_expr(expr.expr)
         if isinstance(recv.type, ir.PointerType) and isinstance(recv.type.pointee, ir.BaseStructType):
@@ -14814,7 +14840,7 @@ class LLVMEmitter:
                     type_name = inferred.name
 
         if type_name is None:
-            raise ValueError(f"Cannot call method '{expr.method}' on unknown type")
+            raise self._err(f"Cannot call method '{expr.method}' on unknown type")
 
         # Check for BitOps intrinsics on primitive integer types
         bitops_result = self._try_emit_bitops_intrinsic(expr, type_name)
@@ -14872,11 +14898,12 @@ class LLVMEmitter:
                     # checker leaves a built-in generic's methods to us.
                     raise EmitError(ref_rules.no_method(expr.method, type_name),
                                     expr.name_span or expr.span)
-                raise ValueError(f"No method '{expr.method}' found for type '{type_name}'")
+                raise self._err(f"No method '{expr.method}' found for type '{type_name}'",
+                                expr.name_span or expr.span)
             used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
 
         if mangled_name not in self.functions:
-            raise ValueError(f"Method function '{mangled_name}' not found")
+            raise InternalError(f"Method function '{mangled_name}' not found")
 
         fn, fn_def = self.functions[mangled_name]
         self._check_private_call(fn_def, f"{type_name}.{expr.method}",
@@ -14999,7 +15026,7 @@ class LLVMEmitter:
                         self.builder.store(val, tmp)
                         receiver_val = tmp
                 else:
-                    raise ValueError(f"Unknown variable: {name}")
+                    raise self._err(f"Unknown variable: {name}")
             else:
                 # For other lvalues (field, index), use normal lvalue_addr
                 receiver_val = self._emit_lvalue_addr(expr.expr)
@@ -15249,7 +15276,7 @@ class LLVMEmitter:
         elif isinstance(val.type, ir.PointerType):
             return self.builder.ptrtoint(val, self.i64)
         else:
-            raise ValueError(f"Cannot convert {val.type} to i64")
+            raise InternalError(f"Cannot convert {val.type} to i64")
 
     def _zero_constant(self, llvm_type: ir.Type) -> ir.Constant:
         """Create a zero/null constant for any LLVM type."""
@@ -16418,7 +16445,7 @@ class LLVMEmitter:
         if method not in ('ceil', 'floor', 'round', 'abs'):
             return None
         if len(expr.args) != 0:
-            raise ValueError(f"{method}() takes no arguments")
+            raise self._err(f"{method}() takes no arguments")
 
         recv = receiver if receiver is not None else self._emit_expr(expr.expr)
         if not isinstance(recv.type, (ir.FloatType, ir.DoubleType)):
@@ -17690,14 +17717,14 @@ class LLVMEmitter:
         # Get the enum name from the expression type
         enum_name = self._get_enum_name_from_expr(expr.expr)
         if not enum_name:
-            raise ValueError(f"Try operator requires a Result type, got expression: {type(expr.expr)}")
+            raise self._err(f"Try operator requires a Result type, got expression: {type(expr.expr)}")
 
         if enum_name == 'Option' or enum_name.startswith("Option$"):
             # `opt?` on an Option<T>: unwrap Some, or return None early.
             return self._emit_try_op_option(expr, result_val, enum_name)
 
         if not enum_name.startswith("Result$"):
-            raise ValueError(
+            raise self._err(
                 f"Try operator requires a Result or Option type, got: {enum_name}")
 
         # Get the Result type info
@@ -17731,7 +17758,7 @@ class LLVMEmitter:
         # Get the Err variant's field type
         err_variant = next((v for v in variants if v.name == "Err"), None)
         if not err_variant or not err_variant.fields:
-            raise ValueError(f"Result type {enum_name} has no Err variant with payload")
+            raise self._err(f"Result type {enum_name} has no Err variant with payload")
 
         err_field_type = err_variant.fields[0]
         llvm_err_type = self._ritz_type_to_llvm(err_field_type)
@@ -17755,7 +17782,7 @@ class LLVMEmitter:
                 fn_ret_type_name = ret_ritz_type.name
 
         if not fn_ret_type_name or fn_ret_type_name not in self.enum_types:
-            raise ValueError(f"Try operator used in function not returning Result type (got {fn_ret_type_name})")
+            raise self._err(f"Try operator used in function not returning Result type (got {fn_ret_type_name})")
 
         fn_ret_enum_type, _ = self.enum_types[fn_ret_type_name]
 
@@ -17785,7 +17812,7 @@ class LLVMEmitter:
         # Get the Ok variant's field type
         ok_variant = next((v for v in variants if v.name == "Ok"), None)
         if not ok_variant or not ok_variant.fields:
-            raise ValueError(f"Result type {enum_name} has no Ok variant with payload")
+            raise self._err(f"Result type {enum_name} has no Ok variant with payload")
 
         ok_field_type = ok_variant.fields[0]
         llvm_ok_type = self._ritz_type_to_llvm(ok_field_type)
@@ -17852,7 +17879,7 @@ class LLVMEmitter:
         fn_ret_enum = self._resolve_fn_return_enum_name()
         if fn_ret_enum is None or not (
                 fn_ret_enum == 'Option' or fn_ret_enum.startswith('Option$')):
-            raise ValueError(
+            raise self._err(
                 "Try operator on an Option used in a function that does not "
                 f"return an Option (got {fn_ret_enum})")
         ret_enum_type, _ = self.enum_types[fn_ret_enum]
@@ -17868,7 +17895,7 @@ class LLVMEmitter:
         self.builder.position_at_end(some_block)
         some_variant = next((v for v in variants if v.name == 'Some'), None)
         if not some_variant or not some_variant.fields:
-            raise ValueError(f"Option type {enum_name} has no Some payload")
+            raise self._err(f"Option type {enum_name} has no Some payload")
         llvm_payload_type = self._ritz_type_to_llvm(some_variant.fields[0])
         data_index = self._get_enum_data_index(enum_name)
         data_ptr = self.builder.gep(
@@ -18470,7 +18497,7 @@ def _llvm_callconv(callconv: Optional[str]) -> Optional[str]:
         return None
     if callconv == 'win64':
         return 'win64cc'
-    raise ValueError(f"unknown calling convention '{callconv}'")
+    raise InternalError(f"unknown calling convention '{callconv}'")
 
 
 def _add_intrinsic_target_features(ir_str: str) -> str:
@@ -18599,8 +18626,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
     """
     generics = getattr(module, 'generics', None)
     if generics is None:
-        raise ValueError("emit() takes a monomorphised module: "
-                         "run instantiate.prepare (or ritz0.PASSES) first")
+        raise InternalError("emit() takes a monomorphised module: "
+                            "run instantiate.prepare (or ritz0.PASSES) first")
 
     # Note: target_os filtering happens earlier in compile_file() before name resolution
 

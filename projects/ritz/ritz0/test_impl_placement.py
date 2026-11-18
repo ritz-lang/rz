@@ -48,6 +48,10 @@ def placed(name, file):
     return f"`{name}` is declared in {file}: its `impl` must be there (§12.2)"
 
 
+def free(param, write):
+    return f"unknown type `{param}`: a generic impl declares it, `{write}`"
+
+
 def every(name, write):
     return f"an impl covers every instantiation of `{name}`: write `{write}`"
 
@@ -161,6 +165,21 @@ impl<T> ^P<T, T>
 pub fn main() -> i32
     0
 """, every("P", "impl<K, V> P<K, V>")),
+    # LARB R81 (#1390): `impl Box<T>` without `<T>`. `T` is an ordinary type
+    # name and names nothing; ritz0 died with "No method 'get' found for type
+    # 'Box$u32'" and a traceback, then with R65's message at `Box`.
+    "free_param": ("""\
+struct Box<T>
+    v: T
+
+impl Box<^T>
+    fn get(self: @Box<T>) -> T
+        self.v
+
+pub fn main() -> i32
+    let b = Box<u32> { v: 3 }
+    b.get() as i32
+""", free("T", "impl<T> Box<T>")),
 }
 
 
@@ -198,3 +217,17 @@ def test_trait_impl_in_the_traits_file_compiles_and_runs(tmp_path):
     assert link.returncode == 0, link.stderr[-2000:]
     import subprocess
     assert subprocess.run([str(exe)], timeout=60).returncode == 42
+
+
+# R81's control: the same program with the impl declaring `T` runs.
+GENERIC_IMPL = REFUSED["free_param"][0].replace("^", "").replace(
+    "impl Box<T>", "impl<T> Box<T>")
+
+
+def test_generic_impl_declaring_its_param_compiles_and_runs(tmp_path):
+    comp = _compile(tmp_path, GENERIC_IMPL)
+    assert comp.returncode == 0, comp.stderr[-2000:]
+    link, exe = _link("ritz0", tmp_path / "main.ll", tmp_path)
+    assert link.returncode == 0, link.stderr[-2000:]
+    import subprocess
+    assert subprocess.run([str(exe)], timeout=60).returncode == 3

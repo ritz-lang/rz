@@ -11,7 +11,11 @@ An impl covers every instantiation: `impl<T> G<T>`, never `impl G<u8>`.
 `impl G<u8>` alone was an unlocated ValueError, and next to `impl<T> G<T>`
 ritz0 silently ran the generic body.
 
-Both errors are located at the impl's type name. Only parsed impls carry
+A generic impl declares its parameters (LARB R81, #1390): in `impl Box<T>`
+without `<T>`, `T` names nothing, which is "unknown type `T`" at the `T`
+rather than R65's message, and was a ValueError traceback before R65.
+
+The other two errors are located at the impl's type name. Only parsed impls carry
 `type_span`; one loaded from a module interface was checked when its own
 module compiled. Impls on types nothing declares (primitives, built-ins,
 unknown names) are builtin_types.py's errors. ritz1's half is #3494.
@@ -20,6 +24,8 @@ unknown names) are builtin_types.py's errors. ritz1's half is #3494.
 from pathlib import Path
 
 import ritz_ast as rast
+from name_resolver import NameResolver
+from type_names import unknown_type
 
 
 def _file(item) -> str | None:
@@ -49,6 +55,20 @@ def _covers_every_instantiation(impl: rast.ImplBlock, decl) -> bool:
     return len(names) == len(args) == len(set(names))
 
 
+def _free_param(impl: rast.ImplBlock, decl, known) -> str | None:
+    """LARB R81 (#1390): `impl Box<T>` without `<T>`. A generic impl declares
+    its parameters; here `T` is an ordinary type name, and it names nothing.
+    Located at the `T`."""
+    args = impl.impl_type.args if isinstance(impl.impl_type, rast.NamedType) else []
+    for arg in args:
+        if (isinstance(arg, rast.NamedType) and not arg.args
+                and arg.name not in impl.type_params and not known(arg.name)):
+            params = ", ".join(decl.type_params)
+            return (f"{arg.span}: {unknown_type(arg.name)}: a generic impl "
+                    f"declares it, `impl<{params}> {impl.type_name}<{params}>`")
+    return None
+
+
 def _partial(impl: rast.ImplBlock, decl) -> str | None:
     if _covers_every_instantiation(impl, decl):
         return None
@@ -65,12 +85,23 @@ def check_impl_placement(module: rast.Module) -> list[str]:
              if isinstance(item, (rast.StructDef, rast.EnumDef))}
     traits = {item.name: item for item in module.items
               if isinstance(item, rast.TraitDef)}
+    declared = {item.name for item in module.items
+                if isinstance(item, (rast.StructDef, rast.EnumDef,
+                                     rast.TraitDef, rast.TypeAlias))}
+
+    def known(name: str) -> bool:
+        return name in declared or name in NameResolver.BUILTIN_TYPES
+
     errors = []
     for impl in module.items:
         if not isinstance(impl, rast.ImplBlock) or not hasattr(impl, 'type_span'):
             continue
         decl = decls.get(impl.type_name)
         if decl is None:
+            continue
+        free = _free_param(impl, decl, known)
+        if free is not None:
+            errors.append(free)
             continue
         for error in (_misplaced(impl, decl, traits), _partial(impl, decl)):
             if error is not None:

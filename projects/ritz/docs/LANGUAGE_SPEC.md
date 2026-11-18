@@ -4624,6 +4624,11 @@ impl G<u8>
         self.v
 ```
 
+A generic impl declares its parameters (LARB R81, AGAST #1390). In
+`impl Box<T>`, written without `<T>`, `T` is an ordinary type name; if no type
+`T` exists, it is an error at the `T`: "unknown type `T`: a generic impl
+declares it, `impl<T> Box<T>`" (ritz0; ritz1's half is #4002).
+
 `dyn` stays a reserved keyword (§2.4). Every use of it, in any type position
 or after `as`, is an error located at the `dyn` token, from ritz0, ritz1 and
 ritz1_selfhosted alike (AGAST #1620; runtime polymorphism is AGAST #3251):
