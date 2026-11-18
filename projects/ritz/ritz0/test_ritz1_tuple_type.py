@@ -149,7 +149,7 @@ fn pick(n: i32) -> i32
         (3, 4)
     else
         (5, 6)
-    p * 10 + q
+    (p * 10 + q) as i32
 
 pub fn main() -> i32
     sp(1.0, 4.0) + sp(4.0, 1.0) + pick(0) + pick(1) + pick(7)
@@ -162,7 +162,7 @@ pub fn main() -> i32
     let (x, y) = (3, 40)
     let (u, v) = (y, x)
     let (f, n) = (2.5, 7u8)
-    u - v + (f * 2.0) as i32 + n as i32
+    (u - v) as i32 + (f * 2.0) as i32 + n as i32
 """
 
 # A match whose arms bind nothing.  12 + 34 + 56 = 102.
@@ -172,7 +172,7 @@ fn m(n: i32) -> i32
         0 => (1, 2)
         1 => (3, 4)
         _ => (5, 6)
-    a * 10 + b
+    (a * 10 + b) as i32
 
 pub fn main() -> i32
     m(0) + m(1) + m(9)
@@ -423,7 +423,7 @@ fn f(c: bool) -> i32
         (q, 1)
     else
         (0, 0)
-    x + y
+    (x + y) as i32
 
 pub fn main() -> i32
     f(true) + f(false)
@@ -438,7 +438,7 @@ fn f(o: Option<i32>) -> i32
     let (x, y) = match o
         Some(v) => (v, 1)
         _ => (0, 0)
-    x + y
+    (x + y) as i32
 
 pub fn main() -> i32
     f(Some(2)) + f(None)

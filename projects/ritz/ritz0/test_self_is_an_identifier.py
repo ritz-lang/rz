@@ -82,11 +82,11 @@ pub fn main() -> i32
 pub fn main() -> i32
     var sum: i32 = 0
     for self in 0..4
-        sum += self
+        sum += self as i32
     if sum != 6
         return 1
     for self in 0..=4
-        sum += self
+        sum += self as i32
     if sum != 16
         return 2
     return 0

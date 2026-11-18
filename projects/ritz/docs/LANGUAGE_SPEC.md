@@ -160,7 +160,7 @@ fn id(v: i32) -> i32
     v
 
 fn pick(n: i32) -> i32
-    let t = match n
+    let t: i32 = match n
         1 => 10
         _ => 20
     id(t) + id(if n == 1 then 1 else 2)
@@ -1520,9 +1520,9 @@ nothing, so it can come any number of times.
 fn total(r: Result<i32, i32>) -> i32
     var s: i32 = 0
     for i in 0..3
-        s = s + i
+        s = s + i as i32
     for i in 0..2
-        s = s + i
+        s = s + i as i32
     match r
         Ok(v) => s + v
         Err(v) => s - v
@@ -2795,11 +2795,41 @@ initialiser would, so it never widens its other arm: with `n: i32`,
 `if` that is an operand, as in `2 * (if c then n else 0)`, keeps its literal
 arms `i64`.
 
-The rule does no range analysis beyond that: with `w: i64`,
-`if w < 255 then w else 255` is rejected even though it is safe, and needs an
-`as`. Only typed `let` and
-`var` initialisers are checked. An assignment, a call argument or a `return`
-still converts silently (#1444).
+An arm may itself be an `if`/`match`, so an `else if` chain whose every arm
+fits is accepted at any depth. The rule does no range analysis beyond that:
+with `w: i64`, `if w < 255 then w else 255` is rejected even though it is
+safe, and needs an `as`.
+
+Arms are judged only where the `if`/`match` is written. Bound to a name, it is
+that name's type, as any initialiser is: an unannotated `let a = if c then x
+else 0` makes `a` an `i64`, so `a` narrows into an `i32` like any `i64` does:
+
+```ritz expect-error="implicit narrowing: `n` is declared `i32` but its initialiser has type `i64`"
+fn f(x: i32) -> i32
+    let a = if x > 0 then x else 0
+    let n: i32 = a
+    return n
+```
+
+The same rule, with the same exemptions, holds wherever a value converts to a
+declared integer type: an assignment `n = e` (the slot is `n`'s type, and
+`n += e` is `n = n + e`), a call argument (the parameter's type), and a
+`return` or a function's tail value (the return type):
+
+```ritz expect-error="implicit narrowing: argument 1 of `take` is `i32` but this value has type `i64`"
+fn big() -> i64
+    return 4294967301
+
+fn take(v: i32) -> i32
+    return v
+
+fn main() -> i32
+    return take(big())      # would silently pass 5
+```
+
+A procedure's tail value is discarded, so it converts to nothing and isn't
+checked. Neither is an `async fn`'s result yet: the poll ABI carries it in an
+`i32` until AGAST #3728.
 
 A non-literal array element is held to the same rule, against the element type:
 
@@ -2808,9 +2838,12 @@ let k: i64 = 300
 let a: [2]u8 = [1, k]
 ```
 
-ritz0 and ritz1 both enforce this rule, and `ritz0/test_ritz1_implicit_narrowing.py`
-checks that they give the same verdict on every case in
-`ritz0/test_implicit_narrowing.py`. ritz1 infers the initialiser's type from its
+ritz0 and ritz1 both enforce this rule for a `let`/`var` initialiser and an
+array element, and `ritz0/test_ritz1_implicit_narrowing.py` checks that they
+give the same verdict on every case in `ritz0/test_implicit_narrowing.py`.
+At an assignment, an argument and a `return`, only ritz0 enforces it
+(`ritz0/test_implicit_narrowing_slots.py`, AGAST #1444). ritz1 still narrows
+there silently until AGAST #4081. ritz1 infers the initialiser's type from its
 Ritz types. Where that inference is unsure, for example for an unannotated
 local, ritz1 accepts the initialiser rather than guess (#1364).
 

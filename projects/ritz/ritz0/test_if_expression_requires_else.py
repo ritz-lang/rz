@@ -251,7 +251,7 @@ def test_the_value_was_really_zero_before_and_is_one_after_adding_else(tmp_path)
     """End to end, on exit codes: the well-formed spelling returns the 1."""
     assert _run(tmp_path, (
         "fn pick(c: i32) -> i32\n"
-        "    let x = if c == 1\n"
+        "    let x: i32 = if c == 1\n"
         "        1\n"
         "    else\n"
         "        0\n"
@@ -499,7 +499,7 @@ def test_else_ful_if_as_operand_and_argument_still_runs(tmp_path):
         "        1\n"
         "    else\n"
         "        0\n"
-        "    return x + id(if c == 1 then 10 else 0)\n"
+        "    return (x + id(if c == 1 then 10 else 0)) as i32\n"
     )) == 16
 
 
@@ -513,7 +513,7 @@ def test_else_less_if_statement_inside_an_operand_arm_compiles(tmp_path):
     argument until LARB R46a made a block inside `(` an error.)
     """
     rc, output, _ = _compile(tmp_path, (
-        "fn pick(c: i32, d: i32) -> i32\n"
+        "fn pick(c: i32, d: i32) -> i64\n"
         "    var r: i32 = 0\n"
         "    return 5 + if c == 1\n"
         "        if d == 1\n"
@@ -567,7 +567,7 @@ def test_else_less_if_nested_in_a_statement_block_of_a_value_arm_compiles(tmp_pa
     value is its tail `1`. Walking `Block.stmts` would reject this.
     """
     rc, output, _ = _compile(tmp_path, (
-        "fn pick(c: i32, d: i32) -> i32\n"
+        "fn pick(c: i32, d: i32) -> i64\n"
         "    var r: i32 = 0\n"
         "    let x = if c == 1\n"
         "        if d == 1\n"
@@ -586,7 +586,7 @@ def test_else_ful_if_in_value_position_still_compiles(tmp_path):
     """The form that was always correct: both arms, so there is a phi."""
     rc, output, ir_text = _compile(tmp_path, (
         "fn pick(c: i32) -> i32\n"
-        "    let x = if c == 1\n"
+        "    let x: i32 = if c == 1\n"
         "        1\n"
         "    else\n"
         "        2\n"
@@ -777,7 +777,7 @@ def test_else_if_chain_terminating_in_else_still_compiles(tmp_path):
     """A chain is nested ifs; only the innermost `else` makes it total."""
     rc, output, ir_text = _compile(tmp_path, (
         "fn pick(c: i32) -> i32\n"
-        "    let x = if c == 1\n"
+        "    let x: i32 = if c == 1\n"
         "        1\n"
         "    else if c == 2\n"
         "        2\n"

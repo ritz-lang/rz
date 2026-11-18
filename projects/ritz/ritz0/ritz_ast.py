@@ -685,6 +685,9 @@ class AssignStmt(Stmt):
     target: Expr
     value: Expr
     op: Optional[str] = None
+    # The `let`/`var` name this store stands for, when an async fn's lowering
+    # turned `let v: T = e` into `*self.v = e` (#1444): diagnostics name `v`.
+    lowered_let: Optional[str] = field(default=None, compare=False, repr=False)
 
 
 @dataclass
@@ -893,6 +896,11 @@ class FnDef(Item):
     attrs: List[Attr] = None
     is_extern: bool = False
     is_async: bool = False  # async fn
+    # Generated `NAME_poll` of an async fn (async_transform_v2). Its Ready
+    # `return` squeezes the result through PollAbi's i32 until #3728 (LARB
+    # R78) stores it in the future instead, so §7.5's return check (#1444)
+    # leaves it alone: R78's store is an assignment, which that check covers.
+    is_async_poll: bool = False
     is_pub: bool = False    # pub fn - exported from module
     type_params: List[str] = None  # Generic type parameters like <T, U>
     type_param_bounds: dict = None  # Trait bounds: {"T": ["Drop", "Clone"]}

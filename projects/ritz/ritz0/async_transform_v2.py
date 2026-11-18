@@ -695,7 +695,7 @@ class _CfgBuilder:
             return
 
         if isinstance(stmt, (rast.LetStmt, rast.VarStmt)):
-            self.lower_value(stmt.value, ('field', stmt.name, stmt.span), loop)
+            self.lower_value(stmt.value, ('field', stmt.name, stmt.span, stmt.name), loop)
         elif isinstance(stmt, rast.AssignStmt):
             target = self.hoist(stmt.target)
             self.lower_value(stmt.value, ('assign', stmt, target), loop)
@@ -791,8 +791,9 @@ class _CfgBuilder:
         elif dest[0] == 'return':
             self.ret(value, value.span)
         elif dest[0] == 'field':
-            _, name, span = dest
-            self.emit(rast.AssignStmt(span=span, target=self.rw.self_field(name, span), value=value))
+            _, name, span, *let = dest
+            self.emit(rast.AssignStmt(span=span, target=self.rw.self_field(name, span), value=value,
+                                      lowered_let=let[0] if let else None))
         else:
             _, stmt, target = dest
             new = copy.copy(stmt)
@@ -1075,7 +1076,8 @@ class TrueAsyncGenerator:
             params=[self_param],
             ret_type=self._make_named_type(PollAbi.RET_TYPE),
             body=body,
-            is_async=False
+            is_async=False,
+            is_async_poll=True,
         )
 
     def _straight_body(self, rewriter: SimpleBodyTransformer) -> rast.Block:

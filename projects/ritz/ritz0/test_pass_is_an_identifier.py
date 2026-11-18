@@ -67,7 +67,7 @@ fn var_assigned() -> i32
 fn loop_var() -> i32
     var sum: i32 = 0
     for pass in 0..4
-        sum += pass
+        sum += pass as i32
     return sum
 
 pub fn main() -> i32

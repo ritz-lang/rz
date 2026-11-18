@@ -1502,7 +1502,7 @@ pub fn main() -> i32
     for i in 0..2
         for j in 0..3
             a[i][j] = 9
-            g[i][j] = i * 3 + j
+            g[i][j] = (i * 3 + j) as i32
     put(@&a, g)
     for i in 0..2
         for j in 0..3

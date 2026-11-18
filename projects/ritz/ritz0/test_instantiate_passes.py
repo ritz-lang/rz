@@ -26,7 +26,7 @@ fn ident<T>(x: T) -> T
     x
 
 fn main() -> i32
-    ident(0)
+    ident(0 as i32)
 """
 
 

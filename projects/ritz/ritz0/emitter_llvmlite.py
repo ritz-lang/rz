@@ -9,6 +9,7 @@ This requires external `llc` to compile since llvmlite's bundled LLVM
 doesn't include the x86 asm parser.
 """
 
+import contextlib
 import os
 import re
 import sys
@@ -932,6 +933,13 @@ class LLVMEmitter:
         self.module: Optional[ir.Module] = None
         self.builder: Optional[ir.IRBuilder] = None
         self.current_fn: Optional[ir.Function] = None
+        # #1444: (value, its expr, slot type, slot words) of the value being
+        # assigned, checked by _convert_type when it truncates that value.
+        self._assign_narrowing = None
+        # #1444: id(phi) -> (phi, its arms before an if/match merge widened them).
+        # And id(BinOp) -> the width of the assignment/argument slot it feeds.
+        self._slot_ctx_widths: Dict[int, int] = {}
+        self._int_merges: Dict[int, Tuple[ir.Value, list]] = {}
 
         # Symbol tables
         self.locals: Dict[str, Tuple[ir.AllocaInstr, ir.Type]] = {}  # name -> (alloca, type)
@@ -1774,6 +1782,33 @@ class LLVMEmitter:
             return -expr.operand.value
         return None
 
+    @contextlib.contextmanager
+    def _int_slot_context(self, slot: Optional[rast.Type], value: Optional[rast.Expr]):
+        """Emit `value` as consumed at integer slot `slot` (#1444).
+
+        #1396's literal context, which a `let`, `var` and `return` get through
+        `expected_ritz_type`, for an assignment and a call argument: `mask =
+        mask | (1 << r)` with `mask, r: i32` shifts at i32, as `let m: i32 =
+        mask | (1 << r)` does, so the two are held to the same §7.5 rule. Keyed
+        by node rather than ambient, so a `let` nested in `value` keeps its own.
+        """
+        width = self._slot_width(slot) if slot is not None and value is not None else None
+        if width is None or width >= 64:
+            yield
+            return
+        saved = {}
+        for node in self._arith_context_nodes(value):
+            saved[node] = self._slot_ctx_widths.get(node)
+            self._slot_ctx_widths[node] = width
+        try:
+            yield
+        finally:
+            for node, old in saved.items():
+                if old is None:
+                    self._slot_ctx_widths.pop(node, None)
+                else:
+                    self._slot_ctx_widths[node] = old
+
     def _expected_int_width(self) -> Optional[int]:
         """Width demanded by the declared type currently in context, else None.
 
@@ -1851,15 +1886,20 @@ class LLVMEmitter:
         Returns the adjusted `(left, right)` pair, or None to leave the
         existing widening path untouched.
         """
-        want = self._expected_int_width()
+        # An assignment's or argument's slot (#1444, `_int_slot_context`)
+        # names its own nodes and width; otherwise the declared type in scope.
+        want = self._slot_ctx_widths.get(id(expr))
         if want is None:
-            return None            # no declared type in scope — change nothing
+            want = self._expected_int_width()
+            if want is None:
+                return None            # no declared type in scope — change nothing
 
-        # The declared type is ambient; this BinOp must actually be the thing
-        # being declared, not something nested inside a call argument or an
-        # index that is consumed at a different type. See _arith_context_nodes.
-        if id(expr) not in getattr(self, '_literal_ctx_nodes', ()):
-            return None
+            # The declared type is ambient; this BinOp must actually be the
+            # thing being declared, not something nested inside a call
+            # argument or an index that is consumed at a different type. See
+            # _arith_context_nodes.
+            if id(expr) not in getattr(self, '_literal_ctx_nodes', ()):
+                return None
 
         lit_left = self._untyped_int_literal(expr.left)
         lit_right = self._untyped_int_literal(expr.right)
@@ -6451,9 +6491,13 @@ class LLVMEmitter:
                     # view, as after `return`.
                     last_val = self._emit_slice_into(fn_def.body.expr, fn_def.ret_type)
                 else:
-                    last_val = self._emit_into_array_slot(
-                        fn_def.body.expr, fn_def.ret_type,
-                        lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
+                    # #1444: the tail is a `return`, so it gets the #1396
+                    # literal context a `return` gets: `8 << (k & 3)` in a
+                    # `-> i32` fn shifts at i32 either way.
+                    with self._int_slot_context(fn_def.ret_type, fn_def.body.expr):
+                        last_val = self._emit_into_array_slot(
+                            fn_def.body.expr, fn_def.ret_type,
+                            lambda tail: self._emit_expr_with_expected_enum(tail, expected_enum_name))
                 self._reject_missing_tail_value(
                     fn_def, lambda e: id(e) in self._procedure_calls)
                 # AGAST #3205: every arm of the tail left by `return` (`0 =>
@@ -6496,6 +6540,8 @@ class LLVMEmitter:
                         getattr(fn_def.body.expr, 'span', None))
                     self._reject_another_struct_return(
                         last_val, ret_type, getattr(fn_def.body.expr, 'span', None))
+                    self._check_return_narrowing(
+                        fn_def.body.expr, last_val, ret_type, fn_def.ret_type)
                 # A procedure's tail is discarded (LANGUAGE_SPEC §5.1, LARB
                 # R69): a bool there (a call, or a statement match whose arms
                 # store one beside `_ => pass`) isn't converted into the
@@ -7349,6 +7395,7 @@ class LLVMEmitter:
                 self._reject_enum_as_int(val, ret_type, ret_ritz, ret_span)
                 self._reject_struct_as_int(val, ret_type, ret_ritz, stmt.value, ret_span)
                 self._reject_another_struct_return(val, ret_type, getattr(stmt, 'span', None) or ret_span)
+                self._check_return_narrowing(stmt.value, val, ret_type, ret_ritz)
                 val = self._convert_type(val, ret_type, stmt.value)
                 # Emit drops for all scopes before return (excluding moved variable)
                 self._emit_drop_for_all_scopes(exclude_var)
@@ -7462,7 +7509,7 @@ class LLVMEmitter:
                         self._reject_another_struct(stmt, val, ty)
                         self._reject_pointer_into_float(val, ty, stmt.value)
                     if stmt.type:
-                        self._check_implicit_narrowing(stmt, val.type, ty)
+                        self._check_implicit_narrowing(stmt, val.type, ty, val)
                     # AGAST #1736: an sret call writes the new var in place
                     # (no first-class %T, which clang -O2 lowers per byte).
                     if not self._retarget_sret_result(val, alloca):
@@ -7529,19 +7576,22 @@ class LLVMEmitter:
                 # Use declared type and convert value if needed
                 declared_ty = self._ritz_type_to_llvm(stmt.type)
                 src_ty = val.type  # before _convert_type hides any narrowing
+                src_val = val
                 self._reject_enum_as_int(val, declared_ty, stmt.type,
                                          getattr(stmt, 'span', None))
                 self._reject_another_struct(stmt, val, declared_ty)
                 self._reject_pointer_into_float(val, declared_ty, stmt.value)
                 val = self._convert_type(val, declared_ty, stmt.value)
-                self._check_implicit_narrowing(stmt, src_ty, declared_ty)
+                self._check_implicit_narrowing(stmt, src_ty, declared_ty, src_val)
                 self._check_let_annotation(stmt, val, declared_ty)
+                self._forget_int_merge(src_val)
                 self._bind_let(stmt.name, val, declared_ty)
                 self.ritz_types[stmt.name] = stmt.type  # Store Ritz type for signedness
                 self._register_let_drop(stmt.name, val, stmt.type)
             else:
                 # Infer Ritz type from expression for signedness tracking
                 inferred_ritz_type = nested_type or self._infer_ritz_type(stmt.value, val)
+                self._forget_int_merge(val)
                 self._bind_let(stmt.name, val, val.type)
                 if inferred_ritz_type:
                     self.ritz_types[stmt.name] = inferred_ritz_type
@@ -7623,14 +7673,19 @@ class LLVMEmitter:
                 if target_enum is None and target_ritz_type.args:
                     target_enum = self._ensure_builtin_generic_specialization(
                         target_ritz_type)
-            self._literal_into_slot(self._infer_ritz_type(stmt.target), stmt.value)
+            target_slot = self._infer_ritz_type(stmt.target)
+            self._literal_into_slot(target_slot, stmt.value)
 
             def emit_val():
                 if target_enum is not None:
                     v = self._emit_enum_variant_with_type(stmt.value, target_enum)
                 else:
-                    v = self._emit_into_array_slot(stmt.value, self._assign_slot(stmt))
+                    with self._int_slot_context(target_slot, stmt.value):
+                        v = self._emit_into_array_slot(stmt.value, self._assign_slot(stmt))
                 self._reject_enum_assign(stmt.target, v, getattr(stmt, 'span', None))
+                self._expect_assign_narrowing(stmt.target, stmt.value, v,
+                                              getattr(stmt, 'lowered_let', None),
+                                              getattr(stmt, 'span', None))
                 return v
 
             # LARB R61 (§13.6): the place, then `v`.  `a[i] = v` evaluates
@@ -8617,6 +8672,8 @@ class LLVMEmitter:
 
         # If both branches have values with different types, convert BEFORE branching
         target_type = None
+        # The arms as they were before the merge converted them (#1444).
+        pre_merge = (then_value, else_value)
         if then_value is not None and else_value is not None:
             if then_value.type != else_value.type:
                 # A float-annotated initialiser fixes the merge type (#2027):
@@ -8700,6 +8757,7 @@ class LLVMEmitter:
             phi = self.builder.phi(then_value.type)  # Types should match now after conversion
             phi.add_incoming(then_value, then_exit_block)
             phi.add_incoming(else_value, else_exit_block)
+            self._note_int_merge(phi, pre_merge)
             return phi
 
         # One arm diverged (return/break/continue) and the other has a value
@@ -11945,6 +12003,7 @@ class LLVMEmitter:
             self._reject_enum_as_int(ret_val, ret_type, ret_ritz, ret_span)
             self._reject_struct_as_int(ret_val, ret_type, ret_ritz, expr.value, ret_span)
             self._reject_another_struct_return(ret_val, ret_type, getattr(expr, 'span', None) or ret_span)
+            self._check_return_narrowing(expr.value, ret_val, ret_type, ret_ritz)
             ret_val = self._convert_type(ret_val, ret_type)
             self._emit_drop_for_all_scopes()
             self.builder.ret(ret_val)
@@ -12012,7 +12071,8 @@ class LLVMEmitter:
             if target_enum is None and target_ritz_type.args:
                 target_enum = self._ensure_builtin_generic_specialization(
                     target_ritz_type)
-        self._literal_into_slot(self._infer_ritz_type(expr.target), expr.value)
+        target_slot = self._infer_ritz_type(expr.target)
+        self._literal_into_slot(target_slot, expr.value)
         # LARB R61 (§13.6): the place is addressed before `v` is emitted:
         # `a[i] = v`, `f().x = v`, `*f() = v` (AGAST #1740).
         ptr = (None if isinstance(expr.target, rast.Ident)
@@ -12020,8 +12080,10 @@ class LLVMEmitter:
         if target_enum is not None:
             val = self._emit_enum_variant_with_type(expr.value, target_enum)
         else:
-            val = self._emit_expr(expr.value)
+            with self._int_slot_context(target_slot, expr.value):
+                val = self._emit_expr(expr.value)
         self._reject_enum_assign(expr.target, val, getattr(expr, 'span', None))
+        self._expect_assign_narrowing(expr.target, expr.value, val)
 
         # Handle different target types (similar to AssignStmt handling)
         if isinstance(expr.target, rast.Ident):
@@ -13042,7 +13104,10 @@ class LLVMEmitter:
                             converted_args.append(self._emit_place_borrow(
                                 arg, ir.PointerType(expected_llvm), fname, i + 1, lent))
                             continue
-                        arg_val = self._emit_expr(arg)
+                        with self._int_slot_context(param_type, arg):
+                            arg_val = self._emit_expr(arg)
+                        self._check_arg_narrowing(arg, arg_val, expected_llvm,
+                                                  param_type, fname, i)
                         converted_args.append(self._convert_type(arg_val, expected_llvm, arg, arg=True))
                     # AGAST #1739 / #1745: large struct args go byval and a
                     # large struct result via sret, as for a direct call.
@@ -13293,8 +13358,10 @@ class LLVMEmitter:
                             # so does `Slot.mk(5)` (AGAST #2185).
                             return self._emit_slice_into(a, slot)
                         return self._emit_into_array_slot(a, slot)
-                    val = self._emit_value_arg(arg, param_def.type, emit_plain)
-
+                    with self._int_slot_context(param_def.type, arg):
+                        val = self._emit_value_arg(arg, param_def.type, emit_plain)
+                    self._check_arg_narrowing(arg, val, expected_type,
+                                              param_def.type, fname, i)
                     val = self._convert_type(val, expected_type, arg, arg=True)
                 args.append(val)
 
@@ -13324,9 +13391,16 @@ class LLVMEmitter:
             # Emit arguments with type conversion
             args = []
             for i, arg in enumerate(call.args):
-                val = self._emit_expr(arg)
+                with self._int_slot_context(
+                        extern_def.params[i].type if i < len(extern_def.params) else None,
+                        arg):
+                    val = self._emit_expr(arg)
                 if i < len(fn_type.args):
                     expected_type = fn_type.args[i]
+                    self._check_arg_narrowing(
+                        arg, val, expected_type,
+                        extern_def.params[i].type if i < len(extern_def.params) else None,
+                        fname, i)
                     val = self._convert_type(val, expected_type, arg, arg=True)
                 args.append(val)
 
@@ -14826,13 +14900,18 @@ class LLVMEmitter:
                 else:
                     slot = fn_def.params[i].type if i < len(fn_def.params) else None
                     # AGAST #1577: at the param's enum, not an outer let's.
-                    all_args.append(self._emit_value_arg(
-                        arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
+                    with self._int_slot_context(slot, arg):
+                        all_args.append(self._emit_value_arg(
+                            arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
 
             # Convert argument types as needed
             converted_args = []
             for i, arg in enumerate(all_args):
                 expected_type = self._fn_param_types(fn)[i]
+                self._check_arg_narrowing(
+                    expr.args[i], arg, expected_type,
+                    fn_def.params[i].type if i < len(fn_def.params) else None,
+                    expr.method, i)
                 converted = self._convert_type(arg, expected_type, expr.args[i], arg=True)
                 converted_args.append(converted)
 
@@ -14977,14 +15056,20 @@ class LLVMEmitter:
             else:
                 slot = fn_def.params[j].type if j < len(fn_def.params) else None
                 # AGAST #1577: at the param's enum, not an outer let's.
-                all_args.append(self._emit_value_arg(
-                    arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
+                with self._int_slot_context(slot, arg):
+                    all_args.append(self._emit_value_arg(
+                        arg, slot, lambda a, s=slot: self._emit_into_array_slot(a, s)))
 
         # Convert argument types as needed
         converted_args = []
         for i, arg in enumerate(all_args):
             expected_type = self._fn_param_types(fn)[i]
             # all_args[0] is the receiver.
+            if i:
+                self._check_arg_narrowing(
+                    expr.args[i - 1], arg, expected_type,
+                    fn_def.params[i].type if i < len(fn_def.params) else None,
+                    expr.method, i - 1)
             converted = self._convert_type(arg, expected_type, expr.args[i - 1] if i else None,
                                            arg=i > 0)
             converted_args.append(converted)
@@ -15438,6 +15523,11 @@ class LLVMEmitter:
                     return self.builder.zext(val, target_type)
                 return self.builder.sext(val, target_type)
             elif val.type.width > target_type.width:
+                pending = self._assign_narrowing
+                if pending is not None and pending[0] is val:
+                    self._check_slot_narrowing(pending[1], val, target_type,
+                                               pending[2], pending[3], "assign",
+                                               at=pending[4])
                 return self.builder.trunc(val, target_type)
 
         # Pointer to integer
@@ -15702,7 +15792,8 @@ class LLVMEmitter:
         return (min(r[0] for r in ranges), max(r[1] for r in ranges))
 
     def _check_implicit_narrowing(self, stmt, src_ty: ir.Type,
-                                  declared_ty: ir.Type) -> None:
+                                  declared_ty: ir.Type,
+                                  val: Optional[ir.Value] = None) -> None:
         """Reject `let n: i32 = <i64 expr>` unless it provably loses no bits.
 
         AGAST #1393, the decision taken in #1364: implicit narrowing is an
@@ -15720,7 +15811,7 @@ class LLVMEmitter:
         """
         declared = getattr(stmt, "type", None)
         src_name = self._unproven_narrowing(getattr(stmt, "value", None), src_ty,
-                                            declared_ty, declared)
+                                            declared_ty, declared, val)
         if src_name is None:
             return
         declared_name = self._format_ritz_type(declared)
@@ -15733,20 +15824,89 @@ class LLVMEmitter:
             getattr(stmt, "span", None),
         )
 
+    def _note_int_merge(self, phi: ir.Value, arms) -> None:
+        """Remember integer phi `phi`'s arms as they were before the merge
+        widened them, for `_arms_fit` (#1444). Every integer merge, not only
+        one that widened an arm: `else if` nests one merge in another, and
+        `if a then 1 else 0` has no narrower arm, yet as an arm of an outer
+        merge it must still be judged arm by arm."""
+        if isinstance(phi.type, ir.IntType):
+            self._int_merges[id(phi)] = (phi, list(arms))
+
+    @staticmethod
+    def _int_const_arm(arm) -> Optional[int]:
+        """The signed value of a constant merge arm, else None (#1444).
+
+        A literal is an `ir.Constant`; `-1` and `0 - 1` are emitted as an
+        unfolded `sub C1, C2`, which is just as constant (§7.5: "a constant
+        expression that fits").
+        """
+        if (isinstance(arm, ir.Instruction) and arm.opname == 'sub'
+                and len(arm.operands) == 2):
+            a, b = (LLVMEmitter._int_const_arm(o) for o in arm.operands)
+            if a is None or b is None:
+                return None
+            v = (a - b) & ((1 << arm.type.width) - 1)
+        elif isinstance(arm, ir.Constant) and isinstance(arm.constant, int):
+            v = arm.constant
+        else:
+            return None
+        if v >= 1 << (arm.type.width - 1):
+            v -= 1 << arm.type.width     # llvmlite may hold it unsigned
+        return v
+
+    def _forget_int_merge(self, val: Optional[ir.Value]) -> None:
+        """A `let` has bound merge `val` to a name: from here on it is that
+        name's type, not its arms (§7.5, AGAST #1688). An immutable `let`
+        keeps the phi itself as the name's value, so without this `_arms_fit`
+        found it by identity wherever the name was read, and judged `let a =
+        if c then x else 0` / `let n: i32 = a` lossless where `var a` was not."""
+        if val is not None:
+            self._int_merges.pop(id(val), None)
+
+    def _arms_fit(self, val: Optional[ir.Value], width: int, signs) -> bool:
+        """Is `val` an if/match merge each of whose arms fits `width` bits?
+
+        #1444. A merge is as wide as its widest arm, and an integer-literal
+        arm is an `i64`, so `if n <= 1 then 1 else n` (n: i32) is an i64 phi.
+        Narrowing it back to the `i32` it came from loses nothing: an arm no
+        wider than the slot was only extended, and a constant arm is checked
+        by value. Judged on the arms as emitted, not on inferred types.
+        """
+        entry = self._int_merges.get(id(val)) if val is not None else None
+        if entry is None or entry[0] is not val:
+            return False
+        for arm in entry[1]:
+            v = self._int_const_arm(arm)
+            if v is not None:
+                if not any(self._int_literal_fits(v, width, u) for u in signs):
+                    return False
+            elif not (isinstance(getattr(arm, 'type', None), ir.IntType)
+                      and (arm.type.width <= width or self._arms_fit(arm, width, signs))):
+                return False
+        return True
+
     def _unproven_narrowing(self, value, src_ty: ir.Type, declared_ty: ir.Type,
-                            declared) -> Optional[str]:
-        """The source type's name if `value` narrows and might lose bits."""
+                            declared, val: Optional[ir.Value] = None) -> Optional[str]:
+        """The source type's name if `value` narrows and might lose bits.
+        `val` is its emitted value, if the caller has it, for `_arms_fit`."""
         if not (isinstance(src_ty, ir.IntType) and isinstance(declared_ty, ir.IntType)):
             return None
         if src_ty.width <= declared_ty.width or declared_ty.width == 1:
             return None
-        unsigned = self._is_unsigned_type(declared)
+        # A slot whose Ritz type is unknown (None) has no known signedness:
+        # a value fitting it either way is not a narrowing anyone can show.
+        signs = ((False, True) if declared is None
+                 else (self._is_unsigned_type(declared),))
         rng = self._provable_int_range(value, whole=True)
         if rng is not None:
             lo, hi = rng
-            if (self._int_literal_fits(lo, declared_ty.width, unsigned)
-                    and self._int_literal_fits(hi, declared_ty.width, unsigned)):
+            if any(self._int_literal_fits(lo, declared_ty.width, unsigned)
+                   and self._int_literal_fits(hi, declared_ty.width, unsigned)
+                   for unsigned in signs):
                 return None
+        if self._arms_fit(val, declared_ty.width, signs):
+            return None
         src_name = None
         try:
             inferred = self._infer_ritz_type(value)
@@ -15757,6 +15917,142 @@ class LLVMEmitter:
         if src_name is None or self._INT_TYPE_WIDTHS.get(src_name) != src_ty.width:
             src_name = f"i{src_ty.width}"
         return src_name
+
+    def _expect_assign_narrowing(self, target: rast.Expr, value: rast.Expr,
+                                 val: ir.Value, lowered_let: Optional[str] = None,
+                                 at: Optional[rast.Span] = None) -> None:
+        """Arm section 7.5 for the store of assigned value `val` (#1444).
+
+        An assignment stores through one of a dozen routes (a name, a global,
+        an element, a field, `*p`, ...), each converting `val` to its own slot
+        type. Rather than repeat the check in each, `_convert_type` runs it
+        when it truncates this very value, whichever route stores it.
+        """
+        try:
+            slot = self._infer_ritz_type(target)
+        except Exception:
+            slot = None
+        # An async fn's `let v: T = await e` is a store into `*self.v`: the
+        # user wrote `v`, at the `let`, and the value has no position.
+        place = lowered_let if lowered_let is not None else self._place_text(target)
+        what = (f"`{place}` is `{{t}}`" if place is not None
+                else "the place assigned is `{t}`")
+        self._assign_narrowing = (val, value, slot, what, at if lowered_let else None)
+
+    @classmethod
+    def _place_text(cls, expr: rast.Expr) -> Optional[str]:
+        """`p.x`, `a[..]`, `*p`: a short name for an assigned place."""
+        if isinstance(expr, rast.Ident):
+            return expr.name
+        if isinstance(expr, rast.Grouped):
+            inner = cls._place_text(expr.expr)
+            return f"({inner})" if inner is not None else None
+        if isinstance(expr, rast.Field):
+            inner = cls._place_text(expr.expr)
+            return f"{inner}.{expr.field}" if inner is not None else None
+        if isinstance(expr, rast.Index):
+            inner = cls._place_text(expr.expr)
+            return f"{inner}[..]" if inner is not None else None
+        if isinstance(expr, rast.UnaryOp) and expr.op == '*':
+            inner = cls._place_text(expr.operand)
+            return f"*{inner}" if inner is not None else None
+        return None
+
+    def _check_arg_narrowing(self, arg: rast.Expr, val: ir.Value,
+                             param_ty: ir.Type, param: Optional[rast.Type],
+                             callee: str, index: int) -> None:
+        """Section 7.5 for argument `index` (0-based) of a call (#1444)."""
+        name = callee.partition('$')[0]
+        self._check_slot_narrowing(
+            arg, val, param_ty, param,
+            f"argument {index + 1} of `{name}` is `{{t}}`", "arg")
+
+    def _check_return_narrowing(self, value: rast.Expr, val: ir.Value,
+                                ret_type: ir.Type, ret_ritz: Optional[rast.Type]) -> None:
+        """Section 7.5 for a `return` or a fn's tail value (#1444)."""
+        fn_def = self.current_fn_def
+        if self._is_procedure(fn_def):
+            return      # a procedure's tail is evaluated for effect, not returned
+        if getattr(fn_def, 'is_async_poll', False):
+            return      # PollAbi's i32, not the async fn's type: #3728 (R78)
+        name = getattr(fn_def, 'name', None)
+        what = f"`{name}` returns `{{t}}`" if name else "this fn returns `{t}`"
+        self._check_slot_narrowing(value, val, ret_type, ret_ritz, what, "return")
+
+    def _check_slot_narrowing(self, value: rast.Expr, val: ir.Value,
+                              slot_ty: ir.Type, slot: Optional[rast.Type],
+                              what: str, kind: str = "",
+                              at: Optional[rast.Span] = None) -> None:
+        """Section 7.5 for an assignment, a call argument or a return (#1444).
+
+        `what` names the slot with a `{t}` for its type: "`n` is `{t}`",
+        "argument 2 of `take` is `{t}`", "`r` returns `{t}`". `slot` is its
+        Ritz type, for signedness; None when unknown, which accepts a
+        constant fitting either signedness. `val` is the value as emitted,
+        before `_convert_type`, as for `_check_implicit_narrowing`.
+        """
+        src_ty = getattr(val, 'type', None)
+        if (slot is not None and isinstance(slot_ty, ir.IntType)
+                and self._slot_width(slot) not in (None, slot_ty.width)):
+            slot = None     # e.g. a closure's `return`, not its enclosing fn's
+        src_name = self._unproven_narrowing(value, src_ty, slot_ty, slot, val)
+        if src_name is None:
+            return
+        slot_name = (self._format_ritz_type(slot) if slot is not None
+                     else f"i{slot_ty.width}")
+        probe = os.environ.get("RITZ_NARROWPROBE")
+        if probe:
+            span = self._value_span(value)
+            try:
+                text = open(span.file).read().splitlines()[span.line - 1].strip()
+            except Exception:
+                text = "?"
+            with open(probe, "a") as fh:
+                fh.write(f"{kind}\t{span!r}\t{src_name}\t{slot_name}\t"
+                         f"{self._probe_literal_artifact(value, slot_ty.width)}\t"
+                         f"{getattr(self.current_fn_def, 'name', '?')}\t{text}\n")
+            return
+        raise EmitError(
+            f"implicit narrowing: {what.format(t=slot_name)} but this value has "
+            f"type `{src_name}`, and the compiler cannot prove the value fits. "
+            f"Write `<expr> as {slot_name}` if truncation is intended",
+            at if at is not None else self._value_span(value),
+        )
+
+    def _probe_literal_artifact(self, value, width: int) -> str:
+        """PROBE ONLY (#1444): is the wide type only from a literal operand?"""
+        leaves, stack = [], [value]
+        while stack:
+            e = stack.pop()
+            if isinstance(e, rast.Grouped):
+                stack.append(e.expr)
+            elif isinstance(e, rast.BinOp):
+                stack += [e.left, e.right]
+            elif isinstance(e, rast.UnaryOp) and e.op in ('-', '~'):
+                stack.append(e.operand)
+            else:
+                leaves.append(e)
+        if not any(isinstance(e, rast.IntLit) for e in leaves):
+            return "real"
+        for e in leaves:
+            if isinstance(e, rast.IntLit):
+                continue
+            try:
+                t = self._infer_ritz_type(e)
+            except Exception:
+                return "real"
+            if not (isinstance(t, rast.NamedType)
+                    and self._INT_TYPE_WIDTHS.get(t.name, 99) <= width):
+                return "real"
+        return "literal"
+
+    def _slot_width(self, slot: rast.Type) -> Optional[int]:
+        """The integer width of Ritz type `slot`, or None if not an integer."""
+        try:
+            ty = self._ritz_type_to_llvm(slot)
+        except Exception:
+            return None
+        return ty.width if isinstance(ty, ir.IntType) else None
 
     def _check_element_narrowing(self, element: rast.Expr, src_ty: ir.Type,
                                  declared_ty: ir.Type, declared: rast.Type) -> None:
@@ -16666,6 +16962,7 @@ class LLVMEmitter:
         phi = self.builder.phi(common_type)
         for val, block in converted:
             phi.add_incoming(val, block)
+        self._note_int_merge(phi, [v for v, _ in incoming])
         return phi
 
     def _emit_enum_match(self, expr: rast.Match, enum_val: ir.Value, enum_name: str) -> ir.Value:

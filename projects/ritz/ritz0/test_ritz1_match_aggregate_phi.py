@@ -75,7 +75,7 @@ pub fn main() -> i32
     let b = option_unwrap_or<Point>(@s, d2)
     if b.x != 30 or b.y != 12
         return 2
-    return b.x + b.y
+    return (b.x + b.y) as i32
 """,
     # A non-generic tail match through a pointer, user struct payload.
     "c_tail_match_user_struct": STRUCT_POINT
@@ -97,7 +97,7 @@ pub fn main() -> i32
     let s: Option<Point> = Some(q)
     let d2 = Point { x: 1, y: 2 }
     let b = pick(@s, d2)
-    b.x + b.y
+    (b.x + b.y) as i32
 """,
     # A tail match on an Option local whose arms are StrView params/bindings.
     "d_tail_match_strview": """\
@@ -143,7 +143,7 @@ pub fn main() -> i32
     let q = Point { x: 40, y: 2 }
     let s: Option<Point> = Some(q)
     let b = pick(@s, @h)
-    b.x + b.y
+    (b.x + b.y) as i32
 """,
     # Scalar arms must still phi as i64 (no regression of the common case).
     "e_scalar_arms_unchanged": """\

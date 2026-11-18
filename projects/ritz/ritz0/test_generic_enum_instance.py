@@ -128,7 +128,7 @@ RUNS = {
     # section 4.4).  ritz0 crashed (`Unknown function: Full`, no location) and
     # ritz1 called an undefined `@Full`.  A literal is an i64...
     "untyped_let": (SLOT + "fn main() -> i32\n    let s = Full(5)\n    match s\n"
-                    "        Full(v) => v\n        _ => 2\n", 5),
+                    "        Full(v) => v as i32\n        _ => 2\n", 5),
     "untyped_let_literal_is_i64": (SLOT + "fn f(o: Slot<i64>) -> i64\n    match o\n"
                                    "        Full(v) => v\n        _ => 2\n"
                                    "fn main() -> i32\n    let s = Full(0x100000009)\n"
