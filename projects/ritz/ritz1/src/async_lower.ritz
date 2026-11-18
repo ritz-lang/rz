@@ -331,7 +331,8 @@ struct AlLocal
     span: SrcSpan
     next: *AlLocal
 
-# An await a state drove, and the field its result is stored in.
+# An await (or a short-circuit `&&` / `||`) a state drove, and the field its
+# value is stored in.
 struct AlPoint
     await_expr: *Expr
     result: *u8
@@ -375,6 +376,7 @@ struct AlFn
     nblocks: i32
     cur: *AlBlock       # the open state; null after a jump
     nawaits: i32        # awaits lowered so far
+    nshorts: i32        # `&&` / `||` with an awaiting right operand, so far
     extra: *AlLocal     # the fields it adds, in order
     errs: i32
 
@@ -391,6 +393,7 @@ fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
     a.nblocks = 0
     a.cur = null
     a.nawaits = 0
+    a.nshorts = 0
     a.extra = null
     a.errs = 0
 
@@ -825,13 +828,15 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
             m.next = e.next
             return m
         return e
-    if k == EXPR_AWAIT
+    if k == EXPR_AWAIT or (k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR))
         let p: *AlPoint = al_point_of(a, e)
         if p != null
-            # A state already drove it: its result is stored.
+            # A state already drove it (an await, or a short-circuit whose
+            # right operand awaits): its value is stored.
             let m: *Expr = al_self_field(p.result, p.result_len, e.span)
             m.next = e.next
             return m
+    if k == EXPR_AWAIT
         var op: *Expr = al_rw_expr(a, e.operand)
         let g: *AlAsync = al_call_of_async(op)
         if g != null
@@ -1464,15 +1469,8 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
             else
                 u = c"a `match`"
         al_hoist_arms(a, e.args as *MatchArm, u)
-    else if k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR)
-        al_hoist_walk(a, e.left, under)
-        var u: *u8 = under
-        if u == null
-            if e.op == OP_AND
-                u = c"the right of `&&`"
-            else
-                u = c"the right of `||`"
-        al_hoist_walk(a, e.right, u)
+    else if k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR) and under == null and al_await_in(e.right) != null
+        al_short_circuit(a, e)
     else if k == EXPR_BINARY or k == EXPR_RANGE or k == EXPR_INDEX
         al_hoist_walk(a, e.left, under)
         al_hoist_walk(a, e.right, under)
@@ -1497,6 +1495,37 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
         while el != null
             al_hoist_walk(a, el, under)
             el = el.next
+
+# `l && r` / `l || r` whose `r` awaits (AGAST #4013): `r`, and its awaits,
+# run only when `l` doesn't decide the value.  ritz0's _short_circuit.
+#
+#     __short_K = l
+#     if __short_K { -> R } else { -> J }    # `||`: the arms swap
+#   R: __short_K = r                         # r's awaits in states
+#   J: ... the expression reads __short_K
+fn al_short_circuit(a: *AlFn, e: *Expr)
+    al_hoist_walk(a, e.left, null)
+    var n: i32 = 0
+    let tmp: *u8 = al_numbered(c"__short_", a.nshorts, @n)
+    a.nshorts += 1
+    al_set_scalar(al_extra(a, tmp, n), TYPE_BOOL)
+    let left: *Expr = al_rw_expr(a, e.left)
+    left.next = null
+    al_emit(a, al_assign_self(tmp, n, left, e.span))
+    let rhs: *AlBlock = al_new_block(a)
+    let join: *AlBlock = al_new_block(a)
+    let known: *Expr = al_self_field(tmp, n, e.span)
+    if e.op == OP_AND
+        al_branch(a, known, rhs, join, e.span)
+    else
+        al_branch(a, known, join, rhs, e.span)
+    a.cur = rhs
+    let right: *Expr = al_hoist(a, e.right)
+    right.next = null
+    al_emit(a, al_assign_self(tmp, n, right, e.span))
+    al_goto(a, join, e.span)
+    a.cur = join
+    al_add_point(a, e, tmp, n)
 
 # `await inner` into `d`: a resume point.  An async fn's call builds its
 # future into a field once, and the resume state polls it until it answers
