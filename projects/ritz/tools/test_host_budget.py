@@ -72,6 +72,9 @@ def _env(tmp_path: Path) -> dict[str, str]:
     env = dict(os.environ)
     env["PATH"] = f"{_fake_bin(tmp_path)}:{env['PATH']}"
     env["RZ_SYSTEMD_USER_DIR"] = str(tmp_path / "units")
+    # Runtime drop-ins (--room-memory, AGAST #3971): never the real
+    # /run/user/$UID/systemd/user.control, where live rooms' overrides sit.
+    env["RZ_SYSTEMD_CONTROL_DIR"] = str(tmp_path / "control")
     # Never read the real ~/.config/rz/host.env (huburght has one, AGAST
     # #2998): every test starts as a host with no config file.
     env["RZ_HOST_ENV"] = str(tmp_path / "host.env")
@@ -391,6 +394,258 @@ def test_remove_works_despite_a_bad_config(tmp_path):
     r = _budget(tmp_path, env, "--remove", ROOM)
     assert r.returncode == 0, r.stderr
     assert not _paths(tmp_path)[2].exists()
+
+
+# --------------------------------------------------------------------------
+# per-room memory override: --room-memory (AGAST #3971)
+# --------------------------------------------------------------------------
+#
+# `systemctl --user set-property --runtime` writes 50-MemoryHigh.conf /
+# 50-MemoryMax.conf, which sort BEFORE 50-ritz-host-budget.conf, so the next
+# daemon-reload (every reap runs one) silently restored the 5G default.  The
+# override is a 90- runtime drop-in that sorts after the budget file.
+
+OVERRIDE = "90-rz-room-memory.conf"
+
+
+def _override(tmp_path: Path, room: str = ROOM) -> Path:
+    return tmp_path / "control" / f"adele-agent@{room}.service.d" / OVERRIDE
+
+
+def _effective(tmp_path: Path, room: str = ROOM) -> dict[str, str]:
+    """The unit's settings after a daemon-reload, merged the way systemd does.
+
+    systemd reads every *.conf drop-in of every unit directory, ordered by FILE
+    NAME across directories (a same-named file in a higher-priority directory
+    replaces the lower one), and the last assignment wins.  user.control is
+    the highest-priority directory.
+    """
+    by_name: dict[str, Path] = {}
+    # Lowest priority first, so higher ones replace same-named files.
+    for base in (tmp_path / "units", tmp_path / "control"):
+        d = base / f"adele-agent@{room}.service.d"
+        for f in d.glob("*.conf") if d.is_dir() else []:
+            by_name[f.name] = f
+    out: dict[str, str] = {}
+    for name in sorted(by_name):
+        out.update(_props(by_name[name]))
+    return out
+
+
+@pytest.mark.unit
+def test_runtime_set_property_is_what_used_to_lose(tmp_path):
+    """The bug, as the merge model sees it: set-property's 50-Memory*.conf
+    sorts before 50-ritz-host-budget.conf, so the budget's 5G wins."""
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    d = _override(tmp_path).parent
+    d.mkdir(parents=True)
+    (d / "50-MemoryMax.conf").write_text("[Service]\nMemoryMax=12G\n")
+    assert _effective(tmp_path)["MemoryMax"] == "5G"
+
+
+@pytest.mark.unit
+def test_room_memory_survives_daemon_reload_then_remove(tmp_path):
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    _host_env(tmp_path, HUBURGHT_ENV)  # slice MemoryMax 32G
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    (tmp_path / "calls.log").unlink()
+
+    r = _budget(tmp_path, env, "--room-memory", ROOM, "10G", "12G")
+    assert r.returncode == 0, r.stderr
+    p = _override(tmp_path)
+    assert _props(p) == {"MemoryHigh": "10G", "MemoryMax": "12G"}
+    assert "systemctl --user daemon-reload" in _calls(tmp_path)
+    eff = _effective(tmp_path)
+    assert (eff["MemoryHigh"], eff["MemoryMax"]) == ("10G", "12G")
+    # The budget's other settings still apply underneath.
+    assert eff["Slice"] == "ritz-rooms.slice" and eff["OOMPolicy"] == "continue"
+
+    # Re-running the install (and its daemon-reload) keeps the override.
+    budget_before = _paths(tmp_path)[2].read_text()
+    _paths(tmp_path)[2].write_text("[Service]\n")  # force a rewrite + reload
+    (tmp_path / "calls.log").unlink()
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    assert "systemctl --user daemon-reload" in _calls(tmp_path)
+    assert _paths(tmp_path)[2].read_text() == budget_before
+    assert _effective(tmp_path)["MemoryMax"] == "12G"
+
+    # Same values again: nothing to write, nothing to reload.
+    (tmp_path / "calls.log").unlink()
+    assert _budget(tmp_path, env, "--room-memory", ROOM, "10G", "12G").returncode == 0
+    assert "systemctl --user daemon-reload" not in _calls(tmp_path)
+
+    # Teardown removes it with the budget drop-in.
+    r = _budget(tmp_path, env, "--remove", ROOM)
+    assert r.returncode == 0, r.stderr
+    assert not p.exists() and not p.parent.exists()
+    assert not _paths(tmp_path)[2].exists()
+    assert "systemctl --user daemon-reload" in _calls(tmp_path)
+
+
+@pytest.mark.unit
+def test_remove_keeps_other_runtime_dropins(tmp_path):
+    """--remove deletes its own file only, not e.g. a host's hand-made one."""
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    assert _budget(tmp_path, env, "--room-memory", ROOM, "4G", "6G").returncode == 0
+    other = _override(tmp_path).parent / "90-rz-survey-memory.conf"
+    other.write_text("[Service]\nMemoryMax=7G\n")
+    assert _budget(tmp_path, env, "--remove", ROOM).returncode == 0
+    assert not _override(tmp_path).exists()
+    assert other.exists()
+
+
+@pytest.mark.unit
+def test_clear_room_memory_keeps_the_budget(tmp_path):
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    assert _budget(tmp_path, env, "--room-memory", ROOM, "4G", "6G").returncode == 0
+    (tmp_path / "calls.log").unlink()
+    # A bad host.env must not stop anyone lowering a room back to default.
+    _host_env(tmp_path, "RZ_GATE_SLOTS=many\n")
+    r = _budget(tmp_path, env, "--clear-room-memory", ROOM)
+    assert r.returncode == 0, r.stderr
+    assert not _override(tmp_path).exists()
+    assert not _override(tmp_path).parent.exists()
+    assert _paths(tmp_path)[2].exists()
+    assert "systemctl --user daemon-reload" in _calls(tmp_path)
+    assert _effective(tmp_path)["MemoryMax"] == "5G"
+    # Clearing twice is fine and reloads nothing.
+    (tmp_path / "calls.log").unlink()
+    assert _budget(tmp_path, env, "--clear-room-memory", ROOM).returncode == 0
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "args, why",
+    [
+        (["12G", "10G"], "MemoryHigh=12G is above MemoryMax=10G"),
+        (["6G", "9G"], "above the ritz-rooms.slice MemoryMax=8G"),  # default slice
+        (["lots", "6G"], "size"),
+        (["4G", "$(touch pwned)"], "size"),
+        (["0", "6G"], "size"),
+        (["4G"], "usage"),
+        (["4G", "6G", "7G"], "usage"),
+    ],
+)
+def test_room_memory_refuses_bad_values_and_writes_nothing(tmp_path, args, why):
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    (tmp_path / "calls.log").unlink()
+    r = _budget(tmp_path, env, "--room-memory", ROOM, *args)
+    assert r.returncode != 0
+    assert why in r.stderr
+    assert not (tmp_path / "control").exists()
+    assert not (tmp_path / "pwned").exists()
+    assert _calls(tmp_path) == []
+
+
+@pytest.mark.unit
+def test_room_memory_may_equal_the_slice_cap(tmp_path):
+    env = _env(tmp_path)
+    r = _budget(tmp_path, env, "--room-memory", ROOM, "8G", "8G")
+    assert r.returncode == 0, r.stderr
+
+
+@pytest.mark.unit
+def test_room_memory_rejects_unsafe_room_names(tmp_path):
+    env = _env(tmp_path)
+    r = _budget(tmp_path, env, "--room-memory", "../x", "4G", "6G")
+    assert r.returncode != 0
+    assert not (tmp_path / "control").exists()
+
+
+@pytest.mark.unit
+def test_verify_reports_the_room_override(tmp_path):
+    env = _env(tmp_path)
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    plain = _budget(tmp_path, env, "--verify", ROOM)
+    assert plain.returncode == 0, plain.stderr
+    assert "override" not in plain.stdout  # rooms without one: unchanged
+
+    assert _budget(tmp_path, env, "--room-memory", ROOM, "6G", "7G").returncode == 0
+    r = _budget(tmp_path, env, "--verify", ROOM)
+    assert r.returncode == 0, r.stderr
+    assert "room override MemoryHigh=6G MemoryMax=7G" in r.stdout
+    assert str(_override(tmp_path)) in r.stdout
+
+    # The slice shrank under it (host.env lowered, slice reinstalled): stale.
+    _host_env(tmp_path, "RZ_ROOMS_MEMORY_HIGH=5G\nRZ_ROOMS_MEMORY_MAX=6G\n")
+    assert _budget(tmp_path, env, ROOM).returncode == 0
+    r = _budget(tmp_path, env, "--verify", ROOM)
+    assert r.returncode != 0
+    assert "--clear-room-memory" in r.stderr
+
+
+@pytest.mark.integration
+def test_room_memory_against_the_real_user_manager(tmp_path):
+    """set -> daemon-reload -> the value holds -> clear, on real systemd.
+
+    Uses a scratch instance, adele-agent@rz-budget-probe-<pid>, that is never
+    started: `systemctl show` loads it with its drop-ins and nothing runs.  No
+    live room's unit or drop-in is touched.  The budget drop-in is written to
+    the runtime unit dir ($XDG_RUNTIME_DIR/systemd/user), not ~/.config.
+    """
+    import shutil
+
+    if shutil.which("systemctl") is None:
+        pytest.skip("no systemctl")
+    run = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    probe = subprocess.run(
+        ["systemctl", "--user", "cat", "adele-agent@.service"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if probe.returncode != 0:
+        pytest.skip("no user manager or no adele-agent@.service template here")
+
+    room = f"rz-budget-probe-{os.getpid()}"
+    unit = f"adele-agent@{room}.service"
+    budget_dir = Path(run) / "systemd" / "user" / f"{unit}.d"
+    env = dict(os.environ)
+    env["RZ_HOST_ENV"] = str(tmp_path / "host.env")  # defaults: slice max 8G
+
+    def show() -> dict[str, str]:
+        out = subprocess.run(
+            ["systemctl", "--user", "show", "-p", "MemoryHigh,MemoryMax", unit],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return dict(line.split("=", 1) for line in out.split())
+
+    # Remove afterwards only the directories this test created.
+    made = [d for d in (budget_dir.parent, budget_dir) if not d.exists()]
+    try:
+        budget_dir.mkdir(parents=True, exist_ok=True)
+        (budget_dir / "50-ritz-host-budget.conf").write_text(
+            "[Service]\nMemoryHigh=3500M\nMemoryMax=5G\n"
+        )
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        if show()["MemoryMax"] != str(5 * GIB):
+            pytest.skip("runtime unit dir not on this manager's search path")
+
+        r = _budget(tmp_path, env, "--room-memory", room, "6G", "7G")
+        assert r.returncode == 0, r.stderr
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=True)
+        assert show() == {"MemoryHigh": str(6 * GIB), "MemoryMax": str(7 * GIB)}
+
+        r = _budget(tmp_path, env, "--clear-room-memory", room)
+        assert r.returncode == 0, r.stderr
+        assert show()["MemoryMax"] == str(5 * GIB)
+    finally:
+        _budget(tmp_path, env, "--clear-room-memory", room)
+        conf = budget_dir / "50-ritz-host-budget.conf"
+        if conf.exists():
+            conf.unlink()
+        for d in reversed(made):
+            if d.exists() and not any(d.iterdir()):
+                d.rmdir()
+        subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
 
 
 # --------------------------------------------------------------------------

@@ -4,11 +4,17 @@
 #
 #   .claude/host-budget.sh <room>            install (idempotent); before `systemctl start`
 #   .claude/host-budget.sh --verify <room>   check only, no writes
-#   .claude/host-budget.sh --remove <room>   drop the room's drop-in (reap)
+#   .claude/host-budget.sh --remove <room>   drop the room's drop-ins (reap)
+#   .claude/host-budget.sh --room-memory <room> <high> <max>
+#                                            raise/lower ONE room's caps (Aaron's OK)
+#   .claude/host-budget.sh --clear-room-memory <room>
+#                                            back to the per-room default
 #
 #   <room> is the adele room / unit instance, e.g. ritz-task-1811.
 #
 # Env overrides (tests): RZ_SYSTEMD_USER_DIR  (default ~/.config/systemd/user)
+#                        RZ_SYSTEMD_CONTROL_DIR
+#                                 (default $XDG_RUNTIME_DIR/systemd/user.control)
 #                        RZ_HOST_ENV          (default ~/.config/rz/host.env)
 #
 # PER HOST (AGAST #2998): ~/.config/rz/host.env may set RZ_ROOMS_MEMORY_HIGH /
@@ -87,6 +93,16 @@ GATE_SLOTS=1              # run-gate.sh's default; reported by --verify
 # MemoryHigh < MemoryMax so a room slows down long before anything is killed.
 # OOMPolicy=continue: the default (stop) would take the whole room, agent
 # included, down when one compiler is OOM-killed inside the cap.
+#
+# PER-ROOM OVERRIDE (AGAST #3971): `--room-memory <room> <high> <max>` gives
+# one room other caps, e.g. a survey that needs 12G.  `systemctl --user
+# set-property --runtime` can NOT do this: it writes 50-MemoryHigh.conf /
+# 50-MemoryMax.conf, which sort before 50-ritz-host-budget.conf, so the next
+# daemon-reload (every --remove at a reap runs one) silently restores 5G.
+# The override is a runtime drop-in, user.control/.../90-rz-room-memory.conf,
+# which sorts after the budget file and so wins; it lives under /run, so a
+# reboot drops it.  high <= max <= the ritz-rooms.slice MemoryMax: the slice
+# cap is what protects the machine, and a room can never exceed it anyway.
 ROOM_CPU_WEIGHT=20
 GATE_CPU_WEIGHT=100
 set -euo pipefail
@@ -102,13 +118,19 @@ export HOME PATH XDG_RUNTIME_DIR
 source "$(dirname "${BASH_SOURCE[0]}")/host-env.sh"
 
 UNITS="${RZ_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
+CONTROL="${RZ_SYSTEMD_CONTROL_DIR:-$XDG_RUNTIME_DIR/systemd/user.control}"
 MODE=install
 case "${1:-}" in
     --verify) MODE=verify; shift ;;
     --remove) MODE=remove; shift ;;
+    --room-memory) MODE=room-memory; shift ;;
+    --clear-room-memory) MODE=clear-room-memory; shift ;;
 esac
-if [[ $# -ne 1 ]]; then
-    echo "usage: $0 [--verify|--remove] <room>" >&2
+WANT=1
+[[ "$MODE" == room-memory ]] && WANT=3
+if [[ $# -ne $WANT ]]; then
+    echo "usage: $0 [--verify|--remove|--clear-room-memory] <room>" >&2
+    echo "       $0 --room-memory <room> <MemoryHigh> <MemoryMax>" >&2
     exit 2
 fi
 ROOM="$1"
@@ -119,9 +141,21 @@ if [[ ! "$ROOM" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]*$ ]]; then
     exit 2
 fi
 
-# --remove needs no values: a bad host.env must not block a reap.
+if [[ "$MODE" == room-memory ]]; then
+    OVR_HIGH="$2"
+    OVR_MAX="$3"
+    for v in "$OVR_HIGH" "$OVR_MAX"; do
+        if [[ ! "$v" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
+            echo "error: --room-memory: '$v' is not a size like 12G" >&2
+            exit 2
+        fi
+    done
+fi
+
+# --remove and --clear-room-memory need no values: a bad host.env must not
+# block a reap, or lowering a room back to its default.
 CONFIG_FROM="no host config, defaults"
-if [[ "$MODE" != remove ]]; then
+if [[ "$MODE" != remove && "$MODE" != clear-room-memory ]]; then
     rz_host_env_load || exit 2
     if [[ -e "$RZ_HOST_ENV_FILE" ]]; then
         CONFIG_FROM="$RZ_HOST_ENV_FILE"
@@ -140,6 +174,8 @@ IN_EFFECT="ritz-rooms.slice: MemoryHigh=$ROOMS_MEMORY_HIGH MemoryMax=$ROOMS_MEMO
 
 DROPIN_DIR="$UNITS/adele-agent@$ROOM.service.d"
 DROPIN="$DROPIN_DIR/50-ritz-host-budget.conf"
+OVR_DIR="$CONTROL/adele-agent@$ROOM.service.d"
+OVR="$OVR_DIR/90-rz-room-memory.conf"
 
 ROOMS_SLICE_BODY="# Installed by .claude/host-budget.sh (AGAST #1811). Do not edit by hand.
 [Unit]
@@ -171,6 +207,26 @@ BODIES=("$ROOMS_SLICE_BODY" "$GATE_SLICE_BODY" "$DROPIN_BODY")
 
 current() { [[ -f "$1" ]] && [[ "$(cat "$1")" == "$2" ]]; }
 
+# ovr_check HIGH MAX: prints why the pair is not allowed; returns 1 if so.
+ovr_check() {
+    if (($(rz_size_bytes "$1") > $(rz_size_bytes "$2"))); then
+        echo "MemoryHigh=$1 is above MemoryMax=$2"
+        return 1
+    fi
+    if (($(rz_size_bytes "$2") > $(rz_size_bytes "$ROOMS_MEMORY_MAX"))); then
+        echo "MemoryMax=$2 is above the ritz-rooms.slice MemoryMax=$ROOMS_MEMORY_MAX"
+        return 1
+    fi
+}
+
+# drop_override: delete the room's override (and its dir, if now empty).
+# Returns 0 if there was one.
+drop_override() {
+    [[ -e "$OVR" ]] || return 1
+    rm -f "$OVR"
+    rmdir "$OVR_DIR" 2>/dev/null || true
+}
+
 case "$MODE" in
 verify)
     bad=0
@@ -184,15 +240,58 @@ verify)
         echo "run: $0 $ROOM" >&2
         exit 1
     fi
-    echo "host budget OK for $ROOM ($IN_EFFECT)"
+    OVR_NOTE=""
+    if [[ -e "$OVR" ]]; then
+        h="$(sed -n 's/^MemoryHigh=//p' "$OVR" | tail -n1)"
+        m="$(sed -n 's/^MemoryMax=//p' "$OVR" | tail -n1)"
+        if [[ ! "$h" =~ ^[1-9][0-9]*[KMG]?$ || ! "$m" =~ ^[1-9][0-9]*[KMG]?$ ]]; then
+            why="unreadable MemoryHigh/MemoryMax"
+        else
+            why="$(ovr_check "$h" "$m")" && why=""
+        fi
+        if [[ -n "$why" ]]; then
+            echo "BAD ROOM MEMORY OVERRIDE: $OVR: $why" >&2
+            echo "run: $0 --clear-room-memory $ROOM (or --room-memory with new values)" >&2
+            exit 1
+        fi
+        OVR_NOTE="; room override MemoryHigh=$h MemoryMax=$m from $OVR"
+    fi
+    echo "host budget OK for $ROOM ($IN_EFFECT$OVR_NOTE)"
     ;;
 remove)
+    reload=0
     if [[ -e "$DROPIN" ]]; then
         rm -f "$DROPIN"
         rmdir "$DROPIN_DIR" 2>/dev/null || true
+        reload=1
+    fi
+    drop_override && reload=1
+    [[ $reload -eq 1 ]] && systemctl --user daemon-reload
+    echo "host budget removed for $ROOM (slices kept)"
+    ;;
+room-memory)
+    if ! why="$(ovr_check "$OVR_HIGH" "$OVR_MAX")"; then
+        echo "error: --room-memory $ROOM: $why ($IN_EFFECT)" >&2
+        exit 2
+    fi
+    OVR_BODY="# Installed by .claude/host-budget.sh --room-memory (AGAST #3971). Runtime:
+# gone at reboot.  Sorts after 50-ritz-host-budget.conf, so it survives
+# daemon-reload.  Clear with: .claude/host-budget.sh --clear-room-memory $ROOM
+[Service]
+MemoryHigh=$OVR_HIGH
+MemoryMax=$OVR_MAX"
+    if ! current "$OVR" "$OVR_BODY"; then
+        mkdir -p "$OVR_DIR"
+        printf '%s\n' "$OVR_BODY" > "$OVR.tmp"
+        mv -f "$OVR.tmp" "$OVR"
         systemctl --user daemon-reload
     fi
-    echo "host budget removed for $ROOM (slices kept)"
+    echo "room memory for $ROOM: MemoryHigh=$OVR_HIGH MemoryMax=$OVR_MAX ($OVR; $IN_EFFECT)"
+    ;;
+clear-room-memory)
+    drop_override && systemctl --user daemon-reload
+    echo "room memory for $ROOM: per-room default (MemoryHigh=$ROOM_MEMORY_HIGH" \
+        "MemoryMax=$ROOM_MEMORY_MAX)"
     ;;
 install)
     changed=0

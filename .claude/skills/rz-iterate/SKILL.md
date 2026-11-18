@@ -123,6 +123,17 @@ stays here; remote hosts only run rooms.
   slice is rewritten, and `.claude/host-budget.sh --verify <room>` prints the
   values in effect and where they came from. An unknown key or bad value is
   an error in both scripts, never a silent default.
+- **One room's memory: `.claude/host-budget.sh --room-memory <room> <high>
+  <max>`** (AGAST #3971), e.g. `--room-memory ritz-task-3965 10G 12G`, and
+  `--clear-room-memory <room>` to go back to 3500M / 5G. **Only with Aaron's
+  OK.** The `ritz-rooms.slice` cap is what protects the machine, so the
+  override has to fit under it: high ≤ max ≤ the slice's MemoryMax, or it is
+  refused. Don't use `systemctl --user set-property --runtime`: its
+  `50-Memory*.conf` sorts before `50-ritz-host-budget.conf`, and the next
+  `daemon-reload` (every reap's `--remove` runs one) silently puts 5G back.
+  The script writes `/run/user/$UID/systemd/user.control/adele-agent@<room>.service.d/90-rz-room-memory.conf`,
+  which sorts after the budget file and survives reloads but not a reboot.
+  `--verify <room>` reports it, and `--remove <room>` deletes it at the reap.
 - **Only Aaron, or `adele` (main) on his behalf, marks a host ready** or
   changes its slots. Edit this table and commit it on `main` when they do.
   A host's first room is a small, low-risk ticket.
