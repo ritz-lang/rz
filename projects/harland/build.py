@@ -29,8 +29,8 @@ RITZ_DIR = PROJECT_ROOT / "ritz"
 BUILD_DIR = PROJECT_ROOT / "build"
 KERNEL_DIR = PROJECT_ROOT / "kernel"
 BOOT_DIR = PROJECT_ROOT / "boot"
-USER_DIR = PROJECT_ROOT / "user"
-TOOLS_DIR = PROJECT_ROOT / "tools"
+# Image tools live in indium, the distribution; harland keeps no copy (AGAST #1871).
+INDIUM_TOOLS_DIR = PROJECT_ROOT.parent / "indium" / "tools"
 
 # Output files
 KERNEL_ELF = BUILD_DIR / "harland.elf"
@@ -582,111 +582,6 @@ def create_placeholder_efi(path: Path):
     print(f"  Warning: Placeholder EFI is not functional")
 
 
-def build_userspace():
-    """Build userspace programs."""
-    print("\n=== Building Userspace Programs ===")
-    ensure_dirs()
-    (BUILD_DIR / "user").mkdir(exist_ok=True)
-
-    ritz = find_ritz_compiler()
-
-    # Find all userspace programs (directories under user/)
-    if not USER_DIR.exists():
-        print("  No user/ directory found")
-        return True
-
-    programs = [d for d in USER_DIR.iterdir() if d.is_dir() and (d / "src" / "main.ritz").exists()]
-
-    if not programs:
-        print("  No userspace programs found")
-        return True
-
-    success = True
-    for prog_dir in programs:
-        prog_name = prog_dir.name
-        src_file = prog_dir / "src" / "main.ritz"
-        out_dir = BUILD_DIR / "user" / prog_name
-        out_dir.mkdir(parents=True, exist_ok=True)
-
-        ll_path = out_dir / "main.ll"
-        obj_path = out_dir / "main.o"
-        elf_path = BUILD_DIR / "user" / f"{prog_name}.elf"
-
-        print(f"  Building {prog_name}...")
-
-        # Step 1: Compile Ritz to LLVM IR
-        # Userspace programs need --no-runtime (we provide our own syscall wrappers)
-        result = run([
-            str(ritz), str(src_file),
-            "--no-runtime",
-            "-o", str(ll_path)
-        ], check=False, env={"RITZ_PATH": str(prog_dir / "src")})
-
-        if result.returncode != 0:
-            print(f"    Ritz compilation failed for {prog_name}")
-            success = False
-            continue
-
-        # Step 2: Compile LLVM IR to object file
-        # Use static relocation model for simple userspace programs
-        run([LLC, "-filetype=obj", "-mtriple=x86_64-none-elf",
-             "-relocation-model=static",
-             str(ll_path), "-o", str(obj_path)])
-
-        # Step 3: Link into a position-independent ELF
-        # We use a simple linker script for userspace
-        user_linker_script = USER_DIR / "user.ld"
-        if not user_linker_script.exists():
-            # Create a simple userspace linker script
-            user_linker_script.write_text("""/* Harland userspace linker script */
-ENTRY(main)
-
-SECTIONS {
-    . = 0x400000;  /* Standard userspace base address */
-
-    .text : {
-        *(.text*)
-    }
-
-    .rodata : {
-        *(.rodata*)
-    }
-
-    .data : {
-        *(.data*)
-    }
-
-    .bss : {
-        *(.bss*)
-        *(COMMON)
-    }
-
-    /DISCARD/ : {
-        *(.comment)
-        *(.note*)
-    }
-}
-""")
-
-        import shutil
-        linker = LLD if shutil.which(LLD) else "ld"
-        run([
-            linker,
-            "-T", str(user_linker_script),
-            "-o", str(elf_path),
-            str(obj_path),
-        ], check=False)
-
-        if elf_path.exists():
-            print(f"    Built: {elf_path}")
-            run(["file", str(elf_path)], check=False)
-        else:
-            print(f"    Linking failed for {prog_name}")
-            success = False
-
-    return success
-
-
 def build_image():
     """Build the qcow2 disk image."""
     print("\n=== Building Disk Image ===")
@@ -701,9 +596,9 @@ def build_image():
         print("Building bootloader first...")
         build_bootloader()
 
-    # Run mkimage.py
+    # Run indium's mkimage.py
     run([
-        "python3", str(TOOLS_DIR / "mkimage.py"),
+        "python3", str(INDIUM_TOOLS_DIR / "mkimage.py"),
         "--kernel", str(KERNEL_ELF),
         "--bootloader", str(BOOTLOADER_EFI),
         "--output", str(IMAGE_QCOW2)
@@ -716,9 +611,6 @@ def cmd_build(args):
 
     if target == 'kernel' or target == 'all':
         build_kernel()
-
-    if target == 'user' or target == 'all':
-        build_userspace()
 
     if target == 'boot' or target == 'all':
         build_bootloader()
@@ -827,7 +719,7 @@ def main():
         "target",
         nargs="?",
         default="all",
-        choices=["kernel", "user", "boot", "image", "all"],
+        choices=["kernel", "boot", "image", "all"],
         help="What to build"
     )
     build_parser.set_defaults(func=cmd_build)

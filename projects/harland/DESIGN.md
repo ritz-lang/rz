@@ -432,14 +432,10 @@ harland/
 │   │       ├── apic.ritz     # APIC drivers
 │   │       └── cpu.ritz      # CPU feature detection
 │   └── linker.ld             # Kernel linker script
-├── user/
-│   └── init/
-│       └── main.ritz         # First user process
 ├── tests/
 │   ├── unit/
 │   └── integration/
-├── tools/
-│   └── mkimage.py            # qcow2 builder
+├── tools/                    # boot tests, mkinitramfs.py (image tools: indium/tools)
 ├── Makefile
 ├── DESIGN.md                 # This file
 ├── TODO.md                   # Current work items
