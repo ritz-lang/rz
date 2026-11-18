@@ -432,6 +432,8 @@ param -> *Param
     # silently dropped from every ritz1 build (AGAST #1301).  param_borrow
     # marks it: ritz0 auto-dereferences a scalar `x:& i64` (`x = x + n`),
     # which `@&i64` does not (AGAST #1644).
+    # AGAST #4122: `p:& *[N][M]T`, the borrowed pointer recording its shape.
+    | IDENT COLON_AMP STAR type_spec { param_borrow(p, $1.start, $1.len, type_mut_ref(p, type_ptr_nd(p, $4)), $1.line, $1.col) }
     | IDENT COLON_AMP type_spec { param_borrow(p, $1.start, $1.len, type_mut_ref(p, $3), $1.line, $1.col) }
     # `name:= T` — move parameter (COLON_EQ; the spaced `name: = T` is
     # refused, AGAST #3911).  ritz0 treats its Borrow.MOVE exactly
@@ -441,8 +443,9 @@ param -> *Param
     # it angelo's `fn add_contour(self:& GlyphOutline, contour:= Contour)`
     # and `fn load_font_data(data:= Vec<u8>)` failed to parse (AGAST #1527).
     | IDENT COLON_EQ type_spec { param_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
-    # AGAST #2098: `name: *[N][M]T`.  Only here and in var_type does a `*`
-    # take an N-D pointee (type_ptr_nd); every other `*` refuses one.
+    # AGAST #2098: `name: *[N][M]T`.  Only the sites that record its shape take
+    # an N-D pointee (type_ptr_nd): here, var_type / var_nd_type, ptr_nd_type and
+    # cast_type (#3635, #4122); every other `*` refuses one.
     # AGAST #3930: `*mut T` (LANGUAGE_SPEC §5) is `*T`, as in ritz0, here and
     # at every other `STAR type_spec`.
     | IDENT COLON STAR MUT type_spec { param_new(p, $1.start, $1.len, type_ptr_nd(p, $5), $1.line, $1.col) }
@@ -450,6 +453,9 @@ param -> *Param
     # Before `STAR type_spec`, whose type_spec would take the inner `*`.
     | IDENT COLON STAR STAR type_spec { param_new(p, $1.start, $1.len, type_ptr_nd(p, type_ptr_nd(p, $5)), $1.line, $1.col) }
     | IDENT COLON STAR type_spec { param_new(p, $1.start, $1.len, type_ptr_nd(p, $4), $1.line, $1.col) }
+    # AGAST #4122: and `name: @*[N][M]T` / `name: @&*[N][M]T`, whose `*name` is one.
+    | IDENT COLON AT AMP STAR type_spec { param_new(p, $1.start, $1.len, type_mut_ref(p, type_ptr_nd(p, $6)), $1.line, $1.col) }
+    | IDENT COLON AT STAR type_spec { param_new(p, $1.start, $1.len, type_ref(p, type_ptr_nd(p, $5)), $1.line, $1.col) }
     | IDENT COLON type_spec { param_new(p, $1.start, $1.len, $3, $1.line, $1.col) }
     ;
 
@@ -463,6 +469,9 @@ return_type -> i32
 # (ptr_array_of_last).  Tried before type_spec at each of those sites.
 ptr_nd_type -> i32
     : STAR MUT type_spec { type_ptr_nd(p, $3) }
+    # AGAST #4122: and `**[N][M]T`, whose `*x` is the `*[N][M]T`.  Before
+    # `STAR type_spec`, whose type_spec would take the inner `*`.
+    | STAR STAR type_spec { type_ptr_nd(p, type_ptr_nd(p, $3)) }
     | STAR type_spec { type_ptr_nd(p, $2) }
     ;
 
@@ -1020,6 +1029,8 @@ var_stmt -> *Stmt
       { stmt_named(stmt_var_decl(p, $2.start, $2.len, capture_var_type(p, type_ptr_nd(p, type_ptr_nd(p, $6))), 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
     | VAR binding_name COLON STAR type_spec NEWLINE
       { stmt_named(stmt_var_decl(p, $2.start, $2.len, capture_var_type(p, type_ptr_nd(p, $5)), 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
+    | VAR binding_name COLON var_nd_type NEWLINE   # AGAST #4122
+      { stmt_named(stmt_var_decl(p, $2.start, $2.len, $4, 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
     | VAR binding_name COLON type_spec NEWLINE
       { stmt_named(stmt_var_decl(p, $2.start, $2.len, $4, 0 as *Expr, $1.line, $1.col), $2.line, $2.col) }
     | VAR binding_name ASSIGN expr NEWLINE
@@ -1029,10 +1040,21 @@ var_stmt -> *Stmt
 # Variable type - like type_spec but captures the type name for struct types
 # This prevents the type name from being clobbered when parsing the initializer expression
 var_type -> i32
-    : STAR MUT type_spec { capture_var_type(p, type_ptr_nd(p, $3)) }   # AGAST #3930
+    : var_nd_type { $1 }   # AGAST #4122
+    | STAR MUT type_spec { capture_var_type(p, type_ptr_nd(p, $3)) }   # AGAST #3930
     | STAR STAR type_spec { capture_var_type(p, type_ptr_nd(p, type_ptr_nd(p, $3))) }   # AGAST #3635
     | STAR type_spec { capture_var_type(p, type_ptr_nd(p, $2)) }   # AGAST #2098
     | type_spec { capture_var_type(p, $1) }
+    ;
+
+# AGAST #4122: a local's type holding a `*[N][M]T` other than as the whole
+# type (var_type's own `*` / `**` forms): behind a reference, `@*[N][M]T` /
+# `@&*[N][M]T`, or as the element of an array, `[K]*[N][M]T`.  Each latches
+# the shape (capture_var_type), with or without an initialiser.
+var_nd_type -> i32
+    : AT AMP STAR type_spec { capture_var_type(p, type_mut_ref(p, type_ptr_nd(p, $4))) }
+    | AT STAR type_spec { capture_var_type(p, type_ref(p, type_ptr_nd(p, $3))) }
+    | LBRACKET NUMBER RBRACKET STAR type_spec { capture_var_type(p, type_array(p, $2.start, $2.len, type_ptr_nd(p, $5))) }
     ;
 
 return_stmt -> *Stmt
@@ -1391,7 +1413,9 @@ cast_tail -> *CastTail
 # the comparison.  `x as *Box<i64>` (or `Box<i64>`) at end of line, before
 # `)`, `.` or an operator, is the generic type.
 cast_type -> i32
-    : type_spec cast_type_end { $1 }
+    # AGAST #4122: `x as *[N][M]T`, which cast_tail_new records the shape of.
+    : STAR type_spec cast_type_end { type_ptr_nd(p, $2) }
+    | type_spec cast_type_end { $1 }
     | IDENT { type_named(p, $1.start, $1.len) }
     ;
 

@@ -1372,9 +1372,49 @@ pub fn base_ptr_array(s: *EmitterState, e: *Expr) -> *Param
         let fd: *FnDef = find_call_fn(s, e)
         if fd != null
             pa = fd.ret_ptr_array
+    else if e.kind == EXPR_CAST
+        pa = e.cast_ptr_array   # AGAST #4122: `x as *[N][M]T`
     if pa == null or pa.param_pointee_array_size <= 0
         return null
+    # AGAST #4122: a `**[N][M]T` field, global or return records its `*x`
+    # (ptr_array_of_last); x itself is no array pointer.  base_plane_ptr_ptr.
+    if pa.param_type == TYPE_PTR_PTR
+        return null
     pa
+
+# AGAST #4122: the shape of the `*[N][M]..T` that `*e` reads, `e` a `**[N][M]..T`
+# field `s.q`, global `gq` or call `f()`; null for anything else, a local included.
+fn base_plane_ptr_ptr(s: *EmitterState, e: *Expr) -> *ArrayShape
+    var pa: *Param = null
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = member_field_def(s, e)
+        if f != null
+            pa = f.ptr_array
+    else if e.kind == EXPR_IDENT
+        if find_local_struct_name(s, e.ident_ptr, e.ident_len) != null
+            return null
+        let g: *GlobalVarDef = find_global(s, e.ident_ptr, e.ident_len)
+        if g != null
+            pa = g.ptr_array
+    else if e.kind == EXPR_CALL
+        let fd: *FnDef = find_call_fn(s, e)
+        if fd != null
+            pa = fd.ret_ptr_array
+    if pa == null or pa.param_type != TYPE_PTR_PTR
+        return null
+    pa.param_pointee_array_shape
+
+# AGAST #4122: the shape of the `*[N][M]..T` an element `a[k]` of a
+# `var a: [K]*[N][M]..T` local is; null for anything else.
+fn elem_plane_ptr_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
+    if e.kind != EXPR_INDEX or e.left == null or e.left.kind != EXPR_IDENT
+        return null
+    if e.right == null or e.right.kind == EXPR_RANGE
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, e.left.ident_ptr, e.left.ident_len)
+    if loc == null or loc.var_type != TYPE_ARRAY or loc.array_rec == null
+        return null
+    loc.array_rec.ptr_plane
 
 # AGAST #2304: the stride of `x + k` on `x`, a `*[N]T` field or global: a row,
 # N * sizeof(T), as on a local (#2330, LARB R9).  A global stepped one byte and a
@@ -4573,10 +4613,9 @@ pub fn nd_index_shape(s: *EmitterState, e: *Expr, out_depth: *i32) -> *ArrayShap
     if e == null or e.kind != EXPR_INDEX
         return null
     var depth: i32 = 0
-    var base: *Expr = e
-    while base.kind == EXPR_INDEX
-        depth = depth + 1
-        base = base.left
+    let base: *Expr = nd_chain_base(s, e, @depth)
+    if depth == 0   # AGAST #4122: `a[k]` itself is the plane pointer, no chain
+        return null
     var sh: *ArrayShape = nd_array_base_shape(s, base)
     if sh == null
         sh = plane_ptr_shape(s, base)   # AGAST #2570: `q[i][j]`, q a plane pointer
@@ -4584,6 +4623,18 @@ pub fn nd_index_shape(s: *EmitterState, e: *Expr, out_depth: *i32) -> *ArrayShap
         return null
     *out_depth = depth
     return sh
+
+# The base an index chain `e` indexes, with the number of indices in
+# *out_depth: the innermost non-index operand, or (AGAST #4122) an element
+# `a[k]` of a `[K]*[N][M]T` local, a plane pointer `a[k][i][j]` indexes.
+pub fn nd_chain_base(s: *EmitterState, e: *Expr, out_depth: *i32) -> *Expr
+    var depth: i32 = 0
+    var base: *Expr = e
+    while base.kind == EXPR_INDEX and elem_plane_ptr_shape(s, base) == null
+        depth = depth + 1
+        base = base.left
+    *out_depth = depth
+    base
 
 # AGAST #3306: the struct S when `e` is a full-depth index chain over an N-D
 # `[..]S` (`g[i][j]`, `s.m[i][j]`, `q[i][j]`), whose element is a `%S`
@@ -4618,13 +4669,35 @@ pub fn plane_ptr_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
     if x.kind == EXPR_IDENT
         let lv: *LocalVar = find_local_struct_name(s, x.ident_ptr, x.ident_len)
         if lv != null
-            if lv.var_type == TYPE_PTR_PTR and deref == 0
+            # AGAST #4122: `*r` too, r an `@*[N][M]T` / `@&*[N][M]T` local or param.
+            if local_holds_plane_ptr(lv) == 1 and deref == 0
                 return null
             return lv.pointee_array_shape
+    # AGAST #4122: `a[k]` (and `*a[k]`), a `[K]*[N][M]T` local's element.
+    let el: *ArrayShape = elem_plane_ptr_shape(s, x)
+    if el != null
+        return el
+    # AGAST #4122: `*s.q`, `*gq`, `*f()` through a `**[N][M]T` field, global, call.
+    if deref == 1
+        let held: *ArrayShape = base_plane_ptr_ptr(s, x)
+        if held != null
+            return held
     let pa: *Param = base_ptr_array(s, x)
     if pa == null or pa.param_type != TYPE_PTR
         return null
     pa.param_pointee_array_shape
+
+# AGAST #4122: 1 when the local `lv` holds a plane pointer's address, not the
+# plane pointer: a `**[N][M]T` (#3635), an `@*[N][M]T` or an `@&*[N][M]T`.
+# Only `*lv` is the plane pointer; its slot is loaded twice.
+fn local_holds_plane_ptr(lv: *LocalVar) -> i32
+    # A `let q = @x[i]` plane (#2570) is an `@[M*N]T` with a shape: its
+    # pointee is the array, not a pointer.
+    if lv.pointee_array_shape == null or lv.pointee_type != TYPE_PTR
+        return 0
+    if lv.var_type == TYPE_PTR_PTR or lv.var_type == TYPE_REF or lv.var_type == TYPE_MUT_REF
+        return 1
+    0
 
 # AGAST #2098 / #3635: the `ptr` a plane_ptr_shape base `e` is, in a register:
 # a local's slot loaded (twice for `*r`, r a `**`), else `e` (or the X of a
@@ -4642,7 +4715,7 @@ pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
             emit_str(s, c" = load ptr, ptr ")
             emit_reg(s, lv.reg)
             emit_str(s, c"\n")
-            if lv.var_type == TYPE_PTR_PTR
+            if local_holds_plane_ptr(lv) == 1   # AGAST #4122: a ref too
                 let r2: i32 = next_reg(s)
                 emit_str(s, c"  ")
                 emit_reg(s, r2)
@@ -4658,6 +4731,15 @@ pub fn emit_plane_ptr(s: *EmitterState, e: *Expr) -> i32
     emit_str(s, c" = inttoptr i64 ")
     emit_reg(s, v)
     emit_str(s, c" to ptr\n")
+    # AGAST #4122: `*s.q` / `*gq` / `*f()` loads the `*[N][M]T` the `**` holds.
+    if x != e and base_plane_ptr_ptr(s, x) != null
+        let held: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, held)
+        emit_str(s, c" = load ptr, ptr ")
+        emit_reg(s, ptr)
+        emit_str(s, c"\n")
+        return held
     ptr
 
 # AGAST #2570: the plane `e`, an index chain two or more short of its N-D

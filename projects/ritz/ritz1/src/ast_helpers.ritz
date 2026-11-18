@@ -1951,6 +1951,10 @@ pub fn ptr_array_of_last(p: *Parser, ty: i32) -> *Param
         return param_of_type(p, null, 0, ty)
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_ARRAY
         return param_of_type(p, null, 0, ty)
+    # AGAST #4122: and a `**[N][M]..T`, the shape of the `*[N][M]..T` that `*x`
+    # reads (plane_ptr_shape; base_ptr_array itself answers for `*` only).
+    if ty == TYPE_PTR_PTR and ptr_nd_pointee_shape(p, ty) != null
+        return param_of_type(p, null, 0, ty)
     null
 
 # `name:& T` (AGAST #1644): a TYPE_MUT_REF param that ritz0 auto-derefs.
@@ -2816,6 +2820,8 @@ var g_ret_ptr_array: *Param = null
 fn fn_ret_ptr_array(ret: i32) -> *Param
     if ret == TYPE_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
         return g_ret_ptr_array
+    if ret == TYPE_PTR_PTR   # AGAST #4122: `-> **[N][M]T` (ptr_array_of_last)
+        return g_ret_ptr_array
     return null
 
 fn fn_ret_array(ret: i32) -> *ArrayElem
@@ -3499,6 +3505,7 @@ fn array_elem_of_last(p: *Parser) -> *ArrayElem
     a.shape = p.last_array_shape
     a.ptr_array = g_last_ptr_array
     a.ptr_array_size = g_last_ptr_array_size
+    a.ptr_plane = g_last_ptr_plane
     return a
 
 # AGAST #2995: the `[M]T` that the element of the `[N]*[M]T` just parsed points at,
@@ -3506,6 +3513,9 @@ fn array_elem_of_last(p: *Parser) -> *ArrayElem
 # last_array_*, so they're current whenever the type just parsed is TYPE_ARRAY.
 var g_last_ptr_array: *ArrayElem = null
 var g_last_ptr_array_size: i32 = 0
+# AGAST #4122: the `[N][M]..T` the element of the `[K]*[N][M]..T` just parsed
+# points at; null for any other `[K]T`.
+var g_last_ptr_plane: *ArrayShape = null
 
 fn type_array_sized(p: *Parser, size: i32, elem_type: i32) -> i32
     # AGAST #2995: `[N]*[M]T`.  The `*[M]T` just parsed left the `[M]T` in
@@ -3517,6 +3527,9 @@ fn type_array_sized(p: *Parser, size: i32, elem_type: i32) -> i32
         inner_size = p.last_array_size
     g_last_ptr_array = inner
     g_last_ptr_array_size = inner_size
+    g_last_ptr_plane = null
+    if elem_type == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY and p.last_array_shape != null
+        g_last_ptr_plane = p.last_array_shape
     # AGAST #1509: `[size]<array>` is multi-dimensional.  The inner array's
     # info is still in p.last_array_* (type_spec is right-recursive, so the
     # inner `[M]T` action ran just before this one): prepend `size` to its
@@ -3623,6 +3636,10 @@ pub fn ptr_nd_pointee_shape(p: *Parser, ty: i32) -> *ArrayShape
         return p.last_array_shape
     if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR and p.last_inner_pointee_type == TYPE_ARRAY and p.last_ptr_depth == 2
         return p.last_array_shape
+    # AGAST #4122: and `@*[N][M]..T` / `@&*[N][M]..T`, the `*[N][M]..T` that `*r`
+    # reads, as `@*[N]T` records N and T (#2331).
+    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
+        return p.last_array_shape
     null
 
 # The element count of `sh`, every dimension multiplied.
@@ -3653,9 +3670,10 @@ pub fn type_ptr(p: *Parser, written: i32) -> i32
     type_ptr_nd(p, written)
 
 # AGAST #2098: `*T`, where an N-D T `[N][M]..T` is lowered: the grammar calls
-# this for the outer `*` of a param's or a typed local's type only, which
-# record the shape (ptr_nd_pointee_shape).  Every other `*` is type_ptr, which
-# refuses an N-D pointee.
+# this only where the holder records the shape (ptr_nd_pointee_shape): a
+# param, a typed local, a field, a global, a return (#3635), and behind `@`,
+# `@&`, `:&`, an array's `[K]` or an `as` (#4122).  Every other `*` is
+# type_ptr, which refuses an N-D pointee.
 pub fn type_ptr_nd(p: *Parser, written: i32) -> i32
     let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
     if is_indirection(inner_type) == 0
@@ -5183,6 +5201,8 @@ pub fn stmt_var_decl(p: *Parser, name: *u8, len: i32, ty: i32, init: *Expr, line
         # alias `var b: PA`) must not take an earlier `*[N][M]T`'s.
         if ty == TYPE_PTR or ty == TYPE_PTR_PTR   # #3635: `**[N][M]T` too
             s.var_pointee_array_shape = g_var_ptr_array_shape
+        if ty == TYPE_REF or ty == TYPE_MUT_REF   # #4122: `@*[N][M]T` / `@&*[N][M]T`
+            s.var_pointee_array_shape = g_var_ptr_array_shape
         g_var_ptr_array_shape = null
     s.var_ref = null
     if (ty == TYPE_REF or ty == TYPE_MUT_REF) and g_var_ref != null
@@ -6386,6 +6406,7 @@ pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
     e.op = target_type
     e.cast_pointee = p.last_pointee_type
     e.cast_array = null
+    e.cast_ptr_array = null
     e.fn_sig = null
     e.int_val = TYPE_VOID
     e.ident_ptr = null
@@ -6600,6 +6621,10 @@ pub fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail, as_line: i32, as_col:
     ct.array = null
     if next == null and ty == TYPE_ARRAY
         ct.array = array_elem_of_last(p)
+    # AGAST #4122: `as *[N][M]..T` keeps its shape, as a `*[N][M]..T` return does.
+    ct.ptr_array = null
+    if next == null and ty == TYPE_PTR and ptr_nd_pointee_shape(p, ty) != null
+        ct.ptr_array = param_of_type(p, null, 0, ty)
     ct.pointee_type = TYPE_VOID
     ct.pointee_name = null
     ct.pointee_name_len = 0
@@ -6683,6 +6708,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
         result.ident_len = ct.pointee_name_len
         result.fn_sig = ct.fn_sig
         result.cast_array = ct.array
+        result.cast_ptr_array = ct.ptr_array   # AGAST #4122
         result.bracket = ct.as_at   # AGAST #3040
         ct = ct.next
     return result
@@ -6885,6 +6911,7 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
             cast_expr.kind = EXPR_CAST
             cast_expr.fn_sig = null
             cast_expr.cast_array = null
+            cast_expr.cast_ptr_array = null
             cast_expr.span = result.span
             cast_expr.left = result
             cast_expr.op = op.cast_type

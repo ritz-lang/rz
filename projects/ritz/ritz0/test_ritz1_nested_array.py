@@ -1120,6 +1120,117 @@ pub fn main() -> i32
     return c[1][1] + d[0][1] + mk()[0][2] + 15
 """,
     # ... a step `*(p + k)` copies the plane k past p's ...
+    # AGAST #4122: and every other place a `*[N][M]T` can be written: behind a
+    # reference (`@*[N][M]T` / `@&*[N][M]T`, `(*r)[i][j]`) ...
+    "pointee_ref": """\
+fn bump(r: @&*[2][3]i32)
+    (*r)[0][1] += 1
+
+fn read(p: *[2][3]i32) -> i32
+    var r: @*[2][3]i32 = @p
+    return (*r)[1][2] + (*r)[0][1]
+
+fn write(p: *[2][3]i32)
+    var q: *[2][3]i32 = p
+    var m: @&*[2][3]i32 = @&q
+    (*m)[1][2] = 30
+    (*m)[0][1] = 7
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = 0
+    var p: *[2][3]i32 = @g
+    write(p)
+    bump(@&p)
+    if g[1][2] != 30 or g[0][1] != 8 or g[0][2] != 0
+        return 1
+    return read(p) + 4
+""",
+    # ... an array of them, `a[k][i][j]` element (i, j) of the k-th plane ...
+    "pointee_array_elem": """\
+pub fn main() -> i32
+    var g: [2][3]i32
+    var h: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = 0
+            h[i][j] = 0
+    var a: [2]*[2][3]i32
+    a[0] = @g
+    a[1] = @h
+    a[0][1][2] = 30
+    a[1][0][1] = 7
+    let q: *[2][3]i32 = a[1]
+    q[1][1] = 2
+    if g[1][2] != 30 or h[0][1] != 7 or h[1][1] != 2 or g[0][1] != 0
+        return 1
+    return a[0][1][2] + a[1][0][1] + a[1][1][1] + 3
+""",
+    # ... a `:&` param, written through and retargeted ...
+    "pointee_borrow_param": """\
+var GA: [2][3]i32
+
+fn retarget(p:& *[2][3]i32)
+    p[1][2] = 30
+    p = @GA
+    p[0][1] = 7
+
+pub fn main() -> i32
+    var g: [2][3]i32
+    for i in 0..2
+        for j in 0..3
+            g[i][j] = 0
+    var p: *[2][3]i32 = @g
+    retarget(p)
+    p[1][0] = 5
+    if g[1][2] != 30 or GA[0][1] != 7 or GA[1][0] != 5 or g[1][0] != 0
+        return 1
+    return g[1][2] + GA[0][1] + GA[1][0]
+""",
+    # ... a cast to one, inferred and typed ...
+    "pointee_cast": """\
+pub fn main() -> i32
+    var g: [6]i32
+    for i in 0..6
+        g[i] = i
+    let p = @g as *[2][3]i32
+    p[1][2] = 30
+    let q: *[2][3]i32 = @g as *[2][3]i32
+    if p[0][1] != 1 or q[1][0] != 3 or g[5] != 30
+        return 1
+    return p[1][2] + q[1][0] + p[0][2] + 7
+""",
+    # ... and a `**[N][M]T` field, global and return, `(*x)[i][j]` each.
+    "pointee_ptr_ptr_held": """\
+var GA: [2][3]i32
+var gp: *[2][3]i32 = null
+var gq: **[2][3]i32 = null
+
+struct S
+    k: i32
+    q: **[2][3]i32
+
+fn pp() -> **[2][3]i32
+    return @gp
+
+pub fn main() -> i32
+    for i in 0..2
+        for j in 0..3
+            GA[i][j] = 0
+    gp = @GA
+    var s: S = S { k: 1, q: @gp }
+    (*s.q)[1][2] = 30
+    gq = @gp
+    (*gq)[0][1] = 7
+    let r: **[2][3]i32 = pp()
+    (*r)[1][0] = 2
+    (*pp())[0][0] = 1
+    if gq == null or GA[1][2] != 30 or GA[0][1] != 7 or GA[1][0] != 2 or GA[0][0] != 1
+        return 1
+    return (*s.q)[1][2] + (*gq)[0][1] + (*pp())[1][0] + s.k + 2
+""",
     "pointee_deref_copy_step": """\
 pub fn main() -> i32
     var g: [2][2][3]i32
@@ -1454,23 +1565,9 @@ def test_ritz1_nested_array(ritz1_bin, tmp_path, name):
 # error naming the source line, never a silent `[N x i64]` (AGAST #1509).
 # `needle` is the `:line:` the error must name.
 FAIL_CLOSED = {
-    # AGAST #2098 / #3635: a `*[N][M]T` param, local, field, global, return
-    # and `**[N][M]T` local or param are lowered (RUNNABLE "pointee*"); an
-    # array of them and a cast to one still go through type_ptr, refused (#4122).
-    "pointee_array_elem": ("""\
-pub fn main() -> i32
-    var g: [2][3]i32
-    var a: [2]*[2][3]i32
-    a[0] = @g
-    return 0
-""", ":3:", "multi-dimensional array type is not supported as a pointee"),
-    "pointee_cast": ("""\
-pub fn main() -> i32
-    var g: [6]i32
-    let p = @g as *[2][3]i32
-    return 0
-""", ":3:", "multi-dimensional array type is not supported as a pointee"),
-    # ... an address of another shape, or of a 1-D array, as ritz0 refuses it.
+    # AGAST #2098 / #3635 / #4122: every `*[N][M]T` is lowered (RUNNABLE
+    # "pointee*"); an address of another shape, or of a 1-D array, is refused
+    # as ritz0 refuses it.
     "pointee_shape_mismatch": ("""\
 pub fn main() -> i32
     var g: [2][4]i32
