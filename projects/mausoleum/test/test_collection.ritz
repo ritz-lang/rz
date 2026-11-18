@@ -7,6 +7,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
+import ritzlib.memory
 
 import lib.m7m_types
 import lib.buffer_pool
@@ -457,50 +458,90 @@ fn test_collection_count_after_delete() -> i32
     0
 
 # ============================================================================
-# Document size limit (AGAST #2208)
+# Document size limit (AGAST #2208, #3638)
 # ============================================================================
 #
 # A document with one string field "c" of `len` bytes serializes to
 # DOC_ONE_FIELD_OVERHEAD + len bytes: the 48-byte header, the field
 # (4 key_len + 1 key + 4 type + 8 len) and the 4-byte link count.
+#
+# Up to MAX_INLINE_DOC_SIZE bytes a document is one B-tree value; past
+# that its bytes go to a chain of overflow pages (#3638), up to MAX_DOC_SIZE.
 
 const DOC_ONE_FIELD_OVERHEAD: i64 = 69
 
+# Room for 40 documents of MAX_DOC_SIZE: an in-memory pool cannot evict.
 fn size_test_pool() -> *BufferPool
-    var pool_opt = buffer_pool_new(256)
+    var pool_opt = buffer_pool_new(1024)
     option_unwrap_or<*BufferPool>(@pool_opt, null)
 
-# A document whose serialization is exactly `size` bytes of which the
-# string payload is `payload`, filled with `fill`.
-fn sized_doc(doc: *Document, payload: *u8, size: i64, fill: u8)
+# The payload byte at `i` for `seed`: 251 is prime, so no two overflow pages
+# (4032 bytes each) hold the same run, and a chunk out of place shows.
+fn pattern_byte(seed: i64, i: i64) -> u8
+    ((seed + i % 251) & 255) as u8
+
+# A document whose serialization is exactly `size` bytes; its string
+# payload (written into `payload`, which must hold `size` bytes) follows
+# pattern_byte(seed, _).
+fn sized_doc(doc: *Document, payload: *u8, size: i64, seed: i64)
     let len: i64 = size - DOC_ONE_FIELD_OVERHEAD
-    memset(payload, fill, len)
+    var i: i64 = 0
+    while i < len
+        payload[i] = pattern_byte(seed, i)
+        i += 1
     var id: DocumentId = doc_id_invalid()
     doc_init(doc, @id)
     var f: Field = field_string(payload, len)
     doc_set_field(doc, "c", @f)
 
-# 0 if the stored value for `id` is `size` bytes whose payload is all `fill`.
-fn stored_doc_is(col: *Collection, id: *DocumentId, size: i64, fill: u8) -> i32
-    var key: [8]u8
-    var key_ptr: *i64 = @key[0] as *i64
-    *key_ptr = id.value
-    var val: [2048]u8
-    var val_len: i32 = 0
-    if btree_get(col.tree, @key[0], 8, @val[0], @val_len) != ERR_OK
+# 0 if the stored bytes of `id` are `size` long and its payload follows
+# pattern_byte(seed, _), read back with collection_get_raw.
+fn stored_doc_is(col: *Collection, id: *DocumentId, size: i64, seed: i64) -> i32
+    let val: *u8 = malloc(MAX_DOC_SIZE)
+    var val_len: i64 = 0
+    var rc: i32 = 0
+    if collection_get_raw(col, id, val, MAX_DOC_SIZE, @val_len) != ERR_OK
+        rc = 1
+    else if val_len != size
+        rc = 2
+    else
+        # Payload sits between the header + field prelude (65) and the link count.
+        var i: i64 = 0
+        while rc == 0 and i < size - DOC_ONE_FIELD_OVERHEAD
+            if val[65 + i] != pattern_byte(seed, i)
+                rc = 3
+            i += 1
+    free(val)
+    rc
+
+# 0 if `doc`'s field "c" is `len` payload bytes following pattern_byte(seed, _).
+fn doc_payload_is(doc: *Document, len: i64, seed: i64) -> i32
+    var f: Field
+    if doc_get_field(doc, "c", @f) != ERR_OK
         return 1
-    if val_len as i64 != size
+    if field_string_len(@f) != len
         return 2
-    # Payload sits between the header + field prelude (65) and the link count.
-    var i: i64 = 65
-    while i < size - 4
-        if val[i] != fill
+    let p: *u8 = field_string_ptr(@f)
+    var i: i64 = 0
+    while i < len
+        if p[i] != pattern_byte(seed, i)
             return 3
         i += 1
     0
 
-# Many documents of exactly MAX_DOC_SIZE fill several leaves (one per page
-# at most two fit) and must all come back intact, before and after an update.
+fn insert_sized(col: *Collection, payload: *u8, size: i64, seed: i64, out_id: *DocumentId) -> i32
+    var doc: Document
+    sized_doc(@doc, payload, size, seed)
+    collection_insert(col, @doc, out_id)
+
+fn update_sized(col: *Collection, payload: *u8, id: *DocumentId, size: i64, seed: i64) -> i32
+    var doc: Document
+    sized_doc(@doc, payload, size, seed)
+    doc.id = *id
+    collection_update(col, @doc)
+
+# Many documents of exactly MAX_DOC_SIZE (each an overflow chain) must all
+# come back intact, before and after an update.
 [[test]]
 fn test_collection_max_size_docs_round_trip() -> i32
     let pool: *BufferPool = size_test_pool()
@@ -509,29 +550,215 @@ fn test_collection_max_size_docs_round_trip() -> i32
     var col: Collection
     collection_init(@col, pool, 1)
 
-    var payload: [2048]u8
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
     var ids: [40]DocumentId
     for i in 0..40
-        var doc: Document
-        sized_doc(@doc, @payload[0], MAX_DOC_SIZE, (65 + i % 26) as u8)
-        if collection_insert(@col, @doc, @ids[i]) != ERR_OK
+        if insert_sized(@col, payload, MAX_DOC_SIZE, i as i64, @ids[i]) != ERR_OK
             return 1
     if collection_count(@col) != 40
         return 2
     for i in 0..40
-        if stored_doc_is(@col, @ids[i], MAX_DOC_SIZE, (65 + i % 26) as u8) != 0
+        if stored_doc_is(@col, @ids[i], MAX_DOC_SIZE, i as i64) != 0
             return 10 + i as i32
 
     # Rewrite every document with a new payload.
     for i in 0..40
-        var doc: Document
-        sized_doc(@doc, @payload[0], MAX_DOC_SIZE, (97 + i % 26) as u8)
-        doc.id = ids[i]
-        if collection_update(@col, @doc) != ERR_OK
+        if update_sized(@col, payload, @ids[i], MAX_DOC_SIZE, 100 + i as i64) != ERR_OK
             return 3
     for i in 0..40
-        if stored_doc_is(@col, @ids[i], MAX_DOC_SIZE, (97 + i % 26) as u8) != 0
+        if stored_doc_is(@col, @ids[i], MAX_DOC_SIZE, 100 + i as i64) != 0
             return 50 + i as i32
+    free(payload)
+    buffer_pool_destroy(pool)
+    0
+
+# Every size around the inline limit and the page boundaries round-trips
+# through collection_get, string fields included.
+[[test]]
+fn test_collection_doc_sizes_round_trip() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    var sizes: [8]i64
+    sizes[0] = MAX_INLINE_DOC_SIZE
+    sizes[1] = MAX_INLINE_DOC_SIZE + 1
+    sizes[2] = 4032
+    sizes[3] = 4033
+    sizes[4] = 2 * 4032
+    sizes[5] = 2 * 4032 + 1
+    sizes[6] = MAX_DOC_SIZE - 1
+    sizes[7] = MAX_DOC_SIZE
+    for k in 0..8
+        var id: DocumentId
+        if insert_sized(@col, payload, sizes[k], k as i64, @id) != ERR_OK
+            return 10 + k as i32
+        var doc: Document
+        if collection_get(@col, @id, @doc, buf, MAX_DOC_SIZE) != ERR_OK
+            return 20 + k as i32
+        if doc_payload_is(@doc, sizes[k] - DOC_ONE_FIELD_OVERHEAD, k as i64) != 0
+            return 30 + k as i32
+    free(buf)
+    free(payload)
+    buffer_pool_destroy(pool)
+    0
+
+# A document over MAX_INLINE_DOC_SIZE takes pages of its own; one at the
+# limit does not.
+[[test]]
+fn test_collection_only_large_docs_take_overflow_pages() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    var id: DocumentId
+    let before: i64 = buffer_pool_page_count(pool)
+    if insert_sized(@col, payload, MAX_INLINE_DOC_SIZE, 1, @id) != ERR_OK
+        return 1
+    if buffer_pool_page_count(pool) != before
+        return 2
+    if insert_sized(@col, payload, MAX_INLINE_DOC_SIZE + 1, 2, @id) != ERR_OK
+        return 3
+    if buffer_pool_page_count(pool) != before + 1
+        return 4
+    if insert_sized(@col, payload, MAX_DOC_SIZE, 3, @id) != ERR_OK
+        return 5
+    # ceil(32768 / 4032) = 9 pages.
+    if buffer_pool_page_count(pool) != before + 10
+        return 6
+    free(payload)
+    buffer_pool_destroy(pool)
+    0
+
+# Rewriting or deleting a large document gives its pages back, so a store
+# that only rewrites does not grow (AGAST #3638).
+[[test]]
+fn test_collection_overflow_pages_are_reused() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    var id: DocumentId
+    if insert_sized(@col, payload, MAX_DOC_SIZE, 1, @id) != ERR_OK
+        return 1
+    # The second chain is written before the first is freed: room for both.
+    if update_sized(@col, payload, @id, MAX_DOC_SIZE, 2) != ERR_OK
+        return 2
+    let high: i64 = buffer_pool_page_count(pool)
+    for i in 0..20
+        if update_sized(@col, payload, @id, MAX_DOC_SIZE - i as i64 * 1000, 3 + i as i64) != ERR_OK
+            return 3
+        if stored_doc_is(@col, @id, MAX_DOC_SIZE - i as i64 * 1000, 3 + i as i64) != 0
+            return 4
+    if buffer_pool_page_count(pool) != high
+        return 5
+    # Large to inline and back.
+    if update_sized(@col, payload, @id, 100, 40) != ERR_OK
+        return 6
+    if buffer_pool_free_page_count(pool) < 9
+        return 7
+    if stored_doc_is(@col, @id, 100, 40) != 0
+        return 8
+    if update_sized(@col, payload, @id, MAX_DOC_SIZE, 41) != ERR_OK
+        return 9
+    if stored_doc_is(@col, @id, MAX_DOC_SIZE, 41) != 0
+        return 10
+    # Delete: both chains' pages are free.  Insert as large: the same
+    # pages again.
+    if collection_delete(@col, @id) != ERR_OK
+        return 11
+    if buffer_pool_free_page_count(pool) != 18
+        return 15
+    if insert_sized(@col, payload, MAX_DOC_SIZE, 42, @id) != ERR_OK
+        return 12
+    if stored_doc_is(@col, @id, MAX_DOC_SIZE, 42) != 0
+        return 13
+    if buffer_pool_page_count(pool) != high
+        return 14
+    free(payload)
+    buffer_pool_destroy(pool)
+    0
+
+# A scan's values are whole documents: collection_iter_value follows the
+# overflow chains btree_iter_value only points at.
+[[test]]
+fn test_collection_scan_resolves_large_docs() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    var sizes: [4]i64
+    sizes[0] = 200
+    sizes[1] = MAX_DOC_SIZE
+    sizes[2] = 300
+    sizes[3] = 9000
+    var id: DocumentId
+    for k in 0..4
+        if insert_sized(@col, payload, sizes[k], k as i64, @id) != ERR_OK
+            return 1
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    let iter_opt = collection_scan(@col)
+    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    if iter == null
+        return 2
+    var k: i32 = 0
+    while btree_iter_valid(iter) == 1
+        var len: i64 = 0
+        if collection_iter_value(@col, iter, buf, MAX_DOC_SIZE, @len) != ERR_OK
+            return 10 + k
+        if len != sizes[k]
+            return 20 + k
+        var doc: Document
+        if doc_deserialize(buf, len, @doc) != ERR_OK
+            return 30 + k
+        if doc_payload_is(@doc, sizes[k] - DOC_ONE_FIELD_OVERHEAD, k as i64) != 0
+            return 40 + k
+        k += 1
+        btree_iter_next(iter)
+    btree_iter_destroy(iter)
+    if k != 4
+        return 3
+    free(buf)
+    free(payload)
+    buffer_pool_destroy(pool)
+    0
+
+# A buffer too small for the document is refused, not overrun; the length
+# it would need comes back.
+[[test]]
+fn test_collection_get_raw_refuses_a_short_buffer() -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    var small_id: DocumentId
+    var big_id: DocumentId
+    insert_sized(@col, payload, 500, 1, @small_id)
+    insert_sized(@col, payload, 9000, 2, @big_id)
+    var buf: [1000]u8
+    buf[499] = 7
+    var len: i64 = 0
+    if collection_get_raw(@col, @small_id, @buf[0], 499, @len) != ERR_FULL or len != 500
+        return 1
+    if buf[499] != 7
+        return 2
+    if collection_get_raw(@col, @big_id, @buf[0], 1000, @len) != ERR_FULL or len != 9000
+        return 3
+    if collection_get_raw(@col, @small_id, @buf[0], 500, @len) != ERR_OK or len != 500
+        return 4
+    free(payload)
+    buffer_pool_destroy(pool)
     0
 
 # One byte over the limit is refused (and leaves nothing behind).
@@ -543,35 +770,36 @@ fn test_collection_refuses_a_doc_one_byte_over_the_limit() -> i32
     var col: Collection
     collection_init(@col, pool, 1)
 
-    var payload: [2100]u8
-    var doc: Document
-    sized_doc(@doc, @payload[0], MAX_DOC_SIZE + 1, 120 as u8)
+    let payload: *u8 = malloc(MAX_DOC_SIZE + 1)
     var id: DocumentId
-    if collection_insert(@col, @doc, @id) != ERR_FULL
+    let pages: i64 = buffer_pool_page_count(pool)
+    if insert_sized(@col, payload, MAX_DOC_SIZE + 1, 1, @id) != ERR_FULL
         return 1
-    if collection_count(@col) != 0
+    if collection_count(@col) != 0 or buffer_pool_page_count(pool) != pages
         return 2
 
     # And an update to one byte over keeps the old version.
-    var small: Document
-    sized_doc(@small, @payload[0], 100, 121 as u8)
-    if collection_insert(@col, @small, @id) != ERR_OK
+    if insert_sized(@col, payload, 100, 2, @id) != ERR_OK
         return 3
-    sized_doc(@doc, @payload[0], MAX_DOC_SIZE + 1, 122 as u8)
-    doc.id = id
-    if collection_update(@col, @doc) != ERR_FULL
+    if update_sized(@col, payload, @id, MAX_DOC_SIZE + 1, 3) != ERR_FULL
         return 4
-    # sized_doc reuses `payload`, so check the stored copy, not the buffer.
-    if stored_doc_is(@col, @id, 100, 121 as u8) != 0
+    if stored_doc_is(@col, @id, 100, 2) != 0
         return 5
+    free(payload)
+    buffer_pool_destroy(pool)
     0
 
-# MAX_DOC_SIZE is a constant for the layers above; it must be exactly what
-# the B-tree stores under a document-id key.
+# The limits the layers above build on: a document fits a B-tree value up
+# to btree_max_value_len(8) bytes, and MAX_DOC_SIZE is 32 KiB.
 [[test]]
-fn test_collection_max_doc_size_is_the_btree_value_limit() -> i32
-    if MAX_DOC_SIZE != btree_max_value_len(8) as i64
+fn test_collection_doc_size_limits() -> i32
+    if MAX_INLINE_DOC_SIZE != btree_max_value_len(8) as i64
         return 1
+    if MAX_DOC_SIZE != 32768
+        return 2
+    # collection.ritz reads raw B-tree values into [2048]u8 buffers.
+    if MAX_INLINE_DOC_SIZE > 2048
+        return 3
     0
 
 # ============================================================================

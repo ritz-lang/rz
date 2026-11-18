@@ -117,6 +117,15 @@ SENDING (3)
 collections big enough to need batches > 7 KiB worth visiting, switch
 to B.
 
+**Since #3638 (documents up to 32 KiB): both.**  Batches still aim at
+~7 KiB, but a document that alone exceeds that goes in a batch of its own,
+and any message over `TASK_BUFFER_SIZE` (8 KiB) — a large INSERT/UPDATE
+coming in, a GET_OK or SCAN_RESULT going out, or their encrypted frames —
+goes through the session's `big_recv` / `big_send` heap buffers
+(`ASYNC_MAX_FRAME` bytes, allocated on first use, freed with the session).
+Replies are built in `ASYNC_MAX_MSG` (36 KiB) stack buffers, and a send that
+completes short is resubmitted for the rest.
+
 ### File layout
 
 ```

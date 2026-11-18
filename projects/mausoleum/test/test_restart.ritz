@@ -17,6 +17,7 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.strview
 import ritzlib.option
+import ritzlib.memory
 
 import lib.m7m_types
 import lib.page
@@ -349,3 +350,143 @@ fn test_close_checkpoints_the_wal() -> i32
     if wal_closed < 0 or wal_closed > 64
         return 3
     return 0
+
+# ============================================================================
+# Large documents (AGAST #3638): overflow chains and their freed pages
+# ============================================================================
+
+# Payload byte `i` of large document `seed`.
+fn big_byte(seed: i64, i: i64) -> u8
+    ((seed * 7 + i % 251) & 255) as u8
+
+# Insert (out_id != null) or rewrite (*id) a document whose one field "c" is
+# `len` bytes of big_byte(seed, _).
+fn put_big(col: *Collection, id: *DocumentId, len: i64, seed: i64, insert: bool) -> i32
+    let payload: *u8 = malloc(len)
+    var i: i64 = 0
+    while i < len
+        payload[i] = big_byte(seed, i)
+        i += 1
+    var doc: Document
+    var tmp: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp)
+    var f: Field = field_string(payload, len)
+    doc_set_field(@doc, "c", @f)
+    var rc: i32 = 0
+    if insert
+        rc = collection_insert(col, @doc, id)
+    else
+        doc.id = *id
+        rc = collection_update(col, @doc)
+    free(payload)
+    rc
+
+# 1 if document `id` is there with field "c" of `len` bytes of big_byte(seed, _).
+fn has_big(col: *Collection, id: *DocumentId, len: i64, seed: i64) -> i32
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    var doc: Document
+    var ok: i32 = 0
+    if collection_get(col, id, @doc, buf, MAX_DOC_SIZE) == ERR_OK
+        var f: Field
+        if doc_get_field(@doc, "c", @f) == ERR_OK and field_string_len(@f) == len
+            ok = 1
+            let p: *u8 = field_string_ptr(@f)
+            var i: i64 = 0
+            while ok == 1 and i < len
+                if p[i] != big_byte(seed, i)
+                    ok = 0
+                i += 1
+    free(buf)
+    ok
+
+# Large documents come back after a clean restart, and a rewrite that only
+# reached the WAL (crash mid-flush) is redone, its new chain included.
+[[test]]
+fn test_restart_keeps_large_documents() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"large")
+    rm_dir_flat(@path[0])
+
+    var s: *Storage = open_store(@path[0])
+    if s == null
+        return 1
+    var col: Collection
+    if collection_open_storage(@col, s, 1) != ERR_OK
+        return 2
+    var a: DocumentId
+    var b: DocumentId
+    if put_big(@col, @a, 20000, 1, true) != ERR_OK or put_big(@col, @b, MAX_DOC_SIZE - 100, 2, true) != ERR_OK
+        return 3
+    if collection_commit(@col, s) != ERR_OK
+        return 4
+    storage_destroy(s)
+
+    s = open_store(@path[0])
+    if s == null or collection_open_storage(@col, s, 1) != ERR_OK
+        return 5
+    if has_big(@col, @a, 20000, 1) == 0 or has_big(@col, @b, MAX_DOC_SIZE - 100, 2) == 0
+        return 6
+    # Rewrite `a` larger; WAL commit only, then "crash".
+    if put_big(@col, @a, 30000, 3, false) != ERR_OK
+        return 7
+    var meta: CollectionMeta
+    collection_meta(@col, @meta)
+    storage_set_collection_meta(s, @meta)
+    if storage_wal_commit(s) != ERR_OK
+        return 8
+
+    s = open_store(@path[0])
+    if s == null or collection_open_storage(@col, s, 1) != ERR_OK
+        return 9
+    var rc: i32 = 0
+    if has_big(@col, @a, 30000, 3) == 0
+        rc = 10
+    else if has_big(@col, @b, MAX_DOC_SIZE - 100, 2) == 0
+        rc = 11
+    storage_destroy(s)
+    rm_dir_flat(@path[0])
+    rc
+
+# The pages a deleted large document gave back are still free after a
+# restart: inserting another one does not grow data.m7m.
+[[test]]
+fn test_restart_reuses_pages_freed_before_it() -> i32
+    var path: [96]u8
+    make_tmp_path(@path[0], c"freed")
+    rm_dir_flat(@path[0])
+
+    var s: *Storage = open_store(@path[0])
+    if s == null
+        return 1
+    var col: Collection
+    if collection_open_storage(@col, s, 1) != ERR_OK
+        return 2
+    var id: DocumentId
+    if put_big(@col, @id, MAX_DOC_SIZE - 100, 1, true) != ERR_OK
+        return 3
+    if collection_commit(@col, s) != ERR_OK
+        return 4
+    if collection_delete(@col, @id) != ERR_OK
+        return 5
+    if collection_commit(@col, s) != ERR_OK
+        return 6
+    let pages: i64 = buffer_pool_page_count(storage_pool(s))
+    storage_destroy(s)
+
+    s = open_store(@path[0])
+    if s == null or collection_open_storage(@col, s, 1) != ERR_OK
+        return 7
+    if put_big(@col, @id, MAX_DOC_SIZE - 100, 2, true) != ERR_OK
+        return 8
+    if collection_commit(@col, s) != ERR_OK
+        return 9
+    var rc: i32 = 0
+    if buffer_pool_page_count(storage_pool(s)) != pages
+        rc = 10
+    else if has_big(@col, @id, MAX_DOC_SIZE - 100, 2) == 0
+        rc = 11
+    storage_destroy(s)
+    if rc == 0 and file_size(@path[0], c"/data.m7m") != pages * PAGE_SIZE
+        rc = 12
+    rm_dir_flat(@path[0])
+    rc

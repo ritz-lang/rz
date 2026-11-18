@@ -35,6 +35,8 @@ import ritzlib.async.tasks {
     task_server_set_shutdown_hook,
     task_submit_recv,
     task_submit_send,
+    task_submit_send_buf,
+    task_submit_recv_buf,
     task_reset_for_recv,
     TASK_BUFFER_SIZE,
     TASK_WAITING,
@@ -49,10 +51,10 @@ import mausoleum.buffer_pool
 import mausoleum.storage
 import mausoleum.registry
 import mausoleum.btree {
+    BTreeIter,
     btree_iter_valid,
     btree_iter_next,
     btree_iter_key,
-    btree_iter_value,
     btree_iter_destroy
 }
 
@@ -65,7 +67,7 @@ import cryptosec.crypto_error
 import mausoleum.session_kdf
 import cryptosec.random
 import cryptosec.mem
-import ritzlib.memory { secure_zero, memzero }
+import ritzlib.memory { secure_zero, memzero, malloc, free }
 
 
 # ============================================================================
@@ -111,6 +113,17 @@ const ENC_TAG_SIZE:        i32 = 16
 const ENC_PUBKEY_SIZE:     i32 = 32
 const ENC_KEY_SIZE:        i32 = 32
 
+# The longest M7SP message the async loops take or send (AGAST #3638): a
+# MAX_DOC_SIZE document and 4 KiB for its framing (header, length prefix,
+# a SCAN_RESULT's counts and id).  The replies are built in stack buffers
+# of this literal size ([36864]u8; test_server_async pins the two equal).
+# A message over TASK_BUFFER_SIZE does not fit the task's own 8 KiB
+# buffers; it goes through the session's big_recv / big_send instead.
+pub const ASYNC_MAX_MSG: i32 = 36864
+# An encrypted frame of an ASYNC_MAX_MSG plaintext (length prefix, nonce
+# and tag around it): the size of big_recv and big_send.
+pub const ASYNC_MAX_FRAME: i32 = 36896
+
 
 struct M7SPSession
     in_use: i32                # 1 when the slot is mapped to a live task
@@ -139,10 +152,18 @@ struct M7SPSession
     scan_max_results: i32      # max_results from MSG_SCAN payload (0 = all)
     scan_total_emitted: i32    # docs emitted across all batches so far
 
-    # Future (phase 4-B): heap-allocated big_send buffer for SCAN_RESULTs > 8 KiB
-    big_send_ptr: i64          # 0 when unused
-    big_send_len: i32
-    big_send_pos: i32
+    # Messages over TASK_BUFFER_SIZE (AGAST #3638).  big_recv / big_send
+    # are heap buffers of ASYNC_MAX_FRAME bytes, allocated the first time
+    # the session needs one and freed by m7sp_session_destroy.  recv_big:
+    # the message being received is collected in big_recv, not read_buf.
+    big_recv: i64              # *u8, 0 = none yet
+    big_send: i64              # *u8, 0 = none yet
+    recv_big: i32
+    # The reply in flight: send_ptr[0..send_len), send_pos bytes sent so
+    # far (a send may complete short; the rest is sent again).
+    send_ptr: i64
+    send_len: i32
+    send_pos: i32
 
     # ─── Phase 6: encrypted-channel state (unused in plain mode) ───
     # X25519 ephemeral keypair + peer pubkey.  After the handshake we
@@ -179,9 +200,10 @@ fn m7sp_session_init(idx: i32)
     g_sessions[idx].scan_request_id = 0
     g_sessions[idx].scan_max_results = 0
     g_sessions[idx].scan_total_emitted = 0
-    g_sessions[idx].big_send_ptr = 0
-    g_sessions[idx].big_send_len = 0
-    g_sessions[idx].big_send_pos = 0
+    g_sessions[idx].recv_big = 0
+    g_sessions[idx].send_ptr = 0
+    g_sessions[idx].send_len = 0
+    g_sessions[idx].send_pos = 0
 
 
 pub fn m7sp_session_destroy(idx: i32)
@@ -201,7 +223,13 @@ pub fn m7sp_session_destroy(idx: i32)
     g_sessions[idx].cipher_recv_nonce = 0
 
     g_sessions[idx].in_use = 0
-    # TODO phase 4-B: if big_send_ptr != 0, munmap it
+    if g_sessions[idx].big_recv != 0
+        free(g_sessions[idx].big_recv as *u8)
+        g_sessions[idx].big_recv = 0
+    if g_sessions[idx].big_send != 0
+        free(g_sessions[idx].big_send as *u8)
+        g_sessions[idx].big_send = 0
+    g_sessions[idx].recv_big = 0
 
     # Draining: this may have been the last busy session, and nothing else
     # would wake the loop to notice — see shutdown_hook.
@@ -223,9 +251,10 @@ pub fn m7sp_session_init_encrypted(idx: i32)
     g_sessions[idx].next_doc_id = 1
     g_sessions[idx].scan_iter = 0
     g_sessions[idx].scan_request_id = 0
-    g_sessions[idx].big_send_ptr = 0
-    g_sessions[idx].big_send_len = 0
-    g_sessions[idx].big_send_pos = 0
+    g_sessions[idx].recv_big = 0
+    g_sessions[idx].send_ptr = 0
+    g_sessions[idx].send_len = 0
+    g_sessions[idx].send_pos = 0
 
     # Generate an ephemeral X25519 keypair.
     getrandom(@g_sessions[idx].cipher_private_key[0], 32, 0)
@@ -436,6 +465,102 @@ fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
 
 
 # ============================================================================
+# Messages over TASK_BUFFER_SIZE (AGAST #3638)
+# ============================================================================
+
+# The session's heap buffer in *slot (big_recv or big_send), allocated on
+# first use; null if malloc fails.
+fn m7sp_session_buf(slot: *i64) -> *u8
+    if *slot == 0
+        *slot = malloc(ASYNC_MAX_FRAME as i64) as i64
+    return *slot as *u8
+
+
+# The bytes of the message being received: big_recv or task.read_buf.
+fn m7sp_msg_bytes(task: *Task, session: *M7SPSession) -> *u8
+    if session.recv_big != 0
+        return session.big_recv as *u8
+    return @task.read_buf[0]
+
+
+# The message's header says it is session.msg_len bytes.  Past
+# TASK_BUFFER_SIZE, move what has arrived to big_recv and collect the
+# rest there.  -1 if it cannot be (too long, or no memory).
+fn m7sp_recv_msg_len_set(task: *Task, session: *M7SPSession, max_len: i32) -> i32
+    if session.msg_len > max_len
+        return -1
+    if session.msg_len <= TASK_BUFFER_SIZE
+        return 0
+    let big: *u8 = m7sp_session_buf(@session.big_recv)
+    if big == null
+        return -1
+    mem_copy(big, @task.read_buf[0], session.have as i64)
+    session.recv_big = 1
+    return 0
+
+
+# Receive more of the current message (session.have bytes so far).
+fn m7sp_recv_more(task: *Task, session: *M7SPSession) -> i32
+    if session.recv_big != 0
+        # Exactly the rest of this message: what follows is the next one's.
+        let pool: *TaskPool = task.user_data as *TaskPool
+        let rest: *u8 = (session.big_recv as *u8) + session.have
+        return task_submit_recv_buf(pool, task, rest, session.msg_len - session.have)
+    return m7sp_submit_recv_at(task, session.have)
+
+
+# Send out[0..len), which is task.write_buf or big_send.
+fn m7sp_submit_out(task: *Task, session: *M7SPSession, out: *u8, len: i32) -> i32
+    session.send_ptr = out as i64
+    session.send_len = len
+    session.send_pos = 0
+    let pool: *TaskPool = task.user_data as *TaskPool
+    return task_submit_send_buf(pool, task, out, len)
+
+
+# Send a reply: from task.write_buf when it fits, else from big_send.
+fn m7sp_send(task: *Task, session: *M7SPSession, data: *u8, len: i32) -> i32
+    var out: *u8 = @task.write_buf[0]
+    if len > TASK_BUFFER_SIZE
+        out = m7sp_session_buf(@session.big_send)
+        if out == null
+            return -1
+    mem_copy(out, data, len as i64)
+    return m7sp_submit_out(task, session, out, len)
+
+
+# Encrypt a plaintext reply into task.write_buf when the frame fits, else
+# into big_send, and send it.
+fn m7sp_send_encrypted(task: *Task, session: *M7SPSession, plaintext: *u8, len: i32) -> i32
+    var out: *u8 = @task.write_buf[0]
+    var cap: i32 = TASK_BUFFER_SIZE
+    if len + ENC_LEN_PREFIX_SIZE + ENC_NONCE_SIZE + ENC_TAG_SIZE > TASK_BUFFER_SIZE
+        out = m7sp_session_buf(@session.big_send)
+        if out == null
+            return -1
+        cap = ASYNC_MAX_FRAME
+    let wire_len: i32 = cipher_encrypt_msg(session, plaintext, len, out, cap)
+    if wire_len < 0
+        return -1
+    return m7sp_submit_out(task, session, out, wire_len)
+
+
+# A send completed with task.io_result bytes.  1 if part of the reply is
+# still to go (its send is resubmitted), 0 if it is all out, -1 on error.
+fn m7sp_send_progress(task: *Task, session: *M7SPSession) -> i32
+    if task.io_result <= 0
+        return -1
+    session.send_pos += task.io_result
+    if session.send_pos >= session.send_len
+        return 0
+    let pool: *TaskPool = task.user_data as *TaskPool
+    let rest: *u8 = (session.send_ptr as *u8) + session.send_pos
+    if task_submit_send_buf(pool, task, rest, session.send_len - session.send_pos) < 0
+        return -1
+    return 1
+
+
+# ============================================================================
 # Phase 3 helpers — mirror the serial path in src/main.ritz
 # ============================================================================
 
@@ -484,7 +609,7 @@ pub fn async_handle_insert(reader: *MessageReader, resp: *MessageBuffer, request
 
 
 # GET — payload: [doc_id: i64]
-fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+pub fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
     let doc_id_val: i64 = msgreader_read_i64(reader)
     if doc_id_val < 0
         build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid document ID")
@@ -493,23 +618,24 @@ fn async_handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i3
     var doc_id: DocumentId
     doc_id.value = doc_id_val
 
-    var doc_buf: [2048]u8
-    var doc_size: i64 = 0
-    let get_result: i32 = collection_get_raw(collection, @doc_id, @doc_buf[0], 2048, @doc_size)
-    if get_result == ERR_NOT_FOUND
-        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
-        return
-    if get_result != ERR_OK
+    let doc_buf: *u8 = malloc(MAX_DOC_SIZE)
+    if doc_buf == null
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
         return
-
-    prints("  [async] GET doc_id=")
-    print_i64(doc_id_val)
-    prints(" size=")
-    print_i64(doc_size)
-    prints("\n")
-
-    build_get_ok(resp, request_id, @doc_buf[0], doc_size as i32)
+    var doc_size: i64 = 0
+    let get_result: i32 = collection_get_raw(collection, @doc_id, doc_buf, MAX_DOC_SIZE, @doc_size)
+    if get_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+    else if get_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
+    else
+        prints("  [async] GET doc_id=")
+        print_i64(doc_id_val)
+        prints(" size=")
+        print_i64(doc_size)
+        prints("\n")
+        build_get_ok(resp, request_id, doc_buf, doc_size as i32)
+    free(doc_buf)
 
 
 # UPDATE — payload: [doc_data_len: i32][doc_data: bytes]
@@ -595,9 +721,9 @@ fn async_handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id:
 #     scan_active == 3: destroy iter, scan_active = 0, fall through to
 #       the normal "send done — recv next" reset.
 #
-# Per the design doc, batches cap at ~7 KiB so a single SCAN_RESULT fits
-# inside `task.write_buf` (8 KiB).  Option B (heap-allocated big buffer)
-# is deferred.
+# Batches cap at ~7 KiB so a SCAN_RESULT of small documents fits inside
+# `task.write_buf` (8 KiB).  A document bigger than that goes in a batch of
+# its own, sent from the session's big_send (AGAST #3638).
 
 # Big-endian i32 store at a specific offset — used to back-patch
 # doc_count / has_more once we know the values for a batch.  Mirrors
@@ -630,6 +756,9 @@ fn put_i32_be(buf: *u8, offset: i32, value: i32)
 # and back-patched at the end via `put_i32_be`.
 fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
     let iter: *BTreeIter = session.scan_iter as *BTreeIter
+    var collection: *Collection = session.collection as *Collection
+    if collection == null
+        collection = get_collection()
 
     msgbuf_start(resp, MSG_SCAN_RESULT, session.scan_request_id)
 
@@ -643,12 +772,12 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
     var batch_count: i32 = 0
     var done: i32 = 0
     var key_buf: [16]u8
-    var val_buf: [2048]u8
+    let val_buf: *u8 = malloc(MAX_DOC_SIZE)
 
     let batch_target: i32 = 16          # safety cap on per-batch doc count
     let batch_byte_budget: i32 = 7000   # ~1.2 KiB headroom in 8 KiB write_buf
 
-    if iter == null or btree_iter_valid(iter) == 0
+    if iter == null or val_buf == null or btree_iter_valid(iter) == 0
         # Empty / unopenable iter — emit a single zero-doc batch.
         done = 1
     else
@@ -664,8 +793,14 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
             var key_len: i32 = 0
             btree_iter_key(iter, @key_buf[0], @key_len)
 
-            var val_len: i32 = 0
-            btree_iter_value(iter, @val_buf[0], @val_len)
+            # The whole document: a large one's overflow chain, not its stub.
+            var full_len: i64 = 0
+            if collection_iter_value(collection, iter, val_buf, MAX_DOC_SIZE, @full_len) != ERR_OK
+                # Unreadable (a broken chain, or no frame to read it
+                # into): skip it rather than end the scan.
+                btree_iter_next(iter)
+                continue
+            let val_len: i32 = full_len as i32
 
             # Stop early if appending this doc would overflow the batch
             # budget — keep at least one doc per non-final batch so we
@@ -680,12 +815,15 @@ fn m7sp_scan_build_batch(resp: *MessageBuffer, session: *M7SPSession) -> i32
             let doc_id: i64 = *id_ptr
 
             msgbuf_write_i64(resp, doc_id)
-            msgbuf_write_bytes(resp, @val_buf[0], val_len)
+            msgbuf_write_bytes(resp, val_buf, val_len)
 
             batch_count += 1
             session.scan_total_emitted += 1
 
             btree_iter_next(iter)
+
+    if val_buf != null
+        free(val_buf)
 
     var has_more: i32 = 1
     if done != 0
@@ -1025,10 +1163,13 @@ fn handle_task_event(task: *Task) -> i32
 
     # ─── SENDING: send completed, prepare for next message (keep-alive) ───
     if session.parse_state == PARSE_SENDING
-        if task.io_result < 0
+        let progress: i32 = m7sp_send_progress(task, session)
+        if progress < 0
             # destroy will free any scan_iter still held
             m7sp_session_destroy(idx)
             return 1
+        if progress > 0
+            return -1   # the rest of the reply is on its way
 
         # ─── SCAN continuations (phase 4) ───
         # When scan_active != 0 the client expects more frames in this
@@ -1038,14 +1179,13 @@ fn handle_task_event(task: *Task) -> i32
             # Build the next SCAN_RESULT batch.  If this batch drains
             # the iter, transition to scan_active=2 so the *next* CQE
             # emits SCAN_END.
+            var out1: [36864]u8
             var resp1: MessageBuffer
-            msgbuf_init(@resp1, @task.write_buf[0], TASK_BUFFER_SIZE)
+            msgbuf_init(@resp1, @out1[0], ASYNC_MAX_MSG)
             let last: i32 = m7sp_scan_build_batch(@resp1, session)
             if last != 0
                 session.scan_active = 2
-            let resp1_len: i32 = msgbuf_len(@resp1)
-            let pool1: *TaskPool = task.user_data as *TaskPool
-            let send_ret1: i32 = task_submit_send(pool1, task, resp1_len)
+            let send_ret1: i32 = m7sp_send(task, session, @out1[0], msgbuf_len(@resp1))
             if send_ret1 < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1058,9 +1198,7 @@ fn handle_task_event(task: *Task) -> i32
             msgbuf_init(@resp2, @task.write_buf[0], TASK_BUFFER_SIZE)
             build_scan_end(@resp2, session.scan_request_id)
             session.scan_active = 3
-            let resp2_len: i32 = msgbuf_len(@resp2)
-            let pool2: *TaskPool = task.user_data as *TaskPool
-            let send_ret2: i32 = task_submit_send(pool2, task, resp2_len)
+            let send_ret2: i32 = m7sp_submit_out(task, session, @task.write_buf[0], msgbuf_len(@resp2))
             if send_ret2 < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1090,6 +1228,7 @@ fn handle_task_event(task: *Task) -> i32
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
         session.msg_len = 0
+        session.recv_big = 0
 
         let ret: i32 = task_reset_for_recv(task)
         if ret < 0
@@ -1109,7 +1248,7 @@ fn handle_task_event(task: *Task) -> i32
     # ─── NEED_HEADER: collect 16 bytes, then parse length ───
     if session.parse_state == PARSE_NEED_HEADER
         if session.have < PROTO_HEADER_SIZE
-            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            let ret: i32 = m7sp_recv_more(task, session)
             if ret < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1125,19 +1264,18 @@ fn handle_task_event(task: *Task) -> i32
         if msg_len < PROTO_HEADER_SIZE
             m7sp_session_destroy(idx)
             return 1
-        if msg_len > TASK_BUFFER_SIZE
-            # Phase 2 cap: anything bigger than 8 KiB closes the connection.
-            # Phase 3 may upgrade to a per-session big buffer.
+        # Over ASYNC_MAX_MSG closes the connection; over TASK_BUFFER_SIZE
+        # is collected in big_recv.
+        session.msg_len = msg_len
+        if m7sp_recv_msg_len_set(task, session, ASYNC_MAX_MSG) < 0
             m7sp_session_destroy(idx)
             return 1
-
-        session.msg_len = msg_len
         session.parse_state = PARSE_NEED_BODY
 
     # ─── NEED_BODY: collect bytes until we have msg_len total ───
     if session.parse_state == PARSE_NEED_BODY
         if session.have < session.msg_len
-            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            let ret: i32 = m7sp_recv_more(task, session)
             if ret < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1147,7 +1285,7 @@ fn handle_task_event(task: *Task) -> i32
     # ─── DISPATCHING: parse + build response + submit_send ───
     if session.parse_state == PARSE_DISPATCHING
         var reader: MessageReader
-        let parse_rc: i32 = msgreader_init(@reader, @task.read_buf[0], session.msg_len)
+        let parse_rc: i32 = msgreader_init(@reader, m7sp_msg_bytes(task, session), session.msg_len)
         if parse_rc != PROTO_OK
             m7sp_session_destroy(idx)
             return 1
@@ -1155,8 +1293,11 @@ fn handle_task_event(task: *Task) -> i32
         let msg_type: i32 = msgreader_msg_type(@reader)
         let request_id: i32 = msgreader_request_id(@reader)
 
+        # Built on the stack (up to ASYNC_MAX_MSG), then sent from
+        # write_buf or big_send by m7sp_send.
+        var out: [36864]u8
         var resp: MessageBuffer
-        msgbuf_init(@resp, @task.write_buf[0], TASK_BUFFER_SIZE)
+        msgbuf_init(@resp, @out[0], ASYNC_MAX_MSG)
 
         m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
 
@@ -1168,8 +1309,7 @@ fn handle_task_event(task: *Task) -> i32
 
         session.parse_state = PARSE_SENDING
 
-        let pool: *TaskPool = task.user_data as *TaskPool
-        let ret: i32 = task_submit_send(pool, task, resp_len)
+        let ret: i32 = m7sp_send(task, session, @out[0], resp_len)
         if ret < 0
             m7sp_session_destroy(idx)
             return 1
@@ -1217,9 +1357,12 @@ fn handle_task_event_encrypted(task: *Task) -> i32
     # ─── HANDSHAKE_SEND completed: server pubkey delivered.  Move to
     #     post-handshake encrypted message loop. ───
     if session.parse_state == PARSE_HANDSHAKE_SEND
-        if task.io_result < 0 or g_draining != 0
+        let hs_progress: i32 = m7sp_send_progress(task, session)
+        if hs_progress < 0 or g_draining != 0
             m7sp_session_destroy(idx)
             return 1
+        if hs_progress > 0
+            return -1
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
         session.msg_len = 0
@@ -1239,9 +1382,12 @@ fn handle_task_event_encrypted(task: *Task) -> i32
     # one encrypted frame per call, channel_send wraps one plaintext
     # message per call, so frame ↔ message is 1:1 in both directions).
     if session.parse_state == PARSE_SENDING
-        if task.io_result < 0
+        let progress: i32 = m7sp_send_progress(task, session)
+        if progress < 0
             m7sp_session_destroy(idx)
             return 1
+        if progress > 0
+            return -1   # the rest of the frame is on its way
 
         # ─── Encrypted SCAN continuations (parity with plain handler) ───
         if session.scan_active == 1
@@ -1249,19 +1395,13 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             # buffer, encrypt into task.write_buf, submit_send.  If this
             # batch drained the iter, transition to scan_active=2 so the
             # *next* CQE emits SCAN_END.
-            var pt1: [8192]u8
+            var pt1: [36864]u8
             var resp1: MessageBuffer
-            msgbuf_init(@resp1, @pt1[0], 8192 - ENC_LEN_PREFIX_SIZE - ENC_NONCE_SIZE - ENC_TAG_SIZE)
+            msgbuf_init(@resp1, @pt1[0], ASYNC_MAX_MSG)
             let last1: i32 = m7sp_scan_build_batch(@resp1, session)
             if last1 != 0
                 session.scan_active = 2
-            let pt1_len: i32 = msgbuf_len(@resp1)
-            let wire1: i32 = cipher_encrypt_msg(session, @pt1[0], pt1_len, @task.write_buf[0], TASK_BUFFER_SIZE)
-            if wire1 < 0
-                m7sp_session_destroy(idx)
-                return 1
-            let pool1: *TaskPool = task.user_data as *TaskPool
-            let send_ret1: i32 = task_submit_send(pool1, task, wire1)
+            let send_ret1: i32 = m7sp_send_encrypted(task, session, @pt1[0], msgbuf_len(@resp1))
             if send_ret1 < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1275,13 +1415,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             msgbuf_init(@resp2, @pt2[0], 256)
             build_scan_end(@resp2, session.scan_request_id)
             session.scan_active = 3
-            let pt2_len: i32 = msgbuf_len(@resp2)
-            let wire2: i32 = cipher_encrypt_msg(session, @pt2[0], pt2_len, @task.write_buf[0], TASK_BUFFER_SIZE)
-            if wire2 < 0
-                m7sp_session_destroy(idx)
-                return 1
-            let pool2: *TaskPool = task.user_data as *TaskPool
-            let send_ret2: i32 = task_submit_send(pool2, task, wire2)
+            let send_ret2: i32 = m7sp_send_encrypted(task, session, @pt2[0], msgbuf_len(@resp2))
             if send_ret2 < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1310,6 +1444,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
         session.msg_len = 0
+        session.recv_big = 0
         let ret: i32 = task_reset_for_recv(task)
         if ret < 0
             m7sp_session_destroy(idx)
@@ -1327,7 +1462,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
     # ─── HANDSHAKE_RECV: collect 32 bytes of client pubkey ───
     if session.parse_state == PARSE_HANDSHAKE_RECV
         if session.have < ENC_PUBKEY_SIZE
-            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            let ret: i32 = m7sp_recv_more(task, session)
             if ret < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1341,8 +1476,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         mem_copy(@task.write_buf[0], @session.cipher_public_key[0], 32)
 
         session.parse_state = PARSE_HANDSHAKE_SEND
-        let pool: *TaskPool = task.user_data as *TaskPool
-        let ret: i32 = task_submit_send(pool, task, ENC_PUBKEY_SIZE)
+        let ret: i32 = m7sp_submit_out(task, session, @task.write_buf[0], ENC_PUBKEY_SIZE)
         if ret < 0
             m7sp_session_destroy(idx)
             return 1
@@ -1351,7 +1485,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
     # ─── NEED_HEADER (encrypted): collect 4-byte outer length prefix ───
     if session.parse_state == PARSE_NEED_HEADER
         if session.have < ENC_LEN_PREFIX_SIZE
-            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            let ret: i32 = m7sp_recv_more(task, session)
             if ret < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1368,20 +1502,18 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             m7sp_session_destroy(idx)
             return 1
         let total_msg_len: i32 = ENC_LEN_PREFIX_SIZE + payload_len
-        # Cap matches the plain path: a single encrypted frame must fit
-        # in the per-task 8 KiB read_buf.  Plaintext capacity is then
-        # 8192 − 32 = 8160 bytes.
-        if total_msg_len > TASK_BUFFER_SIZE
+        # Cap matches the plain path: the frame of an ASYNC_MAX_MSG
+        # plaintext; past TASK_BUFFER_SIZE it is collected in big_recv.
+        session.msg_len = total_msg_len
+        if payload_len > ASYNC_MAX_FRAME or m7sp_recv_msg_len_set(task, session, ASYNC_MAX_FRAME) < 0
             m7sp_session_destroy(idx)
             return 1
-
-        session.msg_len = total_msg_len
         session.parse_state = PARSE_NEED_BODY
 
     # ─── NEED_BODY (encrypted): collect bytes until full frame ───
     if session.parse_state == PARSE_NEED_BODY
         if session.have < session.msg_len
-            let ret: i32 = m7sp_submit_recv_at(task, session.have)
+            let ret: i32 = m7sp_recv_more(task, session)
             if ret < 0
                 m7sp_session_destroy(idx)
                 return 1
@@ -1390,12 +1522,11 @@ fn handle_task_event_encrypted(task: *Task) -> i32
 
     # ─── DISPATCHING: decrypt, parse, dispatch, encrypt, submit_send ───
     if session.parse_state == PARSE_DISPATCHING
-        # Decrypt the inbound frame into a stack plaintext buffer.
-        # 8 KiB matches TASK_BUFFER_SIZE so any frame that fit in the
-        # read buffer also fits decrypted.  Stack frame is ~16 KiB
-        # total (in + out); well within the 8 MiB process default.
-        var plaintext_in: [8192]u8
-        let plaintext_len: i32 = cipher_decrypt_msg(session, @task.read_buf[0], session.msg_len, @plaintext_in[0], 8192)
+        # Decrypt the inbound frame into a stack plaintext buffer of
+        # ASYNC_MAX_MSG, the most any accepted frame holds.  Stack frame
+        # is ~72 KiB (in + out); well within the 8 MiB process default.
+        var plaintext_in: [36864]u8
+        let plaintext_len: i32 = cipher_decrypt_msg(session, m7sp_msg_bytes(task, session), session.msg_len, @plaintext_in[0], ASYNC_MAX_MSG)
         if plaintext_len < 0
             prints("  [async/enc] decrypt failed code=")
             print_int(plaintext_len as i64)
@@ -1412,11 +1543,11 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         let msg_type: i32 = msgreader_msg_type(@reader)
         let request_id: i32 = msgreader_request_id(@reader)
 
-        # Build the plaintext response.  Cap at TASK_BUFFER_SIZE − 32
-        # so the encrypted form is guaranteed to fit in write_buf.
-        var plaintext_out: [8192]u8
+        # Build the plaintext response (up to ASYNC_MAX_MSG); its frame
+        # goes out from write_buf or big_send (m7sp_send_encrypted).
+        var plaintext_out: [36864]u8
         var resp: MessageBuffer
-        msgbuf_init(@resp, @plaintext_out[0], 8192 - ENC_LEN_PREFIX_SIZE - ENC_NONCE_SIZE - ENC_TAG_SIZE)
+        msgbuf_init(@resp, @plaintext_out[0], ASYNC_MAX_MSG)
 
         m7sp_dispatch(@reader, @resp, session, msg_type, request_id)
 
@@ -1425,14 +1556,8 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             m7sp_session_destroy(idx)
             return 1
 
-        let wire_len: i32 = cipher_encrypt_msg(session, @plaintext_out[0], resp_len, @task.write_buf[0], TASK_BUFFER_SIZE)
-        if wire_len < 0
-            m7sp_session_destroy(idx)
-            return 1
-
         session.parse_state = PARSE_SENDING
-        let pool: *TaskPool = task.user_data as *TaskPool
-        let ret: i32 = task_submit_send(pool, task, wire_len)
+        let ret: i32 = m7sp_send_encrypted(task, session, @plaintext_out[0], resp_len)
         if ret < 0
             m7sp_session_destroy(idx)
             return 1

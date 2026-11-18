@@ -7,6 +7,7 @@ import ritzlib.io
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.option
+import ritzlib.fmt { fmt_i64_into }
 
 import lib.m7m_types
 import lib.page
@@ -440,4 +441,127 @@ fn test_fmix64_known_values() -> i32
         return 3
     if fmix64(0) != 0
         return 4
+    0
+
+# ============================================================================
+# Page free list (AGAST #3638): overflow chains give pages back when a large
+# document is rewritten or deleted, and the next allocation reuses them.
+# ============================================================================
+
+fn bp_new(frames: i32) -> *BufferPool
+    let pool_opt = buffer_pool_new(frames)
+    option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+# Allocate one page of `page_type`, unpinned; its id, or -1.
+fn bp_alloc_id(pool: *BufferPool, page_type: i32) -> i64
+    let page_opt = buffer_pool_alloc(pool, page_type)
+    if option_is_none<*Page>(@page_opt) == 1
+        return -1
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+    let id: i64 = buffer_pool_page_id(pool, page)
+    buffer_pool_unpin(pool, id, 1)
+    id
+
+[[test]]
+fn test_buffer_pool_freed_page_is_reused() -> i32
+    let pool: *BufferPool = bp_new(8)
+    if pool == null
+        return 90
+    let a: i64 = bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW)
+    let b: i64 = bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW)
+    let c: i64 = bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW)
+    if a != 0 or b != 1 or c != 2
+        return 1
+    if buffer_pool_free_page(pool, b) != ERR_OK
+        return 2
+    if buffer_pool_free_page_count(pool) != 1
+        return 3
+    # The freed page is blanked: nothing of its old contents is left to read.
+    let freed_opt = buffer_pool_fetch(pool, b)
+    let freed: *Page = option_unwrap_or<*Page>(@freed_opt, null)
+    if freed == null or page_type(freed) != PAGE_MAGIC_FREE
+        return 4
+    buffer_pool_unpin(pool, b, 0)
+
+    # The next allocation takes it back, initialized as asked; then the file
+    # grows again.
+    let page_opt = buffer_pool_alloc(pool, PAGE_MAGIC_BTREE)
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+    if page == null or buffer_pool_page_id(pool, page) != b
+        return 5
+    if page_type(page) != PAGE_MAGIC_BTREE or page.header.page_id != b
+        return 6
+    buffer_pool_unpin(pool, b, 1)
+    if buffer_pool_free_page_count(pool) != 0
+        return 7
+    if bp_alloc_id(pool, PAGE_MAGIC_HEAP) != 3
+        return 8
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_buffer_pool_free_page_refuses_bad_ids() -> i32
+    let pool: *BufferPool = bp_new(8)
+    if pool == null
+        return 90
+    bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW)
+    # Never allocated, negative, or already free: refused, not listed twice.
+    if buffer_pool_free_page(pool, 5) != ERR_INVALID
+        return 1
+    if buffer_pool_free_page(pool, -1) != ERR_INVALID
+        return 2
+    if buffer_pool_free_page(pool, 0) != ERR_OK
+        return 3
+    if buffer_pool_free_page(pool, 0) != ERR_INVALID
+        return 4
+    if buffer_pool_free_page_count(pool) != 1
+        return 5
+    # Still pinned by someone: refused, so it is never handed out in use.
+    let pinned: i64 = bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW)
+    let held_opt = buffer_pool_fetch(pool, pinned)
+    if buffer_pool_free_page(pool, pinned) != ERR_BUSY
+        return 6
+    buffer_pool_unpin(pool, pinned, 0)
+    if buffer_pool_free_page(pool, pinned) != ERR_OK
+        return 7
+    buffer_pool_destroy(pool)
+    0
+
+# A freed page of a data file is still free when the file is opened again:
+# buffer_pool_reclaim_free_pages finds it (and any page never written) so
+# the space is not lost to a restart.
+[[test]]
+fn test_buffer_pool_reclaims_free_pages_of_a_file() -> i32
+    var path: [96]u8
+    let head: *u8 = c"/tmp/mausoleum_bp_free_"
+    var n: i64 = strlen(head)
+    memcpy(@path[0], head, n)
+    n += fmt_i64_into(@path[0] + n, sys_getpid() as i64)
+    path[n] = 0
+    sys_unlink(@path[0])
+
+    var pool: *BufferPool = bp_new(8)
+    if pool == null or buffer_pool_open(pool, @path[0]) != ERR_OK
+        return 90
+    for i in 0..4
+        bp_alloc_id(pool, PAGE_MAGIC_OVERFLOW)
+    if buffer_pool_free_page(pool, 2) != ERR_OK
+        return 1
+    buffer_pool_destroy(pool)
+
+    pool = bp_new(8)
+    if pool == null or buffer_pool_open(pool, @path[0]) != ERR_OK
+        return 91
+    if buffer_pool_free_page_count(pool) != 0
+        return 2
+    if buffer_pool_reclaim_free_pages(pool) != ERR_OK
+        return 3
+    if buffer_pool_free_page_count(pool) != 1
+        return 4
+    if bp_alloc_id(pool, PAGE_MAGIC_HEAP) != 2
+        return 5
+    if bp_alloc_id(pool, PAGE_MAGIC_HEAP) != 4
+        return 6
+    buffer_pool_destroy(pool)
+    sys_unlink(@path[0])
     0

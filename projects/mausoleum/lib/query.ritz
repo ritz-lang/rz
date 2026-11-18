@@ -589,23 +589,29 @@ fn sort_results(q: *Query, col: *Collection, result: *QueryResult)
         return
 
     # key_doc and j_doc are compared while both are alive, so each keeps
-    # its strings in its own buffer.
-    var key_buf: [2048]u8
-    var j_buf: [2048]u8
+    # its strings in its own buffer (each up to MAX_DOC_SIZE).
+    let key_buf: *u8 = malloc(MAX_DOC_SIZE)
+    let j_buf: *u8 = malloc(MAX_DOC_SIZE)
+    if key_buf == null or j_buf == null
+        if key_buf != null
+            free(key_buf)
+        if j_buf != null
+            free(j_buf)
+        return
     var i: i32 = 1
     while i < result.count
         var key_id: i64 = result.doc_ids[i]
         var key_doc: Document
         var key_doc_id: DocumentId
         key_doc_id.value = key_id
-        collection_get(col, @key_doc_id, @key_doc, @key_buf[0], 2048)
+        collection_get(col, @key_doc_id, @key_doc, key_buf, MAX_DOC_SIZE)
 
         var j: i32 = i - 1
         while j >= 0
             var j_doc_id: DocumentId
             j_doc_id.value = result.doc_ids[j]
             var j_doc: Document
-            collection_get(col, @j_doc_id, @j_doc, @j_buf[0], 2048)
+            collection_get(col, @j_doc_id, @j_doc, j_buf, MAX_DOC_SIZE)
 
             if compare_docs_for_sort(q, @j_doc, @key_doc) <= 0
                 break
@@ -615,6 +621,9 @@ fn sort_results(q: *Query, col: *Collection, result: *QueryResult)
 
         result.doc_ids[j + 1] = key_id
         i = i + 1
+
+    free(key_buf)
+    free(j_buf)
 
 # ============================================================================
 # Query Execution
@@ -637,20 +646,21 @@ pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
         return null
     var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
 
+    # One buffer for every document: any one may be up to MAX_DOC_SIZE.
+    let val: *u8 = malloc(MAX_DOC_SIZE)
+    if val == null
+        btree_iter_destroy(iter)
+        query_result_destroy(result)
+        return null
+
     # Iterate through all documents
     while btree_iter_valid(iter) != 0
-        # Get the document
-        var key: [8]u8
-        var key_len: i32 = 0
-        btree_iter_key(iter, @key[0], @key_len)
-
-        var val: [2048]u8
-        var val_len: i32 = 0
-        btree_iter_value(iter, @val[0], @val_len)
-
-        # Deserialize the document
+        # Get the document (resolving an overflow stub) and deserialize it
+        var val_len: i64 = 0
         var doc: Document
-        var err: i32 = doc_deserialize(@val[0], val_len as i64, @doc)
+        var err: i32 = collection_iter_value(col, iter, val, MAX_DOC_SIZE, @val_len)
+        if err == ERR_OK
+            err = doc_deserialize(val, val_len, @doc)
         if err == ERR_OK
             # Check if it matches all filters
             if query_matches(q, @doc) != 0
@@ -661,6 +671,7 @@ pub fn query_exec(q: *Query, col: *Collection) -> *QueryResult
         btree_iter_next(iter)
 
     btree_iter_destroy(iter)
+    free(val)
 
     # Sort results if ordering is specified
     sort_results(q, col, result)

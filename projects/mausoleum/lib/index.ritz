@@ -317,14 +317,19 @@ fn index_build(mgr: *IndexManager, idx: *Index) -> i32
         return ERR_OK  # Empty collection is fine
     var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
 
-    while btree_iter_valid(iter) != 0
-        # Get document
-        var val: [2048]u8
-        var val_len: i32 = 0
-        btree_iter_value(iter, @val[0], @val_len)
+    # One buffer for every document: any one may be up to MAX_DOC_SIZE.
+    let val: *u8 = malloc(MAX_DOC_SIZE)
+    if val == null
+        btree_iter_destroy(iter)
+        return ERR_NO_MEMORY
 
+    while btree_iter_valid(iter) != 0
+        # Get document (resolving an overflow stub)
+        var val_len: i64 = 0
         var doc: Document
-        var err: i32 = doc_deserialize(@val[0], val_len as i64, @doc)
+        var err: i32 = collection_iter_value(mgr.collection, iter, val, MAX_DOC_SIZE, @val_len)
+        if err == ERR_OK
+            err = doc_deserialize(val, val_len, @doc)
         if err == ERR_OK
             # Build index key
             var key: [256]u8
@@ -337,6 +342,7 @@ fn index_build(mgr: *IndexManager, idx: *Index) -> i32
                     var lookup: i32 = btree_get(idx.tree, @key[0], key_len, @existing_val[0], @existing_len)
                     if lookup == ERR_OK
                         btree_iter_destroy(iter)
+                        free(val)
                         return ERR_EXISTS  # Duplicate value
 
                 # Insert into index: key -> doc_id
@@ -351,6 +357,7 @@ fn index_build(mgr: *IndexManager, idx: *Index) -> i32
         btree_iter_next(iter)
 
     btree_iter_destroy(iter)
+    free(val)
     return ERR_OK
 
 # ============================================================================

@@ -991,3 +991,85 @@ fn test_query_first_string_outlives_call() -> i32
 
     buffer_pool_destroy(pool)
     0
+
+# ============================================================================
+# Documents past one B-tree value (AGAST #3638)
+# ============================================================================
+#
+# A document longer than MAX_INLINE_DOC_SIZE is stored in overflow pages;
+# its B-tree value is only a stub, so a scan must resolve it.
+
+const BIG_BODY_LEN: i64 = 9000
+
+# Insert a ~9 KB document: `age`, and a string "c" of BIG_BODY_LEN 'x' bytes
+# ending in "needle".
+fn insert_big_doc(col: *Collection, age: i64) -> DocumentId
+    let body: *u8 = malloc(BIG_BODY_LEN)
+    memset(body, 0x78, BIG_BODY_LEN)
+    memcpy(body + BIG_BODY_LEN - 6, "needle", 6)
+    var doc: Document
+    var id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @id)
+    var age_field: Field = field_int(age)
+    doc_set_field(@doc, "age", @age_field)
+    var f: Field = field_string(body, BIG_BODY_LEN)
+    doc_set_field(@doc, "c", @f)
+    var out_id: DocumentId
+    let rc: i32 = collection_insert(col, @doc, @out_id)
+    free(body)
+    if rc != ERR_OK
+        return doc_id_invalid()
+    return out_id
+
+[[test]]
+fn test_query_exec_finds_overflow_doc() -> i32
+    let pool_opt = buffer_pool_new(256)
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    insert_test_doc(@col, "Alice", 30, 1)
+    var big_id: DocumentId = insert_big_doc(@col, 40)
+    insert_test_doc(@col, "Bob", 25, 1)
+    assert doc_id_is_valid(@big_id) == 1
+
+    # Only the big document's string ends in "needle".
+    var q: Query = query_new()
+    query_contains(@q, "c", "needle", 6)
+    var result: *QueryResult = query_exec(@q, @col)
+    assert result != null
+    assert result.count == 1
+    var got: DocumentId = query_result_get(result, 0)
+    assert doc_id_eq(@got, @big_id) == 1
+
+    query_result_destroy(result)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_query_order_reads_overflow_doc() -> i32
+    let pool_opt = buffer_pool_new(256)
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var a: DocumentId = insert_test_doc(@col, "Alice", 10, 1)
+    var b: DocumentId = insert_test_doc(@col, "Bob", 50, 1)
+    var big_id: DocumentId = insert_big_doc(@col, 99)
+
+    # Sorting compares documents' ages: the big one's must be read.
+    var q: Query = query_new()
+    query_order_desc(@q, "age")
+    var result: *QueryResult = query_exec(@q, @col)
+    assert result != null
+    assert result.count == 3
+    var r0: DocumentId = query_result_get(result, 0)
+    var r1: DocumentId = query_result_get(result, 1)
+    var r2: DocumentId = query_result_get(result, 2)
+    assert doc_id_eq(@r0, @big_id) == 1
+    assert doc_id_eq(@r1, @b) == 1
+    assert doc_id_eq(@r2, @a) == 1
+
+    query_result_destroy(result)
+    buffer_pool_destroy(pool)
+    0

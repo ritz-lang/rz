@@ -44,6 +44,22 @@ fn server_bin() -> *u8
 struct TestServer
     pid: i32
     port: i32
+    mode: i32       # SERVE_*: which serve loop the server runs
+
+# The four serve loops (src/main.ritz cmd_serve).
+const SERVE_ASYNC: i32 = 0              # the default: --no-encryption
+const SERVE_ASYNC_ENCRYPTED: i32 = 1
+const SERVE_SERIAL: i32 = 2             # --serial --no-encryption
+const SERVE_SERIAL_ENCRYPTED: i32 = 3
+
+fn mode_encrypted(mode: i32) -> bool
+    mode == SERVE_ASYNC_ENCRYPTED or mode == SERVE_SERIAL_ENCRYPTED
+
+# client_connect, or client_connect_encrypted for an encrypted loop.
+fn connect_mode(client: *Client, mode: i32, port: i32) -> i32
+    if mode_encrypted(mode)
+        return client_connect_encrypted(client, "127.0.0.1", port, "test")
+    client_connect(client, "127.0.0.1", port, "test")
 
 # ============================================================================
 # Server lifecycle helpers
@@ -62,17 +78,24 @@ fn fmt_uint(buf: *u8, n: i32)
 
 # fork+exec the server on `port` with stdio on /dev/null. Returns child pid
 # or < 0 on failure.
-fn spawn_server(port: i32) -> i32
+fn spawn_server(port: i32, mode: i32) -> i32
     var port_str: [16]u8
     fmt_uint(@port_str[0], port)
 
-    var argv: [6]*u8
-    argv[0] = server_bin()
-    argv[1] = c"serve"
-    argv[2] = c"--no-encryption"
-    argv[3] = c"--port"
-    argv[4] = @port_str[0]
-    argv[5] = null
+    var argv: [7]*u8
+    var n: i32 = 0
+    argv[n] = server_bin()
+    argv[n + 1] = c"serve"
+    n += 2
+    if not mode_encrypted(mode)
+        argv[n] = c"--no-encryption"
+        n += 1
+    if mode == SERVE_SERIAL or mode == SERVE_SERIAL_ENCRYPTED
+        argv[n] = c"--serial"
+        n += 1
+    argv[n] = c"--port"
+    argv[n + 1] = @port_str[0]
+    argv[n + 2] = null
 
     let pid: i32 = sys_fork()
     if pid != 0
@@ -115,7 +138,7 @@ fn wait_ready(srv: *TestServer) -> i32
             return 1
         let probe: *Client = client_new()
         if probe != null
-            let rc: i32 = client_connect(probe, "127.0.0.1", srv.port, "test")
+            let rc: i32 = connect_mode(probe, srv.mode, srv.port)
             if rc == 0
                 client_disconnect(probe)
                 client_free(probe)
@@ -128,6 +151,10 @@ fn wait_ready(srv: *TestServer) -> i32
 # Start a server and wait until it is ready. 0 on success, 90-93 on failure.
 # On failure no server process is left behind.
 fn server_start(srv: *TestServer) -> i32
+    server_start_mode(srv, SERVE_ASYNC)
+
+fn server_start_mode(srv: *TestServer, mode: i32) -> i32
+    srv.mode = mode
     srv.pid = 0
     srv.port = 0
     if sys_access(server_bin(), 1) != 0   # X_OK
@@ -138,7 +165,7 @@ fn server_start(srv: *TestServer) -> i32
         srv.port = base + attempt * 7
         if srv.port >= 65000
             srv.port = srv.port - PORT_SPAN
-        srv.pid = spawn_server(srv.port)
+        srv.pid = spawn_server(srv.port, srv.mode)
         if srv.pid < 0
             srv.pid = 0
             return 91   # fork failed
@@ -161,7 +188,7 @@ fn connect_client(srv: *TestServer) -> *Client
     let client: *Client = client_new()
     if client == null
         return null
-    if client_connect(client, "127.0.0.1", srv.port, "test") < 0
+    if connect_mode(client, srv.mode, srv.port) < 0
         client_free(client)
         return null
     socket_set_io_timeout(@&client.sock, OP_TIMEOUT_MS)
@@ -356,7 +383,11 @@ fn test_delete() -> i32
 # exactly `size` bytes (69 bytes of header and field framing + payload).
 fn make_sized_doc(size: i64, payload: *u8, buf: *u8, cap: i64) -> i64
     let len: i64 = size - 69
-    memset(payload, 113, len)          # 'q'
+    # A run that repeats every 23 bytes: a chunk out of place shows.
+    var i: i64 = 0
+    while i < len
+        payload[i] = (97 + i % 23) as u8
+        i += 1
     var doc: Document
     var tmp_id: DocumentId = doc_id_invalid()
     doc_init(@doc, @tmp_id)
@@ -367,23 +398,38 @@ fn make_sized_doc(size: i64, payload: *u8, buf: *u8, cap: i64) -> i64
 struct ScanSeen
     docs: i32
     max_len: i32
+    expect: *u8         # Documents should be these bytes (null: any)
+    expect_len: i64
+    matched: i32        # Documents that were
+
+fn scan_seen_init(seen: *ScanSeen, expect: *u8, expect_len: i64)
+    seen.docs = 0
+    seen.max_len = 0
+    seen.expect = expect
+    seen.expect_len = expect_len
+    seen.matched = 0
 
 fn scan_seen_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
     let seen: *ScanSeen = user_data as *ScanSeen
     seen.docs += 1
     if len > seen.max_len
         seen.max_len = len
+    # Skip the serial version (4) and the id (8), which the server assigns.
+    if seen.expect != null and len as i64 == seen.expect_len
+        if memcmp(data + 12, seen.expect + 12, seen.expect_len - 12) == 0
+            seen.matched += 1
     return 0
 
 # Several documents of exactly MAX_DOC_SIZE go in, come back whole by GET
-# (only the id the server assigns differs) and all come back by SCAN.
-fn check_max_size_docs(srv: *TestServer) -> i32
+# (only the id the server assigns differs) and all come back by SCAN (if
+# `scan`: the --serial encrypted loop has no SCAN).
+fn check_max_size_docs(srv: *TestServer, scan: bool) -> i32
     let client: *Client = connect_client(srv)
     if client == null
         return 1
-    let payload: *u8 = malloc(4096)
-    let buf: *u8 = malloc(4096)
-    let size: i64 = make_sized_doc(MAX_DOC_SIZE, payload, buf, 4096)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    let size: i64 = make_sized_doc(MAX_DOC_SIZE, payload, buf, MAX_DOC_SIZE)
     if size != MAX_DOC_SIZE
         return 2
     var ids: [6]i64
@@ -402,11 +448,10 @@ fn check_max_size_docs(srv: *TestServer) -> i32
         if memcmp(out + 12, buf + 12, size - 12) != 0
             return 6
     var seen: ScanSeen
-    seen.docs = 0
-    seen.max_len = 0
-    if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
+    scan_seen_init(@seen, buf, size)
+    if scan and client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
         return 7
-    if seen.docs != 6 or seen.max_len as i64 != size
+    if scan and (seen.docs != 6 or seen.matched != 6)
         return 8
     client_disconnect(client)
     client_free(client)
@@ -431,8 +476,7 @@ fn check_oversize_doc(srv: *TestServer, size: i64) -> i32
     if client_ping(client) < 0
         return 6
     var seen: ScanSeen
-    seen.docs = 0
-    seen.max_len = 0
+    scan_seen_init(@seen, null, 0)
     if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
         return 7
     if seen.docs != 0
@@ -441,15 +485,33 @@ fn check_oversize_doc(srv: *TestServer, size: i64) -> i32
     client_free(client)
     return 0
 
-[[test]]
-fn test_max_size_docs_round_trip() -> i32
+fn max_size_docs_round_trip_on(mode: i32) -> i32
     var srv: TestServer
-    let started: i32 = server_start(@srv)
+    let started: i32 = server_start_mode(@srv, mode)
     if started != 0
         return started
-    let rc: i32 = check_max_size_docs(@srv)
+    let rc: i32 = check_max_size_docs(@srv, mode != SERVE_SERIAL_ENCRYPTED)
     server_stop(@srv)
     return rc
+
+# Every serve loop carries MAX_DOC_SIZE documents both ways (AGAST #3638):
+# well past the async loops' 8 KiB task buffers and the serial loops' 4 KiB
+# reads.
+[[test]]
+fn test_max_size_docs_round_trip() -> i32
+    max_size_docs_round_trip_on(SERVE_ASYNC)
+
+[[test]]
+fn test_max_size_docs_round_trip_encrypted() -> i32
+    max_size_docs_round_trip_on(SERVE_ASYNC_ENCRYPTED)
+
+[[test]]
+fn test_max_size_docs_round_trip_serial() -> i32
+    max_size_docs_round_trip_on(SERVE_SERIAL)
+
+[[test]]
+fn test_max_size_docs_round_trip_serial_encrypted() -> i32
+    max_size_docs_round_trip_on(SERVE_SERIAL_ENCRYPTED)
 
 [[test]]
 fn test_doc_one_byte_over_the_limit_is_refused() -> i32

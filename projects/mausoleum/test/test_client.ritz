@@ -2,6 +2,7 @@
 
 import ritzlib.memory
 import ritzlib.str
+import ritzlib.sys
 
 import lib.protocol
 import lib.client
@@ -253,4 +254,81 @@ fn test_client_insert_refuses_an_oversize_doc_before_sending() -> i32
         return 3
     client.connected = 0
     client_free(client)
+    0
+
+# ============================================================================
+# Several replies in one read (AGAST #3638)
+# ============================================================================
+#
+# A SCAN answers with several messages; a fast server's land in the client's
+# buffer together.  recv_message used to move the next one's bytes to the
+# front of the buffer before its caller had read the current one, so the
+# caller parsed the next message's bytes in its place: a nexus scan saw the
+# large document of a second batch twice and the small ones of the first
+# batch never.
+
+struct ScanLog
+    count: i32
+    ids: [8]i64
+    lens: [8]i32
+    firsts: [8]u8
+
+fn scan_log_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
+    let log: *ScanLog = user_data as *ScanLog
+    if log.count < 8
+        log.ids[log.count] = doc_id
+        log.lens[log.count] = len
+        log.firsts[log.count] = *data
+    log.count += 1
+    0
+
+# A SCAN_RESULT of `n` documents id first_id.., each `len` bytes of 'a' + i.
+fn put_batch(out: *MessageBuffer, first_id: i64, n: i32, len: i32, has_more: i32)
+    msgbuf_start(out, MSG_SCAN_RESULT, 1)
+    msgbuf_write_i32(out, n)
+    msgbuf_write_i32(out, has_more)
+    let data: *u8 = malloc(len as i64)
+    for i in 0..n
+        memset(data, (97 + i) as u8, len as i64)
+        msgbuf_write_i64(out, first_id + i as i64)
+        msgbuf_write_bytes(out, data, len)
+    free(data)
+    msgbuf_finish(out)
+
+[[test]]
+fn test_client_scan_reads_replies_that_arrive_together() -> i32
+    var sv: [2]i32
+    # socketpair(AF_UNIX, SOCK_STREAM, 0, sv)
+    assert syscall4(53, 1, 1, 0, @sv[0] as i64) == 0
+    let client: *Client = client_new()
+    client.sock.fd = sv[0]
+    client.connected = 1
+    client.encrypted = 0
+    client.next_request_id = 1
+
+    # Two batches and the SCAN_END, written at once: one read takes all.
+    let wire: *MessageBuffer = msgbuf_new(65536)
+    let part: *MessageBuffer = msgbuf_new(65536)
+    put_batch(part, 10, 2, 100, 1)
+    let a_len: i32 = msgbuf_len(part)
+    memcpy(msgbuf_data(wire), msgbuf_data(part), a_len as i64)
+    put_batch(part, 20, 1, 20000, 0)
+    let b_len: i32 = msgbuf_len(part)
+    memcpy(msgbuf_data(wire) + a_len, msgbuf_data(part), b_len as i64)
+    build_scan_end(part, 1)
+    let c_len: i32 = msgbuf_len(part)
+    memcpy(msgbuf_data(wire) + a_len + b_len, msgbuf_data(part), c_len as i64)
+    let total: i64 = (a_len + b_len + c_len) as i64
+    assert sys_write(sv[1], msgbuf_data(wire), total) == total
+
+    var log: ScanLog
+    log.count = 0
+    assert client_scan(client, scan_log_step as *u8, @log as *u8) == 3
+    assert log.count == 3
+    assert log.ids[0] == 10 and log.lens[0] == 100 and log.firsts[0] == 97
+    assert log.ids[1] == 11 and log.lens[1] == 100 and log.firsts[1] == 98
+    assert log.ids[2] == 20 and log.lens[2] == 20000 and log.firsts[2] == 97
+    client.connected = 0     # nothing to say goodbye to
+    client_free(client)
+    sys_close(sv[1])
     0

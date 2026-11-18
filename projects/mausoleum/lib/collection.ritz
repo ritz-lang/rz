@@ -7,7 +7,10 @@ import ritzlib.sys
 import ritzlib.str
 import ritzlib.option
 
+import ritzlib.memory
+
 import mausoleum.m7m_types
+import mausoleum.page
 import mausoleum.buffer_pool
 import mausoleum.btree
 import mausoleum.storage
@@ -17,12 +20,19 @@ import mausoleum.document
 # Constants
 # ============================================================================
 
-# Max serialized document size: the longest B-tree value under an 8-byte
-# document-id key, btree_max_value_len(8) (AGAST #2208). A document is one
-# inline B-tree value, and a leaf must hold two. Bigger documents would need
-# overflow pages. Every layer above takes its limit from this one: the
-# server's buffers, the client's pre-send check, and nexus's page-size cap.
-pub const MAX_DOC_SIZE: i64 = 1992
+# Max serialized document size (AGAST #3638).  Every layer above takes its
+# limit from this one: the server's buffers, the client's pre-send check,
+# and nexus's page-size cap.  32 KiB holds the largest wiki page with room
+# to spare, and a SCAN batch or wire message of one such document stays
+# well inside the 64 KiB encrypted-channel frame.
+pub const MAX_DOC_SIZE: i64 = 32768
+
+# The longest document stored inline as its B-tree value: the longest value
+# under an 8-byte document-id key, btree_max_value_len(8) (AGAST #2208).
+# A longer one goes to a chain of overflow pages and its B-tree value is an
+# overflow stub (see "Overflow chains" below).  A raw B-tree value is read
+# into a [2048]u8 buffer here, so this must stay at most 2048 (a test pins it).
+pub const MAX_INLINE_DOC_SIZE: i64 = 1992
 
 # Serialization format version
 const DOC_SERIAL_VERSION: i32 = 1
@@ -445,6 +455,193 @@ pub fn doc_deserialize(buf: *u8, buf_len: i64, doc: *Document) -> i32
     return ERR_OK
 
 # ============================================================================
+# Overflow chains (AGAST #3638)
+# ============================================================================
+#
+# A document longer than MAX_INLINE_DOC_SIZE is stored whole in a chain of
+# PAGE_MAGIC_OVERFLOW pages, and its B-tree value is a 20-byte stub:
+#   tag: i32 (OVERFLOW_STUB_TAG)  total_len: i64  first_page: i64
+# A serialized document starts with DOC_SERIAL_VERSION instead, so the two
+# never mix up.  Each overflow page holds up to PAGE_DATA_SIZE bytes in its
+# data area; its header's free_start is how many, next_page the next page
+# (INVALID_PAGE_ID on the last).  A rewrite or delete gives the pages back
+# to the buffer pool's free list.
+
+const OVERFLOW_STUB_TAG: i32 = 0x4F564552   # "OVER", as PAGE_MAGIC_OVERFLOW
+const OVERFLOW_STUB_LEN: i64 = 20
+
+# 1 and the chain's length and first page if `raw` is an overflow stub.
+fn overflow_stub_decode(raw: *u8, raw_len: i64, out_total: *i64, out_first: *i64) -> i32
+    if raw_len != OVERFLOW_STUB_LEN
+        return 0
+    if *(raw as *i32) != OVERFLOW_STUB_TAG
+        return 0
+    *out_total = *((raw + 4) as *i64)
+    *out_first = *((raw + 12) as *i64)
+    return 1
+
+fn overflow_stub_encode(stub: *u8, total: i64, first: i64)
+    *(stub as *i32) = OVERFLOW_STUB_TAG
+    *((stub + 4) as *i64) = total
+    *((stub + 12) as *i64) = first
+
+# Give back every page of the chain starting at `first`.  Stops at the
+# first page that is not an overflow page (nothing to free past a break).
+fn overflow_free(pool: *BufferPool, first: i64)
+    var page_id: i64 = first
+    var left: i64 = MAX_DOC_SIZE / PAGE_DATA_SIZE + 1   # Bounds a looped chain.
+    while page_id != INVALID_PAGE_ID and left > 0
+        let page_opt = buffer_pool_fetch(pool, page_id)
+        if option_is_none<*Page>(@page_opt) == 1
+            return
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+        let is_overflow: bool = page.header.magic == PAGE_MAGIC_OVERFLOW
+        let next: i64 = page.header.next_page
+        buffer_pool_unpin(pool, page_id, 0)
+        if not is_overflow
+            return
+        buffer_pool_free_page(pool, page_id)
+        page_id = next
+        left -= 1
+
+# Write data[0..len) to a new chain; its first page in *out_first.  On
+# failure no page stays allocated.
+fn overflow_write(pool: *BufferPool, data: *u8, len: i64, out_first: *i64) -> i32
+    var first: i64 = INVALID_PAGE_ID
+    var prev: *Page = null
+    var prev_id: i64 = INVALID_PAGE_ID
+    var pos: i64 = 0
+    while pos < len
+        let page_opt = buffer_pool_alloc(pool, PAGE_MAGIC_OVERFLOW)
+        if option_is_none<*Page>(@page_opt) == 1
+            if prev != null
+                buffer_pool_unpin(pool, prev_id, 1)
+            if first != INVALID_PAGE_ID
+                overflow_free(pool, first)
+            return ERR_NO_MEMORY
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+        let page_id: i64 = buffer_pool_page_id(pool, page)
+        var chunk: i64 = len - pos
+        if chunk > PAGE_DATA_SIZE
+            chunk = PAGE_DATA_SIZE
+        memcpy(page_data(page), data + pos, chunk)
+        page.header.free_start = chunk as i32
+        page.header.prev_page = prev_id
+        if prev != null
+            prev.header.next_page = page_id
+            buffer_pool_unpin(pool, prev_id, 1)
+        else
+            first = page_id
+        prev = page
+        prev_id = page_id
+        pos += chunk
+    if prev != null
+        buffer_pool_unpin(pool, prev_id, 1)
+    *out_first = first
+    return ERR_OK
+
+# Read the `total`-byte chain starting at `first` into buf (cap >= total).
+# ERR_CORRUPT if the chain is not exactly `total` bytes of overflow pages.
+fn overflow_read(pool: *BufferPool, first: i64, total: i64, buf: *u8) -> i32
+    var page_id: i64 = first
+    var pos: i64 = 0
+    while pos < total
+        if page_id == INVALID_PAGE_ID
+            return ERR_CORRUPT
+        let page_opt = buffer_pool_fetch(pool, page_id)
+        if option_is_none<*Page>(@page_opt) == 1
+            return ERR_IO
+        let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+        let chunk: i64 = page.header.free_start as i64
+        if page.header.magic != PAGE_MAGIC_OVERFLOW or chunk <= 0 or chunk > PAGE_DATA_SIZE or pos + chunk > total
+            buffer_pool_unpin(pool, page_id, 0)
+            return ERR_CORRUPT
+        memcpy(buf + pos, page_data(page), chunk)
+        let next: i64 = page.header.next_page
+        buffer_pool_unpin(pool, page_id, 0)
+        pos += chunk
+        page_id = next
+    if page_id != INVALID_PAGE_ID
+        return ERR_CORRUPT
+    return ERR_OK
+
+# The document a B-tree value `raw` stands for, copied into buf: `raw`
+# itself, or the chain its stub points at.  ERR_FULL (with the length it
+# needs in *out_len) if it is longer than `cap`.
+fn value_resolve(col: *Collection, raw: *u8, raw_len: i64, buf: *u8, cap: i64, out_len: *i64) -> i32
+    var total: i64 = 0
+    var first: i64 = INVALID_PAGE_ID
+    if overflow_stub_decode(raw, raw_len, @total, @first) == 1
+        *out_len = total
+        if total > cap
+            return ERR_FULL
+        return overflow_read(col.pool, first, total, buf)
+    *out_len = raw_len
+    if raw_len > cap
+        return ERR_FULL
+    if raw_len > 0
+        memcpy(buf, raw, raw_len)
+    return ERR_OK
+
+# The B-tree value for document bytes data[0..len): data itself if it fits
+# inline, else a stub (written into `stub`) for a new chain holding them.
+# *out_val / *out_len say which; *out_first is the chain or INVALID_PAGE_ID.
+fn value_store(col: *Collection, data: *u8, len: i64, stub: *u8, out_val: **u8, out_len: *i64, out_first: *i64) -> i32
+    *out_first = INVALID_PAGE_ID
+    if len <= MAX_INLINE_DOC_SIZE
+        *out_val = data
+        *out_len = len
+        return ERR_OK
+    var first: i64 = INVALID_PAGE_ID
+    let rc: i32 = overflow_write(col.pool, data, len, @first)
+    if rc != ERR_OK
+        return rc
+    overflow_stub_encode(stub, len, first)
+    *out_val = stub
+    *out_len = OVERFLOW_STUB_LEN
+    *out_first = first
+    return ERR_OK
+
+# The overflow chain document `key` points at now, or INVALID_PAGE_ID (no
+# such document, or stored inline).
+fn current_chain(col: *Collection, key: *u8) -> i64
+    var raw: [2048]u8
+    var raw_len: i32 = 0
+    if btree_get(col.tree, key, 8, @raw[0], @raw_len) != ERR_OK
+        return INVALID_PAGE_ID
+    var total: i64 = 0
+    var first: i64 = INVALID_PAGE_ID
+    if overflow_stub_decode(@raw[0], raw_len as i64, @total, @first) == 1
+        return first
+    return INVALID_PAGE_ID
+
+# Serialize `doc` and store it under `key`: inline, or in a new chain (the
+# old chain, if any, is freed once the new value is in).
+fn store_doc(col: *Collection, key: *u8, doc: *Document) -> i32
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    if buf == null
+        return ERR_NO_MEMORY
+    let size: i64 = doc_serialize(doc, buf, MAX_DOC_SIZE)
+    if size < 0
+        free(buf)
+        return ERR_FULL
+
+    let old_chain: i64 = current_chain(col, key)
+    var stub: [20]u8
+    var val: *u8 = null
+    var val_len: i64 = 0
+    var chain: i64 = INVALID_PAGE_ID
+    var rc: i32 = value_store(col, buf, size, @stub[0], @val, @val_len, @chain)
+    if rc == ERR_OK
+        rc = btree_put(col.tree, key, 8, val, val_len as i32)
+        if rc != ERR_OK and chain != INVALID_PAGE_ID
+            overflow_free(col.pool, chain)
+    free(buf)
+    if rc == ERR_OK and old_chain != INVALID_PAGE_ID
+        overflow_free(col.pool, old_chain)
+    return rc
+
+# ============================================================================
 # Collection Operations
 # ============================================================================
 
@@ -456,19 +653,12 @@ pub fn collection_insert(col: *Collection, doc: *Document, out_id: *DocumentId) 
     doc.id = doc_id_new(col.collection_id, col.next_sequence)
     col.next_sequence = col.next_sequence + 1
 
-    # Serialize document
-    var buf: [2048]u8
-    var size: i64 = doc_serialize(doc, @buf[0], MAX_DOC_SIZE)
-    if size < 0
-        return ERR_FULL
-
     # Build key from document ID (8 bytes)
     var key: [8]u8
     var key_ptr: *i64 = @key[0] as *i64
     *key_ptr = doc.id.value
 
-    # Insert into B-tree
-    var result: i32 = btree_put(col.tree, @key[0], 8, @buf[0], size as i32)
+    var result: i32 = store_doc(col, @key[0], doc)
     if result != ERR_OK
         return result
 
@@ -477,7 +667,7 @@ pub fn collection_insert(col: *Collection, doc: *Document, out_id: *DocumentId) 
     return ERR_OK
 
 # Document `id`, deserialized into `out_doc`. Its stored bytes are copied
-# into the caller's `buf` (`cap` >= MAX_DOC_SIZE), and `out_doc`'s
+# into the caller's `buf` (see collection_get_raw), and `out_doc`'s
 # FIELD_STRING and FIELD_BYTES values point into it: `out_doc` is only
 # valid while `buf` is. Two documents alive at once need two buffers.
 pub fn collection_get(col: *Collection, id: *DocumentId, out_doc: *Document, buf: *u8, cap: i64) -> i32
@@ -491,21 +681,34 @@ pub fn collection_get(col: *Collection, id: *DocumentId, out_doc: *Document, buf
 
 # The stored (serialized) bytes of document `id`, copied into `buf`.
 # The server answers GET with these as they are, with no deserialize and
-# re-serialize round trip.
+# re-serialize round trip.  A buffer of MAX_DOC_SIZE holds any document;
+# for a shorter `cap` that the document does not fit, ERR_FULL with the
+# length it needs in *out_len.
 pub fn collection_get_raw(col: *Collection, id: *DocumentId, buf: *u8, cap: i64, out_len: *i64) -> i32
     if col == null or id == null or buf == null or out_len == null
-        return ERR_INVALID
-    if cap < MAX_DOC_SIZE
         return ERR_INVALID
     var key: [8]u8
     var key_ptr: *i64 = @key[0] as *i64
     *key_ptr = id.value
-    var val_len: i32 = 0
-    let result: i32 = btree_get(col.tree, @key[0], 8, buf, @val_len)
+    var raw: [2048]u8
+    var raw_len: i32 = 0
+    let result: i32 = btree_get(col.tree, @key[0], 8, @raw[0], @raw_len)
     if result != ERR_OK
         return result
-    *out_len = val_len as i64
-    return ERR_OK
+    return value_resolve(col, @raw[0], raw_len as i64, buf, cap, out_len)
+
+# The document a scan's iterator is on (see collection_scan), copied into
+# `buf` like collection_get_raw: btree_iter_value gives only its B-tree
+# value, which for a large document is an overflow stub.
+pub fn collection_iter_value(col: *Collection, iter: *BTreeIter, buf: *u8, cap: i64, out_len: *i64) -> i32
+    if col == null or iter == null or buf == null or out_len == null
+        return ERR_INVALID
+    var raw: [2048]u8
+    var raw_len: i32 = 0
+    btree_iter_value(iter, @raw[0], @raw_len)
+    if raw_len <= 0
+        return ERR_IO   # Unreadable leaf (no stored document is empty).
+    return value_resolve(col, @raw[0], raw_len as i64, buf, cap, out_len)
 
 pub fn collection_update(col: *Collection, doc: *Document) -> i32
     if col == null or doc == null
@@ -522,14 +725,8 @@ pub fn collection_update(col: *Collection, doc: *Document) -> i32
     if result != ERR_OK
         return ERR_NOT_FOUND
 
-    # Serialize updated document
-    var buf: [2048]u8
-    var size: i64 = doc_serialize(doc, @buf[0], MAX_DOC_SIZE)
-    if size < 0
-        return ERR_FULL
-
-    # Update in B-tree (put overwrites)
-    return btree_put(col.tree, @key[0], 8, @buf[0], size as i32)
+    # Store the new version (put overwrites); the old chain goes after.
+    return store_doc(col, @key[0], doc)
 
 pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
     if col == null or id == null
@@ -540,10 +737,13 @@ pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
     var key_ptr: *i64 = @key[0] as *i64
     *key_ptr = id.value
 
-    # Delete from B-tree
+    # Delete from B-tree, then give back its overflow chain if it had one.
+    let chain: i64 = current_chain(col, @key[0])
     var result: i32 = btree_delete(col.tree, @key[0], 8)
     if result == ERR_OK
         col.doc_count = col.doc_count - 1
+        if chain != INVALID_PAGE_ID
+            overflow_free(col.pool, chain)
     return result
 
 pub fn collection_count(col: *Collection) -> i64
@@ -572,10 +772,10 @@ pub fn collection_doc_count(col: *Collection) -> i64
 
 # Open a forward iterator over every document in the collection.
 #
-# Walks the underlying B-tree's leaves in DocumentId key order.  Each
-# value is the serialized Document blob (see `doc_serialize`) — pass it
-# to `doc_deserialize` to get a Document back.  Driven by the
-# `btree_iter_*` API exported from `mausoleum.btree`.
+# Walks the underlying B-tree's leaves in DocumentId key order.  Read each
+# document with collection_iter_value (not btree_iter_value, which gives a
+# large document's overflow stub), then `doc_deserialize` it.  Advance and
+# finish with the `btree_iter_*` API exported from `mausoleum.btree`.
 #
 # Returns None on null collection / null tree / OOM.
 pub fn collection_scan(col: *Collection) -> Option<*BTreeIter>

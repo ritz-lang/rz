@@ -4,6 +4,7 @@
 
 import ritzlib.sys
 import ritzlib.str
+import ritzlib.memory
 import ritzlib.option
 
 import mausoleum.m7m_types
@@ -31,20 +32,21 @@ pub fn get_children(col: *Collection, parent_id: *DocumentId, results: *Document
         return ERR_OK
     var iter_ptr: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
 
-    var key: [8]u8
-    var val: [2048]u8
-    var key_len: i32 = 0
-    var val_len: i32 = 0
+    # One buffer for every document: any one may be up to MAX_DOC_SIZE.
+    let val: *u8 = malloc(MAX_DOC_SIZE)
+    if val == null
+        btree_iter_destroy(iter_ptr)
+        return ERR_NO_MEMORY
+    var val_len: i64 = 0
 
     while btree_iter_valid(iter_ptr) == 1 and *out_count < max_results
-        key_len = 0
+        # The document, resolving an overflow stub
         val_len = 0
-        btree_iter_key(iter_ptr, @key[0], @key_len)
-        btree_iter_value(iter_ptr, @val[0], @val_len)
+        var have: i32 = collection_iter_value(col, iter_ptr, val, MAX_DOC_SIZE, @val_len)
 
         # Deserialize to check parent
         var doc: Document
-        if doc_deserialize(@val[0], val_len as i64, @doc) == ERR_OK
+        if have == ERR_OK and doc_deserialize(val, val_len, @doc) == ERR_OK
             if doc_has_parent(@doc) == 1
                 var doc_parent: DocumentId = doc_get_parent(@doc)
                 if doc_id_eq(@doc_parent, parent_id) == 1
@@ -55,6 +57,7 @@ pub fn get_children(col: *Collection, parent_id: *DocumentId, results: *Document
         btree_iter_next(iter_ptr)
 
     btree_iter_destroy(iter_ptr)
+    free(val)
     return ERR_OK
 
 # Get all ancestors of a document (following parent chain to root)
@@ -67,12 +70,14 @@ pub fn get_ancestors(col: *Collection, doc_id: *DocumentId, results: *DocumentId
 
     # Start with the document
     var current_id: DocumentId = *doc_id
-    var buf: [2048]u8
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    if buf == null
+        return ERR_NO_MEMORY
 
     while *out_count < max_results
         # Get document
         var doc: Document
-        var result: i32 = collection_get(col, @current_id, @doc, @buf[0], 2048)
+        var result: i32 = collection_get(col, @current_id, @doc, buf, MAX_DOC_SIZE)
         if result != ERR_OK
             break
 
@@ -87,6 +92,7 @@ pub fn get_ancestors(col: *Collection, doc_id: *DocumentId, results: *DocumentId
         results[*out_count] = current_id
         *out_count = *out_count + 1
 
+    free(buf)
     return ERR_OK
 
 # Get all descendants of a document (children, grandchildren, etc.)
@@ -138,9 +144,12 @@ pub fn get_linked(col: *Collection, source_id: *DocumentId, label: *u8, results:
 
     # Get the source document
     var doc: Document
-    var buf: [2048]u8
-    var result: i32 = collection_get(col, source_id, @doc, @buf[0], 2048)
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    if buf == null
+        return ERR_NO_MEMORY
+    var result: i32 = collection_get(col, source_id, @doc, buf, MAX_DOC_SIZE)
     if result != ERR_OK
+        free(buf)
         return result
 
     # Iterate over links and find matching labels
@@ -151,6 +160,7 @@ pub fn get_linked(col: *Collection, source_id: *DocumentId, label: *u8, results:
             *out_count = *out_count + 1
         i = i + 1
 
+    free(buf)
     return ERR_OK
 
 # Get all documents that link TO this document with a specific label (backlinks/reverse links)
@@ -167,20 +177,21 @@ pub fn get_backlinks(col: *Collection, target_id: *DocumentId, label: *u8, resul
         return ERR_OK
     var iter_ptr: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
 
-    var key: [8]u8
-    var val: [2048]u8
-    var key_len: i32 = 0
-    var val_len: i32 = 0
+    # One buffer for every document: any one may be up to MAX_DOC_SIZE.
+    let val: *u8 = malloc(MAX_DOC_SIZE)
+    if val == null
+        btree_iter_destroy(iter_ptr)
+        return ERR_NO_MEMORY
+    var val_len: i64 = 0
 
     while btree_iter_valid(iter_ptr) == 1 and *out_count < max_results
-        key_len = 0
+        # The document, resolving an overflow stub
         val_len = 0
-        btree_iter_key(iter_ptr, @key[0], @key_len)
-        btree_iter_value(iter_ptr, @val[0], @val_len)
+        var have: i32 = collection_iter_value(col, iter_ptr, val, MAX_DOC_SIZE, @val_len)
 
         # Deserialize to check links
         var doc: Document
-        if doc_deserialize(@val[0], val_len as i64, @doc) == ERR_OK
+        if have == ERR_OK and doc_deserialize(val, val_len, @doc) == ERR_OK
             # Check if this document links to target with the specified label
             if doc_has_link(@doc, label, target_id) == 1
                 results[*out_count] = doc.id
@@ -189,4 +200,5 @@ pub fn get_backlinks(col: *Collection, target_id: *DocumentId, label: *u8, resul
         btree_iter_next(iter_ptr)
 
     btree_iter_destroy(iter_ptr)
+    free(val)
     return ERR_OK

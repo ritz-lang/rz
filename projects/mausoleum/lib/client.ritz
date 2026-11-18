@@ -36,6 +36,8 @@ struct Client
     next_request_id: i32      # Next request ID
     send_buf: *MessageBuffer  # Send buffer
     recv_buf: Vec<u8>         # Receive buffer; .len = bytes held (plaintext path only)
+    recv_used: i32            # Bytes at its front that are the message last
+                              # returned (dropped by the next recv_message)
     last_error: i32           # Last error code
     last_errno: i32           # errno of the last failed connect (0 if none);
                               # see client_last_errno
@@ -89,6 +91,7 @@ pub fn client_new() -> *Client
         free(client as *u8)
         return null
     client.recv_buf = vec_with_cap<u8>(CLIENT_BUFFER_SIZE as i64)
+    client.recv_used = 0
     if client.recv_buf.data == null
         msgbuf_free(client.send_buf)
         free(client as *u8)
@@ -479,6 +482,17 @@ fn recv_message(client: *Client, reader: *MessageReader) -> i32
         client.recv_buf.len = 0
         return 0
 
+    # Drop the message returned last time: its caller is done with it.
+    # (Moving the bytes after it to the front before then overwrote the
+    # message the caller was still reading whenever the next one had
+    # arrived in the same read, AGAST #3638.)
+    if client.recv_used > 0
+        let remaining: i64 = client.recv_buf.len - client.recv_used as i64
+        if remaining > 0
+            memmove(client.recv_buf.data, client.recv_buf.data + client.recv_used, remaining)
+        client.recv_buf.len = remaining
+        client.recv_used = 0
+
     # First receive the header
     while client.recv_buf.len < PROTO_HEADER_SIZE as i64
         if recv_some(client) <= 0
@@ -504,16 +518,9 @@ fn recv_message(client: *Client, reader: *MessageReader) -> i32
     if result != PROTO_OK
         return -4
 
-    # Shift any remaining data
-    let remaining: i32 = client.recv_buf.len as i32 - msg_len
-    if remaining > 0
-        let buf: *u8 = client.recv_buf.data
-        var i: i32 = 0
-        while i < remaining
-            *(buf + i) = *(buf + msg_len + i)
-            i += 1
-    client.recv_buf.len = remaining as i64
-
+    # The reader points into recv_buf: keep the message there until the
+    # next call (any bytes after it are the next message's).
+    client.recv_used = msg_len
     return 0
 
 # ============================================================================

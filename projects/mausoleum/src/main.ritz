@@ -557,19 +557,23 @@ fn serve_loop(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *Collec
 
 # Handle a single encrypted session
 fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
-    var buf: [8192]u8
+    # A request and its reply: each up to ASYNC_MAX_MSG, the async loops'
+    # limit, which holds a MAX_DOC_SIZE document (AGAST #3638).
+    let buf: *u8 = malloc(2 * ASYNC_MAX_MSG as i64)
+    if buf == null
+        return
     var active_txn: i64 = -1  # Track active transaction (-1 = none)
     var collection: *Collection = registry_default(reg)
 
     loop
         # Receive encrypted message
-        let n: i32 = channel_recv(ch, @buf[0], 4096)
+        let n: i32 = channel_recv(ch, buf, ASYNC_MAX_MSG)
         if n <= 0
             break
 
         # Parse and handle M7SP message
         var reader: MessageReader
-        let result: i32 = msgreader_init(@reader, @buf[0], n)
+        let result: i32 = msgreader_init(@reader, buf, n)
         if result != PROTO_OK
             continue
 
@@ -578,7 +582,7 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
 
         # Handle message
         var resp: MessageBuffer
-        msgbuf_init(@resp, @buf[0] + 4096, 4096)
+        msgbuf_init(@resp, buf + ASYNC_MAX_MSG, ASYNC_MAX_MSG)
 
         if msg_type == MSG_CONNECT
             collection = serial_connect(@reader, @resp, request_id, reg, collection)
@@ -649,6 +653,7 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
         let resp_len: i32 = msgbuf_len(@resp)
         if resp_len > 0
             channel_send(ch, msgbuf_data(@resp), resp_len)
+    free(buf)
 
 # ============================================================================
 # Message Handlers
@@ -703,23 +708,24 @@ fn handle_get(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, col
     doc_id.value = doc_id_val
 
     # The stored bytes, sent as they are (see collection_get_raw)
-    var doc_buf: [2048]u8
-    var doc_size: i64 = 0
-    let get_result: i32 = collection_get_raw(collection, @doc_id, @doc_buf[0], 2048, @doc_size)
-    if get_result == ERR_NOT_FOUND
-        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
-        return
-    if get_result != ERR_OK
+    let doc_buf: *u8 = malloc(MAX_DOC_SIZE)
+    if doc_buf == null
         build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
         return
-
-    prints("  GET doc_id=")
-    print_i64(doc_id_val)
-    prints(" size=")
-    print_i64(doc_size)
-    prints("\n")
-
-    build_get_ok(resp, request_id, @doc_buf[0], doc_size as i32)
+    var doc_size: i64 = 0
+    let get_result: i32 = collection_get_raw(collection, @doc_id, doc_buf, MAX_DOC_SIZE, @doc_size)
+    if get_result == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NOT_FOUND, "Document not found")
+    else if get_result != ERR_OK
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to get document")
+    else
+        prints("  GET doc_id=")
+        print_i64(doc_id_val)
+        prints(" size=")
+        print_i64(doc_size)
+        prints("\n")
+        build_get_ok(resp, request_id, doc_buf, doc_size as i32)
+    free(doc_buf)
 
 # Handle UPDATE message
 # Payload: [doc_data_len: i32][doc_data: bytes]
@@ -812,42 +818,41 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
     print_i32(max_results)
     prints("\n")
 
-    # 32 KiB scratch fits ~16 docs at the 2 KiB MAX_DOC_SIZE ceiling —
-    # well above the typical wiki seed.  We flush early on byte-budget
-    # too so the buffer can never overflow.
-    var scan_buf: [32768]u8
+    # A batch is up to ASYNC_MAX_MSG: room for one MAX_DOC_SIZE document,
+    # or several small ones (AGAST #3638).
+    let scan_buf: *u8 = malloc(ASYNC_MAX_MSG as i64)
+    let val_buf: *u8 = malloc(MAX_DOC_SIZE)
     var scan_resp: MessageBuffer
 
     let iter_opt = collection_scan(collection)
-    if option_is_none<*BTreeIter>(@iter_opt) == 1
+    var iter: *BTreeIter = null
+    if option_is_none<*BTreeIter>(@iter_opt) == 0
+        iter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    if iter == null or scan_buf == null or val_buf == null
         # Empty / unopenable: emit one zero-doc SCAN_RESULT then SCAN_END.
-        msgbuf_init(@scan_resp, @scan_buf[0], 32768)
+        var empty: [64]u8
+        msgbuf_init(@scan_resp, @empty[0], 64)
         msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
         msgbuf_write_i32(@scan_resp, 0)
         msgbuf_write_i32(@scan_resp, 0)
         msgbuf_finish(@scan_resp)
         sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
         build_scan_end(resp, request_id)
-        return
-
-    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
-    if iter == null
-        msgbuf_init(@scan_resp, @scan_buf[0], 32768)
-        msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
-        msgbuf_write_i32(@scan_resp, 0)
-        msgbuf_write_i32(@scan_resp, 0)
-        msgbuf_finish(@scan_resp)
-        sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
-        build_scan_end(resp, request_id)
+        if iter != null
+            btree_iter_destroy(iter)
+        if scan_buf != null
+            free(scan_buf)
+        if val_buf != null
+            free(val_buf)
         return
 
     var total_emitted: i32 = 0
     var done: i32 = 0
     let batch_target: i32 = 16          # max docs per SCAN_RESULT batch
-    let batch_byte_budget: i32 = 30000  # leave 2 KiB headroom in 32 KiB
+    let batch_byte_budget: i32 = 30000  # a lone larger document still goes
 
     while done == 0
-        msgbuf_init(@scan_resp, @scan_buf[0], 32768)
+        msgbuf_init(@scan_resp, scan_buf, ASYNC_MAX_MSG)
         msgbuf_start(@scan_resp, MSG_SCAN_RESULT, request_id)
 
         # Reserve doc_count and has_more (4 bytes each).  Capture their
@@ -860,7 +865,6 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
 
         var batch_count: i32 = 0
         var key_buf: [16]u8
-        var val_buf: [2048]u8
 
         while batch_count < batch_target
             if btree_iter_valid(iter) == 0
@@ -874,8 +878,12 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
             var key_len: i32 = 0
             btree_iter_key(iter, @key_buf[0], @key_len)
 
-            var val_len: i32 = 0
-            btree_iter_value(iter, @val_buf[0], @val_len)
+            # The whole document: a large one's overflow chain, not its stub.
+            var full_len: i64 = 0
+            if collection_iter_value(collection, iter, val_buf, MAX_DOC_SIZE, @full_len) != ERR_OK
+                btree_iter_next(iter)
+                continue
+            let val_len: i32 = full_len as i32
 
             # Stop early if appending this doc would overflow the buffer
             let doc_overhead: i32 = 8 + 4   # doc_id + length prefix
@@ -888,7 +896,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
             let doc_id: i64 = *id_ptr
 
             msgbuf_write_i64(@scan_resp, doc_id)
-            msgbuf_write_bytes(@scan_resp, @val_buf[0], val_len)
+            msgbuf_write_bytes(@scan_resp, val_buf, val_len)
 
             batch_count += 1
             total_emitted += 1
@@ -915,13 +923,15 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
         *(more_ptr + 3) = (has_more_val & 0xFF) as u8
 
         msgbuf_finish(@scan_resp)
-        sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
+        write_all(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp))
 
         # Defense: if we somehow emitted zero rows in this batch (iter
         # exhausted at start), bail to avoid spinning on empty batches.
         if batch_count == 0
             done = 1
 
+    free(scan_buf)
+    free(val_buf)
     btree_iter_destroy(iter)
 
     prints("  SCAN emitted ")
@@ -1006,19 +1016,23 @@ fn serve_loop_plain(listen_fd: i32, pool: *BufferPool, storage: *Storage, reg: *
 
 # Handle a single plain (unencrypted) session
 fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *CollectionRegistry)
-    var buf: [8192]u8
+    # A request and its reply: each up to ASYNC_MAX_MSG, the async loops'
+    # limit, which holds a MAX_DOC_SIZE document (AGAST #3638).
+    let buf: *u8 = malloc(2 * ASYNC_MAX_MSG as i64)
+    if buf == null
+        return
     var active_txn: i64 = -1  # Track active transaction (-1 = none)
     var collection: *Collection = registry_default(reg)
 
     loop
-        # Receive message (plain TCP read)
-        let n: i64 = sys_read(fd, @buf[0], 4096)
+        # Receive one whole message (plain TCP read)
+        let n: i32 = read_message(fd, buf, ASYNC_MAX_MSG)
         if n <= 0
             break
 
         # Parse and handle M7SP message
         var reader: MessageReader
-        let result: i32 = msgreader_init(@reader, @buf[0], n as i32)
+        let result: i32 = msgreader_init(@reader, buf, n)
         if result != PROTO_OK
             continue
 
@@ -1027,7 +1041,7 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
 
         # Handle message
         var resp: MessageBuffer
-        msgbuf_init(@resp, @buf[0] + 4096, 4096)
+        msgbuf_init(@resp, buf + ASYNC_MAX_MSG, ASYNC_MAX_MSG)
 
         if msg_type == MSG_CONNECT
             prints("  CONNECT received\n")
@@ -1041,8 +1055,7 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
             if active_txn >= 0 and storage != null
                 storage_abort_txn(storage)
             build_disconnected(@resp, request_id)
-            let resp_len: i32 = msgbuf_len(@resp)
-            sys_write(fd, msgbuf_data(@resp), resp_len as i64)
+            write_all(fd, msgbuf_data(@resp), msgbuf_len(@resp))
             break
 
         else if msg_type == MSG_INSERT
@@ -1101,7 +1114,44 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
         # Send plain response
         let resp_len: i32 = msgbuf_len(@resp)
         if resp_len > 0
-            sys_write(fd, msgbuf_data(@resp), resp_len as i64)
+            write_all(fd, msgbuf_data(@resp), resp_len)
+    free(buf)
+
+# Read exactly `len` bytes into buf.  0 once they are all in, -1 on EOF or
+# an error first.
+fn read_exact(fd: i32, buf: *u8, len: i32) -> i32
+    var got: i32 = 0
+    while got < len
+        let n: i64 = sys_read(fd, buf + got, (len - got) as i64)
+        if n <= 0
+            return -1
+        got += n as i32
+    return 0
+
+# Read one M7SP message (header, then the length it gives) into buf.  Its
+# length, or -1 on EOF / error / a message over `cap`, after which the
+# stream cannot be resynchronized and the session ends.
+fn read_message(fd: i32, buf: *u8, cap: i32) -> i32
+    if read_exact(fd, buf, PROTO_HEADER_SIZE) < 0
+        return -1
+    var msg_len: i32 = (*(buf + 4) as i32) << 24
+    msg_len = msg_len | ((*(buf + 5) as i32) << 16)
+    msg_len = msg_len | ((*(buf + 6) as i32) << 8)
+    msg_len = msg_len | (*(buf + 7) as i32)
+    if msg_len < PROTO_HEADER_SIZE or msg_len > cap
+        return -1
+    if read_exact(fd, buf + PROTO_HEADER_SIZE, msg_len - PROTO_HEADER_SIZE) < 0
+        return -1
+    return msg_len
+
+# Write all of data[0..len) (a socket may take less per write).
+fn write_all(fd: i32, data: *u8, len: i32)
+    var sent: i32 = 0
+    while sent < len
+        let n: i64 = sys_write(fd, data + sent, (len - sent) as i64)
+        if n <= 0
+            return
+        sent += n as i32
 
 # ============================================================================
 # Shell Command - Interactive Client

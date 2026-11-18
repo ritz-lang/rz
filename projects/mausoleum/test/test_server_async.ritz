@@ -73,7 +73,7 @@ fn test_async_handshake_accepts_valid_client_key() -> i32
 
 
 fn sa_collection(col: *Collection) -> i32
-    let pool_opt = buffer_pool_new(64)
+    let pool_opt = buffer_pool_new(128)
     let pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
     if pool == null
         return -1
@@ -94,8 +94,8 @@ fn sa_sized_doc(size: i64, id: i64, payload: *u8, buf: *u8, cap: i64) -> i64
 # Run one INSERT (update == 0) or UPDATE carrying `doc` through the handler;
 # returns the response type, with the error code in *code for MSG_ERROR.
 fn sa_write(col: *Collection, update: i32, doc: *u8, doc_len: i32, code: *i32) -> i32
-    let req: *MessageBuffer = msgbuf_new(16384)
-    let resp: *MessageBuffer = msgbuf_new(16384)
+    let req: *MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+    let resp: *MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
     var msg_type: i32 = MSG_INSERT
     if update != 0
         msg_type = MSG_UPDATE
@@ -122,9 +122,9 @@ fn sa_write(col: *Collection, update: i32, doc: *u8, doc_len: i32, code: *i32) -
 fn test_async_insert_takes_a_max_size_doc() -> i32
     var col: Collection
     assert sa_collection(@col) == ERR_OK
-    let payload: *u8 = malloc(4096)
-    let buf: *u8 = malloc(4096)
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf, 4096)
+    let payload: *u8 = malloc(MAX_DOC_SIZE + 1)
+    let buf: *u8 = malloc(MAX_DOC_SIZE + 1)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf, MAX_DOC_SIZE + 1)
     assert n == MAX_DOC_SIZE
     var code: i32 = 0
     assert sa_write(@col, 0, buf, n as i32, @code) == MSG_INSERT_OK
@@ -135,9 +135,9 @@ fn test_async_insert_takes_a_max_size_doc() -> i32
 fn test_async_insert_refuses_an_oversize_doc_as_too_large() -> i32
     var col: Collection
     assert sa_collection(@col) == ERR_OK
-    let payload: *u8 = malloc(4096)
-    let buf: *u8 = malloc(4096)
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, -1, payload, buf, 4096)
+    let payload: *u8 = malloc(MAX_DOC_SIZE + 1)
+    let buf: *u8 = malloc(MAX_DOC_SIZE + 1)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, -1, payload, buf, MAX_DOC_SIZE + 1)
     var code: i32 = 0
     assert sa_write(@col, 0, buf, n as i32, @code) == MSG_ERROR
     assert code == PROTO_ERR_DOCUMENT_TOO_LARGE
@@ -148,20 +148,64 @@ fn test_async_insert_refuses_an_oversize_doc_as_too_large() -> i32
 fn test_async_update_refuses_an_oversize_doc_as_too_large() -> i32
     var col: Collection
     assert sa_collection(@col) == ERR_OK
-    let payload: *u8 = malloc(4096)
-    let buf: *u8 = malloc(4096)
-    var small: i64 = sa_sized_doc(100, -1, payload, buf, 4096)
+    let payload: *u8 = malloc(MAX_DOC_SIZE + 1)
+    let buf: *u8 = malloc(MAX_DOC_SIZE + 1)
+    var small: i64 = sa_sized_doc(100, -1, payload, buf, MAX_DOC_SIZE + 1)
     var id: DocumentId
     var doc: Document
     assert doc_deserialize(buf, small, @doc) == ERR_OK
     assert collection_insert(@col, @doc, @id) == ERR_OK
 
-    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, id.value, payload, buf, 4096)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE + 1, id.value, payload, buf, MAX_DOC_SIZE + 1)
     var code: i32 = 0
     assert sa_write(@col, 1, buf, n as i32, @code) == MSG_ERROR
     assert code == PROTO_ERR_DOCUMENT_TOO_LARGE
 
     # Control: an update at the limit is fine.
-    let ok: i64 = sa_sized_doc(MAX_DOC_SIZE, id.value, payload, buf, 4096)
+    let ok: i64 = sa_sized_doc(MAX_DOC_SIZE, id.value, payload, buf, MAX_DOC_SIZE + 1)
     assert sa_write(@col, 1, buf, ok as i32, @code) == MSG_UPDATE_OK
+    0
+
+
+# The async loops build replies in [36864]u8 stack buffers sized by
+# ASYNC_MAX_MSG (a literal: array sizes cannot name a constant), and that
+# must hold the largest reply: a SCAN_RESULT or GET_OK of one MAX_DOC_SIZE
+# document (16 header + 8 counts + 8 id + 4 length).  Its encrypted frame
+# is 32 bytes more (AGAST #3638).
+[[test]]
+fn test_async_max_msg_holds_a_max_size_doc() -> i32
+    assert ASYNC_MAX_MSG == 36864
+    assert ASYNC_MAX_MSG as i64 >= MAX_DOC_SIZE + 16 + 8 + 8 + 4
+    assert ASYNC_MAX_FRAME == ASYNC_MAX_MSG + 32
+    0
+
+# A GET of a document over the 8 KiB task buffer answers with all of it.
+[[test]]
+fn test_async_get_returns_a_max_size_doc() -> i32
+    var col: Collection
+    assert sa_collection(@col) == ERR_OK
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    let n: i64 = sa_sized_doc(MAX_DOC_SIZE, -1, payload, buf, MAX_DOC_SIZE)
+    var doc: Document
+    assert doc_deserialize(buf, n, @doc) == ERR_OK
+    var id: DocumentId
+    assert collection_insert(@col, @doc, @id) == ERR_OK
+
+    let req: *MessageBuffer = msgbuf_new(64)
+    let resp: *MessageBuffer = msgbuf_new(ASYNC_MAX_MSG)
+    msgbuf_start(req, MSG_GET, 1)
+    msgbuf_write_i64(req, id.value)
+    msgbuf_finish(req)
+    var reader: MessageReader
+    msgreader_init(@reader, msgbuf_data(req), msgbuf_len(req))
+    async_handle_get(@reader, resp, 1, @col)
+    var out: MessageReader
+    msgreader_init(@out, msgbuf_data(resp), msgbuf_len(resp))
+    assert msgreader_msg_type(@out) == MSG_GET_OK
+    var len: i32 = 0
+    let data: *u8 = msgreader_read_bytes(@out, @len)
+    assert len as i64 == MAX_DOC_SIZE
+    # The id was assigned on insert; everything after it is as sent.
+    assert memcmp(data + 12, buf + 12, MAX_DOC_SIZE - 12) == 0
     0

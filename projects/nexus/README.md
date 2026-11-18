@@ -152,9 +152,9 @@ leaves `default` intact and runs again on the next dial (#3681,
 `test/fixtures/store_v1_wiki`, written by the pre-#3637 binaries).
 
 Page size: a page is one Mausoleum document, and a document is at most
-`MAX_DOC_SIZE` (1992 bytes, one B-tree value; bigger ones would need overflow
-pages). A page also carries its slug, title and six numbers, so its content is
-at most `MAX_CONTENT_SIZE` (1229, `src/services/validation.ritz`). Longer
+`MAX_DOC_SIZE` (32768 bytes; past 1992 it is kept in overflow pages, #3638).
+A page also carries its slug, title and six numbers, so its content is at
+most `MAX_CONTENT_SIZE` (32005, `src/services/validation.ritz`). Longer
 content is a 413, not a database error (#2208). The in-memory fallback keeps
 its own 8192-byte limit (`wiki_page_repo_max_content_len`).
 

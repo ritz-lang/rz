@@ -58,6 +58,11 @@ struct BufferPool
     stats_hits: i64             # Cache hit count
     stats_misses: i64           # Cache miss count
     stats_evictions: i64        # Eviction count
+    # Free pages (AGAST #3638): ids buffer_pool_alloc hands out again before
+    # it grows the file.  Every page on it has magic PAGE_MAGIC_FREE.
+    free_ids: *i64
+    free_count: i64
+    free_cap: i64
 
 # ============================================================================
 # Buffer Pool Creation/Destruction
@@ -119,6 +124,9 @@ pub fn buffer_pool_new(num_frames: i32) -> Option<*BufferPool>
     pool.stats_hits = 0
     pool.stats_misses = 0
     pool.stats_evictions = 0
+    pool.free_ids = null
+    pool.free_count = 0
+    pool.free_cap = 0
 
     return Some(pool)
 
@@ -143,6 +151,8 @@ pub fn buffer_pool_destroy(pool: *BufferPool)
         free(pool.hash_table as *u8)
     if pool.frames != null
         free(pool.frames as *u8)
+    if pool.free_ids != null
+        free(pool.free_ids as *u8)
     free(pool as *u8)
 
 # ============================================================================
@@ -422,10 +432,15 @@ pub fn buffer_pool_unpin(pool: *BufferPool, page_id: i64, dirty: i32)
         if frame.pin_count == 0
             lru_add(pool, frame_idx)
 
-# Allocate a new page
+# Allocate a page of `page_type` (returned pinned and dirty): a freed one
+# if there is any (see buffer_pool_free_page), else a new one at the end of
+# the file.
 pub fn buffer_pool_alloc(pool: *BufferPool, page_type: i32) -> Option<*Page>
     if pool == null
         return None
+
+    if pool.free_count > 0
+        return alloc_free_page(pool, page_type)
 
     let page_id: i64 = pool.next_page_id
     pool.next_page_id += 1
@@ -447,6 +462,113 @@ pub fn buffer_pool_alloc(pool: *BufferPool, page_type: i32) -> Option<*Page>
     hash_insert(pool, frame_idx, page_id)
 
     return Some(@frame.page)
+
+# Hand out the most recently freed page as a new page of `page_type`.  Its
+# old contents are not read: they are overwritten whole.
+fn alloc_free_page(pool: *BufferPool, page_type: i32) -> Option<*Page>
+    let page_id: i64 = *(pool.free_ids + (pool.free_count - 1))
+    var frame_idx: i32 = find_frame(pool, page_id)
+    if frame_idx >= 0
+        let cached: *Frame = get_frame(pool, frame_idx)
+        if cached.pin_count != 0
+            return None  # Freed while still in use: a caller bug, refuse.
+        lru_remove(pool, frame_idx)
+    else
+        frame_idx = get_free_frame(pool)
+        if frame_idx < 0
+            return None
+        hash_insert(pool, frame_idx, page_id)
+
+    pool.free_count -= 1
+    let frame: *Frame = get_frame(pool, frame_idx)
+    page_init(@frame.page, page_type, page_id)
+    frame.page_id = page_id
+    frame.pin_count = 1
+    frame.dirty = 1
+    return Some(@frame.page)
+
+# Put `page_id` on the free list.
+fn free_list_push(pool: *BufferPool, page_id: i64) -> i32
+    if pool.free_count == pool.free_cap
+        var cap: i64 = pool.free_cap * 2
+        if cap < 64
+            cap = 64
+        let grown: *u8 = realloc(pool.free_ids as *u8, cap * 8)
+        if grown == null
+            return ERR_NO_MEMORY
+        pool.free_ids = grown as *i64
+        pool.free_cap = cap
+    *(pool.free_ids + pool.free_count) = page_id
+    pool.free_count += 1
+    return ERR_OK
+
+# Give page `page_id` back (AGAST #3638): it is blanked to a
+# PAGE_MAGIC_FREE page, written out like any other change, and the next
+# buffer_pool_alloc hands it out again.  ERR_INVALID for a page that was
+# never allocated or is free already, ERR_BUSY for one still pinned.
+pub fn buffer_pool_free_page(pool: *BufferPool, page_id: i64) -> i32
+    if pool == null or page_id < 0 or page_id >= pool.next_page_id
+        return ERR_INVALID
+    let page_opt = buffer_pool_fetch(pool, page_id)
+    if option_is_none<*Page>(@page_opt) == 1
+        return ERR_IO
+    let page: *Page = option_unwrap_or<*Page>(@page_opt, null)
+    if page.header.magic == PAGE_MAGIC_FREE
+        buffer_pool_unpin(pool, page_id, 0)
+        return ERR_INVALID
+    # Our fetch is one pin; any other is a user who would see it reused.
+    if get_frame(pool, find_frame(pool, page_id)).pin_count > 1
+        buffer_pool_unpin(pool, page_id, 0)
+        return ERR_BUSY
+    let pushed: i32 = free_list_push(pool, page_id)
+    if pushed != ERR_OK
+        buffer_pool_unpin(pool, page_id, 0)
+        return pushed
+    page_init(page, PAGE_MAGIC_FREE, page_id)
+    buffer_pool_unpin(pool, page_id, 1)
+    return ERR_OK
+
+# Pages the file holds or will (one past the highest page id handed out).
+pub fn buffer_pool_page_count(pool: *BufferPool) -> i64
+    if pool == null
+        return 0
+    return pool.next_page_id
+
+# Pages on the free list.
+pub fn buffer_pool_free_page_count(pool: *BufferPool) -> i64
+    if pool == null
+        return 0
+    return pool.free_count
+
+# Rebuild the free list from the pages themselves: every page below
+# next_page_id whose magic is PAGE_MAGIC_FREE (freed, or never written) is
+# free.  The free list is not stored anywhere else, so storage_open calls
+# this once recovery has brought the pages up to date.  Reads each page's
+# header (or its cached copy): one pass over the data file.
+pub fn buffer_pool_reclaim_free_pages(pool: *BufferPool) -> i32
+    if pool == null
+        return ERR_INVALID
+    pool.free_count = 0
+    var page_id: i64 = 0
+    while page_id < pool.next_page_id
+        var magic: i32 = PAGE_MAGIC_FREE
+        let frame_idx: i32 = find_frame(pool, page_id)
+        if frame_idx >= 0
+            magic = get_frame(pool, frame_idx).page.header.magic
+        else if pool.file_fd >= 0
+            if sys_lseek(pool.file_fd, page_id * PAGE_SIZE, 0) < 0
+                return ERR_IO
+            # A short read is past the end of the file: never written.
+            if sys_read(pool.file_fd, @magic as *u8, 4) != 4
+                magic = PAGE_MAGIC_FREE
+        else
+            magic = 0 - 1   # In-memory pool, page evicted: unknown, keep it.
+        if magic == PAGE_MAGIC_FREE
+            let pushed: i32 = free_list_push(pool, page_id)
+            if pushed != ERR_OK
+                return pushed
+        page_id += 1
+    return ERR_OK
 
 # Get page ID for a page pointer
 pub fn buffer_pool_page_id(pool: *BufferPool, page: *Page) -> i64

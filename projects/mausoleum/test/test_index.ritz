@@ -637,3 +637,52 @@ fn test_index_manager_destroy_null() -> i32
 fn test_index_count_null() -> i32
     assert index_count(null) == 0
     0
+
+# ============================================================================
+# Index build over documents past one B-tree value (AGAST #3638)
+# ============================================================================
+
+[[test]]
+fn test_index_build_reads_overflow_doc() -> i32
+    let pool_opt = buffer_pool_new(256)
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    insert_test_doc(@col, "Alice", 30, 1)
+
+    # A ~9 KB document (stored in overflow pages, its B-tree value a stub).
+    let body_len: i64 = 9000
+    let body: *u8 = malloc(body_len)
+    memset(body, 0x78, body_len)
+    var big: Document
+    var no_id: DocumentId = doc_id_invalid()
+    doc_init(@big, @no_id)
+    var age_field: Field = field_int(77)
+    doc_set_field(@big, "age", @age_field)
+    var body_field: Field = field_string(body, body_len)
+    doc_set_field(@big, "c", @body_field)
+    var big_id: DocumentId
+    assert collection_insert(@col, @big, @big_id) == ERR_OK
+    free(body)
+
+    insert_test_doc(@col, "Bob", 25, 1)
+
+    # The index is built from the existing documents, the big one included.
+    var mgr: *IndexManager = index_manager_new(pool, @col)
+    assert index_create(mgr, "idx_age", "age", 0) == ERR_OK
+    var idx: *Index = index_get(mgr, "idx_age")
+    assert index_entry_count(idx) == 3
+
+    var search_val: Field = field_int(77)
+    var iter_opt = index_scan_eq(idx, @search_val)
+    assert option_is_none<*BTreeIter>(@iter_opt) != 1
+    var iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    assert btree_iter_valid(iter) != 0
+    var found: DocumentId = index_iter_doc_id(iter)
+    assert doc_id_eq(@found, @big_id) == 1
+    btree_iter_destroy(iter)
+
+    index_manager_destroy(mgr)
+    buffer_pool_destroy(pool)
+    0

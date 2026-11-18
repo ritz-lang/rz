@@ -5,6 +5,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.memory
 import ritzlib.option
 
 import lib.m7m_types
@@ -479,6 +480,160 @@ fn test_get_linked_with_string_fields() -> i32
     if count != 1
         return 2
     if doc_id_eq(@results[0], @target_id) != 1
+        return 3
+    buffer_pool_destroy(pool)
+    0
+
+# ============================================================================
+# Traversal over documents past one B-tree value (AGAST #3638)
+# ============================================================================
+#
+# A ~9 KB document is stored in overflow pages; its B-tree value is only a
+# stub, so traversal must resolve it to see its parent and links.
+
+fn big_pool() -> *BufferPool
+    let pool_opt = buffer_pool_new(256)
+    option_unwrap_or<*BufferPool>(@pool_opt, null)
+
+# Give `doc` a 9000-byte body and insert it.
+fn insert_big(col: *Collection, doc: *Document) -> DocumentId
+    let len: i64 = 9000
+    let body: *u8 = malloc(len)
+    memset(body, 0x5A, len)
+    var f: Field = field_string(body, len)
+    doc_set_field(doc, "body", @f)
+    var out_id: DocumentId
+    let rc: i32 = collection_insert(col, doc, @out_id)
+    free(body)
+    if rc != ERR_OK
+        return doc_id_invalid()
+    return out_id
+
+[[test]]
+fn test_get_children_overflow_doc() -> i32
+    var pool: *BufferPool = big_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var invalid: DocumentId = doc_id_invalid()
+    var parent: Document
+    doc_init(@parent, @invalid)
+    var parent_id: DocumentId
+    collection_insert(@col, @parent, @parent_id)
+
+    var child: Document
+    doc_init(@child, @invalid)
+    doc_set_parent(@child, @parent_id)
+    var child_id: DocumentId = insert_big(@col, @child)
+    if doc_id_is_valid(@child_id) != 1
+        return 10
+
+    var results: [8]DocumentId
+    var count: i32 = 0
+    if get_children(@col, @parent_id, @results[0], 8, @count) != ERR_OK
+        return 1
+    if count != 1
+        return 2
+    if doc_id_eq(@results[0], @child_id) != 1
+        return 3
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_get_ancestors_overflow_doc() -> i32
+    var pool: *BufferPool = big_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var invalid: DocumentId = doc_id_invalid()
+    var root: Document
+    doc_init(@root, @invalid)
+    var root_id: DocumentId
+    collection_insert(@col, @root, @root_id)
+
+    # The middle of the chain is the big one.
+    var mid: Document
+    doc_init(@mid, @invalid)
+    doc_set_parent(@mid, @root_id)
+    var mid_id: DocumentId = insert_big(@col, @mid)
+    if doc_id_is_valid(@mid_id) != 1
+        return 10
+
+    var leaf: Document
+    doc_init(@leaf, @invalid)
+    doc_set_parent(@leaf, @mid_id)
+    var leaf_id: DocumentId
+    collection_insert(@col, @leaf, @leaf_id)
+
+    var results: [8]DocumentId
+    var count: i32 = 0
+    if get_ancestors(@col, @leaf_id, @results[0], 8, @count) != ERR_OK
+        return 1
+    if count != 2
+        return 2
+    if doc_id_eq(@results[0], @mid_id) != 1
+        return 3
+    if doc_id_eq(@results[1], @root_id) != 1
+        return 4
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_get_linked_overflow_doc() -> i32
+    var pool: *BufferPool = big_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var invalid: DocumentId = doc_id_invalid()
+    var target: Document
+    doc_init(@target, @invalid)
+    var target_id: DocumentId
+    collection_insert(@col, @target, @target_id)
+
+    var src: Document
+    doc_init(@src, @invalid)
+    doc_add_link(@src, "refs", @target_id)
+    var src_id: DocumentId = insert_big(@col, @src)
+    if doc_id_is_valid(@src_id) != 1
+        return 10
+
+    var results: [8]DocumentId
+    var count: i32 = 0
+    if get_linked(@col, @src_id, "refs", @results[0], 8, @count) != ERR_OK
+        return 1
+    if count != 1
+        return 2
+    if doc_id_eq(@results[0], @target_id) != 1
+        return 3
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_get_backlinks_overflow_doc() -> i32
+    var pool: *BufferPool = big_pool()
+    var col: Collection
+    collection_init(@col, pool, 1)
+
+    var invalid: DocumentId = doc_id_invalid()
+    var target: Document
+    doc_init(@target, @invalid)
+    var target_id: DocumentId
+    collection_insert(@col, @target, @target_id)
+
+    var src: Document
+    doc_init(@src, @invalid)
+    doc_add_link(@src, "refs", @target_id)
+    var src_id: DocumentId = insert_big(@col, @src)
+    if doc_id_is_valid(@src_id) != 1
+        return 10
+
+    var results: [8]DocumentId
+    var count: i32 = 0
+    if get_backlinks(@col, @target_id, "refs", @results[0], 8, @count) != ERR_OK
+        return 1
+    if count != 1
+        return 2
+    if doc_id_eq(@results[0], @src_id) != 1
         return 3
     buffer_pool_destroy(pool)
     0
