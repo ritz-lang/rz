@@ -151,6 +151,9 @@ pub fn vmm_init_physmap() -> i32
         vmm_set_entry(pdpt, g, pd | PTE_PRESENT | PTE_WRITABLE)
         g = g + 1
     vmm_set_entry(vmm_pml4_phys, PHYSMAP_PML4_INDEX, pdpt | PTE_PRESENT | PTE_WRITABLE)
+    # Before the offset switch: its PDPT is written through the identity map.
+    if vmm_init_mmio_window() != 0
+        return -1
     g_physmap_offset = PHYSMAP_BASE
     g_tables_high = true
     prints("[vmm] physmap: ")
@@ -546,8 +549,10 @@ pub fn vmm_ensure_mapped(paddr: u64, size: u64) -> i32
 # mapped uncached into a bump-allocated window at PML4[257], the slot after
 # the physmap. Being kernel-half, vmm_create_user_pml4 copies it into every
 # process, so a driver polled from a syscall reaches its registers whatever
-# CR3 is loaded. Map at boot, before the first process: a process PML4
-# copies PML4[257] only if it is present when the process is created.
+# CR3 is loaded. A process PML4 copies PML4[257] by value, so the entry only
+# reaches processes created after it exists: vmm_init_physmap creates its
+# PDPT before any process (vmm_init_mmio_window, AGAST #3577), and every
+# later mapping, boot-time or not, lands below that one shared PDPT.
 #
 # Before #3438 virtio used 0xFFFFFFFF90000000, inside the boot loader's
 # 2 MiB-page map of the kernel half: vmm_map_page refused it, the error was
@@ -556,6 +561,20 @@ pub const MMIO_WINDOW_BASE: u64 = 0xFFFF808000000000
 const MMIO_WINDOW_SIZE: u64 = 0x8000000000    # 512 GiB, all of PML4[257]
 
 var g_mmio_next: u64 = 0xFFFF808000000000    # MMIO_WINDOW_BASE (ritz0: literal initializers only)
+
+const MMIO_PML4_INDEX: u64 = 257
+
+# Give PML4[257] its PDPT now, so the entry every process copies is the one
+# vmm_map_mmio fills in later. Leaves an entry that is already present (its
+# mappings stay). Returns 0, or -1 when no table page is free.
+pub fn vmm_init_mmio_window() -> i32
+    if (vmm_get_entry(vmm_pml4_phys, MMIO_PML4_INDEX) & PTE_PRESENT) != 0
+        return 0
+    let pdpt: u64 = vmm_alloc_low_table()
+    if pdpt == 0
+        return -1
+    vmm_set_entry(vmm_pml4_phys, MMIO_PML4_INDEX, pdpt | PTE_PRESENT | PTE_WRITABLE)
+    return 0
 
 # Map size bytes of device memory at physical address paddr. Returns the
 # kernel virtual address of paddr itself (page offset kept), or 0 on failure.
