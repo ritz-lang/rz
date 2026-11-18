@@ -13,7 +13,10 @@ only through some module's plain import is an error there, with a hint:
 
 Only the compiled file's own uses are checked: every file is compiled on its
 own, so each use is checked once, in the file that writes it. Method calls
-on a value are not uses of a name: `x.len()` needs `x`'s type, not its name.
+on a value are not uses of a name: `x.len()` needs `x`'s type, not its name,
+and method syntax reaches no free fn (LANGUAGE_SPEC §9.4, #3244), so there is
+no UFCS use of a hidden fn. A static call `T.m()` uses T, and the mangled
+`T_m()` is hidden when T is (#3907).
 The scope walk is name_resolver's, so a local that shadows a hidden name is
 the local.
 """
@@ -84,6 +87,16 @@ def hidden_names(own_items: List[rast.Item], resolver, from_file: str,
             if target not in seen:
                 seen.add(target)
                 queue.append((target, _dotted(imp)))
+    # #3907: `T_m()` calls T's method `m` by its mangled name, so it is
+    # hidden when T is (`T.m()` is a use of T itself, an Ident).
+    for impl in merged.items:
+        if not isinstance(impl, rast.ImplBlock) or impl.type_name not in hints:
+            continue
+        origin, via, _, decl_file = hints[impl.type_name]
+        for method in impl.methods:
+            mangled = f"{impl.type_name}_{method.name}"
+            if mangled not in visible and mangled not in hints:
+                hints[mangled] = (origin, via, method, decl_file)
     return hints
 
 

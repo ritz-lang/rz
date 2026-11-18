@@ -16,9 +16,13 @@
 # import that brings it in (breadth first from the input).  sema_walk asks
 # vis_hidden at each use in the input's own fns.
 #
-# Covered: fns, structs, consts and globals, the items a Module lists.  Enums
-# and type aliases live in the parser's global tables, which don't record a
-# file, so a name of either is never hidden here (ritz0 checks them; AGAST #3907).
+# Covered: fns, structs, consts and globals, the items a Module lists, and
+# enums and type aliases (AGAST #3907): those live in the parser's global
+# tables, which record no file, so resolve_imports marks ast_helpers' log of
+# them before a file is parsed and vis_type_names takes what it added.  An
+# impl method's mangled name `T_m` is hidden when T is (`T.m()` is a use of T
+# at its EXPR_IDENT).  A method on a value names nothing: method syntax
+# reaches no free fn (LANGUAGE_SPEC §9.4), so no UFCS call uses a hidden fn.
 
 import ritzlib.sys
 import ritzlib.memory
@@ -27,6 +31,7 @@ import ritzlib.hash
 import ritzlib.string
 
 import ast
+import ast_helpers   # the enum / alias declaration log (AGAST #3907)
 
 struct VisName
     name: *u8
@@ -59,10 +64,34 @@ struct VisEntry
     via: *u8
     next: *VisEntry
 
+# An impl's method, for its mangled name `T_m` (AGAST #3907).
+struct VisImpl
+    ty: *u8
+    ty_len: i32
+    method: *u8
+    method_len: i32
+    next: *VisImpl
+
 const VIS_BUCKETS: i32 = 4096
 
 var g_vis_mods: *VisMod = null
 var g_vis_tab: **VisEntry = null
+var g_vis_impls: *VisImpl = null
+# The input's own type-alias uses: ast_helpers' alias-use log from .._from
+# up to .._to (AGAST #3907).  The last parse_program's, so a second parse
+# pass replaces the first's.
+var g_vis_alias_from: i32 = 0
+var g_vis_alias_to: i32 = 0
+
+pub fn vis_alias_uses_set(from: i32, to: i32)
+    g_vis_alias_from = from
+    g_vis_alias_to = to
+
+pub fn vis_alias_uses_from() -> i32
+    g_vis_alias_from
+
+pub fn vis_alias_uses_to() -> i32
+    g_vis_alias_to
 
 fn vis_copy(p: *u8, len: i64) -> *u8
     let out: *u8 = malloc(len + 1)
@@ -115,6 +144,30 @@ pub fn vis_names(vm: *VisMod, m: *Module)
     while g != null
         vis_add_name(vm, g.name, g.name_len)
         g = g.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var meth: *FnDef = ib.methods
+        while meth != null
+            let vi: *VisImpl = malloc(sizeof(VisImpl)) as *VisImpl
+            vi.ty = ib.type_name
+            vi.ty_len = ib.type_name_len
+            vi.method = meth.name
+            vi.method_len = meth.name_len
+            vi.next = g_vis_impls
+            g_vis_impls = vi
+            meth = meth.next
+        ib = ib.next
+
+# The enums and type aliases a file declared: ast_helpers' log from `mark`,
+# taken just before the file was parsed (AGAST #3907).
+pub fn vis_type_names(vm: *VisMod, mark: i32)
+    let end: i32 = type_decl_log_count()
+    var i: i32 = mark
+    while i < end
+        var len: i32 = 0
+        let name: *u8 = type_decl_log_at(i, @len)
+        vis_add_name(vm, name, len)
+        i = i + 1
 
 # `from`'s import of the module at canonical path `key`, written `imp`.
 pub fn vis_edge(from: *VisMod, key: *u8, imp: *ImportDecl)
@@ -236,6 +289,20 @@ pub fn vis_compute(main: *VisMod)
         if head.visible == 0
             vis_put_all(head, 1)
         head = head.queued
+    # AGAST #3907: `T_m()` is T's method by its mangled name, hidden when T
+    # is, unless some visible module declares that name itself.
+    var vi: *VisImpl = g_vis_impls
+    while vi != null
+        let t: *VisEntry = vis_find(vi.ty, vi.ty_len)
+        if t != null and t.hidden == 1
+            let n: i32 = vi.ty_len + 1 + vi.method_len
+            let mangled: *u8 = malloc(n as i64 + 1)
+            memcpy(mangled, vi.ty, vi.ty_len as i64)
+            mangled[vi.ty_len] = '_'
+            memcpy(mangled + vi.ty_len + 1, vi.method, vi.method_len as i64)
+            mangled[n] = 0
+            vis_put(mangled, n, 1, t.origin, t.via)
+        vi = vi.next
 
 # The hidden entry for `name`, or null when it is visible, unknown or no
 # input was tabled.

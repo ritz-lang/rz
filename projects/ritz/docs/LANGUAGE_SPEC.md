@@ -5842,7 +5842,11 @@ that would reach a file only that way is an error at the use, for example
 import` it" (AGAST #3891; LARB R54 is the same rule for a selective import's
 list). A local of the same name is the local. The built-ins (`StrView`,
 `Option`, `Result`, `Span` and their variants) are everywhere, so they are
-never hidden. ritz1 doesn't check enum and type-alias names yet (#3907).
+never hidden. An enum's or a type alias's name is hidden as a struct's is,
+at an annotation, at `E.V` and as a pattern's qualifier. A static call `T.m()`
+uses `T`, and the method's mangled name `T_m` is hidden when `T` is. A method
+call on a value, `x.m()`, uses no name: method syntax reaches no free fn
+(§9.4), so it can't reach a hidden one (#3907).
 
 ---
 

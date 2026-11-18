@@ -60,6 +60,21 @@ fn sema_vis_use(sm: *Sema, line: i32, col: i32, name: *u8, len: i32)
         return
     if sm.cur_fn == null or (sm.cur_fn.def_file != null and streq(sm.cur_fn.def_file, sm.file) == 0)
         return
+    sema_vis_report(sm, line, col, name, len)
+
+# AGAST #3907: the input's type-alias uses, wherever written (the parser
+# resolved each to its target, so no walk sees the name).
+fn sema_vis_alias_uses(sm: *Sema)
+    var i: i32 = vis_alias_uses_from()
+    let end: i32 = vis_alias_uses_to()
+    while i < end
+        var len: i32 = 0
+        var span: SrcSpan
+        let name: *u8 = alias_use_at(i, @len, @span)
+        sema_vis_report(sm, span.line, span.col, name, len)
+        i = i + 1
+
+fn sema_vis_report(sm: *Sema, line: i32, col: i32, name: *u8, len: i32)
     var n: i32 = 0
     while n < len and name[n] != '$'
         n = n + 1
@@ -101,6 +116,9 @@ fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discard: i32)
     var arm: *MatchArm = arms
     while arm != null
+        # AGAST #3907: `E.V =>` / `E.V(v) =>` names the enum E.
+        if arm.qualifier != null and sema_is_local(sm, arm.qualifier, arm.qualifier_len) == 0
+            sema_vis_use(sm, arm.head_span.line, arm.head_span.col, arm.qualifier, arm.qualifier_len)
         let mark: i32 = sm.scope_top
         ref_loan_enter()   # AGAST #3506: an arm is a block for loans
         if arm.pattern_kind == PAT_VARIANT
@@ -477,6 +495,7 @@ pub fn sema_check_module(m: *Module, path: *u8) -> i32
     deref_impls_check(sm)   # AGAST #3015: a `DerefMut` impl needs its `Deref`
     bool_check_globals(sm)   # AGAST #2342: before the fns, as the emitter
     literal_globals(sm)      # AGAST #2341
+    sema_vis_alias_uses(sm)  # AGAST #3907
     var seen: HashMapI64 = hashmap_i64_with_cap(4096)
     var f: *FnDef = m.functions
     while f != null
