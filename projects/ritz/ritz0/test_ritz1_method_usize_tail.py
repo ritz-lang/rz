@@ -44,6 +44,11 @@ The method tail's struct branch applies only when the return type lowers
 to a named `%T`; a primitive name (usize/isize/...) takes the scalar `ret`
 typed by emit_llvm_type_struct, the mapping the `define` line already uses.
 
+AGAST #3561: since #2198 the parser spells usize/isize as TYPE_U64/TYPE_I64,
+so no primitive reaches that branch as a TYPE_STRUCT name and the guard was
+deleted as dead code.  The matrix stays: it pins the scalar `ret i64` however
+the method's return type gets there.
+
 Every program has v.len() == 3, n == 4, k == 5 and exits with the value.
 
 COST (AGAST #3524): the rows share one compile and link per compiler
