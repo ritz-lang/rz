@@ -1,0 +1,230 @@
+# Line editor: one handler per key (AGAST #3940, LARB v4 packages.md M9)
+#
+# main's read loop decodes bytes into keys (input.ritz) and hands each key to
+# editor_handle_key, which edits the line buffer (common.ritz), echoes the
+# change to the terminal, and returns what the loop does next.
+
+import common {
+    puts, println, putchar,
+    g_line_buffer, g_line_pos,
+    line_clear, line_add_char, line_backspace, line_delete,
+    line_cursor_left, line_cursor_right, line_cursor_home, line_cursor_end,
+    line_kill_to_end, line_kill_to_start, line_set, line_length, line_cursor_pos,
+    print_prompt
+}
+
+import shell { run_line }
+
+import input {
+    input_get_char, cursor_left, cursor_right, clear_to_eol,
+    KEY_CHAR, KEY_UP, KEY_DOWN, KEY_RIGHT, KEY_LEFT,
+    KEY_HOME, KEY_END, KEY_DELETE, KEY_BACKSPACE, KEY_ENTER,
+    KEY_CTRL_C, KEY_CTRL_D, KEY_CTRL_A, KEY_CTRL_E,
+    KEY_CTRL_K, KEY_CTRL_U, KEY_CTRL_L
+}
+
+import history { history_add, history_up, history_down }
+
+import ritzlib.sys { sys_write, STDOUT }
+import ritzlib.strview { StrView, strview_from_cstr }
+
+# What the read loop does after a key.
+pub const EDIT_CONTINUE: i32 = 0     # keep reading this line
+pub const EDIT_LINE_DONE: i32 = 1    # line finished: print a new prompt
+pub const EDIT_EXIT: i32 = 2         # leave the shell
+
+# What argv[1] asks for.
+pub const CLI_INTERACTIVE: i32 = 0
+pub const CLI_HELP: i32 = 1          # --help
+pub const CLI_COMMAND: i32 = 2       # -c LINE
+
+pub fn cli_mode(arg: *u8) -> i32
+    match strview_from_cstr(arg)
+        "--help" => CLI_HELP
+        "-c" => CLI_COMMAND
+        _ => CLI_INTERACTIVE
+
+# ============================================================================
+# Terminal helpers
+# ============================================================================
+
+# After modifying text mid-line, redraw the remainder and reposition cursor.
+fn redraw_line_from_cursor()
+    let cur: i64 = line_cursor_pos()
+    let len: i64 = line_length()
+    if cur < len
+        sys_write(STDOUT, @g_line_buffer[cur as i32], len - cur)
+    # Clear anything after (in case line got shorter)
+    clear_to_eol()
+    move_left(len - cur)
+
+fn move_left(n: i64)
+    if n > 0
+        cursor_left(n as i32)
+
+fn move_right(n: i64)
+    if n > 0
+        cursor_right(n as i32)
+
+# Blank the visible line, leaving the terminal cursor at the prompt.
+fn erase_visible_line()
+    move_left(line_cursor_pos())
+    clear_to_eol()
+
+fn process_line() -> i32
+    if g_line_pos == 0
+        return 0
+    g_line_buffer[g_line_pos as i32] = 0
+    return run_line(@g_line_buffer[0])
+
+# ============================================================================
+# Line-ending keys
+# ============================================================================
+
+fn on_enter() -> i32
+    println(c"")
+    if line_length() > 0
+        history_add(@g_line_buffer[0])
+    process_line()
+    return EDIT_LINE_DONE
+
+fn on_ctrl_c() -> i32
+    println(c"^C")
+    line_clear()
+    return EDIT_LINE_DONE
+
+# Ctrl-D leaves the shell on an empty line and does nothing otherwise.
+fn on_ctrl_d() -> i32
+    if line_length() != 0
+        return EDIT_CONTINUE
+    println(c"")
+    return EDIT_EXIT
+
+# ============================================================================
+# Editing keys
+# ============================================================================
+
+fn on_char(c: u8)
+    let at_end: bool = line_cursor_pos() == line_length()
+    line_add_char(c)
+    putchar(c)
+    if not at_end
+        redraw_line_from_cursor()
+
+fn on_backspace()
+    if line_cursor_pos() > 0
+        line_backspace()
+        cursor_left(1)
+        redraw_line_from_cursor()
+
+fn on_delete()
+    if line_cursor_pos() < line_length()
+        line_delete()
+        redraw_line_from_cursor()
+
+fn on_kill_to_end()
+    line_kill_to_end()
+    clear_to_eol()
+
+fn on_kill_to_start()
+    move_left(line_cursor_pos())
+    line_kill_to_start()
+    redraw_line_from_cursor()
+
+# Clear the screen and redraw the prompt and line.
+fn on_clear_screen()
+    sys_write(STDOUT, c"\e[2J\e[H", 7)
+    print_prompt()
+    let len: i64 = line_length()
+    if len > 0
+        sys_write(STDOUT, @g_line_buffer[0], len)
+        move_left(len - line_cursor_pos())
+
+# ============================================================================
+# Motion and history keys
+# ============================================================================
+
+fn on_left()
+    if line_cursor_left()
+        cursor_left(1)
+
+fn on_right()
+    if line_cursor_right()
+        cursor_right(1)
+
+fn on_home()
+    move_left(line_cursor_pos())
+    line_cursor_home()
+
+fn on_end()
+    move_right(line_length() - line_cursor_pos())
+    line_cursor_end()
+
+fn on_history_up()
+    let hist: *u8 = history_up()
+    if hist != null
+        erase_visible_line()
+        line_set(hist)
+        puts(hist)
+
+# Past the newest entry, history_down returns null: back to an empty prompt.
+fn on_history_down()
+    let hist: *u8 = history_down()
+    erase_visible_line()
+    if hist == null
+        line_clear()
+        return
+    line_set(hist)
+    puts(hist)
+
+# ============================================================================
+# Dispatch
+# ============================================================================
+
+# Keys that change the line's text. False if `key` is not one of them.
+fn edit_key(key: i32) -> bool
+    if key == KEY_BACKSPACE
+        on_backspace()
+    else if key == KEY_DELETE
+        on_delete()
+    else if key == KEY_CTRL_K
+        on_kill_to_end()
+    else if key == KEY_CTRL_U
+        on_kill_to_start()
+    else if key == KEY_CTRL_L
+        on_clear_screen()
+    else
+        return false
+    return true
+
+# Keys that move the cursor or swap in a history entry.
+fn motion_key(key: i32) -> bool
+    if key == KEY_LEFT
+        on_left()
+    else if key == KEY_RIGHT
+        on_right()
+    else if key == KEY_HOME or key == KEY_CTRL_A
+        on_home()
+    else if key == KEY_END or key == KEY_CTRL_E
+        on_end()
+    else if key == KEY_UP
+        on_history_up()
+    else if key == KEY_DOWN
+        on_history_down()
+    else
+        return false
+    return true
+
+# Handle one decoded key. Unhandled keys (TAB, CTRL_W, ...) are ignored.
+pub fn editor_handle_key(key: i32) -> i32
+    if (key & 0xFFFF) == KEY_CHAR
+        on_char(input_get_char(key))
+    else if key == KEY_ENTER
+        return on_enter()
+    else if key == KEY_CTRL_C
+        return on_ctrl_c()
+    else if key == KEY_CTRL_D
+        return on_ctrl_d()
+    else if not edit_key(key)
+        motion_key(key)
+    return EDIT_CONTINUE

@@ -1,0 +1,189 @@
+# Tests for the line editor's per-key handlers (AGAST #3940)
+#
+# editor_handle_key is what main's read loop calls for each decoded key; it
+# edits the line buffer in common.ritz and tells the loop what to do next.
+# Terminal escape output from the handlers goes to stdout and is ignored here.
+
+
+
+import src.common {
+    g_line_buffer, line_clear, line_length, line_cursor_pos, println
+}
+import src.history { history_clear, history_count, history_reset_nav }
+import src.input {
+    KEY_CHAR, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_UP, KEY_DOWN,
+    KEY_BACKSPACE, KEY_DELETE, KEY_ENTER, KEY_TAB,
+    KEY_CTRL_A, KEY_CTRL_C, KEY_CTRL_D, KEY_CTRL_E, KEY_CTRL_K, KEY_CTRL_U
+}
+import src.editor {
+    editor_handle_key, cli_mode,
+    EDIT_CONTINUE, EDIT_LINE_DONE, EDIT_EXIT,
+    CLI_INTERACTIVE, CLI_HELP, CLI_COMMAND
+}
+
+fn key_char(c: u8) -> i32
+    return KEY_CHAR | ((c as i32) << 16)
+
+# Type each byte of `s` as a KEY_CHAR key.
+fn type_str(s: *u8)
+    var i: i64 = 0
+    while *(s + i) != 0
+        editor_handle_key(key_char(*(s + i)))
+        i = i + 1
+
+# 0 when the line buffer is exactly `want` with the cursor at `cur`.
+fn line_is(want: *u8, cur: i64) -> i32
+    var n: i64 = 0
+    while *(want + n) != 0
+        if g_line_buffer[n as i32] != *(want + n)
+            return 1
+        n = n + 1
+    if line_length() != n
+        return 1
+    if line_cursor_pos() != cur
+        return 1
+    return 0
+
+fn fresh()
+    line_clear()
+    history_reset_nav()
+
+[[test]]
+fn test_chars_insert_at_cursor() -> i32
+    fresh()
+    type_str(c"ac")
+    if line_is(c"ac", 2) != 0
+        return 1
+    if editor_handle_key(KEY_LEFT) != EDIT_CONTINUE
+        return 2
+    type_str(c"b")
+    if line_is(c"abc", 2) != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_cursor_keys() -> i32
+    fresh()
+    type_str(c"abcd")
+    editor_handle_key(KEY_HOME)
+    if line_is(c"abcd", 0) != 0
+        return 1
+    editor_handle_key(KEY_RIGHT)
+    if line_is(c"abcd", 1) != 0
+        return 2
+    editor_handle_key(KEY_END)
+    if line_is(c"abcd", 4) != 0
+        return 3
+    editor_handle_key(KEY_CTRL_A)
+    if line_is(c"abcd", 0) != 0
+        return 4
+    editor_handle_key(KEY_CTRL_E)
+    if line_is(c"abcd", 4) != 0
+        return 5
+    # Right at the end and left at the start are no-ops.
+    editor_handle_key(KEY_RIGHT)
+    if line_is(c"abcd", 4) != 0
+        return 6
+    editor_handle_key(KEY_HOME)
+    editor_handle_key(KEY_LEFT)
+    if line_is(c"abcd", 0) != 0
+        return 7
+    return 0
+
+[[test]]
+fn test_backspace_and_delete() -> i32
+    fresh()
+    type_str(c"abcd")
+    editor_handle_key(KEY_BACKSPACE)
+    if line_is(c"abc", 3) != 0
+        return 1
+    editor_handle_key(KEY_HOME)
+    editor_handle_key(KEY_BACKSPACE)
+    if line_is(c"abc", 0) != 0
+        return 2
+    editor_handle_key(KEY_DELETE)
+    if line_is(c"bc", 0) != 0
+        return 3
+    editor_handle_key(KEY_END)
+    editor_handle_key(KEY_DELETE)
+    if line_is(c"bc", 2) != 0
+        return 4
+    return 0
+
+[[test]]
+fn test_kill_keys() -> i32
+    fresh()
+    type_str(c"abcd")
+    editor_handle_key(KEY_LEFT)
+    editor_handle_key(KEY_LEFT)
+    editor_handle_key(KEY_CTRL_K)
+    if line_is(c"ab", 2) != 0
+        return 1
+    editor_handle_key(KEY_LEFT)
+    editor_handle_key(KEY_CTRL_U)
+    if line_is(c"b", 0) != 0
+        return 2
+    return 0
+
+[[test]]
+fn test_history_keys() -> i32
+    history_clear()
+    fresh()
+    type_str(c"#one")
+    if editor_handle_key(KEY_ENTER) != EDIT_LINE_DONE
+        return 1
+    if history_count() != 1
+        return 2
+    fresh()
+    type_str(c"xy")
+    editor_handle_key(KEY_UP)
+    if line_is(c"#one", 4) != 0
+        return 3
+    editor_handle_key(KEY_DOWN)
+    if line_is(c"", 0) != 0
+        return 4
+    return 0
+
+[[test]]
+fn test_line_ending_keys() -> i32
+    history_clear()
+    fresh()
+    # Enter on an empty line ends it without adding history.
+    if editor_handle_key(KEY_ENTER) != EDIT_LINE_DONE
+        return 1
+    if history_count() != 0
+        return 2
+    type_str(c"abc")
+    if editor_handle_key(KEY_CTRL_C) != EDIT_LINE_DONE
+        return 3
+    if line_is(c"", 0) != 0
+        return 4
+    # Ctrl-D exits only on an empty line.
+    type_str(c"a")
+    if editor_handle_key(KEY_CTRL_D) != EDIT_CONTINUE
+        return 5
+    line_clear()
+    if editor_handle_key(KEY_CTRL_D) != EDIT_EXIT
+        return 6
+    # Unhandled keys leave the line alone.
+    type_str(c"q")
+    if editor_handle_key(KEY_TAB) != EDIT_CONTINUE
+        return 7
+    if line_is(c"q", 1) != 0
+        return 8
+    return 0
+
+[[test]]
+fn test_cli_mode() -> i32
+    if cli_mode(c"--help") != CLI_HELP
+        return 1
+    if cli_mode(c"-c") != CLI_COMMAND
+        return 2
+    if cli_mode(c"-cx") != CLI_INTERACTIVE
+        return 3
+    if cli_mode(c"--hel") != CLI_INTERACTIVE
+        return 4
+    if cli_mode(c"") != CLI_INTERACTIVE
+        return 5
+    println(c"editor key dispatch OK")
+    return 0
