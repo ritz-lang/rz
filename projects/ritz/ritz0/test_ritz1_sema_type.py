@@ -138,6 +138,31 @@ fn recv(pp: *Q) -> i32
         E.A(w) => w.v
         E.B => 0
     d.v + m.v + a.v + n + t + z.v + r
+
+enum F
+    One(i32)
+    Two(i32, i32)
+
+fn ctor() -> i32
+    let o = One(3)
+    let w = Two(3, 4)
+    let a: i32 = match o
+        One(v) => v
+        Two(x, y) => x + y
+    let b: i32 = match w
+        One(v) => v * 2
+        Two(x, y) => x - y
+    a + b
+
+enum G
+    Some(i32)
+    Nada
+
+fn slot() -> i32
+    let s = Some(4)
+    match s
+        Some(v) => v
+        Nada => 0
 """
 
 # (line, col, expr kind, Sema's type kind[, name]): what the dump must say.
@@ -184,6 +209,16 @@ WANTED = [
     (78, 17, E_IDENT, STRUCT, "Q"),   # a, the tuple's first field
     (78, 23, E_IDENT, I32),           # n, its second
     (78, 31, E_IDENT, STRUCT, "Q"),   # z, an inferred `let` of qs[0]
+    # A user-enum variant ctor call builds its enum (AGAST #3995), so an
+    # inferred `let` of one is the enum and its match arms bind typed:
+    (85, 13, E_CALL, STRUCT, "F"),    # One(3)
+    (86, 13, E_CALL, STRUCT, "F"),    # Two(3, 4), a multi-field variant
+    (87, 24, E_IDENT, STRUCT, "F"),   # o, an inferred `let` of One(3)
+    (88, 19, E_IDENT, I32),           # v, One's payload
+    (89, 22, E_IDENT, I32),           # x, Two's first field
+    (89, 26, E_IDENT, I32),           # y, its second
+    (90, 24, E_IDENT, STRUCT, "F"),   # w
+    (92, 22, E_IDENT, I32),           # x, bound off w
 ]
 
 # Shapes Sema leaves unknown: an index of a scalar array (#3510's sema_index
@@ -194,6 +229,9 @@ UNKNOWN_AT = [
     (39, 22, E_IDENT),                 # k
     (41, 18, E_IDENT),                 # other
     (13, 5, E_IDENT),                  # b
+    # A user enum's `Some(4)` (or Ok / Err / None) is the builtin's unless
+    # the slot names the user enum (users_variant_wins): no slot-free type.
+    (100, 13, E_CALL),                 # Some(4)
 ]
 
 DUMP = re.compile(r"^sema-type: (\d+):(\d+) e(\d+) (-?\d+)(?: (\S+))?$", re.M)
@@ -242,7 +280,10 @@ CORPUS_FLOOR = 15000
 # `(*(@x)).f` where the emitter is the unsure side, and `K[i]` of a const
 # array of structs, which the emitter's get_expr_type guesses is an i64 (a
 # guess that refused good programs when Sema copied it).  28 at #3974, which
-# types `c?` as its Ok / Some struct.  Lower it as they go.
+# types `c?` as its Ok / Some struct.  28 still at #3995, which types a
+# user-enum ctor call `One(3)` as its enum (Sema and get_expr_type both) and
+# untyped test_issue_struct_enum_variants' lets again: 41 without it.  Lower
+# it as they go.
 BK_GAP_CEILING = 28
 
 
