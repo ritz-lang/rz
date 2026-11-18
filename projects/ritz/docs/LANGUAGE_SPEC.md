@@ -6283,21 +6283,43 @@ The loop variable's type is its bounds', as a local's is its value's: a bound
 whose type needs more than that, such as a struct field, is refused at the
 `for`; cast it (`0..(p.n as i32)`).
 
-An `await` inside a `match` arm is refused at the `await`, and a `defer` among
-the statements the machine splits into states is refused at the `defer`, until
-those forms are lowered (AGAST #4013):
+A `match` arm may await, or `break` / `continue` the loop the `match` is in
+(AGAST #4189); only the taken arm's awaits run.  An arm's names live across
+its awaits: when an arm binds one, the scrutinee is kept in the future, so its
+type is told as a local's is.  A scrutinee whose type needs more, such as a
+struct field, is refused at the scrutinee; match a typed local instead:
 
-```ritz expect-error="`await` inside a `match` in an async fn is not supported yet (AGAST #4013)"
+```ritz
+enum Job
+    Double(i32)
+    Skip
+
 async fn dbl(x: i32) -> i32
     x * 2
 
-async fn go(x: i32) -> i32
-    match x
-        0 => await dbl(1)
-        _ => 2
+async fn run(j: Job) -> i32
+    match j
+        Double(n) => n + await dbl(n)
+        Skip => 0
 
 fn main() -> i32
-    let r: i32 = await go(0)
+    let r: i32 = await run(Job.Double(3))   # 3 + 6
+    r - 9
+```
+
+A `defer` among the statements the machine splits into states is refused at
+the `defer`, until it is lowered (AGAST #4013):
+
+```ritz expect-error="`defer` in an async fn that awaits is not supported yet (AGAST #4013)"
+async fn dbl(x: i32) -> i32
+    x * 2
+
+async fn go(n: i32) -> i32
+    defer n = 0
+    await dbl(n)
+
+fn main() -> i32
+    let r: i32 = await go(1)
     r - 2
 ```
 

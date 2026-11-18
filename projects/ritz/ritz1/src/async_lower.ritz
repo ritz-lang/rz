@@ -345,7 +345,8 @@ struct AlBlock
     closed: i32         # 1: ends in a jump or a return
     next: *AlBlock
 
-# A name read through another field: an awaiting `for`'s var (#4188).
+# A name read through another field: an awaiting `for`'s var (#4188).  A
+# null field hides the name: a lowered `match` arm's binding (#4189).
 struct AlRename
     name: *u8
     len: i32
@@ -388,6 +389,7 @@ struct AlFn
     extra: *AlLocal     # the fields it adds, in order
     renames: *AlRename  # innermost first
     nfors: i32          # awaiting `for`s lowered so far
+    nmatches: i32       # `__match_K` scrutinee fields added so far
     errs: i32
 
 fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
@@ -407,6 +409,7 @@ fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
     a.extra = null
     a.renames = null
     a.nfors = 0
+    a.nmatches = 0
     a.errs = 0
 
 fn al_local_find(a: *AlFn, name: *u8, len: i32) -> *AlLocal
@@ -844,6 +847,8 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
     let k: i32 = e.kind
     if k == EXPR_IDENT
         let r: *AlRename = al_rename_of(a, e.ident_ptr, e.ident_len)
+        if r != null and r.field == null
+            return e
         if r != null
             let m: *Expr = al_self_field(r.field, r.flen, e.span)
             m.next = e.next
@@ -1356,12 +1361,6 @@ fn al_unplaced(a: *AlFn, what: *u8, span: SrcSpan)
     al_refuse(a, @&m, span)
     string_drop(@&m)
 
-fn al_jump_in_match(a: *AlFn, span: SrcSpan)
-    var m: String = string_new()
-    string_push_str(@&m, "`break` / `continue` inside a `match` of an async fn's loop that awaits is not supported yet (AGAST #4013)")
-    al_refuse(a, @&m, span)
-    string_drop(@&m)
-
 # Where a refused statement is: its first await, else its jump, else itself.
 fn al_culprit(s: *Stmt) -> SrcSpan
     let e: *Expr = al_await_in_stmt(s)
@@ -1492,7 +1491,7 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
             if k == EXPR_IF
                 u = c"an `if` inside an expression"
             else
-                u = c"a `match`"
+                u = c"a `match` inside an expression"
         al_hoist_arms(a, e.args as *MatchArm, u)
     else if k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR) and under == null and al_await_in(e.right) != null
         al_short_circuit(a, e)
@@ -1652,11 +1651,10 @@ fn al_lower_value(a: *AlFn, e: *Expr, d: *AlDest, lp: *AlLoop)
         if a.cur != null
             al_goto(a, join, e.span)
         a.cur = join
+    else if e.kind == EXPR_MATCH and al_arms_need(e.args as *MatchArm, lp) == 1
+        al_lower_match(a, e.left, e.args as *MatchArm, d, lp, e.span)
     else if e.kind == EXPR_AWAIT
         al_lower_await(a, e, d)
-    else if al_await_in(e) == null
-        # Only a jump out of the loop, from where it can't be a state edge.
-        al_jump_in_match(a, al_jump_in_expr(e).span)
     else
         al_deliver(a, al_hoist(a, e), d)
 
@@ -1781,6 +1779,171 @@ fn al_lower_for(a: *AlFn, s: *Stmt)
     al_goto(a, head, span)
     a.cur = exit_b
 
+# Does an arm of a `match` await, or jump out of the loop `lp`?
+fn al_arms_need(arm: *MatchArm, lp: *AlLoop) -> i32
+    if al_await_in_arms(arm) != null
+        return 1
+    (lp != null and al_jump_in_arms(arm) != null) as i32
+
+fn al_hide(a: *AlFn, name: *u8, len: i32)
+    let r: *AlRename = al_zalloc(sizeof(AlRename)) as *AlRename
+    r.name = name
+    r.len = len
+    r.next = a.renames
+    a.renames = r
+
+# The names `arm`'s pattern binds, hidden from the rewrite (they are the
+# arm's, not a field or a `for` var); how many.  A bare name may be a unit
+# variant (`None`), which ritz0's parser can't tell either: it counts.
+# ritz0's _pattern_names.
+fn al_arm_names(a: *AlFn, arm: *MatchArm) -> i32
+    if arm.pattern_kind == PAT_IDENT and arm.qualifier == null
+        al_hide(a, arm.pattern_name, arm.pattern_name_len)
+        return 1
+    if arm.pattern_kind != PAT_VARIANT
+        return 0
+    if arm.pattern_binds == null
+        if arm.pattern_inner_kind != PAT_IDENT
+            return 0
+        al_hide(a, arm.pattern_inner_name, arm.pattern_inner_name_len)
+        return 1
+    var n: i32 = 0
+    var t: *TupleName = arm.pattern_binds
+    while t != null
+        let c0: u8 = *(t.name)
+        if t.len != 1 or c0 != 95   # `_`: a wildcard slot
+            al_hide(a, t.name, t.len)
+            n += 1
+        t = t.next
+    n
+
+fn al_copy_arm(arm: *MatchArm) -> *MatchArm
+    let c: *MatchArm = al_zalloc(sizeof(MatchArm)) as *MatchArm
+    let src: *u8 = arm as *u8
+    let dst: *u8 = c as *u8
+    var i: i64 = 0
+    while i < sizeof(MatchArm)
+        *(dst + i) = *(src + i)
+        i += 1
+    c.next = null
+    c
+
+# `arms`' patterns over `scrut`, arm `sel` running `body` (the others
+# nothing): the same patterns, so the same arm is taken and the match stays
+# exhaustive.  Arm `j` of a dispatch (`sel` -1) jumps to state `entries[j]`.
+fn al_rematch(arms: *MatchArm, scrut: *Expr, sel: i32, body: *Stmt, entries: **AlBlock, span: SrcSpan) -> *Stmt
+    var head: *MatchArm = null
+    var last: *MatchArm = null
+    var j: i32 = 0
+    var cur: *MatchArm = arms
+    while cur != null
+        let c: *MatchArm = al_copy_arm(cur)
+        c.body = null
+        c.is_pass = 1
+        c.is_block = 1
+        c.body_stmts = null
+        if sel < 0
+            let to: *AlBlock = *(entries + j)
+            c.body_stmts = al_set_state(to.idx, span)
+        else if j == sel
+            c.body_stmts = body
+        if last == null
+            head = c
+        else
+            last.next = c
+        last = c
+        j += 1
+        cur = cur.next
+    let s: *Stmt = al_stmt(STMT_MATCH, span)
+    s.if_cond = scrut
+    s.if_then = head as *Stmt
+    s
+
+# A `match` whose arms await, or jump out of the loop (#4189): each arm is a
+# state, entered by matching the scrutinee once.  ritz0's
+# _CfgBuilder._lower_match.
+#
+# An arm's names are bound by the match, which a later state of the arm
+# doesn't run.  When an arm binds one, the scrutinee is a future field,
+# `__match_K`, and each of that arm's states runs inside a match of it over
+# the same patterns (a pattern binds no `mut` name and has no guard, so the
+# same arm is taken with the same values):
+#
+#     __match_K = scrutinee
+#     match __match_K { p0 => -> A0, p1 => -> A1 }
+#   A1: match __match_K { p0 => {}, p1 => { ...A1's statements } }
+fn al_lower_match(a: *AlFn, scrut: *Expr, arms: *MatchArm, d: *AlDest, lp: *AlLoop, span: SrcSpan)
+    var binds: i32 = 0
+    var narms: i32 = 0
+    let saved: *AlRename = a.renames
+    var cur: *MatchArm = arms
+    while cur != null
+        binds += al_arm_names(a, cur)
+        narms += 1
+        cur = cur.next
+    a.renames = saved
+    # Its type is told before the hoist rewrites it.
+    var t: AlLocal
+    var typed: i32 = 0
+    if binds > 0
+        typed = al_infer(a, scrut, @t)
+    let at: SrcSpan = scrut.span
+    var sc: *Expr = al_hoist(a, scrut)
+    sc.next = null
+    var field: *u8 = null
+    var fl: i32 = 0
+    if binds > 0
+        if typed == 0
+            var m: String = string_new()
+            string_push_str(@&m, "cannot infer the type of the `match`'s scrutinee, which `")
+            string_push_bytes(@&m, a.f.name, a.f.name_len as i64)
+            string_push_str(@&m, "`'s future holds across an `await`: match a typed local (`let v: T = ...`)")
+            al_refuse(a, @&m, at)
+            string_drop(@&m)
+            return
+        field = al_numbered(c"__match_", a.nmatches, @fl)
+        a.nmatches += 1
+        let x: *AlLocal = al_extra(a, field, fl)
+        x.ty = t.ty
+        x.type_name = t.type_name
+        x.type_name_len = t.type_name_len
+        x.pointee = t.pointee
+        x.inner_pointee = t.inner_pointee
+        x.inner_ref = t.inner_ref
+        x.unsupported = t.unsupported
+        al_emit(a, al_assign_self(field, fl, sc, span))
+        sc = al_self_field(field, fl, span)
+    let entries: **AlBlock = al_zalloc((narms as i64) * 8) as **AlBlock
+    var j: i32 = 0
+    while j < narms
+        *(entries + j) = al_new_block(a)
+        j += 1
+    let join: *AlBlock = al_new_block(a)
+    al_emit(a, al_rematch(arms, sc, -1, null, entries, span))
+    al_emit(a, al_stmt(STMT_CONTINUE, span))
+    al_close(a)
+    j = 0
+    cur = arms
+    while cur != null
+        let first: i32 = a.nblocks
+        a.cur = *(entries + j)
+        let named: i32 = al_arm_names(a, cur)
+        al_lower_arm(a, cur, d, lp)
+        a.renames = saved
+        if a.cur != null
+            al_goto(a, join, span)
+        if named > 0
+            # A nested match's states are wrapped already: this match goes
+            # around, so its names are in scope there too.
+            var b: *AlBlock = a.blocks
+            while b != null
+                if b == *(entries + j) or b.idx >= first
+                    b.head = al_rematch(arms, al_self_field(field, fl, span), j, b.head, entries, span)
+                b = b.next
+        j += 1
+        cur = cur.next
+    a.cur = join
+
 # The statements `s`; with `d`, the last one is the list's value.
 fn al_lower_list(a: *AlFn, s: *Stmt, d: *AlDest, lp: *AlLoop)
     var cur: *Stmt = s
@@ -1799,21 +1962,29 @@ fn al_lower_tail(a: *AlFn, s: *Stmt, d: *AlDest, lp: *AlLoop)
     if s.kind == STMT_IF and s.if_else != null
         al_lower_if(a, s, d, lp)
         return
-    if s.kind == STMT_MATCH and al_needs(s, lp) == 0
-        # Its arms' values go to `d` in place.
-        s.if_cond = al_rw_expr(a, s.if_cond)
+    if s.kind == STMT_MATCH and al_arms_need(s.if_then as *MatchArm, lp) == 0
+        # Its arms' values go to `d` in place (its scrutinee's awaits first).
+        s.if_cond = al_hoist(a, s.if_cond)
         al_rw_arms(a, s.if_then as *MatchArm)
-        al_deliver_arms(a, s.if_then as *MatchArm, d)
+        let open: i32 = al_deliver_arms(a, s.if_then as *MatchArm, d)
         al_emit(a, s)
         if d.kind == AL_TO_RETURN and a.cur != null
-            al_ret(a, null, s.span)
+            if open == 0
+                al_close(a)   # every arm is Ready: nothing follows (#4189)
+            else
+                al_ret(a, null, s.span)
+        return
+    if s.kind == STMT_MATCH
+        al_lower_match(a, s.if_cond, s.if_then as *MatchArm, d, lp, s.span)
         return
     al_lower_stmt(a, s, lp)
     if d.kind == AL_TO_RETURN and a.cur != null
         al_ret(a, null, s.span)
 
-# Each arm's value `v` becomes the statement that puts it in `d`.
-fn al_deliver_arms(a: *AlFn, arm: *MatchArm, d: *AlDest)
+# Each arm's value `v` becomes the statement that puts it in `d`; how many
+# arms have none.
+fn al_deliver_arms(a: *AlFn, arm: *MatchArm, d: *AlDest) -> i32
+    var open: i32 = 0
     var cur: *MatchArm = arm
     while cur != null
         if cur.body != null and cur.is_pass == 0
@@ -1825,7 +1996,10 @@ fn al_deliver_arms(a: *AlFn, arm: *MatchArm, d: *AlDest)
             cur.body_stmts = al_append(cur.body_stmts, tmp.head)
             cur.body = null
             cur.is_pass = 1
+        else
+            open += 1
         cur = cur.next
+    open
 
 fn al_lower_stmt(a: *AlFn, s: *Stmt, lp: *AlLoop)
     let k: i32 = s.kind
@@ -1876,15 +2050,14 @@ fn al_lower_stmt(a: *AlFn, s: *Stmt, lp: *AlLoop)
     else if k == STMT_UNSAFE
         var d: AlDest = al_dest(AL_TO_NONE, s.span)
         al_lower_list(a, s.while_body, @d, lp)
+    else if k == STMT_MATCH and al_arms_need(s.if_then as *MatchArm, lp) == 1
+        var d: AlDest = al_dest(AL_TO_NONE, s.span)
+        al_lower_match(a, s.if_cond, s.if_then as *MatchArm, @d, lp, s.span)
     else if k == STMT_MATCH
-        if al_await_in_arms(s.if_then as *MatchArm) != null
-            al_unplaced(a, c"a `match`", al_await_in_arms(s.if_then as *MatchArm).span)
-        else if al_await_in(s.if_cond) == null
-            al_jump_in_match(a, al_jump_in_stmt(s).span)
-        else
-            s.if_cond = al_hoist(a, s.if_cond)
-            al_rw_arms(a, s.if_then as *MatchArm)
-            al_emit(a, s)
+        # Only its scrutinee awaits: the match runs whole, after it.
+        s.if_cond = al_hoist(a, s.if_cond)
+        al_rw_arms(a, s.if_then as *MatchArm)
+        al_emit(a, s)
     else if k == STMT_FOR
         al_lower_for(a, s)
     else

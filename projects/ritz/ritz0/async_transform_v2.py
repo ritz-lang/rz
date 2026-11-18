@@ -648,9 +648,10 @@ class _CfgBuilder:
         self.n_awaits = 0
         self.n_shorts = 0
         self.n_fors = 0
+        self.n_matches = 0
         # Fields the lowering adds: awaited futures, await results,
-        # short-circuit values and range-`for` vars and ends, in the order
-        # lowering meets them.
+        # short-circuit values, range-`for` vars and ends and binding
+        # `match`es' scrutinees, in the order lowering meets them.
         self.extra_fields: List[Tuple[str, rast.Type]] = []
 
     # -- states ------------------------------------------------------------
@@ -859,15 +860,87 @@ class _CfgBuilder:
                 self.lower_value(expr.expr, dest, loop)
             elif dest == ('return',) and self.cur is not None:
                 self.ret(None, expr.span)
+        elif isinstance(expr, rast.Match) and any(self._needs_lowering(arm.body, loop) for arm in expr.arms):
+            self._lower_match(expr, dest, loop)
+        elif isinstance(expr, rast.BreakExpr) and loop is not None:
+            self.goto(loop.exit)  # an arm's `break` (#4189)
+        elif isinstance(expr, rast.ContinueExpr) and loop is not None:
+            self.goto(loop.head)
         elif isinstance(expr, rast.Await):
             self.lower_await(expr, dest)
         elif not _has_await(expr):
-            # Only a jump out of the loop, from somewhere it can't be a state edge.
+            # Only a jump out of the loop, from an operand (`1 + if c ...`),
+            # where it can't be a state edge.
             raise AsyncLoweringError(
-                "`break` / `continue` inside a `match` of an async fn's loop that awaits "
+                "`break` / `continue` inside an expression of an async fn's loop that awaits "
                 "is not supported yet (AGAST #4013)", _escaping_jump(expr).span)
         else:
             self.deliver(self.hoist(expr), dest)
+
+    def _rematch(self, m: rast.Match, scrut: rast.Expr, bodies) -> rast.Stmt:
+        """`m`'s arms over `scrut`, arm j running `bodies(j)`: the same
+        patterns, so the same arm is taken and the match stays exhaustive."""
+        new = copy.copy(m)
+        new.expr = scrut
+        new.arms = [rast.MatchArm(span=arm.span, pattern=arm.pattern, guard=None,
+                                  body=rast.Block(span=arm.span, stmts=bodies(j), expr=None))
+                    for j, arm in enumerate(m.arms)]
+        return rast.ExprStmt(span=m.span, expr=new)
+
+    def _lower_match(self, m: rast.Match, dest, loop: Optional[_Loop]):
+        """A `match` whose arms await, or jump out of the loop (AGAST #4189):
+        each arm is a state, entered by matching the scrutinee once.
+
+        An arm's names are bound by the match, which a later state of the arm
+        doesn't run.  When an arm binds one, the scrutinee is a future field,
+        `__match_K`, and each of that arm's states runs inside a match of it
+        over the same patterns (a pattern binds no `mut` name, and has no
+        guard, so the same arm is taken with the same values):
+
+            __match_K = scrutinee
+            match __match_K { p0 => -> A0, p1 => -> A1 }
+          A1: match __match_K { p0 => {}, p1 => { ...A1's statements } }"""
+        names = [_pattern_names(arm.pattern) for arm in m.arms]
+        scrut = self.hoist(m.expr)
+        slot = None
+        if any(names):
+            inf = AsyncAnalyzer(self.gen.fn_sigs)
+            inf.current_locals = dict(self.gen.analysis.all_locals)
+            ty = inf._infer_type(_ungroup(m.expr))
+            if ty is None:
+                raise AsyncLoweringError(
+                    f"cannot infer the type of the `match`'s scrutinee, which `{self.gen.fn_def.name}`'s future "
+                    f"holds across an `await`: match a typed local (`let v: T = ...`)", m.expr.span)
+            slot = self._add_field(f"__match_{self.n_matches}", ty)
+            self.n_matches += 1
+            self.emit(rast.AssignStmt(span=m.span, target=self.rw.self_field(slot, m.span), value=scrut))
+            scrut = self.rw.self_field(slot, m.span)
+        entries = [self.new_block() for _ in m.arms]
+        join = self.new_block()
+        self._close(self._rematch(m, scrut, lambda j: [self._set_state(entries[j])]),
+                    rast.ContinueStmt(span=self.span))
+        for i, arm in enumerate(m.arms):
+            first = len(self.blocks)
+            self.cur = entries[i]
+            # The arm's names are its own, not a field or a `for` var.
+            hidden = names[i] & self.rw.fields
+            self.rw.fields -= hidden
+            renamed = {n: self.rw.renames.pop(n) for n in names[i] if n in self.rw.renames}
+            try:
+                self.lower_value(arm.body, dest, loop)
+            finally:
+                self.rw.fields |= hidden
+                self.rw.renames.update(renamed)
+            if self.cur is not None:
+                self.goto(join)
+            if names[i]:
+                # A nested match's states are wrapped already: this match
+                # goes around, so its names are in scope there too.
+                for b in [entries[i]] + list(range(first, len(self.blocks))):
+                    body = self.blocks[b]
+                    self.blocks[b] = [self._rematch(m, self.rw.self_field(slot, m.span),
+                                                    lambda j: body if j == i else [])]
+        self.cur = join
 
     def deliver(self, value: rast.Expr, dest):
         if dest is None:
@@ -910,7 +983,7 @@ class _CfgBuilder:
         if isinstance(node, rast.Match):
             self._hoist(node.expr, under)
             for arm in node.arms:
-                self._hoist(arm, under or "a `match`")
+                self._hoist(arm, under or "a `match` inside an expression")
             return
         if isinstance(node, rast.BinOp) and node.op in ('&&', '||', 'and', 'or'):
             if under is None and _has_await(node.right):
