@@ -116,6 +116,13 @@ ALLOWED = {
     "cast_to_a_mutable_reference": ("fn g(p: *C)\n    (p as @&C).x = 3\n", "g(@&c)"),
     "cast_to_a_mutable_reference_element": ("fn g(p: *W)\n    (p as @&W).a[1] = 3\n",
                                             "var w = W { c: c, a: [1, 2] }\n    g(@&w)\n    c.x = w.a[1]"),
+    # The cast is the method's receiver (#4161).
+    "cast_to_a_mutable_reference_receiver": ("impl C\n    fn up(self: @&C)\n        self.x = 3\n\n"
+                                             "fn g(p: *C)\n    (p as @&C).up()\n", "g(@&c)"),
+    "cast_to_a_pointer_receiver": ("impl C\n    fn up(self: @&C)\n        self.x = 3\n\n"
+                                   "fn g(p: @C)\n    (p as *C).up()\n", "g(@c)"),
+    "cast_to_shared_receiver": ("impl C\n    fn get(self: @C) -> i32\n        self.x + 2\n\n"
+                                "fn g(p: *C) -> i32\n    (p as @C).get()\n", "c.x = g(@&c)"),
 }
 
 # ritz1 couldn't lower `(p as *C).x = 3` (#2373); it does now.
