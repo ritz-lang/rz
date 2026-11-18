@@ -109,13 +109,18 @@ stays here; remote hosts only run rooms.
 | chungus | `adele-chungus` | 2 | yes (2026-11-12) | 8 cores, 14 GB, ~5-8 GB free (another user's desktop session) and 47 GB disk free (95% used). Smoke passes. `clang`/`lld`/`llvm` 21.1.8; `lld` is a user-local copy (`~/.local/opt/lld-21`). Approved by Aaron 2026-11-12. **1 slot while minecraft is running** (Aaron, 2026-11-14). **2 slots from 2026-11-16 04:50Z** (Aaron, with minecraft stopped). No host.env, so both rooms share the default 7G/8G slice. Watch the disk |
 | huburght | `adele-huburght` | 8 | yes (2026-11-11) | 12 cores, 47 GB (~42 GB free), WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. 2 slots from 2026-11-12 (Aaron: "tons of memory free"; #2582 and #2780 merged cleanly). **6 slots from 2026-11-14 01:04Z** (Aaron, 2026-11-13; omegalisk stays at 2): #2998 landed as 62c9082a and huburght's `~/.config/rz/host.env` sets rooms 28G high / 32G max and 2 gate slots (`host-budget.sh --verify <room>` there shows them). **8 slots from 2026-11-15 16:50Z** (Aaron, while bangerang leaves the LAN: "maybe it can handle 8 rooms … even 12 would work"; go to 12 once 8 has run cleanly). **16 slots from 2026-11-16 04:50Z** (Aaron). **12 slots, spawn while load1 < 25, from 2026-11-16 05:47Z** (Aaron: slower rooms and gates are fine, because more run in parallel; at 16 the load sat at 18–25 on 12 cores and load1 < 14 held spawns back). **8 slots from 2026-11-16, draining** (Aaron: "it seems to be struggling … ease back to 8 and don't go over"): the 12 rooms running then finish normally; nothing is cancelled. No new huburght spawn until fewer than 8 rooms are running, then never more than 8. Baseline at 5 rooms + 2 gates: agents ~0.8 GiB RSS each, gates ~2.5–3 GiB each in `ritz-gate.slice` (no memory cap there; `RZ_GATE_SLOTS` bounds it), 35 GiB free. Coarse mtime clock (#2689) |
 | bangerang | `adele-bangerang` | 6 | yes (2026-11-16) | 10.0.0.224, 61 GiB, ~39 GB disk free (92% used): watch the disk. Ubuntu 26.04, qemu 10.2.1, OVMF 2025.11. **6 slots** (Aaron, 2026-11-16: "bangerang is up and ready"). `/tmp` `noexec` removed; host key `SHA256:jEVBo2Sd…mYI6Q` checked. Full gate passes apart from lexis (`bangerang-setup-d43dae956cb1-4.log`). The test-uefi-boot step stalled once in firmware (1 of 6 runs, cause unknown): send `adele` the gate log if it recurs. `host.env` 20G / 24G, 2 gate slots. First room #1540; its gate runs (venv found). Ramp up from 1 room. **Disk: ~20 GB free is enough** (Aaron, 2026-11-18: "20GB is plenty"; no spawn hold for disk at that level). When it gets tight, clear Ritz caches there (`~/.cache/ritz`, old `/tmp/pytest-of-aaron` runs, orphaned `rz-task-*` worktrees) rather than holding spawns: 6 GB freed that way on 2026-11-18 (20 → 26 GB) |
-| skronk, skronk-2, skronk-3 | `adele-skronk`, `adele-skronk-2`, `adele-skronk-3` | 16 each | yes (2026-11-18), **ephemeral** | **Three boxes from 2026-11-18 ~21:00Z** (Aaron: "register skronk-2 and skronk-3 for work, same specs as skronk"): skronk-2 was spot-terminated ~20:15Z (us-east-1c again; 10 of its 15 rooms had REAPed, the other 5 were re-spawned on bangerang) and relaunched; skronk-3 is new. Deadlines: skronk and skronk-2 02:54Z, skronk-3 08:55Z (`terraform output deadlines_utc`), so long tickets go on skronk-3. Each host's `public_ips` entry goes in `~/.ssh/rz_hosts`. **16 rooms per box from 2026-11-18 15:42Z** (Aaron). At 24, skronk-2 sat at load 119-126 on 36 vCPUs with memory fine (40G free), and gates went false-red on time-outs (#3554's `[Test workspace]` got SIGTERM with every test passing). A box over 16 drains: its rooms finish, and it takes no SPAWN until it's below 16. Spawn on the box with fewer rooms first. **Relaunched 14:54Z 2026-11-18** after both boxes were lost (likely a spot reclaim, ~09:20Z): new IPs in `~/.ssh/rz_hosts`, deadline 02:54Z (both). **Since 06:54Z 2026-11-18: two boxes, EC2 spot c5.9xlarge (36 vCPU, 72 GiB / 68 usable, 200 GB gp3)**, `instance_count = 2`. skronk dies 15:59Z, skronk-2 18:19Z (each counts from its own first apply). **24 rooms per box** (Aaron, 07:00Z), no load hold (spawn unless MemAvailable < 10 GiB). `host.env` 44G / 50G rooms, `RZ_GATE_SLOTS=6` (4 room + 2 train), the Terraform defaults. **Spot losses on 2026-11-18, all in us-east-1c:** the first c5.9xlarge at about 06:15Z (19 rooms), then a c5.12xlarge pair (06:20–06:50Z, 32 rooms + 2 train slots each, 64 rooms lost within 30 minutes). Pin another AZ at the next launch (Aaron: "elsewhere"; the boxes are ephemeral, so no disk has to follow). After the second loss, 23 of 63 rooms had pushed work. Those plus the 25 highest-priority of the rest came back, and the other 15 were released to ready. 12xlarge sizing, for reference: 60G / 66G rooms. Don't add `RZ_TRAIN_SLOTS` to `host.env` until #4031 lands: the parser rejects unknown keys, and every gate on the box, train gates included, fails to start (`gate --next skronk-2`, 06:33Z). Train 2's speculative gate can run on a skronk (`train.sh gate --next skronk-2`). **Spot loss (06:15Z):** the first skronk was terminated while Aaron applied the second box and took `adele-skronk` and 19 rooms with it. Those rooms were re-spawned under the same room IDs: a re-spawned room reads its original briefing from its own room history and resets to its pushed `ritz-task-<id>` branch if there is one, and its claim moves to `ritz-task-<id>@<new box>`. That's why briefings tell rooms to push every commit. Long-running tickets go on the box with the later deadline. Before 06:20Z: one c5.9xlarge (36 vCPU, 72 GiB, 200 GB gp3), Ubuntu 26.04, built and torn down by Terraform in `~/dev/nevelis/lab/skronk` (AGAST #3996; Aaron runs `terraform apply`/`destroy`). **It dies at a deadline** (`terraform output deadline_utc`; `/run/skronk-minutes-left` on the box): it powers itself off then, and EventBridge terminates it 10 minutes later. Unpushed work is lost, so every briefing says to push often and to report by deadline − 20 min; tear rooms down (or let them go) before the deadline, and `release_task` anything that didn't REAP. The public IP changes every launch: update `Host skronk` in `~/.ssh/rz_hosts` from `terraform output rz_hosts_entry`. Remotes are https via `gh`. `host.env` 48G / 54G, 4 gate slots. First run 2026-11-18 04:25Z: 12 rooms at load1 ~13. Smoke 28.6 s. **24 slots from 2026-11-18 05:50Z** (Aaron: "crank skronk up … go to 24"): `ttl_minutes` 720 (deadline 15:59Z) and `root_volume_gb` 200 applied in place, root grown online (growpart + resize2fs) |
+| skronk, skronk-2, skronk-3 | `adele-skronk`, `adele-skronk-2`, `adele-skronk-3` | 16 each | yes (2026-11-18), **ephemeral** | **Three boxes from 2026-11-18 ~21:00Z** (Aaron: "register skronk-2 and skronk-3 for work, same specs as skronk"): skronk-2 was spot-terminated ~20:15Z (us-east-1c again; 10 of its 15 rooms had REAPed, the other 5 were re-spawned on bangerang) and relaunched; skronk-3 is new. Deadlines: skronk and skronk-2 02:54Z, skronk-3 08:55Z (`terraform output deadlines_utc`), so long tickets go on skronk-3. Each host's `public_ips` entry goes in `~/.ssh/rz_hosts`. **16 rooms per box from 2026-11-18 15:42Z** (Aaron). At 24, skronk-2 sat at load 119-126 on 36 vCPUs with memory fine (40G free), and gates went false-red on time-outs (#3554's `[Test workspace]` got SIGTERM with every test passing). A box over 16 drains: its rooms finish, and it takes no SPAWN until it's below 16. Spawn on the box with fewer rooms first. **Relaunched 14:54Z 2026-11-18** after both boxes were lost (likely a spot reclaim, ~09:20Z): new IPs in `~/.ssh/rz_hosts`, deadline 02:54Z (both). **Since 06:54Z 2026-11-18: two boxes, EC2 spot c5.9xlarge (36 vCPU, 72 GiB / 68 usable, 200 GB gp3)**, `instance_count = 2`. skronk dies 15:59Z, skronk-2 18:19Z (each counts from its own first apply). **24 rooms per box** (Aaron, 07:00Z), no load hold (spawn unless MemAvailable < 10 GiB). `host.env` 44G / 50G rooms, `RZ_GATE_SLOTS=6` (4 room + 2 train), the Terraform defaults. **Spot losses on 2026-11-18, all in us-east-1c:** the first c5.9xlarge at about 06:15Z (19 rooms), then a c5.12xlarge pair (06:20–06:50Z, 32 rooms + 2 train slots each, 64 rooms lost within 30 minutes). Pin another AZ at the next launch (Aaron: "elsewhere"; the boxes are ephemeral, so no disk has to follow). After the second loss, 23 of 63 rooms had pushed work. Those plus the 25 highest-priority of the rest came back, and the other 15 were released to ready. 12xlarge sizing, for reference: 60G / 66G rooms. `host.env` gets `RZ_TRAIN_SLOTS=2` (AGAST #4031; Terraform var once it lands): 2 of the 6 gate slots are train-only. (Before #4031 the parser rejected the key and every gate on the box failed to start, `gate --next skronk-2`, 06:33Z.) Train 2's speculative gate can run on a skronk (`train.sh gate --next skronk-2`). **Spot loss (06:15Z):** the first skronk was terminated while Aaron applied the second box and took `adele-skronk` and 19 rooms with it. Those rooms were re-spawned under the same room IDs: a re-spawned room reads its original briefing from its own room history and resets to its pushed `ritz-task-<id>` branch if there is one, and its claim moves to `ritz-task-<id>@<new box>`. That's why briefings tell rooms to push every commit. Long-running tickets go on the box with the later deadline. Before 06:20Z: one c5.9xlarge (36 vCPU, 72 GiB, 200 GB gp3), Ubuntu 26.04, built and torn down by Terraform in `~/dev/nevelis/lab/skronk` (AGAST #3996; Aaron runs `terraform apply`/`destroy`). **It dies at a deadline** (`terraform output deadline_utc`; `/run/skronk-minutes-left` on the box): it powers itself off then, and EventBridge terminates it 10 minutes later. Unpushed work is lost, so every briefing says to push often and to report by deadline − 20 min; tear rooms down (or let them go) before the deadline, and `release_task` anything that didn't REAP. The public IP changes every launch: update `Host skronk` in `~/.ssh/rz_hosts` from `terraform output rz_hosts_entry`. Remotes are https via `gh`. `host.env` 48G / 54G, 4 gate slots. First run 2026-11-18 04:25Z: 12 rooms at load1 ~13. Smoke 28.6 s. **24 slots from 2026-11-18 05:50Z** (Aaron: "crank skronk up … go to 24"): `ttl_minutes` 720 (deadline 15:59Z) and `root_volume_gb` 200 applied in place, root grown online (growpart + resize2fs) |
 
 - **Per-host budget: `~/.config/rz/host.env`** (AGAST #2998), read by
   `.claude/host-budget.sh` and `run-gate.sh`; format and validation in
   `.claude/host-env.sh`. Keys, all optional: `RZ_ROOMS_MEMORY_HIGH` and
   `RZ_ROOMS_MEMORY_MAX` (all of a host's rooms together, the
-  `ritz-rooms.slice` caps) and `RZ_GATE_SLOTS` (gates at once on that host).
+  `ritz-rooms.slice` caps), `RZ_GATE_SLOTS` (gates at once on that host)
+  and `RZ_TRAIN_SLOTS` (AGAST #4031, default 0: how many of those slots
+  only merge-train gates may take; must be below `RZ_GATE_SLOTS`). huburght:
+  `RZ_TRAIN_SLOTS=1` with `RZ_GATE_SLOTS=2` (1 room + 1 train gate: the
+  same 2 gates, so the same memory; 2 train slots would need a third gate,
+  over the 2-per-12-cores limit and ~4.5 GiB short). skronk: 2 of its 6.
   No file means omegalisk's numbers, 7G / 8G / 1, unchanged: omegalisk,
   toffee, starbux and chungus have none. **huburght's file:**
   `RZ_ROOMS_MEMORY_HIGH=28G`, `RZ_ROOMS_MEMORY_MAX=32G`, `RZ_GATE_SLOTS=2`
@@ -674,17 +679,32 @@ re-gate after one merge. That cost three gates where one train needed one.
 This is also how Borque's conductor works.
 
 - **No train in progress:** a REAP that arrives builds a train straight
-  away, with every queued car, and gates it.
+  away, with every queued car, and gates it once the dispatch rule below
+  says so (60 s with no new car, or 8 cars).
 - **A train is gating:** REAPs that arrive form the **next** train, stacked
   on the gating train's tail, not on `main`. Build it as cars arrive so a
-  conflict shows up at once. **Gate it at once on a remote host,
-  speculatively** (AGAST #3988, step 4b): it is tested on the gating
-  train's tail while that train is still being tested. If the first train
-  passes, both land in order. If the second passes first, it lands both at
-  once and the first one's gate is cancelled (step 5). If the first fails, the second train's verdict is
-  thrown away and it is rebuilt and re-gated on the new base. **At most 2
-  trains in flight** (one here, one remote); REAPs that arrive while both
-  gate form train 3, which gates once train 1 lands.
+  conflict shows up at once. **Gate it speculatively** on another host
+  (AGAST #3988, #4031, step 4b) once the dispatch rule below says so: it
+  is tested on the gating train's tail while that train is still being
+  tested. Trains land in order, and a pass of train k lands trains 1..k at
+  once and cancels their gates (step 5). If train k fails, every train
+  after it is thrown away (its base holds the culprit) and its cars are
+  rebuilt on train k-1's tail and re-gated (`train.sh fail`, step 6). **Up
+  to 4 trains in flight** (`RZ_TRAIN_DEPTH`): train 1 here, each later one
+  on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk huburght
+  skronk`) with a free train slot.
+- **Dispatch (Aaron, 2026-11-18, AGAST #4031):** (a) a train that reaches 8
+  cars is gated at once, on any host with a free train slot. (b) A train
+  that cars are boarding waits for more: 60 s after its last car (each new
+  car restarts the 60 s), then it gates, or at once at 8. That holds for a
+  new train 1 (no train building when a car arrives) and for the train
+  stacking behind the gating ones alike. `train.sh pending` applies the
+  rule; just run it after each `build` and act on each line:
+  `GATE train <k> ...: <command>` (run that command: `train.sh gate` for
+  train 1, `train.sh gate --next` for the rest), or `WAIT train <k> n=<cars>
+  <s>s` (schedule a wakeup for that many seconds and run `pending` again;
+  a REAP that arrives meanwhile is a `build --next`, which restarts the
+  wait). A train that is gating is never listed.
 - **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
   with C): bounce E to its room with the exact commit to rebase onto, the
   tail (D's train SHA), not `main`. The room resolves the conflict on D,
@@ -714,9 +734,9 @@ to train 1.
    .claude/skills/rz-iterate/train.sh build ritz-task-2593:3f42ab80 ritz-task-1844:4b699a83 ...
    ```
    **A train is gating:** `--next` keeps train 1 untouched and stacks the
-   given cars on its tail as train 2. If train 2 is gating speculatively
-   (its state has a `SPEC=` line, step 4b) `--next` keeps it too and stacks
-   the cars on *its* tail as train 3. Pass every unchecked item that is not
+   given cars on its tail as train 2. Every later train gating
+   speculatively (its state has a `SPEC=` line, step 4b) is kept too, and
+   the cars stack on the last one's tail. Pass every unchecked item that is not
    in a kept train (`train.sh show` lists each train's `ITEM`s), and run it again
    each time a REAP arrives, so a conflict shows up at once; each run
    rebuilds trains 2+ from scratch (same cars on the same tail give the same
@@ -735,23 +755,39 @@ to train 1.
    only if a commit under it is in no train. `rz-larb` boards like any room
    (`rz-larb:<sha>`).
 4. **Gate train 1, unless `gate=not-needed`** (only cars already on its
-   base or on each other: their own gates cover them). Train 2 gates
-   remotely at the same time (4b):
+   base or on each other: their own gates cover them), when `train.sh
+   pending` says `GATE train 1` (dispatch rule above). Later trains gate on
+   other hosts at the same time (4b):
    ```bash
    LOG=$(.claude/skills/rz-iterate/train.sh gate)
    .claude/skills/rz-iterate/train.sh wait "$LOG"    # Bash run_in_background
    ```
    (`train.sh wait` on a local log is `run-gate.sh --wait`.)
 
-   **4b. Gate train 2 speculatively on a remote host** (AGAST #3988) as soon
-   as `build --next` prints `TRAIN 2 ... gate=needed`, while train 1 gates:
+   **4b. Gate trains 2, 3, ... speculatively** (AGAST #3988, #4031) when
+   `train.sh pending` says `GATE train <k>` (8 cars, or 60 s with no new
+   car), while train 1 gates:
    ```bash
-   LOG2=$(.claude/skills/rz-iterate/train.sh gate --next)   # huburght; or: gate --next <host>
+   LOG2=$(.claude/skills/rz-iterate/train.sh gate --next)   # picks the host; or: gate --next <host>
    .claude/skills/rz-iterate/train.sh wait "$LOG2"         # Bash run_in_background
    ```
-   omegalisk can't take two gates (15 GB WSL), so train 2 runs on a host
-   in `~/.ssh/rz_hosts` (default huburght, `RZ_TRAIN_REMOTE`; 2 gate
-   slots, 47 GB). **The contract**, all in `train.sh` (header and
+   `gate --next` gates the first train past train 1 that needs a gate and
+   has none, on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk
+   huburght skronk`) with a free train slot (`pick_train_host`: a gate
+   slot no gate holds, less the train gates queued there, read from that
+   host's `host.env` and gate dir; stderr says why it passed over each
+   host, `no free train slot` or `unreachable`). omegalisk counts as local
+   (`RZ_TRAIN_LOCAL`, default `hostname -s`): if its slot is free (train 1
+   gating elsewhere), the train gates here, `SPEC=omegalisk - <log> <log>`.
+   No host free: it refuses (`no host in RZ_TRAIN_HOSTS ...`); run
+   `pending` again later. At most `RZ_TRAIN_DEPTH` (4) trains in flight,
+   train 1 included. Each train's gate is named for its worktree slot
+   (`train` for `rz-train`, `train-<s>` for `rz-train-<s>`) and a remote one
+   checks out in `rz-train-remote` or `rz-train-remote-<s>`, so two trains
+   can gate on one host (skronk has 2 train slots). Hosts reserve slots for
+   trains with `RZ_TRAIN_SLOTS` (Hosts above; run-gate.sh header): room
+   gates can't take those, train gates take them first and any free general
+   slot after. **The contract**, all in `train.sh` (header and
    `REMOTE_SH`):
    1. `gate --next` pushes train 2's tail to origin
       `refs/heads/rz-train/<tip12>`, then runs `ssh -F ~/.ssh/rz_hosts
@@ -780,20 +816,24 @@ to train 1.
       a `build` replaces the train (a `DISCARDED speculative gate on <host>
       ...` line). Both lines also stop the host's `ritz-gate-train` unit.
 
-   Refusals: no train 2 (`gate` is for train 1), `gate=not-needed` (land
-   it after train 1), or train 2 already gating (**at most 2 in flight**).
+   Refusals: no train 2 (`gate` is for train 1), no later train needing a
+   gate (each already gating or `gate=not-needed`: land it with the train
+   below), or `RZ_TRAIN_DEPTH` trains in flight already.
    `gate` refuses a train 1 that is gating remotely (`train.sh wait` its
    log). If the host can't start the gate (`the remote gate on <host> did
-   not start`), let train 2 gate here after train 1 lands, as before. If a
+   not start`), name another host (`gate --next <host>`), or let the train
+   gate here once the trains below it land. `train.sh discard <host>` drops
+   only that host's gates (a dead host); then `gate --next` again. If a
    remote gate dies or the host goes away, rebuild with the same cars (a
    plain `build` of trains 1 and 2: same cars on the same tail give the
    same tips) and gate again. Trains still land in order, but a passed
    train 2 lands train 1 with it (step 5): don't wait for train 1's gate.
    Run the wait with `run_in_background`, so it wakes this room when the gate
    ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
-   (slots, nudges, `build --next` for REAPs that arrive) meanwhile. On a
+   (slots, nudges, `build --next` and `pending` for REAPs that arrive)
+   meanwhile. On a
    context reset, `train.sh show` prints every train (`== train <k>` then
-   its state), and the highest-numbered `gate-logs/train-<sha12>-<n>.log` holds the gate. The
+   its state), and the highest-numbered `gate-logs/train[-<s>]-<sha12>-<n>.log` holds the gate (`-<s>`: the train's worktree slot, AGAST #4031). The
    train gate uses omegalisk's one gate slot. It may wait for a room gate
    that already holds the slot, but it takes the next free one ahead of any
    waiting room gate (`.train-waiting`, #3317; FIFO otherwise, #3364).
@@ -915,16 +955,22 @@ to train 1.
    line, "rebase onto <main sha7>: your commit fails the gate on top of
    `main`", with the gate's failing lines. Its fixed REAP goes to the back
    of the queue.
-   **With two trains in flight** (AGAST #3988): if **train 1 fails**,
-   train 2's verdict is worthless whatever it says (its base was train 1's
-   tail). Don't wait for it: the plain `build` for the bisect replaces
-   train 2, prints `DISCARDED speculative gate ...`, stops the remote gate
-   and deletes its ref. Pass train 2's cars after the halved ones as usual,
-   so they stack on the new tail, and gate them with `gate --next` again.
-   If **train 1 passes and train 2 fails**, land train 1 (step 5), then
-   bisect train 2 (now train 1) as above. A stale verdict can't land
-   anything by mistake: it names the old tip, and `land` refuses a log for
-   another commit.
+   **With several trains in flight** (AGAST #3988, #4031): when **train k
+   fails**, every train after it is worthless whatever its gate says (its
+   base holds train k's cars). Don't wait for them:
+   ```bash
+   .claude/skills/rz-iterate/train.sh fail "$LOGK"
+   ```
+   prints `HELD <branch> <sha12>` for each of train k's cars, stops every
+   later train's gate (`DISCARDED speculative gate ...`, ref deleted) and
+   rebuilds their cars on train k-1's tail (`TRAIN <k> base=...` lines;
+   main for k = 1). Trains 1..k-1 and their gates are left alone. Then
+   bisect the HELD cars as above with `build --next <halved HELD cars>
+   <the rest of the queue>` (a plain `build` for k = 1), and gate per
+   `pending`. A failed train with nothing behind it is just dropped. If
+   **train 1 passes and train 2 fails**, land train 1 (step 5), then `fail`
+   train 2's log. A stale verdict can't land anything by mistake: it names
+   the old tip, and `land` refuses a log for another commit.
 7. **`CONFLICT`:** bounce it now, not after the train lands. The line names
    what it hit: `CONFLICT <branch> <sha12> with <car>[,<car>] on
    <file>[,<file>]` (the train cars touching the conflicted files, or

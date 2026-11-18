@@ -11,6 +11,7 @@
 #   RZ_GATE_CMD    command run from a checkout of <worktree>'s HEAD
 #                                                (default: clean ci-local)
 #   RZ_GATE_SLOTS  gates allowed at once         (default: host.env, else 1)
+#   RZ_TRAIN_SLOTS of those, train gates only    (default: host.env, else 0)
 #   RZ_HOST_ENV    per-host config file          (default: ~/.config/rz/host.env)
 #   RZ_GATE_DIR    where logs and slot locks go  (default: ~/dev/ritz-lang/gate-logs)
 #   RZ_GATE_POLL   seconds between slot polls    (default: 20; tests use less)
@@ -94,6 +95,19 @@
 #     seconds goes ahead of trains, so trains can't be starved in turn.
 #     With no starved waiter nothing changes (#3317, #3427).  A queue line
 #     without a time (a gate started by an older run-gate.sh) never starves.
+#   * reserved train slots (AGAST #4031): with one shared pool, a train only
+#     got priority for the NEXT free slot, so train 2 sat queued on
+#     huburght behind two room gates for a whole room gate.  RZ_TRAIN_SLOTS
+#     (host.env) of the RZ_GATE_SLOTS slots, the top-numbered ones, are for
+#     train gates (RZ_GATE_TRAIN=1) only; room gates, starved or not, take
+#     slots 0..SLOTS-TRAIN_SLOTS-1.  A train gate tries its reserved slots
+#     first (top down), so the general ones stay free for rooms, then any
+#     free general slot.  Must be below RZ_GATE_SLOTS (else no room gate
+#     ever runs).  On such a host room gates ignore .train-reserved: the
+#     next train has its own slot, and the time reservation would only idle
+#     a general one.  The log header says SLOTS=<n> TRAIN_SLOTS=<m>.
+#     train.sh asks rz_train_free (host-env.sh) whether a host has a slot
+#     free for a train before it sends one there.
 #   * script by path (AGAST #3567): systemd unescapes and expands `$` in a
 #     unit's command line (`$$` -> `$`, `${x}` -> x from the unit's env, or
 #     empty), so `bash -c "$INNER"` ran a mangled script: every queue pid was
@@ -167,11 +181,9 @@ NAME="$2"
 # shellcheck source=../../host-env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../host-env.sh"
 rz_host_env_load || exit 2
-SLOTS="${RZ_GATE_SLOTS:-${HOST_ENV[RZ_GATE_SLOTS]:-1}}"
-if [[ ! "$SLOTS" =~ ^[1-9][0-9]*$ ]]; then
-    echo "error: RZ_GATE_SLOTS must be a whole number >= 1: '$SLOTS'" >&2
-    exit 2
-fi
+# Slots, and how many of them only train gates take (AGAST #4031).
+SLOT_CFG="$(rz_gate_slots)" || exit 2
+read -r SLOTS TSLOTS <<<"$SLOT_CFG"
 # The ritz0 suite budget's scale on this host (AGAST #4138): host.env's
 # RZ_TEST_BUDGET_SCALE, or the same name in this script's environment.  The
 # unit gets it under that name; main.yml's ritz0 step turns it into
@@ -258,8 +270,8 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\n' \
-    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\nSLOTS=%s TRAIN_SLOTS=%s\n' \
+    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" "$SLOTS" "$TSLOTS" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that
@@ -305,6 +317,8 @@ fi
 # a time from the last RZ_HOLD seconds is ignored.
 train_reserved() {
     [ "$RZ_TRAIN" = 1 ] && return 1
+    # Reserved train slots supersede it (AGAST #4031; see the header).
+    [ "$RZ_TSLOTS" -gt 0 ] 2>/dev/null && return 1
     local t now
     t="$(cat "$RES" 2>/dev/null)" || return 1
     now="$(date +%s)"
@@ -335,6 +349,12 @@ starved() {
     [ "$o" -le "$now" ] || o=0
     [ "$o" -gt "$e" ] && e=$o
     [ $((now - e)) -ge "$RZ_STARVE" ] 2>/dev/null
+}
+# The slots this gate may take, in the order it tries them (AGAST #4031): a
+# room gate the general ones, a train gate its reserved ones first, then any.
+slots() {
+    if [ "$RZ_TRAIN" = 1 ]; then seq $((RZ_SLOTS - 1)) -1 0
+    else seq 0 $((RZ_SLOTS - RZ_TSLOTS - 1)); fi
 }
 qlock() { exec 8>>"$Q.lock" && flock 8; }
 qunlock() { exec 8>&-; }
@@ -408,7 +428,7 @@ while :; do
             said_starved=1
             echo "STARVED: waited ${RZ_STARVE}s or more; next free slot, ahead of merge trains $(date -Is)" >> "$RZ_LOG"
         fi
-        for s in $(seq 0 $((RZ_SLOTS - 1))); do
+        for s in $(slots); do
             exec 9>"$RZ_DIR/.gate-slot-$s"
             if flock -n 9; then
                 { date +%s > "$OVR.$$" && mv -f "$OVR.$$" "$OVR"; } 2>/dev/null \
@@ -424,7 +444,7 @@ while :; do
             echo "WAITING: slot reserved for the merge train since $(date -Is -d "@$(cat "$RES")" 2>/dev/null) $(date -Is)" >> "$RZ_LOG"
         fi
     elif [ "$pos" = 1 ] && ! train_waiting; then
-        for s in $(seq 0 $((RZ_SLOTS - 1))); do
+        for s in $(slots); do
             exec 9>"$RZ_DIR/.gate-slot-$s"
             if flock -n 9; then
                 # A train gate may have reserved the slot and released it
@@ -485,7 +505,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --slice=ritz-gate.slice --property=CPUWeight=100 \
     --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
     --setenv=RZ_LOG="$LOG" --setenv=RZ_SHA="$SHA" --setenv=RZ_CMD="$CMD" \
-    --setenv=RZ_SLOTS="$SLOTS" --setenv=RZ_DIR="$GATES" \
+    --setenv=RZ_SLOTS="$SLOTS" --setenv=RZ_TSLOTS="$TSLOTS" --setenv=RZ_DIR="$GATES" \
     --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \

@@ -488,6 +488,77 @@ check 'grep -qx "FACTOR=\[2\]" "$l20" && grep -qx "CPU_FACTOR=2 (environment)" "
 out="$(RZ_CPU_FACTOR=1e3 RZ_GATE_CMD="$probe" gate "$W" t20 2>&1)"; rc=$?
 check '[[ $rc -eq 2 ]] && [[ "$out" == *RZ_CPU_FACTOR* ]]' "a malformed factor override is refused (rc=$rc)"
 
+# 21. Reserved train slots (AGAST #4031): RZ_TRAIN_SLOTS of a host's slots
+# (the top ones) only train gates take; room gates get the rest.  2 slots, 1
+# reserved: slot 1 is the train's, slot 0 everyone's.
+export RZ_GATE_SLOTS=2 RZ_TRAIN_SLOTS=1 RZ_GATE_POLL=0.1
+slotof() { sed -n 's/^SLOT=\([0-9]*\) .*/\1/p' "$1"; }
+rm -f "$RZ_TEST_RELEASE" "$RES" "$MARK"; : > "$RZ_TEST_ORDER"
+# 21a. A train gate on an idle host takes its reserved slot, not slot 0.
+l20="$(RZ_GATE_TRAIN=1 RZ_GATE_CMD='exit 0' gate "$W" v1t)"
+check '[[ "$(slotof "$l20")" == 1 ]]' "a train gate takes a reserved slot first (SLOT=$(slotof "$l20"))"
+rm -f "$RES"
+# 21b. Room gate A holds slot 0; room gate B can't take the free reserved slot.
+RZ_TEST_NAME=A RZ_GATE_CMD="$hold" gate "$W" v2a >/dev/null &
+until_ '[[ -n "$(logof v2a)" ]] && grep -q "^SLOT=" "$(logof v2a)"'
+check '[[ "$(slotof "$(logof v2a)")" == 0 ]]' "a room gate takes a general slot"
+RZ_GATE_CMD='exit 0' timeout 3 bash "$G" "$W" v2b >/dev/null; rc=$?
+check '[[ $rc -eq 124 ]] && ! grep -q "^SLOT=" "$(logof v2b)"' "a room gate can't take a reserved slot, though it is free (rc=$rc)"
+stop "$(logof v2b)"; until_ '[[ ! -e "$RZ_TEST_ACTIVE/ritz-gate-v2b" ]]'
+# ...but a train gate takes it at once, while A still runs.
+l20="$(RZ_GATE_TRAIN=1 RZ_GATE_CMD='exit 0' timeout 10 bash "$G" "$W" v2t)"; rc=$?
+check '[[ $rc -eq 0 && "$(slotof "$l20")" == 1 ]] && grep -qx EXIT=0 "$l20"' "a train gate takes the reserved slot while room gates fill the rest (rc=$rc)"
+# 21c. A host with reserved slots ignores .train-reserved: the next train has
+# its own slot, so the time reservation would only idle the general ones.
+date +%s > "$RES"
+touch "$RZ_TEST_RELEASE"; wait
+l20="$(RZ_GATE_CMD='exit 0' timeout 10 bash "$G" "$W" v3r)"; rc=$?
+check '[[ $rc -eq 0 && "$(slotof "$l20")" == 0 ]]' "a room gate ignores .train-reserved on a host with reserved train slots (rc=$rc)"
+# 21d. A train gate may also take a free general slot: T1 holds the reserved
+# one, T2 takes slot 0.
+rm -f "$RZ_TEST_RELEASE" "$RES"
+RZ_TEST_NAME=T1 RZ_GATE_TRAIN=1 RZ_GATE_CMD="$hold" gate "$W" v4a >/dev/null &
+until_ '[[ -n "$(logof v4a)" ]] && grep -q "^SLOT=" "$(logof v4a)"'
+l20="$(RZ_GATE_TRAIN=1 RZ_GATE_CMD='exit 0' timeout 10 bash "$G" "$W" v4b)"; rc=$?
+check '[[ $rc -eq 0 && "$(slotof "$l20")" == 0 ]]' "a train gate takes a free general slot when its reserved ones are full (rc=$rc)"
+touch "$RZ_TEST_RELEASE"; wait
+# 21e. A starved room gate still can't take a reserved slot.
+rm -f "$RZ_TEST_RELEASE" "$RES" "$OVR"
+RZ_TEST_NAME=A RZ_GATE_CMD="$hold" gate "$W" v5a >/dev/null &
+until_ '[[ -n "$(logof v5a)" ]] && grep -q "^SLOT=" "$(logof v5a)"'
+RZ_GATE_STARVE=0 RZ_GATE_CMD='exit 0' timeout 3 bash "$G" "$W" v5r >/dev/null; rc=$?
+check '[[ $rc -eq 124 ]] && grep -q "^STARVED" "$(logof v5r)" && ! grep -q "^SLOT=" "$(logof v5r)"' "a starved room gate still can't take a reserved slot (rc=$rc)"
+stop "$(logof v5r)"; until_ '[[ ! -e "$RZ_TEST_ACTIVE/ritz-gate-v5r" ]]'
+touch "$RZ_TEST_RELEASE"; wait
+rm -f "$RES" "$OVR" "$MARK"
+# 21f. Validation: not below the slot count, or not a number, refuses.
+out="$(RZ_TRAIN_SLOTS=2 RZ_GATE_CMD='exit 0' gate "$W" v6 2>&1)"; rc=$?
+check '[[ $rc -eq 2 && "$out" == *"must be below RZ_GATE_SLOTS"* ]]' "RZ_TRAIN_SLOTS >= RZ_GATE_SLOTS is refused (rc=$rc)"
+out="$(RZ_TRAIN_SLOTS=x RZ_GATE_CMD='exit 0' gate "$W" v6 2>&1)"; rc=$?
+check '[[ $rc -eq 2 && "$out" == *RZ_TRAIN_SLOTS* ]]' "a malformed RZ_TRAIN_SLOTS is refused (rc=$rc)"
+printf 'RZ_GATE_SLOTS=6\nRZ_TRAIN_SLOTS=2\n' > "$T/train.env"
+l20="$(env -u RZ_GATE_SLOTS -u RZ_TRAIN_SLOTS RZ_HOST_ENV="$T/train.env" RZ_GATE_TRAIN=1 RZ_GATE_CMD="exit 0" timeout 30 bash "$G" "$W" v6)"
+check '[[ "$(slotof "$l20")" == 5 ]] && grep -qx "SLOTS=6 TRAIN_SLOTS=2" "$l20"' "host.env's RZ_TRAIN_SLOTS=2 of 6 is read and logged (SLOT=$(slotof "$l20"))"
+printf 'RZ_TRAIN_SLOTS=-1\n' > "$T/bad.env"
+out="$(env -u RZ_GATE_SLOTS -u RZ_TRAIN_SLOTS RZ_HOST_ENV="$T/bad.env" RZ_GATE_CMD="exit 0" timeout 30 bash "$G" "$W" v6 2>&1)"; rc=$?
+check '[[ $rc -eq 2 && "$out" == *bad.env* ]]' "host.env's malformed RZ_TRAIN_SLOTS is refused (rc=$rc)"
+# 21g. rz_train_free: free slots a train gate could take, minus queued trains.
+free() { (source "$HERE/../../host-env.sh"; rz_train_free "$RZ_GATE_DIR"); }
+check '[[ "$(free)" == 2 ]]' "rz_train_free: an idle 2-slot host has 2 ($(free))"
+exec 7>>"$RZ_GATE_DIR/.gate-slot-0"; flock -n 7
+check '[[ "$(free)" == 1 ]]' "rz_train_free: a room gate on slot 0 leaves the reserved one ($(free))"
+exec 6>>"$RZ_GATE_DIR/.gate-slot-1"; flock -n 6
+check '[[ "$(free)" == 0 ]]' "rz_train_free: every slot held is 0 ($(free))"
+exec 6>&-
+sleep 300 & qp=$!
+echo "ritz-gate-q $qp 1 $(date +%s)" > "$Q"
+check '[[ "$(free)" == 0 ]]' "rz_train_free: a queued live train gate claims the free slot ($(free))"
+echo "ritz-gate-q $qp 0 $(date +%s)" > "$Q"
+check '[[ "$(free)" == 1 ]]' "rz_train_free: a queued room gate doesn't ($(free))"
+kill $qp; wait $qp 2>/dev/null; : > "$Q"; exec 7>&-
+check '[[ "$(RZ_TRAIN_SLOTS=5 free 2>/dev/null)" == 0 ]]' "rz_train_free: a bad slot config is 0"
+unset RZ_TRAIN_SLOTS RZ_GATE_POLL; export RZ_GATE_SLOTS=1
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

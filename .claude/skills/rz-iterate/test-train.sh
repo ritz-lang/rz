@@ -365,8 +365,8 @@ b9="$(git -C "$M" rev-parse origin/main)"
 a1="$(room sa1 s/a1 A1)"; a2="$(room sa2 s/a2 A2)"; fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" build "sa1:$a1" "sa2:$a2" 2>&1)"
 has "$out" "^TRAIN 1 base=${b9:0:12} .*n=2 gate=needed" "train 1 builds on main"
-t1="$(git -C "$T/train" rev-parse HEAD)"; s1="$(st1)"
-log1="$(bash "$TR" gate)"
+t1="$(git -C "$T/train" rev-parse HEAD)"
+log1="$(bash "$TR" gate)"; s1="$(st1)"
 c1="$(room sb1 s/b1 B1)"; c2="$(room sb2 s/b2 B2)"; fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" build --next "sb1:$c1" "sb2:$c2" 2>&1)"
 has "$out" "^TRAIN 2 base=${t1:0:12} .*n=2 gate=needed" "build --next stacks train 2 on train 1's tail"
@@ -441,6 +441,12 @@ echo "$host $*" >> "$RZ_TEST_DIR/ssh-log"
 [[ -e "$RZ_TEST_DIR/ssh-down" ]] && { echo "ssh: connect to host $host: refused" >&2; exit 255; }
 # The remote user's own HOME (its venv lives there), and a login shell's
 # PATH: /etc/profile resets it, so no venv on it (AGAST #4025).
+# Each host has its own gate dir, and its own host.env if the test wrote one
+# (AGAST #4031: `free` reads them).
+export RZ_GATE_DIR="$RZ_TEST_DIR/gates-$host"
+if [[ -e "$RZ_TEST_DIR/host-$host.env" ]]; then
+    unset RZ_GATE_SLOTS RZ_TRAIN_SLOTS; export RZ_HOST_ENV="$RZ_TEST_DIR/host-$host.env"
+fi
 HOME="$RZ_TEST_DIR/rhome" PATH=/usr/local/bin:/usr/bin:/bin exec bash -c "$*"
 EOF
 chmod +x "$T/bin/fakessh"
@@ -473,12 +479,17 @@ printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\nPYTHON=%s\nGBASE=%s\n' "$(git -C "$
 echo "$log"
 EOF
 git clone -q "$T/origin.git" "$T/remote-rz" 2>/dev/null
-export RZ_TRAIN_SSH="$T/bin/fakessh" RZ_TRAIN_REMOTE=hostx RZ_REMOTE_REPO="$T/remote-rz" \
+export RZ_TRAIN_SSH="$T/bin/fakessh" RZ_TRAIN_HOSTS=hostx RZ_TRAIN_LOCAL=localbox RZ_REMOTE_REPO="$T/remote-rz" \
     RZ_REMOTE_WT="$T/remote-train" RZ_REMOTE_GATE="$T/gate.sh" RZ_TRAIN_SSH_RETRY=0 RZ_GATE_SCRIPT="$T/gate.sh"
 export RZ_TRAIN_QUEUED_PAUSE=0
 RW="$T/remote-train"
 oref() { git -C "$M" ls-remote origin "refs/heads/rz-train/$1" | cut -f1; }
 specof() { bash "$TR" show 2>/dev/null | sed -n 's/^SPEC=//p' | head -1; }
+# rw_of <k>: the remote worktree train k gates in (AGAST #4031: one per slot).
+rw_of() {
+    local w; w="$(bash "$TR" show 2>/dev/null | sed -n "s/^== train $1 //p")"
+    if [[ "$w" == "$T/train" ]]; then echo "$RW"; else echo "$RW-${w##*-}"; fi
+}
 # two <prefix> <file>: two cars, one each, on the current main.  Sets c1 c2.
 two() { c1="$(room "$1"1 "$2"1 X1)"; c2="$(room "$1"2 "$2"2 X2)"; fetch; git -C "$M" checkout -q main; }
 
@@ -491,21 +502,22 @@ out="$(bash "$TR" gate --next 2>&1)"; has "$out" "no train 2" "gate --next with 
 log1="$(bash "$TR" gate)"
 two pb projects/prism/src/pb; out="$(bash "$TR" build --next "pb1:$c1" "pb2:$c2" 2>&1)"
 t2="$(git -C "$T/train-2" rev-parse HEAD)"; t1="$(git -C "$T/train" rev-parse HEAD)"
+rw2="$(rw_of 2)"
 llog="$(bash "$TR" gate --next 2>"$T/err")"; rc=$?
 [[ $rc -eq 0 && "$llog" == "$RZ_GATE_DIR/"*"@hostx.log" ]] && ok "gate --next prints a local log path for the remote gate" \
     || { bad "gate --next prints a local log path (rc=$rc, '$llog')"; sed 's/^/     | /' "$T/err"; }
 [[ "$(oref "${t2:0:12}")" == "$t2" ]] && ok "the train 2 tail is pushed to refs/heads/rz-train/<tip12>" \
     || bad "the train 2 tail is pushed to refs/heads/rz-train/<tip12>"
-[[ "$(git -C "$RW" rev-parse HEAD 2>/dev/null)" == "$t2" ]] && ok "the remote train worktree is at train 2's tip" \
+[[ "$(git -C "$rw2" rev-parse HEAD 2>/dev/null)" == "$t2" ]] && ok "the remote train worktree is at train 2's tip" \
     || bad "the remote train worktree is at train 2's tip"
 rlog="$(specof | cut -d' ' -f3)"
 has "$(cat "$rlog" 2>/dev/null)" "^TRAIN=1$" "the remote gate has train priority (RZ_GATE_TRAIN=1)"
 # Against main, train 1's base, not train 1's tail (AGAST #4151): a pass of
 # train 2 lands train 1 too, so its gate must test train 1's packages.
-has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*remote-train/.claude/skills/rz-iterate/train.sh pkgs test $mb$" \
+has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*remote-train(-[0-9]+)?/.claude/skills/rz-iterate/train.sh pkgs test $mb$" \
     "the remote gate tests trains 1-2's packages against main, train 1's base"
 has "$(cat "$rlog" 2>/dev/null)" "^GBASE=$mb$" "the remote gate's diff base is main, train 1's base"
-out="$(bash "$TR" gate --next 2>&1)"; has "$out" "already" "a third train can't gate: at most 2 in flight"
+out="$(bash "$TR" gate --next 2>&1)"; has "$out" "already gating" "gate --next refuses when every later train is gating"
 out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
 [[ $rc -eq 0 && "$(sed -n 's/^SHA=//p' "$llog" 2>/dev/null)" == "$t2" ]] && ok "wait fetches the remote verdict into the local log" \
     || { bad "wait fetches the remote verdict (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
@@ -674,7 +686,7 @@ t2="$(git -C "$T/train-2" rev-parse HEAD)"
 llog="$(bash "$TR" gate --next 2>/dev/null)"; rlog="$(specof | cut -d' ' -f3)"
 has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*train.sh pkgs test $m0$" \
     "train 2's remote gate runs the package tests though only train 1 touches a package"
-out="$(cd "$RW" && bash "$TR" pkgs list "$m0" 2>&1)"
+out="$(cd "$(rw_of 2)" && bash "$TR" pkgs list "$m0" 2>&1)"
 has "$out" "^projects/prism$" "pkgs list <main> on train 2's tip covers train 1's packages"
 c3="$(room gc1 s/gc1 X)"; fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" build --next "gc1:$c3" 2>&1)"; t3="$(tipof 3 "$out")"
@@ -766,4 +778,143 @@ s="$(room km s/km X)"; git -C "$M" push -q origin "$s:refs/heads/main"; git -C "
 out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "main moved" "land <train 2's log> refuses when main moved"
 [[ -z "$(stops)" && -e "$T/active/$U" && "$(ntrains)" == 2 ]] && ok "a refused land cancels no gate and keeps the trains" \
     || bad "a refused land cancels no gate and keeps the trains (systemctl: '$(stops)')"
+
+# 13. N trains in flight (AGAST #4031).  RZ_TRAIN_DEPTH trains gate at once,
+# train k on train k-1's tail, each on the first RZ_TRAIN_HOSTS host with a
+# free train slot; two can share a host (own gate name, own remote tree).
+gating() { bash "$TR" show 2>/dev/null | grep -c '^SPEC='; }
+tipn() { bash "$TR" show 2>/dev/null | sed -n 's/^TIP=//p' | sed -n "${1}p"; }
+
+# 13a. Three trains in flight land in order.
+fetch; git -C "$M" checkout -q main
+two na s/na; bash "$TR" build "na1:$c1" "na2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate)"
+two nb s/nb; bash "$TR" build --next "nb1:$c1" "nb2:$c2" >/dev/null 2>&1
+l2="$(bash "$TR" gate --next 2>/dev/null)"
+two nc s/nc; out="$(bash "$TR" build --next "nc1:$c1" "nc2:$c2" 2>&1)"
+t2="$(tipn 2)"
+has "$out" "^TRAIN 3 base=${t2:0:12} " "build --next keeps gating train 2 and stacks train 3 on its tail"
+rw3="$(rw_of 3)"; rw2="$(rw_of 2)"
+l3="$(bash "$TR" gate --next 2>"$T/err")"; rc=$?
+t3="$(tipn 3)"
+[[ $rc -eq 0 && "$(gating)" == 2 ]] && ok "a third train gates while two are in flight" \
+    || { bad "a third train gates while two are in flight (rc=$rc)"; sed 's/^/     | /' "$T/err"; }
+[[ "$rw2" != "$rw3" && "$(git -C "$rw3" rev-parse HEAD 2>/dev/null)" == "$t3" && "$(git -C "$rw2" rev-parse HEAD 2>/dev/null)" == "$t2" ]] \
+    && ok "trains 2 and 3 gate in their own remote trees on one host" || bad "trains 2 and 3 gate in their own remote trees"
+grep -q -- "start .* $RZ_TRAIN_NAME-[0-9]" "$T/ssh-log" && ok "a train past slot 1 gates under its own name" \
+    || bad "a train past slot 1 gates under its own name"
+two nd s/nd; bash "$TR" build --next "nd1:$c1" "nd2:$c2" >/dev/null 2>&1
+out="$(RZ_TRAIN_DEPTH=3 bash "$TR" gate --next 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "3 trains in flight already \(at most 3" "RZ_TRAIN_DEPTH caps the trains in flight" \
+    || bad "RZ_TRAIN_DEPTH caps the trains in flight (rc=$rc)"
+l4="$(bash "$TR" gate --next 2>/dev/null)"
+[[ "$(gating)" == 3 ]] && ok "the default depth (4) lets a fourth train gate" || bad "the default depth (4) lets a fourth train gate ($(gating))"
+t4="$(tipn 4)"
+for l in "$l2" "$l3" "$l4"; do bash "$TR" wait "$l" >/dev/null 2>&1; done
+out="$(bash "$TR" land "$log1" 2>&1)"; has "$out" "^NEXT .*spec=$l2" "train 1 lands first; train 2 is next"
+out="$(bash "$TR" land "$l2" 2>&1)"; has "$out" "^MERGED +nb2 " "train 2 lands second"
+has "$out" "^NEXT .*tip=${t3:0:12} .*spec=$l3" "train 3 is next"
+out="$(bash "$TR" land "$l3" 2>&1)"; has "$out" "^MERGED +nc2 " "train 3 lands third"
+out="$(bash "$TR" land "$l4" 2>&1)"; has "$out" "^MERGED +nd2 " "train 4 lands fourth"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$t4" && -z "$(oref "${t3:0:12}")" ]] \
+    && ok "main is train 4's tail, each ref gone" || bad "main is train 4's tail, each ref gone"
+
+# 13b. A middle train fails: train 1 and its gate stay; train 2's cars are
+# HELD; train 3's gate is stopped and its cars rebuilt on train 1's tail.
+fetch; git -C "$M" checkout -q main
+two ma s/ma; bash "$TR" build "ma1:$c1" "ma2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate)"; t1="$(tipn 1)"
+two mb s/mb; bash "$TR" build --next "mb1:$c1" "mb2:$c2" >/dev/null 2>&1; mb1="$c1"
+l2="$(RZ_FAKE_EXIT=1 bash "$TR" gate --next 2>/dev/null)"
+two mc s/mc; bash "$TR" build --next "mc1:$c1" "mc2:$c2" >/dev/null 2>&1
+l3="$(bash "$TR" gate --next 2>/dev/null)"; t3="$(tipn 3)"
+bash "$TR" wait "$l2" >/dev/null 2>&1
+out="$(bash "$TR" fail "$log1" 2>&1)"; has "$out" "passed" "fail refuses a passed gate"
+: > "$T/ssh-log"
+out="$(bash "$TR" fail "$l2" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && has "$out" "^HELD +mb1 ${mb1:0:12}" "fail prints the failed train's cars as HELD" \
+    || { bad "fail <train 2's log> (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+has "$out" "^DISCARDED speculative gate on hostx for ${t3:0:12} " "the later train's gate is discarded"
+grep -q -- "-- stop $RZ_TRAIN_NAME-" "$T/ssh-log" && ok "its remote gate is stopped" || bad "its remote gate is stopped"
+[[ -z "$(oref "${t3:0:12}")" ]] && ok "its rz-train ref is deleted" || bad "its rz-train ref is deleted"
+has "$out" "^TRAIN 2 base=${t1:0:12} .*n=2 gate=needed" "the later train's cars are rebuilt on train 1's tail"
+! grep -q "mb[12]" <<<"$(bash "$TR" show | grep ^ITEM=)" && ok "the failed cars are out of every train" \
+    || bad "the failed cars are out of every train"
+[[ "$(tipn 1)" == "$t1" ]] && ok "train 1 is untouched" || bad "train 1 is untouched"
+l2="$(bash "$TR" gate --next 2>/dev/null)"
+[[ "$(gating)" == 1 ]] && ok "the rebuilt train re-gates" || bad "the rebuilt train re-gates"
+bash "$TR" wait "$l2" >/dev/null 2>&1
+out="$(bash "$TR" land "$l2" 2>&1)"
+has "$out" "^MERGED +mc2 " "the rebuilt train lands trains 1 and 2"
+! grep -q "MERGED +mb" <<<"$out" && ok "without the held cars" || bad "without the held cars"
+# A failed train 1 with nothing behind it is just dropped.
+fetch; git -C "$M" checkout -q main
+two mf s/mf; bash "$TR" build "mf1:$c1" "mf2:$c2" >/dev/null 2>&1
+out="$(bash "$TR" fail "$(RZ_FAKE_EXIT=1 bash "$TR" gate)" 2>&1)"
+has "$out" "^HELD +mf2 " "a failed lone train holds its cars"
+out="$(bash "$TR" show 2>&1)"; has "$out" "no train built" "and leaves no train"
+
+# 13c. pick_train_host: the first host with a free train slot.  This host
+# (RZ_TRAIN_LOCAL, 1 slot) and hostx (2 slots, 1 reserved) are full: hosty.
+fetch; git -C "$M" checkout -q main
+printf 'RZ_GATE_SLOTS=2\nRZ_TRAIN_SLOTS=1\n' > "$T/host-hostx.env"
+mkdir -p "$T/gates-hostx" "$RZ_GATE_DIR"
+exec 5>>"$RZ_GATE_DIR/.gate-slot-0" 6>>"$T/gates-hostx/.gate-slot-0" 7>>"$T/gates-hostx/.gate-slot-1"
+flock -n 5; flock -n 6; flock -n 7
+export RZ_TRAIN_HOSTS="localbox hostx hosty"
+two pha s/pha; bash "$TR" build "pha1:$c1" "pha2:$c2" >/dev/null 2>&1; log1="$(bash "$TR" gate)"
+two phb s/phb; bash "$TR" build --next "phb1:$c1" "phb2:$c2" >/dev/null 2>&1
+l2="$(bash "$TR" gate --next 2>"$T/err")"
+[[ "$(specof | cut -d' ' -f1)" == hosty ]] && ok "gate --next skips a host whose train slots are full" \
+    || { bad "gate --next skips a host whose train slots are full (spec: $(specof))"; sed 's/^/     | /' "$T/err"; }
+grep -q "localbox: no free train slot" "$T/err" && grep -q "hostx: no free train slot" "$T/err" \
+    && ok "it says why it passed over each" || bad "it says why it passed over each"
+# A room gate on hostx's general slot leaves its reserved one free: hostx.
+exec 7>&-
+bash "$TR" discard hosty >/dev/null 2>&1
+[[ -z "$(specof)" ]] && ok "discard <host> drops that host's gate" || bad "discard <host> drops that host's gate"
+l2="$(bash "$TR" gate --next 2>/dev/null)"
+[[ "$(specof | cut -d' ' -f1)" == hostx ]] && ok "a host with a free reserved slot is picked" \
+    || bad "a host with a free reserved slot is picked (spec: $(specof))"
+bash "$TR" discard >/dev/null 2>&1
+# Every host full: refused, nothing pushed or recorded.
+exec 7>>"$T/gates-hostx/.gate-slot-1"; flock -n 7
+touch "$T/ssh-down"
+out="$(bash "$TR" gate --next 2>&1)"; rc=$?
+rm -f "$T/ssh-down"
+[[ $rc -ne 0 && -z "$(specof)" ]] && has "$out" "no host in RZ_TRAIN_HOSTS" "no free host: gate --next refuses" \
+    || bad "no free host: gate --next refuses (rc=$rc)"
+has "$out" "hosty: unreachable" "an unreachable host is skipped"
+# This host free: the speculative gate runs here, and waits and lands locally.
+exec 5>&- 6>&- 7>&-
+l2="$(bash "$TR" gate --next 2>/dev/null)"
+[[ "$(specof)" == "localbox - $l2 $l2" && "$l2" != *@* ]] && ok "this host, when free, gates the train here (a local SPEC)" \
+    || bad "this host, when free, gates the train here (spec: $(specof))"
+out="$(bash "$TR" wait "$l2" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && ok "wait on a local speculative gate" || bad "wait on a local speculative gate (rc=$rc)"
+out="$(bash "$TR" land "$l2" 2>&1)"; has "$out" "^MERGED +phb2 " "a local speculative pass lands"
+! grep -q "warning" <<<"$out" && ok "with no ref to delete" || { bad "with no ref to delete"; echo "$out" | sed 's/^/     | /'; }
+export RZ_TRAIN_HOSTS=hostx; rm -f "$T/host-hostx.env"
+
+# 13d. pending (the dispatch rule): gate at 8 cars, or after 60 s with no new
+# car; each car (a rebuild) restarts the 60 s.
+fetch; git -C "$M" checkout -q main
+two qa s/qa; bash "$TR" build "qa1:$c1" "qa2:$c2" >/dev/null 2>&1
+out="$(bash "$TR" pending)"
+has "$out" "^WAIT train 1 n=2 (59|60)s$" "a new train waits 60 s for more cars"
+st="$(git -C "$T/train" rev-parse --absolute-git-dir)/RZ_TRAIN"
+sed -i "s/^BUILT=.*/BUILT=$(( $(date +%s) - 61 ))/" "$st"
+has "$(bash "$TR" pending)" "^GATE train 1 n=2 \(no new car for 60s\): train.sh gate$" "no new car for 60 s: gate it"
+c3="$(room qa3 s/qa3 X)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "qa1:$c1" "qa2:$c2" "qa3:$c3" >/dev/null 2>&1
+has "$(bash "$TR" pending)" "^WAIT train 1 n=3 (59|60)s$" "another car restarts the window"
+log1="$(bash "$TR" gate)"
+[[ -z "$(bash "$TR" pending)" ]] && ok "a gating train is not pending" || bad "a gating train is not pending"
+items=(); for i in 0 1 2 3 4 5 6 7; do items+=("qb$i:$(room "qb$i" "s/qb$i" "Q$i")"); done
+fetch; git -C "$M" checkout -q main
+bash "$TR" build --next "${items[@]}" >/dev/null 2>&1
+has "$(bash "$TR" pending)" "^GATE train 2 n=8 \(full\): train.sh gate --next$" "a train of 8 gates at once"
+l2="$(bash "$TR" gate --next 2>/dev/null)"
+[[ -z "$(bash "$TR" pending)" ]] && ok "a speculatively gating train is not pending" || bad "a speculatively gating train is not pending"
+bash "$TR" wait "$l2" >/dev/null 2>&1; bash "$TR" land "$l2" >/dev/null 2>&1
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

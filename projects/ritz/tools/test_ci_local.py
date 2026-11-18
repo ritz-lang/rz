@@ -982,7 +982,8 @@ def test_a_real_scope_decision_on_a_real_repo(likely, tmp_path, capsys):
 def test_gate_runner_passes_its_base():
     """run-gate.sh hands ci_local the base: RZ_GATE_BASE (a train's BASE),
     else the room's merge-base with origin/main.  train.sh passes its BASE on
-    both the local and the remote gate."""
+    each of its gates: train 1's, and a speculative train's on a remote host
+    or on this one (AGAST #4031)."""
     root = ci_local.REPO_ROOT / ".claude/skills/rz-iterate"
     gate, train = root / "run-gate.sh", root / "train.sh"
     if not gate.is_file() or not train.is_file():
@@ -994,6 +995,6 @@ def test_gate_runner_passes_its_base():
     assert "RZ_GATE_BASE" in text
     calls = [ln for ln in train.read_text().splitlines()
              if "RZ_GATE_TRAIN=1" in ln and not ln.lstrip().startswith("#")]
-    assert len(calls) == 2, calls
+    assert len(calls) == 3, calls
     for ln in calls:
         assert "RZ_GATE_BASE=" in ln, ln

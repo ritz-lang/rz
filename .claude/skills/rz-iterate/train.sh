@@ -13,14 +13,24 @@
 #                                             (keeps a train 2 gating on a
 #                                             remote host too: then train 3)
 #   train.sh gate                       gate train 1's tail (prints the log)
-#   train.sh gate --next [<host>]       gate train 2's tail on <host> while
-#                                       train 1 gates here (speculative; prints
-#                                       the local log path it will fetch to)
+#   train.sh gate --next [<host>]       gate the next train not yet gating
+#                                       (train 2, 3, ...) on <host>, default
+#                                       the first RZ_TRAIN_HOSTS host with a
+#                                       free train slot (speculative; prints
+#                                       the local log path; AGAST #4031)
 #   train.sh wait <log>                 wait for a gate, local or remote, and
 #                                       exit with its verdict (fetches a
 #                                       remote log back first)
-#   train.sh discard                    drop every speculative gate (a dead
-#                                       host); the trains stay
+#   train.sh discard [<host>]           drop every speculative gate, or
+#                                       <host>'s (a dead host); trains stay
+#   train.sh fail <log>                 train k's gate failed: drop train k
+#                                       and every train after it (gates
+#                                       stopped), print train k's cars as
+#                                       HELD, and restack the later trains'
+#                                       cars on train k-1's tail
+#   train.sh pending                    which trains to gate now: GATE or
+#                                       WAIT <s> per train not yet gating
+#                                       (8 cars, or 60 s with no new car)
 #   train.sh land [<log>]               push the tail of the train <log>
 #                                       passed (train k) to main, landing
 #                                       trains 1..k and cancelling their
@@ -62,6 +72,11 @@
 # Env overrides (for tests):
 #   RZ_TRAIN_WT    train 1's worktree  (default ~/dev/ritz-lang/rz-train)
 #   RZ_TRAIN_MAX   cars per train      (default 8)
+#   RZ_TRAIN_DEPTH trains in flight    (default 4; AGAST #4031)
+#   RZ_TRAIN_HOSTS where `gate --next` looks for a free train slot, in order
+#                  (default "omegalisk huburght skronk")
+#   RZ_TRAIN_LOCAL this host's name in that list (default: hostname -s)
+#   RZ_TRAIN_DEBOUNCE  seconds `pending` waits for another car (default 60)
 #   RZ_MAIN_WT     main checkout       (default ~/dev/ritz-lang/rz)
 #   RZ_TRAIN_NAME  gate name           (default train)
 #   RZ_GATE_SCRIPT run-gate.sh to use  (default: beside this script)
@@ -89,13 +104,34 @@
 # copies the remote log to <local log> and checks its SHA is the train's tip,
 # so `land` checks `SHA=<tip>` and `EXIT=0` exactly as for a local log.  The
 # remote gate's base (package tests, ci-local --diff-base) is main, train 1's
-# base, not train 1's tail: its pass lands train 1 too (AGAST #4151).  At
-# most 2 trains in flight: train 1 here, train 2 remote.  `build --next`
-# keeps a train 2 that has a SPEC and stacks new cars on its tail as train
-# 3.  Any build that replaces a train with a SPEC discards it (DISCARDED
+# base, not train 1's tail: its pass lands train 1 too (AGAST #4151).  (Was
+# at most 2 trains in flight; since #4031, RZ_TRAIN_DEPTH: see below.)
+# `build --next` keeps every train that has a SPEC and stacks new cars on
+# the last one's tail.  Any build that replaces a train with a SPEC discards it (DISCARDED
 # line): stops the remote gate, deletes the ref.  `land` deletes the landed
 # train's ref.  A verdict can never outlive its tree: it names the tip, and
 # a rebuilt train on another base has another tip.
+#
+# N trains in flight (AGAST #4031): the 2-train cap is RZ_TRAIN_DEPTH (default
+# 4), counting train 1 and every later train with a SPEC.  `gate --next` gates
+# the first train past train 1 that needs a gate and has none, each on train
+# k-1's tail, on the first host in RZ_TRAIN_HOSTS with a free train slot
+# (pick_train_host: rz_train_free in host-env.sh, over ssh for a remote host;
+# an unreachable host is skipped).  This host (RZ_TRAIN_LOCAL) is local: its
+# gate runs here and its SPEC is `SPEC=<host> - <log> <log>`.  Each train's
+# gate is named for its worktree slot (gname: `train` for slot 1, `train-<s>`
+# for slot s), and a remote one checks out in RZ_REMOTE_WT, -<s> for slot s,
+# so two trains can gate on one host at once (skronk has 2 train slots).
+# `build --next` keeps train 1 and every train up to the last one with a
+# SPEC.  A failed train k (`fail <log>`) invalidates every train after it
+# (their bases hold its cars): their gates are stopped, and their cars are
+# rebuilt on train k-1's tail.  A pass still lands every train below it.
+#
+# Dispatch (AGAST #4031, SKILL.md "Merge trains"): `build` stamps each train
+# it starts with BUILT=<epoch>, and each REAP is a rebuild, so BUILT is the
+# last car's arrival.  `pending` says GATE for a train with 8 cars or none
+# new for RZ_TRAIN_DEBOUNCE seconds, else WAIT <seconds left>.  `gate` marks
+# train 1 GATED=<log>, so a train already gating is never pending.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -108,8 +144,13 @@ GATES="${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}"
 RESERVED="$GATES/.train-reserved"
 # Speculative remote gates (AGAST #3988; see above).  Remote paths are
 # relative to the remote $HOME unless absolute.
-SSH="${RZ_TRAIN_SSH:-ssh -F $HOME/.ssh/rz_hosts}"
-REMOTE_HOST="${RZ_TRAIN_REMOTE:-huburght}"
+# ConnectTimeout: pick_train_host asks each host in turn, and a spot-killed
+# skronk must cost seconds, not the default TCP timeout (AGAST #4031).
+SSH="${RZ_TRAIN_SSH:-ssh -F $HOME/.ssh/rz_hosts -o ConnectTimeout=10}"
+DEPTH="${RZ_TRAIN_DEPTH:-4}"
+HOSTS="${RZ_TRAIN_HOSTS:-omegalisk huburght skronk}"
+LOCAL="${RZ_TRAIN_LOCAL:-$(hostname -s)}"
+DEBOUNCE="${RZ_TRAIN_DEBOUNCE:-60}"
 REMOTE_REPO="${RZ_REMOTE_REPO:-dev/ritz-lang/rz}"
 REMOTE_WT="${RZ_REMOTE_WT:-dev/ritz-lang/rz-train-remote}"
 REMOTE_GATE="${RZ_REMOTE_GATE:--}"      # - = the train tree's own run-gate.sh
@@ -128,7 +169,13 @@ state() { echo "$(g rev-parse --absolute-git-dir)/RZ_TRAIN"; }
 field() { sed -n "s/^$1=//p" "$2"; }
 
 slot_wt() { if [[ $1 == 1 ]]; then echo "$TRAIN_WT"; else echo "$TRAIN_WT-$1"; fi; }
-use_slot() { WT="$(slot_wt "$1")"; }
+SLOT=1
+use_slot() { SLOT="$1"; WT="$(slot_wt "$1")"; }
+# The current train's gate name and remote worktree, by its slot (AGAST #4031:
+# two trains may gate on one host at once).
+gname() { if [[ $SLOT == 1 ]]; then echo "$NAME"; else echo "$NAME-$SLOT"; fi; }
+rwt() { if [[ $SLOT == 1 ]]; then echo "$REMOTE_WT"; else echo "$REMOTE_WT-$SLOT"; fi; }
+is_local() { [[ "$1" == local || "$1" == "$LOCAL" ]]; }
 qfile() { echo "$(git -C "$MAIN_WT" rev-parse --path-format=absolute --git-common-dir)/RZ_TRAINS"; }
 # The trains' slots in landing order.  No list yet but a train in slot 1:
 # a train built before stacking existed.
@@ -163,6 +210,8 @@ front() { local s; s="$(queue | head -1)"; [[ -n "$s" ]] || die "no train built"
 #                                  <pause> first so a re-poll can't spin
 #   cat <log>                      the log
 #   stop <name>                    stop the gate's unit, if it runs
+#   free                           how many more train gates the host can
+#                                  start now (rz_train_free; AGAST #4031)
 read -r -d '' REMOTE_SH <<'EOF' || true
 set -euo pipefail
 abs() { case "$1" in /*) echo "$1" ;; *) echo "$HOME/$1" ;; esac; }
@@ -214,6 +263,7 @@ main() {
         exit "$rc" ;;
     cat) cat "$1" ;;
     stop) systemctl --user stop "ritz-gate-$1" 2>/dev/null || true ;;
+    free) rz_train_free ;;
     *) echo "error: unknown verb $verb" >&2; exit 2 ;;
     esac
 }
@@ -225,7 +275,8 @@ EOF
 remote() {
     local host="$1"; shift
     # shellcheck disable=SC2086  # $SSH is a command line
-    $SSH "$host" "bash -l -s -- $(printf '%q ' "$@")" <<<"$(declare -f rz_venv_path)
+    $SSH "$host" "bash -l -s -- $(printf '%q ' "$@")" <<<"$(declare -f rz_venv_path \
+        rz_host_env_load rz_budget_scale_ok rz_gate_slots rz_train_free)
 $REMOTE_SH"
 }
 
@@ -236,11 +287,27 @@ discard_spec() {
     [[ -f "$st" ]] || return 0
     read -r host ref rlog llog <<<"$(field SPEC "$st")"
     [[ -n "$host" ]] || return 0
-    remote "$host" stop "$NAME" >/dev/null 2>&1 || echo "warning: could not stop the gate on $host" >&2
-    git -C "$MAIN_WT" push -q origin --delete "refs/heads/$ref" 2>/dev/null \
-        || echo "warning: could not delete $ref on origin" >&2
+    if is_local "$host"; then
+        stop_local "$(gname)"
+    else
+        remote "$host" stop "$(gname)" >/dev/null 2>&1 || echo "warning: could not stop the gate on $host" >&2
+        git -C "$MAIN_WT" push -q origin --delete "refs/heads/$ref" 2>/dev/null \
+            || echo "warning: could not delete $ref on origin" >&2
+    fi
     sed -i '/^SPEC=/d' "$st"
-    echo "$verb speculative gate on $host for ${ref#rz-train/} ($llog)"
+    echo "$verb speculative gate on $host for $(field TIP "$st" | cut -c1-12) ($llog)"
+}
+
+# stop_local <gate name>: stop this host's gate unit of that name if it runs,
+# saying so on stdout (a CANCELLED line, from land), and drop its
+# .train-waiting so room gates see the slot free at once.  Best effort.
+stop_local() {
+    local unit="ritz-gate-$1" tw="$GATES/.train-waiting"
+    if systemctl --user is-active -q "$unit" 2>/dev/null; then
+        systemctl --user stop "$unit" 2>/dev/null || echo "warning: could not stop $unit" >&2
+        [[ -z "${2:-}" ]] || echo "CANCELLED local gate $unit ($2)"
+    fi
+    if [[ "$(cat "$tw" 2>/dev/null)" == "$unit" ]]; then rm -f "$tw"; fi
 }
 
 ensure_worktree() {
@@ -256,7 +323,7 @@ start_train() {
     g cherry-pick --abort >/dev/null 2>&1 || true
     g reset -q --hard
     g checkout -q --detach "$2"
-    printf 'BASE=%s\n' "$2" > "$(state)"
+    printf 'BASE=%s\nBUILT=%s\n' "$2" "$(date +%s)" > "$(state)"
     TBASE="$2"; n=0; picked=0; k=$((k + 1)); slots+=("$1")
 }
 
@@ -286,31 +353,46 @@ conflict_with() {
 }
 
 cmd_build() {
-    local next=0
+    local next=0 old=() keep=0 i st
     if [[ "${1:-}" == --next ]]; then next=1; shift; fi
     [[ $# -ge 1 ]] || die "usage: $0 build [--next] <branch>:<sha> ..."
+    mapfile -t old < <(queue)
+    if [[ $next -eq 1 && ${#old[@]} -gt 0 ]]; then
+        # Train 1 is gating, and so is every later train with a SPEC
+        # (AGAST #3988, #4031): keep them all, up to the last one gating (a
+        # gate=not-needed train between two gating ones stays too), and
+        # stack these cars on its tail.
+        keep=1
+        for ((i = 1; i < ${#old[@]}; i++)); do
+            use_slot "${old[$i]}"; st="$(state)"
+            if [[ -f "$st" && -n "$(field SPEC "$st")" ]]; then keep=$((i + 1))
+            elif [[ ! -f "$st" || "$(field GATE "$st")" != not-needed ]]; then break; fi
+        done
+    elif [[ $next -eq 1 ]]; then
+        echo "note: no train to stack on; building on origin/main" >&2
+    fi
+    build_on "$keep" "$@"
+}
+
+# build_on <keep> <items...>: keep the first <keep> trains as they are, and
+# build <items> on the last one's tail (on origin/main for 0), replacing every
+# later train.
+build_on() {
+    local keep="$1"; shift
     git -C "$MAIN_WT" fetch -q origin
-    local old=() s base
+    local old=() s base i
     mapfile -t old < <(queue)
     slots=(); k=0
-    if [[ $next -eq 1 && ${#old[@]} -gt 0 ]]; then
-        # Train 1 is gating: leave its worktree and state alone.
-        use_slot "${old[0]}"
-        base="$(field TIP "$(state)")"
-        [[ "$base" == "$(g rev-parse HEAD)" ]] || die "train 1 moved since build; rebuild it"
-        slots=("${old[0]}"); k=1; old=("${old[@]:1}")
-        # Train 2 gating speculatively (AGAST #3988) is in flight too: keep
-        # it, and stack these cars on its tail as train 3.
-        if [[ ${#old[@]} -gt 0 ]]; then
-            use_slot "${old[0]}"
-            if [[ -f "$(state)" && -n "$(field SPEC "$(state)")" ]]; then
-                base="$(field TIP "$(state)")"
-                [[ "$base" == "$(g rev-parse HEAD)" ]] || die "train 2 moved since build; rebuild it"
-                slots+=("${old[0]}"); k=2; old=("${old[@]:1}")
-            fi
-        fi
+    if [[ $keep -gt 0 ]]; then
+        # Kept trains: leave their worktrees and state alone.
+        for ((i = 0; i < keep; i++)); do
+            use_slot "${old[$i]}"
+            base="$(field TIP "$(state)")"
+            [[ "$base" == "$(g rev-parse HEAD)" ]] || die "train $((i + 1)) moved since build; rebuild it"
+            slots+=("${old[$i]}"); k=$((i + 1))
+        done
+        old=("${old[@]:keep}")
     else
-        [[ $next -eq 0 ]] || echo "note: no train to stack on; building on origin/main" >&2
         base="$(git -C "$MAIN_WT" rev-parse origin/main)"
     fi
     for s in ${old[@]+"${old[@]}"}; do
@@ -397,7 +479,7 @@ cmd_show() {
 }
 
 cmd_gate() {
-    if [[ "${1:-}" == --next ]]; then gate_next "${2:-$REMOTE_HOST}"; return; fi
+    if [[ "${1:-}" == --next ]]; then gate_next "${2:-}"; return; fi
     front
     local st spec; st="$(state)"
     [[ "$(field TIP "$st")" == "$(g rev-parse HEAD)" ]] \
@@ -414,39 +496,75 @@ cmd_gate() {
         after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
     fi
     # Train priority: the next free slot goes to this gate ahead of room
-    # gates (run-gate.sh, AGAST #3317).
-    RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$NAME"
+    # gates (run-gate.sh, AGAST #3317).  GATED: `pending` skips it (#4031).
+    local log
+    log="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$(gname)")"
+    printf 'GATED=%s\n' "$log" >> "$st"
+    echo "$log"
 }
 
-# gate_next <host>: gate train 2 on <host> while train 1 gates here (AGAST
-# #3988; see the header).  stdout is only the local log path.
+# gate_next [<host>]: gate the first train past train 1 that needs a gate
+# and has none, on <host> or the first RZ_TRAIN_HOSTS host with a free train
+# slot (AGAST #3988, #4031; see the header).  stdout is only the local log path.
 gate_next() {
-    local host="$1" q st tip base ref pkgs=0 rlog llog spec
+    local host="$1" q i k=0 flight=1 st tip base ref pkgs=0 rlog llog after=""
     mapfile -t q < <(queue)
     [[ ${#q[@]} -gt 0 ]] || die "no train built"
     [[ ${#q[@]} -ge 2 ]] || die "no train 2 to gate: build --next first (train 1 gates with plain \`gate\`)"
-    # The base is main (train 1's base), not train 1's tail (AGAST #4151):
-    # a pass here lands train 1 too, so the package tests and the ritz0
-    # diff scope must cover train 1's cars as well as train 2's.
+    # The base is main (train 1's base), not the tail below (AGAST #4151): a
+    # pass here lands every train below too, so the package tests and the
+    # ritz0 diff scope must cover their cars as well.
     use_slot "${q[0]}"; base="$(field BASE "$(state)")"
-    use_slot "${q[1]}"; st="$(state)"
+    for ((i = 1; i < ${#q[@]}; i++)); do
+        use_slot "${q[$i]}"; st="$(state)"
+        if [[ -n "$(field SPEC "$st")" ]]; then flight=$((flight + 1))
+        elif [[ $k -eq 0 && "$(field GATE "$st")" == needed ]]; then k=$((i + 1)); fi
+    done
+    [[ $k -gt 0 ]] || die "no train past train 1 needs a gate: each is already gating or gate=not-needed (land it after the train below)"
+    [[ $flight -lt $DEPTH ]] || die "$flight trains in flight already (at most $DEPTH, RZ_TRAIN_DEPTH): train.sh wait their logs"
+    use_slot "${q[$((k - 1))]}"; st="$(state)"
     tip="$(field TIP "$st")"
-    [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train 2's worktree moved since build; rebuild"
-    [[ "$(field GATE "$st")" == needed ]] || die "train 2 needs no gate (gate=not-needed): land it after train 1"
-    spec="$(field SPEC "$st")"
-    [[ -z "$spec" ]] || die "train 2 is already gating on ${spec%% *} (at most 2 trains in flight): train.sh wait ${spec##* }"
+    [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train $k's worktree moved since build; rebuild"
+    if [[ -z "$host" ]]; then
+        host="$(pick_train_host)" \
+            || die "no host in RZ_TRAIN_HOSTS ($HOSTS) has a free train slot: gate train $k when one frees"
+    fi
     [[ -n "$(cd "$WT" && bash "$HERE/train.sh" pkgs list "$base")" ]] && pkgs=1
+    if is_local "$host"; then
+        [[ $pkgs -eq 0 ]] || after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
+        llog="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$(gname)")" \
+            || die "the local gate for train $k did not start"
+        printf 'SPEC=%s - %s %s\n' "$host" "$llog" "$llog" >> "$st"
+        echo "SPEC train $k tip=${tip:0:12} on $host (local): $llog" >&2
+        echo "$llog"
+        return
+    fi
     ref="rz-train/${tip:0:12}"
     g push -q -f origin "$tip:refs/heads/$ref"
-    if ! rlog="$(remote "$host" start "$REMOTE_REPO" "$REMOTE_WT" "$REMOTE_GATE" "$ref" "$tip" "$base" "$NAME" "$pkgs" | tail -1)" \
+    if ! rlog="$(remote "$host" start "$REMOTE_REPO" "$(rwt)" "$REMOTE_GATE" "$ref" "$tip" "$base" "$(gname)" "$pkgs" | tail -1)" \
             || [[ "$rlog" != /*.log ]]; then
         g push -q origin --delete "refs/heads/$ref" 2>/dev/null || true
-        die "the remote gate on $host did not start (got '$rlog'); gate train 2 here after train 1 lands"
+        die "the remote gate on $host did not start (got '$rlog'); gate train $k elsewhere (gate --next <host>) or here once the trains below land"
     fi
     llog="$GATES/$(basename "${rlog%.log}")@$host.log"
     printf 'SPEC=%s %s %s %s\n' "$host" "$ref" "$rlog" "$llog" >> "$st"
-    echo "SPEC train 2 tip=${tip:0:12} on $host: $rlog" >&2
+    echo "SPEC train $k tip=${tip:0:12} on $host: $rlog" >&2
     echo "$llog"
+}
+
+# pick_train_host: the first RZ_TRAIN_HOSTS host with a free train slot
+# (rz_train_free: a slot no gate holds, less the train gates queued there).
+# This host is asked directly, the rest over ssh; an unreachable one is
+# skipped.  Says why on stderr for each host it passes over.
+pick_train_host() {
+    local h n
+    for h in $HOSTS; do
+        if is_local "$h"; then n="$(rz_train_free "$GATES" 2>/dev/null)" || n=""
+        else n="$(remote "$h" free 2>/dev/null | tail -1)" || n=""; fi
+        if [[ "$n" =~ ^[0-9]+$ && $n -gt 0 ]]; then echo "$h"; return 0; fi
+        echo "note: $h: ${n:+no free train slot}${n:-unreachable}" >&2
+    done
+    return 1
 }
 
 # cmd_wait <log>: block until the gate ends; exit with its code.  A remote
@@ -467,6 +585,8 @@ cmd_wait() {
         exec bash "$GATE" --wait "$log"
     fi
     read -r host ref rlog llog <<<"$spec"
+    # A speculative gate on this host (AGAST #4031): its log is local.
+    if is_local "$host"; then exec bash "$GATE" --wait "$rlog"; fi
     tip="$(field TIP "$st")"
     while :; do
         rc=0; remote "$host" wait "$REMOTE_WT" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" "$QUEUED_PAUSE" || rc=$?
@@ -705,23 +825,19 @@ cmd_land() {
     done
     echo "MAIN     ${tip:0:12}"
     # Trains 1..k-1 are landed: their gates can only repeat train k's verdict.
-    # The local train unit only ever gates train 1, so stop it, and drop its
-    # .train-waiting so room gates see the slot free at once (best effort).
-    local unit="ritz-gate-$NAME" tw="$GATES/.train-waiting"
-    if [[ $k -gt 1 ]] && systemctl --user is-active -q "$unit" 2>/dev/null; then
-        systemctl --user stop "$unit" 2>/dev/null || echo "warning: could not stop $unit" >&2
-        echo "CANCELLED local gate $unit (covered by train $k's pass)"
-    fi
-    if [[ $k -gt 1 && "$(cat "$tw" 2>/dev/null)" == "$unit" ]]; then rm -f "$tw"; fi
+    # Stop each: a speculative one (SPEC, local or remote), else the train's
+    # own local unit, and drop its .train-waiting so room gates see the slot
+    # free at once (best effort).
     for ((i = 0; i < k; i++)); do
         use_slot "${q[$i]}"; st="$(state)"
+        spec="$(field SPEC "$st")"
         if [[ $((i + 1)) -lt $k ]]; then
-            discard_spec CANCELLED
-        else
+            if [[ -n "$spec" ]]; then discard_spec CANCELLED
+            else stop_local "$(gname)" "covered by train $k's pass"; fi
+        elif [[ -n "$spec" ]]; then
             # The landed train's speculative ref (AGAST #3988) has served its purpose.
-            spec="$(field SPEC "$st")"
-            if [[ -n "$spec" ]]; then
-                read -r _ spec _ <<<"$spec"
+            read -r _ spec _ <<<"$spec"
+            if [[ "$spec" != - ]]; then
                 g push -q origin --delete "refs/heads/$spec" 2>/dev/null \
                     || echo "warning: could not delete $spec on origin" >&2
             fi
@@ -741,13 +857,76 @@ cmd_land() {
     fi
 }
 
+# cmd_fail <log>: train k's gate failed (AGAST #4031).  Every train after it
+# sits on its tail, so their gates test a tree that holds the culprit: stop
+# them (DISCARDED lines) and restack their cars on train k-1's tail (main
+# for k = 1), as `build` would.  Train k's own cars come out, one HELD line
+# each: bisect them (SKILL.md step 6) with `build --next`, culprit-suspect
+# first out.  Trains 1..k-1 and their gates stay as they are.
+cmd_fail() {
+    local log="${1:?usage: $0 fail <log>}" lsha q i k=0 items=() b room new s
+    [[ -f "$log" ]] || die "no such gate log: $log"
+    lsha="$(sed -n 's/^SHA=//p' "$log" | head -1)"
+    [[ "$(sed -n 's/^EXIT=//p' "$log" | tail -1)" != 0 ]] || die "that gate passed: land it"
+    mapfile -t q < <(queue)
+    for i in "${!q[@]}"; do
+        use_slot "${q[$i]}"
+        if [[ -n "$lsha" && "$(field TIP "$(state)")" == "$lsha" ]]; then k=$((i + 1)); break; fi
+    done
+    [[ $k -gt 0 ]] || die "gate log is for no train's tip (${lsha:0:12})"
+    use_slot "${q[$((k - 1))]}"
+    while read -r b room new; do echo "HELD     $b ${room:0:12}"; done < <(field ITEM "$(state)")
+    for ((i = k; i < ${#q[@]}; i++)); do
+        use_slot "${q[$i]}"
+        while read -r b room new; do items+=("$b:$room"); done < <(field ITEM "$(state)")
+    done
+    if [[ ${#items[@]} -gt 0 ]]; then build_on "$((k - 1))" "${items[@]}"; return; fi
+    # Nothing behind it: just drop train k (and nothing else).
+    for ((i = k - 1; i < ${#q[@]}; i++)); do
+        use_slot "${q[$i]}"; discard_spec; rm -f "$(state)"
+    done
+    if [[ $k -gt 1 ]]; then printf '%s\n' "${q[@]:0:k-1}" > "$(qfile)"; else rm -f "$(qfile)"; fi
+}
+
+# cmd_pending: the dispatch rule (AGAST #4031; SKILL.md "Merge trains"), for
+# each train that needs a gate and has none yet (no GATED=, no SPEC=):
+#   GATE train <k> n=<cars> (<why>): <command>   gate it now
+#   WAIT train <k> n=<cars> <s>s                 more cars may come
+# A train gates at 8 cars, or once RZ_TRAIN_DEBOUNCE seconds pass after its
+# last car boarded (its BUILT=, stamped by each build); a state with no
+# BUILT= (built before #4031) gates now.
+cmd_pending() {
+    local q i st n built left now cmd
+    mapfile -t q < <(queue)
+    now="$(date +%s)"
+    for i in "${!q[@]}"; do
+        use_slot "${q[$i]}"; st="$(state)"
+        [[ "$(field GATE "$st")" == needed && -z "$(field SPEC "$st")" && -z "$(field GATED "$st")" ]] || continue
+        n="$(field ITEM "$st" | wc -l)"; built="$(field BUILT "$st")"
+        if [[ $i -eq 0 ]]; then cmd="train.sh gate"; else cmd="train.sh gate --next"; fi
+        if [[ $n -ge $MAX ]]; then
+            echo "GATE train $((i + 1)) n=$n (full): $cmd"
+        elif [[ ! "$built" =~ ^[0-9]+$ ]] || (( (left = built + DEBOUNCE - now) <= 0 )); then
+            echo "GATE train $((i + 1)) n=$n (no new car for ${DEBOUNCE}s): $cmd"
+        else
+            echo "WAIT train $((i + 1)) n=$n ${left}s"
+        fi
+    done
+}
+
 case "${1:-}" in
     build) shift; cmd_build "$@" ;;
     gate)  shift; cmd_gate "$@" ;;
     wait)  shift; cmd_wait "$@" ;;
-    discard) for s in $(queue); do use_slot "$s"; discard_spec; done ;;
+    discard)
+        for s in $(queue); do
+            use_slot "$s"
+            if [[ -z "${2:-}" || "$(field SPEC "$(state)" | cut -d' ' -f1)" == "$2" ]]; then discard_spec; fi
+        done ;;
+    fail)  shift; cmd_fail "$@" ;;
+    pending) cmd_pending ;;
     land)  shift; cmd_land "$@" ;;
     pkgs)  shift; cmd_pkgs "$@" ;;
     show)  cmd_show ;;
-    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [--next [<host>]] | wait <log> | discard | land [<log>] | show | pkgs list|test <base>" >&2; exit 2 ;;
+    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [--next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | land [<log>] | show | pkgs list|test <base>" >&2; exit 2 ;;
 esac
