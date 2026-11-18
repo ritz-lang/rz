@@ -6,7 +6,7 @@
 # Depends on PMM for page table allocation.
 
 import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_mark_region_used, pmm_get_total_pages }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_mark_region_used, pmm_get_total_pages, pmm_range_has_free }
 import io { rdmsr, wrmsr, CpuidResult, cpuid }
 
 # ============================================================================
@@ -140,17 +140,9 @@ pub fn vmm_init_physmap() -> i32
     let pdpt: u64 = vmm_alloc_low_table()
     if pdpt == 0
         return -1
-    var g: u64 = 0
-    while g < gbs
-        let pd: u64 = vmm_alloc_low_table()
-        if pd == 0
-            return -1
-        var e: u64 = 0
-        while e < 512
-            vmm_set_entry(pd, e, (g * ONE_GB + e * TWO_MB) | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | g_pte_nx)
-            e = e + 1
-        vmm_set_entry(pdpt, g, pd | PTE_PRESENT | PTE_WRITABLE)
-        g = g + 1
+    let chunks: i64 = vmm_physmap_fill(pdpt, gbs)
+    if chunks < 0
+        return -1
     vmm_set_entry(vmm_pml4_phys, PHYSMAP_PML4_INDEX, pdpt | PTE_PRESENT | PTE_WRITABLE)
     # Before the offset switch: its PDPT is written through the identity map.
     if vmm_init_mmio_window() != 0
@@ -158,10 +150,65 @@ pub fn vmm_init_physmap() -> i32
     g_physmap_offset = PHYSMAP_BASE
     g_tables_high = true
     prints("[vmm] physmap: ")
+    serial_print_dec(chunks as u64 * 2)
+    prints(" MiB of RAM in ")
     serial_print_dec(gbs)
     prints(" GiB at 0xFFFF800000000000\n")
     vmm_drop_identity_above_4g()
     return 0
+
+# Fill the physmap PDPT for GiBs [0, gbs): a write-back 2 MiB page for each
+# chunk that holds RAM (vmm_physmap_chunk_is_ram), and a PD only for a GiB
+# with one. Before #4209 every chunk up to the top of RAM was mapped WB,
+# the PCI hole below 4 GiB (framebuffer, LAPIC, IOAPIC, BARs) included: a
+# cacheable alias of device memory vmm_map_mmio maps UC. Returns the number
+# of chunks mapped, or -1 if a table can't be had.
+pub fn vmm_physmap_fill(pdpt: u64, gbs: u64) -> i64
+    var mapped: i64 = 0
+    var g: u64 = 0
+    while g < gbs
+        var pd: u64 = 0
+        var e: u64 = 0
+        while e < 512
+            let chunk: u64 = g * ONE_GB + e * TWO_MB
+            if vmm_physmap_chunk_is_ram(chunk)
+                if pd == 0
+                    pd = vmm_alloc_low_table()
+                    if pd == 0
+                        return -1
+                vmm_set_entry(pd, e, chunk | PTE_PRESENT | PTE_WRITABLE | PTE_HUGE | g_pte_nx)
+                mapped = mapped + 1
+            e = e + 1
+        if pd != 0
+            vmm_set_entry(pdpt, g, pd | PTE_PRESENT | PTE_WRITABLE)
+        g = g + 1
+    return mapped
+
+# Does the 2 MiB chunk at `chunk` hold RAM? Yes if pmm has a free page in
+# it. Else trust the boot identity map (still whole at this point) where it
+# knows better than pmm: above the first GiB the UEFI loader maps only
+# RAM-typed chunks (chunk_has_ram), loader data pmm never frees such as
+# BootInfo and the boot page tables included; in the first GiB both boot
+# maps cover everything, so only chunks below pmm's top of RAM count.
+fn vmm_physmap_chunk_is_ram(chunk: u64) -> bool
+    if pmm_range_has_free(chunk, TWO_MB)
+        return true
+    if not vmm_boot_identity_maps(chunk)
+        return false
+    return chunk >= ONE_GB or chunk < pmm_get_total_pages() * PAGE_SIZE
+
+# Does the boot identity map (PML4[0]) map the 2 MiB chunk at `chunk`?
+fn vmm_boot_identity_maps(chunk: u64) -> bool
+    let e0: u64 = vmm_get_entry(vmm_pml4_phys, 0)
+    if (e0 & PTE_PRESENT) == 0
+        return false
+    let pdpte: u64 = vmm_get_entry(e0 & PTE_ADDR_MASK, (chunk / ONE_GB) & 511)
+    if (pdpte & PTE_PRESENT) == 0
+        return false
+    if (pdpte & PTE_HUGE) != 0
+        return true
+    let pde: u64 = vmm_get_entry(pdpte & PTE_ADDR_MASK, (chunk / TWO_MB) & 511)
+    return (pde & PTE_PRESENT) != 0
 
 # The UEFI loader identity-maps all of RAM (AGAST #4183: it runs from, and
 # leaves BootInfo at, wherever firmware put them, 0x140000000 with -m 6G).
