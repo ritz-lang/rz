@@ -351,3 +351,25 @@ class TestThroughCompileFile:
         assert r.returncode != 0
         assert "main.ritz:4:5: `token.KIND`: there is no `module.item` access" in r.stderr, r.stderr
         assert "undefined" not in r.stderr, r.stderr
+
+
+class TestUnitIsOneType:
+    """`void` (a fn with no return type) and `()` are the same unit type
+    (AGAST #3594): prism's `RenderCommand.Nop => ()` next to unit-call arms."""
+
+    G = "fn g()\n    pass\n\n"
+
+    @pytest.mark.parametrize("arms", [
+        "        1 => g()\n        _ => ()\n",
+        "        1 => ()\n        _ => g()\n",
+    ], ids=["void-then-unit", "unit-then-void"])
+    def test_match_arms_void_and_unit_agree(self, arms):
+        src = self.G + "fn f(k: i32)\n    match k\n" + arms
+        assert types(src) == []
+
+    def test_unit_fn_tail_is_a_void_call(self):
+        assert types(self.G + "fn f() -> ()\n    g()\n") == []
+
+    def test_unit_still_differs_from_i32(self):
+        src = "fn f(k: i32) -> i32\n    match k\n        1 => 3\n        _ => ()\n"
+        assert any("different types" in e for e in types(src))

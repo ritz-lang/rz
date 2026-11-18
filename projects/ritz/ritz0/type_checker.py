@@ -1690,6 +1690,11 @@ class TypeChecker:
     def _is_void(ty: rast.Type) -> bool:
         return isinstance(ty, rast.NamedType) and ty.name == 'void' and not ty.args
 
+    @classmethod
+    def _is_unit(cls, ty: rast.Type) -> bool:
+        """`void` or `()`: the one unit type, spelled two ways."""
+        return cls._is_void(ty) or (isinstance(ty, rast.TupleType) and not ty.elements)
+
     def _check_discarded(self, expr: rast.Expr, actual: Optional[rast.Type]) -> None:
         """A whole array alone as a statement, or a void fn's tail: a `[N]T`
         local, an `a:& [N]T` param, an array field or `*p` of a `*[N]T`
@@ -2289,6 +2294,10 @@ class TypeChecker:
 
         # Nothing to judge against, and `null` may instantiate a type parameter
         if self._is_opaque(actual) or self._is_opaque(expected):
+            return True
+
+        # `void` (a fn with no return type) and `()` are one unit type (#3594)
+        if self._is_unit(actual) and self._is_unit(expected):
             return True
 
         # A float literal is whichever float its context wants
