@@ -41,4 +41,17 @@ got=$(printf 'only' | ./uniq)
 got=$(printf 'x\nx\nx\nx\n' | ./uniq)
 [[ "$got" == 'x' ]] || fail "all identical: expected 'x', got '$got'"
 
-echo "ok - 7 uniq scenarios"
+# --- argument parsing (ritzlib.argspec, AGAST #1490) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+got=$(printf 'a\na\nb\n' | ./uniq --count)
+[[ "$got" == $'2 a\n1 b' ]] || fail "--count: got '$got'"
+usage_error "uniq: too many arguments (at most 2): unexpected 'c'" ./uniq a b c
+usage_error "uniq: option '--count' doesn't accept a value" ./uniq --count=1
+
+echo "ok - 10 uniq scenarios"

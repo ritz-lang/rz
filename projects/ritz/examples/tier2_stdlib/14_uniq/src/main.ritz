@@ -11,7 +11,7 @@
 #   -i    ignore case when comparing (ASCII only)
 #
 # This example exercises:
-#   - Argument parsing with ritzlib.args
+#   - Argument parsing with ritzlib.argspec
 #   - Vec<u8> and Vec<LineBounds> from ritzlib
 #   - Line comparison with options
 #   - Count tracking and formatting
@@ -23,7 +23,11 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.gvec
-import ritzlib.args
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.span
+import ritzlib.argspec
 
 # ============================================================================
 # Options struct
@@ -171,35 +175,43 @@ fn process_uniq(buf: @Vec<u8>, lines: @Vec<LineBounds>, opts: *UniqOptions, out_
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Set up argument parser
-    var parser: ArgParser
-    args_init(@parser, c"uniq", c"Report or omit repeated lines")
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("uniq", "Report or omit repeated lines")
+    argspec_switch(@&spec, 'c', "count", "Prefix lines by the number of occurrences")
+    argspec_switch(@&spec, 'd', "repeated", "Only print duplicate lines")
+    argspec_switch(@&spec, 'u', "unique", "Only print unique lines")
+    argspec_switch(@&spec, 'i', "ignore-case", "Ignore case when comparing (ASCII only)")
+    # [INPUT [OUTPUT]] - both optional, at most 2
+    argspec_positionals(@&spec, "[INPUT [OUTPUT]]", "Input and output files (default: stdin/stdout)", 0, 2)
+    spec
 
-    # Define flags
-    args_flag(@parser, 99, c"count", c"Prefix lines by the number of occurrences")        # 'c'
-    args_flag(@parser, 100, c"repeated", c"Only print duplicate lines")                   # 'd'
-    args_flag(@parser, 117, c"unique", c"Only print unique lines")                        # 'u'
-    args_flag(@parser, 105, c"ignore-case", c"Ignore case when comparing (ASCII only)")   # 'i'
+# A usage error: argspec_parse says what was wrong; report it and exit 1.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
 
-    # Define positionals: [INPUT [OUTPUT]] - both optional, max 2
-    args_positional(@parser, c"[INPUT [OUTPUT]]", c"Input and output files (default: stdin/stdout)", 0, 2)
-
-    # Parse arguments
-    if args_parse(@parser, argc, argv) != 0
+# UniqOptions keeps its i32 flags; this turns a switch into one.
+fn switch_flag(p: @ParsedArgs, name: StrView) -> i32
+    if parsed_switch(p, name)
         return 1
+    0
 
-    # Populate UniqOptions from parsed flags
+fn uniq(p: @ParsedArgs) -> i32
+    # Populate UniqOptions from parsed switches
     var opts: UniqOptions
-    opts.count = args_get_flag(@parser, 99)        # 'c'
-    opts.duplicates = args_get_flag(@parser, 100)  # 'd'
-    opts.unique = args_get_flag(@parser, 117)      # 'u'
-    opts.ignore_case = args_get_flag(@parser, 105) # 'i'
+    opts.count = switch_flag(p, "c")
+    opts.duplicates = switch_flag(p, "d")
+    opts.unique = switch_flag(p, "u")
+    opts.ignore_case = switch_flag(p, "i")
+
+    # Positionals are views of argv strings, so NUL-terminated as sys_open
+    # needs; argspec_parse has already capped them at 2.
+    let positionals = parsed_positionals(p)
 
     # Open input file (or use stdin)
     var input_fd: i32 = STDIN
-    if parser.positional_count >= 1
-        let input_path: *u8 = args_get_positional(@parser, 0)
+    if positionals.len >= 1
+        let input_path: *u8 = strview_as_cstr_unchecked(span_get<StrView>(@positionals, 0))
         input_fd = sys_open(input_path, O_RDONLY)
         if input_fd < 0
             sys_write(STDERR, c"uniq: cannot open input file\n" as *u8, 29)
@@ -207,8 +219,8 @@ fn main(argc: i32, argv: **u8) -> i32
 
     # Open output file (or use stdout)
     var output_fd: i32 = STDOUT
-    if parser.positional_count >= 2
-        let output_path: *u8 = args_get_positional(@parser, 1)
+    if positionals.len >= 2
+        let output_path: *u8 = strview_as_cstr_unchecked(span_get<StrView>(@positionals, 1))
         # O_WRONLY | O_CREAT | O_TRUNC = 1 | 64 | 512 = 577
         # Mode 0644 = 420
         output_fd = sys_open3(output_path, O_WRONLY + O_CREAT + O_TRUNC, 420)
@@ -236,3 +248,20 @@ fn main(argc: i32, argv: **u8) -> i32
         sys_close(output_fd)
 
     return 0
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let status = uniq(@parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let args = args_tail(@all)
+    let status: i32 = match argspec_parse(@spec, args)
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status

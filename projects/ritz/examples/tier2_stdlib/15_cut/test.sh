@@ -23,4 +23,18 @@ expected=$(printf 'c\nf')
 got=$(printf '' | ./cut -d, -f1)
 [[ -z "$got" ]] || fail "empty: got '$got'"
 
-echo "ok - 4 cut scenarios"
+# --- argument parsing (ritzlib.argspec, AGAST #1490) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+got=$(printf 'a:b:c\n' | ./cut -d: -f2-)
+[[ "$got" == 'b:c' ]] || fail "-d: -f2-: got '$got'"
+usage_error "cut: option '-f' requires a value" ./cut -f
+usage_error "cut: only one of -f or -c may be specified" ./cut -f 1 -c 2
+usage_error "cut: you must specify a list of bytes, characters, or fields" ./cut
+
+echo "ok - 8 cut scenarios"

@@ -27,4 +27,17 @@ got=$(printf 'AB' | ./base64)
 got=$(printf 'ABC' | ./base64)
 [[ "$got" == 'QUJD' ]] || fail "encode 'ABC': got '$got'"
 
-echo "ok - 5 base64 scenarios"
+# --- argument parsing (ritzlib.argspec, AGAST #1490) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+got=$(printf 'hello world\n' | ./base64 -w 4)
+[[ "$got" == $'aGVs\nbG8g\nd29y\nbGQK' ]] || fail "-w 4: got '$got'"
+usage_error "base64: invalid number 'abc'" ./base64 -w abc
+usage_error "base64: too many arguments (at most 1): unexpected 'b'" ./base64 a b
+
+echo "ok - 8 base64 scenarios"

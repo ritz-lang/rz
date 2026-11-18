@@ -19,9 +19,12 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.args
 import ritzlib.gvec
 import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.argspec
 
 # ===== I/O with Vec<u8> =====
 
@@ -96,29 +99,35 @@ fn grep_file(path: *u8, pattern: *Span<u8>) -> i64
 
 # ===== Main =====
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Initialize argument parser
-    var parser: ArgParser
-    args_init(@parser, c"grep", c"Search for PATTERN in files")
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("grep", "Search for PATTERN in files")
+    # PATTERN is required, then any number of FILEs: min 1, no upper bound.
+    argspec_positionals(@&spec, "PATTERN [FILE...]", "Pattern and files to search", 1, ARGS_UNLIMITED)
+    spec
 
-    # Define positionals: PATTERN required, then optional FILE(s)
-    # min=1 (PATTERN required), max=-1 (unlimited files after)
-    args_positional(@parser, c"PATTERN [FILE...]", c"Pattern and files to search", 1, -1)
+# A usage error: argspec_parse says what was wrong; report it and exit 1.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
 
-    # Parse arguments
-    if args_parse(@parser, argc, argv) != 0
+# Search FILE (a positional, so a view of an argv string: NUL-terminated, as
+# sys_open needs).  Returns 1 when the file couldn't be read.
+fn grep_path(path: StrView, pattern: *Span<u8>, total: @&i64) -> i32
+    let matches: i64 = grep_file(strview_as_cstr_unchecked(path), pattern)
+    if matches < 0
         return 1
+    *total = *total + matches
+    0
 
-    # Get pattern from parsed arguments as a Span
-    let pattern_str: *u8 = args_get_positional(@parser, 0)
-    var pattern: Span<u8> = span_from_cstr(pattern_str)
+fn grep(p: @ParsedArgs) -> i32
+    # argspec_parse has checked that PATTERN is there (min 1).
+    let positionals = parsed_positionals(p)
+    var pattern: Span<u8> = span_from_strview(span_get<StrView>(@positionals, 0))
 
     var total_matches: i64 = 0
     var had_error: i32 = 0
 
-    let num_files: i32 = parser.positional_count - 1  # Subtract 1 for PATTERN
-
-    if num_files == 0
+    if positionals.len == 1
         # No files - read from stdin
         let matches: i64 = grep_fd(STDIN, @pattern)
         if matches < 0
@@ -126,14 +135,12 @@ fn main(argc: i32, argv: **u8) -> i32
         else
             total_matches += matches
     else
-        # Process each file
-        for i in 0..num_files
-            let path: *u8 = args_get_positional(@parser, i + 1)  # +1 to skip PATTERN
-            let matches: i64 = grep_file(path, @pattern)
-            if matches < 0
+        # Each FILE in turn; positional 0 is PATTERN.
+        var i: i64 = 1
+        while i < positionals.len
+            if grep_path(span_get<StrView>(@positionals, i), @pattern, @&total_matches) != 0
                 had_error = 1
-            else
-                total_matches += matches
+            i += 1
 
     # Return 0 if any matches, 1 if no matches, 2 on error
     if had_error == 1
@@ -141,3 +148,20 @@ fn main(argc: i32, argv: **u8) -> i32
     if total_matches == 0
         return 1
     0
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let status = grep(@parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let args = args_tail(@all)
+    let status: i32 = match argspec_parse(@spec, args)
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status

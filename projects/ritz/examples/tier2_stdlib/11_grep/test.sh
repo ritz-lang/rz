@@ -30,4 +30,17 @@ expected=$(printf 'a\nb\nc')
 got=$(printf 'only line\n' | ./grep 'only')
 [[ "$got" == 'only line' ]] || fail "single-line match: got '$got'"
 
-echo "ok - 4 grep scenarios"
+# --- argument parsing (ritzlib.argspec, AGAST #1490) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+usage_error "grep: missing required argument 'PATTERN [FILE...]'" ./grep
+usage_error "grep: unknown option '-x'" ./grep -x foo
+got=$(printf 'a\n-x\n' | ./grep -- -x)
+[[ "$got" == '-x' ]] || fail "-- ends options: got '$got'"
+
+echo "ok - 7 grep scenarios"

@@ -23,4 +23,17 @@ got=$(printf 'A' | ./xxd)
 [[ "$got" == *"41"* ]] || fail "expected 0x41 for 'A', got: $got"
 [[ "$got" == *"A"*  ]] || fail "expected 'A' in ASCII column, got: $got"
 
-echo "ok - 3 xxd scenarios"
+# --- argument parsing (ritzlib.argspec, AGAST #1490) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+got=$(printf 'abcd' | ./xxd -c 2 -g 1)
+[[ "$got" == $'00000000: 61 62  ab\n00000002: 63 64  cd' ]] || fail "-c 2 -g 1: got '$got'"
+usage_error "xxd: invalid number 'abc'" ./xxd -c abc
+usage_error "xxd: invalid number 'x'" ./xxd -g x
+
+echo "ok - 6 xxd scenarios"
