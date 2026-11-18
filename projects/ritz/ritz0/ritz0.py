@@ -273,7 +273,8 @@ def _resolve(ctx: _Compile) -> bool:
     # Filter out items that don't match target_os
     # This must happen after import resolution but before name resolution
     # so that name resolution doesn't see excluded items
-    ctx.module = _filter_by_target_os(module, ctx.target_os)
+    ctx.module = resolver.resolve_struct_variants(
+        _filter_by_target_os(module, ctx.target_os))
     return True
 
 
