@@ -14,4 +14,22 @@ echo "$OUTPUT" | grep -q "v=inherited" || { echo "FAIL: environment not inherite
 # Test 3: verify invalid interval is rejected
 ./watch -n 0 echo test 2>&1 | grep -q "at least 1 second" || { echo "FAIL: interval validation"; exit 1; }
 
+
+# --- argument parsing (ritzlib.argspec, AGAST #1492) ---
+fail() { echo "FAIL: $*"; exit 1; }
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+
+OUTPUT=$(timeout 1 ./watch --interval=1 echo a b 2>&1 || true)
+echo "$OUTPUT" | grep -q "Every 1s: echo a b" || fail "--interval=1 with command args"
+usage_error "watch: invalid number 'abc'" ./watch -n abc echo hi
+usage_error "watch: missing required argument 'COMMAND'" ./watch
+usage_error "watch: missing required argument 'COMMAND'" ./watch -n 1
+usage_error "watch: unknown option '-z'" ./watch -z echo
+
 echo "PASS"

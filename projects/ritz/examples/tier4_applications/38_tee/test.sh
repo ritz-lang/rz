@@ -102,4 +102,24 @@ else
     exit 1
 fi
 
+
+# --- argument parsing (ritzlib.argspec, AGAST #1492) ---
+fail() { echo "FAIL: $*"; exit 1; }
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+
+echo -n "Test 9 (argument parsing): "
+"$TEE" -h | grep -q "^Usage: tee" || fail "-h"
+"$TEE" --help | grep -q -- "--append" || fail "--help lists --append"
+echo one > "$TMPDIR/t9.txt"
+echo two | "$TEE" --append "$TMPDIR/t9.txt" >/dev/null
+[[ "$(cat "$TMPDIR/t9.txt")" == $'one\ntwo' ]] || fail "--append"
+usage_error "tee: unknown option '-z'" "$TEE" -z
+echo "PASS"
+
 echo "All tests passed!"

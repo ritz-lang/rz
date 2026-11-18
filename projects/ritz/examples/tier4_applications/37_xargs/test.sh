@@ -132,4 +132,25 @@ else
     exit 1
 fi
 
+
+# --- argument parsing (ritzlib.argspec, AGAST #1492) ---
+fail() { echo "FAIL: $*"; exit 1; }
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || fail "$*: expected exit 1, got $rc"
+  [[ "$err" == "$want" ]] || fail "$*: expected stderr '$want', got '$err'"
+}
+
+echo -n "Test 12 (argument parsing): "
+[[ $(echo "a b c" | "$XARGS" --max-args=2 echo | wc -l) -eq 2 ]] || fail "--max-args=2"
+[[ $(echo "a b c" | "$XARGS" --max-args 1 echo | wc -l) -eq 3 ]] || fail "--max-args 1"
+# echo's own -n reaches echo: '--' ends xargs' options
+[[ $(echo "a" | "$XARGS" -- echo -n) == "a" ]] || fail "-- echo -n"
+usage_error "xargs: invalid number 'abc'" "$XARGS" -n abc echo
+usage_error "xargs: option '-n' requires a value" "$XARGS" -n
+usage_error "xargs: unknown option '-z'" "$XARGS" -z echo
+echo "PASS"
+
 echo "All tests passed!"

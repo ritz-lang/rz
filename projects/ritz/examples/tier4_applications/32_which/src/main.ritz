@@ -21,7 +21,9 @@ import ritzlib.strview
 import ritzlib.option
 import ritzlib.span
 import ritzlib.os.env
-import ritzlib.args
+import ritzlib.gvec
+import ritzlib.result
+import ritzlib.argspec
 
 # ============================================================================
 # Options
@@ -113,30 +115,48 @@ fn search_path(name: *u8, opts: *WhichOptions) -> i32
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    # Initialize argument parser
-    var parser: ArgParser
-    args_init(@parser, c"which", c"Locate a command")
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("which", "Locate a command")
+    argspec_switch(@&spec, 'a', "all", "Print all matching executables in PATH")
+    argspec_positionals(@&spec, "NAME", "Command name(s) to locate", 1, ARGS_UNLIMITED)
+    spec
 
-    # Define flags
-    args_flag(@parser, 97, c"all", c"Print all matching executables in PATH")  # 'a'
+# "which: <message>" on stderr; exit status 1, as before the argspec port.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
 
-    # Define positional arguments (NAME..., at least 1)
-    args_positional(@parser, c"NAME", c"Command name(s) to locate", 1, -1)
+# Positional i as a C string.  A positional is always a whole argv entry, so
+# its view ends at argv's NUL and .ptr is a valid C string.
+fn positional_cstr(pos: @Span<StrView>, i: i64) -> *u8
+    let v: StrView = span_get<StrView>(pos, i)
+    v.ptr
 
-    # Parse arguments
-    if args_parse(@parser, argc, argv) != 0
-        return 1
-
-    # Retrieve flag values
+fn which_all(p: @ParsedArgs) -> i32
     var opts: WhichOptions
-    opts.show_all = args_get_flag(@parser, 97) as u8  # 'a'
+    opts.show_all = parsed_switch(p, "all") as u8
 
     # Search for each command
     var exit_code: i32 = 0
-    for i in 0..parser.positional_count
-        let name: *u8 = args_get_positional(@parser, i)
-        if search_path(name, @opts) != 0
+    let pos = parsed_positionals(p)
+    for i in 0..pos.len
+        if search_path(positional_cstr(@pos, i), @opts) != 0
             exit_code = 1
 
     return exit_code
+
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let status = which_all(@parsed)
+    parsed_drop(@&parsed)
+    status
+
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let status: i32 = match argspec_parse(@spec, args_tail(@all))
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status
