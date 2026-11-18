@@ -24,6 +24,14 @@
 # visits, refuses an inexact source there, and annotates a value whose exact
 # source is unsigned (float_slot_note).  The emitter's int_into_float_slot
 # only reads that annotation to pick `uitofp` over `sitofp`.
+#
+# A POINTER IN A FLOAT SLOT (AGAST #3626, on Sema since #3892).  LARB R1 / R4,
+# LANGUAGE_SPEC §7.5: nothing but a number lands in an f32 / f64.  Sema refuses
+# a value sema_bool_kind is sure is a pointer, in ritz0's words ("cannot use a
+# pointer as a float", _reject_pointer_into_float), at the value: in every
+# slot float_slot_check sees, and in an if / match with no float slot whose
+# arms Sema types as float (float_arm_note), as one beside a float arm.
+# ritz0/test_let_float_pointer.py feeds the same programs to all three.
 
 import ritzlib.sys
 import ritzlib.io
@@ -35,9 +43,8 @@ import ast_helpers
 import emitter_core
 import narrowing
 import bool_check
-import bool_kind
-import diag
 import sema
+import sema_type   # sema_expr_ty: what a pointer points at
 
 # Is `e` built from integer literals alone (`4000000000`, `-3`, `2 * 3`)?
 # ritz0's _int_literal_only.
@@ -89,7 +96,7 @@ pub fn float_slot_unsigned(value: *Expr) -> i32
 # `value` lands in an f32 / f64 slot of type `dst` (a Sema check, AGAST #3510):
 # refuse an inexact integer source (see the header), and note an unsigned one.
 pub fn float_slot_check(sm: *Sema, value: *Expr, dst: i32)
-    if value == null or fs_literal_only(value) == 1
+    if value == null or float_slot_pointer(sm, value, dst) == 1 or fs_literal_only(value) == 1
         return
     float_slot_judge(sm, value, narrow_sema_src_type(sm, value), dst)
 
@@ -152,27 +159,97 @@ pub fn int_into_float_slot(s: *EmitterState, val_reg: i32, value: *Expr, dst_ty:
     emit_str(s, c"\n")
     r
 
-# AGAST #3626, LARB R1 / R4, LANGUAGE_SPEC §7.5: nothing but a number lands
-# in an f32 / f64 slot.  `let a: f64 = p` and an if / match arm `p` next to
-# `1.5` are refused at the pointer value, in ritz0's words
-# (_reject_pointer_into_float; ritz0/test_let_float_pointer.py feeds the same
-# programs to both).  Silent unless bool_kind is sure the value is a pointer.
-# Returns 1 when `value` is a pointer, reported and counted; 0 otherwise.
-# Still on the emitter: an arm next to a float arm has no slot Sema sees (#3892).
-pub fn pointer_into_float(s: *EmitterState, value: *Expr) -> i32
-    if value == null or bool_kind(s, value) != BK_PTR
+# ---- A pointer into a float (AGAST #3626, #3892; see the header) ----
+
+# The pointer values already reported: a pointer arm of a nested if in a float
+# slot is the slot's and its if's, and is said once.
+var g_fs_ptr_said: HashMapI64
+var g_fs_ptr_said_ready: i32 = 0
+
+# 1 if pointer `value` was said already (or is another rule's to say), else
+# 0 and it is now.
+fn fs_pointer_said(value: *Expr) -> i32
+    if g_fs_ptr_said_ready == 0
+        g_fs_ptr_said = hashmap_i64_with_cap(64)
+        g_fs_ptr_said_ready = 1
+    if hashmap_i64_get(@g_fs_ptr_said, value as i64) != 0
+        return 1
+    hashmap_i64_insert(@&g_fs_ptr_said, value as i64, 1)
+    0
+
+# Report `value`, a pointer landing in a float, once.
+pub fn float_slot_pointer_at(sm: *Sema, value: *Expr)
+    if fs_pointer_said(value) == 0 and bool_sema_report_at(sm, fs_report_at(value)) == 1
+        eprints_cstr(c"cannot use a pointer as a float\n")
+
+# 1 if `value`, landing in a float slot of type `dst`, is surely a pointer:
+# reported, unless it points at a `dst`.  `r` (`r: *f64` / `@f64`) in an f64
+# slot is ref_check's "a reference or pointer doesn't fit a by-value slot:
+# write `*` to read through it", as in ritz0 (test_ref_into_value.py): noted
+# as said, so its if / match (float_arms_settle) leaves it to ref_check too.
+pub fn float_slot_pointer(sm: *Sema, value: *Expr, dst: i32) -> i32
+    if sema_bool_kind(sm, value) != BK_PTR
         return 0
-    let at: *Expr = fs_report_at(value)
-    let f: *FnDef = emitter_current_fn()
-    s.error_count = s.error_count + 1
-    emit_str(s, c"  ; ERROR: pointer into a float slot (AGAST #3626)\n")
-    var file: *u8 = null
-    if f != null
-        file = fn_source_file(f)
-    if file == null
-        file = emitter_source_file()
-    diag_error(file, at.span, c"cannot use a pointer as a float")
+    var t: SemaTy
+    var pointee: i32 = TYPE_VOID
+    let k: i32 = sema_expr_ty(sm, value, @t)
+    if k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF
+        pointee = t.pointee
+    float_slot_pointer_to(sm, value, pointee, dst)
     1
+
+# float_slot_pointer for a `value` known to point at `pointee` (TYPE_VOID if
+# unknown).
+pub fn float_slot_pointer_to(sm: *Sema, value: *Expr, pointee: i32, dst: i32)
+    if pointee == dst
+        fs_pointer_said(value)
+    else
+        float_slot_pointer_at(sm, value)
+
+# An if / match's arms, judged in each arm's scope as the walk leaves it
+# (float_arm_note), then settled once all are (float_arms_settle): the if /
+# matches with a float arm, and the arm values that are pointers.
+var g_fs_float_owner: HashMapI64   # EXPR_IF / EXPR_MATCH -> 1: an arm is a float
+var g_fs_ptr_arm: HashMapI64       # arm value -> 1: a pointer
+var g_fs_arms_ready: i32 = 0
+
+fn fs_arms_init()
+    if g_fs_arms_ready == 0
+        g_fs_float_owner = hashmap_i64_with_cap(64)
+        g_fs_ptr_arm = hashmap_i64_with_cap(64)
+        g_fs_arms_ready = 1
+
+# The walk just left `arm` of `owner` (an EXPR_IF / EXPR_MATCH), with the
+# arm's bindings and `let`s still in scope.  A nested if / match arm is a
+# float when one of its own arms is (it was settled first); it is never a
+# pointer arm here: its own pointer arm is its own.
+pub fn float_arm_note(sm: *Sema, owner: *Expr, arm: *MatchArm)
+    if owner == null or arm.is_pass != 0 or arm.body == null
+        return
+    fs_arms_init()
+    let v: *Expr = arm.body
+    if v.kind == EXPR_IF or v.kind == EXPR_MATCH
+        if hashmap_i64_get(@g_fs_float_owner, v as i64) != 0
+            hashmap_i64_insert(@&g_fs_float_owner, owner as i64, 1)
+        return
+    let k: i32 = sema_bool_kind(sm, v)
+    if k == BK_FLOAT
+        hashmap_i64_insert(@&g_fs_float_owner, owner as i64, 1)
+    else if k == BK_PTR
+        hashmap_i64_insert(@&g_fs_ptr_arm, v as i64, 1)
+
+# Every arm of `owner` was noted: with a float arm, each pointer arm, on
+# either side of it, is refused (as LARB R43 refuses an integer arm).
+pub fn float_arms_settle(sm: *Sema, owner: *Expr, arms: *MatchArm)
+    if owner == null or g_fs_arms_ready == 0
+        return
+    if hashmap_i64_get(@g_fs_float_owner, owner as i64) == 0
+        return
+    var arm: *MatchArm = arms
+    while arm != null
+        if arm.is_pass == 0 and arm.body != null and hashmap_i64_get(@g_fs_ptr_arm, arm.body as i64) != 0
+            float_slot_pointer_at(sm, arm.body)
+        arm = arm.next
 
 fn c_float_name(t: i32) -> *u8
     if t == TYPE_F32

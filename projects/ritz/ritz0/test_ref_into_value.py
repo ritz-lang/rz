@@ -84,6 +84,9 @@ SHAPES = {
     "i64_let": "fn f(r: *i64) -> i64\n    let n: i64 = ^r\n    n\n",
     "i64_return": "fn f(r: @i64) -> i64\n    return ^r\n",
     "float_return": "fn f(r: @f64) -> f64\n    return ^r\n",
+    # AGAST #3892: in an f64 slot's arm beside a float, still this rule's,
+    # not "cannot use a pointer as a float" (test_let_float_pointer.py).
+    "float_slot_arm": "fn f(r: @f64, b: i32) -> f64\n    let d: f64 = if b > 0 then ^r else 1.5\n    d\n",
     "inferred_reference": "fn f(d: C) -> i32\n    let p = @d\n    val(^p)\n",
     "inferred_scalar": "fn v(n: i32) -> i32\n    n\n\nfn f(n: i32) -> i32\n    let p = @n\n    v(^p)\n",
     "global_pointer": "var G: *C = null\n\nfn f() -> i32\n    val(^G)\n",

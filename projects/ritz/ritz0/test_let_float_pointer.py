@@ -62,11 +62,51 @@ FORMS = {
                     "    return a as i32\n\n"
                     "fn main() -> i32\n"
                     "    return f(1)\n", 3, 41),
+    # AGAST #3892: no float slot, but an arm is a float: the pointer arm is
+    # refused on either side of it (ritz1 called the pointer-first form an
+    # "integer" arm), as LARB R43 refuses an integer arm.
+    "noslot_if_else": ("fn f(n: i64) -> i32\n"
+                       "    let p: *u8 = c\"x\"\n"
+                       "    let a = if n > 2 then 1.5 else p\n"
+                       "    return a as i32\n\n"
+                       "fn main() -> i32\n"
+                       "    return f(1)\n", 3, 36),
+    "noslot_if_then": ("fn f(n: i64) -> i32\n"
+                       "    let p: *u8 = c\"x\"\n"
+                       "    let a = if n > 2 then p else 1.5\n"
+                       "    return a as i32\n\n"
+                       "fn main() -> i32\n"
+                       "    return f(1)\n", 3, 27),
+    # AGAST #3892: an arm's own pointer `let`, its tail, with no float arm
+    # beside it: read off the `let`, which is out of scope at the slot.
+    "arm_block_local": ("fn f(n: i64) -> i32\n"
+                        "    let a: f64 = match n\n"
+                        "        0 =>\n"
+                        "            let q: *u8 = c\"x\"\n"
+                        "            q\n"
+                        "        _ => 2\n"
+                        "    return a as i32\n\n"
+                        "fn main() -> i32\n"
+                        "    return f(1)\n", 5, 13),
+    # AGAST #3892: every float slot Sema visits, not only a let's: a return.
+    "return_slot": ("fn g(p: *u8) -> f64\n"
+                    "    p\n\n"
+                    "fn main() -> i32\n"
+                    "    return g(c\"x\") as i32\n", 2, 5),
 }
 
 # ritz1 and ritz1_selfhosted: forms with no located refusal yet (none since
 # AGAST #3626).
 RITZ1_GAPS = {}
+
+# ritz0: forms it doesn't refuse yet.  Each compiles (rc 0) to IR clang
+# rejects (`phi i8* [..], [0x3ff8...]`, `ret double %p`).
+RITZ0_GAPS = {
+    "arm_block_local": "ritz0 locates it at 4:1, not at the `q` (AGAST #4199)",
+    "noslot_if_else": "ritz0 merges an unannotated if at its then-arm's type (AGAST #4199)",
+    "noslot_if_then": "ritz0 merges an unannotated if at its then-arm's type (AGAST #4199)",
+    "return_slot": "ritz0 checks a let / var / arm merge, not a return (AGAST #4199)",
+}
 
 
 def _compile(compiler, tmp_path, source):
@@ -95,8 +135,16 @@ def _assert_refused(compiler, tmp_path, name):
     assert not (tmp_path / "bad.ll").exists(), f"{compiler} wrote IR for {name}"
 
 
+def _ritz0_params():
+    for name in FORMS:
+        marks = ()
+        if name in RITZ0_GAPS:
+            marks = pytest.mark.xfail(strict=True, reason=RITZ0_GAPS[name])
+        yield pytest.param(name, id=name, marks=marks)
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("name", FORMS)
+@pytest.mark.parametrize("name", list(_ritz0_params()))
 def test_ritz0_refuses_pointer_into_float(tmp_path, name):
     _assert_refused("ritz0", tmp_path, name)
 
