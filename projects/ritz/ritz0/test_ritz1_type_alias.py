@@ -186,8 +186,44 @@ pub fn main() -> i32
     return twice(make_code(1)) + 1
 """
 
+# AGAST #3030: an alias of a tuple type is the tuple's struct.  The alias
+# makes the driver parse twice, and the second pass must declare the tuple
+# struct again (it read "`p` is a `tuple_i32_i32`, which names no declared
+# struct" / "unhandled EXPR_MEMBER").
+TUPLE_ALIAS = """\
+type Mixed = (i32, i32)
+
+fn g(p: Mixed) -> i32
+    return p.0 + p.1
+
+fn mk() -> Mixed
+    return (2, 0)
+
+pub fn main() -> i32
+    let m: Mixed = (1, 1)
+    var n: Mixed = mk()
+    return g(m) + n.0 - 1
+"""
+
+TUPLES_MODULE = """\
+pub type Two = (i32, i64)
+
+pub fn two(a: i32) -> Two
+    return (a, 1)
+"""
+
+IMPORTED_TUPLE_ALIAS = """\
+import tuples
+
+pub fn main() -> i32
+    let t: Two = two(2)
+    return t.0 + t.1 as i32
+"""
+
 PROGRAMS = {
     "repro": (REPRO, {}),
+    "tuple_alias": (TUPLE_ALIAS, {}),
+    "imported_tuple_alias": (IMPORTED_TUPLE_ALIAS, {"tuples.ritz": TUPLES_MODULE}),
     "pub_alias": (PUB_ALIAS, {}),
     "struct_alias": (STRUCT_ALIAS, {}),
     "pointer_alias": (POINTER_ALIAS, {}),

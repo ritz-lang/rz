@@ -255,10 +255,9 @@ fn make_mixed(a: i32) -> (Tracked, i32)
 """
 
 # Tuple rows ritz1 still misses since it types every tuple (AGAST #3005): a
-# pointer or array element (#3024), a tuple type alias (#3030), a discarded
-# tuple temporary's elements (#3031).
+# pointer or array element (#3024), a discarded tuple temporary's elements
+# (#3031).
 TUPLE_PTR_ELEM = {"ritz1": 3024, "ritz1_selfhosted": 3024}
-TUPLE_ALIAS = {"ritz1": 3030, "ritz1_selfhosted": 3030}
 TUPLE_TEMP_GAP = {"ritz1": 3031, "ritz1_selfhosted": 3031}
 
 # name -> (program body, expected exit status, {compiler: gap ticket}).
@@ -2607,7 +2606,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, TUPLE_ALIAS),
+""", 1, {}),
 
     # The emitter types the binding through the alias, so `x` drops it.
     "tuple_element_alias_binding": (TUPLES + SLOT + """\
@@ -2620,7 +2619,7 @@ fn f()
 pub fn main() -> i32
     f()
     return DROPS
-""", 1, TUPLE_ALIAS),
+""", 1, {}),
 
     # Gaps next to #2244.
     "tuple_destructure_moved": (TUPLES + SLOT + """\
