@@ -392,7 +392,12 @@ class NameResolver:
             # Don't check field names - need type info
 
         elif isinstance(expr, rast.MethodCall):
-            self._check_expr(expr.expr, scope)
+            # `Span.empty()`: the built-in Span as a receiver names the type
+            # (AGAST #3597), as the emitter's _builtin_type_receiver takes it.
+            # Only as a receiver: a bare `Span` is no value.  (A local named
+            # `Span` is defined either way.)
+            if not (isinstance(expr.expr, rast.Ident) and expr.expr.name == 'Span'):
+                self._check_expr(expr.expr, scope)
             for arg in expr.args:
                 self._check_expr(arg, scope)
 
