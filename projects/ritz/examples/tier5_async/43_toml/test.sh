@@ -64,4 +64,16 @@ name = "mydb"' | $TOML -k > "$T"/toml_out.txt
 grep -q 'server.host' "$T"/toml_out.txt || { echo "FAIL: multiple sections"; exit 1; }
 grep -q 'database.name' "$T"/toml_out.txt || { echo "FAIL: multiple sections (2)"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+[ "$(printf 'name = "x"\n' | $TOML --get=name)" = "x" ] || { echo "FAIL: --get=name"; exit 1; }
+usage_error "toml: option '-g' requires a value" $TOML -g
+usage_error "toml: too many arguments (at most 1): unexpected 'b'" $TOML a b
+
 echo "All toml tests passed!"

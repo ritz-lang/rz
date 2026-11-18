@@ -60,4 +60,15 @@ echo "$result" | grep -c "<p>" | grep -q "2" || { echo "FAIL: paragraphs"; exit 
 result=$(printf "<script>alert(1)</script>\n" | $MD)
 echo "$result" | grep -q "&lt;script&gt;" || { echo "FAIL: html escape"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+usage_error "md: too many arguments (at most 1): unexpected 'b'" $MD a b
+usage_error "md: unknown option '-x'" $MD -x
+
 echo "All md tests passed!"

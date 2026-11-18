@@ -43,4 +43,18 @@ echo 'a;b;c
 1;2;3' | $CSV -d ';' > "$T"/csv_out.txt
 grep -q '1' "$T"/csv_out.txt || { echo "FAIL: custom delimiter"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+printf 'x;y\n1;2\n' > "$T"/args.csv
+[ "$($CSV --delimiter=';' -f 2 "$T"/args.csv)" = $'y\n2' ] || { echo "FAIL: --delimiter=; -f 2 FILE"; exit 1; }
+usage_error "csv: option '-d' requires a value" $CSV -d
+usage_error "csv: too many arguments (at most 1): unexpected 'b'" $CSV a b
+usage_error "csv: unknown option '-q'" $CSV -q
+
 echo "All csv tests passed!"

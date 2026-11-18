@@ -54,4 +54,18 @@ grep -q 'hello' "$T"/json_out.txt || { echo "FAIL: escapes"; exit 1; }
 echo '{"empty_obj":{},"empty_arr":[]}' | $JSON > "$T"/json_out.txt
 grep -q '{}' "$T"/json_out.txt || { echo "FAIL: empty structures"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+printf '{"a": [1, {"b": null}]}' > "$T"/args.json
+[ "$($JSON --compact "$T"/args.json)" = '{"a":[1,{"b":null}]}' ] || { echo "FAIL: --compact FILE"; exit 1; }
+[ -z "$($JSON -cv "$T"/args.json)" ] || { echo "FAIL: -cv prints nothing"; exit 1; }
+usage_error "json: too many arguments (at most 1): unexpected 'b'" $JSON a b
+usage_error "json: unknown option '-z'" $JSON -z
+
 echo "All json tests passed!"

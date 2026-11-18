@@ -30,7 +30,12 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.args
+import ritzlib.gvec
+import ritzlib.span
+import ritzlib.option
+import ritzlib.result
+import ritzlib.strview
+import ritzlib.argspec
 
 # ============================================================================
 # Regex matcher using recursive backtracking
@@ -349,36 +354,59 @@ fn process_stream(pattern: *u8, fd: i32) -> i32
 # Main
 # ============================================================================
 
-fn main(argc: i32, argv: **u8) -> i32
-    var argparser: ArgParser
-    args_init(@argparser, c"regex", c"Simple regex matcher")
-    args_positional(@argparser, c"PATTERN", c"Regular expression pattern", 1, 1)
-    args_positional(@argparser, c"FILE", c"File to search (stdin if omitted)", 0, 1)
+# argspec has one run of positionals, so PATTERN and the optional FILE are
+# one run of 1 to 2, named for both in the help.
+fn build_spec() -> ArgSpec
+    var spec = argspec_new("regex", "Simple regex matcher")
+    argspec_positionals(@&spec, "PATTERN [FILE]", "Regular expression pattern, then the file to search (stdin if omitted)", 1, 2)
+    spec
 
-    if args_parse(@argparser, argc, argv) != 0
+# A usage error: argspec_parse says what was wrong; report it and exit 1.
+fn usage_error(spec: @ArgSpec, e: ArgError) -> i32
+    arg_error_print(spec, @e)
+    1
+
+# 0 if anything matched, 1 if not, as grep does.
+fn match_status(found: i32) -> i32
+    if found != 0
+        return 0
+    1
+
+# Both positionals are views of argv strings, so NUL-terminated, as
+# process_stream and sys_open need.
+fn regex(pattern: *u8, file: Option<StrView>) -> i32
+    match file
+        Some(f) => regex_path(pattern, f)
+        None => match_status(process_stream(pattern, 0))
+
+fn regex_path(pattern: *u8, file: StrView) -> i32
+    let path: *u8 = strview_as_cstr_unchecked(file)
+    let fd: i32 = sys_open(path, 0)
+    if fd < 0
+        eprints("regex: cannot open file: ")
+        eprints_cstr(path)
+        eprints("\n")
         return 1
+    let result = match_status(process_stream(pattern, fd))
+    sys_close(fd)
+    result
 
-    let pattern: *u8 = args_get_positional(@argparser, 0)
+# argspec_parse has checked that PATTERN is there (min 1).
+fn run(p: ParsedArgs) -> i32
+    var parsed = p
+    let positionals = parsed_positionals(@parsed)
+    let pattern: *u8 = strview_as_cstr_unchecked(span_get<StrView>(@positionals, 0))
+    let status = regex(pattern, parsed_positional(@parsed, 1))
+    parsed_drop(@&parsed)
+    status
 
-    var result: i32 = 0
-
-    if argparser.positional_count > 1
-        let path: *u8 = args_get_positional(@argparser, 1)
-        let fd: i32 = sys_open(path, 0)
-        if fd < 0
-            eprints("regex: cannot open file: ")
-            eprints_cstr(path)
-            eprints("\n")
-            return 1
-        if process_stream(pattern, fd) != 0
-            result = 0
-        else
-            result = 1
-        sys_close(fd)
-    else
-        if process_stream(pattern, 0) != 0
-            result = 0
-        else
-            result = 1
-
-    return result
+fn main(argc: i32, argv: **u8) -> i32
+    var all = args_from_argv(argc, argv)
+    var spec = build_spec()
+    let args = args_tail(@all)
+    let status: i32 = match argspec_parse(@spec, args)
+        Ok(p) => run(p)
+        Err(e) => usage_error(@spec, e)
+    argspec_drop(@&spec)
+    vec_drop<StrView>(@&all)
+    status

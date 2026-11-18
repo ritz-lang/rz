@@ -50,4 +50,17 @@ echo "$result" | grep -q "fn foo()$" || { echo "FAIL: write mode"; exit 1; }
 result=$(printf "fn foo()\n  x\n" | $FMT -i 2)
 echo "$result" | grep -q "^  x" || { echo "FAIL: custom indent"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+[ "$(printf 'fn main() -> i32\n  return 0\n' | $FMT --indent=2)" = $'fn main() -> i32\n  return 0' ] || { echo "FAIL: --indent=2"; exit 1; }
+usage_error "ritzfmt: invalid number 'abc'" $FMT -i abc
+usage_error "ritzfmt: option '-i' requires a value" $FMT -i
+usage_error "ritzfmt: too many arguments (at most 1): unexpected 'b'" $FMT a b
+
 echo "All ritzfmt tests passed!"

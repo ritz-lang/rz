@@ -23,4 +23,17 @@
 # Test larger numbers
 [ "$(./calc '1000 + 2000')" = "3000" ] || { echo "FAIL: large nums"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+usage_error "calc: missing required argument 'EXPRESSION'" ./calc
+usage_error "calc: too many arguments (at most 1): unexpected 'extra'" ./calc '1 + 2' extra
+usage_error "calc: unknown option '-x'" ./calc -x
+[ "$(./calc -- '5 * 3')" = "15" ] || { echo "FAIL: -- EXPRESSION"; exit 1; }
+
 echo "All calc tests passed!"

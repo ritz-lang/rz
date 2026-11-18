@@ -68,4 +68,15 @@ test "$result" = "(1 2 3)" || { echo "FAIL: cons = $result, expected (1 2 3)"; e
 result=$(echo "(null? '())" | $LISP)
 test "$result" = "#t" || { echo "FAIL: null? = $result, expected #t"; exit 1; }
 
+# --- argument parsing (ritzlib.argspec, AGAST #1493) ---
+# usage_error WANT CMD...: CMD must exit 1 with exactly WANT on stderr.
+usage_error() {
+  local want=$1 rc=0 err; shift
+  err=$("$@" 2>&1 >/dev/null </dev/null) || rc=$?
+  [[ $rc -eq 1 ]] || { echo "FAIL: $*: expected exit 1, got $rc"; exit 1; }
+  [[ "$err" == "$want" ]] || { echo "FAIL: $*: expected stderr '$want', got '$err'"; exit 1; }
+}
+usage_error "lisp: too many arguments (at most 1): unexpected 'b'" $LISP a b
+usage_error "lisp: unknown option '-x'" $LISP -x
+
 echo "All lisp tests passed!"
