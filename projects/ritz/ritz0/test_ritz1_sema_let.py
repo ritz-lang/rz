@@ -27,7 +27,9 @@ order.  An emitter-side error after them (a literal that doesn't fit its
 slot, literal_slot) is no longer printed: before the move it was.  A fn's tail
 expression is the fn's value, not a statement, but an `@&` of a `let` in it
 is refused as anywhere else (AGAST #3804: the emitter never let-checked it).
-ritz1 reports an `@&` at the `@`; ritz0 at its operand, two columns on.
+An `@&` is reported at the `@` (LARB R68, AGAST #3924: every compiler,
+test_let_borrow_at.py); a receiver lent to `self: **C` (42:5) has no `@`,
+so at the receiver.
 """
 
 import re

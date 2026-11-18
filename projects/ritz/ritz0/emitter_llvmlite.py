@@ -4436,7 +4436,9 @@ class LLVMEmitter:
 
         AGAST #3337: or of a const array, or a place inside it (ritz1's
         let_place_const): it is `internal constant` data.  `at` is an
-        explicit `@&`'s own span, where ritz1 locates the const's message.
+        explicit `@&`'s own span: both messages are located there (LARB R68,
+        AGAST #3924: the smallest wrong expression is the borrow, not its
+        operand).  An implicit borrow (no `@&`) is located at its operand.
         """
         place = self._let_place(operand, consts=True)
         if place is not None and self._is_const_array_name(place[0]):
@@ -4446,7 +4448,7 @@ class LLVMEmitter:
         if place is not None:
             raise EmitError(
                 f"cannot borrow `let` binding `{place[0]}` as mutable; declare it `var`",
-                operand.span)
+                at or operand.span)
 
     @staticmethod
     def _is_mut_borrow_param(param: rast.Param) -> bool:
