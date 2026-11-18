@@ -223,7 +223,7 @@ Dirty flags propagate up to ancestors (parent needs relayout if child changes).
 ```
 iris/
 ├── lib/
-│   ├── iris.ritz           # Main API
+│   ├── (iris.ritz)         # Main API: planned; stale draft deleted in #4185
 │   ├── style/
 │   │   ├── types.ritz      # CSS value types
 │   │   ├── event.ritz      # StyleEvent protocol
