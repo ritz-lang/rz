@@ -57,17 +57,25 @@ const XCR0_AVX512_MASK: i32 = XCR0_AVX_MASK | XCR0_OPMASK | XCR0_ZMM_HI256 | XCR
 # Cached Feature Flags
 # ============================================================================
 
-# Global cache for detected features (initialized on first use)
-# Using separate vars since we don't have static initialization
-var g_cpuid_initialized: i32 = 0
-var g_has_aes_ni: i32 = 0
-var g_has_sha_ni: i32 = 0
-var g_has_avx: i32 = 0
-var g_has_avx2: i32 = 0
-var g_has_avx512f: i32 = 0
-var g_has_pclmulqdq: i32 = 0
-var g_has_osxsave: i32 = 0
-var g_xcr0: i32 = 0
+# Every detected feature is one bit of a single u32, published with one atomic
+# store and read with one atomic load (GitHub #149 M-19, AGAST #4126). Seven
+# plain globals plus a separate "initialized" flag let a second thread see the
+# flag before the features, and so take the software path on one call and the
+# hardware path on the next. One word cannot be seen half-written: a reader
+# either finds READY with every flag of the same detection, or 0 and detects
+# for itself. Racing detections all store the same value, so no lock is needed.
+pub const CPUID_F_AES_NI: u32 = 0x1
+pub const CPUID_F_SHA_NI: u32 = 0x2
+pub const CPUID_F_AVX: u32 = 0x4          # already masked by OSXSAVE and XCR0
+pub const CPUID_F_AVX2: u32 = 0x8         # already masked by AVX and XCR0
+pub const CPUID_F_AVX512F: u32 = 0x10     # already masked by AVX2 and XCR0
+pub const CPUID_F_PCLMULQDQ: u32 = 0x20
+pub const CPUID_F_OSXSAVE: u32 = 0x40
+pub const CPUID_F_READY: u32 = 0x80000000 # set in every detected word, so 0 means "not yet"
+
+# 0 until the first detection; then cpuid_pack(...) with CPUID_F_READY set.
+# Touch it only through atomic_load / atomic_store.
+var g_cpuid_word: u32 = 0
 
 # ============================================================================
 # Low-level CPUID Access
@@ -109,10 +117,42 @@ pub fn xgetbv_lo(xcr: i32) -> i32
 # Feature Detection (Internal)
 # ============================================================================
 
-# Initialize CPU feature detection
-fn cpuid_init()
-    if g_cpuid_initialized != 0
-        return
+# Pack detected features (each 0 or nonzero) into one word with CPUID_F_READY.
+pub fn cpuid_pack(aes_ni: i32, sha_ni: i32, avx: i32, avx2: i32, avx512f: i32, pclmulqdq: i32, osxsave: i32) -> u32
+    var w: u32 = CPUID_F_READY
+    if aes_ni != 0
+        w = w | CPUID_F_AES_NI
+    if sha_ni != 0
+        w = w | CPUID_F_SHA_NI
+    if avx != 0
+        w = w | CPUID_F_AVX
+    if avx2 != 0
+        w = w | CPUID_F_AVX2
+    if avx512f != 0
+        w = w | CPUID_F_AVX512F
+    if pclmulqdq != 0
+        w = w | CPUID_F_PCLMULQDQ
+    if osxsave != 0
+        w = w | CPUID_F_OSXSAVE
+    return w
+
+# 1 if `flag` is set in `word`, else 0.
+pub fn cpuid_flag(word: u32, flag: u32) -> i32
+    if (word & flag) != 0
+        return 1
+    return 0
+
+# Run CPUID (and XGETBV) and return the packed feature word. Writes no
+# global; cpuid_features_word publishes the result.
+pub fn cpuid_detect() -> u32
+    var has_aes_ni: i32 = 0
+    var has_sha_ni: i32 = 0
+    var has_avx: i32 = 0
+    var has_avx2: i32 = 0
+    var has_avx512f: i32 = 0
+    var has_pclmulqdq: i32 = 0
+    var has_osxsave: i32 = 0
+    var xcr0: i32 = 0
 
     var eax: i32 = 0
     var ebx: i32 = 0
@@ -129,20 +169,20 @@ fn cpuid_init()
 
         # AES-NI: ECX bit 25
         if ((ecx >> CPUID_ECX_AES) & 1) == 1
-            g_has_aes_ni = 1
+            has_aes_ni = 1
 
         # PCLMULQDQ: ECX bit 1
         if ((ecx >> CPUID_ECX_PCLMULQDQ) & 1) == 1
-            g_has_pclmulqdq = 1
+            has_pclmulqdq = 1
 
         # AVX: ECX bit 28
         if ((ecx >> CPUID_ECX_AVX) & 1) == 1
-            g_has_avx = 1
+            has_avx = 1
 
         # OSXSAVE: ECX bit 27 (needed to verify OS supports AVX state)
         if ((ecx >> CPUID_ECX_OSXSAVE) & 1) == 1
-            g_has_osxsave = 1
-            g_xcr0 = xgetbv_lo(0)
+            has_osxsave = 1
+            xcr0 = xgetbv_lo(0)
 
     # Leaf 7: Extended features (AVX2, SHA-NI, AVX-512F)
     if max_leaf >= 7
@@ -150,24 +190,35 @@ fn cpuid_init()
 
         # AVX2: EBX bit 5
         if ((ebx >> CPUID_EBX_AVX2) & 1) == 1
-            g_has_avx2 = 1
+            has_avx2 = 1
 
         # SHA-NI: EBX bit 29
         if ((ebx >> CPUID_EBX_SHA) & 1) == 1
-            g_has_sha_ni = 1
+            has_sha_ni = 1
 
         # AVX-512F: EBX bit 16
         if ((ebx >> CPUID_EBX_AVX512F) & 1) == 1
-            g_has_avx512f = 1
+            has_avx512f = 1
 
     # Keep only what the OS has enabled in XCR0 (AGAST #4127), so every
     # getter and cpu_detect_features agree. AVX-512 first: it reads the raw
     # AVX/AVX2 bits.
-    g_has_avx512f = cpu_avx512_usable(g_has_avx, g_has_avx2, g_has_osxsave, g_xcr0, g_has_avx512f)
-    g_has_avx2 = cpu_avx2_usable(g_has_avx, g_has_osxsave, g_xcr0, g_has_avx2)
-    g_has_avx = cpu_avx_usable(g_has_avx, g_has_osxsave, g_xcr0)
+    has_avx512f = cpu_avx512_usable(has_avx, has_avx2, has_osxsave, xcr0, has_avx512f)
+    has_avx2 = cpu_avx2_usable(has_avx, has_osxsave, xcr0, has_avx2)
+    has_avx = cpu_avx_usable(has_avx, has_osxsave, xcr0)
 
-    g_cpuid_initialized = 1
+    return cpuid_pack(has_aes_ni, has_sha_ni, has_avx, has_avx2, has_avx512f, has_pclmulqdq, has_osxsave)
+
+# The published feature word, detecting and publishing it on first use. Safe
+# to call from any number of threads at once (AGAST #4126). Read every flag a
+# decision needs out of one returned word, not from repeated calls.
+pub fn cpuid_features_word() -> u32
+    let w: u32 = atomic_load(@g_cpuid_word as *u32)
+    if (w & CPUID_F_READY) != 0
+        return w
+    let detected: u32 = cpuid_detect()
+    atomic_store(@g_cpuid_word as *u32, detected)
+    return detected
 
 # ============================================================================
 # Usability Predicates (pure, so they can be tested without the CPU at hand)
@@ -203,36 +254,30 @@ pub fn cpu_avx512_usable(has_avx: i32, has_avx2: i32, has_osxsave: i32, xcr0: i3
 
 # Check if CPU supports AES-NI (AES encryption instructions)
 pub fn cpu_has_aes_ni() -> i32
-    cpuid_init()
-    return g_has_aes_ni
+    return cpuid_flag(cpuid_features_word(), CPUID_F_AES_NI)
 
 # Check if CPU supports SHA-NI (SHA-256 hardware acceleration)
 pub fn cpu_has_sha_ni() -> i32
-    cpuid_init()
-    return g_has_sha_ni
+    return cpuid_flag(cpuid_features_word(), CPUID_F_SHA_NI)
 
 # Check if CPU supports AVX (256-bit SIMD, needed for AVX2) and the OS has
 # enabled YMM state
 pub fn cpu_has_avx() -> i32
-    cpuid_init()
-    return g_has_avx
+    return cpuid_flag(cpuid_features_word(), CPUID_F_AVX)
 
 # Check if CPU supports AVX2 (256-bit integer SIMD)
-# cpuid_init has already masked it by AVX, OSXSAVE and XCR0.
+# cpuid_detect has already masked it by AVX, OSXSAVE and XCR0.
 pub fn cpu_has_avx2() -> i32
-    cpuid_init()
-    return g_has_avx2
+    return cpuid_flag(cpuid_features_word(), CPUID_F_AVX2)
 
-# Check if CPU supports AVX-512F (512-bit SIMD foundation); cpuid_init has
+# Check if CPU supports AVX-512F (512-bit SIMD foundation); cpuid_detect has
 # already masked it by AVX2, OSXSAVE and XCR0.
 pub fn cpu_has_avx512() -> i32
-    cpuid_init()
-    return g_has_avx512f
+    return cpuid_flag(cpuid_features_word(), CPUID_F_AVX512F)
 
 # Check if CPU supports PCLMULQDQ (carryless multiply for GHASH)
 pub fn cpu_has_pclmulqdq() -> i32
-    cpuid_init()
-    return g_has_pclmulqdq
+    return cpuid_flag(cpuid_features_word(), CPUID_F_PCLMULQDQ)
 
 # ============================================================================
 # Feature Structure
@@ -250,11 +295,11 @@ pub struct CpuFeatures
 
 # Detect all CPU features at once
 pub fn cpu_detect_features(features: *CpuFeatures)
-    cpuid_init()
-    features.has_aes_ni = g_has_aes_ni
-    features.has_sha_ni = g_has_sha_ni
-    features.has_avx = g_has_avx
-    features.has_avx2 = g_has_avx2
-    features.has_avx512f = g_has_avx512f
-    features.has_pclmulqdq = g_has_pclmulqdq
-    features.has_osxsave = g_has_osxsave
+    let w: u32 = cpuid_features_word()       # one load: one consistent snapshot
+    features.has_aes_ni = cpuid_flag(w, CPUID_F_AES_NI)
+    features.has_sha_ni = cpuid_flag(w, CPUID_F_SHA_NI)
+    features.has_avx = cpuid_flag(w, CPUID_F_AVX)
+    features.has_avx2 = cpuid_flag(w, CPUID_F_AVX2)
+    features.has_avx512f = cpuid_flag(w, CPUID_F_AVX512F)
+    features.has_pclmulqdq = cpuid_flag(w, CPUID_F_PCLMULQDQ)
+    features.has_osxsave = cpuid_flag(w, CPUID_F_OSXSAVE)
