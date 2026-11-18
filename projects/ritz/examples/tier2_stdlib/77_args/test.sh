@@ -117,6 +117,12 @@ expect 2 'args: 1
 first: --count' "argdemo: option '--count' requires a value" -- --count
 expect 2 'args: 1
 first: --verbose=1' "argdemo: option '--verbose' doesn't accept a value" -- --verbose=1
+# --- a one-letter LONG option is reported with the dashes typed (#3991):
+#     '--q', not '-q' (-q is a valid short switch here, so '-q' misleads) ---
+expect 2 'args: 1
+first: --q' "argdemo: unknown option '--q'" -- --q
+expect 2 'args: 1
+first: --v=1' "argdemo: unknown option '--v'" -- --v=1
 expect 2 'args: 2
 first: -n
 verbose: no

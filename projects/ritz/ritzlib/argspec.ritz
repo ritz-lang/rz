@@ -26,20 +26,16 @@
 # This replaces the ArgParser API in ritzlib/args.ritz, which is deprecated
 # and stays only until its callers are ported.  It is a separate module, not a
 # section of args.ritz, because ritz1 compiles every function of an imported
-# module: while ritz1 cannot compile this file, putting it in args.ritz would
-# break every existing args.ritz caller under ritz1.
+# module: a construct ritz1 failed to lower here would break every args.ritz
+# caller under ritz1 too.
 #
-# ritz1 cannot compile this module yet.  Known blockers: no Vec<T> for a
-# struct T (#1487), no `@&` on a field (#1488), bool parameters/fields as i1
-# (#1497) and `Some(..)`/`None` as a call argument (#1498); see the 77_args
-# entry of ritz1's old regression allowlist (git history).  The code already
-# avoids the other constructs ritz1 is known not to lower (struct literals
-# outside a `let` initializer, #1362, have lowered since): string literals in
-# struct-literal fields (#1467), block or
-# nested match arms (#1454, #1479), `f().field` (#1470), multi-type-argument
-# calls (#1471) and payload-carrying user enums (#1295).  That last one is why
-# ArgError is a struct with a payload-free kind enum rather than an enum with
-# payloads.
+# ritz1 compiles this module: 77_args and the tier2 examples ported to it in
+# #1490 build and pass under ritz1 and ritz1_selfhosted.  Keep it that way.
+# The code avoids constructs ritz1 has not always lowered: string literals in
+# struct-literal fields (#1467), block or nested match arms (#1454, #1479),
+# `f().field` (#1470), multi-type-argument calls (#1471) and payload-carrying
+# user enums (#1295).  That last one is why ArgError is a struct with a
+# payload-free kind enum rather than an enum with payloads.
 
 import ritzlib.sys
 import ritzlib.io
@@ -194,21 +190,26 @@ pub enum ArgErrorKind
     NotANumber              # text: the offending value
     NotSet                  # text: the name looked up
 
+# `dashes` is what goes in front of `text` when it names an option: what the
+# user typed ("--" from parse_long, "-" from parse_short), so `--f` is
+# reported as '--f' even when `-f` is a valid short option (#3991).  For
+# NotSet it is the dashes of the spec option the name resolved to; it is
+# empty for the kinds whose text is not an option.
 pub struct ArgError
     kind: ArgErrorKind
     text: StrView
     limit: i64
+    dashes: StrView
 
+# An error whose text is not an option name (dashes empty).
 fn arg_error(kind: ArgErrorKind, text: StrView, limit: i64) -> ArgError
-    let e = ArgError { kind: kind, text: text, limit: limit }
+    let e = ArgError { kind: kind, text: text, limit: limit, dashes: strview_empty() }
     e
 
-# The dashes that go in front of an option name the way a user would type
-# it: "-" for a one-byte name (-x), "--" otherwise (--name).
-fn option_dashes(name: StrView) -> StrView
-    if name.len == 1
-        return "-"
-    "--"
+# An error about the option `text`, written with `dashes` in front.
+fn arg_error_opt(kind: ArgErrorKind, text: StrView, dashes: StrView) -> ArgError
+    let e = ArgError { kind: kind, text: text, limit: 0, dashes: dashes }
+    e
 
 # Report an error the conventional way: "<program>: <message>" on stderr.
 pub fn arg_error_print(spec: @ArgSpec, e: @ArgError)
@@ -216,7 +217,7 @@ pub fn arg_error_print(spec: @ArgSpec, e: @ArgError)
     # through a reference an i64 slot.
     let prog: StrView = spec.program
     let text: StrView = e.text
-    let dashes: StrView = option_dashes(text)
+    let dashes: StrView = e.dashes
     let k = e.kind
     if k == ArgErrorKind.UnknownOption
         eprint("{prog}: unknown option '{dashes}{text}'\n")
@@ -276,19 +277,19 @@ fn parse_long(spec: @ArgSpec, args: Span<StrView>, i: i64, p: @&ParsedArgs) -> O
         let name = strview_take(body, eq)
         let idx = find_long(spec, name)
         if idx < 0
-            return Some(arg_error(ArgErrorKind.UnknownOption, name, 0))
+            return Some(arg_error_opt(ArgErrorKind.UnknownOption, name, "--"))
         if flag_takes_value(spec, idx) == false
-            return Some(arg_error(ArgErrorKind.UnexpectedValue, name, 0))
+            return Some(arg_error_opt(ArgErrorKind.UnexpectedValue, name, "--"))
         record(p, idx, strview_skip(body, eq + 1))
         return None
     let idx2 = find_long(spec, body)
     if idx2 < 0
-        return Some(arg_error(ArgErrorKind.UnknownOption, body, 0))
+        return Some(arg_error_opt(ArgErrorKind.UnknownOption, body, "--"))
     if flag_takes_value(spec, idx2) == false
         record(p, idx2, strview_empty())
         return None
     if i + 1 >= args.len
-        return Some(arg_error(ArgErrorKind.MissingValue, body, 0))
+        return Some(arg_error_opt(ArgErrorKind.MissingValue, body, "--"))
     record(p, idx2, span_get<StrView>(@args, i + 1))
     None
 
@@ -309,13 +310,13 @@ fn parse_short(spec: @ArgSpec, args: Span<StrView>, i: i64, p: @&ParsedArgs) -> 
     while j < arg.len
         let idx = find_short(spec, strview_get(arg, j))
         if idx < 0
-            return Some(arg_error(ArgErrorKind.UnknownOption, strview_slice(arg, j, j + 1), 0))
+            return Some(arg_error_opt(ArgErrorKind.UnknownOption, strview_slice(arg, j, j + 1), "-"))
         if flag_takes_value(spec, idx)
             if j + 1 < arg.len
                 record(p, idx, strview_skip(arg, j + 1))
                 return None
             if i + 1 >= args.len
-                return Some(arg_error(ArgErrorKind.MissingValue, strview_slice(arg, j, j + 1), 0))
+                return Some(arg_error_opt(ArgErrorKind.MissingValue, strview_slice(arg, j, j + 1), "-"))
             record(p, idx, span_get<StrView>(@args, i + 1))
             return None
         record(p, idx, strview_empty())
@@ -434,12 +435,20 @@ pub fn parsed_switch(p: @ParsedArgs, name: StrView) -> bool
 pub fn parsed_value(p: @ParsedArgs, name: StrView) -> Option<StrView>
     value_at(p, find_index(@p.spec, name))
 
+# The dashes of the spec option `name` resolves to (see find_index): "-"
+# for a one-byte name that is not a long name (a short option), else "--".
+fn lookup_dashes(spec: @ArgSpec, name: StrView) -> StrView
+    if name.len == 1
+        if find_long(spec, name) < 0
+            return "-"
+    "--"
+
 # The option's value (see parsed_value) as a decimal i64.
 # Err(NotSet) when there is no value, Err(NotANumber) when it isn't one.
 pub fn parsed_int(p: @ParsedArgs, name: StrView) -> Result<i64, ArgError>
     let v = value_at(p, find_index(@p.spec, name))
     if option_is_some<StrView>(@v) == 0
-        return Err(arg_error(ArgErrorKind.NotSet, name, 0))
+        return Err(arg_error_opt(ArgErrorKind.NotSet, name, lookup_dashes(@p.spec, name)))
     arg_parse_i64(option_unwrap_or<StrView>(@v, strview_empty()))
 
 # All positional arguments, in order, as a slice borrowed from `p`.
