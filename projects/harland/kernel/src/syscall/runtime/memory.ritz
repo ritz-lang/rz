@@ -5,8 +5,8 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
-import serial { prints, serial_print_hex, serial_print_dec }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_get_free_pages }
+import serial { StrView, prints, serial_print_hex, serial_print_dec }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_free_page, pmm_get_free_pages, pmm_fail_allocs_after, pmm_fail_allocs_off }
 import mm.vmm { PTE_PRESENT, PTE_WRITABLE, PTE_USER, vmm_map_page, vmm_unmap_page, vmm_virt_to_phys, vmm_nx_flag, phys_to_virt }
 import fs.syscall { fs_process_pid, fs_process_mmap_next, fs_process_set_mmap_next }
 import syscall.errno { Errno }
@@ -134,6 +134,19 @@ fn free_user_stack()
             pmm_free_page(paddr)
         i = i + 1
 
+# Undo a failed sys_mmap_impl: unmap and free the `count` pages it mapped
+# at addr before failing, so NoMem leaves no page behind (AGAST #3552).
+# Each was mapped to a page this call allocated, so freeing exactly what
+# vmm_unmap_page hands back cannot free anything else. Page tables it
+# built stay, as with munmap.
+fn mmap_undo(addr: u64, count: u64)
+    var i: u64 = 0
+    while i < count
+        let phys: u64 = vmm_unmap_page(addr + i * PAGE_SIZE)
+        if phys != 0
+            pmm_free_page(phys)
+        i = i + 1
+
 # ============================================================================
 # sys_mmap: Map anonymous memory pages
 # ============================================================================
@@ -204,7 +217,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         let page_phys: u64 = pmm_alloc_page()
         if page_phys == 0
             prints("[mmap] ERROR: out of physical memory\n")
-            # TODO: Unmap already-mapped pages
+            mmap_undo(map_addr, i)
             return Errno.NoMem as i64
 
         let zero: *u64 = phys_to_virt(page_phys) as *u64
@@ -220,7 +233,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             serial_print_hex(page_virt)
             prints("\n")
             pmm_free_page(page_phys)
-            # TODO: Unmap already-mapped pages
+            mmap_undo(map_addr, i)
             return Errno.NoMem as i64
 
         i = i + 1
@@ -346,6 +359,81 @@ pub fn munmap_self_test() -> bool
         prints("  munmap test FAILED: page still mapped after munmap\n")
         return false
     prints("  munmap test PASSED!\n")
+    return true
+
+# ============================================================================
+# Boot self-test: a failed mmap gives back the pages it already took (#3552)
+# ============================================================================
+#
+# sys_mmap_impl once returned NoMem from page i with pages 0..i-1 still
+# mapped and allocated. OOM injection (pmm_fail_allocs_after) reaches both
+# failure points; each case checks NoMem came back, the PMM free count is
+# unchanged and no page of the range is left mapped.
+#
+# Runs after munmap_self_test, on the same terms: kernel PML4, no process,
+# interrupts off. That test built the PT covering USER_MMAP_START's first
+# 2 MiB, and nothing maps the next 2 MiB, so:
+#   - data page:  8 pages at USER_MMAP_START with 5 allocations allowed:
+#                 page 5's pmm_alloc_page fails.
+#   - page table: 8 pages at USER_MMAP_START + 2 MiB - 4 pages with 5
+#                 allowed: pages 0-3 land in the existing PT, page 4's data
+#                 page is the 5th allocation and the new PT vmm_map_page
+#                 needs for it is the 6th, so vmm_map_page fails.
+const MMAP_FAIL_TEST_PAGES: u64 = 8
+const MMAP_FAIL_TEST_BUDGET: u64 = 5
+const MMAP_PT_SPAN: u64 = 0x200000     # 2 MiB: what one PT maps
+
+# One case: mmap MMAP_FAIL_TEST_PAGES at addr with MMAP_FAIL_TEST_BUDGET
+# allocations allowed. True when it failed cleanly.
+fn mmap_fail_case(name: StrView, addr: u64) -> bool
+    let flags: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+    let prot: u64 = PROT_READ | PROT_WRITE
+    let length: u64 = MMAP_FAIL_TEST_PAGES * PAGE_SIZE
+
+    let before: u64 = pmm_get_free_pages()
+    pmm_fail_allocs_after(MMAP_FAIL_TEST_BUDGET)
+    let result: i64 = sys_mmap_impl(addr, length, prot, flags)
+    pmm_fail_allocs_off()
+    let after: u64 = pmm_get_free_pages()
+
+    prints("  ")
+    prints(name)
+    prints(": free pages before=")
+    serial_print_dec(before)
+    prints(" after=")
+    serial_print_dec(after)
+    prints("\n")
+
+    if result != Errno.NoMem as i64
+        prints("  mmap failure test FAILED: mmap did not return NoMem\n")
+        # It may have mapped the range: give it back so later tests start clean.
+        if result == addr as i64
+            sys_munmap_impl(addr, length)
+        return false
+    var still_mapped: bool = false
+    var i: u64 = 0
+    while i < MMAP_FAIL_TEST_PAGES
+        if vmm_virt_to_phys(addr + i * PAGE_SIZE) != 0
+            still_mapped = true
+        i = i + 1
+    if still_mapped
+        prints("  mmap failure test FAILED: a page is still mapped after NoMem\n")
+        return false
+    if after != before
+        prints("  mmap failure test FAILED: NoMem leaked physical pages\n")
+        return false
+    return true
+
+# Returns true when both failure points roll back, false (after saying why)
+# if not.
+pub fn mmap_failure_self_test() -> bool
+    prints("\nTesting mmap rollback on out-of-memory...\n")
+    if not mmap_fail_case("data page", USER_MMAP_START)
+        return false
+    let pt_addr: u64 = USER_MMAP_START + MMAP_PT_SPAN - 4 * PAGE_SIZE
+    if not mmap_fail_case("page table", pt_addr)
+        return false
+    prints("  mmap failure test PASSED!\n")
     return true
 
 # ============================================================================
