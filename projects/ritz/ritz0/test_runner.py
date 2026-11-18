@@ -115,6 +115,20 @@ def _sources_args(project_root: Optional[Path]) -> List[str]:
     return ["--sources", json.dumps(roots)] if roots else []
 
 
+def harness_source_roots(source_path: str, project_root: Optional[Path]) -> List[str]:
+    """Source roots for a test file's scratch-copy harness.
+
+    ritz0 compiles a copy of the test file in a tmpdir, so its first lookup,
+    "relative to the importing file", sees the tmpdir. The test file's own
+    directory goes first instead, so `import fixtures` finds the module next
+    to the test as `rz build` and ritz1 (which compiles in place) do. Until
+    AGAST #1558 two names were copied into the tmpdir instead
+    (`test_import_*.ritz`, `helpers.ritz`) and every other sibling failed.
+    """
+    own_dir = str(Path(source_path).resolve().parent)
+    return [own_dir] + [r for r in project_source_roots(project_root) if r != own_dir]
+
+
 def parse_project_dependencies(project_root: Path) -> dict:
     """Parse dependencies from project's ritz.toml.
 
@@ -331,14 +345,6 @@ def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path
         dependency_files excludes the test file itself
         dependencies is the parsed DependencyMapping dict from ritz.toml
     """
-    # Copy helper files to temp directory
-    test_dir = Path(source_path).parent
-    for lib_file in test_dir.glob("test_import_*.ritz"):
-        shutil.copy(lib_file, tmpdir)
-    helpers_file = test_dir / "helpers.ritz"
-    if helpers_file.exists():
-        shutil.copy(helpers_file, tmpdir)
-
     # Find project root
     project_root = None
     search_dir = Path(source_path).parent.resolve()
@@ -350,20 +356,17 @@ def setup_test_environment(source_path: str, tmpdir: str) -> Tuple[Optional[Path
 
     # Parse dependencies from ritz.toml (Issue #48)
     dependencies = {}
-    source_roots = None
+    # The harness is a scratch copy in tmpdir, so the test file's own
+    # directory stands in for "relative to the importing file" (AGAST #1558).
+    source_roots = harness_source_roots(source_path, project_root)
     if project_root:
         dependencies = parse_project_dependencies(project_root)
-
-        # Read source roots from project's ritz.toml
-        source_roots = project_source_roots(project_root) or None
 
         # Add ritzlib to source roots (from ritz project or RITZ_PATH)
         ritz0_dir = Path(__file__).parent.resolve()
         ritzlib_path = ritz0_dir.parent / "ritzlib"
         # DEBUG: print(f"DEBUG: ritz0_dir={ritz0_dir}, ritzlib_path={ritzlib_path}, exists={ritzlib_path.exists()}", file=sys.stderr)
         if ritzlib_path.exists():
-            if source_roots is None:
-                source_roots = []
             # Add the parent of ritzlib so imports like 'ritzlib.sys' work
             source_roots.append(str(ritz0_dir.parent))
 
@@ -578,6 +581,7 @@ def _compile_harness(
     project_root: Optional[Path],
     dependencies: Optional[Dict[str, DependencyMapping]],
     compiler: str = "ritz0",
+    source_path: Optional[str] = None,
 ) -> Optional[str]:
     """Compile a test file in test mode (`--test-table`) to LLVM IR.
 
@@ -602,7 +606,8 @@ def _compile_harness(
     # Pass project root for import resolution
     if project_root:
         compile_cmd.extend(["--project-root", str(project_root)])
-    compile_cmd.extend(_sources_args(project_root))
+    roots = harness_source_roots(source_path or harness_path, project_root)
+    compile_cmd.extend(["--sources", json.dumps(roots)])
 
     result = subprocess.run(compile_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -637,7 +642,8 @@ def _harness_obj(source_path: str, harness_path: str, harness_ll: str,
     harness_obj = os.path.join(os.path.dirname(harness_ll), Path(harness_ll).stem + ".rzu.o")
 
     def compile_it() -> Optional[str]:
-        return (_compile_harness(harness_path, harness_ll, project_root, dependencies, compiler)
+        return (_compile_harness(harness_path, harness_ll, project_root, dependencies, compiler,
+                                 source_path)
                 or _build_module().compile_ll_to_obj(
                     Path(harness_ll), Path(harness_obj), Path(source_path)))
 
