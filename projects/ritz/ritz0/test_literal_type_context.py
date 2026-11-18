@@ -360,3 +360,183 @@ def test_a_literal_too_large_for_its_context_is_a_located_error(tmp_path):
     assert "Traceback" not in combined, (
         f"rejection arrived as a Python traceback:\n{combined}"
     )
+
+
+# --------------------------------------------------------------------------
+# AGAST #1445: the context reaches the arm values of an if / match.
+# --------------------------------------------------------------------------
+#
+# An arm's value is consumed at the if / match's own type, which is the slot's,
+# so the declared type follows the value tails: then / else block values and
+# match arm bodies, through nested if / match / block. Never the condition or
+# the scrutinee, which are consumed as a bool and at their own type, and never
+# into an if that sits under an operator: `2 * (if c then a else 200) / 4` at
+# u8 would multiply in 8 bits before the `/` (the #1396 `>>` / `/` / `%`
+# hazard), where today it does so at 64.
+
+def _no_round_trip(body):
+    """No i64 value and no truncation anywhere in a function body."""
+    return not any(re.search(r"\bi64\b|\btrunc\b", line) for line in body)
+
+
+@pytest.mark.unit
+def test_a_literal_arm_takes_the_declared_type(tmp_path):
+    """The two #1445 lines, plus var / return / match / nested / negative arms.
+
+    One compile for the lot: each function is its own assertion. The
+    conditions compare two i32s so that `i64` can only come from an arm.
+    """
+    ir_text = _emit_ir(tmp_path, (
+        "fn let_else(a: i32, b: i32) -> i32\n"
+        "    let m: i32 = if a < b then a else 255\n"
+        "    return m\n"
+        "\n"
+        "fn let_then_arith(a: i32, b: i32) -> i32\n"
+        "    let k: i32 = if a < b then 255 else a - 1\n"
+        "    return k\n"
+        "\n"
+        "fn var_slot(a: u32, b: u32) -> u32\n"
+        "    var m: u32 = if a < b then a else 4000000000\n"
+        "    return m\n"
+        "\n"
+        "fn ret_slot(a: i32, b: i32) -> i32\n"
+        "    return if a < b then a else 255\n"
+        "\n"
+        "fn match_slot(a: i32, b: u8) -> u8\n"
+        "    let m: u8 = match a\n"
+        "        0 => 200\n"
+        "        _ => b\n"
+        "    return m\n"
+        "\n"
+        "fn nested(a: i32, b: i32) -> i32\n"
+        "    let m: i32 = if a < b then a else if a == b then 7 else 255\n"
+        "    return m\n"
+        "\n"
+        "fn negative(a: i8, b: i8) -> i8\n"
+        "    let m: i8 = if a < b then a else -128\n"
+        "    return m\n"
+        "\n"
+        "fn block_arm(a: i32, b: i32) -> i32\n"
+        "    let m: i32 = if a < b\n"
+        "        let t = b\n"
+        "        a + t\n"
+        "    else\n"
+        "        255\n"
+        "    return m\n"
+    ))
+    for fn in ("let_else", "let_then_arith", "var_slot", "ret_slot",
+               "match_slot", "nested", "negative", "block_arm"):
+        body = _body(ir_text, fn)
+        assert _no_round_trip(body), f"{fn}: an arm was computed in i64: {body}"
+
+
+@pytest.mark.unit
+def test_an_operator_in_an_arm_takes_the_declared_type(tmp_path):
+    """`1 << n` in an arm is #1396's left-literal shift, in the slot's width."""
+    ir_text = _emit_ir(tmp_path, (
+        "fn shl_arm(c: bool, n: u32, a: u32) -> u32\n"
+        "    let r: u32 = if c then 1 << n else a\n"
+        "    return r\n"
+        "\n"
+        "fn shl_match_arm(k: i32, n: u32, a: u32) -> u32\n"
+        "    let r: u32 = match k\n"
+        "        0 => 1 << n\n"
+        "        _ => a\n"
+        "    return r\n"
+    ))
+    for fn in ("shl_arm", "shl_match_arm"):
+        body = _body(ir_text, fn)
+        assert any("shl i32" in line for line in body), f"{fn}: {body}"
+        assert _no_round_trip(body), f"{fn}: {body}"
+
+
+@pytest.mark.unit
+def test_the_condition_and_scrutinee_keep_their_own_type(tmp_path):
+    """Not consumed at the slot's type, so not narrowed: `1 << n` stays i64.
+
+    With `n = 31` an i32 `1 << n` is negative, so narrowing the condition
+    would change which arm runs.
+    """
+    ir_text = _emit_ir(tmp_path, (
+        "fn cond(n: i32, a: i32) -> i32\n"
+        "    let r: i32 = if (1 << n) > 0 then a else 0\n"
+        "    return r\n"
+        "\n"
+        "fn scrut(n: i32, a: i32) -> i32\n"
+        "    let r: i32 = match (1 << n) > 0\n"
+        "        true => a\n"
+        "        false => 0\n"
+        "    return r\n"
+    ))
+    for fn in ("cond", "scrut"):
+        body = _body(ir_text, fn)
+        assert any("shl i64" in line for line in body), f"{fn}: narrowed: {body}"
+        assert not any("shl i32" in line for line in body), f"{fn}: {body}"
+
+
+@pytest.mark.unit
+def test_an_if_under_an_operator_is_not_an_arm_of_the_slot(tmp_path):
+    """`2 * (if c then 200 else 100) / 4` into u8 must not multiply in 8 bits.
+
+    At u8, 200 * 2 wraps to 144 and the `/` gives 36, not 100: the arms are
+    consumed by the `*`, whose result the `/` reads at full width. The value
+    stays i64, so the narrowing it is still has to be proven (it can't be).
+    """
+    src = tmp_path / "under.ritz"
+    src.write_text(
+        "fn f(c: bool) -> u8\n"
+        "    let m: u8 = 2 * (if c then 200 else 100) / 4\n"
+        "    return m\n"
+    )
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    proc = run_ritz0([str(src), "-o", str(tmp_path / "under.ll"), "--no-runtime"],
+                     env=env, timeout=300)
+    assert proc.returncode != 0 and "implicit narrowing:" in proc.stderr, (
+        f"the if under `*` took the slot's u8:\n{proc.stdout}{proc.stderr}")
+
+
+@pytest.mark.unit
+def test_literal_arms_give_the_same_answers(tmp_path):
+    """Runtime check of the #1445 shapes, encoded in the exit code."""
+    source = (
+        "fn clamp(a: i32) -> i32\n"
+        "    let m: i32 = if a < 255 then a else 255\n"
+        "    return m\n"
+        "\n"
+        "fn clamp1(a: i32) -> i32\n"
+        "    let k: i32 = if a - 1 < 255 then a - 1 else 255\n"
+        "    return k\n"
+        "\n"
+        "fn low(a: i8) -> i8\n"
+        "    let m: i8 = if a < 0 then -128 else a\n"
+        "    return m\n"
+        "\n"
+        "fn main() -> i32\n"
+        "    if clamp(1000) != 255\n"
+        "        return 1\n"
+        "    if clamp(-5) != -5\n"
+        "        return 2\n"
+        "    if clamp1(1000) != 255\n"
+        "        return 3\n"
+        "    if clamp1(10) != 9\n"
+        "        return 4\n"
+        "    if low(-1) != -128\n"
+        "        return 5\n"
+        "    if low(9) != 9\n"
+        "        return 6\n"
+        "    return 42\n"
+    )
+    src = tmp_path / "arms.ritz"
+    src.write_text(source)
+    ll = tmp_path / "arms.ll"
+    exe = tmp_path / "arms"
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
+    build = run_ritz0([str(src), "-o", str(ll)], env=env, timeout=300)
+    assert build.returncode == 0, build.stderr
+    link = fast_link.clang(
+        ["clang", str(ll), "-o", str(exe), "-nostdlib"],
+        capture_output=True, text=True, timeout=300,
+    )
+    assert link.returncode == 0, link.stderr
+    run = subprocess.run([str(exe)], capture_output=True, timeout=60)
+    assert run.returncode == 42, f"case {run.returncode} gave the wrong answer"

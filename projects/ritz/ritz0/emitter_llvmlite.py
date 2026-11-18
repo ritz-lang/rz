@@ -1679,15 +1679,43 @@ class LLVMEmitter:
         or a Cast, because at each of those the value is consumed at a
         position whose type we have not established. It also stops at `>>`
         (AGAST #2360), whose result depends on its left operand's high bits.
+
+        AGAST #1445: it also follows the value TAILS of an if / match (the
+        then / else block values, each arm's body, through nested if / match /
+        block), since an arm's value is consumed at the if / match's own type,
+        which is the slot's. It never enters the condition or the scrutinee,
+        and only follows tails reached from the slot itself: an if under an
+        operator is consumed by that operator, and narrowing its arms there
+        would move the operator to the slot's width ahead of a `/`, `%` or
+        `>>`. Inside an arm the rule above applies unchanged. An arm that IS
+        an untyped integer literal (`255`, `-128`) is added as well, and
+        `_literal_at_slot_width` emits it at the slot's width; otherwise
+        `if a < b then a else 255` (a: i32) merged at the literal's i64.
         """
         qualifying = set()
-        stack = [root]
+        # (node, how it is reached): 'root' for the slot's own value, 'arm'
+        # for an if / match tail, None below an operator.
+        stack = [(root, 'root')]
         seen = set()
         while stack:
-            node = stack.pop()
+            node, tail = stack.pop()
             if node is None or id(node) in seen:
                 continue
             seen.add(id(node))
+            if tail == 'arm' and self._untyped_int_literal(node) is not None:
+                qualifying.add(id(node))
+                continue
+            if tail is not None:
+                if isinstance(node, rast.If):
+                    stack.append((node.then_block, 'arm'))
+                    stack.append((node.else_block, 'arm'))
+                    continue
+                if isinstance(node, rast.Match):
+                    stack.extend((arm.body, 'arm') for arm in node.arms)
+                    continue
+                if isinstance(node, rast.Block):
+                    stack.append((node.expr, tail))
+                    continue
             if isinstance(node, rast.BinOp):
                 qualifying.add(id(node))
                 if node.op == '>>':
@@ -1703,14 +1731,35 @@ class LLVMEmitter:
                     # which never changes a value, and its left operand stops
                     # here in turn.
                     if isinstance(node.left, rast.BinOp) and node.left.op == '>>':
-                        stack.append(node.left)
+                        stack.append((node.left, None))
                     continue
-                stack.append(node.left)
-                stack.append(node.right)
+                stack.append((node.left, None))
+                stack.append((node.right, None))
             elif isinstance(node, rast.UnaryOp):
                 # `-(x + 1)` is still consumed at the declared width.
-                stack.append(node.operand)
+                stack.append((node.operand, None))
         return qualifying
+
+    def _literal_at_slot_width(self, expr: rast.Expr) -> Optional[ir.Value]:
+        """An if / match arm that is an untyped integer literal, as a constant
+        of the slot's integer type, or None to emit it as before.
+
+        AGAST #1445. Only for the literal arms `_arith_context_nodes` marked,
+        and only when the value fits the declared type: a literal that does
+        not fit keeps its i64 and meets the slot's fit check or #1393's
+        narrowing check, as it did. The arms merge at the wider of their
+        types, so a literal at the slot's width never narrows its sibling.
+        """
+        value = self._untyped_int_literal(expr)
+        if value is None or isinstance(value, bool):
+            return None
+        want = self._expected_int_width()
+        if want is None:
+            return None
+        unsigned = self._is_unsigned_type(self.expected_ritz_type)
+        if not self._int_literal_fits(value, want, unsigned):
+            return None
+        return ir.Constant(ir.IntType(want), value)
 
     def _untyped_int_literal(self, expr: rast.Expr) -> Optional[int]:
         """The value of an untyped integer literal, or None.
@@ -7423,6 +7472,9 @@ class LLVMEmitter:
                 # Restored, not cleared: this `let` may sit in an arm whose
                 # tail is still to land in the enclosing slot.
                 saved_let_expected = self.expected_ritz_type
+                # And so is the context set: the arm's literal tail still needs
+                # its mark after this `let` (AGAST #1445).
+                saved_let_ctx = getattr(self, '_literal_ctx_nodes', set())
                 self.expected_ritz_type = stmt.type
                 self._literal_ctx_nodes = self._arith_context_nodes(stmt.value)
                 # AGAST #1964: variant names are global (`Some` -> whichever
@@ -7445,6 +7497,7 @@ class LLVMEmitter:
                     self._leave_float_tails(saved_float)
                 self.simd_expected_type = None  # Clear SIMD context
                 self.expected_ritz_type = saved_let_expected
+                self._literal_ctx_nodes = saved_let_ctx
             if stmt.type:
                 self._check_initialiser_has_value(stmt, val)
                 # Use declared type and convert value if needed
@@ -9447,6 +9500,11 @@ class LLVMEmitter:
 
     def _emit_expr_core(self, expr: rast.Expr) -> ir.Value:
         """Emit an expression (_emit_expr, before temporaries)."""
+        if id(expr) in getattr(self, '_literal_ctx_nodes', ()):
+            # AGAST #1445: a literal arm of an if / match in a typed slot.
+            arm = self._literal_at_slot_width(expr)
+            if arm is not None:
+                return arm
         if isinstance(expr, rast.IntLit):
             return ir.Constant(self.i64, expr.value)
 

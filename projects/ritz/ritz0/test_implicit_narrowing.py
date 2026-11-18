@@ -22,10 +22,11 @@ on its own, and the rule below exempts exactly those shapes:
   * an `if`/`match` whose every arm is one of the above
 
 Everything else needs an explicit `as T`. The rule deliberately does not try
-to reason about comparisons, loop bounds or arithmetic on variables: an
-`if x < 255 then x else 255` is rejected even though it happens to be safe,
-and a test below pins that, so a future widening of the exemption is a
-conscious act.
+to reason about comparisons, loop bounds or arithmetic on variables: with an
+i64 `x`, `if x < 255 then x else 255` is rejected even though it happens to be
+safe, and a test below pins that, so a future widening of the exemption is a
+conscious act. (With an i32 `x` and an i32 slot it narrows nothing: the
+literal arm is the slot's type, AGAST #1445.)
 
 The accepted controls are load-bearing: without them the check could pass
 every rejection test by rejecting every narrowing, including `let ok: i32 = 5`.
@@ -112,6 +113,16 @@ REJECTED = {
     # Safe at runtime, but only by reasoning about the comparison. Pinned as
     # rejected on purpose: the rule does not do range analysis on conditions.
     "if_bounded_by_comparison": "let n: i32 = if five() < 255 then five() else 255",
+    # AGAST #1445: a literal arm takes the slot's type, but its sibling keeps
+    # its own: an i32 arm into a u8 is still a narrowing.
+    "if_literal_arm_beside_wider": "let n: u8 = if x > 0 then x else 1",
+    "match_literal_arm_beside_wider": ("let n: u8 = match o\n"
+                                       "        Gray => 0\n"
+                                       "        RGB => x\n"
+                                       "        BGR => 2"),
+    # Below an operator an if's arms are not the slot's: the `*` ran at 64
+    # bits, so the `/` result needs proof (there is none).
+    "if_under_operator":         "let n: u8 = 2 * (if x > 0 then 200 else 100) / 4",
 }
 
 
@@ -166,6 +177,12 @@ ACCEPTED = {
                                   "        RGB => 1\n"
                                   "        BGR => 2"),
     "if_constant_arms":          "let n: u8 = if x > 0 then 1 else 0",
+    # AGAST #1445: a literal arm is the slot's type, so it doesn't widen the
+    # if past its other arm (the 39_time / 36_timeout shapes).
+    "if_literal_arm_takes_slot": "let n: i32 = if x < 255 then x else 255",
+    "if_arith_arm_and_literal":  "let n: i32 = if x - 1 < 255 then x - 1 else 255",
+    "if_negative_literal_arm":   "var n: i32 = if x > 0 then -1 else x",
+    "if_nested_literal_arms":    "let n: i32 = if x < 0 then 0 else if x > 9 then 9 else x",
     # Group B: masks that fit.
     "mask_255_into_i32":         "let n: i32 = big() & 255",
     "mask_1_into_u8":            "let n: u8 = (big() >> 3) & 1",

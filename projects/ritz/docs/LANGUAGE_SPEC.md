@@ -2788,8 +2788,16 @@ let low: u8 = x & 255            # a mask `e & K`, K >= 0, K fits the type
 let bit: u8 = if x > 0 then 1 else 0   # an if/match whose every arm is one of these
 ```
 
-The rule does no range analysis beyond that: `if n < 255 then n else 255`
-is rejected even though it is safe, and needs an `as`. Only typed `let` and
+A literal arm of an `if` or `match` takes the declared type, as the whole
+initialiser would, so it never widens its other arm: with `n: i32`,
+`let m: i32 = if n < 255 then n else 255` is an `i32` and narrows nothing
+(AGAST #1445). Only the arms that are the initialiser's own value count: an
+`if` that is an operand, as in `2 * (if c then n else 0)`, keeps its literal
+arms `i64`.
+
+The rule does no range analysis beyond that: with `w: i64`,
+`if w < 255 then w else 255` is rejected even though it is safe, and needs an
+`as`. Only typed `let` and
 `var` initialisers are checked. An assignment, a call argument or a `return`
 still converts silently (#1444).
 

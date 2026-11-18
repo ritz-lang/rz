@@ -112,14 +112,17 @@ RITZ1_EXTRA_REJECTED = {
                               "        RGB => 1\n"
                               "        BGR => 2", "x: i32, o: Order, w: i16"),
 }
-# Block-form if-expressions (AGAST #1613), measured against ritz0: inside an
-# `if` arm a literal is i64 and does not adopt the other arm.  An operand it
-# does adopt (LARB R21, AGAST #3112): `x + 1` is an i32, so that arm fits.
+# Block-form if-expressions (AGAST #1613), measured against ritz0.  In a
+# typed slot a literal arm is the slot's type (AGAST #1445), so it does not
+# widen the if past its other arm; an i64 arm still does.  An operand adopts
+# its sibling (LARB R21, AGAST #3112): `x + 1` is an i32, so that arm fits.
 _IF = "let n: {t} = if x > 0\n        {a}\n    else\n        {b}"
 RITZ1_EXTRA_REJECTED.update({
-    "if_block_literal_arm_is_i64": (_IF.format(t="i32", a="x", b="0"), None),
-    "if_block_literal_first":      (_IF.format(t="i32", a="0", b="x"), None),
     "if_block_i64_arm":            (_IF.format(t="i32", a="x", b="five()"), None),
+    # The i32 arm into a u8: the literal arm being a u8 does not hide it.
+    "if_block_literal_arm_into_u8": (_IF.format(t="u8", a="x", b="0"), None),
+    # Below an operator an if's literal arm is an i64 again.
+    "if_block_under_operator":     ("let n: i32 = 1 + (if x > 0 then x else 0) * x", None),
 })
 
 # AGAST #1688: shapes ritz1 used to answer NARROW_UNKNOWN for.  Each one in
@@ -183,6 +186,8 @@ RITZ1_EXTRA_ACCEPTED = {
     "i32_global":           ("let n: i32 = G32", None, _DECLS),
     "member_two_levels_i32": ("let n: i32 = q.i.w", _P + ", q: *Out", _DECLS),
 
+    "if_block_literal_arm":     (_IF.format(t="i32", a="x", b="0"), None),
+    "if_block_literal_first":   (_IF.format(t="i32", a="0", b="x"), None),
     "if_block_literal_operand": (_IF.format(t="i32", a="x + 1", b="x"), None),
     "if_block_literal_left_operand": (_IF.format(t="i32", a="1 + x", b="x"), None),
     "shift_count_literal_under_shr": ("let n: u8 = (y << 4) >> 4", "y: u8"),

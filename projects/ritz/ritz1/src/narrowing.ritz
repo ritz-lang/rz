@@ -444,12 +444,22 @@ pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
 
 # `lit_i64` is 1 inside the arms of an `if` expression, where ritz0 emits
 # integer literals with no expected type, so they are i64 there and do NOT
-# adopt the other operand or arm (#1445): measured, `if c` + `x` / `else` +
-# `0` into an i32 is rejected, as is `x + 1` / `y`; `x` / `y` is accepted.
+# adopt the other operand or arm: `let a = if c then x else 0` is an i64.
+#
+# It is NARROW_SLOT for a value tail of a typed slot (AGAST #1445): ritz0
+# carries the slot's type into an if / match's arm values
+# (_arith_context_nodes), so a literal arm is the slot's type there, as the
+# whole initialiser is, and `let n: i32 = if c then x else 255` is an i32.
+# Only through if / match: below an operator an if is that operator's operand
+# and its literal arms are i64 again.
+const NARROW_SLOT: i32 = 2
+
 fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
     if e == null
         return NARROW_UNKNOWN
     let k: i32 = e.kind
+    # What an operator's operand reads: never a slot tail.
+    let op_lit: i32 = (lit_i64 == 1) as i32
     if k == EXPR_INT_LIT
         if lit_i64 == 1
             return TYPE_I64
@@ -490,32 +500,36 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
             # A shift's left literal is not (`1 << n`), as before.
             var lt: i32 = NARROW_LIT
             if e.op == OP_SHL or narrow_operand_lit(e.left, e.right) == 0
-                lt = narrow_src_type_in(env, e.left, lit_i64)
+                lt = narrow_src_type_in(env, e.left, op_lit)
             var rt: i32 = NARROW_LIT
             if narrow_operand_lit(e.right, e.left) == 0
-                rt = narrow_src_type_in(env, e.right, lit_i64)
+                rt = narrow_src_type_in(env, e.right, op_lit)
             return narrow_join(lt, rt)
         return NARROW_UNKNOWN
     if k == EXPR_UNARY
         if e.op == OP_NOT
             return TYPE_BOOL
         if e.op == OP_NEG or e.op == OP_BIT_NOT
-            return narrow_src_type_in(env, e.operand, lit_i64)
+            return narrow_src_type_in(env, e.operand, op_lit)
         return NARROW_UNKNOWN
     if k == EXPR_IF
-        # AGAST #1613: the wider of the two arms, literals counting as i64.
+        # AGAST #1613: the wider of the two arms, literals counting as i64,
+        # or as the slot's type in a slot's tail (#1445, NARROW_SLOT).
         let then_arm: *MatchArm = e.args as *MatchArm
         let else_arm: *MatchArm = then_arm.next
         if then_arm.is_pass != 0 or then_arm.body == null
             return NARROW_UNKNOWN
         if else_arm.is_pass != 0 or else_arm.body == null
             return NARROW_UNKNOWN
-        return narrow_join(narrow_src_type_in(env, then_arm.body, 1), narrow_src_type_in(env, else_arm.body, 1))
+        var arm_lit: i32 = 1
+        if lit_i64 == NARROW_SLOT
+            arm_lit = NARROW_SLOT
+        return narrow_join(narrow_src_type_in(env, then_arm.body, arm_lit), narrow_src_type_in(env, else_arm.body, arm_lit))
     if k == EXPR_MATCH
         # Measured against ritz0, not assumed: a literal arm takes the type
         # of the non-literal arms (`match o: A => x_i32, B => 0` is i32), and
-        # a match whose arms are ALL literals is i64.  (#1445's "literal arms
-        # stay i64" is about `if` arms; see EXPR_IF above and lit_i64.)
+        # a match whose arms are ALL literals is i64.  (An `if`'s literal arms
+        # are i64 outside a slot's tail; see EXPR_IF above and lit_i64.)
         var t: i32 = NARROW_LIT
         var arm: *MatchArm = e.args as *MatchArm
         if arm == null
@@ -776,7 +790,7 @@ fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
     let dw: i32 = ty_bits(decl)
     if init == null or dw <= 1 or dw >= 64
         return 0
-    let src: i32 = narrow_src_type_in(env, init, 0)
+    let src: i32 = narrow_src_type_in(env, init, NARROW_SLOT)
     if src == NARROW_UNKNOWN or src == NARROW_LIT or ty_bits(src) <= dw
         return 0
     var lo: i64 = 0
