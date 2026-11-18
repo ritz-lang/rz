@@ -391,6 +391,102 @@ fn test_arg_to_int() -> i32
     return 0
 
 
+# resp_arg_to_int on `text`: its value when ok is 1, else `bad`.
+fn arg_int_or(text: *u8, bad: i64) -> i64
+    var arg: RespArg
+    arg.data = text
+    arg.len = strlen(text)
+    var ok: i32 = 0
+    let v: i64 = resp_arg_to_int(@arg, @ok)
+    if ok != 1
+        return bad
+    return v
+
+
+# Arguments parse through ritzlib's strview_parse_i64 (#1958): the whole i64
+# range, and nothing outside it. The hand-written loop wrapped i64::MAX + 1
+# to i64::MIN and accepted it.
+[[test]]
+fn test_arg_to_int_range() -> i32
+    let min: i64 = -9223372036854775807 - 1
+    let max: i64 = 9223372036854775807
+    if arg_int_or(c"-9223372036854775808", 7) != min
+        return 1
+    if arg_int_or(c"9223372036854775807", 7) != max
+        return 2
+    if arg_int_or(c"0", 7) != 0
+        return 3
+    if arg_int_or(c"9223372036854775808", 7) != 7
+        return 4
+    if arg_int_or(c"-9223372036854775809", 7) != 7
+        return 5
+    if arg_int_or(c"18446744073709551621", 7) != 7  # 2^64 + 5
+        return 6
+    if arg_int_or(c"12x", 7) != 7
+        return 7
+    if arg_int_or(c"-", 7) != 7
+        return 8
+    # Redis takes no '+' sign; neither does tome.
+    if arg_int_or(c"+5", 7) != 7
+        return 9
+    return 0
+
+
+# resp_read_int over `text` from its start: the value, with *ok set as the
+# parser sets it (1 read, 0 incomplete, -1 malformed).
+fn read_int(text: *u8, ok: *i32) -> i64
+    var p: RespParser
+    resp_parser_init(@p, text, strlen(text))
+    return resp_read_int(@p, ok)
+
+
+# A RESP header integer (":n", "$n", "*n") covers i64 too. The old reader
+# refused anything over 18 digits, so i64::MIN and i64::MAX were malformed.
+[[test]]
+fn test_read_int_range() -> i32
+    var ok: i32 = 0
+    let min: i64 = -9223372036854775807 - 1
+    if read_int(c"-9223372036854775808\r\n", @ok) != min or ok != 1
+        return 1
+    if read_int(c"9223372036854775807\r\n", @ok) != 9223372036854775807 or ok != 1
+        return 2
+    if read_int(c"0\r\n", @ok) != 0 or ok != 1
+        return 3
+    if read_int(c"-1\r\n", @ok) != -1 or ok != 1
+        return 4
+    read_int(c"9223372036854775808\r\n", @ok)
+    if ok != -1
+        return 5
+    read_int(c"12x\r\n", @ok)
+    if ok != -1
+        return 6
+    read_int(c"+5\r\n", @ok)
+    if ok != -1
+        return 7
+    read_int(c"-\r\n", @ok)
+    if ok != -1
+        return 8
+    read_int(c"\r\n", @ok)
+    if ok != -1
+        return 9
+    # Digits with no \r yet are incomplete, until they are too long to be
+    # an i64: then it is malformed, not a wait for bytes that fix nothing.
+    read_int(c"-92233720368547758", @ok)
+    if ok != 0
+        return 10
+    read_int(c"123456789012345678901", @ok)
+    if ok != -1
+        return 11
+    read_int(c"12\r", @ok)
+    if ok != 0
+        return 12
+    # ... and a byte no integer holds is malformed before its \r arrives.
+    read_int(c"12x", @ok)
+    if ok != -1
+        return 13
+    return 0
+
+
 [[test]]
 fn test_arg_copy() -> i32
     var arg: RespArg

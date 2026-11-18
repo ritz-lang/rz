@@ -94,6 +94,39 @@ def session(msgs, argv=(), env=None, cwd=None, framer=frame):
         out.append(json.loads(p.stdout[m.end():m.end() + int(m.group(1))]))
     return p.returncode, out
 
+# Content-Length is read by ritzlib's strview_parse_i64 (#1958): digits only,
+# range-checked. A value that is not a positive length the server can buffer
+# closes the connection unanswered; the hand-written loop it replaced wrapped
+# 2^64 + n round to n and read "<n>x" as n, answering a frame it should not.
+INIT = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                   "params": {"processId": None, "rootUri": None,
+                              "capabilities": {}}}).encode()
+def raw_init(value):
+    """initialize under a hand-written Content-Length value; return
+    (exit code, ids of the responses it sent)."""
+    stdin = (b"Content-Length: " + value + b"\r\n\r\n" + INIT
+             + frame({"jsonrpc": "2.0", "id": 99, "method": "shutdown"})
+             + frame({"jsonrpc": "2.0", "method": "exit"}))
+    p = subprocess.run([BIN], input=stdin, capture_output=True, timeout=20)
+    ids = [json.loads(p.stdout[m.end():m.end() + int(m.group(1))]).get("id")
+           for m in re.finditer(rb"Content-Length: (\d+)\r\n\r\n", p.stdout)]
+    return p.returncode, ids
+n = len(INIT)
+for label, value, answered in (
+        ("the exact length", b"%d" % n, True),
+        ("the exact length, padded", b"  %d \t" % n, True),
+        ("0", b"0", False),
+        ("i64::MIN", b"-9223372036854775808", False),
+        ("i64::MAX", b"9223372036854775807", False),
+        ("i64::MAX + 1", b"9223372036854775808", False),
+        ("2^64 + the length (wraps to it)", b"%d" % (2**64 + n), False),
+        ("the length with trailing junk", b"%dx" % n, False),
+        ("a signed length", b"+%d" % n, False),
+        ("a non-digit", b"abc", False)):
+    rc, ids = raw_init(value)
+    check(f"Content-Length {label}: {'answered' if answered else 'closes unanswered'}",
+          rc == 0 and ((1 in ids) == answered), f"exit {rc}, answered ids {ids}")
+
 class Live:
     """A server driven one step at a time. `first` is written into its stdin
     pipe before it starts, so it reads all of `first` as one burst."""
