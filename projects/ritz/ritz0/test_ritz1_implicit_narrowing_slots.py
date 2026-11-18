@@ -91,6 +91,17 @@ EXTRA_ACCEPTED = {
 }
 
 
+# ritz0's async rows (#4166) name the fn; ritz1 still names the lowered
+# place it assigns. Same verdict and position, only the words differ.
+# AGAST #4221 drops this table.
+_RESULT_PLACE = "`self.__result` is `i32`"
+RITZ1_WORDING = {
+    "async_return": _RESULT_PLACE,
+    "async_tail": _RESULT_PLACE,
+    "async_return_after_await": _RESULT_PLACE,
+}
+
+
 def _rows():
     """(id, body, check): check(r, work) is None or what went wrong."""
     def rejects(r, _work):
@@ -105,7 +116,7 @@ def _rows():
 
     rows = [(f"rejected[{n}]", b, rejects) for n, b in sorted(SLOTS.REJECTED.items())]
     rows += [(f"accepted[{n}]", b, accepts) for n, b in sorted(SLOTS.ACCEPTED.items())]
-    rows += [(f"diagnostic[{n}]", body, at(line, col, slot))
+    rows += [(f"diagnostic[{n}]", body, at(line, col, RITZ1_WORDING.get(n, slot)))
              for n, (body, line, col, slot) in sorted(SLOTS.DIAGNOSTICS.items())]
     rows += [(f"extra_rejected[{n}]", b, rejects) for n, b in sorted(EXTRA_REJECTED.items())]
     rows += [(f"extra_accepted[{n}]", b, accepts) for n, b in sorted(EXTRA_ACCEPTED.items())]

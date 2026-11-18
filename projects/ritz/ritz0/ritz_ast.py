@@ -688,6 +688,10 @@ class AssignStmt(Stmt):
     # The `let`/`var` name this store stands for, when an async fn's lowering
     # turned `let v: T = e` into `*self.v = e` (#1444): diagnostics name `v`.
     lowered_let: Optional[str] = field(default=None, compare=False, repr=False)
+    # The async fn whose result this store is, when its lowering turned
+    # `return e` into `*self.__result = e` (#4166): diagnostics say
+    # "`f` returns `T`", as for a plain fn's `return`.
+    lowered_return: Optional[str] = field(default=None, compare=False, repr=False)
 
 
 @dataclass

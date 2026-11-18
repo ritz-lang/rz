@@ -124,6 +124,12 @@ DIAGNOSTICS = {
     "assign": (_fn("var n: i32 = 0\nn = big()"), 3, 9, "`n` is `i32`"),
     "arg":    (_fn("let r = take(big())"), 2, 18, "argument 1 of `take` is `i32`"),
     "field":  (_fn("var p = P { x: 0 }\np.x = big()"), 3, 11, "`p.x` is `i32`"),
+    # An async fn's result is lowered to a store into its future's
+    # `__result`; the error names the fn, as a plain `return` does (#4166).
+    "async_return": ("async fn f() -> i32\n    return big()\n", 2, 12, "`f` returns `i32`"),
+    "async_tail":   ("async fn f() -> i32\n    big()\n", 2, 5, "`f` returns `i32`"),
+    "async_return_after_await": ("async fn f() -> i32\n    let w = await one()\n    return big()\n\n"
+                                 "async fn one() -> i32\n    1\n", 3, 12, "`f` returns `i32`"),
 }
 
 
@@ -198,8 +204,8 @@ ACCEPTED = {
     "tail_else_if_literal_inner": _fn("if x == 1\n    x\nelse if x == 2\n    1\nelse\n    0", tail=""),
     "let_else_if_chain":      _fn("let n: i32 = if x == 1 then 1 else if x == 2 then x else 0",
                                   tail="return n"),
-    # Not returned at all: a procedure's tail, and an async fn's Ready value,
-    # which PollAbi's i32 carries until #3728 (R78).
+    # Not returned at all: a procedure's tail. An async fn's result is
+    # checked at its declared type (R78), so an i64 one takes `big()` whole.
     "procedure_tail":         "fn f()\n    big()\n",
     "void_fn_tail":           "fn f() -> void\n    big()\n",
     "async_fn_result":        "async fn f() -> i64\n    return big()\n",

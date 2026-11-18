@@ -2830,8 +2830,17 @@ fn main() -> i32
 ```
 
 A procedure's tail value is discarded, so it converts to nothing and isn't
-checked. Neither is an `async fn`'s result yet: the poll ABI carries it in an
-`i32` until AGAST #3728.
+checked. An `async fn`'s result is checked at its declared type, like any
+other fn's: only its poll fn's own answer, the poll ABI's `bool` (LARB R78),
+is not a return the user wrote.
+
+```ritz expect-error="implicit narrowing: `f` returns `i32` but this value has type `i64`"
+fn big() -> i64
+    return 4294967301
+
+async fn f() -> i32
+    return big()            # would silently resolve to 5
+```
 
 A non-literal array element is held to the same rule, against the element type:
 

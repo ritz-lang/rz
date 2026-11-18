@@ -7797,7 +7797,8 @@ class LLVMEmitter:
                 self._reject_enum_assign(stmt.target, v, getattr(stmt, 'span', None))
                 self._expect_assign_narrowing(stmt.target, stmt.value, v,
                                               getattr(stmt, 'lowered_let', None),
-                                              getattr(stmt, 'span', None))
+                                              getattr(stmt, 'span', None),
+                                              getattr(stmt, 'lowered_return', None))
                 return v
 
             # LARB R61 (§13.6): the place, then `v`.  `a[i] = v` evaluates
@@ -16041,7 +16042,8 @@ class LLVMEmitter:
 
     def _expect_assign_narrowing(self, target: rast.Expr, value: rast.Expr,
                                  val: ir.Value, lowered_let: Optional[str] = None,
-                                 at: Optional[rast.Span] = None) -> None:
+                                 at: Optional[rast.Span] = None,
+                                 lowered_return: Optional[str] = None) -> None:
         """Arm section 7.5 for the store of assigned value `val` (#1444).
 
         An assignment stores through one of a dozen routes (a name, a global,
@@ -16055,9 +16057,15 @@ class LLVMEmitter:
             slot = None
         # An async fn's `let v: T = await e` is a store into `*self.v`: the
         # user wrote `v`, at the `let`, and the value has no position.
+        # An async fn's `return e` is a store into `*self.__result`: the user
+        # wrote a return, so say what `_check_return_narrowing` says (#4166).
         place = lowered_let if lowered_let is not None else self._place_text(target)
-        what = (f"`{place}` is `{{t}}`" if place is not None
-                else "the place assigned is `{t}`")
+        if lowered_return is not None:
+            what = f"`{lowered_return}` returns `{{t}}`"
+        elif place is not None:
+            what = f"`{place}` is `{{t}}`"
+        else:
+            what = "the place assigned is `{t}`"
         self._assign_narrowing = (val, value, slot, what, at if lowered_let else None)
 
     @classmethod
@@ -16095,7 +16103,8 @@ class LLVMEmitter:
         if self._is_procedure(fn_def):
             return      # a procedure's tail is evaluated for effect, not returned
         if getattr(fn_def, 'is_async_poll', False):
-            return      # PollAbi's i32, not the async fn's type: #3728 (R78)
+            return      # PollAbi's bool answer (R78); the async fn's result is
+                        # judged at its `__result` store (#4166)
         name = getattr(fn_def, 'name', None)
         what = f"`{name}` returns `{{t}}`" if name else "this fn returns `{t}`"
         self._check_slot_narrowing(value, val, ret_type, ret_ritz, what, "return")

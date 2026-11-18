@@ -346,8 +346,11 @@ class PollAbi:
     # poll source, evaluated again at each poll: an i32, -1 while Pending.
     EXPR_TYPE = 'i32'
 
-    def __init__(self, span: rast.Span):
+    def __init__(self, span: rast.Span, fn_name: Optional[str] = None):
         self.span = span
+        # The async fn whose poll this is: a narrowing in the store of its
+        # result names `fn_name`, not `*self.__result` (#4166).
+        self.fn_name = fn_name
 
     def _bool(self, value: bool) -> rast.Expr:
         return rast.BoolLit(span=self.span, value=value)
@@ -380,7 +383,8 @@ class PollAbi:
         stmts: List[rast.Stmt] = []
         if value is not None:
             if result is not None:
-                stmts.append(rast.AssignStmt(span=span, target=result, value=value))
+                stmts.append(rast.AssignStmt(span=span, target=result, value=value,
+                                             lowered_return=self.fn_name))
             elif not isinstance(value, (rast.IntLit, rast.BoolLit, rast.Ident, rast.Field)):
                 stmts.append(rast.ExprStmt(span=span, expr=value))
         stmts.append(rast.ReturnStmt(span=span, value=rast.BoolLit(span=span, value=True)))
@@ -1044,7 +1048,7 @@ class TrueAsyncGenerator:
         self.dummy_span = rast.Span(0, 0, 0, 0)
         # Set of known async function names (for await transformation)
         self.async_functions = async_functions or set()
-        self.abi = PollAbi(self.dummy_span)
+        self.abi = PollAbi(self.dummy_span, self.fn_def.name)
 
     def generate(self) -> AsyncStateMachine:
         """Generate the complete state machine."""
@@ -1172,7 +1176,7 @@ class TrueAsyncGenerator:
         if tail is not None and not (isinstance(tail, rast.Ident) and tail.name == 'pass'):
             if self.fn_def.ret_type is not None:
                 transformed.stmts.append(rast.AssignStmt(span=tail.span, target=rewriter.result(tail.span),
-                                                         value=tail))
+                                                         value=tail, lowered_return=self.fn_def.name))
             else:
                 transformed.stmts.append(rast.ExprStmt(span=tail.span, expr=tail))
         transformed.expr = rast.BoolLit(span=self.dummy_span, value=True)
