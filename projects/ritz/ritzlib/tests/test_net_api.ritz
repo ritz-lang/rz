@@ -456,7 +456,7 @@ fn test_connect_timeout_loopback_ok() -> i32
     assert srv.fd >= 0
     var c: Socket = socket_tcp()
     # A slice of a longer literal: the address needs no terminator.
-    assert unit_ok(socket_connect_timeout(@&c, strview_slice("127.0.0.1:x", 0, 9), port, 1000)) == 1
+    assert unit_ok(socket_connect_timeout(@&c, strview_slice("127.0.0.1:x", 0, 9), port, 5000)) == 1
     # The socket is blocking again afterwards: a send of one byte completes.
     assert count_of(socket_send_str(@&c, "x")) == 1
     socket_close(@&c)
@@ -483,7 +483,7 @@ fn test_connect_timeout_refused_is_the_errno() -> i32
     let port: i32 = bound_port(@tmp)
     socket_close(@&tmp)
     var c: Socket = socket_tcp()
-    assert unit_err(socket_connect_timeout(@&c, "127.0.0.1", port, 1000)) == E_CONNREFUSED
+    assert unit_err(socket_connect_timeout(@&c, "127.0.0.1", port, 5000)) == E_CONNREFUSED
     socket_close(@&c)
     0
 
@@ -621,25 +621,41 @@ fn test_send_all_sends_a_vec_span_and_methods() -> i32
 
 fn sleep_ms(ms: i64)
     var ts: [2]i64
-    ts[0] = 0
-    ts[1] = ms * 1000000
+    # tv_nsec must stay below 1e9, or nanosleep fails EINVAL at once.
+    ts[0] = ms / 1000
+    ts[1] = (ms % 1000) * 1000000
     sys_nanosleep(@ts[0], null)
 
 # A blocking write() on a TCP socket only comes back short when something
 # cuts it off; SO_SNDTIMEO does, once the call has spent that long in total
-# waiting for buffer space.  16 MiB is more than loopback buffers hold, and a
-# forked reader drains it 64 KiB per 10 ms: well over the 300 ms timeout
-# overall, with no single gap near it.  So the first write() returns short
-# and send_all must keep going.  The child exits 0 iff it read every byte.
+# waiting for buffer space.  16 MiB is more than loopback buffers hold, and
+# the forked reader reads nothing for 3 s, then drains without pausing.  So
+# the first write() fills the buffers and comes back short after the 2 s
+# timeout, and send_all must keep going: its next write() waits ~1 s for the
+# reader to start, inside its own 2 s.
+#
+# One sleep, with a second of slack either way, is the only timing here.
+# This test used to have its reader sleep 10 ms after every 64 KiB against a
+# 300 ms timeout: 256 wake-ups that each had to come within 300 ms, which a
+# loaded host missed in about half of all runs (AGAST #3942).  If the reader
+# wakes early, the first write() just completes: the test passes without
+# covering a short write, rather than failing.
+# The child exits 0 iff it read every byte.
 [[test]]
 fn test_send_all_completes_after_short_writes() -> i32
     let total: i64 = 16777216
+    # Filled before the fork, so the first write() starts right after connect.
+    var big: Vec<u8> = vec_new<u8>()
+    vec_ensure_cap<u8>(@&big, total)
+    memset(big.data, 'z', total)
+    big.len = total
     var port: i32 = 0
     var srv: Socket = listen_loopback(@port)
     assert srv.fd >= 0
 
     let pid: i32 = sys_fork()
     if pid == 0
+        sleep_ms(3000)
         var peer: Socket = peer_of(socket_accept(@&srv))
         var got: i64 = 0
         var chunk: Vec<u8> = vec_with_cap<u8>(65536)
@@ -649,18 +665,13 @@ fn test_send_all_completes_after_short_writes() -> i32
             if n <= 0
                 break
             got += n
-            sleep_ms(10)
         if got == total
             sys_exit(0)
         sys_exit(1)
 
     var c: Socket = socket_tcp()
     assert unit_ok(socket_connect(@&c, "127.0.0.1", port)) == 1
-    assert unit_ok(socket_set_io_timeout(@&c, 300)) == 1
-    var big: Vec<u8> = vec_new<u8>()
-    vec_ensure_cap<u8>(@&big, total)
-    memset(big.data, 'z', total)
-    big.len = total
+    assert unit_ok(socket_set_io_timeout(@&c, 2000)) == 1
     assert count_of(socket_send_all(@&c, span_from_vec<u8>(@big))) == total
     socket_close(@&c)
 
