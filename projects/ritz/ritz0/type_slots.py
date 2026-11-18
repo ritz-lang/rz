@@ -43,8 +43,15 @@ class SlotInferMixin:
     def _infer_arm(self, body: rast.Expr, slot: Optional[rast.Type],
                    discarded: bool) -> rast.Type:
         """An arm's or branch's value: dropped with its `if`/`match`, or
-        landing in the slot that one lands in."""
-        return self._infer_discarded(body) if discarded else self._infer_into(body, slot)
+        landing in the slot that one lands in.  A dropped one is judged as
+        any discarded statement (LARB R69, AGAST #3968): a branch of an `if`
+        used as a statement, else-less always, or an arm of a `match` used
+        as one, is never a value, so a whole array there is refused."""
+        if not discarded:
+            return self._infer_into(body, slot)
+        ty = self._infer_discarded(body)
+        self._check_discarded(body, ty)
+        return ty
 
     def _infer_into(self, expr: rast.Expr, slot: Optional[rast.Type]) -> rast.Type:
         """The type of `expr`, whose value lands in a `slot`-typed place.

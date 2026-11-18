@@ -36,12 +36,19 @@ REFUSED = {
     "deref_void_tail": "fn f(p: *[2]i32)\n    ^*p\n",
     # An arm's last statement before its value is not the arm's value
     # (AGAST #3920: ritz1 judged only a statement with a next one, and the
-    # arm's value lives apart from its statements).  As ritz0, the trailing
-    # value of an else-less `if` body is not judged.
+    # arm's value lives apart from its statements).
     "field_before_match_arm_value": ("fn f(w: W, c: i32) -> i32\n    match c\n        3 =>\n"
                                      "            ^w.a\n            1\n        _ => 0\n"),
     "field_before_if_expr_arm_value": ("fn f(w: W, c: i32) -> i32\n    let v: i32 = if c == 2\n"
                                        "        ^w.a\n        1\n    else\n        0\n    v\n"),
+    # LARB R69 (AGAST #3968): a branch of an `if` used as a statement (always
+    # so without `else`) and an arm of a `match` used as one are never values;
+    # their last line is discarded like any statement.  Loop bodies' reach is
+    # test_ritz1_sema_discarded_array_if_arm.py's.
+    "field_else_less_if_tail": "fn f(w: W, c: i32) -> i32\n    if c == 1\n        ^w.a\n    3\n",
+    "field_match_statement_arm": ("fn f(w: W, c: i32) -> i32\n    match c\n        3 => ^w.a\n"
+                                  "        _ => pass\n    3\n"),
+    "field_one_line_if_statement": "fn f(w: W, c: i32) -> i32\n    if c == 1 then ^w.a else w.a\n    3\n",
 }
 
 

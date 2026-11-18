@@ -29,7 +29,8 @@ THE TESTS
   call, a call returning a pointer, a method call), a loop body, a void fn's
   tail and a method's, and an arm's last statement before its value (AGAST
   #3920: the emitter only ever judged a statement with a next one).
-  Unreported, as by ritz0: the trailing value of an else-less `if` body.
+  LARB R69 (AGAST #3968): the trailing value of an else-less `if` body, a
+  statement `if` / `match` arm's and a loop body's, which are discarded.
   if_arm: a nested else-less `if`, an array-valued if (emit_array_if_into),
   a `return if`, the generic wording; an arm that returns is not refused.
 """
@@ -120,13 +121,40 @@ fn v(w: W)
 
 pub fn main() -> i32
     0
+
+fn s(w: W, c: i32) -> [2]i32
+    if c == 1
+        w.a
+    else
+        w.a
+    while c == 2
+        w.a
+    for i in 0..2
+        w.a
+    loop
+        if c == 7
+            break
+        w.a
+    match c
+        4 => w.a
+        _ => pass
+    let b: [2]i32 = if c == 5
+        w.a
+    else
+        w.a
+    if c == 6
+        w.a
+    else
+        b
 """
 
 # line:col of each report, as ritz0 makes them.  38:13, an arm's statement
-# before its value, joined in AGAST #3920; 32:9, the trailing value of an
-# else-less `if` body, is judged by none of the three (see the docstring).
+# before its value, joined in AGAST #3920.  LARB R69 (AGAST #3968): 32:9, the
+# trailing value of an else-less `if` body, and fn s's statement `if` / loop
+# bodies' tails and statement `match` arm; its `let` and tail `if` are values.
 ARRAY_WANTED = sorted(["22:5", "23:5", "24:5", "25:6", "26:5", "27:5", "28:5",
-                       "29:5", "34:9", "38:13", "44:5", "13:9"])
+                       "29:5", "32:9", "34:9", "38:13", "44:5", "13:9",
+                       "51:9", "53:9", "55:9", "57:9", "61:9", "63:14"])
 
 IF_REACH = """\
 fn f(c: i32, d: i32) -> i32
