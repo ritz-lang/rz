@@ -67,6 +67,13 @@ LOCAL_MODULES = {
     "smoke_stack",
     "standard_report",  # docs/STANDARD.md's conformance report (AGAST #1344)
     "ritzgen_py",
+    # ritz0's compiler and ritz/resolve.py, on sys.path by the test that
+    # imports them (test_nexus_r59_worlds.py, AGAST #4158)
+    "ritz0",
+    "move_walk",
+    "ritz_ast",
+    "import_resolver",
+    "resolve",
 }
 
 # Packages under tools/ whose modules are scanned too. smoke_stack was one
