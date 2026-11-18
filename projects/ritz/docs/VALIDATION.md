@@ -249,7 +249,9 @@ of 560 fns. Now every `*.ritz` in `ritz0/test/` is discovered (minus
 `NOT_TESTS`, files with nothing to execute), every `[[test]]` fn is its own
 unit (`file::fn`, own process), a file with no tests but a `main` runs that
 main, and the gate fails if any `[[test]]` line on disk did not become an
-executed unit. Files using ISA extensions the host lacks (`REQUIRES_CPU`) are
+executed unit. A file may not have both: the harness strips `main` from a file
+with `[[test]]` fns, so that main would be compiled by no gate (AGAST #4043).
+Files using ISA extensions the host lacks (`REQUIRES_CPU`) are
 reported as skipped, never as passes.
 
 Known failures are `gate = "matrix"` entries in the workspace's

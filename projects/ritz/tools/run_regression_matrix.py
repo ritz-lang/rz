@@ -317,6 +317,13 @@ def floor_violations(srcs, results):
             out.append(f"{name}: {markers} [[test]] line(s) but {parsed} parsed test fn(s) — "
                        f"find_test_fns cannot read a test signature; fix the parser, "
                        f"do not let the fn drop out")
+        # AGAST #4043: build_harness (and `ritz0 --test`) strip main from a
+        # file with [[test]] fns, so that main is compiled by no gate. Three
+        # of them hid a whole-file compile error until #3610.
+        if markers and _MAIN_RE.search(src):
+            out.append(f"{name}: has [[test]] fn(s) and a main, and the harness strips "
+                       f"main, so no gate compiles its body — delete main, or move what "
+                       f"it checks into a [[test]] fn (AGAST #4043)")
         units = units_for(name, src)
         if not units and markers == 0:
             out.append(f"{name}: no [[test]] fn and no main, so nothing runs — add a test "

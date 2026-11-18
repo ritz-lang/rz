@@ -187,6 +187,11 @@ fn main() -> i32
 """
 
 
+# THREE_FNS with its main gone: the shape every corpus file must have, since
+# a main beside [[test]] fns is stripped unseen (AGAST #4043).
+THREE_FNS_NO_MAIN = THREE_FNS[:THREE_FNS.index("fn main(")]
+
+
 @pytest.mark.unit
 def test_find_test_fns_returns_every_fn_with_its_return_type():
     assert matrix.find_test_fns(THREE_FNS) == [
@@ -314,14 +319,14 @@ def test_known_names_the_matching_entry():
 
 @pytest.mark.unit
 def test_floor_passes_when_every_marker_ran():
-    srcs = {"t": THREE_FNS}
+    srcs = {"t": THREE_FNS_NO_MAIN}
     results = {"ritz1": _results(**{"t::test_a": "pass", "t::test_b": "pass", "t::test_c": "pass"})}
     assert matrix.floor_violations(srcs, results) == []
 
 
 @pytest.mark.unit
 def test_floor_fails_when_a_unit_did_not_run():
-    srcs = {"t": THREE_FNS}
+    srcs = {"t": THREE_FNS_NO_MAIN}
     results = {"ritz1": _results(**{"t::test_a": "pass", "t::test_b": "pass"})}
     v = matrix.floor_violations(srcs, results)
     assert v and "t::test_c" in " ".join(v)
@@ -332,6 +337,24 @@ def test_floor_fails_when_a_marker_has_no_parsed_fn():
     srcs = {"t": "[[test]]\npub fn test_x() -> i32\n    0\n"}
     v = matrix.floor_violations(srcs, {"ritz1": {}})
     assert v and "t" in v[0] and "1" in v[0]
+
+
+@pytest.mark.unit
+def test_floor_fails_when_a_file_has_test_fns_and_a_main():
+    """AGAST #4043: build_harness strips main, and so does `ritz0 --test`, so
+    a main beside [[test]] fns is compiled by no gate. test_level21/22/23 hid
+    a whole-file compile error there until #3610. Every unit ran here; the
+    main alone must fail the floor."""
+    results = {"ritz1": _results(**{"t::test_a": "pass", "t::test_b": "pass", "t::test_c": "pass"})}
+    v = matrix.floor_violations({"t": THREE_FNS}, results)
+    assert len(v) == 1 and v[0].startswith("t:") and "main" in v[0], v
+
+
+@pytest.mark.unit
+def test_floor_accepts_a_main_driven_file():
+    """A file with no [[test]] fn runs its main whole: that main is compiled."""
+    src = "fn main() -> i32\n    0\n"
+    assert matrix.floor_violations({"t": src}, {"ritz1": _results(**{"t::main": "pass"})}) == []
 
 
 @pytest.mark.unit
