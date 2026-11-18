@@ -8,8 +8,8 @@ as *signed*.  With `b = 0xFFFFFFFFFFFFFFF8 as usize`, `b >> 60` was an
 arithmetic shift, `b > 1` was false, `/` and `%` were signed, and `b as f64`
 was negative.  ritz1 now maps `usize` to TYPE_U64 where it maps type names
 (type_named for a written type, primitive_type_from_name for a monomorph's
-`*T` at T = usize), and `isize` stays TYPE_I64.  A generic argument still
-mangles as written (`P$usize`, generic_arg_spelling).
+`*T` at T = usize), and `isize` stays TYPE_I64.  A generic argument mangles
+as the integer too (`P$u64`, AGAST #3935), as ritz0 spells it.
 
 ritz1 doesn't lex `_` digit separators (#3584), so the literals here are
 written without them.
@@ -104,15 +104,16 @@ def test_ritz1_usize_is_u64(run_with, compiler, name):  # noqa: F811
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", RITZ1S)
-def test_ritz1_usize_generic_arg_keeps_its_spelling(compile_with, compiler):  # noqa: F811
-    """`P<usize>` still mangles `P$usize` (#2198), now that usize is TYPE_U64.
+def test_ritz1_usize_generic_arg_is_u64(compile_with, compiler):  # noqa: F811
+    """`P<usize>` mangles `P$u64` (AGAST #3935): the same instance as `P<u64>`.
 
-    generic_arg_spelling kept the written name only for a TYPE_I64, so the
-    switch to TYPE_U64 renamed every usize instance `$u64`: a different symbol
-    from the `$usize` one ritz0 and the other ritz1 call sites spell.
+    #2198 kept the written `P$usize`, then ritz0's spelling.  R53 made usize
+    another name for u64 and ritz0 resolves it in its parser, so `$usize` was
+    a second type a `P<u64>` refused.  test_word_type_generic_arg.py pins it
+    on all three compilers.
     """
     comp, ll, _ = compile_with(compiler, "spelling", _program(CASES["generic_pointee"]))
     assert comp.returncode == 0, comp.stdout + comp.stderr
     ir = ll.read_text()
-    assert "%P$usize = type" in ir
-    assert "P$u64" not in ir
+    assert "%P$u64 = type" in ir
+    assert "usize" not in ir
