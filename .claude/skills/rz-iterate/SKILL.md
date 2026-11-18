@@ -658,7 +658,8 @@ This is also how Borque's conductor works.
   conflict shows up at once. **Gate it at once on a remote host,
   speculatively** (AGAST #3988, step 4b): it is tested on the gating
   train's tail while that train is still being tested. If the first train
-  passes, both land in order. If it fails, the second train's verdict is
+  passes, both land in order. If the second passes first, it lands both at
+  once and the first one's gate is cancelled (step 5). If the first fails, the second train's verdict is
   thrown away and it is rebuilt and re-gated on the new base. **At most 2
   trains in flight** (one here, one remote); REAPs that arrive while both
   gate form train 3, which gates once train 1 lands.
@@ -671,8 +672,9 @@ This is also how Borque's conductor works.
 
 `train.sh` numbers trains in landing order: **train 1** is the one gating
 (or about to), train 2 is stacked on its tail, and so on (AGAST #3809).
-`gate` and `land` always act on train 1; `land` then promotes train 2 to
-train 1.
+`gate` always acts on train 1. `land <log>` lands the train whose tip the
+log passed, and every train below it (step 5), then promotes the next one
+to train 1.
 
 1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it)
    `append_scratchpad_item` immediately, even while a train is gating, then
@@ -738,7 +740,9 @@ train 1.
       **that tree's** `run-gate.sh` with `RZ_GATE_TRAIN=1` (train priority,
       FIFO and reservation on that host, #3317/#3364/#3427, against that
       host's own room gates) and the package tests (#3363) as
-      `RZ_GATE_AFTER`. It records `SPEC=<host> <ref> <remote log> <local
+      `RZ_GATE_AFTER`. Its base, for the package tests and ci-local's
+      `--diff-base`, is `main` (train 1's base), not train 1's tail: a
+      pass lands train 1 too, so it must cover train 1's cars (#4151). It records `SPEC=<host> <ref> <remote log> <local
       log>` in train 2's state and prints the local log path,
       `gate-logs/train-<tip12>-<n>@<host>.log`. stderr says `SPEC train 2
       tip=<12> on <host>: <remote log>`.
@@ -749,9 +753,10 @@ train 1.
       prints `gate <log> SHA=<12> EXIT=<rc>` and exits with the gate's
       code. `land` then checks `SHA=<tip>` and `EXIT=0` exactly as for a
       local log.
-   3. The ref is deleted when the train lands, or when a `build` replaces
-      the train (a `DISCARDED speculative gate on <host> ...` line, which
-      also stops the host's `ritz-gate-train` unit).
+   3. The ref is deleted when the train lands, when a deeper train's pass
+      lands it (a `CANCELLED speculative gate on <host> ...` line), or when
+      a `build` replaces the train (a `DISCARDED speculative gate on <host>
+      ...` line). Both lines also stop the host's `ritz-gate-train` unit.
 
    Refusals: no train 2 (`gate` is for train 1), `gate=not-needed` (land
    it after train 1), or train 2 already gating (**at most 2 in flight**).
@@ -760,8 +765,8 @@ train 1.
    not start`), let train 2 gate here after train 1 lands, as before. If a
    remote gate dies or the host goes away, rebuild with the same cars (a
    plain `build` of trains 1 and 2: same cars on the same tail give the
-   same tips) and gate again. Landing still goes strictly in order: train
-   2 lands only after train 1, on its own verdict.
+   same tips) and gate again. Trains still land in order, but a passed
+   train 2 lands train 1 with it (step 5): don't wait for train 1's gate.
    Run the wait with `run_in_background`, so it wakes this room when the gate
    ends, and keep the usual 1800 s fallback wakeup. Carry on with the loop
    (slots, nudges, `build --next` for REAPs that arrive) meanwhile. On a
@@ -819,12 +824,26 @@ train 1.
    ```bash
    .claude/skills/rz-iterate/train.sh land "$LOG"      # no log when not needed
    ```
-   It lands train 1 only. It refuses if the log isn't for train 1's tip,
-   didn't pass, or `main` moved since the build; then rebuild and re-gate.
-   It pushes the tip to `main` (never forced), fast-forwards
+   **Land the deepest train that passed** (AGAST #4151, #4130). `$LOG` may be
+   any train's: train k is built on train k-1's tail, so a pass of train k's
+   tip tested every car of trains 1..k, and `land` lands them all in one
+   push. Trains 1..k-1's gates only repeat that verdict, so `land` cancels
+   them: it stops the local `ritz-gate-train` unit and clears its
+   `.train-waiting` (the slot frees at once, `CANCELLED local gate ...`),
+   and stops a remote one and deletes its ref (`CANCELLED speculative gate
+   on <host> ...`). So when train 2's remote gate passes while train 1 still
+   gates here, land train 2's log straight away. A red train 1 doesn't
+   block a green train 2 either: train 2 passed on exactly the tree that
+   lands, so train 1's red was a flake or was fixed by a later car (read it
+   before you move on). The 8-car cap is per gate, so landing 16 cars at
+   once this way is fine. A red train k changes nothing.
+   It refuses if the log isn't for any train's tip, didn't pass, a train
+   1..k moved since the build or isn't on the tail below it, or `main`
+   moved since the build; then rebuild and re-gate.
+   It pushes train k's tip to `main` (never forced), fast-forwards
    `~/dev/ritz-lang/rz`, and prints `MERGED <branch> <room sha12> as <main
-   sha12>` per commit. If a train was stacked behind it, it prints `NEXT
-   base=<12> tip=<12> n=<cars> gate=<...>`: that train is train 1 now, its
+   sha12>` per commit of trains 1..k. If a train was stacked behind train k,
+   it prints `NEXT base=<12> tip=<12> n=<cars> gate=<...>`: that train is train 1 now, its
    base (the tail just pushed) is `main`, so gate it straight away (step 4),
    or land it with no log if `gate=not-needed`. If it was gating remotely
    (4b) the line ends `spec=<local log>`: don't gate it again, `train.sh

@@ -21,8 +21,10 @@
 #                                       remote log back first)
 #   train.sh discard                    drop every speculative gate (a dead
 #                                       host); the trains stay
-#   train.sh land [<log>]               push train 1's tail to main; train 2
-#                                       becomes train 1
+#   train.sh land [<log>]               push the tail of the train <log>
+#                                       passed (train k) to main, landing
+#                                       trains 1..k and cancelling their
+#                                       gates; train k+1 becomes train 1
 #   train.sh show                       print every train, in landing order
 #   train.sh pkgs list|test <base>      the touched packages' tests (#3363;
 #                                       the gate runs `test` after its jobs)
@@ -31,9 +33,14 @@
 # car 9 onward start the next train on its tail.  Each train has its own
 # worktree (train 1 first used $RZ_TRAIN_WT, the next free slot <wt>-2, ...)
 # and state file, so building train 2 while train 1 gates leaves train 1's
-# tree and state alone.  Trains gate and land in order: land takes train 1
-# only, and train 2's base, train 1's tail, is then main.  The landing order
-# is the slot list in <common git dir>/RZ_TRAINS.
+# tree and state alone.  Trains land in order, and the landing order is the
+# slot list in <common git dir>/RZ_TRAINS.  A passed train k covers trains
+# 1..k-1 (AGAST #4151): it is built on their tails, so its gate tested every
+# car below it.  `land <train k's log>` pushes train k's tail (one
+# fast-forward), prints MERGED for every car of trains 1..k, cancels trains
+# 1..k-1's gates (stops the local ritz-gate-<name> unit and clears its
+# .train-waiting; stops a remote SPEC gate and deletes its ref: CANCELLED
+# lines), and promotes train k+1.  The 8-car cap is per gate, not per land.
 #
 # `build` prints one line per item, then a summary per train:
 #   APPLIED  <branch> <sha12> as <new12>   (cherry-picked; same patch)
@@ -80,7 +87,9 @@
 #   3. train 2's state gets `SPEC=<host> <ref> <remote log> <local log>`.
 # `wait <local log>` runs the remote run-gate.sh --wait in slices, then
 # copies the remote log to <local log> and checks its SHA is the train's tip,
-# so `land` checks `SHA=<tip>` and `EXIT=0` exactly as for a local log.  At
+# so `land` checks `SHA=<tip>` and `EXIT=0` exactly as for a local log.  The
+# remote gate's base (package tests, ci-local --diff-base) is main, train 1's
+# base, not train 1's tail: its pass lands train 1 too (AGAST #4151).  At
 # most 2 trains in flight: train 1 here, train 2 remote.  `build --next`
 # keeps a train 2 that has a SPEC and stacks new cars on its tail as train
 # 3.  Any build that replaces a train with a SPEC discards it (DISCARDED
@@ -220,9 +229,10 @@ remote() {
 $REMOTE_SH"
 }
 
-# discard_spec: drop the current train's speculative gate, if it has one.
+# discard_spec [<verb>]: drop the current train's speculative gate, if it has
+# one; says <verb> (default DISCARDED).
 discard_spec() {
-    local st host ref rlog llog; st="$(state)"
+    local st host ref rlog llog verb="${1:-DISCARDED}"; st="$(state)"
     [[ -f "$st" ]] || return 0
     read -r host ref rlog llog <<<"$(field SPEC "$st")"
     [[ -n "$host" ]] || return 0
@@ -230,7 +240,7 @@ discard_spec() {
     git -C "$MAIN_WT" push -q origin --delete "refs/heads/$ref" 2>/dev/null \
         || echo "warning: could not delete $ref on origin" >&2
     sed -i '/^SPEC=/d' "$st"
-    echo "DISCARDED speculative gate on $host for ${ref#rz-train/} ($llog)"
+    echo "$verb speculative gate on $host for ${ref#rz-train/} ($llog)"
 }
 
 ensure_worktree() {
@@ -415,8 +425,12 @@ gate_next() {
     mapfile -t q < <(queue)
     [[ ${#q[@]} -gt 0 ]] || die "no train built"
     [[ ${#q[@]} -ge 2 ]] || die "no train 2 to gate: build --next first (train 1 gates with plain \`gate\`)"
+    # The base is main (train 1's base), not train 1's tail (AGAST #4151):
+    # a pass here lands train 1 too, so the package tests and the ritz0
+    # diff scope must cover train 1's cars as well as train 2's.
+    use_slot "${q[0]}"; base="$(field BASE "$(state)")"
     use_slot "${q[1]}"; st="$(state)"
-    tip="$(field TIP "$st")"; base="$(field BASE "$st")"
+    tip="$(field TIP "$st")"
     [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train 2's worktree moved since build; rebuild"
     [[ "$(field GATE "$st")" == needed ]] || die "train 2 needs no gate (gate=not-needed): land it after train 1"
     spec="$(field SPEC "$st")"
@@ -632,27 +646,47 @@ cmd_pkgs() {
     "pkgs_$1" "$2"
 }
 
+# cmd_land [<log>]: land the train whose tip <log> passed, and every train
+# below it (AGAST #4151, #4130).  Train k is built on train k-1's tail, so a
+# green gate on train k's tip tested every car of trains 1..k on main: they
+# land in one fast-forward push, and trains 1..k-1's gates, now redundant,
+# are cancelled.  No log: train 1 alone, which must need no gate.
 cmd_land() {
-    front
-    local st; st="$(state)"
-    local base tip need
-    base="$(field BASE "$st")"
-    tip="$(field TIP "$st")"
-    need="$(field GATE "$st")"
-    [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train worktree moved since build; rebuild"
-    [[ "$tip" != "$base" ]] || die "train is empty; nothing to land"
-    if [[ "$need" == needed ]]; then
-        local log="${1:-}"
-        [[ -n "$log" && -f "$log" ]] || die "gate needed: pass the gate log"
-        [[ "$(sed -n 's/^SHA=//p' "$log" | head -1)" == "$tip" ]] \
-            || die "gate log is for another commit, not the train tip ${tip:0:12}"
+    local q log="${1:-}" lsha="" k=1 i st base base1="" tip prev
+    mapfile -t q < <(queue)
+    [[ ${#q[@]} -gt 0 ]] || die "no train built"
+    if [[ -n "$log" ]]; then
+        [[ -f "$log" ]] || die "no such gate log: $log"
+        lsha="$(sed -n 's/^SHA=//p' "$log" | head -1)"
+        for i in "${!q[@]}"; do
+            use_slot "${q[$i]}"
+            if [[ -n "$lsha" && "$(field TIP "$(state)")" == "$lsha" ]]; then k=$((i + 1)); break; fi
+        done
+    fi
+    # Trains 1..k must be as built, each on the tail of the one before.
+    prev=""
+    for ((i = 0; i < k; i++)); do
+        use_slot "${q[$i]}"; st="$(state)"
+        tip="$(field TIP "$st")"; base="$(field BASE "$st")"
+        [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train $((i + 1))'s worktree moved since build; rebuild"
+        [[ -z "$prev" || "$base" == "$prev" ]] \
+            || die "train $((i + 1)) is not on train $i's tail (${base:0:12} != ${prev:0:12}); rebuild"
+        [[ -n "$prev" ]] || base1="$base"
+        prev="$tip"
+    done
+    [[ "$tip" != "$base1" ]] || die "train is empty; nothing to land"
+    if [[ -n "$log" ]]; then
+        [[ "$lsha" == "$tip" ]] \
+            || die "gate log is for another commit (${lsha:0:12}), not a train tip (train 1's is $(use_slot "${q[0]}"; field TIP "$(state)" | cut -c1-12))"
         [[ "$(sed -n 's/^EXIT=//p' "$log" | tail -1)" == 0 ]] \
             || die "gate did not pass ($(grep '^EXIT=' "$log" | tail -1 || echo 'no verdict'))"
+    else
+        [[ "$(field GATE "$st")" != needed ]] || die "gate needed: pass the gate log"
     fi
     g fetch -q origin
-    # A stacked train's base is the tail of the train that landed before it.
-    [[ "$(g rev-parse origin/main)" == "$base" ]] \
-        || die "main moved since the train was built (${base:0:12} -> $(g rev-parse --short=12 origin/main)); rebuild and re-gate"
+    # Train 1's base is main; a stacked train's base is the tail below it.
+    [[ "$(g rev-parse origin/main)" == "$base1" ]] \
+        || die "main moved since the train was built (${base1:0:12} -> $(g rev-parse --short=12 origin/main)); rebuild and re-gate"
     # Not forced: GitHub refuses it if main moved in the meantime.
     g push -q origin "$tip:refs/heads/main"
     # Hold the gate slot for the next train's gate (run-gate.sh).  Best
@@ -662,21 +696,40 @@ cmd_land() {
         || echo "warning: could not reserve the gate slot ($RESERVED)" >&2
     git -C "$MAIN_WT" fetch -q origin
     git -C "$MAIN_WT" merge -q --ff-only origin/main
-    local b room merged
-    while read -r b room merged; do
-        echo "MERGED   $b ${room:0:12} as ${merged:0:12}"
-    done < <(field ITEM "$st")
+    local b room merged spec
+    for ((i = 0; i < k; i++)); do
+        use_slot "${q[$i]}"
+        while read -r b room merged; do
+            echo "MERGED   $b ${room:0:12} as ${merged:0:12}"
+        done < <(field ITEM "$(state)")
+    done
     echo "MAIN     ${tip:0:12}"
-    # Its speculative ref (AGAST #3988) has served its purpose.
-    local spec; spec="$(field SPEC "$st")"
-    if [[ -n "$spec" ]]; then
-        read -r _ spec _ <<<"$spec"
-        g push -q origin --delete "refs/heads/$spec" 2>/dev/null \
-            || echo "warning: could not delete $spec on origin" >&2
+    # Trains 1..k-1 are landed: their gates can only repeat train k's verdict.
+    # The local train unit only ever gates train 1, so stop it, and drop its
+    # .train-waiting so room gates see the slot free at once (best effort).
+    local unit="ritz-gate-$NAME" tw="$GATES/.train-waiting"
+    if [[ $k -gt 1 ]] && systemctl --user is-active -q "$unit" 2>/dev/null; then
+        systemctl --user stop "$unit" 2>/dev/null || echo "warning: could not stop $unit" >&2
+        echo "CANCELLED local gate $unit (covered by train $k's pass)"
     fi
-    rm -f "$st"
-    # Promote the next train: its base, this train's tail, is main now.
-    local rest; rest="$(queue | tail -n +2)"
+    if [[ $k -gt 1 && "$(cat "$tw" 2>/dev/null)" == "$unit" ]]; then rm -f "$tw"; fi
+    for ((i = 0; i < k; i++)); do
+        use_slot "${q[$i]}"; st="$(state)"
+        if [[ $((i + 1)) -lt $k ]]; then
+            discard_spec CANCELLED
+        else
+            # The landed train's speculative ref (AGAST #3988) has served its purpose.
+            spec="$(field SPEC "$st")"
+            if [[ -n "$spec" ]]; then
+                read -r _ spec _ <<<"$spec"
+                g push -q origin --delete "refs/heads/$spec" 2>/dev/null \
+                    || echo "warning: could not delete $spec on origin" >&2
+            fi
+        fi
+        rm -f "$st"
+    done
+    # Promote the next train: its base, train k's tail, is main now.
+    local rest; rest="$(printf '%s\n' "${q[@]:k}" | sed '/^$/d')"
     if [[ -n "$rest" ]]; then
         printf '%s\n' "$rest" > "$(qfile)"
         use_slot "$(head -1 <<<"$rest")"; st="$(state)"

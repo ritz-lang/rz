@@ -36,6 +36,9 @@ export RZ_TEST_DIR="$T" RZ_MAIN_WT="$M" RZ_TRAIN_WT="$T/train" RZ_GATE_SCRIPT="$
 # Never the real gate-logs: `land` reserves the slot there (AGAST #3365).
 export RZ_GATE_DIR="$T/gates" RZ_HOST_ENV="$T/no-host.env" RZ_GATE_SLOTS=1
 RES="$RZ_GATE_DIR/.train-reserved"
+# Never the real ritz-gate-train unit (AGAST #4151): the fake ssh below runs
+# REMOTE_SH's `stop <name>` with the real systemctl, on this very machine.
+export RZ_TRAIN_NAME="test-train-$$"
 TR="$HERE/train.sh"
 fetch() { git -C "$M" fetch -q origin; }
 
@@ -125,6 +128,10 @@ exit $rc
 STUB
 cat > "$T/bin/systemctl" <<'STUB'
 #!/usr/bin/env bash
+# `stop <unit>` is logged and ends the fake unit (AGAST #4151).
+if [[ " $* " == *" stop "* ]]; then
+    echo "stop ${!#}" >> "$RZ_TEST_DIR/systemctl-log"; rm -f "$RZ_TEST_ACTIVE/${!#}"; exit 0
+fi
 [[ -n "${!#}" && -e "$RZ_TEST_ACTIVE/${!#}" ]] && exit 0
 exit 3
 STUB
@@ -462,7 +469,7 @@ if [[ "$1" == --wait ]]; then
     exit "$(sed -n 's/^EXIT=//p' "$2" | tail -1)"
 fi
 log="$RZ_TEST_DIR/gate-$(git -C "$1" rev-parse --short=12 HEAD).log"
-printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\nPYTHON=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" "${RZ_GATE_AFTER:-}" "$(command -v python3)" > "$log"
+printf 'SHA=%s\nEXIT=%s\nTRAIN=%s\nAFTER=%s\nPYTHON=%s\nGBASE=%s\n' "$(git -C "$1" rev-parse HEAD)" "${RZ_FAKE_EXIT:-0}" "${RZ_GATE_TRAIN:-}" "${RZ_GATE_AFTER:-}" "$(command -v python3)" "${RZ_GATE_BASE:-}" > "$log"
 echo "$log"
 EOF
 git clone -q "$T/origin.git" "$T/remote-rz" 2>/dev/null
@@ -479,6 +486,7 @@ two() { c1="$(room "$1"1 "$2"1 X1)"; c2="$(room "$1"2 "$2"2 X2)"; fetch; git -C 
 fetch; git -C "$M" checkout -q main
 out="$(bash "$TR" gate --next 2>&1)"; has "$out" "no train" "gate --next with no trains refuses"
 two pa s/pa; bash "$TR" build "pa1:$c1" "pa2:$c2" >/dev/null 2>&1
+mb="$(git -C "$M" rev-parse origin/main)"
 out="$(bash "$TR" gate --next 2>&1)"; has "$out" "no train 2" "gate --next with no train 2 refuses"
 log1="$(bash "$TR" gate)"
 two pb projects/prism/src/pb; out="$(bash "$TR" build --next "pb1:$c1" "pb2:$c2" 2>&1)"
@@ -492,8 +500,11 @@ llog="$(bash "$TR" gate --next 2>"$T/err")"; rc=$?
     || bad "the remote train worktree is at train 2's tip"
 rlog="$(specof | cut -d' ' -f3)"
 has "$(cat "$rlog" 2>/dev/null)" "^TRAIN=1$" "the remote gate has train priority (RZ_GATE_TRAIN=1)"
-has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*remote-train/.claude/skills/rz-iterate/train.sh pkgs test $t1$" \
-    "the remote gate tests train 2's packages against its base, train 1's tail"
+# Against main, train 1's base, not train 1's tail (AGAST #4151): a pass of
+# train 2 lands train 1 too, so its gate must test train 1's packages.
+has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*remote-train/.claude/skills/rz-iterate/train.sh pkgs test $mb$" \
+    "the remote gate tests trains 1-2's packages against main, train 1's base"
+has "$(cat "$rlog" 2>/dev/null)" "^GBASE=$mb$" "the remote gate's diff base is main, train 1's base"
 out="$(bash "$TR" gate --next 2>&1)"; has "$out" "already" "a third train can't gate: at most 2 in flight"
 out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
 [[ $rc -eq 0 && "$(sed -n 's/^SHA=//p' "$llog" 2>/dev/null)" == "$t2" ]] && ok "wait fetches the remote verdict into the local log" \
@@ -524,7 +535,7 @@ out="$(bash "$TR" land "$log1" 2>&1)"; has "$out" "did not pass" "a failed train
 out="$(bash "$TR" build "fa1:$fa1" 2>&1)"
 has "$out" "^DISCARDED .*@hostx.log" "rebuilding drops train 2's speculative verdict"
 [[ -z "$(oref "${t2:0:12}")" ]] && ok "a discard deletes the rz-train ref" || bad "a discard deletes the rz-train ref"
-grep -q "^hostx bash -l -s -- stop train" "$T/ssh-log" && ok "a discard stops the remote gate" || bad "a discard stops the remote gate"
+grep -q "^hostx bash -l -s -- stop $RZ_TRAIN_NAME" "$T/ssh-log" && ok "a discard stops the remote gate" || bad "a discard stops the remote gate"
 out="$(bash "$TR" wait "$llog" 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "discarded" "wait refuses a discarded remote gate" || bad "wait refuses a discarded remote gate (rc=$rc)"
 n1="$(git -C "$T/train" rev-parse HEAD)"
@@ -641,4 +652,118 @@ rm -f "$T/queued-polls" "$(dirname "$rlog")/.gate-queue"; echo EXIT=0 >> "$rlog"
 bash "$TR" wait "$llog" >/dev/null 2>&1
 bash "$TR" land "$log1" >/dev/null 2>&1
 out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "^MERGED +eb2 " "the queued-then-passed remote verdict lands"
+# 12. A passed train k lands trains 1..k at once (AGAST #4151, #4130): train
+# k is built on train k-1's tail, so its green gate tested every car of
+# trains 1..k.  The covered trains' gates are cancelled: the local unit
+# stopped, its .train-waiting cleared, a remote one stopped and its ref gone.
+U="ritz-gate-$RZ_TRAIN_NAME"; TW="$RZ_GATE_DIR/.train-waiting"
+# running <log>: a local train gate still going: no EXIT yet, unit active,
+# holding .train-waiting.
+running() { sed -i '/^EXIT=/d' "$1"; touch "$T/active/$U"; echo "$U" > "$TW"; }
+stops() { cat "$T/systemctl-log" 2>/dev/null; }
+ntrains() { bash "$TR" show 2>/dev/null | grep -c '^== train'; }
+
+# 12a. Train 2 passes (remote) while train 1 still gates here: both land in
+# one push, train 1's gate is stopped, train 3 is promoted.  Train 2's gate
+# tested train 1's packages too: its pkgs base is main.
+fetch; git -C "$M" checkout -q main; m0="$(git -C "$M" rev-parse origin/main)"
+two ga projects/prism/src/ga; bash "$TR" build "ga1:$c1" "ga2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate 2>/dev/null)"; running "$log1"
+two gb s/gb; bash "$TR" build --next "gb1:$c1" "gb2:$c2" >/dev/null 2>&1
+t2="$(git -C "$T/train-2" rev-parse HEAD)"
+llog="$(bash "$TR" gate --next 2>/dev/null)"; rlog="$(specof | cut -d' ' -f3)"
+has "$(cat "$rlog" 2>/dev/null)" "^AFTER=bash .*train.sh pkgs test $m0$" \
+    "train 2's remote gate runs the package tests though only train 1 touches a package"
+out="$(cd "$RW" && bash "$TR" pkgs list "$m0" 2>&1)"
+has "$out" "^projects/prism$" "pkgs list <main> on train 2's tip covers train 1's packages"
+c3="$(room gc1 s/gc1 X)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "gc1:$c3" 2>&1)"; t3="$(tipof 3 "$out")"
+bash "$TR" wait "$llog" >/dev/null 2>&1
+: > "$T/systemctl-log"; : > "$T/ssh-log"
+out="$(bash "$TR" land "$llog" 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(grep -c '^MERGED' <<<"$out")" == 4 ]] && ok "land <train 2's log> merges the cars of trains 1 and 2" \
+    || { bad "land <train 2's log> merges the cars of trains 1 and 2 (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+has "$out" "^MERGED +ga1 " "train 1's cars are MERGED"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$t2" ]] && ok "main is train 2's tail, in one push" || bad "main is train 2's tail, in one push"
+[[ "$(stops)" == "stop $U" && ! -e "$T/active/$U" ]] && ok "train 1's local gate is stopped" \
+    || bad "train 1's local gate is stopped (systemctl: '$(stops)')"
+[[ ! -e "$TW" ]] && ok "train 1's .train-waiting is cleared, so the slot frees at once" \
+    || bad "train 1's .train-waiting is cleared"
+has "$out" "^CANCELLED local gate $U " "land says it cancelled train 1's gate"
+has "$out" "^NEXT +base=${t2:0:12} tip=$t3 n=1 gate=" "train 3 is promoted to train 1"
+[[ "$(ntrains)" == 1 && -z "$(oref "${t2:0:12}")" ]] && ok "trains 1 and 2 are gone, with train 2's ref" \
+    || bad "trains 1 and 2 are gone, with train 2's ref ($(ntrains) trains)"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"; has "$out" "^MERGED +gc1 " "the promoted train 3 lands next"
+
+# 12b. Train 2 red while train 1 gates: nothing changes.
+fetch; git -C "$M" checkout -q main; m="$(git -C "$M" rev-parse origin/main)"
+two ha s/ha; bash "$TR" build "ha1:$c1" "ha2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate 2>/dev/null)"; running "$log1"
+two hb s/hb; bash "$TR" build --next "hb1:$c1" "hb2:$c2" >/dev/null 2>&1; hb1="$c1"; hb2="$c2"
+llog="$(RZ_FAKE_EXIT=1 bash "$TR" gate --next 2>/dev/null)"; bash "$TR" wait "$llog" >/dev/null 2>&1
+: > "$T/systemctl-log"; : > "$T/ssh-log"
+out="$(bash "$TR" land "$llog" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "did not pass" "a red train 2 doesn't land" || bad "a red train 2 doesn't land (rc=$rc)"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$m" && "$(ntrains)" == 2 && -n "$(specof)" ]] \
+    && ok "a red train 2 leaves main and both trains alone" || bad "a red train 2 leaves main and both trains alone"
+[[ -z "$(stops)" && -e "$T/active/$U" && -e "$TW" && ! -s "$T/ssh-log" ]] && ok "a red train 2 cancels no gate" \
+    || bad "a red train 2 cancels no gate (systemctl: '$(stops)')"
+rm -f "$T/active/$U" "$TW"; echo EXIT=0 >> "$log1"
+bash "$TR" land "$log1" >/dev/null 2>&1; bash "$TR" build "hb1:$hb1" "hb2:$hb2" >/dev/null 2>&1
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+
+# 12c. Train 1 red, train 2 green (#4130's question): train 2 contains every
+# car of train 1 and passed on exactly the tree that lands, so both land.
+fetch; git -C "$M" checkout -q main
+two ia s/ia; bash "$TR" build "ia1:$c1" "ia2:$c2" >/dev/null 2>&1
+log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+two ib s/ib; bash "$TR" build --next "ib1:$c1" "ib2:$c2" >/dev/null 2>&1
+t2="$(git -C "$T/train-2" rev-parse HEAD)"
+llog="$(bash "$TR" gate --next 2>/dev/null)"; bash "$TR" wait "$llog" >/dev/null 2>&1
+: > "$T/systemctl-log"
+out="$(bash "$TR" land "$llog" 2>&1)"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$t2" ]] && has "$out" "^MERGED +ia1 " "a green train 2 lands a red train 1 with it" \
+    || { bad "a green train 2 lands a red train 1 with it"; echo "$out" | sed 's/^/     | /'; }
+[[ -z "$(stops)" ]] && ok "no local gate to stop when train 1's has ended" || bad "no local gate to stop when train 1's has ended"
+
+# 12d. Train 1 gating remotely (a promoted speculative train) and train 2 on
+# another host: train 2's pass stops train 1's remote gate and deletes its ref.
+fetch; git -C "$M" checkout -q main
+two ja s/ja; bash "$TR" build "ja1:$c1" "ja2:$c2" >/dev/null 2>&1; log1="$(bash "$TR" gate)"
+two jb s/jb; bash "$TR" build --next "jb1:$c1" "jb2:$c2" >/dev/null 2>&1
+tb="$(git -C "$T/train-2" rev-parse HEAD)"
+blog="$(bash "$TR" gate --next 2>/dev/null)"; brlog="$(specof | cut -d' ' -f3)"
+bash "$TR" land "$log1" >/dev/null 2>&1          # train jb is train 1 now, gating on hostx
+sed -i '/^EXIT=/d' "$brlog"
+two jc s/jc; bash "$TR" build --next "jc1:$c1" "jc2:$c2" >/dev/null 2>&1
+tc="$(bash "$TR" show | sed -n 's/^TIP=//p' | tail -1)"
+clog="$(bash "$TR" gate --next hosty 2>/dev/null)"; bash "$TR" wait "$clog" >/dev/null 2>&1
+: > "$T/ssh-log"
+out="$(bash "$TR" land "$clog" 2>&1)"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$tc" ]] && has "$out" "^MERGED +jb1 " "train 2 on hosty lands train 1 gating on hostx" \
+    || { bad "train 2 on hosty lands train 1 gating on hostx"; echo "$out" | sed 's/^/     | /'; }
+grep -q "^hostx bash -l -s -- stop $RZ_TRAIN_NAME" "$T/ssh-log" && ok "the covered train's remote gate is stopped" \
+    || bad "the covered train's remote gate is stopped"
+has "$out" "^CANCELLED speculative gate on hostx for ${tb:0:12} " "land says it cancelled the remote gate"
+[[ -z "$(oref "${tb:0:12}")" && -z "$(oref "${tc:0:12}")" ]] && ok "both trains' rz-train refs are deleted" \
+    || bad "both trains' rz-train refs are deleted"
+out="$(bash "$TR" show 2>&1)"; has "$out" "no train built" "nothing left after landing both"
+
+# 12e. Refusals stay: a log for no train's tip, main moved, a covered train's
+# worktree moved; none of them cancels a gate.
+fetch; git -C "$M" checkout -q main
+two ka s/ka; bash "$TR" build "ka1:$c1" "ka2:$c2" >/dev/null 2>&1
+log1="$(bash "$TR" gate 2>/dev/null)"; running "$log1"
+two kb s/kb; bash "$TR" build --next "kb1:$c1" "kb2:$c2" >/dev/null 2>&1
+llog="$(bash "$TR" gate --next 2>/dev/null)"; bash "$TR" wait "$llog" >/dev/null 2>&1
+: > "$T/systemctl-log"
+m="$(git -C "$M" rev-parse origin/main)"; sed "s/^SHA=.*/SHA=$m/" "$llog" > "$T/main.log"
+out="$(bash "$TR" land "$T/main.log" 2>&1)"; has "$out" "another commit" "land refuses a log for no train's tip"
+echo x > "$T/train/d"; git -C "$T/train" commit -qam stray
+out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "train 1's worktree moved since build" "land refuses when a covered train's worktree moved"
+git -C "$T/train" reset -q --hard HEAD~1
+s="$(room km s/km X)"; git -C "$M" push -q origin "$s:refs/heads/main"; git -C "$M" checkout -q main
+out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "main moved" "land <train 2's log> refuses when main moved"
+[[ -z "$(stops)" && -e "$T/active/$U" && "$(ntrains)" == 2 ]] && ok "a refused land cancels no gate and keeps the trains" \
+    || bad "a refused land cancels no gate and keeps the trains (systemctl: '$(stops)')"
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }
