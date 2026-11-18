@@ -1,0 +1,434 @@
+# test/test_commands_binary.ritz - Command args reach the store whole
+#
+# AGAST #3069: every handler used to copy its args into [256]u8 keys and
+# [8192]u8 values and re-measure them with strlen, so a longer key or value
+# was silently truncated and an embedded NUL cut one short.  Redis stores
+# both whole.  These tests build RESP frames byte by byte, so an arg can be
+# any length and hold any byte.
+#
+# Kept out of test_commands.ritz: `ritz0 --test` recompiles a file once per
+# test, and build.py gives each file a fixed budget.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.fmt
+import ritzlib.memory
+import lib.tome
+import lib.resp
+import lib.commands
+
+
+# ============================================================================
+# RESP frame builder
+# ============================================================================
+
+const REQ_CAP: i64 = 65536
+const KL: i64 = 300     # past the old 255-byte key copy
+const VL: i64 = 10000   # past the old 8191-byte value copy
+
+struct Req
+    buf: *u8
+    len: i64
+
+fn req_new() -> Req
+    return Req { buf: malloc(REQ_CAP), len: 0 }
+
+fn req_put(r: *Req, p: *u8, n: i64)
+    memcpy(r.buf + r.len, p, n)
+    r.len = r.len + n
+
+# `tag` then the decimal `n` then CRLF: "*3\r\n", "$300\r\n".
+fn req_put_num(r: *Req, tag: u8, n: i64)
+    var hdr: [24]u8
+    hdr[0] = tag
+    let k: i64 = fmt_i64_into(@hdr[1], n)
+    req_put(r, @hdr[0], k + 1)
+    req_put(r, c"\r\n", 2)
+
+fn req_bulk(r: *Req, p: *u8, n: i64)
+    req_put_num(r, 36, n)  # '$'
+    req_put(r, p, n)
+    req_put(r, c"\r\n", 2)
+
+# Start a fresh frame of `argc` args (the command name included).
+fn req_cmd(r: *Req, argc: i64, name: *u8)
+    r.len = 0
+    req_put_num(r, 42, argc)  # '*'
+    req_bulk(r, name, strlen(name))
+
+fn req1(r: *Req, name: *u8, a: *u8, an: i64)
+    req_cmd(r, 2, name)
+    req_bulk(r, a, an)
+
+fn req2(r: *Req, name: *u8, a: *u8, an: i64, b: *u8, bn: i64)
+    req_cmd(r, 3, name)
+    req_bulk(r, a, an)
+    req_bulk(r, b, bn)
+
+fn req3(r: *Req, name: *u8, a: *u8, an: i64, b: *u8, bn: i64, c: *u8, cn: i64)
+    req_cmd(r, 4, name)
+    req_bulk(r, a, an)
+    req_bulk(r, b, bn)
+    req_bulk(r, c, cn)
+
+# Run the frame in `r`; 0 when the reply is exactly `want_len` bytes of `want`.
+fn reply_is_n(store: *Store, r: *Req, want: *u8, want_len: i64) -> i32
+    var parser: RespParser
+    resp_parser_init(@parser, r.buf, r.len)
+    if resp_parse(@parser) != RESP_OK
+        return 1
+    let out: *u8 = malloc(REQ_CAP)
+    var ctx: CommandContext
+    cmd_ctx_init(@ctx, store, out, REQ_CAP as i32)
+    cmd_dispatch(@ctx, @parser.command)
+    var rc: i32 = 0
+    if ctx.resp_len as i64 != want_len
+        rc = 1
+    else if memcmp(out, want, want_len) != 0
+        rc = 1
+    free(out)
+    return rc
+
+fn reply_is(store: *Store, r: *Req, want: *u8) -> i32
+    return reply_is_n(store, r, want, strlen(want))
+
+# 0 when the reply is the bulk string of `n` bytes at `p`.
+fn reply_is_bulk(store: *Store, r: *Req, p: *u8, n: i64) -> i32
+    var w: Req = req_new()
+    req_bulk(@w, p, n)
+    let rc: i32 = reply_is_n(store, r, w.buf, w.len)
+    free(w.buf)
+    return rc
+
+# 0 when the reply is the bytes built in `w`.
+fn reply_is_req(store: *Store, r: *Req, w: *Req) -> i32
+    return reply_is_n(store, r, w.buf, w.len)
+
+# `n` bytes of `fill` ending in `last`: two of these that differ only in
+# `last` share their first n-1 bytes, so a truncating copy merges them.
+fn filled(n: i64, fill: u8, last: u8) -> *u8
+    let p: *u8 = malloc(n)
+    memset(p, fill, n)
+    *(p + n - 1) = last
+    return p
+
+
+# The trap: a string key, with a TTL, named by the first 255 bytes that
+# k1 and k2 share.  A handler that truncates k1 or k2 to the old [256]u8
+# copy lands on it and answers for it instead (wrong type, a TTL, ...).
+fn set_trap(store: *Store, r: *Req, k: *u8) -> i32
+    req3(r, c"SETEX", k, 255, c"100", 3, c"t", 1)
+    return reply_is(store, r, c"+OK\r\n")
+
+
+# ============================================================================
+# Strings
+# ============================================================================
+
+[[test]]
+fn test_set_get_long_key() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let k1: *u8 = filled(KL, 107, 97)  # "kkk...ka"
+    let k2: *u8 = filled(KL, 107, 98)  # "kkk...kb"
+    req2(@r, c"SET", k1, KL, c"one", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 1
+    req2(@r, c"SET", k2, KL, c"two", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 2
+    req1(@r, c"GET", k1, KL)
+    if reply_is(@store, @r, c"$3\r\none\r\n") != 0
+        return 3
+    req1(@r, c"GET", k2, KL)
+    if reply_is(@store, @r, c"$3\r\ntwo\r\n") != 0
+        return 4
+    return 0
+
+
+[[test]]
+fn test_set_get_long_value() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let v: *u8 = filled(VL, 118, 90)  # "vvv...vZ"
+    req2(@r, c"SET", c"k", 1, v, VL)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 1
+    req1(@r, c"GET", c"k", 1)
+    if reply_is_bulk(@store, @r, v, VL) != 0
+        return 2
+    return 0
+
+
+[[test]]
+fn test_set_get_value_with_nul() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    req2(@r, c"SET", c"k", 1, c"a\0b", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 1
+    req1(@r, c"GET", c"k", 1)
+    if reply_is_bulk(@store, @r, c"a\0b", 3) != 0
+        return 2
+    return 0
+
+
+[[test]]
+fn test_keys_with_nul_are_distinct() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    req2(@r, c"SET", c"k\0a", 3, c"one", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 1
+    req2(@r, c"SET", c"k\0b", 3, c"two", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 2
+    req1(@r, c"GET", c"k\0a", 3)
+    if reply_is(@store, @r, c"$3\r\none\r\n") != 0
+        return 3
+    req1(@r, c"GET", c"k", 1)
+    if reply_is(@store, @r, c"$-1\r\n") != 0
+        return 4
+    return 0
+
+
+# ============================================================================
+# Key commands: k1 holds a string, k2 (same first 299 bytes) is missing,
+# and the trap holds their shared 255-byte prefix
+# ============================================================================
+
+[[test]]
+fn test_key_commands_long_key() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let k1: *u8 = filled(KL, 107, 97)
+    let k2: *u8 = filled(KL, 107, 98)
+    if set_trap(@store, @r, k1) != 0
+        return 99
+    req2(@r, c"SET", k1, KL, c"x", 1)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 1
+    req1(@r, c"EXISTS", k2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 2
+    req1(@r, c"TTL", k2, KL)
+    if reply_is(@store, @r, c":-2\r\n") != 0
+        return 3
+    req2(@r, c"EXPIRE", k2, KL, c"100", 3)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 4
+    req1(@r, c"PERSIST", k2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 5
+    req1(@r, c"DEL", k2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 6
+    # INCR of the missing k2 counts from 0 (k1's "x" is no integer).
+    req1(@r, c"INCR", k2, KL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 7
+    req2(@r, c"INCRBY", k2, KL, c"4", 1)
+    if reply_is(@store, @r, c":5\r\n") != 0
+        return 8
+    req1(@r, c"GET", k1, KL)
+    if reply_is(@store, @r, c"$1\r\nx\r\n") != 0
+        return 9
+    req1(@r, c"DEL", k2, KL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 12
+    req1(@r, c"EXISTS", k1, KL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 13
+    # "1\0x" is not an integer: INCR reads all 3 bytes, not just "1".
+    req2(@r, c"SET", c"n", 1, c"1\0x", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 10
+    req1(@r, c"INCR", c"n", 1)
+    if reply_is(@store, @r, c"-ERR value is not an integer or out of range\r\n") != 0
+        return 11
+    return 0
+
+
+[[test]]
+fn test_setex_long_key_and_value() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let k1: *u8 = filled(KL, 107, 97)
+    let k2: *u8 = filled(KL, 107, 98)
+    let v: *u8 = filled(VL, 118, 90)
+    if set_trap(@store, @r, k1) != 0
+        return 99
+    req3(@r, c"SETEX", k1, KL, c"100", 3, v, VL)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 1
+    req1(@r, c"GET", k1, KL)
+    if reply_is_bulk(@store, @r, v, VL) != 0
+        return 2
+    req1(@r, c"GET", k2, KL)
+    if reply_is(@store, @r, c"$-1\r\n") != 0
+        return 3
+    req3(@r, c"SETEX", c"b", 1, c"100", 3, c"a\0b", 3)
+    if reply_is(@store, @r, c"+OK\r\n") != 0
+        return 4
+    req1(@r, c"GET", c"b", 1)
+    if reply_is_bulk(@store, @r, c"a\0b", 3) != 0
+        return 5
+    return 0
+
+
+# ============================================================================
+# Lists
+# ============================================================================
+
+[[test]]
+fn test_list_commands_long_args() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let k1: *u8 = filled(KL, 107, 97)
+    let k2: *u8 = filled(KL, 107, 98)
+    let v: *u8 = filled(VL, 118, 90)
+    let w: *u8 = filled(VL, 119, 89)  # "www...wY"
+    if set_trap(@store, @r, k1) != 0
+        return 99
+    req2(@r, c"LPUSH", k1, KL, v, VL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 1
+    req2(@r, c"RPUSH", k1, KL, w, VL)
+    if reply_is(@store, @r, c":2\r\n") != 0
+        return 2
+    req1(@r, c"LLEN", k2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 3
+    req2(@r, c"LINDEX", k1, KL, c"1", 1)
+    if reply_is_bulk(@store, @r, w, VL) != 0
+        return 4
+    var want: Req = req_new()
+    req_put_num(@want, 42, 2)
+    req_bulk(@want, v, VL)
+    req_bulk(@want, w, VL)
+    req3(@r, c"LRANGE", k1, KL, c"0", 1, c"-1", 2)
+    if reply_is_req(@store, @r, @want) != 0
+        return 5
+    req1(@r, c"LPOP", k2, KL)
+    if reply_is(@store, @r, c"$-1\r\n") != 0
+        return 6
+    req1(@r, c"RPOP", k2, KL)
+    if reply_is(@store, @r, c"$-1\r\n") != 0
+        return 7
+    req1(@r, c"LPOP", k1, KL)
+    if reply_is_bulk(@store, @r, v, VL) != 0
+        return 8
+    req1(@r, c"RPOP", k1, KL)
+    if reply_is_bulk(@store, @r, w, VL) != 0
+        return 9
+    return 0
+
+
+# ============================================================================
+# Sets
+# ============================================================================
+
+[[test]]
+fn test_set_commands_long_args() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let k1: *u8 = filled(KL, 107, 97)
+    let k2: *u8 = filled(KL, 107, 98)
+    let m1: *u8 = filled(VL, 109, 97)  # "mmm...ma"
+    let m2: *u8 = filled(VL, 109, 98)  # "mmm...mb"
+    if set_trap(@store, @r, k1) != 0
+        return 99
+    req2(@r, c"SADD", k1, KL, m1, VL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 1
+    req2(@r, c"SISMEMBER", k1, KL, m2, VL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 2
+    req2(@r, c"SADD", k1, KL, m2, VL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 3
+    req1(@r, c"SCARD", k1, KL)
+    if reply_is(@store, @r, c":2\r\n") != 0
+        return 4
+    req1(@r, c"SCARD", k2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 5
+    req2(@r, c"SREM", k1, KL, m2, VL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 7
+    req2(@r, c"SISMEMBER", k1, KL, m1, VL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 8
+    var want: Req = req_new()
+    req_put_num(@want, 42, 1)
+    req_bulk(@want, m1, VL)
+    req1(@r, c"SMEMBERS", k1, KL)
+    if reply_is_req(@store, @r, @want) != 0
+        return 6
+    return 0
+
+
+# ============================================================================
+# Hashes
+# ============================================================================
+
+[[test]]
+fn test_hash_commands_long_args() -> i32
+    var store: Store = store_new()
+    var r: Req = req_new()
+    let k1: *u8 = filled(KL, 107, 97)
+    let k2: *u8 = filled(KL, 107, 98)
+    let f1: *u8 = filled(KL, 102, 97)  # "fff...fa"
+    let f2: *u8 = filled(KL, 102, 98)  # "fff...fb"
+    let v: *u8 = filled(VL, 118, 90)
+    if set_trap(@store, @r, k1) != 0
+        return 99
+    req3(@r, c"HSET", k1, KL, f1, KL, v, VL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 1
+    req2(@r, c"HEXISTS", k1, KL, f2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 2
+    req2(@r, c"HGET", k1, KL, f1, KL)
+    if reply_is_bulk(@store, @r, v, VL) != 0
+        return 3
+    req3(@r, c"HSET", k1, KL, f2, KL, c"two", 3)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 4
+    req2(@r, c"HGET", k1, KL, f2, KL)
+    if reply_is(@store, @r, c"$3\r\ntwo\r\n") != 0
+        return 5
+    req1(@r, c"HLEN", k1, KL)
+    if reply_is(@store, @r, c":2\r\n") != 0
+        return 6
+    req1(@r, c"HLEN", k2, KL)
+    if reply_is(@store, @r, c":0\r\n") != 0
+        return 7
+    req2(@r, c"HDEL", k1, KL, f2, KL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 11
+    req2(@r, c"HEXISTS", k1, KL, f1, KL)
+    if reply_is(@store, @r, c":1\r\n") != 0
+        return 12
+    # k1 is now {f1: v}.
+    var want: Req = req_new()
+    req_put_num(@want, 42, 1)
+    req_bulk(@want, f1, KL)
+    req1(@r, c"HKEYS", k1, KL)
+    if reply_is_req(@store, @r, @want) != 0
+        return 8
+    want.len = 0
+    req_put_num(@want, 42, 1)
+    req_bulk(@want, v, VL)
+    req1(@r, c"HVALS", k1, KL)
+    if reply_is_req(@store, @r, @want) != 0
+        return 9
+    want.len = 0
+    req_put_num(@want, 42, 2)
+    req_bulk(@want, f1, KL)
+    req_bulk(@want, v, VL)
+    req1(@r, c"HGETALL", k1, KL)
+    if reply_is_req(@store, @r, @want) != 0
+        return 10
+    return 0
