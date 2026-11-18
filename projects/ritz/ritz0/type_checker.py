@@ -112,6 +112,8 @@ class TypeChecker:
         self.lent_locals: Dict[str, rast.Type] = {}
         # The slot an `if`, `match` or block's tails land in (_infer_into).
         self._tail_slot: Optional[rast.Type] = None
+        # The `if`, `match` or block next inferred is dropped (_infer_discarded).
+        self._discarding = False
         # id(expr) already reported: a literal's elements are inferred twice.
         self._slot_reported: Set[int] = set()
         # Undeclared struct names a `.field` was refused on, or #3347 refused
@@ -335,9 +337,11 @@ class TypeChecker:
 
         # Check trailing expression matches expected return type
         if block.expr:
-            expr_type = self._infer_into(block.expr, expected_ret)
             if expected_ret is None or self._is_void(expected_ret):
+                expr_type = self._infer_discarded(block.expr)
                 self._check_discarded(block.expr, expr_type)   # #3189: a void tail
+            else:
+                expr_type = self._infer_into(block.expr, expected_ret)
             if expected_ret and not self._value_fits(block.expr, expr_type, expected_ret):
                 self._error(f"block expression has type {self._type_str(expr_type)}, "
                           f"expected {self._type_str(expected_ret)}", block.expr.span)
@@ -396,7 +400,7 @@ class TypeChecker:
             self._pop_scope()
 
         elif isinstance(stmt, rast.ExprStmt):
-            self._check_discarded(stmt.expr, self._infer_type(stmt.expr))
+            self._check_discarded(stmt.expr, self._infer_discarded(stmt.expr))
 
         elif isinstance(stmt, rast.ReturnStmt):
             if stmt.value:
@@ -544,7 +548,8 @@ class TypeChecker:
         elif isinstance(expr, rast.AssignExpr):
             target_type = self._infer_type(expr.target)
             self._check_write(expr.target)
-            return self._infer_into(expr.value, target_type)
+            self._infer_into(expr.value, target_type)
+            return rast.TupleType(expr.span, [])   # an assignment is () (#3593)
 
         elif isinstance(expr, (rast.QualifiedIdent, rast.TypeExpr)):
             return rast.NamedType(expr.span, 'unknown', [])
@@ -568,13 +573,13 @@ class TypeChecker:
             return self._check_if(expr)
 
         elif isinstance(expr, rast.Block):
-            slot = self._take_tail_slot()
+            slot, discarded = self._take_tail_slot(), self._take_discarding()
             self._push_scope()
             for stmt in expr.stmts:
                 self._check_stmt(stmt)
             result = rast.NamedType(expr.span, 'void', [])
             if expr.expr:
-                result = self._infer_into(expr.expr, slot)
+                result = self._infer_arm(expr.expr, slot, discarded)
             self._pop_scope()
             return result
 
@@ -1357,7 +1362,7 @@ class TypeChecker:
 
     def _check_if(self, expr: rast.If) -> rast.Type:
         """Type check if expression."""
-        slot = self._take_tail_slot()
+        slot, discarded = self._take_tail_slot(), self._take_discarding()
         cond_type = self._infer_type(expr.cond)
         if not self._is_bool_or_opaque(cond_type):
             self._error(f"if condition must be bool, got {self._type_str(cond_type)}",
@@ -1368,7 +1373,7 @@ class TypeChecker:
         for stmt in expr.then_block.stmts:
             self._check_stmt(stmt)
         if expr.then_block.expr:
-            then_type = self._infer_into(expr.then_block.expr, slot)
+            then_type = self._infer_arm(expr.then_block.expr, slot, discarded)
         self._pop_scope()
 
         if expr.else_block:
@@ -1377,7 +1382,7 @@ class TypeChecker:
             for stmt in expr.else_block.stmts:
                 self._check_stmt(stmt)
             if expr.else_block.expr:
-                else_type = self._infer_into(expr.else_block.expr, slot)
+                else_type = self._infer_arm(expr.else_block.expr, slot, discarded)
             self._pop_scope()
 
             # Both branches should have same type
@@ -1385,8 +1390,10 @@ class TypeChecker:
                 return then_type
             if self._value_fits(expr.then_block.expr, then_type, else_type):
                 return else_type
-            self._error(f"if branches have different types: {self._type_str(then_type)} "
-                        f"and {self._type_str(else_type)}", expr.span)
+            if not discarded:   # a dropped if's branches needn't agree (#3593)
+                self._error(f"if branches have different types: {self._type_str(then_type)} "
+                            f"and {self._type_str(else_type)}",
+                            (expr.else_block.expr or expr).span)
             return then_type
 
         return then_type
@@ -1417,7 +1424,7 @@ class TypeChecker:
 
     def _check_match(self, expr: rast.Match) -> rast.Type:
         """Type check match expression."""
-        slot = self._take_tail_slot()
+        slot, discarded = self._take_tail_slot(), self._take_discarding()
         match_type = self._infer_type(expr.expr)
 
         result_type = None
@@ -1429,16 +1436,17 @@ class TypeChecker:
                 if not self._is_bool_or_opaque(guard_type):
                     self._error(f"match guard must be bool", arm.guard.span)
 
-            arm_type = self._infer_into(arm.body, slot)
+            arm_type = self._infer_arm(arm.body, slot, discarded)
             if result_type is None:
                 result_type, result_body = arm_type, arm.body
             elif self._value_fits(arm.body, arm_type, result_type):
                 pass
             elif self._value_fits(result_body, result_type, arm_type):
                 result_type, result_body = arm_type, arm.body
-            else:
+            elif not discarded:   # a dropped match's arms needn't agree (#3593)
+                # At the arm: a block arm's body span is column 1 of its line.
                 self._error(f"match arms have different types: {self._type_str(result_type)} "
-                          f"and {self._type_str(arm_type)}", arm.body.span)
+                          f"and {self._type_str(arm_type)}", arm.span)
             self._pop_scope()
 
         return result_type or rast.NamedType(expr.span, 'void', [])
@@ -1509,6 +1517,31 @@ class TypeChecker:
     def _take_tail_slot(self) -> Optional[rast.Type]:
         slot, self._tail_slot = self._tail_slot, None
         return slot
+
+    def _take_discarding(self) -> bool:
+        discarding, self._discarding = self._discarding, False
+        return discarding
+
+    def _infer_discarded(self, expr: rast.Expr) -> rast.Type:
+        """The type of `expr`, whose value is dropped: an expression
+        statement, the tail of a unit fn or a loop body, an arm of a dropped
+        `if`/`match`.  A dropped `if` or `match` is a statement, and its arms
+        needn't agree (AGAST #3593); the emitter never joins them."""
+        inner = expr
+        while isinstance(inner, rast.Grouped):
+            inner = inner.expr
+        if isinstance(inner, (rast.If, rast.Match, rast.Block)):
+            self._discarding = True
+            ty = self._infer_type(inner)
+            self._discarding = False
+            return ty
+        return self._infer_type(expr)
+
+    def _infer_arm(self, body: rast.Expr, slot: Optional[rast.Type],
+                   discarded: bool) -> rast.Type:
+        """An arm's or branch's value: dropped with its `if`/`match`, or
+        landing in the slot that one lands in."""
+        return self._infer_discarded(body) if discarded else self._infer_into(body, slot)
 
     def _infer_into(self, expr: rast.Expr, slot: Optional[rast.Type]) -> rast.Type:
         """The type of `expr`, whose value lands in a `slot`-typed place.
