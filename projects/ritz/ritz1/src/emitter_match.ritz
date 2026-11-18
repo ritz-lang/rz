@@ -107,6 +107,10 @@ struct MatchResult
     # before the slot existed; any forces the phi back (match_merge_slot).
     slot: i32
     slot_misses: i32
+    # AGAST #3028: 1 when nothing reads the match's value (a match statement
+    # before the block's last, or an expression arm of such a match).  An
+    # expression arm's `t` with `t:& T` then reads nothing, as in ritz0.
+    discarded: i32
 
 # AGAST #3276: where a `match` of whole arrays stores each arm's array: the
 # `[N x T]` at `ptr`, held to N (`size`) and T (`et`; a struct's `name`).
@@ -545,6 +549,7 @@ pub fn match_result_init(r: *MatchResult, n_arms: i32)
     r.into = null
     r.slot = 0
     r.slot_misses = 0
+    r.discarded = 0
 
 # AGAST #2046: take the caller's "value discarded" flag (match_no_value) and
 # clear it so no nested match / if sees it.  Returns 1 if the value is wanted.
@@ -552,6 +557,19 @@ fn take_match_wants_value(s: *EmitterState) -> i32
     let discard: i32 = s.match_no_value
     s.match_no_value = 0
     1 - discard
+
+# AGAST #3028: set by a match statement that isn't its block's last (or
+# by such a match for its expression arm's nested match) just before the
+# match is emitted, and taken by emit_match_arms before anything else is.
+var MATCH_DISCARDED: i32 = 0
+
+pub fn match_discard_next()
+    MATCH_DISCARDED = 1
+
+fn take_match_discarded() -> i32
+    let d: i32 = MATCH_DISCARDED
+    MATCH_DISCARDED = 0
+    d
 
 # AGAST #2046: the arms of a match / if were emitted and at least one had no
 # value.  If the value is wanted that is a located error at the innermost
@@ -937,6 +955,11 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         let nested: bool = arm.body.kind == EXPR_MATCH or arm.body.kind == EXPR_IF
         if nested
             s.match_no_value = 1
+        # AGAST #3028: an expression arm's value is the match's own, so it
+        # is discarded when the match's is; a block arm's is its block's tail.
+        let discarded: bool = result.discarded == 1 and arm.is_block == 0
+        if discarded and arm.body.kind == EXPR_MATCH
+            match_discard_next()
         own_check_arm(s, arm.body)   # AGAST #2158: the arm's value moves out
         # AGAST #2288: a `c:& C` arm's value is the referent, as in ritz0.
         # It read as the pointer, so the phi was an i64 over `ptr`s.
@@ -944,7 +967,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         # AGAST #3005: a nameless tuple arm takes the type an earlier arm
         # fixed, or its own elements', with this arm's bindings in scope.
         tuple_lit_name(s, arm.body, result.agg_name, result.agg_name_len)
-        if lent_arm != null
+        if lent_arm != null and discarded
+            body_reg = MATCH_ZERO_VALUE   # AGAST #3028: nothing reads it
+        else if lent_arm != null
             body_reg = emit_lent_referent(s, arm.body, lent_arm.type_name, lent_arm.type_name_len)
         else
             # AGAST #2092: a nested match / if (an `else if`, a match in an
@@ -2459,6 +2484,7 @@ pub fn emit_match_into(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span
 
 fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: SrcSpan, into: *ArrayInto) -> i32
     let wants_value: i32 = take_match_wants_value(s)   # AGAST #2046
+    let discarded: i32 = take_match_discarded()   # AGAST #3028
     # AGAST #1946 / #2092: taken before the scrutinee, so a match there
     # can't see it.
     let float_hint: i32 = take_match_float_hint(s)
@@ -2563,6 +2589,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     result.hint_ty = float_hint   # AGAST #2092
     result.ptr_ty = arms_ptr_valued(s, arms)   # AGAST #2950
     result.into = into   # AGAST #3276
+    result.discarded = discarded   # AGAST #3028
 
     # AGAST #2168: each arm's move check starts from the state before the
     # match; after it, the arms that fall through are merged (own_arms_*).

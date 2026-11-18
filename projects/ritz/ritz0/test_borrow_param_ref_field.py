@@ -2637,6 +2637,38 @@ pub fn main() -> i32
     var r: Res = Res { h: 3 }
     return f(@&r)
 """,
+    # AGAST #3028: a match statement that isn't the block's last discards its
+    # value, so an expression arm's `t` reads nothing; nor does one in a match
+    # that is such an arm.  ritz1 refused both.  A block arm's `t` is that
+    # block's tail and is still read (MOVE_OUT `stmt_match_block_arm`).
+    "stmt_match_expr_arm": RES + """
+fn f(t:& Res, k: i32)
+    match k
+        0 => t
+        _ => pass
+    let z: i32 = k
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    f(@&r, 0)
+    return r.h
+""",
+    # `_ => Res { h: 9 }` types the outer phi: with `pass` there it is an i64
+    # over the inner match's %Res, a nested-match bug of its own (AGAST #4168).
+    "stmt_match_nested_arm": RES + """
+fn f(t:& Res, k: i32)
+    match k
+        0 => match k
+            0 => t
+            _ => pass
+        _ => Res { h: 9 }
+    let z: i32 = k
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    f(@&r, 0)
+    return r.h
+""",
 })
 
 # A by-value field of the same type really would take it from the caller.
@@ -3013,6 +3045,32 @@ fn f(t:& Res, k: i32)
 pub fn main() -> i32
     return 0
 """,
+    # AGAST #3028: a one-statement block arm is a block, unlike `0 => t`.
+    "stmt_match_block_arm": RES + """
+fn f(t:& Res, k: i32)
+    match k
+        0 =>
+            t
+        _ => pass
+    let y: i32 = k
+
+pub fn main() -> i32
+    return 0
+""",
+    # ... in a generic fn's clone too (monomorph.ritz).
+    "stmt_match_block_arm_generic": RES + """
+fn f<T>(t:& Res, x: T, k: i32)
+    match k
+        0 =>
+            t
+        _ => pass
+    let y: i32 = k
+
+pub fn main() -> i32
+    var r: Res = Res { h: 3 }
+    f(@&r, 1, 0)
+    return 0
+""",
     "stmt_array": RES + """
 fn f(a:& [2]Res, k: i32)
     a
@@ -3224,6 +3282,8 @@ def test_ritz0_slot_holds_what_it_is_given(tmp_path, name):
 NO_EFFECT_ROWS = {
     "stmt_mid_block", "stmt_field_tail", "stmt_defer_tail", "stmt_copy_tail",
     "stmt_tail", "stmt_method_tail", "stmt_while", "stmt_for", "stmt_match_arm",
+    "stmt_match_expr_arm", "stmt_match_nested_arm", "stmt_match_block_arm",
+    "stmt_match_block_arm_generic",
 }
 
 
