@@ -724,9 +724,14 @@ pub fn slot_struct_name(s: *EmitterState, out_len: *i32) -> *u8
 # `error: <file>:<line>:<col>: <msg>`.  Counts like emit_ir_error, so the
 # driver refuses to write the output.
 pub fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
-    emit_str(s, c"  ; ERROR: ")
-    emit_str(s, msg)
-    emit_str(s, c"\n")
+    emit_nd_error_begin(s, line, col)
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+
+# AGAST #1295: emit_nd_error for a message the caller finishes itself (it
+# prints the rest, then a newline): `error: <file>:<line>:<col>: `, counted.
+pub fn emit_nd_error_begin(s: *EmitterState, line: i32, col: i32)
+    emit_str(s, c"  ; ERROR\n")
     eprints_cstr(c"error: ")
     if g_emit_file != null
         eprints_cstr(g_emit_file)
@@ -737,8 +742,6 @@ pub fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
     eprints_cstr(c":")
     eprint_int(col as i64)
     eprints_cstr(c": ")
-    eprints_cstr(msg)
-    eprints_cstr(c"\n")
     s.error_count = s.error_count + 1
 
 # AGAST #1813 — where the emitter is, for fatal capacity errors: the input
@@ -2733,6 +2736,21 @@ pub fn is_ctor_slot_enum(name: *u8, len: i32) -> i32
         return 1
     0
 
+# Size and alignment (written to *align) of one payload field `f`, as a
+# struct field is laid out: an array at its element's, anything else at its
+# type's.
+fn payload_field_size_align(s: *EmitterState, f: *StructField, align: *i64) -> i64
+    var falign: i64 = 8
+    var fsize: i64 = 8
+    if f.field_type == TYPE_ARRAY
+        fsize = field_array_size_align(s, f, @falign)
+    else
+        fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
+    if falign < 1
+        falign = 1
+    *align = falign
+    fsize
+
 # Size of one variant's payload fields, laid out in declaration order at
 # their natural alignment and rounded up to the strictest (written to
 # *align).  0 for a unit variant.
@@ -2741,14 +2759,8 @@ fn variant_payload_size_align(s: *EmitterState, fields: *StructField, align: *i6
     var max_align: i64 = 1
     var f: *StructField = fields
     while f != null
-        var falign: i64 = 8
-        var fsize: i64 = 8
-        if f.field_type == TYPE_ARRAY
-            fsize = field_array_size_align(s, f, @falign)
-        else
-            fsize = elem_size_align(s, f.field_type, f.field_type_name, f.field_type_name_len, @falign)
-        if falign < 1
-            falign = 1
+        var falign: i64 = 1
+        let fsize: i64 = payload_field_size_align(s, f, @falign)
         let rem: i64 = offset % falign
         if rem != 0
             offset = offset + (falign - rem)
@@ -2760,6 +2772,27 @@ fn variant_payload_size_align(s: *EmitterState, fields: *StructField, align: *i6
     if rem2 != 0
         offset = offset + (max_align - rem2)
     *align = max_align
+    offset
+
+# AGAST #1295: the byte offset of field `k` within a variant's payload, laid
+# out exactly as variant_payload_size_align lays it out (ritz0's
+# _enum_variant_field_layout).  Construction and binding both take it from
+# here, so they cannot disagree on where a field lives.
+fn variant_field_offset(s: *EmitterState, fields: *StructField, k: i32) -> i64
+    var offset: i64 = 0
+    var i: i32 = 0
+    var f: *StructField = fields
+    while f != null
+        var falign: i64 = 1
+        let fsize: i64 = payload_field_size_align(s, f, @falign)
+        let rem: i64 = offset % falign
+        if rem != 0
+            offset = offset + (falign - rem)
+        if i == k
+            return offset
+        offset = offset + fsize
+        i += 1
+        f = f.next
     offset
 
 # Payload byte count N of user enum `ei`, the tag-to-payload padding written
@@ -2788,15 +2821,95 @@ pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
         return 1
     1 + pad + n
 
-# The payload field of tuple variant `vi` of user enum `name` (null when it
-# is not one: unit / struct variant, generic or unknown enum).
-pub fn user_enum_tuple_field(name: *u8, len: i32, vi: i32) -> *StructField
+# AGAST #1295: a variant SELECTOR names one payload field of a user enum's
+# variant: `vi + k * VARIANT_FIELD_STRIDE` is field k of variant vi.  Field 0
+# is the variant's plain index, so every caller that knew only single-field
+# variants (and Result/Option's 0 / 1) passes the same value it always did.
+# Only the payload helpers take a selector -- never a tag store or compare.
+pub const VARIANT_FIELD_STRIDE: i32 = 65536
+
+pub fn variant_sel(vi: i32, k: i32) -> i32
+    vi + k * VARIANT_FIELD_STRIDE
+
+# AGAST #1295: the payload selector of the binding `arm` has selected
+# (arm_select_bind) in user enum `name`: field pattern_field_sel of the
+# variant it names.  -1 when `name` declares no such variant.
+pub fn arm_variant_sel(name: *u8, len: i32, arm: *MatchArm) -> i32
+    let vi: i32 = enum_variant_index(name, len, arm.pattern_name, arm.pattern_name_len)
+    if vi < 0
+        return vi
+    variant_sel(vi, arm.pattern_field_sel)
+
+# Field count of variant `vi` of user enum `ei` (0 for a unit variant).
+pub fn enum_variant_field_count(ei: i32, vi: i32) -> i32
+    var n: i32 = 0
+    var f: *StructField = enum_variant_fields(ei, vi)
+    while f != null
+        n += 1
+        f = f.next
+    n
+
+# The payload field selector `sel` (variant_sel) names in user enum `name`:
+# field k of a tuple variant, or of a struct variant matched / built
+# positionally (docs/ENUM_VARIANTS.md: same layout).  Null when there is none:
+# a unit variant, a generic or unknown enum, k past the last field.
+pub fn user_enum_tuple_field(name: *u8, len: i32, sel: i32) -> *StructField
     let ei: i32 = user_enum_index(name, len)
-    if ei < 0 or vi < 0 or vi >= enum_variant_count(ei)
+    if ei < 0 or sel < 0
         return null
-    if enum_variant_kind(ei, vi) != ENUM_VARIANT_TUPLE
+    let vi: i32 = sel % VARIANT_FIELD_STRIDE
+    var k: i32 = sel / VARIANT_FIELD_STRIDE
+    if vi >= enum_variant_count(ei)
         return null
-    enum_variant_fields(ei, vi)
+    let kind: i32 = enum_variant_kind(ei, vi)
+    if kind != ENUM_VARIANT_TUPLE and kind != ENUM_VARIANT_STRUCT
+        return null
+    var f: *StructField = enum_variant_fields(ei, vi)
+    while f != null and k > 0
+        f = f.next
+        k -= 1
+    f
+
+# AGAST #1295: byte offset of the payload field `sel` names within the
+# payload buffer: 0 for field 0, for Result / Option and for anything not a
+# user enum's variant.
+pub fn variant_sel_offset(s: *EmitterState, name: *u8, len: i32, sel: i32) -> i64
+    if sel < VARIANT_FIELD_STRIDE
+        return 0
+    let ei: i32 = user_enum_index(name, len)
+    if ei < 0
+        return 0
+    let vi: i32 = sel % VARIANT_FIELD_STRIDE
+    if vi >= enum_variant_count(ei)
+        return 0
+    variant_field_offset(s, enum_variant_fields(ei, vi), sel / VARIANT_FIELD_STRIDE)
+
+# AGAST #1295: a pointer to the payload field `sel` names in the enum at
+# `slot_reg`: field 2 (the `[N x i8]` buffer, AGAST #1898), then the field's
+# byte offset into it.  The buffer is reached by GEP over the enum struct
+# and then by an `i8` GEP, never a single index on the array (the stride
+# trap of ENUM_VARIANTS.md section 3.3).
+pub fn emit_payload_ptr(s: *EmitterState, slot_reg: i32, name: *u8, len: i32, sel: i32) -> i32
+    let pay_ptr: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, name, len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, slot_reg)
+    emit_str(s, c", i32 0, i32 2\n")
+    let off: i64 = variant_sel_offset(s, name, len, sel)
+    if off == 0
+        return pay_ptr
+    let fld: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, fld)
+    emit_str(s, c" = getelementptr i8, ptr ")
+    emit_reg(s, pay_ptr)
+    emit_str(s, c", i64 ")
+    emit_int(s, off)
+    emit_str(s, c"\n")
+    fld
 
 # Width in bits a scalar type code is stored at (see tagged_enum_scalar_bits).
 pub fn type_code_scalar_bits(t: i32, signed: *i32) -> i32
@@ -3740,8 +3853,8 @@ pub fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_othe
         return 0 - 1
     return ei
 
-# AGAST #1797: the user enum a call `Holds(x)` constructs — a one-payload
-# tuple variant of a non-generic enum, resolved as try_emit_user_variant_ctor
+# AGAST #1797: the user enum a call `Holds(x)` constructs — a payload
+# variant of a non-generic enum (AGAST #1295: any field count), resolved as try_emit_user_variant_ctor
 # does (it wins over a same-named fn, as in ritz0).  null/0 otherwise.
 # AGAST #1610: also a unit variant called with no arguments, `Red()` (built
 # with no payload; it used to fall through to a fn call returning i64).
@@ -3761,8 +3874,10 @@ pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
     if kind == ENUM_VARIANT_UNIT
         if e.args != null
             return
-    else if kind == ENUM_VARIANT_TUPLE
-        if e.args == null or e.args.next != null
+    else if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
+        # AGAST #1295: one value per field, `Rect(w, h)`, a struct variant's
+        # positionally; emit_variant_build checks the count, located.
+        if e.args == null
             return
     else
         return

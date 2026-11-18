@@ -281,14 +281,14 @@ gated on closing part of that gap.
 |---|---|---|
 | Bare variants | yes | yes |
 | Single-field tuple variants | yes | yes; user enums construct (`Holds(x)`, unqualified) and bind them since #1797 |
-| Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | **cannot parse** |
-| Struct variants | this task | parsed and laid out (#1797); not constructed or matched |
+| Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | yes (#1295): every field constructed and bound at its ritz0 offset |
+| Struct variants | this task | parsed and laid out (#1797); constructed and matched positionally (#1295); named forms not yet |
 | Payload types retained by parser | yes | yes, in the enum tracker (#1797) |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
 | Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). Non-generic user enums: the same ritz0 layout from the recorded variant fields (#1797); all-unit stays `{ i8 }` |
-| Payload load | per-field, typed | field 2; scalars at their own width, widened to i64 (#1898) |
-| Match bindings per pattern | N | **exactly 1** (`IDENT LPAREN IDENT RPAREN`) |
-| Generic enum specialization | yes | none (name mangling only) |
+| Payload load | per-field, typed | per-field at its offset in field 2 (#1295); scalars at their own width (#1898) |
+| Match bindings per pattern | N | N (#1295), names or `_`; no literals in fields |
+| Generic enum specialization | yes | instances from a typed slot (#2422); `Slot<T>` struct variants run |
 
 Three pre-existing defects were found while surveying, all masked by the fact
 that no code in the repo had ever used a variant with more than one field:
@@ -308,10 +308,17 @@ that no code in the repo had ever used a variant with more than one field:
    variant payload types. *(User enums: AGAST #1797, which records them.)*
 
 The regression matrix runs every case against ritz0, ritz1 and
-ritz1_selfhosted. Since AGAST #1371 it discovers every file in `ritz0/test/`,
-so `test_issue_struct_enum_variants` runs on ritz1 today and is listed in
-`EXPECTED_FAILURES` against #1295. That entry is strict-xpass: the change that
-makes ritz1 build the file must delete it. See AGAST #1282 for sequencing.
+ritz1_selfhosted. Since AGAST #1295, `test_issue_struct_enum_variants` and
+`test_issue_enum_multi_field_tuple` pass on all three, the latter pinning each
+field's byte offset to ritz0's.
+
+How ritz1 does it (#1295): the grammar records every payload type
+(`variant_type`) and every pattern binding (`pattern_binds`). A *variant
+selector*, `vi + k * VARIANT_FIELD_STRIDE`, names field k of variant vi to the
+payload helpers, which lay the field out with `variant_field_offset`, the same
+walk that sizes the enum. Passes written for the single `Some(v)` binding run
+once per binding through `arm_select_bind`. The enum itself still lives in the
+tracker side-table rather than an AST node.
 
 ---
 

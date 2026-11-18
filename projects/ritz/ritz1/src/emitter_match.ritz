@@ -209,14 +209,8 @@ fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_
 # downstream arithmetic / call paths operate on i64 registers.  `variant` is
 # 0 for Ok / Some, 1 for Err.
 fn emit_variant_payload(s: *EmitterState, slot_reg: i32, enum_name: *u8, enum_name_len: i32, variant: i32) -> i32
-    let pay_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, enum_name, enum_name_len)
-    emit_str(s, c", ptr ")
-    emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 2\n")
+    # `variant` is a selector (variant_sel): field k sits at its offset.
+    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, enum_name_len, variant)
     return emit_tagged_payload_load(s, pay_ptr, enum_name, enum_name_len, variant)
 
 # The LLVM integer type of narrow integer type code `t` (AGAST #3116).
@@ -251,10 +245,15 @@ fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) ->
 
 # AGAST #1797: the tag of the variant `arm` names in user enum `enum_name`,
 # or -1 (not a user enum, or no such variant).
+# AGAST #1295: as the payload selector (variant_sel) of the binding the arm
+# has selected (arm_select_bind): field pattern_field_sel of that variant.
 fn user_arm_variant(enum_name: *u8, enum_name_len: i32, arm: *MatchArm) -> i32
     if user_enum_index(enum_name, enum_name_len) < 0
         return 0 - 1
-    return enum_variant_index(enum_name, enum_name_len, arm.pattern_name, arm.pattern_name_len)
+    let vi: i32 = enum_variant_index(enum_name, enum_name_len, arm.pattern_name, arm.pattern_name_len)
+    if vi < 0
+        return vi
+    return variant_sel(vi, arm.pattern_field_sel)
 
 # AGAST #1515: the struct type carried by a tagged enum's carrier variant
 # (Ok/Some): see tagged_enum_payload_struct.  AGAST #1667 adds Result's Err
@@ -377,14 +376,10 @@ fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_n
 # `alloca %Name` and register a struct local, so `p.x` and by-value passing
 # see `%Name` rather than an i64.
 fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_name: *u8, enum_name_len: i32, st_name: *u8, st_name_len: i32)
-    let pay_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, enum_name, enum_name_len)
-    emit_str(s, c", ptr ")
-    emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 2\n")
+    var sel: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+    if sel < 0
+        sel = 0   # Result / Option: the payload is at offset 0
+    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, enum_name_len, sel)
     let val: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, val)
@@ -420,14 +415,7 @@ fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum
     var arr: ArrayArg
     if variant_array_type(s, enum_name, enum_name_len, tag, @arr) == 0
         return 0
-    let pay_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, pay_ptr)
-    emit_str(s, c" = getelementptr %")
-    emit_name(s, enum_name, enum_name_len)
-    emit_str(s, c", ptr ")
-    emit_reg(s, slot_reg)
-    emit_str(s, c", i32 0, i32 2\n")
+    let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, enum_name, enum_name_len, tag)
     let val: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, val)
@@ -754,6 +742,129 @@ fn payload_bool_kind(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name
         return BK_UNSURE
     bk_of_type(uf.field_type, uf.field_type_name, uf.field_type_name_len)
 
+# AGAST #1295: 1 when `arm`'s positional bindings fit its variant: a user
+# enum's variant with fields takes exactly one binding per field.  Otherwise
+# the located error, and 0: nothing is bound.  Result / Option, unknown
+# variants and unit variants are left to the checks that already cover them.
+fn user_arm_arity_ok(s: *EmitterState, arm: *MatchArm, enum_name: *u8, enum_name_len: i32) -> i32
+    let ei: i32 = user_enum_index(enum_name, enum_name_len)
+    if ei < 0
+        return 1
+    let vi: i32 = enum_variant_index(enum_name, enum_name_len, arm.pattern_name, arm.pattern_name_len)
+    if vi < 0
+        return 1
+    let nf: i32 = enum_variant_field_count(ei, vi)
+    let nb: i32 = arm_bind_count(arm)
+    if nf == 0 or nf == nb
+        return 1
+    var line: i32 = arm.head_span.line
+    var col: i32 = arm.head_span.col
+    if line <= 0
+        line = arm.pattern_inner_span.line
+        col = arm.pattern_inner_span.col
+    emit_nd_error_begin(s, line, col)
+    eprints_cstr(c"pattern `")
+    eprint_bytes(arm.pattern_name, arm.pattern_name_len)
+    eprints_cstr(c"` binds ")
+    eprint_int(nb as i64)
+    eprints_cstr(c" field(s), but the variant has ")
+    eprint_int(nf as i64)
+    eprints_cstr(c"\n")
+    0
+
+# Bind the payload binding `arm` has selected (arm_select_bind), as a local
+# of the field's type for the rest of the arm.
+fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: i32, enum_name: *u8, enum_name_len: i32)
+    if arm.pattern_inner_kind == PAT_IDENT
+        if arm.pattern_inner_name_len > 0
+            var is_wildcard: i32 = 0
+            if arm.pattern_inner_name_len == 1
+                if *arm.pattern_inner_name == 95   # '_'
+                    is_wildcard = 1
+            var pay_struct: *u8 = null
+            var pay_struct_len: i32 = 0
+            var ptr_struct: *u8 = null
+            var ptr_struct_len: i32 = 0
+            var ptr_kind: i32 = 0
+            if is_wildcard == 0 and scrut_slot != 0
+                carrier_payload_struct(s, arm, enum_name, enum_name_len, @pay_struct, @pay_struct_len)
+                ptr_kind = carrier_payload_ptr_struct(s, arm, enum_name, enum_name_len, @ptr_struct, @ptr_struct_len)
+            if is_wildcard == 0 and pay_struct == null and ptr_kind == 0 and scrut_slot != 0 and emit_array_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len) == 1
+                is_wildcard = 1   # AGAST #3029: bound, as the `[N]T` it is
+            if is_wildcard == 0 and ptr_kind != 0
+                # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
+                var ptr_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+                let puvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+                if puvi >= 0
+                    ptr_variant = puvi
+                emit_ptr_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, ptr_variant, ptr_kind, ptr_struct, ptr_struct_len)
+                bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
+            else if is_wildcard == 0 and pay_struct != null
+                emit_struct_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, pay_struct, pay_struct_len)
+                # AGAST #2174: it owns the payload of a scrutinee the
+                # match owns.
+                own_match_payload(s, arm.pattern_inner_name, arm.pattern_inner_name_len)
+            else if is_wildcard == 0
+                var payload_reg: i32 = 0
+                # AGAST #1945: a float payload binds as an f32 / f64 local.
+                var bind_ft: i32 = 0
+                # AGAST #3116: a narrow integer payload binds as its own
+                # type (an `i<bits>` local), as a typed `let` does.
+                var bind_nt: i32 = 0
+                # AGAST #3345: its integer type, i64 / u64 too, for
+                # the lossy-conversion check (narrow_note_binding).
+                var bind_it: i32 = 0
+                if scrut_slot != 0 and enum_name != null and enum_name_len > 0
+                    # Result/Option: 0 Ok-Some, 1 Err; a user enum: the
+                    # variant's own tag (AGAST #1797), for its width.
+                    var pay_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
+                    let uvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
+                    if uvi >= 0
+                        pay_variant = uvi
+                    payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len, pay_variant)
+                    bind_ft = tagged_enum_float_type(s, enum_name, enum_name_len, pay_variant)
+                    bind_nt = tagged_enum_narrow_int_type(s, enum_name, enum_name_len, pay_variant)
+                    bind_it = tagged_enum_int_type(s, enum_name, enum_name_len, pay_variant)
+                else
+                    # Non-enum scrutinee (shouldn't reach here in practice).
+                    payload_reg = scrut_reg
+                var bind_llvm: *u8 = c"i64"
+                var bind_type: i32 = TYPE_I64
+                if bind_ft != 0
+                    bind_llvm = float_llvm_name(bind_ft)
+                    bind_type = bind_ft
+                else if bind_nt != 0
+                    bind_type = bind_nt
+                    bind_llvm = narrow_int_llvm(bind_nt)
+                    # The payload was widened to an i64 register; the
+                    # local holds it at its width, truncated back.
+                    let narrow_reg: i32 = next_reg(s)
+                    emit_str(s, c"  ")
+                    emit_reg(s, narrow_reg)
+                    emit_str(s, c" = trunc i64 ")
+                    emit_reg(s, payload_reg)
+                    emit_str(s, c" to ")
+                    emit_str(s, bind_llvm)
+                    emit_str(s, c"\n")
+                    payload_reg = narrow_reg
+                let alloca_reg: i32 = next_reg(s)
+                emit_str(s, c"  ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, c" = alloca ")
+                emit_str(s, bind_llvm)
+                emit_str(s, c"  ; match payload bind\n")
+                emit_str(s, c"  store ")
+                emit_str(s, bind_llvm)
+                emit_str(s, c" ")
+                emit_reg(s, payload_reg)
+                emit_str(s, c", ptr ")
+                emit_reg(s, alloca_reg)
+                emit_str(s, c"\n")
+                add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, bind_type)
+                narrow_note_binding(s, arm.pattern_inner_name, arm.pattern_inner_name_len, bind_it)   # AGAST #3345
+                if bind_ft == 0
+                    bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
+
 # Emit match body, returning (result_reg, exit_label) via MatchResult slot.
 # For PAT_VARIANT arms with PAT_IDENT inner (e.g. `Ok(v) => v`), the inner
 # name is bound to the extracted payload for the duration of the arm body,
@@ -765,97 +876,15 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     let saved_narrow_count: i32 = s.narrow_decl_count
     own_push_scope(s)   # AGAST #2158: the arm is a block for drops
 
-    # Bind variant payload to inner pattern name on `Constructor(binding)`.
+    # Bind variant payload to inner pattern name on `Constructor(binding)`;
+    # AGAST #1295: every binding of `V(a, b, ..)`, each field at its offset.
     if arm.pattern_kind == PAT_VARIANT
-        if arm.pattern_inner_kind == PAT_IDENT
-            if arm.pattern_inner_name_len > 0
-                var is_wildcard: i32 = 0
-                if arm.pattern_inner_name_len == 1
-                    if *arm.pattern_inner_name == 95   # '_'
-                        is_wildcard = 1
-                var pay_struct: *u8 = null
-                var pay_struct_len: i32 = 0
-                var ptr_struct: *u8 = null
-                var ptr_struct_len: i32 = 0
-                var ptr_kind: i32 = 0
-                if is_wildcard == 0 and scrut_slot != 0
-                    carrier_payload_struct(s, arm, enum_name, enum_name_len, @pay_struct, @pay_struct_len)
-                    ptr_kind = carrier_payload_ptr_struct(s, arm, enum_name, enum_name_len, @ptr_struct, @ptr_struct_len)
-                if is_wildcard == 0 and pay_struct == null and ptr_kind == 0 and scrut_slot != 0 and emit_array_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len) == 1
-                    is_wildcard = 1   # AGAST #3029: bound, as the `[N]T` it is
-                if is_wildcard == 0 and ptr_kind != 0
-                    # AGAST #2436: `Some(v)` over `Option<*Pair>`: v is a `*Pair`.
-                    var ptr_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
-                    let puvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
-                    if puvi >= 0
-                        ptr_variant = puvi
-                    emit_ptr_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, ptr_variant, ptr_kind, ptr_struct, ptr_struct_len)
-                    bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
-                else if is_wildcard == 0 and pay_struct != null
-                    emit_struct_payload_bind(s, arm, scrut_slot, enum_name, enum_name_len, pay_struct, pay_struct_len)
-                    # AGAST #2174: it owns the payload of a scrutinee the
-                    # match owns.
-                    own_match_payload(s, arm.pattern_inner_name, arm.pattern_inner_name_len)
-                else if is_wildcard == 0
-                    var payload_reg: i32 = 0
-                    # AGAST #1945: a float payload binds as an f32 / f64 local.
-                    var bind_ft: i32 = 0
-                    # AGAST #3116: a narrow integer payload binds as its own
-                    # type (an `i<bits>` local), as a typed `let` does.
-                    var bind_nt: i32 = 0
-                    # AGAST #3345: its integer type, i64 / u64 too, for
-                    # the lossy-conversion check (narrow_note_binding).
-                    var bind_it: i32 = 0
-                    if scrut_slot != 0 and enum_name != null and enum_name_len > 0
-                        # Result/Option: 0 Ok-Some, 1 Err; a user enum: the
-                        # variant's own tag (AGAST #1797), for its width.
-                        var pay_variant: i32 = 1 - variant_is_tag_one(arm.pattern_name, arm.pattern_name_len)
-                        let uvi: i32 = user_arm_variant(enum_name, enum_name_len, arm)
-                        if uvi >= 0
-                            pay_variant = uvi
-                        payload_reg = emit_variant_payload(s, scrut_slot, enum_name, enum_name_len, pay_variant)
-                        bind_ft = tagged_enum_float_type(s, enum_name, enum_name_len, pay_variant)
-                        bind_nt = tagged_enum_narrow_int_type(s, enum_name, enum_name_len, pay_variant)
-                        bind_it = tagged_enum_int_type(s, enum_name, enum_name_len, pay_variant)
-                    else
-                        # Non-enum scrutinee (shouldn't reach here in practice).
-                        payload_reg = scrut_reg
-                    var bind_llvm: *u8 = c"i64"
-                    var bind_type: i32 = TYPE_I64
-                    if bind_ft != 0
-                        bind_llvm = float_llvm_name(bind_ft)
-                        bind_type = bind_ft
-                    else if bind_nt != 0
-                        bind_type = bind_nt
-                        bind_llvm = narrow_int_llvm(bind_nt)
-                        # The payload was widened to an i64 register; the
-                        # local holds it at its width, truncated back.
-                        let narrow_reg: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, narrow_reg)
-                        emit_str(s, c" = trunc i64 ")
-                        emit_reg(s, payload_reg)
-                        emit_str(s, c" to ")
-                        emit_str(s, bind_llvm)
-                        emit_str(s, c"\n")
-                        payload_reg = narrow_reg
-                    let alloca_reg: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, alloca_reg)
-                    emit_str(s, c" = alloca ")
-                    emit_str(s, bind_llvm)
-                    emit_str(s, c"  ; match payload bind\n")
-                    emit_str(s, c"  store ")
-                    emit_str(s, bind_llvm)
-                    emit_str(s, c" ")
-                    emit_reg(s, payload_reg)
-                    emit_str(s, c", ptr ")
-                    emit_reg(s, alloca_reg)
-                    emit_str(s, c"\n")
-                    add_local(s, arm.pattern_inner_name, arm.pattern_inner_name_len, alloca_reg, bind_type)
-                    narrow_note_binding(s, arm.pattern_inner_name, arm.pattern_inner_name_len, bind_it)   # AGAST #3345
-                    if bind_ft == 0
-                        bool_note_binding(s, payload_bool_kind(s, arm, enum_name, enum_name_len))   # AGAST #2342
+        if user_arm_arity_ok(s, arm, enum_name, enum_name_len) == 1
+            let nb: i32 = arm_bind_count(arm)
+            for k in 0..nb
+                arm_select_bind(arm, k)
+                emit_arm_payload_bind(s, arm, scrut_reg, scrut_slot, enum_name, enum_name_len)
+            arm_select_bind(arm, 0)
 
     # A catch-all name over a scalar (`other => other + 1`) binds the
     # scrutinee, as in ritz0 (LANGUAGE_SPEC §8.2).  Not a const (that arm
@@ -2107,10 +2136,10 @@ fn match_refuse_foreign_arms(s: *EmitterState, arms: *MatchArm, name: *u8, len: 
 
 # --- Field count (AGAST #2408; LANGUAGE_SPEC §8.2) ----------------------------
 #
-# A variant pattern lists one field per field of its variant.  The grammar takes
-# one name, so this is a name on a bare variant (`Z(a)`, `None(k)`), bound to
-# nothing, or on a struct variant of more fields than one.  ritz0's twin is
-# _require_field_count, which also counts the lists ritz1 can't parse.
+# A variant pattern lists one field per field of its variant: a name on a bare
+# variant (`Z(a)`, `None(k)`) would bind nothing, and since AGAST #1295 a list
+# (`Rect(w, h)`) must name every field of a tuple or struct variant.  ritz0's
+# twin is _require_field_count.
 
 # How many fields variant `name` of the scrutinee has, or -1 if it has none so
 # called: that is match_refuse_foreign_arms' error, after coverage.
@@ -2126,8 +2155,7 @@ fn match_variant_field_count(ei: i32, builtin: i32, name: *u8, len: i32) -> i32
             let kind: i32 = enum_variant_kind(ei, vi)
             if kind == ENUM_VARIANT_UNIT
                 return 0
-            if kind == ENUM_VARIANT_TUPLE
-                return 1
+            # AGAST #1295: a tuple variant has as many as it declares too.
             var n: i32 = 0
             var f: *StructField = enum_variant_fields(ei, vi)
             while f != null
@@ -2146,7 +2174,8 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
     while arm != null
         if arm.pattern_kind == PAT_VARIANT
             let has: i32 = match_variant_field_count(ei, builtin, arm.pattern_name, arm.pattern_name_len)
-            if has >= 0 and has != 1
+            let lists: i32 = arm_bind_count(arm)   # AGAST #1295
+            if has >= 0 and has != lists
                 eprints_cstr(fn_source_file(emitter_current_fn()))
                 eprint_char(':')
                 eprint_i64(arm.head_span.line as i64)
@@ -2156,7 +2185,12 @@ fn match_refuse_field_counts(s: *EmitterState, arms: *MatchArm, ei: i32, builtin
                 eprint_bytes(arm.pattern_name, arm.pattern_name_len)
                 eprints_cstr(c"' has ")
                 eprint_i64(has as i64)
-                eprints_cstr(c" fields, but this pattern lists 1\n")
+                if has == 1
+                    eprints_cstr(c" field, but this pattern lists ")
+                else
+                    eprints_cstr(c" fields, but this pattern lists ")
+                eprint_i64(lists as i64)
+                eprints_cstr(c"\n")
                 emit_str(s, c"  ; ERROR: a variant pattern lists a field count its variant doesn't have\n")
                 s.error_count = s.error_count + 1
                 refused = refused + 1

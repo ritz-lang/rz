@@ -11,9 +11,9 @@ ritz1 compiled `Z(a)` and `None(k)` on a bare variant, binding nothing. Each is 
 a located error at the pattern, naming both counts, on every compiler that can
 read the program. It comes before coverage, so `Two(a)` covers nothing.
 
-ritz1's grammar takes one name in a variant pattern and one type in a tuple
-variant (#1295), so the only mismatch it can read is a name on a variant with none, or on
-a struct variant with more than one field. The rest are ritz0's rows alone.
+Since AGAST #1295 ritz1 reads a list of names in a variant pattern and of types
+in a tuple variant, so it says every row but those with a literal in a field
+(its patterns bind names only): those are ritz0's alone.
 """
 
 import os
@@ -29,7 +29,6 @@ from ritz0_inproc import run_ritz0
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 ALL = ["ritz0", "ritz1", "ritz1_selfhosted"]
-RITZ1S = ALL[1:]
 
 _P = "enum P\n    Two(i32, i32)\n    One(i32)\n    Z\n"
 _Q = "enum Q\n    One(i32)\n    Z\n"
@@ -51,9 +50,9 @@ def _lines(prefix):
 ROWS = {
     # Fewer: compiled, read the first field, and covered Two.
     "fewer": (_P + _on("P", ["Two(a) => a", "One(x) => 2", "Z => 3"], "P.Two(1, 5)"),
-              _lines(_P) + 3, "Two", 2, 1, ["ritz0"]),
+              _lines(_P) + 3, "Two", 2, 1, ALL),
     "more": (_on("Option<i32>", ["Some(a, b) => a", "None => 2"], "Some(1)"),
-             3, "Some", 1, 2, ["ritz0"]),
+             3, "Some", 1, 2, ALL),
     # A literal in a surplus field is the count's error, not #2350's.
     "more_with_a_literal": (_on("Option<i32>", ["Some(a, 0) => a", "None => 2"], "Some(1)"),
                             3, "Some", 1, 2, ["ritz0"]),
@@ -69,7 +68,7 @@ ROWS = {
                                   _lines(_S) + 3, "V", 2, 1, ALL),
     # An arm missing too: the count is said, and coverage isn't.
     "fewer_with_an_arm_missing": (_P + _on("P", ["Two(a) => a", "One(x) => 2"], "P.Z"),
-                                  _lines(_P) + 3, "Two", 2, 1, ["ritz0"]),
+                                  _lines(_P) + 3, "Two", 2, 1, ALL),
     "on_a_bare_variant_with_an_arm_missing": (_Q + _on("Q", ["Z(a) => 3"], "Q.Z"),
                                               _lines(_Q) + 3, "Z", 0, 1, ALL),
 }
@@ -116,22 +115,38 @@ def test_a_variant_pattern_lists_every_field(request, tmp_path, compiler, name):
 
 
 @pytest.mark.integration
-def test_ritz0_still_binds_every_field(tmp_path, request):
-    """The count is the variant's: all of them bind, and `_` takes one."""
+@pytest.mark.parametrize("compiler", ALL)
+def test_every_field_binds(tmp_path, request, compiler):
+    """The count is the variant's: all of them bind, and `_` takes one (ritz1
+    since AGAST #1295)."""
     source = _P + _on("P", ["Two(_, b) => b", "One(x) => 2", "Z => 3"], "P.Two(1, 5)")
-    proc, ll = _compile(request, "ritz0", tmp_path, source)
+    proc, ll = _compile(request, compiler, tmp_path, source)
     assert proc.returncode == 0, (proc.stdout + proc.stderr)[-1500:]
     exe = tmp_path / "unit"
-    fast_link.clang(["clang", "-w", str(ll), "-o", str(exe), "-nostdlib"], check=True)
+    # ritz0 emits its own `_start`; ritz1 links the runtime's.
+    start = [] if compiler == "ritz0" else [str(RITZ_ROOT / "runtime" / "ritz_start.x86_64.o")]
+    fast_link.clang(["clang", "-w", str(ll)] + start + ["-o", str(exe), "-nostdlib"], check=True)
     assert subprocess.run([str(exe)], timeout=60, check=False).returncode == 5
 
 
+# AGAST #1295: a constructor takes one value per field too.  ritz1 says so at
+# the first value; ritz0 still accepts a short or long list (AGAST #3992).
+CTOR_ROWS = {
+    "short": ("Rect(1)", 18, 1),
+    "long": ("Rect(1, 2, 3)", 18, 3),
+    "qualified_short": ("Shape.Rect(1)", 24, 1),
+}
+
+
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", RITZ1S)
-def test_ritz1_cannot_parse_a_second_field(request, tmp_path, compiler):
-    """Goes red when ritz1 learns one, which must then count it as ritz0 does."""
-    source = _on("Option<i32>", ["Some(a, b) => a", "None => 2"], "Some(1)")
+@pytest.mark.parametrize("compiler,name", [
+    pytest.param(c, n, id=f"{c}-{n}") for n in sorted(CTOR_ROWS) for c in ALL[1:]])
+def test_a_variant_constructor_takes_every_field(request, tmp_path, compiler, name):
+    ctor, col, got = CTOR_ROWS[name]
+    source = f"enum Shape\n    Circle(i64)\n    Rect(i64, i64)\n\nfn main() -> i32\n    let s = {ctor}\n    0\n"
     proc, ll = _compile(request, compiler, tmp_path, source)
     out = proc.stdout + proc.stderr
-    assert proc.returncode != 0 and "failed to parse" in out, f"{compiler}:\n{out[-800:]}"
-    assert not ll.exists()
+    assert proc.returncode != 0, f"{compiler} accepted {ctor}:\n{out[-1500:]}"
+    want = f"unit.ritz:6:{col}: variant `Rect` takes 2 payload value(s), got {got}"
+    assert want in out, f"{compiler}, {name}: want {want!r}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {ctor}"

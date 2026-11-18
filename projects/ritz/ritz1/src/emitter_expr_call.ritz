@@ -2670,9 +2670,9 @@ pub fn users_variant_wins(s: *EmitterState, e: *Expr) -> i32
     return 1
 
 # AGAST #1797: `Holds(x)`, a payload variant of a user enum (unqualified, as
-# ritz0's variant_to_enum resolves it: enum_of_variant).  Only a tuple
-# variant's single payload is constructed here; a struct variant's field
-# list (`Big(1, 2, 3)`) is not.  The qualified `Opt.Holds(x)` is an
+# ritz0's variant_to_enum resolves it: enum_of_variant), with its payload:
+# AGAST #1295: every field of a tuple variant, `Rect(w, h)`, and of a struct
+# variant built positionally, `Big(1, 2, 3)`.  The qualified `Opt.Holds(x)` is an
 # EXPR_METHOD: emit_qualified_variant_ctor (#1466).  Returns 0 when `e` is
 # not one.
 # AGAST #2039: a callee two enums declare is the located ambiguity error,
@@ -2683,7 +2683,9 @@ fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
     let iei: i32 = slot_instance_variant(s, e.func_name, e.func_name_len, @ivi)
     if iei >= 0
         let ikind: i32 = enum_variant_kind(iei, ivi)
-        if (ikind == ENUM_VARIANT_UNIT and e.args == null) or (ikind == ENUM_VARIANT_TUPLE and e.args != null and e.args.next == null)
+        # AGAST #1295: a payload variant takes its fields' values (counted
+        # by emit_variant_build).
+        if (ikind == ENUM_VARIANT_UNIT and e.args == null) or ((ikind == ENUM_VARIANT_TUPLE or ikind == ENUM_VARIANT_STRUCT) and e.args != null)
             var in_len: i32 = 0
             let in_name: *u8 = enum_name_at(iei, @in_len)
             return emit_variant_build(s, in_name, in_len, ivi, e.args)
@@ -2708,7 +2710,7 @@ fn try_emit_user_variant_ctor(s: *EmitterState, e: *Expr) -> i32
 
 # AGAST #1466: `E.V(args)`, variant `vi` of enum `ei` (see qualified_variant),
 # lowered as the unqualified `V(args)` is (try_emit_user_variant_ctor): a
-# tuple variant with its one payload, or a unit variant called with none.
+# tuple or struct variant with one value per field (AGAST #1295), or a unit variant called with none.
 # Anything else ritz1 cannot build is a located error, never IR.
 fn emit_qualified_variant_ctor(s: *EmitterState, e: *Expr, ei: i32, vi: i32) -> i32
     if enum_is_generic(ei) == 1
@@ -2720,11 +2722,13 @@ fn emit_qualified_variant_ctor(s: *EmitterState, e: *Expr, ei: i32, vi: i32) -> 
         if e.args != null
             return emit_qualified_variant_error(s, e, c"takes no payload")
         return emit_variant_build(s, en, en_len, vi, null)
-    if kind == ENUM_VARIANT_TUPLE
-        if e.args == null or e.args.next != null
+    # AGAST #1295: a tuple variant, or a struct one built positionally, takes
+    # one value per field (emit_variant_build counts them, located).
+    if e.args == null
+        if enum_variant_field_count(ei, vi) == 1
             return emit_qualified_variant_error(s, e, c"takes 1 payload value")
-        return emit_variant_build(s, en, en_len, vi, e.args)
-    return emit_qualified_variant_error(s, e, c"is a struct variant: constructing one is not supported by ritz1 yet (AGAST #1295)")
+        return emit_qualified_variant_error(s, e, c"takes one payload value per field")
+    return emit_variant_build(s, en, en_len, vi, e.args)
 
 # The struct or enum a variant payload's register holds, null/0 for an i64-width
 # scalar.  ritz1 lacks a full expr-type oracle so this peeks at the expression
@@ -2895,28 +2899,33 @@ fn emit_array_payload_into(s: *EmitterState, pay_ptr: i32, arr: *ArrayArg, e: *E
     else
         emit_array_fill_into(s, pay_ptr, arr.size, arr.elem, arr.name, arr.name_len, e.left)
 
-# Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
-# zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
-# where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
-# user enum (AGAST #1797; the payload type is the tuple variant's).
-fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, payload_expr: *Expr) -> i32
+# AGAST #1295: one evaluated variant payload field, between evaluating it
+# (eval_variant_payload) and storing it into the enum (store_variant_payload).
+# have: 0 none (`Ok(())`, a unit variant), 1 a value in reg, 2 an array
+# literal / fill written in place from arr.
+struct VariantPayload
+    have: i32
+    reg: i32
+    arr: ArrayArg
 
-    # Emit payload first (may consume registers); keep expr value for store.
-    var payload_reg: i32 = 0
-    var have_payload: i32 = 0
+# Evaluate payload field `sel` (variant_sel: field k of variant `tag`;
+# Result / Option pass their 0 / 1) from `e`, null for none.
+fn eval_variant_payload(s: *EmitterState, enum_name: *u8, enum_name_len: i32, sel: i32, e: *Expr, pv: *VariantPayload)
+    pv.have = 0
+    pv.reg = 0
     # AGAST #3029: an array literal payload is written in place, below.
-    var arr_pay: ArrayArg
-    let arr_payload: i32 = variant_array_payload(s, enum_name, enum_name_len, tag, payload_expr, @arr_pay)
+    let arr_payload: i32 = variant_array_payload(s, enum_name, enum_name_len, sel, e, @pv.arr)
     # AGAST #2272: `Ok(())` carries a zero-byte payload: nothing to store.
     if arr_payload == 1
-        have_payload = 2
-    else if payload_expr != null and is_unit_expr(payload_expr) == 0
-        payload_reg = emit_lent_payload(s, enum_name, enum_name_len, tag, payload_expr)
-        if payload_reg == 0
-            payload_reg = emit_payload_into_slot(s, enum_name, enum_name_len, tag, payload_expr)
-        have_payload = 1
+        pv.have = 2
+    else if e != null and is_unit_expr(e) == 0
+        pv.reg = emit_lent_payload(s, enum_name, enum_name_len, sel, e)
+        if pv.reg == 0
+            pv.reg = emit_payload_into_slot(s, enum_name, enum_name_len, sel, e)
+        pv.have = 1
 
-    # alloca %Enum
+# `alloca %Enum`, zeroed, with tag `tag` stored at field 0; returns the slot.
+fn emit_variant_slot(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32) -> i32
     let slot: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, slot)
@@ -2946,19 +2955,16 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
     emit_str(s, c", ptr ")
     emit_reg(s, tag_ptr)
     emit_str(s, c"\n")
+    slot
 
-    if have_payload == 2
-        let arr_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, arr_ptr)
-        emit_str(s, c" = getelementptr %")
-        emit_name(s, enum_name, enum_name_len)
-        emit_str(s, c", ptr ")
-        emit_reg(s, slot)
-        emit_str(s, c", i32 0, i32 2\n")
-        emit_array_payload_into(s, arr_ptr, @arr_pay, payload_expr)
+# Store the evaluated payload field `sel` (eval_variant_payload, from `e`)
+# into the enum at `slot`, at the field's offset and type.
+fn store_variant_payload(s: *EmitterState, slot: i32, enum_name: *u8, enum_name_len: i32, sel: i32, e: *Expr, pv: *VariantPayload)
+    if pv.have == 2
+        let arr_ptr: i32 = emit_payload_ptr(s, slot, enum_name, enum_name_len, sel)
+        emit_array_payload_into(s, arr_ptr, @pv.arr, e)
 
-    if have_payload == 1
+    if pv.have == 1
         # Payload goes into field 2 (the `[N x i8]` buffer after the pad,
         # AGAST #1898).  ritz1's expr evaluation always yields an i64-width
         # register for scalar / ptr payloads; it is stored at the payload's
@@ -2966,24 +2972,18 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
         # payloads (e.g. `Vec<u8>` or `StrView`) emit_expr returns the
         # aggregate register — store it by its declared name when we can
         # recover the type, else fall back to the scalar store.
-        let pay_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, pay_ptr)
-        emit_str(s, c" = getelementptr %")
-        emit_name(s, enum_name, enum_name_len)
-        emit_str(s, c", ptr ")
-        emit_reg(s, slot)
-        emit_str(s, c", i32 0, i32 2\n")
+        # AGAST #1295: field `sel` names, at its offset in the buffer.
+        let pay_ptr: i32 = emit_payload_ptr(s, slot, enum_name, enum_name_len, sel)
 
         var aggregate_name: *u8 = null
         var aggregate_name_len: i32 = 0
-        variant_payload_aggregate(s, payload_expr, @aggregate_name, @aggregate_name_len)
+        variant_payload_aggregate(s, e, @aggregate_name, @aggregate_name_len)
         var is_aggregate: i32 = (aggregate_name != null) as i32
 
         # AGAST #1797: a user enum's tuple variant declares its payload
         # type; a struct one is the aggregate whatever the expression form.
         if is_aggregate == 0
-            let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, tag)
+            let uf: *StructField = user_enum_tuple_field(enum_name, enum_name_len, sel)
             if uf != null
                 if uf.field_type == TYPE_STRUCT and uf.field_type_name_len > 0
                     is_aggregate = 1
@@ -2998,7 +2998,7 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
         # i64: invalid IR.
         if is_aggregate == 0
             var decl_len: i32 = 0
-            let decl: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, tag, @decl_len)
+            let decl: *u8 = tagged_enum_arg(s, enum_name, enum_name_len, sel, @decl_len)
             if decl != null and decl_len > 0
                 if is_tagged_enum_type(decl, decl_len) == 1 or enum_find(decl, decl_len) >= 0
                     is_aggregate = 1
@@ -3009,24 +3009,26 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
             emit_str(s, c"  store %")
             emit_name(s, aggregate_name, aggregate_name_len)
             emit_str(s, c" ")
-            emit_reg(s, payload_reg)
+            emit_reg(s, pv.reg)
             emit_str(s, c", ptr ")
             emit_reg(s, pay_ptr)
             emit_str(s, c"\n")
         else
             # AGAST #1945: a float payload is stored at its own type; a
             # literal (always double) or an integer is converted first.
-            var store_reg: i32 = payload_reg
-            let pay_ft: i32 = tagged_enum_float_type(s, enum_name, enum_name_len, tag)
+            var store_reg: i32 = pv.reg
+            let pay_ft: i32 = tagged_enum_float_type(s, enum_name, enum_name_len, sel)
             if pay_ft != 0
-                store_reg = emit_float_coerce(s, payload_reg, get_expr_type(s, payload_expr), pay_ft)
+                store_reg = emit_float_coerce(s, pv.reg, get_expr_type(s, e), pay_ft)
             else
                 # AGAST #2384: an `@&T` payload (`Some(r)`, `r: @&C`, into an
                 # `Option<@&C>`) is a `ptr`; the payload slot holds an i64.
-                store_reg = ptr_value_to_i64(s, payload_expr, payload_reg)
-            emit_tagged_payload_store(s, store_reg, pay_ptr, enum_name, enum_name_len, tag)
+                store_reg = ptr_value_to_i64(s, e, pv.reg)
+            emit_tagged_payload_store(s, store_reg, pay_ptr, enum_name, enum_name_len, sel)
 
-    # Load the assembled struct to return its value.
+
+# Load the enum assembled at `slot` as a value.
+fn emit_variant_load(s: *EmitterState, slot: i32, enum_name: *u8, enum_name_len: i32) -> i32
     let result: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, result)
@@ -3035,7 +3037,55 @@ fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag:
     emit_str(s, c", ptr ")
     emit_reg(s, slot)
     emit_str(s, c"\n")
-    return result
+    result
+
+# Build `%Enum` with tag `tag` and payload `payload_expr` (null: none) in a
+# zeroed alloca, and load it.  `enum_name` is a tagged enum (Result$/Option$,
+# where `tag` 0 / 1 also picks Ok-Some / Err for the payload width) or a
+# user enum (AGAST #1797; the payload type is the tuple variant's).
+# AGAST #1295: `payload_expr` is the head of the argument list: a user
+# enum's variant takes one value per field, each stored at its offset.
+fn emit_variant_build(s: *EmitterState, enum_name: *u8, enum_name_len: i32, tag: i32, payload_expr: *Expr) -> i32
+    let ei: i32 = user_enum_index(enum_name, enum_name_len)
+    if ei >= 0 and tag >= 0 and tag < enum_variant_count(ei) and payload_expr != null
+        let nf: i32 = enum_variant_field_count(ei, tag)
+        var na: i32 = 0
+        var a: *Expr = payload_expr
+        while a != null
+            na += 1
+            a = a.next
+        if nf > 0 and na != nf
+            emit_nd_error_begin(s, payload_expr.span.line, payload_expr.span.col)
+            eprints_cstr(c"variant `")
+            var vn_len: i32 = 0
+            let vn: *u8 = enum_variant_name(ei, tag, @vn_len)
+            eprint_bytes(vn, vn_len)
+            eprints_cstr(c"` takes ")
+            eprint_int(nf as i64)
+            eprints_cstr(c" payload value(s), got ")
+            eprint_int(na as i64)
+            eprints_cstr(c"\n")
+        if nf > 1 and na == nf
+            # Evaluated left to right, each straight into its field.
+            let mslot: i32 = emit_variant_slot(s, enum_name, enum_name_len, tag)
+            var arg: *Expr = payload_expr
+            var k: i32 = 0
+            while arg != null
+                var fpv: VariantPayload
+                let sel: i32 = variant_sel(tag, k)
+                eval_variant_payload(s, enum_name, enum_name_len, sel, arg, @fpv)
+                store_variant_payload(s, mslot, enum_name, enum_name_len, sel, arg, @fpv)
+                arg = arg.next
+                k += 1
+            return emit_variant_load(s, mslot, enum_name, enum_name_len)
+
+    # Emit payload first (may consume registers); keep expr value for store.
+    var pv: VariantPayload
+    eval_variant_payload(s, enum_name, enum_name_len, tag, payload_expr, @pv)
+    let slot: i32 = emit_variant_slot(s, enum_name, enum_name_len, tag)
+    store_variant_payload(s, slot, enum_name, enum_name_len, tag, payload_expr, @pv)
+    # Load the assembled struct to return its value.
+    return emit_variant_load(s, slot, enum_name, enum_name_len)
 
 # =============================================================================
 # AGAST #167 — SIMD builtin lowering

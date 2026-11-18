@@ -1,0 +1,167 @@
+# AGAST #1295: user enums whose tuple variants carry more than one field.
+#
+# THE DEFECT
+#
+# ritz1's grammar took exactly one payload type per tuple variant
+# (`IDENT LPAREN type_spec RPAREN`) and exactly one pattern binding
+# (`IDENT LPAREN IDENT RPAREN`), so the spec's own example
+#
+#     enum Shape
+#         Circle(i64)
+#         Rect(i64, i64)
+#
+# was `error: unexpected ','` on ritz1 (LARB review/5 N4) while ritz0 ran it.
+#
+# THE FIX
+#
+# * grammar: `Name(T1, T2, ..)` records every payload field; a pattern
+#   `Name(a, b, ..)` / `E.Name(a, b, ..)` binds each positionally (`_` skips).
+# * construction `Name(x, y, ..)` stores each field at its offset in the
+#   payload buffer, laid out as ritz0 lays it out (each field at its own
+#   alignment); a binding loads each at its own type from the same offset.
+# * arity is checked on both sides.
+#
+# Oracle: ritz0 runs every case to the same result, and sizeof() pins the
+# layout (ritz0's `{ i8, [pad x i8], [N x i8] }`) on all three compilers.
+
+struct Pt
+    x: i32
+    y: i32
+
+enum Shape
+    Circle(i64)
+    Rect(i64, i64)
+
+enum FShape
+    Dot
+    Box(f64, f64)
+
+# u8 then i32 then u64: the i32 needs 3 bytes of interior padding and the
+# u64 4 more, so offsets are 0 / 4 / 8 and the payload is 16 bytes.
+enum Mixed
+    Packed(u8, i32, u64)
+    Nothing
+
+enum Tagged
+    Plain
+    At(Pt, i32)
+
+fn area(s: Shape) -> i64
+    match s
+        Circle(r) => r * r * 3
+        Rect(w, h) => w * h
+
+[[test]]
+fn test_larb_shape_binds_both_rect_fields() -> i32
+    assert area(Circle(2)) == 12
+    assert area(Rect(3, 4)) == 12
+    assert area(Rect(7, 11)) == 77
+    0
+
+[[test]]
+fn test_shape_layout_matches_ritz0() -> i32
+    # { i8, [7 x i8], [16 x i8] }
+    assert sizeof(Shape) == 24
+    # { i8, [7 x i8], [16 x i8] }
+    assert sizeof(FShape) == 24
+    # { i8, [7 x i8], [16 x i8] }
+    assert sizeof(Mixed) == 24
+    # { i8, [3 x i8], [12 x i8] }
+    assert sizeof(Tagged) == 16
+    0
+
+[[test]]
+fn test_float_fields() -> i32
+    let b: FShape = Box(1.5, 2.25)
+    var w: f64 = 0.0
+    var h: f64 = 0.0
+    match b
+        Dot => w = 0.0 - 1.0
+        Box(bw, bh) =>
+            w = bw
+            h = bh
+    assert w == 1.5
+    assert h == 2.25
+    0
+
+[[test]]
+fn test_mixed_width_interior_alignment() -> i32
+    let m: Mixed = Packed(200, 0 - 100000, 9000000000)
+    var f: u8 = 0
+    var c: i32 = 0
+    var t: u64 = 0
+    match m
+        Packed(flag, count, tail) =>
+            f = flag
+            c = count
+            t = tail
+        Nothing => c = 1
+    assert f == 200
+    assert c == 0 - 100000
+    assert t == 9000000000
+    0
+
+[[test]]
+fn test_struct_field_then_scalar() -> i32
+    let p = Pt { x: 5, y: 6 }
+    let a: Tagged = At(p, 7)
+    var sum: i32 = 0
+    match a
+        Plain => sum = 0 - 1
+        At(q, k) => sum = q.x * 100 + q.y * 10 + k
+    assert sum == 567
+    0
+
+[[test]]
+fn test_wildcard_skips_a_field() -> i32
+    let r: Shape = Rect(8, 9)
+    var got: i64 = 0
+    match r
+        Circle(_) => got = 0 - 1
+        Rect(_, h) => got = h
+    assert got == 9
+    var got2: i64 = 0
+    match r
+        Circle(c) => got2 = c
+        Rect(w, _) => got2 = w
+    assert got2 == 8
+    0
+
+[[test]]
+fn test_qualified_ctor_and_pattern() -> i32
+    let r: Shape = Shape.Rect(10, 20)
+    var s: i64 = 0
+    match r
+        Shape.Circle(c) => s = c
+        Shape.Rect(w, h) => s = w + h
+    assert s == 30
+    0
+
+[[test]]
+fn test_nested_ctor_in_field() -> i32
+    # The inner Rect is built while the outer one's fields are emitted.
+    let r: Shape = Rect(area(Rect(2, 3)), 5)
+    assert area(r) == 30
+    0
+
+[[test]]
+fn test_field_offsets_are_ritz0s() -> i32
+    # Construction and binding share one offset routine, so they would agree
+    # on a wrong layout; read the bytes where ritz0 puts each field instead.
+    # The payload starts at 8 (tag + 7 pad); u8 at +0, i32 at +4, u64 at +8.
+    var m: Mixed = Packed(7, 16909060, 1234605616436508552)
+    let b: *u8 = @m as *u8
+    assert *b == 0
+    assert *(b + 8) == 7
+    let ci: *i32 = (b + 12) as *i32
+    assert *ci == 16909060
+    let tp: *u64 = (b + 16) as *u64
+    assert *tp == 1234605616436508552
+    var r: Shape = Rect(5, 6)
+    let rb: *u8 = @r as *u8
+    assert *rb == 1
+    let w: *i64 = (rb + 8) as *i64
+    let h: *i64 = (rb + 16) as *i64
+    assert *w == 5
+    assert *h == 6
+    0

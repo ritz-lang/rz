@@ -1432,7 +1432,12 @@ fn collect_from_arms(m: *Module, scrut: *Expr, arms: *MatchArm)
     var arm: *MatchArm = arms
     while arm != null
         let saved_count: i32 = g_lv_count
-        bind_arm_payload(m, arm, tn, tn_len)
+        # AGAST #1295: each binding of `V(a, b, ..)`, at its field's type.
+        let nb: i32 = arm_bind_count(arm)
+        for k in 0..nb
+            arm_select_bind(arm, k)
+            bind_arm_payload(m, arm, tn, tn_len)
+        arm_select_bind(arm, 0)
         collect_from_fn_body(m, arm.body_stmts)   # block arm (AGAST #1454)
         if arm.body != null
             collect_from_expr(m, arm.body)
@@ -1470,7 +1475,10 @@ fn bind_arm_payload(m: *Module, arm: *MatchArm, tn: *u8, tn_len: i32)
     if name_len <= 0 or (name_len == 1 and *name == 95)   # `_`
         return
     var pay_len: i32 = 0
-    let pay: *u8 = variant_payload_type(m, tn, tn_len, arm.pattern_name, arm.pattern_name_len, @pay_len)
+    var k: i32 = arm.pattern_field_sel
+    if arm.pattern_binds == null
+        k = 0 - 1
+    let pay: *u8 = variant_field_payload_type(m, tn, tn_len, arm.pattern_name, arm.pattern_name_len, k, @pay_len)
     if pay != null and pay_len > 0
         track_typed_local(name, name_len, TYPE_STRUCT, pay, pay_len)
 
@@ -1478,7 +1486,20 @@ fn bind_arm_payload(m: *Module, arm: *MatchArm, tn: *u8, tn_len: i32)
 # whole suffix, Result's Ok its T and Err its E, a non-generic user enum's
 # single-field tuple variant that field's struct type.
 fn variant_payload_type(m: *Module, tn: *u8, tn_len: i32, ctor: *u8, ctor_len: i32, out_len: *i32) -> *u8
+    return variant_field_payload_type(m, tn, tn_len, ctor, ctor_len, 0 - 1, out_len)
+
+# AGAST #1295: as variant_payload_type, for field `k` of a multi-field user
+# enum variant (`h` of `Rect(w, h)` is field 1).  k = -1 asks for the sole
+# field of a single-field variant (none for a multi-field one); Result /
+# Option have only that one.
+fn variant_field_payload_type(m: *Module, tn: *u8, tn_len: i32, ctor: *u8, ctor_len: i32, k: i32, out_len: *i32) -> *u8
     *out_len = 0
+    if k > 0 and enum_find(tn, tn_len) < 0
+        return null
+    let sole: i32 = (k < 0) as i32
+    var want: i32 = k
+    if want < 0
+        want = 0
     if tn == null or tn_len <= 0
         return null
     if tn_len > 7 and memcmp(tn, c"Option$", 7) == 0
@@ -1503,8 +1524,14 @@ fn variant_payload_type(m: *Module, tn: *u8, tn_len: i32, ctor: *u8, ctor_len: i
     let vi: i32 = enum_variant_index(tn, tn_len, ctor, ctor_len)
     if vi < 0 or enum_variant_kind(ei, vi) != ENUM_VARIANT_TUPLE
         return null
-    let f: *StructField = enum_variant_fields(ei, vi)
-    if f == null or f.next != null or f.field_type != TYPE_STRUCT or f.field_type_name == null
+    var f: *StructField = enum_variant_fields(ei, vi)
+    if sole == 1 and f != null and f.next != null
+        return null   # `V(x)` over a multi-field variant: the arity error's
+    var i: i32 = 0
+    while f != null and i < want
+        f = f.next
+        i += 1
+    if f == null or f.field_type != TYPE_STRUCT or f.field_type_name == null
         return null
     *out_len = f.field_type_name_len
     return f.field_type_name
@@ -4015,6 +4042,9 @@ fn clone_match_arms(arms: *MatchArm, type_param: *u8, type_param_len: i32, subst
     cloned.pattern_inner_name_len = arms.pattern_inner_name_len
     cloned.pattern_inner_span.line = arms.pattern_inner_span.line   # AGAST #2405
     cloned.pattern_inner_span.col = arms.pattern_inner_span.col
+    cloned.pattern_binds = arms.pattern_binds   # AGAST #1295 (shared: never mutated)
+    cloned.pattern_bind_count = arms.pattern_bind_count
+    cloned.pattern_field_sel = arms.pattern_field_sel
     cloned.pattern_span.line = arms.pattern_span.line   # AGAST #2407
     cloned.pattern_span.col = arms.pattern_span.col
     cloned.head_span.line = arms.head_span.line   # AGAST #2431

@@ -51,6 +51,9 @@ def _int_fn(body):
 
 # name -> (source, line, col, what the error must name[, extra files])
 REJECTED = {
+    # A two-field variant: ritz1 too since AGAST #1295.
+    "two_field_variant": ("enum P\n    Two(i64, i64)\n    Z\nfn f(p: P) -> i64\n    match p\n"
+                          "        Two(a, b) => a\n" + _MAIN, 5, 5, "Z"),
     # R6's table: every position a `match` can stand in.
     "value_tail": (_int_fn("    match n\n        0 => 1\n        1 => 2\n"),
                    2, 5, _CATCH_ALL),
@@ -213,13 +216,15 @@ REJECTED_RITZ0_ONLY = {
     # `Some(0)` covers one value of `Some`, so it does not cover `Some`.
     "literal_payload": (_OPT + "fn f(o: Option<i32>) -> i32\n    match o\n"
                         "        Some(0) => 1\n        None => 2\n" + _MAIN, 3, 5, "Some"),
-    "two_field_variant": ("enum P\n    Two(i64, i64)\n    Z\nfn f(p: P) -> i64\n    match p\n"
-                          "        Two(a, b) => a\n" + _MAIN, 5, 5, "Z"),
 }
 
 # name -> (source, exit code[, extra files]); None compiles without running,
 # because ritz1 compiles a module at a time and `pick` lives in another.
 ACCEPTED = {
+    # A two-field variant: ritz1 too since AGAST #1295.
+    "two_field_variant": ("enum P\n    Two(i64, i64)\n    Z\nfn main() -> i32\n"
+                          "    let p = P.Two(1, 2)\n    match p\n"
+                          "        Two(a, b) => (a + b) as i32\n        Z => 0\n", 3),
     "wildcard": ("fn main() -> i32\n    let n: i64 = 5\n    match n\n"
                  "        0 => 1\n        _ => 2\n", 2),
     "binding": ("fn main() -> i32\n    let n: i64 = 5\n    match n\n"
@@ -311,16 +316,13 @@ ACCEPTED = {
 }
 
 ACCEPTED_RITZ0_ONLY = {
-    "two_field_variant": ("enum P\n    Two(i64, i64)\n    Z\nfn main() -> i32\n"
-                          "    let p = P.Two(1, 2)\n    match p\n"
-                          "        Two(a, b) => (a + b) as i32\n        Z => 0\n", 3),
     # ritz1 can't return a generic user enum yet: `ret %W$i32` of an i64.
     "generic_user_enum": ("enum W<T>\n    A(T)\n    Bb\nfn mk() -> W<i32>\n    A(7)\n"
                           "fn f(w: W<i32>) -> i32\n    match w\n        A(x) => x\n"
                           "        Bb => 9\nfn main() -> i32\n    f(mk())\n", 7),
 }
 
-RITZ1_CANNOT_PARSE = ("literal_payload", "two_field_variant")
+RITZ1_CANNOT_PARSE = ("literal_payload",)
 
 # --- Every arm must be reachable (LARB R13, AGAST #2349) ------------------------
 #
@@ -334,6 +336,10 @@ RITZ1_CANNOT_PARSE = ("literal_payload", "two_field_variant")
 #
 # name -> (source, line, col, line of the covering arm)
 UNREACHABLE = {
+    # A two-field variant: ritz1 too since AGAST #1295.
+    "two_field_variant_duplicate": ("enum P\n    Two(i64, i64)\n    Z\nfn f(p: P) -> i64\n"
+                                    "    match p\n        Two(a, b) => a\n        Z => 0\n"
+                                    "        Two(_, d) => d\n" + _MAIN, 8, 9, 6),
     "after_wildcard": (_int_fn("    match n\n        _ => 1\n        5 => 2\n"), 4, 9, 3),
     "after_wildcard_statement": ("fn f(n: i64)\n    match n\n        _ => pass\n"
                                  "        5 => pass\n" + _MAIN, 4, 9, 3),
@@ -394,13 +400,6 @@ UNREACHABLE = {
                                 "        false => 2\n        _ => 3\n" + _MAIN, 5, 9, 4),
 }
 
-# ritz1 parses none of these patterns or types.
-UNREACHABLE_RITZ0_ONLY = {
-    "two_field_variant_duplicate": ("enum P\n    Two(i64, i64)\n    Z\nfn f(p: P) -> i64\n"
-                                    "    match p\n        Two(a, b) => a\n        Z => 0\n"
-                                    "        Two(_, d) => d\n" + _MAIN, 8, 9, 6),
-}
-
 # Still legal: each arm takes a value no arm above it does. name -> (source, code)
 REACHABLE = {
     "literal_then_wildcard": ("fn main() -> i32\n    let n: i64 = 5\n    match n\n"
@@ -434,12 +433,6 @@ def _assert_unreachable(request, compiler, tmp_path, name, entry):
 @pytest.mark.parametrize("name", sorted(UNREACHABLE))
 def test_an_arm_that_cannot_be_reached_is_an_error(request, tmp_path, compiler, name):
     _assert_unreachable(request, compiler, tmp_path, name, UNREACHABLE[name])
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(UNREACHABLE_RITZ0_ONLY))
-def test_ritz0_only_shapes_that_cannot_be_reached(request, tmp_path, name):
-    _assert_unreachable(request, "ritz0", tmp_path, name, UNREACHABLE_RITZ0_ONLY[name])
 
 
 @pytest.mark.integration

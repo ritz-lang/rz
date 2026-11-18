@@ -72,9 +72,6 @@ _RITZ1_TWINS = {
     "test_trait_bounds":
         "AGAST #1621 — trait bounds on generic params; also AGAST #1612 "
         "(multi-arg generic calls)",
-    "test_issue_struct_enum_variants":
-        "AGAST #1295 — payload-carrying user enums / struct variants / N-ary "
-        "patterns",
     # --- codegen, runtime failures ---
 }
 
