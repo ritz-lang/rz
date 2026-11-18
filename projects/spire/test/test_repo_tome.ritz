@@ -5,7 +5,7 @@
 # safe RESP framing helpers land in tome.client; the embedded mode is
 # the one we exercise here.
 
-import spire.repo.tome { Cache }
+import spire.repo.tome { Cache, cache_new }
 import spire.repo.tome { cache_init_embedded, cache_init_tcp, cache_connect, cache_close }
 import spire.repo.tome { cache_set, cache_setex, cache_get, cache_del }
 import spire.repo.tome { cache_exists, cache_expire, cache_ttl, cache_persist }
@@ -19,7 +19,7 @@ import spire.repo.tome { CACHE_OK, CACHE_ERR_NOT_INITIALIZED, CACHE_ERR_NOT_IMPL
 
 [[test]]
 fn test_embedded_init_sets_mode() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
     if cache_mode(@c) != CACHE_MODE_EMBEDDED
@@ -33,7 +33,7 @@ fn test_embedded_init_sets_mode() -> i32
 
 [[test]]
 fn test_tcp_init_sets_mode() -> i32
-    var c: Cache
+    var c = cache_new()
     let host: *u8 = c"127.0.0.1"
     cache_init_tcp(@c, host, 9, 6379)
     if cache_mode(@c) != CACHE_MODE_TCP
@@ -46,7 +46,7 @@ fn test_tcp_init_sets_mode() -> i32
 
 [[test]]
 fn test_ops_before_connect_return_not_initialized() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     # Deliberately do NOT call cache_connect.
     let key: *u8 = c"foo"
@@ -62,7 +62,7 @@ fn test_ops_before_connect_return_not_initialized() -> i32
 
 [[test]]
 fn test_embedded_set_then_get_round_trips() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -94,7 +94,7 @@ fn test_embedded_set_then_get_round_trips() -> i32
 
 [[test]]
 fn test_embedded_get_miss_returns_zero() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -113,7 +113,7 @@ fn test_embedded_get_miss_returns_zero() -> i32
 
 [[test]]
 fn test_embedded_del_removes_key() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -137,7 +137,7 @@ fn test_embedded_del_removes_key() -> i32
 
 [[test]]
 fn test_embedded_overwrite_replaces_value() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -175,7 +175,7 @@ fn test_embedded_overwrite_replaces_value() -> i32
 
 [[test]]
 fn test_embedded_setex_yields_positive_ttl() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -193,7 +193,7 @@ fn test_embedded_setex_yields_positive_ttl() -> i32
 
 [[test]]
 fn test_embedded_persist_strips_ttl() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -213,7 +213,7 @@ fn test_embedded_persist_strips_ttl() -> i32
 
 [[test]]
 fn test_embedded_expire_on_existing_key() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -236,7 +236,7 @@ fn test_embedded_expire_on_existing_key() -> i32
 
 [[test]]
 fn test_embedded_expire_on_missing_key_returns_zero() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -253,7 +253,7 @@ fn test_embedded_expire_on_missing_key_returns_zero() -> i32
 
 [[test]]
 fn test_embedded_len_tracks_inserts() -> i32
-    var c: Cache
+    var c = cache_new()
     cache_init_embedded(@c, 0)
     cache_connect(@c)
 
@@ -275,7 +275,7 @@ fn test_embedded_len_tracks_inserts() -> i32
 
 [[test]]
 fn test_tcp_set_returns_not_implemented_until_wired() -> i32
-    var c: Cache
+    var c = cache_new()
     let host: *u8 = c"127.0.0.1"
     cache_init_tcp(@c, host, 9, 6379)
     # cache_connect on TCP intentionally returns NOT_IMPLEMENTED
@@ -289,4 +289,54 @@ fn test_tcp_set_returns_not_implemented_until_wired() -> i32
     cache_close(@c)
     if rc != CACHE_ERR_NOT_INITIALIZED
         return -1
+    0
+
+# ============================================================================
+# A never-initialized Cache drops cleanly (AGAST #4023)
+# ============================================================================
+
+# cache_init_tcp never writes `store`.  A Cache built from `var c: Cache` and
+# returned carried stack bytes there, and the caller's binding dropped them as a
+# tome Store, freeing a garbage `entries`.  dirty_stack fills the stack with
+# 0xAA first, so an unwritten field always reads non-null.
+[[noinline]]
+fn dirty_stack() -> i32
+    var d: [8192]u8 = [0; 8192]
+    var i: i32 = 0
+    while i < 8192
+        volatile_store(@d[i], 170)
+        i = i + 1
+    volatile_load(@d[77]) as i32
+
+[[noinline]]
+fn tcp_cache() -> Cache
+    var c = cache_new()
+    cache_init_tcp(@c, c"127.0.0.1", 9, 6379)
+    c
+
+[[noinline]]
+fn tcp_cache_mode() -> i32
+    var c = tcp_cache()
+    cache_mode(@c)
+
+[[test]]
+fn test_tcp_cache_on_a_dirty_stack_drops_cleanly() -> i32
+    dirty_stack()
+    if tcp_cache_mode() != CACHE_MODE_TCP
+        return -1
+    0
+
+[[noinline]]
+fn new_cache_connected() -> i32
+    var c = cache_new()
+    cache_is_connected(@c)
+
+[[test]]
+fn test_new_cache_is_not_initialized_or_connected() -> i32
+    dirty_stack()
+    if new_cache_connected() != 0
+        return -1
+    var c = cache_new()
+    if cache_connect(@c) != CACHE_ERR_NOT_INITIALIZED
+        return -2
     0
