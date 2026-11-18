@@ -421,12 +421,16 @@ fn scan_seen_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
     return 0
 
 # Several documents of exactly MAX_DOC_SIZE go in, come back whole by GET
-# (only the id the server assigns differs) and all come back by SCAN (if
-# `scan`: the --serial encrypted loop has no SCAN).
-fn check_max_size_docs(srv: *TestServer, scan: bool) -> i32
+# (only the id the server assigns differs) and all come back by SCAN, as does
+# a zero-document batch for the still-empty collection first (AGAST #4201).
+fn check_max_size_docs(srv: *TestServer) -> i32
     let client: *Client = connect_client(srv)
     if client == null
         return 1
+    var seen: ScanSeen
+    scan_seen_init(@seen, null, 0)
+    if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0 or seen.docs != 0
+        return 9
     let payload: *u8 = malloc(MAX_DOC_SIZE)
     let buf: *u8 = malloc(MAX_DOC_SIZE)
     let size: i64 = make_sized_doc(MAX_DOC_SIZE, payload, buf, MAX_DOC_SIZE)
@@ -447,11 +451,10 @@ fn check_max_size_docs(srv: *TestServer, scan: bool) -> i32
         # Skip the serial version (4) and the id (8).
         if memcmp(out + 12, buf + 12, size - 12) != 0
             return 6
-    var seen: ScanSeen
     scan_seen_init(@seen, buf, size)
-    if scan and client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
+    if client_scan(client, scan_seen_step as *u8, @seen as *u8) < 0
         return 7
-    if scan and (seen.docs != 6 or seen.matched != 6)
+    if seen.docs != 6 or seen.matched != 6
         return 8
     client_disconnect(client)
     client_free(client)
@@ -490,7 +493,7 @@ fn max_size_docs_round_trip_on(mode: i32) -> i32
     let started: i32 = server_start_mode(@srv, mode)
     if started != 0
         return started
-    let rc: i32 = check_max_size_docs(@srv, mode != SERVE_SERIAL_ENCRYPTED)
+    let rc: i32 = check_max_size_docs(@srv)
     server_stop(@srv)
     return rc
 

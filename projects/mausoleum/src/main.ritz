@@ -645,6 +645,9 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
             build_txn_aborted(@resp, request_id)
             active_txn = -1
 
+        else if msg_type == MSG_SCAN
+            handle_scan(@reader, @resp, request_id, collection, -1, ch)
+
         else
             build_error(@resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
 
@@ -791,6 +794,14 @@ fn handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
 
     build_delete_ok(resp, request_id)
 
+# One SCAN_RESULT batch to the client: sealed by `ch` if set, else plain
+# to `fd`.
+fn scan_send(fd: i32, ch: *EncryptedChannel, data: *u8, len: i32)
+    if ch != null
+        channel_send(ch, data, len)
+    else
+        write_all(fd, data, len)
+
 # Handle SCAN message - returns all documents in the collection
 # Handle MSG_SCAN by iterating every document in `collection` and
 # streaming SCAN_RESULT batches to the client, terminated by a single
@@ -809,7 +820,10 @@ fn handle_delete(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, 
 # back-patch them with hand-rolled big-endian byte stores once the batch
 # is closed.  Native i32 stores would silently corrupt the message on
 # little-endian hosts (the bug that bit me last attempt).
-fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection, fd: i32)
+#
+# The batches go out through `ch` when it is set (the --serial encrypted
+# loop), else as plain bytes to `fd` (AGAST #4201).
+fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection, fd: i32, ch: *EncryptedChannel)
     # Read max_results (0 = all)
     let max_results: i32 = msgreader_read_i32(reader)
 
@@ -835,7 +849,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
         msgbuf_write_i32(@scan_resp, 0)
         msgbuf_write_i32(@scan_resp, 0)
         msgbuf_finish(@scan_resp)
-        sys_write(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp) as i64)
+        scan_send(fd, ch, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp))
         build_scan_end(resp, request_id)
         if iter != null
             btree_iter_destroy(iter)
@@ -922,7 +936,7 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
         *(more_ptr + 3) = (has_more_val & 0xFF) as u8
 
         msgbuf_finish(@scan_resp)
-        write_all(fd, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp))
+        scan_send(fd, ch, msgbuf_data(@scan_resp), msgbuf_len(@scan_resp))
 
         # Defense: if we somehow emitted zero rows in this batch (iter
         # exhausted at start), bail to avoid spinning on empty batches.
@@ -1105,7 +1119,7 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
             active_txn = -1
 
         else if msg_type == MSG_SCAN
-            handle_scan(@reader, @resp, request_id, collection, fd)
+            handle_scan(@reader, @resp, request_id, collection, fd, null)
 
         else
             build_error(@resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
