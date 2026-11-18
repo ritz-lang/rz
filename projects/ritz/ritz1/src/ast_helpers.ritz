@@ -2706,6 +2706,7 @@ pub fn type_named(p: *Parser, name: *u8, len: i32) -> i32
     if g_alias_count > 0
         let alias_ty: i32 = type_alias_resolve(p, name, len)
         if alias_ty != TYPE_VOID
+            alias_use_log(p, name, len)   # AGAST #3907
             return alias_ty
     # AGAST #2198: `usize` / `isize` are primitives, not a TYPE_STRUCT named
     # "usize" (which wrote `%usize`, an opaque type clang rejects).  AGAST
@@ -3675,6 +3676,72 @@ var g_alias_count: i32 = 0
 pub fn type_alias_count() -> i32
     g_alias_count
 
+# AGAST #3907: every enum and type alias declared, in parse order, across
+# every file and both parse passes; never reset.  The tables above record no
+# file, so import_vis marks the log before a file is parsed and reads what
+# the file added after (type_decl_log_count / type_decl_log_at).
+var g_tdl_names: **u8 = null
+var g_tdl_lens: *i32 = null
+var g_tdl_count: i32 = 0
+var g_tdl_cap: i32 = 0
+
+fn type_decl_log(name: *u8, len: i32)
+    if g_tdl_count >= g_tdl_cap
+        var cap: i32 = g_tdl_cap * 2
+        if cap == 0
+            cap = 256
+        g_tdl_names = realloc(g_tdl_names as *u8, (cap as i64) * 8) as **u8
+        g_tdl_lens = realloc(g_tdl_lens as *u8, (cap as i64) * 4) as *i32
+        g_tdl_cap = cap
+    *(g_tdl_names + g_tdl_count) = name
+    *(g_tdl_lens + g_tdl_count) = len
+    g_tdl_count = g_tdl_count + 1
+
+pub fn type_decl_log_count() -> i32
+    g_tdl_count
+
+pub fn type_decl_log_at(i: i32, out_len: *i32) -> *u8
+    *out_len = *(g_tdl_lens + i)
+    *(g_tdl_names + i)
+
+# AGAST #3907: each type alias written, in parse order: type_named replaces
+# it with its target, so sema never sees the name.  `name` points into the
+# file's tokens, so a use the parser backtracks over and parses again is
+# logged once.  Never reset; parse_program marks the input file's range.
+var g_aul_names: **u8 = null
+var g_aul_lens: *i32 = null
+var g_aul_spans: *SrcSpan = null
+var g_aul_count: i32 = 0
+var g_aul_cap: i32 = 0
+
+fn alias_use_log(p: *Parser, name: *u8, len: i32)
+    var i: i32 = g_aul_count - 1
+    while i >= 0 and i >= g_aul_count - 64
+        if *(g_aul_names + i) == name
+            return
+        i = i - 1
+    if g_aul_count >= g_aul_cap
+        var cap: i32 = g_aul_cap * 2
+        if cap == 0
+            cap = 256
+        g_aul_names = realloc(g_aul_names as *u8, (cap as i64) * 8) as **u8
+        g_aul_lens = realloc(g_aul_lens as *u8, (cap as i64) * 4) as *i32
+        g_aul_spans = realloc(g_aul_spans as *u8, (cap as i64) * sizeof(SrcSpan)) as *SrcSpan
+        g_aul_cap = cap
+    *(g_aul_names + g_aul_count) = name
+    *(g_aul_lens + g_aul_count) = len
+    # The alias's IDENT is the token just taken.
+    *(g_aul_spans + g_aul_count) = parse_span_at(p, p.pos - 1)
+    g_aul_count = g_aul_count + 1
+
+pub fn alias_use_count() -> i32
+    g_aul_count
+
+pub fn alias_use_at(i: i32, out_len: *i32, out_span: *SrcSpan) -> *u8
+    *out_len = *(g_aul_lens + i)
+    *out_span = *(g_aul_spans + i)
+    *(g_aul_names + i)
+
 fn type_alias_find(name: *u8, len: i32) -> *AliasEntry
     var i: i32 = 0
     while i < g_alias_count
@@ -3743,6 +3810,7 @@ pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
         e = malloc(sizeof(AliasEntry)) as *AliasEntry
         *(g_alias_table + g_alias_count) = e as *u8
         g_alias_count = g_alias_count + 1
+    type_decl_log(name, len)   # AGAST #3907: a redeclaration too
     e.name = name
     e.name_len = len
     e.kind = kind
@@ -7504,6 +7572,8 @@ fn enum_def_start_full(name: *u8, len: i32, generic: i32, repr: i32, line: i32) 
     *(g_enum_pub + g_enum_count) = 0
     *(g_enum_line + g_enum_count) = line
     g_enum_count = g_enum_count + 1
+    if generic != ENUM_INSTANCE   # `Slot$i32` is declared by no file
+        type_decl_log(name, len)   # AGAST #3907
     return 0
 
 # Called from grammar rule enum_def_header: starts a new enum-tracking entry.

@@ -36,6 +36,19 @@ pub fn c_val() -> i32
 
 pub struct CS
     x: i32
+
+impl CS
+    pub fn make() -> CS
+        CS { x: 3 }
+
+    pub fn get(self: @CS) -> i32
+        self.x
+
+pub enum CE
+    A
+    B(i32)
+
+pub type CA = i32
 """
 
 B = """\
@@ -43,6 +56,9 @@ B = """\
 
 pub fn b_val() -> i32
     c_val()
+
+pub fn b_cs() -> CS
+    CS {{ x: 4 }}
 """
 
 MAIN_FN = """\
@@ -100,6 +116,56 @@ import b
 
 pub fn main() -> i32
     sizeof(Nope) as i32
+"""
+
+# An enum's name is a use in an annotation, at `E.V`, and as a pattern's
+# qualifier, bare or with a binding (#3907).
+MAIN_ENUM = """\
+import b
+
+pub fn main() -> i32
+    let e: CE = CE.A
+    match e
+        CE.A => 1
+        CE.B(n) => n
+"""
+
+MAIN_ALIAS = """\
+import b
+
+pub fn main() -> i32
+    let a: CA = 2
+    a
+"""
+
+# `CS.make()` names CS; `CS_make()` is the same method by its mangled name, so
+# it is hidden as CS is (#3907).
+MAIN_STATIC = """\
+import b
+
+pub fn main() -> i32
+    CS.make().x + CS_make().x
+"""
+
+# A method on a value names no item: the value's type is checked where it is
+# written, and here it is written in b.  Method syntax reaches no free fn
+# (LANGUAGE_SPEC §9.4, #3244), so there is no UFCS use of a hidden fn (#3907).
+MAIN_METHOD = """\
+import b
+
+pub fn main() -> i32
+    b_cs().get()
+"""
+
+MAIN_TYPES = """\
+import b
+
+pub fn main() -> i32
+    let e: CE = CE.B(2)
+    let a: CA = match e
+        CE.A => 1
+        CE.B(n) => n
+    a + CS.make().x + CS_make().get()
 """
 
 
@@ -185,3 +251,44 @@ def test_sizeof_of_an_unknown_name_is_an_error(tmp_path, compiler):
     rc, errors = _compile(compiler, tmp_path, False, MAIN_SIZEOF_UNKNOWN)
     assert rc != 0
     assert errors == ["main.ritz:4:12: sizeof: unknown type or value `Nope`"]
+
+
+def _lines(errors, name):
+    """The lines errors are on, after checking each is `name`'s (ritz1
+    locates an annotation's at its `let`, ritz0 at the type)."""
+    assert errors and all(f"`{name}` is undefined (#3891)" in e
+                          for e in errors), errors
+    return sorted({int(e.split(":")[1]) for e in errors})
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_enum_through_a_plain_import_is_undefined(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, False, MAIN_ENUM)
+    assert rc != 0
+    assert _lines(errors, "CE") == [4, 6, 7]
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_type_alias_through_a_plain_import_is_undefined(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, False, MAIN_ALIAS)
+    assert rc != 0
+    assert _lines(errors, "CA") == [4]
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_static_call_on_a_hidden_type_is_undefined(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, False, MAIN_STATIC)
+    assert rc != 0
+    assert errors == [_hidden(4, 5, "CS"), _hidden(4, 19, "CS_make")]
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_method_on_a_value_is_not_a_use(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, False, MAIN_METHOD)
+    assert (rc, errors) == (0, [])
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_pub_import_passes_enums_aliases_and_methods_on(tmp_path, compiler):
+    rc, errors = _compile(compiler, tmp_path, True, MAIN_TYPES)
+    assert (rc, errors) == (0, [])
