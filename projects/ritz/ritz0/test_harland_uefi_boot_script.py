@@ -109,9 +109,32 @@ STUB_QEMU_IMG = textwrap.dedent("""\
     #!/bin/bash
     case "$1" in
         create) : > "$4" ;;
-        convert) : > "${@: -1}" ;;
+        # Keep the raw initramfs (a ustar archive, zero-padded) for the
+        # staging tests to list.
+        convert) : > "${@: -1}"
+                 [ -n "$STUB_RAW" ] && cp "${@: -2:1}" "$STUB_RAW" ;;
     esac
     """)
+
+# Stub ./rz: log each `rz build PKG`, fail the one named by STUB_RZ_FAIL.
+STUB_RZ = textwrap.dedent("""\
+    #!/bin/bash
+    echo "$*" >> "$STUB_RZ_LOG"
+    # A failure whose output test.sh filters out entirely.
+    [ "$2" = "${STUB_RZ_FAIL:-}" ] && { echo "  Compiling $2"; exit 1; }
+    exit 0
+    """)
+
+# The packages initramfs.pkgs lists, as the real tree has them.
+REPO = HARLAND.parents[1]
+PKGS_FILE = REPO / "projects" / "indium" / "initramfs.pkgs"
+
+
+def _listed_pkgs():
+    pkgs = []
+    for line in PKGS_FILE.read_text().splitlines():
+        pkgs.extend(line.split("#", 1)[0].split())
+    return pkgs
 
 
 @pytest.fixture
@@ -126,6 +149,24 @@ def harness(tmp_path):
     debug.mkdir(parents=True)
     (debug / "harland.elf").write_bytes(b"\x7fELF kernel")
     (debug / "BOOTX64.EFI").write_bytes(b"MZ bootloader")
+    # The initramfs package list, a dummy ELF per listed package (indium
+    # also builds init_interactive), and one in a package it does not list.
+    projects = root / "projects"
+    (projects / "indium").mkdir()
+    shutil.copy2(PKGS_FILE, projects / "indium" / "initramfs.pkgs")
+    elves = {pkg: [f"{pkg}_bin"] for pkg in _listed_pkgs()}
+    elves["indium"] = ["init", "init_interactive"]
+    elves["unlisted"] = ["stray"]
+    for pkg, names in elves.items():
+        out = projects / pkg / "build" / "debug"
+        out.mkdir(parents=True, exist_ok=True)
+        for name in names:
+            (out / f"{name}.elf").write_bytes(f"\x7fELF {pkg}/{name}".encode())
+    runtime = projects / "ritz" / "runtime"
+    runtime.mkdir(parents=True)
+    (runtime / "Makefile").write_text("all:\n\t@:\n")
+    (root / "rz").write_text(STUB_RZ)
+    (root / "rz").chmod(0o755)
 
     stubs = tmp_path / "stubs"
     stubs.mkdir()
@@ -135,7 +176,7 @@ def harness(tmp_path):
     ovmf = tmp_path / "OVMF_CODE.fd"
     ovmf.write_bytes(b"\0")
 
-    def run(log, extra_env=None):
+    def run(log, extra_env=None, args=()):
         (tmp_path / "serial.canned").write_text(log)
         env = {
             "HOME": os.environ.get("HOME", str(tmp_path)),
@@ -146,9 +187,11 @@ def harness(tmp_path):
             "BOOT_TIMEOUT": "20",
             "STUB_SERIAL": str(tmp_path / "serial.canned"),
             "STUB_RECORD": str(tmp_path / "esp.record"),
+            "STUB_RAW": str(tmp_path / "initramfs.raw"),
+            "STUB_RZ_LOG": str(tmp_path / "rz.log"),
             **(extra_env or {}),
         }
-        proc = subprocess.run(["bash", str(boot / "test.sh")], capture_output=True,
+        proc = subprocess.run(["bash", str(boot / "test.sh"), *args], capture_output=True,
                               text=True, env=env, timeout=120)
         record = tmp_path / "esp.record"
         return proc, record.read_text() if record.exists() else ""
@@ -202,6 +245,60 @@ def test_boot_script_missing_qemu_img_is_a_setup_error(harness, tmp_path):
     proc, _ = harness(_log_up_to(12), {"PATH": str(only)})
     assert proc.returncode == 3, proc.stdout + proc.stderr
     assert "qemu-img" in proc.stderr
+
+
+# --- the initramfs: indium/initramfs.pkgs, built or a setup error (AGAST #3615) --
+#
+# test.sh hand-built indium, prism and rzsh with `rz build X | grep ... || true`
+# (a failed build went on to boot stale binaries) and copied named binaries
+# into the initramfs, a package set that could drift from initramfs.pkgs.
+
+
+def _staged(tmp_path):
+    """{path: contents} of the regular files in the initramfs tar QEMU got."""
+    import tarfile
+    with tarfile.open(tmp_path / "initramfs.raw") as tar:
+        return {m.name.removeprefix("./"): tar.extractfile(m).read()
+                for m in tar.getmembers() if m.isfile()}
+
+
+def test_boot_script_builds_the_listed_packages(harness, tmp_path):
+    proc, _ = harness(_log_up_to(12), {"SKIP_BUILD": "0"})
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    built = (tmp_path / "rz.log").read_text().split("\n")
+    assert built[:-1] == [f"build {p}" for p in _listed_pkgs()], built
+
+
+@pytest.mark.parametrize("pkg", _listed_pkgs())
+def test_boot_script_build_failure_is_a_setup_error(harness, tmp_path, pkg):
+    proc, _ = harness(_log_up_to(12), {"SKIP_BUILD": "0", "STUB_RZ_FAIL": pkg})
+    out = proc.stdout + proc.stderr
+    assert proc.returncode == 3, out
+    assert f"SETUP ERROR: build of {pkg} failed" in proc.stderr, out
+    assert not (tmp_path / "initramfs.raw").exists(), "booted after a failed build"
+
+
+def test_boot_script_stages_exactly_the_listed_packages(harness, tmp_path):
+    proc, _ = harness(_log_up_to(12))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    bins = {k for k in _staged(tmp_path) if k.startswith("bin/")}
+    want = {f"bin/{p}_bin" for p in _listed_pkgs() if p != "indium"}
+    want |= {"bin/init", "bin/init_interactive"}
+    assert bins == want
+
+
+def test_boot_script_interactive_mode_boots_init_interactive(harness, tmp_path):
+    proc, _ = harness(_log_up_to(12), args=("--interactive",))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    staged = _staged(tmp_path)
+    assert staged["bin/init"] == b"\x7fELF indium/init_interactive"
+    assert staged["bin/init_interactive"] == b"\x7fELF indium/init_interactive"
+
+
+def test_boot_script_default_mode_boots_init(harness, tmp_path):
+    proc, _ = harness(_log_up_to(12))
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert _staged(tmp_path)["bin/init"] == b"\x7fELF indium/init"
 
 
 # --- CI wiring: main.yml's build-all runs it (AGAST #2200) -----------------------

@@ -12,7 +12,7 @@ pin it:
 
   * every /bin/NAME that init.ritz spawns is a [[bin]] of a listed package;
   * every consumer (indium's Makefile and tools/mkiso.sh, harland's
-    test_tier1_boot.sh and test_boot.sh) reads the file and keeps no list
+    test_tier1_boot.sh, test_boot.sh and boot/test.sh) reads the file and keeps no list
     of its own;
   * `make -n build/initramfs.tar` builds and stages exactly the listed
     packages, and packs the staged directory.
@@ -40,6 +40,7 @@ CONSUMERS = (
     INDIUM / "tools" / "mkiso.sh",
     PROJECTS / "harland" / "tools" / "test_tier1_boot.sh",
     PROJECTS / "harland" / "tools" / "test_boot.sh",
+    PROJECTS / "harland" / "boot" / "test.sh",
 )
 
 
