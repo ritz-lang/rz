@@ -48,6 +48,7 @@ LOCAL_MODULES = {
     "audit_string_literals",
     "check_doc_examples",
     "check_no_s_strings",
+    "check_unused_imports",  # AGAST #3458
     "check_test_tempdirs",
     "check_test_budget",
     "cpu_calibrate",
