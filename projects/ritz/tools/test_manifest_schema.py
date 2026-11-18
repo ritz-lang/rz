@@ -80,6 +80,25 @@ def test_every_committed_manifest_validates():
     assert not bad, "manifests the schema rejects:\n" + "\n".join(bad)
 
 
+def test_every_test_sources_dir_exists():
+    """A `[test] sources` entry names a directory in its package.
+
+    build.py skips a missing one silently (it searches each for [[test]]
+    fns), so a stale entry reads as live but runs nothing: harland named
+    "tests" while its tests live in test/ (AGAST #3282).
+    """
+    missing = []
+    for f in _committed_manifests():
+        test_cfg = manifest.load(f).get("test")
+        if not isinstance(test_cfg, dict):
+            continue
+        for rel in test_cfg.get("sources", []):
+            if not (f.parent / rel).is_dir():
+                missing.append(f"{f.relative_to(REPO)}: [test] sources "
+                               f"names '{rel}', which is not a directory")
+    assert not missing, "\n".join(missing)
+
+
 @pytest.mark.parametrize("name", sorted(manifest.SCHEMAS))
 def test_every_schema_key_is_read_by_its_named_reader(name):
     """Each key's `read_by` functions exist and mention the key literally.
