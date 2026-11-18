@@ -3873,6 +3873,38 @@ fn module_has_global(s: *EmitterState, name: *u8, len: i32) -> i32
         g = g.next
     0
 
+# 1 when this file itself has a fn `name` (defined or `extern`): ritz1 writes
+# a define or declare for it, so a weak definition beside it would clash.
+fn module_has_local_fn(s: *EmitterState, name: *u8, len: i32) -> i32
+    var f: *FnDef = s.module.functions
+    while f != null
+        if f.is_local == 1 and name_eq(f.name, f.name_len, name, len) == 1
+            return 1
+        f = f.next
+    0
+
+# AGAST #4119: ritzlib's core (memory, hashmap) declares these platform hooks
+# instead of importing ritzlib.sys, so it builds freestanding.  sys defines
+# them; a test binary that links no sys gets these weak Linux copies, as
+# runtime/ritz_start.x86_64.ll and ritz0's `_start` provide them.  mmap 9,
+# munmap 11 (PROT_READ|PROT_WRITE = 3, MAP_PRIVATE|MAP_ANONYMOUS = 0x22),
+# write 1, exit 60.
+fn emit_platform_hooks(s: *EmitterState)
+    if module_has_local_fn(s, c"ritz_platform_page_map", 22) == 0
+        emit_str(s, c"define weak ptr @ritz_platform_page_map(i64 %len) {\nentry:\n")
+        emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},~{memory}\"(i64 9, i64 0, i64 %len, i64 3, i64 34, i64 -1, i64 0)\n")
+        emit_str(s, c"  %p = inttoptr i64 %r to ptr\n  ret ptr %p\n}\n")
+    if module_has_local_fn(s, c"ritz_platform_page_unmap", 24) == 0
+        emit_str(s, c"define weak i32 @ritz_platform_page_unmap(ptr %p, i64 %len) {\nentry:\n  %a = ptrtoint ptr %p to i64\n")
+        emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}\"(i64 11, i64 %a, i64 %len)\n")
+        emit_str(s, c"  %t = trunc i64 %r to i32\n  ret i32 %t\n}\n")
+    if module_has_local_fn(s, c"ritz_platform_fatal", 19) == 0
+        emit_str(s, c"define weak void @ritz_platform_fatal(ptr %msg, i64 %len, i32 %status) {\nentry:\n  %nl = alloca i8\n  store i8 10, ptr %nl\n")
+        emit_str(s, c"  %m = ptrtoint ptr %msg to i64\n  %n = ptrtoint ptr %nl to i64\n  %st = sext i32 %status to i64\n")
+        emit_str(s, c"  %w1 = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %m, i64 %len)\n")
+        emit_str(s, c"  %w2 = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %n, i64 1)\n")
+        emit_str(s, c"  %x = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 %st)\n  unreachable\n}\n")
+
 fn emit_test_table(s: *EmitterState)
     # This file's tests, in source order.  Imported files record their
     # [[test]] fns too; only the input file's (is_local) count.
@@ -3970,6 +4002,7 @@ fn emit_test_table(s: *EmitterState)
     # defined weak here unless an imported os/env already defines it.
     if module_has_global(s, c"__ritz_envp", 11) == 0
         emit_str(s, c"@__ritz_envp = weak global ptr null\n")
+    emit_platform_hooks(s)
     # Bare `naked`, no alignstack/"no-builtins": asm only (AGAST #1326).
     emit_str(s, c"define void @_start() naked {\nentry:\n")
     emit_str(s, c"  call void asm sideeffect \"movq (%rsp), %rdi\\0Aleaq 8(%rsp), %rsi\\0Aleaq 8(%rsi,%rdi,8), %rdx\\0Amovq %rdx, __ritz_envp(%rip)\\0Aandq $$-16, %rsp\\0Acall main\\0Amovq %rax, %rdi\\0Amovq $$60, %rax\\0Asyscall\", \"~{rax},~{rdi},~{rsi},~{rdx},~{rsp},~{rcx},~{r11},~{memory}\"()\n")

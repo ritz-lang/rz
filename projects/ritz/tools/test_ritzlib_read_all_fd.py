@@ -5,7 +5,8 @@ sys_read loop behave identically, so no behavioural test can tell that one of
 them exists. The behaviour itself is pinned by the examples that read stdin
 through the surviving owner (12_tac, 13_sort, 14_uniq, 78_buf).
 
-* vec_read_all_fd (gvec.ritz) is the only read-all-fd function in ritzlib.
+* vec_read_all_fd (io.ritz; gvec.ritz until AGAST #4119 made gvec core) is the
+  only read-all-fd function in ritzlib.
   buf.ritz's GrowBuf copy is gone and no tracked .ritz file still calls it.
 * buf.ritz no longer calls GrowBuf a "type alias for Vec<u8>" or says it is
   "backed by Vec<u8>": it is its own struct, with an `impl Drop` Vec<u8>
@@ -44,7 +45,7 @@ def test_exactly_one_read_all_fd_in_ritzlib():
         for p in RITZLIB.glob("*.ritz")
         for name in decl.findall(p.read_text())
     )
-    assert owners == ["gvec.ritz:vec_read_all_fd"], owners
+    assert owners == ["io.ritz:vec_read_all_fd"], owners
 
 
 @pytest.mark.unit

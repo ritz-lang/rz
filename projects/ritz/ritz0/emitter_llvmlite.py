@@ -6843,6 +6843,7 @@ class LLVMEmitter:
         # ritzlib.os.env reads first: /proc/self/environ is closed to a
         # process that isn't dumpable.  Same as the runtime/*.ll shims.
         self._define_ritz_envp()
+        self._define_platform_hooks(exit_syscall)
         if self.target_os == 'harland':
             load_args = ""
         else:
@@ -6881,6 +6882,55 @@ class LLVMEmitter:
             return
         g.linkage = "weak"
         g.initializer = ir.Constant(g.value_type, None)
+
+    def _define_platform_hooks(self, exit_syscall: int) -> None:
+        """Weak definitions of ritzlib's core platform hooks (AGAST #4119).
+
+        ritzlib.memory and ritzlib.hashmap declare `extern fn
+        ritz_platform_page_map / _page_unmap / _fatal` rather than import
+        ritzlib.sys, so the core builds freestanding.  ritzlib.sys defines
+        them; these weak copies stand in a program that links no sys, as the
+        runtime/ritz_start*.ll shims' do.  mmap 9, munmap 11 and write 1 are
+        the same on Linux and Harland; only exit differs.  A hook this module
+        already defines (sys compiled in, or the program's own) is left alone.
+        """
+        def syscall(b, *args):
+            regs = ["rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"][:len(args)]
+            cons = ",".join(["={rax}"] + [f"{{{r}}}" for r in regs]
+                            + ["~{rcx}", "~{r11}", "~{memory}"])
+            ty = ir.FunctionType(self.i64, [self.i64] * len(args))
+            return b.call(ir.InlineAsm(ty, "syscall", cons, side_effect=True), list(args))
+
+        def i64(n):
+            return ir.Constant(self.i64, n)
+
+        def hook(name, ret, params):
+            fn = self.module.globals.get(name)
+            if fn is None:
+                fn = ir.Function(self.module, ir.FunctionType(ret, params), name=name)
+            elif not fn.is_declaration:
+                return None, None
+            fn.linkage = "weak"
+            return fn, ir.IRBuilder(fn.append_basic_block("entry"))
+
+        fn, b = hook("ritz_platform_page_map", self.i8_ptr, [self.i64])
+        if fn is not None:
+            r = syscall(b, i64(9), i64(0), fn.args[0], i64(3), i64(0x22), i64(-1), i64(0))
+            b.ret(b.inttoptr(r, self.i8_ptr))
+
+        fn, b = hook("ritz_platform_page_unmap", self.i32, [self.i8_ptr, self.i64])
+        if fn is not None:
+            r = syscall(b, i64(11), b.ptrtoint(fn.args[0], self.i64), fn.args[1])
+            b.ret(b.trunc(r, self.i32))
+
+        fn, b = hook("ritz_platform_fatal", self.void, [self.i8_ptr, self.i64, self.i32])
+        if fn is not None:
+            syscall(b, i64(1), i64(2), b.ptrtoint(fn.args[0], self.i64), fn.args[1])
+            nl = b.alloca(self.i8)
+            b.store(ir.Constant(self.i8, 10), nl, align=1)
+            syscall(b, i64(1), i64(2), b.ptrtoint(nl, self.i64), i64(1))
+            syscall(b, i64(exit_syscall), b.sext(fn.args[2], self.i64))
+            b.unreachable()
 
     def _emit_memset_function(self) -> None:
         """Emit a memset implementation for -nostdlib linking.

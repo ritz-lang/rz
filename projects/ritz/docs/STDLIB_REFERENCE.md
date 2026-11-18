@@ -30,6 +30,31 @@ Ritzlib is built on three core principles:
 
 **Target Platform**: Linux x86-64 (kernel 5.1+ for io_uring features)
 
+### Core and hosted
+
+ritzlib has two layers (AGAST #4119). The **core** (`str`, `strview`, `span`,
+`option`, `result`, `gvec`, `string`, `hashmap`, `memory`, and `fmt`, `drop`
+and `hash`, which they use) builds for a freestanding target, such as a kernel
+with no syscalls: no core module imports a module outside the core, so
+`ritzlib.sys` is never in its import closure. Everything else (`sys`, `io`,
+`fs`, `net`, `uring`, `process`, `os.env`, ...) is **hosted**. The list lives
+in `tools/ritzlib_layers.py`, whose check (`make tools-unit`) fails when a
+core module imports a hosted one.
+
+The core reaches the platform only through three hooks it declares
+`extern fn`:
+
+| Hook | Signature | Used by |
+|------|-----------|---------|
+| `ritz_platform_page_map` | `fn(len: i64) -> *u8` | `memory`'s default page source |
+| `ritz_platform_page_unmap` | `fn(p: *u8, len: i64) -> i32` | `memory`'s default page source |
+| `ritz_platform_fatal` | `fn(msg: *u8, len: i64, status: i32)` | `hashmap`'s missing key (status 101) |
+
+`ritzlib.sys` defines them (anonymous mmap; `msg` and a newline on stderr, then
+exit). Every hosted `_start` (`runtime/ritz_start*.ll`, and the one ritz0 or
+ritz1 emits) also carries weak copies, so a program that imports only core
+modules links without sys. A freestanding program defines all three itself.
+
 ---
 
 ## Table of Contents
@@ -306,9 +331,10 @@ Proper malloc/free with size classes (no need to track sizes when freeing).
 #### Page Source
 
 Every allocator above gets its pages from one page source and returns them
-there. The default is the target's anonymous mmap (`sys_mmap_anon` /
-`sys_munmap`). A kernel, which has no mmap, installs its own frame allocator,
-and a test can install one that fails. `map(len)` returns `len` zeroed
+there. The default is the platform hooks `ritz_platform_page_map` /
+`ritz_platform_page_unmap` (see [Core and hosted](#core-and-hosted)): anonymous
+mmap on a hosted target. A kernel, which has no mmap, defines the hooks over its
+frame allocator or installs a source, and a test can install one that fails. `map(len)` returns `len` zeroed
 read-write bytes, or a value `mmap_failed` accepts (null or `-errno`); every
 allocator then returns null.
 
@@ -333,7 +359,7 @@ fn main() -> i32
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `page_source_set` | `fn(src: PageSource) -> PageSource` | Install `src`; returns the source it replaces |
-| `page_source_get` | `fn() -> PageSource` | The installed source (the mmap default until set) |
+| `page_source_get` | `fn() -> PageSource` | The installed source (the platform hooks until set) |
 | `mmap_failed` | `fn(p: *u8) -> bool` | True for null and `-errno` (any `p <= 0`) |
 
 Install a source before the first allocation, or restore the previous one
@@ -455,7 +481,7 @@ count elements as usual, and `data` is a non-null dangling pointer that
 | `vec_push_str` | `fn(v: @&Vec<u8>, s: *u8) -> i32` | Push C string |
 | `vec_as_str` | `fn(v: @&Vec<u8>) -> *u8` | Get null-terminated string |
 
-**File/Line Utilities**:
+**Line Utilities** (to read a whole fd into a `Vec<u8>`, use `vec_read_all_fd` in [io](#io)):
 
 ```ritz
 struct LineBounds
@@ -465,7 +491,6 @@ struct LineBounds
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `vec_read_all_fd` | `fn(fd: i32, v: @&Vec<u8>) -> i64` | Read file into Vec |
 | `vec_find_lines` | `fn(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> i32` | Find line boundaries |
 
 ---
@@ -1067,7 +1092,7 @@ in name and layout, but the types are distinct: every compiler rejects a
 an `impl Drop` (`Vec<T>` does not); whether that drop is inserted
 automatically depends on the compiler (#1854), so `growbuf_free` remains for
 explicit release. To read a whole file descriptor, use `vec_read_all_fd`
-(gvec) and point a `Buffer` at the bytes.
+(io) and point a `Buffer` at the bytes.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
@@ -1340,6 +1365,12 @@ High-level console I/O functions.
 | `eprintln_i64` | `fn(n: i64)` | Print i64 to stderr with newline |
 | `print_hex64` | `fn(n: u64)` | Print hex |
 | `println_hex64` | `fn(n: u64)` | Print hex with newline |
+
+**Reading a whole fd**:
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `vec_read_all_fd` | `fn(fd: i32, v: @&Vec<u8>) -> i64` | Append everything `fd` yields to `v`; bytes read, or -1. Here rather than in gvec, which is core |
 
 ---
 

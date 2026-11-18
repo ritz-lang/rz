@@ -2,7 +2,8 @@
 #
 # Every `*.ll` in this directory is an entry-point shim: it defines `_start`,
 # marshals the kernel's exec stack into the shape `main` expects, and calls
-# sys_exit with the result. The `.o` files are gitignored build products.
+# sys_exit with the result. It also defines, weak, ritzlib's core platform
+# hooks (ritz_platform_*, AGAST #4119) for a program that links no ritzlib.sys. The `.o` files are gitignored build products.
 #
 # There is one entry path (docs/V1_ABI_CLEANUP.md, AGAST #200):
 #   ritz_start.<arch>.o          - calls main(argc, argv, envp), Linux

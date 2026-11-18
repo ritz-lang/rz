@@ -10,7 +10,9 @@ Ritzlib is the standard library that ships with the Ritz compiler. It provides t
 
 The library is organized as individual `.ritz` files, each providing a focused set of functionality. Programs import specific modules they need rather than pulling in a monolithic standard library. Ritzlib is found automatically by the Ritz compiler via the `RITZ_PATH` environment variable.
 
-Ritzlib spans from low-level syscall wrappers to high-level abstractions like async I/O with io_uring, JSON parsing, and hash maps. It targets Linux userspace and Harland userspace programs; the Harland kernel does not link it, and imports only `ritzlib.option`. Syscall numbers live only in `sys.ritz`, each under a `[[target_os]]`; `memory` gets its pages from a pluggable `PageSource` (mmap by default) so a host without mmap can supply them.
+Ritzlib spans from low-level syscall wrappers to high-level abstractions like async I/O with io_uring, JSON parsing, and hash maps. It targets Linux userspace and Harland userspace programs; the Harland kernel does not link it, and imports only `ritzlib.option`. Syscall numbers live only in `sys.ritz`, each under a `[[target_os]]`; `memory` gets its pages from a pluggable `PageSource` so a host without mmap can supply them.
+
+Ritzlib's **core** (`str`, `strview`, `span`, `option`, `result`, `gvec`, `string`, `hashmap`, `memory`, `fmt`, `drop`, `hash`) builds freestanding: it imports nothing outside the core, so never `ritzlib.sys`, and reaches the platform only through three `extern fn ritz_platform_*` hooks that `sys` (or, weakly, every hosted `_start`) defines and a kernel defines for itself. The rest is **hosted**. `tools/ritzlib_layers.py` holds the list and fails when a core module imports a hosted one (docs/STDLIB_REFERENCE.md, "Core and hosted").
 
 ## Features
 

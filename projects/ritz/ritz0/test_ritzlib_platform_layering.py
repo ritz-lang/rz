@@ -127,7 +127,10 @@ def test_gating_check_sees_an_ungated_const():
 
 
 # A harland user program on the core collections (rzsh does this for real).
+# The collections are core and no longer import sys (AGAST #4119): the program
+# does, so its pages come from sys's ritz_platform_page_map, harland's mmap.
 HARLAND_COLLECTIONS = """\
+import ritzlib.sys
 import ritzlib.gvec
 import ritzlib.string
 import ritzlib.hashmap
@@ -155,3 +158,4 @@ def test_core_collections_build_for_harland(tmp_path):
     ir = ll.read_text()
     # It is the harland build: sys_mmap_anon's harland body (4-arg mmap).
     assert "sys_mmap_anon" in ir
+    assert "ritz_platform_page_map" in ir

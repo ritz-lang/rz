@@ -59,6 +59,7 @@ LOCAL_MODULES = {
     "python_deps",  # AGAST #2300
     "ritz0_scope",  # tools/ritz0_scope.py, the gate's diff scope (AGAST #4027)
     "ritz1_arch",
+    "ritzlib_layers",
     "ritzlib_modules",
     "run_regression_matrix",
     "ritz1_unit",

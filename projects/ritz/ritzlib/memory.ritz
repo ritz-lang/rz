@@ -11,8 +11,16 @@
 # - No per-allocation tracking needed - just bump the offset
 # - Call arena_reset() to reuse memory, arena_destroy() to free
 
-import ritzlib.sys
 import ritzlib.str  # For memcpy, memset, memcmp
+
+# ritzlib.memory is core (tools/ritzlib_layers.py, AGAST #4119): it builds for
+# a freestanding target, so it does not import ritzlib.sys.  The default page
+# source is these two platform hooks instead.  A hosted program gets them from
+# ritzlib.sys (anonymous mmap); a freestanding one (a kernel) defines both
+# itself, e.g. over its frame allocator, or, if it only ever allocates under
+# page_source_set, as stubs that return null and -1.
+extern fn ritz_platform_page_map(len: i64) -> *u8
+extern fn ritz_platform_page_unmap(p: *u8, len: i64) -> i32
 
 # ============================================================================
 # Arena Allocator
@@ -37,9 +45,9 @@ pub fn mmap_failed(p: *u8) -> bool
 # ============================================================================
 # Every allocator here (Arena, the process heap, malloc's slabs and large
 # blocks) gets its memory from one page source and gives it back there. The
-# default is the target's anonymous mmap (sys_mmap_anon / sys_munmap); a
-# kernel, which has no mmap, installs its own frame allocator, and a test can
-# install one that fails (AGAST #1857).
+# default is the platform hooks above (anonymous mmap on a hosted target); a
+# kernel can install its own frame allocator instead, and a test can install
+# one that fails (AGAST #1857).
 #
 #   map(len)       len bytes of zeroed read-write memory, or a value for which
 #                  mmap_failed is true (null, or -errno as the kernels return)
@@ -56,12 +64,12 @@ var g_page_source: PageSource
 var g_page_source_installed: bool = false
 
 fn page_unmap_default(p: *u8, len: i64) -> i32
-    return sys_munmap(p, len)
+    return ritz_platform_page_unmap(p, len)
 
 fn page_map_default(len: i64) -> *u8
-    return sys_mmap_anon(len)
+    return ritz_platform_page_map(len)
 
-# The installed page source (the mmap default until page_source_set).
+# The installed page source (the platform hooks until page_source_set).
 pub fn page_source_get() -> PageSource
     if g_page_source_installed
         return g_page_source
@@ -76,13 +84,13 @@ pub fn page_source_set(src: PageSource) -> PageSource
 
 fn page_map(len: i64) -> *u8
     if not g_page_source_installed
-        return sys_mmap_anon(len)
+        return ritz_platform_page_map(len)
     let f: fn(i64) -> *u8 = g_page_source.map
     return f(len)
 
 fn page_unmap(p: *u8, len: i64) -> i32
     if not g_page_source_installed
-        return sys_munmap(p, len)
+        return ritz_platform_page_unmap(p, len)
     let f: fn(*u8, i64) -> i32 = g_page_source.unmap
     return f(p, len)
 

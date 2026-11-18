@@ -67,7 +67,7 @@ def _compile(compiler, tmp_path, src, name="t"):
 GROWBUF_AS_VEC = """\
 import ritzlib.sys
 import ritzlib.buf
-import ritzlib.gvec
+import ritzlib.io  # vec_read_all_fd (gvec's until AGAST #4119)
 fn main() -> i32
     var g: GrowBuf = growbuf_new()
     let n: i64 = vec_read_all_fd(0, @&g)
