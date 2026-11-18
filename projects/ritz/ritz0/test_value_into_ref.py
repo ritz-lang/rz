@@ -88,6 +88,14 @@ SITES = {
     "value_arm": "fn f({B}, b: i32) -> i32\n    let p: {S} = if b > 0\n        ^c\n    else\n        c\n    0\n",
 }
 
+# A `G` reached through `Option<G>` and `Result<G, i32>` (#3982). Imported,
+# they're declared enums, monomorphised to `Option$G` before the checker runs;
+# without the import ritz0 typed the built-in `Option<G>` already.
+UNWRAP_HEAD = ("import ritzlib.result\n\nstruct C\n    x: i32\n\nstruct G\n    c: C\n\n"
+               "fn mk() -> Option<G>\n    Some(G { c: C { x: 3 } })\n\n"
+               "fn mr() -> Result<G, i32>\n    Ok(G { c: C { x: 3 } })\n\n"
+               "fn rd(p: @C) -> i32\n    p.x\n\nfn wr(p: @&C) -> i32\n    p.x\n\n")
+
 # What the value is, rather than where it lands. `^` as above.
 OTHER_SHAPES = {
     "scalar_lent_let": ("fn f(n:& i32) -> i32\n    let p: @i32 = ^n\n    0\n", VALUE_INTO_SHARED_REF),
@@ -209,6 +217,14 @@ OTHER_SHAPES = {
                         "fn mk() -> Option<C>\n    Some(C { x: 3 })\n\n"
                         "fn f() -> i32\n    match mk()\n        Some(o) => rd(^o)\n        None => 0\n",
                         VALUE_INTO_SHARED_REF),
+    # #3982: `unwrap()` of a monomorphised `Option$G` or `Result$G$i32` is a
+    # `G`, so its field is a value like any other: ritz0 had it untyped.
+    "unwrap_field_shared": (UNWRAP_HEAD + "fn f() -> i32\n    let o = mk()\n    let g = o.unwrap()\n"
+                            "    rd(^g.c)\n", VALUE_INTO_SHARED_REF),
+    "unwrap_field_mutable": (UNWRAP_HEAD + "fn f() -> i32\n    let o = mk()\n    var g = o.unwrap()\n"
+                             "    wr(^g.c)\n", VALUE_INTO_MUT_REF),
+    "unwrap_result_field": (UNWRAP_HEAD + "fn f() -> i32\n    let r = mr()\n    let g = r.unwrap()\n"
+                            "    rd(^g.c)\n", VALUE_INTO_SHARED_REF),
     # A generic struct's instance keeps the `&` of its field, however many
     # params it has.
     "generic_mutable_field": ("struct C\n    x: i32\n\nstruct W<T>\n    r: @&T\n\n"
@@ -291,6 +307,11 @@ EXPLICIT = {
     # A `*T` local takes an `@&T`, as it did.
     "reference_into_a_pointer_local": ("fn wr(p: *C)\n    p.x = 3\n\nfn go(d: @&C)\n    var p: *C = null\n    p = d\n    wr(p)\n",
                                        "    var c = C { x: 1 }\n    go(@&c)\n    c.x\n", 3),
+    # #3982: a field of an `unwrap()` binding is a place, so a `:&` param
+    # still borrows it for you, typed or not.
+    "unwrap_field_lent": ("struct G\n    c: C\n\nfn mk() -> Option<G>\n    Some(G { c: C { x: 1 } })\n\n"
+                          "fn go(c:& C)\n    c.x = 3\n",
+                          "    var g = mk().unwrap()\n    go(g.c)\n    g.c.x\n", 3),
     # `null` is no value of a type, and stays what it was.
     "null_into_a_reference": ("", "    let p: @C = null\n    3\n", 3),
 }

@@ -1050,6 +1050,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         # Primitive and built-in-generic receivers have emitter-provided
         # methods (`x.popcnt()`, `r.unwrap()`) that no source file declares.
         receiver = self._strip_indirection(receiver_type)
+        payload = self._instance_unwrap_ret(receiver, expr.method)
+        if payload is not None:
+            return payload
         if self._is_opaque(receiver) or (isinstance(receiver, rast.NamedType) and (
                 receiver.name in self.NUMERIC_TYPES
                 or receiver.name in BUILTIN_GENERICS
@@ -1223,6 +1226,23 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         if method in ('unwrap', 'expect', 'unwrap_or', 'unwrap_or_default') \
                 and receiver.name in ('Result', 'Option'):
             return receiver.args[0]
+        return None
+
+    def _instance_unwrap_ret(self, receiver: rast.Type, method: str) -> Optional[rast.Type]:
+        """`o.unwrap()`'s type on a monomorphised `Option$G` or `Result$G$E`:
+        the `Some` / `Ok` payload, as the emitter's _try_emit_enum_unwrap_method
+        gives it. Imported from ritzlib, Option and Result are declared enums,
+        instantiated before the checker runs; untyped, a field of the binding
+        was let into an `@T` slot (AGAST #3982). None for anything else."""
+        if method != 'unwrap' or not isinstance(receiver, rast.NamedType) or receiver.args:
+            return None
+        variant = {'Option': 'Some', 'Result': 'Ok'}.get(receiver.name.split('$', 1)[0])
+        enum = self.enums.get(receiver.name) if '$' in receiver.name else None
+        if variant is None or enum is None:
+            return None
+        for v in enum.variants:
+            if v.name == variant and len(v.fields) == 1:
+                return v.fields[0]
         return None
 
     def _is_user_type_without(self, receiver: rast.Type, type_name: str, method: str) -> bool:
