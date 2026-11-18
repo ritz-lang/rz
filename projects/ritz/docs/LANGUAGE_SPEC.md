@@ -1786,7 +1786,9 @@ struct Task
     id: i32
 ```
 
-Function pointers lower to opaque LLVM `ptr`. A parameter whose type is written
+Function pointers lower to opaque LLVM `ptr`, so `null` ([§3.2](#32-pointer-and-reference-types))
+fits a fn-pointer slot, and a fn pointer compares with `null` by `==` / `!=`
+(AGAST #3601): `h.handler = null`, `if h.handler != null`. A parameter whose type is written
 out **inline** is callable, and passing a named function as the argument works:
 
 ```ritz

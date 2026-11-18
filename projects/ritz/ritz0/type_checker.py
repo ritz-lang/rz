@@ -2465,13 +2465,14 @@ class TypeChecker:
                     and other.name in ('f32', 'f64'):
                 return True
 
-        # Null is compatible with any pointer type
+        # Null is compatible with any pointer type, a fn pointer included
+        # (§5.5: a fn type lowers to an opaque `ptr`; AGAST #3601)
         if isinstance(actual, rast.NamedType) and actual.name == 'null':
-            return isinstance(expected, (rast.PtrType, rast.RefType)) or \
+            return isinstance(expected, (rast.PtrType, rast.RefType, rast.FnType)) or \
                    (isinstance(expected, rast.NamedType) and expected.name == 'null')
 
         if isinstance(expected, rast.NamedType) and expected.name == 'null':
-            return isinstance(actual, (rast.PtrType, rast.RefType)) or \
+            return isinstance(actual, (rast.PtrType, rast.RefType, rast.FnType)) or \
                    (isinstance(actual, rast.NamedType) and actual.name == 'null')
 
         # Same named type
