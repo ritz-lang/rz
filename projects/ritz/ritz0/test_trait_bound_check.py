@@ -8,7 +8,8 @@ the type argument, or at the call when the argument is inferred:
 
     `Nope` doesn't implement `Area`, which `T` of `total` requires
 
-An unknown trait is an error at the bound.  Before #3468 a failed bound was an
+An unknown trait is an error at the bound, and at an impl's trait name
+(#4197).  Before #3468 a failed bound was an
 unlocated Python TypeError, and an unknown trait read "does not implement".
 A generic impl satisfying a bound is test_trait_bounds.ritz's run row.
 
@@ -79,6 +80,21 @@ ROWS = {
         "fn main() -> i32\n"
         "    0\n",
         "11:9", "unknown trait `Nonesuch` in the bound on `U`"),
+    # ...and at an impl's trait name (#4197): it compiled silently.  A
+    # declared trait (`Area`) and a compiler trait (`Drop`) are known.
+    "unknown_impl_trait": (
+        "impl Area for Nope\n"
+        "    fn area(self: @Nope) -> i64\n"
+        "        0\n"
+        "impl Drop for Nope\n"
+        "    fn drop(self: @&Nope)\n"
+        "        return\n"
+        "impl Nonesuch for Nope\n"
+        "    fn g(self: @Nope) -> i32\n"
+        "        0\n"
+        "fn main() -> i32\n"
+        "    0\n",
+        "17:6", "unknown trait `Nonesuch`"),
 }
 
 
@@ -94,3 +110,5 @@ def test_failed_bound_is_located(row, tmp_path):
     assert "Traceback" not in out and "TypeError" not in out, out
     assert f"unit.ritz:{where}: {message}" in out, out
     assert "does not implement" not in out, out
+    # Only the row's own: a known trait (`Area`, `Drop`) is never "unknown".
+    assert out.count("unknown trait") == message.count("unknown trait"), out

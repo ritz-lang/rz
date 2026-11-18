@@ -18,6 +18,7 @@ rule (main.ritz, refuse_impls_on_builtin_types).
 import ritz_ast as rast
 from metadata import type_to_string
 from name_resolver import NameResolver
+from trait_bounds import COMPILER_TRAITS
 
 # Built-in type -> the ritzlib module that declares it as an ordinary type.
 BUILTIN_TYPES = {
@@ -71,7 +72,14 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
     "`i32` is a built-in type; it can't have an `impl`" (LARB R36; ritz1's
     half is #3371).  ritz1 says the same for an
     unknown type and an alias (monomorph.ritz, refuse_impls_on_unknown_types,
-    #3369)."""
+    #3369).
+
+    The impl's trait is judged too, at its name (AGAST #4197): known if the
+    merged module declares it (an import counts) or the compiler does
+    (trait_bounds.COMPILER_TRAITS), the same rule as an unknown trait in a
+    bound (check_unknown_bound_traits, #3468)."""
+    traits = set(COMPILER_TRAITS)
+    traits.update(item.name for item in module.items if isinstance(item, rast.TraitDef))
     known = {item.name for item in module.items
              if isinstance(item, (rast.StructDef, rast.EnumDef))}
     # A type alias is known, but not an impl target (LARB R35, #3368): a
@@ -84,6 +92,9 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
     known |= NameResolver.BUILTIN_TYPES - {'Self', 'void'}
     errors = []
     for item in module.items:
+        if (isinstance(item, rast.ImplBlock) and hasattr(item, 'trait_span')
+                and item.trait_name not in traits):
+            errors.append(f"{item.trait_span}: unknown trait `{item.trait_name}`")
         if (not isinstance(item, rast.ImplBlock) or not hasattr(item, 'type_span')
                 or item.type_name in item.type_params):
             continue

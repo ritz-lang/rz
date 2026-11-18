@@ -287,7 +287,8 @@ def _check_impl_targets(ctx: _Compile) -> bool:
     """An `impl` on a built-in type (Span, StrView, Option, Result) no
     module declares (AGAST #3162).  After the merge, so an imported
     `struct Span<T>` makes Span an ordinary struct.  ...and on a type
-    nothing declares or imports (AGAST #3264).  ...and one outside its
+    nothing declares or imports (AGAST #3264), or of a trait nothing
+    declares or the compiler knows (#4197).  ...and one outside its
     type's (or trait's) file, or on one instantiation (LARB R65, #3493)."""
     errors = check_builtin_impls(ctx.module)
     errors += check_unknown_impl_targets(ctx.module)
