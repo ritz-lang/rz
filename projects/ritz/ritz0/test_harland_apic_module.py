@@ -40,7 +40,8 @@ MOVED_FNS = [
     "ap_boot_one", "ap_boot_all", "apic_init_with_mb", "apic_init_from_bootinfo",
 ]
 # ap_started moved on to arch/x86_64/cpu_map.ritz (#1883: test_harland_cpu_map.py).
-MOVED_VARS = ["ap_stacks", "ap_count", "bsp_apic_id"]
+# ap_stacks became ap_stack_tops, one PMM page per AP (#4184).
+MOVED_VARS = ["ap_stack_tops", "ap_count", "bsp_apic_id"]
 MOVED_CONST_PREFIXES = ("LAPIC_", "IOAPIC_", "IPI_DELIVERY_", "AP_TRAMPOLINE_ADDR")
 
 # What kernel_main calls; main must import exactly these from the new module.

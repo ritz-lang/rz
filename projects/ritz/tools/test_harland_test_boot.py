@@ -81,7 +81,10 @@ with open(os.environ["STUB_LOG"], "a") as f:
 
 BANNER = r"    Hello from Harland!\n  [..] Initial filesystem"
 LOADED = r"[initramfs] Loaded 27 files from disk\n"
-PASSED = r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
+# The default -smp 4 starts 3 APs, and every one must come up (#4184).
+APS = r"  [OK] Boot APs (3 APs started)\n"
+PASSED = APS + r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
+SUITE_ONLY = r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
 # What the blank disk produced (#3437): the banner, then a panic.
 PANIC_AFTER_BANNER = (
     BANNER
@@ -223,6 +226,34 @@ def test_good_boot_passes(tree):
     r = _run(tree, BANNER + LOADED + PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
     assert "PASS" in r.stdout
+
+
+# --- every CPU -smp starts comes up (#4184) -----------------------------------
+
+
+def test_a_missing_ap_fails_even_if_the_suite_passed(tree):
+    r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (2 APs started)\n" + SUITE_ONLY)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert '"(3 APs started)"' in r.stdout
+
+
+def test_no_ap_line_fails(tree):
+    r = _run(tree, BANNER + LOADED + SUITE_ONLY)
+    assert r.returncode == 1, r.stdout + r.stderr
+
+
+def test_the_ap_count_follows_smp_and_plug_cpu(tree):
+    """SMP=20,... expects 19 APs; PLUG_CPU cold-plugs one more (APIC ID 256)."""
+    r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (19 APs started)\n" + SUITE_ONLY,
+             env_extra={"SMP": "20,sockets=2,cores=10", "CPU": "Haswell-v1,+x2apic"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "-smp 20,sockets=2,cores=10" in _stub_log(tree) and "-cpu Haswell-v1,+x2apic" in _stub_log(tree)
+    r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (1 APs started)\n" + SUITE_ONLY,
+             env_extra={"SMP": "1,sockets=2,cores=200,maxcpus=400", "MACHINE": "q35",
+                        "PLUG_CPU": "socket-id=1,core-id=0,thread-id=0"})
+    assert r.returncode == 0, r.stdout + r.stderr
+    qemu = [line for line in _stub_log(tree).splitlines() if line.startswith("qemu ")][-1]
+    assert "-machine q35" in qemu and "-device Haswell-v1-x86_64-cpu,socket-id=1,core-id=0,thread-id=0" in qemu, qemu
 
 
 # --- the initramfs is the real one --------------------------------------------

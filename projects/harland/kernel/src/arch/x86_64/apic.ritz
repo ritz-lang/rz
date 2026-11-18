@@ -6,13 +6,19 @@
 #
 # sched/mod.ritz and arch/x86_64/exceptions.ritz bind lapic_id, lapic_eoi,
 # lapic_write and get_ap_stack_top by name with `extern fn`; keep them `pub`.
+#
+# The LAPIC runs in x2APIC mode whenever the CPU has it (CPUID.1:ECX[21]):
+# registers are MSRs 0x800 + offset/16, the ICR is one 64-bit MSR (0x830)
+# with a 32-bit destination, so CPUs with APIC IDs past 255 (MADT type 9)
+# can be started. Without x2APIC the MMIO xAPIC is used and such CPUs are
+# skipped (#4184).
 
-import io { outb, inb, cpu_pause }
+import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult }
 import serial { prints, serial_print_dec, serial_print_hex }
-import mm.pmm { Mb2BootInfo, HarlandBootInfo }
+import mm.pmm { Mb2BootInfo, HarlandBootInfo, pmm_alloc_page }
 import mm.vmm { vmm_pml4_phys, vmm_map_page, PTE_WRITABLE, PTE_CACHE_DISABLE }
 import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr }
-import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started }
+import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
 
 # ============================================================================
 # PIC (Programmable Interrupt Controller) - Remap to vectors 32-47
@@ -74,19 +80,68 @@ const LAPIC_TIMER_DIVIDE: u64 = 0x3E0   # Timer Divide Configuration
 const LAPIC_SVR_ENABLE: u32 = 0x100  # Bit 8: Enable APIC
 const LAPIC_SPURIOUS_VEC: u32 = 0xFF # Spurious vector (255)
 
+# ============================================================================
+# x2APIC mode
+# ============================================================================
+
+const CPUID1_ECX_X2APIC: u32 = 1 << 21   # CPUID.1:ECX[21]: x2APIC supported
+const IA32_APIC_BASE: u32 = 0x1B         # IA32_APIC_BASE MSR
+const APIC_BASE_ENABLE: u64 = 1 << 11    # EN: APIC globally enabled
+const APIC_BASE_EXTD: u64 = 1 << 10      # EXTD: x2APIC mode
+const X2APIC_MSR_BASE: u32 = 0x800       # MSR of xAPIC offset 0 (offset / 16 above)
+const X2APIC_ICR: u32 = 0x830            # 64-bit ICR: destination in bits 63:32
+
+# 1 once the BSP chose x2APIC mode (apic_select_mode); every AP follows it.
+pub var x2apic_mode: u8 = 0
+
+fn cpu_has_x2apic() -> bool
+    let r: CpuidResult = cpuid(1)
+    return (r.ecx & CPUID1_ECX_X2APIC) != 0
+
+# Switch this CPU's LAPIC to x2APIC mode if the BSP chose it. Each CPU has
+# its own IA32_APIC_BASE, and INIT leaves an AP's in xAPIC mode, so every
+# AP calls this before it touches its LAPIC.
+pub fn x2apic_enable_local() -> i32
+    if x2apic_mode == 0
+        return 0
+    let base: u64 = rdmsr(IA32_APIC_BASE)
+    if (base & APIC_BASE_EXTD) == 0
+        wrmsr(IA32_APIC_BASE, base | APIC_BASE_ENABLE | APIC_BASE_EXTD)
+    return 0
+
+# Choose the LAPIC mode on the BSP, after the MADT is parsed and before the
+# LAPIC is first touched.
+fn apic_select_mode() -> i32
+    if cpu_has_x2apic()
+        x2apic_mode = 1
+        x2apic_enable_local()
+        prints("      LAPIC mode: x2APIC\n")
+    else
+        prints("      LAPIC mode: xAPIC\n")
+        if cpu_map_needs_x2apic() != 0
+            prints("      WARNING: CPUs with APIC IDs > 255 need x2APIC; they stay off\n")
+    return 0
+
 # Read LAPIC register
 fn lapic_read(offset: u64) -> u32
+    if x2apic_mode != 0
+        return rdmsr(X2APIC_MSR_BASE + (offset >> 4) as u32) as u32
     let addr: *u32 = (local_apic_addr + offset) as *u32
     return *addr
 
 # Write LAPIC register (pub for scheduler timer)
 pub fn lapic_write(offset: u64, value: u32) -> i32
+    if x2apic_mode != 0
+        wrmsr(X2APIC_MSR_BASE + (offset >> 4) as u32, value as u64)
+        return 0
     let addr: *u32 = (local_apic_addr + offset) as *u32
     *addr = value
     return 0
 
-# Get current CPU's APIC ID
+# Get current CPU's APIC ID (32 bits in x2APIC mode, 8 in xAPIC mode)
 pub fn lapic_id() -> u32
+    if x2apic_mode != 0
+        return lapic_read(LAPIC_ID)
     return lapic_read(LAPIC_ID) >> 24
 
 # Send EOI (End of Interrupt) to LAPIC
@@ -257,13 +312,23 @@ fn pic_disable() -> i32
 
 # AP bootstrap state. Each AP's "started" flag is cpu_map's, by CPU index
 # (an APIC ID can be 16 or more: #1883).
-var ap_stacks: [16][4096]u8     # Stack for each AP
+# Each AP's stack is one PMM page (low, identity-mapped), allocated when
+# first asked for: a static [MAX_CPUS][4096] would be 256 KiB of BSS (#4184).
+const AP_STACK_SIZE: u64 = 4096
+var ap_stack_tops: [64]u64      # Stack top by CPU index (0 = not allocated)
 var ap_count: u32 = 0           # Number of APs that have started
-var bsp_apic_id: u8 = 0         # BSP's APIC ID
+var bsp_apic_id: u32 = 0        # BSP's APIC ID
 
-# Get AP stack top for scheduler module
+# The stack top of the AP at this CPU index (the scheduler runs that AP's
+# idle task on it). 0 for an index out of range or if the PMM is out of pages.
 pub fn get_ap_stack_top(cpu_idx: i32) -> u64
-    return (@ap_stacks[(cpu_idx - 1) as i32][0] as u64) + 4096
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return 0
+    if ap_stack_tops[cpu_idx] == 0
+        let page: u64 = pmm_alloc_page()
+        if page != 0
+            ap_stack_tops[cpu_idx] = page + AP_STACK_SIZE
+    return ap_stack_tops[cpu_idx]
 
 # Trampoline code location (must be in low memory, <1MB)
 const AP_TRAMPOLINE_ADDR: u64 = 0x8000
@@ -277,16 +342,25 @@ const IPI_DELIVERY_FIXED: u8 = 0
 const IPI_DELIVERY_INIT: u8 = 5
 const IPI_DELIVERY_SIPI: u8 = 6
 
-# Send IPI (Inter-Processor Interrupt)
-fn lapic_send_ipi(dest_apic: u8, vector: u8, delivery_mode: u8) -> i32
+# Write the ICR: destination APIC ID and the low 32 bits.
+fn lapic_send_icr(dest_apic: u32, icr_lo: u32) -> i32
+    if x2apic_mode != 0
+        # One 64-bit MSR write sends it; there is no delivery-status bit.
+        wrmsr(X2APIC_ICR, ((dest_apic as u64) << 32) | (icr_lo as u64))
+        return 0
+
     # Wait for previous IPI to complete
     while (lapic_read(LAPIC_ICR_LO) & 0x1000) != 0
         cpu_pause()
 
-    # Set destination in ICR high
-    lapic_write(LAPIC_ICR_HI, (dest_apic as u32) << 24)
+    # Destination in ICR high bits 31:24 (8 bits: xAPIC)
+    lapic_write(LAPIC_ICR_HI, (dest_apic & 0xFF) << 24)
+    lapic_write(LAPIC_ICR_LO, icr_lo)
+    return 0
 
-    # Send IPI via ICR low
+# Send IPI (Inter-Processor Interrupt)
+fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8) -> i32
+    # ICR low:
     # Bits 0-7: Vector
     # Bits 8-10: Delivery mode (000=Fixed, 101=INIT, 110=Startup)
     # Bit 11: Destination mode (0=Physical)
@@ -294,9 +368,7 @@ fn lapic_send_ipi(dest_apic: u8, vector: u8, delivery_mode: u8) -> i32
     # Bit 14: Level (1 for INIT)
     # Bit 15: Trigger mode (0=Edge, 1=Level)
     let icr_lo: u32 = (vector as u32) | ((delivery_mode as u32) << 8)
-    lapic_write(LAPIC_ICR_LO, icr_lo)
-
-    return 0
+    return lapic_send_icr(dest_apic, icr_lo)
 
 # Delay in microseconds (rough, using busy loop)
 fn delay_us(us: u32) -> i32
@@ -309,6 +381,9 @@ fn delay_us(us: u32) -> i32
 
 # AP entry point (called by ap_trampoline.s after transition to long mode)
 pub fn ap_entry() -> i32
+    # Follow the BSP into x2APIC mode before touching our LAPIC
+    x2apic_enable_local()
+
     # Get our APIC ID
     let my_apic_id: u32 = lapic_id()
 
@@ -331,7 +406,7 @@ pub fn ap_entry() -> i32
             hlt
 
 # Copy trampoline code to low memory and set up parameters
-fn ap_setup_trampoline(ap_index: u32) -> i32
+fn ap_setup_trampoline(stack_top: u64) -> i32
     # Calculate trampoline size
     let tramp_start: u64 = @ap_trampoline_start as u64
     let tramp_end: u64 = @ap_trampoline_end as u64
@@ -358,8 +433,6 @@ fn ap_setup_trampoline(ap_index: u32) -> i32
     # Stack pointer (64-bit at 0x8FF8)
     let stack_ptr: *u64 = 0x8FF8 as *u64
     # Stack top is the address of the END of the AP's stack (stacks grow down)
-    # @ap_stacks[ap_index][0] gives the start, add 4096 for the top
-    let stack_top: u64 = (@ap_stacks[ap_index as i32][0] as u64) + 4096
     *stack_ptr = stack_top
 
     # Entry point (64-bit at 0x9000)
@@ -370,22 +443,22 @@ fn ap_setup_trampoline(ap_index: u32) -> i32
 
 # Boot a single AP
 # cpu_idx is the AP's CPU index (cpu_map), whose started flag it sets.
-fn ap_boot_one(apic_id: u8, cpu_idx: i32, ap_index: u32) -> i32
+fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
     prints("    Booting AP ")
     serial_print_dec(apic_id as u64)
     prints("...")
 
     # Set up trampoline for this AP
-    ap_setup_trampoline(ap_index)
+    ap_setup_trampoline(stack_top)
 
     # Send INIT IPI
     lapic_send_ipi(apic_id, 0, IPI_DELIVERY_INIT)
     delay_us(10000)  # 10ms delay
 
-    # Send INIT de-assert (level=0, trigger=level)
-    # This is done by setting level bit low
-    lapic_write(LAPIC_ICR_HI, (apic_id as u32) << 24)
-    lapic_write(LAPIC_ICR_LO, 0x8500)  # INIT, level, de-assert
+    # Send INIT de-assert (level=0, trigger=level). x2APIC mode has no
+    # INIT level de-assert (and CPUs since the Pentium 4 ignore it).
+    if x2apic_mode == 0
+        lapic_send_icr(apic_id, 0x8500)  # INIT, level, de-assert
     delay_us(200)
 
     # Send SIPI (Startup IPI) - vector is page number (0x08 for 0x8000)
@@ -413,7 +486,7 @@ fn ap_boot_one(apic_id: u8, cpu_idx: i32, ap_index: u32) -> i32
 # Boot all APs
 pub fn ap_boot_all() -> i32
     # Record BSP's APIC ID
-    bsp_apic_id = lapic_id() as u8
+    bsp_apic_id = lapic_id()
 
     prints("  [..] Boot APs\n")
     prints("    BSP APIC ID: ")
@@ -422,14 +495,25 @@ pub fn ap_boot_all() -> i32
 
     # Started flags start clear: cpu_map_add clears each CPU's.
     # Boot each AP (skip BSP)
-    var ap_index: u32 = 0
     var i: i32 = 0
     while i < num_cpus as i32 && i < MAX_CPUS
-        # xAPIC IDs are 8 bits (the ICR destination field); cpu_map keeps u32.
-        let apic_id: u8 = cpu_apic_ids[i] as u8
-        if apic_id != bsp_apic_id
-            ap_boot_one(apic_id, i, ap_index)
-            ap_index = ap_index + 1
+        let apic_id: u32 = cpu_apic_ids[i]
+        if apic_id == bsp_apic_id
+            i = i + 1
+            continue
+        # xAPIC's ICR destination is 8 bits: only x2APIC reaches IDs > 255.
+        if x2apic_mode == 0 and apic_id > 255
+            prints("    AP ")
+            serial_print_dec(apic_id as u64)
+            prints(" skipped (needs x2APIC)\n")
+            i = i + 1
+            continue
+        # A PMM page per AP stack (get_ap_stack_top allocates it).
+        let stack_top: u64 = get_ap_stack_top(i)
+        if stack_top == 0
+            prints("    No memory for AP stacks; stopping\n")
+            break
+        ap_boot_one(apic_id, i, stack_top)
         i = i + 1
 
     prints("  [OK] Boot APs (")
@@ -462,6 +546,9 @@ pub fn apic_init_with_mb(mb_info: *Mb2BootInfo) -> i32
             prints(" IOAPIC map failed!\n")
             return -1
     prints(" done\n")
+
+    # xAPIC or x2APIC, before the LAPIC is first touched
+    apic_select_mode()
 
     # Initialize Local APIC on BSP
     prints("    Initializing Local APIC...")
@@ -505,6 +592,9 @@ pub fn apic_init_from_bootinfo(info: *HarlandBootInfo) -> i32
             prints(" IOAPIC map failed!\n")
             return -1
     prints(" done\n")
+
+    # xAPIC or x2APIC, before the LAPIC is first touched
+    apic_select_mode()
 
     # Initialize Local APIC on BSP
     prints("    Initializing Local APIC...")

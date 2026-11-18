@@ -13,7 +13,7 @@
 import io { outw, disable_interrupts }
 import serial { prints, serial_print_hex, serial_print_dec }
 import mm.vmm { vmm_ensure_mapped }
-import arch.x86_64.cpu_map { num_cpus, cpu_map_reset, cpu_map_add }
+import arch.x86_64.cpu_map { num_cpus, cpu_map_reset, cpu_map_add_madt_entry }
 import mm.pmm {
     MB2_TAG_END, MB2_TAG_ACPI_OLD, MB2_TAG_ACPI_NEW,
     Mb2BootInfo, Mb2Tag, HarlandBootInfo
@@ -433,12 +433,15 @@ fn acpi_parse_madt(madt_addr: u64) -> i32
     while entry_addr < madt_end
         let entry: *MadtEntryHeader = entry_addr as *MadtEntryHeader
 
-        if (*entry).entry_type == MADT_LOCAL_APIC
-            let lapic: *MadtLocalApic = entry_addr as *MadtLocalApic
-            # Check if processor is enabled (bit 0) or can be enabled (bit 1)
-            if ((*lapic).flags & 3) != 0
-                # CPUs past MAX_CPUS are refused (-1) and left unused.
-                cpu_map_add((*lapic).apic_id as u32)
+        # A zero-length entry would loop forever; the table is malformed.
+        if (*entry).length == 0
+            break
+
+        if (*entry).entry_type == MADT_LOCAL_APIC or (*entry).entry_type == MADT_X2APIC
+            # Type 0 (8-bit APIC ID) and type 9 (32-bit x2APIC ID, large
+            # EC2/AMD parts list CPUs with IDs > 255 only here: #4184).
+            # cpu_map skips disabled CPUs and those past MAX_CPUS.
+            cpu_map_add_madt_entry(entry_addr as *u8)
         else if (*entry).entry_type == MADT_IO_APIC
             let ioapic: *MadtIoApic = entry_addr as *MadtIoApic
             if io_apic_addr == 0

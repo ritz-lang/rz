@@ -20,6 +20,19 @@
 #        SMP=SPEC       QEMU -smp (default: 4 CPUs with sparse APIC IDs
 #                       0,1,2,4; SMP=10,sockets=2,cores=9,maxcpus=18 gives
 #                       APIC ID 16, past the old [16] arrays: #1883)
+#        CPU=MODEL      QEMU -cpu (default Haswell-v1, which has x2APIC, so
+#                       the kernel runs its LAPIC in x2APIC mode; append
+#                       ,-x2apic for the MMIO xAPIC path). #4184's check:
+#                       SMP=20,sockets=2,cores=10 CPU=Haswell-v1,+x2apic
+#                       (20 CPUs, APIC IDs up to 25, past the old 16-CPU cap)
+#        MACHINE=TYPE   QEMU -machine (default pc; i440fx stops at 255 CPUs).
+#        PLUG_CPU=IDS   cold-plug one more CPU at socket/core/thread IDS.
+#                       APIC IDs past 255 (MADT type 9, x2APIC only: #4184):
+#                       MACHINE=q35 SMP=1,sockets=2,cores=200,maxcpus=400
+#                       PLUG_CPU=socket-id=1,core-id=0,thread-id=0
+#                       CPU=Haswell-v1,+x2apic boots an AP with APIC ID 256
+#
+# Every CPU -smp starts must come up: the log must say "(N-1 APs started)".
 #
 # Exit: 0 = pass; 1 = the boot failed (panic, exception, failed suite, no
 #       verdict before the timeout, or a failed build); 3 = a required tool
@@ -88,9 +101,19 @@ echo "ISO: $ISO"
 # 2 sockets x 3 cores: core IDs take 2 bits, so the 4 CPUs' APIC IDs are
 # 0,1,2,4, not 0..3; per-CPU state must be indexed by CPU, not APIC ID (#1883).
 SMP="${SMP:-4,sockets=2,cores=3,threads=1,maxcpus=6}"
+CPU="${CPU:-Haswell-v1}"
+MACHINE="${MACHINE:-pc}"
+# The CPU count is SMP's leading number (or its cpus= key).
+NCPUS="$(printf '%s\n' "$SMP" | sed -nE 's/^([0-9]+).*/\1/p; s/^.*(^|,)cpus=([0-9]+).*/\2/p' | head -1)"
+PLUG_ARGS=()
+if [ -n "${PLUG_CPU:-}" ]; then
+    PLUG_ARGS=(-device "${CPU%%,*}-x86_64-cpu,$PLUG_CPU")
+    [ -n "$NCPUS" ] && NCPUS=$((NCPUS + 1))
+fi
 : > "$SERIAL_LOG"
 timeout "$TIMEOUT" qemu-system-x86_64 \
-    -cpu Haswell-v1 \
+    -machine "$MACHINE" \
+    -cpu "$CPU" \
     -cdrom "$ISO" \
     -device virtio-blk-pci,drive=initramfs \
     -drive file="$T/initramfs.qcow2",format=qcow2,if=none,id=initramfs \
@@ -103,7 +126,7 @@ timeout "$TIMEOUT" qemu-system-x86_64 \
     -serial file:"$SERIAL_LOG" \
     -display none \
     -monitor none \
-    -smp "$SMP" \
+    -smp "$SMP" "${PLUG_ARGS[@]}" \
     -m 2G \
     -no-reboot >/dev/null 2>&1 &
 pid=$!
@@ -132,6 +155,15 @@ if ! grep -aq "ALL TESTS PASSED" "$SERIAL_LOG"; then
     [ "$timed_out" = 1 ] && echo "FAIL (bios): no verdict within ${TIMEOUT}s (BOOT_TIMEOUT)"
     echo "FAIL (bios): init's Tier-1 suite did not report ALL TESTS PASSED"
     exit 1
+fi
+if [ -n "$NCPUS" ]; then
+    want="($((NCPUS - 1)) APs started)"
+    if ! grep -aqF "$want" "$SERIAL_LOG"; then
+        grep -aE "Boot APs|TIMEOUT|skipped" "$SERIAL_LOG" | head -5
+        echo "FAIL (bios): -smp $SMP should start $((NCPUS - 1)) APs: no \"$want\" in the log"
+        exit 1
+    fi
+    echo "PASS (bios): all $((NCPUS - 1)) APs started (-smp $SMP, -cpu $CPU)"
 fi
 echo "PASS (bios): init Tier-1 suite: ALL TESTS PASSED"
 exit 0
