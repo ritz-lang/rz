@@ -25,6 +25,10 @@ Foo`", at `Id`.
 A primitive is known but closed (LARB R36, #3370): `impl u8` and `impl
 Speak for i32` are "`i32` is a built-in type; it can't have an `impl`", at
 the type.
+
+An undeclared trait is "unknown trait `Nonesuch`", at the impl's trait name
+(#4197 on ritz0, #4211 on ritz1).  Known: a declared or imported trait, and
+a compiler trait (Drop, Deref, DerefMut, Index, IndexMut, IndexSet).
 """
 
 import pytest
@@ -102,11 +106,16 @@ def test_impl_on_unknown_type_refused(request, tmp_path, compiler, row):
 
 # Known targets: the impl compiles and its method runs.
 KNOWN = {
-    # Declared after its impl: the check sees the whole module.
+    # Declared after its impl: the check sees the whole module.  `Drop` is
+    # a compiler trait: known with no declaration (#4211).
     "struct_after_impl": """\
 impl Foo
     fn zz(self: @Foo) -> i32
         return self.x
+
+impl Drop for Foo
+    fn drop(self: @&Foo)
+        return
 
 struct Foo
     x: i32
@@ -287,3 +296,36 @@ def test_impl_on_primitive_refused(request, tmp_path, compiler, row):
     type_name, program = PRIMITIVE_ROWS[row]
     _assert_refused(compiler, tmp_path, f"primitive_{row}", PRELUDE + program,
                     f"`{type_name}` is a built-in type; it can't have an `impl`")
+
+
+# An impl of a trait nothing declares (#4211): it compiled silently on ritz1.
+# `Speak` (declared) and `Drop` (a compiler trait) are known, and only the
+# undeclared one is refused.  ritz0's refusal is #4197's (its row in
+# test_trait_bound_check.py is ritz0-only: that file's ritz1 half is #3469).
+UNKNOWN_TRAIT = """\
+struct Foo
+    x: i32
+
+impl Speak for Foo
+    fn say(self: @Foo) -> i32
+        return 1
+
+impl Drop for Foo
+    fn drop(self: @&Foo)
+        return
+
+impl ^Nonesuch for Foo
+    fn g(self: @Foo) -> i32
+        return 0
+
+pub fn main() -> i32
+    return 0
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_impl_of_unknown_trait_refused(request, tmp_path, compiler):
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    _assert_refused(compiler, tmp_path, "unknown_trait", PRELUDE + UNKNOWN_TRAIT,
+                    "unknown trait `Nonesuch`")
