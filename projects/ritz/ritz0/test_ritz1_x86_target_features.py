@@ -263,7 +263,6 @@ def test_intrinsic_fns_honour_masked_native_features(program_ll, tmp_path):
 # these compile without it either way.
 
 
-@pytest.mark.skipif(not CRYPTOSEC.is_dir(), reason="cryptosec not checked out")
 @pytest.mark.parametrize(
     "name",
     [
@@ -274,6 +273,7 @@ def test_intrinsic_fns_honour_masked_native_features(program_ll, tmp_path):
 )
 def test_cryptosec_source_compiles_at_O2_without_march_flags(ritz1_bin, tmp_path, name,
                                                            monkeypatch):
+    assert CRYPTOSEC.is_dir(), "projects/cryptosec is tracked; its absence is a broken checkout, not an environment (AGAST #3797)"
     # A private, empty store (AGAST #1901): with mem.ritz's interface text
     # stored, ritz1 parses that -- mem_zero's asm body emptied -- and never
     # meets the asm, so the result would depend on what the cache holds.

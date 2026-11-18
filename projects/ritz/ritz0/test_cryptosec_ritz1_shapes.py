@@ -176,9 +176,9 @@ def test_cryptosec_shape_runs_as_ritz0_runs_it(compiler, tmp_path, name):
     assert _run(compiler, tmp_path, name, _src(name)) == PROGRAMS[name][3]
 
 
-@pytest.mark.skipif(not MEM_RITZ.is_file(), reason="cryptosec not checked out")
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_cryptosec_mem_compiles(compiler, tmp_path):
+    assert MEM_RITZ.is_file(), "projects/cryptosec/lib/mem.ritz is tracked; its absence is a broken checkout, not an environment (AGAST #3797)"
     # mem_burn_stack wipes through ritzlib's secure_zero (#1864),
     # which replaced the `nopl ({ptr})` barrier (#1986, ritz1 since #3395).
     comp = _emit(compiler, MEM_RITZ, tmp_path / "mem.ll", tmp_path)

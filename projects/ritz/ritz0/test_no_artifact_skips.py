@@ -85,6 +85,9 @@ ARTIFACT_SKIPS = [
     "SKIPPED [2] test_x.py:5: sample program missing",
     "SKIPPED [1] test_x.py:5: Missing fixture file",
     "SKIPPED [1] test_x.py:5: /tmp/x: No such file or directory",
+    # AGAST #3797: projects/cryptosec is tracked, so its absence is a
+    # broken checkout too.
+    "SKIPPED [2] test_cryptosec_ritz1_shapes.py:179: cryptosec not checked out",
 ]
 
 # Skips that are about the machine, not the checkout. These stay legitimate,

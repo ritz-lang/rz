@@ -267,9 +267,9 @@ CRYPTOSEC_DEPS = json.dumps(
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(not CRYPTOSEC.is_dir(), reason="cryptosec not checked out")
 @pytest.mark.parametrize("name", ["sha256", "aes", "aes_gcm"])
 def test_cryptosec_source_compiles_at_O2_without_march_flags(tmp_path, name):
+    assert CRYPTOSEC.is_dir(), "projects/cryptosec is tracked; its absence is a broken checkout, not an environment (AGAST #3797)"
     ll = tmp_path / f"{name}.ll"
     _ritz0(CRYPTOSEC / "lib" / f"{name}.ritz", ll, "--no-runtime",
            "--deps", CRYPTOSEC_DEPS, "--project-root", str(CRYPTOSEC))
