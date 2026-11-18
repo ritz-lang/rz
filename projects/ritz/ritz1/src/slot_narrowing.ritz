@@ -1,0 +1,305 @@
+# ritz1/src/slot_narrowing.ritz - implicit narrowing at an assignment, a call
+# argument and a return
+#
+# AGAST #4081, ritz1's half of #1444 (LANGUAGE_SPEC §7.5).
+#
+#     fn big() -> i64
+#         return 4294967301
+#     fn r() -> i32
+#         return big()            # error: write `big() as i32`
+#     n = big()                   # error, n: i32
+#     take(big())                 # error, take(v: i32)
+#
+# A `let` / `var` initialiser has been held to §7.5 since #1446
+# (narrowing.ritz's check_implicit_narrowing).  This checks the same rule,
+# with the same provably-lossless exemptions (narrow_sema_unproven: a constant
+# that fits, a mask `e & K`, an if/match whose every arm fits), wherever else
+# an integer converts to a declared integer type:
+#
+#   * an assignment `place = v` / `place op= v`, at the place's type;
+#   * a call argument, at its parameter's type (a fn, a fn pointer, an
+#     extern, a static or an instance method);
+#   * a `return v` or a fn's tail value, at the return type.  A procedure's
+#     tail is discarded, so it is not checked (as in ritz0).  An async fn's
+#     `return v` is lowered to `self.__result = v` before sema, so the
+#     assignment route judges it at the declared type, as ritz0 does.
+#
+# ritz0/test_implicit_narrowing_slots.py is the specification, and
+# ritz0/test_ritz1_implicit_narrowing_slots.py feeds its tables to ritz1.
+#
+# One-sided, as narrowing.ritz is: a slot or a value whose integer type Sema
+# cannot name (NARROW_UNKNOWN, a borrow, a generic) is never refused.
+#
+# WHERE IT RUNS: on Sema, from sema_walk, at the slots literal_slot.ritz
+# visits, before the value's own sub-expressions are walked.
+
+import ritzlib.sys
+import ritzlib.io
+
+import ast
+import types           # the one primitive type table (AGAST #1889)
+import ast_helpers
+import emitter_core
+import diag
+import sema
+import sema_type
+import narrowing
+import bool_check
+
+# What a slot is called in the diagnostic: "`n` is", "argument 2 of `take`
+# is", "`f` returns".
+const SN_PLACE: i32 = 1
+const SN_ARG: i32 = 2
+const SN_RETURN: i32 = 3
+
+struct SlotWords
+    kind: i32
+    # SN_PLACE: the place (`p.x`, `a[..]`, `*p`), or null for "the place
+    # assigned"; SN_ARG: the callee; SN_RETURN: the fn.
+    name: *u8
+    name_len: i32
+    # SN_PLACE: `name` is a field of `base` (`base.name`); SN_ARG: the index.
+    base: *u8
+    base_len: i32
+    shape: i32       # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`
+    index: i32
+
+# Where a value is reported: ritz0's _value_span (a binary at its left
+# operand, a cast at its operand), as float_slot reports it.
+fn sn_report_at(e: *Expr) -> *Expr
+    var at: *Expr = e
+    while (at.kind == EXPR_BINARY or at.kind == EXPR_CAST) and at.left != null
+        at = at.left
+    at
+
+fn sn_print(p: *u8, len: i32)
+    narrow_eprint_name(p, len)
+
+fn sn_print_slot(w: *SlotWords)
+    if w.kind == SN_ARG
+        eprints_cstr(c"argument ")
+        eprint_i64((w.index + 1) as i64)
+        eprints_cstr(c" of `")
+        sn_print(w.name, w.name_len)
+        eprints_cstr(c"` is `")
+        return
+    if w.kind == SN_RETURN
+        eprint_char('`')
+        sn_print(w.name, w.name_len)
+        eprints_cstr(c"` returns `")
+        return
+    if w.name == null
+        eprints_cstr(c"the place assigned is `")
+        return
+    eprint_char('`')
+    if w.shape == 3
+        eprint_char('*')
+    if w.shape == 1
+        sn_print(w.base, w.base_len)
+        eprint_char('.')
+    sn_print(w.name, w.name_len)
+    if w.shape == 2
+        eprints_cstr(c"[..]")
+    eprints_cstr(c"` is `")
+
+# `value` lands in integer slot `slot`: refuse it unless it provably fits.
+fn sn_check(sm: *Sema, value: *Expr, slot: i32, w: *SlotWords)
+    if value == null or slot == NARROW_UNKNOWN
+        return
+    let src: i32 = narrow_sema_unproven(sm, value, slot)
+    if src == 0
+        return
+    if bool_sema_report_at(sm, sn_report_at(value)) == 0
+        return
+    eprints_cstr(c"implicit narrowing: ")
+    sn_print_slot(w)
+    eprints_cstr(ty_name(slot))
+    eprints_cstr(c"` but this value has type `")
+    eprints_cstr(ty_name(src))
+    eprints_cstr(c"`, and the compiler cannot prove the value fits. Write `<expr> as ")
+    eprints_cstr(ty_name(slot))
+    eprints_cstr(c"` if truncation is intended\n")
+
+fn sn_words(w: *SlotWords, kind: i32, name: *u8, len: i32)
+    w.kind = kind
+    w.name = name
+    w.name_len = len
+    w.base = null
+    w.base_len = 0
+    w.shape = 0
+    w.index = 0
+
+# =============================================================================
+# Assignment
+# =============================================================================
+
+# The integer type of place `t` (an EXPR_* target), else NARROW_UNKNOWN; and
+# its words.
+fn sn_place_type(sm: *Sema, t: *Expr, w: *SlotWords) -> i32
+    sn_words(w, SN_PLACE, null, 0)
+    if t == null
+        return NARROW_UNKNOWN
+    if t.kind == EXPR_IDENT
+        w.name = t.ident_ptr
+        w.name_len = t.ident_len
+        return narrow_sema_name_type(sm, t.ident_ptr, t.ident_len)
+    if t.kind == EXPR_MEMBER
+        if t.left != null and t.left.kind == EXPR_IDENT
+            w.base = t.left.ident_ptr
+            w.base_len = t.left.ident_len
+            w.name = t.ident_ptr
+            w.name_len = t.ident_len
+            w.shape = 1
+        let f: *StructField = sbk_member_field(sm, t)
+        if f == null
+            return NARROW_UNKNOWN
+        return narrow_known(f.field_type)
+    if t.kind == EXPR_INDEX
+        if t.left != null and t.left.kind == EXPR_IDENT
+            w.name = t.left.ident_ptr
+            w.name_len = t.left.ident_len
+            w.shape = 2
+        if t.right == null or t.right.kind == EXPR_RANGE
+            return NARROW_UNKNOWN
+        var kind: i32 = TYPE_VOID
+        var pointee: i32 = TYPE_VOID
+        sema_index_slot(sm, t, @kind, @pointee)
+        return narrow_known(kind)
+    if t.kind == EXPR_UNARY and t.op == OP_DEREF
+        if t.operand != null and t.operand.kind == EXPR_IDENT
+            w.name = t.operand.ident_ptr
+            w.name_len = t.operand.ident_len
+            w.shape = 3
+        var pt: SemaTy
+        let pk: i32 = sema_expr_ty(sm, t.operand, @pt)
+        if pk == TYPE_PTR or pk == TYPE_REF or pk == TYPE_MUT_REF
+            return narrow_known(pt.pointee)
+        return NARROW_UNKNOWN
+    NARROW_UNKNOWN
+
+# The field `field` of the struct `local` is, else null.
+fn sn_local_field(sm: *Sema, local: *u8, local_len: i32, field: *u8, field_len: i32) -> *StructField
+    let v: *SemaVar = sema_find_local(sm, local, local_len)
+    if v == null or v.type_name == null or v.type_name_len <= 0
+        return null
+    sbk_struct_field(sm, v.type_name, v.type_name_len, field, field_len)
+
+# `target = value` (and `target op= value`, which the parser makes
+# `target = target op value`), in each spelling the parser has for one.
+pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
+    var w: SlotWords
+    sn_words(@w, SN_PLACE, null, 0)
+    var slot: i32 = NARROW_UNKNOWN
+    let k: i32 = st.kind
+    if k == STMT_ASSIGN
+        if st.assign_target_len != 0
+            w.name = st.assign_target
+            w.name_len = st.assign_target_len
+            slot = narrow_sema_name_type(sm, st.assign_target, st.assign_target_len)
+        else
+            slot = sn_place_type(sm, st.if_cond as *Expr, @w)
+    else if k == STMT_INDEX_ASSIGN
+        w.name = st.assign_target
+        w.name_len = st.assign_target_len
+        w.shape = 2
+        var kind: i32 = TYPE_VOID
+        var pointee: i32 = TYPE_VOID
+        sema_named_elem(sm, st.assign_target, st.assign_target_len, @kind, @pointee)
+        slot = narrow_known(kind)
+    else if k == STMT_LOCAL_FIELD_ASSIGN
+        w.base = st.var_name
+        w.base_len = st.var_name_len
+        w.name = st.assign_target
+        w.name_len = st.assign_target_len
+        w.shape = 1
+        let f: *StructField = sn_local_field(sm, st.var_name, st.var_name_len, st.assign_target, st.assign_target_len)
+        if f != null
+            slot = narrow_known(f.field_type)
+    else if k == STMT_MEMBER_ASSIGN
+        # `p.f = v`, the pointer expression in if_cond.
+        let pe: *Expr = st.if_cond as *Expr
+        if pe != null and pe.kind == EXPR_IDENT
+            w.base = pe.ident_ptr
+            w.base_len = pe.ident_len
+            w.name = st.assign_target
+            w.name_len = st.assign_target_len
+            w.shape = 1
+            let f: *StructField = sn_local_field(sm, pe.ident_ptr, pe.ident_len, st.assign_target, st.assign_target_len)
+            if f != null
+                slot = narrow_known(f.field_type)
+    sn_check(sm, st.assign_value, slot, @w)
+
+# =============================================================================
+# Call arguments
+# =============================================================================
+
+fn sn_args(sm: *Sema, params: *Param, args: *Expr, name: *u8, len: i32)
+    var w: SlotWords
+    sn_words(@w, SN_ARG, name, len)
+    var p: *Param = params
+    var a: *Expr = args
+    var i: i32 = 0
+    while p != null and a != null
+        if p.is_borrow == 0 and p.is_self_borrow == 0
+            w.index = i
+            sn_check(sm, a, narrow_known(p.param_type), @w)
+        p = p.next
+        a = a.next
+        i += 1
+
+# `f(args)`: a fn, an extern, or a fn-pointer local.  A nameless callee
+# (`h.cb(x)`, `fs[i](x)`) is not judged: ritz0 does not judge it either.
+pub fn slot_narrowing_call(sm: *Sema, e: *Expr)
+    if e.func_name_len == 0
+        return
+    if e.call_type_suffix_len <= 0
+        let v: *SemaVar = sema_find_local(sm, e.func_name, e.func_name_len)
+        if v != null
+            if v.fn_sig != null and v.kind != TYPE_ARRAY
+                sn_args(sm, v.fn_sig.params, e.args, e.func_name, e.func_name_len)
+            return
+    let fd: *FnDef = sema_call_fn(sm, e)
+    if fd == null or fd.type_params != null
+        return
+    sn_args(sm, fd.params, e.args, e.func_name, e.func_name_len)
+
+# `recv.m(args)` and `T.m(args)`, as literal_method finds the callee.
+pub fn slot_narrowing_method(sm: *Sema, e: *Expr)
+    var tn_len: i32 = 0
+    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
+    if tn == null
+        return
+    let fd: *FnDef = sema_method_fn(sm, tn, tn_len, e.ident_ptr, e.ident_len)
+    if fd == null or fd.params == null or fd.type_params != null
+        return
+    if name_eq(fd.params.name, fd.params.name_len, c"self", 4) == 1 or sema_is_ufcs_fn(sm, tn, tn_len, e.ident_ptr, e.ident_len, fd) == 1
+        sn_args(sm, fd.params.next, e.args, e.ident_ptr, e.ident_len)
+    else
+        sn_args(sm, fd.params, e.args, e.ident_ptr, e.ident_len)
+
+# =============================================================================
+# Return and fn tail
+# =============================================================================
+
+# The return slot of the fn being walked, NARROW_UNKNOWN when it has none
+# that §7.5 judges here.
+fn sn_return_slot(sm: *Sema, w: *SlotWords) -> i32
+    let f: *FnDef = sm.cur_fn
+    if f == null
+        return NARROW_UNKNOWN
+    sn_words(w, SN_RETURN, f.name, f.name_len)
+    narrow_known(f.return_type)
+
+# `return v` in the fn being walked.
+pub fn slot_narrowing_return(sm: *Sema, v: *Expr)
+    var w: SlotWords
+    let slot: i32 = sn_return_slot(sm, @w)
+    sn_check(sm, v, slot, @w)
+
+# `e` is the fn's value: its tail, or the tail of a block or match arm in the
+# fn's tail chain (sema_walk's tail_value, AGAST #3980), judged as the walk
+# reaches it, so the block's `let`s and the arm's bindings are in scope.
+pub fn slot_narrowing_tail(sm: *Sema, e: *Expr)
+    var w: SlotWords
+    let slot: i32 = sn_return_slot(sm, @w)
+    sn_check(sm, e, slot, @w)

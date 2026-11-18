@@ -83,6 +83,8 @@ import sema_probe
 
 import sema_type
 
+import slot_narrowing   # assignment, argument, return (AGAST #4081)
+
 import tail_value   # AGAST #2236, on Sema since #3511
 
 # AGAST #3891: a use, in the input's own code, of a name that reaches the
@@ -184,6 +186,11 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
         # The arm's `let`s stay bound for its trailing expression: `let b =
         # ..` then `b.p()` (AGAST #2237 / #3511); the arm's mark drops them.
         sema_walk_block(sm, arm.body_stmts, 1)
+        # AGAST #4081: a match statement in the fn's tail chain yields the
+        # fn's value, judged with the arm's bindings and `let`s in scope.
+        if owner == null and discard == 0 and arm.is_pass == 0
+            slot_narrowing_tail(sm, arm.body)
+
         # AGAST #3015: a match arm's value, with its binding in scope (an
         # if-expression's arms were resolved with their statement).  Before
         # let_check, as the emitter used to run them.
@@ -263,6 +270,9 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
         if call_check_muted() == 0
             literal_call(sm, e)   # AGAST #2341: after the call's own check
 
+        if call_check_muted() == 0
+            slot_narrowing_call(sm, e)   # AGAST #4081
+
         # `sizeof(x)` and a non-literal `print(x)` never lower their operand.
         let mute: i32 = call_check_mutes(e)
 
@@ -287,6 +297,9 @@ fn sema_walk_expr(sm: *Sema, e: *Expr)
 
         if call_check_muted() == 0
             literal_method(sm, e)     # after its receiver, as emit_expr_method
+
+        if call_check_muted() == 0
+            slot_narrowing_method(sm, e)   # AGAST #4081
         sema_walk_list(sm, e.args)
     else if k == EXPR_STRUCT_LIT
         struct_lit_field_check(sm, e)   # LARB R49 (AGAST #3563)
@@ -315,6 +328,11 @@ fn sema_bind_decl(sm: *Sema, st: *Stmt)
             t.fn_sig = st.var_fn_sig
     else
         sema_expr_ty(sm, st.var_init, @t)
+        # AGAST #4081: `let t = take` holds fn `take`, so `t(..)` takes its
+        # params (its kind stays unknown, as the bare name's).
+        let init: *Expr = st.var_init
+        if t.fn_sig == null and init != null and init.kind == EXPR_IDENT and sema_find_local(sm, init.ident_ptr, init.ident_len) == null
+            t.fn_sig = sema_find_fn(sm, init.ident_ptr, init.ident_len)
     sema_bind_ty(sm, st.var_name, st.var_name_len, @t, st.var_is_let)
     if st.var_type == TYPE_ARRAY
         let v: *SemaVar = @sm.scope[sm.scope_top - 1]
@@ -426,6 +444,9 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         if fn_tail == 1
             literal_fn_tail(sm, st)   # AGAST #2341
 
+        if tail_value == 1 and st.next == null and st.kind == STMT_EXPR
+            slot_narrowing_tail(sm, st.expr)   # AGAST #4081: the fn's value
+
         ref_loan_check_stmt(sm, st)   # AGAST #2438 / #3506
 
         ref_value_check_stmt(sm, st)   # AGAST #3926
@@ -485,6 +506,8 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
                 return_check_another_struct(sm, st.return_value, st.span.line, st.span.col)   # AGAST #3293
 
             literal_return(sm, st.return_value)   # AGAST #2341
+
+            slot_narrowing_return(sm, st.return_value)   # AGAST #4081
             sema_walk_expr(sm, st.return_value)
         else if st.kind == STMT_EXPR
             # Only a block's last statement can be its value (AGAST #2137).
@@ -505,6 +528,9 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             bool_check_stmt(sm, st)   # AGAST #2342
 
             literal_stmt(sm, st)      # AGAST #2341
+
+            slot_narrowing_assign(sm, st)   # AGAST #4081
+
             if st.kind == STMT_ASSIGN and st.assign_target_len == 0
                 index_store_check(sm, st.if_cond)   # AGAST #3565
                 sema_walk_expr(sm, st.if_cond)

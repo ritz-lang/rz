@@ -2838,14 +2838,14 @@ let k: i64 = 300
 let a: [2]u8 = [1, k]
 ```
 
-ritz0 and ritz1 both enforce this rule for a `let`/`var` initialiser and an
-array element, and `ritz0/test_ritz1_implicit_narrowing.py` checks that they
-give the same verdict on every case in `ritz0/test_implicit_narrowing.py`.
-At an assignment, an argument and a `return`, only ritz0 enforces it
-(`ritz0/test_implicit_narrowing_slots.py`, AGAST #1444). ritz1 still narrows
-there silently until AGAST #4081. ritz1 infers the initialiser's type from its
+ritz0 and ritz1 both enforce this rule at every slot above.
+`ritz0/test_ritz1_implicit_narrowing.py` checks that they give the same
+verdict on every case in `ritz0/test_implicit_narrowing.py` (a `let`/`var`
+initialiser), and `ritz0/test_ritz1_implicit_narrowing_slots.py` does the
+same for `ritz0/test_implicit_narrowing_slots.py` (an assignment, an argument
+and a `return`, AGAST #1444 / #4081). ritz1 infers the value's type from its
 Ritz types. Where that inference is unsure, for example for an unannotated
-local, ritz1 accepts the initialiser rather than guess (#1364).
+local, ritz1 accepts the value rather than guess (#1364).
 
 ### 7.6 Reference Operations
 

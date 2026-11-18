@@ -1627,11 +1627,12 @@ fn f(a:& [2]i32) -> i32
     return 3
 """ + MAIN_13,
     # AGAST #3190: ritz0 wrote `ret [2 x i32]` in an i64 fn; ritz1 returns the
-    # address (#2322).
+    # address (#2322).  main casts f's i64 so the bare array is the only error
+    # (an implicit i64 -> i32 return is refused first since #1444 / #4081).
     "return_to_integer": """
 fn f(a:& [2]i32) -> i64
     return a
-""" + MAIN_13,
+""" + MAIN_13.replace("return f(@&a)", "return f(@&a) as i32"),
     "compare_with_null": """
 fn f(a:& [2]i32) -> i32
     if a == null

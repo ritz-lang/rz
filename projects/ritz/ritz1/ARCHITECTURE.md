@@ -218,7 +218,7 @@ still run mid-lowering on `*EmitterState`, and
 
 - `must_use` — a discarded call to a `[[must_use]]` fn (§17.8).
 
-- `narrowing` — implicit narrowing in a typed let/var. Its rule is also read
+- `narrowing` — implicit narrowing in a typed let/var (§7.5). Its rule is also read
   mid-lowering (sizeof), from the emitter's own table of written types;
   float_slot and literal_slot read it on Sema (`narrow_sema_*`, #3510).
 
@@ -250,6 +250,11 @@ still run mid-lowering on `*EmitterState`, and
 
 - `sema_index_store` — an index store ritz1 can't lower is refused, not
   miscompiled.
+
+- `slot_narrowing` — the same rule at an assignment, a call argument, a
+  `return` and a fn's tail value (§7.5, #4081), on Sema, at the slots
+  literal_slot visits; a tail is judged where the walk reaches it, with its
+  block's `let`s and its arm's bindings in scope.
 
 - `struct_variants` — same-named structs (§15.3, §17.2, #4111): the parser
   notes every struct, `[[target_os]]`-filtered or not, with its target and a

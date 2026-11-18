@@ -12,10 +12,13 @@
 #
 #   * a compile-time constant expression whose value fits the declared type
 #   * a mask `e & K` with constant K >= 0 that fits the declared type
-#   * an if/else or match whose every arm is one of the above
+#   * an if/else or match whose every arm is one of the above, or fits on its
+#     own (narrow_arms_fit, ritz0's `_arms_fit`, #1444 / #4081)
 #
 # ritz0/test_implicit_narrowing.py is the specification of the rule, and
 # ritz0/test_ritz1_implicit_narrowing.py feeds its tables to both compilers.
+# slot_narrowing.ritz holds an assignment, a call argument and a return to the
+# same rule (narrow_sema_unproven, AGAST #4081).
 #
 # THE ONE REAL DIFFERENCE: how the initialiser's type is known.  ritz0 reads
 # the LLVM width of the value it just emitted.  ritz1 cannot: its unified
@@ -798,7 +801,39 @@ fn narrow_unproven_in(env: *NarrowEnv, init: *Expr, decl: i32) -> i32
     if narrow_provable_range(env, init, 1, @lo, @hi) == 1
         if narrow_fits(lo, decl) == 1 and narrow_fits(hi, decl) == 1
             return 0
+    if narrow_arms_fit(env, init, decl) == 1
+        return 0
     src
+
+# AGAST #4081 (ritz0's `_arms_fit`, #1444): is `e` an if/match each of whose
+# arms fits `decl` on its own?  A merge is as wide as its widest arm, and a
+# literal arm is an i64 there, so `if n <= 1 then 1 else n` (n: i32) is an
+# i64.  Narrowing it back to the i32 it came from loses nothing: an arm no
+# wider than the slot was only extended, and a constant arm is judged by its
+# value.  An arm that is itself a merge (`else if`) is judged arm by arm too.
+# A mask arm is not a constant: ritz0 judges the arms as emitted, where
+# `big() & 255` is an i64, so only the whole-merge range above clears it.
+fn narrow_arms_fit(env: *NarrowEnv, e: *Expr, decl: i32) -> i32
+    if e == null or (e.kind != EXPR_IF and e.kind != EXPR_MATCH)
+        return 0
+    let dw: i32 = ty_bits(decl)
+    var arm: *MatchArm = e.args as *MatchArm
+    if arm == null
+        return 0
+    while arm != null
+        if arm.is_pass != 0 or arm.body == null
+            return 0
+        var v: i64 = 0
+        if narrow_const_value(env, arm.body, 1, @v) == 1
+            if narrow_fits(v, decl) == 0
+                return 0
+        else
+            let at: i32 = narrow_src_type_in(env, arm.body, 1)
+            if at == NARROW_UNKNOWN or ty_bits(at) > dw
+                if narrow_arms_fit(env, arm.body, decl) == 0
+                    return 0
+        arm = arm.next
+    1
 
 fn narrow_report(sm: *Sema, stmt: *Stmt, decl: i32, src: i32)
     if stmt.var_src_file != null

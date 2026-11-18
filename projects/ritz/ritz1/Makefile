@@ -70,6 +70,7 @@ SOURCES = \
 	call_check \
 	literal_slot \
 	float_slot \
+	slot_narrowing \
 	float_compare \
 	tail_value \
 	reachability \

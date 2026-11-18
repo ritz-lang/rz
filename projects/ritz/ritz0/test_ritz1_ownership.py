@@ -710,7 +710,7 @@ pub fn main() -> i32
     "match_expr_moves_scrutinee": SLOT + """\
 pub fn main() -> i32
     var s = Slot.Full(make(1))
-    let v = match s
+    let v: i32 = match s
         Full(t) => 1
         _ => 0
     var u = s
