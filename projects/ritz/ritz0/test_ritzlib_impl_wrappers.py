@@ -38,7 +38,8 @@ NOT WRAPPED, on purpose
 
   * `drop`: ritz0 takes any `(T, 'drop')` method as T's destructor
     (_get_drop_fn_name), so a plain `drop` wrapper would make a String drop
-    itself at scope end on top of the explicit `s.drop()` (#3614).
+    itself at scope end on top of the explicit `s.drop()`. Free a String
+    with `string_drop(@&s)` instead (#3614; checked on the ritzlib suite).
 """
 
 import re
@@ -175,24 +176,29 @@ def no_table(functions, type_name, method_name):
 
 emitter_llvmlite.find_ufcs_function = no_table
 import ritz0
-sys.argv = ['ritz0.py', {src!r}, '-o', {out!r}]
+sys.argv = ['ritz0.py', {src!r}, '-o', {out!r}] + {extra!r}
 ritz0.main()
 """
+
+
+def _compile_without_table(src: Path, out: Path, extra=()) -> str:
+    """ritz0 `src` -> `out` with the String table off; the IR text."""
+    driver = NO_TABLE.format(ritz0=str(RITZ0_DIR), src=str(src),
+                             out=str(out), extra=list(extra))
+    proc = subprocess.run(
+        [sys.executable, "-c", driver], cwd=out.parent, capture_output=True,
+        text=True, timeout=300, check=False,
+        env={"RITZ_PATH": str(RITZ_ROOT), "PATH": "/usr/bin:/bin"})
+    assert proc.returncode == 0 and out.exists(), (
+        f"ritz0 without the table:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
+    return out.read_text()
 
 
 @pytest.mark.integration
 def test_every_method_resolves_without_the_table(tmp_path):
     src = tmp_path / "every.ritz"
     src.write_text(EVERY_METHOD)
-    out = tmp_path / "every.ll"
-    driver = NO_TABLE.format(ritz0=str(RITZ0_DIR), src=str(src), out=str(out))
-    proc = subprocess.run(
-        [sys.executable, "-c", driver], cwd=tmp_path, capture_output=True,
-        text=True, timeout=300, check=False,
-        env={"RITZ_PATH": str(RITZ_ROOT), "PATH": "/usr/bin:/bin"})
-    assert proc.returncode == 0 and out.exists(), (
-        f"ritz0 without the table:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
-    ir = out.read_text()
+    ir = _compile_without_table(src, tmp_path / "every.ll")
     # Each call went through a wrapper: its symbol is defined or declared.
     for sym in ("String_push_str", "String_from", "String_eq_strview"):
         assert re.search(rf'@"?[\w.$]*{re.escape(sym)}"?\(', ir), (
@@ -261,3 +267,13 @@ def test_a_pub_impl_method_is_exported(tmp_path):
     defs = {m.group(2): m.group(1) for m in re.finditer(
         r'^define (internal )?.*?@"?(Foo_\w+)"?\(', out.read_text(), re.MULTILINE)}
     assert defs == {"Foo_shown": None, "Foo_hidden": "internal "}, defs
+
+
+@pytest.mark.integration
+def test_string_methods_suite_compiles_without_the_table(tmp_path):
+    """#3614: `String` has no `drop` method on purpose (see NOT WRAPPED), so
+    its ritzlib suite frees a String with `string_drop(@&s)`. An `s.drop()`
+    only resolved through the table and fails once #3496 deletes it."""
+    _compile_without_table(
+        RITZLIB / "tests" / "test_string_methods.ritz",
+        tmp_path / "suite.ll", ["--no-runtime"])
