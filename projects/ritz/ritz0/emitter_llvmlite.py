@@ -15119,22 +15119,6 @@ class LLVMEmitter:
             raise EmitError(_STR_AS_PTR['String' if name == 'String' else 'StrView'],
                             self._value_span(tail))
 
-    @staticmethod
-    def _int_literal_only(expr: rast.Expr) -> bool:
-        """Is `expr` built from integer literals alone (`4000000000`, `-3`,
-        `2 * 3`)?  Literals are not held to §7.5's exactness rule (#2945).
-        ritz1's fs_literal_only is this."""
-        if isinstance(expr, (rast.IntLit, rast.CharLit)):
-            return True
-        if isinstance(expr, rast.Grouped):
-            return LLVMEmitter._int_literal_only(expr.expr)
-        if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
-            return LLVMEmitter._int_literal_only(expr.operand)
-        if isinstance(expr, rast.BinOp) and expr.op in LLVMEmitter._INT_ARITH_OPS:
-            return (LLVMEmitter._int_literal_only(expr.left)
-                    and LLVMEmitter._int_literal_only(expr.right))
-        return False
-
     def _int_into_float_slot(self, val: ir.Value, target_type: ir.Type,
                              at: Optional[rast.Expr]) -> ir.Value:
         """An integer value landing in an f32 / f64 slot (LANGUAGE_SPEC §7.5,
@@ -15149,7 +15133,7 @@ class LLVMEmitter:
             origin = self._value_origin.get(id(val))
             if origin is not None and origin[0] is val:
                 src = origin[1]
-        if src is None or self._int_literal_only(src):
+        if src is None or float_rules.int_literal_only(src):
             return self.builder.sitofp(val, target_type)
         width = val.type.width
         unsigned = self._origin_unsigned(val, src)
