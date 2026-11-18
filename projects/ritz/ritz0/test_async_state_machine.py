@@ -146,6 +146,41 @@ RUNS = {
     # #4013's `__short_K` and #4188's `__for_K` fields in one future.
     "for_and_rhs": (_DBL + _go("(n: i32) -> i32", "    var s: i32 = 0\n    for i in 0..n\n"
                                "        if i > 1 && (await dbl(i)) > 4\n            s += i\n    s\n", "(5)"), 7),
+    # A `match` whose arms await (AGAST #4189): only the taken arm's do.
+    "match_arm_taken": (_AB + _go("(x: i32) -> i32", "    let v: i32 = match x\n        0 => await a()\n"
+                                  "        _ => await b()\n    v * 100 + A * 10 + B\n", "(0)"), 110),
+    "match_arm_other": (_AB + _go("(x: i32) -> i32", "    match x\n        0 => await a()\n        _ => 2\n",
+                                  "(7)"), 2),
+    # Only the scrutinee awaits: the match runs whole after it, so its type
+    # needn't be told; and a tail match that doesn't await, in a fn that does.
+    "match_scrutinee_await_only": (_DBL + "struct P\n    n: i32\n\nasync fn go(p: *P) -> i32\n"
+                                   "    match p.n + await dbl(1)\n        0 => 1\n        k => k * 10\n\n"
+                                   "pub fn main() -> i32\n    var p: P = P { n: 3 }\n    await go(@p)\n", 50),
+    "match_tail_no_await": (_DBL + _go("(x: i32) -> i32", "    let a: i32 = await dbl(1)\n    match x\n"
+                                       "        0 => 1\n        _ => a\n", "(5)"), 2),
+    # An arm's binding is read after the await: the scrutinee is a future
+    # field, `__match_K`, matched again in each of the arm's states.
+    "match_binding_across_await": (_DBL + _go("(x: i32) -> i32", "    match x\n        0 => 1\n"
+                                              "        n => n + await dbl(n)\n", "(5)"), 15),
+    # A variant's payload survives a Pending poll; the scrutinee is awaited.
+    "match_payload_pending": (_LATER + "enum E\n    A(i32)\n    B\n\nasync fn mk(v: i32) -> E\n    E.A(v)\n\n"
+                              "async fn go() -> i32\n    CALLS += 1\n    match await mk(4)\n        A(v) =>\n"
+                              "            let w: i32 = await later()\n            v + w + CALLS * 10\n"
+                              "        B => 1\n\n" + _POLL_GO, 219),
+    # `break` / `continue` in a `match` of a loop that awaits, and a `pass` arm.
+    "match_break_continue": (_DBL + _go("() -> i32", "    var s: i32 = 0\n    var i: i32 = 0\n    while i < 10\n"
+                                        "        i += 1\n        match i\n            2 => continue\n"
+                                        "            5 => break\n            _ => pass\n"
+                                        "        s += await dbl(i)\n    s * 10 + i\n", "()"), 165),
+    # A nested binding match, in a range `for` beside a short-circuit:
+    # #4013's `__short_K`, #4188's `__for_K` and `__match_K` in one future.
+    "match_nested_in_for": (_DBL + "enum E\n    A(i32)\n    B\n\n"
+                            + _go("(e: E) -> i32", "    var s: i32 = 0\n    for i in 0..(3 as i32)\n"
+                                  "        if i > 0 && (await dbl(i)) > 2\n            s += 100\n"
+                                  "        match e\n            A(v) =>\n                match (i + v) as i32\n"
+                                  "                    5 =>\n                        s += await dbl(v)\n"
+                                  "                    w =>\n                        s += w * 10 + await dbl(i)\n"
+                                  "            B =>\n                s += 1\n    s\n", "(E.A(4))"), 212),
     "pending_inner_future_kept": (_LATER + "async fn mid() -> i32\n    CALLS += 1\n    let v: i32 = await later()\n"
                                   "    v\n\nasync fn go() -> i32\n    let v: i32 = await mid()\n"
                                   "    v + CALLS * 10\n\n" + _POLL_GO, 215),
@@ -164,8 +199,13 @@ _UNPLACED = "`await` inside {what} in an async fn is not supported yet (AGAST #4
 
 # name -> (program with `^` at the diagnostic, message)
 REFUSALS = {
-    "match_arm": (_DBL + "async fn go(x: i32) -> i32\n    match x\n        0 => ^await dbl(1)\n        _ => 2\n\n"
-                  "pub fn main() -> i32\n    await go(0)\n", _UNPLACED.format(what="a `match`")),
+    # An arm that binds a name re-matches the scrutinee from a future field,
+    # which needs a type (#4189).
+    "match_untyped_scrutinee": (_DBL + "struct P\n    n: i32\n\nasync fn go(p: *P) -> i32\n    match ^p.n\n"
+                                "        0 => 1\n        k => k + await dbl(k)\n\n"
+                                "pub fn main() -> i32\n    var p: P = P { n: 3 }\n    await go(@p)\n",
+                                "cannot infer the type of the `match`'s scrutinee, which `go`'s future holds across "
+                                "an `await`: match a typed local (`let v: T = ...`)"),
     "for_iterable": (_DBL + "async fn go(q: i32) -> i32\n    var s: i32 = 0\n    for x in q\n"
                      "        s += ^await dbl(x)\n    s\n\npub fn main() -> i32\n    await go(3)\n",
                      _UNPLACED.format(what="a `for` over an iterable")),
@@ -181,8 +221,23 @@ REFUSALS = {
                            "`defer` in an async fn that awaits is not supported yet (AGAST #4013)"),
 }
 
+# Only a value `match` / `if` (a let's, an assignment's, a return's) is
+# lowered; an awaiting or jumping one that is an operand is refused.  ritz1's
+# grammar takes no such operand (`1 + match x` is its parse error), so these
+# rows are ritz0's.
+RITZ0_REFUSALS = {
+    "match_in_expression": (_DBL + "async fn go(x: i32) -> i32\n    let v: i32 = 1 + match x\n"
+                            "        0 => ^await dbl(1)\n        _ => 2\n    v\n\npub fn main() -> i32\n    await go(0)\n",
+                            _UNPLACED.format(what="a `match` inside an expression")),
+    "jump_in_operand": (_DBL + "async fn go(c: bool) -> i32\n    var s: i32 = 0\n    while s < 10\n"
+                        "        s += await dbl(1)\n        let v: i32 = 1 + if c\n            ^break\n"
+                        "        else\n            2\n        s += v\n    s\n\npub fn main() -> i32\n    await go(true)\n",
+                        "`break` / `continue` inside an expression of an async fn's loop that awaits "
+                        "is not supported yet (AGAST #4013)"),
+}
+
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_unplaced_await_is_refused(tmp_path, compiler):
-    assert_refusals(compiler, tmp_path, REFUSALS)
+    assert_refusals(compiler, tmp_path, {**REFUSALS, **(RITZ0_REFUSALS if compiler == "ritz0" else {})})
