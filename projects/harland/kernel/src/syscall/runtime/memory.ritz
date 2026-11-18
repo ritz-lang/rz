@@ -134,6 +134,23 @@ fn free_user_stack()
             pmm_free_page(paddr)
         i = i + 1
 
+# True when a hint range is unusable because some page of it is already
+# mapped: the hint is then ignored, as on Linux, rather than mapped over
+# (#4114). A range outside the mmap region is left to sys_mmap_impl's
+# bounds check (NoMem), as before. The PMM never hands out page 0, so a
+# 0 from vmm_virt_to_phys means unmapped.
+fn mmap_hint_taken(addr: u64, num_pages: u64) -> bool
+    if addr < USER_MMAP_START or addr >= USER_MMAP_END
+        return false
+    if num_pages > (USER_MMAP_END - addr) / PAGE_SIZE
+        return false
+    var i: u64 = 0
+    while i < num_pages
+        if vmm_virt_to_phys(addr + i * PAGE_SIZE) != 0
+            return true
+        i = i + 1
+    return false
+
 # Undo a failed sys_mmap_impl: unmap and free the `count` pages it mapped
 # at addr before failing, so NoMem leaves no page behind (AGAST #3552).
 # Each was mapped to a page this call allocated, so freeing exactly what
@@ -183,8 +200,8 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             prints("[mmap] ERROR: MAP_FIXED requires page-aligned address\n")
             return Errno.Inval as i64
         map_addr = addr_hint
-    else if addr_hint != 0 and (addr_hint & 0xFFF) == 0
-        # Try the hint address if it's page-aligned
+    else if addr_hint != 0 and (addr_hint & 0xFFF) == 0 and not mmap_hint_taken(addr_hint, num_pages)
+        # Try the hint address if it's page-aligned and nothing lives there
         map_addr = addr_hint
     else
         # Kernel chooses: this process's bump cursor, advanced on success
@@ -209,6 +226,15 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
         pte_flags = pte_flags | PTE_WRITABLE
     if (prot & PROT_EXEC) == 0
         pte_flags = pte_flags | vmm_nx_flag()
+
+    # MAP_FIXED replaces whatever is mapped in the range (Linux semantics):
+    # vmm_map_page would overwrite a live leaf PTE and leak its page, so
+    # unmap and free the overlap first (#4114). It must happen here, not in
+    # mmap_undo: the rollback frees what it unmaps, and on failure it only
+    # covers the pages this call mapped. As on Linux, a MAP_FIXED that then
+    # fails leaves the old mapping gone.
+    if (flags & MAP_FIXED) != 0
+        mmap_undo(map_addr, num_pages)
 
     # Allocate, zero (through the physmap, before the user can see it) and
     # map each page.
@@ -434,6 +460,86 @@ pub fn mmap_failure_self_test() -> bool
     if not mmap_fail_case("page table", pt_addr)
         return false
     prints("  mmap failure test PASSED!\n")
+    return true
+
+# ============================================================================
+# Boot self-test: mmap over a live mapping leaks no page (#4114)
+# ============================================================================
+#
+# vmm_map_page never checks the leaf PTE, so sys_mmap_impl once mapped a
+# MAP_FIXED or hint range over live pages by overwriting their PTEs: the old
+# physical pages were never freed. The semantics now (Linux's):
+#   - hint: if any page of the range is mapped, the hint is ignored and the
+#     kernel picks the address from the process's cursor;
+#   - MAP_FIXED: the overlap is unmapped (and freed) first, then replaced.
+#
+# Runs after mmap_failure_self_test, on the same terms: kernel PML4, no
+# process, interrupts off, the PT under USER_MMAP_START already built and
+# nothing mapped. With no process the hint's fallback has no cursor and
+# returns Srch, which takes nothing; what matters is that the live pages are
+# untouched. Both overlaps are partial: the live mapping is the last
+# MMAP_OVERLAP_LIVE pages of the MMAP_OVERLAP_PAGES-page range.
+const MMAP_OVERLAP_PAGES: u64 = 8
+const MMAP_OVERLAP_LIVE: u64 = 4
+
+# Returns true when neither overlap leaked or clobbered a page, false
+# (after saying why) if not.
+pub fn mmap_overlap_self_test() -> bool
+    prints("\nTesting mmap over a live mapping...\n")
+    let fixed: u64 = MAP_ANONYMOUS | MAP_PRIVATE | MAP_FIXED
+    let hint: u64 = MAP_ANONYMOUS | MAP_PRIVATE
+    let prot: u64 = PROT_READ | PROT_WRITE
+    let addr: u64 = USER_MMAP_START
+    let live: u64 = addr + (MMAP_OVERLAP_PAGES - MMAP_OVERLAP_LIVE) * PAGE_SIZE
+    let length: u64 = MMAP_OVERLAP_PAGES * PAGE_SIZE
+
+    let base: u64 = pmm_get_free_pages()
+    if sys_mmap_impl(live, MMAP_OVERLAP_LIVE * PAGE_SIZE, prot, fixed) != live as i64
+        prints("  mmap overlap test FAILED: mapping the live pages failed\n")
+        return false
+    let live_phys: u64 = vmm_virt_to_phys(live)
+    let held: u64 = pmm_get_free_pages()
+
+    # Hint over the live pages: must not map at the hint.
+    let hinted: i64 = sys_mmap_impl(addr, length, prot, hint)
+    let after_hint: u64 = pmm_get_free_pages()
+    prints("  hint: result=0x")
+    serial_print_hex(hinted as u64)
+    prints(" free pages held=")
+    serial_print_dec(held)
+    prints(" after=")
+    serial_print_dec(after_hint)
+    prints("\n")
+    if hinted == addr as i64
+        prints("  mmap overlap test FAILED: hint mapped over a live mapping\n")
+        return false
+    if after_hint != held
+        prints("  mmap overlap test FAILED: refused hint changed the free count\n")
+        return false
+    if vmm_virt_to_phys(addr) != 0 or vmm_virt_to_phys(live) != live_phys
+        prints("  mmap overlap test FAILED: hint touched the live mapping\n")
+        return false
+
+    # MAP_FIXED over the live pages: replaces them, freeing the old ones.
+    let replaced: i64 = sys_mmap_impl(addr, length, prot, fixed)
+    let after_fixed: u64 = pmm_get_free_pages()
+    prints("  MAP_FIXED: free pages base=")
+    serial_print_dec(base)
+    prints(" after=")
+    serial_print_dec(after_fixed)
+    prints("\n")
+    if replaced != addr as i64
+        prints("  mmap overlap test FAILED: MAP_FIXED over a live mapping failed\n")
+        return false
+    if base - after_fixed != MMAP_OVERLAP_PAGES
+        prints("  mmap overlap test FAILED: MAP_FIXED leaked the pages it replaced\n")
+        return false
+
+    sys_munmap_impl(addr, length)
+    if pmm_get_free_pages() != base
+        prints("  mmap overlap test FAILED: munmap did not give every page back\n")
+        return false
+    prints("  mmap overlap test PASSED!\n")
     return true
 
 # ============================================================================
