@@ -15,7 +15,12 @@ The supported set:
     ritz1 rounds it at run time (decimal -> double -> float), so an f32 literal
     is refused when it has more digits than ritz1 can round exactly;
   - struct field: a nested struct literal, recursively (or `"..."` into a
-    StrView, as before).
+    StrView, as before);
+  - enum field: a unit variant, `E.V` or bare `V`, as its tag (a payload
+    enum's payload bytes zero); a payload variant is refused (LARB R75,
+    AGAST #3673);
+  - one-dimensional array field `[N]T`: an array literal of N elements, each
+    lowered as a `T` field is (AGAST #3673).  An element's path is `a[1]`.
 Everything else is an error at the field's value naming the const, element and
 field (a dotted path inside a nested literal), worded like #1569's.
 
@@ -226,6 +231,91 @@ pub fn main() -> i32
     return T[0].x + T[1].x
 """
 
+# R75 (AGAST #3673): a unit variant field is its tag, a payload enum's
+# payload bytes zero; `E.V` and a bare `V` alike.
+ENUM = """\
+enum Color
+    Red
+    Blue
+    Green
+
+enum Shape
+    Dot
+    Circle(i64)
+    Square
+
+struct P
+    x: i32
+    c: Color
+    s: Shape
+
+const T: [2]P = [P { x: 1, c: Color.Blue, s: Shape.Square }, P { x: 2, c: Green, s: Dot }]
+
+fn col(c: Color) -> i32
+    match c
+        Color.Red => 1
+        Color.Blue => 2
+        Color.Green => 3
+
+fn shp(s: Shape) -> i64
+    match s
+        Shape.Dot => 7
+        Shape.Circle(r) => r
+        Shape.Square => 9
+
+pub fn main() -> i32
+    if col(T[0].c) != 2 or col(T[1].c) != 3
+        return 10
+    if shp(T[0].s) != 9 or shp(T[1].s) != 7
+        return 11
+    return T[0].x + T[1].x
+"""
+
+# An array field: each element lowers as a field of its type does, here
+# integers, floats, strings into `*u8`, unit variants and struct literals.
+ARRAY = """\
+enum Color
+    Red
+    Blue
+
+enum Shape
+    Dot
+    Circle(i64)
+
+struct In
+    k: i32
+    f: f64
+
+struct P
+    a: [3]i32
+    f: [2]f64
+    s: [2]*u8
+    c: [2]Color
+    n: [2]In
+
+const K: i32 = 4
+
+const T: [1]P = [P { a: [1, -2, K * 2], f: [1.5, -3], s: ["hi", null], c: [Color.Blue, Red], n: [In { k: 5, f: 0.5 }, In { k: -6, f: 2 }] }]
+
+fn col(c: Color) -> i32
+    match c
+        Color.Red => 1
+        Color.Blue => 2
+
+pub fn main() -> i32
+    if T[0].a[0] != 1 or T[0].a[1] != -2 or T[0].a[2] != 8
+        return 10
+    if T[0].f[0] != 1.5 or T[0].f[1] != -3.0
+        return 11
+    if *(T[0].s[0] + 1) != 'i' or T[0].s[1] != null
+        return 12
+    if col(T[0].c[0]) != 2 or col(T[0].c[1]) != 1
+        return 13
+    if T[0].n[0].k != 5 or T[0].n[1].k != -6 or T[0].n[0].f != 0.5 or T[0].n[1].f != 2.0
+        return 14
+    return 3
+"""
+
 FORMS = {
     "repro": REPRO,
     "pointers": POINTERS,
@@ -235,6 +325,8 @@ FORMS = {
     "nested": NESTED,
     "int_into_f32_once": INT_INTO_F32_ONCE,
     "f32_precise": F32_PRECISE,
+    "enum": ENUM,
+    "array": ARRAY,
 }
 
 # ritz1 refuses these literals (see REFUSED's f32_too_many_* rows).
@@ -263,6 +355,10 @@ DECLS = """\
 enum Color
     Red
     Blue
+
+enum Shape
+    Dot
+    Circle(i64)
 
 struct In
     a: i32
@@ -310,11 +406,26 @@ REFUSED = {
     # A nested field is named by its dotted path.
     "nested_path": ("struct P\n    inn: In\n\nconst T: [1]P = [P { inn: In { a: ^mk() } }]\n",
                     "field 'inn.a' is not a constant integer expression"),
-    # Enum and array fields aren't lowered yet (AGAST #3673).
-    "enum": ("struct P\n    c: Color\n\nconst T: [1]P = [P { c: ^Color.Blue }]\n",
-             "field 'c' has a type ritz1 can't lower in a const (integer, bool, float, pointer and struct fields are)"),
-    "array": ("struct P\n    a: [2]i32\n\nconst T: [1]P = [P { a: ^[1, 2] }]\n",
-              "field 'a' has a type ritz1 can't lower in a const (integer, bool, float, pointer and struct fields are)"),
+    # R75: a unit variant only (AGAST #3673); a payload variant stays refused,
+    # constructed or named bare.
+    "enum_payload": ("struct P\n    s: Shape\n\nconst T: [1]P = [P { s: ^Shape.Circle(1) }]\n",
+                     "field 's' is a variant with a payload, which isn't a constant initialiser"),
+    "enum_payload_bare": ("struct P\n    s: Shape\n\nconst T: [1]P = [P { s: ^Shape.Circle }]\n",
+                          "field 's' is a variant with a payload, which isn't a constant initialiser"),
+    "enum_unit_called": ("struct P\n    s: Shape\n\nconst T: [1]P = [P { s: ^Shape.Dot(1) }]\n",
+                         "field 's' is a variant with a payload, which isn't a constant initialiser"),
+    "enum_not_variant": ("struct P\n    c: Color\n\nconst T: [1]P = [P { c: ^K }]\n",
+                         "field 'c' is not a unit variant of `Color`"),
+    # An array field takes an array literal of its length; an element is
+    # named by its index.
+    "array_len": ("struct P\n    a: [2]i32\n\nconst T: [1]P = [P { a: ^[1, 2, 3] }]\n",
+                  "field 'a' is not an array literal of 2 elements"),
+    "array_elem": ("struct P\n    a: [2]In\n\nconst T: [1]P = [P { a: [In { a: 1 }, In { a: ^mk() }] }]\n",
+                   "field 'a[1].a' is not a constant integer expression"),
+    # Multi-dimensional array fields aren't lowered (AGAST #4175).
+    "array_2d": ("struct P\n    a: [2][2]i32\n\nconst T: [1]P = [P { a: ^[ [1, 2], [3, 4] ] }]\n",
+                 "field 'a' has a type ritz1 can't lower in a const "
+                 "(integer, bool, float, pointer, enum, struct and one-dimensional array fields are)"),
 }
 
 # The element each row's bad field is in, when it isn't element 0.

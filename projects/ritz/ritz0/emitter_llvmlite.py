@@ -2848,6 +2848,8 @@ class LLVMEmitter:
           pointer         `null`, or `"..."` / `c"..."` into a `*u8` / `*i8`
           f64 / f32       a float or integer literal under any number of `-`
           struct          a nested struct literal, or `"..."` into a StrView
+          enum            a unit variant, `E.V` or `V` (LARB R75, AGAST #3673)
+          [N]T            an array literal of N elements, each a T field's value
         """
         def refuse(why: str):
             const_name, index, path = field_of
@@ -2877,9 +2879,26 @@ class LLVMEmitter:
             if not isinstance(expr, rast.StructLit):
                 refuse("is not a struct literal")
             return self._make_const_struct_value(expr, llvm_type, name_hint, field_of)
-        # An enum, an array, or anything else ritz1 has no constant form for.
+        if named is not None and self._names_enum(ritz_type):
+            def refuse_variant(why: str):
+                # _const_init_variant's "non-constant" is, for a field, not
+                # one of the enum's variants: ritz1's wording.
+                if why == _GLOBAL_NON_CONSTANT:
+                    why = f"is not a unit variant of `{named}`"
+                refuse(why)
+            return self._const_init_variant(expr, named, llvm_type, refuse_variant)
+        if isinstance(ritz_type, rast.ArrayType) and isinstance(ritz_type.size, int) \
+                and not isinstance(self._resolve_const_field_alias(ritz_type.inner), rast.ArrayType):
+            if not isinstance(expr, rast.ArrayLit) or len(expr.elements) != ritz_type.size:
+                refuse(f"is not an array literal of {ritz_type.size} elements")
+            const_name, index, path = field_of
+            return ir.Constant(llvm_type, [
+                self._const_struct_field(elem, ritz_type.inner, llvm_type.element,
+                                         f"{name_hint}.{i}", (const_name, index, f"{path}[{i}]"))
+                for i, elem in enumerate(expr.elements)])
+        # A multi-dimensional array, or anything else ritz1 has no constant form for.
         refuse("has a type ritz1 can't lower in a const "
-               "(integer, bool, float, pointer and struct fields are)")
+               "(integer, bool, float, pointer, enum, struct and one-dimensional array fields are)")
 
     def _resolve_const_field_alias(self, ty: rast.Type) -> rast.Type:
         """A field typed by a `type` alias lowers as its target."""
