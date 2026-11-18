@@ -27,7 +27,7 @@ import float_rules
 import ref_rules
 import ritz_ast as rast
 from tail_value import slot_tails
-from monomorph import mangle_generic_name, TypeSubstitution
+from monomorph import bind_type_params, mangle_generic_name, TypeSubstitution
 from ufcs import find_ufcs_function
 from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
 from typed import Typed
@@ -79,6 +79,9 @@ class FnSig:
     is_async: bool = False
     # Indexes of `name:& T` params: the slot is the caller's place, not a `T`.
     lent: Set[int] = field(default_factory=set)
+    # An impl method's impl type params (`impl<T> W<T>`): a call through a
+    # `W<i32>` receiver returns its type at T = i32.
+    owner_params: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -303,7 +306,8 @@ class TypeChecker:
             params=[(p.name, p.type) for p in method.params],
             ret_type=method.ret_type,
             type_params=method.type_params or [],
-            lent=self._lent_params(method)
+            lent=self._lent_params(method),
+            owner_params=list(impl.type_params or []),
         )
         # DerefMut's target is Deref's (rule 1, deref_rules.impl_errors), so
         # `deref` alone answers both a read and a write of `s.f`.
@@ -940,17 +944,23 @@ class TypeChecker:
             caller_params = self.current_type_params
             self.current_type_params = caller_params | captured
             try:
-                self._check_call_args(expr, fn_name, fn_sig)
+                arg_types = self._check_call_args(expr, fn_name, fn_sig)
             finally:
                 self.current_type_params = caller_params
 
             if fn_sig.is_async:
                 # The call makes a `<fn>_Future`; only `.await` gives ret_type.
                 return rast.NamedType(expr.span, 'unknown', [])
-            if captured and fn_sig.ret_type is not None:
-                return TypeSubstitution({tp: rast.NamedType(expr.span, 'unknown', [])
-                                         for tp in captured}).apply(fn_sig.ret_type)
-            return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
+            if fn_sig.ret_type is None:
+                return rast.NamedType(expr.span, 'void', [])
+            # A generic fn's return type at the call's type args (AGAST
+            # #3554): `vec_new<u64>()` is a Vec<u64>, and `id(3)` an i64.
+            mapping = self._call_type_args(expr, fn_sig, arg_types)
+            for tp in captured:
+                mapping.setdefault(tp, rast.NamedType(expr.span, 'unknown', []))
+            if mapping:
+                return TypeSubstitution(mapping).apply(fn_sig.ret_type)
+            return fn_sig.ret_type
 
         else:
             # Indirect call: type the callee for the table, since the emitter
@@ -961,8 +971,10 @@ class TypeChecker:
                 self._infer_type(arg)
             return rast.NamedType(expr.span, 'unknown', [])
 
-    def _check_call_args(self, expr: rast.Call, fn_name: str, fn_sig) -> None:
-        """The arity and each argument of a direct call to `fn_sig`."""
+    def _check_call_args(self, expr: rast.Call, fn_name: str, fn_sig) -> List[rast.Type]:
+        """The arity and each argument of a direct call to `fn_sig`; returns
+        the arguments' types (none on an arity error)."""
+        arg_types: List[rast.Type] = []
         if len(expr.args) != len(fn_sig.params):
             self._error(f"function '{fn_name}' expects {len(fn_sig.params)} arguments, "
                       f"got {len(expr.args)}", expr.span)
@@ -971,6 +983,7 @@ class TypeChecker:
             for i, (arg, (param_name, param_type)) in enumerate(zip(expr.args, fn_sig.params)):
                 if i in fn_sig.lent:
                     arg_type = self._check_lent_arg(arg, param_type)
+                    arg_types.append(arg_type)
                     if isinstance(self._resolve_alias(arg_type),
                                   (rast.PtrType, rast.RefType)):
                         continue
@@ -978,9 +991,30 @@ class TypeChecker:
                     self._arg_depth += 1
                     arg_type = self._infer_into(arg, param_type)
                     self._arg_depth -= 1
+                    arg_types.append(arg_type)
                 if not self._value_fits(arg, arg_type, param_type):
                     self._error(f"argument {i+1} ('{param_name}'): expected {self._type_str(param_type)}, "
                               f"got {self._type_str(arg_type)}", arg.span)
+        return arg_types
+
+    def _call_type_args(self, expr: rast.Call, fn_sig, arg_types) -> Dict[str, rast.Type]:
+        """The type args a call to generic `fn_sig` instantiates it at: its
+        written ones, else those its arguments bind (§4.4, as monomorph binds
+        them).  A param no argument binds, or two bind differently, is left
+        out: monomorph reports it."""
+        params = fn_sig.type_params
+        if not params:
+            return {}
+        if expr.type_args:
+            if len(expr.type_args) != len(params):
+                return {}
+            return dict(zip(params, expr.type_args))
+        if len(arg_types) != len(expr.args):
+            return {}
+        pairs = [(param_type, arg, None if self._is_unknown(ty) else self._plain(ty))
+                 for (_name, param_type), arg, ty in zip(fn_sig.params, expr.args, arg_types)]
+        bound, conflict = bind_type_params(params, pairs, self._resolve_alias)
+        return {tp: ty for tp, ty in bound.items() if tp not in conflict}
 
     def _check_lent_arg(self, arg: rast.Expr, param_type: rast.Type) -> rast.Type:
         """`arg` into a `name:& T` slot, of a direct call or one through a fn
@@ -1036,7 +1070,8 @@ class TypeChecker:
             self._check_value_args(expr, receiver)
             if self._is_strview_as_bytes(receiver, expr):
                 return self._span_of_u8(expr.span)
-            return rast.NamedType(expr.span, 'unknown', [])
+            return (self._builtin_generic_method_ret(receiver, expr.method)
+                    or rast.NamedType(expr.span, 'unknown', []))
         type_name = self._get_type_name(receiver)
 
         # Look up method - try several name patterns
@@ -1143,7 +1178,58 @@ class TypeChecker:
         if not own_method:
             self._check_value_args(expr, receiver)
 
-        return fn_sig.ret_type or rast.NamedType(expr.span, 'void', [])
+        if fn_sig.ret_type is None:
+            return rast.NamedType(expr.span, 'void', [])
+        return self._method_ret(fn_sig, receiver, own_method)
+
+    # The free fns a built-in generic type's methods are (`v.slice(..)` on a
+    # Vec<T> is vec_slice<T>), by the type's name.
+    UFCS_GENERIC_PREFIXES = {'Vec': 'vec_', 'Span': 'span_', 'Option': 'option_',
+                             'Result': 'result_', 'Box': 'box_'}
+    # `o.is_some()` and kin: bool, lowered by the emitter itself.
+    BUILTIN_PREDICATES = {'Option': ('is_some', 'is_none'), 'Result': ('is_ok', 'is_err')}
+
+    def _method_ret(self, fn_sig, receiver: rast.Type, own_method: bool) -> rast.Type:
+        """`fn_sig`'s return type for a method call on `receiver` (AGAST
+        #3554): `Self` is the receiver, and a generic receiver's type args
+        substitute the impl's type params (an impl method) or the free fn's
+        (a built-in generic's UFCS fn, positionally)."""
+        ret = fn_sig.ret_type
+        if isinstance(ret, rast.NamedType) and ret.name == 'Self' and not ret.args:
+            return receiver
+        if not isinstance(receiver, rast.NamedType):
+            return ret
+        if own_method:
+            params = [] if fn_sig.type_params else fn_sig.owner_params
+        elif receiver.name in self.UFCS_GENERIC_PREFIXES and receiver.args:
+            params = fn_sig.type_params
+        else:
+            params = []
+        if params and len(params) == len(receiver.args):
+            return TypeSubstitution(dict(zip(params, receiver.args))).apply(ret)
+        return ret
+
+    def _builtin_generic_method_ret(self, receiver: rast.Type,
+                                    method: str) -> Optional[rast.Type]:
+        """`r.m()`'s type on an Option, Result or Span instance: its impl's
+        method, else its UFCS fn (`option_unwrap<T>`), else for `unwrap` and
+        kin the payload; None when none says."""
+        if not (isinstance(receiver, rast.NamedType) and receiver.args
+                and receiver.name in BUILTIN_GENERICS):
+            return None
+        if method in self.BUILTIN_PREDICATES.get(receiver.name, ()):
+            # The emitter's own predicates, ahead of ritzlib's i32 fns.
+            return rast.NamedType(receiver.span, 'bool', [])
+        sig = self.functions.get(f"{receiver.name}_{method}")
+        own = sig is not None
+        if sig is None:
+            sig = self.functions.get(self.UFCS_GENERIC_PREFIXES[receiver.name] + method)
+        if sig is not None and sig.ret_type is not None:
+            return self._method_ret(sig, receiver, own)
+        if method in ('unwrap', 'expect', 'unwrap_or', 'unwrap_or_default') \
+                and receiver.name in ('Result', 'Option'):
+            return receiver.args[0]
+        return None
 
     def _is_user_type_without(self, receiver: rast.Type, type_name: str, method: str) -> bool:
         """Is `receiver` a non-generic struct or enum the emitter would find
@@ -1293,7 +1379,8 @@ class TypeChecker:
         inner_type = self._strip_indirection(base_type)
         if self._is_opaque(inner_type) or (
                 isinstance(inner_type, rast.NamedType)
-                and inner_type.name in BUILTIN_GENERICS):
+                and inner_type.name in BUILTIN_GENERICS
+                and inner_type.name not in self.structs):
             return rast.NamedType(expr.span, 'unknown', [])
 
         # `Errno.Fault`: a variant named through its enum
@@ -1335,9 +1422,13 @@ class TypeChecker:
             self._error(f"type {inner_type.name} has no fields", expr.span)
             return rast.NamedType(expr.span, 'unknown', [])
 
-        # Find field
+        # Find field: a generic struct's at the receiver's type args (#3554).
         for field_name, field_type in struct_info.fields:
             if field_name == expr.field:
+                if struct_info.type_params and \
+                        len(inner_type.args) == len(struct_info.type_params):
+                    return TypeSubstitution(dict(zip(
+                        struct_info.type_params, inner_type.args))).apply(field_type)
                 return field_type
 
         # Not S's own: through `Deref`, its target's (§7.7). The emitter words
@@ -1446,8 +1537,12 @@ class TypeChecker:
         base_type = self._infer_type(expr.expr)
         index_type = self._infer_type(expr.index)
 
-        # `p[1..3]` is a slice of it, not an element.
+        # `p[1..3]` is a slice of it, not an element: of a Vec<T>, through
+        # any pointers, a Vec<T> (vec_slice<T>, AGAST #2451).
         if isinstance(expr.index, rast.Range):
+            vec = self._strip_indirection(base_type)
+            if isinstance(vec, rast.NamedType) and vec.name == 'Vec' and vec.args:
+                return vec
             return rast.NamedType(expr.span, 'unknown', [])
 
         # Index must be integer
@@ -1466,6 +1561,11 @@ class TypeChecker:
             # String etc - allow indexing. In full implementation, would look
             # up Index trait
             named = self._resolve_alias(base_type)
+            if isinstance(named, rast.NamedType):
+                if named.name in ('Vec', 'Span') and len(named.args) == 1:
+                    return named.args[0]
+                if named.name == 'String' and not named.args:
+                    return rast.NamedType(named.span, 'u8', [])
             held = self._mangled_buffer_element(named.name) if isinstance(named, rast.NamedType) else None
             if held is not None:
                 return held
@@ -1550,8 +1650,9 @@ class TypeChecker:
             struct_info = self._builtin_span_struct(expr)
         if struct_info is None:
             self._error(f"undefined struct: {expr.name}", expr.span)
-            # Its values are typed all the same (typed.py's readers).
-            for _name, value in expr.fields:
+            # Its values are typed still: a built-in (`Span`) is a struct
+            # monomorph knows, and binds its args from them (AGAST #3554).
+            for _, value in expr.fields:
                 self._infer_type(value)
             return rast.NamedType(expr.span, expr.name, [])
 
@@ -1563,14 +1664,26 @@ class TypeChecker:
             if field_name not in expected_fields:
                 self._error(f"struct '{expr.name}' has no field '{field_name}'", expr.span)
 
+        pairs = []
         for name, value in expr.fields:
             if name in expected_fields:
                 value_type = self._infer_into(value, expected_fields[name])
+                pairs.append((expected_fields[name], value,
+                              None if self._is_unknown(value_type) else self._plain(value_type)))
                 if not self._value_fits(value, value_type, expected_fields[name]):
                     self._error(f"field '{name}': expected {self._type_str(expected_fields[name])}, "
                               f"got {self._type_str(value_type)}", value.span)
 
-        return rast.NamedType(expr.span, expr.name, list(expr.type_args) if expr.type_args else [])
+        if expr.type_args:
+            return rast.NamedType(expr.span, expr.name, list(expr.type_args))
+        # An args-less generic literal is the instance its fields bind (§9.2
+        # rule 2, as monomorph infers it; AGAST #3554); unbound, it's left bare
+        # for monomorph to report.
+        params = struct_info.type_params or []
+        bound, conflict = bind_type_params(params, pairs, self._resolve_alias)
+        if params and all(tp in bound and tp not in conflict for tp in params):
+            return rast.NamedType(expr.span, expr.name, [bound[tp] for tp in params])
+        return rast.NamedType(expr.span, expr.name, [])
 
     @staticmethod
     def _builtin_span_struct(expr: rast.StructLit) -> Optional[StructInfo]:
@@ -1656,11 +1769,21 @@ class TypeChecker:
             if enum_name:
                 enum_info = self.enums.get(enum_name)
                 if enum_info:
+                    # A generic enum's payload at the scrutinee's type args:
+                    # `Some(x)` of an Option<Vec<i32>> binds a Vec<i32>, not
+                    # a `T` (AGAST #3554).
+                    scrut = self._strip_indirection(expected_type)
+                    subst = None
+                    if (enum_info.type_params and isinstance(scrut, rast.NamedType)
+                            and scrut.name == enum_name
+                            and len(scrut.args) == len(enum_info.type_params)):
+                        subst = TypeSubstitution(dict(zip(enum_info.type_params, scrut.args)))
                     for variant in enum_info.variants:
                         if variant.name == pattern.name:
                             # Bind sub-patterns to variant field types
                             for sub_pat, field_type in zip(pattern.fields, variant.fields):
-                                self._check_pattern(sub_pat, field_type)
+                                self._check_pattern(
+                                    sub_pat, subst.apply(field_type) if subst else field_type)
                             break
                     return
             # An emitter-instantiated variant (`Err(e)`): payload type untracked
@@ -2459,10 +2582,12 @@ class TypeChecker:
     def _type_receiver_name(self, expr: rast.Expr) -> Optional[str]:
         """The struct or enum a bare receiver identifier names, if any.
 
-        A local shadows the type; a type shadows another enum's same-named
-        variant (AGAST #3618), which a receiver reaches as `Mode.Color`.
+        A local shadows the type, a global doesn't (`var String: i32` beside
+        `String.from(..)`, as the emitter has it); a type shadows another
+        enum's same-named variant (AGAST #3618), which a receiver reaches as
+        `Mode.Color`.
         """
-        if not isinstance(expr, rast.Ident) or self._lookup_var(expr.name) is not None:
+        if not isinstance(expr, rast.Ident) or expr.name in self.locals:
             return None
         if expr.name in self.structs or expr.name in self.enums:
             return expr.name
@@ -2498,6 +2623,18 @@ class TypeChecker:
         return (len(ty.name) == 1 and ty.name.isupper()
                 and ty.name not in self.structs and ty.name not in self.enums
                 and ty.name not in self.type_aliases)
+
+    @staticmethod
+    def _plain(ty: rast.Type) -> rast.Type:
+        """`ty` as a type an instance is made at: a float literal's f64 is
+        just f64 there."""
+        if isinstance(ty, FloatLitType):
+            return rast.NamedType(ty.span, ty.name, list(ty.args))
+        return ty
+
+    @staticmethod
+    def _is_unknown(ty: Optional[rast.Type]) -> bool:
+        return ty is None or (isinstance(ty, rast.NamedType) and ty.name == 'unknown')
 
     def _is_opaque(self, ty: rast.Type) -> bool:
         """A type that can't be judged: `unknown` was either reported where it
@@ -2555,6 +2692,8 @@ class TypeChecker:
             return True
         if value is None:
             return False
+        if self._is_vec_range_view(value, actual, expected):
+            return True
         tails = list(slot_tails(expected, value))
         if not any(self._is_slot_typed_literal(tail) for tail, _ in tails):
             return False
@@ -2574,6 +2713,21 @@ class TypeChecker:
                     mangle_generic_name('Span', [self._resolve_alias(ty.args[0])])
                     == 'Span$u8')
         return ty.name == 'Span$u8'
+
+    def _is_vec_range_view(self, value: rast.Expr, actual: rast.Type,
+                           expected: rast.Type) -> bool:
+        """`v[lo..hi]` of a Vec<T> is a Vec<T> (vec_slice<T>), except in a
+        Span<T> slot, where it is a view of v (AGAST #2451)."""
+        while isinstance(value, rast.Grouped):
+            value = value.expr
+        if not (isinstance(value, rast.Index) and isinstance(value.index, rast.Range)):
+            return False
+        actual = self._resolve_alias(actual)
+        expected = self._resolve_alias(expected)
+        return (isinstance(actual, rast.NamedType) and actual.name == 'Vec'
+                and isinstance(expected, rast.NamedType) and expected.name == 'Span'
+                and len(actual.args) == 1 and len(expected.args) == 1
+                and self._types_compatible(actual.args[0], expected.args[0]))
 
     @staticmethod
     def _is_slot_typed_literal(tail: rast.Expr) -> bool:
