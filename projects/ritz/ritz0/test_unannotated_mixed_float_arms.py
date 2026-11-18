@@ -116,6 +116,32 @@ fn main() -> i32
     return f(0)
 """
 
+# AGAST #3421: the same tail as a multi-line (statement) `if`.
+STMT_FN_TAIL = """\
+fn f(c: i32) -> i64
+    if c > 0
+        0
+    else
+        1.5
+
+fn main() -> i32
+    return f(0) as i32
+"""
+
+# ... and an arm that is itself a statement `if`, with integer arms.
+STMT_ELSE_IF_TAIL = """\
+fn f(c: i32) -> i64
+    if c > 1
+        1.5
+    else if c > 0
+        1
+    else
+        2
+
+fn main() -> i32
+    return f(0) as i32
+"""
+
 REFUSED = [
     # (program, line of the offending if / match)
     pytest.param(IF_INT_THEN_FLOAT, 2, id="if-int-then-float"),
@@ -123,6 +149,8 @@ REFUSED = [
     pytest.param(ELSE_IF_CHAIN, 2, id="else-if-chain"),
     pytest.param(IF_AS_OPERAND, 5, id="if-as-argument"),
     pytest.param(FN_TAIL, 2, id="fn-tail"),
+    pytest.param(STMT_FN_TAIL, 2, id="stmt-fn-tail"),
+    pytest.param(STMT_ELSE_IF_TAIL, 2, id="stmt-else-if-tail"),
     pytest.param(ENUM_MATCH, 4, id="enum-match"),
     pytest.param(INTEGER_MATCH, 2, id="integer-match"),
 ]
@@ -339,6 +367,8 @@ RITZ1_REFUSED = [
     pytest.param(IF_INT_THEN_FLOAT, id="if-int-then-float"),
     pytest.param(IF_FLOAT_THEN_INT, id="if-float-then-int"),
     pytest.param(INTEGER_MATCH, id="integer-match"),
+    pytest.param(STMT_FN_TAIL, id="stmt-fn-tail"),
+    pytest.param(STMT_ELSE_IF_TAIL, id="stmt-else-if-tail"),
 ]
 
 # Each slot, integer arm on both sides, literal and exact non-literal arms.
@@ -431,10 +461,77 @@ fn main() -> i32
     return 42
 """
 
+# AGAST #3421, #4005: the tail of a `-> f64` / `-> f32` fn as a multi-line
+# (statement) `if`: its phi was `i64` over doubles in ritz1.  Float arms;
+# #4005's f32 literal + f32 arm; an integer arm on each side (a parameter
+# and a literal); an else-if chain; an arm with a `let`; a `return` arm;
+# a method.
+STMT_IF_SLOT = """\
+struct P
+    x: f64
+
+impl P
+    fn pick(self: @P, c: i32) -> f64
+        if c > 0
+            self.x
+        else
+            3
+
+fn ml(c: i32) -> f64
+    if c > 0
+        1.5
+    else
+        2.5
+
+fn rate(h: u64, t: u64) -> f32
+    if t == 0
+        0.0
+    else
+        h as f32 / t as f32
+
+fn ki(c: i32, k: i32) -> f64
+    if c > 0
+        k
+    else
+        2.5
+
+fn fk(c: i32) -> f32
+    if c > 0
+        0.5
+    else
+        7
+
+fn chain(c: i32) -> f64
+    if c > 1
+        let d = 0.25
+        d * 2.0
+    else if c > 0
+        1
+    else
+        return 4.5
+
+fn main() -> i32
+    if ml(1) != 1.5 or ml(0) != 2.5
+        return 1
+    if rate(1, 2) != 0.5 or rate(1, 0) != 0.0
+        return 2
+    if ki(1, -3) != -3.0 or ki(0, 3) != 2.5
+        return 3
+    if fk(1) != 0.5 or fk(0) != 7.0
+        return 4
+    if chain(2) != 0.5 or chain(1) != 1.0 or chain(0) != 4.5
+        return 5
+    let p = P { x: 0.5 }
+    if p.pick(1) != 0.5 or p.pick(0) != 3.0
+        return 6
+    return 42
+"""
+
 SLOTS = [
     pytest.param(RETURN_SLOT, id="return-slot"),
     pytest.param(TAIL_SLOT, id="tail-slot"),
     pytest.param(PARAM_SLOT, id="param-slot"),
+    pytest.param(STMT_IF_SLOT, id="stmt-if-slot"),
 ]
 
 # R43a: an arm whose type is not exact in the slot is refused as lossy, in
@@ -474,6 +571,18 @@ fn main() -> i32
     return f(0, 3) as i32
 """
 
+# AGAST #3421: a statement `if` tail, the i64 arm second.
+STMT_IF_I64_ARM = """\
+fn f(c: i32, n: i64) -> f64
+    if c > 0
+        2.5
+    else
+        n
+
+fn main() -> i32
+    return f(0, 3) as i32
+"""
+
 LOSSY_ARMS = [
     pytest.param(RETURN_NON_LITERAL, "i64", "f64", id="return-non-literal"),
     pytest.param(PARAM_NON_LITERAL, "i64", "f64", id="param-non-literal"),
@@ -481,6 +590,7 @@ LOSSY_ARMS = [
     pytest.param(TAIL_I64_ARM_FIRST, "i64", "f64", id="tail-i64-arm-first"),
     pytest.param(PARAM_U64_ARM, "u64", "f64", id="param-u64-arm"),
     pytest.param(F32_I32_ARM, "i32", "f32", id="f32-i32-arm"),
+    pytest.param(STMT_IF_I64_ARM, "i64", "f64", id="stmt-if-i64-arm"),
 ]
 
 
@@ -508,8 +618,10 @@ def test_ritz0_float_slot_refuses_lossy_int_arm(run_ritz0, tmp_path, program, sr
 
 
 # ritz1 runs #3384's literal-arm rows too: each slot path again, plus the
-# fn-pointer and expression callees.
-ACCEPTED_SLOTS = SLOTS + [p for p in ACCEPTED if p.id.endswith("-hint")]
+# fn-pointer and expression callees.  And (#3421) the procedure tail, whose
+# `if` phi was `i64` over an i64 and a double.
+ACCEPTED_SLOTS = SLOTS + [p for p in ACCEPTED if p.id.endswith("-hint")] + [
+    p for p in ACCEPTED if p.id == "procedure-tail"]
 
 
 def _ritz1(request, compiler, tmp_path, program):

@@ -5852,7 +5852,10 @@ fn if_stmt_arm_ptr_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8) -> 
 #
 # AGAST #3749: an arm of a discarded `if` (`discarded` == 1) has no value
 # either, so an `if` ending it is discarded too.
-fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32, discarded: i32)
+#
+# AGAST #3421: the `if`'s float slot (`float_hint`, 0 if none) reaches an
+# `if` / `match` ending the arm, as a match arm's does (#2092).
+fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32, discarded: i32, float_hint: i32)
     let saved: *Stmt = s.if_arm_value
     var st: *Stmt = list
     while st != null
@@ -5860,12 +5863,40 @@ fn emit_if_stmt_arm(s: *EmitterState, list: *Stmt, ret_type: i32, discarded: i32
             s.if_arm_value = st
         if st.next == null and discarded == 1
             s.if_stmt_discarded = st
+        if st.next == null and discarded == 0 and stmt_is_if_or_match(st) == 1
+            s.match_float_hint = float_hint
         emit_stmt(s, st, ret_type)
         s.if_arm_value = saved
         if st.kind == STMT_RETURN
             begin_block(s, next_label(s))
             clear_last_expr(s)
         st = st.next
+
+# 1 if `st` is an `if` / `match`, as a statement or an expression statement.
+fn stmt_is_if_or_match(st: *Stmt) -> i32
+    if st.kind == STMT_IF or st.kind == STMT_MATCH
+        return 1
+    if st.kind == STMT_EXPR and st.expr != null and (st.expr.kind == EXPR_IF or st.expr.kind == EXPR_MATCH)
+        return 1
+    0
+
+# AGAST #3421: settle a statement-`if` arm's scalar value `reg` against the
+# merge's float type `fr` in the arm's own block, before its `br`, as a match
+# arm's is (LARB R43, §7.5: an integer arm converts in a float slot and is
+# refused next to a float arm without one).  The arm's value is its last
+# statement: an expression, or a nested `if` / `match` statement, whose phi
+# type it published (last_match_float_ty).  Its phi was `i64` over doubles.
+fn if_stmt_arm_float_settle(s: *EmitterState, list: *Stmt, reg: i32, agg: *u8, fr: *MatchResult) -> i32
+    if reg <= 0 or agg != null
+        return reg
+    var last: *Stmt = list
+    while last.next != null
+        last = last.next
+    if last.kind == STMT_EXPR and last.expr != null
+        return match_arm_float_settle(s, last.expr, reg, fr)
+    if last.kind == STMT_IF or last.kind == STMT_MATCH
+        return float_arm_settle(s, s.last_match_float_ty, null, reg, fr)
+    reg
 
 # AGAST #3749: a body with no value (a loop's, an `unsafe` block's), whose
 # last statement, if an `if`, is discarded: its arms get no phi.  That phi
@@ -5901,11 +5932,13 @@ fn if_stmt_arm_incoming(result: i32, list: *Stmt) -> i32
         return IF_ARM_DIVERGES
     0
 
-fn emit_if_phi_incoming(s: *EmitterState, reg: i32, agg: *u8)
+fn emit_if_phi_incoming(s: *EmitterState, reg: i32, agg: *u8, float_ty: i32)
     if reg != IF_ARM_DIVERGES
         emit_reg(s, reg)
     else if agg != null
         emit_str(s, c"zeroinitializer")
+    else if float_ty != 0
+        emit_str(s, c"0.0")   # AGAST #3421
     else
         emit_str(s, c"0")
 
@@ -6054,6 +6087,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         emit_assert_stmt(s, stmt)
     else if stmt.kind == STMT_IF
         let discarded: i32 = if_stmt_is_discarded(s, stmt)   # AGAST #3749
+        # AGAST #3421: the float slot the value lands in (a `-> f64` fn's
+        # tail), taken before the condition so a match there can't see it.
+        # The arms settle against it (if_stmt_arm_float_settle).
+        var fr: MatchResult
+        match_result_init(@fr, 1)
+        fr.float_ty = take_match_float_hint(s)
+        fr.hint_ty = fr.float_ty
         let cond: i32 = emit_expr(s, stmt.if_cond)
         # If the condition register is already an i1, use it directly in the
         # br — otherwise coerce i64 -> i1 via `icmp ne ..., 0`.  Without the
@@ -6104,7 +6144,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # merges the arms' moved bindings (own_if_merge).
         let own_before: *i32 = own_snapshot(s)
         own_push_scope(s)
-        emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded)
+        emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded, fr.hint_ty)
         # AGAST #2559: the arm value's struct type, while its bindings resolve.
         var then_agg: *u8 = null
         var then_agg_len: i32 = 0
@@ -6124,6 +6164,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         if stmt.if_else != null
             then_result = if_stmt_arm_settle(s, then_result, then_agg, then_agg_len, then_phi, then_phi_len)
             then_result = if_stmt_arm_ptr_settle(s, stmt.if_then, then_result, then_agg)
+            if discarded == 0
+                then_result = if_stmt_arm_float_settle(s, stmt.if_then, then_result, then_phi, @fr)
         let then_exit_label: i32 = s.current_label  # Capture actual exit block
         emit_str(s, c"  br label %")
         emit_label(s, end_label)
@@ -6138,7 +6180,7 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             clear_last_expr(s)  # Reset before else branch
             own_restore(s, own_before)
             own_push_scope(s)
-            emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded)
+            emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded, fr.hint_ty)
             if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
             own_else_dead = own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
@@ -6151,6 +6193,8 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 else_phi_len = then_phi_len
             else_result = if_stmt_arm_settle(s, else_result, else_agg, else_agg_len, else_phi, else_phi_len)
             else_result = if_stmt_arm_ptr_settle(s, stmt.if_else, else_result, else_agg)
+            if discarded == 0
+                else_result = if_stmt_arm_float_settle(s, stmt.if_else, else_result, else_phi, @fr)
             else_agg = else_phi
             else_agg_len = else_phi_len
             else_exit_label = s.current_label  # Capture actual exit block
@@ -6200,21 +6244,29 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"  ")
             emit_reg(s, phi_reg)
             emit_str(s, c" = phi ")
+            # AGAST #3421: a scalar phi is the arms' float when they have one.
+            var phi_float: i32 = 0
+            if phi_agg == null
+                phi_float = fr.float_ty
             if phi_agg != null
                 emit_llvm_type_struct(s, TYPE_STRUCT, phi_agg, phi_agg_len)
+            else if phi_float != 0
+                emit_str(s, float_llvm_name(phi_float))
             else
                 emit_str(s, c"i64")
             emit_str(s, c" [ ")
-            emit_if_phi_incoming(s, then_result, phi_agg)
+            emit_if_phi_incoming(s, then_result, phi_agg, phi_float)
             emit_str(s, c", %")
             emit_label(s, then_exit_label)
             emit_str(s, c" ], [ ")
-            emit_if_phi_incoming(s, else_result, phi_agg)
+            emit_if_phi_incoming(s, else_result, phi_agg, phi_float)
             emit_str(s, c", %")
             emit_label(s, else_exit_label)
             emit_str(s, c" ]\n")
             set_last_expr(s, phi_reg)
-            if phi_agg == null
+            # Published for an enclosing `if` / `match` this one ends.
+            s.last_match_float_ty = phi_float
+            if phi_agg == null and phi_float == 0
                 set_last_expr_phi(s, phi_reg, 0)   # AGAST #2950: an i64
         else
             # ritz-task-1309 — no phi, so this `if` contributes no value that
