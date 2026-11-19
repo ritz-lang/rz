@@ -14,6 +14,8 @@ the module's, not a fixture's guess.
 
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -32,7 +34,8 @@ pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092
 TREE = {
     "projects/ritz/ritz0/test_reads.py": (
         'NAMED = PROJECTS / "named"\n'
-        'SPEC = RITZ_ROOT / "docs" / "LANGUAGE_SPEC.md"\n'),
+        'SPEC = RITZ_ROOT / "docs" / "LANGUAGE_SPEC.md"\n'
+        'KC = REPO / "docs" / "KERNEL_CONTRACT.md"\n'),
     "projects/ritz/ritz0/parser.py": "x = 1\n",
     "projects/ritz/ritz1/src/main.ritz": "fn main() -> i32\n    0\n",
     "projects/ritz/ritzlib/io.ritz": "fn f() -> i32\n    0\n",
@@ -60,6 +63,7 @@ TREE = {
     ".claude/skills/x/SKILL.md": "# skill\n",
     ".claude/skills/x/run.sh": "echo hi\n",
     "docs/guide.md": "# guide\n",
+    "docs/KERNEL_CONTRACT.md": "# contract\n",
     "PROJECTS.md": "# projects\n",
     "rz": "#!/bin/sh\n",
     "rz.toml": '[workspace]\nmembers = ["projects/*"]\n',
@@ -111,8 +115,6 @@ def decide(r: Path, base: str | None):
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("edits", [
-    pytest.param([("projects/ritz/docs/ROADMAP.md", "# new\n")], id="ritz-docs-md"),
-    pytest.param([("projects/ritz/docs/NEW.md", "# new\n")], id="new-ritz-doc"),
     pytest.param([("docs/guide.md", "# new\n")], id="root-docs-md"),
     pytest.param([("PROJECTS.md", "# new\n")], id="root-md"),
     pytest.param([(".claude/skills/x/run.sh", "echo bye\n")], id="claude"),
@@ -120,7 +122,7 @@ def decide(r: Path, base: str | None):
     pytest.param([("projects/lonely/src/main.ritz", "fn main() -> i32\n    1\n")],
                  id="unnamed-package-source"),
     pytest.param([("projects/lonely/docs/notes.md", None)], id="unnamed-package-doc-deleted"),
-    pytest.param([("projects/ritz/docs/ROADMAP.md", "# a\n"), ("docs/guide.md", "# b\n"),
+    pytest.param([("PROJECTS.md", "# a\n"), ("docs/guide.md", "# b\n"),
                   (".claude/skills/x/SKILL.md", "# c\n")], id="mixed-safe"),
 ])
 def test_a_change_outside_every_input_skips(repo, edits):
@@ -132,7 +134,7 @@ def test_a_change_outside_every_input_skips(repo, edits):
 
 def test_the_skip_line_names_the_inputs_and_the_base(repo):
     r, base = repo
-    change(r, ("projects/ritz/docs/ROADMAP.md", "# new\n"))
+    change(r, ("docs/guide.md", "# new\n"))
     d = decide(r, base)
     assert d.skip
     head = d.lines[0]
@@ -142,7 +144,7 @@ def test_the_skip_line_names_the_inputs_and_the_base(repo):
     for needle in ("projects/ritz/", ".github/", "ritz.toml", "projects/{deep,dep,named}/"):
         assert needle in head, head
     # And every changed path is listed with why it can't reach the step.
-    assert any("projects/ritz/docs/ROADMAP.md" in ln for ln in d.lines[1:]), d.lines
+    assert any("docs/guide.md" in ln for ln in d.lines[1:]), d.lines
 
 
 # --------------------------------------------------------------------------
@@ -168,7 +170,12 @@ def test_a_change_to_an_input_runs(repo, path):
 
 
 @pytest.mark.parametrize("path, why", [
-    ("projects/ritz/docs/LANGUAGE_SPEC.md", "a .md a ritz source names by basename"),
+    ("docs/KERNEL_CONTRACT.md", "a .md a ritz source names by basename"),
+    # AGAST #4206: test_ritz1_bin_staleness copies projects/ritz whole, and
+    # test_fn_cache_ritz0_identity copies ritz0/: read_guard saw them open
+    # every .md there.
+    ("projects/ritz/docs/ROADMAP.md", "ritz0 tests copy the projects/ritz tree"),
+    ("projects/ritz/docs/NEW.md", "even a new one: copied too"),
     ("projects/named/src/main.ritz", "a package a ritz0 test names by path"),
     ("projects/dep/src/lib.ritz", "a package a named package depends on"),
     ("projects/deep/src/lib.ritz", "a dependency of a dependency"),
@@ -227,6 +234,28 @@ def test_a_wildcard_markdown_read_makes_every_md_an_input(repo):
     head = git(r, "rev-parse", "HEAD")
     change(r, ("docs/guide.md", "# x\n"))
     assert not decide(r, head).skip
+
+
+@pytest.mark.parametrize("text", [
+    pytest.param('"""Every .md is an input once a source reads *.md by pattern."""\nx = 1\n',
+                 id="docstring"),
+    pytest.param("x = 1  # D.glob('*.md') would make every doc an input\n", id="comment"),
+])
+def test_a_markdown_wildcard_in_prose_is_no_read(repo, text):
+    """AGAST #4206: ritz0/read_guard.py's docstring says "*.md", and the raw
+    scan made every .md an input of the ritz0 step: no docs-only change
+    skipped it."""
+    r, _ = repo
+    change(r, ("projects/ritz/ritz0/prose.py", text))
+    head = git(r, "rev-parse", "HEAD")
+    change(r, ("docs/guide.md", "# x\n"))
+    assert decide(r, head).skip
+
+
+def test_the_real_tree_reads_no_markdown_by_pattern():
+    repo = Path(__file__).resolve().parents[3]
+    for step in ritz0_scope.STEPS:
+        assert not ritz0_scope.scope(repo, step=step).md_wild, step.name
 
 
 # --------------------------------------------------------------------------
@@ -360,3 +389,385 @@ MEASURED_READ = ("cryptosec", "harland", "indium", "iris", "larb", "prism",
 # packages), tempest/tome/http/squeeze (a whole string literal "tempest" may
 # be a path, as ("spire", ...) is in test_corpus_import_modules_resolve).
 NEVER_READ = frozenset({"nexus", "ritz-lsp", "rzrz", "rzsh", "valet"})
+
+
+# ==========================================================================
+# Per-step read sets (AGAST #4206).  "Differential corpus regression" and
+# "Regression harness self-tests" read a narrow, measured part of
+# projects/ritz (strace -f over a full run).  A change under projects/ritz
+# outside a step's read set skips that step; everything outside projects/ritz
+# is judged as for the ritz0 step (unknown runs, A/D in a package runs, every
+# manifest is an input), with names found in the step's own sources.
+# ==========================================================================
+
+# A step that reads scripts/ and examples/ and the Makefile, and lists tools/
+# and projects/ritz/ (Python's import finder does; so does a glob).
+NARROW = ritz0_scope.Step(
+    "narrow step",
+    reads=("projects/ritz/scripts/", "projects/ritz/examples/", "projects/ritz/Makefile"),
+    lists=("projects/ritz", "projects/ritz/tools"),
+    label="narrow-step")
+
+NARROW_TREE = {
+    "projects/ritz/scripts/regression.sh": 'EX="$ROOT_DIR/examples"\n',
+    "projects/ritz/examples/hello/src/main.ritz": "fn main() -> i32\n    0\n",
+    "projects/ritz/examples/hello/README.md": "# hello\n",
+    "projects/ritz/Makefile": "all:\n",
+}
+
+
+@pytest.fixture
+def narrow(repo):
+    r, _ = repo
+    change(r, *NARROW_TREE.items())
+    return r, git(r, "rev-parse", "HEAD")
+
+
+def decide_narrow(r: Path, base: str):
+    return ritz0_scope.decide(r, base, NARROW)
+
+
+@pytest.mark.parametrize("status, path", [
+    ("M", "projects/ritz/ritz0/parser.py"),
+    ("M", "projects/ritz/ritz1/src/main.ritz"),
+    ("A", "projects/ritz/ritz0/new_test.py"),          # ritz0/ is not listed
+    ("D", "projects/ritz/runtime/start.ll"),
+    ("M", "projects/ritz/tools/check_test_budget.py"),  # modified, in a listed dir
+    ("M", "projects/ritz/build.py"),
+    ("M", "projects/ritz/docs/ROADMAP.md"),
+    ("M", "docs/guide.md"),
+    ("M", ".claude/skills/x/run.sh"),
+    ("M", "projects/lonely/src/main.ritz"),
+])
+def test_a_narrow_step_skips_a_change_outside_its_read_set(narrow, status, path):
+    r, base = narrow
+    change(r, (path, None if status == "D" else "changed\n"))
+    d = decide_narrow(r, base)
+    assert d.skip, d.lines
+    assert d.lines[0].startswith("SKIPPED narrow step: "), d.lines
+
+
+def test_the_ritz0_step_still_runs_where_a_narrow_step_skips(narrow):
+    r, base = narrow
+    change(r, ("projects/ritz/ritz0/parser.py", "y = 2\n"))
+    assert decide_narrow(r, base).skip
+    assert not ritz0_scope.decide(r, base).skip
+
+
+@pytest.mark.parametrize("status, path, why", [
+    ("M", "projects/ritz/scripts/regression.sh", "a file it reads"),
+    ("A", "projects/ritz/scripts/test-regression-new.sh", "under a directory it reads"),
+    ("M", "projects/ritz/examples/hello/src/main.ritz", "the corpus"),
+    ("M", "projects/ritz/examples/hello/README.md", "even Markdown inside its read set"),
+    ("D", "projects/ritz/examples/hello/README.md", "a deletion in its read set"),
+    ("M", "projects/ritz/Makefile", "a single file it reads"),
+    ("A", "projects/ritz/tools/tomllib.py", "an add in a listed dir can shadow an import"),
+    ("A", "projects/ritz/newfile.py", "an add in projects/ritz/, which it lists"),
+    ("M", "projects/ritz/ritz.toml", "every manifest stays an input"),
+    ("A", "projects/ritz/ritz1/ritz.toml", "even one added outside its read set"),
+    ("M", ".github/workflows/main.yml", "the workflow defines the step"),
+    ("M", "rz", "a root file"),
+    ("M", "known-failures/1.toml", "an unknown top-level dir"),
+    ("A", "projects/lonely/src/new.ritz", "an add in a package can change a build plan"),
+    ("M", "projects/lonely/ritz.toml", "a package manifest"),
+])
+def test_a_narrow_step_runs_on_a_change_to_its_inputs(narrow, status, path, why):
+    r, base = narrow
+    change(r, (path, None if status == "D" else "changed\n"))
+    d = decide_narrow(r, base)
+    assert not d.skip, why
+    assert path in d.lines[0], d.lines
+
+
+def test_a_narrow_steps_sources_name_its_packages(narrow):
+    """A package the step's own sources name is an input of that step (and
+    a package only the ritz0 step's sources name is not)."""
+    r, _ = narrow
+    change(r, ("projects/ritz/scripts/regression.sh",
+               NARROW_TREE["projects/ritz/scripts/regression.sh"] + 'L="$ROOT/lonely"\n'))
+    head = git(r, "rev-parse", "HEAD")
+    change(r, ("projects/lonely/src/main.ritz", "fn main() -> i32\n    4\n"))
+    assert not decide_narrow(r, head).skip
+    # `named` is named only by ritz0/test_reads.py, outside NARROW.
+    sc = ritz0_scope.scope(r, step=NARROW)
+    assert "lonely" in sc.named and "named" not in sc.named
+
+
+def test_a_narrow_skip_line_names_its_read_set(narrow):
+    r, base = narrow
+    change(r, ("projects/ritz/ritz0/parser.py", "y = 2\n"))
+    head = decide_narrow(r, base).lines[0]
+    for needle in ("projects/ritz/scripts/", "projects/ritz/examples/",
+                   "projects/ritz/Makefile", ".github/", "ritz.toml", f"(base {base[:7]})"):
+        assert needle in head, head
+
+
+def test_decide_steps_judges_every_step_on_one_diff(narrow):
+    r, base = narrow
+    change(r, ("projects/ritz/ritz0/parser.py", "y = 2\n"))
+    out = ritz0_scope.decide_steps(r, base, (ritz0_scope.RITZ0, NARROW))
+    assert not out[ritz0_scope.STEP].skip and out["narrow step"].skip
+
+
+@pytest.mark.parametrize("base", [None, "", "not-a-rev"])
+def test_a_narrow_step_with_no_usable_base_runs(narrow, base):
+    r, _ = narrow
+    assert not ritz0_scope.decide(r, base, NARROW).skip
+
+
+def test_a_narrow_step_on_an_empty_diff_runs(narrow):
+    r, base = narrow
+    assert not decide_narrow(r, base).skip
+
+
+# --------------------------------------------------------------------------
+# The real steps on the real tree: the measured read sets (AGAST #4206).
+# --------------------------------------------------------------------------
+
+REAL = Path(__file__).resolve().parents[3]
+
+
+@pytest.fixture(scope="module")
+def real_scopes():
+    return {s.name: ritz0_scope.scope(REAL, step=s) for s in ritz0_scope.STEPS}
+
+
+def _real(step, status, path, scopes):
+    return ritz0_scope.why_safe(status, path, scopes[step.name], step)
+
+
+def test_every_scoped_step_is_a_step_main_yml_declares():
+    """A renamed step would silently never be scoped again."""
+    import yaml
+    wf = yaml.safe_load((REAL / ".github/workflows/main.yml").read_text())
+    names = {s.get("name") for job in wf["jobs"].values() for s in job.get("steps", [])}
+    for step in ritz0_scope.STEPS:
+        assert step.name in names, step.name
+
+
+@pytest.mark.parametrize("status, path", [
+    ("M", "projects/ritz/tools/ci_local.py"),
+    ("M", "projects/ritz/tools/ritz0_scope.py"),
+    ("M", "projects/ritz/docs/TESTING.md"),
+    ("M", "projects/ritz/ritz0/test_parser.py"),
+    ("M", ".claude/skills/rz-iterate/run-gate.sh"),
+])
+def test_a_compiler_free_change_skips_both_regression_steps(real_scopes, status, path):
+    for step in (ritz0_scope.HARNESS, ritz0_scope.REGRESSION):
+        if path.startswith("projects/ritz/ritz0/") and step is ritz0_scope.REGRESSION:
+            continue  # ritz0 is the regression's Stage 1 compiler
+        assert _real(step, status, path, real_scopes) is not None, (step.name, path)
+
+
+@pytest.mark.parametrize("path, harness, regression", [
+    ("projects/ritz/scripts/regression.sh", True, True),
+    ("projects/ritz/scripts/test-regression-xpass.sh", True, True),
+    ("projects/ritz/scripts/regression_baseline_keys.py", True, True),
+    ("projects/ritz/tools/known_failures.py", True, True),
+    ("projects/ritz/cache.py", True, True),
+    ("projects/ritz/Makefile", True, True),
+    ("projects/ritz/examples/tier1_basics/01_hello/src/main.ritz", True, True),
+    ("projects/ritz/examples/tier1_basics/01_hello/test.sh", True, True),
+    ("known-failures/4000.toml", True, True),
+    ("projects/ritz/ritz0/parser.py", False, True),
+    ("projects/ritz/ritz1/src/main.ritz", False, True),
+    ("projects/ritz/ritzlib/io.ritz", False, True),
+    ("projects/ritz/runtime/ritz_start.x86_64.ll", False, True),
+    ("projects/ritz/build.py", False, True),
+])
+def test_a_change_to_each_input_runs_its_step(real_scopes, path, harness, regression):
+    """A modification to each measured input runs the step that reads it."""
+    for step, reads in ((ritz0_scope.HARNESS, harness), (ritz0_scope.REGRESSION, regression)):
+        why = _real(step, "M", path, real_scopes)
+        assert (why is None) == reads, (step.name, path, why)
+
+
+# --------------------------------------------------------------------------
+# The read set's own guard (AGAST #4206).  Both steps run binaries (ritz1,
+# clang, make), so an audit hook like ritz0/read_guard.py sees only what they
+# are handed.  `ritz0_scope.py --audit STEP TRACE` reads an
+# `strace -f -y -e trace=%file,execve` log of the step and names every path
+# it touched that the step's read set would let a gate skip.
+# --------------------------------------------------------------------------
+
+def _trace(repo: Path, *lines: str) -> str:
+    return "".join(line.replace("@", str(repo)) + "\n" for line in lines)
+
+
+def test_audit_passes_a_trace_inside_the_read_set(narrow):
+    r, _ = narrow
+    log = _trace(
+        r,
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/scripts/regression.sh", O_RDONLY) = 3<@/projects/ritz/scripts/regression.sh>',
+        '1 openat(AT_FDCWD<@/projects/ritz>, "examples/hello/src/main.ritz", O_RDONLY) = 3<@/projects/ritz/examples/hello/src/main.ritz>',
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/tools", O_RDONLY|O_DIRECTORY) = 3<@/projects/ritz/tools>',
+        '1 execve("/usr/bin/clang", ["clang"], 0x0 /* 1 vars */) = 0',
+        '1 openat(AT_FDCWD</x>, "/etc/passwd", O_RDONLY) = 3</etc/passwd>',
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/scripts/missing.sh", 0x0, 0) = -1 ENOENT (No such file or directory)',
+    )
+    assert ritz0_scope.audit(r, NARROW, log) == []
+
+
+def test_audit_names_a_read_outside_the_read_set(narrow):
+    r, _ = narrow
+    log = _trace(
+        r,
+        '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0/parser.py", O_RDONLY) = 3<@/projects/ritz/ritz0/parser.py>',
+        '2 execve("@/projects/ritz/build.py", ["build.py"], 0x0 /* 1 vars */) = 0',
+        '2 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritzlib/io.ritz", {st_mode=S_IFREG|0644, ...}, 0) = 0',
+    )
+    found = ritz0_scope.audit(r, NARROW, log)
+    assert found == ["projects/ritz/build.py", "projects/ritz/ritz0/parser.py",
+                     "projects/ritz/ritzlib/io.ritz (stat)"], found
+
+
+def test_audit_judges_a_split_call_by_its_result(narrow):
+    """strace -f splits a call another process interrupts; the path is on the
+    first line, the result on the `resumed` one."""
+    r, _ = narrow
+    log = _trace(
+        r,
+        '7 openat(AT_FDCWD</x>, "@/projects/ritz/ritz0/parser.py", O_RDONLY <unfinished ...>',
+        '8 newfstatat(AT_FDCWD</x>, "@/projects/ritz/scripts/x.sh", 0x0, 0) = -1 ENOENT (No such file or directory)',
+        '7 <... openat resumed>) = 3<@/projects/ritz/ritz0/parser.py>',
+        '9 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz1/gone" <unfinished ...>',
+        '9 <... newfstatat resumed>, 0x0, 0) = -1 ENOENT (No such file or directory)',
+        '9 openat(AT_FDCWD</x>, "@/projects/ritz/ritz0/out.ll", O_WRONLY|O_CREAT|O_TRUNC, 0644) = 3<@/projects/ritz/ritz0/out.ll>',
+    )
+    assert ritz0_scope.audit(r, NARROW, log) == [
+        "projects/ritz/ritz0/parser.py", "projects/ritz/ritz1/gone (probed)"]
+
+
+def test_audit_a_stat_of_a_direct_child_of_a_listed_dir_is_covered(narrow):
+    """list_deps.py stats every entry of RITZ_PATH (projects/ritz): its
+    existence and type, which only an add or delete changes."""
+    r, _ = narrow
+    log = _trace(r, '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/build.py", {st_mode=S_IFREG|0644, ...}, 0) = 0')
+    assert ritz0_scope.audit(r, NARROW, log) == []
+
+
+def test_audit_names_a_listing_or_probe_an_add_would_change(narrow):
+    """Listing a directory, or probing a path that is not there, reads the
+    set of files: adding one there must run the step."""
+    r, _ = narrow
+    log = _trace(
+        r,
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/ritz0", O_RDONLY|O_DIRECTORY) = 3<@/projects/ritz/ritz0>',
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/runtime/gone.ll", O_RDONLY) = -1 ENOENT (No such file or directory)',
+    )
+    assert ritz0_scope.audit(r, NARROW, log) == [
+        "projects/ritz/ritz0/ (listed)", "projects/ritz/runtime/gone.ll (probed)"]
+
+
+def test_audit_ignores_generated_paths(narrow):
+    """Build output git ignores is no input: ritz1/build/ritz1 is made from
+    ritz1/'s sources, which make stats (so a %file trace sees them)."""
+    r, _ = narrow
+    change(r, (".gitignore", "build/\n"))
+    log = _trace(
+        r,
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/ritz1/build/ritz1.ll", O_RDONLY) = 3<@/projects/ritz/ritz1/build/ritz1.ll>',
+    )
+    assert ritz0_scope.audit(r, NARROW, log) == []
+
+
+def test_audit_a_py_loaded_from_its_pyc_is_read(narrow):
+    """Python loads a module from __pycache__ after only a stat of its
+    source (the mtime check): that stat is a read of the source."""
+    r, _ = narrow
+    log = _trace(
+        r,
+        '1 newfstatat(AT_FDCWD</x>, "@/projects/ritz/ritz0/parser.py", {st_mode=S_IFREG|0644, ...}, 0) = 0',
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/ritz0/__pycache__/parser.cpython-314.pyc", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/__pycache__/parser.cpython-314.pyc>',
+    )
+    change(r, (".gitignore", "__pycache__/\n"))
+    assert ritz0_scope.audit(r, NARROW, log) == ["projects/ritz/ritz0/parser.py"]
+
+
+def test_audit_cli_exits_nonzero_on_a_finding(narrow, tmp_path):
+    r, _ = narrow
+    log = tmp_path / "t.strace"
+    log.write_text(_trace(
+        r, '1 openat(AT_FDCWD</x>, "@/projects/ritz/ritz0/parser.py", O_RDONLY) = 3<@/projects/ritz/ritz0/parser.py>'))
+    assert ritz0_scope.main(["x", "--audit", "narrow step", str(log)], repo=r,
+                            steps=(NARROW,)) == 1
+    log.write_text("")
+    assert ritz0_scope.main(["x", "--audit", "narrow step", str(log)], repo=r,
+                            steps=(NARROW,)) == 0
+
+
+# Re-derived from the scripts, without a trace: every repo path the
+# regression scripts name by $ROOT_DIR/$RITZ_ROOT/$SCRIPT_DIR, and every
+# sibling module a Python input imports, is in the read set of a step that
+# runs them.  Catches a new input named in a script or an import before the
+# next strace does.
+
+_SCRIPT_REF = re.compile(
+    r'\$\{?(ROOT_DIR|RITZ_ROOT|SCRIPT_DIR)\}?"?/([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*)')
+_ROOTS = {"ROOT_DIR": "projects/ritz/", "RITZ_ROOT": "projects/ritz/",
+          "SCRIPT_DIR": "projects/ritz/scripts/"}
+# Test scripts point ROOT_DIR at a scratch tree; regression.sh's own ROOT_DIR
+# is the real one.  Generated paths are outputs, not inputs.
+_GENERATED = ("build", ".regression", ".regression-cache", "ritz1/build")
+
+
+def _script_refs(text: str) -> set[str]:
+    refs = set()
+    for var, rest in _SCRIPT_REF.findall(text):
+        rel = os.path.normpath(_ROOTS[var] + rest)
+        if rest.startswith(".."):
+            continue  # the project root itself
+        sub = rel[len("projects/ritz/"):]
+        if any(sub == g or sub.startswith(g + "/") for g in _GENERATED):
+            continue
+        refs.add(rel)
+    return refs
+
+
+def test_the_regression_scripts_name_only_paths_in_their_read_set(real_scopes):
+    scripts = REAL / "projects/ritz/scripts"
+    reg = (scripts / "regression.sh").read_text()
+    for rel in sorted(_script_refs(reg)):
+        why = _real(ritz0_scope.REGRESSION, "M", rel, real_scopes)
+        assert why is None, (rel, why)
+    for t in sorted(scripts.glob("test-regression-*.sh")):
+        text = t.read_text()
+        # Only refs through SCRIPT_DIR/RITZ_ROOT are the real tree here.
+        for rel in sorted(r for r in _script_refs(text.replace("$ROOT_DIR", "$SCRATCH"))
+                          if r.startswith("projects/ritz/")):
+            why = _real(ritz0_scope.HARNESS, "M", rel, real_scopes)
+            assert why is None, (t.name, rel, why)
+
+
+def test_the_harness_glob_is_in_its_read_set(real_scopes):
+    mk = (REAL / "projects/ritz/Makefile").read_text()
+    assert "scripts/test-regression-*.sh" in mk
+    assert _real(ritz0_scope.HARNESS, "A", "projects/ritz/scripts/test-regression-new.sh",
+                 real_scopes) is None
+
+
+@pytest.mark.parametrize("step", ritz0_scope.STEPS[1:], ids=lambda s: s.name)
+def test_every_python_input_imports_only_inputs(real_scopes, step):
+    """A Python file the step reads finds its siblings on sys.path[0]: each
+    sibling module it can import is in the read set.  (cache.py's lazy
+    ritz0/ import is not checked: it runs only for a compiler hash over the
+    real ritz0/, which the harness never takes, measured.)"""
+    import ast
+    for rel in ritz0_scope.step_files(REAL, step):
+        if not rel.endswith(".py") or "/examples/" in rel:
+            continue
+        src = REAL / rel
+        try:
+            tree = ast.parse(src.read_text())
+        except SyntaxError:
+            continue
+        mods = {a.name.split(".")[0] for n in ast.walk(tree) if isinstance(n, ast.Import)
+                for a in n.names}
+        mods |= {n.module.split(".")[0] for n in ast.walk(tree)
+                 if isinstance(n, ast.ImportFrom) and n.module and not n.level}
+        for m in mods:
+            for cand in (src.parent / f"{m}.py", src.parent / m / "__init__.py"):
+                if cand.is_file():
+                    crel = cand.relative_to(REAL).as_posix()
+                    why = _real(step, "M", crel, real_scopes)
+                    assert why is None, (step.name, rel, "imports", crel, why)

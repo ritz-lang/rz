@@ -65,7 +65,7 @@ def fake(tmp_path):
     (".github/workflows/main.yml", False),
     ("docs/guide.md", True),
     ("docs/SPEC.md", False),                # a .md a source names
-    ("projects/ritz/docs/NOTES.md", True),  # judged by basename, even here
+    ("projects/ritz/docs/NOTES.md", False),  # all of projects/ritz is an input (#4206)
 ])
 def test_a_read_is_judged_as_a_modification(fake, rel, skippable):
     repo, g = fake

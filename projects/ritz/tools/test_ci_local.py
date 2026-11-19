@@ -928,10 +928,11 @@ def scope(likely, monkeypatch):
     calls = []
 
     def set_verdict(skip: bool):
-        def fake(repo, base):
+        def fake(repo, base, step=ci_local.ritz0_scope.RITZ0):
             calls.append(base)
-            head = (f"SKIPPED ritz0 unit tests: no change under X (base {base[:7]})"
-                    if skip else f"running ritz0 unit tests: Y may reach it (base {base[:7]})")
+            name = step.name
+            head = (f"SKIPPED {name}: no change under X (base {base[:7]})"
+                    if skip else f"running {name}: Y may reach it (base {base[:7]})")
             return ci_local.ritz0_scope.Decision(skip, [head, "  detail"])
         monkeypatch.setattr(ci_local.ritz0_scope, "decide", fake)
 
@@ -1042,3 +1043,80 @@ def test_gate_runner_passes_its_base():
     assert len(calls) == 3, calls
     for ln in calls:
         assert "RZ_GATE_BASE=" in ln, ln
+
+
+# --------------------------------------------------------------------------
+# AGAST #4206: the two regression steps are scoped the same way, each by its
+# own measured read set (tools/ritz0_scope.py HARNESS, REGRESSION).
+# --------------------------------------------------------------------------
+
+SCOPED_WF = """\
+jobs:
+  bootstrap:
+    steps:
+      - name: Regression harness self-tests
+        run: echo harness >> {log}
+      - name: Build ritz1 + ritz1_selfhosted
+        run: echo build >> {log}
+      - name: Differential corpus regression (ritz0 vs ritz1 vs self-hosted)
+        run: echo regression >> {log}
+"""
+
+
+@pytest.fixture
+def scoped(tmp_path, monkeypatch):
+    log = tmp_path / "log"
+    wf = tmp_path / "main.yml"
+    wf.write_text(SCOPED_WF.format(log=log))
+    monkeypatch.setattr(ci_local, "WORKFLOW", wf)
+    verdicts: dict[str, bool] = {}
+    asked: list[str] = []
+
+    def fake(repo, base, step=ci_local.ritz0_scope.RITZ0):
+        asked.append(step.name)
+        skip = verdicts.get(step.name, False)
+        head = (f"SKIPPED {step.name}: no change under X (base {base[:7]})" if skip
+                else f"running {step.name}: Y may reach it (base {base[:7]})")
+        return ci_local.ritz0_scope.Decision(skip, [head])
+
+    monkeypatch.setattr(ci_local.ritz0_scope, "decide", fake)
+    return verdicts, asked, (lambda: log.read_text().split() if log.exists() else [])
+
+
+@pytest.mark.integration
+def test_each_regression_step_is_scoped_by_its_own_verdict(scoped, capsys):
+    verdicts, asked, ran = scoped
+    verdicts["Regression harness self-tests"] = True
+    assert ci_local.main(["--job", "bootstrap", "--diff-base", BASE]) == 0
+    assert sorted(asked) == sorted([ci_local.ritz0_scope.HARNESS.name,
+                                    ci_local.ritz0_scope.REGRESSION.name])
+    assert ran() == ["build", "regression"]
+    out = capsys.readouterr().out
+    assert "SKIPPED Regression harness self-tests: no change under X" in out
+    summary = out[out.index("step timings:"):]
+    assert "[bootstrap] Regression harness self-tests" in summary
+
+
+@pytest.mark.integration
+def test_both_regression_steps_skip_and_the_build_still_runs(scoped, capsys):
+    verdicts, _, ran = scoped
+    verdicts[ci_local.ritz0_scope.HARNESS.name] = True
+    verdicts[ci_local.ritz0_scope.REGRESSION.name] = True
+    assert ci_local.main(["--job", "bootstrap", "--diff-base", BASE]) == 0
+    assert ran() == ["build"]
+
+
+@pytest.mark.integration
+def test_regression_steps_without_a_diff_base_all_run(scoped):
+    verdicts, asked, ran = scoped
+    verdicts[ci_local.ritz0_scope.HARNESS.name] = True
+    assert ci_local.main(["--job", "bootstrap"]) == 0
+    assert asked == [] and ran() == ["harness", "build", "regression"]
+
+
+@pytest.mark.integration
+def test_a_skipped_by_request_step_is_not_scoped(scoped):
+    _, asked, _ = scoped
+    assert ci_local.main(["--job", "bootstrap", "--diff-base", BASE,
+                          "--skip", "Regression harness self-tests"]) == 0
+    assert asked == [ci_local.ritz0_scope.REGRESSION.name]

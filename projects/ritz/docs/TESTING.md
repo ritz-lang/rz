@@ -511,6 +511,19 @@ Rules:
    always runs; here it would make every package an input, and a
    package-only gate could never skip ~7 minutes.  `RITZ_READ_GUARD=0`
    turns the guard off for a local run.
+10. **The regression steps read a measured file list; keep it measured.**
+   "Regression harness self-tests" and "Differential corpus regression"
+   are skipped the same way, each by its own read set (`HARNESS` and
+   `REGRESSION` in `tools/ritz0_scope.py`: scripts/, examples/, ritz0/
+   less its tests, ritz1/, ritzlib/, runtime/, build*.py, ...; AGAST #4206).
+   They run ritz1, clang and make, which no audit hook sees into, so
+   `tools/test_ritz0_scope.py` re-derives the paths the scripts name and
+   the modules their Python imports, and a full trace checks the rest.
+   After teaching either step to read a new file, add it to the step's
+   `reads` and re-run the trace:
+   `strace -f -qq -y -e trace=%file,execve -o /tmp/r.strace ./scripts/regression.sh --no-baseline-cache`
+   then `python3 tools/ritz0_scope.py --audit "<step name>" /tmp/r.strace`
+   (exit 0: the read set covers it).
 
 ### Stale pytest basetemps: install the sweep timer once per host
 

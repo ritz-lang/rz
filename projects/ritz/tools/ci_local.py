@@ -97,13 +97,15 @@ gate on the host orders its pre-pass by it, so a file of 13 s tests is not the
 tail seven idle workers wait on. No history (CI, a new host) keeps the
 selection's order.
 
-Diff-scoped ritz0 tests (AGAST #4027, Aaron 2026-11-18). `--diff-base <rev>`
+Diff-scoped steps (AGAST #4027, Aaron 2026-11-18; #4206). `--diff-base <rev>`
 asks tools/ritz0_scope.py whether anything changed since <rev> can reach the
-"ritz0 unit tests" step, the longest in every gate. If nothing can (docs, .claude,
-...: an allowlist; unknown means run), the step and its likely-first pre-pass
-are skipped with `SKIPPED ritz0 unit tests: no change under <inputs> (base
-<sha7>)` and listed in the summary; otherwise the line says which path may
-reach it. The gate runner passes its base (a room's merge-base with origin/main,
+"ritz0 unit tests" step, the longest in every gate, and each of the two
+regression steps ("Regression harness self-tests", "Differential corpus
+regression ..."), whose inputs are a measured part of projects/ritz. If nothing
+can (docs, .claude, ...: an allowlist; unknown means run), the step (and the
+ritz0 step's likely-first pre-pass) is skipped with `SKIPPED <step>: no change
+under <inputs> (base <sha7>)` and listed in the summary; otherwise the line
+says which path may reach it. The gate runner passes its base (a room's merge-base with origin/main,
 a train's BASE). No --diff-base, as on CI, runs everything.
 
 Exit code: 0 only if every step it ran exited 0. A step that exits 3
@@ -455,8 +457,9 @@ def main(argv: list[str] | None = None) -> int:
                    help="do not run the likely-failing ritz0 test files first "
                         "(AGAST #3456); run every step as declared")
     p.add_argument("--diff-base", metavar="REV",
-                   help=f"skip {PYTEST_STEP!r} if no change since REV can reach it "
-                        "(tools/ritz0_scope.py; AGAST #4027)")
+                   help="skip each of " + ", ".join(repr(s.name) for s in ritz0_scope.STEPS)
+                        + " that no change since REV can reach "
+                        "(tools/ritz0_scope.py; AGAST #4027, #4206)")
     p.add_argument("--skip", action="append", default=[], metavar="STEP",
                    help="do not run the step with this exact name (repeatable); "
                         "an unknown name is an error")
@@ -526,15 +529,20 @@ def main(argv: list[str] | None = None) -> int:
             failures.append(f"[{s.job}] {s.name} (exit {rc})")
 
     chosen = [s for s in steps if s.job in selected]
-    # AGAST #4027: a gate that knows its base may leave the ritz0 step out.
+    # AGAST #4027, #4206: a gate that knows its base may leave out a step no
+    # change can reach (ritz0 unit tests, the regression harness self-tests,
+    # the differential corpus regression; each by its own measured inputs).
     # Only asked when the step would otherwise run; any doubt means run.
     scoped_out: list[str] = []
-    if args.diff_base and PYTEST_STEP not in args.skip and \
-            any(s.name == PYTEST_STEP for s in chosen):
-        decision = ritz0_scope.decide(REPO_ROOT, args.diff_base)
-        print("\n".join(decision.lines), flush=True)
-        if decision.skip:
-            scoped_out = [s.name for s in chosen if s.name == PYTEST_STEP]
+    if args.diff_base:
+        names = {s.name for s in chosen if s.name not in args.skip}
+        for step in ritz0_scope.STEPS:
+            if step.name not in names:
+                continue
+            decision = ritz0_scope.decide(REPO_ROOT, args.diff_base, step)
+            print("\n".join(decision.lines), flush=True)
+            if decision.skip:
+                scoped_out.append(step.name)
     plan_skip = args.skip + scoped_out
     early, rest = ([], None) if args.no_likely_first else \
         plan_likely_first(chosen, plan_skip)
@@ -601,8 +609,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  - {s}")
     if skipped_by_scope:
         # A gate that skipped a step asserts less than CI; say which, and why.
-        print(f"skipped (no change since --diff-base can reach it; "
-              f"tools/ritz0_scope.py, AGAST #4027):")
+        print("skipped (no change since --diff-base can reach it; "
+              "tools/ritz0_scope.py, AGAST #4027, #4206):")
         for s in skipped_by_scope:
             print(f"  - {s}")
     if skipped:

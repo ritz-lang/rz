@@ -24,9 +24,10 @@ tools/smoke_stack, so a package-only change never skipped.
 So this is an ALLOWLIST that fails safe.  A gate skips the step only when every
 changed path is in one of these categories:
 
-  * a Markdown file whose basename no ritz0-step source names (the suite opens
-    docs by name and never globs *.md; if a source ever does, every .md is an
-    input);
+  * a Markdown file outside projects/ritz whose basename no ritz0-step source
+    names (the suite opens docs by name and never globs *.md; if a source
+    ever does, every .md is an input; under projects/ritz every file is an
+    input, .md too: two tests copy the tree, AGAST #4206);
   * a file MODIFIED (not added or deleted: those can change a build plan, and
     the step lists every package's directories) in a package under projects/
     that no ritz0-step source names, directly or through a named package's
@@ -56,12 +57,27 @@ fails there on its first push.  What neither sees: a child process (ritz1,
 build.py) reading a package it was not handed by path, through RITZ_PATH.
 The scan's import rule covers that for programs in the step's own sources.
 
+Two more gate steps are scoped by the same rules (AGAST #4206), each with a
+measured read set inside projects/ritz rather than all of it (Step, HARNESS,
+REGRESSION below): "Regression harness self-tests" (~78 s) and
+"Differential corpus regression" (~90 s).  A change under projects/ritz
+outside a step's `reads` skips that step, unless it is a manifest or adds or
+deletes an entry of a directory the step lists; everything outside
+projects/ritz is judged as above, with the names the step's own files use.
+They run ritz1, clang and make, which an audit hook cannot see into, so their
+read sets are checked by a trace instead (`--audit`, below), and the tests
+re-derive what the scripts name and what their Python imports.
+
     python3 tools/ritz0_scope.py <base>      print the verdict; exit 0 = skip
+    python3 tools/ritz0_scope.py <base> --all            every scoped step's
+    python3 tools/ritz0_scope.py --audit STEP TRACE      exit 0 = covered
 """
 
 from __future__ import annotations
 
+import fnmatch
 import io
+import os
 import re
 import subprocess
 import sys
@@ -100,6 +116,100 @@ _MD_WILDCARD = re.compile(
 # its start (a leading [\w.-]+ class would cost the literal scan: ~1.3 s).
 _MD_END = re.compile(r"\.md(?![\w-])")
 _MD_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
+@dataclass(frozen=True)
+class Step:
+    """A gate step and the part of projects/ritz it reads (AGAST #4206).
+
+    `reads` None: all of projects/ritz (the ritz0 step).  Otherwise
+    repo-relative paths, measured: a trailing / is a directory and all below
+    it.  `excludes`: fnmatch patterns (`*` crosses `/`) of files under
+    `reads` the step never opens (ritz0's tests: the compiler hash skips
+    them too).  `lists`: directories whose listing the step reads (a glob, `find`,
+    Python's import finder on sys.path[0]); adding or deleting an entry in
+    one runs the step.  Outside projects/ritz every step is judged alike,
+    with the packages, top-level dirs and .md names its own sources name."""
+    name: str
+    reads: tuple[str, ...] | None = None
+    lists: tuple[str, ...] = ()
+    label: str = "ritz0-step"  # "no <label> source names it"
+    excludes: tuple[str, ...] = ()
+
+    def in_reads(self, path: str) -> bool:
+        """`path` is, or is under, something the step reads (a directory it
+        reads counts too: a script names it as $ROOT_DIR/examples)."""
+        if self.reads is None or path in self.reads:
+            return True  # a file named outright beats `excludes`
+        return any(path == r.rstrip("/") or (r.endswith("/") and path.startswith(r))
+                   for r in self.reads) and \
+            not any(fnmatch.fnmatchcase(path, x) for x in self.excludes)
+
+    def listed_entries(self, path: str) -> list[str]:
+        """The entry of each listed directory that `path` is or is under."""
+        return [d + "/" + path[len(d) + 1:].split("/")[0]
+                for d in self.lists if path.startswith(d + "/")]
+
+
+RITZ0 = Step(STEP)
+
+# Measured 2026-11-19 (AGAST #4206): `strace -f -y -e trace=%file,execve`
+# over a full `make harness-selftest` (13 scripts, exit 0), every repo path
+# opened, stat'd, probed, listed or exec'd, less what git ignores.  Its
+# scripts point ROOT_DIR at scratch trees; the real tree is read only
+# through SCRIPT_DIR (scripts/), RITZ_ROOT/examples (test-regression-ports,
+# -testscripts) and the root known-failures/ (an unknown top-level dir:
+# always an input).  Python lists tools/ (known_failures.py's sys.path[0])
+# and projects/ritz/.
+HARNESS = Step(
+    "Regression harness self-tests",
+    reads=("projects/ritz/scripts/",
+           "projects/ritz/examples/",
+           "projects/ritz/Makefile",
+           "projects/ritz/cache.py",
+           "projects/ritz/tools/known_failures.py"),
+    lists=("projects/ritz", "projects/ritz/tools"),
+    label="harness-step")
+
+# Measured 2026-11-19 (AGAST #4206), as HARNESS, over a cold
+# `scripts/regression.sh --no-baseline-cache` with RITZ_VERIFY_IR=1 (CI's).
+# Its binaries were built by the step before it ("Build ritz1 +
+# ritz1_selfhosted"), so their sources are inputs too: Stage 2/4's make stats
+# them (the %file trace sees it), and a change to them changes what the
+# binaries accept.
+REGRESSION = Step(
+    "Differential corpus regression (ritz0 vs ritz1 vs self-hosted)",
+    reads=("projects/ritz/ritz0/",
+           "projects/ritz/ritz0/test_runner.py",
+           "projects/ritz/ritz1/",
+           "projects/ritz/ritzlib/",
+           "projects/ritz/runtime/",
+           "projects/ritz/examples/",
+           "projects/ritz/scripts/",
+           "projects/ritz/tools/known_failures.py",
+           "projects/ritz/Makefile",
+           "projects/ritz/build.py",
+           "projects/ritz/build_pipeline.py",
+           "projects/ritz/build_testrun.py",
+           "projects/ritz/build_cli.py",
+           "projects/ritz/manifest.py",
+           "projects/ritz/bounded_run.py",
+           "projects/ritz/cache.py",
+           "projects/ritz/cas.py",
+           "projects/ritz/resolve.py"),
+    # Never opened (the trace): ritz0's tests (cache.py's compiler hash
+    # skips test_* and test/ too), ritzlib/tests, the Markdown.
+    # ritz0.py imports test_runner.py (its --test mode): not a test.
+    excludes=("projects/ritz/ritz0/test_*", "projects/ritz/ritz0/*/test_*",
+              "projects/ritz/ritz0/test/*", "projects/ritz/ritz0/*/test/*",
+              "projects/ritz/ritzlib/tests/*",
+              "projects/ritz/ritz0/*.md", "projects/ritz/ritz1/*.md",
+              "projects/ritz/ritzlib/*.md", "projects/ritz/runtime/*.md"),
+    lists=("projects/ritz", "projects/ritz/tools"),
+    label="regression-step")
+
+# Every step a gate may scope, in no particular order; RITZ0 first.
+STEPS = (RITZ0, HARNESS, REGRESSION)
 
 
 def _md_names(text: str) -> set[str]:
@@ -159,13 +269,18 @@ def _git(repo: Path, *args: str) -> str:
                           capture_output=True, text=True).stdout
 
 
-def _source_files(repo: Path) -> list[tuple[str, str]]:
-    """(path, text) of every ritz0-step source."""
+def step_files(repo: Path, step: Step = RITZ0) -> list[str]:
+    """Every tracked (or untracked, not ignored) file `step` reads under
+    projects/ritz: for the ritz0 step, its sources (below)."""
     out = _git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard",
                "--", "projects/ritz")
     files = []
     for rel in out.split("\0"):
         if not rel:
+            continue
+        if step.reads is not None:
+            if step.in_reads(rel):
+                files.append(rel)
             continue
         p = PurePosixPath(rel)
         sub = p.parts[2:]  # below projects/ritz
@@ -176,6 +291,16 @@ def _source_files(repo: Path) -> list[tuple[str, str]]:
             continue
         if any("/".join(sub).startswith(d) for d in _NOT_RUN):
             continue
+        files.append(rel)
+    return sorted(set(files))
+
+
+def _source_files(repo: Path, step: Step = RITZ0) -> list[tuple[str, str]]:
+    """(path, text) of every source of `step`: the files it reads that can
+    name a path (code, scripts, manifests, data; not Markdown)."""
+    files = []
+    for rel in step_files(repo, step):
+        p = PurePosixPath(rel)
         if p.suffix not in _SOURCE_SUFFIXES and p.name not in _SOURCE_NAMES:
             continue
         try:
@@ -275,10 +400,10 @@ def _direct(files, pkgs) -> set[str]:
     return named
 
 
-def named_packages(repo: Path, files=None) -> set[str]:
-    """Packages under projects/ the ritz0 step reads: named in its sources,
-    or by a named package's manifest (a dependency), to a fixpoint."""
-    files = _source_files(repo) if files is None else files
+def named_packages(repo: Path, files=None, step: Step = RITZ0) -> set[str]:
+    """Packages under projects/ `step` reads: named in its sources, or by a
+    named package's manifest (a dependency), to a fixpoint."""
+    files = _source_files(repo, step) if files is None else files
     pkgs = _packages(repo)
     named = _direct(files, pkgs)
     frontier = set(named)
@@ -289,16 +414,20 @@ def named_packages(repo: Path, files=None) -> set[str]:
     return named
 
 
-def scope(repo: Path, files=None) -> Scope:
-    """Measure what the step's sources reach, once."""
-    files = _source_files(repo) if files is None else files
+def scope(repo: Path, files=None, step: Step = RITZ0) -> Scope:
+    """Measure what `step`'s sources reach, once."""
+    files = _source_files(repo, step) if files is None else files
     raw = "\n".join(t for _, t in files)
     tops = re.compile(r"""["'/](?:""" + "|".join(re.escape(t) for t in TOP_DIRS)
                       + r")(?![\w-])")
     code = "\n".join(_code(r, t) for r, t in files if tops.search(t))
     return Scope(
-        named=frozenset(named_packages(repo, files)),
-        md_wild=bool(_MD_WILDCARD.search(raw)),
+        named=frozenset(named_packages(repo, files, step)),
+        # On code, not prose (AGAST #4206): read_guard.py's docstring says
+        # "*.md", and every .md was an input of the ritz0 step.  Raw text
+        # first: only a file that may match is reduced.
+        md_wild=any(_MD_WILDCARD.search(_code(r, t)) for r, t in files
+                    if _MD_WILDCARD.search(t)),
         md_names=frozenset(_md_names(raw)),
         named_tops=frozenset(t for t in TOP_DIRS if _named(t).search(code)),
     )
@@ -320,68 +449,288 @@ def _changes(repo: Path, base: str) -> list[tuple[str, str]]:
     return sorted((s, p) for p, s in seen.items())
 
 
-def why_safe(status: str, path: str, sc: Scope) -> str | None:
-    """Why a change (`status` A/M/D) to repo-relative `path` cannot reach the
-    step, or None if it may (the default)."""
+def _listing_changes(repo: Path, base: str, step: Step) -> frozenset[str]:
+    """Entries of `step`'s listed directories added or removed since `base`
+    (in the work tree, as `os.listdir` would see them)."""
+    out: set[str] = set()
+    for d in step.lists:
+        then = {x.rsplit("/", 1)[-1] for x in
+                _git(repo, "ls-tree", "-z", "--name-only", base, "--", d + "/").split("\0") if x}
+        try:
+            now = set(os.listdir(repo / d))
+        except OSError:
+            now = set()
+        out |= {f"{d}/{x}" for x in then ^ now}
+    return frozenset(out)
+
+
+def why_safe(status: str, path: str, sc: Scope, step: Step = RITZ0,
+             listing: frozenset[str] | None = None) -> str | None:
+    """Why a change (`status` A/M/D) to repo-relative `path` cannot reach
+    `step`, or None if it may (the default).  `listing`: the entries of the
+    step's listed directories that changed (None: unknown, so an add or
+    delete under one may reach it)."""
     p = PurePosixPath(path)
     if path.startswith(".github/"):
+        return None
+    if step.reads is not None and path.startswith(RITZ):
+        if step.in_reads(path) or p.name in MANIFESTS:
+            return None
+        entries = step.listed_entries(path)
+        if status != "M" and entries and (
+                listing is None or any(e in listing for e in entries)):
+            return None
+        return f"not in the {step.label}'s measured read set"
+    if step.reads is None and path.startswith(RITZ):
+        # Every file under projects/ritz, Markdown too: ritz0 tests copy the
+        # tree (test_ritz1_bin_staleness, test_fn_cache_ritz0_identity), and
+        # read_guard saw them open every .md there (AGAST #4206).
         return None
     if p.suffix == ".md":
         if sc.md_wild or p.name in sc.md_names:
             return None
-        return f"{p.name}: a .md no ritz0-step source names"
-    if path.startswith(RITZ):
-        return None
+        return f"{p.name}: a .md no {step.label} source names"
     top = p.parts[0]
     if top == "projects" and len(p.parts) >= 3:
         pkg = p.parts[1]
         if pkg in sc.named or p.name in MANIFESTS or status != "M":
             return None
-        return f"modified in projects/{pkg}/, which no ritz0-step source reads"
+        return f"modified in projects/{pkg}/, which no {step.label} source reads"
     if top in TOP_DIRS and len(p.parts) >= 2:
         if top in sc.named_tops:
             return None
-        return f"under {top}/, which no ritz0-step source names"
+        return f"under {top}/, which no {step.label} source names"
     return None
 
 
-def inputs_summary(named) -> str:
+def inputs_summary(named, step: Step = RITZ0) -> str:
     pkgs = ",".join(sorted(named))
-    return (f"{RITZ}, .github/, root files, every ritz.toml/rz.toml, "
-            f"projects/{{{pkgs}}}/, .md files ritz0 sources name")
+    reads = RITZ if step.reads is None else ", ".join(step.reads)
+    return (f"{reads}, .github/, root files, every ritz.toml/rz.toml, "
+            f"projects/{{{pkgs}}}/, .md files {step.label} sources name")
 
 
-def decide(repo: Path, base: str | None) -> Decision:
-    """Skip the step only if every change since `base` is measured safe."""
+def decide_steps(repo: Path, base: str | None, steps=STEPS) -> dict[str, Decision]:
+    """Each step's verdict on one diff: skip a step only if every change
+    since `base` is measured safe for it."""
+    def every(line: str) -> dict[str, Decision]:
+        return {s.name: Decision(False, [f"running {s.name}: {line}"]) for s in steps}
+
     if not base:
-        return Decision(False, [f"running {STEP}: no diff base given"])
+        return every("no diff base given")
     try:
         sha = _git(repo, "rev-parse", "--verify", "--quiet", f"{base}^{{commit}}").strip()
     except (subprocess.CalledProcessError, OSError) as e:
-        return Decision(False, [f"running {STEP}: base {base!r} does not resolve ({e})"])
+        return every(f"base {base!r} does not resolve ({e})")
     try:
         changes = _changes(repo, sha)
-        sc = scope(repo)
     except (subprocess.CalledProcessError, OSError) as e:
-        why = f"could not diff against base {sha[:7]} ({e})"
-        return Decision(False, [f"running {STEP}: {why}"])
+        return every(f"could not diff against base {sha[:7]} ({e})")
     if not changes:
-        why = f"nothing differs from base {sha[:7]} (a skip would prove nothing)"
-        return Decision(False, [f"running {STEP}: {why}"])
-    why = [(s, p, why_safe(s, p, sc)) for s, p in changes]
+        return every(f"nothing differs from base {sha[:7]} (a skip would prove nothing)")
+    out = {}
+    for step in steps:
+        try:
+            sc = scope(repo, step=step)
+            listing = _listing_changes(repo, sha, step)
+        except (subprocess.CalledProcessError, OSError) as e:
+            why = f"running {step.name}: could not measure its scope ({e})"
+            out[step.name] = Decision(False, [why])
+            continue
+        out[step.name] = _verdict(step, sha, changes, sc, listing)
+    return out
+
+
+def _verdict(step: Step, sha: str, changes, sc: Scope, listing) -> Decision:
+    why = [(s, p, why_safe(s, p, sc, step, listing)) for s, p in changes]
     reach = [(s, p) for s, p, w in why if w is None]
+    name = step.name
     if reach:
         s, p = reach[0]
         more = f" (and {len(reach) - 1} more)" if len(reach) > 1 else ""
-        head = f"running {STEP}: {p} ({s}) may reach it{more} (base {sha[:7]})"
+        head = f"running {name}: {p} ({s}) may reach it{more} (base {sha[:7]})"
         return Decision(False, [head, *(f"  may reach it: {p} ({s})" for s, p in reach)])
-    head = f"SKIPPED {STEP}: no change under {inputs_summary(sc.named)} (base {sha[:7]})"
+    head = (f"SKIPPED {name}: no change under {inputs_summary(sc.named, step)} "
+            f"(base {sha[:7]})")
     return Decision(True, [head, *(f"  cannot reach it: {p} ({s}): {w}" for s, p, w in why)])
 
 
-def main(argv: list[str]) -> int:
-    repo = Path(__file__).resolve().parents[3]
-    d = decide(repo, argv[1] if len(argv) > 1 else None)
+def decide(repo: Path, base: str | None, step: Step = RITZ0) -> Decision:
+    """Skip `step` only if every change since `base` is measured safe."""
+    return decide_steps(repo, base, (step,))[step.name]
+
+
+# --------------------------------------------------------------------------
+# The read set's guard (AGAST #4206).  Both measured steps run binaries
+# (ritz1, clang, make), which an in-process audit hook cannot see into, so
+# the check is a trace of the whole step:
+#
+#   cd projects/ritz
+#   strace -f -qq -y -s 512 -e trace=%file,execve -o /tmp/h.strace make harness-selftest
+#   python3 tools/ritz0_scope.py --audit "Regression harness self-tests" /tmp/h.strace
+#
+#   strace -f -qq -y -s 512 -e trace=%file,execve -o /tmp/r.strace \
+#       env RITZ_VERIFY_IR=1 ./scripts/regression.sh --no-baseline-cache
+#   python3 tools/ritz0_scope.py --audit "Differential corpus regression \
+#       (ritz0 vs ritz1 vs self-hosted)" /tmp/r.strace
+#
+# It names every repo path the step opened, stat'd or exec'd (a change to it
+# must run the step), probed and did not find, or listed (adding one there
+# must run it), that the read set would let a gate skip.  Git-ignored paths
+# are outputs.  Exit 0: the read set covers the trace.
+# --------------------------------------------------------------------------
+
+_TRACE = re.compile(
+    r'^\s*(?:\[pid\s+)?(\d+)\]?\s+(\w+)\((?:(AT_FDCWD|-?\d+)(?:<([^>]*)>)?,\s*)?"((?:[^"\\]|\\.)*)"(.*)$')
+_RESUMED = re.compile(r'^\s*(?:\[pid\s+)?(\d+)\]?\s+<\.\.\. (\w+) resumed>(.*)$')
+_OPENS = {"open", "openat", "openat2"}
+_EXECS = {"execve", "execveat"}
+_STATS = {"stat", "lstat", "newfstatat", "fstatat64", "statx", "access", "faccessat",
+          "faccessat2", "readlink", "readlinkat", "stat64", "lstat64"}
+_WRITE_FLAGS = re.compile(r"O_WRONLY|O_RDWR|O_CREAT|O_TRUNC")
+
+
+def _trace_accesses(lines, roots: tuple[str, ...]):
+    """(kind, rel) for each repo path in an strace log (`-f -y`, so a
+    relative path's directory is decoded).  kind: "read" (opened or exec'd:
+    its content), "stat" (found by stat/access: its existence and type),
+    "probe" (not found) or "list" (a directory opened: its entries).  A call
+    strace split into `<unfinished ...>` and `<... resumed>` is judged by its
+    result.  Opens for writing are outputs, not reads."""
+    cwd: dict[str, str] = {}
+    pending: dict[str, tuple[str, str, str]] = {}
+    for line in lines.splitlines() if isinstance(lines, str) else lines:
+        m = _RESUMED.match(line)
+        if m:
+            got = pending.pop(m.group(1), None)
+            if got is not None and got[0] == m.group(2):
+                kind = _kind(got[0], got[2] + m.group(3))
+                if kind:
+                    yield kind, got[1]
+            continue
+        m = _TRACE.match(line)
+        if not m:
+            continue
+        pid, call, dirfd, base, path, rest = m.groups()
+        if dirfd == "AT_FDCWD" and base:
+            cwd[pid] = base
+        if call not in _OPENS and call not in _EXECS and call not in _STATS:
+            continue
+        if not path.startswith("/"):
+            anchor = base or cwd.get(pid)
+            if anchor is None:
+                continue
+            path = os.path.join(anchor, path)
+        full = os.path.normpath(path)
+        rel = next((full[len(r) + 1:] for r in roots if full.startswith(r + "/")), None)
+        if not rel:
+            continue
+        if rest.rstrip().endswith("<unfinished ...>"):
+            pending[pid] = (call, rel, rest)
+            continue
+        kind = _kind(call, rest)
+        if kind:
+            yield kind, rel
+
+
+def _kind(call: str, rest: str) -> str | None:
+    args, _, result = rest.rpartition("=")
+    if call in _OPENS and _WRITE_FLAGS.search(args) and "O_RDONLY" not in args:
+        return None  # an output
+    if re.match(r"\s*-1 E(NOENT|NOTDIR)\b", result):
+        return "probe"
+    if re.match(r"\s*-1 ", result):
+        return None  # refused (EACCES, ...): nothing learnt
+    if call in _OPENS:
+        return "list" if "O_DIRECTORY" in args else "read"
+    return "read" if call in _EXECS else "stat"
+
+
+def _ignored(repo: Path, rels) -> set[str]:
+    rels = sorted(set(rels))
+    if not rels:
+        return set()
+    # Exit 1 is "none ignored": not an error.
+    r = subprocess.run(["git", "-C", str(repo), "check-ignore", "--stdin", "-z"],
+                       input="\0".join(rels) + "\0", capture_output=True, text=True,
+                       check=False)
+    return {x for x in r.stdout.split("\0") if x}
+
+
+def audit(repo: Path, step: Step, trace) -> list[str]:
+    """Every repo path an strace of `step` (text, or an iterable of lines)
+    touched that its read set would let a gate skip; [] when it covers it."""
+    roots = tuple(dict.fromkeys((str(repo.absolute()), os.path.realpath(repo))))
+    seen = set(_trace_accesses(trace, roots))
+    # Python loads a module from __pycache__/<name>.<tag>.pyc after a stat of
+    # its source (the mtime check): that stat reads the source.
+    pycs = {(str(PurePosixPath(rel).parent.parent), PurePosixPath(rel).name.split(".")[0])
+            for kind, rel in seen if kind == "read" and rel.endswith(".pyc")
+            and PurePosixPath(rel).parent.name == "__pycache__"}
+    seen = {("read" if kind == "stat" and rel.endswith(".py") and
+             (str(PurePosixPath(rel).parent), PurePosixPath(rel).stem) in pycs else kind, rel)
+            for kind, rel in seen}
+    ignored = _ignored(repo, {rel for _, rel in seen})
+    sc = scope(repo, step=step)
+
+    def new_entries(rel: str) -> frozenset[str]:
+        # Adding `rel` changes a listed directory only where its entry is
+        # not there yet: a new file in an existing ritz0/ leaves the listing
+        # of projects/ritz as it was.
+        return frozenset(e for e in step.listed_entries(rel) if not (repo / e).exists())
+
+    found = set()
+    for kind, rel in seen:
+        if rel in ignored:
+            continue
+        if kind in ("read", "stat") and (repo / rel).is_dir():
+            continue  # its existence; its entries are read by a listing
+        if kind == "read":
+            if why_safe("M", rel, sc, step) is not None:
+                found.add(rel)
+        elif kind == "stat":
+            # Its existence and type, not its content (list_deps.py stats
+            # every entry of RITZ_PATH with is_dir()): deleting it must run
+            # the step.  Deleting a direct child changes a listed directory.
+            gone = frozenset(e for e in step.listed_entries(rel) if e == rel)
+            if why_safe("D", rel, sc, step, gone) is not None:
+                found.add(f"{rel} (stat)")
+        elif kind == "probe":
+            if why_safe("A", rel, sc, step, new_entries(rel)) is not None:
+                found.add(f"{rel} (probed)")
+        else:
+            probe = f"{rel}/.audit-probe"
+            if why_safe("A", probe, sc, step, new_entries(probe)) is not None:
+                found.add(f"{rel}/ (listed)")
+    return sorted(found)
+
+
+def main(argv: list[str], repo: Path | None = None, steps=STEPS) -> int:
+    """`<base>`: the ritz0 step's verdict, exit 0 = skip.  `<base> --all`:
+    every step's.  `--audit STEP TRACE`: check STEP's read set against an
+    strace of it, exit 0 = covered."""
+    repo = Path(__file__).resolve().parents[3] if repo is None else repo
+    if len(argv) > 1 and argv[1] == "--audit":
+        if len(argv) != 4:
+            print("usage: ritz0_scope.py --audit STEP TRACE", file=sys.stderr)
+            return 2
+        by_name = {s.name: s for s in steps}
+        if argv[2] not in by_name:
+            print(f"no scoped step {argv[2]!r}; steps: {', '.join(by_name)}", file=sys.stderr)
+            return 2
+        with open(argv[3], errors="replace") as f:  # a full run's is ~1 GB
+            found = audit(repo, by_name[argv[2]], (ln.rstrip("\n") for ln in f))
+        for f in found:
+            print(f"outside the read set of {argv[2]!r}: {f}")
+        print(f"{len(found)} path(s) outside the read set" if found else "read set covers the trace")
+        return 1 if found else 0
+    base = argv[1] if len(argv) > 1 else None
+    if "--all" in argv[2:]:
+        ds = decide_steps(repo, base, steps)
+        for d in ds.values():
+            print("\n".join(d.lines))
+        return 0 if all(d.skip for d in ds.values()) else 1
+    d = decide(repo, base)
     print("\n".join(d.lines))
     return 0 if d.skip else 1
 

@@ -18,10 +18,12 @@ outside projects/ritz is judged by the scope's own rule, ritz0_scope.why_safe:
   * a directory listed: as if a file were ADDED to it (a package's A/D always
     runs; a listing of .claude/ would see a skippable add).
 
-Markdown is judged by basename wherever it is, as the scope does: a read of
-an unnamed .md, even under projects/ritz, is a hit.  A directory listed or
-handed to a child is not judged for the .md files it may hold; the scope
-treats every .md as an input once a source reads *.md by pattern.
+Markdown outside projects/ritz is judged by basename, as the scope does: a
+read of an unnamed .md is a hit.  Under projects/ritz every file is an input,
+.md too: this guard caught two tests copying the tree and opening every .md
+in it (AGAST #4206).  A directory listed or handed to a child is not judged
+for the .md files it may hold; the scope treats every .md as an input once a
+source reads *.md by pattern.
 
 If the scope would let a gate skip that change, the test fails, naming the
 path: a gate could skip this test for a change that breaks it.  The fix is to
@@ -102,12 +104,12 @@ class Guard:
         p = os.path.normpath(p)
         if not p.startswith(self._prefix):
             return None
-        if (p + os.sep).startswith(self._ritz) and not p.endswith(".md"):
+        if (p + os.sep).startswith(self._ritz):
             return None
         p = os.path.realpath(p)  # projects/ritzlib -> projects/ritz/ritzlib
         if not p.startswith(self._prefix):
             return None
-        if (p + os.sep).startswith(self._ritz) and not p.endswith(".md"):
+        if (p + os.sep).startswith(self._ritz):
             return None
         return p[len(self._prefix):]
 
