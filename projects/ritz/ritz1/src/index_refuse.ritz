@@ -1,0 +1,361 @@
+# ritz1/src/index_refuse.ritz - what has nothing to index, on Sema
+#
+# AGAST #3893 (#1816).  index_through.ritz refused these mid-lowering, on
+# EmitterState's locals; they are rules of the language, not limits of the
+# lowering, so they run from sema_walk now, in the same words at the same
+# places (ritz0's, from _index_through, _struct_index and array_rules):
+#
+#   - `p[i]` with `p` an `@T` / `@&T` (an un-annotated `let p = @x` too,
+#     #2445 / #3079) whose T is no array, Vec, Span or String (LARB R9);
+#   - `x[i][j]` with `x[i]` a scalar or a struct without `Index` (#2452, §7.8);
+#   - `*v` with `v` a struct or sized scalar by value (#2452, #2885);
+#   - `(*p)[i]` with `p` a `*T` to a struct without `Index` or a sized scalar
+#     (#3132, §7.8);
+#   - `p[i] = b` with `p` a `*[N]T` / `@[N]T` / `@&[N]T` and `b` a whole
+#     array (#2330).
+#
+# A local is typed as the emitter's LocalVar had it: rs_local (ref_check's Sema
+# side), which knows the inference's `@T` of `let p = @x`, and a `:&` param by
+# what it was written.  index_through keeps the lowering, and the one refusal
+# that is a limit of it: a slice through a pointer it doesn't lower.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.memory
+
+import ast
+import ast_helpers
+import emitter_core
+import let_check       # let_through_elem
+import ref_check       # rs_local, rs_note, ref_is_pointer
+import sema
+import sema_type
+import struct_index    # si_traits, si_is_struct, si_needs_index_msg
+import types           # ty_int_in, ty_is_float
+
+# 1 for a scalar type no ritz1 local uses to hold a pointer (AGAST #2885): an
+# i64 or u64 may, so neither is refused.
+fn ir_sized_scalar(t: i32) -> i32
+    (ty_int_in(t, 8, 32) == 1 or ty_is_float(t) == 1) as i32
+
+# `x`, a name, as the emitter's local of it: 1 and its type in *out, its `:&`
+# param in *lent; 0 when it's no local or Sema can't say.  A `:&` param is
+# what it was written (a `c:& C` is an `@&C`); rs_local reads it as its C.
+fn ir_local(sm: *Sema, x: *Expr, out: *SemaTy, lent: **Param) -> *SemaVar
+    *lent = null
+    if x == null or x.kind != EXPR_IDENT
+        return null
+    let v: *SemaVar = sema_find_local(sm, x.ident_ptr, x.ident_len)
+    if v == null
+        return null
+    if v.lent != null
+        let p: *Param = v.lent
+        let ipt: i32 = p.param_inner_pointee_type
+        if p.is_borrow == 1 and p.param_pointee_type == TYPE_PTR and (ipt == TYPE_ARRAY or primitive_name_len(ipt) > 0 or (ipt == TYPE_STRUCT and p.param_type_name_len > 0))
+            # AGAST #2075 / #3103: `p:& *T` binds as the caller's `*T` local
+            # (bind_scalar_borrow_param), not as a lent one.
+            rs_set(out, TYPE_PTR, ipt, p.param_type_name, p.param_type_name_len)
+            return v
+        *lent = p
+        rs_set(out, p.param_type, p.param_pointee_type, p.param_type_name, p.param_type_name_len)
+        return v
+    if rs_local(sm, v, out) == 0
+        return null
+    v
+
+# T of the `[N]T` behind `v`, a local `*[N]T`, `@[N]T` or `@&[N]T` the emitter
+# gives a `p#` view (add_array_view); TYPE_VOID otherwise.  A pointer to an
+# N-D array is a plane pointer (#2570), whose `p[i]` is a row: ref_value notes
+# arr_elem only on a written one-dimensional pointee, and a `p:& *[N]T` binds
+# no note, so neither is taken.
+fn ir_view_elem(sm: *Sema, v: *SemaVar) -> i32
+    let n: *RsNote = rs_note(sm, v)
+    if n == null or n.arr_elem == TYPE_VOID
+        return TYPE_VOID
+    sema_view_elem(sm, v)
+
+# Report `msg` at `e`'s `[`: the parser's record of it, else (an index the
+# compiler built) the start of `e`.  Always 1.
+fn ir_at_bracket(sm: *Sema, e: *Expr, msg: *u8) -> i32
+    var line: i32 = e.span.line
+    var col: i32 = e.span.col
+    if e.bracket.line > 0
+        line = e.bracket.line
+        col = e.bracket.col
+    sema_error_at(sm, line, col)
+    eprints_cstr(msg)
+    eprints_cstr(c"\n")
+    1
+
+# needs_index's words for `name` (or, with `name` null, the scalar `kind`) at
+# `e`'s `[`; 0 when a scalar `kind` has no name.
+fn ir_needs_index(sm: *Sema, e: *Expr, name: *u8, len: i32, kind: i32) -> i32
+    var n: *u8 = name
+    var l: i32 = len
+    if n == null
+        n = primitive_name_from_type(kind)
+        if n == null
+            return 0
+        l = strlen(n) as i32
+    ir_at_bracket(sm, e, si_needs_index_msg(n, l))
+
+# 1 when a struct of this name has something to index: a Vec, Span or String,
+# or one that implements `Index`.  An unknown name is given the benefit.
+fn ir_struct_indexes(sm: *Sema, name: *u8, len: i32) -> i32
+    if name == null or len <= 0 or name_is_indexable(name, len) == 1
+        return 1
+    ((si_traits(sm.module, name, len) & SI_INDEX) != 0) as i32
+
+# --- Inferred references this can't type -----------------------------------
+#
+# An un-annotated `let q = @x[i]` (or `@&`) is an `@` the emitter types from
+# what `x[i]` is: a row of an N-D `x` (#2555) is an array, which rs_ty types
+# as its leaf.  So such a binding, and a copy of one (`let r = q + 1`), is
+# never taken for an `@T` of a scalar here.  `@x` of a name and `@a[i]` of a
+# one-dimensional `a` are judged, as #2445 / #3079 wrote them.
+# One byte per Sema scope slot, keyed by the binding's name as RsNote is.
+
+var IR_UNSURE: **u8 = null
+var IR_UNSURE_CAP: i32 = 0
+
+fn ir_slot(sm: *Sema, v: *SemaVar) -> i32
+    ((v as i64 - sm.scope as i64) / sizeof(SemaVar)) as i32
+
+# 1 when `v` was bound unsure (above).
+fn ir_unsure(sm: *Sema, v: *SemaVar) -> i32
+    let i: i32 = ir_slot(sm, v)
+    if i < 0 or i >= IR_UNSURE_CAP
+        return 0
+    (*(IR_UNSURE + i) == v.name) as i32
+
+# 1 when `@x`'s operand `x` may be a row: an index of an N-D local (its
+# SemaVar.shape), of an unsure binding, or of anything but a local `[N]T`;
+# or no name or index at all.  `@a[i]` of a one-dimensional `a` is an `@T`.
+fn ir_addr_unsure(sm: *Sema, x: *Expr) -> i32
+    if x == null
+        return 1
+    if x.kind == EXPR_IDENT
+        return 0
+    var root: *Expr = x
+    while root.kind == EXPR_INDEX and root.left != null
+        root = root.left
+    if root == x or root.kind != EXPR_IDENT
+        return 1
+    let lv: *SemaVar = sema_find_local(sm, root.ident_ptr, root.ident_len)
+    if lv == null or lv.kind != TYPE_ARRAY or lv.shape != null
+        return 1
+    ir_unsure(sm, lv)
+
+# The binding `st` just made (sema_walk, after sema_bind_decl): note it unsure
+# when it is un-annotated and holds `@` / `@&` of what may be a row
+# (ir_addr_unsure), or copies such a binding (under any `+ k` / `- k`).
+pub fn index_refuse_note_decl(sm: *Sema, st: *Stmt)
+    if sm.scope_top <= 0
+        return
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if name_eq(v.name, v.name_len, st.var_name, st.var_name_len) == 0
+        return
+    let i: i32 = ir_slot(sm, v)
+    if i >= IR_UNSURE_CAP
+        let cap: i32 = i * 2 + 16
+        let grown: **u8 = malloc((cap as i64) * sizeof(*u8)) as **u8
+        memset(grown as *u8, 0, (cap as i64) * sizeof(*u8))
+        if IR_UNSURE != null
+            memcpy(grown as *u8, IR_UNSURE as *u8, (IR_UNSURE_CAP as i64) * sizeof(*u8))
+            free(IR_UNSURE as *u8)
+        IR_UNSURE = grown
+        IR_UNSURE_CAP = cap
+    *(IR_UNSURE + i) = null
+    let init: *Expr = st.var_init
+    if st.var_declared_type != TYPE_VOID or init == null
+        return
+    # Judged in the scope outside the new binding, as `let q = q` reads.
+    sm.scope_top = sm.scope_top - 1
+    var unsure: i32 = 0
+    if init.kind == EXPR_UNARY and (init.op == OP_ADDR or init.op == OP_ADDR_MUT)
+        unsure = ir_addr_unsure(sm, init.operand)
+    else
+        # A copy, `let r = q` or `let r = q + 1`.
+        var x: *Expr = init
+        while x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB) and x.left != null
+            x = x.left
+        if x.kind == EXPR_IDENT
+            let src: *SemaVar = sema_find_local(sm, x.ident_ptr, x.ident_len)
+            if src != null
+                unsure = ir_unsure(sm, src)
+    sm.scope_top = sm.scope_top + 1
+    if unsure == 1
+        *(IR_UNSURE + i) = v.name
+
+# `p[i]`, `p` a local `@T` / `@&T` whose T is no array, Vec, Span or String:
+# a reference is one value (LARB R9, AGAST #2440).  `(*q)[i]` names what is
+# behind the reference, so it isn't one of these.
+fn ir_reference_refused(sm: *Sema, e: *Expr) -> i32
+    var t: SemaTy
+    var lent: *Param = null
+    let v: *SemaVar = ir_local(sm, e.left, @t, @lent)
+    if v == null
+        return 0
+    if t.kind != TYPE_REF and t.kind != TYPE_MUT_REF
+        return 0
+    if ir_unsure(sm, v) == 1
+        return 0
+    if t.pointee == TYPE_ARRAY
+        return 0
+    if t.pointee == TYPE_STRUCT and name_is_indexable(t.name, t.name_len) == 1
+        return 0
+    sema_error_at(sm, e.span.line, e.span.col)
+    eprints_cstr(c"a reference is one value, not a buffer: `[]` needs an array, Vec, Span or String behind it\n")
+    1
+
+# AGAST #2452: `x[i][j]`, `e`, with `x[i]` an element of a local `[N]T`, of a
+# `*[N]T`'s view, or of a Vec, Span or String (or a pointer to one) that has
+# nothing to index: a scalar, or a struct without `Index`.  An element that is
+# a pointer is a raw buffer, and one that's a Vec, Span or String indexes
+# (#2442).  index_scalar_check (#3755) doesn't meet these: sema_expr_type
+# types no element `x[i]` as a scalar.
+fn ir_element_refused(sm: *Sema, e: *Expr) -> i32
+    let inner: *Expr = e.left
+    if inner.right == null or inner.right.kind == EXPR_RANGE
+        return 0
+    var root: *Expr = inner.left
+    if root == null
+        return 0
+    var t: SemaTy
+    var lent: *Param = null
+    let v: *SemaVar = ir_local(sm, root, @t, @lent)
+    if v != null and lent == null and t.kind == TYPE_ARRAY
+        # An element of a local `[N]T`.
+        if t.pointee == TYPE_STRUCT
+            if ir_struct_indexes(sm, t.name, t.name_len) == 1
+                return 0
+            return ir_needs_index(sm, e, t.name, t.name_len, TYPE_STRUCT)
+        return ir_needs_index(sm, e, null, 0, t.pointee)
+    if v != null and lent == null
+        # An element of the `[N]T` a `*[N]T` points at (its `p#` view).
+        let view: i32 = ir_view_elem(sm, v)
+        if view != TYPE_VOID
+            if view == TYPE_STRUCT
+                if ir_struct_indexes(sm, v.type_name, v.type_name_len) == 1
+                    return 0
+                return ir_needs_index(sm, e, v.type_name, v.type_name_len, TYPE_STRUCT)
+            return ir_needs_index(sm, e, null, 0, view)
+    # An element of a Vec, Span or String, or of what a pointer to one points
+    # at: `v[i]`, `(*p)[i]`, `x.vf[i]`.
+    let rk: i32 = root.kind
+    if rk != EXPR_IDENT and rk != EXPR_MEMBER and (rk != EXPR_UNARY or root.op != OP_DEREF)
+        return 0
+    if v == null and rs_ty(sm, root, @t) == 0
+        return 0
+    if rk == EXPR_IDENT and t.kind != TYPE_STRUCT and (ref_is_pointer(t.kind) == 0 or t.pointee != TYPE_STRUCT)
+        return 0
+    var k: i32 = TYPE_VOID
+    var n: *u8 = null
+    var l: i32 = 0
+    if let_through_elem(sm, t.kind, t.pointee, t.name, t.name_len, @k, @n, @l) == 0
+        return 0
+    if k == TYPE_STRUCT
+        if n == null or l <= 0 or sema_find_struct(sm, n, l) == null or ir_struct_indexes(sm, n, l) == 1
+            return 0
+        return ir_needs_index(sm, e, n, l, TYPE_STRUCT)
+    ir_needs_index(sm, e, null, 0, k)
+
+# AGAST #3132: `(*p)[i]`, `e`, with `p` a local `*T` and T a struct without
+# `Index` or a sized scalar: `*p` is one T, with nothing to index.  A
+# `p:& *T` param is the same.  A `*[N]T`, `**T` or `*Vec<T>` isn't this shape
+# (#2330, #2537, #2331), and an i64 `*p` may hold a pointer.
+fn ir_deref_pointee_refused(sm: *Sema, e: *Expr) -> i32
+    var t: SemaTy
+    var lent: *Param = null
+    if ir_local(sm, e.left.operand, @t, @lent) == null
+        return 0
+    if t.kind != TYPE_PTR or t.pointee == TYPE_ARRAY
+        return 0
+    if t.pointee == TYPE_STRUCT
+        if t.name == null or t.name_len == 0 or name_is_indexable(t.name, t.name_len) == 1
+            return 0
+        if si_is_struct(sm.module, t.name, t.name_len) == 0 or ir_struct_indexes(sm, t.name, t.name_len) == 1
+            return 0
+        return ir_needs_index(sm, e, t.name, t.name_len, TYPE_STRUCT)
+    if ir_sized_scalar(t.pointee) == 0
+        return 0
+    ir_needs_index(sm, e, null, 0, t.pointee)
+
+# `e`, an EXPR_INDEX read or store target.  sema_walk_expr calls this for
+# every index it visits, after index_scalar_check.  A slice (`p[a..b]`) meets
+# the reference rule only, as index_refused had it.
+pub fn index_refuse_check(sm: *Sema, e: *Expr)
+    if e == null or e.kind != EXPR_INDEX or e.left == null or e.right == null
+        return
+    let b: *Expr = e.left
+    if b.kind == EXPR_IDENT
+        ir_reference_refused(sm, e)
+    else if e.right.kind == EXPR_RANGE
+        return
+    else if b.kind == EXPR_INDEX
+        ir_element_refused(sm, e)
+    else if b.kind == EXPR_UNARY and b.op == OP_DEREF
+        ir_deref_pointee_refused(sm, e)
+
+# `p[i] = v` / `p[i] op= v`, a STMT_INDEX_ASSIGN on the name st.assign_target,
+# index st.while_cond, `[` at st.bracket: index_refuse_check on that target.
+pub fn index_refuse_name_store(sm: *Sema, st: *Stmt)
+    var root: Expr
+    var target: Expr
+    memset(@root as *u8, 0, sizeof(Expr))
+    memset(@target as *u8, 0, sizeof(Expr))
+    root.kind = EXPR_IDENT
+    root.span = st.span
+    root.ident_ptr = st.assign_target
+    root.ident_len = st.assign_target_len
+    target.kind = EXPR_INDEX
+    target.span = st.span
+    target.bracket = st.bracket
+    target.left = @root
+    target.right = st.while_cond
+    index_refuse_check(sm, @target)
+    index_whole_array_check(sm, @target, st)
+
+# AGAST #2452 / #2885: `*v`, `d`, with `v` a local struct or sized scalar by
+# value: there is no pointer to follow.  An i64 or u64 local may hold a
+# pointer, and an integer `:&` borrow binds as a plain T, so neither is
+# refused.  ritz0 says the same, from array_rules.NOT_A_POINTER: of a `.`'s
+# or a method's receiver too, `(*v).f` / `(*v).m()`, which the emitter never
+# refused ("unhandled EXPR_MEMBER", "cannot determine receiver type").
+pub fn deref_value_check(sm: *Sema, d: *Expr)
+    if d == null or d.kind != EXPR_UNARY or d.op != OP_DEREF
+        return
+    var t: SemaTy
+    var lent: *Param = null
+    if ir_local(sm, d.operand, @t, @lent) == null or lent != null
+        return
+    if t.kind != TYPE_STRUCT and ir_sized_scalar(t.kind) == 0
+        return
+    sema_error_at(sm, d.span.line, d.span.col)
+    eprints_cstr(c"`*x` needs `x` to be a pointer or a reference: this one is a value\n")
+
+# AGAST #2330: `p[i] = b`, `target` the store's EXPR_INDEX (`p[i]` or
+# `(*p)[i]`) and `st` the assignment, with `p` a local `*[N]T`, `@[N]T` or
+# `@&[N]T` the emitter views (add_array_view) and `b` a whole array.  `p[i]`
+# is one T (LARB R9); ritz0 stored `b` a row on.  ritz0 says the same, from
+# array_rules.ELEMENT_NOT_ARRAY.
+pub fn index_whole_array_check(sm: *Sema, target: *Expr, st: *Stmt)
+    let value: *Expr = st.assign_value
+    if target == null or target.kind != EXPR_INDEX or target.left == null or value == null
+        return
+    if target.right == null or target.right.kind == EXPR_RANGE
+        return
+    var root: *Expr = target.left
+    if root.kind == EXPR_UNARY and root.op == OP_DEREF
+        root = root.operand
+    if root == null or root.kind != EXPR_IDENT
+        return
+    let v: *SemaVar = sema_find_local(sm, root.ident_ptr, root.ident_len)
+    if v == null or ir_view_elem(sm, v) == TYPE_VOID
+        return
+    let literal: i32 = (value.kind == EXPR_ARRAY_LIT or value.kind == EXPR_ARRAY_FILL) as i32
+    if literal == 0 and sema_expr_type(sm, value) != TYPE_ARRAY
+        return
+    sema_error_at(sm, st.span.line, st.span.col)
+    eprints_cstr(c"`p[i]` is one element of the array behind `p`, not the whole array: `*p = a` stores the array\n")

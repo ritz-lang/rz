@@ -59,6 +59,7 @@ SOURCES = \
 	discarded_array \
 	if_arm_value \
 	sema_index_store \
+	index_refuse \
 	pass_value \
 	generic_method \
 	field_slot \

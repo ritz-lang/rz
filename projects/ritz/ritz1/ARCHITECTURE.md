@@ -203,9 +203,19 @@ still run mid-lowering on `*EmitterState`, and
   error at its use. main records each loaded module and import edge before
   merging; `sema_walk` asks `vis_hidden` at each use in the input's own fns.
 
-- `index_through` — `[]` through a pointer or reference (R9). Its type
-  facts (what `x[i]` holds) are `sema_type`'s, on Sema (#3510); its refusals
-  and other emitter readers are #3893.
+- `index_refuse` — what has nothing to index or no pointer to follow (§7.8,
+  R9; #3893): `p[i]` through an `@T` that isn't a buffer, `x[i][j]` /
+  `(*p)[i]` of a scalar or a struct without `Index`, `*v` of a value, a whole
+  array stored into `p[i]`. On Sema, its locals typed as the emitter's
+  (`rs_local`), at every index and `*` the walk visits.
+
+- `index_through` — `[]` through a pointer or reference (R9): the view it
+  lowers (`index_through_fill`, `through_spill`). Its type facts (what `x[i]`
+  holds) are `sema_type`'s, on Sema (#3510), and its rules `index_refuse`'s
+  (#3893); it keeps one refusal, a slice through a pointer it doesn't lower,
+  a limit of the lowering. Emitter-side readers of its facts (bool_kind,
+  ownership, emitter_stmt / _core / _expr_call, ref_check's `env.s` side)
+  go with their own moves (#3506, #3507).
 
 - `let_check` — `let` immutability: no write or `@&` through a `let`'s place.
   Its place rule (`let_place`) reads either view through a `LetEnv`:
