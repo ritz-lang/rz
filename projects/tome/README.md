@@ -92,7 +92,7 @@ The embedded store is `lib/tome.ritz`, which only re-exports its parts
 
 The server side is `resp.ritz` (RESP protocol), `commands.ritz` (command
 dispatch), `session.ritz` (per-connection state), `server.ritz` (io_uring
-loop), `blocking_server.ritz` / `server_blocking.ritz` (blocking loops),
+loop), `blocking_server.ritz` (blocking loop, `-b`),
 `master.ritz` (multi-process master) and `client.ritz` (client).
 
 ## Dependencies

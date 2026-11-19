@@ -577,3 +577,210 @@ fn test_cmd_bulk_reply_respects_cap() -> i32
     if strcmp(@buf[0], c"$2\r\nhi\r\n") != 0
         return 2
     return 0
+
+
+# ============================================================================
+# Sorted set commands (AGAST #3070)
+# ============================================================================
+# Replies follow Redis: integer replies for counts and ranks, a nil bulk for
+# a missing ZSCORE / ZRANK / ZREVRANK, and arrays for ZRANGE / ZREVRANGE.
+
+const WRONGTYPE_REPLY: *u8 = c"-WRONGTYPE Operation against a key holding the wrong kind of value\r\n"
+
+# z = {a:1, b:2, c:3}
+fn zset_fixture(store: *Store) -> i32
+    return reply_is(store, c"ZADD z 1 a 2 b 3 c\r\n", c":3\r\n")
+
+
+[[test]]
+fn test_cmd_zadd() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    # An update of an existing member is not counted; a new one is.
+    if reply_is(@store, c"ZADD z 5 a 4 d\r\n", c":1\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZSCORE z a\r\n", c"$1\r\n5\r\n") != 0
+        return 3
+    # A bad score rejects the whole command: nothing is added.
+    if reply_is(@store, c"ZADD z 9 e x f\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZCARD z\r\n", c":4\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZADD z 1\r\n", c"-ERR wrong number of arguments for 'zadd' command\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZADD z 1 a 2\r\n", c"-ERR syntax error\r\n") != 0
+        return 7
+    if reply_is(@store, c"zadd neg -7 m\r\n", c":1\r\n") != 0
+        return 8
+    return 0
+
+
+[[test]]
+fn test_cmd_zrem() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZREM z a x c\r\n", c":2\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZREM nokey a\r\n", c":0\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZRANGE z 0 -1\r\n", c"*1\r\n$1\r\nb\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZREM z\r\n", c"-ERR wrong number of arguments for 'zrem' command\r\n") != 0
+        return 5
+    return 0
+
+
+[[test]]
+fn test_cmd_zscore() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZSCORE z b\r\n", c"$1\r\n2\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZSCORE z nope\r\n", c"$-1\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZSCORE nokey a\r\n", c"$-1\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZADD z -12 n\r\n", c":1\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZSCORE z n\r\n", c"$3\r\n-12\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZSCORE z\r\n", c"-ERR wrong number of arguments for 'zscore' command\r\n") != 0
+        return 7
+    return 0
+
+
+[[test]]
+fn test_cmd_zrank() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZRANK z a\r\n", c":0\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZRANK z c\r\n", c":2\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZRANK z nope\r\n", c"$-1\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZRANK nokey a\r\n", c"$-1\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZRANK z\r\n", c"-ERR wrong number of arguments for 'zrank' command\r\n") != 0
+        return 6
+    return 0
+
+
+[[test]]
+fn test_cmd_zrevrank() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZREVRANK z a\r\n", c":2\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZREVRANK z c\r\n", c":0\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZREVRANK z nope\r\n", c"$-1\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZREVRANK nokey a\r\n", c"$-1\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZREVRANK z\r\n", c"-ERR wrong number of arguments for 'zrevrank' command\r\n") != 0
+        return 6
+    return 0
+
+
+[[test]]
+fn test_cmd_zcard() -> i32
+    var store: Store = store_new()
+    if reply_is(@store, c"ZCARD z\r\n", c":0\r\n") != 0
+        return 1
+    if zset_fixture(@store) != 0
+        return 2
+    if reply_is(@store, c"ZCARD z\r\n", c":3\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZCARD\r\n", c"-ERR wrong number of arguments for 'zcard' command\r\n") != 0
+        return 4
+    return 0
+
+
+[[test]]
+fn test_cmd_zrange() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZRANGE z 0 -1\r\n", c"*3\r\n$1\r\na\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZRANGE z 1 1\r\n", c"*1\r\n$1\r\nb\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZRANGE z 5 9\r\n", c"*0\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZRANGE nokey 0 -1\r\n", c"*0\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZRANGE z 0 1 withscores\r\n", c"*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZRANGE z x 1\r\n", c"-ERR value is not an integer or out of range\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZRANGE z 0 1 BOGUS\r\n", c"-ERR syntax error\r\n") != 0
+        return 8
+    if reply_is(@store, c"ZRANGE z 0\r\n", c"-ERR wrong number of arguments for 'zrange' command\r\n") != 0
+        return 9
+    return 0
+
+
+[[test]]
+fn test_cmd_zrevrange() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZREVRANGE z 0 -1\r\n", c"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZREVRANGE z 0 0 WITHSCORES\r\n", c"*2\r\n$1\r\nc\r\n$1\r\n3\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZREVRANGE nokey 0 -1\r\n", c"*0\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZREVRANGE z 0\r\n", c"-ERR wrong number of arguments for 'zrevrange' command\r\n") != 0
+        return 5
+    return 0
+
+
+[[test]]
+fn test_cmd_zset_wrongtype() -> i32
+    var store: Store = store_new()
+    if reply_is(@store, c"SET s v\r\n", c"+OK\r\n") != 0
+        return 1
+    if reply_is(@store, c"ZADD s 1 a\r\n", WRONGTYPE_REPLY) != 0
+        return 2
+    if reply_is(@store, c"ZREM s a\r\n", WRONGTYPE_REPLY) != 0
+        return 3
+    if reply_is(@store, c"ZSCORE s a\r\n", WRONGTYPE_REPLY) != 0
+        return 4
+    if reply_is(@store, c"ZRANK s a\r\n", WRONGTYPE_REPLY) != 0
+        return 5
+    if reply_is(@store, c"ZREVRANK s a\r\n", WRONGTYPE_REPLY) != 0
+        return 6
+    if reply_is(@store, c"ZCARD s\r\n", WRONGTYPE_REPLY) != 0
+        return 7
+    if reply_is(@store, c"ZRANGE s 0 -1\r\n", WRONGTYPE_REPLY) != 0
+        return 8
+    if reply_is(@store, c"ZREVRANGE s 0 -1\r\n", WRONGTYPE_REPLY) != 0
+        return 9
+    # The string is untouched.
+    if reply_is(@store, c"GET s\r\n", c"$1\r\nv\r\n") != 0
+        return 10
+    return 0
+
+
+[[test]]
+fn test_cmd_zrange_reply_respects_cap() -> i32
+    var store: Store = store_new()
+    var name: [4]u8
+    name[0] = 109  # 'm'
+    name[2] = 0
+    for i in 0..20
+        name[1] = (97 + i) as u8
+        store_zadd_cstr(@store, c"z", i as i64, @name[0])
+    var buf: [128]u8
+    if exec_capped(@store, c"ZRANGE z 0 -1\r\n", @buf[0]) != 0
+        return 1
+    if exec_capped(@store, c"ZREVRANGE z 0 -1 WITHSCORES\r\n", @buf[0]) != 0
+        return 2
+    return 0

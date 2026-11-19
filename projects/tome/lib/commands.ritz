@@ -840,6 +840,209 @@ fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
 
 
 # ============================================================================
+# Sorted Set Commands (AGAST #3070)
+# ============================================================================
+# Replies follow Redis.  Scores are i64 in the store (store_zset.ritz), so a
+# score must be an integer; anything else gets Redis's float error.
+
+# If `key` holds a value that is not a sorted set, write the WRONGTYPE reply
+# and answer true.  store_zcard is the type probe: it is -1 only then.
+fn zset_wrongtype(ctx: *CommandContext, key: StrView) -> bool
+    if store_zcard(ctx.store, key) < 0
+        let wrongtype: StrView = "WRONGTYPE Operation against a key holding the wrong kind of value"
+        ctx_write_error_sv(ctx, wrongtype)
+        return true
+    return false
+
+
+# ZADD key score member [score member ...]
+fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 4
+        let err: StrView = "ERR wrong number of arguments for 'zadd' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+    if (cmd.argc - 2) % 2 != 0
+        let err: StrView = "ERR syntax error"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+
+    # Every score is checked before anything is added, so a bad one leaves
+    # the set as it was (as Redis does).
+    var i: i32 = 2
+    while i < cmd.argc
+        var score: i64 = 0
+        let arg: *RespArg = @cmd.args[i]
+        if resp_parse_i64(arg.data, arg.len, @score) == 0
+            let err: StrView = "ERR value is not a valid float"
+            ctx_write_error_sv(ctx, err)
+            return CMD_ERR_SYNTAX
+        i += 2
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    var added: i64 = 0
+    i = 2
+    while i < cmd.argc
+        var score: i64 = 0
+        let arg: *RespArg = @cmd.args[i]
+        resp_parse_i64(arg.data, arg.len, @score)
+        var member_sv: StrView = resp_arg_sv(@cmd.args[i + 1])
+        added += store_zadd(ctx.store, key_sv, score, member_sv)
+        i += 2
+
+    ctx_write_int(ctx, added)
+    return CMD_OK
+
+
+# ZREM key member [member ...]
+fn cmd_zrem(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 3
+        let err: StrView = "ERR wrong number of arguments for 'zrem' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    var removed: i64 = 0
+    for i in 2..cmd.argc
+        var member_sv: StrView = resp_arg_sv(@cmd.args[i])
+        removed += store_zrem(ctx.store, key_sv, member_sv)
+
+    ctx_write_int(ctx, removed)
+    return CMD_OK
+
+
+# ZSCORE key member: the score as a bulk string, nil if there is none.
+fn cmd_zscore(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 3
+        let err: StrView = "ERR wrong number of arguments for 'zscore' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    var member_sv: StrView = resp_arg_sv(@cmd.args[2])
+    var score: i64 = 0
+    if store_zscore(ctx.store, key_sv, member_sv, @&score) == 0
+        ctx_write_null(ctx)
+        return CMD_OK
+
+    var digits: [24]u8
+    let n: i64 = fmt_i64_into(@digits[0], score)
+    ctx_write_bulk(ctx, @digits[0], n)
+    return CMD_OK
+
+
+# ZRANK / ZREVRANK key member: the 0-based rank as an integer, nil if the
+# member (or the key) is missing.
+fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i32
+    if cmd.argc != 3
+        var err: [96]u8
+        argc_error(@err[0], name)
+        ctx_write_error(ctx, @err[0])
+        return CMD_ERR_ARGC
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    var member_sv: StrView = resp_arg_sv(@cmd.args[2])
+    var rank: i64 = -1
+    if rev
+        rank = store_zrevrank(ctx.store, key_sv, member_sv)
+    else
+        rank = store_zrank(ctx.store, key_sv, member_sv)
+    if rank < 0
+        ctx_write_null(ctx)
+    else
+        ctx_write_int(ctx, rank)
+    return CMD_OK
+
+
+# ZCARD key
+fn cmd_zcard(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 2
+        let err: StrView = "ERR wrong number of arguments for 'zcard' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    ctx_write_int(ctx, store_zcard(ctx.store, key_sv))
+    return CMD_OK
+
+
+# ZRANGE / ZREVRANGE key start stop [WITHSCORES]
+# An array of members (ascending or descending score); with WITHSCORES each
+# member is followed by its score as a bulk string.  The 6.2 ZRANGE options
+# (BYSCORE, BYLEX, REV, LIMIT) are not supported: they are a syntax error.
+fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i32
+    if cmd.argc < 4
+        var err: [96]u8
+        argc_error(@err[0], name)
+        ctx_write_error(ctx, @err[0])
+        return CMD_ERR_ARGC
+
+    var withscores: bool = false
+    if cmd.argc == 5
+        let opt: StrView = "WITHSCORES"
+        withscores = resp_arg_eq_ci_sv(@cmd.args[4], opt) == 1
+    if cmd.argc > 5 or (cmd.argc == 5 and not withscores)
+        let err: StrView = "ERR syntax error"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+
+    var ok: i32 = 0
+    let start: i64 = resp_arg_to_int(@cmd.args[2], @ok)
+    var ok2: i32 = 0
+    let stop: i64 = resp_arg_to_int(@cmd.args[3], @ok2)
+    if ok == 0 or ok2 == 0
+        let notint: StrView = "ERR value is not an integer or out of range"
+        ctx_write_error_sv(ctx, notint)
+        return CMD_ERR_SYNTAX
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+
+    var count: i64 = 0
+    var members: *StrView = null
+    if rev
+        members = store_zrevrange(ctx.store, key_sv, start, stop, @&count)
+    else
+        members = store_zrange(ctx.store, key_sv, start, stop, @&count)
+
+    if not withscores
+        ctx_write_bulk_array(ctx, members, count)
+        return CMD_OK
+
+    # Interleave member, score.  Each score's digits live in `digits` (24
+    # bytes a score) until the reply is written.
+    let items: *StrView = malloc(2 * count * sizeof(StrView) + 1) as *StrView
+    let digits: *u8 = malloc(24 * count + 1)
+    for i in 0..count
+        var score: i64 = 0
+        store_zscore(ctx.store, key_sv, members[i], @&score)
+        let d: *u8 = digits + 24 * i
+        let n: i64 = fmt_i64_into(d, score)
+        items[2 * i] = members[i]
+        items[2 * i + 1] = strview_from_ptr(d, n)
+    ctx_write_bulk_array(ctx, items, 2 * count)  # frees items
+    free(digits)
+    if members != null
+        free(members as *u8)
+    return CMD_OK
+
+
+# ============================================================================
 # Server Commands
 # ============================================================================
 
@@ -1063,6 +1266,32 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_hgetall_name: StrView = "HGETALL"
     if resp_arg_eq_ci_sv(c, cmd_hgetall_name) == 1
         return cmd_hgetall(ctx, cmd)
+
+    # Sorted set commands
+    let cmd_zadd_name: StrView = "ZADD"
+    if resp_arg_eq_ci_sv(c, cmd_zadd_name) == 1
+        return cmd_zadd(ctx, cmd)
+    let cmd_zrem_name: StrView = "ZREM"
+    if resp_arg_eq_ci_sv(c, cmd_zrem_name) == 1
+        return cmd_zrem(ctx, cmd)
+    let cmd_zscore_name: StrView = "ZSCORE"
+    if resp_arg_eq_ci_sv(c, cmd_zscore_name) == 1
+        return cmd_zscore(ctx, cmd)
+    let cmd_zrank_name: StrView = "ZRANK"
+    if resp_arg_eq_ci_sv(c, cmd_zrank_name) == 1
+        return cmd_zrank(ctx, cmd, false, c"zrank")
+    let cmd_zrevrank_name: StrView = "ZREVRANK"
+    if resp_arg_eq_ci_sv(c, cmd_zrevrank_name) == 1
+        return cmd_zrank(ctx, cmd, true, c"zrevrank")
+    let cmd_zcard_name: StrView = "ZCARD"
+    if resp_arg_eq_ci_sv(c, cmd_zcard_name) == 1
+        return cmd_zcard(ctx, cmd)
+    let cmd_zrange_name: StrView = "ZRANGE"
+    if resp_arg_eq_ci_sv(c, cmd_zrange_name) == 1
+        return cmd_zrange(ctx, cmd, false, c"zrange")
+    let cmd_zrevrange_name: StrView = "ZREVRANGE"
+    if resp_arg_eq_ci_sv(c, cmd_zrevrange_name) == 1
+        return cmd_zrange(ctx, cmd, true, c"zrevrange")
 
     # Unknown command
     let err: StrView = "ERR unknown command"
