@@ -109,7 +109,7 @@ stays here; remote hosts only run rooms.
 | chungus | `adele-chungus` | 2 | yes (2026-11-12) | 8 cores, 14 GB, ~5-8 GB free (another user's desktop session) and 47 GB disk free (95% used). Smoke passes. `clang`/`lld`/`llvm` 21.1.8; `lld` is a user-local copy (`~/.local/opt/lld-21`). Approved by Aaron 2026-11-12. **1 slot while minecraft is running** (Aaron, 2026-11-14). **2 slots from 2026-11-16 04:50Z** (Aaron, with minecraft stopped). No host.env, so both rooms share the default 7G/8G slice. Watch the disk |
 | huburght | `adele-huburght` | 8 | yes (2026-11-11) | 12 cores, 47 GB (~42 GB free), WSL2 (gone if Windows sleeps). ssh `aaron@10.0.0.191` (name doesn't resolve). Smoke 38 s. `clang`/`lld`/`llvm` 21.1.2 installed 2026-11-11. 2 slots from 2026-11-12 (Aaron: "tons of memory free"; #2582 and #2780 merged cleanly). **6 slots from 2026-11-14 01:04Z** (Aaron, 2026-11-13; omegalisk stays at 2): #2998 landed as 62c9082a and huburght's `~/.config/rz/host.env` sets rooms 28G high / 32G max and 2 gate slots (`host-budget.sh --verify <room>` there shows them). **8 slots from 2026-11-15 16:50Z** (Aaron, while bangerang leaves the LAN: "maybe it can handle 8 rooms … even 12 would work"; go to 12 once 8 has run cleanly). **16 slots from 2026-11-16 04:50Z** (Aaron). **12 slots, spawn while load1 < 25, from 2026-11-16 05:47Z** (Aaron: slower rooms and gates are fine, because more run in parallel; at 16 the load sat at 18–25 on 12 cores and load1 < 14 held spawns back). **8 slots from 2026-11-16, draining** (Aaron: "it seems to be struggling … ease back to 8 and don't go over"): the 12 rooms running then finish normally; nothing is cancelled. No new huburght spawn until fewer than 8 rooms are running, then never more than 8. Baseline at 5 rooms + 2 gates: agents ~0.8 GiB RSS each, gates ~2.5–3 GiB each in `ritz-gate.slice` (no memory cap there; `RZ_GATE_SLOTS` bounds it), 35 GiB free. Coarse mtime clock (#2689) |
 | bangerang | `adele-bangerang` | 6 | yes (2026-11-16) | 10.0.0.224, 61 GiB, ~39 GB disk free (92% used): watch the disk. Ubuntu 26.04, qemu 10.2.1, OVMF 2025.11. **6 slots** (Aaron, 2026-11-16: "bangerang is up and ready"). `/tmp` `noexec` removed; host key `SHA256:jEVBo2Sd…mYI6Q` checked. Full gate passes apart from lexis (`bangerang-setup-d43dae956cb1-4.log`). The test-uefi-boot step stalled once in firmware (1 of 6 runs, cause unknown): send `adele` the gate log if it recurs. `host.env` 20G / 24G, 2 gate slots. First room #1540; its gate runs (venv found). Ramp up from 1 room. **Disk: ~20 GB free is enough** (Aaron, 2026-11-18: "20GB is plenty"; no spawn hold for disk at that level). When it gets tight, clear Ritz caches there (`~/.cache/ritz`, old `/tmp/pytest-of-aaron` runs, orphaned `rz-task-*` worktrees) rather than holding spawns: 6 GB freed that way on 2026-11-18 (20 → 26 GB) |
-| skronk, skronk-2, skronk-3 | `adele-skronk`, `adele-skronk-2`, `adele-skronk-3` | 16 each | yes (2026-11-18), **ephemeral** | **Three boxes from 2026-11-18 ~21:00Z** (Aaron: "register skronk-2 and skronk-3 for work, same specs as skronk"): skronk-2 was spot-terminated ~20:15Z (us-east-1c again; 10 of its 15 rooms had REAPed, the other 5 were re-spawned on bangerang) and relaunched; skronk-3 is new. Deadlines: skronk and skronk-2 02:54Z, skronk-3 08:55Z (`terraform output deadlines_utc`), so long tickets go on skronk-3. Each host's `public_ips` entry goes in `~/.ssh/rz_hosts`. **16 rooms per box from 2026-11-18 15:42Z** (Aaron). At 24, skronk-2 sat at load 119-126 on 36 vCPUs with memory fine (40G free), and gates went false-red on time-outs (#3554's `[Test workspace]` got SIGTERM with every test passing). A box over 16 drains: its rooms finish, and it takes no SPAWN until it's below 16. Spawn on the box with fewer rooms first. **Relaunched 14:54Z 2026-11-18** after both boxes were lost (likely a spot reclaim, ~09:20Z): new IPs in `~/.ssh/rz_hosts`, deadline 02:54Z (both). **Since 06:54Z 2026-11-18: two boxes, EC2 spot c5.9xlarge (36 vCPU, 72 GiB / 68 usable, 200 GB gp3)**, `instance_count = 2`. skronk dies 15:59Z, skronk-2 18:19Z (each counts from its own first apply). **24 rooms per box** (Aaron, 07:00Z), no load hold (spawn unless MemAvailable < 10 GiB). `host.env` 44G / 50G rooms, `RZ_GATE_SLOTS=6` (4 room + 2 train), the Terraform defaults. **Spot losses on 2026-11-18, all in us-east-1c:** the first c5.9xlarge at about 06:15Z (19 rooms), then a c5.12xlarge pair (06:20–06:50Z, 32 rooms + 2 train slots each, 64 rooms lost within 30 minutes). Pin another AZ at the next launch (Aaron: "elsewhere"; the boxes are ephemeral, so no disk has to follow). After the second loss, 23 of 63 rooms had pushed work. Those plus the 25 highest-priority of the rest came back, and the other 15 were released to ready. 12xlarge sizing, for reference: 60G / 66G rooms. `host.env` gets `RZ_TRAIN_SLOTS=2` (AGAST #4031; Terraform var once it lands): 2 of the 6 gate slots are train-only. (Before #4031 the parser rejected the key and every gate on the box failed to start, `gate --next skronk-2`, 06:33Z.) Train 2's speculative gate can run on a skronk (`train.sh gate --next skronk-2`). **Spot loss (06:15Z):** the first skronk was terminated while Aaron applied the second box and took `adele-skronk` and 19 rooms with it. Those rooms were re-spawned under the same room IDs: a re-spawned room reads its original briefing from its own room history and resets to its pushed `ritz-task-<id>` branch if there is one, and its claim moves to `ritz-task-<id>@<new box>`. That's why briefings tell rooms to push every commit. Long-running tickets go on the box with the later deadline. Before 06:20Z: one c5.9xlarge (36 vCPU, 72 GiB, 200 GB gp3), Ubuntu 26.04, built and torn down by Terraform in `~/dev/nevelis/lab/skronk` (AGAST #3996; Aaron runs `terraform apply`/`destroy`). **It dies at a deadline** (`terraform output deadline_utc`; `/run/skronk-minutes-left` on the box): it powers itself off then, and EventBridge terminates it 10 minutes later. Unpushed work is lost, so every briefing says to push often and to report by deadline − 20 min; tear rooms down (or let them go) before the deadline, and `release_task` anything that didn't REAP. The public IP changes every launch: update `Host skronk` in `~/.ssh/rz_hosts` from `terraform output rz_hosts_entry`. Remotes are https via `gh`. `host.env` 48G / 54G, 4 gate slots. First run 2026-11-18 04:25Z: 12 rooms at load1 ~13. Smoke 28.6 s. **24 slots from 2026-11-18 05:50Z** (Aaron: "crank skronk up … go to 24"): `ttl_minutes` 720 (deadline 15:59Z) and `root_volume_gb` 200 applied in place, root grown online (growpart + resize2fs) |
+| skronk, skronk-2, skronk-3 | `adele-skronk`, `adele-skronk-2`, `adele-skronk-3` | 16 each | yes (2026-11-18), **ephemeral** | **Three boxes from 2026-11-18 ~21:00Z** (Aaron: "register skronk-2 and skronk-3 for work, same specs as skronk"): skronk-2 was spot-terminated ~20:15Z (us-east-1c again; 10 of its 15 rooms had REAPed, the other 5 were re-spawned on bangerang) and relaunched; skronk-3 is new. Deadlines: skronk and skronk-2 02:54Z, skronk-3 08:55Z (`terraform output deadlines_utc`), so long tickets go on skronk-3. Each host's `public_ips` entry goes in `~/.ssh/rz_hosts`. **16 rooms per box from 2026-11-18 15:42Z** (Aaron). At 24, skronk-2 sat at load 119-126 on 36 vCPUs with memory fine (40G free), and gates went false-red on time-outs (#3554's `[Test workspace]` got SIGTERM with every test passing). A box over 16 drains: its rooms finish, and it takes no SPAWN until it's below 16. Spawn on the box with fewer rooms first. **Relaunched 14:54Z 2026-11-18** after both boxes were lost (likely a spot reclaim, ~09:20Z): new IPs in `~/.ssh/rz_hosts`, deadline 02:54Z (both). **Since 06:54Z 2026-11-18: two boxes, EC2 spot c5.9xlarge (36 vCPU, 72 GiB / 68 usable, 200 GB gp3)**, `instance_count = 2`. skronk dies 15:59Z, skronk-2 18:19Z (each counts from its own first apply). **24 rooms per box** (Aaron, 07:00Z), no load hold (spawn unless MemAvailable < 10 GiB). `host.env` 44G / 50G rooms, `RZ_GATE_SLOTS=6` (4 room + 2 train), the Terraform defaults. **Spot losses on 2026-11-18, all in us-east-1c:** the first c5.9xlarge at about 06:15Z (19 rooms), then a c5.12xlarge pair (06:20–06:50Z, 32 rooms + 2 train slots each, 64 rooms lost within 30 minutes). Pin another AZ at the next launch (Aaron: "elsewhere"; the boxes are ephemeral, so no disk has to follow). After the second loss, 23 of 63 rooms had pushed work. Those plus the 25 highest-priority of the rest came back, and the other 15 were released to ready. 12xlarge sizing, for reference: 60G / 66G rooms. `host.env` gets `RZ_TRAIN_SLOTS=2` (AGAST #4031; Terraform var once it lands): 2 of the 6 gate slots are train-only. (Before #4031 the parser rejected the key and every gate on the box failed to start, `gate --next skronk-2`, 06:33Z.) Train 2's speculative gate can run on a skronk (`train.sh gate --next skronk-2`). **Spot loss (06:15Z):** the first skronk was terminated while Aaron applied the second box and took `adele-skronk` and 19 rooms with it. Those rooms were re-spawned under the same room IDs: a re-spawned room reads its original briefing from its own room history and resets to its pushed `ritz-task-<id>` branch if there is one, then restores its evacuate hand-off (`refs/wip/<host>/<room>`, see "Re-spawning after a spot loss"), and its claim moves to `ritz-task-<id>@<new box>`. That's why briefings tell rooms to push every commit. Long-running tickets go on the box with the later deadline. Before 06:20Z: one c5.9xlarge (36 vCPU, 72 GiB, 200 GB gp3), Ubuntu 26.04, built and torn down by Terraform in `~/dev/nevelis/lab/skronk` (AGAST #3996; Aaron runs `terraform apply`/`destroy`). **It dies at a deadline** (`terraform output deadline_utc`; `/run/skronk-minutes-left` on the box): it powers itself off then, and EventBridge terminates it 10 minutes later. Unpushed work is lost, so every briefing says to push often and to report by deadline − 20 min; tear rooms down (or let them go) before the deadline, and `release_task` anything that didn't REAP. The public IP changes every launch: update `Host skronk` in `~/.ssh/rz_hosts` from `terraform output rz_hosts_entry`. Remotes are https via `gh`. `host.env` 48G / 54G, 4 gate slots. First run 2026-11-18 04:25Z: 12 rooms at load1 ~13. Smoke 28.6 s. **24 slots from 2026-11-18 05:50Z** (Aaron: "crank skronk up … go to 24"): `ttl_minutes` 720 (deadline 15:59Z) and `root_volume_gb` 200 applied in place, root grown online (growpart + resize2fs) |
 
 - **Per-host budget: `~/.config/rz/host.env`** (AGAST #2998), read by
   `.claude/host-budget.sh` and `run-gate.sh`; format and validation in
@@ -595,12 +595,58 @@ and room history survived.
   - REAP (or report state to `rz`) by **<deadline − 20 min>Z** at the latest.
 ````
 
-**Re-spawning after a spot loss:** keep the room ID, and send the host a
-resume briefing that points at the room's own history (the original
-`## Task Briefing` message) and says to `git fetch origin ritz-task-<id> &&
-git reset --hard FETCH_HEAD` if a branch exists. A room with nothing pushed
-can replay its predecessor's recorded edits from the room history (#1444
-recovered 16 edits that way, 2026-11-18).
+**Re-spawning after a spot loss:** keep the room ID (the evacuate refs and
+the hand-off message are keyed by it), and post this resume briefing in the
+room (`<old host>` is the lost box):
+
+````markdown
+## Resume — ritz-task-<id> (re-spawned on <new host>; <old host> was lost)
+
+Your original `## Task Briefing` is in this room's history: it still holds.
+Before anything else, in this order:
+1. `git fetch origin ritz-task-<id> && git reset --hard FETCH_HEAD` if the
+   branch exists (else stay on `origin/main`).
+2. **Restore the evacuate hand-off.** Look in this room's history for a
+   message from `evacuate@<old host>` (adele `room evacuate`, adele
+   docs/host-evacuation.md). If there is one, run, from the worktree:
+   `bash .claude/skills/rz-iterate/restore-wip.sh --ref <the ref it names> ritz-task-<id> "$PWD"`
+   (with no hand-off message, run it without `--ref`; it takes the newest
+   `refs/wip/*/ritz-task-<id>` and prints `NONE` if there is none).
+   - Exit 0 `RESTORED`: the branch is fast-forwarded to the old room's HEAD
+     and its uncommitted work is back, unstaged (new files untracked).
+   - Exit 0 `NONE` / `already restored`: carry on.
+   - Exit 3 `REFUSED` (worktree dirty, branch ahead of the snapshot's HEAD,
+     a side ref or pre-rebase tip): nothing changed. Follow the hand-off
+     message's own restore commands in a scratch worktree
+     (`git worktree add`), copy what still applies, and say so; if unsure,
+     ask `rz`.
+   - Never apply `+kept-` / `+branch/` refs unasked: they may hold work
+     deleted on purpose. The script lists them.
+3. **Say in this room what you restored:** the ref, its sha (first 12), and
+   the files (the script's output, or `git status --short`); or "no
+   hand-off". Then push it as WIP (`wip: restored from <ref>`) and carry on
+   from the hand-off's state and your last messages here.
+4. Don't delete or push any `refs/wip/*` ref.
+````
+
+What `restore-wip.sh` does (tests: `test-restore-wip.sh`, scratch repos
+only): `ls-remote` the room's refs, fetch objects only (no local ref), pick
+`--ref` or the newest by committer date (`<room>` or a `<room>-<stamp>`
+fallback, never `<room>0` / `<room>-foo`), fast-forward to the snapshot's
+parent, `read-tree -u -m` the snapshot and unstage it. Exactly the doc's
+`worktree add` + `reset HEAD~1`, done in the room's existing worktree. It
+refuses (exit 3) rather than clobber anything, never pushes or deletes a
+ref, and writes `<git dir>/wip-restored` so a restarted room doesn't apply
+the snapshot twice.
+
+**The `refs/wip/<old host>/*` refs afterwards:** nobody in the rz loop
+deletes them, neither the room nor `rz` at reap. They stay for adele's
+evacuate sweep (adele #4137 item 13), which owns them. Kept refs may be the
+only copy of work deleted between checkpoints, and a room re-spawned twice
+may still need the older host's refs. They live outside `refs/heads`, so they
+start no CI and don't hold up a reap. A room with nothing pushed and no
+hand-off can still replay its predecessor's recorded edits from the room
+history (#1444 recovered 16 edits that way, 2026-11-18).
 
 ## Reaping
 
