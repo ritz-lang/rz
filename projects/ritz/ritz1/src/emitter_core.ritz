@@ -6004,6 +6004,15 @@ fn index_elem_size(s: *EmitterState, idx: *Expr) -> i64
                 if gsize > 0
                     return gsize
                 return ptr_elem_size_unknown(s, base.span, base.ident_ptr, base.ident_len)
+    # AGAST #4249: `@x.buf[0] + i` with `buf: [N]T` a struct field strides by
+    # sizeof(T).  The member fell to ptr_arith_elem_size, which knows only a
+    # pointer field, so it was a raw byte add.  N-D fields keep that path.
+    if base.kind == EXPR_MEMBER
+        let fld: *StructField = member_field_def(s, base)
+        if fld != null and fld.field_type == TYPE_ARRAY and fld.array_shape == null
+            let fsize: i64 = ptr_pointee_size(s, fld.array_elem_type, fld.array_elem_type_name, fld.array_elem_type_name_len)
+            if fsize > 0
+                return fsize
     # AGAST #2440: through a reference or pointer it's the buffer's element.
     let through: *LocalVar = index_through(s, idx)
     if through != null and through.array_base != null
@@ -6668,6 +6677,14 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
             let inl_pt: i32 = inline_deref_scalar_pointee(s, e.operand)
             if inl_pt != TYPE_VOID
                 return inl_pt
+            # AGAST #4249: `*(@a[0] + i)` / `*(@x - k)` load the base's
+            # inline pointee too.  The ptr+offset arm below knows only an
+            # ident / member / `*pp` base, so this loaded i64: 21_ls's
+            # newline count over a `[N]u8` saw one line of six.
+            if e.operand.kind == EXPR_BINARY and (e.operand.op == OP_ADD or e.operand.op == OP_SUB)
+                let off_pt: i32 = inline_deref_scalar_pointee(s, find_base_expr(e.operand))
+                if off_pt != TYPE_VOID
+                    return off_pt
             # AGAST #2332: `*a[i]` / `*(a[i] + k)` with `a: [N]*T`.
             let el_pt: i32 = array_elem_pointee_kind(s, e.operand)
             if el_pt != TYPE_VOID
