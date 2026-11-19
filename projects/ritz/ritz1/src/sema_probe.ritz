@@ -32,6 +32,10 @@
 # Sema doesn't yet, what bool_check's move (#3502) must close or keep
 # BK_UNSURE for.  ritz0/test_ritz1_sema_type.py runs the matrix corpus with
 # it on and requires no mismatch.
+#
+# This module is Sema's side and imports no emitter module (AGAST #3513): the
+# emitter's answers come in through sema_probe_expr's SemaProbeEmitter, which
+# emitter_expr fills with bool_kind, get_expr_type and the current fn's file.
 
 import ritzlib.sys
 import ritzlib.io
@@ -39,11 +43,10 @@ import ritzlib.hashmap
 
 import ast
 import ast_helpers
-import emitter_core
+import ast_query    # TYPE_UNKNOWN (AGAST #3513)
 import sema
 import sema_type
 import bool_check
-import bool_kind
 import ritzlib.memory
 
 var g_sema_probe_on: i32 = 0
@@ -57,6 +60,14 @@ var g_sema_probe_lenient: i64 = 0
 var g_sema_probe_bool_gap: i64 = 0
 var g_sema_probe_bk_gap: i64 = 0
 var g_sema_probe_bk: HashMapI64        # e -> sema_bool_kind + 100
+
+# The emitter's view of an expression, for sema_probe_expr (AGAST #3513):
+# `s` is the *EmitterState, opaque here, that each fn is called with.
+pub struct SemaProbeEmitter
+    s: *u8
+    bool_kind: fn(*u8, *Expr) -> i32
+    expr_type: fn(*u8, *Expr) -> i32
+    source_file: fn() -> *u8
 
 # `dump` is 1 for RITZ1_SEMA_PROBE=dump: each record is also printed,
 # `sema-type: <line>:<col> e<expr kind> <type kind>[ <name>]`, so a test can
@@ -103,16 +114,17 @@ fn sema_probe_dump(e: *Expr, t: *SemaTy)
             i += 1
     eprints_cstr(c"\n")
 
-fn sema_probe_mismatch(e: *Expr, rule: *u8, sema_k: i32, emit_k: i32)
+fn sema_probe_mismatch(em: *SemaProbeEmitter, e: *Expr, rule: *u8, sema_k: i32, emit_k: i32)
     g_sema_probe_mismatched = g_sema_probe_mismatched + 1
     eprints_cstr(c"sema-probe: mismatch ")
-    sema_probe_note(e, rule, sema_k, emit_k)
+    sema_probe_note(em, e, rule, sema_k, emit_k)
 
 # `<rule> at <file>:<line>:<col> expr kind <k>: sema <s>, emitter <e>`.
-fn sema_probe_note(e: *Expr, rule: *u8, sema_k: i32, emit_k: i32)
+fn sema_probe_note(em: *SemaProbeEmitter, e: *Expr, rule: *u8, sema_k: i32, emit_k: i32)
     eprints_cstr(rule)
     eprints_cstr(c" at ")
-    eprints_cstr(fn_source_file(emitter_current_fn()))
+    let source_file: fn() -> *u8 = em.source_file
+    eprints_cstr(source_file())
     eprints_cstr(c":")
     eprint_int(e.span.line as i64)
     eprints_cstr(c":")
@@ -143,28 +155,31 @@ fn sema_probe_aggregate_default(e: *Expr, k: i32) -> bool
     e.kind == EXPR_INDEX or e.kind == EXPR_METHOD or e.kind == EXPR_TRY
 
 # emit_expr, on entry: compare the record for `e` with the emitter's view.
-pub fn sema_probe_expr(s: *EmitterState, e: *Expr)
+pub fn sema_probe_expr(em: *SemaProbeEmitter, e: *Expr)
+    let bk_of: fn(*u8, *Expr) -> i32 = em.bool_kind
+    let type_of: fn(*u8, *Expr) -> i32 = em.expr_type
+    let s: *u8 = em.s
     let t: *SemaTy = hashmap_i64_get(@g_sema_probe_map, e as i64) as *SemaTy
     if t == null
         return
     let sbk: i32 = (hashmap_i64_get(@g_sema_probe_bk, e as i64) - 100) as i32
-    let ebk: i32 = bool_kind(s, e)
+    let ebk: i32 = bk_of(s, e)
     if sbk != ebk
         if sbk != BK_UNSURE and ebk != BK_UNSURE
-            sema_probe_mismatch(e, c"bk", sbk, ebk)
+            sema_probe_mismatch(em, e, c"bk", sbk, ebk)
             return
         g_sema_probe_bk_gap = g_sema_probe_bk_gap + 1
         eprints_cstr(c"sema-probe: ")
-        sema_probe_note(e, c"bk-gap", sbk, ebk)
+        sema_probe_note(em, e, c"bk-gap", sbk, ebk)
     if t.kind == TYPE_UNKNOWN
         g_sema_probe_unknown = g_sema_probe_unknown + 1
-        let gk: i32 = bool_kind(s, e)
+        let gk: i32 = bk_of(s, e)
         if gk != BK_UNSURE and gk != BK_BAD
             g_sema_probe_bool_gap = g_sema_probe_bool_gap + 1
         return
     g_sema_probe_compared = g_sema_probe_compared + 1
     if t.kind != TYPE_BOOL
-        let ek: i32 = get_expr_type(s, e)
+        let ek: i32 = type_of(s, e)
         if ek != t.kind
             let int_default: i32 = (sema_is_int_kind(t.kind) == 1 and not hashmap_i64_contains(@g_sema_probe_local_names, e as i64)) as i32
             let ref_field: i32 = (e.kind == EXPR_MEMBER and ek == TYPE_PTR and (t.kind == TYPE_REF or t.kind == TYPE_MUT_REF)) as i32
@@ -175,13 +190,13 @@ pub fn sema_probe_expr(s: *EmitterState, e: *Expr)
                 if aggregate == 1
                     return   # bool_kind reads the same default (an int)
             else
-                sema_probe_mismatch(e, c"type", t.kind, ek)
+                sema_probe_mismatch(em, e, c"type", t.kind, ek)
                 return
-    let bk: i32 = bool_kind(s, e)
+    let bk: i32 = bk_of(s, e)
     if bk != BK_UNSURE and bk != BK_BAD
         let sk: i32 = bk_of_type(t.kind, t.name, t.name_len)
         if sk != bk
-            sema_probe_mismatch(e, c"bool", sk, bk)
+            sema_probe_mismatch(em, e, c"bool", sk, bk)
 
 pub fn sema_probe_report()
     if g_sema_probe_on == 0

@@ -1,0 +1,423 @@
+# ritz1/src/ast_query.ritz - pure AST and name queries (AGAST #3513)
+#
+# Helpers that read only the AST, the parser's enum tables (ast_helpers) and
+# the primitive type table (types): no EmitterState, no Sema, no emitter
+# global.  They lived in emitter_core until #3513 (LARB F5, #1816), which made
+# every Sema module import the emitter for `name_eq` and its kin.  Sema
+# and the check modules import this module; emitter_core `pub import`s it, so
+# an emitter module still reaches every one of them through emitter_core.
+#
+# Nothing here may import an emitter* or sema* module
+# (tools/test_ritz1_emitter_check_freeze.py).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+
+import ast
+import types
+import ast_helpers   # enum_find / enum_variant_* (AGAST #1660)
+
+# AGAST #1328: "not a local" miss value for find_local_type.  The old miss
+# value was TYPE_I64, which is indistinguishable from a real i64 local —
+# twice now (#1325 deref form, #1328 subscript form) a caller treated a
+# global pointer as an i64 and silently loaded the wrong width.  -1 collides
+# with no TYPE_* kind, so a caller that forgets to handle the miss now takes
+# its explicit "unknown" branch instead of impersonating an i64.
+const TYPE_UNKNOWN: i32 = -1
+
+# Helper to check if name matches a string
+pub fn name_eq(name: *u8, len: i32, target: *u8, target_len: i32) -> i32
+    if len != target_len
+        return 0
+    for i in 0..len
+        if *(name + i) != *(target + i)
+            return 0
+    1
+
+pub fn eprint_bytes(p: *u8, len: i32)
+    for i in 0..len
+        eprint_char(*(p + i))
+
+# Find field index in a struct (returns -1 if not found)
+pub fn find_field_index(st: *StructDef, field: *u8, field_len: i32) -> i32
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if f.name_len == field_len
+            var j: i32 = 0
+            var matched: i32 = 1
+            while j < field_len
+                if *(f.name + j) != *(field + j)
+                    matched = 0
+                    break
+                j += 1
+            if matched == 1
+                return idx
+        idx += 1
+        f = f.next
+    -1
+
+# Get field type from struct definition
+pub fn get_field_type(st: *StructDef, field_idx: i32) -> *StructField
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if idx == field_idx
+            return f
+        idx += 1
+        f = f.next
+    null
+
+# 1 if `name` is the mangled symbol `<ib.type_name>_<method.name>`.
+pub fn impl_method_symbol_eq(ib: *ImplBlock, method: *FnDef, name: *u8, len: i32) -> i32
+    let type_len: i32 = ib.type_name_len
+    if type_len + 1 + method.name_len != len
+        return 0
+    for mj in 0..type_len
+        if *(ib.type_name + mj) != *(name + mj)
+            return 0
+    if *(name + type_len) != 95  # '_'
+        return 0
+    for mk in 0..method.name_len
+        if *(method.name + mk) != *(name + type_len + 1 + mk)
+            return 0
+    1
+
+# The impl method (with a body) whose mangled `Type_method` symbol is `name`,
+# or null.  R10: `C_g(c)` names the method `c.g()` calls (AGAST #2447). A method defined by this .ll (is_local == 1) is preferred over an
+# imported copy of the same symbol.
+pub fn find_impl_method_by_symbol(m: *Module, name: *u8, len: i32) -> *FnDef
+    var found: *FnDef = null
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            if method.body != null and impl_method_symbol_eq(ib, method, name, len) == 1
+                if method.is_local == 1
+                    return method
+                if found == null
+                    found = method
+            method = method.next
+        ib = ib.next
+    found
+
+# A fn that yields no value: no return type, or `-> void` (AGAST #2246).
+pub fn fn_is_procedure(fd: *FnDef) -> i32
+    if fd == null or fd.return_type != TYPE_VOID
+        return 0
+    1
+
+# Is this name a primitive integer/float/bool type? Used in several places
+# where post-monomorphization a generic `T` has been substituted with a
+# primitive but the AST still carries TYPE_STRUCT — we must NOT emit `%u16`
+# struct references or `{ i8 }` fallback decls for those names.
+pub fn is_primitive_type_name(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"i8", 2) == 1
+        return 1
+    if name_eq(name, len, c"u8", 2) == 1
+        return 1
+    if name_eq(name, len, c"i16", 3) == 1
+        return 1
+    if name_eq(name, len, c"u16", 3) == 1
+        return 1
+    if name_eq(name, len, c"i32", 3) == 1
+        return 1
+    if name_eq(name, len, c"u32", 3) == 1
+        return 1
+    if name_eq(name, len, c"i64", 3) == 1
+        return 1
+    if name_eq(name, len, c"u64", 3) == 1
+        return 1
+    if name_eq(name, len, c"f32", 3) == 1
+        return 1
+    if name_eq(name, len, c"f64", 3) == 1
+        return 1
+    if name_eq(name, len, c"bool", 4) == 1
+        return 1
+    if name_eq(name, len, c"usize", 5) == 1
+        return 1
+    if name_eq(name, len, c"isize", 5) == 1
+        return 1
+    0
+
+# AGAST #167: SIMD vector type names (`v4i32`, `v16i8`, etc).  ritz0 treats
+# these as builtin types in name_resolver.BUILTIN_TYPES.  ritz1's parser
+# accepts them as struct-name annotations; without explicit recognition they
+# fall through to the `%v4i32 = type { i8 }` fallback decl, breaking the
+# stride for `simd_*` builtins which must produce/consume real LLVM `<N x iM>`
+# vectors.  Returns 1 for all SSE2 (128-bit) and AVX2 (256-bit) name shapes
+# the cryptosec / squeeze libs use.
+pub fn is_simd_vector_type_name(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"v16i8", 5) == 1
+        return 1
+    if name_eq(name, len, c"v8i16", 5) == 1
+        return 1
+    if name_eq(name, len, c"v4i32", 5) == 1
+        return 1
+    if name_eq(name, len, c"v2i64", 5) == 1
+        return 1
+    if name_eq(name, len, c"v32i8", 5) == 1
+        return 1
+    if name_eq(name, len, c"v16i16", 6) == 1
+        return 1
+    if name_eq(name, len, c"v8i32", 5) == 1
+        return 1
+    if name_eq(name, len, c"v4i64", 5) == 1
+        return 1
+    0
+
+# Returns 1 if the type name refers to a tagged-enum instantiation
+# (`Result$...` or `Option$...`).  After ritz-task-133 these are lowered to a
+# real LLVM struct `{ i8, [P x i8], [N x i8] }` (ritz0's layout, #1898) rather
+# than the old packed-i64 representation.  Callers that emit payload load /
+# store paths still key off this predicate to decide between "scalar slot"
+# and "tagged-enum aggregate slot" code shapes.
+pub fn is_tagged_enum_type(name: *u8, name_len: i32) -> i32
+    if name_len >= 7
+        # "Result$" = 82 101 115 117 108 116 36
+        if *(name + 0) == 82
+            if *(name + 1) == 101
+                if *(name + 2) == 115
+                    if *(name + 3) == 117
+                        if *(name + 4) == 108
+                            if *(name + 5) == 116
+                                if *(name + 6) == 36
+                                    return 1
+        # "Option$" = 79 112 116 105 111 110 36
+        if *(name + 0) == 79
+            if *(name + 1) == 112
+                if *(name + 2) == 116
+                    if *(name + 3) == 105
+                        if *(name + 4) == 111
+                            if *(name + 5) == 110
+                                if *(name + 6) == 36
+                                    return 1
+    return 0
+
+# AGAST #1596: the element kind for indexing THROUGH a pointer-typed struct
+# field (`s.data[i]` with `data: *T` or `**T`). `**T` elements are pointers;
+# a `*Struct` element is TYPE_STRUCT (spelled `%T` from field_type_name);
+# primitive pointees (integers, since #2053 f32 / f64, and since #2063 bool)
+# come from array_elem_type (#1304); their in-memory spelling is
+# ptr_field_elem_llvm.  Anything else (an unrecorded pointee, a non-pointer
+# field) is TYPE_UNKNOWN: ritz1 cannot address it at the right width, so
+# callers must fail closed rather than guess a stride.  bool is an `i1`
+# everywhere since #2063 (a local `[N]bool` kept i64 slots, so a `*bool`
+# had no single stride).
+pub fn ptr_field_elem_kind(field: *StructField) -> i32
+    if field.field_type == TYPE_PTR_PTR
+        return TYPE_PTR
+    if field.field_type != TYPE_PTR
+        return TYPE_UNKNOWN
+    if field.field_type_name_len > 0
+        return TYPE_STRUCT
+    let t: i32 = field.array_elem_type
+    if ty_int_in(t, 8, 16) == 1
+        return t
+    if ty_int_in(t, 32, 64) == 1
+        return t
+    if t == TYPE_F32 or t == TYPE_F64 or t == TYPE_BOOL
+        return t
+    return TYPE_UNKNOWN
+
+# Width in bits a scalar type code is stored at (see tagged_enum_scalar_bits).
+pub fn type_code_scalar_bits(t: i32, signed: *i32) -> i32
+    *signed = 1
+    if t == TYPE_I8
+        return 8
+    if t == TYPE_I16
+        return 16
+    if t == TYPE_I32
+        return 32
+    *signed = 0
+    if t == TYPE_U8 or t == TYPE_BOOL
+        return 8
+    if t == TYPE_U16
+        return 16
+    if t == TYPE_U32
+        return 32
+    *signed = 1
+    64
+
+# Tracker index of the non-generic user enum `name`, or -1.
+pub fn user_enum_index(name: *u8, len: i32) -> i32
+    if name == null or len <= 0
+        return 0 - 1
+    let ei: i32 = enum_find(name, len)
+    if ei < 0
+        return 0 - 1
+    if enum_is_generic(ei) == 1
+        return 0 - 1
+    ei
+
+# AGAST #1295: a variant SELECTOR names one payload field of a user enum's
+# variant: `vi + k * VARIANT_FIELD_STRIDE` is field k of variant vi.  Field 0
+# is the variant's plain index, so every caller that knew only single-field
+# variants (and Result/Option's 0 / 1) passes the same value it always did.
+# Only the payload helpers take a selector -- never a tag store or compare.
+pub const VARIANT_FIELD_STRIDE: i32 = 65536
+
+pub fn variant_sel(vi: i32, k: i32) -> i32
+    vi + k * VARIANT_FIELD_STRIDE
+
+# AGAST #1295: the payload selector of the binding `arm` has selected
+# (arm_select_bind) in user enum `name`: field pattern_field_sel of the
+# variant it names.  -1 when `name` declares no such variant.
+pub fn arm_variant_sel(name: *u8, len: i32, arm: *MatchArm) -> i32
+    let vi: i32 = enum_variant_index(name, len, arm.pattern_name, arm.pattern_name_len)
+    if vi < 0
+        return vi
+    variant_sel(vi, arm.pattern_field_sel)
+
+# The payload field selector `sel` (variant_sel) names in user enum `name`:
+# field k of a tuple variant, or of a struct variant matched / built
+# positionally (docs/ENUM_VARIANTS.md: same layout).  Null when there is none:
+# a unit variant, a generic or unknown enum, k past the last field.
+pub fn user_enum_tuple_field(name: *u8, len: i32, sel: i32) -> *StructField
+    let ei: i32 = user_enum_index(name, len)
+    if ei < 0 or sel < 0
+        return null
+    let vi: i32 = sel % VARIANT_FIELD_STRIDE
+    var k: i32 = sel / VARIANT_FIELD_STRIDE
+    if vi >= enum_variant_count(ei)
+        return null
+    let kind: i32 = enum_variant_kind(ei, vi)
+    if kind != ENUM_VARIANT_TUPLE and kind != ENUM_VARIANT_STRUCT
+        return null
+    var f: *StructField = enum_variant_fields(ei, vi)
+    while f != null and k > 0
+        f = f.next
+        k -= 1
+    f
+
+# AGAST #1797: the user enum a call `Holds(x)` constructs — a payload
+# variant of a non-generic enum (AGAST #1295: any field count), resolved as try_emit_user_variant_ctor
+# does (it wins over a same-named fn, as in ritz0).  null/0 otherwise.
+# AGAST #1610: also a unit variant called with no arguments, `Red()` (built
+# with no payload; it used to fall through to a fn call returning i64).
+# AGAST #2039: a name two enums declare is no ctor here (null): the caller,
+# try_emit_user_variant_ctor, reports it via user_variant_ctor_ambiguous.
+pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null or e.kind != EXPR_CALL
+        return
+    var vi: i32 = 0
+    var other: i32 = 0
+    let ei: i32 = enum_of_variant_unique(e.func_name, e.func_name_len, @vi, @other)
+    if ei < 0
+        return
+    let kind: i32 = enum_variant_kind(ei, vi)
+    if kind == ENUM_VARIANT_UNIT
+        if e.args != null
+            return
+    else if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
+        # AGAST #1295: one value per field, `Rect(w, h)`, a struct variant's
+        # positionally; emit_variant_build checks the count, located.
+        if e.args == null
+            return
+    else
+        return
+    *out_name = enum_name_at(ei, out_len)
+
+# AGAST #3995: the user enum a call constructs whatever its slot, for the two
+# typers (get_expr_type, Sema's sema_call_ty): user_variant_ctor_enum, less
+# a variant named Some / Ok / Err / None, whose call is the builtin Option /
+# Result one unless the slot is the user's enum (users_variant_wins).
+pub fn user_enum_ctor_call(e: *Expr, out_name: **u8, out_len: *i32)
+    *out_name = null
+    *out_len = 0
+    if e == null or e.kind != EXPR_CALL
+        return
+    let n: *u8 = e.func_name
+    let l: i32 = e.func_name_len
+    if name_eq(n, l, c"Some", 4) == 1 or name_eq(n, l, c"Ok", 2) == 1 or name_eq(n, l, c"Err", 3) == 1 or name_eq(n, l, c"None", 4) == 1
+        return
+    user_variant_ctor_enum(e, out_name, out_len)
+
+# The dims of `sh` from dimension `from` inward, and its leaf, as a shape of
+# their own: `[3][4]T` from 1 of `[2][3][4]T`.  AGAST #3379: a plane a `for`
+# binds, too.
+pub fn nd_shape_from(sh: *ArrayShape, from: i32) -> *ArrayShape
+    let out: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
+    *out = *sh
+    out.rank = sh.rank - from
+    var i: i32 = 0
+    while i < out.rank
+        out.dims[i] = sh.dims[from + i]
+        i = i + 1
+    out
+
+# AGAST #2570: how many leaves a `[M][N]..T` holds, M*N..: the size of the flat
+# `[M*N..]T` a plane pointer is, so `q + k` strides k whole planes.
+pub fn shape_leaf_count(sh: *ArrayShape) -> i32
+    var n: i32 = 1
+    var i: i32 = 0
+    while i < sh.rank
+        n = n * sh.dims[i]
+        i = i + 1
+    n
+
+# AGAST #1965: 1 when `e` is a float literal or a negated one (`-2.5`, which
+# #1959 lowers as `fneg double`).  Both are `double`, narrowable to f32.
+pub fn is_float_lit_operand(e: *Expr) -> i32
+    if e.kind == EXPR_FLOAT_LIT
+        return 1
+    if e.kind == EXPR_UNARY and e.op == OP_NEG
+        return is_float_lit_operand(e.operand)
+    # AGAST #3607: literals only, `0.0 - 7.0`, is a literal too (ritz0's
+    # FloatLitType): it takes the other side's width, and is never an f64
+    # meeting an f32.
+    if e.kind == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV)
+        return (is_float_lit_operand(e.left) == 1 and is_float_lit_operand(e.right) == 1) as i32
+    return 0
+
+# AGAST #2308: the scalar T of a `-> @T` / `-> @&T` fn, or TYPE_VOID.
+pub fn ret_ref_scalar_pointee(f: *FnDef) -> i32
+    if f == null or f.ret_ref == null or primitive_name_len(f.ret_ref.param_pointee_type) == 0
+        return TYPE_VOID
+    return f.ret_ref.param_pointee_type
+
+# The volatile and atomic memory builtins (LANGUAGE_SPEC §18.4-§18.5, AGAST
+# #1879); emitter_core lowers them.
+const MEM_VOLATILE_LOAD: i32 = 1
+const MEM_VOLATILE_STORE: i32 = 2
+const MEM_ATOMIC_LOAD: i32 = 3
+const MEM_ATOMIC_STORE: i32 = 4
+const MEM_ATOMIC_XCHG: i32 = 5
+const MEM_ATOMIC_CMPXCHG: i32 = 6
+const MEM_ATOMIC_ADD: i32 = 7
+const MEM_ATOMIC_SUB: i32 = 8
+const MEM_ATOMIC_AND: i32 = 9
+const MEM_ATOMIC_OR: i32 = 10
+const MEM_ATOMIC_XOR: i32 = 11
+const MEM_FENCE: i32 = 12
+
+# The MEM_* id of a builtin name, 0 for any other name.
+pub fn mem_builtin_id(name: *u8, len: i32) -> i32
+    if name_eq(name, len, c"volatile_load", 13) == 1
+        return MEM_VOLATILE_LOAD
+    if name_eq(name, len, c"volatile_store", 14) == 1
+        return MEM_VOLATILE_STORE
+    if name_eq(name, len, c"atomic_load", 11) == 1
+        return MEM_ATOMIC_LOAD
+    if name_eq(name, len, c"atomic_store", 12) == 1
+        return MEM_ATOMIC_STORE
+    if name_eq(name, len, c"atomic_xchg", 11) == 1
+        return MEM_ATOMIC_XCHG
+    if name_eq(name, len, c"atomic_cmpxchg", 14) == 1
+        return MEM_ATOMIC_CMPXCHG
+    if name_eq(name, len, c"atomic_fetch_add", 16) == 1
+        return MEM_ATOMIC_ADD
+    if name_eq(name, len, c"atomic_fetch_sub", 16) == 1
+        return MEM_ATOMIC_SUB
+    if name_eq(name, len, c"atomic_fetch_and", 16) == 1
+        return MEM_ATOMIC_AND
+    if name_eq(name, len, c"atomic_fetch_or", 15) == 1
+        return MEM_ATOMIC_OR
+    if name_eq(name, len, c"atomic_fetch_xor", 16) == 1
+        return MEM_ATOMIC_XOR
+    if name_eq(name, len, c"fence", 5) == 1
+        return MEM_FENCE
+    0

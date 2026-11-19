@@ -110,6 +110,13 @@ the emitter (AGAST #3462, #1816; LARB review/5 ritz1 N1):
   allowlist (`tools/ritz1_emitter_checks.allow`) lists the checks still in
   the emitter.  The list only shrinks: each move off the emitter is a child
   ticket of #1816 and deletes its entries.
+- Import no `emitter*` module (AGAST #3513).  A pure helper the emitter
+  also uses (`name_eq`, `find_field_index`, `user_enum_index`, ...) lives in
+  `ast_query`; move another one there rather than importing `emitter_core`.
+  The same freeze test fails on a `sema*` module importing an emitter module,
+  and on a Checks module doing so unless
+  `tools/ritz1_check_emitter_imports.allow` names it (the modules still on
+  `EmitterState`; that list only shrinks too).
 
 ## Module responsibilities
 
@@ -127,6 +134,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `parser_gen` | Recursive-descent parser. Generated. |
 | `ast` | AST node structs (`Expr`, `Stmt`, `FnDef`, `StructDef`, `Module`, ...) and kind constants. |
 | `ast_helpers` | AST constructors the grammar's actions call, the parser arena, type-alias and array-length folding, and AST queries used everywhere downstream. Hand-written (see below). |
+| `ast_query` | Pure queries over the AST, the enum tables and the type table (`name_eq`, `find_field_index`, `user_enum_index`, `mem_builtin_id`, ...): no `EmitterState`, no Sema. Moved out of `emitter_core` by #3513 so Sema and the checks import no emitter module; `emitter_core` `pub import`s it. |
 | `types` | The one table of primitive type facts (AGAST #1889): LLVM spelling in memory and as a value, store size, alignment, bit width, signedness, Ritz name, name→kind. Struct/enum kinds answer "unknown"; the emitter's struct table sizes them. |
 | `diag` | Located diagnostics: one `<file>:<line>:<col>: error: <message>` line per error. |
 | `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>_Future`, `<f>`, `<f>_poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |

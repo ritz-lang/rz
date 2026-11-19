@@ -16,10 +16,11 @@ import ast
 import diag            # diag_error_at, fn_display_name (AGAST #3445, #3621, #4018)
 import types           # the one primitive type table (AGAST #1889)
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
+# name_eq and the other pure AST queries, moved out of here by #3513;
+# re-exported, so an emitter module reaches them through emitter_core.
+pub import ast_query
 import index_through # index_through (AGAST #2440)
 import tokens_gen
-import ownership     # own_before_ret (AGAST #1625)
-import ref_check     # ref_cast_reads_referent (AGAST #3004)
 import emitter_expr
 import emitter_expr_arith
 import emitter_expr_call
@@ -393,6 +394,10 @@ struct EmitterState
     # AGAST #3508: emit_stmt, for ownership.ritz to emit a deferred statement
     # at a block's exit (own_run_defer) without importing emitter_stmt.
     own_emit_stmt: fn(*EmitterState, *Stmt, i32)
+    # AGAST #3513: ownership's own_before_ret and ref_check's
+    # ref_cast_reads_referent, so emitter_core imports neither module.
+    own_before_ret_fn: fn(*EmitterState)
+    ref_cast_reads_referent_fn: fn(*EmitterState, *Expr) -> i32
     # AGAST #3739 — what frame_limit.ritz needs to locate a fn's allocas.
     # fm: (offset in out, span) marks, appended as emit_stmt / emit_expr
     # enter and leave; an alloca line belongs to the last mark at or before
@@ -563,7 +568,8 @@ pub fn emit_str(s: *EmitterState, text: *u8)
     # therefore start the string it is emitted in.
     if *text == 32
         if emit_str_is_ret(text) == 1
-            own_before_ret(s)
+            let before_ret: fn(*EmitterState) = s.own_before_ret_fn
+            before_ret(s)
     var i: i32 = 0
     while *(text + i) != 0
         i += 1
@@ -1002,14 +1008,6 @@ pub fn find_local(s: *EmitterState, name: *u8, len: i32) -> i32
         return -1
     let loc: *LocalVar = local_at(s, idx)
     return loc.reg
-
-# AGAST #1328: "not a local" miss value for find_local_type.  The old miss
-# value was TYPE_I64, which is indistinguishable from a real i64 local —
-# twice now (#1325 deref form, #1328 subscript form) a caller treated a
-# global pointer as an i64 and silently loaded the wrong width.  -1 collides
-# with no TYPE_* kind, so a caller that forgets to handle the miss now takes
-# its explicit "unknown" branch instead of impersonating an i64.
-const TYPE_UNKNOWN: i32 = -1
 
 pub fn find_local_type(s: *EmitterState, name: *u8, len: i32) -> i32
     let idx: i32 = find_local_idx(s, name, len)
@@ -1656,45 +1654,6 @@ pub fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
         cur = cur.next
     return null
 
-# 1 if `name` is the mangled symbol `<ib.type_name>_<method.name>`.
-pub fn impl_method_symbol_eq(ib: *ImplBlock, method: *FnDef, name: *u8, len: i32) -> i32
-    let type_len: i32 = ib.type_name_len
-    if type_len + 1 + method.name_len != len
-        return 0
-    for mj in 0..type_len
-        if *(ib.type_name + mj) != *(name + mj)
-            return 0
-    if *(name + type_len) != 95  # '_'
-        return 0
-    for mk in 0..method.name_len
-        if *(method.name + mk) != *(name + type_len + 1 + mk)
-            return 0
-    1
-
-# The impl method (with a body) whose mangled `Type_method` symbol is `name`,
-# or null.  R10: `C_g(c)` names the method `c.g()` calls (AGAST #2447). A method defined by this .ll (is_local == 1) is preferred over an
-# imported copy of the same symbol.
-pub fn find_impl_method_by_symbol(m: *Module, name: *u8, len: i32) -> *FnDef
-    var found: *FnDef = null
-    var ib: *ImplBlock = m.impls
-    while ib != null
-        var method: *FnDef = ib.methods
-        while method != null
-            if method.body != null and impl_method_symbol_eq(ib, method, name, len) == 1
-                if method.is_local == 1
-                    return method
-                if found == null
-                    found = method
-            method = method.next
-        ib = ib.next
-    found
-
-# A fn that yields no value: no return type, or `-> void` (AGAST #2246).
-pub fn fn_is_procedure(fd: *FnDef) -> i32
-    if fd == null or fd.return_type != TYPE_VOID
-        return 0
-    1
-
 # The file a fn's lines belong to: a specialised generic may come from an import.
 pub fn fn_source_file(f: *FnDef) -> *u8
     if f != null and f.def_file != null
@@ -1921,36 +1880,6 @@ pub fn struct_map_find(map: *HashMapI64, m: *Module, name: *u8, len: i32) -> *St
         cur = cur.next
     return null
 
-# Find field index in a struct (returns -1 if not found)
-pub fn find_field_index(st: *StructDef, field: *u8, field_len: i32) -> i32
-    var idx: i32 = 0
-    var f: *StructField = st.fields
-    while f != null
-        if f.name_len == field_len
-            var j: i32 = 0
-            var matched: i32 = 1
-            while j < field_len
-                if *(f.name + j) != *(field + j)
-                    matched = 0
-                    break
-                j += 1
-            if matched == 1
-                return idx
-        idx += 1
-        f = f.next
-    -1
-
-# Get field type from struct definition
-pub fn get_field_type(st: *StructDef, field_idx: i32) -> *StructField
-    var idx: i32 = 0
-    var f: *StructField = st.fields
-    while f != null
-        if idx == field_idx
-            return f
-        idx += 1
-        f = f.next
-    null
-
 # Result struct for emit_member_ptr - returns pointer register and field info
 struct MemberPtrResult
     reg: i32              # Register holding pointer to field
@@ -2047,15 +1976,6 @@ pub fn add_method_extern(s: *EmitterState, type_name: *u8, type_len: i32, method
 
     # Add to externs
     add_extern(s, name, total_len)
-
-# Helper to check if name matches a string
-pub fn name_eq(name: *u8, len: i32, target: *u8, target_len: i32) -> i32
-    if len != target_len
-        return 0
-    for i in 0..len
-        if *(name + i) != *(target + i)
-            return 0
-    1
 
 # =============================================================================
 # Deduplication Helpers - Track emitted structs/functions to avoid duplicates
@@ -2330,32 +2250,6 @@ pub fn emit_array_elem_narrow(s: *EmitterState, val: i32, t: i32, ty: *u8) -> i3
     emit_str(s, c"\n")
     return narrow
 
-# AGAST #1596: the element kind for indexing THROUGH a pointer-typed struct
-# field (`s.data[i]` with `data: *T` or `**T`). `**T` elements are pointers;
-# a `*Struct` element is TYPE_STRUCT (spelled `%T` from field_type_name);
-# primitive pointees (integers, since #2053 f32 / f64, and since #2063 bool)
-# come from array_elem_type (#1304); their in-memory spelling is
-# ptr_field_elem_llvm.  Anything else (an unrecorded pointee, a non-pointer
-# field) is TYPE_UNKNOWN: ritz1 cannot address it at the right width, so
-# callers must fail closed rather than guess a stride.  bool is an `i1`
-# everywhere since #2063 (a local `[N]bool` kept i64 slots, so a `*bool`
-# had no single stride).
-pub fn ptr_field_elem_kind(field: *StructField) -> i32
-    if field.field_type == TYPE_PTR_PTR
-        return TYPE_PTR
-    if field.field_type != TYPE_PTR
-        return TYPE_UNKNOWN
-    if field.field_type_name_len > 0
-        return TYPE_STRUCT
-    let t: i32 = field.array_elem_type
-    if ty_int_in(t, 8, 16) == 1
-        return t
-    if ty_int_in(t, 32, 64) == 1
-        return t
-    if t == TYPE_F32 or t == TYPE_F64 or t == TYPE_BOOL
-        return t
-    return TYPE_UNKNOWN
-
 # AGAST #3972: 1 when `f` is a `*S` field whose element `x.f[i]` is an S, a
 # known struct.  The value, member, address and type paths each ask this, so
 # they agree on which fields they take.  A pointer to a Vec, Span or String
@@ -2405,34 +2299,6 @@ pub fn is_float_type(t: i32, name: *u8, name_len: i32) -> i32
             return 1
         if *(name + 0) == 102 and *(name + 1) == 54 and *(name + 2) == 52  # f64
             return 1
-    return 0
-
-# Returns 1 if the type name refers to a tagged-enum instantiation
-# (`Result$...` or `Option$...`).  After ritz-task-133 these are lowered to a
-# real LLVM struct `{ i8, [P x i8], [N x i8] }` (ritz0's layout, #1898) rather
-# than the old packed-i64 representation.  Callers that emit payload load /
-# store paths still key off this predicate to decide between "scalar slot"
-# and "tagged-enum aggregate slot" code shapes.
-pub fn is_tagged_enum_type(name: *u8, name_len: i32) -> i32
-    if name_len >= 7
-        # "Result$" = 82 101 115 117 108 116 36
-        if *(name + 0) == 82
-            if *(name + 1) == 101
-                if *(name + 2) == 115
-                    if *(name + 3) == 117
-                        if *(name + 4) == 108
-                            if *(name + 5) == 116
-                                if *(name + 6) == 36
-                                    return 1
-        # "Option$" = 79 112 116 105 111 110 36
-        if *(name + 0) == 79
-            if *(name + 1) == 112
-                if *(name + 2) == 116
-                    if *(name + 3) == 105
-                        if *(name + 4) == 111
-                            if *(name + 5) == 110
-                                if *(name + 6) == 36
-                                    return 1
     return 0
 
 # The concrete struct carried by a tagged enum's Ok/Some variant, named by
@@ -2727,17 +2593,6 @@ pub fn tagged_enum_layout(s: *EmitterState, name: *u8, len: i32, pad: *i64) -> i
 # tagged-enum path above.)
 # =============================================================================
 
-# Tracker index of the non-generic user enum `name`, or -1.
-pub fn user_enum_index(name: *u8, len: i32) -> i32
-    if name == null or len <= 0
-        return 0 - 1
-    let ei: i32 = enum_find(name, len)
-    if ei < 0
-        return 0 - 1
-    if enum_is_generic(ei) == 1
-        return 0 - 1
-    ei
-
 # AGAST #2453: a let's type a bare constructor can build: an Option / Result,
 # or a user enum, whose `Ok(5)` / `Some(5)` is its own variant
 # (users_variant_wins).  resolve_enum_ctx still takes only the builtins.
@@ -2833,25 +2688,6 @@ pub fn user_enum_size(s: *EmitterState, ei: i32) -> i64
         return 1
     1 + pad + n
 
-# AGAST #1295: a variant SELECTOR names one payload field of a user enum's
-# variant: `vi + k * VARIANT_FIELD_STRIDE` is field k of variant vi.  Field 0
-# is the variant's plain index, so every caller that knew only single-field
-# variants (and Result/Option's 0 / 1) passes the same value it always did.
-# Only the payload helpers take a selector -- never a tag store or compare.
-pub const VARIANT_FIELD_STRIDE: i32 = 65536
-
-pub fn variant_sel(vi: i32, k: i32) -> i32
-    vi + k * VARIANT_FIELD_STRIDE
-
-# AGAST #1295: the payload selector of the binding `arm` has selected
-# (arm_select_bind) in user enum `name`: field pattern_field_sel of the
-# variant it names.  -1 when `name` declares no such variant.
-pub fn arm_variant_sel(name: *u8, len: i32, arm: *MatchArm) -> i32
-    let vi: i32 = enum_variant_index(name, len, arm.pattern_name, arm.pattern_name_len)
-    if vi < 0
-        return vi
-    variant_sel(vi, arm.pattern_field_sel)
-
 # Field count of variant `vi` of user enum `ei` (0 for a unit variant).
 pub fn enum_variant_field_count(ei: i32, vi: i32) -> i32
     var n: i32 = 0
@@ -2860,27 +2696,6 @@ pub fn enum_variant_field_count(ei: i32, vi: i32) -> i32
         n += 1
         f = f.next
     n
-
-# The payload field selector `sel` (variant_sel) names in user enum `name`:
-# field k of a tuple variant, or of a struct variant matched / built
-# positionally (docs/ENUM_VARIANTS.md: same layout).  Null when there is none:
-# a unit variant, a generic or unknown enum, k past the last field.
-pub fn user_enum_tuple_field(name: *u8, len: i32, sel: i32) -> *StructField
-    let ei: i32 = user_enum_index(name, len)
-    if ei < 0 or sel < 0
-        return null
-    let vi: i32 = sel % VARIANT_FIELD_STRIDE
-    var k: i32 = sel / VARIANT_FIELD_STRIDE
-    if vi >= enum_variant_count(ei)
-        return null
-    let kind: i32 = enum_variant_kind(ei, vi)
-    if kind != ENUM_VARIANT_TUPLE and kind != ENUM_VARIANT_STRUCT
-        return null
-    var f: *StructField = enum_variant_fields(ei, vi)
-    while f != null and k > 0
-        f = f.next
-        k -= 1
-    f
 
 # AGAST #1295: byte offset of the payload field `sel` names within the
 # payload buffer: 0 for field 0, for Result / Option and for anything not a
@@ -2922,25 +2737,6 @@ pub fn emit_payload_ptr(s: *EmitterState, slot_reg: i32, name: *u8, len: i32, se
     emit_int(s, off)
     emit_str(s, c"\n")
     fld
-
-# Width in bits a scalar type code is stored at (see tagged_enum_scalar_bits).
-pub fn type_code_scalar_bits(t: i32, signed: *i32) -> i32
-    *signed = 1
-    if t == TYPE_I8
-        return 8
-    if t == TYPE_I16
-        return 16
-    if t == TYPE_I32
-        return 32
-    *signed = 0
-    if t == TYPE_U8 or t == TYPE_BOOL
-        return 8
-    if t == TYPE_U16
-        return 16
-    if t == TYPE_U32
-        return 32
-    *signed = 1
-    64
 
 # Integer width in bits of a scalar payload narrower than i64 — the width it
 # is stored at, as ritz0 does — with *signed set for sign- vs zero-extension
@@ -3153,64 +2949,6 @@ pub fn emit_tagged_payload_store(s: *EmitterState, val: i32, pay_ptr: i32, name:
 # Emit LLVM type with struct name support.  Tagged-enum types emit as the
 # named struct so variant constructors / match / return paths share the same
 # declared layout.
-# Is this name a primitive integer/float/bool type? Used in several places
-# where post-monomorphization a generic `T` has been substituted with a
-# primitive but the AST still carries TYPE_STRUCT — we must NOT emit `%u16`
-# struct references or `{ i8 }` fallback decls for those names.
-pub fn is_primitive_type_name(name: *u8, len: i32) -> i32
-    if name_eq(name, len, c"i8", 2) == 1
-        return 1
-    if name_eq(name, len, c"u8", 2) == 1
-        return 1
-    if name_eq(name, len, c"i16", 3) == 1
-        return 1
-    if name_eq(name, len, c"u16", 3) == 1
-        return 1
-    if name_eq(name, len, c"i32", 3) == 1
-        return 1
-    if name_eq(name, len, c"u32", 3) == 1
-        return 1
-    if name_eq(name, len, c"i64", 3) == 1
-        return 1
-    if name_eq(name, len, c"u64", 3) == 1
-        return 1
-    if name_eq(name, len, c"f32", 3) == 1
-        return 1
-    if name_eq(name, len, c"f64", 3) == 1
-        return 1
-    if name_eq(name, len, c"bool", 4) == 1
-        return 1
-    if name_eq(name, len, c"usize", 5) == 1
-        return 1
-    if name_eq(name, len, c"isize", 5) == 1
-        return 1
-    0
-
-# AGAST #167: SIMD vector type names (`v4i32`, `v16i8`, etc).  ritz0 treats
-# these as builtin types in name_resolver.BUILTIN_TYPES.  ritz1's parser
-# accepts them as struct-name annotations; without explicit recognition they
-# fall through to the `%v4i32 = type { i8 }` fallback decl, breaking the
-# stride for `simd_*` builtins which must produce/consume real LLVM `<N x iM>`
-# vectors.  Returns 1 for all SSE2 (128-bit) and AVX2 (256-bit) name shapes
-# the cryptosec / squeeze libs use.
-pub fn is_simd_vector_type_name(name: *u8, len: i32) -> i32
-    if name_eq(name, len, c"v16i8", 5) == 1
-        return 1
-    if name_eq(name, len, c"v8i16", 5) == 1
-        return 1
-    if name_eq(name, len, c"v4i32", 5) == 1
-        return 1
-    if name_eq(name, len, c"v2i64", 5) == 1
-        return 1
-    if name_eq(name, len, c"v32i8", 5) == 1
-        return 1
-    if name_eq(name, len, c"v16i16", 6) == 1
-        return 1
-    if name_eq(name, len, c"v8i32", 5) == 1
-        return 1
-    if name_eq(name, len, c"v4i64", 5) == 1
-        return 1
-    0
 
 # Emit the LLVM `<N x iM>` syntax for a SIMD vector type name.  Caller must
 # ensure `is_simd_vector_type_name(name, len) == 1` first.
@@ -3928,36 +3666,6 @@ pub fn bare_unit_variant_enum(s: *EmitterState, e: *Expr, out_vi: *i32, out_othe
         return 0 - 1
     return ei
 
-# AGAST #1797: the user enum a call `Holds(x)` constructs — a payload
-# variant of a non-generic enum (AGAST #1295: any field count), resolved as try_emit_user_variant_ctor
-# does (it wins over a same-named fn, as in ritz0).  null/0 otherwise.
-# AGAST #1610: also a unit variant called with no arguments, `Red()` (built
-# with no payload; it used to fall through to a fn call returning i64).
-# AGAST #2039: a name two enums declare is no ctor here (null): the caller,
-# try_emit_user_variant_ctor, reports it via user_variant_ctor_ambiguous.
-pub fn user_variant_ctor_enum(e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
-    if e == null or e.kind != EXPR_CALL
-        return
-    var vi: i32 = 0
-    var other: i32 = 0
-    let ei: i32 = enum_of_variant_unique(e.func_name, e.func_name_len, @vi, @other)
-    if ei < 0
-        return
-    let kind: i32 = enum_variant_kind(ei, vi)
-    if kind == ENUM_VARIANT_UNIT
-        if e.args != null
-            return
-    else if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
-        # AGAST #1295: one value per field, `Rect(w, h)`, a struct variant's
-        # positionally; emit_variant_build checks the count, located.
-        if e.args == null
-            return
-    else
-        return
-    *out_name = enum_name_at(ei, out_len)
-
 # AGAST #4153: 1 when the call `e` names a variant of one user enum with a
 # list user_variant_ctor_enum leaves to a fn of that name: values for a bare
 # variant, `Z(1)`, or none for a payload one, `One()`.  *out_ei / *out_vi
@@ -3976,21 +3684,6 @@ pub fn user_variant_ctor_miscounted(e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
     if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
         return (e.args == null) as i32
     0
-
-# AGAST #3995: the user enum a call constructs whatever its slot, for the two
-# typers (get_expr_type, Sema's sema_call_ty): user_variant_ctor_enum, less
-# a variant named Some / Ok / Err / None, whose call is the builtin Option /
-# Result one unless the slot is the user's enum (users_variant_wins).
-pub fn user_enum_ctor_call(e: *Expr, out_name: **u8, out_len: *i32)
-    *out_name = null
-    *out_len = 0
-    if e == null or e.kind != EXPR_CALL
-        return
-    let n: *u8 = e.func_name
-    let l: i32 = e.func_name_len
-    if name_eq(n, l, c"Some", 4) == 1 or name_eq(n, l, c"Ok", 2) == 1 or name_eq(n, l, c"Err", 3) == 1 or name_eq(n, l, c"None", 4) == 1
-        return
-    user_variant_ctor_enum(e, out_name, out_len)
 
 # AGAST #2039: a call `B()` / `Holds(x)` whose callee name two or more
 # non-generic enums declare as a variant.  Returns 1 and fills *out_a /
@@ -4141,10 +3834,6 @@ pub fn emit_ambiguous_variant_error(s: *EmitterState, name: *u8, len: i32, span:
     emit_str(s, c" = add i64 0, 0\n")
     return zero
 
-pub fn eprint_bytes(p: *u8, len: i32)
-    for i in 0..len
-        eprint_char(*(p + i))
-
 # Best-effort resolve the LLVM struct type-name produced by an expression.
 # Writes the name pointer and length into the out-pointers, or null/0 if
 # the producer's struct type isn't statically known.  Used to detect
@@ -4165,7 +3854,8 @@ pub fn resolve_expr_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_
     # `%Span$u8` into the `%StrView` the slot expects.
     if e.kind == EXPR_CAST and e.op == TYPE_STRUCT
         # AGAST #3004: `r as C` through a reference loads the `%C` itself.
-        if ref_cast_reads_referent(s, e) == 1
+        let reads_referent: fn(*EmitterState, *Expr) -> i32 = s.ref_cast_reads_referent_fn
+        if reads_referent(s, e) == 1
             *out_name = e.ident_ptr
             *out_len = e.ident_len
             return
@@ -4815,29 +4505,6 @@ pub fn nd_plane_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
     if sh == null or depth > sh.rank - 2
         return null
     nd_shape_from(sh, depth)
-
-# The dims of `sh` from dimension `from` inward, and its leaf, as a shape of
-# their own: `[3][4]T` from 1 of `[2][3][4]T`.  AGAST #3379: a plane a `for`
-# binds, too.
-pub fn nd_shape_from(sh: *ArrayShape, from: i32) -> *ArrayShape
-    let out: *ArrayShape = malloc(sizeof(ArrayShape)) as *ArrayShape
-    *out = *sh
-    out.rank = sh.rank - from
-    var i: i32 = 0
-    while i < out.rank
-        out.dims[i] = sh.dims[from + i]
-        i = i + 1
-    out
-
-# AGAST #2570: how many leaves a `[M][N]..T` holds, M*N..: the size of the flat
-# `[M*N..]T` a plane pointer is, so `q + k` strides k whole planes.
-pub fn shape_leaf_count(sh: *ArrayShape) -> i32
-    var n: i32 = 1
-    var i: i32 = 0
-    while i < sh.rank
-        n = n * sh.dims[i]
-        i = i + 1
-    n
 
 # The ArrayShape of the local / global N-D array named `name`, or null.
 pub fn nd_array_name_shape(s: *EmitterState, name: *u8, len: i32) -> *ArrayShape
@@ -6331,20 +5998,6 @@ pub fn user_method_ret_type(s: *EmitterState, e: *Expr) -> i32
         ib = ib.next
     TYPE_UNKNOWN
 
-# AGAST #1965: 1 when `e` is a float literal or a negated one (`-2.5`, which
-# #1959 lowers as `fneg double`).  Both are `double`, narrowable to f32.
-pub fn is_float_lit_operand(e: *Expr) -> i32
-    if e.kind == EXPR_FLOAT_LIT
-        return 1
-    if e.kind == EXPR_UNARY and e.op == OP_NEG
-        return is_float_lit_operand(e.operand)
-    # AGAST #3607: literals only, `0.0 - 7.0`, is a literal too (ritz0's
-    # FloatLitType): it takes the other side's width, and is never an f64
-    # meeting an f32.
-    if e.kind == EXPR_BINARY and (e.op == OP_ADD or e.op == OP_SUB or e.op == OP_MUL or e.op == OP_DIV)
-        return (is_float_lit_operand(e.left) == 1 and is_float_lit_operand(e.right) == 1) as i32
-    return 0
-
 # AGAST #1965: the float width a binop `e` is computed at, or 0 when neither
 # operand is a float.  f32 when both sides are f32, or one is f32 and the
 # other a literal / `-literal` (a `double` that narrows); f64 otherwise --
@@ -6371,47 +6024,6 @@ pub fn binop_float_width(s: *EmitterState, e: *Expr) -> i32
 # come back extended (sext / zext by the pointee's signedness) and value
 # operands are truncated, as a call argument would be.
 
-const MEM_VOLATILE_LOAD: i32 = 1
-const MEM_VOLATILE_STORE: i32 = 2
-const MEM_ATOMIC_LOAD: i32 = 3
-const MEM_ATOMIC_STORE: i32 = 4
-const MEM_ATOMIC_XCHG: i32 = 5
-const MEM_ATOMIC_CMPXCHG: i32 = 6
-const MEM_ATOMIC_ADD: i32 = 7
-const MEM_ATOMIC_SUB: i32 = 8
-const MEM_ATOMIC_AND: i32 = 9
-const MEM_ATOMIC_OR: i32 = 10
-const MEM_ATOMIC_XOR: i32 = 11
-const MEM_FENCE: i32 = 12
-
-# The MEM_* id of a builtin name, 0 for any other name.
-pub fn mem_builtin_id(name: *u8, len: i32) -> i32
-    if name_eq(name, len, c"volatile_load", 13) == 1
-        return MEM_VOLATILE_LOAD
-    if name_eq(name, len, c"volatile_store", 14) == 1
-        return MEM_VOLATILE_STORE
-    if name_eq(name, len, c"atomic_load", 11) == 1
-        return MEM_ATOMIC_LOAD
-    if name_eq(name, len, c"atomic_store", 12) == 1
-        return MEM_ATOMIC_STORE
-    if name_eq(name, len, c"atomic_xchg", 11) == 1
-        return MEM_ATOMIC_XCHG
-    if name_eq(name, len, c"atomic_cmpxchg", 14) == 1
-        return MEM_ATOMIC_CMPXCHG
-    if name_eq(name, len, c"atomic_fetch_add", 16) == 1
-        return MEM_ATOMIC_ADD
-    if name_eq(name, len, c"atomic_fetch_sub", 16) == 1
-        return MEM_ATOMIC_SUB
-    if name_eq(name, len, c"atomic_fetch_and", 16) == 1
-        return MEM_ATOMIC_AND
-    if name_eq(name, len, c"atomic_fetch_or", 15) == 1
-        return MEM_ATOMIC_OR
-    if name_eq(name, len, c"atomic_fetch_xor", 16) == 1
-        return MEM_ATOMIC_XOR
-    if name_eq(name, len, c"fence", 5) == 1
-        return MEM_FENCE
-    0
-
 # AGAST #2286: the local `e` names when its slot holds a `:&` borrow's pointer,
 # so that `@e` is that pointer (LocalVar.holds_lent_ptr); null otherwise.
 pub fn lent_ptr_local(s: *EmitterState, e: *Expr) -> *LocalVar
@@ -6429,12 +6041,6 @@ pub fn lent_struct_local(s: *EmitterState, e: *Expr) -> *LocalVar
     if loc == null or loc.pointee_type != TYPE_STRUCT
         return null
     return loc
-
-# AGAST #2308: the scalar T of a `-> @T` / `-> @&T` fn, or TYPE_VOID.
-pub fn ret_ref_scalar_pointee(f: *FnDef) -> i32
-    if f == null or f.ret_ref == null or primitive_name_len(f.ret_ref.param_pointee_type) == 0
-        return TYPE_VOID
-    return f.ret_ref.param_pointee_type
 
 # The pointee type a pointer expression states inline, or TYPE_VOID: `<e> as
 # *T` (the cast records T; AGAST #1453), `@x` (x's own type) and a call that
