@@ -7232,9 +7232,8 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
     # AGAST #3993: the literal's name is a type name the AST keeps no slot
     # for; note it (#4021) so type_name_check.ritz refuses one that names
     # nothing, at the name.  An unannotated `let a = Nope { .. }` compiled to
-    # an uninitialised alloca, and a struct variant's name (`Log { .. }`, no
-    # named construction yet) is no type either.  A token, not the action's
-    # p.pos: the literal's fields have been parsed since its name.
+    # an uninitialised alloca.  A token, not the action's p.pos: the
+    # literal's fields have been parsed since its name.
     note_type_name_written(p, tok.start, tok.line, tok.col)
     tn_note(p, tok.start, tok.len)
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
@@ -7246,7 +7245,70 @@ fn struct_lit_expr(p: *Parser, tok: Token, lit: *FieldInit) -> *Expr
     # Store field inits in args field (reuse)
     e.args = lit as *Expr
     e.next = null
+    # AGAST #4187: a struct variant's name builds the variant
+    # (`Log { level: 4 }`); named_variants.ritz turns it into the positional
+    # call and accepts the name noted above.
+    named_form_note(p, null, e, tok, null, 0)
     return e
+
+# AGAST #4187: the named forms of a struct-declared variant
+# (docs/ENUM_VARIANTS.md §4-5), a pattern `V { b, a }` / `E.V { .. }` and a
+# struct literal that may name one, noted as they parse.  The variant may be
+# declared later or in an import, so named_variants.ritz maps the names to
+# field positions once the whole closure is parsed.  An alternative the
+# parser backtracks out of leaves its note behind; nothing points at its
+# node, and named_variants reports each source position once.
+struct NamedForm
+    arm: *MatchArm   # a named pattern, else null
+    lit: *Expr       # a struct literal (EXPR_STRUCT_LIT), else null
+    name: *u8        # the variant's name (a literal's, which may be a struct's)
+    name_len: i32
+    qual: *u8        # a pattern's `E` of `E.V { .. }`, else null
+    qual_len: i32
+    span: SrcSpan    # where the form begins, for its errors
+    file: *u8
+    next: *NamedForm
+
+var g_named_forms: *NamedForm = null
+
+pub fn named_forms() -> *NamedForm
+    g_named_forms
+
+# The driver re-parses from scratch (#1475).
+pub fn named_forms_reset()
+    g_named_forms = null
+
+# `head` is where the form begins: the qualifier of `E.V { .. }`.
+fn named_form_note(p: *Parser, arm: *MatchArm, lit: *Expr, head: Token, qual: *u8, qual_len: i32)
+    if p.skip_item != 0
+        return
+    let f: *NamedForm = parser_alloc(p, sizeof(NamedForm)) as *NamedForm
+    f.arm = arm
+    f.lit = lit
+    if arm != null
+        f.name = arm.pattern_name
+        f.name_len = arm.pattern_name_len
+    else
+        f.name = lit.ident_ptr
+        f.name_len = lit.ident_len
+    f.qual = qual
+    f.qual_len = qual_len
+    f.span.line = head.line
+    f.span.col = head.col
+    f.file = parse_file_copy_shared(p)
+    f.next = g_named_forms
+    g_named_forms = f
+
+# pattern : [IDENT '.'] IDENT '{' IDENT (',' IDENT)* '}'  (AGAST #4187).  The
+# names bind as written until named_variants.ritz puts them in field order.
+# `head` is the pattern's first token, `name` the variant's.
+pub fn pattern_variant_named(p: *Parser, head: Token, name: Token, binds: *TupleName) -> *MatchArm
+    let a: *MatchArm = pattern_variant_binds(p, name.start, name.len, binds)
+    if head.start == name.start
+        named_form_note(p, a, null, head, null, 0)
+    else
+        named_form_note(p, a, null, head, head.start, head.len)
+    return a
 
 # Generic struct literal parsed through generic_args (AGAST #1300):
 # `Pair<i64, Vec<i64>> { ... }`.  Mangles on every argument (AGAST #1574),

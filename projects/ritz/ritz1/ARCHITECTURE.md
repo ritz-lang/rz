@@ -45,6 +45,9 @@ input.ritz
   │         strip it to its interface, merge it into the one Module.
   │         Re-parse once if type aliases / pending array lengths need it.
   ▼
+[named]     named_variants: a struct variant's named pattern and literal
+  │         become their positional forms (#4187)
+  ▼
 [async]     async_lower: each `async fn` becomes ritz0's `<f>_Future` struct,
   │         constructor and `<f>_poll` state machine; every `await` is lowered;
   │         a bare call to an async fn is refused (§16.2)
@@ -127,6 +130,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `types` | The one table of primitive type facts (AGAST #1889): LLVM spelling in memory and as a value, store size, alignment, bit width, signedness, Ritz name, name→kind. Struct/enum kinds answer "unknown"; the emitter's struct table sizes them. |
 | `diag` | Located diagnostics: one `<file>:<line>:<col>: error: <message>` line per error. |
 | `async_lower` | `async fn` / `await` lowered, AST to AST, to ritz0's state machine (`<f>_Future`, `<f>`, `<f>_poll`; `async fn main` polled by a sync `main`), and a bare call to an async fn refused (§16.2). Run by main once, after imports merge. |
+| `named_variants` | A struct variant's named forms (§10.3, #4187): `V { b, a } =>` gets its bindings in field order and the literal `V { a: 1, b: 2 }` becomes the call `V(1, 2)`, in place, from the forms the parser noted (`named_form_note`); a missing, unknown or repeated field is refused at the name. Run by main once, after imports merge. |
 | `interp` | Reads `{expr}` placeholders in print strings; re-enters the lexer/parser for each placeholder expression. |
 
 **Driver and caching**

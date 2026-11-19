@@ -38,6 +38,7 @@ SOURCES = \
 	frame_limit \
 	binder_check \
 	type_name_check \
+	named_variants \
 	index_through \
 	ll_copy_scan \
 	narrowing \

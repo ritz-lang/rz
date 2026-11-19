@@ -1,0 +1,294 @@
+# ritz1/src/named_variants.ritz - named struct-variant forms (AGAST #4187)
+#
+# A struct-declared variant
+#
+#     enum Msg
+#         SetViewport
+#             width: i32
+#             height: i32
+#
+# may be matched as `SetViewport { height, width } =>` (or `Msg.SetViewport
+# { .. } =>`) and built as `SetViewport { width: 1, height: 2 }`
+# (docs/ENUM_VARIANTS.md §4-5).  Field names are sugar over the positional
+# forms, so each is turned into its positional equivalent, as ritz0's
+# named_variants.py does, before any other pass reads it:
+#
+#   - a pattern's bindings are put in field order, so binding k is field k
+#     (pattern_binds / pattern_field_sel, arm_select_bind);
+#   - a literal becomes, in place, the call `SetViewport(1, 2)` with its
+#     values in field order, which emit_variant_build lowers; its name, noted
+#     as a type name by struct_lit_expr, is accepted.
+#
+# The parser notes every form (ast_helpers named_form_note); this runs once
+# the import closure is parsed, when every enum is known.  Each field must be
+# named exactly once.  A literal's values are evaluated in field order, as the
+# positional call evaluates them.
+#
+# Errors, located where the form begins and worded as ritz0's: a named form on
+# a variant declared without field names, a field it doesn't declare, one
+# named twice and one left out.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ast
+import ast_helpers
+import diag
+import emitter_core
+
+# Positions already reported: a form the parser tried more than once is noted
+# once per try.
+var g_nv_seen: **u8 = null
+var g_nv_seen_count: i32 = 0
+var g_nv_seen_cap: i32 = 0
+
+# 1 the first time the form beginning at `at` is reported.
+fn nv_first_report(at: *u8) -> i32
+    for i in 0..g_nv_seen_count
+        if *(g_nv_seen + i) == at
+            return 0
+    if g_nv_seen_count == g_nv_seen_cap
+        var cap: i32 = g_nv_seen_cap * 2
+        if cap == 0
+            cap = 16
+        g_nv_seen = realloc(g_nv_seen as *u8, (cap as i64) * 8) as **u8
+        g_nv_seen_cap = cap
+    *(g_nv_seen + g_nv_seen_count) = at
+    g_nv_seen_count = g_nv_seen_count + 1
+    1
+
+# `<file>:<line>:<col>: error: ` for form `f`, or 0 if it was reported.
+fn nv_error_begin(f: *NamedForm) -> i32
+    if nv_first_report(f.name) == 0
+        return 0
+    diag_error_at(f.file, f.span)
+    1
+
+fn nv_no_named_fields(f: *NamedForm)
+    if nv_error_begin(f) == 1
+        eprints_cstr(c"variant `")
+        eprint_bytes(f.name, f.name_len)
+        eprints_cstr(c"` has no named fields\n")
+
+fn nv_no_such_field(f: *NamedForm, field: *u8, field_len: i32)
+    if nv_error_begin(f) == 1
+        eprints_cstr(c"variant `")
+        eprint_bytes(f.name, f.name_len)
+        eprints_cstr(c"` has no field `")
+        eprint_bytes(field, field_len)
+        eprints_cstr(c"`\n")
+
+fn nv_named_twice(f: *NamedForm, field: *u8, field_len: i32)
+    if nv_error_begin(f) == 1
+        eprints_cstr(c"field `")
+        eprint_bytes(field, field_len)
+        eprints_cstr(c"` of variant `")
+        eprint_bytes(f.name, f.name_len)
+        eprints_cstr(c"` named twice\n")
+
+fn nv_missing(f: *NamedForm, field: *u8, field_len: i32)
+    if nv_error_begin(f) == 1
+        eprints_cstr(c"missing field `")
+        eprint_bytes(field, field_len)
+        eprints_cstr(c"` of variant `")
+        eprint_bytes(f.name, f.name_len)
+        eprints_cstr(c"`\n")
+
+# The enum whose variant form `f` names, with the variant in `out_vi`, or -1.
+# Only the qualifier's enum, for `E.V { .. }`.  Several enums may declare the
+# name: a struct-declared one wins, as in ritz0; otherwise the first.
+fn nv_find(f: *NamedForm, out_vi: *i32) -> i32
+    var found: i32 = 0 - 1
+    var ei: i32 = 0
+    let n: i32 = enum_count()
+    while ei < n
+        var en_len: i32 = 0
+        let en: *u8 = enum_name_at(ei, @en_len)
+        if f.qual == null or name_eq(en, en_len, f.qual, f.qual_len) == 1
+            for vi in 0..enum_variant_count(ei)
+                var vn_len: i32 = 0
+                let vn: *u8 = enum_variant_name(ei, vi, @vn_len)
+                if name_eq(vn, vn_len, f.name, f.name_len) == 1
+                    if enum_variant_kind(ei, vi) == ENUM_VARIANT_STRUCT
+                        *out_vi = vi
+                        return ei
+                    if found < 0
+                        found = ei
+                        *out_vi = vi
+        ei = ei + 1
+    found
+
+# 1 if a struct the module declares is named like literal `f`.
+fn nv_is_struct(m: *Module, f: *NamedForm) -> i32
+    var st: *StructDef = m.structs
+    while st != null
+        if name_eq(st.name, st.name_len, f.name, f.name_len) == 1
+            return 1
+        st = st.next
+    0
+
+# Map the `nw` written names (`wn` / `wl`) onto the fields of variant `vi` of
+# enum `ei`: order[k] is the written index of field k.  0, or 1 with the
+# error reported.
+fn nv_order(f: *NamedForm, ei: i32, vi: i32, wn: **u8, wl: *i32, nw: i32, order: *i32) -> i32
+    if enum_variant_kind(ei, vi) != ENUM_VARIANT_STRUCT
+        nv_no_named_fields(f)
+        return 1
+    let fields: *StructField = enum_variant_fields(ei, vi)
+    for i in 0..nw
+        var known: i32 = 0
+        var fd: *StructField = fields
+        while fd != null
+            if name_eq(fd.name, fd.name_len, *(wn + i), *(wl + i)) == 1
+                known = 1
+            fd = fd.next
+        if known == 0
+            nv_no_such_field(f, *(wn + i), *(wl + i))
+            return 1
+        for j in 0..i
+            if name_eq(*(wn + j), *(wl + j), *(wn + i), *(wl + i)) == 1
+                nv_named_twice(f, *(wn + i), *(wl + i))
+                return 1
+    var k: i32 = 0
+    var fd: *StructField = fields
+    while fd != null
+        var at: i32 = 0 - 1
+        for i in 0..nw
+            if name_eq(fd.name, fd.name_len, *(wn + i), *(wl + i)) == 1
+                at = i
+        if at < 0
+            nv_missing(f, fd.name, fd.name_len)
+            return 1
+        *(order + k) = at
+        k = k + 1
+        fd = fd.next
+    0
+
+fn nv_count_fields(ei: i32, vi: i32) -> i32
+    var n: i32 = 0
+    var fd: *StructField = enum_variant_fields(ei, vi)
+    while fd != null
+        n = n + 1
+        fd = fd.next
+    n
+
+# `V { b, a } =>`: the bindings in field order.  New TupleName nodes: a node
+# may be shared with an alternative the parser backtracked out of.
+fn nv_pattern(f: *NamedForm, ei: i32, vi: i32) -> i32
+    let arm: *MatchArm = f.arm
+    var nw: i32 = 0
+    var b: *TupleName = arm.pattern_binds
+    while b != null
+        nw = nw + 1
+        b = b.next
+    let nf: i32 = nv_count_fields(ei, vi)
+    let cap: i64 = (nw + nf + 1) as i64
+    let nodes: **TupleName = malloc(cap * 8) as **TupleName
+    let wn: **u8 = malloc(cap * 8) as **u8
+    let wl: *i32 = malloc(cap * 4) as *i32
+    let order: *i32 = malloc(cap * 4) as *i32
+    var i: i32 = 0
+    b = arm.pattern_binds
+    while b != null
+        *(nodes + i) = b
+        *(wn + i) = b.name
+        *(wl + i) = b.len
+        i = i + 1
+        b = b.next
+    var bad: i32 = nv_order(f, ei, vi, wn, wl, nw, order)
+    if bad == 0
+        var head: *TupleName = null
+        var tail: *TupleName = null
+        for k in 0..nf
+            let from: *TupleName = *(nodes + *(order + k))
+            let t: *TupleName = malloc(sizeof(TupleName)) as *TupleName
+            t.name = from.name
+            t.len = from.len
+            t.span = from.span
+            t.next = null
+            if tail == null
+                head = t
+            else
+                tail.next = t
+            tail = t
+        arm.pattern_binds = head
+        arm.pattern_bind_count = nf
+        arm_select_bind(arm, 0)
+        # One binding is the `V(x)` shape: no list (ast.ritz MatchArm).
+        if nf == 1
+            arm.pattern_binds = null
+    free(nodes as *u8)
+    free(wn as *u8)
+    free(wl as *u8)
+    free(order as *u8)
+    bad
+
+# `V { a: 1, b: 2 }` -> `V(1, 2)`, in place.
+fn nv_literal(f: *NamedForm, ei: i32, vi: i32) -> i32
+    let e: *Expr = f.lit
+    # Its name is the variant's: not an unknown type, whatever comes of it.
+    let at: *TypeNameAt = type_name_written_at(f.name)
+    if at != null
+        at.reported = 1
+    var nw: i32 = 0
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        nw = nw + 1
+        fi = fi.next
+    let nf: i32 = nv_count_fields(ei, vi)
+    let cap: i64 = (nw + nf + 1) as i64
+    let vals: **Expr = malloc(cap * 8) as **Expr
+    let wn: **u8 = malloc(cap * 8) as **u8
+    let wl: *i32 = malloc(cap * 4) as *i32
+    let order: *i32 = malloc(cap * 4) as *i32
+    var i: i32 = 0
+    fi = e.args as *FieldInit
+    while fi != null
+        *(vals + i) = fi.value
+        *(wn + i) = fi.name
+        *(wl + i) = fi.name_len
+        i = i + 1
+        fi = fi.next
+    var bad: i32 = nv_order(f, ei, vi, wn, wl, nw, order)
+    if bad == 0
+        var head: *Expr = null
+        var tail: *Expr = null
+        for k in 0..nf
+            let v: *Expr = *(vals + *(order + k))
+            v.next = null
+            if tail == null
+                head = v
+            else
+                tail.next = v
+            tail = v
+        e.kind = EXPR_CALL
+        e.func_name = e.ident_ptr
+        e.func_name_len = e.ident_len
+        e.args = head
+        e.call_type_suffix = null
+        e.call_type_suffix_len = 0
+    free(vals as *u8)
+    free(wn as *u8)
+    free(wl as *u8)
+    free(order as *u8)
+    bad
+
+# Resolve every named form the parser noted.  Errors reported; main stops the
+# compile on any.
+pub fn named_variants_resolve(m: *Module) -> i32
+    var errors: i32 = 0
+    var f: *NamedForm = named_forms()
+    while f != null
+        var vi: i32 = 0
+        if f.arm != null
+            let ei: i32 = nv_find(f, @vi)
+            # No such variant: emitter_match's unknown-variant error.
+            if ei >= 0
+                errors = errors + nv_pattern(f, ei, vi)
+        else if f.lit.kind == EXPR_STRUCT_LIT and nv_is_struct(m, f) == 0
+            let ei: i32 = nv_find(f, @vi)
+            # No such variant either: type_name_check's unknown type.
+            if ei >= 0
+                errors = errors + nv_literal(f, ei, vi)
+        f = f.next
+    errors

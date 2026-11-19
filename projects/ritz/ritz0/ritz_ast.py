@@ -618,6 +618,11 @@ class VariantPattern(Pattern):
     name: str
     fields: List[Pattern]
     qualifier: str = None  # Optional type qualifier for Type.Variant patterns
+    # `V { b, a }` (docs/ENUM_VARIANTS.md §4, AGAST #4187): the names as
+    # written, parallel to `fields`.  named_variants.py reorders `fields` into
+    # declaration order and clears this, so later passes see a positional
+    # pattern.
+    field_names: List[str] = None
 
 
 @dataclass

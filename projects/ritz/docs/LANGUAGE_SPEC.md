@@ -3802,6 +3802,31 @@ fn main() -> i32
     f(Some(5))
 ```
 
+A variant declared with named fields (§10.1) may instead be matched by name:
+`SetViewport { height, width }` binds each field to a local of its own name.
+Every field is named exactly once, in any order (AGAST #4187); there is no
+`..` rest pattern yet. A named pattern on a variant declared without field
+names, a field the variant doesn't declare, one named twice and one left out
+are each a compile error at the pattern. The named literal
+`SetViewport { width: 640, height: 480 }` builds the variant under the same
+rule (§10.3).
+
+```ritz expect-error="missing field `height` of variant `SetViewport`"
+enum Msg
+    Stop
+    SetViewport
+        width: i32
+        height: i32
+
+fn f(m: Msg) -> i32
+    match m
+        SetViewport { width } => width
+        Stop => 0
+
+fn main() -> i32
+    f(Msg.Stop)
+```
+
 A variant pattern, qualified (`E.V`, `E.V(x)`) or not (`V(x)`), names a
 variant of the scrutinee's enum. One of any other enum is a compile error at
 the pattern, naming the enum as declared (AGAST #2431); a missing arm is
@@ -4237,8 +4262,7 @@ fn main() -> i32
     0
 ```
 
-Fields bind **positionally**, for tuple and named-field variants alike — the
-field names in the declaration do not appear in the pattern:
+Fields bind **positionally**, for tuple and named-field variants alike:
 
 ```ritz
 import ritzlib.strview
@@ -4261,6 +4285,31 @@ fn handle(m: Msg) -> i32
 
 fn main() -> i32
     return handle(Msg.Stop)
+```
+
+A named-field variant may also be matched and built **by name** (AGAST
+#4187). Every field is named exactly once, in any order; the names map to
+positions, so `SetViewport { height: 480, width: 640 }` is
+`SetViewport(640, 480)`, its values evaluated in field order, and
+`SetViewport { height, width }` binds what `SetViewport(width, height)` does.
+Qualified patterns (`Msg.SetViewport { width, height }`) follow the same rule
+(§8.2):
+
+```ritz
+enum Msg
+    Stop
+    SetViewport
+        width: i32
+        height: i32
+
+fn area(m: Msg) -> i32
+    match m
+        Msg.SetViewport { height, width } => width * height
+        Stop => 0
+
+fn main() -> i32
+    let m = SetViewport { height: 480, width: 640 }
+    if area(m) == 307200 then 0 else 1
 ```
 
 Use `_` for a field you do not need:

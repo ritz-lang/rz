@@ -248,7 +248,7 @@ Rules:
 - **Named patterns** are valid only for struct-declared variants. Each named
   field must exist on the variant. Order does not matter; naming a subset is
   permitted only via an explicit `..` rest pattern (not yet implemented — until
-  then, all fields must be named).
+  then, all fields must be named). Each field is named once (AGAST #4187).
 - Bindings are introduced by value into the arm's scope and removed at the end
   of the arm.
 - A bare `IDENT` pattern that is not a known variant of the scrutinee's enum is
@@ -268,7 +268,11 @@ let c = Msg.Stop                                 # bare
 
 Named construction reuses the existing struct-literal syntax and is checked the
 same way as a named pattern: every field must be present exactly once. Both
-forms lower to identical IR.
+forms lower to identical IR: every compiler rewrites the named form into the
+positional one (ritz0 `named_variants.py`, ritz1 `named_variants.ritz`, AGAST
+#4187), so the values are evaluated in field order. The qualified literal
+`Msg.SetViewport { .. }` is not implemented yet (a parse error in every
+compiler); write the unqualified form.
 
 ---
 
@@ -282,7 +286,7 @@ gated on closing part of that gap.
 | Bare variants | yes | yes |
 | Single-field tuple variants | yes | yes; user enums construct (`Holds(x)`, unqualified) and bind them since #1797 |
 | Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | yes (#1295): every field constructed and bound at its ritz0 offset |
-| Struct variants | this task | parsed and laid out (#1797); constructed and matched positionally (#1295); named forms not yet: every compiler refuses `V { a: 1 }` as "unknown type `V`" and `V { a } =>` as a parse error (#3993) |
+| Struct variants | yes; named patterns and construction since #4187 | parsed and laid out (#1797); constructed and matched positionally (#1295) and by name, `V { a: 1 }` / `V { a } =>` (#4187) |
 | Payload types retained by parser | yes | yes, in the enum tracker (#1797) |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
 | Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). Non-generic user enums: the same ritz0 layout from the recorded variant fields (#1797); all-unit stays `{ i8 }` |

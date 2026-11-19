@@ -62,12 +62,10 @@ REFUSED = {
     # A struct literal's name (AGAST #3993).  ritz1 compiled an unannotated
     # `let` of one to an uninitialised alloca, and refused one in an argument
     # with no location ("struct not found for literal").  A struct variant's
-    # name is no type: `Log { level: 4 }` is refused like any other, as ritz0
-    # does, until named variant construction exists.
+    # name builds the variant since AGAST #4187: `struct_lit_variant` runs in
+    # test_named_struct_variants.py.
     "struct_lit": "fn f() -> i32\n    let a = ^Nope { code: 2 }\n    0\n",
     "struct_lit_empty": "fn f() -> i32\n    let a = ^Nope {}\n    0\n",
-    "struct_lit_variant": "enum Msg\n    Log\n        level: i32\n    Stop\n\n"
-    "fn g(m: Msg) -> i32\n    0\n\nfn f() -> i32\n    g(^Log { level: 4 })\n",
     # AGAST #4171: a struct-style variant's field (no StructDef to walk) and
     # a generic call's type argument (a bare token, never a type_spec).
     "variant_field": "enum E\n    A\n        x: ^Nope\n    B\n",

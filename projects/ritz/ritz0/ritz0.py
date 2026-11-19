@@ -25,6 +25,7 @@ from typing import List, Optional, Set
 from lexer import Lexer, LexerError
 from parser import Parser, ParseError
 from enum_from import rewrite_enum_from
+from named_variants import rewrite_named_variants
 from emitter_llvmlite import emit as emit_llvmlite, EmitError
 from instantiate import check_instances, monomorphize_module, raise_instance_errors
 from import_resolver import ImportResolver, ImportError as RitzImportError
@@ -301,6 +302,14 @@ def _rewrite_enum_from(ctx: _Compile) -> bool:
     return _report(rewrite_enum_from(ctx.module), "Error: ")
 
 
+def _rewrite_named_variants(ctx: _Compile) -> bool:
+    """`V { b, a } =>` and `V { a: 1, b: 2 }` -> their positional forms
+    (docs/ENUM_VARIANTS.md §4–5, AGAST #4187).  After the merge, so an
+    imported enum's variants count; before _check_type_names, which would
+    take the literal's variant name for an unknown type."""
+    return _report(rewrite_named_variants(ctx.module), "Error: ")
+
+
 def _eval_array_sizes(ctx: _Compile) -> bool:
     """Evaluate constant expressions in array sizes.  This must happen
     before name resolution since it transforms the AST."""
@@ -513,18 +522,19 @@ def _emit(ctx: _Compile) -> bool:
 
 # The compile, in order: parse -> resolve -> check[] -> monomorph -> emit
 # (LARB review/5 N2, AGAST #3449).  The order is load-bearing: the lowering
-# passes (_rewrite_enum_from, _eval_array_sizes) run between the first checks,
-# and _infer_struct_lit_args, monomorph's first step, runs before the typing
-# pass (_type) the type and ownership checks read.  The rest of
-# monomorphisation (_monomorph) and the checks that judge each generic
-# instance (_check_instances) run after the source-level checks, so emit()
-# takes a monomorphised module (AGAST #3523).
+# passes (_rewrite_enum_from, _rewrite_named_variants, _eval_array_sizes) run
+# between the first checks, and _infer_struct_lit_args, monomorph's first
+# step, runs before the typing pass (_type) the type and ownership checks
+# read.  The rest of monomorphisation (_monomorph) and the checks that judge
+# each generic instance (_check_instances) run after the source-level checks,
+# so emit() takes a monomorphised module (AGAST #3523).
 PASSES = (
     _parse,
     _lower_main,
     _resolve,
     _check_impl_targets,
     _rewrite_enum_from,
+    _rewrite_named_variants,
     _eval_array_sizes,
     _check_type_names,
     _check_binders,

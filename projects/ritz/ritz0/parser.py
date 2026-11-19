@@ -1708,6 +1708,22 @@ class Parser:
                 self._expect(TokenType.RPAREN)
                 return rast.VariantPattern(span, name, fields, qualifier)
 
+            # Named struct-variant pattern: `V { a, b }` / `Type.V { a, b }`
+            # (docs/ENUM_VARIANTS.md §4, AGAST #4187).  Each name binds the
+            # field of that name; named_variants.py maps them to positions.
+            if self._at(TokenType.LBRACE):
+                self._advance()
+                names, fields = [], []
+                while True:
+                    tok = self._expect(TokenType.IDENT, "Expected field name in variant pattern")
+                    names.append(tok.value)
+                    fields.append(rast.IdentPattern(tok.span, tok.value, False))
+                    if not self._at(TokenType.COMMA):
+                        break
+                    self._advance()
+                self._expect(TokenType.RBRACE, "Expected '}' to close variant pattern")
+                return rast.VariantPattern(span, name, fields, qualifier, names)
+
             # Qualified variant without fields: Type.None
             if qualifier:
                 return rast.VariantPattern(span, name, [], qualifier)
