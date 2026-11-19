@@ -6,7 +6,7 @@ located message.
 The forms a table takes:
   - `[N]S` of struct literals whose fields are integers, `"..."` into a
     `StrView` / `Span<u8>`, and so on (#1569, #3651 cover the field kinds);
-  - `[N]StrView` of `"..."`;
+  - `[N]StrView` of `"..."`, as a list or a fill (#3978);
   - `[N]*u8` of `"..."`, `c"..."` or `null`, as a list or a fill;
   - `[N]u32` / `[N]u64` of hex literals with the top bit set (SHA round K).
 
@@ -178,6 +178,28 @@ pub fn main() -> i32
         return 11
     3
 """,
+    # AGAST #3978: a `[N]StrView` fill of `"..."` (§3.3).  ritz1 emitted no
+    # global, so `D[i].len` was an unlocated "unhandled EXPR_MEMBER".
+    "strview_fill": """\
+const D: [3]StrView = ["ab"; 3]
+
+pub fn main() -> i32
+    var i: i32 = 1
+    if D[i].len != 2 or *(D[i].ptr + 1) != 'b' or *(D[0].ptr + 2) != 0
+        return 10
+    let s = D[2]
+    if s.len != 2 or *s.ptr != 'a'
+        return 11
+    var n: i64 = 0
+    for v in D
+        n = n + v.len
+    if n != 6
+        return 12
+    let r = @D[i]
+    if r.len != 2
+        return 13
+    3
+""",
     # SHA-256 / SHA-512 round constants: hex with the top bit set.
     "wide_hex": """\
 const K: [3]u32 = [0x428a2f98, 0xb5c0fbcf, 0xc67178f2]
@@ -239,3 +261,15 @@ def test_struct_table_is_not_a_fill(tmp_path, compiler):
     comp, _, _ = _compile(compiler, tmp_path, "struct_fill_once", src.replace("^", ""))
     out = comp.stdout + comp.stderr
     assert out.count("error") <= 1 and "cannot emit" not in out, out
+
+
+# AGAST #3978: only a `[N]StrView` table takes a `"..."` fill; any other
+# struct table is still the #3946 refusal, at the fill's value.
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_struct_table_string_fill_is_refused(tmp_path, compiler):
+    src = (
+        "struct P\n    a: i32\n\n"
+        'const T: [2]P = [^"ab"; 2]\n\n'
+        "pub fn main() -> i32\n    var i: i32 = 1\n    T[i].a\n"
+    )
+    _assert_refused(compiler, tmp_path, "struct_str_fill", src, STRUCT_FILL)

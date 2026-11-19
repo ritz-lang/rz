@@ -28,7 +28,7 @@ import ref_check         # ref_begin_fn (AGAST #2336)
 import emitter_asm       # emit_naked_fn_body (AGAST #3395)
 import frame_limit       # refuse_huge_frame (AGAST #3739)
 import emitter_expr_access
-import emitter_expr_arith   # const_struct_fill_refused (AGAST #3946)
+import emitter_expr_arith   # const_struct_fill_refused (AGAST #3946), const_strview_fill (#3978)
 import emitter_expr_call
 import ritzlib.hashmap
 
@@ -3326,7 +3326,7 @@ fn const_struct_fill_error(s: *EmitterState, c: *ConstEntry)
         i += 1
     eprints_cstr(c"': a struct table can't be a fill `[v; N]`: write its elements out\n")
     s.error_count = s.error_count + 1
-    # A placeholder `[N x %S]` so `T[i].a` lowers (const_struct_fill_refused
+    # A placeholder `[N x %S]` so `T[i].a` lowers (const_struct_fill_global
     # lets the readers through) instead of cascading into an unlocated
     # "unhandled EXPR_MEMBER".  The output is refused, so it is never written.
     if was_global_emitted(s, c.name, c.name_len) == 1 or c.array_elem_type_name_len <= 0
@@ -3413,6 +3413,33 @@ fn emit_const_ptr_array(s: *EmitterState, c: *ConstEntry)
         pi = pi + 1
     emit_str(s, c"]\n")
 
+# AGAST #3978: `const D: [N]StrView = ["s"; N]` as
+# `@D = internal constant [N x %StrView]` of N `{ ptr, len }` views over one
+# backing string `@.const.D.0`, as ritz0's is_strview_array fill.  It used
+# to emit no global, so `D[i].len` was an unlocated "unhandled EXPR_MEMBER".
+fn emit_const_strview_fill(s: *EmitterState, c: *ConstEntry)
+    if was_global_emitted(s, c.name, c.name_len) == 1
+        return
+    mark_global_emitted(s, c.name, c.name_len)
+    let lit: *Expr = c.value_expr.left
+    emit_const_array_elem_string(s, c, 0, lit)
+    emit_str(s, c"@")
+    emit_name(s, c.name, c.name_len)
+    emit_str(s, c" = internal constant [")
+    emit_int(s, c.array_size as i64)
+    emit_str(s, c" x %StrView] [")
+    var i: i32 = 0
+    while i < c.array_size
+        if i > 0
+            emit_str(s, c", ")
+        emit_str(s, c"%StrView { ptr @.const.")
+        emit_name(s, c.name, c.name_len)
+        emit_str(s, c".0, i64 ")
+        emit_int(s, lit.string_len as i64)
+        emit_str(s, c" }")
+        i += 1
+    emit_str(s, c"]\n")
+
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
 fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     if c.const_type != TYPE_ARRAY
@@ -3432,6 +3459,8 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
             emit_const_ptr_array(s, c)   # AGAST #1866: `[c"s"; N]`, `[null; N]`
         else if c.array_elem_type != TYPE_STRUCT
             emit_const_array_fill_entry(s, c)
+        else if const_strview_fill(c) == 1
+            emit_const_strview_fill(s, c)   # AGAST #3978: `["s"; N]`
         else if const_struct_fill_refused(c) == 1
             const_struct_fill_error(s, c)   # AGAST #3946
         return

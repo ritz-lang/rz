@@ -973,8 +973,17 @@ fn main() -> i32
     reason(404).len as i32 + h.name.len as i32 + (K[1] >> 31) as i32 - 13
 ```
 
-An integer or `*u8` table can also be a fill, `[v; N]`. A struct table can't:
-write its elements out.
+An integer, `*u8` or `StrView` table can also be a fill, `[v; N]`; a `StrView`
+fill's `v` is a `"..."`, and every element views the same bytes. Any other
+struct table can't be a fill: write its elements out.
+
+```ritz
+const BLANK: [4]StrView = ["-"; 4]
+
+fn main() -> i32
+    var i: i32 = 3
+    BLANK[i].len as i32 - 1
+```
 
 A `*u8` element that is not a string or `null` is an error at the element. A
 pointer is `null`, never the integer `0` (§3.2):
