@@ -259,7 +259,7 @@ def test_irq4_feeds_the_line_discipline_and_delivers_ctrl_c():
     assert "process_kill_current(TTY_INTR_STATUS)" in kill
     assert re.search(r"TTY_INTR_STATUS: i32 = 130\b", _code(CONSOLE))
     due = _body(_code(CONSOLE), "tty_console_intr_due")
-    assert "parent" in due, "init (no parent) is never killed"
+    assert "tty_fg_is_current()" in due, "only the foreground; init never (tty/fg.ritz)"
 
 
 def test_syscall_exit_delivers_a_pending_ctrl_c():
@@ -278,3 +278,138 @@ def test_tty_syscalls_numbered_and_registered():
     get = _body(sys, "sys_tty_getattr")
     assert "SYS_TTY_GETATTR" in get, "no stub: a real syscall"
     assert "SYS_TTY_SETATTR" in _body(sys, "sys_tty_setattr")
+
+
+# --- the console's foreground (#4276) ---------------------------------------
+#
+# rzsh turns ISIG back on (tty_setattr) a few syscalls before it spawns the
+# command. A Ctrl-C typed in between used to be delivered at the end of
+# rzsh's own syscall, and the running process then was rzsh: it was killed.
+# Now the console has a foreground (tty/fg.ritz) that the shell sets, as
+# tcsetpgrp does: TTY_FG_CHILDREN hands the console to the caller's
+# descendants (spawn is blocking, so the shell can't name the child's pid
+# ahead), TTY_FG_PID to a pid and its descendants, TTY_FG_NONE back to
+# #4254's "the running process". A Ctrl-C for a process outside the
+# foreground is dropped, as for init.
+
+FG = KERNEL_SRC / "tty" / "fg.ritz"
+PROC_TABLE = KERNEL_SRC / "proc" / "table.ritz"
+ERRNO = KERNEL_SRC / "syscall" / "errno.ritz"
+
+FG_PROGRAM = """\
+import syscall.errno { Errno }
+import proc.table
+import tty.fg
+
+fn main() -> i32
+    proc_table_reset()
+    tty_fg_reset()
+    if tty_fg_is_current()
+        return 1
+    proc_enter_init(4096)
+    if tty_fg_is_current()
+        return 2
+    # rzsh, pid 2. Nothing set: the running process (#4254).
+    proc_spawn_child()
+    if not tty_fg_is_current()
+        return 3
+    # rzsh hands the console to its children: from here on a Ctrl-C while
+    # rzsh runs (tty_setattr .. spawn) is not rzsh's.
+    if tty_fg_set(TTY_FG_CHILDREN, 0) != 0 or tty_fg_is_current()
+        return 4
+    # the command, pid 3, and what it spawns, pid 4
+    proc_spawn_child()
+    if not tty_fg_is_current()
+        return 5
+    proc_spawn_child()
+    if not tty_fg_is_current()
+        return 6
+    proc_exit_current(0)
+    proc_exit_current(130)
+    if proc_current_pid() != 2 or tty_fg_is_current()
+        return 7
+    # A pid: that process and its descendants, not its parent.
+    proc_spawn_child()
+    if proc_current_pid() != 5 or tty_fg_set(TTY_FG_PID, 5) != 0 or not tty_fg_is_current()
+        return 8
+    proc_spawn_child()
+    if not tty_fg_is_current()
+        return 9
+    proc_exit_current(0)
+    proc_exit_current(0)
+    if tty_fg_is_current()
+        return 10
+    # A pid that is not running matches nothing.
+    if tty_fg_set(TTY_FG_PID, 99) != 0 or tty_fg_is_current()
+        return 11
+    # TTY_FG_NONE: the running process again; anything else is EINVAL.
+    if tty_fg_set(TTY_FG_NONE, 0) != 0 or not tty_fg_is_current()
+        return 12
+    if tty_fg_set(3, 0) != Errno.Inval as i32 or tty_fg_set(TTY_FG_PID, 0) != Errno.Inval as i32
+        return 13
+    if not tty_fg_is_current()
+        return 13
+    # init is never the foreground, not even by its pid.
+    proc_exit_current(0)
+    if proc_current_pid() != 1 or tty_fg_set(TTY_FG_PID, 1) != 0 or tty_fg_is_current()
+        return 14
+    if tty_fg_set(TTY_FG_CHILDREN, 0) != 0 or tty_fg_is_current()
+        return 15
+    0
+"""
+
+FG_CLAIMS = {1: "nothing running: no foreground", 2: "init alone: no foreground",
+             3: "unset: the running process is the foreground",
+             4: "TTY_FG_CHILDREN: the shell itself is not the foreground (the window)",
+             5: "TTY_FG_CHILDREN: the shell's child is", 6: "... and its child",
+             7: "back in the shell: still not the foreground",
+             8: "a pid: that process is", 9: "a pid: its child is",
+             10: "a pid: its parent is not", 11: "a dead pid matches nothing",
+             12: "TTY_FG_NONE: the running process again", 13: "a bad mode or pid 0 is EINVAL, and changes nothing",
+             14: "init is never the foreground by pid", 15: "init is never the foreground"}
+
+
+@pytest.mark.integration
+def test_foreground_group(tmp_path):
+    tree = tmp_path / "tree"
+    for src, rel in [(ERRNO, "syscall/errno.ritz"), (PROC_TABLE, "proc/table.ritz"), (FG, "tty/fg.ritz")]:
+        (tree / rel).parent.mkdir(parents=True, exist_ok=True)
+        (tree / rel).write_text(src.read_text())
+    (tmp_path / "t.ritz").write_text(FG_PROGRAM)
+    env = dict(os.environ, RITZ_PATH=f"{tree}:{RITZ_ROOT}:{tmp_path}")
+    objs = []
+    for src, name, extra in [(tmp_path / "t.ritz", "t", ()),
+                             (tree / "syscall/errno.ritz", "errno", ("--no-runtime",)),
+                             (tree / "proc/table.ritz", "table", ("--no-runtime",)),
+                             (tree / "tty/fg.ritz", "fg", ("--no-runtime",))]:
+        ll = tmp_path / f"{name}.ll"
+        proc = run_ritz0([str(src), "-o", str(ll), *extra], cwd=tmp_path, env=env, timeout=300)
+        assert proc.returncode == 0 and ll.exists(), f"ritz0 rejected {name}:\n{proc.stdout}{proc.stderr}"
+        objs.append(str(ll))
+    exe = tmp_path / "t"
+    link = subprocess.run(["clang", "-Wno-override-module", *objs, "-o", str(exe), "-nostdlib", "-no-pie"],
+                          capture_output=True, text=True)
+    assert link.returncode == 0, link.stderr[-3000:]
+    rc = subprocess.run([str(exe)], capture_output=True, timeout=60).returncode
+    assert rc == 0, f"exit {rc}: {FG_CLAIMS.get(rc, 'crash')}"
+
+
+def test_ctrl_c_goes_only_to_the_foreground():
+    due = _body(_code(CONSOLE), "tty_console_intr_due")
+    assert "tty_fg_is_current()" in due, "the console asks tty/fg.ritz whose Ctrl-C it is"
+    assert "ldisc_take_intr()" in due, "a Ctrl-C outside the foreground is dropped"
+    assert "proc." not in _code(FG).replace("import proc.table", ""), \
+        "fg.ritz keeps pids, not Proc pointers (#3629 rewrites the table)"
+
+
+def test_tty_setfg_syscall():
+    assert re.search(r"TtySetfg = 16\b", _code(NUMBERS))
+    assert "syscall_register(Syscall.TtySetfg, sys_tty_setfg_handler)" in _code(ENTRY)
+    handler = _body(_code(FILE_RT), "sys_tty_setfg_handler")
+    assert "tty_fd_ok(" in handler and "tty_console_set_fg(" in handler
+    sys = _code(SYS)
+    assert re.search(r"SYS_TTY_SETFG: i64 = 16\b", sys)
+    assert "SYS_TTY_SETFG" in _body(sys, "sys_tty_setfg")
+    for code in (sys, _code(FG)):
+        for name, n in (("NONE", 0), ("CHILDREN", 1), ("PID", 2)):
+            assert re.search(rf"TTY_FG_{name}: u64 = {n}\b", code), name

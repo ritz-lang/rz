@@ -12,10 +12,12 @@
 # it nothing wakes the hlt. One CPU runs syscalls and spawn is blocking, so
 # the reader is the only runnable process: halting is sleeping.
 #
-# Ctrl-C (TTY_ISIG): the foreground process is the running Proc, the
-# deepest in the blocking-spawn chain (proc/table.ritz). It exits with
-# status 130 (128 + SIGINT, as a shell reports it) and its parent resumes.
-# init has no parent and is never killed: its Ctrl-C only drops the line.
+# Ctrl-C (TTY_ISIG) kills the running Proc, the deepest in the
+# blocking-spawn chain (proc/table.ritz), if it is in the console's
+# foreground (tty/fg.ritz, #4276: set by the shell, as tcsetpgrp does). It
+# exits with status 130 (128 + SIGINT, as a shell reports it) and its parent
+# resumes. A Ctrl-C for a process outside the foreground (init always; rzsh
+# between its tty_setattr and spawn) only drops the line.
 # The kill happens
 #   * in the IRQ 4 handler, when the interrupt came from ring 3 (a program
 #     computing in a loop), after its EOI;
@@ -25,7 +27,7 @@
 
 import io { sti_hlt, disable_interrupts, enable_interrupts }
 import serial { serial_data_available, serial_read_byte_nonblock, serial_write_byte }
-import proc.table { Proc, proc_current }
+import tty.fg { tty_fg_is_current, tty_fg_set }
 import syscall.runtime.process { process_kill_current }
 import tty.ldisc { ldisc_input, ldisc_readable, ldisc_read, ldisc_take_intr, ldisc_intr_pending, ldisc_take_echo, ldisc_get_flags, ldisc_set_flags }
 
@@ -55,13 +57,12 @@ fn tty_console_pull()
         ldisc_input(c as u8)
     tty_console_send_echo()
 
-# A Ctrl-C is waiting and there is a foreground process to take it. A
-# Ctrl-C with only init running is dropped here (the line already was).
+# A Ctrl-C is waiting and the running process is in the foreground to take
+# it. A Ctrl-C for anyone else is dropped here (the line already was).
 fn tty_console_intr_due() -> bool
     if not ldisc_intr_pending()
         return false
-    let p: *Proc = proc_current()
-    if p == 0 as *Proc or p.parent < 0
+    if not tty_fg_is_current()
         ldisc_take_intr()
         return false
     true
@@ -120,3 +121,11 @@ pub fn tty_console_set_flags(flags: u32)
     disable_interrupts()
     ldisc_set_flags(flags)
     enable_interrupts()
+
+# tty_setfg: TTY_FG_NONE, TTY_FG_CHILDREN, or TTY_FG_PID and a pid
+# (tty/fg.ritz). 0, or Errno.Inval.
+pub fn tty_console_set_fg(mode: u64, pid: u64) -> i32
+    disable_interrupts()
+    let r: i32 = tty_fg_set(mode, pid)
+    enable_interrupts()
+    r

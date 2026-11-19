@@ -113,8 +113,13 @@ class Console:
         self.type_bytes((line + "\r").encode())
 
     def type_bytes(self, data: bytes) -> None:
+        """Type data. A guest that hung up (rzsh killed, init powered off)
+        takes nothing; the next expect() reports it."""
         for b in data:
-            self.conn.sendall(bytes([b]))
+            try:
+                self.conn.sendall(bytes([b]))
+            except (BrokenPipeError, ConnectionResetError):
+                return
             time.sleep(TYPE_DELAY)
 
 
@@ -198,6 +203,28 @@ def tty_session(con: "Console", timeout: float) -> int:
     out = con.expect(PROMPT, timeout)
     fails += _ok(out is not None and "still-here" in _lines(out[: -len(PROMPT)]),
                  "rzsh survives Ctrl-C at its prompt", out)
+
+    # Ctrl-C between rzsh's tty_setattr (ISIG back on) and its spawn (#4276).
+    # RZSH_DEBUG_TTY_WINDOW holds rzsh there, in a cooked read(0), so the
+    # Ctrl-C lands in rzsh's own syscall every time. rzsh has handed the
+    # console to its children, so the kernel drops it: rzsh is not killed,
+    # and the Enter that ends the read lets it spawn cat. Before #4276 rzsh
+    # died here and init_interactive printed "[init] Shell exited". Last, as
+    # a failure ends the session.
+    con.type_line("RZSH_DEBUG_TTY_WINDOW=1")
+    con.expect(PROMPT, timeout)
+    con.type_line("cat /etc/motd")
+    out = con.expect(b"rzsh: tty window", timeout)
+    fails += _ok(out is not None, "rzsh stops between tty_setattr and spawn (debug hook)", out)
+    time.sleep(1.0)                       # rzsh is now blocked in read(0)
+    con.type_bytes(b"\x03")
+    time.sleep(1.0)
+    con.type_bytes(b"\r")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and b"Welcome to Harland!" in out,
+                 "Ctrl-C between tty_setattr and spawn does not kill rzsh; cat runs", out)
+    con.type_line("unset RZSH_DEBUG_TTY_WINDOW")
+    con.expect(PROMPT, timeout)
     return fails
 
 

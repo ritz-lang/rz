@@ -41,3 +41,27 @@ def test_raw_mode_is_a_real_tty_setattr_on_harland():
 def test_exec_external_hands_the_terminal_to_the_command():
     ext = _body(_code(RZSH_SRC / "shell.ritz"), "exec_external")
     assert "os_tty_suspend()" in ext and "os_tty_resume(" in ext
+
+
+def test_rzsh_takes_itself_out_of_the_foreground_before_isig_is_on():
+    """#4276: rzsh hands the console to its children (sys_tty_setfg) before
+    os_tty_suspend turns ISIG back on, so a Ctrl-C typed before spawn starts
+    the command is not rzsh's: the kernel drops it instead of killing rzsh."""
+    os_code = _code(RZSH_SRC / "os.ritz")
+    fg = os_code.split('[[target_os = "harland"]]\nfn os_tty_fg_children')[1]
+    fg = fg.split("[[target_os")[0]
+    assert "sys_tty_setfg(STDIN, TTY_FG_CHILDREN, 0)" in fg
+    suspend = _body(os_code, "os_tty_suspend")
+    assert suspend.index("os_tty_fg_children()") < suspend.index("os_disable_raw_mode()")
+    # Every time, not once: a nested rzsh (a script) moves it to its own children.
+    assert suspend.index("os_tty_fg_children()") < suspend.index("return false")
+
+
+def test_exec_external_has_the_window_hook():
+    """RZSH_DEBUG_TTY_WINDOW stops rzsh in a read(0) between restoring ISIG
+    and spawning, so the serial session can type Ctrl-C in that window."""
+    ext = _body(_code(RZSH_SRC / "shell.ritz"), "exec_external")
+    suspend, hook, spawn = (ext.index(s) for s in
+                            ("os_tty_suspend()", "RZSH_DEBUG_TTY_WINDOW", "os_spawn_search("))
+    assert suspend < hook < spawn
+    assert "os_tty_window_probe()" in ext

@@ -54,6 +54,11 @@ NVME_SCRIPT = "projects/harland/tools/test_nvme_boot.sh"
 # never prompts; Ctrl-C prints ^C and ends either one at a fresh prompt (or
 # drops the line at the prompt). $FAKE_NO_RUBOUT=1 takes DEL as a byte and
 # $FAKE_NO_INTR=1 ignores Ctrl-C.
+#
+# With RZSH_DEBUG_TTY_WINDOW=1 set (#4276), an external command first prints
+# "rzsh: tty window" and waits in a cooked read: Ctrl-C there is echoed and
+# dropped, Enter runs the command. $FAKE_WINDOW_KILLS=1 is the bug: that
+# Ctrl-C kills rzsh, and init_interactive and the kernel shut down.
 QEMU_STUB = r"""#!/usr/bin/env python3
 import json, os, socket, sys, time
 open(os.environ["STUB_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
@@ -65,17 +70,28 @@ prompt = os.environ.get("FAKE_PROMPT", "rzsh> ").encode()
 replies = json.loads(os.environ.get("FAKE_REPLIES", "{}"))
 rubout = os.environ.get("FAKE_NO_RUBOUT") != "1"
 intr = os.environ.get("FAKE_NO_INTR") != "1"
+window_kills = os.environ.get("FAKE_WINDOW_KILLS") == "1"
+window = False
 s.sendall(os.environ.get("FAKE_BANNER", "").encode())
 if os.environ.get("FAKE_NO_PROMPT") == "1":
     time.sleep(30)
     sys.exit(1)
 s.sendall(prompt)
 line = b""
-fg = None  # the running program that has not prompted: "cat" or "spin"
+fg = None  # the running program that has not prompted: "cat" or "spin",
+          # or ("window", cmd): rzsh held before spawning cmd
 while True:
     b = s.recv(1)
     if not b:
         sys.exit(1)
+    if b == b"\x03" and isinstance(fg, tuple):
+        s.sendall(b"^C\r\n")
+        line = b""
+        if window_kills:
+            s.sendall(b"[init] Shell exited\r\n[exit] init exited with code 0, powering off\r\n")
+            s.close()
+            sys.exit(0)
+        continue
     if b == b"\x03" and intr:
         s.sendall(b"^C\r\n" + prompt)
         line, fg = b"", None
@@ -90,6 +106,10 @@ while True:
         line += b
         continue
     cmd, line = line.decode(), b""
+    if isinstance(fg, tuple):  # the window's read ends; rzsh spawns
+        s.sendall(b"\r\n" + replies.get(fg[1], "").replace("\n", "\r\n").encode() + prompt)
+        fg = None
+        continue
     if fg == "cat":  # cooked mode echoes CR as CR LF; cat writes the line
         s.sendall(b"\r\n" + cmd.encode() + b"\n")
         continue
@@ -102,6 +122,14 @@ while True:
         sys.exit(int(os.environ.get("FAKE_EXIT_RC", "0")))
     if cmd == "cat":
         fg = "cat"
+        continue
+    if cmd in ("RZSH_DEBUG_TTY_WINDOW=1", "unset RZSH_DEBUG_TTY_WINDOW"):
+        window = not cmd.startswith("unset")
+        s.sendall(prompt)
+        continue
+    if window and cmd == "cat /etc/motd":
+        fg = ("window", cmd)
+        s.sendall(b"rzsh: tty window\r\n")
         continue
     if cmd == "spin":
         fg = "spin"
@@ -142,6 +170,8 @@ TTY_PASSES = (
     "PASS: spin killed by Ctrl-C exits 130",
     "PASS: Ctrl-C at the prompt",
     "PASS: rzsh survives Ctrl-C at its prompt",
+    "PASS: rzsh stops between tty_setattr and spawn",
+    "PASS: Ctrl-C between tty_setattr and spawn does not kill rzsh",
 )
 EXIT = ("Goodbye!\r\n[init] Shell exited\r\n"
         "[exit] init exited with code 0, powering off\r\n")
@@ -357,6 +387,15 @@ def test_ctrl_c_ignored_fails(tree):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS: cooked read(0)" in r.stdout
     assert "FAIL: Ctrl-C kills cat blocked in read(0)" in r.stdout
+
+
+@pytest.mark.integration
+def test_ctrl_c_that_kills_rzsh_before_spawn_fails(tree):
+    """#4276: a Ctrl-C between rzsh's tty_setattr and spawn killed rzsh."""
+    r = _run(tree, env_extra={"FAKE_WINDOW_KILLS": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS: rzsh stops between tty_setattr and spawn" in r.stdout
+    assert "FAIL: Ctrl-C between tty_setattr and spawn does not kill rzsh" in r.stdout
 
 
 @pytest.mark.integration

@@ -80,6 +80,25 @@ fn sys_tty_setattr(fd: i32, attrs: *TtyAttrs) -> i32
 - **fd**: 0, 1 or 2 when it is not an open file
 - **Returns**: 0, ENOTTY for any other fd, EFAULT for a bad `attrs`
 
+#### SYS_TTY_SETFG (16)
+
+```ritz
+# The console's foreground: whose Ctrl-C it is (tcsetpgrp, AGAST #4276)
+fn sys_tty_setfg(fd: i32, mode: u64, pid: u64) -> i32
+```
+
+- **mode**: TTY_FG_NONE (0), the boot default: Ctrl-C kills the running
+  process. TTY_FG_CHILDREN (1): the caller's descendants, not the caller.
+  Spawn blocks, so a shell can't name its command's pid in advance. rzsh sets
+  this before it turns ISIG back on, so a Ctrl-C typed before spawn starts
+  the command is dropped instead of killing rzsh. TTY_FG_PID (2): `pid` and
+  its descendants. A pid that is not running matches nothing.
+- A Ctrl-C for a process outside the foreground only drops the line. init is
+  never the foreground.
+- **fd**: 0, 1 or 2 when it is not an open file
+- **Returns**: 0, ENOTTY for any other fd, EINVAL for an unknown mode, for
+  TTY_FG_PID with pid 0, or for TTY_FG_CHILDREN before init starts
+
 ---
 
 ### IPC Syscalls

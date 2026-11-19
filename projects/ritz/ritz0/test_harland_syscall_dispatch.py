@@ -53,7 +53,7 @@ COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 # they are gone, and their numbers are free.
 ABI = {
     "Read": 0, "Write": 1, "Open": 2, "Close": 3, "Lseek": 8,
-    "Mmap": 9, "Munmap": 11, "Readdir": 17, "TtyGetattr": 18, "TtySetattr": 19,
+    "Mmap": 9, "Munmap": 11, "TtySetfg": 16, "Readdir": 17, "TtyGetattr": 18, "TtySetattr": 19,
     "Exit": 20, "Spawn": 21, "Wait": 22, "Getpid": 23, "Yield": 24,
     "SpawnArgs": 25, "Getcwd": 26, "Chdir": 27,
     "IpcSend": 30, "IpcRecv": 31, "IpcClose": 33,
@@ -75,7 +75,7 @@ DISPATCHED = {
     "Readdir", "Spawn", "SpawnArgs", "Wait", "ChannelCreate", "IpcSend",
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
-    "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr",
+    "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
 }
 
 

@@ -18,7 +18,8 @@ import ritzlib.sys {
     VMIN, VTIME, STDIN,
     # Harland-specific (only used when target_os=harland)
     sys_readdir, sys_spawn_args, sys_wait, sys_yield,
-    sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON, TTY_ISIG
+    sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON, TTY_ISIG,
+    sys_tty_setfg, TTY_FG_CHILDREN
 }
 
 import ritzlib.str { strlen }
@@ -435,10 +436,27 @@ pub fn os_disable_raw_mode() -> i32
 pub fn os_is_raw_mode() -> bool
     return g_raw_mode_active != 0
 
+# The console's Ctrl-C goes to rzsh's children, never to rzsh (#4276, the
+# kernel's tty/fg.ritz). Spawn is blocking, so rzsh can't name the command's
+# pid before it runs; "my children" covers it and whatever it spawns. A
+# Ctrl-C typed while rzsh is still between tty_setattr and spawn is then
+# dropped instead of killing rzsh. Set before every command, not once: a
+# nested rzsh (a script) hands the console to its own children.
+[[target_os = "harland"]]
+fn os_tty_fg_children()
+    sys_tty_setfg(STDIN, TTY_FG_CHILDREN, 0)
+
+# Linux: the job-control shell's tcsetpgrp is not rzsh's yet.
+[[target_os = "linux"]]
+fn os_tty_fg_children()
+    return
+
 # A command gets the terminal as rzsh found it (echo, line editing, Ctrl-C),
 # not rzsh's raw mode: os_tty_suspend before it runs, os_tty_resume(the
-# result) after. Only a raw mode that was on is turned back on.
+# result) after. Only a raw mode that was on is turned back on. The console's
+# foreground moves to rzsh's children first, before ISIG is back on.
 pub fn os_tty_suspend() -> bool
+    os_tty_fg_children()
     if g_raw_mode_active == 0
         return false
     os_disable_raw_mode()
@@ -447,3 +465,12 @@ pub fn os_tty_suspend() -> bool
 pub fn os_tty_resume(was_raw: bool)
     if was_raw
         os_enable_raw_mode()
+
+# RZSH_DEBUG_TTY_WINDOW (exec_external): hold rzsh between os_tty_suspend
+# (ISIG back on) and spawn, in a read(0) of one line, so a test can type
+# Ctrl-C into that window every time (#4276).
+pub fn os_tty_window_probe()
+    let msg: *u8 = c"rzsh: tty window\n"
+    sys_write(1, msg, strlen(msg))
+    var buf: [256]u8
+    sys_read(0, @buf[0], 256)
