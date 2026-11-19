@@ -632,6 +632,55 @@ fn test_cmd_zrem() -> i32
     return 0
 
 
+# Scores are doubles, as in Redis: fractions and ±inf are accepted, and
+# replies use Redis's shortest round-trip form (AGAST #4268).
+[[test]]
+fn test_cmd_zadd_double_scores() -> i32
+    var store: Store = store_new()
+    if reply_is(@store, c"ZADD f 1.5 a -inf b +inf c 0.1 d 2.5e-7 e\r\n", c":5\r\n") != 0
+        return 1
+    if reply_is(@store, c"ZSCORE f a\r\n", c"$3\r\n1.5\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZSCORE f b\r\n", c"$4\r\n-inf\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZSCORE f c\r\n", c"$3\r\ninf\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZSCORE f e\r\n", c"$6\r\n2.5e-7\r\n") != 0
+        return 5
+    let all: *u8 = c"*10\r\n$1\r\nb\r\n$4\r\n-inf\r\n$1\r\ne\r\n$6\r\n2.5e-7\r\n$1\r\nd\r\n$3\r\n0.1\r\n$1\r\na\r\n$3\r\n1.5\r\n$1\r\nc\r\n$3\r\ninf\r\n"
+    if reply_is(@store, c"ZRANGE f 0 -1 WITHSCORES\r\n", all) != 0
+        return 6
+    # A tie on score orders by member; 1.5 and 1.50 are the same score.
+    if reply_is(@store, c"ZADD f 1.50 a 1.5 0\r\n", c":1\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZRANGE f 2 4\r\n", c"*3\r\n$1\r\nd\r\n$1\r\n0\r\n$1\r\na\r\n") != 0
+        return 8
+    # Two scores that differ only in the last bit order correctly.
+    if reply_is(@store, c"ZADD f 0.30000000000000004 y 0.3 x\r\n", c":2\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZREVRANGE f 2 4 WITHSCORES\r\n", c"*6\r\n$1\r\n0\r\n$3\r\n1.5\r\n$1\r\ny\r\n$19\r\n0.30000000000000004\r\n$1\r\nx\r\n$3\r\n0.3\r\n") != 0
+        return 10
+    if reply_is(@store, c"ZSCORE f y\r\n", c"$19\r\n0.30000000000000004\r\n") != 0
+        return 11
+    # A large integer score prints the way Redis 7.2 does.
+    if reply_is(@store, c"ZADD g 100000000 m\r\n", c":1\r\n") != 0
+        return 12
+    if reply_is(@store, c"ZSCORE g m\r\n", c"$4\r\n1e+8\r\n") != 0
+        return 13
+    # NaN, overflow and underflow to zero are refused, leaving the set alone.
+    if reply_is(@store, c"ZADD f nan n\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 14
+    if reply_is(@store, c"ZADD f 1 p 1e400 q\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 15
+    if reply_is(@store, c"ZADD f 1e-400 r\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 16
+    if reply_is(@store, c"ZADD f 1.5x s\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 17
+    if reply_is(@store, c"ZCARD f\r\n", c":8\r\n") != 0
+        return 18
+    return 0
+
+
 [[test]]
 fn test_cmd_zscore() -> i32
     var store: Store = store_new()
@@ -777,7 +826,7 @@ fn test_cmd_zrange_reply_respects_cap() -> i32
     name[2] = 0
     for i in 0..20
         name[1] = (97 + i) as u8
-        store_zadd_cstr(@store, c"z", i as i64, @name[0])
+        store_zadd_cstr(@store, c"z", i as f64, @name[0])
     var buf: [128]u8
     if exec_capped(@store, c"ZRANGE z 0 -1\r\n", @buf[0]) != 0
         return 1

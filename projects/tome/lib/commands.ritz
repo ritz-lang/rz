@@ -20,6 +20,7 @@ import ritzlib.string
 import ritzlib.strview
 import lib.tome
 import lib.resp
+import lib.score
 
 
 # ============================================================================
@@ -842,8 +843,9 @@ fn cmd_hgetall(ctx: *CommandContext, cmd: *RespCommand) -> i32
 # ============================================================================
 # Sorted Set Commands (AGAST #3070)
 # ============================================================================
-# Replies follow Redis.  Scores are i64 in the store (store_zset.ritz), so a
-# score must be an integer; anything else gets Redis's float error.
+# Replies follow Redis.  Scores are doubles: lib/score.ritz reads them as
+# Redis does (fractions, exponents, ±inf; NaN and out-of-range values get
+# Redis's float error) and writes them in Redis's shortest form.
 
 # If `key` holds a value that is not a sorted set, write the WRONGTYPE reply
 # and answer true.  store_zcard is the type probe: it is -1 only then.
@@ -870,9 +872,9 @@ fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
     # the set as it was (as Redis does).
     var i: i32 = 2
     while i < cmd.argc
-        var score: i64 = 0
+        var score: f64 = 0.0
         let arg: *RespArg = @cmd.args[i]
-        if resp_parse_i64(arg.data, arg.len, @score) == 0
+        if score_parse(arg.data, arg.len, @score) == 0
             let err: StrView = "ERR value is not a valid float"
             ctx_write_error_sv(ctx, err)
             return CMD_ERR_SYNTAX
@@ -885,9 +887,9 @@ fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
     var added: i64 = 0
     i = 2
     while i < cmd.argc
-        var score: i64 = 0
+        var score: f64 = 0.0
         let arg: *RespArg = @cmd.args[i]
-        resp_parse_i64(arg.data, arg.len, @score)
+        score_parse(arg.data, arg.len, @score)
         var member_sv: StrView = resp_arg_sv(@cmd.args[i + 1])
         added += store_zadd(ctx.store, key_sv, score, member_sv)
         i += 2
@@ -928,13 +930,13 @@ fn cmd_zscore(ctx: *CommandContext, cmd: *RespCommand) -> i32
         return CMD_ERR_TYPE
 
     var member_sv: StrView = resp_arg_sv(@cmd.args[2])
-    var score: i64 = 0
+    var score: f64 = 0.0
     if store_zscore(ctx.store, key_sv, member_sv, @&score) == 0
         ctx_write_null(ctx)
         return CMD_OK
 
-    var digits: [24]u8
-    let n: i64 = fmt_i64_into(@digits[0], score)
+    var digits: [32]u8
+    let n: i64 = score_format(score, @digits[0])
     ctx_write_bulk(ctx, @digits[0], n)
     return CMD_OK
 
@@ -983,7 +985,8 @@ fn cmd_zcard(ctx: *CommandContext, cmd: *RespCommand) -> i32
 # ZRANGE / ZREVRANGE key start stop [WITHSCORES]
 # An array of members (ascending or descending score); with WITHSCORES each
 # member is followed by its score as a bulk string.  The 6.2 ZRANGE options
-# (BYSCORE, BYLEX, REV, LIMIT) are not supported: they are a syntax error.
+# (BYSCORE, BYLEX, REV, LIMIT) are not supported: they are a syntax error
+# (AGAST #4284).
 fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i32
     if cmd.argc < 4
         var err: [96]u8
@@ -1024,15 +1027,15 @@ fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> 
         ctx_write_bulk_array(ctx, members, count)
         return CMD_OK
 
-    # Interleave member, score.  Each score's digits live in `digits` (24
-    # bytes a score) until the reply is written.
+    # Interleave member, score.  Each score's text lives in `digits`
+    # (SCORE_FMT_MAX bytes a score) until the reply is written.
     let items: *StrView = malloc(2 * count * sizeof(StrView) + 1) as *StrView
-    let digits: *u8 = malloc(24 * count + 1)
+    let digits: *u8 = malloc(SCORE_FMT_MAX * count + 1)
     for i in 0..count
-        var score: i64 = 0
+        var score: f64 = 0.0
         store_zscore(ctx.store, key_sv, members[i], @&score)
-        let d: *u8 = digits + 24 * i
-        let n: i64 = fmt_i64_into(d, score)
+        let d: *u8 = digits + SCORE_FMT_MAX * i
+        let n: i64 = score_format(score, d)
         items[2 * i] = members[i]
         items[2 * i + 1] = strview_from_ptr(d, n)
     ctx_write_bulk_array(ctx, items, 2 * count)  # frees items
