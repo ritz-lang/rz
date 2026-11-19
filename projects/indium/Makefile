@@ -38,7 +38,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi debug test test-uefi test-uefi-gui ec2-disk help
+.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi shell debug test test-uefi test-uefi-gui ec2-disk help
 
 all: iso
 
@@ -188,6 +188,33 @@ run-uefi: $(UEFI_DISK) $(INITRAMFS) $(STORAGE)
 		-serial mon:stdio $(QEMU_DISPLAY) \
 		-no-reboot
 
+# An interactive shell on the serial console (AGAST #4252): the initramfs with
+# init_interactive as /bin/init, which spawns /bin/rzsh. COM1 is this
+# terminal (-serial mon:stdio, no display): type at the `rzsh> ` prompt.
+# Ctrl-A x quits QEMU; rzsh's `exit` returns to init, which powers off. Under OVMF with
+# harland's own BOOTX64.EFI on a vvfat ESP directory (no mtools), as
+# harland/tools/test_shell_boot.sh boots, which scripts a session over the
+# same image in the gate.
+SHELL_ESP = $(BUILD_DIR)/shell-esp
+SHELL_INITRAMFS = $(BUILD_DIR)/shell-initramfs.qcow2
+
+shell: kernel initramfs-bin
+	@if [ -z "$(OVMF_CODE)" ]; then echo "ERROR: OVMF not found. Install ovmf package."; exit 1; fi
+	@rm -rf $(SHELL_ESP) && mkdir -p $(SHELL_ESP)/EFI/BOOT $(SHELL_ESP)/harland
+	cp $(BOOTLOADER) $(SHELL_ESP)/EFI/BOOT/BOOTX64.EFI
+	cp $(KERNEL_ELF) $(SHELL_ESP)/harland/kernel.elf
+	python3 $(HARLAND_DIR)/tools/mkinitramfs.py --bin-dir $(INITRAMFS_BIN) \
+		--init init_interactive --output $(SHELL_INITRAMFS)
+	@echo "=== Booting to rzsh on this terminal (Ctrl-A x quits QEMU) ==="
+	$(QEMU) $(QEMU_CPU) -smp 4 -m 2G \
+		-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+		-drive format=raw,file=fat:rw:$(SHELL_ESP) \
+		-device virtio-blk-pci,drive=initramfs \
+		-drive file=$(SHELL_INITRAMFS),format=qcow2,if=none,id=initramfs \
+		-display none \
+		-serial mon:stdio \
+		-no-reboot
+
 # Run with GDB server for debugging (BIOS mode)
 debug: iso $(INITRAMFS) $(STORAGE)
 	$(QEMU) $(QEMU_CPU) \
@@ -267,6 +294,7 @@ help:
 	@echo "  run         - Boot in QEMU (BIOS/GRUB mode, default)"
 	@echo "  run-iso     - Boot in QEMU (BIOS/GRUB mode)"
 	@echo "  run-uefi    - Boot in QEMU (UEFI mode); headless: QEMU_DISPLAY=\"-display none\""
+	@echo "  shell       - Boot to an rzsh prompt on this terminal (serial; Ctrl-A x quits)"
 	@echo "  debug       - Boot with GDB server on :1234 (BIOS)"
 	@echo "  debug-uefi  - Boot with GDB server on :1234 (UEFI)"
 	@echo ""

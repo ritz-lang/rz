@@ -15,14 +15,23 @@ import subprocess
 from pathlib import Path
 
 
-def create_initramfs(bin_dir: Path, output: Path, extra_files: dict = None):
+def create_initramfs(bin_dir: Path, output: Path, extra_files: dict = None,
+                     init: str | None = None):
     """Create an initramfs TAR archive.
 
     Args:
         bin_dir: Directory containing user ELF binaries
         output: Output TAR file path (or qcow2 if write_to_disk is True)
         extra_files: Dict of {path: content} for additional files
+        init: Name of the ELF (bin_dir/NAME.elf) to install as /bin/init in
+              place of init.elf, e.g. "init_interactive" for `make shell`
+              (AGAST #4252). None: init.elf, the Tier-1 suite.
     """
+    init_elf = None
+    if init:
+        init_elf = bin_dir / f"{init}.elf"
+        if not init_elf.is_file():
+            raise SystemExit(f"mkinitramfs: --init {init}: {init_elf} not found")
     print(f"Creating initramfs: {output}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -67,8 +76,11 @@ Goliath filesystem initialized.
                         continue  # Skip kernel
                     # Remove .elf extension for /bin name
                     bin_name = elf.stem
-                    print(f"    /bin/{bin_name}")
-                    tar.add(str(elf), arcname=f"./bin/{bin_name}")
+                    src = elf
+                    if bin_name == "init" and init_elf is not None:
+                        src = init_elf
+                    print(f"    /bin/{bin_name}" + (f" ({src.name})" if src != elf else ""))
+                    tar.add(str(src), arcname=f"./bin/{bin_name}")
 
             # Add any extra files
             if extra_files:
@@ -120,10 +132,13 @@ def main():
                         help="Directory containing user ELF binaries")
     parser.add_argument("--output", type=Path, required=True,
                         help="Output file (.tar or .qcow2)")
+    parser.add_argument("--init", metavar="NAME",
+                        help="install BIN_DIR/NAME.elf as /bin/init "
+                             "(e.g. init_interactive: boot to rzsh)")
 
     args = parser.parse_args()
 
-    create_initramfs(args.bin_dir, args.output)
+    create_initramfs(args.bin_dir, args.output, init=args.init)
     return 0
 
 

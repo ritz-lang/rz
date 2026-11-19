@@ -25,6 +25,12 @@ Named after Indium, a soft malleable metal - the distribution that wraps around 
 - GPU framebuffer support with prism_demo
 - EC2-compatible GPT disk image builder (`make ec2-disk`)
 
+## Try it
+
+`make -C projects/indium shell` boots Harland to an `rzsh> ` prompt on your terminal (serial console, no window; OVMF needed).
+Try `echo hi`, `pwd`, `ls /bin`, `cat /etc/motd`; `exit` returns to init, which powers the VM off; Ctrl-A x quits QEMU at any time.
+The gate scripts this same session: `projects/harland/tools/test_shell_boot.sh`.
+
 ## Installation
 
 ```bash
@@ -63,6 +69,7 @@ make iso          # Create bootable ISO with GRUB
 make ec2-disk     # Create EC2-compatible GPT disk image
 make run          # Boot in QEMU (UEFI)
 make run-iso      # Boot in QEMU (BIOS/GRUB)
+make shell        # Boot to an rzsh prompt on this terminal (serial)
 make test-uefi-gui # Boot with display (shows graphics)
 make debug        # Boot with GDB server on :1234
 make clean        # Remove build artifacts
