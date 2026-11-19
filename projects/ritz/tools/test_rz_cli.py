@@ -100,6 +100,16 @@ class TestKnownFailingConfig:
                      'reason = "not rz\'s"\nagast = 7\n')
         assert rz.known_failing_from_config() == {"lexis": "AGAST #7: why"}
 
+    def test_the_sweep_reads_its_compilers_build_excuses(self, rz, tmp_path,
+                                                         monkeypatch):
+        """AGAST #4272: `rz build --all --compiler ritz1` honours a ritz1
+        build entry; the ritz0 sweep does not."""
+        self._kf_dir(tmp_path, monkeypatch,
+                     '[[entry]]\ngate = "build"\ncompiler = "ritz1"\nunit = "x"\n'
+                     'reason = "r1"\nagast = 7\n')
+        assert rz.known_failing_from_config("ritz1") == {"x": "AGAST #7: r1"}
+        assert rz.known_failing_from_config("ritz0") == {}
+
     def test_a_malformed_excuse_stops_rz(self, rz, tmp_path, monkeypatch, capsys):
         # No ticket: rz refuses rather than honouring it.
         self._kf_dir(tmp_path, monkeypatch,

@@ -15,7 +15,7 @@ agast    = 1621                 # the ticket; must equal the file name
 
 | gate | read by | compiler | unit |
 |------|---------|----------|------|
-| `build` | `rz build --all`, `rz test --all`, train.sh package tests | `any` | rz project id (`lexis`, `ritz/ritzlib/tests`) |
+| `build` | `rz build --all`, `rz test --all`, train.sh package tests | `any` (every compiler), or ritz0, ritz1, ritz1_selfhosted (that sweep only) | rz project id (`lexis`, `ritz/ritzlib/tests`) |
 | `matrix` | `tools/run_regression_matrix.py` | ritz0, ritz1, ritz1_selfhosted | `file` (its build failures only) or `file::fn` |
 | `regression` | `scripts/regression.sh` (via the CLI) | ritz0, ritz1 (covers ritz1_selfhosted) | example key: path under `examples/`, `/` → `_` |
 | `examples` | `tools/example_tests.py` | ritz0 | test file under `examples/` |

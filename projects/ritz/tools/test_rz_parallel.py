@@ -379,7 +379,7 @@ class TestGateWiring:
                             calls.setdefault("bpar", (projects, jobs)) and
                             (list(failed), []))
         monkeypatch.setattr(rz, "known_failing_from_config",
-                            lambda: calls.setdefault("kf", "build") and
+                            lambda compiler: calls.setdefault("kf", compiler) and
                             {"q": "AGAST #1 — x"})
 
         def gate(kind, f, kf, ran, setup=None):
@@ -395,7 +395,7 @@ class TestGateWiring:
         calls = self._run(rz, monkeypatch, ["test", "--all", "-j", "4"],
                           ["q"])
         assert calls["par"] == (["p", "q"], 4)
-        assert calls["kf"] == "build"
+        assert calls["kf"] == "ritz0"
         assert calls["gate"] == ("test", ["q"], {"q": "AGAST #1 — x"},
                                  ["p", "q"])
 
@@ -405,6 +405,13 @@ class TestGateWiring:
         assert calls["bpar"] == (["p", "q"], 3)
         assert calls["gate"][:4] == ("build", ["p"], {"q": "AGAST #1 — x"},
                                      ["p", "q"])
+
+    def test_build_sweep_reads_its_compilers_excuses(self, rz, monkeypatch):
+        """AGAST #4272: the ritz1 sweep honours ritz1's `build` entries."""
+        calls = self._run(rz, monkeypatch,
+                          ["build", "--all", "-j", "3", "--compiler", "ritz1"],
+                          [])
+        assert calls["kf"] == "ritz1"
 
     def test_j1_keeps_the_serial_streaming_path(self, rz, monkeypatch):
         ran = []

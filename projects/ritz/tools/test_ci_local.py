@@ -1120,3 +1120,44 @@ def test_a_skipped_by_request_step_is_not_scoped(scoped):
     assert ci_local.main(["--job", "bootstrap", "--diff-base", BASE,
                           "--skip", "Regression harness self-tests"]) == 0
     assert asked == [ci_local.ritz0_scope.REGRESSION.name]
+
+
+@pytest.mark.unit
+def test_the_gate_builds_every_package_under_ritz1():
+    """AGAST #4272: goal 2 of the self-hosting loop is "ritz1 builds every
+    package ritz0 builds".  The gate's bootstrap job sweeps `rz build --all
+    --compiler ritz1` once ritz1 exists -- --all, not a list, so a new package
+    is covered the day it lands; a package ritz1 cannot build is a
+    known-failures/ `build` entry naming ritz1 and its ticket."""
+    steps = [s for s in ci_local.load_steps() if s.job == "bootstrap"]
+    names = [s.name for s in steps]
+    sweep = [i for i, s in enumerate(steps)
+             if re.search(r"\bmake build-all-ritz1\b", s.run)]
+    assert len(sweep) == 1, names
+    assert names.index(ci_local.PYTEST_PREREQ) < sweep[0]
+    assert steps[sweep[0]].workdir == "projects/ritz"
+    makefile = (ci_local.REPO_ROOT / "projects/ritz/Makefile").read_text()
+    m = re.search(r"^build-all-ritz1:.*\n((?:\t.*\n)+)", makefile, re.M)
+    assert m, "projects/ritz/Makefile has no build-all-ritz1 target"
+    for compiler in ("ritz1", "ritz1_selfhosted"):  # + AGAST #4317
+        assert re.search(rf"\./rz build --all --compiler {compiler}$",
+                         m.group(1), re.M), (compiler, m.group(1))
+
+
+@pytest.mark.integration
+def test_the_ritz1_sweep_is_never_scoped_out(tmp_path, monkeypatch):
+    """AGAST #4272 x #4206: the ritz1 sweep reads every package, so no per-step
+    read set may drop it -- even when every scoped step says skip, it runs."""
+    real = next(s for s in ci_local.load_steps()
+                if re.search(r"\bmake build-all-ritz1\b", s.run))
+    assert real.name not in {s.name for s in ci_local.ritz0_scope.STEPS}
+    log = tmp_path / "log"
+    wf = tmp_path / "main.yml"
+    wf.write_text(SCOPED_WF.format(log=log)
+                  + f"      - name: {real.name}\n        run: echo sweep >> {log}\n")
+    monkeypatch.setattr(ci_local, "WORKFLOW", wf)
+    monkeypatch.setattr(ci_local.ritz0_scope, "decide",
+                        lambda repo, base, step=None: ci_local.ritz0_scope.Decision(
+                            True, [f"SKIPPED {step.name}"]))
+    assert ci_local.main(["--job", "bootstrap", "--diff-base", BASE]) == 0
+    assert log.read_text().split() == ["build", "sweep"]

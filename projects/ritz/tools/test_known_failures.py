@@ -82,7 +82,7 @@ def test_an_empty_or_missing_directory_has_no_entries(tmp_path):
     ("7.toml", "[[entry]\n", "7.toml"),  # not TOML at all
     ("7.toml", entry(gate="nightly"), "nightly"),
     ("7.toml", entry(gate="matrix", compiler="ritz9"), "ritz9"),
-    ("7.toml", entry(gate="build", compiler="ritz1"), "ritz1"),
+    ("7.toml", entry(gate="build", compiler="ritz9"), "ritz9"),
     ("7.toml", entry(gate="doc", compiler="ritz1", unit="LANGUAGE_SPEC.md 12"), "12-hex"),
     ("7.toml", entry(gate="matrix", compiler="ritz1", unit="a::b::c"), "a::b::c"),
     ("7.toml", entry() + entry(), "listed twice"),
@@ -163,6 +163,21 @@ def test_build_entries_apply_whatever_compiler_rz_runs(tmp_path):
     es = kf.load(tmp_path)
     assert kf.known("build", "any", es) == {"lexis": "AGAST #7: why"}
     assert kf.known("build", "ritz1", es) == {"lexis": "AGAST #7: why"}
+
+
+@pytest.mark.unit
+def test_a_compiler_named_build_entry_excuses_only_that_compiler(tmp_path):
+    """AGAST #4272: the gate sweeps `rz build --all` under ritz0 AND ritz1, so
+    a package only ritz1 cannot build needs an excuse ritz0's sweep ignores --
+    an `any` entry there would xpass-fail ritz0.  `any` still covers both."""
+    write(tmp_path, "7.toml",
+          entry() + entry(compiler="ritz1", unit="angelo", reason="r1 only"))
+    es = kf.load(tmp_path)
+    assert kf.known("build", "ritz1", es) == {"lexis": "AGAST #7: why",
+                                              "angelo": "AGAST #7: r1 only"}
+    assert kf.known("build", "ritz0", es) == {"lexis": "AGAST #7: why"}
+    assert kf.known("build", "ritz1_selfhosted", es) == {"lexis": "AGAST #7: why"}
+    assert kf.known("build", "any", es) == {"lexis": "AGAST #7: why"}
 
 
 @pytest.mark.unit

@@ -233,6 +233,17 @@ ritzlib-tests-ritz1: ritz1-bootstrap
 	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1
 	cd ../.. && ./rz test ritz/ritzlib/tests --compiler ritz1_selfhosted
 
+# Every workspace package built by ritz1 (AGAST #4272) and ritz1_selfhosted
+# (#4317): goal 2 of the self-hosting loop, "ritz1 builds every package ritz0
+# builds".  --all, not a list, so a new package is covered the day it lands;
+# one a compiler cannot build is a known-failures/ `build` entry naming that
+# compiler and its ticket, and strict xpass deletes it once it builds.  All 28
+# built under each on 0a839f97: ~56 s / ~58 s cold, ~9 s warm, on 8 workers.
+.PHONY: build-all-ritz1
+build-all-ritz1: ritz1-bootstrap
+	cd ../.. && ./rz build --all --compiler ritz1
+	cd ../.. && ./rz build --all --compiler ritz1_selfhosted
+
 # Build and test all examples (always runs)
 .PHONY: examples
 examples:

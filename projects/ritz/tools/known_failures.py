@@ -62,7 +62,10 @@ COMPILERS = ("ritz0", "ritz1", "ritz1_selfhosted")
 # gate -> (compilers an entry may name, what a unit is).  "any" means the
 # gate's sweep does not vary by compiler, so neither does its excuse.
 GATES: dict[str, tuple[tuple[str, ...], str]] = {
-    "build": (("any",),
+    # `any` excuses the package under every compiler; naming one excuses it
+    # only there (AGAST #4272: the gate sweeps under ritz0 and ritz1, and an
+    # `any` entry for a ritz1-only failure would xpass-fail ritz0's sweep).
+    "build": (("any",) + COMPILERS,
               "an rz project id (`rz build/test --all`, train.sh package tests)"),
     "matrix": (COMPILERS,
                ("`<file>` (excuses its build failures) or `<file>::<fn>` "
@@ -187,7 +190,7 @@ def load(directory: Path | None = None) -> list[Entry]:
 def _list_compiler(gate: str, compiler: str) -> str:
     if gate not in GATES:
         raise KnownFailuresError(f"unknown gate {gate!r}; one of {', '.join(GATES)}")
-    if gate == "build":
+    if gate == "build" and compiler == "any":
         return "any"
     if compiler not in COMPILERS:
         raise KnownFailuresError(f"unknown compiler {compiler!r}")
@@ -201,7 +204,9 @@ def entries_for(gate: str, compiler: str,
     """{unit: Entry} excused for `gate` under `compiler`."""
     c = _list_compiler(gate, compiler)
     es = load() if entries is None else entries
-    return {e.unit: e for e in es if e.gate == gate and e.compiler == c}
+    # A build sweep under compiler C honours `any` entries and C's own.
+    cs = {"any", c} if gate == "build" else {c}
+    return {e.unit: e for e in es if e.gate == gate and e.compiler in cs}
 
 
 def known(gate: str, compiler: str,
