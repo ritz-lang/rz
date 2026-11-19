@@ -126,6 +126,27 @@ def test_a_lent_slot_still_needs_its_pointee(tmp_path, capsys):
     assert ok is False, out
 
 
+# A fn reading a `[2]i32` called through a pointer to another array reads
+# that array as a `[2]i32` (AGAST #4278): its slot is another array type, a
+# `:&` one or a plain `@` one alike, as a direct call `f(@b)` refuses it on
+# all three compilers. ritz1 judges no fn value against its slot yet (#4310).
+OTHER_ARRAY = [("fn(@[3]i32)", "var b: [3]i32 = [1, 3, 5]"),
+               ("fn(@[2]i64)", "var b: [2]i64 = [1, 3]"),
+               ("fn(@[2]u32)", "var b: [2]u32 = [1, 3]"),
+               ("fn(@[2]f32)", "var b: [2]f32 = [1.0, 3.0]")]
+
+
+@pytest.mark.parametrize("slot,decl", OTHER_ARRAY)
+@pytest.mark.parametrize("param", ["a:& [2]i32", "a: @[2]i32"])
+def test_a_slot_of_another_array_type_is_refused(tmp_path, capsys, param, slot, decl):
+    source = (LENT_AS_VALUE.replace("a:& [2]i32", param).replace("fn(@[2]i32)", slot)
+              .replace("var b: [2]i32 = [1, 3]", decl))
+    ok, out, _, ll = _compile(tmp_path, capsys, source)
+    assert ok is False, out
+    assert f"a.ritz:5:5: cannot initialize {slot} -> i32 with fn(" in out, out
+    assert not ll.exists()
+
+
 # Rules the typing pass lacked, which the emitter lowers: each was a refused
 # row of test_ritz1_whole_array.py once the typing pass's errors reported.
 BYTES = ("fn g(s: StrView) -> i32\n    return s.len as i32\n\n"

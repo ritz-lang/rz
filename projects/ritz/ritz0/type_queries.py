@@ -508,18 +508,47 @@ class TypeQueriesMixin:
             if len(actual.params) != len(expected.params):
                 return False
             for i, (a, e) in enumerate(zip(actual.params, expected.params)):
-                if self._types_compatible(a, e):
+                if self._types_compatible(a, e) and self._arrays_agree(a, e):
                     continue
                 # A `name:& T` slot is physically a `*T` (AGAST #3034): it
                 # fits a `@T` / `@&T` / `*T` param, as the emitter lowers it
                 # (AGAST #4260, test_ritz1_borrow_array's fn_value).
                 if i in actual.lent and isinstance(e, (rast.RefType, rast.PtrType)) \
-                        and self._types_compatible(a, e.inner):
+                        and self._types_compatible(a, e.inner) \
+                        and self._arrays_agree(a, e.inner):
                     continue
                 return False
             return self._types_compatible(actual.ret, expected.ret)
 
         return False
+
+    def _arrays_agree(self, actual: rast.Type, expected: rast.Type) -> bool:
+        """An array a fn's param reads is the array its slot's type passes.
+
+        `_types_compatible`'s array rule takes any length and, through the
+        integer coercion, any element width: right for a literal, which is
+        whatever array its slot is, but a fn reading a `[2]i32` called through
+        a `fn(@[3]i32)` or `fn(@[2]i64)` reads another array as one (AGAST
+        #4278). Arrays reached through matching `*` / `@` layers need the same
+        length and the same element type; a size still an expression is
+        judged elsewhere.
+        """
+        actual, expected = self._resolve_alias(actual), self._resolve_alias(expected)
+        refs = (rast.PtrType, rast.RefType)
+        while isinstance(actual, refs) and isinstance(expected, refs):
+            actual = self._resolve_alias(actual.inner)
+            expected = self._resolve_alias(expected.inner)
+        if not (isinstance(actual, rast.ArrayType) and isinstance(expected, rast.ArrayType)):
+            return True
+        if isinstance(actual.size, int) and isinstance(expected.size, int) \
+                and actual.size != expected.size:
+            return False
+        a, e = self._resolve_alias(actual.inner), self._resolve_alias(expected.inner)
+        # `_types_compatible` has checked any type args; the widening rules
+        # (i32 into i64, f32 into f64) are for a value, not an element read
+        if isinstance(a, rast.NamedType) and isinstance(e, rast.NamedType):
+            return a.name == e.name
+        return self._arrays_agree(a, e)
 
     def _promote_numeric_types(self, t1: rast.Type, t2: rast.Type) -> rast.Type:
         """Get the common type for two numeric types."""
