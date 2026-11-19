@@ -112,6 +112,105 @@ pub fn main() -> i32
     ),
 }
 
+# AGAST #4262: a builtin-generic Option/Result whose ritzlib module isn't
+# imported. ritz1 and ritz1_selfhosted called an undeclared
+# `@Result$i32_i32_frob` and failed at link; ritz0 raised its own words.
+# Refused at the method name whether or not ritzlib.option/result is imported.
+OPTION_G = """\
+struct G
+    v: i32
+
+fn mk() -> Option<G>
+    Some(G { v: 7 })
+
+pub fn main() -> i32
+    let o = mk()
+"""
+
+RESULT_UNIMPORTED = """\
+fn mk() -> Result<i32, i32>
+    Ok(3)
+
+pub fn main() -> i32
+    let o = mk()
+    o.^frob()
+    0
+"""
+
+REFUSED |= {
+    "option_builtin_unimported": (
+        """\
+fn mk() -> Option<i32>
+    Some(3)
+
+pub fn main() -> i32
+    let o = mk()
+    o.^frob()
+    0
+""",
+        no_method("frob", "Option$i32"),
+    ),
+    # AGAST #4263: with a member access after it, ritz1 reported "cannot
+    # emit: unhandled EXPR_MEMBER" at the outer expression instead.  `expect`
+    # is no method of Option's: no emitter lowers it.
+    "option_expect_then_member": (
+        "import ritzlib.option\n\n" + OPTION_G + '    o.^expect("x").v\n',
+        no_method("expect", "Option$G"),
+    ),
+    "option_frob_then_member": (
+        "import ritzlib.option\n\n" + OPTION_G + "    o.^frob().v\n",
+        no_method("frob", "Option$G"),
+    ),
+    "option_expect_then_member_unimported": (
+        OPTION_G + '    o.^expect("x").v\n',
+        no_method("expect", "Option$G"),
+    ),
+    # As a condition, ritz1's bool check said "if condition must be bool, and
+    # ritz1 cannot tell that it is" before the method got its own error, once
+    # `expect` left the carrier's payload methods (bool_kind.ritz).
+    "option_expect_as_condition": (
+        """\
+fn mk() -> Option<bool>
+    Some(true)
+
+pub fn main() -> i32
+    let o = mk()
+    if o.^expect("x")
+        return 1
+    0
+""",
+        no_method("expect", "Option$bool"),
+    ),
+    # ...and, on an Option<i32>, "must be bool, got i32", typing `expect` as
+    # the payload.
+    "option_expect_i32_as_condition": (
+        """\
+fn mk() -> Option<i32>
+    Some(1)
+
+pub fn main() -> i32
+    let o = mk()
+    if o.^expect("x")
+        return 1
+    0
+""",
+        no_method("expect", "Option$i32"),
+    ),
+    "option_frob_as_condition": (
+        """\
+fn mk() -> Option<i32>
+    Some(1)
+
+pub fn main() -> i32
+    let o = mk()
+    if o.^frob()
+        return 1
+    0
+""",
+        no_method("frob", "Option$i32"),
+    ),
+}
+
 # A StrView's methods are ritzlib's `impl StrView` and ritz0's emitter
 # builtins (`len`, `as_bytes`): its emitter raised an unlocated ValueError for
 # anything else (AGAST #3649). ritz1 named it `Span$u8` until AGAST #3697.
@@ -253,6 +352,8 @@ pub fn main() -> i32
 """,
         7,
     ),
+    # AGAST #4263: the carrier's own `unwrap` still reaches the payload's field.
+    "option_unwrap_then_member": (OPTION_G + "    o.unwrap().v\n", 7),
     # A type in the UFCS table: `s.len()` on a `String` is `string_len(@s)`.
     # The table goes by the type's name, so ritzlib's String is declared here
     # in its shape, and the program links without ritzlib's objects.
@@ -280,6 +381,15 @@ pub fn main() -> i32
 def test_method_syntax_needs_an_impl_method(tmp_path, compiler, name):
     program, message = REFUSED[name]
     _assert_refused(compiler, tmp_path, name, program, message)
+
+
+# AGAST #4262. A two-argument instance is `Result$i32$i32` to ritz1 and
+# `Result$i32_i32` to ritz0, as for any generic (AGAST #4266).
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_unimported_result_method_it_lacks_is_refused(tmp_path, compiler):
+    instance = "Result$i32_i32" if compiler == "ritz0" else "Result$i32$i32"
+    _assert_refused(compiler, tmp_path, "result_builtin_unimported", RESULT_UNIMPORTED,
+                    no_method("frob", instance))
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

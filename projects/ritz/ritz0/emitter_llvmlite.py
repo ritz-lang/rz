@@ -42,6 +42,7 @@ import module_interface
 import main_abi
 from main_abi import display_name
 from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
+from name_resolver import BUILTIN_GENERICS
 
 
 # AGAST #3347: `let s: String = "abc"` with no `import ritzlib.string`. ritz1's
@@ -15053,9 +15054,11 @@ class LLVMEmitter:
                 builtin_span = self._try_emit_builtin_span_method(expr, type_name)
                 if builtin_span is not None:
                     return builtin_span
-                if type_name == 'Span' or type_name.startswith('Span$'):
+                if type_name.split('$')[0] in BUILTIN_GENERICS:
                     # ritz1's words, at the method name (AGAST #3764): the
                     # checker leaves a built-in generic's methods to us.
+                    # Option/Result too, imported from ritzlib or not
+                    # (AGAST #4262).
                     raise EmitError(ref_rules.no_method(expr.method, type_name),
                                     expr.name_span or expr.span)
                 raise self._err(f"No method '{expr.method}' found for type '{type_name}'",

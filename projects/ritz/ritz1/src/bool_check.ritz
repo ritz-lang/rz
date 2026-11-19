@@ -368,10 +368,11 @@ pub fn sbk_method_def(sm: *Sema, e: *Expr) -> *FnDef
         return null
     sema_method_fn(sm, tn, tn_len, e.ident_ptr, e.ident_len)
 
+# `expect` is none (AGAST #4263): no emitter lowers it.
 fn sbk_is_unwrap(e: *Expr) -> i32
-    if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1 or name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9) == 1
+    if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1
         return 1
-    name_eq(e.ident_ptr, e.ident_len, c"expect", 6)
+    name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9)
 
 # 1 when method call `e` on type `tn` is `StrView.as_bytes()`, a Span$u8 the
 # emitter lowers inline (try_emit_strview_as_bytes) with no FnDef to read its
@@ -390,7 +391,7 @@ fn sbk_method(sm: *Sema, e: *Expr) -> i32
     if name_eq(e.ident_ptr, e.ident_len, c"is_ok", 5) == 1 or name_eq(e.ident_ptr, e.ident_len, c"is_err", 6) == 1
         return BK_BOOL
     # The carrier's own methods hand back its payload.
-    if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1 or name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9) == 1 or name_eq(e.ident_ptr, e.ident_len, c"expect", 6) == 1
+    if name_eq(e.ident_ptr, e.ident_len, c"unwrap", 6) == 1 or name_eq(e.ident_ptr, e.ident_len, c"unwrap_or", 9) == 1
         let pk: i32 = sbk_payload_of(sm, e.left)
         if pk != BK_UNSURE
             return pk
@@ -1324,6 +1325,10 @@ fn bool_require(sm: *Sema, e: *Expr, what: *u8, op: *u8)
     # ("`g` returns nothing, so its call has no value"), on the emitter.
     if k == BK_UNSURE and sbk_is_procedure_call(sm, e) == 1
         return
+    # So is a method an Option/Result doesn't have (`o.expect("x")`, `o.frob()`):
+    # refuse_no_method's "no method `m` on `T`", at the method (AGAST #4263).
+    if k == BK_UNSURE and sbk_is_unknown_carrier_method(sm, e) == 1
+        return
     if bool_sema_report_at(sm, e) == 0
         return
     eprints_cstr(what)
@@ -1337,6 +1342,25 @@ fn bool_require(sm: *Sema, e: *Expr, what: *u8, op: *u8)
     eprints_cstr(bk_words(k))
     bk_write(k)
     eprints_cstr(c"\n")
+
+# 1 when `e` is `o.m(...)` on an `Option$`/`Result$` receiver with no fn for
+# `m`, and `m` none of the carrier's builtins (unwrap, unwrap_or, is_some...).
+fn sbk_is_unknown_carrier_method(sm: *Sema, e: *Expr) -> i32
+    if e.kind != EXPR_METHOD or sbk_is_unwrap(e) == 1
+        return 0
+    if name_eq(e.ident_ptr, e.ident_len, c"is_some", 7) == 1 or name_eq(e.ident_ptr, e.ident_len, c"is_none", 7) == 1
+        return 0
+    if name_eq(e.ident_ptr, e.ident_len, c"is_ok", 5) == 1 or name_eq(e.ident_ptr, e.ident_len, c"is_err", 6) == 1
+        return 0
+    var tn_len: i32 = 0
+    let tn: *u8 = sbk_method_recv(sm, e, @tn_len)
+    if tn == null or tn_len < 7
+        return 0
+    if name_eq(tn, 7, c"Option$", 7) == 0 and name_eq(tn, 7, c"Result$", 7) == 0
+        return 0
+    if sema_method_fn(sm, tn, tn_len, e.ident_ptr, e.ident_len) != null
+        return 0
+    1
 
 fn sbk_is_procedure_call(sm: *Sema, e: *Expr) -> i32
     var fd: *FnDef = null
