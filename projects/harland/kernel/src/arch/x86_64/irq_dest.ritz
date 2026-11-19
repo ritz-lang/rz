@@ -1,0 +1,94 @@
+# Harland device-interrupt destinations: which CPU an MSI or an I/O APIC
+# interrupt can be sent to, and how each encodes that CPU (AGAST #4233).
+#
+# IPIs carry a 32-bit destination in x2APIC mode, but device interrupts
+# don't: an MSI address holds the APIC ID in bits 19:12 and an I/O APIC
+# redirection entry in bits 63:56, 8 bits each, and 0xFF there is the
+# broadcast ID. Past that, a CPU is reachable only through interrupt
+# remapping (VT-d/AMD-Vi, which Harland doesn't drive yet) or on a
+# hypervisor that advertises the extended destination ID
+# (KVM_FEATURE_MSI_EXT_DEST_ID, CPUID 0x40000001 EAX bit 15): APIC ID bits
+# 14:8 go in MSI address bits 11:5 and in redirection-entry bits 55:49.
+# Any other CPU's interrupts go to one that is reachable: the BSP if it is,
+# else the first CPU in the MADT that is.
+#
+# No imports, no hardware access: the host test compiles this module as is
+# (projects/ritz/ritz0/test_harland_irq_dest.py). arch/x86_64/apic.ritz
+# reads CPUID and the CPU map and calls these; drivers/msix.ritz encodes
+# its table entries with msi_addr_lo.
+
+# MSI message address: the Local APIC window.
+pub const MSI_ADDR_BASE: u32 = 0xFEE00000
+
+# The 8-bit destination that means "every CPU", not APIC ID 255.
+pub const IRQ_DEST_BROADCAST: u32 = 0xFF
+
+# Highest APIC ID the extended destination ID reaches (8 + 7 bits).
+pub const IRQ_EXT_DEST_MAX: u32 = 0x7FFF
+
+# irq_dest_pick's answer when no CPU at all can take device interrupts.
+pub const IRQ_DEST_NONE: u32 = 0xFFFFFFFF
+
+# KVM's CPUID signature at 0x40000000 ("KVMKVMKVM\0\0\0" in EBX, ECX, EDX),
+# and its feature leaf's extended-destination-ID bit.
+pub const KVM_SIG_EBX: u32 = 0x4B4D564B
+pub const KVM_SIG_ECX: u32 = 0x564B4D56
+pub const KVM_SIG_EDX: u32 = 0x0000004D
+pub const KVM_CPUID_FEATURES: u32 = 0x40000001
+pub const KVM_FEATURE_MSI_EXT_DEST_ID: u32 = 0x8000
+
+# Does the hypervisor advertise the extended destination ID? Takes CPUID
+# 0x40000000's EAX (highest hypervisor leaf), EBX, ECX, EDX and CPUID
+# 0x40000001's EAX. Only KVM's signature counts: another hypervisor's
+# feature leaf means something else.
+pub fn irq_ext_dest_from_cpuid(max_leaf: u32, ebx: u32, ecx: u32, edx: u32, features: u32) -> bool
+    if ebx != KVM_SIG_EBX or ecx != KVM_SIG_ECX or edx != KVM_SIG_EDX
+        return false
+    if max_leaf < KVM_CPUID_FEATURES
+        return false
+    return (features & KVM_FEATURE_MSI_EXT_DEST_ID) != 0
+
+# Can an MSI or an I/O APIC interrupt, with no interrupt remapping, be sent
+# to `apic_id` alone? 0..254 always (255 is the broadcast ID); up to
+# IRQ_EXT_DEST_MAX with the extended destination ID.
+pub fn irq_dest_reachable(apic_id: u32, ext_dest: bool) -> bool
+    if apic_id == IRQ_DEST_BROADCAST
+        return false
+    if apic_id < IRQ_DEST_BROADCAST
+        return true
+    return ext_dest and apic_id <= IRQ_EXT_DEST_MAX
+
+# The MSI address (low 32 bits) that sends to `apic_id`: physical mode,
+# no redirection hint. Bits 19:12 are ID bits 7:0, bits 11:5 ID bits 14:8
+# (0 for any ID below 256). Only meaningful for a reachable ID.
+pub fn msi_addr_lo(apic_id: u32) -> u32
+    return MSI_ADDR_BASE | ((apic_id & 0xFF) << 12) | (((apic_id >> 8) & 0x7F) << 5)
+
+# The APIC ID an MSI address sends to (msi_addr_lo's inverse).
+pub fn msi_addr_dest(addr_lo: u32) -> u32
+    return ((addr_lo >> 12) & 0xFF) | (((addr_lo >> 5) & 0x7F) << 8)
+
+# The high 32 bits of an I/O APIC redirection entry that sends to
+# `apic_id`: bits 31:24 are ID bits 7:0, bits 23:17 ID bits 14:8.
+pub fn ioapic_rte_hi(apic_id: u32) -> u32
+    return ((apic_id & 0xFF) << 24) | (((apic_id >> 8) & 0x7F) << 17)
+
+# The APIC ID a redirection entry's high 32 bits send to.
+pub fn ioapic_rte_dest(rte_hi: u32) -> u32
+    return ((rte_hi >> 24) & 0xFF) | (((rte_hi >> 17) & 0x7F) << 8)
+
+# The CPU to send a device interrupt meant for `want` to: `want` if it is
+# reachable, else `bsp` if it is, else the first of `ids[0..n]` that is.
+# IRQ_DEST_NONE if none is.
+pub fn irq_dest_pick(want: u32, bsp: u32, ids: *u32, n: i32, ext_dest: bool) -> u32
+    if irq_dest_reachable(want, ext_dest)
+        return want
+    if irq_dest_reachable(bsp, ext_dest)
+        return bsp
+    var i: i32 = 0
+    while i < n
+        let id: u32 = *(ids + i)
+        if irq_dest_reachable(id, ext_dest)
+            return id
+        i = i + 1
+    return IRQ_DEST_NONE

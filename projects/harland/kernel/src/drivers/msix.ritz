@@ -6,14 +6,17 @@
 # and a mask bit; when the device raises entry N it writes N's data to N's
 # address. Address 0xFEE0_0000 | (APIC ID << 12) with data = vector delivers
 # that vector, edge-triggered, to that CPU's Local APIC: no I/O APIC, no
-# shared INTx line.
+# shared INTx line. The APIC ID field is 8 bits: a CPU with ID 255 or more
+# is reached only with the extended destination ID, else its entries go to
+# another CPU (arch/x86_64/irq_dest.ritz, AGAST #4233).
 #
 # This module:
 #   - finds a device's MSI-X capability and its table (msix_probe);
 #   - maps the table through the kernel MMIO window, masks every entry and
 #     enables MSI-X (msix_enable);
 #   - hands out IDT vectors MSIX_VECTOR_BASE.. (msix_vector_alloc) and points
-#     a table entry at one, aimed at the BSP (msix_set_entry);
+#     a table entry at one, aimed at the current CPU if an MSI can reach
+#     it, else the BSP (msix_set_entry);
 #   - counts each vector's interrupts (msix_dispatch, from irq_handler), so a
 #     driver or a test can see interrupts were delivered (msix_vector_count).
 #
@@ -23,9 +26,13 @@
 import serial { prints, serial_print_dec, serial_print_hex, serial_print_hex8, serial_print_hex16 }
 import mm.vmm { vmm_map_mmio }
 import drivers.pci { PciDevice, pci_find_capability, pci_read_config16, pci_read_config32, pci_write_config16, pci_enable_memory, pci_get_device_count, pci_get_device }
+import arch.x86_64.irq_dest { msi_addr_lo, IRQ_DEST_NONE }
 
-# Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
+# Current CPU's Local APIC ID, the CPU an interrupt meant for an APIC ID
+# goes to, and why it isn't that one (arch/x86_64/apic.ritz)
 extern fn lapic_id() -> u32
+extern fn irq_route_dest(want: u32) -> u32
+extern fn irq_route_print_reason(apic_id: u32) -> i32
 
 # ============================================================================
 # Constants
@@ -49,9 +56,6 @@ const MSIX_ENTRY_ADDR_HI: u64 = 4
 const MSIX_ENTRY_DATA: u64 = 8
 const MSIX_ENTRY_CTRL: u64 = 12
 const MSIX_ENTRY_CTRL_MASKED: u32 = 1
-
-# x86 MSI message address: the Local APIC window, destination in bits 19:12
-const MSI_ADDR_BASE: u32 = 0xFEE00000
 
 # IDT vectors handed out to MSI-X entries: 0x40-0x4F, above the I/O APIC's
 # 32-47 and below anything else the kernel uses (spurious is 0xFF).
@@ -156,16 +160,38 @@ pub fn msix_vector_alloc() -> u8
     return vector
 
 # Point table entry `entry` at `vector` on the current CPU (the BSP during
-# boot) and unmask it. Returns 0, or -1 if the entry is out of range or the
-# table isn't mapped.
+# boot) and unmask it. A CPU an MSI can't reach (APIC ID 255 or more with
+# no extended destination ID) gets the entry sent to the BSP, or the first
+# CPU an MSI reaches, and says so. Returns 0, or -1 if the entry is out of
+# range, the table isn't mapped or no CPU can take the interrupt.
 pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
     if (*info).table_virt == 0 or entry >= (*info).table_size
         return -1
     let e: u64 = (*info).table_virt + (entry as u64) * MSIX_ENTRY_SIZE
-    let dest: u32 = lapic_id() & 0xFF
+    let here: u32 = lapic_id()
+    let dest: u32 = irq_route_dest(here)
+    if dest == IRQ_DEST_NONE
+        prints("[msix] no CPU can take MSI-X vector ")
+        serial_print_dec(vector as u64)
+        prints(" (APIC ID ")
+        serial_print_dec(here as u64)
+        prints(": ")
+        irq_route_print_reason(here)
+        prints(")\n")
+        return -1
+    if dest != here
+        prints("[msix] vector ")
+        serial_print_dec(vector as u64)
+        prints(" -> APIC ID ")
+        serial_print_dec(dest as u64)
+        prints(", not this CPU's ")
+        serial_print_dec(here as u64)
+        prints(": ")
+        irq_route_print_reason(here)
+        prints("\n")
     # Mask while rewriting, so the device never sees half an entry.
     volatile_store((e + MSIX_ENTRY_CTRL) as *u32, MSIX_ENTRY_CTRL_MASKED)
-    volatile_store((e + MSIX_ENTRY_ADDR_LO) as *u32, MSI_ADDR_BASE | (dest << 12))
+    volatile_store((e + MSIX_ENTRY_ADDR_LO) as *u32, msi_addr_lo(dest))
     volatile_store((e + MSIX_ENTRY_ADDR_HI) as *u32, 0)
     # Fixed delivery, edge-triggered: data is just the vector.
     volatile_store((e + MSIX_ENTRY_DATA) as *u32, vector as u32)
