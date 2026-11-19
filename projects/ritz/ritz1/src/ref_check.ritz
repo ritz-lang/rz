@@ -398,6 +398,17 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
             var plane: RefTy
             ref_set_array(@plane, TYPE_ARRAY, TYPE_VOID, b.name, b.name_len, b.ref_shape, 0)
             return ref_row(@plane, out)
+        if ref_is_pointer(b.kind) == 1 and b.pointee == TYPE_ARRAY
+            # A `*[N]T` / `@[N]T` / `@&[N]T`'s `q[i]` is an element of the
+            # `[N]T` behind it, as the array's own `a[i]` is (AGAST #4290).
+            var arr: RefTy
+            if ref_behind(env, e.left, @arr) == 0
+                if b.ref_elem == TYPE_VOID
+                    return 0
+                ref_set_array(@arr, b.ref_elem, TYPE_VOID, b.name, b.name_len, null, b.ref_size)
+            if arr.kind == TYPE_ARRAY and arr.pointee == TYPE_ARRAY
+                return ref_row(@arr, out)   # an `@[N][M]T` plane, by Sema's shape
+            b = arr
         # AGAST #2377: `a[i]` with `a: [N]*T` is a `*T`, so `*a[i]` and
         # `a[i][j]` are read through a pointer: a Drop T is not moved out.
         if b.kind == TYPE_ARRAY and ref_is_pointer(b.pointee) == 1
@@ -461,8 +472,16 @@ fn ref_behind(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
     # AGAST #3642: a plane `@x[i]` (#2570) is its `[M][N]..T`, as an N-D local
     # is, so `*q = [..]` is judged by shape (R42), not by the flat count
     # pointee_array_size keeps.
-    if loc.pointee_array_shape != null
-        return ref_set_array(out, TYPE_ARRAY, loc.pointee_array_elem_pointee, en, en_len, loc.pointee_array_shape, 0)
+    var shape: *ArrayShape = loc.pointee_array_shape
+    if shape == null and env.s == null
+        # AGAST #4290: on Sema, an `@[N][M]T` / `@&[N][M]T` is a plane too,
+        # by SemaVar's shape (sema_elem_ty's), which the emitter's image keeps
+        # only for a `*[N][M]T` (bind_nd_pointee_param): `(*p)[i]` is a row.
+        let v: *SemaVar = sema_find_local(env.sm, e.ident_ptr, e.ident_len)
+        if v != null and ref_is_pointer(v.kind) == 1 and v.shape != null and v.shape.rank >= 2
+            shape = v.shape
+    if shape != null
+        return ref_set_array(out, TYPE_ARRAY, loc.pointee_array_elem_pointee, en, en_len, shape, 0)
     ref_set_array(out, loc.pointee_array_elem_type, loc.pointee_array_elem_pointee, en, en_len, null, loc.pointee_array_size)
 
 # Does the place `e` lie behind an `@T`, `@&T`, `*T` or `:&`?  ritz0's
@@ -516,9 +535,6 @@ pub struct RsNote
     ref_name: *u8
     ref_name_len: i32
     inner_ref: i32        # Param.param_inner_ref / Stmt.var_inner_ref (AGAST #2399)
-    # T of the `[N]T` a `*[N]T` / `@[N]T` / `@&[N]T` points at, whether or not
-    # it has a `p#` view (ref_behind); the view's is sema_view_elem's.
-    arr_elem: i32
     # The `q#` view's T when emit_var_decl's inference makes an un-annotated
     # `let q = h(p)` a `*[N]T` (infer_array_ptr_let), which index_elem, from
     # what's written, can't know; TYPE_VOID otherwise (AGAST #4011).
@@ -572,7 +588,6 @@ pub fn rs_note_new(sm: *Sema, v: *SemaVar) -> *RsNote
     memset(n as *u8, 0, sizeof(RsNote))
     n.name = v.name
     n.ref_kind = TYPE_VOID
-    n.arr_elem = TYPE_VOID
     n.infer_view = TYPE_VOID
     n.root_pointee = TYPE_VOID
     n
@@ -754,6 +769,11 @@ pub fn rs_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
             # Sema's element step: an N-D array's row, else its element.
             return (sema_arr_elem(@b, out) != TYPE_UNKNOWN) as i32
         if ref_is_pointer(b.kind) == 1
+            # A `*[N]T`'s `q[i]` is an element (a plane's, a row) of the
+            # `[N]T` behind it, as the array's own is (AGAST #4290).
+            var arr: SemaTy
+            if b.pointee == TYPE_ARRAY and rs_behind(sm, e.left, @b, @arr) == 1
+                return (sema_arr_elem(@arr, out) != TYPE_UNKNOWN) as i32
             if b.pointee == TYPE_VOID or ref_is_pointer(b.pointee) == 1 or b.pointee == TYPE_ARRAY or b.pointee == TYPE_PTR_PTR
                 return 0
             return rs_set(out, b.pointee, TYPE_VOID, b.name, b.name_len)
@@ -850,14 +870,28 @@ pub fn rs_method_def(sm: *Sema, e: *Expr) -> *FnDef
     sbk_method_def(sm, e)
 
 # The `[N]T` behind `e`, a local `*[N]T`, `@[N]T` or `@&[N]T` of type `o`, as
-# ref_behind reads it; 0 for any other pointer: only a local keeps the element.
+# sema_elem_ty reads it (AGAST #4290): SemaVar.index_elem and, for a plane
+# pointer `*[N][M]..T` (#2570), its shape, so `(*p)[i]` is a row.  What the
+# emitter's inference made a `*[N]T` (an un-annotated `let q = h(p)`, which
+# index_elem, from what's written, can't know) is the LocalVar image's.  0 for
+# any other pointer: only a local keeps the element.
 fn rs_behind(sm: *Sema, e: *Expr, o: *SemaTy, out: *SemaTy) -> i32
     if e.kind != EXPR_IDENT
         return 0
-    let n: *RsNote = rs_note(sm, sema_find_local(sm, e.ident_ptr, e.ident_len))
-    if n == null or n.arr_elem == TYPE_VOID
+    let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+    if v == null
         return 0
-    rs_set(out, TYPE_ARRAY, n.arr_elem, o.name, o.name_len)
+    if ref_is_pointer(v.kind) == 1 and v.index_elem != TYPE_VOID
+        sema_arr_ty(out, v.index_elem, o.name, o.name_len, v.shape)
+        return 1
+    let n: *RsNote = rs_note(sm, v)
+    if n == null or n.has_loc == 0
+        return 0
+    let lo: *LocalVar = @n.loc
+    if ref_is_pointer(lo.var_type) == 0 or lo.pointee_type != TYPE_ARRAY or lo.pointee_array_elem_type == TYPE_VOID
+        return 0
+    sema_arr_ty(out, lo.pointee_array_elem_type, o.name, o.name_len, lo.pointee_array_shape)
+    1
 
 # index_through_struct on Sema: 1 when `e` is `p[i]` through a Vec, Span or
 # String (or a pointer to one), with the element's struct name in *name (null

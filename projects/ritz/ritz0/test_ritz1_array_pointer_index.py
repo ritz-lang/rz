@@ -443,11 +443,16 @@ STRUCT_WRITES = {
 # R9 makes `p[i]` a row here, and `p[i] = row` its store: `*[N][M]T` is #2098's.
 ROWS = {
     "row_element": "fn f(p: @[2][3]i32) -> i32\n    return p[1][2]\n\n",
-    "row": "fn f(p: @[2][3]i32) -> i32\n    let r: *i32 = p[1] as *i32\n    return r[2]\n\n",
     # An `@[2][3]i32` param, not a `:&` one: main's `f(@a)` would be refused
     # first, on Sema since AGAST #4011 (`@x` doesn't fit a `:&` slot).
     "inferred": "fn f(a: @[2][3]i32) -> i32\n    let p = a\n    return p[1][2]\n\n",
 }
+
+# AGAST #4290: `p[1]` of an `@[2][3]i32` is a row, a `[3]i32` value, which an
+# `as *i32` can't make a pointer: Sema says so before the emitter's limit, in
+# ritz0's words at ritz0's place.
+ROW_AS_POINTER = ("fn f(p: @[2][3]i32) -> i32\n    let r: *i32 = p[1] as *i32\n    return r[2]\n\n"
+                  "pub fn main() -> i32\n    var a: [2][3]i32\n    a[1][2] = 6\n    return f(@a)\n")
 
 
 # `p[i]` over a pointer to an array of pointers is element i, a pointer (LARB R9,
@@ -1053,6 +1058,7 @@ TABLE = [
           Refused(ROWS[name] + "pub fn main() -> i32\n    var a: [2][3]i32\n    a[1][2] = 6\n    return f(@a)\n",
                   "a pointer to a multi-dimensional array can't be indexed", located=False))
       for name in sorted(ROWS)),
+    Row("a_row_is_no_pointer", ALL, Refused(ROW_AS_POINTER, ref_rules.VALUE_INTO_SHARED_REF, at=(2, 19))),
     *(Row(f"a_pointer_element[{name}]", ALL, Run(*POINTER_ELEMENT[name])) for name in sorted(POINTER_ELEMENT)),
     *(Row(f"a_shared_pointer_element_is_read_only[{_escaped(op)}]", ALL,
           Refused("fn f(p: @[2]*i16) -> i32\n" + op + "    return 0\n" + _PTRS.format(t="i16", addr="@"),
