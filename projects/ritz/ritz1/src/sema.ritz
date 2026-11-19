@@ -63,6 +63,7 @@ import ritzlib.sys
 import ritzlib.io
 import ritzlib.hash
 import ritzlib.hashmap
+import ritzlib.str
 
 import ast
 import diag          # the error prefix (AGAST #3445)
@@ -286,8 +287,61 @@ fn sema_view_struct(name: *u8, len: i32) -> *StructDef
     st.fields = @g_sema_view_ptr
     st
 
+# AGAST #4251: the structs Sema made for nameless tuple literals `(a, b, ..)`
+# (sema_type.ritz's sema_tuple_ty).  The emitter names its own `tuple_*`
+# struct as it lowers the literal (tuple_lit_infer), from its spelling of each
+# element's type; Sema names one `(tuple)NNNNNN`, which no struct can be named.
+# Its fields are reached through sema_recv_struct (`p.0`, `let (a, b) = p`)
+# and the move check; sema_find_struct doesn't name it.
+const SEMA_TUPLE_NAME_LEN: i32 = 13
+var g_sema_tuples: **StructDef
+var g_sema_tuple_count: i32 = 0
+var g_sema_tuple_cap: i32 = 0
+
+# A new tuple struct with `fields`, named for its index.
+pub fn sema_tuple_new(fields: *StructField) -> *StructDef
+    if g_sema_tuple_count >= g_sema_tuple_cap
+        var cap: i32 = g_sema_tuple_cap * 2
+        if cap < 8
+            cap = 8
+        g_sema_tuples = realloc(g_sema_tuples as *u8, (cap as i64) * 8) as **StructDef
+        g_sema_tuple_cap = cap
+    let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
+    let name: *u8 = malloc(16)
+    memcpy(name, c"(tuple)", 7)
+    var n: i32 = g_sema_tuple_count
+    var at: i32 = SEMA_TUPLE_NAME_LEN - 1
+    while at >= 7
+        *(name + at) = ('0' as i32 + n % 10) as u8
+        n = n / 10
+        at -= 1
+    *(name + SEMA_TUPLE_NAME_LEN) = 0
+    st.name = name
+    st.name_len = SEMA_TUPLE_NAME_LEN
+    st.fields = fields
+    let ts: **StructDef = g_sema_tuples
+    ts[g_sema_tuple_count] = st
+    g_sema_tuple_count = g_sema_tuple_count + 1
+    st
+
+# The tuple struct `name` names, or null.
+pub fn sema_tuple_struct(name: *u8, len: i32) -> *StructDef
+    if name == null or len != SEMA_TUPLE_NAME_LEN or name_eq(name, 7, c"(tuple)", 7) == 0
+        return null
+    var n: i32 = 0
+    var at: i32 = 7
+    while at < SEMA_TUPLE_NAME_LEN
+        n = n * 10 + (*(name + at) as i32 - '0' as i32)
+        at += 1
+    if n < 0 or n >= g_sema_tuple_count
+        return null
+    let ts: **StructDef = g_sema_tuples
+    ts[n]
+
 # The struct named `name`: the first of that name, as the emitter's
-# find_struct resolves it.
+# find_struct resolves it.  Not a tuple struct Sema made: a nameless tuple
+# takes the type of the slot it is written into (the emitter's tuple_lit_name),
+# so the checks comparing one struct with another leave it be.
 pub fn sema_find_struct(sm: *Sema, name: *u8, len: i32) -> *StructDef
     if name == null or len <= 0
         return null

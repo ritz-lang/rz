@@ -128,6 +128,13 @@ fn note(d: i32) -> i32
 fn try_make(i: i32) -> Result<Tracked, i32>
     Ok(make(i))
 
+impl Tracked
+    fn try_new(i: i32) -> Result<Tracked, i32>
+        Ok(make(i))
+
+fn eat_slot(s: Slot) -> i32
+    0
+
 """
 
 # name -> (the row's fns, then each error as (line in the row, col, words)).
@@ -138,6 +145,10 @@ REACH = {
         "fn r_enum() -> i32\n    var s = Slot.Full(make(1))\n    match s\n        Full(t) =>\n"
         "            let k = consume(t) + consume(t)\n        Empty =>\n            let z = 0\n    0\n",
         [(5, 42, "use of moved value: `t` (moved at {at:5:29})")]),
+    # `var s = E.V`, a unit variant, is the enum too (AGAST #4251).
+    "enum_unit_variant_let": (
+        "fn r_enum_unit() -> i32\n    var s = Slot.Empty\n    return eat_slot(s) + eat_slot(s)\n",
+        [(3, 35, "use of moved value: `s` (moved at {at:3:21})")]),
     # `match *p` owns nothing: its payload is lent (AGAST #2178).
     "payload_through_a_pointer": (
         "fn r_lent_payload(p: *Slot) -> i32\n    match *p\n        Full(t) => return consume(t)\n"
@@ -158,6 +169,11 @@ REACH = {
     # `c?` of a Result carrying a move-only struct (AGAST #3974).
     "try_binding": (
         "fn r_try() -> Result<i32, i32>\n    var t = try_make(1)?\n"
+        "    let k = consume(t) + consume(t)\n    return Ok(k)\n",
+        [(3, 34, "use of moved value: `t` (moved at {at:3:21})")]),
+    # `T.f()?` of a static method (AGAST #4251).
+    "try_static_method": (
+        "fn r_try_static() -> Result<i32, i32>\n    var t = Tracked.try_new(1)?\n"
         "    let k = consume(t) + consume(t)\n    return Ok(k)\n",
         [(3, 34, "use of moved value: `t` (moved at {at:3:21})")]),
     # A `:&` param read by value (AGAST #2250): a `let`, a return.
