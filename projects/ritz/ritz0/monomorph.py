@@ -339,7 +339,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 self.expected_type = stmt.type
             elif stmt.value is not None:
                 # No explicit type — try to infer from the rhs so that subsequent
-                # method calls (`v.push(...)`) can register UFCS instantiations.
+                # method calls (`v.push(...)`) can want their impl methods.
                 self._note_tuple_lit_let(stmt)
                 inferred = self._type_of(stmt.value)
                 if inferred is not None:
@@ -409,15 +409,13 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                         mangled = mangle_generic_name(fn_name, expr.type_args)
                         self.function_instantiations[key] = mangled
             # AGAST #1824: format_into(sink, "...") appends through
-            # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>` ->
-            # `impl<T> Vec<T>`'s push_bytes) needs that method specialised
-            # even when nothing else calls it (#3617; since R66, #3496, the
-            # emitter finds only the impl method, not vec_push_bytes<u8>).
+            # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>`) wants
+            # that impl method (Vec$u8.push_bytes, and through it
+            # vec_push_bytes<u8>) even when nothing else calls it (#4303).
             if (isinstance(expr.func, rast.Ident) and expr.func.name == 'format_into'
                     and expr.args):
-                sink_call = rast.MethodCall(expr.span, expr.args[0], 'push_bytes', [])
-                self._register_method_instantiation(sink_call)
-                self._want_called_method(sink_call)
+                self._want_called_method(
+                    rast.MethodCall(expr.span, expr.args[0], 'push_bytes', []))
         elif isinstance(expr, rast.StructLit):
             for _, field_expr in expr.fields:
                 self._visit_expr(field_expr)
@@ -447,8 +445,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             self._visit_expr(expr.expr)
             for arg in expr.args:
                 self._visit_expr(arg)
-            # Register method instantiation for UFCS on generic types
-            self._register_method_instantiation(expr)
+            # `v.pop()` names the impl method Vec<T>.pop; specialising it
+            # instantiates the vec_pop<T> its body calls (AGAST #4303).
             self._want_called_method(expr)
         elif isinstance(expr, rast.If):
             self._visit_expr(expr.cond)
@@ -608,90 +606,6 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         if self._instance_subst is not None:
             ty = self._instance_subst.apply(ty)
         return ty
-
-    def _register_method_instantiation(self, expr: rast.MethodCall) -> None:
-        """Register UFCS function instantiation for method calls on generic types.
-
-        When we see `v.len()` on a Vec<T>, we need to instantiate `vec_len<T>`.
-        This enables method syntax on types without impl blocks by mapping:
-          - Vec<T>.method() -> vec_method<T>
-          - Span<T>.method() -> span_method<T>
-          - Option<T>.method() -> option_method<T>
-        """
-        # Associated call on a built-in generic type: `Span.empty()`. The
-        # receiver names a type, so the type argument comes from the expected
-        # type of the surrounding context.
-        if (isinstance(expr.expr, rast.Ident)
-                and expr.expr.name in ('Vec', 'Span', 'Option', 'Result', 'Box')
-                and expr.expr.name not in self.var_types):
-            expected = self.expected_type
-            while isinstance(expected, (rast.PtrType, rast.RefType)):
-                expected = expected.inner
-            if (isinstance(expected, rast.NamedType)
-                    and expected.name == expr.expr.name and expected.args):
-                self._register_ufcs_instantiation(expected.name, expr.method,
-                                                  expected.args)
-            return
-
-        var_type = self._type_of(expr.expr)
-
-        # Unwrap pointer/reference types: &Vec<T>, *Vec<T>, &mut Vec<T> -> Vec<T>
-        while isinstance(var_type, rast.RefType):
-            var_type = var_type.inner
-        while isinstance(var_type, rast.PtrType):
-            var_type = var_type.inner
-
-        if not isinstance(var_type, rast.NamedType):
-            return
-
-        # AGAST #2944: in a specialisation's body `Vec<T>` has already been
-        # rewritten to the struct it instantiates, `Vec$i32`, with no args.
-        # Recover `Vec<i32>`, or `v.push(a)` in `mk<T>` registers nothing and
-        # links only if other code happened to instantiate vec_push<i32>.
-        var_type = self._generic_instance_of(var_type)
-
-        type_name = var_type.name
-        if type_name not in self.TYPE_TO_UFCS_PREFIX:
-            return
-
-        # Register instantiation with the type's type args
-        if var_type.args:
-            self._register_ufcs_instantiation(type_name, expr.method, var_type.args)
-
-    def _generic_instance_of(self, ty: rast.NamedType) -> rast.NamedType:
-        """`Vec<i32>` for a mangled `Vec$i32`; any other type unchanged."""
-        if ty.args:
-            return ty
-        for instantiations in (self.struct_instantiations, self.enum_instantiations):
-            for (base_name, type_args_key), mangled_name in instantiations.items():
-                if mangled_name == ty.name and base_name in self.TYPE_TO_UFCS_PREFIX:
-                    generic_def = (self.generic_structs.get(base_name)
-                                   or self.generic_enums.get(base_name))
-                    params = generic_def.type_params if generic_def else []
-                    args = self._parse_type_args_key(type_args_key, params)
-                    return rast.NamedType(ty.span, base_name, args)
-        return ty
-
-    TYPE_TO_UFCS_PREFIX = {
-        'Vec': 'vec_',
-        'Span': 'span_',
-        'Option': 'option_',
-        'Result': 'result_',
-        'Box': 'box_',
-    }
-
-    def _register_ufcs_instantiation(self, type_name: str, method: str,
-                                     type_args: List[rast.Type]) -> None:
-        """Register the UFCS free function backing `Type<T>.method()`."""
-        prefix = self.TYPE_TO_UFCS_PREFIX.get(type_name)
-        if prefix is None:
-            return
-        fn_name = f"{prefix}{method}"
-        if fn_name not in self.generic_functions:
-            return
-        key = (fn_name, self._type_args_to_key(type_args))
-        if key not in self.function_instantiations:
-            self.function_instantiations[key] = mangle_generic_name(fn_name, type_args)
 
     def _generate_specializations_iterative(self) -> None:
         """Generate specialized versions iteratively until no new instantiations are found.

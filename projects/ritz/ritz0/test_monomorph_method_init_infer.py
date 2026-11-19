@@ -11,11 +11,16 @@
 method reached only through it (`s.pop()`) was never instantiated: ritz0 then
 failed "No method 'pop' found for type 'Vec$i32'".
 
-Each case runs the instantiation pass on a self-contained module (a stub
-`Vec<T>`, the `vec_*` functions it needs and, since LARB R66 (#3496), the
-`impl<T> Vec<T>` its methods are) and checks the method used only
-through the inferred local was registered at i32.  The end-to-end programs are
-in test_ritz1_method_init_infer.py.
+Each case runs the monomorphizer on a self-contained module (a stub `Vec<T>`,
+the `vec_*` functions and the `impl<T> Vec<T>` wrappers ritzlib's gvec has)
+and checks the method used only through the inferred local was specialised at
+i32: its wrapper `Vec$i32.pop`, and through it `vec_pop<i32>`.
+
+Method syntax reaches only impl methods (LARB R66), so the free fn behind a
+method is instantiated only by specialising the wrapper that calls it.  The
+`vec_` prefix table that used to pre-instantiate it from `v.pop()` directly
+went with AGAST #4303; test_free_fn_without_wrapper_is_not_instantiated pins
+that.  The end-to-end programs are in test_ritz1_method_init_infer.py.
 """
 
 import pytest
@@ -55,12 +60,18 @@ impl<T> Vec<T>
 """
 
 
-def _instantiated(body: str) -> set:
+def _monomorphize(body: str) -> Monomorphizer:
     mono = Monomorphizer()
-    module = parse(PRELUDE + body)
-    mono._collect_generics(module)
-    mono._find_instantiations(module)
-    return {(name, args) for (name, args) in mono.function_instantiations}
+    mono.monomorphize(parse(PRELUDE + body))
+    return mono
+
+
+def _instantiated(body: str) -> set:
+    return set(_monomorphize(body).function_instantiations)
+
+
+def _pop_wrapper_specialised(mono: Monomorphizer) -> bool:
+    return ("Vec", ("i32",), "pop") in mono._done_methods
 
 
 CASES = {
@@ -121,16 +132,46 @@ fn main() -> i32
 @pytest.mark.unit
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_method_reached_only_through_inferred_local_is_instantiated(name):
-    assert ("vec_pop", ("i32",)) in _instantiated(CASES[name]), name
+    mono = _monomorphize(CASES[name])
+    assert _pop_wrapper_specialised(mono), name
+    # The wrapper's body names vec_pop<i32>: instantiated transitively.
+    assert ("vec_pop", ("i32",)) in mono.function_instantiations, name
+
+
+@pytest.mark.unit
+def test_free_fn_without_wrapper_is_not_instantiated():
+    """`a.first()` has no `impl Vec<T>` wrapper, so it names no method: the
+    free fn `vec_first<T>` is not pre-instantiated behind it, as the `vec_`
+    prefix table did (AGAST #4303)."""
+    got = _instantiated("""
+fn vec_first<T>(v: *Vec<T>) -> T
+    return *v.data
+
+fn main() -> i32
+    var a: Vec<i32> = vec_new<i32>()
+    return a.first()
+""")
+    assert not any(name == "vec_first" for name, _ in got)
+
+
+@pytest.mark.unit
+def test_no_ufcs_prefix_table():
+    """The UFCS instantiation table and its registrars are gone (#4303)."""
+    for attr in ("TYPE_TO_UFCS_PREFIX", "_register_ufcs_instantiation",
+                 "_register_method_instantiation"):
+        assert not hasattr(Monomorphizer, attr), attr
 
 
 @pytest.mark.unit
 def test_unresolvable_method_leaves_local_untyped():
-    """An unknown method must not invent a type (and must not crash)."""
-    got = _instantiated("""
+    """An unknown method must not invent a type (and must not crash): `s`
+    stays untyped, so `s.pop()` is wanted on every instance (a wild method),
+    never as `Vec<i32>.pop` from a type `nonexistent` doesn't have."""
+    mono = _monomorphize("""
 fn main() -> i32
     var a: Vec<i32> = vec_new<i32>()
     var s = a.nonexistent()
     return s.pop()
 """)
-    assert not any(name == "vec_pop" for name, _ in got)
+    assert ("Vec", ("i32",), "pop") not in mono._wanted_methods
+    assert "pop" in mono._wild_methods

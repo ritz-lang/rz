@@ -178,14 +178,18 @@ fn main() -> i32
 
 
 def _monomorph_takes_a_receivers_type_from_the_table():
-    """Retype `v` as a Vec<u16> in the table: `v.len()` is then a
-    vec_len<u16>, which monomorph instantiates.  Its own rule (the callee's
-    declared i32) would instantiate nothing."""
+    """Retype `v` as a Vec<u16> in the table: `v.len()` then wants
+    Vec<u16>'s impl method `len`.  Its own rule (the callee's declared i32)
+    would want it on no instance.  Since #4303 the call names only the impl
+    method, not vec_len<u16> behind it (no Vec<u16> value exists here to
+    specialise it at, so nothing is instantiated)."""
     module = parse(LET_SOURCE)
     table = typed.type_module(module)
     (recv,) = [m.expr for m in _nodes(module, rast.MethodCall) if m.method == "len"]
     table.record(recv, rast.NamedType(None, "Vec", [rast.NamedType(None, "u16", [])]))
-    assert "vec_len$u16" in _fn_names(monomorphize(module))
+    mono = monomorph.Monomorphizer()
+    mono.monomorphize(module)
+    assert ("Vec", ("u16",), "len") in mono._wanted_methods
 
 
 def _monomorph_types_an_untyped_module_itself():

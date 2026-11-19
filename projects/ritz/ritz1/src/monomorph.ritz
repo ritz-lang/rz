@@ -675,43 +675,34 @@ fn template_member_field(m: *Module, sname: *u8, sname_len: i32, e: *Expr) -> *S
     out.next = null
     out
 
-# The generic UFCS template `<prefix><method>` (vec_/span_) a method call on
-# a Vec/Span receiver of the given kind dispatches to, or null.
-fn find_ufcs_template(m: *Module, kind: i32, method: *u8, method_len: i32) -> *FnDef
-    var prefix: *u8 = null
-    var prefix_len: i32 = 0
-    if kind == 1
-        prefix = c"vec_"
-        prefix_len = 4
-    else if kind == 2
-        prefix = c"span_"
-        prefix_len = 5
-    if prefix_len == 0
+# The method `meth` of the inherent generic impl of Vec (kind 1) or Span
+# (kind 2), and through out_ib that impl, or null.  Method syntax reaches only
+# impl methods (LARB R66); the vec_/span_ prefix table this replaced went with
+# AGAST #4303.
+fn collection_impl_method(m: *Module, kind: i32, meth: *u8, meth_len: i32, out_ib: **ImplBlock) -> *FnDef
+    var base: *u8 = c"Vec"
+    var bl: i32 = 3
+    if kind == 2
+        base = c"Span"
+        bl = 4
+    else if kind != 1
         return null
-    let mangled_len: i32 = prefix_len + method_len
-    let mangled: *u8 = malloc(mangled_len as i64 + 1) as *u8
-    for i in 0..prefix_len
-        *(mangled + i) = *(prefix + i)
-    for i in 0..method_len
-        *(mangled + prefix_len + i) = *(method + i)
-    *(mangled + mangled_len) = 0
-    let tmpl: *FnDef = find_generic_function(m, mangled, mangled_len)
-    free(mangled)
-    return tmpl
-
-# Register `<prefix><method>$T` (vec_/span_) for a UFCS call on a Vec/Span
-# receiver of the given kind and "$T" suffix, if that generic template exists.
-fn register_ufcs_instantiation(m: *Module, kind: i32, suf: *u8, suf_len: i32, method: *u8, method_len: i32)
-    if suf == null or suf_len <= 0
-        return
-    let tmpl: *FnDef = find_ufcs_template(m, kind, method, method_len)
-    if tmpl != null
-        add_instantiation(tmpl.name, tmpl.name_len, suf, suf_len)
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params != null and (ib.trait_name == null or ib.trait_name_len == 0) and buf_eq(ib.type_name, ib.type_name_len, base, bl) == 1
+            var f: *FnDef = ib.methods
+            while f != null
+                if buf_eq(f.name, f.name_len, meth, meth_len) == 1
+                    *out_ib = ib
+                    return f
+                f = f.next
+        ib = ib.next
+    null
 
 # AGAST #1798: record an un-annotated local initialised by a method call on a
 # tracked ident receiver -- `var s = a.slice(0, n)`, `var s = a[:]` (which
 # lowers to that call), `var v = b.items()` -- so a later `s.push(..)`
-# instantiates `vec_push$T` even when no other receiver calls push.
+# wants `Vec$T.push` even when no other receiver calls push.
 fn track_method_init_local(m: *Module, name: *u8, name_len: i32, init: *Expr)
     if init.left == null or init.left.kind != EXPR_IDENT
         return
@@ -720,16 +711,17 @@ fn track_method_init_local(m: *Module, name: *u8, name_len: i32, init: *Expr)
         return
     let kind: i32 = *(g_lv_prefix_kind + idx)
     if kind > 0
-        # Vec/Span receiver: a UFCS template returning its own collection
-        # over its type parameter (`vec_slice<T> -> Vec<T>`, "Vec$T") gives
-        # that collection at the receiver's suffix.
-        let tmpl: *FnDef = find_ufcs_template(m, kind, init.ident_ptr, init.ident_len)
-        if tmpl == null or tmpl.return_type != TYPE_STRUCT or tmpl.type_params == null
+        # Vec/Span receiver: an impl method returning its own collection
+        # over the impl's type parameter (`fn slice(..) -> Vec<T>`, "Vec$T")
+        # gives that collection at the receiver's suffix.
+        var cib: *ImplBlock = null
+        let tmpl: *FnDef = collection_impl_method(m, kind, init.ident_ptr, init.ident_len, @cib)
+        if tmpl == null or tmpl.return_type != TYPE_STRUCT
             return
         var rsuf: *u8 = null
         var rsuf_len: i32 = 0
         let rkind: i32 = classify_collection_type(tmpl.return_type_name, tmpl.return_type_name_len, @rsuf, @rsuf_len)
-        let tp: *TypeParam = tmpl.type_params
+        let tp: *TypeParam = cib.type_params
         if rkind > 0 and rsuf_len == tp.name_len + 1
             if memcmp(rsuf + 1, tp.name, tp.name_len as i64) == 0
                 add_local_var(name, name_len, rkind, *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx))
@@ -2350,40 +2342,6 @@ fn slice_bound_rereadable(e: *Expr) -> i32
             return slice_bound_rereadable(e.right)
     return 0
 
-# Register the UFCS instantiation a call of `method` on receiver `recv`
-# dispatches to: `vec_<method>$T` / `span_<method>$T` when `recv` is a
-# tracked Vec / Span local, a field of one (`r.raw.push(9)`, AGAST #1512), or
-# `@` / `@&` of either (format_into's sink, AGAST #1824).
-fn register_receiver_method(m: *Module, recv: *Expr, method: *u8, method_len: i32)
-    var r: *Expr = recv
-    if r != null and r.kind == EXPR_UNARY and (r.op == OP_ADDR or r.op == OP_ADDR_MUT)
-        r = r.operand
-    if r == null
-        return
-    if r.kind == EXPR_IDENT
-        let lv_idx: i32 = find_local_var_idx(r.ident_ptr, r.ident_len)
-        if lv_idx >= 0
-            register_ufcs_instantiation(m, *(g_lv_prefix_kind + lv_idx), *(g_lv_suffixes + lv_idx), *(g_lv_suffix_lens + lv_idx), method, method_len)
-    else if r.kind == EXPR_MEMBER
-        # A `*Vec<T>`, `@Vec<T>` or `@&Vec<T>` field dispatches to the same
-        # `vec_<method>$T` as a by-value one (the emitter passes the pointer
-        # it holds).  A held reference was missed, so a helper whose only
-        # use was `s.v.push(3)` on `v: @&Vec<u8>` never got a define (#2383).
-        let rf: *StructField = resolve_member_field(m, r)
-        if rf != null and (rf.field_type == TYPE_STRUCT or rf.field_type == TYPE_PTR or field_is_ref(rf) == 1)
-            var fsuf: *u8 = null
-            var fsuf_len: i32 = 0
-            let fkind: i32 = classify_collection_type(rf.field_type_name, rf.field_type_name_len, @fsuf, @fsuf_len)
-            register_ufcs_instantiation(m, fkind, fsuf, fsuf_len, method, method_len)
-    else if r.kind == EXPR_INDEX
-        # AGAST #2519: `v[1].get(1)` on a Vec<Vec<i32>>: the element is the
-        # receiver, one level into the collection's suffix ("$Vec$i32" ->
-        # "Vec$i32" -> vec_get$i32).
-        var esuf: *u8 = null
-        var esuf_len: i32 = 0
-        let ekind: i32 = indexed_element_collection(m, r, @esuf, @esuf_len)
-        register_ufcs_instantiation(m, ekind, esuf, esuf_len, method, method_len)
-
 # AGAST #2519: if `e` is `b[i]` (or `(*b)[i]`) on a Vec or Span whose element
 # is itself a Vec or Span, return that element's kind and write its "$T"
 # suffix to out; 0 otherwise.  `b` is a tracked local (the collection itself,
@@ -2440,12 +2398,10 @@ fn collect_from_expr(m: *Module, e: *Expr)
         if e.call_type_suffix_len > 0
             add_instantiation(e.func_name, e.func_name_len, e.call_type_suffix, e.call_type_suffix_len)
         # AGAST #1824: format_into(sink, "...") appends through
-        # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>` ->
-        # `impl<T> Vec<T>`'s push_bytes) needs that method specialised even
-        # when nothing else calls it (#3617; the emitter finds only the impl
-        # method since R66, #3497).
+        # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>`) wants that
+        # impl method (Vec$u8.push_bytes, and through it vec_push_bytes$u8)
+        # even when nothing else calls it (#4303).
         if e.args != null and buf_eq(e.func_name, e.func_name_len, c"format_into", 11) == 1
-            register_receiver_method(m, e.args, c"push_bytes", 10)
             want_receiver_method(m, e.args, c"push_bytes", 10)
         want_interp_methods(m, e)   # AGAST #3617
         # Recurse into arguments, each into its parameter's slot (AGAST #2877).
@@ -2504,15 +2460,8 @@ fn collect_from_expr(m: *Module, e: *Expr)
     else if k == EXPR_MEMBER
         collect_from_expr(m, e.left)  # base
     else if k == EXPR_METHOD
-        # UFCS instantiation: `v.push(...)` where v: Vec<T> implies
-        # `vec_push<T>` needs to be specialized.  Look up the receiver
-        # ident in the local-var tracker; when it's a Vec or Span,
-        # mangle to `vec_<method>$T` / `span_<method>$T` and register
-        # the instantiation so the specialization loop emits a real
-        # function body.  Without this, the linker fails on the missing
-        # `vec_<method>$T` symbol (the emitter's UFCS dispatch falls
-        # back to the broken `Vec$T_<method>` mangling).
-        register_receiver_method(m, e.left, e.ident_ptr, e.ident_len)
+        # `v.push(..)` names the impl method Vec<T>.push; specialising it
+        # instantiates the vec_push<T> its body calls (AGAST #3617, #4303).
         want_receiver_method(m, e.left, e.ident_ptr, e.ident_len)   # AGAST #3617
         collect_from_expr(m, e.left)  # receiver
         var arg: *Expr = e.args

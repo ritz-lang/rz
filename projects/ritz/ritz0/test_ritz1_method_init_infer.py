@@ -21,12 +21,13 @@ A generic impl method returning its own generic struct (`w.dup()` on W<i32>)
 is covered annotated and un-annotated (AGAST #2096).
 """
 
+import os
 import re
 import subprocess
 
 import pytest
 
-from test_ritz1_builtin_struct_shadow import _run_pkg
+from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _run_pkg
 
 PROGRAMS = {
     # The ticket's repro.
@@ -285,3 +286,37 @@ def test_ritz1_spec_method_call_matches_define(ritz1_bin, tmp_path, name):
             assert (c["ret"], types(c["args"])) == defines[c["name"]], c.group(0)
             checked += 1
     assert checked, ir
+
+
+# AGAST #4303: `s` is typed from the impl method `slice`'s `-> Vec<T>`
+# (collection_impl_method), not from the deleted vec_ prefix table.  Untyped,
+# `s.pop()` would still link -- a method on an unknown receiver is wanted on
+# every instance -- but every Vec in the program would get a `pop`.
+PRECISE_PROGRAM = """\
+import ritzlib.memory
+import ritzlib.gvec
+
+fn main() -> i32
+    var a: Vec<i32> = vec_new<i32>()
+    var b: Vec<i64> = vec_new<i64>()
+    a.push(3)
+    b.push(4)
+    var s = a.slice(0, 1)
+    return s.pop() + (b.len() as i32)
+"""
+
+
+@pytest.mark.integration
+def test_ritz1_method_init_local_wants_only_its_instance(ritz1_bin, tmp_path):
+    """`s.pop()` on `var s = a.slice(..)` specialises Vec$i32's pop only."""
+    src = tmp_path / "main.ritz"
+    src.write_text(PRECISE_PROGRAM)
+    ll = tmp_path / "main.ll"
+    comp = subprocess.run(
+        [str(ritz1_bin), str(src), "-o", str(ll)], capture_output=True, text=True,
+        env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
+    )
+    assert comp.returncode == 0, comp.stderr[-2000:]
+    defined = set(re.findall(r'^define [^@]*@"?([\w$]+)', ll.read_text(), re.M))
+    assert "Vec$i32_pop" in defined
+    assert "Vec$i64_pop" not in defined, "pop wanted on every Vec instance"
