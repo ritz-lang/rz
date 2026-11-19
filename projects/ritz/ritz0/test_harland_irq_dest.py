@@ -44,14 +44,14 @@ var ids: [4]u32
 
 fn main() -> i32
     # 8-bit destinations: 0..254; 255 is broadcast, 256+ needs more bits
-    if not irq_dest_reachable(0, false) or not irq_dest_reachable(254, false)
+    if not irq_dest_reachable(0, false, false) or not irq_dest_reachable(254, false, false)
         return 1
-    if irq_dest_reachable(255, false) or irq_dest_reachable(255, true)
+    if irq_dest_reachable(255, false, false) or irq_dest_reachable(255, true, false)
         return 2
-    if irq_dest_reachable(256, false) or irq_dest_reachable(0x7FFF, false)
+    if irq_dest_reachable(256, false, false) or irq_dest_reachable(0x7FFF, false, false)
         return 3
     # extended destination ID: up to 15 bits
-    if not irq_dest_reachable(256, true) or not irq_dest_reachable(0x7FFF, true) or irq_dest_reachable(0x8000, true)
+    if not irq_dest_reachable(256, true, false) or not irq_dest_reachable(0x7FFF, true, false) or irq_dest_reachable(0x8000, true, false)
         return 4
     # MSI address: ID bits 7:0 in 19:12, bits 14:8 in 11:5
     if msi_addr_lo(0) != 0xFEE00000 or msi_addr_lo(5) != 0xFEE05000 or msi_addr_lo(254) != 0xFEEFE000
@@ -72,21 +72,21 @@ fn main() -> i32
     ids[1] = 256
     ids[2] = 9
     ids[3] = 4
-    if irq_dest_pick(4, 300, @ids[0], 4, false) != 4
+    if irq_dest_pick(4, 300, @ids[0], 4, false, false) != 4
         return 11
     # else the BSP (whatever its ID), not APIC ID 0 or the low byte
-    if irq_dest_pick(256, 9, @ids[0], 4, false) != 9 or irq_dest_pick(257, 3, @ids[0], 4, false) != 3
+    if irq_dest_pick(256, 9, @ids[0], 4, false, false) != 9 or irq_dest_pick(257, 3, @ids[0], 4, false, false) != 3
         return 12
     # else the first reachable CPU in the list
-    if irq_dest_pick(256, 300, @ids[0], 4, false) != 9
+    if irq_dest_pick(256, 300, @ids[0], 4, false, false) != 9
         return 13
     # with the extended destination ID, 256 takes its own
-    if irq_dest_pick(256, 9, @ids[0], 4, true) != 256
+    if irq_dest_pick(256, 9, @ids[0], 4, true, false) != 256
         return 14
     # nothing reachable
     ids[2] = 255
     ids[3] = 511
-    if irq_dest_pick(256, 300, @ids[0], 4, false) != IRQ_DEST_NONE
+    if irq_dest_pick(256, 300, @ids[0], 4, false, false) != IRQ_DEST_NONE
         return 15
     # KVM's signature and feature bit 15
     if not irq_ext_dest_from_cpuid(0x40000001, 0x4B4D564B, 0x564B4D56, 0x4D, 0x8000)
@@ -98,6 +98,15 @@ fn main() -> i32
     # Hyper-V ("Microsoft Hv") with the same bit set doesn't count
     if irq_ext_dest_from_cpuid(0x40000005, 0x7263694D, 0x666F736F, 0x76482074, 0x8000)
         return 19
+    # interrupt remapping with 32-bit destinations (#4316): every ID but
+    # x2APIC broadcast, 255 and past 0x7FFF included
+    if not irq_dest_reachable(255, false, true) or not irq_dest_reachable(0x8000, false, true)
+        return 20
+    if not irq_dest_reachable(0xFFFFFFFE, true, true) or irq_dest_reachable(0xFFFFFFFF, true, true)
+        return 21
+    # with remapping, 256 and 511 take their own; nothing is rerouted
+    if irq_dest_pick(256, 300, @ids[0], 4, false, true) != 256 or irq_dest_pick(511, 0, @ids[0], 4, false, true) != 511
+        return 22
     0
 """
 
@@ -106,7 +115,8 @@ CLAIMS = {1: "IDs 0..254 reachable", 2: "255 is broadcast", 3: "256+ needs ext d
           7: "MSI addr round trip", 8: "RTE hi low IDs", 9: "RTE hi ext bits 23:17",
           10: "RTE round trip", 11: "pick wanted", 12: "pick BSP", 13: "pick first reachable",
           14: "pick ext dest", 15: "pick none", 16: "KVM ext dest bit", 17: "KVM without bit",
-          18: "KVM leaf missing", 19: "non-KVM signature"}
+          18: "KVM leaf missing", 19: "non-KVM signature",
+          20: "IR reaches 255 and 15+ bits", 21: "IR x2APIC broadcast", 22: "pick with IR"}
 
 
 @pytest.mark.integration

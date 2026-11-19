@@ -1,0 +1,339 @@
+# Harland Intel VT-d interrupt remapping (AGAST #4316).
+#
+# MSI and I/O APIC interrupts name their CPU with 8 bits (arch/x86_64/
+# irq_dest.ritz), so on bare metal a CPU with APIC ID 255 or more gets no
+# device interrupt of its own. Interrupt remapping fixes that: each device
+# message carries a handle, and the remapping unit looks up that handle's
+# entry (IRTE) in a table the kernel owns. In extended interrupt mode (EIM)
+# an IRTE holds a full 32-bit x2APIC destination.
+#
+# vtd_ir_init, from apic_select_mode once the LAPIC mode is known and before
+# the I/O APIC is programmed:
+#   - finds the ACPI DMAR table and parses it (drivers/iommu/dmar.ritz);
+#   - checks every remapping unit can remap (ECAP.IR, queued invalidation,
+#     and EIM in x2APIC mode); if any can't, remapping stays off and device
+#     interrupts keep the 8-bit / extended-destination-ID rules;
+#   - gives every unit one shared 256-entry IRT and its own invalidation
+#     queue, sets the table pointer, flushes the interrupt entry cache and
+#     turns remapping on with compatibility-format interrupts blocked (CFI
+#     clear): an unremapped MSI or redirection entry would bypass the table.
+# vtd_ir_set then writes an IRTE and invalidates it; drivers/msix.ritz and
+# ioapic_set_irq (arch/x86_64/apic.ritz) program their sources in the
+# remappable format with handles from ir_handle_msi / ir_handle_ioapic.
+#
+# DMA remapping (translation) stays off: TE is never set.
+#
+# vtd_ir_set takes no lock: today only the BSP calls it, during boot. A
+# caller on another CPU needs one around the IRTE write and the queue.
+#
+# AMD-Vi (IVRS) is not driven yet: AGAST #4329.
+
+import io { memory_barrier, cpu_pause }
+import serial { prints, serial_print_dec, serial_print_hex }
+import mm.pmm { pmm_alloc_page }
+import mm.vmm { vmm_map_mmio, vmm_ensure_mapped, phys_to_virt }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import drivers.acpi.tables { acpi_find_table }
+import drivers.iommu.dmar {
+    ACPI_SIG_DMAR, DMAR_INTR_REMAP, DMAR_X2APIC_OPT_OUT,
+    dmar_parse, dmar_flags, dmar_num_units, dmar_unit_base, dmar_num_ioapics,
+    dmar_ioapic_source_id,
+    irte_lo, irte_hi, IRTE_SVT_VERIFY_SID, IRT_ENTRIES,
+    VTD_REG_ECAP, VTD_REG_GCMD, VTD_REG_GSTS,
+    VTD_REG_IQH, VTD_REG_IQT, VTD_REG_IQA, VTD_REG_IRTA,
+    ECAP_C, GCMD_QIE, GCMD_IRE, GCMD_SIRTP, GCMD_CFI,
+    vtd_gcmd_from_gsts, vtd_irta, vtd_ecap_can_remap,
+    QI_DESC_SIZE, qi_iec_global_lo, qi_iec_index_lo, qi_wait_lo, qi_wait_hi, qi_next_tail
+}
+
+# How long a unit gets to acknowledge a command or finish the queue.
+const VTD_TIMEOUT_US: u64 = 100000
+
+# Fault status register: IQE (bit 4), an invalid queue descriptor.
+const VTD_REG_FSTS: u64 = 0x34
+const FSTS_IQE: u32 = 0x10
+
+var vtd_on: u8 = 0
+var vtd_x2: u8 = 0
+var vtd_units: i32 = 0
+var vtd_regs: [8]u64            # kernel virtual address of each unit's registers
+var vtd_coherent: [8]u8         # ECAP.C: the unit snoops the IRT, no flush needed
+var vtd_qi_phys: [8]u64         # each unit's invalidation queue (one page)
+var vtd_qi_tail: [8]u32         # its next free descriptor
+var vtd_irt_phys: u64 = 0
+var vtd_status_phys: u64 = 0    # wait descriptors write their sequence number here
+var vtd_seq: u32 = 0
+
+# Is interrupt remapping on? Then every MSI and redirection entry must be
+# programmed in the remappable format.
+pub fn vtd_ir_enabled() -> bool
+    return vtd_on != 0
+
+# ... and are IRTE destinations 32-bit x2APIC IDs (EIM)?
+pub fn vtd_ir_x2apic() -> bool
+    return vtd_on != 0 and vtd_x2 != 0
+
+# ============================================================================
+# Registers
+# ============================================================================
+
+fn vtd_reg32(u: i32, off: u64) -> u32
+    return volatile_load((vtd_regs[u] + off) as *u32)
+
+fn vtd_wreg32(u: i32, off: u64, v: u32)
+    volatile_store((vtd_regs[u] + off) as *u32, v)
+
+fn vtd_reg64(u: i32, off: u64) -> u64
+    return (vtd_reg32(u, off) as u64) | ((vtd_reg32(u, off + 4) as u64) << 32)
+
+# 64-bit registers take two aligned dword writes, low first.
+fn vtd_wreg64(u: i32, off: u64, v: u64)
+    vtd_wreg32(u, off, (v & 0xFFFFFFFF) as u32)
+    vtd_wreg32(u, off + 4, (v >> 32) as u32)
+
+# Wait until GSTS has all of `bits` set (`want_set`) or clear.
+fn vtd_wait_gsts(u: i32, bits: u32, want_set: bool) -> bool
+    let deadline: u64 = deadline_after_us(VTD_TIMEOUT_US)
+    while true
+        let now: u32 = vtd_reg32(u, VTD_REG_GSTS) & bits
+        if (want_set and now == bits) or (not want_set and now == 0)
+            return true
+        if deadline_passed(deadline)
+            return false
+        cpu_pause()
+
+# Issue a GCMD: the current persistent state plus `set`, minus `clear`;
+# wait for GSTS to show `wait_bits` set (or clear when `want_set` is false).
+fn vtd_gcmd(u: i32, set: u32, clear: u32, wait_bits: u32, want_set: bool) -> bool
+    let cmd: u32 = (vtd_gcmd_from_gsts(vtd_reg32(u, VTD_REG_GSTS)) | set) & (0xFFFFFFFF ^ clear)
+    vtd_wreg32(u, VTD_REG_GCMD, cmd)
+    return vtd_wait_gsts(u, wait_bits, want_set)
+
+# Write back an IRTE's cache line when the unit doesn't snoop the table.
+fn vtd_clflush(addr: u64) -> i32
+    asm x86_64:
+        movq {addr}, %r8
+        clflush (%r8)
+    return 0
+
+# ============================================================================
+# Queued invalidation
+# ============================================================================
+
+fn vtd_qi_submit(u: i32, lo: u64, hi: u64)
+    let d: u64 = phys_to_virt(vtd_qi_phys[u]) + (vtd_qi_tail[u] as u64) * QI_DESC_SIZE
+    volatile_store(d as *u64, lo)
+    volatile_store((d + 8) as *u64, hi)
+    vtd_qi_tail[u] = qi_next_tail(vtd_qi_tail[u])
+    memory_barrier()
+    vtd_wreg64(u, VTD_REG_IQT, (vtd_qi_tail[u] as u64) << 4)
+
+# Queue a wait descriptor and spin until the unit has done everything
+# before it. False on a timeout or a queue error.
+fn vtd_qi_sync(u: i32) -> bool
+    vtd_seq = vtd_seq + 1
+    let status: *u32 = phys_to_virt(vtd_status_phys) as *u32
+    volatile_store(status, 0)
+    vtd_qi_submit(u, qi_wait_lo(vtd_seq), qi_wait_hi(vtd_status_phys))
+    let deadline: u64 = deadline_after_us(VTD_TIMEOUT_US)
+    while volatile_load(status) != vtd_seq
+        if (vtd_reg32(u, VTD_REG_FSTS) & FSTS_IQE) != 0
+            prints("      [vtd] unit ")
+            serial_print_dec(u as u64)
+            prints(": invalidation queue error\n")
+            return false
+        if deadline_passed(deadline)
+            prints("      [vtd] unit ")
+            serial_print_dec(u as u64)
+            prints(": invalidation wait timed out\n")
+            return false
+        cpu_pause()
+    return true
+
+# ============================================================================
+# IRTEs
+# ============================================================================
+
+# Point IRT entry `handle` at `vector` on APIC ID `dest` (32-bit in EIM,
+# else 8-bit), edge or level, from source ID `sid` (DMAR_SID_NONE: not
+# validated), and make every unit drop its cached copy. The source should
+# be masked: a live entry is cleared before its source ID changes.
+# Returns 0, or -1 if remapping is off, the handle is out of range or a
+# unit didn't confirm the invalidation.
+pub fn vtd_ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
+    if vtd_on == 0 or handle >= IRT_ENTRIES
+        return -1
+    let e: u64 = phys_to_virt(vtd_irt_phys) + (handle as u64) * 16
+    let lo: u64 = irte_lo(vector, dest, level, vtd_x2 != 0)
+    let hi: u64 = irte_hi(sid, IRTE_SVT_VERIFY_SID)
+    if volatile_load((e + 8) as *u64) != hi
+        # Not present while the source ID changes: no half-old entry.
+        volatile_store(e as *u64, 0)
+        memory_barrier()
+        volatile_store((e + 8) as *u64, hi)
+        memory_barrier()
+    volatile_store(e as *u64, lo)
+    memory_barrier()
+    var rc: i32 = 0
+    var u: i32 = 0
+    while u < vtd_units
+        if vtd_coherent[u] == 0
+            vtd_clflush(e)
+            memory_barrier()
+        vtd_qi_submit(u, qi_iec_index_lo(handle), 0)
+        if not vtd_qi_sync(u)
+            rc = -1
+        u = u + 1
+    return rc
+
+# The low 64 bits of IRT entry `handle` (vector, destination, present),
+# for the boot log; 0 if remapping is off.
+pub fn vtd_ir_get_lo(handle: u32) -> u64
+    if vtd_on == 0 or handle >= IRT_ENTRIES
+        return 0
+    return volatile_load((phys_to_virt(vtd_irt_phys) + (handle as u64) * 16) as *u64)
+
+# The source ID DMAR gives I/O APIC `ioapic_id`, or DMAR_SID_NONE.
+pub fn vtd_ioapic_sid(ioapic_id: u8) -> u32
+    return dmar_ioapic_source_id(ioapic_id)
+
+# ============================================================================
+# Bring-up
+# ============================================================================
+
+fn vtd_alloc_page() -> u64
+    let p: u64 = pmm_alloc_page()
+    if p == 0
+        return 0
+    let v: *u64 = phys_to_virt(p) as *u64
+    var i: i64 = 0
+    while i < 512
+        *(v + i) = 0
+        i = i + 1
+    return p
+
+fn vtd_fail(u: i32, what: StrView) -> i32
+    prints("      Interrupt remapping: off (unit ")
+    serial_print_dec(u as u64)
+    prints(": ")
+    prints(what)
+    prints(")\n")
+    return -1
+
+# Turn remapping on in unit `u`: take over the invalidation queue, set the
+# table, flush the entry cache, enable with compatibility format blocked.
+fn vtd_unit_enable(u: i32, x2: bool) -> i32
+    let gsts: u32 = vtd_reg32(u, VTD_REG_GSTS)
+    # Firmware may have left remapping or its own queue on.
+    if (gsts & GCMD_IRE) != 0 and not vtd_gcmd(u, 0, GCMD_IRE, GCMD_IRE, false)
+        return vtd_fail(u, "IRE won't clear")
+    if (gsts & GCMD_QIE) != 0
+        let deadline: u64 = deadline_after_us(VTD_TIMEOUT_US)
+        while vtd_reg64(u, VTD_REG_IQH) != vtd_reg64(u, VTD_REG_IQT) and not deadline_passed(deadline)
+            cpu_pause()
+        if not vtd_gcmd(u, 0, GCMD_QIE, GCMD_QIE, false)
+            return vtd_fail(u, "firmware's invalidation queue won't stop")
+    # Queue: 256 128-bit descriptors (QS = 0, DW = 0), empty.
+    vtd_qi_tail[u] = 0
+    vtd_wreg64(u, VTD_REG_IQT, 0)
+    vtd_wreg64(u, VTD_REG_IQA, vtd_qi_phys[u])
+    if not vtd_gcmd(u, GCMD_QIE, 0, GCMD_QIE, true)
+        return vtd_fail(u, "queued invalidation won't start")
+    vtd_wreg64(u, VTD_REG_IRTA, vtd_irta(vtd_irt_phys, x2))
+    if not vtd_gcmd(u, GCMD_SIRTP, 0, GCMD_SIRTP, true)
+        return vtd_fail(u, "table pointer not taken")
+    vtd_qi_submit(u, qi_iec_global_lo(), 0)
+    if not vtd_qi_sync(u)
+        return vtd_fail(u, "entry cache flush failed")
+    if not vtd_gcmd(u, GCMD_IRE, GCMD_CFI, GCMD_IRE, true)
+        return vtd_fail(u, "IRE won't set")
+    if (vtd_reg32(u, VTD_REG_GSTS) & GCMD_CFI) != 0
+        return vtd_fail(u, "compatibility format still passes")
+    return 0
+
+# Turn remapping back off in units 0..n-1 after a later unit failed.
+fn vtd_units_disable(n: i32)
+    var u: i32 = 0
+    while u < n
+        vtd_gcmd(u, 0, GCMD_IRE, GCMD_IRE, false)
+        u = u + 1
+
+# Bring up interrupt remapping on every DMAR unit. `x2apic`: the LAPIC is
+# in x2APIC mode, so IRTEs carry 32-bit destinations (EIM). ACPI must be
+# parsed. Returns 0 with remapping on, -1 with it off (logged why).
+pub fn vtd_ir_init(x2apic: bool) -> i32
+    vtd_on = 0
+    vtd_units = 0
+    let dmar: u64 = acpi_find_table(ACPI_SIG_DMAR)
+    if dmar == 0
+        prints("      Interrupt remapping: off (no DMAR table)\n")
+        return -1
+    let len: u32 = *((dmar + 4) as *u32)
+    if vmm_ensure_mapped(dmar, len as u64) != 0
+        prints("      Interrupt remapping: off (DMAR table not mappable)\n")
+        return -1
+    let n: i32 = dmar_parse(dmar as *u8, len)
+    prints("      DMAR at ")
+    serial_print_hex(dmar)
+    prints(": ")
+    serial_print_dec(dmar_num_units as u64)
+    prints(" remapping unit(s), ")
+    serial_print_dec(dmar_num_ioapics as u64)
+    prints(" I/O APIC scope(s), flags ")
+    serial_print_hex(dmar_flags as u64)
+    prints("\n")
+    if n <= 0
+        prints("      Interrupt remapping: off (DMAR lists no remapping unit)\n")
+        return -1
+    if (dmar_flags & DMAR_INTR_REMAP) == 0
+        prints("      Interrupt remapping: off (DMAR: the platform doesn't support it)\n")
+        return -1
+    if x2apic and (dmar_flags & DMAR_X2APIC_OPT_OUT) != 0
+        prints("      Interrupt remapping: off (DMAR: firmware opts out of x2APIC)\n")
+        return -1
+    var u: i32 = 0
+    while u < n
+        let regs: u64 = vmm_map_mmio(dmar_unit_base[u], 4096)
+        if regs == 0
+            return vtd_fail(u, "registers not mappable")
+        vtd_regs[u] = regs
+        let ecap: u64 = vtd_reg64(u, VTD_REG_ECAP)
+        if not vtd_ecap_can_remap(ecap, x2apic)
+            prints("      [vtd] unit at ")
+            serial_print_hex(dmar_unit_base[u])
+            prints(": ECAP ")
+            serial_print_hex(ecap)
+            prints("\n")
+            return vtd_fail(u, "no IR, queued invalidation or EIM")
+        vtd_coherent[u] = 0
+        if (ecap & ECAP_C) != 0
+            vtd_coherent[u] = 1
+        vtd_qi_phys[u] = vtd_alloc_page()
+        if vtd_qi_phys[u] == 0
+            return vtd_fail(u, "no page for the invalidation queue")
+        u = u + 1
+    vtd_irt_phys = vtd_alloc_page()
+    vtd_status_phys = vtd_alloc_page()
+    if vtd_irt_phys == 0 or vtd_status_phys == 0
+        prints("      Interrupt remapping: off (no page for the table)\n")
+        return -1
+    u = 0
+    while u < n
+        if vtd_unit_enable(u, x2apic) != 0
+            vtd_units_disable(u)
+            return -1
+        u = u + 1
+    vtd_units = n
+    vtd_x2 = 0
+    if x2apic
+        vtd_x2 = 1
+    vtd_on = 1
+    prints("      Interrupt remapping: VT-d on, ")
+    serial_print_dec(n as u64)
+    prints(" unit(s), table at ")
+    serial_print_hex(vtd_irt_phys)
+    if x2apic
+        prints(", 32-bit x2APIC destinations (EIM)\n")
+    else
+        prints(", 8-bit xAPIC destinations\n")
+    return 0

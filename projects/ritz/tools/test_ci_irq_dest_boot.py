@@ -1,11 +1,14 @@
 """CI boots harland with an APIC ID 256 CPU and checks device-interrupt
-destinations (AGAST #4233).
+destinations (AGAST #4233), without and with VT-d interrupt remapping (#4316).
 
 projects/harland/tools/test_irq_dest_boot.sh boots q35 + OVMF with the BSP at
 APIC ID 0 and an AP at 256. The MSI and I/O APIC destination is 8 bits, so the
 kernel must log APIC ID 256's device interrupts as going to the BSP, the I/O
 APIC's IRQ 1 and IRQ 4 must read back as the BSP's ID, NVMe must still
-deliver MSI-X interrupts and init's suite must pass. These tests pin the
+deliver MSI-X interrupts and init's suite must pass. A second boot adds
+-device intel-iommu,intremap=on,eim=on: remapping must come up in extended
+interrupt mode, APIC ID 256 must keep its own interrupts and the I/O APIC
+and NVMe entries must go through IRTEs aimed at the BSP. These tests pin the
 main.yml wiring and the script's verdicts against a stub QEMU.
 """
 
@@ -65,6 +68,12 @@ SUITE = r"  ALL TESTS PASSED\n"
 
 PASSED = X2APIC + DEST_8BIT + ioapic(0, 0) + bsp(0) + APS + REROUTE_256 + NVME + SUITE
 
+IR_ON = r"      Interrupt remapping: VT-d on, 1 unit(s), table at 3DE000, 32-bit x2APIC destinations (EIM)\n"
+DEST_IR = r"      Device interrupt destinations: interrupt remapping (32-bit APIC IDs)\n"
+IOAPIC_IR = r"      I/O APIC: IRQ 1 -> APIC ID 0, IRQ 4 -> APIC ID 0 (remapped: IRTE 1, 4)\n"
+NVME_IR = NVME.replace("io=65\\n", "io=65 (IRTE 192, 193 -> APIC ID 0, 0)\\n", 1)
+VTD_PASSED = X2APIC + IR_ON + DEST_IR + IOAPIC_IR + bsp(0) + APS + NVME_IR + SUITE
+
 
 def _build_all() -> list[dict]:
     return yaml.safe_load(ci_local.WORKFLOW.read_text())["jobs"]["build-all"]["steps"]
@@ -92,9 +101,18 @@ def test_irq_dest_boot_runs_after_the_tier1_boot_and_before_the_log_upload():
 @pytest.mark.unit
 def test_the_machine_has_an_apic_id_256_cpu():
     text = (REPO / SCRIPT).read_text()
-    assert "-machine q35" in text and "+x2apic" in text
+    assert 'machine="q35"' in text and '-machine "$machine"' in text and "+x2apic" in text
     assert "-smp 1,sockets=2,cores=200,maxcpus=400" in text
     assert "socket-id=1,core-id=0,thread-id=0" in text
+
+
+@pytest.mark.unit
+def test_the_vtd_boot_has_an_iommu_with_32_bit_remapping():
+    text = (REPO / SCRIPT).read_text()
+    assert "-device intel-iommu,intremap=on,eim=on" in text
+    # KVM needs the split irqchip for the IOMMU's interrupt remapping
+    assert 'machine="q35,kernel-irqchip=split"' in text
+    assert 'IRQ_DEST_BOOTS:-plain vtd' in text, "CI must run both boots by default"
 
 
 @pytest.fixture
@@ -120,8 +138,9 @@ def tree(tmp_path):
     return {"script": tools / "test_irq_dest_boot.sh", "stubs": stubs, "ovmf": ovmf, "tmp": tmp_path}
 
 
-def _run(tree, serial: str) -> subprocess.CompletedProcess:
+def _run(tree, serial: str, boots: str = "plain") -> subprocess.CompletedProcess:
     env = {
+        "IRQ_DEST_BOOTS": boots,
         "PATH": f"{tree['stubs']}{os.pathsep}{os.environ['PATH']}",
         "HOME": str(tree["tmp"]),
         "TMPDIR": str(tree["tmp"]),
@@ -139,7 +158,50 @@ def _run(tree, serial: str) -> subprocess.CompletedProcess:
 def test_a_good_boot_passes(tree):
     r = _run(tree, PASSED)
     assert r.returncode == 0, r.stdout + r.stderr
-    assert "PASS: APIC ID 256's device interrupts go to the BSP" in r.stdout
+    assert "PASS: [plain] APIC ID 256's device interrupts go to the BSP" in r.stdout
+
+
+@pytest.mark.integration
+def test_a_good_vtd_boot_passes(tree):
+    r = _run(tree, VTD_PASSED, "vtd")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: [vtd] APIC ID 256 takes its own device interrupts (interrupt remapping)" in r.stdout
+    argv = (tree["tmp"] / "stub.log").read_text()
+    assert "intel-iommu,intremap=on,eim=on" in argv
+
+
+@pytest.mark.integration
+def test_both_boots_run_by_default(tree):
+    r = _run(tree, PASSED, "plain vtd")
+    # one fake serial for both: plain passes, vtd fails, so the run fails
+    assert r.returncode == 1 and "PASS: [plain] init Tier-1 suite" in r.stdout and "FAIL: [vtd]" in r.stdout
+    argv = (tree["tmp"] / "stub.log").read_text().splitlines()
+    assert len(argv) == 2 and "intel-iommu" not in argv[0] and "intel-iommu" in argv[1]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("serial, why", [
+    (VTD_PASSED.replace(IR_ON, r"      Interrupt remapping: off (no DMAR table)\n"), "interrupt remapping is not on"),
+    (VTD_PASSED.replace(IR_ON, IR_ON.replace("32-bit x2APIC destinations (EIM)", "8-bit xAPIC destinations")),
+     "interrupt remapping is not on"),
+    (VTD_PASSED.replace(DEST_IR, DEST_8BIT), "not 32-bit through remapping"),
+    (VTD_PASSED + REROUTE_256, "rerouted though interrupt remapping reaches it"),
+    (VTD_PASSED.replace(IOAPIC_IR, ioapic(0, 0)), "not in the remappable format"),
+    (VTD_PASSED.replace(NVME_IR, NVME), "NVMe MSI-X entries are not in the remappable format"),
+    (VTD_PASSED.replace("-> APIC ID 0, 0)", "-> APIC ID 0, 256)"), "want \"(IRTE 192, 193 -> APIC ID 0, 0)\""),
+    (VTD_PASSED.replace("(IRTE 192, 193", "(IRTE 64, 65"), "want"),
+    (VTD_PASSED.replace("interrupts: 3,", "interrupts: 0,"), "counter is 0"),
+])
+def test_a_bad_vtd_boot_fails(tree, serial, why):
+    r = _run(tree, serial, "vtd")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert why in r.stdout, r.stdout
+
+
+@pytest.mark.integration
+def test_an_unknown_boot_is_a_setup_error(tree):
+    r = _run(tree, PASSED, "plain nope")
+    assert r.returncode == 3 and "unknown boot" in r.stderr
 
 
 @pytest.mark.integration

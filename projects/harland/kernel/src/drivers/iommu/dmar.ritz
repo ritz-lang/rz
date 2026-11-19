@@ -1,0 +1,333 @@
+# Intel VT-d interrupt remapping: the DMAR table and the formats, no
+# hardware (AGAST #4316).
+#
+# An MSI address and an I/O APIC redirection entry carry an 8-bit APIC ID
+# (arch/x86_64/irq_dest.ritz). With interrupt remapping on, they carry a
+# handle instead: an index into the interrupt remapping table (IRT), whose
+# 128-bit entry (IRTE) holds the vector and, with extended interrupt mode
+# (EIM), a full 32-bit x2APIC destination. That is how bare metal with APIC
+# IDs past 254 gets device interrupts to every CPU.
+#
+# This module:
+#   - parses the ACPI DMAR table: the remapping units (DRHD) and the I/O
+#     APICs they list, with their PCI source IDs (dmar_parse);
+#   - encodes IRTEs, remappable MSI addresses and remappable redirection
+#     entries, and decodes them back for the boot logs;
+#   - names the IRT handle each interrupt source uses;
+#   - encodes the register values and invalidation-queue descriptors
+#     drivers/iommu/vtd.ritz writes.
+#
+# No imports, no hardware access: projects/ritz/ritz0/test_harland_vtd.py
+# compiles it into a host program as is. Formats: Intel VT-d specification
+# rev. 4, sections 5.1 (interrupt remapping), 6.5.2 (invalidation queue),
+# 8 (DMAR), 9.10 (IRTE), 11.4 (registers).
+
+# ============================================================================
+# DMAR table (ACPI signature "DMAR")
+# ============================================================================
+
+pub const ACPI_SIG_DMAR: u32 = 0x52414D44
+
+# Header: the 36-byte ACPI header, host address width (1), flags (1),
+# 10 reserved; remapping structures follow.
+pub const DMAR_FLAGS_OFFSET: u32 = 37
+pub const DMAR_STRUCTS_OFFSET: u32 = 48
+
+# DMAR flags
+pub const DMAR_INTR_REMAP: u8 = 0x01           # the platform supports interrupt remapping
+pub const DMAR_X2APIC_OPT_OUT: u8 = 0x02       # firmware asks the OS not to use x2APIC
+
+# Remapping structure types (u16 type, u16 length)
+pub const DMAR_TYPE_DRHD: u16 = 0              # a remapping hardware unit
+
+# DRHD: type, length, flags (1), size (1), segment (2), register base (8),
+# then device scopes.
+pub const DRHD_SCOPES_OFFSET: u32 = 16
+pub const DRHD_INCLUDE_PCI_ALL: u8 = 0x01
+
+# Device scope: type (1), length (1), reserved (2), enumeration ID (1),
+# start bus (1), then (device, function) pairs.
+pub const SCOPE_IOAPIC: u8 = 3
+
+pub const DMAR_MAX_UNITS: i32 = 8
+pub const DMAR_MAX_IOAPICS: i32 = 8
+
+# What dmar_parse found.
+pub var dmar_flags: u8 = 0
+pub var dmar_num_units: i32 = 0
+pub var dmar_unit_base: [8]u64                 # register base, per unit
+pub var dmar_unit_segment: [8]u16
+pub var dmar_unit_include_all: [8]u8           # 1: the unit covers every device not listed elsewhere
+pub var dmar_num_ioapics: i32 = 0
+pub var dmar_ioapic_id: [8]u8                  # I/O APIC ID (the scope's enumeration ID)
+pub var dmar_ioapic_sid: [8]u32                # its source ID (bus << 8 | dev << 3 | fn), or DMAR_SID_NONE
+pub var dmar_ioapic_unit: [8]i32               # the unit that remaps it
+
+# A source ID that can't be named: the scope's path crosses a bridge.
+pub const DMAR_SID_NONE: u32 = 0xFFFFFFFF
+
+fn dmar_rd8(p: *u8, off: u32) -> u8
+    return *(p + off as i64)
+
+fn dmar_rd16(p: *u8, off: u32) -> u16
+    return (dmar_rd8(p, off) as u16) | ((dmar_rd8(p, off + 1) as u16) << 8)
+
+fn dmar_rd32(p: *u8, off: u32) -> u32
+    return (dmar_rd16(p, off) as u32) | ((dmar_rd16(p, off + 2) as u32) << 16)
+
+fn dmar_rd64(p: *u8, off: u32) -> u64
+    return (dmar_rd32(p, off) as u64) | ((dmar_rd32(p, off + 4) as u64) << 32)
+
+# The source ID of a one-step device-scope path, DMAR_SID_NONE for any
+# other. A longer path goes through bridges whose secondary bus numbers only
+# PCI config space knows; the IRTE then skips source validation.
+pub fn dmar_scope_sid(scope: *u8) -> u32
+    let len: u32 = dmar_rd8(scope, 1) as u32
+    if len != 8
+        return DMAR_SID_NONE
+    let bus: u32 = dmar_rd8(scope, 5) as u32
+    let dev: u32 = dmar_rd8(scope, 6) as u32
+    let fun: u32 = dmar_rd8(scope, 7) as u32
+    return (bus << 8) | ((dev & 0x1F) << 3) | (fun & 0x7)
+
+# Parse the DMAR table at `table` (`len` bytes, its header's length).
+# Fills the dmar_* variables. Returns the number of remapping units, or -1
+# if the table is too short or not a DMAR. A malformed structure (zero
+# length, running past the end) ends the parse there.
+pub fn dmar_parse(table: *u8, len: u32) -> i32
+    dmar_flags = 0
+    dmar_num_units = 0
+    dmar_num_ioapics = 0
+    if len < DMAR_STRUCTS_OFFSET or dmar_rd32(table, 0) != ACPI_SIG_DMAR
+        return -1
+    if dmar_rd32(table, 4) < len
+        return -1
+    dmar_flags = dmar_rd8(table, DMAR_FLAGS_OFFSET)
+    var off: u32 = DMAR_STRUCTS_OFFSET
+    while off + 4 <= len
+        let stype: u16 = dmar_rd16(table, off)
+        let slen: u32 = dmar_rd16(table, off + 2) as u32
+        if slen < 4 or off + slen > len
+            break
+        if stype == DMAR_TYPE_DRHD and slen >= DRHD_SCOPES_OFFSET and dmar_num_units < DMAR_MAX_UNITS
+            let unit: i32 = dmar_num_units
+            dmar_unit_base[unit] = dmar_rd64(table, off + 8)
+            dmar_unit_segment[unit] = dmar_rd16(table, off + 6)
+            dmar_unit_include_all[unit] = dmar_rd8(table, off + 4) & DRHD_INCLUDE_PCI_ALL
+            dmar_num_units = unit + 1
+            var s: u32 = off + DRHD_SCOPES_OFFSET
+            while s + 6 <= off + slen
+                let sc_len: u32 = dmar_rd8(table, s + 1) as u32
+                if sc_len < 6 or s + sc_len > off + slen
+                    break
+                if dmar_rd8(table, s) == SCOPE_IOAPIC and dmar_num_ioapics < DMAR_MAX_IOAPICS
+                    let k: i32 = dmar_num_ioapics
+                    dmar_ioapic_id[k] = dmar_rd8(table, s + 4)
+                    dmar_ioapic_sid[k] = dmar_scope_sid(table + s as i64)
+                    dmar_ioapic_unit[k] = unit
+                    dmar_num_ioapics = k + 1
+                s = s + sc_len
+        off = off + slen
+    return dmar_num_units
+
+# The source ID DMAR gives the I/O APIC with ID `ioapic_id`, or
+# DMAR_SID_NONE if it lists none (or can't name it).
+pub fn dmar_ioapic_source_id(ioapic_id: u8) -> u32
+    var k: i32 = 0
+    while k < dmar_num_ioapics
+        if dmar_ioapic_id[k] == ioapic_id
+            return dmar_ioapic_sid[k]
+        k = k + 1
+    return DMAR_SID_NONE
+
+# ============================================================================
+# Interrupt remapping table entries (128 bits: lo, hi)
+# ============================================================================
+
+# The IRT is one 4 KiB page: 256 entries of 16 bytes.
+pub const IRT_ENTRIES: u32 = 256
+# IRTA.S: the table has 2^(S+1) entries.
+pub const IRTA_SIZE_256: u64 = 7
+pub const IRTA_EIME: u64 = 0x800               # bit 11: 32-bit (x2APIC) destinations
+
+pub const IRTE_PRESENT: u64 = 0x1
+pub const IRTE_LEVEL: u64 = 0x10               # TM: level-triggered
+
+# Source validation (IRTE hi bits 19:18): none, or the requester ID must be
+# the source ID exactly (SQ = 0).
+pub const IRTE_SVT_NONE: u32 = 0
+pub const IRTE_SVT_VERIFY_SID: u32 = 1
+
+# The low 64 bits of a present IRTE: fixed delivery, physical destination,
+# no redirection hint, remapped (not posted). `x2` (IRTA.EIME): the 32-bit
+# destination is bits 63:32; without it the 8-bit xAPIC ID is bits 47:40.
+pub fn irte_lo(vector: u8, dest: u32, level: bool, x2: bool) -> u64
+    var v: u64 = IRTE_PRESENT | ((vector as u64) << 16)
+    if level
+        v = v | IRTE_LEVEL
+    if x2
+        v = v | ((dest as u64) << 32)
+    else
+        v = v | (((dest & 0xFF) as u64) << 40)
+    return v
+
+# The high 64 bits: the source ID and how it is checked. DMAR_SID_NONE
+# (or any SVT other than VERIFY_SID) means no source validation.
+pub fn irte_hi(sid: u32, svt: u32) -> u64
+    if svt != IRTE_SVT_VERIFY_SID or sid == DMAR_SID_NONE
+        return 0
+    return ((sid & 0xFFFF) as u64) | ((IRTE_SVT_VERIFY_SID as u64) << 18)
+
+pub fn irte_vector(lo: u64) -> u8
+    return ((lo >> 16) & 0xFF) as u8
+
+pub fn irte_dest(lo: u64, x2: bool) -> u32
+    if x2
+        return (lo >> 32) as u32
+    return ((lo >> 40) & 0xFF) as u32
+
+# ============================================================================
+# Remappable MSI addresses and I/O APIC redirection entries
+# ============================================================================
+
+pub const MSI_ADDR_REMAP_BASE: u32 = 0xFEE00010   # bit 4: remappable format
+
+# MSI address (low 32 bits) for IRT handle `handle`: handle bits 14:0 in
+# 19:5, bit 15 in 2; SHV clear, so the data register is 0.
+pub fn msi_addr_remap(handle: u32) -> u32
+    return MSI_ADDR_REMAP_BASE | ((handle & 0x7FFF) << 5) | (((handle >> 15) & 1) << 2)
+
+pub fn msi_addr_is_remap(addr_lo: u32) -> bool
+    return (addr_lo & 0x10) != 0
+
+pub fn msi_addr_handle(addr_lo: u32) -> u32
+    return ((addr_lo >> 5) & 0x7FFF) | (((addr_lo >> 2) & 1) << 15)
+
+# Redirection entry, remappable format. High dword: bit 16 (entry bit 48)
+# is the format, bits 31:17 (63:49) handle bits 14:0. Low dword: vector
+# (which the EOI broadcast matches), handle bit 15 in bit 11, polarity,
+# trigger and mask where the compatibility format has them; delivery mode 0.
+pub const RTE_HI_REMAP: u32 = 0x10000
+pub const RTE_LO_MASKED: u32 = 0x10000
+pub const RTE_LO_LEVEL: u32 = 0x8000
+pub const RTE_LO_ACTIVE_LOW: u32 = 0x2000
+
+pub fn ioapic_rte_remap_hi(handle: u32) -> u32
+    return RTE_HI_REMAP | ((handle & 0x7FFF) << 17)
+
+pub fn ioapic_rte_remap_lo(vector: u8, handle: u32, masked: bool) -> u32
+    var v: u32 = (vector as u32) | (((handle >> 15) & 1) << 11)
+    if masked
+        v = v | RTE_LO_MASKED
+    return v
+
+pub fn ioapic_rte_is_remap(rte_hi: u32) -> bool
+    return (rte_hi & RTE_HI_REMAP) != 0
+
+pub fn ioapic_rte_handle(rte_hi: u32, rte_lo: u32) -> u32
+    return ((rte_hi >> 17) & 0x7FFF) | (((rte_lo >> 11) & 1) << 15)
+
+# ============================================================================
+# IRT handles
+# ============================================================================
+#
+# I/O APIC pin N uses entry N (pins 0..127); MSI-X vector V uses entry
+# 128 + (V & 127), so every MSI-X vector (64..79) has its own entry and no
+# pin shares one.
+
+pub const IR_HANDLE_MSI_BASE: u32 = 128
+
+pub fn ir_handle_ioapic(pin: u32) -> u32
+    return pin & 0x7F
+
+pub fn ir_handle_msi(vector: u8) -> u32
+    return IR_HANDLE_MSI_BASE + ((vector as u32) & 0x7F)
+
+# ============================================================================
+# Registers (offsets from the unit's register base) and their values
+# ============================================================================
+
+pub const VTD_REG_VER: u64 = 0x00
+pub const VTD_REG_CAP: u64 = 0x08
+pub const VTD_REG_ECAP: u64 = 0x10
+pub const VTD_REG_GCMD: u64 = 0x18
+pub const VTD_REG_GSTS: u64 = 0x1C
+pub const VTD_REG_IQH: u64 = 0x80
+pub const VTD_REG_IQT: u64 = 0x88
+pub const VTD_REG_IQA: u64 = 0x90
+pub const VTD_REG_IRTA: u64 = 0xB8
+
+# ECAP
+pub const ECAP_C: u64 = 0x1                    # page-walk coherency: no cache flush needed
+pub const ECAP_QI: u64 = 0x2                   # queued invalidation
+pub const ECAP_IR: u64 = 0x8                   # interrupt remapping
+pub const ECAP_EIM: u64 = 0x10                 # extended interrupt mode (32-bit destinations)
+
+# GCMD (write) / GSTS (read): same bit for a command and its status.
+pub const GCMD_TE: u32 = 0x80000000
+pub const GCMD_SRTP: u32 = 0x40000000
+pub const GCMD_SFL: u32 = 0x20000000
+pub const GCMD_WBF: u32 = 0x08000000
+pub const GCMD_QIE: u32 = 0x04000000
+pub const GCMD_IRE: u32 = 0x02000000
+pub const GCMD_SIRTP: u32 = 0x01000000
+pub const GCMD_CFI: u32 = 0x00800000
+
+# GCMD takes the whole state at once: the persistent bits as GSTS reports
+# them, without the one-shot commands (SRTP, SFL, WBF, SIRTP), which would
+# run again.
+pub const GCMD_ONE_SHOT: u32 = 0x69000000
+
+pub fn vtd_gcmd_from_gsts(gsts: u32) -> u32
+    return gsts & (0xFFFFFFFF ^ GCMD_ONE_SHOT)
+
+# IRTA: table address, EIME, size.
+pub fn vtd_irta(table_phys: u64, x2: bool) -> u64
+    var v: u64 = (table_phys & 0xFFFFFFFFFFFFF000) | IRTA_SIZE_256
+    if x2
+        v = v | IRTA_EIME
+    return v
+
+# The ECAP bits interrupt remapping needs: IR and queued invalidation (the
+# interrupt entry cache is invalidated only through the queue), and EIM for
+# 32-bit destinations.
+pub fn vtd_ecap_can_remap(ecap: u64, x2: bool) -> bool
+    if (ecap & ECAP_IR) == 0 or (ecap & ECAP_QI) == 0
+        return false
+    if x2 and (ecap & ECAP_EIM) == 0
+        return false
+    return true
+
+# ============================================================================
+# Invalidation queue descriptors (128 bits: lo, hi)
+# ============================================================================
+#
+# The queue (IQA, QS = 0) is one 4 KiB page of 256 descriptors; IQT holds
+# the next free descriptor's byte offset.
+
+pub const QI_ENTRIES: u32 = 256
+pub const QI_DESC_SIZE: u64 = 16
+pub const QI_TYPE_IEC: u64 = 0x4
+pub const QI_TYPE_WAIT: u64 = 0x5
+pub const QI_IEC_INDEXED: u64 = 0x10           # G: one entry (IIDX), not all
+pub const QI_WAIT_SW: u64 = 0x20               # status write
+
+# Interrupt entry cache invalidation: every entry.
+pub fn qi_iec_global_lo() -> u64
+    return QI_TYPE_IEC
+
+# ... or the one IRTE `handle` (index mask 0).
+pub fn qi_iec_index_lo(handle: u32) -> u64
+    return QI_TYPE_IEC | QI_IEC_INDEXED | (((handle & 0xFFFF) as u64) << 32)
+
+# Wait descriptor: once every earlier descriptor is done, write `data` to
+# the dword at physical `status_phys` (its hi half).
+pub fn qi_wait_lo(data: u32) -> u64
+    return QI_TYPE_WAIT | QI_WAIT_SW | ((data as u64) << 32)
+
+pub fn qi_wait_hi(status_phys: u64) -> u64
+    return status_phys & 0xFFFFFFFFFFFFFFFC
+
+# IQT after `tail` (a descriptor index) advances by one.
+pub fn qi_next_tail(tail: u32) -> u32
+    return (tail + 1) % QI_ENTRIES

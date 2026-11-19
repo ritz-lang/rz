@@ -5,8 +5,9 @@
 # don't: an MSI address holds the APIC ID in bits 19:12 and an I/O APIC
 # redirection entry in bits 63:56, 8 bits each, and 0xFF there is the
 # broadcast ID. Past that, a CPU is reachable only through interrupt
-# remapping (VT-d/AMD-Vi, which Harland doesn't drive yet) or on a
-# hypervisor that advertises the extended destination ID
+# remapping (VT-d with extended interrupt mode, drivers/iommu/vtd.ritz,
+# AGAST #4316: the message carries a table handle and the table entry a
+# 32-bit destination) or on a hypervisor that advertises the extended destination ID
 # (KVM_FEATURE_MSI_EXT_DEST_ID, CPUID 0x40000001 EAX bit 15): APIC ID bits
 # 14:8 go in MSI address bits 11:5 and in redirection-entry bits 55:49.
 # Any other CPU's interrupts go to one that is reachable: the BSP if it is,
@@ -48,10 +49,17 @@ pub fn irq_ext_dest_from_cpuid(max_leaf: u32, ebx: u32, ecx: u32, edx: u32, feat
         return false
     return (features & KVM_FEATURE_MSI_EXT_DEST_ID) != 0
 
-# Can an MSI or an I/O APIC interrupt, with no interrupt remapping, be sent
-# to `apic_id` alone? 0..254 always (255 is the broadcast ID); up to
-# IRQ_EXT_DEST_MAX with the extended destination ID.
-pub fn irq_dest_reachable(apic_id: u32, ext_dest: bool) -> bool
+# x2APIC's broadcast ID: the one 32-bit destination no remapped interrupt
+# can name alone.
+pub const IRQ_DEST_X2_BROADCAST: u32 = 0xFFFFFFFF
+
+# Can an MSI or an I/O APIC interrupt be sent to `apic_id` alone? With
+# interrupt remapping in extended interrupt mode (`ir_x2`), any 32-bit ID
+# but x2APIC broadcast. Otherwise 0..254 (255 is the 8-bit broadcast ID),
+# or up to IRQ_EXT_DEST_MAX with the extended destination ID.
+pub fn irq_dest_reachable(apic_id: u32, ext_dest: bool, ir_x2: bool) -> bool
+    if ir_x2
+        return apic_id != IRQ_DEST_X2_BROADCAST
     if apic_id == IRQ_DEST_BROADCAST
         return false
     if apic_id < IRQ_DEST_BROADCAST
@@ -80,15 +88,15 @@ pub fn ioapic_rte_dest(rte_hi: u32) -> u32
 # The CPU to send a device interrupt meant for `want` to: `want` if it is
 # reachable, else `bsp` if it is, else the first of `ids[0..n]` that is.
 # IRQ_DEST_NONE if none is.
-pub fn irq_dest_pick(want: u32, bsp: u32, ids: *u32, n: i32, ext_dest: bool) -> u32
-    if irq_dest_reachable(want, ext_dest)
+pub fn irq_dest_pick(want: u32, bsp: u32, ids: *u32, n: i32, ext_dest: bool, ir_x2: bool) -> u32
+    if irq_dest_reachable(want, ext_dest, ir_x2)
         return want
-    if irq_dest_reachable(bsp, ext_dest)
+    if irq_dest_reachable(bsp, ext_dest, ir_x2)
         return bsp
     var i: i32 = 0
     while i < n
         let id: u32 = *(ids + i)
-        if irq_dest_reachable(id, ext_dest)
+        if irq_dest_reachable(id, ext_dest, ir_x2)
             return id
         i = i + 1
     return IRQ_DEST_NONE

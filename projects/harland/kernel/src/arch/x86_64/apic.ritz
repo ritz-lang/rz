@@ -21,6 +21,8 @@ import mm.vmm { vmm_pml4_phys, vmm_map_page, PTE_WRITABLE, PTE_CACHE_DISABLE }
 import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr }
 import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
 import arch.x86_64.irq_dest { irq_dest_pick, irq_ext_dest_from_cpuid, ioapic_rte_hi, ioapic_rte_dest, msi_addr_lo, IRQ_DEST_NONE }
+import drivers.iommu.vtd { vtd_ir_init, vtd_ir_enabled, vtd_ir_x2apic, vtd_ir_set, vtd_ir_get_lo, vtd_ioapic_sid }
+import drivers.iommu.dmar { ir_handle_ioapic, ioapic_rte_remap_hi, ioapic_rte_remap_lo, ioapic_rte_is_remap, ioapic_rte_handle, irte_dest }
 
 # ============================================================================
 # PIC (Programmable Interrupt Controller) - Remap to vectors 32-47
@@ -126,6 +128,11 @@ fn apic_select_mode() -> i32
     # not always 0 (#4233). ap_boot_all reads it again; it can't change.
     bsp_apic_id = lapic_id()
     irq_ext_dest_detect()
+    # Interrupt remapping (VT-d, #4316) before the I/O APIC is programmed:
+    # with it, every MSI and redirection entry goes through the table, and
+    # in x2APIC mode reaches any APIC ID.
+    vtd_ir_init(x2apic_mode != 0)
+    irq_dest_print_mode()
     return 0
 
 # CPUID.1:ECX bit 31: running under a hypervisor (its leaves start at
@@ -144,7 +151,15 @@ fn irq_ext_dest_detect() -> i32
         let feat: CpuidResult = cpuid(0x40000001)
         if irq_ext_dest_from_cpuid(sig.eax, sig.ebx, sig.ecx, sig.edx, feat.eax)
             irq_ext_dest = 1
-    if irq_ext_dest != 0
+    return 0
+
+# How far device interrupts reach, for the boot log (the boot tests read it).
+fn irq_dest_print_mode() -> i32
+    if vtd_ir_x2apic()
+        prints("      Device interrupt destinations: interrupt remapping (32-bit APIC IDs)\n")
+    else if vtd_ir_enabled()
+        prints("      Device interrupt destinations: 8-bit through interrupt remapping (xAPIC mode)\n")
+    else if irq_ext_dest != 0
         prints("      Device interrupt destinations: extended destination ID (APIC IDs up to 32767)\n")
     else
         prints("      Device interrupt destinations: 8-bit (APIC IDs up to 254; no interrupt remapping or extended destination ID)\n")
@@ -155,11 +170,13 @@ fn irq_ext_dest_detect() -> i32
 # the first CPU that can be reached. IRQ_DEST_NONE if none can. drivers/msix
 # calls this for the CPU it runs on.
 pub fn irq_route_dest(want: u32) -> u32
-    return irq_dest_pick(want, bsp_apic_id, @cpu_apic_ids[0], num_cpus as i32, irq_ext_dest != 0)
+    return irq_dest_pick(want, bsp_apic_id, @cpu_apic_ids[0], num_cpus as i32, irq_ext_dest != 0, vtd_ir_x2apic())
 
 # Why irq_route_dest(id) isn't id.
 pub fn irq_route_print_reason(apic_id: u32) -> i32
-    if apic_id == 255
+    if vtd_ir_x2apic()
+        prints("the x2APIC broadcast ID")
+    else if apic_id == 255
         prints("APIC ID 255 is the broadcast ID")
     else if irq_ext_dest != 0
         prints("beyond the extended destination ID's 15 bits")
@@ -315,10 +332,28 @@ fn ioapic_write(reg: u8, value: u32) -> i32
     *window = value
     return 0
 
+# The I/O APIC's own ID (IOAPIC_ID bits 27:24): DMAR names its source ID by it.
+var ioapic_hw_id: u8 = 0
+
 # Set up an I/O APIC redirection entry
 fn ioapic_set_irq(irq: u8, vector: u8, dest_apic: u32, masked: bool) -> i32
     let reg_lo: u8 = IOAPIC_REDTBL + irq * 2
     let reg_hi: u8 = IOAPIC_REDTBL + irq * 2 + 1
+
+    # With interrupt remapping (#4316) the entry names IRT entry `irq`, and
+    # that entry the vector and the (32-bit) destination. Masked first, so
+    # the pin never fires through a half-written entry.
+    if vtd_ir_enabled()
+        let handle: u32 = ir_handle_ioapic(irq as u32)
+        ioapic_write(reg_lo, ioapic_rte_remap_lo(vector, handle, true))
+        if vtd_ir_set(handle, vector, dest_apic, false, vtd_ioapic_sid(ioapic_hw_id)) != 0
+            prints("      I/O APIC: IRQ ")
+            serial_print_dec(irq as u64)
+            prints(": IRTE not set; left masked\n")
+            return -1
+        ioapic_write(reg_hi, ioapic_rte_remap_hi(handle))
+        ioapic_write(reg_lo, ioapic_rte_remap_lo(vector, handle, masked))
+        return 0
 
     # High 32 bits: destination APIC ID bits 7:0 in 31:24, and with the
     # extended destination ID bits 14:8 in 23:17 (irq_dest.ritz)
@@ -346,6 +381,7 @@ fn ioapic_init() -> i32
         prints("      No I/O APIC!\n")
         return -1
 
+    ioapic_hw_id = ((ioapic_read(IOAPIC_ID) >> 24) & 0xF) as u8
     let version: u32 = ioapic_read(IOAPIC_VER)
     let max_irqs: u32 = ((version >> 16) & 0xFF) + 1
 
@@ -388,12 +424,27 @@ fn ioapic_init() -> i32
     # Read the routing back: tools/test_irq_dest_boot.sh checks it names
     # the BSP's APIC ID.
     prints("      I/O APIC: IRQ 1 -> APIC ID ")
-    serial_print_dec(ioapic_rte_dest(ioapic_read(IOAPIC_REDTBL + 3)) as u64)
+    serial_print_dec(ioapic_irq_dest(1) as u64)
     prints(", IRQ 4 -> APIC ID ")
-    serial_print_dec(ioapic_rte_dest(ioapic_read(IOAPIC_REDTBL + 9)) as u64)
+    serial_print_dec(ioapic_irq_dest(4) as u64)
+    if vtd_ir_enabled()
+        prints(" (remapped: IRTE ")
+        serial_print_dec(ioapic_rte_handle(ioapic_read(IOAPIC_REDTBL + 3), ioapic_read(IOAPIC_REDTBL + 2)) as u64)
+        prints(", ")
+        serial_print_dec(ioapic_rte_handle(ioapic_read(IOAPIC_REDTBL + 9), ioapic_read(IOAPIC_REDTBL + 8)) as u64)
+        prints(")")
     prints("\n")
 
     return 0
+
+# The APIC ID pin `irq` is sent to, read back from the hardware: the
+# redirection entry, or in the remappable format the IRTE it names.
+fn ioapic_irq_dest(irq: u8) -> u32
+    let hi: u32 = ioapic_read(IOAPIC_REDTBL + irq * 2 + 1)
+    if ioapic_rte_is_remap(hi)
+        let lo: u32 = ioapic_read(IOAPIC_REDTBL + irq * 2)
+        return irte_dest(vtd_ir_get_lo(ioapic_rte_handle(hi, lo)), vtd_ir_x2apic())
+    return ioapic_rte_dest(hi)
 
 # Disable legacy 8259 PIC
 fn pic_disable() -> i32
