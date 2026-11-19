@@ -126,7 +126,13 @@ def test_indium_disks_carry_the_initramfs_on_the_esp():
     uefi = _recipe(text, "$(UEFI_DISK)")
     assert "initramfs.tar" in uefi.split("mkuefi.py", 1)[1]
     ec2 = _recipe(text, "$(EC2_DISK)")
-    assert "mnt/harland/initramfs.tar" in ec2
+    # AGAST #1849: the EC2 disk is built by tools/mkec2disk.py, which writes
+    # harland/initramfs.tar into the ESP itself (pinned byte-for-byte by
+    # test_indium_ec2_run.py::test_built_disk_holds_the_initramfs). The
+    # recipe's job is to hand it the initramfs target and stay rootless.
+    assert "tools/mkec2disk.py" in ec2
+    assert "$(EC2_INITRAMFS)" in ec2
+    assert "sudo" not in ec2 and "mkfs" not in ec2 and "mount" not in ec2
     assert "--new=2:" not in ec2 and "seek=" not in ec2
 
 

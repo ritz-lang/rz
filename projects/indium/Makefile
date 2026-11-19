@@ -38,7 +38,7 @@ STORAGE = $(BUILD_DIR)/storage.qcow2
 # Phony targets
 # ============================================================================
 
-.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi shell debug test test-uefi test-uefi-gui ec2-disk help
+.PHONY: all clean kernel userspace initramfs-bin iso run run-iso run-uefi shell debug test test-uefi test-uefi-gui ec2-disk ec2-boot help
 
 all: iso
 
@@ -84,38 +84,31 @@ $(UEFI_DISK): kernel $(BUILD_DIR)/initramfs.tar
 # BOOTX64.EFI reads harland/initramfs.tar with the UEFI file protocol and
 # passes it in BootInfo (AGAST #4253). The raw-TAR partition 2 is gone.
 EC2_DISK = $(BUILD_DIR)/ec2-boot.img
-
+EC2_INITRAMFS = $(BUILD_DIR)/ec2-initramfs.tar
+#
+# The EC2 initramfs runs init_interactive, as `make shell` does: the instance
+# boots to an rzsh prompt on the serial console instead of running init's
+# test suite and powering off (AGAST #1849).
+#
+# tools/mkec2disk.py builds the disk without root: no sudo, losetup, sgdisk
+# or mkfs.vfat, none of which a task room has (AGAST #1849).
 ec2-disk: $(EC2_DISK)
 
-$(EC2_DISK): kernel $(BUILD_DIR)/initramfs.tar
+$(EC2_INITRAMFS): initramfs-bin
+	python3 $(HARLAND_DIR)/tools/mkinitramfs.py --bin-dir $(INITRAMFS_BIN) \
+		--init init_interactive --output $@
+
+$(EC2_DISK): kernel $(EC2_INITRAMFS)
 	@echo "=== Creating EC2 Boot Disk (GPT + ESP) ==="
 	@mkdir -p $(BUILD_DIR)
-	@# Create 128MB disk image
-	dd if=/dev/zero of=$@ bs=1M count=128 2>/dev/null
-	@# GPT with one partition: the ESP from 1MB (sector 2048) to the last
-	@# usable sector, 262110 (the backup GPT takes the final 33 sectors)
-	sgdisk --clear \
-	       --new=1:2048:0 --typecode=1:EF00 --change-name=1:ESP \
-	       $@
-	@# Format and populate the ESP
-	@# ESP offset: 2048 * 512 = 1048576 (1MB)
-	@# ESP size: (262110 - 2048 + 1) * 512 = 133152256 (~127MB)
-	@LOOP_ESP=$$(sudo losetup --find --show --offset 1048576 --sizelimit 133152256 $@) && \
-	sudo mkfs.vfat -F 32 $$LOOP_ESP && \
-	mkdir -p $(BUILD_DIR)/mnt && \
-	sudo mount $$LOOP_ESP $(BUILD_DIR)/mnt && \
-	sudo mkdir -p $(BUILD_DIR)/mnt/EFI/BOOT && \
-	sudo mkdir -p $(BUILD_DIR)/mnt/harland && \
-	sudo cp $(BOOTLOADER) $(BUILD_DIR)/mnt/EFI/BOOT/BOOTX64.EFI && \
-	sudo cp $(KERNEL_ELF) $(BUILD_DIR)/mnt/harland/kernel.elf && \
-	sudo cp $(BUILD_DIR)/initramfs.tar $(BUILD_DIR)/mnt/harland/initramfs.tar && \
-	echo '@echo -off' > $(BUILD_DIR)/startup.nsh && \
-	echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh && \
-	sudo cp $(BUILD_DIR)/startup.nsh $(BUILD_DIR)/mnt/startup.nsh && \
-	sudo umount $(BUILD_DIR)/mnt && \
-	sudo losetup -d $$LOOP_ESP && \
-	rmdir $(BUILD_DIR)/mnt
-	@echo "Created: $@ (GPT + ESP with kernel and initramfs, ready for EC2)"
+	python3 ./tools/mkec2disk.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(EC2_INITRAMFS)
+
+# One guarded boot on a real Nitro t3.micro: build, snapshot, apply, poll the
+# serial console for rzsh, save the log to boot-logs/, destroy everything.
+# Needs the DEFAULT AWS profile on account 412381736149. Never from CI.
+# EC2_BOOT_ARGS=--dry-run touches no AWS.
+ec2-boot:
+	./iac/run.sh $(EC2_BOOT_ARGS)
 
 # ============================================================================
 # Run targets
@@ -288,7 +281,8 @@ help:
 	@echo "  userspace   - Build indium's own userspace programs"
 	@echo "  initramfs-bin - Build and stage every package in initramfs.pkgs"
 	@echo "  iso         - Create bootable ISO with GRUB"
-	@echo "  ec2-disk    - Create EC2-compatible UEFI disk (GPT + ESP)"
+	@echo "  ec2-disk    - Create EC2-compatible UEFI disk (GPT + ESP), rootless"
+	@echo "  ec2-boot    - Boot it once on a t3.micro, save the serial log (iac/run.sh)"
 	@echo ""
 	@echo "Run Targets:"
 	@echo "  run         - Boot in QEMU (BIOS/GRUB mode, default)"
