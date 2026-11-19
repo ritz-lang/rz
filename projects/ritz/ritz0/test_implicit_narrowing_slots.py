@@ -127,6 +127,9 @@ REJECTED = {
 # the value. One per position, since each words its slot differently.
 # --------------------------------------------------------------------------
 
+# A struct with an array field, and one holding a pointer to it: 6 lines.
+_ARR = "struct A\n    x: [2]i32\n\nstruct Q\n    a: *A\n\n"
+
 DIAGNOSTICS = {
     # name: (body, line within f, column, slot words)
     "return": (_fn("return big()", tail=""), 2, 12, "`f` returns `i32`"),
@@ -146,6 +149,32 @@ DIAGNOSTICS = {
     # The pointer may be any expression: its pointee's field is the slot.
     "field_through_member_deref": ("struct Q\n    p: *P\n\nfn f(q: *Q) -> i32\n"
                                    "    (*q.p).x = big()\n    0\n", 5, 16, "`*q.p.x` is `i32`"),
+    # An element of an array field is a slot of its element type, `*p.x[..]`
+    # through a pointer (#4309); `op=` again at the `*`.
+    "field_index_through_deref": (_ARR + "fn f(p: *A) -> i32\n    (*p).x[1] = big()\n    0\n",
+                                  8, 17, "`*p.x[..]` is `i32`"),
+    "field_index_through_deref_op": (_ARR + "fn f(p: *A) -> i32\n    (*p).x[1] += big()\n    0\n",
+                                     8, 6, "`*p.x[..]` is `i32`"),
+    "field_index_through_member_deref": (_ARR + "fn f(q: *Q) -> i32\n    (*q.a).x[1] = big()\n    0\n",
+                                         8, 19, "`*q.a.x[..]` is `i32`"),
+    "field_index_local": (_ARR + "fn f() -> i32\n    var s = A { x: [0, 0] }\n    s.x[1] = big()\n    0\n",
+                          9, 14, "`s.x[..]` is `i32`"),
+    "field_index_local_op": (_ARR + "fn f() -> i32\n    var s = A { x: [0, 0] }\n    s.x[1] += big()\n    0\n",
+                             9, 5, "`s.x[..]` is `i32`"),
+    "field_index_auto_deref_op": (_ARR + "fn f(p: *A) -> i32\n    p.x[1] += big()\n    0\n",
+                                  8, 5, "`p.x[..]` is `i32`"),
+    "async_field_index_through_param_op": (_ARR + "async fn f(p: *A) -> i32\n    let w = await one()\n"
+                                           "    (*p).x[1] += big()\n    0\n\nasync fn one() -> i32\n    1\n",
+                                           9, 6, "`**self.p.x[..]` is `i32`"),
+    # A struct local the future holds is `*self.s`, not a pointer to deref:
+    # one `*` (#4309).
+    "async_local_field": ("async fn f() -> i32\n    var s: P = P { x: 0 }\n    let w = await one()\n"
+                          "    s.x = big()\n    0\n\nasync fn one() -> i32\n    1\n",
+                          4, 11, "`*self.s.x` is `i32`"),
+    "async_local_field_index_op": (_ARR + "async fn f() -> i32\n    var s: A = A { x: [0, 0] }\n"
+                                   "    let w = await one()\n    s.x[1] += big()\n    0\n\n"
+                                   "async fn one() -> i32\n    1\n",
+                                   10, 5, "`*self.s.x[..]` is `i32`"),
     # In an async fn the pointer param is a field of the future, `*self.p`,
     # once lowered; the store through it is judged all the same (#4288).
     "async_field_through_param": ("async fn f(p: *P) -> i32\n    let w = await one()\n"
@@ -209,6 +238,9 @@ ACCEPTED = {
     "assign_narrow_sum":      _fn("var b: u8 = 0\nb = k + 1"),
     "assign_mask":            _fn("var b: u8 = 0\nb = big() & 255"),
     "assign_explicit_cast":   _fn("var n: i32 = 0\nn = big() as i32\nG = big() as i32"),
+    # An element of an array field, through a pointer or not (#4309).
+    "assign_field_index_cast": _ARR + ("fn f(p: *A) -> i32\n    (*p).x[1] = big() as i32\n"
+                                       "    p.x[0] += big() as i32\n    0\n"),
     # call argument
     "arg_constant_fits":      _fn("take(7)\ntake_u8(200)"),
     "arg_mask":               _fn("take(big() & 255)"),

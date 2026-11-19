@@ -69,9 +69,12 @@ struct SlotWords
     # SN_PLACE shapes 5 and 6: the field of `base` that holds the pointer.
     mid: *u8
     mid_len: i32
-    # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`, 4 `*base.name`,
-    # 5 `*base.mid.name`, 6 `**base.mid.name`
+    # SN_PLACE: 0 bare, 1 `base.name`, 3 `*name`, 4 `*base.name`,
+    # 5 `*base.mid.name`, 6 `**base.mid.name` (2, `name[..]`, is now 0 indexed)
     shape: i32
+    # SN_PLACE: 1 when the place is an element of it, `<shape>[..]` (#4309:
+    # `*p.x[..]`, `s.x[..]`).
+    indexed: i32
     index: i32
 
 # Where a value is reported: ritz0's _value_span (a binary at its left
@@ -120,7 +123,7 @@ fn sn_print_slot(w: *SlotWords)
         sn_print(w.mid, w.mid_len)
         eprint_char('.')
     sn_print(w.name, w.name_len)
-    if w.shape == 2
+    if w.indexed == 1
         eprints_cstr(c"[..]")
     eprints_cstr(c"` is `")
 
@@ -151,6 +154,7 @@ fn sn_words(w: *SlotWords, kind: i32, name: *u8, len: i32)
     w.mid = null
     w.mid_len = 0
     w.shape = 0
+    w.indexed = 0
     w.index = 0
 
 # =============================================================================
@@ -182,7 +186,7 @@ fn sn_place_type(sm: *Sema, t: *Expr, w: *SlotWords) -> i32
         if t.left != null and t.left.kind == EXPR_IDENT
             w.name = t.left.ident_ptr
             w.name_len = t.left.ident_len
-            w.shape = 2
+            w.indexed = 1
         if t.right == null or t.right.kind == EXPR_RANGE
             return NARROW_UNKNOWN
         var kind: i32 = TYPE_VOID
@@ -225,35 +229,56 @@ pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
     else if k == STMT_INDEX_ASSIGN
         w.name = st.assign_target
         w.name_len = st.assign_target_len
-        w.shape = 2
+        w.indexed = 1
         var kind: i32 = TYPE_VOID
         var pointee: i32 = TYPE_VOID
         sema_named_elem(sm, st.assign_target, st.assign_target_len, @kind, @pointee)
         slot = narrow_known(kind)
-    else if k == STMT_LOCAL_FIELD_ASSIGN
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
         w.base = st.var_name
         w.base_len = st.var_name_len
         w.name = st.assign_target
         w.name_len = st.assign_target_len
         w.shape = 1
         let f: *StructField = sn_local_field(sm, st.var_name, st.var_name_len, st.assign_target, st.assign_target_len)
-        if f != null
-            slot = narrow_known(f.field_type)
-    else if k == STMT_MEMBER_ASSIGN
-        slot = sn_member_assign(sm, st, @w)
+        slot = sn_field_slot(sm, f, sn_is(k, STMT_LOCAL_FIELD_INDEX_ASSIGN), @w)
+    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        let f: *StructField = sn_member_field(sm, st, @w)
+        slot = sn_field_slot(sm, f, sn_is(k, STMT_MEMBER_INDEX_ASSIGN), @w)
+        if k == STMT_MEMBER_ASSIGN
+            sn_async_result(sm, st.if_cond as *Expr, @w)
     sn_check(sm, st.assign_value, slot, @w)
 
-# `(*pe).f = v`, the pointer expression `pe` in if_cond: the slot is the field
-# of the struct `pe` points at, whatever expression `pe` is (AGAST #4288: in
+fn sn_is(a: i32, b: i32) -> i32
+    if a == b
+        return 1
+    0
+
+# The slot field `f` is (null: unknown), or with `indexed` (`x.f[i] = v`, the
+# STMT_*_INDEX_ASSIGN forms, AGAST #4309) the slot an element of it is, as
+# `x.f[i]` on the right is typed; the place is then worded `<place>[..]`.
+fn sn_field_slot(sm: *Sema, f: *StructField, indexed: i32, w: *SlotWords) -> i32
+    if f == null
+        return NARROW_UNKNOWN
+    if indexed == 0
+        return narrow_known(f.field_type)
+    w.indexed = 1
+    var kind: i32 = TYPE_VOID
+    var pointee: i32 = TYPE_VOID
+    sema_field_elem(sm, f, @kind, @pointee)
+    narrow_known(kind)
+
+# `(*pe).f = v` (or `(*pe).f[i] = v`), the pointer expression `pe` in
+# if_cond: the field `f` of the struct `pe` points at, whatever expression `pe` is (AGAST #4288: in
 # an async fn the lowering makes a pointer param `p` the future's `self.p`).
 #
 # ritz0 names the place as written through the pointer, "`*p.f` is" (AGAST
 # #4240), "`*q.p.f` is" for `(*q.p).f`, and, as it renders the async
 # lowering's `self.<local>` (`*self.n`), "`**self.p.f` is" in a lowered poll.
-fn sn_member_assign(sm: *Sema, st: *Stmt, w: *SlotWords) -> i32
+fn sn_member_field(sm: *Sema, st: *Stmt, w: *SlotWords) -> *StructField
     let pe: *Expr = st.if_cond as *Expr
     if pe == null
-        return NARROW_UNKNOWN
+        return null
     w.name = st.assign_target
     w.name_len = st.assign_target_len
     if pe.kind == EXPR_IDENT
@@ -266,22 +291,23 @@ fn sn_member_assign(sm: *Sema, st: *Stmt, w: *SlotWords) -> i32
         w.mid = pe.ident_ptr
         w.mid_len = pe.ident_len
         w.shape = 5
+        # A pointer the future holds (a param `p`, `(*p).f`) is `**self.p.f`;
+        # a struct local it holds (`s.f`, lowered to `self.s`) is ritz0's
+        # `*self.s.f`, the shape-5 words (AGAST #4309).
         if name_eq(w.base, w.base_len, c"self", 4) == 1 and sn_poll_fn_len(sm) > 0
-            w.shape = 6
+            var mt: SemaTy
+            let mk: i32 = sema_expr_ty(sm, pe, @mt)
+            if mk == TYPE_PTR or mk == TYPE_REF or mk == TYPE_MUT_REF
+                w.shape = 6
     else
         w.name = null     # "the place assigned"
         w.name_len = 0
     var tn: *u8 = null
     var tn_len: i32 = 0
     sbk_receiver(sm, pe, @tn, @tn_len)
-    var slot: i32 = NARROW_UNKNOWN
-    if tn != null and tn_len > 0
-        let f: *StructField = sbk_struct_field(sm, tn, tn_len, st.assign_target, st.assign_target_len)
-        if f != null
-            slot = narrow_known(f.field_type)
-    if pe.kind == EXPR_IDENT
-        sn_async_result(sm, pe, w)
-    slot
+    if tn == null or tn_len <= 0
+        return null
+    sbk_struct_field(sm, tn, tn_len, st.assign_target, st.assign_target_len)
 
 # The length of `<f>` when the fn being walked is an async fn's lowered poll,
 # `fn <f>_poll(self: *<f>_Future)`, else 0.  The lowering sets no flag on the
@@ -310,6 +336,8 @@ fn sn_poll_fn_len(sm: *Sema) -> i32
 # `(*self).__result = v` takes this route too, and keeps its place wording,
 # "`*self.__result` is", unless its fn is `<f>_poll(self: *<f>_Future)`.
 fn sn_async_result(sm: *Sema, pe: *Expr, w: *SlotWords)
+    if pe == null or pe.kind != EXPR_IDENT or w.kind != SN_PLACE or w.name == null
+        return
     if name_eq(pe.ident_ptr, pe.ident_len, c"self", 4) == 0 or name_eq(w.name, w.name_len, c"__result", 8) == 0
         return
     let fl: i32 = sn_poll_fn_len(sm)
