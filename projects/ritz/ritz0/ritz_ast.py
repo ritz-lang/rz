@@ -434,6 +434,9 @@ class StructLit(Expr):
     name: str
     fields: List[tuple[str, Expr]]
     type_args: List[Type] = None  # Generic type arguments like <i32>
+    # `Msg` of a qualified named variant literal `Msg.V { .. }` (AGAST
+    # #4275); named_variants.py rewrites every such literal.
+    qualifier: str | None = None
 
     def __post_init__(self):
         if self.type_args is None:

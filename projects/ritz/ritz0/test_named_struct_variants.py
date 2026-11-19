@@ -15,7 +15,8 @@ The rule, on all three compilers: each field is named exactly once, in any
 order; the names map to the variant's field positions, so a named pattern
 binds exactly what the positional pattern binds, and a named literal builds
 exactly what the positional constructor builds.  Qualified patterns
-(`Msg.SetViewport { .. } =>`) follow the same rules.  A named form on a
+(`Msg.SetViewport { .. } =>`) and literals (`Msg.SetViewport { width: 1,
+height: 2 }`, AGAST #4275) follow the same rules.  A named form on a
 variant declared without field names, an unknown field, a repeated one or a
 missing one is refused at the variant's name.
 """
@@ -94,6 +95,43 @@ RUNS = {
     "pub fn main() -> i32\n"
     "    g(Log { level: 3 })\n",
     # A block-bodied arm and a statement-position match.
+    # Qualified construction (AGAST #4275), any order: `Msg.SetViewport { .. }`
+    # is `Msg.SetViewport(640, 480)`.
+    "build_qualified": ENUM
+    + "pub fn main() -> i32\n"
+    "    let m = Msg.SetViewport { height: 480, width: 640 }\n"
+    "    match m\n"
+    "        Msg.SetViewport { width, height } => if width == 640 and height == 480 then 3 else 1\n"
+    "        _ => 2\n",
+    # Qualified, as an argument, across lines, with a trailing comma.
+    "build_qualified_arg": ENUM
+    + "fn g(m: Msg) -> i32\n"
+    "    match m\n"
+    "        Mixed(a, b, c) => (a as i32) + (b as i32) - c\n"
+    "        _ => 0\n\n"
+    "pub fn main() -> i32\n"
+    "    g(Msg.Mixed {\n"
+    "        c: 4,\n"
+    "        b: 5,\n"
+    "        a: 2,\n"
+    "    })\n",
+    # A qualified literal as a match scrutinee, and a field access as an
+    # `if`/`while` condition: neither swallows the block that follows.
+    "qualified_scrutinee_and_conditions": ENUM
+    + "struct P\n"
+    "    ok: bool\n\n"
+    "pub fn main() -> i32\n"
+    "    let p = P { ok: true }\n"
+    "    var r: i32 = 0\n"
+    "    if p.ok\n"
+    "        r = 1\n"
+    "    while p.ok and r < 2\n"
+    "        r = r + 1\n"
+    "    match Msg.SetViewport { width: 1, height: 0 }\n"
+    "        SetViewport(w, h) =>\n"
+    "            r = r + w - h\n"
+    "        _ => r = 9\n"
+    "    r\n",
     "block_arm": ENUM
     + "pub fn main() -> i32\n"
     "    var r: i32 = 0\n"
@@ -146,6 +184,23 @@ REFUSED = {
     ),
     "lit_tuple_variant": (
         "fn f() -> Msg\n    ^Reload { x: 1 }\n",
+        "variant `Reload` has no named fields",
+    ),
+    # Qualified construction (AGAST #4275): located where the form begins.
+    "qlit_missing": (
+        "fn f() -> Msg\n    ^Msg.SetViewport { width: 1 }\n",
+        "missing field `height` of variant `SetViewport`",
+    ),
+    "qlit_unknown": (
+        "fn f() -> Msg\n    ^Msg.SetViewport { width: 1, height: 2, depth: 3 }\n",
+        "variant `SetViewport` has no field `depth`",
+    ),
+    "qlit_twice": (
+        "fn f() -> Msg\n    ^Msg.SetViewport { width: 1, width: 2 }\n",
+        "field `width` of variant `SetViewport` named twice",
+    ),
+    "qlit_tuple_variant": (
+        "fn f() -> Msg\n    ^Msg.Reload { x: 1 }\n",
         "variant `Reload` has no named fields",
     ),
 }

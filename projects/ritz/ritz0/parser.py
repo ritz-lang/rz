@@ -217,6 +217,58 @@ class Parser:
         """Check if current token is one of the given types."""
         return self._current().type in types
 
+    def _parse_struct_lit_fields(self) -> list:
+        """`{ field: value, ... }`: the (name, value) pairs of a struct
+        literal, from its opening brace through its closing one."""
+        self._advance()
+        fields = []
+        # Skip any newlines/indentation after opening brace
+        while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            self._advance()
+        while not self._at(TokenType.RBRACE, TokenType.EOF):
+            # Skip any newlines/indentation between fields
+            while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                self._advance()
+            if self._at(TokenType.RBRACE):
+                break
+            # Parse field name
+            if not self._at(TokenType.IDENT):
+                raise ParseError("Expected field name in struct literal", self._current().span)
+            field_name = self._advance().value
+
+            self._expect(TokenType.COLON, "Expected ':' after field name in struct literal")
+
+            # Parse field value
+            field_value = self.parse_expr()
+            fields.append((field_name, field_value))
+
+            # Skip any newlines after field value
+            while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                self._advance()
+
+            if self._at(TokenType.COMMA):
+                self._advance()
+                # Skip any newlines after comma
+                while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+                    self._advance()
+                if self._at(TokenType.RBRACE):
+                    break
+            elif not self._at(TokenType.RBRACE):
+                raise ParseError("Expected ',' or '}' in struct literal", self._current().span)
+        self._expect(TokenType.RBRACE, "Expected '}' to close struct literal")
+        return fields
+
+    def _at_named_fields(self) -> bool:
+        """At `{ name:` (newlines allowed after the brace): a struct
+        literal's fields, not a block.  `Msg.V {` builds a variant only
+        then (AGAST #4275)."""
+        if not self._at(TokenType.LBRACE):
+            return False
+        i = 1
+        while self._peek_at(i, TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
+            i += 1
+        return self._peek_at(i, TokenType.IDENT) and self._peek_at(i + 1, TokenType.COLON)
+
     def _peek_at(self, offset: int, *types: TokenType) -> bool:
         """Check if token at offset is one of the given types."""
         return self._peek(offset).type in types
@@ -1238,6 +1290,15 @@ class Parser:
                         self._expect(TokenType.RPAREN)
                         expr = rast.MethodCall(expr.span, expr, field_tok.value, args,
                                                field_tok.span)
+                    elif (isinstance(expr, rast.Ident) and not hasattr(expr, '_type_args')
+                          and self._at_named_fields()):
+                        # `Msg.SetViewport { width: 1, height: 2 }`: a
+                        # qualified named variant literal (docs/ENUM_VARIANTS.md
+                        # §5, AGAST #4275); named_variants.py makes it
+                        # `Msg.SetViewport(1, 2)`.
+                        fields = self._parse_struct_lit_fields()
+                        expr = rast.StructLit(expr.span, field_tok.value, fields,
+                                              qualifier=expr.name)
                     else:
                         expr = rast.Field(expr.span, expr, field_tok.value, field_tok.span)
 
@@ -1337,43 +1398,7 @@ class Parser:
 
             # Check for struct literal: Name { field: value, ... } or Name<T> { ... }
             if self._at(TokenType.LBRACE):
-                self._advance()
-                fields = []
-                # Skip any newlines/indentation after opening brace
-                while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
-                    self._advance()
-                while not self._at(TokenType.RBRACE, TokenType.EOF):
-                    # Skip any newlines/indentation between fields
-                    while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
-                        self._advance()
-                    if self._at(TokenType.RBRACE):
-                        break
-                    # Parse field name
-                    if not self._at(TokenType.IDENT):
-                        raise ParseError("Expected field name in struct literal", self._current().span)
-                    field_name = self._advance().value
-
-                    self._expect(TokenType.COLON, "Expected ':' after field name in struct literal")
-
-                    # Parse field value
-                    field_value = self.parse_expr()
-                    fields.append((field_name, field_value))
-
-                    # Skip any newlines after field value
-                    while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
-                        self._advance()
-
-                    if self._at(TokenType.COMMA):
-                        self._advance()
-                        # Skip any newlines after comma
-                        while self._at(TokenType.NEWLINE, TokenType.INDENT, TokenType.DEDENT):
-                            self._advance()
-                        if self._at(TokenType.RBRACE):
-                            break
-                    elif not self._at(TokenType.RBRACE):
-                        raise ParseError("Expected ',' or '}' in struct literal", self._current().span)
-
-                self._expect(TokenType.RBRACE, "Expected '}' to close struct literal")
+                fields = self._parse_struct_lit_fields()
                 return rast.StructLit(span, name, fields, type_args=type_args)
             elif type_args:
                 # We have type_args but no struct literal - this is a generic identifier

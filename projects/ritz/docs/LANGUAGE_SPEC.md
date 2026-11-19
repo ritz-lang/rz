@@ -4315,8 +4315,9 @@ A named-field variant may also be matched and built **by name** (AGAST
 positions, so `SetViewport { height: 480, width: 640 }` is
 `SetViewport(640, 480)`, its values evaluated in field order, and
 `SetViewport { height, width }` binds what `SetViewport(width, height)` does.
-Qualified patterns (`Msg.SetViewport { width, height }`) follow the same rule
-(§8.2):
+Qualified patterns (`Msg.SetViewport { width, height }`, §8.2) and literals
+(`Msg.SetViewport { width: 640, height: 480 }`, AGAST #4275) follow the same
+rule:
 
 ```ritz
 enum Msg
@@ -4332,7 +4333,8 @@ fn area(m: Msg) -> i32
 
 fn main() -> i32
     let m = SetViewport { height: 480, width: 640 }
-    if area(m) == 307200 then 0 else 1
+    let q = Msg.SetViewport { width: 2, height: 3 }
+    if area(m) == 307200 and area(q) == 6 then 0 else 1
 ```
 
 Use `_` for a field you do not need:

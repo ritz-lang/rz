@@ -263,6 +263,7 @@ Qualified forms (`Msg.SetViewport(w, h)`) follow the same rules.
 ```ritz
 let a = SetViewport(640, 480)                    # positional
 let b = SetViewport { width: 640, height: 480 }  # named (struct variants only)
+let q = Msg.SetViewport { height: 480, width: 640 }  # named, qualified
 let c = Msg.Stop                                 # bare
 ```
 
@@ -271,8 +272,10 @@ same way as a named pattern: every field must be present exactly once. Both
 forms lower to identical IR: every compiler rewrites the named form into the
 positional one (ritz0 `named_variants.py`, ritz1 `named_variants.ritz`, AGAST
 #4187), so the values are evaluated in field order. The qualified literal
-`Msg.SetViewport { .. }` is not implemented yet (a parse error in every
-compiler); write the unqualified form.
+`Msg.SetViewport { .. }` (AGAST #4275) becomes `Msg.SetViewport(640, 480)`
+the same way; its errors are the unqualified form's, located at `Msg`. It is
+a literal only when a `name:` follows the brace, so a field access is never
+taken for one.
 
 ---
 
@@ -286,7 +289,7 @@ gated on closing part of that gap.
 | Bare variants | yes | yes |
 | Single-field tuple variants | yes | yes; user enums construct (`Holds(x)`, unqualified) and bind them since #1797 |
 | Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | yes (#1295): every field constructed and bound at its ritz0 offset |
-| Struct variants | yes; named patterns and construction since #4187 | parsed and laid out (#1797); constructed and matched positionally (#1295) and by name, `V { a: 1 }` / `V { a } =>` (#4187) |
+| Struct variants | yes; named patterns and construction since #4187, qualified construction since #4275 | parsed and laid out (#1797); constructed and matched positionally (#1295) and by name, `V { a: 1 }` / `V { a } =>` (#4187), `E.V { a: 1 }` (#4275) |
 | Payload types retained by parser | yes | yes, in the enum tracker (#1797) |
 | Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
 | Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). Non-generic user enums: the same ritz0 layout from the recorded variant fields (#1797); all-unit stays `{ i8 }` |

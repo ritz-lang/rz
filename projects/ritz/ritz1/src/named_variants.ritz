@@ -8,7 +8,8 @@
 #             height: i32
 #
 # may be matched as `SetViewport { height, width } =>` (or `Msg.SetViewport
-# { .. } =>`) and built as `SetViewport { width: 1, height: 2 }`
+# { .. } =>`) and built as `SetViewport { width: 1, height: 2 }` (or
+# `Msg.SetViewport { .. }`, AGAST #4275)
 # (docs/ENUM_VARIANTS.md §4-5).  Field names are sugar over the positional
 # forms, so each is turned into its positional equivalent, as ritz0's
 # named_variants.py does, before any other pass reads it:
@@ -223,6 +224,40 @@ fn nv_pattern(f: *NamedForm, ei: i32, vi: i32) -> i32
     free(order as *u8)
     bad
 
+# Literal `f` becomes, in place, the positional form its values `args` (in
+# order) build: `V(..)`, EXPR_CALL; `E.V(..)`, EXPR_METHOD on the `E` its
+# parser left in `left` (AGAST #4275).
+fn nv_literal_call(f: *NamedForm, args: *Expr)
+    let e: *Expr = f.lit
+    if f.qual != null
+        e.kind = EXPR_METHOD
+        e.args = args
+        return
+    e.kind = EXPR_CALL
+    e.func_name = e.ident_ptr
+    e.func_name_len = e.ident_len
+    e.args = args
+    e.call_type_suffix = null
+    e.call_type_suffix_len = 0
+
+# `E.Nope { a: 1 }`: `E.Nope(1)`, values as written, for the error that
+# draws (AGAST #4275).
+fn nv_literal_as_written(f: *NamedForm)
+    var head: *Expr = null
+    var tail: *Expr = null
+    var fi: *FieldInit = f.lit.args as *FieldInit
+    while fi != null
+        let v: *Expr = fi.value
+        let nx: *FieldInit = fi.next
+        v.next = null
+        if tail == null
+            head = v
+        else
+            tail.next = v
+        tail = v
+        fi = nx
+    nv_literal_call(f, head)
+
 # `V { a: 1, b: 2 }` -> `V(1, 2)`, in place.
 fn nv_literal(f: *NamedForm, ei: i32, vi: i32) -> i32
     let e: *Expr = f.lit
@@ -261,12 +296,7 @@ fn nv_literal(f: *NamedForm, ei: i32, vi: i32) -> i32
             else
                 tail.next = v
             tail = v
-        e.kind = EXPR_CALL
-        e.func_name = e.ident_ptr
-        e.func_name_len = e.ident_len
-        e.args = head
-        e.call_type_suffix = null
-        e.call_type_suffix_len = 0
+        nv_literal_call(f, head)
     free(vals as *u8)
     free(wn as *u8)
     free(wl as *u8)
@@ -285,6 +315,13 @@ pub fn named_variants_resolve(m: *Module) -> i32
             # No such variant: emitter_match's unknown-variant error.
             if ei >= 0
                 errors = errors + nv_pattern(f, ei, vi)
+        else if f.lit.kind == EXPR_STRUCT_LIT and f.qual != null
+            # `E.V { .. }` names a variant, never a struct.
+            let ei: i32 = nv_find(f, @vi)
+            if ei >= 0
+                errors = errors + nv_literal(f, ei, vi)
+            else
+                nv_literal_as_written(f)
         else if f.lit.kind == EXPR_STRUCT_LIT and nv_is_struct(m, f) == 0
             let ei: i32 = nv_find(f, @vi)
             # No such variant either: type_name_check's unknown type.

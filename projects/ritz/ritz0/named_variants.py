@@ -9,11 +9,12 @@ A struct-declared variant
             height: i32
 
 may be matched as `SetViewport { height, width } =>` (or qualified,
-`Msg.SetViewport { .. }`) and built as `SetViewport { width: 1, height: 2 }`.
+`Msg.SetViewport { .. }`) and built as `SetViewport { width: 1, height: 2 }`
+(or `Msg.SetViewport { .. }`, AGAST #4275).
 Field names are sugar over the positional forms, so this pass, run on the
 merged module after import resolution, rewrites each into its positional
 equivalent: the pattern's bindings are reordered into declaration order, and
-the literal becomes the call `SetViewport(1, 2)`.  Every later pass sees only
+the literal becomes the call `SetViewport(1, 2)` (`Msg.SetViewport(1, 2)`).  Every later pass sees only
 positional forms.  ritz1 does the same mapping in its emitter
 (ritz1/src/struct_variants.ritz).
 
@@ -103,17 +104,28 @@ def rewrite_named_variants(module: rast.Module) -> List[str]:
         node.field_names = None
 
     def literal(node: rast.StructLit):
-        if node.name in structs or node.type_args:
+        q = node.qualifier
+        if q is None and (node.name in structs or node.type_args):
             return node
-        variant = variant_for(node.name, None)
+
+        def build(args):
+            # The positional form the parser makes of `V(..)` / `E.V(..)`.
+            if q is None:
+                return rast.Call(node.span, rast.Ident(node.span, node.name), args)
+            return rast.MethodCall(node.span, rast.Ident(node.span, q), node.name,
+                                   args, node.span)
+
+        variant = variant_for(node.name, q)
         if variant is None:
-            return node  # unknown type: type_names.py says so
+            if q is None:
+                return node  # unknown type: type_names.py says so
+            # `E.Nope { .. }`: whatever `E.Nope(..)` is told.
+            return build([v for (_, v) in node.fields])
         order, err = _order(variant, [n for (n, _) in node.fields])
         if err:
             errors.append(f"{node.span}: {err}")
             return node
-        return rast.Call(node.span, rast.Ident(node.span, node.name),
-                         [node.fields[i][1] for i in order])
+        return build([node.fields[i][1] for i in order])
 
     skip = rast.Type
 
