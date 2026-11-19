@@ -341,8 +341,12 @@ def test_corrected_program_still_compiles(tmp_path, row):
 
 def test_no_bare_value_error_left_in_the_emitter():
     """LARB review/5 N4: every site is a SourceError or an InternalError."""
-    src = (Path(__file__).parent / "emitter_llvmlite.py").read_text()
-    assert src.count("raise ValueError") == 0
+    here = Path(__file__).parent
+    # The emitter split moves code into emitter/*.py (AGAST #1826).
+    sources = [here / "emitter_llvmlite.py"] + [
+        p for p in sorted((here / "emitter").glob("*.py")) if not p.name.startswith("test_")]
+    for path in sources:
+        assert path.read_text().count("raise ValueError") == 0, path.name
 
 
 def test_internal_error_is_not_dressed_as_a_user_error():
