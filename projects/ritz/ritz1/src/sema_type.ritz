@@ -12,8 +12,9 @@
 # agree, a struct literal (for bool_check, #3502), and an if / match
 # expression whose arm the walk typed as a struct (#3042).  And a receiver's
 # shapes, which deref_field typed on its own until AGAST #3810: `*p` of a
-# pointer to a struct, a struct element `a[i]` (sema_elem_ty), a method call's
-# result, `E.V(..)` and a `c?`'s Ok / Some struct (#3974).  (A deref step's
+# pointer to a struct, an element `a[i]` (sema_elem_ty, Sema's one element
+# typer: a struct, a scalar, a pointer, or an N-D array's row, #3943 / #4259),
+# a method call's result, `E.V(..)` and a `c?`'s Ok / Some struct (#3974).  (A deref step's
 # `S_deref(..)` is a call like any other, found by its symbol.)  Anything else
 # is TYPE_UNKNOWN until a check move needs it.
 #
@@ -41,10 +42,13 @@ fn sema_ty_set(t: *SemaTy, kind: i32, name: *u8, name_len: i32, pointee: i32, fn
     t.name_len = name_len
     t.pointee = pointee
     t.fn_sig = fn_sig
+    t.shape = null
     kind
 
 fn sema_ty_copy(dst: *SemaTy, src: *SemaTy) -> i32
     sema_ty_set(dst, src.kind, src.name, src.name_len, src.pointee, src.fn_sig)
+    dst.shape = src.shape
+    dst.kind
 
 fn sema_ty_none(t: *SemaTy) -> i32
     sema_ty_unknown(t)
@@ -62,10 +66,16 @@ fn sema_is_int_lit(e: *Expr) -> i32
 pub fn sema_name_ty(sm: *Sema, name: *u8, len: i32, t: *SemaTy) -> i32
     let v: *SemaVar = sema_find_local(sm, name, len)
     if v != null
+        if v.kind == TYPE_ARRAY
+            sema_arr_ty(t, v.index_elem, v.type_name, v.type_name_len, v.shape)
+            t.fn_sig = v.fn_sig
+            return TYPE_ARRAY
         return sema_ty_set(t, v.kind, v.type_name, v.type_name_len, v.pointee, v.fn_sig)
     var g: *GlobalVarDef = sm.module.globals
     while g != null
         if name_eq(g.name, g.name_len, name, len) == 1
+            if g.var_type == TYPE_ARRAY
+                return sema_arr_ty(t, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len, g.array_shape)
             # `var g: *S` names S as its pointee, not its type (AGAST #1554).
             if g.type_name == null and g.var_type == TYPE_PTR and g.pointee_type == TYPE_STRUCT
                 return sema_ty_set(t, g.var_type, g.pointee_type_name, g.pointee_type_name_len, g.pointee_type, null)
@@ -166,6 +176,8 @@ pub fn sema_field_ty(sm: *Sema, r: *SemaTy, name: *u8, len: i32, t: *SemaTy) -> 
     if idx < 0
         return sema_ty_none(t)
     let f: *StructField = get_field_type(st, idx)
+    if f.field_type == TYPE_ARRAY
+        return sema_arr_ty(t, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, f.array_shape)
     var pointee: i32 = TYPE_VOID
     if f.field_type == TYPE_PTR
         pointee = f.ptr_pointee
@@ -227,67 +239,95 @@ fn sema_unary_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
             return sema_ty_set(t, TYPE_STRUCT, o.name, o.name_len, TYPE_VOID, null)
     sema_ty_none(t)
 
-# --- A receiver's shapes (AGAST #3810) -------------------------------------
+# --- One element typer: what `x[i]` is (AGAST #3810, #3943, #4259) ----------
+#
+# `x[i]`, and what `for x in b` binds, is typed here and nowhere else on Sema:
+# sema_expr_ty, ref_check's rs_ty (whose steps read sema_arr_elem), the slot
+# rules' sema_named_elem / sema_index_slot and let_check's let_through_elem
+# (sema_buffer_ty) all take their element from it.
+#
+# An array is typed by its element: kind TYPE_ARRAY, pointee the element's
+# kind (the leaf T of an N-D `[N][M]..T`), name the leaf's struct, shape its N-D
+# shape (null for one dimension).  An N-D array's `x[i]` is a row, one
+# dimension fewer (#2555), and only the full-rank `x[i][j]..` is its leaf T.
 
-# A struct element of `b` (`b[i]`, or what `for x in b` binds): of a `[N]S`
-# local, global or field, of a `*S`, or of a Vec$S (through a `@Vec<S>` /
-# `*Vec<S>` too).  Unknown for any other element.
+# `t`, an array of `elem` (its struct `name`), of N-D `shape` or null.  An N-D
+# array's element is its leaf (a parsed `[N][M]T` says TYPE_ARRAY there).
+pub fn sema_arr_ty(t: *SemaTy, elem: i32, name: *u8, len: i32, shape: *ArrayShape) -> i32
+    if shape != null and shape.rank >= 2
+        sema_ty_set(t, TYPE_ARRAY, shape.leaf_name, shape.leaf_name_len, shape.leaf_type, null)
+        t.shape = shape
+        return TYPE_ARRAY
+    sema_ty_set(t, TYPE_ARRAY, name, len, elem, null)
+
+# `a[i]` of the array `a`, typed as above: a row of an N-D array, else its
+# element (a struct, a scalar, or a pointer, to the struct its name says).
+# Unknown when the element isn't known.
+pub fn sema_arr_elem(a: *SemaTy, t: *SemaTy) -> i32
+    let sh: *ArrayShape = a.shape
+    if sh != null and sh.rank >= 2
+        var row: *ArrayShape = null
+        if sh.rank > 2
+            row = nd_shape_from(sh, 1)
+        return sema_arr_ty(t, sh.leaf_type, sh.leaf_name, sh.leaf_name_len, row)
+    let k: i32 = a.pointee
+    if k == TYPE_VOID or k == TYPE_UNKNOWN or k == TYPE_PTR_PTR
+        return sema_ty_none(t)
+    if k == TYPE_ARRAY
+        # A row Sema has no shape for: an array, of what it can't say.
+        return sema_ty_set(t, TYPE_ARRAY, a.name, a.name_len, TYPE_VOID, null)
+    if sema_is_ptr_kind(k) == 1 and a.name_len > 0
+        return sema_ty_set(t, k, a.name, a.name_len, TYPE_STRUCT, null)
+    sema_ty_set(t, k, a.name, a.name_len, TYPE_VOID, null)
+
+# The element of a Vec, Span or String, or of what a pointer or reference to
+# one points at, `bt`: its kind (a String's bytes are u8, a Vec's or Span's
+# what its `data` / `ptr` field points at) and struct name.  Unknown for
+# anything else.  through_named_elem's sees_through / indexes_itself.
+pub fn sema_buffer_ty(sm: *Sema, bt: *SemaTy, t: *SemaTy) -> i32
+    let kind: i32 = bt.kind
+    if kind != TYPE_STRUCT and (sema_is_ptr_kind(kind) == 0 or bt.pointee != TYPE_STRUCT)
+        return sema_ty_none(t)
+    if name_is_indexable(bt.name, bt.name_len) == 0
+        return sema_ty_none(t)
+    if name_eq(bt.name, bt.name_len, c"String", 6) == 1
+        return sema_ty_set(t, TYPE_U8, null, 0, TYPE_VOID, null)
+    let st: *StructDef = sema_find_struct(sm, bt.name, bt.name_len)
+    if st == null
+        return sema_ty_none(t)
+    var idx: i32 = find_field_index(st, c"data", 4)
+    if idx < 0
+        idx = find_field_index(st, c"ptr", 3)
+    if idx < 0
+        return sema_ty_none(t)
+    let f: *StructField = get_field_type(st, idx)
+    sema_ty_set(t, ptr_field_elem_kind(f), f.field_type_name, f.field_type_name_len, TYPE_VOID, null)
+
+# The element of `b` (`b[i]`, or what `for x in b` binds): of an array local,
+# global or field (a row of an N-D one), of the `[N]T` a `*[N]T` local's view
+# reads, of a Vec, Span or String (or a pointer to one), or what a `*T` points
+# at.  Unknown for any other.
 pub fn sema_elem_ty(sm: *Sema, b: *Expr, t: *SemaTy) -> i32
     if b == null
         return sema_ty_none(t)
-    if b.kind == EXPR_IDENT
-        let v: *SemaVar = sema_find_local(sm, b.ident_ptr, b.ident_len)
-        if v != null and v.kind == TYPE_ARRAY
-            if v.elem == TYPE_STRUCT and v.type_name_len > 0
-                return sema_ty_set(t, TYPE_STRUCT, v.type_name, v.type_name_len, TYPE_VOID, null)
-            if sema_is_ptr_kind(v.elem) == 1 and v.type_name_len > 0
-                return sema_ty_set(t, v.elem, v.type_name, v.type_name_len, TYPE_STRUCT, null)
-            return sema_ty_none(t)
-        if v == null
-            var g: *GlobalVarDef = sm.module.globals
-            while g != null
-                if name_eq(g.name, g.name_len, b.ident_ptr, b.ident_len) == 1
-                    if g.var_type == TYPE_ARRAY and g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
-                        return sema_ty_set(t, TYPE_STRUCT, g.array_elem_type_name, g.array_elem_type_name_len, TYPE_VOID, null)
-                    g = null
-                else
-                    g = g.next
-    if b.kind == EXPR_MEMBER and b.left != null
-        var r: SemaTy
-        sema_expr_ty(sm, b.left, @r)
-        let st: *StructDef = sema_recv_struct(sm, @r)
-        if st != null
-            let fi: i32 = find_field_index(st, b.ident_ptr, b.ident_len)
-            if fi >= 0
-                let f: *StructField = get_field_type(st, fi)
-                if f.field_type == TYPE_ARRAY
-                    if f.array_elem_type == TYPE_STRUCT and f.array_elem_type_name_len > 0
-                        return sema_ty_set(t, TYPE_STRUCT, f.array_elem_type_name, f.array_elem_type_name_len, TYPE_VOID, null)
-                    return sema_ty_none(t)
     var bt: SemaTy
     sema_expr_ty(sm, b, @bt)
-    # A Vec's element is what its `data: *T` points at, a Span's what its
-    # `ptr: *T` does (AGAST #3973).
-    let held: i32 = (bt.kind == TYPE_STRUCT or (sema_is_ptr_kind(bt.kind) == 1 and bt.pointee == TYPE_STRUCT)) as i32
-    var buf: *u8 = null
-    var buf_len: i32 = 0
-    if held == 1 and bt.name_len > 4 and name_eq(bt.name, 4, c"Vec$", 4) == 1
-        buf = c"data"
-        buf_len = 4
-    else if held == 1 and bt.name_len > 5 and name_eq(bt.name, 5, c"Span$", 5) == 1
-        buf = c"ptr"
-        buf_len = 3
-    if buf != null
-        let vst: *StructDef = sema_find_struct(sm, bt.name, bt.name_len)
-        if vst != null
-            let di: i32 = find_field_index(vst, buf, buf_len)
-            if di >= 0
-                let df: *StructField = get_field_type(vst, di)
-                if df.field_type == TYPE_PTR and df.field_type_name_len > 0
-                    return sema_ty_set(t, TYPE_STRUCT, df.field_type_name, df.field_type_name_len, TYPE_VOID, null)
-        return sema_ty_none(t)
+    if bt.kind == TYPE_ARRAY
+        return sema_arr_elem(@bt, t)
+    if b.kind == EXPR_IDENT
+        # A `*[N]T` (`@[N]T`, `@&[N]T`): its `[N]T`'s element.
+        let v: *SemaVar = sema_find_local(sm, b.ident_ptr, b.ident_len)
+        if v != null and sema_is_ptr_kind(v.kind) == 1 and v.index_elem != TYPE_VOID
+            var a: SemaTy
+            sema_arr_ty(@a, v.index_elem, v.type_name, v.type_name_len, v.shape)
+            return sema_arr_elem(@a, t)
+    if sema_buffer_ty(sm, @bt, t) != TYPE_UNKNOWN
+        return t.kind
     if sema_is_ptr_kind(bt.kind) == 1 and bt.pointee == TYPE_STRUCT and bt.name_len > 0
         return sema_ty_set(t, TYPE_STRUCT, bt.name, bt.name_len, TYPE_VOID, null)
+    # A `*T` buffer of scalars: an `@T` is one value (index_refuse refuses it).
+    if bt.kind == TYPE_PTR and primitive_name_len(bt.pointee) > 0
+        return sema_ty_set(t, bt.pointee, null, 0, TYPE_VOID, null)
     sema_ty_none(t)
 
 fn sema_index_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
@@ -498,17 +538,10 @@ pub fn name_is_indexable(name: *u8, len: i32) -> i32
 # answers for one: a String's bytes are u8, a Vec's or Span's the pointee of its
 # `data` / `ptr` field.  TYPE_UNKNOWN when the struct or field isn't found.
 pub fn sema_buffer_elem(sm: *Sema, name: *u8, len: i32) -> i32
-    if name_eq(name, len, c"String", 6) == 1
-        return TYPE_U8
-    let st: *StructDef = sema_find_struct(sm, name, len)
-    if st == null
-        return TYPE_UNKNOWN
-    var idx: i32 = find_field_index(st, c"data", 4)
-    if idx < 0
-        idx = find_field_index(st, c"ptr", 3)
-    if idx < 0
-        return TYPE_UNKNOWN
-    ptr_field_elem_kind(get_field_type(st, idx))
+    var bt: SemaTy
+    sema_ty_set(@bt, TYPE_STRUCT, name, len, TYPE_VOID, null)
+    var t: SemaTy
+    sema_buffer_ty(sm, @bt, @t)
 
 # The element kind of `v[i]` when `v`, of kind `kind` (pointing at `pointee`,
 # naming `name`), is a Vec, Span or String or one level of pointer or
@@ -537,8 +570,13 @@ pub fn sx_view_elem_ok(sm: *Sema, elem: i32, name: *u8, len: i32) -> i32
 
 # T of the `[N]T` the `*[N]T` / `@[N]T` / `@&[N]T` local or param `v` points at,
 # when the emitter gives it a `p#` view (add_array_view); TYPE_VOID otherwise.
+#
+# A pointer to an N-D array is a plane pointer (#2570), whose `p[i]` is a row:
+# it has no view (AGAST #4259).
 pub fn sema_view_elem(sm: *Sema, v: *SemaVar) -> i32
     if v.kind != TYPE_PTR and v.kind != TYPE_REF and v.kind != TYPE_MUT_REF
+        return TYPE_VOID
+    if v.shape != null and v.shape.rank >= 2
         return TYPE_VOID
     if v.index_elem == TYPE_VOID or sx_view_elem_ok(sm, v.index_elem, v.type_name, v.type_name_len) == 0
         return TYPE_VOID
@@ -680,17 +718,20 @@ pub fn sema_index_note_decl(sm: *Sema, st: *Stmt)
         if v.kind == TYPE_PTR or v.kind == TYPE_REF or v.kind == TYPE_MUT_REF
             # Judged before the name is in scope, as `let q = q` reads the outer q.
             sm.scope_top = sm.scope_top - 1
-            v.index_elem = sx_init_elem(sm, st.var_init)
+            v.index_elem = sx_init_elem(sm, st.var_init, @v.shape)
             sm.scope_top = sm.scope_top + 1
         return
     if st.var_type == TYPE_ARRAY
         v.index_elem = st.var_array_elem_type
+        v.shape = st.var_array_shape
     else if (st.var_type == TYPE_PTR or st.var_type == TYPE_REF or st.var_type == TYPE_MUT_REF) and st.var_pointee_type == TYPE_ARRAY
         v.index_elem = st.var_pointee_array_elem_type
+        v.shape = st.var_pointee_array_shape
 
-# The element of the `[N]T` initialiser `init` points at: a pointer local
-# that has one, under any `+ k` / `- k`, or `@a` / `@&a` of a `[N]T` local.
-fn sx_init_elem(sm: *Sema, init: *Expr) -> i32
+# The element of the `[N]T` initialiser `init` points at (and its N-D shape
+# into *shape): a pointer local that has one, under any `+ k` / `- k`, or
+# `@a` / `@&a` of a `[N]T` local.
+fn sx_init_elem(sm: *Sema, init: *Expr, shape: **ArrayShape) -> i32
     var x: *Expr = init
     while x != null and x.kind == EXPR_BINARY and (x.op == OP_ADD or x.op == OP_SUB)
         x = x.left
@@ -699,6 +740,7 @@ fn sx_init_elem(sm: *Sema, init: *Expr) -> i32
     if x.kind == EXPR_UNARY and (x.op == OP_ADDR or x.op == OP_ADDR_MUT) and x.operand != null and x.operand.kind == EXPR_IDENT
         let a: *SemaVar = sema_find_local(sm, x.operand.ident_ptr, x.operand.ident_len)
         if a != null and a.kind == TYPE_ARRAY
+            *shape = a.shape
             return a.index_elem
         return TYPE_VOID
     if x.kind != EXPR_IDENT
@@ -706,6 +748,7 @@ fn sx_init_elem(sm: *Sema, init: *Expr) -> i32
     let p: *SemaVar = sema_find_local(sm, x.ident_ptr, x.ident_len)
     if p == null or p.kind == TYPE_ARRAY
         return TYPE_VOID
+    *shape = p.shape
     p.index_elem
 
 # The param sema_walk just bound.
@@ -715,5 +758,7 @@ pub fn sema_index_note_param(sm: *Sema, p: *Param)
         return
     if p.param_type == TYPE_ARRAY
         v.index_elem = p.param_array_elem_type
+        v.shape = p.param_array_shape
     else if (p.param_type == TYPE_PTR or p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF) and p.param_pointee_type == TYPE_ARRAY
         v.index_elem = p.param_pointee_array_elem_type
+        v.shape = p.param_pointee_array_shape

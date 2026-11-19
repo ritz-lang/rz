@@ -163,6 +163,17 @@ fn slot() -> i32
     match s
         Some(v) => v
         Nada => 0
+
+fn elems(pb: *u8, bs: [2]bool) -> i32
+    var m: [2][3]i32
+    var cube: [2][2][3]i32
+    let a: i32 = m[1][2] + cube[1][0][2]
+    let c: u8 = pb[3]
+    let f: bool = bs[1]
+    let r = @cube[1]
+    if f
+        return 1
+    a + c as i32
 """
 
 # (line, col, expr kind, Sema's type kind[, name]): what the dump must say.
@@ -219,13 +230,19 @@ WANTED = [
     (89, 26, E_IDENT, I32),           # y, its second
     (90, 24, E_IDENT, STRUCT, "F"),   # w
     (92, 22, E_IDENT, I32),           # x, bound off w
+    # One element typer, `x[i]` of anything indexable (AGAST #3943, #4259):
+    # a scalar element, and an N-D array's row (one dimension fewer) and leaf.
+    (36, 18, E_INDEX, I32),           # arr[1]
+    (108, 18, E_INDEX, I32),          # m[1][2]
+    (108, 28, E_INDEX, I32),          # cube[1][0][2]
+    (109, 17, E_INDEX, U8),           # pb[3] through a *u8
+    (110, 19, E_INDEX, BOOL),         # bs[1]
+    (111, 14, E_INDEX, ARRAY),        # cube[1], a [2][3]i32 plane
 ]
 
-# Shapes Sema leaves unknown: an index of a scalar array (#3510's sema_index
-# types those), a `for` variable over a range, a catch-all arm binding and a
+# Shapes Sema leaves unknown: a `for` variable over a range, a catch-all arm binding and a
 # scalar `:&` param (take's `b`, line 13: `*b` is how it is read and written).
 UNKNOWN_AT = [
-    (36, 18, E_INDEX),                 # arr[1]
     (39, 22, E_IDENT),                 # k
     (41, 18, E_IDENT),                 # other
     (13, 5, E_IDENT),                  # b
@@ -275,8 +292,7 @@ CORPUS_FLOOR = 15000
 # 40 at #3024 (a nameless tuple's `*T` / `[N]T` element: `*q`, `b[i]`).
 # 29 at #3810, which types a receiver's `*p`, struct `a[i]`, method results
 # and the `for` / arm / tuple bindings over them (a field through a generic
-# Deref).  What's left: an index through a Vec / Span / StrView field, call or
-# payload (#3510's), a struct match payload's field,
+# Deref).  What's left: a struct match payload's field,
 # `(*(@x)).f` where the emitter is the unsure side, and `K[i]` of a const
 # array of structs, which the emitter's get_expr_type guesses is an i64 (a
 # guess that refused good programs when Sema copied it).  28 at #3974, which
@@ -285,9 +301,11 @@ CORPUS_FLOOR = 15000
 # untyped test_issue_struct_enum_variants' lets again: 41 without it.  30 at
 # #4248, whose fs Err payload became the user enum Errno: Sema leaves a
 # Result payload binding of user-enum type untyped (`Err(e) => errno_code(e)`
-# in the two corpus files reading fs's Err; #4265 types it).  Lower it as
-# they go.
-BK_GAP_CEILING = 30
+# in the two corpus files reading fs's Err; #4265 types it).  23 at
+# #3943 / #4259, whose one element typer (sema_elem_ty) types `x[i]`'s scalars
+# and bool_check's sbk_index falls back on it: an index through a Vec or Span
+# a field, call or method holds.  Lower it as they go.
+BK_GAP_CEILING = 23
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

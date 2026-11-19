@@ -106,12 +106,20 @@ pub fn ref_set_array(out: *RefTy, elem: i32, elem_pointee: i32, name: *u8, len: 
 pub fn ref_set_elem(out: *RefTy, a: *ArrayElem) -> i32
     ref_set_array(out, a.elem, a.pointee, a.name, a.name_len, a.shape, 0)
 
-# `out` is what `a[i]` holds for `[N][M]T`: 0 past two dimensions, or for a
-# one-dimensional `a`.
+# `out` is what `a[i]` holds for an N-D `[N][M]..T`: a row, one dimension
+# fewer, as Sema's element step has it (sema_arr_elem, AGAST #4259): `[M]T`
+# for two, an `[M][K]T` plane past that.  0 for a one-dimensional `a`.
 pub fn ref_row(a: *RefTy, out: *RefTy) -> i32
-    if a.shape == null or a.shape.rank != 2
+    let sh: *ArrayShape = a.shape
+    if sh == null or sh.rank < 2
         return 0
-    ref_set_array(out, a.shape.leaf_type, a.shape.leaf_pointee, a.shape.leaf_name, a.shape.leaf_name_len, null, a.shape.dims[1])
+    var at: SemaTy
+    sema_arr_ty(@at, TYPE_ARRAY, null, 0, sh)
+    var row: SemaTy
+    sema_arr_elem(@at, @row)
+    if row.shape != null
+        return ref_set_array(out, TYPE_ARRAY, sh.leaf_pointee, sh.leaf_name, sh.leaf_name_len, row.shape, 0)
+    ref_set_array(out, sh.leaf_type, sh.leaf_pointee, sh.leaf_name, sh.leaf_name_len, null, sh.dims[sh.rank - 1])
 
 pub fn ref_is_pointer(kind: i32) -> i32
     if kind == TYPE_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF
@@ -384,6 +392,12 @@ pub fn ref_ty_in(env: *RefEnv, e: *Expr, out: *RefTy) -> i32
             return 0
         if b.kind == TYPE_ARRAY and b.pointee == TYPE_ARRAY
             return ref_row(@b, out)
+        if ref_is_pointer(b.kind) == 1 and b.pointee == TYPE_ARRAY and b.ref_shape != null
+            # A plane pointer's `q[i]` is a row of its `[M][N]..T` (#2570,
+            # AGAST #4259), as the plane's own is.
+            var plane: RefTy
+            ref_set_array(@plane, TYPE_ARRAY, TYPE_VOID, b.name, b.name_len, b.ref_shape, 0)
+            return ref_row(@plane, out)
         # AGAST #2377: `a[i]` with `a: [N]*T` is a `*T`, so `*a[i]` and
         # `a[i][j]` are read through a pointer: a Drop T is not moved out.
         if b.kind == TYPE_ARRAY and ref_is_pointer(b.pointee) == 1
@@ -625,6 +639,7 @@ pub fn rs_set(out: *SemaTy, kind: i32, pointee: i32, name: *u8, len: i32) -> i32
     out.name = name
     out.name_len = len
     out.fn_sig = null
+    out.shape = null
     1
 
 pub fn rs_local(sm: *Sema, v: *SemaVar, out: *SemaTy) -> i32
@@ -641,8 +656,9 @@ pub fn rs_local(sm: *Sema, v: *SemaVar, out: *SemaTy) -> i32
     if kind == TYPE_ARRAY
         var elem: i32 = v.let_elem
         if elem == TYPE_VOID
-            elem = v.elem
-        return rs_set(out, TYPE_ARRAY, elem, v.let_name, v.let_name_len)
+            elem = v.index_elem
+        sema_arr_ty(out, elem, v.let_name, v.let_name_len, v.shape)
+        return 1
     if ref_is_pointer(kind) == 1
         return rs_set(out, kind, v.let_pointee, v.let_name, v.let_name_len)
     rs_set(out, kind, TYPE_VOID, v.let_name, v.let_name_len)
@@ -657,7 +673,8 @@ pub fn rs_ident(sm: *Sema, name: *u8, len: i32, out: *SemaTy) -> i32
     if ref_is_pointer(g.var_type) == 1
         return rs_set(out, g.var_type, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
     if g.var_type == TYPE_ARRAY
-        return rs_set(out, TYPE_ARRAY, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+        sema_arr_ty(out, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len, g.array_shape)
+        return 1
     rs_set(out, g.var_type, TYPE_VOID, g.type_name, g.type_name_len)
 
 # What fn `f` returns, as ref_check's ref_of_fn has it.
@@ -670,7 +687,8 @@ pub fn rs_fn(f: *FnDef, out: *SemaTy) -> i32
             return 0
         return rs_set(out, r.param_type, r.param_pointee_type, r.param_type_name, r.param_type_name_len)
     if f.ret_array != null
-        return rs_set(out, TYPE_ARRAY, f.ret_array.elem, f.ret_array.name, f.ret_array.name_len)
+        sema_arr_ty(out, f.ret_array.elem, f.ret_array.name, f.ret_array.name_len, f.ret_array.shape)
+        return 1
     if f.return_type == TYPE_PTR or f.return_type == TYPE_PTR_PTR
         if f.return_type_name_len > 0 and f.return_type == TYPE_PTR
             return rs_set(out, TYPE_PTR, TYPE_STRUCT, f.return_type_name, f.return_type_name_len)
@@ -707,7 +725,8 @@ pub fn rs_of_field(f: *StructField, out: *SemaTy) -> i32
             pointee = TYPE_STRUCT
         return rs_set(out, t, pointee, f.field_type_name, f.field_type_name_len)
     if t == TYPE_ARRAY
-        return rs_set(out, TYPE_ARRAY, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+        sema_arr_ty(out, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len, f.array_shape)
+        return 1
     if t == TYPE_PTR_PTR
         return 0
     rs_set(out, t, TYPE_VOID, f.field_type_name, f.field_type_name_len)
@@ -732,9 +751,8 @@ pub fn rs_ty(sm: *Sema, e: *Expr, out: *SemaTy) -> i32
         if rs_ty(sm, e.left, @b) == 0
             return 0
         if b.kind == TYPE_ARRAY
-            if b.pointee == TYPE_VOID or b.pointee == TYPE_UNKNOWN or b.pointee == TYPE_PTR_PTR
-                return 0
-            return rs_set(out, b.pointee, TYPE_VOID, b.name, b.name_len)
+            # Sema's element step: an N-D array's row, else its element.
+            return (sema_arr_elem(@b, out) != TYPE_UNKNOWN) as i32
         if ref_is_pointer(b.kind) == 1
             if b.pointee == TYPE_VOID or ref_is_pointer(b.pointee) == 1 or b.pointee == TYPE_ARRAY or b.pointee == TYPE_PTR_PTR
                 return 0

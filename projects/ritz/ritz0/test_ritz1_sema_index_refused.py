@@ -166,3 +166,90 @@ def test_a_plane_pointer_indexes_a_row(request, tmp_path, compiler):
     request.getfixturevalue("ritz1_bin")
     comp, ll, _ = _compile(compiler, tmp_path, "sema_index_plane", PLANE)
     assert comp.returncode == 0 and ll.exists(), f"{compiler}:\n{comp.stdout + comp.stderr}"
+
+
+# AGAST #4259: Sema types `x[i]` of an N-D array as its row, one dimension
+# fewer, and the full-rank `x[i][j]..` as its leaf (sema_arr_elem), so an
+# inferred `let q = @x[..]` is an `@T` exactly when it names a leaf.  Until
+# then rs_ty typed every element of an N-D array as its leaf, so #3893 left
+# such a `q` (and a copy of it) unjudged.  ritz0 refuses each of these.
+LEAF_REFS = """\
+var g: [2][3]i32
+
+struct H
+    n: i32
+    m: [2][2][3]i32
+
+fn leaf3() -> i32
+    var x: [2][2][3]i32
+    let q = @x[1][0][2]
+    q[0]
+
+fn leaf2_mut() -> i32
+    var x: [2][3]i32
+    let q = @&x[1][2]
+    q[0]
+
+fn copy() -> i32
+    var x: [2][2][3]i32
+    let q = @x[1][0][2]
+    let r = q
+    r[0]
+
+fn global_leaf() -> i32
+    let q = @g[1][2]
+    q[0]
+
+fn field_leaf() -> i32
+    var h: H
+    let q = @h.m[1][0][2]
+    q[0]
+
+fn main() -> i32
+    0
+"""
+
+LEAF_WANTED = [("10:5", NOT_A_BUFFER), ("15:5", NOT_A_BUFFER), ("21:5", NOT_A_BUFFER),
+               ("25:5", NOT_A_BUFFER), ("30:5", NOT_A_BUFFER)]
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_inferred_reference_to_an_nd_leaf_is_one_value(request, tmp_path, compiler):
+    request.getfixturevalue("ritz1_bin")
+    comp, ll, _ = _compile(compiler, tmp_path, "sema_index_nd_leaf", LEAF_REFS)
+    out = comp.stdout + comp.stderr
+    assert comp.returncode != 0 and not ll.exists(), f"{compiler} accepted it:\n{out}"
+    found = re.findall(r"main\.ritz:(\d+:\d+): error: (.*)", out)
+    assert found == LEAF_WANTED, f"{compiler}:\n{out}"
+
+
+# Its controls: `@` of a row or a plane (of a local, a copy, a global, a
+# field) is an `@` to an array, which indexes.
+ROW_REFS = """\
+var g: [2][3]i32
+
+struct H
+    n: i32
+    m: [2][2][3]i32
+
+fn main() -> i32
+    var x: [2][2][3]i32
+    x[1][0][2] = 4
+    x[1][1][2] = 5
+    g[1][2] = 6
+    var h: H
+    h.m[1][1][0] = 7
+    let q = @x[1][0]
+    let p = @x[1]
+    let r = p
+    let s = @g[1]
+    let t = @h.m[1]
+    q[2] + r[1][2] + s[2] + t[1][0] - 22
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_an_inferred_reference_to_an_nd_row_indexes(request, tmp_path, compiler):
+    request.getfixturevalue("ritz1_bin")
+    comp, ll, _ = _compile(compiler, tmp_path, "sema_index_nd_row", ROW_REFS)
+    assert comp.returncode == 0 and ll.exists(), f"{compiler}:\n{comp.stdout + comp.stderr}"
