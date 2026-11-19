@@ -1379,8 +1379,8 @@ High-level console I/O functions.
 **Module**: `ritzlib.errno`
 
 `Errno`, a typed kernel error code: the `Err` payload of ritzlib's fallible
-syscall wrappers (`ritzlib.fs`, which re-exports it). One variant per errno fs
-returns, numbered as on Linux x86_64, and `Other(n)` for any other code, so no
+syscall wrappers (`ritzlib.fs`, `ritzlib.net` and `ritzlib.process`, which
+each re-export it). One variant per errno those modules return, numbered as on Linux x86_64, and `Other(n)` for any other code, so no
 number is lost. The variant names follow Harland's kernel `Errno`; the raw
 `i32` constants (`ENOENT`, ...) stay in `ritzlib.sys`.
 
@@ -1391,15 +1391,22 @@ pub enum Errno
     Intr            # EINTR 4
     Io              # EIO 5
     BadF            # EBADF 9
+    Child           # ECHILD 10
     Again           # EAGAIN 11
+    NoMem           # ENOMEM 12
     Acces           # EACCES 13
     Exist           # EEXIST 17
     NotDir          # ENOTDIR 20
     IsDir           # EISDIR 21
     Inval           # EINVAL 22
     NoSpc           # ENOSPC 28
+    Pipe            # EPIPE 32
     NameTooLong     # ENAMETOOLONG 36
     NotEmpty        # ENOTEMPTY 39
+    AddrInUse       # EADDRINUSE 98
+    ConnReset       # ECONNRESET 104
+    TimedOut        # ETIMEDOUT 110
+    ConnRefused     # ECONNREFUSED 111
     Other(i32)      # any other errno, by its positive number
 ```
 
@@ -1659,7 +1666,36 @@ struct IoVecBuilder
 
 **Module**: `ritzlib.net`
 
-TCP/IP socket operations.
+TCP/IP socket operations. Every fallible function returns a `Result` whose
+`Err` is a `ritzlib.errno` `Errno` (AGAST #4298; it was a positive `i32`
+errno), and `net` re-exports `ritzlib.errno`. Compare with the raw numbers
+via `errno_code(e) == EINVAL`, or match the variant:
+
+```ritz
+import ritzlib.net
+
+# A listener on 127.0.0.1:`port`, or the errno that stopped it.
+fn open_listener(port: i32) -> Result<Socket, Errno>
+    var sock: Socket = socket_tcp()?
+    match socket_bind(@&sock, "127.0.0.1", port)
+        Ok(_) => pass
+        Err(e) =>
+            socket_close(@&sock)
+            return Err(e)
+    socket_listen(@&sock, 128)?
+    Ok(sock)
+
+# Whether something else already holds `port`.
+fn port_taken(port: i32) -> bool
+    match open_listener(port)
+        Ok(s) =>
+            var t: Socket = s
+            socket_close(@&t)
+            false
+        Err(e) => match e
+            AddrInUse => true
+            _ => false
+```
 
 **Constants**:
 - Address families: `AF_INET` (2), `AF_INET6` (10)
@@ -1699,50 +1735,50 @@ struct EpollEvent
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_tcp` | `fn() -> Socket` | Create TCP socket |
-| `socket_tcp_nonblock` | `fn() -> Socket` | Create non-blocking TCP |
-| `socket_udp` | `fn() -> Socket` | Create UDP socket |
-| `socket_valid` | `fn(sock: @Socket) -> bool` | Holds an open fd |
-| `socket_close` | `fn(sock: @&Socket) -> Result<(), i32>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
+| `socket_tcp` | `fn() -> Result<Socket, Errno>` | A TCP socket, or `Err(errno)` from socket(2) (e.g. `Other(24)`, EMFILE) |
+| `socket_tcp_nonblock` | `fn() -> Result<Socket, Errno>` | A non-blocking TCP socket, or `Err(errno)` |
+| `socket_udp` | `fn() -> Result<Socket, Errno>` | A UDP socket, or `Err(errno)` |
+| `socket_valid` | `fn(sock: @Socket) -> bool` | Holds an open fd (false once closed) |
+| `socket_close` | `fn(sock: @&Socket) -> Result<(), Errno>` | Close and set `fd = -1`; `Ok(())` if already closed, else `Err(errno)` from close(2) |
 
 **Socket Options**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_set_opt_int` | `fn(sock: @&Socket, level: i32, optname: i32, value: i32) -> Result<(), i32>` | setsockopt with an int; `Err(errno)` |
-| `socket_set_reuseaddr` | `fn(sock: @&Socket) -> Result<(), i32>` | Enable SO_REUSEADDR |
-| `socket_set_reuseport` | `fn(sock: @&Socket) -> Result<(), i32>` | Enable SO_REUSEPORT |
-| `socket_set_nodelay` | `fn(sock: @&Socket) -> Result<(), i32>` | Disable Nagle |
-| `socket_set_io_timeout` | `fn(sock: @&Socket, timeout_ms: i32) -> Result<(), i32>` | SO_RCVTIMEO + SO_SNDTIMEO; 0 clears |
+| `socket_set_opt_int` | `fn(sock: @&Socket, level: i32, optname: i32, value: i32) -> Result<(), Errno>` | setsockopt with an int; `Err(errno)` |
+| `socket_set_reuseaddr` | `fn(sock: @&Socket) -> Result<(), Errno>` | Enable SO_REUSEADDR |
+| `socket_set_reuseport` | `fn(sock: @&Socket) -> Result<(), Errno>` | Enable SO_REUSEPORT |
+| `socket_set_nodelay` | `fn(sock: @&Socket) -> Result<(), Errno>` | Disable Nagle |
+| `socket_set_io_timeout` | `fn(sock: @&Socket, timeout_ms: i32) -> Result<(), Errno>` | SO_RCVTIMEO + SO_SNDTIMEO; 0 clears |
 
 **Server Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_bind` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Bind; `Err(EINVAL)` for a bad address, else `Err(errno)` |
-| `socket_listen` | `fn(sock: @&Socket, backlog: i32) -> Result<(), i32>` | Start listening; `Err(errno)` |
-| `socket_accept` | `fn(sock: @&Socket) -> Result<Socket, i32>` | Accept (blocking); `Err(errno)`, e.g. EINVAL if not listening |
-| `socket_accept_nonblock` | `fn(sock: @&Socket) -> Result<Socket, i32>` | Accept without blocking (peer is non-blocking too); `Err(EAGAIN)` if none pending |
+| `socket_bind` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>` | Bind; `Err(Inval)` for a bad address, else `Err(errno)` |
+| `socket_listen` | `fn(sock: @&Socket, backlog: i32) -> Result<(), Errno>` | Start listening; `Err(errno)` |
+| `socket_accept` | `fn(sock: @&Socket) -> Result<Socket, Errno>` | Accept (blocking); `Err(errno)`, e.g. `Inval` if not listening |
+| `socket_accept_nonblock` | `fn(sock: @&Socket) -> Result<Socket, Errno>` | Accept without blocking (peer is non-blocking too); `Err(Again)` if none pending |
 
 **Client Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `socket_connect` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), i32>` | Connect; `Err(EINVAL)` for a bad address, else `Err(errno)` |
-| `socket_connect_timeout` | `fn(sock: @&Socket, addr: StrView, port: i32, timeout_ms: i32) -> Result<(), i32>` | Connect within `timeout_ms`; `Err(EINVAL)` bad address, `Err(ETIMEDOUT)`, else `Err(errno)` |
-| `socket_send_all` | `fn(sock: @&Socket, data: Span<u8>) -> Result<i64, i32>` | Send every byte (retries short writes and EINTR) |
-| `socket_send_str` | `fn(sock: @&Socket, s: StrView) -> Result<i64, i32>` | `socket_send_all` for text |
-| `socket_recv_into` | `fn(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, i32>` | Append up to `max` bytes; `Ok(0)` at EOF |
+| `socket_connect` | `fn(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>` | Connect; `Err(Inval)` for a bad address, else `Err(errno)` |
+| `socket_connect_timeout` | `fn(sock: @&Socket, addr: StrView, port: i32, timeout_ms: i32) -> Result<(), Errno>` | Connect within `timeout_ms`; `Err(Inval)` bad address, `Err(TimedOut)`, else `Err(errno)` |
+| `socket_send_all` | `fn(sock: @&Socket, data: Span<u8>) -> Result<i64, Errno>` | Send every byte (retries short writes and EINTR) |
+| `socket_send_str` | `fn(sock: @&Socket, s: StrView) -> Result<i64, Errno>` | `socket_send_all` for text |
+| `socket_recv_into` | `fn(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>` | Append up to `max` bytes; `Ok(0)` at EOF |
 
 **Epoll Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `epoll_create` | `fn() -> i32` | Create epoll instance |
-| `epoll_add` | `fn(epfd: i32, fd: i32, events: u32) -> i32` | Add fd |
-| `epoll_del` | `fn(epfd: i32, fd: i32) -> i32` | Remove fd |
-| `epoll_mod` | `fn(epfd: i32, fd: i32, events: u32) -> i32` | Modify events |
-| `epoll_wait_events` | `fn(epfd: i32, events: *EpollEvent, maxevents: i32, timeout_ms: i32) -> i32` | Wait |
+| `epoll_create` | `fn() -> Result<i32, Errno>` | A new epoll instance's fd |
+| `epoll_add` | `fn(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>` | Watch fd; `Err(Exist)` if already watched |
+| `epoll_del` | `fn(epfd: i32, fd: i32) -> Result<(), Errno>` | Stop watching fd; `Err(NoEnt)` if not watched |
+| `epoll_mod` | `fn(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>` | Change events; `Err(NoEnt)` if not watched |
+| `epoll_wait_events` | `fn(epfd: i32, events: *EpollEvent, maxevents: i32, timeout_ms: i32) -> Result<i32, Errno>` | Wait: `Ok(ready fds)`, `Ok(0)` on timeout, `Err(errno)` e.g. `Intr` |
 
 ---
 
@@ -2032,7 +2068,8 @@ struct IoUring
 
 Subprocess spawning with connected pipes. Every fn on a live `Process` takes
 `@&Process` (they close fds and record the wait); `process_valid` only reads
-it (AGAST #3750).
+it (AGAST #3750). Every fallible fn returns `Result<T, Errno>` (`ritzlib.errno`,
+which `ritzlib.process` re-exports), never `-1` or a negative errno (#4298).
 
 ```ritz
 struct Process
@@ -2052,27 +2089,27 @@ struct ProcessResult
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is the positive errno: 2 not found, 13 not executable, or a pipe/fork failure |
-| `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, i32>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
+| `spawn` | `fn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>` | Spawn `cmd` (found by `find_command`) with `args` as argv[1..]; argv[0] is `cmd` as given. `Err` is an `Errno`: `NoEnt` not found, `Acces` not executable, `NoMem`, or a pipe/fork failure |
+| `spawn_env` | `fn(cmd: StrView, args: Span<StrView>, env: Span<StrView>) -> Result<Process, Errno>` | `spawn`, but the child's environment is exactly `env` (`"KEY=VALUE"` views, nothing of ours merged in; an empty span is empty). `spawn` inherits ours |
 | `process_valid` | `fn(p: @Process) -> i32` | 1 if the spawn gave a live pid |
 
 **I/O Operations**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `process_write_all` | `fn(p: @&Process, data: StrView) -> i64` | Write all of `data` to stdin (retries short writes); `data.len` or a negative errno |
+| `process_write_all` | `fn(p: @&Process, data: StrView) -> Result<i64, Errno>` | Write all of `data` to stdin (retries short writes and EINTR); `Ok(data.len)`, `Err(BadF)` once stdin is closed, `Err(Pipe)` once the child closed it |
 | `process_close_stdin` | `fn(p: @&Process)` | Close stdin (EOF) |
-| `process_read_stdout` | `fn(p: @&Process, buf: *u8, max: i64) -> i64` | Read from stdout |
+| `process_read_stdout` | `fn(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>` | Read up to `max` bytes of stdout: `Ok(n)`, `Ok(0)` at EOF, `Err(BadF)` once the pipe is closed |
 | `process_read_stdout_all` | `fn(p: @&Process) -> Vec<u8>` | Read all stdout |
 | `process_read_line` | `fn(p: @&Process) -> Vec<u8>` | Read line |
-| `process_read_stderr` | `fn(p: @&Process, buf: *u8, max: i64) -> i64` | Read stderr |
+| `process_read_stderr` | `fn(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>` | `process_read_stdout` for stderr |
 | `process_read_stderr_all` | `fn(p: @&Process) -> Vec<u8>` | Read all stderr |
 
 **Lifecycle**:
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `process_wait` | `fn(p: @&Process) -> ProcessResult` | Wait for exit |
+| `process_wait` | `fn(p: @&Process) -> Result<ProcessResult, Errno>` | Close stdin and block until exit; `Err(Child)` if nothing is left to wait for (already waited), else `Err` from wait4 |
 | `process_kill` | `fn(p: @&Process)` | Kill process |
 | `process_close_pipes` | `fn(p: @&Process)` | Close all pipes |
 | `process_cleanup` | `fn(p: @&Process)` | Full cleanup |

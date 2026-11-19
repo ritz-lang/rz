@@ -21,6 +21,14 @@ deletes the raw forms:
    Result<Socket, i32> (SIGNATURES), not 0-or-negative-errno or a Socket
    whose fd < 0 means "failed".
 
+#4298 moves every Err to ritzlib.errno's `Errno` (as #4248 did for fs):
+
+5. No pub fn in net.ritz returns `Result<_, i32>`; socket_tcp /
+   socket_tcp_nonblock / socket_udp return Result<Socket, Errno> instead
+   of a Socket whose fd < 0 means "failed", and the epoll wrappers return
+   Result instead of 0-or-negative-errno.  Outside the sys_* shims no pub
+   fn body has a `return -1` / `return null` sentinel.
+
 These are text checks on the source, so they cost no compile. What the fns
 do is covered by ritzlib/tests/test_net_api.ritz.
 """
@@ -88,17 +96,30 @@ def test_no_raw_socket_pointer_parameter_outside_syscall_shims():
 # Socket with fd < 0 standing for an error.
 SIGNATURES = [
     "pub fn socket_connect_timeout(sock: @&Socket, addr: StrView, port: i32, "
-    "timeout_ms: i32) -> Result<(), i32>",
-    "pub fn socket_close(sock: @&Socket) -> Result<(), i32>",
+    "timeout_ms: i32) -> Result<(), Errno>",
+    "pub fn socket_close(sock: @&Socket) -> Result<(), Errno>",
     "pub fn socket_set_opt_int(sock: @&Socket, level: i32, optname: i32, "
-    "value: i32) -> Result<(), i32>",
-    "pub fn socket_set_reuseaddr(sock: @&Socket) -> Result<(), i32>",
-    "pub fn socket_set_reuseport(sock: @&Socket) -> Result<(), i32>",
-    "pub fn socket_set_nodelay(sock: @&Socket) -> Result<(), i32>",
-    "pub fn socket_set_io_timeout(sock: @&Socket, timeout_ms: i32) -> Result<(), i32>",
-    "pub fn socket_listen(sock: @&Socket, backlog: i32) -> Result<(), i32>",
-    "pub fn socket_accept(sock: @&Socket) -> Result<Socket, i32>",
-    "pub fn socket_accept_nonblock(sock: @&Socket) -> Result<Socket, i32>",
+    "value: i32) -> Result<(), Errno>",
+    "pub fn socket_set_reuseaddr(sock: @&Socket) -> Result<(), Errno>",
+    "pub fn socket_set_reuseport(sock: @&Socket) -> Result<(), Errno>",
+    "pub fn socket_set_nodelay(sock: @&Socket) -> Result<(), Errno>",
+    "pub fn socket_set_io_timeout(sock: @&Socket, timeout_ms: i32) -> Result<(), Errno>",
+    "pub fn socket_listen(sock: @&Socket, backlog: i32) -> Result<(), Errno>",
+    "pub fn socket_accept(sock: @&Socket) -> Result<Socket, Errno>",
+    "pub fn socket_accept_nonblock(sock: @&Socket) -> Result<Socket, Errno>",
+    "pub fn socket_tcp() -> Result<Socket, Errno>",
+    "pub fn socket_tcp_nonblock() -> Result<Socket, Errno>",
+    "pub fn socket_udp() -> Result<Socket, Errno>",
+    "pub fn socket_bind(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>",
+    "pub fn socket_connect(sock: @&Socket, addr: StrView, port: i32) -> Result<(), Errno>",
+    "pub fn socket_send_all(sock: @&Socket, data: Span<u8>) -> Result<i64, Errno>",
+    "pub fn socket_send_str(sock: @&Socket, s: StrView) -> Result<i64, Errno>",
+    "pub fn socket_recv_into(sock: @&Socket, buf: @&Vec<u8>, max: i64) -> Result<i64, Errno>",
+    "pub fn epoll_create() -> Result<i32, Errno>",
+    "pub fn epoll_add(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>",
+    "pub fn epoll_del(epfd: i32, fd: i32) -> Result<(), Errno>",
+    "pub fn epoll_mod(epfd: i32, fd: i32, events: u32) -> Result<(), Errno>",
+    "pub fn epoll_wait_events(epfd: i32, events: *EpollEvent, maxevents: i32, timeout_ms: i32) -> Result<i32, Errno>",
 ]
 
 
@@ -108,6 +129,40 @@ def test_signature(sig):
     m = re.search(rf"^{re.escape(head)}\(.*$", NET.read_text(), re.MULTILINE)
     assert m, f"net.ritz has no `{head}(`"
     assert m.group(0).rstrip() == sig
+
+
+def _pub_fn_bodies(path):
+    """(name, signature line, body text) for each top-level or impl `pub fn`."""
+    lines = path.read_text().splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^(\s*)pub fn (\w+)\(", line)
+        if not m:
+            continue
+        indent = len(m.group(1))
+        body = []
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and len(nxt) - len(nxt.lstrip()) <= indent:
+                break
+            body.append(nxt)
+        out.append((m.group(2), line, "\n".join(body)))
+    return out
+
+
+def test_no_i32_errno_result():
+    """#4298: every Err in net.ritz's API is an Errno, not a bare number."""
+    offenders = [sig for _, sig, _ in _pub_fn_bodies(NET) if re.search(r"Result<.*,\s*i32>", sig)]
+    assert offenders == []
+
+
+def test_no_sentinel_return_outside_syscall_shims():
+    """#4298: no `return -1` / `return null` in a pub fn (sys_* shims aside)."""
+    offenders = [
+        name
+        for name, _, body in _pub_fn_bodies(NET)
+        if not name.startswith("sys_") and re.search(r"\breturn\s+(-1\b|null\b)", body)
+    ]
+    assert offenders == []
 
 
 @pytest.mark.parametrize("name", DELETED)

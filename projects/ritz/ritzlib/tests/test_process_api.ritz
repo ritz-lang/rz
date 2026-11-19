@@ -2,10 +2,12 @@
 #
 #   find_command_in(name: StrView, path: StrView) -> Option<String>
 #   find_command(name: StrView) -> Option<String>        ($PATH, or a default)
-#   spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, i32>
-#   process_write_all(p: @&Process, data: StrView) -> i64
-#   process_valid(p: @Process), process_wait(p: @&Process) and the other
-#   fns on a live Process (AGAST #3750)
+#   spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>
+#   process_write_all(p: @&Process, data: StrView) -> Result<i64, Errno>
+#   process_read_stdout / process_read_stderr -> Result<i64, Errno>
+#   process_wait(p: @&Process) -> Result<ProcessResult, Errno>
+#   process_valid(p: @Process) and the other fns on a live Process (#3750)
+#   Every Err is a ritzlib.errno Errno (AGAST #4298).
 #   result_success(r: @ProcessResult) -> bool
 #
 # A StrView carries no terminator, so every test that matters here hands the
@@ -33,21 +35,34 @@ fn is_none(o: *Option<String>) -> i32
         Some(_) => 0
         None => 1
 
-fn spawn_err(r: *Result<Process, i32>) -> i32
+# The errno number of a failed spawn, 0 if it succeeded.
+fn spawn_err(r: *Result<Process, Errno>) -> i32
     match *r
         Ok(_) => 0
-        Err(e) => e
+        Err(e) => errno_code(e)
+
+# The count of an Ok, -1000 - errno for an Err (so a test sees which).
+fn count_of(r: Result<i64, Errno>) -> i64
+    match r
+        Ok(n) => n
+        Err(e) => -1000 - errno_code(e) as i64
+
+# process_wait's exit code, or -1000 - errno if it failed.
+fn wait_code(p: @&Process) -> i32
+    match process_wait(p)
+        Ok(res) => res.exit_code
+        Err(e) => -1000 - errno_code(e)
 
 # Run the spawned process to completion: stdout into *out, the exit code back
 # (-1 if spawn failed).
-fn run(r: *Result<Process, i32>, out: *Vec<u8>) -> i32
+fn run(r: *Result<Process, Errno>, out: *Vec<u8>) -> i32
     match *r
         Ok(p) =>
             var q: Process = p
             *out = process_read_stdout_all(@&q)
-            let res: ProcessResult = process_wait(@&q)
+            let code: i32 = wait_code(@&q)
             process_cleanup(@&q)
-            res.exit_code
+            code
         Err(_) => -1
 
 fn bytes_are(v: *Vec<u8>, want: StrView) -> i32
@@ -126,21 +141,20 @@ fn test_find_command_missing_is_none() -> i32
     0
 
 # ============================================================================
-# spawn(cmd, args) -> Result<Process, i32>
+# spawn(cmd, args) -> Result<Process, Errno>
 # ============================================================================
 
 [[test]]
 fn test_spawn_no_args_cat_echoes_stdin() -> i32
-    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    var r: Result<Process, Errno> = spawn("/bin/cat", span_empty<StrView>())
     match r
         Ok(p) =>
             var q: Process = p
-            assert process_write_all(@&q, "hello\n") == 6
+            assert count_of(process_write_all(@&q, "hello\n")) == 6
             process_close_stdin(@&q)
             var out: Vec<u8> = process_read_stdout_all(@&q)
             assert bytes_are(@out, "hello\n") == 1
-            let res: ProcessResult = process_wait(@&q)
-            assert res.exit_code == 0
+            assert wait_code(@&q) == 0
             process_cleanup(@&q)
         Err(_) =>
             assert false
@@ -151,7 +165,7 @@ fn test_spawn_searches_path_and_passes_args() -> i32
     var args: [2]StrView
     args[0] = "-c"
     args[1] = "exit 3"
-    var r: Result<Process, i32> = spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+    var r: Result<Process, Errno> = spawn("sh", span_from_ptr<StrView>(@args[0], 2))
     var out: Vec<u8> = vec_new<u8>()
     assert run(@r, @out) == 3
     0
@@ -174,7 +188,7 @@ fn test_spawn_args_are_exact_bytes() -> i32
     shifted[3] = args[2]
     shifted[4] = args[3]
     shifted[5] = args[4]
-    var r: Result<Process, i32> = spawn("sh", span_from_ptr<StrView>(@shifted[0], 6))
+    var r: Result<Process, Errno> = spawn("sh", span_from_ptr<StrView>(@shifted[0], 6))
     var out: Vec<u8> = vec_new<u8>()
     assert run(@r, @out) == 0
     assert bytes_are(@out, "3|a b||xyz") == 1
@@ -186,7 +200,7 @@ fn test_spawn_argv0_is_cmd_as_given() -> i32
     var args: [2]StrView
     args[0] = "-c"
     args[1] = "printf '%s' \"$0\""
-    var r: Result<Process, i32> = spawn(strview_slice("shNOPE", 0, 2), span_from_ptr<StrView>(@args[0], 2))
+    var r: Result<Process, Errno> = spawn(strview_slice("shNOPE", 0, 2), span_from_ptr<StrView>(@args[0], 2))
     var out: Vec<u8> = vec_new<u8>()
     assert run(@r, @out) == 0
     assert bytes_are(@out, "sh") == 1
@@ -194,15 +208,29 @@ fn test_spawn_argv0_is_cmd_as_given() -> i32
 
 [[test]]
 fn test_spawn_missing_command_is_enoent() -> i32
-    var r: Result<Process, i32> = spawn("ritz-no-such-command", span_empty<StrView>())
+    var r: Result<Process, Errno> = spawn("ritz-no-such-command", span_empty<StrView>())
     assert spawn_err(@r) == 2
+    match r
+        Ok(_) =>
+            assert false
+        Err(e) => match e
+            NoEnt => pass
+            _ =>
+                assert false
     0
 
 [[test]]
 fn test_spawn_not_executable_is_eacces() -> i32
     # Found (a '/' path is taken as is) but not executable: Err(13), no fork.
-    var r: Result<Process, i32> = spawn("/etc/passwd", span_empty<StrView>())
+    var r: Result<Process, Errno> = spawn("/etc/passwd", span_empty<StrView>())
     assert spawn_err(@r) == 13
+    match r
+        Ok(_) =>
+            assert false
+        Err(e) => match e
+            Acces => pass
+            _ =>
+                assert false
     0
 
 # ============================================================================
@@ -211,29 +239,76 @@ fn test_spawn_not_executable_is_eacces() -> i32
 
 [[test]]
 fn test_process_write_all_writes_view_length() -> i32
-    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    var r: Result<Process, Errno> = spawn("/bin/cat", span_empty<StrView>())
     match r
         Ok(p) =>
             var q: Process = p
-            assert process_write_all(@&q, strview_slice("abcNOPE", 0, 3)) == 3
+            assert count_of(process_write_all(@&q, strview_slice("abcNOPE", 0, 3))) == 3
             process_close_stdin(@&q)
             var out: Vec<u8> = process_read_stdout_all(@&q)
             assert bytes_are(@out, "abc") == 1
-            process_wait(@&q)
+            assert wait_code(@&q) == 0
             process_cleanup(@&q)
         Err(_) =>
             assert false
     0
 
 [[test]]
-fn test_process_write_all_after_close_is_negative() -> i32
-    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+fn test_process_write_all_after_close_is_badf() -> i32
+    var r: Result<Process, Errno> = spawn("/bin/cat", span_empty<StrView>())
     match r
         Ok(p) =>
             var q: Process = p
             process_close_stdin(@&q)
-            assert process_write_all(@&q, "x") < 0
-            process_wait(@&q)
+            match process_write_all(@&q, "x")
+                Ok(_) =>
+                    assert false
+                Err(e) => match e
+                    BadF => pass
+                    _ =>
+                        assert false
+            assert wait_code(@&q) == 0
+            process_cleanup(@&q)
+        Err(_) =>
+            assert false
+    0
+
+# ============================================================================
+# process_read_stdout / process_read_stderr -> Result<i64, Errno> (#4298)
+# ============================================================================
+
+[[test]]
+fn test_process_read_stdout_reads_then_eof() -> i32
+    var args: [2]StrView
+    args[0] = "-c"
+    args[1] = "printf out; printf err >&2"
+    match spawn("sh", span_from_ptr<StrView>(@args[0], 2))
+        Ok(p) =>
+            var q: Process = p
+            var buf: [16]u8
+            assert count_of(process_read_stdout(@&q, @buf[0], 16)) == 3
+            assert strview_eq(strview_from_ptr(@buf[0], 3), "out")
+            assert count_of(process_read_stdout(@&q, @buf[0], 16)) == 0
+            assert count_of(process_read_stderr(@&q, @buf[0], 16)) == 3
+            assert strview_eq(strview_from_ptr(@buf[0], 3), "err")
+            assert wait_code(@&q) == 0
+            process_cleanup(@&q)
+        Err(_) =>
+            assert false
+    0
+
+[[test]]
+fn test_process_read_after_close_is_badf() -> i32
+    var r: Result<Process, Errno> = spawn("/bin/cat", span_empty<StrView>())
+    match r
+        Ok(p) =>
+            var q: Process = p
+            process_kill(@&q)
+            assert wait_code(@&q) == 128 + 9
+            process_close_pipes(@&q)
+            var buf: [4]u8
+            assert count_of(process_read_stdout(@&q, @buf[0], 4)) == -1000 - EBADF as i64
+            assert count_of(process_read_stderr(@&q, @buf[0], 4)) == -1000 - EBADF as i64
             process_cleanup(@&q)
         Err(_) =>
             assert false
@@ -255,7 +330,11 @@ fn sh_result(script: StrView) -> ProcessResult
         Ok(p) =>
             var q: Process = p
             assert process_valid(@q) == 1
-            let res: ProcessResult = process_wait(@&q)
+            var res: ProcessResult = bad
+            match process_wait(@&q)
+                Ok(w) => res = w
+                Err(_) =>
+                    assert false
             process_cleanup(@&q)
             res
         Err(_) => bad
@@ -299,17 +378,26 @@ fn test_result_success_rule() -> i32
 
 [[test]]
 fn test_process_kill_then_wait_reports_signal() -> i32
-    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    var r: Result<Process, Errno> = spawn("/bin/cat", span_empty<StrView>())
     match r
         Ok(p) =>
             var q: Process = p
             process_kill(@&q)
-            let res: ProcessResult = process_wait(@&q)
-            assert res.signaled == 1
-            assert res.exit_code == 128 + 9
-            # A second wait finds nothing to wait for.
-            let again: ProcessResult = process_wait(@&q)
-            assert again.exit_code == -1
+            match process_wait(@&q)
+                Ok(res) =>
+                    assert res.signaled == 1
+                    assert res.exit_code == 128 + 9
+                Err(_) =>
+                    assert false
+            # A second wait finds nothing to wait for: Err(Child), not a
+            # ProcessResult whose exit_code -1 stands for "failed".
+            match process_wait(@&q)
+                Ok(_) =>
+                    assert false
+                Err(e) => match e
+                    Child => pass
+                    _ =>
+                        assert false
             process_cleanup(@&q)
         Err(_) =>
             assert false
@@ -327,7 +415,7 @@ fn try_wait_code(o: *Option<ProcessResult>) -> i32
 
 [[test]]
 fn test_process_try_wait_is_none_while_running_then_reaps() -> i32
-    var r: Result<Process, i32> = spawn("/bin/cat", span_empty<StrView>())
+    var r: Result<Process, Errno> = spawn("/bin/cat", span_empty<StrView>())
     match r
         Ok(p) =>
             var q: Process = p

@@ -131,20 +131,21 @@ pub fn main() -> i32
 """
 
 # 50_http's shape: ritzlib.net Socket methods, incl. a struct-returning one
-# (a Result<Socket, i32> since #3880).
+# (a Result<Socket, Errno> since #3880 / #4298).
 # accept() would block, so it sits on a branch that never runs; the build is
 # what was broken.
 MAIN_SOCKET = """\
 import ritzlib.net
 
 pub fn main() -> i32
-    var s: Socket = socket_tcp()
-    if not s.valid()
-        return 1
+    var s: Socket
+    match socket_tcp()
+        Ok(t) => s = t
+        Err(_) => return 1
     var r: i32 = 0
     match s.set_reuseaddr()
         Ok(_) => r = 0
-        Err(e) => r = e
+        Err(e) => r = errno_code(e)
     if s.fd < -1000
         match s.accept()
             Ok(c) =>

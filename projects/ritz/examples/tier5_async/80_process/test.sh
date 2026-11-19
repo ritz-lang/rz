@@ -18,7 +18,7 @@ stdout: [alpha\nbravo\n] (12)
 exit: 0
 success: 1
 signaled: 0
-wait again: -1
+wait again: ECHILD
 == read by line ==
 line 1: [alpha\n] (6)
 line 2: [bravo] (5)

@@ -13,6 +13,15 @@ the job:
    find_command_in_path, process_write, process_write_str. spawn_env
    (cmd, args, env: Span<StrView>) replaces spawn_full's explicit envp.
 
+#4298 moves every Err to ritzlib.errno's `Errno` (as #4248 did for fs):
+
+4. spawn / spawn_env return Result<Process, Errno>; process_write_all,
+   process_read_stdout and process_read_stderr return Result<i64, Errno>
+   (Err(BadF) once the pipe is closed) instead of -1 / a negative errno;
+   process_wait returns Result<ProcessResult, Errno> (Err(Child) when there
+   is nothing left to wait for) instead of an exit_code of -1.  No pub fn
+   body has a `return -1` / `return null` sentinel.
+
 These are text checks on the source, so they cost no compile. What the fns
 do is covered by ritzlib/tests/test_process_api.ritz and
 test_process_env.ritz, and examples/tier5_async/80_process.
@@ -88,9 +97,53 @@ def test_spawn_env_takes_views():
     sig = _signature("spawn_env")
     assert re.fullmatch(
         r"pub fn spawn_env\(cmd: StrView, args: Span<StrView>, env: Span<StrView>\)"
-        r" -> Result<Process, i32>",
+        r" -> Result<Process, Errno>",
         sig.rstrip(),
     ), sig
+
+
+RESULT_SIGNATURES = [
+    "pub fn spawn(cmd: StrView, args: Span<StrView>) -> Result<Process, Errno>",
+    "pub fn process_write_all(p: @&Process, data: StrView) -> Result<i64, Errno>",
+    "pub fn process_read_stdout(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
+    "pub fn process_read_stderr(p: @&Process, buf: *u8, max: i64) -> Result<i64, Errno>",
+    "pub fn process_wait(p: @&Process) -> Result<ProcessResult, Errno>",
+]
+
+
+@pytest.mark.parametrize("sig", RESULT_SIGNATURES, ids=lambda s: s.split("(")[0][7:])
+def test_errno_result_signature(sig):
+    name = sig.split("(")[0][len("pub fn "):]
+    assert _signature(name).rstrip() == sig
+
+
+def _pub_fn_bodies():
+    lines = PROCESS.read_text().splitlines()
+    out = []
+    for i, line in enumerate(lines):
+        m = re.match(r"^pub fn (\w+)\(", line)
+        if not m:
+            continue
+        body = []
+        for nxt in lines[i + 1:]:
+            if nxt.strip() and not nxt[0].isspace():
+                break
+            body.append(nxt)
+        out.append((m.group(1), line, "\n".join(body)))
+    return out
+
+
+def test_no_i32_errno_result():
+    offenders = [sig for _, sig, _ in _pub_fn_bodies() if re.search(r"Result<.*,\s*i32>", sig)]
+    assert offenders == []
+
+
+def test_no_sentinel_return():
+    offenders = [
+        name for name, _, body in _pub_fn_bodies()
+        if re.search(r"\breturn\s+(-1\b|null\b|-\()", body)
+    ]
+    assert offenders == []
 
 
 @pytest.mark.parametrize("name", DELETED)
