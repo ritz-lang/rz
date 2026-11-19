@@ -1,7 +1,7 @@
 """A statement-position `match`/`if` is not a value: its arms needn't agree
 (AGAST #3593).
 
-`--check-names --check-types` refused 31 sites in angelo, prism and mausoleum
+`--check-names` and the typing pass refused 31 sites in angelo, prism and mausoleum
 the emitter accepts: a `match`/`if` whose value is dropped (an expression
 statement, the tail of a unit fn or of a loop body, an arm of one that is
 itself dropped) was held to "arms have different types".  Only a match/if in
@@ -19,6 +19,7 @@ import re
 import pytest
 
 from ritz0_inproc import run_ritz0
+from test_typing_pass_only import compile_typing_only
 
 pytestmark = pytest.mark.integration
 
@@ -54,7 +55,16 @@ def _check(tmp_path, body):
     src = tmp_path / "unit.ritz"
     src.write_text(PRELUDE + body + MAIN)
     return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime",
-                      "--check-names", "--check-types"])
+                      "--check-names"])
+
+
+def _typed(tmp_path, body):
+    """The typing pass's own verdict: ritz0 reports it after the emitter,
+    whose words win where both refuse (AGAST #4260)."""
+    src = tmp_path / "unit.ritz"
+    src.write_text(PRELUDE + body + MAIN)
+    return compile_typing_only(src, tmp_path / "unit.ll", no_runtime=True,
+                               check_names=True)
 
 
 # Each row drops the match/if's value a different way; each fails on its own
@@ -119,7 +129,7 @@ def _error_at(result):
 def test_assignment_is_unit(tmp_path):
     """prism's `KeyCode.AltLeft => self.modifiers.alt = true` was typed bool:
     an assignment yields (), so it can't stand beside 7 in a value slot."""
-    result = _check(tmp_path, """\
+    result = _typed(tmp_path, """\
 fn val(m: @&M, k: i32) -> i32
     let x: i32 = match k
         1 => m.n = 5
@@ -134,7 +144,7 @@ fn val(m: @&M, k: i32) -> i32
 def test_value_slot_mismatch_reported_at_arm(tmp_path):
     """A value slot still compares arms, and points at the arm, not column 1
     of a block arm's body."""
-    result = _check(tmp_path, """\
+    result = _typed(tmp_path, """\
 fn val(k: i32) -> Result<i32, i32>
     let x: i32 = match k
         1 => pop()?
@@ -148,7 +158,7 @@ fn val(k: i32) -> Result<i32, i32>
 
 
 def test_value_slot_if_mismatch_reported_at_else(tmp_path):
-    result = _check(tmp_path, """\
+    result = _typed(tmp_path, """\
 fn val(m: *M, c: bool) -> *M
     if c
         find(m)

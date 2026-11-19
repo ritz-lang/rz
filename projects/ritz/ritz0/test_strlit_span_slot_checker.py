@@ -1,4 +1,4 @@
-"""`--check-types`: a `"…"` literal in a `Span<u8>` slot (AGAST #3596).
+"""The typing pass: a `"…"` literal in a `Span<u8>` slot (AGAST #3596).
 
 LARB R62 and LANGUAGE_SPEC §3.5: in a `Span<u8>` slot a `"…"` literal is a
 `Span<u8>` of its bytes; a `StrView` value, a `c"…"` literal and a `String`
@@ -67,7 +67,7 @@ class TestStillRefused:
 
 
 @pytest.mark.integration
-def test_corpus_sites_pass_check_types():
+def test_corpus_sites_type_check():
     """The 27 findings #2229 measured, through ritz0.py's wiring."""
     here = Path(__file__).parent
     files = ["test_cs_mixed", "test_sstring", "test_strlit_span_slot_no_import",
@@ -75,7 +75,7 @@ def test_corpus_sites_pass_check_types():
     for name in files:
         result = subprocess.run(
             [sys.executable, str(here / "ritz0.py"), str(here / "test" / f"{name}.ritz"),
-             "-o", "/dev/null", "--check-names", "--check-types"],
+             "-o", "/dev/null", "--check-names"],
             capture_output=True, text=True, env={"RITZ_PATH": str(here.parent)},
             cwd=here.parent)
         assert result.returncode == 0, f"{name}: {result.stderr}"

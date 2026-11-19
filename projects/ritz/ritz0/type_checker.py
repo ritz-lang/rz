@@ -514,7 +514,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         elif isinstance(stmt, rast.AsmStmt):
             # §18.6: an `out` or `inout` operand is an assignment of its
             # place.  Scope, type and place are the emitter's (_emit_asm),
-            # which runs whether or not --check-types does.
+            # which judges them itself.
             for o in stmt.operands:
                 if o.direction in ('out', 'inout') and o.name in self.locals:
                     self._check_write(rast.Ident(o.span, o.name))
@@ -849,10 +849,10 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                     and not isinstance(self._resolve_alias(operand_type),
                                        (rast.PtrType, rast.RefType)):
                 return operand_type
-            if isinstance(operand_type, rast.PtrType):
-                return operand_type.inner
-            elif isinstance(operand_type, rast.RefType):
-                return operand_type.inner
+            # Through an alias of one (`type IP = *i32`, AGAST #4260)
+            pointer = self._resolve_alias(operand_type)
+            if isinstance(pointer, (rast.PtrType, rast.RefType)):
+                return pointer.inner
             elif self._is_opaque(operand_type):
                 return rast.NamedType(expr.span, 'unknown', [])
             else:
@@ -876,7 +876,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 # A value operand the emitter reads the type of (#3555):
                 # `sizeof('a')`, `sizeof(x as u16)`.  A name may spell a
                 # type, so only kinds that can't.  Quietly: the checker
-                # never looked there, so --check-types reports nothing new.
+                # never looked there, so it reports nothing new.
                 elif isinstance(expr.args[0], SIZEOF_VALUE_OPERANDS):
                     self._quiet_type(expr.args[0])
                 return rast.NamedType(expr.span, 'i64', [])
@@ -976,7 +976,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                         and (tp in self.structs or tp in self.enums
                              or tp in self.type_aliases)}
             caller_params = self.current_type_params
-            self.current_type_params = caller_params | captured
+            # Every one of the callee's own params is opaque in its slots, not
+            # just a single capital's (`T0`..`T11`, AGAST #4260).
+            self.current_type_params = caller_params | captured | set(fn_sig.type_params)
             try:
                 arg_types = self._check_call_args(expr, fn_name, fn_sig)
             finally:
@@ -1081,8 +1083,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         else:
             receiver_type = self._infer_type(expr.expr)
 
-        # `Color.Green(1)`: a variant constructed through its enum
-        if isinstance(expr.expr, rast.Ident) and expr.expr.name in self.enums:
+        # `Color.Green(1)`: a variant constructed through its enum, unless a
+        # local shadows the enum (`var Opt: S`, AGAST #4260)
+        if self._type_receiver_name(expr.expr) in self.enums:
             enum = self.enums[expr.expr.name]
             if any(v.name == expr.method for v in enum.variants):
                 self._check_payload(expr.args, enum.name, expr.method)
@@ -1189,6 +1192,13 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             # Try just the method name
             tried_names.append(expr.method)
             fn_sig = self.functions.get(expr.method)
+
+        if fn_sig is None:
+            dispatched = self._emitter_dispatched(receiver, expr)
+            if dispatched is not None:
+                for arg in expr.args:
+                    self._infer_type(arg)
+                return dispatched
 
         if fn_sig is None:
             # A monomorphised helper (`vec_push$C`) has no name the lookups
@@ -1424,7 +1434,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         # variant `RepoError(RepoError)` and a `NotFound` too (AGAST #2534):
         # a bare name looked up as a value finds that variant first. As
         # `Color.Green(1)` does in _check_method_call.
-        if isinstance(expr.expr, rast.Ident) and expr.expr.name in self.enums:
+        if self._type_receiver_name(expr.expr) in self.enums:
             enum = self.enums[expr.expr.name]
             if any(v.name == expr.field for v in enum.variants):
                 return rast.NamedType(expr.span, enum.name, [])
@@ -1666,6 +1676,11 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             held = self._mangled_buffer_element(inner.name)
             if held is not None:
                 return held
+            # A struct with an `impl Index`: `mk()[2]` on a `*Tally` is the
+            # pointee's `index`, as the emitter dispatches it (AGAST #4260)
+            index = self.functions.get(f"{inner.name}_index")
+            if index is not None and index.ret_type is not None:
+                return self._strip_indirection(index.ret_type)
         return pointer.inner
 
     def _mangled_buffer_element(self, name: str) -> Optional[rast.Type]:
@@ -1918,7 +1933,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         return copy.copy(scrut.args[idx])
 
     def _error(self, message: str, span: Optional[rast.Span]):
-        """Record a type error (reported under --check-types)."""
+        """Record a type error (ritz0._check_types reports it)."""
         self.errors.append(TypeError(message, span))
 
     def _slot_error(self, message: str, span: Optional[rast.Span],

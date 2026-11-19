@@ -91,8 +91,8 @@ class EmitError(Exception):
 
     Some source errors are only reachable from the emitter. Matching on a
     variant an enum does not declare is one: `type_checker._check_pattern`
-    silently ignores it, and `--check-types` is off by default, so emission is
-    the first and only pass that notices. Those are still *user* errors and
+    silently ignores it, so emission is the first and only pass that
+    notices. Those are still *user* errors and
     must read like one, so this mirrors the `file:line:column: message` format
     used by `TypeError`, `OwnershipError`, `NameError` and friends rather than
     escaping as a bare `ValueError` with a Python traceback attached.
@@ -16371,9 +16371,9 @@ class LLVMEmitter:
         not know how to convert, it hands the value back unchanged.  LetStmt
         then filed the DECLARED type against a value that did not have it, so
         the annotation was discarded and the eventual error surfaced a line or
-        two later naming a type the programmer never wrote.  ritz0 has no
-        separate type checker (`--check-types` is off by default), so emission
-        is the first and only pass that could notice.
+        two later naming a type the programmer never wrote.  ritz0's type
+        checker (then behind `--check-types`) didn't see it, so emission was
+        the first pass that could notice.
 
         Scope is deliberately the irreconcilable case only -- a scalar
         annotation on an aggregate value, or the reverse.  Implicit NARROWING

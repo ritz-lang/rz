@@ -10,8 +10,8 @@ type checker's inference and leaves a `Typed` side table, keyed by node, on
 It runs on every compile (ritz0._type), before the ownership pass, and again
 on the monomorphised module the emitter emits (ritz0._check_instances), so an
 instance of a generic body is typed at its concrete `T`.  The type errors it
-finds are kept on the table: `--check-types` decides whether ritz0 prints
-them (on by default is #3556, #1823), and the slot errors (§13.2, §13.4) are printed
+finds are kept on the table, and ritz0._check_types prints them on every
+compile (AGAST #3556), and the slot errors (§13.2, §13.4) are printed
 beside an ownership error, or refuse an instance, either way.
 
 Who reads it so far: the type checker (it is the inference), the move

@@ -55,12 +55,16 @@ def test_compile_file_runs_the_pass_list_in_order():
     _resolve so it is checked and emitted like any fn.  _monomorph and
     _check_instances (AGAST #3523) ran first thing inside _emit.
     _rewrite_named_variants (AGAST #4187) is new: a named variant literal
-    must be a call before _check_type_names takes its name for a type."""
+    must be a call before _check_type_names takes its name for a type.
+    The typing pass's errors (_check_types) are reported after _emit,
+    before _write writes the .ll, so the emitter's words win where both
+    refuse (AGAST #4260)."""
     assert [p.__name__ for p in ritz0.PASSES] == [
         "_parse", "_lower_main", "_resolve", "_check_impl_targets", "_rewrite_enum_from",
         "_rewrite_named_variants", "_eval_array_sizes", "_check_type_names", "_check_binders", "_check_reachable",
-        "_check_names", "_infer_struct_lit_args", "_type", "_check_types",
+        "_check_names", "_infer_struct_lit_args", "_type",
         "_check_no_effect", "_check_ownership", "_monomorph", "_check_instances", "_emit",
+        "_check_types", "_write",
     ]
 
 

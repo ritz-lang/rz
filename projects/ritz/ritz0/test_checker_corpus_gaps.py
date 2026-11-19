@@ -1,6 +1,7 @@
 """Checker false positives and crashes found running the corpus (AGAST #1823).
 
-`--check-names` / `--check-types` had never run over real code. Each test here
+`--check-names` and the type checker (`--check-types` until AGAST #3556,
+now on every compile) had never run over real code. Each test here
 is a valid program a checker rejected or crashed on, or an invalid one a fix
 must not start accepting.
 """
@@ -338,16 +339,19 @@ class TestThroughCompileFile:
             capture_output=True, text=True)
 
     def test_ill_typed_program_rejected_with_location(self, tmp_path):
-        r = self.run(tmp_path, "fn t(s: StrView) -> i32\n    0\n\n"
-                               "fn f(p: *u8) -> i32\n    t(p)\n", "--check-types")
+        # One the emitter lowers: where it refuses too, its words are
+        # printed, and the typing pass's after it never are (AGAST #4260).
+        r = self.run(tmp_path, "fn f(p: *u8) -> i32\n    let n: i32 = p\n    n\n")
         assert r.returncode != 0
-        assert "main.ritz:5:7: argument 1 ('s'): expected StrView, got *u8" in r.stderr
+        assert "Type error: " in r.stderr, r.stderr
+        assert "main.ritz:2:5: cannot initialize i32 with *u8" in r.stderr, r.stderr
+        assert not (tmp_path / "o.ll").exists()
 
     def test_import_is_a_qualifier_for_both_checkers(self, tmp_path):
         # Neither checker calls `token` undefined; the emitter refuses the
         # module access, located (§15.3, AGAST #2215).
         r = self.run(tmp_path, "import token\n\nfn f() -> i32\n    token.KIND\n",
-                     "--check-types", "--check-names")
+                     "--check-names")
         assert r.returncode != 0
         assert "main.ritz:4:5: `token.KIND`: there is no `module.item` access" in r.stderr, r.stderr
         assert "undefined" not in r.stderr, r.stderr

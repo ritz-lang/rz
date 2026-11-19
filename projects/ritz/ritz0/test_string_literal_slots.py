@@ -20,8 +20,8 @@ checks REJECTED and ACCEPTED with test_table_rows' assert_rows, each row under
 the id its parametrised test had less the compiler
 (`test_what_does_not_fit_is_a_located_error[strview_let-ritz0]` is
 `what_does_not_fit_is_a_located_error[strview_let]` on ritz0), and a failure
-names its rows.  `test_check_types_rows` does the same for the two
-`--check-types` lists (`check_types_takes_a_literal_in_a_pointer_slot[let]`).
+names its rows.  `test_type_check_rows` does the same for the typing pass's
+two lists (`type_check_takes_a_literal_in_a_pointer_slot[let]`).
 """
 
 import os
@@ -36,6 +36,7 @@ import fast_link
 import test_table_rows as table_rows
 from ritz0_inproc import run_ritz0
 from test_table_rows import Refused, Row, Run
+from test_typing_pass_only import compile_typing_only
 
 # AGAST #2806: each test's rows share one compile per compiler (batching.py).
 pytestmark = pytest.mark.batched
@@ -588,29 +589,31 @@ def test_ritz0_only_accepted(request, tmp_path, name):
     _assert_runs(request, "ritz0", tmp_path, name, source, code)
 
 
-# `--check-types` runs before emission and has its own wording. Generic sites only.
+# The typing pass has its own wording (a default compile prints the emitter's
+# where both refuse). Generic sites only.
 CHECKED_ACCEPTED = ["let", "var", "assign", "return", "tail", "field", "arg", "element",
                     "arm_if", "arm_match", "arm_beside_pointer", "tail_if", "strview_slot"]
 CHECKED_REJECTED = ["strview_let", "strview_return", "strview_arg", "strview_field",
                     "strview_arm", "string_let", "string_arg"]
 
 
-def _check_types(tmp_path, source):
+def _type_check(tmp_path, source):
     src = tmp_path / "unit.ritz"
     src.write_text(_PRELUDE + source)
-    env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{tmp_path}")
-    return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--check-types"],
-                     cwd=tmp_path, env=env, timeout=300)
+    # Every pass but emission: a default compile reports the typing pass's
+    # errors after the emitter's, whose words win where both refuse (#4260).
+    return compile_typing_only(src, tmp_path / "unit.ll",
+                               ritz_path=f"{RITZ_ROOT}:{tmp_path}")
 
 
-def _check_types_wrong(here, accepted, name):
-    """Why `--check-types` gets the row wrong, or None."""
+def _type_check_wrong(here, accepted, name):
+    """Why the typing pass gets the row wrong, or None."""
     here.mkdir()
     if accepted:
-        proc = _check_types(here, ACCEPTED[name][0])
+        proc = _type_check(here, ACCEPTED[name][0])
         output = proc.stdout + proc.stderr
         return None if proc.returncode == 0 else f"want it accepted, got:\n{output[-800:]}"
-    proc = _check_types(here, REJECTED[name][0])
+    proc = _type_check(here, REJECTED[name][0])
     output = proc.stdout + proc.stderr
     if proc.returncode == 0 or "*u8" not in output:
         return f"want it refused naming `*u8`, got:\n{output[-800:]}"
@@ -621,14 +624,14 @@ def _check_types_wrong(here, accepted, name):
 
 
 @pytest.mark.integration
-def test_check_types_rows(tmp_path):
-    """A literal in a pointer slot passes `--check-types`; a non-literal is
+def test_type_check_rows(tmp_path):
+    """A literal in a pointer slot passes the typing pass; a non-literal is
     refused in the checker's own words.  Every failing row is named."""
-    rows = ([(f"check_types_takes_a_literal_in_a_pointer_slot[{n}]", True, n) for n in CHECKED_ACCEPTED]
-            + [(f"check_types_refuses_a_non_literal_in_a_pointer_slot[{n}]", False, n)
+    rows = ([(f"type_check_takes_a_literal_in_a_pointer_slot[{n}]", True, n) for n in CHECKED_ACCEPTED]
+            + [(f"type_check_refuses_a_non_literal_in_a_pointer_slot[{n}]", False, n)
                for n in CHECKED_REJECTED])
     failures = [(rid, f"ritz0 {rid}: {why}") for k, (rid, accepted, name) in enumerate(rows)
-                for why in [_check_types_wrong(tmp_path / str(k), accepted, name)] if why]
+                for why in [_type_check_wrong(tmp_path / str(k), accepted, name)] if why]
     table_rows._assert_none("ritz0", failures, len(rows))
 
 

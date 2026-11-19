@@ -149,7 +149,7 @@ def _typed(src):
 
 
 def test_ritz0_typing_pass_refuses_on_every_compile():
-    """typed.py's slot errors are reported without --check-types (ritz0.py)."""
+    """typed.py's slot errors are reported on every compile (ritz0.py)."""
     _, table = _typed(COMPARE.format(cond="x >= y"))
     assert [str(e).split(": ", 1)[1] for e in table.slot_errors] == [mixed_float_compare("f64", "f32")]
     _, table = _typed(COMPARE.format(cond="y == 0.1 and x == (y as f64)"))

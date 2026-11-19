@@ -905,8 +905,8 @@ def test_the_type_checker_sees_the_element(tmp_path):
         here.mkdir()
         src = here / "main.ritz"
         src.write_text(program)
-        comp = for_header.ritz0_inproc.run_ritz0([str(src), "--check-types", "-o", str(here / "main.ll")],
+        comp = for_header.ritz0_inproc.run_ritz0([str(src), "-o", str(here / "main.ll")],
                                                  cwd=here, env=for_header.ENV, timeout=300)
         if comp.returncode != 0:
-            failures.append(f"ritz0 --check-types {rid}:\n" + (comp.stdout + comp.stderr)[-800:])
+            failures.append(f"ritz0 {rid}:\n" + (comp.stdout + comp.stderr)[-800:])
     assert not failures, "\n".join(failures)

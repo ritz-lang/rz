@@ -11,7 +11,7 @@ every pointer is an opaque `ptr`, so #2229's re-measure found 16 in the corpus:
   (`ident_or_struct`, `struct_lit_expr`, `generic_struct_lit_arg`) now say
   `*FieldInit`, parser_gen.ritz is regenerated and `struct StructLit` is gone.
 
-This pins each repaired file type-checking clean under `--check-types`, so
+This pins each repaired file type-checking clean (the typing pass's errors), so
 nothing regrows there.  One case per package, and each compile stops after
 `_check_types` (no ownership pass, no emit), so a failure's stderr names the
 file and line.
@@ -52,14 +52,15 @@ GROUPS = {
 def test_repaired_files_type_check_clean(group, tmp_path, capsys, monkeypatch):
     root, sources, target, files = GROUPS[group]
     passes = ritz0.PASSES
+    # Through the typing pass, then its report (ritz0 runs that after _emit).
     monkeypatch.setattr(ritz0, "PASSES",
-                        passes[:passes.index(ritz0._check_types) + 1])
+                        passes[:passes.index(ritz0._type) + 1] + (ritz0._check_types,))
     failed = []
     for i, rel in enumerate(files):
         # A fresh output path each time: an up-to-date .ll skips every pass,
         # type checking included.
         ok = ritz0.compile_file(str(root / rel), str(tmp_path / f"{i}.ll"),
-                                no_runtime=True, check_types=True,
+                                no_runtime=True,
                                 source_roots=sources, project_root=str(root),
                                 target=target)
         if not ok:

@@ -22,8 +22,8 @@ programmer never wrote. That is why 53_async, 54_async_fs and
 55_async_state_machine read as async bugs and sat on the known-failure
 allowlist misfiled as "unmigrated async".
 
-ritz0 has no separate type checker — `--check-types` is off by default — so
-emission is the first and only pass that could notice.
+ritz0's type checker (then behind `--check-types`, off by default) didn't
+see it, so emission was the first and only pass that could notice.
 
 SCOPE, deliberately narrow. This rejects only the irreconcilable case: a scalar
 annotation on an aggregate value, or an aggregate annotation on a scalar value.

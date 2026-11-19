@@ -37,9 +37,8 @@ Two defects fall out of that, and this module pins both.
    variant is a legitimate user error, but it escaped as an unhandled
    ``ValueError`` from deep inside the emitter with a Python traceback and no
    ``file:line:column``.  ``type_checker._check_pattern`` has the information to
-   catch this earlier but silently ignores it, and ``--check-types`` is off by
-   default — so the emitter is the only line of defence and must report like
-   one.
+   catch this earlier but silently ignores it, so the emitter is the only
+   line of defence and must report like one.
 """
 
 import subprocess

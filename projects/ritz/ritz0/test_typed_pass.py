@@ -4,9 +4,10 @@ ritz0 N1, AGAST #3448).
 ritz0 typed expressions in four places (type_checker, move_checker, monomorph,
 the emitter), each re-deriving the same rules.  `typed.type_module` is now the
 one walk that types a module: it leaves a `Typed` side table, keyed by node,
-on `module.typed`.  It runs on every compile, as `ritz0._type`, not only under
-`--check-types`; that flag now only decides whether its type errors are
-reported (turning them on by default is #1823).  The move checker takes the
+on `module.typed`.  It runs on every compile, as `ritz0._type`, and
+`ritz0._check_types` reports its type errors on every compile too, after
+emission (AGAST #3556 removed the `--check-types` flag that gated them;
+#4260 kept the emitter's words where both refuse).  The move checker takes the
 types of literals, casts, struct literals and calls from the table; its own
 rules for those kinds are gone.  So does the emitter, for typed.EMITTER_READS
 (#3555), and so does monomorph (#3554, test_monomorph_reads_typed.py).
@@ -97,8 +98,8 @@ def test_the_table_is_keyed_by_node_not_by_equal_nodes():
 
 
 def test_type_errors_are_kept_whether_or_not_they_are_reported():
-    """The pass collects every type error; `--check-types` only decides
-    whether ritz0 prints them.  The slot errors (§13.2) are their own list:
+    """The pass collects every type error, which _check_types prints.
+    The slot errors (§13.2) are their own list:
     the ownership pass prints those beside a move error."""
     module = parse("fn f(n:& i32) -> i32\n    let x: i32 = c\"no\"\n"
                    "    let p: @i32 = n\n    0\n")
@@ -111,29 +112,16 @@ def test_type_errors_are_kept_whether_or_not_they_are_reported():
 # --- the pass list -----------------------------------------------------------
 
 def test_the_typing_pass_runs_before_the_checkers_that_read_it():
+    """...and its own errors are reported after emission, so the emitter's
+    words win where both refuse (AGAST #4260, test_type_errors_after_emit)."""
     names = [p.__name__ for p in ritz0.PASSES]
-    assert names.index("_type") < names.index("_check_types") \
-        < names.index("_check_ownership") < names.index("_emit")
+    assert names.index("_type") < names.index("_check_ownership") \
+        < names.index("_emit") < names.index("_check_types") < names.index("_write")
     assert names.index("_infer_struct_lit_args") < names.index("_type")
 
 
-def test_the_typing_pass_runs_without_check_types(tmp_path, monkeypatch):
-    seen = {}
-
-    def stop(ctx):
-        seen["typed"] = getattr(ctx.module, "typed", None)
-        return False
-
-    names = [p.__name__ for p in ritz0.PASSES]
-    monkeypatch.setattr(ritz0, "PASSES", ritz0.PASSES[:names.index("_type") + 1] + (stop,))
-    src = tmp_path / "a.ritz"
-    src.write_text(SOURCE)
-    ritz0.compile_file(str(src), str(tmp_path / "a.ll"), check_types=False)
-    assert isinstance(seen["typed"], typed.Typed) and len(seen["typed"]) > 0
-
-
 def test_a_compile_walks_its_module_with_the_type_checker_once(tmp_path, monkeypatch):
-    """`--check-types` and the slot rules beside an ownership error used to
+    """The type errors and the slot rules beside an ownership error used to
     walk the module once each; both now read the one typing pass."""
     walks = []
     real = type_checker.TypeChecker.check
@@ -161,8 +149,7 @@ fn main() -> i32
     take(r)
     0
 """)
-    ok = ritz0.compile_file(str(src), str(tmp_path / "a.ll"), check_ownership=True,
-                            check_types=True)
+    ok = ritz0.compile_file(str(src), str(tmp_path / "a.ll"), check_ownership=True)
     assert ok is False
     assert len(walks) == 1
 

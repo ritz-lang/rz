@@ -56,7 +56,7 @@ def _check(tmp_path, source):
     src.write_text(source)
     env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
     return run_ritz0([str(src), "-o", str(tmp_path / "unit.ll"), "--no-runtime",
-                      "--check-types", "--check-names"], env=env, timeout=300)
+                      "--check-names"], env=env, timeout=300)
 
 
 def test_null_fits_fn_pointer_slots(tmp_path):

@@ -13,7 +13,7 @@ all three now agree. Rename the struct and nothing here changes.
 The type checker reads a generic callee's signature at the call. Its slot
 rules run there before monomorphisation only after an ownership error, so the
 capture showed as a bogus ref-slot error in place of the real one; under
-`--check-types` the call's `T` result was the struct too.
+the typing pass the call's `T` result was the struct too.
 """
 
 import os
@@ -114,11 +114,11 @@ def test_ref_slot_check_sees_the_param_not_the_struct(compile_with, compiler):
     assert message.endswith("main.ritz:10:13)"), message
 
 
-def test_check_types_call_result_is_not_the_struct(tmp_path):
-    """ritz0 only: `--check-types` has no ritz1 counterpart."""
+def test_typing_pass_call_result_is_not_the_struct(tmp_path):
+    """ritz0 only: the typing pass's judgement, which ritz1 has no copy of."""
     src = tmp_path / "main.ritz"
     src.write_text(OPAQUE.replace("    peek(@n) - 3\n", "    let x: i32 = peek(@n)\n    x - 3\n"))
-    comp = ritz0_inproc.run_ritz0([str(src), "--check-types", "-o", str(tmp_path / "main.ll")],
+    comp = ritz0_inproc.run_ritz0([str(src), "-o", str(tmp_path / "main.ll")],
                                   cwd=tmp_path, env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)),
                                   timeout=300)
     assert comp.returncode == 0, comp.stdout + comp.stderr

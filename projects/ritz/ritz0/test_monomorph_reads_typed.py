@@ -236,7 +236,7 @@ def _monomorph_has_no_inferrers_of_its_own():
     assert "self._typed.type_of(" in inspect.getsource(monomorph.Monomorphizer._type_of)
 
 
-# --- what the instantiated types must not break (--check-types) -------------
+# --- what the instantiated types must not break (the type errors) ----------
 
 def _an_option_or_result_predicate_is_a_bool():
     """The emitter lowers `is_some` and kin itself, as a bool; ritzlib's
@@ -409,7 +409,7 @@ def _failures(rows):
 
 def test_the_typing_pass_types_each_row():
     """The type checker instantiates generics (GENERIC_ROWS), and the types
-    it now gives don't break --check-types or what monomorph binds from them."""
+    it now gives don't break its type errors or what monomorph binds from them."""
     rows = [(f"{value} is {expected}",
              lambda v=value, x=expected: _a_generic_is_typed_at_its_type_args(v, x))
             for value, expected in GENERIC_ROWS]

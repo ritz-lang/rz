@@ -56,7 +56,7 @@ from emitter.fn_cache import (
 import ritz_ast as rast
 
 
-def _compile_mode(no_runtime, check_names, check_ownership, check_types,
+def _compile_mode(no_runtime, check_names, check_ownership,
                   dependencies, source_roots, project_root, target, target_os,
                   test_mode, stack_protector=False) -> dict:
     """Every compile_file input, besides the sources themselves, that shapes
@@ -90,7 +90,6 @@ def _compile_mode(no_runtime, check_names, check_ownership, check_types,
         'stack_protector': bool(stack_protector),
         'check_names': bool(check_names),
         'check_ownership': bool(check_ownership),
-        'check_types': bool(check_types),
         'project_root': str(root) if root else None,
         'source_roots': roots,
         'ritz_path': ritz_path,
@@ -137,7 +136,6 @@ class _Compile:
     no_runtime: bool = False
     check_names: bool = False
     check_ownership: bool = False
-    check_types: bool = False
     dependencies: Optional[dict] = None
     source_roots: Optional[list] = None
     project_root: Optional[str] = None
@@ -159,6 +157,13 @@ class _Compile:
     module_names: Set[str] = field(default_factory=set)
     import_hashes: dict = field(default_factory=dict)
     import_misses: List[str] = field(default_factory=list)
+    # _emit, for _write: the IR, per-fn IR, and (fn_hashes, sig_hashes,
+    # old_sig_data) for the .ritz.sig
+    ir: str = ''
+    emitted_fn_ir: dict = field(default_factory=dict)
+    fn_cache_state: tuple = ({}, {}, None)
+    # _type, for _check_types: the source module's type errors
+    type_errors: list = field(default_factory=list)
 
 
 def _report(errors, prefix: str = '') -> bool:
@@ -367,14 +372,10 @@ def _type(ctx: _Compile) -> bool:
     `module.typed`, which the passes after it read.  Always runs; its errors
     are _check_types' and _check_ownership's to report."""
     type_module(ctx.module, ctx.module_names)
+    # _check_types reports these after _emit, by when ctx.module is the
+    # monomorphised module, whose table holds its instances' errors.
+    ctx.type_errors = list(ctx.module.typed.errors)
     return True
-
-
-def _check_types(ctx: _Compile) -> bool:
-    """`--check-types`: report the typing pass's type errors."""
-    if not ctx.check_types:
-        return True
-    return _report(ctx.module.typed.errors, "Type error: ")
 
 
 def _check_ownership(ctx: _Compile) -> bool:
@@ -465,8 +466,7 @@ def _invalidate_dependents(ctx: _Compile, changed_sigs) -> None:
 
 
 def _emit(ctx: _Compile) -> bool:
-    """Emit IR (emitter_llvmlite.emit), write the .ll, then the .ritz.sig
-    cache.
+    """Emit IR (emitter_llvmlite.emit) into `ctx.ir`; _write writes it.
 
     Always separate compilation: each source file -> one .ll file.
     Functions from the current file: define (full body).  Functions from
@@ -489,11 +489,34 @@ def _emit(ctx: _Compile) -> bool:
         fn_cache_data=None if ctx.test_mode or ctx.main_lowered else fn_cache_data)
 
     if fn_cache_data is not None and isinstance(emit_result, tuple):
-        ir, emitted_fn_ir = emit_result
+        ctx.ir, ctx.emitted_fn_ir = emit_result
     else:
-        ir = emit_result
-        emitted_fn_ir = {}
+        ctx.ir, ctx.emitted_fn_ir = emit_result, {}
+    ctx.fn_cache_state = (fn_hashes, sig_hashes, old_sig_data)
+    return True
 
+
+def _check_types(ctx: _Compile) -> bool:
+    """Report the typing pass's type errors, on every compile (AGAST #3556,
+    which removed the `--check-types` flag that gated them).
+
+    After _emit, so only a program the emitter accepted gets here: where
+    both refuse, the emitter's actionable words (which the 3-compiler
+    matrices pin, and ritz1 shares) are the ones printed, and an ill-typed
+    program the emitter would lower is still refused (AGAST #4260).  The
+    IR is only in memory yet; a stale .ll from an earlier compile goes, so
+    nothing downstream links a refused program."""
+    if _report(ctx.type_errors, "Type error: "):
+        return True
+    Path(ctx.output_path).unlink(missing_ok=True)
+    return False
+
+
+def _write(ctx: _Compile) -> bool:
+    """Write the .ll _emit produced, then the .ritz.sig cache: only once
+    every check passed, so no sig records a refused compile as up to date."""
+    ir, emitted_fn_ir = ctx.ir, ctx.emitted_fn_ir
+    fn_hashes, sig_hashes, old_sig_data = ctx.fn_cache_state
     Path(ctx.output_path).write_text(ir)
 
     # --- Write .ritz.sig cache with emitted function IR ---
@@ -542,18 +565,19 @@ PASSES = (
     _check_names,
     _infer_struct_lit_args,
     _type,
-    _check_types,
     _check_no_effect,
     _check_ownership,
     _monomorph,
     _check_instances,
     _emit,
+    _check_types,
+    _write,
 )
 
 
 def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   check_names: bool = False, check_ownership: bool = False,
-                  check_types: bool = False, dependencies: dict = None,
+                  dependencies: dict = None,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
                   target_os: str = 'linux', test_mode: bool = False,
@@ -567,13 +591,13 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
     """
     try:
         ctx = _Compile(source_path, output_path, no_runtime, check_names,
-                       check_ownership, check_types, dependencies, source_roots,
+                       check_ownership, dependencies, source_roots,
                        project_root, target, target_os, test_mode,
                        stack_protector)
         ctx.source = Path(source_path).read_text()
         ctx.source_abs_path = str(Path(source_path).resolve())
         ctx.mode_key = compile_mode_key(_compile_mode(
-            no_runtime, check_names, check_ownership, check_types,
+            no_runtime, check_names, check_ownership,
             dependencies, source_roots, project_root, target, target_os,
             test_mode, stack_protector))
         if _up_to_date(ctx):
@@ -654,8 +678,6 @@ def main():
                         help='Verify all referenced names are defined before IR emission')
     parser.add_argument('--no-check-ownership', action='store_true',
                         help='Disable ownership/borrowing checks (enabled by default)')
-    parser.add_argument('--check-types', action='store_true',
-                        help='Enable type checking (catches type errors before IR generation)')
     parser.add_argument('--deps',
                         help='JSON dependency specification for RFC #109 namespacing')
     parser.add_argument('--sources',
@@ -741,7 +763,6 @@ def main():
                                no_runtime=args.no_runtime,
                                check_names=args.check_names,
                                check_ownership=not args.no_check_ownership,
-                               check_types=args.check_types,
                                dependencies=dependencies,
                                source_roots=source_roots,
                                project_root=project_root,

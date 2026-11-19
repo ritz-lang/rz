@@ -8,6 +8,7 @@ from typing import Optional, Tuple
 
 import array_rules
 import float_rules
+import future_rules
 import ritz_ast as rast
 from monomorph import mangle_generic_name
 from tail_value import slot_tails
@@ -97,6 +98,47 @@ class TypeQueriesMixin:
             self._slot_reported.add(id(value))
             self._slot_error(array_rules.LENGTH_MISMATCH, stmt.span)
 
+    def _emitter_dispatched(self, receiver: rast.Type,
+                            expr: rast.MethodCall) -> Optional[rast.Type]:
+        """The type of a method call no declared fn answers but the emitter
+        dispatches, which the refusal predicates below leave alone (AGAST
+        #4260): `v.len()` on a Vec (_try_emit_len_builtin) is an i64, and a
+        `Deref` type's call reaches its target's methods through `Foo_deref`
+        (§7.7), typed by the target's own method.  None for anything else."""
+        if not isinstance(receiver, rast.NamedType):
+            return None
+        name = receiver.name.split('$')[0]
+        if name == 'Vec' and expr.method == 'len' and not expr.args:
+            return rast.NamedType(expr.span, 'i64', [])
+        for key in (receiver.name, name):
+            if key in self.deref_targets:
+                target = self._strip_indirection(self.deref_targets[key][1])
+                if not isinstance(target, rast.NamedType):
+                    return rast.NamedType(expr.span, 'unknown', [])
+                sig = self.functions.get(f"{target.name}_{expr.method}")
+                if sig is not None and sig.ret_type is not None:
+                    return sig.ret_type
+                return rast.NamedType(expr.span, 'unknown', [])
+        return None
+
+    def _is_u8(self, ty: rast.Type) -> bool:
+        ty = self._resolve_alias(ty)
+        return isinstance(ty, rast.NamedType) and ty.name == 'u8' and not ty.args
+
+    def _is_strview(self, ty: rast.Type) -> bool:
+        ty = self._resolve_alias(ty)
+        return isinstance(ty, rast.NamedType) and ty.name == 'StrView' and not ty.args
+
+    def _is_byte_array(self, ty: rast.Type) -> bool:
+        """`[N]u8` / `[N]i8`, or an `@` / `*` of one."""
+        ty = self._resolve_alias(ty)
+        if isinstance(ty, (rast.PtrType, rast.RefType)):
+            ty = self._resolve_alias(ty.inner)
+        if not isinstance(ty, rast.ArrayType):
+            return False
+        elem = self._resolve_alias(ty.inner)
+        return isinstance(elem, rast.NamedType) and elem.name in ('u8', 'i8')
+
     def _arrays_fit(self, actual: rast.Type, slot: rast.Type) -> bool:
         """False if an array in `actual` lands on another element type in `slot`.
         The length is judged elsewhere."""
@@ -121,6 +163,11 @@ class TypeQueriesMixin:
                     and self._same_type(a.inner, b.inner))
         if isinstance(a, (rast.PtrType, rast.RefType)) and type(a) is type(b):
             return a.mutable == b.mutable and self._same_type(a.inner, b.inner)
+        # `Box<T>` against `Box<i32>`: T is a callee's type parameter, which
+        # can't be judged here either (AGAST #4260)
+        if (isinstance(a, rast.NamedType) and isinstance(b, rast.NamedType)
+                and a.name == b.name and a.args and len(a.args) == len(b.args)):
+            return all(self._same_type(x, y) for x, y in zip(a.args, b.args))
         return self._type_str(a) == self._type_str(b)
 
     # Helper methods
@@ -266,8 +313,15 @@ class TypeQueriesMixin:
         return all(self._is_u8_ptr(slot) or self._is_u8_span(slot)
                    if isinstance(tail, rast.StringLit)
                    else (float_rules.int_literal_only(tail) and self._is_float(slot))
-                   or self._type_fits(self._infer_type(tail), slot)
+                   or self._type_fits(self._tail_type(tail), slot)
                    for tail, slot in tails)
+
+    def _tail_type(self, tail: rast.Expr) -> rast.Type:
+        """A tail's type as typed in its own scope: a match arm's binding
+        (`n => n`) is out of scope here, so re-inferring it called `n`
+        undefined (AGAST #4260).  Inferred afresh only if never typed."""
+        ty = self.typed.type_of(tail)
+        return ty if ty is not None else self._infer_type(tail)
 
     def _type_fits(self, actual: rast.Type, expected: rast.Type) -> bool:
         """A value of type `actual` in an `expected` slot: compatible, or an
@@ -379,6 +433,10 @@ class TypeQueriesMixin:
                 return True
             if actual.name in self.INT_TYPES and expected.name in self.INT_TYPES:
                 return True  # Allow integer type coercion for now
+            # An f32 widens into an f64 slot implicitly; only the other way
+            # needs `as` (LANGUAGE_SPEC §7.5, AGAST #4260)
+            if actual.name == 'f32' and expected.name == 'f64':
+                return True
             # void compatible with no return
             if actual.name == 'void' or expected.name == 'void':
                 return True
@@ -390,6 +448,26 @@ class TypeQueriesMixin:
         if isinstance(actual, rast.NamedType) and isinstance(expected, (rast.PtrType, rast.RefType)):
             if actual.name in {'i64', 'u64'}:
                 return True
+
+        # The byte pointer is the way between (LANGUAGE_SPEC, LARB R71): any
+        # `*T` or `@T` fits a `*u8`, and a `*u8` fits any `*T` (AGAST #4260)
+        if isinstance(expected, rast.PtrType) and (
+                (isinstance(actual, (rast.PtrType, rast.RefType)) and self._is_u8(expected.inner))
+                or (isinstance(actual, rast.PtrType) and self._is_u8(actual.inner))):
+            return True
+        # ...and a fn type, which lowers to an opaque `ptr` (§5.5): `*u8` from
+        # an `extern fn addr(..) -> *u8` is the way into one
+        if isinstance(expected, rast.FnType) and isinstance(actual, rast.PtrType) \
+                and self._is_u8(actual.inner):
+            return True
+
+        # Any async fn's generated future (`NAME_Future`) is a `Future` behind
+        # a reference (LARB R79, as type_refs._other_referent; AGAST #4260)
+        if isinstance(actual, (rast.PtrType, rast.RefType)) \
+                and isinstance(expected, (rast.PtrType, rast.RefType)) \
+                and future_rules.is_future(self._resolve_alias(expected.inner)) \
+                and self._future_fn(self._resolve_alias(actual.inner)) is not None:
+            return True
 
         # Pointer types
         if isinstance(actual, rast.PtrType) and isinstance(expected, rast.PtrType):
@@ -416,6 +494,11 @@ class TypeQueriesMixin:
             return all(self._types_compatible(a, e)
                        for a, e in zip(actual.elements, expected.elements))
 
+        # `[N]u8` / `[N]i8`, bare or `@`, is `StrView { &a[0], N }`, as the
+        # emitter lowers it (AGAST #4260, test_ritz1_whole_array's strview_*)
+        if self._is_strview(expected) and self._is_byte_array(actual):
+            return True
+
         # `@a` of an array or a Vec views its elements: it fits their Span
         if self._is_span(expected) and self._span_view_fits(actual, expected):
             return True
@@ -424,9 +507,16 @@ class TypeQueriesMixin:
         if isinstance(actual, rast.FnType) and isinstance(expected, rast.FnType):
             if len(actual.params) != len(expected.params):
                 return False
-            for a, e in zip(actual.params, expected.params):
-                if not self._types_compatible(a, e):
-                    return False
+            for i, (a, e) in enumerate(zip(actual.params, expected.params)):
+                if self._types_compatible(a, e):
+                    continue
+                # A `name:& T` slot is physically a `*T` (AGAST #3034): it
+                # fits a `@T` / `@&T` / `*T` param, as the emitter lowers it
+                # (AGAST #4260, test_ritz1_borrow_array's fn_value).
+                if i in actual.lent and isinstance(e, (rast.RefType, rast.PtrType)) \
+                        and self._types_compatible(a, e.inner):
+                    continue
+                return False
             return self._types_compatible(actual.ret, expected.ret)
 
         return False

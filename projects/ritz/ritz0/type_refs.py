@@ -114,7 +114,9 @@ class RefChecksMixin:
         pointer = isinstance(actual, (rast.PtrType, rast.RefType))
         if pointer and isinstance(slot, rast.RefType) and isinstance(inner, rast.PtrType):
             held = self._resolve_alias(actual.inner)
-            if isinstance(held, rast.PtrType) and self._type_str(held) != self._type_str(inner):
+            # Pointee against pointee, a callee's `T` unjudged (`*B<i32>`
+            # into `@*B<T>`, AGAST #4260)
+            if isinstance(held, rast.PtrType) and not self._same_type(held.inner, inner.inner):
                 self._slot_reported.add(id(expr))
                 self._slot_error(ref_rules.REF_TO_OTHER_POINTER, expr.span)
                 return
