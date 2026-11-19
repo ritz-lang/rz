@@ -274,18 +274,26 @@ pub fn daemon_get_worker_slot(ctx: *DaemonContext, slot_idx: i32) -> *WorkerSlot
 # Worker Lifecycle
 # ============================================================================
 
-# Prepare worker (set up shm, ready to fork)
+# Prepare worker (set up shm, ready to fork). Accepts a freshly allocated
+# slot, or one whose previous worker has been reaped (DEAD, pid 0), which is
+# how respawn and hot reload reuse a slot (AGAST #4179): the replacement gets
+# a fresh control block, not the old one's STOPPING state and ring indices.
+# A slot with a live worker is refused: its control block is in use.
 pub fn daemon_prepare_worker(ctx: *DaemonContext, slot_idx: i32) -> i32
     if slot_idx < 0 || slot_idx >= MAX_WORKERS
         return -1
 
     let slot: *WorkerSlot = ctx.workers + slot_idx
-    if slot.state != WORKER_SLOT_ALLOCATED
+    let reaped: bool = slot.state == WORKER_SLOT_DEAD && slot.pid == 0
+    if slot.state != WORKER_SLOT_ALLOCATED && !reaped
         return -1
 
-    # Initialize control block
+    # Initialize control block, keeping the ring geometry shm_create gave it
+    # (control_block_init assumes the 256-slot default).
     let cb: *ControlBlock = shm_get_control_block(@slot.shm)
     control_block_init(cb)
+    cb.ring_capacity = slot.shm.config.ring_capacity
+    cb.ring_mask = slot.shm.config.ring_capacity - 1
 
     slot.state = WORKER_SLOT_PREPARED
     return 0
@@ -314,6 +322,19 @@ pub fn daemon_request_worker_stop(ctx: *DaemonContext, slot_idx: i32)
     # Signal via control block
     let cb: *ControlBlock = shm_get_control_block(@slot.shm)
     cb.state = WORKER_STATE_STOPPING
+
+# Record that the slot's process has exited and been waited for. The slot
+# keeps its shm; daemon_prepare_worker can then make it ready for a
+# replacement (respawn, hot reload).
+pub fn daemon_mark_worker_reaped(ctx: *DaemonContext, slot_idx: i32)
+    if slot_idx < 0 || slot_idx >= MAX_WORKERS
+        return
+
+    let slot: *WorkerSlot = ctx.workers + slot_idx
+    if slot.state == WORKER_SLOT_FREE
+        return
+    slot.state = WORKER_SLOT_DEAD
+    slot.pid = 0
 
 # Get count of running workers
 pub fn daemon_get_running_worker_count(ctx: *DaemonContext) -> i32

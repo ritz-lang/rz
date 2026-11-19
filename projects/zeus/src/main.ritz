@@ -297,8 +297,12 @@ fn check_workers(ctx: *DaemonContext)
                 print_i32(i)
                 print_str(c" died, respawning...\n")
 
-                # Re-prepare the slot (reinitialize control block)
-                daemon_prepare_worker(ctx, i)
+                # The old process is reaped: give the slot a fresh control
+                # block before the replacement attaches (AGAST #4179)
+                daemon_mark_worker_reaped(ctx, i)
+                if !reprepare_worker(ctx, i)
+                    i = i + 1
+                    continue
 
                 # Spawn new worker
                 let pid: i32 = spawn_worker(slot.shm.fd, slot.shm.size, i, g_worker_count, g_app_module)
@@ -362,6 +366,16 @@ fn mark_reaped(slot: *WorkerSlot, idx: i32)
     print_str(c")\n")
     slot.state = WORKER_SLOT_DEAD
     slot.pid = 0
+
+# Re-prepare a reaped slot for its replacement worker. On failure the slot
+# stays DEAD and nothing is spawned on a stale control block (AGAST #4179).
+fn reprepare_worker(ctx: *DaemonContext, idx: i32) -> bool
+    if daemon_prepare_worker(ctx, idx) == 0
+        return true
+    print_str(c"zeus: failed to prepare worker ")
+    print_i32(idx)
+    print_str(c"\n")
+    return false
 
 # Stop and reap every worker (AGAST #2465): SIGTERM, up to 1s for them to
 # exit, then SIGKILL whatever is left and wait for it. A supervisor that
@@ -450,7 +464,9 @@ fn initiate_hot_reload(ctx: *DaemonContext)
             print_i32(i)
             print_str(c"\n")
 
-            daemon_prepare_worker(ctx, i)
+            if !reprepare_worker(ctx, i)
+                i = i + 1
+                continue
             let pid: i32 = spawn_worker(slot.shm.fd, slot.shm.size, i, g_worker_count, g_app_module)
             if pid > 0
                 daemon_mark_worker_running(ctx, i, pid)

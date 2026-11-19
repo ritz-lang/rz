@@ -257,6 +257,143 @@ fn test_daemon_prepare_worker() -> i32
     daemon_destroy(@ctx)
     return 0
 
+# AGAST #4179: control_block_init hardcodes 256 slots, so prepare must put
+# back the capacity the slot's shm was created with (-r).
+[[test]]
+fn test_daemon_prepare_keeps_ring_capacity() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 1
+    cfg.ring_capacity = 512
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.shm)
+    if cb.ring_capacity != 512 || cb.ring_mask != 511
+        prints("FAIL: prepare reset ring capacity to the 256 default\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# AGAST #4179: respawn and hot reload re-prepare a slot whose worker has been
+# reaped. Prepare used to refuse anything but ALLOCATED, so the new worker
+# inherited the old control block: state STOPPING and stale ring indices.
+[[test]]
+fn test_daemon_prepare_reaped_worker_reinits_control_block() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 1
+    cfg.ring_capacity = 512
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+    daemon_mark_worker_running(@ctx, slot_idx, 12345)
+
+    # The old worker served traffic, then a SIGHUP asked it to stop
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.shm)
+    cb.req_write_idx = 7
+    cb.req_read_idx = 5
+    cb.resp_write_idx = 5
+    cb.resp_read_idx = 4
+    cb.worker_pid = 12345
+    daemon_request_worker_stop(@ctx, slot_idx)
+
+    daemon_mark_worker_reaped(@ctx, slot_idx)
+    if slot.state != WORKER_SLOT_DEAD || slot.pid != 0
+        prints("FAIL: reaped slot should be DEAD with pid 0\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if daemon_prepare_worker(@ctx, slot_idx) != 0
+        prints("FAIL: prepare refused a reaped slot\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if slot.state != WORKER_SLOT_PREPARED
+        prints("FAIL: re-prepared slot should be PREPARED\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if cb.state != WORKER_STATE_IDLE
+        prints("FAIL: control block state not reinitialised (still STOPPING)\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if cb.req_write_idx != 0 || cb.req_read_idx != 0 || cb.resp_write_idx != 0 || cb.resp_read_idx != 0
+        prints("FAIL: ring indices not reinitialised\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if cb.worker_pid != 0
+        prints("FAIL: control block pid not reinitialised\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if cb.ring_capacity != 512 || cb.ring_mask != 511
+        prints("FAIL: re-prepare reset ring capacity\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
+# A slot whose worker is still live must not have its control block wiped
+# under it: prepare refuses RUNNING and STOPPING.
+[[test]]
+fn test_daemon_prepare_refuses_live_worker() -> i32
+    var cfg: DaemonConfig
+    daemon_config_init(@cfg)
+    cfg.worker_count = 1
+
+    var ctx: DaemonContext
+    daemon_init(@ctx, @cfg)
+
+    let slot_idx: i32 = daemon_alloc_worker_slot(@ctx)
+    daemon_prepare_worker(@ctx, slot_idx)
+    daemon_mark_worker_running(@ctx, slot_idx, 12345)
+
+    let slot: *WorkerSlot = daemon_get_worker_slot(@ctx, slot_idx)
+    let cb: *ControlBlock = shm_get_control_block(@slot.shm)
+    cb.req_write_idx = 7
+
+    if daemon_prepare_worker(@ctx, slot_idx) == 0
+        prints("FAIL: prepare accepted a RUNNING slot\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_request_worker_stop(@ctx, slot_idx)
+    if daemon_prepare_worker(@ctx, slot_idx) == 0
+        prints("FAIL: prepare accepted a STOPPING slot\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    if cb.req_write_idx != 7 || slot.state != WORKER_SLOT_STOPPING
+        prints("FAIL: refused prepare still touched the slot\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    # DEAD but still carrying a pid: not reaped through
+    # daemon_mark_worker_reaped, so not known to be gone
+    slot.state = WORKER_SLOT_DEAD
+    if daemon_prepare_worker(@ctx, slot_idx) == 0
+        prints("FAIL: prepare accepted a DEAD slot that still has a pid\n")
+        daemon_destroy(@ctx)
+        return 1
+
+    daemon_destroy(@ctx)
+    return 0
+
 [[test]]
 fn test_daemon_mark_worker_running() -> i32
     var cfg: DaemonConfig
