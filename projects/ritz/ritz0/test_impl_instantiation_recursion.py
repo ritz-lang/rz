@@ -1,20 +1,23 @@
 #!/usr/bin/env python3
-"""A generic impl whose method names a deeper instance is refused (AGAST #3330).
+"""A generic impl whose called method names a deeper instance is refused (AGAST #3330).
 
     impl<T> Cell<T>
-        fn wrap(self: @Cell<T>) -> Cell<Cell<T>>
+        fn deep(self: @Cell<T>) -> i32
+            let c = Cell<Cell<T>> { v: *self }
+            c.deep()
 
-Every method of a generic impl is specialised for each instance of its type,
-so Cell<i32>'s `wrap` names Cell<Cell<i32>>, whose `wrap` names
+`deep` at Cell<i32> calls `deep` at Cell<Cell<i32>>, which calls it at
 Cell<Cell<Cell<i32>>>, and so on.  ritz0 gave up after 100 rounds and died in
 the emitter with a Python traceback; ritz1 and ritz1_selfhosted never finished.
+All three compilers now cap how deep instantiation goes: an instance
+discovered while specialising another is one generation deeper, and past 64
+generations instantiation stops with an error at the generic impl, naming the
+type.
 
-Specialising only the methods a call reaches (as Rust does) would compile this
-program (AGAST #3341), but ritz1 resolves method calls in its emitter, after
-monomorphisation, so it can't yet tell which methods are reached.  All three
-compilers instead cap how deep instantiation goes: an instance discovered while
-specialising another is one generation deeper, and past 64 generations
-instantiation stops with an error at the generic impl, naming the type.
+A method is specialised only where a call reaches it (AGAST #3617, #3341), so
+the ticket's first program, `fn wrap(self) -> Cell<Cell<T>>` called once,
+now compiles: Cell<Cell<i32>>'s `wrap` is never called
+(test_impl_specialize_on_use.py).
 
 The ritz1 compilers run under a timeout, so a regression to the old hang fails
 here rather than stalling the suite.
@@ -34,11 +37,12 @@ RECURSIVE = """\
 struct Cell<T>
     v: T
 impl<T> Cell<T>
-    fn wrap(self: @Cell<T>) -> Cell<Cell<T>>
-        Cell<Cell<T>> { v: Cell<T> { v: self.v } }
+    fn deep(self: @Cell<T>) -> i32
+        let c = Cell<Cell<T>> { v: *self }
+        c.deep()
 fn main() -> i32
     let c = Cell<i32> { v: 9 }
-    c.wrap().v.v
+    c.deep()
 """
 
 # Nesting the program spells out is finite, so it still compiles: two levels

@@ -3,10 +3,12 @@
     import ritzlib.span
     # T implements Drop
     fn f(p: @Span<T>) -> i32
+        let x: T = p.get(0)
         return 0
 
-instantiates span.ritz's `span_get<T>`, whose `return *(s.ptr + idx)` moves a T
-out of a pointer.  ritz0 reports it at `.../ritzlib/span.ritz:91:12`; ritz1 and
+instantiates span.ritz's `span_get<T>` through `impl<T> Span<T>`'s `get` (a
+method is specialised only once called: AGAST #3617), and `span_get`'s
+`return *(s.ptr + idx)` moves a T out of a pointer.  ritz0 reports it at `.../ritzlib/span.ritz:91:12`; ritz1 and
 ritz1_selfhosted printed `main.ritz:91:12`, a line main.ritz doesn't have,
 because ref_check located every error in the driver's input file.
 
@@ -90,21 +92,21 @@ MOVE_OUT = "cannot move out of a reference"
 CASES = {
     # (main.ritz, extra files, the file the error belongs to, line:col, message)
     "ritzlib_span": (
-        f"import ritzlib.span\n\n{DROP_T}\nfn f(p: @Span<T>) -> i32\n    return 0\n",
+        f"import ritzlib.span\n\n{DROP_T}\nfn f(p: @Span<T>) -> i32\n    let x: T = p.get(0)\n    return 0\n",
         {},
         str(RITZ_ROOT / "ritzlib" / "span.ritz"),
         "91:12",
         MOVE_OUT,
     ),
     "user_module": (
-        f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    return 0\n",
+        f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    let x: T = p.get()\n    return 0\n",
         {"cell.ritz": CELL},
         "cell.ritz",
         "5:12",
         MOVE_OUT,
     ),
     "user_method": (
-        f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    return 0\n",
+        f"import cell\n\n{DROP_T}\nfn f(p: @Cell<T>) -> i32\n    let x: T = p.get()\n    return 0\n",
         {"cell.ritz": CELL_METHOD},
         "cell.ritz",
         "6:16",

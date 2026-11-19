@@ -16,6 +16,7 @@ import ast_helpers
 import struct_index   # AGAST #1635
 import emitter_core   # is_simd_vector_type_name (AGAST #3264), is_primitive_type_name
 import diag           # diag_error_at (AGAST #3445)
+import interp         # print placeholders' method calls (AGAST #3617)
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
@@ -2486,6 +2487,7 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # vec_push_bytes$u8) needs that method even when nothing else calls it.
         if e.args != null and buf_eq(e.func_name, e.func_name_len, c"format_into", 11) == 1
             register_receiver_method(m, e.args, c"push_bytes", 10)
+        want_interp_methods(m, e)   # AGAST #3617
         # Recurse into arguments, each into its parameter's slot (AGAST #2877).
         let callee: *FnDef = slice_callee(m, e)
         var par: *Param = null
@@ -2551,6 +2553,7 @@ fn collect_from_expr(m: *Module, e: *Expr)
         # `vec_<method>$T` symbol (the emitter's UFCS dispatch falls
         # back to the broken `Vec$T_<method>` mangling).
         register_receiver_method(m, e.left, e.ident_ptr, e.ident_len)
+        want_receiver_method(m, e.left, e.ident_ptr, e.ident_len)   # AGAST #3617
         collect_from_expr(m, e.left)  # receiver
         var arg: *Expr = e.args
         while arg != null
@@ -2832,15 +2835,9 @@ fn clone_and_specialize_function(m: *Module, template: *FnDef, suffix: *u8, suff
         tp = tp.next
         i = i + 1
     g_mono_component_mode = 0
-    # A specialisation's body has no slot context (AGAST #2877).
-    let saved_ret: *u8 = g_mono_ret_name
-    let saved_ret_len: i32 = g_mono_ret_len
-    let saved_tail: *Stmt = g_mono_tail
-    set_mono_fn_context(null)
-    collect_from_fn_body(m, cur.body)
-    g_mono_ret_name = saved_ret
-    g_mono_ret_len = saved_ret_len
-    g_mono_tail = saved_tail
+    # Walked as a one-parameter specialisation is: its params seeded, so a
+    # receiver's type is the param's, not a stale local's (AGAST #3617).
+    collect_receiver_methods(m, cur)
     cur
 
 # AGAST #2412: walk a one-parameter specialisation's finished body, as the
@@ -2859,7 +2856,13 @@ fn collect_receiver_methods(m: *Module, f: *FnDef)
     reset_local_var_tracker()
     var pp: *Param = f.params
     while pp != null
-        track_typed_local_through(pp.name, pp.name_len, pp.param_type, pp.param_pointee_type, pp.param_type_name, pp.param_type_name_len)
+        if g_impl_self_len > 0 and param_is_self(pp) == 1 and pp.param_type_name_len == 0
+            # AGAST #3617: a bare `self` / `self:&` of the impl method being
+            # specialised is its instance, which name_untyped_self names only
+            # afterwards: `self.m()` wants `m` there alone.
+            track_typed_local_through(pp.name, pp.name_len, TYPE_MUT_REF, TYPE_STRUCT, g_impl_self_name, g_impl_self_len)
+        else
+            track_typed_local_through(pp.name, pp.name_len, pp.param_type, pp.param_pointee_type, pp.param_type_name, pp.param_type_name_len)
         pp = pp.next
     set_mono_fn_context(null)   # A specialisation has no slot context (#2877).
     collect_from_fn_body(m, f.body)
@@ -4694,21 +4697,217 @@ fn specialize_impl_methods(m: *Module, type_name: *u8, type_name_len: i32, suffi
         specialize_one_impl(m, ib, type_name, type_name_len, suffix, suffix_len)
         ib = find_generic_impl(ib.next, type_name, type_name_len)
 
+# A trait impl is specialised whole: the compiler calls its methods itself
+# (drop, index, ...).  An inherent impl's methods wait for a call that names
+# them (AGAST #3617): specialize_wanted_methods.
 fn specialize_one_impl(m: *Module, ib: *ImplBlock, type_name: *u8, type_name_len: i32, suffix: *u8, suffix_len: i32)
+    if ib.trait_name == null or ib.trait_name_len == 0
+        return
     var method: *FnDef = ib.methods
     while method != null
-        let specialized: *FnDef = specialize_impl_method(m, ib, method, type_name, type_name_len, suffix, suffix_len)
-        if specialized != null
-            collect_struct_types_from_fn(m, specialized)
-            # Add to module's function list
-            if m.functions == null
-                m.functions = specialized
-            else
-                var f: *FnDef = m.functions
-                while f.next != null
-                    f = f.next
-                f.next = specialized
+        add_specialized_method(m, specialize_impl_method(m, ib, method, type_name, type_name_len, suffix, suffix_len))
         method = method.next
+
+fn add_specialized_method(m: *Module, specialized: *FnDef)
+    if specialized == null
+        return
+    collect_struct_types_from_fn(m, specialized)
+    # Add to module's function list
+    if m.functions == null
+        m.functions = specialized
+    else
+        var f: *FnDef = m.functions
+        while f.next != null
+            f = f.next
+        f.next = specialized
+
+# ============================================================================
+# Inherent impl methods, specialised on use (AGAST #3617, #3341)
+# ============================================================================
+# Every method of a generic impl used to be specialised for every instance of
+# its type, so a method nothing calls was emitted, typed and move-checked at
+# every instance: an importer of ritzlib.gvec linked malloc through
+# `vec_grow$u8`, and `impl<T> Cell<T>`'s `fn wrap(self) -> Cell<Cell<T>>`
+# named a deeper instance at every level.  Now a call names the methods it
+# reaches, as a generic fn's call does: `x.m()` wants `m` at x's instance,
+# when the local-var tracker knows x's type, and at every instance when it
+# doesn't (nothing reachable is missed).  ritz0: monomorph.py, _want_method.
+
+struct WantedMethod
+    base: *u8
+    base_len: i32
+    suffix: *u8          # "$i32"; null: every instance
+    suffix_len: i32
+    method: *u8
+    method_len: i32
+    next: *WantedMethod
+
+var g_wanted_methods: *WantedMethod = null
+var g_done_methods: *WantedMethod = null
+# The instance whose impl method is being specialised ("W$i32"), for its
+# bare `self` (collect_receiver_methods); 0 outside.
+var g_impl_self_name: *u8 = null
+var g_impl_self_len: i32 = 0
+
+# 1 if an inherent generic impl of `base` (null: of any type) defines `meth`.
+fn inherent_generic_method(m: *Module, base: *u8, base_len: i32, meth: *u8, meth_len: i32) -> i32
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.type_params != null and (ib.trait_name == null or ib.trait_name_len == 0)
+            if base == null or buf_eq(ib.type_name, ib.type_name_len, base, base_len) == 1
+                var f: *FnDef = ib.methods
+                while f != null
+                    if buf_eq(f.name, f.name_len, meth, meth_len) == 1
+                        return 1
+                    f = f.next
+        ib = ib.next
+    0
+
+fn wanted_in(list: *WantedMethod, base: *u8, base_len: i32, suffix: *u8, suffix_len: i32, meth: *u8, meth_len: i32) -> i32
+    var w: *WantedMethod = list
+    while w != null
+        if buf_eq(w.method, w.method_len, meth, meth_len) == 1
+            if w.suffix == null
+                return 1
+            if buf_eq(w.base, w.base_len, base, base_len) == 1 and buf_eq(w.suffix, w.suffix_len, suffix, suffix_len) == 1
+                return 1
+        w = w.next
+    0
+
+fn push_wanted(list: *WantedMethod, base: *u8, base_len: i32, suffix: *u8, suffix_len: i32, meth: *u8, meth_len: i32) -> *WantedMethod
+    let w: *WantedMethod = malloc(sizeof(WantedMethod)) as *WantedMethod
+    w.base = base
+    w.base_len = base_len
+    w.suffix = suffix
+    w.suffix_len = suffix_len
+    w.method = meth
+    w.method_len = meth_len
+    w.next = list
+    w
+
+# A call names `meth` on an instance of type `tn` ("W$i32"; null: unknown).
+fn want_method(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32)
+    if tn == null or tn_len <= 0
+        if inherent_generic_method(m, null, 0, meth, meth_len) == 1 and wanted_in(g_wanted_methods, null, 0, null, 0, meth, meth_len) == 0
+            g_wanted_methods = push_wanted(g_wanted_methods, null, 0, null, 0, meth, meth_len)
+        return
+    let d: i32 = find_dollar_sign(tn, tn_len)
+    if d <= 0 or inherent_generic_method(m, tn, d, meth, meth_len) == 0
+        return
+    if wanted_in(g_wanted_methods, tn, d, tn + d, tn_len - d, meth, meth_len) == 0
+        g_wanted_methods = push_wanted(g_wanted_methods, tn, d, tn + d, tn_len - d, meth, meth_len)
+
+# `recv.meth(..)`: the instance the tracker types `recv` as, or every one.
+fn want_receiver_method(m: *Module, recv: *Expr, meth: *u8, meth_len: i32)
+    if inherent_generic_method(m, null, 0, meth, meth_len) == 0
+        return
+    var r: *Expr = recv
+    if r != null and r.kind == EXPR_UNARY and (r.op == OP_ADDR or r.op == OP_ADDR_MUT)
+        r = r.operand
+    if r != null and r.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(r.ident_ptr, r.ident_len)
+        if idx >= 0 and *(g_lv_prefix_kind + idx) == 0
+            want_method(m, *(g_lv_type_names + idx), *(g_lv_type_name_lens + idx), meth, meth_len)
+            return
+        if idx >= 0
+            # A Vec / Span local: its type is the kind's name and suffix.
+            var base: *u8 = c"Vec"
+            var bl: i32 = 3
+            if *(g_lv_prefix_kind + idx) == 2
+                base = c"Span"
+                bl = 4
+            let sl: i32 = *(g_lv_suffix_lens + idx)
+            let tn: *u8 = malloc((bl + sl) as i64 + 1)
+            memcpy(tn, base, bl as i64)
+            memcpy(tn + bl, *(g_lv_suffixes + idx), sl as i64)
+            *(tn + bl + sl) = 0
+            want_method(m, tn, bl + sl, meth, meth_len)
+            return
+    else if r != null and r.kind == EXPR_MEMBER
+        let rf: *StructField = resolve_member_field(m, r)
+        if rf != null and rf.field_type_name != null and rf.field_type_name_len > 0
+            want_method(m, rf.field_type_name, rf.field_type_name_len, meth, meth_len)
+            return
+    want_method(m, null, 0, meth, meth_len)
+
+# The method calls in an expression: `a.m(b.n())` wants `m` and `n`.
+fn want_methods_in(m: *Module, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_METHOD
+        want_receiver_method(m, e.left, e.ident_ptr, e.ident_len)
+    if k == EXPR_STRUCT_LIT or k == EXPR_MATCH or k == EXPR_IF
+        return   # their args are no *Expr list; a placeholder holds none
+    want_methods_in(m, e.left)
+    want_methods_in(m, e.right)
+    want_methods_in(m, e.operand)
+    if k == EXPR_CALL or k == EXPR_METHOD or k == EXPR_ARRAY_LIT
+        var a: *Expr = e.args
+        while a != null
+            want_methods_in(m, a)
+            a = a.next
+
+# print / eprint / format_into's "..." literal is split into its `{expr}`
+# placeholders only when it is emitted (emitter_print.ritz), after this pass:
+# `print("{b.get()}")` names `get` where no walk here sees it.  Parse each
+# placeholder as the emitter will (interp.ritz) and want its method calls.
+fn want_interp_methods(m: *Module, e: *Expr)
+    if e.args == null
+        return
+    var lit: *Expr = null
+    if buf_eq(e.func_name, e.func_name_len, c"print", 5) == 1 or buf_eq(e.func_name, e.func_name_len, c"eprint", 6) == 1
+        lit = e.args
+    else if buf_eq(e.func_name, e.func_name_len, c"format_into", 11) == 1
+        lit = e.args.next
+    if lit == null or lit.kind != EXPR_STRING_LIT or lit.ident_ptr == null or lit.ident_len < 2
+        return
+    let body: *u8 = lit.ident_ptr + 1
+    let n: i32 = lit.ident_len - 2
+    var i: i32 = 0
+    while i < n
+        let c: i32 = *(body + i) as i32
+        if c == 92   # `\x`: an escaped byte, never a brace
+            i = i + 2
+        else if (c == 123 or c == 125) and i + 1 < n and *(body + i + 1) as i32 == c
+            i = i + 2   # `{{` / `}}`
+        else if c == 123 and interp_match_brace(body, n, i) >= 0
+            let close: i32 = interp_match_brace(body, n, i)
+            want_methods_in(m, interp_parse_expr(body + i + 1, close - i - 1, lit.span.line, lit.span.col))
+            i = close + 1
+        else
+            i = i + 1
+
+# Specialise each wanted inherent method of each instance so far, once.
+# Returns how many it specialised: the fixpoint goes on while any are.
+fn specialize_wanted_methods(m: *Module) -> i32
+    if g_wanted_methods == null
+        return 0
+    var made: i32 = 0
+    var si: i32 = 0
+    # Instances this pass adds wait for the next round, after
+    # specialize_pending_structs has checked their depth (MAX_INSTANCE_DEPTH).
+    let end: i32 = g_struct_count
+    while si < end and g_mono_errors == 0
+        let name: *u8 = get_struct_instantiation_name(si)
+        let name_len: i32 = get_struct_instantiation_name_len(si)
+        let suffix: *u8 = get_struct_instantiation_suffix(si)
+        let suffix_len: i32 = get_struct_instantiation_suffix_len(si)
+        var ib: *ImplBlock = find_generic_impl(m.impls, name, name_len)
+        while ib != null
+            if ib.trait_name == null or ib.trait_name_len == 0
+                var method: *FnDef = ib.methods
+                while method != null
+                    if wanted_in(g_wanted_methods, name, name_len, suffix, suffix_len, method.name, method.name_len) == 1 and wanted_in(g_done_methods, name, name_len, suffix, suffix_len, method.name, method.name_len) == 0
+                        g_done_methods = push_wanted(g_done_methods, name, name_len, suffix, suffix_len, method.name, method.name_len)
+                        g_cur_gen = *(g_struct_gens + si)
+                        add_specialized_method(m, specialize_impl_method(m, ib, method, name, name_len, suffix, suffix_len))
+                        made = made + 1
+                    method = method.next
+            ib = find_generic_impl(ib.next, name, name_len)
+        si = si + 1
+    g_cur_gen = -1
+    made
 
 # Specialise one method of generic impl `ib` at `suffix`.  The method is
 # specialised exactly as a generic fn whose type params are the impl's
@@ -4719,7 +4918,15 @@ fn specialize_impl_method(m: *Module, ib: *ImplBlock, method: *FnDef, type_name:
     let template: *FnDef = malloc(sizeof(FnDef)) as *FnDef
     memcpy(template as *u8, method as *u8, sizeof(FnDef))
     template.type_params = ib.type_params
+    let self_name: *u8 = malloc((type_name_len + suffix_len) as i64 + 1)
+    memcpy(self_name, type_name, type_name_len as i64)
+    memcpy(self_name + type_name_len, suffix, suffix_len as i64)
+    *(self_name + type_name_len + suffix_len) = 0
+    g_impl_self_name = self_name
+    g_impl_self_len = type_name_len + suffix_len
     let specialized: *FnDef = clone_and_specialize_function(m, template, suffix, suffix_len)
+    g_impl_self_name = null
+    g_impl_self_len = 0
     free(template as *u8)
     if specialized == null
         return null
@@ -4777,9 +4984,11 @@ pub fn monomorphize_module(m: *Module)
     # specialises its impl methods, which may name further instantiations.
     var s_done: i32 = 0
     var i: i32 = 0
-    while g_mono_errors == 0 and (s_done < g_struct_count or i < g_inst_count)
+    var made: i32 = 0
+    while g_mono_errors == 0 and (s_done < g_struct_count or i < g_inst_count or made > 0)
         s_done = specialize_pending_structs(m, s_done)
         i = specialize_pending_fns(m, i)
+        made = specialize_wanted_methods(m)   # AGAST #3617
     g_cur_gen = -1
 
 # Errors monomorphize_module reported (AGAST #3330); main stops on any.

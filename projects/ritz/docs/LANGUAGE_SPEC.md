@@ -4539,6 +4539,29 @@ This document claimed until 2026-09-12 that only the first type argument
 mangled — which would have made `Result<i32, StrView>` and `Result<i32, i64>`
 collide. They do not.
 
+A method of a generic inherent impl (`impl<T> Cell<T>`) is specialised, and
+type- and move-checked, only at the instances a call names it at, as a
+generic fn is: `x.m()` on that instance, `T.m()` filling a slot of it, or a
+call from another method so specialised. A method nothing calls at
+`Vec<Res>` is never checked there, so it may do what only some `T` allow
+(move a `T` out of a reference, say), and its callees are never linked. A
+trait impl (`impl<T> Drop for Box<T>`) is specialised whole for every
+instance: the compiler calls its methods itself. Below, `wrap` at `Cell<i32>`
+names `Cell<Cell<i32>>`, whose own `wrap` nobody calls (AGAST #3617):
+
+```ritz
+struct Cell<T>
+    v: T
+
+impl<T> Cell<T>
+    fn wrap(self: @Cell<T>) -> Cell<Cell<T>>
+        Cell<Cell<T>> { v: Cell<T> { v: self.v } }
+
+fn main() -> i32
+    let c = Cell<i32> { v: 9 }
+    c.wrap().v.v - 9
+```
+
 ### 11.5 Trait Bounds
 
 A type parameter of a fn, struct, enum or impl may name the traits it needs:

@@ -74,6 +74,21 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         self.specialized_functions: List[rast.FnDef] = []
         self.specialized_impls: List[rast.ImplBlock] = []
 
+        # AGAST #3617: an inherent generic impl's method is specialised for an
+        # instance only once a call names it there, as a generic fn is.
+        # `_impl_instances`: base -> [(type_args_key, mangled)] seen so far;
+        # `_wanted_methods`: (base, type_args_key, method) a call names, in
+        # discovery order; `_wild_methods`: methods named on a receiver whose
+        # type is unknown, wanted on every instance; `_impl_shells`: the
+        # specialised block per (generic impl, instance), made at its first
+        # method.  Trait impls are still specialised whole: the compiler
+        # calls their methods itself (drop, index, ...).
+        self._impl_instances: Dict[str, List[Tuple[Tuple[str, ...], str]]] = {}
+        self._wanted_methods: Dict[Tuple[str, Tuple[str, ...], str], None] = {}
+        self._wild_methods: Dict[str, None] = {}
+        self._impl_shells: Dict[Tuple[int, str], rast.ImplBlock] = {}
+        self._done_methods: Set[Tuple[str, Tuple[str, ...], str]] = set()
+
         # Variable type tracking for slice/index syntax
         # Maps variable name -> declared type (for current scope)
         self.var_types: Dict[str, rast.Type] = {}
@@ -432,6 +447,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 self._visit_expr(arg)
             # Register method instantiation for UFCS on generic types
             self._register_method_instantiation(expr)
+            self._want_called_method(expr)
         elif isinstance(expr, rast.If):
             self._visit_expr(expr.cond)
             self._visit_block(expr.then_block)
@@ -712,8 +728,9 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             new_structs = [k for k in self.struct_instantiations if k not in processed_structs]
             new_enums = [k for k in self.enum_instantiations if k not in processed_enums]
             new_functions = [k for k in self.function_instantiations if k not in processed_functions]
+            new_methods = self._pending_methods()
 
-            if not new_structs and not new_enums and not new_functions:
+            if not new_structs and not new_enums and not new_functions and not new_methods:
                 # Fixpoint reached
                 break
             if generation == MAX_INSTANCE_DEPTH:
@@ -754,17 +771,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 self.specialized_structs.append(specialized)
                 processed_structs.add(key)
 
-                # Also specialize any generic impl blocks for this struct
-                if base_name in self.generic_impls:
-                    for generic_impl in self.generic_impls[base_name]:
-                        # An impl's bounds are on its type's args (§11.5).
-                        self._check_bounds('struct', base_name, generic_impl.type_params,
-                                           type_args_key, type_args,
-                                           generic_impl.type_param_bounds,
-                                           owner=f"impl {base_name}")
-                        impl_subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)), struct_manglings)
-                        specialized_impl = self._specialize_impl(generic_impl, mangled_name, impl_subst)
-                        self.specialized_impls.append(specialized_impl)
+                self._instantiate_impls('struct', base_name, type_args_key, type_args,
+                                        mangled_name, struct_manglings)
 
 
             # Generate specialized enums for new instantiations
@@ -783,17 +791,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                 self.specialized_enums.append(specialized)
                 processed_enums.add(key)
 
-                # Also specialize any generic impl blocks for this enum
-                if base_name in self.generic_impls:
-                    for generic_impl in self.generic_impls[base_name]:
-                        # An impl's bounds are on its type's args (§11.5).
-                        self._check_bounds('enum', base_name, generic_impl.type_params,
-                                           type_args_key, type_args,
-                                           generic_impl.type_param_bounds,
-                                           owner=f"impl {base_name}")
-                        impl_subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)), struct_manglings)
-                        specialized_impl = self._specialize_impl(generic_impl, mangled_name, impl_subst)
-                        self.specialized_impls.append(specialized_impl)
+                self._instantiate_impls('enum', base_name, type_args_key, type_args,
+                                        mangled_name, struct_manglings)
 
 
             # Generate specialized functions for new instantiations
@@ -814,6 +813,157 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
 
                 # CRITICAL: Scan the specialized function body for new instantiations
                 # This discovers transitive generic calls like vec_ensure_cap<i32>
+                self._scan_for_new_instantiations(specialized)
+
+            # Methods calls named last generation (AGAST #3617).
+            for base_name, type_args_key, mangled_name, method in new_methods:
+                self._specialize_wanted_method(base_name, type_args_key, mangled_name,
+                                               method, struct_manglings)
+
+    def _instantiate_impls(self, kind: str, base_name: str, type_args_key: Tuple[str, ...],
+                           type_args: List[rast.Type], mangled_name: str,
+                           struct_manglings: Dict[str, Dict[Tuple[str, ...], str]]) -> None:
+        """A new instance `mangled_name` of `base_name`: specialise its trait
+        impls whole, and make its inherent impls' methods available to the
+        calls that name them (AGAST #3617)."""
+        lazy = False
+        for generic_impl in self.generic_impls.get(base_name, ()):
+            # An impl's bounds are on its type's args (§11.5).
+            self._check_bounds(kind, base_name, generic_impl.type_params,
+                               type_args_key, type_args,
+                               generic_impl.type_param_bounds,
+                               owner=f"impl {base_name}")
+            if generic_impl.trait_name is None:
+                lazy = True
+                continue
+            impl_subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)),
+                                          struct_manglings)
+            specialized_impl = self._specialize_impl(generic_impl, mangled_name, impl_subst)
+            self.specialized_impls.append(specialized_impl)
+            for method in specialized_impl.methods:
+                self._scan_for_new_instantiations(method)
+        if lazy:
+            self._impl_instances.setdefault(base_name, []).append((type_args_key, mangled_name))
+
+    def _inherent_method(self, base_name: str, method: str) -> bool:
+        """Whether an inherent generic impl of `base_name` defines `method`."""
+        return any(generic_impl.trait_name is None
+                   and any(m.name == method for m in generic_impl.methods)
+                   for generic_impl in self.generic_impls.get(base_name, ()))
+
+    def _want_called_method(self, expr: rast.MethodCall) -> None:
+        """`x.m()` / `T.m()` names inherent method `m` of x's / the slot's
+        instance (AGAST #3617)."""
+        if not self._impl_instances and not any(
+                g.trait_name is None for impls in self.generic_impls.values() for g in impls):
+            return
+        recv = expr.expr
+        if isinstance(recv, rast.TypeExpr):
+            self._want_method(recv.ty, expr.method)
+            return
+        if (isinstance(recv, rast.Ident) and recv.name in self.generic_impls
+                and recv.name not in self.var_types):
+            # `T.m()`: the instance of the slot the call fills (§11.3).
+            expected = self.expected_type
+            while isinstance(expected, (rast.PtrType, rast.RefType)):
+                expected = expected.inner
+            if isinstance(expected, rast.NamedType):
+                expected = self._instance_of_mangled(expected)
+                if expected.name == recv.name and expected.args:
+                    self._want_method(expected, expr.method)
+                    return
+            self._want_method(None, expr.method)
+            return
+        self._want_method(self._type_of(recv), expr.method)
+
+    def _want_method(self, receiver: Optional[rast.Type], method: str) -> None:
+        """A call names `method` on `receiver`, a type (None: unknown)."""
+        while isinstance(receiver, (rast.RefType, rast.PtrType)):
+            receiver = receiver.inner
+        if receiver is None or (isinstance(receiver, rast.NamedType)
+                                and receiver.name == 'unknown'):
+            # Its receiver can't be told: wanted on every instance, so a
+            # call the scan can't type still finds its method.
+            if any(self._inherent_method(b, method) for b in self.generic_impls):
+                self._wild_methods.setdefault(method, None)
+            return
+        if not isinstance(receiver, rast.NamedType):
+            return
+        receiver = self._instance_of_mangled(receiver)
+        if not receiver.args or not self._inherent_method(receiver.name, method):
+            return
+        key = (receiver.name, self._type_args_to_key(receiver.args), method)
+        self._wanted_methods.setdefault(key, None)
+
+    def _instance_of_mangled(self, ty: rast.Type) -> rast.Type:
+        """`W<Cell<i32>>` for a mangled `W$Cell_i32` or `W<Cell$i32>`: the
+        generic spelling the instance keys are made from.  Any other type
+        unchanged."""
+        if not isinstance(ty, rast.NamedType):
+            return ty
+        if ty.args:
+            return rast.NamedType(ty.span, ty.name,
+                                  [self._instance_of_mangled(a) for a in ty.args])
+        if '$' not in ty.name:
+            return ty
+        for instances in (self.struct_instantiations, self.enum_instantiations):
+            for (base_name, type_args_key), mangled in instances.items():
+                if mangled == ty.name:
+                    generic_def = (self.generic_structs.get(base_name)
+                                   or self.generic_enums.get(base_name))
+                    params = generic_def.type_params if generic_def else []
+                    return rast.NamedType(ty.span, base_name,
+                                          self._parse_type_args_key(type_args_key, params))
+        return ty
+
+    def _pending_methods(self) -> List[Tuple[str, Tuple[str, ...], str, str]]:
+        """(base, type_args_key, mangled, method) wanted on a known instance
+        and not yet specialised, in discovery order."""
+        pending = []
+        seen = set()
+
+        def add(base_name, type_args_key, mangled, method):
+            key = (base_name, type_args_key, method)
+            if key in self._done_methods or key in seen:
+                return
+            seen.add(key)
+            pending.append((base_name, type_args_key, mangled, method))
+
+        for base_name, type_args_key, method in self._wanted_methods:
+            for key, mangled in self._impl_instances.get(base_name, ()):
+                if key == type_args_key:
+                    add(base_name, type_args_key, mangled, method)
+        for method in self._wild_methods:
+            for base_name, instances in self._impl_instances.items():
+                if self._inherent_method(base_name, method):
+                    for type_args_key, mangled in instances:
+                        add(base_name, type_args_key, mangled, method)
+        return pending
+
+    def _specialize_wanted_method(self, base_name: str, type_args_key: Tuple[str, ...],
+                                  mangled_name: str, method: str,
+                                  struct_manglings: Dict[str, Dict[Tuple[str, ...], str]]) -> None:
+        """Specialise inherent method `method` of `base_name` at one instance,
+        then scan it for the instances and methods it names."""
+        self._done_methods.add((base_name, type_args_key, method))
+        for generic_impl in self.generic_impls.get(base_name, ()):
+            if generic_impl.trait_name is not None:
+                continue
+            for template in generic_impl.methods:
+                if template.name != method:
+                    continue
+                type_args = self._parse_type_args_key(type_args_key, generic_impl.type_params)
+                subst = TypeSubstitution(dict(zip(generic_impl.type_params, type_args)),
+                                         struct_manglings)
+                specialized = self._specialize_function_for_impl(template, subst)
+                shell_key = (id(generic_impl), mangled_name)
+                shell = self._impl_shells.get(shell_key)
+                if shell is None:
+                    shell = rast.ImplBlock(generic_impl.span, None, mangled_name, [],
+                                           type_params=[], impl_type=None)
+                    self._impl_shells[shell_key] = shell
+                    self.specialized_impls.append(shell)
+                shell.methods.append(specialized)
                 self._scan_for_new_instantiations(specialized)
 
     def _recursion_error(self, pending: List[Tuple[str, Tuple[str, ...]]]) -> InstantiationRecursionError:
@@ -1107,6 +1257,7 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
         # Don't preserve source_file so _should_emit_body returns True
         new_fn.is_monomorphized = True
         new_fn.instance_args = list(subst.mapping.values())
+        new_fn.instance_subst = subst
         return new_fn
 
     def _specialize_block(self, block: rast.Block, subst: TypeSubstitution) -> rast.Block:
