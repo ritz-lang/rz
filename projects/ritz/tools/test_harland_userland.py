@@ -30,6 +30,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 from pathlib import Path
 
 import pytest
@@ -228,6 +229,22 @@ def test_mkiso_builds_with_every_package(fake_world):
     assert (fake_world["build"] / "indium.iso").is_file()
     staged = sorted(p.name for p in (fake_world["build"] / "initramfs-bin").iterdir())
     assert staged == sorted(f"{p}.elf" for p in fake_world["pkgs"])
+
+
+def test_mkiso_loads_the_initramfs_as_a_multiboot2_module(fake_world):
+    """AGAST #4258: the ISO carries the raw TAR and GRUB loads it with
+    module2 after the kernel, so it boots with no virtio-blk disk."""
+    r = _mkiso(fake_world)
+    assert r.returncode == 0, r.stdout + r.stderr
+    isodir = fake_world["build"] / "isodir" / "boot"
+    tar = isodir / "initramfs.tar"
+    assert tar.is_file() and tarfile.is_tarfile(tar)
+    cfg = (isodir / "grub" / "grub.cfg").read_text()
+    lines = [ln.strip() for ln in cfg.splitlines()]
+    assert "module2 /boot/initramfs.tar" in lines
+    assert lines.index("multiboot2 /boot/harland.elf") < lines.index(
+        "module2 /boot/initramfs.tar"
+    ) < lines.index("boot")
 
 
 def test_mkiso_fails_when_rzsh_fails_to_build(fake_world):

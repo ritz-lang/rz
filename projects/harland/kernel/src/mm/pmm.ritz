@@ -91,6 +91,31 @@ pub struct Mb2MmapEntry
     entry_type: u32
     reserved: u32
 
+# Boot module tag (type 3, multiboot2 spec 3.6.6): a file GRUB's `module2`
+# loaded into RAM at [mod_start, mod_end). Followed by its command line.
+pub struct Mb2ModuleTag
+    tag_type: u32
+    size: u32
+    mod_start: u32
+    mod_end: u32
+
+# The first boot module's tag (GRUB's `module2 /boot/initramfs.tar`, AGAST
+# #4258), or 0 if GRUB loaded none. GRUB marks the module's pages as
+# available RAM in the memory map: the caller must reserve them.
+pub fn mb2_find_module(mb_info: *Mb2BootInfo) -> *Mb2ModuleTag
+    let info_end: u64 = (mb_info as u64) + (*mb_info).total_size as u64
+    var tag_ptr: u64 = (mb_info as u64) + 8
+    while tag_ptr + 8 <= info_end
+        let tag: *Mb2Tag = tag_ptr as *Mb2Tag
+        if (*tag).tag_type == MB2_TAG_END or (*tag).size < 8
+            break
+        if (*tag).tag_type == MB2_TAG_MODULE and (*tag).size >= 16
+            let m: *Mb2ModuleTag = tag_ptr as *Mb2ModuleTag
+            if (*m).mod_end > (*m).mod_start
+                return m
+        tag_ptr = (tag_ptr + (*tag).size as u64 + 7) & ~7
+    return 0 as *Mb2ModuleTag
+
 # ============================================================================
 # Harland Boot Protocol (UEFI bootloader native format)
 # ============================================================================
@@ -564,6 +589,10 @@ fn pmm_start_bitmap(size: u64) -> i32
 pub fn pmm_init_from_multiboot(mb_info: *Mb2BootInfo, kernel_phys_end: u64) -> i32
     pmm_avoid_reset(kernel_phys_end)
     pmm_avoid(mb_info as u64, (*mb_info).total_size as u64)
+    # The initramfs module (AGAST #4258) sits in "available" RAM too.
+    let mb_mod: *Mb2ModuleTag = mb2_find_module(mb_info)
+    if mb_mod != 0 as *Mb2ModuleTag
+        pmm_avoid((*mb_mod).mod_start as u64, ((*mb_mod).mod_end - (*mb_mod).mod_start) as u64)
     pmm_mb2_pass(mb_info, PMM_PASS_TOP, 0)
     let size: u64 = pmm_bitmap_size_from_top()
     if size == 0

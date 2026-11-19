@@ -1,12 +1,18 @@
 #!/usr/bin/env python3
-"""CI must boot harland with the initramfs on the ESP and no block device (AGAST #4253).
+"""CI must boot harland with the initramfs in boot memory and no block device.
 
-projects/harland/tools/test_esp_initramfs_boot.sh boots the kernel under OVMF
-with only a vvfat ESP: EFI/BOOT/BOOTX64.EFI, harland/kernel.elf and
+Two modes (AGAST #4253, #4258); CI runs both (no argument = all):
+
+esp: projects/harland/tools/test_esp_initramfs_boot.sh boots the kernel under
+OVMF with only a vvfat ESP: EFI/BOOT/BOOTX64.EFI, harland/kernel.elf and
 harland/initramfs.tar. There is no virtio-blk or NVMe disk, as on EC2 Nitro or
 a laptop. It passes only if BOOTX64.EFI logs that it read the TAR (its exact
 size), the kernel loads the initramfs from boot memory (the BootInfo hand-off,
 not a disk) and init's Tier-1 suite passes.
+
+grub: OVMF boots a standalone GRUB-EFI that loads harland.elf over multiboot2
+and the TAR with `module2 /boot/initramfs.tar`; again no disk but the ESP.
+The kernel must find the module tag and load the initramfs from boot memory.
 
 These tests pin, as test_ci_nvme_boot.py does for its boot:
 
@@ -55,6 +61,16 @@ for a in "$@"; do
 done
 sleep 30
 """
+# grub-mkstandalone -O x86_64-efi -o OUT name=path...: log argv, write OUT.
+GRUB_STUB = r"""#!/usr/bin/env bash
+echo "$@" >> "$GRUB_LOG"
+prev=""
+for a in "$@"; do
+    if [ "$prev" = "-o" ]; then echo efi > "$a"; fi
+    if [ "${a#boot/grub/grub.cfg=}" != "$a" ]; then cp "${a#boot/grub/grub.cfg=}" "$GRUB_CFG_COPY"; fi
+    prev="$a"
+done
+"""
 MKINITRAMFS_STUB = f"""import sys
 out = sys.argv[sys.argv.index("--output") + 1]
 open(out, "wb").write(bytes({TAR_SIZE}))
@@ -70,6 +86,8 @@ FROM_DISK = (
 )
 SUITE_PASSED = r"  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
 PASSED = LOADER + FROM_MEMORY + SUITE_PASSED
+MULTIBOOT2 = r"Boot protocol: Multiboot2 (BIOS/GRUB)\n"
+GRUB_PASSED = MULTIBOOT2 + FROM_MEMORY + SUITE_PASSED
 
 
 # --------------------------------------------------------------------------
@@ -151,11 +169,14 @@ def _stub(stubs: Path, name: str, body: str) -> None:
 
 
 def _run(
-    tree, serial: str = "", *, qemu=True, env_extra=None
+    tree, serial: str = "", *, mode="esp", qemu=True, env_extra=None
 ) -> subprocess.CompletedProcess:
     stubs = tree["stubs"]
+    grub_dir = tree["tmp"] / "grub-x86_64-efi"
+    grub_dir.mkdir(exist_ok=True)
     if qemu:
         _stub(stubs, "qemu-system-x86_64", QEMU_STUB)
+        _stub(stubs, "grub-mkstandalone", GRUB_STUB)
         path = f"{stubs}{os.pathsep}{os.environ['PATH']}"
     else:
         for tool in ("dirname", "python3"):
@@ -169,10 +190,13 @@ def _run(
         "OVMF_CODE": str(tree["ovmf"]),
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
         "FAKE_SERIAL": serial,
+        "GRUB_EFI_DIR": str(grub_dir),
+        "GRUB_LOG": str(tree["tmp"] / "grub.log"),
+        "GRUB_CFG_COPY": str(tree["tmp"] / "grub.cfg"),
         **(env_extra or {}),
     }
     return subprocess.run(
-        ["/bin/bash", str(tree["script"])],
+        ["/bin/bash", str(tree["script"]), *([mode] if mode else [])],
         env=env,
         capture_output=True,
         text=True,
@@ -243,3 +267,91 @@ def test_no_verdict_before_the_timeout_fails(tree):
     r = _run(tree, LOADER + FROM_MEMORY)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "did not report ALL TESTS PASSED" in r.stdout
+
+
+# --------------------------------------------------------------------------
+# grub mode (AGAST #4258): GRUB-EFI, multiboot2, the TAR as a module2
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_ci_runs_both_modes():
+    """The CI step passes no mode, and no mode means esp and grub."""
+    [step] = [s for s in ci_local.load_steps() if ESP_SCRIPT in s.run]
+    assert step.run.strip().endswith(ESP_SCRIPT)
+    assert 'MODE="${1:-all}"' in (REPO / ESP_SCRIPT).read_text()
+
+
+@pytest.mark.integration
+def test_grub_passes_with_the_initramfs_module_and_only_the_esp(tree):
+    keep = tree["tmp"] / "logs"
+    keep.mkdir()
+    r = _run(tree, GRUB_PASSED, mode="grub", env_extra={"KEEP_WORK": str(keep)})
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "from boot memory" in (keep / "grub-initramfs.log").read_text()
+    cfg = (tree["tmp"] / "grub.cfg").read_text()
+    assert "multiboot2 /boot/harland.elf; module2 /boot/initramfs.tar;" in cfg
+    grub_argv = (tree["tmp"] / "grub.log").read_text()
+    assert "boot/initramfs.tar=" in grub_argv and "boot/harland.elf=" in grub_argv
+    argv = (tree["tmp"] / "stub.log").read_text()
+    drives = [a for a in argv.split() if a.startswith(("format=", "file=", "if="))]
+    assert len([d for d in drives if "fat:rw:" in d]) == 1
+    assert not [d for d in drives if "fat:rw:" not in d and "pflash" not in d], drives
+    for dev in ("virtio-blk", "nvme", "-hda", "-cdrom"):
+        assert dev not in argv
+
+
+@pytest.mark.integration
+def test_grub_initramfs_panic_fails(tree):
+    """The kernel ignored the module tag (the mutation that drops the hand-off)."""
+    r = _run(
+        tree,
+        MULTIBOOT2 + r"*** KERNEL PANIC: Failed to load initramfs ***\n",
+        mode="grub",
+    )
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL (grub): kernel panic or exception" in r.stdout
+    assert (
+        "FAIL (grub): the kernel did not load the initramfs from boot memory"
+        in r.stdout
+    )
+
+
+@pytest.mark.integration
+def test_grub_initramfs_from_a_disk_fails(tree):
+    r = _run(tree, MULTIBOOT2 + FROM_DISK + SUITE_PASSED, mode="grub")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "did not load the initramfs from boot memory" in r.stdout
+
+
+@pytest.mark.integration
+def test_grub_must_boot_over_multiboot2(tree):
+    r = _run(tree, FROM_MEMORY + SUITE_PASSED, mode="grub")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "did not boot over multiboot2" in r.stdout
+
+
+@pytest.mark.integration
+def test_grub_mode_without_grub_efi_modules_is_a_setup_error(tree):
+    missing = str(tree["tmp"] / "no-such-grub-dir")
+    r = _run(tree, GRUB_PASSED, mode="grub", env_extra={"GRUB_EFI_DIR": missing})
+    assert r.returncode == ci_local.EXIT_SETUP, r.stdout + r.stderr
+    assert "SETUP ERROR" in r.stderr and "x86_64-efi" in r.stderr
+
+
+@pytest.mark.integration
+def test_all_runs_both_boots(tree):
+    """No argument boots both; a stub serial that only satisfies the esp
+    checks fails the grub one."""
+    r = _run(tree, PASSED, mode="")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS (esp): init Tier-1 suite" in r.stdout
+    assert "FAIL (grub): the kernel did not boot over multiboot2" in r.stdout
+    r = _run(tree, LOADER + GRUB_PASSED, mode="")
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.integration
+def test_bad_mode_is_a_usage_error(tree):
+    r = _run(tree, PASSED, mode="bogus")
+    assert r.returncode == 2, r.stdout + r.stderr

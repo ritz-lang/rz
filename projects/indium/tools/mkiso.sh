@@ -101,6 +101,13 @@ mkdir -p "$ISO_DIR/boot/grub"
 # Copy kernel
 cp "$KERNEL_ELF" "$ISO_DIR/boot/harland.elf"
 
+# The initramfs as a multiboot2 module (AGAST #4258): GRUB loads the raw TAR
+# into RAM and the kernel unpacks it from the module tag, so the ISO boots
+# with no virtio-blk disk. initramfs.qcow2 stays for `make run-iso`.
+python3 "$HARLAND_DIR/tools/mkinitramfs.py" \
+    --bin-dir "$INITRAMFS_BIN" \
+    --output "$ISO_DIR/boot/initramfs.tar"
+
 # Create GRUB configuration
 cat > "$ISO_DIR/boot/grub/grub.cfg" << 'EOF'
 # Indium GRUB Configuration
@@ -114,6 +121,7 @@ insmod all_video
 
 menuentry "Indium (Harland Kernel)" {
     multiboot2 /boot/harland.elf
+    module2 /boot/initramfs.tar
     boot
 }
 EOF

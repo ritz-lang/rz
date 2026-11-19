@@ -15,7 +15,7 @@
 import io { halt_loop }
 import serial { StrView, serial_init, prints, serial_print_hex, serial_print_dec, serial_enable_rx }
 import drivers.pci { pci_init }
-import mm.pmm { PAGE_SIZE, Mb2BootInfo, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel, pmm_bitmap_phys, pmm_bitmap_size }
+import mm.pmm { PAGE_SIZE, Mb2BootInfo, Mb2ModuleTag, mb2_find_module, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel, pmm_bitmap_phys, pmm_bitmap_size }
 import mm.vmm { vmm_init, vmm_flush_tlb_all, vmm_reserve_page_tables, vmm_init_physmap, phys_to_virt }
 import mm.heap { KERNEL_VIRT_BASE, heap_init, heap_get_used, heap_check }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
@@ -327,6 +327,12 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         # apic_init_with_mb reads the info block long after the first
         # allocation: keep its pages out of the pool.
         pmm_mark_region_used(boot_info_addr, (*mb_info).total_size as u64)
+        # The initramfs GRUB loaded as a module (`module2
+        # /boot/initramfs.tar`, AGAST #4258): keep its pages until
+        # initramfs_load has unpacked it.
+        let mb_mod: *Mb2ModuleTag = mb2_find_module(mb_info)
+        if mb_mod != 0 as *Mb2ModuleTag
+            pmm_mark_region_used((*mb_mod).mod_start as u64, ((*mb_mod).mod_end - (*mb_mod).mod_start) as u64)
     if boot_protocol == BOOT_PROTOCOL_UNKNOWN
         klog(c"\r  [!!] Physical memory (no boot info)\n")
     else if pmm_ok
@@ -475,11 +481,17 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         klog(c"\r  [OK] Filesystem syscalls\n")
 
         # Load initial filesystem: the TAR BOOTX64.EFI read from the ESP if
-        # BootInfo carries one (AGAST #4253), else a virtio-blk TAR disk.
+        # BootInfo carries one (AGAST #4253), or GRUB's multiboot2 module
+        # (#4258), else a virtio-blk TAR disk.
         # The kernel heap grows to fit it.
         if boot_protocol == BOOT_PROTOCOL_HARLAND and (*harland_boot_info).version >= HARLAND_BOOT_VERSION_INITRAMFS
             if (*harland_boot_info).initramfs_size > 0
                 initramfs_set_boot_image(phys_to_virt((*harland_boot_info).initramfs_phys), (*harland_boot_info).initramfs_size)
+        # GRUB's boot module (AGAST #4258), the multiboot2 equivalent.
+        if boot_protocol == BOOT_PROTOCOL_MULTIBOOT2
+            let boot_mod: *Mb2ModuleTag = mb2_find_module(boot_info_addr as *Mb2BootInfo)
+            if boot_mod != 0 as *Mb2ModuleTag
+                initramfs_set_boot_image(phys_to_virt((*boot_mod).mod_start as u64), ((*boot_mod).mod_end - (*boot_mod).mod_start) as u64)
         klog(c"  [..] Initial filesystem")
         initramfs_load()
         klog(c"\r  [OK] Initial filesystem\n")
