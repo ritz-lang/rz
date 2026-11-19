@@ -4723,6 +4723,13 @@ fn main() -> i32
     total(@n) as i32
 ```
 
+An impl's bound is on its type's arguments, so every instance of the type is
+checked against it, and the error names the generic `impl W`: with `impl<T:
+Area> W<T>`, `W<Nope>` is "`Nope` doesn't implement `Area`, which `T` of
+`impl W` requires". An instance only ever named inside another generic
+(`total<U>(x)` in `outer<U>`, instantiated by `outer<Nope>`) is an error at
+that argument, the `U`.
+
 A bound naming no trait is an error at the bound, used or not: "unknown trait
 `Nonesuch` in the bound on `T`". A bound doesn't change how a method on `T` is
 found: that happens after substitution (§11.4), so `a.area()` on an unbounded
@@ -4776,8 +4783,9 @@ generic parameter's trait bound is a check at instantiation (§11.5).
 An `impl` targets a struct or enum declared in Ritz source. A primitive is a
 built-in type, closed like `Span` (LARB R26), so `impl u8` and `impl Speak for
 i32` are errors at the type: "`i32` is a built-in type; it can't have an
-`impl`" (LARB R36, AGAST #3288). Trait impls on primitives come back with
-trait bounds (#1621) and cross-module impls (#3256).
+`impl`" (LARB R36, AGAST #3288). Whether a trait impl may target a primitive
+now that trait bounds exist (§11.5) is R36's revisit (#4294), with
+cross-module impls (#3256).
 
 Where an `impl` lives (LARB R65, AGAST #3493). An inherent `impl T` is in the
 file that declares `T`. A trait impl is in the type's file or the trait's file;

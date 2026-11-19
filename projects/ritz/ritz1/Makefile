@@ -76,6 +76,7 @@ SOURCES = \
 	slot_narrowing \
 	float_compare \
 	tail_value \
+	trait_bound \
 	reachability \
 	emitter_asm \
 	emitter_stmt \

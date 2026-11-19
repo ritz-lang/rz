@@ -300,6 +300,12 @@ still run mid-lowering on `*EmitterState`, and
   divergence walk (`tail_stmts_diverge`) is also read by `reachability` and
   `emitter_stmt`.
 
+- `trait_bound` — a type parameter's bound `<T: A + B>` (§11.5, LARB R55,
+  #3469): an unknown trait at the bound, and each of monomorph's instances
+  (fn, struct, enum, and a generic impl's on its type) needing an impl of
+  each trait, exact or through a generic impl, at the argument as first
+  written (ast_helpers' `GenericUse` notes) or the inferred call.
+
 - `type_name_check` — a written type name must name a type: "unknown type
   `Nope`" at the name (#3932). Run by main over the whole module before
   monomorphisation; `type_named` records where each name was written.

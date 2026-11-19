@@ -301,7 +301,7 @@ def test_impl_on_primitive_refused(request, tmp_path, compiler, row):
 # An impl of a trait nothing declares (#4211): it compiled silently on ritz1.
 # `Speak` (declared) and `Drop` (a compiler trait) are known, and only the
 # undeclared one is refused.  ritz0's refusal is #4197's (its row in
-# test_trait_bound_check.py is ritz0-only: that file's ritz1 half is #3469).
+# test_trait_bound_check.py runs on all three compilers since #3469).
 UNKNOWN_TRAIT = """\
 struct Foo
     x: i32

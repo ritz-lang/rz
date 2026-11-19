@@ -2282,7 +2282,23 @@ pub fn type_param_new(p: *Parser, name: *u8, len: i32) -> *TypeParam
     tp.name = name as *u8
     tp.name_len = len
     tp.next = null
+    tp.bounds = null
     return tp
+
+# `T: A + B` (AGAST #3469): the parameter with its bound's traits.
+pub fn type_param_bounded(p: *Parser, name: *u8, len: i32, bounds: *TraitBound) -> *TypeParam
+    let tp: *TypeParam = type_param_new(p, name, len)
+    tp.bounds = bounds
+    return tp
+
+pub fn trait_bound_new(p: *Parser, name: *u8, len: i32, line: i32, col: i32, rest: *TraitBound) -> *TraitBound
+    let b: *TraitBound = parser_alloc(p, sizeof(TraitBound)) as *TraitBound
+    b.name = name
+    b.name_len = len
+    b.span = diag_span(line, col)
+    b.file = parse_file_copy_shared(p)
+    b.next = rest
+    return b
 
 pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
     first.next = rest
@@ -4286,18 +4302,8 @@ fn ref_as_pointer(p: *Parser, inner_type: i32) -> i32
 # AGAST #1574: the records form the whole argument list (`next`), and EVERY
 # argument drives mangling: `Pair<i64, i32>` is `Pair$i64$i32`, not
 # `Pair$i64` (which left the second parameter unsubstituted and collided
-# with `Pair<i64, i64>`).
-struct GenericArg
-    ty: i32
-    name: *u8
-    name_len: i32
-    next: *GenericArg
-    # AGAST #4021: the name the argument ends with as written (`Nope` of
-    # `*Nope`), which type_generic_with_saved notes; null when it ends with
-    # no name (`Vec<T>`, whose own arguments were noted).
-    written: *u8
-    written_len: i32
-
+# with `Pair<i64, i64>`).  The record, GenericArg, is in ast.ritz.
+#
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
 pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
@@ -4341,11 +4347,25 @@ pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
     ga.next = null
     ga.written = null
     ga.written_len = 0
+    ga.at = diag_span(0, 0)
     let t: *Token = tn_last_written(p, 1)
     if t != null
         ga.written = t.start
         ga.written_len = t.len
     return ga
+
+# The grammar's type_arg_start: where the next type argument starts, as a
+# token index (zero-width; AGAST #3469).
+pub fn generic_arg_mark(p: *Parser) -> i32
+    p.pos
+
+# capture_first_generic_arg for an argument that started at token `start`.
+pub fn capture_generic_arg_at(p: *Parser, ty: i32, start: i32) -> *GenericArg
+    let ga: *GenericArg = capture_first_generic_arg(p, ty)
+    if start >= 0 and start < p.token_count
+        let t: *Token = p.tokens + start
+        ga.at = diag_span(t.line, t.col)
+    ga
 
 # Spelling of a primitive type argument, as ritz0 mangles it (its type
 # name).  Returns its length (0 for a non-primitive) and the bytes in *out.
@@ -4682,7 +4702,71 @@ pub fn type_generic_with_saved(p: *Parser, base_name: *u8, base_len: i32, ga: *G
     var len: i32 = 0
     p.last_type_name = mangle_generic_args(p, base_name, base_len, ga, @len)
     p.last_type_name_len = len
+    if p.skip_item == 0
+        generic_use_note_mangled(p.last_type_name, len, ga, diag_span(0, 0), parse_file_copy_shared(p))
     return TYPE_STRUCT
+
+# =============================================================================
+# Where each generic instance is first written (AGAST #3469)
+# =============================================================================
+#
+# A failed trait bound is an error at the type argument as first written
+# (`Holder<Nope>`, `total<Nope>(..)`), or at the call when its arguments were
+# inferred (LANGUAGE_SPEC §11.5), as ritz0's monomorph notes an instance's
+# first use.  ritz1's instance trackers keep only mangled names, so the parser
+# notes each generic type and explicit call here, and infer_generic_calls each
+# inferred call, after them.  trait_bound.ritz asks only once a bound has
+# failed, so a list is enough; it is newest first, so the first use is the
+# last match.
+struct GenericUse
+    name: *u8          # `Holder`, `total`
+    name_len: i32
+    suffix: *u8        # `$Nope`
+    suffix_len: i32
+    args: *GenericArg  # as written, each with its `at`; null when inferred
+    at: SrcSpan        # an inferred call: the call; line 0 otherwise
+    file: *u8          # null: the main file
+    next: *GenericUse
+
+var g_generic_uses: *GenericUse = null
+
+pub fn generic_use_note(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32, args: *GenericArg, at: SrcSpan, file: *u8)
+    if name == null or name_len <= 0 or suffix == null or suffix_len <= 0
+        return
+    let u: *GenericUse = malloc(sizeof(GenericUse)) as *GenericUse
+    u.name = name
+    u.name_len = name_len
+    u.suffix = suffix
+    u.suffix_len = suffix_len
+    u.args = args
+    u.at = at
+    u.file = file
+    u.next = g_generic_uses
+    g_generic_uses = u
+
+# A generic type's mangled name `Holder$Nope` is the instance `Holder` with
+# suffix `$Nope`, as monomorph tracks it.
+fn generic_use_note_mangled(mangled: *u8, len: i32, args: *GenericArg, at: SrcSpan, file: *u8)
+    var k: i32 = 0
+    while k < len and *(mangled + k) != 36   # '$'
+        k = k + 1
+    if k > 0 and k < len
+        generic_use_note(mangled, k, mangled + k, len - k, args, at, file)
+
+# Every noted use, newest first (trait_bound.ritz's own searches).
+pub fn generic_use_list() -> *GenericUse
+    g_generic_uses
+
+# The first noted use of the instance (name, suffix), or null.
+pub fn generic_use_first(name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> *GenericUse
+    var found: *GenericUse = null
+    var u: *GenericUse = g_generic_uses
+    while u != null
+        if u.name_len == name_len and u.suffix_len == suffix_len
+            if memcmp(u.name, name, name_len as i64) == 0 and memcmp(u.suffix, suffix, suffix_len as i64) == 0
+                found = u
+        u = u.next
+    found
 
 # The slice type `[T]` (AGAST #1614): sugar for `Span<T>` (LANGUAGE_SPEC §3.4),
 # as ritz0's make_slice_type desugars it.  `elem` is T, captured by
@@ -6970,6 +7054,19 @@ pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
 # Generic function call - creates a call with type suffix from the type token
 # The type_tok is the token for the type name (e.g., "u8", "String", etc.)
 # Builds a suffix like "$u8" to be appended to the function name
+# A generic call's one-token type argument (`g<Nope>`, `g<*Nope>`) as a
+# GenericArg that only says where it is written (AGAST #3469).
+fn generic_tok_arg(p: *Parser, tok: Token) -> *GenericArg
+    let ga: *GenericArg = parser_alloc(p, sizeof(GenericArg)) as *GenericArg
+    ga.ty = TYPE_VOID
+    ga.name = null
+    ga.name_len = 0
+    ga.next = null
+    ga.written = tok.start
+    ga.written_len = tok.len
+    ga.at = diag_span(tok.line, tok.col)
+    ga
+
 pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_CALL
@@ -6979,6 +7076,7 @@ pub fn postfix_generic_call(p: *Parser, type_tok: Token, args: *Expr) -> *Postfi
     tn_note_tok(p, type_tok)   # AGAST #4171
     op.call_type_suffix = generic_tok_suffix(p, null, 0, type_tok, @len)
     op.call_type_suffix_len = len
+    op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
 
@@ -6998,6 +7096,7 @@ pub fn postfix_generic_call_ptr(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     tn_note_tok(p, type_tok)   # AGAST #4171
     op.call_type_suffix = generic_tok_suffix(p, c"ptr_", 4, type_tok, @len)
     op.call_type_suffix_len = len
+    op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
 
@@ -7013,6 +7112,7 @@ pub fn postfix_generic_call_arg(p: *Parser, ga: *GenericArg, args: *Expr) -> *Po
     var len: i32 = 0
     op.call_type_suffix = mangle_generic_args(p, null, 0, ga, @len)
     op.call_type_suffix_len = len
+    op.call_targs = ga
     op.next = null
     return op
 
@@ -7059,6 +7159,7 @@ pub fn postfix_generic_call_list(p: *Parser, ga: *GenericArg, args: *Expr) -> *P
     var len: i32 = 0
     op.call_type_suffix = mangle_generic_args(p, null, 0, ga, @len)
     op.call_type_suffix_len = len
+    op.call_targs = ga
     op.next = null
     return op
 
@@ -7115,6 +7216,8 @@ pub fn apply_postfix_p(p: *Parser, base: *Expr, ops: *PostfixOp) -> *Expr
                 result.call_type_suffix = op.call_type_suffix
                 result.call_type_suffix_len = op.call_type_suffix_len
                 result.args = op.args
+                if op.call_type_suffix != null and p.skip_item == 0
+                    generic_use_note(result.func_name, result.func_name_len, op.call_type_suffix, op.call_type_suffix_len, op.call_targs, diag_span(0, 0), parse_file_copy_shared(p))
             else if result.kind == EXPR_MEMBER
                 # Method call: expr.method(args)
                 # EXPR_MEMBER has: left = receiver, ident_ptr/len = method name
@@ -8710,6 +8813,7 @@ pub fn postfix_generic_call_ref(p: *Parser, type_tok: Token, args: *Expr) -> *Po
     tn_note_tok(p, type_tok)   # AGAST #4171
     op.call_type_suffix = generic_tok_suffix(p, c"ref_", 4, type_tok, @len)
     op.call_type_suffix_len = len
+    op.call_targs = generic_tok_arg(p, type_tok)
     op.next = null
     return op
 
@@ -8860,6 +8964,7 @@ pub fn generic_enum_params(ei: i32) -> *TypeParam
             tp.name = start
             tp.name_len = n
             tp.next = null
+            tp.bounds = null
             if last == null
                 first = tp
             else

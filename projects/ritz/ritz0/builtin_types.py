@@ -30,8 +30,9 @@ BUILTIN_TYPES = {
 
 
 # The scalars: built-in types closed to `impl`, inherent or trait (LARB R36,
-# AGAST #3370; spec §12.2).  Trait impls on them come back with trait bounds
-# (#1621) and cross-module impls (#3256).  SIMD vectors aren't in R36.
+# AGAST #3370; spec §12.2).  Whether trait impls on them come back, now that
+# trait bounds exist, is R36's revisit (#4294), with cross-module impls
+# (#3256).  SIMD vectors aren't in R36.
 PRIMITIVES = frozenset({
     'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'bool',
 })

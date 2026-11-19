@@ -11,7 +11,7 @@ found after substitution, §11.4).  Two rules, each located:
     (`impl<T> Drop for Box<T>` covers every `Box<..>`, §12.2), else an error
     at the type argument (at the call when inferred): bound_error.  Run by
     monomorph, which is where every instance, inferred or transitive, is
-    known.  ritz1's half is #3469.
+    known.  ritz1's half is ritz1/src/trait_bound.ritz, on Sema (#3469).
 """
 
 from typing import Dict, Iterator, List, Optional, Tuple

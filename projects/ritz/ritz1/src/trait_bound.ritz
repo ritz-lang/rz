@@ -1,0 +1,348 @@
+# trait_bound.ritz - trait bounds `<T: A + B>`, checked on Sema
+#
+# LANGUAGE_SPEC §11.5, LARB R55, AGAST #3469 (ritz0's half: #3468,
+# ritz0/trait_bounds.py).  A type parameter of a fn, struct, enum or impl may
+# name the traits it needs.  A bound is a check only: it doesn't change how a
+# method on `T` is found (that happens after substitution, §11.4).  Two rules,
+# each located, with ritz0's messages:
+#
+#   * An unknown trait is an error at the bound, used or not:
+#       unknown trait `Nonesuch` in the bound on `U`
+#   * Each instance's type arguments need an impl of each trait, exact
+#     (`impl Area for Sq`) or through a generic impl (`impl<T> Drop for
+#     Box<T>` covers every `Box<..>`, with that impl's own bounds on its
+#     args), else an error at the type argument as first written, or at the
+#     call when the arguments were inferred:
+#       `Nope` doesn't implement `Area`, which `T` of `total` requires
+#     An impl's bounds are on its type's args, named `impl W`.
+#
+# The instances are monomorph's trackers, so every instance is judged,
+# inferred or transitive.  Where one was first written comes from
+# ast_helpers' GenericUse notes; a transitive instance (`total<U>` inside
+# another generic) is at that call's argument, as ritz0 reports it.
+
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str
+import ritzlib.sys
+
+import ast
+import ast_helpers
+import diag
+import monomorph
+import sema
+
+fn tb_eq(a: *u8, alen: i32, b: *u8, blen: i32) -> i32
+    if alen != blen
+        return 0
+    (memcmp(a, b, alen as i64) == 0) as i32
+
+fn tb_write(s: *u8, len: i32)
+    sys_write(2, s, len as i64)
+
+fn tb_file(sm: *Sema, file: *u8) -> *u8
+    if file == null
+        return sm.file
+    file
+
+fn tb_dollar(s: *u8, len: i32) -> i32
+    var k: i32 = 0
+    while k < len and *(s + k) != 36   # '$'
+        k = k + 1
+    k
+
+fn tb_has_bounds(tps: *TypeParam) -> i32
+    var tp: *TypeParam = tps
+    while tp != null
+        if tp.bounds != null
+            return 1
+        tp = tp.next
+    0
+
+# ----------------------------------------------------------------------------
+# Unknown traits, at the bound
+# ----------------------------------------------------------------------------
+
+fn tb_trait_known(name: *u8, len: i32) -> i32
+    if trait_declared(name, len) == 1 or is_compiler_trait(name, len) == 1
+        return 1
+    0
+
+fn tb_unknown_in(sm: *Sema, tps: *TypeParam)
+    var tp: *TypeParam = tps
+    while tp != null
+        var b: *TraitBound = tp.bounds
+        while b != null
+            if tb_trait_known(b.name, b.name_len) == 0
+                diag_error_at(tb_file(sm, b.file), b.span)
+                eprints_cstr(c"unknown trait `")
+                tb_write(b.name, b.name_len)
+                eprints_cstr(c"` in the bound on `")
+                tb_write(tp.name, tp.name_len)
+                eprints_cstr(c"`\n")
+                sm.error_count = sm.error_count + 1
+            b = b.next
+        tp = tp.next
+
+fn tb_unknown_check(sm: *Sema)
+    let m: *Module = sm.module
+    var f: *FnDef = m.functions
+    while f != null
+        tb_unknown_in(sm, f.type_params)
+        f = f.next
+    var st: *StructDef = m.structs
+    while st != null
+        tb_unknown_in(sm, st.type_params)
+        st = st.next
+    for ei in 0..enum_count()
+        if enum_is_generic(ei) == 1
+            tb_unknown_in(sm, generic_enum_params(ei))
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        tb_unknown_in(sm, ib.type_params)
+        ib = ib.next
+
+# ----------------------------------------------------------------------------
+# Which types implement which traits
+# ----------------------------------------------------------------------------
+
+# The `n` arguments of an instance's suffix `$a1$a2..`, each as a
+# one-argument suffix `$ai` (split_mangled_args).  One parameter takes the
+# whole suffix (`Bag$Bag$Nope`), as monomorph's own split does.  Returns the
+# count, or -1 when the suffix doesn't split into `n`.
+fn tb_split(m: *Module, n: i32, suffix: *u8, suffix_len: i32, starts: *i32, lens: *i32) -> i32
+    if n == 1
+        *starts = 0
+        *lens = suffix_len
+        return 1
+    if split_mangled_args(m, suffix, suffix_len, starts, lens) != n
+        return -1
+    n
+
+# The first (param index, bound) of `tps` that the args of `suffix` miss, as
+# `*out_bound`; -1 when every bound is met or the suffix doesn't split.
+fn tb_unmet(m: *Module, tps: *TypeParam, suffix: *u8, suffix_len: i32, out_bound: **TraitBound) -> i32
+    let n: i32 = count_type_params(tps)
+    if n == 0 or tb_has_bounds(tps) == 0
+        return -1
+    let cap: i64 = 4 * (mangled_arg_capacity(suffix, suffix_len) + 1) as i64
+    let starts: *i32 = malloc(cap) as *i32
+    let lens: *i32 = malloc(cap) as *i32
+    var miss: i32 = -1
+    if tb_split(m, n, suffix, suffix_len, starts, lens) == n
+        var tp: *TypeParam = tps
+        var i: i32 = 0
+        while tp != null and miss < 0
+            # Skip the `$` each argument's suffix starts with.
+            let arg: *u8 = suffix + *(starts + i) + 1
+            let arg_len: i32 = *(lens + i) - 1
+            var b: *TraitBound = tp.bounds
+            while b != null and miss < 0
+                if tb_implements(m, arg, arg_len, b.name, b.name_len) == 0
+                    miss = i
+                    *out_bound = b
+                b = b.next
+            tp = tp.next
+            i = i + 1
+    free(starts as *u8)
+    free(lens as *u8)
+    miss
+
+# Does the type `arg` (mangled: `Sq`, `Bag$Sq`, `ptr_Sq`) implement `trait`?
+# Exactly, by a non-generic impl for its name, or through a generic impl of
+# its generic type whose own bounds its args meet (§12.2: an impl covers
+# every instantiation).  A pointer, reference, array or primitive has none.
+fn tb_implements(m: *Module, arg: *u8, arg_len: i32, tname: *u8, tname_len: i32) -> i32
+    let k: i32 = tb_dollar(arg, arg_len)
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.trait_name != null and tb_eq(ib.trait_name, ib.trait_name_len, tname, tname_len) == 1 and tb_eq(ib.type_name, ib.type_name_len, arg, k) == 1
+            if k == arg_len and ib.type_params == null
+                return 1
+            if k < arg_len and ib.type_params != null
+                var unused: *TraitBound = null
+                if tb_unmet(m, ib.type_params, arg + k, arg_len - k, @unused) < 0
+                    return 1
+                return 0
+        ib = ib.next
+    0
+
+# ----------------------------------------------------------------------------
+# Spelling a mangled type as written: `Bag$Nope` is `Bag<Nope>`
+# ----------------------------------------------------------------------------
+
+fn tb_eprint_type(m: *Module, s: *u8, len: i32)
+    if len > 7 and memcmp(s, c"refmut_", 7) == 0
+        eprints_cstr(c"@&")
+        tb_eprint_type(m, s + 7, len - 7)
+        return
+    if len > 4 and memcmp(s, c"ref_", 4) == 0
+        eprint_char('@')
+        tb_eprint_type(m, s + 4, len - 4)
+        return
+    if len > 4 and memcmp(s, c"ptr_", 4) == 0
+        eprint_char('*')
+        tb_eprint_type(m, s + 4, len - 4)
+        return
+    let k: i32 = tb_dollar(s, len)
+    tb_write(s, k)
+    if k >= len
+        return
+    let arity: i32 = mangled_component_arity(m, s, k)
+    if arity <= 0
+        tb_write(s + k, len - k)   # no template to say how it nests
+        return
+    let cap: i64 = 4 * (mangled_arg_capacity(s + k, len - k) + 1) as i64
+    let starts: *i32 = malloc(cap) as *i32
+    let lens: *i32 = malloc(cap) as *i32
+    if tb_split(m, arity, s + k, len - k, starts, lens) != arity
+        tb_write(s + k, len - k)
+    else
+        eprint_char('<')
+        for i in 0..arity
+            if i > 0
+                eprints_cstr(c", ")
+            tb_eprint_type(m, s + k + *(starts + i) + 1, *(lens + i) - 1)
+        eprint_char('>')
+    free(starts as *u8)
+    free(lens as *u8)
+
+# ----------------------------------------------------------------------------
+# One instance
+# ----------------------------------------------------------------------------
+
+# Is the instance's argument still a parameter (`W$T`, a template's own
+# spelling of its type, or `total$U` inside another generic)?  Such a
+# spelling is no instance: the one its parameters become is judged.
+fn tb_has_free_param(m: *Module, suffix: *u8, suffix_len: i32) -> i32
+    var pos: i32 = 0
+    while pos < suffix_len
+        var end: i32 = pos + 1
+        while end < suffix_len and *(suffix + end) != 36
+            end = end + 1
+        var c: *u8 = suffix + pos + 1
+        var clen: i32 = end - pos - 1
+        # The name under `ptr_` / `ref_` / `refmut_` / `arrN_` pieces.
+        var j: i32 = clen - 1
+        while j >= 0 and *(c + j) != 95   # '_'
+            j = j - 1
+        c = c + j + 1
+        clen = clen - j - 1
+        if clen > 0 and *c >= 65 and *c <= 90 and module_declares_type(m, c, clen) == 0 and find_generic_struct(m, c, clen) == null and trait_declared(c, clen) == 0
+            return 1
+        pos = end
+    0
+
+# A transitive instance (`total$Nope` from `outer<Nope>`'s `total<U>(x)`) was
+# never written as such: its first use is the generic one, `total<U>`, whose
+# argument ritz0 reports at too (its monomorph substitutes into that call).
+fn tb_use_in_generic(m: *Module, name: *u8, name_len: i32) -> *GenericUse
+    var found: *GenericUse = null
+    var u: *GenericUse = generic_use_list()
+    while u != null
+        if tb_eq(u.name, u.name_len, name, name_len) == 1 and tb_has_free_param(m, u.suffix, u.suffix_len) == 1
+            found = u
+        u = u.next
+    found
+
+# Judge one instance `name` + `suffix` of a generic whose parameters are
+# `tps`, named `owner` (with `impl ` before it when `is_impl`).  Reports the
+# first unmet bound; returns 1 if it did.
+fn tb_check_instance(sm: *Sema, owner: *u8, owner_len: i32, is_impl: i32, tps: *TypeParam, name: *u8, name_len: i32, suffix: *u8, suffix_len: i32) -> i32
+    let m: *Module = sm.module
+    if tb_has_bounds(tps) == 0 or tb_has_free_param(m, suffix, suffix_len) == 1
+        return 0
+    var bound: *TraitBound = null
+    let i: i32 = tb_unmet(m, tps, suffix, suffix_len, @bound)
+    if i < 0
+        return 0
+    var tp: *TypeParam = tps
+    for k in 0..i
+        tp = tp.next
+    # Where: the argument as first written, else the inferred call; for a
+    # transitive instance the generic call it came from; else the bound.
+    var file: *u8 = bound.file
+    var at: SrcSpan = bound.span
+    var u: *GenericUse = generic_use_first(name, name_len, suffix, suffix_len)
+    if u == null
+        u = tb_use_in_generic(m, name, name_len)
+    if u != null
+        var ga: *GenericArg = u.args
+        for k in 0..i
+            if ga != null
+                ga = ga.next
+        if ga != null and ga.at.line > 0
+            file = u.file
+            at = ga.at
+        else if u.at.line > 0
+            file = u.file
+            at = u.at
+    let cap: i64 = 4 * (mangled_arg_capacity(suffix, suffix_len) + 1) as i64
+    let starts: *i32 = malloc(cap) as *i32
+    let lens: *i32 = malloc(cap) as *i32
+    tb_split(m, count_type_params(tps), suffix, suffix_len, starts, lens)
+    diag_error_at(tb_file(sm, file), at)
+    eprint_char('`')
+    tb_eprint_type(m, suffix + *(starts + i) + 1, *(lens + i) - 1)
+    eprints_cstr(c"` doesn't implement `")
+    tb_write(bound.name, bound.name_len)
+    eprints_cstr(c"`, which `")
+    tb_write(tp.name, tp.name_len)
+    eprints_cstr(c"` of `")
+    if is_impl == 1
+        eprints_cstr(c"impl ")
+    tb_write(owner, owner_len)
+    eprints_cstr(c"` requires\n")
+    sm.error_count = sm.error_count + 1
+    free(starts as *u8)
+    free(lens as *u8)
+    1
+
+fn tb_generic_fn(m: *Module, name: *u8, len: i32) -> *FnDef
+    var f: *FnDef = m.functions
+    while f != null
+        if f.type_params != null and tb_eq(f.name, f.name_len, name, len) == 1
+            return f
+        f = f.next
+    null
+
+# A generic type's instance: its own bounds, then each generic impl's.
+fn tb_check_type_instance(sm: *Sema, tps: *TypeParam, name: *u8, name_len: i32, suffix: *u8, suffix_len: i32)
+    if tps != null and tb_check_instance(sm, name, name_len, 0, tps, name, name_len, suffix, suffix_len) == 1
+        return
+    var ib: *ImplBlock = sm.module.impls
+    while ib != null
+        if ib.type_params != null and tb_eq(ib.type_name, ib.type_name_len, name, name_len) == 1
+            if tb_check_instance(sm, name, name_len, 1, ib.type_params, name, name_len, suffix, suffix_len) == 1
+                return
+        ib = ib.next
+
+pub fn trait_bound_check(sm: *Sema)
+    let before: i32 = sm.error_count
+    tb_unknown_check(sm)
+    if sm.error_count > before
+        return
+    let m: *Module = sm.module
+    for i in 0..get_struct_instantiation_count()
+        let name: *u8 = get_struct_instantiation_name(i)
+        let name_len: i32 = get_struct_instantiation_name_len(i)
+        var tps: *TypeParam = null
+        let st: *StructDef = find_generic_struct(m, name, name_len)
+        if st != null
+            tps = st.type_params
+        tb_check_type_instance(sm, tps, name, name_len, get_struct_instantiation_suffix(i), get_struct_instantiation_suffix_len(i))
+    # A generic enum's instances (`Slot$Nope`) are recorded as enums.
+    for ei in 0..enum_count()
+        var len: i32 = 0
+        let ename: *u8 = enum_name_at(ei, @len)
+        let k: i32 = tb_dollar(ename, len)
+        if k < len
+            let base: i32 = enum_find(ename, k)
+            if base >= 0 and enum_is_generic(base) == 1
+                tb_check_instance(sm, ename, k, 0, generic_enum_params(base), ename, k, ename + k, len - k)
+    for i in 0..get_instantiation_count()
+        let name: *u8 = get_instantiation_name(i)
+        let name_len: i32 = get_instantiation_name_len(i)
+        let f: *FnDef = tb_generic_fn(m, name, name_len)
+        if f != null
+            tb_check_instance(sm, name, name_len, 0, f.type_params, name, name_len, get_instantiation_suffix(i), get_instantiation_suffix_len(i))
