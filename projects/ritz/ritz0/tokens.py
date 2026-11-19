@@ -221,6 +221,10 @@ class Token:
     # len(exprs) + 1 and `{{` / `}}` collapsed in the parts. Only print /
     # eprint use it (AGAST #2102); `value` is the plain literal. None otherwise.
     interp: Optional[Tuple[List[str], List[str]]] = None
+    # A literal's source text as written (`"a\n"`, `c"x"`, `0xFF`, `'a'`),
+    # for diagnostics that quote the token as ritz1 does (AGAST #4283). None
+    # for every other token: their `value` is their text.
+    raw: Optional[str] = None
 
     def __repr__(self) -> str:
         if self.value is not None:

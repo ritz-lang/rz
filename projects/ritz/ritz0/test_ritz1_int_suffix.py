@@ -84,17 +84,16 @@ pub fn main() -> i32
 # NUMBER_SUFFIXES has no `U`/`I` form, so `1U32` lexes as `1` and the
 # identifier `U32`, and the program is refused downstream at the `U`; ritz1's
 # lexer took `[uUiI]` and compiled it. Each must fail on all three at the
-# suffix's column, naming the stray identifier. The wording differs: ritz0's
-# parser reads a second statement on the same line, so it says "statement has
-# no effect" where ritz1 says "unexpected 'U32'" (that ritz0 quirk is #4283).
+# suffix's column, naming the stray identifier, in one wording: a second
+# statement on the line is "unexpected 'U32'" everywhere (AGAST #4283).
 # name -> (program, "line:col", message fragment)
 UPPERCASE = {
     "upper_u32": ("pub fn main() -> i32\n    let a = 1U32\n    return 0\n",
-                  "2:14", "U32"),
+                  "2:14", "unexpected 'U32'"),
     "upper_i8_hex": ("pub fn main() -> i32\n    let a = 0xFFI8\n    return 0\n",
-                     "2:17", "I8"),
+                     "2:17", "unexpected 'I8'"),
     "upper_usize": ("pub fn main() -> i32\n    let a = 3Usize\n    return 0\n",
-                    "2:14", "Usize"),
+                    "2:14", "unexpected 'Usize'"),
     "upper_i64_arg": ("fn f(x: i64) -> i64\n    x\n\npub fn main() -> i32\n"
                       "    f(2I64) as i32\n",
                       "5:8", ""),

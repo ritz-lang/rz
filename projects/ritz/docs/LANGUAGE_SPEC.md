@@ -136,6 +136,21 @@ fn pack(r: u8, g: u8) -> u32
     (g as u32)
 ```
 
+**One statement per line.** Ritz has no `;` statement separator: a
+statement ends its line, and the next one starts on a new line. A second
+statement on the same line is an error at its first token (AGAST #4283), so
+`let a = 1U32` is refused at the `U32` (§2.6: a suffix is lowercase) rather
+than read as `let a = 1` and a stray `U32`:
+
+```ritz expect-error="unexpected 'g'"
+fn g() -> i32
+    0
+
+fn two() -> i32
+    let a = 1 g()
+    a
+```
+
 A line that does not end in an operator ends the statement, even when the
 next line could carry on the expression: `x = x + 1` followed by `-x` is two
 statements. Inside `(`, `[` or `{` line breaks and indentation are ignored
@@ -348,9 +363,10 @@ let a: i32 = 0xDEADBEEF as i32
 **Removed in RERITZ:** the `s"..."` prefix. Bare `"..."` now produces exactly
 the `{ ptr, len }` value that `s"..."` used to, so the prefix was redundant
 (AGAST #98). `s"hello"` now lexes as the identifier `s` next to a string,
-and that string, alone on its line, is a statement with no effect:
+and that string is a second statement on the line ([§2.2](#22-indentation)),
+refused at its opening quote:
 
-```ritz body expect-error="a string on its own line prints nothing: call print"
+```ritz body expect-error=".ritz:2:16: unexpected '"
 let bad = s"hello"
 ```
 

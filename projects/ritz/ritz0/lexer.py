@@ -848,10 +848,12 @@ class Lexer:
             return tok
 
         ch = self._peek()
+        start = self.pos
 
         # String literal
         if ch == '"' or ch == "'":
             tok = self._lex_string()
+            tok.raw = self.source[start:self.pos]
             self.last_token_type = tok.type
             return tok
 
@@ -864,12 +866,14 @@ class Lexer:
         # Number literal
         if ch.isdigit():
             tok = self._lex_number()
+            tok.raw = self.source[start:self.pos]
             self.last_token_type = tok.type
             return tok
 
         # C-string literal: c"..."
         if ch == 'c' and self._peek(1) == '"':
             tok = self._lex_cstring()
+            tok.raw = self.source[start:self.pos]
             self.last_token_type = tok.type
             return tok
 

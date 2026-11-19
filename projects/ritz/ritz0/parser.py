@@ -1599,6 +1599,8 @@ class Parser:
         else:
             # Single line: parse expression or control flow statement
             body = self.parse_match_arm_body()
+            # The arm's statement ends its line too (AGAST #4283).
+            self._expect_stmt_end()
             # Skip newline after arm body
             self._skip_newlines()
 
@@ -1758,6 +1760,7 @@ class Parser:
         while not self._at(TokenType.DEDENT, TokenType.EOF):
             stmt = self.parse_stmt()
             stmts.append(stmt)
+            self._expect_stmt_end()
             self._skip_newlines()  # Skip newlines after each statement
 
         if self._at(TokenType.DEDENT):
@@ -1770,6 +1773,24 @@ class Parser:
             stmts = stmts[:-1]
 
         return rast.Block(span, stmts, expr)
+
+    def _expect_stmt_end(self) -> None:
+        """A statement ends its line (LANGUAGE_SPEC §2.2; AGAST #4283).
+
+        Ritz has no `;`: the next statement starts on a new line.  ritz0 once
+        read `let a = 1 g()` as two statements (and `let a = 1U32` as `let a =
+        1` plus a discarded `U32`); ritz1 refuses at the stray token, and so
+        does ritz0 now, in ritz1's words (ast_helpers.ritz eprint_token_desc).
+        A statement that ends in an indented block (`if`, `while`, `match`, ...)
+        has already consumed its DEDENT, so the next line follows directly.
+        """
+        if self._at(TokenType.NEWLINE, TokenType.DEDENT, TokenType.EOF):
+            return
+        if self.pos > 0 and self.tokens[self.pos - 1].type == TokenType.DEDENT:
+            return
+        tok = self._current()
+        text = tok.raw if tok.raw is not None else tok.value
+        raise ParseError(f"unexpected '{text}'", tok.span)
 
     def parse_stmt(self) -> rast.Stmt:
         """Parse a statement."""
