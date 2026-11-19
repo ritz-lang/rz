@@ -46,6 +46,28 @@ LEGACY_ENTRIES = ("objects", "deps.json", "hashes.json")
 # pytest caches, the test/ tree and test_*.py modules.
 RITZ0_EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "test"}
 RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
+# ...except these, which are compiler code despite the prefix: ritz0.py
+# imports test_runner for `--test` (AGAST #4314). tools/check_liveness.py
+# carves out the same file. tools/test_compiler_hash_import_graph.py fails
+# if ritz0.py can import anything the hash misses.
+RITZ0_HASHED_DESPITE_PREFIX = {"test_runner.py"}
+
+# projects/ritz files hashed into every compiler's fingerprint, with their tag.
+# build.py owns the clang flags (-ffreestanding/-fno-builtin), the runtime
+# shims and the link order; leaving it out once let a new clang flag reuse
+# every stale object. The rest were part of build.py until AGAST #1835 /
+# #3632: resolve.py decides the --deps every module is compiled with,
+# build_pipeline.py owns the flags and links, manifest.py what each [[bin]] is
+# built as. cas.py derives every artifact key and ritz0's module_interface
+# imports it (AGAST #4314). (build_testrun.py and build_cli.py produce no
+# artefact.)
+RITZ0_DRIVER_FILES = {
+    "build.py": b"build-driver",
+    "resolve.py": b"build-driver-resolve",
+    "build_pipeline.py": b"build-driver-pipeline",
+    "manifest.py": b"build-driver-manifest",
+    "cas.py": b"build-driver-cas",
+}
 
 
 # ============================================================================
@@ -177,7 +199,8 @@ def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
         for fn in filenames:
             if not fn.endswith(".py"):
                 continue
-            if fn.startswith(RITZ0_EXCLUDE_FILE_PREFIXES):
+            if (fn.startswith(RITZ0_EXCLUDE_FILE_PREFIXES)
+                    and fn not in RITZ0_HASHED_DESPITE_PREFIX):
                 continue
             sources.append(Path(dirpath) / fn)
     sources.sort(key=lambda p: p.relative_to(ritz0_root).as_posix())
@@ -187,30 +210,17 @@ def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
 def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
     """Fingerprint the compiler; part of every CAS key and import-scan store.
 
-    ``ritz0``: build.py, resolve.py, build_pipeline.py and manifest.py plus
-    every ``.py`` under ``ritz0/`` except tests and bytecode caches (the
-    source tree is the artifact).
-    ``ritz1`` / ``ritz1_selfhosted``: those four files plus the binary
+    ``ritz0``: the ``RITZ0_DRIVER_FILES`` plus every ``.py`` under
+    ``ritz0/`` except tests and bytecode caches (the source tree is the
+    artifact); ``test_runner.py`` is compiler code, not a test.
+    ``ritz1`` / ``ritz1_selfhosted``: the driver files plus the binary
     under ``ritz1/build/``; a missing binary returns the sentinel ``"<compiler>-missing"`` so state
     recorded without it is invalidated once it appears.
     """
     h = hashlib.sha256()
     h.update(f"compiler={compiler}\n".encode())  # namespace the digest
 
-    # build.py is codegen-critical for both compilers: it owns the clang flags
-    # (-ffreestanding/-fno-builtin), the runtime shims and the link order.
-    # Leaving it out once let a new clang flag reuse every stale object.
-    build_driver = project_root / "build.py"
-    if build_driver.is_file():
-        h.update(b"build-driver\x00")
-        _hash_file_into(h, build_driver)
-    # These were part of build.py until AGAST #1835 / #3632: resolve.py
-    # decides the --deps every module is compiled with, build_pipeline.py
-    # owns the flags and links, manifest.py what each [[bin]] is built as.
-    # (build_testrun.py and build_cli.py produce no artefact.)
-    for tag, name in ((b"build-driver-resolve", "resolve.py"),
-                      (b"build-driver-pipeline", "build_pipeline.py"),
-                      (b"build-driver-manifest", "manifest.py")):
+    for name, tag in RITZ0_DRIVER_FILES.items():
         driver = project_root / name
         if driver.is_file():
             h.update(tag + b"\x00")
