@@ -6354,6 +6354,23 @@ fn main() -> i32
     r - 9
 ```
 
+A value `if` with an `else` may await as an operand, too (AGAST #4190): only
+the taken arm's awaits run, and its value is kept in the future, of the type
+of the first arm whose value isn't a bare literal.  One that tells no type,
+such as a struct field, is refused at the `if`; cast an arm (`p.n as i32`):
+
+```ritz
+async fn dbl(x: i32) -> i32
+    x * 2
+
+async fn pick(c: bool) -> i32
+    1 + if c then 7 else await dbl(5)
+
+fn main() -> i32
+    let r: i32 = await pick(false)   # 1 + 10
+    r - 11
+```
+
 A `defer` among the statements the machine splits into states is refused at
 the `defer`, until it is lowered (AGAST #4013):
 

@@ -205,6 +205,31 @@ def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path):
     assert _run_pkg("ritz1", tmp_path, "imp_async", program, extra) == 86
 
 
+def _future_fields(ll: str, name: str) -> list:
+    """`name`'s LLVM struct fields, module prefixes dropped: ritz1 names a
+    struct `%"struct.ritz_module_1.X"`, ritz0 `%X`."""
+    m = re.search(rf'^%"?(?:struct\.\w+\.)?{name}"? = type \{{(.*)\}}$', ll, re.MULTILINE)
+    assert m, f"no {name} in the module"
+    return [re.sub(r'%"?(?:struct\.\w+\.)?(\w+)"?', r"%\1", f.strip()) for f in m.group(1).split(",")]
+
+
+@pytest.mark.integration
+def test_if_operand_future_layout_as_ritz0(ritz1_bin, tmp_path):
+    """#4190: an awaiting `if` operand's `__if_K` field comes after its
+    condition's fields, as the arms' do after it, in both compilers: the
+    same `go_Future`, field for field, beside `__for_K` and `__short_K`."""
+    program = (_DBL + "async fn go(n: i32) -> i32\n    var s: i32 = 0\n    for i in 0..n\n"
+               "        s += 1 + if i > 0 && (await dbl(i)) > 2 then "
+               "100 + (if i == 2 then await dbl(5) else await dbl(20)) else 0\n    s\n\n"
+               + _main("    await go(4)\n"))
+    layouts = []
+    for compiler in ("ritz0", "ritz1"):
+        res = _compile(compiler, tmp_path, program)
+        assert res.returncode == 0, (compiler, res.stdout, res.stderr)
+        layouts.append(_future_fields((tmp_path / f"m_{compiler}_{compiler}.ll").read_text(), "go_Future"))
+    assert layouts[0] == layouts[1]
+
+
 PRIVATE_ASYNC_CALLERS = {
     # (main.ritz, line:col of `fetch` at the call)
     "await": ("import a\n\nasync fn main() -> i32\n    let v: i32 = await fetch(41)\n    v\n",

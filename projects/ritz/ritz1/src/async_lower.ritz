@@ -386,6 +386,7 @@ struct AlFn
     cur: *AlBlock       # the open state; null after a jump
     nawaits: i32        # awaits lowered so far
     nshorts: i32        # `&&` / `||` with an awaiting right operand, so far
+    nifs: i32           # awaiting `if` operands lowered so far (#4190)
     extra: *AlLocal     # the fields it adds, in order
     renames: *AlRename  # innermost first
     nfors: i32          # awaiting `for`s lowered so far
@@ -406,6 +407,7 @@ fn al_fn_init(a: *AlFn, f: *FnDef, sync: i32)
     a.cur = null
     a.nawaits = 0
     a.nshorts = 0
+    a.nifs = 0
     a.extra = null
     a.renames = null
     a.nfors = 0
@@ -858,11 +860,11 @@ fn al_rw_expr(a: *AlFn, e: *Expr) -> *Expr
             m.next = e.next
             return m
         return e
-    if k == EXPR_AWAIT or (k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR))
+    if k == EXPR_AWAIT or k == EXPR_IF or (k == EXPR_BINARY and (e.op == OP_AND or e.op == OP_OR))
         let p: *AlPoint = al_point_of(a, e)
         if p != null
-            # A state already drove it (an await, or a short-circuit whose
-            # right operand awaits): its value is stored.
+            # A state already drove it (an await, a short-circuit whose right
+            # operand awaits, or an awaiting `if` operand): its value is stored.
             let m: *Expr = al_self_field(p.result, p.result_len, e.span)
             m.next = e.next
             return m
@@ -1484,6 +1486,8 @@ fn al_hoist_walk(a: *AlFn, e: *Expr, under: *u8)
         d.len = n
         al_lower_await(a, e, @d)
         al_add_point(a, e, tmp, n)
+    else if k == EXPR_IF and under == null and (e.args as *MatchArm).next != null and al_await_in(e) != null
+        al_if_value(a, e)
     else if k == EXPR_IF or k == EXPR_MATCH
         al_hoist_walk(a, e.left, under)
         var u: *u8 = under
@@ -1548,6 +1552,97 @@ fn al_short_circuit(a: *AlFn, e: *Expr)
     right.next = null
     al_emit(a, al_assign_self(tmp, n, right, e.span))
     al_goto(a, join, e.span)
+    a.cur = join
+    al_add_point(a, e, tmp, n)
+
+# A value's type into `l`, as al_infer tells it, read also through a value
+# `if` (al_if_type) and the arithmetic over one: an awaiting `if` operand's
+# `__if_K` field (AGAST #4190).  Only that field's: an untyped `let`'s is
+# al_infer's alone.  ritz0's _IfTyper.
+fn al_value_type(a: *AlFn, e: *Expr, l: *AlLocal) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_IF
+        return al_if_type(a, e, l)
+    if k == EXPR_BINARY and (e.op < OP_EQ or e.op > OP_OR)
+        if e.op != OP_SHL and e.op != OP_SHR and e.left.kind == EXPR_INT_LIT and e.right.kind != EXPR_INT_LIT
+            return al_value_type(a, e.right, l)
+        return al_value_type(a, e.left, l)
+    if k == EXPR_UNARY and (e.op == OP_NEG or e.op == OP_BIT_NOT)
+        return al_value_type(a, e.operand, l)
+    al_infer(a, e, l)
+
+# A value `if`'s type: its first arm's whose value isn't a bare literal (`7`
+# takes the other arm's type); else its first arm's that tells (`i64`).
+fn al_if_type(a: *AlFn, e: *Expr, l: *AlLocal) -> i32
+    let then_arm: *MatchArm = e.args as *MatchArm
+    if then_arm == null or then_arm.next == null
+        return 0
+    var arm: *MatchArm = then_arm
+    while arm != null
+        if arm.body != null and al_untyped_int(arm.body) == 0 and al_value_type(a, arm.body, l) == 1
+            return 1
+        arm = arm.next
+    arm = then_arm
+    while arm != null
+        if al_value_type(a, arm.body, l) == 1
+            return 1
+        arm = arm.next
+    0
+
+# A value `if` that is an operand and awaits (AGAST #4190): each arm runs in
+# states of its own, its awaits only when it is taken, and writes the value
+# to a field the expression reads.  al_short_circuit, with two arms; ritz0's
+# _CfgBuilder._if_value.
+#
+#     if c { -> T } else { -> E }    # c's awaits first
+#   T: __if_K = then-value           # its awaits in states
+#   E: __if_K = else-value
+#   J: ... the expression reads __if_K
+fn al_if_value(a: *AlFn, e: *Expr)
+    let jump: *Stmt = al_jump_in_expr(e)
+    if jump != null
+        # An arm's `break` would leave the dispatch loop, not the user's.
+        # ritz0's row (jump_in_awaiting_operand): ritz1's operand `if` is
+        # the inline form, whose arms hold no `break`, so it can't reach here.
+        var jm: String = string_new()
+        string_push_str(@&jm, "`break` / `continue` inside an expression of an async fn's loop that awaits is not supported yet (AGAST #4013)")
+        al_refuse(a, @&jm, jump.span)
+        string_drop(@&jm)
+        return
+    var t: AlLocal
+    if al_if_type(a, e, @t) == 0
+        var m: String = string_new()
+        string_push_str(@&m, "cannot infer the type of the `if`'s value, which `")
+        string_push_bytes(@&m, a.f.name, a.f.name_len as i64)
+        string_push_str(@&m, "`'s future holds across an `await`: cast an arm (`x as i32`)")
+        al_refuse(a, @&m, e.span)
+        string_drop(@&m)
+        return
+    al_hoist_walk(a, e.left, null)
+    var n: i32 = 0
+    let tmp: *u8 = al_numbered(c"__if_", a.nifs, @n)
+    a.nifs += 1
+    al_if_type(a, e, al_extra(a, tmp, n))
+    let cond: *Expr = al_rw_expr(a, e.left)
+    cond.next = null
+    let then_arm: *MatchArm = e.args as *MatchArm
+    let then_b: *AlBlock = al_new_block(a)
+    let else_b: *AlBlock = al_new_block(a)
+    let join: *AlBlock = al_new_block(a)
+    al_branch(a, cond, then_b, else_b, e.span)
+    var d: AlDest = al_dest(AL_TO_FIELD, e.span)
+    d.name = tmp
+    d.len = n
+    a.cur = then_b
+    al_lower_arm(a, then_arm, @d, null)
+    if a.cur != null
+        al_goto(a, join, e.span)
+    a.cur = else_b
+    al_lower_arm(a, then_arm.next, @d, null)
+    if a.cur != null
+        al_goto(a, join, e.span)
     a.cur = join
     al_add_point(a, e, tmp, n)
 

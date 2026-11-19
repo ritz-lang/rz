@@ -181,16 +181,55 @@ RUNS = {
                                   "                    5 =>\n                        s += await dbl(v)\n"
                                   "                    w =>\n                        s += w * 10 + await dbl(i)\n"
                                   "            B =>\n                s += 1\n    s\n", "(E.A(4))"), 212),
+    # A value `if` that is an operand, and awaits (AGAST #4190): its value is
+    # an `__if_K` field the taken arm's states write, which the expression
+    # reads.  Only the taken arm awaits; A counts a()'s runs, B b()'s.
+    "if_operand_then": (_AB + _go("(c: bool) -> i32", "    let v: i32 = 1 + if c then await a() else await b()\n"
+                                  "    v * 50 + A * 10 + B\n", "(true)"), 110),
+    "if_operand_else": (_AB + _go("(c: bool) -> i32", "    let v: i32 = 1 + if c then await a() else await b()\n"
+                                  "    v * 50 + A * 10 + B\n", "(false)"), 151),
+    # An arm that doesn't await, in a loop: the field's type is the arm
+    # value's that isn't a bare literal (an i64 field would be narrowed).
+    "if_operand_literal_arm": (_DBL + _go("(c: bool) -> i32", "    var s: i32 = 0\n    while s < 30\n"
+                                          "        s = s + 2 * if c then 7 else 1 + await dbl(2)\n"
+                                          "        c = !c\n    s\n", "(true)"), 38),
+    # Survives a Pending poll; the statement ahead of it runs once.
+    "if_operand_pending": (_LATER + "async fn go() -> i32\n    CALLS += 1\n"
+                           "    let v: i32 = 0 + if CALLS > 0 then await later() else 0\n"
+                           "    v + CALLS * 10\n\n" + _POLL_GO, 215),
+    # An `&&` in the condition and a nested awaiting `if` in an arm's sum
+    # (its type read through the `+`), in a range `for`: `__for_K`,
+    # `__short_K` and two `__if_K` fields in one future.
+    "if_operand_nested_for": (_DBL + _go("(n: i32) -> i32", "    var s: i32 = 0\n    for i in 0..n\n"
+                                         "        s += 1 + if i > 0 && (await dbl(i)) > 2 then "
+                                         "100 + (if i == 2 then await dbl(5) else await dbl(20)) else 0\n"
+                                         "    s\n", "(4)"), 254),
     "pending_inner_future_kept": (_LATER + "async fn mid() -> i32\n    CALLS += 1\n    let v: i32 = await later()\n"
                                   "    v\n\nasync fn go() -> i32\n    let v: i32 = await mid()\n"
                                   "    v + CALLS * 10\n\n" + _POLL_GO, 215),
 }
 
 
+# An awaiting `if` operand in the block form, whose arms hold statements:
+# ritz1's grammar takes only the inline `if c then a else b` as an operand,
+# so these rows are ritz0's (AGAST #4190).
+RITZ0_RUNS = {
+    "if_operand_block_arms": (_DBL + _go("(c: bool) -> i32", "    var s: i32 = 0\n    while s < 30\n"
+                                         "        s = s + 2 * if c\n            7\n        else\n"
+                                         "            let t: i32 = await dbl(2)\n            t + 1\n"
+                                         "        c = !c\n    s\n", "(true)"), 38),
+    "if_operand_block_nested": (_DBL + _go("(n: i32) -> i32", "    var s: i32 = 0\n    for i in 0..n\n"
+                                           "        s += 1 + if i > 0 && (await dbl(i)) > 2\n"
+                                           "            100 + if i == 2\n                await dbl(5)\n"
+                                           "            else\n                await dbl(20)\n"
+                                           "        else\n            0\n    s\n", "(4)"), 254),
+}
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_async_body_runs_as_written(tmp_path, compiler):
-    assert_runs(compiler, tmp_path, RUNS)
+    assert_runs(compiler, tmp_path, {**RUNS, **(RITZ0_RUNS if compiler == "ritz0" else {})})
 
 
 # Forms whose awaits the state machine doesn't place yet (AGAST #4013): each
@@ -215,16 +254,24 @@ REFUSALS = {
                           "pub fn main() -> i32\n    var p: P = P { n: 3 }\n    await go(@p)\n",
                           "cannot infer the type of `i`, which `go`'s future holds across an `await`: "
                           "cast a bound of its range (`0..(n as i64)`)"),
+    # An awaiting `if` operand's value is a future field, which needs a type
+    # (#4190): neither arm's tells it.
+    "if_operand_untyped": (_DBL + "struct P\n    n: i32\n\nasync fn go(p: *P, c: bool) -> i32\n"
+                           "    let v: i32 = 1 + ^if c then p.n else p.n + await dbl(1)\n    v\n\n"
+                           "pub fn main() -> i32\n    var p: P = P { n: 3 }\n    await go(@p, true)\n",
+                           "cannot infer the type of the `if`'s value, which `go`'s future holds across "
+                           "an `await`: cast an arm (`x as i32`)"),
     # A defer the machine would split: refused at the `defer` itself.
     "defer_among_states": (_DBL + "async fn go(n: i32) -> i32\n    ^defer n = 0\n    await dbl(n)\n\n"
                            "pub fn main() -> i32\n    await go(3)\n",
                            "`defer` in an async fn that awaits is not supported yet (AGAST #4013)"),
 }
 
-# Only a value `match` / `if` (a let's, an assignment's, a return's) is
-# lowered; an awaiting or jumping one that is an operand is refused.  ritz1's
-# grammar takes no such operand (`1 + match x` is its parse error), so these
-# rows are ritz0's.
+# An awaiting `match` that is an operand is refused, as is a jump out of the
+# loop from an operand's arm: only a value `match` (a let's, an assignment's,
+# a return's) and an awaiting `if` operand (#4190) are lowered.  ritz1's
+# grammar takes no such operand (`1 + match x` is its parse error, and an
+# inline `if`'s arms hold no `break`), so these rows are ritz0's.
 RITZ0_REFUSALS = {
     "match_in_expression": (_DBL + "async fn go(x: i32) -> i32\n    let v: i32 = 1 + match x\n"
                             "        0 => ^await dbl(1)\n        _ => 2\n    v\n\npub fn main() -> i32\n    await go(0)\n",
@@ -234,6 +281,14 @@ RITZ0_REFUSALS = {
                         "        else\n            2\n        s += v\n    s\n\npub fn main() -> i32\n    await go(true)\n",
                         "`break` / `continue` inside an expression of an async fn's loop that awaits "
                         "is not supported yet (AGAST #4013)"),
+    # An awaiting `if` operand is lowered (#4190), but not an arm's jump out
+    # of the loop: it would leave the poll's dispatch loop.
+    "jump_in_awaiting_operand": (_DBL + "async fn go(c: bool) -> i32\n    var s: i32 = 0\n    while s < 10\n"
+                                 "        let v: i32 = 1 + if c\n            ^break\n"
+                                 "        else\n            await dbl(2)\n        s += v\n    s\n\n"
+                                 "pub fn main() -> i32\n    await go(true)\n",
+                                 "`break` / `continue` inside an expression of an async fn's loop that awaits "
+                                 "is not supported yet (AGAST #4013)"),
 }
 
 

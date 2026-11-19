@@ -431,6 +431,42 @@ def _has_await(node) -> bool:
     return _first_await(node) is not None
 
 
+class _IfTyper(AsyncAnalyzer):
+    """_infer_type that also reads through a value `if` and a block's tail,
+    for an awaiting `if` operand's `__if_K` field (AGAST #4190).  ritz1's
+    al_value_type.  Only that field's type: an untyped `let`'s is unchanged."""
+
+    def _infer_type(self, expr: rast.Expr) -> Optional[rast.Type]:
+        expr = _ungroup(expr)
+        if isinstance(expr, rast.Block):
+            return None if expr.expr is None else self._infer_type(expr.expr)
+        if isinstance(expr, rast.If):
+            if expr.else_block is None:
+                return None
+            # The first arm whose value isn't a bare literal (`7`, which takes
+            # the other arm's type); else the first arm that answers (`i64`).
+            arms = (expr.then_block, expr.else_block)
+            for arm in arms:
+                if not _untyped_int_literal(_tail_value(arm)):
+                    ty = self._infer_type(arm)
+                    if ty is not None:
+                        return ty
+            for arm in arms:
+                ty = self._infer_type(arm)
+                if ty is not None:
+                    return ty
+            return None
+        return super()._infer_type(expr)
+
+
+def _tail_value(expr: rast.Expr) -> Optional[rast.Expr]:
+    """A block's value, read through blocks and parentheses."""
+    expr = _ungroup(expr)
+    while isinstance(expr, rast.Block):
+        expr = None if expr.expr is None else _ungroup(expr.expr)
+    return expr
+
+
 def _escaping_jump(node) -> Optional[rast.Node]:
     """A `break` / `continue` in `node` that leaves it for an enclosing loop."""
     if isinstance(node, (rast.BreakStmt, rast.ContinueStmt, rast.BreakExpr, rast.ContinueExpr)):
@@ -647,6 +683,7 @@ class _CfgBuilder:
         self.cur: Optional[int] = None
         self.n_awaits = 0
         self.n_shorts = 0
+        self.n_ifs = 0
         self.n_fors = 0
         self.n_matches = 0
         # Fields the lowering adds: awaited futures, await results,
@@ -975,6 +1012,9 @@ class _CfgBuilder:
             self.rw.await_results[id(node)] = tmp
             return
         if isinstance(node, rast.If):
+            if under is None and node.else_block is not None and _has_await(node):
+                self._if_value(node)
+                return
             self._hoist(node.cond, under)
             for arm in (node.then_block, node.else_block):
                 if arm is not None:
@@ -1020,6 +1060,45 @@ class _CfgBuilder:
         self.emit(rast.AssignStmt(span=node.span, target=self.rw.self_field(tmp, node.span),
                                   value=self.hoist(node.right)))
         self.goto(join)
+        self.cur = join
+        self.rw.await_results[id(node)] = tmp
+
+    def _if_type(self, node: rast.If) -> Optional[rast.Type]:
+        typer = _IfTyper(self.gen.fn_sigs)
+        typer.current_locals = dict(self.gen.analysis.all_locals)
+        return typer._infer_type(node)
+
+    def _if_value(self, node: rast.If):
+        """A value `if` that is an operand and awaits (AGAST #4190): each arm
+        runs in states of its own, its awaits only when it is taken, and
+        writes the value to a field the expression reads.  #4013's
+        _short_circuit, with two arms.
+
+            if c { -> T } else { -> E }    # c's awaits first
+          T: __if_K = then-value           # its awaits in states
+          E: __if_K = else-value
+          J: ... the expression reads __if_K"""
+        jump = _escaping_jump(node)
+        if jump is not None:
+            # An arm's `break` would leave the dispatch loop, not the user's.
+            raise AsyncLoweringError(
+                "`break` / `continue` inside an expression of an async fn's loop that awaits "
+                "is not supported yet (AGAST #4013)", jump.span)
+        ty = self._if_type(node)
+        if ty is None:
+            raise AsyncLoweringError(
+                f"cannot infer the type of the `if`'s value, which `{self.gen.fn_def.name}`'s future holds "
+                f"across an `await`: cast an arm (`x as i32`)", node.span)
+        self._hoist(node.cond, None)
+        tmp = self._add_field(f"__if_{self.n_ifs}", ty)
+        self.n_ifs += 1
+        then_b, else_b, join = self.new_block(), self.new_block(), self.new_block()
+        self.branch(self.rw.rewrite(node.cond), then_b, else_b)
+        for entry, arm in ((then_b, node.then_block), (else_b, node.else_block)):
+            self.cur = entry
+            self.lower_value(arm, ('field', tmp, node.span), None)
+            if self.cur is not None:
+                self.goto(join)
         self.cur = join
         self.rw.await_results[id(node)] = tmp
 
