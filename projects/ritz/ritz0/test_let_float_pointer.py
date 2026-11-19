@@ -123,6 +123,32 @@ FORMS = {
                    "        _ => 1.5\n\n"
                    "fn main() -> i32\n"
                    "    return g(1, c\"x\") as i32\n", 3, 21),
+    # AGAST #4200: a pattern binding's pointer payload, which ritz1 knew only
+    # as bool / int / unsure, so it converted the pointer.
+    "pattern_binding": ("fn f(o: Option<*u8>) -> i32\n"
+                        "    let a: f64 = match o\n"
+                        "        Some(q) => q\n"
+                        "        None => 1.5\n"
+                        "    return a as i32\n\n"
+                        "fn main() -> i32\n"
+                        "    return f(None)\n", 3, 20),
+    "pattern_binding_err": ("fn f(o: Result<i32, *u8>) -> i32\n"
+                            "    let a: f64 = match o\n"
+                            "        Ok(n) => 1.5\n"
+                            "        Err(q) => q\n"
+                            "    return a as i32\n\n"
+                            "fn main() -> i32\n"
+                            "    return f(Ok(1))\n", 4, 19),
+    "pattern_binding_user_enum": ("enum E\n"
+                                  "    P(*u8)\n"
+                                  "    N\n\n"
+                                  "fn f(o: E) -> i32\n"
+                                  "    let a: f64 = match o\n"
+                                  "        P(q) => q\n"
+                                  "        N => 1.5\n"
+                                  "    return a as i32\n\n"
+                                  "fn main() -> i32\n"
+                                  "    return f(N)\n", 7, 17),
 }
 
 # ritz1 and ritz1_selfhosted: forms with no located refusal yet (none since

@@ -304,8 +304,11 @@ CORPUS_FLOOR = 15000
 # in the two corpus files reading fs's Err; #4265 types it).  23 at
 # #3943 / #4259, whose one element typer (sema_elem_ty) types `x[i]`'s scalars
 # and bool_check's sbk_index falls back on it: an index through a Vec or Span
-# a field, call or method holds.  Lower it as they go.
-BK_GAP_CEILING = 23
+# a field, call or method holds.  24 at #4200, which binds a `ptr_T`
+# Option / Result payload (`Some(p)`, p: *Inner_2) as a pointer on Sema; the
+# emitter's bool_kind of it (emitter_match's bk_tagged_payload) is the unsure
+# side (#4280).  Lower it as they go.
+BK_GAP_CEILING = 24
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
