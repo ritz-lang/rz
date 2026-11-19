@@ -241,6 +241,11 @@ let sized = 100u16      # Typed suffix
 There is no octal literal form. `0o77` lexes as `0` followed by the identifier
 `o77` and fails at name resolution.
 
+A type suffix is lowercase: `u8`, `u16`, `u32`, `u64`, `usize`, `i8`, `i16`,
+`i32`, `i64`, `isize` (and `f32`, `f64` on a float). `1U32` is no typed
+literal: it lexes as `1` followed by the identifier `U32`, and is refused at
+the `U` (AGAST #4273).
+
 #### Digit Separators
 
 A `_` may separate two digits of a numeric literal, decimal, hex or binary:
