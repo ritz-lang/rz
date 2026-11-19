@@ -1148,5 +1148,110 @@ l1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
 sed -i "s/^SHA=.*/SHA=$(git -C "$M" rev-parse origin/main)/" "$l1"
 eq "$(bash "$TR" pending)" "GATE train 1 n=2 (full): train.sh gate" "a red log for another SHA is no verdict: the train gates again"
 bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+
+# 15. A malformed build item changes nothing (AGAST #4337).  `build --next
+# ritz-task-4287 <sha>` (a space, not a colon) died with "bad item" only
+# after build_on had discarded the replaced trains, removed RZ_TRAINS and
+# started a new empty train in the free slot: trains 2-4, gating remotely,
+# fell out of the queue.  Every item is checked before anything changes now.
+# snap: RZ_TRAINS, every train worktree's HEAD and RZ_TRAIN, and `show`.
+snap() {
+    local d q; q="$(git -C "$M" rev-parse --path-format=absolute --git-common-dir)/RZ_TRAINS"
+    echo "--- RZ_TRAINS"; cat "$q" 2>/dev/null || echo "(none)"
+    for d in "$T"/train "$T"/train-*; do
+        [[ -e "$d/.git" ]] || continue
+        echo "--- $d $(git -C "$d" rev-parse HEAD)"
+        cat "$(git -C "$d" rev-parse --absolute-git-dir)/RZ_TRAIN" 2>/dev/null || echo "(no state)"
+    done
+    echo "--- show"; bash "$TR" show 2>&1
+}
+same() {
+    local after; after="$(snap)"
+    [[ "$after" == "$1" ]] && ok "$2" || { bad "$2"; diff <(echo "$1") <(echo "$after") | sed 's/^/     | /'; }
+}
+fetch; git -C "$M" checkout -q main
+cars va 6; bash "$TR" build "${items[@]}" >/dev/null 2>&1
+# Train 1 gates here, trains 2 and 3 as local SPECs: build --next keeps all 3.
+bash "$TR" gate 1 >/dev/null 2>&1; bash "$TR" gate 2 >/dev/null 2>&1; l3="$(bash "$TR" gate 3 2>/dev/null)"
+[[ -n "$(gatedn 1)" && -n "$(specn 2)" && -n "$(specn 3)" ]] && ok "three trains gating" || bad "three trains gating"
+c7="$(room va7 s/va7 X)"; fetch; git -C "$M" checkout -q main
+before="$(snap)"
+out="$(bash "$TR" build --next va7 "$c7" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "bad item 'va7'" "build --next <branch> <sha> (a space) dies" || bad "build --next <branch> <sha> dies (rc=$rc)"
+same "$before" "a malformed build --next item leaves every train, RZ_TRAINS and show as they were"
+out="$(bash "$TR" build --next "va7:$c7" "va8" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "bad item 'va8'" "a malformed item after a good one dies" || bad "a malformed item after a good one dies (rc=$rc)"
+same "$before" "a malformed item after a good one changes nothing"
+out="$(bash "$TR" build "va7:" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "bad item 'va7:'" "plain build with an empty sha dies" || bad "plain build with an empty sha dies (rc=$rc)"
+same "$before" "a malformed plain build changes nothing"
+# A build that dies part-way (here: the free slot's tree can't be reset)
+# leaves the kept trains in the queue, and nothing half-built in it.
+if [[ -e "$T/train-4/.git" ]]; then lock="$(git -C "$T/train-4" rev-parse --absolute-git-dir)/index.lock"
+else lock="$T/train-4"; fi
+: > "$lock"
+out="$(bash "$TR" build --next "va7:$c7" 2>&1)"; rc=$?
+rm -f "$lock"
+[[ $rc -ne 0 ]] && ok "a build that dies part-way fails" || bad "a build that dies part-way fails (rc=$rc)"
+eq "$(bash "$TR" show 2>/dev/null | grep -c '^== train')" 3 "a build that dies part-way keeps the 3 gating trains queued"
+[[ "$(specn 2)" == "$(echo "$before" | awk '/^== train 2/{t=1} t && /^SPEC=/{sub(/^SPEC=/,""); print; exit}')" && -n "$(specn 3)" ]] \
+    && ok "their gates are untouched" || bad "their gates are untouched"
+out="$(bash "$TR" land "$l3" 2>&1)"
+[[ "$(grep -c '^MERGED' <<<"$out")" == 6 ]] && ok "the kept trains still land" || { bad "the kept trains still land"; echo "$out" | sed 's/^/     | /'; }
+# Dying part-way after trains 2 and 3 (not gating) were replaced: the queue
+# is train 1 alone, not a list naming slots with no state.
+fetch; git -C "$M" checkout -q main
+cars vb 6; bash "$TR" build "${items[@]}" >/dev/null 2>&1; l1="$(bash "$TR" gate 1 2>/dev/null)"
+c7="$(room vb7 s/vb7 X)"; fetch; git -C "$M" checkout -q main
+t1="$(snap | sed -n '/^--- .*\/train /,/^---/p')"
+lock="$(git -C "$T/train-2" rev-parse --absolute-git-dir)/index.lock"; : > "$lock"
+out="$(bash "$TR" build --next "vb7:$c7" 2>&1)"; rc=$?
+rm -f "$lock"
+[[ $rc -ne 0 ]] && has "$out" "stopped part-way.*1 kept" "a build dying after it replaced trains says so" || bad "a build dying after it replaced trains says so (rc=$rc)"
+out="$(bash "$TR" show 2>&1)"; rc=$?
+[[ $rc -eq 0 && "$(grep -c '^== train' <<<"$out")" == 1 ]] && ok "then show lists train 1 alone" || { bad "then show lists train 1 alone (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+eq "$(snap | sed -n '/^--- .*\/train /,/^---/p')" "$t1" "train 1 is untouched"
+out="$(bash "$TR" land "$l1" 2>&1)"
+[[ "$(grep -c '^MERGED' <<<"$out")" == 2 && -z "$(bash "$TR" show 2>/dev/null)" ]] && ok "train 1 lands, leaving no train" \
+    || { bad "train 1 lands, leaving no train"; echo "$out" | sed 's/^/     | /'; }
+# 16. The zero-slot queue write leaves an empty list, not no list (AGAST
+# #4337).  land/fail write RZ_TRAINS before clearing trains 1..k's state, so a
+# removed list lets queue()'s legacy fallback (slot 1 with an RZ_TRAIN)
+# resurrect a train whose cleanup was interrupted.  The rm stub below fails at
+# that first state removal, exactly where an interrupt would.
+cat > "$T/bin/rm" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${RZ_TEST_RM_FAIL_STATE:-0}" == 1 ]]; then
+    for a in "$@"; do
+        [[ "$a" == */RZ_TRAIN ]] && { echo "rm: cannot remove '$a' (test)" >&2; exit 1; }
+    done
+fi
+exec /bin/rm "$@"
+STUB
+chmod +x "$T/bin/rm"
+fetch; git -C "$M" checkout -q main
+cars wc 6; bash "$TR" build "${items[@]}" >/dev/null 2>&1
+eq "$(bash "$TR" show 2>/dev/null | grep -c '^== train')" 3 "three trains built"
+l3="$(bash "$TR" gate 3 2>/dev/null)"
+q="$(git -C "$M" rev-parse --path-format=absolute --git-common-dir)/RZ_TRAINS"
+st1="$(git -C "$T/train" rev-parse --absolute-git-dir)/RZ_TRAIN"
+out="$(RZ_TEST_RM_FAIL_STATE=1 bash "$TR" land "$l3" 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && ok "landing stops when clearing a train's state fails" \
+    || bad "landing stops when clearing a train's state fails (rc=$rc)"
+[[ -f "$st1" ]] && ok "slot 1's state survives, as after an interrupt" \
+    || bad "slot 1's state survives, as after an interrupt"
+[[ -f "$q" && ! -s "$q" ]] && ok "the queue is an empty list, not a removed one" \
+    || bad "the queue is an empty list, not a removed one (file: $( [[ -e "$q" ]] && cat "$q" || echo absent ))"
+[[ -z "$(bash "$TR" show 2>/dev/null)" ]] && ok "show lists no train" \
+    || { bad "show lists no train"; bash "$TR" show 2>&1 | sed 's/^/     | /'; }
+eq "$(bash "$TR" pending)" "" "nothing is pending"
+out="$(bash "$TR" land 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "no train built" "a stale slot 1 is not a train" \
+    || bad "a stale slot 1 is not a train (rc=$rc)"
+# A list that never existed is still legacy slot 1 (a train built before
+# stacking existed).
+rm -f "$q"
+eq "$(bash "$TR" show 2>/dev/null | grep -c '^== train')" 1 "an absent list is still legacy train 1"
+rm -f "$st1"
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

@@ -205,6 +205,18 @@ queue() {
     fi
 }
 front() { local s; s="$(queue | head -1)"; [[ -n "$s" ]] || die "no train built"; use_slot "$s"; }
+# write_queue <slots...>: RZ_TRAINS is these slots, replaced in one rename so
+# no reader (or a dying writer) sees it half-written or missing; no slots: an
+# empty list, in one rename too.  Not a removed file: queue()'s legacy fallback
+# (no list, but an RZ_TRAIN in slot 1) would then resurrect a train land/fail
+# is still clearing - they write the queue before the trains' state.  A list
+# that was never written stays absent, so a pre-stacking train is still seen.
+# AGAST #4337.
+write_queue() {
+    local q; q="$(qfile)"
+    if [[ $# -eq 0 ]]; then : > "$q.tmp.$$"; else printf '%s\n' "$@" > "$q.tmp.$$"; fi \
+        && mv -f "$q.tmp.$$" "$q"
+}
 
 # --- Remote speculative gates (AGAST #3988) ---------------------------------
 # REMOTE_SH runs on the gate host as `bash -l -s -- <verb> <args>`, read from
@@ -398,6 +410,20 @@ conflict_with() {
     if [[ ${#hit[@]} -eq 0 ]]; then echo main; else (IFS=,; echo "${hit[*]}"); fi
 }
 
+# build_abort <rc>: the EXIT trap of a build past its checks (AGAST #4337).
+# Dying part-way, it drops the trains it started and queues only the kept
+# ones (their trees and gates untouched); the replaced ones are gone anyway.
+BUILD_KEEP=-1
+build_abort() {
+    [[ $1 -ne 0 && $BUILD_KEEP -ge 0 ]] || return 0
+    local s d
+    for s in "${slots[@]:BUILD_KEEP}"; do
+        d="$(git -C "$(slot_wt "$s")" rev-parse --absolute-git-dir 2>/dev/null)" && rm -f "$d/RZ_TRAIN"
+    done
+    write_queue "${slots[@]:0:BUILD_KEEP}" || true
+    echo "error: build stopped part-way: RZ_TRAINS holds the $BUILD_KEEP kept train(s) only; rebuild the rest" >&2
+}
+
 cmd_build() {
     local next=0 old=() keep=0 i st
     if [[ "${1:-}" == --next ]]; then next=1; shift; fi
@@ -423,9 +449,33 @@ cmd_build() {
 # build_on <keep> <items...>: keep the first <keep> trains as they are, and
 # build <items> on the last one's tail (on origin/main for 0), replacing every
 # later train.
+#
+# Nothing changes until every item checks out (AGAST #4337: a space for the
+# colon died after the replaced trains were gone and RZ_TRAINS removed, so
+# trains 2-4 gating remotely fell out of the queue): a malformed item dies
+# first; then, fetched, an item that is no commit or not its branch's tip is
+# a BAD line and stays out.  RZ_TRAINS is written once, when the new trains
+# are built; a death part-way (build_abort) leaves the kept trains queued.
 build_on() {
     local keep="$1"; shift
+    local item branch sha full items=()
+    for item in "$@"; do
+        branch="${item%%:*}"; sha="${item#*:}"
+        [[ "$branch" != "$item" && -n "$branch" && -n "$sha" ]] \
+            || die "bad item '$item' (want <branch>:<sha>); nothing changed"
+    done
     git -C "$MAIN_WT" fetch -q origin
+    for item in "$@"; do
+        branch="${item%%:*}"; sha="${item#*:}"
+        if ! full="$(git -C "$MAIN_WT" rev-parse -q --verify "$sha^{commit}")"; then
+            echo "BAD      $branch ${sha:0:12}: no such commit (fetched?)"; continue
+        fi
+        # The REAP must name the branch tip, as in the one-at-a-time checks.
+        if [[ "$(git -C "$MAIN_WT" rev-parse -q --verify "origin/$branch" || true)" != "$full" ]]; then
+            echo "BAD      $branch ${full:0:12}: origin/$branch is not this commit"; continue
+        fi
+        items+=("$branch:$full")
+    done
     local old=() s base i
     mapfile -t old < <(queue)
     slots=(); k=0
@@ -441,28 +491,21 @@ build_on() {
     else
         base="$(git -C "$MAIN_WT" rev-parse origin/main)"
     fi
+    # The old trains change from here on.
+    BUILD_KEEP=$keep; trap 'build_abort $?' EXIT
     for s in ${old[@]+"${old[@]}"}; do
         [[ -e "$(slot_wt "$s")/.git" ]] || continue
         use_slot "$s"; discard_spec
         rm -f "$(state)"
     done
-    rm -f "$(qfile)"
     # The lowest slot not holding a kept train.
     free_slot() { local i=1; while printf '%s\n' ${slots[@]+"${slots[@]}"} | grep -qx "$i"; do i=$((i + 1)); done; echo "$i"; }
     start_train "$(free_slot)" "$base"
     local first_new=$k
 
-    local item branch sha full parent count mb extra files
-    for item in "$@"; do
-        branch="${item%%:*}"; sha="${item#*:}"
-        [[ "$branch" != "$item" && -n "$sha" ]] || die "bad item '$item' (want <branch>:<sha>)"
-        if ! full="$(g rev-parse -q --verify "$sha^{commit}")"; then
-            echo "BAD      $branch ${sha:0:12}: no such commit (fetched?)"; continue
-        fi
-        # The REAP must name the branch tip, as in the one-at-a-time checks.
-        if [[ "$(g rev-parse -q --verify "origin/$branch" || true)" != "$full" ]]; then
-            echo "BAD      $branch ${full:0:12}: origin/$branch is not this commit"; continue
-        fi
+    local parent count mb extra files
+    for item in ${items[@]+"${items[@]}"}; do
+        branch="${item%%:*}"; full="${item#*:}"
         # One commit over main, or over train commits (a car bounced to
         # rebase onto a train's tail): every commit under it must be in the
         # trains so far, as an ancestor of the tail or as the same patch.
@@ -505,7 +548,8 @@ build_on() {
         n=$((n + 1)); picked=$((picked + 1))
     done
     finish_train
-    printf '%s\n' "${slots[@]}" > "$(qfile)"
+    write_queue "${slots[@]}"
+    BUILD_KEEP=-1
     # No train gate is coming to take over the reservation: let rooms in.
     if [[ $first_new -eq 1 ]]; then
         use_slot "${slots[0]}"
@@ -965,8 +1009,10 @@ cmd_land() {
     { mkdir -p "$(dirname "$RESERVED")" && date +%s > "$RESERVED.tmp" \
         && mv -f "$RESERVED.tmp" "$RESERVED"; } 2>/dev/null \
         || echo "warning: could not reserve the gate slot ($RESERVED)" >&2
-    git -C "$MAIN_WT" fetch -q origin
-    git -C "$MAIN_WT" merge -q --ff-only origin/main
+    # main has moved: from here on nothing may die before the queue says so
+    # (AGAST #4337), so the main checkout's catch-up only warns.
+    { git -C "$MAIN_WT" fetch -q origin && git -C "$MAIN_WT" merge -q --ff-only origin/main; } \
+        || echo "warning: could not fast-forward $MAIN_WT to origin/main" >&2
     local b room merged spec
     for ((i = 0; i < k; i++)); do
         use_slot "${q[$i]}"
@@ -975,6 +1021,10 @@ cmd_land() {
         done < <(field ITEM "$(state)")
     done
     echo "MAIN     ${tip:0:12}"
+    # Trains 1..k are off the queue first, in one rename (AGAST #4337).
+    local rest=()
+    for ((i = k; i < ${#q[@]}; i++)); do rest+=("${q[$i]}"); done
+    write_queue ${rest[@]+"${rest[@]}"}
     # Trains 1..k-1 are landed: their gates can only repeat train k's verdict.
     # Stop each: a speculative one (SPEC, local or remote), else the train's
     # own local unit, and drop its .train-waiting so room gates see the slot
@@ -996,15 +1046,11 @@ cmd_land() {
         rm -f "$st"
     done
     # Promote the next train: its base, train k's tail, is main now.
-    local rest; rest="$(printf '%s\n' "${q[@]:k}" | sed '/^$/d')"
-    if [[ -n "$rest" ]]; then
-        printf '%s\n' "$rest" > "$(qfile)"
-        use_slot "$(head -1 <<<"$rest")"; st="$(state)"
+    if [[ ${#rest[@]} -gt 0 ]]; then
+        use_slot "${rest[0]}"; st="$(state)"
         spec="$(field SPEC "$st")"
         echo "NEXT     base=$(field BASE "$st" | cut -c1-12) tip=$(field TIP "$st" | cut -c1-12)" \
             "n=$(field ITEM "$st" | wc -l) gate=$(field GATE "$st")${spec:+ spec=${spec##* }}"
-    else
-        rm -f "$(qfile)"
     fi
 }
 
@@ -1032,11 +1078,12 @@ cmd_fail() {
         while read -r b room new; do items+=("$b:$room"); done < <(field ITEM "$(state)")
     done
     if [[ ${#items[@]} -gt 0 ]]; then build_on "$((k - 1))" "${items[@]}"; return; fi
-    # Nothing behind it: just drop train k (and nothing else).
+    # Nothing behind it: just drop train k (and nothing else), off the queue
+    # first (AGAST #4337).
+    write_queue "${q[@]:0:k-1}"
     for ((i = k - 1; i < ${#q[@]}; i++)); do
         use_slot "${q[$i]}"; discard_spec; rm -f "$(state)"
     done
-    if [[ $k -gt 1 ]]; then printf '%s\n' "${q[@]:0:k-1}" > "$(qfile)"; else rm -f "$(qfile)"; fi
 }
 
 # cmd_pending: the dispatch rule (AGAST #4031, #4156; SKILL.md "Merge
