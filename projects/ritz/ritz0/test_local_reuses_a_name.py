@@ -152,6 +152,18 @@ REFUSED = {
     "arm_name_over_local": (
         "fn f(x: i32) -> i32\n    let n: i32 = 1\n    match x\n        0 => 1\n        n => n\n"
         "fn main() -> i32\n    f(5)\n", (5, 9), (2, 9), "n"),
+    # AGAST #4230: in an async fn whose `let` awaits.  ritz1 lowered the fn
+    # before judging it, so the `let` had become a future's field and the arm
+    # shadowed it (exit 15).
+    "arm_name_over_awaited_local": (
+        "async fn dbl(x: i32) -> i32\n    x * 2\n\nasync fn go(x: i32) -> i32\n"
+        "    let n: i32 = await dbl(50)\n    match x\n        0 => 1\n"
+        "        n => n + await dbl(n)\n\npub fn main() -> i32\n    await go(5)\n",
+        (8, 9), (5, 9), "n"),
+    "payload_over_awaited_local": (
+        "async fn dbl(x: i32) -> i32\n    x * 2\n\nasync fn go(o: Option<i32>) -> i32\n"
+        "    let v: i32 = await dbl(1)\n    match o\n        Some(v) => v\n        _ => 2\n"
+        "\npub fn main() -> i32\n    await go(Some(5))\n", (7, 14), (5, 9), "v"),
     # The tuple `let`'s names, each at its own place.
     "tuple_second_over_local": (
         "struct P\n    a: i32\n    b: i32\nfn p() -> P\n    P { a: 1, b: 2 }\n"
@@ -222,6 +234,11 @@ KEPT = {
     "arm_variant_compares": (
         "enum C\n    R\n    S\nfn f(c: C) -> i32\n    let k: i32 = 1\n    match c\n"
         "        R => k\n        S => 2\nfn main() -> i32\n    f(C.S)\n", 2),
+    # #4230's program with the arm's name changed: 5 + dbl(5).
+    "arm_name_beside_awaited_local": (
+        "async fn dbl(x: i32) -> i32\n    x * 2\n\nasync fn go(x: i32) -> i32\n"
+        "    let n: i32 = await dbl(50)\n    match x\n        0 => n\n"
+        "        m => m + await dbl(m)\n\npub fn main() -> i32\n    await go(5)\n", 15),
     # Assignment isn't a binding.
     "assign_reuses_nothing": (
         "fn main() -> i32\n    var x: i32 = 1\n    if x == 1\n        x = 2\n    x\n", 2),
