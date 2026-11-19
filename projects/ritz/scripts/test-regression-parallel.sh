@@ -99,6 +99,16 @@ check() {
         TESTS_FAILED=$((TESTS_FAILED + 1))
     fi
 }
+# A wall-clock bound: skipped under ritz0_scope.py --trace (RITZ_TRACED=1,
+# AGAST #4315), where strace -f stretches every fork and exec; the trace
+# audits what the step reads, and an untraced gate run still checks these.
+check_timing() {
+    if [[ "${RITZ_TRACED:-}" == 1 ]]; then
+        echo "  skip $1 (wall clock, under strace)"
+        return 0
+    fi
+    check "$@"
+}
 eq() { [[ "$1" == "$2" ]] || { echo "       want: $2"; echo "       got:  $1"; return 1; }; }
 has() { grep -qF -- "$2" "$1"; }
 hasnt() { ! grep -qF -- "$2" "$1"; }
@@ -165,7 +175,7 @@ done
 NONTERMINATING_EXAMPLES=()
 reset_build; REGRESSION_JOBS=8
 t0=$(date +%s.%N); run_stage slow run_stage1; t1=$(date +%s.%N)
-check "8 one-second examples with 8 jobs take under 4 s" \
+check_timing "8 one-second examples with 8 jobs take under 4 s" \
     awk -v a="$t0" -v b="$t1" 'BEGIN { exit !((b - a) < 4) }'
 check "and all 8 pass" has "$SCRATCH/slow.summary" "8 passed, 0 failed"
 EXAMPLES_DIR="$SAVED_EX"
@@ -260,7 +270,7 @@ make_example n2_exits  'echo bye'
 NONTERMINATING_EXAMPLES=(n1_server n2_exits n9_gone)
 reset_build; USE_BASELINE_CACHE=0
 t0=$(date +%s); run_stage nt run_stage1; t1=$(date +%s)
-check "a declared server costs the short budget, not 5 s" \
+check_timing "a declared server costs the short budget, not 5 s" \
     test $((t1 - t0)) -lt 5
 check "a declared example that exits on its own is red" \
     has "$SCRATCH/nt.out" "n2_exits: declared non-terminating but exited on its own"

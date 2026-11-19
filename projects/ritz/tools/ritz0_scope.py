@@ -71,6 +71,8 @@ re-derive what the scripts name and what their Python imports.
     python3 tools/ritz0_scope.py <base>      print the verdict; exit 0 = skip
     python3 tools/ritz0_scope.py <base> --all            every scoped step's
     python3 tools/ritz0_scope.py --audit STEP TRACE      exit 0 = covered
+    python3 tools/ritz0_scope.py --trace STEP -- CMD...  run CMD under strace,
+                         audit as it streams; exit 0 = passed and covered (CI)
 """
 
 from __future__ import annotations
@@ -577,7 +579,8 @@ def decide(repo: Path, base: str | None, step: Step = RITZ0) -> Decision:
 # It names every repo path the step opened, stat'd or exec'd (a change to it
 # must run the step), probed and did not find, or listed (adding one there
 # must run it), that the read set would let a gate skip.  Git-ignored paths
-# are outputs.  Exit 0: the read set covers the trace.
+# are outputs.  Exit 0: the read set covers the trace.  `--trace` (below)
+# does both in one go and stores nothing; CI runs it (AGAST #4315).
 # --------------------------------------------------------------------------
 
 _TRACE = re.compile(
@@ -705,11 +708,71 @@ def audit(repo: Path, step: Step, trace) -> list[str]:
     return sorted(found)
 
 
+# `--trace STEP -- CMD...` (AGAST #4315): run CMD under strace and audit the
+# trace as it streams, through a pipe: a full regression run's trace is ~1 GB,
+# never stored.  main.yml's read-set-audit job runs it on both steps on every
+# push to main, so an input reached only through ritz1, make or clang fails CI
+# instead of waiting for someone to re-trace by hand.
+STRACE = ("strace", "-f", "-qq", "-y", "-s", "512", "-e", "trace=%file,execve")
+
+
+def trace(repo: Path, step: Step, cmd: list[str]) -> int:
+    """Run `cmd` under strace, audit its trace against `step`'s read set;
+    print the verdict.  Exit: cmd's own if it failed (a failed run did not
+    read all a passing one reads), else 1 on a finding, else 0."""
+    r, w = os.pipe()
+    # The command must not inherit the write end: a daemon it leaves behind
+    # would hold the pipe open and the audit would never see EOF.  strace's
+    # own descriptor for /dev/fd/W is close-on-exec; this closes W itself.
+    argv = [*STRACE, "-o", f"/dev/fd/{w}", "--",
+            "bash", "-c", f'exec {w}>&-; exec "$@"', "ritz0_scope-trace", *cmd]
+    # RITZ_TRACED: test-regression-parallel.sh skips its wall-clock checks
+    # (strace -f stretches 8 parallel 1 s sleeps past its 4 s bound).
+    env = {**os.environ, "RITZ_TRACED": "1"}
+    try:
+        proc = subprocess.Popen(argv, pass_fds=(w,), env=env)
+    finally:
+        os.close(w)
+    lines = 0
+
+    def stream():
+        nonlocal lines
+        with open(r, errors="replace") as f:
+            for ln in f:
+                lines += 1
+                yield ln.rstrip("\n")
+
+    found = audit(repo, step, stream())
+    rc = proc.wait()
+    sys.stdout.flush()
+    if rc != 0:
+        print(f"the traced command exited {rc}: a failed run is no measure of the read set")
+        return rc
+    if lines == 0:
+        print("strace wrote no trace")
+        return 1
+    for f in found:
+        print(f"outside the read set of {step.name!r}: {f}")
+    print(f"{len(found)} path(s) outside the read set ({lines} trace lines)" if found
+          else f"read set covers the trace ({lines} trace lines)")
+    return 1 if found else 0
+
+
 def main(argv: list[str], repo: Path | None = None, steps=STEPS) -> int:
     """`<base>`: the ritz0 step's verdict, exit 0 = skip.  `<base> --all`:
     every step's.  `--audit STEP TRACE`: check STEP's read set against an
-    strace of it, exit 0 = covered."""
+    strace of it, exit 0 = covered.  `--trace STEP -- CMD...`: run CMD under
+    strace and audit it as it streams, exit 0 = CMD passed and is covered."""
     repo = Path(__file__).resolve().parents[3] if repo is None else repo
+    if len(argv) > 1 and argv[1] == "--trace":
+        if len(argv) < 5 or argv[3] != "--":
+            print("usage: ritz0_scope.py --trace STEP -- CMD...", file=sys.stderr)
+            return 2
+        by_name = {s.name: s for s in steps}
+        if argv[2] not in by_name:
+            print(f"no scoped step {argv[2]!r}; steps: {', '.join(by_name)}", file=sys.stderr)
+            return 2
+        return trace(repo, by_name[argv[2]], argv[4:])
     if len(argv) > 1 and argv[1] == "--audit":
         if len(argv) != 4:
             print("usage: ritz0_scope.py --audit STEP TRACE", file=sys.stderr)

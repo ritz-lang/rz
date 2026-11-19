@@ -589,3 +589,55 @@ jobs:
         # and turns a two-year-old codegen bug into a mystery CI break.
         env:
           RITZ_VERIFY_IR: '1'
+
+  # AGAST #4315. The gate skips "Regression harness self-tests" and
+  # "Differential corpus regression" when a change touches nothing in their
+  # read sets (HARNESS and REGRESSION in projects/ritz/tools/ritz0_scope.py,
+  # AGAST #4206). Those steps run ritz1, make and clang, which no audit hook
+  # sees into, so tests re-derive what their scripts and Python name; an input
+  # reached only through a binary shows up only in a trace. This job traces
+  # both steps on every push to main and fails on any repo path they read,
+  # stat, probe or list that the read set would let a gate skip. Fix: add it
+  # to the step's `reads` (docs/TESTING.md rule 10).
+  #
+  # `--trace STEP -- CMD` streams strace through a pipe into the audit; the
+  # regression trace is ~1 GB and is never stored. Each traced command is the
+  # bootstrap step's own, with its env and directory (test_ritz0_scope.py
+  # checks they match). A fresh runner has no .regression-cache, so Stage 1
+  # builds every example, as `--no-baseline-cache` would. Under the trace
+  # test-regression-parallel.sh skips its wall-clock checks (RITZ_TRACED).
+  # Not part of the gate (run-gate.sh runs build-all, test-all, bootstrap).
+  read-set-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python, toolchain and ritz0 dependencies
+        uses: ./.github/actions/setup
+        with:
+          clang-version: ${{ env.CLANG_VERSION }}
+
+      - name: Install test tools (strace)
+        run: |
+          for i in 1 2 3 4 5; do
+            sudo apt-get install -y strace && exit 0
+            sleep $((15 * i)); sudo apt-get update || true
+          done
+          echo "::error::strace did not install after 5 attempts"; exit 1
+
+      - name: Audit the read set of Regression harness self-tests
+        run: python3 tools/ritz0_scope.py --trace "Regression harness self-tests" -- make harness-selftest
+        working-directory: projects/ritz
+        timeout-minutes: 20
+
+      - name: Build ritz1 + ritz1_selfhosted
+        run: make ritz1-bootstrap
+        working-directory: projects/ritz
+
+      # ~6.5 min untraced; ~10 min under the trace, measured (AGAST #4206).
+      - name: Audit the read set of Differential corpus regression
+        run: python3 tools/ritz0_scope.py --trace "Differential corpus regression (ritz0 vs ritz1 vs self-hosted)" -- ./scripts/regression.sh
+        working-directory: projects/ritz
+        timeout-minutes: 45
+        env:
+          RITZ_VERIFY_IR: '1'

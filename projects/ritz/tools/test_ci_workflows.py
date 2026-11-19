@@ -126,11 +126,15 @@ def test_gate_coverage_is_documented_where_main_yml_points():
             if line.startswith("| `")}
     jobs = sorted(yaml.safe_load(main)["jobs"])
     assert sorted(rows) == jobs, sorted(rows)
+    # read-set-audit (AGAST #4315) is the one job a merge does not wait on:
+    # ~15 min under strace, and it audits the gate's skip rule, not a change.
+    not_gated = {"read-set-audit"}
     for job, row in rows.items():
-        assert row.split("|")[2].strip().startswith("yes"), row
+        gated = row.split("|")[2].strip()
+        assert gated.startswith("no" if job in not_gated else "yes"), row
     gate = (REPO_ROOT / ".claude/skills/rz-iterate/run-gate.sh").read_text()
     cmd = next(line for line in gate.splitlines() if line.startswith("CMD="))
-    assert sorted(re.findall(r"--job ([\w-]+)", cmd)) == jobs, cmd
+    assert sorted(re.findall(r"--job ([\w-]+)", cmd)) == sorted(set(jobs) - not_gated), cmd
 
 
 # Spawns shellcheck: integration even though it skips without it (AGAST #4264).

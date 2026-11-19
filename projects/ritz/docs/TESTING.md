@@ -523,7 +523,13 @@ Rules:
    `reads` and re-run the trace:
    `strace -f -qq -y -e trace=%file,execve -o /tmp/r.strace ./scripts/regression.sh --no-baseline-cache`
    then `python3 tools/ritz0_scope.py --audit "<step name>" /tmp/r.strace`
-   (exit 0: the read set covers it).
+   (exit 0: the read set covers it), or stream it without the ~1 GB file:
+   `python3 tools/ritz0_scope.py --trace "<step name>" -- ./scripts/regression.sh`.
+   CI's `read-set-audit` job (main.yml) runs that `--trace` on both steps
+   on every push to main (AGAST #4315), so a read the trace finds and the
+   read set lacks turns main red; add the path to the step's `reads`.
+   Under `--trace`, `RITZ_TRACED=1`: `test-regression-parallel.sh` skips
+   its wall-clock checks, which strace's overhead breaks.
 
 ### Stale pytest basetemps: install the sweep timer once per host
 

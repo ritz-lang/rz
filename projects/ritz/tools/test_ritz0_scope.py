@@ -771,3 +771,112 @@ def test_every_python_input_imports_only_inputs(real_scopes, step):
                     crel = cand.relative_to(REAL).as_posix()
                     why = _real(step, "M", crel, real_scopes)
                     assert why is None, (step.name, rel, "imports", crel, why)
+
+
+# --------------------------------------------------------------------------
+# The read set's audit, run by CI (AGAST #4315).  `--trace STEP -- CMD`
+# runs CMD under strace and streams the trace through a pipe into the
+# audit: a full regression run's trace is ~1 GB, never stored.  main.yml's
+# read-set-audit job runs it on both scoped steps on every push to main.
+# --------------------------------------------------------------------------
+
+def _can_strace() -> bool:
+    import shutil
+    if not shutil.which("strace"):
+        return False
+    r = subprocess.run(["strace", "-qq", "-o", "/dev/null", "true"],
+                       capture_output=True, check=False)
+    return r.returncode == 0
+
+
+needs_strace = pytest.mark.skipif(not _can_strace(), reason="strace missing or ptrace denied")
+
+
+def _trace_main(r: Path, *cmd: str) -> int:
+    return ritz0_scope.main(["x", "--trace", "narrow step", "--", *cmd], repo=r,
+                            steps=(NARROW,))
+
+
+@needs_strace
+def test_trace_passes_a_command_inside_the_read_set(narrow, capsys):
+    r, _ = narrow
+    assert _trace_main(r, "cat", str(r / "projects/ritz/Makefile")) == 0
+    out = capsys.readouterr().out
+    assert "read set covers the trace" in out, out
+
+
+@needs_strace
+def test_trace_names_a_read_outside_the_read_set(narrow, capsys):
+    r, _ = narrow
+    (r / "projects/ritz/ritz0").mkdir(parents=True, exist_ok=True)
+    (r / "projects/ritz/ritz0/parser.py").write_text("x = 1\n")
+    assert _trace_main(r, "cat", str(r / "projects/ritz/ritz0/parser.py")) == 1
+    out = capsys.readouterr().out
+    assert "outside the read set of 'narrow step': projects/ritz/ritz0/parser.py" in out, out
+
+
+@needs_strace
+def test_trace_fails_when_the_traced_command_fails(narrow, capsys):
+    """A step that fails under the trace did not read all it reads."""
+    r, _ = narrow
+    assert _trace_main(r, "sh", "-c", f"cat {r}/projects/ritz/Makefile; exit 3") == 3
+    assert "exited 3" in capsys.readouterr().out
+
+
+@needs_strace
+def test_trace_tells_the_step_it_is_traced(narrow):
+    """test-regression-parallel.sh's wall-clock checks skip under the trace:
+    strace -f makes 8 parallel one-second sleeps take longer than 4 s."""
+    r, _ = narrow
+    assert _trace_main(r, "sh", "-c", 'test "$RITZ_TRACED" = 1') == 0
+
+
+@needs_strace
+def test_the_traced_command_does_not_hold_the_trace_pipe(narrow, capsys):
+    """The command gets no copy of the pipe's write end: a leaked copy in a
+    daemon the step leaves running would keep the audit from ever ending."""
+    r, _ = narrow
+    assert _trace_main(r, "sh", "-c",
+                      'for f in /proc/$$/fd/*; do [ -e "$f" ] && [ "${f##*/}" -gt 2 ] && exit 9; done; exit 0') == 0
+
+
+def test_trace_usage(narrow, capsys):
+    r, _ = narrow
+    assert ritz0_scope.main(["x", "--trace", "narrow step"], repo=r, steps=(NARROW,)) == 2
+    assert ritz0_scope.main(["x", "--trace", "nope", "--", "true"], repo=r,
+                            steps=(NARROW,)) == 2
+
+
+def _job_steps(job: str) -> list[dict]:
+    import yaml
+    wf = yaml.safe_load((REAL / ".github/workflows/main.yml").read_text())
+    return wf["jobs"][job]["steps"]
+
+
+@pytest.mark.parametrize("step", ritz0_scope.STEPS[1:], ids=lambda s: s.name)
+def test_ci_traces_each_scoped_step_exactly_as_the_gate_runs_it(step):
+    """The read-set-audit job traces the very command, env and directory of
+    the bootstrap step it audits, under the step's own name."""
+    import shlex
+    gated = next(s for s in _job_steps("bootstrap") if s.get("name") == step.name)
+    traced = [s for s in _job_steps("read-set-audit")
+              if f"--trace {shlex.quote(step.name)} -- " in s.get("run", "")
+              or f'--trace "{step.name}" -- ' in s.get("run", "")]
+    assert len(traced) == 1, (step.name, traced)
+    t = traced[0]
+    argv = shlex.split(t["run"])
+    assert argv[:2] == ["python3", "tools/ritz0_scope.py"], argv
+    assert argv[2:5] == ["--trace", step.name, "--"], argv
+    assert argv[5:] == shlex.split(gated["run"]), (argv, gated["run"])
+    assert t.get("working-directory") == gated.get("working-directory")
+    assert (t.get("env") or {}) == (gated.get("env") or {})
+
+
+def test_the_audit_job_installs_strace_and_is_not_gated():
+    """The gate (run-gate.sh: build-all, test-all, bootstrap) must not run
+    a ~15-minute traced job; CI runs it on main."""
+    steps = _job_steps("read-set-audit")
+    runs = " ".join(s.get("run", "") for s in steps)
+    assert "strace" in runs.split("--trace")[0], runs
+    gate = (REAL / ".claude/skills/rz-iterate/run-gate.sh").read_text()
+    assert "read-set-audit" not in gate

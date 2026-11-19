@@ -625,6 +625,12 @@ So:
 | `build-all` (`./rz build --all`) | yes (#2141) | yes |
 | `test-all` (`./rz test --all`) | yes (#3969, Aaron 2026-11-18) | yes |
 | `bootstrap` (matrix-full, regression.sh, ...) | yes | yes |
+| `read-set-audit` (strace of the two scoped regression steps) | no (#4315: ~15 min traced; it checks the gate's own skip rule, not the change) | yes |
+
+`read-set-audit` is the one job the gate does not run. It traces
+"Regression harness self-tests" and "Differential corpus regression" and
+fails on a read outside their read sets (`tools/ritz0_scope.py --trace`),
+so a scoped skip that should have run turns main red after the fact.
 
 `test-all` runs between build-all and bootstrap, in workflow order, on the
 CAS build-all just warmed. It's main.yml's own job, not a copy of its
