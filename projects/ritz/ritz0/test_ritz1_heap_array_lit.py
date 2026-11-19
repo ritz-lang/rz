@@ -17,6 +17,8 @@ padded-size canary):
 - `-> *T` at T = `[N]E` recorded no `*[N]E` return (ret_ptr_array), so the
   caller's `let p = f<[N]E>(..)` was a `*arrN_E` struct pointer: `p[i]` had
   no element size and `p[i].f` was "unhandled EXPR_MEMBER".  `ret_ptr`.
+  generic_infer typed no such `p[i]` either, so `size(p[0])` bound no T
+  (AGAST #4182, `call_ptr_index`).
 """
 
 import pytest
@@ -108,6 +110,21 @@ PROGRAMS = {
         "        return 3\n"
         "    if corner([ [1, 2], [x as i64, 4] ]) != 3 or corner([ [7; 2]; 2]) != 7\n"
         "        return 4\n"
+        "    0\n"
+    ),
+    # AGAST #4182: `p[i]` of a `-> *T` at T = `[N]E` is an E, so it binds a
+    # T of its own, written (`put<[2]i32>`) or inferred (`put([x, 5])`).
+    "call_ptr_index": (
+        "    let x: i32 = 3\n"
+        "    let p = put<[2]i32>([x, 5])\n"
+        "    if p[1] != 5 or size(p[0]) != 4\n"
+        "        return 1\n"
+        "    let q = put([x, 5])\n"
+        "    if q[0] != 3 or size(q[1]) != 4\n"
+        "        return 2\n"
+        "    let r = put<[2]P>([P { a: 1, b: 2, c: 3 }, P { a: 4, b: 5, c: 6 }])\n"
+        "    if r[1].b != 5 or size(r[1]) != 24\n"
+        "        return 3\n"
         "    0\n"
     ),
 }
