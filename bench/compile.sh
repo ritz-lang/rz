@@ -115,7 +115,7 @@ done
 # ────────────────────────────────────────────────────────────────────
 
 T=$(mktemp -d)
-# shellcheck disable=SC2329  # invoked by the EXIT trap below
+# shellcheck disable=SC2317,SC2329  # invoked by the EXIT trap below (SC2317 on shellcheck < 0.11)
 cleanup() {
     if [[ "$KEEP" == "1" ]]; then
         echo "[compile] --keep: logs and artifact store left in $T" >&2

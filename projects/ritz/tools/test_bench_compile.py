@@ -391,6 +391,8 @@ def test_bootstrap_uses_real_target_and_keeps_ritzlib_objects(fake, tmp_path):
     assert make_log.count("distclean") >= 2
 
 
+# Spawns shellcheck: integration even though it skips without it (AGAST #4264).
+@pytest.mark.integration
 def test_shellcheck_clean():
     sc = shutil.which("shellcheck")
     if not sc:

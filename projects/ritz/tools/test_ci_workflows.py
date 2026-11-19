@@ -133,7 +133,8 @@ def test_gate_coverage_is_documented_where_main_yml_points():
     assert sorted(re.findall(r"--job ([\w-]+)", cmd)) == jobs, cmd
 
 
-@pytest.mark.unit
+# Spawns shellcheck: integration even though it skips without it (AGAST #4264).
+@pytest.mark.integration
 def test_regression_sh_is_shellcheck_clean():
     shellcheck = shutil.which("shellcheck")
     if shellcheck is None:

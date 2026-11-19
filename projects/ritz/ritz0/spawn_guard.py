@@ -13,13 +13,26 @@ It observes behaviour rather than grepping source, so a spawn hidden in a
 helper imported from another module is caught, and a pure test in a module
 that merely imports `subprocess` is not flagged.
 
+Watching has one blind spot: a test that skips when an optional tool is
+missing (`shutil.which("shellcheck")` → `pytest.skip`, or a `skipif`) never
+reaches its spawn on a host without the tool, so it passes there unmarked
+and fails on CI, which has the tool (AGAST #4264).  So before setup, a
+non-integration test whose own source calls a spawn API (`subprocess.run`,
+`os.system`, ... — see _SPAWN_CALLS) fails too, whether or not it would
+skip.  This static check reads only the test function itself; helpers are
+left to the runtime watch.
+
 Loaded by ritz0/conftest.py and tools/conftest.py (`pytest_plugins`; tools/
 since AGAST #4092); test_spawn_guard.py loads it with `-p spawn_guard`.
 """
 
+import ast
 import contextlib
+import functools
+import inspect
 import os
 import subprocess
+import textwrap
 
 import pytest
 
@@ -77,10 +90,55 @@ def pytest_unconfigure(config):
     os.system = _orig_system
 
 
-def _watch(item):
+# Calls that start a process, written as they appear in a test's source.
+_SPAWN_CALLS = frozenset(
+    {f"subprocess.{f}" for f in ("run", "Popen", "call", "check_call",
+                                 "check_output", "getoutput", "getstatusoutput")}
+    | {f"os.{f}" for f in ("system", "popen", "posix_spawn", "posix_spawnp",
+                           "execv", "execve", "execvp", "execvpe",
+                           "spawnv", "spawnve", "spawnvp", "spawnvpe")}
+)
+
+
+@functools.cache
+def _static_spawns(code) -> tuple:
+    """Spawn calls written in the body of the function owning `code`."""
+    try:
+        source = textwrap.dedent(inspect.getsource(code))
+        tree = ast.parse(source)
+    except (OSError, TypeError, SyntaxError):
+        return ()
+    return tuple(sorted({
+        ast.unparse(node.func) for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and ast.unparse(node.func) in _SPAWN_CALLS
+    }))
+
+
+def _check_static(item):
+    """Fail an unmarked test whose own source spawns (AGAST #4264).
+
+    Runs before setup, so neither a `skipif` mark nor a `pytest.skip` in the
+    body (taken on a host missing the tool) can hide the spawn.
+    """
+    fn = getattr(item, "function", None)  # None for doctest and other items
+    code = getattr(inspect.unwrap(fn), "__code__", None) if fn else None
+    calls = _static_spawns(code) if code is not None else ()
+    if calls:
+        pytest.fail(
+            f"{item.nodeid} calls {', '.join(calls)} but is not marked "
+            f"`integration` (AGAST #1805, #4264; ritz0/spawn_guard.py): a skip "
+            f"when its tool is missing would hide the spawn on hosts without it.\n"
+            f"Mark the test (or the module: `pytestmark = pytest.mark.integration`).",
+            pytrace=False,
+        )
+
+
+def _watch(item, static=False):
     global _seen
     if item.get_closest_marker("integration") is not None:
         return (yield)
+    if static:
+        _check_static(item)
     _seen = []
     try:
         result = yield
@@ -100,7 +158,7 @@ def _watch(item):
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_setup(item):
-    return (yield from _watch(item))
+    return (yield from _watch(item, static=True))
 
 
 @pytest.hookimpl(wrapper=True)

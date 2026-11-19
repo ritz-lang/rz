@@ -7,6 +7,8 @@ in setup, call or teardown, directly or through ritz0_inproc — unless it is
 marked `integration`.  It watches what the test actually does rather than
 grepping its source, so it cannot be fooled by a helper imported from
 another module, and it cannot flag a pure test for mentioning `subprocess`.
+AGAST #4264 adds one static check on top: an unmarked test whose own source
+calls a spawn API fails in setup, so skipping for a missing tool can't hide it.
 
 Every case is a scratch test file, and one nested pytest runs them all with
 the plugin loaded by name, exactly as ritz0/conftest.py loads it.  Each case
@@ -30,10 +32,14 @@ pytestmark = pytest.mark.integration
 RITZ0_DIR = Path(__file__).resolve().parent
 
 CASES = {
+    # The spawn sits in a helper, outside the test's own source, so the
+    # runtime watch (not AGAST #4264's static check) is what catches it.
     "unmarked_spawn": """
         import subprocess
-        def test_spawns():
+        def spawn():
             subprocess.run(["true"])
+        def test_spawns():
+            spawn()
     """,
     "marked_spawn": """
         import pytest, subprocess
@@ -61,8 +67,35 @@ CASES = {
     """,
     "os_system": """
         import os
-        def test_shell():
+        def shell():
             os.system("true")
+        def test_shell():
+            shell()
+    """,
+    # AGAST #4264: a test that skips when an optional tool is missing never
+    # reaches its spawn on such a host, so the runtime watch saw nothing and
+    # the gate passed tests that CI (which has the tool) then failed.
+    "skip_hides_spawn": """
+        import pytest, shutil, subprocess
+        def test_tool_gated():
+            tool = shutil.which("no-such-tool-4264")
+            if tool is None:
+                pytest.skip("no-such-tool-4264 not on PATH")
+            subprocess.run([tool])
+    """,
+    "skipif_hides_spawn": """
+        import pytest, subprocess
+        @pytest.mark.skipif(True, reason="optional tool missing")
+        def test_tool_gated():
+            subprocess.run(["no-such-tool-4264"])
+    """,
+    "marked_skip_hides_spawn": """
+        import pytest, shutil, subprocess
+        @pytest.mark.integration
+        def test_tool_gated():
+            if shutil.which("no-such-tool-4264") is None:
+                pytest.skip("no-such-tool-4264 not on PATH")
+            subprocess.run(["no-such-tool-4264"])
     """,
 }
 
@@ -142,3 +175,18 @@ def test_inproc_ritz0_counts_as_a_spawn(verdicts):
 def test_os_system_counts_as_a_spawn(verdicts):
     outcome, message = verdicts["os_system"]
     assert outcome == "failure", message
+
+
+@pytest.mark.parametrize("case", ["skip_hides_spawn", "skipif_hides_spawn"])
+def test_a_skip_cannot_hide_an_unmarked_spawn(verdicts, case):
+    # AGAST #4264: the spawn is in the test's own source, so the guard fails
+    # it in setup, before a skip (in the body or a skipif) can hide it.
+    outcome, message = verdicts[case]
+    assert outcome in ("error", "failure"), message
+    assert "not marked `integration`" in message and "subprocess.run" in message
+
+
+def test_a_marked_tool_gated_test_still_skips(verdicts):
+    assert verdicts["marked_skip_hides_spawn"][0] == "passed", (
+        verdicts["marked_skip_hides_spawn"]
+    )
