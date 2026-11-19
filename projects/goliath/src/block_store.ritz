@@ -1,28 +1,34 @@
 # BlockStore - a goliath image on a block device (AGAST #1881)
 #
 # The kernel's persistent filesystem: the same image goliath.file_store keeps
-# in a host file (goliath.image), behind a one-sector superblock, on any
+# in a host file (goliath.image), behind two one-sector slot headers, on any
 # device that reads and writes 512-byte sectors. The device is a BlockDevice
 # (an opaque handle and two functions), so the kernel passes its virtio-blk
 # driver and a test passes a RAM disk.
 #
 # Layout (integers little-endian):
 #
-#     sector 0     superblock
-#                    0  magic      "GOLIATHB"   8 bytes
-#                    8  version    u32 = 1
-#                    12 sector     u32 = 512
-#                    16 image_len  u64          bytes of image from sector 1
-#                    24 zero to the end of the sector
-#     sector 1..   the image, zero padded to a whole sector
+#     sector 0, 1  two slot headers, each naming one image
+#                    0   magic       "GOLIATHB"   8 bytes
+#                    8   version     u32 = 2
+#                    12  sector      u32 = 512
+#                    16  generation  u64 >= 1     newer saves count higher
+#                    24  image_lba   u64          first sector of the image
+#                    32  image_len   u64          bytes of image
+#                    40  zero up to 504
+#                    504 checksum    u64          FNV-1a 64 of bytes 0..504
+#     sector 2..   images, each zero padded to a whole sector
 #
-# Save writes the image first and the superblock last. Free space needs no
-# map: the store is in memory and the image holds only live blobs, so a
-# deleted file's blobs are gone from the next save.
+# Crash safety (AGAST #4226): load takes the valid header with the highest
+# generation. Save never touches that header or its image: it writes the new
+# image where it doesn't overlap the one in use (ahead of it if it fits,
+# otherwise after it), then the other header, with the next generation. So
+# until that last one-sector write lands the disk still loads the previous
+# tree; a header cut mid-sector fails its checksum and is skipped. The image
+# needs room for itself beside the one in use.
 #
-# Not yet crash-safe: a save cut short leaves an image that fails its hashes
-# (ERR_CORRUPT_BLOB) rather than the previous one (two image slots would fix
-# that: AGAST follow-up).
+# Free space needs no map: the store is in memory and the image holds only
+# live blobs, so a deleted file's blobs are gone from the next save.
 
 import goliath.alloc { Allocator, allocator_alloc, allocator_free }
 import goliath.blob_store { MemoryBlobStore, memory_store_allocator }
@@ -31,7 +37,11 @@ import goliath.image { ImageSink, image_size, image_write, image_load, image_put
 import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_CORRUPT_BLOB, ERR_IO_ERROR, ERR_OUT_OF_SPACE }
 
 pub const BLOCK_SECTOR_SIZE: i64 = 512
-pub const BLOCK_STORE_VERSION: u32 = 1
+pub const BLOCK_STORE_VERSION: u32 = 2
+
+# Sectors before the first image: the two slot headers
+const BLOCK_HEADERS: u64 = 2
+const BLOCK_CHECKSUM_AT: i64 = 504
 
 # Sectors per device call when loading (one page)
 const BLOCK_IO_SECTORS: u32 = 8
@@ -58,6 +68,92 @@ fn block_magic_byte(i: i64) -> u8
 # Sectors holding `len` bytes
 fn sectors_for(len: u64) -> u64
     (len + BLOCK_SECTOR_SIZE as u64 - 1) / BLOCK_SECTOR_SIZE as u64
+
+# ============================================================================
+# Slot headers
+# ============================================================================
+
+const HEADER_NONE: i32 = 0      # no goliath magic: blank or foreign
+const HEADER_VALID: i32 = 1
+const HEADER_BAD: i32 = 2       # goliath magic, but torn or out of bounds
+
+struct SlotHeader
+    state: i32
+    generation: u64
+    lba: u64
+    len: u64
+
+# FNV-1a 64 of the header bytes before the checksum
+fn header_checksum(sb: *u8) -> u64
+    var h: u64 = 14695981039346656037
+    var i: i64 = 0
+    while i < BLOCK_CHECKSUM_AT
+        h = (h ^ *(sb + i) as u64) * 1099511628211
+        i = i + 1
+    h
+
+# Read header `idx` (0 or 1) into `h`; false on an I/O error
+fn header_read(dev: *BlockDevice, idx: u64, h: *SlotHeader) -> bool
+    (*h).state = HEADER_NONE
+    (*h).generation = 0
+    (*h).lba = 0
+    (*h).len = 0
+    if idx >= (*dev).sectors
+        return true
+    var sb: [512]u8
+    if not dev_read(dev, idx, 1, @sb[0])
+        return false
+    var i: i64 = 0
+    while i < 8
+        if sb[i] != block_magic_byte(i)
+            return true
+        i = i + 1
+    (*h).state = HEADER_BAD
+    if image_get_le(@sb[BLOCK_CHECKSUM_AT], 8) != header_checksum(@sb[0])
+        return true
+    if image_get_le(@sb[8], 4) as u32 != BLOCK_STORE_VERSION
+        return true
+    if image_get_le(@sb[12], 4) != BLOCK_SECTOR_SIZE as u64
+        return true
+    let gen: u64 = image_get_le(@sb[16], 8)
+    let lba: u64 = image_get_le(@sb[24], 8)
+    let len: u64 = image_get_le(@sb[32], 8)
+    if gen == 0 or len == 0 or lba < BLOCK_HEADERS or lba + sectors_for(len) > (*dev).sectors
+        return true
+    (*h).state = HEADER_VALID
+    (*h).generation = gen
+    (*h).lba = lba
+    (*h).len = len
+    true
+
+fn header_write(dev: *BlockDevice, idx: u64, gen: u64, lba: u64, len: u64) -> bool
+    var sb: [512]u8
+    var i: i64 = 0
+    while i < BLOCK_SECTOR_SIZE
+        sb[i] = 0
+        i = i + 1
+    i = 0
+    while i < 8
+        sb[i] = block_magic_byte(i)
+        i = i + 1
+    image_put_le(@sb[8], BLOCK_STORE_VERSION as u64, 4)
+    image_put_le(@sb[12], BLOCK_SECTOR_SIZE as u64, 4)
+    image_put_le(@sb[16], gen, 8)
+    image_put_le(@sb[24], lba, 8)
+    image_put_le(@sb[32], len, 8)
+    image_put_le(@sb[BLOCK_CHECKSUM_AT], header_checksum(@sb[0]), 8)
+    dev_write(dev, idx, 1, @sb[0])
+
+# The header in use: the valid one with the higher generation. -1 if neither
+# is valid; ERR_IO_ERROR as -2.
+fn header_current(dev: *BlockDevice, h0: *SlotHeader, h1: *SlotHeader) -> i32
+    if not header_read(dev, 0, h0) or not header_read(dev, 1, h1)
+        return -2
+    if (*h1).state == HEADER_VALID and ((*h0).state != HEADER_VALID or (*h1).generation > (*h0).generation)
+        return 1
+    if (*h0).state == HEADER_VALID
+        return 0
+    -1
 
 # ============================================================================
 # Save
@@ -94,33 +190,45 @@ fn writer_write(ctx: *u8, data: *u8, len: i64) -> bool
     true
 
 # Write `ns` (its whole store) to `dev`. ERR_OK, ERR_OUT_OF_SPACE (the image
-# doesn't fit; the device is untouched) or ERR_IO_ERROR.
+# doesn't fit beside the one in use; the device is untouched) or
+# ERR_IO_ERROR. Cut short at any point, the device still loads the tree of
+# the last save that returned ERR_OK.
 pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
     let len: u64 = image_size(ns)
-    if 1 + sectors_for(len) > (*dev).sectors
+    let sectors: u64 = sectors_for(len)
+    if BLOCK_HEADERS + sectors > (*dev).sectors
         return ERR_OUT_OF_SPACE
+    var h0: SlotHeader
+    var h1: SlotHeader
+    let cur: i32 = header_current(dev, @h0, @h1)
+    if cur == -2
+        return ERR_IO_ERROR
+
+    # Where the new image goes, which header names it, and its generation
+    var lba: u64 = BLOCK_HEADERS
+    var idx: u64 = 0
+    var gen: u64 = 1
+    if cur >= 0
+        var live: *SlotHeader = @h0
+        idx = 1
+        if cur == 1
+            live = @h1
+            idx = 0
+        gen = (*live).generation + 1
+        if BLOCK_HEADERS + sectors > (*live).lba
+            lba = (*live).lba + sectors_for((*live).len)
+            if lba + sectors > (*dev).sectors
+                return ERR_OUT_OF_SPACE
 
     var w: SectorWriter
     w.dev = dev
-    w.lba = 1
+    w.lba = lba
     w.fill = 0
     var sink: ImageSink = ImageSink { ctx: @w as *u8, write: writer_write }
     if not image_write(ns, @sink) or not writer_flush(@w)
         return ERR_IO_ERROR
-
-    var sb: [512]u8
-    var i: i64 = 0
-    while i < BLOCK_SECTOR_SIZE
-        sb[i] = 0
-        i = i + 1
-    i = 0
-    while i < 8
-        sb[i] = block_magic_byte(i)
-        i = i + 1
-    image_put_le(@sb[8], BLOCK_STORE_VERSION as u64, 4)
-    image_put_le(@sb[12], BLOCK_SECTOR_SIZE as u64, 4)
-    image_put_le(@sb[16], len, 8)
-    if not dev_write(dev, 0, 1, @sb[0])
+    # The flip: one sector, last
+    if not header_write(dev, idx, gen, lba, len)
         return ERR_IO_ERROR
     ERR_OK
 
@@ -128,33 +236,31 @@ pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
 # Load
 # ============================================================================
 
-# Load the image on `dev` into the empty `store` and set `ns_out` to its
-# namespace.
+# Load the newest whole image on `dev` into the empty `store` and set
+# `ns_out` to its namespace.
 #
 #   ERR_OK
-#   ERR_NOT_FOUND     no goliath superblock: a blank (or foreign) device;
+#   ERR_NOT_FOUND     no goliath header: a blank (or foreign) device;
 #                     the caller starts an empty namespace (namespace_new)
-#   ERR_CORRUPT_BLOB  a goliath superblock, but the image isn't whole
+#   ERR_CORRUPT_BLOB  goliath headers, but none valid, or the image they
+#                     name isn't whole
 #   ERR_IO_ERROR / ERR_OUT_OF_SPACE
 pub fn block_store_load(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
-    if (*dev).sectors < 1
-        return ERR_NOT_FOUND
-    var sb: [512]u8
-    if not dev_read(dev, 0, 1, @sb[0])
+    var h0: SlotHeader
+    var h1: SlotHeader
+    let cur: i32 = header_current(dev, @h0, @h1)
+    if cur == -2
         return ERR_IO_ERROR
-    var i: i64 = 0
-    while i < 8
-        if sb[i] != block_magic_byte(i)
-            return ERR_NOT_FOUND
-        i = i + 1
-    if image_get_le(@sb[8], 4) as u32 != BLOCK_STORE_VERSION
-        return ERR_CORRUPT_BLOB
-    if image_get_le(@sb[12], 4) != BLOCK_SECTOR_SIZE as u64
-        return ERR_CORRUPT_BLOB
-    let len: u64 = image_get_le(@sb[16], 8)
+    if cur == -1
+        if h0.state == HEADER_BAD or h1.state == HEADER_BAD
+            return ERR_CORRUPT_BLOB
+        return ERR_NOT_FOUND
+    var live: *SlotHeader = @h0
+    if cur == 1
+        live = @h1
+    let len: u64 = (*live).len
     let sectors: u64 = sectors_for(len)
-    if len == 0 or 1 + sectors > (*dev).sectors
-        return ERR_CORRUPT_BLOB
+    let first: u64 = (*live).lba
 
     let alloc: *Allocator = memory_store_allocator(store)
     let buf_len: i64 = (sectors * BLOCK_SECTOR_SIZE as u64) as i64
@@ -166,7 +272,7 @@ pub fn block_store_load(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Nam
         var n: u32 = BLOCK_IO_SECTORS
         if sectors - done < n as u64
             n = (sectors - done) as u32
-        if not dev_read(dev, 1 + done, n, buf + (done * BLOCK_SECTOR_SIZE as u64) as i64)
+        if not dev_read(dev, first + done, n, buf + (done * BLOCK_SECTOR_SIZE as u64) as i64)
             allocator_free(alloc, buf, buf_len)
             return ERR_IO_ERROR
         done = done + n as u64

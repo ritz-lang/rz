@@ -74,8 +74,11 @@ pub trait BlobStore
 Implemented (AGAST #1881): one format, the **image** (`src/image.ritz`): a
 `GOLIATHS` header naming the root directory blob, then every live blob as
 `{ id, size, bytes }`. A host file holds one image (`src/file_store.ritz`);
-a block device holds one from sector 1 behind a `GOLIATHB` superblock in
-sector 0 (`src/block_store.ritz`). Loading verifies every blob's hash and
+a block device holds two from sector 2, each named by a `GOLIATHB` slot
+header (sectors 0 and 1) carrying a generation and a checksum
+(`src/block_store.ritz`). A save writes its image beside the one in use and
+then the other header, so a save cut short still loads the previous tree
+(AGAST #4226). Loading verifies every blob's hash and
 that the tree is whole. The store is in memory between loads and saves, so
 the image carries only live blobs and needs no allocation bitmap.
 

@@ -21,6 +21,13 @@ struct RamDisk
     data: *u8
     sectors: u64
     fail_io: bool
+    # Power loss: sectors written so far, and how many may be written before
+    # every write fails (-1: no limit). A write that runs into the limit
+    # stores the sectors before it and fails; with `torn` the sector it fails
+    # on is half written, as a write cut mid-sector would leave it.
+    written: i64
+    write_budget: i64
+    torn: bool
 
 fn ram_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     let d: *RamDisk = dev as *RamDisk
@@ -38,15 +45,26 @@ fn ram_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
     if (*d).fail_io or lba + count as u64 > (*d).sectors
         return -5
     let base: *u8 = (*d).data + (lba * 512) as i64
-    var i: i64 = 0
-    while i < count as i64 * 512
-        *(base + i) = *(buf + i)
-        i = i + 1
+    var s: i64 = 0
+    while s < count as i64
+        var bytes: i64 = 512
+        if (*d).write_budget >= 0 and (*d).written >= (*d).write_budget
+            if not (*d).torn
+                return -5
+            bytes = 256
+        var i: i64 = s * 512
+        while i < s * 512 + bytes
+            *(base + i) = *(buf + i)
+            i = i + 1
+        if bytes < 512
+            return -5
+        (*d).written = (*d).written + 1
+        s = s + 1
     0
 
 # A zeroed (blank) disk of `sectors` sectors
 fn ram_new(sectors: u64) -> RamDisk
-    RamDisk { data: heap_alloc((sectors * 512) as i64), sectors: sectors, fail_io: false }
+    RamDisk { data: heap_alloc((sectors * 512) as i64), sectors: sectors, fail_io: false, written: 0, write_budget: -1, torn: false }
 
 fn ram_device(d: *RamDisk) -> BlockDevice
     BlockDevice { dev: d as *u8, sectors: (*d).sectors, read: ram_read, write: ram_write }
@@ -125,8 +143,8 @@ fn test_block_store_refuses_blank_damaged_and_full() -> i32
     assert write_text(@ns, "/f", c"payload", 7) == ERR_OK
     assert block_store_save(@dev, @ns) == ERR_OK
 
-    # One flipped byte in the image (sector 1 onwards)
-    *((disk.data) + 512 + 100) = *((disk.data) + 512 + 100) ^ 1
+    # One flipped byte in the image (the first save puts it at sector 2)
+    *((disk.data) + 1024 + 100) = *((disk.data) + 1024 + 100) ^ 1
     var s2: MemoryBlobStore = memory_store_new()
     var ns2: Namespace
     assert block_store_load(@dev, @s2, @ns2) == ERR_CORRUPT_BLOB
@@ -152,6 +170,147 @@ fn test_block_store_refuses_blank_damaged_and_full() -> i32
 
     memory_store_free(@store)
     ram_free(@tiny)
+    ram_free(@disk)
+    0
+
+# ---------------------------------------------------------------------------
+# Crash safety (AGAST #4226)
+# ---------------------------------------------------------------------------
+
+# Generation `gen` of the test tree: /v holds "gen-<g>", and /pad holds
+# `pad` bytes so generations differ in size (and so in where they land).
+fn crash_tree(ns: *Namespace, g: u8, pad: i64) -> ErrorCode
+    var v: [5]u8
+    v[0] = 103
+    v[1] = 101
+    v[2] = 110
+    v[3] = 45
+    v[4] = 48 + g
+    var rc: ErrorCode = write_text(ns, "/v", @v[0], 5)
+    if rc != ERR_OK
+        return rc
+    let p: *u8 = heap_alloc(pad + 1)
+    var i: i64 = 0
+    while i < pad + 1
+        *(p + i) = (i * 7 + g as i64) as u8
+        i = i + 1
+    rc = write_text(ns, "/pad", p, pad)
+    heap_free(p, pad + 1)
+    rc
+
+# Which generation the disk loads: 0..9, or -1 if it doesn't load whole
+fn loaded_gen(dev: *BlockDevice) -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace
+    var g: i32 = -1
+    if block_store_load(dev, @store, @ns) == ERR_OK
+        let got: Span<u8> = namespace_read(@ns, "/v")
+        if got.ptr != null and got.len == 5
+            g = *(got.ptr + 4) as i32 - 48
+    memory_store_free(@store)
+    g
+
+# Sector writes of one uncut save of `ns` to a fresh disk prepared by
+# `crash_disk` (the save's length doesn't depend on what's on the disk
+# beyond where it lands, which crash_disk fixes)
+fn crash_disk(disk: *RamDisk, pad0: i64, pad1: i64) -> bool
+    var dev: BlockDevice = ram_device(disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    var ok: bool = crash_tree(@ns, 0, pad0) == ERR_OK and block_store_save(@dev, @ns) == ERR_OK
+    ok = ok and crash_tree(@ns, 1, pad1) == ERR_OK and block_store_save(@dev, @ns) == ERR_OK
+    memory_store_free(@store)
+    ok and loaded_gen(@dev) == 1
+
+# On a disk holding generations 0 then 1, cut a save of generation 2 after
+# every number of sectors from none to all of them: the disk then loads
+# generation 1 or 2 and never fails, it loads 2 only once the save has
+# written everything, and it takes a further save (generation 3).
+fn crash_every_sector(pad0: i64, pad1: i64, pad2: i64, torn: bool) -> bool
+    # How many sectors an uncut save of generation 2 writes
+    var probe: RamDisk = ram_new(256)
+    if not crash_disk(@probe, pad0, pad1)
+        return false
+    var pdev: BlockDevice = ram_device(@probe)
+    var s2: MemoryBlobStore = memory_store_new()
+    var ns2: Namespace = namespace_new(@s2)
+    if crash_tree(@ns2, 2, pad2) != ERR_OK
+        return false
+    probe.written = 0
+    if block_store_save(@pdev, @ns2) != ERR_OK or loaded_gen(@pdev) != 2
+        return false
+    let total: i64 = probe.written
+    ram_free(@probe)
+    if total < 2
+        return false
+
+    var n: i64 = 0
+    while n <= total
+        var disk: RamDisk = ram_new(256)
+        if not crash_disk(@disk, pad0, pad1)
+            return false
+        var dev: BlockDevice = ram_device(@disk)
+        disk.written = 0
+        disk.write_budget = n
+        disk.torn = torn
+        let rc: ErrorCode = block_store_save(@dev, @ns2)
+        disk.write_budget = -1
+        let g: i32 = loaded_gen(@dev)
+        if n < total
+            if rc != ERR_IO_ERROR or g != 1
+                return false
+        else
+            if rc != ERR_OK or g != 2
+                return false
+        # The store keeps working after the crash
+        var s3: MemoryBlobStore = memory_store_new()
+        var ns3: Namespace = namespace_new(@s3)
+        if crash_tree(@ns3, 3, pad0 + 700) != ERR_OK or block_store_save(@dev, @ns3) != ERR_OK
+            return false
+        memory_store_free(@s3)
+        if loaded_gen(@dev) != 3
+            return false
+        ram_free(@disk)
+        n = n + 1
+    memory_store_free(@s2)
+    true
+
+# A save cut short leaves the previous tree, never a corrupt image, whether
+# the new image fits before the one in use or must go after it.
+[[test]]
+fn test_block_store_save_cut_at_every_sector() -> i32
+    # Generation 2 smaller than 0: it reuses 0's space ahead of 1
+    assert crash_every_sector(3000, 1500, 100, false)
+    # Generation 2 bigger than 0: it goes after 1
+    assert crash_every_sector(100, 1500, 3000, false)
+    0
+
+# The same, with the sector the power fails on half written
+[[test]]
+fn test_block_store_save_torn_at_every_sector() -> i32
+    assert crash_every_sector(3000, 1500, 100, true)
+    assert crash_every_sector(100, 1500, 3000, true)
+    0
+
+# Saves alternate between two slots, so the image only needs the space of
+# itself plus the one in use; and a full device leaves the last save whole.
+[[test]]
+fn test_block_store_out_of_space_keeps_previous() -> i32
+    var disk: RamDisk = ram_new(24)
+    var dev: BlockDevice = ram_device(@disk)
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    var k: u8 = 0
+    while k < 6
+        assert crash_tree(@ns, k, 3000) == ERR_OK
+        assert block_store_save(@dev, @ns) == ERR_OK
+        assert loaded_gen(@dev) == k as i32
+        k = k + 1
+    # Too big to fit beside generation 5: refused, 5 still loads
+    assert crash_tree(@ns, 6, 9000) == ERR_OK
+    assert block_store_save(@dev, @ns) == ERR_OUT_OF_SPACE
+    assert loaded_gen(@dev) == 5
+    memory_store_free(@store)
     ram_free(@disk)
     0
 
