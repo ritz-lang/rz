@@ -1,0 +1,452 @@
+# AMD-Vi interrupt remapping: the IVRS table and the formats, no hardware
+# (AGAST #4329).
+#
+# The AMD counterpart of drivers/iommu/dmar.ritz. An MSI or I/O APIC
+# interrupt names its CPU with 8 bits; with AMD-Vi interrupt remapping the
+# IOMMU looks the requester's device ID up in the device table, and the
+# device table entry (DTE) points at that device's interrupt remapping
+# table. The message's data bits 10:0 index it; with GA mode on, each entry
+# (IRTE) is 128 bits wide and, with XT on, holds a full 32-bit x2APIC
+# destination.
+#
+# This module:
+#   - parses the ACPI IVRS table: the IOMMUs (IVHD blocks of type 10h, 11h
+#     or 40h, the highest type present, as Linux picks), the device IDs they
+#     cover (the device table must reach the last one), alias entries
+#     (requests from a device arrive with another device's ID) and the
+#     I/O APIC / HPET special entries (ivrs_parse);
+#   - encodes DTEs, IRTEs (32-bit legacy and 128-bit GA), the MSI address /
+#     data and redirection entries that name an IRTE, command-buffer
+#     commands and register values, and decodes IRTEs back for the logs.
+#
+# No imports, no hardware access: projects/ritz/ritz0/test_harland_amdvi.py
+# compiles it into a host program as is. Formats: AMD I/O Virtualization
+# Technology (IOMMU) Specification 48882 rev. 3.x, sections 2.2.2 (device
+# table), 2.2.5 (interrupt remapping), 2.4 (commands), 3.4 (registers),
+# 5.2 (IVRS).
+
+# ============================================================================
+# IVRS table (ACPI signature "IVRS")
+# ============================================================================
+
+pub const ACPI_SIG_IVRS: u32 = 0x53525649
+
+# Header: the 36-byte ACPI header, IVinfo (4), 8 reserved; IVHD/IVMD
+# blocks follow.
+pub const IVRS_IVINFO_OFFSET: u32 = 36
+pub const IVRS_BLOCKS_OFFSET: u32 = 48
+
+# IVHD block types: each IOMMU is described once per type the firmware
+# supports; software uses the highest it knows.
+pub const IVHD_TYPE_10: u8 = 0x10
+pub const IVHD_TYPE_11: u8 = 0x11
+pub const IVHD_TYPE_40: u8 = 0x40
+
+# IVHD header: type (1), flags (1), length (2), IOMMU device ID (2),
+# capability offset (2), MMIO base (8), PCI segment (2), IOMMU info (2),
+# then type 10h: feature reporting (4), entries at 24; types 11h/40h:
+# attributes (4), EFR image (8), EFR2 image (8), entries at 40.
+pub const IVHD10_ENTRIES_OFFSET: u32 = 24
+pub const IVHD11_ENTRIES_OFFSET: u32 = 40
+
+# Type 10h feature reporting: XTSup bit 0, GASup bit 6.
+pub const IVHD10_FEAT_XT: u32 = 0x1
+pub const IVHD10_FEAT_GA: u32 = 0x40
+
+# IVHD device entries (4 bytes below 40h, 8 bytes 40h..7Fh, F0h variable)
+pub const IVHD_DEV_PAD: u8 = 0x00
+pub const IVHD_DEV_ALL: u8 = 0x01
+pub const IVHD_DEV_SELECT: u8 = 0x02
+pub const IVHD_DEV_RANGE_START: u8 = 0x03
+pub const IVHD_DEV_RANGE_END: u8 = 0x04
+pub const IVHD_DEV_ALIAS_SELECT: u8 = 0x42
+pub const IVHD_DEV_ALIAS_RANGE: u8 = 0x43
+pub const IVHD_DEV_EXT_SELECT: u8 = 0x46
+pub const IVHD_DEV_EXT_RANGE: u8 = 0x47
+pub const IVHD_DEV_SPECIAL: u8 = 0x48
+pub const IVHD_DEV_ACPI_HID: u8 = 0xF0
+
+# Special entry variety (byte 7)
+pub const IVHD_SPECIAL_IOAPIC: u8 = 1
+pub const IVHD_SPECIAL_HPET: u8 = 2
+
+pub const IVRS_MAX_UNITS: i32 = 8
+pub const IVRS_MAX_SPECIAL: i32 = 16
+pub const IVRS_MAX_ALIASES: i32 = 16
+
+# A device ID that can't be named.
+pub const IVRS_DEVID_NONE: u32 = 0xFFFFFFFF
+
+# What ivrs_parse found.
+pub var ivrs_ivinfo: u32 = 0
+pub var ivrs_ivhd_type: u8 = 0                 # the IVHD type used
+pub var ivrs_num_units: i32 = 0
+pub var ivrs_unit_base: [8]u64                 # MMIO base, per IOMMU
+pub var ivrs_unit_devid: [8]u16                # the IOMMU's own device ID
+pub var ivrs_unit_segment: [8]u16
+pub var ivrs_unit_efr: [8]u64                  # EFR image (11h/40h), or 10h's GA/XT as EFR bits
+pub var ivrs_last_devid: u32 = 0               # the highest device ID any entry names
+pub var ivrs_num_special: i32 = 0
+pub var ivrs_special_variety: [16]u8           # IVHD_SPECIAL_IOAPIC / _HPET
+pub var ivrs_special_handle: [16]u8            # I/O APIC ID or HPET number
+pub var ivrs_special_devid: [16]u16
+pub var ivrs_num_aliases: i32 = 0
+pub var ivrs_alias_first: [16]u16              # requests from first..last
+pub var ivrs_alias_last: [16]u16
+pub var ivrs_alias_to: [16]u16                 # arrive as this device ID
+
+fn ivrs_rd8(p: *u8, off: u32) -> u8
+    return *(p + off as i64)
+
+fn ivrs_rd16(p: *u8, off: u32) -> u16
+    return (ivrs_rd8(p, off) as u16) | ((ivrs_rd8(p, off + 1) as u16) << 8)
+
+fn ivrs_rd32(p: *u8, off: u32) -> u32
+    return (ivrs_rd16(p, off) as u32) | ((ivrs_rd16(p, off + 2) as u32) << 16)
+
+fn ivrs_rd64(p: *u8, off: u32) -> u64
+    return (ivrs_rd32(p, off) as u64) | ((ivrs_rd32(p, off + 4) as u64) << 32)
+
+fn ivrs_note_devid(devid: u32)
+    if devid > ivrs_last_devid
+        ivrs_last_devid = devid
+
+# Bytes in the device entry at `e` (type `t`), 0 if unknown: parsing stops.
+pub fn ivhd_entry_len(t: u8, e: *u8, room: u32) -> u32
+    if t < 0x40
+        return 4
+    if t < 0x80
+        return 8
+    if t == IVHD_DEV_ACPI_HID and room >= 22
+        return 22 + (ivrs_rd8(e, 21) as u32)
+    return 0
+
+fn ivrs_add_alias(first: u32, last: u32, to: u32)
+    if ivrs_num_aliases >= IVRS_MAX_ALIASES or last < first
+        return
+    let k: i32 = ivrs_num_aliases
+    ivrs_alias_first[k] = first as u16
+    ivrs_alias_last[k] = last as u16
+    ivrs_alias_to[k] = to as u16
+    ivrs_num_aliases = k + 1
+    ivrs_note_devid(last)
+    ivrs_note_devid(to)
+
+# Walk one IVHD's device entries, bytes [off, end).
+fn ivrs_parse_entries(t: *u8, off: u32, end: u32)
+    var e: u32 = off
+    var range_start: u32 = IVRS_DEVID_NONE
+    var range_alias: u32 = IVRS_DEVID_NONE
+    while e + 4 <= end
+        let et: u8 = ivrs_rd8(t, e)
+        let n: u32 = ivhd_entry_len(et, t + e as i64, end - e)
+        if n == 0 or e + n > end
+            break
+        let devid: u32 = ivrs_rd16(t, e + 1) as u32
+        if et == IVHD_DEV_ALL
+            ivrs_note_devid(0xFFFF)
+        else if et == IVHD_DEV_SELECT or et == IVHD_DEV_EXT_SELECT or et == IVHD_DEV_ACPI_HID
+            ivrs_note_devid(devid)
+        else if et == IVHD_DEV_RANGE_START or et == IVHD_DEV_EXT_RANGE
+            range_start = devid
+            range_alias = IVRS_DEVID_NONE
+            ivrs_note_devid(devid)
+        else if et == IVHD_DEV_ALIAS_RANGE
+            range_start = devid
+            range_alias = ivrs_rd16(t, e + 5) as u32
+            ivrs_note_devid(devid)
+        else if et == IVHD_DEV_RANGE_END
+            ivrs_note_devid(devid)
+            if range_start != IVRS_DEVID_NONE and range_alias != IVRS_DEVID_NONE
+                ivrs_add_alias(range_start, devid, range_alias)
+            range_start = IVRS_DEVID_NONE
+            range_alias = IVRS_DEVID_NONE
+        else if et == IVHD_DEV_ALIAS_SELECT
+            ivrs_add_alias(devid, devid, ivrs_rd16(t, e + 5) as u32)
+        else if et == IVHD_DEV_SPECIAL
+            let sdev: u32 = ivrs_rd16(t, e + 5) as u32
+            ivrs_note_devid(sdev)
+            if ivrs_num_special < IVRS_MAX_SPECIAL
+                let k: i32 = ivrs_num_special
+                ivrs_special_variety[k] = ivrs_rd8(t, e + 7)
+                ivrs_special_handle[k] = ivrs_rd8(t, e + 4)
+                ivrs_special_devid[k] = sdev as u16
+                ivrs_num_special = k + 1
+        e = e + n
+
+# Parse the IVRS table at `table` (`len` bytes, its header's length). Fills
+# the ivrs_* variables from the IVHD blocks of the highest type present
+# (10h, 11h or 40h). Returns the number of IOMMUs, or -1 if the table is
+# too short or not an IVRS. A malformed block (shorter than its header,
+# running past the end) ends the parse there.
+pub fn ivrs_parse(table: *u8, len: u32) -> i32
+    ivrs_ivinfo = 0
+    ivrs_ivhd_type = 0
+    ivrs_num_units = 0
+    ivrs_last_devid = 0
+    ivrs_num_special = 0
+    ivrs_num_aliases = 0
+    if len < IVRS_BLOCKS_OFFSET or ivrs_rd32(table, 0) != ACPI_SIG_IVRS
+        return -1
+    if ivrs_rd32(table, 4) < len
+        return -1
+    ivrs_ivinfo = ivrs_rd32(table, IVRS_IVINFO_OFFSET)
+    # Pass 1: the highest IVHD type present.
+    var off: u32 = IVRS_BLOCKS_OFFSET
+    while off + 4 <= len
+        let bt: u8 = ivrs_rd8(table, off)
+        let blen: u32 = ivrs_rd16(table, off + 2) as u32
+        if blen < 4 or off + blen > len
+            break
+        if (bt == IVHD_TYPE_10 or bt == IVHD_TYPE_11 or bt == IVHD_TYPE_40) and bt > ivrs_ivhd_type
+            ivrs_ivhd_type = bt
+        off = off + blen
+    if ivrs_ivhd_type == 0
+        return 0
+    var hdr: u32 = IVHD11_ENTRIES_OFFSET
+    if ivrs_ivhd_type == IVHD_TYPE_10
+        hdr = IVHD10_ENTRIES_OFFSET
+    # Pass 2: that type's blocks.
+    off = IVRS_BLOCKS_OFFSET
+    while off + 4 <= len
+        let bt: u8 = ivrs_rd8(table, off)
+        let blen: u32 = ivrs_rd16(table, off + 2) as u32
+        if blen < 4 or off + blen > len
+            break
+        if bt == ivrs_ivhd_type and blen >= hdr and ivrs_num_units < IVRS_MAX_UNITS
+            let u: i32 = ivrs_num_units
+            ivrs_unit_devid[u] = ivrs_rd16(table, off + 4)
+            ivrs_unit_base[u] = ivrs_rd64(table, off + 8)
+            ivrs_unit_segment[u] = ivrs_rd16(table, off + 16)
+            if bt == IVHD_TYPE_10
+                let feat: u32 = ivrs_rd32(table, off + 20)
+                var efr: u64 = 0
+                if (feat & IVHD10_FEAT_XT) != 0
+                    efr = efr | EFR_XT_SUP
+                if (feat & IVHD10_FEAT_GA) != 0
+                    efr = efr | EFR_GA_SUP
+                ivrs_unit_efr[u] = efr
+            else
+                ivrs_unit_efr[u] = ivrs_rd64(table, off + 24)
+            ivrs_num_units = u + 1
+            ivrs_note_devid(ivrs_unit_devid[u] as u32)
+            ivrs_parse_entries(table, off + hdr, off + blen)
+        off = off + blen
+    return ivrs_num_units
+
+# The device ID IVRS gives the I/O APIC with ID `ioapic_id`, or
+# IVRS_DEVID_NONE.
+pub fn ivrs_ioapic_devid(ioapic_id: u8) -> u32
+    var k: i32 = 0
+    while k < ivrs_num_special
+        if ivrs_special_variety[k] == IVHD_SPECIAL_IOAPIC and ivrs_special_handle[k] == ioapic_id
+            return ivrs_special_devid[k] as u32
+        k = k + 1
+    return IVRS_DEVID_NONE
+
+# The device ID requests from `devid` arrive with (an alias entry's
+# target), or `devid` itself.
+pub fn ivrs_alias(devid: u32) -> u32
+    var k: i32 = 0
+    while k < ivrs_num_aliases
+        if devid >= (ivrs_alias_first[k] as u32) and devid <= (ivrs_alias_last[k] as u32)
+            return ivrs_alias_to[k] as u32
+        k = k + 1
+    return devid
+
+# ============================================================================
+# Device table (256-bit entries: q0..q3)
+# ============================================================================
+
+pub const DTE_SIZE: u64 = 32
+pub const DTE_V: u64 = 0x1                     # q0: entry valid
+pub const DTE_TV: u64 = 0x2                    # q0: translation info valid (Mode 0: no translation)
+pub const DTE_IR: u64 = 0x2000000000000000     # q0 bit 61: DMA reads allowed
+pub const DTE_IW: u64 = 0x4000000000000000     # q0 bit 62: DMA writes allowed
+pub const DTE_IV: u64 = 0x1                    # q2 bit 128: interrupt map valid
+pub const DTE_INTCTL_REMAP: u64 = 0x2000000000000000   # q2 bits 189:188 = 10b
+pub const DTE_IRT_ROOT_MASK: u64 = 0x000FFFFFFFFFFFC0  # q2 bits 179:134 (address 51:6)
+
+# Every device's IRT: 256 entries (IntTabLen 8), one 4 KiB page in GA
+# mode. The handles (dmar.ritz's ir_handle_*) stay below 256, so MSI data
+# bits 10:8 (the delivery mode the IOMMU checks first) stay 0: fixed.
+pub const AMDVI_IRT_ENTRIES: u32 = 256
+pub const AMDVI_IRT_LEN_LOG2: u64 = 8
+
+# q0: DMA passes untranslated (Mode 0, reads and writes allowed): this
+# driver remaps interrupts only.
+pub fn dte_q0_passthrough() -> u64
+    return DTE_V | DTE_TV | DTE_IR | DTE_IW
+
+# q2 of a device with no IRT yet: interrupt map valid, IntCtl 00b (fixed
+# and arbitrated interrupts aborted), every pass bit clear. Nothing reaches
+# a CPU without going through a table.
+pub fn dte_q2_blocked() -> u64
+    return DTE_IV
+
+# q2 pointing at the 256-entry IRT at `irt_phys` (128-byte aligned), IntCtl
+# 10b: fixed and arbitrated interrupts are remapped.
+pub fn dte_q2_remap(irt_phys: u64) -> u64
+    return DTE_IV | (AMDVI_IRT_LEN_LOG2 << 1) | (irt_phys & DTE_IRT_ROOT_MASK) | DTE_INTCTL_REMAP
+
+pub fn dte_q2_is_remap(q2: u64) -> bool
+    return (q2 & DTE_IV) != 0 and (q2 & 0x3000000000000000) == DTE_INTCTL_REMAP
+
+pub fn dte_q2_irt(q2: u64) -> u64
+    return q2 & DTE_IRT_ROOT_MASK
+
+# Device table base register: 4 KiB-aligned address, size in pages - 1.
+pub fn amdvi_devtab_reg(phys: u64, pages: u64) -> u64
+    return (phys & 0x000FFFFFFFFFF000) | ((pages - 1) & 0x1FF)
+
+# Pages a device table for device IDs 0..last_devid takes (1..512).
+pub fn amdvi_devtab_pages(last_devid: u32) -> u64
+    let bytes: u64 = ((last_devid & 0xFFFF) as u64 + 1) * DTE_SIZE
+    return (bytes + 4095) / 4096
+
+# ============================================================================
+# IRTEs
+# ============================================================================
+#
+# 32-bit (legacy): RemapEn 0, IntType 4:2 (0: fixed), DM 6 (0: physical),
+# destination 15:8, vector 23:16.
+# 128-bit (GA mode, GuestMode 0): lo: RemapEn 0, IntType 4:2, DM 6,
+# destination 31:8 (bits 23:0); hi: vector 7:0, destination 63:56 (bits
+# 31:24, used with XT).
+
+pub const IRTE_REMAP_EN: u64 = 0x1
+
+pub fn irte32(vector: u8, dest: u32) -> u32
+    return 1 | ((dest & 0xFF) << 8) | ((vector as u32) << 16)
+
+pub fn irte32_dest(e: u32) -> u32
+    return (e >> 8) & 0xFF
+
+pub fn irte_ga_lo(dest: u32) -> u64
+    return IRTE_REMAP_EN | (((dest & 0xFFFFFF) as u64) << 8)
+
+pub fn irte_ga_hi(vector: u8, dest: u32) -> u64
+    return (vector as u64) | (((dest >> 24) as u64) << 56)
+
+pub fn irte_ga_dest(lo: u64, hi: u64) -> u32
+    return (((lo >> 8) & 0xFFFFFF) as u32) | (((hi >> 56) as u32) << 24)
+
+pub fn irte_ga_vector(hi: u64) -> u8
+    return (hi & 0xFF) as u8
+
+# ============================================================================
+# The interrupt messages: MSI and I/O APIC redirection entries
+# ============================================================================
+#
+# Unlike VT-d there is no remappable format: the IOMMU remaps every fixed
+# interrupt from a device whose DTE says so, taking the IRTE index from
+# data bits 10:0. An MSI goes to FEE0_0000 (destination 0, ignored) with the
+# handle as its data; a redirection entry carries the handle in its vector
+# field, fixed delivery, physical, destination 0. Edge-triggered only, as
+# ioapic_set_irq programs them: a level-triggered pin's EOI broadcast
+# carries the IRTE's vector, which wouldn't match the entry's.
+
+pub const AMDVI_MSI_ADDR: u32 = 0xFEE00000
+
+pub fn amdvi_msi_data(handle: u32) -> u32
+    return handle & 0xFF
+
+pub fn amdvi_msi_handle(data: u32) -> u32
+    return data & 0x7FF
+
+pub const AMDVI_RTE_MASKED: u32 = 0x10000
+
+pub fn amdvi_rte_lo(handle: u32, masked: bool) -> u32
+    var v: u32 = handle & 0xFF
+    if masked
+        v = v | AMDVI_RTE_MASKED
+    return v
+
+pub fn amdvi_rte_handle(rte_lo: u32) -> u32
+    return rte_lo & 0x7FF
+
+# ============================================================================
+# Registers (offsets from the IOMMU's MMIO base) and their values
+# ============================================================================
+
+pub const AMDVI_MMIO_SIZE: u64 = 0x4000
+pub const AMDVI_REG_DEVTAB: u64 = 0x0000
+pub const AMDVI_REG_CMDBUF: u64 = 0x0008
+pub const AMDVI_REG_EVTLOG: u64 = 0x0010
+pub const AMDVI_REG_CONTROL: u64 = 0x0018
+pub const AMDVI_REG_EFR: u64 = 0x0030
+pub const AMDVI_REG_CMD_HEAD: u64 = 0x2000
+pub const AMDVI_REG_CMD_TAIL: u64 = 0x2008
+pub const AMDVI_REG_STATUS: u64 = 0x2020
+
+# Control register
+pub const CTRL_IOMMU_EN: u64 = 0x1
+pub const CTRL_EVT_LOG_EN: u64 = 0x4
+pub const CTRL_CMDBUF_EN: u64 = 0x1000
+pub const CTRL_GA_EN: u64 = 0x20000            # bit 17: 128-bit IRTEs
+pub const CTRL_GAM_MASK: u64 = 0xE000000       # bits 27:25: guest APIC mode (0: plain remapping)
+pub const CTRL_XT_EN: u64 = 0x4000000000000    # bit 50: 32-bit x2APIC destinations
+
+# Extended feature register
+pub const EFR_XT_SUP: u64 = 0x4                # bit 2
+pub const EFR_IA_SUP: u64 = 0x40               # bit 6: INVALIDATE_ALL
+pub const EFR_GA_SUP: u64 = 0x80               # bit 7
+
+# Status register: the command buffer is running.
+pub const STATUS_CMDBUF_RUN: u32 = 0x10
+
+# The control value that turns unit on from `ctrl` (what firmware left):
+# command buffer and translation on, event log off, GA (128-bit IRTEs) and
+# XT (32-bit destinations) as asked, guest APIC mode 0.
+pub fn amdvi_control(ctrl: u64, ga: bool, xt: bool) -> u64
+    var v: u64 = ctrl & (0xFFFFFFFFFFFFFFFF ^ (CTRL_EVT_LOG_EN | CTRL_GA_EN | CTRL_GAM_MASK | CTRL_XT_EN))
+    v = v | CTRL_IOMMU_EN | CTRL_CMDBUF_EN
+    if ga
+        v = v | CTRL_GA_EN
+    if xt
+        v = v | CTRL_XT_EN
+    return v
+
+# The features to use: GA if supported; XT (needs GA's 128-bit IRTEs) in
+# x2APIC mode if supported. Bit 0: GA, bit 1: XT.
+pub fn amdvi_pick_modes(efr: u64, x2apic: bool) -> u32
+    if (efr & EFR_GA_SUP) == 0
+        return 0
+    if x2apic and (efr & EFR_XT_SUP) != 0
+        return 3
+    return 1
+
+# ============================================================================
+# Command buffer (128-bit commands: lo, hi; opcode in lo bits 63:60)
+# ============================================================================
+#
+# The buffer is one 4 KiB page of 256 commands (ComLen 8); the tail register
+# holds the next free command's byte offset.
+
+pub const CMD_ENTRIES: u32 = 256
+pub const CMD_SIZE: u64 = 16
+pub const CMD_COMPLETION_WAIT: u64 = 0x1
+pub const CMD_INV_DEVTAB_ENTRY: u64 = 0x2
+pub const CMD_INV_IRT: u64 = 0x5
+pub const CMD_INV_ALL: u64 = 0x8
+
+pub fn amdvi_cmdbuf_reg(phys: u64) -> u64
+    return (phys & 0x000FFFFFFFFFF000) | (8 << 56)
+
+# COMPLETION_WAIT with store: once every earlier command is done, write the
+# 64-bit hi half to the qword at `store_phys` (8-byte aligned).
+pub fn cmd_wait_lo(store_phys: u64) -> u64
+    return (store_phys & 0x000FFFFFFFFFFFF8) | 1 | (CMD_COMPLETION_WAIT << 60)
+
+pub fn cmd_inv_irt_lo(devid: u32) -> u64
+    return ((devid & 0xFFFF) as u64) | (CMD_INV_IRT << 60)
+
+pub fn cmd_inv_dte_lo(devid: u32) -> u64
+    return ((devid & 0xFFFF) as u64) | (CMD_INV_DEVTAB_ENTRY << 60)
+
+pub fn cmd_inv_all_lo() -> u64
+    return CMD_INV_ALL << 60
+
+# Tail after `tail` (a command index) advances by one.
+pub fn cmd_next_tail(tail: u32) -> u32
+    return (tail + 1) % CMD_ENTRIES

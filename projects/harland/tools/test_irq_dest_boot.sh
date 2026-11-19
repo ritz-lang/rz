@@ -1,7 +1,7 @@
 #!/bin/bash
 # Boot Harland under OVMF on a machine with a CPU whose APIC ID is 256 and
 # check where device interrupts go (AGAST #4233), without and with VT-d
-# interrupt remapping (#4316).
+# (#4316) or AMD-Vi (#4329) interrupt remapping.
 #
 # An MSI address and an I/O APIC redirection entry carry an 8-bit APIC ID
 # (0xFF is broadcast). msix_set_entry used to write `lapic_id() & 0xFF`,
@@ -31,6 +31,15 @@
 # says, so "nothing bypasses the table" is pinned at source level only
 # (projects/ritz/ritz0/test_harland_vtd.py).
 #
+# The third boot ("amdvi") adds -device amd-iommu,intremap=on,xtsup=on
+# instead (QEMU >= 9.0 for xtsup): QEMU's IVRS table lists the IOMMU and
+# the I/O APIC's device ID, the kernel builds a device table whose entries
+# point at per-device interrupt remapping tables, turns on 128-bit (GA)
+# IRTEs with x2APIC destinations (XT) (drivers/iommu/amdvi.ritz), and
+# MSI-X data and redirection-entry vectors carry the IRTE index. Same
+# verdicts as vtd, with "AMD-Vi on" (projects/ritz/ritz0/test_harland_amdvi.py
+# pins the formats).
+#
 # Each boot passes only if:
 #   - the LAPIC runs in x2APIC mode and the AP started ("(1 APs started)");
 #   - the I/O APIC's IRQ 1 and IRQ 4 read back as the BSP's APIC ID
@@ -40,7 +49,8 @@
 #     with the BSP's MSI address and the reason ("[irq] APIC ID 256: device
 #     interrupts -> APIC ID B (MSI addr FEE0B000): beyond the 8-bit ...");
 #     with the extended destination ID, it is not rerouted at all;
-#   - vtd boot: "Interrupt remapping: VT-d on ... (EIM)", destinations
+#   - vtd / amdvi boot: "Interrupt remapping: VT-d on ... (EIM)" or
+#     "Interrupt remapping: AMD-Vi on ... (GA, XT)", destinations
 #     "interrupt remapping (32-bit APIC IDs)", APIC ID 256 not rerouted, the
 #     I/O APIC's IRQ 1 and 4 remapped (IRTE 1, 4) to the BSP, and the NVMe
 #     vectors set through IRTEs aimed at the BSP;
@@ -50,11 +60,12 @@
 #     TESTS PASSED.
 #
 # Usage: tools/test_irq_dest_boot.sh
-#        IRQ_DEST_BOOTS="plain vtd"  which boots to run (default both)
+#        IRQ_DEST_BOOTS="plain vtd amdvi"  which boots to run (default all)
 #        ACCEL=kvm      boot under KVM (default TCG)
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 240)
-#        KEEP_WORK=DIR  copy the serial logs (irq-dest.log, irq-dest-vtd.log) into DIR
+#        KEEP_WORK=DIR  copy the serial logs (irq-dest.log, irq-dest-vtd.log,
+#                       irq-dest-amdvi.log) into DIR
 #        OVMF_CODE=F    OVMF firmware to use (default: search the usual paths)
 #
 # Exit: 0 = pass; 1 = the boot or a check failed; 3 = a required tool is
@@ -72,12 +83,12 @@ TIMEOUT="${BOOT_TIMEOUT:-240}"
 USER_PKGS="indium rzsh prism"
 # The CPU the AP gets: APIC ID = socket 1 << 8 (core IDs take 8 bits).
 AP_APIC_ID=256
-BOOTS="${IRQ_DEST_BOOTS:-plain vtd}"
+BOOTS="${IRQ_DEST_BOOTS:-plain vtd amdvi}"
 
 EXIT_SETUP=3
 setup_error() { echo "SETUP ERROR: $*" >&2; exit "$EXIT_SETUP"; }
 for b in $BOOTS; do
-    case "$b" in plain|vtd) ;; *) setup_error "unknown boot in IRQ_DEST_BOOTS: $b";; esac
+    case "$b" in plain|vtd|amdvi) ;; *) setup_error "unknown boot in IRQ_DEST_BOOTS: $b";; esac
 done
 
 command -v qemu-system-x86_64 >/dev/null || setup_error "qemu-system-x86_64 not found"
@@ -124,15 +135,16 @@ cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
 python3 -c 'import sys; open(sys.argv[1], "wb").truncate(16 << 20)' "$WORK/nvme.img" \
     || { echo "FAIL: could not write the NVMe disk"; exit 1; }
 
-# boot NAME SERIAL: boot the machine, NAME "vtd" with the IOMMU.
+# boot NAME SERIAL: boot the machine, NAME "vtd" / "amdvi" with that IOMMU.
 boot() {
     local name="$1" serial="$2" machine="q35" accel=() iommu=() vars=()
     if [ "${ACCEL:-}" = kvm ]; then
         accel=(-accel kvm)
-        [ "$name" = vtd ] && machine="q35,kernel-irqchip=split"
+        [ "$name" != plain ] && machine="q35,kernel-irqchip=split"
     fi
     # The IOMMU first: it must exist before the PCI devices it remaps.
     [ "$name" = vtd ] && iommu=(-device intel-iommu,intremap=on,eim=on)
+    [ "$name" = amdvi ] && iommu=(-device amd-iommu,intremap=on,xtsup=on)
     if [ -n "$OVMF_VARS" ]; then
         cp "$OVMF_VARS" "$WORK/vars-$name.fd"
         vars=(-drive "if=pflash,format=raw,file=$WORK/vars-$name.fd")
@@ -165,7 +177,7 @@ boot() {
 check() {
     local name="$1" SERIAL="$2"
     echo "----- irq-dest boot ($name): APIC and interrupt routing lines -----"
-    grep -aE "LAPIC mode|Device interrupt destinations|Interrupt remapping|DMAR at|\[vtd\]|I/O APIC:|BSP APIC ID|APs started|\[irq\]|\[msix\] (nvme|vector|no CPU)" "$SERIAL" | head -24
+    grep -aE "LAPIC mode|Device interrupt destinations|Interrupt remapping|DMAR at|IVRS at|\[vtd\]|\[amdvi\]|I/O APIC:|BSP APIC ID|APs started|\[irq\]|\[msix\] (nvme|vector|no CPU)" "$SERIAL" | head -24
     echo "-----------------------------------------------------------"
     local P="[$name]"
 
@@ -204,12 +216,20 @@ check() {
     else
         echo "PASS: $P I/O APIC sends IRQ 1 and IRQ 4 to the BSP (APIC ID $bsp)"
     fi
-    if [ "$name" = vtd ]; then
-        if grep -aqE "Interrupt remapping: VT-d on, [0-9]+ unit\(s\), table at [0-9A-Fa-fx]+, 32-bit x2APIC destinations \(EIM\)" "$SERIAL"; then
-            echo "PASS: $P VT-d interrupt remapping on with 32-bit destinations (EIM)"
+    if [ "$name" != plain ]; then
+        local ir_on ir_what
+        if [ "$name" = vtd ]; then
+            ir_on="Interrupt remapping: VT-d on, [0-9]+ unit\(s\), table at [0-9A-Fa-fx]+, 32-bit x2APIC destinations \(EIM\)"
+            ir_what="VT-d interrupt remapping on with 32-bit destinations (EIM)"
         else
-            grep -aE "Interrupt remapping|DMAR|\[vtd\]" "$SERIAL" | head -5
-            echo "FAIL: $P interrupt remapping is not on in extended interrupt mode"
+            ir_on="Interrupt remapping: AMD-Vi on, [0-9]+ unit\(s\), device table at [0-9A-Fa-fx]+, 32-bit x2APIC destinations \(GA, XT\)"
+            ir_what="AMD-Vi interrupt remapping on with 32-bit destinations (GA, XT)"
+        fi
+        if grep -aqE "$ir_on" "$SERIAL"; then
+            echo "PASS: $P $ir_what"
+        else
+            grep -aE "Interrupt remapping|DMAR|IVRS|\[vtd\]|\[amdvi\]" "$SERIAL" | head -5
+            echo "FAIL: $P interrupt remapping is not on with 32-bit destinations"
             rc=1
         fi
         if ! grep -aqF "Device interrupt destinations: interrupt remapping (32-bit APIC IDs)" "$SERIAL"; then
@@ -290,7 +310,7 @@ check() {
 rc=0
 for b in $BOOTS; do
     log="$WORK/irq-dest.log"
-    [ "$b" = vtd ] && log="$WORK/irq-dest-vtd.log"
+    [ "$b" != plain ] && log="$WORK/irq-dest-$b.log"
     boot "$b" "$log"
     check "$b" "$log"
 done

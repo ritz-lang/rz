@@ -1,5 +1,6 @@
 """CI boots harland with an APIC ID 256 CPU and checks device-interrupt
-destinations (AGAST #4233), without and with VT-d interrupt remapping (#4316).
+destinations (AGAST #4233), without and with VT-d (#4316) or AMD-Vi (#4329)
+interrupt remapping.
 
 projects/harland/tools/test_irq_dest_boot.sh boots q35 + OVMF with the BSP at
 APIC ID 0 and an AP at 256. The MSI and I/O APIC destination is 8 bits, so the
@@ -8,7 +9,8 @@ APIC's IRQ 1 and IRQ 4 must read back as the BSP's ID, NVMe must still
 deliver MSI-X interrupts and init's suite must pass. A second boot adds
 -device intel-iommu,intremap=on,eim=on: remapping must come up in extended
 interrupt mode, APIC ID 256 must keep its own interrupts and the I/O APIC
-and NVMe entries must go through IRTEs aimed at the BSP. These tests pin the
+and NVMe entries must go through IRTEs aimed at the BSP. A third boot does
+the same with -device amd-iommu,intremap=on,xtsup=on. These tests pin the
 main.yml wiring and the script's verdicts against a stub QEMU.
 """
 
@@ -74,6 +76,9 @@ IOAPIC_IR = r"      I/O APIC: IRQ 1 -> APIC ID 0, IRQ 4 -> APIC ID 0 (remapped: 
 NVME_IR = NVME.replace("io=65\\n", "io=65 (IRTE 192, 193 -> APIC ID 0, 0)\\n", 1)
 VTD_PASSED = X2APIC + IR_ON + DEST_IR + IOAPIC_IR + bsp(0) + APS + NVME_IR + SUITE
 
+AMD_ON = r"      Interrupt remapping: AMD-Vi on, 1 unit(s), device table at 3DB000, 32-bit x2APIC destinations (GA, XT)\n"
+AMDVI_PASSED = VTD_PASSED.replace(IR_ON, AMD_ON)
+
 
 def _build_all() -> list[dict]:
     return yaml.safe_load(ci_local.WORKFLOW.read_text())["jobs"]["build-all"]["steps"]
@@ -112,7 +117,15 @@ def test_the_vtd_boot_has_an_iommu_with_32_bit_remapping():
     assert "-device intel-iommu,intremap=on,eim=on" in text
     # KVM needs the split irqchip for the IOMMU's interrupt remapping
     assert 'machine="q35,kernel-irqchip=split"' in text
-    assert 'IRQ_DEST_BOOTS:-plain vtd' in text, "CI must run both boots by default"
+    assert 'IRQ_DEST_BOOTS:-plain vtd amdvi' in text, "CI must run every boot by default"
+
+
+@pytest.mark.unit
+def test_the_amdvi_boot_has_an_amd_iommu_with_x2apic_remapping():
+    text = (REPO / SCRIPT).read_text()
+    assert "-device amd-iommu,intremap=on,xtsup=on" in text
+    # KVM needs the split irqchip for either IOMMU
+    assert '[ "$name" != plain ] && machine="q35,kernel-irqchip=split"' in text
 
 
 @pytest.fixture
@@ -177,6 +190,41 @@ def test_both_boots_run_by_default(tree):
     assert r.returncode == 1 and "PASS: [plain] init Tier-1 suite" in r.stdout and "FAIL: [vtd]" in r.stdout
     argv = (tree["tmp"] / "stub.log").read_text().splitlines()
     assert len(argv) == 2 and "intel-iommu" not in argv[0] and "intel-iommu" in argv[1]
+
+
+@pytest.mark.integration
+def test_a_good_amdvi_boot_passes(tree):
+    r = _run(tree, AMDVI_PASSED, "amdvi")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "PASS: [amdvi] AMD-Vi interrupt remapping on with 32-bit destinations (GA, XT)" in r.stdout
+    assert "PASS: [amdvi] APIC ID 256 takes its own device interrupts (interrupt remapping)" in r.stdout
+    argv = (tree["tmp"] / "stub.log").read_text()
+    assert "amd-iommu,intremap=on,xtsup=on" in argv and "intel-iommu" not in argv
+
+
+@pytest.mark.integration
+def test_the_vtd_line_does_not_pass_an_amdvi_boot(tree):
+    # each vendor's boot must see its own IOMMU come up
+    r = _run(tree, VTD_PASSED, "amdvi")
+    assert r.returncode == 1 and "FAIL: [amdvi] interrupt remapping is not on" in r.stdout, r.stdout
+    r = _run(tree, AMDVI_PASSED, "vtd")
+    assert r.returncode == 1 and "FAIL: [vtd] interrupt remapping is not on" in r.stdout, r.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("serial, why", [
+    (AMDVI_PASSED.replace(AMD_ON, r"      Interrupt remapping: off (no DMAR or IVRS table)\n"), "interrupt remapping is not on"),
+    (AMDVI_PASSED.replace(AMD_ON, AMD_ON.replace("32-bit x2APIC destinations (GA, XT)", "8-bit xAPIC destinations (GA)")),
+     "interrupt remapping is not on"),
+    (AMDVI_PASSED + REROUTE_256, "rerouted though interrupt remapping reaches it"),
+    (AMDVI_PASSED.replace(IOAPIC_IR, ioapic(0, 0)), "not in the remappable format"),
+    (AMDVI_PASSED.replace(NVME_IR, NVME), "NVMe MSI-X entries are not in the remappable format"),
+    (AMDVI_PASSED.replace("-> APIC ID 0, 0)", "-> APIC ID 0, 256)"), "want \"(IRTE 192, 193 -> APIC ID 0, 0)\""),
+])
+def test_a_bad_amdvi_boot_fails(tree, serial, why):
+    r = _run(tree, serial, "amdvi")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert why in r.stdout, r.stdout
 
 
 @pytest.mark.integration

@@ -27,8 +27,8 @@ import serial { prints, serial_print_dec, serial_print_hex, serial_print_hex8, s
 import mm.vmm { vmm_map_mmio }
 import drivers.pci { PciDevice, pci_find_capability, pci_read_config16, pci_read_config32, pci_write_config16, pci_enable_memory, pci_get_device_count, pci_get_device }
 import arch.x86_64.irq_dest { msi_addr_lo, msi_addr_dest, IRQ_DEST_NONE }
-import drivers.iommu.vtd { vtd_ir_enabled, vtd_ir_x2apic, vtd_ir_set, vtd_ir_get_lo }
-import drivers.iommu.dmar { ir_handle_msi, msi_addr_remap, msi_addr_is_remap, msi_addr_handle, irte_dest }
+import drivers.iommu.ir { ir_enabled, ir_set, ir_get_dest, ir_msi_addr, ir_msi_data, ir_msi_handle }
+import drivers.iommu.dmar { ir_handle_msi }
 
 # Current CPU's Local APIC ID, the CPU an interrupt meant for an APIC ID
 # goes to, and why it isn't that one (arch/x86_64/apic.ritz)
@@ -164,10 +164,11 @@ pub fn msix_vector_alloc() -> u8
 # Point table entry `entry` at `vector` on the current CPU (the BSP during
 # boot) and unmask it. A CPU an MSI can't reach (APIC ID 255 or more with
 # no extended destination ID) gets the entry sent to the BSP, or the first
-# CPU an MSI reaches, and says so. With interrupt remapping on (#4316) the
-# entry carries IRT handle ir_handle_msi(vector) in the remappable format,
-# and the IRTE the vector, the (32-bit) destination and the device's
-# requester ID. Returns 0, or -1 if the entry is out of range, the table
+# CPU an MSI reaches, and says so. With interrupt remapping on (VT-d #4316,
+# AMD-Vi #4329) the entry names table entry ir_handle_msi(vector) (in the
+# format drivers/iommu/ir.ritz gives), and that entry holds the vector and
+# the (32-bit) destination; the device's requester ID picks (AMD-Vi) or
+# validates (VT-d) the table. Returns 0, or -1 if the entry is out of range, the table
 # isn't mapped, no CPU can take the interrupt or the IRTE can't be set.
 pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
     if (*info).table_virt == 0 or entry >= (*info).table_size
@@ -199,17 +200,15 @@ pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
     # Fixed delivery, edge-triggered: data is just the vector.
     var addr: u32 = msi_addr_lo(dest)
     var data: u32 = vector as u32
-    if vtd_ir_enabled()
+    if ir_enabled()
         let handle: u32 = ir_handle_msi(vector)
-        let dev: *PciDevice = (*info).dev
-        let sid: u32 = (((*dev).bus as u32) << 8) | (((*dev).device as u32) << 3) | ((*dev).function as u32)
-        if vtd_ir_set(handle, vector, dest, false, sid) != 0
+        if ir_set(handle, vector, dest, false, msix_sid(info)) != 0
             prints("[msix] vector ")
             serial_print_dec(vector as u64)
             prints(": IRTE not set; entry left masked\n")
             return -1
-        addr = msi_addr_remap(handle)
-        data = 0
+        addr = ir_msi_addr(handle)
+        data = ir_msi_data(handle)
     volatile_store((e + MSIX_ENTRY_ADDR_LO) as *u32, addr)
     volatile_store((e + MSIX_ENTRY_ADDR_HI) as *u32, 0)
     volatile_store((e + MSIX_ENTRY_DATA) as *u32, data)
@@ -273,25 +272,28 @@ pub fn msix_print_all()
     serial_print_dec(found as u64)
     prints(" PCI devices with MSI-X\n")
 
+# The device's requester ID: bus << 8 | device << 3 | function.
+fn msix_sid(info: *MsixInfo) -> u32
+    let dev: *PciDevice = (*info).dev
+    return (((*dev).bus as u32) << 8) | (((*dev).device as u32) << 3) | ((*dev).function as u32)
+
 # The IRT handle table entry `entry` sends through, read back from the
-# device's table: MSIX_NO_IRTE if the entry is in the compatibility format
-# (no interrupt remapping) or out of range.
-pub const MSIX_NO_IRTE: u32 = 0xFFFFFFFF
+# device's table: MSIX_NO_IRTE if the entry names none (no interrupt
+# remapping) or is out of range.
+pub const MSIX_NO_IRTE: u32 = 0xFFFFFFFF          # = IR_NO_HANDLE
 
 pub fn msix_entry_irte(info: *MsixInfo, entry: u16) -> u32
     if (*info).table_virt == 0 or entry >= (*info).table_size
         return MSIX_NO_IRTE
-    let addr: u32 = volatile_load(((*info).table_virt + (entry as u64) * MSIX_ENTRY_SIZE + MSIX_ENTRY_ADDR_LO) as *u32)
-    if not msi_addr_is_remap(addr)
-        return MSIX_NO_IRTE
-    return msi_addr_handle(addr)
+    let e: u64 = (*info).table_virt + (entry as u64) * MSIX_ENTRY_SIZE
+    return ir_msi_handle(volatile_load((e + MSIX_ENTRY_ADDR_LO) as *u32), volatile_load((e + MSIX_ENTRY_DATA) as *u32))
 
 # The APIC ID table entry `entry` reaches, read back: from its IRTE when
 # remapped, else from the address itself.
 pub fn msix_entry_dest(info: *MsixInfo, entry: u16) -> u32
     let handle: u32 = msix_entry_irte(info, entry)
     if handle != MSIX_NO_IRTE
-        return irte_dest(vtd_ir_get_lo(handle), vtd_ir_x2apic())
+        return ir_get_dest(handle, msix_sid(info))
     if (*info).table_virt == 0 or entry >= (*info).table_size
         return IRQ_DEST_NONE
     return msi_addr_dest(volatile_load(((*info).table_virt + (entry as u64) * MSIX_ENTRY_SIZE + MSIX_ENTRY_ADDR_LO) as *u32))

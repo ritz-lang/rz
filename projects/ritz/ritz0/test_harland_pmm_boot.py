@@ -76,6 +76,50 @@ def test_pmm_never_hands_out_or_frees_page_zero(tmp_path):
     assert rc == 0, f"PMM page-0 check {rc} failed (see PMM_PAGE_ZERO)"
 
 
+# --- contiguous runs (AGAST #4329: the AMD-Vi device table) ---------------------
+PMM_CONTIG = """\
+import ritzlib.option
+import mm.pmm { PAGE_SIZE, pmm_init, pmm_mark_region_free, pmm_alloc_page, pmm_alloc_contig, pmm_free_page, pmm_get_free_pages }
+
+var bm: [8]u8
+
+fn main() -> i32
+    pmm_init(@bm[0], 64)
+    # Pages 1..9 free, then a hole at 10, then 11..15.
+    pmm_mark_region_free(0, 10 * PAGE_SIZE)
+    pmm_mark_region_free(11 * PAGE_SIZE, 5 * PAGE_SIZE)
+    # Take pages 1..3, give back 2: the free run 2..2 is too short for 4,
+    # so the run of 4 is 4..7.
+    let a: u64 = pmm_alloc_page()
+    let b: u64 = pmm_alloc_page()
+    let c: u64 = pmm_alloc_page()
+    if a != PAGE_SIZE or c != 3 * PAGE_SIZE
+        return 1
+    pmm_free_page(b)
+    if pmm_alloc_contig(4) != 4 * PAGE_SIZE
+        return 2
+    # 14 free - 3 + 1 - 4: pages 2, 8, 9, 11..15
+    if pmm_get_free_pages() != 8
+        return 3
+    # No run of 6 (the hole at 10 splits 8..15); the run of 5 is 11..15.
+    if pmm_alloc_contig(6) != 0
+        return 4
+    if pmm_alloc_contig(5) != 11 * PAGE_SIZE
+        return 5
+    if pmm_alloc_contig(0) != 0 or pmm_alloc_contig(3) != 0
+        return 6
+    # The single pages left still allocate: 2, then 8.
+    if pmm_alloc_page() != 2 * PAGE_SIZE or pmm_alloc_page() != 8 * PAGE_SIZE
+        return 7
+    0
+"""
+
+
+def test_pmm_alloc_contig_finds_a_free_run(tmp_path):
+    rc = _run("ritz0", tmp_path, PMM_CONTIG, PMM_MODULES)
+    assert rc == 0, f"PMM contig check {rc} failed (see PMM_CONTIG)"
+
+
 # --- memory above 4 GiB (AGAST #4183) -------------------------------------------
 #
 # Before #4183 the bitmap was a fixed 128 KiB array (MAX_PAGES, 4 GiB): pages

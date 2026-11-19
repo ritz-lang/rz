@@ -1,0 +1,117 @@
+# Harland interrupt remapping, vendor-neutral (AGAST #4329).
+#
+# Intel VT-d (drivers/iommu/vtd.ritz, #4316) and AMD-Vi (drivers/iommu/
+# amdvi.ritz, #4329) both let a device interrupt reach a CPU whose APIC ID
+# doesn't fit the MSI address's or redirection entry's 8 bits: the message
+# names a table entry (a handle) and the entry the vector and a 32-bit
+# destination. They differ in how the message names the entry:
+#   - VT-d: the remappable format, the handle in MSI address bits 19:5 / 2
+#     (data 0) or redirection-entry bits 63:49 / 11 with bit 48 set;
+#   - AMD-Vi: the compatibility format, the handle in MSI data bits 10:0 or
+#     the redirection entry's vector field; the IOMMU picks the table from
+#     the requester's device table entry.
+# drivers/msix.ritz and ioapic_set_irq (arch/x86_64/apic.ritz) call only
+# this module: ir_set for the entry, ir_msi_* / ir_ioapic_rte_* for the
+# message, with the handles from drivers/iommu/dmar.ritz (I/O APIC pin N:
+# N; MSI vector V: 128 + (V & 127)) under either vendor.
+#
+# ir_init picks the vendor by the ACPI table firmware provides: DMAR for
+# VT-d, else IVRS for AMD-Vi.
+
+import serial { prints }
+import drivers.acpi.tables { acpi_find_table }
+import drivers.iommu.dmar {
+    ACPI_SIG_DMAR, msi_addr_remap, msi_addr_is_remap, msi_addr_handle,
+    ioapic_rte_remap_hi, ioapic_rte_remap_lo, ioapic_rte_is_remap, ioapic_rte_handle, irte_dest
+}
+import drivers.iommu.vtd { vtd_ir_init, vtd_ir_enabled, vtd_ir_x2apic, vtd_ir_set, vtd_ir_get_lo, vtd_ioapic_sid }
+import drivers.iommu.ivrs { AMDVI_MSI_ADDR, amdvi_msi_data, amdvi_msi_handle, amdvi_rte_lo, amdvi_rte_handle }
+import drivers.iommu.amdvi { amdvi_ir_init, amdvi_ir_enabled, amdvi_ir_x2apic, amdvi_ir_set, amdvi_ir_get_dest, amdvi_ioapic_sid }
+
+# No handle: the message isn't in a format that names a table entry.
+pub const IR_NO_HANDLE: u32 = 0xFFFFFFFF
+
+# Bring interrupt remapping up, VT-d or AMD-Vi. `x2apic`: the LAPIC is in
+# x2APIC mode, so table entries carry 32-bit destinations where the
+# hardware can. Returns 0 with remapping on, -1 with it off (logged why).
+pub fn ir_init(x2apic: bool) -> i32
+    if acpi_find_table(ACPI_SIG_DMAR) != 0
+        return vtd_ir_init(x2apic)
+    let rc: i32 = amdvi_ir_init(x2apic)
+    if rc == -2
+        prints("      Interrupt remapping: off (no DMAR or IVRS table)\n")
+        return -1
+    return rc
+
+# Is interrupt remapping on? Then every MSI and redirection entry must name
+# a table entry (ir_msi_*, ir_ioapic_rte_*).
+pub fn ir_enabled() -> bool
+    return vtd_ir_enabled() or amdvi_ir_enabled()
+
+# ... and do table entries hold 32-bit x2APIC destinations?
+pub fn ir_x2apic() -> bool
+    return vtd_ir_x2apic() or amdvi_ir_x2apic()
+
+# Point table entry `handle` of requester `sid` (bus << 8 | dev << 3 | fn)
+# at `vector` on APIC ID `dest`. The source should be masked. Returns 0,
+# or -1 if remapping is off or the entry can't be set.
+pub fn ir_set(handle: u32, vector: u8, dest: u32, level: bool, sid: u32) -> i32
+    if vtd_ir_enabled()
+        return vtd_ir_set(handle, vector, dest, level, sid)
+    if amdvi_ir_enabled()
+        return amdvi_ir_set(handle, vector, dest, level, sid)
+    return -1
+
+# The APIC ID table entry `handle` of requester `sid` sends to, for the
+# boot logs.
+pub fn ir_get_dest(handle: u32, sid: u32) -> u32
+    if vtd_ir_enabled()
+        return irte_dest(vtd_ir_get_lo(handle), vtd_ir_x2apic())
+    return amdvi_ir_get_dest(handle, sid)
+
+# The requester ID I/O APIC `ioapic_id` sends with (DMAR scope / IVRS
+# special entry), or 0xFFFFFFFF if firmware names none.
+pub fn ir_ioapic_sid(ioapic_id: u8) -> u32
+    if vtd_ir_enabled()
+        return vtd_ioapic_sid(ioapic_id)
+    return amdvi_ioapic_sid(ioapic_id)
+
+# ============================================================================
+# Messages that name table entry `handle`
+# ============================================================================
+
+pub fn ir_msi_addr(handle: u32) -> u32
+    if amdvi_ir_enabled()
+        return AMDVI_MSI_ADDR
+    return msi_addr_remap(handle)
+
+pub fn ir_msi_data(handle: u32) -> u32
+    if amdvi_ir_enabled()
+        return amdvi_msi_data(handle)
+    return 0
+
+# The handle an MSI address/data pair names, IR_NO_HANDLE if none.
+pub fn ir_msi_handle(addr_lo: u32, data: u32) -> u32
+    if amdvi_ir_enabled()
+        return amdvi_msi_handle(data)
+    if vtd_ir_enabled() and msi_addr_is_remap(addr_lo)
+        return msi_addr_handle(addr_lo)
+    return IR_NO_HANDLE
+
+pub fn ir_ioapic_rte_hi(handle: u32) -> u32
+    if amdvi_ir_enabled()
+        return 0
+    return ioapic_rte_remap_hi(handle)
+
+pub fn ir_ioapic_rte_lo(vector: u8, handle: u32, masked: bool) -> u32
+    if amdvi_ir_enabled()
+        return amdvi_rte_lo(handle, masked)
+    return ioapic_rte_remap_lo(vector, handle, masked)
+
+# The handle a redirection entry names, IR_NO_HANDLE if none.
+pub fn ir_ioapic_rte_handle(rte_hi: u32, rte_lo: u32) -> u32
+    if amdvi_ir_enabled()
+        return amdvi_rte_handle(rte_lo)
+    if vtd_ir_enabled() and ioapic_rte_is_remap(rte_hi)
+        return ioapic_rte_handle(rte_hi, rte_lo)
+    return IR_NO_HANDLE

@@ -34,6 +34,7 @@ DMAR = KERNEL_SRC / "drivers" / "iommu" / "dmar.ritz"
 VTD = KERNEL_SRC / "drivers" / "iommu" / "vtd.ritz"
 APIC = KERNEL_SRC / "arch" / "x86_64" / "apic.ritz"
 MSIX = KERNEL_SRC / "drivers" / "msix.ritz"
+IR = KERNEL_SRC / "drivers" / "iommu" / "ir.ritz"
 
 PROGRAM = """\
 import drivers.iommu.dmar
@@ -226,25 +227,33 @@ def test_dmar_module_is_import_free():
 
 @pytest.mark.unit
 def test_msix_entry_uses_an_irte_when_remapping_is_on():
-    body = _body(_code(MSIX), "msix_set_entry")
-    assert "vtd_ir_enabled()" in body, body
-    assert re.search(r"vtd_ir_set\(\s*\w+\s*,\s*vector\s*,\s*dest\b", body), "the IRTE must carry the vector and destination"
-    assert "ir_handle_msi(vector)" in body and "msi_addr_remap(" in body, body
+    # through drivers/iommu/ir.ritz (#4329), which hands VT-d the remappable format
+    code = _code(MSIX)
+    body = _body(code, "msix_set_entry")
+    assert "ir_enabled()" in body, body
+    assert re.search(r"ir_set\(\s*\w+\s*,\s*vector\s*,\s*dest\s*,\s*\w+\s*,\s*msix_sid\(info\)", body), \
+        "the IRTE must carry the vector, destination and requester ID"
+    assert "ir_handle_msi(vector)" in body and "ir_msi_addr(" in body and "ir_msi_data(" in body, body
+    assert "msi_addr_remap(" in _body(_code(IR), "ir_msi_addr")
     # the device's requester ID goes into the IRTE for source validation
-    assert re.search(r"\.bus\b", body) and re.search(r"\.device\b", body) and re.search(r"\.function\b", body), body
+    sid = _body(code, "msix_sid")
+    assert re.search(r"\.bus\b", sid) and re.search(r"\.device\b", sid) and re.search(r"\.function\b", sid), sid
 
 
 @pytest.mark.unit
 def test_ioapic_entries_are_remappable_when_remapping_is_on():
     code = _code(APIC)
     set_irq = _body(code, "ioapic_set_irq")
-    assert "vtd_ir_enabled()" in set_irq, set_irq
-    assert "ir_handle_ioapic(" in set_irq and "ioapic_rte_remap_hi(" in set_irq and "ioapic_rte_remap_lo(" in set_irq
-    assert "vtd_ir_set(" in set_irq, set_irq
+    assert "ir_enabled()" in set_irq, set_irq
+    assert "ir_handle_ioapic(" in set_irq and "ir_ioapic_rte_hi(" in set_irq and "ir_ioapic_rte_lo(" in set_irq
+    assert "ir_set(" in set_irq and "ir_ioapic_sid(" in set_irq, set_irq
+    ir = _code(IR)
+    assert "ioapic_rte_remap_hi(" in _body(ir, "ir_ioapic_rte_hi") and "ioapic_rte_remap_lo(" in _body(ir, "ir_ioapic_rte_lo")
     # remapping is up before the I/O APIC is programmed, after the LAPIC mode is known
     select = _body(code, "apic_select_mode")
-    assert "vtd_ir_init(" in select, select
-    assert select.index("x2apic_mode = 1") < select.index("vtd_ir_init("), select
+    assert "ir_init(" in select, select
+    assert select.index("x2apic_mode = 1") < select.index("ir_init("), select
+    assert "vtd_ir_init(" in _body(_code(IR), "ir_init")
     for init_fn in ("apic_init_with_mb", "apic_init_from_bootinfo"):
         b = _body(code, init_fn)
         assert b.index("apic_select_mode()") < b.index("ioapic_init()"), init_fn
@@ -253,7 +262,10 @@ def test_ioapic_entries_are_remappable_when_remapping_is_on():
 @pytest.mark.unit
 def test_irq_route_counts_remapping_as_reachable():
     code = _code(APIC)
-    assert re.search(r"irq_dest_pick\(.*vtd_ir_x2apic\(\)", _body(code, "irq_route_dest")), "irq_route_dest ignores IR"
+    route = _body(code, "irq_route_dest")
+    assert re.search(r"irq_dest_pick\(.*\bir_x2apic\(\)", route), "irq_route_dest ignores IR"
+    # with IR on the table entry holds the destination: no extended-destination-ID bits
+    assert re.search(r"irq_ext_dest != 0 and not ir_enabled\(\)", route), route
 
 
 @pytest.mark.unit
