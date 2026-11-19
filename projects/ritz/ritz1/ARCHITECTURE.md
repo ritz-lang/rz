@@ -253,6 +253,8 @@ still run mid-lowering on `*EmitterState`, and
 - `ownership` — drop insertion (§13.6): drop flags, the moves that clear
   them, glue, temporaries and `defer` lowering. Which bindings own a value is
   Sema's annotation (`FnDef.own_binds`); the check itself is `own_check`'s.
+  Each `ret`'s drops are emitted with it, for what is live there (#3508):
+  nothing rescans the finished body for them.
 
 - `pass_value` — `pass` has no value (§2.4, §6.1).
 

@@ -21,10 +21,12 @@
 #   - on assignment, for the old value (copied aside first, so the new value
 #     may still read it); and on assignment to a field, for the field's old
 #     value (AGAST #2173, see own_field_drop_cond);
-#   - before every `ret` of the fn, for every binding of the fn (reverse
-#     declaration order): own_end_fn inserts them into the finished body,
-#     because ritz1 emits `ret` from dozens of sites.  A binding whose block
-#     already ended has a cleared flag, so it is not dropped twice.
+#   - before every `ret` of the fn, for the bindings and temporaries live
+#     there, newest first (own_before_ret, which emit_str calls as a `ret`
+#     starts, because ritz1 emits `ret` from dozens of sites; AGAST #3508).
+#     Which locals own a value is Sema's annotation (FnDef.own_binds), so
+#     the drops are known where the `ret` is emitted: nothing rescans the
+#     finished body.
 # Glue: a type's own `drop` (if it has one) runs first, then each move-only
 # field is dropped in declaration order.  An array drops its elements in
 # index order; an enum (a user enum, or a tagged Option / Result) drops the
@@ -70,11 +72,8 @@ import ritzlib.memory
 import ast
 import ast_helpers
 import emitter_core
-import emitter_expr        # emit_member_gep_from_ptr
 import emitter_expr_call   # method_callee_def, find_spec_impl_method
-import ll_copy_scan        # ll_line_len, ll_starts_with
 import ref_check           # ref_ty_of, ref_through, ref_method_def, ref_temp_call
-import emitter_stmt        # emit_stmt, for a deferred statement (AGAST #1625)
 import emitter_match
 import ritzlib.str
 
@@ -344,9 +343,7 @@ pub fn own_init(s: *EmitterState)
     o.scope_dead = malloc((OWN_INIT_CAP as i64) * 4) as *i32
     o.scope_count = 0
     o.scope_cap = OWN_INIT_CAP
-    o.all = malloc((OWN_INIT_CAP as i64) * sizeof(OwnBinding)) as *OwnBinding
-    o.all_count = 0
-    o.all_cap = OWN_INIT_CAP
+    o.seq_next = 0
     o.loop_base = -1
     o.ret_seq = 0
     o.has_drop = 0 - 1
@@ -374,14 +371,9 @@ pub fn own_init(s: *EmitterState)
     o.loop_dcap = OWN_INIT_CAP
     o.in_ret = 0
     s.own = o
-    s.defer_live = 0
 
 fn own_live_at(o: *OwnState, i: i32) -> *OwnBinding
     let base: *OwnBinding = o.live
-    return @base[i]
-
-fn own_all_at(o: *OwnState, i: i32) -> *OwnBinding
-    let base: *OwnBinding = o.all
     return @base[i]
 
 fn own_copy_binding(dst: *OwnBinding, src: *OwnBinding)
@@ -564,6 +556,20 @@ fn own_emit_own_drop(s: *EmitterState, ptr: i32, name: *u8, len: i32)
     emit_str(s, c")\n")
     add_method_extern(s, name, len, c"drop", 4)
 
+# A pointer to field `idx` of the struct `st` at `ptr`.
+fn own_field_gep(s: *EmitterState, ptr: i32, st: *StructDef, idx: i32) -> i32
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = getelementptr %")
+    emit_name(s, st.name, st.name_len)
+    emit_str(s, c", ptr ")
+    emit_reg(s, ptr)
+    emit_str(s, c", i32 0, i32 ")
+    emit_int(s, idx as i64)
+    emit_str(s, c"\n")
+    r
+
 # Drop the value of type `name` at `ptr`: its own drop, then its move-only
 # struct fields in declaration order, or an enum's payload.
 fn own_emit_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, depth: i32)
@@ -583,9 +589,7 @@ fn own_emit_glue(s: *EmitterState, ptr: i32, name: *u8, len: i32, depth: i32)
     var f: *StructField = st.fields
     while f != null
         if own_field_move_only(s, f, 0) == 1
-            var r: MemberPtrResult
-            emit_member_gep_from_ptr(s, @r, ptr, st, idx, f)
-            own_emit_field_glue(s, r.reg, f, depth + 1)
+            own_emit_field_glue(s, own_field_gep(s, ptr, st, idx), f, depth + 1)
         idx += 1
         f = f.next
 
@@ -650,12 +654,11 @@ fn own_emit_masked_glue(s: *EmitterState, ptr: i32, b: *OwnBinding, path: i32, m
                 emit_label(s, next)
                 emit_str(s, c"\n")
                 begin_block(s, do_label)
-            var r: MemberPtrResult
-            emit_member_gep_from_ptr(s, @r, ptr, st, idx, f)
+            let fp: i32 = own_field_gep(s, ptr, st, idx)
             if part >= 0 and own_has_parts(b, part) == 1
-                own_emit_masked_glue(s, r.reg, b, part, mask)
+                own_emit_masked_glue(s, fp, b, part, mask)
             else
-                own_emit_field_glue(s, r.reg, f, 1)
+                own_emit_field_glue(s, fp, f, 1)
             if next >= 0
                 own_case_end(s, next)
         idx += 1
@@ -988,12 +991,11 @@ fn own_grow_live(o: *OwnState)
     o.live = realloc(o.live as *u8, (cap as i64) * sizeof(OwnBinding)) as *OwnBinding
     o.live_cap = cap
 
-fn own_grow_all(o: *OwnState)
-    if o.all_count < o.all_cap
-        return
-    let cap: i32 = o.all_cap * 2
-    o.all = realloc(o.all as *u8, (cap as i64) * sizeof(OwnBinding)) as *OwnBinding
-    o.all_cap = cap
+# AGAST #3508: the next binding's / temporary's OwnBinding.seq.
+fn own_next_seq(o: *OwnState) -> i32
+    let q: i32 = o.seq_next
+    o.seq_next = q + 1
+    q
 
 pub fn own_push_scope(s: *EmitterState)
     let o: *OwnState = s.own
@@ -1046,7 +1048,6 @@ pub fn own_pop_scope(s: *EmitterState) -> i32
     if dead == 0
         own_unwind(s, start, dstart)   # drops and deferred statements (#1625)
     o.defer_count = dstart
-    s.defer_live = dstart
     o.live_count = start
     o.scope_count = o.scope_count - 1
     dead
@@ -1220,11 +1221,8 @@ fn own_push_temp(s: *EmitterState, slot: i32, name: *u8, len: i32, count: i32)
     b.path_count = 0
     b.fmask = 0
     b.aux = 0
+    b.seq = own_next_seq(o)
     o.temp_count = o.temp_count + 1
-    # In `all` too, so a `ret` before its drop (a `return`'s value) drops it.
-    own_grow_all(o)
-    own_copy_binding(own_all_at(o, o.all_count), b)
-    o.all_count = o.all_count + 1
     own_store_flag(s, b, 1)
 
 # Drop temps[from..] (newest first) and forget them.
@@ -1502,10 +1500,8 @@ fn own_register(s: *EmitterState, idx: i32, owned: i32)
     b.path_count = path_count
     b.fmask = fmask
     b.aux = 0
+    b.seq = own_next_seq(o)
     o.live_count = o.live_count + 1
-    own_grow_all(o)
-    own_copy_binding(own_all_at(o, o.all_count), b)
-    o.all_count = o.all_count + 1
     own_store_flag(s, b, owned)
     own_clear_mask(s, b)
 
@@ -1515,7 +1511,7 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     let o: *OwnState = s.own
     o.live_count = 0
     o.scope_count = 0
-    o.all_count = 0
+    o.seq_next = 0
     o.loop_base = -1
     o.ret_seq = 0
     o.temp_expr_count = 0
@@ -1526,7 +1522,6 @@ pub fn own_begin_fn(s: *EmitterState, params: *Param)
     o.match_scrut = 0 - 1
     o.defer_count = 0
     o.in_ret = 0
-    s.defer_live = 0
     own_push_scope(s)
     var p: *Param = params
     while p != null
@@ -2299,10 +2294,9 @@ fn own_field_ptr(s: *EmitterState, base: i32, tname: *u8, tlen: i32, fname: *u8,
     if idx < 0
         return 0
     let f: *StructField = get_field_type(st, idx)
-    var r: MemberPtrResult
-    emit_member_gep_from_ptr(s, @r, base, st, idx, f)
+    let r: i32 = own_field_gep(s, base, st, idx)
     *out_f = f
-    r.reg
+    r
 
 # A member path `x.f...` rooted at a single-value binding x (*out_b): a
 # pointer to its field (*out_f), or 0.
@@ -2510,12 +2504,9 @@ pub fn own_match_begin(s: *EmitterState, e: *Expr, slot: i32, name: *u8, len: i3
     b.path_count = 0
     b.fmask = 0
     b.aux = 0
+    b.seq = own_next_seq(o)
     o.match_scrut = o.live_count
     o.live_count = o.live_count + 1
-    # In `all` too, so a `return` in an arm drops it.
-    own_grow_all(o)
-    own_copy_binding(own_all_at(o, o.all_count), b)
-    o.all_count = o.all_count + 1
     own_store_flag(s, b, 1)
     old
 
@@ -2544,44 +2535,71 @@ pub fn own_match_end(s: *EmitterState, old: i32)
     o.match_scrut = old
 
 # =============================================================================
-# End of fn: zero the flags in the entry block, drop before every `ret`
+# Before every `ret`: drop what is live (AGAST #3508)
 # =============================================================================
+#
+# emit_str calls own_before_ret as a `ret` starts.  Every binding and
+# temporary still live there drops, newest first by OwnBinding.seq; a
+# binding whose block already ended was dropped there (or moved), and one
+# declared later isn't reached, so neither is in `live`.  These are the
+# drops own_end_fn inserted before every `ret` of the finished body until
+# #3508, for every binding of the fn; the ones it no longer emits found a
+# cleared flag (or one zeroed in the entry block, which no flag needs now).
 
+# `if flag { flag = 0; glue(b) }` before a `ret`.  Its blocks are named
+# `own.d<n>` / `own.n<n>`, not by next_label, as when own_end_fn emitted them:
+# nothing follows a `ret` in its block, so they need not be the current one.
+fn own_emit_ret_drop(s: *EmitterState, b: *OwnBinding)
+    let o: *OwnState = s.own
+    let seq: i32 = o.ret_seq
+    o.ret_seq = o.ret_seq + 1
+    let f: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, f)
+    emit_str(s, c" = load i1, ptr ")
+    emit_reg(s, b.flag)
+    emit_str(s, c"\n  br i1 ")
+    emit_reg(s, f)
+    emit_str(s, c", label %own.d")
+    emit_int(s, seq as i64)
+    emit_str(s, c", label %own.n")
+    emit_int(s, seq as i64)
+    emit_str(s, c"\nown.d")
+    emit_int(s, seq as i64)
+    emit_str(s, c":\n")
+    emit_str(s, c"  store i1 0, ptr ")
+    emit_reg(s, b.flag)
+    emit_str(s, c"\n")
+    own_emit_binding_glue(s, b, b.slot, own_load_mask(s, b))
+    emit_str(s, c"  br label %own.n")
+    emit_int(s, seq as i64)
+    emit_str(s, c"\nown.n")
+    emit_int(s, seq as i64)
+    emit_str(s, c":\n")
+
+# The live bindings and temporaries, newest first.
 fn own_emit_ret_drops(s: *EmitterState)
     let o: *OwnState = s.own
-    var i: i32 = o.all_count - 1
-    while i >= 0
-        let b: *OwnBinding = own_all_at(o, i)
-        let seq: i32 = o.ret_seq
-        o.ret_seq = o.ret_seq + 1
-        let f: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, f)
-        emit_str(s, c" = load i1, ptr ")
-        emit_reg(s, b.flag)
-        emit_str(s, c"\n  br i1 ")
-        emit_reg(s, f)
-        emit_str(s, c", label %own.d")
-        emit_int(s, seq as i64)
-        emit_str(s, c", label %own.n")
-        emit_int(s, seq as i64)
-        emit_str(s, c"\nown.d")
-        emit_int(s, seq as i64)
-        emit_str(s, c":\n")
-        emit_str(s, c"  store i1 0, ptr ")
-        emit_reg(s, b.flag)
-        emit_str(s, c"\n")
-        own_emit_binding_glue(s, b, b.slot, own_load_mask(s, b))
-        emit_str(s, c"  br label %own.n")
-        emit_int(s, seq as i64)
-        emit_str(s, c"\nown.n")
-        emit_int(s, seq as i64)
-        emit_str(s, c":\n")
-        i -= 1
+    var i: i32 = o.live_count - 1
+    var t: i32 = o.temp_count - 1
+    while i >= 0 or t >= 0
+        var take_temp: i32 = 0
+        if i < 0
+            take_temp = 1
+        else if t >= 0
+            let lb: *OwnBinding = own_live_at(o, i)
+            let tb: *OwnBinding = own_temp_at(o, t)
+            if tb.seq > lb.seq
+                take_temp = 1
+        if take_temp == 1
+            own_emit_ret_drop(s, own_temp_at(o, t))
+            t -= 1
+        else
+            own_emit_ret_drop(s, own_live_at(o, i))
+            i -= 1
 
-# Called once the body is complete, before hoist_entry_allocas (which then
-# moves the flag allocas above the zeroing stores).
-pub fn own_end_fn(s: *EmitterState, body_start: i64)
+# The body is complete: forget the fn.
+pub fn own_end_fn(s: *EmitterState)
     let o: *OwnState = s.own
     o.scope_count = 0
     o.live_count = 0
@@ -2591,29 +2609,7 @@ pub fn own_end_fn(s: *EmitterState, body_start: i64)
     o.temp_last_reg = 0   # registers restart per function
     o.loop_depth = 0
     o.defer_count = 0
-    s.defer_live = 0
-    if o.all_count == 0
-        return
-    let n: i64 = s.out.len - body_start
-    if n <= 0
-        return
-    let base: *u8 = malloc(n)
-    memcpy(base, s.out.data + body_start, n)
-    let end: *u8 = base + n
-    s.out.len = body_start
-    var i: i32 = 0
-    while i < o.all_count
-        own_store_flag(s, own_all_at(o, i), 0)
-        i += 1
-    var p: *u8 = base
-    while p < end
-        let ll: i64 = ll_line_len(p, end)
-        if ll_starts_with(p, ll, c"  ret ") == 1 or ll_starts_with(p, ll, c"  ret\n") == 1
-            own_emit_ret_drops(s)
-        vec_push_bytes<u8>(s.out, p, ll)
-        p = p + ll
-    free(base)
-    o.all_count = 0
+    o.seq_next = 0
 
 # =============================================================================
 # `defer` (LANGUAGE_SPEC §13.7, LARB R14, AGAST #1625)
@@ -2655,9 +2651,11 @@ fn own_run_defer(s: *EmitterState, j: i32)
     let saved_ctx: *u8 = s.ctx_enum_name
     let saved_ctx_len: i32 = s.ctx_enum_name_len
     own_push_scope(s)
+    # emit_stmt, through EmitterState (AGAST #3508: no emitter_stmt import).
+    let run: fn(*EmitterState, *Stmt, i32) = s.own_emit_stmt
     var st: *Stmt = d.while_body
     while st != null
-        emit_stmt(s, st, ret_type)
+        run(s, st, ret_type)
         st = st.next
     own_pop_scope(s)
     s.ctx_enum_name = saved_ctx
@@ -2691,25 +2689,30 @@ fn own_unwind(s: *EmitterState, from: i32, dfrom: i32)
             own_emit_drop(s, own_live_at(o, i))
             i -= 1
 
-# Called by emit_str as a `ret` starts while a `defer` is registered: every
-# block is being left, so run them all, innermost first, with the drops
-# they interleave with (own_end_fn's drops then find those flags clear).
-# What follows a `ret` is unreachable from it, so the moves don't stay.
-# The live temporaries (the `return` / `?` / tail expression's) drop first,
-# as ritz0 drops the statement's temp frames before its defers (AGAST #2810,
-# §13.6 then §13.7); their flags clear, so the `ret`'s drops skip them.
+# Called by emit_str as a `ret` starts: every block is being left.  With a
+# `defer` registered, run them all, innermost first, with the drops they
+# interleave with; the live temporaries (the `return` / `?` / tail
+# expression's) drop first, as ritz0 drops the statement's temp frames
+# before its defers (AGAST #2810, §13.6 then §13.7).  Otherwise drop what is
+# live, newest first (own_emit_ret_drops, AGAST #3508).  What follows a
+# `ret` is unreachable from it, so the moves don't stay.
 pub fn own_before_ret(s: *EmitterState)
     let o: *OwnState = s.own
-    if o.in_ret == 1 or o.defer_count == 0
+    if o.in_ret == 1
+        return
+    if o.live_count == 0 and o.temp_count == 0 and o.defer_count == 0
         return
     if own_scope_is_dead(o) == 1
         return
     o.in_ret = 1
-    var t: i32 = o.temp_count - 1
-    while t >= 0
-        own_emit_drop(s, own_temp_at(o, t))
-        t -= 1
-    own_unwind(s, 0, 0)
+    if o.defer_count == 0
+        own_emit_ret_drops(s)
+    else
+        var t: i32 = o.temp_count - 1
+        while t >= 0
+            own_emit_drop(s, own_temp_at(o, t))
+            t -= 1
+        own_unwind(s, 0, 0)
     o.in_ret = 0
 
 # A STMT_DEFER is reached: register it with the innermost block.
@@ -2725,4 +2728,3 @@ pub fn own_defer(s: *EmitterState, d: *Stmt, ret_type: i32)
     pos[o.defer_count] = o.live_count
     rets[o.defer_count] = ret_type
     o.defer_count = o.defer_count + 1
-    s.defer_live = o.defer_count

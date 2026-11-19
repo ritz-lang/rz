@@ -386,9 +386,9 @@ struct EmitterState
     # AGAST #2158 — move checking and drop insertion (ownership.ritz).
     # Allocated by own_init in emit_module.
     own: *OwnState
-    # AGAST #1625: how many `defer`s are registered (OwnState.defer_count),
-    # so emit_str can tell cheaply whether a `ret` must run them first.
-    defer_live: i32
+    # AGAST #3508: emit_stmt, for ownership.ritz to emit a deferred statement
+    # at a block's exit (own_run_defer) without importing emitter_stmt.
+    own_emit_stmt: fn(*EmitterState, *Stmt, i32)
     # AGAST #3739 — what frame_limit.ritz needs to locate a fn's allocas.
     # fm: (offset in out, span) marks, appended as emit_stmt / emit_expr
     # enter and leave; an alloca line belongs to the last mark at or before
@@ -462,6 +462,9 @@ struct OwnBinding
     # paths' mask from before the store.
     old_field: *StructField
     old_path: i32
+    # AGAST #3508: its place in the order the fn's bindings and temporaries
+    # were registered; a `ret` drops what is live newest first by it.
+    seq: i32
 
 # Per-function ownership state (ownership.ritz).
 struct OwnState
@@ -475,13 +478,11 @@ struct OwnState
     scope_dead: *i32
     scope_count: i32
     scope_cap: i32
-    # Every binding of the fn, in declaration order: the drops before `ret`.
-    all: *OwnBinding
-    all_count: i32
-    all_cap: i32
+    # The next OwnBinding.seq (AGAST #3508).
+    seq_next: i32
     # `live` index where the innermost loop body starts; -1 outside a loop.
     loop_base: i32
-    # Label counter for the drops own_end_fn inserts before each `ret`.
+    # Label counter for the drops own_before_ret emits before each `ret`.
     ret_seq: i32
     # AGAST #2165.  -1 until known, then 1 when the module has an `impl
     # Drop` at all (without one nothing is move-only).
@@ -537,13 +538,14 @@ struct OwnState
 # =============================================================================
 
 pub fn emit_str(s: *EmitterState, text: *u8)
-    # AGAST #1625: every way out of a fn is a `ret`, written from dozens of
-    # sites once the return value is computed.  A registered `defer` has to
-    # run there, after the value and before the `ret` (own_before_ret).
-    if s.defer_live > 0
-        if *text == 32
-            if emit_str_is_ret(text) == 1
-                own_before_ret(s)
+    # AGAST #1625, #3508: every way out of a fn is a `ret`, written from
+    # dozens of sites once the return value is computed.  The live owned
+    # bindings and temporaries drop, and a registered `defer` runs, there:
+    # after the value and before the `ret` (own_before_ret).  A `ret` must
+    # therefore start the string it is emitted in.
+    if *text == 32
+        if emit_str_is_ret(text) == 1
+            own_before_ret(s)
     var i: i32 = 0
     while *(text + i) != 0
         i += 1
