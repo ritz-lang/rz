@@ -68,6 +68,12 @@ _OPT = ("fn ob() -> Option<{t}>\n    Some(5)\n\n"
         "fn f() -> i32\n    match ob()\n        Some(v) => v\n        None => 0\n")
 _TAIL_LET = ("fn f(x: i32) -> i32\n    if x > 0\n        let w: {t} = {e}\n"
              "        w\n    else\n        0\n")
+# A store the user wrote in the lowered poll's spelling, `(*self).__result = v`
+# in a `g_poll` that is not `fn g_poll(self: *g_Future)`, is an assignment to
+# that place: ritz1 must not call it a return of `g` (AGAST #4221; ritz1 tells
+# the lowered poll by that shape alone).
+WRITTEN_POLL_RESULT = ("struct S\n    __result: i32\n\n"
+                       "fn g_poll(self: *S)\n    (*self).__result = big()\n")
 EXTRA_REJECTED = {
     "member_through_pointer":    _EXTRA_FN.format("q.x = big()"),
     "member_through_pointer_op": _EXTRA_FN.format("q.x += big()"),
@@ -77,6 +83,7 @@ EXTRA_REJECTED = {
     # An async fn's `return v` is lowered to `self.__result = v`, so both
     # compilers judge it on the assignment route at the declared type.
     "async_fn_narrow_result":    "async fn f() -> i32\n    return big()\n",
+    "written_poll_result":       WRITTEN_POLL_RESULT,
 }
 EXTRA_ACCEPTED = {
     "member_through_pointer_cast": _EXTRA_FN.format("q.x = big() as i32"),
@@ -88,17 +95,6 @@ EXTRA_ACCEPTED = {
     # not either: a nameless callee is skipped.
     "fn_pointer_field_call":       ("struct H\n    cb: fn(i32) -> i32\n\n"
                                     "fn f(h: *H) -> i32\n    h.cb(big())\n"),
-}
-
-
-# ritz0's async rows (#4166) name the fn; ritz1 still names the lowered
-# place it assigns. Same verdict and position, only the words differ.
-# AGAST #4221 drops this table.
-_RESULT_PLACE = "`self.__result` is `i32`"
-RITZ1_WORDING = {
-    "async_return": _RESULT_PLACE,
-    "async_tail": _RESULT_PLACE,
-    "async_return_after_await": _RESULT_PLACE,
 }
 
 
@@ -124,10 +120,13 @@ def _rows():
 
     rows = [(f"rejected[{n}]", b, rejects) for n, b in sorted(SLOTS.REJECTED.items())]
     rows += [(f"accepted[{n}]", b, accepts) for n, b in sorted(SLOTS.ACCEPTED.items())]
-    rows += [(f"diagnostic[{n}]", body, at(line, col, RITZ1_WORDING.get(n, slot)))
+    rows += [(f"diagnostic[{n}]", body, at(line, col, slot))
              for n, (body, line, col, slot) in sorted(SLOTS.DIAGNOSTICS.items())]
     rows += [(f"extra_rejected[{n}]", b, rejects) for n, b in sorted(EXTRA_REJECTED.items())]
     rows += [(f"extra_accepted[{n}]", b, accepts) for n, b in sorted(EXTRA_ACCEPTED.items())]
+    rows.append(("written_poll_result_is_a_place", WRITTEN_POLL_RESULT,
+                 lambda r, _w: None if _rejected(r) and "`g` returns" not in r.stderr
+                 else "did not reject it as an assignment to its place"))
     return [row for row in rows if row[0] not in RITZ1_PENDING]
 
 

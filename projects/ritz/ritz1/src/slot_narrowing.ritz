@@ -22,7 +22,8 @@
 #   * a `return v` or a fn's tail value, at the return type.  A procedure's
 #     tail is discarded, so it is not checked (as in ritz0).  An async fn's
 #     `return v` is lowered to `self.__result = v` before sema, so the
-#     assignment route judges it at the declared type, as ritz0 does.
+#     assignment route judges it at the declared type, and words it as a
+#     return of the async fn ("`f` returns"), as ritz0 does (sn_async_result).
 #
 # ritz0/test_implicit_narrowing_slots.py is the specification, and
 # ritz0/test_ritz1_implicit_narrowing_slots.py feeds its tables to ritz1.
@@ -227,7 +228,32 @@ pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
             let f: *StructField = sn_local_field(sm, pe.ident_ptr, pe.ident_len, st.assign_target, st.assign_target_len)
             if f != null
                 slot = narrow_known(f.field_type)
+            sn_async_result(sm, pe, @w)
     sn_check(sm, st.assign_value, slot, @w)
+
+# An async fn's `return v` and tail, lowered (async_lower.ritz al_poll_ready)
+# to `self.__result = v` in `fn <f>_poll(self: *<f>_Future) -> bool`, are
+# returns of `f`: report them as ritz0 does, "`f` returns `i32`" (AGAST
+# #4221), not as the lowered place the user never wrote.  The slot stays the
+# field's type, which is `f`'s declared return type.
+#
+# The lowering sets no flag on the poll (and clears is_async), so it is known
+# by its shape: a written `(*self).__result = v` takes this route too, and
+# keeps its place wording unless its fn is `<f>_poll(self: *<f>_Future)`.
+fn sn_async_result(sm: *Sema, pe: *Expr, w: *SlotWords)
+    if name_eq(pe.ident_ptr, pe.ident_len, c"self", 4) == 0 or name_eq(w.name, w.name_len, c"__result", 8) == 0
+        return
+    let f: *FnDef = sm.cur_fn
+    if f == null or f.params == null or f.name_len <= 5
+        return
+    let fl: i32 = f.name_len - 5   # `<f>_poll` less its `_poll`
+    if name_eq(f.name + fl as i64, 5, c"_poll", 5) == 0
+        return
+    let tn: *u8 = f.params.param_type_name
+    if f.params.param_type_name_len != fl + 7 or name_eq(tn, fl, f.name, fl) == 0
+        return
+    if name_eq(tn + fl as i64, 7, c"_Future", 7) == 1
+        sn_words(w, SN_RETURN, f.name, fl)
 
 # =============================================================================
 # Call arguments
