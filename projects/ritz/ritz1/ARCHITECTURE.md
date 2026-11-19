@@ -270,9 +270,9 @@ still run mid-lowering on `*EmitterState`, and
   miscompiled.
 
 - `slot_narrowing` — the same rule at an assignment, a call argument, a
-  `return` and a fn's tail value (§7.5, #4081), on Sema, at the slots
-  literal_slot visits; a tail is judged where the walk reaches it, with its
-  block's `let`s and its arm's bindings in scope.
+  `return`, a fn's tail value (§7.5, #4081) and a struct literal field
+  (#4218), on Sema, at the slots literal_slot visits; a tail is judged where
+  the walk reaches it, with its block's `let`s and its arm's bindings in scope.
 
 - `struct_variants` — same-named structs (§15.3, §17.2, #4111): the parser
   notes every struct, `[[target_os]]`-filtered or not, with its target and a

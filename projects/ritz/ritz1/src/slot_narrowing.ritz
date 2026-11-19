@@ -1,7 +1,7 @@
 # ritz1/src/slot_narrowing.ritz - implicit narrowing at an assignment, a call
-# argument and a return
+# argument, a return and a struct literal field
 #
-# AGAST #4081, ritz1's half of #1444 (LANGUAGE_SPEC §7.5).
+# AGAST #4081 and #4218, ritz1's halves of #1444 and #4157 (LANGUAGE_SPEC §7.5).
 #
 #     fn big() -> i64
 #         return 4294967301
@@ -9,6 +9,7 @@
 #         return big()            # error: write `big() as i32`
 #     n = big()                   # error, n: i32
 #     take(big())                 # error, take(v: i32)
+#     P { x: big() }              # error, P.x: i32
 #
 # A `let` / `var` initialiser has been held to §7.5 since #1446
 # (narrowing.ritz's check_implicit_narrowing).  This checks the same rule,
@@ -19,6 +20,7 @@
 #   * an assignment `place = v` / `place op= v`, at the place's type;
 #   * a call argument, at its parameter's type (a fn, a fn pointer, an
 #     extern, a static or an instance method);
+#   * a struct literal's field initialiser `S { f: v }`, at the field's type;
 #   * a `return v` or a fn's tail value, at the return type.  A procedure's
 #     tail is discarded, so it is not checked (as in ritz0).  An async fn's
 #     `return v` is lowered to `self.__result = v` before sema, so the
@@ -52,14 +54,16 @@ import bool_check
 const SN_PLACE: i32 = 1
 const SN_ARG: i32 = 2
 const SN_RETURN: i32 = 3
+const SN_FIELD: i32 = 4
 
 struct SlotWords
     kind: i32
     # SN_PLACE: the place (`p.x`, `a[..]`, `*p`), or null for "the place
-    # assigned"; SN_ARG: the callee; SN_RETURN: the fn.
+    # assigned"; SN_ARG: the callee; SN_RETURN: the fn; SN_FIELD: the field.
     name: *u8
     name_len: i32
-    # SN_PLACE: `name` is a field of `base` (`base.name`); SN_ARG: the index.
+    # SN_PLACE: `name` is a field of `base` (`base.name`); SN_FIELD: the
+    # struct; SN_ARG: the index.
     base: *u8
     base_len: i32
     shape: i32       # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`
@@ -82,6 +86,13 @@ fn sn_print_slot(w: *SlotWords)
         eprint_i64((w.index + 1) as i64)
         eprints_cstr(c" of `")
         sn_print(w.name, w.name_len)
+        eprints_cstr(c"` is `")
+        return
+    if w.kind == SN_FIELD
+        eprints_cstr(c"field `")
+        sn_print(w.name, w.name_len)
+        eprints_cstr(c"` of `")
+        sn_print(w.base, w.base_len)
         eprints_cstr(c"` is `")
         return
     if w.kind == SN_RETURN
@@ -302,6 +313,31 @@ pub fn slot_narrowing_method(sm: *Sema, e: *Expr)
         sn_args(sm, fd.params.next, e.args, e.ident_ptr, e.ident_len)
     else
         sn_args(sm, fd.params, e.args, e.ident_ptr, e.ident_len)
+
+# =============================================================================
+# Struct literal field
+# =============================================================================
+
+# `S { f: v, .. }`: each value lands in its field (ritz0's
+# _emit_struct_lit_field, #4157).  A nested literal is its own EXPR_STRUCT_LIT,
+# judged when the walk reaches it.  A generic struct's `T` field is no
+# integer type, so it is never refused.
+pub fn slot_narrowing_struct_lit(sm: *Sema, e: *Expr)
+    let st: *StructDef = sema_find_struct(sm, e.ident_ptr, e.ident_len)
+    if st == null
+        return
+    var w: SlotWords
+    sn_words(@w, SN_FIELD, null, 0)
+    w.base = st.name
+    w.base_len = st.name_len
+    var fi: *FieldInit = e.args as *FieldInit
+    while fi != null
+        let idx: i32 = find_field_index(st, fi.name, fi.name_len)
+        if idx >= 0
+            w.name = fi.name
+            w.name_len = fi.name_len
+            sn_check(sm, fi.value, narrow_known(get_field_type(st, idx).field_type), @w)
+        fi = fi.next
 
 # =============================================================================
 # Return and fn tail

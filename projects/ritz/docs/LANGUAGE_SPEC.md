@@ -2917,13 +2917,12 @@ let k: i64 = 300
 let a: [2]u8 = [1, k]
 ```
 
-ritz0 and ritz1 both enforce this rule at every slot above but one: ritz1
-still narrows silently into a struct literal field (ritz0 since AGAST #4157)
-until AGAST #4218. `ritz0/test_ritz1_implicit_narrowing.py` checks that they
+ritz0 and ritz1 both enforce this rule at every slot above (a struct literal
+field since AGAST #4157 / #4218). `ritz0/test_ritz1_implicit_narrowing.py` checks that they
 give the same verdict on every case in `ritz0/test_implicit_narrowing.py` (a
 `let`/`var` initialiser), and `ritz0/test_ritz1_implicit_narrowing_slots.py`
 does the same for `ritz0/test_implicit_narrowing_slots.py` (an assignment, an
-argument and a `return`, AGAST #1444 / #4081). ritz1 infers the value's type from its
+argument, a `return` and a struct literal field, AGAST #1444 / #4081 / #4218). ritz1 infers the value's type from its
 Ritz types. Where that inference is unsure, for example for an unannotated
 local, ritz1 accepts the value rather than guess (#1364).
 

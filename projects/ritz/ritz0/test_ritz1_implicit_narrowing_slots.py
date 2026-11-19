@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""ritz1 rejects implicit narrowing at an assignment, a call argument and a
-return exactly where ritz0 does (AGAST #4081, ritz1's half of #1444).
+"""ritz1 rejects implicit narrowing at an assignment, a call argument, a
+return and a struct literal field exactly where ritz0 does (AGAST #4081 and
+#4218, ritz1's halves of #1444 and #4157).
 
 #1444 held `n = big()`, `take(big())` and `return big()` to LANGUAGE_SPEC §7.5's
 let/var rule in ritz0; ritz1 (slot_narrowing.ritz) now does too. This feeds
@@ -114,14 +115,6 @@ EXTRA_ACCEPTED = {
 }
 
 
-# ritz1 still narrows silently into a struct literal field (#4157 is ritz0's
-# half). AGAST #4218 drops this set.
-RITZ1_PENDING = {
-    "rejected[field_value_lit]", "rejected[field_in_place_lit]",
-    "rejected[field_unsigned_slot]", "diagnostic[field_init]",
-}
-
-
 def _rows():
     """(id, body, check): check(r, work) is None or what went wrong."""
     def rejects(r, _work):
@@ -143,7 +136,7 @@ def _rows():
     rows.append(("written_poll_result_is_a_place", WRITTEN_POLL_RESULT,
                  lambda r, _w: None if _rejected(r) and "`g` returns" not in r.stderr
                  else "did not reject it as an assignment to its place"))
-    return [row for row in rows if row[0] not in RITZ1_PENDING]
+    return rows
 
 
 def _ritz0_disagrees(tmp_path):
