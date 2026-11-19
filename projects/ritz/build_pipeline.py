@@ -978,11 +978,17 @@ class Target:
     `stack_protector` passes the compiler's --stack-protector (AGAST #2590):
     the IR gets `sspstrong`, so the binary must define `__stack_chk_guard`
     and `__stack_chk_fail`.
+    `no_red_zone` passes the compiler's --no-red-zone (AGAST #4308): the IR
+    gets `noredzone`. The `-mno-red-zone` in `clang_flags` is a frontend
+    flag that does nothing for .ll input, and the compiler is never given
+    the [[bin]]'s triple, so without this harland's functions used the red
+    zone.
     """
     freestanding: bool = False
     clang_flags: Tuple[str, ...] = ()
     target_os: str = ""
     stack_protector: bool = False
+    no_red_zone: bool = False
 
     @property
     def obj_flags(self) -> List[str]:
@@ -995,13 +1001,18 @@ class Target:
     def key_flags(self) -> Optional[dict]:
         """cas_module_key's `object_flags`: None for the hosted defaults.
         Unchanged from AGAST #1896, so existing store entries stay valid;
-        `stack_protector` appears only when set, for the same reason."""
+        `stack_protector` and `no_red_zone` appear only when set, for the
+        same reason. (`no_red_zone` must be in the key even though
+        `-mno-red-zone` already is: entries stored before #4308 hold
+        red-zone objects under the key that flag alone produces.)"""
         if not self.freestanding:
             return None
         flags = {"freestanding": True, "target_os": self.target_os,
                  "clang": list(self.clang_flags)}
         if self.stack_protector:
             flags["stack_protector"] = True
+        if self.no_red_zone:
+            flags["no_red_zone"] = True
         return flags
 
     def compiler_args(self) -> List[str]:
@@ -1009,6 +1020,8 @@ class Target:
         args = ["--target-os", self.target_os] if self.target_os else []
         if self.stack_protector:
             args.append("--stack-protector")
+        if self.no_red_zone:
+            args.append("--no-red-zone")
         return args
 
 
@@ -1652,7 +1665,8 @@ def freestanding_target(bin_config: BinaryConfig) -> Target:
             clang_flags.append("-mno-red-zone")
     return Target(freestanding=True, clang_flags=tuple(clang_flags),
                   target_os=bin_config.target_os or "",
-                  stack_protector=bool(bin_config.stack_protector))
+                  stack_protector=bool(bin_config.stack_protector),
+                  no_red_zone=bool(bin_config.no_red_zone))
 
 
 _INCBIN = re.compile(r'\.incbin\s+"([^"]+)"')

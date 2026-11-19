@@ -3791,6 +3791,11 @@ var g_emit_stack_protector: i32 = 0
 pub fn emitter_set_stack_protector(on: i32)
     g_emit_stack_protector = on
 
+# `--no-red-zone` (AGAST #4308): emit_fn_attrs adds LLVM's noredzone, as
+# every hand-written helper define does (emitter_core's emit_no_red_zone_attr).
+pub fn emitter_set_no_red_zone(on: i32)
+    set_no_red_zone_attr(on)
+
 # The attributes every non-naked Ritz fn's `define` carries.
 #
 # alignstack(16) ensures proper 16-byte stack alignment for SIMD instructions
@@ -3808,10 +3813,15 @@ pub fn emitter_set_stack_protector(on: i32)
 # same reason: clang's -fstack-protector-strong is a frontend flag.  On a
 # `*-none-*` target LLVM reads the canary from the global __stack_chk_guard,
 # so the program (harland) defines it and __stack_chk_fail.
+#
+# noredzone (--no-red-zone, AGAST #4308), likewise for -mno-red-zone: in
+# ring 0 an interrupt on the current stack clobbers the 128 bytes below
+# %rsp that a leaf fn would otherwise keep its locals in.
 fn emit_fn_attrs(s: *EmitterState)
     emit_str(s, c") alignstack(16) \"no-builtins\"")
     if g_emit_stack_protector == 1
         emit_str(s, c" sspstrong")
+    emit_no_red_zone_attr(s)
 
 pub fn emitter_set_test_mode(on: i32)
     g_emit_test_table = on
@@ -3902,15 +3912,21 @@ fn module_has_local_fn(s: *EmitterState, name: *u8, len: i32) -> i32
 # write 1, exit 60.
 fn emit_platform_hooks(s: *EmitterState)
     if module_has_local_fn(s, c"ritz_platform_page_map", 22) == 0
-        emit_str(s, c"define weak ptr @ritz_platform_page_map(i64 %len) {\nentry:\n")
+        emit_str(s, c"define weak ptr @ritz_platform_page_map(i64 %len)")
+        emit_no_red_zone_attr(s)
+        emit_str(s, c" {\nentry:\n")
         emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},~{rcx},~{r11},~{memory}\"(i64 9, i64 0, i64 %len, i64 3, i64 34, i64 -1, i64 0)\n")
         emit_str(s, c"  %p = inttoptr i64 %r to ptr\n  ret ptr %p\n}\n")
     if module_has_local_fn(s, c"ritz_platform_page_unmap", 24) == 0
-        emit_str(s, c"define weak i32 @ritz_platform_page_unmap(ptr %p, i64 %len) {\nentry:\n  %a = ptrtoint ptr %p to i64\n")
+        emit_str(s, c"define weak i32 @ritz_platform_page_unmap(ptr %p, i64 %len)")
+        emit_no_red_zone_attr(s)
+        emit_str(s, c" {\nentry:\n  %a = ptrtoint ptr %p to i64\n")
         emit_str(s, c"  %r = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},~{rcx},~{r11},~{memory}\"(i64 11, i64 %a, i64 %len)\n")
         emit_str(s, c"  %t = trunc i64 %r to i32\n  ret i32 %t\n}\n")
     if module_has_local_fn(s, c"ritz_platform_fatal", 19) == 0
-        emit_str(s, c"define weak void @ritz_platform_fatal(ptr %msg, i64 %len, i32 %status) {\nentry:\n  %nl = alloca i8\n  store i8 10, ptr %nl\n")
+        emit_str(s, c"define weak void @ritz_platform_fatal(ptr %msg, i64 %len, i32 %status)")
+        emit_no_red_zone_attr(s)
+        emit_str(s, c" {\nentry:\n  %nl = alloca i8\n  store i8 10, ptr %nl\n")
         emit_str(s, c"  %m = ptrtoint ptr %msg to i64\n  %n = ptrtoint ptr %nl to i64\n  %st = sext i32 %status to i64\n")
         emit_str(s, c"  %w1 = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %m, i64 %len)\n")
         emit_str(s, c"  %w2 = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, i64 %n, i64 1)\n")
@@ -3953,7 +3969,9 @@ fn emit_test_table(s: *EmitterState)
         if bits != 32
             emit_str(s, c"define internal i32 @__ritz_test_run.")
             emit_int(s, i)
-            emit_str(s, c"() {\nentry:\n")
+            emit_str(s, c"()")
+            emit_no_red_zone_attr(s)
+            emit_str(s, c" {\nentry:\n")
             if bits == 0
                 emit_str(s, c"  call void @")
                 emit_name(s, f.name, f.name_len)

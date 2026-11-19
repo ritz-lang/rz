@@ -197,6 +197,9 @@ def tree(tmp_path):
     tools.mkdir(parents=True)
     shutil.copy(REPO / BOOT_SCRIPT, tools / "test_tier1_boot.sh")
     (tools / "mkinitramfs.py").write_text(MKINITRAMFS_STUB)
+    # The fake harland.elf is not a real binary: the red-zone check (AGAST
+    # #4308) passes unless a test says otherwise.
+    (tools / "check_no_red_zone.py").write_text("import sys\nsys.exit(0)\n")
     for rel in (
         "projects/harland/build/debug/harland.elf",
         "projects/harland/build/debug/BOOTX64.EFI",
@@ -480,6 +483,18 @@ def test_build_failure_is_a_failure(tree):
     r = _run(tree, PASSED, env_extra={"SKIP_BUILD": "0"})
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL: build of harland failed" in r.stdout
+
+
+@pytest.mark.integration
+def test_red_zone_use_fails_before_booting(tree):
+    """AGAST #4308: the kernel is checked for red-zone use, and a kernel
+    that uses it fails the boot test."""
+    (tree["root"] / "projects/harland/tools/check_no_red_zone.py").write_text(
+        "import sys\nprint('FAIL: uses the red zone')\nsys.exit(1)\n")
+    r = _run(tree, PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: uses the red zone" in r.stdout
+    assert "ALL TESTS PASSED" not in r.stdout
 
 
 @pytest.mark.integration

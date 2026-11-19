@@ -941,6 +941,8 @@ class LLVMEmitter:
         self.is_freestanding = target.endswith('-none-elf') or '-none-' in target
         # --stack-protector (AGAST #2590); see _add_stack_protector.
         self.stack_protector = False
+        # --no-red-zone (AGAST #4308); see _add_no_red_zone.
+        self.no_red_zone = False
 
         # LLVM types - integers
         self.i8 = ir.IntType(8)
@@ -3606,6 +3608,8 @@ class LLVMEmitter:
 
         if self.stack_protector:
             self._add_stack_protector()
+        if self.no_red_zone or self.is_freestanding:
+            self._add_no_red_zone()
 
         # Generate IR string
         ir_str = str(self.module)
@@ -3644,6 +3648,24 @@ class LLVMEmitter:
             if fn.is_declaration or 'naked' in fn.attributes:
                 continue
             fn.attributes.add('sspstrong')
+
+    def _add_no_red_zone(self) -> None:
+        """Give every function this module defines LLVM's `noredzone`
+        (--no-red-zone or a freestanding --target, AGAST #4308).
+
+        Without it a leaf function keeps locals in the 128 bytes below %rsp.
+        In ring 0 an interrupt taken on the current stack (IST 0) pushes its
+        frame there and clobbers them.  It has to be in the IR: clang's
+        -mno-red-zone is a frontend flag that has no effect on .ll input, and
+        build.py never passes ritz0 the [[bin]]'s triple.
+
+        Every defined function, synthesized ones (_start, the test main,
+        async lowerings) included, not just the ones _declare_function
+        marks for a freestanding triple.
+        """
+        for fn in self.module.functions:
+            if not fn.is_declaration:
+                fn.attributes.add('noredzone')
 
     def _drop_dead_large_loads(self) -> None:
         """Delete every unused `load %T` of a type at the sret threshold.
@@ -3712,14 +3734,26 @@ class LLVMEmitter:
         # The pattern must:
         # 1. Start at line beginning with 'define'
         # 2. Have @"funcname"(...) format
-        # 3. Not already have alignstack
-        # We use negative lookbehind to skip if alignstack already present
-        # Pattern: start of line, define, type, @"name"(...), optional space, !dbg or {
+        # 3. Not already have alignstack (add_attrs skips adding a second)
+        # Pattern: start of line, define, type, @"name"(...), attrs, !dbg or {
         # The parameter list may itself contain parens: `sret(%T)` (#1736).
+        # Group 2 is the bare attributes llvmlite prints there (sspstrong,
+        # noredzone, noinline, ...). AGAST #4308: the pattern used to need
+        # `)` directly before `{`/`!dbg`, so any such attribute made the
+        # define silently miss both of ours; with --stack-protector that was
+        # every function in harland.
         pattern = (r'^(define [^\n]+@"[^"]+"' + _IR_PARAMS
-                   + r')(?! alignstack)(\s*)(!dbg|\{)')
-        replacement = r'\1 alignstack(16) "no-builtins"\2\3'
-        ir_str = re.sub(pattern, replacement, ir_str, flags=re.MULTILINE)
+                   + r')((?: [a-z][a-z0-9_]*(?:\(\d+\))?)*)(\s*)(!dbg|\{)')
+
+        def add_attrs(m: 're.Match') -> str:
+            attrs = m.group(2).split()
+            if 'naked' in attrs:
+                return m.group(0)
+            extra = '' if any(a.startswith('alignstack') for a in attrs) \
+                else ' alignstack(16)'
+            return f'{m.group(1)}{m.group(2)}{extra} "no-builtins"{m.group(3)}{m.group(4)}'
+
+        ir_str = re.sub(pattern, add_attrs, ir_str, flags=re.MULTILINE)
 
         # "no-builtins" on declarations too (AGAST #1917). The attribute on
         # definitions only covers what a function's body may become; LLVM's
@@ -18810,7 +18844,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
          target: str = 'x86_64-unknown-linux-gnu',
          target_os: str = 'linux',
          fn_cache_data: Optional[Dict] = None,
-         stack_protector: bool = False) -> Union[str, Tuple[str, Dict[str, str]]]:
+         stack_protector: bool = False,
+         no_red_zone: bool = False) -> Union[str, Tuple[str, Dict[str, str]]]:
     """Emit a monomorphised, instance-checked module to LLVM IR.
 
     `module` is what ritz0.PASSES' _monomorph and _check_instances leave
@@ -18831,6 +18866,8 @@ def emit(module: rast.Module, no_runtime: bool = False,
         target_os: Target OS for conditional compilation (default: linux)
         stack_protector: If True, every defined function except a [[naked]]
                          one gets LLVM's sspstrong (AGAST #2590).
+        no_red_zone: If True, every defined function gets LLVM's noredzone
+                     (AGAST #4308), as a freestanding `target` already does.
         fn_cache_data: Per-function cache data from .ritz.sig (optional).
                        When provided, enables per-fn IR reuse. Functions with
                        matching token hashes will use cached IR instead of
@@ -18855,6 +18892,7 @@ def emit(module: rast.Module, no_runtime: bool = False,
     emitter.no_runtime = no_runtime
     emitter.test_mode = test_mode
     emitter.stack_protector = stack_protector
+    emitter.no_red_zone = no_red_zone
     emitter.generic_fn_names = generics.fn_names
     emitter.generic_method_names = generics.method_names
 

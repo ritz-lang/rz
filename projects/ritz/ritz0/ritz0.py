@@ -58,13 +58,13 @@ import ritz_ast as rast
 
 def _compile_mode(no_runtime, check_names, check_ownership,
                   dependencies, source_roots, project_root, target, target_os,
-                  test_mode, stack_protector=False) -> dict:
+                  test_mode, stack_protector=False, no_red_zone=False) -> dict:
     """Every compile_file input, besides the sources themselves, that shapes
     the output or whether the compile succeeds (AGAST #2020).
 
     The source-level fast path may only reuse an output built under the same
     mode.  Covered: the emit flags (no_runtime, test_mode, target, target_os,
-    stack_protector);
+    stack_protector, no_red_zone);
     the import roots, which decide WHICH file an import resolves to (the
     import hashes only vouch for the files the last compile resolved), as
     ImportResolver resolves them; and the checks, since a skip would stand in
@@ -88,6 +88,8 @@ def _compile_mode(no_runtime, check_names, check_ownership,
         'target': target,
         'target_os': target_os,
         'stack_protector': bool(stack_protector),
+        # Only when set: every existing mode key stays valid (AGAST #4308).
+        **({'no_red_zone': True} if no_red_zone else {}),
         'check_names': bool(check_names),
         'check_ownership': bool(check_ownership),
         'project_root': str(root) if root else None,
@@ -143,6 +145,7 @@ class _Compile:
     target_os: str = 'linux'
     test_mode: bool = False
     stack_protector: bool = False
+    no_red_zone: bool = False
     # Set up by compile_file before the passes run.
     source: str = ''
     source_abs_path: str = ''
@@ -481,7 +484,7 @@ def _emit(ctx: _Compile) -> bool:
         source_file=source_path_obj.name, source_dir=source_dir,
         main_source_path=ctx.source_abs_path,
         target=ctx.target, target_os=ctx.target_os, test_mode=ctx.test_mode,
-        stack_protector=ctx.stack_protector,
+        stack_protector=ctx.stack_protector, no_red_zone=ctx.no_red_zone,
         # Per-fn IR reuse is keyed on the source alone, so it cannot tell a
         # test-mode compile (no `main`) from a normal one: test mode always
         # emits fresh.
@@ -581,7 +584,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
                   target_os: str = 'linux', test_mode: bool = False,
-                  stack_protector: bool = False) -> bool:
+                  stack_protector: bool = False,
+                  no_red_zone: bool = False) -> bool:
     """Compile a single Ritz source file to LLVM IR, by running PASSES.
 
     Each .ritz file compiles to one .ll file; imports are resolved and
@@ -593,13 +597,13 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
         ctx = _Compile(source_path, output_path, no_runtime, check_names,
                        check_ownership, dependencies, source_roots,
                        project_root, target, target_os, test_mode,
-                       stack_protector)
+                       stack_protector, no_red_zone)
         ctx.source = Path(source_path).read_text()
         ctx.source_abs_path = str(Path(source_path).resolve())
         ctx.mode_key = compile_mode_key(_compile_mode(
             no_runtime, check_names, check_ownership,
             dependencies, source_roots, project_root, target, target_os,
-            test_mode, stack_protector))
+            test_mode, stack_protector, no_red_zone))
         if _up_to_date(ctx):
             print(f"Skipped {source_path} (unchanged)")
             return True
@@ -694,6 +698,10 @@ def main():
                         help='Give every defined function except a [[naked]] one '
                              'LLVM\'s sspstrong (AGAST #2590). The program must '
                              'define __stack_chk_guard and __stack_chk_fail.')
+    parser.add_argument('--no-red-zone', action='store_true',
+                        help='Give every defined function LLVM\'s noredzone '
+                             '(AGAST #4308), as a freestanding --target does. '
+                             'clang\'s -mno-red-zone does nothing for .ll input.')
 
     args = parser.parse_args()
 
@@ -769,7 +777,8 @@ def main():
                                target=args.target,
                                target_os=args.target_os,
                                test_mode=args.test_table,
-                               stack_protector=args.stack_protector)
+                               stack_protector=args.stack_protector,
+                               no_red_zone=args.no_red_zone)
         sys.exit(0 if success else 1)
 
 

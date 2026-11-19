@@ -77,6 +77,8 @@ def _tree(root: Path) -> Path:
     tools.mkdir(parents=True)
     shutil.copy(TIER1_SH, tools / TIER1_SH.name)
     (tools / "mkinitramfs.py").write_text(FAKE_MKINITRAMFS)
+    # Its fake kernel passes the red-zone check (AGAST #4308).
+    (tools / "check_no_red_zone.py").write_text("import sys\nsys.exit(0)\n")
     for elf in ("harland/build/debug/harland.elf", "harland/build/debug/BOOTX64.EFI",
                 "indium/build/debug/init.elf"):
         p = root / "projects" / elf

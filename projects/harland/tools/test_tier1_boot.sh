@@ -126,6 +126,10 @@ for f in "$KERNEL_ELF" "$LOADER_EFI" "$PROJECTS_DIR/indium/build/debug/init.elf"
     [ -f "$f" ] || { echo "FAIL: not built: $f"; exit 1; }
 done
 
+# AGAST #4308: no kernel function may keep data below %rsp. An interrupt or
+# exception on the current stack (IST 0) would clobber it.
+python3 "$HARLAND_DIR/tools/check_no_red_zone.py" "$KERNEL_ELF" || exit 1
+
 # COMPILER set: every binary the boot loads must say COMPILER built it. The
 # manifest (build.py writes BIN.manifest.json beside each output) records the
 # compiler; the build directory does not, so without this SKIP_BUILD, or a
