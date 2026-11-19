@@ -379,7 +379,58 @@ fn main() -> i32
 | `mmap_failed` | `fn(p: *u8) -> bool` | True for null and `-errno` (any `p <= 0`) |
 
 Install a source before the first allocation, or restore the previous one
-before anything allocated under it is freed.
+before anything allocated under it is freed. To give one subsystem its own
+pages instead, build its collections on a `pages_allocator` (below): those
+blocks go back to their own source whatever is installed.
+
+#### Allocator
+
+`malloc`/`free`/`realloc` are one global heap. An `Allocator` is any other
+memory source (an Arena, a subsystem's own pages, a kernel heap) that a `Vec`,
+`String` or `HashMap` can be built on (AGAST #4120). It has the shape
+goliath's allocator had (AGAST #1881) plus a `ctx`, and goliath now uses it:
+
+```text
+pub struct Allocator
+    ctx: *u8                       # the allocator's state
+    alloc: fn(*u8, i64) -> *u8     # alloc(ctx, len): len bytes, 8-aligned, or null
+    free: fn(*u8, *u8, i64) -> i32 # free(ctx, p, len): what one alloc(ctx, len) returned
+```
+
+```ritz
+import ritzlib.memory
+import ritzlib.gvec
+
+fn arena_vec() -> i64
+    var ar: Arena = arena_new(65536)
+    var a: Allocator = arena_allocator(@ar)
+    var v: Vec<i64> = vec_new_in<i64>(@a)   # every grow comes from `ar`
+    vec_push<i64>(@&v, 7)
+    let x: i64 = vec_get<i64>(@v, 0)
+    vec_drop<i64>(@&v)                      # back to `a`, not the global heap
+    arena_destroy(@ar)
+    x
+```
+
+`malloc_in(a, n)` takes `n + 16` bytes from `a`, and the block's header names
+`a` as its owner. Plain `free` and `realloc` read that header, so collection
+code is unchanged and a block never goes back to the wrong allocator. A null
+owner is the global heap. The `Allocator` must stay at its address while any
+block it handed out is live, because the header points at it.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `malloc_in` | `fn(a: *Allocator, size: i64) -> *u8` | `size` bytes owned by `a` (null `a`: `malloc`) |
+| `allocator_of` | `fn(p: *u8) -> *Allocator` | `p`'s owner; null for the global heap and for null |
+| `arena_allocator` | `fn(arena: *Arena) -> Allocator` | Bump from `arena`; `free` gives nothing back until reset/destroy |
+| `pages_allocator` | `fn(src: *PageSource) -> Allocator` | Each block its own whole-page mapping from `src`, unmapped there |
+
+The collections' `_in` constructors take one: `vec_new_in` / `vec_with_cap_in`
+(`ritzlib.gvec`), `string_new_in` / `string_with_cap_in` (`ritzlib.string`) and
+`hashmap_new_in` / `hashmap_with_cap_in` (`ritzlib.hashmap`), whose grows build
+the bigger table in the same allocator. An empty Vec remembers nothing, so
+`vec_new_in` reserves 8 elements. A slice or clone, and a push after a drop,
+use the global heap.
 
 The `heap e` expression (see [heap](#heap)) allocates with this `malloc`, so a
 module using it needs `ritzlib.memory` loaded, imported directly or not. ritz1

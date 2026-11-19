@@ -130,13 +130,17 @@ expect ls_tmp_taken  0     ' late$'          -- "$BIN" ls /late
 # Freestanding core (AGAST #1881): the kernel builds goliath, so only the
 # hosted glue (hosted.ritz: the default allocator; file_store.ritz: a host
 # file; main.ritz: the CLI) may use the hosted ritzlib. The rest takes its
-# memory from an Allocator and its disk from a BlockDevice.
+# memory from an Allocator (ritzlib.memory's type, imported alone) and its disk
+# from a BlockDevice.
 HOSTED_OK="main.ritz hosted.ritz file_store.ritz"
 core=0
 for f in src/*.ritz; do
     case " $HOSTED_OK " in *" $(basename "$f") "*) continue;; esac
     core=$((core+1))
-    hits=$(grep -nE '^import ritzlib\.(sys|memory|io|fs|process)\b|\bsys_[a-z]' "$f")
+    # The Allocator type is ritzlib.memory's (AGAST #4120); importing it alone
+    # takes no memory from the global heap.
+    hits=$(grep -nE '^import ritzlib\.(sys|memory|io|fs|process)\b|\bsys_[a-z]' "$f" \
+        | grep -vE '^[0-9]+:import ritzlib\.memory \{ Allocator \}$')
     [ -z "$hits" ] || fail "$f is goliath core but uses the hosted ritzlib: $hits"
 done
 [ "$core" -ge 8 ] && echo "ok: freestanding_core ($core modules)" || fail "freestanding check saw only $core core modules"

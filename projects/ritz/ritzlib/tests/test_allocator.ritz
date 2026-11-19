@@ -1,0 +1,297 @@
+# Allocator-aware collections (AGAST #4120)
+#
+# A Vec, String or HashMap built with an `_in` constructor takes its memory
+# from that Allocator, and every later grow and the final drop go back to the
+# same one: the block's header names its owner, so plain realloc/free route
+# there. Collections built the usual way stay on the global heap. Each test
+# counts what its allocator handed out and got back.
+
+import ritzlib.memory
+import ritzlib.gvec
+import ritzlib.string
+import ritzlib.hash
+import ritzlib.hashmap
+import ritzlib.sys
+
+# An Arena behind a counting Allocator. ctx points at one of these.
+struct CountingArena
+    arena: Arena
+    allocs: i64
+    frees: i64
+    live_bytes: i64
+
+fn counting_alloc(ctx: *u8, len: i64) -> *u8
+    let c: *CountingArena = ctx as *CountingArena
+    let p: *u8 = arena_alloc(@c.arena, len)
+    if p != null
+        c.allocs += 1
+        c.live_bytes += len
+    return p
+
+fn counting_free(ctx: *u8, p: *u8, len: i64) -> i32
+    let c: *CountingArena = ctx as *CountingArena
+    c.frees += 1
+    c.live_bytes -= len
+    return 0
+
+fn counting_new(c: *CountingArena, size: i64) -> Allocator
+    c.arena = arena_new(size)
+    c.allocs = 0
+    c.frees = 0
+    c.live_bytes = 0
+    return Allocator { ctx: c as *u8, alloc: counting_alloc, free: counting_free }
+
+fn in_arena(c: *CountingArena, p: *u8) -> bool
+    let lo: i64 = c.arena.base as i64
+    return p as i64 >= lo and p as i64 < lo + c.arena.size
+
+# The acceptance test: one Vec on an arena allocator and one on the global
+# heap, side by side; each drop goes back to its own allocator.
+[[test]]
+fn test_vec_on_arena_and_global_heap_coexist() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 65536)
+
+    var av: Vec<i64> = vec_new_in<i64>(@a)
+    var gv: Vec<i64> = vec_new<i64>()
+    for i in 0..100
+        assert vec_push<i64>(@&av, i) == 0
+        assert vec_push<i64>(@&gv, i * 2) == 0
+
+    assert allocator_of(av.data as *u8) == @a
+    assert allocator_of(gv.data as *u8) == null
+    assert in_arena(@c, av.data as *u8)
+    assert not in_arena(@c, gv.data as *u8)
+    for i in 0..100
+        assert vec_get<i64>(@av, i) == i
+        assert vec_get<i64>(@gv, i) == i * 2
+    # Growing 8 -> 16 -> 32 -> 64 -> 128 elements: 5 blocks from the arena,
+    # 4 of them already handed back by realloc.
+    assert c.allocs == 5
+    assert c.frees == 4
+
+    # The global Vec's drop does not touch the arena allocator...
+    let frees_before: i64 = c.frees
+    let gdata: *u8 = gv.data as *u8
+    vec_drop<i64>(@&gv)
+    assert c.frees == frees_before
+    # ...its 1 KiB block is back on the global heap: the next malloc of that
+    # size class gets it again.
+    let again: *u8 = malloc(1024)
+    assert again == gdata
+    free(again)
+
+    # The arena Vec's drop goes back to the arena allocator.
+    vec_drop<i64>(@&av)
+    assert c.frees == frees_before + 1
+    assert c.allocs == c.frees
+    assert c.live_bytes == 0
+    arena_destroy(@c.arena)
+    0
+
+[[test]]
+fn test_vec_with_cap_in_reserves_from_the_allocator() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 65536)
+    var v: Vec<i32> = vec_with_cap_in<i32>(@a, 50)
+    assert vec_cap<i32>(@v) == 50
+    assert c.allocs == 1
+    assert allocator_of(v.data as *u8) == @a
+    for i in 0..50
+        vec_push<i32>(@&v, i as i32)
+    # Within capacity: no new block.
+    assert c.allocs == 1
+    vec_drop<i32>(@&v)
+    assert c.frees == 1
+    assert c.live_bytes == 0
+    arena_destroy(@c.arena)
+    0
+
+[[test]]
+fn test_string_on_an_allocator() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 65536)
+    var s: String = string_new_in(@a)
+    var g: String = string_new()
+    for i in 0..40
+        string_push_str(@&s, "abc")
+        string_push_str(@&g, "xyz")
+    assert string_len(@s) == 120
+    assert string_eq(@s, "abcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabcabc")
+    assert allocator_of(s.data.data) == @a
+    assert allocator_of(g.data.data) == null
+    let frees_before: i64 = c.frees
+    string_drop(@&g)
+    assert c.frees == frees_before
+    string_drop(@&s)
+    assert c.allocs == c.frees
+    assert c.live_bytes == 0
+
+    var w: String = string_with_cap_in(@a, 10)
+    assert string_cap(@w) == 10
+    assert allocator_of(w.data.data) == @a
+    string_drop(@&w)
+    assert c.allocs == c.frees
+    arena_destroy(@c.arena)
+    0
+
+struct Pt
+    x: i64
+    y: i64
+
+impl Hash for Pt
+    pub fn hash(self: @Pt) -> u64
+        fnv1a_i64(fnv1a_i64(fnv1a_init(), self.x), self.y)
+
+impl Eq for Pt
+    pub fn equals(self: @Pt, other: @Pt) -> bool
+        self.x == other.x and self.y == other.y
+
+fn get_or(m: @HashMap<Pt, i64>, k: Pt, d: i64) -> i64
+    match m.get(k)
+        Some(v) => v
+        None => d
+
+# A HashMap's grow builds a bigger table: in the map's own allocator.
+[[test]]
+fn test_hashmap_on_an_allocator_grows_in_it() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 262144)
+    var m: HashMap<Pt, i64> = hashmap_new_in<Pt, i64>(@a)
+    assert allocator_of(m.slots.data as *u8) == @a
+    for i in 0..100
+        m.insert(Pt { x: i, y: 0 - i }, i * 10)
+    # 16 slots -> 32 -> 64 -> 128 -> 256.
+    assert m.slots.len == 256
+    assert allocator_of(m.slots.data as *u8) == @a
+    assert c.allocs == 5
+    assert c.frees == 4
+    for i in 0..100
+        assert get_or(@m, Pt { x: i, y: 0 - i }, -1) == i * 10
+    hashmap_drop<Pt, i64>(@&m)
+    assert c.allocs == c.frees
+    assert c.live_bytes == 0
+
+    var g: HashMap<Pt, i64> = hashmap_new<Pt, i64>()
+    for i in 0..100
+        g.insert(Pt { x: i, y: i }, i)
+    assert allocator_of(g.slots.data as *u8) == null
+    hashmap_drop<Pt, i64>(@&g)
+    assert c.allocs == c.frees
+    arena_destroy(@c.arena)
+    0
+
+# The low-level interface: malloc_in / realloc / free on a tagged block.
+[[test]]
+fn test_malloc_in_realloc_free_route_to_the_owner() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 65536)
+    let p: *u8 = malloc_in(@a, 24)
+    assert p != null
+    assert c.allocs == 1
+    for i in 0..24
+        *(p + i) = i as u8
+    # Fits the usable size: stays put.
+    assert realloc(p, 20) == p
+    assert c.allocs == 1
+    # Grows: a new block from the same allocator, the old one freed there.
+    let q: *u8 = realloc(p, 4000)
+    assert q != null
+    assert q != p
+    assert allocator_of(q) == @a
+    assert c.allocs == 2
+    assert c.frees == 1
+    for i in 0..24
+        assert *(q + i) == i as u8
+    free(q)
+    assert c.frees == 2
+    assert c.live_bytes == 0
+    # realloc(p, 0) frees into the owner too.
+    let r: *u8 = malloc_in(@a, 8)
+    assert realloc(r, 0) == null
+    assert c.allocs == c.frees
+    # A null allocator is the global heap.
+    let h: *u8 = malloc_in(null, 64)
+    assert h != null
+    assert allocator_of(h) == null
+    free(h)
+    assert allocator_of(null) == null
+    arena_destroy(@c.arena)
+    0
+
+# An allocator that is out of memory makes the _in constructors fail empty.
+fn none_alloc(ctx: *u8, len: i64) -> *u8
+    return null
+
+fn none_free(ctx: *u8, p: *u8, len: i64) -> i32
+    return 0
+
+[[test]]
+fn test_exhausted_allocator_returns_null() -> i32
+    var a: Allocator = Allocator { ctx: null, alloc: none_alloc, free: none_free }
+    assert malloc_in(@a, 16) == null
+    var v: Vec<i64> = vec_with_cap_in<i64>(@a, 10)
+    assert v.data == null
+    assert vec_cap<i64>(@v) == 0
+    var e: Vec<i64> = vec_new_in<i64>(@a)
+    assert e.data == null
+    0
+
+# ritzlib's own arena_allocator: blocks come from the Arena; free gives
+# nothing back until the arena is reset or destroyed.
+[[test]]
+fn test_arena_allocator_backs_a_vec() -> i32
+    var ar: Arena = arena_new(65536)
+    var a: Allocator = arena_allocator(@ar)
+    var v: Vec<i64> = vec_new_in<i64>(@a)
+    for i in 0..300
+        vec_push<i64>(@&v, i)
+    let lo: i64 = ar.base as i64
+    assert v.data as i64 >= lo and v.data as i64 < lo + ar.size
+    for i in 0..300
+        assert vec_get<i64>(@v, i) == i
+    let used: i64 = arena_used(@ar)
+    vec_drop<i64>(@&v)
+    assert arena_used(@ar) == used
+    arena_destroy(@ar)
+    0
+
+# pages_allocator: every block is its own mapping from the given PageSource,
+# and goes back to that source on free, whatever source is installed then.
+var g_pa_maps: i64 = 0
+var g_pa_unmaps: i64 = 0
+
+fn pa_map(len: i64) -> *u8
+    g_pa_maps += 1
+    return sys_mmap_anon(len)
+
+fn pa_unmap(p: *u8, len: i64) -> i32
+    g_pa_unmaps += 1
+    return sys_munmap(p, len)
+
+fn enomem_map(len: i64) -> *u8
+    return -12 as *u8
+
+fn never_unmap(p: *u8, len: i64) -> i32
+    return -1
+
+[[test]]
+fn test_pages_allocator_frees_to_its_own_source() -> i32
+    var src: PageSource = PageSource { map: pa_map, unmap: pa_unmap }
+    var a: Allocator = pages_allocator(@src)
+    var v: Vec<u8> = vec_with_cap_in<u8>(@a, 100)
+    assert g_pa_maps == 1
+    for i in 0..5000
+        vec_push<u8>(@&v, (i % 251) as u8)
+    let maps: i64 = g_pa_maps
+    assert maps > 1
+    assert g_pa_unmaps == maps - 1
+    # Swap the global page source for one that can't map or unmap: the Vec's
+    # memory still goes back to its own source.
+    let prev: PageSource = page_source_set(PageSource { map: enomem_map, unmap: never_unmap })
+    for i in 0..5000
+        assert vec_get<u8>(@v, i) == (i % 251) as u8
+    vec_drop<u8>(@&v)
+    page_source_set(prev)
+    assert g_pa_unmaps == maps
+    0

@@ -296,8 +296,11 @@ const HEADER_SIZE: i64 = 16  # Block header (size + padding for alignment)
 # Block header stored before each allocation
 # For size-class: stores class index (0-8)
 # For large: stores actual mmap size (negative to indicate large)
+# For a block from malloc_in(a, ..): owner is a, and size_class is the whole
+# block's length (header included) as a.alloc handed it out.
 struct BlockHeader
-    size_class: i64   # 0-8 for bins, negative for mmap size
+    size_class: i64   # 0-8 for bins, negative for mmap size, length if owned
+    owner: *Allocator # null: the global heap below; else the block's Allocator
 
 # Free list node (embedded in free blocks, after header)
 struct FreeNode
@@ -404,6 +407,7 @@ fn bin_alloc(bin: *SizeBin, class: i32) -> *u8
     # Set up header
     let header: *BlockHeader = block as *BlockHeader
     header.size_class = class as i64
+    header.owner = null
 
     # Return pointer after header
     return block + HEADER_SIZE
@@ -456,6 +460,7 @@ pub fn malloc(size: i64) -> *u8
         # Store negative size to indicate large block
         let header: *BlockHeader = block as *BlockHeader
         header.size_class = 0 - mmap_size
+        header.owner = null
 
         return block + HEADER_SIZE
 
@@ -478,6 +483,11 @@ pub fn free(ptr: *u8)
     # Read header
     let header: *BlockHeader = (ptr as i64 - HEADER_SIZE) as *BlockHeader
     let size_class: i64 = header.size_class
+
+    # A malloc_in block goes back to the Allocator it came from.
+    if header.owner != null
+        allocator_release(header.owner, header as *u8, size_class)
+        return
 
     if size_class < 0
         # Large allocation - munmap
@@ -503,6 +513,10 @@ pub fn realloc(ptr: *u8, new_size: i64) -> *u8
     # Read old size class
     let header: *BlockHeader = (ptr as i64 - HEADER_SIZE) as *BlockHeader
     let old_class: i64 = header.size_class
+
+    # A malloc_in block stays with its Allocator.
+    if header.owner != null
+        return realloc_owned(header.owner, ptr, old_class - HEADER_SIZE, new_size)
 
     var old_usable: i64 = 0
     if old_class < 0
@@ -550,3 +564,112 @@ pub fn calloc(count: i64, size: i64) -> *u8
     if ptr != null
         memzero(ptr, total)
     return ptr
+
+# ============================================================================
+# Allocator: per-instance heaps (AGAST #4120)
+# ============================================================================
+# malloc/free/realloc above are one global heap. An Allocator is any other
+# source of memory -- an Arena, a subsystem's own pages, a kernel heap -- that
+# a Vec, String or HashMap can be built on (vec_new_in, string_new_in,
+# hashmap_new_in) and that every later grow and the final free go back to.
+#
+#   ctx               the allocator's state (an *Arena, a *PageSource, ...)
+#   alloc(ctx, len)   len bytes of read-write memory, 8-aligned, or null
+#   free(ctx, p, len) give back what one alloc(ctx, len) returned
+#
+# This is the shape goliath's allocator had (AGAST #1881) plus a ctx, so one
+# alloc fn can serve many instances; goliath now uses this type.
+#
+# malloc_in(a, size) takes size + HEADER_SIZE bytes from a, and the header
+# names a as the block's owner. Plain free and realloc read that header, so
+# collection code calls them unchanged and a block never goes back to the
+# wrong allocator; a null owner is the global heap (malloc_in(null, n) is
+# malloc(n)). An Allocator must stay where it is (a global, or a var that
+# outlives the blocks) while any block it gave out is live: the header points
+# at it.
+pub struct Allocator
+    ctx: *u8
+    alloc: fn(*u8, i64) -> *u8
+    free: fn(*u8, *u8, i64) -> i32
+
+# size bytes owned by `a`; free/realloc route them back there. A null `a` is
+# the global heap.
+pub fn malloc_in(a: *Allocator, size: i64) -> *u8
+    if a == null
+        return malloc(size)
+    if size <= 0
+        return null
+    let total: i64 = size + HEADER_SIZE
+    # size near i64 max wraps total; refuse rather than ask for a tiny block.
+    if total <= size
+        return null
+    let f: fn(*u8, i64) -> *u8 = a.alloc
+    let block: *u8 = f(a.ctx, total)
+    if block == null
+        return null
+    let header: *BlockHeader = block as *BlockHeader
+    header.size_class = total
+    header.owner = a
+    return block + HEADER_SIZE
+
+# The Allocator that owns p (a block from malloc, malloc_in or realloc), or
+# null for the global heap and for a null p.
+pub fn allocator_of(p: *u8) -> *Allocator
+    if p == null
+        return null
+    let header: *BlockHeader = (p as i64 - HEADER_SIZE) as *BlockHeader
+    return header.owner
+
+# Hand a whole block (header included) back to its owner.
+fn allocator_release(a: *Allocator, block: *u8, len: i64)
+    let f: fn(*u8, *u8, i64) -> i32 = a.free
+    f(a.ctx, block, len)
+
+# realloc of an owned block: in place while it fits, else a new block from the
+# same Allocator. new_size > 0, `usable` is what the block holds.
+fn realloc_owned(a: *Allocator, ptr: *u8, usable: i64, new_size: i64) -> *u8
+    if new_size <= usable
+        return ptr
+    let new_ptr: *u8 = malloc_in(a, new_size)
+    if new_ptr == null
+        return null
+    memcpy(new_ptr, ptr, usable)
+    free(ptr)
+    return new_ptr
+
+# ---- Allocators over ritzlib's own sources ----
+
+fn arena_allocator_alloc(ctx: *u8, len: i64) -> *u8
+    return arena_alloc(ctx as *Arena, len)
+
+fn arena_allocator_free(ctx: *u8, p: *u8, len: i64) -> i32
+    return 0
+
+# An Allocator over `arena`: blocks are bumped out of it, and free gives
+# nothing back: the memory returns on arena_reset / arena_destroy, which must
+# not happen while a collection on it is still in use.
+pub fn arena_allocator(arena: *Arena) -> Allocator
+    return Allocator { ctx: arena as *u8, alloc: arena_allocator_alloc, free: arena_allocator_free }
+
+fn pages_allocator_alloc(ctx: *u8, len: i64) -> *u8
+    let src: *PageSource = ctx as *PageSource
+    let f: fn(i64) -> *u8 = src.map
+    let p: *u8 = f(pages_round(len))
+    if mmap_failed(p)
+        return null
+    return p
+
+fn pages_allocator_free(ctx: *u8, p: *u8, len: i64) -> i32
+    let src: *PageSource = ctx as *PageSource
+    let f: fn(*u8, i64) -> i32 = src.unmap
+    return f(p, pages_round(len))
+
+fn pages_round(len: i64) -> i64
+    return (len + PAGE_SIZE - 1) / PAGE_SIZE * PAGE_SIZE
+
+# An Allocator whose every block is its own whole-page mapping from `src`,
+# given back to `src` on free, whichever PageSource page_source_set has
+# installed by then. For a subsystem with its own pages; small blocks each
+# cost a page (no size-class layer per source yet: AGAST #4326).
+pub fn pages_allocator(src: *PageSource) -> Allocator
+    return Allocator { ctx: src as *u8, alloc: pages_allocator_alloc, free: pages_allocator_free }
