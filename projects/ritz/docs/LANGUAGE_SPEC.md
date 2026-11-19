@@ -2288,6 +2288,13 @@ literal that doesn't fit the other operand's type is an error, as it is in a
 slot. A shift is the exception (§7.4): its count has no say, and a literal on its
 left is an `i64`.
 
+An operation over literals only, such as `0 - 1`, `~63` or `1 << 26`, is a
+constant. Its value is computed as the `i64` it would be, and the operand is then
+one literal of that value (AGAST #4082). So with `w: i32`, `w ^ (0 - 1)` is an
+`i32`, exactly as `w ^ -1` is. If the value doesn't fit the other operand's type,
+or computing it leaves `i64`, the operand stays an `i64`. That is not an error,
+because nothing about it was written as a literal of the wrong type.
+
 `+`, `-` and `*` wrap on overflow at their type, except in a wider slot.
 
 #### Wider slots

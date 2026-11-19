@@ -34,7 +34,7 @@ import match_coverage
 from metadata import type_to_string
 from async_transform_v2 import (generate_state_machine, AsyncStateMachine, UntypedAsyncLocal, AsyncLoweringError,
                                 PollAbi)
-from const_eval import ConstEvaluator, ConstEvalError
+from const_eval import ConstEvaluator, ConstEvalError, fold_literal_i64
 from move_checker import MoveChecker, MoveTypes, field_path, path_within, _subst as move_subst
 from type_checker import TypeChecker
 from typed import EMITTER_READS, typed_of
@@ -1823,6 +1823,17 @@ class LLVMEmitter:
             return -expr.operand.value
         return None
 
+    def _literal_operand_value(self, expr: rast.Expr) -> Optional[int]:
+        """`_untyped_int_literal`, or the value of an all-literal operator
+        expression (`0 - 1`, `~63`, `1 << 26`), which is one literal of that
+        value (AGAST #4082, `fold_literal_i64`). For the operand rules only:
+        R21's sibling type, #1396's slot width and the shapes that read them.
+        A folded value that does not fit its sibling is left as it was, an
+        i64, never the error a written literal that does not fit is.
+        """
+        value = self._untyped_int_literal(expr)
+        return value if value is not None else fold_literal_i64(expr)
+
     @contextlib.contextmanager
     def _int_slot_context(self, slot: Optional[rast.Type], value: Optional[rast.Expr]):
         """Emit `value` as consumed at integer slot `slot` (#1444).
@@ -1887,8 +1898,8 @@ class LLVMEmitter:
         literal already is one, and `_int_shape` reads its signedness.
         Returns the `(left, right)` pair, re-materialised or as given.
         """
-        lit_left = self._untyped_int_literal(expr.left)
-        lit_right = self._untyped_int_literal(expr.right)
+        lit_left = self._literal_operand_value(expr.left)
+        lit_right = self._literal_operand_value(expr.right)
         if (lit_left is None) == (lit_right is None):
             return left, right
         shift = expr.op in ('<<', '>>')
@@ -1903,7 +1914,8 @@ class LLVMEmitter:
         width = other.type.width
         unsigned = self._int_shape(other_expr, True)[1]
         if not self._int_literal_fits(lit_val, width, unsigned):
-            if shift:
+            # A folded operand (#4082) that doesn't fit stays the i64 it was.
+            if shift or self._untyped_int_literal(lit_expr) is None:
                 return left, right
             name = f"{'u' if unsigned else 'i'}{width}"
             raise EmitError(f"`{lit_val}` does not fit in `{name}`",
@@ -1946,8 +1958,8 @@ class LLVMEmitter:
             if id(expr) not in getattr(self, '_literal_ctx_nodes', ()):
                 return None
 
-        lit_left = self._untyped_int_literal(expr.left)
-        lit_right = self._untyped_int_literal(expr.right)
+        lit_left = self._literal_operand_value(expr.left)
+        lit_right = self._literal_operand_value(expr.right)
         # Exactly one side must be a literal: `x + y` has nothing to re-type
         # and `1 + 2` needs no help from us.
         if (lit_left is None) == (lit_right is None):
@@ -2037,8 +2049,8 @@ class LLVMEmitter:
             # Binary ops inherit type from left operand, unless it's a literal
             # that takes the right one's type (LARB R21, #3112): `2 * x` is x's.
             if (expr.op in self._INT_ARITH_OPS and expr.op not in ('<<', '>>')
-                    and self._untyped_int_literal(expr.left) is not None
-                    and self._untyped_int_literal(expr.right) is None):
+                    and self._literal_operand_value(expr.left) is not None
+                    and self._literal_operand_value(expr.right) is None):
                 return self._infer_ritz_type(expr.right)
             return self._infer_ritz_type(expr.left)
         elif isinstance(expr, rast.UnaryOp):
@@ -9851,6 +9863,12 @@ class LLVMEmitter:
             elif op in ('||', 'or'):
                 return self._emit_short_circuit_or(expr)
 
+            # AGAST #4082: an all-literal operator is one constant, the i64
+            # it computed, so R21 can give it its sibling's width.
+            folded = fold_literal_i64(expr)
+            if folded is not None:
+                return ir.Constant(self.i64, folded)
+
             left = self._emit_expr(expr.left)
             right = self._emit_expr(expr.right)
             self._check_bool_operands(expr, left, right)
@@ -10074,6 +10092,9 @@ class LLVMEmitter:
             return ir.Constant(self.i32, 0)
 
         elif isinstance(expr, rast.UnaryOp):
+            folded = fold_literal_i64(expr)          # `~63` (AGAST #4082)
+            if folded is not None:
+                return ir.Constant(self.i64, folded)
             return self._emit_unary(expr)
 
         elif isinstance(expr, rast.StructLit):
@@ -12425,7 +12446,7 @@ class LLVMEmitter:
         sibling's type (R21) and fits it, so it is just its value."""
         if not isinstance(val.type, ir.IntType) or not 1 < val.type.width < bits:
             return val
-        lit = self._untyped_int_literal(operand)
+        lit = self._literal_operand_value(operand)
         if lit is not None:
             return ir.Constant(ir.IntType(bits), lit)
         if self._int_shape(operand, True)[1]:
@@ -16400,9 +16421,12 @@ class LLVMEmitter:
         if isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
             return self._int_shape(expr.operand, narrowed)
         if isinstance(expr, rast.BinOp) and expr.op in self._INT_ARITH_OPS:
-            if narrowed and isinstance(expr.right, rast.IntLit):
+            # A folded all-literal operand took its sibling's type too (#4082).
+            if narrowed and (isinstance(expr.right, rast.IntLit)
+                             or fold_literal_i64(expr.right) is not None):
                 return self._int_shape(expr.left, narrowed)
-            if narrowed and isinstance(expr.left, rast.IntLit):
+            if narrowed and (isinstance(expr.left, rast.IntLit)
+                             or fold_literal_i64(expr.left) is not None):
                 return self._int_shape(expr.right, narrowed)
             lbits, lunsigned = self._int_shape(expr.left, narrowed)
             rbits, runsigned = self._int_shape(expr.right, narrowed)

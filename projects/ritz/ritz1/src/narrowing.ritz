@@ -438,6 +438,110 @@ fn narrow_is_int_lit(e: *Expr) -> i32
         lit = e.operand
     (lit.kind == EXPR_INT_LIT and lit.lit_kind == LIT_PLAIN) as i32
 
+# AGAST #4082: operand `e` of an arithmetic operator, typed `t`, beside
+# `other`, typed `ot`.  An all-literal `e` (`0 - 1`, `~63`, `1 << 26`) is one
+# literal of its i64 value (narrow_fold_lit), so under R21 it is `other`'s
+# type when that value fits it: NARROW_LIT.  A value that doesn't fit stays
+# the i64 it was, as in ritz0 (`_literal_operand_value`).  `arm_i64` says a
+# shift's left literal in an `if` arm is an i64, as `1 << n` is there.
+fn narrow_folded_side(e: *Expr, other: *Expr, t: i32, ot: i32, arm_i64: i32) -> i32
+    var v: i64 = 0
+    if narrow_fold_lit(e, @v) == 0
+        return t
+    var ov: i64 = 0
+    if narrow_is_int_lit(other) == 1 or narrow_fold_lit(other, @ov) == 1
+        return t        # both literal: the operator itself folds
+    if arm_i64 == 1
+        return TYPE_I64
+    if ty_is_int(ot) == 1 and ty_bits(ot) < 64 and narrow_fits(v, ot) == 0
+        return TYPE_I64
+    NARROW_LIT
+
+# ritz0's fold_literal_i64 (AGAST #4082): the i64 value of an operator over
+# untyped integer literals only, into *out; 1 if it folds.  A bare literal
+# (`5`, `-5`) is one already and gives 0, as do names and casts.  Unlike
+# narrow_const_value, which proves a slot's fit, it folds what the emitter
+# computes: `>>` is arithmetic and `/` `%` truncate on negative operands too.
+# Any step outside i64, a zero divisor or a count outside 0..63 gives 0.
+pub fn narrow_fold_lit(e: *Expr, out: *i64) -> i32
+    if e == null or narrow_is_int_lit(e) == 1
+        return 0
+    if e.kind != EXPR_BINARY and e.kind != EXPR_UNARY
+        return 0
+    narrow_fold_lit_in(e, out)
+
+fn narrow_fold_lit_in(e: *Expr, out: *i64) -> i32
+    if e == null
+        return 0
+    let min: i64 = 0 - I64_MAX - 1
+    if e.kind == EXPR_INT_LIT
+        # A negative int_val is a literal only a u64 holds (int_operand_shape).
+        if e.lit_kind != LIT_PLAIN or e.int_val < 0
+            return 0
+        *out = e.int_val
+        return 1
+    var l: i64 = 0
+    if e.kind == EXPR_UNARY
+        if e.op != OP_NEG and e.op != OP_BIT_NOT
+            return 0
+        if narrow_fold_lit_in(e.operand, @l) == 0
+            return 0
+        if e.op == OP_BIT_NOT
+            *out = (0 - 1) - l
+            return 1
+        if l == min
+            return 0
+        *out = 0 - l
+        return 1
+    if e.kind != EXPR_BINARY or narrow_is_arith_op(e.op) == 0
+        return 0
+    var r: i64 = 0
+    if narrow_fold_lit_in(e.left, @l) == 0 or narrow_fold_lit_in(e.right, @r) == 0
+        return 0
+    let op: i32 = e.op
+    if op == OP_SHL or op == OP_SHR
+        if r < 0 or r >= 64
+            return 0
+        if op == OP_SHR
+            *out = l >> r
+            return 1
+        if l >= 0 and l > (I64_MAX >> r)
+            return 0
+        if l < 0 and l < (min >> r)
+            return 0
+        *out = l << r
+        return 1
+    if op == OP_DIV or op == OP_MOD
+        if r == 0 or (l == min and r == 0 - 1)
+            return 0
+        if op == OP_DIV
+            *out = l / r
+        else
+            *out = l % r
+        return 1
+    if op == OP_ADD
+        if narrow_add_ok(l, r) == 0
+            return 0
+        *out = l + r
+        return 1
+    if op == OP_SUB
+        if narrow_sub_ok(l, r) == 0
+            return 0
+        *out = l - r
+        return 1
+    if op == OP_MUL
+        if narrow_mul_ok(l, r) == 0
+            return 0
+        *out = l * r
+        return 1
+    if op == OP_BIT_AND
+        *out = l & r
+    else if op == OP_BIT_OR
+        *out = l | r
+    else
+        *out = l ^ r
+    1
+
 # Ritz type of an initialiser, NARROW_LIT, or NARROW_UNKNOWN (see header).
 pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
     var env: NarrowEnv
@@ -496,7 +600,8 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
             let lt: i32 = narrow_src_type_in(env, e.left, 1)
             if e.right != null and e.right.kind == EXPR_INT_LIT
                 return narrow_join(lt, NARROW_LIT)
-            return narrow_join(lt, narrow_src_type_in(env, e.right, 1))
+            let ct: i32 = narrow_src_type_in(env, e.right, 1)
+            return narrow_join(lt, narrow_folded_side(e.right, e.left, ct, lt, 0))
         if narrow_is_arith_op(e.op) == 1
             # LARB R21 (AGAST #3112): a literal operand is the other operand's
             # type, in an `if` arm or under `>>` too: `(a << 4) >> 4` is a's.
@@ -507,7 +612,13 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
             var rt: i32 = NARROW_LIT
             if narrow_operand_lit(e.right, e.left) == 0
                 rt = narrow_src_type_in(env, e.right, op_lit)
-            return narrow_join(lt, rt)
+            # AGAST #4082: an all-literal operand is one literal, R21 and all.
+            var shl_arm: i32 = 0
+            if e.op == OP_SHL and op_lit == 1
+                shl_arm = 1     # `1 << n` in an arm is an i64: so is `(1 << 2) << n`
+            let lf: i32 = narrow_folded_side(e.left, e.right, lt, rt, shl_arm)
+            let rf: i32 = narrow_folded_side(e.right, e.left, rt, lt, 0)
+            return narrow_join(lf, rf)
         return NARROW_UNKNOWN
     if k == EXPR_UNARY
         if e.op == OP_NOT

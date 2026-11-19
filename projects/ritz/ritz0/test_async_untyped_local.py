@@ -66,6 +66,8 @@ TYPES = {
     "bool_literal": ("    let y = true\n" + _AWAIT, "y", "bool"),
     # A literal operand takes the other operand's type (LARB R21).
     "literal_left_operand": ("    let y = 2 * (x as u8)\n" + _AWAIT, "y", "u8"),
+    # An all-literal operand is one literal (AGAST #4082).
+    "folded_left_operand": ("    let y = (3 - 1) * (x as u8)\n" + _AWAIT, "y", "u8"),
     "shift_keeps_left": ("    let y = 1 << (x as u8)\n" + _AWAIT, "y", "i64"),
     "comparison_is_bool": ("    let y = x > 3\n" + _AWAIT, "y", "bool"),
     "not_is_bool": ("    let y = !(x > 3)\n" + _AWAIT, "y", "bool"),

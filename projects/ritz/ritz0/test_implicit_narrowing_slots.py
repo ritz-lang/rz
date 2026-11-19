@@ -205,6 +205,10 @@ ACCEPTED = {
     "tail_literal_shift":     _fn("8 << (x & 3)", tail=""),
     "assign_literal_shift":   _fn("var n: i32 = 0\nn = n | (1 << x)"),
     "arg_literal_shift":      _fn("take(x | (1 << x))"),
+    # AGAST #4082: an all-literal operand takes the sibling's type at an
+    # assignment and an argument too (poly1305's `g4 - (1 << 26)`).
+    "assign_all_literal":     _fn("var b: u8 = 0\nb = b - (1 << 2)\nb = k ^ -(0 - 3)"),
+    "arg_all_literal":        _fn("take(x ^ (0 - 1))"),
     # An if/match merge is as wide as its widest arm, and a literal arm is
     # i64; narrowing it back to the i32 its other arm came from loses nothing.
     "return_if_literal_arm":  _fn("return if x <= 1 then 1 else x", tail=""),

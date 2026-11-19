@@ -191,6 +191,71 @@ class ConstEvaluator:
             return None
 
 
+_I64_MIN, _I64_MAX = -(1 << 63), (1 << 63) - 1
+_FOLD_BINOPS = frozenset(('+', '-', '*', '/', '%', '<<', '>>', '&', '|', '^'))
+
+
+def fold_literal_i64(expr: rast.Expr) -> Optional[int]:
+    """The value of an ALL-LITERAL integer operator expression, or None.
+
+    AGAST #4082. `0 - 1`, `~63` and `1 << 26` have no typed operand, so LARB
+    R21 had no sibling to type them from; folded, each is one untyped literal
+    of its value. Only an operator over untyped integer literals (recursively,
+    through parentheses) folds: a bare `5` / `-5` is already a literal and
+    returns None, as do names, chars, casts and compares.
+
+    The fold is the i64 computation the emitter would have done, which is why
+    it is exact and refuses rather than wraps: any step outside i64 (a u64-only
+    literal, `(1 << 63) >> 60`, an overflowing `+`), a zero divisor or a shift
+    count outside 0..63 returns None and the expression is emitted as before.
+    Inside i64, `>>` is arithmetic and `/`, `%` truncate toward zero, as
+    ashr / sdiv / srem. Folding at a narrower width instead would change a
+    `>>`, `/` or `%` (#1396): `(1 << 40) >> 38` is 4, not 0.
+    """
+    if not isinstance(expr, (rast.BinOp, rast.UnaryOp, rast.Grouped)):
+        return None
+    if isinstance(expr, rast.UnaryOp) and isinstance(expr.operand, rast.IntLit):
+        if expr.op == '-':
+            return None          # `-5` is a literal already
+    return _fold_i64(expr)
+
+
+def _fold_i64(expr: rast.Expr) -> Optional[int]:
+    """fold_literal_i64's recursion: also accepts a bare literal."""
+    if isinstance(expr, rast.IntLit):
+        value = expr.value
+    elif isinstance(expr, rast.Grouped):
+        return _fold_i64(expr.expr)
+    elif isinstance(expr, rast.UnaryOp) and expr.op in ('-', '~'):
+        operand = _fold_i64(expr.operand)
+        if operand is None:
+            return None
+        value = -operand if expr.op == '-' else ~operand
+    elif isinstance(expr, rast.BinOp) and expr.op in _FOLD_BINOPS:
+        left = _fold_i64(expr.left)
+        right = _fold_i64(expr.right) if left is not None else None
+        if right is None:
+            return None
+        op = expr.op
+        if op in ('/', '%'):
+            if right == 0:
+                return None
+            quotient = abs(left) // abs(right)
+            quotient = quotient if (left < 0) == (right < 0) else -quotient
+            value = quotient if op == '/' else left - quotient * right
+        elif op in ('<<', '>>'):
+            if not 0 <= right < 64:
+                return None
+            value = left << right if op == '<<' else left >> right
+        else:
+            value = {'+': left + right, '-': left - right, '*': left * right,
+                     '&': left & right, '|': left | right,
+                     '^': left ^ right}[op]
+    else:
+        return None
+    return value if _I64_MIN <= value <= _I64_MAX else None
+
+
 def evaluate_const_expr(expr: rast.Expr, constants: Dict[str, int] = None) -> int:
     """Convenience function to evaluate a constant expression.
 

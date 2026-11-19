@@ -123,6 +123,12 @@ REJECTED = {
     # Below an operator an if's arms are not the slot's: the `*` ran at 64
     # bits, so the `/` result needs proof (there is none).
     "if_under_operator":         "let n: u8 = 2 * (if x > 0 then 200 else 100) / 4",
+    # AGAST #4082: an all-literal operand is one literal of its i64 value, so
+    # it takes the sibling's type only if that value fits it ...
+    "all_literal_operand_too_big":   "let n: i32 = x ^ (1 << 40)",
+    "all_literal_unary_too_big":     "let n: i32 = x & ~(1 << 40)",
+    # ... and only if it folds inside i64: `(1 << 62) * 4` wraps there.
+    "all_literal_operand_wraps_i64": "let n: i32 = x + ((1 << 62) * 4 >> 60)",
 }
 
 
@@ -183,6 +189,12 @@ ACCEPTED = {
     "if_arith_arm_and_literal":  "let n: i32 = if x - 1 < 255 then x - 1 else 255",
     "if_negative_literal_arm":   "var n: i32 = if x > 0 then -1 else x",
     "if_nested_literal_arms":    "let n: i32 = if x < 0 then 0 else if x > 9 then 9 else x",
+    # AGAST #4082: an all-literal operand (`0 - 1`, `~63`) is one literal and
+    # takes its sibling's type (R21), as `x ^ -1` does: no i64 to narrow.
+    "all_literal_operand":       "let n: i32 = x ^ (0 - 1)",
+    "all_literal_unary_operand": "let n: i32 = x & -(1 + 1)",
+    "all_literal_shift_count":   "let n: i32 = x >> (8 - 4)",
+    "all_literal_negative_div":  "let n: i32 = x + (0 - 7) / 2",
     # Group B: masks that fit.
     "mask_255_into_i32":         "let n: i32 = big() & 255",
     "mask_1_into_u8":            "let n: u8 = (big() >> 3) & 1",

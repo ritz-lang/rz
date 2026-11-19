@@ -59,6 +59,7 @@ import copy
 from dataclasses import dataclass, field, fields
 from typing import List, Dict, Set, Optional, Tuple
 import ritz_ast as rast
+from const_eval import fold_literal_i64
 
 
 @dataclass
@@ -102,6 +103,12 @@ def _untyped_int_literal(expr: rast.Expr) -> bool:
     if isinstance(expr, rast.UnaryOp) and expr.op == '-':
         expr = expr.operand
     return isinstance(expr, rast.IntLit)
+
+
+def _literal_operand(expr: rast.Expr) -> bool:
+    """The emitter's `_literal_operand_value`: a literal, or an operator over
+    literals that folds (AGAST #4082), so `(0 - 1) ^ w` is w's type."""
+    return _untyped_int_literal(expr) or fold_literal_i64(expr) is not None
 
 
 class AsyncAnalyzer:
@@ -148,8 +155,9 @@ class AsyncAnalyzer:
                 return rast.NamedType(span, 'bool')
             if expr.op not in _INT_ARITH_OPS:
                 return None
-            if (expr.op not in ('<<', '>>') and _untyped_int_literal(expr.left)
-                    and not _untyped_int_literal(expr.right)):
+            # An all-literal operand (`0 - 1`) is one literal too (#4082).
+            if (expr.op not in ('<<', '>>') and _literal_operand(expr.left)
+                    and not _literal_operand(expr.right)):
                 return self._infer_type(expr.right)
             return self._infer_type(expr.left)
         if isinstance(expr, rast.UnaryOp):
