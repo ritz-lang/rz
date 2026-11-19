@@ -77,6 +77,17 @@ pub fn hashmap_i64_new() -> HashMapI64
     return hashmap_i64_with_cap(16)
 
 pub fn hashmap_i64_with_cap(cap: i64) -> HashMapI64
+    return hashmap_i64_with_cap_in(null, cap)
+
+# A HashMapI64 whose table comes from `a` (AGAST #4327): every grow builds the
+# bigger table there too, and drop frees back to it (the block's header names
+# its owner; see malloc_in). A null `a` is the global heap.
+pub fn hashmap_i64_new_in(a: *Allocator) -> HashMapI64
+    return hashmap_i64_with_cap_in(a, 16)
+
+# hashmap_i64_with_cap, with the table from `a`; empty (cap 0, entries null)
+# if `a` is out of memory.
+pub fn hashmap_i64_with_cap_in(a: *Allocator, cap: i64) -> HashMapI64
     # Initialize to null BEFORE malloc to prevent Drop on garbage if malloc fails
     var m: HashMapI64 = HashMapI64 { entries: null, cap: 0, len: 0, tombstones: 0 }
 
@@ -86,7 +97,9 @@ pub fn hashmap_i64_with_cap(cap: i64) -> HashMapI64
         actual_cap *= 2
 
     let size: i64 = actual_cap * sizeof(HashMapEntryI64)
-    m.entries = malloc(size) as *HashMapEntryI64
+    m.entries = malloc_in(a, size) as *HashMapEntryI64
+    if m.entries == null
+        return m
     m.cap = actual_cap
 
     # Initialize all entries to empty
@@ -217,6 +230,11 @@ pub fn hashmap_i64_find_slot(m: @HashMapI64, key: i64) -> i64
 
 # Insert or update a key-value pair
 pub fn hashmap_i64_insert(m: @&HashMapI64, key: i64, value: i64)
+    # An empty table (dropped, or its allocator was out of memory) gets one.
+    if m.cap == 0
+        hashmap_i64_grow(m)
+        if m.cap == 0
+            return
     # Check load factor and resize if needed (> 75%)
     let load: i64 = (m.len + m.tombstones + 1) * 100 / m.cap
     if load > 75
@@ -312,9 +330,15 @@ pub fn hashmap_i64_grow(m: @&HashMapI64)
     let old_cap: i64 = m.cap
 
     # Allocate new table with double capacity
-    let new_cap: i64 = old_cap * 2
+    # The new table comes from the same Allocator as the old one.
+    var new_cap: i64 = old_cap * 2
+    if new_cap == 0
+        new_cap = 16
     let size: i64 = new_cap * sizeof(HashMapEntryI64)
-    m.entries = malloc(size) as *HashMapEntryI64
+    let new_entries: *HashMapEntryI64 = malloc_in(allocator_of(old_entries as *u8), size) as *HashMapEntryI64
+    if new_entries == null
+        return  # Out of memory: keep the old table
+    m.entries = new_entries
     m.cap = new_cap
     m.len = 0
     m.tombstones = 0
@@ -330,7 +354,7 @@ pub fn hashmap_i64_grow(m: @&HashMapI64)
         if old_entry.state == Slot.Full
             hashmap_i64_insert(m, old_entry.key, old_entry.value)
 
-    # Free old table
+    # Free old table (free(null) is a no-op)
     free(old_entries as *u8)
 
 # ============================================================================

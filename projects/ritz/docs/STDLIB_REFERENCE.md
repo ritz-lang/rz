@@ -380,8 +380,8 @@ fn main() -> i32
 
 Install a source before the first allocation, or restore the previous one
 before anything allocated under it is freed. To give one subsystem its own
-pages instead, build its collections on a `pages_allocator` (below): those
-blocks go back to their own source whatever is installed.
+pages instead, build its collections on a `heap_allocator` or `pages_allocator`
+(below): those blocks go back to their own source whatever is installed.
 
 #### Allocator
 
@@ -424,11 +424,37 @@ block it handed out is live, because the header points at it.
 | `allocator_of` | `fn(p: *u8) -> *Allocator` | `p`'s owner; null for the global heap and for null |
 | `arena_allocator` | `fn(arena: *Arena) -> Allocator` | Bump from `arena`; `free` gives nothing back until reset/destroy |
 | `pages_allocator` | `fn(src: *PageSource) -> Allocator` | Each block its own whole-page mapping from `src`, unmapped there |
+| `heap_init` | `fn(h: *Heap, src: PageSource)` | Fill `h` as a size-class heap whose slabs and large blocks map from `src` |
+| `heap_allocator` | `fn(h: *Heap) -> Allocator` | Small blocks from `h`'s 64 KiB slabs, freed into its bins; over 2 KiB, its own mapping |
+| `heap_destroy` | `fn(h: *Heap)` | Unmap every slab and live large block of `h` to its source; `h` is empty again |
+
+A `Heap` (AGAST #4326) is the global heap's size classes over a source of its
+own: `pages_allocator` costs a page per block, a `heap_allocator` packs small
+blocks into slabs. The global heap is itself a `Heap` that follows the
+installed source. The `Heap` must stay at its address while its allocator or
+any block from it is live, and `heap_destroy` frees every block at once:
+
+```ritz
+import ritzlib.memory
+import ritzlib.gvec
+
+fn heap_vec() -> i64
+    var h: Heap
+    heap_init(@h, page_source_get())           # keeps this source
+    var a: Allocator = heap_allocator(@h)
+    var v: Vec<u8> = vec_new_in<u8>(@a)        # a slab block, not a page
+    vec_push<u8>(@&v, 7)
+    let x: i64 = vec_get<u8>(@v, 0) as i64
+    vec_drop<u8>(@&v)                          # back to h's bins
+    heap_destroy(@h)                           # every slab back to the source
+    x
+```
 
 The collections' `_in` constructors take one: `vec_new_in` / `vec_with_cap_in`
 (`ritzlib.gvec`), `string_new_in` / `string_with_cap_in` (`ritzlib.string`) and
-`hashmap_new_in` / `hashmap_with_cap_in` (`ritzlib.hashmap`), whose grows build
-the bigger table in the same allocator. An empty Vec remembers nothing, so
+`hashmap_new_in` / `hashmap_with_cap_in` and `hashmap_i64_new_in` /
+`hashmap_i64_with_cap_in` (`ritzlib.hashmap`), whose grows build the bigger
+table in the same allocator, and `box_new_in` (`ritzlib.box`). An empty Vec remembers nothing, so
 `vec_new_in` reserves 8 elements. A slice or clone, and a push after a drop,
 use the global heap.
 
@@ -462,6 +488,7 @@ struct Box<T>
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `box_new` | `fn<T>(value: T) -> Box<T>` | Create box containing value |
+| `box_new_in` | `fn<T>(a: *Allocator, value: T) -> Box<T>` | `box_new` with the value in memory from `a`; empty if `a` is out of memory |
 | `box_get` | `fn<T>(b: @Box<T>) -> T` | Get value (returns copy) |
 | `box_as_ptr` | `fn<T>(b: @Box<T>) -> *T` | Get pointer to value |
 | `box_set` | `fn<T>(b: @&Box<T>, value: T)` | Set new value |
@@ -710,6 +737,8 @@ struct HashMapI64
 |----------|-----------|-------------|
 | `hashmap_i64_new` | `fn() -> HashMapI64` | Create with default capacity (16) |
 | `hashmap_i64_with_cap` | `fn(cap: i64) -> HashMapI64` | Create with capacity |
+| `hashmap_i64_new_in` | `fn(a: *Allocator) -> HashMapI64` | Table (and every grow) from `a` |
+| `hashmap_i64_with_cap_in` | `fn(a: *Allocator, cap: i64) -> HashMapI64` | With capacity, from `a`; empty if `a` is out of memory |
 
 **Operations**:
 

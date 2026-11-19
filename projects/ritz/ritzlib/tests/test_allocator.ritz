@@ -11,6 +11,7 @@ import ritzlib.gvec
 import ritzlib.string
 import ritzlib.hash
 import ritzlib.hashmap
+import ritzlib.box
 import ritzlib.sys
 
 # An Arena behind a counting Allocator. ctx points at one of these.
@@ -294,4 +295,216 @@ fn test_pages_allocator_frees_to_its_own_source() -> i32
     vec_drop<u8>(@&v)
     page_source_set(prev)
     assert g_pa_unmaps == maps
+    0
+
+# ============================================================================
+# Heap: a size-class layer per PageSource (AGAST #4326)
+# ============================================================================
+# A Heap carves small blocks out of 64 KiB slabs from its own PageSource, as
+# the global heap does from the installed one, so a subsystem on its own pages
+# no longer pays a page per small block. heap_destroy gives every slab and
+# every live large block back to that source.
+
+var g_hp_maps: i64 = 0
+var g_hp_unmaps: i64 = 0
+var g_hp_live: i64 = 0
+
+fn hp_map(len: i64) -> *u8
+    let p: *u8 = sys_mmap_anon(len)
+    if not mmap_failed(p)
+        g_hp_maps += 1
+        g_hp_live += len
+    return p
+
+fn hp_unmap(p: *u8, len: i64) -> i32
+    g_hp_unmaps += 1
+    g_hp_live -= len
+    return sys_munmap(p, len)
+
+fn hp_reset()
+    g_hp_maps = 0
+    g_hp_unmaps = 0
+    g_hp_live = 0
+
+# The acceptance test: 1000 small Vec<u8>s take a few slabs, not 1000 pages,
+# and destroying the heap unmaps every slab to the heap's own source, even
+# with a failing source installed globally in the meantime.
+[[test]]
+fn test_heap_allocator_packs_small_vecs_into_slabs() -> i32
+    hp_reset()
+    var h: Heap
+    heap_init(@h, PageSource { map: hp_map, unmap: hp_unmap })
+    var a: Allocator = heap_allocator(@h)
+    assert g_hp_maps == 0
+    # The Vec headers live on the global heap, allocated before the swap.
+    let vs: *Vec<u8> = calloc(1000, sizeof(Vec<u8>)) as *Vec<u8>
+    assert vs != null
+    let prev: PageSource = page_source_set(PageSource { map: enomem_map, unmap: never_unmap })
+    for i in 0..1000
+        let vp: *Vec<u8> = vs + i
+        *vp = vec_new_in<u8>(@a)
+        for j in 0..12
+            assert vec_push<u8>(@&*vp, (i + j) as u8) == 0
+        assert allocator_of(vp.data as *u8) == @a
+    page_source_set(prev)
+    # 1000 live 16-byte blocks plus their freed 8-byte first blocks: a slab
+    # or two per size class.
+    assert g_hp_maps >= 1
+    assert g_hp_maps <= 4
+    assert g_hp_unmaps == 0
+    for i in 0..1000
+        let vp: *Vec<u8> = vs + i
+        assert vp.len == 12
+        for j in 0..12
+            assert vec_get<u8>(@*vp, j) == (i + j) as u8
+    # Drop half of them: the blocks go back to the heap's bins, not the source.
+    for i in 0..500
+        vec_drop<u8>(@&*(vs + i))
+    assert g_hp_unmaps == 0
+    # Those freed blocks are reused before any new slab is mapped.
+    let maps: i64 = g_hp_maps
+    for i in 0..500
+        let vp: *Vec<u8> = vs + i
+        *vp = vec_with_cap_in<u8>(@a, 16)
+        assert vp.data != null
+    assert g_hp_maps == maps
+    heap_destroy(@h)
+    assert g_hp_unmaps == g_hp_maps
+    assert g_hp_live == 0
+    free(vs as *u8)
+    0
+
+# A block over the largest size class is its own mapping from the heap's
+# source: free unmaps it there, and heap_destroy unmaps one still live.
+[[test]]
+fn test_heap_allocator_large_blocks_use_its_source() -> i32
+    hp_reset()
+    var h: Heap
+    heap_init(@h, PageSource { map: hp_map, unmap: hp_unmap })
+    var a: Allocator = heap_allocator(@h)
+    let p: *u8 = malloc_in(@a, 10000)
+    assert p != null
+    assert g_hp_maps == 1
+    assert allocator_of(p) == @a
+    for i in 0..10000
+        *(p + i) = (i % 199) as u8
+    # Grows into another large mapping; the old one goes back to the source.
+    let q: *u8 = realloc(p, 30000)
+    assert q != null
+    assert g_hp_maps == 2
+    assert g_hp_unmaps == 1
+    for i in 0..10000
+        assert *(q + i) == (i % 199) as u8
+    let r: *u8 = malloc_in(@a, 5000)
+    assert r != null
+    assert g_hp_maps == 3
+    free(r)
+    assert g_hp_unmaps == 2
+    # One small block too, so there is a slab to give back.
+    let s: *u8 = malloc_in(@a, 40)
+    assert s != null
+    assert g_hp_maps == 4
+    # q and the slab are still live: destroy unmaps both.
+    heap_destroy(@h)
+    assert g_hp_unmaps == 4
+    assert g_hp_live == 0
+    0
+
+# Two heaps on one source keep their own bins: a block freed into one is not
+# handed out by the other.
+[[test]]
+fn test_heaps_keep_their_own_bins() -> i32
+    hp_reset()
+    var h1: Heap
+    heap_init(@h1, PageSource { map: hp_map, unmap: hp_unmap })
+    var h2: Heap
+    heap_init(@h2, PageSource { map: hp_map, unmap: hp_unmap })
+    var a1: Allocator = heap_allocator(@h1)
+    var a2: Allocator = heap_allocator(@h2)
+    let p: *u8 = malloc_in(@a1, 24)
+    free(p)
+    let q: *u8 = malloc_in(@a2, 24)
+    assert q != p
+    assert allocator_of(q) == @a2
+    # h1 hands its own freed block back out.
+    let r: *u8 = malloc_in(@a1, 24)
+    assert r == p
+    heap_destroy(@h1)
+    heap_destroy(@h2)
+    assert g_hp_unmaps == g_hp_maps
+    assert g_hp_live == 0
+    0
+
+# ============================================================================
+# HashMapI64 and Box<T> on an Allocator (AGAST #4327)
+# ============================================================================
+
+# HashMapI64's grow builds its bigger table in the map's own allocator.
+[[test]]
+fn test_hashmap_i64_on_an_allocator_grows_in_it() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 262144)
+    var m: HashMapI64 = hashmap_i64_new_in(@a)
+    assert c.allocs == 1
+    assert allocator_of(m.entries as *u8) == @a
+    for i in 0..100
+        hashmap_i64_insert(@&m, i * 7, i)
+    # 16 entries -> 32 -> 64 -> 128 -> 256.
+    assert hashmap_i64_cap(@m) == 256
+    assert allocator_of(m.entries as *u8) == @a
+    assert c.allocs == 5
+    assert c.frees == 4
+    for i in 0..100
+        assert hashmap_i64_get(@m, i * 7) == i
+    hashmap_i64_drop(@&m)
+    assert c.allocs == c.frees
+    assert c.live_bytes == 0
+
+    var w: HashMapI64 = hashmap_i64_with_cap_in(@a, 100)
+    assert hashmap_i64_cap(@w) == 128
+    assert allocator_of(w.entries as *u8) == @a
+    hashmap_i64_drop(@&w)
+    assert c.allocs == c.frees
+
+    # The plain constructor stays on the global heap.
+    var g: HashMapI64 = hashmap_i64_new()
+    for i in 0..100
+        hashmap_i64_insert(@&g, i, i)
+    assert allocator_of(g.entries as *u8) == null
+    hashmap_i64_drop(@&g)
+    assert c.allocs == c.frees
+    arena_destroy(@c.arena)
+    0
+
+struct BoxPayload
+    a: i64
+    b: i64
+    c: i64
+
+[[test]]
+fn test_box_on_an_allocator() -> i32
+    var c: CountingArena
+    var a: Allocator = counting_new(@c, 65536)
+    var b: Box<BoxPayload> = box_new_in<BoxPayload>(@a, BoxPayload { a: 1, b: 2, c: 3 })
+    assert box_valid<BoxPayload>(@b) == 1
+    assert c.allocs == 1
+    assert allocator_of(b.ptr as *u8) == @a
+    assert in_arena(@c, b.ptr as *u8)
+    let v: BoxPayload = box_get<BoxPayload>(@b)
+    assert v.a == 1 and v.b == 2 and v.c == 3
+    box_drop<BoxPayload>(@&b)
+    assert c.frees == 1
+    assert c.live_bytes == 0
+
+    # Out of memory: an empty Box.
+    var none: Allocator = Allocator { ctx: null, alloc: none_alloc, free: none_free }
+    var e: Box<i64> = box_new_in<i64>(@none, 5)
+    assert box_valid<i64>(@e) == 0
+
+    # The plain constructor stays on the global heap.
+    var g: Box<i64> = box_new<i64>(7)
+    assert allocator_of(g.ptr as *u8) == null
+    box_drop<i64>(@&g)
+    assert c.frees == 1
+    arena_destroy(@c.arena)
     0

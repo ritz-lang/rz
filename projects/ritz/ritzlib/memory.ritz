@@ -312,15 +312,52 @@ struct SizeBin
     block_size: i64       # Total block size (header + usable)
     slab: *u8             # Current slab being carved
     slab_offset: i64      # Next allocation offset in slab
-    slab_size: i64        # Total slab size
+    home: *Heap           # The heap whose source its slabs come from
 
-# Global allocator state
-struct GlobalAlloc
+# A size-class heap over one page source (AGAST #4326): the bins below, and
+# the source their 64 KiB slabs and its large blocks map from and unmap to.
+# g_alloc, the global heap behind malloc/free, is one with no source of its
+# own: it follows whichever PageSource page_source_set has installed. A Heap
+# from heap_init keeps the PageSource it was given, whatever is installed
+# later, and an Allocator over it (heap_allocator) puts small blocks in its
+# slabs rather than a page apiece.
+pub struct Heap
     bins: [9]SizeBin      # One per size class
     initialized: i32
+    own_source: bool      # false: the installed page source (g_alloc)
+    source: PageSource    # when own_source
+    slabs: *FreeNode      # every slab mapped, chained through its first word
+    large: *LargeLink     # live large blocks from heap_allocator
 
 # Global allocator instance
-var g_alloc: GlobalAlloc
+var g_alloc: Heap
+
+# The first SLAB_LINK_SIZE bytes of each slab link it into its Heap's slabs;
+# blocks are carved after them, still 16-aligned.
+const SLAB_SIZE: i64 = 65536
+const SLAB_LINK_SIZE: i64 = 16
+
+# Ahead of each large block heap_allocator hands out: its mapping's length
+# and its place in the Heap's large list, so heap_destroy can unmap it.
+struct LargeLink
+    prev: *LargeLink
+    next: *LargeLink
+    map_len: i64
+    pad: i64
+
+const LARGE_LINK_SIZE: i64 = 32
+
+fn heap_page_map(h: *Heap, len: i64) -> *u8
+    if not h.own_source
+        return page_map(len)
+    let f: fn(i64) -> *u8 = h.source.map
+    return f(len)
+
+fn heap_page_unmap(h: *Heap, p: *u8, len: i64) -> i32
+    if not h.own_source
+        return page_unmap(p, len)
+    let f: fn(*u8, i64) -> i32 = h.source.unmap
+    return f(p, len)
 
 # Get block size for a size class
 fn get_block_size(class: i32) -> i64
@@ -365,52 +402,67 @@ fn get_size_class(size: i64) -> i32
         return 7
     return -1  # Large allocation
 
-# Initialize a size bin
+# Initialize a size bin, leaving home unset: heap_bind points it at its heap
+# where that heap's address is final (alloc_init for g_alloc, heap_init,
+# heap_allocator and heap_destroy for a caller's Heap). No bin is used
+# before it is bound.
 fn bin_init(bin: *SizeBin, block_size: i64)
     bin.free_list = null
     bin.block_size = block_size
     bin.slab = null
     bin.slab_offset = 0
-    bin.slab_size = 0
 
-# Allocate a new slab for a bin
+# Allocate a new 64 KiB slab for a bin, from its heap's source, linked into
+# that heap's slabs
 fn bin_new_slab(bin: *SizeBin) -> i32
-    # Allocate 64KB slabs for efficiency
-    let slab_size: i64 = 65536
-    let slab: *u8 = page_map(slab_size)
+    let h: *Heap = bin.home
+    let slab: *u8 = heap_page_map(h, SLAB_SIZE)
     if mmap_failed(slab)
         return -1
+    let link: *FreeNode = slab as *FreeNode
+    link.next = h.slabs
+    h.slabs = link
     bin.slab = slab
-    bin.slab_offset = 0
-    bin.slab_size = slab_size
+    bin.slab_offset = SLAB_LINK_SIZE
     return 0
 
-# Allocate from a bin
-fn bin_alloc(bin: *SizeBin, class: i32) -> *u8
+# Carve one block of `class` from bin's current slab, which has room.
+fn bin_carve(bin: *SizeBin, class: i64) -> *u8
+    let block: *u8 = bin.slab + bin.slab_offset
+    bin.slab_offset = bin.slab_offset + bin.block_size
+
+    # Set up header
+    let header: *BlockHeader = block as *BlockHeader
+    header.size_class = class
+    header.owner = null
+
+    # Return pointer after header
+    return block + HEADER_SIZE
+
+# bin_alloc once bin's slab is used up: a new slab from the bin's heap, then
+# carve. Once per 64 KiB, so out of line: malloc's inlined fast path stays
+# small, and the heap argument costs the hot path nothing.
+[[noinline]]
+fn bin_refill(bin: *SizeBin, class: i64) -> *u8
+    if bin_new_slab(bin) != 0
+        return null
+    return bin_carve(bin, class)
+
+# Allocate from a bin; its heap is bin.home
+fn bin_alloc(bin: *SizeBin, class: i64) -> *u8
     # Try free list first
     if bin.free_list != null
         let node: *FreeNode = bin.free_list
         bin.free_list = node.next
         # The header is at (node - HEADER_SIZE)
         let header: *BlockHeader = (node as i64 - HEADER_SIZE) as *BlockHeader
-        header.size_class = class as i64
+        header.size_class = class
         return node as *u8
 
     # Carve from slab
-    if bin.slab == null or bin.slab_offset + bin.block_size > bin.slab_size
-        if bin_new_slab(bin) != 0
-            return null
-
-    let block: *u8 = bin.slab + bin.slab_offset
-    bin.slab_offset = bin.slab_offset + bin.block_size
-
-    # Set up header
-    let header: *BlockHeader = block as *BlockHeader
-    header.size_class = class as i64
-    header.owner = null
-
-    # Return pointer after header
-    return block + HEADER_SIZE
+    if bin.slab == null or bin.slab_offset + bin.block_size > SLAB_SIZE
+        return bin_refill(bin, class)
+    return bin_carve(bin, class)
 
 # Free to a bin
 fn bin_free(bin: *SizeBin, ptr: *u8)
@@ -419,15 +471,27 @@ fn bin_free(bin: *SizeBin, ptr: *u8)
     node.next = bin.free_list
     bin.free_list = node
 
+# Empty bins, no slabs, no large blocks.
+fn heap_init_bins(h: *Heap)
+    for i in 0..NUM_SIZE_CLASSES
+        bin_init(@h.bins[i], get_block_size(i))
+    h.slabs = null
+    h.large = null
+    h.initialized = 1
+
+# Point every bin at its heap, so a slab refill knows where to map from. Split
+# from heap_init_bins because a caller's Heap is bound where its address is
+# final: heap_init, heap_allocator and heap_destroy all call it.
+fn heap_bind(h: *Heap)
+    for i in 0..NUM_SIZE_CLASSES
+        h.bins[i].home = h
+
 # Initialize the global allocator
 fn alloc_init()
     if g_alloc.initialized != 0
         return
-
-    for i in 0..NUM_SIZE_CLASSES
-        bin_init(@g_alloc.bins[i], get_block_size(i))
-
-    g_alloc.initialized = 1
+    heap_init_bins(@g_alloc)
+    heap_bind(@g_alloc)
 
 # ============================================================================
 # Public API: malloc, free, realloc
@@ -438,9 +502,11 @@ pub fn malloc(size: i64) -> *u8
     if size <= 0
         return null
 
-    alloc_init()
+    # The check is inline: alloc_init is a call, and malloc is the hot path.
+    if g_alloc.initialized == 0
+        alloc_init()
 
-    let class: i32 = get_size_class(size)
+    let class: i64 = get_size_class(size) as i64
 
     if class < 0
         # Large allocation - use mmap directly.
@@ -669,7 +735,96 @@ fn pages_round(len: i64) -> i64
 
 # An Allocator whose every block is its own whole-page mapping from `src`,
 # given back to `src` on free, whichever PageSource page_source_set has
-# installed by then. For a subsystem with its own pages; small blocks each
-# cost a page (no size-class layer per source yet: AGAST #4326).
+# installed by then. Every small block costs a page: heap_allocator, below,
+# packs them into slabs from the source instead.
 pub fn pages_allocator(src: *PageSource) -> Allocator
     return Allocator { ctx: src as *u8, alloc: pages_allocator_alloc, free: pages_allocator_free }
+
+# ---- Heap: a size-class layer over a PageSource (AGAST #4326) ----
+
+# Fill `h` as a Heap whose slabs and large blocks map from `src` and unmap to
+# it, whatever page_source_set installs later. Nothing is mapped until the
+# first block. Fills in place rather than returning a Heap: a Heap is large,
+# and ritz0 emits an internal sret-copy helper for a large by-value return.
+# `h` must stay at this address while its Allocator or any block from it is
+# live.
+pub fn heap_init(h: *Heap, src: PageSource)
+    heap_init_bins(h)
+    h.own_source = true
+    h.source = src
+    heap_bind(h)
+
+# The size class heap_allocator serves a len-byte request (header included)
+# from, or -1 for a large block.
+fn heap_class(len: i64) -> i32
+    if len <= HEADER_SIZE
+        return 0
+    return get_size_class(len - HEADER_SIZE)
+
+fn heap_allocator_alloc(ctx: *u8, len: i64) -> *u8
+    let h: *Heap = ctx as *Heap
+    let class: i64 = heap_class(len) as i64
+    if class >= 0
+        # bin_alloc returns the block's usable bytes; the caller (malloc_in)
+        # writes its own header over the bin's, so hand out the whole block.
+        let p: *u8 = bin_alloc(@h.bins[class], class)
+        if p == null
+            return null
+        return p - HEADER_SIZE
+    let map_len: i64 = pages_round(len + LARGE_LINK_SIZE)
+    if map_len <= len
+        return null
+    let m: *u8 = heap_page_map(h, map_len)
+    if mmap_failed(m)
+        return null
+    let link: *LargeLink = m as *LargeLink
+    link.prev = null
+    link.next = h.large
+    link.map_len = map_len
+    if h.large != null
+        h.large.prev = link
+    h.large = link
+    return m + LARGE_LINK_SIZE
+
+fn heap_allocator_free(ctx: *u8, p: *u8, len: i64) -> i32
+    let h: *Heap = ctx as *Heap
+    let class: i32 = heap_class(len)
+    if class >= 0
+        bin_free(@h.bins[class], p + HEADER_SIZE)
+        return 0
+    let link: *LargeLink = (p as i64 - LARGE_LINK_SIZE) as *LargeLink
+    if link.prev != null
+        link.prev.next = link.next
+    else
+        h.large = link.next
+    if link.next != null
+        link.next.prev = link.prev
+    return heap_page_unmap(h, link as *u8, link.map_len)
+
+# An Allocator over `h`: small blocks come out of h's size-class slabs and
+# free puts them back in its bins; a block over 2 KiB is its own mapping from
+# h's source. h must stay where it is while the Allocator or any block from
+# it is live. Binds h's bins to h: this is where a Heap's address is final.
+pub fn heap_allocator(h: *Heap) -> Allocator
+    heap_bind(h)
+    return Allocator { ctx: h as *u8, alloc: heap_allocator_alloc, free: heap_allocator_free }
+
+# Unmap every slab and every live large block of h to its source, and leave
+# h empty, ready for reuse. Every block from h is gone with them: nothing
+# allocated from it may be used, or freed, afterwards. The global heap is
+# never destroyed (a no-op on it).
+pub fn heap_destroy(h: *Heap)
+    if h == @g_alloc
+        return
+    var s: *FreeNode = h.slabs
+    while s != null
+        let next: *FreeNode = s.next
+        heap_page_unmap(h, s as *u8, SLAB_SIZE)
+        s = next
+    var l: *LargeLink = h.large
+    while l != null
+        let next: *LargeLink = l.next
+        heap_page_unmap(h, l as *u8, l.map_len)
+        l = next
+    heap_init_bins(h)
+    heap_bind(h)
