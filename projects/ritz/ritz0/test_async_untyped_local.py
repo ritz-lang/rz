@@ -42,6 +42,8 @@ def _go(body: str, params: str = "x: i32") -> str:
 def _type_name(ty) -> str:
     if isinstance(ty, rast.PtrType):
         return "*" + _type_name(ty.inner)
+    if isinstance(ty, rast.FnType):  # the header's `__poll` (LARB R79)
+        return f"fn({', '.join(map(_type_name, ty.params))}) -> {_type_name(ty.ret)}"
     return ty.name
 
 

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 import bool_rules
 from builtin_types import PRIMITIVES
 import float_rules
+import future_rules
 import ref_rules
 import ritz_ast as rast
 from monomorph import bind_type_params, mangle_generic_name, TypeSubstitution
@@ -190,6 +191,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
         # Third pass: check function bodies
         wanted = emits_body or (lambda _fn: True)
+        # `Future` has no size: a by-value slot of one (LARB R79).
+        for message, span in future_rules.by_value_errors(module, wanted):
+            self._slot_error(message, span)
         for item in module.items:
             if isinstance(item, rast.FnDef) and wanted(item):
                 self._check_function(item)
@@ -876,6 +880,13 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 elif isinstance(expr.args[0], SIZEOF_VALUE_OPERANDS):
                     self._quiet_type(expr.args[0])
                 return rast.NamedType(expr.span, 'i64', [])
+
+            # future_poll(f: @&Future) -> bool (LARB R79): `f` is typed and
+            # held to an `@&Future` slot like any argument.
+            if fn_name == future_rules.POLL and fn_name not in self.functions:
+                for arg in expr.args:
+                    self._check_ref_slot(arg, self._infer_type(arg), future_rules.POLL_PARAM)
+                return rast.NamedType(expr.span, 'bool', [])
 
             # typeof(expr) -> type info (returns i64 type id for now)
             if fn_name == 'typeof':

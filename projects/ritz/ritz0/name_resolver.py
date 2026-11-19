@@ -72,6 +72,8 @@ class NameResolver:
         'volatile_load', 'volatile_store', 'atomic_load', 'atomic_store',
         'atomic_xchg', 'atomic_cmpxchg', 'atomic_fetch_add', 'atomic_fetch_sub',
         'atomic_fetch_and', 'atomic_fetch_or', 'atomic_fetch_xor', 'fence',
+        # Poll an `@&Future` through its header (LARB R79, AGAST #4006)
+        'future_poll',
     } | INTRINSICS
 
     # Built-in types
@@ -88,6 +90,9 @@ class NameResolver:
         'v2i64', 'v4i32', 'v8i16', 'v16i8',
         # SIMD vector types (AVX2 256-bit)
         'v4i64', 'v8i32', 'v16i16', 'v32i8',
+        # Some async fn's future, by reference only: `@&Future` (LARB R79,
+        # AGAST #4006; future_rules.py).
+        'Future',
     }
 
     def __init__(self, module_names: Optional[Set[str]] = None):

@@ -29,6 +29,7 @@ import ref_rules
 import let_rules
 import bool_rules
 import float_rules
+import future_rules
 import binder_names
 import type_order
 import match_coverage
@@ -12035,6 +12036,8 @@ class LLVMEmitter:
         For non-async calls, just evaluate the inner expression (synchronous MVP).
         """
         inner_expr = await_expr.expr
+        while isinstance(inner_expr, rast.Grouped):
+            inner_expr = inner_expr.expr
 
         # Check if this is a call to an async function
         if isinstance(inner_expr, rast.Call) and isinstance(inner_expr.func, rast.Ident):
@@ -12042,6 +12045,12 @@ class LLVMEmitter:
             if fn_name in self.async_functions:
                 # Async function call outside async context - generate poll loop
                 return self._emit_await_poll_loop(fn_name, inner_expr.args)
+
+        # A held future (`var p = f(args)`, LARB R79): poll it in place until
+        # it answers true (at once, if it has finished), then read its result.
+        held = self._held_future_fn(inner_expr)
+        if held is not None:
+            return self._emit_poll_until_ready(held, self._emit_lvalue_addr(inner_expr))
 
         # Non-async call: just evaluate the inner expression (MVP behavior)
         return self._emit_expr(inner_expr)
@@ -12087,6 +12096,36 @@ class LLVMEmitter:
         future_alloca = self.builder._entry_alloca(future_llvm_type, "future")  # AGAST #3661
         future_val = self.builder.call(constructor_fn, emit_args, name="future_init")
         self.builder.store(future_val, future_alloca)
+        return self._emit_poll_until_ready(fn_name, future_alloca)
+
+    def _held_future_fn(self, expr: rast.Expr) -> Optional[str]:
+        """The async fn whose future the local `expr` holds, or None."""
+        if not isinstance(expr, rast.Ident):
+            return None
+        ty = self._infer_ritz_type(expr)
+        if not isinstance(ty, rast.NamedType) or ty.args or not ty.name.endswith('_Future'):
+            return None
+        fn_name = ty.name[:-len('_Future')]
+        return fn_name if fn_name in self.async_functions else None
+
+    def _emit_future_poll(self, call: rast.Call) -> ir.Value:
+        """`future_poll(f)`: load the poll fn from the first field of `f`'s
+        header (async_transform_v2.PollAbi.header) and call it on `f`."""
+        if len(call.args) != 1:
+            raise EmitError(f"`{future_rules.POLL}` takes one argument, an `@&Future`", call.span)
+        fut = self._emit_expr(call.args[0])
+        if not isinstance(fut.type, ir.PointerType):
+            raise EmitError(f"`{future_rules.POLL}` takes an `@&Future`", call.args[0].span)
+        poll_type = ir.FunctionType(self.i1, [self.i8.as_pointer()])
+        slot = self.builder.bitcast(fut, poll_type.as_pointer().as_pointer())
+        poll = self.builder.load(slot, name="future_poll_fn")
+        return self.builder.call(poll, [self.builder.bitcast(fut, self.i8.as_pointer())], name="future_ready")
+
+    def _emit_poll_until_ready(self, fn_name: str, future_ptr: ir.Value) -> ir.Value:
+        """Poll `fn_name`'s future at `future_ptr` until true, then its
+        result (i32 0 for a unit fn)."""
+        future_type_name = f"{fn_name}_Future"
+        poll_fn, _ = self.functions[f"{fn_name}_poll"]
 
         # Create loop blocks
         loop_block = self.current_fn.append_basic_block("poll_loop")
@@ -12099,7 +12138,7 @@ class LLVMEmitter:
         self.builder.position_at_end(loop_block)
 
         # Call poll: ready = fn_name_poll(&future)
-        ready = self.builder.call(poll_fn, [future_alloca], name="poll_ready")
+        ready = self.builder.call(poll_fn, [future_ptr], name="poll_ready")
         is_ready = self.builder.icmp_unsigned('!=', ready, ir.Constant(ready.type, 0), name="is_ready")
         self.builder.cbranch(is_ready, done_block, loop_block)
 
@@ -12108,7 +12147,7 @@ class LLVMEmitter:
         if PollAbi.RESULT not in [name for name, _ in self.struct_fields.get(future_type_name, [])]:
             return ir.Constant(self.i32, 0)
         idx = self._get_struct_field_index(future_type_name, PollAbi.RESULT)
-        result_ptr = self.builder.gep(future_alloca, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
+        result_ptr = self.builder.gep(future_ptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx)])
         return self.builder.load(result_ptr, name="await_result")
 
     def _emit_heap_expr(self, heap_expr: rast.HeapExpr) -> ir.Value:
@@ -13386,6 +13425,10 @@ class LLVMEmitter:
         if fname in MEM_BUILTINS:
             return self._emit_mem_builtin(fname, call)
 
+        # future_poll(f: @&Future) -> bool: the header's poll fn, on f (LARB R79).
+        if fname == future_rules.POLL and fname not in self.functions:
+            return self._emit_future_poll(call)
+
         # Handle print / eprint builtins - print(string_literal) -> write(1, ptr, len).
         # eprint is the same lowering to fd 2 (AGAST #1641).
         if fname in ('print', 'eprint'):
@@ -13545,6 +13588,11 @@ class LLVMEmitter:
                     if arg_is_ref or arg_is_ptr or arg_is_addr_of:
                         # Argument is already a pointer type - just emit it
                         val = self._emit_expr(arg)
+                        # Any async fn's future is a `Future` (LARB R79): the
+                        # checker judged the referent, the pointer is cast.
+                        if (future_rules.is_future(resolve_alias_in(param_def.type.inner, self.type_aliases))
+                                and isinstance(val.type, ir.PointerType)):
+                            val = self.builder.bitcast(val, expected_type)
                     else:
                         self._check_let_implicit_mut_borrow(arg, param_def)
                         # Reference parameter: emit address of the argument.
