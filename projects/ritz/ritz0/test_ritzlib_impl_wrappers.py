@@ -9,9 +9,10 @@ one-line `pub` wrapper of the free fn, as `span.ritz`'s `impl<T> Span<T>`
 already is. The table itself is deleted later, one ticket per compiler
 (#3496, #3497); this step must leave `rz test --all` unchanged.
 
-ONLY String, FOR NOW
+ONLY String HERE
 
-`impl<T> Vec<T>` and `impl<T> Option<T>` wait on #3617. Both compilers
+`impl<T> Vec<T>` and `impl<T> Option<T>` waited on #3617 and came with #4231
+(test_ritzlib_generic_impl_wrappers.py). Both compilers
 specialize every method of a generic impl for every instance of the type, even
 one only an imported signature names. The Vec wrappers then pulled `malloc`
 into every importer of ritzlib.gvec, and the `pop` / `get` / `unwrap_or`

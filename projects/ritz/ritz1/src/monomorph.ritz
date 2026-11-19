@@ -489,6 +489,45 @@ var g_ufcs_shadowed: i32 = 0
 fn reset_local_var_tracker()
     g_lv_count = 0
     g_ufcs_shadowed = 0
+    g_al_count = 0
+
+# `[N]S` locals (and `[N]*S`, `[N]@S`), name -> S, so `a[i].m()` is typed
+# (AGAST #4231, receiver_instance).  Reset with the tracker above.
+var g_al_names: **u8 = null
+var g_al_name_lens: *i32 = null
+var g_al_elems: **u8 = null
+var g_al_elem_lens: *i32 = null
+var g_al_count: i32 = 0
+var g_al_cap: i32 = 0
+
+fn track_array_local(name: *u8, name_len: i32, elem: *u8, elem_len: i32)
+    if elem == null or elem_len <= 0
+        return
+    if g_al_count >= g_al_cap
+        var cap: i32 = g_al_cap * 2
+        if cap == 0
+            cap = 16
+        g_al_names = realloc(g_al_names as *u8, (cap as i64) * 8) as **u8
+        g_al_name_lens = realloc(g_al_name_lens as *u8, (cap as i64) * 4) as *i32
+        g_al_elems = realloc(g_al_elems as *u8, (cap as i64) * 8) as **u8
+        g_al_elem_lens = realloc(g_al_elem_lens as *u8, (cap as i64) * 4) as *i32
+        g_al_cap = cap
+    *(g_al_names + g_al_count) = name
+    *(g_al_name_lens + g_al_count) = name_len
+    *(g_al_elems + g_al_count) = elem
+    *(g_al_elem_lens + g_al_count) = elem_len
+    g_al_count = g_al_count + 1
+
+# The element type name of `[N]S` local `name`, or null.  The latest
+# declaration of the name wins.
+fn array_local_elem(name: *u8, name_len: i32, out_len: *i32) -> *u8
+    var i: i32 = g_al_count - 1
+    while i >= 0
+        if buf_eq(*(g_al_names + i), *(g_al_name_lens + i), name, name_len) == 1
+            *out_len = *(g_al_elem_lens + i)
+            return *(g_al_elems + i)
+        i = i - 1
+    null
 
 fn note_ufcs_shadow(name: *u8, name_len: i32)
     var pl: i32 = 0
@@ -1390,6 +1429,9 @@ fn collect_from_stmt(m: *Module, s: *Stmt)
         if lv_kind > 0 and lv_suf != null and lv_suf_len > 0
             add_local_var(s.var_name, s.var_name_len, lv_kind, lv_suf, lv_suf_len)
             mark_last_local_by_value()
+        else if s.var_type == TYPE_ARRAY and s.var_type_name != null and s.var_type_name_len > 0
+            # `[N]S`: an element receiver `a[i].m()` is an S (AGAST #4231).
+            track_array_local(s.var_name, s.var_name_len, s.var_type_name, s.var_type_name_len)
         else if s.var_type_name != null and s.var_type_name_len > 0
             # Plain struct (or pointer/ref to one): root of a field receiver.
             track_typed_local_through(s.var_name, s.var_name_len, s.var_type, s.var_pointee_type, s.var_type_name, s.var_type_name_len)
@@ -4797,38 +4839,155 @@ fn want_method(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32)
     if wanted_in(g_wanted_methods, tn, d, tn + d, tn_len - d, meth, meth_len) == 0
         g_wanted_methods = push_wanted(g_wanted_methods, tn, d, tn + d, tn_len - d, meth, meth_len)
 
+# "Vec$i32" / "Span$u8" for a Vec / Span of the tracker's kind and suffix.
+fn collection_instance_name(kind: i32, suf: *u8, suf_len: i32, out_len: *i32) -> *u8
+    var base: *u8 = c"Vec"
+    var bl: i32 = 3
+    if kind == 2
+        base = c"Span"
+        bl = 4
+    let tn: *u8 = malloc((bl + suf_len) as i64 + 1)
+    memcpy(tn, base, bl as i64)
+    memcpy(tn + bl, suf, suf_len as i64)
+    *(tn + bl + suf_len) = 0
+    *out_len = bl + suf_len
+    tn
+
+# The type a call `f(..)` returns, by name: a plain fn's (or an impl method's
+# by its symbol, `String_from`), or a one-param generic fn's `Base$T` at the
+# call's own suffix (`vec_new<i32>()` -> "Vec$i32").  null when unknown.
+fn call_result_type_name(m: *Module, call: *Expr, out_len: *i32) -> *u8
+    var f: *FnDef = find_fn_in_module(m, call.func_name, call.func_name_len)
+    if f == null
+        f = find_impl_method_by_symbol(m, call.func_name, call.func_name_len)
+    if f == null or f.return_type_name == null or f.return_type_name_len <= 0
+        return null
+    if f.type_params == null
+        *out_len = f.return_type_name_len
+        return f.return_type_name
+    let tp: *TypeParam = f.type_params
+    if tp.next != null or call.call_type_suffix == null or call.call_type_suffix_len <= 0
+        return null
+    let d: i32 = find_dollar_sign(f.return_type_name, f.return_type_name_len)
+    if d <= 0 or buf_eq(f.return_type_name + d + 1, f.return_type_name_len - d - 1, tp.name, tp.name_len) == 0
+        return null
+    let n: i32 = d + call.call_type_suffix_len
+    let tn: *u8 = malloc(n as i64 + 1)
+    memcpy(tn, f.return_type_name, d as i64)
+    memcpy(tn + d, call.call_type_suffix, call.call_type_suffix_len as i64)
+    *(tn + n) = 0
+    *out_len = n
+    tn
+
+# The instance a method call's receiver is a value of ("W$i32"), or null when
+# the tracker can't tell.  `&x`, `@x`, `*p` are x's / p's; `x`, `a.b`, `p[i]`
+# of a Vec<Vec<T>> or a `[N]S` local, and a call's result are typed
+# (AGAST #4231: ritzlib's `impl<T> Vec<T>` made every untyped `.push(..)`
+# specialise `push` on every Vec instance, linking malloc into -nostdlib
+# importers and move-checking `Vec<MoveOnly>`'s `get`).
+fn receiver_instance(m: *Module, recv: *Expr, out_len: *i32) -> *u8
+    var r: *Expr = recv
+    while r != null and r.kind == EXPR_UNARY and (r.op == OP_ADDR or r.op == OP_ADDR_MUT or r.op == OP_DEREF)
+        r = r.operand
+    if r == null
+        return null
+    if r.kind == EXPR_IDENT
+        let idx: i32 = find_local_var_idx(r.ident_ptr, r.ident_len)
+        if idx < 0
+            return null
+        if *(g_lv_prefix_kind + idx) == 0
+            *out_len = *(g_lv_type_name_lens + idx)
+            return *(g_lv_type_names + idx)
+        return collection_instance_name(*(g_lv_prefix_kind + idx), *(g_lv_suffixes + idx), *(g_lv_suffix_lens + idx), out_len)
+    if r.kind == EXPR_MEMBER
+        let rf: *StructField = resolve_member_field(m, r)
+        if rf == null or rf.field_type_name == null or rf.field_type_name_len <= 0
+            return null
+        *out_len = rf.field_type_name_len
+        return rf.field_type_name
+    if r.kind == EXPR_INDEX
+        var esuf: *u8 = null
+        var esuf_len: i32 = 0
+        let ekind: i32 = indexed_element_collection(m, r, @esuf, @esuf_len)
+        if ekind > 0
+            return collection_instance_name(ekind, esuf, esuf_len, out_len)
+        if r.left != null and r.left.kind == EXPR_IDENT and r.right != null and r.right.kind != EXPR_RANGE
+            return array_local_elem(r.left.ident_ptr, r.left.ident_len, out_len)
+        return null
+    if r.kind == EXPR_CALL
+        return call_result_type_name(m, r, out_len)
+    if r.kind == EXPR_METHOD
+        # `a.slice(0, 1).get(0)`: what the inner method returns at a's type.
+        var il: i32 = 0
+        let inner: *u8 = receiver_instance(m, r.left, @il)
+        if inner == null or il <= 0
+            return null
+        return method_result_type_name(m, inner, il, r.ident_ptr, r.ident_len, out_len)
+    null
+
+# The type impl method `meth` of instance `tn` ("Vec$i32", or a plain "S")
+# returns, by name: a one-param generic impl's `T` / `Base$T` at tn's suffix,
+# or a concrete name as written.  null when unknown, or when the name still
+# holds a type param this can't substitute.
+fn method_result_type_name(m: *Module, tn: *u8, tn_len: i32, meth: *u8, meth_len: i32, out_len: *i32) -> *u8
+    let d: i32 = find_dollar_sign(tn, tn_len)
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        if ib.trait_name == null or ib.trait_name_len == 0
+            let generic: i32 = (ib.type_params != null) as i32
+            var hit: i32 = 0
+            if generic == 1 and d > 0
+                hit = buf_eq(ib.type_name, ib.type_name_len, tn, d)
+            else if generic == 0
+                hit = buf_eq(ib.type_name, ib.type_name_len, tn, tn_len)
+            if hit == 1
+                var f: *FnDef = ib.methods
+                while f != null
+                    if buf_eq(f.name, f.name_len, meth, meth_len) == 1
+                        return method_ret_at(ib, f, tn, tn_len, d, out_len)
+                    f = f.next
+        ib = ib.next
+    null
+
+fn method_ret_at(ib: *ImplBlock, f: *FnDef, tn: *u8, tn_len: i32, d: i32, out_len: *i32) -> *u8
+    let rn: *u8 = f.return_type_name
+    let rl: i32 = f.return_type_name_len
+    if rn == null or rl <= 0
+        return null
+    if ib.type_params == null
+        *out_len = rl
+        return rn
+    let tp: *TypeParam = ib.type_params
+    if tp.next != null
+        return null
+    if buf_eq(rn, rl, tp.name, tp.name_len) == 1
+        # `-> T`: the instance's own argument.
+        *out_len = tn_len - d - 1
+        return tn + d + 1
+    let rd: i32 = find_dollar_sign(rn, rl)
+    if rd < 0
+        *out_len = rl
+        return rn   # a concrete type
+    if buf_eq(rn + rd + 1, rl - rd - 1, tp.name, tp.name_len) == 0
+        return null
+    let n: i32 = rd + tn_len - d
+    let out: *u8 = malloc(n as i64 + 1)
+    memcpy(out, rn, rd as i64)
+    memcpy(out + rd, tn + d, (tn_len - d) as i64)
+    *(out + n) = 0
+    *out_len = n
+    out
+
 # `recv.meth(..)`: the instance the tracker types `recv` as, or every one.
 fn want_receiver_method(m: *Module, recv: *Expr, meth: *u8, meth_len: i32)
     if inherent_generic_method(m, null, 0, meth, meth_len) == 0
         return
-    var r: *Expr = recv
-    if r != null and r.kind == EXPR_UNARY and (r.op == OP_ADDR or r.op == OP_ADDR_MUT)
-        r = r.operand
-    if r != null and r.kind == EXPR_IDENT
-        let idx: i32 = find_local_var_idx(r.ident_ptr, r.ident_len)
-        if idx >= 0 and *(g_lv_prefix_kind + idx) == 0
-            want_method(m, *(g_lv_type_names + idx), *(g_lv_type_name_lens + idx), meth, meth_len)
-            return
-        if idx >= 0
-            # A Vec / Span local: its type is the kind's name and suffix.
-            var base: *u8 = c"Vec"
-            var bl: i32 = 3
-            if *(g_lv_prefix_kind + idx) == 2
-                base = c"Span"
-                bl = 4
-            let sl: i32 = *(g_lv_suffix_lens + idx)
-            let tn: *u8 = malloc((bl + sl) as i64 + 1)
-            memcpy(tn, base, bl as i64)
-            memcpy(tn + bl, *(g_lv_suffixes + idx), sl as i64)
-            *(tn + bl + sl) = 0
-            want_method(m, tn, bl + sl, meth, meth_len)
-            return
-    else if r != null and r.kind == EXPR_MEMBER
-        let rf: *StructField = resolve_member_field(m, r)
-        if rf != null and rf.field_type_name != null and rf.field_type_name_len > 0
-            want_method(m, rf.field_type_name, rf.field_type_name_len, meth, meth_len)
-            return
-    want_method(m, null, 0, meth, meth_len)
+    var tn_len: i32 = 0
+    let tn: *u8 = receiver_instance(m, recv, @tn_len)
+    if tn == null or tn_len <= 0
+        want_method(m, null, 0, meth, meth_len)
+    else
+        want_method(m, tn, tn_len, meth, meth_len)
 
 # The method calls in an expression: `a.m(b.n())` wants `m` and `n`.
 fn want_methods_in(m: *Module, e: *Expr)
