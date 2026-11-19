@@ -38,6 +38,10 @@ enum Order
 struct P
     x: i32
 
+struct B
+    pad: [64]i32
+    v: u8
+
 impl P
     fn make(v: i32) -> P
         return P { x: v }
@@ -110,6 +114,11 @@ REJECTED = {
     "arg_static_method":    _fn("let p = P.make(big())"),
     "arg_instance_method":  _fn("var p = P.make(1)\np.set(big())"),
     "arg_unsigned_slot":    _fn("take_u8(0 - 1)"),
+    # struct literal field (#4157): a small literal is built as a value, a
+    # large one (>= SRET_MIN_BYTES) in place, each converting its fields.
+    "field_value_lit":      _fn("let p = P { x: big() }"),
+    "field_in_place_lit":   _fn("var b = B { v: x }"),
+    "field_unsigned_slot":  _fn("var b = B { v: 0 - 1 }"),
 }
 
 
@@ -130,6 +139,7 @@ DIAGNOSTICS = {
     "async_tail":   ("async fn f() -> i32\n    big()\n", 2, 5, "`f` returns `i32`"),
     "async_return_after_await": ("async fn f() -> i32\n    let w = await one()\n    return big()\n\n"
                                  "async fn one() -> i32\n    1\n", 3, 12, "`f` returns `i32`"),
+    "field_init": (_fn("let p = P { x: big() }"), 2, 20, "field `x` of `P` is `i32`"),
 }
 
 
@@ -183,6 +193,12 @@ ACCEPTED = {
     "arg_mask":               _fn("take(big() & 255)"),
     "arg_explicit_cast":      _fn("take(big() as i32)\nP.make(big() as i32)"),
     "arg_widening":           _fn("take64(x)"),
+    # struct literal field
+    "field_constant_fits":    _fn("let p = P { x: 7 }\nvar b = B { v: 200 }"),
+    "field_mask":             _fn("var b = B { v: x & 255 }"),
+    "field_explicit_cast":    _fn("let p = P { x: big() as i32 }\nvar b = B { v: x as u8 }"),
+    "field_widening":         _fn("let p = P { x: k }"),
+    "field_if_literal_arm":   _fn("var b = B { v: if x > 0 then k else 0 }"),
     # #1396's literal context, which a `let` gets, at each position: the
     # literal takes the slot's width, so `8 << ...` shifts at i32.
     "return_literal_shift":   _fn("return 8 << (x & 3)", tail=""),

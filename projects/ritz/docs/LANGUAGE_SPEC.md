@@ -2829,6 +2829,19 @@ fn main() -> i32
     return take(big())      # would silently pass 5
 ```
 
+A struct literal's field initialiser is a slot of the same kind, whose type is
+the field's:
+
+```ritz expect-error="implicit narrowing: field `v` of `S` is `u8` but this value has type `u16`"
+struct S
+    v: u8
+
+fn main() -> i32
+    let x: u16 = 300
+    let s = S { v: x }      # would silently store 44
+    return s.v as i32
+```
+
 A procedure's tail value is discarded, so it converts to nothing and isn't
 checked. An `async fn`'s result is checked at its declared type, like any
 other fn's: only its poll fn's own answer, the poll ABI's `bool` (LARB R78),
@@ -2849,12 +2862,13 @@ let k: i64 = 300
 let a: [2]u8 = [1, k]
 ```
 
-ritz0 and ritz1 both enforce this rule at every slot above.
-`ritz0/test_ritz1_implicit_narrowing.py` checks that they give the same
-verdict on every case in `ritz0/test_implicit_narrowing.py` (a `let`/`var`
-initialiser), and `ritz0/test_ritz1_implicit_narrowing_slots.py` does the
-same for `ritz0/test_implicit_narrowing_slots.py` (an assignment, an argument
-and a `return`, AGAST #1444 / #4081). ritz1 infers the value's type from its
+ritz0 and ritz1 both enforce this rule at every slot above but one: ritz1
+still narrows silently into a struct literal field (ritz0 since AGAST #4157)
+until AGAST #4218. `ritz0/test_ritz1_implicit_narrowing.py` checks that they
+give the same verdict on every case in `ritz0/test_implicit_narrowing.py` (a
+`let`/`var` initialiser), and `ritz0/test_ritz1_implicit_narrowing_slots.py`
+does the same for `ritz0/test_implicit_narrowing_slots.py` (an assignment, an
+argument and a `return`, AGAST #1444 / #4081). ritz1 infers the value's type from its
 Ritz types. Where that inference is unsure, for example for an unannotated
 local, ritz1 accepts the value rather than guess (#1364).
 

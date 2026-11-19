@@ -12692,6 +12692,11 @@ class LLVMEmitter:
         else:
             field_val = self._emit_into_array_slot(field_expr, expected_type)
         field_ty = self._ritz_type_to_llvm(expected_type)
+        # Section 7.5 (#4157): the field's type is a declared slot, like a
+        # typed let's. Checked before `_convert_type`, which truncates.
+        self._check_slot_narrowing(
+            field_expr, field_val, field_ty, expected_type,
+            f"field `{field_name}` of `{struct_name}` is `{{t}}`", "field")
         field_val = self._convert_type(field_val, field_ty, field_expr)
         if field_val.type != field_ty:
             # _convert_type passes what it can't convert through unchanged:

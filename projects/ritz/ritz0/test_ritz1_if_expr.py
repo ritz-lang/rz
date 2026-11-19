@@ -426,12 +426,12 @@ fn twice(v: i32) -> i32
     v * 2
 
 fn mk(c: i32) -> P
-    let ax = if c == 1
+    let ax: i32 = if c == 1
         twice(5)
     else
         1
     let a: P = P { x: ax, y: 0 }
-    let bx = if c == 0
+    let bx: i32 = if c == 0
         0
     else if c == 1
         twice(a.x)

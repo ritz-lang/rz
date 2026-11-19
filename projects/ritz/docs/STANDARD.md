@@ -906,10 +906,10 @@ is provably lossless (LANGUAGE_SPEC §7.5, #1393). Annotate the binding,
 `var i: i32 = 0`, or narrow on purpose with `<expr> as i32`.
 
 ritz0 and ritz1 refuse it in a typed `let` or `var` initialiser. ritz1 doesn't
-yet refuse an *unannotated* source like `var i = 0` (#1688). ritz0 also refuses
+yet refuse an *unannotated* source like `var i = 0` (#1688). Both also refuse
 it in an assignment (`=` and `op=`), a call argument and a `return` or function
-tail (#1444). ritz1 still narrows those silently until #4081, so write the `as`
-there too.
+tail (#1444, #4081). ritz0 refuses it in a struct literal field too (#4157);
+ritz1 still narrows there silently until #4218, so write the `as` there too.
 
 ```ritz body expect-error="implicit narrowing: `n` is declared `i32` but its initialiser has type `i64`"
 var i: i64 = 0
