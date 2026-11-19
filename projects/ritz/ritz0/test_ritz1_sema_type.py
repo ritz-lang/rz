@@ -307,8 +307,13 @@ CORPUS_FLOOR = 15000
 # a field, call or method holds.  24 at #4200, which binds a `ptr_T`
 # Option / Result payload (`Some(p)`, p: *Inner_2) as a pointer on Sema; the
 # emitter's bool_kind of it (emitter_match's bk_tagged_payload) is the unsure
-# side (#4280).  Lower it as they go.
-BK_GAP_CEILING = 24
+# side (#4280).  10 at #4280 / #4265: the emitter reads a `ptr_T` payload
+# binding as a pointer too (bk_tagged_binding, LocalVar.bk_ptr), Sema types a
+# user-enum payload (`Err(e)` of Result<T, Errno>) as its enum, and a payload
+# binding Sema typed (a struct one too) takes its bool kind from that type
+# (test_ritz1_payload_bk_gap.py).  What's left: `(*(@x)).f` where the emitter
+# is the unsure side, and `.as_bytes()` / a StrView index.  Lower it as they go.
+BK_GAP_CEILING = 10
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

@@ -396,6 +396,38 @@ pub fn sema_tagged_payload(sm: *Sema, name: *u8, len: i32, is_err: i32) -> *Stru
         cut += 1
     null
 
+# AGAST #4265: the user enum (`Errno`, a local `enum E2`) an `Option$E` /
+# `Result$T$E` carries in Some / Ok (is_err 0) or Err (1), as a slice of `name`
+# into `out_len`; null if that payload is no (non-generic) user enum.  A
+# Result's split is the first `$` with a user enum on the side wanted.
+fn sema_tagged_enum_payload(name: *u8, len: i32, is_err: i32, out_len: *i32) -> *u8
+    *out_len = 0
+    var d: i32 = 0
+    while d < len and *(name + d) != '$'
+        d += 1
+    if d >= len
+        return null
+    let sfx: *u8 = name + d + 1
+    let sfx_len: i32 = len - d - 1
+    if name_eq(name, d, c"Option", 6) == 1
+        if is_err == 1 or user_enum_index(sfx, sfx_len) < 0
+            return null
+        *out_len = sfx_len
+        return sfx
+    if name_eq(name, d, c"Result", 6) == 0
+        return null
+    var cut: i32 = 0
+    while cut < sfx_len
+        if *(sfx + cut) == '$'
+            if is_err == 0 and user_enum_index(sfx, cut) >= 0
+                *out_len = cut
+                return sfx
+            if is_err == 1 and user_enum_index(sfx + cut + 1, sfx_len - cut - 1) >= 0
+                *out_len = sfx_len - cut - 1
+                return sfx + cut + 1
+        cut += 1
+    null
+
 # A match arm's binding `V(x)` on `scrut`: V's payload.  Unknown for a
 # catch-all name, as the emitter left it: a `match` on a struct value is
 # refused (by ritz0 too), and typing one only lets `.` reach unlowerable IR.
@@ -410,7 +442,15 @@ pub fn sema_arm_payload_ty(sm: *Sema, arm: *MatchArm, scrut: *Expr, t: *SemaTy) 
         var is_err: i32 = 0
         if name_eq(arm.pattern_name, arm.pattern_name_len, c"Err", 3) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"None", 4) == 1
             is_err = 1
-        return sema_struct_ty(sema_tagged_payload(sm, s.name, s.name_len, is_err), t)
+        let st: *StructDef = sema_tagged_payload(sm, s.name, s.name_len, is_err)
+        if st != null
+            return sema_struct_ty(st, t)
+        # AGAST #4265: a user-enum payload is that enum, as a `let x: E` is.
+        var en_len: i32 = 0
+        let en: *u8 = sema_tagged_enum_payload(s.name, s.name_len, is_err, @en_len)
+        if en != null
+            return sema_ty_set(t, TYPE_STRUCT, en, en_len, TYPE_VOID, null)
+        return sema_ty_none(t)
     if user_enum_index(s.name, s.name_len) >= 0
         let uf: *StructField = user_enum_tuple_field(s.name, s.name_len, arm_variant_sel(s.name, s.name_len, arm))
         # A u64 payload stays unknown: the emitter binds it as an i64 local

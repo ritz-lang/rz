@@ -148,6 +148,24 @@ pub fn bk_tagged_payload(name: *u8, name_len: i32, is_err: i32) -> i32
         return BK_UNSURE
     bk_mangled(name + i, end - i)
 
+# What `Some(v)` / `Ok(v)` / `Err(v)` binds over the mangled tagged enum
+# `name`: bk_tagged_payload's kinds, and a pointer for a payload ritz0 mangles
+# `ptr_T` (`Option$ptr_u8`), which bk_mangled leaves unsure (AGAST #4200).
+# Sema's bool_note_arm and the emitter's payload_bool_kind both read a
+# binding with it, so the two agree (#4280).
+pub fn bk_tagged_binding(name: *u8, len: i32, is_err: i32) -> i32
+    var i: i32 = 0
+    while i < len and *(name + i) != '$'
+        i += 1
+    i += 1
+    if is_err == 1
+        while i < len and *(name + i) != '$'
+            i += 1
+        i += 1
+    if i + 4 < len and name_eq(name + i, 4, c"ptr_", 4) == 1
+        return BK_PTR
+    bk_tagged_payload(name, len, is_err)
+
 # --- What an expression is, on Sema --------------------------------------------
 #
 # sema_bool_kind is the emitter's bool_kind (bool_kind.ritz) read off Sema's
@@ -873,20 +891,9 @@ fn sbk_binding(k: i32) -> i32
     BK_UNSURE
 
 # What `Some(v)` / `Ok(v)` / `Err(v)` binds over the mangled tagged enum
-# `name`, as a binding: bk_tagged_payload's kinds, and a pointer for a payload
-# ritz0 mangles `ptr_T` (`Option$ptr_u8`), which bk_mangled leaves unsure.
+# `name`, as a binding on Sema: bk_tagged_binding's kinds.
 fn sbk_tagged_binding(name: *u8, len: i32, is_err: i32) -> i32
-    var i: i32 = 0
-    while i < len and *(name + i) != '$'
-        i += 1
-    i += 1
-    if is_err == 1
-        while i < len and *(name + i) != '$'
-            i += 1
-        i += 1
-    if i + 4 < len and name_eq(name + i, 4, c"ptr_", 4) == 1
-        return BK_PTR
-    sbk_binding(bk_tagged_payload(name, len, is_err))
+    sbk_binding(bk_tagged_binding(name, len, is_err))
 
 # The `let` / `var` sema_walk just bound.  An unannotated one takes its
 # initialiser's kind, judged before it is in scope (`let x = x`).
@@ -1243,6 +1250,10 @@ pub fn bool_note_arm(sm: *Sema, arm: *MatchArm, scrut: *Expr)
         v.bk = sbk_tagged_binding(name, len, is_err)
         # A float payload binds a float local, a struct payload a struct one.
         sbk_payload_struct(sm, v, name, len, is_err)
+        # AGAST #4265: one sema_arm_payload_ty typed (a struct, a user enum
+        # such as fs's Errno) is what its type says, as the emitter has it.
+        if v.bk == BK_UNSURE and v.kind != TYPE_UNKNOWN
+            v.bk = sbk_of_ty(v.kind, v.type_name, v.type_name_len)
     else if user_enum_index(name, len) >= 0
         let uf: *StructField = user_enum_tuple_field(name, len, arm_variant_sel(name, len, arm))
         if uf == null
