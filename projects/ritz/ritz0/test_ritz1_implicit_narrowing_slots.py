@@ -74,6 +74,17 @@ _TAIL_LET = ("fn f(x: i32) -> i32\n    if x > 0\n        let w: {t} = {e}\n"
 # the lowered poll by that shape alone).
 WRITTEN_POLL_RESULT = ("struct S\n    __result: i32\n\n"
                        "fn g_poll(self: *S)\n    (*self).__result = big()\n")
+# A typed literal is a cast (`1u32` is `1 as u32`, ritz0's
+# _apply_literal_suffix), so an unannotated local bound to one has the
+# suffix's type, as do the operators it feeds (AGAST #4245: angelo's
+# render.ritz `padding` and cmap.ritz binary search).
+_SFX = "fn take_u32(v: u32) -> u32\n    return v\n\n"
+_SFX_WIDTH = _SFX + ("fn f(w: f32) -> u32\n    let padding = 1u32\n"
+                     "    let width = w as u32 + padding * 2\n    take_u32(width)\n")
+_SFX_SEARCH = ("fn f(n: u16) -> u16\n    var low = 0u16\n    var high = n\n"
+               "    while low < high\n        let mid = (low + high) / 2\n"
+               "        if mid < 7\n            low = mid + 1\n"
+               "        else\n            high = mid\n    low\n")
 EXTRA_REJECTED = {
     "member_through_pointer":    _EXTRA_FN.format("q.x = big()"),
     "member_through_pointer_op": _EXTRA_FN.format("q.x += big()"),
@@ -84,6 +95,8 @@ EXTRA_REJECTED = {
     # compilers judge it on the assignment route at the declared type.
     "async_fn_narrow_result":    "async fn f() -> i32\n    return big()\n",
     "written_poll_result":       WRITTEN_POLL_RESULT,
+    # The suffix is the local's type, not a free literal's: a u64 is no u32.
+    "suffixed_local_wider":      _SFX + "fn f() -> u32\n    let p = 1u64\n    take_u32(p)\n",
 }
 EXTRA_ACCEPTED = {
     "member_through_pointer_cast": _EXTRA_FN.format("q.x = big() as i32"),
@@ -95,6 +108,9 @@ EXTRA_ACCEPTED = {
     # not either: a nameless callee is skipped.
     "fn_pointer_field_call":       ("struct H\n    cb: fn(i32) -> i32\n\n"
                                     "fn f(h: *H) -> i32\n    h.cb(big())\n"),
+    "suffixed_local_arg":          _SFX + "fn f() -> u32\n    let p = 1u32\n    take_u32(p)\n",
+    "suffixed_local_width":        _SFX_WIDTH,
+    "suffixed_binary_search":      _SFX_SEARCH,
 }
 
 
