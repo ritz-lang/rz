@@ -283,6 +283,21 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             is_async=getattr(fn, 'is_async', False),
             lent=self._lent_params(fn)
         )
+        if getattr(fn, 'is_async', False):
+            self._register_poll(fn)
+
+    def _register_poll(self, fn: rast.FnDef):
+        """An async fn's generated `<fn>_poll(self: *<fn>_Future) -> bool`
+        (async_transform_v2, PollAbi), which a program may call itself
+        (AGAST #3556).  A fn the module declares of that name is its own."""
+        name = f"{fn.name}_poll"
+        if name in self.functions:
+            return
+        span = fn.span
+        future = rast.PtrType(span=span, inner=rast.NamedType(span, f"{fn.name}_Future", []),
+                              mutable=True)
+        self.functions[name] = FnSig(name=name, params=[('self', future)],
+                                     ret_type=rast.NamedType(span, 'bool', []))
 
     def _register_extern(self, fn: rast.ExternFn):
         """Register extern function signature."""
@@ -1818,6 +1833,13 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             if pattern.qualifier:
                 # Qualified pattern: Type.Variant - use the qualifier as enum name
                 enum_name = pattern.qualifier
+            elif self._declares_variant(expected_type, pattern.name):
+                # The scrutinee's own enum, as the emitter takes it: not the
+                # last one registered with a variant of the name, a unit
+                # `SlugVerdict.Ok` beside a Result's `Ok(v)` (AGAST #3556).
+                enum_name = self._strip_indirection(expected_type).name
+            elif self._builtin_variant_payload(pattern, expected_type) is not None:
+                enum_name = None
             elif pattern.name in self.variant_to_enum:
                 # Unqualified pattern: look up which enum this variant belongs to
                 enum_name = self.variant_to_enum[pattern.name]
