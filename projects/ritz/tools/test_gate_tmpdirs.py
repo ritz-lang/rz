@@ -182,6 +182,39 @@ def test_every_selftest_scratch_is_mktemp_removed_by_its_own_trap():
     assert offenders == []
 
 
+# $RANDOM is not a unique name: 15 bits, and bash reseeds it in every $(...)
+# fork, so two calls can draw the same value.  test-regression-xpass.sh named
+# each helper's result file "$SCRATCH/r.$RANDOM"; a repeat handed a later case
+# an earlier case's .verdict, and "unlisted + compiles -> no verdict" read
+# `fail` (AGAST #4234).  Unique names come from mktemp, or a counter.
+RANDOM_NAME = re.compile(r"\$\{?RANDOM\b")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("src, hit", [
+    ('local out="$SCRATCH/r.$RANDOM" msg', True),
+    ('out="$SCRATCH/r.${RANDOM}"', True),
+    ('out=$(mktemp "$SCRATCH/r.XXXXXX")', False),
+    ("# never name scratch with $RANDOM", False),
+])
+def test_random_name_detector(src, hit):
+    assert bool(RANDOM_NAME.search(_code(src))) is hit
+
+
+@pytest.mark.unit
+def test_no_selftest_names_scratch_with_random():
+    offenders = {
+        f.name: [n for n, line in enumerate(f.read_text().splitlines(), 1)
+                 if RANDOM_NAME.search(_code(line))]
+        for f in sorted(SCRIPTS.glob("test-regression-*.sh"))
+    }
+    offenders = {k: v for k, v in offenders.items() if v}
+    assert offenders == {}, (
+        "$RANDOM repeats across $(...) forks; name scratch files with mktemp "
+        f"(AGAST #4234): {offenders}"
+    )
+
+
 @pytest.mark.unit
 def test_shared_host_scripts_exist():
     """A renamed script must not silently drop out of the rule."""

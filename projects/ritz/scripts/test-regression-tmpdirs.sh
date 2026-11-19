@@ -52,6 +52,13 @@ check() {
     return 1
 }
 
+# A copy's failing assertions, then its last lines.  `tail -5` alone showed
+# only the "1 of 21 failed" summary, never which assertion (AGAST #4234).
+show_failure() {
+    grep -A2 '^FAIL' "$1" | sed 's/^/      | /'
+    tail -3 "$1" | sed 's/^/      | /'
+}
+
 echo "harness self-tests, two copies at once in one TMPDIR"
 echo "===================================================="
 
@@ -74,8 +81,30 @@ for name in "${PAIRED[@]}"; do
     b=$!
     wait "$a"; rc_a=$?
     wait "$b"; rc_b=$?
-    check "$name: copy A passes beside copy B" 0 "$rc_a" || tail -5 "$SHARED/$name.a.log"
-    check "$name: copy B passes beside copy A" 0 "$rc_b" || tail -5 "$SHARED/$name.b.log"
+    check "$name: copy A passes beside copy B" 0 "$rc_a" || show_failure "$SHARED/$name.a.log"
+    check "$name: copy B passes beside copy A" 0 "$rc_b" || show_failure "$SHARED/$name.b.log"
+done
+
+# Two copies only collide when they happen to: a 1-in-thousands repeat passes
+# a dozen reruns.  Pin bash's $RANDOM to one value in every process and fork
+# (BASH_ENV runs before the script; `unset` drops its special meaning), so a
+# scratch name built from $RANDOM repeats every time instead of rarely.
+# test-regression-xpass.sh named its result files "$SCRATCH/r.$RANDOM"
+# until AGAST #4234; a repeat handed one case another case's .verdict.
+PIN="$SHARED/pin-random.bash"
+printf 'unset RANDOM\nRANDOM=7\n' > "$PIN"
+pids=()
+for name in "${PAIRED[@]}"; do
+    t="$SCRIPT_DIR/test-regression-$name.sh"
+    [[ -f "$t" ]] || continue
+    BASH_ENV="$PIN" TMPDIR="$TMP" bash "$t" > "$SHARED/$name.pin.log" 2>&1 &
+    pids+=("$name:$!")
+done
+for p in "${pids[@]}"; do
+    name=${p%%:*}
+    wait "${p#*:}"; rc=$?
+    check "$name: passes with bash RANDOM pinned to one value" 0 "$rc" \
+        || show_failure "$SHARED/$name.pin.log"
 done
 
 check "another run's dir in the shared TMPDIR is untouched" \

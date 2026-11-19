@@ -79,13 +79,18 @@ export RITZ_KNOWN_FAILURES="$KF"
 
 # Capture what the helpers report: fail/warn print, _verdict writes a file.
 # Run each in a subshell so a helper's state can't leak between cases.
+# Each case's result prefix comes from mktemp, never $RANDOM: bash reseeds
+# $RANDOM in every $(...) fork, so two cases could draw the same 15-bit
+# name and one would read the other's .verdict (AGAST #4234).
 judge_fail() {   # $1=compiler $2=key -> "<verdict>|<output>"
-    local out="$SCRATCH/r.$RANDOM" msg
+    local out msg
+    out=$(mktemp "$SCRATCH/r.XXXXXX") || return
     msg=$(judge_compile_failure "$1" "$2" "$1" "$out" 2>&1)
     printf '%s|%s' "$(cat "$out.verdict" 2>/dev/null || echo none)" "$msg"
 }
 judge_pass() {   # $1=compiler $2=key -> "<rc>|<verdict>|<output>"
-    local out="$SCRATCH/r.$RANDOM" msg rc
+    local out msg rc
+    out=$(mktemp "$SCRATCH/r.XXXXXX") || return
     msg=$(report_xpass "$1" "$2" "$out" 2>&1); rc=$?
     printf '%s|%s|%s' "$rc" "$(cat "$out.verdict" 2>/dev/null || echo none)" "$msg"
 }
