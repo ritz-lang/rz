@@ -10,6 +10,7 @@ import ritzlib.strview
 import ritzlib.drop
 import ritzlib.sys
 import tome.store_types
+import tome.store
 
 # ============================================================================
 # Pub/Sub System
@@ -18,12 +19,16 @@ import tome.store_types
 # Subscribers register callbacks that are invoked when messages arrive.
 # Pattern subscriptions use glob-style matching (* = any characters).
 
-# Callback type: fn(channel: *u8, message: *u8, context: *u8) -> i32
-# Returns 0 to continue receiving, non-zero to auto-unsubscribe
+# Callback type: fn(channel: StrView, message: StrView, context: *u8) -> i32
+# Returns 0 to continue receiving, non-zero to auto-unsubscribe.
+#
+# Channels, patterns and messages are (ptr, len) views, not C strings: Redis
+# PUBLISH is binary-safe, so "c\0a" and "c\0b" are different channels and a
+# message with an embedded NUL reaches the callback whole (#4223).
 
 # A single subscriber entry in a channel's subscriber list
 struct Subscriber
-    callback: fn(*u8, *u8, *u8) -> i32   # (channel, message, ctx)
+    callback: fn(StrView, StrView, *u8) -> i32  # (channel, message, ctx)
     context: *u8                          # User-provided context
     next: *Subscriber                     # Next subscriber in list
 
@@ -36,7 +41,7 @@ struct ChannelEntry
 # A pattern subscription entry
 struct PatternEntry
     pattern: String              # Glob pattern (owned)
-    callback: fn(*u8, *u8, *u8) -> i32
+    callback: fn(StrView, StrView, *u8) -> i32
     context: *u8
     next: *PatternEntry          # Next pattern in list
 
@@ -58,7 +63,7 @@ pub fn pubsub_new() -> PubSub
     ps.channel_cap = 16
     ps.channel_len = 0
     ps.channel_tombstones = 0
-    let size: i64 = ps.channel_cap * 32  # ChannelEntry size estimate
+    let size: i64 = ps.channel_cap * sizeof(ChannelEntry)
     ps.channels = malloc(size) as *ChannelEntry
     for i in 0..ps.channel_cap
         let entry: *ChannelEntry = ps.channels + i
@@ -104,7 +109,7 @@ fn pubsub_grow_channels(ps: @&PubSub)
     ps.channel_cap = old_cap * 2
     ps.channel_len = 0
     ps.channel_tombstones = 0
-    let size: i64 = ps.channel_cap * 32
+    let size: i64 = ps.channel_cap * sizeof(ChannelEntry)
     ps.channels = malloc(size) as *ChannelEntry
     for i in 0..ps.channel_cap
         let entry: *ChannelEntry = ps.channels + i
@@ -132,13 +137,13 @@ fn pubsub_grow_channels(ps: @&PubSub)
     free(old_channels as *u8)
 
 # Get or create a channel entry
-fn pubsub_get_or_create_channel(ps: @&PubSub, channel: *u8) -> *ChannelEntry
+fn pubsub_get_or_create_channel(ps: @&PubSub, channel: StrView) -> *ChannelEntry
     # Check load factor
     let load: i64 = (ps.channel_len + ps.channel_tombstones + 1) * 100 / ps.channel_cap
     if load > 75
         pubsub_grow_channels(ps)
 
-    let h: u64 = hash_cstr(channel)
+    let h: u64 = hash_strview(channel)
     let mask: i64 = ps.channel_cap - 1
     var idx: i64 = (h as i64) & mask
     var first_tombstone: i64 = -1
@@ -153,7 +158,7 @@ fn pubsub_get_or_create_channel(ps: @&PubSub, channel: *u8) -> *ChannelEntry
                 insert_idx = first_tombstone
                 ps.channel_tombstones -= 1
             let target: *ChannelEntry = ps.channels + insert_idx
-            target.name = string_from_cstr(channel)
+            target.name = string_from_strview(channel)
             target.subscribers = null
             target.state = 1
             ps.channel_len += 1
@@ -164,7 +169,7 @@ fn pubsub_get_or_create_channel(ps: @&PubSub, channel: *u8) -> *ChannelEntry
                 first_tombstone = idx
 
         if entry.state == 1  # Occupied
-            if string_eq_cstr(@entry.name, channel)
+            if string_eq_strview(@entry.name, channel)
                 return entry
 
         idx = (idx + 1) & mask
@@ -173,11 +178,11 @@ fn pubsub_get_or_create_channel(ps: @&PubSub, channel: *u8) -> *ChannelEntry
     return null
 
 # Find a channel (don't create)
-fn pubsub_find_channel(ps: @PubSub, channel: *u8) -> *ChannelEntry
+fn pubsub_find_channel(ps: @PubSub, channel: StrView) -> *ChannelEntry
     if ps.channel_len == 0
         return null
 
-    let h: u64 = hash_cstr(channel)
+    let h: u64 = hash_strview(channel)
     let mask: i64 = ps.channel_cap - 1
     var idx: i64 = (h as i64) & mask
     var i: i64 = 0
@@ -189,7 +194,7 @@ fn pubsub_find_channel(ps: @PubSub, channel: *u8) -> *ChannelEntry
             return null
 
         if entry.state == 1
-            if string_eq_cstr(@entry.name, channel)
+            if string_eq_strview(@entry.name, channel)
                 return entry
 
         idx = (idx + 1) & mask
@@ -202,7 +207,7 @@ fn pubsub_find_channel(ps: @PubSub, channel: *u8) -> *ChannelEntry
 # ============================================================================
 
 # Subscribe to a channel with a callback
-pub fn pubsub_subscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+pub fn pubsub_subscribe(ps: @&PubSub, channel: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
     let entry: *ChannelEntry = pubsub_get_or_create_channel(ps, channel)
     if entry == null
         return -1
@@ -215,7 +220,7 @@ pub fn pubsub_subscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8) 
         sub = sub.next
 
     # Add new subscriber at head
-    let new_sub: *Subscriber = malloc(24) as *Subscriber  # 8+8+8 bytes
+    let new_sub: *Subscriber = malloc(sizeof(Subscriber)) as *Subscriber
     new_sub.callback = callback
     new_sub.context = context
     new_sub.next = entry.subscribers
@@ -223,7 +228,7 @@ pub fn pubsub_subscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8) 
     return 1
 
 # Unsubscribe from a channel
-pub fn pubsub_unsubscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+pub fn pubsub_unsubscribe(ps: @&PubSub, channel: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
     let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
     if entry == null
         return 0
@@ -249,18 +254,18 @@ pub fn pubsub_unsubscribe(ps: @&PubSub, channel: *u8, callback: fn(*u8, *u8, *u8
 # ============================================================================
 
 # Subscribe to a pattern (glob-style)
-pub fn pubsub_psubscribe(ps: @&PubSub, pattern: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+pub fn pubsub_psubscribe(ps: @&PubSub, pattern: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
     # Check if already subscribed
     var pat: *PatternEntry = ps.patterns
     while pat != null
-        if string_eq_cstr(@pat.pattern, pattern)
+        if string_eq_strview(@pat.pattern, pattern)
             if pat.callback == callback && pat.context == context
                 return 0  # Already subscribed
         pat = pat.next
 
     # Add new pattern at head
-    let new_pat: *PatternEntry = malloc(40) as *PatternEntry  # String(16) + fn(8) + ctx(8) + next(8)
-    new_pat.pattern = string_from_cstr(pattern)
+    let new_pat: *PatternEntry = malloc(sizeof(PatternEntry)) as *PatternEntry
+    new_pat.pattern = string_from_strview(pattern)
     new_pat.callback = callback
     new_pat.context = context
     new_pat.next = ps.patterns
@@ -269,11 +274,11 @@ pub fn pubsub_psubscribe(ps: @&PubSub, pattern: *u8, callback: fn(*u8, *u8, *u8)
     return 1
 
 # Unsubscribe from a pattern
-pub fn pubsub_punsubscribe(ps: @&PubSub, pattern: *u8, callback: fn(*u8, *u8, *u8) -> i32, context: *u8) -> i32
+pub fn pubsub_punsubscribe(ps: @&PubSub, pattern: StrView, callback: fn(StrView, StrView, *u8) -> i32, context: *u8) -> i32
     var prev: *PatternEntry = null
     var pat: *PatternEntry = ps.patterns
     while pat != null
-        if string_eq_cstr(@pat.pattern, pattern)
+        if string_eq_strview(@pat.pattern, pattern)
             if pat.callback == callback && pat.context == context
                 # Remove from list
                 if prev == null
@@ -293,39 +298,39 @@ pub fn pubsub_punsubscribe(ps: @&PubSub, pattern: *u8, callback: fn(*u8, *u8, *u
 # Pattern Matching (glob-style)
 # ============================================================================
 
-# Match a string against a glob pattern
-# Supports: * (any chars), ? (any single char)
-fn tome_glob_match(pattern: *u8, str: *u8) -> i32
-    var p: *u8 = pattern
-    var s: *u8 = str
-    var star_p: *u8 = null    # Position after last * in pattern
-    var star_s: *u8 = null    # Position in str when we matched *
+# Match a channel name against a glob pattern, both (ptr, len): a NUL is an
+# ordinary byte.  Supports: * (any run of bytes), ? (any single byte)
+fn tome_glob_match(pattern: StrView, str: StrView) -> i32
+    var p: i64 = 0
+    var s: i64 = 0
+    var star_p: i64 = -1    # Index after the last * in pattern
+    var star_s: i64 = 0     # Index in str when we matched that *
 
-    while *s != 0
-        if *p == 42  # '*'
+    while s < str.len
+        if p < pattern.len && *(pattern.ptr + p) == 42  # '*'
             # Skip consecutive stars
-            while *p == 42
-                p = p + 1
-            if *p == 0
+            while p < pattern.len && *(pattern.ptr + p) == 42
+                p += 1
+            if p == pattern.len
                 return 1  # Trailing * matches everything
             star_p = p
             star_s = s
-        else if *p == 63 || *p == *s  # '?' or exact match
-            p = p + 1
-            s = s + 1
-        else if star_p != null
-            # Backtrack: try matching * with one more char
+        else if p < pattern.len && (*(pattern.ptr + p) == 63 || *(pattern.ptr + p) == *(str.ptr + s))  # '?' or exact
+            p += 1
+            s += 1
+        else if star_p >= 0
+            # Backtrack: try matching * with one more byte
             p = star_p
-            star_s = star_s + 1
+            star_s += 1
             s = star_s
         else
             return 0  # No match
 
     # Skip trailing stars in pattern
-    while *p == 42
-        p = p + 1
+    while p < pattern.len && *(pattern.ptr + p) == 42
+        p += 1
 
-    if *p == 0
+    if p == pattern.len
         return 1
     return 0
 
@@ -335,7 +340,7 @@ fn tome_glob_match(pattern: *u8, str: *u8) -> i32
 
 # Publish a message to a channel
 # Returns number of subscribers that received the message
-pub fn pubsub_publish(ps: @&PubSub, channel: *u8, message: *u8) -> i64
+pub fn pubsub_publish(ps: @&PubSub, channel: StrView, message: StrView) -> i64
     var count: i64 = 0
 
     # Direct channel subscribers
@@ -344,7 +349,7 @@ pub fn pubsub_publish(ps: @&PubSub, channel: *u8, message: *u8) -> i64
         var prev: *Subscriber = null
         var sub: *Subscriber = entry.subscribers
         while sub != null
-            let cb: fn(*u8, *u8, *u8) -> i32 = sub.callback
+            let cb: fn(StrView, StrView, *u8) -> i32 = sub.callback
             let result: i32 = cb(channel, message, sub.context)
             count += 1
 
@@ -365,8 +370,8 @@ pub fn pubsub_publish(ps: @&PubSub, channel: *u8, message: *u8) -> i64
     var prev_pat: *PatternEntry = null
     var pat: *PatternEntry = ps.patterns
     while pat != null
-        if tome_glob_match(string_as_ptr(@&pat.pattern), channel) == 1
-            let pcb: fn(*u8, *u8, *u8) -> i32 = pat.callback
+        if tome_glob_match(string_as_view(@pat.pattern), channel) == 1
+            let pcb: fn(StrView, StrView, *u8) -> i32 = pat.callback
             let result: i32 = pcb(channel, message, pat.context)
             count += 1
 
@@ -395,7 +400,7 @@ pub fn pubsub_publish(ps: @&PubSub, channel: *u8, message: *u8) -> i64
 # ============================================================================
 
 # Get count of subscribers to a specific channel
-pub fn pubsub_numsub(ps: @PubSub, channel: *u8) -> i64
+pub fn pubsub_numsub(ps: @PubSub, channel: StrView) -> i64
     let entry: *ChannelEntry = pubsub_find_channel(ps, channel)
     if entry == null
         return 0
@@ -411,8 +416,9 @@ pub fn pubsub_numsub(ps: @PubSub, channel: *u8) -> i64
 pub fn pubsub_numpat(ps: @PubSub) -> i64
     return ps.pattern_count
 
-# Get list of channels with subscribers. Returns array of borrowed pointers.
-pub fn pubsub_channels(ps: @PubSub, out_count: @&i64) -> **u8
+# Get list of channels with subscribers: a malloc'd array of `*out_count`
+# views borrowing the registry's names (lengths kept; free the array only).
+pub fn pubsub_channels(ps: @PubSub, out_count: @&i64) -> *StrView
     *out_count = 0
     if ps.channel_len == 0
         return null
@@ -427,12 +433,12 @@ pub fn pubsub_channels(ps: @PubSub, out_count: @&i64) -> **u8
     if active == 0
         return null
 
-    let arr: **u8 = malloc(active * 8) as **u8
+    let arr: *StrView = malloc(active * sizeof(StrView)) as *StrView
     var j: i64 = 0
     for i in 0..ps.channel_cap
         let entry: *ChannelEntry = ps.channels + i
         if entry.state == 1 && entry.subscribers != null
-            *(arr + j) = string_as_ptr(@&entry.name)
+            *(arr + j) = string_as_view(@entry.name)
             j += 1
             if j >= active
                 break

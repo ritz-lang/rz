@@ -1,0 +1,230 @@
+# test/test_pubsub_binary.ritz - Tome pub/sub heap sizing and binary safety (#4223)
+#
+# The pub/sub tables were sized by hand: the channel table at 32 bytes a slot
+# (ChannelEntry is 40) and PatternEntry at 40 bytes (it is 48), so pubsub_new
+# wrote past its table and every PSUBSCRIBE past its entry.  The neighbour
+# tests below catch the table overrun at run time; ritzlib's malloc rounds a
+# 40-byte request up to 64 usable bytes, so the PatternEntry/Subscriber sizes
+# are held by tools/test_tome_malloc_sizeof.py instead.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.str
+import ritzlib.strview
+import ritzlib.string
+import ritzlib.memory
+import lib.tome
+
+const CANARY: u8 = 165  # 0xA5
+const CANARY_LEN: i64 = 256
+
+fn canary_fill(p: *u8)
+    for i in 0..CANARY_LEN
+        *(p + i) = CANARY
+
+fn canary_intact(p: *u8) -> bool
+    for i in 0..CANARY_LEN
+        if *(p + i) != CANARY
+            return false
+    return true
+
+# A pair of adjacent blocks in one malloc size class: `first` is freed, so the
+# next allocation of that class reuses it, and `second` (canaried) sits right
+# after it.  An allocation that writes past its block lands in `second`.
+struct Trap
+    first: *u8
+    second: *u8
+
+# block = the class's block size including the 16-byte header.
+fn trap_set(usable: i64, block: i64) -> Trap
+    var t: Trap
+    t.first = malloc(usable)
+    t.second = malloc(usable)
+    canary_fill(t.second)
+    free(t.first)
+    if t.second != t.first + block
+        t.second = null  # not adjacent: the test's premise does not hold
+    return t
+
+var g_hits: i64 = 0
+
+fn count_cb(channel: StrView, message: StrView, ctx: *u8) -> i32
+    g_hits += 1
+    return 0
+
+# pubsub_new's table (16 slots) and its first grow (32 slots) must stay inside
+# their allocations: the old 32-bytes-a-slot sizing took a 512 then a 1024
+# byte block and wrote 640 then 1280 bytes into them.
+[[test]]
+fn test_pubsub_channel_table_stays_in_its_block() -> i32
+    let t512: Trap = trap_set(512, 528)
+    if t512.second == null
+        return 90
+
+    var ps: PubSub = pubsub_new()
+    if not canary_intact(t512.second)
+        return 1
+
+    # Set after pubsub_new, so the grow below (not the initial table) is what
+    # would reuse this trap's freed block.
+    let t1024: Trap = trap_set(1024, 1040)
+    if t1024.second == null
+        return 91
+
+    # 20 channels: the 13th insert grows the table to 32 slots.
+    var name: [4]u8
+    name[0] = 99  # 'c'
+    name[1] = 104 # 'h'
+    for i in 0..20
+        name[2] = (65 + i) as u8
+        if pubsub_subscribe(@&ps, strview_from_ptr(@name[0], 3), count_cb, null) != 1
+            return 2
+    if not canary_intact(t1024.second)
+        return 3
+    if not canary_intact(t512.second)
+        return 4
+
+    for i in 0..20
+        name[2] = (65 + i) as u8
+        if pubsub_numsub(@ps, strview_from_ptr(@name[0], 3)) != 1
+            return 5
+
+    pubsub_drop(@&ps)
+    free(t512.second)
+    free(t1024.second)
+    return 0
+
+# PSUBSCRIBE/PUNSUBSCRIBE churn: entries are freed and their blocks reused.
+[[test]]
+fn test_pubsub_pattern_churn() -> i32
+    var ps: PubSub = pubsub_new()
+    var pat: [4]u8
+    pat[0] = 112  # 'p'
+    pat[2] = 42   # '*'
+    for round in 0..200
+        for i in 0..8
+            pat[1] = (97 + i) as u8
+            if pubsub_psubscribe(@&ps, strview_from_ptr(@pat[0], 3), count_cb, null) != 1
+                return 1
+        if pubsub_numpat(@ps) != 8
+            return 2
+        g_hits = 0
+        if pubsub_publish(@&ps, "pc-chan", "m") != 1
+            return 3
+        for i in 0..8
+            pat[1] = (97 + i) as u8
+            if pubsub_punsubscribe(@&ps, strview_from_ptr(@pat[0], 3), count_cb, null) != 1
+                return 4
+        if pubsub_numpat(@ps) != 0
+            return 5
+    pubsub_drop(@&ps)
+    return 0
+
+# ============================================================================
+# Binary safety: channels, patterns and messages are (ptr, len), not C strings
+# ============================================================================
+
+var g_last_channel: StrView
+var g_last_message: StrView
+
+fn record_cb(channel: StrView, message: StrView, ctx: *u8) -> i32
+    g_hits += 1
+    g_last_channel = channel
+    g_last_message = message
+    return 0
+
+# "c\0a" and "c\0b" are different channels: a C-string registry saw both as "c".
+[[test]]
+fn test_pubsub_channels_with_nul_are_distinct() -> i32
+    var ps: PubSub = pubsub_new()
+    g_hits = 0
+    if pubsub_subscribe(@&ps, "c\0a", record_cb, null) != 1
+        return 1
+    if pubsub_subscribe(@&ps, "c\0b", record_cb, null) != 1
+        return 2  # was 0: "already subscribed" to "c"
+    if pubsub_numsub(@ps, "c\0a") != 1 || pubsub_numsub(@ps, "c\0b") != 1
+        return 3
+    if pubsub_numsub(@ps, "c") != 0
+        return 4
+
+    if pubsub_publish(@&ps, "c\0b", "x") != 1
+        return 5
+    if not strview_eq(g_last_channel, "c\0b")
+        return 6
+
+    if pubsub_unsubscribe(@&ps, "c\0a", record_cb, null) != 1
+        return 7
+    if pubsub_numsub(@ps, "c\0b") != 1
+        return 8
+    pubsub_drop(@&ps)
+    return 0
+
+# The message reaches the callback whole, embedded NUL and all.
+[[test]]
+fn test_pubsub_message_with_nul_is_whole() -> i32
+    var ps: PubSub = pubsub_new()
+    g_hits = 0
+    pubsub_subscribe(@&ps, "news", record_cb, null)
+    if pubsub_publish(@&ps, "news", "c\0a") != 1
+        return 1
+    if g_last_message.len != 3
+        return 2
+    if not strview_eq(g_last_message, "c\0a")
+        return 3
+    if not strview_eq(g_last_channel, "news")
+        return 4
+    pubsub_drop(@&ps)
+    return 0
+
+# Pattern subscriptions and glob matching run over the whole channel name.
+[[test]]
+fn test_pubsub_pattern_matches_past_nul() -> i32
+    var ps: PubSub = pubsub_new()
+    g_hits = 0
+    pubsub_psubscribe(@&ps, "c\0a*", record_cb, null)
+    # "c\0b..." used to match: both pattern and channel stopped at the NUL.
+    if pubsub_publish(@&ps, "c\0bxyz", "m") != 0
+        return 1
+    if pubsub_publish(@&ps, "c\0axyz", "m") != 1
+        return 2
+    if not strview_eq(g_last_channel, "c\0axyz")
+        return 3
+    # "c\0a" and "c\0b" are different patterns.
+    if pubsub_psubscribe(@&ps, "c\0b*", record_cb, null) != 1
+        return 4
+    if pubsub_numpat(@ps) != 2
+        return 5
+    if pubsub_punsubscribe(@&ps, "c\0b*", record_cb, null) != 1
+        return 6
+    if pubsub_numpat(@ps) != 1
+        return 7
+    # '?' matches a NUL byte like any other.
+    pubsub_psubscribe(@&ps, "x?y", record_cb, null)
+    if pubsub_publish(@&ps, "x\0y", "m") != 1
+        return 8
+    pubsub_drop(@&ps)
+    return 0
+
+# PUBSUB CHANNELS returns each name with its length.
+[[test]]
+fn test_pubsub_channels_list_keeps_lengths() -> i32
+    var ps: PubSub = pubsub_new()
+    pubsub_subscribe(@&ps, "c\0a", record_cb, null)
+    pubsub_subscribe(@&ps, "c\0b", record_cb, null)
+    var count: i64 = 0
+    let names: *StrView = pubsub_channels(@ps, @&count)
+    if count != 2
+        return 1
+    var seen_a: bool = false
+    var seen_b: bool = false
+    for i in 0..count
+        let sv: StrView = *(names + i)
+        if strview_eq(sv, "c\0a")
+            seen_a = true
+        if strview_eq(sv, "c\0b")
+            seen_b = true
+    free(names as *u8)
+    if not seen_a || not seen_b
+        return 2
+    pubsub_drop(@&ps)
+    return 0
