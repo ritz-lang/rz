@@ -107,9 +107,9 @@ CONST_SCALAR_ADDR = "cannot take the address of const `{}`; a const scalar has n
 
 
 # `x.m(...)` on a user type with no `m` in an `impl` for it (or a trait impl):
-# method syntax reaches only impl methods, and the ritzlib types in the UFCS
-# table (ufcs.py) until #3252. A free `foo_m` is not a method (Aaron's ruling
-# on AGAST #3244). `free_call` is the call to write instead, when there is a
+# method syntax reaches only impl methods, ritzlib's types included since the
+# UFCS tables went (LARB R66, #3496/#3497). A free `foo_m` is not a method
+# (Aaron's ruling on AGAST #3244). `free_call` is the call to write instead, when there is a
 # free fn `<lowercased type>_<m>` to call. ritz1 prints the same words
 # (emitter_expr_call.ritz, refuse_no_method).
 def no_method(method: str, type_name: str, free_call: str | None = None) -> str:

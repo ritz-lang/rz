@@ -211,15 +211,6 @@ REJECTED = {
         "fn main() -> i32\n"
         "    let b: B = B { v: 1 }\n"
         "    return f<B>(b) as i32\n", 9),
-    "ufcs_method_call_to_a_procedure": (
-        "struct S\n"
-        "    v: i64\n"
-        "fn span_touch<T>(s: *Span<T>)\n"
-        "    var i: i64 = 1\n"
-        "fn f(s: Span<i64>) -> i64\n"
-        "    s.touch()\n"
-        "fn main() -> i32\n"
-        "    return 0\n", 6),
     "method_call_to_a_procedure_in_a_method": (
         "struct B\n"
         "    v: i64\n"

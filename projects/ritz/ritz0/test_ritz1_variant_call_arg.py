@@ -17,7 +17,8 @@ No call path set the context from the callee's parameter type, so
 
 THE FIX
 
-Every call path (plain, impl method, static `Type.method`, UFCS) now emits
+Every call path (plain, impl method, static `Type.method`; UFCS until LARB
+R66 deleted it, #3497) now emits
 each argument with the enum context set from its parameter: the param's
 type when it is a tagged enum, else no context at all. Inside an argument
 the enclosing fn's return type is never consulted, so a constructor with no
@@ -204,22 +205,6 @@ fn main() -> i32
 """
 )
 
-# UFCS path: `s.take(..)` on a String dispatches to the free fn
-# `string_take(@s, ..)` (ufcs_non_generic_prefix); receiver param skipped.
-UFCS_ARG = """\
-import ritzlib.string
-
-fn string_take(s: @String, o: Option<i64>) -> i64
-    let r: i64 = match o
-        Some(v) => v + string_len(s)
-        None => 30
-    return r
-
-fn main() -> i32
-    let s: String = string_new()
-    (s.take(Some(12)) + s.take(None)) as i32
-"""
-
 CASES = {
     "some_i64": (SOME_I64, 7),
     "none_i64": (NONE_I64, 5),
@@ -235,7 +220,6 @@ PKG_CASES = {
     "some_strview": (SOME_STRVIEW, 7),
     "none_strview": (NONE_STRVIEW, 3),
     "let_some_strview": (LET_SOME_STRVIEW, 8),
-    "ufcs_arg": (UFCS_ARG, 42),
 }
 
 

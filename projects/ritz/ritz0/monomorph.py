@@ -410,12 +410,14 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                         self.function_instantiations[key] = mangled
             # AGAST #1824: format_into(sink, "...") appends through
             # `sink.push_bytes(..)`, so a generic sink (`*Vec<u8>` ->
-            # vec_push_bytes<u8>) needs that method instantiated even when
-            # nothing else calls it.
+            # `impl<T> Vec<T>`'s push_bytes) needs that method specialised
+            # even when nothing else calls it (#3617; since R66, #3496, the
+            # emitter finds only the impl method, not vec_push_bytes<u8>).
             if (isinstance(expr.func, rast.Ident) and expr.func.name == 'format_into'
                     and expr.args):
-                self._register_method_instantiation(
-                    rast.MethodCall(expr.span, expr.args[0], 'push_bytes', []))
+                sink_call = rast.MethodCall(expr.span, expr.args[0], 'push_bytes', [])
+                self._register_method_instantiation(sink_call)
+                self._want_called_method(sink_call)
         elif isinstance(expr, rast.StructLit):
             for _, field_expr in expr.fields:
                 self._visit_expr(field_expr)

@@ -6,8 +6,8 @@ THE CHANGE
 through a name table, ritz0's `ufcs.py` and ritz1's `ufcs_non_generic_prefix`.
 R66 replaces the table with impl blocks in the type's own file, each method a
 one-line `pub` wrapper of the free fn, as `span.ritz`'s `impl<T> Span<T>`
-already is. The table itself is deleted later, one ticket per compiler
-(#3496, #3497); this step must leave `rz test --all` unchanged.
+already is. The tables themselves went later, one ticket per compiler
+(#3496, #3497).
 
 ONLY String HERE
 
@@ -25,9 +25,8 @@ THE TESTS
   * `impl String` holds exactly the methods listed here, each `pub`, each a
     single `return string_<method>(...)` of its own free fn. A missing,
     extra, private or misrouted wrapper fails here by name.
-  * with ritz0's table switched off for String (find_ufcs_function -> None,
-    as #3496 will do), one program calling every wrapper by method syntax
-    still compiles: every call resolves through the impl.
+  * one program calling every wrapper by method syntax compiles: with the
+    table gone (#3496), every call resolves through the impl.
   * literal arguments, end to end on ritz0 and ritz1: ritz1 now reaches its
     impl method arms for String, which mis-passed a `"..."` into a `StrView`
     param (test_ritz1_impl_strview_lit_arg.py).
@@ -160,38 +159,16 @@ fn main() -> i32
     return t as i32
 """
 
-# The table, switched off for String as #3496 will delete it; the
-# rest of ritz0 is unchanged. One interpreter launch: the in-process ritz0
-# (ritz0_inproc) forks from a server that imported the emitter before any
-# patch here could reach it.
-NO_TABLE = """\
-import sys
-sys.path.insert(0, {ritz0!r})
-import emitter_llvmlite
-real = emitter_llvmlite.find_ufcs_function
-
-def no_table(functions, type_name, method_name):
-    if type_name == 'String':
-        return None
-    return real(functions, type_name, method_name)
-
-emitter_llvmlite.find_ufcs_function = no_table
-import ritz0
-sys.argv = ['ritz0.py', {src!r}, '-o', {out!r}] + {extra!r}
-ritz0.main()
-"""
-
-
 def _compile_without_table(src: Path, out: Path, extra=()) -> str:
-    """ritz0 `src` -> `out` with the String table off; the IR text."""
-    driver = NO_TABLE.format(ritz0=str(RITZ0_DIR), src=str(src),
-                             out=str(out), extra=list(extra))
+    """ritz0 `src` -> `out`; the IR text. ritz0 has no UFCS table since #3496,
+    so every method call here resolves through an impl or fails."""
     proc = subprocess.run(
-        [sys.executable, "-c", driver], cwd=out.parent, capture_output=True,
+        [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(src), "-o", str(out),
+         *extra], cwd=out.parent, capture_output=True,
         text=True, timeout=300, check=False,
         env={"RITZ_PATH": str(RITZ_ROOT), "PATH": "/usr/bin:/bin"})
     assert proc.returncode == 0 and out.exists(), (
-        f"ritz0 without the table:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
+        f"ritz0:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
     return out.read_text()
 
 
@@ -274,7 +251,7 @@ def test_a_pub_impl_method_is_exported(tmp_path):
 def test_string_methods_suite_compiles_without_the_table(tmp_path):
     """#3614: `String` has no `drop` method on purpose (see NOT WRAPPED), so
     its ritzlib suite frees a String with `string_drop(@&s)`. An `s.drop()`
-    only resolved through the table and fails once #3496 deletes it."""
+    only resolved through the table, which #3496 deleted."""
     _compile_without_table(
         RITZLIB / "tests" / "test_string_methods.ritz",
         tmp_path / "suite.ll", ["--no-runtime"])

@@ -43,7 +43,6 @@ from typed import EMITTER_READS, typed_of
 import module_interface
 import main_abi
 from main_abi import display_name
-from ufcs import UFCS_NON_GENERIC_PREFIXES, find_ufcs_function
 from name_resolver import BUILTIN_GENERICS
 
 
@@ -4690,10 +4689,6 @@ class LLVMEmitter:
 
         return None
 
-    def _find_method_fallback(self, type_name: str, method_name: str) -> Optional[str]:
-        """The standalone function acting as `method_name` on `type_name`."""
-        return find_ufcs_function(self.functions, type_name, method_name)
-
     def _struct_has_field(self, struct_name: str, field_name: str) -> bool:
         """Check if a struct has a given field without raising an exception."""
         layout = self.struct_registry.get_layout(struct_name)
@@ -4843,8 +4838,7 @@ class LLVMEmitter:
         for method in methods:
             mangled = None
             if type_name is not None:
-                mangled = (self.method_lookup.get((type_name, method))
-                           or self._find_method_fallback(type_name, method))
+                mangled = self.method_lookup.get((type_name, method))
             entry = self.functions.get(mangled) if mangled else None
             if entry is None:
                 # Unresolved here: one slot costs a load, a copy loses writes.
@@ -8173,8 +8167,6 @@ class LLVMEmitter:
         mangled = None
         if type_name is not None:
             mangled = self.method_lookup.get((type_name, 'push_bytes'))
-            if mangled is None:
-                mangled = self._find_method_fallback(type_name, 'push_bytes')
         if mangled is None or mangled not in self.functions:
             shown = type_name or str(sink.type.pointee)
             raise EmitError(
@@ -14674,7 +14666,7 @@ class LLVMEmitter:
         `Type.method(args)` parses as a method call whose receiver is the bare
         type name. For the built-in generics the concrete type argument is not
         spelled, so take it from the expected type of the surrounding context
-        and dispatch through the usual UFCS mangling (`span_empty$u8`).
+        and dispatch to its impl's static method (`Span$u8_empty`).
         """
         base_name = self._builtin_type_receiver(expr)
         if base_name is None:
@@ -14697,7 +14689,7 @@ class LLVMEmitter:
                 raise EmitError(span_empty_needs_slot(expr.method), expr.span)
             return None
 
-        fn_name = self._find_method_fallback(type_name, expr.method)
+        fn_name = self.method_lookup.get((type_name, expr.method))
         if fn_name is None:
             # `Span<T>.empty()` is `{ null, 0 }` - a built-in shape, so it must
             # work without importing ritzlib.span.
@@ -14825,8 +14817,7 @@ class LLVMEmitter:
         while isinstance(base, rast.Grouped):
             base = base.expr
         name = self._receiver_struct(base)
-        if name is None or (name, expr.method) in self.method_lookup \
-                or self._find_method_fallback(name, expr.method):
+        if name is None or (name, expr.method) in self.method_lookup:
             return None
         if not any(field_name == expr.method
                    and isinstance(resolve_alias_in(ty, self.type_aliases), rast.FnType)
@@ -14846,8 +14837,7 @@ class LLVMEmitter:
         while isinstance(base, rast.Grouped):
             base = base.expr
         name = self._receiver_struct(base)
-        if name is None or (name, expr.method) in self.method_lookup \
-                or self._find_method_fallback(name, expr.method):
+        if name is None or (name, expr.method) in self.method_lookup:
             return expr
         traits = self._deref_traits(name)
         target = self._deref_target(name) if 'Deref' in traits else None
@@ -15096,34 +15086,29 @@ class LLVMEmitter:
             return unwrap_builtin
 
 
+        # Method syntax reaches only impl methods: the UFCS name table that
+        # sent `v.m()` to a free `vec_m$T` / `string_m` went with LARB R66
+        # (AGAST #3496).
         method_key = (type_name, expr.method)
-        used_ufcs_fallback = False  # Track if we used UFCS fallback
         if method_key in self.method_lookup:
             mangled_name = self.method_lookup[method_key]
         else:
-            # Fallback: look for standalone functions with naming convention
-            # Vec$u8.len() -> vec_len$u8(&self)
-            # String.len() -> string_len(&self)
-            # Span$u8.len() -> span_len$u8(&self)
-            mangled_name = self._find_method_fallback(type_name, expr.method)
-            if mangled_name is None:
-                # Core Span<T> operations are built-in shapes ({ ptr, len }),
-                # so they must work without importing ritzlib.span.
-                builtin_span = self._try_emit_builtin_span_method(expr, type_name)
-                if builtin_span is not None:
-                    return builtin_span
-                if type_name.split('$')[0] in BUILTIN_GENERICS:
-                    # ritz1's words, at the method name (AGAST #3764): the
-                    # checker leaves a built-in generic's methods to us.
-                    # Option/Result too, imported from ritzlib or not
-                    # (AGAST #4262).  Named as ritz1 names it, not by
-                    # type_name, its linked name (AGAST #4266).
-                    raise EmitError(ref_rules.no_method(
-                                        expr.method, instance_display_name(type_name)),
-                                    expr.name_span or expr.span)
-                raise self._err(f"No method '{expr.method}' found for type '{type_name}'",
+            # Core Span<T> operations are built-in shapes ({ ptr, len }),
+            # so they must work without importing ritzlib.span.
+            builtin_span = self._try_emit_builtin_span_method(expr, type_name)
+            if builtin_span is not None:
+                return builtin_span
+            if type_name.split('$')[0] in BUILTIN_GENERICS:
+                # ritz1's words, at the method name (AGAST #3764): the
+                # checker leaves a built-in generic's methods to us.
+                # Option/Result too, imported from ritzlib or not
+                # (AGAST #4262).  Named as ritz1 names it, not by
+                # type_name, its linked name (AGAST #4266).
+                raise EmitError(ref_rules.no_method(
+                                    expr.method, instance_display_name(type_name)),
                                 expr.name_span or expr.span)
-            used_ufcs_fallback = True  # UFCS fallback functions take receiver as first param
+            raise self._err(f"No method '{expr.method}' found for type '{type_name}'",
+                            expr.name_span or expr.span)
 
         if mangled_name not in self.functions:
             raise InternalError(f"Method function '{mangled_name}' not found")
@@ -15136,14 +15121,7 @@ class LLVMEmitter:
 
         # Check if this is a static method (no self parameter)
         # Static methods are called as Type.method() with no receiver instance
-        # For UFCS fallback functions, treat first parameter as receiver even
-        # if not named 'self' — but only when the call actually *has* a
-        # receiver instance. A static-style UFCS call (`String.from(x)` ->
-        # `string_from(x)`) passes its arguments plainly; forcing a self param
-        # here made the static-call check below reject it. AGAST #1321.
-        has_self_param = len(fn_def.params) > 0 and (
-            fn_def.params[0].name == 'self'
-            or (used_ufcs_fallback and not is_static_call))
+        has_self_param = len(fn_def.params) > 0 and fn_def.params[0].name == 'self'
 
         # For static calls (Type.method()), verify there's no self parameter
         # A lent `self` too, `@T`, `@&T`, `*T` or `:&` (AGAST #2292, #3236).

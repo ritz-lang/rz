@@ -12,9 +12,14 @@ THE RULE (Aaron, 2026-11-15)
 
 `x.m(...)` on a user type resolves only to a method declared in an `impl` for
 that type, or a trait impl. A free fn that happens to be called `foo_cmp` is not
-a method. Otherwise all three compilers refuse it at the method name. The
-ritzlib types in the UFCS table (ritz0/ufcs.py, ritz1's
-ufcs_non_generic_prefix) still dispatch to their free fns, until #3252.
+a method. Otherwise all three compilers refuse it at the method name.
+
+LARB R66 (#3496 ritz0, #3497 ritz1): that holds for ritzlib's types too. The
+UFCS name tables that sent `s.len()` on a `String` to `string_len(@s)`, and
+`v.m()` on a `Vec<T>`/`Span<T>`/`StrView` to `vec_m`/`span_m`/`strview_m`
+(ritz0's ufcs.py; ritz1's ufcs_non_generic_prefix and ufcs_fn_def) are gone:
+those methods are the types' `impl` blocks. The *_TABLE rows below are what
+the tables used to dispatch and now refuse.
 """
 
 import pytest
@@ -211,6 +216,64 @@ pub fn main() -> i32
     ),
 }
 
+# The deleted UFCS tables (R66, #3496/#3497): a free fn with a table prefix is
+# no longer a method. `vec_push_str` is ritzlib's, with no `impl<T> Vec<T>`
+# method, so the generic-prefix arm (`vec_<m>$T`) is pinned on a real Vec.
+REFUSED_TABLE = {
+    # The non-generic table went by the type's name: String -> string_.
+    "table_string_free_fn": (
+        """\
+struct String
+    data: *u8
+    len: i64
+    cap: i64
+
+fn string_len(s: @String) -> i64
+    s.len
+
+pub fn main() -> i32
+    let s = String { data: null, len: 5, cap: 0 }
+    s.^len() as i32
+""",
+        no_method("len", "String", "string_len(s)"),
+    ),
+    "table_vec_free_fn": (
+        """\
+import ritzlib.gvec
+
+pub fn main() -> i32
+    var v: Vec<u8> = vec_new<u8>()
+    v.^push_str(c"x")
+""",
+        no_method("push_str", "Vec$u8"),
+    ),
+    # ritz1's lowercase `strview_<m>` fallback (#3240, folded into #3497).
+    "table_strview_free_fn": (
+        """\
+fn strview_nope(s: StrView) -> i32
+    s.len as i32
+
+pub fn main() -> i32
+    let s = "abc"
+    s.^nope()
+""",
+        "no method `nope` on `StrView`",
+    ),
+    # ...and on a declared StrView, which ritz1 exempted from the refusal
+    # while the fallback caught it, then called an undeclared `@StrView_nope`.
+    "table_strview_declared_free_fn": (
+        """\
+fn strview_nope(s: StrView) -> i32
+    s.len as i32
+
+pub fn main() -> i32
+    let s: StrView = "abc"
+    s.^nope()
+""",
+        "no method `nope` on `StrView`",
+    ),
+}
+
 # A StrView's methods are ritzlib's `impl StrView` and ritz0's emitter
 # builtins (`len`, `as_bytes`): its emitter raised an unlocated ValueError for
 # anything else (AGAST #3649). ritz1 named it `Span$u8` until AGAST #3697.
@@ -354,25 +417,6 @@ pub fn main() -> i32
     ),
     # AGAST #4263: the carrier's own `unwrap` still reaches the payload's field.
     "option_unwrap_then_member": (OPTION_G + "    o.unwrap().v\n", 7),
-    # A type in the UFCS table: `s.len()` on a `String` is `string_len(@s)`.
-    # The table goes by the type's name, so ritzlib's String is declared here
-    # in its shape, and the program links without ritzlib's objects.
-    "table_string_len": (
-        """\
-struct String
-    data: *u8
-    len: i64
-    cap: i64
-
-fn string_len(s: @String) -> i64
-    s.len
-
-pub fn main() -> i32
-    let s = String { data: null, len: 5, cap: 0 }
-    s.len() as i32
-""",
-        5,
-    ),
 }
 
 
@@ -428,6 +472,41 @@ def test_a_generic_instance_is_named_alike_in_every_compiler(tmp_path, compiler,
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(REFUSED_TABLE))
+def test_a_ufcs_table_free_fn_is_not_a_method(tmp_path, compiler, name):
+    program, message = REFUSED_TABLE[name]
+    _assert_refused(compiler, tmp_path, name, program, message)
+
+
+# What the tables carried now comes from the impls (#3240's pin): `v.parse_i64()`
+# is `impl StrView`'s, and `b.push_bytes(..)` `impl<T> Vec<T>`'s (the method
+# print-to-a-Vec sinks lower to). Built as a package so ritzlib links in.
+IMPL_METHODS = """\
+import ritzlib.strview
+import ritzlib.option
+import ritzlib.gvec
+
+pub fn main() -> i32
+    let v: StrView = "37"
+    var r: Option<i64> = v.parse_i64()
+    let bad: StrView = "3x"
+    var q: Option<i64> = bad.parse_i64()
+    var b: Vec<u8> = vec_new<u8>()
+    if b.push_bytes(c"abc", 3) != 0
+        return 1
+    (r.unwrap_or(0) + q.unwrap_or(2) + b.len()) as i32
+"""
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_parse_i64_and_push_bytes_are_impl_methods(request, tmp_path, compiler):
+    from test_ritz1_builtin_struct_shadow import _run_pkg
+    if compiler != "ritz0":
+        request.getfixturevalue("ritz1_bin")
+    assert _run_pkg(compiler, tmp_path, "implm", IMPL_METHODS) == 42
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_strview_method_it_lacks_is_refused_as_strview(tmp_path, compiler):
     program, message = STRVIEW_REFUSED["strview"]
     _assert_refused(compiler, tmp_path, "strview", program, message)
@@ -458,6 +537,6 @@ pub fn main() -> i32
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(DISPATCHED))
-def test_impl_and_table_methods_still_dispatch(tmp_path, compiler, name):
+def test_impl_methods_dispatch(tmp_path, compiler, name):
     program, want = DISPATCHED[name]
     assert _run(compiler, tmp_path, name, program) == want

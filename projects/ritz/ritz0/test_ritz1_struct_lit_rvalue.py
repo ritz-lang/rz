@@ -23,7 +23,8 @@ struct-literal path uses), and loads the `%T` aggregate as its value. For
 literal itself and stores that aggregate into each slot. Two consumers had
 to learn the literal is an aggregate. One is the variant-ctor payload store
 (emit_variant_struct). The other is the scalar→newtype arg boxing in the
-impl-method and UFCS call paths, which re-boxed it through an i64.
+impl-method and UFCS call paths (UFCS until LARB R66, #3497), which re-boxed
+it through an i64.
 
 Oracle: ritz0 builds and runs every program with the same exit code.
 """
@@ -334,27 +335,9 @@ fn main() -> i32
     return option_is_some<Point>(@o) - 1
 """
 
-# UFCS path: `s.plus(..)` on a String dispatches to the free fn
-# `string_plus(@s, ..)` (try_emit_ufcs_method), receiver param skipped.
-UFCS_ARG = """\
-import ritzlib.string
-
-struct P
-    x: i64
-    y: i64
-
-fn string_plus(s: @String, p: P) -> i64
-    return string_len(s) + p.x + p.y
-
-fn main() -> i32
-    let s: String = string_new()
-    s.plus(P { x: 20, y: 22 }) as i32
-"""
-
 PKG_CASES = {
     "vec_push": (VEC_PUSH, 42),
     "option_point": (OPTION_POINT, 0),
-    "ufcs_arg": (UFCS_ARG, 42),
 }
 
 

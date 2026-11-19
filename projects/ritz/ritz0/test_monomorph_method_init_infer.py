@@ -1,7 +1,7 @@
 """ritz0 monomorph infers an un-annotated local from a method-call initializer
 (AGAST #2095).
 
-    var s = a.slice(0, n)     # UFCS: vec_slice<T> -> Vec<T>
+    var s = a.slice(0, n)     # impl<T> Vec<T>'s slice -> Vec<T>
     var s = a[:]              # slice sugar on a Vec<T>
     var v = b.items()         # user impl method -> Vec<i32>
     var w = p.dup()           # generic impl method, substituted at W<i32>
@@ -12,7 +12,8 @@ method reached only through it (`s.pop()`) was never instantiated: ritz0 then
 failed "No method 'pop' found for type 'Vec$i32'".
 
 Each case runs the instantiation pass on a self-contained module (a stub
-`Vec<T>` and the `vec_*` functions it needs) and checks the method used only
+`Vec<T>`, the `vec_*` functions it needs and, since LARB R66 (#3496), the
+`impl<T> Vec<T>` its methods are) and checks the method used only
 through the inferred local was registered at i32.  The end-to-end programs are
 in test_ritz1_method_init_infer.py.
 """
@@ -41,6 +42,16 @@ fn vec_pop<T>(v: *Vec<T>) -> T
 
 fn vec_last<T>(v: *Vec<T>) -> T
     return *v.data
+
+impl<T> Vec<T>
+    pub fn slice(self: *Vec<T>, start: i64, end: i64) -> Vec<T>
+        return vec_slice<T>(self, start, end)
+    pub fn len(self: *Vec<T>) -> i64
+        return vec_len<T>(self)
+    pub fn pop(self: *Vec<T>) -> T
+        return vec_pop<T>(self)
+    pub fn last(self: *Vec<T>) -> T
+        return vec_last<T>(self)
 """
 
 

@@ -202,59 +202,7 @@ HOLDERS = {
                                                          "fn g(p: *C) -> i32\n    p.plus(bump(p))\n\n"), 1),
     "by_value_self_is_read_before_the_arguments_two_levels": (_main("    g(@&q)\n", COPIED + "fn bump(p: **C) -> i32\n    p.x = 5\n    0\n\n"
                                                                     "fn g(p: **C) -> i32\n    p.plus(bump(p))\n\n"), 1),
-    # UFCS: a standalone function taking the receiver, `s` rather than `self`.
-    "ufcs_shared_ptr_read": ("struct String\n    n: i32\n\nfn string_size(s: @String) -> i32\n    s.n\n\n"
-                             "fn g(p: @*String) -> i32\n    p.size()\n\n"
-                             "pub fn main() -> i32\n    var s = String { n: 3 }\n    var q: *String = @&s\n    g(@q)\n", 3),
-    "ufcs_ptr_ptr_store": ("struct String\n    n: i32\n\nfn string_put(s: @&String, v: i32)\n    s.n = v\n\n"
-                           "fn g(p: **String)\n    p.put(3)\n\n"
-                           "pub fn main() -> i32\n    var s = String { n: 1 }\n    var q: *String = @&s\n    g(@&q)\n    s.n\n", 3),
 }
-
-# A receiver that doesn't lead to `self`'s type: `s` is a `*u8`, so `p` and `h.s`
-# are the pointer it gets, and nothing past them.
-OTHER_POINTER = """\
-struct String
-    n: i32
-
-struct H
-    s: *String
-
-fn string_first(s: *u8) -> i32
-    *s as i32
-
-fn g(p: *String) -> i32
-    p.first()
-
-"""
-
-HOLDERS |= {
-    "ufcs_self_of_another_pointer_type": (OTHER_POINTER + "pub fn main() -> i32\n    var s = String { n: 3 }\n"
-                                          "    var q: *String = @&s\n    g(q)\n", 3),
-    "ufcs_field_of_another_pointer_type": (OTHER_POINTER + "pub fn main() -> i32\n    var s = String { n: 3 }\n"
-                                           "    var h = H { s: @&s }\n    h.s.first()\n", 3),
-}
-
-HOLDERS |= {
-    "ufcs_other_pointer_type_behind_a_reference": (
-        OTHER_POINTER + "fn r(p: @*String) -> i32\n    p.first()\n\npub fn main() -> i32\n"
-        "    var s = String { n: 3 }\n    var q: *String = @&s\n    r(@q)\n", 3),
-    "ufcs_other_pointer_type_behind_a_pointer": (
-        OTHER_POINTER + "fn r(p: **String) -> i32\n    p.first()\n\npub fn main() -> i32\n"
-        "    var s = String { n: 3 }\n    var q: *String = @&s\n    r(@&q)\n", 3),
-    "ufcs_other_pointer_type_in_a_ptr_ptr_field": (
-        OTHER_POINTER + "struct D\n    s: **String\n\npub fn main() -> i32\n"
-        "    var s = String { n: 3 }\n    var q: *String = @&s\n    var d = D { s: @&q }\n    d.s.first()\n", 3),
-}
-
-# A by-value `self` that isn't what the pointers end at: `*Vec<u8>` converts to a
-# `Span<u8>`, it doesn't load to one.
-HOLDERS["ufcs_by_value_self_is_a_conversion"] = (
-    "struct Vec<T>\n    data: *T\n    len: i64\n    cap: i64\n\n"
-    "fn vec_total(s: Span<u8>) -> i32\n    s.len as i32\n\n"
-    "fn g(p: *Vec<u8>) -> i32\n    p.total()\n\n"
-    "pub fn main() -> i32\n    var b: [3]u8 = [1, 2, 3]\n"
-    "    var v = Vec<u8> { data: @&b[0], len: 3, cap: 3 }\n    g(@&v)\n", 3)
 
 # `self` is the pointer, so nothing comes off it.
 KEEPS_THE_POINTER = """\
@@ -316,8 +264,8 @@ MOVES = {
 # `one_level_returned`, `h(q).set(3)`, once #2946 named a `*S` free call's.)
 # `chained_store` (#2295) runs since #3015 made an `@S` / `@&S` call result a place.
 # #2399's rows run since it lowered `@@C`, `@*S` fields and `-> @*S` / `**S` calls.
-# The global, element and `(*p)` rows, `global_shared_ptr_read` and the UFCS
-# Span conversion run since #2404.
+# The global, element and `(*p)` rows and `global_shared_ptr_read` run since
+# #2404 (and the UFCS rows, until LARB R66 deleted UFCS, #3496/#3497).
 RITZ1_GAPS = {}
 
 GAPS = {"ritz0": {}, "ritz1": RITZ1_GAPS, "ritz1_selfhosted": RITZ1_GAPS}

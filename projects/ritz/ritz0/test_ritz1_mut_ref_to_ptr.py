@@ -466,48 +466,51 @@ pub fn main() -> i32
 # AGAST #1758: the UFCS fallback (`v.rd(x)` -> `vec_rd$T(@v, x)`) converted
 # every `@&S` argument with `inttoptr i64`, but `@&v`, an `@&S` ident and
 # `p as @&S` are already `ptr`.  A `-> @&S` call result is i64 and still
-# needs it.  Leading `import` lines are hoisted above PRELUDE by _compile.
-UFCS_HELPER = """\
-import ritzlib.gvec
+# needs it.  The fallback went with LARB R66 (#3497); the same arguments now
+# go through an impl method's arm, so the rows hold it to the same.
+METHOD_HELPER = """\
+struct W
+    n: i64
 
-fn vec_rd<T>(v: *Vec<T>, s: @&S) -> i32
-    s.a = s.a + 2
-    s.a
+impl W
+    fn rd(self: *W, s: @&S) -> i32
+        s.a = s.a + 2
+        s.a
 
 fn pass_mut(s: @&S) -> @&S
     s
 
 """
 
-UFCS_MUT_REF_ARG = {
-    "ufcs_addr_mut": UFCS_HELPER + """\
+METHOD_MUT_REF_ARG = {
+    "method_addr_mut": METHOD_HELPER + """\
 pub fn main() -> i32
     var s: S = S { a: 40 }
-    var v: Vec<i64> = vec_new<i64>()
+    var v: W = W { n: 0 }
     v.rd(@&s)
 """,
     # An `@&S` param passed on through the method call.
-    "ufcs_mut_ref_param": UFCS_HELPER + """\
-fn f(v: *Vec<i64>, s: @&S) -> i32
+    "method_mut_ref_param": METHOD_HELPER + """\
+fn f(v: *W, s: @&S) -> i32
     v.rd(s)
 
 pub fn main() -> i32
     var s: S = S { a: 40 }
-    var v: Vec<i64> = vec_new<i64>()
+    var v: W = W { n: 0 }
     f(@v, @&s)
 """,
-    "ufcs_cast_to_mut_ref": UFCS_HELPER + """\
+    "method_cast_to_mut_ref": METHOD_HELPER + """\
 pub fn main() -> i32
     var s: S = S { a: 40 }
-    var v: Vec<i64> = vec_new<i64>()
+    var v: W = W { n: 0 }
     let p: *S = @s
     v.rd(p as @&S)
 """,
     # Pinned: the i64 call result still gets its inttoptr.
-    "ufcs_call_result": UFCS_HELPER + """\
+    "method_call_result": METHOD_HELPER + """\
 pub fn main() -> i32
     var s: S = S { a: 40 }
-    var v: Vec<i64> = vec_new<i64>()
+    var v: W = W { n: 0 }
     v.rd(pass_mut(@&s))
 """,
 }
@@ -518,7 +521,7 @@ LEFTOVERS = {
     **REF_RETURN,
     **COMPARE,
     **CALL_RESULT_TO_MUT_REF,
-    **UFCS_MUT_REF_ARG,
+    **METHOD_MUT_REF_ARG,
 }
 
 BROKEN = {**LET_ASSIGN, **CAST, **RET_FIELD}
@@ -646,10 +649,10 @@ def test_ritz1_call_result_into_mut_ref_param(ritz1_bin, tmp_path, name):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", sorted(RITZ1_BINS))
-@pytest.mark.parametrize("name", sorted(UFCS_MUT_REF_ARG))
-def test_ritz1_ufcs_mut_ref_arg(ritz1_bin, tmp_path, compiler, name):
-    """#1758: a UFCS `@&S` argument already `ptr` is passed as-is, not inttoptr'd."""
-    assert _run(compiler, tmp_path, name, UFCS_MUT_REF_ARG[name]) == 42
+@pytest.mark.parametrize("name", sorted(METHOD_MUT_REF_ARG))
+def test_ritz1_method_mut_ref_arg(ritz1_bin, tmp_path, compiler, name):
+    """#1758: a method's `@&S` argument already `ptr` is passed as-is, not inttoptr'd."""
+    assert _run(compiler, tmp_path, name, METHOD_MUT_REF_ARG[name]) == 42
 
 
 # AGAST #1758 item 2: the no-fn_def argument path (the callee is unknown, so

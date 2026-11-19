@@ -5,8 +5,8 @@ located refusal, in _emit_call's words (AGAST #3319).
 _dispatch_method_call, and a struct where a method takes an `i64` was a raw
 llvmlite TypeError: tracebacks with no file, line or callee.  Free-fn calls
 already said "`f` called with 3 argument(s) but defined with 1" and
-"argument N of `f` has the wrong type".  Method, static-method and UFCS calls
-now say the same.
+"argument N of `f` has the wrong type".  Method and static-method calls now
+say the same (and UFCS calls did, until LARB R66 deleted them, #3496).
 
 A method call is counted as its desugaring, `get(p, 1, 2)`: the receiver is
 argument 1, as the method `:&` diagnostics already number it on all three
@@ -14,8 +14,8 @@ compilers (test_bare_place_borrow METHOD_MISFITS).  A static call has no
 receiver.
 
 ritz0 only: ritz1's side of method arity is AGAST #1629.  The rows that pass
-are the auto-borrows (receiver and argument), an sret method and a UFCS call,
-which the new checks must leave alone.
+are the auto-borrows (receiver and argument) and an sret method, which the
+new checks must leave alone.
 """
 
 import pytest
@@ -33,15 +33,9 @@ struct Q
 struct Big
     a: [8]i64
 
-struct String
-    n: i64
-
 enum Lv
     Lo
     Hi
-
-fn string_size(s: *String) -> i64
-    s.n
 
 impl P
     fn get(self: *P, k: i64) -> i64
@@ -66,7 +60,7 @@ impl P
 
 """
 
-SETUP = "    var p: P = P { n: 1 }\n    var q: Q = Q { m: 2 }\n    var s: String = String { n: 3 }\n"
+SETUP = "    var p: P = P { n: 1 }\n    var q: Q = Q { m: 2 }\n"
 
 
 def _src(line):
@@ -90,7 +84,6 @@ REFUSED = {
                                "`byval` called with 3 argument(s) but defined with 2"),
     "static_too_many": ("^P.mk(1, 2)", "`mk` called with 2 argument(s) but defined with 1"),
     "static_too_few": ("^P.mk()", "`mk` called with 0 argument(s) but defined with 1"),
-    "ufcs_too_many": ("^s.size(1)", "`size` called with 2 argument(s) but defined with 1"),
     # Type: at the argument.
     "struct_for_int": ("p.get(^q)", _wrong(2, "get", "i64", _Q)),
     "static_struct_for_int": ("P.mk(^q)", _wrong(1, "mk", "i64", _Q)),
@@ -113,7 +106,6 @@ ACCEPTED = {
     "pointer_arg": ("return p.take(@q) as i32", 3),
     "place_borrowed_for_colon_amp": ("var k: i64 = 4\n    p.bump(k)\n    return k as i32", 5),
     "sret_method": ("let b: Big = p.big(9)\n    return b.a[0] as i32", 9),
-    "ufcs": ("return s.size() as i32", 3),
 }
 
 

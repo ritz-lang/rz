@@ -19,7 +19,6 @@ import ref_rules
 from metadata import type_to_string
 import ritz_ast as rast
 import typed
-from ufcs import UFCS_NON_GENERIC_PREFIXES
 # The state lives in move_state.py, the per-node-kind walk in move_walk.py
 # (AGAST #3449); every name move_state defines is still importable from here.
 from move_state import (  # noqa: F401 (re-exported)
@@ -905,25 +904,16 @@ class MoveChecker(MoveWalk):
                 return False
         return True
 
-    # The free function `v.m()` means on a type with no `m` of its own: Vec's
-    # `vec_m`, String's `string_m` (ufcs.py has the emitter's table).
-    UFCS_PREFIXES = {'Vec': 'vec_', 'Span': 'span_', 'Option': 'option_',
-                     'Result': 'result_', 'Box': 'box_', **UFCS_NON_GENERIC_PREFIXES}
-
     def _lends_self_mut(self, call: rast.MethodCall) -> bool:
-        """Does `call` take its receiver `self: @&T`, `self:& T`, or as a UFCS
-        function's first param of either kind? A mutable borrow of the
-        receiver's place (AGAST #2438). False where the callee is unknown."""
+        """Does `call` take its receiver `self: @&T` or `self:& T`? A mutable
+        borrow of the receiver's place (AGAST #2438). Only impl methods: the
+        UFCS table that also named free fns went with R66 (#3496). False
+        where the callee is unknown."""
         ty = self._receiver_type(call.expr)
         if not isinstance(ty, rast.NamedType):
             return False
         cands = [list(m.params) for m in self.type_methods.get((ty.name, call.method)) or []]
-        if cands:
-            cands = [ps for ps in cands if ps and ps[0].name == 'self']
-        else:
-            prefix = self.UFCS_PREFIXES.get(ty.name)
-            params = self.fn_params.get(f"{prefix}{call.method}") if prefix else None
-            cands = [params] if params else []
+        cands = [ps for ps in cands if ps and ps[0].name == 'self']
         return bool(cands) and all(ps and _lends_mut(ps[0]) for ps in cands)
 
     def _receiver_type(self, expr: rast.Expr) -> Optional[rast.Type]:

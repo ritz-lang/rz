@@ -60,8 +60,9 @@ def _fn_names(module):
     return {item.name for item in module.items if isinstance(item, rast.FnDef)}
 
 
-# A built-in-shaped generic `Vec<T>` with the UFCS fns its methods lower to,
-# so a parse-only module exercises monomorph's `v.len()` -> vec_len<T>.
+# A built-in-shaped generic `Vec<T>` with the impl its methods are (ritzlib's
+# `impl<T> Vec<T>` wraps vec_len<T>), so a parse-only module exercises
+# monomorph's `v.len()`.  A UFCS fn alone typed it until LARB R66 (#3496).
 VEC = """
 struct Vec<T>
     data: *T
@@ -72,6 +73,10 @@ fn vec_new<T>() -> Vec<T>
 
 fn vec_len<T>(v: @Vec<T>) -> i64
     v.len
+
+impl<T> Vec<T>
+    pub fn len(self: @Vec<T>) -> i64
+        return vec_len<T>(self)
 
 fn id<T>(x: T) -> T
     x
@@ -97,7 +102,7 @@ GENERIC_ROWS = [
     ("Cell<u32> { v: 1 }.v", "u32"),
     # a generic impl's method at the receiver's type args
     ("Cell<u32> { v: 1 }.get()", "u32"),
-    # a built-in generic's UFCS method (vec_len<T>), and indexing a Vec<T>
+    # a built-in generic's impl method (Vec<T>.len), and indexing a Vec<T>
     ("vec_new<u16>().len()", "i64"),
     ("vec_new<u16>()[0]", "u16"),
 ]

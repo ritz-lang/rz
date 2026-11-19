@@ -437,11 +437,10 @@ function is right for what isn't one type's behaviour: an operation over
 several types, or a module's entry point.
 
 ritzlib's `string_*`, `vec_*` and `option_*` free functions predate this rule.
-LARB R66 (#3252) replaces the compiler's UFCS name table with `pub` methods
-(#3495, then #3496 and #3497 delete the table). `impl String`, `impl<T>
-Vec<T>` and `impl<T> Option<T>` hold them (#3495, #4231). Until the table
-goes, `s.len()` on a `String` reaching `string_len` is that table, not a
-method.
+LARB R66 (#3252) replaced the compiler's UFCS name table with `pub` methods
+(#3495; #3496 and #3497 deleted the table). `impl String`, `impl<T> Vec<T>`,
+`impl<T> Option<T>`, `impl<T> Span<T>` and `impl StrView` hold them (#3495,
+#4231): method syntax on a ritzlib type reaches only those.
 
 Report: `free-fn-method`. Counts public module-level fns whose first parameter
 is a struct or enum the same file declares.

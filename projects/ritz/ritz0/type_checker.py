@@ -28,7 +28,6 @@ import ref_rules
 import ritz_ast as rast
 from monomorph import bind_type_params, mangle_generic_name, TypeSubstitution
 from monomorph_core import display_generic_name, instance_display_name
-from ufcs import find_ufcs_function
 from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
 from tail_value import arm_diverges
 from typed import Typed
@@ -1136,8 +1135,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
                 own_method = fn_sig is not None
 
         # What the emitter dispatches to: a looser name below doesn't reach it.
-        receiver_sig = fn_sig if own_method else self.functions.get(
-            find_ufcs_function(self.functions, type_name, expr.method))
+        receiver_sig = fn_sig if own_method else None
 
         # LARB R41 (§5.5): with no method `f`, `h.f(1)` is `(h.f)(1)` through
         # a `fn(...)` field `f`; with both, neither is picked silently.
@@ -1154,18 +1152,6 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
         if receiver_sig is not None:
             self._check_receiver(expr, receiver_sig)
-
-        if fn_sig is None:
-            # A ritzlib type's free fn in the UFCS table (`s.len()` on a
-            # String is `string_len(@s)`): the emitter's one fallback. Not
-            # `<lowercased type>_<method>`: the emitter never dispatched to
-            # that, and died on it (AGAST #3244). Unmonomorphised, a
-            # `Vec<u8>` is still `Vec`: the table knows it as `Vec$u8`.
-            fn_sig = receiver_sig
-            if fn_sig is None and isinstance(receiver, rast.NamedType) and receiver.args:
-                fn_sig = self.functions.get(find_ufcs_function(
-                    self.functions, mangle_generic_name(receiver.name, receiver.args),
-                    expr.method))
 
         if fn_sig is None and self._is_user_type_without(receiver, type_name, expr.method):
             # Method syntax reaches only impl methods (§9, AGAST #3244).
@@ -1231,18 +1217,13 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             return rast.NamedType(expr.span, 'void', [])
         return self._method_ret(fn_sig, receiver, own_method)
 
-    # The free fns a built-in generic type's methods are (`v.slice(..)` on a
-    # Vec<T> is vec_slice<T>), by the type's name.
-    UFCS_GENERIC_PREFIXES = {'Vec': 'vec_', 'Span': 'span_', 'Option': 'option_',
-                             'Result': 'result_', 'Box': 'box_'}
     # `o.is_some()` and kin: bool, lowered by the emitter itself.
     BUILTIN_PREDICATES = {'Option': ('is_some', 'is_none'), 'Result': ('is_ok', 'is_err')}
 
     def _method_ret(self, fn_sig, receiver: rast.Type, own_method: bool) -> rast.Type:
         """`fn_sig`'s return type for a method call on `receiver` (AGAST
         #3554): `Self` is the receiver, and a generic receiver's type args
-        substitute the impl's type params (an impl method) or the free fn's
-        (a built-in generic's UFCS fn, positionally)."""
+        substitute the impl's type params (an impl method)."""
         ret = fn_sig.ret_type
         if isinstance(ret, rast.NamedType) and ret.name == 'Self' and not ret.args:
             return receiver
@@ -1250,8 +1231,6 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             return ret
         if own_method:
             params = [] if fn_sig.type_params else fn_sig.owner_params
-        elif receiver.name in self.UFCS_GENERIC_PREFIXES and receiver.args:
-            params = fn_sig.type_params
         else:
             params = []
         if params and len(params) == len(receiver.args):
@@ -1261,8 +1240,8 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
     def _builtin_generic_method_ret(self, receiver: rast.Type,
                                     method: str) -> Optional[rast.Type]:
         """`r.m()`'s type on an Option, Result or Span instance: its impl's
-        method, else its UFCS fn (`option_unwrap<T>`), else for `unwrap` and
-        kin the payload; None when none says."""
+        method, else for `unwrap` and kin the payload; None when none says.
+        Not a free `option_<m>`: method syntax reaches only impls (R66)."""
         if not (isinstance(receiver, rast.NamedType) and receiver.args
                 and receiver.name in BUILTIN_GENERICS):
             return None
@@ -1270,11 +1249,8 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             # The emitter's own predicates, ahead of ritzlib's i32 fns.
             return rast.NamedType(receiver.span, 'bool', [])
         sig = self.functions.get(f"{receiver.name}_{method}")
-        own = sig is not None
-        if sig is None:
-            sig = self.functions.get(self.UFCS_GENERIC_PREFIXES[receiver.name] + method)
         if sig is not None and sig.ret_type is not None:
-            return self._method_ret(sig, receiver, own)
+            return self._method_ret(sig, receiver, True)
         if method in ('unwrap', 'expect', 'unwrap_or', 'unwrap_or_default') \
                 and receiver.name in ('Result', 'Option'):
             return receiver.args[0]
@@ -1299,7 +1275,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
     def _is_user_type_without(self, receiver: rast.Type, type_name: str, method: str) -> bool:
         """Is `receiver` a non-generic struct or enum the emitter would find
-        no `method` on? Its impl methods (`Foo_cmp`) and table fns were looked
+        no `method` on? Its impl methods (`Foo_cmp`) were looked
         up already; a `Deref` type's target's methods are §7.7's, which the
         emitter reaches through `Foo_deref`, so one is never refused here."""
         if not isinstance(receiver, rast.NamedType) or receiver.args:
@@ -1326,8 +1302,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         if not (isinstance(receiver, rast.NamedType) and receiver.name == 'StrView'):
             return False
         return (method not in self.STRVIEW_BUILTINS
-                and f"StrView_{method}" not in self.functions
-                and find_ufcs_function(self.functions, 'StrView', method) is None)
+                and f"StrView_{method}" not in self.functions)
 
     @staticmethod
     def _is_strview_as_bytes(receiver: rast.Type, expr: rast.MethodCall) -> bool:
@@ -1409,8 +1384,7 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         if not isinstance(receiver, rast.NamedType):
             return
         type_name = self._get_type_name(receiver)
-        sig = self.functions.get(f"{type_name}_{expr.method}") or self.functions.get(
-            find_ufcs_function(self.functions, type_name, expr.method))
+        sig = self.functions.get(f"{type_name}_{expr.method}")
         if sig is None or len(sig.params) != len(expr.args) + 1:
             return
         for i, arg in enumerate(expr.args):

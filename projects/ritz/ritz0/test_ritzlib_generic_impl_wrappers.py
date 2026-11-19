@@ -33,8 +33,8 @@ THE TESTS
   * a -nostdlib program importing ritzlib.gvec whose untyped receivers call
     a `push` of its own references no malloc, realloc or vec_grow.
 
-Method syntax on a Vec or Option still reaches the free fn through the UFCS
-table; the table is deleted by #3496 (ritz0) and #3497 (ritz1).
+Method syntax on a Vec or Option reaches only these wrappers: the UFCS tables
+that also reached the free fns were deleted by #3496 (ritz0) and #3497 (ritz1).
 """
 
 import os
@@ -58,7 +58,7 @@ COMPILERS = ("ritz0", "ritz1", "ritz1_selfhosted")
 
 VEC_METHODS = {
     "len", "cap", "is_empty", "push", "pop", "get", "get_ptr", "set", "clear",
-    "first", "last", "as_ptr", "slice", "clone", "swap",
+    "first", "last", "as_ptr", "slice", "clone", "swap", "push_bytes",
 }
 OPTION_METHODS = {"is_some", "is_none", "unwrap_or"}
 

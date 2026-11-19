@@ -2354,23 +2354,6 @@ def test_ritz1_abi_is_ritz0s(ritz1_bin, tmp_path):
     assert _signature(ll1.read_text())[1:3] == want[1:3]
 
 
-# AGAST #2302: a UFCS helper (`v.head4()` is `strview_head4(@v)`) returning
-# `[N]T`.  ritz0 has no user UFCS, so this one is ritz1's alone.
-UFCS_RETURN = """\
-import ritzlib.strview
-
-fn strview_head4(s: *StrView) -> [4]u8
-    var a: [4]u8 = [0, 0, 0, 0]
-    a[3] = s.len as u8 + 1
-    return a
-
-pub fn main() -> i32
-    let v: StrView = "ab"
-    let b = v.head4()
-    return b[3] as i32
-"""
-
-
 # AGAST #3276: test_ritz1_refuses_array_tail_value pinned ritz1's refusal of
 # a `match` of `-> [N]T` calls as a fn's tail.  It's lowered now, and
 # MATCHES["match_call_arms_tail"] compares it with ritz0 above.
@@ -2432,11 +2415,6 @@ def test_ritz1_refuses_if_arm_of_another_length(ritz1_bin, tmp_path, name):
     comp, ll = _compile("ritz1", ritz1_bin, tmp_path, name, IF_WRONG_LEN[name])
     assert comp.returncode != 0 and not ll.exists()
     assert "array length does not match the local array's length" in comp.stdout + comp.stderr
-
-
-@pytest.mark.integration
-def test_ritz1_ufcs_array_return(ritz1_bin, tmp_path):
-    assert _run("ritz1", tmp_path, "u", UFCS_RETURN) == 3
 
 
 # AGAST #2302: ritz0's array return, read from its IR: `[4 x i32]` at the

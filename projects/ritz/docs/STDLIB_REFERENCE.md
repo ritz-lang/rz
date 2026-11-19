@@ -832,6 +832,10 @@ the view by value; slicing returns a new view of the same bytes.
 | `s.starts_with(p)`, `s.ends_with(p)`, `s.contains(t)` | `strview_starts_with`, `strview_ends_with`, `strview_contains` |
 | `s.find(t)`, `s.rfind(t)`, `s.find_byte(c)` | `strview_find`, `strview_rfind`, `strview_find_byte` |
 | `s.to_cstr()`, `s.as_cstr_unchecked()` | `strview_to_cstr`, `strview_as_cstr_unchecked` |
+| `s.parse_i64()` | `strview_parse_i64` |
+
+Method syntax reaches only these: a `strview_*` function with no method here
+(`strview_from_cstr`, `strview_empty`) is called as a function (LARB R66).
 
 `s.as_bytes()` is not in this table: it is a compiler built-in, with no
 `strview_*` function behind it, and works without importing this module. It is

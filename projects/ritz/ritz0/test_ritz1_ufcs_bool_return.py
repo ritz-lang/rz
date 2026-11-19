@@ -13,7 +13,8 @@ method) already called a bool fn as `call i1` and zext'd the result.
 
 THE TESTS
 
-  * IR: one bool method per UFCS family -- generic (`Span$T` ->
+  * IR: one bool method per family (UFCS until LARB R66, #3497; now the
+    impls, `Span$u8_*`, `StrView_*`, `String_*`) -- generic (`Span$T` ->
     `span_*$T`), fixed prefix (`StrView` -> `strview_*`) and the non-generic
     table (`String` -> `string_*`) -- is called as `call i1`, never `i64`,
     and the result is zext'd to the i64 value model.
@@ -66,10 +67,11 @@ fn main() -> i32
     42
 """
 
-# family -> (program, the bool UFCS helper main calls)
+# family -> (program, the bool impl method main calls: each was a UFCS free
+# fn, `span_*$T` / `strview_*` / `string_*`, until LARB R66, #3497)
 IR_CASES = {
-    "span": (REPRO, "span_is_empty$u8"),
-    "strview": (STRVIEW, "strview_is_empty"),
+    "span": (REPRO, "Span$u8_is_empty"),
+    "strview": (STRVIEW, "StrView_is_empty"),
     # `impl String`'s wrapper of string_is_empty (LARB R66, AGAST #3495).
     "string": (STRING, "String_is_empty"),
 }
