@@ -855,12 +855,77 @@ fn test_epoll_wait_events_counts_ready_fds() -> i32
     var b: u8 = 'x'
     assert sys_write(fds[1], @b, 1) == 1
     assert int_of(epoll_wait_events(ep, @evs[0], 1, 0)) == 1
-    # events is at offset 0 under either layout; data is not checked, as
-    # EpollEvent is not declared packed (the kernel's is 12 bytes).
     assert (evs[0].events & L_EPOLLIN) != 0
     sys_close(fds[0])
     sys_close(fds[1])
     sys_close(ep)
     # On a closed epoll fd the wait is Err(BadF).
     assert int_of(epoll_wait_events(ep, @evs[0], 1, 0)) == -1000 - E_BADF
+    0
+
+# AGAST #4302: EpollEvent must match the x86_64 kernel's packed
+# `struct epoll_event` — 12 bytes, `data` at offset 4.  Unpacked, Ritz laid
+# it out as 16 bytes with `data` at 8, so epoll_ctl read the fd from the
+# wrong bytes and a multi-event wait's evs[1] was 4 bytes off.
+
+fn ep_off(base: *u8, field: *u8) -> i64
+    field as i64 - base as i64
+
+[[test]]
+fn test_epoll_event_is_kernel_layout() -> i32
+    assert sizeof(EpollEvent) == 12
+    var ev: EpollEvent
+    let base: *u8 = @ev as *u8
+    assert ep_off(base, @ev.events as *u8) == 0
+    assert ep_off(base, @ev.data as *u8) == 4
+    var evs: [2]EpollEvent
+    assert ep_off(@evs[0] as *u8, @evs[1] as *u8) == 12
+    0
+
+# The fd epoll_add registered comes back in `.data`, read through the
+# kernel's offset as well as the field, for each of two ready fds.
+[[test]]
+fn test_epoll_wait_events_returns_fd_in_data() -> i32
+    let ep: i32 = int_of(epoll_create())
+    var a: [2]i32
+    var b: [2]i32
+    assert sys_pipe(@a[0]) == 0
+    assert sys_pipe(@b[0]) == 0
+    assert unit_ok(epoll_add(ep, a[0], L_EPOLLIN)) == 1
+    assert unit_ok(epoll_add(ep, b[0], L_EPOLLIN)) == 1
+    var c: u8 = 'x'
+    assert sys_write(a[1], @c, 1) == 1
+    assert sys_write(b[1], @c, 1) == 1
+    # Poison the buffer so a stale or misplaced byte cannot pass by luck.
+    var evs: [4]EpollEvent
+    let raw: *u8 = @evs[0] as *u8
+    var i: i64 = 0
+    while i < 48
+        *(raw + i) = 0xAA
+        i += 1
+    assert int_of(epoll_wait_events(ep, @evs[0], 4, 0)) == 2
+    var seen_a: i32 = 0
+    var seen_b: i32 = 0
+    var k: i64 = 0
+    while k < 2
+        # The kernel writes event k at k * 12, data at +4.
+        let kdata: u64 = *((raw + k * 12 + 4) as *u64)
+        assert evs[k].data == kdata
+        assert (evs[k].events & L_EPOLLIN) != 0
+        if kdata == a[0] as u64
+            seen_a += 1
+        if kdata == b[0] as u64
+            seen_b += 1
+        k += 1
+    assert seen_a == 1
+    assert seen_b == 1
+    # epoll_mod re-registers `.data` the same way.
+    assert unit_ok(epoll_mod(ep, a[0], L_EPOLLIN)) == 1
+    assert int_of(epoll_wait_events(ep, @evs[0], 1, 0)) >= 1
+    assert evs[0].data == a[0] as u64 or evs[0].data == b[0] as u64
+    sys_close(a[0])
+    sys_close(a[1])
+    sys_close(b[0])
+    sys_close(b[1])
+    sys_close(ep)
     0

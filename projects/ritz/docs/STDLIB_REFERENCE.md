@@ -1776,6 +1776,8 @@ struct Socket
     family: i32
     socktype: i32
 
+# The kernel's packed epoll_event: 12 bytes, data at offset 4.
+[[packed]]
 struct EpollEvent
     events: u32
     data: u64
