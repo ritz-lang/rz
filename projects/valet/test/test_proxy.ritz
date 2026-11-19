@@ -12,6 +12,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
+import ritzlib.uring
 
 import lib.request
 import http.h1_framing
@@ -243,4 +244,88 @@ fn test_proxy_headers_extra_bound_covers_growth() -> i32
     let n: i64 = proxy_copy_headers(@dst[0], 256, src, strlen(src), 0)
     if n < 0 or n > strlen(src) + PROXY_CONNECTION_EXTRA
         return 1
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# Yield backoff (AGAST #183)
+#
+# A PROXY_WAIT task that misses its response re-arms a yield.  A NOP yield
+# completes at once, so N waiters made the event loop spin on N NOP CQEs
+# per pass (~950 continuations a request at c=50) and the connection
+# stalled.  The first few yields stay NOPs (most responses land within
+# microseconds); later ones become IORING_OP_TIMEOUTs that double from
+# PROXY_YIELD_MIN_US up to PROXY_YIELD_MAX_US.
+# ----------------------------------------------------------------------------
+
+[[test]]
+fn test_yield_first_yields_are_nops() -> i32
+    for n in 0..PROXY_YIELD_NOPS
+        if proxy_yield_delay_us(n) != 0
+            return 1
+    return 0
+
+[[test]]
+fn test_yield_first_timer_is_min() -> i32
+    if proxy_yield_delay_us(PROXY_YIELD_NOPS) != PROXY_YIELD_MIN_US
+        return 1
+    return 0
+
+[[test]]
+fn test_yield_timer_doubles() -> i32
+    let a: i64 = proxy_yield_delay_us(PROXY_YIELD_NOPS)
+    let b: i64 = proxy_yield_delay_us(PROXY_YIELD_NOPS + 1)
+    let c: i64 = proxy_yield_delay_us(PROXY_YIELD_NOPS + 2)
+    if b != a * 2 or c != a * 4
+        return 1
+    return 0
+
+[[test]]
+fn test_yield_timer_is_capped() -> i32
+    if proxy_yield_delay_us(PROXY_YIELD_NOPS + 40) != PROXY_YIELD_MAX_US
+        return 1
+    # A huge yield count (a 5 s wait at the cap is ~5000 yields) must not
+    # overflow the shift into a negative or zero delay.
+    if proxy_yield_delay_us(1000000) != PROXY_YIELD_MAX_US
+        return 2
+    return 0
+
+[[test]]
+fn test_yield_timer_never_decreases() -> i32
+    var prev: i64 = 0
+    for n in 0..200
+        let d: i64 = proxy_yield_delay_us(n as i32)
+        if d < prev or d > PROXY_YIELD_MAX_US
+            return 1
+        prev = d
+    return 0
+
+[[test]]
+fn test_yield_negative_count_is_nop() -> i32
+    if proxy_yield_delay_us(-1) != 0
+        return 1
+    return 0
+
+[[test]]
+fn test_yield_timespec_split() -> i32
+    var ts: KernelTimespec
+    proxy_yield_timespec(@ts, 1500000)
+    if ts.tv_sec != 1 or ts.tv_nsec != 500000000
+        return 1
+    proxy_yield_timespec(@ts, 16)
+    if ts.tv_sec != 0 or ts.tv_nsec != 16000
+        return 2
+    return 0
+
+[[test]]
+fn test_yield_einval_disables_timer() -> i32
+    # A kernel that rejects IORING_OP_TIMEOUT (WSL2 6.6) answers -EINVAL:
+    # valet then yields with NOPs for the rest of its life.
+    if proxy_yield_timer_rejected(-22) != 1
+        return 1
+    # -ETIME is a timer that fired; 0 is a NOP's CQE.
+    if proxy_yield_timer_rejected(-62) != 0
+        return 2
+    if proxy_yield_timer_rejected(0) != 0
+        return 3
     return 0
