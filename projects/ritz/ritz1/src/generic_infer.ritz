@@ -242,7 +242,7 @@ fn gi_member_type(m: *Module, e: *Expr, out: *GiType) -> i32
         return 0
     let st: *StructDef = find_concrete_struct(m, sn, sl)
     if st == null
-        return 0
+        return gi_instance_member_type(m, sn, sl, e, out)
     var f: *StructField = st.fields
     while f != null
         if f.name_len == e.ident_len and memcmp(f.name, e.ident_ptr, e.ident_len as i64) == 0
@@ -253,6 +253,47 @@ fn gi_member_type(m: *Module, e: *Expr, out: *GiType) -> i32
             return 0
         f = f.next
     0
+
+# AGAST #4299: `b.v` where b is a generic struct's instance (`Bag$Nope`, a
+# `var b: Bag<Nope>`): monomorph hasn't made `Bag$Nope` yet, so the field is
+# read off the template `Bag<T>` and its type has the instance's args put in
+# for the params (`T` is `Nope`; `V` of `Pair<K, V>` is the 2nd arg), then
+# typed as the one-argument suffix "$Nope" is.  Mirrors ritz0, which types
+# the member through the instantiated struct.
+fn gi_instance_member_type(m: *Module, sn: *u8, sl: i32, e: *Expr, out: *GiType) -> i32
+    var i: i32 = 0
+    while i < sl and *(sn + i) != 36   # '$'
+        i = i + 1
+    if i == sl
+        return 0
+    let st: *StructDef = find_generic_struct(m, sn, i)
+    if st == null
+        return 0
+    let f: *StructField = gi_field_named(st, e.ident_ptr, e.ident_len)
+    if f == null
+        return 0
+    if f.field_type != TYPE_STRUCT or f.field_type_name == null
+        if gi_is_prim(f.field_type) == 1
+            return gi_set(out, f.field_type, null, 0, TYPE_VOID)
+        return 0
+    let suffix: *u8 = sn + i
+    let sfl: i32 = sl - i
+    let cap: i32 = mangled_arg_capacity(suffix, sfl)
+    let starts: *i32 = malloc((cap as i64) * 4) as *i32
+    let lens: *i32 = malloc((cap as i64) * 4) as *i32
+    var r: i32 = 0
+    if split_mangled_args(m, suffix, sfl, starts, lens) == count_type_params(st.type_params)
+        var fl: i32 = f.field_type_name_len
+        let tn: *u8 = substitute_params_in_mangled(st.type_params, suffix, starts, lens, f.field_type_name, fl, @fl)
+        # As a one-argument suffix: "$" + the substituted type's name.
+        let one: *u8 = malloc((fl + 2) as i64)
+        *one = 36
+        memcpy(one + 1, tn, fl as i64)
+        *(one + fl + 1) = 0
+        r = gi_type_from_suffix(one, fl + 1, out)
+    free(starts as *u8)
+    free(lens as *u8)
+    r
 
 # `b[i]`: a Vec's or Span's element, a `*T`'s T, or a `[N]E`'s or `*[N]E`'s E.
 fn gi_index_type(m: *Module, e: *Expr, out: *GiType) -> i32
