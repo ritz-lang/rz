@@ -855,6 +855,90 @@ pub fn narrow_fits(v: i64, t: i32) -> i32
     let half: i64 = (1 as i64) << (w - 1)
     (v >= 0 - half and v <= half - 1) as i32
 
+# The integer kind of `bits` bits, unsigned when `uns` is 1; 0 for no such kind.
+pub fn int_kind_of(bits: i32, uns: i32) -> i32
+    var k: i32 = 0
+    if bits == 8
+        k = TYPE_I8
+        if uns == 1
+            k = TYPE_U8
+    else if bits == 16
+        k = TYPE_I16
+        if uns == 1
+            k = TYPE_U16
+    else if bits == 32
+        k = TYPE_I32
+        if uns == 1
+            k = TYPE_U32
+    else if bits == 64
+        k = TYPE_I64
+        if uns == 1
+            k = TYPE_U64
+    k
+
+# AGAST #4080 (LANGUAGE_SPEC §6.3): the integer type of `for x in a..b`'s x,
+# from its bounds' types `ts` and `te`, ritz0's _emit_for.  A lone untyped
+# literal bound (`lit_s` / `lit_e` 1, value `sv` / `ev`) is the other bound's
+# type when it fits there, as an operator's literal operand is (LARB R21); one
+# that doesn't fit a narrow type widens to an i64.  Two literals are an i64.
+# Otherwise the wider bound's width, unsigned when a bound is: any unsigned
+# bound below 64 bits, a u64 at 64 (#1636 / #3328).  0 when a bound's type is
+# untold.
+pub fn for_range_type(ts: i32, lit_s: i32, sv: i64, te: i32, lit_e: i32, ev: i64) -> i32
+    if lit_s == 1 and lit_e == 1
+        return TYPE_I64
+    if lit_s == 1 or lit_e == 1
+        var o: i32 = te
+        var v: i64 = sv
+        if lit_e == 1
+            o = ts
+            v = ev
+        let ob: i32 = ty_int_bits(o)
+        if ob == 0
+            return 0
+        if ob == 64 or narrow_fits(v, o) == 1
+            return o
+        return TYPE_I64
+    let sb: i32 = ty_int_bits(ts)
+    let eb: i32 = ty_int_bits(te)
+    if sb == 0 or eb == 0
+        return 0
+    var bits: i32 = sb
+    if eb > bits
+        bits = eb
+    var uns: i32 = 0
+    if ty_is_unsigned(ts) == 1 and (bits < 64 or ts == TYPE_U64)
+        uns = 1
+    if ty_is_unsigned(te) == 1 and (bits < 64 or te == TYPE_U64)
+        uns = 1
+    int_kind_of(bits, uns)
+
+# AGAST #4080: a range `for`'s x has for_range_type's type, so `take(x)` is
+# judged as the emitter will bind it (#3973 binds an iterable's element).  Its
+# bounds read the names outside the loop, as `for i in 0..i` does.
+pub fn narrow_sema_for(sm: *Sema, st: *Stmt)
+    if st.for_end == null or sm.scope_top <= 0
+        return
+    let v: *SemaVar = @sm.scope[sm.scope_top - 1]
+    if v.name != st.for_var or v.name_len != st.for_var_len
+        return
+    var env: NarrowEnv
+    env.s = null
+    env.sm = sm
+    var sv: i64 = 0
+    var ev: i64 = 0
+    let lit_s: i32 = lit_int_value(st.for_start, @sv)
+    let lit_e: i32 = lit_int_value(st.for_end, @ev)
+    var ts: i32 = 0
+    var te: i32 = 0
+    sm.scope_top = sm.scope_top - 1
+    if lit_s == 0
+        ts = narrow_src_type_in(@env, st.for_start, 1)
+    if lit_e == 0
+        te = narrow_src_type_in(@env, st.for_end, 1)
+    sm.scope_top = sm.scope_top + 1
+    narrow_sema_note(sm, st.for_var, st.for_var_len, for_range_type(ts, lit_s, sv, te, lit_e, ev))
+
 # =============================================================================
 # The check
 # =============================================================================

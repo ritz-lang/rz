@@ -2161,6 +2161,35 @@ fn main() -> i32
     0
 ```
 
+A range's variable has its bounds' integer type (AGAST #4080, the ruling of
+record):
+
+- A lone untyped integer literal bound is the other bound's type when it fits
+  there, as a binary operator's literal operand is (§7.1, LARB R21). With
+  `n: i32`, `for i in 0..n`, `1..n` and `1..(n + 1)` all bind an `i32`, and
+  `k..10` with `k: i32` does too.
+- A literal that doesn't fit widens the loop to an `i64` (`-129..m` with
+  `m: i8`). Two literals (`1..=5`) are an `i64`, as a lone literal is.
+- Otherwise the wider bound's width, unsigned when a bound is unsigned (only a
+  `u64` counts at 64 bits). That range compares unsigned (AGAST #1636 / #3328).
+
+The variable's arithmetic is at that width: with `m: u32`, `i - 2` in
+`for i in 1..m` wraps as a `u32` does.
+
+```ritz
+fn take(v: i32) -> i32
+    v
+
+fn sum_to(n: i32) -> i32
+    var s: i32 = 0
+    for i in 1..(n + 1)     # i: i32, so take(i) narrows nothing
+        s = s + take(i)
+    s
+
+fn main() -> i32
+    sum_to(4) - 10
+```
+
 Iterator for loops walk a `Vec<T>`:
 
 ```ritz

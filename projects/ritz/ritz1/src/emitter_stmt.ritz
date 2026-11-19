@@ -5996,6 +5996,35 @@ fn for_range_unsigned(s: *EmitterState, stmt: *Stmt) -> i32
         return 1
     0
 
+# AGAST #4080: the type for_range_type gives `for x in a..b`'s x, from the
+# bounds as int_operand_shape reads them (a literal is told apart first).
+fn for_range_var_type(s: *EmitterState, stmt: *Stmt) -> i32
+    var sv: i64 = 0
+    var ev: i64 = 0
+    let lit_s: i32 = lit_int_value(stmt.for_start, @sv)
+    let lit_e: i32 = lit_int_value(stmt.for_end, @ev)
+    var su: i32 = 0
+    var eu: i32 = 0
+    let sb: i32 = int_operand_shape(s, stmt.for_start, @su)
+    let eb: i32 = int_operand_shape(s, stmt.for_end, @eu)
+    for_range_type(int_kind_of(sb, su), lit_s, sv, int_kind_of(eb, eu), lit_e, ev)
+
+# A range bound's i64 register at the loop variable's type `t`: truncated when
+# `t` is narrower (ritz1 holds every integer in an i64), else as it is.
+fn for_bound_at(s: *EmitterState, reg: i32, t: i32) -> i32
+    let bits: i32 = ty_int_bits(t)
+    if bits == 0 or bits >= 64
+        return reg
+    let r: i32 = next_reg(s)
+    emit_str(s, c"  ")
+    emit_reg(s, r)
+    emit_str(s, c" = trunc i64 ")
+    emit_reg(s, reg)
+    emit_str(s, c" to ")
+    emit_str(s, ty_mem_llvm(t))
+    emit_str(s, c"\n")
+    r
+
 # 1 when `e` is a StrView value that ritz1 lowers to a `%Span$u8`: a `"..."`,
 # a `... as StrView` (whose register is its operand's, #2131), or a local
 # marked str_view (#3564: `let b = a` copies what `a` is).
@@ -6387,27 +6416,40 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         s.break_label = end_label
         s.continue_label = incr_label
 
-        # Allocate loop variable
-        let var_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, var_reg)
-        emit_str(s, c" = alloca i64\n")
-
         # AGAST #1636 / #3328: the range compares unsigned when a bound is a
         # u64, and the loop variable is then a u64 in the body, so `j / 2`
         # with `j = 1 << 63` is a udiv.  Decided once, from the bounds as they
         # read before `j` is bound, so the compare and the type can't disagree.
-        let range_uns: i32 = for_range_unsigned(s, stmt)
+        var range_uns: i32 = for_range_unsigned(s, stmt)
         var var_type: i32 = TYPE_I64
         if range_uns == 1
             var_type = TYPE_U64
+        # AGAST #4080: a narrower range binds its own type (for_range_type),
+        # in a slot of that width: `for i in 1..n` with `n: i32` is an i32, as
+        # on ritz0.  The start is truncated into it, and the compare and the
+        # increment are at that width, as ritz0's are.
+        let narrow_ty: i32 = for_range_var_type(s, stmt)
+        if ty_int_bits(narrow_ty) > 0 and ty_int_bits(narrow_ty) < 64
+            var_type = narrow_ty
+            range_uns = ty_is_unsigned(narrow_ty)
+        let var_llvm: *u8 = ty_mem_llvm(var_type)
+
+        # Allocate loop variable
+        let var_reg: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, var_reg)
+        emit_str(s, c" = alloca ")
+        emit_str(s, var_llvm)
+        emit_str(s, c"\n")
 
         # Register the loop variable
         add_local(s, stmt.for_var, stmt.for_var_len, var_reg, var_type)
 
         # Emit start expression and store it
-        let start_reg: i32 = emit_expr(s, stmt.for_start)
-        emit_str(s, c"  store i64 ")
+        let start_reg: i32 = for_bound_at(s, emit_expr(s, stmt.for_start), var_type)
+        emit_str(s, c"  store ")
+        emit_str(s, var_llvm)
+        emit_str(s, c" ")
         emit_reg(s, start_reg)
         emit_str(s, c", ptr ")
         emit_reg(s, var_reg)
@@ -6423,11 +6465,13 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let load_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, load_reg)
-        emit_str(s, c" = load i64, ptr ")
+        emit_str(s, c" = load ")
+        emit_str(s, var_llvm)
+        emit_str(s, c", ptr ")
         emit_reg(s, var_reg)
         emit_str(s, c"\n")
 
-        let end_reg: i32 = emit_expr(s, stmt.for_end)
+        let end_reg: i32 = for_bound_at(s, emit_expr(s, stmt.for_end), var_type)
         let cmp_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, cmp_reg)
@@ -6435,14 +6479,16 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         # or not by range_uns.
         if stmt.for_inclusive != 0
             if range_uns == 1
-                emit_str(s, c" = icmp ule i64 ")
+                emit_str(s, c" = icmp ule ")
             else
-                emit_str(s, c" = icmp sle i64 ")
+                emit_str(s, c" = icmp sle ")
         else
             if range_uns == 1
-                emit_str(s, c" = icmp ult i64 ")
+                emit_str(s, c" = icmp ult ")
             else
-                emit_str(s, c" = icmp slt i64 ")
+                emit_str(s, c" = icmp slt ")
+        emit_str(s, var_llvm)
+        emit_str(s, c" ")
         emit_reg(s, load_reg)
         emit_str(s, c", ")
         emit_reg(s, end_reg)
@@ -6471,16 +6517,22 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         let load2_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, load2_reg)
-        emit_str(s, c" = load i64, ptr ")
+        emit_str(s, c" = load ")
+        emit_str(s, var_llvm)
+        emit_str(s, c", ptr ")
         emit_reg(s, var_reg)
         emit_str(s, c"\n")
         let incr_reg: i32 = next_reg(s)
         emit_str(s, c"  ")
         emit_reg(s, incr_reg)
-        emit_str(s, c" = add i64 ")
+        emit_str(s, c" = add ")
+        emit_str(s, var_llvm)
+        emit_str(s, c" ")
         emit_reg(s, load2_reg)
         emit_str(s, c", 1\n")
-        emit_str(s, c"  store i64 ")
+        emit_str(s, c"  store ")
+        emit_str(s, var_llvm)
+        emit_str(s, c" ")
         emit_reg(s, incr_reg)
         emit_str(s, c", ptr ")
         emit_reg(s, var_reg)

@@ -89,7 +89,7 @@ fn run()
 fn main() -> i32
     var n: i32 = 3
     for i in 0..2
-        check(i)
+        check(i as i32)
         n = n + 1
     loop
         check(2)

@@ -8997,10 +8997,13 @@ class LLVMEmitter:
         # This handles common case: for i in 0..count where count is i32
         loop_ty = start_val.type
         if start_val.type != end_val.type:
-            # Prefer the end type if start is just a constant 0
-            if isinstance(range_expr.start, rast.IntLit) and range_expr.start.value == 0:
-                loop_ty = end_val.type
-                start_val = ir.Constant(loop_ty, 0)
+            # AGAST #4080: an untyped literal bound takes the other bound's
+            # type when it fits, as a binary operator's literal operand does
+            # (LARB R21): `for i in 1..n` with `n: i32` binds `i: i32`, as
+            # `0..n` always did. One that doesn't fit widens, as below.
+            adopted = self._for_literal_bound_type(range_expr, start_val, end_val)
+            if adopted is not None:
+                loop_ty, start_val, end_val = adopted
             else:
                 # Otherwise widen the narrower bound to the larger type, by its
                 # own Ritz type as binary operators do (AGAST #3327): a u32
@@ -9329,6 +9332,36 @@ class LLVMEmitter:
         narrowed = isinstance(loop_ty, ir.IntType) and loop_ty.width < 64
         return (self._int_shape(range_expr.start, narrowed)[1]
                 or self._int_shape(range_expr.end, narrowed)[1])
+
+    def _for_literal_bound_type(self, range_expr: rast.Range, start_val: ir.Value,
+                                end_val: ir.Value):
+        """AGAST #4080: `(loop_ty, start, end)` when exactly one bound of
+        `range_expr` is an untyped integer literal that fits the other's
+        integer type, the literal re-materialised at that type; else None.
+
+        The literal's fit is judged by the other bound's signedness, so
+        `-1..n` with `n: u32` doesn't fit and widens to i64 as before. `0`
+        fits every integer type, so `0..n` keeps the type it always had.
+        """
+        lit_start = self._untyped_int_literal(range_expr.start)
+        lit_end = self._untyped_int_literal(range_expr.end)
+        if (lit_start is None) == (lit_end is None):
+            return None
+        if lit_start is not None:
+            lit_val, other, other_expr = lit_start, end_val, range_expr.end
+        else:
+            lit_val, other, other_expr = lit_end, start_val, range_expr.start
+        if not isinstance(other.type, ir.IntType):
+            return None
+        width = other.type.width
+        if lit_val != 0:
+            unsigned = self._int_shape(other_expr, width < 64)[1]
+            if not self._int_literal_fits(lit_val, width, unsigned):
+                return None
+        const = ir.Constant(other.type, lit_val)
+        if lit_start is not None:
+            return other.type, const, end_val
+        return other.type, start_val, const
 
     def _widen_for_bound(self, bound: rast.Expr, val: ir.Value, ty: ir.Type) -> ir.Value:
         """The narrower bound `val` of a mixed-width range, widened to `ty` by

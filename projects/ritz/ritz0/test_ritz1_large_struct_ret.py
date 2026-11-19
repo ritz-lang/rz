@@ -271,7 +271,7 @@ fn tokendefs_add(defs: *TokenDefs, id: i32, name: *u8) -> i32
         if c == 0
             break
         def.name[j] = c
-        i = j + 1
+        i = (j + 1) as i32
     def.name[i] = 0
     defs.count = defs.count + 1
     return 0
