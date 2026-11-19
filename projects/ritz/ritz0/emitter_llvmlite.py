@@ -1929,6 +1929,24 @@ class LLVMEmitter:
         const = ir.Constant(ir.IntType(width), lit_val)
         return (const, right) if lit_left is not None else (left, const)
 
+    def _int_literal_takes_float_type(self, expr: rast.BinOp, left: ir.Value,
+                                      right: ir.Value) -> Tuple[ir.Value, ir.Value]:
+        """AGAST #4285: an integer literal operand (`2`, `-3`, `2 * 3`;
+        `_literal_operand_value`) opposite a float operand becomes a constant
+        of that float type, as it would in a float slot (§7.5).
+        Returns the `(left, right)` pair, re-materialised or as given."""
+        for lit_expr, lit, other in ((expr.right, right, left), (expr.left, left, right)):
+            if not (self._is_float_type(other.type) and isinstance(lit.type, ir.IntType)):
+                continue
+            value = self._literal_operand_value(lit_expr)
+            if value is not None:
+                const = ir.Constant(other.type, float(value))
+                if lit_expr is expr.right:
+                    right = const
+                else:
+                    left = const
+        return left, right
+
     def _retype_literal_operand(self, expr: rast.BinOp, left: ir.Value,
                                 right: ir.Value):
         """Re-materialise an untyped integer literal at the declared width.
@@ -10052,6 +10070,11 @@ class LLVMEmitter:
                     left = self.builder.fpext(left, right.type)
                 else:
                     right = self.builder.fpext(right, left.type)
+
+            # AGAST #4285: an integer literal operand (`x != 2`, `1 + x`) is
+            # in a float slot (§7.5), so it is a constant of the other side's
+            # float type, never the i64 it folded to.
+            left, right = self._int_literal_takes_float_type(expr, left, right)
 
             # Handle pointer comparison with integer 0 (null pointer check)
             # Only for comparison operators, not arithmetic

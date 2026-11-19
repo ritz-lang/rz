@@ -730,6 +730,14 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
         left_type = self._infer_type(expr.left)
         right_type = self._infer_type(expr.right)
 
+        # An integer literal (`2`, `-1`, `1 * 2`) opposite a float operand is
+        # that float (§7.5, AGAST #4285): `x != 2` compares two f64s, `1 + y`
+        # with `y: f32` is an f32.  The emitter makes it a float constant.
+        if float_rules.int_literal_only(expr.left) and self._is_float(right_type):
+            left_type = right_type
+        elif float_rules.int_literal_only(expr.right) and self._is_float(left_type):
+            right_type = left_type
+
         # Comparison operators return bool
         if expr.op in bool_rules.COMPARISONS:
             mixed = self._mixed_float_widths(left_type, right_type)
