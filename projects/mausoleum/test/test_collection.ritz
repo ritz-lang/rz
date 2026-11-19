@@ -732,6 +732,101 @@ fn test_collection_scan_resolves_large_docs() -> i32
     buffer_pool_destroy(pool)
     0
 
+# A scan kept open across writes, as server_async keeps a session's
+# scan_iter between messages (AGAST #4203): the document under the scan is
+# deleted or rewritten, its old chain freed, and a new large document takes
+# those pages.  The scan must still read only live documents' bytes, never
+# the reused chain as the old document.  The iterator holds a leaf and slot,
+# not a value, so collection_iter_value reads whatever stub is in the leaf
+# now, and every stub in the tree points at its own key's live chain.
+fn scan_after_reuse(rewrite: i32) -> i32
+    let pool: *BufferPool = size_test_pool()
+    if pool == null
+        return 90
+    var col: Collection
+    collection_init(@col, pool, 1)
+    let payload: *u8 = malloc(MAX_DOC_SIZE)
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    var ids: [3]DocumentId
+    for k in 0..3
+        if insert_sized(@col, payload, 9000, k as i64, @ids[k]) != ERR_OK
+            return 1
+    let iter_opt = collection_scan(@col)
+    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    if iter == null
+        return 2
+    # Read the first document, then step onto the second.
+    var len: i64 = 0
+    if collection_iter_value(@col, iter, buf, MAX_DOC_SIZE, @len) != ERR_OK or len != 9000
+        return 3
+    btree_iter_next(iter)
+
+    # Free the second document's chain and hand its pages to a new document
+    # of the same size (same chain shape, same lengths).
+    let free_before: i64 = buffer_pool_free_page_count(pool)
+    if rewrite != 0
+        if update_sized(@col, payload, @ids[1], 100, 50) != ERR_OK
+            return 4
+    else if collection_delete(@col, @ids[1]) != ERR_OK
+        return 4
+    if buffer_pool_free_page_count(pool) != free_before + 3
+        return 5
+    var reuser: DocumentId
+    if insert_sized(@col, payload, 9000, 77, @reuser) != ERR_OK
+        return 6
+    if buffer_pool_free_page_count(pool) != free_before
+        return 7     # The new document did not take the freed pages.
+
+    # Continue the scan: every document it yields is one that is live now,
+    # with that document's own bytes.
+    var seen: i32 = 0
+    while btree_iter_valid(iter) == 1
+        var key: [16]u8
+        var key_len: i32 = 0
+        btree_iter_key(iter, @key[0], @key_len)
+        var id: DocumentId
+        id.value = *(@key[0] as *i64)
+        var want_size: i64 = 9000
+        var seed: i64 = 0
+        if id.value == ids[1].value
+            if rewrite == 0
+                return 8         # Deleted, yet still scanned.
+            want_size = 100
+            seed = 50
+        else if id.value == ids[2].value
+            seed = 2
+        else if id.value == reuser.value
+            seed = 77
+        else
+            return 9
+        if collection_iter_value(@col, iter, buf, MAX_DOC_SIZE, @len) != ERR_OK
+            return 10
+        if len != want_size
+            return 11
+        var doc: Document
+        if doc_deserialize(buf, len, @doc) != ERR_OK
+            return 12
+        if doc_payload_is(@doc, want_size - DOC_ONE_FIELD_OVERHEAD, seed) != 0
+            return 13    # Another document's bytes under this key.
+        seen += 1
+        btree_iter_next(iter)
+    btree_iter_destroy(iter)
+    # ids[2] and the reuser, plus ids[1] if it was only rewritten.
+    if seen != 2 + rewrite
+        return 14
+    free(buf)
+    free(payload)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_collection_scan_survives_chain_reuse_after_delete() -> i32
+    scan_after_reuse(0)
+
+[[test]]
+fn test_collection_scan_survives_chain_reuse_after_update() -> i32
+    scan_after_reuse(1)
+
 # A buffer too small for the document is refused, not overrun; the length
 # it would need comes back.
 [[test]]
