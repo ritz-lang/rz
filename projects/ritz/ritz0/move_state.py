@@ -71,6 +71,14 @@ class VarInfo:
     # where. The binding stays usable through its other fields; using it
     # whole, the moved field, a parent of it or a part of it is an error.
     moved_fields: Dict[str, rast.Span] = field(default_factory=dict)
+    # `var x: T` with no initialiser, T with drop glue (§13.6, AGAST #4033):
+    # the declaration's span, which also stands as the "moved at" of each
+    # part not written yet (uninit_rules.py), so `is` tells one from a move.
+    uninit_span: Optional[rast.Span] = None
+
+    def unwritten(self, span: Optional[rast.Span]) -> bool:
+        """Is `span`, a moved_fields or move_span entry, "not written yet"?"""
+        return span is not None and span is self.uninit_span
 
 
 @dataclass

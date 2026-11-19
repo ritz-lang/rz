@@ -16,8 +16,11 @@ move_checker.py.  Blocks, `defer`s and loops are here too: they are the walk.
 
 from typing import Dict, List, Optional, Set, Tuple
 
+import copy
+
 import array_rules
 import deref_rules
+import uninit_rules
 import ritz_ast as rast
 from move_state import OwnershipError, Scope, VarInfo, VarState, _is_lending_param
 
@@ -60,6 +63,7 @@ class MoveWalk:
                 self._release_arg_loans(mark)
             # Falling off the end, after the tail value.
             self._run_defers(len(self._defers) - 1)
+            self._check_unwritten_drop(self.scope.parent, None)
             return False
         finally:
             self._defers.pop()
@@ -157,8 +161,101 @@ class MoveWalk:
                 array_rules.uninitialised_drop_array(stmt.name),
                 stmt.name_span or stmt.span))
         self.scope.define(stmt.name, self._binding_type(stmt), stmt.span)
+        if stmt.value is None:
+            self._start_unwritten(self.scope.vars[stmt.name], stmt)
         self._hold_loans(self.scope.vars[stmt.name], stmt.value, stmt.type)
         return False
+
+    def _start_unwritten(self, info: VarInfo, stmt: rast.VarStmt) -> None:
+        """`var x: T` with no initialiser, T with drop glue (§13.6, AGAST
+        #4033): each part of T with drop glue starts unwritten, kept as a
+        part moved out at the declaration (uninit_rules.py).  The emitter
+        clears those parts' drop flags at the declaration
+        (`stmt.unwritten_parts`), so neither a first write nor a drop
+        touches what the stack held."""
+        parts = uninit_rules.unwritten_parts(self.types, stmt.type)
+        stmt.unwritten_parts = [p for p in parts if p]
+        if not parts:
+            return
+        info.uninit_span = copy.copy(stmt.name_span or stmt.span)
+        if parts == [""]:
+            info.state = VarState.MOVED
+            info.move_span = info.uninit_span
+            return
+        for path in parts:
+            info.moved_fields[path] = info.uninit_span
+            self._field_moves.add((stmt.name, path))
+
+    def _moved_error(self, name: str, info: VarInfo, path: str,
+                     moved_at: Optional[rast.Span], span, borrow: bool = False):
+        """The error for using `name` (or its part `path`) while it, or a
+        part overlapping the use, is moved: or, at the declaration's span,
+        not written yet (§13.6, AGAST #4033)."""
+        place = f"{name}.{path}" if path else name
+        if info.unwritten(moved_at):
+            msg = uninit_rules.unwritten_use(place, name)
+            # One error per binding: its drop's would say the same again.
+            self._unwritten_reported.add(id(info))
+        elif borrow and path:
+            msg = f"cannot borrow `{name}` - `{place}` has been moved"
+        elif borrow:
+            msg = f"cannot borrow `{name}` - value has been moved"
+        else:
+            msg = f"use of moved value: `{place}` (moved at {moved_at})"
+        return OwnershipError(msg, span, after_move=True)
+
+    def _raw_written(self, cast: rast.Cast) -> None:
+        """`@x as *U` (§13.6, AGAST #4033): x's storage goes to code that
+        writes it through a raw pointer (ritzlib's ptr_read memcpys into
+        it).  What of x was unwritten counts as written from here, as a
+        store through a `*T` is the code's to get right; the emitter sets
+        those parts' drop flags (`cast.raw_written`).  Lending x into a `*T`
+        parameter without the cast stays a use of it."""
+        inner = cast.expr
+        while isinstance(inner, rast.Grouped):
+            inner = inner.expr
+        if not (isinstance(self.types.resolve(cast.target), rast.PtrType)
+                and isinstance(inner, rast.UnaryOp) and inner.op in ('@', '@&', '&', '&mut')
+                and isinstance(inner.operand, rast.Ident)):
+            return
+        info = self.scope.lookup(inner.operand.name)
+        if info is None or info.uninit_span is None:
+            return
+        parts = [p for p, at in info.moved_fields.items() if info.unwritten(at)]
+        whole = info.state == VarState.MOVED and info.unwritten(info.move_span)
+        if not parts and not whole:
+            return
+        for p in parts:
+            del info.moved_fields[p]
+        if whole:
+            info.state = VarState.OWNED
+            info.move_span = None
+        cast.raw_written = (inner.operand.name, parts)
+
+    def _check_unwritten_drop(self, stop: Optional[Scope], span) -> None:
+        """An exit that drops the bindings of every scope from the current
+        one up to `stop` (exclusive; None: the whole fn): a binding there
+        still owning its value with a part with drop glue unwritten on some
+        path is an error (§13.6, AGAST #4096).  `span` locates it; None puts
+        it at the binding's declaration (the end of its block)."""
+        scope = self.scope
+        while scope is not None and scope is not stop:
+            for info in scope.vars.values():
+                self._unwritten_at_drop(info, span)
+            scope = scope.parent
+
+    def _unwritten_at_drop(self, info: VarInfo, span) -> None:
+        """One binding an exit drops (_check_unwritten_drop)."""
+        if (info.uninit_span is None or info.state == VarState.MOVED
+                or id(info) in self._unwritten_reported):
+            return
+        path = next((p for p, at in info.moved_fields.items() if info.unwritten(at)), None)
+        if path is None:
+            return
+        self.errors.append(OwnershipError(
+            uninit_rules.unwritten_drop(f"{info.name}.{path}", info.name),
+            span or info.uninit_span, after_move=True))
+        self._unwritten_reported.add(id(info))
 
     def _stmt_let(self, stmt: rast.LetStmt) -> bool:
         if stmt.value:
@@ -192,6 +289,7 @@ class MoveWalk:
         if stmt.value:
             self._check_expr(stmt.value, is_move_context=True)
         self._run_defers(0)
+        self._check_unwritten_drop(None, stmt.span)
         # Return terminates this control flow path
         return True
 
@@ -275,11 +373,13 @@ class MoveWalk:
 
     def _stmt_break(self, stmt: rast.BreakStmt) -> bool:
         self._run_loop_defers()
+        self._check_loop_exit_drop(stmt.span)
         self._note_loop_exit('breaks')
         return True
 
     def _stmt_continue(self, stmt: rast.ContinueStmt) -> bool:
         self._run_loop_defers()
+        self._check_loop_exit_drop(stmt.span)
         self._note_loop_exit('continues')
         return True
 
@@ -339,6 +439,11 @@ class MoveWalk:
         out |= {(k, f) for k, (_i, _st, _s, fields) in snap.items() for f in fields}
         return out
 
+    def _check_loop_exit_drop(self, span) -> None:
+        """break / continue drops the bindings declared inside the loop."""
+        if self._loop_scopes:
+            self._check_unwritten_drop(self._loop_scopes[-1], span)
+
     def _run_loop_defers(self) -> None:
         """break / continue: the defers of the blocks inside the loop."""
         if self._loop_defer_depth:
@@ -357,10 +462,12 @@ class MoveWalk:
             frame = {'breaks': [], 'continues': []}
             self._loops.append(frame)
             self._loop_defer_depth.append(len(self._defers))
+            self._loop_scopes.append(self.scope)
             try:
                 done = iteration()
             finally:
                 self._loop_defer_depth.pop()
+                self._loop_scopes.pop()
             self._loops.pop()
             back = list(frame['continues'])
             if not done:
@@ -394,18 +501,14 @@ class MoveWalk:
             return
         # Check if variable has been moved
         if var_info.state == VarState.MOVED:
-            self.errors.append(OwnershipError(
-                f"use of moved value: `{expr.name}` (moved at {var_info.move_span})",
-                expr.span, after_move=True
-            ))
+            self.errors.append(self._moved_error(
+                expr.name, var_info, "", var_info.move_span, expr.span))
             return
         # Used whole after a field was moved out (AGAST #2171).
         if var_info.moved_fields:
             fname, fspan = next(iter(var_info.moved_fields.items()))
-            self.errors.append(OwnershipError(
-                f"use of moved value: `{expr.name}.{fname}` (moved at {fspan})",
-                expr.span, after_move=True
-            ))
+            self.errors.append(self._moved_error(
+                expr.name, var_info, fname, fspan, expr.span))
             return
 
         # If this is a move context and type is not Copy, mark as moved.
@@ -619,16 +722,19 @@ class MoveWalk:
 
     def _expr_break(self, expr: rast.BreakExpr, is_move_context: bool) -> None:
         self._run_loop_defers()
+        self._check_loop_exit_drop(expr.span)
         self._note_loop_exit('breaks')
 
     def _expr_continue(self, expr: rast.ContinueExpr, is_move_context: bool) -> None:
         self._run_loop_defers()
+        self._check_loop_exit_drop(expr.span)
         self._note_loop_exit('continues')
 
     def _expr_return(self, expr: rast.ReturnExpr, is_move_context: bool) -> None:
         if expr.value is not None:
             self._check_expr(expr.value, is_move_context=True)
         self._run_defers(0)
+        self._check_unwritten_drop(None, expr.span)
 
     def _expr_try(self, expr: rast.TryOp, is_move_context: bool) -> None:
         self._check_expr(expr.expr, is_move_context=is_move_context)
@@ -637,11 +743,15 @@ class MoveWalk:
         if self._defers and any(self._defers):
             snap = self._snapshot()
             self._run_defers(0)
+            self._check_unwritten_drop(None, expr.span)
             self._restore(snap)
+        else:
+            self._check_unwritten_drop(None, expr.span)
 
     def _expr_cast(self, expr: rast.Cast, is_move_context: bool) -> None:
         # `v as T` hands its operand's value on: it moves wherever the
         # cast does (AGAST #2948; `t as Res` with `t:& Res` copied out).
+        self._raw_written(expr)
         self._check_ref_cast(expr)
         self._check_expr(expr.expr, is_move_context=is_move_context)
 
@@ -669,6 +779,9 @@ class MoveWalk:
             # (the non-return path is when condition is false)
             if then_returns:
                 self.scope.restore_states(saved_states)
+            else:
+                # The condition-false path keeps what was unwritten.
+                self._keep_unwritten(saved_states)
             # If then doesn't return, merge: either then path moved or condition was false
             # Conservative: if moved in then, mark as potentially moved
             return
@@ -692,6 +805,21 @@ class MoveWalk:
             self.scope.restore_states(states_after_then)
         else:
             self._merge_branches(states_after_then)
+
+    def _keep_unwritten(self, other) -> None:
+        """Join the current state with `other` (a save_states) for what
+        is unwritten (§13.6, AGAST #4033): a part unwritten on either path
+        may be unwritten here.  Moves keep their own (older) rule."""
+        for name, (state, span, fields) in other.items():
+            info = self.scope.lookup(name)
+            if info is None or info.uninit_span is None:
+                continue
+            if state == VarState.MOVED and info.unwritten(span):
+                info.state = VarState.MOVED
+                info.move_span = span
+            for fname, at in fields.items():
+                if info.unwritten(at):
+                    info.moved_fields.setdefault(fname, at)
 
     def _merge_branches(self, states_after_then) -> None:
         """Neither branch of an if/else returned: a binding moved in either

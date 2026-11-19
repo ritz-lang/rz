@@ -815,10 +815,12 @@ def test_uninitialised_drop_array_refused(tmp_path, compiler, name):
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_uninitialised_copy_array_and_drop_struct_accepted(tmp_path, compiler):
-    """Only an array of a drop-glue type needs one: a `[2]i32`, and a plain
-    `var b: S` (the constructor idiom, 13 in the corpus), stay as they were."""
-    body = "fn f()\n    var a: [2]i32\n    a[0] = 1\n    var b: S\n    b.x = 4\n"
+def test_uninitialised_copy_array_accepted(tmp_path, compiler):
+    """Only an array of a drop-glue type needs one: a `[2]i32` stays as it
+    was.  A plain `var b: S` filled field by field (`b.x = 4`) was accepted
+    here too until AGAST #4033: S has its own `drop`, so it is now written
+    whole or not at all (§13.6, LARB R59; test_unwritten_drop_parts.py)."""
+    body = "fn f()\n    var a: [2]i32\n    a[0] = 1\n"
     comp, ll, _ = _compile(compiler, tmp_path, "uninit_ok", _source(body, "f()", 4))
     out = comp.stdout + comp.stderr
     assert comp.returncode == 0 and ll.exists(), f"{compiler}:\n{out[-2000:]}"

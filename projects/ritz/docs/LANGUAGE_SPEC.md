@@ -5683,6 +5683,91 @@ Returning a binding moves it to the caller. A binding moved on some paths only
 is dropped only on the paths where it still owns its value. Assigning to a
 moved-from binding drops nothing and makes the binding an owner again.
 
+**Definite initialisation.** A binding declared with no initialiser, `var x: T`,
+owns nothing yet. When T has drop glue, every part of x with drop glue must be
+written, on every path, before x is moved, lent, returned or dropped (AGAST
+#4033, #4096). Each such part starts *unwritten*: T's fields, followed down
+through every struct with no `drop` of its own, to the first part that can't be
+split (a type with its own `drop`, an enum, an array, a tuple). When T itself
+can't be split, x is unwritten whole. Storing a part (`x.f = v`, `x.a.f = v`) or
+assigning x whole writes it, and drops nothing the first time, because there is
+no old value. Until every path has written it:
+
+- using x whole (moving, returning or lending it, `@x` or `@&x`), or using an
+  unwritten part, is an error at the use. A store into a part of an unwritten
+  part (`x.f.n = 1` with `x.f` unwritten) is a use of `x.f`;
+- an exit that drops x (the end of its block, or a `return`, `?`, `break` or
+  `continue` that leaves it) is an error at that exit, or at x's name for the
+  end of its block. An x unwritten whole owns nothing until it is assigned, so
+  nothing is dropped and there's no error.
+
+Only drop glue is tracked: a field without it that is read before it's written
+reads whatever the stack held, as any `var` of a copy type does.
+
+Code that fills x through a raw pointer says so with a cast: `@x as *U` counts
+as writing every unwritten part of x, from there on. Getting the bytes right is
+that code's job, as a store through a `*T` is (ritzlib's `ptr_read` copies into
+`var out: T` this way). Without the cast, lending an unwritten x, even to a
+`*T` parameter (`init(@x)`), is a use of it.
+
+```ritz
+struct Fd
+    n: i32
+
+impl Drop for Fd
+    fn drop(self: @&Fd)
+        self.n = 0
+
+struct Conn
+    fd: Fd
+    port: i32
+
+fn open(port: i32) -> Conn
+    var c: Conn
+    c.port = port
+    c.fd = Fd { n: 3 }     # every part with drop glue is written, so c can move
+    c
+```
+
+```ritz expect-error="`c.fd` may be unwritten: `c` has no initialiser (§13.6)"
+struct Fd
+    n: i32
+
+impl Drop for Fd
+    fn drop(self: @&Fd)
+        self.n = 0
+
+struct Conn
+    fd: Fd
+    port: i32
+
+fn open(port: i32) -> Conn
+    var c: Conn
+    c.port = port
+    c                      # c.fd was never written
+```
+
+```ritz expect-error="`c.fd` may be unwritten when `c` is dropped: `c` has no initialiser (§13.6)"
+struct Fd
+    n: i32
+
+impl Drop for Fd
+    fn drop(self: @&Fd)
+        self.n = 0
+
+struct Conn
+    fd: Fd
+    port: i32
+
+fn port_of(p: i32) -> i32
+    var c: Conn
+    c.port = p
+    c.port                 # c drops here, and c.fd was never written
+```
+
+To build a value whose other fields may stay zero, use a struct literal, whose
+omitted fields are zero (§9.2), not a `var` with no initialiser.
+
 Assigning to a move-only field of a binding (`h.t = v`, or deeper,
 `h.a.t = v`) drops the field's old value the same way: after `v` has been
 evaluated, so `v` may read or move the old value, and before `v` is stored.

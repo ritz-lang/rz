@@ -69,6 +69,7 @@ def test_hook_sees_an_uninitialised_move_only_var(tmp_path, uninit_move_only):
         "fn mk() -> i32\n"
         "    var w: W\n"
         "    w.n = 1\n"
+        "    w.g = G { p: null }\n"   # §13.6 (AGAST #4096): written before w drops
         "    var c: C\n"
         "    c.n = 2\n"
         "    w.n + c.n\n"

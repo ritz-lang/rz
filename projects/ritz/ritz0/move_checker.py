@@ -87,6 +87,9 @@ class MoveChecker(MoveWalk):
         # were written at each exit it runs on (_run_defers).
         self._defers: List[List[Tuple[rast.DeferStmt, Scope]]] = []
         self._loop_defer_depth: List[int] = []
+        # Per open loop: the scope outside its body, where a `break` or
+        # `continue` stops dropping (AGAST #4096).
+        self._loop_scopes: List[Scope] = []
         # Defers already refused, so one reached by several exits is one error.
         self._refused_defers: Set[int] = set()
 
@@ -553,6 +556,8 @@ class MoveChecker(MoveWalk):
         self.current_fn_name = fn.name
         self._body = fn
         self._field_moves = set()
+        # Bindings whose unwritten part was reported (uninit_rules.py).
+        self._unwritten_reported = set()
         self._push_scope()
 
         # Parameters are owned at function start
@@ -865,15 +870,13 @@ class MoveChecker(MoveWalk):
         moves out of `b` (a partial move, §13.6)."""
         name, path = field_path(expr)
         if info.state == VarState.MOVED:
-            self.errors.append(OwnershipError(
-                f"use of moved value: `{name}` (moved at {info.move_span})",
-                expr.span, after_move=True))
+            self.errors.append(self._moved_error(
+                name, info, "", info.move_span, expr.span))
             return
         for moved, moved_at in info.moved_fields.items():
             if path_within(path, moved) or path_within(moved, path):
-                self.errors.append(OwnershipError(
-                    f"use of moved value: `{name}.{moved}` (moved at {moved_at})",
-                    expr.span, after_move=True))
+                self.errors.append(self._moved_error(
+                    name, info, moved, moved_at, expr.span))
                 return
         if not is_move_context or not self.types.is_move_only(self._field_path_type(expr)):
             return
@@ -997,17 +1000,13 @@ class MoveChecker(MoveWalk):
             if var_info:
                 # Can't borrow a moved value
                 if var_info.state == VarState.MOVED:
-                    self.errors.append(OwnershipError(
-                        f"cannot borrow `{expr.name}` - value has been moved",
-                        span, after_move=True
-                    ))
+                    self.errors.append(self._moved_error(
+                        expr.name, var_info, "", var_info.move_span, span, borrow=True))
                     return
                 if var_info.moved_fields:
-                    fname = next(iter(var_info.moved_fields))
-                    self.errors.append(OwnershipError(
-                        f"cannot borrow `{expr.name}` - `{expr.name}.{fname}` has been moved",
-                        span, after_move=True
-                    ))
+                    fname, fspan = next(iter(var_info.moved_fields.items()))
+                    self.errors.append(self._moved_error(
+                        expr.name, var_info, fname, fspan, span, borrow=True))
                     return
         else:
             # For non-identifier borrows, check the expression

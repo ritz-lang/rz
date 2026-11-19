@@ -1541,6 +1541,41 @@ pub fn own_decl(s: *EmitterState, stmt: *Stmt, before: i32)
     if stmt.var_init != null
         owned = 1
     own_register(s, idx, owned)
+    if owned == 0
+        own_start_unwritten(s, stmt)
+
+# `var x: T` with no initialiser, T with drop glue (§13.6, AGAST #4033,
+# #4096; own_check's oc_start_unwritten checks it).  Each path of T with no
+# parts of its own (a type with its own drop, an enum, an array) starts
+# unwritten.  x owns the rest, so its flag is set and those paths' mask bits
+# too: neither the first store into one nor x's drop runs glue over what the
+# stack held.  A T with no paths leaves x owning nothing (its flag clear)
+# until it is assigned.
+fn own_start_unwritten(s: *EmitterState, stmt: *Stmt)
+    let b: *OwnBinding = own_lookup(s, stmt.var_name, stmt.var_name_len)
+    if b == null or b.count > 0 or b.path_count == 0
+        return
+    var leaves: i32 = 0
+    var i: i32 = 0
+    while i < b.path_count
+        if own_has_parts(b, i) == 0
+            leaves = own_set_or(leaves, own_set_bit(i))
+        i += 1
+    own_store_flag(s, b, 1)
+    own_emit_mask_bits(s, b, leaves, 1)
+
+# `@x as *U` that own_check marked (Expr.own_raw, its oc_raw_written): raw
+# code writes x's unwritten parts from here, so x owns them: its flag is set
+# and those paths' mask bits cleared.
+pub fn own_raw_written(s: *EmitterState, e: *Expr)
+    if e.own_raw == 0 or e.left == null or e.left.operand == null
+        return
+    let x: *Expr = e.left.operand
+    let b: *OwnBinding = own_lookup(s, x.ident_ptr, x.ident_len)
+    if b == null
+        return
+    own_store_flag(s, b, 1)
+    own_emit_mask_bits(s, b, e.own_raw_bits, 0)
 
 # After a `let (a, b, ..) = v` (emit_tuple_decl): each name owns the element
 # it was bound to, and drops it at scope end unless moved (AGAST #3033).  The

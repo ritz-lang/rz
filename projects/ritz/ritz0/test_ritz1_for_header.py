@@ -584,8 +584,10 @@ impl Drop for D
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_move_only_element_is_not_dropped_by_the_loop(run_with, compiler):
-    program = (GVEC + _DROPS + MAIN + "    var v: Vec<D> = vec_new<D>()\n    var d: D\n"
-               "    d.x = 5\n    v.push(d)\n"
+    # `d` is built whole: a D has its own drop, so `var d: D` then `d.x = 5`
+    # is a store into an unwritten D (§13.6, AGAST #4033).
+    program = (GVEC + _DROPS + MAIN + "    var v: Vec<D> = vec_new<D>()\n    var d = D { x: 5 }\n"
+               "    v.push(d)\n"
                + _body("var t: i32 = 0\nfor e in v\n    t = t + e.x\nif t != 5\n    return 1\n"
                        "if drops != 0\n    return 2\nreturn 0\n"))
     assert run_with(compiler, "drops", program) == 0

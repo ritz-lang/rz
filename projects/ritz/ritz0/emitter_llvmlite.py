@@ -5612,6 +5612,39 @@ class LLVMEmitter:
             if slot is not val:
                 self._set_let_drop_slot(name, slot)
 
+    def _start_unwritten(self, stmt: rast.VarStmt, alloca: ir.AllocaInstr) -> None:
+        """`var x: T` with no initialiser (§13.6, AGAST #4033, #4096). With
+        no part written yet, x owns nothing: its drop flag is cleared (again,
+        on a later pass round a loop). When the move checker split T into
+        parts (`stmt.unwritten_parts`), x owns the rest from here: its flag
+        is set, each such part's flag cleared until a store writes it, so
+        neither that first store nor x's drop runs glue over stack bytes."""
+        flag = self.drop_flags.get(id(alloca))
+        if flag is None or self.builder.block.is_terminated:
+            return
+        parts = getattr(stmt, 'unwritten_parts', None) or ()
+        self.builder.store(ir.Constant(self.i1, 1 if parts else 0), flag)
+        for fpath, fflag in self.field_drop_flags.get(id(alloca), {}).items():
+            self.builder.store(ir.Constant(self.i1, 0 if fpath in parts else 1), fflag)
+
+    def _raw_written(self, cast: rast.Cast) -> None:
+        """`@x as *U` of an unwritten x (the move checker's
+        `cast.raw_written`: x's name and the parts it wrote, none for x
+        whole): x owns its value from here, so its drop flag and those
+        parts' are set (§13.6, AGAST #4033)."""
+        mark = getattr(cast, 'raw_written', None)
+        if mark is None or self.builder.block.is_terminated:
+            return
+        name, parts = mark
+        slot = self._drop_slot_of(name)
+        flag = self.drop_flags.get(id(slot)) if slot is not None else None
+        if flag is None:
+            return
+        self.builder.store(ir.Constant(self.i1, 1), flag)
+        for fpath, fflag in self._field_flags_of(name).items():
+            if fpath in parts:
+                self.builder.store(ir.Constant(self.i1, 1), fflag)
+
     def _mark_drop_variable_initialized(self, alloca: ir.AllocaInstr):
         """Set the drop flag to 1, indicating the variable is now initialized.
 
@@ -7691,6 +7724,8 @@ class LLVMEmitter:
                 # Mark as initialized if we just assigned a value
                 if stmt.value:
                     self._mark_drop_variable_initialized(alloca)
+                else:
+                    self._start_unwritten(stmt, alloca)
             # Emit debug info for variable (requires ritz_type for proper type info)
             if ritz_type:
                 self._emit_dbg_declare(alloca, stmt.name, ritz_type, stmt_line)
@@ -10186,6 +10221,7 @@ class LLVMEmitter:
             return self._emit_field_access(expr)
 
         elif isinstance(expr, rast.Cast):
+            self._raw_written(expr)
             return self._emit_cast(expr)
 
         elif isinstance(expr, rast.Match):

@@ -132,6 +132,14 @@ struct OcBind
     path_count: i32
     fmoved: i32
     fshadow: i32
+    # AGAST #4033, #4096: `var x: T` with no initialiser, T with drop glue
+    # (§13.6): where it was declared (0 when it wasn't), and 1 once an
+    # unwritten part of it was reported.  Each part not written yet is kept
+    # as moved there, recorded at line -uninit_line so a use tells it from a
+    # move (oc_start_unwritten).
+    uninit_line: i32
+    uninit_col: i32
+    uninit_told: i32
 
 struct OcState
     module: *Module      # the module any_drop was found for
@@ -641,6 +649,7 @@ fn oc_pop_scope(sm: *Sema) -> i32
     let dead: i32 = oc_scope_is_dead(o)
     if dead == 0
         oc_unwind(sm, dstart)
+        oc_check_unwritten_drop(sm, start, 0, 0)   # AGAST #4096
     o.defer_count = dstart
     o.live_count = start
     o.scope_count = o.scope_count - 1
@@ -814,6 +823,9 @@ fn oc_error_defer_at(sm: *Sema, line: i32, col: i32, b: *OcBind)
 fn oc_error_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, move_line: i32, move_col: i32)
     if oc_error_in_defer(sm, b) == 1
         return
+    if move_line < 0
+        oc_error_unwritten_at(sm, line, col, b, 0 - 1)
+        return
     oc_error_at(sm, line, col)
     oc_put_cstr(c"use of moved value: `")
     oc_put_bytes(b.name, b.name_len)
@@ -823,6 +835,9 @@ fn oc_error_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, move_line: i32, m
 
 fn oc_error_borrow_at(sm: *Sema, line: i32, col: i32, b: *OcBind)
     if oc_error_in_defer(sm, b) == 1
+        return
+    if b.move_line < 0
+        oc_error_unwritten_at(sm, line, col, b, 0 - 1)
         return
     oc_error_at(sm, line, col)
     oc_put_cstr(c"cannot borrow `")
@@ -846,11 +861,14 @@ fn oc_error_field_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i32)
         return
     let o: *OcState = oc()
     let path: i32 = oc_first_moved(o, b.id, bits)
+    let r: *i32 = oc_fm_find(o, b.id, path)
+    if r != null and r[2] < 0
+        oc_error_unwritten_at(sm, line, col, b, path)
+        return
     oc_error_at(sm, line, col)
     oc_put_cstr(c"use of moved value: `")
     oc_put_binding_path(b, path)
     oc_put_cstr(c"`")
-    let r: *i32 = oc_fm_find(o, b.id, path)
     if r != null
         oc_put_cstr(c" (moved at ")
         oc_put_loc(sm, r[2], r[3])
@@ -859,6 +877,11 @@ fn oc_error_field_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i32)
 
 fn oc_error_borrow_field_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i32)
     if oc_error_in_defer(sm, b) == 1
+        return
+    let path: i32 = oc_first_moved(oc(), b.id, bits)
+    let r: *i32 = oc_fm_find(oc(), b.id, path)
+    if r != null and r[2] < 0
+        oc_error_unwritten_at(sm, line, col, b, path)
         return
     oc_error_at(sm, line, col)
     oc_put_cstr(c"cannot borrow `")
@@ -1685,6 +1708,7 @@ fn oc_walk(sm: *Sema, e: *Expr, mv: i32)
         oc_walk_member(sm, e, mv)
     else if k == EXPR_CAST
         # `v as T` hands its operand's value on (AGAST #2964).
+        oc_raw_written(sm, e)   # AGAST #4033
         oc_walk(sm, e.left, mv)
     else if k == EXPR_TRY
         oc_walk(sm, e.left, mv)
@@ -1778,9 +1802,53 @@ fn oc_try_count(e: *Expr) -> i32
 # Each `?` in `e` leaves the fn: the deferred statements run there.
 fn oc_try_rets(sm: *Sema, e: *Expr)
     var n: i32 = oc_try_count(e)
+    if n > 0 and oc_checking(sm) == 1
+        let t: *Expr = oc_first_try(e)
+        if t != null
+            oc_check_unwritten_drop(sm, 0, t.span.line, t.span.col)   # AGAST #4096
     while n > 0
         oc_before_ret(sm)
         n -= 1
+
+# The first `?` in `e`, in oc_try_count's order, or null.
+fn oc_first_try(e: *Expr) -> *Expr
+    if e == null
+        return null
+    let k: i32 = e.kind
+    if k == EXPR_TRY
+        let inner: *Expr = oc_first_try(e.left)
+        if inner != null
+            return inner
+        return e
+    if k == EXPR_UNARY
+        return oc_first_try(e.operand)
+    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        let l: *Expr = oc_first_try(e.left)
+        if l != null
+            return l
+        return oc_first_try(e.right)
+    if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_ARRAY_FILL or k == EXPR_MATCH or k == EXPR_IF
+        return oc_first_try(e.left)
+    if k == EXPR_METHOD
+        let r: *Expr = oc_first_try(e.left)
+        if r != null
+            return r
+    if k == EXPR_CALL or k == EXPR_ARRAY_LIT or k == EXPR_METHOD
+        var a: *Expr = e.args
+        while a != null
+            let t: *Expr = oc_first_try(a)
+            if t != null
+                return t
+            a = a.next
+        return null
+    if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            let t: *Expr = oc_first_try(fi.value)
+            if t != null
+                return t
+            fi = fi.next
+    null
 
 # --- Statements -----------------------------------------------------------------------------
 
@@ -1912,11 +1980,15 @@ fn oc_stmt_begin(sm: *Sema, stmt: *Stmt)
     if k == STMT_DEFER
         oc_defer(sm, stmt)
     else if k == STMT_BREAK
+        oc_check_jump_drop(sm, stmt)   # AGAST #4096
         oc_loop_jump(sm, 0)
     else if k == STMT_CONTINUE
+        oc_check_jump_drop(sm, stmt)
         oc_loop_jump(sm, 1)
     else if k == STMT_RETURN
         oc_before_ret(sm)
+        if oc_checking(sm) == 1
+            oc_check_unwritten_drop(sm, 0, stmt.span.line, stmt.span.col)   # AGAST #4096
 
 # After a statement (and its nested lists): a declaration registers what it
 # binds; `x = v` owns v; a `return` ends its block for the check, and so does
@@ -2016,6 +2088,9 @@ fn oc_tuple_name(sm: *Sema, name: *u8, len: i32, f: *StructField)
 fn oc_decl(sm: *Sema, stmt: *Stmt)
     if stmt.var_init == null
         oc_check_uninit_array(sm, stmt)
+        if oc_register(sm, stmt.var_name, stmt.var_name_len) == 1
+            oc_start_unwritten(sm, stmt)
+        return
     if stmt.var_declared_type == TYPE_VOID
         let tup: *StructDef = oc_tuple_def(sm, stmt.var_init)
         if tup != null
@@ -2263,6 +2338,184 @@ fn oc_loop_jump(sm: *Sema, is_continue: i32)
         oc_restore(snap)
         free(snap as *u8)
 
+# --- Definite initialisation (§13.6, AGAST #4033, #4096) ---------------------------------
+#
+# ritz0's uninit_rules.py.  `var x: T` with no initialiser, T with drop glue:
+# each path of T with no parts of its own (a type with its own drop, an enum,
+# an array) starts unwritten, kept as moved with -line as its "moved at", so
+# that writing it gives it back as for a move.  A use of x whole or of an
+# unwritten part is an error at the use; an exit that drops x with a part
+# unwritten is one at the exit.  A T that can't be split leaves x unwritten
+# whole: it owns nothing until assigned.  ownership.ritz's own_start_unwritten
+# sets the flag and mask bits to match.
+
+fn oc_start_unwritten(sm: *Sema, stmt: *Stmt)
+    let b: *OcBind = oc_lookup(sm, stmt.var_name, stmt.var_name_len)
+    if b == null or b.count > 0
+        return
+    if b.path_count == 0 and oc_has_drop_impl(sm, b.type_name, b.type_name_len) == 0 and oc_find_struct(sm, b.type_name, b.type_name_len) != null
+        # Move-only only through a type argument (`Vec<Res>`: a `*Res`
+        # field): no part has drop glue, so nothing starts unwritten.
+        return
+    var line: i32 = stmt.name_span.line
+    var col: i32 = stmt.name_span.col
+    if line == 0
+        line = stmt.span.line
+        col = stmt.span.col
+    b.uninit_line = line
+    b.uninit_col = col
+    b.uninit_told = 0
+    if b.path_count == 0
+        b.moved = 1
+        b.move_line = 0 - line
+        b.move_col = col
+        return
+    b.fmoved = oc_push_unwritten(oc(), b, 0 - 1, 0)
+
+# Record the paths below `parent` that have no parts of their own, in field
+# order, depth first (ritz0's moved_fields order), as unwritten; returns
+# `acc` with their bits added.
+fn oc_push_unwritten(o: *OcState, b: *OcBind, parent: i32, acc: i32) -> i32
+    var out: i32 = acc
+    var i: i32 = 0
+    while i < b.path_count
+        let p: *OwnPath = oc_path_at(b, i)
+        if p.parent == parent
+            if p.down != own_set_bit(i)
+                out = oc_push_unwritten(o, b, i, out)
+            else
+                oc_fm_push(o, b.id, i, 0 - b.uninit_line, b.uninit_col)
+                out = own_set_or(out, own_set_bit(i))
+        i += 1
+    out
+
+# The bits of `b`'s paths that are unwritten now (their latest record is the
+# declaration's).
+fn oc_unwritten_bits(o: *OcState, b: *OcBind) -> i32
+    var bits: i32 = 0
+    let base: *i32 = o.fm_loc
+    var i: i32 = 0
+    while i < b.path_count
+        if own_set_has(b.fmoved, i) == 1
+            let at: i32 = oc_fm_index(o, b.id, i)
+            if at >= 0
+                let r: *i32 = base + at * 4
+                if r[2] < 0
+                    bits = own_set_or(bits, own_set_bit(i))
+        i += 1
+    bits
+
+# `<place>` may be unwritten: `x` has no initialiser (§13.6), ritz0's
+# uninit_rules.unwritten_use.  `path` -1 is x whole.
+fn oc_error_unwritten_at(sm: *Sema, line: i32, col: i32, b: *OcBind, path: i32)
+    oc_error_at(sm, line, col)
+    oc_put_char('`')
+    oc_put_binding_path(b, path)
+    oc_put_cstr(c"` may be unwritten: `")
+    oc_put_bytes(b.name, b.name_len)
+    oc_put_cstr(c"` has no initialiser (§13.6)\n")
+    b.uninit_told = 1
+
+# An exit that drops live[from..]: one of them that owns its value with a
+# part unwritten is an error (AGAST #4096), at line:col, or (line 0, the end
+# of its block) at its declaration.  ritz0's _check_unwritten_drop.
+fn oc_check_unwritten_drop(sm: *Sema, from: i32, line: i32, col: i32)
+    let o: *OcState = oc()
+    var i: i32 = from
+    if i < 0
+        i = 0
+    while i < o.live_count
+        let b: *OcBind = oc_live_at(o, i)
+        if b.uninit_line != 0 and b.uninit_told == 0 and b.moved == 0
+            let bits: i32 = oc_unwritten_bits(o, b)
+            if bits != 0
+                var l: i32 = line
+                var c: i32 = col
+                if l == 0
+                    l = b.uninit_line
+                    c = b.uninit_col
+                oc_error_at(sm, l, c)
+                oc_put_char('`')
+                oc_put_binding_path(b, oc_first_moved(o, b.id, bits))
+                oc_put_cstr(c"` may be unwritten when `")
+                oc_put_bytes(b.name, b.name_len)
+                oc_put_cstr(c"` is dropped: `")
+                oc_put_bytes(b.name, b.name_len)
+                oc_put_cstr(c"` has no initialiser (§13.6)\n")
+                b.uninit_told = 1
+        i += 1
+
+# `break` / `continue` drops the loop body's bindings.
+fn oc_check_jump_drop(sm: *Sema, stmt: *Stmt)
+    let o: *OcState = oc()
+    if o.loop_base < 0 or oc_checking(sm) == 0
+        return
+    oc_check_unwritten_drop(sm, o.loop_base, stmt.span.line, stmt.span.col)
+
+# Join the current state with `snap`'s for what is unwritten (ritz0's
+# _keep_unwritten): a part unwritten on either path may be unwritten here.
+# Moves keep their own (older) rule.
+fn oc_keep_unwritten(snap: *i32)
+    if snap == null
+        return
+    let o: *OcState = oc()
+    var n: i32 = snap[0]
+    if n > o.live_count
+        n = o.live_count
+    let base: *i32 = o.fm_loc
+    var i: i32 = 0
+    while i < n
+        let b: *OcBind = oc_live_at(o, i)
+        let r: *i32 = oc_snap_rec(snap, i)
+        if b.uninit_line != 0
+            if r[0] == 1 and r[1] < 0 and b.moved == 0
+                b.moved = 1
+                b.move_line = r[1]
+                b.move_col = r[2]
+            var back: i32 = 0
+            var p: i32 = 0
+            while p < b.path_count
+                if own_set_has(r[4], p) == 1 and own_set_has(b.fmoved, p) == 0
+                    let at: i32 = oc_fm_latest_below(o, b.id, p, snap[1])
+                    if at >= 0
+                        let fr: *i32 = base + at * 4
+                        if fr[2] < 0
+                            back = own_set_or(back, own_set_bit(p))
+                p += 1
+            if back != 0
+                oc_fm_repush(o, b.id, back, snap[1], 1)
+                b.fmoved = own_set_or(b.fmoved, back)
+        i += 1
+
+# `@x as *U` (ritz0's _raw_written): x's storage goes to code that writes it
+# through a raw pointer (ritzlib's ptr_read memcpys into it).  What of x was
+# unwritten counts as written from here; the emitter sets x's flag and
+# clears those mask bits (Expr.own_raw, ownership.ritz's own_raw_written).
+# Lending x into a `*T` parameter without the cast stays a use of it.
+fn oc_raw_written(sm: *Sema, e: *Expr)
+    if e.op != TYPE_PTR or e.left == null or e.left.kind != EXPR_UNARY
+        return
+    let a: *Expr = e.left
+    if (a.op != OP_ADDR and a.op != OP_ADDR_MUT) or a.operand == null or a.operand.kind != EXPR_IDENT
+        return
+    let b: *OcBind = oc_lookup(sm, a.operand.ident_ptr, a.operand.ident_len)
+    if b == null or b.uninit_line == 0
+        return
+    if b.moved == 1
+        if b.move_line < 0
+            b.moved = 0
+            b.move_line = 0
+            b.move_col = 0
+            e.own_raw = 1
+            e.own_raw_bits = 0
+        return
+    let bits: i32 = oc_unwritten_bits(oc(), b)
+    if bits == 0
+        return
+    b.fmoved = own_set_minus(b.fmoved, bits)
+    e.own_raw = 1
+    e.own_raw_bits = bits
+
 # --- Snapshots: `if` and arm merges (ritz0's If handling) ---------------------------------
 
 fn oc_snap_rec(snap: *i32, i: i32) -> *i32
@@ -2375,6 +2628,8 @@ fn oc_if_merge(before: *i32, after_then: *i32, then_dead: i32, has_else: i32, el
     if has_else == 0
         if then_dead == 1
             oc_restore(before)
+        else
+            oc_keep_unwritten(before)   # AGAST #4033: the condition-false path
     else if then_dead == 0 and else_dead == 1
         oc_restore(after_then)
     else if then_dead == 0 and else_dead == 0
@@ -3190,6 +3445,8 @@ pub fn own_check_block_leave(sm: *Sema)
     else if kind == OC_BLOCK_BODY
         # The fn's own `ret`, with the body's bindings still in scope.
         oc_before_ret(sm)
+        if oc_scope_is_dead(o) == 0
+            oc_check_unwritten_drop(sm, 0, 0, 0)   # AGAST #4096
 
 # The next statement list is an `unsafe` block's: no block of its own.
 pub fn own_check_unsafe()
