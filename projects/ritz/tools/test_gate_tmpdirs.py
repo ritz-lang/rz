@@ -79,6 +79,12 @@ RM_GLOB = re.compile(r"\brm\s+(?:-\w*\s+)*-\w*r\w*\b[^;&|]*\*")
 SOCK_DIR_MKTEMP = re.compile(
     r'^\s*\w*SOCK_DIR=("?)\$\(mktemp -d /tmp/[\w.-]+\.X{8,}\)\1\s*$'
 )
+# ...and sock_dir()'s candidate list, whose last resort is /tmp (AGAST #4274:
+# $TMPDIR first, then $XDG_RUNTIME_DIR, so a full /tmp no longer breaks the
+# harness).  Each candidate only parents a unique `mktemp -d` template.
+SOCK_DIR_CANDIDATES = re.compile(
+    r'^\s*for base in "\$\{TMPDIR:-\}" "\$\{XDG_RUNTIME_DIR:-\}" /tmp; do\s*$'
+)
 
 
 def tmp_violations(text: str):
@@ -86,7 +92,8 @@ def tmp_violations(text: str):
     return [
         (n, line.strip())
         for n, line in enumerate(text.splitlines(), 1)
-        if (TMP_PATH.search(_code(line)) and not SOCK_DIR_MKTEMP.match(_code(line)))
+        if (TMP_PATH.search(_code(line)) and not SOCK_DIR_MKTEMP.match(_code(line))
+            and not SOCK_DIR_CANDIDATES.match(_code(line)))
         or RM_GLOB.search(_code(line))
     ]
 
@@ -125,6 +132,8 @@ def scratch_owned_by_trap(text: str) -> bool:
     "x=$(mktemp -d /tmp/foo.XXXXXXXX)",            # ...even for a socket, unless SOCK_DIR
     "SOCK_DIR=/tmp/zeus_sock",                     # SOCK_DIR, but a fixed shared name
     "SOCK_DIR=$(mktemp -d /tmp/s.XXXXXXXX); rm -f /tmp/x",  # exception covers one mktemp only
+    'for base in "${TMPDIR:-}" /tmp/x; do',         # not sock_dir's exact candidate list
+    'for base in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" /tmp; do rm -f /tmp/y; done',
 ])
 def test_detector_flags(src):
     assert tmp_violations(src) != []
@@ -138,6 +147,7 @@ def test_detector_flags(src):
     'rm -rf "$sandbox"',
     "find . -name x -exec rm -rf {} +",
     'SOCK_DIR="$(mktemp -d /tmp/rz_e2e_sock.XXXXXXXX)"',  # sun_path (#4135)
+    '    for base in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" /tmp; do',  # sock_dir (#4274)
 ])
 def test_detector_passes(src):
     assert tmp_violations(src) == []

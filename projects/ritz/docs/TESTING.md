@@ -512,6 +512,27 @@ Rules:
    package-only gate could never skip ~7 minutes.  `RITZ_READ_GUARD=0`
    turns the guard off for a local run.
 
+### Stale pytest basetemps: install the sweep timer once per host
+
+A pytest run outside a gate puts its `tmp_path`s in
+`/tmp/pytest-of-$USER/pytest-N`.  pytest keeps the last 3, but not one whose
+run was killed (its `.lock` holds it for 3 days) or one a test left a mode-000
+dir in.  On 2026-11-19 29 of them (110-145k files each) used all of
+bangerang's /tmp inodes and every gate failed at `mktemp` (AGAST #4274).
+Gates don't add to it: their TMPDIR, and the ritz0 step's `--basetemp`, are
+their own and removed afterwards (`chmod -R u+rwx` first).  For the rest,
+every host runs `tools/sweep_pytest_tmp.py` from a user timer.  Once per host,
+from any checkout:
+
+```bash
+python3 projects/ritz/tools/sweep_pytest_tmp.py --install     # copy + enable the timer
+python3 projects/ritz/tools/sweep_pytest_tmp.py --dry-run     # what it would remove now
+```
+
+Every 30 minutes it removes the `pytest-*` dirs untouched for 3 hours (or
+dated in the future: gate-queue tests set future mtimes) whose
+`.lock` names no live process.
+
 ---
 
 ## Test attributes reference

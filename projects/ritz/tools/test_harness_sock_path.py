@@ -1,4 +1,7 @@
-"""Shell harnesses must bind their unix sockets under /tmp, not $TMPDIR (#4135).
+"""Shell harnesses must bind their unix sockets where the path fits (#4135).
+
+AGAST #4274 (below): under $TMPDIR when it fits, else $XDG_RUNTIME_DIR,
+else /tmp; never a hardcoded /tmp that a full tmpfs breaks.
 
 A unix socket path fits in sun_path: 108 bytes with the NUL, so 107 usable.
 The gate sets TMPDIR deep in its worktree (.trees/ritz-gate-<name>.tmp), and
@@ -18,8 +21,10 @@ the limit; neither needs a built server:
 
 import os
 import re
+import shutil
 import signal
 import subprocess
+import tempfile
 import textwrap
 from pathlib import Path
 
@@ -105,3 +110,111 @@ def test_e2e_large_page_socket_fits_sun_path_under_long_tmpdir(tmp_path):
     assert not sock.startswith(str(tmpdir)), sock
     # The EXIT trap still removes the dir after a SIGTERM.
     assert not Path(sock).parent.exists(), f"{sock} left behind"
+
+
+# AGAST #4274: a hardcoded /tmp socket dir broke every gate on bangerang when
+# /tmp ran out of inodes (`mktemp: No space left on device`).  Both harnesses
+# now take their socket dir from sock_dir(): $TMPDIR when the path fits
+# sun_path, else $XDG_RUNTIME_DIR, else /tmp -- and the next candidate when a
+# mktemp fails.  The function is the same text in both scripts.
+TIER1_SH = REPO / "projects" / "harland" / "tools" / "test_tier1_boot.sh"
+SOCK_DIR_SCRIPTS = (E2E_SH, TIER1_SH)
+
+
+def _sock_dir_fn(script: Path) -> str:
+    m = re.search(r"^sock_dir\(\) \{\n.*?^\}\n", script.read_text(), re.MULTILINE | re.DOTALL)
+    assert m, f"{script.name} defines no sock_dir()"
+    return m.group(0)
+
+
+def _sock_dir(script: Path, env: dict, prefix: str = "rz_t", namelen: int = 9):
+    r = subprocess.run(
+        ["bash", "-c", _sock_dir_fn(script) + f'sock_dir {prefix} {namelen}'],
+        capture_output=True, text=True, timeout=10, env=env, check=False,
+    )
+    return r.returncode, r.stdout.strip(), r.stderr
+
+
+def test_sock_dir_is_one_function_shared_by_both_harnesses():
+    assert _sock_dir_fn(E2E_SH) == _sock_dir_fn(TIER1_SH)
+
+
+@pytest.mark.parametrize("script", SOCK_DIR_SCRIPTS, ids=lambda p: p.name)
+def test_harness_takes_its_socket_dir_from_sock_dir_not_a_hardcoded_tmp(script):
+    text = script.read_text()
+    assert not re.search(r"mktemp\s+-d\s+/tmp/", text), f"{script.name} still hardcodes /tmp"
+    assert re.search(r'^SOCK_DIR="\$\(sock_dir \w+ \d+\)" \|\| exit 1$', text, re.MULTILINE), script.name
+
+
+def _clean_env(**kw) -> dict:
+    env = {k: v for k, v in os.environ.items() if k not in ("TMPDIR", "XDG_RUNTIME_DIR")}
+    env.update({k: str(v) for k, v in kw.items() if v is not None})
+    return env
+
+
+def test_sock_dir_honours_a_short_tmpdir(tmp_path):
+    short = Path(tempfile.mkdtemp(prefix="rzs", dir="/tmp"))
+    try:
+        rc, d, err = _sock_dir(E2E_SH, _clean_env(TMPDIR=short, XDG_RUNTIME_DIR=tmp_path))
+        assert rc == 0, err
+        assert Path(d).parent == short and Path(d).is_dir(), d
+    finally:
+        shutil.rmtree(short)
+
+
+def test_sock_dir_skips_a_long_tmpdir_for_xdg_runtime_dir(tmp_path):
+    runtime = Path(tempfile.mkdtemp(prefix="rzx", dir="/tmp"))
+    try:
+        rc, d, err = _sock_dir(E2E_SH, _clean_env(TMPDIR=_long_tmpdir(tmp_path), XDG_RUNTIME_DIR=runtime))
+        assert rc == 0, err
+        assert Path(d).parent == runtime, d
+    finally:
+        shutil.rmtree(runtime)
+
+
+def test_sock_dir_falls_through_when_mktemp_fails(tmp_path):
+    # A full /tmp is what #4274 saw; an unwritable TMPDIR fails mktemp the
+    # same way, and the next candidate (here XDG_RUNTIME_DIR) is used.
+    full = tmp_path / "full"
+    full.mkdir()
+    full.chmod(0o500)
+    runtime = Path(tempfile.mkdtemp(prefix="rzx", dir="/tmp"))
+    try:
+        rc, d, err = _sock_dir(E2E_SH, _clean_env(TMPDIR=full, XDG_RUNTIME_DIR=runtime))
+        assert rc == 0, err
+        assert Path(d).parent == runtime, d
+    finally:
+        full.chmod(0o700)
+        shutil.rmtree(runtime)
+
+
+def test_sock_dir_ends_at_tmp(tmp_path):
+    rc, d, err = _sock_dir(E2E_SH, _clean_env(TMPDIR=_long_tmpdir(tmp_path)))
+    assert rc == 0, err
+    try:
+        assert Path(d).parent == Path("/tmp"), d
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def test_sock_dir_path_plus_name_always_fits_sun_path():
+    # A TMPDIR exactly at the limit for prefix + name is used; one byte
+    # longer is skipped.  Bases under /tmp: a gate's tmp_path is too deep.
+    prefix, namelen = "rz_t", 30
+    room = SUN_PATH_MAX - len("/" + prefix + ".XXXXXXXX/") - namelen
+    top = Path(tempfile.mkdtemp(prefix="rze", dir="/tmp"))
+    try:
+        edge = top / ("e" * (room - len(os.fsencode(top)) - 1))
+        over = Path(str(edge) + "x")
+        edge.mkdir()
+        over.mkdir()
+        assert len(os.fsencode(edge)) == room
+        rc, d, err = _sock_dir(E2E_SH, _clean_env(TMPDIR=edge), prefix, namelen)
+        assert rc == 0 and Path(d).parent == edge, (d, err)
+        assert len(os.fsencode(d)) + 1 + namelen == SUN_PATH_MAX, d
+        rc, d, err = _sock_dir(E2E_SH, _clean_env(TMPDIR=over), prefix, namelen)
+        assert rc == 0 and Path(d).parent != over, (d, err)
+        if not str(d).startswith(str(top)):
+            shutil.rmtree(d, ignore_errors=True)
+    finally:
+        shutil.rmtree(top)

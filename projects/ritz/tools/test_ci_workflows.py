@@ -146,3 +146,20 @@ def test_regression_sh_is_shellcheck_clean():
     r = subprocess.run([shellcheck, "-x", "scripts/regression.sh"],
                        cwd=PKG_DIR, capture_output=True, text=True)
     assert r.returncode == 0, r.stdout + r.stderr
+
+
+@pytest.mark.unit
+def test_every_step_trap_that_removes_a_dir_makes_it_removable_first():
+    """AGAST #4274: tests leave dirs with no read/search bit (mode 000), and a
+    bare `rm -rf` can't descend into one: pytest basetemps of 110-145k files
+    each survived that way until bangerang's /tmp ran out of inodes.  So a
+    step's `trap ... rm -rf "$X"` runs `chmod -R u+rwx "$X"` first."""
+    traps = []
+    for wf, job, spec in _jobs():
+        for step in spec.get("steps") or []:
+            for m in re.finditer(r"trap '([^']*)'", step.get("run") or ""):
+                for target in re.findall(r'rm -rf ("\$\w+")', m.group(1)):
+                    traps.append((wf, job, step.get("name"), m.group(1), target))
+    assert traps, "no step trap removes a dir: the ritz0 step's BASETEMP trap moved?"
+    bad = [t for t in traps if f"chmod -R u+rwx {t[4]}" not in t[3].split("rm -rf")[0]]
+    assert not bad, bad

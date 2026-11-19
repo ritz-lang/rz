@@ -3,7 +3,7 @@
 # runs in the foreground against a throwaway repo.  Run: bash test-run-gate.sh
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
-T="$(mktemp -d)"; trap 'chmod -R u+w "$T"; rm -rf "$T"' EXIT
+T="$(mktemp -d)"; trap 'chmod -R u+rwx "$T"; rm -rf "$T"' EXIT
 fails=0
 ok()  { echo "ok   - $1"; }
 bad() { echo "FAIL - $1"; fails=$((fails + 1)); }
@@ -386,6 +386,12 @@ check '[[ "$(cat "$RZ_TEST_ORDER.tmpdir")" == "$GT" ]]' "the command's TMPDIR is
 check '[[ "$(cat "$RZ_TEST_ORDER.pytmp")" == "$GT" ]]' "python's tempfile (and so pytest's tmp_path) follows it"
 check '[[ "$(grep -c "^TMPDIR=" "$l17")" -eq 1 ]] && sed "/^WAITING/q" "$l17" | grep -qx "TMPDIR=$GT"' "the log names the TMPDIR once, in its header (before WAITING)"
 check '[[ ! -e "$GT" ]]' "the gate's TMPDIR is removed afterwards"
+# AGAST #4274: some tests leave a dir with no read/search permission (mode
+# 000), as pytest basetemps on bangerang did; `chmod -R u+w` can't descend
+# into one, so the dir and the TMPDIR around it survived the gate.
+l17="$(RZ_GATE_CMD='mkdir -p "$TMPDIR/pytest-of-u/pytest-0/t/noread" && touch "$TMPDIR/pytest-of-u/pytest-0/t/noread/f" && chmod 000 "$TMPDIR/pytest-of-u/pytest-0/t/noread" "$TMPDIR/pytest-of-u/pytest-0/t"' gate "$W" t17)"
+check 'grep -qx EXIT=0 "$l17"' "a command leaving a mode-000 dir in its TMPDIR passes ($(grep '^EXIT=' "$l17"))"
+check '[[ ! -e "$GT" ]]' "and the TMPDIR is removed anyway, mode-000 dirs and all"
 # The probe is the one smoke uses, called on the gate's dir before any step.
 cat > "$T/bin/probe-ok" <<'STUB'
 #!/usr/bin/env bash

@@ -55,11 +55,28 @@ done
 command -v curl >/dev/null || { echo "FAIL: curl not found" >&2; exit 1; }
 
 TMP="$(mktemp -d)"
-# zeus.sock gets its own dir under /tmp, not $TMPDIR: a gate's TMPDIR sits
-# deep in its worktree, and a socket path must fit sun_path's 107 bytes or
-# zeus's bind() fails, which shows here only as "zeus socket never appeared"
-# (AGAST #4135).
-SOCK_DIR="$(mktemp -d /tmp/rz_e2e_sock.XXXXXXXX)"
+# sock_dir PREFIX NAMELEN: make and print a fresh dir for unix sockets whose
+# names are at most NAMELEN bytes.  $TMPDIR first, if <dir>/<name> fits
+# sun_path's 107 bytes (a gate's TMPDIR, deep in its worktree, doesn't:
+# AGAST #4135/#4177); else $XDG_RUNTIME_DIR; else /tmp.  A candidate whose
+# mktemp fails (a full /tmp ran out of inodes on bangerang, AGAST #4274) is
+# skipped for the next.  Kept identical in nexus/test/e2e_large_page.sh and
+# harland/tools/test_tier1_boot.sh (tools/test_harness_sock_path.py).
+sock_dir() {
+    local base LC_ALL=C
+    for base in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" /tmp; do
+        base="${base%/}"
+        [[ -n "$base" && -d "$base" ]] || continue
+        # <base>/<PREFIX>.XXXXXXXX/<name>
+        (( ${#base} + 1 + ${#1} + 9 + 1 + $2 <= 107 )) || continue
+        mktemp -d "$base/$1.XXXXXXXX" 2>/dev/null && return 0
+    done
+    echo "FAIL: no dir for a $1 socket: every candidate is too long or full" >&2
+    return 1
+}
+# zeus.sock's dir: a socket path past sun_path's 107 bytes fails zeus's
+# bind(), which shows here only as "zeus socket never appeared" (AGAST #4135).
+SOCK_DIR="$(sock_dir rz_e2e_sock 9)" || exit 1
 SOCK="$SOCK_DIR/zeus.sock"
 PIDS=()
 

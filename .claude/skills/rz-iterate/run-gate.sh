@@ -403,8 +403,10 @@ untree() {
     git worktree remove --force "$RZ_TREE" >/dev/null 2>&1
     rm -rf "$RZ_TREE"
     git worktree prune
-    # The gate's TMPDIR (AGAST #3704).  A test may leave a read-only dir.
-    chmod -R u+w "$RZ_TMPDIR" 2>/dev/null
+    # The gate's TMPDIR (AGAST #3704).  A test may leave a read-only dir, or
+    # one with no read/search bit (mode 000) that `chmod -R u+w` can't
+    # descend into (AGAST #4274).
+    chmod -R u+rwx "$RZ_TMPDIR" 2>/dev/null
     rm -rf "$RZ_TMPDIR"
 }
 trap 'dequeue; unmark; untree' EXIT
