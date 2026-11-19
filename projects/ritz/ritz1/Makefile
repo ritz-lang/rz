@@ -66,6 +66,7 @@ SOURCES = \
 	field_slot \
 	ref_loan \
 	ref_value \
+	own_check \
 	sema_walk \
 	bool_check \
 	bool_kind \

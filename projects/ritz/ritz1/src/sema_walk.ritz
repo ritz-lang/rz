@@ -73,6 +73,8 @@ import must_use
 
 import narrowing   # check_implicit_narrowing (AGAST #3505)
 
+import own_check   # the move check (AGAST #2158), on Sema since #3507
+
 import pass_value   # AGAST #3740, #3759
 
 import ref_loan   # §13.5 borrow conflicts (AGAST #2438), on Sema since #3506
@@ -154,6 +156,8 @@ fn sema_note_arm_value(sm: *Sema, owner: *Expr, arm: *MatchArm)
 # is the EXPR_IF / EXPR_MATCH the arms are of; null for a match statement.
 # `discard`: the match / if's value is discarded, so its arms' are (#3980).
 fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discard: i32)
+    own_check_arms_begin(sm, scrut)   # AGAST #3507: a match owns what it moves
+
     var arm: *MatchArm = arms
     while arm != null
         # AGAST #3907: `E.V =>` / `E.V(v) =>` names the enum E.
@@ -161,6 +165,8 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
             sema_vis_use(sm, arm.head_span.line, arm.head_span.col, arm.qualifier, arm.qualifier_len)
         let mark: i32 = sm.scope_top
         ref_loan_enter()   # AGAST #3506: an arm is a block for loans
+
+        own_check_arm_begin(sm)   # AGAST #3507: from the state before the arms
 
         if arm.pattern_kind == PAT_VARIANT
             # AGAST #1295: each binding of `V(a, b, ..)` in turn.
@@ -176,6 +182,8 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
                     ref_value_note_arm(sm, arm, scrut)   # AGAST #3926
 
                     ref_value_bind_arm(sm, arm)   # AGAST #4011
+
+                    own_check_arm_bound(sm, arm)   # AGAST #3507: it may own the payload
 
                 narrow_sema_arm(sm, scrut, arm)
             arm_select_bind(arm, 0)
@@ -219,15 +227,21 @@ fn sema_walk_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm, owner: *Expr, discar
             discarded_array_check(sm, arm.body)
 
         if_arm_discard_next(discard)
+
+        own_check_arm_value(sm, arm, discard)   # AGAST #3507: the arm's value moves out
         sema_walk_expr(sm, arm.body)
         sema_note_arm_value(sm, owner, arm)   # after it: a nested `if`'s own note
 
         float_arm_note(sm, owner, arm)   # AGAST #3892, likewise
 
+        own_check_arm_end(sm)   # AGAST #3507: before its bindings leave scope
+
         ref_loan_leave()
         sm.scope_top = mark
         arm = arm.next
     float_arms_settle(sm, owner, arms)   # AGAST #3892
+
+    own_check_arms_end(sm, scrut)   # AGAST #3507
 
 # Every sub-expression, for the probe; a match or an if/else expression's
 # arms hold statements.
@@ -430,7 +444,12 @@ fn sema_is_assign(kind: i32) -> i32
 fn sema_walk_stmts(sm: *Sema, first: *Stmt, void_tail: i32)
     let mark: i32 = sm.scope_top
     ref_loan_enter()   # AGAST #3506: a loan ends with its holder's block
+
+    own_check_block_enter(sm)   # AGAST #3507: a block for the move check
     sema_walk_block(sm, first, void_tail)
+
+    own_check_block_leave(sm)   # AGAST #3507: its deferred statements run
+
     ref_loan_leave()
     sm.scope_top = mark
 
@@ -445,6 +464,11 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         # members.  pass_value only looks for `pass`, which a step never holds.
         deref_field_stmt(sm, st)
         let fn_tail: i32 = (st.next == null and sm.cur_fn != null and first == sm.cur_fn.body) as i32
+
+        # AGAST #3507: the move check, as the emitter ran it on each statement
+        # before lowering it; a fn's value tail is a move (own_check_tail).
+        own_check_stmt(sm, st, (fn_tail == 1 and sm.cur_fn.return_type != TYPE_VOID) as i32)
+
         if fn_tail == 1
             bool_check_tail(sm, st)   # AGAST #2342
 
@@ -498,23 +522,55 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
             bool_note_for(sm, st)
 
             let_note_for(sm, st)   # AGAST #2389: an element is a `let`
+
+            own_check_loop_enter(sm)   # AGAST #3507
             sema_walk_stmts(sm, st.for_body, 0)
+
+            own_check_loop_exit(sm)
             sm.scope_top = for_mark
         else if st.kind == STMT_IF
             bool_check_cond(sm, st.if_cond, c"if condition")
             sema_walk_expr(sm, st.if_cond)
             let in_tail: i32 = (tail_value == 1 and st.next == null) as i32
             if_arm_want_tail(in_tail)
+
+            own_check_if_then(sm, st)   # AGAST #3507: the arms' moves merge
             sema_walk_stmts(sm, st.if_then, 0)
+
+            own_check_if_else(sm, st)
+
             if_arm_want_tail(in_tail)
             sema_walk_stmts(sm, st.if_else, 0)
+
+            own_check_if_end(sm, st)
         else if st.kind == STMT_WHILE
             bool_check_cond(sm, st.while_cond, c"while condition")
             sema_walk_expr(sm, st.while_cond)
+
+            own_check_loop_enter(sm)   # AGAST #3507
             sema_walk_stmts(sm, st.while_body, 0)
+
+            own_check_loop_exit(sm)
         else if st.kind == STMT_LOOP or st.kind == STMT_DEFER or st.kind == STMT_UNSAFE
             if_arm_want_tail((st.kind == STMT_UNSAFE and tail_value == 1 and st.next == null) as i32)
+
+            # AGAST #3507: a loop's body; a `defer`'s runs at its block's exits,
+            # not here; an `unsafe` block's bindings are its block's.
+            if st.kind == STMT_LOOP
+                own_check_loop_enter(sm)
+
+            if st.kind == STMT_DEFER
+                own_check_mute(1)
+
+            if st.kind == STMT_UNSAFE
+                own_check_unsafe()
             sema_walk_stmts(sm, st.while_body, 0)
+
+            if st.kind == STMT_LOOP
+                own_check_loop_exit(sm)
+
+            if st.kind == STMT_DEFER
+                own_check_mute(0 - 1)
         else if st.kind == STMT_MATCH
             sema_walk_expr(sm, st.if_cond)
             # AGAST #3980: its arms are values only if it is the block's.
@@ -568,6 +624,8 @@ fn sema_walk_block(sm: *Sema, first: *Stmt, void_tail: i32)
         ref_loan_after(sm, st)   # a declaration holds its `@x` (AGAST #3506)
 
         ref_value_after(sm, st)   # its binding's notes (AGAST #3926)
+
+        own_check_after(sm, st)   # AGAST #3507: registers what it binds
         st = st.next
 
 # enum_as_int (AGAST #2136 / #3511) on statement `st` of the list `first`:
@@ -603,9 +661,13 @@ fn sema_walk_fn(sm: *Sema, f: *FnDef)
 
     ref_value_begin_fn(sm, f)   # AGAST #3926
 
+    own_check_begin_fn(sm, f)   # AGAST #3507: by-value move-only params
+
     if_arm_want_tail((f.return_type != TYPE_VOID) as i32)   # AGAST #3980
     sema_walk_stmts(sm, f.body, (f.return_type == TYPE_VOID) as i32)
     tail_value_check(sm, f)   # AGAST #2236 / #3511, after call_check's notes
+
+    own_check_end_fn(sm, f)   # AGAST #3507: the fn's `ret`
     sm.scope_top = 0
     sm.cur_fn = null
 
@@ -656,4 +718,6 @@ pub fn sema_check_module(m: *Module, path: *u8) -> i32
                     sm.cur_impl = null
                 method = method.next
         ib = ib.next
+
+    own_check_flush(sm)   # AGAST #3507: only on a module the other checks pass
     sm.error_count

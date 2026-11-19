@@ -239,7 +239,19 @@ still run mid-lowering on `*EmitterState`, and
   mid-lowering (sizeof), from the emitter's own table of written types;
   float_slot and literal_slot read it on Sema (`narrow_sema_*`, #3510).
 
-- `ownership` — move checking and drop insertion (§13).
+- `own_check` — the move check (§13, #2158), on Sema since #3507: a use
+  of a moved value, a move out of a reference, an array element or a global,
+  a `:&` param's referent read by value, and a deferred statement checked at
+  each exit it runs on. sema_walk calls its `own_check_*` hooks where the
+  emitter used to, so the move state flows through the same steps (`if` and
+  arm merges, loop shadows, `defer` replays at every exit, match ownership).
+  Its errors wait until the walk ends and print only if no other check
+  failed. It annotates each fn with the bindings that own a move-only value
+  (`FnDef.own_binds`), which `ownership` gives drop flags.
+
+- `ownership` — drop insertion (§13.6): drop flags, the moves that clear
+  them, glue, temporaries and `defer` lowering. Which bindings own a value is
+  Sema's annotation (`FnDef.own_binds`); the check itself is `own_check`'s.
 
 - `pass_value` — `pass` has no value (§2.4, §6.1).
 
@@ -253,8 +265,7 @@ still run mid-lowering on `*EmitterState`, and
   the emitter's locals or Sema's scope; on Sema a binding is read from the
   image of the `LocalVar` the emitter will make for it (`RsNote.loc`). It
   keeps Sema's place typing (`rs_ty`) and per-binding notes (`RsNote`), and
-  what the emitter still asks (`ref_ty_of`, `ref_through`, `ref_temp_call`,
-  "cannot move out of a reference").
+  what the emitter still asks (`ref_ty_of`, `ref_through`, `ref_temp_call`).
 
 - `ref_loan` — a borrow of a place conflicts with an overlapping loan
   (§13.5, R11 / R11a). A loan ends with its holder's block: Sema's blocks

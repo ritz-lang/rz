@@ -124,11 +124,6 @@ struct LocalVar
     # AGAST #2340: 1 for a `:&` param, whatever its T, and `self:&`: what `@x` names
     # is the caller's, so x isn't a local root.  See ref_mark_params.
     is_caller_place: i32
-    # AGAST #2178: 1 for a match arm's payload binding (`Full(t)`) of a
-    # move-only payload when the match owns nothing (`match @s`, a `:&` param,
-    # a place behind a pointer): t is a copy of a value its owner still drops,
-    # so it reads like a `:&` param and can't move.  See own_match_payload.
-    lent_payload: i32
     # AGAST #2364: U for an `@*U` / `@&*U` param or local
     # (Param.param_ref_ptr_pointee), TYPE_VOID otherwise.  Set by ref_check.ritz
     # (ref_mark_params, ref_after_stmt), which compares it: a scalar U has no name.
@@ -422,9 +417,10 @@ struct FrameSlot
 
 # AGAST #2242 — a path a binding's value can be moved out along: a move-only
 # field of it, or of a field of it that can itself be partly moved.  A path's
-# index in OwnBinding.paths is its bit in fmask, fmoved and fshadow.  `up`,
-# `down`, fmoved and fshadow are path sets (ownership.ritz's own_set_*, AGAST
-# #2319): the bitmask itself for paths 0..30, else an interned set's handle.
+# index in OwnBinding.paths is its bit in fmask (and in own_check.ritz's
+# fmoved and fshadow).  `up` and `down` are path sets (ownership.ritz's
+# own_set_*, AGAST #2319): the bitmask itself for paths 0..30, else an
+# interned set's handle.
 struct OwnPath
     parent: i32           # the path it is a part of, or -1 (the binding's own)
     idx: i32              # its field index in that struct
@@ -442,31 +438,23 @@ struct OwnBinding
     flag: i32             # register of its `alloca i1` drop flag
     type_name: *u8
     type_name_len: i32
-    moved: i32            # move check: 1 once moved on the path being checked
-    move_line: i32
-    move_col: i32
+    # 1 once a move cleared its flag, until it is assigned again: a match on
+    # it owns the value it just moved (own_scrutinee_moved).  The move check
+    # itself is own_check.ritz's, on Sema (AGAST #3507).
+    moved: i32
     # AGAST #2165: >0 for an array binding of `count` type_name elements
     # (an N-D array counts every leaf), 0 for a single value.
     count: i32
-    # AGAST #2165: loop move check.  1 while the binding would be moved here
-    # if the innermost loop's head were reached with it moved: set for every
-    # unmoved binding on entering a loop body, cleared by assigning to it.
-    shadow: i32
     # AGAST #2168, #2242: moves out of a field.  `paths` lists what can be
     # moved out (`path_count` of them, null when nothing can).  `fmask` is
     # the register of an `alloca iN` (N: path_count in whole 32-bit words,
     # AGAST #2319) whose bit i is set at run time while
     # path i is moved out (the drop skips it), or 0 when the binding can't be
-    # partly moved (an array, a temporary, a type with its own drop).
-    # `fmoved` is the move check's bits of the paths moved on the flow being
-    # checked, and `fshadow` its loop shadow per path (as `shadow`, cleared
-    # by assigning to the path).  `aux` is used by own_assign_begin's handle
-    # only.
+    # partly moved (an array, a temporary, a type with its own drop).  `aux`
+    # is used by own_assign_begin's handle only.
     paths: *OwnPath
     path_count: i32
     fmask: i32
-    fmoved: i32
-    fshadow: i32
     aux: i32
     # AGAST #2173: in own_assign_begin's handle only: the field a field
     # store `x.f... = v` overwrites (the handle is then for its old value),
@@ -482,7 +470,7 @@ struct OwnState
     live_count: i32
     live_cap: i32
     # One entry per open block: the index into `live` where it starts, and
-    # 1 once a `return` was checked directly in it (what follows is dead).
+    # 1 once a `return` was emitted directly in it (what follows is dead).
     scope_start: *i32
     scope_dead: *i32
     scope_count: i32
@@ -498,7 +486,7 @@ struct OwnState
     # AGAST #2165.  -1 until known, then 1 when the module has an `impl
     # Drop` at all (without one nothing is move-only).
     has_drop: i32
-    # Call expressions the move check found to yield a move-only temporary
+    # Call expressions own_walk found to yield a move-only temporary
     # nobody owns; emit_expr spills each one and moves it to `temps`.
     temp_exprs: **Expr
     temp_expr_count: i32
@@ -515,24 +503,12 @@ struct OwnState
     temp_cap: i32
     # `temps` index where the statement being emitted starts.
     stmt_mark: i32
-    # Loop move check: OWN_EV_* events, OWN_EV_INTS i32s each, and the
-    # current loop nesting depth.
-    loop_ev: *i32
-    loop_ev_count: i32
-    loop_ev_cap: i32
+    # The current loop nesting depth (loop_dstart's index).
     loop_depth: i32
-    # 1 when the last own_pop_scope closed a block that ended in a
-    # `return` / `break` / `continue`.
-    last_pop_dead: i32
-    # AGAST #2168: where each field move happened, for diagnostics:
-    # [slot, path, line, col] per move, in order.
-    fm_loc: *i32
-    fm_count: i32
-    fm_cap: i32
     # AGAST #2174: the `live` index of the scrutinee the innermost match
     # being emitted owns, or -1 (see own_match_begin).
     match_scrut: i32
-    # AGAST #2173: the i1 register own_check_stmt computed for the field
+    # AGAST #2173: the i1 register own_stmt_moves computed for the field
     # store `x.f... = v` being emitted (x owns the field's old value: drop
     # it), or 0.  own_assign_begin consumes it, with (#2242) the path stored
     # to (-1 if it isn't one) and the moved paths' mask before the store.
@@ -553,9 +529,7 @@ struct OwnState
     scope_dstart: *i32
     loop_dstart: *i32
     loop_dcap: i32
-    # The STMT_DEFER being emitted at an exit (for the moved-binding error,
-    # located at the `defer`), or null; in_ret is 1 while a `ret` runs them.
-    cur_defer: *Stmt
+    # 1 while a `ret` runs them.
     in_ret: i32
 
 # =============================================================================
@@ -1600,7 +1574,6 @@ pub fn add_local_full(s: *EmitterState, name: *u8, len: i32, reg: i32, var_type:
     loc.holds_lent_ptr = 0
     loc.is_lent_self = 0
     loc.is_caller_place = 0
-    loc.lent_payload = 0
     loc.ref_ptr_pointee = TYPE_VOID
     loc.not_fn = 0
     loc.array_view = 0

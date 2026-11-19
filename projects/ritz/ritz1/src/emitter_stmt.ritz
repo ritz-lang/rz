@@ -5427,16 +5427,10 @@ fn emit_array_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32
     emit_str(s, c", label %")
     emit_label(s, else_label)
     emit_str(s, c"\n")
-    let own_before: *i32 = own_arms_begin(s)
-    var own_acc: *i32 = null
     begin_block(s, then_label)
     emit_array_arm_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, then_arm, end_label)
-    own_arm_end(s, @own_acc)
-    own_arm_begin(s, own_before)
     begin_block(s, else_label)
     emit_array_arm_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, else_arm, end_label)
-    own_arm_end(s, @own_acc)
-    own_arms_end(s, own_before, own_acc)
     begin_block(s, end_label)
 
 # AGAST #3276: a `match` of whole arrays (an EXPR_MATCH value or a STMT_MATCH
@@ -5497,16 +5491,10 @@ pub fn emit_array_stmt_if_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, ds
     emit_str(s, c", label %")
     emit_label(s, else_label)
     emit_str(s, c"\n")
-    let own_before: *i32 = own_arms_begin(s)
-    var own_acc: *i32 = null
     begin_block(s, then_label)
     emit_array_block_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.if_then, end_label)
-    own_arm_end(s, @own_acc)
-    own_arm_begin(s, own_before)
     begin_block(s, else_label)
     emit_array_block_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.if_else, end_label)
-    own_arm_end(s, @own_acc)
-    own_arms_end(s, own_before, own_acc)
     begin_block(s, end_label)
 
 # A block whose last statement is the array: an expression, an `if` / `else`,
@@ -5516,7 +5504,7 @@ fn emit_array_block_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: 
     var st: *Stmt = stmts
     while st != null
         if st.next == null and st.kind == STMT_EXPR
-            own_check_arm(s, st.expr)   # ref_check judges the noted tail; the value moves
+            own_arm_moves(s, st.expr)   # the value moves
             emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st.expr)
         else if st.next == null and st.kind == STMT_IF and st.if_else != null
             emit_array_stmt_if_into(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, st)
@@ -5535,7 +5523,7 @@ fn emit_array_block_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: 
 fn emit_array_arm_into(s: *EmitterState, dst_ptr: i32, dst_size: i32, dst_et: i32, dst_name: *u8, dst_name_len: i32, arm: *MatchArm, end_label: i32)
     emit_match_arm_stmts(s, arm.body_stmts)
     if arm.is_pass == 0 and arm.body != null
-        own_check_arm(s, arm.body)   # as emit_match_arm_body does
+        own_arm_moves(s, arm.body)   # as emit_match_arm_body does
         emit_array_local_whole_assign(s, dst_ptr, dst_size, dst_et, dst_name, dst_name_len, arm.body)
     emit_str(s, c"  br label %")
     emit_label(s, end_label)
@@ -5945,9 +5933,10 @@ fn if_stmt_arm_settle(s: *EmitterState, reg: i32, agg: *u8, agg_len: i32, phi: *
         return rebuild_layout_equiv(s, reg, agg, agg_len, phi, phi_len)
     reg
 
-# AGAST #2158: the move check and drop insertion (ownership.ritz) wrap every
-# statement.  The check runs first, so a statement's moves clear their drop
-# flags before it executes; `x = v` drops x's old value once v is stored.
+# AGAST #2158: drop insertion (ownership.ritz) wraps every statement.  Its
+# moves clear their drop flags first, before it executes (the move check
+# itself ran on Sema, own_check.ritz, AGAST #3507); `x = v` drops x's old
+# value once v is stored.
 #
 # AGAST #2165: own_stmt_begin / own_stmt_end bracket it, so the temporaries
 # it makes drop when it ends (an `if` / `while` condition's earlier, at
@@ -5965,7 +5954,7 @@ pub fn emit_stmt(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
 fn emit_stmt_body(s: *EmitterState, stmt: *Stmt, ret_type: i32)
     let own_mark: i32 = own_stmt_begin(s)
-    own_check_stmt(s, stmt)
+    own_stmt_moves(s, stmt)
     let wanted_mark: i32 = s.wanted_count   # AGAST #2260
     want_stmt_values(s, stmt, ret_type)
     # AGAST #2173: and `x.f = v` drops x.f's old value.
@@ -6143,18 +6132,14 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
 
         begin_block(s, then_label)
         clear_last_expr(s)  # Reset before then branch
-        # AGAST #2158: each arm is a block for drops; the move check
-        # merges the arms' moved bindings (own_if_merge).
-        let own_before: *i32 = own_snapshot(s)
+        # AGAST #2158: each arm is a block for drops.
         own_push_scope(s)
         emit_if_stmt_arm(s, stmt.if_then, ret_type, discarded, fr.hint_ty)
         # AGAST #2559: the arm value's struct type, while its bindings resolve.
         var then_agg: *u8 = null
         var then_agg_len: i32 = 0
         if_stmt_arm_agg(s, stmt.if_then, @then_agg, @then_agg_len)
-        let own_then_dead: i32 = own_pop_scope(s)
-        let own_after_then: *i32 = own_snapshot(s)
-        var own_else_dead: i32 = 0
+        own_pop_scope(s)
         # ritz-task-1309 — `last_expr_here` (not `s.last_expr_reg`) so a value
         # produced in a block nested inside the then-arm, which the insertion
         # point has since left, is reported as "no value" instead of being
@@ -6181,11 +6166,10 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
         if stmt.if_else != null
             begin_block(s, else_label)
             clear_last_expr(s)  # Reset before else branch
-            own_restore(s, own_before)
             own_push_scope(s)
             emit_if_stmt_arm(s, stmt.if_else, ret_type, discarded, fr.hint_ty)
             if_stmt_arm_agg(s, stmt.if_else, @else_agg, @else_agg_len)
-            own_else_dead = own_pop_scope(s)
+            own_pop_scope(s)
             else_result = last_expr_here(s)  # Capture else branch result
             # AGAST #2563: the phi's type is the then-arm's when it has one.
             var else_phi: *u8 = null
@@ -6206,10 +6190,6 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
             emit_str(s, c"\n")
 
         begin_block(s, end_label)
-        var own_has_else: i32 = 0
-        if stmt.if_else != null
-            own_has_else = 1
-        own_if_merge(s, own_before, own_after_then, own_then_dead, own_has_else, own_else_dead)
 
         # If both branches produce values, emit a phi node.  When the
         # enclosing fn returns a tagged-enum struct, both branches hand us
@@ -6593,8 +6573,6 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                 s.match_no_value = 1
             # (must_use_check and discarded_array_check run on Sema,
             # sema_walk.ritz, AGAST #3462 / #3512.)
-            if stmt.next == null
-                own_check_lent_value_stmt(s, stmt.expr)   # AGAST #2949
             var expr_reg: i32 = 0
             let lent: *LocalVar = lent_referent_local(s, stmt.expr)
             if stmt == s.if_arm_value and lent != null

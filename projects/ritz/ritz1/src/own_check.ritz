@@ -1,0 +1,3312 @@
+# ritz1/src/own_check.ritz - the move check, on Sema (§13; AGAST #2158, #3507)
+#
+# LANGUAGE_SPEC §13.  A type is MOVE-ONLY iff it implements Drop, or a field
+# or generic argument of it is move-only (ownership.ritz's
+# own_type_is_move_only_in).  Using a move-only binding by value (binding it,
+# assigning it, passing it to a by-value parameter, returning it, storing it
+# in a struct or array literal) moves it; any later use is a located error
+# worded as ritz0's move_checker.py words it:
+#
+#     use of moved value: `t` (moved at F:L:C)
+#     cannot borrow `t` - value has been moved
+#
+# The rules are ownership.ritz's, which ran them as each statement was
+# emitted until AGAST #3507 (#1816) moved them here: sema_walk calls the
+# own_check_* hooks at the points the emitter called own_check_stmt,
+# own_check_tail, own_check_arm, own_push_scope / own_pop_scope and the
+# rest, so the move state flows through the same steps in the same order.
+#   - A block stops being checked after a `return` directly in it (and a
+#     `break` / `continue` in a loop); after an `if`, a binding moved in
+#     either arm that falls through counts as moved; assigning to a binding
+#     makes it an owner again.
+#   - Match / if-expression arms each start from the state before them, and
+#     join after (oc_arms_*).  A match owns a scrutinee it moves; a payload
+#     binding owns a move-only payload of an owned scrutinee, and is lent
+#     (can't move) when the match owns nothing (AGAST #2174, #2178).
+#   - Loops: each binding from outside a loop carries `shadow` (moved if the
+#     head was reached moved); uses while shadowed are recorded and reported
+#     at the loop's end if the body's fall-through, or a `continue`, reaches
+#     the head with it moved (ritz0's _check_loop, AGAST #2165).
+#   - Fields (AGAST #2168, #2242): a move-only field moved out of a binding
+#     moves that path only; a path set (ownership.ritz's own_set_*) records
+#     which, and a later use overlapping one is an error.
+#   - `defer` (§13.7, AGAST #1625): a deferred statement is checked as if
+#     written at each exit it runs on (a block's end, `break` / `continue`,
+#     `return`, `?` and the fn's own `ret`), as the emitter emits it there.
+#     A binding moved by then is reported at the `defer`.  The emitter
+#     reaches a deferred statement only through those exits, so the walk's
+#     own visit of a `defer` body is muted here (own_check_mute), and the
+#     exits replay it (oc_replay_*).
+#   - What reads a move-only value out from behind a reference, out of an
+#     array element or out of a global is refused (AGAST #2336, #2268, #3367).
+#
+# Its errors wait in a buffer and are printed when the walk ends, only if no
+# other Sema check reported one (own_check_flush): that is what the emitter
+# printed, since Sema stopped the compile before emission on any error.
+#
+# The result reaches the emitter as an annotation on the AST (AGAST #3507):
+# FnDef.own_binds lists the bindings of the fn that own a move-only value (a
+# by-value param, a `let` / `var`, a `let (a, b)` name, a match's payload
+# binding), by their declaring name pointer.  ownership.ritz gives exactly
+# those a drop flag; with Sema's scopes that is the set of owned bindings
+# live at each exit (AGAST #3508 inserts their drops from it).
+#
+# Types are Sema's: a binding is read as the emitter will make its LocalVar,
+# through ref_check's RefEnv (ref_local_in, ref_ty_in), which ref_value.ritz's
+# hooks keep for each binding (RsNote).  Where neither that nor sema_expr_ty
+# types a value as the emitter does (a user enum's constructor, a nameless
+# tuple, `*p` as a scrutinee, `Some(x)` as one, `c?`, `p[i].f` of a Span),
+# oc_struct_of and its helpers type it here; one typing for those is #4251.
+#
+# Tests: ritz0/test_ritz1_sema_own.py (on Sema, stops before emission, the
+# emitter tracks nothing), test_ritz1_ownership.py, test_move_checker.py,
+# test_defer_all_compilers.py and test_ownership_free_count.py.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.memory
+import ritzlib.str
+
+import ast
+import ast_helpers
+import emitter_core   # OwnPath, name_eq, find_field_index, user_variant_ctor_enum
+import emitter_expr_call   # is_variant_carrier, is_variant_null
+import ownership      # path sets, move-only types (own_type_is_move_only_in)
+import ref_check      # RefEnv, ref_local_in, ref_ty_in, rs_*: Sema's place typing
+import ref_loan       # rl_qualified_variant
+import let_check      # let_through_elem
+import bool_check     # sbk_global
+import sema
+import sema_type
+
+const OC_INIT_CAP: i32 = 16
+# Deeper than any real struct nesting; stops a malformed recursive type.
+const OC_MAX_DEPTH: i32 = 32
+# OcState.match_scrut for a match that owns nothing (AGAST #2178).
+const OC_MATCH_LENT: i32 = 0 - 2
+
+# Loop move-check events: [kind, id, depth, a, b, c, d, e, f], `id` the
+# binding's identity and `depth` the loop nesting depth they belong to.
+const OC_EV_INTS: i32 = 9
+# Loop entry: a = shadow before, b = moved, c:d = its move, e = fmoved,
+# f = fshadow before.
+const OC_EV_SAVE: i32 = 1
+# A use while shadowed: a = 1 for a borrow + 2 when the whole binding was
+# shadowed, c:d = where, e = the paths it would be using moved (fshadow bits),
+# b:f = the `defer` it is in (0:0 for none), where it is reported (#2810).
+const OC_EV_USE: i32 = 2
+# `continue` / `break` with it (partly) moved: b = moved, c:d = the move,
+# e = fmoved.
+const OC_EV_HEAD: i32 = 3
+const OC_EV_BREAK: i32 = 4
+
+# The snapshots of the move state (oc_snapshot): a header of the count and
+# the field-move log's length, then per live binding moved, its line and
+# column, shadow, fmoved and fshadow.
+const OC_SNAP_INTS: i32 = 6
+const OC_SNAP_HDR: i32 = 2
+
+# A block on the hook stack: one that is a block for the move check (its own
+# scope), or one that isn't: the fn body, held by own_check_begin_fn's scope,
+# whose end is the fn's `ret`; an `unsafe` block, whose bindings are the
+# enclosing block's (AGAST #2248).
+const OC_BLOCK_NONE: i32 = 0
+const OC_BLOCK_SCOPE: i32 = 1
+const OC_BLOCK_BODY: i32 = 2
+const OC_BLOCK_UNSAFE: i32 = 3
+
+# A binding that owns a value of a move-only type.
+struct OcBind
+    name: *u8
+    name_len: i32
+    vi: i32           # its SemaVar's index in Sema's scope; -1 for a match's scrutinee
+    id: i32           # its identity, for the loop events and the field-move log
+    type_name: *u8    # the struct (or an array's element struct)
+    type_name_len: i32
+    count: i32        # element count of a `[N]T` binding; 0 for a single value
+    moved: i32
+    move_line: i32
+    move_col: i32
+    shadow: i32
+    paths: *OwnPath   # AGAST #2242: a partly movable struct's paths
+    path_count: i32
+    fmoved: i32
+    fshadow: i32
+
+struct OcState
+    module: *Module      # the module any_drop was found for
+    has_drop: i32        # 1 when it has an `impl Drop`; -1 not yet known
+    live: *OcBind
+    live_count: i32
+    live_cap: i32
+    scope_start: *i32
+    scope_dead: *i32
+    scope_dstart: *i32
+    scope_count: i32
+    scope_cap: i32
+    last_pop_dead: i32
+    loop_base: i32
+    loop_depth: i32
+    loop_dstart: *i32
+    loop_dcap: i32
+    loop_ev: *i32
+    loop_ev_count: i32
+    loop_ev_cap: i32
+    fm_loc: *i32         # field moves: [id, path, line, col]
+    fm_count: i32
+    fm_cap: i32
+    match_scrut: i32
+    scrut_name: *u8      # the enum the innermost match is over, or null
+    scrut_len: i32
+    # A tagged constructor `Some(x)` it is over (scrut_name is then x's
+    # struct), or null.
+    scrut_ctor: *Expr
+    defer_stmts: **Stmt
+    defer_count: i32
+    defer_cap: i32
+    cur_defer: *Stmt
+    in_ret: i32
+    next_id: i32
+    mute: i32
+    # Payload bindings a non-owning match lent (AGAST #2178): their SemaVar
+    # index and name pointer.
+    lent_vi: *i32
+    lent_name: **u8
+    lent_count: i32
+    lent_cap: i32
+    # The hook stack: block kinds, and the saved state of the `if`s, arms,
+    # matches and loops being walked.
+    blocks: *i32
+    block_count: i32
+    block_cap: i32
+    saved: *i64
+    saved_count: i32
+    saved_cap: i32
+    body_pending: i32    # the kind the next statement list is (OC_BLOCK_*), or 0
+    # The buffered diagnostics (own_check_flush) and how many.
+    out: *u8
+    out_len: i64
+    out_cap: i64
+    errors: i32
+    # The last "cannot move out" place reported: one report per place.
+    last_line: i32
+    last_col: i32
+    # The tuple structs Sema made for `let p = (a, b)` (oc_tuple_def): the
+    # emitter makes its own when it lowers the literal (tuple_lit_infer).
+    tuples: **StructDef
+    tuple_count: i32
+    tuple_cap: i32
+
+var OC_STATE: OcState
+var OC_READY: i32 = 0
+
+fn oc() -> *OcState
+    let o: *OcState = @OC_STATE
+    if OC_READY == 1
+        return o
+    OC_READY = 1
+    memset(o as *u8, 0, sizeof(OcState))
+    o.live = malloc((OC_INIT_CAP as i64) * sizeof(OcBind)) as *OcBind
+    o.live_cap = OC_INIT_CAP
+    o.scope_start = malloc((OC_INIT_CAP as i64) * 4) as *i32
+    o.scope_dead = malloc((OC_INIT_CAP as i64) * 4) as *i32
+    o.scope_dstart = malloc((OC_INIT_CAP as i64) * 4) as *i32
+    o.scope_cap = OC_INIT_CAP
+    o.loop_base = 0 - 1
+    o.loop_dstart = malloc((OC_INIT_CAP as i64) * 4) as *i32
+    o.loop_dcap = OC_INIT_CAP
+    o.loop_ev = malloc((OC_INIT_CAP * OC_EV_INTS * 4) as i64) as *i32
+    o.loop_ev_cap = OC_INIT_CAP
+    o.fm_loc = malloc((OC_INIT_CAP * 16) as i64) as *i32
+    o.fm_cap = OC_INIT_CAP
+    o.match_scrut = 0 - 1
+    o.defer_stmts = malloc((OC_INIT_CAP as i64) * 8) as **Stmt
+    o.defer_cap = OC_INIT_CAP
+    o.lent_vi = malloc((OC_INIT_CAP as i64) * 4) as *i32
+    o.lent_name = malloc((OC_INIT_CAP as i64) * 8) as **u8
+    o.lent_cap = OC_INIT_CAP
+    o.blocks = malloc((OC_INIT_CAP as i64) * 4) as *i32
+    o.block_cap = OC_INIT_CAP
+    o.saved = malloc((OC_INIT_CAP as i64) * 8) as *i64
+    o.saved_cap = OC_INIT_CAP
+    o.has_drop = 0 - 1
+    o
+
+fn oc_live_at(o: *OcState, i: i32) -> *OcBind
+    let base: *OcBind = o.live
+    return @base[i]
+
+fn oc_ev_at(o: *OcState, i: i32) -> *i32
+    let base: *i32 = o.loop_ev
+    return base + i * OC_EV_INTS
+
+fn oc_ev_push(o: *OcState, kind: i32, id: i32, a: i32, b: i32, c: i32, d: i32, e: i32, f: i32)
+    if o.loop_ev_count >= o.loop_ev_cap
+        let cap: i32 = o.loop_ev_cap * 2
+        o.loop_ev = realloc(o.loop_ev as *u8, (cap * OC_EV_INTS * 4) as i64) as *i32
+        o.loop_ev_cap = cap
+    let ev: *i32 = oc_ev_at(o, o.loop_ev_count)
+    ev[0] = kind
+    ev[1] = id
+    ev[2] = o.loop_depth
+    ev[3] = a
+    ev[4] = b
+    ev[5] = c
+    ev[6] = d
+    ev[7] = e
+    ev[8] = f
+    o.loop_ev_count = o.loop_ev_count + 1
+
+# AGAST #2168: remember where path `path` of the binding `id` moved.
+fn oc_fm_push(o: *OcState, id: i32, path: i32, line: i32, col: i32)
+    if o.fm_count >= o.fm_cap
+        let cap: i32 = o.fm_cap * 2
+        o.fm_loc = realloc(o.fm_loc as *u8, (cap * 16) as i64) as *i32
+        o.fm_cap = cap
+    let base: *i32 = o.fm_loc
+    let r: *i32 = base + o.fm_count * 4
+    r[0] = id
+    r[1] = path
+    r[2] = line
+    r[3] = col
+    o.fm_count = o.fm_count + 1
+
+# The latest record of that path below index `bound`, or -1.
+fn oc_fm_latest_below(o: *OcState, id: i32, path: i32, bound: i32) -> i32
+    let base: *i32 = o.fm_loc
+    var i: i32 = bound - 1
+    while i >= 0
+        let r: *i32 = base + i * 4
+        if r[0] == id and r[1] == path
+            return i
+        i -= 1
+    0 - 1
+
+fn oc_fm_index(o: *OcState, id: i32, path: i32) -> i32
+    oc_fm_latest_below(o, id, path, o.fm_count)
+
+# That move: [id, path, line, col], or null.
+fn oc_fm_find(o: *OcState, id: i32, path: i32) -> *i32
+    let i: i32 = oc_fm_index(o, id, path)
+    if i < 0
+        return null
+    let base: *i32 = o.fm_loc
+    base + i * 4
+
+# The path in `bits` (bits != 0) that moved first, as ritz0 names the first
+# entry of its moved fields.
+fn oc_first_moved(o: *OcState, id: i32, bits: i32) -> i32
+    var best: i32 = 0
+    var best_at: i32 = o.fm_count
+    var i: i32 = own_set_top(bits) - 1
+    while i >= 0
+        if own_set_has(bits, i) == 1
+            var at: i32 = oc_fm_index(o, id, i)
+            if at < 0
+                at = o.fm_count
+            if at <= best_at
+                best = i
+                best_at = at
+        i -= 1
+    best
+
+# --- The hook stack ---------------------------------------------------------------
+
+fn oc_save(o: *OcState, v: i64)
+    if o.saved_count >= o.saved_cap
+        let cap: i32 = o.saved_cap * 2
+        o.saved = realloc(o.saved as *u8, (cap as i64) * 8) as *i64
+        o.saved_cap = cap
+    let sv: *i64 = o.saved
+    sv[o.saved_count] = v
+    o.saved_count = o.saved_count + 1
+
+fn oc_restore_saved(o: *OcState) -> i64
+    o.saved_count = o.saved_count - 1
+    let sv: *i64 = o.saved
+    sv[o.saved_count]
+
+fn oc_block_push(o: *OcState, kind: i32)
+    if o.block_count >= o.block_cap
+        let cap: i32 = o.block_cap * 2
+        o.blocks = realloc(o.blocks as *u8, (cap as i64) * 4) as *i32
+        o.block_cap = cap
+    let bs: *i32 = o.blocks
+    bs[o.block_count] = kind
+    o.block_count = o.block_count + 1
+
+fn oc_block_pop(o: *OcState) -> i32
+    if o.block_count <= 0
+        return OC_BLOCK_NONE
+    o.block_count = o.block_count - 1
+    let bs: *i32 = o.blocks
+    bs[o.block_count]
+
+# --- Diagnostics (buffered) ----------------------------------------------------------
+
+fn oc_put(p: *u8, n: i64)
+    let o: *OcState = oc()
+    if n <= 0
+        return
+    if o.out_len + n > o.out_cap
+        var cap: i64 = o.out_cap * 2
+        if cap < 256
+            cap = 256
+        while cap < o.out_len + n
+            cap = cap * 2
+        o.out = realloc(o.out, cap)
+        o.out_cap = cap
+    memcpy(o.out + o.out_len, p, n)
+    o.out_len = o.out_len + n
+
+fn oc_put_cstr(p: *u8)
+    oc_put(p, strlen(p))
+
+fn oc_put_bytes(p: *u8, n: i32)
+    oc_put(p, n as i64)
+
+fn oc_put_char(c: u8)
+    var b: u8 = c
+    oc_put(@b, 1)
+
+fn oc_put_int(n: i32)
+    if n < 0
+        oc_put_char('-')
+        oc_put_int(0 - n)
+        return
+    if n >= 10
+        oc_put_int(n / 10)
+    oc_put_char(('0' as i32 + n % 10) as u8)
+
+# `<file>:<line>:<col>` as diag_loc prints it: the file the fn is written in
+# (an instance of an imported generic has its lines in that module, AGAST
+# #2890).
+fn oc_put_loc(sm: *Sema, line: i32, col: i32)
+    var f: *u8 = sema_file(sm)
+    if f == null
+        f = c"<input>"
+    oc_put_cstr(f)
+    oc_put_char(':')
+    oc_put_int(line)
+    oc_put_char(':')
+    oc_put_int(col)
+
+# `<file>:<line>:<col>: error: `, counted.
+fn oc_error_at(sm: *Sema, line: i32, col: i32)
+    oc_put_loc(sm, line, col)
+    oc_put_cstr(c": error: ")
+    let o: *OcState = oc()
+    o.errors = o.errors + 1
+
+# --- Move-only types ------------------------------------------------------------------
+
+# 1 when the module has an `impl Drop` at all; without one nothing is
+# move-only, and the hooks skip their work.
+fn oc_any_drop(sm: *Sema) -> i32
+    let o: *OcState = oc()
+    if o.module == sm.module and o.has_drop >= 0
+        return o.has_drop
+    o.module = sm.module
+    o.has_drop = 0
+    var ib: *ImplBlock = sm.module.impls
+    while ib != null
+        if ib.trait_name != null and name_eq(ib.trait_name, ib.trait_name_len, c"Drop", 4) == 1
+            o.has_drop = 1
+            return 1
+        ib = ib.next
+    0
+
+# A tuple struct oc_tuple_def made, by name; null if `name` names none.
+fn oc_tuple_named(name: *u8, len: i32) -> *StructDef
+    let o: *OcState = oc()
+    let ts: **StructDef = o.tuples
+    var i: i32 = 0
+    while i < o.tuple_count
+        let st: *StructDef = ts[i]
+        if name_eq(st.name, st.name_len, name, len) == 1
+            return st
+        i += 1
+    null
+
+# The struct `name` names: Sema's, or a tuple oc_tuple_def made.
+fn oc_find_struct(sm: *Sema, name: *u8, len: i32) -> *StructDef
+    let t: *StructDef = oc_tuple_named(name, len)
+    if t != null
+        return t
+    sema_find_struct(sm, name, len)
+
+fn oc_move_only(sm: *Sema, name: *u8, len: i32) -> i32
+    if name == null or len <= 0 or oc_any_drop(sm) == 0
+        return 0
+    let t: *StructDef = oc_tuple_named(name, len)
+    if t != null
+        return own_fields_move_only_in(sm.module, @sm.struct_map, t.fields, 1)
+    own_type_is_move_only_in(sm.module, @sm.struct_map, name, len)
+
+# AGAST #3005: the tuple struct a nameless tuple literal `(a, b, ..)` is, its
+# elements typed as Sema types them (as tuple_lit_infer names the emitter's);
+# null when `e` is no such literal.
+fn oc_tuple_def(sm: *Sema, e: *Expr) -> *StructDef
+    if e == null or e.kind != EXPR_STRUCT_LIT or e.ident_len != 0
+        return null
+    var fi: *FieldInit = e.args as *FieldInit
+    if fi == null or fi.name_len != 1 or *fi.name != '0'
+        return null
+    let o: *OcState = oc()
+    let st: *StructDef = calloc(1, sizeof(StructDef)) as *StructDef
+    # `(tuple)NNNNNN`: no struct can be named so.
+    let name: *u8 = malloc(16)
+    memcpy(name, c"(tuple)", 7)
+    var n: i32 = o.tuple_count
+    var at: i32 = 12
+    while at >= 7
+        *(name + at) = ('0' as i32 + n % 10) as u8
+        n = n / 10
+        at -= 1
+    *(name + 13) = 0
+    st.name = name
+    st.name_len = 13
+    var last: *StructField = null
+    while fi != null
+        let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
+        f.name = fi.name
+        f.name_len = fi.name_len
+        f.field_type = TYPE_I64
+        f.inner_pointee_type = TYPE_VOID
+        var en: i32 = 0
+        let ename: *u8 = oc_struct_of(sm, fi.value, @en)
+        if ename != null
+            f.field_type = TYPE_STRUCT
+            f.field_type_name = ename
+            f.field_type_name_len = en
+        if last == null
+            st.fields = f
+        else
+            last.next = f
+        last = f
+        fi = fi.next
+    if o.tuple_count >= o.tuple_cap
+        var cap: i32 = o.tuple_cap * 2
+        if cap < 8
+            cap = 8
+        o.tuples = realloc(o.tuples as *u8, (cap as i64) * 8) as **StructDef
+        o.tuple_cap = cap
+    let ts: **StructDef = o.tuples
+    ts[o.tuple_count] = st
+    o.tuple_count = o.tuple_count + 1
+    st
+
+fn oc_field_move_only(sm: *Sema, f: *StructField) -> i32
+    own_field_move_only_in(sm.module, @sm.struct_map, f, 0)
+
+fn oc_has_drop_impl(sm: *Sema, name: *u8, len: i32) -> i32
+    own_has_drop_impl_in(sm.module, name, len)
+
+# AGAST #2168: 1 when a value of struct type `name` can have fields moved
+# out: it has no drop of its own and a move-only field.
+fn oc_partly_movable(sm: *Sema, name: *u8, len: i32) -> i32
+    if oc_has_drop_impl(sm, name, len) == 1
+        return 0
+    let st: *StructDef = oc_find_struct(sm, name, len)
+    if st == null
+        return 0
+    own_fields_move_only_in(sm.module, @sm.struct_map, st.fields, 0)
+
+# --- Paths (AGAST #2242) ----------------------------------------------------------------
+
+fn oc_path_at(b: *OcBind, i: i32) -> *OwnPath
+    let base: *OwnPath = b.paths
+    return @base[i]
+
+# Add a path for each move-only field of the struct `name`, the parts of
+# path `parent`, to the array *pp (room for *cap, grown as it fills).
+# Returns the new path count.
+fn oc_add_paths(sm: *Sema, pp: **OwnPath, cap: *i32, count: i32, parent: i32, name: *u8, len: i32) -> i32
+    let st: *StructDef = oc_find_struct(sm, name, len)
+    if st == null
+        return count
+    var n: i32 = count
+    var idx: i32 = 0
+    var f: *StructField = st.fields
+    while f != null
+        if oc_field_move_only(sm, f) == 1
+            if n >= *cap
+                let nc: i32 = *cap * 2
+                *pp = realloc(*pp as *u8, (nc as i64) * sizeof(OwnPath)) as *OwnPath
+                *cap = nc
+            let paths: *OwnPath = *pp
+            let bit: i32 = own_set_bit(n)
+            let p: *OwnPath = @paths[n]
+            p.parent = parent
+            p.idx = idx
+            p.fld = f
+            p.up = bit
+            p.down = bit
+            var a: i32 = parent
+            while a >= 0
+                let ap: *OwnPath = @paths[a]
+                p.up = own_set_or(p.up, own_set_bit(a))
+                ap.down = own_set_or(ap.down, bit)
+                a = ap.parent
+            n += 1
+        idx += 1
+        f = f.next
+    n
+
+fn oc_path_depth(paths: *OwnPath, i: i32) -> i32
+    var d: i32 = 0
+    var p: *OwnPath = @paths[i]
+    while p.parent >= 0
+        d += 1
+        p = @paths[p.parent]
+    d
+
+# The paths of a partly movable struct `name`, shallowest first; a field
+# stops the walk where it can't be partly moved itself.
+fn oc_build_paths(sm: *Sema, name: *u8, len: i32, out_n: *i32) -> *OwnPath
+    var cap: i32 = 32
+    var paths: *OwnPath = malloc((cap as i64) * sizeof(OwnPath)) as *OwnPath
+    var n: i32 = oc_add_paths(sm, @paths, @cap, 0, 0 - 1, name, len)
+    var i: i32 = 0
+    while i < n
+        let p: *OwnPath = @paths[i]
+        let f: *StructField = p.fld
+        if f.field_type == TYPE_STRUCT and oc_path_depth(paths, i) < OC_MAX_DEPTH and oc_partly_movable(sm, f.field_type_name, f.field_type_name_len) == 1
+            n = oc_add_paths(sm, @paths, @cap, n, i, f.field_type_name, f.field_type_name_len)
+        i += 1
+    *out_n = n
+    paths
+
+# The path for the field `name` of path `parent`, or -1.
+fn oc_named_path(b: *OcBind, parent: i32, name: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < b.path_count
+        let p: *OwnPath = oc_path_at(b, i)
+        if p.parent == parent and name_eq(p.fld.name, p.fld.name_len, name, len) == 1
+            return i
+        i += 1
+    0 - 1
+
+# The paths a use of `path` overlaps: it and its parents, and with `exact` 1
+# its parts too.
+fn oc_overlap(b: *OcBind, path: i32, exact: i32) -> i32
+    if path < 0
+        return 0
+    let p: *OwnPath = oc_path_at(b, path)
+    if exact == 1
+        return own_set_or(p.up, p.down)
+    p.up
+
+# --- Scopes ---------------------------------------------------------------------------
+
+fn oc_push_scope()
+    let o: *OcState = oc()
+    if o.scope_count >= o.scope_cap
+        let cap: i32 = o.scope_cap * 2
+        o.scope_start = realloc(o.scope_start as *u8, (cap as i64) * 4) as *i32
+        o.scope_dead = realloc(o.scope_dead as *u8, (cap as i64) * 4) as *i32
+        o.scope_dstart = realloc(o.scope_dstart as *u8, (cap as i64) * 4) as *i32
+        o.scope_cap = cap
+    let starts: *i32 = o.scope_start
+    let deads: *i32 = o.scope_dead
+    let dstarts: *i32 = o.scope_dstart
+    starts[o.scope_count] = o.live_count
+    deads[o.scope_count] = 0
+    dstarts[o.scope_count] = o.defer_count
+    o.scope_count = o.scope_count + 1
+
+fn oc_scope_is_dead(o: *OcState) -> i32
+    if o.scope_count <= 0
+        return 0
+    let deads: *i32 = o.scope_dead
+    deads[o.scope_count - 1]
+
+fn oc_mark_dead(o: *OcState)
+    if o.scope_count <= 0
+        return
+    let deads: *i32 = o.scope_dead
+    deads[o.scope_count - 1] = 1
+
+# Close the innermost block: run its deferred statements (unless the block
+# ended in a `return`) and forget its bindings.  Returns 1 when the block
+# returned (for the `if` merge).
+fn oc_pop_scope(sm: *Sema) -> i32
+    let o: *OcState = oc()
+    if o.scope_count <= 0
+        return 0
+    let starts: *i32 = o.scope_start
+    let start: i32 = starts[o.scope_count - 1]
+    let dstarts: *i32 = o.scope_dstart
+    let dstart: i32 = dstarts[o.scope_count - 1]
+    let dead: i32 = oc_scope_is_dead(o)
+    if dead == 0
+        oc_unwind(sm, dstart)
+    o.defer_count = dstart
+    o.live_count = start
+    o.scope_count = o.scope_count - 1
+    o.last_pop_dead = dead
+    dead
+
+# 1 when the move check should look at code at this point.
+fn oc_checking(sm: *Sema) -> i32
+    let o: *OcState = oc()
+    if o.live_count == 0 and oc_any_drop(sm) == 0
+        return 0
+    if oc_scope_is_dead(o) == 1
+        return 0
+    1
+
+# --- Bindings --------------------------------------------------------------------------
+
+fn oc_grow_live(o: *OcState)
+    if o.live_count < o.live_cap
+        return
+    let cap: i32 = o.live_cap * 2
+    o.live = realloc(o.live as *u8, (cap as i64) * sizeof(OcBind)) as *OcBind
+    o.live_cap = cap
+
+fn oc_new_bind(o: *OcState) -> *OcBind
+    oc_grow_live(o)
+    let b: *OcBind = oc_live_at(o, o.live_count)
+    memset(b as *u8, 0, sizeof(OcBind))
+    b.vi = 0 - 1
+    b.id = o.next_id
+    o.next_id = o.next_id + 1
+    o.live_count = o.live_count + 1
+    b
+
+# The SemaVar index of the innermost local `name`, or -1.
+fn oc_var_index(sm: *Sema, name: *u8, len: i32) -> i32
+    let v: *SemaVar = sema_find_local(sm, name, len)
+    if v == null
+        return 0 - 1
+    ((v as i64 - sm.scope as i64) / sizeof(SemaVar)) as i32
+
+# The LocalVar the emitter makes for the local `name` (ref_check's image of
+# it on Sema), or null.
+fn oc_local(sm: *Sema, name: *u8, len: i32) -> *LocalVar
+    var env: RefEnv
+    var is_local: i32 = 0
+    ref_local_in(ref_env_of(@env, null, sm), name, len, @is_local)
+
+# The move-only struct a local holds (an `[N]T` / N-D array's element struct,
+# with the element count in *count), as own_register reads its LocalVar; null
+# when it holds none.
+fn oc_local_owns(sm: *Sema, loc: *LocalVar, count: *i32, len: *i32) -> *u8
+    *count = 0
+    var name: *u8 = loc.type_name
+    var n: i32 = loc.type_name_len
+    if loc.var_type == TYPE_ARRAY
+        if loc.array_shape != null
+            if own_shape_elems(loc.array_shape, count, @name, @n) == 0
+                return null
+        else if loc.array_elem_type == TYPE_STRUCT and loc.array_size > 0
+            *count = loc.array_size
+        else
+            return null
+    else if loc.var_type != TYPE_STRUCT
+        return null
+    if oc_move_only(sm, name, n) == 0
+        return null
+    *len = n
+    name
+
+# Record on the fn that `name` (a declaration's name pointer) owns its value.
+fn oc_annotate(sm: *Sema, name: *u8)
+    let f: *FnDef = sm.cur_fn
+    if f == null or name == null
+        return
+    var ob: *OwnedBinds = f.own_binds
+    if ob == null
+        ob = malloc(sizeof(OwnedBinds)) as *OwnedBinds
+        ob.names = malloc(8 * 8) as **u8
+        ob.count = 0
+        ob.cap = 8
+        f.own_binds = ob
+    var names: **u8 = ob.names
+    var i: i32 = 0
+    while i < ob.count
+        if names[i] == name
+            return
+        i += 1
+    if ob.count >= ob.cap
+        ob.cap = ob.cap * 2
+        names = realloc(names as *u8, (ob.cap as i64) * 8) as **u8
+        ob.names = names
+    names[ob.count] = name
+    ob.count = ob.count + 1
+
+# Register the local `name` (the innermost of that name) if it holds a
+# move-only value.  `owned` is 1 when it starts out holding one.  Returns 1
+# when it is registered.
+fn oc_register(sm: *Sema, name: *u8, len: i32) -> i32
+    let loc: *LocalVar = oc_local(sm, name, len)
+    var count: i32 = 0
+    var tlen: i32 = 0
+    var tname: *u8 = null
+    if loc != null
+        tname = oc_local_owns(sm, loc, @count, @tlen)
+    if tname == null and (loc == null or loc.var_type != TYPE_ARRAY)
+        # A user enum value (`var s = E.V(x)`): Sema's own type of it, where
+        # the image of its LocalVar can't say.
+        let v: *SemaVar = sema_find_local(sm, name, len)
+        if v != null and v.kind == TYPE_STRUCT and user_enum_index(v.type_name, v.type_name_len) >= 0 and oc_move_only(sm, v.type_name, v.type_name_len) == 1
+            tname = v.type_name
+            tlen = v.type_name_len
+    if tname == null
+        return 0
+    oc_register_as(sm, name, len, tname, tlen, count)
+
+# Register the local `name` as holding the move-only `tname` (`count` of
+# them for an array).
+fn oc_register_as(sm: *Sema, name: *u8, len: i32, tname: *u8, tlen: i32, count: i32) -> i32
+    let vi: i32 = oc_var_index(sm, name, len)
+    if vi < 0
+        return 0
+    let o: *OcState = oc()
+    let b: *OcBind = oc_new_bind(o)
+    b.name = name
+    b.name_len = len
+    b.vi = vi
+    b.type_name = tname
+    b.type_name_len = tlen
+    b.count = count
+    # AGAST #2168: a struct with no drop of its own can be partly moved.
+    if count == 0 and oc_partly_movable(sm, tname, tlen) == 1
+        b.paths = oc_build_paths(sm, tname, tlen, @b.path_count)
+    oc_annotate(sm, name)
+    1
+
+# The registered binding `name` currently resolves to, or null.
+fn oc_lookup(sm: *Sema, name: *u8, len: i32) -> *OcBind
+    let o: *OcState = oc()
+    if o.live_count == 0
+        return null
+    let vi: i32 = oc_var_index(sm, name, len)
+    if vi < 0
+        return null
+    var i: i32 = o.live_count - 1
+    while i >= 0
+        let b: *OcBind = oc_live_at(o, i)
+        if b.vi == vi and name_eq(b.name, b.name_len, name, len) == 1
+            return b
+        i -= 1
+    null
+
+# --- Errors ------------------------------------------------------------------------------
+
+# AGAST #1625: a deferred statement is checked as if written at each exit it
+# runs on; a binding it names that is moved by then is reported at the
+# `defer`, as ritz0 reports it.  Returns 1 when it reported.
+fn oc_error_in_defer(sm: *Sema, b: *OcBind) -> i32
+    let d: *Stmt = oc().cur_defer
+    if d == null
+        return 0
+    oc_error_defer_at(sm, d.span.line, d.span.col, b)
+    1
+
+fn oc_error_defer_at(sm: *Sema, line: i32, col: i32, b: *OcBind)
+    oc_error_at(sm, line, col)
+    oc_put_char('`')
+    oc_put_bytes(b.name, b.name_len)
+    oc_put_cstr(c"` may be moved before the deferred statement runs\n")
+
+fn oc_error_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, move_line: i32, move_col: i32)
+    if oc_error_in_defer(sm, b) == 1
+        return
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"use of moved value: `")
+    oc_put_bytes(b.name, b.name_len)
+    oc_put_cstr(c"` (moved at ")
+    oc_put_loc(sm, move_line, move_col)
+    oc_put_cstr(c")\n")
+
+fn oc_error_borrow_at(sm: *Sema, line: i32, col: i32, b: *OcBind)
+    if oc_error_in_defer(sm, b) == 1
+        return
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"cannot borrow `")
+    oc_put_bytes(b.name, b.name_len)
+    oc_put_cstr(c"` - value has been moved\n")
+
+# `b.f.g` for path `path` of the binding (`b` for -1).
+fn oc_put_binding_path(b: *OcBind, path: i32)
+    if path < 0
+        oc_put_bytes(b.name, b.name_len)
+        return
+    let p: *OwnPath = oc_path_at(b, path)
+    oc_put_binding_path(b, p.parent)
+    oc_put_char('.')
+    oc_put_bytes(p.fld.name, p.fld.name_len)
+
+# AGAST #2168: a use of one of the moved paths `bits` (or of the whole
+# binding): `use of moved value: `h.t` (moved at F:L:C)`, for the first moved.
+fn oc_error_field_use_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i32)
+    if oc_error_in_defer(sm, b) == 1
+        return
+    let o: *OcState = oc()
+    let path: i32 = oc_first_moved(o, b.id, bits)
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"use of moved value: `")
+    oc_put_binding_path(b, path)
+    oc_put_cstr(c"`")
+    let r: *i32 = oc_fm_find(o, b.id, path)
+    if r != null
+        oc_put_cstr(c" (moved at ")
+        oc_put_loc(sm, r[2], r[3])
+        oc_put_cstr(c")")
+    oc_put_cstr(c"\n")
+
+fn oc_error_borrow_field_at(sm: *Sema, line: i32, col: i32, b: *OcBind, bits: i32)
+    if oc_error_in_defer(sm, b) == 1
+        return
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"cannot borrow `")
+    oc_put_bytes(b.name, b.name_len)
+    oc_put_cstr(c"` - `")
+    oc_put_binding_path(b, oc_first_moved(oc(), b.id, bits))
+    oc_put_cstr(c"` has been moved\n")
+
+# `x.f.g`, as written.
+fn oc_put_path(e: *Expr)
+    if e.kind == EXPR_MEMBER
+        oc_put_path(e.left)
+        oc_put_char('.')
+        oc_put_bytes(e.ident_ptr, e.ident_len)
+    else if e.kind == EXPR_IDENT
+        oc_put_bytes(e.ident_ptr, e.ident_len)
+
+fn oc_error_move_from_drop(sm: *Sema, line: i32, col: i32, e: *Expr, tname: *u8, tlen: i32)
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"cannot move out of `")
+    oc_put_path(e)
+    oc_put_cstr(c"`: `")
+    oc_put_bytes(tname, own_base_len(tname, tlen))
+    oc_put_cstr(c"` implements Drop\n")
+
+# 1 the first time this place is reported: a deferred statement is checked at
+# each exit.
+fn oc_first_report(line: i32, col: i32) -> i32
+    let o: *OcState = oc()
+    if line == o.last_line and col == o.last_col
+        return 0
+    o.last_line = line
+    o.last_col = col
+    1
+
+# ref_rules.move_out_of_reference.
+fn oc_error_move_out(sm: *Sema, line: i32, col: i32)
+    if oc_first_report(line, col) == 0
+        return
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"cannot move out of a reference\n")
+
+# AGAST #2268: array_rules.py's words.
+fn oc_error_move_out_of_element(sm: *Sema, line: i32, col: i32)
+    if oc_first_report(line, col) == 0
+        return
+    oc_error_at(sm, line, col)
+    oc_put_cstr(c"cannot move out of an array element: the array still drops it; borrow it with `@a[i]`\n")
+
+# LARB R34 (AGAST #3367): ref_rules.move_out_of_global.
+fn oc_error_move_out_of_global(sm: *Sema, g: *Expr, e: *Expr)
+    if oc_first_report(g.span.line, g.span.col) == 0
+        return
+    oc_error_at(sm, g.span.line, g.span.col)
+    oc_put_cstr(c"cannot move out of global `")
+    oc_put_bytes(g.ident_ptr, g.ident_len)
+    oc_put_cstr(c"`: borrow it with `@")
+    oc_put_path(e)
+    oc_put_cstr(c"`\n")
+
+# --- Uses while a loop shadows a binding -------------------------------------------------
+
+fn oc_note_use_ev(o: *OcState, id: i32, a: i32, line: i32, col: i32, fs: i32)
+    var dl: i32 = 0
+    var dc: i32 = 0
+    let d: *Stmt = o.cur_defer
+    if d != null
+        dl = d.span.line
+        dc = d.span.col
+    oc_ev_push(o, OC_EV_USE, id, a, dl, line, col, fs, dc)
+
+# A use of an unmoved binding inside a loop: if the binding is shadowed,
+# record the use for oc_loop_exit.
+fn oc_note_use(b: *OcBind, line: i32, col: i32, borrow: i32)
+    let o: *OcState = oc()
+    if o.loop_depth == 0 or b.moved == 1
+        return
+    let fs: i32 = own_set_minus(b.fshadow, b.fmoved)
+    if b.shadow == 1 or fs != 0
+        oc_note_use_ev(o, b.id, borrow + b.shadow * 2, line, col, fs)
+
+# A use of the paths `bits` only (AGAST #2168).
+fn oc_note_field_use(b: *OcBind, bits: i32, line: i32, col: i32)
+    let o: *OcState = oc()
+    if o.loop_depth == 0 or b.moved == 1
+        return
+    let fs: i32 = own_set_and(b.fshadow, bits)
+    if b.shadow == 1 or fs != 0
+        oc_note_use_ev(o, b.id, b.shadow * 2, line, col, fs)
+
+# The binding a field / element store writes into is used as a place: an
+# error if it was moved, but not if one of its fields was.
+fn oc_note_place_use(sm: *Sema, b: *OcBind, line: i32, col: i32)
+    if b.moved == 1
+        oc_error_use_at(sm, line, col, b, b.move_line, b.move_col)
+        return
+    let o: *OcState = oc()
+    if o.loop_depth > 0 and b.shadow == 1
+        oc_note_use_ev(o, b.id, 2, line, col, 0)
+
+# `b.<path> = v`, once v is checked: b must still hold the parents of what
+# is stored to; then the path and its parts are owned again (AGAST #2168).
+fn oc_store_path(sm: *Sema, b: *OcBind, path: i32, exact: i32, line: i32, col: i32)
+    if b.moved == 1
+        oc_error_use_at(sm, line, col, b, b.move_line, b.move_col)
+        return
+    var parents: i32 = oc_overlap(b, path, 0)
+    if exact == 1
+        parents = own_set_minus(parents, own_set_bit(path))
+    if own_set_and(b.fmoved, parents) != 0
+        oc_error_field_use_at(sm, line, col, b, own_set_and(b.fmoved, oc_overlap(b, path, exact)))
+        return
+    oc_note_field_use(b, parents, line, col)
+    if exact == 0
+        return
+    let p: *OwnPath = oc_path_at(b, path)
+    let bits: i32 = p.down
+    b.fshadow = own_set_minus(b.fshadow, bits)
+    b.fmoved = own_set_minus(b.fmoved, bits)
+
+# --- Places -------------------------------------------------------------------------------
+
+fn oc_member_root(e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r.kind == EXPR_MEMBER and r.left != null
+        r = r.left
+    r
+
+# Field `idx` of the struct `name`, or null.
+fn oc_struct_field(sm: *Sema, name: *u8, len: i32, idx: i32) -> *StructField
+    let st: *StructDef = oc_find_struct(sm, name, len)
+    if st == null
+        return null
+    var f: *StructField = st.fields
+    var i: i32 = 0
+    while f != null and i < idx
+        f = f.next
+        i += 1
+    f
+
+# A member path `x.f1...fn` rooted at a registered single-value binding x:
+# fn's field, with x (*out_b) and the first struct along the path that has
+# its own drop (*out_drop, null if none); else null.
+fn oc_member_path(sm: *Sema, e: *Expr, out_b: **OcBind, out_drop: **u8, out_drop_len: *i32) -> *StructField
+    if e.kind != EXPR_MEMBER or e.left == null
+        return null
+    let l: *Expr = e.left
+    var tname: *u8 = null
+    var tlen: i32 = 0
+    if l.kind == EXPR_IDENT
+        let b: *OcBind = oc_lookup(sm, l.ident_ptr, l.ident_len)
+        if b == null or b.count > 0
+            return null
+        tname = b.type_name
+        tlen = b.type_name_len
+        *out_b = b
+    else
+        let pf: *StructField = oc_member_path(sm, l, out_b, out_drop, out_drop_len)
+        if pf == null or pf.field_type != TYPE_STRUCT
+            return null
+        tname = pf.field_type_name
+        tlen = pf.field_type_name_len
+    let st: *StructDef = oc_find_struct(sm, tname, tlen)
+    if st == null
+        return null
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return null
+    if l.kind == EXPR_IDENT
+        *out_drop = null
+        *out_drop_len = 0
+    if *out_drop == null and oc_has_drop_impl(sm, tname, tlen) == 1
+        *out_drop = tname
+        *out_drop_len = tlen
+    oc_struct_field(sm, tname, tlen, idx)
+
+# The deepest path of `b` along the member path `e`, rooted at b (-1 for b
+# itself); *out_exact is 1 when `e` ends on it.
+fn oc_path_of(b: *OcBind, e: *Expr, out_exact: *i32) -> i32
+    if e.kind != EXPR_MEMBER or e.left == null
+        *out_exact = 1
+        return 0 - 1
+    var exact: i32 = 0
+    let parent: i32 = oc_path_of(b, e.left, @exact)
+    if exact == 0
+        *out_exact = 0
+        return parent
+    let path: i32 = oc_named_path(b, parent, e.ident_ptr, e.ident_len)
+    if path < 0
+        *out_exact = 0
+        return parent
+    *out_exact = 1
+    path
+
+# The fn a call `e` calls (a local fn value's signature, else the fn).
+fn oc_call_fn(sm: *Sema, e: *Expr) -> *FnDef
+    rs_call_fn(sm, e)
+
+# The move-only struct type a call or method call returns by value (its length
+# in *out_len), or null.
+fn oc_call_ret_type(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+    var f: *FnDef = null
+    if e.kind == EXPR_CALL
+        f = oc_call_fn(sm, e)
+    else if e.kind == EXPR_METHOD
+        f = rs_method_def(sm, e)   # AGAST #2262
+    if f == null or f.return_type != TYPE_STRUCT or f.return_type_name_len <= 0
+        return null
+    if oc_move_only(sm, f.return_type_name, f.return_type_name_len) == 0
+        return null
+    *out_len = f.return_type_name_len
+    f.return_type_name
+
+# `call().f` with f a move-only field (ritz0's _is_move_only_field).
+fn oc_temp_field_move_only(sm: *Sema, e: *Expr) -> i32
+    let l: *Expr = e.left
+    if l == null or l.kind != EXPR_CALL
+        return 0
+    var len: i32 = 0
+    let name: *u8 = oc_call_ret_type(sm, l, @len)
+    if name == null
+        return 0
+    let st: *StructDef = sema_find_struct(sm, name, len)
+    if st == null
+        return 0
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return 0
+    oc_field_move_only(sm, oc_struct_field(sm, name, len, idx))
+
+# `p[i]` through a Vec, Span or String (or a pointer to one), as
+# index_through_value_struct reads it: 1 with the struct its element is by
+# value (a `*S` buffer's S), 0 for a scalar or pointer element, -1 when `e`
+# reads through no such buffer.
+fn oc_buffer_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    let l: *Expr = e.left
+    if e.right == null or e.right.kind == EXPR_RANGE or l == null
+        return 0 - 1
+    if l.kind != EXPR_IDENT and l.kind != EXPR_MEMBER and (l.kind != EXPR_UNARY or l.op != OP_DEREF)
+        return 0 - 1
+    var t: SemaTy
+    if rs_ty(sm, l, @t) == 0
+        return 0 - 1
+    var k: i32 = TYPE_VOID
+    var n: *u8 = null
+    var nl: i32 = 0
+    if let_through_elem(sm, t.kind, t.pointee, t.name, t.name_len, @k, @n, @nl) == 0
+        return 0 - 1
+    if k != TYPE_STRUCT or n == null or nl <= 0
+        return 0
+    *out_name = n
+    *out_len = nl
+    1
+
+# The struct `e` holds by value: 1 and its name, or 0.  `p[i]` through a Vec
+# or Span holds its element (AGAST #2444, R9).
+fn oc_value_struct(sm: *Sema, e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if e.kind == EXPR_INDEX and rs_through_kind(sm, e) != TYPE_VOID
+        let r: i32 = oc_buffer_value_struct(sm, e, out_name, out_len)
+        if r >= 0
+            return r
+    var env: RefEnv
+    var t: RefTy
+    if ref_ty_in(ref_env_of(@env, null, sm), e, @t) == 1
+        if t.kind != TYPE_STRUCT
+            return 0
+        if t.name_len > 0
+            *out_name = t.name
+            *out_len = t.name_len
+            return 1
+    if e.kind == EXPR_IDENT
+        # A binding Sema's scope can't type but this check registered (a
+        # nameless tuple's, oc_tuple_def).
+        let b: *OcBind = oc_lookup(sm, e.ident_ptr, e.ident_len)
+        if b == null or b.count > 0
+            return 0
+        *out_name = b.type_name
+        *out_len = b.type_name_len
+        return 1
+    # `p[i].f` through a Vec or Span (AGAST #2444): f of the element's struct,
+    # which ref_ty_in doesn't type on Sema.
+    if e.kind != EXPR_MEMBER or e.left == null
+        return 0
+    var bn: *u8 = null
+    var bl: i32 = 0
+    if oc_value_struct(sm, e.left, @bn, @bl) == 0
+        return 0
+    let st: *StructDef = oc_find_struct(sm, bn, bl)
+    if st == null
+        return 0
+    let idx: i32 = find_field_index(st, e.ident_ptr, e.ident_len)
+    if idx < 0
+        return 0
+    let f: *StructField = get_field_type(st, idx)
+    if f.field_type != TYPE_STRUCT or f.field_type_name_len <= 0
+        return 0
+    *out_name = f.field_type_name
+    *out_len = f.field_type_name_len
+    1
+
+# 1 when `e`, a payload copy a non-owning match lent, is named (AGAST #2178).
+fn oc_lent_payload(sm: *Sema, e: *Expr) -> i32
+    let vi: i32 = oc_var_index(sm, e.ident_ptr, e.ident_len)
+    if vi < 0
+        return 0
+    let v: *SemaVar = @sm.scope[vi]
+    let o: *OcState = oc()
+    let lvi: *i32 = o.lent_vi
+    let lname: **u8 = o.lent_name
+    var i: i32 = o.lent_count - 1
+    while i >= 0
+        if lvi[i] == vi and lname[i] == v.name
+            return 1
+        i -= 1
+    0
+
+# Does the place `e` lie behind an `@T`, `@&T`, `*T` or `:&`?  ref_check's
+# ref_through, on Sema; ritz0's MoveChecker._through_reference.
+fn oc_through(sm: *Sema, e0: *Expr) -> i32
+    var env: RefEnv
+    ref_env_of(@env, null, sm)
+    var e: *Expr = e0
+    while e != null
+        var next: *Expr = null
+        if e.kind == EXPR_MEMBER or e.kind == EXPR_INDEX
+            next = e.left
+        else if e.kind == EXPR_UNARY and e.op == OP_DEREF
+            next = e.operand
+        else
+            if e.kind != EXPR_IDENT
+                return 0
+            if sema_find_local(sm, e.ident_ptr, e.ident_len) == null
+                return 0
+            if oc_lent_payload(sm, e) == 1
+                return 1
+            let loc: *LocalVar = oc_local(sm, e.ident_ptr, e.ident_len)
+            if loc == null
+                return 0
+            return loc.is_lent
+        e = next
+        var t: RefTy
+        if ref_ty_in(@env, e, @t) == 1 and ref_is_pointer(t.kind) == 1
+            return 1
+    0
+
+# AGAST #2336: `e` (`*r`, `r.f`, `p[i]`) names a move-only value behind a
+# reference.  Used by value it would have two owners.
+fn oc_moves_out(sm: *Sema, e: *Expr) -> i32
+    if e.kind == EXPR_IDENT
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if oc_value_struct(sm, e, @name, @len) == 0
+        return 0
+    if oc_move_only(sm, name, len) == 0
+        return 0
+    oc_through(sm, e)
+
+# The `a[i]` that the place `e` (`a[i]`, `a[i].f.g`) is, or is a field of,
+# when `a` is an array held by value.  ritz0's MoveChecker._element_root.
+fn oc_element_root(sm: *Sema, e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r != null and r.kind == EXPR_MEMBER
+        r = r.left
+    if r == null or r.kind != EXPR_INDEX
+        return null
+    var env: RefEnv
+    var b: RefTy
+    if ref_ty_in(ref_env_of(@env, null, sm), r.left, @b) == 0 or b.kind != TYPE_ARRAY
+        return null
+    r
+
+# nd_index_shape on Sema: the `[N][M]..T` an index chain `e` indexes into,
+# with the number of indexes in *out_depth; null when it indexes none.
+fn oc_nd_index_shape(sm: *Sema, e: *Expr, out_depth: *i32) -> *ArrayShape
+    if e == null or e.kind != EXPR_INDEX
+        return null
+    var depth: i32 = 0
+    var base: *Expr = e
+    while base.kind == EXPR_INDEX
+        depth = depth + 1
+        base = base.left
+    var sh: *ArrayShape = null
+    if base.kind == EXPR_IDENT
+        if sema_find_local(sm, base.ident_ptr, base.ident_len) != null
+            let loc: *LocalVar = oc_local(sm, base.ident_ptr, base.ident_len)
+            if loc != null and loc.var_type == TYPE_ARRAY
+                sh = loc.array_shape
+            else if loc != null and ref_is_pointer(loc.var_type) == 1
+                sh = loc.pointee_array_shape
+        else
+            let g: *GlobalVarDef = sbk_global(sm, base.ident_ptr, base.ident_len)
+            if g != null and g.var_type == TYPE_ARRAY
+                sh = g.array_shape
+    else if base.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, base)
+        if f != null and f.field_type == TYPE_ARRAY
+            sh = f.array_shape
+    if sh == null or depth > sh.rank
+        return null
+    *out_depth = depth
+    sh
+
+# 1 when a by-value read of `e` moves a move-only value out of an array
+# element (AGAST #2268): the array drops every element.
+fn oc_moves_element(sm: *Sema, e: *Expr) -> i32
+    # AGAST #3322: a row of an N-D array of a move-only S is an array of S's
+    # the array still drops.
+    var row_depth: i32 = 0
+    let row_sh: *ArrayShape = oc_nd_index_shape(sm, e, @row_depth)
+    if row_sh != null and row_depth < row_sh.rank
+        if row_sh.leaf_type != TYPE_STRUCT or row_sh.leaf_name_len == 0
+            return 0
+        return oc_move_only(sm, row_sh.leaf_name, row_sh.leaf_name_len)
+    if oc_element_root(sm, e) == null
+        return 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if oc_value_struct(sm, e, @name, @len) == 0
+        return 0
+    oc_move_only(sm, name, len)
+
+# LARB R34 (AGAST #3367, §13.2): the `G` of a by-value read of `e` (`G`,
+# `G.f.g`) that moves a move-only value out of the module-level `var G`.
+fn oc_moves_global(sm: *Sema, e: *Expr) -> *Expr
+    var r: *Expr = e
+    while r != null and r.kind == EXPR_MEMBER
+        r = r.left
+    if r == null or r.kind != EXPR_IDENT
+        return null
+    if sema_find_local(sm, r.ident_ptr, r.ident_len) != null or sbk_global(sm, r.ident_ptr, r.ident_len) == null
+        return null
+    var name: *u8 = null
+    var len: i32 = 0
+    if oc_value_struct(sm, e, @name, @len) == 0 or oc_move_only(sm, name, len) == 0
+        return null
+    r
+
+# 1 when an argument bound to `p` is passed by value (a move).  A reference
+# param borrows its argument; an unknown callee is taken as by-value.
+fn oc_param_moves(p: *Param) -> i32
+    if p == null
+        return 1
+    if p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF or p.param_type == TYPE_PTR or p.param_type == TYPE_PTR_PTR
+        return 0
+    1
+
+fn oc_walk_args(sm: *Sema, a0: *Expr, p0: *Param)
+    var a: *Expr = a0
+    var p: *Param = p0
+    while a != null
+        oc_walk(sm, a, oc_param_moves(p))
+        if p != null
+            p = p.next
+        a = a.next
+
+# The method a receiver names, as emitter_expr_call's method_recv_type does:
+# on the struct of a local receiver.
+fn oc_recv_def(sm: *Sema, e: *Expr) -> *FnDef
+    let recv: *Expr = e.left
+    if recv == null or recv.kind != EXPR_IDENT
+        return null
+    if sema_find_local(sm, recv.ident_ptr, recv.ident_len) == null
+        return null
+    let loc: *LocalVar = oc_local(sm, recv.ident_ptr, recv.ident_len)
+    if loc == null or loc.type_name_len <= 0
+        return null
+    sema_method_fn(sm, loc.type_name, loc.type_name_len, e.ident_ptr, e.ident_len)
+
+# ptr_levels_of's question on Sema: the struct S when `x` is a `**S` (or
+# deeper) local, global, field, cast or call result; null otherwise.
+fn oc_ptr_ptr_struct(sm: *Sema, x: *Expr, out_len: *i32) -> *u8
+    if x == null
+        return null
+    var name: *u8 = null
+    var len: i32 = 0
+    if x.kind == EXPR_IDENT
+        if sema_find_local(sm, x.ident_ptr, x.ident_len) != null
+            let loc: *LocalVar = oc_local(sm, x.ident_ptr, x.ident_len)
+            if loc == null or loc.var_type != TYPE_PTR_PTR
+                return null
+            name = loc.type_name
+            len = loc.type_name_len
+        else
+            let g: *GlobalVarDef = sbk_global(sm, x.ident_ptr, x.ident_len)
+            if g == null or g.var_type != TYPE_PTR_PTR
+                return null
+            name = g.pointee_type_name
+            len = g.pointee_type_name_len
+    else if x.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, x)
+        if f == null or f.field_type != TYPE_PTR_PTR
+            return null
+        name = f.field_type_name
+        len = f.field_type_name_len
+    else if x.kind == EXPR_CAST
+        if x.op != TYPE_PTR_PTR
+            return null
+        name = x.ident_ptr
+        len = x.ident_len
+    else if x.kind == EXPR_CALL
+        # `f()` with `f() -> **S`, spelled with a `ptr_` per level past two.
+        let fd: *FnDef = oc_call_fn(sm, x)
+        if fd == null or fd.return_type != TYPE_PTR_PTR or fd.return_type_name == null
+            return null
+        name = fd.return_type_name
+        len = fd.return_type_name_len
+        while len > 4 and memcmp(name, c"ptr_", 4) == 0
+            name = name + 4
+            len = len - 4
+    if name == null or len <= 0 or sema_find_struct(sm, name, len) == null
+        return null
+    *out_len = len
+    name
+
+# AGAST #2336: a by-value `self` method on a reference to a move-only value.
+fn oc_check_ref_receiver(sm: *Sema, e: *Expr)
+    var name: *u8 = null
+    var len: i32 = 0
+    var is_ptr: i32 = 0
+    var m: *FnDef = null
+    if e.left != null and e.left.kind == EXPR_INDEX and rs_through_kind(sm, e.left) != TYPE_VOID
+        # `p[i].m()`: the element's method, on the element's type (AGAST #2444).
+        if oc_buffer_value_struct(sm, e.left, @name, @len) != 1
+            return
+        m = sema_method_fn(sm, name, len, e.ident_ptr, e.ident_len)
+    else
+        var env: RefEnv
+        var t: RefTy
+        if ref_ty_in(ref_env_of(@env, null, sm), e.left, @t) == 1 and t.name_len > 0
+            name = t.name
+            len = t.name_len
+            is_ptr = ref_is_pointer(t.kind)
+            m = rs_method_def(sm, e)
+        else if e.left != null and e.left.kind == EXPR_MEMBER and oc_value_struct(sm, e.left, @name, @len) == 1
+            # `p[i].f.m()` through a Vec or Span: f's struct.
+            m = sema_method_fn(sm, name, len, e.ident_ptr, e.ident_len)
+        else
+            # `p.m()` with `p: **S` (or deeper): the method is S's and the
+            # receiver is behind a pointer (AGAST #2402).
+            name = oc_ptr_ptr_struct(sm, e.left, @len)
+            if name == null
+                return
+            is_ptr = 1
+            m = sema_method_fn(sm, name, len, e.ident_ptr, e.ident_len)
+    if m == null or m.params == null or oc_param_moves(m.params) == 0 or m.params.is_borrow == 1
+        return
+    if name_eq(m.params.name, m.params.name_len, c"self", 4) == 0
+        return
+    if oc_move_only(sm, name, len) == 0
+        return
+    if is_ptr == 1 or oc_through(sm, e.left) == 1
+        let at: *Expr = own_start_of(e)
+        oc_error_move_out(sm, at.span.line, at.span.col)
+
+# A scrutinee moves into its match, unless a reference holds it, or it is an
+# array's element (#2268): that's a read.
+fn oc_scrutinee_mv(sm: *Sema, e: *Expr) -> i32
+    if oc_through(sm, e) == 1 or oc_element_root(sm, e) != null
+        return 0
+    1
+
+# --- Reading a `:&` param's referent (AGAST #2250, #2949) -------------------------------------
+#
+# `c:& C` reads as its referent where a by-value C is wanted (a `let`, an
+# argument, a return, a struct or array field), and so does a block's last
+# statement `c`.  A move-only C would then have two owners: "cannot move out
+# of a reference", as ritz0's move checker says.  ownership.ritz's
+# own_check_lent_read / own_check_lent_value_stmt ran this where the emitter
+# lowered each read, until AGAST #3507.
+
+# How a `:&` param is read (oc_lent_name): by value where a slot wants it
+# (emit_lent_referent: `c:& C`, `self:& C`, `a:& [N]T`), as a block's value
+# (`c:& C`, `a:& [N]T`), through `*@c` (lent_struct_local) or `*a`.
+const OC_READ_SLOT: i32 = 0
+const OC_READ_VALUE: i32 = 1
+const OC_READ_ADDR: i32 = 2
+const OC_READ_DEREF: i32 = 3
+
+# The struct (an `a:& [N]T`'s element T) a `:&` param `e` names, when reading
+# `e` as `how` (OC_READ_*) reads the referent; null otherwise.
+fn oc_lent_name(sm: *Sema, e: *Expr, how: i32, out_len: *i32) -> *u8
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    let v: *SemaVar = sema_find_local(sm, e.ident_ptr, e.ident_len)
+    if v == null or v.lent == null
+        return null
+    let loc: *LocalVar = oc_local(sm, e.ident_ptr, e.ident_len)
+    if loc == null or loc.type_name_len <= 0
+        return null
+    let p: *Param = v.lent
+    let arr: i32 = (loc.is_lent == 1 and loc.var_type == TYPE_ARRAY) as i32   # lent_array_ident
+    let referent: i32 = (loc.is_lent == 1 and loc.var_type == TYPE_MUT_REF and loc.pointee_type == TYPE_STRUCT) as i32
+    var ok: i32 = 0
+    if how == OC_READ_SLOT
+        ok = arr | referent
+        if p.is_self_borrow == 1 and loc.pointee_type == TYPE_STRUCT and (loc.var_type == TYPE_PTR or loc.var_type == TYPE_MUT_REF)
+            ok = 1   # lent_self_local
+    else if how == OC_READ_VALUE
+        ok = arr | referent
+    else if how == OC_READ_ADDR
+        # lent_struct_local: a `:&` param (an impl's `self:&` too) held as a
+        # reference to a struct.
+        ok = ((loc.var_type == TYPE_MUT_REF or loc.var_type == TYPE_PTR) and loc.pointee_type == TYPE_STRUCT) as i32
+    else
+        ok = arr
+    if ok == 0
+        return null
+    *out_len = loc.type_name_len
+    loc.type_name
+
+# `e`, a `:&` param, read by value.
+fn oc_lent_read(sm: *Sema, e: *Expr, how: i32)
+    var len: i32 = 0
+    let name: *u8 = oc_lent_name(sm, e, how, @len)
+    if name == null or oc_move_only(sm, name, len) == 0
+        return
+    oc_error_move_out(sm, e.span.line, e.span.col)
+
+# The reads of `e`, used by value when `mv` is 1, in the order lowering it
+# reaches them.
+fn oc_lent_walk(sm: *Sema, e: *Expr, mv: i32)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        if mv == 1
+            oc_lent_read(sm, e, OC_READ_SLOT)
+    else if k == EXPR_UNARY
+        # AGAST #2286: `*@c` reads `c:& C` by value, as `c` itself does; and
+        # `*a` the whole `a:& [N]T` (AGAST #2290).
+        if e.op == OP_DEREF and mv == 1 and e.operand != null and e.operand.kind == EXPR_UNARY and e.operand.op == OP_ADDR
+            oc_lent_read(sm, e.operand.operand, OC_READ_ADDR)
+            return
+        if e.op == OP_DEREF and mv == 1 and e.operand != null and e.operand.kind == EXPR_IDENT
+            oc_lent_read(sm, e.operand, OC_READ_DEREF)
+            return
+        if e.op == OP_ADDR or e.op == OP_ADDR_MUT
+            return
+        oc_lent_walk(sm, e.operand, 0)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        oc_lent_walk(sm, e.left, 0)
+        oc_lent_walk(sm, e.right, 0)
+    else if k == EXPR_MEMBER
+        oc_lent_walk(sm, e.left, 0)
+    else if k == EXPR_CAST or k == EXPR_TRY
+        oc_lent_walk(sm, e.left, mv)
+    else if k == EXPR_CALL
+        if e.func_name_len == 6 and name_eq(e.func_name, e.func_name_len, c"sizeof", 6) == 1
+            return
+        var p: *Param = null
+        let f: *FnDef = oc_call_fn(sm, e)
+        if f != null
+            p = f.params
+        var a: *Expr = e.args
+        while a != null
+            oc_lent_walk(sm, a, oc_param_moves(p))
+            if p != null
+                p = p.next
+            a = a.next
+    else if k == EXPR_METHOD
+        oc_lent_walk(sm, e.left, 0)
+        var mp: *Param = null
+        let m: *FnDef = oc_recv_def(sm, e)
+        if m != null and m.params != null
+            mp = m.params.next
+        var a: *Expr = e.args
+        while a != null
+            oc_lent_walk(sm, a, oc_param_moves(mp))
+            if mp != null
+                mp = mp.next
+            a = a.next
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            oc_lent_walk(sm, fi.value, 1)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        var el: *Expr = e.args
+        while el != null
+            oc_lent_walk(sm, el, 1)
+            el = el.next
+    else if k == EXPR_ARRAY_FILL
+        oc_lent_walk(sm, e.left, 1)
+    else if k == EXPR_MATCH or k == EXPR_IF
+        oc_lent_walk(sm, e.left, 0)
+
+# AGAST #2949: `e` is a block's last statement, so it is the block's value:
+# a bare `c` with `c:& C` (or `a:& [N]T`) reads the referent, in a void fn
+# too.  A `defer` body's value is discarded, as in ritz0.
+fn oc_lent_value_stmt(sm: *Sema, e: *Expr)
+    if oc().cur_defer != null
+        return
+    oc_lent_read(sm, e, OC_READ_VALUE)
+
+# The reads of a statement's own expressions, as oc_check_stmt walks them.
+fn oc_lent_stmt(sm: *Sema, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        oc_lent_walk(sm, stmt.var_init, 1)
+    else if k == STMT_ASSIGN
+        let t: *Expr = stmt.if_cond as *Expr
+        if stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
+            oc_lent_walk(sm, t, 0)
+        oc_lent_walk(sm, stmt.assign_value, 1)
+    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        oc_lent_walk(sm, stmt.while_cond, 0)
+        oc_lent_walk(sm, stmt.assign_value, 1)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+        oc_lent_walk(sm, stmt.assign_value, 1)
+    else if k == STMT_RETURN
+        oc_lent_walk(sm, stmt.return_value, 1)
+    else if k == STMT_EXPR
+        if stmt.next == null
+            oc_lent_value_stmt(sm, stmt.expr)
+        oc_lent_walk(sm, stmt.expr, 0)
+    else if k == STMT_MATCH
+        oc_lent_walk(sm, stmt.if_cond as *Expr, 0)
+    else if k == STMT_IF or k == STMT_ASSERT
+        oc_lent_walk(sm, stmt.if_cond, 0)
+    else if k == STMT_WHILE
+        oc_lent_walk(sm, stmt.while_cond, 0)
+    else if k == STMT_FOR
+        oc_lent_walk(sm, stmt.for_start, 0)
+        oc_lent_walk(sm, stmt.for_end, 0)
+
+# --- The walk -------------------------------------------------------------------------------
+
+# `x.f...` (AGAST #2168, #2242): a use of that path, or with `mv` 1 a move of
+# it when the path's value is move-only.
+fn oc_walk_member(sm: *Sema, e: *Expr, mv: i32)
+    var b: *OcBind = null
+    var dn: *u8 = null
+    var dl: i32 = 0
+    let f: *StructField = oc_member_path(sm, e, @b, @dn, @dl)
+    if f == null
+        var lmv: i32 = 0
+        if mv == 1 and oc_temp_field_move_only(sm, e) == 1
+            lmv = 1
+        oc_walk(sm, e.left, lmv)
+        return
+    let root: *Expr = oc_member_root(e)
+    let line: i32 = root.span.line
+    let col: i32 = root.span.col
+    if b.moved == 1
+        oc_error_use_at(sm, line, col, b, b.move_line, b.move_col)
+        return
+    var exact: i32 = 0
+    let path: i32 = oc_path_of(b, e, @exact)
+    let overlap: i32 = oc_overlap(b, path, exact)
+    if own_set_and(b.fmoved, overlap) != 0
+        oc_error_field_use_at(sm, line, col, b, own_set_and(b.fmoved, overlap))
+        return
+    oc_note_field_use(b, overlap, line, col)
+    if mv == 0 or oc_field_move_only(sm, f) == 0
+        return
+    if dn != null
+        oc_error_move_from_drop(sm, line, col, e, dn, dl)
+        return
+    if path < 0
+        # Can't be tracked per path: the whole binding moves.
+        b.moved = 1
+        b.move_line = line
+        b.move_col = col
+        return
+    b.fmoved = own_set_or(b.fmoved, own_set_bit(path))
+    oc_fm_push(oc(), b.id, path, line, col)
+
+# Check one expression, in evaluation order.  `mv` is 1 when its value is
+# used by value (a move for a move-only binding).  Mirrors ritz0's
+# MoveChecker._check_expr.  Match / if-expression arms are checked as the
+# walk reaches them (own_check_arm_*).
+fn oc_walk(sm: *Sema, e: *Expr, mv: i32)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if mv == 1 and oc_moves_out(sm, e) == 1
+        let at: *Expr = own_start_of(e)
+        oc_error_move_out(sm, at.span.line, at.span.col)
+        return
+    if mv == 1 and oc_moves_element(sm, e) == 1
+        let eat: *Expr = own_start_of(e)
+        oc_error_move_out_of_element(sm, eat.span.line, eat.span.col)
+        return
+    if mv == 1
+        let g: *Expr = oc_moves_global(sm, e)
+        if g != null
+            oc_error_move_out_of_global(sm, g, e)
+            return
+    if k == EXPR_IDENT
+        if mv == 1 and oc_lent_payload(sm, e) == 1
+            oc_error_move_out(sm, e.span.line, e.span.col)
+            return
+        let b: *OcBind = oc_lookup(sm, e.ident_ptr, e.ident_len)
+        if b == null
+            return
+        if b.moved == 1
+            oc_error_use_at(sm, e.span.line, e.span.col, b, b.move_line, b.move_col)
+            return
+        if b.fmoved != 0
+            oc_error_field_use_at(sm, e.span.line, e.span.col, b, b.fmoved)
+            return
+        oc_note_use(b, e.span.line, e.span.col, 0)
+        if mv == 1
+            b.moved = 1
+            b.move_line = e.span.line
+            b.move_col = e.span.col
+    else if k == EXPR_UNARY
+        if (e.op == OP_ADDR or e.op == OP_ADDR_MUT) and e.operand != null and e.operand.kind == EXPR_IDENT
+            let bb: *OcBind = oc_lookup(sm, e.operand.ident_ptr, e.operand.ident_len)
+            if bb != null
+                if bb.moved == 1
+                    oc_error_borrow_at(sm, e.span.line, e.span.col, bb)
+                else if bb.fmoved != 0
+                    oc_error_borrow_field_at(sm, e.span.line, e.span.col, bb, bb.fmoved)
+                else
+                    oc_note_use(bb, e.span.line, e.span.col, 1)
+            return
+        oc_walk(sm, e.operand, 0)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        oc_walk(sm, e.left, 0)
+        oc_walk(sm, e.right, 0)
+    else if k == EXPR_MEMBER
+        oc_walk_member(sm, e, mv)
+    else if k == EXPR_CAST
+        # `v as T` hands its operand's value on (AGAST #2964).
+        oc_walk(sm, e.left, mv)
+    else if k == EXPR_TRY
+        oc_walk(sm, e.left, mv)
+    else if k == EXPR_CALL
+        # sizeof's operand is never evaluated (ritz0 #2124).
+        if e.func_name_len == 6 and name_eq(e.func_name, e.func_name_len, c"sizeof", 6) == 1
+            return
+        var p: *Param = null
+        let f: *FnDef = oc_call_fn(sm, e)
+        if f != null
+            p = f.params
+        oc_walk_args(sm, e.args, p)
+    else if k == EXPR_METHOD
+        # A by-value `self` takes the receiver (AGAST #2393); a call result
+        # as receiver of a method ritz1 can't find stays a move (#2262).
+        let m: *FnDef = oc_recv_def(sm, e)
+        var rmv: i32 = 0
+        let taken: *FnDef = rs_method_def(sm, e)
+        if taken == null and e.left != null and (e.left.kind == EXPR_CALL or e.left.kind == EXPR_METHOD)
+            rmv = 1
+        if taken != null and param_self_is_value(taken.params) == 1
+            rmv = 1
+        oc_check_ref_receiver(sm, e)
+        oc_walk(sm, e.left, rmv)
+        var mp: *Param = null
+        if m != null
+            mp = m.params
+            if mp != null
+                mp = mp.next
+        oc_walk_args(sm, e.args, mp)
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            oc_walk(sm, fi.value, 1)
+            fi = fi.next
+    else if k == EXPR_ARRAY_LIT
+        # A literal owns its elements (ritz0 #2238, AGAST #2266).
+        var el: *Expr = e.args
+        while el != null
+            if oc_moves_out(sm, el) == 1
+                let eat: *Expr = own_start_of(el)
+                oc_error_move_out(sm, eat.span.line, eat.span.col)
+            else
+                oc_walk(sm, el, 1)
+            el = el.next
+    else if k == EXPR_ARRAY_FILL
+        # `[v; N]` moves `v` into its element, as `[v]` does (AGAST #2976).
+        oc_walk(sm, e.left, 1)
+    else if k == EXPR_MATCH
+        oc_walk(sm, e.left, oc_scrutinee_mv(sm, e.left))
+    else if k == EXPR_IF
+        oc_walk(sm, e.left, 0)
+
+# How many `?` emitting `e` emits a `ret` for (each runs every deferred
+# statement first, own_before_ret): the ones oc_walk visits.
+fn oc_try_count(e: *Expr) -> i32
+    if e == null
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_TRY
+        return 1 + oc_try_count(e.left)
+    if k == EXPR_UNARY
+        return oc_try_count(e.operand)
+    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        return oc_try_count(e.left) + oc_try_count(e.right)
+    if k == EXPR_MEMBER or k == EXPR_CAST or k == EXPR_ARRAY_FILL or k == EXPR_MATCH or k == EXPR_IF
+        return oc_try_count(e.left)
+    if k == EXPR_CALL or k == EXPR_ARRAY_LIT
+        var n: i32 = 0
+        var a: *Expr = e.args
+        while a != null
+            n = n + oc_try_count(a)
+            a = a.next
+        return n
+    if k == EXPR_METHOD
+        var n: i32 = oc_try_count(e.left)
+        var a: *Expr = e.args
+        while a != null
+            n = n + oc_try_count(a)
+            a = a.next
+        return n
+    if k == EXPR_STRUCT_LIT
+        var n: i32 = 0
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            n = n + oc_try_count(fi.value)
+            fi = fi.next
+        return n
+    0
+
+# Each `?` in `e` leaves the fn: the deferred statements run there.
+fn oc_try_rets(sm: *Sema, e: *Expr)
+    var n: i32 = oc_try_count(e)
+    while n > 0
+        oc_before_ret(sm)
+        n -= 1
+
+# --- Statements -----------------------------------------------------------------------------
+
+# The binding a whole-binding assignment `x = v` writes, or null.
+fn oc_assign_target(sm: *Sema, stmt: *Stmt) -> *OcBind
+    if stmt.kind != STMT_ASSIGN
+        return null
+    if stmt.assign_target_len > 0
+        return oc_lookup(sm, stmt.assign_target, stmt.assign_target_len)
+    let t: *Expr = stmt.if_cond as *Expr
+    if t != null and t.kind == EXPR_IDENT
+        return oc_lookup(sm, t.ident_ptr, t.ident_len)
+    null
+
+# The statement's own expressions, before it runs (own_check_stmt on the
+# emitter).  Nested statement lists are checked as the walk reaches them.
+# Returns 1 when the statement stores a whole binding (`x = v`), which owns
+# its value again once the statement is done.  Mirrors ritz0's _check_stmt.
+fn oc_check_stmt(sm: *Sema, stmt: *Stmt)
+    if oc_checking(sm) == 0
+        return
+    let k: i32 = stmt.kind
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        oc_walk(sm, stmt.var_init, 1)
+    else if k == STMT_ASSIGN
+        let t: *Expr = stmt.if_cond as *Expr
+        # `x.f... = v` (AGAST #2168, #2242): v first, as ritz0 checks it, since
+        # it can move what is stored to; then the path is owned again.
+        var pb: *OcBind = null
+        var pf: *StructField = null
+        if stmt.assign_target_len == 0 and t != null and t.kind == EXPR_MEMBER
+            var dn: *u8 = null
+            var dl: i32 = 0
+            pf = oc_member_path(sm, t, @pb, @dn, @dl)
+        if pf == null and stmt.assign_target_len == 0 and t != null and t.kind != EXPR_IDENT
+            oc_walk(sm, t, 0)
+        oc_walk(sm, stmt.assign_value, 1)
+        if pf != null
+            var exact: i32 = 0
+            let path: i32 = oc_path_of(pb, t, @exact)
+            let root: *Expr = oc_member_root(t)
+            oc_store_path(sm, pb, path, exact, root.span.line, root.span.col)
+    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN
+        # `x[i] = v`, `x.f = v`, `x.f[i] = v`: x is used, not moved.
+        var base: *OcBind = null
+        if k == STMT_INDEX_ASSIGN
+            base = oc_lookup(sm, stmt.assign_target, stmt.assign_target_len)
+        else
+            base = oc_lookup(sm, stmt.var_name, stmt.var_name_len)
+        if k == STMT_LOCAL_FIELD_ASSIGN and base != null and base.count == 0
+            # `x.f = v`, as the path store above.
+            oc_walk(sm, stmt.assign_value, 1)
+            let path: i32 = oc_named_path(base, 0 - 1, stmt.assign_target, stmt.assign_target_len)
+            var exact: i32 = 0
+            if path >= 0
+                exact = 1
+            oc_store_path(sm, base, path, exact, stmt.span.line, stmt.span.col)
+            return
+        if k == STMT_LOCAL_FIELD_INDEX_ASSIGN and base != null and base.count == 0 and base.moved == 0
+            # AGAST #3434: `x.f[i] = v` uses the array `x.f` as a place.
+            let fpath: i32 = oc_named_path(base, 0 - 1, stmt.assign_target, stmt.assign_target_len)
+            var fexact: i32 = 0
+            if fpath >= 0
+                fexact = 1
+            let fover: i32 = oc_overlap(base, fpath, fexact)
+            if own_set_and(base.fmoved, fover) != 0
+                oc_error_field_use_at(sm, stmt.span.line, stmt.span.col, base, own_set_and(base.fmoved, fover))
+                return
+            oc_note_field_use(base, fover, stmt.span.line, stmt.span.col)
+        if base != null
+            oc_note_place_use(sm, base, stmt.span.line, stmt.span.col)
+        if k != STMT_LOCAL_FIELD_ASSIGN
+            oc_walk(sm, stmt.while_cond, 0)
+        oc_walk(sm, stmt.assign_value, 1)
+    else if k == STMT_MEMBER_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        oc_walk(sm, stmt.assign_value, 1)
+    else if k == STMT_RETURN
+        oc_walk(sm, stmt.return_value, 1)
+    else if k == STMT_EXPR
+        oc_walk(sm, stmt.expr, 0)
+    else if k == STMT_MATCH
+        # AGAST #2174: the scrutinee moves into the match.
+        oc_walk(sm, stmt.if_cond as *Expr, oc_scrutinee_mv(sm, stmt.if_cond as *Expr))
+    else if k == STMT_IF or k == STMT_ASSERT
+        oc_walk(sm, stmt.if_cond, 0)
+    else if k == STMT_WHILE
+        oc_walk(sm, stmt.while_cond, 0)
+    else if k == STMT_FOR
+        oc_walk(sm, stmt.for_start, 0)
+        oc_walk(sm, stmt.for_end, 0)
+
+# The `?`s the statement's own expressions hold, in the order emitting them
+# reaches each `ret`.
+fn oc_stmt_try_rets(sm: *Sema, stmt: *Stmt)
+    let k: i32 = stmt.kind
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        oc_try_rets(sm, stmt.var_init)
+    else if k == STMT_ASSIGN
+        if stmt.assign_target_len == 0
+            oc_try_rets(sm, stmt.if_cond as *Expr)
+        oc_try_rets(sm, stmt.assign_value)
+    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        oc_try_rets(sm, stmt.while_cond)
+        oc_try_rets(sm, stmt.assign_value)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+        oc_try_rets(sm, stmt.assign_value)
+    else if k == STMT_RETURN
+        oc_try_rets(sm, stmt.return_value)
+    else if k == STMT_EXPR
+        oc_try_rets(sm, stmt.expr)
+    else if k == STMT_MATCH
+        oc_try_rets(sm, stmt.if_cond as *Expr)
+    else if k == STMT_IF or k == STMT_ASSERT
+        oc_try_rets(sm, stmt.if_cond)
+    else if k == STMT_WHILE
+        oc_try_rets(sm, stmt.while_cond)
+    else if k == STMT_FOR
+        oc_try_rets(sm, stmt.for_start)
+        oc_try_rets(sm, stmt.for_end)
+
+# Everything the emitter did for `stmt` before its nested statement lists:
+# the check, the `?` exits, a `defer`'s registration, a `break` / `continue`
+# and a `return`'s exit.
+fn oc_stmt_begin(sm: *Sema, stmt: *Stmt)
+    oc_check_stmt(sm, stmt)
+    oc_lent_stmt(sm, stmt)
+    oc_stmt_try_rets(sm, stmt)
+    let k: i32 = stmt.kind
+    if k == STMT_DEFER
+        oc_defer(sm, stmt)
+    else if k == STMT_BREAK
+        oc_loop_jump(sm, 0)
+    else if k == STMT_CONTINUE
+        oc_loop_jump(sm, 1)
+    else if k == STMT_RETURN
+        oc_before_ret(sm)
+
+# After a statement (and its nested lists): a declaration registers what it
+# binds; `x = v` owns v; a `return` ends its block for the check, and so does
+# a `break` / `continue` in a loop.
+fn oc_stmt_end(sm: *Sema, stmt: *Stmt)
+    let o: *OcState = oc()
+    let k: i32 = stmt.kind
+    if k == STMT_VAR_DECL
+        oc_decl(sm, stmt)
+    else if k == STMT_TUPLE_DECL
+        # AGAST #3033: each name owns the element it was bound to.
+        var tup: *StructDef = null
+        var un: *u8 = null
+        var ul: i32 = 0
+        if oc_value_struct(sm, stmt.var_init, @un, @ul) == 1
+            tup = oc_find_struct(sm, un, ul)
+        else
+            tup = oc_tuple_def(sm, stmt.var_init)
+        var f: *StructField = null
+        if tup != null
+            f = tup.fields
+        oc_tuple_name(sm, stmt.var_name, stmt.var_name_len, f)
+        if f != null
+            f = f.next
+        oc_tuple_name(sm, stmt.assign_target, stmt.assign_target_len, f)
+        if f != null
+            f = f.next
+        var tn: *TupleName = stmt.tuple_more
+        while tn != null
+            oc_tuple_name(sm, tn.name, tn.len, f)
+            if f != null
+                f = f.next
+            tn = tn.next
+    else if k == STMT_ASSIGN
+        let b: *OcBind = oc_assign_target(sm, stmt)
+        if b != null
+            b.moved = 0
+            b.shadow = 0
+            b.fmoved = 0
+            b.fshadow = 0
+    if o.scope_count <= 0
+        return
+    if k == STMT_RETURN
+        oc_mark_dead(o)
+    else if (k == STMT_BREAK or k == STMT_CONTINUE) and o.loop_depth > 0
+        oc_mark_dead(o)
+
+# `c?` (AGAST #3974): the struct c's Result carries in Ok, or its Option in
+# Some, with c typed by the fn or method it calls; null otherwise.
+fn oc_try_struct(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+    let c: *Expr = e.left
+    if c == null
+        return null
+    var f: *FnDef = null
+    if c.kind == EXPR_CALL
+        f = oc_call_fn(sm, c)
+    else if c.kind == EXPR_METHOD
+        f = rs_method_def(sm, c)
+    if f == null or f.return_type_name == null or f.return_type_name_len <= 0
+        return null
+    let st: *StructDef = sema_tagged_payload(sm, f.return_type_name, f.return_type_name_len, 0)
+    if st == null
+        return null
+    *out_len = st.name_len
+    st.name
+
+# The struct a value `e` is, as far as this check can say: ref_check's typing
+# (oc_value_struct), a user enum's constructor, Sema's own type, `c?`.
+fn oc_struct_of(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+    var n: *u8 = null
+    var l: i32 = 0
+    if oc_value_struct(sm, e, @n, @l) == 1
+        *out_len = l
+        return n
+    n = oc_ctor_enum(sm, e, out_len)
+    if n != null
+        return n
+    var t: SemaTy
+    sema_expr_ty(sm, e, @t)
+    if t.kind == TYPE_STRUCT and t.name != null and t.name_len > 0
+        *out_len = t.name_len
+        return t.name
+    if e.kind == EXPR_TRY
+        return oc_try_struct(sm, e, out_len)
+    null
+
+# A `let (a, b, ..)` name just bound to the tuple's field `f` (null when
+# unknown): register it, typed as Sema's scope has it, else as `f`.
+fn oc_tuple_name(sm: *Sema, name: *u8, len: i32, f: *StructField)
+    if oc_register(sm, name, len) == 1 or f == null
+        return
+    if f.field_type == TYPE_STRUCT and oc_move_only(sm, f.field_type_name, f.field_type_name_len) == 1
+        oc_register_as(sm, name, len, f.field_type_name, f.field_type_name_len, 0)
+
+# A `let` / `var` just bound: register it.  §3.3 (LARB R39, AGAST #3377): `var
+# a: [N]S` with no `=`, S with drop glue, is refused at the name.
+fn oc_decl(sm: *Sema, stmt: *Stmt)
+    if stmt.var_init == null
+        oc_check_uninit_array(sm, stmt)
+    if stmt.var_declared_type == TYPE_VOID
+        let tup: *StructDef = oc_tuple_def(sm, stmt.var_init)
+        if tup != null
+            if oc_move_only(sm, tup.name, tup.name_len) == 1
+                oc_register_as(sm, stmt.var_name, stmt.var_name_len, tup.name, tup.name_len, 0)
+            return
+    if oc_register(sm, stmt.var_name, stmt.var_name_len) == 1 or stmt.var_declared_type != TYPE_VOID or stmt.var_init == null
+        return
+    # `let x = p.0` of a tuple only this check types (oc_tuple_def), and
+    # `var s = E.V` / `E.V(x)` / `V(x)` of a user enum.
+    var vn: *u8 = null
+    var vl: i32 = 0
+    var count: i32 = 0
+    let init: *Expr = stmt.var_init
+    if init.kind == EXPR_ARRAY_LIT
+        # AGAST #2266: `let a = [h.t]`, an array of what its elements are.
+        var el: *Expr = init.args
+        while el != null
+            if vn == null
+                vn = oc_struct_of(sm, el, @vl)
+            count += 1
+            el = el.next
+    else
+        vn = oc_struct_of(sm, init, @vl)
+    if vn != null and oc_move_only(sm, vn, vl) == 1
+        oc_register_as(sm, stmt.var_name, stmt.var_name_len, vn, vl, count)
+
+fn oc_check_uninit_array(sm: *Sema, stmt: *Stmt)
+    let loc: *LocalVar = oc_local(sm, stmt.var_name, stmt.var_name_len)
+    if loc == null or loc.var_type != TYPE_ARRAY
+        return
+    var count: i32 = 0
+    var len: i32 = 0
+    if oc_local_owns(sm, loc, @count, @len) == null
+        return
+    var line: i32 = stmt.name_span.line
+    var col: i32 = stmt.name_span.col
+    if line == 0
+        line = stmt.span.line
+        col = stmt.span.col
+    oc_error_at(sm, line, col)
+    oc_put_char('`')
+    oc_put_bytes(stmt.var_name, stmt.var_name_len)
+    oc_put_cstr(c"` must be initialised: its elements have `drop`\n")
+
+# --- Loops ---------------------------------------------------------------------------------
+
+# Enter a loop body.  Entering shadows every unmoved binding (all are outside
+# the loop), and every field of it not moved out, saving its state for
+# oc_loop_exit.  Returns the state to restore.
+fn oc_loop_enter() -> i32
+    let o: *OcState = oc()
+    let old: i32 = o.loop_base
+    o.loop_base = o.live_count
+    o.loop_depth = o.loop_depth + 1
+    if o.loop_depth >= o.loop_dcap
+        let dcap: i32 = o.loop_dcap * 2
+        o.loop_dstart = realloc(o.loop_dstart as *u8, (dcap as i64) * 4) as *i32
+        o.loop_dcap = dcap
+    let ld: *i32 = o.loop_dstart
+    ld[o.loop_depth] = o.defer_count
+    var i: i32 = 0
+    while i < o.live_count
+        let b: *OcBind = oc_live_at(o, i)
+        oc_ev_push(o, OC_EV_SAVE, b.id, b.shadow, b.moved, b.move_line, b.move_col, b.fmoved, b.fshadow)
+        b.shadow = 1 - b.moved
+        b.fshadow = 0
+        if b.moved == 0
+            b.fshadow = own_set_minus(own_set_range(b.path_count), b.fmoved)
+        i += 1
+    old
+
+fn oc_ev_find(o: *OcState, kind: i32, id: i32, depth: i32) -> *i32
+    var j: i32 = 0
+    while j < o.loop_ev_count
+        let ev: *i32 = oc_ev_at(o, j)
+        if ev[0] == kind and ev[1] == id and ev[2] == depth
+            return ev
+        j += 1
+    null
+
+# Report the recorded use `ev` of `b`, given its state at the loop head
+# (`head`: [moved, line, col, fmoved]).  Returns 1 if it was an error.
+fn oc_report_loop_use(sm: *Sema, ev: *i32, b: *OcBind, head: *i32) -> i32
+    let borrow: i32 = ev[3] & 1
+    if ev[4] != 0 and (((ev[3] & 2) != 0 and head[0] == 1) or own_set_and(head[3], ev[7]) != 0)
+        # In a deferred statement: reported at the `defer` (AGAST #2810).
+        oc_error_defer_at(sm, ev[4], ev[8], b)
+        return 1
+    if (ev[3] & 2) != 0 and head[0] == 1
+        if borrow == 1
+            oc_error_borrow_at(sm, ev[5], ev[6], b)
+        else
+            oc_error_use_at(sm, ev[5], ev[6], b, head[1], head[2])
+        return 1
+    let hit: i32 = own_set_and(head[3], ev[7])
+    if hit == 0
+        return 0
+    if borrow == 1
+        oc_error_borrow_field_at(sm, ev[5], ev[6], b, hit)
+    else
+        oc_error_field_use_at(sm, ev[5], ev[6], b, hit)
+    1
+
+# After the loop body (its scope already popped).  A binding (or a field of
+# it) reaches the head moved when the body falls through with it moved or a
+# `continue` leaves with it moved; then every use recorded while it was
+# shadowed is an error, as in ritz0's re-check of the body.
+fn oc_loop_exit(sm: *Sema, old: i32)
+    let o: *OcState = oc()
+    let depth: i32 = o.loop_depth
+    let n: i32 = o.live_count
+    var head: *i32 = null
+    if n > 0
+        head = malloc((n as i64) * 16) as *i32
+    var i: i32 = 0
+    while i < n
+        let b: *OcBind = oc_live_at(o, i)
+        let h: *i32 = head + i * 4
+        h[0] = 0
+        h[3] = 0
+        if o.last_pop_dead == 0
+            h[3] = b.fmoved
+            if b.moved == 1
+                h[0] = 1
+                h[1] = b.move_line
+                h[2] = b.move_col
+        let hv: *i32 = oc_ev_find(o, OC_EV_HEAD, b.id, depth)
+        if hv != null
+            if h[0] == 0 and hv[4] == 1
+                h[0] = 1
+                h[1] = hv[5]
+                h[2] = hv[6]
+            h[3] = own_set_or(h[3], hv[7])
+        i += 1
+    var j: i32 = 0
+    while j < o.loop_ev_count
+        let ev: *i32 = oc_ev_at(o, j)
+        if ev[0] == OC_EV_USE and ev[2] == depth
+            var bi: i32 = n - 1
+            while bi >= 0
+                let cb: *OcBind = oc_live_at(o, bi)
+                if cb.id == ev[1]
+                    break
+                bi -= 1
+            var reported: i32 = 0
+            if bi >= 0
+                reported = oc_report_loop_use(sm, ev, oc_live_at(o, bi), head + bi * 4)
+            if bi >= 0 and reported == 0 and depth > 1
+                # Still shadowed in the enclosing loop.
+                let sv: *i32 = oc_ev_find(o, OC_EV_SAVE, ev[1], depth)
+                if sv != null
+                    var a: i32 = ev[3] & 1
+                    if sv[3] == 1
+                        a = a | (ev[3] & 2)
+                    let fm: i32 = own_set_and(ev[7], sv[8])
+                    if (a & 2) != 0 or fm != 0
+                        ev[2] = depth - 1
+                        ev[3] = a
+                        ev[7] = fm
+        j += 1
+    i = 0
+    while i < n
+        let b: *OcBind = oc_live_at(o, i)
+        let h: *i32 = head + i * 4
+        let sv: *i32 = oc_ev_find(o, OC_EV_SAVE, b.id, depth)
+        let bv: *i32 = oc_ev_find(o, OC_EV_BREAK, b.id, depth)
+        var am: i32 = 0
+        var al: i32 = 0
+        var ac: i32 = 0
+        var fm: i32 = h[3]
+        if sv != null and sv[4] == 1
+            am = 1
+            al = sv[5]
+            ac = sv[6]
+        else if h[0] == 1
+            am = 1
+            al = h[1]
+            ac = h[2]
+        else if bv != null and bv[4] == 1
+            am = 1
+            al = bv[5]
+            ac = bv[6]
+        if sv != null
+            fm = own_set_or(fm, sv[7])
+        if bv != null
+            fm = own_set_or(fm, bv[7])
+        b.moved = am
+        if am == 1
+            b.move_line = al
+            b.move_col = ac
+        b.fmoved = fm
+        if sv != null
+            b.shadow = sv[3]
+            b.fshadow = sv[8]
+        i += 1
+    if head != null
+        free(head as *u8)
+    var w: i32 = 0
+    j = 0
+    while j < o.loop_ev_count
+        let ev: *i32 = oc_ev_at(o, j)
+        if ev[2] < depth
+            if w != j
+                memcpy(oc_ev_at(o, w) as *u8, ev as *u8, (OC_EV_INTS * 4) as i64)
+            w += 1
+        j += 1
+    o.loop_ev_count = w
+    o.loop_depth = depth - 1
+    o.loop_base = old
+
+# Before a `break` (is_continue 0) / `continue` (1) leaves the loop body: the
+# body's deferred statements run, and the (partly) moved outer bindings are
+# recorded.
+fn oc_loop_jump(sm: *Sema, is_continue: i32)
+    let o: *OcState = oc()
+    if o.loop_base < 0
+        return
+    if oc_scope_is_dead(o) == 1
+        return
+    let ld: *i32 = o.loop_dstart
+    let dbase: i32 = ld[o.loop_depth]
+    var snap: *i32 = null
+    if o.defer_count > dbase
+        snap = oc_snapshot()
+        oc_unwind(sm, dbase)
+    var kind: i32 = OC_EV_BREAK
+    if is_continue == 1
+        kind = OC_EV_HEAD
+    var i: i32 = 0
+    while i < o.loop_base and i < o.live_count
+        let b: *OcBind = oc_live_at(o, i)
+        if b.moved == 1 or b.fmoved != 0
+            let ev: *i32 = oc_ev_find(o, kind, b.id, o.loop_depth)
+            if ev == null
+                oc_ev_push(o, kind, b.id, 0, b.moved, b.move_line, b.move_col, b.fmoved, 0)
+            else
+                if ev[4] == 0 and b.moved == 1
+                    ev[4] = 1
+                    ev[5] = b.move_line
+                    ev[6] = b.move_col
+                ev[7] = own_set_or(ev[7], b.fmoved)
+        i += 1
+    if snap != null
+        oc_restore(snap)
+        free(snap as *u8)
+
+# --- Snapshots: `if` and arm merges (ritz0's If handling) ---------------------------------
+
+fn oc_snap_rec(snap: *i32, i: i32) -> *i32
+    snap + OC_SNAP_HDR + i * OC_SNAP_INTS
+
+fn oc_snapshot() -> *i32
+    let o: *OcState = oc()
+    if o.live_count == 0
+        return null
+    let snap: *i32 = malloc(((o.live_count * OC_SNAP_INTS + OC_SNAP_HDR) * 4) as i64) as *i32
+    snap[0] = o.live_count
+    snap[1] = o.fm_count
+    var i: i32 = 0
+    while i < o.live_count
+        let b: *OcBind = oc_live_at(o, i)
+        let r: *i32 = oc_snap_rec(snap, i)
+        r[0] = b.moved
+        r[1] = b.move_line
+        r[2] = b.move_col
+        r[3] = b.shadow
+        r[4] = b.fmoved
+        r[5] = b.fshadow
+        i += 1
+    snap
+
+# AGAST #2320: oc_fm_find answers with the latest record of a path, so a
+# state taken from a snapshot re-records the snapshot's own moves.
+fn oc_fm_repush(o: *OcState, id: i32, bits: i32, bound: i32, force: i32)
+    if bits == 0
+        return
+    let base: *i32 = o.fm_loc
+    var stale: i32 = force
+    var i: i32 = 0
+    while stale == 0 and i < bound
+        let r: *i32 = base + i * 4
+        if r[0] == id and own_set_has(bits, r[1]) == 1 and oc_fm_latest_below(o, id, r[1], bound) == i
+            if oc_fm_index(o, id, r[1]) != i
+                stale = 1
+        i += 1
+    if stale == 0
+        return
+    i = 0
+    while i < bound
+        let r: *i32 = o.fm_loc + i * 4
+        if r[0] == id and own_set_has(bits, r[1]) == 1 and oc_fm_latest_below(o, id, r[1], bound) == i
+            oc_fm_push(o, id, r[1], r[2], r[3])
+        i += 1
+
+fn oc_restore(snap: *i32)
+    if snap == null
+        return
+    let o: *OcState = oc()
+    var n: i32 = snap[0]
+    if n > o.live_count
+        n = o.live_count
+    var i: i32 = 0
+    while i < n
+        let b: *OcBind = oc_live_at(o, i)
+        let r: *i32 = oc_snap_rec(snap, i)
+        b.moved = r[0]
+        b.move_line = r[1]
+        b.move_col = r[2]
+        b.shadow = r[3]
+        b.fmoved = r[4]
+        b.fshadow = r[5]
+        oc_fm_repush(o, b.id, b.fmoved, snap[1], 0)
+        i += 1
+
+# Paths meet: what `into` holds is moved (shadowed) if it is on either path;
+# a binding moved on both keeps `into`'s move, as ritz0's _join keeps the
+# first path's.
+fn oc_join_snap(o: *OcState, into: *i32, other: *i32)
+    var n: i32 = into[0]
+    if other[0] < n
+        n = other[0]
+    if o.live_count < n
+        n = o.live_count
+    var i: i32 = 0
+    while i < n
+        let a: *i32 = oc_snap_rec(into, i)
+        let b: *i32 = oc_snap_rec(other, i)
+        if a[4] != 0 or b[4] != 0
+            let id: i32 = oc_live_at(o, i).id
+            oc_fm_repush(o, id, a[4], into[1], 1)
+            oc_fm_repush(o, id, own_set_minus(b[4], a[4]), other[1], 1)
+        if a[0] == 0 and b[0] == 1
+            a[0] = 1
+            a[1] = b[1]
+            a[2] = b[2]
+        a[3] = a[3] | b[3]
+        a[4] = own_set_or(a[4], b[4])
+        a[5] = own_set_or(a[5], b[5])
+        i += 1
+    into[1] = o.fm_count
+
+# Neither arm returned: a binding moved in the then-arm (`after_then`) is
+# moved after the `if` too (the else-arm's state is current).
+fn oc_merge_moved(after_then: *i32)
+    if after_then == null
+        return
+    let now: *i32 = oc_snapshot()
+    if now == null
+        return
+    oc_join_snap(oc(), after_then, now)
+    oc_restore(after_then)
+    free(now as *u8)
+
+# STMT_IF, after both arms: settle the move state per ritz0.
+fn oc_if_merge(before: *i32, after_then: *i32, then_dead: i32, has_else: i32, else_dead: i32)
+    if has_else == 0
+        if then_dead == 1
+            oc_restore(before)
+    else if then_dead == 0 and else_dead == 1
+        oc_restore(after_then)
+    else if then_dead == 0 and else_dead == 0
+        oc_merge_moved(after_then)
+    if before != null
+        free(before as *u8)
+    if after_then != null
+        free(after_then as *u8)
+
+# An arm that falls through joins its state into `*acc`.
+fn oc_arm_join(acc: **i32)
+    let o: *OcState = oc()
+    if o.last_pop_dead == 1
+        return
+    let now: *i32 = oc_snapshot()
+    if now == null
+        return
+    if *acc == null
+        *acc = now
+        return
+    oc_join_snap(o, *acc, now)
+    free(now as *u8)
+
+# The arms' result: the join, or (no arm falls through) the last arm's state.
+fn oc_arms_settle(before: *i32, acc: *i32)
+    if acc != null
+        oc_restore(acc)
+        free(acc as *u8)
+    if before != null
+        free(before as *u8)
+
+# --- Matches (AGAST #2174, #2178) ------------------------------------------------------------
+
+# 1 when `e` is a constructor that builds its enum where it stands.
+fn oc_scrutinee_builds(sm: *Sema, e: *Expr) -> i32
+    if e.kind == EXPR_CALL
+        if is_variant_carrier(e.func_name, e.func_name_len) == 1 or is_variant_null(e.func_name, e.func_name_len) == 1
+            return 1
+        var name: *u8 = null
+        var len: i32 = 0
+        user_variant_ctor_enum(e, @name, @len)
+        if name != null
+            return 1
+        if e.call_type_suffix_len == 0 and sema_find_fn(sm, e.func_name, e.func_name_len) == null
+            var vi: i32 = 0
+            if generic_enum_of_variant(e.func_name, e.func_name_len, @vi) >= 0
+                return 1
+        return 0
+    if e.kind == EXPR_METHOD
+        return rl_qualified_variant(sm, e)
+    0
+
+# 1 when the move check just moved `e`, a match scrutinee, by value.
+fn oc_scrutinee_moved(sm: *Sema, e: *Expr) -> i32
+    if oc_checking(sm) == 0
+        return 0
+    let k: i32 = e.kind
+    if k == EXPR_IDENT
+        let b: *OcBind = oc_lookup(sm, e.ident_ptr, e.ident_len)
+        if b != null and b.count == 0 and b.moved == 1
+            return 1
+        return 0
+    if k == EXPR_CALL
+        var len: i32 = 0
+        if oc_call_ret_type(sm, e, @len) != null
+            return 1
+        return oc_scrutinee_builds(sm, e)
+    if k == EXPR_METHOD
+        return oc_scrutinee_builds(sm, e)
+    if k == EXPR_MEMBER
+        var b: *OcBind = null
+        var dn: *u8 = null
+        var dl: i32 = 0
+        let f: *StructField = oc_member_path(sm, e, @b, @dn, @dl)
+        if f != null and dn == null and oc_field_move_only(sm, f) == 1
+            return 1
+    0
+
+# AGAST #2178: does a match on `e` own nothing because something else owns
+# the value?  ritz0's MoveChecker._lent_scrutinee_type.
+fn oc_match_lent(sm: *Sema, e: *Expr) -> i32
+    if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
+        return 1
+    if oc_through(sm, e) == 1 or oc_element_root(sm, e) != null
+        return 1
+    var r: *Expr = e
+    while r != null and (r.kind == EXPR_MEMBER or (r.kind == EXPR_UNARY and r.op == OP_DEREF))
+        if r.kind == EXPR_MEMBER
+            r = r.left
+        else
+            r = r.operand
+    if r == null or r.kind != EXPR_IDENT
+        return 0
+    let v: *SemaVar = sema_find_local(sm, r.ident_ptr, r.ident_len)
+    if v == null
+        return 0
+    let n: *RsNote = rs_note(sm, v)
+    if n == null
+        return 0
+    n.caller_place
+
+# The user enum a constructor `e` builds where it stands: `E.V`, `E.V(x)`,
+# or a variant only one enum declares, `V(x)`; null for any other `e`.
+fn oc_ctor_enum(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+    if e == null
+        return null
+    var l: *Expr = null
+    if e.kind == EXPR_MEMBER or e.kind == EXPR_METHOD
+        l = e.left
+    if l != null and l.kind == EXPR_IDENT and sema_find_local(sm, l.ident_ptr, l.ident_len) == null and user_enum_index(l.ident_ptr, l.ident_len) >= 0
+        *out_len = l.ident_len
+        return l.ident_ptr
+    if e.kind != EXPR_CALL
+        return null
+    var name: *u8 = null
+    var len: i32 = 0
+    user_variant_ctor_enum(e, @name, @len)
+    if name == null
+        return null
+    *out_len = len
+    name
+
+# A tagged constructor `Some(x)` / `Ok(x)` / `Err(x)` with a struct `x`: that
+# struct, the payload of the arm of its own variant (the emitter resolves the
+# rest of its enum from the arms); null otherwise.
+fn oc_tagged_ctor_payload(sm: *Sema, e: *Expr, out_len: *i32) -> *u8
+    if e == null or e.kind != EXPR_CALL
+        return null
+    if is_variant_carrier(e.func_name, e.func_name_len) == 0 and is_variant_null(e.func_name, e.func_name_len) == 0
+        return null
+    let a: *Expr = e.args
+    if a == null or a.next != null
+        return null
+    var n: *u8 = null
+    var l: i32 = 0
+    if oc_value_struct(sm, a, @n, @l) == 1
+        *out_len = l
+        return n
+    var t: SemaTy
+    sema_expr_ty(sm, a, @t)
+    if t.kind != TYPE_STRUCT or t.name == null or t.name_len <= 0
+        return null
+    *out_len = t.name_len
+    t.name
+
+# The enum a match on `scrut` is over, as the emitter resolves it: its type's
+# name; null when Sema can't say.
+fn oc_scrut_enum(sm: *Sema, typed: *Expr, out_len: *i32) -> *u8
+    var t: SemaTy
+    sema_expr_ty(sm, typed, @t)
+    if t.kind != TYPE_UNKNOWN and t.name != null and t.name_len > 0
+        *out_len = t.name_len
+        return t.name
+    let cn: *u8 = oc_ctor_enum(sm, typed, out_len)
+    if cn != null
+        return cn
+    # A binding this check registered with a type Sema's scope can't give, or
+    # a field of one (`p.0` of a tuple).
+    var vn: *u8 = null
+    var vl: i32 = 0
+    if (typed.kind == EXPR_IDENT or typed.kind == EXPR_MEMBER) and oc_value_struct(sm, typed, @vn, @vl) == 1
+        *out_len = vl
+        return vn
+    # `*p` of a `p: *E`: what ref_check's typing says it points at.
+    var env: RefEnv
+    var r: RefTy
+    if ref_ty_in(ref_env_of(@env, null, sm), typed, @r) == 0 or r.kind != TYPE_STRUCT or r.name_len <= 0
+        return null
+    *out_len = r.name_len
+    r.name
+
+# Before a match's arms: the match owns a scrutinee it moved.  The old
+# match_scrut goes on the hook stack for oc_match_end.
+fn oc_match_begin(sm: *Sema, scrut: *Expr)
+    let o: *OcState = oc()
+    oc_save(o, o.match_scrut as i64)
+    oc_save(o, o.scrut_name as i64)
+    oc_save(o, o.scrut_len as i64)
+    oc_save(o, o.scrut_ctor as i64)
+    o.match_scrut = 0 - 1
+    o.scrut_name = null
+    o.scrut_len = 0
+    o.scrut_ctor = null
+    if scrut == null
+        return
+    var typed: *Expr = scrut
+    if scrut.kind == EXPR_UNARY and (scrut.op == OP_ADDR or scrut.op == OP_ADDR_MUT) and scrut.operand != null
+        typed = scrut.operand
+    var len: i32 = 0
+    var name: *u8 = oc_scrut_enum(sm, typed, @len)
+    var ctor_pay: *u8 = null
+    var ctor_len: i32 = 0
+    if name == null
+        # AGAST #2419: `match Some(make(1))` owns the payload it builds.
+        ctor_pay = oc_tagged_ctor_payload(sm, typed, @ctor_len)
+        if ctor_pay != null and oc_move_only(sm, ctor_pay, ctor_len) == 1
+            name = ctor_pay
+            len = ctor_len
+            o.scrut_ctor = typed
+    o.scrut_name = name
+    o.scrut_len = len
+    if name == null or oc_move_only(sm, name, len) == 0
+        return
+    # `@Some(x)` borrows a value only this match holds (emit_match's owned).
+    var owned: *Expr = scrut
+    if typed != scrut and oc_scrutinee_builds(sm, typed) == 1
+        owned = typed
+    if oc_scrutinee_moved(sm, owned) == 0
+        if oc_match_lent(sm, owned) == 1
+            o.match_scrut = OC_MATCH_LENT
+        return
+    oc_push_scope()
+    let b: *OcBind = oc_new_bind(o)
+    b.type_name = name
+    b.type_name_len = len
+    o.match_scrut = o.live_count - 1
+
+# The struct an arm's payload binding holds: as sema_walk bound it
+# (sema_arm_payload_ty), else the payload of the arm's variant of the enum
+# oc_match_begin resolved; null when it holds none.
+fn oc_payload_struct(sm: *Sema, arm: *MatchArm, pv: *SemaVar, out_len: *i32) -> *u8
+    if pv.kind == TYPE_STRUCT and pv.type_name != null and pv.type_name_len > 0
+        *out_len = pv.type_name_len
+        return pv.type_name
+    let o: *OcState = oc()
+    let en: *u8 = o.scrut_name
+    let el: i32 = o.scrut_len
+    if en == null or el <= 0
+        return null
+    let ctor: *Expr = o.scrut_ctor
+    if ctor != null
+        # `Some(v)` of `match Some(make(1))`: the constructor's own payload.
+        if name_eq(arm.pattern_name, arm.pattern_name_len, ctor.func_name, ctor.func_name_len) == 0
+            return null
+        *out_len = el
+        return en
+    if is_tagged_enum_type(en, el) == 1
+        var is_err: i32 = 0
+        if name_eq(arm.pattern_name, arm.pattern_name_len, c"Err", 3) == 1 or name_eq(arm.pattern_name, arm.pattern_name_len, c"None", 4) == 1
+            is_err = 1
+        let st: *StructDef = sema_tagged_payload(sm, en, el, is_err)
+        if st == null
+            return null
+        *out_len = st.name_len
+        return st.name
+    if user_enum_index(en, el) < 0
+        return null
+    let uf: *StructField = user_enum_tuple_field(en, el, arm_variant_sel(en, el, arm))
+    if uf == null or uf.field_type != TYPE_STRUCT or uf.field_type_name_len <= 0
+        return null
+    *out_len = uf.field_type_name_len
+    uf.field_type_name
+
+# An arm bound `name` to a copy of the payload: when the match owns its
+# scrutinee and the payload is move-only, the binding owns it now; when the
+# match owns nothing, it is lent (AGAST #2178, Rust's E0507).
+fn oc_match_payload(sm: *Sema, arm: *MatchArm, name: *u8, len: i32)
+    let o: *OcState = oc()
+    if o.match_scrut < 0 and o.match_scrut != OC_MATCH_LENT
+        return
+    let vi: i32 = oc_var_index(sm, name, len)
+    if vi < 0
+        return
+    var plen: i32 = 0
+    let pname: *u8 = oc_payload_struct(sm, arm, @sm.scope[vi], @plen)
+    if pname == null
+        return
+    if o.match_scrut == OC_MATCH_LENT
+        if oc_move_only(sm, pname, plen) == 1
+            if o.lent_count >= o.lent_cap
+                let cap: i32 = o.lent_cap * 2
+                o.lent_vi = realloc(o.lent_vi as *u8, (cap as i64) * 4) as *i32
+                o.lent_name = realloc(o.lent_name as *u8, (cap as i64) * 8) as **u8
+                o.lent_cap = cap
+            let lvi: *i32 = o.lent_vi
+            let lname: **u8 = o.lent_name
+            let v: *SemaVar = @sm.scope[vi]
+            lvi[o.lent_count] = vi
+            lname[o.lent_count] = v.name
+            o.lent_count = o.lent_count + 1
+        return
+    if oc_move_only(sm, pname, plen) == 1
+        oc_register_as(sm, name, len, pname, plen, 0)
+
+# After the arms have met: forget the scrutinee where no arm took it, and
+# restore the enclosing match's state.
+fn oc_match_end(sm: *Sema)
+    let o: *OcState = oc()
+    if o.match_scrut >= 0
+        oc_pop_scope(sm)
+    o.scrut_ctor = oc_restore_saved(o) as *Expr
+    o.scrut_len = oc_restore_saved(o) as i32
+    o.scrut_name = oc_restore_saved(o) as *u8
+    o.match_scrut = oc_restore_saved(o) as i32
+
+# --- `defer` (LANGUAGE_SPEC §13.7, LARB R14, AGAST #1625) -----------------------------------
+#
+# Nothing runs at a `defer`: oc_defer registers it in the innermost block.
+# Every exit of that block then runs the statement as if it were written
+# there (oc_run_defer):
+#   - falling off the end: oc_pop_scope;
+#   - `break` / `continue`: oc_loop_jump, for the blocks inside the loop;
+#   - `return`, `?` and the fn's end: oc_before_ret, for every block.
+# What follows a `ret` (or a jump) is unreachable from it, so those moves
+# don't stay.
+
+fn oc_grow_defers(o: *OcState)
+    if o.defer_count < o.defer_cap
+        return
+    let cap: i32 = o.defer_cap * 2
+    o.defer_stmts = realloc(o.defer_stmts as *u8, (cap as i64) * 8) as **Stmt
+    o.defer_cap = cap
+
+# Run deferred statement `j` here: its statements are a block of their own.
+fn oc_run_defer(sm: *Sema, j: i32)
+    let o: *OcState = oc()
+    let ds: **Stmt = o.defer_stmts
+    let d: *Stmt = ds[j]
+    let saved_defer: *Stmt = o.cur_defer
+    let mark: i32 = sm.scope_top
+    oc_push_scope()
+    var st: *Stmt = d.while_body
+    while st != null
+        o.cur_defer = d
+        oc_replay_stmt(sm, st)
+        st = st.next
+    o.cur_defer = d
+    oc_pop_scope(sm)
+    sm.scope_top = mark
+    o.cur_defer = saved_defer
+
+# Leave the blocks holding defers[dfrom..]: each deferred statement, newest
+# first.
+fn oc_unwind(sm: *Sema, dfrom: i32)
+    let o: *OcState = oc()
+    var j: i32 = o.defer_count - 1
+    while j >= dfrom
+        oc_run_defer(sm, j)
+        j -= 1
+
+# A `ret` is emitted (a `return`, a `?`, the fn's end): every block is left,
+# so run every deferred statement, innermost first.  What follows a `ret` is
+# unreachable from it, so the moves don't stay.
+fn oc_before_ret(sm: *Sema)
+    let o: *OcState = oc()
+    if o.in_ret == 1 or o.defer_count == 0
+        return
+    if oc_scope_is_dead(o) == 1
+        return
+    o.in_ret = 1
+    let snap: *i32 = oc_snapshot()
+    oc_unwind(sm, 0)
+    oc_restore(snap)
+    if snap != null
+        free(snap as *u8)
+    o.in_ret = 0
+
+fn oc_defer_error(sm: *Sema, d: *Stmt, msg: *u8)
+    oc_error_at(sm, d.span.line, d.span.col)
+    oc_put_cstr(msg)
+    oc_put_cstr(c"\n")
+
+# What would leave a deferred statement: 0 nothing, 1 `return`, 2 `?`,
+# 3 `break`, 4 `continue`.  `loops` counts the loops entered inside it.
+const DEFER_OK: i32 = 0
+const DEFER_RETURN: i32 = 1
+const DEFER_TRY: i32 = 2
+const DEFER_BREAK: i32 = 3
+const DEFER_CONTINUE: i32 = 4
+
+fn oc_defer_leaves_arms(arms: *MatchArm, loops: i32) -> i32
+    var arm: *MatchArm = arms
+    while arm != null
+        var r: i32 = oc_defer_leaves_stmts(arm.body_stmts, loops)
+        if r == DEFER_OK
+            r = oc_defer_leaves_expr(arm.body, loops)
+        if r != DEFER_OK
+            return r
+        arm = arm.next
+    DEFER_OK
+
+fn oc_defer_leaves_list(e: *Expr, loops: i32) -> i32
+    var a: *Expr = e
+    while a != null
+        let r: i32 = oc_defer_leaves_expr(a, loops)
+        if r != DEFER_OK
+            return r
+        a = a.next
+    DEFER_OK
+
+fn oc_defer_leaves_expr(e: *Expr, loops: i32) -> i32
+    if e == null
+        return DEFER_OK
+    let k: i32 = e.kind
+    if k == EXPR_TRY
+        return DEFER_TRY
+    if k == EXPR_UNARY
+        return oc_defer_leaves_expr(e.operand, loops)
+    if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        let r: i32 = oc_defer_leaves_expr(e.left, loops)
+        if r != DEFER_OK
+            return r
+        return oc_defer_leaves_expr(e.right, loops)
+    if k == EXPR_MEMBER or k == EXPR_CAST
+        return oc_defer_leaves_expr(e.left, loops)
+    if k == EXPR_CALL or k == EXPR_ARRAY_LIT
+        return oc_defer_leaves_list(e.args, loops)
+    if k == EXPR_METHOD
+        let r: i32 = oc_defer_leaves_expr(e.left, loops)
+        if r != DEFER_OK
+            return r
+        return oc_defer_leaves_list(e.args, loops)
+    if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            let r: i32 = oc_defer_leaves_expr(fi.value, loops)
+            if r != DEFER_OK
+                return r
+            fi = fi.next
+        return DEFER_OK
+    if k == EXPR_MATCH or k == EXPR_IF
+        let r: i32 = oc_defer_leaves_expr(e.left, loops)
+        if r != DEFER_OK
+            return r
+        return oc_defer_leaves_arms(e.args as *MatchArm, loops)
+    DEFER_OK
+
+fn oc_defer_leaves_stmt(st: *Stmt, loops: i32) -> i32
+    let k: i32 = st.kind
+    if k == STMT_RETURN
+        return DEFER_RETURN
+    if k == STMT_BREAK
+        if loops == 0
+            return DEFER_BREAK
+        return DEFER_OK
+    if k == STMT_CONTINUE
+        if loops == 0
+            return DEFER_CONTINUE
+        return DEFER_OK
+    if k == STMT_EXPR
+        return oc_defer_leaves_expr(st.expr, loops)
+    if k == STMT_VAR_DECL or k == STMT_TUPLE_DECL
+        return oc_defer_leaves_expr(st.var_init, loops)
+    if k == STMT_IF
+        var r: i32 = oc_defer_leaves_expr(st.if_cond, loops)
+        if r == DEFER_OK
+            r = oc_defer_leaves_stmts(st.if_then, loops)
+        if r == DEFER_OK
+            r = oc_defer_leaves_stmts(st.if_else, loops)
+        return r
+    if k == STMT_ASSERT
+        return oc_defer_leaves_expr(st.if_cond, loops)
+    if k == STMT_WHILE
+        let r: i32 = oc_defer_leaves_expr(st.while_cond, loops)
+        if r != DEFER_OK
+            return r
+        return oc_defer_leaves_stmts(st.while_body, loops + 1)
+    if k == STMT_LOOP
+        return oc_defer_leaves_stmts(st.while_body, loops + 1)
+    if k == STMT_UNSAFE
+        return oc_defer_leaves_stmts(st.while_body, loops)   # a block, not a loop (#2248)
+    if k == STMT_ASM
+        # Control leaves an asm block at its end (§18.6, AGAST #3394).
+        return DEFER_OK
+    if k == STMT_FOR
+        var r: i32 = oc_defer_leaves_expr(st.for_start, loops)
+        if r == DEFER_OK
+            r = oc_defer_leaves_expr(st.for_end, loops)
+        if r == DEFER_OK
+            r = oc_defer_leaves_stmts(st.for_body, loops + 1)
+        return r
+    if k == STMT_MATCH
+        let r: i32 = oc_defer_leaves_expr(st.if_cond as *Expr, loops)
+        if r != DEFER_OK
+            return r
+        return oc_defer_leaves_arms(st.if_then as *MatchArm, loops)
+    if k == STMT_ASSIGN
+        if st.assign_target_len == 0
+            let r: i32 = oc_defer_leaves_expr(st.if_cond as *Expr, loops)
+            if r != DEFER_OK
+                return r
+        return oc_defer_leaves_expr(st.assign_value, loops)
+    if k == STMT_MEMBER_ASSIGN or k == STMT_LOCAL_FIELD_ASSIGN
+        return oc_defer_leaves_expr(st.assign_value, loops)
+    if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        let r: i32 = oc_defer_leaves_expr(st.while_cond, loops)
+        if r != DEFER_OK
+            return r
+        return oc_defer_leaves_expr(st.assign_value, loops)
+    DEFER_OK
+
+fn oc_defer_leaves_stmts(list: *Stmt, loops: i32) -> i32
+    var st: *Stmt = list
+    while st != null
+        let r: i32 = oc_defer_leaves_stmt(st, loops)
+        if r != DEFER_OK
+            return r
+        st = st.next
+    DEFER_OK
+
+# The error a `defer` can't be registered with, reported at the `defer`; 1 if
+# there was one.
+fn oc_defer_refusal(sm: *Sema, d: *Stmt) -> i32
+    let body: *Stmt = d.while_body
+    if body == null
+        oc_defer_error(sm, d, c"`defer` needs a statement")
+        return 1
+    if d.defer_is_block == 0 and (body.kind == STMT_VAR_DECL or body.kind == STMT_TUPLE_DECL)
+        oc_defer_error(sm, d, c"a deferred `let` or `var` would die at once")
+        return 1
+    let r: i32 = oc_defer_leaves_stmts(body, 0)
+    if r == DEFER_RETURN
+        oc_defer_error(sm, d, c"`return` can't leave a deferred statement")
+    else if r == DEFER_TRY
+        oc_defer_error(sm, d, c"`?` can't leave a deferred statement")
+    else if r == DEFER_BREAK
+        oc_defer_error(sm, d, c"`break` can't leave a deferred statement")
+    else if r == DEFER_CONTINUE
+        oc_defer_error(sm, d, c"`continue` can't leave a deferred statement")
+    if r != DEFER_OK
+        return 1
+    0
+
+# A STMT_DEFER is reached: register it with the innermost block.
+fn oc_defer(sm: *Sema, d: *Stmt)
+    let o: *OcState = oc()
+    if oc_defer_refusal(sm, d) == 1
+        return
+    if oc_scope_is_dead(o) == 1
+        return
+    oc_grow_defers(o)
+    let ds: **Stmt = o.defer_stmts
+    ds[o.defer_count] = d
+    o.defer_count = o.defer_count + 1
+
+# --- Arms ------------------------------------------------------------------------------------
+#
+# A match's or an if-expression's arms, as emit_match / emit_match_arm_body
+# take them.  The main walk calls these from sema_walk_arms; a deferred
+# statement's replay from oc_replay_arms.
+
+fn oc_arms_open(sm: *Sema, scrut: *Expr)
+    let o: *OcState = oc()
+    if scrut != null
+        oc_match_begin(sm, scrut)
+    oc_save(o, oc_snapshot() as i64)   # the state before the arms
+    oc_save(o, 0)                      # the join of those that fall through
+
+fn oc_arm_open(sm: *Sema)
+    let o: *OcState = oc()
+    let sv: *i64 = o.saved
+    oc_restore(sv[o.saved_count - 2] as *i32)
+    oc_push_scope()
+
+# The payload binding the arm just bound.
+fn oc_arm_bound(sm: *Sema, arm: *MatchArm)
+    if arm.pattern_kind == PAT_VARIANT and arm.pattern_inner_kind == PAT_IDENT
+        oc_match_payload(sm, arm, arm.pattern_inner_name, arm.pattern_inner_name_len)
+
+# The arm's value moves out (own_check_arm), and each `?` in it leaves the fn.
+# An expression arm of a match whose value is discarded (`discard` 1) reads
+# no `:&` referent (AGAST #3028).
+fn oc_arm_value(sm: *Sema, arm: *MatchArm, discard: i32)
+    if arm.is_pass == 1 or arm.body == null
+        return
+    if oc_checking(sm) == 1
+        oc_walk(sm, arm.body, 1)
+    if discard == 0 or arm.is_block == 1
+        oc_lent_walk(sm, arm.body, 1)
+    oc_try_rets(sm, arm.body)
+
+fn oc_arm_close(sm: *Sema)
+    let o: *OcState = oc()
+    oc_pop_scope(sm)
+    let sv: *i64 = o.saved
+    var acc: *i32 = sv[o.saved_count - 1] as *i32
+    oc_arm_join(@acc)
+    sv[o.saved_count - 1] = acc as i64
+
+fn oc_arms_close(sm: *Sema, scrut: *Expr)
+    let o: *OcState = oc()
+    let acc: *i32 = oc_restore_saved(o) as *i32
+    let before: *i32 = oc_restore_saved(o) as *i32
+    oc_arms_settle(before, acc)
+    if scrut != null
+        oc_match_end(sm)
+
+# --- Replaying a deferred statement ------------------------------------------------------------
+#
+# A deferred statement runs at each exit (oc_run_defer).  It is walked here as
+# the main walk's hooks walk any statement, binding its own `let`s in Sema's
+# scope so names resolve as the emitter's do there.  `return`, `?`, `break`
+# and `continue` can't leave one (oc_defer_refusal), so none reaches here.
+
+fn oc_replay_list(sm: *Sema, first: *Stmt)
+    var st: *Stmt = first
+    while st != null
+        oc_replay_stmt(sm, st)
+        st = st.next
+
+fn oc_replay_block(sm: *Sema, first: *Stmt)
+    let mark: i32 = sm.scope_top
+    oc_push_scope()
+    oc_replay_list(sm, first)
+    oc_pop_scope(sm)
+    sm.scope_top = mark
+
+fn oc_replay_loop(sm: *Sema, body: *Stmt)
+    let old: i32 = oc_loop_enter()
+    oc_replay_block(sm, body)
+    oc_loop_exit(sm, old)
+
+fn oc_replay_arms(sm: *Sema, scrut: *Expr, arms: *MatchArm)
+    oc_arms_open(sm, scrut)
+    var arm: *MatchArm = arms
+    while arm != null
+        let mark: i32 = sm.scope_top
+        oc_arm_open(sm)
+        if arm.pattern_kind == PAT_VARIANT
+            let nb: i32 = arm_bind_count(arm)
+            for k in 0..nb
+                arm_select_bind(arm, k)
+                if arm.pattern_inner_kind == PAT_IDENT
+                    var pt: SemaTy
+                    sema_arm_payload_ty(sm, arm, scrut, @pt)
+                    sema_bind_ty(sm, arm.pattern_inner_name, arm.pattern_inner_name_len, @pt, 0)
+                    oc_arm_bound(sm, arm)
+            arm_select_bind(arm, 0)
+        else if arm.pattern_kind == PAT_IDENT
+            sema_bind(sm, arm.pattern_name, arm.pattern_name_len)
+        oc_replay_list(sm, arm.body_stmts)
+        oc_arm_value(sm, arm, 0)
+        oc_replay_expr(sm, arm.body)
+        oc_arm_close(sm)
+        sm.scope_top = mark
+        arm = arm.next
+    oc_arms_close(sm, scrut)
+
+# The match and if expressions in `e`, in the order emitting it reaches them.
+fn oc_replay_expr(sm: *Sema, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if k == EXPR_MATCH or k == EXPR_IF
+        oc_replay_expr(sm, e.left)
+        var scrut: *Expr = null
+        if k == EXPR_MATCH
+            scrut = e.left
+        oc_replay_arms(sm, scrut, e.args as *MatchArm)
+    else if k == EXPR_BINARY or k == EXPR_INDEX or k == EXPR_RANGE
+        oc_replay_expr(sm, e.left)
+        oc_replay_expr(sm, e.right)
+    else if k == EXPR_UNARY
+        oc_replay_expr(sm, e.operand)
+    else if k == EXPR_CAST or k == EXPR_MEMBER or k == EXPR_TRY or k == EXPR_ARRAY_FILL
+        oc_replay_expr(sm, e.left)
+    else if k == EXPR_CALL or k == EXPR_ARRAY_LIT
+        var a: *Expr = e.args
+        while a != null
+            oc_replay_expr(sm, a)
+            a = a.next
+    else if k == EXPR_METHOD
+        oc_replay_expr(sm, e.left)
+        var a: *Expr = e.args
+        while a != null
+            oc_replay_expr(sm, a)
+            a = a.next
+    else if k == EXPR_STRUCT_LIT
+        var fi: *FieldInit = e.args as *FieldInit
+        while fi != null
+            oc_replay_expr(sm, fi.value)
+            fi = fi.next
+
+fn oc_replay_stmt(sm: *Sema, st: *Stmt)
+    oc_stmt_begin(sm, st)
+    let k: i32 = st.kind
+    if k == STMT_VAR_DECL
+        oc_replay_expr(sm, st.var_init)
+        var t: SemaTy
+        if st.var_declared_type != TYPE_VOID
+            t.kind = st.var_type
+            t.name = st.var_type_name
+            t.name_len = st.var_type_name_len
+            t.pointee = st.var_pointee_type
+            t.fn_sig = null
+        else
+            sema_expr_ty(sm, st.var_init, @t)
+        sema_bind_ty(sm, st.var_name, st.var_name_len, @t, st.var_is_let)
+    else if k == STMT_TUPLE_DECL
+        oc_replay_expr(sm, st.var_init)
+        sema_bind(sm, st.var_name, st.var_name_len)
+        sema_bind(sm, st.assign_target, st.assign_target_len)
+        var tn: *TupleName = st.tuple_more
+        while tn != null
+            sema_bind(sm, tn.name, tn.len)
+            tn = tn.next
+    else if k == STMT_IF
+        oc_replay_expr(sm, st.if_cond)
+        let before: *i32 = oc_snapshot()
+        oc_replay_block(sm, st.if_then)
+        let then_dead: i32 = oc().last_pop_dead
+        let after_then: *i32 = oc_snapshot()
+        var else_dead: i32 = 0
+        var has_else: i32 = 0
+        if st.if_else != null
+            has_else = 1
+            oc_restore(before)
+            oc_replay_block(sm, st.if_else)
+            else_dead = oc().last_pop_dead
+        oc_if_merge(before, after_then, then_dead, has_else, else_dead)
+    else if k == STMT_WHILE
+        oc_replay_expr(sm, st.while_cond)
+        oc_replay_loop(sm, st.while_body)
+    else if k == STMT_LOOP
+        oc_replay_loop(sm, st.while_body)
+    else if k == STMT_FOR
+        oc_replay_expr(sm, st.for_start)
+        oc_replay_expr(sm, st.for_end)
+        let for_mark: i32 = sm.scope_top
+        sema_bind(sm, st.for_var, st.for_var_len)
+        oc_replay_loop(sm, st.for_body)
+        sm.scope_top = for_mark
+    else if k == STMT_UNSAFE
+        let mark: i32 = sm.scope_top
+        oc_replay_list(sm, st.while_body)
+        sm.scope_top = mark
+    else if k == STMT_MATCH
+        oc_replay_expr(sm, st.if_cond as *Expr)
+        oc_replay_arms(sm, st.if_cond as *Expr, st.if_then as *MatchArm)
+    else if k == STMT_RETURN
+        oc_replay_expr(sm, st.return_value)
+    else if k == STMT_EXPR
+        oc_replay_expr(sm, st.expr)
+    else if k == STMT_ASSERT
+        oc_replay_expr(sm, st.if_cond)
+    else if k == STMT_ASSIGN
+        if st.assign_target_len == 0
+            oc_replay_expr(sm, st.if_cond as *Expr)
+        oc_replay_expr(sm, st.assign_value)
+    else if k == STMT_INDEX_ASSIGN or k == STMT_LOCAL_FIELD_INDEX_ASSIGN or k == STMT_MEMBER_INDEX_ASSIGN
+        oc_replay_expr(sm, st.while_cond)
+        oc_replay_expr(sm, st.assign_value)
+    else if k == STMT_LOCAL_FIELD_ASSIGN or k == STMT_MEMBER_ASSIGN
+        oc_replay_expr(sm, st.assign_value)
+    oc_stmt_end(sm, st)
+
+# =============================================================================
+# The hooks sema_walk calls
+# =============================================================================
+
+fn oc_muted() -> i32
+    (oc().mute > 0) as i32
+
+# The fn body begins, its params bound: the fn's outermost block, holding its
+# by-value move-only params, which the callee owns.
+pub fn own_check_begin_fn(sm: *Sema, f: *FnDef)
+    let o: *OcState = oc()
+    o.live_count = 0
+    o.scope_count = 0
+    o.loop_base = 0 - 1
+    o.loop_ev_count = 0
+    o.loop_depth = 0
+    o.last_pop_dead = 0
+    o.fm_count = 0
+    o.match_scrut = 0 - 1
+    o.defer_count = 0
+    o.cur_defer = null
+    o.in_ret = 0
+    o.mute = 0
+    o.lent_count = 0
+    o.block_count = 0
+    o.saved_count = 0
+    o.last_line = 0
+    o.last_col = 0
+    f.own_binds = null
+    oc_push_scope()
+    var p: *Param = f.params
+    while p != null
+        if p.param_type == TYPE_STRUCT or p.param_type == TYPE_ARRAY
+            oc_register(sm, p.name, p.name_len)
+        p = p.next
+    o.body_pending = OC_BLOCK_BODY
+
+# The fn is done (its `ret` ran its deferred statements at the body's end,
+# own_check_block_leave).
+pub fn own_check_end_fn(sm: *Sema, f: *FnDef)
+    let o: *OcState = oc()
+    o.live_count = 0
+    o.scope_count = 0
+    o.defer_count = 0
+
+# A statement list begins (sema_walk_stmts): a block of its own, except the
+# fn body (own_check_begin_fn's) and an `unsafe` block (own_check_unsafe).
+pub fn own_check_block_enter(sm: *Sema)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    if o.body_pending != 0
+        oc_block_push(o, o.body_pending)
+        o.body_pending = 0
+        return
+    oc_block_push(o, OC_BLOCK_SCOPE)
+    oc_push_scope()
+
+# The statement list ends, with its bindings still in Sema's scope.
+pub fn own_check_block_leave(sm: *Sema)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    let kind: i32 = oc_block_pop(o)
+    if kind == OC_BLOCK_SCOPE
+        oc_pop_scope(sm)
+    else if kind == OC_BLOCK_BODY
+        # The fn's own `ret`, with the body's bindings still in scope.
+        oc_before_ret(sm)
+
+# The next statement list is an `unsafe` block's: no block of its own.
+pub fn own_check_unsafe()
+    let o: *OcState = oc()
+    if o.mute == 0
+        o.body_pending = OC_BLOCK_UNSAFE
+
+# A `defer` body: the walk visits it where it is written, the emitter only
+# at its exits; `delta` +1 before, -1 after.
+pub fn own_check_mute(delta: i32)
+    let o: *OcState = oc()
+    o.mute = o.mute + delta
+
+# Before a statement: its own expressions are checked (own_check_stmt on the
+# emitter), and a `defer` registers.  `fn_tail` is 1 for the value tail of a
+# fn that returns one: that is a move (own_check_tail).
+pub fn own_check_stmt(sm: *Sema, st: *Stmt, fn_tail: i32)
+    if oc_muted() == 1
+        return
+    if fn_tail == 1 and st.kind == STMT_EXPR
+        if oc_checking(sm) == 1
+            oc_walk(sm, st.expr, 1)
+        oc_lent_value_stmt(sm, st.expr)
+        oc_lent_walk(sm, st.expr, 1)
+        oc_try_rets(sm, st.expr)
+        return
+    oc_stmt_begin(sm, st)
+
+# After a statement and its nested lists.
+pub fn own_check_after(sm: *Sema, st: *Stmt)
+    if oc_muted() == 1
+        return
+    oc_stmt_end(sm, st)
+
+# Around a statement `if`'s arms: the then-arm's state is merged with the
+# else-arm's (oc_if_merge).
+pub fn own_check_if_then(sm: *Sema, st: *Stmt)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    oc_save(o, oc_snapshot() as i64)
+
+pub fn own_check_if_else(sm: *Sema, st: *Stmt)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    let then_dead: i32 = o.last_pop_dead
+    oc_save(o, then_dead as i64)
+    oc_save(o, oc_snapshot() as i64)
+    if st.if_else != null
+        let sv: *i64 = o.saved
+        oc_restore(sv[o.saved_count - 3] as *i32)
+
+pub fn own_check_if_end(sm: *Sema, st: *Stmt)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    var else_dead: i32 = 0
+    var has_else: i32 = 0
+    if st.if_else != null
+        has_else = 1
+        else_dead = o.last_pop_dead
+    let after_then: *i32 = oc_restore_saved(o) as *i32
+    let then_dead: i32 = oc_restore_saved(o) as i32
+    let before: *i32 = oc_restore_saved(o) as *i32
+    oc_if_merge(before, after_then, then_dead, has_else, else_dead)
+
+# Around a loop's body (`while`, `for`, `loop`).
+pub fn own_check_loop_enter(sm: *Sema)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    oc_save(o, oc_loop_enter() as i64)
+
+pub fn own_check_loop_exit(sm: *Sema)
+    let o: *OcState = oc()
+    if o.mute > 0
+        return
+    oc_loop_exit(sm, oc_restore_saved(o) as i32)
+
+# A match's (scrut != null) or an if-expression's arms.
+pub fn own_check_arms_begin(sm: *Sema, scrut: *Expr)
+    if oc_muted() == 1
+        return
+    oc_arms_open(sm, scrut)
+
+pub fn own_check_arm_begin(sm: *Sema)
+    if oc_muted() == 1
+        return
+    oc_arm_open(sm)
+
+pub fn own_check_arm_bound(sm: *Sema, arm: *MatchArm)
+    if oc_muted() == 1
+        return
+    oc_arm_bound(sm, arm)
+
+pub fn own_check_arm_value(sm: *Sema, arm: *MatchArm, discard: i32)
+    if oc_muted() == 1
+        return
+    oc_arm_value(sm, arm, discard)
+
+pub fn own_check_arm_end(sm: *Sema)
+    if oc_muted() == 1
+        return
+    oc_arm_close(sm)
+
+pub fn own_check_arms_end(sm: *Sema, scrut: *Expr)
+    if oc_muted() == 1
+        return
+    oc_arms_close(sm, scrut)
+
+# The walk is done: print the move check's errors if no other check reported
+# one (the emitter only ran on a module Sema passed), counting them.
+pub fn own_check_flush(sm: *Sema)
+    let o: *OcState = oc()
+    if sm.error_count == 0 and o.errors > 0
+        sys_write(STDERR, o.out, o.out_len)
+        sm.error_count = sm.error_count + o.errors
+    o.out_len = 0
+    o.errors = 0
