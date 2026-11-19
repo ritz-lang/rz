@@ -133,6 +133,10 @@ DIAGNOSTICS = {
     "assign": (_fn("var n: i32 = 0\nn = big()"), 3, 9, "`n` is `i32`"),
     "arg":    (_fn("let r = take(big())"), 2, 18, "argument 1 of `take` is `i32`"),
     "field":  (_fn("var p = P { x: 0 }\np.x = big()"), 3, 11, "`p.x` is `i32`"),
+    # A store through an explicit deref names the place as written through
+    # the pointer, `*p.x`, at the value (#4240).
+    "field_through_deref": (_fn("var q = P { x: 0 }\nlet p: *P = @q\n(*p).x = big()"),
+                            4, 14, "`*p.x` is `i32`"),
     # An async fn's result is lowered to a store into its future's
     # `__result`; the error names the fn, as a plain `return` does (#4166).
     "async_return": ("async fn f() -> i32\n    return big()\n", 2, 12, "`f` returns `i32`"),

@@ -66,7 +66,8 @@ struct SlotWords
     # struct; SN_ARG: the index.
     base: *u8
     base_len: i32
-    shape: i32       # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`
+    # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`, 4 `*base.name`
+    shape: i32
     index: i32
 
 # Where a value is reported: ritz0's _value_span (a binary at its left
@@ -104,9 +105,9 @@ fn sn_print_slot(w: *SlotWords)
         eprints_cstr(c"the place assigned is `")
         return
     eprint_char('`')
-    if w.shape == 3
+    if w.shape == 3 or w.shape == 4
         eprint_char('*')
-    if w.shape == 1
+    if w.shape == 1 or w.shape == 4
         sn_print(w.base, w.base_len)
         eprint_char('.')
     sn_print(w.name, w.name_len)
@@ -228,14 +229,16 @@ pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
         if f != null
             slot = narrow_known(f.field_type)
     else if k == STMT_MEMBER_ASSIGN
-        # `p.f = v`, the pointer expression in if_cond.
+        # `(*p).f = v`, the pointer expression in if_cond.  ritz0 names the
+        # place as written through the pointer, "`*p.f` is" (AGAST #4240), as
+        # it does the async lowering's `self.<local> = v` stores (`*self.n`).
         let pe: *Expr = st.if_cond as *Expr
         if pe != null and pe.kind == EXPR_IDENT
             w.base = pe.ident_ptr
             w.base_len = pe.ident_len
             w.name = st.assign_target
             w.name_len = st.assign_target_len
-            w.shape = 1
+            w.shape = 4
             let f: *StructField = sn_local_field(sm, pe.ident_ptr, pe.ident_len, st.assign_target, st.assign_target_len)
             if f != null
                 slot = narrow_known(f.field_type)
@@ -250,7 +253,8 @@ pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
 #
 # The lowering sets no flag on the poll (and clears is_async), so it is known
 # by its shape: a written `(*self).__result = v` takes this route too, and
-# keeps its place wording unless its fn is `<f>_poll(self: *<f>_Future)`.
+# keeps its place wording, "`*self.__result` is", unless its fn is
+# `<f>_poll(self: *<f>_Future)`.
 fn sn_async_result(sm: *Sema, pe: *Expr, w: *SlotWords)
     if name_eq(pe.ident_ptr, pe.ident_len, c"self", 4) == 0 or name_eq(w.name, w.name_len, c"__result", 8) == 0
         return
