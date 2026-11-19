@@ -173,7 +173,10 @@ still run mid-lowering on `*EmitterState`, and
 - `bool_check` — `bool` is its own type: conditions and `and` / `or` / `not`
   take bool (LARB R4). `bool_kind` is the emitter's copy of its inference.
 
-- `call_check` — a call's arguments fit its callee.
+- `call_check` — a call's arguments fit its callee: its count, each argument's
+  kind, and what a pointer or array argument points at ("argument N of `f`
+  has the wrong type", AGAST #4173; the emitter keeps only the `:&` borrow
+  check).
 
 - `deref_field` — `.` through a struct's `Deref` / `DerefMut` (§7.7, R17).
   Sema also resolves such a `.` into step calls, each annotated

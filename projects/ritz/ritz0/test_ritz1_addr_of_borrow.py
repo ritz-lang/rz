@@ -1027,10 +1027,13 @@ def test_ritz1_refuses_a_borrow_of_another_type(ritz1_bin, tmp_path):
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, "wrong", WRONG_POINTEE)
     assert comp.returncode != 0
     assert not ll.exists()
-    # The slot check, on Sema since AGAST #4011, refuses `@c` first and stops
-    # the compile before the emitter's "argument 1 of `h` has the wrong type".
-    assert re.search(r"main\.ritz:\d+:14: error: a reference to one type doesn't fit a reference "
-                     r"to another: cast it with `as`", comp.stdout + comp.stderr), comp.stdout + comp.stderr
+    # The slot check refuses `@c`, and the call check names the callee and
+    # argument at the same call: both on Sema (AGAST #4011, #4173), in walk order.
+    out = comp.stdout + comp.stderr
+    slot = re.search(r"main\.ritz:(\d+):14: error: a reference to one type doesn't fit a reference "
+                     r"to another: cast it with `as`", out)
+    call = re.search(r"main\.ritz:(\d+):\d+: error: argument 1 of `h` has the wrong type: D\* != C\*", out)
+    assert slot and call and slot[1] == call[1] and slot.start() < call.start(), out
 
 
 @pytest.mark.integration

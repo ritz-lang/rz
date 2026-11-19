@@ -253,7 +253,7 @@ WHOLE_OPS = {
     # ref_behind / array_place_shape: `*p` read as a `[3]S`.
     "load_whole_let": "    var z: [3]S = *P\n    return z[1].b\n",
     "load_whole_assign": "    var z: [3]S\n    z = *P\n    return z[1].b\n",
-    # check_array_ref_arg: `P` into a `*[3]S` param.
+    # call_check.ritz's ca_array_ref (AGAST #4173): `P` into a `*[3]S` param.
     "call_ptr": "    return g(P)\n",
 }
 

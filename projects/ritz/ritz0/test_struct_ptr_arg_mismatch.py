@@ -184,13 +184,15 @@ def test_struct_ptr_arg_mismatch_rejected(compiler, case, tmp_path):
     assert proc.returncode != 0, f"{compiler} accepted a struct-pointer mismatch ({case}):\n{out}"
     assert re.search(rf"t\.ritz:{line}\b", out), (
         f"{compiler}: diagnostic not located at t.ritz:{line}:\n{out[-2000:]}")
-    # ritz1's slot check, on Sema since AGAST #4011, refuses an `@x` argument
-    # first, in ritz0's referent words, and stops the compile before the
-    # emitter's call check names the callee and argument.
-    if compiler != "ritz0" and re.search(rf"t\.ritz:{line}:\d+: error: " + re.escape(OTHER_REFERENT), out):
-        assert case in SLOT_FIRST, f"{compiler}: {case} is refused by the slot check:\n{out[-2000:]}"
-        return
-    assert case not in SLOT_FIRST or compiler == "ritz0", f"{compiler}: {case} isn't the slot check's:\n{out[-2000:]}"
+    # ritz1's slot check refuses an `@x` argument of another type, in ritz0's
+    # referent words, and its call check names the callee and argument at the
+    # same call: both on Sema (AGAST #4011, #4173), in walk order.
+    slot = re.search(rf"t\.ritz:{line}:\d+: error: " + re.escape(OTHER_REFERENT), out)
+    if compiler != "ritz0":
+        assert (slot is not None) == (case in SLOT_FIRST), f"{compiler}: {case}:\n{out[-2000:]}"
+        call = re.search(rf"t\.ritz:{line}:\d+: error: argument {argno} of `{callee}` has the wrong type", out)
+        assert call, f"{compiler}: no call check naming `{callee}` and argument {argno}:\n{out[-2000:]}"
+        assert slot is None or slot.start() < call.start(), f"{compiler}: not in walk order:\n{out[-2000:]}"
     assert callee in out, f"{compiler}: diagnostic does not name `{callee}`:\n{out[-2000:]}"
     assert re.search(rf"argument {argno}\b", out), (
         f"{compiler}: diagnostic does not name argument {argno}:\n{out[-2000:]}")

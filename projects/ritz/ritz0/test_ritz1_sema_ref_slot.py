@@ -177,6 +177,15 @@ def test_a_slot_error_stops_the_compile_before_emission(request, tmp_path, compi
     assert not bad, f"{compiler}:\n" + "\n".join(bad)
 
 
+# AGAST #4173: rows whose argument the call check refuses too, at the same
+# call, after the slot error (walk order): its line:col and words.
+NOT_AN_ARRAY_PARAM = "argument 1 of `g` has the wrong type: the parameter doesn't take a whole array"
+AND_THE_CALL = {
+    "lent_array_bare": ("5:5", NOT_AN_ARRAY_PARAM),
+    "whole_array_into_pointer": ("6:5", NOT_AN_ARRAY_PARAM),
+}
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_the_rules_reach_each_fact_sema_learned(request, tmp_path, compiler):
@@ -190,6 +199,10 @@ def test_the_rules_reach_each_fact_sema_learned(request, tmp_path, compiler):
         out = comp.stdout + comp.stderr
         line, col = (int(n) for n in at.split(":"))
         want = [(f"{_L + line - 1}:{col}", words)]
+        if name in AND_THE_CALL:
+            call_at, call_words = AND_THE_CALL[name]
+            call_line, call_col = (int(n) for n in call_at.split(":"))
+            want.append((f"{_L + call_line - 1}:{call_col}", call_words))
         found = re.findall(_FOUND, out)
         if comp.returncode == 0 or found != want:
             bad.append(f"{name}: wanted {want}, got:\n{out}")

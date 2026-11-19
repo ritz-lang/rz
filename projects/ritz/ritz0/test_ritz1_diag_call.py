@@ -72,7 +72,7 @@ fn main() -> i32
     a.cmp(b)
     0
 """, 7, 7, "no method `cmp` on `Foo`: declare it in `impl Foo`"),
-    # eprint_arg_type_error (array_arg_error), at the call.
+    # call_check.ritz's ca_array (AGAST #4173), at the call.
     "arg_type": ("""\
 fn f(a: [3]i32) -> i32
     a[0]

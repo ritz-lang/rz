@@ -1460,9 +1460,9 @@ def test_ritz0_refuses(tmp_path, name):
     assert comp.returncode != 0, "ritz0 now takes this: it isn't a refusal to match"
 
 
-# These `@x` arguments are refused first by the slot checks, on Sema since
-# AGAST #4011 (ref_rules' words), which stop the compile before the emitter's
-# "argument N has the wrong type".
+# These `@x` arguments are refused by the slot checks too (ref_rules' words),
+# and by the call check's "argument N has the wrong type": both on Sema
+# (AGAST #4011, #4173), in walk order where they're at the same call.
 OTHER_TYPE = "a reference to one type doesn't fit a reference to another: cast it with `as`"
 SHARED_INTO_MUT = "`@x` is shared and doesn't fit an `@&T` or `:&` slot: write `@&x`"
 REFUSED_ON_SEMA = {
@@ -1497,12 +1497,17 @@ REFUSED_ON_SEMA = {
 @pytest.mark.parametrize("name", sorted(REFUSED))
 def test_ritz1_refuses_at_the_line(ritz1_bin, tmp_path, name):
     pattern, program = REFUSED[name]
-    if name in REFUSED_ON_SEMA:
-        pattern = r"main\.ritz:\d+:\d+: error: " + re.escape(REFUSED_ON_SEMA[name])
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, name, TYPES + program)
+    out = comp.stdout + comp.stderr
     assert comp.returncode != 0
     assert not ll.exists()
-    assert re.search(pattern, comp.stdout + comp.stderr), comp.stdout + comp.stderr
+    call = re.search(pattern, out)
+    assert call, out
+    if name in REFUSED_ON_SEMA:
+        slot = re.search(r"main\.ritz:(\d+):\d+: error: " + re.escape(REFUSED_ON_SEMA[name]), out)
+        assert slot, out
+        line = re.match(r"main\.ritz:(\d+):", call[0])[1]
+        assert slot[1] != line or slot.start() < call.start(), f"not in walk order:\n{out}"
 
 
 # ritz0 gives 3 for these.  ritz1 refused them, located, until AGAST #3634: a

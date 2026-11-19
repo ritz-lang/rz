@@ -11,6 +11,8 @@
 #           (a nameless callee is `<expression>`, as in ritz0; #3348)
 #   private "`f` is private to a.ritz; mark it `pub` (#3413)", at the call, and
 #           a note at the declaration (AGAST #3419, LARB R45a; ritz0's #3418)
+#   points  "argument N of `f` has the wrong type: T* != S*" / an array's
+#           mismatch, at the call (AGAST #4173; "What an argument points at")
 #
 # AGAST #3503 (#1816): these run on Sema, from sema_walk at each call, not in
 # the emitter.  A refused call stops the compile before emission, so the
@@ -61,6 +63,8 @@ import sema
 import sema_type
 import bool_check    # BK_*, bk_of_type, sema_bool_kind and its sbk_* readers
 import tail_value    # tail_note_callee (AGAST #3511)
+import ref_check     # RefEnv, ref_local_in, rs_field (AGAST #4173)
+import emitter_expr_call  # ArrayDims, lent_self_call_view_in (AGAST #4173)
 import ritzlib.memory
 import ritzlib.str
 
@@ -586,6 +590,7 @@ fn cc_method(sm: *Sema, e: *Expr, fd: *FnDef, recv: i32)
     if recv == 1
         p = p.next
     cc_kinds(sm, e.ident_ptr, e.ident_len, 1 + recv, p, e.args)
+    ca_args(sm, e, e.ident_ptr, e.ident_len, 1 + recv, p, e.args)   # AGAST #4173
 
 # --- Free calls ------------------------------------------------------------------
 
@@ -729,6 +734,7 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
         let sig: *FnDef = sbk_value_fn_sig(sm, e.left)
         if sig != null and cc_arity(sm, e.span.line, e.span.col, c"<expression>", 12, sig, e.args) == 0
             cc_kinds(sm, c"<expression>", 12, 1, sig.params, e.args)
+            ca_args(sm, e, c"<expression>", 12, 1, sig.params, e.args)
         return
     if cc_variant_ctor(sm, e) == 1
         return
@@ -760,6 +766,12 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
     # that param is a bare `self:&` or an `@&C`, neither of which cc_kind
     # judges, so it needs no lent view here.
     cc_kinds(sm, full, full_len, 1, fd.params, e.args)
+    # What each argument points at (AGAST #4173), against the params the
+    # emitter lowers the call with: `C_get(c)` lends c to a `self:&`.
+    var cf: *FnDef = fd
+    if v == null
+        cf = lent_self_call_view_in(sm.module, fd)
+    ca_args(sm, e, e.func_name, e.func_name_len, 1, cf.params, e.args)
 
 # --- Method calls ----------------------------------------------------------------
 
@@ -884,3 +896,436 @@ fn cc_boxed_args(sm: *Sema, e: *Expr, params: *Param, span_ok: i32)
         p = p.next
         a = a.next
         argno = argno + 1
+
+# --- What an argument points at (AGAST #4173) ------------------------------------
+#
+# The emitter's call check, on Sema: an argument that isn't what its param
+# points at is "argument N of `f` has the wrong type", at the call, naming the
+# callee and the argument as ritz0 does (#1366).  It printed after the slot
+# checks' line on the emitter; since those moved to Sema (#4011) and stop the
+# compile, it is said here, after them, in walk order.
+#
+#   a struct pointer   `p: *T` / `@T` / `@&T` given `@x`, `@&x` or a pointer
+#                      local of another struct S: "T* != S*" (AGAST #1948)
+#   an array           a whole array where the param takes none, a length
+#                      that isn't a `[N]T` param's, an array that isn't the
+#                      one an `a:& [N]T` / `@[N]T` / `@&[N]T` points at, or no
+#                      array at all (#2287, #2290); `@x` of a `[N]T` not of
+#                      u8 / i8 into a StrView, at the argument (#2305, #3349)
+#
+# Types are read off the image of each local the emitter will make (RsNote.loc,
+# ref_local_in), globals and fields as the emitter reads them.  What that
+# can't type stays unjudged.  A bare place into a `:&` param that the
+# emitter's borrow check refuses (a temporary, through an `@T`) is left to it.
+
+fn ca_local(sm: *Sema, e: *Expr) -> *LocalVar
+    if e == null or e.kind != EXPR_IDENT
+        return null
+    var env: RefEnv
+    var is_local: i32 = 0
+    ref_local_in(ref_env_of(@env, null, sm), e.ident_ptr, e.ident_len, @is_local)
+
+# 1 when `e` names a local, typed or not.
+fn ca_is_local(sm: *Sema, e: *Expr) -> i32
+    (e != null and e.kind == EXPR_IDENT and sema_find_local(sm, e.ident_ptr, e.ident_len) != null) as i32
+
+fn ca_global(sm: *Sema, e: *Expr) -> *GlobalVarDef
+    if e == null or e.kind != EXPR_IDENT or ca_is_local(sm, e) == 1
+        return null
+    sbk_global(sm, e.ident_ptr, e.ident_len)
+
+# The last argument reported, so an argument judged twice is said once.
+var g_ca_call: *Expr = null
+var g_ca_argno: i32 = 0
+
+# `path:line:col: error: argument N of `f` has the wrong type: ` at `at`, once
+# per argument of `call`; 0 when it was said already.
+fn ca_report(sm: *Sema, call: *Expr, at: *Expr, fname: *u8, flen: i32, argno: i32) -> i32
+    if g_ca_call == call and g_ca_argno == argno
+        return 0
+    g_ca_call = call
+    g_ca_argno = argno
+    sm.error_count = sm.error_count + 1
+    diag_error_at(sema_file(sm), at.span)
+    eprints_cstr(c"argument ")
+    eprint_int(argno as i64)
+    eprints_cstr(c" of `")
+    eprint_bytes(fname, flen)
+    eprints_cstr(c"` has the wrong type: ")
+    1
+
+fn ca_error(sm: *Sema, call: *Expr, at: *Expr, fname: *u8, flen: i32, argno: i32, why: *u8)
+    if ca_report(sm, call, at, fname, flen, argno) == 1
+        eprints_cstr(why)
+        eprint_char('\n')
+
+# The struct a pointer param `p: *T` / `@T` / `@&T` points at, or null (the
+# emitter's param_pointee_struct until AGAST #4173): not a `p:& T`, whose
+# argument is a value.
+fn ca_param_struct(sm: *Sema, p: *Param, out_len: *i32) -> *u8
+    *out_len = 0
+    if p == null or p.is_borrow == 1 or p.param_type_name_len <= 0
+        return null
+    if p.param_type != TYPE_PTR and p.param_type != TYPE_REF and p.param_type != TYPE_MUT_REF
+        return null
+    if p.param_pointee_type != TYPE_STRUCT or sema_find_struct(sm, p.param_type_name, p.param_type_name_len) == null
+        return null
+    *out_len = p.param_type_name_len
+    p.param_type_name
+
+# The struct `arg` surely points at, or null (the emitter's arg_pointee_struct):
+# `@x` / `@&x` of a struct local, a `c:& C` param or a struct field; `x` a
+# local `*T` / `@T` / `@&T`.  Anything else fails open.
+fn ca_arg_struct(sm: *Sema, arg: *Expr, out_len: *i32) -> *u8
+    *out_len = 0
+    var name: *u8 = null
+    var len: i32 = 0
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        let x: *Expr = arg.operand
+        if x == null
+            return null
+        if x.kind == EXPR_IDENT
+            let loc: *LocalVar = ca_local(sm, x)
+            if loc == null
+                return null
+            let lent: i32 = (loc.holds_lent_ptr == 1 and loc.pointee_type == TYPE_STRUCT) as i32
+            if loc.var_type != TYPE_STRUCT and lent == 0
+                return null
+            if ca_names_differ(sm, x, loc) == 1
+                return null
+            name = loc.type_name
+            len = loc.type_name_len
+        else if x.kind == EXPR_MEMBER
+            let f: *StructField = rs_field(sm, x)
+            if f == null or f.field_type != TYPE_STRUCT
+                return null
+            name = f.field_type_name
+            len = f.field_type_name_len
+        else
+            return null
+    else if arg.kind == EXPR_IDENT
+        let loc: *LocalVar = ca_local(sm, arg)
+        if loc == null
+            return null
+        if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+            return null
+        if loc.pointee_type != TYPE_STRUCT or ca_names_differ(sm, arg, loc) == 1
+            return null
+        name = loc.type_name
+        len = loc.type_name_len
+    else
+        return null
+    if name == null or len <= 0 or sema_find_struct(sm, name, len) == null
+        return null
+    *out_len = len
+    name
+
+# 1 when the image of `x` and Sema's own binding name different structs: an
+# inferred `let c = v[i]` through a Vec reads as the container (#2443), where
+# Sema, which resolved its `.` through Deref, has the element.  Unjudged.
+fn ca_names_differ(sm: *Sema, x: *Expr, loc: *LocalVar) -> i32
+    let v: *SemaVar = sema_find_local(sm, x.ident_ptr, x.ident_len)
+    if v == null or v.type_name_len <= 0
+        return 0
+    1 - name_eq(v.type_name, v.type_name_len, loc.type_name, loc.type_name_len)
+
+# AGAST #1948: a pointer to struct S where one to T goes.
+fn ca_struct_ptr(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
+    var want_len: i32 = 0
+    let want: *u8 = ca_param_struct(sm, p, @want_len)
+    if want == null
+        return
+    var got_len: i32 = 0
+    let got: *u8 = ca_arg_struct(sm, arg, @got_len)
+    if got == null or name_eq(want, want_len, got, got_len) == 1
+        return
+    if ca_report(sm, call, call, fname, flen, argno) == 1
+        eprint_bytes(want, want_len)
+        eprints_cstr(c"* != ")
+        eprint_bytes(got, got_len)
+        eprints_cstr(c"*\n")
+
+# --- Arrays ---
+
+# The `*[N]T` / `@[N]T` / `@&[N]T` local `e` names (array_ptr_local), or null.
+fn ca_array_ptr_local(sm: *Sema, e: *Expr) -> *LocalVar
+    let loc: *LocalVar = ca_local(sm, e)
+    if loc == null or loc.pointee_type != TYPE_ARRAY or loc.pointee_array_size <= 0
+        return null
+    if loc.var_type == TYPE_ARRAY and loc.is_lent == 1
+        return loc
+    if loc.var_type != TYPE_PTR and loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+        return null
+    loc
+
+# What a `*[N]T` field, global, call or cast `e` that isn't a local was declared
+# as (base_ptr_array), or null.
+fn ca_base_ptr_array(sm: *Sema, e: *Expr) -> *Param
+    var pa: *Param = null
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, e)
+        if f != null
+            pa = f.ptr_array
+    else if e.kind == EXPR_IDENT
+        let g: *GlobalVarDef = ca_global(sm, e)
+        if g != null
+            pa = g.ptr_array
+    else if e.kind == EXPR_CALL
+        let fd: *FnDef = sema_call_fn(sm, e)
+        if fd != null
+            pa = fd.ret_ptr_array
+    else if e.kind == EXPR_CAST
+        pa = e.cast_ptr_array
+    if pa == null or pa.param_pointee_array_size <= 0 or pa.param_type == TYPE_PTR_PTR
+        return null
+    pa
+
+# N and T of the `[N]T` that `*e` is, `e` a `*[N]T` local, param, field, global
+# (array_ptr_shape).  A step `p + k` isn't judged.
+fn ca_array_ptr_shape(sm: *Sema, e: *Expr, out: *ArrayDims) -> i32
+    let loc: *LocalVar = ca_array_ptr_local(sm, e)
+    if loc != null
+        var en_len: i32 = 0
+        let en: *u8 = array_ptr_elem_name(loc, @en_len)
+        return array_dims_1d(out, loc.pointee_array_size, loc.pointee_array_elem_type, en, en_len)
+    if e.kind == EXPR_BINARY
+        return 0
+    let pa: *Param = ca_base_ptr_array(sm, e)
+    if pa == null
+        return 0
+    array_dims_1d(out, pa.param_pointee_array_size, pa.param_pointee_array_elem_type, pa.param_type_name, pa.param_type_name_len)
+
+# A whole 1-D array `value` reads (arg_array_shape): a local or by-value param,
+# a global, `*@a`, `*p` of a `*[N]T`, a field.
+fn ca_array_shape(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
+    if value.kind == EXPR_IDENT
+        let loc: *LocalVar = ca_local(sm, value)
+        if loc != null
+            # An inferred `let b = g(a)` of a generic's `[N]T` keeps no N here.
+            if loc.var_type == TYPE_ARRAY and loc.array_shape == null and loc.array_size > 0
+                return array_dims_1d(out, loc.array_size, loc.array_elem_type, loc.type_name, loc.type_name_len)
+            return 0
+        if ca_is_local(sm, value) == 1
+            return 0
+        let g: *GlobalVarDef = ca_global(sm, value)
+        if g != null and g.var_type == TYPE_ARRAY and g.array_shape == null
+            return array_dims_1d(out, g.array_size, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+        return 0
+    if value.kind == EXPR_UNARY and value.op == OP_DEREF and value.operand != null
+        let o: *Expr = value.operand
+        if o.kind == EXPR_UNARY and (o.op == OP_ADDR or o.op == OP_ADDR_MUT) and o.operand != null
+            let x: *Expr = o.operand
+            if x.kind == EXPR_IDENT or x.kind == EXPR_UNARY
+                return ca_array_shape(sm, x, out)
+            return 0
+        return ca_array_ptr_shape(sm, o, out)
+    if value.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, value)
+        if f != null and f.field_type == TYPE_ARRAY and f.array_shape == null
+            return array_dims_1d(out, f.array_size, f.array_elem_type, f.array_elem_type_name, f.array_elem_type_name_len)
+    0
+
+# The N-D array a name or field is (nd_array_base_shape), or null.
+fn ca_nd_shape(sm: *Sema, base: *Expr) -> *ArrayShape
+    if base.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, base)
+        if f == null or f.field_type != TYPE_ARRAY
+            return null
+        return f.array_shape
+    if base.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = ca_local(sm, base)
+    if loc != null
+        if loc.var_type == TYPE_ARRAY
+            return loc.array_shape
+        return null
+    let g: *GlobalVarDef = ca_global(sm, base)
+    if g != null and g.var_type == TYPE_ARRAY
+        return g.array_shape
+    null
+
+# What the place `value` holds (place_array_dims): its dimensions, that it's
+# no array, or ARG_DIMS_UNKNOWN.
+fn ca_place_dims(sm: *Sema, value: *Expr, out: *ArrayDims) -> i32
+    if ca_array_shape(sm, value, out) == 1
+        return ARG_DIMS_ARRAY
+    if value.kind == EXPR_IDENT
+        let sh: *ArrayShape = ca_nd_shape(sm, value)
+        if sh != null
+            return array_dims_nd(out, sh, 0)
+        let loc: *LocalVar = ca_local(sm, value)
+        if loc != null and loc.var_type == TYPE_ARRAY
+            return ARG_DIMS_UNKNOWN
+        if loc != null or ca_global(sm, value) != null
+            return ARG_DIMS_NOT_ARRAY
+        return ARG_DIMS_UNKNOWN
+    if value.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, value)
+        if f != null and f.field_type == TYPE_ARRAY and f.array_shape != null
+            return array_dims_nd(out, f.array_shape, 0)
+        if f != null and f.field_type != TYPE_ARRAY
+            return ARG_DIMS_NOT_ARRAY
+        return ARG_DIMS_UNKNOWN
+    if value.kind == EXPR_INDEX
+        # The chain's base and depth (nd_index_shape).  A `[K]*[N][M]T`
+        # element, or a plane pointer's, isn't judged.
+        var depth: i32 = 0
+        var base: *Expr = value
+        while base.kind == EXPR_INDEX
+            depth = depth + 1
+            base = base.left
+        let bl: *LocalVar = ca_local(sm, base)
+        if bl != null and (bl.array_rec != null or bl.pointee_array_shape != null)
+            return ARG_DIMS_UNKNOWN
+        let sh: *ArrayShape = ca_nd_shape(sm, base)
+        if sh != null
+            if depth > sh.rank
+                return ARG_DIMS_UNKNOWN
+            return array_dims_nd(out, sh, depth)
+        # An element of a 1-D array.
+        var whole: ArrayDims
+        if value.left.kind != EXPR_INDEX and ca_place_dims(sm, value.left, @whole) == ARG_DIMS_ARRAY
+            return ARG_DIMS_NOT_ARRAY
+    ARG_DIMS_UNKNOWN
+
+# What `arg` points at, for a param that takes an array by address (ref_arg_dims).
+fn ca_ref_dims(sm: *Sema, arg: *Expr, out: *ArrayDims) -> i32
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        return ca_place_dims(sm, arg.operand, out)
+    if arg.kind == EXPR_IDENT
+        let loc: *LocalVar = ca_local(sm, arg)
+        if loc != null and loc.var_type != TYPE_ARRAY
+            let ploc: *LocalVar = ca_array_ptr_local(sm, arg)
+            if ploc != null
+                # AGAST #4122: a plane pointer `*[N][M]T` points at its shape.
+                if ploc.pointee_array_shape != null and ploc.var_type == TYPE_PTR
+                    return array_dims_nd(out, ploc.pointee_array_shape, 0)
+                var en_len: i32 = 0
+                let en: *u8 = array_ptr_elem_name(ploc, @en_len)
+                return array_dims_1d(out, ploc.pointee_array_size, ploc.pointee_array_elem_type, en, en_len)
+            if loc.is_lent == 1
+                return ARG_DIMS_NOT_ARRAY
+            # A pointer whose pointee is known and no array (AGAST #2323).
+            if loc.var_type == TYPE_PTR or loc.var_type == TYPE_PTR_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+                if loc.pointee_type == TYPE_ARRAY or loc.pointee_type == TYPE_UNKNOWN or loc.pointee_type == TYPE_VOID
+                    return ARG_DIMS_UNKNOWN
+                return ARG_DIMS_NOT_ARRAY
+    ca_place_dims(sm, arg, out)
+
+# AGAST #2290: `a[i]` in the callee trusts the N and T its param declares.
+fn ca_array_ref(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
+    var got: ArrayDims
+    let known: i32 = ca_ref_dims(sm, arg, @got)
+    if known == ARG_DIMS_UNKNOWN
+        return
+    if known == ARG_DIMS_NOT_ARRAY
+        ca_error(sm, call, call, fname, flen, argno, c"the parameter points at an array")
+        return
+    # A struct element the image doesn't name (`let p = q` of an `@&[3]S`) is unjudged.
+    if got.leaf == TYPE_STRUCT and got.name_len <= 0
+        return
+    var want: ArrayDims
+    param_pointee_dims(@want, p)
+    if array_dims_match(@got, @want) == 0
+        ca_error(sm, call, call, fname, flen, argno, c"the array isn't the one the parameter points at")
+
+# 1 when `p` is a StrView.
+fn ca_strview(p: *Param) -> i32
+    (p.param_type == TYPE_STRUCT and name_eq(p.param_type_name, p.param_type_name_len, c"StrView", 7) == 1) as i32
+
+# 1 when `arg`, into the StrView `p`, is a `[N]u8` / `[N]i8` (bare, `@a`, or a
+# `*[N]u8` local, param or field): ritz0 makes it the StrView (strview_array_src).
+# 2 when it is `@a` or a `*[N]T` of another element: ritz0's "Type of #1 arg
+# mismatch" (the emitter's strview_wrong_array until AGAST #4173).
+fn ca_strview_array(sm: *Sema, arg: *Expr, p: *Param) -> i32
+    if ca_strview(p) == 0
+        return 0
+    var src: ArrayDims
+    if arg.kind == EXPR_IDENT or arg.kind == EXPR_MEMBER
+        if ca_array_ptr_shape(sm, arg, @src) == 1
+            if ty_int_bits(src.leaf) == 8
+                return 1
+            return 2
+    var x: *Expr = arg
+    let addr: i32 = (x.kind == EXPR_UNARY and (x.op == OP_ADDR or x.op == OP_ADDR_MUT) and x.operand != null) as i32
+    if addr == 1
+        x = x.operand
+    if ca_array_shape(sm, x, @src) == 0
+        return 0
+    if ty_int_bits(src.leaf) == 8
+        return 1
+    if addr == 1
+        return 2
+    0
+
+# 1 when the emitter's borrow check refuses `arg` into the `:&` param `p` (a
+# temporary, a place through an `@T`), so it, not the array check, speaks.
+fn ca_borrow_speaks(sm: *Sema, arg: *Expr, p: *Param) -> i32
+    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+        return 0
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        return 0
+    # A whole array into a `:& T` of no array: "this place doesn't hold what
+    # the `:&` parameter borrows".
+    if param_takes_array_ref(p) == 0
+        return 1
+    let loc: *LocalVar = ca_local(sm, arg)
+    if loc != null and loc.var_type == TYPE_ARRAY and loc.is_lent == 1
+        return 0
+    # A place: a name, its fields and elements, or what a pointer points at.
+    var root: *Expr = arg
+    while root.kind == EXPR_MEMBER or (root.kind == EXPR_INDEX and root.right != null and root.right.kind != EXPR_RANGE)
+        root = root.left
+    if root.kind == EXPR_IDENT
+        if ca_is_local(sm, root) == 0 and sbk_global(sm, root.ident_ptr, root.ident_len) == null
+            return 1
+    else if root.kind != EXPR_UNARY or root.op != OP_DEREF
+        return 1
+    if loc != null and loc.var_type == TYPE_REF
+        return 1
+    var env: RefEnv
+    ref_write_is_shared_in(ref_env_of(@env, null, sm), arg)
+
+# AGAST #2287: a whole array argument fits its param: a by-value `[N]T` the same
+# N, `a:& [N]T` / `@[N]T` / `@&[N]T` the same array, a Span any; else nothing
+# takes it.  A by-value `self` isn't judged.
+fn ca_array(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
+    if name_eq(p.name, p.name_len, c"self", 4) == 1 and p.is_borrow == 0
+        return
+    if ca_borrow_speaks(sm, arg, p) == 1
+        return
+    let sv: i32 = ca_strview_array(sm, arg, p)
+    if sv == 1
+        return
+    if sv == 2
+        ca_error(sm, call, arg, fname, flen, argno, c"the parameter doesn't take a whole array")
+        return
+    let literal: i32 = (arg.kind == EXPR_ARRAY_LIT or arg.kind == EXPR_ARRAY_FILL) as i32
+    if literal == 0 and param_takes_array_ref(p) == 1
+        ca_array_ref(sm, call, fname, flen, argno, arg, p)
+        return
+    var src: ArrayDims
+    if literal == 0 and ca_array_shape(sm, arg, @src) == 0
+        return
+    if p.param_type == TYPE_ARRAY
+        if literal == 0 and src.dims[0] != p.param_array_size
+            ca_error(sm, call, call, fname, flen, argno, c"the array's length isn't the parameter's")
+        return
+    if param_is_span(p) == 1
+        return
+    if param_takes_array_ref(p) == 0
+        ca_error(sm, call, call, fname, flen, argno, c"the parameter doesn't take a whole array")
+        return
+    ca_error(sm, call, call, fname, flen, argno, c"an array literal has no address to pass")
+
+# Each argument of `call` against `params`, numbered from `argno`.
+fn ca_args(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, params: *Param, args: *Expr)
+    var p: *Param = params
+    var a: *Expr = args
+    var n: i32 = argno
+    while p != null and a != null
+        ca_struct_ptr(sm, call, fname, flen, n, a, p)
+        ca_array(sm, call, fname, flen, n, a, p)
+        p = p.next
+        a = a.next
+        n = n + 1
