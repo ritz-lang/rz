@@ -13,6 +13,8 @@
 #           a note at the declaration (AGAST #3419, LARB R45a; ritz0's #3418)
 #   points  "argument N of `f` has the wrong type: T* != S*" / an array's
 #           mismatch, at the call (AGAST #4173; "What an argument points at")
+#   borrow  "argument N of `f` has the wrong type: a `:&` parameter ...", at
+#           the argument (AGAST #2335, #4244; "A bare argument to a `:&` param")
 #
 # AGAST #3503 (#1816): these run on Sema, from sema_walk at each call, not in
 # the emitter.  A refused call stops the compile before emission, so the
@@ -915,8 +917,8 @@ fn cc_boxed_args(sm: *Sema, e: *Expr, params: *Param, span_ok: i32)
 #
 # Types are read off the image of each local the emitter will make (RsNote.loc,
 # ref_local_in), globals and fields as the emitter reads them.  What that
-# can't type stays unjudged.  A bare place into a `:&` param that the
-# emitter's borrow check refuses (a temporary, through an `@T`) is left to it.
+# can't type stays unjudged.  A bare argument into a `:&` param is ca_borrow's
+# (AGAST #4244), said instead of the array check's.
 
 fn ca_local(sm: *Sema, e: *Expr) -> *LocalVar
     if e == null or e.kind != EXPR_IDENT
@@ -1258,41 +1260,298 @@ fn ca_strview_array(sm: *Sema, arg: *Expr, p: *Param) -> i32
         return 2
     0
 
-# 1 when the emitter's borrow check refuses `arg` into the `:&` param `p` (a
-# temporary, a place through an `@T`), so it, not the array check, speaks.
-fn ca_borrow_speaks(sm: *Sema, arg: *Expr, p: *Param) -> i32
-    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+# --- A bare argument to a `:&` param (AGAST #2335, #4244) ---
+#
+# LARB R1's second exception: a place of `T` into a `name:& T` param is
+# borrowed, as if written `@&x`.  What isn't one passes if it's the pointer to
+# one (an `@&T`, a `*T`), else it is refused at the argument:
+#
+#   a temporary       "a `:&` parameter needs a place to borrow, ..."
+#   another type      "this place doesn't hold what the `:&` parameter borrows"
+#                     (exactly, not by width: AGAST #2368, #2530)
+#   through an `@T`   "a `:&` parameter can't borrow through an `@T`, ..."
+#   untypable         "ritz1 can't tell what this argument is: write `@&` ..."
+#
+# The emitter's check_borrow_arg until AGAST #4244, so a Sema error anywhere
+# in the module hid it.  The emitter keeps borrow_arg_kind to lower a place
+# to its address; Sema only says what is refused, so where the emitter tells
+# a place from a pointer that passes (a `**S` as deep as `:& **S`), both are
+# silent here.
+
+const CA_BORROW_PASS: i32 = 0      # a place of `T`, or the pointer to one
+const CA_BORROW_RVALUE: i32 = 2
+const CA_BORROW_MISFIT: i32 = 3    # a place of something else
+const CA_BORROW_UNTYPED: i32 = 4   # ritz1 can't type it
+const CA_BORROW_SHARED: i32 = 5    # reached through an `@T`, read-only
+
+# The type of a place, as the emitter's PlaceType: `name` is a struct's, or for
+# a pointer the struct it points at.
+struct CaPlace
+    kind: i32
+    pointee: i32
+    name: *u8
+    name_len: i32
+
+fn ca_place_set(out: *CaPlace, kind: i32, pointee: i32, name: *u8, name_len: i32) -> i32
+    out.kind = kind
+    out.pointee = pointee
+    out.name = name
+    out.name_len = name_len
+    1
+
+fn ca_is_pointer(t: i32) -> i32
+    (t == TYPE_PTR or t == TYPE_PTR_PTR or t == TYPE_REF or t == TYPE_MUT_REF) as i32
+
+# What `*x` gives, for `x` of type `base`.
+fn ca_place_deref(base: *CaPlace, out: *CaPlace) -> i32
+    var held: i32 = TYPE_UNKNOWN
+    if base.name_len > 0
+        held = TYPE_STRUCT
+    if base.kind == TYPE_PTR_PTR
+        return ca_place_set(out, TYPE_PTR, held, base.name, base.name_len)
+    if ca_is_pointer(base.kind) == 0
         return 0
-    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+    ca_place_set(out, base.pointee, held, base.name, base.name_len)
+
+# The plane `[N][M]T` a plane pointer local `q` (`*[N][M]T`), or `*r` of an
+# `@*[N][M]T` / `**[N][M]T` one, points at (plane_ptr_shape), or null.
+fn ca_plane_shape(sm: *Sema, e: *Expr) -> *ArrayShape
+    var x: *Expr = e
+    var deref: i32 = 0
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+        x = e.operand
+        deref = 1
+    let loc: *LocalVar = ca_local(sm, x)
+    if loc == null or loc.pointee_array_shape == null
+        return null
+    # Its slot holds the plane pointer's address: only `*r` is the pointer.
+    let holds: i32 = (loc.pointee_type == TYPE_PTR and (loc.var_type == TYPE_PTR_PTR or loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF)) as i32
+    if holds == 1 and deref == 0
+        return null
+    loc.pointee_array_shape
+
+# What `x[i]` gives (place_index_type): the array shapes know what they hold; a
+# pointer is `*x`.  An element of a `[K]*[N][M]T` is the emitter's to type.
+fn ca_place_index(sm: *Sema, value: *Expr, out: *CaPlace) -> i32
+    var depth: i32 = 0
+    var base: *Expr = value
+    while base.kind == EXPR_INDEX
+        depth = depth + 1
+        base = base.left
+    var sh: *ArrayShape = ca_nd_shape(sm, base)
+    if sh == null
+        sh = ca_plane_shape(sm, base)
+    if sh != null and depth <= sh.rank
+        if depth < sh.rank
+            return ca_place_set(out, TYPE_ARRAY, TYPE_UNKNOWN, sh.leaf_name, sh.leaf_name_len)
+        return ca_place_set(out, sh.leaf_type, TYPE_UNKNOWN, sh.leaf_name, sh.leaf_name_len)
+    var src: ArrayDims
+    if ca_array_shape(sm, value.left, @src) == 1
+        var held: i32 = TYPE_UNKNOWN
+        if src.name_len > 0
+            held = TYPE_STRUCT
+        return ca_place_set(out, src.leaf, held, src.name, src.name_len)
+    var b: CaPlace
+    if ca_place_type(sm, value.left, @b) == 0
         return 0
-    # A whole array into a `:& T` of no array: "this place doesn't hold what
-    # the `:&` parameter borrows".
-    if param_takes_array_ref(p) == 0
-        return 1
-    let loc: *LocalVar = ca_local(sm, arg)
-    if loc != null and loc.var_type == TYPE_ARRAY and loc.is_lent == 1
-        return 0
-    # A place: a name, its fields and elements, or what a pointer points at.
-    var root: *Expr = arg
-    while root.kind == EXPR_MEMBER or (root.kind == EXPR_INDEX and root.right != null and root.right.kind != EXPR_RANGE)
+    ca_place_deref(@b, out)
+
+# 1 and `out` when Sema can type the place `e` (place_type_of).
+fn ca_place_type(sm: *Sema, e: *Expr, out: *CaPlace) -> i32
+    if e.kind == EXPR_IDENT
+        if ca_is_local(sm, e) == 1
+            let loc: *LocalVar = ca_local(sm, e)
+            if loc == null
+                return 0
+            return ca_place_set(out, loc.var_type, loc.pointee_type, loc.type_name, loc.type_name_len)
+        let g: *GlobalVarDef = sbk_global(sm, e.ident_ptr, e.ident_len)
+        if g == null
+            return 0
+        if ca_is_pointer(g.var_type) == 1
+            return ca_place_set(out, g.var_type, g.pointee_type, g.pointee_type_name, g.pointee_type_name_len)
+        return ca_place_set(out, g.var_type, TYPE_UNKNOWN, g.type_name, g.type_name_len)
+    if e.kind == EXPR_MEMBER
+        let f: *StructField = rs_field(sm, e)
+        if f == null
+            return 0
+        return ca_place_set(out, f.field_type, ptr_field_elem_kind(f), f.field_type_name, f.field_type_name_len)
+    if e.kind == EXPR_INDEX
+        return ca_place_index(sm, e, out)
+    if e.kind == EXPR_UNARY and e.op == OP_DEREF and e.operand != null
+        var b: CaPlace
+        if ca_place_type(sm, find_base_expr(e.operand), @b) == 0
+            return 0
+        return ca_place_deref(@b, out)
+    0
+
+# 1 when `e` is a place: it names storage the caller can see afterwards.  A
+# field or element of a call result isn't one.
+fn ca_arg_is_place(sm: *Sema, e: *Expr) -> i32
+    var root: *Expr = e
+    while root.kind == EXPR_MEMBER or root.kind == EXPR_INDEX
+        if root.kind == EXPR_INDEX and root.right != null and root.right.kind == EXPR_RANGE
+            return 0
         root = root.left
-    if root.kind == EXPR_IDENT
-        if ca_is_local(sm, root) == 0 and sbk_global(sm, root.ident_ptr, root.ident_len) == null
+    if root.kind == EXPR_UNARY and root.op == OP_DEREF
+        return 1
+    if root.kind != EXPR_IDENT
+        return 0
+    if ca_is_local(sm, root) == 1
+        return 1
+    (sbk_global(sm, root.ident_ptr, root.ident_len) != null) as i32
+
+# What `arg`, no place, does for `p`: it passes if it's the pointer `p` is.
+fn ca_rvalue_borrow(sm: *Sema, arg: *Expr, p: *Param) -> i32
+    if arg.kind == EXPR_NIL_LIT or arg.kind == EXPR_CSTRING_LIT
+        return CA_BORROW_RVALUE
+    var t: i32 = sema_expr_type(sm, arg)
+    if arg.kind == EXPR_METHOD
+        let m: *FnDef = sbk_method_def(sm, arg)
+        if m == null
+            return CA_BORROW_UNTYPED
+        t = m.return_type
+    if t == TYPE_REF
+        return CA_BORROW_SHARED
+    if p.param_pointee_type == TYPE_PTR
+        if t == TYPE_PTR_PTR
+            return CA_BORROW_PASS
+    else if ca_is_pointer(t) == 1
+        return CA_BORROW_PASS
+    CA_BORROW_RVALUE
+
+# 1 when the place `e` is an `@T`, or the nearest indirection on its path to the
+# root is one.  An `@&T` or `*T` nearer than that makes it writable.
+fn ca_behind_shared(sm: *Sema, e: *Expr) -> i32
+    var pl: CaPlace
+    if ca_place_type(sm, e, @pl) == 1 and pl.kind == TYPE_REF
+        return 1
+    var at: *Expr = e
+    while at != null
+        if at.kind == EXPR_MEMBER or at.kind == EXPR_INDEX
+            at = at.left
+        else if at.kind == EXPR_UNARY and at.op == OP_DEREF
+            at = find_base_expr(at.operand)
+        else
+            return 0
+        if ca_place_type(sm, at, @pl) == 1
+            if pl.kind == TYPE_REF
+                return 1
+            if ca_is_pointer(pl.kind) == 1
+                return 0
+    0
+
+# AGAST #2354: 1 when `arg` names a by-value `@&U` param of the fn walked.
+fn ca_ref_param(sm: *Sema, arg: *Expr) -> i32
+    if arg.kind != EXPR_IDENT or sm.cur_fn == null
+        return 0
+    var q: *Param = sm.cur_fn.params
+    while q != null
+        if q.param_type == TYPE_MUT_REF and q.is_borrow == 0 and name_eq(q.name, q.name_len, arg.ident_ptr, arg.ident_len) == 1
             return 1
-    else if root.kind != EXPR_UNARY or root.op != OP_DEREF
+        q = q.next
+    0
+
+# 1 when pointer place `pl` is the `*U` that `p`, a `:& *U`, borrows.
+fn ca_pointer_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
+    let want: i32 = p.param_ref_ptr_pointee
+    if want == TYPE_VOID or pl.pointee == TYPE_UNKNOWN
         return 1
-    if loc != null and loc.var_type == TYPE_REF
-        return 1
-    var env: RefEnv
-    ref_write_is_shared_in(ref_env_of(@env, null, sm), arg)
+    # AGAST #3101: `r:& T` at T = `*[N]E` takes a `*[N]E` place, the same N and E.
+    if want == TYPE_ARRAY and p.param_pointee_array_size > 0
+        if pl.pointee != TYPE_ARRAY
+            return 0
+        var got: ArrayDims
+        if ca_ref_dims(sm, arg, @got) != ARG_DIMS_ARRAY
+            return 1
+        # A struct element the image doesn't name (a `var q: *[3]S`) is
+        # unjudged, as in ca_array_ref.
+        if got.leaf == TYPE_STRUCT and got.name_len <= 0
+            return 1
+        var dims: ArrayDims
+        param_pointee_dims(@dims, p)
+        return array_dims_match(@got, @dims)
+    if want == TYPE_STRUCT or pl.pointee == TYPE_STRUCT
+        return (want == pl.pointee and name_eq(p.param_type_name, p.param_type_name_len, pl.name, pl.name_len) == 1) as i32
+    # Exactly: a `*u32` isn't the `*i32` (#2530).
+    (want == pl.pointee) as i32
+
+# A pointer place into `p`: a `*U` into `:& *U` is a place of `T`; into `:& U`,
+# or a `**U` into `:& *U`, it's the pointer to one.  An `@&U` place holds a
+# pointer as a `*U` does (#2354); an `@&U` param is no place: ritz0 gives it no
+# storage.  (A `**S` into `:& **S`, place or pointer, passes either way: #2372.)
+fn ca_pointer_place(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
+    if p.param_pointee_type != TYPE_PTR
+        return CA_BORROW_PASS
+    if pl.kind == TYPE_PTR_PTR or pl.pointee == TYPE_PTR
+        return CA_BORROW_PASS
+    if pl.kind != TYPE_PTR and (pl.kind != TYPE_MUT_REF or ca_ref_param(sm, arg) == 1)
+        return CA_BORROW_MISFIT
+    if ca_pointer_fits(sm, arg, pl, p) == 1
+        return CA_BORROW_PASS
+    CA_BORROW_MISFIT
+
+# 1 when the place `arg`, of type `pl`, holds the `T` of `p`: exactly, not by
+# width (Aaron's ruling on AGAST #2368), so `:& u32` doesn't take an `i32`.
+fn ca_place_fits(sm: *Sema, arg: *Expr, pl: *CaPlace, p: *Param) -> i32
+    let pt: i32 = p.param_pointee_type
+    if pl.kind != TYPE_ARRAY and pl.kind != TYPE_STRUCT
+        # AGAST #2994: a `bool` local is a `bool`, though its slot is an i64.
+        let loc: *LocalVar = ca_local(sm, arg)
+        if loc != null and loc.is_bool == 1
+            return (pt == TYPE_BOOL) as i32
+        return (pl.kind == pt) as i32
+    if pl.kind == TYPE_STRUCT
+        return (pt == TYPE_STRUCT and name_eq(p.param_type_name, p.param_type_name_len, pl.name, pl.name_len) == 1) as i32
+    if pt != TYPE_ARRAY
+        return 0
+    var got: ArrayDims
+    var want: ArrayDims
+    if ca_place_dims(sm, arg, @got) != ARG_DIMS_ARRAY
+        return 0
+    param_pointee_dims(@want, p)
+    array_dims_match(@got, @want)
+
+# What `arg` is to the `:&` param `p` (the emitter's borrow_arg_kind).
+fn ca_borrow_kind(sm: *Sema, arg: *Expr, p: *Param) -> i32
+    if p == null or p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
+        return CA_BORROW_PASS
+    if arg.kind == EXPR_UNARY and (arg.op == OP_ADDR or arg.op == OP_ADDR_MUT)
+        return CA_BORROW_PASS
+    # An `a:& [N]T` param reads as the pointer it's bound to.
+    let lent: *LocalVar = ca_local(sm, arg)
+    if lent != null and lent.var_type == TYPE_ARRAY and lent.is_lent == 1
+        return CA_BORROW_PASS
+    if ca_arg_is_place(sm, arg) == 0
+        return ca_rvalue_borrow(sm, arg, p)
+    if ca_behind_shared(sm, arg) == 1
+        return CA_BORROW_SHARED
+    var pl: CaPlace
+    if ca_place_type(sm, arg, @pl) == 0 or pl.kind == TYPE_UNKNOWN
+        return CA_BORROW_UNTYPED
+    if ca_is_pointer(pl.kind) == 1
+        return ca_pointer_place(sm, arg, @pl, p)
+    if ca_place_fits(sm, arg, @pl, p) == 1
+        return CA_BORROW_PASS
+    CA_BORROW_MISFIT
+
+# Refuses what can't go in the `:&` param `p`, at the argument.  A misfit into
+# an `a:& [N]T` is ca_array_ref's, which says which array it wanted.
+fn ca_borrow(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
+    let k: i32 = ca_borrow_kind(sm, arg, p)
+    if k == CA_BORROW_RVALUE
+        ca_error(sm, call, arg, fname, flen, argno, c"a `:&` parameter needs a place to borrow, and this is a temporary")
+    else if k == CA_BORROW_MISFIT and param_takes_array_ref(p) == 0
+        ca_error(sm, call, arg, fname, flen, argno, c"this place doesn't hold what the `:&` parameter borrows")
+    else if k == CA_BORROW_SHARED
+        ca_error(sm, call, arg, fname, flen, argno, c"a `:&` parameter can't borrow through an `@T`, which is read-only")
+    else if k == CA_BORROW_UNTYPED
+        ca_error(sm, call, arg, fname, flen, argno, c"ritz1 can't tell what this argument is: write `@&` before it")
 
 # AGAST #2287: a whole array argument fits its param: a by-value `[N]T` the same
 # N, `a:& [N]T` / `@[N]T` / `@&[N]T` the same array, a Span any; else nothing
 # takes it.  A by-value `self` isn't judged.
 fn ca_array(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
     if name_eq(p.name, p.name_len, c"self", 4) == 1 and p.is_borrow == 0
-        return
-    if ca_borrow_speaks(sm, arg, p) == 1
         return
     let sv: i32 = ca_strview_array(sm, arg, p)
     if sv == 1
@@ -1325,6 +1584,9 @@ fn ca_args(sm: *Sema, call: *Expr, fname: *u8, flen: i32, argno: i32, params: *P
     var n: i32 = argno
     while p != null and a != null
         ca_struct_ptr(sm, call, fname, flen, n, a, p)
+        # AGAST #4244: before ca_array, so a refused borrow is said in its own
+        # words; ca_report says one error per argument.
+        ca_borrow(sm, call, fname, flen, n, a, p)
         ca_array(sm, call, fname, flen, n, a, p)
         p = p.next
         a = a.next

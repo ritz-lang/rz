@@ -833,8 +833,6 @@ fn emit_ufcs_call(s: *EmitterState, e: *Expr, fn_def: *FnDef, receiver_reg: i32,
     if ap != null
         ap = ap.next
     while arg != null
-        # Receiver is argument 1, as ritz0 numbers it (AGAST #1948).
-        check_borrow_param(s, e.ident_ptr, e.ident_len, arg_count + 2, arg, ap)
         arg_regs[arg_count] = emit_call_arg(s, arg, ap)
         arg_count = arg_count + 1
         if ap != null
@@ -1148,7 +1146,7 @@ pub fn impl_of_method(m: *Module, f: *FnDef) -> *ImplBlock
 # AGAST #3278: a typed `self:& C`, and so a generic instance's bare `self:&`
 # once name_untyped_self has named it, is lent the same way.  It's a
 # TYPE_MUT_REF without is_borrow (Param.is_self_borrow), which ref_check's
-# ref_args and check_borrow_arg read as an `@&C` slot: `C_bump(c)` was "a value
+# ref_args and call_check's ca_borrow read as an `@&C` slot: `C_bump(c)` was "a value
 # doesn't fit a reference slot".  ref_value.ritz (Sema) calls this for the free call too.
 pub fn lent_self_call_view(s: *EmitterState, f: *FnDef) -> *FnDef
     lent_self_call_view_in(s.module, f)
@@ -2415,7 +2413,9 @@ fn place_behind_shared_ref(s: *EmitterState, e: *Expr) -> i32
                 return 0
     0
 
-# Emits nothing, so it can be asked again at each step of a call.
+# Emits nothing, so it can be asked again at each step of a call.  What it
+# refuses (a temporary, a misfit, through an `@T`, untypable) is said on Sema,
+# by call_check's ca_borrow (AGAST #4244); here only BORROW_PLACE is lowered.
 pub fn borrow_arg_kind(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if p == null or p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
         return BORROW_PASS
@@ -2436,39 +2436,6 @@ pub fn borrow_arg_kind(s: *EmitterState, arg: *Expr, p: *Param) -> i32
     if place_fits_borrow(s, arg, @pl, p) == 1
         return BORROW_PLACE
     BORROW_MISFIT
-
-fn borrow_arg_error(s: *EmitterState, arg: *Expr, fname: *u8, flen: i32, argno: i32, why: *u8)
-    emit_str(s, c"  ; ERROR: argument to a `:&` param (AGAST #2335)\n")
-    eprint_arg_type_error(arg, fname, flen, argno)
-    eprints_cstr(why)
-    eprints_cstr(c"\n")
-    s.error_count = s.error_count + 1
-
-# Reports what can't go in `:&` param `p`, and answers 1 if it did.
-fn check_borrow_arg(s: *EmitterState, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param) -> i32
-    let k: i32 = borrow_arg_kind(s, arg, p)
-    # Sema's ca_array_ref (call_check.ritz) says which array it wanted.
-    if k == BORROW_MISFIT and param_takes_array_ref(p) == 1
-        return 0
-    if k == BORROW_RVALUE
-        borrow_arg_error(s, arg, fname, flen, argno, c"a `:&` parameter needs a place to borrow, and this is a temporary")
-    else if k == BORROW_MISFIT
-        borrow_arg_error(s, arg, fname, flen, argno, c"this place doesn't hold what the `:&` parameter borrows")
-    else if k == BORROW_SHARED
-        borrow_arg_error(s, arg, fname, flen, argno, c"a `:&` parameter can't borrow through an `@T`, which is read-only")
-    else if k == BORROW_UNTYPED
-        borrow_arg_error(s, arg, fname, flen, argno, c"ritz1 can't tell what this argument is: write `@&` before it")
-    else
-        return 0
-    1
-
-# check_borrow_arg at each argument of a call.  What an argument points at,
-# struct or array, is Sema's (call_check.ritz's ca_args, AGAST #4173); a
-# receiver isn't judged, except the one lent_self_call_view lends as a `:&`.
-fn check_borrow_param(s: *EmitterState, fname: *u8, flen: i32, argno: i32, arg: *Expr, p: *Param)
-    if p == null or (name_eq(p.name, p.name_len, c"self", 4) == 1 and p.is_borrow == 0)
-        return
-    check_borrow_arg(s, fname, flen, argno, arg, p)
 
 # The address of a place borrowed by `p`, as an i64 like `@x`; every slot
 # converts that to what it is.  0 when `arg` is anything else.
@@ -4578,7 +4545,6 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if fn_def != null
         ap = fn_def.params
     while arg2 != null
-        check_borrow_param(s, e.func_name, e.func_name_len, arg_count + 1, arg2, ap)
         arg_regs[arg_count] = emit_call_arg(s, arg2, ap)
         arg_count += 1
         if ap != null
@@ -6213,7 +6179,6 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
                 # No receiver: params line up from the head (AGAST #1498).
                 var sm_ap: *Param = sm_method.params
                 while sm_arg != null
-                    check_borrow_param(s, e.ident_ptr, e.ident_len, sm_arg_count + 1, sm_arg, sm_ap)
                     sm_arg_regs[sm_arg_count] = emit_call_arg(s, sm_arg, sm_ap)
                     sm_arg_count = sm_arg_count + 1
                     if sm_ap != null
@@ -6917,8 +6882,6 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
         if ap != null
             ap = ap.next
     while arg != null
-        # Receiver is argument 1, as ritz0 numbers it (AGAST #1948).
-        check_borrow_param(s, e.ident_ptr, e.ident_len, arg_count + 2, arg, ap)
         arg_regs[arg_count] = emit_call_arg(s, arg, ap)
         conv_regs[arg_count] = arg_regs[arg_count]
         arg_count = arg_count + 1

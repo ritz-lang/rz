@@ -179,8 +179,9 @@ still run mid-lowering on `*EmitterState`, and
 
 - `call_check` — a call's arguments fit its callee: its count, each argument's
   kind, and what a pointer or array argument points at ("argument N of `f`
-  has the wrong type", AGAST #4173; the emitter keeps only the `:&` borrow
-  check).
+  has the wrong type", AGAST #4173), and what a bare argument to a `:&` param
+  is (a temporary, a misfit, a place through an `@T`: AGAST #4244; the emitter
+  keeps borrow_arg_kind only to lower a borrowed place to its address).
 
 - `deref_field` — `.` through a struct's `Deref` / `DerefMut` (§7.7, R17).
   Sema also resolves such a `.` into step calls, each annotated
