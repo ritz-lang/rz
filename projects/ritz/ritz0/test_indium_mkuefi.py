@@ -104,6 +104,34 @@ def test_builds_image_with_all_three_files_and_no_dd(tmp_path):
 
 @pytest.mark.integration
 @needs_tools
+def test_initramfs_argument_lands_beside_the_kernel(tmp_path):
+    """AGAST #4253: BOOTX64.EFI reads \\harland\\initramfs.tar from the ESP and
+    hands it to the kernel, so the disk needs no virtio-blk initramfs disk."""
+    boot, kernel, nsh = _inputs(tmp_path)
+    tar = tmp_path / "initramfs.tar"
+    tar.write_bytes(os.urandom(5 * 512))
+    image = tmp_path / "uefi.img"
+    r = _run([image, boot, kernel, nsh, tar], tmp_path, [*_mtools_path(), Path("/bin"), Path("/usr/bin")])
+    assert r.returncode == 0, r.stdout + r.stderr
+    out = tmp_path / "copy_initramfs.tar"
+    subprocess.run(["mcopy", "-n", "-i", str(image), "::/harland/initramfs.tar", str(out)], check=True,
+                   env=dict(os.environ, MTOOLS_SKIP_CHECK="1"), timeout=60)
+    assert out.read_bytes() == tar.read_bytes()
+
+
+def test_indium_disks_carry_the_initramfs_on_the_esp():
+    """AGAST #4253: run-uefi's disk and the EC2 disk hold harland/initramfs.tar
+    in the ESP; the EC2 disk no longer writes a raw TAR partition."""
+    text = INDIUM_MAKEFILE.read_text()
+    uefi = _recipe(text, "$(UEFI_DISK)")
+    assert "initramfs.tar" in uefi.split("mkuefi.py", 1)[1]
+    ec2 = _recipe(text, "$(EC2_DISK)")
+    assert "mnt/harland/initramfs.tar" in ec2
+    assert "--new=2:" not in ec2 and "seek=" not in ec2
+
+
+@pytest.mark.integration
+@needs_tools
 def test_failed_step_leaves_no_image(tmp_path):
     """mkfs and mmd succeed, then mcopy fails: the image is half built at that point."""
     boot, kernel, nsh = _inputs(tmp_path)

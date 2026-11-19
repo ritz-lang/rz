@@ -89,8 +89,12 @@ make ec2-disk        # builds build/ec2-boot.img
 
 - **GPT partition table** (required for UEFI boot)
 - **EFI System Partition (ESP)** — FAT32, type code `EF00`
-- Sectors 2048-131038 (~63MB ESP), containing
-  `/EFI/BOOT/BOOTX64.EFI` (bootloader) and `/harland/kernel.elf` (kernel)
+- One partition, the ESP: sector 2048 to the end of the 128MB disk (~127MB),
+  containing `/EFI/BOOT/BOOTX64.EFI` (bootloader), `/harland/kernel.elf`
+  (kernel) and `/harland/initramfs.tar` (initramfs). Nitro has no virtio-blk,
+  so BOOTX64.EFI reads the TAR from the ESP and passes it to the kernel in
+  BootInfo (AGAST #4253); a virtio-blk TAR disk is only the fallback.
+  `make run-uefi`'s disk carries the same file.
 
 ### Hardware Support (Nitro Instances)
 

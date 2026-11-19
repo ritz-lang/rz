@@ -390,6 +390,11 @@ struct BootInfo
     kernel_phys: u64                 # Kernel physical address
     kernel_size: u64                 # Kernel size in bytes
     pml4_phys: u64                   # Page table physical address
+    # Version 2 (AGAST #4253): \harland\initramfs.tar, read from the boot
+    # volume into loader memory (EfiLoaderData, so reserved in the map).
+    # 0/0 when the ESP has none: the kernel then reads a virtio-blk disk.
+    initramfs_phys: u64              # Physical address of the TAR, or 0
+    initramfs_size: u64              # Its size in bytes, or 0
 
 [[packed]]
 struct MemoryMapEntry
@@ -399,7 +404,7 @@ struct MemoryMapEntry
     reserved: u32
 
 const BOOT_MAGIC: u32 = 0x4841524C   # "HARL"
-const BOOT_VERSION: u32 = 1
+const BOOT_VERSION: u32 = 2
 
 # Memory types for our simplified map
 const MEM_USABLE: u32 = 1
@@ -1051,6 +1056,10 @@ fn build_boot_info() -> i32
     # Set page table info
     boot_info.pml4_phys = pml4_addr
 
+    # The initramfs read from the ESP (0/0 if none)
+    boot_info.initramfs_phys = initramfs_addr
+    boot_info.initramfs_size = initramfs_size
+
     # Set framebuffer info (populated by init_graphics)
     boot_info.framebuffer_addr = fb_addr
     boot_info.framebuffer_width = fb_width
@@ -1266,10 +1275,94 @@ fn load_kernel_from_fs() -> i32
     # Close kernel file
     (kfile.close as EfiFn1)(kernel_file)
 
+    # The initramfs beside it, if the volume has one. A read error is not
+    # fatal here: the kernel can still find a virtio-blk initramfs disk.
+    load_initramfs_from_fs(root_file)
+
     # Close root
     (root.close as EfiFn1)(root_file)
 
     prints("    Kernel loaded successfully!\n")
+    return 0
+
+# ============================================================================
+# Initramfs from the boot volume (AGAST #4253)
+# ============================================================================
+
+# Path of the initramfs on the boot volume, beside the kernel. Machines with
+# no virtio-blk disk (EC2 Nitro's NVMe, laptops) boot with it: the kernel
+# unpacks the TAR from memory instead of reading a raw TAR disk.
+var initramfs_path: [32]u16
+var initramfs_addr: u64 = 0
+var initramfs_size: u64 = 0
+
+# Write s into out as a null-terminated UCS-2 string (ASCII only); out must
+# hold s.len + 1 code units.
+fn ascii_to_ucs2(s: StrView, out: *u16) -> i32
+    var i: i64 = 0
+    while i < s.len
+        *(out + i) = *(s.ptr + i) as u16
+        i = i + 1
+    *(out + i) = 0
+    return 0
+
+# Read \harland\initramfs.tar from the open root directory root_file into
+# EfiLoaderData pages, and record where in initramfs_addr / initramfs_size.
+# A missing file is not an error (returns 1): the kernel falls back to a
+# virtio-blk disk. Returns 0 when loaded, -1 on a read error.
+fn load_initramfs_from_fs(root_file: u64) -> i32
+    ascii_to_ucs2("\\harland\\initramfs.tar", @initramfs_path[0])
+    let root: *EfiFile = root_file as *EfiFile
+    var file: u64 = 0
+    let st_open: u64 = (root.open as EfiFn5)(root_file, @file as u64, @initramfs_path[0] as u64, EFI_FILE_MODE_READ, 0)
+    if st_open != EFI_SUCCESS
+        prints("    No \\harland\\initramfs.tar on the boot volume (kernel will try virtio-blk)\n")
+        return 1
+    let f: *EfiFile = file as *EfiFile
+
+    # Size: seek to the end (all ones) and read the position back
+    var size: u64 = 0
+    var status: u64 = (f.set_position as EfiFn2)(file, 0xFFFFFFFFFFFFFFFF)
+    if status == EFI_SUCCESS
+        status = (f.get_position as EfiFn2)(file, @size as u64)
+    if status == EFI_SUCCESS
+        status = (f.set_position as EfiFn2)(file, 0)
+    if status != EFI_SUCCESS or size == 0
+        prints("    ERROR: Cannot size initramfs.tar: ")
+        serial_print_hex(status)
+        prints("\n")
+        (f.close as EfiFn1)(file)
+        return -1
+
+    var addr: u64 = 0
+    status = efi_allocate_pages(ALLOCATE_ANY_PAGES, EFI_LOADER_DATA, (size + 4095) / 4096, @addr)
+    if status != EFI_SUCCESS
+        prints("    ERROR: Cannot allocate initramfs buffer: ")
+        serial_print_hex(status)
+        prints("\n")
+        (f.close as EfiFn1)(file)
+        return -1
+
+    var got: u64 = size
+    status = (f.read as EfiFn3)(file, @got as u64, addr)
+    (f.close as EfiFn1)(file)
+    if status != EFI_SUCCESS or got != size
+        prints("    ERROR: Cannot read initramfs.tar: ")
+        serial_print_hex(status)
+        prints(", ")
+        serial_print_dec(got)
+        prints(" of ")
+        serial_print_dec(size)
+        prints(" bytes\n")
+        return -1
+
+    initramfs_addr = addr
+    initramfs_size = size
+    prints("    Read initramfs: ")
+    serial_print_dec(size)
+    prints(" bytes at ")
+    serial_print_hex(addr)
+    prints("\n")
     return 0
 
 # ============================================================================

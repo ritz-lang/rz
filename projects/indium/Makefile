@@ -63,42 +63,44 @@ iso: kernel
 	./tools/mkiso.sh
 
 # Create UEFI boot disk (uses mtools, no root required)
-$(UEFI_DISK): kernel
+$(UEFI_DISK): kernel $(BUILD_DIR)/initramfs.tar
 	@echo "=== Creating UEFI Boot Disk ==="
 	@mkdir -p $(BUILD_DIR)
-	@# 64MB FAT32 image: BOOTX64.EFI, harland/kernel.elf, startup.nsh.
+	@# 64MB FAT32 image: BOOTX64.EFI, harland/kernel.elf, startup.nsh and
+	@# harland/initramfs.tar, which BOOTX64.EFI hands the kernel in BootInfo
+	@# (AGAST #4253), so the disk boots with no virtio-blk initramfs disk.
 	@# tools/mkuefi.py logs and time-limits each step and never runs dd,
 	@# which hung here (AGAST #2748).
 	@echo '@echo -off' > $(BUILD_DIR)/startup.nsh
 	@echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh
-	python3 ./tools/mkuefi.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(BUILD_DIR)/startup.nsh
+	python3 ./tools/mkuefi.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(BUILD_DIR)/startup.nsh $(BUILD_DIR)/initramfs.tar
 
 # Create EC2-compatible UEFI boot disk with GPT partition table
 # EC2 requires a proper GPT with EFI System Partition for UEFI boot
-# Layout:
-#   Partition 1: ESP (EFI System Partition) - FAT32, ~32MB - kernel + bootloader
-#   Partition 2: Data - Raw TAR initramfs - ~30MB
+# Layout: one partition, the ESP (FAT32, sector 2048 to the end, ~127MB):
+#   /EFI/BOOT/BOOTX64.EFI, /harland/kernel.elf, /harland/initramfs.tar,
+#   /startup.nsh
+# Nitro has NVMe, no virtio-blk, so the kernel can't read a raw TAR disk:
+# BOOTX64.EFI reads harland/initramfs.tar with the UEFI file protocol and
+# passes it in BootInfo (AGAST #4253). The raw-TAR partition 2 is gone.
 EC2_DISK = $(BUILD_DIR)/ec2-boot.img
 
 ec2-disk: $(EC2_DISK)
 
 $(EC2_DISK): kernel $(BUILD_DIR)/initramfs.tar
-	@echo "=== Creating EC2 Boot Disk (GPT + ESP + Data) ==="
+	@echo "=== Creating EC2 Boot Disk (GPT + ESP) ==="
 	@mkdir -p $(BUILD_DIR)
-	@# Create 128MB disk image (ESP + initramfs partition)
+	@# Create 128MB disk image
 	dd if=/dev/zero of=$@ bs=1M count=128 2>/dev/null
-	@# Create GPT partition table with:
-	@#   Partition 1: ESP at 1MB (sector 2048), 32MB
-	@#   Partition 2: Linux data at 34MB, rest of disk
-	@# Sector calculations: 1MB = 2048 sectors, 32MB = 65536 sectors
+	@# GPT with one partition: the ESP from 1MB (sector 2048) to the last
+	@# usable sector, 262110 (the backup GPT takes the final 33 sectors)
 	sgdisk --clear \
-	       --new=1:2048:67583 --typecode=1:EF00 --change-name=1:ESP \
-	       --new=2:69632:0 --typecode=2:8300 --change-name=2:initramfs \
+	       --new=1:2048:0 --typecode=1:EF00 --change-name=1:ESP \
 	       $@
-	@# Format and populate ESP (partition 1)
+	@# Format and populate the ESP
 	@# ESP offset: 2048 * 512 = 1048576 (1MB)
-	@# ESP size: 65536 * 512 = 33554432 (~32MB)
-	@LOOP_ESP=$$(sudo losetup --find --show --offset 1048576 --sizelimit 33554432 $@) && \
+	@# ESP size: (262110 - 2048 + 1) * 512 = 133152256 (~127MB)
+	@LOOP_ESP=$$(sudo losetup --find --show --offset 1048576 --sizelimit 133152256 $@) && \
 	sudo mkfs.vfat -F 32 $$LOOP_ESP && \
 	mkdir -p $(BUILD_DIR)/mnt && \
 	sudo mount $$LOOP_ESP $(BUILD_DIR)/mnt && \
@@ -106,17 +108,14 @@ $(EC2_DISK): kernel $(BUILD_DIR)/initramfs.tar
 	sudo mkdir -p $(BUILD_DIR)/mnt/harland && \
 	sudo cp $(BOOTLOADER) $(BUILD_DIR)/mnt/EFI/BOOT/BOOTX64.EFI && \
 	sudo cp $(KERNEL_ELF) $(BUILD_DIR)/mnt/harland/kernel.elf && \
+	sudo cp $(BUILD_DIR)/initramfs.tar $(BUILD_DIR)/mnt/harland/initramfs.tar && \
 	echo '@echo -off' > $(BUILD_DIR)/startup.nsh && \
 	echo 'FS0:\EFI\BOOT\BOOTX64.EFI' >> $(BUILD_DIR)/startup.nsh && \
 	sudo cp $(BUILD_DIR)/startup.nsh $(BUILD_DIR)/mnt/startup.nsh && \
 	sudo umount $(BUILD_DIR)/mnt && \
 	sudo losetup -d $$LOOP_ESP && \
 	rmdir $(BUILD_DIR)/mnt
-	@# Write initramfs TAR to partition 2 (raw, no filesystem)
-	@# Partition 2 offset: 69632 * 512 = 35651584 (~34MB)
-	@echo "Writing initramfs to partition 2..."
-	dd if=$(BUILD_DIR)/initramfs.tar of=$@ bs=512 seek=69632 conv=notrunc 2>/dev/null
-	@echo "Created: $@ (GPT + ESP + initramfs, ready for EC2)"
+	@echo "Created: $@ (GPT + ESP with kernel and initramfs, ready for EC2)"
 
 # ============================================================================
 # Run targets

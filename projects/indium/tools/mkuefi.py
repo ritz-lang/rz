@@ -2,10 +2,12 @@
 """Build a UEFI boot disk image with explicit per-step timing/logging.
 
 Usage:
-  mkuefi.py <image> <bootloader> <kernel> <startup_nsh>
+  mkuefi.py <image> <bootloader> <kernel> <startup_nsh> [<initramfs_tar>]
 
 The image is a 64 MiB FAT32 filesystem holding /EFI/BOOT/BOOTX64.EFI,
-/harland/kernel.elf and /startup.nsh. It is zero-filled with a sparse
+/harland/kernel.elf and /startup.nsh, plus /harland/initramfs.tar when given:
+BOOTX64.EFI reads it and hands it to the kernel in BootInfo (AGAST #4253), so
+the disk boots without a virtio-blk initramfs disk. It is zero-filled with a sparse
 truncate, not `dd if=/dev/zero`, which hung the build (AGAST #2748).
 
 The image is built under a temporary name and renamed into place only when
@@ -71,18 +73,22 @@ def find_mkfs_vfat() -> str:
 
 
 def main() -> int:
-    if len(sys.argv) != 5:
-        print("usage: mkuefi.py <image> <bootloader> <kernel> <startup_nsh>", file=sys.stderr)
+    if len(sys.argv) not in (5, 6):
+        print(
+            "usage: mkuefi.py <image> <bootloader> <kernel> <startup_nsh> [<initramfs_tar>]",
+            file=sys.stderr,
+        )
         return 2
 
     image = Path(sys.argv[1])
     bootloader = Path(sys.argv[2])
     kernel = Path(sys.argv[3])
     startup_nsh = Path(sys.argv[4])
+    initramfs = Path(sys.argv[5]) if len(sys.argv) == 6 else None
 
     work = image.with_name(image.name + ".tmp")
     try:
-        build(work, bootloader, kernel, startup_nsh)
+        build(work, bootloader, kernel, startup_nsh, initramfs)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
         work.unlink(missing_ok=True)
         log(f"FAILED: {exc}")
@@ -95,7 +101,13 @@ def main() -> int:
     return 0
 
 
-def build(image: Path, bootloader: Path, kernel: Path, startup_nsh: Path) -> None:
+def build(
+    image: Path,
+    bootloader: Path,
+    kernel: Path,
+    startup_nsh: Path,
+    initramfs: Path | None = None,
+) -> None:
     timeout_s = int(os.environ.get("UEFI_STEP_TIMEOUT", "120"))
     trace = os.environ.get("UEFI_TRACE", "1") == "1"
 
@@ -130,6 +142,14 @@ def build(image: Path, bootloader: Path, kernel: Path, startup_nsh: Path) -> Non
         trace,
         env=mtools_env,
     )
+    if initramfs is not None:
+        run_step(
+            "copy initramfs",
+            ["mcopy", "-i", str(image), str(initramfs), "::/harland/initramfs.tar"],
+            timeout_s,
+            trace,
+            env=mtools_env,
+        )
 
 
 if __name__ == "__main__":

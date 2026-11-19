@@ -1,6 +1,8 @@
 # Initramfs Loader
 #
-# Loads the initial filesystem from a TAR archive on the VirtIO block device.
+# Loads the initial filesystem from a TAR archive: the one BOOTX64.EFI read
+# from the ESP and handed over in BootInfo (AGAST #4253: EC2 Nitro and laptops
+# have no virtio-blk), else the raw TAR on the first VirtIO block device.
 # This is required for boot - if the initramfs cannot be loaded, the kernel panics.
 #
 # The TAR archive contains:
@@ -32,11 +34,24 @@ const READ_BUFFER_SIZE: u64 = 3584   # 7 * 512
 # Attempts per virtio read before the load gives up (transient errors)
 const READ_ATTEMPTS: i32 = 3
 
+# The TAR the bootloader loaded (a kernel-virtual address) and its size, or
+# 0/0. When set, every sector read comes from it instead of virtio-blk.
+var g_boot_image: *u8 = 0 as *u8
+var g_boot_image_size: u64 = 0
+
 # ============================================================================
 # Public API
 # ============================================================================
 
-# Load the initramfs from VirtIO disk.
+# Use the TAR at kernel-virtual address `image` (`size` bytes) that the
+# bootloader read from the ESP, instead of a virtio-blk disk. Call before
+# initramfs_load.
+pub fn initramfs_set_boot_image(image: u64, size: u64)
+    g_boot_image = image as *u8
+    g_boot_image_size = size
+
+# Load the initramfs: from the boot image if initramfs_set_boot_image gave
+# one, else from the first VirtIO disk.
 # Panics if the initramfs cannot be loaded - this is a fatal boot error.
 pub fn initramfs_load() -> i32
     let result: i32 = initramfs_load_from_disk()
@@ -46,7 +61,7 @@ pub fn initramfs_load() -> i32
         serial_print_dec(result as u64)
         prints("\n" as StrView)
         prints("    Cannot continue without root filesystem.\n" as StrView)
-        prints("    Ensure VirtIO disk with TAR initramfs is attached.\n\n" as StrView)
+        prints("    Put harland/initramfs.tar on the ESP, or attach a VirtIO disk holding the TAR.\n\n" as StrView)
         halt_loop()
     result
 
@@ -54,20 +69,27 @@ pub fn initramfs_load() -> i32
 # Load from VirtIO Disk
 # ============================================================================
 
-# Load initramfs from the first VirtIO block device
-# The disk contains a raw TAR archive (no partition table)
+# Load initramfs from the boot image, else the first VirtIO block device.
+# Either holds a raw TAR archive (no partition table), read in 512-byte sectors.
 fn initramfs_load_from_disk() -> i32
-    let dev: *VirtioBlkDevice = virtio_blk_get_device()
-    if dev == 0 as *VirtioBlkDevice
-        prints("[initramfs] No VirtIO block device\n" as StrView)
-        return -1
+    var dev: *VirtioBlkDevice = 0 as *VirtioBlkDevice
+    if g_boot_image == 0 as *u8
+        dev = virtio_blk_get_device()
+        if dev == 0 as *VirtioBlkDevice
+            prints("[initramfs] No boot image and no VirtIO block device\n" as StrView)
+            return -1
 
     let ns: *KNamespace = knamespace_get()
     if ns == 0 as *KNamespace
         prints("[initramfs] No namespace\n" as StrView)
         return -2
 
-    prints("[initramfs] Loading from VirtIO disk...\n" as StrView)
+    if g_boot_image != 0 as *u8
+        prints("[initramfs] Loading from boot memory (" as StrView)
+        serial_print_dec(g_boot_image_size)
+        prints(" bytes)...\n" as StrView)
+    else
+        prints("[initramfs] Loading from VirtIO disk...\n" as StrView)
 
     # Allocate read buffer
     let read_buf: *u8 = kalloc(READ_BUFFER_SIZE) as *u8
@@ -134,7 +156,10 @@ fn initramfs_load_from_disk() -> i32
 
     prints("[initramfs] Loaded " as StrView)
     serial_print_dec(entries_loaded as u64)
-    prints(" files from disk\n" as StrView)
+    if g_boot_image != 0 as *u8
+        prints(" files from boot memory\n" as StrView)
+    else
+        prints(" files from disk\n" as StrView)
 
     if entries_loaded > 0
         return 0
@@ -268,7 +293,10 @@ fn process_directory(ns: *KNamespace, path: *StrView) -> i32
 
 # Read `count` sectors, retrying up to READ_ATTEMPTS times so one transient
 # virtio error doesn't fail the boot. Returns 0 or the last error.
+# With a boot image, copies from it instead (see read_boot_image).
 fn read_with_retry(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> i32
+    if g_boot_image != 0 as *u8
+        return read_boot_image(sector, count, buf)
     var result: i32 = -1
     var attempt: i32 = 0
     while attempt < READ_ATTEMPTS
@@ -277,6 +305,27 @@ fn read_with_retry(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8) -> 
             return 0
         attempt = attempt + 1
     result
+
+# Copy `count` 512-byte sectors from sector `sector` of the boot image into
+# buf. Bytes past the image's end read as zero: an archive cut short of its
+# two all-zero end blocks (or of its 10 KiB record padding) then ends where
+# its data does, as a disk past the TAR would read. Always returns 0.
+fn read_boot_image(sector: u64, count: u32, buf: *u8) -> i32
+    let offset: u64 = sector * 512
+    let want: u64 = count as u64 * 512
+    var avail: u64 = 0
+    if offset < g_boot_image_size
+        avail = g_boot_image_size - offset
+    if avail > want
+        avail = want
+    var i: u64 = 0
+    while i < avail
+        *(buf + i as i64) = *(g_boot_image + (offset + i) as i64)
+        i = i + 1
+    while i < want
+        *(buf + i as i64) = 0
+        i = i + 1
+    0
 
 # Create every missing ancestor directory of the absolute path `path`
 # (len bytes), outermost first. Stops at the first mkdir that fails for a
