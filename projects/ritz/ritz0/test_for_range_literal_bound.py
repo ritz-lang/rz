@@ -107,6 +107,51 @@ for i in -129..m
 if n != 2
     return 1
 0""",
+    # AGAST #4261: `-1` doesn't fit the u32 end, so the loop widens to an
+    # i64, and at 64 bits only a u64 bound is unsigned (§6.3): the compare is
+    # signed and runs -1, 0, 1, 2. ritz0 compared unsigned (-1 as u64 > 3) and
+    # ran it 0 times.
+    "negative_literal_unsigned_end": """\
+let m: u32 = 3
+var n: i64 = 0
+var s: i64 = 0
+for i in -1..m
+    n = n + 1
+    s = s + i
+if n != 4
+    return 1
+if s != 2
+    return 2
+0""",
+    "negative_literal_unsigned_end_inclusive": """\
+let m: u32 = 3
+var n: i64 = 0
+for i in -1..=m
+    n = n + 1
+if n != 5
+    return 1
+0""",
+    # The same without a literal: an i64 start and a u32 end are an i64.
+    "i64_start_u32_end": """\
+let a: i64 = -2
+let m: u32 = 2
+var n: i64 = 0
+for i in a..m
+    n = n + 1
+if n != 4
+    return 1
+0""",
+    # A u32 end beyond i32 still zero-extends into the signed i64 range.
+    "negative_literal_big_u32_end": """\
+let m: u32 = 4294967295
+var n: i64 = 0
+for i in -1..m
+    n = n + 1
+    if n > 2
+        break
+if n != 3
+    return 1
+0""",
 }
 
 # name -> (program body of main, the `take(i)` line)

@@ -86,8 +86,14 @@ _SFX_SEARCH = ("fn f(n: u16) -> u16\n    var low = 0u16\n    var high = n\n"
                "    while low < high\n        let mid = (low + high) / 2\n"
                "        if mid < 7\n            low = mid + 1\n"
                "        else\n            high = mid\n    low\n")
+
+# A range loop's variable has its bounds' type (LANGUAGE_SPEC §6.3, #4080), so
+# `take(i)` narrows when the end is an i64 and not when it is an i32: Sema
+# used to leave `i` untyped and accept both (AGAST #4165).
+_RANGE_VAR_ARG = "fn g(n: {t}) -> i32\n    for i in 0..n\n        take(i)\n    0\n"
 EXTRA_REJECTED = {
-    "member_through_pointer":    _EXTRA_FN.format("q.x = big()"),
+    "range_var_arg":             _RANGE_VAR_ARG.format(t="i64"),
+    "member_through_pointer":   _EXTRA_FN.format("q.x = big()"),
     "member_through_pointer_op": _EXTRA_FN.format("q.x += big()"),
     "local_field_op":            SLOTS._fn("var p = P { x: 0 }\np.x += big()"),
     "tail_match_binding":        _OPT.format(t="i64"),
@@ -100,6 +106,7 @@ EXTRA_REJECTED = {
     "suffixed_local_wider":      _SFX + "fn f() -> u32\n    let p = 1u64\n    take_u32(p)\n",
 }
 EXTRA_ACCEPTED = {
+    "range_var_arg_fits":          _RANGE_VAR_ARG.format(t="i32"),
     "member_through_pointer_cast": _EXTRA_FN.format("q.x = big() as i32"),
     "tail_match_binding_fits":     _OPT.format(t="i32"),
     "tail_if_arm_let_fits":        _TAIL_LET.format(t="i32", e="x"),

@@ -9329,10 +9329,17 @@ class LLVMEmitter:
         """Is `for j in a..b` unsigned? It is when a bound is, by binary `<`'s
         rule (_operands_unsigned, #2361), so `for j in 0..big` with
         `big: u64 = 1 << 63` runs (#1636) and `-3..2` stays signed. This one
-        answer picks the compare and `j`'s type in the body (#3328)."""
+        answer picks the compare and `j`'s type in the body (#3328).
+
+        At 64 bits only a u64 bound counts (LANGUAGE_SPEC §6.3, AGAST #4261):
+        `-1..m` with `m: u32` widens to an i64 and compares signed, as an
+        i64 and a u32 operand of `<` do. ritz1's for_range_unsigned."""
         narrowed = isinstance(loop_ty, ir.IntType) and loop_ty.width < 64
-        return (self._int_shape(range_expr.start, narrowed)[1]
-                or self._int_shape(range_expr.end, narrowed)[1])
+        for bound in (range_expr.start, range_expr.end):
+            bits, unsigned = self._int_shape(bound, narrowed)
+            if unsigned and (narrowed or bits == 64):
+                return True
+        return False
 
     def _for_literal_bound_type(self, range_expr: rast.Range, start_val: ir.Value,
                                 end_val: ir.Value):

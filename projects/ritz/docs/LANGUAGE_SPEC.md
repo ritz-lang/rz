@@ -2186,6 +2186,8 @@ record):
   `m: i8`). Two literals (`1..=5`) are an `i64`, as a lone literal is.
 - Otherwise the wider bound's width, unsigned when a bound is unsigned (only a
   `u64` counts at 64 bits). That range compares unsigned (AGAST #1636 / #3328).
+  So `-1..m` with `m: u32` is an `i64` range that compares signed and runs
+  from `-1` (AGAST #4261), as does `a..m` with `a: i64`.
 
 The variable's arithmetic is at that width: with `m: u32`, `i - 2` in
 `for i in 1..m` wraps as a `u32` does.
