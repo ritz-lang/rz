@@ -1005,6 +1005,50 @@ fn test_cmd_zcount() -> i32
     return 0
 
 
+# Bounds are read with Redis's raw strtod (zslParseRange), not the strict
+# string2d that reads scores (AGAST #4311).  Replies checked against Redis.
+[[test]]
+fn test_cmd_score_bound_strtod() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    # An empty bound, or a bare "(", is 0.
+    if reply_is(@store, c"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$0\r\n\r\n$1\r\n3\r\n", c":3\r\n") != 0
+        return 2
+    if reply_is(@store, c"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$1\r\n(\r\n$1\r\n2\r\n", c":2\r\n") != 0
+        return 3
+    # Leading whitespace, also after "(".
+    if reply_is(@store, c"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$2\r\n 2\r\n$1\r\n3\r\n", c":2\r\n") != 0
+        return 4
+    if reply_is(@store, c"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$3\r\n( 1\r\n$1\r\n3\r\n", c":2\r\n") != 0
+        return 5
+    # Overflow is ±inf, underflow is 0.
+    if reply_is(@store, c"ZCOUNT z -1e400 1e400\r\n", c":3\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZCOUNT z 1e-400 2\r\n", c":2\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZRANGE z 1e400 (-1e400 BYSCORE REV\r\n", c"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n") != 0
+        return 8
+    # Hex floats.
+    if reply_is(@store, c"ZCOUNT z (0x1p0 0x1.8p1\r\n", c":2\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZRANGEBYSCORE z 0x2 +inf\r\n", c"*2\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 10
+    # Still refused: whitespace alone, trailing junk, a bare "0x" or "1e".
+    if reply_is(@store, c"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$1\r\n \r\n$1\r\n3\r\n", RANGE_NOT_FLOAT) != 0
+        return 11
+    if reply_is(@store, c"*4\r\n$6\r\nZCOUNT\r\n$1\r\nz\r\n$2\r\n1 \r\n$1\r\n3\r\n", RANGE_NOT_FLOAT) != 0
+        return 12
+    if reply_is(@store, c"ZCOUNT z 0x 1\r\n", RANGE_NOT_FLOAT) != 0
+        return 13
+    if reply_is(@store, c"ZRANGEBYSCORE z 1e 2\r\n", RANGE_NOT_FLOAT) != 0
+        return 14
+    # Scores themselves stay strict.
+    if reply_is(@store, c"ZADD z 0x10 d\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 15
+    return 0
+
+
 [[test]]
 fn test_cmd_zincrby() -> i32
     var store: Store = store_new()

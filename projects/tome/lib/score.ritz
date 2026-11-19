@@ -12,6 +12,11 @@
 # correctly rounded (to nearest, ties to even).  Hex floats ("0x1p3"), which
 # glibc's strtod also takes, are refused.
 #
+# score_parse_bound reads a range bound the way Redis's zslParseRange does,
+# with glibc's raw strtod (AGAST #4311): it stops at a NUL, skips leading
+# whitespace, reads "" as 0, takes hex floats ("0x1.8p3"), and gives ±inf on
+# overflow and ±0 on underflow.  Only trailing junk and NaN are refused.
+#
 # score_format follows Redis 7.2+'s addReplyDouble: "inf" / "-inf", else
 # fpconv_dtoa's layout of the shortest digits that read back as the same
 # double ("1.5", "0.1", "1e+8", "2.5e-7", "-0").  The digits come from
@@ -206,9 +211,125 @@ fn score_store_bits(out: *f64, bits: u64)
     let po: *u64 = out as *u64
     *po = bits
 
+# C isspace: ' ' \t \n \v \f \r
+fn score_is_space(c: u8) -> bool
+    return c == 32 or (c >= 9 and c <= 13)
+
+# Hex digit value, or -1.
+fn score_hex_val(c: u8) -> i32
+    if score_is_digit(c)
+        return (c - 48) as i32
+    let l: u8 = c | 32
+    if l >= 97 and l <= 102
+        return (l - 87) as i32
+    return -1
+
+# A value too large for a double: refused, or ±inf when lenient.
+fn score_overflow(out: *f64, sign: u64, lenient: bool) -> i32
+    if not lenient
+        return 0
+    score_store_bits(out, sign | F64_INF)
+    return 1
+
+# A nonzero value that rounds to 0: refused, or ±0 when lenient.
+fn score_underflow(out: *f64, sign: u64, lenient: bool) -> i32
+    if not lenient
+        return 0
+    score_store_bits(out, sign)
+    return 1
+
 # Parse p[0..len] as a score into *out.  1 if it is one, 0 if Redis would
 # reply "value is not a valid float" (*out is then untouched).
 pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
+    return score_parse_mode(p, len, out, false)
+
+# Parse p[0..len] as a range bound into *out (see the top of the file).  1 if
+# it is one, 0 if Redis would reply "min or max is not a float".
+pub fn score_parse_bound(p: *u8, len: i64, out: *f64) -> i32
+    var n: i64 = 0
+    while n < len and p[n] != 0
+        n += 1
+    if n == 0
+        score_store_bits(out, 0)
+        return 1
+    var i: i64 = 0
+    while i < n and score_is_space(p[i])
+        i += 1
+    return score_parse_mode(p + i, n - i, out, true)
+
+# Hex float digits after "0x" at p[i..len]: h [. h] [p [+-] d], with at
+# least one hex digit.  Lenient (bound) parsing only.
+fn score_parse_hex(p: *u8, start: i64, len: i64, sign: u64, out: *f64) -> i32
+    var i: i64 = start
+    var num: Big
+    big_set_u64(@num, 0)
+    var nd: i64 = 0                         # significant hex digits kept
+    var bexp: i64 = 0                       # value = num * 2^bexp
+    var sticky: bool = false
+    var saw_digit: bool = false
+    var frac: bool = false
+    while i < len
+        if p[i] == 46 and not frac          # '.'
+            frac = true
+            i += 1
+            continue
+        let d: i32 = score_hex_val(p[i])
+        if d < 0
+            break
+        saw_digit = true
+        if nd == 0 and d == 0
+            if frac
+                bexp -= 4
+        else if nd < 32                     # 128 bits: far past rounding
+            big_mul_add_small(@num, 16, d as u32)
+            nd += 1
+            if frac
+                bexp -= 4
+        else
+            if not frac
+                bexp += 4
+            if d != 0
+                sticky = true
+        i += 1
+    if not saw_digit
+        return 0
+    if i < len and (p[i] | 32) == 112       # 'p'
+        i += 1
+        var eneg: bool = false
+        if i < len and (p[i] == 43 or p[i] == 45)
+            eneg = p[i] == 45
+            i += 1
+        if i >= len or not score_is_digit(p[i])
+            return 0
+        var ev: i64 = 0
+        while i < len and score_is_digit(p[i])
+            if ev < 100000
+                ev = ev * 10 + ((p[i] - 48) as i64)
+            i += 1
+        if eneg
+            bexp -= ev
+        else
+            bexp += ev
+    if i != len
+        return 0
+    if nd == 0
+        score_store_bits(out, sign)         # ±0
+        return 1
+    # Loose bounds; score_round decides the edges exactly.
+    let top: i64 = big_bitlen(@num) + bexp  # value < 2^top
+    if top > 1100
+        return score_overflow(out, sign, true)
+    if top < -1200
+        return score_underflow(out, sign, true)
+    var den: Big
+    big_set_u64(@den, 1)
+    if bexp >= 0
+        big_shl(@num, bexp)
+    else
+        big_shl(@den, 0 - bexp)
+    return score_round(@num, @den, sign, sticky, true, out)
+
+fn score_parse_mode(p: *u8, len: i64, out: *f64, lenient: bool) -> i32
     if len <= 0
         return 0
     var i: i64 = 0
@@ -217,6 +338,9 @@ pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
         if p[0] == 45
             sign = F64_SIGN
         i = 1
+
+    if lenient and i + 1 < len and p[i] == 48 and (p[i + 1] | 32) == 120   # "0x"
+        return score_parse_hex(p, i + 2, len, sign, out)
 
     # inf / infinity
     if i < len and (p[i] | 32) == 105      # 'i'
@@ -295,9 +419,9 @@ pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
 
     # value = D * 10^dexp with 10^(nd+dexp-1) <= value < 10^(nd+dexp).
     if nd + dexp > 309
-        return 0                            # >= 1e309: overflow
+        return score_overflow(out, sign, lenient)   # >= 1e309
     if nd + dexp <= -324
-        return 0                            # < 1e-324: rounds to 0
+        return score_underflow(out, sign, lenient)  # < 1e-324: rounds to 0
 
     # value = N / M exactly.
     var num: Big
@@ -312,15 +436,20 @@ pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
         big_mul_pow10(@num, dexp)
     else
         big_mul_pow10(@den, 0 - dexp)
+    return score_round(@num, @den, sign, sticky, lenient, out)
 
+# Store sign | the double nearest num / den (> 0) into *out.  `sticky` says
+# the true value is a little above num / den (dropped nonzero digits).
+fn score_round(num: *Big, den: *Big, sign: u64, sticky_in: bool, lenient: bool, out: *f64) -> i32
+    var sticky: bool = sticky_in
     # Scale so that den <= num < 2*den; then value is in [2^b, 2^(b+1)).
-    var b: i64 = big_bitlen(@num) - big_bitlen(@den)
+    var b: i64 = big_bitlen(num) - big_bitlen(den)
     if b >= 0
-        big_shl(@den, b)
+        big_shl(den, b)
     else
-        big_shl(@num, 0 - b)
-    if big_cmp(@num, @den) < 0
-        big_shl(@num, 1)
+        big_shl(num, 0 - b)
+    if big_cmp(num, den) < 0
+        big_shl(num, 1)
         b -= 1
 
     # 64 quotient bits by long division: value = q * 2^(b-63), plus a
@@ -329,12 +458,12 @@ pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
     var k: i32 = 0
     while k < 64
         q = q << 1
-        if big_cmp(@num, @den) >= 0
-            big_sub(@num, @den)
+        if big_cmp(num, den) >= 0
+            big_sub(num, den)
             q = q | 1
-        big_shl(@num, 1)
+        big_shl(num, 1)
         k += 1
-    if not big_is_zero(@num)
+    if not big_is_zero(num)
         sticky = true
 
     var bits: u64 = 0
@@ -348,13 +477,13 @@ pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
                 mant = mant >> 1
                 b += 1
         if b > 1023
-            return 0                        # rounded up to inf
+            return score_overflow(out, sign, lenient)   # rounded up to inf
         bits = (((b + 1023) as u64) << 52) | (mant & F64_FRAC_MASK)
     else
         # Subnormal: the exponent is pinned at -1022, so fewer bits remain.
         let shift: i64 = 11 + (-1022 - b)
         if shift > 64
-            return 0                        # below half the least subnormal
+            return score_underflow(out, sign, lenient)  # below half the least subnormal
         var mant: u64 = 0
         var low: bool = sticky
         if shift == 64
@@ -370,7 +499,7 @@ pub fn score_parse(p: *u8, len: i64, out: *f64) -> i32
         if round == 1 and (low or (mant & 1) == 1)
             mant += 1                       # may carry into the least normal
         if mant == 0
-            return 0                        # underflowed to 0
+            return score_underflow(out, sign, lenient)  # underflowed to 0
         bits = mant
     score_store_bits(out, sign | bits)
     return 1

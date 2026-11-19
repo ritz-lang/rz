@@ -260,3 +260,103 @@ fn test_score_round_trip() -> i32
     if round_trips(0x7FEFFFFFFFFFFFFF) != 0
         return 5
     return 0
+
+
+# ============================================================================
+# Range bounds (AGAST #4311): Redis's zslParseRange reads them with raw
+# strtod, which also takes "", leading space, hex floats, and gives ±inf on
+# overflow and ±0 on underflow.  It stops at a NUL; only trailing junk and
+# NaN are refused.
+# ============================================================================
+
+fn bound_is(text: *u8, len: i64, want: u64) -> i32
+    var out: f64 = 1.0
+    if score_parse_bound(text, len, @out) != 1
+        return 1
+    if sc_bits(out) != want
+        return 2
+    return 0
+
+fn bound_refused(text: *u8) -> i32
+    var out: f64 = 0.0
+    if score_parse_bound(text, strlen(text), @out) != 0
+        return 1
+    return 0
+
+fn bound_to(text: *u8, want: u64) -> i32
+    return bound_is(text, strlen(text), want)
+
+
+[[test]]
+fn test_score_bound_lenient() -> i32
+    if bound_to(c"", 0) != 0
+        return 1
+    if bound_to(c"1.5", 0x3FF8000000000000) != 0
+        return 2
+    if bound_to(c" \t\n\x0b\x0c\r2", 0x4000000000000000) != 0
+        return 3
+    if bound_to(c"1e400", 0x7FF0000000000000) != 0
+        return 4
+    if bound_to(c"-1e400", 0xFFF0000000000000) != 0
+        return 5
+    if bound_to(c"1.7976931348623159e308", 0x7FF0000000000000) != 0
+        return 6
+    if bound_to(c"1e-400", 0) != 0
+        return 7
+    if bound_to(c"-2e-324", 0x8000000000000000) != 0
+        return 8
+    # Hex floats: digits, a fraction, a binary exponent, any case.
+    if bound_to(c"0x10", 0x4030000000000000) != 0
+        return 9
+    if bound_to(c"-0X1.8P1", 0xC008000000000000) != 0
+        return 10
+    if bound_to(c"0x.8", 0x3FE0000000000000) != 0
+        return 11
+    if bound_to(c"0x1p-1074", 0x0000000000000001) != 0
+        return 12
+    if bound_to(c"0x1p-1076", 0) != 0
+        return 13
+    if bound_to(c"0x1p1024", 0x7FF0000000000000) != 0
+        return 14
+    if bound_to(c"0x1fffffffffffff", 0x433FFFFFFFFFFFFF) != 0
+        return 15
+    # 2^53 + 1 rounds to even (2^53); a sticky bit past it rounds up.
+    if bound_to(c"0x20000000000001", 0x4340000000000000) != 0
+        return 16
+    if bound_to(c"0x20000000000001000000000000000000001", 0x4880000000000001) != 0
+        return 17
+    if bound_to(c"0x1.fffffffffffff8p1023", 0x7FF0000000000000) != 0
+        return 18
+    if bound_to(c"0xffP-4", 0x402FE00000000000) != 0
+        return 19
+    # strtod stops at a NUL.
+    if bound_is(c"3\0x", 3, 0x4008000000000000) != 0
+        return 20
+    if bound_to(c"inf", 0x7FF0000000000000) != 0
+        return 21
+    return 0
+
+
+[[test]]
+fn test_score_bound_refused() -> i32
+    if bound_refused(c" ") != 0
+        return 1
+    if bound_refused(c"1 ") != 0
+        return 2
+    if bound_refused(c"nan") != 0
+        return 3
+    if bound_refused(c"-") != 0
+        return 4
+    if bound_refused(c"0x") != 0
+        return 5
+    if bound_refused(c"0xg") != 0
+        return 6
+    if bound_refused(c"0x1p") != 0
+        return 7
+    if bound_refused(c"1e") != 0
+        return 8
+    if bound_refused(c"x") != 0
+        return 9
+    if bound_refused(c"0x.") != 0
+        return 10
+    return 0
