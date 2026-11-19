@@ -673,6 +673,7 @@ pick_train_host() {
 # train's tip exits 3.  Only an EXIT= line in that log ends a remote wait: a
 # slice that times out (124) or ends with no EXIT= polls again, and 5 ends
 # with no EXIT= in a row are no verdict (98), never exit 0 (AGAST #4116).
+# The remote wait runs in the train's own slot tree, $(rwt) (AGAST #4247).
 cmd_wait() {
     local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 nov=0 tip
     for s in $(queue); do
@@ -690,7 +691,7 @@ cmd_wait() {
     if is_local "$host"; then exec bash "$GATE" --wait "$rlog"; fi
     tip="$(field TIP "$st")"
     while :; do
-        rc=0; remote "$host" wait "$REMOTE_WT" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" "$QUEUED_PAUSE" || rc=$?
+        rc=0; remote "$host" wait "$(rwt)" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" "$QUEUED_PAUSE" || rc=$?
         if [[ $rc -eq 124 ]]; then nov=0; continue; fi    # still running
         if [[ $rc -eq 255 ]]; then                        # ssh itself failed
             tries=$((tries + 1))

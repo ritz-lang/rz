@@ -664,6 +664,25 @@ out="$(timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
 [[ $rc -eq 98 && "$(polls)" == 5 ]] && has "$out" "EXIT=none" "a remote gate that dies with no verdict exits 98 after 5 polls, not a hang" \
     || bad "a remote gate that dies with no verdict exits 98 after 5 polls, not a hang (rc=$rc, $(polls) polls)"
 rm -f "$T/queued-polls" "$(dirname "$rlog")/.gate-queue"; echo EXIT=0 >> "$rlog"
+# 11h. A remote wait runs the run-gate.sh of the slot's own tree (AGAST
+# #4247): train 2 gates in remote-train-<s>, and on a host where slot 1
+# never ran there is no remote-train, so the slot-1 tree's script is no
+# verdict (98).  RZ_REMOTE_GATE=- (the default) picks the tree's own script;
+# only train 2's tree has one here.
+rw2="$(rw_of 2)"; g2="$rw2/.claude/skills/rz-iterate/run-gate.sh"
+[[ "$rw2" != "$RW" ]] || bad "train 2 gates in a slot >= 2 tree ($rw2)"
+[[ -e "$RW" ]] && mv "$RW" "$T/remote-train.aside"
+mkdir -p "$(dirname "$g2")"; [[ -e "$g2" ]] && mv "$g2" "$g2.aside"; cp "$T/gate.sh" "$g2"
+# The gate is still running (no EXIT= yet); its --wait ends it with EXIT=0.
+sed -i '/^EXIT=/d' "$rlog"; echo 0 > "$T/queued-polls"; : > "$T/ssh-log"
+out="$(RZ_REMOTE_GATE=- timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
+rm -f "$T/queued-polls"; grep -q '^EXIT=' "$rlog" || echo EXIT=0 >> "$rlog"
+[[ $rc -eq 0 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" "a slot >= 2 remote wait with no slot-1 tree reads the verdict from its own tree" \
+    || { bad "a slot >= 2 remote wait with no slot-1 tree reads the verdict from its own tree (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+grep -q -- "-- wait $rw2 - " "$T/ssh-log" && ok "the remote wait names the slot's own tree" \
+    || bad "the remote wait names the slot's own tree ($(grep -- '-- wait ' "$T/ssh-log" | head -1))"
+mv "$g2" "$T/run-gate.sh.4247"; [[ -e "$g2.aside" ]] && mv "$g2.aside" "$g2"
+[[ -e "$T/remote-train.aside" ]] && mv "$T/remote-train.aside" "$RW"
 bash "$TR" wait "$llog" >/dev/null 2>&1
 bash "$TR" land "$log1" >/dev/null 2>&1
 out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "^MERGED +eb2 " "the queued-then-passed remote verdict lands"
