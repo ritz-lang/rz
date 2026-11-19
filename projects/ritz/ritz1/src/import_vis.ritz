@@ -29,19 +29,23 @@ import ritzlib.memory
 import ritzlib.str
 import ritzlib.hash
 import ritzlib.string
+import ritzlib.io
 
 import ast
-import ast_helpers   # the enum / alias declaration log (AGAST #3907)
+import ast_helpers   # the enum / alias / trait declaration logs (#3907, #3467)
+import diag          # R54's located errors (AGAST #3467)
 
 struct VisName
     name: *u8
     len: i32
+    fd: *FnDef        # the fn this name declares, else null (R54's private fn)
     next: *VisName
 
 struct VisEdge
     target: *VisMod
     shown: *u8        # the import's path as written: `c`, `ritzlib.str`
     is_pub: i32
+    decl: *ImportDecl # the import itself: R54 reads its list (AGAST #3467)
     next: *VisEdge
 
 struct VisMod
@@ -53,6 +57,9 @@ struct VisMod
     shown: *u8        # how the nearest importer wrote it
     via: *u8          # that importer, as it was written; null for the input
     queued: *VisMod   # the breadth-first queue's link
+    traits: *VisName  # its traits and its items gated out for this target:
+                      # R54 only, never tabled (AGAST #3467)
+    r54_active: i32   # vis_defined is inside this module (a `pub import` cycle)
     next: *VisMod
 
 # A name of the merged module: hidden, with where it comes from, or visible.
@@ -115,22 +122,28 @@ pub fn vis_module(key: *u8) -> *VisMod
     vm.shown = null
     vm.via = null
     vm.queued = null
+    vm.traits = null
+    vm.r54_active = 0
     vm.next = g_vis_mods
     g_vis_mods = vm
     vm
 
-fn vis_add_name(vm: *VisMod, name: *u8, len: i32)
+fn vis_new_name(name: *u8, len: i32, fd: *FnDef, rest: *VisName) -> *VisName
     let n: *VisName = malloc(sizeof(VisName)) as *VisName
     n.name = name
     n.len = len
-    n.next = vm.names
-    vm.names = n
+    n.fd = fd
+    n.next = rest
+    n
+
+fn vis_add_name(vm: *VisMod, name: *u8, len: i32)
+    vm.names = vis_new_name(name, len, null, vm.names)
 
 # What `m` declares itself: call before its imports are merged into it.
 pub fn vis_names(vm: *VisMod, m: *Module)
     var f: *FnDef = m.functions
     while f != null
-        vis_add_name(vm, f.name, f.name_len)
+        vm.names = vis_new_name(f.name, f.name_len, f, vm.names)
         f = f.next
     var s: *StructDef = m.structs
     while s != null
@@ -169,6 +182,33 @@ pub fn vis_type_names(vm: *VisMod, mark: i32)
         vis_add_name(vm, name, len)
         i = i + 1
 
+# The traits a file declared and the items `[[target_os]]` gated out of it:
+# ast_helpers' trait and gated logs from the marks taken just before the file
+# was parsed.  Kept apart from `names`, so R54 sees them and #3891's table
+# doesn't (AGAST #3467).
+pub fn vis_r54_names(vm: *VisMod, mark: i32, gated_mark: i32)
+    let end: i32 = trait_declared_count()
+    var i: i32 = mark
+    while i < end
+        var len: i32 = 0
+        let name: *u8 = trait_declared_at(i, @len)
+        vm.traits = vis_new_name(name, len, null, vm.traits)
+        i = i + 1
+    let gated_end: i32 = gated_decl_count()
+    var g: i32 = gated_mark
+    while g < gated_end
+        var glen: i32 = 0
+        let gname: *u8 = gated_decl_at(g, @glen)
+        vm.traits = vis_new_name(gname, glen, null, vm.traits)
+        g = g + 1
+
+# Forget `vm`'s import edges, before its imports are resolved again: a second
+# parse pass (main.ritz, #1475) would otherwise list each import twice, the
+# first pass's copy pointing at that pass's ImportDecls.  (A list R54 refuses
+# stops the compile in the first pass, so the second never reports it again.)
+pub fn vis_edges_reset(vm: *VisMod)
+    vm.edges = null
+
 # `from`'s import of the module at canonical path `key`, written `imp`.
 pub fn vis_edge(from: *VisMod, key: *u8, imp: *ImportDecl)
     let e: *VisEdge = malloc(sizeof(VisEdge)) as *VisEdge
@@ -183,6 +223,7 @@ pub fn vis_edge(from: *VisMod, key: *u8, imp: *ImportDecl)
     e.shown = vis_copy(string_as_ptr(@&shown), string_len(@shown))
     string_drop(@&shown)
     e.is_pub = imp.is_pub
+    e.decl = imp
     # Appended, so edges keep source order: the nearest import is the first.
     e.next = null
     if from.edges == null
@@ -311,3 +352,130 @@ pub fn vis_hidden(name: *u8, len: i32) -> *VisEntry
     if e == null or e.hidden == 0
         return null
     e
+
+# =============================================================================
+# LARB R54 (LANGUAGE_SPEC §15.1, AGAST #3467; ritz0's #3466)
+# =============================================================================
+#
+# Each name in the input's `import m { … }` must be one `m` defines: declared
+# at its top level (a fn, struct, const, global, enum, type alias or trait),
+# or re-exported by one of its `pub import`s (only the names a `pub import t
+# { x }` lists).  What `m` reaches through its own plain `import` doesn't
+# count.  Otherwise, at the name, in ritz0's words:
+#
+#   main.ritz:1:17: error: `nope` is not defined in a
+#
+# A private fn in the list is §15.2's error at the import, with call_check's
+# exemptions and its note:
+#
+#   main.ritz:1:17: error: `helper` is private to a.ritz; mark it `pub` (#3413)
+#   /abs/a.ritz:1:1: note: `helper` is declared here
+#
+# Private types and consts count: type privacy isn't enforced.  The list is
+# checked but doesn't filter.  Only the input's own imports are checked: every
+# file is compiled on its own, so each list is checked in the file that
+# writes it.  Run once imports are resolved, before Sema and emission.
+
+# §15.2's private fn, as call_check's cc_private exempts: an `extern fn` (no
+# body), a written `fn .. = extern`, a generated `E.from`, and a fn whose file
+# isn't known.
+fn vis_private_fn(fd: *FnDef) -> i32
+    if fd == null or fd.is_pub == 1 or fd.body == null or fd.extern_decl == 1
+        return 0
+    (fd.from_generated == 0 and fd.def_file != null) as i32
+
+# `name` in `n`'s list.  Of [[target_os]] variants, one that isn't a private
+# fn wins, so the private-fn error needs every variant private.
+fn vis_in_list(n: *VisName, name: *u8, len: i32) -> *VisName
+    var private: *VisName = null
+    var at: *VisName = n
+    while at != null
+        if at.len == len and memcmp(at.name, name, len as i64) == 0
+            if vis_private_fn(at.fd) == 0
+                return at
+            if private == null
+                private = at
+        at = at.next
+    private
+
+fn vis_listed(it: *ImportItem, name: *u8, len: i32) -> i32
+    var at: *ImportItem = it
+    while at != null
+        if at.name_len == len and memcmp(at.name, name, len as i64) == 0
+            return 1
+        at = at.next
+    0
+
+# The declaration of `name` that `vm` defines, or null.  Its own come first;
+# then its `pub import`s', in source order.  A `pub import` cycle adds nothing.
+fn vis_defined(vm: *VisMod, name: *u8, len: i32) -> *VisName
+    let own: *VisName = vis_in_list(vm.names, name, len)
+    if own != null
+        return own
+    let tr: *VisName = vis_in_list(vm.traits, name, len)
+    if tr != null
+        return tr
+    if vm.r54_active == 1
+        return null
+    vm.r54_active = 1
+    var found: *VisName = null
+    var e: *VisEdge = vm.edges
+    while e != null and found == null
+        if e.is_pub == 1
+            # A name `m`'s `pub import t { x }` lists that `t` doesn't
+            # define is `m`'s error, reported when `m` is compiled.
+            if e.decl.items == null or vis_listed(e.decl.items, name, len) == 1
+                found = vis_defined(e.target, name, len)
+        e = e.next
+    vm.r54_active = 0
+    found
+
+fn vis_eprint(p: *u8, len: i32)
+    for i in 0..len
+        eprint_char(p[i])
+
+fn vis_basename(path: *u8) -> *u8
+    var base: *u8 = path
+    var i: i64 = 0
+    while path[i] != 0
+        if path[i] == '/'
+            base = path + i + 1
+        i = i + 1
+    base
+
+# Check the input's selective lists; `main` is its module, `file` its path as
+# diagnostics name it.  The number of errors reported.
+pub fn vis_selective_check(main: *VisMod, file: *u8) -> i32
+    var errors: i32 = 0
+    var e: *VisEdge = main.edges
+    while e != null
+        var it: *ImportItem = e.decl.items
+        while it != null
+            let d: *VisName = vis_defined(e.target, it.name, it.name_len)
+            if d == null
+                diag_error_at(file, diag_span(it.line, it.col))
+                eprint_char('`')
+                vis_eprint(it.name, it.name_len)
+                eprints_cstr(c"` is not defined in ")
+                eprints_cstr(e.shown)
+                eprint_char('\n')
+                errors = errors + 1
+            else if vis_private_fn(d.fd) == 1
+                diag_error_at(file, diag_span(it.line, it.col))
+                eprint_char('`')
+                vis_eprint(it.name, it.name_len)
+                eprints_cstr(c"` is private to ")
+                eprints_cstr(vis_basename(d.fd.def_file))
+                eprints_cstr(c"; mark it `pub` (#3413)\n")
+                eprints_cstr(d.fd.def_file)
+                eprint_char(':')
+                eprint_int(d.fd.line as i64)
+                eprint_char(':')
+                eprint_int(d.fd.col as i64)
+                eprints_cstr(c": note: `")
+                vis_eprint(it.name, it.name_len)
+                eprints_cstr(c"` is declared here\n")
+                errors = errors + 1
+            it = it.next
+        e = e.next
+    errors

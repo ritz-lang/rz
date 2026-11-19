@@ -203,11 +203,42 @@ pub fn test_fns_reset()
 # Without these, the grammar action would need to be multi-statement
 # (`if not skipped: add_to_module; reset; return 1`), which ritzgen
 # doesn't yet support — so we hide the conditional inside a helper.
+# AGAST #3467 (LARB R54): every item `[[target_os]]` gates out, by name, in
+# parse order, never reset.  Gating decides what is compiled, not what a
+# module defines: ritzlib.sys's harland-only names may be listed in an
+# `import ritzlib.sys { … }` built for linux, as ritz0 accepts.  import_vis
+# marks the log before a file is parsed and reads what the file added.
+var g_gated_names: **u8 = null
+var g_gated_lens: *i32 = null
+var g_gated_count: i32 = 0
+var g_gated_cap: i32 = 0
+
+fn gated_decl_log(name: *u8, len: i32)
+    if g_gated_count >= g_gated_cap
+        var cap: i32 = g_gated_cap * 2
+        if cap == 0
+            cap = 64
+        g_gated_names = realloc(g_gated_names as *u8, (cap as i64) * 8) as **u8
+        g_gated_lens = realloc(g_gated_lens as *u8, (cap as i64) * 4) as *i32
+        g_gated_cap = cap
+    *(g_gated_names + g_gated_count) = name
+    *(g_gated_lens + g_gated_count) = len
+    g_gated_count = g_gated_count + 1
+
+pub fn gated_decl_count() -> i32
+    g_gated_count
+
+pub fn gated_decl_at(i: i32, out_len: *i32) -> *u8
+    *out_len = *(g_gated_lens + i)
+    *(g_gated_names + i)
+
 pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     # AGAST #4055: a fn gated out never reaches the module, so main's
     # fn-conflict checks can't see two gated to one other target; note it.
     if p.skip_item != 0 and (g_attr_bits & ATTR_TARGET_OS) != 0 and fn_def.body != null
         fn_variant_note(fn_def.name, fn_def.name_len, fn_def.line, parse_file_copy_shared(p), g_attr_target)
+    if p.skip_item != 0
+        gated_decl_log(fn_def.name, fn_def.name_len)   # AGAST #3467
     if p.skip_item == 0
         module_add_fn(p.module, fn_def)
         # AGAST #2148: what main.ritz's fn-conflict checks read.
@@ -238,6 +269,8 @@ pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     if p.skip_item != 0
         exists = 0
     struct_variant_note(p.tokens, p.pos, st.name, st.name_len, parse_file_copy_shared(p), target, exists)
+    if p.skip_item != 0
+        gated_decl_log(st.name, st.name_len)   # AGAST #3467
     if p.skip_item == 0
         module_add_struct(p.module, st)
         if (g_attr_bits & ATTR_PACKED) != 0
@@ -247,6 +280,8 @@ pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     return 1
 
 pub fn item_dispatch_const(p: *Parser, c: *ConstEntry) -> i32
+    if p.skip_item != 0
+        gated_decl_log(c.name, c.name_len)   # AGAST #3467
     if p.skip_item == 0
         if (g_attr_bits & ATTR_TARGET_OS) != 0
             c.target_gated = 1
@@ -256,6 +291,8 @@ pub fn item_dispatch_const(p: *Parser, c: *ConstEntry) -> i32
     return 1
 
 pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
+    if p.skip_item != 0 and g != null
+        gated_decl_log(g.name, g.name_len)   # AGAST #3467
     if p.skip_item == 0
         module_add_global_var(p.module, g)
     p.skip_item = 0
@@ -1461,6 +1498,16 @@ pub fn trait_declared_record(name: *u8, len: i32) -> i32
     *(g_trait_lens + g_trait_count) = len
     g_trait_count = g_trait_count + 1
     0
+
+# The log in parse order, never reset: import_vis marks it before a file is
+# parsed and reads what the file added, for R54's selective-list check
+# (AGAST #3467), as with type_decl_log.
+pub fn trait_declared_count() -> i32
+    g_trait_count
+
+pub fn trait_declared_at(i: i32, out_len: *i32) -> *u8
+    *out_len = *(g_trait_lens + i)
+    *(g_trait_names + i)
 
 pub fn trait_declared(name: *u8, len: i32) -> i32
     var i: i32 = 0
@@ -2705,18 +2752,30 @@ fn const_fold_compare(op: i32, a: i64, b: i64) -> i32
 # Import helpers
 # =============================================================================
 
-pub fn import_new(p: *Parser, path: *ImportPath) -> *ImportDecl
+# `items` is the selective list `{ a, b }`, null when there is none.
+pub fn import_new(p: *Parser, path: *ImportPath, items: *ImportItem) -> *ImportDecl
     let i: *ImportDecl = parser_alloc(p, sizeof(ImportDecl)) as *ImportDecl
     i.path = path
     i.next = null
     i.is_pub = 0
+    i.items = items
     return i
 
 # `pub import m`: a re-export (LANGUAGE_SPEC §15.4, AGAST #3891).
-pub fn import_new_pub(p: *Parser, path: *ImportPath) -> *ImportDecl
-    let i: *ImportDecl = import_new(p, path)
+pub fn import_new_pub(p: *Parser, path: *ImportPath, items: *ImportItem) -> *ImportDecl
+    let i: *ImportDecl = import_new(p, path, items)
     i.is_pub = 1
     i
+
+# A name of a selective list, at its token (AGAST #3467, LARB R54).
+pub fn import_item_new(p: *Parser, name: *u8, len: i32, line: i32, col: i32, rest: *ImportItem) -> *ImportItem
+    let it: *ImportItem = parser_alloc(p, sizeof(ImportItem)) as *ImportItem
+    it.name = name
+    it.name_len = len
+    it.line = line
+    it.col = col
+    it.next = rest
+    it
 
 pub fn path_new(p: *Parser, seg: *u8, len: i32, rest: *ImportPath) -> *ImportPath
     let path: *ImportPath = parser_alloc(p, sizeof(ImportPath)) as *ImportPath
@@ -4096,6 +4155,7 @@ fn type_alias_kind_has_state(kind: i32) -> i32
 # already set for a [[target_os = "<not linux>"]] alias: don't record it.
 pub fn type_alias_record(p: *Parser, name: *u8, len: i32, kind: i32) -> i32
     if p.skip_item != 0
+        gated_decl_log(name, len)   # AGAST #3467
         return kind
     # AGAST #4021: the target, before NEWLINE, judged even if the alias is
     # never used (a use replays it, and is judged as the target).

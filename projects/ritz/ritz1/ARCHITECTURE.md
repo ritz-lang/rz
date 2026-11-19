@@ -210,6 +210,9 @@ still run mid-lowering on `*EmitterState`, and
   that reaches the input only through another module's plain `import` is an
   error at its use. main records each loaded module and import edge before
   merging; `sema_walk` asks `vis_hidden` at each use in the input's own fns.
+  Over the same tables, `vis_selective_check` refuses a name in the input's
+  `import m { … }` that `m` doesn't define, at the name (§15.1, R54, #3467),
+  once imports are resolved and before any later pass.
 
 - `index_refuse` — what has nothing to index or no pointer to follow (§7.8,
   R9; #3893): `p[i]` through an `@T` that isn't a buffer, `x[i][j]` /

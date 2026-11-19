@@ -6142,10 +6142,29 @@ import ritzlib.sys as sys          # Import with alias
 import ritzlib.gvec { vec_new }    # Selective import
 ```
 
-The selective form is recognised but does not currently filter: the whole
-module is imported either way. The alias form is likewise parsed and recorded
-but unused, because there is no qualified-access syntax to use it with (see
-[§15.3](#153-qualified-access)).
+Each name in a selective import's list must be one the module defines (LARB
+R54). A module defines what it declares at its top level (a fn, struct, enum,
+const, global, type alias or trait, `pub` or not) and what it re-exports with
+`pub import` (§15.4); `pub import t { x }` re-exports only `x`. What it
+reaches only through its own plain `import` doesn't count. A declaration
+`[[target_os]]` gates out of this build still counts: gating decides what is
+compiled, not what a module defines. Any other name is
+an error at the name, for example "`nope` is not defined in ritzlib.io". A
+private fn in the list gets §15.2's error at the import, with its note, even
+if the file never calls it. Private types and consts are accepted, because
+type privacy isn't enforced. Each file's lists are checked when that file is
+compiled (ritz0: AGAST #3466; ritz1: #3467).
+
+```ritz expect-error="`nope` is not defined in ritzlib.io"
+import ritzlib.io { prints, nope }
+
+fn main() -> i32
+    0
+```
+
+The list is checked but doesn't filter: the whole module is imported either
+way. The alias form is parsed and recorded but unused, because there is no
+qualified-access syntax to use it with (see [§15.3](#153-qualified-access)).
 
 ### 15.2 Visibility
 
