@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-boot test-tier1 test-uefi-boot test-uefi-gui run-gui kernel iso help
+.PHONY: all build clean test test-boot test-tier1 test-uefi-boot test-uefi-gui run-gui kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -88,6 +88,17 @@ run-gui: kernel
 	@echo "=== Running Harland (GUI, interactive) ==="
 	cd boot && ./test.sh --gui --interactive
 
+# Hardware-inventory USB stick (AGAST #3406): HWINV.EFI on a GPT + FAT32
+# image for `dd` or Etcher. See inventory/README.md.
+INVENTORY_IMG ?= $(BUILD_DIR)/hwinv.img
+INVENTORY_MIB ?= 64
+inventory-img: kernel
+	python3 inventory/esp_image.py build $(INVENTORY_IMG) --efi build/debug/HWINV.EFI --size-mib $(INVENTORY_MIB)
+
+# Boot the stick image headless (q35 + OVMF, USB storage) and check the dump
+test-inventory: kernel
+	SKIP_BUILD=1 ./inventory/test.sh
+
 # ============================================================================
 # Clean
 # ============================================================================
@@ -114,6 +125,8 @@ help:
 	@echo "  test-tier1   - Boot with indium, check init Tier-1 suite (OVMF)"
 	@echo "  test-uefi-boot - Test UEFI bootloader (headless)"
 	@echo "  test-uefi-gui  - Test UEFI bootloader with display"
+	@echo "  inventory-img  - Build the hardware-inventory USB stick image (build/hwinv.img)"
+	@echo "  test-inventory - Boot the inventory stick in QEMU and check its dump"
 	@echo "  run-gui        - Interactive run (no timeout, kill QEMU manually)"
 	@echo "  clean        - Remove build artifacts"
 	@echo "  help         - Show this help"

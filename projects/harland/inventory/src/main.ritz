@@ -1,0 +1,1231 @@
+# HWINV.EFI - hardware inventory to the boot stick (AGAST #3406)
+#
+# A UEFI application for machines that don't run Linux. Booted from a USB
+# stick (esp_image.py builds the image; it installs this as
+# \EFI\BOOT\BOOTX64.EFI), it runs before ExitBootServices and uses Boot
+# Services only, so it needs no drivers of its own. It writes:
+#
+#   \INVENTORY\<YYYYMMDD-HHMMSS>\
+#       acpi\RSDP, acpi\XSDT (or RSDT), acpi\<SIG>[n]   every table, raw,
+#                                named as Linux's /sys/firmware/acpi/tables
+#       acpi\DSDT, acpi\FACS     from the FADT
+#       smbios\smbios_entry_point, smbios\DMI           as /sys/firmware/dmi/tables
+#       memmap.bin, memmap.txt   GetMemoryMap: raw descriptors and one line each
+#       pci.bin, pci.txt         config space of every function (Root Bridge I/O),
+#                                4 KiB where extended config space answers
+#       gop.txt, edid-<n>.bin    GOP modes; EDID (active, else discovered)
+#       firmware.txt             vendor, revision, UEFI revision, SecureBoot,
+#                                SetupMode, every configuration table GUID
+#       hwinv.log                what each step did
+#       manifest.txt             every file and its size, then "end": written
+#                                last, so a complete manifest is a complete dump
+#
+# to the FAT file system it was loaded from (Simple File System on the
+# LoadedImage's DeviceHandle): pull the stick, read the files anywhere.
+# Then it prints "HWINV: DONE", waits up to 15 s for a key and powers off.
+#
+# Every step is independent: one that fails is logged in hwinv.log and the
+# rest still run. Raw tables are copied as found; parsing them is the host's
+# job (check_dump.py), so a firmware bug cannot stop the dump.
+
+import ritzlib.fmt { fmt_u64_into, fmt_u64_hex_into }
+
+pub struct StrView
+    ptr: *u8
+    len: i64
+
+# ============================================================================
+# UEFI types
+# ============================================================================
+
+const EFI_SUCCESS: u64 = 0
+const EFI_BUFFER_TOO_SMALL: u64 = 0x8000000000000005
+const EFI_NOT_FOUND: u64 = 0x800000000000000E
+
+const EFI_LOADER_DATA: u64 = 2
+const EFI_FILE_MODE_READ: u64 = 0x0000000000000001
+const EFI_FILE_MODE_WRITE: u64 = 0x0000000000000002
+const EFI_FILE_MODE_CREATE: u64 = 0x8000000000000000
+const EFI_FILE_DIRECTORY: u64 = 0x10
+const BY_PROTOCOL: u64 = 2
+const EVT_TIMER: u64 = 0x80000000
+const TIMER_RELATIVE: u64 = 2
+const RESET_SHUTDOWN: u64 = 2
+const PCI_WIDTH_U32: u64 = 2
+
+[[callconv = "win64"]]
+type EfiFn1 = fn(u64) -> u64
+
+[[callconv = "win64"]]
+type EfiFn2 = fn(u64, u64) -> u64
+
+[[callconv = "win64"]]
+type EfiFn3 = fn(u64, u64, u64) -> u64
+
+[[callconv = "win64"]]
+type EfiFn4 = fn(u64, u64, u64, u64) -> u64
+
+[[callconv = "win64"]]
+type EfiFn5 = fn(u64, u64, u64, u64, u64) -> u64
+
+[[packed]]
+struct EfiTableHeader
+    signature: u64
+    revision: u32
+    header_size: u32
+    crc32: u32
+    reserved: u32
+
+[[packed]]
+struct EfiSystemTable
+    hdr: EfiTableHeader
+    firmware_vendor: *u16
+    firmware_revision: u32
+    _pad1: u32
+    console_in_handle: u64
+    con_in: *EfiSimpleTextInput
+    console_out_handle: u64
+    con_out: *EfiSimpleTextOutput
+    stderr_handle: u64
+    std_err: *u8
+    runtime_services: *EfiRuntimeServices
+    boot_services: *EfiBootServices
+    number_of_table_entries: u64
+    configuration_table: *EfiConfigurationTable
+
+[[packed]]
+struct EfiSimpleTextInput
+    reset: *u8
+    read_key_stroke: *u8
+    wait_for_key: u64
+
+[[packed]]
+struct EfiSimpleTextOutput
+    reset: *u8
+    output_string: *u8
+
+[[packed]]
+struct EfiRuntimeServices
+    hdr: EfiTableHeader
+    get_time: *u8
+    set_time: *u8
+    get_wakeup_time: *u8
+    set_wakeup_time: *u8
+    set_virtual_address_map: *u8
+    convert_pointer: *u8
+    get_variable: *u8
+    get_next_variable_name: *u8
+    set_variable: *u8
+    get_next_high_monotonic_count: *u8
+    reset_system: *u8
+
+[[packed]]
+struct EfiBootServices
+    hdr: EfiTableHeader
+    raise_tpl: *u8
+    restore_tpl: *u8
+    allocate_pages: *u8
+    free_pages: *u8
+    get_memory_map: *u8
+    allocate_pool: *u8
+    free_pool: *u8
+    create_event: *u8
+    set_timer: *u8
+    wait_for_event: *u8
+    signal_event: *u8
+    close_event: *u8
+    check_event: *u8
+    install_protocol_interface: *u8
+    reinstall_protocol_interface: *u8
+    uninstall_protocol_interface: *u8
+    handle_protocol: *u8
+    reserved: *u8
+    register_protocol_notify: *u8
+    locate_handle: *u8
+    locate_device_path: *u8
+    install_configuration_table: *u8
+    load_image: *u8
+    start_image: *u8
+    exit: *u8
+    unload_image: *u8
+    exit_boot_services: *u8
+    get_next_monotonic_count: *u8
+    stall: *u8
+    set_watchdog_timer: *u8
+    connect_controller: *u8
+    disconnect_controller: *u8
+    open_protocol: *u8
+    close_protocol: *u8
+    open_protocol_information: *u8
+    protocols_per_handle: *u8
+    locate_handle_buffer: *u8
+    locate_protocol: *u8
+
+[[packed]]
+struct EfiGuid
+    data1: u32
+    data2: u16
+    data3: u16
+    data4: [8]u8
+
+[[packed]]
+struct EfiConfigurationTable
+    vendor_guid: EfiGuid
+    vendor_table: u64
+
+[[packed]]
+struct EfiLoadedImage
+    revision: u32
+    _pad: u32
+    parent_handle: u64
+    system_table: *u8
+    device_handle: u64
+
+[[packed]]
+struct EfiSimpleFileSystem
+    revision: u64
+    open_volume: *u8
+
+[[packed]]
+struct EfiFile
+    revision: u64
+    open: *u8
+    close: *u8
+    delete: *u8
+    read: *u8
+    write: *u8
+    get_position: *u8
+    set_position: *u8
+    get_info: *u8
+    set_info: *u8
+    flush: *u8
+
+[[packed]]
+struct EfiTime
+    year: u16
+    month: u8
+    day: u8
+    hour: u8
+    minute: u8
+    second: u8
+    pad1: u8
+    nanosecond: u32
+    time_zone: i16
+    daylight: u8
+    pad2: u8
+
+[[packed]]
+struct EfiGopModeInfo
+    version: u32
+    horizontal_resolution: u32
+    vertical_resolution: u32
+    pixel_format: u32
+    red_mask: u32
+    green_mask: u32
+    blue_mask: u32
+    reserved_mask: u32
+    pixels_per_scan_line: u32
+
+[[packed]]
+struct EfiGopMode
+    max_mode: u32
+    mode: u32
+    info: *EfiGopModeInfo
+    size_of_info: u64
+    frame_buffer_base: u64
+    frame_buffer_size: u64
+
+[[packed]]
+struct EfiGop
+    query_mode: *u8
+    set_mode: *u8
+    blt: *u8
+    mode: *EfiGopMode
+
+# EFI_EDID_ACTIVE_PROTOCOL / EFI_EDID_DISCOVERED_PROTOCOL
+[[packed]]
+struct EfiEdid
+    size_of_edid: u32
+    _pad: u32
+    edid: *u8
+
+# EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL, up to SegmentNumber
+[[packed]]
+struct EfiPciRootBridgeIo
+    parent_handle: u64
+    poll_mem: *u8
+    poll_io: *u8
+    mem_read: *u8
+    mem_write: *u8
+    io_read: *u8
+    io_write: *u8
+    pci_read: *u8
+    pci_write: *u8
+    copy_mem: *u8
+    map: *u8
+    unmap: *u8
+    allocate_buffer: *u8
+    free_buffer: *u8
+    flush: *u8
+    get_attributes: *u8
+    set_attributes: *u8
+    configuration: *u8
+    segment_number: u32
+
+# ============================================================================
+# Globals
+# ============================================================================
+
+var g_image: u64 = 0
+var g_st: *EfiSystemTable = 0 as *EfiSystemTable
+var g_bs: *EfiBootServices = 0 as *EfiBootServices
+var g_rt: *EfiRuntimeServices = 0 as *EfiRuntimeServices
+
+var guid_loaded_image: EfiGuid
+var guid_sfs: EfiGuid
+var guid_acpi20: EfiGuid
+var guid_acpi10: EfiGuid
+var guid_smbios3: EfiGuid
+var guid_smbios: EfiGuid
+var guid_gop: EfiGuid
+var guid_edid_active: EfiGuid
+var guid_edid_discovered: EfiGuid
+var guid_root_bridge: EfiGuid
+var guid_global_var: EfiGuid
+
+fn set_guid(g: *EfiGuid, d1: u32, d2: u16, d3: u16, d4: u64) -> i32
+    g.data1 = d1
+    g.data2 = d2
+    g.data3 = d3
+    # d4's bytes in reading order: the GUID's last 8 bytes as written
+    var i: i64 = 0
+    while i < 8
+        g.data4[i] = ((d4 >> ((56 - i * 8) as u64)) & 0xFF) as u8
+        i = i + 1
+    return 0
+
+fn init_guids() -> i32
+    set_guid(@guid_loaded_image, 0x5B1B31A1, 0x9562, 0x11D2, 0x8E3F00A0C969723B)
+    set_guid(@guid_sfs, 0x964E5B22, 0x6459, 0x11D2, 0x8E3900A0C969723B)
+    set_guid(@guid_acpi20, 0x8868E871, 0xE4F1, 0x11D3, 0xBC220080C73C8881)
+    set_guid(@guid_acpi10, 0xEB9D2D30, 0x2D88, 0x11D3, 0x9A160090273FC14D)
+    set_guid(@guid_smbios3, 0xF2FD1544, 0x9794, 0x4A2C, 0x992EE5BBCF20E394)
+    set_guid(@guid_smbios, 0xEB9D2D31, 0x2D88, 0x11D3, 0x9A160090273FC14D)
+    set_guid(@guid_gop, 0x9042A9DE, 0x23DC, 0x4A38, 0x96FB7ADED080516A)
+    set_guid(@guid_edid_active, 0xBD8C1056, 0x9F36, 0x44EC, 0x92A8A6337F817986)
+    set_guid(@guid_edid_discovered, 0x1C0C34F6, 0xD380, 0x41FA, 0xA0498AD06C1A66AA)
+    set_guid(@guid_root_bridge, 0x2F707EBB, 0x4A1A, 0x11D4, 0x9A380090273FC14D)
+    set_guid(@guid_global_var, 0x8BE4DF61, 0x93CA, 0x11D2, 0xAA0D00E098032B8C)
+    return 0
+
+fn guid_eq(a: *EfiGuid, b: *EfiGuid) -> bool
+    if a.data1 != b.data1 or a.data2 != b.data2 or a.data3 != b.data3
+        return false
+    var i: i64 = 0
+    while i < 8
+        if a.data4[i] != b.data4[i]
+            return false
+        i = i + 1
+    return true
+
+# The configuration table entry with this GUID, or 0.
+fn config_table(g: *EfiGuid) -> u64
+    var i: u64 = 0
+    while i < g_st.number_of_table_entries
+        let e: *EfiConfigurationTable = g_st.configuration_table + i
+        if guid_eq(@e.vendor_guid, g)
+            return e.vendor_table
+        i = i + 1
+    return 0
+
+# ============================================================================
+# Memory and byte helpers
+# ============================================================================
+
+fn pool_alloc(size: u64) -> *u8
+    var p: u64 = 0
+    if (g_bs.allocate_pool as EfiFn3)(EFI_LOADER_DATA, size, @p as u64) != EFI_SUCCESS
+        return 0 as *u8
+    return p as *u8
+
+fn pool_free(p: *u8) -> i32
+    if p as u64 != 0
+        (g_bs.free_pool as EfiFn1)(p as u64)
+    return 0
+
+fn copy_bytes(dst: *u8, src: *u8, n: u64) -> i32
+    var i: u64 = 0
+    while i < n
+        *(dst + i) = *(src + i)
+        i = i + 1
+    return 0
+
+fn rd8(p: u64) -> u64
+    return *(p as *u8) as u64
+
+fn rd16(p: u64) -> u64
+    return *(p as *u16) as u64
+
+fn rd32(p: u64) -> u64
+    return *(p as *u32) as u64
+
+fn rd64(p: u64) -> u64
+    return *(p as *u64)
+
+# ============================================================================
+# Growable byte buffers (text files, pci.bin, the manifest)
+# ============================================================================
+
+struct Buf
+    ptr: *u8
+    len: u64
+    cap: u64
+
+fn buf_init(b: *Buf, cap: u64) -> i32
+    b.ptr = pool_alloc(cap)
+    b.len = 0
+    b.cap = cap
+    if b.ptr as u64 == 0
+        b.cap = 0
+        return -1
+    return 0
+
+fn buf_reserve(b: *Buf, extra: u64) -> bool
+    if b.len + extra <= b.cap
+        return true
+    var cap: u64 = b.cap * 2
+    if cap < 4096
+        cap = 4096
+    while cap < b.len + extra
+        cap = cap * 2
+    let p: *u8 = pool_alloc(cap)
+    if p as u64 == 0
+        return false
+    copy_bytes(p, b.ptr, b.len)
+    pool_free(b.ptr)
+    b.ptr = p
+    b.cap = cap
+    return true
+
+fn buf_bytes(b: *Buf, p: *u8, n: u64) -> i32
+    if buf_reserve(b, n)
+        copy_bytes(b.ptr + b.len, p, n)
+        b.len = b.len + n
+    return 0
+
+fn buf_ch(b: *Buf, c: u8) -> i32
+    if buf_reserve(b, 1)
+        *(b.ptr + b.len) = c
+        b.len = b.len + 1
+    return 0
+
+fn buf_str(b: *Buf, s: StrView) -> i32
+    return buf_bytes(b, s.ptr, s.len as u64)
+
+fn buf_dec(b: *Buf, v: u64) -> i32
+    var tmp: [20]u8
+    let n: i64 = fmt_u64_into(@tmp[0], v)
+    return buf_bytes(b, @tmp[0], n as u64)
+
+fn buf_hex(b: *Buf, v: u64) -> i32
+    var tmp: [16]u8
+    buf_str(b, "0x")
+    let n: i64 = fmt_u64_hex_into(@tmp[0], v)
+    return buf_bytes(b, @tmp[0], n as u64)
+
+# v as exactly `width` lower-case hex digits
+fn buf_hexw(b: *Buf, v: u64, width: u64) -> i32
+    var i: u64 = width
+    while i > 0
+        i = i - 1
+        let d: u64 = (v >> (i * 4)) & 0xF
+        if d < 10
+            buf_ch(b, (48 + d) as u8)
+        else
+            buf_ch(b, (87 + d) as u8)
+    return 0
+
+fn buf_dec_pad2(b: *Buf, v: u64) -> i32
+    buf_ch(b, (48 + (v / 10) % 10) as u8)
+    buf_ch(b, (48 + v % 10) as u8)
+    return 0
+
+fn buf_guid(b: *Buf, g: *EfiGuid) -> i32
+    buf_hexw(b, g.data1 as u64, 8)
+    buf_ch(b, 45)
+    buf_hexw(b, g.data2 as u64, 4)
+    buf_ch(b, 45)
+    buf_hexw(b, g.data3 as u64, 4)
+    buf_ch(b, 45)
+    var i: i64 = 0
+    while i < 8
+        if i == 2
+            buf_ch(b, 45)
+        buf_hexw(b, g.data4[i] as u64, 2)
+        i = i + 1
+    return 0
+
+# ============================================================================
+# Console (ConOut; OVMF mirrors it to the serial port) and the step log
+# ============================================================================
+
+var out_u16: [512]u16
+var g_log: Buf
+
+fn con_bytes(p: *u8, n: u64) -> i32
+    var i: u64 = 0
+    var j: u64 = 0
+    while i < n
+        let c: u8 = *(p + i)
+        if c == 10
+            out_u16[j] = 13
+            j = j + 1
+        out_u16[j] = c as u16
+        j = j + 1
+        i = i + 1
+        if j >= 500 or i == n
+            out_u16[j] = 0
+            (g_st.con_out.output_string as EfiFn2)(g_st.con_out as u64, @out_u16[0] as u64)
+            j = 0
+    return 0
+
+# A line to the console and to hwinv.log
+fn say(s: StrView) -> i32
+    con_bytes(s.ptr, s.len as u64)
+    buf_str(@g_log, s)
+    return 0
+
+fn say_buf(b: *Buf) -> i32
+    con_bytes(b.ptr, b.len)
+    buf_bytes(@g_log, b.ptr, b.len)
+    return 0
+
+var g_line: Buf
+var g_err: Buf
+
+fn line_reset() -> *Buf
+    g_line.len = 0
+    return @g_line
+
+# ============================================================================
+# Files on the boot volume
+# ============================================================================
+
+var name_u16: [256]u16
+var g_manifest: Buf
+var g_files: u64 = 0
+var g_bytes: u64 = 0
+
+fn set_name(p: *u8, n: u64) -> u64
+    var i: u64 = 0
+    while i < n and i < 255
+        name_u16[i] = *(p + i) as u16
+        i = i + 1
+    name_u16[i] = 0
+    return @name_u16[0] as u64
+
+# Open (and create) the directory `name` under dir. 0 on failure.
+fn open_dir(dir: u64, p: *u8, n: u64) -> u64
+    var h: u64 = 0
+    let f: *EfiFile = dir as *EfiFile
+    let st: u64 = (f.open as EfiFn5)(dir, @h as u64, set_name(p, n), EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, EFI_FILE_DIRECTORY)
+    if st != EFI_SUCCESS
+        return 0
+    return h
+
+fn open_dir_sv(dir: u64, name: StrView) -> u64
+    return open_dir(dir, name.ptr, name.len as u64)
+
+fn dir_exists(dir: u64, p: *u8, n: u64) -> bool
+    var h: u64 = 0
+    let f: *EfiFile = dir as *EfiFile
+    if (f.open as EfiFn5)(dir, @h as u64, set_name(p, n), EFI_FILE_MODE_READ, 0) != EFI_SUCCESS
+        return false
+    (((h as *EfiFile).close) as EfiFn1)(h)
+    return true
+
+fn close_file(h: u64) -> i32
+    if h != 0
+        let f: *EfiFile = h as *EfiFile
+        (f.flush as EfiFn1)(h)
+        (f.close as EfiFn1)(h)
+    return 0
+
+# Write data to `name` in dir and list it in the manifest as prefix + name.
+fn write_file(dir: u64, prefix: StrView, p: *u8, n: u64, data: *u8, len: u64) -> bool
+    if dir == 0
+        return false
+    var h: u64 = 0
+    let f: *EfiFile = dir as *EfiFile
+    var st: u64 = (f.open as EfiFn5)(dir, @h as u64, set_name(p, n), EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE, 0)
+    if st == EFI_SUCCESS
+        var size: u64 = len
+        if len > 0
+            st = (((h as *EfiFile).write) as EfiFn3)(h, @size as u64, data as u64)
+        close_file(h)
+    if st != EFI_SUCCESS
+        # g_err, not g_line: the caller's name may live in g_line
+        let b: *Buf = @g_err
+        b.len = 0
+        buf_str(b, "  write ")
+        buf_str(b, prefix)
+        buf_bytes(b, p, n)
+        buf_str(b, " FAILED: ")
+        buf_hex(b, st)
+        buf_ch(b, 10)
+        say_buf(b)
+        return false
+    buf_str(@g_manifest, prefix)
+    buf_bytes(@g_manifest, p, n)
+    buf_ch(@g_manifest, 32)
+    buf_dec(@g_manifest, len)
+    buf_ch(@g_manifest, 10)
+    g_files = g_files + 1
+    g_bytes = g_bytes + len
+    return true
+
+fn write_sv(dir: u64, prefix: StrView, name: StrView, data: *u8, len: u64) -> bool
+    return write_file(dir, prefix, name.ptr, name.len as u64, data, len)
+
+fn write_buf(dir: u64, name: StrView, b: *Buf) -> bool
+    return write_sv(dir, "", name, b.ptr, b.len)
+
+# ============================================================================
+# ACPI
+# ============================================================================
+
+var tbl_addr: [512]u64
+var tbl_sig: [512]u32
+var tbl_count: u64 = 0
+
+fn sig_total(sig: u32) -> u64
+    var n: u64 = 0
+    var i: u64 = 0
+    while i < tbl_count
+        if tbl_sig[i] == sig
+            n = n + 1
+        i = i + 1
+    return n
+
+fn sig_instance(sig: u32, upto: u64) -> u64
+    var n: u64 = 0
+    var i: u64 = 0
+    while i <= upto
+        if tbl_sig[i] == sig
+            n = n + 1
+        i = i + 1
+    return n
+
+# A table's file name into g_line: its signature (unsafe bytes as '_'),
+# then its instance number when the signature repeats (Linux's sysfs names).
+fn table_name(sig: u32, instance: u64, total: u64) -> *Buf
+    let b: *Buf = line_reset()
+    var i: u64 = 0
+    while i < 4
+        let c: u8 = ((sig as u64 >> (i * 8)) & 0xFF) as u8
+        if (c >= 48 and c <= 57) or (c >= 65 and c <= 90) or (c >= 97 and c <= 122)
+            buf_ch(b, c)
+        else
+            buf_ch(b, 95)
+        i = i + 1
+    if total > 1
+        buf_dec(b, instance)
+    return b
+
+fn dump_table(dir: u64, addr: u64, name: *Buf) -> bool
+    if addr == 0
+        return false
+    let len: u64 = rd32(addr + 4)
+    if len < 36 or len > 0x1000000
+        return false
+    return write_file(dir, "acpi/", name.ptr, name.len, addr as *u8, len)
+
+fn dump_acpi(top: u64) -> i32
+    var rsdp: u64 = config_table(@guid_acpi20)
+    if rsdp == 0
+        rsdp = config_table(@guid_acpi10)
+    if rsdp == 0
+        say("  acpi: no RSDP in the configuration table\n")
+        return -1
+    let dir: u64 = open_dir_sv(top, "acpi")
+    if dir == 0
+        say("  acpi: cannot create the acpi directory\n")
+        return -1
+    let rev: u64 = rd8(rsdp + 15)
+    var rsdp_len: u64 = 20
+    if rev >= 2
+        rsdp_len = rd32(rsdp + 20)
+    write_sv(dir, "acpi/", "RSDP", rsdp as *u8, rsdp_len)
+    var root: u64 = rd32(rsdp + 16)
+    var entry_size: u64 = 4
+    if rev >= 2 and rd64(rsdp + 24) != 0
+        root = rd64(rsdp + 24)
+        entry_size = 8
+    let root_len: u64 = rd32(root + 4)
+    if entry_size == 8
+        write_sv(dir, "acpi/", "XSDT", root as *u8, root_len)
+    else
+        write_sv(dir, "acpi/", "RSDT", root as *u8, root_len)
+    tbl_count = 0
+    var off: u64 = 36
+    while off + entry_size <= root_len and tbl_count < 512
+        var a: u64 = 0
+        if entry_size == 8
+            a = rd64(root + off)
+        else
+            a = rd32(root + off)
+        tbl_addr[tbl_count] = a
+        tbl_sig[tbl_count] = 0
+        if a != 0
+            tbl_sig[tbl_count] = rd32(a) as u32
+        tbl_count = tbl_count + 1
+        off = off + entry_size
+    var dumped: u64 = 0
+    var i: u64 = 0
+    while i < tbl_count
+        let sig: u32 = tbl_sig[i]
+        if dump_table(dir, tbl_addr[i], table_name(sig, sig_instance(sig, i), sig_total(sig)))
+            dumped = dumped + 1
+        # FADT: the DSDT and FACS hang off it, not off the XSDT
+        if sig == 0x50434146
+            let fadt: u64 = tbl_addr[i]
+            let flen: u64 = rd32(fadt + 4)
+            var dsdt: u64 = rd32(fadt + 40)
+            if flen >= 148 and rd64(fadt + 140) != 0
+                dsdt = rd64(fadt + 140)
+            var facs: u64 = rd32(fadt + 36)
+            if flen >= 140 and rd64(fadt + 132) != 0
+                facs = rd64(fadt + 132)
+            if dsdt != 0
+                write_sv(dir, "acpi/", "DSDT", dsdt as *u8, rd32(dsdt + 4))
+            if facs != 0
+                write_sv(dir, "acpi/", "FACS", facs as *u8, rd32(facs + 4))
+        i = i + 1
+    close_file(dir)
+    let b: *Buf = line_reset()
+    buf_str(b, "  acpi: RSDP rev ")
+    buf_dec(b, rev)
+    buf_str(b, ", ")
+    buf_dec(b, dumped)
+    buf_str(b, " of ")
+    buf_dec(b, tbl_count)
+    buf_str(b, " tables (+ DSDT, FACS)\n")
+    say_buf(b)
+    return 0
+
+# ============================================================================
+# SMBIOS
+# ============================================================================
+
+# Bytes from table to the end of its type-127 structure, at most max.
+fn smbios_length(table: u64, max: u64) -> u64
+    var off: u64 = 0
+    while off + 4 <= max
+        let typ: u64 = rd8(table + off)
+        let ln: u64 = rd8(table + off + 1)
+        if ln < 4
+            return off
+        var s: u64 = off + ln
+        while s + 1 < max and (rd8(table + s) != 0 or rd8(table + s + 1) != 0)
+            s = s + 1
+        off = s + 2
+        if typ == 127
+            return off
+    return max
+
+fn dump_smbios(top: u64) -> i32
+    var ep: u64 = config_table(@guid_smbios3)
+    var ep_len: u64 = 0
+    var table: u64 = 0
+    var table_len: u64 = 0
+    if ep != 0
+        ep_len = rd8(ep + 6)
+        table = rd64(ep + 16)
+        table_len = smbios_length(table, rd32(ep + 12))
+    else
+        ep = config_table(@guid_smbios)
+        if ep == 0
+            say("  smbios: no SMBIOS entry point in the configuration table\n")
+            return -1
+        ep_len = rd8(ep + 5)
+        table = rd32(ep + 24)
+        table_len = rd16(ep + 22)
+    let dir: u64 = open_dir_sv(top, "smbios")
+    write_sv(dir, "smbios/", "smbios_entry_point", ep as *u8, ep_len)
+    write_sv(dir, "smbios/", "DMI", table as *u8, table_len)
+    close_file(dir)
+    let b: *Buf = line_reset()
+    buf_str(b, "  smbios: entry point ")
+    buf_dec(b, ep_len)
+    buf_str(b, " bytes, structure table ")
+    buf_dec(b, table_len)
+    buf_str(b, " bytes\n")
+    say_buf(b)
+    return 0
+
+# ============================================================================
+# Memory map
+# ============================================================================
+
+fn dump_memmap(top: u64) -> i32
+    var size: u64 = 65536
+    var key: u64 = 0
+    var dsize: u64 = 0
+    var dver: u32 = 0
+    var map: *u8 = 0 as *u8
+    var st: u64 = EFI_BUFFER_TOO_SMALL
+    var tries: i32 = 0
+    while st == EFI_BUFFER_TOO_SMALL and tries < 4
+        pool_free(map)
+        size = size + 8192
+        map = pool_alloc(size)
+        if map as u64 == 0
+            say("  memmap: out of memory\n")
+            return -1
+        st = (g_bs.get_memory_map as EfiFn5)(@size as u64, map as u64, @key as u64, @dsize as u64, @dver as u64)
+        tries = tries + 1
+    if st != EFI_SUCCESS or dsize == 0
+        say("  memmap: GetMemoryMap failed\n")
+        return -1
+    let count: u64 = size / dsize
+    var t: Buf
+    buf_init(@t, 8192)
+    buf_str(@t, "desc_size=")
+    buf_dec(@t, dsize)
+    buf_str(@t, " desc_version=")
+    buf_dec(@t, dver as u64)
+    buf_str(@t, " count=")
+    buf_dec(@t, count)
+    buf_ch(@t, 10)
+    var i: u64 = 0
+    while i < count
+        let d: u64 = map as u64 + i * dsize
+        buf_dec(@t, rd32(d))
+        buf_ch(@t, 32)
+        buf_hex(@t, rd64(d + 8))
+        buf_ch(@t, 32)
+        buf_dec(@t, rd64(d + 24))
+        buf_ch(@t, 32)
+        buf_hex(@t, rd64(d + 32))
+        buf_ch(@t, 10)
+        i = i + 1
+    write_sv(top, "", "memmap.bin", map, count * dsize)
+    write_buf(top, "memmap.txt", @t)
+    pool_free(t.ptr)
+    pool_free(map)
+    let b: *Buf = line_reset()
+    buf_str(b, "  memmap: ")
+    buf_dec(b, count)
+    buf_str(b, " descriptors\n")
+    say_buf(b)
+    return 0
+
+# ============================================================================
+# PCI (Root Bridge I/O: every bus a root bridge decodes)
+# ============================================================================
+
+var cfg: [4096]u8
+
+fn pci_read32(rb: *EfiPciRootBridgeIo, bus: u64, dev: u64, func: u64, reg: u64, out: *u8) -> bool
+    # EFI_PCI_ADDRESS: register in bits 0-7, or ExtendedRegister in 32-63
+    var addr: u64 = (bus << 24) | (dev << 16) | (func << 8)
+    if reg < 256
+        addr = addr | reg
+    else
+        addr = addr | (reg << 32)
+    return (rb.pci_read as EfiFn5)(rb as u64, PCI_WIDTH_U32, addr, 1, out as u64) == EFI_SUCCESS
+
+# The root bridge's bus range from its ACPI resource descriptors
+fn bus_range(rb: *EfiPciRootBridgeIo, lo: *u64, hi: *u64) -> i32
+    *lo = 0
+    *hi = 255
+    var res: u64 = 0
+    if (rb.configuration as EfiFn2)(rb as u64, @res as u64) != EFI_SUCCESS or res == 0
+        return 0
+    var p: u64 = res
+    var guard: i32 = 0
+    while rd8(p) == 0x8A and guard < 64
+        if rd8(p + 3) == 2
+            *lo = rd64(p + 14)
+            let n: u64 = rd64(p + 38)
+            if n > 0
+                *hi = *lo + n - 1
+            return 0
+        p = p + 3 + rd16(p + 1)
+        guard = guard + 1
+    return 0
+
+fn dump_pci(top: u64) -> i32
+    var n: u64 = 0
+    var handles: u64 = 0
+    if (g_bs.locate_handle_buffer as EfiFn5)(BY_PROTOCOL, @guid_root_bridge as u64, 0, @n as u64, @handles as u64) != EFI_SUCCESS
+        say("  pci: no PCI Root Bridge I/O protocol\n")
+        return -1
+    var bin: Buf
+    var txt: Buf
+    buf_init(@bin, 65536)
+    buf_init(@txt, 8192)
+    var funcs: u64 = 0
+    var h: u64 = 0
+    while h < n
+        var rbp: u64 = 0
+        if (g_bs.handle_protocol as EfiFn3)(*((handles as *u64) + h), @guid_root_bridge as u64, @rbp as u64) == EFI_SUCCESS
+            let rb: *EfiPciRootBridgeIo = rbp as *EfiPciRootBridgeIo
+            let seg: u64 = rb.segment_number as u64
+            var lo: u64 = 0
+            var hi: u64 = 0
+            bus_range(rb, @lo, @hi)
+            var bus: u64 = lo
+            while bus <= hi and bus < 256
+                var dev: u64 = 0
+                while dev < 32
+                    var func: u64 = 0
+                    var nfunc: u64 = 8
+                    while func < nfunc
+                        var id: u32 = 0xFFFFFFFF
+                        let ok: bool = pci_read32(rb, bus, dev, func, 0, @id as *u8)
+                        if not ok or (id & 0xFFFF) == 0xFFFF
+                            if func == 0
+                                nfunc = 0
+                        else
+                            var r: u64 = 0
+                            while r < 256
+                                pci_read32(rb, bus, dev, func, r, @cfg[0] + r)
+                                r = r + 4
+                            if func == 0 and (cfg[14] & 0x80) == 0
+                                nfunc = 1
+                            # Extended config space, where the bridge decodes it
+                            var len: u64 = 256
+                            var ext: u32 = 0xFFFFFFFF
+                            if pci_read32(rb, bus, dev, func, 256, @ext as *u8) and ext != 0xFFFFFFFF
+                                len = 4096
+                                while r < 4096
+                                    pci_read32(rb, bus, dev, func, r, @cfg[0] + r)
+                                    r = r + 4
+                            # pci.bin record: seg u16, bus, dev, func, 0, length u16
+                            var rec: [8]u8
+                            rec[0] = (seg & 0xFF) as u8
+                            rec[1] = ((seg >> 8) & 0xFF) as u8
+                            rec[2] = bus as u8
+                            rec[3] = dev as u8
+                            rec[4] = func as u8
+                            rec[5] = 0
+                            rec[6] = (len & 0xFF) as u8
+                            rec[7] = (len >> 8) as u8
+                            buf_bytes(@bin, @rec[0], 8)
+                            buf_bytes(@bin, @cfg[0], len)
+                            buf_hexw(@txt, seg, 4)
+                            buf_ch(@txt, 58)
+                            buf_hexw(@txt, bus, 2)
+                            buf_ch(@txt, 58)
+                            buf_hexw(@txt, dev, 2)
+                            buf_ch(@txt, 46)
+                            buf_hexw(@txt, func, 1)
+                            buf_ch(@txt, 32)
+                            buf_hexw(@txt, (id & 0xFFFF) as u64, 4)
+                            buf_ch(@txt, 58)
+                            buf_hexw(@txt, (id >> 16) as u64, 4)
+                            buf_str(@txt, " class ")
+                            buf_hexw(@txt, cfg[11] as u64, 2)
+                            buf_hexw(@txt, cfg[10] as u64, 2)
+                            buf_hexw(@txt, cfg[9] as u64, 2)
+                            buf_str(@txt, " cfg ")
+                            buf_dec(@txt, len)
+                            buf_ch(@txt, 10)
+                            funcs = funcs + 1
+                        func = func + 1
+                    dev = dev + 1
+                bus = bus + 1
+        h = h + 1
+    pool_free(handles as *u8)
+    write_buf(top, "pci.bin", @bin)
+    write_buf(top, "pci.txt", @txt)
+    pool_free(bin.ptr)
+    pool_free(txt.ptr)
+    let b: *Buf = line_reset()
+    buf_str(b, "  pci: ")
+    buf_dec(b, funcs)
+    buf_str(b, " functions on ")
+    buf_dec(b, n)
+    buf_str(b, " root bridge(s)\n")
+    say_buf(b)
+    return 0
+
+# ============================================================================
+# Graphics: GOP modes and EDID
+# ============================================================================
+
+fn dump_gop(top: u64) -> i32
+    var t: Buf
+    buf_init(@t, 4096)
+    var gp: u64 = 0
+    if (g_bs.locate_protocol as EfiFn3)(@guid_gop as u64, 0, @gp as u64) != EFI_SUCCESS or gp == 0
+        buf_str(@t, "absent\n")
+        write_buf(top, "gop.txt", @t)
+        pool_free(t.ptr)
+        say("  gop: none\n")
+        return 0
+    let gop: *EfiGop = gp as *EfiGop
+    let mode: *EfiGopMode = gop.mode
+    buf_str(@t, "modes ")
+    buf_dec(@t, mode.max_mode as u64)
+    buf_str(@t, " current ")
+    buf_dec(@t, mode.mode as u64)
+    buf_str(@t, " fb ")
+    buf_hex(@t, mode.frame_buffer_base)
+    buf_str(@t, " size ")
+    buf_hex(@t, mode.frame_buffer_size)
+    buf_ch(@t, 10)
+    var m: u64 = 0
+    while m < mode.max_mode as u64
+        var isz: u64 = 0
+        var ip: u64 = 0
+        if (gop.query_mode as EfiFn4)(gp, m, @isz as u64, @ip as u64) == EFI_SUCCESS and ip != 0
+            let info: *EfiGopModeInfo = ip as *EfiGopModeInfo
+            buf_str(@t, "mode ")
+            buf_dec(@t, m)
+            buf_str(@t, ": ")
+            buf_dec(@t, info.horizontal_resolution as u64)
+            buf_ch(@t, 120)
+            buf_dec(@t, info.vertical_resolution as u64)
+            buf_str(@t, " format ")
+            buf_dec(@t, info.pixel_format as u64)
+            buf_str(@t, " stride ")
+            buf_dec(@t, info.pixels_per_scan_line as u64)
+            buf_ch(@t, 10)
+            pool_free(ip as *u8)
+        else
+            buf_str(@t, "mode ")
+            buf_dec(@t, m)
+            buf_str(@t, ": 0x0 query failed\n")
+        m = m + 1
+    # EDID on every GOP handle: the active EDID, else the discovered one
+    var n: u64 = 0
+    var handles: u64 = 0
+    var edids: u64 = 0
+    if (g_bs.locate_handle_buffer as EfiFn5)(BY_PROTOCOL, @guid_gop as u64, 0, @n as u64, @handles as u64) == EFI_SUCCESS
+        var i: u64 = 0
+        while i < n
+            let hd: u64 = *((handles as *u64) + i)
+            var ep: u64 = 0
+            if (g_bs.handle_protocol as EfiFn3)(hd, @guid_edid_active as u64, @ep as u64) != EFI_SUCCESS
+                ep = 0
+            if ep == 0 or (ep as *EfiEdid).size_of_edid == 0
+                if (g_bs.handle_protocol as EfiFn3)(hd, @guid_edid_discovered as u64, @ep as u64) != EFI_SUCCESS
+                    ep = 0
+            if ep != 0
+                let e: *EfiEdid = ep as *EfiEdid
+                if e.size_of_edid > 0 and e.edid as u64 != 0
+                    let b: *Buf = line_reset()
+                    buf_str(b, "edid-")
+                    buf_dec(b, i)
+                    buf_str(b, ".bin")
+                    if write_file(top, "", b.ptr, b.len, e.edid, e.size_of_edid as u64)
+                        buf_str(@t, "edid ")
+                        buf_dec(@t, i)
+                        buf_ch(@t, 32)
+                        buf_dec(@t, e.size_of_edid as u64)
+                        buf_ch(@t, 10)
+                        edids = edids + 1
+            i = i + 1
+        pool_free(handles as *u8)
+    if edids == 0
+        buf_str(@t, "edid none\n")
+    write_buf(top, "gop.txt", @t)
+    pool_free(t.ptr)
+    let b: *Buf = line_reset()
+    buf_str(b, "  gop: ")
+    buf_dec(b, mode.max_mode as u64)
+    buf_str(b, " modes, ")
+    buf_dec(b, edids)
+    buf_str(b, " EDID(s)\n")
+    say_buf(b)
+    return 0
+
+# ============================================================================
+# Firmware: vendor, revisions, Secure Boot, configuration tables
+# ============================================================================
+
+# A global variable's first byte, as "0"/"1"/..., or "absent"
+fn var_byte(t: *Buf, key: StrView, name: StrView) -> i32
+    buf_str(t, key)
+    buf_ch(t, 61)
+    var data: [8]u8
+    var size: u64 = 8
+    let st: u64 = (g_rt.get_variable as EfiFn5)(set_name(name.ptr, name.len as u64), @guid_global_var as u64, 0, @size as u64, @data[0] as u64)
+    if st == EFI_SUCCESS and size >= 1
+        buf_dec(t, data[0] as u64)
+    else if st == EFI_NOT_FOUND
+        buf_str(t, "absent")
+    else
+        buf_str(t, "error ")
+        buf_hex(t, st)
+    buf_ch(t, 10)
+    return 0
+
+fn dump_firmware(top: u64) -> i32
+    var t: Buf
+    buf_init(@t, 4096)
+    buf_str(@t, "vendor=")
+    let v: *u16 = g_st.firmware_vendor
+    var i: u64 = 0
+    while v as u64 != 0 and *(v + i) != 0 and i < 256
+        let c: u16 = *(v + i)
+        if c >= 32 and c < 127
+            buf_ch(@t, c as u8)
+        else
+            buf_ch(@t, 63)
+        i = i + 1
+    buf_str(@t, "\nrevision=")
+    buf_hex(@t, g_st.firmware_revision as u64)
+    buf_str(@t, "\nuefi=")
+    buf_hex(@t, g_st.hdr.revision as u64)
+    buf_ch(@t, 10)
+    var_byte(@t, "secure_boot", "SecureBoot")
+    var_byte(@t, "setup_mode", "SetupMode")
+    buf_str(@t, "config_tables=")
+    buf_dec(@t, g_st.number_of_table_entries)
+    buf_ch(@t, 10)
+    i = 0
+    while i < g_st.number_of_table_entries
+        let e: *EfiConfigurationTable = g_st.configuration_table + i
+        buf_str(@t, "config_table ")
+        buf_guid(@t, @e.vendor_guid)
+        buf_ch(@t, 32)
+        buf_hex(@t, e.vendor_table)
+        buf_ch(@t, 10)
+        i = i + 1
+    write_buf(top, "firmware.txt", @t)
+    pool_free(t.ptr)
+    say("  firmware: vendor, revision, Secure Boot state\n")
+    return 0
+
+# ============================================================================
+# The dump directory: \INVENTORY\<YYYYMMDD-HHMMSS>[-n]
+# ============================================================================
+
+fn open_volume() -> u64
+    var lip: u64 = 0
+    if (g_bs.handle_protocol as EfiFn3)(g_image, @guid_loaded_image as u64, @lip as u64) != EFI_SUCCESS
+        say("HWINV: no LoadedImage protocol\n")
+        return 0
+    let li: *EfiLoadedImage = lip as *EfiLoadedImage
+    var fsp: u64 = 0
+    if (g_bs.handle_protocol as EfiFn3)(li.device_handle, @guid_sfs as u64, @fsp as u64) != EFI_SUCCESS
+        say("HWINV: the boot device has no file system\n")
+        return 0
+    var root: u64 = 0
+    if (((fsp as *EfiSimpleFileSystem).open_volume) as EfiFn2)(fsp, @root as u64) != EFI_SUCCESS
+        say("HWINV: cannot open the boot volume\n")
+        return 0
+    return root
+
+var g_stamp: Buf
+
+fn make_stamp() -> i32
+    var t: EfiTime
+    t.year = 0
+    let b: *Buf = @g_stamp
+    b.len = 0
+    if (g_rt.get_time as EfiFn2)(@t as u64, 0) == EFI_SUCCESS and t.year != 0
+        buf_dec(b, t.year as u64)
+        buf_dec_pad2(b, t.month as u64)
+        buf_dec_pad2(b, t.day as u64)
+        buf_ch(b, 45)
+        buf_dec_pad2(b, t.hour as u64)
+        buf_dec_pad2(b, t.minute as u64)
+        buf_dec_pad2(b, t.second as u64)
+    else
+        buf_str(b, "notime-")
+        var mono: u64 = 0
+        (g_bs.get_next_monotonic_count as EfiFn1)(@mono as u64)
+        buf_dec(b, mono)
+    return 0
+
+fn open_dump_dir(root: u64) -> u64
+    let inv: u64 = open_dir_sv(root, "INVENTORY")
+    if inv == 0
+        say("HWINV: cannot create \\INVENTORY (read-only stick?)\n")
+        return 0
+    make_stamp()
+    let base: u64 = g_stamp.len
+    var n: u64 = 2
+    while dir_exists(inv, g_stamp.ptr, g_stamp.len) and n < 100
+        g_stamp.len = base
+        buf_ch(@g_stamp, 45)
+        buf_dec(@g_stamp, n)
+        n = n + 1
+    let d: u64 = open_dir(inv, g_stamp.ptr, g_stamp.len)
+    close_file(inv)
+    return d
+
+# ============================================================================
+# Entry
+# ============================================================================
+
+fn wait_then_power_off() -> i32
+    var timer: u64 = 0
+    var events: [2]u64
+    var index: u64 = 0
+    events[0] = g_st.con_in.wait_for_key
+    if (g_bs.create_event as EfiFn5)(EVT_TIMER, 0, 0, 0, @timer as u64) == EFI_SUCCESS
+        (g_bs.set_timer as EfiFn3)(timer, TIMER_RELATIVE, 150000000)
+        events[1] = timer
+        (g_bs.wait_for_event as EfiFn3)(2, @events[0] as u64, @index as u64)
+    (g_rt.reset_system as EfiFn4)(RESET_SHUTDOWN, 0, 0, 0)
+    return 0
+
+pub fn efi_main(image_handle: u64, system_table: *EfiSystemTable) -> u64
+    g_image = image_handle
+    g_st = system_table
+    g_bs = system_table.boot_services
+    g_rt = system_table.runtime_services
+    # No watchdog: a slow PCI walk on a big machine must not reset it
+    (g_bs.set_watchdog_timer as EfiFn4)(0, 0, 0, 0)
+    init_guids()
+    buf_init(@g_log, 8192)
+    buf_init(@g_line, 512)
+    buf_init(@g_err, 512)
+    buf_init(@g_manifest, 8192)
+    buf_init(@g_stamp, 64)
+    say("\nHWINV: Ritz hardware inventory (AGAST #3406)\n")
+
+    let root: u64 = open_volume()
+    var top: u64 = 0
+    if root != 0
+        top = open_dump_dir(root)
+    if top == 0
+        say("HWINV: FAIL: nowhere to write the inventory\n")
+        wait_then_power_off()
+        return 1
+    let b: *Buf = line_reset()
+    buf_str(b, "HWINV: writing \\INVENTORY\\")
+    buf_bytes(b, g_stamp.ptr, g_stamp.len)
+    buf_ch(b, 10)
+    say_buf(b)
+
+    dump_firmware(top)
+    dump_acpi(top)
+    dump_smbios(top)
+    dump_pci(top)
+    dump_gop(top)
+    dump_memmap(top)
+
+    let s: *Buf = line_reset()
+    buf_str(s, "HWINV: ")
+    buf_dec(s, g_files + 2)
+    buf_str(s, " files, ")
+    buf_dec(s, g_bytes)
+    buf_str(s, " bytes of data\n")
+    say_buf(s)
+    write_buf(top, "hwinv.log", @g_log)
+    buf_str(@g_manifest, "end\n")
+    let ok: bool = write_buf(top, "manifest.txt", @g_manifest)
+    close_file(top)
+    close_file(root)
+    if ok
+        say("HWINV: DONE. Remove the stick; powering off in 15 s (any key: now)\n")
+    else
+        say("HWINV: FAIL: could not write manifest.txt\n")
+    wait_then_power_off()
+    return 0

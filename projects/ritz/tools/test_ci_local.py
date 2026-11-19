@@ -611,7 +611,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     to that. The harland boot (#1845) exits 3 too, and only for the same
     reason: a missing tool (QEMU, OVMF, GRUB-EFI, or rz build's own exit 3)
     -- test_ci_harland_boot.py holds it to that. So does test-uefi-boot's
-    boot/test.sh (#2200; test_harland_uefi_boot_script.py), and the MSI-X
+    boot/test.sh (#2200; test_harland_uefi_boot_script.py), the inventory
+    stick's inventory/test.sh (#3406; test_ci_inventory_boot.py), the MSI-X
     boot (#1852; test_ci_msix_boot.py), the NVMe boot (#1850;
     test_ci_nvme_boot.py), the ESP-initramfs boot (#4253;
     test_ci_esp_initramfs_boot.py) and the rzsh serial session (#4252;
@@ -631,6 +632,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_tier1_boot.sh",
         "bash projects/harland/boot/test.sh",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs/inventory" '
+        "bash projects/harland/inventory/test.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_msix_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '

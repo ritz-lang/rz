@@ -50,6 +50,8 @@ test-tier1      Boot with indium, check init Tier-1 suite (OVMF)
 test-uefi-boot  Test UEFI bootloader (headless)
 test-uefi-gui   Test UEFI bootloader with display
 run-gui         Interactive run (no timeout, kill QEMU manually)
+inventory-img   Build the hardware-inventory USB stick image (build/hwinv.img; inventory/README.md)
+test-inventory  Boot the inventory stick in QEMU and check its dump
 clean           Remove build artifacts
 help            Show this help
 ```
