@@ -1110,8 +1110,17 @@ class ImportResolver:
                 item_target_os = item.get_attr_value('target_os')
 
             if item_target_os is not None:
-                # This function has a target_os attribute - always add it
-                # (filtering will pick the right one later)
+                # A [[target_os]] fn: one variant per target (LANGUAGE_SPEC
+                # §17.2, AGAST #4055).  target_os filtering keeps the one for
+                # the target being compiled; two gated to the same target
+                # are an error whatever that target is -- this used to keep
+                # both, and filtering left the first to win silently.
+                for existing in self.functions[item.name]:
+                    if existing.get_attr_value('target_os') == item_target_os:
+                        raise ImportError(
+                            f"Conflicting function definition for '{item.name}': "
+                            f"defined in both {existing.source_file} and {source_file}"
+                        )
                 self.functions[item.name].append(item)
             else:
                 # No target_os attribute: at most one ungated definition per

@@ -18,6 +18,11 @@ bodies), main file vs import (the rzsh tests' shadowed `println`), nested
 imports (the diagnostic names the file that defined the fn), two in one file,
 and a user fn named like a generated `E__from`.
 
+Two `[[target_os]]` variants gated to the same target are rejected too
+(LANGUAGE_SPEC §17.2, AGAST #4055): both compilers used to keep the first
+and run it.  Rejected whatever the target being compiled, as for structs and
+consts: in one file, across two imports, and gated to another target.
+
 Accepted, and still running correctly: a diamond import (one module reached
 twice is registered once), the same name as `extern fn` in two modules, a
 `[[target_os]]` fn beside an ungated one (never compared, as for consts), and
@@ -50,20 +55,21 @@ def _write(tmp_path, files):
         (tmp_path / f"{name}.ritz").write_text(text)
 
 
-def _compile(compiler, tmp_path, name):
+def _compile(compiler, tmp_path, name, target_os=None):
     src = tmp_path / f"{name}.ritz"
     ll = tmp_path / f"{name}_{compiler}.ll"
     env = dict(os.environ, RITZ_PATH=f"{RITZ_ROOT}:{tmp_path}")
+    args = [str(src), "-o", str(ll)]
+    if target_os is not None:
+        args += ["--target-os", target_os]
     if compiler == "ritz0":
-        proc = run_ritz0([str(src), "-o", str(ll), "--no-runtime"], cwd=tmp_path,
-                         env=env, timeout=300)
+        proc = run_ritz0(args + ["--no-runtime"], cwd=tmp_path, env=env, timeout=300)
     else:
         binary = RITZ1_BUILD / compiler
         # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
         assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
-        proc = subprocess.run([str(binary), str(src), "-o", str(ll)],
-                              cwd=tmp_path, env=env, capture_output=True,
-                              text=True, timeout=300)
+        proc = subprocess.run([str(binary)] + args, cwd=tmp_path, env=env,
+                              capture_output=True, text=True, timeout=300)
     return proc, ll
 
 
@@ -72,8 +78,8 @@ def _conflict(tmp_path, name, first, second):
             f"{tmp_path / (first + '.ritz')} and {tmp_path / (second + '.ritz')}")
 
 
-def _assert_rejected(compiler, tmp_path, diag, main="t"):
-    proc, _ = _compile(compiler, tmp_path, main)
+def _assert_rejected(compiler, tmp_path, diag, main="t", target_os=None):
+    proc, _ = _compile(compiler, tmp_path, main, target_os)
     out = proc.stderr + proc.stdout
     assert proc.returncode != 0, f"{compiler} accepted a duplicate fn:\n{out}"
     assert diag in out, f"{compiler}: wrong diagnostic, want {diag!r}:\n{out}"
@@ -190,6 +196,53 @@ def test_user_fn_named_like_generated_from_rejected(compiler, tmp_path):
     _assert_rejected(compiler, tmp_path, _conflict(tmp_path, "Color__from", "ma", "t"))
 
 
+def _gated(os_name, fn, value):
+    return f'[[target_os = "{os_name}"]]\npub fn {fn}() -> i32\n    {value}\n\n'
+
+
+# (id, target gated twice, target compiled for).  AGAST #4055's repro is
+# linux/linux; harland/linux checks the variants that never reach the module.
+SAME_TARGET = [("compiled_target", "linux", "linux"),
+               ("other_target", "harland", "linux")]
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("gate,target_os", [c[1:] for c in SAME_TARGET],
+                         ids=[c[0] for c in SAME_TARGET])
+def test_same_target_twice_in_one_file_rejected(compiler, tmp_path, gate, target_os):
+    _write(tmp_path, {"t": _gated(gate, "get_platform_id", 1)
+                      + _gated(gate, "get_platform_id", 2)
+                      + "fn main() -> i32\n    0\n"})
+    _assert_rejected(compiler, tmp_path,
+                     _conflict(tmp_path, "get_platform_id", "t", "t"),
+                     target_os=target_os)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("gate,target_os", [c[1:] for c in SAME_TARGET],
+                         ids=[c[0] for c in SAME_TARGET])
+def test_same_target_across_imports_rejected(compiler, tmp_path, gate, target_os):
+    """Identical bodies too: as for ungated fns, bodies are not compared."""
+    _write(tmp_path, {"ma": _gated(gate, "helper", 1) + "pub fn fa() -> i32\n    1\n",
+                      "mb": _gated(gate, "helper", 1) + "pub fn fb() -> i32\n    2\n",
+                      "t": MAIN_AB})
+    _assert_rejected(compiler, tmp_path, _conflict(tmp_path, "helper", "ma", "mb"),
+                     target_os=target_os)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_main_vs_import_same_target_rejected(compiler, tmp_path):
+    """Named in registration order, as for ungated fns: the import first."""
+    _write(tmp_path, {
+        "ma": _gated("linux", "helper", 1) + "pub fn fa() -> i32\n    helper()\n",
+        "t": "import ma\n\n" + _gated("linux", "helper", 7)
+             + "fn main() -> i32\n    fa() * 10 + helper()\n"})
+    _assert_rejected(compiler, tmp_path, _conflict(tmp_path, "helper", "ma", "t"))
+
+
 # ---------------------------------------------------------------------------
 # Still accepted, and still running with the right result.
 # ---------------------------------------------------------------------------
@@ -231,6 +284,21 @@ def test_gated_vs_ungated_not_compared(compiler, tmp_path):
         "t": MAIN_AB})
     proc, _ = _compile(compiler, tmp_path, "t")
     assert PREFIX not in proc.stderr + proc.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_one_variant_per_target_runs(compiler, tmp_path):
+    """A linux and a harland variant, in one file and across imports: linux's runs."""
+    _write(tmp_path, {
+        "ma": _gated("harland", "fa", 9) + _gated("linux", "fa", 4),
+        "mb": _gated("linux", "fb", 2),
+        "mc": _gated("harland", "fb", 8),
+        "t": "import ma\nimport mb\nimport mc\n\nfn main() -> i32\n    fa() * 10 + fb()\n"})
+    assert _run(compiler, tmp_path, ["t", "ma", "mb", "mc"]) == 42
+    for name in ("t", "ma", "mb", "mc"):
+        proc, _ = _compile(compiler, tmp_path, name, "harland")
+        assert PREFIX not in proc.stderr + proc.stdout, (name, proc.stderr)
 
 
 @pytest.mark.integration

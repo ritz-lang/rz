@@ -6577,6 +6577,30 @@ fn platform_id() -> i32
     1
 ```
 
+A `fn` or `struct` name may have one `[[target_os]]` variant per target.
+Two definitions gated to the same target are an error naming both
+locations, whatever the target being compiled. The compiler never silently
+picks one of them. Two such fns conflict even if they are identical. Two
+such structs conflict unless their fields are identical, in which case the
+repeat is dropped, as for ungated structs. How a gated variant relates to
+an ungated definition of the same name is set out in
+[§15.3](#153-qualified-access) for fns. A struct gated variant may stand
+beside an ungated struct only if the two are identical, and this is checked
+only on the variant's own target.
+
+```ritz expect-error="Conflicting function definition for 'get_platform_id'"
+[[target_os = "linux"]]
+fn get_platform_id() -> i32
+    1
+
+[[target_os = "linux"]]
+fn get_platform_id() -> i32
+    2
+
+fn main() -> i32
+    get_platform_id()
+```
+
 ### 17.3 The `@` Attribute Syntax Was Removed
 
 `@` is the reference operator now, so `@test` / `@inline` no longer parse as

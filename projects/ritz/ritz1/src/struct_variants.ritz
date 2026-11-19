@@ -44,9 +44,22 @@ var g_sv: *StructVariant = null
 var g_sv_count: i64 = 0
 var g_sv_cap: i64 = 0
 
-# Forget every noted struct: the driver re-parses from scratch (#1475).
+# A fn gated out by [[target_os]] (AGAST #4055): name, line, file, target.
+struct FnVariant
+    name: *u8
+    name_len: i32
+    line: i32
+    file: *u8            # the defining file (shared copy, never freed)
+    target: u64          # hash of the [[target_os]] value; never 0
+
+var g_fv: *FnVariant = null
+var g_fv_count: i64 = 0
+var g_fv_cap: i64 = 0
+
+# Forget every noted struct and fn: the driver re-parses from scratch (#1475).
 pub fn struct_variants_reset()
     g_sv_count = 0
+    g_fv_count = 0
 
 # The hash a `[[target_os = "<os>"]]` value is noted under; never 0.
 pub fn struct_variant_target_hash(os: *u8, os_len: i32) -> u64
@@ -154,6 +167,84 @@ pub fn struct_variants_check() -> i32
             let a: *StructVariant = g_sv + j
             if a.body != b.body and sv_same_name(a, b) == 1 and sv_coexist(a, b) == 1
                 sv_report(a, b)
+                bad = 1
+                j = i
+            j = j + 1
+        i = i + 1
+    if bad == 1
+        return -1
+    0
+
+# =============================================================================
+# Gated-out fns (AGAST #4055)
+# =============================================================================
+#
+# LANGUAGE_SPEC §17.2: two fns of one name gated to the same target are an
+# error whatever the target compiled for, as in ritz0 (import_resolver.py
+# `_register_item` FnDef branch).  Two kept ones are main.ritz's
+# fns_conflict; two gated out never reach the module, so the parser notes
+# each here and fn_variants_check pairs them once the import closure is
+# parsed.  Bodies are not compared: any second definition conflicts.
+
+pub fn fn_variant_note(name: *u8, name_len: i32, line: i32, file: *u8, target: u64)
+    if g_fv_count == g_fv_cap
+        var cap: i64 = g_fv_cap * 2
+        if cap == 0
+            cap = 64
+        let grown: *FnVariant = realloc(g_fv as *u8, cap * sizeof(FnVariant)) as *FnVariant
+        if grown == null
+            eprints_cstr(c"error: ritz1: out of memory recording gated fns\n")
+            sys_exit(70)
+        g_fv = grown
+        g_fv_cap = cap
+    let v: *FnVariant = g_fv + g_fv_count
+    v.name = name
+    v.name_len = name_len
+    v.line = line
+    v.file = file
+    v.target = target
+    g_fv_count = g_fv_count + 1
+
+fn fv_same_name(a: *FnVariant, b: *FnVariant) -> i32
+    if a.name_len != b.name_len
+        return 0
+    if a.name_len == 0
+        return 1
+    if memcmp(a.name, b.name, a.name_len as i64) == 0
+        return 1
+    0
+
+# "Error: <later>:<line>: Conflicting function definition for 'X': defined
+# in both <earlier> and <later>", main.ritz report_fn_conflict's words.
+fn fv_report(earlier: *FnVariant, later: *FnVariant)
+    var msg: String = string_from("Error: ")
+    if later.file != null
+        string_push_cstr(@&msg, later.file)
+    string_push(@&msg, ':')
+    string_push_i64(@&msg, later.line as i64)
+    string_push_str(@&msg, ": Conflicting function definition for '")
+    string_push_bytes(@&msg, later.name, later.name_len as i64)
+    string_push_str(@&msg, "': defined in both ")
+    if earlier.file != null
+        string_push_cstr(@&msg, earlier.file)
+    string_push_str(@&msg, " and ")
+    if later.file != null
+        string_push_cstr(@&msg, later.file)
+    eprintln_string(@msg)
+    string_drop(@&msg)
+
+# Report each later gated-out fn against the first of its name and target.
+# Returns -1 if there was one, else 0.
+pub fn fn_variants_check() -> i32
+    var bad: i32 = 0
+    var i: i64 = 1
+    while i < g_fv_count
+        let b: *FnVariant = g_fv + i
+        var j: i64 = 0
+        while j < i
+            let a: *FnVariant = g_fv + j
+            if a.target == b.target and fv_same_name(a, b) == 1
+                fv_report(a, b)
                 bad = 1
                 j = i
             j = j + 1
