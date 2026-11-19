@@ -441,6 +441,13 @@ cat > "$T/bin/fakessh" <<'EOF'
 host="$1"; shift
 echo "$host $*" >> "$RZ_TEST_DIR/ssh-log"
 [[ -e "$RZ_TEST_DIR/ssh-down" ]] && { echo "ssh: connect to host $host: refused" >&2; exit 255; }
+# ssh-flaky: every other connection fails (a slow host, AGAST #4318).
+if [[ -e "$RZ_TEST_DIR/ssh-flaky" ]]; then
+    if [[ "$(cat "$RZ_TEST_DIR/ssh-flaky")" == 1 ]]; then
+        echo 0 > "$RZ_TEST_DIR/ssh-flaky"; echo "ssh: connect to host $host: timed out" >&2; exit 255
+    fi
+    echo 1 > "$RZ_TEST_DIR/ssh-flaky"
+fi
 # The remote user's own HOME (its venv lives there), and a login shell's
 # PATH: /etc/profile resets it, so no venv on it (AGAST #4025).
 # Each host has its own gate dir, and its own host.env if the test wrote one
@@ -449,7 +456,7 @@ export RZ_GATE_DIR="$RZ_TEST_DIR/gates-$host"
 if [[ -e "$RZ_TEST_DIR/host-$host.env" ]]; then
     unset RZ_GATE_SLOTS RZ_TRAIN_SLOTS; export RZ_HOST_ENV="$RZ_TEST_DIR/host-$host.env"
 fi
-HOME="$RZ_TEST_DIR/rhome" PATH=/usr/local/bin:/usr/bin:/bin exec bash -c "$*"
+HOME="$RZ_TEST_DIR/rhome" PATH="$RZ_TEST_DIR/rbin:/usr/local/bin:/usr/bin:/bin" exec bash -c "$*"
 EOF
 chmod +x "$T/bin/fakessh"
 # The remote host's gate venv: a python3 whose `import pytest` works unless
@@ -471,7 +478,12 @@ if [[ "$1" == --wait ]]; then
     echo "waited $2" >&2
     if ! grep -q '^EXIT=' "$2"; then
         n="$(cat "$RZ_TEST_DIR/queued-polls" 2>/dev/null || echo 0)"
-        if [[ $n -gt 0 ]]; then echo $((n - 1)) > "$RZ_TEST_DIR/queued-polls"; exit "${RZ_FAKE_QUEUED_RC:-1}"; fi
+        if [[ $n -gt 0 ]]; then
+        echo $((n - 1)) > "$RZ_TEST_DIR/queued-polls"
+        # RZ_FAKE_GROW: the gate is mid-run, its log advancing (AGAST #4318).
+        [[ -n "${RZ_FAKE_GROW:-}" ]] && echo "tests/x.py ... [$n%]" >> "$2"
+        exit "${RZ_FAKE_QUEUED_RC:-1}"
+    fi
         [[ -e "$RZ_TEST_DIR/queued-polls" ]] && echo EXIT=0 >> "$2"
     fi
     exit "$(sed -n 's/^EXIT=//p' "$2" | tail -1)"
@@ -683,6 +695,70 @@ grep -q -- "-- wait $rw2 - " "$T/ssh-log" && ok "the remote wait names the slot'
     || bad "the remote wait names the slot's own tree ($(grep -- '-- wait ' "$T/ssh-log" | head -1))"
 mv "$g2" "$T/run-gate.sh.4247"; [[ -e "$g2.aside" ]] && mv "$g2.aside" "$g2"
 [[ -e "$T/remote-train.aside" ]] && mv "$T/remote-train.aside" "$RW"
+
+# 11i. A remote gate that outlives the old 5-poll cap (AGAST #4318: EXIT=none
+# twice with pytest still running).  Each --wait slice ends early with no
+# EXIT= (its `systemctl is-active` missed the unit: 98), more than 5 times in
+# a row; while the unit is still active, its state is unknown, or the log
+# still grows, wait keeps polling to the verdict.  Only a stopped unit whose
+# log no longer grows is a dead gate (98, and says so).  The remote side's
+# systemctl is a fake: rsystemctl-state holds the unit's ActiveState
+# (BUSDOWN: systemctl can't reach the user bus); is-active always misses.
+mkdir -p "$T/rbin"
+cat > "$T/rbin/systemctl" <<'EOF'
+#!/usr/bin/env bash
+st="$RZ_TEST_DIR/rsystemctl-state"
+[[ -e "$st" ]] || exec env PATH=/usr/local/bin:/usr/bin:/bin systemctl "$@"
+[[ "$(cat "$st")" == BUSDOWN ]] && { echo "Failed to connect to bus" >&2; exit 1; }
+[[ " $* " == *" show "* ]] && { cat "$st"; exit 0; }
+[[ " $* " == *" stop "* ]] && exit 0
+exit 3
+EOF
+chmod +x "$T/rbin/systemctl"
+grep -q '^UNIT=' "$rlog" || echo "UNIT=rz-test-4318-unit" >> "$rlog"
+# wait4318 <state> <polls> [env...]: a gate with no EXIT= whose --wait ends
+# early (98) <polls> times, then writes EXIT=0.
+wait4318() {
+    local st="$1" n="$2"; shift 2
+    sed -i '/^EXIT=/d' "$rlog"; echo "$n" > "$T/queued-polls"; : > "$T/ssh-log"
+    echo "$st" > "$T/rsystemctl-state"
+    out="$(env RZ_FAKE_QUEUED_RC=98 "$@" timeout 60 bash "$TR" wait "$llog" 2>&1)"; rc=$?
+}
+wait4318 inactive 8 RZ_FAKE_GROW=1
+[[ $rc -eq 0 && "$(polls)" == 9 && "$out" != *EXIT=none* ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "wait keeps polling a gate whose log still grows, past 5 early ends, to EXIT=0" \
+    || { bad "wait keeps polling a gate whose log still grows, past 5 early ends (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+wait4318 active 8
+[[ $rc -eq 0 && "$(polls)" == 9 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "wait keeps polling a gate whose unit is still active, past 5 early ends, to EXIT=0" \
+    || { bad "wait keeps polling a gate whose unit is still active, past 5 early ends (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+wait4318 BUSDOWN 8
+[[ $rc -eq 0 && "$(polls)" == 9 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "wait keeps polling a gate whose unit state is unknown (no user bus) to EXIT=0" \
+    || { bad "wait keeps polling a gate whose unit state is unknown (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# Queued for a slot (its waiter alive, the unit not started: inactive).
+sleep 300 & qpid=$!
+echo "$(sed -n 's/^UNIT=//p' "$rlog" | head -1) $qpid 1 $(date +%s)" > "$(dirname "$rlog")/.gate-queue"
+wait4318 inactive 8
+kill "$qpid" 2>/dev/null; wait "$qpid" 2>/dev/null; rm -f "$(dirname "$rlog")/.gate-queue"
+[[ $rc -eq 0 && "$(polls)" == 9 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" \
+    "wait keeps polling a gate queued for a slot, past 5 early ends, to EXIT=0" \
+    || { bad "wait keeps polling a gate queued for a slot, past 5 early ends (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# A slow host whose ssh fails every other time, 8 times over one long gate:
+# the retry budget is for failures in a row, not for the whole wait.
+echo 1 > "$T/ssh-flaky"; wait4318 active 8; rm -f "$T/ssh-flaky"
+[[ $rc -eq 0 ]] && has "$out" "SHA=${t2:0:12} EXIT=0$" "ssh failures that are not 5 in a row don't end a long remote wait" \
+    || { bad "ssh failures that are not 5 in a row don't end a long remote wait (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+# The unit stopped, the log no longer grows, never an EXIT=: dead, 98, and
+# the message says the unit stopped.
+wait4318 failed 99
+[[ $rc -eq 98 && "$(polls)" == 5 ]] && has "$out" "EXIT=none .*stopped" "a stopped remote unit with no EXIT= is 98, saying the unit stopped" \
+    || { bad "a stopped remote unit with no EXIT= is 98, saying the unit stopped (rc=$rc, $(polls) polls)"; echo "$out" | sed 's/^/     | /'; }
+# Unreachable past the retry budget: 98, saying so.
+touch "$T/ssh-down"; wait4318 active 99; rm -f "$T/ssh-down"
+[[ $rc -eq 98 ]] && has "$out" "EXIT=none .*unreachable" "a host unreachable past the ssh retry budget is 98, saying unreachable" \
+    || { bad "a host unreachable past the ssh retry budget is 98, saying unreachable (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+rm -f "$T/queued-polls" "$T/rsystemctl-state"; grep -q '^EXIT=' "$rlog" || echo EXIT=0 >> "$rlog"
 bash "$TR" wait "$llog" >/dev/null 2>&1
 bash "$TR" land "$log1" >/dev/null 2>&1
 out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "^MERGED +eb2 " "the queued-then-passed remote verdict lands"

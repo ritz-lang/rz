@@ -224,8 +224,12 @@ front() { local s; s="$(queue | head -1)"; [[ -n "$s" ]] || die "no train built"
 #                                  EXIT yet whose unit is active or whose
 #                                  waiter is queued for a slot is still
 #                                  running, whatever code --wait ended with
-#                                  (AGAST #4025); after an early end, sleep
-#                                  <pause> first so a re-poll can't spin
+#                                  (AGAST #4025), as is one whose unit is
+#                                  active or of unknown state, or whose log
+#                                  grew in the slice (#4318); 98 only for a
+#                                  stopped unit with a still log.  After an
+#                                  early end, sleep <pause> first so a
+#                                  re-poll can't spin
 #   cat <log>                      the log
 #   stop <name>                    stop the gate's unit, if it runs
 #   free                           how many more train gates the host can
@@ -249,6 +253,15 @@ alive() {
     done < "$q"
     return 1
 }
+# ustate <log>: its unit's ActiveState (active, inactive, failed...), "none"
+# with no UNIT= line, "unknown" if systemctl can't say (no user bus).
+ustate() {
+    local unit s
+    unit="$(sed -n 's/^UNIT=//p' "$1" | head -1)"
+    [ -n "$unit" ] || { echo none; return; }
+    s="$(systemctl --user show -p ActiveState --value "$unit" 2>/dev/null)" || s=""
+    echo "${s:-unknown}"
+}
 main() {
     # systemd-run --user needs the user bus; a non-login ssh may not set it.
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
@@ -270,15 +283,30 @@ main() {
         [ "$8" = 1 ] && after="bash $(printf %q "$wt/.claude/skills/rz-iterate/train.sh") pkgs test $6"
         RZ_GATE_TRAIN=1 RZ_GATE_BASE="$6" RZ_GATE_AFTER="$after" bash "$gate" "$wt" "$7" ;;
     wait)
-        local rc=0 t0
-        t0="$(date +%s)"
+        local rc=0 t0 s0 st why=""
+        t0="$(date +%s)"; s0="$(wc -c < "$3")"
         timeout "$4" bash "$(gate_of "$(abs "$1")" "$2")" --wait "$3" >&2 || rc=$?
-        if [ "$rc" != 124 ] && ! grep -q '^EXIT=' "$3" && alive "$3"; then
-            echo "no verdict yet, gate still running or queued (--wait exit $rc)" >&2
-            [ $(( $(date +%s) - t0 )) -ge "$5" ] || sleep "$5"
-            rc=124
+        [ "$rc" != 124 ] || exit 124
+        grep -q '^EXIT=' "$3" && exit "$rc"
+        # --wait ended with no verdict.  Its one `is-active` can miss a unit
+        # that is still running (a loaded host's user bus; AGAST #4318), so
+        # look again after <pause>, and call the gate dead only when its unit
+        # has stopped and its log has stopped growing.
+        [ $(( $(date +%s) - t0 )) -ge "$5" ] || sleep "$5"
+        grep -q '^EXIT=' "$3" && exit 0                 # it ended meanwhile
+        st="$(ustate "$3")"
+        if alive "$3"; then why="its unit is $st or queued"
+        elif [ "$(wc -c < "$3")" != "$s0" ]; then why="its log is still growing"
+        else case "$st" in
+            inactive|failed|none) ;;
+            *) why="its unit is $st" ;;                # active, activating, unknown...
+        esac; fi
+        if [ -n "$why" ]; then
+            echo "no verdict yet, gate still running: $why (--wait exit $rc)" >&2
+            exit 124
         fi
-        exit "$rc" ;;
+        echo "unit stopped: $(sed -n 's/^UNIT=//p' "$3" | head -1) is $st, its log not growing, and no EXIT= (--wait exit $rc)" >&2
+        exit 98 ;;
     cat) cat "$1" ;;
     stop) systemctl --user stop "ritz-gate-$1" 2>/dev/null || true ;;
     free) rz_train_free ;;
@@ -670,9 +698,12 @@ pick_train_host() {
 
 # cmd_wait <log>: block until the gate ends; exit with its code.  A remote
 # gate's log is fetched to <log> once it ends; a log for another SHA than its
-# train's tip exits 3.  Only an EXIT= line in that log ends a remote wait: a
-# slice that times out (124) or ends with no EXIT= polls again, and 5 ends
-# with no EXIT= in a row are no verdict (98), never exit 0 (AGAST #4116).
+# train's tip exits 3.  Only an EXIT= line in that log ends a remote wait: it
+# polls in WAIT_SLICE slices with no cap while the remote unit is active (or
+# its state unknown) or the log still grows (AGAST #4116, #4318).  No verdict
+# (98, never exit 0) is only 5 reports in a row of a stopped unit with no
+# EXIT= and a still log, or 5 ssh failures in a row (host unreachable); the
+# EXIT=none line says which.
 # The remote wait runs in the train's own slot tree, $(rwt) (AGAST #4247).
 cmd_wait() {
     local log="${1:?usage: $0 wait <log>}" s st="" spec="" host ref rlog llog rc tries=0 nov=0 tip
@@ -690,25 +721,43 @@ cmd_wait() {
     # A speculative gate on this host (AGAST #4031): its log is local.
     if is_local "$host"; then exec bash "$GATE" --wait "$rlog"; fi
     tip="$(field TIP "$st")"
+    local why="" out crc
     while :; do
         rc=0; remote "$host" wait "$(rwt)" "$REMOTE_GATE" "$rlog" "$WAIT_SLICE" "$QUEUED_PAUSE" || rc=$?
-        if [[ $rc -eq 124 ]]; then nov=0; continue; fi    # still running
         if [[ $rc -eq 255 ]]; then                        # ssh itself failed
             tries=$((tries + 1))
-            [[ $tries -lt 5 ]] || die "ssh to $host failed 5 times: no verdict for $log"
+            if [[ $tries -ge 5 ]]; then
+                why="host unreachable: ssh to $host failed 5 times in a row"; break
+            fi
             sleep "$SSH_RETRY"; continue
         fi
-        remote "$host" cat "$rlog" > "$llog.tmp" || { rm -f "$llog.tmp"; die "could not fetch $rlog from $host"; }
-        mv -f "$llog.tmp" "$llog"
+        tries=0                                           # 5 in a row, not 5 per wait
+        if [[ $rc -eq 124 ]]; then nov=0; continue; fi    # still running
+        # The slice ended: fetch the log, retrying the fetch itself.
+        for crc in 1 2 3 4 5; do
+            out="$(remote "$host" cat "$rlog")" && { crc=0; break; }
+            [[ $crc -eq 5 ]] || sleep "$SSH_RETRY"
+        done
+        if [[ $crc -ne 0 ]]; then
+            why="host unreachable: could not fetch $rlog from $host 5 times in a row"; break
+        fi
+        printf '%s\n' "$out" > "$llog.tmp" && mv -f "$llog.tmp" "$llog"
         grep -q '^EXIT=' "$llog" && break
-        # The slice ended but the log has no verdict (AGAST #4116): the gate
-        # may still be running (alive() can miss its unit), so poll again;
-        # only 5 such ends in a row are a dead gate, no verdict (98 below).
+        # The slice ended with no verdict and the remote says the unit has
+        # stopped and its log no longer grows (AGAST #4318: a unit still
+        # active, of unknown state, or a growing log is 124 above, however
+        # long the gate runs).  5 such reports in a row are a dead gate.
         nov=$((nov + 1))
-        [[ $nov -lt 5 ]] || break
+        if [[ $nov -ge 5 ]]; then
+            why="unit stopped: the gate on $host ended without writing EXIT="; break
+        fi
         echo "no EXIT= yet in $host:$rlog (wait exit $rc): polling again" >&2
         sleep "$QUEUED_PAUSE"
     done
+    if [[ -n "$why" ]]; then
+        echo "gate $(basename "$llog") SHA=${tip:0:12} EXIT=none — no verdict, $why"
+        exit 98
+    fi
     if [[ "$(sed -n 's/^SHA=//p' "$llog" | head -1)" != "$tip" ]]; then
         echo "REFUSED: $host's verdict is for $(sed -n 's/^SHA=//p' "$llog" | head -1 | cut -c1-12), not the train tip ${tip:0:12}" >&2
         exit 3
