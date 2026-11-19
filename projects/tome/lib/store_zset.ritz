@@ -660,3 +660,135 @@ pub fn store_zrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: 
 pub fn store_zrevrange_cstr(s: *Store, key: *u8, start: i64, stop: i64, out_count: @&i64) -> *StrView
     var key_sv: StrView = strview_from_cstr(key)
     return store_zrevrange(s, key_sv, start, stop, out_count)
+
+# ============================================================================
+# Ranges by score and by member (AGAST #4284)
+# ============================================================================
+# A ZRangeSpec is Redis's zrangespec / zlexrangespec: the interval ZCOUNT,
+# ZRANGE BYSCORE / BYLEX and Z[REV]RANGEBY{SCORE,LEX} select.
+
+const ZRANGE_BY_SCORE: i32 = 1
+const ZRANGE_BY_LEX: i32 = 2
+
+# Kinds of lexicographic bound: "-" (below every member), "+" (above every
+# member), or a value ("[v" inclusive, "(v" exclusive).
+const ZLEX_NEG_INF: i32 = 0
+const ZLEX_POS_INF: i32 = 1
+const ZLEX_VALUE: i32 = 2
+
+struct ZLexBound
+    kind: i32
+    excl: bool
+    value: StrView           # borrowed; only for ZLEX_VALUE
+
+struct ZRangeSpec
+    by: i32                  # ZRANGE_BY_SCORE or ZRANGE_BY_LEX
+    min: f64                 # score bounds (BY_SCORE)
+    max: f64
+    minex: bool              # true: the bound itself is excluded
+    maxex: bool
+    lmin: ZLexBound          # member bounds (BY_LEX)
+    lmax: ZLexBound
+
+# One member of a range reply: its bytes (borrowed from the set) and score.
+struct ZItem
+    member: StrView
+    score: f64
+
+fn zlex_gte_min(b: *ZLexBound, v: StrView) -> bool
+    if b.kind == ZLEX_NEG_INF
+        return true
+    if b.kind == ZLEX_POS_INF
+        return false
+    let c: i32 = strview_cmp(v, b.value)
+    if b.excl
+        return c > 0
+    return c >= 0
+
+fn zlex_lte_max(b: *ZLexBound, v: StrView) -> bool
+    if b.kind == ZLEX_POS_INF
+        return true
+    if b.kind == ZLEX_NEG_INF
+        return false
+    let c: i32 = strview_cmp(v, b.value)
+    if b.excl
+        return c < 0
+    return c <= 0
+
+# True if (score, member) lies inside spec.  An empty interval (min > max,
+# or min == max with an end excluded) holds nothing.  A lexicographic range
+# compares members bytewise, as Redis does; like Redis it is meant for a set
+# whose scores are all equal.
+pub fn zrange_spec_contains(spec: *ZRangeSpec, score: f64, member: StrView) -> bool
+    if spec.by == ZRANGE_BY_LEX
+        return zlex_gte_min(@spec.lmin, member) and zlex_lte_max(@spec.lmax, member)
+    if spec.minex
+        if not (score > spec.min)
+            return false
+    else if not (score >= spec.min)
+        return false
+    if spec.maxex
+        return score < spec.max
+    return score <= spec.max
+
+# Number of members of zset inside spec.
+pub fn zset_count_spec(zset: *ZSet, spec: *ZRangeSpec) -> i64
+    var n: i64 = 0
+    var node: *ZSetNode = zset.header.forward[0]
+    while node != null
+        if zrange_spec_contains(spec, node.score, string_as_view(@node.member))
+            n += 1
+        node = node.forward[0]
+    return n
+
+# The members of zset inside spec, ascending (descending with `rev`), after
+# skipping `offset` of them and keeping at most `limit` (negative: all).  A
+# negative offset selects nothing, as in Redis.  Returns an array of
+# *out_count items the caller frees (null when there are none).
+pub fn zset_range_spec(zset: *ZSet, spec: *ZRangeSpec, rev: bool, offset: i64, limit: i64, out_count: @&i64) -> *ZItem
+    *out_count = 0
+    if offset < 0 or limit == 0
+        return null
+    let n: i64 = zset_count_spec(zset, spec)
+    if offset >= n
+        return null
+    var take: i64 = n - offset
+    if limit > 0 and limit < take
+        take = limit
+
+    # Matches in ascending order; item k of the reply is match `first + k`
+    # going up, or `last - k` going down.
+    var first: i64 = offset
+    if rev
+        first = n - 1 - offset
+    let items: *ZItem = malloc(take * sizeof(ZItem)) as *ZItem
+    var idx: i64 = 0
+    var node: *ZSetNode = zset.header.forward[0]
+    while node != null
+        let m: StrView = string_as_view(@node.member)
+        if zrange_spec_contains(spec, node.score, m)
+            var k: i64 = idx - first
+            if rev
+                k = first - idx
+            if k >= 0 and k < take
+                items[k].member = m
+                items[k].score = node.score
+            idx += 1
+        node = node.forward[0]
+    *out_count = take
+    return items
+
+# ZCOUNT: members of key's zset inside spec (0 if there is none).
+pub fn store_zcount(s: *Store, key: StrView, spec: *ZRangeSpec) -> i64
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return 0
+    return zset_count_spec(zset, spec)
+
+# ZRANGE BYSCORE / BYLEX: see zset_range_spec.  No items if there is no zset.
+pub fn store_zrange_spec(s: *Store, key: StrView, spec: *ZRangeSpec, rev: bool, offset: i64, limit: i64, out_count: @&i64) -> *ZItem
+    *out_count = 0
+    let zset: *ZSet = store_get_zset(s, key)
+    if zset == null
+        return null
+    return zset_range_spec(zset, spec, rev, offset, limit, out_count)

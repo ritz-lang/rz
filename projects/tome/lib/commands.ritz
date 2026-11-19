@@ -9,7 +9,9 @@
 #   List:   LPUSH, RPUSH, LPOP, RPOP, LLEN, LINDEX, LRANGE
 #   Set:    SADD, SREM, SISMEMBER, SCARD, SMEMBERS
 #   Hash:   HSET, HGET, HDEL, HEXISTS, HLEN, HKEYS, HVALS, HGETALL
-#   ZSet:   ZADD, ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD, ZRANGE, ZREVRANGE
+#   ZSet:   ZADD, ZINCRBY, ZREM, ZSCORE, ZRANK, ZREVRANK, ZCARD, ZCOUNT,
+#           ZRANGE, ZREVRANGE, ZRANGEBYSCORE, ZREVRANGEBYSCORE,
+#           ZRANGEBYLEX, ZREVRANGEBYLEX
 #   Server: PING, ECHO, COMMAND, INFO, DBSIZE, FLUSHDB
 
 import ritzlib.ct
@@ -138,6 +140,12 @@ fn ctx_write_null(ctx: *CommandContext)
         ctx_too_large(ctx)
         return
     ctx.resp_len = resp_write_null(ctx.resp_buf)
+
+fn ctx_write_null_array(ctx: *CommandContext)
+    if not ctx_fits(ctx, 0)
+        ctx_too_large(ctx)
+        return
+    ctx.resp_len = resp_write_null_array(ctx.resp_buf)
 
 # Write an array of `count` bulk strings, each its view's whole (ptr, len),
 # embedded NULs included (AGAST #4210), then free the `items` array (the
@@ -857,20 +865,74 @@ fn zset_wrongtype(ctx: *CommandContext, key: StrView) -> bool
     return false
 
 
-# ZADD key score member [score member ...]
-fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
-    if cmd.argc < 4
-        let err: StrView = "ERR wrong number of arguments for 'zadd' command"
-        ctx_write_error_sv(ctx, err)
-        return CMD_ERR_ARGC
-    if (cmd.argc - 2) % 2 != 0
+# ZADD flags (Redis's ZADD_IN_*).
+const ZADD_NX: i32 = 1
+const ZADD_XX: i32 = 2
+const ZADD_GT: i32 = 4
+const ZADD_LT: i32 = 8
+const ZADD_CH: i32 = 16
+const ZADD_INCR: i32 = 32
+
+# The (flag, name) pairs ZADD reads before its scores.
+fn zadd_flag(arg: *RespArg) -> i32
+    let nx: StrView = "NX"
+    let xx: StrView = "XX"
+    let gt: StrView = "GT"
+    let lt: StrView = "LT"
+    let ch: StrView = "CH"
+    let incr: StrView = "INCR"
+    if resp_arg_eq_ci_sv(arg, nx) == 1
+        return ZADD_NX
+    if resp_arg_eq_ci_sv(arg, xx) == 1
+        return ZADD_XX
+    if resp_arg_eq_ci_sv(arg, gt) == 1
+        return ZADD_GT
+    if resp_arg_eq_ci_sv(arg, lt) == 1
+        return ZADD_LT
+    if resp_arg_eq_ci_sv(arg, ch) == 1
+        return ZADD_CH
+    if resp_arg_eq_ci_sv(arg, incr) == 1
+        return ZADD_INCR
+    return 0
+
+
+# ZADD / ZINCRBY's body (Redis's zaddGenericCommand): the score/member pairs
+# start at args[scoreidx]; `flags` are ZADD_* bits.
+#   NX: only add new members.          XX: only update existing ones.
+#   GT / LT: only move a score up / down (new members are still added).
+#   CH: count changed scores as well as additions.
+#   INCR: add the score to the member's (one pair only); the reply is the
+#   new score, or nil if NX / XX / GT / LT skipped it.  A NaN result (inf
+#   plus -inf) is refused and leaves the score alone.
+fn zadd_apply(ctx: *CommandContext, cmd: *RespCommand, scoreidx: i32, flags: i32) -> i32
+    let nx: bool = (flags & ZADD_NX) != 0
+    let xx: bool = (flags & ZADD_XX) != 0
+    let gt: bool = (flags & ZADD_GT) != 0
+    let lt: bool = (flags & ZADD_LT) != 0
+    let ch: bool = (flags & ZADD_CH) != 0
+    let incr: bool = (flags & ZADD_INCR) != 0
+
+    let elements: i32 = cmd.argc - scoreidx
+    if elements % 2 != 0 or elements == 0
         let err: StrView = "ERR syntax error"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+    if nx and xx
+        let err: StrView = "ERR XX and NX options at the same time are not compatible"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+    if (gt and nx) or (lt and nx) or (gt and lt)
+        let err: StrView = "ERR GT, LT, and/or NX options at the same time are not compatible"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+    if incr and elements > 2
+        let err: StrView = "ERR INCR option supports a single increment-element pair"
         ctx_write_error_sv(ctx, err)
         return CMD_ERR_SYNTAX
 
     # Every score is checked before anything is added, so a bad one leaves
     # the set as it was (as Redis does).
-    var i: i32 = 2
+    var i: i32 = scoreidx
     while i < cmd.argc
         var score: f64 = 0.0
         let arg: *RespArg = @cmd.args[i]
@@ -884,18 +946,82 @@ fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
     if zset_wrongtype(ctx, key_sv)
         return CMD_ERR_TYPE
 
+    # A member is only written when it is added or its score moves, so XX
+    # on a missing key creates nothing.
     var added: i64 = 0
-    i = 2
+    var updated: i64 = 0
+    var processed: i64 = 0
+    var newscore: f64 = 0.0
+    i = scoreidx
     while i < cmd.argc
         var score: f64 = 0.0
         let arg: *RespArg = @cmd.args[i]
         score_parse(arg.data, arg.len, @score)
         var member_sv: StrView = resp_arg_sv(@cmd.args[i + 1])
-        added += store_zadd(ctx.store, key_sv, score, member_sv)
         i += 2
 
-    ctx_write_int(ctx, added)
+        var cur: f64 = 0.0
+        if store_zscore(ctx.store, key_sv, member_sv, @&cur) == 1
+            if nx
+                continue
+            if incr
+                score = cur + score
+                if score_is_nan(score)
+                    let err: StrView = "ERR resulting score is not a number (NaN)"
+                    ctx_write_error_sv(ctx, err)
+                    return CMD_ERR_SYNTAX
+            if (lt and score >= cur) or (gt and score <= cur)
+                continue
+            if score != cur
+                store_zadd(ctx.store, key_sv, score, member_sv)
+                updated += 1
+        else
+            if xx
+                continue
+            store_zadd(ctx.store, key_sv, score, member_sv)
+            added += 1
+        processed += 1
+        newscore = score
+
+    if incr
+        if processed == 0
+            ctx_write_null(ctx)
+        else
+            var digits: [32]u8
+            let n: i64 = score_format(newscore, @digits[0])
+            ctx_write_bulk(ctx, @digits[0], n)
+        return CMD_OK
+    if ch
+        ctx_write_int(ctx, added + updated)
+    else
+        ctx_write_int(ctx, added)
     return CMD_OK
+
+
+# ZADD key [NX|XX] [GT|LT] [CH] [INCR] score member [score member ...]
+fn cmd_zadd(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc < 4
+        let err: StrView = "ERR wrong number of arguments for 'zadd' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+    var flags: i32 = 0
+    var scoreidx: i32 = 2
+    while scoreidx < cmd.argc
+        let f: i32 = zadd_flag(@cmd.args[scoreidx])
+        if f == 0
+            break
+        flags = flags | f
+        scoreidx += 1
+    return zadd_apply(ctx, cmd, scoreidx, flags)
+
+
+# ZINCRBY key increment member: ZADD INCR's reply, the new score.
+fn cmd_zincrby(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 4
+        let err: StrView = "ERR wrong number of arguments for 'zincrby' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+    return zadd_apply(ctx, cmd, 2, ZADD_INCR)
 
 
 # ZREM key member [member ...]
@@ -941,14 +1067,24 @@ fn cmd_zscore(ctx: *CommandContext, cmd: *RespCommand) -> i32
     return CMD_OK
 
 
-# ZRANK / ZREVRANK key member: the 0-based rank as an integer, nil if the
-# member (or the key) is missing.
+# ZRANK / ZREVRANK key member [WITHSCORE]: the 0-based rank as an integer,
+# nil if the member (or the key) is missing.  With WITHSCORE the reply is
+# [rank, score], and a miss is a nil array.
 fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i32
-    if cmd.argc != 3
+    if cmd.argc < 3 or cmd.argc > 4
         var err: [96]u8
         argc_error(@err[0], name)
         ctx_write_error(ctx, @err[0])
         return CMD_ERR_ARGC
+
+    var withscore: bool = false
+    if cmd.argc == 4
+        let opt: StrView = "WITHSCORE"
+        if resp_arg_eq_ci_sv(@cmd.args[3], opt) != 1
+            let err: StrView = "ERR syntax error"
+            ctx_write_error_sv(ctx, err)
+            return CMD_ERR_SYNTAX
+        withscore = true
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
     if zset_wrongtype(ctx, key_sv)
@@ -961,9 +1097,26 @@ fn cmd_zrank(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i
     else
         rank = store_zrank(ctx.store, key_sv, member_sv)
     if rank < 0
-        ctx_write_null(ctx)
-    else
+        if withscore
+            ctx_write_null_array(ctx)
+        else
+            ctx_write_null(ctx)
+        return CMD_OK
+    if not withscore
         ctx_write_int(ctx, rank)
+        return CMD_OK
+
+    var score: f64 = 0.0
+    store_zscore(ctx.store, key_sv, member_sv, @&score)
+    var digits: [32]u8
+    let n: i64 = score_format(score, @digits[0])
+    if not ctx_fits(ctx, n + 2 * RESP_FRAME_OVERHEAD)
+        ctx_too_large(ctx)
+        return CMD_OK
+    var pos: i32 = resp_write_array(ctx.resp_buf, 2)
+    pos += resp_write_i64(ctx.resp_buf + pos, rank)
+    pos += resp_write_bulk(ctx.resp_buf + pos, @digits[0], n)
+    ctx.resp_len = pos
     return CMD_OK
 
 
@@ -982,66 +1135,224 @@ fn cmd_zcard(ctx: *CommandContext, cmd: *RespCommand) -> i32
     return CMD_OK
 
 
-# ZRANGE / ZREVRANGE key start stop [WITHSCORES]
-# An array of members (ascending or descending score); with WITHSCORES each
-# member is followed by its score as a bulk string.  The 6.2 ZRANGE options
-# (BYSCORE, BYLEX, REV, LIMIT) are not supported: they are a syntax error
-# (AGAST #4284).
-fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rev: bool, name: *u8) -> i32
+# Reply with `count` range items: their members, each followed by its score
+# when `withscores`.  Frees `items`.
+fn ctx_write_zitems(ctx: *CommandContext, items: *ZItem, count: i64, withscores: bool)
+    var n: i64 = count
+    if withscores
+        n = 2 * count
+    let views: *StrView = malloc(n * sizeof(StrView) + 1) as *StrView
+    # Each score's text lives in `digits` (SCORE_FMT_MAX bytes a score)
+    # until the reply is written.
+    let digits: *u8 = malloc(SCORE_FMT_MAX * count + 1)
+    for i in 0..count
+        if withscores
+            let d: *u8 = digits + SCORE_FMT_MAX * i
+            let len: i64 = score_format(items[i].score, d)
+            views[2 * i] = items[i].member
+            views[2 * i + 1] = strview_from_ptr(d, len)
+        else
+            views[i] = items[i].member
+    ctx_write_bulk_array(ctx, views, n)  # frees views
+    free(digits)
+    if items != null
+        free(items as *u8)
+
+
+# Parse a score bound as Redis's zslParseRange: a score, "(" before it
+# makes it exclusive.  False if it is not one ("min or max is not a float").
+# Redis reads a bound with raw strtod, which also takes "", 1e400, leading
+# space and hex; score_parse refuses those (AGAST #4311).
+fn parse_score_bound(arg: *RespArg, out: *f64, excl: *bool) -> bool
+    var p: *u8 = arg.data
+    var len: i64 = arg.len
+    *excl = false
+    if len > 0 and *p == 40                 # '('
+        *excl = true
+        p = p + 1
+        len -= 1
+    return score_parse(p, len, out) == 1
+
+
+# Parse a lexicographic bound as Redis's zslParseLexRangeItem: "-", "+",
+# "[member" (inclusive) or "(member" (exclusive).  The member is borrowed
+# from the argument.
+fn parse_lex_bound(arg: *RespArg, b: *ZLexBound) -> bool
+    if arg.len < 1
+        return false
+    let c: u8 = *arg.data
+    b.excl = false
+    if c == 43 or c == 45                   # '+' '-'
+        if arg.len != 1
+            return false
+        if c == 43
+            b.kind = ZLEX_POS_INF
+        else
+            b.kind = ZLEX_NEG_INF
+        return true
+    if c != 40 and c != 91                  # '(' '['
+        return false
+    b.kind = ZLEX_VALUE
+    b.excl = c == 40
+    b.value = strview_from_ptr(arg.data + 1, arg.len - 1)
+    return true
+
+
+# Range types and directions (Redis's zrange_type / zrange_direction).  A
+# command fixes what its name implies; ZRANGE leaves both AUTO for its
+# BYSCORE / BYLEX / REV options to set.
+const ZRANGE_AUTO: i32 = 0
+const ZRANGE_RANK: i32 = 3            # ZRANGE_BY_SCORE / _BY_LEX: store_zset
+const ZDIR_AUTO: i32 = 0
+const ZDIR_FORWARD: i32 = 1
+const ZDIR_REVERSE: i32 = 2
+
+# ZRANGE key start stop [BYSCORE|BYLEX] [REV] [LIMIT offset count] [WITHSCORES]
+# and the commands it generalises (Redis's zrangeGenericCommand):
+#   ZREVRANGE key start stop [WITHSCORES]
+#   Z[REV]RANGEBYSCORE key min max [WITHSCORES] [LIMIT offset count]
+#   Z[REV]RANGEBYLEX key min max [LIMIT offset count]
+# A rank range counts from 0 (negative from the end); a score range takes
+# "(" for an exclusive bound and -inf / +inf; a lex range takes "-", "+",
+# "[m" and "(m".  Reversed score and lex ranges are given max first.  A
+# negative LIMIT count is no limit.  The reply is an array of members, each
+# followed by its score with WITHSCORES.
+fn cmd_zrange(ctx: *CommandContext, cmd: *RespCommand, rangetype_in: i32, direction_in: i32, name: *u8) -> i32
     if cmd.argc < 4
         var err: [96]u8
         argc_error(@err[0], name)
         ctx_write_error(ctx, @err[0])
         return CMD_ERR_ARGC
 
+    var rangetype: i32 = rangetype_in
+    var direction: i32 = direction_in
     var withscores: bool = false
-    if cmd.argc == 5
-        let opt: StrView = "WITHSCORES"
-        withscores = resp_arg_eq_ci_sv(@cmd.args[4], opt) == 1
-    if cmd.argc > 5 or (cmd.argc == 5 and not withscores)
-        let err: StrView = "ERR syntax error"
+    var offset: i64 = 0
+    var limit: i64 = -1
+    let o_withscores: StrView = "WITHSCORES"
+    let o_limit: StrView = "LIMIT"
+    let o_rev: StrView = "REV"
+    let o_bylex: StrView = "BYLEX"
+    let o_byscore: StrView = "BYSCORE"
+    var j: i32 = 4
+    while j < cmd.argc
+        let opt: *RespArg = @cmd.args[j]
+        let left: i32 = cmd.argc - j - 1
+        if resp_arg_eq_ci_sv(opt, o_withscores) == 1
+            withscores = true
+        else if resp_arg_eq_ci_sv(opt, o_limit) == 1 and left >= 2
+            var ok: i32 = 0
+            var ok2: i32 = 0
+            offset = resp_arg_to_int(@cmd.args[j + 1], @ok)
+            if ok == 1
+                limit = resp_arg_to_int(@cmd.args[j + 2], @ok2)
+            if ok == 0 or ok2 == 0
+                let notint: StrView = "ERR value is not an integer or out of range"
+                ctx_write_error_sv(ctx, notint)
+                return CMD_ERR_SYNTAX
+            j += 2
+        else if direction == ZDIR_AUTO and resp_arg_eq_ci_sv(opt, o_rev) == 1
+            direction = ZDIR_REVERSE
+        else if rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_bylex) == 1
+            rangetype = ZRANGE_BY_LEX
+        else if rangetype == ZRANGE_AUTO and resp_arg_eq_ci_sv(opt, o_byscore) == 1
+            rangetype = ZRANGE_BY_SCORE
+        else
+            let err: StrView = "ERR syntax error"
+            ctx_write_error_sv(ctx, err)
+            return CMD_ERR_SYNTAX
+        j += 1
+
+    if rangetype == ZRANGE_AUTO
+        rangetype = ZRANGE_RANK
+    let rev: bool = direction == ZDIR_REVERSE
+    if limit != -1 and rangetype == ZRANGE_RANK
+        let err: StrView = "ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+    if withscores and rangetype == ZRANGE_BY_LEX
+        let err: StrView = "ERR syntax error, WITHSCORES not supported in combination with BYLEX"
         ctx_write_error_sv(ctx, err)
         return CMD_ERR_SYNTAX
 
-    var ok: i32 = 0
-    let start: i64 = resp_arg_to_int(@cmd.args[2], @ok)
-    var ok2: i32 = 0
-    let stop: i64 = resp_arg_to_int(@cmd.args[3], @ok2)
-    if ok == 0 or ok2 == 0
-        let notint: StrView = "ERR value is not an integer or out of range"
-        ctx_write_error_sv(ctx, notint)
-        return CMD_ERR_SYNTAX
+    var minidx: i32 = 2
+    var maxidx: i32 = 3
+    if rev and rangetype != ZRANGE_RANK
+        minidx = 3
+        maxidx = 2
+
+    var start: i64 = 0
+    var stop: i64 = 0
+    var spec: ZRangeSpec
+    spec.by = rangetype
+    if rangetype == ZRANGE_RANK
+        var ok: i32 = 0
+        var ok2: i32 = 0
+        start = resp_arg_to_int(@cmd.args[2], @ok)
+        stop = resp_arg_to_int(@cmd.args[3], @ok2)
+        if ok == 0 or ok2 == 0
+            let notint: StrView = "ERR value is not an integer or out of range"
+            ctx_write_error_sv(ctx, notint)
+            return CMD_ERR_SYNTAX
+    else if rangetype == ZRANGE_BY_SCORE
+        if not parse_score_bound(@cmd.args[minidx], @spec.min, @spec.minex) or not parse_score_bound(@cmd.args[maxidx], @spec.max, @spec.maxex)
+            let err: StrView = "ERR min or max is not a float"
+            ctx_write_error_sv(ctx, err)
+            return CMD_ERR_SYNTAX
+    else
+        if not parse_lex_bound(@cmd.args[minidx], @spec.lmin) or not parse_lex_bound(@cmd.args[maxidx], @spec.lmax)
+            let err: StrView = "ERR min or max not valid string range item"
+            ctx_write_error_sv(ctx, err)
+            return CMD_ERR_SYNTAX
 
     var key_sv: StrView = resp_arg_sv(@cmd.args[1])
     if zset_wrongtype(ctx, key_sv)
         return CMD_ERR_TYPE
 
     var count: i64 = 0
+    if rangetype != ZRANGE_RANK
+        let items: *ZItem = store_zrange_spec(ctx.store, key_sv, @spec, rev, offset, limit, @&count)
+        ctx_write_zitems(ctx, items, count, withscores)
+        return CMD_OK
+
     var members: *StrView = null
     if rev
         members = store_zrevrange(ctx.store, key_sv, start, stop, @&count)
     else
         members = store_zrange(ctx.store, key_sv, start, stop, @&count)
-
-    if not withscores
-        ctx_write_bulk_array(ctx, members, count)
-        return CMD_OK
-
-    # Interleave member, score.  Each score's text lives in `digits`
-    # (SCORE_FMT_MAX bytes a score) until the reply is written.
-    let items: *StrView = malloc(2 * count * sizeof(StrView) + 1) as *StrView
-    let digits: *u8 = malloc(SCORE_FMT_MAX * count + 1)
+    let items: *ZItem = malloc(count * sizeof(ZItem) + 1) as *ZItem
     for i in 0..count
-        var score: f64 = 0.0
-        store_zscore(ctx.store, key_sv, members[i], @&score)
-        let d: *u8 = digits + SCORE_FMT_MAX * i
-        let n: i64 = score_format(score, d)
-        items[2 * i] = members[i]
-        items[2 * i + 1] = strview_from_ptr(d, n)
-    ctx_write_bulk_array(ctx, items, 2 * count)  # frees items
-    free(digits)
+        items[i].member = members[i]
+        items[i].score = 0.0
+        if withscores
+            var score: f64 = 0.0
+            store_zscore(ctx.store, key_sv, members[i], @&score)
+            items[i].score = score
     if members != null
         free(members as *u8)
+    ctx_write_zitems(ctx, items, count, withscores)
+    return CMD_OK
+
+
+# ZCOUNT key min max: the number of members whose score is in [min, max]
+# ("(" for an exclusive bound, -inf / +inf).
+fn cmd_zcount(ctx: *CommandContext, cmd: *RespCommand) -> i32
+    if cmd.argc != 4
+        let err: StrView = "ERR wrong number of arguments for 'zcount' command"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_ARGC
+
+    var spec: ZRangeSpec
+    spec.by = ZRANGE_BY_SCORE
+    if not parse_score_bound(@cmd.args[2], @spec.min, @spec.minex) or not parse_score_bound(@cmd.args[3], @spec.max, @spec.maxex)
+        let err: StrView = "ERR min or max is not a float"
+        ctx_write_error_sv(ctx, err)
+        return CMD_ERR_SYNTAX
+
+    var key_sv: StrView = resp_arg_sv(@cmd.args[1])
+    if zset_wrongtype(ctx, key_sv)
+        return CMD_ERR_TYPE
+    ctx_write_int(ctx, store_zcount(ctx.store, key_sv, @spec))
     return CMD_OK
 
 
@@ -1289,12 +1600,30 @@ pub fn cmd_dispatch(ctx: *CommandContext, cmd: *RespCommand) -> i32
     let cmd_zcard_name: StrView = "ZCARD"
     if resp_arg_eq_ci_sv(c, cmd_zcard_name) == 1
         return cmd_zcard(ctx, cmd)
+    let cmd_zcount_name: StrView = "ZCOUNT"
+    if resp_arg_eq_ci_sv(c, cmd_zcount_name) == 1
+        return cmd_zcount(ctx, cmd)
+    let cmd_zincrby_name: StrView = "ZINCRBY"
+    if resp_arg_eq_ci_sv(c, cmd_zincrby_name) == 1
+        return cmd_zincrby(ctx, cmd)
     let cmd_zrange_name: StrView = "ZRANGE"
     if resp_arg_eq_ci_sv(c, cmd_zrange_name) == 1
-        return cmd_zrange(ctx, cmd, false, c"zrange")
+        return cmd_zrange(ctx, cmd, ZRANGE_AUTO, ZDIR_AUTO, c"zrange")
     let cmd_zrevrange_name: StrView = "ZREVRANGE"
     if resp_arg_eq_ci_sv(c, cmd_zrevrange_name) == 1
-        return cmd_zrange(ctx, cmd, true, c"zrevrange")
+        return cmd_zrange(ctx, cmd, ZRANGE_RANK, ZDIR_REVERSE, c"zrevrange")
+    let cmd_zrangebyscore_name: StrView = "ZRANGEBYSCORE"
+    if resp_arg_eq_ci_sv(c, cmd_zrangebyscore_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_SCORE, ZDIR_FORWARD, c"zrangebyscore")
+    let cmd_zrevrangebyscore_name: StrView = "ZREVRANGEBYSCORE"
+    if resp_arg_eq_ci_sv(c, cmd_zrevrangebyscore_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_SCORE, ZDIR_REVERSE, c"zrevrangebyscore")
+    let cmd_zrangebylex_name: StrView = "ZRANGEBYLEX"
+    if resp_arg_eq_ci_sv(c, cmd_zrangebylex_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_FORWARD, c"zrangebylex")
+    let cmd_zrevrangebylex_name: StrView = "ZREVRANGEBYLEX"
+    if resp_arg_eq_ci_sv(c, cmd_zrevrangebylex_name) == 1
+        return cmd_zrange(ctx, cmd, ZRANGE_BY_LEX, ZDIR_REVERSE, c"zrevrangebylex")
 
     # Unknown command
     let err: StrView = "ERR unknown command"

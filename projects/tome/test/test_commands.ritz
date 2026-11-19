@@ -833,3 +833,361 @@ fn test_cmd_zrange_reply_respects_cap() -> i32
     if exec_capped(@store, c"ZREVRANGE z 0 -1 WITHSCORES\r\n", @buf[0]) != 0
         return 2
     return 0
+
+
+# ============================================================================
+# ZSet option families (AGAST #4284)
+# ============================================================================
+# Replies follow Redis 7.2's t_zset.c: ZRANGE's 6.2 options, ZRANGEBYSCORE /
+# ZREVRANGEBYSCORE (and the BYLEX pair), ZCOUNT, ZINCRBY, ZADD's flags and
+# ZRANK / ZREVRANK WITHSCORE.
+
+const SYNTAX_ERR: *u8 = c"-ERR syntax error\r\n"
+const RANGE_NOT_FLOAT: *u8 = c"-ERR min or max is not a float\r\n"
+const NAN_RESULT: *u8 = c"-ERR resulting score is not a number (NaN)\r\n"
+
+# l = {a, b, c, d}, all score 0 (a lexicographic range needs equal scores)
+fn zset_lex_fixture(store: *Store) -> i32
+    return reply_is(store, c"ZADD l 0 a 0 b 0 c 0 d\r\n", c":4\r\n")
+
+
+[[test]]
+fn test_cmd_zrange_byscore() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZRANGE z 1 2 BYSCORE\r\n", c"*2\r\n$1\r\na\r\n$1\r\nb\r\n") != 0
+        return 2
+    # '(' makes a bound exclusive; -inf / +inf are open ends.
+    if reply_is(@store, c"ZRANGE z (1 +inf byscore\r\n", c"*2\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZRANGE z -inf (3 BYSCORE WITHSCORES\r\n", c"*4\r\n$1\r\na\r\n$1\r\n1\r\n$1\r\nb\r\n$1\r\n2\r\n") != 0
+        return 4
+    # With REV the range is given max first.
+    if reply_is(@store, c"ZRANGE z 3 1 BYSCORE REV\r\n", c"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZRANGE z +inf -inf REV BYSCORE LIMIT 1 1\r\n", c"*1\r\n$1\r\nb\r\n") != 0
+        return 6
+    # A negative count is no limit; a negative offset is an empty reply.
+    if reply_is(@store, c"ZRANGE z -inf +inf BYSCORE LIMIT 1 -1\r\n", c"*2\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZRANGE z -inf +inf BYSCORE LIMIT -1 2\r\n", c"*0\r\n") != 0
+        return 8
+    if reply_is(@store, c"ZRANGE z -inf +inf BYSCORE LIMIT 0 0\r\n", c"*0\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZRANGE z -inf +inf BYSCORE LIMIT 3 1\r\n", c"*0\r\n") != 0
+        return 10
+    # Empty intervals: min > max, or min == max with an exclusive end.
+    if reply_is(@store, c"ZRANGE z 2 1 BYSCORE\r\n", c"*0\r\n") != 0
+        return 11
+    if reply_is(@store, c"ZRANGE z (2 2 BYSCORE\r\n", c"*0\r\n") != 0
+        return 12
+    if reply_is(@store, c"ZRANGE z 2 2 BYSCORE\r\n", c"*1\r\n$1\r\nb\r\n") != 0
+        return 13
+    if reply_is(@store, c"ZRANGE nokey 0 1 BYSCORE\r\n", c"*0\r\n") != 0
+        return 14
+    # REV alone reverses a rank range.
+    if reply_is(@store, c"ZRANGE z 0 0 REV WITHSCORES\r\n", c"*2\r\n$1\r\nc\r\n$1\r\n3\r\n") != 0
+        return 15
+    # Errors.
+    if reply_is(@store, c"ZRANGE z 0 -1 LIMIT 0 1\r\n", c"-ERR syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX\r\n") != 0
+        return 16
+    if reply_is(@store, c"ZRANGE z 0 -1 BYSCORE LIMIT 0\r\n", SYNTAX_ERR) != 0
+        return 17
+    if reply_is(@store, c"ZRANGE z 0 -1 BYSCORE BYLEX\r\n", SYNTAX_ERR) != 0
+        return 18
+    if reply_is(@store, c"ZRANGE z 0 -1 REV REV\r\n", SYNTAX_ERR) != 0
+        return 19
+    if reply_is(@store, c"ZRANGE z x 1 BYSCORE\r\n", RANGE_NOT_FLOAT) != 0
+        return 20
+    if reply_is(@store, c"ZRANGE z 1 ((2 BYSCORE\r\n", RANGE_NOT_FLOAT) != 0
+        return 21
+    if reply_is(@store, c"ZRANGE z nan 2 BYSCORE\r\n", RANGE_NOT_FLOAT) != 0
+        return 22
+    if reply_is(@store, c"ZRANGE z 0 1 BYSCORE LIMIT x 1\r\n", c"-ERR value is not an integer or out of range\r\n") != 0
+        return 23
+    # ZREVRANGE already fixes the direction and the range type.
+    if reply_is(@store, c"ZREVRANGE z 0 -1 REV\r\n", SYNTAX_ERR) != 0
+        return 24
+    if reply_is(@store, c"ZREVRANGE z 0 -1 BYSCORE\r\n", SYNTAX_ERR) != 0
+        return 25
+    return 0
+
+
+[[test]]
+fn test_cmd_zrangebyscore() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZRANGEBYSCORE z 2 +inf\r\n", c"*2\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZRANGEBYSCORE z (1 3 WITHSCORES LIMIT 1 5\r\n", c"*2\r\n$1\r\nc\r\n$1\r\n3\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZREVRANGEBYSCORE z +inf (1\r\n", c"*2\r\n$1\r\nc\r\n$1\r\nb\r\n") != 0
+        return 4
+    if reply_is(@store, c"zrevrangebyscore z 3 -inf limit 0 2 withscores\r\n", c"*4\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nb\r\n$1\r\n2\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZRANGEBYSCORE z 1.5 2.5\r\n", c"*1\r\n$1\r\nb\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZRANGEBYSCORE z 1 2 REV\r\n", SYNTAX_ERR) != 0
+        return 7
+    if reply_is(@store, c"ZRANGEBYSCORE z 1 2 BYSCORE\r\n", SYNTAX_ERR) != 0
+        return 8
+    if reply_is(@store, c"ZRANGEBYSCORE z 1\r\n", c"-ERR wrong number of arguments for 'zrangebyscore' command\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZREVRANGEBYSCORE z 1\r\n", c"-ERR wrong number of arguments for 'zrevrangebyscore' command\r\n") != 0
+        return 10
+    if reply_is(@store, c"ZREVRANGEBYSCORE z a b\r\n", RANGE_NOT_FLOAT) != 0
+        return 11
+    if reply_is(@store, c"ZRANGEBYSCORE nokey -inf +inf\r\n", c"*0\r\n") != 0
+        return 12
+    return 0
+
+
+[[test]]
+fn test_cmd_zrange_bylex() -> i32
+    var store: Store = store_new()
+    if zset_lex_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZRANGE l [b (d BYLEX\r\n", c"*2\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZRANGE l - + BYLEX LIMIT 1 2\r\n", c"*2\r\n$1\r\nb\r\n$1\r\nc\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZRANGE l + (b BYLEX REV\r\n", c"*2\r\n$1\r\nd\r\n$1\r\nc\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZRANGE l [c [a REV BYLEX\r\n", c"*3\r\n$1\r\nc\r\n$1\r\nb\r\n$1\r\na\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZRANGE l + - BYLEX\r\n", c"*0\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZRANGE l [b [b BYLEX\r\n", c"*1\r\n$1\r\nb\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZRANGE l (b [b BYLEX\r\n", c"*0\r\n") != 0
+        return 8
+    # A bound past every member, and one between members.
+    if reply_is(@store, c"ZRANGE l (bb [zz BYLEX\r\n", c"*2\r\n$1\r\nc\r\n$1\r\nd\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZRANGEBYLEX l - [b\r\n", c"*2\r\n$1\r\na\r\n$1\r\nb\r\n") != 0
+        return 10
+    if reply_is(@store, c"ZREVRANGEBYLEX l + (c LIMIT 0 5\r\n", c"*1\r\n$1\r\nd\r\n") != 0
+        return 11
+    if reply_is(@store, c"ZRANGE l - + BYLEX WITHSCORES\r\n", c"-ERR syntax error, WITHSCORES not supported in combination with BYLEX\r\n") != 0
+        return 12
+    if reply_is(@store, c"ZRANGE l a [c BYLEX\r\n", c"-ERR min or max not valid string range item\r\n") != 0
+        return 13
+    if reply_is(@store, c"ZRANGE l - ++ BYLEX\r\n", c"-ERR min or max not valid string range item\r\n") != 0
+        return 14
+    if reply_is(@store, c"ZRANGEBYLEX l - + WITHSCORES\r\n", c"-ERR syntax error, WITHSCORES not supported in combination with BYLEX\r\n") != 0
+        return 15
+    return 0
+
+
+[[test]]
+fn test_cmd_zcount() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZCOUNT z -inf +inf\r\n", c":3\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZCOUNT z (1 3\r\n", c":2\r\n") != 0
+        return 3
+    if reply_is(@store, c"ZCOUNT z (1 (3\r\n", c":1\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZCOUNT z 3 1\r\n", c":0\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZCOUNT nokey 0 1\r\n", c":0\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZCOUNT z a 1\r\n", RANGE_NOT_FLOAT) != 0
+        return 7
+    if reply_is(@store, c"ZCOUNT z 1\r\n", c"-ERR wrong number of arguments for 'zcount' command\r\n") != 0
+        return 8
+    if reply_is(@store, c"ZCOUNT z 1 2 3\r\n", c"-ERR wrong number of arguments for 'zcount' command\r\n") != 0
+        return 9
+    return 0
+
+
+[[test]]
+fn test_cmd_zincrby() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZINCRBY z 2 a\r\n", c"$1\r\n3\r\n") != 0
+        return 2
+    # A new member starts from 0; a new key is created.
+    if reply_is(@store, c"ZINCRBY z -0.5 n\r\n", c"$4\r\n-0.5\r\n") != 0
+        return 3
+    if reply_is(@store, c"zincrby k 1.25 m\r\n", c"$4\r\n1.25\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZRANGE z 0 -1\r\n", c"*4\r\n$1\r\nn\r\n$1\r\nb\r\n$1\r\na\r\n$1\r\nc\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZINCRBY z x a\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZINCRBY z 1\r\n", c"-ERR wrong number of arguments for 'zincrby' command\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZINCRBY z 1 a b\r\n", c"-ERR wrong number of arguments for 'zincrby' command\r\n") != 0
+        return 8
+    # inf + -inf is NaN: refused, and the score stays.
+    if reply_is(@store, c"ZINCRBY z +inf a\r\n", c"$3\r\ninf\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZINCRBY z -inf a\r\n", NAN_RESULT) != 0
+        return 10
+    if reply_is(@store, c"ZSCORE z a\r\n", c"$3\r\ninf\r\n") != 0
+        return 11
+    return 0
+
+
+[[test]]
+fn test_cmd_zadd_flags() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    # NX: only add new members.
+    if reply_is(@store, c"ZADD z NX 10 a 4 d\r\n", c":1\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZSCORE z a\r\n", c"$1\r\n1\r\n") != 0
+        return 3
+    # XX: only update existing members.
+    if reply_is(@store, c"ZADD z XX 10 a 5 e\r\n", c":0\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZSCORE z a\r\n", c"$2\r\n10\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZSCORE z e\r\n", c"$-1\r\n") != 0
+        return 6
+    # CH counts changed scores as well as additions; an equal score is no change.
+    if reply_is(@store, c"ZADD z xx ch 11 a 5 e\r\n", c":1\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZADD z CH 11 a 6 f\r\n", c":1\r\n") != 0
+        return 8
+    # GT / LT: only move a score up / down; new members are still added.
+    if reply_is(@store, c"ZADD z GT CH 5 a 7 b 1 g\r\n", c":2\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZRANGE z 0 -1 WITHSCORES\r\n", c"*12\r\n$1\r\ng\r\n$1\r\n1\r\n$1\r\nc\r\n$1\r\n3\r\n$1\r\nd\r\n$1\r\n4\r\n$1\r\nf\r\n$1\r\n6\r\n$1\r\nb\r\n$1\r\n7\r\n$1\r\na\r\n$2\r\n11\r\n") != 0
+        return 10
+    if reply_is(@store, c"ZADD z LT CH 100 a 0 b\r\n", c":1\r\n") != 0
+        return 11
+    if reply_is(@store, c"ZSCORE z b\r\n", c"$1\r\n0\r\n") != 0
+        return 12
+    # XX on a missing key does not create it.
+    if reply_is(@store, c"ZADD nx XX 1 a\r\n", c":0\r\n") != 0
+        return 13
+    if reply_is(@store, c"EXISTS nx\r\n", c":0\r\n") != 0
+        return 14
+    # Errors, which leave the set alone.
+    if reply_is(@store, c"ZADD z NX XX 1 a\r\n", c"-ERR XX and NX options at the same time are not compatible\r\n") != 0
+        return 15
+    if reply_is(@store, c"ZADD z GT LT 1 a\r\n", c"-ERR GT, LT, and/or NX options at the same time are not compatible\r\n") != 0
+        return 16
+    if reply_is(@store, c"ZADD z NX GT 1 a\r\n", c"-ERR GT, LT, and/or NX options at the same time are not compatible\r\n") != 0
+        return 17
+    if reply_is(@store, c"ZADD z INCR 1 a 2 b\r\n", c"-ERR INCR option supports a single increment-element pair\r\n") != 0
+        return 18
+    if reply_is(@store, c"ZADD z NX 1\r\n", SYNTAX_ERR) != 0
+        return 19
+    if reply_is(@store, c"ZADD z NX\r\n", c"-ERR wrong number of arguments for 'zadd' command\r\n") != 0
+        return 20
+    if reply_is(@store, c"ZADD z XX x a\r\n", c"-ERR value is not a valid float\r\n") != 0
+        return 21
+    if reply_is(@store, c"ZCARD z\r\n", c":6\r\n") != 0
+        return 22
+    return 0
+
+
+[[test]]
+fn test_cmd_zadd_incr() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZADD z INCR 2.5 a\r\n", c"$3\r\n3.5\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZADD z INCR 1 n\r\n", c"$1\r\n1\r\n") != 0
+        return 3
+    # A skipped INCR (NX on an existing member, XX on a new one, GT / LT
+    # against the move) answers nil.
+    if reply_is(@store, c"ZADD z NX INCR 1 a\r\n", c"$-1\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZADD z XX INCR 1 nope\r\n", c"$-1\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZSCORE z nope\r\n", c"$-1\r\n") != 0
+        return 6
+    if reply_is(@store, c"ZADD z GT INCR -1 a\r\n", c"$-1\r\n") != 0
+        return 7
+    # An equal score is not "greater".
+    if reply_is(@store, c"ZADD z GT INCR 0 a\r\n", c"$-1\r\n") != 0
+        return 13
+    if reply_is(@store, c"ZADD z LT INCR -1 a\r\n", c"$3\r\n2.5\r\n") != 0
+        return 8
+    if reply_is(@store, c"ZADD z CH INCR 1 b\r\n", c"$1\r\n3\r\n") != 0
+        return 9
+    if reply_is(@store, c"ZADD z +inf i\r\n", c":1\r\n") != 0
+        return 10
+    if reply_is(@store, c"ZADD z INCR -inf i\r\n", NAN_RESULT) != 0
+        return 11
+    if reply_is(@store, c"ZSCORE z i\r\n", c"$3\r\ninf\r\n") != 0
+        return 12
+    return 0
+
+
+[[test]]
+fn test_cmd_zrank_withscore() -> i32
+    var store: Store = store_new()
+    if zset_fixture(@store) != 0
+        return 1
+    if reply_is(@store, c"ZRANK z b WITHSCORE\r\n", c"*2\r\n:1\r\n$1\r\n2\r\n") != 0
+        return 2
+    if reply_is(@store, c"ZREVRANK z a withscore\r\n", c"*2\r\n:2\r\n$1\r\n1\r\n") != 0
+        return 3
+    # A miss with WITHSCORE is a nil array.
+    if reply_is(@store, c"ZRANK z nope WITHSCORE\r\n", c"*-1\r\n") != 0
+        return 4
+    if reply_is(@store, c"ZREVRANK nokey a WITHSCORE\r\n", c"*-1\r\n") != 0
+        return 5
+    if reply_is(@store, c"ZRANK z a WITHSCORES\r\n", SYNTAX_ERR) != 0
+        return 6
+    if reply_is(@store, c"ZRANK z a WITHSCORE x\r\n", c"-ERR wrong number of arguments for 'zrank' command\r\n") != 0
+        return 7
+    if reply_is(@store, c"ZREVRANK z a WITHSCORE x\r\n", c"-ERR wrong number of arguments for 'zrevrank' command\r\n") != 0
+        return 8
+    return 0
+
+
+[[test]]
+fn test_cmd_zset_options_wrongtype() -> i32
+    var store: Store = store_new()
+    if reply_is(@store, c"SET s v\r\n", c"+OK\r\n") != 0
+        return 1
+    if reply_is(@store, c"ZADD s XX 1 a\r\n", WRONGTYPE_REPLY) != 0
+        return 2
+    if reply_is(@store, c"ZADD s INCR 1 a\r\n", WRONGTYPE_REPLY) != 0
+        return 3
+    if reply_is(@store, c"ZINCRBY s 1 a\r\n", WRONGTYPE_REPLY) != 0
+        return 4
+    if reply_is(@store, c"ZCOUNT s 0 1\r\n", WRONGTYPE_REPLY) != 0
+        return 5
+    # The range is checked before the key's type.
+    if reply_is(@store, c"ZCOUNT s x 1\r\n", RANGE_NOT_FLOAT) != 0
+        return 6
+    if reply_is(@store, c"ZRANGEBYSCORE s 0 1\r\n", WRONGTYPE_REPLY) != 0
+        return 7
+    if reply_is(@store, c"ZRANGE s - + BYLEX\r\n", WRONGTYPE_REPLY) != 0
+        return 8
+    if reply_is(@store, c"ZRANK s a WITHSCORE\r\n", WRONGTYPE_REPLY) != 0
+        return 9
+    if reply_is(@store, c"GET s\r\n", c"$1\r\nv\r\n") != 0
+        return 10
+    return 0
+
+
+[[test]]
+fn test_cmd_zrangebyscore_reply_respects_cap() -> i32
+    var store: Store = store_new()
+    var name: [4]u8
+    name[0] = 109  # 'm'
+    name[2] = 0
+    for i in 0..20
+        name[1] = (97 + i) as u8
+        store_zadd_cstr(@store, c"z", i as f64, @name[0])
+    var buf: [128]u8
+    if exec_capped(@store, c"ZRANGEBYSCORE z -inf +inf WITHSCORES\r\n", @buf[0]) != 0
+        return 1
+    if exec_capped(@store, c"ZRANGE z +inf -inf BYSCORE REV\r\n", @buf[0]) != 0
+        return 2
+    return 0
