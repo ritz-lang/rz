@@ -109,6 +109,8 @@ SHAPES = {
     "fn_pointer": "fn f(r: @C, g: fn(C) -> i32) -> i32\n    g(^r)\n",
     "assign_in_an_arm": "fn f(r: @C, e: C, b: i32) -> i32\n    var d = e\n    match b\n        0 => d = ^r\n        _ => d = *r\n    d.x\n",
     "value_arm": "fn f(r: @C, b: i32) -> i32\n    let d: C = if b > 0\n        ^r\n    else\n        *r\n    d.x\n",
+    # A match arm's `@C` payload binding is a reference like any other (AGAST #4143).
+    "match_payload": "enum EP\n    S(@C)\n    M\n\nfn f(e: EP) -> i32\n    match e\n        EP.S(v) => val(^v)\n        _ => 0\n",
 }
 
 # Shapes ritz1 doesn't see as a reference yet, each an AGAST ticket number.

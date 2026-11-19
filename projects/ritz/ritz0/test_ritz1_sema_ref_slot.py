@@ -139,6 +139,10 @@ REACH = {
     # `let q = @&x[0]` of a `[2][2][3]i64` is a plane pointer (#2570): `*q` is its `[2][3]i64`.
     "plane_pointer": ("fn f()\n    var x: [2][2][3]i64 = [ [ [0; 3]; 2]; 2]\n    let q = @&x[0]\n    *q = [ [1, 2, 3]]\n",
                       "4:10", "an array literal of 1 element for a `[2][3]i64`"),
+    # A match arm's `@C` payload binding stays typed, as ritz0 reads it (AGAST #4143).
+    "pointer_payload": ("enum E\n    S(@C)\n    N\n\nfn take(c: C) -> i32\n    c.x\n\n"
+                        "fn f(e: E) -> i32\n    match e\n        E.S(v) => take(v)\n        _ => 0\n",
+                        "10:24", SLOT_REF),
 }
 
 # name -> the program after _C, accepted.
@@ -156,10 +160,6 @@ OPEN = {
     # ...and so is `q[1]` of a `let q = h(p)` holding the `*[3]i32` h returns.
     "element_through_a_returned_pointer": ("fn h(p: *[3]i32) -> *[3]i32\n    p\n\n"
                                            "fn f(p: *[3]i32)\n    let q = h(p)\n    let e: @&i32 = @&q[1]\n    *e = 7\n"),
-    # As the emitter binds it, an `@C` match payload goes unread (bool_note_binding's
-    # bk_unsure).  ritz0 refuses it: AGAST #4143.
-    "pointer_payload_unread": ("enum E\n    S(@C)\n    N\n\nfn take(c: C) -> i32\n    c.x\n\n"
-                               "fn f(e: E) -> i32\n    match e\n        E.S(v) => take(v)\n        _ => 0\n"),
 }
 
 
