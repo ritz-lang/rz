@@ -49,11 +49,13 @@ PORT_NAMES=(PORT_DIRECT PORT_STATIC PORT_PROXY PORT_PROXY_DB PORT_MAUSOLEUM)
 # The mausoleum data dir, logs and wrk output live in one `mktemp -d`, and
 # the unix sockets in a second one, both removed by the EXIT trap (kept with
 # --keep), so two rooms benching on one host never share a path (AGAST #3183).
-# The socket dir is under /tmp, not $TMPDIR: a gate's TMPDIR sits deep in its
-# worktree, and a socket path must fit sun_path's 107 bytes or zeus's bind()
-# fails (AGAST #4135).
+# The socket dir comes from sock_dir: $TMPDIR if a socket path under it fits
+# sun_path's 107 bytes (a gate's, deep in its worktree, does not: zeus's
+# bind() fails, AGAST #4135), else $XDG_RUNTIME_DIR, else /tmp, moving on
+# when a mktemp fails (a full /tmp, AGAST #4274/#4282).
+. "$REPO_ROOT/projects/ritz/tools/sock_dir.sh"
 T=$(mktemp -d)
-SOCK_DIR=$(mktemp -d /tmp/rz_bench_sock.XXXXXXXX)
+SOCK_DIR=$(sock_dir rz_bench_sock. zeus_bench_inmem.sock) || { rm -rf "$T"; exit 1; }
 trap 'rm -rf "$T" "$SOCK_DIR"' EXIT     # until cleanup() below takes over
 SOCK_PROXY="$SOCK_DIR/zeus_bench_inmem.sock"
 SOCK_PROXY_DB="$SOCK_DIR/zeus_bench_db.sock"

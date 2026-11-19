@@ -23,6 +23,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 TIER1_SH = REPO / "projects" / "harland" / "tools" / "test_tier1_boot.sh"
+SOCK_DIR_SH = REPO / "projects" / "ritz" / "tools" / "sock_dir.sh"
 SUN_PATH_MAX = 107  # sizeof(sun_path) - 1 for the NUL
 
 FAKE_QEMU = textwrap.dedent("""\
@@ -76,6 +77,10 @@ def _tree(root: Path) -> Path:
     tools = root / "projects" / "harland" / "tools"
     tools.mkdir(parents=True)
     shutil.copy(TIER1_SH, tools / TIER1_SH.name)
+    # ...which sources the shared socket-dir picker (AGAST #4282).
+    sock_dir_sh = root / "projects" / "ritz" / "tools" / SOCK_DIR_SH.name
+    sock_dir_sh.parent.mkdir(parents=True)
+    shutil.copy(SOCK_DIR_SH, sock_dir_sh)
     (tools / "mkinitramfs.py").write_text(FAKE_MKINITRAMFS)
     # Its fake kernel passes the red-zone check (AGAST #4308).
     (tools / "check_no_red_zone.py").write_text("import sys\nsys.exit(0)\n")

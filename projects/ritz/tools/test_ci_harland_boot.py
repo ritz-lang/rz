@@ -196,6 +196,9 @@ def tree(tmp_path):
     tools = root / "projects" / "harland" / "tools"
     tools.mkdir(parents=True)
     shutil.copy(REPO / BOOT_SCRIPT, tools / "test_tier1_boot.sh")
+    # ...which sources the shared socket-dir picker (AGAST #4282).
+    (root / "projects/ritz/tools").mkdir(parents=True)
+    shutil.copy(REPO / "projects/ritz/tools/sock_dir.sh", root / "projects/ritz/tools/sock_dir.sh")
     (tools / "mkinitramfs.py").write_text(MKINITRAMFS_STUB)
     # The fake harland.elf is not a real binary: the red-zone check (AGAST
     # #4308) passes unless a test says otherwise.

@@ -271,11 +271,32 @@ def unix_socket_path(path: Path) -> Path:
     return path
 
 
-def short_sock_dir() -> Path:
-    """A fresh dir for unix sockets under /tmp, not $TMPDIR: a gate's TMPDIR
-    sits deep in its worktree and left zeus.sock ~10 bytes of headroom
-    (#4100). The caller removes it."""
-    return Path(tempfile.mkdtemp(prefix="smoke_", dir="/tmp"))
+def short_sock_dir(name: str = "zeus.sock", prefix: str = "smoke_") -> Path:
+    """A fresh dir for unix sockets where <dir>/name fits sun_path. The
+    caller removes it.
+
+    The first of $TMPDIR, $XDG_RUNTIME_DIR, /tmp ($SOCK_DIR_LAST, for tests)
+    that is absolute, short enough, and where mkdtemp succeeds. A gate's
+    TMPDIR sits deep in its worktree and left zeus.sock ~10 bytes of headroom
+    (#4100); a full /tmp failed every gate on bangerang (#4274). Same order
+    as tools/sock_dir.sh (#4282); Broken, naming each candidate, if none."""
+    why = []
+    for cand in (os.environ.get("TMPDIR", ""), os.environ.get("XDG_RUNTIME_DIR", ""),
+                 os.environ.get("SOCK_DIR_LAST", "/tmp")):
+        if not cand.startswith("/"):
+            if cand:
+                why.append(f"{cand} (relative)")
+            continue
+        cand = cand.rstrip("/") or "/"
+        # <cand>/<prefix>XXXXXXXX/<name>, as mkdtemp names it
+        if len(os.fsencode(cand)) + 1 + len(prefix) + 8 + 1 + len(os.fsencode(name)) > SUN_PATH_MAX:
+            why.append(f"{cand} (too long)")
+            continue
+        try:
+            return Path(tempfile.mkdtemp(prefix=prefix, dir=cand))
+        except OSError as e:
+            why.append(f"{cand} ({e.strerror or e})")
+    raise Broken(f"no socket dir for {name}: {'; '.join(why)}")
 
 
 def run_cmd(argv: list[str], cwd: Path, stdin: bytes | None = None,

@@ -35,6 +35,7 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[3]
 RUN_SH = REPO / "bench" / "run.sh"
+SOCK_DIR_REL = Path("projects/ritz/tools/sock_dir.sh")  # run.sh sources it
 SERVERS = ("valet", "nexus", "zeus", "mausoleum")
 LOOP = "for _ in $(seq 300); do sleep 1; done"
 PORT_VARS = (
@@ -91,12 +92,15 @@ def _listed_pids(out: str) -> set:
 
 @pytest.fixture
 def worktrees(tmp_path):
-    """Two fake worktrees, each with its own copy of bench/run.sh."""
+    """Two fake worktrees, each with its own copy of bench/run.sh and the
+    sock_dir.sh it sources (#4282)."""
     roots = []
     for name in ("room_a", "room_b"):
         root = tmp_path / name
         (root / "bench").mkdir(parents=True)
         shutil.copy(RUN_SH, root / "bench" / "run.sh")
+        (root / SOCK_DIR_REL).parent.mkdir(parents=True)
+        shutil.copy(REPO / SOCK_DIR_REL, root / SOCK_DIR_REL)
         roots.append(root)
     return roots
 

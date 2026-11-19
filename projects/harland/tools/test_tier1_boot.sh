@@ -154,28 +154,14 @@ if [ -n "$COMPILER" ]; then
 fi
 
 WORK="$(mktemp -d)"
-# sock_dir PREFIX NAMELEN: make and print a fresh dir for unix sockets whose
-# names are at most NAMELEN bytes.  $TMPDIR first, if <dir>/<name> fits
-# sun_path's 107 bytes (a gate's TMPDIR, deep in its worktree, doesn't:
-# AGAST #4135/#4177); else $XDG_RUNTIME_DIR; else /tmp.  A candidate whose
-# mktemp fails (a full /tmp ran out of inodes on bangerang, AGAST #4274) is
-# skipped for the next.  Kept identical in nexus/test/e2e_large_page.sh and
-# harland/tools/test_tier1_boot.sh (tools/test_harness_sock_path.py).
-sock_dir() {
-    local base LC_ALL=C
-    for base in "${TMPDIR:-}" "${XDG_RUNTIME_DIR:-}" /tmp; do
-        base="${base%/}"
-        [[ -n "$base" && -d "$base" ]] || continue
-        # <base>/<PREFIX>.XXXXXXXX/<name>
-        (( ${#base} + 1 + ${#1} + 9 + 1 + $2 <= 107 )) || continue
-        mktemp -d "$base/$1.XXXXXXXX" 2>/dev/null && return 0
-    done
-    echo "FAIL: no dir for a $1 socket: every candidate is too long or full" >&2
-    return 1
-}
+# sock_dir (tools/sock_dir.sh, shared with bench/run.sh, nexus's
+# e2e_large_page.sh and smoke_stack): $TMPDIR if <dir>/<name> fits sun_path,
+# else $XDG_RUNTIME_DIR, else /tmp; a full or unwritable one is skipped.
+. "$ROOT_DIR/projects/ritz/tools/sock_dir.sh"
 # The QEMU monitor sockets' dir (<name>-mon.sock): a socket path past
-# sun_path's 107 bytes stops QEMU from starting at all (AGAST #4177).
-SOCK_DIR="$(sock_dir rz_tier1_mon 24)" || exit 1
+# sun_path's 107 bytes stops QEMU from starting at all (AGAST #4177).  Sized
+# for a boot name of up to 15 bytes (native, grub).
+SOCK_DIR="$(sock_dir rz_tier1_mon. 123456789012345-mon.sock)" || exit 1
 trap '[ -n "${KEEP_WORK:-}" ] && cp "$WORK"/*.log "$KEEP_WORK"/ 2>/dev/null; rm -rf "$WORK" "$SOCK_DIR"' EXIT
 mkdir -p "$WORK/bin"
 for pkg in $USER_PKGS; do
