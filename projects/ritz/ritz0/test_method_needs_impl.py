@@ -383,13 +383,48 @@ def test_method_syntax_needs_an_impl_method(tmp_path, compiler, name):
     _assert_refused(compiler, tmp_path, name, program, message)
 
 
-# AGAST #4262. A two-argument instance is `Result$i32$i32` to ritz1 and
-# `Result$i32_i32` to ritz0, as for any generic (AGAST #4266).
+# AGAST #4262. A two-argument instance is `Result$i32$i32` in all three: one
+# `$` per argument (AGAST #4266).
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_an_unimported_result_method_it_lacks_is_refused(tmp_path, compiler):
-    instance = "Result$i32_i32" if compiler == "ritz0" else "Result$i32$i32"
     _assert_refused(compiler, tmp_path, "result_builtin_unimported", RESULT_UNIMPORTED,
-                    no_method("frob", instance))
+                    no_method("frob", "Result$i32$i32"))
+
+
+# AGAST #4266: a generic instance is named alike in every compiler's
+# diagnostics: the base, then `$` and each argument's spelling, a nested
+# instance by that same name (`W$V$i32$i64`), a pointer as `ptr_`.  ritz0 said
+# `W$i32_i64` and `W$V_i32` (monomorph_core.mangle_generic_name's `_` join,
+# still its linked names).  Not `W<i32, i64>`: ritz1 holds only the mangled
+# name where it refuses, and a nested one does not split back into arguments.
+W2 = """\
+struct V<T>
+    x: T
+
+struct W<T, U>
+    x: T
+    y: U
+
+struct W1<T>
+    x: T
+
+pub fn main() -> i32
+"""
+
+INSTANCE_NAMED = {
+    "two_args": ("    let w = W<i32, i64> { x: 1, y: 2 }\n", "W$i32$i64"),
+    "pointer_arg": ("    let w = W<*u8, i64> { x: null, y: 2 }\n", "W$ptr_u8$i64"),
+    "nested_arg": ("    let w = W<V<i32>, i64> { x: V<i32> { x: 1 }, y: 2 }\n", "W$V$i32$i64"),
+    "nested_one_arg": ("    let w = W1<V<i32>> { x: V<i32> { x: 1 } }\n", "W1$V$i32"),
+}
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(INSTANCE_NAMED))
+def test_a_generic_instance_is_named_alike_in_every_compiler(tmp_path, compiler, name):
+    binding, instance = INSTANCE_NAMED[name]
+    program = W2 + binding + "    w.^nope()\n    0\n"
+    _assert_refused(compiler, tmp_path, name, program, no_method("nope", instance))
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

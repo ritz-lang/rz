@@ -18,6 +18,7 @@ from typing import ClassVar, Dict, Optional, Tuple, List, Union, Set, Iterator
 from llvmlite import ir
 import ritz_ast as rast
 from monomorph import mangle_generic_name, mangle_type_name, resolve_alias_in
+from monomorph_core import instance_display_name, note_instance_display
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 from qualified_access import module_item_access_removed
@@ -1573,6 +1574,7 @@ class LLVMEmitter:
             return specialized_name
         if ty.name != 'Span' or len(ty.args) != 1:
             return None
+        note_instance_display(specialized_name, ty.name, ty.args)  # AGAST #4266
 
         elem_ty = self._ritz_type_to_llvm(ty.args[0])
         span_ty = self.module.context.get_identified_type(specialized_name)
@@ -1604,6 +1606,7 @@ class LLVMEmitter:
             ]
         else:
             return None
+        note_instance_display(specialized_name, ty.name, ty.args)  # AGAST #4266
 
         enum_type = self.module.context.get_identified_type(specialized_name)
         self.enum_types[specialized_name] = (enum_type, variants)
@@ -15065,8 +15068,10 @@ class LLVMEmitter:
                     # ritz1's words, at the method name (AGAST #3764): the
                     # checker leaves a built-in generic's methods to us.
                     # Option/Result too, imported from ritzlib or not
-                    # (AGAST #4262).
-                    raise EmitError(ref_rules.no_method(expr.method, type_name),
+                    # (AGAST #4262).  Named as ritz1 names it, not by
+                    # type_name, its linked name (AGAST #4266).
+                    raise EmitError(ref_rules.no_method(
+                                        expr.method, instance_display_name(type_name)),
                                     expr.name_span or expr.span)
                 raise self._err(f"No method '{expr.method}' found for type '{type_name}'",
                                 expr.name_span or expr.span)

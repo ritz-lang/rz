@@ -26,6 +26,7 @@ import float_rules
 import ref_rules
 import ritz_ast as rast
 from monomorph import bind_type_params, mangle_generic_name, TypeSubstitution
+from monomorph_core import display_generic_name, instance_display_name
 from ufcs import find_ufcs_function
 from name_resolver import BUILTIN_GENERICS, BUILTIN_VARIANTS, INTRINSICS, NameResolver
 from tail_value import arm_diverges
@@ -1166,8 +1167,9 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             # (AGAST #3649). The instance has no `impl W$i32` to hint at.
             for arg in expr.args:
                 self._infer_type(arg)
-            instance = (mangle_generic_name(receiver.name, receiver.args)
-                        if receiver.args else receiver.name)
+            # Named as ritz1 names it, not by its linked name (AGAST #4266).
+            instance = (display_generic_name(receiver.name, receiver.args)
+                        if receiver.args else instance_display_name(receiver.name))
             self._slot_error(ref_rules.no_method(expr.method, instance),
                 expr.name_span or expr.span)
             return rast.NamedType(expr.span, 'unknown', [])

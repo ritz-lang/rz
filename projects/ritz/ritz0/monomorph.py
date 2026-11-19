@@ -37,7 +37,7 @@ from typed import Typed, typed_of, type_bodies
 from monomorph_core import (  # noqa: F401 -- re-exported: monomorph's public names
     GenericInferError, InstantiationRecursionError, MAX_INSTANCE_DEPTH,
     TypeSubstitution, bind_type_params, map_child_nodes, mangle_generic_name,
-    mangle_type_name, resolve_alias_in, type_aliases)
+    mangle_type_name, note_instance_display, resolve_alias_in, type_aliases)
 from monomorph_infer import MonoInferMixin
 from trait_bounds import TraitImpls, bound_error
 from monomorph_rewrite import MonoRewriteMixin
@@ -1129,6 +1129,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
             new_type = subst.apply(field_type)
             new_fields.append((field_name, new_type))
 
+        note_instance_display(new_name, generic_def.name,
+                              [subst.mapping[p] for p in generic_def.type_params])
         return rast.StructDef(
             generic_def.span,
             new_name,
@@ -1154,6 +1156,8 @@ class Monomorphizer(MonoInferMixin, MonoRewriteMixin):
                                              field_names=list(variant.field_names),
                                              discriminant=variant.discriminant))
 
+        note_instance_display(new_name, generic_def.name,
+                              [subst.mapping[p] for p in generic_def.type_params])
         return rast.EnumDef(
             generic_def.span,
             new_name,

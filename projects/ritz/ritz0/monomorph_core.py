@@ -322,6 +322,41 @@ def mangle_generic_name(base_name: str, type_args: List[rast.Type]) -> str:
     return f"{base_name}${arg_names}"
 
 
+def display_generic_name(base_name: str, type_args: List[rast.Type]) -> str:
+    """A generic instance's name in a diagnostic, as ritz1 spells it (AGAST #4266).
+
+    One `$` before each argument, a nested instance by this same name and a
+    pointer as `ptr_`: `W<V<i32>, *u8>` is "W$V$i32$ptr_u8", where
+    mangle_generic_name, the linked name, is "W$V_i32_ptr_u8".  For the
+    message only: ritz1 holds just this name where it refuses a method.
+    """
+    def arg(ty: rast.Type) -> str:
+        ty = resolve_alias(ty)
+        if isinstance(ty, rast.NamedType) and ty.args:
+            return display_generic_name(ty.name, ty.args)
+        if isinstance(ty, rast.PtrType):
+            return f"ptr_{arg(ty.inner)}"
+        return mangle_type_name(ty)
+
+    return base_name + "".join(f"${arg(a)}" for a in type_args)
+
+
+# Linked name -> display_generic_name of each struct / enum instance monomorph
+# specialised.  Past monomorph a receiver is just `W$i32_i64`, with no
+# arguments left to name it by; the linked name is one instance's, so keying
+# by it is sound across modules.
+_INSTANCE_DISPLAY: Dict[str, str] = {}
+
+
+def note_instance_display(linked: str, base_name: str, type_args: List[rast.Type]) -> None:
+    _INSTANCE_DISPLAY[linked] = display_generic_name(base_name, type_args)
+
+
+def instance_display_name(type_name: str) -> str:
+    """`type_name` as a diagnostic names it: an instance as ritz1 does."""
+    return _INSTANCE_DISPLAY.get(type_name, type_name)
+
+
 @contextlib.contextmanager
 def type_aliases(module: rast.Module):
     """Make `module`'s type aliases the ones resolve_alias / mangle_type_name
