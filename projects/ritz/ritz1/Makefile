@@ -74,6 +74,7 @@ SOURCES = \
 	call_check \
 	literal_slot \
 	float_slot \
+	fn_slot \
 	slot_narrowing \
 	float_compare \
 	tail_value \

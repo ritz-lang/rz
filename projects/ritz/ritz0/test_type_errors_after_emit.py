@@ -9,6 +9,7 @@ emitter message stays, and an ill-typed program the emitter would lower is
 still refused, with no .ll (or .ritz.sig claiming it) left behind.
 """
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -129,7 +130,7 @@ def test_a_lent_slot_still_needs_its_pointee(tmp_path, capsys):
 # A fn reading a `[2]i32` called through a pointer to another array reads
 # that array as a `[2]i32` (AGAST #4278): its slot is another array type, a
 # `:&` one or a plain `@` one alike, as a direct call `f(@b)` refuses it on
-# all three compilers. ritz1 judges no fn value against its slot yet (#4310).
+# all three compilers (ritz1 and ritz1_selfhosted: FN_SLOT_REFUSED, #4310).
 OTHER_ARRAY = [("fn(@[3]i32)", "var b: [3]i32 = [1, 3, 5]"),
                ("fn(@[2]i64)", "var b: [2]i64 = [1, 3]"),
                ("fn(@[2]u32)", "var b: [2]u32 = [1, 3]"),
@@ -260,3 +261,125 @@ def test_another_struct_is_no_future(tmp_path):
                    + "pub fn main() -> i32\n    var s = S { x: 1 }\n    drive(@&s)\n")
     r = compile_typing_only(src, tmp_path / "a.ll", ritz_path=RITZ_ROOT)
     assert r.returncode != 0 and "expected @&Future, got @&S" in r.stderr, r.stdout + r.stderr
+
+
+# A fn value is judged against the fn-typed slot it lands in, on all three
+# compilers, in ritz0's words and at ritz0's place (AGAST #4310): the same
+# arity, each param fitting as `_types_compatible`'s FnType branch rules it
+# (a `:&` param fits a `@T` / `@&T` / `*T` slot; arrays agree, #4278) and a
+# return that fits.  ritz1 and ritz1_selfhosted judged none: each row below
+# compiled there, and the array rows read a `[3]i32` as a `[2]i32`.  ritz1
+# leaves unjudged what its AST doesn't keep: a global's fn type, and the
+# pointee of a fn type's `-> *T` (AGAST #4324).
+TWO = "fn f(a: i32, b: i32) -> i32\n    a\n\n"
+FN_SLOT_REFUSED = {
+    "let_arity": (TWO + "fn main() -> i32\n    let h: fn(i32) -> i32 = f\n    h(1)\n",
+                  5, 5, "cannot initialize fn(i32) -> i32 with fn(i32, i32) -> i32"),
+    "let_value_into_ref": (("fn f(a: i32) -> i32\n    a\n\n"
+                            "fn main() -> i32\n    var x: i32 = 1\n"
+                            "    let h: fn(@i32) -> i32 = f\n    h(@x)\n"),
+                           6, 5, "cannot initialize fn(@i32) -> i32 with fn(i32) -> i32"),
+    "let_untyped_local": (TWO + ("fn main() -> i32\n    let g = f\n"
+                                 "    let h: fn(i32) -> i32 = g\n    h(1)\n"),
+                          6, 5, "cannot initialize fn(i32) -> i32 with fn(i32, i32) -> i32"),
+    "let_params_spelled": (("struct P\n    n: i32\n\n"
+                            "fn f(a: *P, b: @&[2]u8, c: **i32, d: bool) -> i32\n    0\n\n"
+                           "fn main() -> i32\n    let h: fn(*P, @[2]u8, **i32) -> i32 = f\n    0\n"),
+                           8, 5, ("cannot initialize fn(*P, @[2]u8, **i32) -> i32 with "
+                                  "fn(*P, @&[2]u8, **i32, bool) -> i32")),
+    "let_bool_param": (("fn f(a: bool) -> i32\n    0\n\n"
+                        "fn main() -> i32\n    let h: fn(i32) -> i32 = f\n    0\n"),
+                       5, 5, "cannot initialize fn(i32) -> i32 with fn(bool) -> i32"),
+    "let_other_struct": (("struct P\n    n: i32\n\nstruct Q\n    n: i32\n\n"
+                          "fn f(a: P) -> i32\n    0\n\n"
+                          "fn main() -> i32\n    let h: fn(Q) -> i32 = f\n    0\n"),
+                         11, 5, "cannot initialize fn(Q) -> i32 with fn(P) -> i32"),
+    "let_fn_param": (("fn f(g: fn(i32) -> i32) -> i32\n    g(1)\n\n"
+                      "fn main() -> i32\n    let h: fn(fn(i64, i32) -> i32) -> i32 = f\n    0\n"),
+                     5, 5, ("cannot initialize fn(fn(i64, i32) -> i32) -> i32 with "
+                            "fn(fn(i32) -> i32) -> i32")),
+    "assign_local": (TWO + "fn g(a: i32) -> i32\n    a\n\n"
+                     "fn main() -> i32\n    var h: fn(i32) -> i32 = g\n    h = f\n    h(1)\n",
+                     9, 5, "cannot assign fn(i32, i32) -> i32 to fn(i32) -> i32"),
+    "argument": (TWO + "fn call(h: fn(i32) -> i32) -> i32\n    h(1)\n\n"
+                 "fn main() -> i32\n    call(f)\n",
+                 8, 10, "argument 1 ('h'): expected fn(i32) -> i32, got fn(i32, i32) -> i32"),
+    "field": ("struct S\n    h: fn(i32) -> i32\n\n" + TWO
+              + "fn main() -> i32\n    let s = S { h: f }\n    0\n",
+              8, 20, "field 'h': expected fn(i32) -> i32, got fn(i32, i32) -> i32"),
+    "return": (TWO + "fn pick() -> fn(i32) -> i32\n    return f\n\nfn main() -> i32\n    0\n",
+               5, 5, "return type fn(i32, i32) -> i32 doesn't match expected fn(i32) -> i32"),
+    "tail": (TWO + "fn pick() -> fn(i32) -> i32\n    f\n\nfn main() -> i32\n    0\n",
+             5, 5, "block expression has type fn(i32, i32) -> i32, expected fn(i32) -> i32"),
+}
+for _param in ("a:& [2]i32", "a: @[2]i32"):
+    for _slot, _decl in OTHER_ARRAY:
+        _spelt = "[2]i32" if _param.startswith("a:&") else "@[2]i32"
+        FN_SLOT_REFUSED[f"array {_param} {_slot}"] = (
+            LENT_AS_VALUE.replace("a:& [2]i32", _param).replace("fn(@[2]i32)", _slot)
+            .replace("var b: [2]i32 = [1, 3]", _decl),
+            5, 5, f"cannot initialize {_slot} -> i32 with fn({_spelt}) -> i32")
+
+# What ritz0 lets in stays in: a fn value that fits, and the leniencies of
+# `_types_compatible` (an integer return of another width, a value-returning
+# fn in a `fn(..)` slot, a `:&` param in a by-value slot, a method's argument).
+FN_SLOT_ACCEPTED = {
+    "lent_as_ref": LENT_AS_VALUE,
+    "fits_everywhere": ("struct S\n    h: fn(i32) -> i32\n\n"
+                        "fn f(a: i32) -> i32\n    a\n\n"
+                        "fn call(h: fn(i32) -> i32) -> i32\n    h(1)\n\n"
+                        "fn pick() -> fn(i32) -> i32\n    if 1 > 2\n        return f\n    f\n\n"
+                        "fn main() -> i32\n    var h: fn(i32) -> i32 = f\n    h = pick()\n"
+                        "    let s = S { h: h }\n    call(s.h) - 1\n"),
+    "int_width_return": ("fn f(a: i32) -> i64\n    0\n\n"
+                         "fn main() -> i32\n    let h: fn(i32) -> i32 = f\n    h(1)\n"),
+    "value_fn_in_void_slot": ("fn f(a: i32) -> i32\n    a\n\n"
+                              "fn main() -> i32\n    let h: fn(i32) = f\n    h(1)\n    0\n"),
+    "lent_in_value_slot": ("fn f(a:& i32) -> i32\n    a\n\n"
+                           "fn main() -> i32\n    let h: fn(i32) -> i32 = f\n    0\n"),
+    "method_argument": ("struct S\n    n: i32\n\nimpl S\n"
+                        "    fn run(self, h: fn(i32) -> i32) -> i32\n        h(1)\n\n"
+                        "fn f(a: i32, b: i32) -> i32\n    a\n\n"
+                        "fn main() -> i32\n    let s = S { n: 1 }\n    s.run(f)\n"),
+}
+
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+
+def _compile_with(request, compiler, tmp_path, source):
+    """(refused?, output, .ll path) of `compiler` on `source` as a.ritz."""
+    src, ll = tmp_path / "a.ritz", tmp_path / "a.ll"
+    src.write_text(source)
+    if compiler == "ritz0":
+        cmd = [sys.executable, str(Path(__file__).with_name("ritz0.py")), "a.ritz", "-o", "a.ll"]
+    else:
+        request.getfixturevalue("ritz1_bin")
+        binary = RITZ_ROOT / "ritz1" / "build" / compiler
+        # Never skip (#1327): the gate builds both ritz1 binaries before pytest.
+        assert binary.exists(), f"{binary} missing; run `make -C ritz1 bootstrap`"
+        cmd = [str(binary), "a.ritz", "-o", "a.ll"]
+    r = subprocess.run(cmd, cwd=tmp_path, capture_output=True, text=True, timeout=300, check=False,
+                       env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)))
+    return r.returncode != 0, r.stdout + r.stderr, ll
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(FN_SLOT_REFUSED))
+def test_a_fn_value_that_doesnt_fit_its_slot_is_refused(request, tmp_path, compiler, name):
+    source, line, col, message = FN_SLOT_REFUSED[name]
+    refused, out, ll = _compile_with(request, compiler, tmp_path, source)
+    assert refused, f"{compiler} accepted {name}:\n{out[-1500:]}"
+    assert not ll.exists(), f"{compiler} wrote IR for {name}"
+    where = (f"Type error: a.ritz:{line}:{col}: " if compiler == "ritz0"
+             else f"a.ritz:{line}:{col}: error: ")
+    assert where + message in out, f"{compiler}, {name}:\n{out[-1500:]}"
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("name", sorted(FN_SLOT_ACCEPTED))
+def test_a_fn_value_that_fits_its_slot_compiles(request, tmp_path, compiler, name):
+    refused, out, ll = _compile_with(request, compiler, tmp_path, FN_SLOT_ACCEPTED[name])
+    assert not refused, f"{compiler} refused {name}:\n{out[-1500:]}"
+    assert ll.exists()

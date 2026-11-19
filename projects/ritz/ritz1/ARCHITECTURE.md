@@ -210,6 +210,9 @@ still run mid-lowering on `*EmitterState`, and
   `uitofp` (`float_slot_unsigned`, #3510). `pointer_into_float` still runs
   mid-lowering (#3892).
 
+- `fn_slot` — a fn value fits the fn-typed slot it lands in: arity, each
+  param and the return, as ritz0's `_types_compatible` (#4310).
+
 - `generic_method` — a free call to a generic impl's method (R37, §5.4).
 
 - `if_arm_value` — an if-expression arm must end in a value (§6.1, #1613), only where the value is wanted: a match statement's arms are statements (#3980).
