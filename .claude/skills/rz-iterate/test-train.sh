@@ -69,7 +69,8 @@ out="$(bash "$TR" land "$log" 2>&1)"; has "$out" "did not pass" "land refuses a 
 echo x > "$T/train/d"; git -C "$T/train" commit -qam stray
 out="$(bash "$TR" land 2>&1)"; has "$out" "moved since build" "land refuses a moved worktree"
 git -C "$T/train" reset -q --hard HEAD~1
-log="$(bash "$TR" gate)"
+# Re-gating a red train 1 is explicit (AGAST #4156: plain `gate` says fail it).
+log="$(bash "$TR" gate 1)"
 out="$(bash "$TR" land "$log" 2>&1)"
 has "$out" "^MERGED +r2 " "r2 merged"; has "$out" "^MERGED +r4 " "r4 merged"
 [[ "$(git -C "$M" show origin/main:b)" == B2 && "$(git -C "$M" show origin/main:c)" == C4 ]] \
@@ -399,9 +400,10 @@ has "$out" "^TRAIN 1 base=${b10:0:12} .*n=8 gate=needed" "the first 8 cars form 
 tt1="$(tipof 1 "$out")"
 has "$out" "^TRAIN 2 base=$tt1 .*n=2 gate=needed" "cars 9-10 form train 2 on train 1's tail"
 [[ "$(git -C "$M" rev-list --count "$b10..$tt1")" == 8 ]] && ok "train 1 holds 8 commits" || bad "train 1 holds 8 commits"
+# Deepest first (AGAST #4156): one gate, on train 2's tip, lands all 10.
 out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
-[[ "$(grep -c '^MERGED' <<<"$out")" == 8 ]] && ok "landing train 1 merges 8 cars" || bad "landing train 1 merges 8 cars"
-out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+[[ "$(grep -c '^MERGED' <<<"$out")" == 10 ]] && ok "one gate on train 2's tip lands all 10 cars" \
+    || bad "one gate on train 2's tip lands all 10 cars"
 has "$out" "^MERGED +sc9 " "train 2 lands its cars"
 
 # 10c. A car rebased onto an unlanded train commit boards, not BAD.
@@ -529,7 +531,7 @@ has "$out" "^TRAIN 3 base=${t2:0:12} " "build --next keeps a speculatively gatin
     || bad "train 2 and its remote gate are untouched"
 out="$(bash "$TR" land "$log1" 2>&1)"
 has "$out" "^NEXT .*tip=${t2:0:12} .*spec=$llog" "land names the promoted train's remote verdict"
-out="$(bash "$TR" gate 2>&1)"; has "$out" "train.sh wait" "gate refuses a train already gating remotely"
+out="$(bash "$TR" gate 1 2>&1)"; has "$out" "train 1 passed on hostx: train.sh land $llog" "gate 1 refuses a train whose remote gate passed"
 out="$(bash "$TR" land "$llog" 2>&1)"
 has "$out" "^MERGED +pb2 " "train 2 lands on the remote verdict"
 [[ "$(git -C "$M" rev-parse origin/main)" == "$t2" ]] && ok "main is train 2's tail" || bad "main is train 2's tail"
@@ -538,10 +540,11 @@ has "$out" "^MERGED +pb2 " "train 2 lands on the remote verdict"
 # 11b. N fails: N+1's verdict is discarded, N+1 rebuilt on the new base.
 fetch; git -C "$M" checkout -q main
 two fa s/fa; bash "$TR" build "fa1:$c1" "fa2:$c2" >/dev/null 2>&1; fa1="$c1"
-log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate)"
+log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate)"; sed -i '/^EXIT=/d' "$log1"   # still running
 two fb s/fb; bash "$TR" build --next "fb1:$c1" "fb2:$c2" >/dev/null 2>&1; fb1="$c1"; fb2="$c2"
 t2="$(git -C "$T/train-2" rev-parse HEAD)"
 llog="$(bash "$TR" gate --next 2>/dev/null)"; bash "$TR" wait "$llog" >/dev/null 2>&1
+echo EXIT=1 >> "$log1"                                                  # then red
 out="$(bash "$TR" land "$log1" 2>&1)"; has "$out" "did not pass" "a failed train 1 doesn't land"
 : > "$T/ssh-log"
 out="$(bash "$TR" build "fa1:$fa1" 2>&1)"
@@ -555,7 +558,7 @@ out="$(bash "$TR" build --next "fb1:$fb1" "fb2:$fb2" 2>&1)"
 has "$out" "^TRAIN 2 base=${n1:0:12} " "N+1 is rebuilt on the new train 1's tail"
 nt2="$(git -C "$T/train-2" rev-parse HEAD)"
 [[ "$nt2" != "$t2" ]] && ok "the rebuilt N+1 has a new tip" || bad "the rebuilt N+1 has a new tip"
-bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+bash "$TR" land "$(bash "$TR" gate 1)" >/dev/null 2>&1
 out="$(bash "$TR" land "$llog" 2>&1)"; has "$out" "another commit" "the old speculative verdict can't land the rebuilt N+1"
 llog="$(bash "$TR" gate --next 2>&1)"; has "$llog" "no train 2" "after the land, the rebuilt train is train 1"
 bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
@@ -728,10 +731,11 @@ bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
 # car of train 1 and passed on exactly the tree that lands, so both land.
 fetch; git -C "$M" checkout -q main
 two ia s/ia; bash "$TR" build "ia1:$c1" "ia2:$c2" >/dev/null 2>&1
-log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"; sed -i '/^EXIT=/d' "$log1"
 two ib s/ib; bash "$TR" build --next "ib1:$c1" "ib2:$c2" >/dev/null 2>&1
 t2="$(git -C "$T/train-2" rev-parse HEAD)"
 llog="$(bash "$TR" gate --next 2>/dev/null)"; bash "$TR" wait "$llog" >/dev/null 2>&1
+echo EXIT=1 >> "$log1"                       # train 1 goes red after train 2 started
 : > "$T/systemctl-log"
 out="$(bash "$TR" land "$llog" 2>&1)"
 [[ "$(git -C "$M" rev-parse origin/main)" == "$t2" ]] && has "$out" "^MERGED +ia1 " "a green train 2 lands a red train 1 with it" \
@@ -917,4 +921,137 @@ has "$(bash "$TR" pending)" "^GATE train 2 n=8 \(full\): train.sh gate --next$" 
 l2="$(bash "$TR" gate --next 2>/dev/null)"
 [[ -z "$(bash "$TR" pending)" ]] && ok "a speculatively gating train is not pending" || bad "a speculatively gating train is not pending"
 bash "$TR" wait "$l2" >/dev/null 2>&1; bash "$TR" land "$l2" >/dev/null 2>&1
+
+# 14. Deepest train first (AGAST #4156).  Since #4151 a pass of train k lands
+# trains 1..k, so the train to gate is the deepest built one (its tip covers
+# every car below it); a shorter prefix gates only to bisect a red deeper
+# gate.  Trains of 2 cars here (RZ_TRAIN_MAX), so 6 cars are 3 trains.
+export RZ_TRAIN_MAX=2 RZ_TRAIN_DEBOUNCE=0
+# cars <prefix> <n>: <n> one-file cars on the current main, as build items.
+cars() { local i; items=(); for ((i = 1; i <= $2; i++)); do items+=("$1$i:$(room "$1$i" "s/$1$i" X)"); done; fetch; git -C "$M" checkout -q main; }
+specn() { bash "$TR" show 2>/dev/null | awk -v k="$1" '/^== train /{t=$3} t==k && /^SPEC=/{sub(/^SPEC=/,""); print}'; }
+gatedn() { bash "$TR" show 2>/dev/null | awk -v k="$1" '/^== train /{t=$3} t==k && /^GATED=/{sub(/^GATED=/,""); print}'; }
+shaof() { sed -n 's/^SHA=//p' "$1" 2>/dev/null | head -1; }
+
+# 14a. Three trains built, none gating: pending names train 3 only, and plain
+# `gate` gates train 3's tip here (a local SPEC, so wait/land/fail know it),
+# against main, train 1's base.
+fetch; git -C "$M" checkout -q main; m0="$(git -C "$M" rev-parse origin/main)"
+cars ua 6; out="$(bash "$TR" build "${items[@]}" 2>&1)"
+has "$out" "^TRAIN 3 .*n=2 gate=needed" "six cars build three trains of two"
+t3="$(tipn 3)"
+out="$(bash "$TR" pending)"
+eq "$out" "GATE train 3 n=2 (full): train.sh gate --next" "pending names only the deepest train"
+log3="$(bash "$TR" gate 2>/dev/null)"; rc=$?
+[[ $rc -eq 0 && "$(shaof "$log3")" == "$t3" ]] && ok "plain gate gates the deepest train's tip" \
+    || bad "plain gate gates the deepest train's tip (rc=$rc, sha $(shaof "$log3"))"
+eq "$(specn 3)" "localbox - $log3 $log3" "a local gate of train 3 is recorded as a local SPEC"
+[[ -z "$(gatedn 1)$(specn 1)$(specn 2)" ]] && ok "trains 1 and 2 are not gated" || bad "trains 1 and 2 are not gated"
+has "$(cat "$log3")" "^GBASE=$m0$" "train 3's gate diffs against main, train 1's base"
+sed -i '/^EXIT=/d' "$log3"                       # still running
+eq "$(bash "$TR" pending)" "" "nothing is pending while the deepest train gates"
+out="$(bash "$TR" gate 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "train 3 is already gating.*train.sh wait" "gate refuses while the deepest train gates" \
+    || bad "gate refuses while the deepest train gates (rc=$rc)"
+out="$(bash "$TR" gate 3 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "train 3 is already gating on localbox: train.sh wait $log3" "gate 3 refuses a train gating here" \
+    || bad "gate 3 refuses a train gating here (rc=$rc)"
+out="$(bash "$TR" gate --next 2>&1)"; rc=$?
+[[ $rc -ne 0 && -z "$(specn 2)" ]] && has "$out" "already gating" "gate --next gates no shorter prefix while the deepest gates" \
+    || bad "gate --next gates no shorter prefix while the deepest gates (rc=$rc)"
+echo EXIT=0 >> "$log3"
+out="$(bash "$TR" wait "$log3" 2>&1)"; rc=$?
+[[ $rc -eq 0 ]] && ok "wait on the local gate of train 3" || bad "wait on the local gate of train 3 (rc=$rc)"
+out="$(bash "$TR" land "$log3" 2>&1)"
+[[ "$(grep -c '^MERGED' <<<"$out")" == 6 && "$(git -C "$M" rev-parse origin/main)" == "$t3" ]] \
+    && ok "train 3's pass lands all six cars" || { bad "train 3's pass lands all six cars"; echo "$out" | sed 's/^/     | /'; }
+
+# 14b. gate --next (a remote slot frees) also takes the deepest train.
+fetch; git -C "$M" checkout -q main
+cars ub 6; bash "$TR" build "${items[@]}" >/dev/null 2>&1; t3="$(tipn 3)"
+l3="$(bash "$TR" gate --next 2>/dev/null)"
+[[ "$(specn 3 | cut -d' ' -f1)" == hostx && -z "$(specn 2)" && "$(oref "${t3:0:12}")" == "$t3" ]] \
+    && ok "gate --next gates the deepest train on the free host" \
+    || bad "gate --next gates the deepest train on the free host (2: '$(specn 2)', 3: '$(specn 3)')"
+bash "$TR" wait "$l3" >/dev/null 2>&1
+out="$(bash "$TR" land "$l3" 2>&1)"; has "$out" "^MERGED +ub1 " "its pass lands train 1 too"
+
+# 14c. A gate=not-needed deepest train still covers a train below that needs
+# one: it is the one to gate.
+fetch; git -C "$M" checkout -q main
+two uc s/uc; bash "$TR" build "uc1:$c1" "uc2:$c2" >/dev/null 2>&1
+k1="$(room uc3 s/uc3 X "$(tipn 1)")"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "uc3:$k1" 2>&1)"
+has "$out" "^TRAIN 2 .*n=1 gate=not-needed" "a car on train 1's tail is a not-needed train 2"
+eq "$(bash "$TR" pending)" "GATE train 2 n=1 (no new car for 0s): train.sh gate --next" \
+    "a not-needed deepest train over a needed one is the one to gate"
+log="$(bash "$TR" gate 2>/dev/null)"
+[[ "$(shaof "$log")" == "$(tipn 2)" ]] && ok "gate gates it" || bad "gate gates it"
+out="$(bash "$TR" land "$log" 2>&1)"; has "$out" "^MERGED +uc3 " "and its pass lands both"
+
+# 14d. Bisect a red deeper gate with shorter prefixes: 4 trains, train 4 red
+# -> gate train 2 (half); it passes and lands -> the red train is train 2 ->
+# gate train 1; it is red with nothing below -> fail it.
+fetch; git -C "$M" checkout -q main
+cars ud 8; bash "$TR" build "${items[@]}" >/dev/null 2>&1
+t2="$(tipn 2)"
+log4="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+eq "$(bash "$TR" pending)" "GATE train 2 n=2 (bisect red train 4): train.sh gate --next" \
+    "a red train 4 bisects: gate train 2"
+log2="$(bash "$TR" gate --next 2>/dev/null)"
+[[ "$(specn 2 | cut -d' ' -f1)" == hostx ]] && ok "gate --next gates the bisect prefix" \
+    || bad "gate --next gates the bisect prefix (2: '$(specn 2)')"
+eq "$(bash "$TR" pending)" "" "nothing more is pending while the bisect prefix gates"
+bash "$TR" wait "$log2" >/dev/null 2>&1
+out="$(bash "$TR" land "$log2" 2>&1)"
+[[ "$(git -C "$M" rev-parse origin/main)" == "$t2" ]] && ok "the green prefix lands" || bad "the green prefix lands"
+eq "$(bash "$TR" pending)" "GATE train 1 n=2 (bisect red train 2): train.sh gate" \
+    "the red train is now train 2: gate train 1"
+log1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+[[ -n "$(gatedn 1)" && -z "$(specn 1)" ]] && ok "plain gate gates train 1 as before (GATED=)" \
+    || bad "plain gate gates train 1 as before (GATED=)"
+eq "$(bash "$TR" pending)" "FAIL train 1 n=2 (red, nothing below to bisect): train.sh fail $log1" \
+    "a red train 1 is failed, not bisected further"
+out="$(bash "$TR" gate 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "train.sh fail" "plain gate refuses a red train with nothing to bisect" \
+    || bad "plain gate refuses a red train with nothing to bisect (rc=$rc)"
+out="$(bash "$TR" fail "$log1" 2>&1)"
+has "$out" "^HELD +ud5 " "fail holds the culprit train's cars"
+has "$out" "^TRAIN 1 .*n=2 gate=needed" "the train above it is restacked on main"
+eq "$(bash "$TR" pending)" "GATE train 1 n=2 (full): train.sh gate" "the restacked train gates"
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+
+# 14e. A green train below the red one: bisect only above it; train 3 red
+# over a green train 2 (not landed yet) is failed, not bisected.
+fetch; git -C "$M" checkout -q main
+cars ue 6; bash "$TR" build "${items[@]}" >/dev/null 2>&1
+l3="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+eq "$(bash "$TR" pending)" "GATE train 1 n=2 (bisect red train 3): train.sh gate" "a red train 3 bisects: gate train 1"
+bash "$TR" gate 2 >/dev/null 2>&1
+eq "$(bash "$TR" pending)" "FAIL train 3 n=2 (red, nothing below to bisect): train.sh fail $l3" \
+    "a red train over a green one is failed"
+
+# 14f. gate <k> gates train k here, whatever the rule says.
+l1="$(bash "$TR" gate 1 2>/dev/null)"
+[[ "$(shaof "$l1")" == "$(tipn 1)" && "$(gatedn 1)" == "$l1" ]] && ok "gate 1 gates train 1 here" || bad "gate 1 gates train 1 here"
+out="$(bash "$TR" gate 9 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "no train 9" "gate <k> refuses a train that isn't built" || bad "gate <k> refuses a train that isn't built (rc=$rc)"
+bash "$TR" land "$(specn 2 | cut -d' ' -f3)" >/dev/null 2>&1
+bash "$TR" fail "$l3" >/dev/null 2>&1
+
+# 14g. Trains that need no gate are never pending; a gate log for another
+# SHA than the tip is no verdict of this train (it gates again, not FAIL).
+fetch; git -C "$M" checkout -q main
+k1="$(room uf1 s/uf1 X)"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "uf1:$k1" 2>&1)"; has "$out" "gate=not-needed" "a lone KEPT car needs no gate"
+eq "$(bash "$TR" pending)" "" "a not-needed train is not pending"
+out="$(bash "$TR" gate 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "no train needs a gate" "gate refuses when no train needs one" || bad "gate refuses when no train needs one (rc=$rc)"
+bash "$TR" land >/dev/null 2>&1
+two ug s/ug; bash "$TR" build "ug1:$c1" "ug2:$c2" >/dev/null 2>&1
+l1="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+sed -i "s/^SHA=.*/SHA=$(git -C "$M" rev-parse origin/main)/" "$l1"
+eq "$(bash "$TR" pending)" "GATE train 1 n=2 (full): train.sh gate" "a red log for another SHA is no verdict: the train gates again"
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

@@ -697,18 +697,27 @@ This is also how Borque's conductor works.
   to 4 trains in flight** (`RZ_TRAIN_DEPTH`): train 1 here, each later one
   on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk huburght
   skronk`) with a free train slot.
+- **Deepest train first (AGAST #4156):** a pass of train k lands trains
+  1..k (step 5), so when a gate slot frees, here or on another host, gate
+  the **deepest** built train's tip, not train 1: one gate covers every car
+  below it. Trains still hold at most 8 cars each. While the deepest train
+  gates, nothing below it gates; cars that arrive stack a new deepest train
+  behind it, which gates next. A shorter prefix (train 1, 2, ...) gates
+  **only to bisect a red deeper gate** (step 6).
 - **Dispatch (Aaron, 2026-11-18, AGAST #4031):** (a) a train that reaches 8
   cars is gated at once, on any host with a free train slot. (b) A train
   that cars are boarding waits for more: 60 s after its last car (each new
   car restarts the 60 s), then it gates, or at once at 8. That holds for a
   new train 1 (no train building when a car arrives) and for the train
   stacking behind the gating ones alike. `train.sh pending` applies the
-  rule; just run it after each `build` and act on each line:
-  `GATE train <k> ...: <command>` (run that command: `train.sh gate` for
-  train 1, `train.sh gate --next` for the rest), or `WAIT train <k> n=<cars>
-  <s>s` (schedule a wakeup for that many seconds and run `pending` again;
-  a REAP that arrives meanwhile is a `build --next`, which restarts the
-  wait). A train that is gating is never listed.
+  rule and deepest-first; just run it after each `build` and act on its
+  line (at most one): `GATE train <k> ...: <command>` (run that command:
+  `train.sh gate` for train 1, `train.sh gate --next` for the rest; a
+  bisect prefix says `(bisect red train <r>)` and gates at once), `WAIT
+  train <k> n=<cars> <s>s` (schedule a wakeup for that many seconds and run
+  `pending` again; a REAP that arrives meanwhile is a `build --next`, which
+  restarts the wait), or `FAIL train <r> ...: train.sh fail <log>` (step
+  6). A train that is gating is never listed.
 - **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
   with C): bounce E to its room with the exact commit to rebase onto, the
   tail (D's train SHA), not `main`. The room resolves the conflict on D,
@@ -716,11 +725,13 @@ This is also how Borque's conductor works.
 - **A train fails:** find the culprit by reasoning first, bisection second
   (step 6).
 
-`train.sh` numbers trains in landing order: **train 1** is the one gating
-(or about to), train 2 is stacked on its tail, and so on (AGAST #3809).
-`gate` always acts on train 1. `land <log>` lands the train whose tip the
-log passed, and every train below it (step 5), then promotes the next one
-to train 1.
+`train.sh` numbers trains in landing order: **train 1** is built on
+`main`, train 2 is stacked on its tail, and so on (AGAST #3809). `gate`
+and `gate --next` gate the train `pending` names (deepest first, or a
+bisect prefix); `gate <k>` gates train k here whatever the rule says (a
+retry of a red gate, a hand bisect). `land <log>` lands the train whose tip
+the log passed, and every train below it (step 5), then promotes the next
+one to train 1.
 
 1. **REAP arrives:** (this section, not `/reap-ritz-room`, handles it)
    `append_scratchpad_item` immediately, even while a train is gating, then
@@ -758,25 +769,31 @@ to train 1.
    it sits on the same patches at other SHAs; `BAD ... not in the train`
    only if a commit under it is in no train. `rz-larb` boards like any room
    (`rz-larb:<sha>`).
-4. **Gate train 1, unless `gate=not-needed`** (only cars already on its
-   base or on each other: their own gates cover them), when `train.sh
-   pending` says `GATE train 1` (dispatch rule above). Later trains gate on
-   other hosts at the same time (4b):
+4. **Gate the deepest train** (AGAST #4156) when `train.sh pending` says
+   `GATE train <k>` (dispatch rule above), unless every train is
+   `gate=not-needed` (only cars already on their base or on each other:
+   their own gates cover them; `pending` lists nothing, `land` with no
+   log). `GATE train 1` (the only train, or a bisect prefix):
    ```bash
    LOG=$(.claude/skills/rz-iterate/train.sh gate)
    .claude/skills/rz-iterate/train.sh wait "$LOG"    # Bash run_in_background
    ```
-   (`train.sh wait` on a local log is `run-gate.sh --wait`.)
+   (`train.sh wait` on a local log is `run-gate.sh --wait`.) Plain `gate`
+   gates the train `pending` names here; for train 1 it records `GATED=` as
+   before, for a deeper one a local `SPEC=<this host> - <log> <log>`, the
+   same as `gate --next` on this host. It refuses while that train already
+   gates (`train.sh wait` its log), when no train needs a gate, and for a
+   red train with nothing below it to bisect (`train.sh fail`, step 6; to
+   re-gate it instead, e.g. a flake, `gate <k>`).
 
-   **4b. Gate trains 2, 3, ... speculatively** (AGAST #3988, #4031) when
-   `train.sh pending` says `GATE train <k>` (8 cars, or 60 s with no new
-   car), while train 1 gates:
+   **4b. `GATE train <k>` for k > 1** (AGAST #3988, #4031, #4156): gate it
+   on the first host with a free slot, this one included:
    ```bash
    LOG2=$(.claude/skills/rz-iterate/train.sh gate --next)   # picks the host; or: gate --next <host>
    .claude/skills/rz-iterate/train.sh wait "$LOG2"         # Bash run_in_background
    ```
-   `gate --next` gates the first train past train 1 that needs a gate and
-   has none, on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk
+   `gate --next` gates the same train `pending` names (the deepest, or a
+   bisect prefix past train 1), on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk
    huburght skronk`) with a free train slot (`pick_train_host`: a gate
    slot no gate holds, less the train gates queued there, read from that
    host's `host.env` and gate dir; stderr says why it passed over each
@@ -784,8 +801,8 @@ to train 1.
    (`RZ_TRAIN_LOCAL`, default `hostname -s`): if its slot is free (train 1
    gating elsewhere), the train gates here, `SPEC=omegalisk - <log> <log>`.
    No host free: it refuses (`no host in RZ_TRAIN_HOSTS ...`); run
-   `pending` again later. At most `RZ_TRAIN_DEPTH` (4) trains in flight,
-   train 1 included. Each train's gate is named for its worktree slot
+   `pending` again later. At most `RZ_TRAIN_DEPTH` (4) trains in flight
+   (each with a `GATED=` or `SPEC=` line). Each train's gate is named for its worktree slot
    (`train` for `rz-train`, `train-<s>` for `rz-train-<s>`) and a remote one
    checks out in `rz-train-remote` or `rz-train-remote-<s>`, so two trains
    can gate on one host (skronk has 2 train slots). Hosts reserve slots for
@@ -820,11 +837,12 @@ to train 1.
       a `build` replaces the train (a `DISCARDED speculative gate on <host>
       ...` line). Both lines also stop the host's `ritz-gate-train` unit.
 
-   Refusals: no train 2 (`gate` is for train 1), no later train needing a
-   gate (each already gating or `gate=not-needed`: land it with the train
-   below), or `RZ_TRAIN_DEPTH` trains in flight already.
-   `gate` refuses a train 1 that is gating remotely (`train.sh wait` its
-   log). If the host can't start the gate (`the remote gate on <host> did
+   Refusals: no train 2 (`gate` is for train 1), the train to gate is
+   train 1 (`train.sh gate`), the deepest train already gating (`already
+   gating`: wait for it; only its red verdict opens a bisect), no train
+   needing a gate, or `RZ_TRAIN_DEPTH` trains in flight already.
+   `gate <k>` refuses a train k that is gating remotely (`train.sh wait` its
+   log) or whose gate passed (`train.sh land` it). If the host can't start the gate (`the remote gate on <host> did
    not start`), name another host (`gate --next <host>`), or let the train
    gate here once the trains below it land. `train.sh discard <host>` drops
    only that host's gates (a dead host); then `gate --next` again. If a
@@ -910,11 +928,11 @@ to train 1.
    `~/dev/ritz-lang/rz`, and prints `MERGED <branch> <room sha12> as <main
    sha12>` per commit of trains 1..k. If a train was stacked behind train k,
    it prints `NEXT base=<12> tip=<12> n=<cars> gate=<...>`: that train is train 1 now, its
-   base (the tail just pushed) is `main`, so gate it straight away (step 4),
-   or land it with no log if `gate=not-needed`. If it was gating remotely
-   (4b) the line ends `spec=<local log>`: don't gate it again, `train.sh
-   wait` that log (if not done yet) and land it with that log. Then gate
-   the new train 2, if any, with `gate --next` (4b). It also
+   base (the tail just pushed) is `main`: run `pending` and gate what it
+   names (step 4; the deepest train, AGAST #4156), or land it with no log if
+   `gate=not-needed`. If it was gating (4b) the line ends `spec=<local
+   log>`: don't gate it again, `train.sh wait` that log (if not done yet)
+   and land it with that log. It also
    renews the gate's reservation (#3365), so the 10 minutes count from the
    push: build and gate the next train promptly. A `build` with
    `gate=not-needed` drops the reservation; if nothing else is queued, just
@@ -959,9 +977,20 @@ to train 1.
    line, "rebase onto <main sha7>: your commit fails the gate on top of
    `main`", with the gate's failing lines. Its fixed REAP goes to the back
    of the queue.
+   **A red deeper gate bisects by prefix first** (AGAST #4156). Train r
+   red with ungated trains below it: the culprit may be in any of trains
+   1..r. Don't `fail` it yet; run `pending`, which says `GATE train <m>
+   n=<cars> (bisect red train <r>)` with m half-way between the highest
+   green train below r (0: none) and r, once nothing between them is
+   still gating. Gate it (step 4/4b). Green: land it (trains 1..m), and
+   the red train is now train r-m: `pending` again. Red: it is the new r,
+   halve again. Once the red train has nothing ungated below it (train 1,
+   or the train above a green one), `pending` says `FAIL train <r> ...:
+   train.sh fail <log>`: bisect its cars as below.
    **With several trains in flight** (AGAST #3988, #4031): when **train k
-   fails**, every train after it is worthless whatever its gate says (its
-   base holds train k's cars). Don't wait for them:
+   fails** with nothing below it to bisect, every train after it is
+   worthless whatever its gate says (its base holds train k's cars). Don't
+   wait for them:
    ```bash
    .claude/skills/rz-iterate/train.sh fail "$LOGK"
    ```
