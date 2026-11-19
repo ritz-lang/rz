@@ -1,5 +1,16 @@
-# ritzlib/hashmap.ritz - Hash map for i64 keys
+# ritzlib/hashmap.ritz - Hash maps: HashMap<K, V>, and HashMapI64
 #
+# HashMap<K: Hash + Eq, V> (AGAST #1858) takes any key type with ritzlib's
+# Hash and Eq (hash.ritz):
+#   var m: HashMap<StrView, i64> = hashmap_new<StrView, i64>()
+#   m.insert("one", 1)
+#   match m.get("one")       # Option<i64>: a missing key is None
+#       Some(v) => v
+#       None => 0
+#   hashmap_drop(@&m)
+# A primitive key waits on R36's revisit (#4294): `i64` has no Hash impl.
+#
+# HashMapI64, below it, maps i64 to i64.
 # Provides O(1) average lookup, insert, and delete.
 # Uses open addressing with linear probing.
 #
@@ -10,9 +21,6 @@
 #
 # Or by index (LANGUAGE_SPEC §7.8): `m[42] = 100` inserts, and `m[42]` reads,
 # ending the program on a missing key.
-#
-# Note: This is a specialized implementation for i64 keys and i64 values.
-# Generic HashMap<K,V> requires parser support for multi-param generics in casts.
 
 import ritzlib.memory
 import ritzlib.str      # memcpy
@@ -20,6 +28,8 @@ import ritzlib.hash
 import ritzlib.drop
 import ritzlib.fmt      # fmt_i64_into: the one digit routine (AGAST #1856)
 import ritzlib.strview  # StrView
+import ritzlib.gvec     # Vec<T>, HashMap's slots
+import ritzlib.option   # Option<V>, HashMap.get
 
 # Core (tools/ritzlib_layers.py, AGAST #4119): no ritzlib.sys, so a missing key
 # ends the program through this platform hook.  ritzlib.sys defines it for a
@@ -323,3 +333,147 @@ pub fn hashmap_i64_grow(m: @&HashMapI64)
     # Free old table
     free(old_entries as *u8)
 
+# ============================================================================
+# HashMap<K: Hash + Eq, V> - the generic map
+# ============================================================================
+# The same open addressing as HashMapI64: linear probing over a power-of-2
+# table of slots, each Empty, Full or Tomb.  The table is a Vec whose len is
+# its capacity, every slot initialised.
+
+struct HashMapEntry<K, V>
+    key: K
+    value: V
+    state: Slot
+
+struct HashMap<K: Hash + Eq, V>
+    slots: Vec<HashMapEntry<K, V>>
+    len: i64          # Full slots
+    tombstones: i64   # Tomb slots
+
+# An empty map with 16 slots.
+pub fn hashmap_new<K: Hash + Eq, V>() -> HashMap<K, V>
+    hashmap_with_cap<K, V>(16)
+
+# An empty map with room for cap slots, rounded up to a power of 2 (min 16).
+pub fn hashmap_with_cap<K: Hash + Eq, V>(cap: i64) -> HashMap<K, V>
+    var n: i64 = 16
+    while n < cap
+        n *= 2
+    var m: HashMap<K, V>
+    m.slots = vec_with_cap<HashMapEntry<K, V>>(n)
+    m.slots.len = n
+    for i in 0..n
+        let e: *HashMapEntry<K, V> = vec_get_ptr<HashMapEntry<K, V>>(@&m.slots, i)
+        e.state = Slot.Empty
+    m.len = 0
+    m.tombstones = 0
+    m
+
+# Free the table.  The map is empty afterwards, with no slots; it can't be
+# used again until reassigned from hashmap_new.
+pub fn hashmap_drop<K: Hash + Eq, V>(m: @&HashMap<K, V>)
+    vec_drop<HashMapEntry<K, V>>(@&m.slots)
+    m.len = 0
+    m.tombstones = 0
+
+impl<K: Hash + Eq, V> HashMap<K, V>
+    # The number of keys.
+    pub fn len(self: @HashMap<K, V>) -> i64
+        self.len
+
+    # Insert key, or overwrite its value if present.
+    pub fn insert(self: @&HashMap<K, V>, key: K, value: V)
+        hashmap_insert<K, V>(self, key, value)
+
+    # The value for key, or None.
+    pub fn get(self: @HashMap<K, V>, key: K) -> Option<V>
+        hashmap_get<K, V>(self, key)
+
+    pub fn contains(self: @HashMap<K, V>, key: K) -> bool
+        hashmap_find<K, V>(self, @key) >= 0
+
+    # Remove key: true if it was there.
+    pub fn remove(self: @&HashMap<K, V>, key: K) -> bool
+        hashmap_remove<K, V>(self, key)
+
+fn hashmap_slot<K: Hash + Eq, V>(m: @HashMap<K, V>, i: i64) -> *HashMapEntry<K, V>
+    m.slots.data + i
+
+# The index of the Full slot holding key, or -1: it stops at the first Empty
+# slot and steps over Tomb ones.
+fn hashmap_find<K: Hash + Eq, V>(m: @HashMap<K, V>, key: @K) -> i64
+    let mask: i64 = m.slots.len - 1
+    var idx: i64 = (key.hash() as i64) & mask
+    for i in 0..m.slots.len
+        let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
+        if e.state == Slot.Empty
+            return -1
+        if e.state == Slot.Full and e.key.equals(key)
+            return idx
+        idx = (idx + 1) & mask
+    -1
+
+# The slot insert writes key to: key's own, else the first Tomb on its chain,
+# else the Empty slot ending it; -1 if the table has neither.
+fn hashmap_find_slot<K: Hash + Eq, V>(m: @HashMap<K, V>, key: @K) -> i64
+    let mask: i64 = m.slots.len - 1
+    var idx: i64 = (key.hash() as i64) & mask
+    var first_tomb: i64 = -1
+    for i in 0..m.slots.len
+        let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
+        if e.state == Slot.Empty
+            if first_tomb >= 0
+                return first_tomb
+            return idx
+        if e.state == Slot.Tomb
+            if first_tomb < 0
+                first_tomb = idx
+        else if e.key.equals(key)
+            return idx
+        idx = (idx + 1) & mask
+    first_tomb
+
+pub fn hashmap_insert<K: Hash + Eq, V>(m: @&HashMap<K, V>, key: K, value: V)
+    # Keep Full + Tomb at most 75% of the table.
+    if (m.len + m.tombstones + 1) * 100 / m.slots.len > 75
+        hashmap_grow<K, V>(m)
+    let idx: i64 = hashmap_find_slot<K, V>(m, @key)
+    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
+    if e.state == Slot.Full
+        e.value = value
+        return
+    if e.state == Slot.Tomb
+        m.tombstones -= 1
+    e.key = key
+    e.value = value
+    e.state = Slot.Full
+    m.len += 1
+
+pub fn hashmap_get<K: Hash + Eq, V>(m: @HashMap<K, V>, key: K) -> Option<V>
+    let idx: i64 = hashmap_find<K, V>(m, @key)
+    if idx < 0
+        return None
+    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
+    Some(e.value)
+
+# Remove key, leaving a Tomb so the chains through its slot stay intact.
+pub fn hashmap_remove<K: Hash + Eq, V>(m: @&HashMap<K, V>, key: K) -> bool
+    let idx: i64 = hashmap_find<K, V>(m, @key)
+    if idx < 0
+        return false
+    let e: *HashMapEntry<K, V> = hashmap_slot<K, V>(m, idx)
+    e.state = Slot.Tomb
+    m.len -= 1
+    m.tombstones += 1
+    true
+
+# Double the table and reinsert every Full slot, dropping the Tombs.
+fn hashmap_grow<K: Hash + Eq, V>(m: @&HashMap<K, V>)
+    var bigger: HashMap<K, V> = hashmap_with_cap<K, V>(m.slots.len * 2)
+    for i in 0..m.slots.len
+        let e: *HashMapEntry<K, V> = m.slots.data + i
+        if e.state == Slot.Full
+            hashmap_insert<K, V>(@&bigger, e.key, e.value)
+    hashmap_drop<K, V>(m)
+    m.slots = bigger.slots
+    m.len = bigger.len

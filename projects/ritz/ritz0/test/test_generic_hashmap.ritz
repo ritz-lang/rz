@@ -1,0 +1,110 @@
+# ritzlib's generic HashMap<K: Hash + Eq, V> (AGAST #1858 slice 2, #4306),
+# on ritz0, ritz1 and ritz1_selfhosted.  Keys: StrView (impls in hash.ritz)
+# and user structs with their own Hash/Eq.  A key type without Hash is
+# refused at the type argument: ritz0/test_generic_hashmap.py.
+#
+# HashMap<i64, ..> needs `impl Hash for i64`, which R36 refuses; it waits on
+# R36's revisit (#4294).  Each test returns 0, or the number of the failed check.
+
+import ritzlib.hash
+import ritzlib.hashmap
+import ritzlib.option
+import ritzlib.strview
+import ritzlib.sys
+
+struct Pt
+    x: i64
+    y: i64
+
+impl Hash for Pt
+    pub fn hash(self: @Pt) -> u64
+        fnv1a_i64(fnv1a_i64(fnv1a_init(), self.x), self.y)
+
+impl Eq for Pt
+    pub fn equals(self: @Pt, other: @Pt) -> bool
+        self.x == other.x and self.y == other.y
+
+# Every Bad hashes alike, so each key probes past all the others.
+struct Bad
+    k: i64
+
+impl Hash for Bad
+    pub fn hash(self: @Bad) -> u64
+        7
+
+impl Eq for Bad
+    pub fn equals(self: @Bad, other: @Bad) -> bool
+        self.k == other.k
+
+# The value for k, or d when get says None.
+fn get_or<K: Hash + Eq>(m: @HashMap<K, i64>, k: K, d: i64) -> i64
+    match m.get(k)
+        Some(v) => v
+        None => d
+
+fn absent<K: Hash + Eq>(m: @HashMap<K, i64>, k: K) -> bool
+    match m.get(k)
+        Some(_) => false
+        None => true
+
+[[test]]
+fn test_hashmap_strview_key() -> i32
+    var m: HashMap<StrView, i64> = hashmap_new<StrView, i64>()
+    m.insert("one", 1)
+    m.insert("two", 2)
+    if m.len() != 2
+        return 1
+    if get_or(@m, "one", -1) != 1 or get_or(@m, "two", -1) != 2
+        return 2
+    if not absent(@m, "three")
+        return 3
+    m.insert("one", 11)
+    if m.len() != 2 or get_or(@m, "one", -1) != 11
+        return 4
+    # Equal bytes from another buffer find the same key.
+    let s: StrView = "xxtwoxx"
+    if get_or(@m, strview_slice(s, 2, 5), -1) != 2
+        return 5
+    if not m.remove("two") or m.remove("two") or m.contains("two")
+        return 6
+    if m.len() != 1 or not m.contains("one")
+        return 7
+    hashmap_drop(@&m)
+    0
+
+[[test]]
+fn test_hashmap_struct_key_grow() -> i32
+    var m: HashMap<Pt, i64> = hashmap_new<Pt, i64>()
+    for i in 0..500
+        m.insert(Pt { x: i, y: -i }, i * 3)
+    if m.len() != 500
+        return 1
+    for i in 0..500
+        if get_or(@m, Pt { x: i, y: -i }, -1) != i * 3
+            return 2
+    if m.contains(Pt { x: 1, y: 1 })
+        return 3
+    hashmap_drop(@&m)
+    0
+
+[[test]]
+fn test_hashmap_collision_tomb() -> i32
+    var m: HashMap<Bad, i64> = hashmap_new<Bad, i64>()
+    for i in 0..10
+        m.insert(Bad { k: i }, i + 100)
+    if not m.remove(Bad { k: 3 })
+        return 1
+    if m.contains(Bad { k: 3 })
+        return 2
+    for i in 4..10
+        if get_or(@m, Bad { k: i }, -1) != i + 100
+            return 3
+    m.insert(Bad { k: 42 }, 7)
+    if m.len() != 10 or get_or(@m, Bad { k: 42 }, -1) != 7
+        return 4
+    for i in 0..10
+        m.remove(Bad { k: i })
+    if m.len() != 1 or get_or(@m, Bad { k: 42 }, -1) != 7
+        return 5
+    hashmap_drop(@&m)
+    0

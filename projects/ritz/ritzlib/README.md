@@ -77,7 +77,7 @@ pub fn main() -> i32
 | `fs.ritz` | `ritzlib.fs` | Filesystem utility functions |
 | `gvec.ritz` | `ritzlib.gvec` | Generic dynamic array |
 | `hash.ritz` | `ritzlib.hash` | Hashing utilities |
-| `hashmap.ritz` | `ritzlib.hashmap` | Hash map for i64 keys |
+| `hashmap.ritz` | `ritzlib.hashmap` | Hash maps: HashMap<K, V>, and HashMapI64 |
 | `io.ritz` | `ritzlib.io` | High-level I/O functions |
 | `iovec.ritz` | `ritzlib.iovec` | Vectored I/O for scatter/gather writes |
 | `json.ritz` | `ritzlib.json` | JSON Parser |

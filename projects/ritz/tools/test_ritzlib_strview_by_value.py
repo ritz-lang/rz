@@ -28,6 +28,11 @@ ALLOWED = {
     ("os/env.ritz", "env_get_p", "name"): (
         "the pointer form of env_get by design; by value it would be env_get"
     ),
+    # A trait impl's signature is the trait's: Hash and Eq take `@Self`, so
+    # a generic HashMap can call them on any K (#1858).
+    ("hash.ritz", "hash", "self"): "impl Hash for StrView: the trait's @Self",
+    ("hash.ritz", "equals", "self"): "impl Eq for StrView: the trait's @Self",
+    ("hash.ritz", "equals", "other"): "impl Eq for StrView: the trait's @Self",
 }
 
 FN_RE = re.compile(r"^\s*(?:pub\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)")

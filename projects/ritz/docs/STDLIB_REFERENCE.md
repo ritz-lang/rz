@@ -238,6 +238,22 @@ FNV-1a hash functions for use in HashMap and other data structures.
 | `hash_i64` | `fn(val: i64) -> u64` | Standalone hash for i64 |
 | `hash_u64` | `fn(val: u64) -> u64` | Standalone hash for u64 |
 
+**Traits**: what `HashMap<K, V>` needs of `K` (LANGUAGE_SPEC §11.5). `StrView`
+implements both, here in the traits' file (LARB R65).
+
+```ritz
+trait Hash
+    fn hash(self: @Self) -> u64
+
+trait Eq
+    fn equals(self: @Self, other: @Self) -> bool
+```
+
+`Eq`'s method is `equals`, not `eq`: a type has one method per name, and
+`StrView` already has a by-value `s.eq(t)`. A primitive can't implement either
+yet (LARB R36; revisit #4294), so there is no `HashMap<i64, V>`: use
+`HashMapI64`.
+
 ---
 
 ## Memory Management
@@ -578,7 +594,46 @@ struct String
 
 **Module**: `ritzlib.hashmap`
 
-Hash map for i64 keys and i64 values using open addressing with linear probing.
+Hash maps using open addressing with linear probing: the generic
+`HashMap<K: Hash + Eq, V>`, and `HashMapI64` for i64 keys and values.
+
+**`HashMap<K, V>`** (AGAST #1858) keeps its slots in a `Vec`. `K` needs
+`Hash` and `Eq` from `ritzlib.hash`; a key type without them is an error at
+the type argument. `get` returns `Option<V>`, so a missing key is `None`.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `hashmap_new<K, V>` | `fn() -> HashMap<K, V>` | Create with 16 slots |
+| `hashmap_with_cap<K, V>` | `fn(cap: i64) -> HashMap<K, V>` | Create with `cap` slots, rounded up to a power of 2 |
+| `hashmap_insert<K, V>` | `fn(m: @&HashMap<K, V>, key: K, value: V)` | Insert or overwrite |
+| `hashmap_get<K, V>` | `fn(m: @HashMap<K, V>, key: K) -> Option<V>` | The value, or `None` |
+| `hashmap_remove<K, V>` | `fn(m: @&HashMap<K, V>, key: K) -> bool` | Remove key (true if it was there) |
+| `hashmap_drop<K, V>` | `fn(m: @&HashMap<K, V>)` | Free the table |
+
+**Methods**: `len`, `insert`, `get`, `contains`, `remove`. The map has no
+`Drop` impl yet (its `Vec` hasn't either, #3614): free it with `hashmap_drop`.
+
+```ritz
+import ritzlib.hash
+import ritzlib.hashmap
+import ritzlib.option
+import ritzlib.strview
+
+fn main() -> i32
+    var m: HashMap<StrView, i64> = hashmap_new<StrView, i64>()
+    m.insert("one", 1)
+    m.insert("one", 2)
+    let one: i64 = match m.get("one")
+        Some(v) => v
+        None => -1
+    let two: i64 = match m.get("two")
+        Some(v) => v
+        None => 0
+    hashmap_drop(@&m)
+    (one + two - 2) as i32
+```
+
+**`HashMapI64`**:
 
 ```ritz
 enum Slot
