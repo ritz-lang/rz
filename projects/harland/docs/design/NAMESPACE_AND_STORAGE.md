@@ -1,5 +1,12 @@
 # Harland Namespace & Storage Architecture
 
+> **Status (AGAST #1881):** a design, not built. The kernel's namespace today
+> is goliath, bound by `kernel/src/fs/kfs.ritz` (see `../GOLIATH_INTEGRATION.md`):
+> one tree, no backends, visibility or capability checks. A first sketch of
+> this design (`fs/namespace.ritz`, `fs/backend.ritz`) was never wired in and
+> was deleted with the goliath forks; git has it. `knamespace` below means
+> that future layer.
+
 ## Overview
 
 Harland separates two distinct concerns that traditional Unix conflates:

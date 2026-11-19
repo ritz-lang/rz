@@ -1,15 +1,16 @@
 # Filesystem Syscalls
 #
 # Implements sys_open, sys_close, sys_read, sys_write for files.
-# Integrates with knamespace and the per-process fd tables (fs/fd.ritz).
+# Integrates with the kernel namespace (fs/kfs.ritz) and the per-process fd tables (fs/fd.ritz).
 
 import serial { StrView, prints }
 import fs.vfs { O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_TRUNC, O_APPEND }
 import fs.fd { FdTable, MAX_FDS, fd_table_init, fd_alloc, fd_free, fd_dup, fd_owner, fd_refs, fd_heir }
 import syscall.errno { Errno }
-import fs.knamespace { KNamespace, knamespace_get, knamespace_resolve, knamespace_read, knamespace_write, knamespace_exists, knamespace_mkdir }
-import fs.kblob { KBlobStore, KBlobId, kblob_id_is_zero, kblob_id_copy, kblob_store_get, kblob_store_get_size, kblob_get_store }
-import fs.kpath { strview_from_ptr }
+import fs.kfs { kfs_get, kfs_write, kfs_mkdir }
+import goliath.namespace { Namespace, namespace_resolve, namespace_store, namespace_hold, namespace_unhold }
+import goliath.blob_id { BlobId, blob_id_is_zero, blob_id_copy }
+import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size }
 import mm.heap { kalloc, kfree }
 
 # Syscall numbers are `enum Syscall` in syscall/numbers.ritz; main.ritz
@@ -36,8 +37,8 @@ import mm.heap { kalloc, kfree }
 
 # One open file.
 struct FsFile
-    blob_id: KBlobId        # The blob this fd refers to
-    data_ptr: *u8           # Cached pointer to blob data
+    blob_id: BlobId         # The blob this fd refers to, held while it is open
+    data_ptr: *u8           # The blob's bytes (the hold keeps them alive)
     size: u64               # File size
     position: u64           # Current read/write position
     flags: i32              # Open flags
@@ -191,27 +192,27 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     if p == 0 as *FsProc
         return Errno.Srch as i64
 
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
+    let ns: *Namespace = kfs_get()
+    if ns == 0 as *Namespace
         return Errno.Inval as i64
 
-    let path: StrView = strview_from_ptr(path_ptr, path_len as i64)
+    let path: StrView = StrView { ptr: path_ptr, len: path_len as i64 }
 
     # Resolve the path to a blob ID
-    var blob_id: KBlobId = knamespace_resolve(ns, path)
+    var blob_id: BlobId = namespace_resolve(ns, path)
 
     # Check if file exists
-    if kblob_id_is_zero(@blob_id)
+    if blob_id_is_zero(@blob_id)
         # File doesn't exist
         if (flags & O_CREAT) != 0
             # Create the file with empty content
             var empty: u8 = 0
-            let create_result: i32 = knamespace_write(ns, path, @empty, 0)
+            let create_result: i32 = kfs_write(ns, path, @empty, 0)
             if create_result != 0
                 return create_result as i64
             # Re-resolve to get the new blob ID
-            blob_id = knamespace_resolve(ns, path)
-            if kblob_id_is_zero(@blob_id)
+            blob_id = namespace_resolve(ns, path)
+            if blob_id_is_zero(@blob_id)
                 return Errno.NoEnt as i64
         else
             return Errno.NoEnt as i64
@@ -221,14 +222,18 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     if fd < 0
         return fd as i64
 
-    # Get the blob data
-    let store: *KBlobStore = kblob_get_store()
-    let data_ptr: *u8 = kblob_store_get(store, @blob_id)
-    let size: u64 = kblob_store_get_size(store, @blob_id)
+    # Hold the blob while the fd is open: a rewrite or delete of the path
+    # then can't free the bytes data_ptr points at (fs_close_file unholds).
+    if not namespace_hold(ns, @blob_id)
+        fd_free(@(*p).table, fd)
+        return Errno.NoEnt as i64
+    let store: *MemoryBlobStore = namespace_store(ns)
+    let data_ptr: *u8 = memory_store_get(store, @blob_id)
+    let size: u64 = memory_store_get_size(store, @blob_id)
 
     # Set up file state
     let f: *FsFile = @(*p).files[fd]
-    (*f).blob_id = kblob_id_copy(@blob_id)
+    (*f).blob_id = blob_id_copy(@blob_id)
     (*f).data_ptr = data_ptr
     (*f).size = size
     (*f).position = 0
@@ -252,6 +257,7 @@ pub fn sys_open(path_ptr: *u8, path_len: u64, flags: i32) -> i64
     if (flags & O_WRONLY) != 0 or (flags & O_RDWR) != 0
         let copy: *u8 = kalloc(path_len + 1)
         if copy == 0 as *u8
+            namespace_unhold(ns, @blob_id)
             fd_free(@(*p).table, fd)
             return Errno.NoMem as i64
         var i: u64 = 0
@@ -303,13 +309,17 @@ fn fs_close_file(p: *FsProc, fd: i32) -> i32
         kfree((*f).path)
         (*f).path = 0 as *u8
         (*f).path_len = 0
+    let ns: *Namespace = kfs_get()
+    if ns != 0 as *Namespace
+        namespace_unhold(ns, @(*f).blob_id)
+    (*f).data_ptr = 0 as *u8
     (*f).position = 0
     fd_free(@(*p).table, fd)
     flush_result
 
 # Move an open file's state from one fd's slot to another's.
 fn fs_file_move(src: *FsFile, dst: *FsFile)
-    (*dst).blob_id = kblob_id_copy(@(*src).blob_id)
+    (*dst).blob_id = blob_id_copy(@(*src).blob_id)
     (*dst).data_ptr = (*src).data_ptr
     (*dst).size = (*src).size
     (*dst).position = (*src).position
@@ -452,13 +462,13 @@ fn fs_flush_write_buffer(f: *FsFile) -> i32
         kfree(wbuf)
         return Errno.Io as i32  # no path to write back to
 
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
+    let ns: *Namespace = kfs_get()
+    if ns == 0 as *Namespace
         kfree(wbuf)
         return Errno.Io as i32
 
-    let path: StrView = strview_from_ptr((*f).path, (*f).path_len as i64)
-    let result: i32 = knamespace_write(ns, path, wbuf, wsize)
+    let path: StrView = StrView { ptr: (*f).path, len: (*f).path_len as i64 }
+    let result: i32 = kfs_write(ns, path, wbuf, wsize)
     kfree(wbuf)
     result
 
@@ -498,12 +508,12 @@ pub fn sys_lseek(fd: i32, offset: i64, whence: i32) -> i64
 # ============================================================================
 
 pub fn sys_mkdir(path_ptr: *u8, path_len: u64) -> i64
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
+    let ns: *Namespace = kfs_get()
+    if ns == 0 as *Namespace
         return Errno.Inval as i64
 
-    let path: StrView = strview_from_ptr(path_ptr, path_len as i64)
-    let result: i32 = knamespace_mkdir(ns, path)
+    let path: StrView = StrView { ptr: path_ptr, len: path_len as i64 }
+    let result: i32 = kfs_mkdir(ns, path)
     result as i64
 
 # ============================================================================

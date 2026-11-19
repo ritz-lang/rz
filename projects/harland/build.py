@@ -173,12 +173,7 @@ def find_ritz_sources(src_dir: Path) -> list[Path]:
         "net/dhcp.ritz",               # DHCP client
         "net/stack.ritz",              # Network stack orchestration
         # Filesystem modules (Goliath + VFS)
-        "fs/kpath.ritz",               # Path handling (no deps)
-        "fs/kdir_entry.ritz",          # Directory entry structure (no deps)
-        "fs/backend.ritz",             # Backend types (no deps)
-        "fs/kblob.ritz",               # Blob storage layer
-        "fs/knamespace.ritz",          # Namespace layer (legacy, blob-backed)
-        "fs/namespace.ritz",           # In-memory namespace tree (new!)
+        "fs/kfs.ritz",                 # goliath, bound to the kernel (#1881)
         "fs/vfs.ritz",                 # VFS layer
         "fs/syscall.ritz",             # Filesystem syscalls
         "fs/tar.ritz",                 # TAR archive parser

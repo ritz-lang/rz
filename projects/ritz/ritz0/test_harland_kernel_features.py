@@ -23,6 +23,7 @@ regression to the workaround fails the test that names it. The last test is
 the ticket's source-level acceptance scan.
 """
 
+import json
 import os
 import re
 import subprocess
@@ -30,6 +31,10 @@ import sys
 from pathlib import Path
 
 import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from resolve import package_import_namespaces, read_manifest  # noqa: E402
+
 
 pytestmark = pytest.mark.integration   # each fixture runs ritz0 (AGAST #1805)
 
@@ -40,13 +45,23 @@ KERNEL_SRC = HARLAND / "kernel" / "src"
 BOOT_SRC = HARLAND / "boot" / "src"
 
 
+def harland_deps_args() -> list[str]:
+    """`["--deps", <json>]`: harland's [dependencies] (goliath, cryptosec:
+    AGAST #1881), as `rz build harland` passes them to ritz0."""
+    deps = {name: {"path": str(spec.path), "sources": spec.sources}
+            for name, spec in package_import_namespaces(read_manifest(HARLAND), HARLAND).items()}
+    return ["--deps", json.dumps(deps)]
+
+
 def _compile(tmp_path_factory, rel, boot=False):
     """ritz0 IR of one harland module, compiled as `rz build harland` would."""
     out = tmp_path_factory.mktemp("harland_ir") / (Path(rel).stem + ".ll")
     if boot:
         src, sources, target, extra = BOOT_SRC / rel, '["boot/src"]', "x86_64-unknown-uefi", []
     else:
-        src, sources, target, extra = KERNEL_SRC / rel, '["kernel/src"]', "x86_64-none-elf", ["--no-runtime"]
+        # The kernel imports its [dependencies] (goliath, cryptosec: #1881)
+        src, sources, target = KERNEL_SRC / rel, '["kernel/src"]', "x86_64-none-elf"
+        extra = ["--no-runtime", *harland_deps_args()]
     proc = subprocess.run(
         [sys.executable, str(RITZ0), str(src), "-o", str(out), *extra,
          "--project-root", str(HARLAND), "--sources", sources, "--target", target],

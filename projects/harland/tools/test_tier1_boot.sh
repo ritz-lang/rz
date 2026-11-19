@@ -27,6 +27,12 @@
 # request 100 ms late. A spin-count poll gave up after ~40 ms of TCG time, and
 # far less on a loaded host (AGAST #4078), so the store must still come up.
 #
+# The grub boot's second virtio-blk disk is a real, blank qcow2 that a third
+# boot, grub-reboot, boots again (AGAST #1881): the kernel's namespace is
+# goliath, restored from that disk's goliath image at boot, and each boot
+# counts itself in /var/boots and saves the image. The first boot must log
+# "boot 1" and the reboot "boot 2": what one boot saved, the next one loaded.
+#
 # A boot fails as a hang when its serial log stops growing for BOOT_STALL
 # seconds, not after a fixed time: on a host at load ~100 a TCG boot ran 10x
 # slower and overran a fixed 60 s, though it was still making progress
@@ -437,6 +443,20 @@ high_memory() {
     echo "PASS ($1): $free_mb MB free; pages above 4 GiB allocated and touched through the physmap"
 }
 
+# persisted NAME N: pass only if boot NAME restored the goliath image the
+# boot before saved, so this is boot N of the storage disk (#1881).
+persisted() {
+    local got
+    got="$(grep -aoE '\[OK\] Persistent storage \(goliath image: boot [0-9]+' "$WORK/$1.log" | head -1 | grep -oE '[0-9]+$')"
+    if [ "$got" = "$2" ]; then
+        echo "PASS ($1): goliath image on the storage disk: boot $2"
+    else
+        grep -aE "Persistent storage|kfs:" "$WORK/$1.log" | head -5
+        echo "FAIL ($1): want boot $2 of the storage disk, got ${got:-no count}"
+        return 1
+    fi
+}
+
 # all_passed NAME: pass only if the kernel took no exception and the suite
 # reported ALL TESTS PASSED.
 all_passed() {
@@ -480,7 +500,11 @@ EOF
     grub-mkstandalone -O x86_64-efi -o "$WORK/esp-grub/EFI/BOOT/BOOTX64.EFI" \
         "boot/grub/grub.cfg=$WORK/grub.cfg" "boot/harland.elf=$KERNEL_ELF" \
         || setup_error "grub-mkstandalone failed"
-    boot grub "$WORK/esp-grub" "" || rc=1
+    qemu-img create -q -f qcow2 "$WORK/storage.qcow2" 64M \
+        || { echo "FAIL: qemu-img create failed"; exit 1; }
+    STORAGE=(-drive "file=$WORK/storage.qcow2,format=qcow2,if=none,id=storage"
+             -device "virtio-blk-pci,drive=storage")
+    boot grub "$WORK/esp-grub" "" "${STORAGE[@]}" || rc=1
     # The framebuffer must come from the multiboot2 tag, not just be absent
     # and tolerated (#2143).
     if grep -aq "\[OK\] Display driver" "$WORK/grub.log"; then
@@ -494,7 +518,12 @@ EOF
     key_received grub || rc=1
     preempted grub || rc=1
     powered_off grub || rc=1
+    persisted grub 1 || rc=1
     [ "$HIGH_MEM" = 1 ] && { high_memory grub || rc=1; }
+    # The same storage disk, booted again: the image survives the reboot
+    boot grub-reboot "$WORK/esp-grub" "" "${STORAGE[@]}" || rc=1
+    all_passed grub-reboot || rc=1
+    persisted grub-reboot 2 || rc=1
 fi
 
 exit $rc

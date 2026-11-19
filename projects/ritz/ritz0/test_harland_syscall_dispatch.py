@@ -28,6 +28,9 @@ from pathlib import Path
 
 import pytest
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from resolve import package_import_namespaces, read_manifest  # noqa: E402
+
 import fast_link
 
 from ritz0_inproc import run_ritz0
@@ -39,6 +42,14 @@ RITZ_ROOT = RITZ0_DIR.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
 RITZ_START = RITZ_ROOT / "runtime" / "ritz_start.x86_64.o"
 HARLAND = RITZ_ROOT.parent / "harland"
+
+
+def harland_deps_args() -> list[str]:
+    """`["--deps", <json>]`: harland's [dependencies] (goliath, cryptosec:
+    AGAST #1881), as `rz build harland` passes them to ritz0."""
+    deps = {name: {"path": str(spec.path), "sources": spec.sources}
+            for name, spec in package_import_namespaces(read_manifest(HARLAND), HARLAND).items()}
+    return ["--deps", json.dumps(deps)]
 KERNEL_SRC = HARLAND / "kernel" / "src"
 # syscall_init, syscall_table_init and syscall_handler moved here from main.ritz (#2751).
 ENTRY = KERNEL_SRC / "syscall" / "runtime" / "entry.ritz"
@@ -232,7 +243,7 @@ def test_syscall_init_fills_the_table(tmp_path):
     proc = subprocess.run(
         [sys.executable, str(RITZ0_DIR / "ritz0.py"), str(ENTRY), "-o", str(out),
          "--no-runtime", "--project-root", str(HARLAND), "--sources", '["kernel/src"]',
-         "--target", "x86_64-none-elf"],
+         "--target", "x86_64-none-elf", *harland_deps_args()],
         capture_output=True, text=True, cwd=RITZ0_DIR, timeout=300,
         env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)))
     assert proc.returncode == 0 and out.exists(), proc.stdout + proc.stderr

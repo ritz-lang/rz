@@ -13,9 +13,10 @@
 
 import serial { StrView, prints, serial_print_dec }
 import io { halt_loop }
-import fs.knamespace { KNamespace, knamespace_get, knamespace_mkdir, knamespace_write, KNS_OK }
+import fs.kfs { KFS_OK, kfs_get, kfs_mkdir, kfs_write }
+import goliath.namespace { Namespace }
 import syscall.errno { Errno }
-import fs.kpath { strview_from_ptr }
+import ritzlib.strview { strview_from_ptr }
 import fs.tar { TarEntry, TAR_ENTRY_SIZE, TAR_BLOCK_SIZE, TAR_TYPE_FILE, TAR_TYPE_FILE_ALT, TAR_TYPE_DIRECTORY, tar_parse_header, tar_data_blocks }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_read }
 import mm.heap { kalloc, kfree }
@@ -79,8 +80,8 @@ fn initramfs_load_from_disk() -> i32
             prints("[initramfs] No boot image and no VirtIO block device\n" as StrView)
             return -1
 
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
+    let ns: *Namespace = kfs_get()
+    if ns == 0 as *Namespace
         prints("[initramfs] No namespace\n" as StrView)
         return -2
 
@@ -201,7 +202,7 @@ fn tar_to_absolute_path(tar_path: *StrView, out_buf: *u8, max_len: i64) -> i64
     i + 1
 
 # Load a file's data from TAR archive
-fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, data_sector: u64) -> i32
+fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *Namespace, entry: *TarEntry, data_sector: u64) -> i32
     let size: u64 = (*entry).size
 
     # Convert TAR path to absolute path
@@ -217,10 +218,10 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
     if size == 0
         # Empty file
         let empty: u8 = 0
-        var empty_result: i32 = knamespace_write(ns, abs_path, @empty as *u8, 0)
+        var empty_result: i32 = kfs_write(ns, abs_path, @empty as *u8, 0)
         if empty_result == Errno.NoEnt as i32
             ensure_parent_dirs(ns, @abs_path_buf[0], abs_len)
-            empty_result = knamespace_write(ns, abs_path, @empty as *u8, 0)
+            empty_result = kfs_write(ns, abs_path, @empty as *u8, 0)
         return empty_result
 
     # Allocate buffer for file contents - round up to sector boundary
@@ -264,14 +265,14 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
 
     # Create file in namespace. A TAR may list a file before its directory,
     # or never list the directory: create the parents and retry once.
-    var write_result: i32 = knamespace_write(ns, abs_path, file_buf, size)
+    var write_result: i32 = kfs_write(ns, abs_path, file_buf, size)
     if write_result == Errno.NoEnt as i32
         ensure_parent_dirs(ns, @abs_path_buf[0], abs_len)
-        write_result = knamespace_write(ns, abs_path, file_buf, size)
+        write_result = kfs_write(ns, abs_path, file_buf, size)
     kfree(file_buf)
 
-    if write_result != KNS_OK
-        prints("[initramfs] knamespace_write failed for " as StrView)
+    if write_result != KFS_OK
+        prints("[initramfs] kfs_write failed for " as StrView)
         prints(abs_path)
         prints(" error=" as StrView)
         serial_print_dec(write_result as u64)
@@ -281,7 +282,7 @@ fn load_file_from_tar(dev: *VirtioBlkDevice, ns: *KNamespace, entry: *TarEntry, 
 
 # Process a directory entry
 # TAR paths are like "./var/log/" - we need to convert to "/var/log"
-fn process_directory(ns: *KNamespace, path: *StrView) -> i32
+fn process_directory(ns: *Namespace, path: *StrView) -> i32
     var abs_path_buf: [256]u8
     let abs_len: i64 = tar_to_absolute_path(path, @abs_path_buf[0], 256)
 
@@ -289,7 +290,7 @@ fn process_directory(ns: *KNamespace, path: *StrView) -> i32
         return 0  # Root directory, nothing to create
 
     let abs_path: StrView = strview_from_ptr(@abs_path_buf[0], abs_len)
-    knamespace_mkdir(ns, abs_path)
+    kfs_mkdir(ns, abs_path)
 
 # Read `count` sectors, retrying up to READ_ATTEMPTS times so one transient
 # virtio error doesn't fail the boot. Returns 0 or the last error.
@@ -330,11 +331,11 @@ fn read_boot_image(sector: u64, count: u32, buf: *u8) -> i32
 # Create every missing ancestor directory of the absolute path `path`
 # (len bytes), outermost first. Stops at the first mkdir that fails for a
 # reason other than the directory already existing.
-fn ensure_parent_dirs(ns: *KNamespace, path: *u8, len: i64)
+fn ensure_parent_dirs(ns: *Namespace, path: *u8, len: i64)
     var i: i64 = 1
     while i < len
         if *(path + i) == 47
-            let r: i32 = knamespace_mkdir(ns, strview_from_ptr(path, i))
-            if r != KNS_OK and r != Errno.Exist as i32
+            let r: i32 = kfs_mkdir(ns, strview_from_ptr(path, i))
+            if r != KFS_OK and r != Errno.Exist as i32
                 return
         i = i + 1

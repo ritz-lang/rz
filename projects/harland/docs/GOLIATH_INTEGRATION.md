@@ -1,169 +1,61 @@
-# Goliath Filesystem Integration Plan
+# Goliath in the Harland kernel
 
-## Overview
+The kernel's filesystem **is goliath** (`projects/goliath`), the same code
+goliath's Linux tests run. Until AGAST #1881 this file planned, and the kernel
+carried, ports of it (`fs/kblob`, `fs/kpath`, `fs/kdir_entry`,
+`fs/knamespace`, plus a copy of cryptosec's SHA-256 in `lib/sha256.ritz`),
+because goliath and cryptosec imported the hosted ritzlib (`ritzlib.sys`).
+The forks drifted: goliath lost nested writes (LARB v4 M13) that the kernel
+port had fixed, and the kernel kept a second on-disk format (`HARBLOB`) that
+was never restored at boot. #1881 removed all of them.
 
-Goliath is a content-addressable filesystem. Integration with Harland requires:
-1. **Kernel-space blob store** for boot-time filesystem access
-2. **VFS abstraction** for userspace filesystem operations
-3. **Ring 2 filesystem service** for runtime operations
+## How the kernel binds goliath
 
-## Current State
+`kernel/src/fs/kfs.ritz` is the only kernel-specific filesystem code:
 
-### Goliath
-- `BlobStore`: Content-addressed storage (hash → data)
-- `Namespace`: Path → BlobId mapping
-- Uses `sys_mmap()` for memory allocation (Linux syscalls)
+| goliath needs | the kernel gives it |
+|---------------|---------------------|
+| `goliath.alloc.Allocator` (memory for blobs and buffers) | `kalloc` / `kfree` |
+| `goliath.block_store.BlockDevice` (512-byte sectors) | the second virtio-blk device (`virtio_blk_read` / `virtio_blk_write`) |
+| ritzlib core's platform hooks (`ritz_platform_page_map` / `_unmap` / `_fatal`) | `kernel/src/platform.ritz`: the kernel heap, and a panic |
 
-### Harland Kernel
-- `kalloc()`/`kfree()`: Kernel heap allocator
-- `pmm_alloc_page()`/`pmm_free_page()`: Physical memory
-- VirtIO block driver for disk access
+It also maps goliath's `ErrorCode`s to the `Errno`s syscalls return, and
+keeps the one global `Namespace` (`kfs_get`). Syscalls, the initramfs loader
+and exec call goliath's `namespace_*` through it.
 
-## Integration Phases
+## Boot order
 
-### Phase 1: Kernel Blob Store (Boot-time)
+1. `virtio_blk_init_nth(1)`: the storage disk, if there is one.
+2. `kfs_init(storage)`: restore the namespace from the disk's goliath image
+   (`block_store_load`); a blank disk, or none, starts an empty tree.
+3. `kfs_record_boot()`: count this boot in `/var/boots` and save the image
+   (`block_store_save`). The log says
+   `[OK] Persistent storage (goliath image: boot N, M blobs)`.
+4. The initramfs loads on top, so the saved image holds what was written,
+   not the boot binaries.
 
-Create `kernel/src/fs/kblob.ritz`:
-- `KBlobStore` using `kalloc()` instead of `sys_mmap()`
-- Minimal subset for reading initramfs
-- No persistence (RAM-only for now)
+`tools/test_tier1_boot.sh` boots the GRUB image twice on one blank qcow2
+storage disk and requires `boot 1`, then `boot 2`.
 
-```ritz
-# Kernel blob store using kalloc
-pub struct KBlobStore
-    entries: *KBlobEntry
-    capacity: i32
-    count: i32
+## One on-disk format
 
-pub fn kblob_store_new() -> KBlobStore
-    let entries: *KBlobEntry = kalloc(64 * 56) as *KBlobEntry
-    # ...
+goliath's image (`goliath.image`) is the only format: in a host file
+(`goliath.file_store`) or behind two crash-safe slot headers on a block device
+(`goliath.block_store`, "GOLIATHB"). Only live blobs are written, so deleting a
+file frees its space at the next save. The initramfs is still a TAR, read
+once at boot.
 
-pub fn kblob_store_put(store: *KBlobStore, data: *u8, size: u64) -> BlobId
-pub fn kblob_store_get(store: *KBlobStore, id: *BlobId) -> *u8
-```
+## Open files and GC
 
-### Phase 2: VFS Abstraction
+goliath frees a blob when nothing references it (refcounts, #1881). An open
+fd keeps a pointer to its file's bytes, so `sys_open` holds the blob
+(`namespace_hold`) and the last close drops it (`namespace_unhold`). A rewrite
+or delete of the path then can't free the bytes under a reader.
 
-Create `kernel/src/fs/vfs.ritz`:
-- Abstract filesystem operations
-- Multiple backend support (Goliath, devfs, procfs)
+## Not done yet
 
-```ritz
-pub struct VfsOps
-    open: fn(*u8, u64, i32) -> i32
-    read: fn(i32, *u8, u64) -> i64
-    write: fn(i32, *u8, u64) -> i64
-    close: fn(i32) -> i32
-    stat: fn(*u8, u64, *Stat) -> i32
-
-pub fn vfs_register_fs(name: *u8, ops: *VfsOps) -> i32
-pub fn vfs_mount(source: *u8, target: *u8, fstype: *u8) -> i32
-```
-
-### Phase 3: Initramfs Loading
-
-At boot:
-1. Load initramfs from VirtIO disk (or embedded in kernel)
-2. Parse as Goliath namespace blob
-3. Mount at `/`
-
-```ritz
-# In kernel_main()
-kblob_store_init()
-initramfs_load()
-vfs_mount("goliath://boot", "/", "goliath")
-```
-
-### Phase 4: Ring 2 Filesystem Service
-
-Once userspace works:
-1. Goliath runs as Ring 2 service
-2. Kernel forwards syscalls via IPC
-3. Goliath uses shared memory for zero-copy I/O
-
-## Allocator Abstraction
-
-To share code between kernel and userspace Goliath:
-
-```ritz
-# goliath/src/alloc.ritz
-pub struct Allocator
-    alloc: fn(u64) -> *u8
-    free: fn(*u8, u64)
-
-# Kernel provides:
-pub fn kernel_allocator() -> Allocator
-    Allocator {
-        alloc: kalloc,
-        free: kfree_sized
-    }
-
-# Userspace provides:
-pub fn user_allocator() -> Allocator
-    Allocator {
-        alloc: mmap_alloc,
-        free: munmap_free
-    }
-```
-
-## File Descriptors
-
-The kernel needs to track open files:
-
-```ritz
-# kernel/src/fs/fd.ritz
-pub struct FileDescriptor
-    inode: u64           # Or BlobId for Goliath
-    position: u64        # Current read/write offset
-    flags: u32           # O_RDONLY, O_WRONLY, etc.
-    refcount: i32
-
-# Per-process file descriptor table
-pub struct FdTable
-    fds: [64]FileDescriptor
-    count: i32
-```
-
-## Syscalls
-
-New syscalls for filesystem:
-
-| # | Name | Description |
-|---|------|-------------|
-| 10 | sys_open | Open file |
-| 11 | sys_close | Close file descriptor |
-| 12 | sys_read | Read from file |
-| 13 | sys_write | Write to file |
-| 14 | sys_lseek | Seek in file |
-| 15 | sys_stat | Get file info |
-| 16 | sys_mkdir | Create directory |
-| 17 | sys_readdir | List directory |
-
-## Testing Strategy
-
-1. Unit tests in Goliath project (host mode)
-2. Kernel integration tests in QEMU:
-   - Load test blobs into KBlobStore
-   - Verify read/write operations
-   - Test VFS mount/unmount
-
-## Dependencies
-
-- [x] Kernel heap (`kalloc`/`kfree`)
-- [x] VirtIO block driver
-- [ ] Kernel blob store (`kblob`)
-- [ ] VFS abstraction
-- [ ] File descriptor management
-- [ ] Syscall handlers
-
-## Timeline
-
-| Phase | Work | Estimate |
-|-------|------|----------|
-| 1 | Kernel blob store | 2-3 hours |
-| 2 | VFS abstraction | 2-3 hours |
-| 3 | Initramfs loading | 3-4 hours |
-| 4 | Ring 2 service | 4-6 hours |
-
-Total: ~12-16 hours of focused work
+- Nothing saves after boot: files written at run time persist only if a later
+  boot's save includes them. A `sync` syscall, or a save on close, is
+  follow-up work.
+- Saves write the whole namespace. Once run-time saves exist, they will also
+  write the initramfs binaries.

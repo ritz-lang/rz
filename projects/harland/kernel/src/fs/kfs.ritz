@@ -1,0 +1,210 @@
+# Kernel filesystem: goliath, bound to the kernel (AGAST #1881)
+#
+# The kernel's filesystem is goliath itself, the same code goliath's Linux
+# tests run, not a fork of it (the kpath / kdir_entry / knamespace / kblob
+# forks and a copy of cryptosec's SHA-256 lived here until #1881). This
+# module only binds it to the kernel:
+#
+#   * memory: a goliath Allocator over the kernel heap (kalloc / kfree)
+#   * disk:   a goliath BlockDevice over a virtio-blk device; the namespace
+#             is restored from it at boot and saved with kfs_save, in
+#             goliath's one on-disk image format (goliath.block_store)
+#   * errors: goliath's ErrorCodes become Errno values for the syscall layer
+#
+# One global namespace (kfs_get). Calls take the *Namespace so callers read
+# like the goliath API they wrap.
+
+import serial { StrView, prints, serial_print_dec }
+import mm.heap { kalloc, kfree }
+import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_read, virtio_blk_write }
+import syscall.errno { Errno }
+import ritzlib.span { Span, span_from_ptr }
+import ritzlib.memory { Allocator }
+import goliath.blob_store { MemoryBlobStore, memory_store_new_in, memory_store_count }
+import goliath.namespace { Namespace, namespace_new, namespace_exists, namespace_read, namespace_write, namespace_mkdir, namespace_list }
+import goliath.block_store { BlockDevice, block_store_save, block_store_load }
+import goliath.dir_entry { DirEntry }
+import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_ALREADY_EXISTS, ERR_INVALID_PATH, ERR_OUT_OF_SPACE, ERR_NOT_A_DIRECTORY, ERR_NOT_A_FILE, ERR_DIRECTORY_NOT_EMPTY, ERR_PERMISSION_DENIED, ERR_PATH_TOO_LONG }
+
+pub const KFS_OK: i32 = 0
+
+# ============================================================================
+# Allocator and block device
+# ============================================================================
+
+fn kfs_alloc(ctx: *u8, len: i64) -> *u8
+    kalloc(len as u64)
+
+fn kfs_free(ctx: *u8, p: *u8, len: i64) -> i32
+    kfree(p)
+
+fn kfs_allocator() -> Allocator
+    Allocator { ctx: null, alloc: kfs_alloc, free: kfs_free }
+
+fn kfs_dev_read(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    virtio_blk_read(dev as *VirtioBlkDevice, lba, count, buf)
+
+fn kfs_dev_write(dev: *u8, lba: u64, count: u32, buf: *u8) -> i32
+    virtio_blk_write(dev as *VirtioBlkDevice, lba, count, buf)
+
+# ============================================================================
+# Errors
+# ============================================================================
+
+# A goliath ErrorCode as the Errno a syscall returns (`as i32`; 0 for ERR_OK)
+pub fn kfs_errno(code: ErrorCode) -> i32
+    if code == ERR_OK
+        return KFS_OK
+    if code == ERR_NOT_FOUND
+        return Errno.NoEnt as i32
+    if code == ERR_ALREADY_EXISTS
+        return Errno.Exist as i32
+    if code == ERR_INVALID_PATH
+        return Errno.Inval as i32
+    if code == ERR_OUT_OF_SPACE
+        return Errno.NoSpc as i32
+    if code == ERR_NOT_A_DIRECTORY
+        return Errno.NotDir as i32
+    if code == ERR_NOT_A_FILE
+        return Errno.IsDir as i32
+    if code == ERR_DIRECTORY_NOT_EMPTY
+        return Errno.NotEmpty as i32
+    if code == ERR_PERMISSION_DENIED
+        return Errno.Perm as i32
+    if code == ERR_PATH_TOO_LONG
+        return Errno.NameTooLong as i32
+    Errno.Io as i32
+
+# ============================================================================
+# The global namespace
+# ============================================================================
+
+var g_kfs_store: MemoryBlobStore
+var g_kfs_ns: Namespace
+var g_kfs_dev: BlockDevice
+var g_kfs_has_dev: u8 = 0
+var g_kfs_initialized: u8 = 0
+
+# Start the kernel namespace. With a storage device, restore the tree its
+# goliath image holds; a blank device (or none) starts an empty tree. 0, or
+# -1 if the root directory can't be allocated. A device whose image is
+# damaged or unreadable is logged and not used, so a save can't replace
+# what may still be recoverable.
+pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
+    if g_kfs_initialized != 0
+        return 0
+    g_kfs_store = memory_store_new_in(kfs_allocator())
+    if storage != 0 as *VirtioBlkDevice
+        g_kfs_dev = BlockDevice { dev: storage as *u8, sectors: (*storage).capacity, read: kfs_dev_read, write: kfs_dev_write }
+        let rc: ErrorCode = block_store_load(@g_kfs_dev, @g_kfs_store, @g_kfs_ns)
+        if rc == ERR_OK
+            g_kfs_has_dev = 1
+            g_kfs_initialized = 1
+            return 0
+        if rc == ERR_NOT_FOUND
+            g_kfs_has_dev = 1
+        else
+            prints("kfs: storage image unreadable (goliath error " as StrView)
+            serial_print_dec(rc as u64)
+            prints("); not using it\n" as StrView)
+            # A failed load may have stored part of the image
+            g_kfs_store = memory_store_new_in(kfs_allocator())
+    g_kfs_ns = namespace_new(@g_kfs_store)
+    if namespace_exists(@g_kfs_ns, "/") == false
+        return -1
+    g_kfs_initialized = 1
+    0
+
+# The kernel namespace (null before kfs_init)
+pub fn kfs_get() -> *Namespace
+    if g_kfs_initialized == 0
+        return 0 as *Namespace
+    @g_kfs_ns
+
+# Whether the namespace has a storage device to save to
+pub fn kfs_has_storage() -> bool
+    g_kfs_initialized != 0 and g_kfs_has_dev != 0
+
+# Blobs the namespace holds
+pub fn kfs_blob_count() -> i32
+    memory_store_count(@g_kfs_store)
+
+# Save the whole namespace to the storage device: 0, or an Errno (NoDev
+# without one). A save cut short leaves the previous image loadable.
+pub fn kfs_save() -> i32
+    if not kfs_has_storage()
+        return Errno.NoDev as i32
+    kfs_errno(block_store_save(@g_kfs_dev, @g_kfs_ns))
+
+# ============================================================================
+# Namespace calls with kernel-shaped results
+# ============================================================================
+
+# A file's bytes (null if `path` isn't stored), its size in *out_size. The
+# pointer is the blob's: valid until the file is rewritten or deleted.
+pub fn kfs_read(ns: *Namespace, path: StrView, out_size: *u64) -> *u8
+    let data: Span<u8> = namespace_read(ns, path)
+    *out_size = data.len as u64
+    data.ptr
+
+# Write (create or replace) a file: 0 or an Errno
+pub fn kfs_write(ns: *Namespace, path: StrView, data: *u8, size: u64) -> i32
+    let bytes: Span<u8> = span_from_ptr<u8>(data, size as i64)
+    kfs_errno(namespace_write(ns, path, @bytes))
+
+# Create a directory: 0 or an Errno (Exist if it is already there)
+pub fn kfs_mkdir(ns: *Namespace, path: StrView) -> i32
+    kfs_errno(namespace_mkdir(ns, path))
+
+# Copy up to `max_entries` of directory `path`'s entries: its entry count, or
+# Errno.NoEnt / Errno.NotDir.
+pub fn kfs_list(ns: *Namespace, path: StrView, entries: *DirEntry, max_entries: i32) -> i32
+    let count: i32 = namespace_list(ns, path, entries, max_entries)
+    if count >= 0
+        return count
+    if namespace_exists(ns, path)
+        return Errno.NotDir as i32
+    Errno.NoEnt as i32
+
+# ============================================================================
+# Boot record
+# ============================================================================
+
+# Count this boot in /var/boots (a decimal number) and save the namespace to
+# the storage device, so each boot's count is one more than the last boot's
+# when the image survived the reboot. The boot gate checks exactly that
+# (tools/test_tier1_boot.sh). The count, or an Errno.
+pub fn kfs_record_boot() -> i64
+    let ns: *Namespace = kfs_get()
+    if ns == 0 as *Namespace
+        return Errno.NoDev as i64
+    let rc: i32 = kfs_mkdir(ns, "/var")
+    if rc != KFS_OK and rc != Errno.Exist as i32
+        return rc as i64
+    var size: u64 = 0
+    let old: *u8 = kfs_read(ns, "/var/boots", @size)
+    var boots: u64 = 0
+    var i: u64 = 0
+    while i < size and old != 0 as *u8
+        let c: u8 = *(old + i)
+        if c < 48 or c > 57
+            break
+        boots = boots * 10 + (c - 48) as u64
+        i = i + 1
+    boots = boots + 1
+
+    # Decimal digits, most significant first
+    var digits: [20]u8
+    var n: i64 = 0
+    var v: u64 = boots
+    while v > 0
+        digits[19 - n] = (v % 10) as u8 + 48
+        v = v / 10
+        n = n + 1
+    let wrc: i32 = kfs_write(ns, "/var/boots", @digits[20 - n], n as u64)
+    if wrc != KFS_OK
+        return wrc as i64
+    let src: i32 = kfs_save()
+    if src != KFS_OK
+        return src as i64
+    boots as i64

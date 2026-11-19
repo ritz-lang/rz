@@ -5,8 +5,9 @@ projects/harland/tools/test_nvme_boot.sh boots the kernel under OVMF with two
 QEMU NVMe controllers and no virtio-blk: harland-root holds the initramfs,
 harland-data a 4 MiB disk with a known sector pattern. It passes only if the
 kernel's NVMe driver logs the right size and FNV-1a of LBAs 1-200 for
-harland-data, the initramfs loads, persistent storage formats harland-data
-(its magic is in the image afterwards) and init's Tier-1 suite passes.
+harland-data, the initramfs loads, persistent storage saves a goliath image to
+harland-data (its header and image magic are on the disk afterwards, AGAST
+#1881) and init's Tier-1 suite passes.
 
 AGAST #4088: a second CI step runs the same boot with NVME_LBA_SIZE=4096
 (QEMU `logical_block_size=4096` on both controllers), so the driver must
@@ -48,9 +49,10 @@ NVME_SCRIPT = "projects/harland/tools/test_nvme_boot.sh"
 MSIX_SCRIPT = "projects/harland/tools/test_msix_boot.sh"
 
 # The QEMU stub writes $FAKE_SERIAL to the `-serial file:PATH` it was given;
-# with FAKE_PERSIST=1 it also writes the persist superblock magic into the
-# drive with id=data, as the kernel's NVMe writes would, and with
-# FAKE_CLOBBER=1 zeroes sector 66 (a write that skipped read-modify-write).
+# with FAKE_PERSIST=1 it also writes a goliath block-store header (sector 0:
+# "GOLIATHB", image at sector 2, 100 bytes) and the image magic ("GOLIATHS",
+# sector 2) into the drive with id=data, as the kernel's NVMe writes would, and
+# with FAKE_CLOBBER=1 zeroes sector 1 (a write that skipped read-modify-write).
 # Then it idles until killed. Every argv goes to $STUB_LOG.
 QEMU_STUB = r"""#!/usr/bin/env bash
 echo "$@" >> "$STUB_LOG"
@@ -60,9 +62,11 @@ for a in "$@"; do
     if [ "$prev" = "-drive" ] && [ "${FAKE_PERSIST:-0}" = 1 ]; then
         case "$a" in *id=data*)
             f="${a#file=}"; f="${f%%,*}"
-            printf '\0HARBLOB' | dd of="$f" conv=notrunc status=none
+            printf 'GOLIATHB' | dd of="$f" conv=notrunc status=none
+            printf '\x02\0\0\0\0\0\0\0\x64\0\0\0\0\0\0\0' | dd of="$f" bs=1 seek=24 conv=notrunc status=none
+            printf 'GOLIATHS' | dd of="$f" bs=1 seek=1024 conv=notrunc status=none
             if [ "${FAKE_CLOBBER:-0}" = 1 ]; then
-                dd if=/dev/zero of="$f" bs=512 seek=66 count=1 conv=notrunc status=none
+                dd if=/dev/zero of="$f" bs=512 seek=1 count=1 conv=notrunc status=none
             fi ;;
         esac
     fi
@@ -97,7 +101,7 @@ def nvme_line(sectors: int = 8192, fnv: int | None = None, lba: int = 512) -> st
 
 
 INITRAMFS = r"[initramfs] Loaded 42 entries\n"
-PERSIST = r"  [OK] Persistent storage (0 blobs)\n"
+PERSIST = r"  [OK] Persistent storage (goliath image: boot 1, 3 blobs)\n"
 # No \harland\net-selftest on this ESP, so the kernel leaves the NIC alone
 # before init (AGAST #4335); test_nvme_boot.sh requires this line.
 NET_SKIPPED = r"[net] Network self-tests skipped: boot option off\n"
@@ -260,11 +264,11 @@ def test_initramfs_not_loaded_fails(tree):
 
 @pytest.mark.integration
 def test_persist_magic_missing_from_the_image_fails(tree):
-    """The kernel says persist came up, but nothing reached the disk: the
-    mutation that drops the NVMe write command's doorbell."""
+    """The kernel says persistent storage came up, but nothing reached the
+    disk: the mutation that drops the NVMe write command's doorbell."""
     r = _run(tree, PASSED, persist=False)
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "persistent storage did not come up" in r.stdout
+    assert "did not save a goliath image" in r.stdout
 
 
 @pytest.mark.integration
@@ -347,8 +351,9 @@ def test_unknown_lba_size_is_refused(tree):
 
 @pytest.mark.integration
 def test_sectors_beside_persists_writes_must_keep_the_pattern(tree):
-    """Persist writes sectors 0-64; on 4 KiB LBAs sector 64 shares LBA 8 with
-    65-71, so a write without read-modify-write zeroes them."""
+    """goliath writes its header to sector 0 alone; on 4 KiB LBAs sector 1
+    (the unused second header) shares LBA 0 with it, so a write without
+    read-modify-write zeroes it."""
     r = _run(tree, PASSED_4K, env_extra={"NVME_LBA_SIZE": "4096", "FAKE_CLOBBER": "1"})
     assert r.returncode == 1, r.stdout + r.stderr
-    assert "clobbered: 66" in r.stdout
+    assert "clobbered: 1" in r.stdout

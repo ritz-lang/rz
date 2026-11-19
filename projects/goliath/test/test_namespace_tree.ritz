@@ -7,9 +7,10 @@
 
 import ritzlib.strview { StrView }
 import ritzlib.span { Span, span_from_ptr }
-import goliath.blob_store { MemoryBlobStore, memory_store_free, memory_store_count }
+import goliath.blob_id { BlobId }
+import goliath.blob_store { MemoryBlobStore, memory_store_free, memory_store_count, memory_store_get }
 import goliath.hosted { memory_store_new }
-import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists }
+import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve, namespace_hold, namespace_unhold }
 import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_DIRECTORY_NOT_EMPTY, ERR_NOT_A_FILE }
 
 # 1 if `path` reads back exactly the `len` bytes at `want`.
@@ -99,5 +100,39 @@ fn test_overwrite_reclaims_superseded_blobs() -> i32
     # root, /log and /log/cur
     assert memory_store_count(@store) == 3
     assert reads_back(@ns, "/log/cur", @buf[0], 2)
+    memory_store_free(@store)
+    0
+
+# A held blob outlives the tree that named it (the kernel holds each open
+# file's blob, so a rewrite or delete can't free it under a reader), and is
+# freed, a directory with the children only it still names, on unhold.
+[[test]]
+fn test_hold_outlives_overwrite_and_delete() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var ns: Namespace = namespace_new(@store)
+    let empty: i32 = memory_store_count(@store)
+    assert write_cstr(@ns, "/f", c"old", 3) == ERR_OK
+    var file: BlobId = namespace_resolve(@ns, "/f")
+    assert namespace_hold(@ns, @file)
+    assert write_cstr(@ns, "/f", c"new", 3) == ERR_OK
+    let old: *u8 = memory_store_get(@store, @file)
+    assert old != null
+    assert *old == 111 and *(old + 2) == 100
+    namespace_unhold(@ns, @file)
+    assert memory_store_get(@store, @file) == null
+
+    assert namespace_mkdir(@ns, "/d") == ERR_OK
+    assert write_cstr(@ns, "/d/x", c"child", 5) == ERR_OK
+    var dir: BlobId = namespace_resolve(@ns, "/d")
+    assert namespace_hold(@ns, @dir)
+    assert namespace_delete(@ns, "/d/x") == ERR_OK
+    assert namespace_delete(@ns, "/d") == ERR_OK
+    assert namespace_delete(@ns, "/f") == ERR_OK
+    # the held directory still names "child"
+    assert memory_store_count(@store) == empty + 2
+    namespace_unhold(@ns, @dir)
+    assert memory_store_count(@store) == empty
+    var none: BlobId = namespace_resolve(@ns, "/missing")
+    assert not namespace_hold(@ns, @none)
     memory_store_free(@store)
     0

@@ -17,7 +17,7 @@ import serial { StrView, serial_init, prints, serial_print_hex, serial_print_dec
 import drivers.pci { pci_init }
 import mm.pmm { PAGE_SIZE, Mb2BootInfo, Mb2ModuleTag, mb2_find_module, HARLAND_BOOT_MAGIC, HARLAND_BOOT_VERSION_INITRAMFS, HARLAND_BOOT_VERSION_FLAGS, HARLAND_BOOT_FLAG_NET_SELFTEST, HarlandMemEntry, HarlandBootInfo, BOOT_PROTOCOL_UNKNOWN, BOOT_PROTOCOL_MULTIBOOT2, BOOT_PROTOCOL_HARLAND, pmm_mark_region_used, pmm_get_free_pages, pmm_get_total_pages, pmm_init_from_multiboot, pmm_init_from_bootinfo, pmm_reserve_kernel, pmm_bitmap_phys, pmm_bitmap_size }
 import mm.vmm { vmm_init, vmm_flush_tlb_all, vmm_reserve_page_tables, vmm_init_physmap, phys_to_virt }
-import mm.heap { KERNEL_VIRT_BASE, heap_init, heap_get_used, heap_check }
+import mm.heap { KERNEL_VIRT_BASE, kheap_init, heap_get_used, heap_check }
 # mm.shm and mm.dma are WIP - commented out until imports are fixed
 # import mm.shm { ShmRegion, ShmMapping, shm_create, ... }
 # import mm.dma { DmaRegion, dma_alloc, dma_free, ... }
@@ -25,13 +25,11 @@ import ipc.channel { channel_init }
 import ipc.syscall { ipc_syscall_init }
 import cap.table { cap_table_init }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_init, virtio_blk_init_nth }
-import fs.kblob { KBlobStore, kblob_init, kblob_get_store }
 import fs.vfs { vfs_init }
-import fs.knamespace { KNamespace, knamespace_init, knamespace_get, knamespace_read }
+import fs.kfs { kfs_init, kfs_get, kfs_read, kfs_has_storage, kfs_record_boot, kfs_blob_count }
+import goliath.namespace { Namespace }
 import fs.syscall { fs_syscall_init }
 import fs.initramfs { initramfs_load, initramfs_set_boot_image }
-import fs.persist { PersistBlobStore, persist_count, persist_global_init, persist_get_store }
-import fs.sync { fs_sync_init }
 
 # Display driver imports
 import drivers.display.mod { SimpleFramebuffer, display_init, display_get_framebuffer, PIXEL_FORMAT_UNSUPPORTED, Mb2FramebufferTag, mb2_fb_format, mb2_find_fb_tag, MB2_FB_TAG_RGB_MIN_SIZE }
@@ -103,6 +101,9 @@ fn clear_bss() -> i32
 # instrumented prologues and epilogues reference them. A bare import keeps
 # the module linked without naming symbols main.ritz never uses (#3458).
 import stack_protector
+# ritzlib's platform hooks (#1881): ritzlib's core, which goliath uses, calls
+# them by name, so they too are linked by a bare import.
+import platform
 import klog { ring_clear, klog }
 import postinit { postinit_self_tests, postinit_diagnostics }
 
@@ -179,15 +180,15 @@ fn run_init() -> i32
     prints("[init] Loading /bin/init from filesystem...\n")
 
     # Get filesystem namespace
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
+    let ns: *Namespace = kfs_get()
+    if ns == 0 as *Namespace
         prints("[init] No namespace!\n")
         return -1
 
     # Read /bin/init
     let path: StrView = "/bin/init" as StrView
     var file_size: u64 = 0
-    let elf_data: *u8 = knamespace_read(ns, path, @file_size)
+    let elf_data: *u8 = kfs_read(ns, path, @file_size)
 
     if elf_data == 0 as *u8
         prints("[init] /bin/init not found in filesystem\n")
@@ -380,7 +381,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     serial_print_hex(vmm_pml4_phys)
     prints("\n")
 
-    # Reserve the current page tables before heap_init allocates through the
+    # Reserve the current page tables before kheap_init allocates through the
     # PMM; reserve again after it, since heap mapping creates new tables (#2749).
     vmm_reserve_page_tables()
 
@@ -397,7 +398,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     klog(c"  [..] Kernel heap")
     # 256 KiB to start; kalloc grows it on demand, under whichever CR3 is
     # loaded: it is in the kernel half every address space shares (#2761).
-    let heap_result: i32 = heap_init(64)
+    let heap_result: i32 = kheap_init(64)
     if heap_result == 0
         klog(c"\r  [OK] Kernel heap\n")
         prints("      Size: ")
@@ -407,7 +408,7 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         klog(c"\r  [!!] Kernel heap (init failed)\n")
 
     # Reserve all page table pages in PMM so they won't be reallocated.
-    # Re-run after heap_init since heap mapping creates additional PT pages.
+    # Re-run after kheap_init since heap mapping creates additional PT pages.
     vmm_reserve_page_tables()
 
     # Initialize Display subsystem (if framebuffer available)
@@ -437,13 +438,6 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
                 fb_fill_rect_rgb(fb, 540, 350, 200, 100, 0x40, 0x80, 0xFF)
         else
             klog(c"\r  [..] Display driver (headless mode)\n")
-
-    # Initialize Kernel Filesystem Layer
-    klog(c"  [..] Kernel blob store")
-    kblob_init()
-    klog(c"\r  [OK] Kernel blob store\n")
-    if heap_check() != 0
-        klog(c"    [HEAP CORRUPT after kblob_init]\n")
 
     klog(c"  [..] VFS layer")
     vfs_init()
@@ -476,14 +470,35 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     if heap_check() != 0
         klog(c"    [HEAP CORRUPT after virtio_blk_init]\n")
 
-    # Initialize kernel namespace (Goliath integration)
+    # The kernel namespace is goliath (fs/kfs.ritz, AGAST #1881). The second
+    # block device holds its image: it comes up first so the namespace
+    # starts from the tree the last boot saved, then this boot is counted in
+    # /var/boots and saved, and only then does the initial filesystem load
+    # on top (so the image holds what was written, not the initramfs).
+    let storage_dev: *VirtioBlkDevice = virtio_blk_init_nth(1)
     klog(c"  [..] Kernel namespace")
-    let kns_store: *KBlobStore = kblob_get_store()
-    if kns_store != 0 as *KBlobStore
-        knamespace_init(kns_store)
-        klog(c"\r  [OK] Kernel namespace\n")
+    if kfs_init(storage_dev) == 0
+        klog(c"\r  [OK] Kernel namespace (goliath)\n")
         if heap_check() != 0
-            klog(c"    [HEAP CORRUPT after knamespace_init]\n")
+            klog(c"    [HEAP CORRUPT after kfs_init]\n")
+
+        klog(c"  [..] Persistent storage")
+        if kfs_has_storage()
+            let boots: i64 = kfs_record_boot()
+            if boots > 0
+                klog(c"\r  [OK] Persistent storage (goliath image: boot ")
+                serial_print_dec(boots as u64)
+                klog(c", ")
+                serial_print_dec(kfs_blob_count() as u64)
+                klog(c" blobs)\n")
+            else
+                klog(c"\r  [!!] Persistent storage (save failed: errno ")
+                serial_print_dec((0 - boots) as u64)
+                klog(c")\n")
+        else if storage_dev != 0 as *VirtioBlkDevice
+            klog(c"\r  [!!] Persistent storage (image unreadable)\n")
+        else
+            klog(c"\r  [..] Persistent storage (not found)\n")
 
         # Initialize filesystem syscalls
         klog(c"  [..] Filesystem syscalls")
@@ -506,34 +521,8 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
         initramfs_load()
         klog(c"\r  [OK] Initial filesystem\n")
 
-        # Initialize second block device (persistent storage)
-        klog(c"  [..] Persistent storage")
-        let storage_dev: *VirtioBlkDevice = virtio_blk_init_nth(1)
-        if storage_dev != 0 as *VirtioBlkDevice
-            # Initialize persistent blob store
-            let persist_result: i32 = persist_global_init()
-            if persist_result == 0
-                let pstore: *PersistBlobStore = persist_get_store()
-                if pstore != 0 as *PersistBlobStore
-                    klog(c"\r  [OK] Persistent storage (")
-                    serial_print_dec(persist_count(pstore) as u64)
-                    klog(c" blobs)\n")
-
-                    # Initialize filesystem sync layer
-                    klog(c"  [..] Filesystem sync")
-                    let sync_result: i32 = fs_sync_init()
-                    if sync_result == 0
-                        klog(c"\r  [OK] Filesystem sync\n")
-                    else
-                        klog(c"\r  [!!] Filesystem sync (failed)\n")
-                else
-                    klog(c"\r  [!!] Persistent storage (init failed)\n")
-            else
-                klog(c"\r  [!!] Persistent storage (persist_init failed)\n")
-        else
-            klog(c"\r  [..] Persistent storage (not found)\n")
     else
-        klog(c"\r  [!!] Kernel namespace (no store)\n")
+        klog(c"\r  [!!] Kernel namespace (out of memory)\n")
 
     # Initialize APIC based on boot protocol
     if boot_protocol == BOOT_PROTOCOL_HARLAND

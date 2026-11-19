@@ -15,11 +15,12 @@ for init, spawn)
 and fs_process_end() when it exits, which closes what it left open, flushing
 writes as sys_close does, and makes the parent's table current again.
 
-The behaviour tests compile the real fs/fd.ritz, fs/syscall.ritz, fs/vfs.ritz,
-fs/kpath.ritz and syscall/errno.ritz into host programs on every compiler,
-with stand-ins for serial, the kernel heap (an arena that counts live
-allocations) and the namespace/blob store (a few named files; writes are
-recorded). Exit codes name the failed claim. Source-level tests pin where the
+The behaviour tests compile the real fs/fd.ritz, fs/syscall.ritz, fs/vfs.ritz
+and syscall/errno.ritz into host programs on every compiler, with stand-ins
+for serial, the kernel heap (an arena that counts live allocations) and the
+namespace: fs/kfs.ritz and the goliath modules fs/syscall.ritz calls (a few
+named files; writes are recorded, and so are blob holds: every open holds its
+file's blob and its last close must drop it, AGAST #1881). Exit codes name the failed claim. Source-level tests pin where the
 process layer calls into fs. The boot-level checks are indium's
 fd_table_test, fd_isolation_child (driven by init) and pid_child_test, run
 by projects/harland/tools/test_tier1_boot.sh.
@@ -96,21 +97,11 @@ pub fn heap_live() -> i64
 """
 
 # Blob n (1-based) is file n's bytes; its id is hash[0] = n.
-KBLOB_STUB = """\
-pub struct KBlobId
+BLOB_ID_STUB = """\
+pub struct BlobId
     hash: [32]u8
 
-pub struct KBlobStore
-    count: i32
-
-var g_store: KBlobStore
-var g_data: [8][64]u8
-var g_size: [8]u64
-
-pub fn kblob_get_store() -> *KBlobStore
-    @g_store
-
-pub fn kblob_id_is_zero(id: *KBlobId) -> bool
+pub fn blob_id_is_zero(id: *BlobId) -> bool
     var i: i32 = 0
     while i < 32
         if (*id).hash[i] != 0
@@ -118,22 +109,36 @@ pub fn kblob_id_is_zero(id: *KBlobId) -> bool
         i = i + 1
     true
 
-pub fn kblob_id_copy(src: *KBlobId) -> KBlobId
-    var dst: KBlobId
+pub fn blob_id_copy(src: *BlobId) -> BlobId
+    var dst: BlobId
     var i: i32 = 0
     while i < 32
         dst.hash[i] = (*src).hash[i]
         i = i + 1
     dst
+"""
 
-pub fn kblob_store_get(store: *KBlobStore, id: *KBlobId) -> *u8
+BLOB_STORE_STUB = """\
+import goliath.blob_id { BlobId }
+
+pub struct MemoryBlobStore
+    count: i32
+
+var g_store: MemoryBlobStore
+var g_data: [8][64]u8
+var g_size: [8]u64
+
+pub fn blob_stub_store() -> *MemoryBlobStore
+    @g_store
+
+pub fn memory_store_get(store: *MemoryBlobStore, id: *BlobId) -> *u8
     let n: i32 = (*id).hash[0] as i32
     @g_data[n][0]
 
-pub fn kblob_store_get_size(store: *KBlobStore, id: *KBlobId) -> u64
+pub fn memory_store_get_size(store: *MemoryBlobStore, id: *BlobId) -> u64
     g_size[(*id).hash[0] as i32]
 
-pub fn kblob_stub_set(n: i32, data: *u8, size: u64)
+pub fn blob_stub_set(n: i32, data: *u8, size: u64)
     var i: u64 = 0
     while i < size and i < 64
         g_data[n][i as i32] = *(data + i)
@@ -141,20 +146,22 @@ pub fn kblob_stub_set(n: i32, data: *u8, size: u64)
     g_size[n] = size
 """
 
-# Files by path: /a = "alpha", /b = "bravo"; knamespace_write creates or
-# replaces one and is counted, so a flush is observable.
-KNAMESPACE_STUB = """\
+# Files by path: /a = "alpha", /b = "bravo"; a write creates or replaces one
+# and is counted, so a flush is observable. Holds are counted too.
+NAMESPACE_STUB = """\
 import serial { StrView }
-import fs.kblob { KBlobId, kblob_stub_set, kblob_store_get, kblob_get_store }
+import goliath.blob_id { BlobId }
+import goliath.blob_store { MemoryBlobStore, blob_stub_store, blob_stub_set, memory_store_get }
 
-pub struct KNamespace
+pub struct Namespace
     count: i32
 
-var g_ns: KNamespace
+var g_ns: Namespace
 var g_paths: [8][16]u8
 var g_lens: [8]i64
 var g_files: i32 = 0
 var g_writes: i32 = 0
+var g_holds: i32 = 0
 
 fn find(path: StrView) -> i32
     var n: i32 = 1
@@ -178,17 +185,17 @@ fn add(name: *u8, len: i64, data: *u8, size: u64) -> i32
         g_paths[g_files][i as i32] = *(name + i)
         i = i + 1
     g_lens[g_files] = len
-    kblob_stub_set(g_files, data, size)
+    blob_stub_set(g_files, data, size)
     g_files
 
-pub fn knamespace_get() -> *KNamespace
+pub fn ns_stub_get() -> *Namespace
     if g_files == 0
         add(c"/a", 2, c"alpha", 5)
         add(c"/b", 2, c"bravo", 5)
     @g_ns
 
-pub fn knamespace_resolve(ns: *KNamespace, path: StrView) -> KBlobId
-    var id: KBlobId
+pub fn namespace_resolve(ns: *Namespace, path: StrView) -> BlobId
+    var id: BlobId
     var i: i32 = 0
     while i < 32
         id.hash[i] = 0
@@ -196,35 +203,42 @@ pub fn knamespace_resolve(ns: *KNamespace, path: StrView) -> KBlobId
     id.hash[0] = find(path) as u8
     id
 
-pub fn knamespace_write(ns: *KNamespace, path: StrView, data: *u8, size: u64) -> i32
+pub fn namespace_store(ns: *Namespace) -> *MemoryBlobStore
+    blob_stub_store()
+
+pub fn namespace_hold(ns: *Namespace, id: *BlobId) -> bool
+    if (*id).hash[0] == 0
+        return false
+    g_holds = g_holds + 1
+    true
+
+pub fn namespace_unhold(ns: *Namespace, id: *BlobId)
+    g_holds = g_holds - 1
+
+pub fn ns_stub_write(path: StrView, data: *u8, size: u64) -> i32
     let n: i32 = find(path)
     if n == 0
         add(path.ptr, path.len, data, size)
     else
-        kblob_stub_set(n, data, size)
+        blob_stub_set(n, data, size)
     if size > 0
         g_writes = g_writes + 1
     0
 
-pub fn knamespace_read(ns: *KNamespace, path: StrView, out_size: *u64) -> *u8
-    0 as *u8
-
-pub fn knamespace_exists(ns: *KNamespace, path: StrView) -> bool
-    find(path) != 0
-
-pub fn knamespace_mkdir(ns: *KNamespace, path: StrView) -> i32
-    0
-
-# Writes that carried data, and whether `path` now holds `want`.
+# Writes that carried data, whether `path` now holds `want`, and blob holds
+# not yet dropped.
 pub fn stub_writes() -> i32
     g_writes
 
+pub fn stub_open_holds() -> i32
+    g_holds
+
 pub fn stub_holds(path: *u8, plen: i64, want: *u8, wlen: u64) -> bool
     let p: StrView = StrView { ptr: path, len: plen }
-    var id: KBlobId = knamespace_resolve(@g_ns, p)
+    var id: BlobId = namespace_resolve(@g_ns, p)
     if id.hash[0] == 0
         return false
-    let data: *u8 = kblob_store_get(kblob_get_store(), @id)
+    let data: *u8 = memory_store_get(blob_stub_store(), @id)
     var i: u64 = 0
     while i < wlen
         if *(want + i) != *(data + i)
@@ -233,13 +247,29 @@ pub fn stub_holds(path: *u8, plen: i64, want: *u8, wlen: u64) -> bool
     true
 """
 
+KFS_STUB = """\
+import serial { StrView }
+import goliath.namespace { Namespace, ns_stub_get, ns_stub_write }
+
+pub fn kfs_get() -> *Namespace
+    ns_stub_get()
+
+pub fn kfs_write(ns: *Namespace, path: StrView, data: *u8, size: u64) -> i32
+    ns_stub_write(path, data, size)
+
+pub fn kfs_mkdir(ns: *Namespace, path: StrView) -> i32
+    0
+"""
+
 STUBS = {
     "serial.ritz": SERIAL_STUB,
     "mm/heap.ritz": HEAP_STUB,
-    "fs/kblob.ritz": KBLOB_STUB,
-    "fs/knamespace.ritz": KNAMESPACE_STUB,
+    "goliath/blob_id.ritz": BLOB_ID_STUB,
+    "goliath/blob_store.ritz": BLOB_STORE_STUB,
+    "goliath/namespace.ritz": NAMESPACE_STUB,
+    "fs/kfs.ritz": KFS_STUB,
 }
-REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/kpath.ritz", "syscall/errno.ritz"]
+REAL = ["fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "syscall/errno.ritz"]
 
 
 def _compile(compiler, tmp_path, path, name, extra=()):
@@ -284,9 +314,9 @@ def _run(compiler, tmp_path, src, modules):
 
 
 FD_MODULES = ["fs/fd.ritz", "syscall/errno.ritz"]
-FS_MODULES = ["serial.ritz", "mm/heap.ritz", "fs/kblob.ritz", "fs/knamespace.ritz",
-              "fs/fd.ritz", "fs/syscall.ritz", "fs/vfs.ritz", "fs/kpath.ritz",
-              "syscall/errno.ritz"]
+FS_MODULES = ["serial.ritz", "mm/heap.ritz", "goliath/blob_id.ritz", "goliath/blob_store.ritz",
+              "goliath/namespace.ritz", "fs/kfs.ritz", "fs/fd.ritz", "fs/syscall.ritz",
+              "fs/vfs.ritz", "syscall/errno.ritz"]
 
 # --- FdTable (fs/fd.ritz) ---------------------------------------------------------
 
@@ -359,7 +389,7 @@ import syscall.errno { Errno }
 import fs.syscall
 import fs.vfs { O_RDONLY, O_WRONLY, O_CREAT }
 import mm.heap { heap_live }
-import fs.knamespace { stub_writes, stub_holds }
+import goliath.namespace { stub_writes, stub_holds, stub_open_holds }
 
 fn reads(fd: i32, want: *u8, n: u64) -> bool
     var buf: [16]u8
@@ -410,6 +440,8 @@ fn main() -> i32
         return 13
     if heap_live() != base
         return 14
+    if stub_open_holds() != 0
+        return 15
     0
 """
 
@@ -420,7 +452,8 @@ ISOLATION_CLAIMS = {1: "init gets a table", 2: "init's first fd is 3", 3: "child
                     10: "parent's fd 3 still reads its own file",
                     11: "child's fd 4 did not survive in the parent",
                     12: "parent's next fd is 4", 13: "init exit releases its table",
-                    14: "FsProcs/paths/write buffers freed"}
+                    14: "FsProcs/paths/write buffers freed",
+                    15: "every open's blob hold was dropped"}
 
 
 @pytest.mark.integration
@@ -538,6 +571,8 @@ fn main() -> i32
         return 12
     if fs_process_end() != 2 or heap_live() != base
         return 13
+    if stub_open_holds() != 0
+        return 14
     0
 """
 
@@ -548,7 +583,8 @@ DUP_CLAIMS = {1: "init gets a table", 2: "open /a as 3, dup as 4",
               8: "both fds write", 9: "closing one fd does not flush",
               10: "the last close flushes both writes once",
               11: "stdio and unopened fds don't dup",
-              12: "open /a and dup it again", 13: "exit closes both; nothing leaked or double-freed"}
+              12: "open /a and dup it again", 13: "exit closes both; nothing leaked or double-freed",
+              14: "one blob hold per open file, dropped once by its last close"}
 
 
 @pytest.mark.integration

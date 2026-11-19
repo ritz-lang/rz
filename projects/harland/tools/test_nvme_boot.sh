@@ -16,8 +16,8 @@
 #
 # NVME_LBA_SIZE=4096 (AGAST #4088) gives both controllers 4 KiB logical
 # blocks (QEMU logical_block_size=4096): the driver translates 512-byte
-# sectors to native LBAs and read-modify-writes unaligned writes (persist
-# writes single sectors). It must log "4096-byte LBAs", so this variant
+# sectors to native LBAs and read-modify-writes unaligned writes (goliath's
+# block store writes a one-sector header). It must log "4096-byte LBAs", so this variant
 # cannot pass on a QEMU that ignored the option. It also sets mdts=2 (16 KiB
 # per command), so long transfers split at the controller's limit.
 #
@@ -27,11 +27,13 @@
 #     and NVME_LBA_SIZE as its LBA size;
 #   - the initramfs loaded from harland-root and init's Tier-1 suite reports
 #     ALL TESTS PASSED (the fs layer mounted from NVMe, unchanged);
-#   - persistent storage came up on harland-data and its superblock magic
-#     "\0HARBLOB" is in sector 0 of the image after the boot (write path);
-#   - sectors 65-71 still hold the pattern: persist's format writes sectors
-#     0-64 one at a time, and on 4 KiB LBAs sector 64 shares an LBA with
-#     them, so a write that skipped read-modify-write would clobber them;
+#   - persistent storage came up on harland-data: after the boot sector 0
+#     holds a goliath block-store header ("GOLIATHB", AGAST #1881) naming an
+#     image ("GOLIATHS") at sector 2 (write path);
+#   - the sectors around those writes still hold the pattern: sector 1 (the
+#     unused second header) and those after the image up to sector 15. On
+#     4 KiB LBAs they share LBAs 0-1 with the writes, so a write that
+#     skipped read-modify-write would clobber them;
 #   - the kernel took no exception;
 #   - this ESP has no \harland\net-selftest boot option, so the kernel
 #     skipped the pre-init network self-tests and never probed a NIC
@@ -193,25 +195,40 @@ else
     echo "FAIL: the initramfs did not load from harland-root"
     rc=1
 fi
-magic=$(python3 -c 'import sys; print(open(sys.argv[1], "rb").read(8).hex())' "$WORK/data.img" 2>/dev/null)
-if grep -aq "\[OK\] Persistent storage" "$SERIAL" && [ "$magic" = "00484152424c4f42" ]; then
-    echo "PASS: persistent storage formatted harland-data over NVMe writes"
-else
-    echo "FAIL: persistent storage did not come up on harland-data (sector 0 starts ${magic:-?})"
-    rc=1
-fi
-# Sectors 65-71: unchanged pattern, or the sector numbers that differ.
-bad=$(python3 - "$WORK/data.img" <<'EOF2'
+# The goliath header in sector 0 and its image: "ok", or what is wrong.
+layout=$(python3 - "$WORK/data.img" <<'EOF2'
 import struct, sys
 data = open(sys.argv[1], "rb").read()
-print(" ".join(str(n) for n in range(65, 72)
+if data[:8] != b"GOLIATHB":
+    print("sector 0 starts " + data[:8].hex()); sys.exit()
+lba, length = struct.unpack_from("<QQ", data, 24)
+if lba != 2 or data[1024:1032] != b"GOLIATHS":
+    print("header names an image at sector %d, not a goliath image at sector 2" % lba); sys.exit()
+print("ok %d" % (2 + (length + 511) // 512))
+EOF2
+) || layout="unreadable"
+if grep -aq "\[OK\] Persistent storage" "$SERIAL" && [ "${layout%% *}" = ok ]; then
+    echo "PASS: persistent storage saved a goliath image to harland-data over NVMe writes"
+else
+    echo "FAIL: persistent storage did not save a goliath image on harland-data (${layout})"
+    rc=1
+fi
+# Sector 1 and the sectors after the image up to 15: unchanged pattern, or
+# the sector numbers that differ.
+image_end="${layout#ok }"
+case "$image_end" in ''|*[!0-9]*) image_end=16 ;; esac
+bad=$(python3 - "$WORK/data.img" "$image_end" <<'EOF2'
+import struct, sys
+data = open(sys.argv[1], "rb").read()
+keep = [1] + list(range(int(sys.argv[2]), 16))
+print(" ".join(str(n) for n in keep
                if data[n * 512:(n + 1) * 512] != (b"LBA" + struct.pack("<I", n) + b"!") * 64))
 EOF2
 ) || bad="?"
 if [ -z "$bad" ]; then
-    echo "PASS: sectors 65-71 kept the pattern (writes beside them read-modify-wrote)"
+    echo "PASS: sectors beside goliath's writes kept the pattern (writes beside them read-modify-wrote)"
 else
-    echo "FAIL: sectors beside persist's writes were clobbered: ${bad}"
+    echo "FAIL: sectors beside goliath's writes were clobbered: ${bad}"
     rc=1
 fi
 if grep -aq "ALL TESTS PASSED" "$SERIAL"; then

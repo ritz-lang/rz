@@ -7,7 +7,9 @@ frees its blobs), and one on-disk image format kept in a host file
 (`file_store`) or on a block device (`block_store`). The core builds
 freestanding: memory comes from an `Allocator`, disks are a `BlockDevice`,
 and only `hosted.ritz`, `file_store.ritz` and the CLI use the hosted ritzlib
-(AGAST #1881). Run `./rz test goliath` for the current test count.
+(AGAST #1881). The harland kernel runs this same goliath as its filesystem
+(`harland/kernel/src/fs/kfs.ritz`; see `harland/docs/GOLIATH_INTEGRATION.md`).
+Run `./rz test goliath` for the current test count.
 The `goliath` binary stores files and reads them back: `goliath put FILE`
 prints the file's blob id, `goliath get ID` writes the blob to stdout, and
 `goliath ls PATH` lists the namespace (AGAST #2788).
