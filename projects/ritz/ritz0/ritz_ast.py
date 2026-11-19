@@ -294,6 +294,9 @@ class InterpString(Expr):
     """
     parts: List[str]   # String fragments (always len(exprs) + 1)
     exprs: List[Expr]  # Interpolated expressions
+    # AGAST #201: each placeholder's format spec, `{x:08x}` -> "08x"; "" for
+    # none. Parallel to exprs (empty when built without specs).
+    specs: List[str] = field(default_factory=list)
 
 
 @dataclass

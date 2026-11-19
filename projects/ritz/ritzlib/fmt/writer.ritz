@@ -1,0 +1,136 @@
+# ritzlib/fmt/writer.ritz - Writer: one byte sink for every formatter
+#
+# AGAST #201 (#198 Phase 2, docs/V1_ABI_CLEANUP.md "Writer abstraction").
+# A Writer is a fn pointer plus the state its sink needs, so Display impls
+# and the print builtins can target stdout, stderr, any fd, a String, a
+# fixed buffer or nothing, through one call:
+#
+#     var w = stdout_writer()
+#     writer_write_str(@&w, "hello\n")
+#
+# Every write returns the bytes it accepted, or a negative value on error
+# (a -errno from the fd sinks, -1 from a full span). `len` counts every byte
+# a sink has accepted, so a null_writer measures what would be written.
+#
+# Writers are short-lived stack values and the sink they name (a String, a
+# buffer) must outlive them (V1_ABI_CLEANUP "Implementation-time questions" 4).
+#
+# A Writer is also a `format_into` sink (LANGUAGE_SPEC §2.6): its
+# `push_bytes` method makes `format_into(@&w, "x = {x}\n")` work on any sink.
+
+import ritzlib.sys
+import ritzlib.string
+
+pub struct Writer
+    sink: fn(@&Writer, *u8, i64) -> i64   # the sink's write; see the constructors
+    state: *u8                            # sink-specific: the String, or the span's bytes
+    fd: i32                               # fd sinks: the file descriptor
+    cap: i64                              # span sink: the buffer's size
+    len: i64                              # bytes accepted so far, every sink
+
+impl Writer
+    # The format_into sink protocol (LANGUAGE_SPEC §2.6): 0 when every byte
+    # was accepted, -1 otherwise.
+    pub fn push_bytes(self: @&Writer, data: *u8, len: i64) -> i32
+        if writer_write(self, data, len) == len
+            return 0
+        -1
+
+# Write len bytes from data. Returns len, or a negative value on error.
+pub fn writer_write(w: @&Writer, data: *u8, len: i64) -> i64
+    if len <= 0
+        return 0
+    let n: i64 = (w.sink)(w, data, len)
+    if n > 0
+        w.len = w.len + n
+    n
+
+pub fn writer_write_str(w: @&Writer, s: StrView) -> i64
+    writer_write(w, s.ptr, s.len)
+
+pub fn writer_write_byte(w: @&Writer, b: u8) -> i64
+    var one: [1]u8
+    one[0] = b
+    writer_write(w, @one[0] as *u8, 1)
+
+# `b` written n times (padding). Returns n, or the first error.
+pub fn writer_write_fill(w: @&Writer, b: u8, n: i64) -> i64
+    var chunk: [32]u8
+    var i: i64 = 0
+    while i < 32
+        chunk[i] = b
+        i += 1
+    var left: i64 = n
+    while left > 0
+        var step: i64 = left
+        if step > 32
+            step = 32
+        let got: i64 = writer_write(w, @chunk[0] as *u8, step)
+        if got < 0
+            return got
+        left = left - step
+    n
+
+# Bytes accepted so far.
+pub fn writer_len(w: @Writer) -> i64
+    w.len
+
+# ============================================================================
+# Sinks
+# ============================================================================
+
+# Write all len bytes to w.fd, retrying short writes.
+fn fd_sink(w: @&Writer, data: *u8, len: i64) -> i64
+    var done: i64 = 0
+    while done < len
+        let n: i64 = sys_write(w.fd, data + done, len - done)
+        if n < 0
+            return n
+        if n == 0
+            return -1
+        done = done + n
+    done
+
+fn string_sink(w: @&Writer, data: *u8, len: i64) -> i64
+    let s: *String = w.state as *String
+    if string_push_bytes(s, data, len) != 0
+        return -1
+    len
+
+# All or nothing: a write that doesn't fit is -1 and leaves the buffer as it was.
+fn span_sink(w: @&Writer, data: *u8, len: i64) -> i64
+    if len > w.cap - w.len
+        return -1
+    var i: i64 = 0
+    while i < len
+        *(w.state + w.len + i) = *(data + i)
+        i += 1
+    len
+
+fn null_sink(w: @&Writer, data: *u8, len: i64) -> i64
+    len
+
+pub fn fd_writer(fd: i32) -> Writer
+    Writer { sink: fd_sink, state: null, fd: fd, cap: 0, len: 0 }
+
+pub fn stdout_writer() -> Writer
+    fd_writer(1)
+
+pub fn stderr_writer() -> Writer
+    fd_writer(2)
+
+# Appends to *s.
+pub fn string_writer(s: @&String) -> Writer
+    Writer { sink: string_sink, state: s as *u8, fd: -1, cap: 0, len: 0 }
+
+# Fills buf from its start; writer_view is what has been written.
+pub fn span_writer(buf: Span<u8>) -> Writer
+    Writer { sink: span_sink, state: buf.ptr, fd: -1, cap: buf.len, len: 0 }
+
+# Accepts and discards everything; writer_len measures the output.
+pub fn null_writer() -> Writer
+    Writer { sink: null_sink, state: null, fd: -1, cap: 0, len: 0 }
+
+# What a span_writer has written so far.
+pub fn writer_view(w: @Writer) -> StrView
+    StrView { ptr: w.state, len: w.len }

@@ -21,10 +21,10 @@ import re
 import sys
 from pathlib import Path
 
-# ritzlib's core, by import path under `ritzlib.`.  fmt, drop and hash are
+# ritzlib's core, by import path under `ritzlib.`.  fmt.digits, drop and hash are
 # here because the others use them.
 CORE = frozenset({
-    "drop", "fmt", "gvec", "hash", "hashmap", "memory", "option", "result",
+    "drop", "fmt.digits", "gvec", "hash", "hashmap", "memory", "option", "result",
     "span", "str", "string", "strview",
 })
 

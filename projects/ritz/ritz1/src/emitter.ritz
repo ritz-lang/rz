@@ -844,6 +844,41 @@ fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
     vec_push_bytes<u8>(s.out, tail, n)
     free(tail)
 
+# 1 when fn_linkage gives the fn an ODR linkage (linkonce_odr / weak_odr).
+fn fn_is_odr(is_main: i32, is_monomorph: i32, is_pub: i32, from_generated: i32) -> i32
+    if is_main == 1
+        return 0
+    if is_monomorph == 1
+        return 1
+    if is_pub == 1 and from_generated == 1
+        return 1
+    0
+
+# AGAST #201: an ODR *function* goes in its own same-named comdat, as clang
+# does for every C++ inline/template function.  On ELF a linkonce definition
+# is a weak symbol and the linker keeps one copy either way; on COFF (a
+# `*-uefi` [[bin]] compiles for x86_64-windows-gnu) one without a comdat is a
+# plain weak external, and lld-link reports two objects' copies of
+# `vec_push$u8` as a duplicate symbol (harland's hwinv).  ritz0 does the same
+# (_add_odr_comdats).  This writes the `$name = comdat any` line, just before
+# the define (module-level entities may come in any order); the caller writes
+# ` comdat` after the define's attributes.
+#
+# Functions only, never globals: a comdat group is matched by *name* across
+# objects, and globals of unrelated modules share names (`g_out`, every test
+# file's capture buffer).  The ritzunit runner localizes its own copy with
+# `objcopy --keep-global-symbol=main`, so the test's group was discarded in
+# its favour and the test's references bound to the discarded section --
+# `@g_out[0]` became 0 and every capture test SIGSEGVd.  A global stays
+# `weak_odr` alone, as on main; only functions get the group.
+fn emit_odr_comdat_start(s: *EmitterState, name: *u8, name_len: i32, suffix: *u8, suffix_len: i32)
+    emit_str(s, c"$")
+    emit_name(s, name, name_len)
+    if suffix != null
+        emit_str(s, c"_")
+        emit_name(s, suffix, suffix_len)
+    emit_str(s, c" = comdat any\n")
+
 # AGAST #3386 (LARB R45): a defined fn's linkage follows its visibility.
 #   - `main`: external (the runtime's _start calls it).
 #   - a monomorph ('$' in its name): linkonce_odr. Every module using it
@@ -856,9 +891,9 @@ fn tag_intrinsic_target_features(s: *EmitterState, attr_pos: i64)
 fn fn_linkage(is_main: i32, is_monomorph: i32, is_pub: i32, from_generated: i32) -> *u8
     if is_main == 1
         return c"define "
-    if is_monomorph == 1
-        return c"define linkonce_odr "
-    if is_pub == 1 and from_generated == 1
+    if fn_is_odr(is_main, is_monomorph, is_pub, from_generated) == 1
+        if is_monomorph == 1
+            return c"define linkonce_odr "
         return c"define weak_odr "
     if is_pub == 1
         return c"define "
@@ -929,6 +964,8 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         # the defining module's object has the symbol.
         emit_str(s, c"define available_externally ")
     else
+        if fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated) == 1
+            emit_odr_comdat_start(s, f.name, f.name_len, null, 0)
         emit_str(s, fn_linkage(is_main, is_monomorph, f.is_pub, f.from_generated))
     emit_str(s, fn_callconv_kw(f))   # [[callconv = "win64"]] (AGAST #1879)
     if s.ret_sret == 1
@@ -976,6 +1013,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     emit_fn_attrs(s)
     emit_str(s, fn_inline_attr(f))   # [[inline]] / [[always_inline]] / [[noinline]] (#1847)
     let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
+    # After attr_pos: an attribute inserted there must precede `comdat`.
+    if f.is_local == 1 and fn_is_odr(is_main, is_monomorph, f.is_pub, f.from_generated) == 1
+        emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
     # AGAST #1685: allocas emitted below this point are hoisted back here.
@@ -1298,6 +1338,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     var im_pub: i32 = method.is_pub
     if ib.trait_name != null
         im_pub = 1
+    if fn_is_odr(0, im_is_monomorph, im_pub, 0) == 1
+        emit_odr_comdat_start(s, ib.type_name, ib.type_name_len, method.name, method.name_len)
     emit_str(s, fn_linkage(0, im_is_monomorph, im_pub, 0))
     # For struct-returning impl methods (where `method.return_type_name`
     # is set), emit `%Type` so call sites that walk the impl table can
@@ -1348,6 +1390,8 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     # emit_fn_attrs.
     emit_fn_attrs(s)
     let attr_pos: i64 = s.out.len    # AGAST #1737: target attrs go here
+    if fn_is_odr(0, im_is_monomorph, im_pub, 0) == 1
+        emit_str(s, c" comdat")   # AGAST #201: see emit_odr_comdat_start
     emit_str(s, c" {\n")
     emit_str(s, c"entry:\n")
     # AGAST #1685: allocas emitted below this point are hoisted back here.
@@ -2717,9 +2761,11 @@ fn emit_global_vars(s: *EmitterState)
             emit_nd_error(s, g.line, g.col, c"an initializer on a multi-dimensional array is not supported in ritz1")
         var gi: GlobalInit
         global_init_check(s, g, @gi)
+        # weak_odr: merge duplicates across modules (same as functions).  No
+        # comdat: see emit_odr_comdat_start -- its group would match another
+        # module's global of the same name, which is not what ODR means.
         emit_str(s, c"@")
         emit_name(s, g.name, g.name_len)
-        # weak_odr: merge duplicates across modules (same as functions)
         emit_str(s, c" = weak_odr global ")
         emit_global_llvm_type(s, g)
         emit_global_init(s, g, @gi)

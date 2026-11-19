@@ -121,7 +121,7 @@ package files by paths relative to the package, never `../`.
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.str
-import ritzlib.fmt { fmt_i64_into }
+import ritzlib.fmt.digits { fmt_i64_into }
 
 # ==== Helpers ====
 
@@ -149,7 +149,7 @@ fn util_exec(argv: **u8, stdin_content: *u8, stdin_len: i64,
     while *(prefix + i) != 0
         path_buf[i] = *(prefix + i)
         i += 1
-    # The pid's digits via ritzlib.fmt, not a hand-rolled digit loop.
+    # The pid's digits via ritzlib.fmt.digits, not a hand-rolled digit loop.
     i += fmt_i64_into(@path_buf[i], sys_getpid() as i64)
     path_buf[i] = 0
 

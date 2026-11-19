@@ -52,7 +52,7 @@ def _fn(path, name):
 # --- the PMM frees only frames it manages (runs pmm.ritz on the host) -------------
 
 # mm/pmm imports serial, whose `asm x86_64:` blocks only ritz0 parses.
-PMM_MODULES = ["mm.pmm", "serial", "io", "ritzlib.fmt"]  # serial imports ritzlib.fmt (#1957)
+PMM_MODULES = ["mm.pmm", "serial", "io", "ritzlib.fmt.digits"]  # serial imports ritzlib.fmt.digits (#1957)
 
 # Exit code i names the i-th failing check.
 PMM_OWN_FRAMES = """\

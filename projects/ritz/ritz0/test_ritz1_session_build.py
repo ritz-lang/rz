@@ -196,11 +196,15 @@ def test_failed_session_build_fails_tests_never_skips(ritz1_bin, tmp_path, mode)
         f"a failed ritz1 build must fail every test that needs it:\n{out[-4000:]}")
 
 
-# Tests that must lead the collection order (AGAST #1804): the longest single
-# test, and the members of the serial `tree` group.
+# Tests that lead the collection order (AGAST #1804): the longest single test,
+# the members of the serial `tree` group, and every batched (`xdist_group`)
+# file that sorts before the ordinary bulk.  conftest ranks all groups ahead of
+# the rest, so a new grouped file whose name sorts early lands in this region;
+# list it here or the guard below reports the front files behind it as "late".
 _FRONT = re.compile(
     r"^(test_ritz1_bin_staleness\.py::test_stale_ritz1_binary_cannot_produce_a_false_pass"
     r"|test_build_compiler_switch\.py::|test_ritzlib_output_goldens\.py::"
+    r"|test_odr_comdat\.py::"
     r"|test_ritz1_session_build\.py::"
     r"|test_build\.py::Test\w+::test_(build_exits_nonzero|package_builds_when|package_imports_a_sibling)"
     r"|test_build_lib\.py::TestLibraryBuild::)"

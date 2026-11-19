@@ -43,7 +43,7 @@ def test_core_imports_only_core():
 
 
 def test_ticket_core_modules_are_core():
-    # The ticket's list; fmt, drop and hash are in CORE because these use them.
+    # The ticket's list; fmt.digits, drop and hash are in CORE because these use them.
     assert {"str", "strview", "span", "option", "result", "gvec", "string",
             "hashmap", "memory"} <= CORE
 

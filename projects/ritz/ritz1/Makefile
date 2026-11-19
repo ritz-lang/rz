@@ -90,12 +90,13 @@ SOURCES = \
 
 # ritzlib modules needed by ritz1
 # - json/option/result pulled in for fn_cache.ritz (sig file I/O)
+# - fmt_digits (ritzlib/fmt/digits.ritz): the integer digit routines (AGAST #201)
 # - os_env (ritzlib/os/env.ritz) + span: main.ritz's RITZ_PATH lookup
 #   (AGAST #1750).  A nested module is named with `_` for `/`: see the
 #   explicit ritzlib_os_env rules below, since the ritzlib_% pattern only
 #   reaches top-level ritzlib/*.ritz.
 RITZLIB_DIR = ../ritzlib
-RITZLIB_MODULES = sys io str fmt string strview hash hashmap memory gvec drop option result json span os_env
+RITZLIB_MODULES = sys io str fmt_digits string strview hash hashmap memory gvec drop option result json span os_env
 
 # Build artifacts
 BUILD_DIR = build
@@ -189,6 +190,11 @@ $(BUILD_DIR)/ritzlib_%.o: $(RITZLIB_DIR)/%.ritz | $(BUILD_DIR)
 $(BUILD_DIR)/ritzlib_os_env.o: $(RITZLIB_DIR)/os/env.ritz | $(BUILD_DIR)
 	@echo "ritzlib/os/env.ritz → $@ (artifact store)"
 	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_os_env.d.tmp && mv $(BUILD_DIR)/ritzlib_os_env.d.tmp $(BUILD_DIR)/ritzlib_os_env.d
+	$(CAS_OBJ) $< $@
+
+$(BUILD_DIR)/ritzlib_fmt_digits.o: $(RITZLIB_DIR)/fmt/digits.ritz | $(BUILD_DIR)
+	@echo "ritzlib/fmt/digits.ritz → $@ (artifact store)"
+	@$(MKDEPS) $< $@ > $(BUILD_DIR)/ritzlib_fmt_digits.d.tmp && mv $(BUILD_DIR)/ritzlib_fmt_digits.d.tmp $(BUILD_DIR)/ritzlib_fmt_digits.d
 	$(CAS_OBJ) $< $@
 
 # === Build ritz1 from source using ritz0 ===

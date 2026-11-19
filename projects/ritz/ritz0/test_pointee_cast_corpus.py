@@ -29,7 +29,7 @@ RITZ1 = ROOT / "projects/ritz/ritz1"
 
 # (project root, source roots, target, files) per package.
 GROUPS = {
-    # ROOT/projects/ritz holds ritzlib (serial.ritz imports ritzlib.fmt,
+    # ROOT/projects/ritz holds ritzlib (serial.ritz imports ritzlib.fmt.digits,
     # #1957): harland's build gets it from RITZ_PATH, which CI doesn't set
     # for pytest (AGAST #4150).
     "harland_kfree": (HARLAND, ["kernel/src", str(ROOT / "projects/ritz")],

@@ -55,7 +55,7 @@ RITZ1_SRC = RITZ_ROOT / "ritz1" / "src"
 # The lexer and everything it transitively imports. ritz0 compiles one module
 # at a time, so each is compiled and linked explicitly.
 LOCAL_MODULES = ["tokens_gen", "lexer_scan_gen", "lexer"]
-RITZLIB_MODULES = ["memory", "strview", "sys", "str", "fmt"]  # str imports fmt (itoa)
+RITZLIB_MODULES = ["memory", "strview", "sys", "str", "fmt/digits"]  # str imports fmt.digits (itoa)
 
 PROBE_HEAD = """\
 import tokens_gen
@@ -123,7 +123,7 @@ def lexer_objects(tmp_path_factory) -> tuple[Path, list[Path]]:
         _ritz0(work / f"{m}.ritz", out, "--no-runtime")
         lls.append(out)
     for m in RITZLIB_MODULES:
-        out = work / f"lib_{m}.ll"
+        out = work / f"lib_{m.replace('/', '_')}.ll"
         _ritz0(RITZ_ROOT / "ritzlib" / f"{m}.ritz", out, "--no-runtime")
         lls.append(out)
     return work, lls

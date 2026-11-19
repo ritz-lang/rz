@@ -33,8 +33,8 @@ Ritzlib is built on three core principles:
 ### Core and hosted
 
 ritzlib has two layers (AGAST #4119). The **core** (`str`, `strview`, `span`,
-`option`, `result`, `gvec`, `string`, `hashmap`, `memory`, and `fmt`, `drop`
-and `hash`, which they use) builds for a freestanding target, such as a kernel
+`option`, `result`, `gvec`, `string`, `hashmap`, `memory`, and `fmt.digits`,
+`drop` and `hash`, which they use) builds for a freestanding target, such as a kernel
 with no syscalls: no core module imports a module outside the core, so
 `ritzlib.sys` is never in its import closure. Everything else (`sys`, `io`,
 `fs`, `net`, `uring`, `process`, `os.env`, ...) is **hosted**. The list lives
@@ -76,7 +76,8 @@ modules links without sys. A freestanding program defines all three itself.
 4. [String Utilities](#string-utilities)
    - [strview](#strview) - Borrowed string views (`StrView`)
    - [str](#str) - C-string interop
-   - [fmt](#fmt) - Integer-to-text digit routines
+   - [fmt.digits](#fmtdigits) - Integer-to-text digit routines
+   - [fmt](#fmt) - Writer, Display / Debug, format specs
    - [ct](#ct) - Constant-time comparison of secrets
    - [buf](#buf) - Buffer and parsing utilities
 5. [System Interface](#system-interface)
@@ -1035,24 +1036,27 @@ the compiler emits calls to those symbols.
 
 ---
 
-### fmt
+### fmt.digits
 
-**Module**: `ritzlib.fmt`
+**Module**: `ritzlib.fmt.digits` (core)
 
 The one integer digit routine. Every ritzlib integer formatter (`print_int`,
 `eprint_int`, `print_hex`, `itoa`, `string_push_i64`, `string_from_hex`,
-`iovec_append_int`/`_uint`) calls it, so all of them handle i64's minimum
-(AGAST #1856). Each writes into a caller buffer, returns the byte count, and
-writes no NUL. It has no imports, so freestanding code can use it too.
+`iovec_append_int`/`_uint`, `ritzlib.fmt`'s Display) calls it, so all of them
+handle i64's minimum (AGAST #1856). Each writes into a caller buffer, returns
+the byte count, and writes no NUL. It has no imports, so freestanding code can
+use it too. It was `ritzlib.fmt` until AGAST #201 made that name the hosted
+formatting surface below.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `fmt_i64_into` | `fn(buf: *u8, n: i64) -> i64` | Decimal with `-` when negative; needs 20 bytes |
 | `fmt_u64_into` | `fn(buf: *u8, n: u64) -> i64` | Unsigned decimal; needs 20 bytes |
 | `fmt_u64_hex_into` | `fn(buf: *u8, n: u64) -> i64` | Lowercase hex, no `0x`, no leading zeros; needs 16 bytes |
+| `fmt_u64_radix_into` | `fn(buf: *u8, n: u64, radix: u64, upper: i32) -> i64` | Base 2..16, `upper != 0` for `A`..`F`; needs 64 bytes |
 
 ```ritz
-import ritzlib.fmt
+import ritzlib.fmt.digits
 
 fn fmt_example() -> i64
     var buf: [20]u8
@@ -1060,6 +1064,91 @@ fn fmt_example() -> i64
 ```
 
 ---
+
+### fmt
+
+**Module**: `ritzlib.fmt` (hosted)
+
+Formatting and printing, in one import (AGAST #201, docs/V1_ABI_CLEANUP.md
+Phase 2). It `pub import`s `ritzlib.fmt.digits`, `.spec`, `.writer`,
+`.impls`, `.display` and `ritzlib.io` (for `println` / `eprintln`); `print`
+and `eprint` are builtins ([LANGUAGE_SPEC §2.6](LANGUAGE_SPEC.md)).
+
+**Writer** (`ritzlib.fmt.writer`). A byte sink: a fn pointer and the state it
+needs. Every write returns the bytes accepted, or a negative value (a -errno
+from an fd, -1 from a full span). `w.len` counts every byte accepted. A Writer
+is a `format_into` sink: it has `push_bytes`.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `stdout_writer` / `stderr_writer` | `fn() -> Writer` | fd 1 / fd 2 |
+| `fd_writer` | `fn(fd: i32) -> Writer` | Any fd; short writes are retried |
+| `string_writer` | `fn(s: @&String) -> Writer` | Appends to `*s` |
+| `span_writer` | `fn(buf: Span<u8>) -> Writer` | Fills `buf`; a write that doesn't fit is -1 and writes nothing |
+| `null_writer` | `fn() -> Writer` | Discards; `w.len` measures |
+| `writer_write` | `fn(w: @&Writer, data: *u8, len: i64) -> i64` | `len` bytes |
+| `writer_write_str` | `fn(w: @&Writer, s: StrView) -> i64` | A view's bytes |
+| `writer_write_byte` | `fn(w: @&Writer, b: u8) -> i64` | One byte |
+| `writer_write_fill` | `fn(w: @&Writer, b: u8, n: i64) -> i64` | `b`, `n` times |
+| `writer_len` | `fn(w: @Writer) -> i64` | Bytes accepted so far |
+| `writer_view` | `fn(w: @Writer) -> StrView` | What a `span_writer` holds |
+| `write` / `writeln` | `fn(w: @&Writer, s: StrView) -> i64` | `s` (and a newline) to `w` |
+| `format` | `fn(s: StrView) -> String` | `s` copied into a new String |
+
+**Display and Debug** (`ritzlib.fmt.display`). `{v}` is Display and `{v:?}`
+is Debug. A user type opts in with an impl; the methods need no `pub`
+(§15.2). The generics `fmt_show`, `fmt_show_debug` and `fmt_show_with` call
+them, and `fmt_show_with` pads any Display type to a spec's width.
+
+```ritz
+# ritzlib/fmt/display.ritz
+import ritzlib.fmt.writer
+
+pub trait Display
+    fn show(self: @Self, w: @&Writer) -> i64
+
+pub trait Debug
+    fn show_debug(self: @Self, w: @&Writer) -> i64
+```
+
+```ritz
+import ritzlib.fmt
+import ritzlib.span
+
+struct Point
+    x: i64
+    y: i64
+
+impl Display for Point
+    fn show(self: @Point, w: @&Writer) -> i64
+        let before: i64 = w.len
+        format_into(w, "({self.x}, {self.y})")
+        w.len - before
+
+fn main() -> i32
+    var buf: [32]u8
+    var w: Writer = span_writer(span_from_ptr<u8>(@buf[0], 32))
+    let p = Point { x: 3, y: 4 }
+    fmt_show_with(@p, @&w, ">8")          # "  (3, 4)"
+    fmt_show_i64_with(255, @&w, "08x")    # "000000ff"
+    (writer_len(@w) - 16) as i32
+```
+
+**The built-in types** (`ritzlib.fmt.impls`). A primitive or built-in type
+can't have an `impl` yet (§12.2, LARB R36), so for each of `i8`..`i64`,
+`u8`..`u64`, `bool`, `strview`, `string` (`@String`), `cstr` (`*u8`) and
+`bytes` (`Span<u8>`) there are three fns: `fmt_show_T(v, w)`,
+`fmt_show_T_with(v, w, spec)` and `fmt_debug_T(v, w)`. `String` also has
+the real `impl Display` and `impl Debug`. Debug quotes text and escapes `"`,
+`\`, `\n`, `\t`, `\r` and other bytes outside `' '`..`'~'` as `\xNN`;
+`Span<u8>` is `[1, 2, 255]`; integers and `bool` are as Display.
+
+**Specs** (`ritzlib.fmt.spec`). `fmt_spec_parse(spec: StrView) -> FmtSpec`
+reads the v1 set: `x` `X` `b` `o`, a width before them with an optional
+`0` for zero padding (`08x`), `<N` `>N` `^N`, and `?`. Anything else has
+`ok == false`, and the `_with` fns then write nothing and return -1. Under
+`x` `X` `b` `o` a negative signed value prints its two's complement at its own
+width (`-1 as i8` is `ff`). A width never truncates.
 
 ### ct
 

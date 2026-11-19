@@ -19,6 +19,7 @@ from tokens import Token, TokenType, Span, KEYWORDS
 from lexer import Lexer, LexerError, UNMATCHED_INDENT, relayout
 import ritz_ast as rast
 import index_rules
+import interp_spec
 from qualified_access import module_item_access_removed
 from monomorph import TypeSubstitution
 
@@ -601,8 +602,8 @@ class Parser:
                 and args[0].interp is not None):
             lit = args[0]
             parts, expr_strs = lit.interp
-            exprs = [self._parse_interp_expr(e, lit.span) for e in expr_strs]
-            return [rast.InterpString(lit.span, parts, exprs)]
+            exprs, specs = self._parse_interp_placeholders(expr_strs, lit.span)
+            return [rast.InterpString(lit.span, parts, exprs, specs)]
         # AGAST #1824: format_into(sink, "...") -- the same literal rules,
         # on its second argument.
         if (isinstance(callee, rast.Ident) and callee.name == 'format_into'
@@ -610,9 +611,31 @@ class Parser:
                 and args[1].interp is not None):
             lit = args[1]
             parts, expr_strs = lit.interp
-            exprs = [self._parse_interp_expr(e, lit.span) for e in expr_strs]
-            return [args[0], rast.InterpString(lit.span, parts, exprs)]
+            exprs, specs = self._parse_interp_placeholders(expr_strs, lit.span)
+            return [args[0], rast.InterpString(lit.span, parts, exprs, specs)]
         return args
+
+    def _parse_interp_placeholders(self, expr_strs: List[str], parent_span: Span):
+        """Each placeholder's (expression, format spec): `{expr:spec}`.
+
+        AGAST #201: the spec is the text after the last top-level `:`, ""
+        for none. An unknown spec is refused here, before its expression is
+        parsed (interp_spec.py has the grammar, shared in spirit with
+        ritz1/src/interp.ritz).
+        """
+        exprs, specs = [], []
+        for raw in expr_strs:
+            colon = interp_spec.spec_colon(raw)
+            spec = ""
+            if colon >= 0:
+                spec = raw[colon + 1:]
+                raw = raw[:colon]
+                if not interp_spec.spec_valid(spec):
+                    raise ParseError(
+                        interp_spec.unknown_spec_message(raw.strip(), spec), parent_span)
+            exprs.append(self._parse_interp_expr(raw, parent_span))
+            specs.append(spec)
+        return exprs, specs
 
     def _parse_interp_expr(self, expr_str: str, parent_span: Span) -> rast.Expr:
         """Parse an expression string from inside an interpolated string.
@@ -2957,6 +2980,14 @@ class Parser:
 
         if self._at(TokenType.DEDENT):
             self._advance()
+
+        # LANGUAGE_SPEC §15.2: a trait impl's methods need no `pub`; they are
+        # reachable wherever the trait is. A generic over the trait in another
+        # file (ritzlib.fmt's `fmt_show<T>` calling a user's `Point.show`)
+        # calls them from there (AGAST #201, test_trait_impl_method_reach.py).
+        if trait_name is not None:
+            for method in methods:
+                method.is_pub = True
 
         block = rast.ImplBlock(span, trait_name, type_name, methods, type_params, impl_type,
                                type_param_bounds=type_param_bounds)

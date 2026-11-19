@@ -52,6 +52,38 @@ fn emit_print_error(s: *EmitterState, lit: *Expr, msg: *u8)
     eprint_char('\n')
     s.error_count = s.error_count + 1
 
+fn eprint_bytes_n(p: *u8, n: i32)
+    var i: i32 = 0
+    while i < n
+        eprint_char(*(p + i))
+        i = i + 1
+
+# A placeholder `{expr:spec}` (`expr` is `elen` bytes, untrimmed): refuse an
+# unknown spec, and -- until AGAST #202 prints specs through ritzlib.fmt's
+# Display -- a valid one, rather than print the value without it. ritz0's
+# messages are interp_spec.py's, word for word.
+fn emit_spec_error(s: *EmitterState, lit: *Expr, expr: *u8, elen: i32, spec: *u8, slen: i32)
+    diag_error_at(emitter_source_file(), lit.span)
+    if interp_spec_valid(spec, slen) == 0
+        var lo: i32 = 0
+        let n: i32 = interp_trim(expr, elen, @lo)
+        eprints_cstr(c"unknown format spec `")
+        eprint_bytes_n(spec, slen)
+        eprints_cstr(c"` in `{")
+        eprint_bytes_n(expr + lo, n)
+        eprint_char(':')
+        eprint_bytes_n(spec, slen)
+        eprints_cstr(c"}`: the v1 specs are x X b o, a zero-padded width (08x), <N >N ^N and ?")
+    else
+        eprints_cstr(c"format spec `")
+        eprint_bytes_n(spec, slen)
+        eprints_cstr(c"` is parsed but not printed until AGAST #202; drop `:")
+        eprint_bytes_n(spec, slen)
+        eprints_cstr(c"` for now")
+    eprint_char('\n')
+    emit_str(s, c"  ; ERROR: format spec\n")
+    s.error_count = s.error_count + 1
+
 fn emit_print_zero(s: *EmitterState) -> i32
     let z: i32 = next_reg(s)
     emit_str(s, c"  ")
@@ -313,13 +345,21 @@ fn emit_interp_literal(s: *EmitterState, fd: i64, k: *FmtSink, lit: *Expr) -> i3
                 emit_interp_bytes(s, fd, k, buf + start, w - start)
             start = w
             placeholders = placeholders + 1
-            let e: *Expr = interp_parse_expr(body + i + 1, close - i - 1, lit.span.line, lit.span.col)
-            if e == null
-                emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
-            else if k != null
-                fmt_push_value(s, k, lit, e)
+            let ptext: *u8 = body + i + 1
+            var plen: i32 = close - i - 1
+            # AGAST #201: `{expr:spec}`. An unknown spec is refused; a valid
+            # one too, until AGAST #202 prints it.
+            let colon: i32 = interp_spec_colon(ptext, plen)
+            if colon >= 0
+                emit_spec_error(s, lit, ptext, colon, ptext + colon + 1, plen - colon - 1)
             else
-                emit_print_value(s, fd, lit, e)
+                let e: *Expr = interp_parse_expr(ptext, plen, lit.span.line, lit.span.col)
+                if e == null
+                    emit_print_error(s, lit, c"invalid interpolation expression: a `{...}` placeholder must hold exactly one expression (write `{{` for a literal brace)")
+                else if k != null
+                    fmt_push_value(s, k, lit, e)
+                else
+                    emit_print_value(s, fd, lit, e)
             i = close + 1
         else
             *(buf + w) = c as u8

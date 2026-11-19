@@ -1,0 +1,92 @@
+# ritzlib/fmt/display.ritz - the Display and Debug traits
+#
+# AGAST #201 (#198 Phase 2, docs/V1_ABI_CLEANUP.md "Core trait").
+#
+#     struct Point
+#         x: i64
+#         y: i64
+#
+#     impl Display for Point
+#         fn show(self: @Point, w: @&Writer) -> i64
+#             format_into(w, "({self.x}, {self.y})")
+#             0
+#
+# `show` writes the value to the Writer and returns the bytes written, or a
+# negative value on error. The receiver is `@Self`: shown values are
+# borrowed, never copied (LARB #4016 rules the receiver syntax). `{p}` is
+# Display and `{p:?}` is Debug, whose method is `show_debug`: methods resolve
+# by name on the concrete type (§12.2), so the two traits can't share one.
+#
+# A spec's width and alignment work for every Display type, through
+# fmt_show_with below; a type writes only its plain form. Integers also take
+# x X b o and zero padding (ritzlib.fmt.impls).
+#
+# Built-in types can't have impls yet (LARB R36), so their Display and Debug
+# are the fmt_show_T / fmt_debug_T fns in ritzlib.fmt.impls. String is a
+# ritzlib struct, so its impls are here, in the trait's file (§12.2, R65).
+
+import ritzlib.fmt.impls
+import ritzlib.fmt.spec
+import ritzlib.fmt.writer
+import ritzlib.string
+
+pub trait Display
+    fn show(self: @Self, w: @&Writer) -> i64
+
+pub trait Debug
+    fn show_debug(self: @Self, w: @&Writer) -> i64
+
+impl Display for String
+    fn show(self: @String, w: @&Writer) -> i64
+        fmt_show_string(self, w)
+
+impl Debug for String
+    fn show_debug(self: @String, w: @&Writer) -> i64
+        fmt_debug_string(self, w)
+
+# The generics below are written `<T>`, not `<T: Display>`: ritz1 can't parse
+# a bound yet (#3469). A bound is a check only (§11.5, LARB R55), so the
+# lookup of `show` on T is the same either way; a T without `show` is an
+# error inside the instance instead of at the call. The bounds go back on
+# with #3469 (#4295).
+
+# v's Display.
+pub fn fmt_show<T>(v: @T, w: @&Writer) -> i64
+    v.show(w)
+
+# v's Debug.
+pub fn fmt_show_debug<T>(v: @T, w: @&Writer) -> i64
+    v.show_debug(w)
+
+# v's Display under a format spec's width and alignment (left by default).
+# The value is measured with a null_writer first, so `show` runs twice when
+# there is padding to place. A radix or zero flag means nothing to a struct
+# and is ignored; `?` needs Debug, so it is fmt_show_debug, not this.
+pub fn fmt_show_with<T>(v: @T, w: @&Writer, spec: StrView) -> i64
+    let s: FmtSpec = fmt_spec_parse(spec)
+    if not s.ok or s.debug
+        return -1
+    if s.width == 0
+        return v.show(w)
+    var probe: Writer = null_writer()
+    let n: i64 = v.show(@&probe)
+    if n < 0
+        return n
+    let pad: i64 = s.width - probe.len
+    if pad <= 0
+        return v.show(w)
+    var before: i64 = 0
+    if s.align == FMT_ALIGN_RIGHT
+        before = pad
+    else if s.align == FMT_ALIGN_CENTER
+        before = pad / 2
+    let a: i64 = writer_write_fill(w, 32, before)
+    if a < 0
+        return a
+    let b: i64 = v.show(w)
+    if b < 0
+        return b
+    let c: i64 = writer_write_fill(w, 32, pad - before)
+    if c < 0
+        return c
+    s.width

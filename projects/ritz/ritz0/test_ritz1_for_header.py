@@ -48,7 +48,7 @@ GVEC = "import ritzlib.gvec\n\n"
 ENV = dict(os.environ, RITZ_PATH=str(RITZ_ROOT))
 
 # What ritzlib.gvec's `realloc` needs, as build.py would link it.
-UNITS = ("memory", "sys", "str", "fmt")
+UNITS = ("memory", "sys", "str", "fmt/digits")
 
 
 def _emit(compiler, ritz1_bin, src: Path, ll: Path):
@@ -73,14 +73,14 @@ def library_objects(compiler, ritz1_bin, units: tuple) -> tuple:
     atexit.register(shutil.rmtree, work, True)
     objects = []
     for unit in units:
-        ll, src = work / f"{unit}.ll", RITZ_ROOT / "ritzlib" / f"{unit}.ritz"
+        ll, src = work / f"{unit.replace('/', '_')}.ll", RITZ_ROOT / "ritzlib" / f"{unit}.ritz"
         if compiler == "ritz0":
             comp = ritz0_inproc.run_ritz0([str(src), "-o", str(ll), "--no-runtime"], cwd=work, env=ENV,
                                           timeout=300)
         else:
             comp = _emit(compiler, ritz1_bin, src, ll)
         assert comp.returncode == 0, comp.stdout + comp.stderr
-        obj = work / f"{unit}.o"
+        obj = ll.with_suffix(".o")
         fast_link.clang(["clang", "-w", "-c", str(ll), "-o", str(obj)], check=True)
         objects.append(str(obj))
     return tuple(objects)

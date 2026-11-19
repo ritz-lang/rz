@@ -1,0 +1,248 @@
+# ritzlib.fmt.impls and ritzlib.fmt.spec: the built-in types' Display and
+# Debug, and the v1 format specs (AGAST #201).
+#
+# Runs under ritz0 (the package step) and ritz1 / ritz1_selfhosted
+# (make ritzlib-tests-ritz1).
+
+import ritzlib.fmt
+import ritzlib.string
+import ritzlib.span
+import ritzlib.strview
+
+var g_buf: [256]u8
+
+fn fresh() -> Writer
+    span_writer(span_from_ptr<u8>(@g_buf[0], 256))
+
+fn view_is(w: @Writer, want: StrView) -> bool
+    strview_eq(writer_view(w), want)
+
+# ============================================================================
+# Specs
+# ============================================================================
+
+[[test]]
+fn test_spec_parse_the_v1_set() -> i32
+    let e: FmtSpec = fmt_spec_parse("")
+    assert e.ok and e.radix == 10 and e.width == 0 and not e.debug
+    let x: FmtSpec = fmt_spec_parse("x")
+    assert x.ok and x.radix == 16 and not x.upper
+    let X: FmtSpec = fmt_spec_parse("X")
+    assert X.ok and X.radix == 16 and X.upper
+    let z: FmtSpec = fmt_spec_parse("08x")
+    assert z.ok and z.zero and z.width == 8 and z.radix == 16
+    let b: FmtSpec = fmt_spec_parse("b")
+    assert b.ok and b.radix == 2
+    let o: FmtSpec = fmt_spec_parse("o")
+    assert o.ok and o.radix == 8
+    let l: FmtSpec = fmt_spec_parse("<20")
+    assert l.ok and l.align == FMT_ALIGN_LEFT and l.width == 20
+    let r: FmtSpec = fmt_spec_parse(">4")
+    assert r.ok and r.align == FMT_ALIGN_RIGHT and r.width == 4
+    let c: FmtSpec = fmt_spec_parse("^40")
+    assert c.ok and c.align == FMT_ALIGN_CENTER and c.width == 40
+    let d: FmtSpec = fmt_spec_parse("?")
+    assert d.ok and d.debug
+    0
+
+[[test]]
+fn test_spec_parse_refuses_the_rest() -> i32
+    assert not fmt_spec_parse("d").ok
+    assert not fmt_spec_parse("<").ok       # an alignment needs a width
+    assert not fmt_spec_parse("<4x").ok     # and nothing after it
+    assert not fmt_spec_parse("0x").ok      # a '0' needs a width
+    assert not fmt_spec_parse("0").ok
+    assert not fmt_spec_parse("8").ok       # a width alone isn't a spec
+    assert not fmt_spec_parse("xx").ok
+    assert not fmt_spec_parse("*<8").ok     # fill characters are v1.1+
+    assert not fmt_spec_parse("#?").ok
+    assert not fmt_spec_parse(".3").ok
+    assert not fmt_spec_parse(">99999").ok  # width capped at 4096
+    0
+
+# ============================================================================
+# Integers
+# ============================================================================
+
+[[test]]
+fn test_show_signed_decimal() -> i32
+    var w: Writer = fresh()
+    fmt_show_i64(-42, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_i64(-9223372036854775807 - 1, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_i32(2147483647, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_i16(-32768 as i16, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_i8(-1 as i8, @&w)
+    assert view_is(@w, "-42 -9223372036854775808 2147483647 -32768 -1")
+    0
+
+[[test]]
+fn test_show_unsigned_decimal() -> i32
+    var w: Writer = fresh()
+    fmt_show_u64(18446744073709551615, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_u32(4000000000, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_u16(65535, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_u8(200, @&w)
+    assert view_is(@w, "18446744073709551615 4000000000 65535 200")
+    0
+
+[[test]]
+fn test_show_returns_the_byte_count() -> i32
+    var w: Writer = fresh()
+    assert fmt_show_i64(-123, @&w) == 4
+    assert fmt_show_u8(0, @&w) == 1
+    assert fmt_show_i64_with(255, @&w, "08x") == 8
+    assert fmt_show_i64_with(1, @&w, "nope") == -1
+    assert view_is(@w, "-1230000000ff")
+    0
+
+[[test]]
+fn test_radix_specs() -> i32
+    var w: Writer = fresh()
+    fmt_show_u64_with(3735928559, @&w, "x")
+    writer_write_byte(@&w, 32)
+    fmt_show_u64_with(3735928559, @&w, "X")
+    writer_write_byte(@&w, 32)
+    fmt_show_i64_with(42, @&w, "08x")
+    writer_write_byte(@&w, 32)
+    fmt_show_u8_with(90, @&w, "b")
+    writer_write_byte(@&w, 32)
+    fmt_show_u32_with(493, @&w, "o")
+    writer_write_byte(@&w, 32)
+    fmt_show_u64_with(0, @&w, "x")
+    assert view_is(@w, "deadbeef DEADBEEF 0000002a 1011010 755 0")
+    0
+
+[[test]]
+fn test_radix_of_a_negative_is_its_twos_complement() -> i32
+    var w: Writer = fresh()
+    fmt_show_i8_with(-1 as i8, @&w, "x")
+    writer_write_byte(@&w, 32)
+    fmt_show_i16_with(-2 as i16, @&w, "X")
+    writer_write_byte(@&w, 32)
+    fmt_show_i32_with(-1, @&w, "x")
+    writer_write_byte(@&w, 32)
+    fmt_show_i64_with(-1, @&w, "x")
+    writer_write_byte(@&w, 32)
+    fmt_show_i8_with(-128 as i8, @&w, "b")
+    assert view_is(@w, "ff FFFE ffffffff ffffffffffffffff 10000000")
+    0
+
+[[test]]
+fn test_width_and_alignment_of_numbers() -> i32
+    var w: Writer = fresh()
+    fmt_show_i64_with(7, @&w, ">4")
+    writer_write_byte(@&w, 124)
+    fmt_show_i64_with(7, @&w, "<4")
+    writer_write_byte(@&w, 124)
+    fmt_show_i64_with(7, @&w, "^5")
+    writer_write_byte(@&w, 124)
+    fmt_show_i64_with(-7, @&w, "05x")      # x of -7 is its two's complement
+    writer_write_byte(@&w, 124)
+    fmt_show_i64_with(12345, @&w, ">3")    # a width never truncates
+    writer_write_byte(@&w, 124)
+    fmt_show_u64_with(10, @&w, "6b")       # a bare width right-aligns
+    assert view_is(@w, "   7|7   |  7  |fffffffffffffff9|12345|  1010")
+    0
+
+[[test]]
+fn test_debug_of_integers_is_display() -> i32
+    var w: Writer = fresh()
+    fmt_debug_i32(-5, @&w)
+    fmt_debug_u8(9, @&w)
+    fmt_show_i64_with(3, @&w, "?")
+    assert view_is(@w, "-593")
+    0
+
+# ============================================================================
+# bool and text
+# ============================================================================
+
+[[test]]
+fn test_bool() -> i32
+    var w: Writer = fresh()
+    fmt_show_bool(true, @&w)
+    fmt_show_bool(false, @&w)
+    fmt_debug_bool(true, @&w)
+    fmt_show_bool_with(false, @&w, ">7")
+    assert view_is(@w, "truefalsetrue  false")
+    0
+
+[[test]]
+fn test_strview_display_and_width() -> i32
+    var w: Writer = fresh()
+    fmt_show_strview("hi", @&w)
+    writer_write_byte(@&w, 124)
+    fmt_show_strview_with("ab", @&w, "<5")
+    writer_write_byte(@&w, 124)
+    fmt_show_strview_with("ab", @&w, ">5")
+    writer_write_byte(@&w, 124)
+    fmt_show_strview_with("ab", @&w, "^6")
+    writer_write_byte(@&w, 124)
+    fmt_show_strview_with("ab", @&w, "^5")  # the odd pad goes after
+    writer_write_byte(@&w, 124)
+    fmt_show_strview_with("toolong", @&w, "<3")
+    assert view_is(@w, "hi|ab   |   ab|  ab  | ab  |toolong")
+    0
+
+[[test]]
+fn test_strview_debug_quotes_and_escapes() -> i32
+    var w: Writer = fresh()
+    fmt_debug_strview("a\"b\\c\n\t\r\x01\x7f!", @&w)
+    assert view_is(@w, "\"a\\\"b\\\\c\\n\\t\\r\\x01\\x7f!\"")
+    var e: Writer = fresh()
+    fmt_show_strview_with("", @&e, "?")
+    assert view_is(@e, "\"\"")
+    0
+
+[[test]]
+fn test_string() -> i32
+    var s: String = string_from("str")
+    var w: Writer = fresh()
+    fmt_show_string(@s, @&w)
+    fmt_show_string_with(@s, @&w, ">5")
+    fmt_debug_string(@s, @&w)
+    assert view_is(@w, "str  str\"str\"")
+    string_drop(@&s)
+    0
+
+[[test]]
+fn test_cstr() -> i32
+    var w: Writer = fresh()
+    let p: *u8 = c"cs"
+    let none: *u8 = null
+    fmt_show_cstr(p, @&w)
+    assert fmt_show_cstr(none, @&w) == 0
+    fmt_show_cstr_with(p, @&w, ">4")
+    fmt_debug_cstr(p, @&w)
+    fmt_debug_cstr(none, @&w)
+    assert view_is(@w, "cs  cs\"cs\"null")
+    0
+
+[[test]]
+fn test_bytes() -> i32
+    var w: Writer = fresh()
+    var raw: [3]u8 = [104, 105, 255]
+    let s: Span<u8> = span_from_ptr<u8>(@raw[0], 3)
+    fmt_show_bytes(span_from_ptr<u8>(@raw[0], 2), @&w)
+    writer_write_byte(@&w, 32)
+    fmt_debug_bytes(s, @&w)
+    writer_write_byte(@&w, 32)
+    fmt_show_bytes_with(span_from_ptr<u8>(@raw[0], 0), @&w, "?")
+    assert view_is(@w, "hi [104, 105, 255] []")
+    0
+
+[[test]]
+fn test_a_full_writer_stops_the_formatter() -> i32
+    var small: [3]u8
+    var w: Writer = span_writer(span_from_ptr<u8>(@small[0], 3))
+    assert fmt_show_i64(12345, @&w) < 0
+    assert fmt_debug_strview("abcdef", @&w) < 0
+    assert fmt_show_strview_with("a", @&w, ">9") < 0
+    0

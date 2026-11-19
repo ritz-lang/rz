@@ -1,8 +1,9 @@
 # V1 ABI / Idiom Cleanup
 
 **Status:** Phase 1 (runtime + `main` ABI, AGAST #200) landed on main for
-ritz0 and ritz1, 2026-11-18. Phases 2-5 (#201-#204) follow, one room each,
-in order. Redone on current main after Aaron's decision of 2026-11-18 (#198:
+ritz0 and ritz1, 2026-11-18. Phase 2 (Writer, Display, format specs, #201)
+landed 2026-11-20; see "Phase 2 as built". Phases 3-5 (#202-#204) follow,
+one room each, in order. Redone on current main after Aaron's decision of 2026-11-18 (#198:
 "Hell yeah, redo that shit. Ritz-ify it.").
 **Driver:** AGAST `#198` (with phase subtasks).
 
@@ -400,6 +401,57 @@ Phase 5 removes them.
 5. Format-spec parsing in the lexer; spec passed compile-time-constant to
    `Display::show_with` / `Debug::show_with`.
 
+### Phase 2 as built (#201, 2026-11-20)
+
+The sketches above are the plan; this is what landed. Where they differ, this
+wins.
+
+- **Modules.** `ritzlib.fmt` is the one import: it `pub import`s
+  `ritzlib.fmt.{digits,spec,writer,impls,display}` and `ritzlib.io`, and
+  defines `write`, `writeln` and `format`. The old `ritzlib.fmt` (the integer
+  digit routines) is now `ritzlib.fmt.digits`, and every importer moved. It
+  had to: `string` imports the digits, `writer` imports `string`, an import
+  cycle is an error, and the digits are core (freestanding) while the
+  Writer is hosted (`tools/ritzlib_layers.py`).
+- **print / eprint are builtins** with interpolation (LANGUAGE_SPEC §2.6,
+  #1641, #2102), and `println` / `eprintln` stay in `ritzlib.io`.
+  `ritzlib.fmt` adds none of the four; it reaches `println` / `eprintln`
+  through `pub import ritzlib.io`.
+- **Writer.** `sink: fn(@&Writer, *u8, i64) -> i64`, `state: *u8`, `fd`,
+  `cap`, `len`. Lengths are `i64` like the rest of ritzlib, not `i32`. A
+  `span_writer` write that doesn't fit is -1 and writes nothing. `len` counts
+  bytes accepted, so `null_writer` measures. A Writer has `push_bytes`, so
+  it is a `format_into` sink: `format_into(@&w, "x={x}")` works on any sink
+  today.
+- **Traits.** `Display.show(self: @Self, w: @&Writer) -> i64` and
+  `Debug.show_debug(...)`. Debug's method can't also be called `show`:
+  methods resolve by name on the concrete type (§12.2), so a type with both
+  impls would have two `show`s. Traits have no default methods, so
+  `show_with` is not a trait method: `fmt_show_with<T>(v, w, spec)` pads any
+  Display type to a spec's width (measuring with a `null_writer`), and the
+  integer impls take radix specs themselves. `fmt_show<T>` and
+  `fmt_show_debug<T>` are the generic calls.
+- **Impls on built-ins are fns.** `impl Display for i64` (or `StrView`,
+  `Span<u8>`, `*u8`) is refused (§12.2, LARB R36 / R26), so
+  `ritzlib.fmt.impls` has `fmt_show_T`, `fmt_show_T_with` and `fmt_debug_T`
+  for each built-in `T`. Phase 3 lowers `{x}` to these by `x`'s type. `String`
+  gets real impls, in the trait's file (R65). R36's revisit, trait impls on
+  primitives in the trait's file, is LARB #4294.
+- **No bounds yet.** The generics are `<T>`, not `<T: Display>`: ritz1 can't
+  parse a bound until #3469. A bound is a check only (R55), so lookup is the
+  same; the bounds go on with #3469 (#4295).
+- **Trait impl methods are reachable.** §15.2 says they need no `pub`; ritz0
+  refused a call from a generic in another file and ritz1 gave them internal
+  linkage. Both now mark a trait impl's methods `pub` at the parse
+  (`ritz0/test_trait_impl_method_reach.py`).
+- **Specs.** `ritzlib.fmt.spec`'s `fmt_spec_parse` is the runtime grammar,
+  and the compilers lex `{expr:spec}` with the same grammar (see
+  LANGUAGE_SPEC §2.6). An unknown spec is a compile error. A valid one is
+  refused at the emitter until Phase 3 prints it, so nothing prints a
+  placeholder wrongly in between.
+- **Tests:** `ritzlib/tests/test_fmt_{writer,impls,display}.ritz` on ritz0,
+  ritz1 and ritz1_selfhosted.
+
 ### Phase 3 — emitter dispatches via trait (0.5 day)
 
 1. Replace `_emit_print_value` hardcoded type-dispatch with trait-method
@@ -480,11 +532,13 @@ forms work. Phase 5 removes the old ones in one commit.
 ## Implementation-time questions
 
 1. **`@Self` vs `&Self` syntax in trait declarations.** The lean is `@Self`,
-   matching existing impl blocks. **Moved to LARB: #4016** (Phase 2 needs it).
+   matching existing impl blocks. **Moved to LARB: #4016.** Phase 2 shipped
+   `self: @Self` with `w: @&Writer`, the shape §11.5 and §12 already use.
 
 2. **Generic Display impls** (`impl<T: Display> Display for Span<T>`, …).
-   **Moved to LARB: #4017.** If ritz0 lacks bounded generic impls, Phase 2
-   ships monomorphic impls for the common `Span<T>` substitutions.
+   **Moved to LARB: #4017.** Phase 2 shipped no generic impls: built-ins
+   can't have impls at all yet (R36), and ritz1 can't parse a bound (#3469).
+   `Span<u8>` has its fns (`fmt_show_bytes`); other `Span<T>` wait on both.
 
 3. **`fn main` not `pub` is silently accepted.** **RESOLVED (Phase 1):** both
    compilers special-case `main`'s linkage by name, so it widens nothing else.

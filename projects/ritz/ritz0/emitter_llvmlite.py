@@ -24,6 +24,7 @@ import array_rules
 from qualified_access import module_item_access_removed
 from builtin_types import BUILTIN_TYPES
 import index_rules
+import interp_spec
 import deref_rules
 import ref_rules
 import let_rules
@@ -450,6 +451,35 @@ def _byval_align(ty: ir.Type) -> int:
 # attributes such as `sret(%T)`. The regexes over `define`/`declare` lines
 # used `\([^)]*\)`, which stops inside `sret(` (AGAST #1736).
 _IR_PARAMS = r'\((?:[^()]|\([^()]*\))*\)'
+
+# AGAST #201: the `define` line of an ODR definition, split where `comdat`
+# goes (after the attributes, before `!dbg` / `{`). llvmlite quotes names.
+_ODR_DEFINE = re.compile(
+    r'^(define (?:linkonce_odr|weak_odr) [^\n]*?@("[^"]+")' + _IR_PARAMS
+    + r'[^\n!{]*?)((?: !dbg !\d+)?(?: \{)?)$', re.M)
+
+
+def _add_odr_comdats(ir_str: str) -> str:
+    """Put every `linkonce_odr` / `weak_odr` *function* in its own comdat.
+
+    A monomorph (and a generated `E__from`, #2160) is defined in every
+    object that uses it, for the linker to keep one copy.  On ELF a linkonce
+    definition is a weak symbol and that just works.  On COFF (a `*-uefi`
+    [[bin]] compiles for x86_64-windows-gnu) one without a comdat lowers to
+    a plain weak external, and lld-link reports two of them as a duplicate
+    symbol: harland's hwinv, once ritzlib.io and ritzlib.string both
+    instantiated Vec<u8>.  Clang gives every C++ inline/template definition
+    a same-named `comdat any` on every target; so does this, and ritz1
+    (emit_odr_comdat).  The `$name = comdat any` line goes just before the
+    define: module-level entities may come in any order.
+
+    Globals are deliberately not matched: a group is matched by name across
+    objects, and unrelated modules' globals share names (`g_out`).  See
+    ritz1's emit_odr_comdat_start for the SIGSEGV that cost.
+    """
+    def add(m: 're.Match') -> str:
+        return f'${m.group(2)} = comdat any\n{m.group(1)} comdat{m.group(3)}'
+    return _ODR_DEFINE.sub(add, ir_str)
 
 # AGAST #1732: instructions that cannot write memory.  A large-struct
 # `store (load src), dst` may become a copy from `src` only when everything
@@ -3635,6 +3665,9 @@ class LLVMEmitter:
         # Post-process IR to add alignstack(16) and "no-builtins" to ALL
         # functions. See _add_alignstack_to_all_functions.
         ir_str = self._add_alignstack_to_all_functions(ir_str)
+
+        # AGAST #201: every ODR definition in its own comdat, for COFF.
+        ir_str = _add_odr_comdats(ir_str)
 
         # AGAST #1736: functions calling ISA-extension intrinsics declare
         # the CPU features those intrinsics need.
@@ -8227,6 +8260,7 @@ class LLVMEmitter:
         push = self._format_sink(sink_expr, span)
 
         if isinstance(lit, rast.InterpString):
+            self._refuse_format_specs(lit)
             parts, exprs = lit.parts, lit.exprs
         else:
             text = lit.value
@@ -8445,6 +8479,15 @@ class LLVMEmitter:
         b.ret(n)
         return fn
 
+    def _refuse_format_specs(self, lit: rast.InterpString):
+        """AGAST #201: a `{x:spec}` placeholder's spec is parsed (and an
+        unknown one refused by the parser), but printing it is AGAST #202's,
+        through ritzlib.fmt's Display. Until then refuse a spec rather than
+        print the value without it."""
+        for spec in lit.specs:
+            if spec:
+                raise EmitError(interp_spec.not_printed_message(spec), lit.span)
+
     def _emit_interp_string_print(self, expr: rast.InterpString, fd: int = 1):
         """Emit print calls for an interpolated string, writing to `fd`.
 
@@ -8456,6 +8499,7 @@ class LLVMEmitter:
             prints(", y = ")
             print_int(y)
         """
+        self._refuse_format_specs(expr)
         for i, part in enumerate(expr.parts):
             # Print string literal part (if non-empty)
             if part:

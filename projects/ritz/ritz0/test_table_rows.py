@@ -372,7 +372,14 @@ def assert_refusals(compiler, tmp_path, rows, gaps=None, *, build=None, compile=
 # other way #3889 grew, each chunk a build.py package of its own, paid a python
 # start and a cold build cache, every module compiled again, per chunk.
 
-_IMPORT = re.compile(r"^import ritzlib\.(\w+)", re.MULTILINE)
+# A nested module (`ritzlib.fmt.digits`) is its path under ritzlib/
+# (`fmt/digits`), the form for_header.UNITS uses; `pub import` re-exports
+# count (AGAST #201: ritzlib.fmt is an umbrella of them).
+_IMPORT = re.compile(r"^(?:pub\s+)?import ritzlib\.([\w.]+)", re.MULTILINE)
+
+
+def _imports(text: str) -> list:
+    return [m.replace(".", "/") for m in _IMPORT.findall(text)]
 
 
 @functools.cache
@@ -383,7 +390,7 @@ def _closure(roots: tuple) -> tuple:
         unit = todo.pop()
         if unit not in seen:
             seen.add(unit)
-            todo += _IMPORT.findall((for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz").read_text())
+            todo += _imports((for_header.RITZ_ROOT / "ritzlib" / f"{unit}.ritz").read_text())
     return tuple(sorted(seen))
 
 
@@ -391,7 +398,7 @@ def ritzlib_build(ritz1_bin):
     """`check`'s `build`: compile the program and link every ritzlib module it
     imports, transitively, as build.py links a package's."""
     def build(compiler, src, work):
-        roots = tuple(sorted(set(_IMPORT.findall(src.read_text()))))
+        roots = tuple(sorted(set(_imports(src.read_text()))))
         units = tuple(u for u in _closure(roots) if u not in for_header.UNITS)
         return for_header.batch_build(
             ritz1_bin, lambda c: for_header.library_objects(c, ritz1_bin, units))(compiler, src, work)

@@ -28,8 +28,8 @@ pytestmark = pytest.mark.integration
 VMM_SRC = KERNEL_SRC / "mm" / "vmm.ritz"
 
 # vmm imports serial and io, whose `asm x86_64:` blocks only ritz0 parses;
-# serial imports ritzlib.fmt (#1957).
-VMM_MODULES = ["mm.vmm", "mm.pmm", "serial", "io", "ritzlib.fmt"]
+# serial imports ritzlib.fmt.digits (#1957).
+VMM_MODULES = ["mm.vmm", "mm.pmm", "serial", "io", "ritzlib.fmt.digits"]
 
 GIB = 1 << 30
 SIX_GIB_PAGES = 6 * GIB // 4096

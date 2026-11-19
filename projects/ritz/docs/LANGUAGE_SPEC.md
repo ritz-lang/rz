@@ -475,6 +475,37 @@ fn main() -> i32
     return 0
 ```
 
+**Format specs:** a placeholder may end in a format spec, `{expr:spec}`
+(AGAST #201). The spec is the text after the placeholder's last top-level `:`,
+one not inside `()`, `[]`, `{}` or a string or character literal within the
+expression, so `{P { x: 1 }.x}` has none. The spec holds no whitespace and is
+one of the v1 set:
+
+| Spec | Means |
+|------|-------|
+| `x` `X` `b` `o` | hex (lower / upper), binary, octal |
+| `08x`, `8x` | `[0][N]` then one of `x X b o`: a width, zero-padded with a leading `0` (which needs the width) |
+| `<N` `>N` `^N` | left / right / centre in a width of `N` |
+| `?` | Debug rather than Display |
+
+`N` is decimal digits, at most 4096. Anything else, including the empty spec
+of `{x:}`, a fill character, a precision or `#?`, is a compile error at the
+literal:
+
+```ritz body expect-error="unknown format spec `d` in `{x:d}`: the v1 specs are x X b o, a zero-padded width (08x), <N >N ^N and ?"
+let x: i32 = 42
+print("{x:d}\n")
+```
+
+A valid spec is parsed, but printing it lands with AGAST #202 (through
+`ritzlib.fmt`'s Display). Until then a placeholder with a spec is refused
+rather than printed without it:
+
+```ritz body expect-error="format spec `08x` is parsed but not printed until AGAST #202; drop `:08x` for now"
+let x: i32 = 42
+print("{x:08x}\n")
+```
+
 #### Formatting into a buffer: `format_into`
 
 `format_into(sink, "...")` appends instead of printing (AGAST #1824). The

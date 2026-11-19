@@ -53,7 +53,7 @@ PLAIN_WIPE = "for j in 0..37\n        key[j] = 0"
 
 # Each compiler emits one module per source; an imported fn is a `declare`.
 # ritzlib.memory and what it imports, compiled alongside the program.
-RITZLIB_MODULES = ("memory", "str", "sys", "fmt")
+RITZLIB_MODULES = ("memory", "str", "sys", "fmt/digits")
 
 
 def _llvm_tool(name):
@@ -73,7 +73,7 @@ def _modules(compiler, tmp_path, src, name):
     lls = [_ir(compiler, tmp_path, src, name)]
     for mod in RITZLIB_MODULES:
         lls.append(_ir(compiler, tmp_path, (RITZ_ROOT / "ritzlib" / f"{mod}.ritz").read_text(),
-                       f"ritzlib_{mod}"))
+                       f"ritzlib_{mod.replace('/', '_')}"))
     return lls
 
 

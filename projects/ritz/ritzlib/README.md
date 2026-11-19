@@ -73,7 +73,12 @@ pub fn main() -> i32
 | `drop.ritz` | `ritzlib.drop` | Drop trait for automatic cleanup |
 | `elf.ritz` | `ritzlib.elf` | ELF Binary Format Parser |
 | `errno.ritz` | `ritzlib.errno` | `Errno`, a typed kernel error code (AGAST #4248) |
-| `fmt.ritz` | `ritzlib.fmt` | the one integer-to-text digit routine |
+| `fmt.ritz` | `ritzlib.fmt` | formatting and printing: the one import |
+| `fmt/digits.ritz` | `ritzlib.fmt.digits` | the one integer-to-text digit routine |
+| `fmt/display.ritz` | `ritzlib.fmt.display` | the Display and Debug traits |
+| `fmt/impls.ritz` | `ritzlib.fmt.impls` | Display and Debug for the built-in types |
+| `fmt/spec.ritz` | `ritzlib.fmt.spec` | the `{x:spec}` format specifiers, parsed |
+| `fmt/writer.ritz` | `ritzlib.fmt.writer` | Writer: one byte sink for every formatter |
 | `fs.ritz` | `ritzlib.fs` | Filesystem utility functions |
 | `gvec.ritz` | `ritzlib.gvec` | Generic dynamic array |
 | `hash.ritz` | `ritzlib.hash` | Hashing utilities |

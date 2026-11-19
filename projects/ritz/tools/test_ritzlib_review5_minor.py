@@ -36,17 +36,17 @@ def _files(root: Path, pattern: str):
 
 
 def test_no_digit_loop_outside_fmt():
-    """`git grep -nE '% 10([^0-9]|$)' ritzlib -- ':!*fmt.ritz' ':!*test*'` is empty."""
+    """`git grep -nE '% 10([^0-9]|$)' ritzlib -- ':!*fmt/digits.ritz' ':!*test*'` is empty."""
     digit_loop = re.compile(r"% 10(?![0-9])")
     offenders = []
     for path in _files(RITZLIB, "*"):
         rel = str(path.relative_to(RITZLIB))
-        if rel.endswith("fmt.ritz") or "test" in rel:
+        if rel == "fmt/digits.ritz" or "test" in rel:
             continue
         for n, line in enumerate(path.read_text(errors="replace").splitlines(), 1):
             if digit_loop.search(line):
                 offenders.append(f"{rel}:{n}: {line.strip()}")
-    assert offenders == [], "format integers through ritzlib.fmt:\n" + "\n".join(offenders)
+    assert offenders == [], "format integers through ritzlib.fmt.digits:\n" + "\n".join(offenders)
 
 
 def test_ptr_header_makes_no_container_claim_unless_true():

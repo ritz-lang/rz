@@ -1,0 +1,95 @@
+# ritzlib/fmt/spec.ritz - the `{x:spec}` format specifiers, parsed
+#
+# AGAST #201 (#198 Phase 2). The v1 set (V1_ABI_CLEANUP "Format specifiers"):
+#
+#     x  X       hex, lower / upper          {addr:x}   7ffe9a3c1234
+#     b  o       binary, octal               {mode:o}   755
+#     08x        zero-padded to width 8      {err:08x}  0000002a
+#                (any width, with x X b o)
+#     <N >N ^N   left / right / centre in N  {name:<20}
+#     ?          Debug, not Display          {p:?}
+#
+# and the empty spec, which is plain Display. Nothing else is a spec: no
+# fill character, no precision, no `#?` (v1.1+). The compilers check a
+# literal's specs with the same grammar at compile time, so a spec reaching
+# a show_with fn is valid; fmt_spec_parse still answers `ok: false` for any
+# other text, and the show_with fns then write nothing and return -1.
+
+pub const FMT_ALIGN_NONE: u8 = 0
+pub const FMT_ALIGN_LEFT: u8 = 60     # '<'
+pub const FMT_ALIGN_RIGHT: u8 = 62    # '>'
+pub const FMT_ALIGN_CENTER: u8 = 94   # '^'
+
+pub struct FmtSpec
+    ok: bool       # false: not a spec in the v1 set
+    radix: u64     # 10, 16, 2 or 8
+    upper: bool    # X: 'A'..'F'
+    zero: bool     # 08x: pad with '0' after any sign, on the left
+    align: u8      # FMT_ALIGN_*
+    width: i64     # minimum width in bytes; 0 for none
+    debug: bool    # ?: Debug's form
+
+pub fn fmt_spec_default() -> FmtSpec
+    FmtSpec { ok: true, radix: 10, upper: false, zero: false, align: FMT_ALIGN_NONE, width: 0, debug: false }
+
+fn fmt_spec_bad() -> FmtSpec
+    var s: FmtSpec = fmt_spec_default()
+    s.ok = false
+    s
+
+fn fmt_is_digit(c: u8) -> bool
+    c >= 48 and c <= 57
+
+# Parse the text after the `:` of a placeholder.
+pub fn fmt_spec_parse(spec: StrView) -> FmtSpec
+    var s: FmtSpec = fmt_spec_default()
+    if spec.len == 0
+        return s
+    let first: u8 = *spec.ptr
+    if spec.len == 1 and first == 63   # '?'
+        s.debug = true
+        return s
+
+    var i: i64 = 0
+    if first == FMT_ALIGN_LEFT or first == FMT_ALIGN_RIGHT or first == FMT_ALIGN_CENTER
+        s.align = first
+        i = 1
+    else if first == 48 and spec.len > 1   # '0' before a width: zero padding
+        s.zero = true
+        i = 1
+
+    # The width: required after an alignment or a '0'.
+    let digits_at: i64 = i
+    var width: i64 = 0
+    while i < spec.len and fmt_is_digit(*(spec.ptr + i))
+        width = width * 10 + (*(spec.ptr + i) - 48) as i64
+        if width > 4096
+            return fmt_spec_bad()
+        i += 1
+    s.width = width
+    let has_width: bool = i > digits_at
+
+    if s.align != FMT_ALIGN_NONE
+        # <N >N ^N: a width and nothing after it.
+        if not has_width or i != spec.len
+            return fmt_spec_bad()
+        return s
+
+    # [0][N]radix: exactly one radix letter, last.
+    if s.zero and not has_width
+        return fmt_spec_bad()
+    if i != spec.len - 1
+        return fmt_spec_bad()
+    let r: u8 = *(spec.ptr + i)
+    if r == 120         # 'x'
+        s.radix = 16
+    else if r == 88        # 'X'
+        s.radix = 16
+        s.upper = true
+    else if r == 98        # 'b'
+        s.radix = 2
+    else if r == 111       # 'o'
+        s.radix = 8
+    else
+        return fmt_spec_bad()
+    s
