@@ -66,7 +66,11 @@ struct SlotWords
     # struct; SN_ARG: the index.
     base: *u8
     base_len: i32
-    # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`, 4 `*base.name`
+    # SN_PLACE shapes 5 and 6: the field of `base` that holds the pointer.
+    mid: *u8
+    mid_len: i32
+    # SN_PLACE: 0 bare, 1 `base.name`, 2 `name[..]`, 3 `*name`, 4 `*base.name`,
+    # 5 `*base.mid.name`, 6 `**base.mid.name`
     shape: i32
     index: i32
 
@@ -105,10 +109,15 @@ fn sn_print_slot(w: *SlotWords)
         eprints_cstr(c"the place assigned is `")
         return
     eprint_char('`')
-    if w.shape == 3 or w.shape == 4
+    if w.shape >= 3
         eprint_char('*')
-    if w.shape == 1 or w.shape == 4
+    if w.shape == 6
+        eprint_char('*')
+    if w.shape == 1 or w.shape >= 4
         sn_print(w.base, w.base_len)
+        eprint_char('.')
+    if w.shape >= 5
+        sn_print(w.mid, w.mid_len)
         eprint_char('.')
     sn_print(w.name, w.name_len)
     if w.shape == 2
@@ -139,6 +148,8 @@ fn sn_words(w: *SlotWords, kind: i32, name: *u8, len: i32)
     w.name_len = len
     w.base = null
     w.base_len = 0
+    w.mid = null
+    w.mid_len = 0
     w.shape = 0
     w.index = 0
 
@@ -229,21 +240,65 @@ pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
         if f != null
             slot = narrow_known(f.field_type)
     else if k == STMT_MEMBER_ASSIGN
-        # `(*p).f = v`, the pointer expression in if_cond.  ritz0 names the
-        # place as written through the pointer, "`*p.f` is" (AGAST #4240), as
-        # it does the async lowering's `self.<local> = v` stores (`*self.n`).
-        let pe: *Expr = st.if_cond as *Expr
-        if pe != null and pe.kind == EXPR_IDENT
-            w.base = pe.ident_ptr
-            w.base_len = pe.ident_len
-            w.name = st.assign_target
-            w.name_len = st.assign_target_len
-            w.shape = 4
-            let f: *StructField = sn_local_field(sm, pe.ident_ptr, pe.ident_len, st.assign_target, st.assign_target_len)
-            if f != null
-                slot = narrow_known(f.field_type)
-            sn_async_result(sm, pe, @w)
+        slot = sn_member_assign(sm, st, @w)
     sn_check(sm, st.assign_value, slot, @w)
+
+# `(*pe).f = v`, the pointer expression `pe` in if_cond: the slot is the field
+# of the struct `pe` points at, whatever expression `pe` is (AGAST #4288: in
+# an async fn the lowering makes a pointer param `p` the future's `self.p`).
+#
+# ritz0 names the place as written through the pointer, "`*p.f` is" (AGAST
+# #4240), "`*q.p.f` is" for `(*q.p).f`, and, as it renders the async
+# lowering's `self.<local>` (`*self.n`), "`**self.p.f` is" in a lowered poll.
+fn sn_member_assign(sm: *Sema, st: *Stmt, w: *SlotWords) -> i32
+    let pe: *Expr = st.if_cond as *Expr
+    if pe == null
+        return NARROW_UNKNOWN
+    w.name = st.assign_target
+    w.name_len = st.assign_target_len
+    if pe.kind == EXPR_IDENT
+        w.base = pe.ident_ptr
+        w.base_len = pe.ident_len
+        w.shape = 4
+    else if pe.kind == EXPR_MEMBER and pe.left != null and pe.left.kind == EXPR_IDENT
+        w.base = pe.left.ident_ptr
+        w.base_len = pe.left.ident_len
+        w.mid = pe.ident_ptr
+        w.mid_len = pe.ident_len
+        w.shape = 5
+        if name_eq(w.base, w.base_len, c"self", 4) == 1 and sn_poll_fn_len(sm) > 0
+            w.shape = 6
+    else
+        w.name = null     # "the place assigned"
+        w.name_len = 0
+    var tn: *u8 = null
+    var tn_len: i32 = 0
+    sbk_receiver(sm, pe, @tn, @tn_len)
+    var slot: i32 = NARROW_UNKNOWN
+    if tn != null and tn_len > 0
+        let f: *StructField = sbk_struct_field(sm, tn, tn_len, st.assign_target, st.assign_target_len)
+        if f != null
+            slot = narrow_known(f.field_type)
+    if pe.kind == EXPR_IDENT
+        sn_async_result(sm, pe, w)
+    slot
+
+# The length of `<f>` when the fn being walked is an async fn's lowered poll,
+# `fn <f>_poll(self: *<f>_Future)`, else 0.  The lowering sets no flag on the
+# poll (and clears is_async), so it is known by its shape.
+fn sn_poll_fn_len(sm: *Sema) -> i32
+    let f: *FnDef = sm.cur_fn
+    if f == null or f.params == null or f.name_len <= 5
+        return 0
+    let fl: i32 = f.name_len - 5   # `<f>_poll` less its `_poll`
+    if name_eq(f.name + fl as i64, 5, c"_poll", 5) == 0
+        return 0
+    let tn: *u8 = f.params.param_type_name
+    if f.params.param_type_name_len != fl + 7 or name_eq(tn, fl, f.name, fl) == 0
+        return 0
+    if name_eq(tn + fl as i64, 7, c"_Future", 7) == 0
+        return 0
+    fl
 
 # An async fn's `return v` and tail, lowered (async_lower.ritz al_poll_ready)
 # to `self.__result = v` in `fn <f>_poll(self: *<f>_Future) -> bool`, are
@@ -251,24 +306,15 @@ pub fn slot_narrowing_assign(sm: *Sema, st: *Stmt)
 # #4221), not as the lowered place the user never wrote.  The slot stays the
 # field's type, which is `f`'s declared return type.
 #
-# The lowering sets no flag on the poll (and clears is_async), so it is known
-# by its shape: a written `(*self).__result = v` takes this route too, and
-# keeps its place wording, "`*self.__result` is", unless its fn is
-# `<f>_poll(self: *<f>_Future)`.
+# The poll is known by its shape (sn_poll_fn_len): a written
+# `(*self).__result = v` takes this route too, and keeps its place wording,
+# "`*self.__result` is", unless its fn is `<f>_poll(self: *<f>_Future)`.
 fn sn_async_result(sm: *Sema, pe: *Expr, w: *SlotWords)
     if name_eq(pe.ident_ptr, pe.ident_len, c"self", 4) == 0 or name_eq(w.name, w.name_len, c"__result", 8) == 0
         return
-    let f: *FnDef = sm.cur_fn
-    if f == null or f.params == null or f.name_len <= 5
-        return
-    let fl: i32 = f.name_len - 5   # `<f>_poll` less its `_poll`
-    if name_eq(f.name + fl as i64, 5, c"_poll", 5) == 0
-        return
-    let tn: *u8 = f.params.param_type_name
-    if f.params.param_type_name_len != fl + 7 or name_eq(tn, fl, f.name, fl) == 0
-        return
-    if name_eq(tn + fl as i64, 7, c"_Future", 7) == 1
-        sn_words(w, SN_RETURN, f.name, fl)
+    let fl: i32 = sn_poll_fn_len(sm)
+    if fl > 0
+        sn_words(w, SN_RETURN, sm.cur_fn.name, fl)
 
 # =============================================================================
 # Call arguments

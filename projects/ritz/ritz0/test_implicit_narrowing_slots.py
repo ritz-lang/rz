@@ -137,6 +137,23 @@ DIAGNOSTICS = {
     # the pointer, `*p.x`, at the value (#4240).
     "field_through_deref": (_fn("var q = P { x: 0 }\nlet p: *P = @q\n(*p).x = big()"),
                             4, 14, "`*p.x` is `i32`"),
+    # `(*p).x op= v` is `(*p).x = (*p).x op v`: reported at that binary's left
+    # operand, which starts at the `*`, not at the `(` (#4288).
+    "field_through_deref_op": (_fn("var q = P { x: 0 }\nlet p: *P = @q\n(*p).x += big()"),
+                               4, 6, "`*p.x` is `i32`"),
+    "field_through_deref_op_spaced": (_fn("var q = P { x: 0 }\nlet p: *P = @q\n( *p).x += big()"),
+                                      4, 7, "`*p.x` is `i32`"),
+    # The pointer may be any expression: its pointee's field is the slot.
+    "field_through_member_deref": ("struct Q\n    p: *P\n\nfn f(q: *Q) -> i32\n"
+                                   "    (*q.p).x = big()\n    0\n", 5, 16, "`*q.p.x` is `i32`"),
+    # In an async fn the pointer param is a field of the future, `*self.p`,
+    # once lowered; the store through it is judged all the same (#4288).
+    "async_field_through_param": ("async fn f(p: *P) -> i32\n    let w = await one()\n"
+                                  "    (*p).x = big()\n    0\n\nasync fn one() -> i32\n    1\n",
+                                  3, 14, "`**self.p.x` is `i32`"),
+    "async_field_through_param_op": ("async fn f(p: *P) -> i32\n    let w = await one()\n"
+                                     "    (*p).x += big()\n    0\n\nasync fn one() -> i32\n    1\n",
+                                     3, 6, "`**self.p.x` is `i32`"),
     # An async fn's result is lowered to a store into its future's
     # `__result`; the error names the fn, as a plain `return` does (#4166).
     "async_return": ("async fn f() -> i32\n    return big()\n", 2, 12, "`f` returns `i32`"),
@@ -233,6 +250,9 @@ ACCEPTED = {
     "procedure_tail":         "fn f()\n    big()\n",
     "void_fn_tail":           "fn f() -> void\n    big()\n",
     "async_fn_result":        "async fn f() -> i64\n    return big()\n",
+    "async_field_through_param_cast": ("async fn f(p: *P) -> i32\n    let w = await one()\n"
+                                       "    (*p).x = big() as i32\n    0\n\n"
+                                       "async fn one() -> i32\n    1\n"),
 }
 
 # The merge exemption judges every arm: one wide arm is still a narrowing.

@@ -2046,6 +2046,48 @@ pub fn primitive_member_refused(s: *EmitterState, e: *Expr) -> i32
     s.error_count = s.error_count + 1
     return 1
 
+# `"lit".ptr` / `"lit".len` (AGAST #4301).  A bare literal is a StrView (#98):
+# `.ptr` is its NUL-terminated @.str global, as a `c"lit"` is (a *u8, carried
+# as i64), and `.len` its byte count, known here.  ritz0 types `.len` as an
+# i64 like any StrView's, so a narrowing `let n: i32 = "lit".len` is refused
+# by both (narrowing.ritz does not exempt it as a constant).  No other field.
+fn emit_strlit_field(s: *EmitterState, e: *Expr) -> i32
+    let lit: *Expr = e.left
+    if name_eq(e.ident_ptr, e.ident_len, c"len", 3) == 1
+        let r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, r)
+        emit_str(s, c" = add i64 0, ")
+        emit_int(s, lit.string_len as i64)
+        emit_str(s, c"  ; string-literal .len\n")
+        return r
+    if name_eq(e.ident_ptr, e.ident_len, c"ptr", 3) == 1
+        let str_idx: i32 = add_string(s, lit.string_ptr, lit.string_len)
+        let gep: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, gep)
+        emit_str(s, c" = getelementptr [")
+        emit_int(s, (lit.string_len + 1) as i64)
+        emit_str(s, c" x i8], ptr @.str.")
+        emit_int(s, str_idx as i64)
+        emit_str(s, c", i64 0, i64 0\n")
+        let r: i32 = next_reg(s)
+        emit_str(s, c"  ")
+        emit_reg(s, r)
+        emit_str(s, c" = ptrtoint ptr ")
+        emit_reg(s, gep)
+        emit_str(s, c" to i64  ; string-literal .ptr\n")
+        return r
+    # deref_field.ritz refuses any other field first, in these words; this
+    # is the backstop, so a miss there is an error and never bad IR.
+    emit_str(s, c"  ; ERROR\n")
+    diag_error_at(emitter_source_file(), e.span)
+    eprints_cstr(c"`StrView` has no field `")
+    eprint_bytes(e.ident_ptr, e.ident_len)
+    eprints_cstr(c"`\n")
+    s.error_count = s.error_count + 1
+    0
+
 pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
     # expr.field - member access on struct.
     #
@@ -2065,6 +2107,8 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
                 if enum_is_generic(enum_find(e.left.ident_ptr, e.left.ident_len)) == 1
                     return emit_qualified_variant_error(s, e, c"is a variant of a generic enum: a qualified generic enum value is not supported (ritz0 rejects it too); write the unqualified form, e.g. None")
                 return emit_unit_variant_value(s, e.left.ident_ptr, e.left.ident_len, variant_idx)
+    if e.left.kind == EXPR_STRING_LIT
+        return emit_strlit_field(s, e)
     #
     # `m.K` / `m.f`: no `module.item` access (§15.3, AGAST #2215).  Was a
     # flat lookup of K (ritz0's too), so it compiled while `m.f()` did not.
