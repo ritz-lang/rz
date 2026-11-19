@@ -161,6 +161,50 @@ def test_config_file_follows_claude_config_dir(env, tmp_path: Path):
     assert json.loads((home / ".claude.json").read_text()) == {}
 
 
+@pytest.fixture(params=["ritz.git", "ritz"], ids=["bare", "bare-no-git-suffix"])
+def bare_env(env, tmp_path: Path, request):
+    """A worktree of a BARE mirror, as Borque's hostd makes them (AGAST #4256):
+    ~/borque/mirrors/ritz.git -> ~/borque/worktrees/<room>. The CLI keys trust
+    on the common git dir, which for a bare repo is the mirror dir itself."""
+    mirror = tmp_path / "mirrors" / request.param
+    wt = tmp_path / "worktrees" / "room-1"
+    subprocess.run(
+        ["git", "clone", "-q", "--bare", env["main"], str(mirror)], check=True
+    )
+    subprocess.run(
+        ["git", "-C", str(mirror), "worktree", "add", "-q", "-b", "r1", str(wt)],
+        check=True,
+    )
+    return {**env, "mirror": str(mirror.resolve()), "wt": str(wt.resolve())}
+
+
+def test_bare_worktree_apply_trusts_the_mirror_dir(bare_env):
+    """Not the worktree path alone: the CLI ignores the allow list unless
+    projects[<mirror dir>] is trusted."""
+    r = _run(bare_env, bare_env["wt"])
+    assert r.returncode == 0, r.stdout + r.stderr
+    p = _projects(bare_env)
+    assert p[bare_env["mirror"]]["hasTrustDialogAccepted"] is True
+    assert p[bare_env["wt"]]["hasTrustDialogAccepted"] is True
+    v = _run(bare_env, "--verify", bare_env["wt"])
+    assert v.returncode == 0, v.stdout + v.stderr
+    assert bare_env["mirror"] in v.stdout
+
+
+def test_bare_worktree_verify_fails_with_only_the_worktree_key(bare_env):
+    """The #2746/#1378 false pass, Borque edition: --verify must check the
+    mirror key the CLI uses, so trusting only the worktree fails. Apply first
+    so the settings file is complete and the missing key is the only gap."""
+    assert _run(bare_env, bare_env["wt"]).returncode == 0
+    d = json.loads(bare_env["cj"].read_text())
+    d["projects"].pop(bare_env["mirror"], None)
+    bare_env["cj"].write_text(json.dumps(d))
+    assert bare_env["wt"] in _projects(bare_env)
+    r = _run(bare_env, "--verify", bare_env["wt"])
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert bare_env["mirror"] in r.stderr
+
+
 def test_verify_requires_bare_bash_as_well_as_write(env):
     """--verify checks the bare Bash entry too: without it, rm / git push in a
     trusted room still reach adele's approval callback."""

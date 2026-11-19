@@ -8,8 +8,9 @@
 #   .claude/provision-room.sh --remove <worktree-path>   # drop worktree trust entry (reap)
 #
 # Config file: ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json.  Trust is set under the
-# MAIN checkout's path (the key the CLI checks for a worktree, AGAST #2746) and
-# under the worktree's own path.  See TRUST_KEY below.
+# MAIN checkout's path (the key the CLI checks for a worktree, AGAST #2746; for
+# a worktree of a BARE repo, the repo dir itself, #4256) and under the
+# worktree's own path.  See TRUST_KEY below.
 #
 # ---------------------------------------------------------------------------
 # WHY THIS EXISTS  (AGAST #1378 — measured 2026-09-08, not theorised)
@@ -129,12 +130,22 @@ CLAUDE_JSON="${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json"
 #   trusted: main checkout   -> entries honoured, callback never reached
 # This script used to trust only the worktree path, and --verify checked that
 # same path, so it passed while every Ritz room's allow list was ignored.
-# The main checkout is the parent of the common git dir.  Not a worktree (or
-# --remove after the dir is gone): fall back to the path itself.
+# The CLI's key is the common git dir minus a trailing /.git: for a normal
+# checkout, its parent (the main checkout); for a BARE repo, the repo dir
+# itself.  Borque's hostd makes room worktrees from a bare mirror
+# (~/borque/mirrors/ritz.git), and this script used to fall back to the
+# worktree path there, so every Borque room's allow list was ignored while
+# --verify passed (AGAST #4256; measured on CLI 2.1.326 for bare, bare without
+# a .git suffix, and non-bare).  --verify checks this same key.  Not a
+# worktree (or --remove after the dir is gone): fall back to the path itself.
 TRUST_KEY="$WT"
 if COMMON="$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
     COMMON="$(cd "$COMMON" && pwd -P)"
-    [[ "$(basename "$COMMON")" == .git ]] && TRUST_KEY="$(dirname "$COMMON")"
+    if [[ "$(basename "$COMMON")" == .git ]]; then
+        TRUST_KEY="$(dirname "$COMMON")"
+    else
+        TRUST_KEY="$COMMON"   # bare repo: the CLI keys on the repo dir
+    fi
 fi
 
 # Tools a headless room must never block on.  Bare names only — see fact (a).
