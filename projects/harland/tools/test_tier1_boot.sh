@@ -15,6 +15,8 @@
 #           (#2143). The display driver must come up and the suite must also
 #           report ALL TESTS PASSED. Its virtio-blk is QEMU's default
 #           transitional device, so the legacy I/O-port path stays covered.
+# Each boot's suite also runs two busy children side by side (#3629): their
+# progress lines must interleave, which only timer preemption does.
 # Each boot also injects `sendkey a` through the QEMU monitor once the kernel
 # logs "[OK] VirtIO input device"; the key must reach the kernel's input queue
 # ("[virtio-input] event type=1 code=30 value=1") and init's input check.
@@ -353,6 +355,38 @@ powered_off() {
     echo "PASS ($1): init exited and QEMU powered off"
 }
 
+# preempted NAME: pass only if the kernel calibrated its LAPIC tick and init's
+# two /bin/busy children (Tier-1 `preempt`, #3629) both finished all their
+# steps with their progress lines interleaved: the run of one child's lines
+# broken by the other's at least twice (A..B..A or B..A..B). Neither child
+# makes a syscall between lines, so without timer preemption the first runs
+# to its end before the second starts: exactly two runs.
+preempted() {
+    local log="$WORK/$1.log"
+    if ! grep -aqE '\[timer\] LAPIC timer [0-9]+ Hz .*periodic [0-9]+ Hz tick' "$log"; then
+        grep -a '\[timer\]' "$log" | head -3
+        echo "FAIL ($1): no calibrated LAPIC timer tick"
+        return 1
+    fi
+    python3 - "$log" "$1" <<'PY'
+import re, sys
+log, name = sys.argv[1], sys.argv[2]
+text = open(log, "rb").read().decode(errors="replace")
+lines = re.findall(r"\[busy ([AB])\] (\d+)/(\d+)", text)
+seq = [tag for tag, _, _ in lines]
+done = {tag for tag, n, total in lines if n == total}
+runs = sum(1 for i, t in enumerate(seq) if i == 0 or seq[i - 1] != t)
+order = "".join(seq)
+if done != {"A", "B"}:
+    print(f"FAIL ({name}): busy children did not both finish (progress: {order or 'none'})")
+    sys.exit(1)
+if runs < 3:
+    print(f"FAIL ({name}): busy children ran one after the other, not preempted ({order})")
+    sys.exit(1)
+print(f"PASS ({name}): two busy children preempted each other: {order} ({runs} runs)")
+PY
+}
+
 # mem_mib SIZE: QEMU's -m SIZE (e.g. 512M, 6G, 6144) in MiB.
 mem_mib() {
     case "$1" in
@@ -406,6 +440,7 @@ if [ "$MODE" != grub ]; then
     blk_transport native modern || rc=1
     slow_disk native || rc=1
     key_received native || rc=1
+    preempted native || rc=1
     powered_off native || rc=1
     [ "$HIGH_MEM" = 1 ] && { high_memory native || rc=1; }
 fi
@@ -434,6 +469,7 @@ EOF
     all_passed grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
+    preempted grub || rc=1
     powered_off grub || rc=1
     [ "$HIGH_MEM" = 1 ] && { high_memory grub || rc=1; }
 fi

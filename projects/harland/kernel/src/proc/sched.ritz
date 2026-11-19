@@ -1,0 +1,191 @@
+# Harland scheduler: preemptive round robin of user processes (AGAST #3629)
+#
+# proc/table.ritz decides who may run (states, the round-robin pick); this
+# module makes the switch. A switch, always from inside the kernel with
+# IF=0, points everything per-process at the next process:
+#   * CR3                its page table
+#   * TSS.rsp0           its kernel stack's top (a ring-3 IRQ lands there)
+#   * kstack_current_top the same top (syscall_entry's RSP)
+#   * the fs layer       its FsProc (fs_process_select)
+# then swaps kernel stacks (proc_switch.s sched_switch). The process
+# switched to returns from its own sched_switch and unwinds to its own
+# iretq: out of the timer IRQ that preempted it, or out of the syscall it
+# blocked or yielded in. A new process starts from a frame
+# sched_prepare_user builds on its kernel stack.
+#
+# Where switches happen:
+#   * sched_tick: the periodic LAPIC timer (apic.ritz lapic_timer_start),
+#     when it interrupted ring 3. A tick in ring 0 (a syscall, a driver
+#     wait, the idle hlt) only counts: the kernel is not preemptible, so its
+#     globals need no locks.
+#   * sched_yield: sys_yield.
+#   * sched_block: wait / blocking spawn (BLOCK_CHILD), read(0) (BLOCK_TTY).
+#     With nothing runnable the CPU idles in sti;hlt on the blocked
+#     process's stack until an IRQ wakes someone.
+#   * sched_exit: an exiting or killed process leaves for good.
+#
+# One CPU runs processes; the APs halt (per-CPU run queues: AGAST #4192).
+
+import io { sti_hlt, disable_interrupts, enable_interrupts, interrupts_enabled }
+import serial { prints, serial_print_dec }
+import mm.vmm { vmm_switch_pml4, vmm_get_current_pml4 }
+import arch.x86_64.gdt { gdt_set_kernel_stack }
+import arch.x86_64.apic { lapic_timer_start }
+import fs.syscall { fs_process_select }
+import syscall.stack { kstack_top }
+import proc.table { Proc, PROC_RUNNING, proc_at, proc_current_slot, proc_pick_next, proc_set_current }
+
+extern fn sched_switch(save_ksp: *u64, new_ksp: u64)
+extern fn proc_first_entry()
+extern fn kstack_set_current(top: u64)
+
+# Timer interrupts a second: a process runs at most 10 ms before the next
+# runnable one gets the CPU.
+pub const SCHED_HZ: u64 = 100
+
+# isr_stubs.s's InterruptFrame: 15 GPRs (r15 first), vector, error code,
+# RIP, CS, RFLAGS, RSP, SS.
+const FRAME_WORDS: u64 = 22
+const FRAME_RDI: u64 = 9
+const FRAME_RSI: u64 = 10
+const FRAME_RIP: u64 = 17
+const FRAME_CS: u64 = 18
+const FRAME_RFLAGS: u64 = 19
+const FRAME_RSP: u64 = 20
+const FRAME_SS: u64 = 21
+# sched_switch's saved frame: RFLAGS, r15, r14, r13, r12, rbx, rbp, return.
+const SWITCH_WORDS: u64 = 8
+const SWITCH_RET: u64 = 7
+
+const USER_CS: u64 = 0x1B
+const USER_SS: u64 = 0x23
+const USER_RFLAGS: u64 = 0x202     # IF=1: the timer can preempt it
+const KERNEL_RFLAGS: u64 = 0x2     # IF=0 until proc_first_entry's iretq
+
+var sched_ticks: u64 = 0
+var sched_switches: u64 = 0
+var sched_preemptions: u64 = 0
+var sched_running: u8 = 0
+
+# The process in `slot` runs on its own kernel stack from now on: TSS.rsp0
+# and the syscall stack point at it. Only the switch and sched_start call
+# this.
+fn sched_use_kstack(slot: i32)
+    let top: u64 = kstack_top(slot)
+    gdt_set_kernel_stack(top)
+    kstack_set_current(top)
+
+# Switch to the runnable process in `next`. IF=0. Returns when something
+# switches back to the caller (never, for an exiting caller).
+fn sched_switch_to(next: i32)
+    let prev: i32 = proc_current_slot()
+    if next == prev
+        return
+    let p: *Proc = proc_at(next)
+    proc_set_current(next)
+    if p.pml4 != vmm_get_current_pml4()
+        vmm_switch_pml4(p.pml4)
+    sched_use_kstack(next)
+    fs_process_select(p.pid)
+    sched_switches = sched_switches + 1
+    let from: *Proc = proc_at(prev)
+    sched_switch(@(*from).ksp, p.ksp)
+
+# init (the running process, slot `slot`) is about to enter ring 3: it runs
+# on its own kernel stack, and the periodic tick starts.
+pub fn sched_start(slot: i32)
+    sched_use_kstack(slot)
+    lapic_timer_start(SCHED_HZ)
+    sched_running = 1
+
+# Give the CPU to the next runnable process, if there is another; the
+# caller stays runnable and continues when its turn comes round.
+pub fn sched_yield()
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    let next: i32 = proc_pick_next()
+    if next >= 0
+        sched_switch_to(next)
+    if was
+        enable_interrupts()
+
+# The caller has marked itself blocked (proc_block): run others until
+# something makes it runnable again. With nothing runnable the CPU sleeps
+# in sti;hlt; the IRQ that ends the wait (COM1's, the timer's) runs, and the
+# loop looks again.
+pub fn sched_block()
+    let was: bool = interrupts_enabled()
+    disable_interrupts()
+    let me: i32 = proc_current_slot()
+    while proc_at(me).state != PROC_RUNNING
+        let next: i32 = proc_pick_next()
+        if next < 0
+            sti_hlt()
+            disable_interrupts()
+        else
+            sched_switch_to(next)
+    if was
+        enable_interrupts()
+
+# The caller has exited (proc_exit_current: a zombie, or a free slot):
+# switch to anything runnable, idling until something is. Never returns;
+# nothing switches back to an exited process.
+pub fn sched_exit()
+    disable_interrupts()
+    while true
+        let next: i32 = proc_pick_next()
+        if next < 0
+            sti_hlt()
+            disable_interrupts()
+        else
+            sched_switch_to(next)
+
+# The timer IRQ (vector 32), after its EOI. from_user: it interrupted
+# ring 3, the only place a process is preempted.
+pub fn sched_tick(from_user: bool)
+    sched_ticks = sched_ticks + 1
+    if not from_user or sched_running == 0
+        return
+    let next: i32 = proc_pick_next()
+    if next >= 0 and next != proc_current_slot()
+        sched_preemptions = sched_preemptions + 1
+        sched_switch_to(next)
+
+# Build a new process's first frames on slot's kernel stack: its user frame
+# (ring 3 at `entry`, RSP `user_rsp`, RDI/RSI = arg0/arg1, every other
+# register 0) at the top, and below it a sched_switch frame that "returns"
+# into proc_first_entry, which pops the user frame and irets. The first
+# switch to the slot then enters the program.
+pub fn sched_prepare_user(slot: i32, entry: u64, user_rsp: u64, arg0: u64, arg1: u64)
+    let top: u64 = kstack_top(slot)
+    let frame: *u64 = (top - FRAME_WORDS * 8) as *u64
+    var i: u64 = 0
+    while i < FRAME_WORDS
+        *(frame + i) = 0
+        i = i + 1
+    *(frame + FRAME_RDI) = arg0
+    *(frame + FRAME_RSI) = arg1
+    *(frame + FRAME_RIP) = entry
+    *(frame + FRAME_CS) = USER_CS
+    *(frame + FRAME_RFLAGS) = USER_RFLAGS
+    *(frame + FRAME_RSP) = user_rsp
+    *(frame + FRAME_SS) = USER_SS
+    let sw: *u64 = (top - (FRAME_WORDS + SWITCH_WORDS) * 8) as *u64
+    i = 0
+    while i < SWITCH_WORDS
+        *(sw + i) = 0
+        i = i + 1
+    *sw = KERNEL_RFLAGS
+    *(sw + SWITCH_RET) = proc_first_entry as u64
+    let p: *Proc = proc_at(slot)
+    (*p).ksp = sw as u64
+
+# Report the scheduler's counters (init's exit).
+pub fn sched_report()
+    prints("[sched] ")
+    serial_print_dec(sched_ticks)
+    prints(" ticks, ")
+    serial_print_dec(sched_switches)
+    prints(" switches, ")
+    serial_print_dec(sched_preemptions)
+    prints(" preemptions\n")

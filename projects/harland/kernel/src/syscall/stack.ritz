@@ -1,15 +1,17 @@
-# Syscall Stack Sentinel (AGAST #2761)
+# Kernel stacks: sentinels and guard pages (AGAST #2761, #1877, #3629)
 #
-# Every syscall, and every IRQ taken during one, runs on the single
-# syscall_stack in syscall_entry.s. Its lowest quadword holds a sentinel; a
-# syscall that runs off the bottom overwrites it. syscall_stack_check runs
-# when a syscall leaves the kernel (syscall_handler's return, and sys_exit
-# before it resumes the parent) and panics if the sentinel is gone, instead
-# of letting the overflow corrupt whatever lies below. Before #2761 the stack
-# was 4 KiB in .data, directly above g_child_pid and fs_current, and a deep
-# write-back flush overwrote them without a trace (#4064).
+# Every process-table slot has its own kernel stack (syscall_entry.s
+# proc_kstacks, AGAST #3629): the running process's syscalls, the IRQs taken
+# during one, and the timer IRQ that preempts it all run on it. Each stack's
+# lowest quadword holds a sentinel; a syscall that runs off the bottom
+# overwrites it. syscall_stack_check runs when a syscall leaves the kernel
+# (syscall_handler's return, and sys_exit before it leaves the CPU) and
+# panics if the running process's sentinel is gone, instead of letting the
+# overflow corrupt whatever lies below. Before #2761 the one stack was 4 KiB
+# in .data, directly above g_child_pid and fs_current, and a deep write-back
+# flush overwrote them without a trace (#4064).
 #
-# The sentinel only notices an overflow once the syscall is over. Below the
+# The sentinel only notices an overflow once the syscall is over. Below each
 # stack sits a guard page that syscall_stack_init unmaps (AGAST #1877): the
 # first write past the bottom page-faults, the #PF handler runs on IST1 and
 # exception_handler names the overflow (syscall_stack_guard_hit).
@@ -18,39 +20,89 @@ import serial { prints, serial_print_dec, serial_print_hex }
 import io { halt_loop }
 import mm.vmm { vmm_unmap_kernel_page, vmm_virt_to_phys }
 
-extern fn syscall_stack_guard_init()
-extern fn syscall_stack_guard_intact() -> u64
-extern fn syscall_stack_high_water() -> u64
+extern fn proc_kstacks_base() -> u64
+extern fn kstack_stride() -> u64
+extern fn kstack_slots() -> u64
 extern fn syscall_stack_size() -> u64
-extern fn syscall_stack_guard_page() -> u64
+extern fn kstack_get_current() -> u64
 
 const GUARD_PAGE_SIZE: u64 = 4096
+const SYSCALL_STACK_SENTINEL: u64 = 0x5359534B53544B21   # "SYSKSTK!"
 
-# Write the sentinel and unmap the guard page. Call once, after the physmap
-# is up (vmm_unmap_kernel_page may need a page table) and before the first
-# syscall. A guard page still mapped afterwards is a boot-time panic.
+# Slot `slot`'s guard page.
+fn kstack_guard(slot: u64) -> u64
+    return proc_kstacks_base() + slot * kstack_stride()
+
+# Slot `slot`'s lowest quadword: where its sentinel lives.
+fn kstack_bottom(slot: u64) -> u64
+    return kstack_guard(slot) + GUARD_PAGE_SIZE
+
+# Slot `slot`'s top (one past its highest byte): its TSS.rsp0 and syscall
+# entry RSP while it runs.
+pub fn kstack_top(slot: i32) -> u64
+    return kstack_guard(slot as u64) + kstack_stride()
+
+# The running process's slot, from the stack syscall_entry uses.
+fn kstack_current_slot() -> u64
+    let top: u64 = kstack_get_current()
+    return (top - proc_kstacks_base()) / kstack_stride() - 1
+
+fn kstack_sentinel_intact(slot: u64) -> bool
+    return *(kstack_bottom(slot) as *u64) == SYSCALL_STACK_SENTINEL
+
+# Write every stack's sentinel and unmap every guard page. Call once, after
+# the physmap is up (vmm_unmap_kernel_page may need a page table) and before
+# the first syscall. A guard page still mapped afterwards is a boot-time
+# panic.
 pub fn syscall_stack_init()
-    syscall_stack_guard_init()
-    let guard: u64 = syscall_stack_guard_page()
-    vmm_unmap_kernel_page(guard)
-    if vmm_virt_to_phys(guard) != 0
-        prints("\n*** KERNEL PANIC: syscall stack guard page still mapped at 0x")
-        serial_print_hex(guard)
-        prints(" ***\n")
-        halt_loop()
+    var slot: u64 = 0
+    while slot < kstack_slots()
+        *(kstack_bottom(slot) as *u64) = SYSCALL_STACK_SENTINEL
+        let guard: u64 = kstack_guard(slot)
+        vmm_unmap_kernel_page(guard)
+        if vmm_virt_to_phys(guard) != 0
+            prints("\n*** KERNEL PANIC: syscall stack guard page still mapped at 0x")
+            serial_print_hex(guard)
+            prints(" ***\n")
+            halt_loop()
+        slot = slot + 1
 
-# True if addr (a page fault's CR2) lies in the syscall stack's guard page.
+# True if addr (a page fault's CR2) lies in any kernel stack's guard page.
 pub fn syscall_stack_guard_hit(addr: u64) -> bool
-    let guard: u64 = syscall_stack_guard_page()
-    return addr >= guard and addr < guard + GUARD_PAGE_SIZE
+    var slot: u64 = 0
+    while slot < kstack_slots()
+        let guard: u64 = kstack_guard(slot)
+        if addr >= guard and addr < guard + GUARD_PAGE_SIZE
+            return true
+        slot = slot + 1
+    return false
 
-# Bytes of the syscall stack ever used (a lower bound, see syscall_entry.s).
+# Bytes of slot's stack ever used: from the top down to the lowest non-zero
+# quadword above the sentinel (.bss starts zeroed). A lower bound: a zero
+# word left deep in a frame doesn't count.
+fn kstack_high_water(slot: u64) -> u64
+    let top: u64 = kstack_bottom(slot) + syscall_stack_size()
+    var p: u64 = kstack_bottom(slot) + 8
+    while p < top and *(p as *u64) == 0
+        p = p + 8
+    return top - p
+
+# The deepest any kernel stack has been (a lower bound, see above).
 pub fn syscall_stack_used() -> u64
-    syscall_stack_high_water()
+    var peak: u64 = 0
+    var slot: u64 = 0
+    while slot < kstack_slots()
+        let used: u64 = kstack_high_water(slot)
+        if used > peak
+            peak = used
+        slot = slot + 1
+    return peak
 
-# Panic if a syscall has run off the bottom of the syscall stack.
+# Panic if a syscall has run off the bottom of the running process's stack.
 pub fn syscall_stack_check()
-    if syscall_stack_guard_intact() != 0
+    if kstack_get_current() == 0
+        return
+    if kstack_sentinel_intact(kstack_current_slot())
         return
     prints("\n*** KERNEL PANIC: syscall stack overflow (")
     serial_print_dec(syscall_stack_size())

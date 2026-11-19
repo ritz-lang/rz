@@ -6,18 +6,18 @@
 # process.
 #
 # Sleeping: read(0) disables interrupts, pulls whatever COM1's FIFO holds,
-# and if nothing is readable halts with sti_hlt (sti; hlt as one step, so
-# the RX interrupt that ends the wait cannot slip in between the check and
-# the hlt). It needs COM1's RX interrupt (serial_enable_rx at boot): without
-# it nothing wakes the hlt. One CPU runs syscalls and spawn is blocking, so
-# the reader is the only runnable process: halting is sleeping.
+# and if nothing is readable blocks in the scheduler (BLOCK_TTY,
+# proc/sched.ritz, #3629): other processes run meanwhile, or, with none
+# runnable, the CPU sleeps in sti;hlt. COM1's RX interrupt (serial_enable_rx
+# at boot) wakes the reader. Interrupts stay off from the check to the
+# block, so input landing in between still wakes it.
 #
-# Ctrl-C (TTY_ISIG) kills the running Proc, the deepest in the
-# blocking-spawn chain (proc/table.ritz), if it is in the console's
-# foreground (tty/fg.ritz, #4276: set by the shell, as tcsetpgrp does). It
-# exits with status 130 (128 + SIGINT, as a shell reports it) and its parent
-# resumes. A Ctrl-C for a process outside the foreground (init always; rzsh
-# between its tty_setattr and spawn) only drops the line.
+# Ctrl-C (TTY_ISIG) kills the running Proc if it is in the console's
+# foreground (tty/fg.ritz, #4276: set by the shell, as tcsetpgrp does). With
+# preemption (#3629) the running Proc is whichever process holds the CPU when
+# the Ctrl-C lands. It exits with status 130 (128 + SIGINT, as a shell reports it)
+# and its parent resumes. A Ctrl-C for a process outside the foreground
+# (init always; rzsh between its tty_setattr and spawn) only drops the line.
 # The kill happens
 #   * in the IRQ 4 handler, when the interrupt came from ring 3 (a program
 #     computing in a loop), after its EOI;
@@ -25,9 +25,11 @@
 #     tty_console_check_intr), e.g. a program printing in a loop;
 #   * in read(0), which the interrupt wakes.
 
-import io { sti_hlt, disable_interrupts, enable_interrupts }
+import io { disable_interrupts, enable_interrupts }
 import serial { serial_data_available, serial_read_byte_nonblock, serial_write_byte }
 import tty.fg { tty_fg_is_current, tty_fg_set }
+import proc.table { BLOCK_TTY, proc_block, proc_wake }
+import proc.sched { sched_block }
 import syscall.runtime.process { process_kill_current }
 import tty.ldisc { ldisc_input, ldisc_readable, ldisc_read, ldisc_take_intr, ldisc_intr_pending, ldisc_take_echo, ldisc_get_flags, ldisc_set_flags }
 
@@ -77,6 +79,8 @@ fn tty_console_kill_foreground()
 # tty_console_irq_kill: a ring-3 process to kill for a Ctrl-C.
 pub fn tty_console_irq(from_user: bool) -> bool
     tty_console_pull()
+    # A reader blocked in read(0) looks again (a line, a byte, ^D or ^C).
+    proc_wake(BLOCK_TTY)
     from_user and tty_console_intr_due()
 
 pub fn tty_console_irq_kill()
@@ -107,8 +111,9 @@ pub fn tty_console_read(buf: *u8, count: i64) -> i64
             n = ldisc_read(buf, count)
             enable_interrupts()
         else
-            # Wakes on the next interrupt (COM1's RX among them), IF=1.
-            sti_hlt()
+            # Until COM1's interrupt wakes it; returns with IF=0.
+            proc_block(BLOCK_TTY, 0)
+            sched_block()
     n
 
 pub fn tty_console_get_flags() -> u32

@@ -157,7 +157,7 @@ def test_process_kill_current_is_exit():
 
 def test_init_exit_powers_off():
     body = _fn(PROCESS, "sys_exit_impl")
-    init = body.split("resume_user_frame(", 1)[1]
+    init = body.split("sched_exit()", 1)[1]
     # fds flushed, then ACPI poweroff; only a failed poweroff halts.
     assert init.index("fs_process_end()") < init.index("acpi_poweroff()") < init.index("halt_loop()")
 

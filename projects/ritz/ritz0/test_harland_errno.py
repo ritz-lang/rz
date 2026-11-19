@@ -288,7 +288,8 @@ def test_elf_status_owns_its_codes():
 
 def test_spawn_maps_elf_status_to_errno():
     """A failed load answers ENOMEM (out of pages) or ENOEXEC (not a loadable
-    x86-64 executable): both spawn paths go through elf_status_errno."""
+    x86-64 executable): every spawn goes through spawn_process (#3629), which
+    maps the load's status with elf_status_errno."""
     main = (KERNEL_SRC / "syscall" / "runtime" / "process.ritz").read_text()  # from main.ritz (#2751)
     m = re.search(r"^fn elf_status_errno\(s: ElfStatus\) -> i64\n((?:[ \t]+.*\n)+)", main, re.M)
     assert m, "syscall/runtime/process.ritz has no elf_status_errno"
@@ -296,7 +297,9 @@ def test_spawn_maps_elf_status_to_errno():
     assert re.search(r"AllocFailed => Errno\.NoMem as i64", body)
     assert re.search(r"MapFailed => Errno\.NoMem as i64", body)
     assert re.search(r"_ => Errno\.NoExec as i64", body)
-    assert main.count("return elf_status_errno(load_result.error)") == 2
+    assert main.count("return elf_status_errno(load_result.error)") == 1
+    spawn = re.search(r"^fn spawn_process\(.*?(?=^\S)", main, re.M | re.S)
+    assert spawn and "return elf_status_errno(load_result.error)" in spawn.group(0)
 
 
 # --- acceptance: no loose errno values left in the kernel ---------------------------

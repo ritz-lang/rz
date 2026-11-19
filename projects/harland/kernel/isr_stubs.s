@@ -242,7 +242,7 @@ ISR_NOERR 31    # Reserved
 # IRQ Stubs (mapped to vectors 32-47)
 # ============================================================================
 
-IRQ_STUB 0,  32     # IRQ0 - Timer
+# Vector 32, the scheduler's LAPIC tick: irq_stub_timer below.
 IRQ_STUB 1,  33     # IRQ1 - Keyboard
 IRQ_STUB 2,  34     # IRQ2 - Cascade
 IRQ_STUB 3,  35     # IRQ3 - COM2
@@ -277,3 +277,63 @@ IRQ_STUB 44, 76
 IRQ_STUB 45, 77
 IRQ_STUB 46, 78
 IRQ_STUB 47, 79
+
+# ============================================================================
+# Timer IRQ stub (vector 32, AGAST #3629)
+# ============================================================================
+# The tick runs on IST3 (its own 4 KiB stack, gdt.ritz), never on the stack
+# it interrupted. Since #4308 the compiled kernel is noredzone (and
+# tools/check_no_red_zone.py enforces it), but IST3 also keeps the tick
+# off hand-written asm stacks and off a syscall stack near its guard page.
+# This stub itself must never touch memory below %rsp either: the checker
+# scans it too.
+#
+# A tick from ring 3 may preempt the process (sched_tick switches kernel
+# stacks), so its frames must live on the process's own kernel stack, where
+# they stay while it is switched out: the stub saves %rax/%rbx on IST3
+# (push, so nothing is below %rsp), copies the CPU's 5-word IRET frame from
+# IST3 to the top of the running process's kernel stack
+# (kstack_current_top, which is TSS.rsp0) and continues there. A tick from
+# ring 0 never switches, so it stays on IST3. IF=0 throughout (interrupt
+# gate), and nothing else runs on IST3 (NMI and #DF are IST1).
+.global irq_stub_timer
+irq_stub_timer:
+    testq $3, 8(%rsp)            # CS of the interrupted code
+    jz 1f
+    pushq %rax                   # IRET frame now starts at 16(%rsp)
+    pushq %rbx
+    movq kstack_current_top(%rip), %rax
+    subq $40, %rax
+    movq 16(%rsp), %rbx          # RIP
+    movq %rbx, 0(%rax)
+    movq 24(%rsp), %rbx          # CS
+    movq %rbx, 8(%rax)
+    movq 32(%rsp), %rbx          # RFLAGS
+    movq %rbx, 16(%rax)
+    movq 40(%rsp), %rbx          # RSP
+    movq %rbx, 24(%rax)
+    movq 48(%rsp), %rbx          # SS
+    movq %rbx, 32(%rax)
+    movq %rsp, %rbx              # IST3: [0]=saved rbx, [8]=saved rax
+    movq %rax, %rsp              # on the process's kernel stack now
+    movq 8(%rbx), %rax
+    movq 0(%rbx), %rbx
+1:
+    pushq $0                     # dummy error code
+    pushq $32                    # vector
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    jmp irq_common

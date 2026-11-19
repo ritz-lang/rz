@@ -245,8 +245,13 @@ def test_read_zero_sleeps_on_the_console():
     assert "tty_console_read" in read
     assert "serial_poll" not in read and "serial_buf_read_many" not in read
     loop = _body(_code(CONSOLE), "tty_console_read")
-    assert "sti_hlt()" in loop, "read(0) sleeps until an interrupt, no busy loop"
+    # sleeps in the scheduler until COM1's interrupt wakes it (#3629): other
+    # processes run meanwhile, or the CPU halts; no busy loop
+    assert "proc_block(BLOCK_TTY, 0)" in loop and "sched_block()" in loop, \
+        "read(0) sleeps until an interrupt, no busy loop"
     assert "yield" not in loop and "cpu_pause" not in loop
+    irq = _body(_code(CONSOLE), "tty_console_irq")
+    assert "proc_wake(BLOCK_TTY)" in irq, "COM1's interrupt wakes the reader"
 
 
 def test_irq4_feeds_the_line_discipline_and_delivers_ctrl_c():
@@ -301,16 +306,29 @@ import syscall.errno { Errno }
 import proc.table
 import tty.fg
 
+# What spawn and the scheduler do (#3629): a new child runs; an exiting
+# process hands the CPU back to its parent's slot.
+fn spawn() -> i32
+    let slot: i32 = proc_new_child()
+    proc_start(slot)
+    proc_set_current(slot)
+    slot
+
+fn exit_to(code: i64, parent: i32)
+    proc_exit_current(code)
+    proc_set_current(parent)
+
 fn main() -> i32
     proc_table_reset()
     tty_fg_reset()
     if tty_fg_is_current()
         return 1
     proc_enter_init(4096)
+    let init: i32 = proc_current_slot()
     if tty_fg_is_current()
         return 2
     # rzsh, pid 2. Nothing set: the running process (#4254).
-    proc_spawn_child()
+    let rzsh: i32 = spawn()
     if not tty_fg_is_current()
         return 3
     # rzsh hands the console to its children: from here on a Ctrl-C while
@@ -318,25 +336,25 @@ fn main() -> i32
     if tty_fg_set(TTY_FG_CHILDREN, 0) != 0 or tty_fg_is_current()
         return 4
     # the command, pid 3, and what it spawns, pid 4
-    proc_spawn_child()
+    let cmd: i32 = spawn()
     if not tty_fg_is_current()
         return 5
-    proc_spawn_child()
+    spawn()
     if not tty_fg_is_current()
         return 6
-    proc_exit_current(0)
-    proc_exit_current(130)
+    exit_to(0, cmd)
+    exit_to(130, rzsh)
     if proc_current_pid() != 2 or tty_fg_is_current()
         return 7
     # A pid: that process and its descendants, not its parent.
-    proc_spawn_child()
+    let five: i32 = spawn()
     if proc_current_pid() != 5 or tty_fg_set(TTY_FG_PID, 5) != 0 or not tty_fg_is_current()
         return 8
-    proc_spawn_child()
+    spawn()
     if not tty_fg_is_current()
         return 9
-    proc_exit_current(0)
-    proc_exit_current(0)
+    exit_to(0, five)
+    exit_to(0, rzsh)
     if tty_fg_is_current()
         return 10
     # A pid that is not running matches nothing.
@@ -350,7 +368,7 @@ fn main() -> i32
     if not tty_fg_is_current()
         return 13
     # init is never the foreground, not even by its pid.
-    proc_exit_current(0)
+    exit_to(0, init)
     if proc_current_pid() != 1 or tty_fg_set(TTY_FG_PID, 1) != 0 or tty_fg_is_current()
         return 14
     if tty_fg_set(TTY_FG_CHILDREN, 0) != 0 or tty_fg_is_current()

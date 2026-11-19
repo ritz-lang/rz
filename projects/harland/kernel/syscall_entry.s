@@ -15,31 +15,49 @@
 # Return value in RAX
 
 .set SYSCALL_STACK_SIZE, 65536
-.set SYSCALL_STACK_SENTINEL, 0x5359534B53544B21   # "SYSKSTK!"
+
+.set KSTACK_GUARD_SIZE, 4096
+.set KSTACK_STRIDE, KSTACK_GUARD_SIZE + SYSCALL_STACK_SIZE
+.set KSTACK_SLOTS, 8                # proc/table.ritz MAX_PROCS
 
 .section .bss
-# Kernel stack for every syscall, and for the IRQs taken during one (IST=0).
-# One for all CPUs: APs halt in ap_entry and never enter ring 3 (per-CPU
-# stacks: AGAST #4192). In .bss so an overflow can't run into
-# .data: it was 4 KiB in .data directly above g_child_pid and fs_current,
-# and a deep syscall (a write-back flush through knamespace_write) grew down
-# into them (AGAST #2761, #4064). Its lowest quadword holds a sentinel that
-# syscall_stack_check (syscall/stack.ritz) checks at syscall exit.
+# One kernel stack per process-table slot (AGAST #3629): the running
+# process's syscalls, the IRQs taken during them (IST=0), and the timer IRQ
+# that preempts it in ring 3 (TSS.rsp0) all run on its own stack, and a
+# process switched out in the kernel (blocked in wait/spawn/read, or
+# preempted) keeps its frames there until it runs again. proc/sched.ritz
+# points kstack_current_top and TSS.rsp0 at the next process's stack on
+# every switch. Before #3629 this was a single syscall_stack, so a process
+# could only stop in the kernel by never coming back (blocking spawn).
 #
-# Below it, syscall_stack_guard: one page that syscall_stack_init unmaps
-# (AGAST #1877), so the first write past the bottom faults at once. #PF and
-# #DF run on IST1 (idt.ritz), so the fault handler has a stack of its own and
-# reports "syscall stack overflow" (exceptions.ritz).
+# Each slot is a guard page, then SYSCALL_STACK_SIZE of stack:
+#
+#   proc_kstacks + i * KSTACK_STRIDE    guard page (unmapped by
+#                                       syscall_stack_init, AGAST #1877)
+#   ... + KSTACK_GUARD_SIZE             the stack's lowest quadword: the
+#                                       sentinel (#2761) syscall_stack_check
+#                                       checks at syscall exit
+#   ... + KSTACK_STRIDE                 the stack's top
+#
+# In .bss so an overflow can't run into .data (it once ran into g_child_pid
+# and fs_current, AGAST #2761, #4064). #PF and #DF run on IST1 (idt.ritz),
+# so a write into a guard page is reported as "syscall stack overflow"
+# (exceptions.ritz).
 .align 4096
-syscall_stack_guard:
-    .space 4096
-syscall_stack:
-    .space SYSCALL_STACK_SIZE
-syscall_stack_top:
+proc_kstacks:
+    .space KSTACK_STRIDE * KSTACK_SLOTS
+proc_kstacks_end:
 
 .section .data
 # Saved user RSP during syscall
 user_rsp_save:
+    .quad 0
+
+# Top of the running process's kernel stack: syscall_entry's RSP, and
+# where irq_stub_timer (isr_stubs.s) moves a ring-3 tick's frame.
+# proc/sched.ritz sets it (with TSS.rsp0) on every switch.
+.global kstack_current_top
+kstack_current_top:
     .quad 0
 
 # ============================================================================
@@ -109,8 +127,8 @@ syscall_entry:
     # Save user RSP first
     movq %rsp, user_rsp_save(%rip)
 
-    # Load kernel syscall stack
-    leaq syscall_stack_top(%rip), %rsp
+    # Load the running process's kernel stack
+    movq kstack_current_top(%rip), %rsp
 
     # Now we have a safe kernel stack
 
@@ -148,10 +166,10 @@ syscall_entry:
     pushq %r14
     pushq %r15
 
-    # Enable interrupts during syscall handling
-    # This is safe because we're on the dedicated syscall_stack.
-    # IRQs use IST=0 (current stack), so they push onto syscall_stack.
-    # Userspace runs with IF=0, so timer only fires during syscall.
+    # Enable interrupts during syscall handling. The timer IRQ (IST=0)
+    # pushes onto this process's kernel stack and only counts the tick: the
+    # kernel is never preempted, a syscall leaves the CPU only by blocking
+    # in the scheduler (proc/sched.ritz). Other IRQs run on IST2.
     sti
 
     # Call the Ritz syscall handler
@@ -315,71 +333,6 @@ syscall_set_return_context:
 .size syscall_set_return_context, . - syscall_set_return_context
 
 # ============================================================================
-# Save / Resume a Whole User Syscall Frame (blocking spawn -> exit, #2132)
-# ============================================================================
-# syscall_entry always builds its frame at the top of the single syscall_stack,
-# so the current syscall's frame is always the 16 quadwords below
-# syscall_stack_top:
-#
-#   word:  0   1   2   3   4   5   6   7   8   9   10  11  12  13  14     15
-#   reg:   r15 r14 r13 r12 rbp rbx rax rdi rsi rdx r10 r8  r9  rip rflags rsp
-#
-# The child's own syscalls overwrite that frame, so a blocking spawn has to
-# copy the parent's frame out and resume from the copy when the child exits.
-# Resuming from user RIP/RSP alone, with the GPRs zeroed, breaks the parent:
-# its syscall stub does `mov %rbp, %rsp` after `syscall`, and RBP=0 left it
-# running with RSP=0.
-.set SYSCALL_FRAME_WORDS, 16
-.set SYSCALL_FRAME_BYTES, SYSCALL_FRAME_WORDS * 8
-
-# void syscall_save_user_frame(u64* dst)
-# Copy the current syscall's user frame (16 quadwords) to dst.
-# Call it only from inside a syscall handler.
-.global syscall_save_user_frame
-.type syscall_save_user_frame, @function
-syscall_save_user_frame:
-    leaq syscall_stack_top(%rip), %rsi
-    subq $SYSCALL_FRAME_BYTES, %rsi
-    movq $SYSCALL_FRAME_WORDS, %rcx
-    cld
-    rep movsq
-    ret
-.size syscall_save_user_frame, . - syscall_save_user_frame
-
-# noreturn void resume_user_frame(u64* frame, i64 retval)
-# Return to ring 3 as though the syscall that saved frame had just returned
-# retval. Every register the syscall ABI preserves comes from frame. RCX and
-# R11 get the return RIP and RFLAGS, as SYSCALL/SYSRET leave them.
-.global resume_user_frame
-.type resume_user_frame, @function
-resume_user_frame:
-    cli
-    # IRET frame: SS, RSP, RFLAGS, CS, RIP
-    pushq $0x23                  # SS (user data, ring 3)
-    pushq 120(%rdi)              # user RSP
-    pushq 112(%rdi)              # user RFLAGS
-    pushq $0x1B                  # CS (user code, ring 3)
-    pushq 104(%rdi)              # user RIP
-
-    movq %rsi, %rax              # syscall return value
-    movq 0(%rdi), %r15
-    movq 8(%rdi), %r14
-    movq 16(%rdi), %r13
-    movq 24(%rdi), %r12
-    movq 32(%rdi), %rbp
-    movq 40(%rdi), %rbx
-    movq 64(%rdi), %rsi
-    movq 72(%rdi), %rdx
-    movq 80(%rdi), %r10
-    movq 88(%rdi), %r8
-    movq 96(%rdi), %r9
-    movq 104(%rdi), %rcx         # RCX = return RIP (SYSCALL semantics)
-    movq 112(%rdi), %r11         # R11 = RFLAGS (SYSCALL semantics)
-    movq 56(%rdi), %rdi          # RDI last: it held the frame pointer
-    iretq
-.size resume_user_frame, . - resume_user_frame
-
-# ============================================================================
 # Jump to Userspace with Arguments (argc/argv)
 # ============================================================================
 # void jump_to_userspace_with_args(u64 entry_point, u64 user_stack, i64 argc, u64 argv)
@@ -474,54 +427,36 @@ harland_syscall:
 .size harland_syscall, . - harland_syscall
 
 # ============================================================================
-# Syscall Stack Sentinel (AGAST #2761)
+# Kernel Stacks (AGAST #2761, #1877, #3629)
 # ============================================================================
+# The sentinel, guard-page and high-water logic is syscall/stack.ritz's; it
+# finds each slot from these.
 
-# void syscall_stack_guard_init(void): write the sentinel at the stack's
-# lowest quadword. Call once, before the first syscall.
-.global syscall_stack_guard_init
-.type syscall_stack_guard_init, @function
-syscall_stack_guard_init:
-    movabsq $SYSCALL_STACK_SENTINEL, %rax
-    movq %rax, syscall_stack(%rip)
+# u64 proc_kstacks_base(void): address of slot 0's guard page (page-aligned).
+.global proc_kstacks_base
+.type proc_kstacks_base, @function
+proc_kstacks_base:
+    leaq proc_kstacks(%rip), %rax
     ret
-.size syscall_stack_guard_init, . - syscall_stack_guard_init
+.size proc_kstacks_base, . - proc_kstacks_base
 
-# u64 syscall_stack_guard_intact(void): 1 while the sentinel is untouched,
-# 0 once a syscall (or an IRQ on top of one) has run off the stack's bottom.
-.global syscall_stack_guard_intact
-.type syscall_stack_guard_intact, @function
-syscall_stack_guard_intact:
-    movabsq $SYSCALL_STACK_SENTINEL, %rcx
-    xorl %eax, %eax
-    cmpq %rcx, syscall_stack(%rip)
-    sete %al
+# u64 kstack_stride(void): bytes per slot, guard page included.
+.global kstack_stride
+.type kstack_stride, @function
+kstack_stride:
+    movq $KSTACK_STRIDE, %rax
     ret
-.size syscall_stack_guard_intact, . - syscall_stack_guard_intact
+.size kstack_stride, . - kstack_stride
 
-# u64 syscall_stack_high_water(void): bytes of the syscall stack ever used,
-# measured as the distance from the top to the lowest non-zero quadword
-# above the sentinel (.bss starts zeroed). A lower bound: a zero word left
-# deep in a frame doesn't count.
-.global syscall_stack_high_water
-.type syscall_stack_high_water, @function
-syscall_stack_high_water:
-    leaq syscall_stack+8(%rip), %rcx
-    leaq syscall_stack_top(%rip), %rdx
-1:
-    cmpq %rdx, %rcx
-    jae 2f
-    cmpq $0, (%rcx)
-    jne 2f
-    addq $8, %rcx
-    jmp 1b
-2:
-    movq %rdx, %rax
-    subq %rcx, %rax
+# u64 kstack_slots(void): how many slots (proc/table.ritz MAX_PROCS).
+.global kstack_slots
+.type kstack_slots, @function
+kstack_slots:
+    movq $KSTACK_SLOTS, %rax
     ret
-.size syscall_stack_high_water, . - syscall_stack_high_water
+.size kstack_slots, . - kstack_slots
 
-# u64 syscall_stack_size(void): the syscall stack's size in bytes.
+# u64 syscall_stack_size(void): one slot's stack, in bytes.
 .global syscall_stack_size
 .type syscall_stack_size, @function
 syscall_stack_size:
@@ -529,11 +464,18 @@ syscall_stack_size:
     ret
 .size syscall_stack_size, . - syscall_stack_size
 
-# u64 syscall_stack_guard_page(void): address of the guard page below the
-# syscall stack (page-aligned, unmapped by syscall_stack_init).
-.global syscall_stack_guard_page
-.type syscall_stack_guard_page, @function
-syscall_stack_guard_page:
-    leaq syscall_stack_guard(%rip), %rax
+# void kstack_set_current(u64 top): the stack syscall_entry loads.
+.global kstack_set_current
+.type kstack_set_current, @function
+kstack_set_current:
+    movq %rdi, kstack_current_top(%rip)
     ret
-.size syscall_stack_guard_page, . - syscall_stack_guard_page
+.size kstack_set_current, . - kstack_set_current
+
+# u64 kstack_get_current(void)
+.global kstack_get_current
+.type kstack_get_current, @function
+kstack_get_current:
+    movq kstack_current_top(%rip), %rax
+    ret
+.size kstack_get_current, . - kstack_get_current

@@ -25,8 +25,10 @@ import mm.heap { kalloc, kfree }
 # fs_process_start(pid) when it starts running (run_init for init, spawn for
 # a child) makes a fresh FsProc current; fs_process_end() when it exits
 # closes every fd it left open (flushing writes as sys_close does), frees the
-# FsProc and makes the parent's current again. So the fs layer never asks
-# who is running, and imports nothing from the process layer.
+# FsProc and makes the parent's current again. With several processes
+# runnable (#3629), proc/sched.ritz calls fs_process_select(pid) on every
+# switch. So the fs layer never asks who is running, and imports nothing from
+# the process layer.
 #
 # An FsProc is ~36 KB and comes from the kernel heap only while its process
 # lives, so the BSS holds just the FS_MAX_PROCS pointers. Read its fields as
@@ -52,7 +54,7 @@ struct FsProc
     table: FdTable
     files: [256]FsFile      # indexed by fd; meaningful while the fd is open
 
-# Live processes at once. Blocking spawn keeps at most init and one child.
+# Live processes at once: proc/table.ritz's MAX_PROCS.
 pub const FS_MAX_PROCS: i32 = 8
 
 var fs_procs: [8]*FsProc
@@ -122,6 +124,20 @@ pub fn fs_process_end() -> i32
     fs_current = p.parent
     kfree(p as *u8)
     closed
+
+# Make process `pid`'s FsProc current: the scheduler switched to it
+# (proc/sched.ritz, #3629). 0, or Errno.Srch if it has none (nothing is
+# current then).
+pub fn fs_process_select(pid: u64) -> i32
+    var slot: i32 = 0
+    while slot < FS_MAX_PROCS
+        let p: *FsProc = fs_procs[slot]
+        if p != 0 as *FsProc and p.pid == pid
+            fs_current = slot
+            return 0
+        slot = slot + 1
+    fs_current = -1
+    Errno.Srch as i32
 
 # The pid fs_process_start gave the current process, or 0 if none.
 pub fn fs_process_pid() -> u64

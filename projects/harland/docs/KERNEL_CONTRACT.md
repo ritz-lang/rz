@@ -53,7 +53,25 @@ fn sys_exit(code: i32) -> !
 fn sys_yield() -> i32
 ```
 
+- The next runnable process runs; the caller runs again when its turn
+  comes round (at once if nothing else can run). Processes are also
+  preempted: a 100 Hz LAPIC tick, calibrated against the TSC, round-robins
+  the runnable processes whenever it interrupts ring 3 (AGAST #3629).
 - **Returns**: 0 on success
+
+#### SYS_SPAWN_BG (28)
+
+```ritz
+# Start a program without waiting for it (AGAST #3629)
+fn sys_spawn_bg(path: *u8, argv: **u8, argc: i32) -> i64
+```
+
+- Like SYS_SPAWN_ARGS (25), which blocks until the child exits; here the
+  caller and the child both run. `sys_wait(pid)` (22) sleeps until the child
+  exits and returns its exit code. A child whose parent exits first is
+  detached: nobody can wait for it, and its exit frees its slot.
+- **Returns**: the child's pid, or a negative errno (ENOENT, ENOEXEC,
+  ENOMEM, EAGAIN with 8 processes live, E2BIG, EFAULT)
 
 #### SYS_GETPID (23)
 

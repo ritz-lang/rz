@@ -1,7 +1,17 @@
 # Harland Syscall Runtime - Process (AGAST #2751, from main.ritz)
 #
-# Blocking spawn/exit/wait on the process table (proc/table.ritz, AGAST
-# #1882), and the syscalls that read it (getpid, yield, acpi_poweroff).
+# spawn/exit/wait on the process table (proc/table.ritz, AGAST #1882) and the
+# scheduler (proc/sched.ritz, AGAST #3629), and the syscalls that read them
+# (getpid, yield, acpi_poweroff).
+#
+# Every process runs on its own kernel stack. spawn builds the child (page
+# table, ELF, user stack, argv, fd table) and a first frame on the child's
+# kernel stack, then makes it runnable. spawn_bg returns its pid at once;
+# spawn blocks in the scheduler until the child exits, and wait(pid) blocks
+# until that child exits. A blocked process's syscall frame stays on its
+# own kernel stack, so it simply returns when it runs again: there is no
+# saved-frame copy to resume (#2132's syscall_save_user_frame and
+# resume_user_frame are gone with the single syscall stack).
 #
 # The open handler lives here, not in file.ritz: it used to save and restore
 # the running pid around sys_open. That guarded against the 4 KiB syscall
@@ -9,49 +19,41 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
-import io { halt_loop }
+import io { halt_loop, disable_interrupts, enable_interrupts }
 import serial { StrView, prints, serial_print_hex, serial_print_dec, serial_write_byte }
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_read_pml4_entry }
 import mm.uptr { uptr_validate_string, uptr_check_read }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_read }
 import fs.kpath { strview_from_ptr }
-import fs.syscall { sys_open, fs_process_end, fs_process_start }
+import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
 import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
 import loader.elf { ElfLoadResult, ElfStatus, elf_load }
 import syscall.errno { Errno }
 import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
-import proc.table { Proc, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_frame, proc_spawn_child, proc_abort_child, proc_exit_current, proc_wait }
+import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait }
+import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
 
-# External assembly functions (syscall_entry.s, user_entry) for user context
-extern fn jump_to_userspace(entry: u64, stack: u64)
-extern fn syscall_save_user_frame(dst: *u64)
 extern fn syscall_stack_size() -> u64
-extern fn resume_user_frame(frame: *u64, retval: i64)
-extern fn jump_to_userspace_with_args(entry: u64, stack: u64, argc: i64, argv: u64)
 
 # ============================================================================
-# Blocking spawn
+# spawn
 # ============================================================================
-#
-# spawn saves the caller's whole syscall frame (GPRs, RIP, RFLAGS, RSP;
-# layout in syscall_entry.s) and page table in the caller's own Proc, pushes
-# a child Proc and jumps into the child. The frame can't stay on the syscall
-# stack: that stack is one global and the child's own syscalls overwrite it
-# (#2132). The child's exit resumes the parent from its Proc, so a child can
-# spawn in turn: init -> rzsh -> script -> command.
 
-# spawn_args' copy of the parent's argv, made before it switches to the
+# spawn_process' copy of the parent's argv, made before it switches to the
 # child's page table (AGAST #1877: 5 KiB that used to be syscall-stack
-# locals). Static even though spawn nests: one CPU runs syscalls, and each
-# spawn_args fills them and is done with them before it jumps into the
-# child, which never returns into this call.
+# locals). Static: the kernel is not preempted, and spawn_process fills and
+# is done with them before anything can switch away.
 const SPAWN_ARGV_BYTES: i64 = 4096
 const SPAWN_ARGV_MAX: i32 = 64
 var g_spawn_argv_copy: [4096]u8
 var g_spawn_argv_offsets: [64]i64     # offset of each arg in g_spawn_argv_copy
 var g_spawn_child_argv: [64]u64       # each arg's address on the child's stack
+
+# init's page table: the kernel's own, mapped for as long as the kernel
+# runs. An exiting process leaves its own for this one before freeing it.
+var g_kernel_pml4: u64 = 0
 
 # Get current process ID (for syscalls that need caller PID)
 pub fn current_pid() -> u32
@@ -74,13 +76,16 @@ fn prints_str(s: *u8)
         p = p + 1
 
 # Make the running process init (PID 1, no parent, cwd "/") with its own fd
-# table (#2753): run_init, before it jumps to /bin/init.
+# table (#2753) and kernel stack, and start the scheduler's tick (#3629):
+# run_init, before it jumps to /bin/init.
 pub fn process_enter_init()
     proc_table_reset()
-    if proc_enter_init(vmm_get_current_pml4()) != 0
+    g_kernel_pml4 = vmm_get_current_pml4()
+    if proc_enter_init(g_kernel_pml4) != 0
         prints("[init] No process table slot for init\n")
     if fs_process_start(1) != 0
         prints("[init] No fd table: init cannot open files\n")
+    sched_start(proc_current_slot())
 
 # The errno a failed spawn returns for a failed ELF load: out of memory, or
 # a file that isn't a loadable x86-64 executable.
@@ -90,180 +95,32 @@ fn elf_status_errno(s: ElfStatus) -> i64
         MapFailed => Errno.NoMem as i64
         _ => Errno.NoExec as i64
 
-# Start a spawn: save the caller's frame and page table in its Proc and push
-# the child's, with its own address space. The child is current; the caller
-# is returned (null, with *err set, on failure, nothing changed).
-fn spawn_begin(err: *i64) -> *Proc
-    let parent: *Proc = proc_current()
-    syscall_save_user_frame(proc_frame(parent))
-    (*parent).pml4 = vmm_get_current_pml4()
-    let rc: i32 = proc_spawn_child()
-    if rc != 0
-        *err = rc as i64
-        return 0 as *Proc
-    # An isolated address space: kernel mappings, empty user space.
-    let child_pml4: u64 = vmm_create_user_pml4()
-    if child_pml4 == 0
-        proc_abort_child()
-        *err = Errno.NoMem as i64
-        return 0 as *Proc
-    (*proc_current()).pml4 = child_pml4
-    return parent
+# Undo a spawn that failed after the child's slot, fd table and page table
+# were made, before it ran. The caller is back in its own page table. The
+# parent keeps its pid throughout (AGAST #2762).
+fn spawn_undo(slot: i32, parent_pid: u64)
+    let c: *Proc = proc_at(slot)
+    fs_process_select(c.pid)
+    fs_process_end()
+    fs_process_select(parent_pid)
+    if c.pml4 != 0
+        vmm_free_pml4(c.pml4)
+    proc_abort_child(slot)
 
-# Undo a spawn that failed after spawn_begin, before the child ran: its page
-# table is freed and the parent is the running process again, under its own
-# pid (AGAST #2762: getpid in the parent returned the half-made child's).
-fn spawn_undo()
-    vmm_free_pml4((*proc_current()).pml4)
-    proc_abort_child()
-
-# sys_spawn: Load and execute a binary from the filesystem
-# This is a BLOCKING spawn - we save parent state, run child, and when
-# child exits, we restore parent state and return with child's exit code.
-#
-# ISOLATION: Each child process gets its own page table (CR3), providing
-# full memory isolation from the parent. The child cannot read or write
-# the parent's user-space memory.
-fn sys_spawn_impl(path: *u8) -> i64
-    # Look up the file in the namespace
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
-        return Errno.NoDev as i64
-
-    # Read file from namespace (using kernel's page table)
-    let path_len: i64 = syscall_strlen(path)
-    let path_view: StrView = strview_from_ptr(path, path_len)
-    var file_size: u64 = 0
-    let elf_data: *u8 = knamespace_read(ns, path_view, @file_size)
-
-    if elf_data == 0 as *u8
-        return Errno.NoEnt as i64
-
-    # Save the caller's context in its Proc; the child's exit resumes it.
-    var err: i64 = 0
-    let parent: *Proc = spawn_begin(@err)
-    if parent == 0 as *Proc
-        return err
-    let child_pml4: u64 = (*proc_current()).pml4
-
-    # Debug: Print parent PML4[511] before switch
-    prints("[spawn] Parent PML4[511] = 0x")
-    serial_print_hex(vmm_read_pml4_entry(parent.pml4, 511))
-    prints("\n")
-    prints("[spawn] Child  PML4[511] = 0x")
-    serial_print_hex(vmm_read_pml4_entry(child_pml4, 511))
-    prints("\n")
-
-    # The child's own fd table (#2753); sys_exit_impl releases it. Made here,
-    # in the parent's address space: kalloc may grow the heap, and
-    # vmm_map_page walks the page tables through the identity map, which a
-    # child's page table lacks.
-    let fs_result: i32 = fs_process_start(proc_current_pid())
-    if fs_result != 0
-        spawn_undo()
-        return fs_result as i64
-
-    # Switch to child's address space for ELF loading
-    # This way, elf_load will map pages directly into the child's page table
-    vmm_switch_pml4(child_pml4)
-
-    # Load the child ELF into the child's address space
-    # For PIE executables, we can load at any address in userspace.
-    # With isolated address spaces, we can use the same base as init!
-    let child_load_base: u64 = 0x100000000  # 4GB - same as init, no conflict due to isolation
-    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
-
-    if load_result.error != ElfStatus.Ok
-        # Switch back to parent before cleanup
-        vmm_switch_pml4(parent.pml4)
-        fs_process_end()
-        spawn_undo()
-        return elf_status_errno(load_result.error)
-
-    # Allocate 64KB user stack (16 pages)
-    let child_stack_top: u64 = alloc_user_stack()
-    if child_stack_top == 0
-        vmm_switch_pml4(parent.pml4)
-        fs_process_end()
-        spawn_undo()
-        return Errno.NoMem as i64
-
-    # Jump to child! This does NOT return.
-    # We're already in the child's address space (CR3 was switched above).
-    # When the child calls sys_exit(), sys_exit_impl resumes the parent from
-    # its Proc, switching back to the parent's CR3 first.
-    jump_to_userspace(load_result.entry_point, child_stack_top)
-
-    # Never reached - child will call sys_exit which handles return to parent
-    return Errno.NoExec as i64
-
-# sys_spawn_args: Load and execute a binary with command-line arguments
-# Similar to sys_spawn_impl but passes argc/argv to the child process.
-#
-# Arguments:
-#   path: Path to the executable
-#   argv: Array of null-terminated argument strings (in parent's address space)
-#   argc: Number of arguments
-#
-# The child's main() receives: fn main(argc: i32, argv: **u8) -> i32
-fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
-    prints("[spawn_args] spawn_args(")
-    prints_str(path)
-    prints(", argc=")
-    serial_print_dec(argc as u64)
-    prints(")\n")
-
-    # Look up the file in the namespace
-    let ns: *KNamespace = knamespace_get()
-    if ns == 0 as *KNamespace
-        prints("[spawn_args] No namespace\n")
-        return Errno.NoDev as i64
-
-    # Read file from namespace (using kernel's page table)
-    let path_len: i64 = syscall_strlen(path)
-    let path_view: StrView = strview_from_ptr(path, path_len)
-    var file_size: u64 = 0
-    let elf_data: *u8 = knamespace_read(ns, path_view, @file_size)
-
-    if elf_data == 0 as *u8
-        prints("[spawn_args] File not found: ")
-        prints_str(path)
-        prints("\n")
-        return Errno.NoEnt as i64
-
-    prints("[spawn_args] Loading ELF (")
-    serial_print_dec(file_size)
-    prints(" bytes)...\n")
-
-    # Save the caller's context in its Proc; the child's exit resumes it.
-    var err: i64 = 0
-    let parent: *Proc = spawn_begin(@err)
-    if parent == 0 as *Proc
-        prints("[spawn_args] No child process or page table\n")
-        return err
-    let child_pml4: u64 = (*proc_current()).pml4
-
-    # Copy argv strings from parent's address space before switching
-    # We need to measure total space needed and copy while we can still read parent memory
-    var total_string_bytes: i64 = 0
-    var i: i32 = 0
-    while i < argc
-        let arg: *u8 = *(argv + i)
-        total_string_bytes = total_string_bytes + syscall_strlen(arg) + 1  # +1 for null
-        i = i + 1
-
-    # Copy the argv strings to g_spawn_argv_copy (max 4 KiB, 64 args)
-    if total_string_bytes > SPAWN_ARGV_BYTES
-        prints("[spawn_args] argv too large\n")
-        spawn_undo()
-        return Errno.TooBig as i64
-
+# Copy argv (argc strings in the caller's address space) into
+# g_spawn_argv_copy. Its total size, or Errno.TooBig.
+fn spawn_copy_argv(argv: **u8, argc: i32) -> i64
     if argc > SPAWN_ARGV_MAX
         prints("[spawn_args] too many arguments\n")
-        spawn_undo()
         return Errno.TooBig as i64
-
-    # Copy all strings into g_spawn_argv_copy
+    var total: i64 = 0
+    var i: i32 = 0
+    while i < argc
+        total = total + syscall_strlen(*(argv + i)) + 1  # +1 for null
+        i = i + 1
+    if total > SPAWN_ARGV_BYTES
+        prints("[spawn_args] argv too large\n")
+        return Errno.TooBig as i64
     var copy_pos: i64 = 0
     i = 0
     while i < argc
@@ -273,62 +130,21 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         while *(arg + j) != 0
             g_spawn_argv_copy[(copy_pos + j) as i32] = *(arg + j)
             j = j + 1
-        g_spawn_argv_copy[(copy_pos + j) as i32] = 0  # Null terminate
+        g_spawn_argv_copy[(copy_pos + j) as i32] = 0
         copy_pos = copy_pos + j + 1
         i = i + 1
+    return total
 
-    # The child's own fd table (#2753); sys_exit_impl releases it. Made here,
-    # in the parent's address space: kalloc may grow the heap, and
-    # vmm_map_page walks the page tables through the identity map, which a
-    # child's page table lacks.
-    let fs_result: i32 = fs_process_start(proc_current_pid())
-    if fs_result != 0
-        prints("[spawn_args] No fd table for the child\n")
-        spawn_undo()
-        return fs_result as i64
-
-    # Switch to child's address space
-    vmm_switch_pml4(child_pml4)
-
-    # Load the child ELF
-    let child_load_base: u64 = 0x100000000
-    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
-
-    if load_result.error != ElfStatus.Ok
-        prints("[spawn_args] Failed to load ELF\n")
-        vmm_switch_pml4(parent.pml4)
-        fs_process_end()
-        spawn_undo()
-        return elf_status_errno(load_result.error)
-
-    # Allocate 64KB user stack (16 pages)
-    let alloc_stack_top: u64 = alloc_user_stack()
-    if alloc_stack_top == 0
-        prints("[spawn_args] Failed to allocate child stack\n")
-        vmm_switch_pml4(parent.pml4)
-        fs_process_end()
-        spawn_undo()
-        return Errno.NoMem as i64
-
-    # Set up the stack with argv data
-    # Layout from top of stack going down:
-    #   1. String data (argv[0] content, argv[1] content, ...)
-    #   2. argv[argc] = NULL
-    #   3. argv[argc-1] pointer
-    #   4. ...
-    #   5. argv[0] pointer
-    #   6. (16-byte aligned) <- RSP points here
-
+# Lay out argv on the child's user stack (the child's page table is
+# current): the strings at the top, below them the argv array and its NULL,
+# 16-aligned. The child's RSP; *child_argv gets argv's address.
+fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
     # Stack top is USER_STACK_TOP + PAGE_SIZE (first unmapped address)
     var stack_ptr: u64 = USER_STACK_TOP + PAGE_SIZE
-
-    # Copy string data to top of stack (working down)
     stack_ptr = stack_ptr - (total_string_bytes as u64)
-    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0  # Align to 16 bytes
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
     let strings_base: u64 = stack_ptr
-
-    # Copy argv strings to child stack
-    i = 0
+    var i: i32 = 0
     var dst_offset: i64 = 0
     while i < argc
         g_spawn_child_argv[i] = strings_base + (dst_offset as u64)
@@ -340,102 +156,210 @@ fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
         *((strings_base + dst_offset as u64 + j as u64) as *u8) = 0
         dst_offset = dst_offset + j + 1
         i = i + 1
-
-    # Push argv array (including NULL terminator)
     let argv_array_size: u64 = ((argc + 1) as u64) * 8  # pointers + NULL
     stack_ptr = stack_ptr - argv_array_size
-    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0  # Align
-    let child_argv: u64 = stack_ptr
-
-    # Write argv pointers
+    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
+    let argv_addr: u64 = stack_ptr
     i = 0
     while i < argc
-        *((child_argv + (i as u64) * 8) as *u64) = g_spawn_child_argv[i]
+        *((argv_addr + (i as u64) * 8) as *u64) = g_spawn_child_argv[i]
         i = i + 1
-    # NULL terminator
-    *((child_argv + (argc as u64) * 8) as *u64) = 0
+    *((argv_addr + (argc as u64) * 8) as *u64) = 0
+    *child_argv = argv_addr
+    return stack_ptr & 0xFFFFFFFFFFFFFFF0
 
-    # Final stack alignment for SysV ABI (RSP must be 16-byte aligned before call)
-    stack_ptr = stack_ptr & 0xFFFFFFFFFFFFFFF0
+# Start `path` as a child of the running process, with argc/argv (argc 0:
+# none) in main's RDI/RSI. The child is runnable when this returns: its pid,
+# or a negative errno with nothing changed.
+#
+# ISOLATION: each child gets its own page table (CR3); it cannot read or
+# write the parent's user memory.
+fn spawn_process(path: *u8, argv: **u8, argc: i32) -> i64
+    let ns: *KNamespace = knamespace_get()
+    if ns == 0 as *KNamespace
+        prints("[spawn_args] No namespace\n")
+        return Errno.NoDev as i64
 
-    prints("[spawn_args] Child argv at 0x")
-    serial_print_hex(child_argv)
-    prints(", stack=0x")
-    serial_print_hex(stack_ptr)
+    # Read file from namespace (using kernel's page table)
+    let path_len: i64 = syscall_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    var file_size: u64 = 0
+    let elf_data: *u8 = knamespace_read(ns, path_view, @file_size)
+    if elf_data == 0 as *u8
+        if argc > 0
+            prints("[spawn_args] File not found: ")
+            prints_str(path)
+            prints("\n")
+        return Errno.NoEnt as i64
+
+    # argv lives in the parent's address space: copy it out first.
+    var total_string_bytes: i64 = 0
+    if argc > 0
+        total_string_bytes = spawn_copy_argv(argv, argc)
+        if total_string_bytes < 0
+            return total_string_bytes
+
+    let parent: *Proc = proc_current()
+    let parent_pid: u64 = parent.pid
+    let parent_pml4: u64 = vmm_get_current_pml4()
+    (*parent).pml4 = parent_pml4
+    let slot: i32 = proc_new_child()
+    if slot < 0
+        prints("[spawn_args] No child process slot\n")
+        return slot as i64
+    let child: *Proc = proc_at(slot)
+    let child_pid: u64 = child.pid
+
+    # The child's own fd table (#2753); its exit releases it. Made here, in
+    # the parent's address space: kalloc may grow the heap, and vmm_map_page
+    # walks the page tables through the identity map, which a child's page
+    # table lacks. fs_process_start makes it current: the parent's again
+    # straight after.
+    let fs_result: i32 = fs_process_start(child_pid)
+    fs_process_select(parent_pid)
+    if fs_result != 0
+        prints("[spawn_args] No fd table for the child\n")
+        proc_abort_child(slot)
+        return fs_result as i64
+
+    # An isolated address space: kernel mappings, empty user space.
+    let child_pml4: u64 = vmm_create_user_pml4()
+    if child_pml4 == 0
+        spawn_undo(slot, parent_pid)
+        return Errno.NoMem as i64
+    (*child).pml4 = child_pml4
+
+    # Debug: Print parent PML4[511] before switch
+    prints("[spawn] Parent PML4[511] = 0x")
+    serial_print_hex(vmm_read_pml4_entry(parent_pml4, 511))
+    prints("\n")
+    prints("[spawn] Child  PML4[511] = 0x")
+    serial_print_hex(vmm_read_pml4_entry(child_pml4, 511))
     prints("\n")
 
-    # Debug: print first arg
+    # Load in the child's address space, so elf_load maps its pages there.
+    # The same base as init's: address spaces are isolated.
+    vmm_switch_pml4(child_pml4)
+    let child_load_base: u64 = 0x100000000
+    let load_result: ElfLoadResult = elf_load(elf_data, file_size, child_load_base)
+    if load_result.error != ElfStatus.Ok
+        prints("[spawn_args] Failed to load ELF\n")
+        vmm_switch_pml4(parent_pml4)
+        spawn_undo(slot, parent_pid)
+        return elf_status_errno(load_result.error)
+
+    # 64 KiB user stack (16 pages)
+    let child_stack_top: u64 = alloc_user_stack()
+    if child_stack_top == 0
+        prints("[spawn_args] Failed to allocate child stack\n")
+        vmm_switch_pml4(parent_pml4)
+        spawn_undo(slot, parent_pid)
+        return Errno.NoMem as i64
+
+    var user_rsp: u64 = child_stack_top
+    var child_argv: u64 = 0
     if argc > 0
-        prints("[spawn_args] argv[0] = ")
-        prints_str(g_spawn_child_argv[0] as *u8)
+        user_rsp = spawn_push_argv(argc, total_string_bytes, @child_argv)
+        prints("[spawn_args] Child argv at 0x")
+        serial_print_hex(child_argv)
+        prints(", stack=0x")
+        serial_print_hex(user_rsp)
         prints("\n")
+    vmm_switch_pml4(parent_pml4)
 
-    prints("[spawn_args] Jumping to child with args...\n\n")
+    # main(argc, argv) in RDI/RSI; the first switch to the slot enters it.
+    var arg0: u64 = 0
+    if argc > 0
+        arg0 = argc as u64
+    sched_prepare_user(slot, load_result.entry_point, user_rsp, arg0, child_argv)
+    proc_start(slot)
+    return child_pid as i64
 
-    # Jump to child with argc/argv!
-    jump_to_userspace_with_args(load_result.entry_point, stack_ptr, argc as i64, child_argv)
+# Sleep until the running process's child `pid` exits (or at once if it
+# has): PROC_CHILD_EXITED with its code in *code, or Errno.Child if pid is
+# no child of the caller. Doesn't reap it.
+fn wait_for_child(pid: u64, code: *i64) -> i32
+    disable_interrupts()
+    var st: i32 = proc_child_status(pid, code)
+    while st == PROC_CHILD_LIVE
+        proc_block(BLOCK_CHILD, pid)
+        sched_block()
+        st = proc_child_status(pid, code)
+    enable_interrupts()
+    st
 
-    # Never reached
-    prints("[spawn_args] ERROR: jump returned!\n")
-    return Errno.NoExec as i64
+# spawn, blocking: start the child and sleep until it exits. Its pid, for
+# sys_wait to collect the status; a negative exit code fails the spawn with
+# -1 instead, and the child is reaped here since no wait will come.
+fn spawn_and_block(path: *u8, argv: **u8, argc: i32) -> i64
+    let pid: i64 = spawn_process(path, argv, argc)
+    if pid <= 0
+        return pid
+    var code: i64 = 0
+    wait_for_child(pid as u64, @code)
+    if code < 0
+        proc_wait(pid as u64)
+        return -1
+    return pid
 
-# sys_exit: Exit the current process
-# A spawned child becomes a zombie for its parent's wait and the parent
-# resumes from its spawn with the child's pid. init exiting powers off.
+# sys_spawn: run a binary from the filesystem and wait for it to exit.
+fn sys_spawn_impl(path: *u8) -> i64
+    return spawn_and_block(path, 0 as **u8, 0)
+
+# sys_spawn_args: run a binary with arguments and wait for it to exit. The
+# child's main() receives: fn main(argc: i32, argv: **u8) -> i32
+fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
+    prints("[spawn_args] spawn_args(")
+    prints_str(path)
+    prints(", argc=")
+    serial_print_dec(argc as u64)
+    prints(")\n")
+    return spawn_and_block(path, argv, argc)
+
+# sys_exit: the running process exits. Its fds are flushed and closed, its
+# address space freed, and it becomes a zombie for its parent's wait (a
+# parent blocked on it runs again); then the CPU goes to whoever runs next.
+# init exiting powers off.
 fn sys_exit_impl(code: i32) -> i64
-    var child_pid: u64 = 0
-    var child_pml4: u64 = 0
-    let child: *Proc = proc_current()
-    if child != 0 as *Proc
-        child_pid = child.pid
-        child_pml4 = child.pml4
-    let parent: *Proc = proc_exit_current(code as i64)
-    if parent != 0 as *Proc
-        # IMPORTANT: Switch back to parent's address space BEFORE jumping!
-        # The parent's user code and stack are only accessible in the parent's
-        # page table. If we jump while still in the child's CR3, we'll page fault.
-        vmm_switch_pml4(parent.pml4)
+    let me: *Proc = proc_current()
+    if me != 0 as *Proc and not proc_is_init(me)
+        let my_pml4: u64 = me.pml4
+        # Leave the exiting address space for the kernel's, which stays
+        # mapped, before freeing it.
+        vmm_switch_pml4(g_kernel_pml4)
 
-        # Close the fds the child left open (flushing their writes) and free
-        # its fd table, so none outlive it; the parent's table is current
-        # again (#2753).
+        # Close the fds it left open (flushing their writes) and free its
+        # fd table, so none outlive it (#2753).
         fs_process_end()
 
-        # Free the child's page table and all its user-space pages
-        if child_pml4 != 0
-            vmm_free_pml4(child_pml4)
+        # Free its page table and all its user-space pages
+        if my_pml4 != 0
+            vmm_free_pml4(my_pml4)
 
-        # The parent's spawn returns the child's pid, for sys_wait. A
-        # negative exit code fails the spawn with -1 instead, so no wait
-        # will come: reap it now.
-        var retval: i64 = child_pid as i64
-        if code < 0
-            proc_wait(child_pid)
-            retval = -1
+        disable_interrupts()
+        proc_exit_current(code as i64)
 
         # exit never returns through syscall_handler, so its stack check
         # runs here (#2761).
         syscall_stack_check()
 
-        # Resume the parent with every register it had at sys_spawn, not only
-        # RIP/RSP: its syscall stub restores RSP from RBP.
-        resume_user_frame(proc_frame(parent), retval)
-
-        # Never reached
+        # Never returns: nothing switches back to an exited process.
+        sched_exit()
 
     # No parent - this is init exiting. Its fds are closed (and their writes
     # flushed) like any process's (#2753), then the machine powers off
     # through ACPI S5 (#2755): under QEMU the VM exits instead of hanging.
     fs_process_end()
     # init's exit doesn't return through syscall_handler either: panic, not
-    # power off as if fine, if a syscall ran off the syscall stack (#2761),
-    # and report how deep any went.
+    # power off as if fine, if a syscall ran off its stack (#2761), and
+    # report how deep any went.
     syscall_stack_check()
     prints("[exit] syscall stack peak ")
     serial_print_dec(syscall_stack_used())
     prints(" of ")
     serial_print_dec(syscall_stack_size())
     prints(" bytes\n")
+    sched_report()
     prints("[exit] init exited with code ")
     if code < 0
         prints("-")
@@ -450,16 +374,19 @@ fn sys_exit_impl(code: i32) -> i64
     return 0
 
 # Terminate the running process with `status`, as if it had called
-# exit(status): its parent resumes, or init's exit powers off. The exception
-# handler calls this for a fault taken in ring 3 (#2755). Never returns.
+# exit(status): its parent's wait sees it, or init's exit powers off. The
+# exception handler calls this for a fault taken in ring 3 (#2755), the
+# console for Ctrl-C (#4254). Never returns.
 pub fn process_kill_current(status: i32) -> i64
     return sys_exit_impl(status)
 
-# sys_wait: reap the caller's exited child `pid`. With blocking spawn the
-# child has exited by the time spawn returns, so this only collects its exit
-# code: the code, or Errno.Child if pid is no unreaped child of the caller.
+# sys_wait: reap the caller's child `pid`, sleeping until it exits: its exit
+# code, or Errno.Child if pid is no unreaped child of the caller.
 fn sys_wait_impl(pid: i32) -> i64
     if pid <= 0
+        return Errno.Child as i64
+    var code: i64 = 0
+    if wait_for_child(pid as u64, @code) != PROC_CHILD_EXITED
         return Errno.Child as i64
     return proc_wait(pid as u64)
 
@@ -514,6 +441,27 @@ pub fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
             i = i + 1
     return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
 
+# spawn_bg(path, argv, argc): like spawn_args, but the caller doesn't wait:
+# the child's pid comes back at once, both run (#3629), and wait(pid)
+# collects its exit code.
+pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
+    if path_result < 0
+        return Errno.Fault as i64
+    let argc: i32 = rdx as i32
+    if argc < 0
+        return Errno.Inval as i64
+    if argc > 0
+        if uptr_check_read(rsi as *u8, (argc as u64) * 8) != 0
+            return Errno.Fault as i64
+        var i: i32 = 0
+        let argv: **u8 = rsi as **u8
+        while i < argc
+            if uptr_validate_string(*(argv + i), 4096) < 0
+                return Errno.Fault as i64
+            i = i + 1
+    return spawn_process(rdi as *u8, rsi as **u8, argc)
+
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return sys_wait_impl(rdi as i32)
@@ -522,10 +470,10 @@ pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 pub fn sys_getpid_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return proc_current_pid() as i64
 
-# yield(): a no-op. Spawn is blocking, so the one running process is the
-# only one that can run; there is no scheduler to yield to (the unused
-# kernel-thread one was deleted, AGAST #1882).
+# yield(): the next runnable process gets the CPU; the caller runs again
+# when its turn comes round (at once, if nothing else can run).
 pub fn sys_yield_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    sched_yield()
     return 0
 
 # acpi_poweroff()

@@ -51,6 +51,7 @@ AREAS = {
         "current_pid", "syscall_strlen", "prints_str", "process_enter_init",
         "elf_status_errno", "sys_spawn_impl", "sys_spawn_args_impl", "sys_exit_impl", "sys_wait_impl",
         "sys_exit_handler", "sys_open_handler", "sys_spawn_handler", "sys_spawn_args_handler",
+        "sys_spawn_bg_handler", "spawn_process", "wait_for_child",
         "sys_wait_handler", "sys_getpid_handler", "sys_yield_handler", "sys_acpi_poweroff_handler",
     ],
     "file": [
@@ -206,7 +207,7 @@ def test_table_registers_handlers_imported_from_their_area():
     each taken from the area module that defines it."""
     code = _code(_area("entry"))
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
-    assert len(regs) == 35, regs
+    assert len(regs) == 36, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

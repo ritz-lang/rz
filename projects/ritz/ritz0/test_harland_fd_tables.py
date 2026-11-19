@@ -573,23 +573,36 @@ PROCESS = KERNEL_SRC / "syscall" / "runtime" / "process.ritz"
 def test_exit_releases_the_table_before_the_parent_resumes():
     body = _fn(PROCESS, "sys_exit_impl")
     child, init = body.split("# No parent", 1)
-    # child: in the parent's address space, before the parent runs again (the
-    # order is #2753's; a flush growing the heap is safe under any CR3, #2761)
-    assert child.index("vmm_switch_pml4(parent.pml4)") < child.index("fs_process_end()") \
-        < child.index("resume_user_frame(")
+    # child: out of its own address space, its fds closed and its pages
+    # freed, before it becomes a zombie its parent can reap and the CPU
+    # leaves it for good (#2753; the scheduler, #3629). A flush growing the
+    # heap is safe under any CR3 (#2761).
+    assert child.index("vmm_switch_pml4(g_kernel_pml4)") < child.index("fs_process_end()") \
+        < child.index("vmm_free_pml4(my_pml4)") < child.index("proc_exit_current(") \
+        < child.index("sched_exit()")
     # init exiting: released before the halt
     assert init.index("fs_process_end()") < init.index("halt_loop()")
 
 
-@pytest.mark.parametrize("spawn", ["sys_spawn_impl", "sys_spawn_args_impl"])
-def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure(spawn):
-    body = _fn(PROCESS, spawn)
+def test_spawn_gives_the_child_a_table_and_undoes_it_on_failure():
+    body = _fn(PROCESS, "spawn_process")
     # made before the switch into the child's page table (kalloc may map
-    # heap pages through the identity map, which the child's lacks)
-    assert body.index("fs_process_start(proc_current_pid())") < body.index("vmm_switch_pml4(child_pml4)")
-    # every later failure path gives it back
-    fails = re.findall(r"vmm_switch_pml4\(parent\.pml4\)\n(\s+)(\S.*)\n", body)
-    assert fails and all(line == "fs_process_end()" for _, line in fails), fails
+    # heap pages through the identity map, which the child's lacks), and the
+    # parent's table is current again straight after
+    start = body.index("fs_process_start(child_pid)")
+    assert start < body.index("fs_process_select(parent_pid)") < body.index("vmm_switch_pml4(child_pml4)")
+    # every later failure path gives it back: spawn_undo ends the child's table
+    fails = re.findall(r"vmm_switch_pml4\(parent_pml4\)\n(\s+)(\S.*)\n", body)
+    fail_lines = [line for _, line in fails]
+    assert fail_lines.count("spawn_undo(slot, parent_pid)") >= 2, fails
+    undo = _fn(PROCESS, "spawn_undo")
+    assert undo.index("fs_process_select(c.pid)") < undo.index("fs_process_end()") \
+        < undo.index("fs_process_select(parent_pid)")
+    # both spawn syscalls, and spawn_bg, go through it
+    for spawn in ("spawn_and_block", "sys_spawn_bg_handler"):
+        assert "spawn_process(" in _fn(PROCESS, spawn), spawn
+    for spawn in ("sys_spawn_impl", "sys_spawn_args_impl"):
+        assert "spawn_and_block(" in _fn(PROCESS, spawn), spawn
 
 
 def test_init_gets_a_table_before_it_runs():

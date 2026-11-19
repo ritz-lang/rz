@@ -1,0 +1,56 @@
+# busy: a process that computes without yielding (AGAST #3629)
+#
+# Usage: busy TAG
+# Spins BUSY_STEPS times through BUSY_SPIN iterations of a loop that makes no
+# syscall, printing "[busy TAG] n/BUSY_STEPS" after each, then exits 0. init's
+# Tier-1 `preempt` test spawn_bg's two of them side by side: only the
+# kernel's timer can take the CPU from either mid-loop, so their progress
+# lines interleave only with preemption. tools/test_tier1_boot.sh checks
+# that they do. Each line is one write, so lines never mix.
+
+import ritzlib.sys { sys_write, STDOUT }
+import ritzlib.fmt { fmt_i64_into }
+
+# Long enough under QEMU TCG (tens of ms a step) that a step spans several
+# 10 ms ticks; short enough that the pair finishes in a few seconds.
+const BUSY_STEPS: i64 = 8
+const BUSY_SPIN: u64 = 0x100000
+
+var g_counter: u64 = 0
+var g_line: [64]u8
+
+fn put(pos: i64, s: *u8) -> i64
+    var n: i64 = pos
+    var i: i64 = 0
+    while *(s + i) != 0
+        g_line[n] = *(s + i)
+        n = n + 1
+        i = i + 1
+    n
+
+fn report(tag: *u8, step: i64)
+    var n: i64 = put(0, c"[busy ")
+    n = put(n, tag)
+    n = put(n, c"] ")
+    n = n + fmt_i64_into(@g_line[n], step)
+    n = put(n, c"/")
+    n = n + fmt_i64_into(@g_line[n], BUSY_STEPS)
+    g_line[n] = 10
+    sys_write(STDOUT, @g_line[0], n + 1)
+
+pub fn main(argc: i32, argv: **u8) -> i32
+    var tag: *u8 = c"?"
+    if argc > 1
+        tag = *(argv + 1)
+    var step: i64 = 1
+    while step <= BUSY_STEPS
+        var i: u64 = 0
+        while i < BUSY_SPIN
+            # The asm keeps the optimiser from folding the loop away.
+            asm x86_64:
+                pause
+            g_counter = g_counter + 1
+            i = i + 1
+        report(tag, step)
+        step = step + 1
+    return 0

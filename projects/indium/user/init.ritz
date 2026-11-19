@@ -10,7 +10,7 @@
 import libharland { print_str, print_int }
 import ritzlib.str { strlen }
 import ritzlib.fmt { fmt_i64_into }
-import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_wait, sys_read, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, sys_input_poll, sys_input_read, sys_open, sys_close, O_RDONLY, sys_getcwd }
+import ritzlib.sys { sys_getpid, sys_yield, sys_spawn, sys_spawn_args, sys_spawn_bg, sys_wait, sys_read, sys_mmap, sys_munmap, PROT_READ, PROT_WRITE, MAP_PRIVATE, MAP_ANONYMOUS, sys_input_poll, sys_input_read, sys_open, sys_close, O_RDONLY, sys_getcwd }
 
 # ============================================================================
 # Test Infrastructure
@@ -314,6 +314,65 @@ fn run_spawn_fail_pid_test() -> i32
     g_failed = g_failed + 1
     return 1
 
+# Preemption (AGAST #3629). init spawn_bg's two /bin/busy children, which
+# compute without a syscall between progress lines, then waits for both. The
+# kernel must run them side by side: spawn_bg returns at once, wait sleeps
+# until each exits, and only the timer can take the CPU from a busy child.
+# Here both must start and exit 0; tools/test_tier1_boot.sh checks from the
+# serial log that their "[busy A]" / "[busy B]" lines interleave, which they
+# can't if the first one runs to its end before the second starts.
+# Returns 0 on PASS, else a step number.
+fn preempt_steps() -> i32
+    var argv_a: [2]*u8
+    argv_a[0] = c"busy"
+    argv_a[1] = c"A"
+    var argv_b: [2]*u8
+    argv_b[0] = c"busy"
+    argv_b[1] = c"B"
+    let a: i64 = sys_spawn_bg(c"/bin/busy", @argv_a[0], 2)
+    if a <= 0
+        print_str(c"(spawn_bg A returned ")
+        print_int(a)
+        print_str(c") ")
+        return 1
+    let b: i64 = sys_spawn_bg(c"/bin/busy", @argv_b[0], 2)
+    if b <= 0 or b == a
+        print_str(c"(spawn_bg B returned ")
+        print_int(b)
+        print_str(c") ")
+        sys_wait(a as i32)
+        return 2
+    # init still runs while both children do: getpid answers at once.
+    if sys_getpid() != 1
+        return 3
+    let code_a: i64 = sys_wait(a as i32)
+    let code_b: i64 = sys_wait(b as i32)
+    if code_a != 0 or code_b != 0
+        print_str(c"(exit codes ")
+        print_int(code_a)
+        print_str(c", ")
+        print_int(code_b)
+        print_str(c") ")
+        return 4
+    # each is reaped exactly once
+    if sys_wait(a as i32) >= 0 or sys_wait(b as i32) >= 0
+        return 5
+    return 0
+
+fn run_preempt_test() -> i32
+    print_str(c"[test] preempt (two busy children) ...\n")
+    let step: i32 = preempt_steps()
+    print_str(c"[test] preempt ... ")
+    if step == 0
+        print_str(c"PASS\n")
+        g_passed = g_passed + 1
+        return 0
+    print_str(c"FAIL (step ")
+    print_int(step as i64)
+    print_str(c")\n")
+    g_failed = g_failed + 1
+    return 1
+
 fn run_fd_isolation_test() -> i32
     print_str(c"[test] fd_isolation ... ")
     let step: i32 = fd_isolation_steps()
@@ -349,6 +408,7 @@ fn test_write() -> i32
 
 fn test_yield() -> i32
     print_str(c"[init] Testing sys_yield()... ")
+    # Nothing else runs yet: yield comes straight back to init.
     sys_yield()
     print_str(c"PASS\n")
     return 0
@@ -468,6 +528,9 @@ fn run_tier1_tests() -> i32
 
     # Three levels below init, each resuming after its child (AGAST #1882).
     run_nested_spawn_test()
+
+    # Two children computing side by side, preempted by the timer (#3629).
+    run_preempt_test()
 
     run_input_check()
 

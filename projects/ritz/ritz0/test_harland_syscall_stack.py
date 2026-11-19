@@ -1,13 +1,17 @@
-"""Harland's syscall stack: big enough, out of .data, and guarded (AGAST #2761).
+"""Harland's kernel stacks: big enough, out of .data, and guarded (AGAST #2761).
 
-Every syscall, and every IRQ taken during one, runs on the single
-syscall_stack in kernel/syscall_entry.s. It was 4 KiB in .data, directly
-above g_child_pid and fs_current; Tier-1 already peaks at ~8 KiB, and a deep
-syscall (a knamespace_write flush, an O_CREAT open) silently overwrote those
-globals (#2761, #4064). The fix keeps it in .bss at 64 KiB with a sentinel
-quadword at its bottom that syscall_stack_check (syscall/stack.ritz) checks
-when a syscall leaves the kernel: after every dispatch, and in sys_exit,
-which resumes the parent without returning through syscall_handler.
+Every syscall runs on a kernel stack in kernel/syscall_entry.s. It was one
+4 KiB syscall_stack in .data, directly above g_child_pid and fs_current;
+Tier-1 already peaks at ~8 KiB, and a deep syscall (a knamespace_write
+flush, an O_CREAT open) silently overwrote those globals (#2761, #4064).
+The fix kept it in .bss at 64 KiB with a sentinel quadword at its bottom
+that syscall_stack_check (syscall/stack.ritz) checks when a syscall leaves
+the kernel: after every dispatch, and in sys_exit, which leaves the CPU
+without returning through syscall_handler.
+
+Since #3629 each process-table slot has its own such stack (proc_kstacks),
+each with a sentinel and a guard page: a process blocked or preempted in
+the kernel keeps its frames there while others run.
 
 The checks are structural, at source level. The runtime checks are the OVMF
 Tier-1 boot's heap_grow test (indium heap_grow_child) and the panic message
@@ -57,46 +61,45 @@ def _body(code, fn):
 
 def test_syscall_stack_is_in_bss_and_big_enough():
     asm = _asm()
-    assert _section_of(asm, "syscall_stack") == ".bss"
+    assert _section_of(asm, "proc_kstacks") == ".bss"
     size = re.search(r"^\.set SYSCALL_STACK_SIZE,\s*(\w+)", asm, re.MULTILINE)
     assert size and int(size.group(1), 0) >= MIN_STACK, size and size.group(0)
-    # The stack is exactly SYSCALL_STACK_SIZE between its two labels.
+    # One guard page plus one stack per process-table slot.
+    assert re.search(r"^\.set KSTACK_STRIDE,\s*KSTACK_GUARD_SIZE \+ SYSCALL_STACK_SIZE", asm, re.M)
+    assert re.search(r"^\.set KSTACK_GUARD_SIZE,\s*4096", asm, re.M)
+    slots = re.search(r"^\.set KSTACK_SLOTS,\s*(\d+)", asm, re.M)
+    table = (KERNEL / "src" / "proc" / "table.ritz").read_text()
+    assert slots and f"MAX_PROCS: i32 = {slots.group(1)}" in table, "a kernel stack per Proc slot"
     assert re.search(
-        r"^syscall_stack:\s*\n\s*\.space SYSCALL_STACK_SIZE\s*\nsyscall_stack_top:",
-        asm,
-        re.MULTILINE,
+        r"^proc_kstacks:\s*\n\s*\.space KSTACK_STRIDE \* KSTACK_SLOTS", asm, re.MULTILINE
     )
     # The globals that sit after it stay in .data.
     assert _section_of(asm, "user_rsp_save") == ".data"
+    assert _section_of(asm, "kstack_current_top") == ".data"
+    # syscall_entry runs on the running process's stack.
+    entry = asm[asm.index("\nsyscall_entry:"):asm.index(".size syscall_entry")]
+    assert "movq kstack_current_top(%rip), %rsp" in entry
 
 
 def test_sentinel_helpers_use_the_stack_bottom():
     asm = _asm()
-    for fn in (
-        "syscall_stack_guard_init",
-        "syscall_stack_guard_intact",
-        "syscall_stack_high_water",
-        "syscall_stack_size",
-    ):
+    for fn in ("proc_kstacks_base", "kstack_stride", "kstack_slots", "syscall_stack_size",
+               "kstack_set_current", "kstack_get_current"):
         assert re.search(rf"^\.global {fn}$", asm, re.MULTILINE), fn
-    init = asm[
-        asm.index("\nsyscall_stack_guard_init:") : asm.index(
-            ".size syscall_stack_guard_init"
-        )
-    ]
-    assert "movq %rax, syscall_stack(%rip)" in init
-    intact = asm[
-        asm.index("\nsyscall_stack_guard_intact:") : asm.index(
-            ".size syscall_stack_guard_intact"
-        )
-    ]
-    assert "cmpq %rcx, syscall_stack(%rip)" in intact
+    stack = STACK.read_text()
+    # each slot's sentinel sits directly above its guard page
+    bottom = _body(stack, "kstack_bottom")
+    assert "kstack_guard(slot) + GUARD_PAGE_SIZE" in bottom
+    init = _body(stack, "syscall_stack_init")
+    assert "*(kstack_bottom(slot) as *u64) = SYSCALL_STACK_SENTINEL" in init
+    intact = _body(stack, "kstack_sentinel_intact")
+    assert "*(kstack_bottom(slot) as *u64) == SYSCALL_STACK_SENTINEL" in intact
 
 
 def test_check_panics_and_runs_where_syscalls_leave_the_kernel():
     stack = STACK.read_text()
     check = _body(stack, "syscall_stack_check")
-    assert "syscall_stack_guard_intact()" in check and "halt_loop()" in check
+    assert "kstack_sentinel_intact(kstack_current_slot())" in check and "halt_loop()" in check
     assert (
         "KERNEL PANIC: syscall stack overflow" in check
     )  # tools/test_*boot.sh grep KERNEL PANIC
@@ -108,7 +111,7 @@ def test_check_panics_and_runs_where_syscalls_leave_the_kernel():
     ), handler
     exit_body = _body((RUNTIME / "process.ritz").read_text(), "sys_exit_impl")
     assert exit_body.index("syscall_stack_check()") < exit_body.index(
-        "resume_user_frame("
+        "sched_exit()"
     ), exit_body
 
 
@@ -127,27 +130,18 @@ INDIUM = RITZ0_DIR.parents[1] / "indium"
 
 def test_guard_page_sits_directly_below_the_stack():
     asm = _asm()
-    # A whole page, page-aligned, in .bss, then the stack: an overflow of
-    # syscall_stack writes into syscall_stack_guard first.
-    assert re.search(
-        r"^\.align 4096\s*\nsyscall_stack_guard:\s*\n\s*\.space 4096\s*\n"
-        r"syscall_stack:",
-        asm,
-        re.MULTILINE,
-    ), "no page-aligned 4 KiB syscall_stack_guard directly below syscall_stack"
-    assert _section_of(asm, "syscall_stack_guard") == ".bss"
-    assert re.search(r"^\.global syscall_stack_guard_page$", asm, re.MULTILINE)
-    page = asm[
-        asm.index("\nsyscall_stack_guard_page:") : asm.index(
-            ".size syscall_stack_guard_page"
-        )
-    ]
-    assert "leaq syscall_stack_guard(%rip), %rax" in page
+    # Page-aligned slots in .bss, each a 4 KiB guard page then the stack: an
+    # overflow of a stack writes into its guard page first.
+    assert re.search(r"^\.align 4096\s*\nproc_kstacks:", asm, re.MULTILINE), \
+        "proc_kstacks is not page-aligned"
+    stack = STACK.read_text()
+    assert "proc_kstacks_base() + slot * kstack_stride()" in _body(stack, "kstack_guard")
+    assert "kstack_guard(slot as u64) + kstack_stride()" in _body(stack, "kstack_top")
 
 
 def test_init_unmaps_the_guard_page_and_checks_it():
     init = _body(STACK.read_text(), "syscall_stack_init")
-    assert "syscall_stack_guard_init()" in init
+    assert "while slot < kstack_slots()" in init, "every slot's guard page"
     assert init.index("vmm_unmap_kernel_page(") < init.index("vmm_virt_to_phys(")
     # Still mapped after the unmap: a boot-time panic, which the boot tests catch.
     assert "KERNEL PANIC" in init
@@ -168,7 +162,7 @@ def test_page_fault_on_the_guard_page_reports_the_overflow():
     handler = _body(exc, "exception_handler")
     assert "syscall_stack_guard_hit(" in handler
     hit = _body(STACK.read_text(), "syscall_stack_guard_hit")
-    assert "syscall_stack_guard_page()" in hit
+    assert "kstack_guard(slot)" in hit and "while slot < kstack_slots()" in hit
     assert "KERNEL PANIC: syscall stack overflow" in handler
     # #PF and #DF run on IST1, so the fault handler never uses the overflowed
     # stack.

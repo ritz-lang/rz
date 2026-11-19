@@ -186,7 +186,11 @@ BLK_MODERN = r"[virtio-blk] Device 0 initialized (64 MB, modern, queue 256)\n"
 PERSIST_OK = r"\r  [OK] Persistent storage (0 blobs)\n"
 # init exits after the suite, and the kernel powers off (AGAST #2755).
 INIT_EXIT = r"[exit] init exited with code 0, powering off\n"
-PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + SUITE_PASSED + INIT_EXIT
+# The kernel calibrated its LAPIC tick, and init's two /bin/busy children
+# (Tier-1 `preempt`) ran side by side: their lines interleave (AGAST #3629).
+TIMER_OK = r"[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 100 Hz tick, initial count 625000\n"
+PREEMPT_OK = TIMER_OK + r"[busy A] 1/2\n[busy B] 1/2\n[busy A] 2/2\n[busy B] 2/2\n"
+PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -404,6 +408,40 @@ def test_persistent_storage_that_never_came_up_fails(tree):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS (native): init Tier-1 suite" in r.stdout
     assert "persistent storage did not come up" in r.stdout
+
+
+@pytest.mark.integration
+def test_busy_children_that_ran_one_after_the_other_fail(tree):
+    """ALL TESTS PASSED is not enough: init only sees both children exit 0.
+    Without preemption the first runs to its end before the second starts
+    (AGAST #3629)."""
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+              + r"[busy A] 1/2\n[busy A] 2/2\n[busy B] 1/2\n[busy B] 2/2\n"
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS (native): init Tier-1 suite" in r.stdout
+    assert "busy children ran one after the other, not preempted (AABB)" in r.stdout
+
+
+@pytest.mark.integration
+def test_busy_child_that_never_finished_fails(tree):
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+              + r"[busy A] 1/2\n[busy B] 1/2\n[busy A] 2/2\n"
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "busy children did not both finish" in r.stdout
+
+
+@pytest.mark.integration
+def test_no_calibrated_timer_fails(tree):
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK
+              + r"[busy A] 1/2\n[busy B] 1/2\n[busy A] 2/2\n[busy B] 2/2\n"
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "no calibrated LAPIC timer tick" in r.stdout
 
 
 @pytest.mark.integration

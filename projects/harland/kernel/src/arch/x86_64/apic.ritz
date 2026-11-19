@@ -4,8 +4,10 @@
 # processor) bootstrap: trampoline copy, INIT/SIPI, per-AP stacks and the
 # started flags. Moved out of main.ritz unchanged (AGAST #2750, part of #1844).
 #
-# sched/mod.ritz and arch/x86_64/exceptions.ritz bind lapic_id, lapic_eoi,
-# lapic_write and get_ap_stack_top by name with `extern fn`; keep them `pub`.
+# arch/x86_64/exceptions.ritz binds lapic_eoi by name with `extern fn`, and
+# other modules import lapic_id, lapic_write and get_ap_stack_top; keep them
+# `pub`. (The deleted sched/mod.ritz extern-declared lapic_write(reg: u32);
+# the one definition is lapic_write(offset: u64, value: u32), #3629.)
 #
 # The LAPIC runs in x2APIC mode whenever the CPU has it (CPUID.1:ECX[21]):
 # registers are MSRs 0x800 + offset/16, the ICR is one 64-bit MSR (0x830)
@@ -15,6 +17,7 @@
 
 import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
+import arch.x86_64.tsc_calc { LAPIC_CAL_WINDOW_US, lapic_timer_hz, lapic_timer_initial }
 import serial { prints, serial_print_dec, serial_print_hex }
 import mm.pmm { Mb2BootInfo, HarlandBootInfo, pmm_alloc_page }
 import mm.vmm { vmm_pml4_phys, vmm_map_page, PTE_WRITABLE, PTE_CACHE_DISABLE }
@@ -255,11 +258,81 @@ pub fn lapic_watchdog_arm(ticks: u32) -> i32
 pub fn lapic_watchdog_expired() -> bool
     return lapic_read(LAPIC_TIMER_CURRENT) == 0
 
-# Stop the timer and mask it again, as lapic_init leaves it.
+# Stop the timer: masked again, as lapic_init leaves it, or back to the
+# scheduler's periodic tick once lapic_timer_start has run (#3629).
 pub fn lapic_watchdog_stop() -> i32
     lapic_write(LAPIC_TIMER_INITIAL, 0)
     lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED)
+    lapic_timer_resume()
     return 0
+
+# ============================================================================
+# Periodic scheduler tick (AGAST #3629)
+# ============================================================================
+#
+# The LAPIC timer's rate is the bus clock's, which nothing enumerates: count
+# it down (masked, divide by 16) over LAPIC_CAL_WINDOW_US timed by the TSC
+# (tsc.ritz, #4181), then run it periodic on vector 32 at the tick rate
+# asked for. irq_handler hands each tick to the scheduler (proc/sched.ritz).
+# The NVMe watchdog borrows the same timer one-shot; lapic_watchdog_stop
+# gives the tick back.
+
+const LAPIC_TIMER_PERIODIC: u32 = 0x20000    # LVT timer mode bits 18:17 = 01
+const LAPIC_COUNT_MAX: u32 = 0xFFFFFFFF
+
+# The periodic tick's initial count; 0 while there is no tick.
+var lapic_tick_initial: u32 = 0
+var lapic_timer_rate_hz: u64 = 0
+
+fn lapic_present() -> bool
+    return x2apic_mode != 0 or local_apic_addr != 0
+
+# The LAPIC timer's rate in Hz (divide by 16), measured over the TSC window.
+fn lapic_timer_calibrate() -> u64
+    lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV16)
+    lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED)
+    lapic_write(LAPIC_TIMER_INITIAL, LAPIC_COUNT_MAX)
+    delay_us(LAPIC_CAL_WINDOW_US)
+    let left: u32 = lapic_read(LAPIC_TIMER_CURRENT)
+    lapic_write(LAPIC_TIMER_INITIAL, 0)
+    return lapic_timer_hz((LAPIC_COUNT_MAX - left) as u64, LAPIC_CAL_WINDOW_US)
+
+# Calibrate the timer and start a periodic tick_hz tick on vector 32 on this
+# CPU. 0, or -1 (no LAPIC, or a timer that doesn't count: no tick).
+pub fn lapic_timer_start(tick_hz: u64) -> i32
+    if not lapic_present()
+        prints("[timer] no LAPIC: no scheduler tick\n")
+        return -1
+    let hz: u64 = lapic_timer_calibrate()
+    let initial: u32 = lapic_timer_initial(hz, tick_hz)
+    if initial == 0
+        prints("[timer] LAPIC timer did not count: no scheduler tick\n")
+        return -1
+    lapic_timer_rate_hz = hz
+    lapic_tick_initial = initial
+    prints("[timer] LAPIC timer ")
+    serial_print_dec(hz)
+    prints(" Hz (bus/16, TSC-calibrated), periodic ")
+    serial_print_dec(tick_hz)
+    prints(" Hz tick, initial count ")
+    serial_print_dec(initial as u64)
+    prints("\n")
+    lapic_timer_resume()
+    return 0
+
+# (Re)arm the periodic tick, if lapic_timer_start set one up.
+pub fn lapic_timer_resume() -> i32
+    if lapic_tick_initial == 0
+        return 0
+    lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV16)
+    lapic_write(LAPIC_TIMER, LAPIC_WATCHDOG_VECTOR | LAPIC_TIMER_PERIODIC)
+    lapic_write(LAPIC_TIMER_INITIAL, lapic_tick_initial)
+    return 0
+
+# The calibrated LAPIC timer rate (divide by 16) in Hz; 0 before
+# lapic_timer_start.
+pub fn lapic_timer_rate() -> u64
+    return lapic_timer_rate_hz
 
 # Initialize Local APIC
 fn lapic_init() -> i32

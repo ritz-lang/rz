@@ -62,6 +62,8 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[virtio-input] event type=1 code=30 value=1\\n"
                 "key event code=30 value=1\\n"
                 "[OK] Persistent storage\\n"
+                "[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 100 Hz tick, initial count 625000\\n"
+                "[busy A] 1/2\\n[busy B] 1/2\\n[busy A] 2/2\\n[busy B] 2/2\\n"
                 "ALL TESTS PASSED\\n"
                 "[exit] init exited with code 0\\n")
     """)
