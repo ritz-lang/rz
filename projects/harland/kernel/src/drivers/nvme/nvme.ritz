@@ -259,14 +259,14 @@ fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
 # the CQE (polled for its phase tag).
 # Returns 0 on success, the NVMe status (positive) on a command error, or -1
 # on timeout.
-# Sleep until `vec` has fired more than `irqs` times. Called with IF=1.
-# Each round checks the counter with interrupts off and then does sti;hlt,
-# so an interrupt landing between the check and the hlt still wakes it. Any
-# interrupt wakes it; the LAPIC watchdog bounds the wait. Counts a miss when
-# the vector doesn't fire within NVME_IRQ_WATCHDOG_ROUNDS watchdog runs; the
-# caller then finds the CQE by polling. Returns with IF=1, the timer masked.
-fn nvme_wait_irq(vec: u8, irqs: u64)
-    nvme_irq_waits = nvme_irq_waits + 1
+# Sleep until `vec` has fired more than `irqs` times, or `max_rounds` runs
+# of the LAPIC watchdog have passed. Called with IF=1. Each round checks the
+# counter with interrupts off and then does sti;hlt, so an interrupt landing
+# between the check and the hlt still wakes it. Any interrupt wakes it; the
+# watchdog bounds the wait. Adds the hlts it slept in to `*halts`. Returns 1
+# if the vector fired, 0 if it gave up. Returns with IF=1, the timer masked.
+fn nvme_irq_sleep(vec: u8, irqs: u64, max_rounds: u32, halts: *u64) -> i32
+    var fired: i32 = 1
     var rounds: u32 = 0
     lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
     while true
@@ -275,14 +275,23 @@ fn nvme_wait_irq(vec: u8, irqs: u64)
             break
         if lapic_watchdog_expired()
             rounds = rounds + 1
-            if rounds >= NVME_IRQ_WATCHDOG_ROUNDS
-                nvme_irq_missed = nvme_irq_missed + 1
+            if rounds >= max_rounds
+                fired = 0
                 break
             lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
-        nvme_irq_halts = nvme_irq_halts + 1
+        *halts = *halts + 1
         sti_hlt()
     lapic_watchdog_stop()
     enable_interrupts()
+    return fired
+
+# A command's wait for its completion interrupt: counts a miss when the
+# vector doesn't fire within NVME_IRQ_WATCHDOG_ROUNDS watchdog runs; the
+# caller then finds the CQE by polling.
+fn nvme_wait_irq(vec: u8, irqs: u64)
+    nvme_irq_waits = nvme_irq_waits + 1
+    if nvme_irq_sleep(vec, irqs, NVME_IRQ_WATCHDOG_ROUNDS, @nvme_irq_halts) == 0
+        nvme_irq_missed = nvme_irq_missed + 1
 
 fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
     let cid: u32 = (*c).next_cid & 0xFFFF
@@ -820,3 +829,24 @@ pub fn nvme_irq_missed_count() -> u64
 # hlts the interrupt waits slept in (0 means they never had to sleep)
 pub fn nvme_irq_halt_count() -> u64
     return nvme_irq_halts
+
+# Run the commands' interrupt wait (nvme_irq_sleep) on the first MSI-X
+# controller's I/O vector for one watchdog round with no command
+# outstanding, and return the hlts it slept in (AGAST #4246). The vector
+# cannot fire, so the wait must sleep however fast the device is: a correct
+# wait halts at least once and wakes only for the watchdog and whatever other
+# interrupts land in the window; one that spun would halt 0 times, or count
+# thousands of rounds. A command's own wait halts only if its interrupt is
+# still pending when it first checks, which QEMU often is not. Call with
+# IF=1 and the controller idle. Returns 0 when no controller is in MSI-X mode.
+pub fn nvme_irq_idle_probe() -> u64
+    var i: i32 = 0
+    while i < nvme_ctrl_count
+        let c: *NvmeController = nvme_ctrls[i]
+        let vec: u8 = (*c).vec[NVME_IO_Q]
+        if vec != 0
+            var halts: u64 = 0
+            nvme_irq_sleep(vec, msix_vector_count(vec), 1, @halts)
+            return halts
+        i = i + 1
+    return 0

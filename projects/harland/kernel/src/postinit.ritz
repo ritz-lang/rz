@@ -15,7 +15,7 @@ import ipc.channel { ChannelEndpoint, ChannelPair, channel_create, channel_send,
 import drivers.pci { pci_print_all_devices }
 import drivers.msix { msix_print_all }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count }
-import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count }
+import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test }
 import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_configured }
@@ -466,15 +466,19 @@ fn network_dhcp_ping()
 # command waits for its completion interrupt (AGAST #3630). Logs
 #   [msix] nvme interrupts: N, commands waited: W, completions without one: M
 #   [msix] nvme waits halted: H
+#   [msix] nvme idle wait halted: P
 # (W counts every command since MSI-X went on that waited for its interrupt;
-# H the hlts those waits slept in.)
-# tools/test_msix_boot.sh wants N > 0, W > 0, M = 0, H > 0 and the read's
-# fingerprint.
+# H the hlts those waits slept in, 0 when every interrupt beat its wait's
+# first check; P the hlts of one watchdog round of the same wait with no
+# command outstanding, AGAST #4246.)
+# tools/test_msix_boot.sh wants N > 0, W > 0, M = 0, 0 < P <= 64 and the
+# read's fingerprint.
 fn nvme_msix_check()
     if nvme_enable_msix() == 0
         return
     enable_interrupts()
     nvme_msix_read_check()
+    let idle_halts: u64 = nvme_irq_idle_probe()
     disable_interrupts()
     prints("[msix] nvme interrupts: ")
     serial_print_dec(nvme_irq_count())
@@ -485,6 +489,9 @@ fn nvme_msix_check()
     prints("\n")
     prints("[msix] nvme waits halted: ")
     serial_print_dec(nvme_irq_halt_count())
+    prints("\n")
+    prints("[msix] nvme idle wait halted: ")
+    serial_print_dec(idle_halts)
     prints("\n")
 
 fn virtio_blk_check()

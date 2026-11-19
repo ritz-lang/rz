@@ -38,9 +38,16 @@
 #   - "[msix] nvme interrupts: N, commands waited: W, completions without
 #     one: M" has N > 0, W > 0 and M = 0: the driver waited for its MSI-X
 #     vector on every command (W) and every one of them fired (M);
-#   - "[msix] nvme waits halted: H" has H > 0: those waits slept in hlt
-#     (cli/check/sti;hlt, so the wakeup cannot be missed) instead of
-#     spinning on the vector's counter (AGAST #4212);
+#   - "[msix] nvme idle wait halted: P" has 0 < P <= 64: with no command
+#     outstanding, the kernel ran the commands' interrupt wait on the I/O
+#     vector for one watchdog round (~0.27 s). The vector cannot fire, so a
+#     wait that sleeps in hlt (cli/check/sti;hlt, so the wakeup cannot be
+#     missed) halts at least once and wakes only for the few interrupts of
+#     that window; one that spins on the vector's counter halts 0 times, or
+#     a huge number if it still counts its rounds (AGAST #4212). The
+#     commands' own "[msix] nvme waits halted: H" is only logged: QEMU often
+#     raises the interrupt before the wait checks, so H = 0 is legal
+#     (AGAST #4246);
 #   - the kernel took no exception, and init's Tier-1 suite still reports
 #     ALL TESTS PASSED with the NIC and NVMe attached.
 #
@@ -260,12 +267,21 @@ elif [ "$n_missed" -ne 0 ]; then
 else
     echo "PASS: NVMe delivered $n_count MSI-X interrupts, $n_waited commands waited for theirs, none missed"
 fi
-n_halted=$(grep -aoE "\[msix\] nvme waits halted: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
-if [ -z "$n_halted" ] || [ "$n_halted" -eq 0 ]; then
-    echo "FAIL: NVMe interrupt waits never halted (${n_halted:-no count logged}): they spin instead of sleeping"
+# An idle sleeping wait wakes only for the watchdog and the odd other
+# interrupt; a spinning one that counts its rounds runs thousands of them.
+IDLE_HALTS_MAX=64
+n_idle=$(grep -aoE "\[msix\] nvme idle wait halted: [0-9]+" "$SERIAL" | tail -1 | sed -nE 's/.*halted: ([0-9]+)$/\1/p')
+if [ -z "$n_idle" ]; then
+    echo "FAIL: no NVMe idle interrupt wait logged ([msix] nvme idle wait halted: P)"
+    rc=1
+elif [ "$n_idle" -eq 0 ]; then
+    echo "FAIL: NVMe idle interrupt wait never halted: it spins instead of sleeping"
+    rc=1
+elif [ "$n_idle" -gt "$IDLE_HALTS_MAX" ]; then
+    echo "FAIL: NVMe idle interrupt wait halted $n_idle times (> $IDLE_HALTS_MAX): it spins instead of sleeping"
     rc=1
 else
-    echo "PASS: NVMe interrupt waits halted $n_halted times instead of spinning"
+    echo "PASS: NVMe idle interrupt wait slept: halted $n_idle times in one watchdog round"
 fi
 if grep -aq "ALL TESTS PASSED" "$SERIAL"; then
     echo "PASS: init Tier-1 suite: ALL TESTS PASSED"
