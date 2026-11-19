@@ -48,6 +48,12 @@ NVME_SCRIPT = "projects/harland/tools/test_nvme_boot.sh"
 # (missing: no output) followed by $FAKE_PROMPT. `exit` sends $FAKE_EXIT and
 # exits with $FAKE_EXIT_RC (0 = a guest power-off). Every argv goes to
 # $STUB_LOG.
+#
+# It is a terminal too (#4254): DEL rubs out a byte (BS SP BS), `cat` is
+# blocked in a cooked read (each line it reads is echoed back) and `spin`
+# never prompts; Ctrl-C prints ^C and ends either one at a fresh prompt (or
+# drops the line at the prompt). $FAKE_NO_RUBOUT=1 takes DEL as a byte and
+# $FAKE_NO_INTR=1 ignores Ctrl-C.
 QEMU_STUB = r"""#!/usr/bin/env python3
 import json, os, socket, sys, time
 open(os.environ["STUB_LOG"], "a").write(" ".join(sys.argv[1:]) + "\n")
@@ -57,26 +63,50 @@ s = socket.socket(socket.AF_UNIX)
 s.connect(path)
 prompt = os.environ.get("FAKE_PROMPT", "rzsh> ").encode()
 replies = json.loads(os.environ.get("FAKE_REPLIES", "{}"))
+rubout = os.environ.get("FAKE_NO_RUBOUT") != "1"
+intr = os.environ.get("FAKE_NO_INTR") != "1"
 s.sendall(os.environ.get("FAKE_BANNER", "").encode())
 if os.environ.get("FAKE_NO_PROMPT") == "1":
     time.sleep(30)
     sys.exit(1)
 s.sendall(prompt)
 line = b""
+fg = None  # the running program that has not prompted: "cat" or "spin"
 while True:
     b = s.recv(1)
     if not b:
         sys.exit(1)
-    s.sendall(b)  # echo, as rzsh does
+    if b == b"\x03" and intr:
+        s.sendall(b"^C\r\n" + prompt)
+        line, fg = b"", None
+        continue
+    if b == b"\x7f" and rubout:
+        if line:
+            line = line[:-1]
+            s.sendall(b"\x08 \x08")
+        continue
     if b != b"\r":
+        s.sendall(b)  # echo, as rzsh (and cooked mode) does
         line += b
         continue
     cmd, line = line.decode(), b""
-    s.sendall(b"\r\n")
+    if fg == "cat":  # cooked mode echoes CR as CR LF; cat writes the line
+        s.sendall(b"\r\n" + cmd.encode() + b"\n")
+        continue
+    s.sendall(b"\r\r\n")
+    if fg:
+        continue
     if cmd == "exit":
         s.sendall(os.environ.get("FAKE_EXIT", "").encode())
         s.close()
         sys.exit(int(os.environ.get("FAKE_EXIT_RC", "0")))
+    if cmd == "cat":
+        fg = "cat"
+        continue
+    if cmd == "spin":
+        fg = "spin"
+        s.sendall(b"spin: running\r\n")
+        continue
     s.sendall(replies.get(cmd, "").replace("\n", "\r\n").encode() + prompt)
 """
 QEMU_IMG_STUB = """#!/usr/bin/env bash
@@ -95,6 +125,24 @@ REPLIES = {
     "cat /etc/motd": "[spawn_args] spawn_args(/bin/cat, argc=2)\nWelcome to Harland!\n",
     "echo after-cat": "after-cat\n",
 }
+# tty_session()'s commands (#4254), kept apart so the wrong-answer cases above
+# stay one per SESSION command.
+TTY_REPLIES = {
+    "echo abc": "abc\n",
+    "echo $?": "130\n",
+    "echo still-here": "still-here\n",
+}
+TTY_PASSES = (
+    "PASS: rzsh's line editor",
+    "PASS: cooked read(0)",
+    "PASS: Ctrl-C kills cat blocked in read(0)",
+    "PASS: a command killed by Ctrl-C exits 130",
+    "PASS: spin (a program that never ends) starts",
+    "PASS: Ctrl-C during a long-running program",
+    "PASS: spin killed by Ctrl-C exits 130",
+    "PASS: Ctrl-C at the prompt",
+    "PASS: rzsh survives Ctrl-C at its prompt",
+)
 EXIT = ("Goodbye!\r\n[init] Shell exited\r\n"
         "[exit] init exited with code 0, powering off\r\n")
 # Before #1882 the kernel took rzsh's exit as init's: no "[init] Shell exited".
@@ -193,7 +241,8 @@ def _stub(stubs: Path, name: str, body: str) -> None:
     p.chmod(0o755)
 
 
-def _run(tree, *, replies=None, qemu=True, env_extra=None) -> subprocess.CompletedProcess:
+def _run(tree, *, replies=None, tty_replies=None, qemu=True,
+         env_extra=None) -> subprocess.CompletedProcess:
     stubs = tree["stubs"]
     _stub(stubs, "qemu-img", QEMU_IMG_STUB)
     if qemu:
@@ -211,7 +260,7 @@ def _run(tree, *, replies=None, qemu=True, env_extra=None) -> subprocess.Complet
         "SHELL_TYPE_DELAY": "0",
         "OVMF_CODE": str(tree["ovmf"]),
         "STUB_LOG": str(tree["tmp"] / "stub.log"),
-        "FAKE_REPLIES": json.dumps(REPLIES if replies is None else replies),
+        "FAKE_REPLIES": json.dumps({**(REPLIES if replies is None else replies), **(tty_replies or TTY_REPLIES)}),
         "FAKE_EXIT": EXIT,
         **(env_extra or {}),
     }
@@ -234,6 +283,9 @@ def test_a_scripted_session_passes(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     for cmd in ("echo hi", "pwd", "ls /bin", "cat /etc/motd", "echo after-cat", "exit"):
         assert f"PASS: `{cmd}`" in r.stdout
+    for check in TTY_PASSES:
+        assert check in r.stdout, check
+    assert "FAIL" not in r.stdout
     transcript = (keep / "shell.log").read_text()
     assert "Welcome to Harland!" in transcript and "Goodbye!" in transcript
     argv = (tree["tmp"] / "stub.log").read_text()
@@ -286,6 +338,33 @@ def test_init_exit_before_shell_exited_fails(tree):
                               "powering off\r\n[init] Shell exited\r\n"})
     assert r.returncode == 1, r.stdout + r.stderr
     assert "FAIL: `exit`" in r.stdout
+
+
+@pytest.mark.integration
+def test_no_rubout_fails(tree):
+    """DEL taken as a byte: rzsh's editor and cooked mode both fail."""
+    r = _run(tree, env_extra={"FAKE_NO_RUBOUT": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: rzsh's line editor" in r.stdout
+    assert "FAIL: cooked read(0)" in r.stdout
+    assert "PASS: Ctrl-C during a long-running program" in r.stdout
+
+
+@pytest.mark.integration
+def test_ctrl_c_ignored_fails(tree):
+    """Ctrl-C that never reaches the foreground program: no prompt comes back."""
+    r = _run(tree, env_extra={"FAKE_NO_INTR": "1"})
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS: cooked read(0)" in r.stdout
+    assert "FAIL: Ctrl-C kills cat blocked in read(0)" in r.stdout
+
+
+@pytest.mark.integration
+def test_wrong_status_after_ctrl_c_fails(tree):
+    r = _run(tree, tty_replies=dict(TTY_REPLIES, **{"echo $?": "0\n"}))
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "FAIL: a command killed by Ctrl-C exits 130" in r.stdout
+    assert "FAIL: spin killed by Ctrl-C exits 130" in r.stdout
 
 
 @pytest.mark.integration

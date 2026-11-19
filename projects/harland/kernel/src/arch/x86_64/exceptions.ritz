@@ -4,7 +4,8 @@
 # These handlers are called from isr_stubs.s assembly code.
 
 import io { halt_loop }
-import serial { StrView, prints, serial_print, serial_print_hex, serial_print_dec, serial_poll, serial_drain_output }
+import serial { StrView, prints, serial_print, serial_print_hex, serial_print_dec, serial_drain_output }
+import tty.console { tty_console_irq, tty_console_irq_kill }
 import mm.vmm { vmm_debug_page_tables }
 import drivers.msix { msix_dispatch }
 import syscall.runtime.process { process_kill_current, current_pid }
@@ -338,10 +339,15 @@ pub fn irq_handler(frame: *InterruptFrame) -> i32
         return 0
 
     if irq_num == 4
-        # COM1 serial port interrupt
-        # Handle both RX (incoming data) and TX (buffer drain) interrupts
-        serial_poll()          # Read any available input
-        serial_drain_output()  # Send any pending output
+        # COM1 serial port interrupt: received bytes go through the console's
+        # line discipline (#4254), then any pending output is sent.
+        let kill: bool = tty_console_irq(((*frame).cs & 3) == 3)
+        serial_drain_output()
+        if kill
+            # Ctrl-C while a program ran in ring 3: it exits (130) and its
+            # parent resumes; this handler never returns, so EOI first.
+            lapic_eoi()
+            tty_console_irq_kill()
 
     # MSI-X vectors (64-79): count the interrupt (drivers/msix.ritz)
     msix_dispatch((*frame).vector)

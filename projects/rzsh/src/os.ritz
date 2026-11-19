@@ -18,7 +18,7 @@ import ritzlib.sys {
     VMIN, VTIME, STDIN,
     # Harland-specific (only used when target_os=harland)
     sys_readdir, sys_spawn_args, sys_wait, sys_yield,
-    sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON
+    sys_tty_getattr, sys_tty_setattr, TtyAttrs, TTY_ECHO, TTY_ICANON, TTY_ISIG
 }
 
 import ritzlib.str { strlen }
@@ -298,10 +298,11 @@ pub fn os_environ(argc: i32, argv: **u8) -> **u8
 pub fn os_input_ended(n: i64) -> bool
     return n == 0 or (n < 0 and n != -4)
 
-# Harland's console read is non-blocking: 0 just means nothing yet.
+# Harland's console read blocks too (AGAST #4254): 0 is ^D on an empty
+# line in cooked mode, a negative errno an unreadable stdin.
 [[target_os = "harland"]]
 pub fn os_input_ended(n: i64) -> bool
-    return false
+    return n <= 0
 
 # Linux: blocking read handles waiting, no need to do anything
 [[target_os = "linux"]]
@@ -403,18 +404,46 @@ pub fn os_disable_raw_mode() -> i32
 pub fn os_is_raw_mode() -> bool
     return g_raw_mode_active != 0
 
-# Harland: Terminal is always in "raw" mode from the shell's perspective
-# The kernel provides character-by-character input via serial console
+# Harland: the console has three flags (ritzlib TtyAttrs, AGAST #4254). Raw
+# mode clears them all: no kernel echo or line editing, and Ctrl-C reaches
+# the editor as a byte instead of killing the shell.
 [[target_os = "harland"]]
 pub fn os_enable_raw_mode() -> i32
+    if g_raw_mode_active != 0
+        return 0
+    let orig: *TtyAttrs = @g_termios_storage[0] as *TtyAttrs
+    let r1: i32 = sys_tty_getattr(STDIN, orig)
+    if r1 != 0
+        return r1
+    var raw: TtyAttrs = *orig
+    raw.flags = raw.flags & (0xFFFFFFFF ^ (TTY_ECHO | TTY_ICANON | TTY_ISIG))
+    let r2: i32 = sys_tty_setattr(STDIN, @raw)
+    if r2 != 0
+        return r2
     g_raw_mode_active = 1
-    return 0  # Always succeeds - Harland serial is already raw
+    return 0
 
 [[target_os = "harland"]]
 pub fn os_disable_raw_mode() -> i32
+    if g_raw_mode_active == 0
+        return 0
+    let r: i32 = sys_tty_setattr(STDIN, @g_termios_storage[0] as *TtyAttrs)
     g_raw_mode_active = 0
-    return 0
+    return r
 
 [[target_os = "harland"]]
 pub fn os_is_raw_mode() -> bool
     return g_raw_mode_active != 0
+
+# A command gets the terminal as rzsh found it (echo, line editing, Ctrl-C),
+# not rzsh's raw mode: os_tty_suspend before it runs, os_tty_resume(the
+# result) after. Only a raw mode that was on is turned back on.
+pub fn os_tty_suspend() -> bool
+    if g_raw_mode_active == 0
+        return false
+    os_disable_raw_mode()
+    return true
+
+pub fn os_tty_resume(was_raw: bool)
+    if was_raw
+        os_enable_raw_mode()

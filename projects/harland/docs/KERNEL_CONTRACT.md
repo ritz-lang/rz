@@ -64,6 +64,22 @@ fn sys_getpid() -> i32
 
 - **Returns**: Current process ID
 
+#### SYS_TTY_GETATTR (18), SYS_TTY_SETATTR (19)
+
+```ritz
+# The serial console's terminal flags (AGAST #4254)
+fn sys_tty_getattr(fd: i32, attrs: *TtyAttrs) -> i32
+fn sys_tty_setattr(fd: i32, attrs: *TtyAttrs) -> i32
+```
+
+- **attrs**: `{ flags: u32 }`: TTY_ECHO (1) echoes input, TTY_ICANON (2)
+  edits a line in the kernel (DEL/BS rub out, CR reads as NL, Ctrl-D ends
+  input) and `read(0)` returns one line, TTY_ISIG (4) makes Ctrl-C kill the
+  foreground process (exit status 130; init is never killed). All three are
+  set at boot. `read(0)` blocks until there is input.
+- **fd**: 0, 1 or 2 when it is not an open file
+- **Returns**: 0, ENOTTY for any other fd, EFAULT for a bad `attrs`
+
 ---
 
 ### IPC Syscalls
@@ -385,6 +401,7 @@ this table lists exactly its variants (checked by
 | -21 | EISDIR | IsDir | Is a directory |
 | -22 | EINVAL | Inval | Invalid argument |
 | -23 | ENFILE | NFile | Too many open files |
+| -25 | ENOTTY | NotTy | Not a terminal |
 | -28 | ENOSPC | NoSpc | No space left |
 | -32 | EPIPE | Pipe | Broken pipe (peer closed) |
 | -34 | ERANGE | Range | Buffer too small |

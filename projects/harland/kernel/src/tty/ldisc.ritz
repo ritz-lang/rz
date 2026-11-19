@@ -1,0 +1,205 @@
+# Harland console line discipline (AGAST #4254)
+#
+# What sits between COM1's received bytes and read(0): the terminal flags
+# tcgetattr/tcsetattr read and write (sys_tty_getattr/sys_tty_setattr in
+# ritzlib), canonical line editing, echo and Ctrl-C.
+#
+#   TTY_ICANON  canonical: a line is edited here (backspace/DEL rubs out the
+#               last byte, CR reads as NL, Ctrl-D ends input) and read()
+#               sees it only once NL completes it. Off: every byte is
+#               readable as it arrives (rzsh's own line editor).
+#   TTY_ECHO    each accepted byte is echoed back (rubout as "\b \b", NL as
+#               "\r\n").
+#   TTY_ISIG    Ctrl-C (0x03) is not input: it discards the line being
+#               edited, echoes "^C" and raises an interrupt for the
+#               foreground process (tty/console.ritz kills it).
+#
+# The default is cooked (all three), as a POSIX terminal starts. rzsh turns
+# all three off while it edits a line and back on while a command runs.
+#
+# Pure: no imports and no hardware, so projects/ritz/ritz0/test_harland_tty.py
+# compiles this file into a host program and types at it. tty/console.ritz
+# feeds it COM1's bytes (from the IRQ 4 handler, interrupts off) and sends
+# the echo it queues.
+
+pub const TTY_ECHO: u32 = 1
+pub const TTY_ICANON: u32 = 2
+pub const TTY_ISIG: u32 = 4
+pub const TTY_FLAGS_ALL: u32 = 7
+pub const TTY_FLAGS_DEFAULT: u32 = 7
+
+# Bytes read() can take: completed lines (canonical) or raw bytes.
+const LDISC_QUEUE_SIZE: i32 = 1024
+# The line being edited: 255 bytes and its NL, then input is dropped
+# (as a full Linux line is) until NL, rubout or Ctrl-C.
+const LDISC_LINE_SIZE: i32 = 256
+# Echo waiting for the console to send it.
+const LDISC_ECHO_SIZE: i32 = 256
+
+const CH_INTR: u8 = 3        # Ctrl-C
+const CH_EOF: u8 = 4         # Ctrl-D
+const CH_BS: u8 = 8          # Backspace
+const CH_NL: u8 = 10
+const CH_CR: u8 = 13
+const CH_DEL: u8 = 127       # what a terminal's backspace key sends
+
+var g_ldisc_flags: u32 = 7
+
+var g_ldisc_queue: [1024]u8
+var g_ldisc_q_head: i32 = 0      # next write
+var g_ldisc_q_tail: i32 = 0      # next read
+var g_ldisc_q_count: i32 = 0
+
+var g_ldisc_line: [256]u8
+var g_ldisc_line_len: i32 = 0
+
+# Ctrl-D on an empty line: the next read that finds nothing queued returns 0.
+var g_ldisc_eof: i32 = 0
+# Ctrl-C seen under ISIG and not yet taken by the console.
+var g_ldisc_intr: i32 = 0
+
+var g_ldisc_echo: [256]u8
+var g_ldisc_echo_len: i32 = 0
+
+# Cooked, empty (boot; the host test).
+pub fn ldisc_reset()
+    g_ldisc_flags = TTY_FLAGS_DEFAULT
+    g_ldisc_q_head = 0
+    g_ldisc_q_tail = 0
+    g_ldisc_q_count = 0
+    g_ldisc_line_len = 0
+    g_ldisc_eof = 0
+    g_ldisc_intr = 0
+    g_ldisc_echo_len = 0
+
+pub fn ldisc_get_flags() -> u32
+    g_ldisc_flags
+
+# Set the flags (unknown bits are dropped). Leaving canonical mode makes a
+# half-edited line readable as it stands; turning ISIG off drops an
+# interrupt not yet delivered.
+pub fn ldisc_set_flags(flags: u32)
+    let f: u32 = flags & TTY_FLAGS_ALL
+    if (g_ldisc_flags & TTY_ICANON) != 0 and (f & TTY_ICANON) == 0
+        flush_line()
+    if (f & TTY_ISIG) == 0
+        g_ldisc_intr = 0
+    g_ldisc_flags = f
+
+fn queue_put(c: u8)
+    if g_ldisc_q_count >= LDISC_QUEUE_SIZE
+        return
+    g_ldisc_queue[g_ldisc_q_head] = c
+    g_ldisc_q_head = (g_ldisc_q_head + 1) % LDISC_QUEUE_SIZE
+    g_ldisc_q_count = g_ldisc_q_count + 1
+
+fn echo_put(c: u8)
+    if (g_ldisc_flags & TTY_ECHO) == 0
+        return
+    if g_ldisc_echo_len >= LDISC_ECHO_SIZE
+        return
+    g_ldisc_echo[g_ldisc_echo_len] = c
+    g_ldisc_echo_len = g_ldisc_echo_len + 1
+
+# The edited line becomes readable.
+fn flush_line()
+    var i: i32 = 0
+    while i < g_ldisc_line_len
+        queue_put(g_ldisc_line[i])
+        i = i + 1
+    g_ldisc_line_len = 0
+
+# One received byte. Returns 1 if it raised an interrupt (Ctrl-C under
+# ISIG), else 0.
+pub fn ldisc_input(c: u8) -> i32
+    let flags: u32 = g_ldisc_flags
+    if (flags & TTY_ISIG) != 0 and c == CH_INTR
+        g_ldisc_line_len = 0
+        g_ldisc_intr = 1
+        echo_put(94)            # '^'
+        echo_put(67)            # 'C'
+        echo_put(CH_CR)
+        echo_put(CH_NL)
+        return 1
+
+    if (flags & TTY_ICANON) == 0
+        queue_put(c)
+        echo_put(c)
+        return 0
+
+    var b: u8 = c
+    if b == CH_CR
+        b = CH_NL
+    if b == CH_DEL or b == CH_BS
+        if g_ldisc_line_len > 0
+            g_ldisc_line_len = g_ldisc_line_len - 1
+            echo_put(CH_BS)
+            echo_put(32)
+            echo_put(CH_BS)
+        return 0
+    if b == CH_EOF
+        if g_ldisc_line_len == 0
+            g_ldisc_eof = 1
+        else
+            flush_line()
+        return 0
+    if b == CH_NL
+        g_ldisc_line[g_ldisc_line_len] = CH_NL
+        g_ldisc_line_len = g_ldisc_line_len + 1
+        flush_line()
+        echo_put(CH_CR)
+        echo_put(CH_NL)
+        return 0
+    # Room is always kept for the NL.
+    if g_ldisc_line_len < LDISC_LINE_SIZE - 1
+        g_ldisc_line[g_ldisc_line_len] = b
+        g_ldisc_line_len = g_ldisc_line_len + 1
+        echo_put(b)
+    return 0
+
+# True when read() would return now: bytes are queued or input has ended.
+pub fn ldisc_readable() -> bool
+    g_ldisc_q_count > 0 or g_ldisc_eof != 0
+
+# Take up to max queued bytes into buf; canonical mode stops after a NL, so
+# a read returns at most one line. 0 with nothing queued: an end of input
+# (Ctrl-D), which this read consumes, or nothing at all.
+pub fn ldisc_read(buf: *u8, max: i64) -> i64
+    var n: i64 = 0
+    if g_ldisc_q_count == 0
+        g_ldisc_eof = 0
+        return 0
+    let canon: bool = (g_ldisc_flags & TTY_ICANON) != 0
+    while n < max and g_ldisc_q_count > 0
+        let c: u8 = g_ldisc_queue[g_ldisc_q_tail]
+        g_ldisc_q_tail = (g_ldisc_q_tail + 1) % LDISC_QUEUE_SIZE
+        g_ldisc_q_count = g_ldisc_q_count - 1
+        *(buf + n) = c
+        n = n + 1
+        if canon and c == CH_NL
+            return n
+    n
+
+# True (and cleared) if a Ctrl-C is waiting to be delivered.
+pub fn ldisc_take_intr() -> bool
+    if g_ldisc_intr == 0
+        return false
+    g_ldisc_intr = 0
+    true
+
+pub fn ldisc_intr_pending() -> bool
+    g_ldisc_intr != 0
+
+# Move the queued echo into buf (up to max bytes); returns how many.
+pub fn ldisc_take_echo(buf: *u8, max: i64) -> i64
+    var n: i64 = 0
+    while n < max and n < g_ldisc_echo_len as i64
+        *(buf + n) = g_ldisc_echo[n]
+        n = n + 1
+    # Keep any rest (max smaller than the queue) for the next call.
+    var i: i32 = 0
+    while (i as i64) + n < g_ldisc_echo_len as i64
+        g_ldisc_echo[i] = g_ldisc_echo[(i as i64 + n) as i32]
+        i = i + 1
+    g_ldisc_echo_len = g_ldisc_echo_len - n as i32
+    n

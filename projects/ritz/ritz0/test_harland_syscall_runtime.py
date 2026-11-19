@@ -56,7 +56,8 @@ AREAS = {
     "file": [
         "sys_readdir_impl",
         "sys_close_handler", "sys_lseek_handler", "sys_mkdir_handler", "sys_write_handler",
-        "sys_read_handler", "sys_readdir_handler",
+        "sys_read_handler", "sys_readdir_handler", "tty_fd_ok",
+        "sys_tty_getattr_handler", "sys_tty_setattr_handler",
     ],
     "ipc": [
         "sys_channel_create_handler", "sys_ipc_send_handler", "sys_ipc_recv_handler",
@@ -205,7 +206,7 @@ def test_table_registers_handlers_imported_from_their_area():
     each taken from the area module that defines it."""
     code = _code(_area("entry"))
     regs = re.findall(r"^\s+syscall_register\(Syscall\.(\w+),\s*(\w+)\)", _body(code, "syscall_table_init"), re.M)
-    assert len(regs) == 32, regs
+    assert len(regs) == 34, regs
     for _, handler in regs:
         owner = [a for a, fns in AREAS.items() if handler in fns]
         assert len(owner) == 1, f"{handler} is defined in no area module"

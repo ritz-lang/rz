@@ -5,7 +5,8 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
-import serial { StrView, serial_poll, serial_buf_read_many, serial_buffer_write, serial_drain_output }
+import serial { StrView, serial_buffer_write, serial_drain_output }
+import tty.console { tty_console_read, tty_console_get_flags, tty_console_set_flags }
 import mm.uptr { uptr_validate_string, uptr_check_read, uptr_check_write }
 import fs.knamespace { KNamespace, knamespace_get, knamespace_list }
 import fs.kdir_entry { KDirEntry }
@@ -154,12 +155,8 @@ pub fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if fd != 0
         return Errno.BadF as i64
 
-    # First, poll for any new data
-    serial_poll()
-
-    # Read from the serial input buffer
-    let bytes_read: i64 = serial_buf_read_many(buf, count)
-    return bytes_read
+    # The console: sleeps until a line (or, raw, a byte) arrives (#4254).
+    return tty_console_read(buf, count)
 
 # readdir(path, buf, size)
 pub fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -172,3 +169,27 @@ pub fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         if buf_result != 0
             return Errno.Fault as i64
     return sys_readdir_impl(rdi as *u8, rsi as *u8, rdx as i64)
+
+# The console's terminal flags (#4254): tty/ldisc.ritz's TTY_ECHO,
+# TTY_ICANON and TTY_ISIG in a 4-byte struct (ritzlib's TtyAttrs). fds 0-2
+# are the console unless they name a file; anything else is not a terminal.
+fn tty_fd_ok(fd: i32) -> bool
+    fd >= 0 and fd <= 2 and not is_fs_fd(fd)
+
+# tty_getattr(fd, attrs)
+pub fn sys_tty_getattr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not tty_fd_ok(rdi as i32)
+        return Errno.NotTy as i64
+    if uptr_check_write(rsi as *u8, 4) != 0
+        return Errno.Fault as i64
+    *(rsi as *u32) = tty_console_get_flags()
+    return 0
+
+# tty_setattr(fd, attrs)
+pub fn sys_tty_setattr_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    if not tty_fd_ok(rdi as i32)
+        return Errno.NotTy as i64
+    if uptr_check_read(rsi as *u8, 4) != 0
+        return Errno.Fault as i64
+    tty_console_set_flags(*(rsi as *u32))
+    return 0

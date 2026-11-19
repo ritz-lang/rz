@@ -35,7 +35,7 @@ LINUX = {
     "Perm": 1, "NoEnt": 2, "Srch": 3, "Io": 5, "TooBig": 7, "NoExec": 8,
     "BadF": 9, "Child": 10, "Again": 11, "NoMem": 12, "Acces": 13, "Fault": 14,
     "Exist": 17, "NoDev": 19, "NotDir": 20, "IsDir": 21, "Inval": 22,
-    "NFile": 23, "NoSpc": 28, "Pipe": 32, "Range": 34, "NameTooLong": 36,
+    "NFile": 23, "NotTy": 25, "NoSpc": 28, "Pipe": 32, "Range": 34, "NameTooLong": 36,
     "NoSys": 38, "NotEmpty": 39,
 }
 

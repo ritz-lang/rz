@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
-"""Drive a scripted rzsh session over a guest's serial console (AGAST #4252).
+"""Drive a scripted rzsh session over a guest's serial console (AGAST #4252, #4254).
 
     shell_session.py LOG TIMEOUT -- QEMU_ARGV...
 
 Listens on a unix socket, starts QEMU with its first serial port connected to
 it (`-chardev socket,id=con,path=SOCK -serial chardev:con`, appended to
 QEMU_ARGV), and then plays the session below: wait for the `rzsh> ` prompt,
-type a command a byte at a time (sys_read(0) polls COM1, whose FIFO is only
-16 bytes deep), wait for the next prompt and check what the command printed.
+type a command a byte at a time (COM1's receive interrupt drains a 16-byte
+FIFO into the console's ring buffer; pacing keeps that FIFO from overrunning),
+wait for the next prompt and check what the command printed.
+
+After SESSION, tty_session() checks that the console is a terminal (#4254):
+rubout in rzsh's editor and in the kernel's cooked mode, Ctrl-C on a program
+blocked in read(0) and on one computing in a loop (`spin`), `$?` = 130 after
+each, and Ctrl-C at the prompt leaving rzsh alive.
 
 Every byte the guest sends is written to LOG. Each check prints one
 `PASS: ...` or `FAIL: ...` line. Exit status: 0 = every check passed;
@@ -34,7 +40,7 @@ import tempfile
 import time
 
 PROMPT = b"rzsh> "
-# Seconds between typed bytes: COM1 is polled, not interrupt driven.
+# Seconds between typed bytes, so COM1's 16-byte FIFO never overruns.
 TYPE_DELAY = float(os.environ.get("SHELL_TYPE_DELAY", "0.02"))
 FATAL = re.compile(rb"KERNEL PANIC|!!! EXCEPTION !!!|EXCEPTION:")
 
@@ -104,7 +110,10 @@ class Console:
         return out
 
     def type_line(self, line: str) -> None:
-        for b in (line + "\r").encode():
+        self.type_bytes((line + "\r").encode())
+
+    def type_bytes(self, data: bytes) -> None:
+        for b in data:
             self.conn.sendall(bytes([b]))
             time.sleep(TYPE_DELAY)
 
@@ -125,6 +134,73 @@ def _in_order(data: bytes, markers) -> bool:
         pos = i + len(m)
     return True
 
+
+def _ok(cond: bool, what: str, got: bytes | None = None) -> int:
+    if cond:
+        print(f"PASS: {what}")
+        return 0
+    tail = (got or b"")[-200:].decode(errors="replace")
+    print(f"FAIL: {what}; got {tail!r}")
+    return 1
+
+
+def tty_session(con: "Console", timeout: float) -> int:
+    """The console is a terminal (AGAST #4254): rubout, Ctrl-C, $? = 130.
+
+    Each step ends at a prompt, so a failed step does not derail the next.
+    Returns the number of failed checks."""
+    fails = 0
+    # rzsh's own line editor (raw mode): DEL rubs out the X.
+    con.type_bytes(b"echo abX\x7fc\r")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and "abc" in _lines(out[: -len(PROMPT)]),
+                 "rzsh's line editor: `echo abX<DEL>c` prints abc", out)
+
+    # A cooked read: cat with no file reads stdin. The kernel's line
+    # discipline echoes, rubs the X out (BS SP BS) and hands cat "hello".
+    con.type_line("cat")
+    time.sleep(1.0)                       # cat is now blocked in read(0)
+    con.type_bytes(b"hellX\x7fo\r")
+    out = con.expect(b"\x08 \x08o\r\nhello\n", timeout)
+    fails += _ok(out is not None,
+                 "cooked read(0): the kernel echoes, rubs out DEL and cat reads `hello`", out)
+    # Ctrl-C while cat sleeps in read(0): ^C, cat killed, the prompt again.
+    con.type_bytes(b"\x03")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and b"^C" in out,
+                 "Ctrl-C kills cat blocked in read(0) and rzsh prompts", out)
+    con.type_line("echo $?")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and "130" in _lines(out[: -len(PROMPT)]),
+                 "a command killed by Ctrl-C exits 130", out)
+
+    # Ctrl-C during a long-running program: spin computes in ring 3 and
+    # never enters the kernel, so COM1's interrupt must kill it.
+    con.type_line("spin")
+    out = con.expect(b"spin: running", timeout)
+    fails += _ok(out is not None, "spin (a program that never ends) starts", out)
+    time.sleep(1.0)
+    con.type_bytes(b"\x03")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and b"^C" in out,
+                 "Ctrl-C during a long-running program returns to rzsh", out)
+    con.type_line("echo $?")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and "130" in _lines(out[: -len(PROMPT)]),
+                 "spin killed by Ctrl-C exits 130", out)
+
+    # Ctrl-C at rzsh's prompt goes to its editor (raw mode: no ISIG), not
+    # to the kernel: the shell survives it and runs the next command.
+    con.type_bytes(b"junk\x03")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None, "Ctrl-C at the prompt: rzsh drops the line", out)
+    con.type_line("echo still-here")
+    out = con.expect(PROMPT, timeout)
+    fails += _ok(out is not None and "still-here" in _lines(out[: -len(PROMPT)]),
+                 "rzsh survives Ctrl-C at its prompt", out)
+    return fails
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 4 or argv[2] != "--":
         print("usage: shell_session.py LOG TIMEOUT -- QEMU_ARGV...", file=sys.stderr)
@@ -133,7 +209,8 @@ def main(argv: list[str]) -> int:
 
     # Under /tmp, not $TMPDIR: a gate's TMPDIR is deep enough to overrun
     # sun_path's 107 bytes (AGAST #4177).
-    sock_dir = tempfile.mkdtemp(prefix="rz_shell_", dir="/tmp")
+    # SOCK_DIR overrides it where /tmp is private or full (a room's unit).
+    sock_dir = tempfile.mkdtemp(prefix="rz_shell_", dir=os.environ.get("SOCK_DIR", "/tmp"))
     sock_path = os.path.join(sock_dir, "con.sock")
     srv = socket.socket(socket.AF_UNIX)
     srv.bind(sock_path)
@@ -172,6 +249,8 @@ def main(argv: list[str]) -> int:
                 else:
                     print(f"FAIL: `{cmd}`: {what}; got {lines!r}")
                     rc = 1
+            if tty_session(con, timeout):
+                rc = 1
             con.type_line("exit")
             tail = con.drain(timeout)
             ok_exit = _in_order(tail, EXIT_MARKERS)
