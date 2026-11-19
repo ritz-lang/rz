@@ -29,6 +29,7 @@ import log
 import static
 import compress
 import tls
+import proxy { proxy_yield_timespec, proxy_yield_timer_rejected }
 import http.h1_framing
 import cryptosec.tls13_record
 
@@ -858,7 +859,7 @@ pub struct ProxyState
     request_id: u64          # the response id we're waiting for
     claimed_slot: i64        # ring slot we claimed for path/body bytes
     deadline_sec: i64        # gettimeofday tv_sec at the give-up moment
-    spin_count: i32          # bookkeeping: number of yields so far
+    spin_count: i32          # yields so far; picks the backoff delay (#183)
     _pad: i32
 
 
@@ -923,21 +924,42 @@ pub fn valet_proxy_state_clear(task: *Task)
         st.spin_count = 0
 
 
-# Yield the calling task and request a wake on the next event loop pass.
+# Per-task timer for a TIMEOUT yield.  io_uring reads the timespec when it
+# prepares the SQE, which may be after the handler returns, so it lives
+# here (one per task slot) and not on the stack.
+var g_proxy_yield_ts: [256]KernelTimespec
+
+# 0 once the kernel has refused an IORING_OP_TIMEOUT (-EINVAL, as WSL2 6.6
+# did): every later yield is a NOP.
+var g_proxy_timer_ok: i32 = 1
+
+
+# Yield the calling task: wake it after `micros` microseconds, or on the
+# next event-loop pass when `micros` is 0 (AGAST #183).
 #
-# Implementation: NOP SQE.  IORING_OP_TIMEOUT returns -EINVAL on some
-# kernels (notably WSL2 6.6 — see the disabled
-# task_server_submit_idle_timeout for the precedent), and
-# IORING_OP_FUTEX_WAIT is 6.7+.  NOP fires immediately, generating a
-# CQE that re-dispatches us through valet_handle_connection's
-# CONN_STATE_PROXY_WAIT branch.  Other tasks get to run between the
-# submit and the re-dispatch, which is the whole point of pipelining.
+# micros > 0 arms an IORING_OP_TIMEOUT.  The continuation picks `micros`
+# from proxy_yield_delay_us (lib/proxy.ritz): the first yields of a wait
+# are NOPs, later ones back off up to a 1 ms timer.  With NOPs only, N
+# waiting tasks kept N CQEs in flight every loop pass and the event loop
+# never slept; the proxy fell from 33k rps at c=20 to 0 at c=50.
 #
-# `_micros` is reserved for future kernels with working timers; ignored
-# today.  The continuation manages an overall deadline (g_proxies
-# .deadline_sec) so we don't spin forever.
-pub fn valet_proxy_arm_yield(task: *Task, _micros: i64) -> i32
+# micros == 0, or a kernel that refused a timer, arms a NOP: it fires at
+# once and re-dispatches us through valet_handle_connection's
+# CONN_STATE_PROXY_WAIT branch, other tasks running in between.  That
+# branch notices a refused timer (proxy_yield_timer_rejected) and turns
+# timers off for good.  IORING_OP_FUTEX_WAIT would be better still, but
+# is 6.7+.
+#
+# The continuation manages an overall deadline (g_proxies .deadline_sec),
+# so a wait never yields forever.
+pub fn valet_proxy_arm_yield(task: *Task, micros: i64) -> i32
     let pool: *TaskPool = task.user_data as *TaskPool
+    if micros > 0 and g_proxy_timer_ok != 0
+        let idx: i32 = valet_task_slot_idx(task)
+        if idx >= 0
+            let ts: *KernelTimespec = @g_proxy_yield_ts[idx]
+            proxy_yield_timespec(ts, micros)
+            return task_submit_timeout(pool, task, ts)
     return task_submit_nop(pool, task)
 
 
@@ -1615,6 +1637,10 @@ pub fn valet_handle_connection(task: *Task) -> i32
         if cont == null
             # Nothing registered — bail out cleanly rather than spin.
             return 1
+        # A kernel that refuses IORING_OP_TIMEOUT answers our timer yield
+        # with -EINVAL at once: yield with NOPs from now on (AGAST #183).
+        if g_proxy_timer_ok != 0 and proxy_yield_timer_rejected(task.io_result) != 0
+            g_proxy_timer_ok = 0
         return cont(task)
 
     # State: SEND - wait for send completion

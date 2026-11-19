@@ -1,10 +1,12 @@
-# lib/proxy.ritz - Sizing helpers for the zeus reverse proxy (AGAST #2104)
+# lib/proxy.ritz - Sizing and yield-backoff helpers for the zeus reverse proxy
 #
 # A zeus worker hands its response back as (offset, length) pairs into the
 # per-slot shm arena: one for the pre-baked header block, one for the body.
 # Those numbers come from another process, so valet validates them against
 # the slot's bounds before reading a byte, and sizes its send buffer from
 # them rather than assuming the 8 KB task write_buf.
+
+import ritzlib.uring
 
 
 # Is [off, off+len) inside [slot_start, slot_end)?  An empty range is always
@@ -106,3 +108,63 @@ pub fn proxy_copy_headers(dst: *u8, cap: i64, src: *u8, len: i64, closing: i32) 
     else
         pos = proxy_put(dst, cap, pos, c"Connection: keep-alive\r\n\r\n", 26)
     return pos
+
+
+# ----------------------------------------------------------------------------
+# Yield backoff (AGAST #183)
+#
+# A proxied request waits in CONN_STATE_PROXY_WAIT, re-arming a yield after
+# every miss until the worker's response lands.  A NOP yield completes at
+# once: with N waiters every event-loop pass was N NOP CQEs and N
+# continuations, a hot spin (~950 continuations a request at c=50) that
+# collapsed the proxy from 33k rps at c=20 to 0 at c=50.
+#
+# So the first PROXY_YIELD_NOPS yields stay NOPs (the common response lands
+# within tens of microseconds and should not pay a timer's granularity), and
+# later ones are IORING_OP_TIMEOUTs of PROXY_YIELD_MIN_US, doubling per yield
+# up to PROXY_YIELD_MAX_US.  A waiter at the cap costs ~1k wakeups a second
+# instead of ~100k: a request parked on a stalled worker took valet from
+# ~90-100% of a core to 1-4% (AGAST #4297).
+#
+# Tuned on toffee (AGAST #4297): 2 NOPs cost c=1 ~25% (a ~45 µs response
+# fell into a timer); 32 NOPs match the NOP-only baseline at c=1 and c=100.
+# A 250 µs cap bought no measurable throughput and tripled idle-wait CPU.
+# ----------------------------------------------------------------------------
+
+pub const PROXY_YIELD_NOPS: i32 = 32
+pub const PROXY_YIELD_MIN_US: i64 = 16
+pub const PROXY_YIELD_MAX_US: i64 = 1000
+
+# The kernel's answer to an IORING_OP_TIMEOUT it does not support.
+const PROXY_EINVAL: i32 = -22
+
+
+# Microseconds the `n`th yield (0-based) of one wait should sleep; 0 = NOP.
+pub fn proxy_yield_delay_us(n: i32) -> i64
+    if n < PROXY_YIELD_NOPS
+        return 0
+    var d: i64 = PROXY_YIELD_MIN_US
+    var k: i32 = n - PROXY_YIELD_NOPS
+    # Double until the cap; the loop ends within log2(MAX/MIN) steps, so a
+    # huge `n` can neither overflow nor take long.
+    while k > 0 and d < PROXY_YIELD_MAX_US
+        d = d * 2
+        k = k - 1
+    if d > PROXY_YIELD_MAX_US
+        return PROXY_YIELD_MAX_US
+    return d
+
+
+# A relative timespec of `us` microseconds.
+pub fn proxy_yield_timespec(ts: *KernelTimespec, us: i64)
+    ts.tv_sec = us / 1000000
+    ts.tv_nsec = (us % 1000000) * 1000
+
+
+# 1 when a yield's CQE result says the kernel refused the timer (-EINVAL,
+# as WSL2 6.6 did): yield with NOPs from then on.  A fired timer gives
+# -ETIME and a NOP 0, neither of which is a refusal.
+pub fn proxy_yield_timer_rejected(io_result: i32) -> i32
+    if io_result == PROXY_EINVAL
+        return 1
+    return 0
