@@ -282,9 +282,12 @@ CORPUS_FLOOR = 15000
 # guess that refused good programs when Sema copied it).  28 at #3974, which
 # types `c?` as its Ok / Some struct.  28 still at #3995, which types a
 # user-enum ctor call `One(3)` as its enum (Sema and get_expr_type both) and
-# untyped test_issue_struct_enum_variants' lets again: 41 without it.  Lower
-# it as they go.
-BK_GAP_CEILING = 28
+# untyped test_issue_struct_enum_variants' lets again: 41 without it.  30 at
+# #4248, whose fs Err payload became the user enum Errno: Sema leaves a
+# Result payload binding of user-enum type untyped (`Err(e) => errno_code(e)`
+# in the two corpus files reading fs's Err; #4265 types it).  Lower it as
+# they go.
+BK_GAP_CEILING = 30
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

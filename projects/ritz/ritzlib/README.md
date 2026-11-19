@@ -72,6 +72,7 @@ pub fn main() -> i32
 | `ct.ritz` | `ritzlib.ct` | Constant-time comparison (AGAST #1863) |
 | `drop.ritz` | `ritzlib.drop` | Drop trait for automatic cleanup |
 | `elf.ritz` | `ritzlib.elf` | ELF Binary Format Parser |
+| `errno.ritz` | `ritzlib.errno` | `Errno`, a typed kernel error code (AGAST #4248) |
 | `fmt.ritz` | `ritzlib.fmt` | the one integer-to-text digit routine |
 | `fs.ritz` | `ritzlib.fs` | Filesystem utility functions |
 | `gvec.ritz` | `ritzlib.gvec` | Generic dynamic array |

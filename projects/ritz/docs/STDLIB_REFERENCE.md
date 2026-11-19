@@ -1374,6 +1374,68 @@ High-level console I/O functions.
 
 ---
 
+### errno
+
+**Module**: `ritzlib.errno`
+
+`Errno`, a typed kernel error code: the `Err` payload of ritzlib's fallible
+syscall wrappers (`ritzlib.fs`, which re-exports it). One variant per errno fs
+returns, numbered as on Linux x86_64, and `Other(n)` for any other code, so no
+number is lost. The variant names follow Harland's kernel `Errno`; the raw
+`i32` constants (`ENOENT`, ...) stay in `ritzlib.sys`.
+
+```ritz
+pub enum Errno
+    Perm            # EPERM 1
+    NoEnt           # ENOENT 2
+    Intr            # EINTR 4
+    Io              # EIO 5
+    BadF            # EBADF 9
+    Again           # EAGAIN 11
+    Acces           # EACCES 13
+    Exist           # EEXIST 17
+    NotDir          # ENOTDIR 20
+    IsDir           # EISDIR 21
+    Inval           # EINVAL 22
+    NoSpc           # ENOSPC 28
+    NameTooLong     # ENAMETOOLONG 36
+    NotEmpty        # ENOTEMPTY 39
+    Other(i32)      # any other errno, by its positive number
+```
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `errno_from_raw` | `fn(code: i32) -> Errno` | The Errno for `code`; either sign, so a raw `-errno` syscall return converts directly |
+| `errno_code` | `fn(e: Errno) -> i32` | The positive number (`NoEnt` -> 2, `Other(n)` -> n) |
+| `errno_name` | `fn(e: Errno) -> StrView` | `"ENOENT"`, ...; `"EUNKNOWN"` for `Other` |
+| `errno_message` | `fn(e: Errno) -> StrView` | strerror(3)'s text (`"No such file or directory"`); `"Unknown error"` for `Other` |
+| `errno_write` | `fn(fd: i32, e: Errno) -> i64` | Write the message to `fd`, no newline; `Other(n)` gives `"Unknown error <n>"` |
+
+`Errno` carries data, so `e as i32` is an error: use `errno_code`.
+
+```ritz
+import ritzlib.fs
+import ritzlib.io
+import ritzlib.string
+
+# 0 if `path` was read or is simply missing; otherwise report why and return 1.
+fn read_if_present(path: StrView) -> i32
+    match read_file(path)
+        Ok(s) =>
+            var text: String = s
+            string_drop(@&text)
+            0
+        Err(e) => match e
+            NoEnt => 0
+            _ =>
+                eprint("cannot read file: ")
+                errno_write(2, e)
+                eprint("\n")
+                1
+```
+
+---
+
 ### fs
 
 **Module**: `ritzlib.fs`
@@ -1382,9 +1444,10 @@ High-level filesystem operations.
 
 There is one path API, and every path is a `StrView`. A `"..."` literal is
 already a StrView; a `String` passes `string_as_view(@s)`; a C string passes
-`strview_from_cstr(p)`. Every `Err` holds the positive kernel errno (`2` =
-ENOENT, `17` = EEXIST, ...). A path of 4096 bytes or more fails with `36`
-(ENAMETOOLONG) without making a syscall.
+`strview_from_cstr(p)`. Every `Err` is an `Errno` (see [errno](#errno), which
+fs re-exports): `NoEnt`, `Exist`, ..., or `Other(n)`; no fs function returns
+a `-1` / `null` sentinel. A path of 4096 bytes or more fails with
+`NameTooLong` without making a syscall.
 
 **Path Checking** (lstat: a symlink is reported as itself, so `is_dir` of a
 link to a directory is `false`):
@@ -1395,7 +1458,7 @@ link to a directory is `false`):
 | `is_dir` | `fn(path: StrView) -> bool` | Is directory? |
 | `is_file` | `fn(path: StrView) -> bool` | Is regular file? |
 | `is_symlink` | `fn(path: StrView) -> bool` | Is symlink? |
-| `file_size` | `fn(path: StrView) -> Result<i64, i32>` | Size in bytes (a symlink's own size) |
+| `file_size` | `fn(path: StrView) -> Result<i64, Errno>` | Size in bytes (a symlink's own size) |
 
 **Mode Helpers**:
 
@@ -1409,15 +1472,15 @@ link to a directory is `false`):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `stat` | `fn(path: StrView) -> Result<Stat, i32>` | Status of `path`, following symlinks |
-| `lstat` | `fn(path: StrView) -> Result<Stat, i32>` | Status of `path`; a symlink is reported as itself |
+| `stat` | `fn(path: StrView) -> Result<Stat, Errno>` | Status of `path`, following symlinks |
+| `lstat` | `fn(path: StrView) -> Result<Stat, Errno>` | Status of `path`; a symlink is reported as itself |
 
 `Stat` is the kernel's x86_64 `struct stat`, defined once in `ritzlib.sys`
 (`st_dev`, `st_ino`, `st_nlink`, `st_mode`, `st_uid`, `st_gid`, `st_size`,
 `st_blksize`, `st_blocks`, timestamps). The path is a `StrView` and needn't be
-NUL-terminated, because it's copied into a terminated buffer first. `Err` holds
-the positive errno (`2` = ENOENT). A path of 4096 bytes or more gives `36`
-(ENAMETOOLONG) without making a syscall.
+NUL-terminated, because it's copied into a terminated buffer first. A missing
+file is `Err(NoEnt)`; a path of 4096 bytes or more gives `Err(NameTooLong)`
+without making a syscall.
 
 ```ritz
 import ritzlib.fs
@@ -1425,7 +1488,7 @@ import ritzlib.sys     # Stat
 import ritzlib.result
 
 fn size_or_minus_one(path: StrView) -> i64
-    var r: Result<Stat, i32> = lstat(path)
+    var r: Result<Stat, Errno> = lstat(path)
     match r
         Ok(st) => st.st_size
         Err(_) => -1
@@ -1435,8 +1498,7 @@ fn size_or_minus_one(path: StrView) -> i64
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `dir_open` | `fn(path: StrView) -> DirIter` | Open a directory; check `dir_valid` |
-| `dir_valid` | `fn(dir: *DirIter) -> i32` | 1 if the directory was opened |
+| `dir_open` | `fn(path: StrView) -> Result<DirIter, Errno>` | Open a directory (`Err(NoEnt)`, `Err(NotDir)`, ...) |
 | `dir_next` | `fn(dir: *DirIter) -> i32` | Advance; 1 if an entry is available, 0 at the end |
 | `dir_close` | `fn(dir: *DirIter)` | Close the iterator |
 | `dir_entry` | `fn(dir: @DirIter) -> DirEntry` | Current entry after `dir_next` returns 1 |
@@ -1450,7 +1512,9 @@ import ritzlib.strview
 
 # Count regular files in `path` (0 if it can't be opened).
 fn count_files(path: StrView) -> i64
-    var dir: DirIter = dir_open(path)
+    var dir: DirIter = match dir_open(path)
+        Ok(d) => d
+        Err(_) => return 0
     var n: i64 = 0
     while dir_next(@dir) != 0
         let e: DirEntry = dir_entry(@dir)    # e.ino, e.kind, e.name: StrView
@@ -1512,31 +1576,31 @@ extension.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `read_file` | `fn(path: StrView) -> Result<String, i32>` | Whole contents of a file |
-| `write_file` | `fn(path: StrView, content: StrView) -> Result<i64, i32>` | Create/truncate (0644) and write; `Ok` = bytes written |
-| `copy_file` | `fn(src: StrView, dest: StrView, mode: i32) -> Result<i64, i32>` | Copy; `Ok` = bytes copied |
-| `mkdir` | `fn(path: StrView, mode: i32) -> Result<i32, i32>` | Create directory (`Ok(0)`; `Err(17)` if it exists) |
-| `unlink` | `fn(path: StrView) -> Result<i32, i32>` | Remove a non-directory (`Ok(0)`) |
-| `rmdir` | `fn(path: StrView) -> Result<i32, i32>` | Remove an empty directory (`Ok(0)`) |
+| `read_file` | `fn(path: StrView) -> Result<String, Errno>` | Whole contents of a file |
+| `write_file` | `fn(path: StrView, content: StrView) -> Result<i64, Errno>` | Create/truncate (0644) and write; `Ok` = bytes written |
+| `copy_file` | `fn(src: StrView, dest: StrView, mode: i32) -> Result<i64, Errno>` | Copy; `Ok` = bytes copied |
+| `mkdir` | `fn(path: StrView, mode: i32) -> Result<i32, Errno>` | Create directory (`Ok(0)`; `Err(Exist)` if it exists) |
+| `unlink` | `fn(path: StrView) -> Result<i32, Errno>` | Remove a non-directory (`Ok(0)`) |
+| `rmdir` | `fn(path: StrView) -> Result<i32, Errno>` | Remove an empty directory (`Ok(0)`) |
 
 ```ritz
 import ritzlib.fs
 import ritzlib.string
 import ritzlib.result
 
-# Write `text` to dir/name; 0 on success, else the errno.
+# Write `text` to dir/name; 0 on success, else the errno's number.
 fn save(dir: StrView, name: StrView, text: StrView) -> i32
     if not is_dir(dir)
-        var made: Result<i32, i32> = mkdir(dir, 493)    # 0755
+        var made: Result<i32, Errno> = mkdir(dir, 493)    # 0755
         match made
             Ok(_) => pass
-            Err(e) => return e
+            Err(e) => return errno_code(e)
     var path: String = path_join(dir, name)
-    var r: Result<i64, i32> = write_file(string_as_view(@path), text)
+    var r: Result<i64, Errno> = write_file(string_as_view(@path), text)
     string_drop(@&path)
     match r
         Ok(_) => 0
-        Err(e) => e
+        Err(e) => errno_code(e)
 ```
 
 ---
@@ -2430,13 +2494,13 @@ import ritzlib.io
 import ritzlib.result
 
 fn show_file(path: StrView) -> i32
-    var r: Result<String, i32> = read_file(path)
+    var r: Result<String, Errno> = read_file(path)
     match r
         Ok(content) =>
             print_string(@content)
             string_drop(@&content)
             0
-        Err(errno) => errno
+        Err(e) => errno_code(e)
 ```
 
 **Creating a TCP server**:

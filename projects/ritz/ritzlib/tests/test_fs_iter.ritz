@@ -1,144 +1,111 @@
 # test_fs_iter.ritz - Tests for directory iteration
 #
-# TDD: These tests define the API we want for DirIter
+# dir_open -> Result<DirIter, Errno> (AGAST #4248). Tests run with the package
+# dir (ritzlib/tests) as cwd, so "." is this directory and ".." is ritzlib.
+#
+# These used to count failures in globals through assert_true/assert_gt while
+# every test returned 0, so none could fail: test_dir_iterate_projects opened
+# "projects", which does not exist from this cwd, and passed anyway. They
+# assert now.
 
 import ritzlib.sys
-import ritzlib.io
 import ritzlib.fs
-import ritzlib.str
-import ritzlib.string
-import ritzlib.gvec
+import ritzlib.errno
+import ritzlib.result
 import ritzlib.strview
-
-# Test infrastructure
-var g_passed: i32 = 0
-var g_failed: i32 = 0
-
-fn assert_true(name: *u8, cond: i32)
-    if cond != 0
-        g_passed += 1
-    else
-        prints_cstr(c"FAIL: ")
-        prints_cstr(name)
-        prints_cstr(c"\n")
-        g_failed += 1
-
-fn assert_gt(name: *u8, val: i64, min: i64)
-    if val > min
-        g_passed += 1
-    else
-        prints_cstr(c"FAIL: ")
-        prints_cstr(name)
-        prints_cstr(c" - expected > ")
-        print_int(min)
-        prints_cstr(c", got ")
-        print_int(val)
-        prints_cstr(c"\n")
-        g_failed += 1
-
-# ============================================================================
-# Directory Iteration Tests
-# ============================================================================
 
 [[test]]
 fn test_dir_open_close() -> i32
-    # Open current directory
-    var dir: DirIter = dir_open(".")
-    assert_true(c"dir_open returns valid", dir_valid(@dir))
-    dir_close(@dir)
+    match dir_open(".")
+        Ok(d) =>
+            var dir: DirIter = d
+            dir_close(@dir)
+        Err(_) => return 1
     0
 
 [[test]]
 fn test_dir_open_invalid() -> i32
-    # Try to open non-existent directory
-    var dir: DirIter = dir_open("/this/path/does/not/exist")
-    assert_true(c"dir_open invalid returns invalid", (dir_valid(@dir) == 0) as i32)
+    match dir_open("/this/path/does/not/exist")
+        Ok(d) =>
+            var dir: DirIter = d
+            dir_close(@dir)
+            return 1
+        Err(e) =>
+            assert errno_code(e) == ENOENT, "dir_open of a missing dir is ENOENT"
     0
 
 [[test]]
 fn test_dir_iterate_current() -> i32
-    # Iterate over current directory, count entries
-    var dir: DirIter = dir_open(".")
+    var dir: DirIter = match dir_open(".")
+        Ok(d) => d
+        Err(_) => return 1
     var count: i64 = 0
-
     while dir_next(@dir) != 0
         count += 1
-
     dir_close(@dir)
-
-    # Current directory should have some entries
-    assert_gt(c"dir has entries", count, 0)
+    # ".", ".." and this file at least.
+    assert count >= 3, "current dir has entries"
     0
 
 [[test]]
 fn test_dir_entry_name() -> i32
-    # Check that we can get entry names
-    var dir: DirIter = dir_open(".")
-    var found_dot: i32 = 0
-
+    var dir: DirIter = match dir_open(".")
+        Ok(d) => d
+        Err(_) => return 1
+    var found_dot: bool = false
+    var found_self: bool = false
     while dir_next(@dir) != 0
-        let name: *u8 = dir_entry_name(@dir)
-        if strcmp(name, c".") == 0
-            found_dot = 1
-
+        let name: StrView = dir_entry(@dir).name
+        if strview_eq_cstr(name, c".")
+            found_dot = true
+        if strview_eq_cstr(name, c"test_fs_iter.ritz")
+            found_self = true
     dir_close(@dir)
-    assert_true(c"found . entry", found_dot)
+    assert found_dot, "found . entry"
+    assert found_self, "found this test file"
     0
 
 [[test]]
 fn test_dir_entry_is_dir() -> i32
-    # Check entry type detection
-    var dir: DirIter = dir_open(".")
-    var found_subdir: i32 = 0
-
+    var dir: DirIter = match dir_open(".")
+        Ok(d) => d
+        Err(_) => return 1
+    var found_subdir: bool = false
     while dir_next(@dir) != 0
         if dir_entry_is_dir(@dir) != 0
-            found_subdir = 1
+            found_subdir = true
             break
-
     dir_close(@dir)
-    # Current directory should have at least . and .. which are dirs
-    assert_true(c"found a directory entry", found_subdir)
+    # At least . and .. are directories.
+    assert found_subdir, "found a directory entry"
     0
 
 [[test]]
-fn test_dir_iterate_projects() -> i32
-    # Iterate over projects directory (the one rzrz will use)
-    var dir: DirIter = dir_open("projects")
+fn test_dir_iterate_parent() -> i32
+    # ".." is ritzlib: dozens of modules.
+    var dir: DirIter = match dir_open("..")
+        Ok(d) => d
+        Err(_) => return 1
     var count: i64 = 0
-
+    var found_fs: bool = false
     while dir_next(@dir) != 0
-        let name: *u8 = dir_entry_name(@dir)
-        # Skip . and ..
-        if strcmp(name, c".") != 0 and strcmp(name, c"..") != 0
+        let name: StrView = dir_entry(@dir).name
+        if not strview_eq_cstr(name, c".") and not strview_eq_cstr(name, c"..")
             count += 1
-
+        if strview_eq_cstr(name, c"fs.ritz")
+            found_fs = true
     dir_close(@dir)
-
-    # Should have multiple projects
-    assert_gt(c"projects has multiple entries", count, 5)
+    assert count > 5, "ritzlib has multiple entries"
+    assert found_fs, "ritzlib holds fs.ritz"
     0
 
-# ============================================================================
-# Main test runner
-# ============================================================================
-
-fn main(argc: i32, argv: **u8) -> i32
-    prints_cstr(c"Running fs directory iteration tests...\n\n")
-
-    test_dir_open_close()
-    test_dir_open_invalid()
-    test_dir_iterate_current()
-    test_dir_entry_name()
-    test_dir_entry_is_dir()
-    test_dir_iterate_projects()
-
-    prints_cstr(c"\n")
-    print_int(g_passed as i64)
-    prints_cstr(c" passed, ")
-    print_int(g_failed as i64)
-    prints_cstr(c" failed\n")
-
-    if g_failed > 0
-        return 1
+[[test]]
+fn test_dir_entry_type_without_entry_is_unknown() -> i32
+    # No current entry (before dir_next): DT_UNKNOWN, not a stale byte.
+    var dir: DirIter = match dir_open(".")
+        Ok(d) => d
+        Err(_) => return 1
+    let t: u8 = dir_entry_type(@dir)
+    dir_close(@dir)
+    assert t == DT_UNKNOWN, "dir_entry_type with no entry"
     0

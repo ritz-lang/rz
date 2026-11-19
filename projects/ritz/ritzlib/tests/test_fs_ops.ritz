@@ -1,14 +1,15 @@
 # Tests for fs.ritz filesystem operations over StrView paths (AGAST #1477).
 #
 # Predicates (path_exists/is_dir/is_file/is_symlink) return bool. Fallible
-# operations return Result whose Err is the positive kernel errno, as stat()
-# does (#1476): 2 = ENOENT, 17 = EEXIST.
+# operations return Result<T, Errno> (ritzlib.errno, AGAST #4248): the helpers
+# below compare errno_code(e), 2 = ENOENT, 17 = EEXIST.
 #
 # Each test owns its fixtures under /tmp and removes them, so the verdict does
 # not depend on the cwd build.py runs the binary from.
 
 import ritzlib.sys
 import ritzlib.fs
+import ritzlib.errno
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.fmt { fmt_i64_into }
@@ -36,28 +37,28 @@ fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
 fn tmp_view(dst: *u8, name: *u8) -> StrView
     strview_from_cstr(pid_tmp_path(dst, name))
 
-fn i64_err(r: *Result<i64, i32>) -> i32
+fn i64_err(r: *Result<i64, Errno>) -> i32
     match *r
         Ok(_) => 0
-        Err(e) => e
+        Err(e) => errno_code(e)
 
-fn i64_ok(r: *Result<i64, i32>) -> i64
+fn i64_ok(r: *Result<i64, Errno>) -> i64
     match *r
         Ok(v) => v
         Err(_) => -1
 
-fn unit_err(r: *Result<i32, i32>) -> i32
+fn unit_err(r: *Result<i32, Errno>) -> i32
     match *r
         Ok(_) => 0
-        Err(e) => e
+        Err(e) => errno_code(e)
 
-fn string_err(r: *Result<String, i32>) -> i32
+fn string_err(r: *Result<String, Errno>) -> i32
     match *r
         Ok(_) => 0
-        Err(e) => e
+        Err(e) => errno_code(e)
 
 # 1 if `r` is Ok and its String equals `want`.
-fn string_ok_is(r: *Result<String, i32>, want: StrView) -> i32
+fn string_ok_is(r: *Result<String, Errno>, want: StrView) -> i32
     match *r
         Ok(s) => string_eq(@s, want) as i32
         Err(_) => 0
@@ -94,7 +95,7 @@ fn test_is_dir() -> i32
 fn test_is_file() -> i32
     var pathbuf: [96]u8
     let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_file.tmp")
-    var w: Result<i64, i32> = write_file(path, "x")
+    var w: Result<i64, Errno> = write_file(path, "x")
     if i64_err(@w) != 0
         return 1
     if not is_file(path)
@@ -125,17 +126,17 @@ fn test_is_symlink() -> i32
     0
 
 # ============================================================================
-# file_size -> Result<i64, i32>
+# file_size -> Result<i64, Errno>
 # ============================================================================
 
 [[test]]
 fn test_file_size_ok() -> i32
     var pathbuf: [96]u8
     let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_size.tmp")
-    var w: Result<i64, i32> = write_file(path, "12345")
+    var w: Result<i64, Errno> = write_file(path, "12345")
     if i64_err(@w) != 0
         return 1
-    var r: Result<i64, i32> = file_size(path)
+    var r: Result<i64, Errno> = file_size(path)
     unlink(path)
     if i64_ok(@r) != 5
         return 2
@@ -143,23 +144,23 @@ fn test_file_size_ok() -> i32
 
 [[test]]
 fn test_file_size_err_is_errno() -> i32
-    var r: Result<i64, i32> = file_size("/nonexistent/path")
+    var r: Result<i64, Errno> = file_size("/nonexistent/path")
     if i64_err(@r) != 2
         return 1
     0
 
 # ============================================================================
-# read_file -> Result<String, i32>, write_file -> Result<i64, i32>
+# read_file -> Result<String, Errno>, write_file -> Result<i64, Errno>
 # ============================================================================
 
 [[test]]
 fn test_write_then_read_file() -> i32
     var pathbuf: [96]u8
     let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_rw.tmp")
-    var w: Result<i64, i32> = write_file(path, "Hello, Result!")
+    var w: Result<i64, Errno> = write_file(path, "Hello, Result!")
     if i64_ok(@w) != 14
         return 1
-    var r: Result<String, i32> = read_file(path)
+    var r: Result<String, Errno> = read_file(path)
     unlink(path)
     if string_ok_is(@r, "Hello, Result!") == 0
         return 2
@@ -168,20 +169,40 @@ fn test_write_then_read_file() -> i32
 [[test]]
 fn test_read_file_missing_is_enoent() -> i32
     var missingbuf: [96]u8
-    var r: Result<String, i32> = read_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
+    var r: Result<String, Errno> = read_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
     if string_err(@r) != 2
         return 1
     0
 
 [[test]]
+fn test_read_file_missing_is_noent_variant() -> i32
+    # The Err is the typed variant, not just a number that happens to be 2.
+    var missingbuf: [96]u8
+    match read_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
+        Ok(_) => return 1
+        Err(e) => match e
+            NoEnt => pass
+            _ => return 2
+    0
+
+[[test]]
+fn test_read_file_dir_is_eisdir() -> i32
+    match read_file("/tmp")
+        Ok(_) => return 1
+        Err(e) => match e
+            IsDir => pass
+            _ => return 2
+    0
+
+[[test]]
 fn test_write_file_bad_dir_is_enoent() -> i32
-    var w: Result<i64, i32> = write_file("/nonexistent/dir/f", "x")
+    var w: Result<i64, Errno> = write_file("/nonexistent/dir/f", "x")
     if i64_err(@w) != 2
         return 1
     0
 
 # ============================================================================
-# mkdir / rmdir / unlink -> Result<i32, i32>
+# mkdir / rmdir / unlink -> Result<i32, Errno>
 # ============================================================================
 
 [[test]]
@@ -189,15 +210,20 @@ fn test_mkdir_rmdir() -> i32
     var pathbuf: [96]u8
     let path: StrView = tmp_view(@pathbuf[0], c"fs_ops_dir")
     rmdir(path)
-    var mk: Result<i32, i32> = mkdir(path, 493)  # 0755
+    var mk: Result<i32, Errno> = mkdir(path, 493)  # 0755
     if unit_err(@mk) != 0
         return 1
     if not is_dir(path)
         return 2
-    var again: Result<i32, i32> = mkdir(path, 493)
+    var again: Result<i32, Errno> = mkdir(path, 493)
     if unit_err(@again) != 17
         return 3
-    var rm: Result<i32, i32> = rmdir(path)
+    match again
+        Ok(_) => return 6
+        Err(e) => match e
+            Exist => pass
+            _ => return 7
+    var rm: Result<i32, Errno> = rmdir(path)
     if unit_err(@rm) != 0
         return 4
     if path_exists(path)
@@ -207,13 +233,13 @@ fn test_mkdir_rmdir() -> i32
 [[test]]
 fn test_unlink_missing_is_enoent() -> i32
     var missingbuf: [96]u8
-    var r: Result<i32, i32> = unlink(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
+    var r: Result<i32, Errno> = unlink(tmp_view(@missingbuf[0], c"does_not_exist.tmp"))
     if unit_err(@r) != 2
         return 1
     0
 
 # ============================================================================
-# copy_file -> Result<i64, i32>
+# copy_file -> Result<i64, Errno>
 # ============================================================================
 
 [[test]]
@@ -223,10 +249,10 @@ fn test_copy_file() -> i32
     var dstbuf: [96]u8
     let dst: StrView = tmp_view(@dstbuf[0], c"fs_ops_dst.tmp")
     write_file(src, "Content to copy")
-    var c: Result<i64, i32> = copy_file(src, dst, 420)  # 0644
+    var c: Result<i64, Errno> = copy_file(src, dst, 420)  # 0644
     if i64_ok(@c) != 15
         return 1
-    var r: Result<String, i32> = read_file(dst)
+    var r: Result<String, Errno> = read_file(dst)
     unlink(src)
     unlink(dst)
     if string_ok_is(@r, "Content to copy") == 0
@@ -238,7 +264,7 @@ fn test_copy_file_missing_src_is_enoent() -> i32
     var missingbuf: [96]u8
     var neverbuf: [96]u8
     let never: StrView = tmp_view(@neverbuf[0], c"fs_ops_never.tmp")
-    var c: Result<i64, i32> = copy_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"), never, 420)
+    var c: Result<i64, Errno> = copy_file(tmp_view(@missingbuf[0], c"does_not_exist.tmp"), never, 420)
     if i64_err(@c) != 2
         return 1
     if path_exists(never)
@@ -246,16 +272,24 @@ fn test_copy_file_missing_src_is_enoent() -> i32
     0
 
 # ============================================================================
-# dir_open(StrView)
+# dir_open(StrView) -> Result<DirIter, Errno>
 # ============================================================================
 
 [[test]]
 fn test_dir_open_view() -> i32
-    var dir: DirIter = dir_open("/tmp")
-    if dir_valid(@dir) == 0
-        return 1
-    dir_close(@dir)
-    var bad: DirIter = dir_open("/nonexistent/x")
-    if dir_valid(@bad) != 0
-        return 2
+    match dir_open("/tmp")
+        Ok(d) =>
+            var dir: DirIter = d
+            dir_close(@dir)
+        Err(_) => return 1
+    match dir_open("/nonexistent/x")
+        Ok(_) => return 2
+        Err(e) => match e
+            NoEnt => pass
+            _ => return 3
+    match dir_open("/proc/self/exe")
+        Ok(_) => return 4
+        Err(e) => match e
+            NotDir => pass
+            _ => return 5
     0

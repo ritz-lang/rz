@@ -1,0 +1,141 @@
+# ritzlib/errno.ritz - `Errno`, a typed kernel error code (AGAST #4248)
+#
+# The Err payload of ritzlib's fallible syscall wrappers (ritzlib.fs today;
+# net and process are later slices of #1859). One variant per errno those
+# wrappers actually return, numbered as on Linux x86_64, plus `Other(n)` so a
+# code without a variant keeps its number instead of being lost.
+#
+#     match read_file(path)
+#         Ok(s) => ...
+#         Err(e) => match e
+#             NoEnt => ...                   # a missing file is fine here
+#             _ =>
+#                 eprint("cannot read: ")
+#                 errno_write(2, e)          # "Permission denied", ...
+#
+# (A nested pattern, `Err(NoEnt)`, binds a local named NoEnt: match twice.)
+#
+# The variant names follow harland's kernel `Errno` (syscall/errno.ritz) and
+# deliberately differ from ritzlib.sys's `ENOENT`/`EACCES`/... i32 consts,
+# which stay the raw numbers: `errno_code(e) == ENOENT` compares the two.
+#
+# `Errno` carries data (`Other`), so `e as i32` is an error: use errno_code.
+
+import ritzlib.sys
+import ritzlib.strview
+import ritzlib.fmt { fmt_i64_into }
+
+pub enum Errno
+    Perm            # EPERM 1: operation not permitted
+    NoEnt           # ENOENT 2: no such file or directory
+    Intr            # EINTR 4: interrupted system call
+    Io              # EIO 5: input/output error
+    BadF            # EBADF 9: bad file descriptor
+    Again           # EAGAIN 11: resource temporarily unavailable
+    Acces           # EACCES 13: permission denied
+    Exist           # EEXIST 17: file exists
+    NotDir          # ENOTDIR 20: not a directory
+    IsDir           # EISDIR 21: is a directory
+    Inval           # EINVAL 22: invalid argument
+    NoSpc           # ENOSPC 28: no space left on device
+    NameTooLong     # ENAMETOOLONG 36: file name too long
+    NotEmpty        # ENOTEMPTY 39: directory not empty
+    Other(i32)      # any other errno, by its positive number
+
+# The Errno for kernel error number `code`. Either sign is accepted, so a raw
+# syscall return (-errno) converts directly: errno_from_raw(-2) is NoEnt.
+pub fn errno_from_raw(code: i32) -> Errno
+    var n: i32 = code
+    if n < 0
+        n = -n
+    match n
+        1 => Errno.Perm
+        2 => Errno.NoEnt
+        4 => Errno.Intr
+        5 => Errno.Io
+        9 => Errno.BadF
+        11 => Errno.Again
+        13 => Errno.Acces
+        17 => Errno.Exist
+        20 => Errno.NotDir
+        21 => Errno.IsDir
+        22 => Errno.Inval
+        28 => Errno.NoSpc
+        36 => Errno.NameTooLong
+        39 => Errno.NotEmpty
+        _ => Errno.Other(n)
+
+# The positive kernel error number (NoEnt -> 2; Other(n) -> n).
+pub fn errno_code(e: Errno) -> i32
+    match e
+        Perm => 1
+        NoEnt => 2
+        Intr => 4
+        Io => 5
+        BadF => 9
+        Again => 11
+        Acces => 13
+        Exist => 17
+        NotDir => 20
+        IsDir => 21
+        Inval => 22
+        NoSpc => 28
+        NameTooLong => 36
+        NotEmpty => 39
+        Other(n) => n
+
+# The symbolic name ("ENOENT"); "EUNKNOWN" for Other (errno_code has its number).
+pub fn errno_name(e: Errno) -> StrView
+    match e
+        Perm => "EPERM"
+        NoEnt => "ENOENT"
+        Intr => "EINTR"
+        Io => "EIO"
+        BadF => "EBADF"
+        Again => "EAGAIN"
+        Acces => "EACCES"
+        Exist => "EEXIST"
+        NotDir => "ENOTDIR"
+        IsDir => "EISDIR"
+        Inval => "EINVAL"
+        NoSpc => "ENOSPC"
+        NameTooLong => "ENAMETOOLONG"
+        NotEmpty => "ENOTEMPTY"
+        Other(_) => "EUNKNOWN"
+
+# The message strerror(3) gives ("No such file or directory"); "Unknown error"
+# for Other, which errno_write completes with the number.
+pub fn errno_message(e: Errno) -> StrView
+    match e
+        Perm => "Operation not permitted"
+        NoEnt => "No such file or directory"
+        Intr => "Interrupted system call"
+        Io => "Input/output error"
+        BadF => "Bad file descriptor"
+        Again => "Resource temporarily unavailable"
+        Acces => "Permission denied"
+        Exist => "File exists"
+        NotDir => "Not a directory"
+        IsDir => "Is a directory"
+        Inval => "Invalid argument"
+        NoSpc => "No space left on device"
+        NameTooLong => "File name too long"
+        NotEmpty => "Directory not empty"
+        Other(_) => "Unknown error"
+
+# Write strerror(3)'s text for `e` to `fd`, with no newline: the message, or
+# "Unknown error <n>" for Other(n) (glibc's wording). Returns bytes written.
+pub fn errno_write(fd: i32, e: Errno) -> i64
+    let msg: StrView = errno_message(e)
+    var buf: [96]u8
+    var len: i64 = 0
+    for i in 0..msg.len
+        buf[len] = *(msg.ptr + i)
+        len += 1
+    match e
+        Other(n) =>
+            buf[len] = ' '
+            len += 1
+            len += fmt_i64_into(@buf[len], n as i64)
+        _ => pass
+    sys_write(fd, @buf[0], len)

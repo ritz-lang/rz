@@ -6,6 +6,7 @@
 
 import ritzlib.sys
 import ritzlib.fs
+import ritzlib.errno
 import ritzlib.str
 import ritzlib.memory
 import ritzlib.fmt { fmt_i64_into }
@@ -34,7 +35,7 @@ fn pid_tmp_path(dst: *u8, name: *u8) -> *u8
     dst
 
 fn inode_of(path: *u8) -> i64
-    var r: Result<Stat, i32> = stat(strview_from_cstr(path))
+    var r: Result<Stat, Errno> = stat(strview_from_cstr(path))
     match r
         Ok(st) => st.st_ino
         Err(_) => -1
@@ -82,7 +83,9 @@ fn test_dir_next_entry_yields_typed_entries() -> i32
     var seen_beta: i32 = 0
     var count: i32 = 0
     var bad: i32 = 0
-    var dir: DirIter = dir_open(strview_from_cstr(d))
+    var dir: DirIter = match dir_open(strview_from_cstr(d))
+        Ok(it) => it
+        Err(_) => return 7
     loop
         var o: Option<DirEntry> = dir_next_entry(@&dir)
         if option_is_none<DirEntry>(@o) == 1
@@ -118,20 +121,38 @@ fn test_dir_next_entry_yields_typed_entries() -> i32
     0
 
 [[test]]
-fn test_dir_next_entry_invalid_dir_is_none() -> i32
-    var dir: DirIter = dir_open("/nonexistent/ritz_1476")
-    var o: Option<DirEntry> = dir_next_entry(@&dir)
-    if option_is_none<DirEntry>(@o) == 0
-        return 1
-    # With no current record, dir_entry is the empty entry, not stale bytes.
-    let e: DirEntry = dir_entry(@dir)
-    if e.ino != 0 or e.kind != DT_UNKNOWN or e.name.len != 0
+fn test_dir_open_missing_is_err() -> i32
+    match dir_open("/nonexistent/ritz_1476")
+        Ok(_) => return 1
+        Err(e) => match e
+            NoEnt => pass
+            _ => return 2
+    0
+
+[[test]]
+fn test_dir_next_entry_after_end_is_none() -> i32
+    var dir: DirIter = match dir_open("/tmp")
+        Ok(it) => it
+        Err(_) => return 1
+    loop
+        var o: Option<DirEntry> = dir_next_entry(@&dir)
+        if option_is_none<DirEntry>(@o) == 1
+            break
+    # Exhausted: still None, and dir_entry is the empty entry, not stale bytes.
+    var again: Option<DirEntry> = dir_next_entry(@&dir)
+    if option_is_none<DirEntry>(@again) == 0
         return 2
+    let e: DirEntry = dir_entry(@dir)
+    dir_close(@dir)
+    if e.ino != 0 or e.kind != DT_UNKNOWN or e.name.len != 0
+        return 3
     0
 
 [[test]]
 fn test_dir_entry_matches_legacy_getters() -> i32
-    var dir: DirIter = dir_open("/tmp")
+    var dir: DirIter = match dir_open("/tmp")
+        Ok(it) => it
+        Err(_) => return 7
     var checked: i32 = 0
     while dir_next(@dir) != 0
         let e: DirEntry = dir_entry(@dir)
@@ -141,10 +162,6 @@ fn test_dir_entry_matches_legacy_getters() -> i32
             return 2
         if e.name.ptr != dirent_get_name(dir.entry)
             return 3
-        if e.name.ptr != dir_entry_name(@dir)
-            return 4
-        if not strview_eq_cstr(e.name, dir_entry_name(@dir))
-            return 5
         checked += 1
     dir_close(@dir)
     if checked == 0

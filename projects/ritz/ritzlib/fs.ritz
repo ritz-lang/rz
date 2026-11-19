@@ -6,14 +6,16 @@
 # a String passes string_as_view(@s); a C string passes strview_from_cstr(p).
 #
 #   predicates   path_exists / is_dir / is_file / is_symlink    -> bool
-#   queries      stat / lstat -> Result<Stat, i32>, file_size -> Result<i64, i32>
-#   whole files  read_file -> Result<String, i32>, write_file -> Result<i64, i32>
-#   mutation     mkdir / unlink / rmdir -> Result<i32, i32> (Ok(0)), copy_file
+#   queries      stat / lstat -> Result<Stat, Errno>, file_size -> Result<i64, Errno>
+#   whole files  read_file -> Result<String, Errno>, write_file -> Result<i64, Errno>
+#   mutation     mkdir / unlink / rmdir -> Result<i32, Errno> (Ok(0)), copy_file
+#   directories  dir_open -> Result<DirIter, Errno>; dir_next / dir_next_entry
 #   paths        path_join -> String; path_basename / dirname / extension / stem
 #                -> StrView, a view into the input (no allocation)
 #
-# Every Err carries the positive kernel errno (2 = ENOENT, 17 = EEXIST, ...).
-# A path of FS_PATH_MAX bytes or more fails with ENAMETOOLONG (36).
+# Every Err is a ritzlib.errno `Errno` (NoEnt, Exist, ...; Other(n) for a code
+# without a variant), never a -1 / null sentinel or a bare number (AGAST
+# #4248). A path of FS_PATH_MAX bytes or more fails with NameTooLong.
 #
 # Note: Stat struct and STAT_SIZE are defined in ritzlib/sys.ritz
 
@@ -23,9 +25,11 @@ import ritzlib.string
 import ritzlib.strview
 import ritzlib.result
 import ritzlib.option
+# Errno is part of this API (every Err), so importers of fs get it too.
+pub import ritzlib.errno
 
 # ============================================================================
-# stat / lstat -> Result<Stat, i32>
+# stat / lstat -> Result<Stat, Errno>
 # ============================================================================
 # `Stat` is the kernel's x86_64 `struct stat`, declared once in ritzlib/sys.ritz
 # (st_dev @0, st_ino @8, st_nlink @16, st_mode @24, st_uid @28, st_gid @32,
@@ -34,11 +38,10 @@ import ritzlib.option
 #
 #     match stat("/etc/passwd")
 #         Ok(st) => print_int(st.st_size)
-#         Err(errno) => ...            # positive errno, e.g. 2 = ENOENT
+#         Err(e) => ...                # an Errno, e.g. NoEnt
 #
-# Err carries the positive kernel errno. A path longer than FS_PATH_MAX
-# (PATH_MAX, 4096 including the NUL) fails with ENAMETOOLONG (36) without a
-# syscall.
+# A path longer than FS_PATH_MAX (PATH_MAX, 4096 including the NUL) fails with
+# NameTooLong without a syscall.
 
 const FS_PATH_MAX: i64 = 4096
 const FS_ENAMETOOLONG: i32 = 36
@@ -55,11 +58,11 @@ fn fs_path_cstr(path: StrView, buf: *u8) -> i32
     0
 
 # Shared body of stat/lstat. `follow` selects stat(2) (1) or lstat(2) (0).
-fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, i32>
+fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
     if perr != 0
-        return Err(perr)
+        return Err(errno_from_raw(perr))
     var st: Stat
     var ret: i32 = 0
     if follow != 0
@@ -67,15 +70,15 @@ fn fs_stat_impl(path: StrView, follow: i32) -> Result<Stat, i32>
     else
         ret = sys_lstat2(@cpath[0], @st)
     if ret < 0
-        return Err(-ret)
+        return Err(errno_from_raw(ret))
     Ok(st)
 
 # Status of the file at `path`, following symlinks.
-pub fn stat(path: StrView) -> Result<Stat, i32>
+pub fn stat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 1)
 
 # Status of the file at `path`; a symlink is reported as itself.
-pub fn lstat(path: StrView) -> Result<Stat, i32>
+pub fn lstat(path: StrView) -> Result<Stat, Errno>
     fs_stat_impl(path, 0)
 
 # ============================================================================
@@ -161,7 +164,7 @@ pub fn mode_is_socket(mode: i32) -> i32
 
 # st_mode of `path` (lstat), or -1 if it cannot be statted.
 fn fs_lstat_mode(path: StrView) -> i32
-    var r: Result<Stat, i32> = fs_stat_impl(path, 0)
+    var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
         Ok(st) => st.st_mode
         Err(_) => -1
@@ -183,8 +186,8 @@ pub fn is_symlink(path: StrView) -> bool
     mode >= 0 and mode_is_link(mode) != 0
 
 # Size in bytes of `path` (lstat: a symlink's own size).
-pub fn file_size(path: StrView) -> Result<i64, i32>
-    var r: Result<Stat, i32> = fs_stat_impl(path, 0)
+pub fn file_size(path: StrView) -> Result<i64, Errno>
+    var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
         Ok(st) => Ok(st.st_size)
         Err(e) => Err(e)
@@ -307,7 +310,7 @@ pub fn path_stem(path: StrView) -> StrView
     strview_from_ptr(path.ptr, dot)
 
 # ============================================================================
-# File operations -> Result (Err = positive errno)
+# File operations -> Result<T, Errno>
 # ============================================================================
 
 const FS_EIO: i32 = 5
@@ -333,10 +336,10 @@ fn fs_write_all(fd: i32, data: *u8, len: i64) -> i32
     0
 
 # The whole contents of the file at `path`.
-pub fn read_file(path: StrView) -> Result<String, i32>
+pub fn read_file(path: StrView) -> Result<String, Errno>
     let fd: i32 = fs_open(path, O_RDONLY, 0)
     if fd < 0
-        return Err(-fd)
+        return Err(errno_from_raw(fd))
     var out: String = string_new()
     var buf: [4096]u8
     loop
@@ -344,7 +347,7 @@ pub fn read_file(path: StrView) -> Result<String, i32>
         if n < 0
             sys_close(fd)
             string_drop(@&out)
-            return Err(-(n as i32))
+            return Err(errno_from_raw(n as i32))
         if n == 0
             break
         string_push_bytes(@&out, @buf[0], n)
@@ -353,28 +356,28 @@ pub fn read_file(path: StrView) -> Result<String, i32>
 
 # Create or truncate `path` (mode 0644) and write `content` to it.
 # Ok carries the number of bytes written.
-pub fn write_file(path: StrView, content: StrView) -> Result<i64, i32>
+pub fn write_file(path: StrView, content: StrView) -> Result<i64, Errno>
     # O_WRONLY | O_CREAT | O_TRUNC = 1 + 64 + 512 = 577; 0644 = 420
     let fd: i32 = fs_open(path, 577, 420)
     if fd < 0
-        return Err(-fd)
+        return Err(errno_from_raw(fd))
     let werr: i32 = fs_write_all(fd, content.ptr, content.len)
     sys_close(fd)
     if werr != 0
-        return Err(werr)
+        return Err(errno_from_raw(werr))
     Ok(content.len)
 
 # Copy `src` to `dest` (created or truncated with `mode`).
 # Ok carries the number of bytes copied. `dest` is not created if `src`
 # cannot be opened.
-pub fn copy_file(src: StrView, dest: StrView, mode: i32) -> Result<i64, i32>
+pub fn copy_file(src: StrView, dest: StrView, mode: i32) -> Result<i64, Errno>
     let src_fd: i32 = fs_open(src, O_RDONLY, 0)
     if src_fd < 0
-        return Err(-src_fd)
+        return Err(errno_from_raw(src_fd))
     let dest_fd: i32 = fs_open(dest, 577, mode)
     if dest_fd < 0
         sys_close(src_fd)
-        return Err(-dest_fd)
+        return Err(errno_from_raw(dest_fd))
 
     var buf: [8192]u8
     var total: i64 = 0
@@ -394,37 +397,37 @@ pub fn copy_file(src: StrView, dest: StrView, mode: i32) -> Result<i64, i32>
     sys_close(src_fd)
     sys_close(dest_fd)
     if err != 0
-        return Err(err)
+        return Err(errno_from_raw(err))
     Ok(total)
 
-# Map a raw syscall return (0 or -errno) to Result<i32, i32>.
-fn fs_unit(ret: i32) -> Result<i32, i32>
+# Map a raw syscall return (0 or -errno) to Result<i32, Errno>.
+fn fs_unit(ret: i32) -> Result<i32, Errno>
     if ret < 0
-        return Err(-ret)
+        return Err(errno_from_raw(ret))
     Ok(0)
 
 # Create directory `path` with `mode` (e.g. 493 = 0755). EEXIST if present.
-pub fn mkdir(path: StrView, mode: i32) -> Result<i32, i32>
+pub fn mkdir(path: StrView, mode: i32) -> Result<i32, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
     if perr != 0
-        return Err(perr)
+        return Err(errno_from_raw(perr))
     fs_unit(sys_mkdir(@cpath[0], mode))
 
 # Remove the (non-directory) entry at `path`.
-pub fn unlink(path: StrView) -> Result<i32, i32>
+pub fn unlink(path: StrView) -> Result<i32, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
     if perr != 0
-        return Err(perr)
+        return Err(errno_from_raw(perr))
     fs_unit(sys_unlink(@cpath[0]))
 
 # Remove the empty directory at `path`.
-pub fn rmdir(path: StrView) -> Result<i32, i32>
+pub fn rmdir(path: StrView) -> Result<i32, Errno>
     var cpath: [4096]u8
     let perr: i32 = fs_path_cstr(path, @cpath[0])
     if perr != 0
-        return Err(perr)
+        return Err(errno_from_raw(perr))
     fs_unit(sys_rmdir(@cpath[0]))
 
 # ============================================================================
@@ -433,13 +436,16 @@ pub fn rmdir(path: StrView) -> Result<i32, i32>
 # High-level directory iteration API using getdents64.
 #
 # Usage:
-#     var dir: DirIter = dir_open("/path/to/dir")
+#     var dir: DirIter = match dir_open("/path/to/dir")
+#         Ok(d) => d
+#         Err(e) => return ...                # NoEnt, NotDir, Acces, ...
 #     while dir_next(@dir)
 #         let e: DirEntry = dir_entry(@dir)   # e.ino, e.kind, e.name (StrView)
 #         # process entry...
 #     dir_close(@dir)
 #
-# dir_entry_name / dir_entry_type are the older *u8 / u8 accessors.
+# dir_entry_type is the older u8 accessor; dir_entry(@dir).name replaces the
+# removed *u8 dir_entry_name (it returned null with no current entry).
 
 const DIR_BUF_SIZE: i64 = 4096
 
@@ -450,19 +456,18 @@ pub struct DirIter
     buf_len: i64         # Bytes read into buffer
     entry: *u8           # Current entry pointer
 
-# Open a directory for iteration.
-# Returns a DirIter - check with dir_valid() before using.
-pub fn dir_open(path: StrView) -> DirIter
+# Open a directory for iteration; Err (NoEnt, NotDir, Acces, ...) if it
+# cannot be opened. Release the Ok iterator with dir_close.
+pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
+    let fd: i32 = fs_open(path, O_RDONLY + O_DIRECTORY, 0)
+    if fd < 0
+        return Err(errno_from_raw(fd))
     var dir: DirIter
-    dir.fd = fs_open(path, O_RDONLY + O_DIRECTORY, 0)
+    dir.fd = fd
     dir.buf_pos = 0
     dir.buf_len = 0
     dir.entry = null
-    dir
-
-# Check if directory was opened successfully.
-pub fn dir_valid(dir: *DirIter) -> i32
-    (dir.fd >= 0) as i32
+    Ok(dir)
 
 # Advance to the next record; 1 if `dir.entry` now points at one, 0 at the end.
 # Shared by dir_next and dir_next_entry. It takes @&DirIter and only touches
@@ -508,23 +513,16 @@ pub fn dir_entry(dir: @DirIter) -> DirEntry
 #             Some(e) => handle(@e)
 #             None => break
 pub fn dir_next_entry(dir: @&DirIter) -> Option<DirEntry>
-    # An unopened iterator (fd < 0) ends here too: getdents64 fails, buf_len <= 0.
+    # A closed iterator (fd < 0) ends here too: getdents64 fails, buf_len <= 0.
     if dir_advance(dir) == 0
         return None
     Some(dirent_entry(dir.entry))
 
-# Get name of current entry.
-# Only valid after dir_next() returns 1.
-pub fn dir_entry_name(dir: *DirIter) -> *u8
-    if dir.entry == null
-        return null
-    dirent_get_name(dir.entry)
-
-# Get type of current entry.
-# Returns DT_REG, DT_DIR, etc. from sys.ritz
+# Type of the current entry: DT_REG, DT_DIR, etc. from sys.ritz, or DT_UNKNOWN
+# with no current entry (before dir_next, or after the end).
 pub fn dir_entry_type(dir: *DirIter) -> u8
     if dir.entry == null
-        return 0
+        return DT_UNKNOWN
     dirent_get_type(dir.entry)
 
 # Check if current entry is a directory.
