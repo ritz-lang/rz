@@ -1,0 +1,69 @@
+# Harland TSC arithmetic: frequency from each calibration source, time units
+# and deadlines (AGAST #4181).
+#
+# No imports, no hardware access: the host test compiles this module as is
+# (projects/ritz/ritz0/test_harland_tsc.py). arch/x86_64/tsc.ritz reads the
+# hardware and calls these.
+
+# The 8254 PIT's input clock, and the channel 2 gate tsc.ritz measures over:
+# 11931 ticks is 9.999 ms.
+pub const PIT_HZ: u64 = 1193182
+pub const PIT_GATE_TICKS: u64 = 11931
+
+pub const US_PER_SEC: u64 = 1000000
+pub const NS_PER_SEC: u64 = 1000000000
+
+# Assumed when nothing calibrates. Too high a guess only makes waits longer,
+# too low makes them short, so this sits above any TSC we would boot on.
+pub const TSC_FALLBACK_HZ: u64 = 6000000000
+
+const TSC_MIN_HZ: u64 = 100000000       # 100 MHz
+const TSC_MAX_HZ: u64 = 20000000000     # 20 GHz
+const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFF
+
+# TSC cycles counted over `pit_ticks` PIT ticks -> TSC Hz (0 if no ticks).
+pub fn tsc_hz_from_pit(tsc_delta: u64, pit_ticks: u64) -> u64
+    if pit_ticks == 0
+        return 0
+    return tsc_delta * PIT_HZ / pit_ticks
+
+# CPUID 0x15: TSC = crystal (ECX) * EBX / EAX. A zero field means the leaf
+# doesn't enumerate it (QEMU and most hypervisors leave ECX 0), and any zero
+# makes the result 0; only EAX needs guarding (it divides).
+pub fn tsc_hz_from_cpuid15(eax: u32, ebx: u32, ecx: u32) -> u64
+    if eax == 0
+        return 0
+    return (ecx as u64) * (ebx as u64) / (eax as u64)
+
+# CPUID 0x16: processor base frequency in MHz, EAX[15:0] (0 if absent). The
+# nominal frequency, close to but not exactly the TSC's: a last resort.
+pub fn tsc_hz_from_cpuid16(eax: u32) -> u64
+    return ((eax & 0xFFFF) as u64) * US_PER_SEC
+
+pub fn tsc_hz_plausible(hz: u64) -> bool
+    return hz >= TSC_MIN_HZ and hz <= TSC_MAX_HZ
+
+# Cycles in `us` microseconds at `hz`, without forming hz * us (which
+# overflows past ~1 hour at 5 GHz).
+pub fn tsc_cycles_for_us(hz: u64, us: u64) -> u64
+    let whole: u64 = hz / US_PER_SEC
+    let frac: u64 = hz % US_PER_SEC
+    return whole * us + frac * us / US_PER_SEC
+
+# Cycles -> nanoseconds at `hz` (0 when hz is 0).
+pub fn tsc_cycles_to_ns(hz: u64, cycles: u64) -> u64
+    if hz == 0
+        return 0
+    let secs: u64 = cycles / hz
+    let rem: u64 = cycles % hz
+    return secs * NS_PER_SEC + rem * NS_PER_SEC / hz
+
+# The TSC value `us` microseconds after `now`, saturating at u64 max.
+pub fn tsc_deadline(now: u64, hz: u64, us: u64) -> u64
+    let cycles: u64 = tsc_cycles_for_us(hz, us)
+    if cycles > U64_MAX - now
+        return U64_MAX
+    return now + cycles
+
+pub fn tsc_deadline_passed(now: u64, deadline: u64) -> bool
+    return now >= deadline

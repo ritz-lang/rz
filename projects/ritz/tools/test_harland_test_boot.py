@@ -22,6 +22,8 @@ log, so they need no QEMU, kernel or ISO build. The verdicts they pin:
   * the initramfs QEMU boots is the one mkinitramfs.py built from the
     userspace packages, never a blank disk, and nothing is left under build/
     for a later run to boot instead;
+  * the TSC is calibrated: the log names a measured frequency, not the
+    uncalibrated fallback guess (#4181);
   * a missing tool is a SETUP ERROR (exit 3, ci_local's EXIT_SETUP), not a
     regression.
 
@@ -80,7 +82,9 @@ with open(os.environ["STUB_LOG"], "a") as f:
 """
 
 BANNER = r"    Hello from Harland!\n  [..] Initial filesystem"
-LOADED = r"[initramfs] Loaded 27 files from disk\n"
+# The calibrated TSC frequency kernel_main logs before APs start (#4181).
+TSC = r"[tsc] 2304.186 MHz (PIT), not invariant\n"
+LOADED = TSC + r"[initramfs] Loaded 27 files from disk\n"
 # The default -smp 4 starts 3 APs, and every one must come up (#4184).
 APS = r"  [OK] Boot APs (3 APs started)\n"
 PASSED = APS + r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
@@ -264,6 +268,30 @@ def test_the_ap_count_follows_smp_and_plug_cpu(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     qemu = [line for line in _stub_log(tree).splitlines() if line.startswith("qemu ")][-1]
     assert "-machine q35" in qemu and "-device Haswell-v1-x86_64-cpu,socket-id=1,core-id=0,thread-id=0" in qemu, qemu
+
+
+# --- the TSC is calibrated (#4181) ---------------------------------------------
+
+
+@pytest.mark.integration
+def test_good_boot_names_the_tsc_frequency(tree):
+    r = _run(tree, BANNER + LOADED + PASSED)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "[tsc] 2304.186 MHz (PIT)" in r.stdout
+
+
+@pytest.mark.integration
+def test_no_tsc_line_fails(tree):
+    r = _run(tree, BANNER + LOADED.replace(TSC, "") + PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "no calibrated TSC frequency" in r.stdout
+
+
+@pytest.mark.integration
+def test_uncalibrated_tsc_fails(tree):
+    guess = r"[tsc] 6000.000 MHz (uncalibrated guess), not invariant\n"
+    r = _run(tree, BANNER + LOADED.replace(TSC, guess) + PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
 
 
 # --- the initramfs is the real one --------------------------------------------

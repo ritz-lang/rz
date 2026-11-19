@@ -14,6 +14,7 @@
 # skipped (#4184).
 
 import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult }
+import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import serial { prints, serial_print_dec, serial_print_hex }
 import mm.pmm { Mb2BootInfo, HarlandBootInfo, pmm_alloc_page }
 import mm.vmm { vmm_pml4_phys, vmm_map_page, PTE_WRITABLE, PTE_CACHE_DISABLE }
@@ -370,15 +371,6 @@ fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8) -> i32
     let icr_lo: u32 = (vector as u32) | ((delivery_mode as u32) << 8)
     return lapic_send_icr(dest_apic, icr_lo)
 
-# Delay in microseconds (rough, using busy loop)
-fn delay_us(us: u32) -> i32
-    # Very rough delay - assumes ~1GHz CPU
-    var i: u32 = 0
-    while i < us * 100
-        cpu_pause()
-        i = i + 1
-    return 0
-
 # AP entry point (called by ap_trampoline.s after transition to long mode)
 pub fn ap_entry() -> i32
     # Follow the BSP into x2APIC mode before touching our LAPIC
@@ -470,11 +462,10 @@ fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
     lapic_send_ipi(apic_id, sipi_vector, IPI_DELIVERY_SIPI)
     delay_us(200)
 
-    # Wait for AP to start (with timeout)
-    var timeout: u32 = 1000
-    while cpu_map_started(cpu_idx) == 0 && timeout > 0
-        delay_us(1000)
-        timeout = timeout - 1
+    # Wait up to 1 s for the AP to start
+    let deadline: u64 = deadline_after_us(1000000)
+    while cpu_map_started(cpu_idx) == 0 && not deadline_passed(deadline)
+        cpu_pause()
 
     if cpu_map_started(cpu_idx) != 0
         prints(" OK\n")

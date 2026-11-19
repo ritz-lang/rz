@@ -33,6 +33,7 @@
 #                       CPU=Haswell-v1,+x2apic boots an AP with APIC ID 256
 #
 # Every CPU -smp starts must come up: the log must say "(N-1 APs started)".
+# The TSC must be calibrated: the log must say "[tsc] N.NNN MHz (source)" (#4181).
 #
 # Exit: 0 = pass; 1 = the boot failed (panic, exception, failed suite, no
 #       verdict before the timeout, or a failed build); 3 = a required tool
@@ -165,5 +166,13 @@ if [ -n "$NCPUS" ]; then
     fi
     echo "PASS (bios): all $((NCPUS - 1)) APs started (-smp $SMP, -cpu $CPU)"
 fi
+# Every kernel wait is a deadline on the calibrated TSC (#4181): the boot must
+# log a measured frequency, not the uncalibrated fallback guess.
+tsc=$(grep -aoE "\[tsc\] [0-9]+\.[0-9]{3} MHz \([^)]*\)" "$SERIAL_LOG" | head -1)
+if [ -z "$tsc" ] || [[ "$tsc" == *uncalibrated* ]]; then
+    echo "FAIL (bios): no calibrated TSC frequency in the log (got: ${tsc:-nothing})"
+    exit 1
+fi
+echo "PASS (bios): $tsc"
 echo "PASS (bios): init Tier-1 suite: ALL TESTS PASSED"
 exit 0

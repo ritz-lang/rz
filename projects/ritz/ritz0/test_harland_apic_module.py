@@ -36,10 +36,11 @@ MOVED_FNS = [
     "pic_remap", "pic_disable",
     "lapic_read", "lapic_write", "lapic_id", "lapic_eoi", "lapic_init", "lapic_send_ipi",
     "ioapic_read", "ioapic_write", "ioapic_set_irq", "ioapic_init",
-    "get_ap_stack_top", "delay_us", "ap_entry", "ap_setup_trampoline",
+    "get_ap_stack_top", "ap_entry", "ap_setup_trampoline",
     "ap_boot_one", "ap_boot_all", "apic_init_with_mb", "apic_init_from_bootinfo",
 ]
 # ap_started moved on to arch/x86_64/cpu_map.ritz (#1883: test_harland_cpu_map.py).
+# delay_us moved on to arch/x86_64/tsc.ritz, calibrated (#4181: test_harland_tsc.py).
 # ap_stacks became ap_stack_tops, one PMM page per AP (#4184).
 MOVED_VARS = ["ap_stack_tops", "ap_count", "bsp_apic_id"]
 MOVED_CONST_PREFIXES = ("LAPIC_", "IOAPIC_", "IPI_DELIVERY_", "AP_TRAMPOLINE_ADDR")

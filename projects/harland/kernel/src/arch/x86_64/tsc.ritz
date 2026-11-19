@@ -1,0 +1,178 @@
+# Harland's clock: the TSC, calibrated once (AGAST #4181).
+#
+# Every kernel wait is a deadline on this module's delay_us() /
+# deadline_after_us(), never a count of pause instructions or loop
+# iterations (those ran as long as the CPU happened to be slow).
+#
+# Calibration order (tsc_calibrate):
+#   1. CPUID 0x15 when it names the crystal (exact; Intel Skylake+ hardware).
+#   2. PIT channel 2 over a ~10 ms gate, best of three (any PC, QEMU, OVMF).
+#   3. CPUID 0x16 base MHz (nominal; for machines without a PIT).
+#   4. TSC_FALLBACK_HZ, a guess high enough that waits err long.
+# Invariant TSC (CPUID 0x80000007 EDX[8]) is checked and logged; without it
+# the TSC may change rate with P-states, so waits are only approximately
+# right, which is still better than pause counts.
+#
+# The LAPIC timer calibration (#3629) shares this: measure the LAPIC
+# count over a delay_us() window, or scale from tsc_hz().
+#
+# The arithmetic is in tsc_calc.ritz, host-tested by
+# projects/ritz/ritz0/test_harland_tsc.py.
+
+import io { inb, outb, rdtsc, cpuid, CpuidResult, cpu_pause }
+import serial { prints, serial_print_dec }
+import arch.x86_64.tsc_calc {
+    PIT_GATE_TICKS, TSC_FALLBACK_HZ,
+    tsc_hz_from_pit, tsc_hz_from_cpuid15, tsc_hz_from_cpuid16, tsc_hz_plausible,
+    tsc_cycles_to_ns, tsc_deadline, tsc_deadline_passed
+}
+
+# PIT ports: channel 2 data, mode/command, and the NMI status/control port
+# (bit 0 gates channel 2, bit 1 drives the speaker, bit 5 reads OUT2).
+const PIT_CH2_DATA: u16 = 0x42
+const PIT_COMMAND: u16 = 0x43
+const PORT_61: u16 = 0x61
+const PORT_61_GATE2: u8 = 0x01
+const PORT_61_SPEAKER: u8 = 0x02
+const PORT_61_OUT2: u8 = 0x20
+# Channel 2, lobyte/hibyte, mode 0 (interrupt on terminal count), binary.
+const PIT_CH2_MODE0: u8 = 0xB0
+# A gate that never ends means no PIT: give up after this many port reads
+# (a read of port 0x61 costs ~1 us, so this is seconds, not the 10 ms gate).
+const PIT_MAX_POLLS: u64 = 10000000
+const PIT_RUNS: u32 = 3
+
+const SOURCE_NONE: u8 = 0
+const SOURCE_CPUID15: u8 = 1
+const SOURCE_PIT: u8 = 2
+const SOURCE_CPUID16: u8 = 3
+const SOURCE_FALLBACK: u8 = 4
+
+var tsc_hz_value: u64 = 0
+var tsc_source: u8 = 0
+var tsc_invariant_flag: u8 = 0
+
+# One PIT channel 2 gate: TSC Hz, or 0 when the gate never ends.
+fn pit_measure() -> u64
+    let saved: u8 = inb(PORT_61)
+    # Gate channel 2 on, speaker off
+    outb(PORT_61, (saved & (0xFF ^ PORT_61_SPEAKER)) | PORT_61_GATE2)
+    # Mode 0: OUT2 drops when the command is written, rises at terminal count
+    outb(PIT_COMMAND, PIT_CH2_MODE0)
+    outb(PIT_CH2_DATA, (PIT_GATE_TICKS & 0xFF) as u8)
+    outb(PIT_CH2_DATA, ((PIT_GATE_TICKS >> 8) & 0xFF) as u8)
+    let start: u64 = rdtsc()
+    var polls: u64 = 0
+    while (inb(PORT_61) & PORT_61_OUT2) == 0
+        polls = polls + 1
+        if polls > PIT_MAX_POLLS
+            outb(PORT_61, saved)
+            return 0
+    let end: u64 = rdtsc()
+    outb(PORT_61, saved)
+    return tsc_hz_from_pit(end - start, PIT_GATE_TICKS)
+
+# Best of PIT_RUNS gates. An SMI or a descheduled vCPU only ever lengthens a
+# gate, so the lowest plausible result is the truest.
+fn pit_calibrate() -> u64
+    var best: u64 = 0
+    var run: u32 = 0
+    while run < PIT_RUNS
+        let hz: u64 = pit_measure()
+        if tsc_hz_plausible(hz) and (best == 0 or hz < best)
+            best = hz
+        run = run + 1
+    return best
+
+fn print_hz(hz: u64)
+    serial_print_dec(hz / 1000000)
+    prints(".")
+    let khz: u64 = (hz / 1000) % 1000
+    if khz < 100
+        prints("0")
+    if khz < 10
+        prints("0")
+    serial_print_dec(khz)
+    prints(" MHz")
+
+# Calibrate the TSC (once; later calls return the stored value) and log it.
+pub fn tsc_calibrate() -> u64
+    if tsc_hz_value != 0
+        return tsc_hz_value
+
+    let max_leaf: u32 = cpuid(0).eax
+    let max_ext: u32 = cpuid(0x80000000).eax
+    if max_ext >= 0x80000007
+        if (cpuid(0x80000007).edx & (1 << 8)) != 0
+            tsc_invariant_flag = 1
+
+    var hz: u64 = 0
+    if max_leaf >= 0x15
+        let r: CpuidResult = cpuid(0x15)
+        hz = tsc_hz_from_cpuid15(r.eax, r.ebx, r.ecx)
+        if tsc_hz_plausible(hz)
+            tsc_source = SOURCE_CPUID15
+        else
+            hz = 0
+    if hz == 0
+        hz = pit_calibrate()
+        if hz != 0
+            tsc_source = SOURCE_PIT
+    if hz == 0 and max_leaf >= 0x16
+        hz = tsc_hz_from_cpuid16(cpuid(0x16).eax)
+        if tsc_hz_plausible(hz)
+            tsc_source = SOURCE_CPUID16
+        else
+            hz = 0
+    if hz == 0
+        hz = TSC_FALLBACK_HZ
+        tsc_source = SOURCE_FALLBACK
+    tsc_hz_value = hz
+
+    prints("[tsc] ")
+    print_hz(hz)
+    if tsc_source == SOURCE_CPUID15
+        prints(" (CPUID 0x15)")
+    else if tsc_source == SOURCE_PIT
+        prints(" (PIT)")
+    else if tsc_source == SOURCE_CPUID16
+        prints(" (CPUID 0x16 base)")
+    else
+        prints(" (uncalibrated guess)")
+    if tsc_invariant_flag != 0
+        prints(", invariant\n")
+    else
+        prints(", not invariant\n")
+    return hz
+
+# TSC frequency in Hz (calibrating on first use).
+pub fn tsc_hz() -> u64
+    if tsc_hz_value == 0
+        return tsc_calibrate()
+    return tsc_hz_value
+
+pub fn tsc_invariant() -> bool
+    tsc_hz()
+    return tsc_invariant_flag != 0
+
+# Nanoseconds since the TSC started counting (power-on or reset).
+pub fn time_ns() -> u64
+    let hz: u64 = tsc_hz()
+    return tsc_cycles_to_ns(hz, rdtsc())
+
+# The TSC value `us` microseconds from now; poll with deadline_passed.
+pub fn deadline_after_us(us: u64) -> u64
+    let hz: u64 = tsc_hz()
+    return tsc_deadline(rdtsc(), hz, us)
+
+pub fn deadline_passed(deadline: u64) -> bool
+    return tsc_deadline_passed(rdtsc(), deadline)
+
+# Busy-wait at least `us` microseconds.
+pub fn delay_us(us: u64)
+    let deadline: u64 = deadline_after_us(us)
+    while not deadline_passed(deadline)
+        cpu_pause()
+
+pub fn delay_ms(ms: u64)
+    delay_us(ms * 1000)

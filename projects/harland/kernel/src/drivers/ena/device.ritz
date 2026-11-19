@@ -6,6 +6,7 @@
 # Reference: https://github.com/amzn/amzn-drivers
 
 import io
+import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import serial { prints, serial_print_hex, serial_print_dec, serial_write_byte }
 import drivers.pci { PciDevice, pci_find_ena, pci_enable_bus_master, pci_enable_memory }
 import drivers.ena.regs {
@@ -64,6 +65,7 @@ const ENA_RX_BUFFER_COUNT: u32 = 8   # Reduced for initial testing
 const ENA_TX_BUFFER_COUNT: u32 = 8   # Reduced for initial testing
 
 const ENA_ADMIN_TIMEOUT_US: u32 = 3000000   # 3 seconds
+const ENA_READY_TIMEOUT_US: u64 = 1000000   # 1 second
 const ENA_RESET_TIMEOUT_MS: u32 = 1000
 
 # Local constants to avoid module access issues
@@ -216,26 +218,20 @@ fn ena_get_reset_timeout(dev: *EnaDevice) -> u32
 
 # Wait for reset state to match expected value
 fn ena_wait_for_reset_state(dev: *EnaDevice, expected_state: u32, timeout_100ms: u32) -> i32
-    # Convert 100ms units to iterations (roughly 100k loops per 100ms)
-    var max_iterations: u64 = (timeout_100ms as u64) * 100000
-    if max_iterations < 1000000
-        max_iterations = 1000000  # Minimum ~1 second
+    # The device's reset timeout (100 ms units), at least 1 second
+    var timeout_us: u64 = (timeout_100ms as u64) * 100000
+    if timeout_us < 1000000
+        timeout_us = 1000000
+    let deadline: u64 = deadline_after_us(timeout_us)
 
-    var iterations: u64 = 0
-    while iterations < max_iterations
+    while not deadline_passed(deadline)
         let status: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
         let reset_in_progress: u32 = status & ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK
 
         if reset_in_progress == expected_state
             return 0
 
-        # Simple delay loop with some volatility to prevent optimization
-        var delay: u32 = 0
-        while delay < 100
-            cpu_pause()
-            delay = delay + 1
-
-        iterations = iterations + 1
+        cpu_pause()
 
     return -1  # Timeout
 
@@ -295,8 +291,8 @@ fn ena_device_reset(dev: *EnaDevice, reason: u8) -> i32
     return 0
 
 fn ena_wait_for_ready(dev: *EnaDevice) -> i32
-    var timeout: u32 = 0
-    while timeout < 10000
+    let deadline: u64 = deadline_after_us(ENA_READY_TIMEOUT_US)
+    while not deadline_passed(deadline)
         let status: u32 = ena_read32(dev, ENA_REGS_DEV_STS_OFF)
         if (status & ENA_REGS_DEV_STS_READY_MASK) != 0
             return 0
@@ -304,11 +300,7 @@ fn ena_wait_for_ready(dev: *EnaDevice) -> i32
         if (status & ENA_REGS_DEV_STS_FATAL_ERROR_MASK) != 0
             prints("[ena] ERROR: Device fatal error\n")
             return -1
-        # Simple delay
-        var i: u32 = 0
-        while i < 10000
-            i = i + 1
-        timeout = timeout + 1
+        delay_us(10)
 
     prints("[ena] ERROR: Device not ready (timeout)\n")
     return -1
@@ -508,8 +500,8 @@ fn ena_admin_submit_cmd(dev: *EnaDevice, cmd: *EnaAdminAqEntry) -> u16
 fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
     let aq: *EnaAdminQueue = @(*dev).admin_queue
 
-    var timeout: u32 = 0
-    while timeout < 100000
+    let deadline: u64 = deadline_after_us(ENA_ADMIN_TIMEOUT_US as u64)
+    while not deadline_passed(deadline)
         # Read memory barrier before checking completion
         read_barrier()
 
@@ -550,7 +542,6 @@ fn ena_admin_wait_completion(dev: *EnaDevice, cmd_id: u16) -> i32
 
         # Pause to avoid hammering the bus
         cpu_pause()
-        timeout = timeout + 1
 
     prints("[ena] Admin command timeout (cmd_id=")
     serial_print_dec(cmd_id as u64)
