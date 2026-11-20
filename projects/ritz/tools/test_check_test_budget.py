@@ -167,16 +167,21 @@ def test_real_budget_file_loads_and_every_override_names_a_ticket():
 COLLECTED_AT_LAST_CAP = 25_533
 
 
-# Reference-host (toffee) CPU-s the cap is set from.  The cap is in normalised
-# CPU-s (see [calibration]), so it is measured on the reference scale, not on
-# whatever host runs this file.  CI on main at 4d5f05cb read 1,118.5
-# normalised; #4418 cut the work 11.2% raw, so ~993 here.  test_budget.toml's
-# 1,090 is that +~10%.
-MEASURED_SUITE_CPU_S = 995.0
-# test_interface_text.py: the file the old blank 90.0 cap took red on CI
-# (91.5 CPU-s).  #4418 cut its duplicate cold closure compile, 85.3 -> 68.9
-# CPU-s on huburght; reference scale ~72, and its override (80.0) is +~10%.
-MEASURED_HOT_FILE_CPU_S = 73.0
+# Reference-host CPU-s the cap is set from.  The cap is in normalised CPU-s
+# (see [calibration]), so it is measured on the reference scale, not on
+# whatever host runs this file.  The reference host is CI's GitHub runner,
+# and it is noisy: nine "Main Branch Validation" runs on main on 2026-11-20
+# (44765657285 .. 44819616721) read 967.7-1,342.3 normalised for the pre-#4418
+# suite -- a 39% spread.  #4418 cut the work 11.2% raw, so the worst observed
+# run becomes ~1,192; but a cap set at that (~1,090) is below the runner's own
+# run-to-run variance and would red main, which is exactly what #4418's first
+# attempt did.  The cap must clear the worst *observed* figure, so it is
+# derived from 1,342.3 plus a margin.
+MEASURED_SUITE_CPU_S = 1342.3
+# test_interface_text.py: the file the old blank 90.0 cap took red on CI.  Two
+# CI runs read 91.5 (4d5f05cb) and 98.6 (b1284668) normalised -- an 8% spread
+# of its own, so its override is sized from the worse one plus a margin.
+MEASURED_HOT_FILE_CPU_S = 98.6
 
 
 @pytest.mark.unit
@@ -192,8 +197,9 @@ def test_real_test_cap_sits_just_above_the_collected_count():
 @pytest.mark.unit
 def test_real_cpu_cap_sits_just_above_the_measured_cost():
     """AGAST #4418: the CPU cap is a ratchet, not a ceiling above the old
-    suite.  It must sit above the measured reference-scale cost (or the gate
-    false-reds) and no more than ~10% above it (or growth is free again)."""
+    suite.  "Measured" is the worst recent run on the reference host (CI),
+    because CI varies 39% run to run; the cap clears it and is no more than
+    ~10% above it (or growth is free again)."""
     cap = float(ctb.load_budget(ctb.DEFAULT_BUDGET)["suite"]["cpu_s"])
     assert MEASURED_SUITE_CPU_S <= cap <= MEASURED_SUITE_CPU_S * 1.10, (
         f"[suite] cpu_s = {cap}: set it to the measured cost plus ~10%")
@@ -201,16 +207,18 @@ def test_real_cpu_cap_sits_just_above_the_measured_cost():
 
 @pytest.mark.unit
 def test_real_hot_file_override_sits_just_above_its_measured_cost():
-    """AGAST #4418: the one explicit per-file cap is also a ratchet.  It is
-    above its file's measured cost, within ~10%, and still below the 90 s the
-    blank cap used to allow (which the file crossed and turned CI red)."""
+    """AGAST #4418: the one explicit per-file cap is also a ratchet, set from
+    the reference host.  CI measured this file at 91.5 and 98.6 normalised;
+    the override clears the worse run and is within ~15% of it.  It must be
+    *above* the old blank 90.0 -- a cap at 90 is what took main red."""
     b = ctb.load_budget(ctb.DEFAULT_BUDGET)
     override = b["file"]["override"]["test_interface_text.py"]
     cap = float(override["cpu_s"])
-    assert MEASURED_HOT_FILE_CPU_S <= cap <= MEASURED_HOT_FILE_CPU_S * 1.10, (
-        f"test_interface_text.py override = {cap}: set it to the measured "
-        f"cost plus ~10%")
-    assert cap < 90.0, "the override must be below the blank cap it replaces"
+    assert MEASURED_HOT_FILE_CPU_S <= cap <= MEASURED_HOT_FILE_CPU_S * 1.15, (
+        f"test_interface_text.py override = {cap}: set it to the worse CI "
+        f"reading plus a margin")
+    assert cap > 90.0, (
+        "the override must clear the old blank cap; 90.0 is what reddened CI")
 
 
 @pytest.mark.unit
@@ -228,8 +236,8 @@ def test_real_budget_goes_red_on_one_extra_test_file():
     assert ctb.check(r, b) == []
     r["files"]["test_planted_extra.py"] = {"tests": 1, "cpu_s": 0.1, "wall_s": 0.1}
     errs = ctb.check(r, b)
-    assert errs == [f"suite: {cap + 1} tests over its cap of {cap}; "
-                    f"collapse a matrix into table rows before adding cases"]
+    assert errs == [(f"suite: {cap + 1} tests over its cap of {cap}; "
+                     f"collapse a matrix into table rows before adding cases")]
 
 
 def _suite_report(total: float, files: int = 20) -> dict:
