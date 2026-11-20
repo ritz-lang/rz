@@ -30,9 +30,11 @@
 #                                       HELD, and restack the later trains'
 #                                       cars on train k-1's tail
 #   train.sh pending                    the train to gate: GATE now, or
-#                                       WAIT <s> (8 cars, or 60 s with no
-#                                       new car); FAIL: a red train with
-#                                       nothing below it to bisect
+#                                       WAIT (8 cars, or 60 s with no new
+#                                       car on the first train; a train
+#                                       behind a gating one buffers to 8);
+#                                       FAIL: a red train with nothing
+#                                       below it to bisect
 #   train.sh land [<log>]               push the tail of the train <log>
 #                                       passed (train k) to main, landing
 #                                       trains 1..k and cancelling their
@@ -129,11 +131,15 @@
 # (their bases hold its cars): their gates are stopped, and their cars are
 # rebuilt on train k-1's tail.  A pass still lands every train below it.
 #
-# Dispatch (AGAST #4031, SKILL.md "Merge trains"): `build` stamps each train
-# it starts with BUILT=<epoch>, and each REAP is a rebuild, so BUILT is the
-# last car's arrival.  `pending` says GATE for a train with 8 cars or none
-# new for RZ_TRAIN_DEBOUNCE seconds, else WAIT <seconds left>.  `gate` marks
-# train 1 GATED=<log>, so a train already gating is never pending.
+# Dispatch (AGAST #4031, #4156; Aaron 2026-11-20; SKILL.md "Merge trains"):
+# `build` stamps each train it starts with BUILT=<epoch>, and each REAP is a
+# rebuild, so BUILT is the last car's arrival.  The first train (nothing
+# gating below it) gates at 8 cars or after RZ_TRAIN_DEBOUNCE seconds with no
+# new car, else WAIT.  A train stacked behind a gating one does not spend a
+# second slot early: it buffers to 8 cars before GATE, and WAITs until then.
+# The whole stack is gated at its tip, so a full buffered train gates every
+# car below it at once.  `gate` marks the gated train GATED=<log> (or a
+# remote SPEC=<host> ...), so a train already gating is never pending.
 #
 # Deepest train first (AGAST #4156): a pass of train k lands trains 1..k
 # (#4151), so gating a shorter prefix while a deeper train is built only
@@ -1096,9 +1102,12 @@ cmd_fail() {
 #                                                bisect: bisect its cars
 # The deepest train gates at 8 cars, or once RZ_TRAIN_DEBOUNCE seconds pass
 # after its last car boarded (its BUILT=, stamped by each build); a state
-# with no BUILT= (built before #4031) gates now.  A bisect prefix gates at
-# once: no car boards it.  <command> is `train.sh gate` for train 1 (this
-# host), else `train.sh gate --next` (the first host with a free slot).
+# with no BUILT= (built before #4031) gates now.  A train with another train
+# GATING below it skips the debounce and buffers to 8 cars: it takes no
+# second slot until it is full (Aaron, 2026-11-20), so the next train is
+# gated as a whole rather than car by car.  A bisect prefix gates at once:
+# no car boards it.  <command> is `train.sh gate` for train 1 (this host),
+# else `train.sh gate --next` (the first host with a free slot).
 cmd_pending() {
     local q st n built left now cmd
     mapfile -t q < <(queue)
@@ -1113,11 +1122,23 @@ cmd_pending() {
     use_slot "${q[$((TGT - 1))]}"; st="$(state)"
     now="$(date +%s)"
     n="$(field ITEM "$st" | wc -l)"; built="$(field BUILT "$st")"
+    # A train stacked behind a gating one buffers to MAX before it spends a
+    # second slot (Aaron, 2026-11-20).  Only the first train -- nothing
+    # gating below it -- uses the debounce.
+    local below=0 q2=() i
+    mapfile -t q2 < <(queue)
+    for ((i = 0; i < TGT - 1; i++)); do
+        use_slot "${q2[$i]}"
+        if [[ -n "$(field GATED "$(state)")" || -n "$(field SPEC "$(state)")" ]]; then below=1; break; fi
+    done
+    use_slot "${q[$((TGT - 1))]}"
     if [[ $TGT -eq 1 ]]; then cmd="train.sh gate"; else cmd="train.sh gate --next"; fi
     if [[ $REASON != deepest ]]; then
         echo "GATE train $TGT n=$n ($REASON): $cmd"
     elif [[ $n -ge $MAX ]]; then
         echo "GATE train $TGT n=$n (full): $cmd"
+    elif [[ $below -eq 1 ]]; then
+        echo "WAIT train $TGT n=$n (buffer to $MAX: a train below is gating)"
     elif [[ ! "$built" =~ ^[0-9]+$ ]] || (( (left = built + DEBOUNCE - now) <= 0 )); then
         echo "GATE train $TGT n=$n (no new car for ${DEBOUNCE}s): $cmd"
     else

@@ -756,20 +756,25 @@ This is also how Borque's conductor works.
   gates, nothing below it gates; cars that arrive stack a new deepest train
   behind it, which gates next. A shorter prefix (train 1, 2, ...) gates
   **only to bisect a red deeper gate** (step 6).
-- **Dispatch (Aaron, 2026-11-18, AGAST #4031):** (a) a train that reaches 8
-  cars is gated at once, on any host with a free train slot. (b) A train
-  that cars are boarding waits for more: 60 s after its last car (each new
-  car restarts the 60 s), then it gates, or at once at 8. That holds for a
-  new train 1 (no train building when a car arrives) and for the train
-  stacking behind the gating ones alike. `train.sh pending` applies the
-  rule and deepest-first; just run it after each `build` and act on its
-  line (at most one): `GATE train <k> ...: <command>` (run that command:
-  `train.sh gate` for train 1, `train.sh gate --next` for the rest; a
-  bisect prefix says `(bisect red train <r>)` and gates at once), `WAIT
-  train <k> n=<cars> <s>s` (schedule a wakeup for that many seconds and run
-  `pending` again; a REAP that arrives meanwhile is a `build --next`, which
-  restarts the wait), or `FAIL train <r> ...: train.sh fail <log>` (step
-  6). A train that is gating is never listed.
+- **Dispatch (Aaron, 2026-11-18, AGAST #4031; revised 2026-11-20):**
+  (a) a train that reaches 8 cars is gated at once, on any host with a free
+  train slot. (b) **The first train** — nothing gating below it — waits for
+  more: 60 s after its last car (each new car restarts the 60 s), then it
+  gates. (c) **A train stacked behind a gating one does not spend a second
+  slot early:** it buffers to 8 cars and only then gates, so the next train
+  is gated as a whole rather than car by car. Its `pending` line is a plain
+  `WAIT` with no seconds; re-run `pending` when the gating train lands or a
+  car boards (both rebuild it). When the gating train lands, the buffered
+  train becomes train 1 and gates on its (long-expired) window.
+  `train.sh pending` applies the rule and deepest-first; just run it after
+  each `build` and act on its line (at most one): `GATE train <k> ...:
+  <command>` (run that command: `train.sh gate` for train 1, `train.sh gate
+  --next` for the rest; a bisect prefix says `(bisect red train <r>)` and
+  gates at once), `WAIT train <k> n=<cars> <s>s` (schedule a wakeup for that
+  many seconds and run `pending` again), `WAIT train <k> n=<cars> (buffer to
+  8: a train below is gating)` (no timer: the train below's verdict or a new
+  car will wake you), or `FAIL train <r> ...: train.sh fail <log>` (step 6).
+  A train that is gating is never listed.
 - **A car conflicts** (e.g. ABCD is in the train, E arrives, and E conflicts
   with C): bounce E to its room with the exact commit to rebase onto, the
   tail (D's train SHA), not `main`. The room resolves the conflict on D,

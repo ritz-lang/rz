@@ -1009,6 +1009,13 @@ bash "$TR" build "qa1:$c1" "qa2:$c2" "qa3:$c3" >/dev/null 2>&1
 has "$(bash "$TR" pending)" "^WAIT train 1 n=3 (59|60)s$" "another car restarts the window"
 log1="$(bash "$TR" gate)"
 [[ -z "$(bash "$TR" pending)" ]] && ok "a gating train is not pending" || bad "a gating train is not pending"
+# A train stacked behind a gating one buffers to 8: it takes no second slot
+# for a partly-filled train, so the whole next train is gated at once
+# (Aaron, 2026-11-20).
+c9="$(room qb9 s/qb9 X)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build --next "qb9:$c9" >/dev/null 2>&1
+eq "$(bash "$TR" pending)" "WAIT train 2 n=1 (buffer to 8: a train below is gating)" \
+    "a train behind a gating one buffers to 8 instead of gating"
 items=(); for i in 0 1 2 3 4 5 6 7; do items+=("qb$i:$(room "qb$i" "s/qb$i" "Q$i")"); done
 fetch; git -C "$M" checkout -q main
 bash "$TR" build --next "${items[@]}" >/dev/null 2>&1
