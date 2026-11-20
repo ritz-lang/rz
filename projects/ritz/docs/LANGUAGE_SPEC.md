@@ -5754,7 +5754,9 @@ binding that still owns a value of that type when the binding's scope ends:
   after a temporary that is still pending drops before that temporary, and
   a temporary the `return` itself creates drops before every binding
   declared earlier (AGAST #4304);
-- on `break` and `continue`, for every binding declared inside the loop body;
+- on `break` and `continue`, for every binding declared inside the loop body
+  and every temporary the statement they leave still has pending, innermost
+  first, as on `return` (AGAST #4387);
 - on assignment to the binding, for the old value, before the new value is
   stored.
 

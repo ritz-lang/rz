@@ -1138,6 +1138,78 @@ pub fn main() -> i32
     return ORDER
 """, 21, {}),
 
+    # A `break` that leaves a statement whose temporary is still pending
+    # drops that temporary too, innermost first: the arm binding `t` (id 2)
+    # before the statement's `make(1)` (id 1), so DROPS is 2 and ORDER 21
+    # (AGAST #4387; LANGUAGE_SPEC §13.6).
+    "break_before_pending_temp": (SLOT + """\
+fn pick(id: i32) -> Slot
+    Slot.Full(make(id + 1))
+
+fn f() -> i32
+    var i: i32 = 0
+    while i < 1
+        i = i + 1
+        match pick(make(1).id)
+            Full(t) =>
+                break
+            _ =>
+                pass
+    return DROPS * 100 + ORDER
+
+pub fn main() -> i32
+    f()
+    return DROPS * 100 + ORDER
+""", 221, {}),
+
+    # The same shape through `continue` (AGAST #4387).
+    "continue_before_pending_temp": (SLOT + """\
+fn pick(id: i32) -> Slot
+    Slot.Full(make(id + 1))
+
+fn f() -> i32
+    var i: i32 = 0
+    while i < 1
+        i = i + 1
+        match pick(make(1).id)
+            Full(t) =>
+                continue
+            _ =>
+                pass
+    return DROPS * 100 + ORDER
+
+pub fn main() -> i32
+    f()
+    return DROPS * 100 + ORDER
+""", 221, {}),
+
+    # A `defer` registered after the statement's temporary runs before it
+    # drops, but the arm binding and the temporary still go innermost first:
+    # the deferred `make(3)`, then `t` (id 2), then `make(1)` (id 1), so
+    # ORDER is 321 (DROPS 3).  DROPS * 10 + ORDER / 100 keeps it small
+    # (a process exit status is mod 256) while telling 33 from the 32 that
+    # dropping the temporary before the defer would give (AGAST #4387).
+    "defer_before_pending_temp": (SLOT + """\
+fn pick(id: i32) -> Slot
+    Slot.Full(make(id + 1))
+
+fn f() -> i32
+    var i: i32 = 0
+    while i < 1
+        i = i + 1
+        match pick(make(1).id)
+            Full(t) =>
+                defer make(3)
+                break
+            _ =>
+                pass
+    return DROPS * 10 + ORDER / 100
+
+pub fn main() -> i32
+    f()
+    return DROPS * 10 + ORDER / 100
+""", 33, {}),
+
     # Plain copies: `a` stays usable after every copy, and nothing drops.
     "plain_struct_copy": ("""\
 fn take(p: Plain) -> i32

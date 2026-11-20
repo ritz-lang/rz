@@ -345,6 +345,8 @@ pub fn own_init(s: *EmitterState)
     o.scope_cap = OWN_INIT_CAP
     o.seq_next = 0
     o.loop_base = -1
+    o.loop_tbase = malloc((OWN_INIT_CAP as i64) * 4) as *i32
+    o.loop_tcap = OWN_INIT_CAP
     o.ret_seq = 0
     o.has_drop = 0 - 1
     o.temp_exprs = malloc((OWN_INIT_CAP as i64) * 8) as **Expr
@@ -363,6 +365,7 @@ pub fn own_init(s: *EmitterState)
     o.fa_mask = 0
     o.defer_stmts = malloc((OWN_INIT_CAP as i64) * 8) as **Stmt
     o.defer_pos = malloc((OWN_INIT_CAP as i64) * 4) as *i32
+    o.defer_tpos = malloc((OWN_INIT_CAP as i64) * 4) as *i32
     o.defer_ret = malloc((OWN_INIT_CAP as i64) * 4) as *i32
     o.defer_count = 0
     o.defer_cap = OWN_INIT_CAP
@@ -1065,6 +1068,13 @@ pub fn own_loop_enter(s: *EmitterState) -> i32
         o.loop_dcap = dcap
     let ld: *i32 = o.loop_dstart
     ld[o.loop_depth] = o.defer_count
+    # AGAST #4387: the temporaries a `break` / `continue` must drop too.
+    if o.loop_depth >= o.loop_tcap
+        let tcap: i32 = o.loop_tcap * 2
+        o.loop_tbase = realloc(o.loop_tbase as *u8, (tcap as i64) * 4) as *i32
+        o.loop_tcap = tcap
+    let lt: *i32 = o.loop_tbase
+    lt[o.loop_depth] = o.temp_count
     old
 
 # After the loop body (its scope already popped).
@@ -1074,7 +1084,8 @@ pub fn own_loop_exit(s: *EmitterState, old: i32)
     o.loop_base = old
 
 # Before a `break` (is_continue 0) / `continue` (1) branches out of the
-# loop body: drop the body's bindings, running its deferred statements.
+# loop body: drop the body's bindings and pending temporaries, running its
+# deferred statements, innermost first (AGAST #2158, #4387).
 pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
     let o: *OwnState = s.own
     if o.loop_base < 0
@@ -1084,10 +1095,14 @@ pub fn own_loop_jump(s: *EmitterState, is_continue: i32)
     # AGAST #1625: the body's deferred statements run first.
     let ld: *i32 = o.loop_dstart
     let dbase: i32 = ld[o.loop_depth]
-    if o.defer_count > dbase
-        own_unwind(s, o.loop_base, dbase)
-    else if o.live_count > o.loop_base
+    # AGAST #4387: the statement's pending temporaries leave with it too,
+    # innermost first.
+    let lt: *i32 = o.loop_tbase
+    let tbase: i32 = lt[o.loop_depth]
+    if o.temp_count <= tbase and o.defer_count <= dbase
         own_drop_from(s, o.loop_base)
+    else
+        own_unwind_loop(s, o.loop_base, dbase, tbase)
 
 # =============================================================================
 # Temporaries (AGAST #2165)
@@ -2670,6 +2685,7 @@ fn own_grow_defers(o: *OwnState)
     let cap: i32 = o.defer_cap * 2
     o.defer_stmts = realloc(o.defer_stmts as *u8, (cap as i64) * 8) as **Stmt
     o.defer_pos = realloc(o.defer_pos as *u8, (cap as i64) * 4) as *i32
+    o.defer_tpos = realloc(o.defer_tpos as *u8, (cap as i64) * 4) as *i32
     o.defer_ret = realloc(o.defer_ret as *u8, (cap as i64) * 4) as *i32
     o.defer_cap = cap
 
@@ -2724,6 +2740,40 @@ fn own_unwind(s: *EmitterState, from: i32, dfrom: i32)
             own_emit_drop(s, own_live_at(o, i))
             i -= 1
 
+# A `break` / `continue` leaving the loop body (AGAST #4387): as own_unwind,
+# but the pending temporaries temps[tfrom..] drop with the bindings, newest
+# first by seq, so the arm binding `t` drops before the statement's older
+# temporary (§13.6's innermost-first rule).  A deferred statement runs before
+# a temporary when it was registered after it (defer_tpos), as it does for a
+# binding (defer_pos).
+fn own_unwind_loop(s: *EmitterState, from: i32, dfrom: i32, tfrom: i32)
+    let o: *OwnState = s.own
+    var i: i32 = o.live_count - 1
+    var t: i32 = o.temp_count - 1
+    var j: i32 = o.defer_count - 1
+    while i >= from or t >= tfrom or j >= dfrom
+        var run: i32 = 0
+        if j >= dfrom
+            run = 1
+            let pos: *i32 = o.defer_pos
+            if i >= from and pos[j] <= i
+                run = 0
+            let tpos: *i32 = o.defer_tpos
+            if t >= tfrom and tpos[j] <= t
+                run = 0
+        if run == 1
+            own_run_defer(s, j)
+            j -= 1
+            # The deferred statements may have consumed (lent) a temporary.
+            if t >= o.temp_count
+                t = o.temp_count - 1
+        else if t >= tfrom and (i < from or own_temp_at(o, t).seq > own_live_at(o, i).seq)
+            own_emit_drop(s, own_temp_at(o, t))
+            t -= 1
+        else
+            own_emit_drop(s, own_live_at(o, i))
+            i -= 1
+
 # Called by emit_str as a `ret` starts: every block is being left.  With a
 # `defer` registered, run them all, innermost first, with the drops they
 # interleave with; the live temporaries (the `return` / `?` / tail
@@ -2758,8 +2808,10 @@ pub fn own_defer(s: *EmitterState, d: *Stmt, ret_type: i32)
     own_grow_defers(o)
     let ds: **Stmt = o.defer_stmts
     let pos: *i32 = o.defer_pos
+    let tpos: *i32 = o.defer_tpos
     let rets: *i32 = o.defer_ret
     ds[o.defer_count] = d
     pos[o.defer_count] = o.live_count
+    tpos[o.defer_count] = o.temp_count
     rets[o.defer_count] = ret_type
     o.defer_count = o.defer_count + 1
