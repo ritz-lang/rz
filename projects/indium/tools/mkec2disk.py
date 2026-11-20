@@ -12,11 +12,10 @@ end, FAT32, holding
     /harland/initramfs.tar    BOOTX64.EFI hands it to the kernel (AGAST #4253)
     /startup.nsh              the UEFI shell fallback
 
-Task rooms have no sudo (the "no new privileges" flag), and dosfstools lives
-in /usr/sbin, off a room's PATH. harland's inventory/esp_image.py writes the
-GPT and the FAT32 in pure Python, but only 8.3 names, and `initramfs.tar` is
-not one. So esp_image lays out the disk with the 8.3 files, and mtools'
-`mcopy` (which writes long names) adds /harland at the partition's offset.
+Task rooms have no sudo (the "no new privileges" flag), no mtools and no
+dosfstools (which lives in /usr/sbin, off a room's PATH). harland's
+inventory/esp_image.py writes the GPT and the FAT32 in pure Python, long
+names included, so the whole disk is built here without a helper binary.
 
 The image is built under a temporary name and renamed into place only when
 every step succeeded, so make never sees a half-written disk as up to date.
@@ -25,8 +24,6 @@ every step succeeded, so make never sees a half-written disk as up to date.
 from __future__ import annotations
 
 import argparse
-import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -44,17 +41,9 @@ def build(out: Path, efi: Path, kernel: Path, initramfs: Path, size_mib: int = 1
     esp_image.build_image(tmp, {
         "EFI/BOOT/BOOTX64.EFI": Path(efi).read_bytes(),
         "STARTUP.NSH": STARTUP_NSH,
+        "harland/kernel.elf": Path(kernel).read_bytes(),
+        "harland/initramfs.tar": Path(initramfs).read_bytes(),
     }, size_mib=size_mib)
-    target = f"{tmp}@@{esp_image.PART_START * esp_image.SECTOR}"
-    env = dict(os.environ, MTOOLS_SKIP_CHECK="1")
-    try:
-        subprocess.run(["mmd", "-i", target, "::/harland"], check=True, env=env)
-        for src, name in ((kernel, "kernel.elf"), (initramfs, "initramfs.tar")):
-            subprocess.run(["mcopy", "-i", target, str(src), f"::/harland/{name}"],
-                           check=True, env=env)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
     tmp.replace(out)
 
 

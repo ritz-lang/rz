@@ -9,9 +9,11 @@ README.TXT. HWINV.EFI writes its dump to \\INVENTORY\\<timestamp>\\ on the
 same partition; `extract` copies everything back out on any host.
 
 Pure Python on purpose: no mtools, dosfstools (/usr/sbin, off a room's
-PATH), losetup or root. The writer only takes upper-case 8.3 names, which is
-all the image needs; the reader also follows long-name (LFN) entries and the
-NT lower-case flags, since the firmware's FAT driver writes both.
+PATH), losetup or root. The writer takes long names: each is stored with a
+long-file-name (LFN) entry over a generated, collision-free upper-case 8.3
+alias, so callers keep mixed case and names longer than 8.3. The reader
+follows LFN entries and the NT lower-case flags, since the firmware's FAT
+driver writes both.
 
 Usage:
     esp_image.py build OUT.img --efi HWINV.EFI [--size-mib N]
@@ -64,13 +66,86 @@ def _sectors_per_cluster(part_sectors):
     return 64
 
 
-def _short_name(name):
-    base, _, ext = name.partition(".")
-    if (not base or len(base) > 8 or len(ext) > 3 or "." in ext
-            or name != name.upper()
-            or any(c not in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-~" for c in base + ext)):
-        raise ValueError(f"not an upper-case 8.3 name: {name!r}")
-    return base.ljust(8).encode() + ext.ljust(3).encode()
+_SHORT_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-~")
+_BAD_NAME_CHARS = frozenset('"*/:<>?\\|') | {chr(c) for c in range(32)}
+
+
+def _valid_name(name):
+    """One path component: a FAT long name, without separators or controls."""
+    if not name or name in (".", ".."):
+        raise ValueError(f"bad file name: {name!r}")
+    if name != name.strip() or name.endswith("."):
+        raise ValueError(f"leading or trailing space, or trailing dot: {name!r}")
+    if len(name) > 255:
+        raise ValueError(f"name longer than FAT's 255 characters: {name!r}")
+    if any(c in _BAD_NAME_CHARS for c in name):
+        raise ValueError(f"character not allowed in a FAT name: {name!r}")
+
+
+def _short_alias(name, used):
+    """An unused upper-case 8.3 alias (11 bytes) for the long name `name`."""
+    base, _, ext = name.rpartition(".") if "." in name else (name, "", "")
+
+    def clean(s):
+        return "".join(c if c in _SHORT_CHARS else "_" for c in s.upper())
+
+    base, ext = clean(base) or "FILE", clean(ext)
+    plain = (base[:8].ljust(8) + ext[:3].ljust(3)).encode("ascii")
+    if len(base) <= 8 and len(ext) <= 3 and plain not in used:
+        return plain
+    for n in range(1, 1000):
+        tag = f"~{n}"
+        alias = (base[:8 - len(tag)] + tag).ljust(8) + ext[:3].ljust(3)
+        alias = alias.encode("ascii")
+        if alias not in used:
+            return alias
+    raise ValueError(f"too many colliding 8.3 aliases for {name!r}")
+
+
+def _decode_short(name11):
+    """The name an 8.3 entry spells when read without its LFN entries."""
+    base = name11[:8].decode("latin-1").rstrip(" ")
+    ext = name11[8:].decode("latin-1").rstrip(" ")
+    return base + ("." + ext if ext else "")
+
+
+def _lfn_count(name):
+    """How many 32-byte LFN entries `name` needs (13 UTF-16 units each)."""
+    units = len(name.encode("utf-16-le")) // 2
+    return -(-units // 13)
+
+
+def _lfn_checksum(name11):
+    s = 0
+    for b in name11:
+        s = (((s & 1) << 7) | (s >> 1)) + b
+        s &= 0xFF
+    return s
+
+
+def _lfn_entries(name, name11):
+    """`name`'s LFN entries, highest sequence number first (on-disk order)."""
+    data = name.encode("utf-16-le")
+    chars = [data[i:i + 2] for i in range(0, len(data), 2)]
+    chunks = [chars[i:i + 13] for i in range(0, len(chars), 13)]
+    checksum = _lfn_checksum(name11)
+    out = []
+    for seq in range(len(chunks), 0, -1):
+        part = chunks[seq - 1]
+        slots = list(part)
+        if seq == len(chunks) and len(part) < 13:
+            slots.append(b"\x00\x00")          # the name's terminator
+        slots += [b"\xff\xff"] * (13 - len(slots))
+        raw = b"".join(slots)                  # 13 units, 26 bytes
+        e = bytearray(32)
+        e[0] = seq | (0x40 if seq == len(chunks) else 0)
+        e[1:11] = raw[0:10]
+        e[11] = 0x0F                           # ATTR_LONG_NAME
+        e[13] = checksum
+        e[14:26] = raw[10:22]
+        e[28:32] = raw[22:26]
+        out.append(bytes(e))
+    return out
 
 
 def _dirent(name11, attr, cluster, size):
@@ -149,15 +224,29 @@ def _tree(files):
     root = {}
     for path, data in files.items():
         parts = path.strip("/").split("/")
+        for p in parts:
+            _valid_name(p)
         node = root
         for p in parts[:-1]:
-            _short_name(p)
             node = node.setdefault(p, {})
             if not isinstance(node, dict):
                 raise ValueError(f"{path}: a file is in the way")
-        _short_name(parts[-1])
+        if parts[-1] in node:
+            raise ValueError(f"{path}: duplicate name")
         node[parts[-1]] = bytes(data)
     return root
+
+
+def _dir_bytes(node, root):
+    """Room for node's own entry plus the most LFN ones any child needs.
+
+    Every child is budgeted as 1 + its LFN entries even when an 8.3 name
+    needs none, so a collision-bumped alias can never overrun the cluster.
+    """
+    count = 1 if root else 2              # the volume label, or "." and ".."
+    for name in node:
+        count += 1 + _lfn_count(name)
+    return count * 32
 
 
 def _write_dir(fs, node, cluster, parent):
@@ -168,25 +257,29 @@ def _write_dir(fs, node, cluster, parent):
     else:
         entries.append(_dirent(b".          ", 0x10, cluster, 0))
         entries.append(_dirent(b"..         ", 0x10, 0 if parent == 2 else parent, 0))
+    used = set()
     for name in sorted(node):
         child = node[name]
+        name11 = _short_alias(name, used)
+        used.add(name11)
+        if _decode_short(name11) != name:
+            entries.extend(_lfn_entries(name, name11))
         if isinstance(child, dict):
-            nbytes = (len(child) + 2) * 32
-            first, _ = fs.alloc(nbytes)
-            entries.append(_dirent(_short_name(name), 0x10, first, 0))
+            first, _ = fs.alloc(_dir_bytes(child, root=False))
+            entries.append(_dirent(name11, 0x10, first, 0))
             _write_dir(fs, child, first, cluster)
         else:
             first = fs.alloc(len(child))[0] if child else 0
             if child:
                 fs.put(first, child)
-            entries.append(_dirent(_short_name(name), 0x20, first, len(child)))
+            entries.append(_dirent(name11, 0x20, first, len(child)))
     fs.put(cluster, b"".join(entries))
 
 
 def _fat_partition(part_sectors, files):
     fs = _Fat32(part_sectors)
     tree = _tree(files)
-    fs.alloc((len(tree) + 1) * 32)        # the root directory: cluster 2
+    fs.alloc(_dir_bytes(tree, root=True))  # the root directory: cluster 2
     _write_dir(fs, tree, 2, None)
     return fs.render()
 
@@ -203,7 +296,7 @@ def _gpt_header(my_lba, alt_lba, entries_lba, last_usable, entries_crc):
 
 def build_image(out, files, size_mib=64):
     """Write a GPT + FAT32 ESP image of size_mib MiB holding `files`
-    ({"EFI/BOOT/BOOTX64.EFI": bytes, ...}; upper-case 8.3 names only)."""
+    ({"EFI/BOOT/BOOTX64.EFI": bytes, ...}; long names get LFN entries)."""
     total = size_mib * 1024 * 1024 // SECTOR
     last_lba = total - 1
     last_usable = last_lba - 1 - GPT_ENTRY_SECTORS

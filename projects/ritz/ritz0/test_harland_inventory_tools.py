@@ -174,9 +174,44 @@ def test_reader_follows_long_names_and_lowercase_83_names(stick, tmp_path):
     assert files["INVENTORY/20261119-060203/acpi/smbios_entry_point"] == src.read_bytes()
 
 
-def test_build_rejects_names_that_are_not_83(tmp_path):
+def test_writer_stores_long_names_as_lfn_entries(tmp_path):
+    """AGAST #4359: the EC2 disk needs mixed-case names and `initramfs.tar`,
+    none of which is upper-case 8.3. The writer emits LFN entries over
+    generated aliases (the smbios path needs more than one), and the reader
+    returns every name exactly as written."""
+    img = tmp_path / "long.img"
+    files = {
+        "EFI/BOOT/BOOTX64.EFI": b"MZ",
+        "harland/kernel.elf": b"\x7fELF" + b"k" * 5000,
+        "harland/initramfs.tar": b"t" * 5000,
+        "INVENTORY/20261119-060203/acpi/smbios_entry_point": b"long",
+    }
+    esp_image.build_image(img, files, size_mib=48)
+    assert esp_image.read_files(img) == files
+
+
+def test_a_directory_spanning_clusters_keeps_every_long_name(tmp_path):
+    """512-byte clusters hold 16 entries; 20 names of three LFN entries each
+    overrun the first cluster, so the writer must budget LFN entries, not
+    just one entry per name, or the tail lands on another file's cluster."""
+    img = tmp_path / "many.img"
+    files = {f"logs/session-{i:03d}-diagnostics.txt": bytes([i]) for i in range(20)}
+    esp_image.build_image(img, files, size_mib=48)
+    assert esp_image.read_files(img) == files
+
+
+def test_lfn_aliases_do_not_collide(tmp_path):
+    img = tmp_path / "collide.img"
+    files = {"initramfs-one.tar": b"one", "initramfs-two.tar": b"two",
+             "KERNEL.ELF": b"upper", "boot/initrd.img": b"lower"}
+    esp_image.build_image(img, files, size_mib=48)
+    assert esp_image.read_files(img) == files
+
+
+@pytest.mark.parametrize("bad", ["EFI/BOOT/bad*name.efi", "name.", "name ", "a/b:c", ""])
+def test_build_rejects_invalid_names(tmp_path, bad):
     with pytest.raises(ValueError):
-        esp_image.build_image(tmp_path / "x.img", {"EFI/BOOT/bootx64.efi.old": b""})
+        esp_image.build_image(tmp_path / "x.img", {bad: b""})
 
 
 def test_bigger_sticks_get_bigger_clusters(tmp_path):

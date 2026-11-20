@@ -228,10 +228,17 @@ cleanup() {
         snaps=$(aws_ ec2 describe-snapshots --owner-ids self \
             --filters "Name=tag:RunId,Values=$RUN_ID" \
             --query 'Snapshots[].SnapshotId' --output text)
-        for s in $(echo "$SNAPSHOT_ID $snaps" | tr ' \t' '\n\n' | sort -u); do
+        # tr maps each character in SET1 to the one at the same position in
+        # SET2 (a short SET2 repeats its last character), so one '\n' turns
+        # both the space and the tab into newlines.
+        for s in $(echo "$SNAPSHOT_ID $snaps" | tr ' \t' '\n' | sort -u); do
             [ "$s" = None ] && continue
-            aws_ ec2 delete-snapshot --snapshot-id "$s" && echo "deleted $s" \
-                || { echo "run.sh: LEAK: snapshot $s not deleted" >&2; RC=5; }
+            if aws_ ec2 delete-snapshot --snapshot-id "$s"; then
+                echo "deleted $s"
+            else
+                echo "run.sh: LEAK: snapshot $s not deleted" >&2
+                RC=5
+            fi
         done
     fi
     step summary
