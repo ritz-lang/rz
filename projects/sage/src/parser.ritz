@@ -273,17 +273,83 @@ fn is_assignment_op(typ: TokenType) -> i32
     0
 
 # =============================================================================
+# Arrow Functions
+# =============================================================================
+
+# Is the `(` at the cursor the parameter list of an arrow function?
+# Scans to the matching `)` and checks whether `=>` follows. This keeps a
+# parenthesised expression (`(a + b) * 2`) a parenthesised expression.
+fn is_arrow_param_list(p: @&Parser) -> i32
+    var depth: i64 = 0
+    var i: i64 = p.pos
+    let n = vec_len<Token>(@p.tokens)
+    while i < n
+        let t = vec_get<Token>(@p.tokens, i)
+        if t.typ == TokenType.LParen
+            depth = depth + 1
+        else if t.typ == TokenType.RParen
+            depth = depth - 1
+            if depth == 0
+                let next = i + 1
+                if next < n
+                    let nt = vec_get<Token>(@p.tokens, next)
+                    if nt.typ == TokenType.Arrow
+                        return 1
+                return 0
+        i = i + 1
+    0
+
+# Parse the body of an arrow function whose parameters are already collected.
+# `x => expr` and `x => { ... }` both land here; the `is_expr_body` flag tells
+# the interpreter whether to evaluate the body as an expression or run it.
+fn parse_arrow_body(p: @&Parser, params: @Vec<i64>, start_tok: Token) -> i64
+    var is_expr_body: i32 = 1
+    var body: i64 = NO_CHILD
+    if parser_check(p, TokenType.LBrace) == 1
+        is_expr_body = 0
+        body = parse_block(p)
+    else
+        body = parse_expression(p, PREC_ASSIGN)
+
+    let params_count = vec_len<i64>(params)
+    let params_start = ast_add_children(@&p.ast, params)
+    let end_pos = parser_current(p).start
+    let node = ast_arrow(params_start, params_count, body, is_expr_body, start_tok.start, end_pos, start_tok.line, start_tok.column)
+    ast_add_node(@&p.ast, node)
+
+# Parse `(a, b) => body`.
+fn parse_arrow_paren(p: @&Parser) -> i64
+    let start_tok = parser_expect(p, TokenType.LParen)
+    var params: Vec<i64> = vec_new<i64>()
+
+    while parser_check(p, TokenType.RParen) == 0 and parser_is_eof(p) == 0
+        let param_tok = parser_expect(p, TokenType.Identifier)
+        let param_node = ast_identifier(param_tok.start, param_tok.length, param_tok.start, param_tok.start + param_tok.length, param_tok.line, param_tok.column)
+        let param_idx = ast_add_node(@&p.ast, param_node)
+        vec_push<i64>(@&params, param_idx)
+
+        if parser_check(p, TokenType.RParen) == 0
+            parser_expect(p, TokenType.Comma)
+
+    parser_expect(p, TokenType.RParen)
+    parser_expect(p, TokenType.Arrow)
+    parse_arrow_body(p, @params, start_tok)
+
+# =============================================================================
 # Primary Expression Parsing
 # =============================================================================
 
 # Parse a primary expression: a literal, identifier, array or object
-# literal, function expression or parenthesised expression. Elements,
-# values and the parenthesised expression are full expressions.
+# literal, function expression, arrow function or parenthesised expression.
+# Elements, values and the parenthesised expression are full expressions.
 fn parse_atom(p: @&Parser) -> i64
     let tok = parser_current(p)
 
-    # Parenthesised expression (so `-(a + b)` and `!(x)` parse too)
+    # Arrow function with a parenthesised parameter list: `(a, b) => ...`.
+    # Everything else beginning with `(` stays a parenthesised expression.
     if tok.typ == TokenType.LParen
+        if is_arrow_param_list(p) == 1
+            return parse_arrow_paren(p)
         parser_advance(p)
         let inner = parse_expression(p, PREC_COMMA)
         parser_expect(p, TokenType.RParen)
@@ -336,9 +402,16 @@ fn parse_atom(p: @&Parser) -> i64
         let node = ast_this(tok.start, tok.start + tok.length, tok.line, tok.column)
         return ast_add_node(@&p.ast, node)
 
-    # Identifier
+    # Identifier, or a single-parameter arrow function (`x => ...`)
     if tok.typ == TokenType.Identifier
         parser_advance(p)
+        if parser_check(p, TokenType.Arrow) == 1
+            parser_advance(p)
+            var params: Vec<i64> = vec_new<i64>()
+            let param_node = ast_identifier(tok.start, tok.length, tok.start, tok.start + tok.length, tok.line, tok.column)
+            let param_idx = ast_add_node(@&p.ast, param_node)
+            vec_push<i64>(@&params, param_idx)
+            return parse_arrow_body(p, @params, tok)
         let node = ast_identifier(tok.start, tok.length, tok.start, tok.start + tok.length, tok.line, tok.column)
         return ast_add_node(@&p.ast, node)
 

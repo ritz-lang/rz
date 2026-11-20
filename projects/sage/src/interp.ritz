@@ -1384,6 +1384,12 @@ fn eval_function_expr(it: @&Interp, idx: i64) -> Value
     declare(it, s, 1, name.str_start, name.str_len, f, 1)
     f
 
+# An arrow function closes over the current scope. Its body and parameters
+# live on the node itself (see call_function); unlike a named function
+# expression it does not introduce a name binding.
+fn eval_arrow_expr(it: @&Interp, idx: i64) -> Value
+    make_function(it, idx, it.scope)
+
 fn eval_logical(it: @&Interp, node: *AstNode) -> Value
     let op = node.int_value
     let left = eval(it, node.child1)
@@ -1621,7 +1627,22 @@ fn call_function(it: @&Interp, f: Value, args: @Vec<Value>, callee: i64) -> Valu
     let saved = it.scope
     it.scope = scope
     it.depth = it.depth + 1
-    let body = node_at(it, fnode.child2)
+
+    # An arrow with an expression body returns that value; `ast_arrow` stores
+    # the body in child1 and the expression/block flag in bool_value.
+    if fnode.tag == AstTag.ArrowFunction and fnode.bool_value == 1
+        let value = eval(it, fnode.child1)
+        it.depth = it.depth - 1
+        it.scope = saved
+        if it.ctl == CTL_THROW
+            return v_undef()
+        return value
+
+    # Block-bodied arrows keep their body in child1; declarations use child2.
+    var body_idx = fnode.child2
+    if fnode.tag == AstTag.ArrowFunction
+        body_idx = fnode.child1
+    let body = node_at(it, body_idx)
     exec_list(it, body.children_start, body.children_count)
     it.depth = it.depth - 1
     it.scope = saved
@@ -1695,6 +1716,8 @@ fn eval(it: @&Interp, idx: i64) -> Value
         return eval_array(it, idx)
     if tag == AstTag.FunctionExpr
         return eval_function_expr(it, idx)
+    if tag == AstTag.ArrowFunction
+        return eval_arrow_expr(it, idx)
     throw_unsupported(it, ast_node_type_name(tag))
     v_undef()
 
