@@ -681,28 +681,6 @@ fn emit_self_value(s: *EmitterState, p: *Param, recv: i32) -> i32
 #   store <payload-llvm-type> %v, ptr %pp                  ; scalars at own width
 #   %r = load %Result$T, ptr %a
 # See emitter_match.ritz for the consumer side (extract tag, load payload).
-pub fn is_variant_carrier(name: *u8, name_len: i32) -> i32
-    if name_len == 4
-        # "Some"
-        if *name == 83 and *(name + 1) == 111 and *(name + 2) == 109 and *(name + 3) == 101
-            return 1
-    if name_len == 2
-        # "Ok"
-        if *name == 79 and *(name + 1) == 107
-            return 1
-    return 0
-
-pub fn is_variant_null(name: *u8, name_len: i32) -> i32
-    if name_len == 4
-        # "None"
-        if *name == 78 and *(name + 1) == 111 and *(name + 2) == 110 and *(name + 3) == 101
-            return 1
-    if name_len == 3
-        # "Err"
-        if *name == 69 and *(name + 1) == 114 and *(name + 2) == 114
-            return 1
-    return 0
-
 # Resolve the enum name to alloca for a variant constructor.  Prefers an
 # explicit context set by emit_var_decl for `let r: Result<_,_> = Ok(x)`
 # bindings; falls back to the enclosing function's return type (which covers
@@ -733,63 +711,10 @@ pub fn resolve_enum_ctx(s: *EmitterState, out_name: **u8, out_len: *i32) -> i32
     *out_len = 0
     return 0
 
-# The ImplBlock whose methods hold `f`, or null.
-pub fn impl_of_method(m: *Module, f: *FnDef) -> *ImplBlock
-    var ib: *ImplBlock = m.impls
-    while ib != null
-        var method: *FnDef = ib.methods
-        while method != null
-            if method == f
-                return ib
-            method = method.next
-        ib = ib.next
-    null
-
-# AGAST #3260: R10's free call `C_get(c)` of a method whose receiver is a bare
-# `self:&`.  That receiver names no type: the method path and emit_impl_method
-# take it from the ImplBlock, so the free call had none to give its argument,
-# and emitted `call @C_get(% ..)`.  Here it's `f` with that receiver spelled
-# `self:& C`, C the impl's, and lent as a `c:& C` param is, as ritz0 reads it:
-# `C_get(c)` borrows c, and a temporary or a `let` is refused.  Any other `f`
-# is itself.  A generic impl's instance is already named (name_untyped_self).
-#
-# AGAST #3278: a typed `self:& C`, and so a generic instance's bare `self:&`
-# once name_untyped_self has named it, is lent the same way.  It's a
-# TYPE_MUT_REF without is_borrow (Param.is_self_borrow), which ref_check's
-# ref_args and call_check's ca_borrow read as an `@&C` slot: `C_bump(c)` was "a value
-# doesn't fit a reference slot".  ref_value.ritz (Sema) calls this for the free call too.
+# The EmitterState form of ast_query's lent_self_call_view_in (AGAST #4391:
+# the pure part moved to ast_query, this wrapper stays here).
 pub fn lent_self_call_view(s: *EmitterState, f: *FnDef) -> *FnDef
     lent_self_call_view_in(s.module, f)
-
-# lent_self_call_view over the module `m`: Sema's too (AGAST #4011).
-pub fn lent_self_call_view_in(m: *Module, f: *FnDef) -> *FnDef
-    if f == null or f.params == null
-        return f
-    let p: *Param = f.params
-    if param_is_self(p) == 0 or p.is_self_borrow == 0 or p.is_borrow == 1
-        return f
-    var typed: i32 = 0
-    if p.param_type == TYPE_MUT_REF and p.param_type_name_len > 0
-        typed = 1
-    if typed == 0 and (p.param_type != TYPE_STRUCT or p.param_type_name_len > 0)
-        return f
-    var ib: *ImplBlock = null
-    if typed == 0
-        ib = impl_of_method(m, f)
-        if ib == null
-            return f
-    let lent: *Param = malloc(sizeof(Param)) as *Param
-    memcpy(lent as *u8, p as *u8, sizeof(Param))
-    if typed == 0
-        lent.param_type = TYPE_MUT_REF
-        lent.param_pointee_type = TYPE_STRUCT
-        lent.param_type_name = ib.type_name
-        lent.param_type_name_len = ib.type_name_len
-    lent.is_borrow = 1
-    let view: *FnDef = malloc(sizeof(FnDef)) as *FnDef
-    memcpy(view as *u8, f as *u8, sizeof(FnDef))
-    view.params = lent
-    view
 
 # Emit one call argument with the enum context its parameter dictates
 # (AGAST #1498).  `p` is the matching callee Param, or null when unknown.
@@ -1188,15 +1113,6 @@ fn emit_array_ptr_arg_copy(s: *EmitterState, value: *Expr, loc: *LocalVar, slot:
         return
     emit_local_array_copy(s, p.param_array_size, p.param_array_elem_type, p.param_type_name, p.param_type_name_len, emit_load_ptr(s, loc.reg), slot)
 
-# 1 when `p` takes an array by address: `a:& [N]T`, `a: @[N]T`, `a: @&[N]T`.
-# `*[N]T` doesn't: ritz0 refuses `g(a)` there.
-pub fn param_takes_array_ref(p: *Param) -> i32
-    if p.param_type != TYPE_REF and p.param_type != TYPE_MUT_REF
-        return 0
-    if p.param_pointee_type == TYPE_ARRAY
-        return 1
-    0
-
 # 1 when `arg` came back from emit_call_arg as an address, for `@&T` param `p` of
 # a cascade that otherwise leaves its value alone.
 fn param_takes_addr_value(s: *EmitterState, arg: *Expr, p: *Param) -> i32
@@ -1494,59 +1410,6 @@ fn eprint_arg_type_error(call: *Expr, fname: *u8, flen: i32, argno: i32)
         eprint_char(*(fname + i))
     eprints_cstr(c"` has the wrong type: ")
 
-# 1 when `p` is a `Span<T>`: emit_expr_call builds one from a local array.
-pub fn param_is_span(p: *Param) -> i32
-    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 4
-        return 0
-    return (memcmp(p.param_type_name, c"Span$", 5) == 0) as i32
-
-# AGAST #2290: every dimension of an array, for comparing one with the array a
-# reference param points at.  `leaf` is what the innermost dimension holds.
-pub struct ArrayDims
-    rank: i32
-    dims: [8]i32
-    leaf: i32
-    name: *u8
-    name_len: i32
-
-# What ref_arg_dims can say about an argument.
-pub const ARG_DIMS_UNKNOWN: i32 = 0
-pub const ARG_DIMS_ARRAY: i32 = 1
-pub const ARG_DIMS_NOT_ARRAY: i32 = 2
-
-pub fn array_dims_1d(out: *ArrayDims, size: i32, elem: i32, name: *u8, name_len: i32) -> i32
-    out.rank = 1
-    out.dims[0] = size
-    out.leaf = elem
-    out.name = name
-    out.name_len = name_len
-    ARG_DIMS_ARRAY
-
-# The array left of `sh` once `from` indices are applied.  With none left it's
-# an element.
-pub fn array_dims_nd(out: *ArrayDims, sh: *ArrayShape, from: i32) -> i32
-    if from >= sh.rank
-        return ARG_DIMS_NOT_ARRAY
-    out.rank = sh.rank - from
-    var i: i32 = 0
-    while i < out.rank
-        out.dims[i] = sh.dims[from + i]
-        i = i + 1
-    out.leaf = sh.leaf_type
-    out.name = sh.leaf_name
-    out.name_len = sh.leaf_name_len
-    ARG_DIMS_ARRAY
-
-pub fn array_dims_match(a: *ArrayDims, b: *ArrayDims) -> i32
-    if a.rank != b.rank
-        return 0
-    var i: i32 = 0
-    while i < a.rank
-        if a.dims[i] != b.dims[i]
-            return 0
-        i = i + 1
-    return array_elem_types_match(a.leaf, a.name, a.name_len, b.leaf, b.name, b.name_len)
-
 # What the place `value` holds: its array's dimensions in `out`, or that it's no
 # array, or ARG_DIMS_UNKNOWN when ritz1 can't tell from here.  Emits nothing.
 fn place_array_dims(s: *EmitterState, value: *Expr, out: *ArrayDims) -> i32
@@ -1607,13 +1470,6 @@ fn ref_arg_dims(s: *EmitterState, arg: *Expr, out: *ArrayDims) -> i32
                     return ARG_DIMS_UNKNOWN
                 return ARG_DIMS_NOT_ARRAY
     return place_array_dims(s, arg, out)
-
-# The array `p`, an `@[N]T` or the like, points at.
-pub fn param_pointee_dims(out: *ArrayDims, p: *Param)
-    if p.param_pointee_array_shape != null
-        array_dims_nd(out, p.param_pointee_array_shape, 0)
-    else
-        array_dims_1d(out, p.param_pointee_array_size, p.param_pointee_array_elem_type, p.param_type_name, p.param_type_name_len)
 
 # Fill `out` when `arg` is a whole 1-D array, as a place or an inline field.
 pub fn arg_array_shape(s: *EmitterState, arg: *Expr, out: *ArraySrc) -> i32

@@ -8,6 +8,13 @@
 # and the check modules import this module; emitter_core `pub import`s it, so
 # an emitter module still reaches every one of them through emitter_core.
 #
+# #4319 and #4391 moved more of the pure half here, so the Checks modules that
+# read it (enum_as_int, literal_slot, call_check, own_check, ref_value) import
+# no emitter module: the data-only `LocalVar`, `OwnPath` and `ArrayDims` types
+# the Sema side builds an image of a local in, and the pure helpers that fill
+# or read them (array dimensions, local placement, struct pointer levels, the
+# variant-constructor queries).  Nothing here reads or holds an EmitterState.
+#
 # Nothing here may import an emitter* or sema* module
 # (tools/test_ritz1_emitter_check_freeze.py).
 
@@ -16,6 +23,7 @@ import ritzlib.io
 import ritzlib.memory
 import ritzlib.hash       # fnv1a_str (struct_map_find)
 import ritzlib.hashmap    # HashMapI64
+import ritzlib.str        # memcmp (array_elem_types_match, param_is_span)
 
 import ast
 import types
@@ -560,3 +568,475 @@ pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name: *u8, len: i32,
         return null
     *out_len = e_end - e_start
     return name + e_start
+
+# =============================================================================
+# The local and ownership-path images the Sema-side checks read (AGAST #4391)
+# =============================================================================
+#
+# LocalVar is the emitter's record of a local; ref_check builds the image of one
+# for a Sema binding (rs_default_loc, ref_local_in), and the checks type their
+# places from it (call_check, own_check, ref_value).  OwnPath is what
+# own_check reads from ownership through that image.  The two structs and the
+# variant-constructor queries lived in emitter_core / emitter_expr_call (#4376,
+# #4391); moved here so those Checks modules import no emitter module.  This is
+# data only: no EmitterState, no Sema.  #3514 deletes the side channels the
+# image itself is made of.
+
+struct LocalVar
+    name: *u8
+    name_len: i32
+    reg: i32
+    var_type: i32
+    type_name: *u8       # Struct name when var_type == TYPE_STRUCT
+    type_name_len: i32
+    pointee_type: i32    # Element type for pointers (e.g., TYPE_U8 for *u8)
+    array_size: i32      # Array size when var_type == TYPE_ARRAY
+    array_elem_type: i32 # Element type when var_type == TYPE_ARRAY
+    # AGAST #1521: 1 for a local declared `: bool`. emit_var_decl stores bools
+    # in an i64 slot and records var_type TYPE_I64, so this is the only place
+    # that remembers the declared type (print interpolation prints a bool as
+    # true/false).
+    is_bool: i32
+    # AGAST #2341: T for a local `[N]*T`; TYPE_VOID otherwise.
+    array_elem_pointee: i32
+    # AGAST #2342: 1 for an unannotated `let x = init` whose init bool_kind can't
+    # type.  var_type then says nothing: the parser defaulted it to TYPE_I64.
+    bk_unsure: i32
+    # AGAST #4280: 1 for a pattern binding bool_note_binding knows is a pointer
+    # (`Some(p)` of an `Option<*T>`): its slot is an i64, so var_type can't say.
+    # bk_unsure stays 1 for it, as the checks reading that flag expect.
+    bk_ptr: i32
+    # AGAST #1671: signature of a `fn(...) -> T`-typed local or param (null
+    # otherwise); emit_call uses it for `call <ret> %f(<params>)`.
+    fn_sig: *FnDef
+    # AGAST #1815: innermost pointee of a `**T` local/param (TYPE_U8 for
+    # `**u8`); TYPE_VOID otherwise.  pointee_type is TYPE_PTR for every **T.
+    inner_pointee_type: i32
+    # AGAST #2028: 1 for a `let` binding (set by emit_stmt from
+    # Stmt.var_is_let).  add_local_full clears it, so a `var`, param, range loop
+    # or match binding that shadows a `let` is mutable.  A `for x in <iterable>`
+    # binding is a `let`, as in ritz0 (AGAST #2389).  See let_check.ritz.
+    is_let: i32
+    # AGAST #2399: Param.param_inner_ref / Stmt.var_inner_ref.
+    inner_ref: i32
+    # AGAST #1953: for a `*[N]T` local or param (pointee_type == TYPE_ARRAY),
+    # N and T; 0 / TYPE_VOID otherwise.  A struct T is named by type_name.
+    # Read by emit_array_field_copy_from for `x.f = *src`.
+    pointee_array_size: i32
+    pointee_array_elem_type: i32
+    pointee_array_elem_pointee: i32   # AGAST #2343: U for `*[N]*U`
+    # AGAST #2543: S for a `*[N]S` / `**[N]S` local, and (#2548) a `*[N]S`,
+    # `@[N]S` or `@&[N]S` param.  Not type_name: that makes `p.f` and `(*r).f` a
+    # `*S`'s field.  And (#2553) a `**[N]S` param.
+    pointee_array_elem_name: *u8
+    pointee_array_elem_name_len: i32
+    # AGAST #1509: every dimension of a `var g: [N][M]..T` local (array_size
+    # and array_elem_type then hold N and TYPE_ARRAY); null otherwise.
+    array_shape: *ArrayShape
+    # AGAST #2570: for a pointer to a plane of an N-D array (an inferred
+    # `let q = @x[i]` leaving `[M][N]..T`, or a copy of one), that
+    # `[M][N]..T`; null otherwise.  pointee_array_size holds the flat count
+    # M*N.., so `q + k` strides whole planes; nd_index_shape reads this one,
+    # so `q[i][j]` is one GEP over it from q's value (emit_nd_index_ptr).
+    pointee_array_shape: *ArrayShape
+    # AGAST #2995: what a `var a: [N]T` local's element is (Stmt.var_array); null
+    # otherwise.  Its ptr_array says what a `*[M]T` element points at.
+    array_rec: *ArrayElem
+    # AGAST #2250: 1 for a `name:& T` param whose T is an integer, a struct or
+    # an array (#2279), which ritz0's `_borrow_referent_slot` covers.  `@&T`
+    # params stay 0.  add_local_full clears it: the next function reuses these
+    # entries.
+    # An integer T binds as a plain T local (bind_scalar_borrow_param), as a
+    # bool or float T does without is_lent (#2994, #1668), and any other T
+    # reads as the pointer, so the slot a value goes to decides what to
+    # do; see emit_lent_referent and lent_array_local.
+    is_lent: i32
+    # AGAST #2286: 1 for a `:&` param whose slot holds the borrow's pointer, so
+    # the place `@x` names is behind that pointer, not the slot.  Not is_lent:
+    # that covers an integer, whose slot IS the caller's variable, and leaves
+    # out `:& f64`, `:& bool` and `:& **C`.  `p:& *T` stays 0 as well: its slot
+    # is the caller's pointer variable.  See mark_lent_param.
+    holds_lent_ptr: i32
+    # AGAST #2278: 1 for a `self:& T` / bare `self:&` receiver whose T is a
+    # struct (Param.is_self_borrow).  Not is_lent, which would change every read
+    # of `self`: only emit_lent_referent's by-value slots read the referent.
+    # In an impl it's a `*T` local (an i64 value); in a free fn a `:&` one.
+    is_lent_self: i32
+    # AGAST #2340: 1 for a `:&` param, whatever its T, and `self:&`: what `@x` names
+    # is the caller's, so x isn't a local root.  See ref_mark_params.
+    is_caller_place: i32
+    # AGAST #2364: U for an `@*U` / `@&*U` param or local
+    # (Param.param_ref_ptr_pointee), TYPE_VOID otherwise.  Set by ref_check.ritz
+    # (ref_mark_params, ref_after_stmt), which compares it: a scalar U has no name.
+    ref_ptr_pointee: i32
+    # AGAST #2407: 1 when the binding certainly holds no fn value (a typed one
+    # that isn't a fn type or pointer, or one bound to a literal), so a call
+    # of its name is an error, not a jump.  0 when it may hold one: ritz1
+    # types an untyped `let h = t.h` as an i64.
+    not_fn: i32
+    # AGAST #2330: 1 for the `*T` view of a `*[N]T`, `@[N]T` or `@&[N]T` local `p`,
+    # named `p#`.  It shares p's slot, which holds the address of element 0, so
+    # `p[i]` is `*(p# + i)`: element i at stride T in every position (LARB R9).
+    # See add_array_view and index_through.
+    array_view: i32
+    # AGAST #2329: for the view index_through makes of a base that isn't a local,
+    # `h.r`, `g` or `h(p)`, that base; null otherwise.  It's in no scope: an
+    # emitting site has through_spill bind it, the type-only ones read it as is.
+    array_base: *Expr
+    # AGAST #3579: 1 for an unannotated `let v = "..."` / `var v = "..."`.  ritz1
+    # lowers it to a `%Span$u8` (type_name), but it is a StrView value: only the
+    # literal itself fits a `Span<u8>` slot (#3441).  See another_struct_source.
+    str_view: i32
+
+# AGAST #2242 — a path a binding's value can be moved out along: a move-only
+# field of it, or of a field of it that can itself be partly moved.  A path's
+# index in OwnBinding.paths is its bit in fmask (and in own_check.ritz's
+# fmoved and fshadow).  `up` and `down` are path sets (ownership.ritz's
+# own_set_*, AGAST #2319): the bitmask itself for paths 0..30, else an
+# interned set's handle.
+struct OwnPath
+    parent: i32           # the path it is a part of, or -1 (the binding's own)
+    idx: i32              # its field index in that struct
+    fld: *StructField
+    up: i32               # its bit, and those of the paths it is a part of
+    down: i32             # its bit, and those of its parts
+
+# AGAST #4391: a user enum variant-constructor query, moved from
+# emitter_expr_call; the checks and the emitter both ask it.
+pub fn is_variant_carrier(name: *u8, name_len: i32) -> i32
+    if name_len == 4
+        # "Some"
+        if *name == 83 and *(name + 1) == 111 and *(name + 2) == 109 and *(name + 3) == 101
+            return 1
+    if name_len == 2
+        # "Ok"
+        if *name == 79 and *(name + 1) == 107
+            return 1
+    return 0
+
+pub fn is_variant_null(name: *u8, name_len: i32) -> i32
+    if name_len == 4
+        # "None"
+        if *name == 78 and *(name + 1) == 111 and *(name + 2) == 110 and *(name + 3) == 101
+            return 1
+    if name_len == 3
+        # "Err"
+        if *name == 69 and *(name + 1) == 114 and *(name + 2) == 114
+            return 1
+    return 0
+
+# =============================================================================
+# Pure helpers the Sema check modules share with the emitter (AGAST #4391)
+# =============================================================================
+#
+# Moved here from emitter_core / emitter_expr_call / emitter_stmt so
+# call_check (and, below, own_check and ref_value) import no emitter module
+# (#3513, #1816).  Emitter modules reach them through emitter_core's
+# `pub import ast_query`, so no call site changed.
+
+# =========================================================================
+# The ident-only half of expr_is_ptr_valued: the shape `*x` / `*x = v` see.
+# The integer kinds a `:&` borrow binds as a plain local (AGAST #1644).
+pub fn is_borrow_scalar_kind(t: i32) -> i32
+    if ty_int_in(t, 8, 16) == 1
+        return 1
+    if ty_int_in(t, 32, 64) == 1
+        return 1
+    return 0
+
+# =========================================================================
+# array_ptr_elem_name: the S of a `*[N]S` / `**[N]S` local (AGAST
+# #4391, moved from emitter_core).
+# AGAST #2543: the S of `loc`, a `*[N]S` or `**[N]S` local or param, or null.
+# #2548: every reader of a `*[N]S`'s element name asks here, not type_name, which
+# a `*[N]S` or `**[N]S` local or param leaves empty (#2553).
+pub fn array_ptr_elem_name(loc: *LocalVar, out_len: *i32) -> *u8
+    if loc.pointee_array_elem_name_len > 0
+        *out_len = loc.pointee_array_elem_name_len
+        return loc.pointee_array_elem_name
+    *out_len = loc.type_name_len
+    loc.type_name
+
+# =========================================================================
+# The variant-constructor queries (AGAST #4391; moved from emitter_core).
+# AGAST #4153: 1 when the call `e` names a variant of one user enum with a
+# list user_variant_ctor_enum leaves to a fn of that name: values for a bare
+# variant, `Z(1)`, or none for a payload one, `One()`.  *out_ei / *out_vi
+# name the variant.  With no such fn it was "Unknown function: Z".
+pub fn user_variant_ctor_miscounted(e: *Expr, out_ei: *i32, out_vi: *i32) -> i32
+    if e == null or e.kind != EXPR_CALL
+        return 0
+    var other: i32 = 0
+    let ei: i32 = enum_of_variant_unique(e.func_name, e.func_name_len, out_vi, @other)
+    if ei < 0
+        return 0
+    *out_ei = ei
+    let kind: i32 = enum_variant_kind(ei, *out_vi)
+    if kind == ENUM_VARIANT_UNIT
+        return (e.args != null) as i32
+    if kind == ENUM_VARIANT_TUPLE or kind == ENUM_VARIANT_STRUCT
+        return (e.args == null) as i32
+    0
+
+# AGAST #2039: a call `B()` / `Holds(x)` whose callee name two or more
+# non-generic enums declare as a variant.  Returns 1 and fills *out_a /
+# *out_b with the two enums to name (enum_of_variant_unique's -2), else 0.
+pub fn user_variant_ctor_ambiguous(e: *Expr, out_a: *i32, out_b: *i32) -> i32
+    if e == null or e.kind != EXPR_CALL
+        return 0
+    if enum_of_variant_unique(e.func_name, e.func_name_len, out_a, out_b) == 0 - 2
+        return 1
+    return 0
+
+# =========================================================================
+# Helper: find the leftmost/base expression in a chain of binary ops
+# e.g., for (a.ptr + pos + i), returns a.ptr
+pub fn find_base_expr(e: *Expr) -> *Expr
+    if e.kind == EXPR_BINARY
+        return find_base_expr(e.left)
+    return e
+
+# =========================================================================
+# 1 when `p` takes an array by address: `a:& [N]T`, `a: @[N]T`, `a: @&[N]T`.
+# `*[N]T` doesn't: ritz0 refuses `g(a)` there.
+pub fn param_takes_array_ref(p: *Param) -> i32
+    if p.param_type != TYPE_REF and p.param_type != TYPE_MUT_REF
+        return 0
+    if p.param_pointee_type == TYPE_ARRAY
+        return 1
+    0
+
+# =========================================================================
+# 1 when `p` is a `Span<T>`: emit_expr_call builds one from a local array.
+pub fn param_is_span(p: *Param) -> i32
+    if p.param_type != TYPE_STRUCT or p.param_type_name == null or p.param_type_name_len <= 4
+        return 0
+    return (memcmp(p.param_type_name, c"Span$", 5) == 0) as i32
+
+# =========================================================================
+# ArrayDims and the array-dimension helpers (AGAST #4391; moved from
+# emitter_expr_call; call_check compares a place with its param through them).
+# AGAST #2290: every dimension of an array, for comparing one with the array a
+# reference param points at.  `leaf` is what the innermost dimension holds.
+pub struct ArrayDims
+    rank: i32
+    dims: [8]i32
+    leaf: i32
+    name: *u8
+    name_len: i32
+
+# What ref_arg_dims can say about an argument.
+pub const ARG_DIMS_UNKNOWN: i32 = 0
+pub const ARG_DIMS_ARRAY: i32 = 1
+pub const ARG_DIMS_NOT_ARRAY: i32 = 2
+
+pub fn array_dims_1d(out: *ArrayDims, size: i32, elem: i32, name: *u8, name_len: i32) -> i32
+    out.rank = 1
+    out.dims[0] = size
+    out.leaf = elem
+    out.name = name
+    out.name_len = name_len
+    ARG_DIMS_ARRAY
+
+# The array left of `sh` once `from` indices are applied.  With none left it's
+# an element.
+pub fn array_dims_nd(out: *ArrayDims, sh: *ArrayShape, from: i32) -> i32
+    if from >= sh.rank
+        return ARG_DIMS_NOT_ARRAY
+    out.rank = sh.rank - from
+    var i: i32 = 0
+    while i < out.rank
+        out.dims[i] = sh.dims[from + i]
+        i = i + 1
+    out.leaf = sh.leaf_type
+    out.name = sh.leaf_name
+    out.name_len = sh.leaf_name_len
+    ARG_DIMS_ARRAY
+
+pub fn array_dims_match(a: *ArrayDims, b: *ArrayDims) -> i32
+    if a.rank != b.rank
+        return 0
+    var i: i32 = 0
+    while i < a.rank
+        if a.dims[i] != b.dims[i]
+            return 0
+        i = i + 1
+    return array_elem_types_match(a.leaf, a.name, a.name_len, b.leaf, b.name, b.name_len)
+
+# =========================================================================
+# The impl a method belongs to, and the `self:&` borrow view (AGAST #4391;
+# moved from emitter_expr_call).
+# The ImplBlock whose methods hold `f`, or null.
+pub fn impl_of_method(m: *Module, f: *FnDef) -> *ImplBlock
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            if method == f
+                return ib
+            method = method.next
+        ib = ib.next
+    null
+
+# AGAST #3260: R10's free call `C_get(c)` of a method whose receiver is a bare
+# `self:&`.  That receiver names no type: the method path and emit_impl_method
+# take it from the ImplBlock, so the free call had none to give its argument,
+# and emitted `call @C_get(% ..)`.  Here it's `f` with that receiver spelled
+# `self:& C`, C the impl's, and lent as a `c:& C` param is, as ritz0 reads it:
+# `C_get(c)` borrows c, and a temporary or a `let` is refused.  Any other `f`
+# is itself.  A generic impl's instance is already named (name_untyped_self).
+#
+# AGAST #3278: a typed `self:& C`, and so a generic instance's bare `self:&`
+# once name_untyped_self has named it, is lent the same way.  It's a
+# TYPE_MUT_REF without is_borrow (Param.is_self_borrow), which ref_check's
+# ref_args and call_check's ca_borrow read as an `@&C` slot: `C_bump(c)` was "a value
+# doesn't fit a reference slot".  ref_value.ritz (Sema) calls this for the free call too.
+# lent_self_call_view over the module `m`: Sema's too (AGAST #4011).
+pub fn lent_self_call_view_in(m: *Module, f: *FnDef) -> *FnDef
+    if f == null or f.params == null
+        return f
+    let p: *Param = f.params
+    if param_is_self(p) == 0 or p.is_self_borrow == 0 or p.is_borrow == 1
+        return f
+    var typed: i32 = 0
+    if p.param_type == TYPE_MUT_REF and p.param_type_name_len > 0
+        typed = 1
+    if typed == 0 and (p.param_type != TYPE_STRUCT or p.param_type_name_len > 0)
+        return f
+    var ib: *ImplBlock = null
+    if typed == 0
+        ib = impl_of_method(m, f)
+        if ib == null
+            return f
+    let lent: *Param = malloc(sizeof(Param)) as *Param
+    memcpy(lent as *u8, p as *u8, sizeof(Param))
+    if typed == 0
+        lent.param_type = TYPE_MUT_REF
+        lent.param_pointee_type = TYPE_STRUCT
+        lent.param_type_name = ib.type_name
+        lent.param_type_name_len = ib.type_name_len
+    lent.is_borrow = 1
+    let view: *FnDef = malloc(sizeof(FnDef)) as *FnDef
+    memcpy(view as *u8, f as *u8, sizeof(FnDef))
+    view.params = lent
+    view
+
+# =========================================================================
+# The array `p`, an `@[N]T` or the like, points at.
+pub fn param_pointee_dims(out: *ArrayDims, p: *Param)
+    if p.param_pointee_array_shape != null
+        array_dims_nd(out, p.param_pointee_array_shape, 0)
+    else
+        array_dims_1d(out, p.param_pointee_array_size, p.param_pointee_array_elem_type, p.param_type_name, p.param_type_name_len)
+
+# =========================================================================
+# 1 when two array element types name the same type (struct elements by name).
+# Exactly the same type, through an address too: `[N]u32` doesn't fit a
+# reference to `[N]i32`, though LLVM spells both `i32` (#2367).
+pub fn array_elem_types_match(a: i32, a_name: *u8, a_len: i32, b: i32, b_name: *u8, b_len: i32) -> i32
+    if a == TYPE_STRUCT or b == TYPE_STRUCT
+        if a != b or a_len != b_len or a_len <= 0
+            return 0
+        return (memcmp(a_name, b_name, a_len as i64) == 0) as i32
+    return (a == b) as i32
+
+# =============================================================================
+# Local-placement and struct-level helpers the checks share (AGAST #4391)
+# =============================================================================
+# Moved from emitter_core / emitter_expr for ref_value; emitter modules reach
+# them through emitter_core's pub import.
+
+# On the local `loc` bound for `param` (name_array_ptr_param, AGAST #4011: Sema's
+# image of it too).
+pub fn name_array_ptr_param_loc(loc: *LocalVar, param: *Param)
+    let ptr_elem: bool = param.param_pointee_array_elem_type == TYPE_PTR and param.param_pointee_array_elem_pointee == TYPE_STRUCT
+    if param.param_pointee_array_size <= 0 or (param.param_pointee_array_elem_type != TYPE_STRUCT and ptr_elem == false)
+        return
+    if param.param_pointee_type == TYPE_ARRAY and ptr_elem
+        return
+    if param.param_pointee_type != TYPE_ARRAY
+        # AGAST #2331: and `@*[N]S` / `@&*[N]S`, as `**[N]S`.
+        let ref_ptr: bool = (param.param_type == TYPE_REF or param.param_type == TYPE_MUT_REF) and param.param_pointee_type == TYPE_PTR
+        if ref_ptr == false and (param.param_type != TYPE_PTR_PTR or param.param_inner_pointee_type != TYPE_ARRAY)
+            return
+    if loc == null or loc.type_name_len <= 0
+        return
+    loc.pointee_array_elem_name = loc.type_name
+    loc.pointee_array_elem_name_len = loc.type_name_len
+    loc.type_name = null
+    loc.type_name_len = 0
+
+# AGAST #3074: 1 when the array behind `stmt`'s local holds S or `*S`.
+pub fn names_array_elem_struct(stmt: *Stmt) -> i32
+    if stmt.var_pointee_array_size <= 0
+        return 0
+    let elem: i32 = stmt.var_pointee_array_elem_type
+    (elem == TYPE_STRUCT or (elem == TYPE_PTR and stmt.var_pointee_array_elem_pointee == TYPE_STRUCT)) as i32
+
+# AGAST #2543: a `*[N]S`, `@[N]S`, `@&[N]S` or `**[N]S` local records S in
+# pointee_array_elem_name, as such a param does (#2548).  It recorded none, so
+# `let p = q` and `let p = *r`, which take S from what they copy, had none for
+# `p#`, and `p[i].f` was refused "unhandled EXPR_MEMBER".
+#
+# AGAST #3074: an `@*[N]S` / `@&*[N]S` local (and `[N]*S`) is named through its
+# var_ref, in type_name, which made `*r` a `*S`: `(*r).f` read element 0's f where
+# ritz0 refuses it.  It moves to pointee_array_elem_name, as name_array_ptr_param does.
+#
+# AGAST #3104: and a `**[N]*S` local, which capture_var_type names as `@*[N]*S`.
+pub fn name_array_ptr_local(loc: *LocalVar, stmt: *Stmt, name: *u8, len: i32)
+    let deep_ptr: bool = ref_to_ptr(loc) == 1 or loc.var_type == TYPE_PTR_PTR
+    if loc.type_name_len > 0 and deep_ptr and names_array_elem_struct(stmt) == 1
+        loc.pointee_array_elem_name = loc.type_name
+        loc.pointee_array_elem_name_len = loc.type_name_len
+        loc.type_name = null
+        loc.type_name_len = 0
+        return
+    if loc.type_name_len > 0 or name == null or len <= 0
+        return
+    if stmt.var_pointee_array_size <= 0 or stmt.var_pointee_array_elem_type != TYPE_STRUCT
+        return
+    let t: i32 = loc.var_type
+    let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_ARRAY
+    # AGAST #3079: an `@*[N]S` / `@&*[N]S` (`let r = @q`) is as deep as a `**[N]S`.
+    let deep: bool = t == TYPE_PTR_PTR or ((t == TYPE_REF or t == TYPE_MUT_REF) and stmt.var_pointee_type == TYPE_PTR)
+    let two: bool = deep and stmt.var_inner_pointee_type == TYPE_ARRAY
+    if one or two
+        loc.pointee_array_elem_name = name
+        loc.pointee_array_elem_name_len = len
+
+# AGAST #2331: 1 for an `@*T` or `@&*T` local.  It records N and U when T is
+# `[N]U`: `*r` reads that `*[N]U`, as it does through a `**[N]U`.
+pub fn ref_to_ptr(loc: *LocalVar) -> i32
+    if loc.var_type != TYPE_REF and loc.var_type != TYPE_MUT_REF
+        return 0
+    (loc.pointee_type == TYPE_PTR) as i32
+
+# AGAST #2403: pointers between a `self` param and its struct, as
+# local_struct_levels counts a local's: 2 for `**S` and `@*S`.
+pub fn self_struct_levels(p: *Param) -> i32
+    if p.param_type == TYPE_PTR_PTR
+        return ptr_ptr_ident_levels(p.param_inner_pointee_type)
+    if p.param_type == TYPE_REF or p.param_type == TYPE_MUT_REF
+        if p.param_pointee_type == TYPE_PTR
+            return 2
+        if p.param_pointee_type == TYPE_PTR_PTR
+            return 3
+        return 1
+    if p.param_type == TYPE_PTR
+        return 1
+    0
+
+# 1 for a `p:& **S` param, of any depth.
+pub fn param_borrows_struct_ptr_ptr(p: *Param) -> i32
+    if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF or p.param_pointee_type != TYPE_PTR_PTR
+        return 0
+    (ptr_ptr_slot_inner(p.param_inner_pointee_type) == TYPE_STRUCT) as i32
+
+# AGAST #1924: pointer levels of a `**S` local/param/field from its inner
+# pointee slot: 3 for `***S`.  2 when the slot records nothing (the
+# pre-#1924 assumption, kept for names whose depth was never recorded).
+pub fn ptr_ptr_ident_levels(slot: i32) -> i32
+    let lv: i32 = ptr_ptr_slot_levels(slot)
+    if lv < 2
+        return 2
+    return lv
