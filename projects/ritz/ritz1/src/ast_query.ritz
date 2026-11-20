@@ -37,6 +37,71 @@ import ast_helpers   # enum_find / enum_variant_* (AGAST #1660)
 # its explicit "unknown" branch instead of impersonating an i64.
 const TYPE_UNKNOWN: i32 = -1
 
+# AGAST #4404: N.  Sema's annotation on an Expr (ast.ritz's Expr.sema_ty),
+# encoded kind + 2 so the parser arena's zeroing means "not annotated".
+# sema_walk notes it for every expression it reaches; the emitter reads it
+# through expr_sema_ty rather than re-deriving a type from EmitterState.
+pub fn expr_note_sema_ty(e: *Expr, k: i32)
+    if e == null
+        return
+    e.sema_ty = k + 2
+
+# The TYPE_* kind Sema gave `e`, or TYPE_UNKNOWN when it did not annotate it
+# (null, or a node the walk never reached).  1 not 2 -- see expr_note_sema_ty.
+pub fn expr_sema_ty(e: *Expr) -> i32
+    if e == null
+        return TYPE_UNKNOWN
+    if e.sema_ty == 0
+        return TYPE_UNKNOWN
+    e.sema_ty - 2
+
+# 1 when Sema annotated `e` (its answer may still be TYPE_UNKNOWN).
+pub fn expr_has_sema_ty(e: *Expr) -> i32
+    (e != null and e.sema_ty != 0) as i32
+
+# AGAST #4404: the slot type a node fixes by itself -- the arms of the
+# emitter's old get_expr_type that never read EmitterState: literals, a
+# cast's written target, a comparison's i64 bool slot (AGAST #3931 / #1646),
+# and `@` / `@&` / `not` / `~`.  TYPE_UNKNOWN for the kinds whose slot needs
+# Sema's scope; those are the rest of #4404.
+pub fn expr_local_slot_ty(e: *Expr) -> i32
+    if e == null
+        return TYPE_UNKNOWN
+    let k: i32 = e.kind
+    if k == EXPR_INT_LIT
+        return TYPE_I64
+    if k == EXPR_FLOAT_LIT
+        return TYPE_F64
+    if k == EXPR_CHAR_LIT
+        return TYPE_U8
+    if k == EXPR_STRING_LIT
+        return TYPE_STRUCT   # bare "..." is a StrView (AGAST #98)
+    if k == EXPR_CSTRING_LIT or k == EXPR_NIL_LIT
+        return TYPE_PTR
+    if k == EXPR_CAST
+        # Target type stored in e.op (set by expr_cast).
+        return e.op
+    if k == EXPR_BINARY and e.op >= OP_EQ and e.op <= OP_GE
+        return TYPE_I64
+    if k == EXPR_UNARY
+        if e.op == OP_ADDR
+            return TYPE_PTR
+        if e.op == OP_ADDR_MUT
+            return TYPE_MUT_REF
+        if e.op == OP_NOT or e.op == OP_BIT_NOT
+            return TYPE_I64
+    TYPE_UNKNOWN
+
+# The slot type the emitter reads (#4404): Sema's annotation from its walk,
+# else the node-local answer for a node built after the walk -- a print
+# placeholder's parsed expression (`{x as i64}`) never meets Sema.
+pub fn expr_slot_ty(e: *Expr) -> i32
+    if e == null
+        return TYPE_UNKNOWN
+    if e.sema_ty != 0
+        return e.sema_ty - 2
+    expr_local_slot_ty(e)
+
 # Helper to check if name matches a string
 pub fn name_eq(name: *u8, len: i32, target: *u8, target_len: i32) -> i32
     if len != target_len

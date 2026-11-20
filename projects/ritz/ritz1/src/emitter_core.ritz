@@ -5961,22 +5961,12 @@ fn mem_builtin_result_type(s: *EmitterState, e: *Expr, id: i32) -> i32
 
 pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
     # Returns the Ritz type of an expression
-    if e.kind == EXPR_INT_LIT
-        return TYPE_I64
-    else if e.kind == EXPR_FLOAT_LIT
-        # Float literals default to f64; narrowing to f32 happens at
-        # binding/argument-coerce sites via fptrunc.
-        return TYPE_F64
-    else if e.kind == EXPR_CHAR_LIT
-        return TYPE_U8   # Character literals are u8
-    else if e.kind == EXPR_STRING_LIT
-        return TYPE_STRUCT  # Bare "..." is StrView { ptr: *u8, len: i64 } (AGAST #98)
-    else if e.kind == EXPR_CSTRING_LIT
-        return TYPE_PTR  # c"..." is null-terminated *u8
-    # EXPR_SSTRING_LIT removed in AGAST #98 — bare EXPR_STRING_LIT above
-    # now covers the same StrView { ptr, len } shape.
-    else if e.kind == EXPR_NIL_LIT
-        return TYPE_PTR  # nil is a null pointer
+    # AGAST #4404 (#1816): a literal's slot type is decided by the node
+    # itself, so Sema annotates it (sema_walk -> sema_note_expr_ty) and the
+    # emitter reads the annotation (expr_slot_ty) instead of keeping its own
+    # copy of the rule.
+    if e.kind == EXPR_INT_LIT or e.kind == EXPR_FLOAT_LIT or e.kind == EXPR_CHAR_LIT or e.kind == EXPR_STRING_LIT or e.kind == EXPR_CSTRING_LIT or e.kind == EXPR_NIL_LIT
+        return expr_slot_ty(e)
     else if e.kind == EXPR_IDENT
         # AGAST #1325: locals first (they shadow globals), then globals.
         # This arm used to consult only the locals table, so a global
@@ -6094,20 +6084,9 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                     return pk
         return TYPE_I64  # Default
     else if e.kind == EXPR_UNARY
-        if e.op == OP_ADDR
-            return TYPE_PTR  # Address-of gives pointer
-        else if e.op == OP_ADDR_MUT
-            return TYPE_MUT_REF  # Mutable address-of gives mutable reference
-        else if e.op == OP_NOT
-            # `not <expr>` lowers to `icmp eq + zext to i64` (see
-            # emit_expr_unary), so the value-flavoured result is i64
-            # regardless of operand type.  (Returning the operand's type once
-            # told STMT_IF "already i1" and skipped the i64→i1 icmp coerce,
-            # wiring an i64 reg into `br i1 ...`; conditions now always
-            # coerce, AGAST #3010.)
-            return TYPE_I64
-        else if e.op == OP_BIT_NOT
-            return TYPE_I64
+        # AGAST #4404: these four are node-local; Sema annotates them.
+        if e.op == OP_ADDR or e.op == OP_ADDR_MUT or e.op == OP_NOT or e.op == OP_BIT_NOT
+            return expr_slot_ty(e)
         else if e.op == OP_DEREF
             # AGAST #2119: `*(@s as *i8)` / `*@g` load the stated pointee.
             let inl_pt: i32 = inline_deref_scalar_pointee(s, e.operand)
@@ -6216,11 +6195,9 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
                 return bw
         # AGAST #3931: a comparison is a bool whatever its operands, held in
         # the emitter's bool slot, TYPE_I64 (#1646), as Sema's sema_expr_ty
-        # types it TYPE_BOOL.  It reported its left operand's type, so
-        # `let x = a == b` on f32s took a `float` slot (#2047's inference)
-        # and clang refused `store float <i64>`.
+        # types it TYPE_BOOL.  Sema annotates the slot (AGAST #4404).
         if e.op >= OP_EQ and e.op <= OP_GE
-            return TYPE_I64
+            return expr_slot_ty(e)
         return get_expr_type(s, e.left)  # Binary ops preserve left type (simplified)
     else if e.kind == EXPR_MEMBER
         # Look up the field type through the whole receiver chain.  Without
@@ -6252,8 +6229,9 @@ pub fn get_expr_type(s: *EmitterState, e: *Expr) -> i32
 
         return TYPE_I64  # Default for unknown functions
     else if e.kind == EXPR_CAST
-        # Target type stored in e.op (set by expr_cast helper).
-        return e.op
+        # Target type stored in e.op (set by expr_cast helper); Sema
+        # annotates it (AGAST #4404).
+        return expr_slot_ty(e)
     else if e.kind == EXPR_METHOD
         # AGAST #1370: `x.ceil()` on an f32 is an f32 (a `float` register),
         # so `let y = x.ceil()` infers f32 and `x.floor() + 0.5` is f32 math.
