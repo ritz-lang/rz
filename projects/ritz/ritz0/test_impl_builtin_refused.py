@@ -20,6 +20,12 @@ and unaffected.  The control rows live where they already ran:
 test_method_receiver_once.py's span_own_methods (a module's own
 `struct Span<T>` + `impl<T> Span<T>`) and span_param_ritzlib (ritzlib.span's),
 and test_strview_ufcs_by_value.py (a module's own `struct StrView` + impl).
+
+LARB R36's revisit (#4294) carves out a *trait* impl on `Span<T>` or
+`StrView` in the file that declares the trait (and on a primitive or `*u8`);
+those rows live in test_impl_on_builtin_trait_file.py.  Every inherent impl
+here stays refused, as does a trait impl on Option or Result, which the
+ruling does not name.
 """
 
 import pytest
@@ -65,14 +71,6 @@ pub fn main() -> i32
 ^impl<T> Span<T>
     fn first(self: @Span<T>) -> *T
         return self.ptr
-
-pub fn main() -> i32
-    return 0
-"""),
-    "span_trait": ("Span", """\
-^impl Speak for Span<u8>
-    fn say(self: @Span<u8>) -> i32
-        return 1
 
 pub fn main() -> i32
     return 0

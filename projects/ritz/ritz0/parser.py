@@ -2913,9 +2913,24 @@ class Parser:
         if self._at(TokenType.FOR):
             self._advance()
             trait_name = first_name
-            type_tok = self._expect(TokenType.IDENT)
-            type_name = type_tok.value
-            impl_type = None  # Reset - impl_type will be parsed next
+            if self._at(TokenType.STAR):
+                # LARB R36's revisit (AGAST #4294): `impl Trait for *u8` is a
+                # trait impl on a built-in pointer type.  The checker admits it
+                # only in the trait's file; the impl's symbol uses `ptr_u8`,
+                # since `*` can't appear in an LLVM symbol name.  The spelling
+                # for diagnostics is `*u8`.
+                star = self._current()
+                self._advance()
+                pointee_tok = self._expect(TokenType.IDENT)
+                impl_type = rast.PtrType(
+                    star.span, rast.NamedType(pointee_tok.span, pointee_tok.value),
+                    mutable=False)
+                type_name = f"ptr_{pointee_tok.value}"
+                type_tok = star
+            else:
+                type_tok = self._expect(TokenType.IDENT)
+                type_name = type_tok.value
+                impl_type = None  # Reset - impl_type will be parsed next
             if trait_name in index_rules.TRAITS and type_name in index_rules.BUILT_IN:
                 # `[]` on a Vec, Span or String keeps one meaning (§7.8).
                 raise ParseError(index_rules.builtin_impl(trait_name, type_name),

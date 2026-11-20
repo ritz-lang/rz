@@ -4854,12 +4854,26 @@ shape and its methods are emitted, but there is no dynamic dispatch and no `dyn
 Trait`. Methods are resolved statically from the receiver's concrete type. A
 generic parameter's trait bound is a check at instantiation (§11.5).
 
-An `impl` targets a struct or enum declared in Ritz source. A primitive is a
-built-in type, closed like `Span` (LARB R26), so `impl u8` and `impl Speak for
-i32` are errors at the type: "`i32` is a built-in type; it can't have an
-`impl`" (LARB R36, AGAST #3288). Whether a trait impl may target a primitive
-now that trait bounds exist (§11.5) is R36's revisit (#4294), with
-cross-module impls (#3256).
+An `impl` targets a struct or enum declared in Ritz source. An inherent impl
+on a primitive is an error, closed like `Span` (LARB R26): `impl u8` is
+"`u8` is a built-in type; it can't have an `impl`" (LARB R36, AGAST #3288).
+
+R36's revisit (Aaron, 2026-11-20, AGAST #4294) admits a *trait* impl on a
+primitive or on a closed built-in, but only in the file that declares the
+trait:
+
+- `impl Display for i64` and `impl Display for bool` — primitives;
+- `impl Display for *u8` — the pointer type;
+- `impl Display for StrView` — a built-in;
+- `impl Display for Span<u8>` — one concrete instantiation.
+
+An inherent impl is still refused, and a trait impl outside the trait's file
+is "`i64` is a built-in type: a trait impl for it must be in the trait's file
+(§12.2)". `Option` and `Result` are not in the ruling: a trait impl on either
+is still "`Option` is a built-in type and can't be extended here: import
+ritzlib.option or declare your own type" (AGAST #3162), and a generic
+`impl<T> Span<T>` stays closed (R26). The concrete `Span<u8>` shape is the
+one exception to "an impl covers every instantiation" below.
 
 Where an `impl` lives (LARB R65, AGAST #3493). An inherent `impl T` is in the
 file that declares `T`. A trait impl is in the type's file or the trait's file;

@@ -252,9 +252,9 @@ trait Eq
 ```
 
 `Eq`'s method is `equals`, not `eq`: a type has one method per name, and
-`StrView` already has a by-value `s.eq(t)`. A primitive can't implement either
-yet (LARB R36; revisit #4294), so there is no `HashMap<i64, V>`: use
-`HashMapI64`.
+`StrView` already has a by-value `s.eq(t)`. A primitive can implement either
+now, but only in the trait's file (LARB R36's revisit, #4294), and ritzlib
+doesn't yet, so there is no `HashMap<i64, V>`: use `HashMapI64`.
 
 ---
 
@@ -1135,14 +1135,17 @@ fn main() -> i32
     (writer_len(@w) - 16) as i32
 ```
 
-**The built-in types** (`ritzlib.fmt.impls`). A primitive or built-in type
-can't have an `impl` yet (§12.2, LARB R36), so for each of `i8`..`i64`,
-`u8`..`u64`, `bool`, `strview`, `string` (`@String`), `cstr` (`*u8`) and
-`bytes` (`Span<u8>`) there are three fns: `fmt_show_T(v, w)`,
-`fmt_show_T_with(v, w, spec)` and `fmt_debug_T(v, w)`. `String` also has
-the real `impl Display` and `impl Debug`. Debug quotes text and escapes `"`,
-`\`, `\n`, `\t`, `\r` and other bytes outside `' '`..`'~'` as `\xNN`;
-`Span<u8>` is `[1, 2, 255]`; integers and `bool` are as Display.
+**The built-in types** (`ritzlib.fmt.impls`). R36's revisit (#4294) lets
+`ritzlib.fmt.display` — the trait's file — carry the real impls: `impl
+Display` and `impl Debug` for `i8`..`i64`, `u8`..`u64`, `bool`, `StrView`,
+`*u8` and `Span<u8>`, each body one of the fns below. The fns remain for the
+`_with` spec forms: for each of `i8`..`i64`, `u8`..`u64`, `bool`, `strview`,
+`string` (`@String`), `cstr` (`*u8`) and `bytes` (`Span<u8>`) there are three
+fns: `fmt_show_T(v, w)`, `fmt_show_T_with(v, w, spec)` and
+`fmt_debug_T(v, w)`. `String` also has the real `impl Display` and `impl
+Debug`. Debug quotes text and escapes `"`, `\`, `\n`, `\t`, `\r` and other
+bytes outside `' '`..`'~'` as `\xNN`; `Span<u8>` is `[1, 2, 255]`; integers
+and `bool` are as Display.
 
 **Specs** (`ritzlib.fmt.spec`). `fmt_spec_parse(spec: StrView) -> FmtSpec`
 reads the v1 set: `x` `X` `b` `o`, a width before them with an optional

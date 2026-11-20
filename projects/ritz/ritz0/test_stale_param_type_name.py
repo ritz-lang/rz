@@ -9,7 +9,9 @@ pointer to Res (or St).  Method-call syntax then dispatched `d.peek()` to
 buffer.
 
 ritz0 has no method-call syntax on a `*u8`/`**u8`/`@u8` receiver and rejects
-`d.peek()`; ritz1 now rejects it too, where it used to call Res_peek.  The
+`d.peek()`; ritz1 now rejects it too, where it used to call Res_peek.  #4294
+naming `u8`/`*u8` for its own impls changed only ritz0's wording (below):
+`peek` is no type's method, `**u8` has no impl target.  The
 controls (named pointees, which must keep their name) return 42 on ritz0,
 ritz1 and ritz1_selfhosted.
 """
@@ -172,6 +174,16 @@ REJECTED_BY = {
     "ritz1_selfhosted": "cannot determine receiver type for method call",
 }
 
+# #4294 lets a trait impl target `u8` and `*u8`, so ritz0 now names those
+# receivers instead of calling them unknown; `peek` is still not an impl
+# method, and the refusal stands with a more precise message.  `**u8` has no
+# impl target, so it keeps the unknown-type message.
+RITZ0_NAMED_RECEIVER = {
+    "ptr_u8": "No method 'peek' found for type '*u8'",
+    "ref_u8": "No method 'peek' found for type 'u8'",
+    "after_enum_field": "No method 'peek' found for type '*u8'",
+}
+
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("case", sorted(STALE))
@@ -179,7 +191,8 @@ def test_prim_pointer_param_has_no_type_name(compiler, case, tmp_path):
     proc, _ = _compile(compiler, tmp_path, STALE[case])
     out = proc.stdout + proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted `d.peek()` on a primitive pointer:\n{out}"
-    assert REJECTED_BY[compiler] in out, out
+    expected = RITZ0_NAMED_RECEIVER.get(case) if compiler == "ritz0" else None
+    assert (expected or REJECTED_BY[compiler]) in out, out
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

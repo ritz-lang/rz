@@ -431,12 +431,14 @@ wins.
   Display type to a spec's width (measuring with a `null_writer`), and the
   integer impls take radix specs themselves. `fmt_show<T>` and
   `fmt_show_debug<T>` are the generic calls.
-- **Impls on built-ins are fns.** `impl Display for i64` (or `StrView`,
-  `Span<u8>`, `*u8`) is refused (§12.2, LARB R36 / R26), so
-  `ritzlib.fmt.impls` has `fmt_show_T`, `fmt_show_T_with` and `fmt_debug_T`
-  for each built-in `T`. Phase 3 lowers `{x}` to these by `x`'s type. `String`
-  gets real impls, in the trait's file (R65). R36's revisit, trait impls on
-  primitives in the trait's file, is LARB #4294.
+- **Impls on built-ins are real now.** R36's revisit (#4294) admits
+  `impl Display for i64` (and `bool`, `StrView`, `Span<u8>`, `*u8`, the
+  integer widths) in the file that declares the trait, so
+  `ritzlib.fmt.display` has them, one line each calling the fn.
+  `ritzlib.fmt.impls` keeps `fmt_show_T`, `fmt_show_T_with` and `fmt_debug_T`
+  for the `_with` spec forms. Phase 3 lowers `{x}` to `show` / `fmt_show<T>`
+  by `x`'s type. An inherent impl, an impl outside the trait's file, and
+  Option/Result remain refused (§12.2, R36 / R26).
 - **No bounds yet.** The generics are `<T>`, not `<T: Display>`: ritz1 can't
   parse a bound until #3469. A bound is a check only (R55), so lookup is the
   same; the bounds go on with #3469 (#4295).
@@ -536,9 +538,11 @@ forms work. Phase 5 removes the old ones in one commit.
    `self: @Self` with `w: @&Writer`, the shape §11.5 and §12 already use.
 
 2. **Generic Display impls** (`impl<T: Display> Display for Span<T>`, …).
-   **Moved to LARB: #4017.** Phase 2 shipped no generic impls: built-ins
-   can't have impls at all yet (R36), and ritz1 can't parse a bound (#3469).
-   `Span<u8>` has its fns (`fmt_show_bytes`); other `Span<T>` wait on both.
+   **Moved to LARB: #4017.** Phase 2 shipped no generic impls, and ritz1
+   can't parse a bound (#3469). The concrete `impl Display for Span<u8>` and
+   `impl Display for i64` (and the like) now exist in `ritzlib.fmt.display`
+   (R36's revisit, #4294); `impl<T> ... for Span<T>` still waits on the
+   bound.
 
 3. **`fn main` not `pub` is silently accepted.** **RESOLVED (Phase 1):** both
    compilers special-case `main`'s linkage by name, so it widens nothing else.

@@ -23,7 +23,7 @@ from monomorph_core import instance_display_name, note_instance_display
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 from qualified_access import module_item_access_removed
-from builtin_types import BUILTIN_TYPES
+from builtin_types import BUILTIN_TYPES, PRIMITIVES, target_spelling
 import index_rules
 import interp_spec
 import deref_rules
@@ -4663,6 +4663,14 @@ class LLVMEmitter:
             # Mangle name: Type_method
             mangled_name = f"{impl_block.type_name}_{method.name}"
             self.method_lookup[(impl_block.type_name, method.name)] = mangled_name
+            # R36's revisit (#4294): `impl Display for Span<u8>` names one
+            # instantiation.  A receiver of that type is spelled `Span$u8`
+            # by inference, so register the method under both keys.
+            impl_type = impl_block.impl_type
+            if (not impl_block.type_params
+                    and isinstance(impl_type, rast.NamedType) and impl_type.args):
+                instance = mangle_generic_name(impl_type.name, impl_type.args)
+                self.method_lookup[(instance, method.name)] = mangled_name
 
             # Create a copy of the method with the mangled name
             # We need to declare and emit it like a regular function
@@ -14226,6 +14234,26 @@ class LLVMEmitter:
             self._evaluated_once = outer
             self._deref_use_now = outer_use
 
+    def _builtin_receiver_name(self, expr: rast.Expr) -> Optional[str]:
+        """The impl target a primitive/built-in receiver names (#4294).
+
+        `i64`, `bool`, `StrView`, `Span$u8` and `ptr_u8` are method-dispatch
+        names for built-in types; a reference to one dispatches on the type
+        it refers to.  None for a struct, an enum or anything else."""
+        ty = self._infer_ritz_type(expr)
+        if isinstance(ty, rast.RefType):
+            ty = ty.inner
+        if isinstance(ty, rast.PtrType):
+            inner = ty.inner
+            if (isinstance(inner, rast.NamedType) and inner.name == 'u8'
+                    and not inner.args):
+                return 'ptr_u8'
+            return None
+        if (isinstance(ty, rast.NamedType) and not ty.args
+                and ty.name in PRIMITIVES):
+            return ty.name
+        return None
+
     def _method_def(self, type_name: str, method: str) -> Optional[rast.FnDef]:
         """`type_name`'s method `method`, from its impls."""
         for (_, ty), methods in self.impls.items():
@@ -14500,6 +14528,12 @@ class LLVMEmitter:
                 else:
                     type_name = inferred.name
 
+        # R36's revisit (#4294): a receiver inferred as a primitive, a `*u8`,
+        # or a reference to one dispatches to the trait impl on that built-in
+        # type.  `fmt_show<T>`'s `v.show(w)` at T = i64 is a `@i64`.
+        if type_name is None:
+            type_name = self._builtin_receiver_name(expr.expr)
+
         if type_name is None:
             raise self._err(f"Cannot call method '{expr.method}' on unknown type")
 
@@ -14559,7 +14593,11 @@ class LLVMEmitter:
                 raise EmitError(ref_rules.no_method(
                                     expr.method, instance_display_name(type_name)),
                                 expr.name_span or expr.span)
-            raise self._err(f"No method '{expr.method}' found for type '{type_name}'",
+            # `ptr_u8` is the linked spelling; name the pointer the way the
+            # source does, `*u8` (R36's revisit, #4294, names primitives and
+            # pointers instead of leaving them "unknown type").
+            raise self._err(f"No method '{expr.method}' found for type "
+                            f"'{target_spelling(type_name)}'",
                             expr.name_span or expr.span)
 
         if mangled_name not in self.functions:

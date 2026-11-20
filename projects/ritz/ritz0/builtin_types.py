@@ -15,6 +15,8 @@ is an ordinary type, and its impls are unaffected.  ritz1 applies the same
 rule (main.ritz, refuse_impls_on_builtin_types).
 """
 
+from pathlib import Path
+
 import ritz_ast as rast
 from metadata import type_to_string
 from name_resolver import NameResolver
@@ -30,12 +32,48 @@ BUILTIN_TYPES = {
 
 
 # The scalars: built-in types closed to `impl`, inherent or trait (LARB R36,
-# AGAST #3370; spec §12.2).  Whether trait impls on them come back, now that
-# trait bounds exist, is R36's revisit (#4294), with cross-module impls
-# (#3256).  SIMD vectors aren't in R36.
+# AGAST #3370; spec §12.2).  R36's revisit (Aaron, 2026-11-20, AGAST #4294)
+# admits a *trait* impl on one — `impl Display for i64` — but only in the file
+# that declares the trait.  SIMD vectors aren't in R36.
 PRIMITIVES = frozenset({
     'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'bool',
 })
+
+# The built-ins R36's revisit admits as trait-impl targets, in the trait's
+# file: `Span<T>` (a concrete instantiation, `impl Display for Span<u8>`) and
+# `StrView`.  Option and Result are not in the ruling.  A file that imports
+# ritzlib.span / ritzlib.strview declares the type outright, and its impls are
+# ordinary (R65).
+BUILTIN_IMPL_TARGETS = frozenset({'Span', 'StrView'})
+
+# A pointer target: the parser spells `impl Trait for *u8` as `ptr_u8` (the
+# symbol `*u8_show` isn't valid LLVM IR).  R36's revisit admits only `*u8`.
+POINTER_TARGETS = frozenset({'ptr_u8'})
+
+
+def target_spelling(type_name: str) -> str:
+    """The source spelling of an impl target: `ptr_u8` is `*u8`."""
+    return "*" + type_name[4:] if type_name.startswith("ptr_") else type_name
+
+
+def is_builtin_target(type_name: str) -> bool:
+    """A target no file declares (a primitive, a built-in or a pointer)."""
+    return (type_name in PRIMITIVES or type_name in BUILTIN_IMPL_TARGETS
+            or type_name in POINTER_TARGETS)
+
+
+def in_trait_file(impl: rast.ImplBlock, traits: dict) -> bool:
+    """Is `impl` a trait impl in the file that declares its trait?
+
+    R36's revisit admits impls on primitives/built-ins only there; a trait
+    the compiler knows (Drop, Index…) declares no file, so it never is."""
+    if impl.trait_name is None:
+        return False
+    trait = traits.get(impl.trait_name)
+    impl_file = getattr(impl, 'source_file', None)
+    trait_file = getattr(trait, 'source_file', None) if trait is not None else None
+    return (impl_file is not None and trait_file is not None
+            and str(Path(impl_file).resolve()) == str(Path(trait_file).resolve()))
 
 
 def refusal(type_name: str) -> str:
@@ -43,18 +81,35 @@ def refusal(type_name: str) -> str:
             f"import {BUILTIN_TYPES[type_name]} or declare your own type")
 
 
+def misplaced_target(type_name: str) -> str:
+    """A built-in impl target outside the trait's file (R36's revisit)."""
+    return (f"`{target_spelling(type_name)}` is a built-in type: a trait impl "
+            f"for it must be in the trait's file (§12.2)")
+
+
 def check_builtin_impls(module: rast.Module) -> list[str]:
     """One located error per `impl` whose target is a built-in type.
 
     Runs on the merged module, after import resolution, so an imported
-    declaration counts as the program's own."""
+    declaration counts as the program's own.  A trait impl on `Span<T>` or
+    `StrView` in the trait's file is R36's revisit and stands; one outside it
+    is the placement error, not the import hint."""
     declared = {item.name for item in module.items
                 if isinstance(item, (rast.StructDef, rast.EnumDef))}
-    return [f"{item.span}: {refusal(item.type_name)}"
-            for item in module.items
-            if isinstance(item, rast.ImplBlock)
-            and item.type_name in BUILTIN_TYPES
-            and item.type_name not in declared]
+    traits = {item.name: item for item in module.items
+              if isinstance(item, rast.TraitDef)}
+    errors = []
+    for item in module.items:
+        if (not isinstance(item, rast.ImplBlock)
+                or item.type_name not in BUILTIN_TYPES
+                or item.type_name in declared):
+            continue
+        if item.type_name in BUILTIN_IMPL_TARGETS and item.trait_name is not None:
+            if not in_trait_file(item, traits):
+                errors.append(f"{item.type_span}: {misplaced_target(item.type_name)}")
+            continue
+        errors.append(f"{item.span}: {refusal(item.type_name)}")
+    return errors
 
 
 def check_unknown_impl_targets(module: rast.Module) -> list[str]:
@@ -79,8 +134,10 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
     merged module declares it (an import counts) or the compiler does
     (trait_bounds.COMPILER_TRAITS), the same rule as an unknown trait in a
     bound (check_unknown_bound_traits, #3468)."""
-    traits = set(COMPILER_TRAITS)
-    traits.update(item.name for item in module.items if isinstance(item, rast.TraitDef))
+    trait_set = set(COMPILER_TRAITS)
+    trait_set.update(item.name for item in module.items if isinstance(item, rast.TraitDef))
+    trait_defs = {item.name: item for item in module.items
+                  if isinstance(item, rast.TraitDef)}
     known = {item.name for item in module.items
              if isinstance(item, (rast.StructDef, rast.EnumDef))}
     # A type alias is known, but not an impl target (LARB R35, #3368): a
@@ -94,7 +151,7 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
     errors = []
     for item in module.items:
         if (isinstance(item, rast.ImplBlock) and hasattr(item, 'trait_span')
-                and item.trait_name not in traits):
+                and item.trait_name not in trait_set):
             errors.append(f"{item.trait_span}: unknown trait `{item.trait_name}`")
         if (not isinstance(item, rast.ImplBlock) or not hasattr(item, 'type_span')
                 or item.type_name in item.type_params):
@@ -103,9 +160,15 @@ def check_unknown_impl_targets(module: rast.Module) -> list[str]:
             target = type_to_string(aliases[item.type_name])
             errors.append(f"{item.type_span}: `{item.type_name}` is a type alias "
                           f"for `{target}`: write `impl {target}`")
-        elif item.type_name in PRIMITIVES:
-            errors.append(f"{item.type_span}: `{item.type_name}` is a built-in "
-                          f"type; it can't have an `impl`")
+        elif item.type_name in PRIMITIVES or item.type_name in POINTER_TARGETS:
+            # R36's revisit (#4294): a trait impl on a primitive / `*u8` is
+            # legal in the trait's file, and nowhere else.  An inherent impl
+            # is still the old refusal.
+            if item.trait_name is None:
+                errors.append(f"{item.type_span}: `{target_spelling(item.type_name)}` "
+                              f"is a built-in type; it can't have an `impl`")
+            elif not in_trait_file(item, trait_defs):
+                errors.append(f"{item.type_span}: {misplaced_target(item.type_name)}")
         elif item.type_name not in known:
             errors.append(f"{item.type_span}: unknown type `{item.type_name}`")
     return errors

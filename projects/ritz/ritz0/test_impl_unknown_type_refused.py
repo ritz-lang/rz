@@ -22,9 +22,12 @@ A type alias is known but can't be an impl target (LARB R35, #3368): `type
 Id = Foo` then `impl Id` is "`Id` is a type alias for `Foo`: write `impl
 Foo`", at `Id`.
 
-A primitive is known but closed (LARB R36, #3370): `impl u8` and `impl
-Speak for i32` are "`i32` is a built-in type; it can't have an `impl`", at
-the type.
+A primitive is known but closed to an inherent impl (LARB R36, #3370):
+`impl u8` is "`u8` is a built-in type; it can't have an `impl`", at the
+type.  R36's revisit (#4294) admits a *trait* impl on one in the file that
+declares the trait (test_impl_on_builtin_trait_file.py); anywhere else it is
+"`i64` is a built-in type: a trait impl for it must be in the trait's file
+(§12.2)".
 
 An undeclared trait is "unknown trait `Nonesuch`", at the impl's trait name
 (#4197 on ritz0, #4211 on ritz1).  Known: a declared or imported trait, and
@@ -263,10 +266,15 @@ def test_impl_on_known_type_compiles(request, tmp_path, compiler, row):
     assert _run(compiler, tmp_path, row, PRELUDE + COMPILES[row]) == 7
 
 
-# A primitive is a built-in type, closed to `impl` (LARB R36, #3288),
-# inherent or trait: located at the type, on every compiler.  ritz1 failed
-# with an unlocated "Parse error at pos 64": its grammar took only an IDENT
-# as the target, and `i32` is a keyword (#3371).
+# An inherent impl on a primitive is a built-in type, closed to `impl` (LARB
+# R36, #3288), located at the type, on every compiler.  ritz1 failed with an
+# unlocated "Parse error at pos 64": its grammar took only an IDENT as the
+# target, and `i32` is a keyword (#3371).
+#
+# A *trait* impl on a primitive is R36's revisit (#4294): legal in the file
+# declaring the trait, so here only one outside it is refused — `Drop` is a
+# compiler trait, which no file declares (the multi-file case is
+# test_impl_on_builtin_trait_file.py).
 PRIMITIVE_ROWS = {
     "inherent": ("u8", """\
 impl ^u8
@@ -275,16 +283,16 @@ impl ^u8
 
 pub fn main() -> i32
     return 0
-"""),
-    "trait": ("i32", """\
-impl Speak for ^i32
-    fn say(self: @i32) -> i32
-        return *self
+""", "`u8` is a built-in type; it can't have an `impl`"),
+    "trait_outside_file": ("i64", """\
+impl Drop for ^i64
+    fn drop(self: @&i64)
+        return
 
 pub fn main() -> i32
-    let x: i32 = 7
-    return x.say()
-"""),
+    return 0
+""", "`i64` is a built-in type: a trait impl for it must be in the "
+     "trait's file (§12.2)"),
 }
 
 
@@ -293,9 +301,9 @@ pub fn main() -> i32
 def test_impl_on_primitive_refused(request, tmp_path, compiler, row):
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")
-    type_name, program = PRIMITIVE_ROWS[row]
+    _, program, message = PRIMITIVE_ROWS[row]
     _assert_refused(compiler, tmp_path, f"primitive_{row}", PRELUDE + program,
-                    f"`{type_name}` is a built-in type; it can't have an `impl`")
+                    message)
 
 
 # An impl of a trait nothing declares (#4211): it compiled silently on ritz1.

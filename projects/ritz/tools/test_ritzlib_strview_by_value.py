@@ -33,6 +33,10 @@ ALLOWED = {
     ("hash.ritz", "hash", "self"): "impl Hash for StrView: the trait's @Self",
     ("hash.ritz", "equals", "self"): "impl Eq for StrView: the trait's @Self",
     ("hash.ritz", "equals", "other"): "impl Eq for StrView: the trait's @Self",
+    # Display/Debug declare `self: @Self` (LARB #4016), so the StrView impls
+    # must spell it `@StrView`; the value is still only read (#4294).
+    ("fmt/display.ritz", "show", "self"): "impl Display for StrView: the trait's @Self",
+    ("fmt/display.ritz", "show_debug", "self"): "impl Debug for StrView: the trait's @Self",
 }
 
 FN_RE = re.compile(r"^\s*(?:pub\s+)?fn\s+(\w+)\s*(?:<[^>]*>)?\s*\(([^)]*)\)")

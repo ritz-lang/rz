@@ -24,6 +24,7 @@ unknown names) are builtin_types.py's errors. ritz1's half is #3494.
 from pathlib import Path
 
 import ritz_ast as rast
+from builtin_types import BUILTIN_IMPL_TARGETS
 from name_resolver import NameResolver
 from type_names import unknown_type
 
@@ -103,7 +104,18 @@ def check_impl_placement(module: rast.Module) -> list[str]:
         if free is not None:
             errors.append(free)
             continue
-        for error in (_misplaced(impl, decl, traits), _partial(impl, decl)):
+        trait = traits.get(impl.trait_name) if impl.trait_name else None
+        # R36's revisit (#4294): `impl Display for Span<u8>` is a concrete
+        # instantiation, which R65 otherwise refuses, and is legal in the
+        # trait's file.  StrView has no instantiation; the same file rule
+        # already reaches it through `_misplaced`.
+        builtin_concrete = (impl.type_name in BUILTIN_IMPL_TARGETS
+                            and trait is not None
+                            and _file(trait) == _file(impl))
+        errors_for = [_misplaced(impl, decl, traits)]
+        if not builtin_concrete:
+            errors_for.append(_partial(impl, decl))
+        for error in errors_for:
             if error is not None:
                 errors.append(f"{impl.type_span}: {error}")
                 break

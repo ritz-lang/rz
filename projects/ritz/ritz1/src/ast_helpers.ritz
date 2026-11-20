@@ -1381,9 +1381,34 @@ fn impl_keyword_span(p: *Parser, type_name: *u8, out: *SrcSpan, at_type: *SrcSpa
         i += 1
 
 pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u8, type_len: i32, type_params: *TypeParam, methods: *FnDef) -> *ImplBlock
+    impl_block_core(p, trait_name, trait_len, type_name, type_len, type_params, methods, 0, null, 0)
+
+# AGAST #4294 (R36's revisit): `impl Trait for *u8`.  The target is spelled
+# `ptr_u8` — `*` can't appear in an LLVM symbol — and the AST keeps the
+# pointee so `Self` in the impl's signatures spells `@*u8`.  Admitted only in
+# the trait's file by monomorph's checks; an inherent impl on it is refused.
+pub fn impl_block_ptr_new(p: *Parser, trait_name: *u8, trait_len: i32, pointee: *u8, pointee_len: i32, type_params: *TypeParam, methods: *FnDef, star_line: i32, star_col: i32) -> *ImplBlock
+    let name: *u8 = parser_alloc(p, (pointee_len + 5) as i64)
+    *(name + 0) = 112  # 'p'
+    *(name + 1) = 116  # 't'
+    *(name + 2) = 114  # 'r'
+    *(name + 3) = 95   # '_'
+    for i in 0..pointee_len
+        *(name + 4 + i) = *(pointee + i)
+    *(name + 4 + pointee_len) = 0
+    let ib: *ImplBlock = impl_block_core(p, trait_name, trait_len, name, pointee_len + 4, type_params, methods, 1, pointee, pointee_len)
+    # `ptr_u8` is not in the source, so impl_keyword_span found no token to
+    # name: the `*` the target was written with locates the diagnostic.
+    if star_line > 0
+        ib.type_span.line = star_line
+        ib.type_span.col = star_col
+    ib
+
+fn impl_block_core(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u8, type_len: i32, type_params: *TypeParam, methods: *FnDef, ptr_target: i32, ptr_pointee: *u8, ptr_pointee_len: i32) -> *ImplBlock
     if trait_name != null
         index_impl_on_builtin(p, trait_name, trait_len, type_name, type_len)
     let ib: *ImplBlock = parser_alloc(p, sizeof(ImplBlock)) as *ImplBlock
+    ib.ptr_target = ptr_target
     ib.trait_span.line = 0
     ib.trait_span.col = 0
     if trait_name != null
@@ -1412,6 +1437,8 @@ pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u
         if trait_len == 4 and name_is_drop(trait_name) == 1 and mt.name_len == 4 and name_is_drop_fn(mt.name) == 1
             drop_by_value_error(tok_span_of(p, mt.name, mt.line), mt)
         impl_spell_self(p, mt, type_name, type_len, type_params)   # AGAST #3249
+        if ptr_target == 1
+            impl_spell_self_ptr(mt, ptr_pointee, ptr_pointee_len)   # AGAST #4294
         # LANGUAGE_SPEC §15.2: a trait impl's methods need no `pub`; they are
         # reachable wherever the trait is, so a generic over the trait in
         # another file can call them (AGAST #201, as ritz0's parse_impl).
@@ -1431,6 +1458,22 @@ pub fn impl_block_new(p: *Parser, trait_name: *u8, trait_len: i32, type_name: *u
 # type_generic_with_saved spells it, so monomorph substitutes T in it like
 # a written `@Box<T>`.  (The grammar drops the impl's own type args, so this
 # assumes they are its type params in order, as ritz1's impls already do.)
+# AGAST #4294 (R36's revisit): `impl Trait for Span<u8>` is one impl block for
+# the concrete instance, as ritz0 records it — the target is `Span$u8`, so its
+# methods are `Span$u8_show` and its `self` is `@Span$u8`.  A generic impl
+# (`impl<T> Trait for Foo<T>`) keeps the base name; monomorph specializes it.
+pub fn impl_block_generic_new(p: *Parser, trait_name: *u8, trait_len: i32, base: *u8, base_len: i32, args: *GenericArg, type_params: *TypeParam, methods: *FnDef) -> *ImplBlock
+    if type_params != null or args == null
+        return impl_block_new(p, trait_name, trait_len, base, base_len, type_params, methods)
+    var name_len: i32 = 0
+    let name: *u8 = mangle_generic_args(p, base, base_len, args, @name_len)
+    let ib: *ImplBlock = impl_block_new(p, trait_name, trait_len, name, name_len, type_params, methods)
+    # `Span$u8` is not in the source; locate the diagnostic at the base token
+    # the user wrote (`Span`), as the pointer target does with its `*`.
+    if ib.type_span.line == 0
+        impl_keyword_span(p, base, @ib.impl_span, @ib.type_span)
+    ib
+
 fn impl_spell_self(p: *Parser, mt: *FnDef, type_name: *u8, type_len: i32, type_params: *TypeParam)
     var self_len: i32 = 0
     let self_name: *u8 = impl_self_spelling(p, type_name, type_len, type_params, @self_len)
@@ -1449,6 +1492,64 @@ fn param_spell_self(prm: *Param, self_name: *u8, self_len: i32)
     if prm != null and name_is_self_type(prm.param_type_name, prm.param_type_name_len) == 1
         prm.param_type_name = self_name
         prm.param_type_name_len = self_len
+
+# AGAST #4294: `impl Trait for *u8` spells its impl target `ptr_u8`.
+# impl_spell_self wrote that name into every `Self`; turn it into the
+# `@*u8` the parser builds for that written type: a reference whose pointee
+# is a pointer to the scalar, so `*self` is the `*u8`.
+fn impl_spell_self_ptr(mt: *FnDef, pointee: *u8, pointee_len: i32)
+    var ptr_name: *u8 = null
+    var ptr_len: i32 = 0
+    if pointee != null
+        ptr_name = pointee
+        ptr_len = pointee_len
+    var prm: *Param = mt.params
+    while prm != null
+        param_spell_ptr_self(prm, ptr_name, ptr_len)
+        prm = prm.next
+    if name_matches_ptr_self(mt.return_type_name, mt.return_type_name_len, ptr_name, ptr_len) == 1
+        mt.return_type = TYPE_PTR
+        mt.return_type_name = ptr_name
+        mt.return_type_name_len = ptr_len
+
+fn name_matches_ptr_self(name: *u8, len: i32, pointee: *u8, pointee_len: i32) -> i32
+    if name == null or pointee == null or len != pointee_len + 4
+        return 0
+    if memcmp(name, c"ptr_", 4) != 0
+        return 0
+    buf_eq(name + 4, len - 4, pointee, pointee_len)
+
+fn param_spell_ptr_self(prm: *Param, pointee: *u8, pointee_len: i32)
+    if prm == null
+        return
+    if name_matches_ptr_self(prm.param_type_name, prm.param_type_name_len, pointee, pointee_len) == 0
+        return
+    prm.param_type_name = pointee
+    prm.param_type_name_len = pointee_len
+    prm.param_pointee_type = TYPE_PTR
+    prm.param_inner_pointee_type = scalar_kind_of_name(pointee, pointee_len)
+
+# The TYPE_* of a scalar's name; TYPE_VOID for anything else.
+fn scalar_kind_of_name(name: *u8, len: i32) -> i32
+    if buf_eq(name, len, c"u8", 2) == 1
+        return TYPE_U8
+    if buf_eq(name, len, c"i8", 2) == 1
+        return TYPE_I8
+    if buf_eq(name, len, c"u16", 3) == 1
+        return TYPE_U16
+    if buf_eq(name, len, c"i16", 3) == 1
+        return TYPE_I16
+    if buf_eq(name, len, c"u32", 3) == 1
+        return TYPE_U32
+    if buf_eq(name, len, c"i32", 3) == 1
+        return TYPE_I32
+    if buf_eq(name, len, c"u64", 3) == 1
+        return TYPE_U64
+    if buf_eq(name, len, c"i64", 3) == 1
+        return TYPE_I64
+    if buf_eq(name, len, c"bool", 4) == 1
+        return TYPE_BOOL
+    TYPE_VOID
 
 fn name_is_self_type(name: *u8, len: i32) -> i32
     if len != 4 or name == null
@@ -1561,8 +1662,24 @@ pub fn decl_fn_def_new(p: *Parser, name: *u8, len: i32, type_params: *TypeParam,
 # Grammar action of trait_def; a re-parse records a name twice, harmlessly.
 var g_trait_names: **u8 = null
 var g_trait_lens: *i32 = null
+# AGAST #4294: the file each trait was declared in, so a trait impl on a
+# primitive/built-in can be admitted only in the trait's file.
+var g_trait_files: **u8 = null
 var g_trait_count: i32 = 0
 var g_trait_cap: i32 = 0
+
+fn dup_parse_file_name(path: *u8) -> *u8
+    if path == null
+        return null
+    var n: i64 = 0
+    while *(path + n) != 0
+        n = n + 1
+    let buf: *u8 = malloc(n + 1)
+    var i: i64 = 0
+    while i <= n
+        *(buf + i) = *(path + i)
+        i = i + 1
+    buf
 
 pub fn trait_declared_record(name: *u8, len: i32) -> i32
     if g_trait_count >= g_trait_cap
@@ -1571,9 +1688,11 @@ pub fn trait_declared_record(name: *u8, len: i32) -> i32
             cap = 64
         g_trait_names = realloc(g_trait_names as *u8, (cap as i64) * 8) as **u8
         g_trait_lens = realloc(g_trait_lens as *u8, (cap as i64) * 4) as *i32
+        g_trait_files = realloc(g_trait_files as *u8, (cap as i64) * 8) as **u8
         g_trait_cap = cap
     *(g_trait_names + g_trait_count) = name
     *(g_trait_lens + g_trait_count) = len
+    *(g_trait_files + g_trait_count) = dup_parse_file_name(g_parse_file)
     g_trait_count = g_trait_count + 1
     0
 
@@ -1592,6 +1711,29 @@ pub fn trait_declared(name: *u8, len: i32) -> i32
     while i < g_trait_count
         if buf_eq(*(g_trait_names + i), *(g_trait_lens + i), name, len) == 1
             return 1
+        i += 1
+    0
+
+fn cstr_eq(a: *u8, b: *u8) -> i32
+    if a == null or b == null
+        return 0
+    var i: i64 = 0
+    while *(a + i) != 0 and *(b + i) != 0
+        if *(a + i) != *(b + i)
+            return 0
+        i = i + 1
+    (*(a + i) == *(b + i)) as i32
+
+# AGAST #4294: is `name` a trait declared in `file`?  The file of the impl
+# (ImplBlock.def_file) is compared with the file the trait was parsed from.
+pub fn trait_declared_in_file(name: *u8, len: i32, file: *u8) -> i32
+    if file == null
+        return 0
+    var i: i32 = 0
+    while i < g_trait_count
+        if buf_eq(*(g_trait_names + i), *(g_trait_lens + i), name, len) == 1
+            if cstr_eq(*(g_trait_files + i), file) == 1
+                return 1
         i += 1
     0
 

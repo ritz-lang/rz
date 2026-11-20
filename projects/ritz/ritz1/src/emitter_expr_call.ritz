@@ -457,6 +457,31 @@ fn emit_strview_from_lit(s: *EmitterState, arg: *Expr, reg: i32) -> i32
 
 # The impl method `type_name.method` defined in this module, or null.
 pub fn find_impl_method(s: *EmitterState, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
+    let exact: *FnDef = find_impl_method_exact(s, type_name, type_name_len, method, method_len)
+    if exact != null
+        return exact
+    # AGAST #4294 (R36's revisit): a concrete built-in target —
+    # `impl Display for Span<u8>` — is one impl block for every instantiation
+    # (R65), so its target is the base name and the receiver is `Span$u8`.
+    # Match the base only for a non-generic impl: a generic impl's methods are
+    # monomorphized into the module's functions (find_spec_impl_method).
+    var base_len: i32 = 0
+    while base_len < type_name_len and *(type_name + base_len) != '$'
+        base_len = base_len + 1
+    if base_len == type_name_len
+        return null
+    var ib: *ImplBlock = s.module.impls
+    while ib != null
+        if ib.type_params == null and name_eq(ib.type_name, ib.type_name_len, type_name, base_len) == 1
+            var mm: *FnDef = ib.methods
+            while mm != null
+                if name_eq(mm.name, mm.name_len, method, method_len) == 1
+                    return mm
+                mm = mm.next
+        ib = ib.next
+    return null
+
+fn find_impl_method_exact(s: *EmitterState, type_name: *u8, type_name_len: i32, method: *u8, method_len: i32) -> *FnDef
     var ib: *ImplBlock = s.module.impls
     while ib != null
         if name_eq(ib.type_name, ib.type_name_len, type_name, type_name_len) == 1
@@ -5641,6 +5666,39 @@ fn span_param_arg(s: *EmitterState, arg: *Expr, p: *Param, reg: i32) -> i32
                 coerced = 1
     res
 
+# AGAST #4294 (R36's revisit): the impl target a receiver names when it is a
+# primitive or a `*u8` — `i64`, `bool`, `ptr_u8`.  Null for anything else.  A
+# declared type keeps its name (the arms above resolve those).  ritz1's value
+# model puts a `*u8` in a slot as an i64, so only the declared pointee says.
+fn builtin_receiver_name(s: *EmitterState, recv: *Expr, out_len: *i32) -> *u8
+    if recv == null or recv.kind != EXPR_IDENT
+        return null
+    let loc: *LocalVar = find_local_struct_name(s, recv.ident_ptr, recv.ident_len)
+    if loc == null or loc.type_name_len > 0
+        return null
+    var name: *u8 = null
+    if loc.is_bool == 1
+        # A bool local's slot is an i64 (var_type TYPE_I64); is_bool remembers
+        # the declared type (AGAST #1521).
+        name = c"bool"
+    else if loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+        if loc.pointee_type == TYPE_PTR and loc.inner_pointee_type == TYPE_U8
+            name = c"ptr_u8"
+        else
+            name = primitive_name_from_type(loc.pointee_type)
+    else if loc.var_type == TYPE_PTR
+        if loc.pointee_type == TYPE_U8
+            name = c"ptr_u8"
+    else
+        name = primitive_name_from_type(loc.var_type)
+    if name == null
+        return null
+    if name_eq(name, 2, c"u8", 2) == 1 or name_eq(name, 2, c"i8", 2) == 1
+        *out_len = 2
+    else
+        *out_len = strlen(name) as i32
+    name
+
 pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     record_assert_site(s, e)   # AGAST #1869: in a [[test]] fn only
     # `m.f()`: no `module.item` access (§15.3, AGAST #2215); was "cannot
@@ -6368,6 +6426,17 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             if enum_pred >= 0
                 return enum_pred
 
+    # R36's revisit (#4294): a primitive or `*u8` receiver dispatches to the
+    # trait impl on that built-in type (only legal in the trait's file).  Only
+    # when such a method exists: otherwise the BitOps intrinsics below keep
+    # their no-impl-name path (`x.count_ones()`).
+    if type_name == null or type_name_len == 0
+        var br_len: i32 = 0
+        let br: *u8 = builtin_receiver_name(s, recv, @br_len)
+        if br != null and find_impl_method(s, br, br_len, e.ident_ptr, e.ident_len) != null
+            type_name = br
+            type_name_len = br_len
+
     if type_name == null or type_name_len == 0
         # Integer-primitive receiver: BitOps intrinsics (AGAST #1506).
         # Only reached when no struct type resolved, so it cannot shadow
@@ -6418,25 +6487,7 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
     # coerce struct-ref args (auto-borrow) and narrow non-i64 return values.
     # Without the FnDef, fall back to the pre-#113 `call i64 @...(i64 ...)`.
     var mfn: *FnDef = null
-    var ib_it: *ImplBlock = s.module.impls
-    while ib_it != null and mfn == null
-        if ib_it.type_name_len == type_name_len
-            var ib_match: i32 = 1
-            for i in 0..type_name_len
-                if *(ib_it.type_name + i) != *(type_name + i)
-                    ib_match = 0
-            if ib_match == 1
-                var mm: *FnDef = ib_it.methods
-                while mm != null and mfn == null
-                    if mm.name_len == e.ident_len
-                        var name_match: i32 = 1
-                        for i in 0..e.ident_len
-                            if *(mm.name + i) != *(e.ident_ptr + i)
-                                name_match = 0
-                        if name_match == 1
-                            mfn = mm
-                    mm = mm.next
-        ib_it = ib_it.next
+    mfn = find_impl_method(s, type_name, type_name_len, e.ident_ptr, e.ident_len)
     # AGAST #2096: a generic impl's method specialized at the receiver's type
     # (`w.dup()` on W<i32> -> `W$i32_dup`) lives in the module's functions,
     # not in an impl block.  Without its FnDef the call fell back to

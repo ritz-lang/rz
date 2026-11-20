@@ -207,17 +207,27 @@ pub fn find_generic_struct(m: *Module, name: *u8, name_len: i32) -> *StructDef
 # says the same (ritz0/builtin_types.py).
 
 # The ritzlib module declaring `name` if it is a built-in type, else null.
+# The base name of a concrete generic instance: `Span$u8` names `Span`.
+# AGAST #4294: an impl target on a built-in may be a concrete instantiation
+# (`impl Display for Span<u8>`), and the parser spells it mangled.
+fn type_base_len(name: *u8, len: i32) -> i32
+    var i: i32 = 0
+    while i < len and *(name + i) != 36   # '$'
+        i = i + 1
+    i
+
 fn builtin_type_module(name: *u8, len: i32, out_len: *i32) -> *u8
-    if len == 4 and memcmp(name, c"Span", 4) == 0
+    let base: i32 = type_base_len(name, len)
+    if base == 4 and memcmp(name, c"Span", 4) == 0
         *out_len = 12
         return c"ritzlib.span"
-    if len == 7 and memcmp(name, c"StrView", 7) == 0
+    if base == 7 and memcmp(name, c"StrView", 7) == 0
         *out_len = 15
         return c"ritzlib.strview"
-    if len == 6 and memcmp(name, c"Option", 6) == 0
+    if base == 6 and memcmp(name, c"Option", 6) == 0
         *out_len = 14
         return c"ritzlib.option"
-    if len == 6 and memcmp(name, c"Result", 6) == 0
+    if base == 6 and memcmp(name, c"Result", 6) == 0
         *out_len = 14
         return c"ritzlib.result"
     null
@@ -232,6 +242,35 @@ pub fn module_declares_type(m: *Module, name: *u8, len: i32) -> i32
         return 1
     0
 
+# AGAST #4294 (R36's revisit): a trait impl on a primitive/built-in is legal
+# in the file that declares the trait.  `ib.def_file` is the file the impl was
+# parsed from; the trait log records each trait's file.
+fn impl_in_trait_file(ib: *ImplBlock) -> i32
+    if ib.trait_name == null
+        return 0
+    trait_declared_in_file(ib.trait_name, ib.trait_name_len, ib.def_file)
+
+# R36's revisit admits `Span<T>` and `StrView`, not Option/Result.  A concrete
+# instance (`Span$u8`) is judged by its base.
+fn builtin_impl_target_allowed(name: *u8, len: i32) -> i32
+    let base: i32 = type_base_len(name, len)
+    if base == 4 and memcmp(name, c"Span", 4) == 0
+        return 1
+    if base == 7 and memcmp(name, c"StrView", 7) == 0
+        return 1
+    0
+
+# The target's source spelling: `Span$u8` names `Span`, `ptr_u8` is `*u8`,
+# anything else is as written.
+fn eprint_impl_target(ib: *ImplBlock)
+    if ib.ptr_target == 1
+        eprint_char('*')
+        if ib.type_name_len > 4
+            sys_write(2, ib.type_name + 4, (ib.type_name_len - 4) as i64)
+        return
+    let base: i32 = type_base_len(ib.type_name, ib.type_name_len)
+    sys_write(2, ib.type_name, base as i64)
+
 # Errors reported; `path` is the main file, for blocks it parsed.
 pub fn refuse_impls_on_builtin_types(m: *Module, path: *u8) -> i32
     var errors: i32 = 0
@@ -239,7 +278,11 @@ pub fn refuse_impls_on_builtin_types(m: *Module, path: *u8) -> i32
     while ib != null
         var mod_len: i32 = 0
         let module: *u8 = builtin_type_module(ib.type_name, ib.type_name_len, @mod_len)
-        if module != null and module_declares_type(m, ib.type_name, ib.type_name_len) == 0
+        # A trait impl on Span/StrView is R36's revisit (#4294); it is this
+        # check's to refuse only when inherent, and the placement is
+        # impl_target_class's.
+        let allowed_trait: i32 = (builtin_impl_target_allowed(ib.type_name, ib.type_name_len) == 1 and ib.trait_name != null) as i32
+        if module != null and module_declares_type(m, ib.type_name, ib.type_name_len) == 0 and allowed_trait == 0
             if ib.def_file != null
                 eprints_cstr(ib.def_file)
             else
@@ -249,7 +292,7 @@ pub fn refuse_impls_on_builtin_types(m: *Module, path: *u8) -> i32
             eprint_char(':')
             eprint_i64(ib.impl_span.col as i64)
             eprints_cstr(c": error: `")
-            sys_write(2, ib.type_name, ib.type_name_len as i64)
+            eprint_impl_target(ib)
             eprints_cstr(c"` is a built-in type and can't be extended here: import ")
             sys_write(2, module, mod_len as i64)
             eprints_cstr(c" or declare your own type\n")
@@ -291,6 +334,9 @@ const IMPL_TARGET_OK: i32 = 0
 const IMPL_TARGET_UNKNOWN: i32 = 1
 const IMPL_TARGET_ALIAS: i32 = 2
 const IMPL_TARGET_PRIMITIVE: i32 = 3
+# R36's revisit (#4294): a trait impl on a primitive / built-in / `*u8` that
+# is not in the file declaring the trait.
+const IMPL_TARGET_MISPLACED: i32 = 4
 
 fn impl_has_type_param(ib: *ImplBlock, name: *u8, len: i32) -> i32
     var tp: *TypeParam = ib.type_params
@@ -309,11 +355,41 @@ fn impl_target_class(m: *Module, ib: *ImplBlock) -> i32
         return IMPL_TARGET_OK
     if type_alias_declared(name, len) == 1
         return IMPL_TARGET_ALIAS
+    # R36's revisit (#4294): `impl Trait for *u8` — the parser spells the
+    # target `ptr_u8` — is legal only in the trait's file.
+    if ib.ptr_target == 1
+        if impl_in_trait_file(ib) == 1
+            return IMPL_TARGET_OK
+        return IMPL_TARGET_MISPLACED
     if is_primitive_type_name(name, len) == 1
+        # A trait impl on a primitive is legal in the trait's file; an
+        # inherent impl still says "it can't have an `impl`".
+        if impl_in_trait_file(ib) == 1
+            return IMPL_TARGET_OK
+        if ib.trait_name != null
+            return IMPL_TARGET_MISPLACED
         return IMPL_TARGET_PRIMITIVE
+    # `Span<T>` / `StrView` in the trait's file stand even when nothing
+    # declares them (the emitter synthesizes them); outside it, the trait
+    # impl is misplaced (#4294).
+    var mod_len: i32 = 0
+    let module: *u8 = builtin_type_module(name, len, @mod_len)
+    if module != null and module_declares_type(m, name, len) == 0
+        if builtin_impl_target_allowed(name, len) == 1 and ib.trait_name != null
+            if impl_in_trait_file(ib) == 1
+                return IMPL_TARGET_OK
+            return IMPL_TARGET_MISPLACED
     if module_declares_type(m, name, len) == 1 or is_simd_vector_type_name(name, len) == 1
         return IMPL_TARGET_OK
     IMPL_TARGET_UNKNOWN
+
+# R36's revisit (#4294): "`*u8` is a built-in type: a trait impl for it must
+# be in the trait's file (§12.2)", the target spelled as the source wrote it
+# (`ptr_u8` is `*u8`).
+fn eprint_misplaced_target(ib: *ImplBlock)
+    eprint_char('`')
+    eprint_impl_target(ib)
+    eprints_cstr(c"` is a built-in type: a trait impl for it must be in the trait's file (§12.2)\n")
 
 # "`Id` is a type alias for `Foo`: write `impl Foo`", the target as the
 # alias wrote it (#3625).  One with no recorded spelling drops the "for `T`".
@@ -375,6 +451,8 @@ pub fn refuse_impls_on_unknown_types(m: *Module, path: *u8) -> i32
                 eprint_char('`')
                 sys_write(2, ib.type_name, ib.type_name_len as i64)
                 eprints_cstr(c"` is a built-in type; it can't have an `impl`\n")
+            else if cls == IMPL_TARGET_MISPLACED
+                eprint_misplaced_target(ib)
             else
                 eprints_cstr(c"unknown type `")
                 sys_write(2, ib.type_name, ib.type_name_len as i64)
