@@ -201,7 +201,7 @@ stays here; remote hosts only run rooms.
   claimed"). See "Who owns the ticket" for the whole claim-to-close path.
 - **Host room verbs** (always `send_room_message(room_id="adele-<host>",
   ..., sender_name="rz", ask_claude=True)`):
-  - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=opus`, then
+  - `SPAWN ritz-task-<id> repo=rz task=<id> callback=rz model=deepseek-flash`, then
     the briefing. The host answers `SPAWNED ritz-task-<id> on <host>` or
     `SPAWN-FAILED ritz-task-<id> on <host>: <reason>`.
     `SPAWN` creates the worktree off `origin/main`; the room gates with
@@ -346,8 +346,33 @@ brief, verify the agent woke), with these ritz values:
 | Room / branch / unit name | `ritz-task-<agast-id>` |
 | Worktree | `~/dev/ritz-lang/rz-task-<agast-id>` (branch off `origin/main`) |
 | Install from | `~/dev/nevelis/adele`, `--workspace` pointing at the worktree |
-| Model | `opus` |
+| Model | `deepseek-flash` (see "Fleet model" below), not `opus` |
 | Callback room | `rz` |
+
+**Pass `--worktree ~/dev/ritz-lang/rz-task-<agast-id>` explicitly.** `adele
+room spawn`'s default is `<repo-dir>-<room>`, which for repo `rz` and room
+`ritz-task-<id>` gives `rz-ritz-task-<id>` — a worktree name no briefing,
+reap, or teardown step expects (2026-11-20).
+
+**Fleet model (AGAST #2609 follow-up).** While the Claude weekly limit is
+exhausted the whole fleet runs DeepSeek. `adele room spawn --harness
+deepseek` writes `ADELE_HARNESS` but the unit template's `ExecStart` never
+passes `--harness`, so the agent falls back to Claude and its first turn
+dies with "You've hit your weekly limit · resets <date>". Two steps per
+room, **before** the unit starts:
+1. `adele install … --harness deepseek --model deepseek-flash` (or pass
+   `model=deepseek-flash` to the host room's `SPAWN`).
+2. Write
+   `~/.config/systemd/user/adele-agent@<room>.service.d/90-adele-deepseek.conf`:
+   ```
+   [Service]
+   ExecStart=
+   ExecStart=/usr/bin/env PYTHONPATH=%h/dev/nevelis/adele %h/dev/nevelis/.venv/bin/python -m cli.main agent --room %i --harness deepseek --model deepseek-flash
+   ```
+   then `systemctl --user daemon-reload` *before* starting the unit.
+Remove the drop-in once the spawn template passes the harness itself.
+Rooms that keep dying on their first turn, or whose last `claude_response`
+is the synthetic "weekly limit" line, are this, not a bug in their work.
 
 **"START poke sent" doesn't mean the room started.** Within ~2 minutes of
 `adele room spawn`, check the room has posted a `claude_response` or tool use
