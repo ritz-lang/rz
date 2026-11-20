@@ -114,6 +114,16 @@ SCANNER_DISPATCHED_CHARS = '"\'#$ \t\r\n'
 # (AGAST #3414, LARB R45a: a fn called from another file must be `pub`).
 PUBLIC_RULES = frozenset({'module', 'expr'})
 
+# AGAST #4374: nullable rules whose empty match is pure (or fails through
+# p.error alone), so an alternative beginning with one may be skipped when the
+# lookahead cannot reach the alternative's first terminal.  `assign_pos` is a
+# pure query, `attrs`/`op_nl` match empty with no action, and
+# `closure_ahead` only sets p.error (and only when the lookahead is `|`, which
+# is in every alternative's FIRST set, so it still runs there).  Anything else
+# that is nullable and first in an alternative stays unguarded: the generator
+# cannot know its action is pure, and running it must not be skipped.
+TRANSPARENT_NULLABLE_PREFIX = frozenset({'assign_pos', 'attrs', 'op_nl', 'closure_ahead'})
+
 
 def unmapped_tokens(grammar: Grammar) -> List[str]:
     """Grammar tokens that have no ritz1 token ID (and so can't be lexed)."""
@@ -127,6 +137,9 @@ class RitzGenerator:
         self.grammar = grammar
         self.output: List[str] = []
         self.rule_map: Dict[str, GrammarRule] = {r.name: r for r in grammar.rules}
+        # AGAST #4374: computed once, from the grammar, for lookahead dispatch.
+        self._nullable: Optional[Dict[str, bool]] = None
+        self._first: Optional[Dict[str, Set[str]]] = None
 
     def _emit(self, line: str = ''):
         """Emit a line of Ritz code."""
@@ -418,6 +431,40 @@ class RitzGenerator:
         self._emit('        eof.col = 0')
         self._emit('        return eof')
         self._emit('    return *(p.tokens + p.pos)')
+        self._emit('')
+        # AGAST #4374: FIRST-set dispatch.  A token kind is one bit in a 3x
+        # u64 set (kinds are 0..141).  p_first_has answers "could an
+        # alternative beginning with one of these terminals match here?";
+        # p_record_first replays the expects that trying a skipped
+        # alternative in turn would have recorded, i.e. its first terminal.
+        self._emit('fn p_first_has(kind: i32, b0: u64, b1: u64, b2: u64) -> i32')
+        self._emit('    if kind < 0')
+        self._emit('        return 0')
+        self._emit('    if kind < 64')
+        self._emit('        return ((b0 >> (kind as u64)) & (1 as u64)) as i32')
+        self._emit('    if kind < 128')
+        self._emit('        return ((b1 >> ((kind - 64) as u64)) & (1 as u64)) as i32')
+        self._emit('    if kind < 192')
+        self._emit('        return ((b2 >> ((kind - 128) as u64)) & (1 as u64)) as i32')
+        self._emit('    0')
+        self._emit('')
+        # Record a skipped alternative's FIRST set directly: OR-ing the bits is
+        # O(1), where replaying p_record_fail per kind would walk all 192.  It
+        # obeys the same mark as p_record_fail (AGAST #1819): only failures at
+        # the furthest position reached are kept, so this cannot widen a
+        # diagnostic past what trying the alternative would have produced.
+        self._emit('fn p_record_first(p: *Parser, b0: u64, b1: u64, b2: u64)')
+        self._emit('    if p.fail_pos < 0 or p.pos > p.fail_pos')
+        self._emit('        p.fail_pos = p.pos')
+        self._emit('        p.fail_b0 = b0')
+        self._emit('        p.fail_b1 = b1')
+        self._emit('        p.fail_b2 = b2')
+        self._emit('        return')
+        self._emit('    if p.pos < p.fail_pos')
+        self._emit('        return')
+        self._emit('    p.fail_b0 = p.fail_b0 | b0')
+        self._emit('    p.fail_b1 = p.fail_b1 | b1')
+        self._emit('    p.fail_b2 = p.fail_b2 | b2')
 
     def _get_return_type(self, rule: GrammarRule) -> str:
         """Get the Ritz return type for a rule."""
@@ -470,6 +517,118 @@ class RitzGenerator:
                 return True
         return False
 
+    # =========================================================================
+    # FIRST sets and lookahead dispatch (AGAST #4374)
+    # =========================================================================
+    #
+    # Every alternative used to be tried in turn, each with its whole flat
+    # sequence of symbols: a failed symbol then made every later call a no-op,
+    # but the calls were still made (parse_primary_expr costs ~40 of them on a
+    # token only its last alternative accepts).  An alternative is now guarded
+    # by the FIRST set of the terminal it can begin with, so a lookahead that
+    # cannot start it skips it outright.  The skipped alternatives fail at
+    # their first terminal in the unguarded parser, so the consumed prefix,
+    # p.max_pos and p.error are unchanged; each skipped alternative records its
+    # FIRST set as an expected token, so the located "expected one of: ..."
+    # diagnostic is unchanged too.
+
+    def _nullable_rules(self) -> Dict[str, bool]:
+        if self._nullable is not None:
+            return self._nullable
+        nullable = {name: False for name in self.rule_map}
+        changed = True
+        while changed:
+            changed = False
+            for name, rule in self.rule_map.items():
+                if nullable[name]:
+                    continue
+                for alt in rule.alternatives:
+                    if self._alt_nullable(alt, nullable):
+                        nullable[name] = True
+                        changed = True
+                        break
+        self._nullable = nullable
+        return nullable
+
+    def _first_sets(self) -> Dict[str, Set[str]]:
+        if self._first is not None:
+            return self._first
+        nullable = self._nullable_rules()
+        first = {name: set() for name in self.rule_map}
+        changed = True
+        while changed:
+            changed = False
+            for name, rule in self.rule_map.items():
+                for alt in rule.alternatives:
+                    add = self._alt_first(alt, first, nullable)
+                    if not add <= first[name]:
+                        first[name] |= add
+                        changed = True
+        self._first = first
+        return first
+
+    def _symbol_nullable(self, sym: GrammarSymbol, nullable: Dict[str, bool]) -> bool:
+        if sym.kind in (SymbolKind.OPTIONAL, SymbolKind.STAR):
+            return True
+        if sym.kind in (SymbolKind.NONTERMINAL, SymbolKind.PLUS):
+            return nullable.get(sym.name, False)
+        return False
+
+    def _alt_nullable(self, alt: GrammarAlt, nullable: Dict[str, bool]) -> bool:
+        """True when the alternative can match the empty string."""
+        return all(self._symbol_nullable(s, nullable) for s in alt.symbols)
+
+    def _alt_first(self, alt: GrammarAlt, first: Dict[str, Set[str]],
+                   nullable: Dict[str, bool]) -> Set[str]:
+        """The terminals an alternative can begin with (proper FIRST set)."""
+        out: Set[str] = set()
+        for sym in alt.symbols:
+            if sym.kind == SymbolKind.TERMINAL:
+                out.add(sym.name)
+            else:
+                out |= first.get(sym.name, set())
+            if not self._symbol_nullable(sym, nullable):
+                break
+        return out
+
+    def _first_bits(self, token_names: Set[str]) -> Tuple[int, int, int]:
+        """A 3x u64 bitset of token kinds, p_first_has's argument shape."""
+        b = [0, 0, 0]
+        for name in token_names:
+            tid = HAND_WRITTEN_TOKEN_IDS.get(name)
+            if tid is None:
+                raise ValueError(f"FIRST set names unmapped token {name}")
+            b[tid // 64] |= 1 << (tid % 64)
+        return b[0], b[1], b[2]
+
+    def _alt_dispatch(self, alt: GrammarAlt) -> Optional[Set[str]]:
+        """The FIRST terminals guarding this alternative, or None to always run it.
+
+        None means: the alternative is nullable (it must always run, and its
+        empty match is a legitimate success), falls through a nullable prefix
+        whose action the generator cannot vouch for, or has no FIRST terminal
+        at all.
+        """
+        nullable = self._nullable_rules()
+        if self._alt_nullable(alt, nullable):
+            return None
+        for sym in alt.symbols:
+            if sym.kind == SymbolKind.TERMINAL:
+                break
+            if sym.kind == SymbolKind.NONTERMINAL and nullable.get(sym.name):
+                if sym.name not in TRANSPARENT_NULLABLE_PREFIX:
+                    return None
+                continue
+            if sym.kind != SymbolKind.NONTERMINAL:
+                # A leading `x?` / `x*` / `x+`: its own action may run even on
+                # a missed lookahead, so don't skip it.
+                return None
+            break
+        first = self._alt_first(alt, self._first_sets(), nullable)
+        if not first:
+            return None
+        return first
+
     def _generate_parse_function(self, rule: GrammarRule):
         """Generate a parse_<name>() function for one grammar rule."""
         rt = self._get_return_type(rule)
@@ -485,12 +644,48 @@ class RitzGenerator:
         self._emit(f'        return {default_ret}')
         self._emit(f'    let start_pos: i32 = p.pos')
 
+        # AGAST #4374: dispatch each alternative on the lookahead's FIRST set.
+        # Single-alternative rules have nothing to choose, so they keep the
+        # plain flat sequence.
+        dispatch: List[Optional[Set[str]]] = [None] * len(rule.alternatives)
+        if len(rule.alternatives) > 1:
+            dispatch = [self._alt_dispatch(alt) for alt in rule.alternatives]
+        any_guard = any(d is not None for d in dispatch)
+        all_guard = any_guard and all(d is not None for d in dispatch)
+        if any_guard:
+            # The lookahead at each alternative's start: p.pos is start_pos
+            # there (every preceding alternative either returned or was
+            # rewound), so one read serves them all.
+            self._emit('    let la: i32 = p_peek(p)')
         for alt_idx, alt in enumerate(rule.alternatives):
             if alt_idx > 0:
                 # Reset for next alternative
                 self._emit('    p_rewind(p, start_pos)')
 
-            self._generate_alternative(rule, alt, alt_idx, default_ret)
+            if dispatch[alt_idx] is not None:
+                first = dispatch[alt_idx]
+                b0, b1, b2 = self._first_bits(first)
+                if len(first) == 1:
+                    # The common case is a one-token FIRST set: compare the
+                    # lookahead directly.  p_first_has is a real call, and on
+                    # this path it is inside every enclosing parse loop.
+                    self._emit(f'    if la == TOK_{next(iter(first))}')
+                else:
+                    self._emit(f'    if p_first_has(la, {b0} as u64, {b1} as u64, '
+                               f'{b2} as u64) != 0')
+                self._generate_alternative_indented(rule, alt, alt_idx,
+                                                    default_ret, 1)
+                # AGAST #4374: a skipped alternative fails at its first
+                # terminal in the unguarded parser, so record that here.  The
+                # flat sequence did it by running p_expect; without this the
+                # located "expected one of: ..." loses the alternatives the
+                # guard skipped (measured: `dedent` alone where the flat form
+                # said `dedent, self, identifier`).
+                self._emit('    else')
+                self._emit(f'        p_record_first(p, {b0} as u64, '
+                           f'{b1} as u64, {b2} as u64)')
+            else:
+                self._generate_alternative(rule, alt, alt_idx, default_ret)
 
         # AGAST #1819: every failed alternative used to restore p.pos as it
         # went; now the restore happens just before the next alternative, so
@@ -498,6 +693,23 @@ class RitzGenerator:
         # what the caller (and the recovery block below) must see.
         if len(rule.alternatives) > 1:
             self._emit('    p.pos = start_pos')
+
+        if all_guard:
+            # Reaching the end means no alternative matched: each is guarded,
+            # and none can succeed without consuming a token.  The failure
+            # must be stated here -- when the *last* alternative's guard
+            # missed, the rewind before it cleared p.error and no alternative
+            # body ran to set it again (postfix_ops looped forever this way).
+            # Record what trying every alternative from start_pos would have
+            # expected: the union of their FIRST sets.
+            union = set()
+            for alt in rule.alternatives:
+                union |= self._alt_first(alt, self._first_sets(),
+                                         self._nullable_rules())
+            u0, u1, u2 = self._first_bits(union)
+            self._emit(f'    p_record_first(p, {u0} as u64, {u1} as u64, '
+                       f'{u2} as u64)')
+            self._emit('    p.error = 1')
 
         # Recovery directive: when all alternatives failed and we're not
         # at EOF, skip forward to the next "anchor" token from the rule's
@@ -529,6 +741,24 @@ class RitzGenerator:
         # Final return.  The old `if p.error == 0 / return X / return X` pair
         # returned the same value on both paths (AGAST #1819).
         self._emit(f'    return {default_ret}')
+
+    def _generate_alternative_indented(self, rule: GrammarRule, alt: GrammarAlt,
+                                       alt_idx: int, default_ret: str,
+                                       depth: int):
+        """Emit an alternative's body nested `depth` levels (inside a guard)."""
+        if depth == 0:
+            self._generate_alternative(rule, alt, alt_idx, default_ret)
+            return
+        saved = self.output
+        self.output = []
+        try:
+            self._generate_alternative(rule, alt, alt_idx, default_ret)
+            body = self.output
+        finally:
+            self.output = saved
+        pad = '    ' * depth
+        for line in body:
+            self._emit(pad + line if line else line)
 
     def _generate_alternative(self, rule: GrammarRule, alt: GrammarAlt,
                               alt_idx: int, default_ret: str):
