@@ -35,6 +35,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 from test_ritz0_x86_target_features import (
     BASELINE_CPU,
@@ -127,24 +128,25 @@ def _ritz1(src: Path, ll: Path) -> None:
 def _define_attrs(ir: str, fn: str) -> str:
     """The attribute text after the parameter list of fn's `define` line.
 
-    ritz1 spells names bare (`@use_sha(`), ritz0 quotes them; accept both.
+    ritz1 spells names bare (`@use_sha(`), ritz0 quotes them; a private free
+    fn's symbol also carries its file's hash in ritz1 (#1858/#4356).
     """
+    pat = re.compile(test_ir.symbol(fn) + r"\(")
     for line in ir.splitlines():
         if not line.startswith("define"):
             continue
-        for head in (f"@{fn}(", f'@"{fn}"('):
-            at = line.find(head)
-            if at < 0:
-                continue
-            # Skip to the paren closing the parameter list (attributes such
-            # as alignstack(16) carry parens of their own).
-            depth, i = 0, at + len(head) - 1
-            while i < len(line):
-                depth += {"(": 1, ")": -1}.get(line[i], 0)
-                if depth == 0:
-                    break
-                i += 1
-            return line[i + 1 :].rsplit("{", 1)[0]
+        m = pat.search(line)
+        if not m:
+            continue
+        # Skip to the paren closing the parameter list (attributes such
+        # as alignstack(16) carry parens of their own).
+        depth, i = 0, m.end() - 1
+        while i < len(line):
+            depth += {"(": 1, ")": -1}.get(line[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        return line[i + 1 :].rsplit("{", 1)[0]
     raise AssertionError(f"no define for @{fn}")
 
 

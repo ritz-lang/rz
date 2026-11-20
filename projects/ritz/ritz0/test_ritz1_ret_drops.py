@@ -18,6 +18,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 import fast_link
 from test_ownership_free_count import PRELUDE, RITZ_START, SLOT, _compile
@@ -77,9 +78,7 @@ def _build_run(compiler, tmp_path, body):
 
 
 def _fn_ir(ll: str, name: str) -> str:
-    m = re.search(r"^define [^\n]*@" + re.escape(name) + r"\(.*?^}", ll, re.S | re.M)
-    assert m, f"no @{name} in the IR"
-    return m.group(0)
+    return test_ir.define_text(ll, name)
 
 
 def _blocks(fn_ir: str) -> list:

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import fast_link
 import pytest
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 
@@ -73,9 +74,7 @@ fn main() -> i32
 
 
 def _fn_body(ll: str, name: str) -> str:
-    m = re.search(r"^define [^\n]*@" + re.escape(name) + r"\(.*?^}", ll, re.S | re.M)
-    assert m, f"no definition of @{name} in the IR"
-    return m.group(0)
+    return test_ir.define_text(ll, name)
 
 
 def _compile(ritz1_bin: Path, tmp_path: Path, name: str, program: str) -> str:

@@ -23,6 +23,7 @@ from types import SimpleNamespace
 import pytest
 
 import fast_link
+import test_ir
 
 import match_coverage
 import parser as ritz_parser
@@ -698,8 +699,7 @@ _STRUCT_TAIL = ("struct P\n    a: i64\n    b: i64\n    c: i64\n    d: i64\n    e
 
 
 def _fn_ir(ll, name):
-    text = ll.read_text()
-    return text[text.index(f"@{name}("):].split("\n}\n", 1)[0]
+    return test_ir.define_rest(ll.read_text(), name)
 
 
 @pytest.mark.integration

@@ -18,6 +18,7 @@ until #1864 replaced it with secure_zero (#3628 then removed mem_zero).
 import re
 
 import pytest
+import test_ir
 
 import subprocess
 
@@ -247,7 +248,7 @@ fn bare(a: i64) -> i64
 
 pub fn main() -> i32
     0
-""", [r'define internal i64 @bare\(i64 %a\.arg\) naked noinline \{\nentry:\n'
+""", [rf'define (?:internal )?i64 {test_ir.symbol("bare")}\(i64 %a\.arg\) naked noinline \{{\nentry:\n'
       r'  call void asm sideeffect "movq %rdi, %rax", "~\{rax\},~\{rdi\},~\{memory\},~\{dirflag\},~\{fpsr\},~\{flags\}"\(\)\n'
       r'  call void asm sideeffect "retq", "~\{memory\},~\{dirflag\},~\{fpsr\},~\{flags\}"\(\)\n'
       r'  unreachable\n\}']),

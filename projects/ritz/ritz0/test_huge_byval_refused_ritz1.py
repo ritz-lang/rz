@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 import fast_link
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BUILD = RITZ_ROOT / "ritz1" / "build"
@@ -117,5 +118,6 @@ def test_ritz1_keeps_a_huge_param_by_reference(request, tmp_path, compiler, name
 def test_ritz1_keeps_byval_below_4_gib(request, tmp_path, compiler):
     proc, ll = _ritz1(request, compiler, tmp_path, _ONE_GIB)
     assert proc.returncode == 0, f"{compiler}:\n{(proc.stdout + proc.stderr)[-800:]}"
-    assert re.search(r"define .*@f\(ptr byval\(%G\) align 8 %g\.arg\)", ll.read_text()), \
+    assert re.search(rf"define .*{test_ir.symbol('f')}\(ptr byval\(%G\) align 8 %g\.arg\)",
+                     ll.read_text()), \
         f"{compiler}: the 1 GiB param should stay byval"

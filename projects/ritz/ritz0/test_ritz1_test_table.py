@@ -23,6 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -118,16 +119,20 @@ def test_every_entry_is_called_as_fn_returning_i32(ritz1_bin, tmp_path):
     """
     ir = _ir(tmp_path, SOURCE)
     table = _table(ir)
-    assert "ptr @check_first }" in table, table
+    # A [[test]] fn is a private free fn: in ritz1 its symbol carries its
+    # file's hash (#1858/#4356).
+    assert re.search(rf"ptr {test_ir.symbol('check_first')} \}}", table), table
     for name in ("test_unit", "test_wide", "test_flag"):
-        assert f"ptr @{name} " not in table, f"{name} must be wrapped: {table}"
+        assert not re.search(rf"ptr {test_ir.symbol(name)} ", table), (
+            f"{name} must be wrapped: {table}")
     wide = re.search(r'^define internal i32 @__ritz_test_run\.\d+\(\) \{\n(?:(?!^\}).*\n)*'
-                     r'.*call i64 @test_wide\(\)\n(?:(?!^\}).*\n)*\}', ir, re.M)
+                     rf'.*call i64 {test_ir.symbol("test_wide")}\(\)\n(?:(?!^\}}).*\n)*\}}',
+                     ir, re.M)
     assert wide, ir
     assert "icmp ne i64" in wide.group(0) and "trunc" not in wide.group(0), wide.group(0)
-    unit = re.search(r'call void @test_unit\(\)\n  ret i32 0', ir)
+    unit = re.search(rf'call void {test_ir.symbol("test_unit")}\(\)\n  ret i32 0', ir)
     assert unit, ir
-    assert re.search(r'call i1 @test_flag\(\)\n  %failed = icmp ne i1 %r, 0', ir), ir
+    assert re.search(rf'call i1 {test_ir.symbol("test_flag")}\(\)\n  %failed = icmp ne i1 %r, 0', ir), ir
 
 
 def test_test_mode_starts_in_the_runners_main(ritz1_bin, tmp_path):

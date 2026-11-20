@@ -48,6 +48,7 @@ import subprocess
 import pytest
 
 import batching
+import test_ir
 import test_table_rows as table_rows
 from ritz0_inproc import run_ritz0
 from test_ritz1_builtin_struct_shadow import RITZ_ROOT, _batch_build, _batch_compile, _run
@@ -2338,7 +2339,8 @@ pub fn main() -> i32
 
 def _signature(text):
     """The param types in `@g`'s definition, with the name mangling dropped."""
-    line = next(l for l in text.splitlines() if l.startswith("define") and re.search(r'@"?g"?\(', l))
+    line = next(l for l in text.splitlines()
+                if l.startswith("define") and re.search(test_ir.symbol("g") + r"\(", l))
     params = line[line.index("(") + 1:line.index(")")]
     return [re.sub(r'%"?struct\.[a-z_0-9]*\.', "%", p.rsplit(" ", 1)[0]).replace('"', "").replace("*", "").strip()
             for p in params.split(", ")]
@@ -2448,7 +2450,8 @@ def _ret_spellings(text):
     """{(kind, fn): return type} for the define / declare / call of f, S_m, ext."""
     out = {}
     for line in text.splitlines():
-        m = re.match(r'\s*(?:%"?[.\w]+"? = )?(define|declare|call)\b(.*?)@"?(f|S_m|ext)"?\(', line)
+        m = re.match(r'\s*(?:%"?[.\w]+"? = )?(define|declare|call)\b(.*?)@"?'
+                     r'(f|S_m|ext)(?:__[0-9a-f]{8})?"?\(', line)
         if m:
             words = [w for w in m.group(2).split() if w not in ("internal", "external", "weak_odr")]
             out[(m.group(1), m.group(3))] = " ".join(words)

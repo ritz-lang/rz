@@ -32,6 +32,7 @@ from pathlib import Path
 
 import fast_link
 import pytest
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -182,6 +183,6 @@ STORE_TYPE = {
 @pytest.mark.parametrize("name", sorted(STORE_TYPE))
 def test_ritz1_storeu_typed_as_value(ritz1_bin, tmp_path, name):
     ll = _ritz1_compile(tmp_path, name, PROGRAMS[name][0])
-    body = ll.read_text().split("@use(", 1)[1].split("\n}\n", 1)[0]
+    body = test_ir.define_rest(ll.read_text(), "use")
     stores = [ln for ln in body.splitlines() if "store <" in ln and "align 1" in ln]
     assert len(stores) == 1 and f"store {STORE_TYPE[name]}" in stores[0], stores

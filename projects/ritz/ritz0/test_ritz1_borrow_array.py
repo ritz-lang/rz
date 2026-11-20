@@ -21,6 +21,7 @@ is the oracle: every program runs through both compilers.
 import re
 
 import pytest
+import test_ir
 
 from test_borrow_param_ref_field import _compile, _run
 
@@ -133,7 +134,7 @@ pub fn main() -> i32
 """
     comp, ll, _ = _compile("ritz1", ritz1_bin, tmp_path, "ir", program)
     assert comp.returncode == 0, comp.stdout + comp.stderr
-    body = re.search(r"define [^\n]*@f\(.*?^}", ll.read_text(), re.M | re.S).group(0)
+    body = test_ir.define_text(ll.read_text(), "f")
     assert "getelementptr [2 x i32]" in body
     assert "store i32" in body
     assert "store i64" not in body.replace("store i64 0", "")

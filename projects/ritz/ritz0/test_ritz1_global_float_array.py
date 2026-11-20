@@ -18,6 +18,7 @@ import subprocess
 
 import fast_link
 import pytest
+import test_ir
 
 SHAPE = """\
 var g: [3]{elem}
@@ -37,8 +38,7 @@ pub fn main() -> i32
 
 
 def _fn_ir(ll_text, name):
-    body = ll_text.split(f" @{name}(", 1)[1]
-    return body.split("\n}", 1)[0]
+    return test_ir.define_rest(ll_text, name)
 
 
 @pytest.mark.integration

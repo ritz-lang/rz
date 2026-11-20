@@ -34,6 +34,7 @@ import re
 from pathlib import Path
 
 import pytest
+import test_ir
 
 from test_ritz1_large_struct_ret import (
     _assert_no_libc_mem,
@@ -61,7 +62,7 @@ BYVAL_BIG = rf"byval\({BIG_T}\) align 8"
 
 def _header(text: str, kind: str, fn: str) -> str:
     """The `define`/`declare` line of @fn (llvmlite quotes the name)."""
-    pat = re.compile(rf'^{kind}\b.*@"?{re.escape(fn)}"?\(')
+    pat = re.compile(rf'^{kind}\b.*{test_ir.symbol(fn)}\(')
     for line in text.splitlines():
         if pat.search(line):
             return line
@@ -69,7 +70,7 @@ def _header(text: str, kind: str, fn: str) -> str:
 
 
 def _calls(text: str, fn: str) -> list:
-    pat = re.compile(rf'call [^@]*@"?{re.escape(fn)}"?\(')
+    pat = re.compile(rf'call [^@]*{test_ir.symbol(fn)}\(')
     return [line for line in text.splitlines() if pat.search(line)]
 
 

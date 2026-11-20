@@ -31,6 +31,7 @@ from pathlib import Path
 import pytest
 
 import fast_link
+import test_ir
 
 from ritz0_inproc import run_ritz0
 
@@ -207,7 +208,7 @@ def test_ptr_float_deref_ir_loads_float(ritz1_bin, tmp_path, t, llty):
     comp = _compile("ritz1", ritz1_bin, src, ll)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()
-    m = re.search(r"define [^\n]*@first\(.*?\n}\n", ir, re.S)
+    m = re.search(rf"define [^\n]*{test_ir.symbol('first')}\(.*?\n}}\n", ir, re.S)
     assert m, ir[:2000]
     body = m.group(0)
     assert f"load {llty}, ptr" in body, body

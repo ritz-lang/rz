@@ -24,6 +24,7 @@ way still has to emit icmp u* / udiv / urem.
 import re
 
 import pytest
+import test_ir
 
 from test_ritz1_builtin_struct_shadow import _run
 
@@ -214,9 +215,7 @@ def test_unsigned_ops_match_ritz0(ritz1_bin, tmp_path, name, program):
 
 
 def _fn_body(ll_text: str, name: str) -> str:
-    m = re.search(rf"^define [^\n]*@{name}\(.*?^\}}", ll_text, re.M | re.S)
-    assert m, f"no definition of @{name} in ritz1 IR"
-    return m.group(0)
+    return test_ir.define_text(ll_text, name)
 
 
 # One fn per op, so each instruction is checked where it is emitted.

@@ -5,10 +5,12 @@ every definition of the name is the same, so two modules' *private*
 `fn helper()` with different bodies were merged into one, and one module
 silently called the other's body.
 
-The rule: a private fn is `internal`, a `pub fn` an external `define`, `main`
-external, a monomorph (`$` in its name) `linkonce_odr`. Inherent impl
-methods follow the same rule; a trait impl's methods are external. Only the
-module that declares the impl defines them.
+The rule: a private *free* fn is an external `define` whose symbol carries its
+defining file's hash (`priv_fn__1a2b3c4d`, #1858/#4356), a `pub fn` an external
+`define`, `main` external, a monomorph (`$` in its name) `linkonce_odr`. An
+inherent impl method stays `internal` (it can only be called through its
+type's module); a trait impl's methods are external. Only the module that
+declares the impl defines them.
 
 §15.3 refuses one import closure holding two `fn helper`, so the runtime test
 links two modules that never import each other: main imports `a` and reaches
@@ -113,7 +115,9 @@ def _link_run(cwd: Path, lls: list) -> int:
 
 
 def _define_line(ir: str, symbol: str) -> str:
-    m = re.search(rf"^define [^\n]*@{re.escape(symbol)}\(", ir, re.M)
+    # A private free fn's symbol carries its file's hash (#4356).
+    m = re.search(rf"^define [^\n]*@{re.escape(symbol)}(?:__[0-9a-f]{{8}})?\(",
+                  ir, re.M)
     assert m, f"no definition of @{symbol} in:\n{ir[:3000]}"
     return m.group(0)
 
@@ -127,7 +131,7 @@ def test_ritz1_private_fns_of_two_modules_stay_apart(ritz1_bin, tmp_path):
 
 # (symbol, linkage prefix of its `define` line)
 ROWS = {
-    "private_fn": ("priv_fn", "define internal "),
+    "private_fn": ("priv_fn", "define i32 "),
     "pub_fn": ("pub_fn", "define i32 "),
     "main": ("main", "define i32 "),
     "monomorph": ("ident$i32", "define linkonce_odr "),

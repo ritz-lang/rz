@@ -25,6 +25,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 import fast_link
 
@@ -169,6 +170,6 @@ def test_global_struct_ptr_add_is_scaled_in_ir(ritz1_bin, tmp_path):
     comp = _compile("ritz1", ritz1_bin, src, ll)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()
-    m = re.search(r"define [^\n]*@at\(.*?\n}\n", ir, re.S)
+    m = re.search(rf"define [^\n]*{test_ir.symbol('at')}\(.*?\n}}\n", ir, re.S)
     assert m, ir[:2000]
     assert re.search(r"= mul i64 %[\w.]+, 24\n", m.group(0)), m.group(0)

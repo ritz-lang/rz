@@ -22,6 +22,7 @@ from pathlib import Path
 
 import fast_link
 import pytest
+import test_ir
 from test_kernel_features import COMPILERS, RITZ_ROOT, RITZ_START, _ir
 
 pytestmark = pytest.mark.integration
@@ -93,8 +94,11 @@ def _o2(compiler, tmp_path, src, name):
 
 
 def _fn_body(ir, name):
-    """The text of `define ... @name(...) { ... }` in `ir`."""
-    m = re.search(rf"^define [^\n]*@\"?{re.escape(name)}\"?\(.*?^}}", ir, re.MULTILINE | re.DOTALL)
+    """The text of `define ... @name(...) { ... }` in `ir`.  `name` is the
+    Ritz name; a private fn's symbol carries its file (`derive__1a2b3c4d`,
+    AGAST #1858/#4356), which test_ir.symbol accepts."""
+    m = re.search(rf"^define [^\n]*{test_ir.symbol(name)}\(.*?^}}",
+                  ir, re.MULTILINE | re.DOTALL)
     assert m, f"no define for {name}:\n{ir[:3000]}"
     return m.group(0)
 
@@ -114,7 +118,7 @@ def test_secure_zero_survives_O2(compiler, tmp_path):
     body = _fn_body(secure, "derive")
     # Inlined (volatile stores in derive) or not (derive still calls it and
     # its body keeps them): either way the wipe reaches memory.
-    if re.search(r"call [^\n]*@\"?secure_zero\"?\(", body):
+    if re.search(rf"call [^\n]*{test_ir.symbol('secure_zero')}\(", body):
         body = _fn_body(secure, "secure_zero")
     assert re.search(r"store volatile i8 ", body), f"{compiler}: byte wipe elided at -O2:\n{body}"
     assert re.search(r"store volatile i64 ", body), f"{compiler}: word wipe elided at -O2:\n{body}"

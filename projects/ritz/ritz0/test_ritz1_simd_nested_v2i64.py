@@ -28,6 +28,7 @@ from pathlib import Path
 
 import fast_link
 import pytest
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -187,7 +188,7 @@ def test_ritz1_stores_nested_v2i64_as_v2i64(ritz1_bin, tmp_path, name):
         timeout=300,
         check=True,
     )
-    body = ll.read_text().split(f"@use_{name}(", 1)[1].split("\n}\n", 1)[0]
+    body = test_ir.define_rest(ll.read_text(), f"use_{name}")
     # simd_storeu is the only align-1 vector store (the `let` bindings'
     # stores carry no alignment).
     stores = [ln for ln in body.splitlines() if "store <" in ln and "align 1" in ln]

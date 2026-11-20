@@ -103,6 +103,18 @@ def test_two_imports_each_with_a_private_be16(compiler, tmp_path):
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
+def test_generic_instance_calls_its_own_modules_private_fn(compiler, tmp_path):
+    """AGAST #4356: `m`'s generic calls `m`'s private helper, but the instance
+    is emitted in t's object, so the symbol (not an internal, un-mangled one)
+    must resolve across objects."""
+    _write(tmp_path, {
+        "m": "fn helper() -> i32\n    7\n\n"
+             "pub fn f<T>(v: i32) -> i32\n    helper() + v\n",
+        "t": "import m\n\nfn main() -> i32\n    f<i32>(1)\n"})
+    assert _run(compiler, tmp_path, ["m", "t"]) == 8
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_importer_private_beside_an_imports_private(compiler, tmp_path):
     """The compiled file's own private be16 is the one its body calls."""
     _write(tmp_path, {

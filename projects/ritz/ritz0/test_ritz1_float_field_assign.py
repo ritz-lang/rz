@@ -20,6 +20,7 @@ import subprocess
 
 import fast_link
 import pytest
+import test_ir
 
 SHAPE = """\
 struct P
@@ -65,8 +66,7 @@ LITERAL_FNS = ("local_lit", "ptr_param_lit", "nested_lit")
 
 
 def _fn_ir(ll_text, name):
-    body = ll_text.split(f" @{name}(", 1)[1]
-    return body.split("\n}", 1)[0]
+    return test_ir.define_rest(ll_text, name)
 
 
 @pytest.mark.integration

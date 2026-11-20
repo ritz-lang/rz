@@ -29,6 +29,7 @@ from pathlib import Path
 import pytest
 
 import fast_link
+import test_ir
 
 from ritz0_inproc import run_ritz0
 
@@ -279,7 +280,9 @@ def test_comma_separated_attribute_list(request, tmp_path, compiler):
 def test_inline_family_reaches_the_ir(request, tmp_path, compiler):
     _need(compiler, request)
     ir = _ir(compiler, tmp_path, KNOWN_OK)
-    defs = {m.group(1): m.group(0) for m in
+    # A private free fn's symbol carries its file's hash in ritz1 (#4356);
+    # key by the Ritz name so both compilers look the same here.
+    defs = {test_ir.strip(m.group(1)): m.group(0) for m in
             re.finditer(r'^define [^@]*@"?(\w+)"?\(.*$', ir, re.M)}
 
     def attrs_of(fn):
@@ -669,7 +672,8 @@ def test_ritz1_naked_has_no_prologue_and_runs_at_O2(ritz1_bin, tmp_path):
     # it: `naked noinline` (#1917), no slot for a parameter, the blocks, then
     # `unreachable`.
     ir = _ir("ritz1", tmp_path, NAKED)
-    m = re.search(r'^define [^\n]*@"?naked_add"?\(.*?^}', ir, re.M | re.S)
+    m = re.search(rf'^define [^\n]*{test_ir.symbol("naked_add")}\(.*?^}}',
+                  ir, re.M | re.S)
     assert m, ir
     body = m.group(0)
     header = body.splitlines()[0]

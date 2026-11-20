@@ -309,9 +309,12 @@ def _same_ir_wrong(compiler, work: Path, name: str):
     if _as_span(program) == program:
         return "the rewrite must change something"
     outs = []
-    for sub, text in (("slice", program), ("span", _as_span(program))):
-        d = work / name / sub
-        d.mkdir(parents=True)
+    # Both spellings compile from the same path: a private free fn's symbol
+    # carries its file's hash (#1858/#4356), so two directories would make
+    # otherwise-identical IR differ by symbol.
+    d = work / name
+    d.mkdir(parents=True)
+    for text in (program, _as_span(program)):
         comp, ll = _compile(compiler, d, text)
         diag = (comp.stdout + comp.stderr).replace(str(d), "<dir>")
         ir = ll.read_text().replace(str(d), "<dir>") if ll.exists() else None

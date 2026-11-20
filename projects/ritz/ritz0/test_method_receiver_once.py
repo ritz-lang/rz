@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import fast_link
+import test_ir
 
 from const_eval import evaluate_array_sizes
 
@@ -608,7 +609,7 @@ def test_array_temporary_spilled_once(request, tmp_path, compiler):
     body = "if mkt()[1].peek() != 2\n        MADE = 50"
     assert _run(request, tmp_path, compiler, TEMPLATE.format(body=body)) == 12
     ir = (tmp_path / "main.ll").read_text()
-    g = re.search(r"define [^\n]*@g\(\)[^\n]*\{\n(.*?)\n\}", ir, re.S).group(1)
+    g = test_ir.define_text(ir, "g")
     assert len(re.findall(r"= alloca \[2 x %T\]", g)) == 1, g
 
 

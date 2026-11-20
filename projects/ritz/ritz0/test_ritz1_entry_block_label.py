@@ -34,6 +34,7 @@ import re
 import subprocess
 
 import pytest
+import test_ir
 
 from test_ritz1_builtin_struct_shadow import RITZ_ROOT
 
@@ -82,7 +83,7 @@ pub fn main() -> i32
 def _fn_bodies(ir: str) -> dict:
     """Map each defined fn's name to its body text."""
     return {
-        m.group(1): m.group(2)
+        test_ir.strip(m.group(1)): m.group(2)
         for m in re.finditer(r"^define [^@]*@(\w+)\(.*?\{\n(.*?)^\}", ir, re.M | re.S)
     }
 
@@ -107,7 +108,7 @@ def test_dead_merge_after_returning_arms_is_unreachable(ritz1_bin, tmp_path):
             continue
         checked.append(name)
         # The entry block's only value is the entry_value() call.
-        entry = re.search(r"(%\.\d+) = call i64 @entry_value\(\)", body)
+        entry = re.search(rf"(%\.\d+) = call i64 {test_ir.symbol('entry_value')}\(\)", body)
         assert entry, f"{name}: no entry_value() call:\n{body}"
         tail = body.rstrip().splitlines()[-1].strip()
         assert tail == "unreachable", (

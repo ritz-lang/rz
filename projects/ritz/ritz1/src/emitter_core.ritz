@@ -15,6 +15,7 @@ import ritzlib.hashmap
 import ast
 import diag            # diag_error_at, fn_display_name (AGAST #3445, #3621, #4018)
 import types           # the one primitive type table (AGAST #1889)
+import sha256          # sha256_hex, for a private fn's symbol (AGAST #4356)
 import ast_helpers   # is_enum_type / enum_variant_index (AGAST #1660)
 # name_eq and the other pure AST queries, moved out of here by #3513;
 # re-exported, so an emitter module reaches them through emitter_core.
@@ -1466,6 +1467,111 @@ pub fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
 # import only emitter_core.
 pub fn fn_source_file(f: *FnDef) -> *u8
     diag_fn_source_file(f)
+
+# AGAST #4356: 1 for a file's private free fn -- one whose IR symbol carries
+# its defining file (AGAST #1858).  As ritz0's LLVMEmitter._private_free:
+# not `pub`, not `main`, not a method (`T_m` cannot clash across files),
+# not a monomorph instance ('$'; linkonce_odr), not a generated `E__from`,
+# and not a written `extern fn` (body null).  A declaration-only fn -- a
+# written `fn .. = extern`, or one an interface text replaced by one -- has
+# the non-null stripped_body() sentinel (#1900), so it is included: an
+# importer must spell the symbol its module's object actually defines.
+pub fn fn_private_free(f: *FnDef) -> i32
+    if f == null or f.is_pub != 0 or f.body == null or f.from_generated != 0
+        return 0
+    if f.def_file == null or *(f.def_file) == 60   # '<input>': no real file
+        return 0
+    if f.name_len == 4 and name_eq(f.name, 4, c"main", 4) == 1
+        return 0
+    var i: i32 = 0
+    while i < f.name_len
+        if *(f.name + i) == 36   # '$': a monomorph instance, not the fn
+            return 0
+        i += 1
+    1
+
+# AGAST #4356: `f`'s defining file as an absolute, lexically normalised path,
+# so the definition's compile (`m.ritz`) and an importer's (`./m.ritz`, or the
+# same path through RITZ_PATH) hash alike.  Freshly allocated; `raw` on a
+# getcwd failure, which only risks the old spelling mismatch.
+fn fn_def_file_abs(f: *FnDef) -> *u8
+    let raw: *u8 = f.def_file
+    let rlen: i64 = strlen(raw)
+    var abs: *u8 = raw
+    var alen: i64 = rlen
+    if rlen == 0 or *(raw) != 47   # '/'
+        var cwd: [4096]u8
+        let cwdp: *u8 = @cwd[0]
+        let n: i64 = sys_getcwd(cwdp, 4096)
+        if n <= 0
+            return raw
+        var clen: i64 = n
+        if *(cwdp + clen - 1) == 0
+            clen -= 1
+        let joined: *u8 = malloc(clen + 1 + rlen + 1)
+        memcpy(joined, cwdp, clen)
+        *(joined + clen) = 47
+        memcpy(joined + clen + 1, raw, rlen)
+        *(joined + clen + 1 + rlen) = 0
+        abs = joined
+        alen = clen + 1 + rlen
+    # Split on '/', dropping empty and "." segments and folding "..".
+    let out: *u8 = malloc(alen + 2)
+    var olen: i32 = 0
+    var i: i64 = 0
+    while i < alen
+        if *(abs + i) == 47
+            i += 1
+            continue
+        var j: i64 = i
+        while j < alen and *(abs + j) != 47
+            j += 1
+        let seg: *u8 = abs + i
+        let slen: i64 = j - i
+        if slen == 1 and *seg == 46   # "."
+            i = j
+            continue
+        if slen == 2 and *seg == 46 and *(seg + 1) == 46   # ".."
+            while olen > 0 and *(out + olen - 1) != 47
+                olen -= 1
+            if olen > 0
+                olen -= 1
+            i = j
+            continue
+        *(out + olen) = 47
+        olen += 1
+        memcpy(out + olen, seg, slen)
+        olen += slen as i32
+        i = j
+    if olen == 0
+        *(out + olen) = 47
+        olen = 1
+    *(out + olen) = 0
+    out
+
+# AGAST #4356: the IR symbol of `f`, its length in *out_len.  A private free
+# fn's symbol is its name and its defining file's hash (`helper__5e0ed276`),
+# so a generic's instance -- emitted in the object of the file that
+# instantiates it -- resolves the definition in its own module's object.
+# ritz0 does the same since #1858 (LLVMEmitter._symbol_name); every other
+# fn's symbol is its name.  A mangled result is freshly allocated.
+pub fn fn_symbol(f: *FnDef, out_len: *i32) -> *u8
+    *out_len = f.name_len
+    if fn_private_free(f) == 0
+        return f.name
+    var hex: [64]u8
+    let file: *u8 = fn_def_file_abs(f)
+    sha256_hex(file, strlen(file), @hex[0])
+    let n: i32 = f.name_len + 10   # "__" + the first 8 hex digits
+    let buf: *u8 = malloc(n as i64 + 1)
+    memcpy(buf, f.name, f.name_len as i64)
+    buf[f.name_len] = 95
+    buf[f.name_len + 1] = 95
+    for i in 0..8
+        buf[f.name_len + 2 + i] = hex[i]
+    buf[n] = 0
+    *out_len = n
+    buf
 
 # AGAST #2260: is `e`'s value used by a statement being emitted?
 fn value_wanted(s: *EmitterState, e: *Expr) -> i32

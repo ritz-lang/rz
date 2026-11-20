@@ -16,10 +16,12 @@ layout shows up as a wrong exit code, not just a wrong value.
 """
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 import fast_link
 
@@ -1864,15 +1866,17 @@ def test_ritz1_nested_array_by_value_abi(ritz1_bin, tmp_path):
     """AGAST #3634: a by-value `[N][M]T` param and return are ritz0's nested
     `[N x [M x T]]`, and a large one (`by_value_large`) `ptr byval` / `ptr
     sret` at the leaf's alignment, as a 1-D one is (#2306, #3181)."""
+    # A private free fn is external under a mangled symbol in ritz1 (#4356),
+    # so match its `define` line by name and check the ABI text after it.
     sigs = {
         "return_by_value": [
-            "define internal [2 x [3 x i32]] @mk(i32 %k.arg)",
-            "define internal i32 @at([2 x [3 x i32]] %a.arg, i32 %i.arg, i32 %j.arg)",
-            "call [2 x [3 x i32]] @mk(",
+            rf"define\b[^\n]*\[2 x \[3 x i32\]\] {test_ir.symbol('mk')}\(i32 %k\.arg\)",
+            rf"define\b[^\n]*i32 {test_ir.symbol('at')}\(\[2 x \[3 x i32\]\] %a\.arg, i32 %i\.arg, i32 %j\.arg\)",
+            rf"call \[2 x \[3 x i32\]\] {test_ir.symbol('mk')}\(",
         ],
         "by_value_large": [
-            "define internal void @mk(ptr sret([16 x [32 x i32]]) %ret.sret, i32 %k.arg)",
-            "define internal i32 @bump(ptr byval([16 x [32 x i32]]) align 4 %a.arg)",
+            rf"define\b[^\n]*void {test_ir.symbol('mk')}\(ptr sret\(\[16 x \[32 x i32\]\]\) %ret\.sret, i32 %k\.arg\)",
+            rf"define\b[^\n]*i32 {test_ir.symbol('bump')}\(ptr byval\(\[16 x \[32 x i32\]\]\) align 4 %a\.arg\)",
         ],
     }
     for name, want in sigs.items():
@@ -1880,7 +1884,7 @@ def test_ritz1_nested_array_by_value_abi(ritz1_bin, tmp_path):
         assert comp.returncode == 0, comp.stderr[-2000:]
         ir = ll.read_text()
         for w in want:
-            assert w in ir, (w, ir)
+            assert re.search(w, ir), (w, ir)
 
 
 @pytest.mark.integration

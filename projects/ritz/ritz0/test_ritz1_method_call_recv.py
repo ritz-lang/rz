@@ -15,6 +15,7 @@ import re
 import subprocess
 
 import pytest
+import test_ir
 
 from test_ritz1_builtin_struct_shadow import RITZ1_BIN, RITZ_ROOT, _run
 
@@ -165,7 +166,7 @@ def test_ritz1_sret_receiver_is_the_sret_slot(ritz1_bin, tmp_path):
         [str(RITZ1_BIN), str(src), "-o", str(ll)], env=env, check=True, timeout=300
     )
     ir = ll.read_text()
-    slot = re.search(r"call void @mk\(ptr sret\(%Big\) (%[\w.]+)", ir)
+    slot = re.search(rf"call void {test_ir.symbol('mk')}\(ptr sret\(%Big\) (%[\w.]+)", ir)
     recv = re.search(r"call i64 @Big_ends\(ptr (%[\w.]+)\)", ir)
     assert slot and recv, ir
     assert recv.group(1) == slot.group(1), ir

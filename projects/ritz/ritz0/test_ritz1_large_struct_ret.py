@@ -35,11 +35,13 @@ clang on the old IR takes the host down.
 """
 
 import os
+import re
 import resource
 import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 import fast_link
 
@@ -152,8 +154,9 @@ def _link_run(objs: list, exe: Path, with_start: bool) -> int:
 
 
 def _define_line(ll: Path, fn: str) -> str:
+    pat = re.compile(rf"^define\b[^\n]*{test_ir.symbol(fn)}\(")
     for line in ll.read_text().splitlines():
-        if line.startswith("define") and f"@{fn}(" in line:
+        if pat.search(line):
             return line
     raise AssertionError(f"no define for @{fn} in {ll.name}")
 
@@ -333,10 +336,10 @@ fn big_wrap() -> Big
 def test_ritz1_large_return_is_sret(ritz1_bin, tmp_path):
     ll = _ritz1_ll(tmp_path, "shape", SHAPE)
     hdr = _define_line(ll, "big_new")
-    assert " void @big_new(ptr sret(%Big) " in hdr, hdr
+    assert re.search(rf" void {test_ir.symbol('big_new')}\(ptr sret\(%Big\) ", hdr), hdr
     text = ll.read_text()
     assert "ret %Big" not in text, "a large struct is still returned first-class"
-    assert "call void @big_new(ptr sret(%Big) " in text, (
+    assert re.search(rf"call void {test_ir.symbol('big_new')}\(ptr sret\(%Big\) ", text), (
         "the caller in big_wrap does not pass an sret slot"
     )
 
@@ -346,7 +349,7 @@ def test_ritz1_small_return_is_unchanged(ritz1_bin, tmp_path):
     """A 16-byte struct still returns in registers: no ABI change below 256 B."""
     ll = _ritz1_ll(tmp_path, "shape", SHAPE)
     hdr = _define_line(ll, "small_new")
-    assert " %Small @small_new(" in hdr and "sret" not in hdr, hdr
+    assert re.search(rf" %Small {test_ir.symbol('small_new')}\(", hdr) and "sret" not in hdr, hdr
 
 
 # --- behaviour on every call path, with a ritz0 oracle ----------------------
@@ -427,7 +430,7 @@ def test_ritz1_every_call_path_passes_sret(ritz1_bin, tmp_path):
     """
     text = _ritz1_ll(tmp_path, "paths", CALL_PATHS).read_text()
     for callee in ("big_pick", "big_with", "Big_grown", "Big_made", "big_copy"):
-        assert f"call void @{callee}(ptr sret(%Big) " in text, (
+        assert re.search(rf"call void {test_ir.symbol(callee)}\(ptr sret\(%Big\) ", text), (
             f"the call to @{callee} does not pass an sret slot"
         )
     assert "call %Big " not in text, "a call still returns %Big first-class"

@@ -37,6 +37,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import test_ir
 
 import fast_link
 
@@ -452,7 +453,7 @@ def test_ritz1_repro_ir_loads_struct(ritz1_bin, tmp_path):
     comp, ll = _compile("ritz1", tmp_path, "ptr_add_ir", PTR_ADD)
     assert comp.returncode == 0, comp.stderr[-2000:]
     ir = ll.read_text()
-    get_body = ir.split("@get(", 1)[1].split("\n}", 1)[0]
+    get_body = test_ir.define_rest(ir, "get")
     assert "= load %D, ptr" in get_body
     assert re.search(r"= mul i64 %\.\d+, 16\n", get_body), get_body
 
