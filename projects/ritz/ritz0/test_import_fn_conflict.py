@@ -28,9 +28,13 @@ Two `[[target_os]]` variants gated to the same target are rejected too
 and run it.  Rejected whatever the target being compiled, as for structs and
 consts: in one file, across two imports, and gated to another target.
 
+A `[[target_os]]` fn beside an ungated one of the same name conflicts on the
+gated target (AGAST #4270), as for structs (#4054/#4111): after target_os
+filtering at most one definition of a name may survive.  Onto another target
+the gated one is filtered out, so nothing conflicts.
+
 Accepted, and still running correctly: a diamond import (one module reached
-twice is registered once), the same name as `extern fn` in two modules, a
-`[[target_os]]` fn beside an ungated one (never compared, as for consts), and
+twice is registered once), the same name as `extern fn` in two modules, and
 identical `enum E: u8` in two modules that import ritzlib.option (each
 generates `E__from`; the enums are already checked identical).
 """
@@ -297,15 +301,28 @@ def test_extern_fn_in_two_modules_runs(compiler, tmp_path):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_gated_vs_ungated_not_compared(compiler, tmp_path):
-    """As for consts, a [[target_os]] fn is never compared with an ungated one."""
+# ritz1 checks each import against those already merged, so the pair must
+# conflict whichever definition is seen first.
+@pytest.mark.parametrize("first,second", [("ma", "mb"), ("mb", "ma")],
+                         ids=["gated_first", "ungated_first"])
+def test_gated_vs_ungated_rejected(compiler, tmp_path, first, second):
+    """A [[target_os]] fn beside an ungated one conflicts on its own target
+    (AGAST #4270), as for structs: at most one definition survives filtering.
+
+    Onto another target the gated one is filtered out, so there is nothing to
+    compare and the ungated one is accepted.
+    """
     _write(tmp_path, {
         "ma": '[[target_os = "linux"]]\nfn helper() -> i32\n    1\n\n'
               "pub fn fa() -> i32\n    helper()\n",
         "mb": _helper_module("fb", 2),
-        "t": MAIN_AB})
-    proc, _ = _compile(compiler, tmp_path, "t")
-    assert PREFIX not in proc.stderr + proc.stdout
+        "t": f"import {first}\nimport {second}\n\n"
+             "fn main() -> i32\n    fa() * 10 + fb()\n"})
+    _assert_rejected(compiler, tmp_path,
+                     _conflict(tmp_path, "helper", first, second),
+                     target_os="linux")
+    proc, _ = _compile(compiler, tmp_path, "t", target_os="harland")
+    assert PREFIX not in proc.stderr + proc.stdout, (compiler, proc.stderr)
 
 
 @pytest.mark.integration

@@ -1374,6 +1374,28 @@ class ImportResolver:
             items.append(item)
         return rast.Module(module.span, items)
 
+    def resolve_fn_variants(self, module: rast.Module) -> rast.Module:
+        """After target_os filtering, at most one definition of each fn name
+        may remain (AGAST #4270, LANGUAGE_SPEC §15.3).
+
+        Two ungated fns are reduced to the one this compile sees by
+        _keep_one_fn, and two gated to one target are refused at
+        registration; what filtering can leave is a gated variant beside an
+        ungated one on the variant's own target.  That is a conflict, as for
+        structs (#4054/#4111): bodies are not compared, since an import is
+        seen through its interface."""
+        kept: Dict[str, rast.FnDef] = {}
+        for item in module.items:
+            if isinstance(item, rast.FnDef):
+                first = kept.get(item.name)
+                if first is not None:
+                    raise ImportError(
+                        f"Conflicting function definition for '{item.name}': "
+                        f"defined in both {first.source_file} and {item.source_file}"
+                    )
+                kept[item.name] = item
+        return module
+
     def _structs_equal(self, a: rast.StructDef, b: rast.StructDef) -> bool:
         """Check if two struct definitions are equivalent."""
         if a.name != b.name:

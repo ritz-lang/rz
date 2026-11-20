@@ -286,9 +286,11 @@ def _resolve(ctx: _Compile) -> bool:
 
     # Filter out items that don't match target_os
     # This must happen after import resolution but before name resolution
-    # so that name resolution doesn't see excluded items
-    ctx.module = resolver.resolve_struct_variants(
-        _filter_by_target_os(module, ctx.target_os))
+    # so that name resolution doesn't see excluded items.  Then at most one
+    # definition of each struct and fn name may survive (AGAST #4054, #4270).
+    ctx.module = resolver.resolve_fn_variants(
+        resolver.resolve_struct_variants(
+            _filter_by_target_os(module, ctx.target_os)))
     return True
 
 

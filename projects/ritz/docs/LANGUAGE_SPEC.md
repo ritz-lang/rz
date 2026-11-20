@@ -6406,9 +6406,9 @@ different files therefore coexist, each visible only in its own file, and so do
 a private one and a `pub` one its file doesn't import. Bodies are not compared:
 an import is seen through its interface, so two `pub` definitions conflict even
 if their bodies are identical. A conflict is an error naming both files, not a
-silent choice of one. A `[[target_os]]` variant is never compared with an
-ungated fn of the same name, and `extern fn` declarations are not definitions
-(AGAST #2148, #1858).
+silent choice of one. A `[[target_os]]` variant beside an ungated fn of the
+same name is a conflict on the variant's target (§17.2), and `extern fn`
+declarations are not definitions (AGAST #2148, #1858, #4270).
 
 ```ritz expect-error="Conflicting function definition for 'area'"
 fn area() -> i32
