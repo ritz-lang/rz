@@ -125,11 +125,19 @@ pub fn virtio_blk_write(dev: *VirtioBlkDevice, sector: u64, count: u32, buf: *u8
     -5
 """
 
+# kfs.ritz debounces a save on close with time_ns (#4321); this harness never
+# saves, so a clock that never advances is enough to compile.
+TSC_STUB = """\
+pub fn time_ns() -> u64
+    0
+"""
+
 STUBS = {
     "serial.ritz": SERIAL_STUB,
     "io.ritz": IO_STUB,
     "mm/heap.ritz": HEAP_STUB,
     "drivers/virtio/blk.ritz": BLK_STUB,
+    "arch/x86_64/tsc.ritz": TSC_STUB,
 }
 REAL = ["fs/kfs.ritz", "fs/tar.ritz", "fs/initramfs.ritz", "syscall/errno.ritz"]
 

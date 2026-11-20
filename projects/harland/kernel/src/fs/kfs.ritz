@@ -15,6 +15,7 @@
 # like the goliath API they wrap.
 
 import serial { StrView, prints, serial_print_dec }
+import arch.x86_64.tsc { time_ns }
 import mm.heap { kalloc, kfree }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_read, virtio_blk_write }
 import syscall.errno { Errno }
@@ -81,60 +82,143 @@ pub fn kfs_errno(code: ErrorCode) -> i32
 
 var g_kfs_store: MemoryBlobStore
 var g_kfs_ns: Namespace
+# The persistent subtree. What userspace writes at or below /var lives here
+# and is what kfs_save writes to the storage device; the initramfs root above
+# it never is, so the image can't grow by the initramfs (AGAST #4321).
+var g_kfs_pstore: MemoryBlobStore
+var g_kfs_pns: Namespace
 var g_kfs_dev: BlockDevice
 var g_kfs_has_dev: u8 = 0
 var g_kfs_initialized: u8 = 0
+# When kfs_save last ran (time_ns; 0 = never) and whether a debounced save
+# was skipped since (fs_sync/power-off clear it).
+var g_kfs_last_save_ns: u64 = 0
+var g_kfs_save_pending: u8 = 0
 
-# Start the kernel namespace. With a storage device, restore the tree its
-# goliath image holds; a blank device (or none) starts an empty tree. 0, or
-# -1 if the root directory can't be allocated. A device whose image is
-# damaged or unreadable is logged and not used, so a save can't replace
-# what may still be recoverable.
+# Start the kernel namespace. The storage device holds the persistent /var
+# subtree's goliath image (what the last boot saved); a blank device starts
+# it empty. The runtime tree starts empty and the initramfs loads into it, so
+# the image holds what was written, not the initramfs. 0, or -1 if the root
+# directory can't be allocated. A device whose image is damaged or unreadable
+# is logged and not used, so a save can't replace what may still be
+# recoverable.
 pub fn kfs_init(storage: *VirtioBlkDevice) -> i32
     if g_kfs_initialized != 0
         return 0
     g_kfs_store = memory_store_new_in(kfs_allocator())
+    g_kfs_pstore = memory_store_new_in(kfs_allocator())
+    g_kfs_ns = namespace_new(@g_kfs_store)
+    g_kfs_pns = namespace_new(@g_kfs_pstore)
     if storage != 0 as *VirtioBlkDevice
         g_kfs_dev = BlockDevice { dev: storage as *u8, sectors: (*storage).capacity, read: kfs_dev_read, write: kfs_dev_write }
-        let rc: ErrorCode = block_store_load(@g_kfs_dev, @g_kfs_store, @g_kfs_ns)
+        let rc: ErrorCode = block_store_load(@g_kfs_dev, @g_kfs_pstore, @g_kfs_pns)
         if rc == ErrorCode.Ok
             g_kfs_has_dev = 1
-            g_kfs_initialized = 1
-            return 0
-        if rc == ErrorCode.NotFound
+        else if rc == ErrorCode.NotFound
             g_kfs_has_dev = 1
         else
             prints("kfs: storage image unreadable (goliath error " as StrView)
             serial_print_dec(rc as u64)
             prints("); not using it\n" as StrView)
             # A failed load may have stored part of the image
-            g_kfs_store = memory_store_new_in(kfs_allocator())
-    g_kfs_ns = namespace_new(@g_kfs_store)
+            g_kfs_pstore = memory_store_new_in(kfs_allocator())
+            g_kfs_pns = namespace_new(@g_kfs_pstore)
+    g_kfs_initialized = 1
     if namespace_exists(@g_kfs_ns, "/") == false
         return -1
-    g_kfs_initialized = 1
     0
 
-# The kernel namespace (null before kfs_init)
+# The kernel namespace (null before kfs_init): the runtime tree the initramfs
+# loads into.
 pub fn kfs_get() -> *Namespace
     if g_kfs_initialized == 0
         return 0 as *Namespace
     @g_kfs_ns
 
+# The namespace that persists: its root is /var's contents.
+pub fn kfs_persist_get() -> *Namespace
+    if g_kfs_initialized == 0
+        return 0 as *Namespace
+    @g_kfs_pns
+
 # Whether the namespace has a storage device to save to
 pub fn kfs_has_storage() -> bool
     g_kfs_initialized != 0 and g_kfs_has_dev != 0
 
-# Blobs the namespace holds
+# Blobs the runtime namespace holds
 pub fn kfs_blob_count() -> i32
     memory_store_count(@g_kfs_store)
 
-# Save the whole namespace to the storage device: 0, or an Errno (NoDev
+# Save the persistent subtree to the storage device: 0, or an Errno (NoDev
 # without one). A save cut short leaves the previous image loadable.
 pub fn kfs_save() -> i32
     if not kfs_has_storage()
         return Errno.NoDev as i32
-    kfs_errno(block_store_save(@g_kfs_dev, @g_kfs_ns))
+    let rc: i32 = kfs_errno(block_store_save(@g_kfs_dev, @g_kfs_pns))
+    # A failing disk is not retried harder either: the next save is still a
+    # debounce interval away.
+    g_kfs_last_save_ns = time_ns()
+    if rc == KFS_OK
+        g_kfs_save_pending = 0
+    rc
+
+# How long a save on close is deferred after the last one: a burst of
+# writes then costs one disk image, not one per file.
+const SAVE_DEBOUNCE_NS: u64 = 200000000
+
+# Save the persistent subtree, at most once per SAVE_DEBOUNCE_NS. The
+# syscalls call this when a written /var file closes, so a program that
+# writes a hundred files in one go saves once and the next write past the
+# window saves again. A deferred save is not lost: kfs_save (the Sync
+# syscall) and the power-off path both save unconditionally. 0, or an Errno
+# (NoDev without storage).
+pub fn kfs_save_later() -> i32
+    if not kfs_has_storage()
+        return Errno.NoDev as i32
+    let now: u64 = time_ns()
+    if g_kfs_last_save_ns != 0 and now - g_kfs_last_save_ns < SAVE_DEBOUNCE_NS
+        g_kfs_save_pending = 1
+        return KFS_OK
+    kfs_save()
+
+# Whether a debounced save is owed to the storage device
+pub fn kfs_save_pending() -> bool
+    g_kfs_save_pending != 0
+
+# ============================================================================
+# The persistent subtree (/var)
+# ============================================================================
+
+# Length of the "/var" prefix `path` starts with (0 if it doesn't): 4 for
+# "/var" exactly and for "/var/...".
+fn kfs_persist_prefix(path: StrView) -> i64
+    if path.len < 4
+        return 0
+    if *(path.ptr) != 47 or *(path.ptr + 1) != 118 or *(path.ptr + 2) != 97 or *(path.ptr + 3) != 114
+        return 0
+    if path.len == 4 or *(path.ptr + 4) == 47
+        return 4
+    0
+
+# Whether `path` is part of the persistent subtree (at or below /var)
+pub fn kfs_is_persist(path: StrView) -> bool
+    kfs_persist_prefix(path) != 0
+
+# The namespace a path lives in: the persistent /var subtree for /var and
+# below, else the runtime tree.
+pub fn kfs_ns_for(path: StrView) -> *Namespace
+    if kfs_is_persist(path) and g_kfs_initialized != 0
+        return @g_kfs_pns
+    kfs_get()
+
+# `path` within kfs_ns_for's namespace: "/var/x" is "/x" in the subtree.
+pub fn kfs_local(path: StrView) -> StrView
+    let n: i64 = kfs_persist_prefix(path)
+    if n == 0
+        return path
+    if path.len == n
+        return StrView { ptr: c"/", len: 1 }
+    StrView { ptr: path.ptr + n, len: path.len - n }
 
 # ============================================================================
 # Namespace calls with kernel-shaped results
@@ -167,22 +251,57 @@ pub fn kfs_list(ns: *Namespace, path: StrView, entries: *DirEntry, max_entries: 
     Errno.NoEnt as i32
 
 # ============================================================================
+# User writes: the runtime tree and, under /var, the persistent subtree
+# ============================================================================
+#
+# Userspace sees one tree: the initramfs root with /var on the storage device.
+# A write below /var goes to both -- the runtime copy serves readdir of "/",
+# the persistent copy is what the next boot loads -- and anywhere else only to
+# the runtime tree, which is RAM and gone at reboot.
+
+# Write `path` as the running system sees it: the runtime tree, plus the
+# persistent subtree for /var and below. 0 or an Errno.
+pub fn kfs_persist_write(path: StrView, data: *u8, size: u64) -> i32
+    let rc: i32 = kfs_write(kfs_get(), path, data, size)
+    if rc != KFS_OK or not kfs_is_persist(path)
+        return rc
+    kfs_write(@g_kfs_pns, kfs_local(path), data, size)
+
+# mkdir `path` as the running system sees it: the runtime tree, plus the
+# persistent subtree for /var and below (Exist is fine in either). 0 or an
+# Errno.
+pub fn kfs_persist_mkdir(path: StrView) -> i32
+    let rc: i32 = kfs_mkdir(kfs_get(), path)
+    if rc != KFS_OK and rc != Errno.Exist as i32
+        return rc
+    if not kfs_is_persist(path)
+        return KFS_OK
+    let prc: i32 = kfs_mkdir(@g_kfs_pns, kfs_local(path))
+    if prc == Errno.Exist as i32
+        return KFS_OK
+    prc
+
+# ============================================================================
 # Boot record
 # ============================================================================
 
-# Count this boot in /var/boots (a decimal number) and save the namespace to
-# the storage device, so each boot's count is one more than the last boot's
-# when the image survived the reboot. The boot gate checks exactly that
-# (tools/test_tier1_boot.sh). The count, or an Errno.
+# Count this boot in /var/boots (a decimal number) and save the persistent
+# subtree to the storage device, so each boot's count is one more than the
+# last boot's when the image survived the reboot. The boot gate checks exactly
+# that (tools/test_tier1_boot.sh). The count, or an Errno.
 pub fn kfs_record_boot() -> i64
     let ns: *Namespace = kfs_get()
     if ns == 0 as *Namespace
         return Errno.NoDev as i64
-    let rc: i32 = kfs_mkdir(ns, "/var")
-    if rc != KFS_OK and rc != Errno.Exist as i32
+    let pns: *Namespace = kfs_persist_get()
+    let rc: i32 = kfs_persist_mkdir(StrView { ptr: c"/var", len: 4 })
+    if rc != KFS_OK
         return rc as i64
+    # The count is the persistent subtree's, not the runtime tree's: the
+    # initramfs has not loaded yet, so the runtime tree is empty here and
+    # reading it would restart at 1 every boot.
     var size: u64 = 0
-    let old: *u8 = kfs_read(ns, "/var/boots", @size)
+    let old: *u8 = kfs_read(pns, StrView { ptr: c"/boots", len: 6 }, @size)
     var boots: u64 = 0
     var i: u64 = 0
     while i < size and old != 0 as *u8
@@ -201,7 +320,8 @@ pub fn kfs_record_boot() -> i64
         digits[19 - n] = (v % 10) as u8 + 48
         v = v / 10
         n = n + 1
-    let wrc: i32 = kfs_write(ns, "/var/boots", @digits[20 - n], n as u64)
+    let boot_path: StrView = StrView { ptr: c"/var/boots", len: 10 }
+    let wrc: i32 = kfs_persist_write(boot_path, @digits[20 - n], n as u64)
     if wrc != KFS_OK
         return wrc as i64
     let src: i32 = kfs_save()

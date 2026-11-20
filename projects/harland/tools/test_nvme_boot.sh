@@ -27,13 +27,14 @@
 #     and NVME_LBA_SIZE as its LBA size;
 #   - the initramfs loaded from harland-root and init's Tier-1 suite reports
 #     ALL TESTS PASSED (the fs layer mounted from NVMe, unchanged);
-#   - persistent storage came up on harland-data: after the boot sector 0
-#     holds a goliath block-store header ("GOLIATHB", AGAST #1881) naming an
-#     image ("GOLIATHS") at sector 2 (write path);
-#   - the sectors around those writes still hold the pattern: sector 1 (the
-#     unused second header) and those after the image up to sector 15. On
-#     4 KiB LBAs they share LBAs 0-1 with the writes, so a write that
-#     skipped read-modify-write would clobber them;
+#   - persistent storage came up on harland-data: after the boot a slot
+#     header holds "GOLIATHB" (AGAST #1881) naming a "GOLIATHS" image (a boot
+#     saves the boot record and then the /var writes, #4321, so one or both
+#     slot headers and their images are on the disk);
+#   - the sectors around those writes still hold the pattern: those after the
+#     images up to sector 15, and sector 1 unless the second slot header went
+#     there. On 4 KiB LBAs they share LBAs 0-1 with the writes, so a write
+#     that skipped read-modify-write would clobber them;
 #   - the kernel took no exception;
 #   - this ESP has no \harland\net-selftest boot option, so the kernel
 #     skipped the pre-init network self-tests and never probed a NIC
@@ -195,16 +196,29 @@ else
     echo "FAIL: the initramfs did not load from harland-root"
     rc=1
 fi
-# The goliath header in sector 0 and its image: "ok", or what is wrong.
+# The goliath image on harland-data: every valid slot header and the sectors
+# its image occupies ("ok <sectors>"), or what is wrong. A boot saves more
+# than once (the boot record, then sync, #4321), so both slot headers and
+# both places a save puts a small image are goliath's: sector 2-3 and, ahead
+# of the image in use, 4-5.
 layout=$(python3 - "$WORK/data.img" <<'EOF2'
 import struct, sys
 data = open(sys.argv[1], "rb").read()
-if data[:8] != b"GOLIATHB":
-    print("sector 0 starts " + data[:8].hex()); sys.exit()
-lba, length = struct.unpack_from("<QQ", data, 24)
-if lba != 2 or data[1024:1032] != b"GOLIATHS":
-    print("header names an image at sector %d, not a goliath image at sector 2" % lba); sys.exit()
-print("ok %d" % (2 + (length + 511) // 512))
+covered = set()
+for idx in (0, 1):
+    sb = data[idx * 512:(idx + 1) * 512]
+    if len(sb) < 512 or sb[:8] != b"GOLIATHB":
+        continue
+    version, sector = struct.unpack_from("<II", sb, 8)
+    lba, length = struct.unpack_from("<QQ", sb, 24)
+    if (version, sector) != (2, 512) or lba < 2 or length == 0:
+        print("header %d names a bad image (lba %d, len %d)" % (idx, lba, length)); sys.exit()
+    if data[lba * 512:lba * 512 + 8] != b"GOLIATHS":
+        print("header %d names an image at sector %d, which is not a goliath image" % (idx, lba)); sys.exit()
+    covered.update(range(lba, lba + (length + 511) // 512))
+if not covered:
+    print("no goliath slot header on the disk"); sys.exit()
+print("ok " + " ".join(str(n) for n in sorted(covered)))
 EOF2
 ) || layout="unreadable"
 if grep -aq "\[OK\] Persistent storage" "$SERIAL" && [ "${layout%% *}" = ok ]; then
@@ -213,14 +227,21 @@ else
     echo "FAIL: persistent storage did not save a goliath image on harland-data (${layout})"
     rc=1
 fi
-# Sector 1 and the sectors after the image up to 15: unchanged pattern, or
-# the sector numbers that differ.
-image_end="${layout#ok }"
-case "$image_end" in ''|*[!0-9]*) image_end=16 ;; esac
-bad=$(python3 - "$WORK/data.img" "$image_end" <<'EOF2'
+# Sectors after the last image up to 15 still hold the pattern, and sector 1
+# unless a second slot header went there. A save moves an image ahead of the
+# one in use, so a sector an earlier save used (before the last image) is
+# stale image, not pattern. On 4 KiB LBAs the checked sectors share an LBA
+# with goliath's writes, so a write that skipped read-modify-write would
+# clobber them.
+covered="${layout#ok }"
+case "$covered" in ''|*[!0-9\ ]*) covered="" ;; esac
+bad=$(python3 - "$WORK/data.img" "$covered" <<'EOF2'
 import struct, sys
 data = open(sys.argv[1], "rb").read()
-keep = [1] + list(range(int(sys.argv[2]), 16))
+covered = {int(n) for n in sys.argv[2].split() if n}
+keep = list(range(max(covered) + 1 if covered else 2, 16))
+if data[512:520] != b"GOLIATHB":
+    keep.insert(0, 1)
 print(" ".join(str(n) for n in keep
                if data[n * 512:(n + 1) * 512] != (b"LBA" + struct.pack("<I", n) + b"!") * 64))
 EOF2

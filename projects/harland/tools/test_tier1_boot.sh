@@ -457,6 +457,96 @@ persisted() {
     fi
 }
 
+# image_entries: print the keys of the goliath image the storage disk holds.
+# The kernel saves only the persistent subtree (/var, #4321), so the image's
+# root is that subtree's contents: no /bin, /etc or any other initramfs file.
+# Reads the qcow2's slots and image with python3 (already a required tool).
+image_entries() {
+    local raw
+    raw="$(mktemp)" || return 1
+    qemu-img convert -f qcow2 -O raw "$WORK/storage.qcow2" "$raw" || { rm -f "$raw"; return 1; }
+    python3 - "$raw" <<'PY'
+import struct, sys
+
+raw = open(sys.argv[1], "rb").read()
+
+def fnv(b):
+    h = 14695981039346656037
+    for x in b[:504]:
+        h = ((h ^ x) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+best = None
+for idx in (0, 1):
+    sb = raw[idx * 512:(idx + 1) * 512]
+    if len(sb) < 512 or sb[:8] != b"GOLIATHB":
+        continue
+    version, sector = struct.unpack_from("<II", sb, 8)
+    gen, lba, ln = struct.unpack_from("<QQQ", sb, 16)
+    if version != 2 or sector != 512 or struct.unpack_from("<Q", sb, 504)[0] != fnv(sb):
+        continue
+    if gen == 0 or ln == 0 or lba < 2 or lba * 512 + ln > len(raw):
+        continue
+    if best is None or gen > best[0]:
+        best = (gen, lba, ln)
+if best is None:
+    print("no valid goliath image on the storage disk")
+    sys.exit(1)
+gen, lba, ln = best
+img = raw[lba * 512:lba * 512 + ln]
+magic, version, count = struct.unpack_from("<8sII", img, 0)
+if magic != b"GOLIATHS" or version != 1:
+    print("bad goliath image")
+    sys.exit(1)
+blobs = {}
+off = 48
+for _ in range(count):
+    bid = img[off:off + 32]
+    size = struct.unpack_from("<Q", img, off + 32)[0]
+    off += 40
+    blobs[bid] = img[off:off + size]
+    off += size
+print("goliath image: generation %d, %d bytes, %d blobs" % (gen, ln, count))
+
+def walk(blob, path):
+    n = struct.unpack_from("<I", blob, 0)[0]
+    for i in range(n):
+        e = blob[4 + i * 320:4 + (i + 1) * 320]
+        name = e[:256].split(b"\0", 1)[0].decode(errors="replace")
+        kind, bid = e[257], e[258:290]
+        p = path + "/" + name
+        print("  " + p + ("/" if kind == 1 else ""))
+        if kind == 1 and bid in blobs:
+            walk(blobs[bid], p)
+
+walk(blobs.get(img[16:48], b"\0\0\0\0"), "")
+PY
+    rm -f "$raw"
+}
+
+# saved_subtree NAME: pass only if the image the boot saved holds the
+# persistent /var subtree and no initramfs content (#4321). Boot 1 wrote
+# /var/x, so the subtree's keys must be /boots and /x — no /bin.
+saved_subtree() {
+    local out
+    if ! out="$(image_entries)"; then
+        echo "FAIL ($1): no readable goliath image on the storage disk"
+        return 1
+    fi
+    echo "$out" | sed "s/^/  ($1) /"
+    local top
+    top="$(echo "$out" | sed -n 's/^  \/\([^\/]*\)\/\{0,1\}$/\1/p' | sort | tr '\n' ' ')"
+    if echo "$out" | grep -qE '^  /(bin|etc|initramfs)(/|$)'; then
+        echo "FAIL ($1): initramfs content is in the saved image: $top"
+        return 1
+    fi
+    if ! echo "$out" | grep -qx '  /boots' || ! echo "$out" | grep -qx '  /x'; then
+        echo "FAIL ($1): saved subtree keys are '$top', want 'boots x'"
+        return 1
+    fi
+    echo "PASS ($1): saved image holds only the /var subtree: $top"
+}
+
 # all_passed NAME: pass only if the kernel took no exception and the suite
 # reported ALL TESTS PASSED.
 all_passed() {
@@ -519,11 +609,13 @@ EOF
     preempted grub || rc=1
     powered_off grub || rc=1
     persisted grub 1 || rc=1
+    saved_subtree grub || rc=1
     [ "$HIGH_MEM" = 1 ] && { high_memory grub || rc=1; }
     # The same storage disk, booted again: the image survives the reboot
     boot grub-reboot "$WORK/esp-grub" "" "${STORAGE[@]}" || rc=1
     all_passed grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
+    saved_subtree grub-reboot || rc=1
 fi
 
 exit $rc

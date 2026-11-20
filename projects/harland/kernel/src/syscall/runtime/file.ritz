@@ -8,11 +8,11 @@
 import serial { StrView, serial_buffer_write, serial_drain_output }
 import tty.console { tty_console_read, tty_console_get_flags, tty_console_set_flags, tty_console_set_fg }
 import mm.uptr { uptr_validate_string, uptr_check_read, uptr_check_write }
-import fs.kfs { kfs_get, kfs_list }
+import fs.kfs { kfs_ns_for, kfs_local, kfs_list }
 import goliath.namespace { Namespace }
 import goliath.dir_entry { DirEntry }
 import ritzlib.strview { strview_from_ptr }
-import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_lseek, sys_mkdir, is_fs_fd }
+import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_lseek, sys_mkdir, is_fs_fd, fs_sync }
 import syscall.errno { Errno }
 import syscall.runtime.process { syscall_strlen }
 import mm.heap { kalloc, kfree }
@@ -23,20 +23,23 @@ const READDIR_MAX: i32 = 64
 # sys_readdir: List directory contents
 # Returns bytes written to buffer as null-terminated strings
 fn sys_readdir_impl(dir_path: *u8, buf: *u8, buf_size: i64) -> i64
-    let ns: *Namespace = kfs_get()
-    if ns == 0 as *Namespace
-        return Errno.NoDev as i64
-
     # Create StrView from path
     let path_len: i64 = syscall_strlen(dir_path)
     let path_view: StrView = strview_from_ptr(dir_path, path_len)
+
+    # /var and below are listed from the persistent subtree's namespace
+    # (fs/kfs.ritz, #4321), where they are "/" and "/x".
+    let ns: *Namespace = kfs_ns_for(path_view)
+    if ns == 0 as *Namespace
+        return Errno.NoDev as i64
+    let local: StrView = kfs_local(path_view)
 
     # The entries go on the heap: 64 of them are ~21 KiB, which on the
     # syscall stack once overran it (AGAST #1877).
     let entries: *DirEntry = kalloc(sizeof(DirEntry) as u64 * READDIR_MAX as u64) as *DirEntry
     if entries == 0 as *DirEntry
         return Errno.NoMem as i64
-    let count: i32 = kfs_list(ns, path_view, entries, READDIR_MAX)
+    let count: i32 = kfs_list(ns, local, entries, READDIR_MAX)
 
     if count < 0
         kfree(entries as *u8)
@@ -201,3 +204,9 @@ pub fn sys_tty_setfg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     if not tty_fd_ok(rdi as i32)
         return Errno.NotTy as i64
     return tty_console_set_fg(rsi, rdx) as i64
+
+# sync(): save the persistent subtree (/var) to the storage device now.
+# Save-on-close is debounced (fs/syscall.ritz, #4321); Sync is the way a
+# program says "now". Returns 0, or an Errno (NoDev without a disk).
+pub fn sys_sync_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    return fs_sync() as i64

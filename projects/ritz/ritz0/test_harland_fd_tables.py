@@ -251,13 +251,36 @@ KFS_STUB = """\
 import serial { StrView }
 import goliath.namespace { Namespace, ns_stub_get, ns_stub_write }
 
+pub const KFS_OK: i32 = 0
+
 pub fn kfs_get() -> *Namespace
     ns_stub_get()
+
+pub fn kfs_ns_for(path: StrView) -> *Namespace
+    ns_stub_get()
+
+pub fn kfs_local(path: StrView) -> StrView
+    path
+
+pub fn kfs_is_persist(path: StrView) -> bool
+    false
+
+pub fn kfs_persist_write(path: StrView, data: *u8, size: u64) -> i32
+    ns_stub_write(path, data, size)
+
+pub fn kfs_persist_mkdir(path: StrView) -> i32
+    0
 
 pub fn kfs_write(ns: *Namespace, path: StrView, data: *u8, size: u64) -> i32
     ns_stub_write(path, data, size)
 
 pub fn kfs_mkdir(ns: *Namespace, path: StrView) -> i32
+    0
+
+pub fn kfs_save() -> i32
+    0
+
+pub fn kfs_save_later() -> i32
     0
 """
 

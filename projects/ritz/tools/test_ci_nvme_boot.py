@@ -50,8 +50,9 @@ MSIX_SCRIPT = "projects/harland/tools/test_msix_boot.sh"
 
 # The QEMU stub writes $FAKE_SERIAL to the `-serial file:PATH` it was given;
 # with FAKE_PERSIST=1 it also writes a goliath block-store header (sector 0:
-# "GOLIATHB", image at sector 2, 100 bytes) and the image magic ("GOLIATHS",
-# sector 2) into the drive with id=data, as the kernel's NVMe writes would, and
+# "GOLIATHB", version 2, 512-byte sectors, image at sector 2, 100 bytes) and
+# the image magic ("GOLIATHS", sector 2) into the drive with id=data, as the
+# kernel's NVMe writes would, and
 # with FAKE_CLOBBER=1 zeroes sector 1 (a write that skipped read-modify-write).
 # Then it idles until killed. Every argv goes to $STUB_LOG.
 QEMU_STUB = r"""#!/usr/bin/env bash
@@ -63,6 +64,7 @@ for a in "$@"; do
         case "$a" in *id=data*)
             f="${a#file=}"; f="${f%%,*}"
             printf 'GOLIATHB' | dd of="$f" conv=notrunc status=none
+            printf '\x02\0\0\0\x00\x02\0\0' | dd of="$f" bs=1 seek=8 conv=notrunc status=none
             printf '\x02\0\0\0\0\0\0\0\x64\0\0\0\0\0\0\0' | dd of="$f" bs=1 seek=24 conv=notrunc status=none
             printf 'GOLIATHS' | dd of="$f" bs=1 seek=1024 conv=notrunc status=none
             if [ "${FAKE_CLOBBER:-0}" = 1 ]; then

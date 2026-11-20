@@ -24,7 +24,7 @@ import serial { StrView, prints, serial_print_hex, serial_print_dec, serial_writ
 import mm.pmm { PAGE_SIZE }
 import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_read_pml4_entry }
 import mm.uptr { uptr_validate_string, uptr_check_read }
-import fs.kfs { kfs_get, kfs_read }
+import fs.kfs { kfs_ns_for, kfs_local, kfs_read, kfs_save, kfs_save_pending }
 import goliath.namespace { Namespace }
 import ritzlib.strview { strview_from_ptr }
 import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
@@ -176,16 +176,17 @@ fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
 fn spawn_process(path: *u8, argv: **u8, argc: i32) -> i64
-    let ns: *Namespace = kfs_get()
+    # Read file from namespace (using kernel's page table). A path under
+    # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
+    let path_len: i64 = syscall_strlen(path)
+    let path_view: StrView = strview_from_ptr(path, path_len)
+    let ns: *Namespace = kfs_ns_for(path_view)
     if ns == 0 as *Namespace
         prints("[spawn_args] No namespace\n")
         return Errno.NoDev as i64
 
-    # Read file from namespace (using kernel's page table)
-    let path_len: i64 = syscall_strlen(path)
-    let path_view: StrView = strview_from_ptr(path, path_len)
     var file_size: u64 = 0
-    let elf_data: *u8 = kfs_read(ns, path_view, @file_size)
+    let elf_data: *u8 = kfs_read(ns, kfs_local(path_view), @file_size)
     if elf_data == 0 as *u8
         if argc > 0
             prints("[spawn_args] File not found: ")
@@ -333,6 +334,12 @@ fn sys_exit_impl(code: i32) -> i64
         # fd table, so none outlive it (#2753).
         fs_process_end()
 
+        # Save-on-close is debounced (#4321): a write it deferred is not lost
+        # when the process that made it goes away. Only then is a save owed,
+        # so a boot full of children costs no disk writes.
+        if kfs_save_pending()
+            kfs_save()
+
         # Free its page table and all its user-space pages
         if my_pml4 != 0
             vmm_free_pml4(my_pml4)
@@ -351,6 +358,10 @@ fn sys_exit_impl(code: i32) -> i64
     # flushed) like any process's (#2753), then the machine powers off
     # through ACPI S5 (#2755): under QEMU the VM exits instead of hanging.
     fs_process_end()
+    # Its closes may have deferred a save (#4321); the machine is about to
+    # lose RAM, so write the persistent subtree out now.
+    if kfs_save_pending()
+        kfs_save()
     # init's exit doesn't return through syscall_handler either: panic, not
     # power off as if fine, if a syscall ran off its stack (#2761), and
     # report how deep any went.
@@ -480,6 +491,10 @@ pub fn sys_yield_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # acpi_poweroff()
 pub fn sys_acpi_poweroff_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     prints("[syscall] ACPI poweroff requested\n")
+    # Whatever save-on-close deferred (#4321) goes to the disk before the
+    # machine goes down.
+    if kfs_save_pending()
+        kfs_save()
     let result: i32 = acpi_poweroff()
     # If we get here, poweroff failed
     return result as i64
