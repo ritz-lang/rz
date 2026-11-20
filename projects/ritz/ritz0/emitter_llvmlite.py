@@ -10,6 +10,7 @@ doesn't include the x86 asm parser.
 """
 
 import contextlib
+import hashlib
 import os
 import re
 import sys
@@ -1049,13 +1050,15 @@ class LLVMEmitter:
         self.const_ritz_types: Dict[str, rast.Type] = {}
         self.globals: Dict[str, Tuple[ir.GlobalVariable, ir.Type]] = {}  # name -> (gvar, type)
         self.extern_fns: Dict[str, ir.Function] = {}
-        # AGAST #1736: LLVM function name -> struct type it returns via sret,
-        # and live `load %T, slot` results of sret calls (keyed by id()) that
-        # may still be retargeted at their destination.
-        self._sret_fns: Dict[str, ir.Type] = {}
-        # AGAST #1739: LLVM function name -> {logical param index: %T} of its
-        # large by-value struct params, passed `%T* byval(%T) align 8`.
-        self._byval_fns: Dict[str, Dict[int, ir.Type]] = {}
+        # AGAST #1736: IR function -> struct type it returns via sret, and
+        # live `load %T, slot` results of sret calls (keyed by id()) that may
+        # still be retargeted at their destination.  Keyed by the function
+        # object, not its name: a private fn's symbol carries its file
+        # (AGAST #1858), while `fn.name` here was the logical name.
+        self._sret_fns: Dict[ir.Function, ir.Type] = {}
+        # AGAST #1739: IR function -> {logical param index: %T} of its large
+        # by-value struct params, passed `%T* byval(%T) align 8`.
+        self._byval_fns: Dict[ir.Function, Dict[int, ir.Type]] = {}
         self._sret_results: Dict[int, tuple] = {}
         self.struct_types: Dict[str, ir.BaseStructType] = {}  # name -> LLVM struct type
         self.struct_fields: Dict[str, List[Tuple[str, rast.Type]]] = {}  # name -> [(field_name, type)]
@@ -5739,7 +5742,7 @@ class LLVMEmitter:
         """The struct `fn` returns via sret, or None."""
         if not isinstance(fn, ir.Function):
             return None
-        return self._sret_fns.get(fn.name)
+        return self._sret_fns.get(fn)
 
     def _new_function(self, name: str, ret_type: ir.Type,
                       param_types: List[ir.Type],
@@ -5763,13 +5766,13 @@ class LLVMEmitter:
             fn = ir.Function(self.module, fn_type, name=name)
             fn.args[0].add_attribute('sret')
             fn.args[0].name = 'ret.sret'
-            self._sret_fns[name] = sret_ty
+            self._sret_fns[fn] = sret_ty
             lead = 1
         for i, ty in byval.items():
             fn.args[i + lead].add_attribute('byval')
             fn.args[i + lead].attributes.align = _byval_align(ty)
         if byval:
-            self._byval_fns[name] = byval
+            self._byval_fns[fn] = byval
         cc = _llvm_callconv(callconv)
         if cc:
             fn.calling_convention = cc
@@ -5834,7 +5837,7 @@ class LLVMEmitter:
         """Logical param index -> %T for `fn`'s byval params (AGAST #1739)."""
         if not isinstance(fn, ir.Function):
             return {}
-        return self._byval_fns.get(fn.name, {})
+        return self._byval_fns.get(fn, {})
 
     def _fn_param_types(self, fn: ir.Function) -> list:
         """`fn`'s logical parameter types (without the sret pointer, and with
@@ -6400,11 +6403,24 @@ class LLVMEmitter:
         # `declared_method` holds the visibility (AGAST #3416).  ritzlib's
         # `impl String` (AGAST #3495) is called from other objects, and ritz1
         # already exports impl methods.
-        if not getattr(self, 'no_runtime', False):
-            is_pub = fn_def.is_pub or getattr(
-                getattr(fn_def, 'declared_method', None), 'is_pub', False)
-            if not is_pub and fn_def.name != 'main' and self._should_emit_body(fn_def):
-                fn.linkage = 'internal'
+        #
+        # AGAST #1858: in separate compilation a private free fn keeps its
+        # external linkage but its symbol carries its defining file (below):
+        # two files' private `be16`s are two symbols, not one defined twice.
+        # Internal linkage was the tempting fix and is wrong: a generic's
+        # instance is emitted in the object of the file that instantiates it,
+        # and its body may call its own module's private helper, which is in
+        # that module's object (AGAST #3906).  Moving the symbol keeps the
+        # call resolvable.  Methods are not mangled: a trait impl's method is
+        # called from other objects without `pub` (Drop's drop at another
+        # file's scope end), and `T_m` cannot clash.
+        is_pub = fn_def.is_pub or getattr(
+            getattr(fn_def, 'declared_method', None), 'is_pub', False)
+        if getattr(self, 'no_runtime', False):
+            if self._private_free(fn_def, is_pub):
+                fn.name = self._symbol_name(fn_def)
+        elif not is_pub and fn_def.name != 'main' and self._should_emit_body(fn_def):
+            fn.linkage = 'internal'
 
         # Create DISubprogram for debug info (only for functions we'll define, not declarations)
         if self.emit_debug and self.di_file and self._should_emit_body(fn_def):
@@ -6452,6 +6468,28 @@ class LLVMEmitter:
         # Register function so it can be called from any function body
         self.functions[fn_def.name] = (fn, fn_def)
         return fn
+
+    @staticmethod
+    def _private_free(fn_def: rast.FnDef, is_pub: bool) -> bool:
+        """A private fn of a file, not a method, a generic's instance or a
+        generated fn: one whose symbol carries its file (AGAST #1858)."""
+        file = getattr(fn_def, 'source_file', None) or ''
+        return (not is_pub
+                and fn_def.name != 'main'
+                and getattr(fn_def, 'declared_method', None) is None
+                and not getattr(fn_def, 'generated', False)
+                and not getattr(fn_def, 'is_monomorphized', False)
+                and not fn_def.is_decl
+                and file != '' and not file.startswith('<'))
+
+    @staticmethod
+    def _symbol_name(fn_def: rast.FnDef) -> str:
+        """A private fn's symbol: its name and its defining file's hash, so
+        two files' `be16`s are two symbols (AGAST #1858).  The path is
+        resolved, as the file's own compile and every importer see it."""
+        digest = hashlib.sha256(
+            os.path.realpath(fn_def.source_file).encode()).hexdigest()[:8]
+        return f"{fn_def.name}__{digest}"
 
     def _set_debug_loc(self, node) -> None:
         """Set debug location on current builder position from AST node.
@@ -18090,7 +18128,9 @@ def _extract_fn_ir_blocks(ir_str: str) -> Dict[str, str]:
     pattern = re.compile(r'^(define\s+[^@]+@"?([^"(]+)"?\([^)]*\)[^{]*\{)', re.MULTILINE)
 
     for match in pattern.finditer(ir_str):
-        fn_name = match.group(2)
+        # A private fn's symbol carries its defining file (AGAST #1858, with
+        # `@`); the sig keys blocks by the Ritz name.
+        fn_name = re.sub(r'__[0-9a-f]{8}$', '', match.group(2))
         start = match.start()
 
         # Find the matching closing brace (accounting for nested braces in blocks)

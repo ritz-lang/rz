@@ -33,6 +33,8 @@ from resolve import package_import_namespaces, read_manifest  # noqa: E402
 
 import fast_link
 
+import test_ir
+
 from ritz0_inproc import run_ritz0
 
 pytestmark = pytest.mark.integration
@@ -248,9 +250,9 @@ def test_syscall_init_fills_the_table(tmp_path):
         env=dict(os.environ, RITZ_PATH=str(RITZ_ROOT)))
     assert proc.returncode == 0 and out.exists(), proc.stdout + proc.stderr
     ir = out.read_text()
-    m = re.search(r'^define [^\n]*@"syscall_init"\(.*?^}', ir, re.M | re.S)
+    m = re.search(test_ir.define("syscall_init") + r'.*?^}', ir, re.M | re.S)
     assert m, "no definition of syscall_init"
-    assert '@"syscall_table_init"(' in m.group(0), m.group(0)
+    assert re.search(test_ir.symbol("syscall_table_init") + r'\(', m.group(0)), m.group(0)
 
 
 # --- one ABI: ritzlib's harland numbers are the kernel's (AGAST #2122) -----------

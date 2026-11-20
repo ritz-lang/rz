@@ -103,6 +103,7 @@ modules links without sys. A freestanding program defines all three itself.
     - [timer](#timer) - High-precision timing
     - [json](#json) - JSON parsing
     - [elf](#elf) - ELF binary parsing
+    - [endian](#endian) - Big- and little-endian integers in a byte buffer
     - [testing](#testing) - Removed; use `assert`
 
 ---
@@ -2710,6 +2711,41 @@ struct ElfReader
 | `elf_symbol_count` | `fn(reader: *ElfReader) -> i64` | Get symbol count |
 | `elf_find_test_functions` | `fn(reader: *ElfReader, callback: *u8, user_data: *u8) -> i32` | Find test_* functions |
 | `elf_print_test_functions` | `fn(reader: *ElfReader)` | Print test functions |
+
+---
+
+### endian
+
+**Module**: `ritzlib.endian`
+
+Reads and writes multi-byte integers in a caller-owned byte buffer, in the byte
+order a wire or file format chose (AGAST #1858). The pointer is byte-addressed,
+so it need not be aligned (packed headers, ELF and MADT records). There is no
+bounds check: the caller owns the buffer, as with `*u8` everywhere.
+
+| Function | Signature | Description |
+|----------|-----------|-------------|
+| `endian_read_u16_be` / `_le` | `fn(p: *u8) -> u16` | Read a u16 in big / little endian |
+| `endian_read_u32_be` / `_le` | `fn(p: *u8) -> u32` | Read a u32 in big / little endian |
+| `endian_read_u64_be` / `_le` | `fn(p: *u8) -> u64` | Read a u64 in big / little endian |
+| `endian_write_u16_be` / `_le` | `fn(p: *u8, v: u16)` | Write a u16 in big / little endian |
+| `endian_write_u32_be` / `_le` | `fn(p: *u8, v: u32)` | Write a u32 in big / little endian |
+| `endian_write_u64_be` / `_le` | `fn(p: *u8, v: u64)` | Write a u64 in big / little endian |
+
+```ritz
+import ritzlib.endian
+
+fn main() -> i32
+    var b: [4]u8 = [0, 0, 0, 0]
+    endian_write_u32_be(@b[0], 0xdeadbeef)
+    if endian_read_u32_be(@b[0]) == 0xdeadbeef
+        0
+    else
+        1
+```
+
+Swapping the bytes of an integer value is the language's `x.swap_bytes()`
+(`ritzlib/tests/test_bitops.ritz`), not this module.
 
 ---
 

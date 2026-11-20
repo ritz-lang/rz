@@ -360,6 +360,9 @@ def test_dhcp_discover_offer_request_ack(tmp_path):
         "net/udp.ritz": NET_UDP_STUB,
         "net/eth.ritz": NET_ETH_STUB,
         "net/dhcp.ritz": (KERNEL_SRC / "net" / "dhcp.ritz").read_text(),
+        # dhcp.ritz imports ritzlib.endian (AGAST #1858); a real build compiles
+        # the module to its own object, and so must this tree.
+        "ritzlib/endian.ritz": (RITZ_ROOT / "ritzlib" / "endian.ritz").read_text(),
     }
     rc = _run(tmp_path, DHCP_MAIN, tree)
     assert rc == 0, f"exit {rc}: {DHCP_CLAIMS.get(rc, 'crashed')}"

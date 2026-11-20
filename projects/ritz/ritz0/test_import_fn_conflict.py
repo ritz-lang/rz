@@ -13,10 +13,15 @@ A being the earlier definition in ritz0's registration order (imports before
 the file importing them, the main file last).  Every case runs ritz0 and both
 ritz1 binaries.
 
-Rejected: import vs import (private or `pub`, differing or even identical
-bodies), main file vs import (the rzsh tests' shadowed `println`), nested
-imports (the diagnostic names the file that defined the fn), two in one file,
-and a user fn named like a generated `E__from`.
+Rejected: two `pub` fns of one name in two imports, a fn beside a `pub` one
+its file imports (the rzsh tests' shadowed `println`), nested imports (the
+diagnostic names the file that defined the fn), two in one file, and a user fn
+named like a generated `E__from`.
+
+Since AGAST #1858 a private fn is in its own file's namespace only, so two
+files' private fns of one name, or a private one beside a `pub` one its file
+doesn't import, coexist and each file runs its own (more in
+test_private_fn_no_clash.py).
 
 Two `[[target_os]]` variants gated to the same target are rejected too
 (LANGUAGE_SPEC §17.2, AGAST #4055): both compilers used to keep the first
@@ -110,11 +115,17 @@ MAIN_AB = "import ma\nimport mb\n\nfn main() -> i32\n    fa() * 10 + fb()\n"
 
 # (id, ma's helper visibility, mb's, ma's body, mb's body)
 IMPORT_VS_IMPORT = [
+    ("pub_pub", "pub ", "pub ", 1, 2),
+    # Bodies are not compared: an import is seen through its interface.
+    ("identical", "pub ", "pub ", 1, 1),
+]
+
+# Neither module imports the other, so a private helper is in no namespace
+# but its own (AGAST #1858): each module's fa/fb runs its own helper.
+IMPORT_BESIDE_IMPORT = [
     ("private_private", "", "", 1, 2),
     ("pub_private", "pub ", "", 1, 2),
     ("private_pub", "", "pub ", 1, 2),
-    ("pub_pub", "pub ", "pub ", 1, 2),
-    # Bodies are not compared: an import is seen through its interface.
     ("identical", "", "", 1, 1),
 ]
 
@@ -131,10 +142,21 @@ def test_import_vs_import_rejected(compiler, tmp_path, pa, pb, va, vb):
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("pa,pb,va,vb", [c[1:] for c in IMPORT_BESIDE_IMPORT],
+                         ids=[c[0] for c in IMPORT_BESIDE_IMPORT])
+def test_private_beside_import_runs(compiler, tmp_path, pa, pb, va, vb):
+    _write(tmp_path, {"ma": _helper_module("fa", va, pa),
+                      "mb": _helper_module("fb", vb, pb), "t": MAIN_AB})
+    assert _run(compiler, tmp_path, ["t", "ma", "mb"]) == va * 10 + vb
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
 def test_main_vs_import_rejected(compiler, tmp_path):
-    """The main file is registered after its imports, so it is named second."""
+    """The main file is registered after its imports, so it is named second.
+    ma's helper is `pub`, so it is in t's namespace beside t's own."""
     _write(tmp_path, {
-        "ma": _helper_module("fa", 1),
+        "ma": _helper_module("fa", 1, "pub "),
         "t": "import ma\n\nfn helper() -> i32\n    7\n\n"
              "fn main() -> i32\n    fa() * 10 + helper()\n"})
     _assert_rejected(compiler, tmp_path, _conflict(tmp_path, "helper", "ma", "t"))
@@ -157,8 +179,8 @@ def test_main_shadowing_ritzlib_rejected(compiler, tmp_path):
 def test_nested_import_names_defining_file(compiler, tmp_path):
     """mc's helper reaches t through mb; the diagnostic names mc, not mb."""
     _write(tmp_path, {
-        "ma": _helper_module("fa", 1),
-        "mc": "fn helper() -> i32\n    3\n\npub fn fc() -> i32\n    helper()\n",
+        "ma": _helper_module("fa", 1, "pub "),
+        "mc": "pub fn helper() -> i32\n    3\n\npub fn fc() -> i32\n    helper()\n",
         "mb": "import mc\n\npub fn fb() -> i32\n    fc()\n",
         "t": MAIN_AB})
     _assert_rejected(compiler, tmp_path, _conflict(tmp_path, "helper", "ma", "mc"))

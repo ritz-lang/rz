@@ -31,6 +31,7 @@ RITZ_DIR = RITZ0_DIR.parent
 sys.path.insert(0, str(RITZ0_DIR))
 
 import test_runner  # noqa: E402
+import test_ir
 
 pytestmark = pytest.mark.integration
 
@@ -71,7 +72,7 @@ def _ir(tmp_path) -> str:
 
 
 def _function(ir: str, name: str) -> str:
-    match = re.search(r'define [^\n]*@"?%s"?\(.*?\n}\n' % re.escape(name), ir, re.S)
+    match = re.search(test_ir.define(name) + r'.*?\n}\n', ir, re.S)
     assert match, f"{name} not in IR"
     return match.group(0)
 

@@ -72,6 +72,7 @@ pub fn main() -> i32
 | `ct.ritz` | `ritzlib.ct` | Constant-time comparison (AGAST #1863) |
 | `drop.ritz` | `ritzlib.drop` | Drop trait for automatic cleanup |
 | `elf.ritz` | `ritzlib.elf` | ELF Binary Format Parser |
+| `endian.ritz` | `ritzlib.endian` | big- and little-endian integers in a byte buffer |
 | `errno.ritz` | `ritzlib.errno` | `Errno`, a typed kernel error code (AGAST #4248) |
 | `fmt.ritz` | `ritzlib.fmt` | formatting and printing: the one import |
 | `fmt/digits.ritz` | `ritzlib.fmt.digits` | the one integer-to-text digit routine |

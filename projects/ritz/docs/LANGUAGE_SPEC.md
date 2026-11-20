@@ -6361,9 +6361,12 @@ impl's `drop` at the end of a scope in another file (AGAST #3386).
 ### 15.3 Qualified Access
 
 **Removed in RERITZ.** There is no `module::item` or `module.item` access
-form. Imported names land in a single flat namespace, which is why the standard
-library uses long, prefixed free-function names (`strview_find`,
-`vec_push`, `string_from`) instead of short names behind a module path.
+form. An imported `pub` name lands in a single flat namespace, which is why the
+standard library uses long, prefixed free-function names (`strview_find`,
+`vec_push`, `string_from`) instead of short names behind a module path. A
+private (non-`pub`) name is visible only in its own module (§15.2): it does not
+land in the importer's namespace, and two modules may each define a private
+`fn be16` [AGAST #1858].
 
 ```ritz body expect-error="`sys::write`: `::` was removed in RERITZ"
 let n = sys::write(1, c"hi\n", 3)
@@ -6380,12 +6383,18 @@ fn main() -> i32
     m.K
 ```
 
-Privacy does not give a fn its own namespace either: a fn name may be defined
-at most once across a file and everything it imports, transitively, whether
-the definitions are `pub` or private, and even if they are identical. A second
-definition is an error naming both files, not a silent choice of one. A
-`[[target_os]]` variant is never compared with an ungated fn of the same
-name, and `extern fn` declarations are not definitions.
+A fn name may have at most one definition in any one file's namespace. Two
+`pub` fns of one name always conflict: each is exported and in the namespace of
+every file that imports it. A private fn conflicts with a fn of its own name
+its file declares, and with a `pub` fn its file imports (directly or by `pub
+import`); it conflicts with nothing else. Two private fns of one name in
+different files therefore coexist, each visible only in its own file, and so do
+a private one and a `pub` one its file doesn't import. Bodies are not compared:
+an import is seen through its interface, so two `pub` definitions conflict even
+if their bodies are identical. A conflict is an error naming both files, not a
+silent choice of one. A `[[target_os]]` variant is never compared with an
+ungated fn of the same name, and `extern fn` declarations are not definitions
+(AGAST #2148, #1858).
 
 ```ritz expect-error="Conflicting function definition for 'area'"
 fn area() -> i32

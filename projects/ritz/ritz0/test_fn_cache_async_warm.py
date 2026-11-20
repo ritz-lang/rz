@@ -30,6 +30,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import test_ir
 
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
@@ -62,7 +63,8 @@ def _compile(src: Path, out: Path, cache_dir: Path) -> None:
 
 
 def _defined(ir: str) -> set:
-    return set(_DEFINE_RE.findall(ir))
+    # A private fn's symbol carries its file (AGAST #1858).
+    return {test_ir.strip(n) for n in _DEFINE_RE.findall(ir)}
 
 
 def _declared(ir: str) -> set:

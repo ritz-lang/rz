@@ -31,6 +31,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import test_ir
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from resolve import package_import_namespaces, read_manifest  # noqa: E402
@@ -75,7 +76,7 @@ def _compile(tmp_path_factory, rel, boot=False):
 
 def _body(ir, name):
     """The IR text of `define ... @"name"(...) { ... }`."""
-    m = re.search(rf'^define [^\n]*@"{re.escape(name)}"\(.*?^}}', ir, re.M | re.S)
+    m = re.search(test_ir.define(name) + r'.*?^}', ir, re.M | re.S)
     assert m, f"no definition of {name} in the IR"
     return m.group(0)
 

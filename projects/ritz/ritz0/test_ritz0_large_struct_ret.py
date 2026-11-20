@@ -45,6 +45,7 @@ import pytest
 import fast_link
 
 from ritz0_inproc import run_ritz0
+import test_ir
 
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
@@ -110,7 +111,7 @@ def _assert_no_libc_mem(obj: Path) -> None:
 def _fn_body(ir: str, fn: str) -> str:
     lines = ir.splitlines()
     for i, line in enumerate(lines):
-        if line.startswith("define") and f'@"{fn}"(' in line:
+        if re.match(test_ir.define(fn), line):
             end = lines.index("}", i)
             return "\n".join(lines[i:end + 1])
     raise AssertionError(f"no define for @{fn}")
@@ -118,7 +119,7 @@ def _fn_body(ir: str, fn: str) -> str:
 
 def _sig_line(ir: str, kind: str, fn: str) -> str:
     for line in ir.splitlines():
-        if line.startswith(kind) and f'@"{fn}"(' in line:
+        if line.startswith(kind) and re.search(test_ir.symbol(fn) + r'\(', line):
             return line
     raise AssertionError(f"no {kind} for @{fn}")
 
@@ -158,7 +159,7 @@ def test_var_init_from_sret_call_fills_the_var_in_place(tmp_path):
     ir = _ritz0_ll(tmp_path, "tome_cli_shape", TOME_CLI, "--no-runtime").read_text()
     body = _fn_body(ir, "main")
     assert re.search(
-        r'call void @"client_new"\(%"[^"]+"\* sret\(%"[^"]+"\) %"client\.addr"\)', body), (
+        r'call void ' + test_ir.symbol("client_new") + r'\(%"[^"]+"\* sret\(%"[^"]+"\) %"client\.addr"\)', body), (
         f"client_new() must write straight into client.addr:\n{body}")
     big = re.findall(r'(?:load|store|call) %"struct\.[^"]*Client"[ ,]', body)
     assert not big, f"a first-class %Client value survives in main: {big}"
@@ -231,7 +232,8 @@ PROGRAM_EXIT = 89
 def test_large_struct_return_is_defined_sret(tmp_path, fn):
     ir = _ritz0_ll(tmp_path, "prog", PROGRAM, "--no-runtime").read_text()
     define = _sig_line(ir, "define", fn)
-    assert re.match(rf'define (\w+ )*void @"{fn}"\(%"[^"]+"\* sret\(%"[^"]+"\) ', define), define
+    assert re.match(r'define (\w+ )*void ' + test_ir.symbol(fn)
+                    + r'\(%"[^"]+"\* sret\(%"[^"]+"\) ', define), define
     body = _fn_body(ir, fn)
     assert "ret void" in body and not re.search(r'ret %"struct', body), body
 
@@ -248,7 +250,8 @@ def test_return_of_sret_call_forwards_the_callers_slot(tmp_path, fn, callee):
     first-class %T copied from one to the other."""
     body = _fn_body(_ritz0_ll(tmp_path, "prog", PROGRAM, "--no-runtime").read_text(), fn)
     assert re.search(
-        rf'call void @"{callee}"\(%"[^"]+"\* sret\(%"[^"]+"\) %"ret\.sret"', body), body
+        r'call void ' + test_ir.symbol(callee)
+        + r'\(%"[^"]+"\* sret\(%"[^"]+"\) %"ret\.sret"', body), body
     assert "sret.slot" not in body and not re.search(r'(load|store) %"struct', body), body
 
 
@@ -256,7 +259,8 @@ def test_return_of_sret_call_forwards_the_callers_slot(tmp_path, fn, callee):
 @pytest.mark.unit
 def test_small_struct_return_keeps_first_class_abi(tmp_path):
     ir = _ritz0_ll(tmp_path, "prog", PROGRAM, "--no-runtime").read_text()
-    assert re.match(r'define (\w+ )*%"struct\.[^"]*Small" @"small_make"\(\)',
+    assert re.match(r'define (\w+ )*%"struct\.[^"]*Small" '
+                    + test_ir.symbol("small_make") + r'\(\)',
                     _sig_line(ir, "define", "small_make"))
 
 
@@ -272,7 +276,8 @@ def test_var_init_paths_pass_the_var_as_sret_slot(tmp_path, callee, var):
     ir = _ritz0_ll(tmp_path, "prog", PROGRAM, "--no-runtime").read_text()
     body = _fn_body(ir, "main")
     assert re.search(
-        rf'call void @"{callee}"\(%"[^"]+"\* sret\(%"[^"]+"\) %"{var}\.addr"', body), (
+        r'call void ' + test_ir.symbol(callee)
+        + rf'\(%"[^"]+"\* sret\(%"[^"]+"\) %"{var}\.addr"', body), (
         f"{callee}() must write straight into {var}.addr:\n{body}")
 
 

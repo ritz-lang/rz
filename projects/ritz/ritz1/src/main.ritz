@@ -736,9 +736,12 @@ fn check_const_conflicts(m: *Module, other: *Module, path: *u8) -> i32
 # Function conflicts across files (AGAST #2148)
 # =============================================================================
 #
-# A fn name may have at most one ungated definition in the whole import
-# closure, private or not: imported names share one flat namespace
-# (LANGUAGE_SPEC §15.3).  ritz0's rule (import_resolver.py _register_item):
+# A fn name may have at most one ungated definition in any one file's
+# namespace (LANGUAGE_SPEC §15.3).  A private fn is in its own file's only
+# (AGAST #1858): two files' private fns of one name coexist, and so do a
+# private one and a `pub` one its file doesn't import (fns_coexist);
+# keep_one_fn then keeps the one this compile sees.  Two `pub` ones always
+# conflict.  ritz0's rule (import_resolver.py _register_item, _fns_coexist):
 # bodies are not compared (an import is seen through its interface); a
 # [[target_os]] fn is never compared with an ungated one, but two kept ones
 # are both gated to the target compiled for, so they conflict (LANGUAGE_SPEC
@@ -760,7 +763,79 @@ fn fns_conflict(a: *FnDef, b: *FnDef) -> i32
         return 0
     if a.from_generated == 1 and b.from_generated == 1
         return 0
-    bytes_same(a.name, a.name_len, b.name, b.name_len)
+    if bytes_same(a.name, a.name_len, b.name, b.name_len) == 0
+        return 0
+    if a.target_gated == 0 and fns_coexist(a, b) == 1
+        return 0
+    1
+
+# 1 if two ungated fns of one name, from two files, may both exist (AGAST
+# #1858): a private fn is in its own file's namespace only, so it clashes
+# only with a `pub` fn its file imports (directly, or by `pub import`).
+fn fns_coexist(a: *FnDef, b: *FnDef) -> i32
+    if streq(a.def_file, b.def_file) == 1
+        return 0
+    if a.is_pub == 1 and b.is_pub == 1
+        return 0
+    if a.is_pub == 0 and b.is_pub == 0
+        return 1
+    var private: *FnDef = a
+    var public: *FnDef = b
+    if a.is_pub == 1
+        private = b
+        public = a
+    var key: String = import_key(private.def_file)
+    let sees: i32 = vis_sees(string_as_ptr(@&key), public)
+    string_drop(@&key)
+    1 - sees
+
+# Of the ungated fns of one name fns_coexist let through, keep the one the
+# input sees: its own (is_local), or else the `pub` one, or else the first.
+# The others are other files' private fns: the input can't call them
+# (§15.2, call_check's error needs the one kept) and their own objects define
+# them (internal linkage).  An instance of a dropped fn's file's generic that
+# calls it binds to the kept one, which call_check refuses as private to the
+# kept one's file, at the call in the generic.
+fn keep_one_candidate(f: *FnDef) -> i32
+    if f.target_gated == 0 and f.body != null and f.from_generated == 0
+        return 1
+    0
+
+fn keep_one_fn(m: *Module)
+    var f: *FnDef = m.functions
+    while f != null
+        # Every group of two or more has a private member: start from it.
+        var removed: i32 = 0
+        if f.is_pub == 0 and keep_one_candidate(f) == 1
+            var best: *FnDef = f
+            var count: i32 = 0
+            var g: *FnDef = m.functions
+            while g != null
+                if keep_one_candidate(g) == 1 and bytes_same(g.name, g.name_len, f.name, f.name_len) == 1
+                    count += 1
+                    if best.is_local == 0 and (g.is_local == 1 or (g.is_pub == 1 and best.is_pub == 0))
+                        best = g
+                g = g.next
+            if count > 1
+                # Unlink every other one of f's name.
+                var prev: *FnDef = null
+                var h: *FnDef = m.functions
+                while h != null
+                    let nxt: *FnDef = h.next
+                    if h != best and keep_one_candidate(h) == 1 and bytes_same(h.name, h.name_len, best.name, best.name_len) == 1
+                        if prev == null
+                            m.functions = nxt
+                        else
+                            prev.next = nxt
+                    else
+                        prev = h
+                    h = nxt
+                removed = 1
+        # A group is rare: start over rather than track f's predecessor.
+        if removed == 1
+            f = m.functions
+        else
+            f = f.next
 
 # "Error: <later>:<line>: Conflicting function definition for 'X': defined in
 # both <earlier> and <later>"
@@ -1479,6 +1554,7 @@ fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz
     if resolve_imports(m, input_path, source_dir, ritz_path) < 0
         eprintln("Error: Import resolution failed")
         return null
+    keep_one_fn(m)   # AGAST #1858: one of each name the input sees
     # AGAST #4111: every struct of the closure is noted now, gated out or not.
     if struct_variants_check() < 0
         return null

@@ -36,6 +36,7 @@ import pytest
 import fast_link
 from const_eval import fold_literal_i64
 from ritz0_inproc import run_ritz0
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 
@@ -54,7 +55,7 @@ def _compile(tmp_path, source, name="unit"):
 
 def _body(ir_text, fn_name):
     """A function's instruction lines, debug metadata stripped."""
-    m = re.search(r'define [^\n]*@"%s"[^\n]*\n\{\n(.*?)\n\}' % re.escape(fn_name),
+    m = re.search(r'define [^\n]*' + test_ir.symbol(fn_name) + r'[^\n]*\n\{\n(.*?)\n\}',
                   ir_text, re.S)
     assert m, f"function {fn_name} not found in IR"
     lines = []

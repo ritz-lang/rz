@@ -34,6 +34,7 @@ from pathlib import Path
 import pytest
 
 from ritz0_inproc import run_ritz0
+import test_ir
 
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
@@ -65,7 +66,7 @@ def _ritz0_ll(tmp_path: Path, program: str, *extra: str) -> str:
 def _fn_body(ir: str, fn: str) -> str:
     lines = ir.splitlines()
     for i, line in enumerate(lines):
-        if line.startswith("define") and f'@"{fn}"(' in line:
+        if re.match(test_ir.define(fn), line):
             end = lines.index("}", i)
             return "\n".join(lines[i:end + 1])
     raise AssertionError(f"no define for @{fn}")
@@ -165,10 +166,12 @@ def test_repro_borrows_reuse_the_let_slot(tmp_path):
     assert not loads, "the sret result was loaded as a first-class %Big:\n" + "\n".join(loads)
     slots = re.findall(rf'(%"[^"]+") = alloca {BIG_TY}', body)
     assert len(slots) == 1, f"want one %Big slot for `b`, got {slots}:\n{body}"
-    calls = re.findall(rf'call i64 @"big_n"\({BIG_TY}\* (%"[^"]+")\)', body)
+    calls = re.findall(r'call i64 ' + test_ir.symbol("big_n")
+                       + rf'\({BIG_TY}\* (%"[^"]+")\)', body)
     assert calls == [slots[0]] * 2, (
         f"both borrows must pass the let's slot {slots[0]}, got {calls}:\n{body}")
-    assert re.search(rf'call void @"big_new"\({BIG_TY}\* sret\({BIG_TY}\) {re.escape(slots[0])}\)',
+    assert re.search(r'call void ' + test_ir.symbol("big_new")
+                     + rf'\({BIG_TY}\* sret\({BIG_TY}\) {re.escape(slots[0])}\)',
                      body), f"big_new() must write straight into the slot:\n{body}"
 
 

@@ -41,6 +41,7 @@ from pathlib import Path
 import pytest
 
 from ritz0_inproc import run_ritz0
+import test_ir
 
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
@@ -132,7 +133,7 @@ def _crash_head(stderr: str) -> str:
 def _define_attrs(ir: str, fn: str) -> str:
     """The attribute text of `define ... @"fn"(...) <attrs>`."""
     for line in ir.splitlines():
-        if line.startswith("define") and f'@"{fn}"(' in line:
+        if re.match(test_ir.define(fn), line):
             return line.split(")", 1)[1] if ")" in line else ""
     raise AssertionError(f"no define for @{fn}")
 

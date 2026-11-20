@@ -42,6 +42,19 @@ from resolve import package_sources  # noqa: E402
 _CACHED_SPAN = rast.Span("<cached>", 0, 0, 0)
 
 
+def _calls(node, name: str) -> bool:
+    """Does the AST under `node` call the free fn `name`?"""
+    if isinstance(node, rast.Call) and isinstance(node.func, rast.Ident) \
+            and node.func.name == name:
+        return True
+    if isinstance(node, (list, tuple)):
+        return any(_calls(x, name) for x in node)
+    if hasattr(node, '__dataclass_fields__'):
+        return any(_calls(getattr(node, f), name)
+                   for f in node.__dataclass_fields__)
+    return False
+
+
 def parse_type_string(type_str: str) -> rast.Type:
     """Parse a type string back to a Type AST node."""
     if type_str is None or type_str == "void":
@@ -321,6 +334,11 @@ class ImportResolver:
         # Every module this resolver loaded, by resolved path: what R54's
         # selective-import check reads (selective_import.py, AGAST #3466).
         self.loaded_modules: Dict[str, rast.Module] = {}
+        # The file `resolve` compiles and its imports (_imports_of), and
+        # _sees' memo of what each module defines (AGAST #1858).
+        self._main_source: Optional[str] = None
+        self._main_imports: List[rast.Import] = []
+        self._definitions = None
         # RFC #109 Phase 2: Dependency mappings for namespace resolution
         self.dependencies: Dict[str, DependencyMapping] = dependencies.copy() if dependencies else {}
         # Auto-detect dependencies from RITZ_PATH entries with ritz.toml
@@ -601,12 +619,15 @@ class ImportResolver:
         imports = [item for item in module.items if isinstance(item, rast.Import)]
         non_imports = [item for item in module.items if not isinstance(item, rast.Import)]
 
+        self._main_source = source_path
+        self._main_imports = imports
         for imp in imports:
             self._process_import(imp, source_path)
 
         # Collect items from this module
         for item in non_imports:
             self._register_item(item, source_path)
+        self._keep_one_fn(source_path)
 
         # Build merged module
         merged_items = []
@@ -1072,6 +1093,96 @@ class ImportResolver:
             impl_block.source_file = source_file
             self.impls.append(impl_block)
 
+    def _imports_of(self, path: str) -> List[rast.Import]:
+        """The import declarations of the module at `path`."""
+        if path == self._main_source:
+            return self._main_imports
+        return [i for i in self.load_module(path).items
+                if isinstance(i, rast.Import)]
+
+    def _sees(self, path: str, fn: rast.FnDef) -> bool:
+        """Is `fn` (a `pub` fn) in the namespace of the module at `path`: does
+        one of its imports bring it in, directly or by `pub import`?"""
+        from selective_import import _Definitions
+        if self._definitions is None:
+            self._definitions = _Definitions(self)
+        for imp in self._imports_of(path):
+            target = self._resolve_import_path(imp.path, path)
+            if target is None:
+                continue
+            entry = self._definitions.defined(target).get(fn.name)
+            if (entry is not None and entry[1] == fn.source_file
+                    and getattr(entry[0], 'is_pub', False)):
+                return True
+        return False
+
+    def _fns_coexist(self, a: rast.FnDef, b: rast.FnDef) -> bool:
+        """Can two ungated fns of one name both exist (AGAST #1858)?
+
+        A private fn is in its own file's namespace only (LANGUAGE_SPEC
+        §15.3), so it clashes with a fn of its own file, and with a `pub` fn
+        its file imports. Two `pub` fns always clash: each is in the
+        namespace of every file that imports it, and both are external
+        symbols of one name.
+        """
+        if a.source_file == b.source_file:
+            return False
+        if a.is_pub and b.is_pub:
+            return False
+        if not a.is_pub and not b.is_pub:
+            return True
+        private, public = (a, b) if b.is_pub else (b, a)
+        return not self._sees(private.source_file, public)
+
+    def _keep_one_fn(self, source_path: str) -> None:
+        """Of the ungated fns of one name _fns_coexist let through, keep the
+        one the file being compiled sees: its own, or else the `pub` one.
+        The others are other files' private fns, which this file can't call
+        (§15.2) and whose objects define them (internal linkage); one is
+        kept only for §15.2's error at a call. A generic of a dropped fn's
+        file whose body calls it would bind to the kept one when instanced
+        here, so that is refused rather than run wrong (AGAST #1858)."""
+        for name, fns in self.functions.items():
+            ungated = [f for f in fns
+                       if not (hasattr(f, 'get_attr_value')
+                               and f.get_attr_value('target_os') is not None)]
+            if len(ungated) < 2:
+                continue
+            keep = (next((f for f in ungated if f.source_file == source_path), None)
+                    or next((f for f in ungated if f.is_pub), None)
+                    or ungated[0])
+            for dropped in ungated:
+                if dropped is keep:
+                    continue
+                caller = self._generic_caller(dropped.source_file, name)
+                if caller is not None:
+                    raise ImportError(
+                        f"generic `{caller}` in {dropped.source_file} calls its "
+                        f"private `{name}`, and {keep.source_file} has another "
+                        f"`{name}`: an instance here can't reach the first. "
+                        f"Rename one, or mark it `pub` (AGAST #1858)")
+            self.functions[name] = [f for f in fns
+                                    if f is keep or f not in ungated]
+
+    def _generic_caller(self, path: str, name: str) -> Optional[str]:
+        """The first generic fn or generic impl method of the module at
+        `path` whose body calls `name`, if any."""
+        if path == self._main_source:
+            return None  # its own instances are emitted with its own fns
+        module = self.loaded_modules.get(path)
+        if module is None:
+            return None  # registered from metadata: no generics (see above)
+        for item in module.items:
+            bodies = []
+            if isinstance(item, rast.FnDef) and item.type_params:
+                bodies.append((item.name, item.body))
+            elif isinstance(item, rast.ImplBlock) and item.type_params:
+                bodies.extend((m.name, m.body) for m in item.methods)
+            for fn_name, body in bodies:
+                if _calls(body, name):
+                    return fn_name
+        return None
+
     def _register_item(self, item: rast.Item, source_file: str):
         """Register an item, checking for duplicates."""
         # Track which file this item came from (for separate compilation)
@@ -1124,12 +1235,14 @@ class ImportResolver:
                 self.functions[item.name].append(item)
             else:
                 # No target_os attribute: at most one ungated definition per
-                # name in the whole import closure, private or not (AGAST
-                # #2148).  Names share one flat namespace (LANGUAGE_SPEC
-                # §15.3); this used to keep the last one, so callers in the
-                # earlier module silently ran the later body.  Bodies are not
-                # compared: an import is seen through its interface.  Two
-                # generated `E__from` fns come from enums _enums_equal has
+                # name in any one file's namespace (AGAST #2148, #1858;
+                # LANGUAGE_SPEC §15.3).  This used to keep the last one, so
+                # callers in the earlier module silently ran the later body.
+                # A private fn is in its own file's namespace only, so two
+                # files' private fns of one name coexist (_fns_coexist), and
+                # _keep_one_fn picks the one this compile declares.  Bodies
+                # are not compared: an import is seen through its interface.
+                # Two generated `E__from` fns come from enums _enums_equal has
                 # already found identical, so the first is kept.
                 for existing in self.functions[item.name]:
                     existing_target_os = (existing.get_attr_value('target_os')
@@ -1138,6 +1251,8 @@ class ImportResolver:
                         continue
                     if getattr(existing, 'generated', False) and getattr(item, 'generated', False):
                         return
+                    if self._fns_coexist(existing, item):
+                        continue
                     raise ImportError(
                         f"Conflicting function definition for '{item.name}': "
                         f"defined in both {existing.source_file} and {source_file}"

@@ -33,6 +33,7 @@ import pytest
 import fast_link
 
 from ritz0_inproc import run_ritz0
+import test_ir
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 
@@ -58,9 +59,9 @@ def _verify_ir(tmp_path):
 def _fn_ir(tmp_path, name):
     """Return the IR text of function @name."""
     ir_text = (tmp_path / "unit.ll").read_text()
-    start = ir_text.index(f'@"{name}"(') if f'@"{name}"(' in ir_text \
-        else ir_text.index(f"@{name}(")
-    start = ir_text.rindex("define", 0, start)
+    m = re.search(test_ir.define(name), ir_text, re.M)
+    assert m, f"no define for @{name}"
+    start = m.start()
     return ir_text[start:ir_text.index("\n}", start)]
 
 

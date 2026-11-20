@@ -35,6 +35,7 @@ from pathlib import Path
 import pytest
 
 from ritz0_inproc import run_ritz0
+import test_ir
 
 RITZ0_DIR = Path(__file__).resolve().parent
 RITZ_ROOT = RITZ0_DIR.parent
@@ -92,7 +93,8 @@ def _define_lines(ir: str) -> dict:
     for line in ir.splitlines():
         m = re.match(r'define [^@]*@"?([A-Za-z0-9_$.]+)"?\(', line)
         if m:
-            out[m.group(1)] = line
+            # A private fn's symbol carries its file (AGAST #1858).
+            out[test_ir.strip(m.group(1))] = line
     return out
 
 
