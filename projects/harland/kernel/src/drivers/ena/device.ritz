@@ -61,8 +61,12 @@ const ENA_AENQ_DEPTH: u32 = 32
 const ENA_IO_QUEUE_DEPTH: u32 = 256  # ENA minimum is 256 (ENA_MIN_RING_SIZE)
 const ENA_RX_BUFFER_SIZE: u32 = 2048
 const ENA_TX_BUFFER_SIZE: u32 = 2048
-const ENA_RX_BUFFER_COUNT: u32 = 8   # Reduced for initial testing
-const ENA_TX_BUFFER_COUNT: u32 = 8   # Reduced for initial testing
+const ENA_RX_BUFFER_COUNT: u32 = 8   # one per req_id in flight
+# One buffer per TX ring slot: a slot is rewritten only after the ring wraps,
+# and a buffer must never be reused while the device may still read it, so the
+# arena is as deep as the ring (AGAST #4334). Completion-based reclamation,
+# which would let fewer buffers serve the ring, is #1851.
+const ENA_TX_BUFFER_COUNT: u32 = ENA_IO_QUEUE_DEPTH
 
 const ENA_ADMIN_TIMEOUT_US: u32 = 3000000   # 3 seconds
 const ENA_READY_TIMEOUT_US: u64 = 1000000   # 1 second
@@ -148,12 +152,81 @@ pub struct EnaDevice
 # Global device instance
 var ena_dev: EnaDevice
 
-# Pre-allocated RX/TX buffers (reduced for initial testing)
-var ena_rx_buffers: [16384]u8     # 8 * 2048 = 16KB
-var ena_tx_buffers: [16384]u8     # 8 * 2048 = 16KB
+# Pre-allocated RX/TX buffers
+var ena_rx_buffers: [16384]u8       # 8 * 2048 = 16KB
+var ena_tx_buffers: [ENA_TX_BUFFER_COUNT * ENA_TX_BUFFER_SIZE]u8   # one per TX ring slot
 
 # RX buffer tracking
 var ena_rx_req_to_buf: [256]u16   # req_id -> buffer index
+
+# ============================================================================
+# Buffer Ownership
+# ============================================================================
+#
+# Every descriptor the driver hands the device must name a buffer the driver
+# owns for that queue: the arenas above sit in .bss next to the kernel log
+# ring, the network stack's buffers and (further out) the syscall stacks, so a
+# descriptor that points past its arena lets the NIC or the copy path write
+# over kernel memory (AGAST #4334). These helpers are the single definition of
+# that mapping; ena_send and the RX path use them.
+
+# Is [addr, addr+size) wholly inside an arena of count entries of that size?
+fn ena_in_arena(addr: u64, base: u64, count: u32, size: u32) -> bool
+    let end: u64 = base + (count as u64) * (size as u64)
+    addr >= base and addr + (size as u64) <= end
+
+# Address of the buffer backing TX ring slot `slot`. The modulo is what keeps
+# the address inside the arena for every slot, whatever the ring's depth.
+pub fn ena_tx_buffer_addr(slot: u32) -> u64
+    let idx: u32 = slot % ENA_TX_BUFFER_COUNT
+    (@ena_tx_buffers[0] as u64) + (idx as u64) * (ENA_TX_BUFFER_SIZE as u64)
+
+pub fn ena_tx_buffer_owned(slot: u32) -> bool
+    ena_in_arena(ena_tx_buffer_addr(slot), @ena_tx_buffers[0] as u64,
+                 ENA_TX_BUFFER_COUNT, ENA_TX_BUFFER_SIZE)
+
+pub fn ena_rx_buffer_addr(idx: u32) -> u64
+    let i: u32 = idx % ENA_RX_BUFFER_COUNT
+    (@ena_rx_buffers[0] as u64) + (i as u64) * (ENA_RX_BUFFER_SIZE as u64)
+
+pub fn ena_rx_buffer_owned(idx: u32) -> bool
+    ena_in_arena(ena_rx_buffer_addr(idx), @ena_rx_buffers[0] as u64,
+                 ENA_RX_BUFFER_COUNT, ENA_RX_BUFFER_SIZE)
+
+# Buffer index for an RX completion's req_id. A completion is untrusted input;
+# -1 means the req_id names no buffer the driver handed the device.
+pub fn ena_rx_req_to_buf_index(req_id: u16) -> i32
+    if req_id >= ENA_RX_BUFFER_COUNT as u16
+        return -1
+    ena_rx_req_to_buf[req_id] as i32
+
+# Check every descriptor the driver has handed the device: its buffer must lie
+# inside the arena registered for that queue. Returns 0, or the first offender:
+# +slot (1-based) for a TX descriptor, -(idx+1) for RX. Skipped descriptors
+# (never submitted) hold no buffer and are not checked.
+pub fn ena_check_io_buffers() -> i32
+    let tx_sq: *EnaIoSq = @ena_dev.tx_sq
+    var i: u16 = 0
+    while i < (*tx_sq).depth
+        let desc: *EnaTxDesc = ena_io_sq_entry_addr(tx_sq, i, ENA_TX_DESC_SIZE) as *EnaTxDesc
+        if ((*desc).len_ctrl & ENA_TX_DESC_LENGTH_MASK) != 0
+            let addr: u64 = ((*desc).buff_addr_lo as u64) | ((((*desc).buff_addr_hi_hdr_sz & 0xFFFF) as u64) << 32)
+            if not ena_in_arena(addr, @ena_tx_buffers[0] as u64,
+                                ENA_TX_BUFFER_COUNT, ENA_TX_BUFFER_SIZE)
+                return (i as i32) + 1
+        i = i + 1
+
+    let rx_sq: *EnaIoSq = @ena_dev.rx_sq
+    i = 0
+    while i < (*rx_sq).depth
+        let desc: *EnaRxDesc = ena_io_sq_entry_addr(rx_sq, i, ENA_RX_DESC_SIZE) as *EnaRxDesc
+        if (*desc).ctrl != 0
+            let addr: u64 = ((*desc).buff_addr_lo as u64) | (((*desc).buff_addr_hi as u64) << 32)
+            if not ena_in_arena(addr, @ena_rx_buffers[0] as u64,
+                                ENA_RX_BUFFER_COUNT, ENA_RX_BUFFER_SIZE)
+                return -((i as i32) + 1)
+        i = i + 1
+    return 0
 
 # ============================================================================
 # Address Calculation Helpers
@@ -972,7 +1045,7 @@ fn ena_populate_rx_buffers(dev: *EnaDevice) -> i32
     var buf_idx: u32 = 0
 
     while buf_idx < ENA_RX_BUFFER_COUNT
-        let buf_addr: u64 = (@ena_rx_buffers[0] as u64) + (buf_idx as u64 * ENA_RX_BUFFER_SIZE as u64)
+        let buf_addr: u64 = ena_rx_buffer_addr(buf_idx)
         let buf_phys: u64 = vmm_virt_to_phys(buf_addr)
         let phys: u64 = ena_get_phys_or_virt(buf_phys, buf_addr)
 
@@ -1155,7 +1228,7 @@ pub fn ena_send(data: *u8, len: u32) -> i32
 
     # Get buffer for this packet (simple: use head index)
     let buf_idx: u32 = tx_sq.head as u32
-    let buf_addr: u64 = (@ena_tx_buffers[0] as u64) + (buf_idx as u64 * ENA_TX_BUFFER_SIZE as u64)
+    let buf_addr: u64 = ena_tx_buffer_addr(buf_idx)
 
     # Copy packet to buffer
     var i: u32 = 0
@@ -1206,7 +1279,11 @@ pub fn ena_poll(buf: *u8, max_len: u32) -> i32
     let pkt_len: u16 = ena_rx_cdesc_get_length(cqe)
     let req_id: u16 = ena_rx_cdesc_get_req_id(cqe)
 
-    if pkt_len == 0
+    # Get buffer from req_id. The completion is untrusted input: a req_id that
+    # names no buffer we handed the device is dropped rather than turned into
+    # an out-of-range arena index (#4334).
+    let buf_idx: i32 = ena_rx_req_to_buf_index(req_id)
+    if pkt_len == 0 or buf_idx < 0
         # Advance CQ and return
         (*rx_cq).head = (*rx_cq).head + 1
         if (*rx_cq).head >= (*rx_cq).depth
@@ -1214,9 +1291,7 @@ pub fn ena_poll(buf: *u8, max_len: u32) -> i32
             (*rx_cq).phase = (*rx_cq).phase ^ 1
         return 0
 
-    # Get buffer from req_id
-    let buf_idx: u16 = ena_rx_req_to_buf[req_id]
-    let src_addr: u64 = (@ena_rx_buffers[0] as u64) + (buf_idx as u64 * ENA_RX_BUFFER_SIZE as u64)
+    let src_addr: u64 = ena_rx_buffer_addr(buf_idx as u32)
 
     # Copy packet to output buffer
     var copy_len: u32 = pkt_len as u32
