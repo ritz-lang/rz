@@ -6,7 +6,8 @@ literal_slot.ritz (AGAST #2341: a literal takes its slot's type; #3083, #2138
 the literals no type holds; #3112 R21's literal operand; #3440 a `c"..."` in a
 view slot) ran mid-lowering on EmitterState, at each slot the emitter reached.
 Its refusal, lit_check_fits, was one of the emitter checks
-tools/ritz1_emitter_checks.allow still listed.  It now takes `sm: *Sema` and
+tools/ritz1_emitter_checks.allow listed (that allowlist is now gone: the
+check freeze is the grep being empty, #1816).  It now takes `sm: *Sema` and
 runs from sema_walk.ritz at the slots bool_check visits.  What it learns it
 writes on the AST for the emitter to read: a `"..."` in a `*u8` slot becomes a
 `c"..."`, and a `/` or `%` in a wider integer slot records it (Expr.slot_type,

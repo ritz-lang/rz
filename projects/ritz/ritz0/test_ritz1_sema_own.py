@@ -262,5 +262,3 @@ def test_the_emitter_tracks_no_moves():
     assert "own_check_stmt(sm, st," in walk, "sema_walk runs the move check"
     ast = (SRC / "ast.ritz").read_text()
     assert "own_binds: *OwnedBinds" in ast, "FnDef carries Sema's owned bindings"
-    allow = (RITZ_ROOT / "tools" / "ritz1_emitter_checks.allow").read_text()
-    assert "ownership.ritz:" not in allow, "ownership's checks are off the emitter"

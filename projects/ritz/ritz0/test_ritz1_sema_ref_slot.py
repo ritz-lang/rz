@@ -28,8 +28,9 @@ THE TESTS
 - REACH: one row per fact Sema had to learn, each refused at the same place in
   the same words as the emitter did.  OPEN: what the rules leave alone stays
   accepted.
-- The emitter runs none of them, and their two entries are gone from
-  tools/ritz1_emitter_checks.allow.
+- The emitter runs none of them, and their two entries are gone from the
+  emitter-check freeze (tools/test_ritz1_emitter_check_freeze.py, whose grep
+  is empty since #1816 closed).
 """
 
 import re
@@ -41,7 +42,6 @@ from test_ref_into_value import _compile
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 SRC = RITZ_ROOT / "ritz1" / "src"
-ALLOW = RITZ_ROOT / "tools" / "ritz1_emitter_checks.allow"
 COMPILERS = ["ritz1", "ritz1_selfhosted"]
 _FOUND = r"main\.ritz:(\d+:\d+): (?:error: )?(.*)"
 
@@ -224,6 +224,3 @@ def test_the_emitter_runs_none_of_them():
         assert hook not in own, f"ownership.ritz's hooks still call {hook}"
     value = (SRC / "ref_value.ritz").read_text()
     assert "rv_slot_refuses" not in value, "return-of-local still stands aside for an emitter check"
-    allow = ALLOW.read_text()
-    for entry in ("ref_check.ritz:ref_check_stmt", "ref_check.ritz:ref_check_value"):
-        assert entry not in allow, f"{entry} is still in {ALLOW.name}"

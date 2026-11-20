@@ -106,10 +106,9 @@ the emitter (AGAST #3462, #1816; LARB review/5 ritz1 N1):
   after monomorphisation and before `emit_module`, over exactly the fns the
   emitter lowers, and stops on any error.
 - Do not add a `pub fn *check*(s: *EmitterState, ..)`.
-  `tools/test_ritz1_emitter_check_freeze.py` fails on a new one.  Its
-  allowlist (`tools/ritz1_emitter_checks.allow`) lists the checks still in
-  the emitter.  The list only shrinks: each move off the emitter is a child
-  ticket of #1816 and deletes its entries.
+  `tools/test_ritz1_emitter_check_freeze.py` fails on a new one: every
+  emitter-side check has moved (#1816), so the freeze is the grep being
+  empty and its allowlist is deleted.
 - Import no `emitter*` module (AGAST #3513).  A pure helper the emitter
   also uses (`name_eq`, `find_field_index`, `user_enum_index`, ...) lives in
   `ast_query`; move another one there rather than importing `emitter_core`.
@@ -174,9 +173,9 @@ One entry per check module, sorted, with a blank line between entries, so
 two rooms editing neighbouring entries touch no adjacent lines and git merges
 them (#3896; `--check` enforces all three). An entry states the rule, not
 where it runs: `make arch-report` says which checks are on Sema and which
-still run mid-lowering on `*EmitterState`, and
-`tools/ritz1_emitter_checks.allow` lists the emitter-side ones still to move
-(#1816). A note that belongs to a move goes on that check's own entry.
+still run mid-lowering on `*EmitterState`; the emitter-side ones are all
+moved (#1816), and `tools/test_ritz1_emitter_check_freeze.py` holds the grep
+empty. A note that belongs to a move goes on that check's own entry.
 
 - `binder_check` — a local can't take a module value's name, nor a name
   already in scope in its fn. Run by main over the whole module before
