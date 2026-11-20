@@ -45,6 +45,16 @@
 #   train.sh show                       print every train, in landing order
 #   train.sh pkgs list|test <base>      the touched packages' tests (#3363;
 #                                       the gate runs `test` after its jobs)
+#   train.sh tail                       the deepest built train's tail
+#                                       (<tip12> rz-train/<tip12>), nothing
+#                                       when none is built (#4413)
+#   train.sh rebase-plan [<ref>]        one loop turn's preemptive rebase
+#        [--dropped <oldtip> [--onto <ref>]]
+#                                       advice, rooms on stdin (#4413): print
+#                                       each room's base vs the deepest tail,
+#                                       SKIP a room mid-gate, and one REBASE
+#                                       line for a room to move (see the
+#                                       function comment)
 #
 # Stacked trains (AGAST #3809): a train holds at most 8 cars (RZ_TRAIN_MAX);
 # car 9 onward start the next train on its tail.  Each train has its own
@@ -694,6 +704,171 @@ cmd_show() {
     done
 }
 
+# cmd_tail: the deepest built train's tail — the base a new room should use
+# (AGAST #4409, #4413).  Prints "<tip12> rz-train/<tip12>", or nothing when no
+# train is built.  A train whose state file is gone, or whose published tail
+# ref is absent on origin (its build was replaced, it failed, or it landed),
+# is not a built train: never report such a stale TIP= (AGAST #4413).  Exits 2
+# when origin can't be asked: an absent answer is not the same as an absent
+# ref, and the caller must not act on it.
+cmd_tail() {
+    local q=() i st tip ref got
+    mapfile -t q < <(queue)
+    for ((i = ${#q[@]} - 1; i >= 0; i--)); do
+        use_slot "${q[$i]}"; st="$(state)"
+        [[ -f "$st" ]] || continue
+        tip="$(field TIP "$st")"
+        [[ -n "$tip" ]] || continue
+        ref="rz-train/${tip:0:12}"
+        if ! got="$(git -C "$MAIN_WT" ls-remote --heads origin "refs/heads/$ref" 2>/dev/null)"; then
+            echo "error: cannot reach origin to check $ref (is it built?)" >&2
+            exit 2
+        fi
+        [[ "$(cut -f1 <<<"$got")" == "$tip" ]] || continue
+        echo "${tip:0:12} $ref"
+        return 0
+    done
+    return 0
+}
+
+# gate_live <room> <field>: 0 when a gate for <room> is live.  <field> from
+# the caller (gating|idle) wins: that is how a remote room is fed from its
+# host's STATUS gate list.  "-" or empty asks this host: the room's
+# ritz-gate-<room> unit (AGAST #4413).
+gate_live() {
+    local room="$1" g="${2:-}"
+    case "$g" in
+        gating) return 0 ;;
+        idle) return 1 ;;
+    esac
+    systemctl --user is-active -q "ritz-gate-$room" 2>/dev/null
+}
+# gate_reason <room> <field>: where the liveness came from, for the SKIP line.
+gate_reason() {
+    local room="$1" g="${2:-}"
+    case "$g" in
+        gating|idle) echo "host STATUS" ;;
+        *) echo "ritz-gate-$room is active" ;;
+    esac
+}
+
+# cmd_rebase_plan [<ref>] [--dropped <oldtip> [--onto <ref>]]: one rz loop
+# turn of the preemptive rebase advisory (AGAST #4413).  Every loop turn, a
+# room based on an older base than the deepest train tail is told (once) to
+# rebase onto that tail, so its car boards the train as KEPT instead of being
+# cherry-picked; a room mid-gate is skipped, never rewound.  Advisory only:
+# this moves no branch and touches no worktree.
+#
+# stdin, one room per line:
+#   <room> <base> [<gate>]
+#     <room>  the room name (ritz-task-<id>)
+#     <base>  the room HEAD's merge-base with the reference (the caller's
+#             job: local `git -C <wt> merge-base <ref> HEAD`, a remote room's
+#             from its host's STATUS, or a base the caller already knows),
+#             full or 12-char SHA; "-" when unknown.
+#     <gate>  gating|idle, or - / absent to ask this host (gate_live).  A
+#             remote room is fed from its host's STATUS gate list.
+# The reference is <ref> when given, else the deepest built train's tail
+# (cmd_tail), else origin/main.  Output is one status line per room, then at
+# most one action line:
+#   ROOM <room> base=<b12> tail=<t12|main> on-tail|behind|unknown|other
+#   SKIP <room>: gate live (<why>); not rebasing mid-gate
+#   REBASE <room> onto <t12>: rebase onto <t12>: `git fetch origin
+#          rz-train/<t12> && git rebase FETCH_HEAD`, resolve, re-gate and REAP
+#   BOUNCE <room> onto <t12|main>: the train was discarded; rebase onto
+#          <t12|main>: ... (--dropped mode)
+# --dropped <oldtip>: bounce the rooms whose <base> is exactly <oldtip>, onto
+# <ref>/--onto or the deepest tail/main: a room spawned on a tail whose train
+# failed or was replaced must move even when no newer tail carries its cars.
+# Rooms not based on <oldtip> are listed "other" and left alone.
+cmd_rebase_plan() {
+    local refarg="" dropped="" ref refname base_full t room base gate b12 why
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dropped) dropped="${2:?--dropped needs a commit}"; shift 2 ;;
+            --onto)    refarg="${2:?--onto needs a commit}"; shift 2 ;;
+            *)         refarg="$1"; shift ;;
+        esac
+    done
+    if [[ -n "$refarg" ]]; then
+        ref="$(git -C "$MAIN_WT" rev-parse -q --verify "$refarg^{commit}" 2>/dev/null)" \
+            || die "no such commit: $refarg"
+        if [[ "$ref" == "$(git -C "$MAIN_WT" rev-parse origin/main)" ]]; then
+            refname="main"
+        else
+            refname="${refarg#refs/heads/}"; refname="${refname#rz-train/}"
+            refname="${refname:0:12}"
+        fi
+    else
+        t="$(cmd_tail | awk '{print $1}')"
+        if [[ -n "$t" ]]; then
+            ref="$(git -C "$MAIN_WT" rev-parse -q --verify "$t^{commit}")"
+            refname="$t"
+        else
+            ref="$(git -C "$MAIN_WT" rev-parse origin/main)"
+            refname="main"
+        fi
+    fi
+    if [[ -n "$dropped" ]]; then
+        local oldname="$dropped" dropped_sha
+        dropped_sha="$(git -C "$MAIN_WT" rev-parse -q --verify "$dropped^{commit}" 2>/dev/null)" \
+            || die "no such commit: $oldname"
+        dropped="$dropped_sha"
+    fi
+    while read -r room base gate || [[ -n "$room" ]]; do
+        [[ -n "$room" && "$room" != \#* ]] || continue
+        base_full=""
+        if [[ "$base" != - && -n "$base" ]]; then
+            base_full="$(git -C "$MAIN_WT" rev-parse -q --verify "$base^{commit}" 2>/dev/null || true)"
+        fi
+        if [[ -z "$base_full" ]]; then
+            echo "ROOM $room base=? tail=$refname unknown"
+            continue
+        fi
+        b12="${base_full:0:12}"
+        if [[ -n "$dropped" ]]; then
+            if [[ "$base_full" != "$dropped" ]]; then
+                echo "ROOM $room base=$b12 tail=$refname other"
+                continue
+            fi
+            echo "ROOM $room base=$b12 tail=$refname dropped"
+            if gate_live "$room" "$gate"; then
+                why="$(gate_reason "$room" "$gate")"
+                echo "SKIP $room: gate live ($why); not rebasing mid-gate"
+                continue
+            fi
+            rebase_line BOUNCE "$room" "$refname"
+            continue
+        fi
+        if [[ "$base_full" == "$ref" ]]; then
+            echo "ROOM $room base=$b12 tail=$refname on-tail"
+            continue
+        fi
+        echo "ROOM $room base=$b12 tail=$refname behind"
+        if gate_live "$room" "$gate"; then
+            why="$(gate_reason "$room" "$gate")"
+            echo "SKIP $room: gate live ($why); not rebasing mid-gate"
+            continue
+        fi
+        rebase_line REBASE "$room" "$refname"
+    done
+}
+
+# rebase_line <verb> <room> <refname>: the one message the caller sends (or
+# forwards) for <room>.  main has no rz-train ref: fetch it directly.
+rebase_line() {
+    local verb="$1" room="$2" refname="$3" fetch
+    if [[ "$refname" == main ]]; then
+        fetch='git fetch origin && git rebase FETCH_HEAD'
+        printf '%s %s onto main: rebase onto main: `%s`, resolve, re-gate and REAP\n' \
+            "$verb" "$room" "$fetch"
+    else
+        fetch="git fetch origin rz-train/$refname && git rebase FETCH_HEAD"
+        printf '%s %s onto %s: rebase onto %s: `%s`, resolve, re-gate and REAP\n' \
+            "$verb" "$room" "$refname" "$refname" "$fetch"
+    fi
+}
+
 # gate_log: the current train's gate log: its SPEC's local log, else its
 # last GATED=; empty if it was never gated.
 gate_log() {
@@ -1219,7 +1394,7 @@ cmd_land() {
 # each: bisect them (SKILL.md step 6) with `build --next`, culprit-suspect
 # first out.  Trains 1..k-1 and their gates stay as they are.
 cmd_fail() {
-    local log="${1:?usage: $0 fail <log>}" lsha q i k=0 items=() b room new s
+    local log="${1:?usage: $0 fail <log>}" lsha q i k=0 items=() b room new s tip
     [[ -f "$log" ]] || die "no such gate log: $log"
     lsha="$(sed -n 's/^SHA=//p' "$log" | head -1)"
     [[ "$(sed -n 's/^EXIT=//p' "$log" | tail -1)" != 0 ]] || die "that gate passed: land it"
@@ -1231,6 +1406,15 @@ cmd_fail() {
     [[ $k -gt 0 ]] || die "gate log is for no train's tip (${lsha:0:12})"
     use_slot "${q[$((k - 1))]}"
     while read -r b room new; do echo "HELD     $b ${room:0:12}"; done < <(field ITEM "$(state)")
+    # The tails a room may be based on and that are about to go: train k's and
+    # every later train's.  A room spawned on one must move even when no newer
+    # tail carries its cars (AGAST #4413): name each, so rz can bounce them
+    # (`rebase-plan --dropped <tip> --onto <new>`).
+    for ((i = k - 1; i < ${#q[@]}; i++)); do
+        use_slot "${q[$i]}"
+        tip="$(field TIP "$(state)")"
+        [[ -z "$tip" ]] || echo "DROPPED  tail ${tip:0:12} — a room based on it must rebase"
+    done
     for ((i = k; i < ${#q[@]}; i++)); do
         use_slot "${q[$i]}"
         while read -r b room new; do items+=("$b:$room"); done < <(field ITEM "$(state)")
@@ -1314,5 +1498,7 @@ case "${1:-}" in
     land)  shift; cmd_land "$@" ;;
     pkgs)  shift; cmd_pkgs "$@" ;;
     show)  cmd_show ;;
-    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | land [<log>] | show | pkgs list|test <base>" >&2; exit 2 ;;
+    tail)  cmd_tail ;;
+    rebase-plan) shift; cmd_rebase_plan "$@" ;;
+    *) echo "usage: $0 build [--next] <branch>:<sha> ... | gate [<k> | --next [<host>]] | wait <log> | discard [<host>] | fail <log> | pending | land [<log>] | show | tail | rebase-plan [<ref>] [--dropped <oldtip> [--onto <ref>]] | pkgs list|test <base>" >&2; exit 2 ;;
 esac

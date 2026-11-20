@@ -1488,5 +1488,109 @@ out="$(bash "$TR" land "$log6" 2>&1)"
 [[ -z "$(oref "${tips[0]:0:12}")$(oref "${tips[2]:0:12}")$(oref "${t6:0:12}")" ]] \
     && ok "landing deletes the published tails" || bad "landing deletes the published tails"
 
+# 18. Preemptive rebase advisory (AGAST #4413).  `tail` names the deepest
+# built train's published tail, never a discarded one.  `rebase-plan` is one
+# loop turn: it compares each running room's base (fed in, so a local and a
+# remote room alike) to that tail, SKIPs a room mid-gate with the reason, and
+# prints exactly one rebase message for a room that must move.  It moves
+# nothing itself: no branch, no worktree.
+export RZ_TRAIN_MAX=8 RZ_TRAIN_DEBOUNCE=0
+# 17f left its seventh train in flight: the build succeeds and it is the gate
+# that refuses past the depth.  Drop it so these tests start from no train.
+lg7="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)" || true
+[[ -n "$lg7" ]] && bash "$TR" fail "$lg7" >/dev/null 2>&1 || true
+tail1() { bash "$TR" tail | awk '{print $1}'; }
+
+# 18a. No train built: tail prints nothing (not a stale TIP=).
+fetch; git -C "$M" checkout -q main
+eq "$(bash "$TR" tail)" "" "tail prints nothing when no train is built"
+
+# 18b. A built train: tail is its published tip.
+za="$(room za s/za ZA)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "za:$za" >/dev/null 2>&1
+t1="$(tipn 1)"; p1="${t1:0:12}"
+[[ "$(tail1)" == "$p1" && "$(oref "$p1")" == "$(git -C "$T/train" rev-parse HEAD)" ]] \
+    && ok "tail names the built train's published tip" || bad "tail names the built train's published tip"
+eq "$(bash "$TR" tail)" "$p1 rz-train/$p1" "tail prints '<tip12> rz-train/<tip12>'"
+
+# 18c. Two trains: the deepest is the tail.
+zb="$(room zb s/zb ZB)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build --next "zb:$zb" >/dev/null 2>&1
+t2="$(tipn 2)"; p2="${t2:0:12}"
+eq "$(tail1)" "$p2" "tail is the deepest of two trains"
+
+# 18d. A discarded tail is never reported: the ref is the truth, not TIP=.
+git -C "$M" push -q origin --delete "refs/heads/rz-train/$p2"
+eq "$(tail1)" "$p1" "tail falls back past a train whose tail ref was discarded"
+git -C "$M" push -q origin --delete "refs/heads/rz-train/$p1"
+eq "$(bash "$TR" tail)" "" "tail prints nothing when every tail ref is gone"
+# Restore the two trains (same cars on the same tail give the same tips).
+bash "$TR" build "za:$za" >/dev/null 2>&1; bash "$TR" build --next "zb:$zb" >/dev/null 2>&1
+eq "$(tail1)" "$p2" "a rebuilt train republishes its tail"
+
+# 18e. A failed train names the tail a room based on it must leave (AGAST
+# #4413 point 5): the room may carry cars that no newer tail holds.
+log="$(RZ_FAKE_EXIT=1 bash "$TR" gate 2>/dev/null)"
+out="$(bash "$TR" fail "$log" 2>&1)"
+has "$out" "^DROPPED +tail $p2 " "fail names the tail a room based on it must rebase from"
+eq "$(tail1)" "$p1" "after the fail the deepest built tail is train 1's"
+
+# 18f. One loop turn: each room's base vs the tail, a gating room skipped with
+# the reason, and exactly one rebase message for a room that must move.
+main="$(git -C "$M" rev-parse origin/main)"; m12="${main:0:12}"
+mkdir -p "$RZ_TEST_ACTIVE"; touch "$RZ_TEST_ACTIVE/ritz-gate-zloc"
+out="$(printf 'zon %s idle\nzmain %s idle\nzloc %s\nzrem %s gating\n' \
+    "$p1" "$m12" "$m12" "$m12" | bash "$TR" rebase-plan)"
+rm -f "$RZ_TEST_ACTIVE/ritz-gate-zloc"
+has "$out" "^ROOM zon base=$p1 tail=$p1 on-tail$" "a room on the tail is on-tail"
+! grep -q '^REBASE zon' <<<"$out" && ok "a room on the tail is not messaged" || bad "a room on the tail is not messaged"
+has "$out" "^ROOM zmain base=$m12 tail=$p1 behind$" "a room behind the tail says so"
+has "$out" "^REBASE zmain onto $p1: rebase onto $p1: .git fetch origin rz-train/$p1 && git rebase FETCH_HEAD" \
+    "a room behind the tail gets one rebase message"
+[[ "$(grep -c '^REBASE zmain' <<<"$out")" == 1 ]] && ok "exactly one rebase message per room" \
+    || bad "exactly one rebase message per room"
+has "$out" "^SKIP zloc: gate live \(ritz-gate-zloc is active\); not rebasing mid-gate" \
+    "a room mid-gate here is skipped with the local reason"
+has "$out" "^SKIP zrem: gate live \(host STATUS\); not rebasing mid-gate" \
+    "a remote room mid-gate (fed from its host) is skipped with that reason"
+! grep -q '^REBASE zloc\|^REBASE zrem' <<<"$out" && ok "a gating room is never told to rebase" \
+    || bad "a gating room is never told to rebase"
+[[ "$(grep -c '^REBASE' <<<"$out")" == 1 ]] && ok "only the non-gating behind room gets a message" \
+    || bad "only the non-gating behind room gets a message ($(grep -c '^REBASE' <<<"$out"))"
+
+# 18g. An unknown base is listed, never messaged.
+out="$(printf 'zunk - idle\n' | bash "$TR" rebase-plan)"
+has "$out" "^ROOM zunk base=. tail=$p1 unknown$" "an unknown base is listed as unknown"
+! grep -q '^REBASE zunk' <<<"$out" && ok "an unknown base gets no rebase message" || bad "an unknown base gets no rebase message"
+
+# 18h. No train built: main is the reference (a room on main is on-tail).
+bash "$TR" land >/dev/null 2>&1   # train 1 is gate=not-needed (its car is KEPT)
+eq "$(bash "$TR" tail)" "" "tail prints nothing once the trains land"
+main="$(git -C "$M" rev-parse origin/main)"; m12="${main:0:12}"
+older="$(git -C "$M" rev-parse origin/main~1)"; o12="${older:0:12}"
+out="$(printf 'zmain %s idle\nzold %s idle\n' "$m12" "$o12" | bash "$TR" rebase-plan)"
+has "$out" "^ROOM zmain base=$m12 tail=main on-tail$" "with no train, a room on main is on-tail"
+has "$out" "^REBASE zold onto main: rebase onto main: .git fetch origin && git rebase FETCH_HEAD" \
+    "with no train, a room off main is told to rebase onto main"
+
+# 18i. A discarded/failed train's tail: a room based on it is bounced onto the
+# new tail or main even when no newer tail carries its cars (AGAST #4413
+# point 5).  The caller feeds the merge-base against the dropped tail.
+zc="$(room zc s/zc ZC)"; fetch; git -C "$M" checkout -q main
+bash "$TR" build "zc:$zc" >/dev/null 2>&1
+drop="$(tail1)"; main="$(git -C "$M" rev-parse origin/main)"; m12="${main:0:12}"
+git -C "$M" push -q origin --delete "refs/heads/rz-train/$drop"
+out="$(printf 'zdrop %s idle\nzother %s idle\n' "$drop" "$m12" | bash "$TR" rebase-plan --dropped "$drop")"
+has "$out" "^ROOM zdrop base=$drop tail=main dropped$" "a room on the dropped tail is named dropped"
+has "$out" "^BOUNCE zdrop onto main: rebase onto main: .git fetch origin && git rebase FETCH_HEAD" \
+    "a room on the dropped tail is bounced onto main"
+has "$out" "^ROOM zother base=$m12 tail=main other$" "a room not on the dropped tail is left alone"
+! grep -q '^BOUNCE zother' <<<"$out" && ok "a room not on the dropped tail is not bounced" \
+    || bad "a room not on the dropped tail is not bounced"
+out="$(printf 'zdrop2 %s gating\n' "$drop" | bash "$TR" rebase-plan --dropped "$drop")"
+has "$out" "^SKIP zdrop2: gate live \(host STATUS\); not rebasing mid-gate" \
+    "a room on a dropped tail but mid-gate is skipped, not rewound"
+! grep -q '^BOUNCE zdrop2' <<<"$out" && ok "a gating room is never bounced" || bad "a gating room is never bounced"
+
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

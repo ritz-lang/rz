@@ -15,7 +15,9 @@ full. It keeps looping until the goal at the bottom of this file is met.
 Repeat until the goal is met:
 
 1. **Drain the reap queue** (see "Reaping"). Merges first. Queued REAPs land
-   together as one merge train with one gate; rooms don't rebase for it.
+   together as one merge train with one gate; a room's car joins it without
+   the room rebasing for the merge (rooms do rebase preemptively onto a newer
+   tail: "Keep running rooms on the deepest tail").
    **First, recover dropped REAPs:** a REAP turn can be interrupted by the
    next REAP's turn before it queues anything (1485 was lost this way twice).
    `get_conversation_messages(room_id="rz", message_type="chat", since=<last check>)`,
@@ -1140,12 +1142,25 @@ one to train 1.
    .claude/skills/rz-iterate/train.sh fail "$LOGK"
    ```
    prints `HELD <branch> <sha12>` for each of train k's cars, stops every
-   later train's gate (`DISCARDED speculative gate ...`, ref deleted) and
-   rebuilds their cars on train k-1's tail (`TRAIN <k> base=...` lines;
-   main for k = 1). Trains 1..k-1 and their gates are left alone. Then
-   bisect the HELD cars as above with `build --next <halved HELD cars>
-   <the rest of the queue>` (a plain `build` for k = 1), and gate per
-   `pending`. A failed train with nothing behind it is just dropped. If
+   later train's gate (`DISCARDED speculative gate ...`, ref deleted),
+   prints a `DROPPED  tail <tip12> — a room based on it must rebase` line
+   for train k's tail and each later train's, and rebuilds their cars on
+   train k-1's tail (`TRAIN <k> base=...` lines; main for k = 1). Trains
+   1..k-1 and their gates are left alone. Then bisect the HELD cars as above
+   with `build --next <halved HELD cars> <the rest of the queue>` (a plain
+   `build` for k = 1), and gate per `pending`. A failed train with nothing
+   behind it is just dropped. **Each `DROPPED` tail is a base some running
+   room may sit on** (AGAST #4413 point 5): a room spawned on it must move
+   even when no newer tail carries its cars, so bounce it now rather than
+   waiting for a conflict (the preemptive loop below explains the input):
+   ```bash
+   printf '%s %s idle\n' ritz-task-1234 "$(git -C ~/dev/ritz-lang/rz-task-1234 merge-base "$DROP" HEAD)" |
+       .claude/skills/rz-iterate/train.sh rebase-plan --dropped "$DROP"
+   ```
+   It answers `ROOM ... dropped` and one `BOUNCE <room> onto <new tail|main>`
+   per room whose base is that tail, skipping a room mid-gate. Send each
+   `BOUNCE` line's message; a `fail` that rebuilds later cars prints
+   `DROPPED` for their old tails too, so bounce those rooms as well. If
    **train 1 passes and train 2 fails**, land train 1 (step 5), then `fail`
    train 2's log. A stale verdict can't land anything by mistake: it names
    the old tip, and `land` refuses a log for another commit.
@@ -1163,11 +1178,64 @@ one to train 1.
    in step 5.
 8. **All items checked:** `clear_scratchpad`.
 
-**Never tell running rooms that `main` moved.** A room rebases only when its
-own commit conflicted or failed (steps 6 and 7). Broadcasting made five rooms
+**Keep running rooms on the deepest tail (AGAST #4413).** A room's car is
+gated on whatever base it branched from. Once a newer train stacks a tail
+above it, that base is stale: the room's next gate covers a tree that main
+will no longer match, and its REAP then cherry-picks (`APPLIED`) instead of
+boarding as-is (`KEPT`). Each loop turn, learn the deepest **built** tail and
+which running rooms are behind it:
+
+```bash
+.claude/skills/rz-iterate/train.sh tail
+# <tip12> rz-train/<tip12>, or nothing when no train is built
+```
+
+`tail` reads each train's `TIP=` **and** confirms
+`refs/heads/rz-train/<tip12>` is still on origin, so a train whose build was
+replaced, failed or landed is never offered (a stale `TIP=` in a dead slot is
+skipped and the next-deepest built train wins); it exits 2 when origin can't
+be asked, because "no answer" is not "no ref". Then feed it one line per
+running room and act on its lines:
+
+```bash
+printf '%s %s %s\n' \
+    ritz-task-1234 "$BASE" idle \
+    ritz-task-5678 "$BASE2" gating |
+    .claude/skills/rz-iterate/train.sh rebase-plan
+```
+
+Each line is `<room> <base> [<gate>]`. `<base>` is the room HEAD's
+merge-base with the reference (local: `git -C <wt> merge-base <ref> HEAD`;
+a remote room's comes from its host's `STATUS`), full or 12-char SHA, or `-`
+when unknown. `<gate>` is `gating`/`idle` when the caller already knows it —
+**that is how a remote room's liveness is fed in**, from its host's `STATUS`
+gate list; omit it (or pass `-`) for a local room and `rebase-plan` asks this
+host's `ritz-gate-<room>` unit. Output is one status line per room, then at
+most one action line:
+
+    ROOM <room> base=<b12> tail=<t12|main> on-tail|behind|unknown|other
+    SKIP <room>: gate live (<why>); not rebasing mid-gate
+    REBASE <room> onto <t12>: rebase onto <t12>: `git fetch origin
+           rz-train/<t12> && git rebase FETCH_HEAD`, resolve, re-gate and REAP
+
+The reference is the deepest built tail, or `origin/main` when no train is
+built (`tail=main`); an `unknown` base is listed, never messaged. A room
+whose base is not the tail is `behind` and gets **exactly one** `REBASE`
+line; a room on a live gate (fed, or a local `ritz-gate-<room>` unit) is
+`SKIP`ped with the reason and **never rebased mid-gate**. Send each `REBASE`
+line's message to its room verbatim; that is all `rz` does with it.
+`rebase-plan` is **advisory only**: it moves no branch, rewinds nothing and
+touches no worktree. A room that already gated on its base may still land;
+let it, and its REAP boards normally (if its base is still a train's tail it
+boards `KEPT`).
+
+**Never broadcast that `main` moved.** The loop above is per-room and tracked
+to the tail, not a "main moved" broadcast; broadcasting made five rooms
 re-gate at once, filling both gate slots with work that was stale again by
-the next merge. Committing to `main` from this room (skill edits and the
-like) needs no message either; it just becomes the next train's base.
+the next merge. A room rebases on its own schedule; a REAP whose commit
+conflicted or failed is bounced individually (steps 6 and 7). Committing to
+`main` from this room (skill edits and the like) needs no message either; it
+just becomes the next train's base.
 
 GitHub CI: glance at `gh run list -L 3` each turn. Red on an already-known
 failure set is normal (`known-failures/` reds). A **new** failure becomes a
