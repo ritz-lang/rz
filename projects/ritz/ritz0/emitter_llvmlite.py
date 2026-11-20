@@ -23,7 +23,8 @@ from monomorph_core import instance_display_name, note_instance_display
 from tail_value import arm_diverges, slot_tails, value_gap, value_tails
 import array_rules
 from qualified_access import module_item_access_removed
-from builtin_types import BUILTIN_TYPES, PRIMITIVES, target_spelling
+from builtin_types import (BUILTIN_TYPES, PRIMITIVES, is_builtin_target,
+                           target_spelling)
 import index_rules
 import interp_spec
 import deref_rules
@@ -8383,16 +8384,18 @@ class LLVMEmitter:
                 f"bool, StrView and pointers have a formatted form",
                 getattr(expr, "span", None) or span)
 
-    def _format_int_digits(self, value: ir.Value, expr: rast.Expr):
+    def _format_int_digits(self, value: ir.Value, expr: rast.Expr, rtype=None):
         """Format integer `value` (placeholder `expr`) into a stack buffer.
 
         Returns (ptr, len) of its decimal digits. Signedness comes from the
         Ritz type, not the LLVM type (which has none): an unsigned value is
         zero-extended and divided unsigned, so u8 200 is `200` and u64::MAX
         is `18446744073709551615` (AGAST #2128). print, eprint and
-        format_into all format integers here.
+        format_into all format integers here. `rtype` names the type when
+        there is no expression to infer it from (an auto-derived Debug's
+        struct field, #202).
         """
-        rt = self._infer_ritz_type(expr, value)
+        rt = rtype if rtype is not None else self._infer_ritz_type(expr, value)
         unsigned = isinstance(rt, rast.NamedType) and rt.name in ('u8', 'u16', 'u32', 'u64')
         if value.type.width < 64:
             value = self.builder.zext(value, self.i64) if unsigned else self.builder.sext(value, self.i64)
@@ -8527,12 +8530,13 @@ class LLVMEmitter:
         return fn
 
     def _refuse_format_specs(self, lit: rast.InterpString):
-        """AGAST #201: a `{x:spec}` placeholder's spec is parsed (and an
-        unknown one refused by the parser), but printing it is #202's,
-        through ritzlib.fmt's Display. Until then refuse a spec rather than
-        print the value without it."""
+        """AGAST #201/#202: a placeholder's spec is parsed (and an unknown one
+        refused by the parser). `?` prints, through Debug. Every other spec
+        (width, radix, alignment) is still not printed, so refuse it rather
+        than print the value without it. ritz1 refuses every spec, `?`
+        included, until its Display/Debug port (AGAST #4381)."""
         for spec in lit.specs:
-            if spec:
+            if spec and spec != '?':
                 raise EmitError(interp_spec.not_printed_message(spec), lit.span)
 
     # ------------------------------------------------------------------
@@ -8563,21 +8567,25 @@ class LLVMEmitter:
                 got = self._sink_write_const(sink, part)
                 total = self.builder.add(total, got)
             if i < len(expr.exprs):
-                got = self._emit_display_value(expr.exprs[i], sink)
+                got = self._emit_display_value(expr.exprs[i], sink,
+                                               expr.specs[i] if i < len(expr.specs) else '')
                 total = self.builder.add(total, got)
         if newline:
             got = self._sink_write_const(sink, "\n")
             total = self.builder.add(total, got)
         return total
 
-    def _emit_display_value(self, expr: rast.Expr, sink, trait: str = 'Display',
-                            method: str = 'show'):
-        """Write `{expr}` to `sink` through the value's own trait impl.
+    def _emit_display_value(self, expr: rast.Expr, sink, spec: str = ''):
+        """Write one `{expr[:spec]}` to `sink` through the value's own impl.
 
+        `{x}` is Display::show. `{x:?}` is Debug::show_debug, and a struct
+        with no Debug impl of its own auto-derives one (`Name { f: v }`).
         The impl wins over the compiler's built-in form; only when there is
         no impl in scope does a primitive use the intrinsic form, and a type
         with neither is a located diagnostic naming the impl to add.
         """
+        debug = spec == '?'
+        trait, method = ('Debug', 'show_debug') if debug else ('Display', 'show')
         value = self._emit_expr(expr)
         type_name, spelling = self._display_type_name(expr, value)
         mangled = (self._display_method(type_name, trait, method)
@@ -8585,10 +8593,15 @@ class LLVMEmitter:
         if mangled is not None:
             return self._emit_display_call(expr, value, type_name, spelling,
                                            method, sink)
-        got = self._emit_intrinsic_display(value, expr, sink)
+        span = getattr(expr, "span", None)
+        if debug:
+            got = self._emit_auto_debug(value, type_name, spelling, sink, span)
+            if got is None:
+                got = self._emit_intrinsic_debug(value, expr, sink)
+        else:
+            got = self._emit_intrinsic_display(value, expr, sink)
         if got is not None:
             return got
-        span = getattr(expr, "span", None)
         raise EmitError(
             f"type `{spelling}` doesn't implement {trait}; "
             f"add `impl {trait} for {spelling}`", span)
@@ -8641,19 +8654,138 @@ class LLVMEmitter:
         return None
 
     def _emit_display_call(self, expr: rast.Expr, value: ir.Value,
-                           type_name: str, spelling: str, method: str, sink):
-        """Call `value`'s trait method with the sink's Writer."""
+                           type_name: str, spelling: str, method: str, sink,
+                           rtype=None):
+        """Call `value`'s trait method with the sink's Writer.
+
+        `expr` may be None when the value is a struct field the auto-derived
+        Debug extracted; `rtype` then names its declared type.
+        """
         span = getattr(expr, "span", None)
         recv = self.builder._entry_alloca(value.type, "fmt.recv")
         self.builder.store(value, recv)
         recv_name = self._fmt_local_name("recv")
         self.locals[recv_name] = (recv, value.type)
-        rty = self._infer_ritz_type(expr, value)
+        rty = rtype if rtype is not None else self._infer_ritz_type(expr, value)
         if rty is not None:
             self.ritz_types[recv_name] = rty
         arg = self._display_writer_arg(sink, span)
         call = rast.MethodCall(span, rast.Ident(span, recv_name), method, [arg])
         return self._emit_method_call(call)
+
+    # ------------------------------------------------------------------
+    # Debug's auto-derive (#202): a struct with no `impl Debug` prints as
+    # `Name { field: value, ... }`, each field through its own Debug (a real
+    # impl, an auto-derived one, or a scalar's intrinsic). A field the
+    # compiler cannot print is the same located diagnostic the top level
+    # gives, naming the field's type.
+    # ------------------------------------------------------------------
+
+    def _emit_auto_debug(self, value: ir.Value, type_name, spelling: str,
+                         sink, span):
+        """Synthesize `Name { f: v, ... }` for a struct, or None.
+
+        Only a struct whose fields the compiler knows qualifies: a built-in
+        (`StrView`, `Span<u8>`) keeps its ritzlib impl as the only word on
+        how it prints, and a non-struct has nothing to derive from. A struct
+        with no fields prints as its bare name.
+        """
+        if type_name is None:
+            return None
+        base = type_name.split('$')[0]
+        if is_builtin_target(base) or is_builtin_target(type_name):
+            return None
+        fields = self.struct_fields.get(type_name)
+        struct_ty = self.struct_types.get(type_name)
+        if fields is None or struct_ty is None:
+            return None
+        # `{@p:?}` (and a field reached through a reference) names the
+        # struct but holds its address: load it before extracting fields.
+        if isinstance(value.type, ir.PointerType) and value.type.pointee == struct_ty:
+            value = self.builder.load(value)
+        if value.type != struct_ty:
+            return None
+        stack = getattr(self, '_auto_debug_stack', None)
+        if stack is None:
+            stack = self._auto_debug_stack = set()
+        if type_name in stack:
+            return None
+        stack.add(type_name)
+        try:
+            total = self._sink_write_const(sink, spelling)
+            if fields:
+                total = self.builder.add(
+                    total, self._sink_write_const(sink, " { "))
+                for i, (fname, ftype) in enumerate(fields):
+                    if i:
+                        total = self.builder.add(
+                            total, self._sink_write_const(sink, ", "))
+                    total = self.builder.add(
+                        total, self._sink_write_const(sink, f"{fname}: "))
+                    got = self._emit_debug_field(
+                        self.builder.extract_value(value, i), ftype, sink, span)
+                    total = self.builder.add(total, got)
+                total = self.builder.add(
+                    total, self._sink_write_const(sink, " }"))
+            return total
+        finally:
+            stack.discard(type_name)
+
+    def _emit_debug_field(self, value: ir.Value, ftype, sink, span):
+        """Write one struct field's Debug form."""
+        ftype = resolve_alias_in(ftype, self.type_aliases)
+        if isinstance(ftype, rast.RefType):
+            ftype = resolve_alias_in(ftype.inner, self.type_aliases)
+        name, spelling = self._field_dispatch_name(ftype)
+        mangled = (self._display_method(name, 'Debug', 'show_debug')
+                   if name else None)
+        if mangled is not None:
+            return self._emit_display_call(None, value, name, spelling,
+                                           'show_debug', sink, rtype=ftype)
+        got = self._emit_auto_debug(value, name, spelling, sink, span)
+        if got is None:
+            got = self._emit_intrinsic_debug(value, None, sink, rtype=ftype)
+        if got is not None:
+            return got
+        raise EmitError(
+            f"type `{spelling}` doesn't implement Debug; "
+            f"add `impl Debug for {spelling}`", span)
+
+    def _field_dispatch_name(self, ftype):
+        """The dispatch name and source spelling of a declared field type."""
+        if isinstance(ftype, rast.PtrType):
+            inner = resolve_alias_in(ftype.inner, self.type_aliases)
+            if (isinstance(inner, rast.NamedType) and inner.name == 'u8'
+                    and not inner.args):
+                return 'ptr_u8', '*u8'
+            return None, self._show_type(ftype)
+        if isinstance(ftype, rast.NamedType):
+            name = (mangle_generic_name(ftype.name, ftype.args)
+                    if ftype.args else ftype.name)
+            return name, self._show_type(ftype)
+        return None, self._show_type(ftype)
+
+    def _emit_intrinsic_debug(self, value: ir.Value, expr, sink, rtype=None):
+        """The compiler's own Debug form of a scalar, or None.
+
+        An integer's and a boolean's Debug is their Display. Text is not:
+        ritzlib's Debug quotes and escapes a StrView, and the emitter does
+        not claim to be that second implementation of the format -- a
+        self-contained program without the impl gets the diagnostic.
+        """
+        ty = value.type
+        if ty == self.i1:
+            true_str = self._get_string_constant("true")
+            false_str = self._get_string_constant("false")
+            true_ptr = self.builder.gep(true_str, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
+            false_ptr = self.builder.gep(false_str, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
+            ptr = self.builder.select(value, true_ptr, false_ptr)
+            length = self.builder.select(value, ir.Constant(self.i64, 4), ir.Constant(self.i64, 5))
+            return self._sink_write_ptr(sink, ptr, length)
+        if isinstance(ty, ir.IntType):
+            ptr, length = self._format_int_digits(value, expr, rtype=rtype)
+            return self._sink_write_ptr(sink, ptr, length)
+        return None
 
     # ------------------------------------------------------------------
     # Sinks: a file descriptor (an implicit print) or the program's Writer.

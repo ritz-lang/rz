@@ -12,13 +12,16 @@ ritzlib/fmt/spec.ritz `fmt_spec_parse`'s grammar:
 with N decimal digits <= 4096. Any other spec is a compile error at the
 literal, the same text from all three compilers.
 
-Printing a spec is AGAST #202 (through ritzlib.fmt's Display). Until then
-a valid spec is parsed and refused at the emitter, so no program silently
-prints its value unformatted.
+Printing a spec is AGAST #202 (through ritzlib.fmt's Display). `?` now
+prints in ritz0 (Debug, auto-derived for a struct); every other spec is
+still parsed and refused at the emitter, so no program silently prints its
+value unformatted. ritz1 keeps refusing `?` until the parity follow-up.
 
     INVALID      each unknown spec, refused with SPEC_MSG
-    NOT_PRINTED  each valid spec, refused with LATER_MSG (print, eprint and
-                 format_into)
+    NOT_PRINTED  each remaining valid spec, refused with LATER_MSG (print,
+                 eprint and format_into)
+    DEBUG_LATER  `?` in ritz1 / ritz1_selfhosted, refused with LATER_MSG;
+                 ritz0's `?` is covered by test_display_dispatch.py
     test_placeholders_without_a_spec_are_unchanged
                  `{x}`, a call, `{{x}}`, a struct literal and a char
                  literal holding `:` still print the same bytes
@@ -105,7 +108,6 @@ NOT_PRINTED = {
     "left": ('print(^"{s:<4}")', "<4"),
     "right": ('print(^"[{s:>10}]")', ">10"),
     "centre_max": ('print(^"{s:^4096}")', "^4096"),
-    "debug": ('print(^"{x:?}")', "?"),
     "format_into": ('format_into(@&buf, ^"{x:X}")', "X"),
     "after_plain": ('print(^"{x} {x:X}\\n")', "X"),
 }
@@ -115,6 +117,22 @@ NOT_PRINTED = {
 @pytest.mark.parametrize("name", sorted(NOT_PRINTED))
 def test_a_valid_spec_is_refused_until_202(tmp_path, compiler, name):
     line, spec = NOT_PRINTED[name]
+    _assert_refused(compiler, tmp_path, f"later_{name}", _prog(line), LATER_MSG(spec))
+
+
+# ritz0 prints `?` (#202); ritz1's port is AGAST #4381. Until it lands the
+# refusal is pinned for the two Ritz-written compilers, so the divergence is
+# stated rather than silent (and this block is the reminder to delete).
+DEBUG_LATER = {
+    "debug": ('print(^"{x:?}")', "?"),
+    "debug_line": ('print(^"{x:?}\\n")', "?"),
+}
+
+
+@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
+@pytest.mark.parametrize("name", sorted(DEBUG_LATER))
+def test_debug_spec_is_refused_until_ritz1_parity(tmp_path, compiler, name):
+    line, spec = DEBUG_LATER[name]
     _assert_refused(compiler, tmp_path, f"later_{name}", _prog(line), LATER_MSG(spec))
 
 

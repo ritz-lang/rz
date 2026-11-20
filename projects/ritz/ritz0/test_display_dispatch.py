@@ -1,5 +1,6 @@
 """AGAST #202 (#198 Phase 3): `{x}` in print / println / eprint / eprintln
-is `Display::show`, not a type switch.
+is `Display::show`, not a type switch, and `{x:?}` is `Debug::show_debug`,
+auto-derived for a struct that has no impl of its own.
 
 THE GAP
 
@@ -29,6 +30,10 @@ ritz0 compiles, links and runs each program; stdout and stderr are pinned to
 literal bytes. The missing-impl case compiles to a located diagnostic naming
 the type and the impl to add -- not a Python traceback, not an emitter
 internal error.
+
+These cases are ritz0-only for now: ritz1 still switches on the LLVM type
+and refuses `?`. Porting this dispatch to ritz1 is AGAST #4381 (under #198);
+until it lands test_interp_format_spec.py pins ritz1's `?` refusal.
 """
 
 import os
@@ -254,4 +259,145 @@ def test_write_into_ritzlib_string_writer(tmp_path):
     run = subprocess.run([str(exe)], capture_output=True, timeout=60, check=False)
     assert run.returncode == 0, run.stderr[-1000:]
     assert run.stdout == b"[p=(3, 4) x=3\n] 13\n", run.stdout
+    assert run.stderr == b"", run.stderr
+
+
+# ---------------------------------------------------------------------------
+# `{x:?}` asks Debug; a struct with no Debug impl auto-derives one.
+# ---------------------------------------------------------------------------
+
+DEBUG_TRAIT = """\
+trait Debug
+    fn show_debug(self: @Self, w: @&Writer) -> i64
+
+"""
+
+
+def test_a_struct_without_debug_auto_derives_it(tmp_path):
+    """No Debug impl anywhere: the compiler prints the fields."""
+    program = SHAPE + """\
+struct Point
+    x: i64
+    y: i64
+
+pub fn main() -> i32
+    let p: Point = Point { x: 3, y: 4 }
+    print("{p:?}\\n")
+    0
+"""
+    out, err = _run(tmp_path, "debug_derive", program)
+    assert out == b"Point { x: 3, y: 4 }\n", out
+    assert err == b"", err
+
+
+def test_auto_debug_nests_and_is_typed_per_field(tmp_path):
+    """A struct field recurses; each scalar prints by its own type."""
+    program = SHAPE + """\
+struct Inner
+    n: i32
+    flag: bool
+
+struct Outer
+    inner: Inner
+    count: u64
+
+pub fn main() -> i32
+    let o: Outer = Outer { inner: Inner { n: -7, flag: true }, count: 9 }
+    print("{o:?}\\n")
+    0
+"""
+    out, err = _run(tmp_path, "debug_nested", program)
+    assert out == b"Outer { inner: Inner { n: -7, flag: true }, count: 9 }\n", out
+    assert err == b"", err
+
+
+def test_an_explicit_debug_impl_wins_over_auto_derive(tmp_path):
+    program = SHAPE + DEBUG_TRAIT + """\
+struct Point
+    x: i64
+    y: i64
+
+impl Debug for Point
+    fn show_debug(self: @Point, w: @&Writer) -> i64
+        raw_write(w, "POINT!")
+
+pub fn main() -> i32
+    let p: Point = Point { x: 3, y: 4 }
+    print("p={p:?}\\n")
+    0
+"""
+    out, err = _run(tmp_path, "debug_explicit", program)
+    assert out == b"p=POINT!\n", out
+    assert err == b"", err
+
+
+def test_a_display_impl_does_not_answer_the_debug_spec(tmp_path):
+    """`{p:?}` asks Debug alone; a Display-only type still auto-derives."""
+    program = SHAPE + POINT + """\
+pub fn main() -> i32
+    let p: Point = Point { x: 3, y: 4 }
+    print("p={p:?}\\n")
+    0
+"""
+    out, err = _run(tmp_path, "debug_not_display", program)
+    assert out == b"p=Point { x: 3, y: 4 }\n", out
+    assert err == b"", err
+
+
+def test_integer_and_bool_debug_is_their_display(tmp_path):
+    program = SHAPE + """\
+pub fn main() -> i32
+    let n: i32 = -5
+    let u: u8 = 200
+    let b: bool = true
+    print("{n:?} {u:?} {b:?}\\n")
+    0
+"""
+    out, err = _run(tmp_path, "debug_scalars", program)
+    assert out == b"-5 200 true\n", out
+    assert err == b"", err
+
+
+def test_missing_debug_is_a_friendly_located_error(tmp_path):
+    """A StrView has no Debug impl in a self-contained program: named."""
+    program = SHAPE + """\
+pub fn main() -> i32
+    let s: StrView = "hi"
+    print("s={s:?}\\n")
+    0
+"""
+    _src, comp, _ll = _compile(tmp_path, "debug_missing", program)
+    assert comp.returncode != 0, "a value with no Debug compiled"
+    text = comp.stderr
+    line = program[:program.index('    print("s={s:?}')].count("\n") + 1
+    assert "Traceback" not in text, text
+    assert re.search(rf"debug_missing\.ritz:{line}:\d+: ", text), text
+    assert "doesn't implement Debug" in text, text
+    assert "impl Debug for StrView" in text, text
+
+
+PACKAGE_DEBUG = """\
+import ritzlib.fmt
+
+struct Point
+    name: StrView
+    x: i64
+
+pub fn main() -> i32
+    let p: Point = Point { name: "hi", x: 3 }
+    println("{p:?}")
+    0
+"""
+
+
+def test_auto_debug_uses_ritzlib_impls_for_the_fields(tmp_path):
+    """A StrView field quotes through ritzlib.fmt's real Debug impl."""
+    from test_format_into import _build
+
+    proc, exe = _build("ritz0", tmp_path, "debug_pkg", PACKAGE_DEBUG)
+    assert proc.returncode == 0 and exe.exists(), (
+        f"ritz0 failed to build:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
+    run = subprocess.run([str(exe)], capture_output=True, timeout=60, check=False)
+    assert run.returncode == 0, run.stderr[-1000:]
+    assert run.stdout == b'Point { name: "hi", x: 3 }\n', run.stdout
     assert run.stderr == b"", run.stderr
