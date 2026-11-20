@@ -1706,9 +1706,13 @@ link to a directory is `false`):
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `mode_is_dir` | `fn(mode: i32) -> i32` | Check mode is directory |
-| `mode_is_file` | `fn(mode: i32) -> i32` | Check mode is regular file |
-| `mode_is_link` | `fn(mode: i32) -> i32` | Check mode is symlink |
+| `mode_is_dir` | `fn(mode: i32) -> bool` | Check mode is directory |
+| `mode_is_file` | `fn(mode: i32) -> bool` | Check mode is regular file |
+| `mode_is_link` | `fn(mode: i32) -> bool` | Check mode is symlink |
+| `mode_is_char` | `fn(mode: i32) -> bool` | Check mode is a character device |
+| `mode_is_block` | `fn(mode: i32) -> bool` | Check mode is a block device |
+| `mode_is_fifo` | `fn(mode: i32) -> bool` | Check mode is a FIFO |
+| `mode_is_socket` | `fn(mode: i32) -> bool` | Check mode is a socket |
 
 **stat / lstat**:
 
@@ -1741,10 +1745,14 @@ fn size_or_minus_one(path: StrView) -> i64
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `dir_open` | `fn(path: StrView) -> Result<DirIter, Errno>` | Open a directory (`Err(NoEnt)`, `Err(NotDir)`, ...) |
-| `dir_next` | `fn(dir: *DirIter) -> i32` | Advance; 1 if an entry is available, 0 at the end |
+| `dir_next` | `fn(dir: *DirIter) -> bool` | Advance; true if an entry is available, false at the end |
 | `dir_close` | `fn(dir: *DirIter)` | Close the iterator |
-| `dir_entry` | `fn(dir: @DirIter) -> DirEntry` | Current entry after `dir_next` returns 1 |
+| `dir_entry` | `fn(dir: @DirIter) -> DirEntry` | Current entry after `dir_next` returns true |
 | `dir_next_entry` | `fn(dir: @&DirIter) -> Option<DirEntry>` | Advance and return the next entry, `None` at the end |
+| `dir_entry_type` | `fn(dir: *DirIter) -> Option<u8>` | Type of the current entry (`DT_REG`, `DT_DIR`, ...), `None` if there is none |
+| `dir_entry_is_dir` | `fn(dir: *DirIter) -> bool` | Is the current entry a directory? |
+| `dir_entry_is_file` | `fn(dir: *DirIter) -> bool` | Is the current entry a regular file? |
+| `dir_entry_is_link` | `fn(dir: *DirIter) -> bool` | Is the current entry a symlink? |
 | `dirent_entry` | `fn(entry: *u8) -> DirEntry` | Decode one raw `linux_dirent64` record |
 
 ```ritz
@@ -1758,7 +1766,7 @@ fn count_files(path: StrView) -> i64
         Ok(d) => d
         Err(_) => return 0
     var n: i64 = 0
-    while dir_next(@dir) != 0
+    while dir_next(@dir)
         let e: DirEntry = dir_entry(@dir)    # e.ino, e.kind, e.name: StrView
         if e.kind == DT_REG
             n += 1

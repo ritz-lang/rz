@@ -9,7 +9,8 @@
 #   queries      stat / lstat -> Result<Stat, Errno>, file_size -> Result<i64, Errno>
 #   whole files  read_file -> Result<String, Errno>, write_file -> Result<i64, Errno>
 #   mutation     mkdir / unlink / rmdir -> Result<i32, Errno> (Ok(0)), copy_file
-#   directories  dir_open -> Result<DirIter, Errno>; dir_next / dir_next_entry
+#   directories  dir_open -> Result<DirIter, Errno>; dir_next -> bool;
+#                dir_entry_type -> Option<u8>; dir_entry / dir_next_entry
 #   paths        path_join -> String; path_basename / dirname / extension / stem
 #                -> StrView, a view into the input (no allocation)
 #
@@ -128,33 +129,33 @@ pub fn stat_get_blocks(statbuf: *u8) -> i64
 # File type helpers
 # ============================================================================
 
-pub fn mode_is_dir(mode: i32) -> i32
+pub fn mode_is_dir(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == 4) as i32
+    return type_bits == 4
 
-pub fn mode_is_file(mode: i32) -> i32
+pub fn mode_is_file(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == 8) as i32
+    return type_bits == 8
 
-pub fn mode_is_link(mode: i32) -> i32
+pub fn mode_is_link(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == '\n') as i32
+    return type_bits == '\n'
 
-pub fn mode_is_char(mode: i32) -> i32
+pub fn mode_is_char(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == 2) as i32
+    return type_bits == 2
 
-pub fn mode_is_block(mode: i32) -> i32
+pub fn mode_is_block(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == 6) as i32
+    return type_bits == 6
 
-pub fn mode_is_fifo(mode: i32) -> i32
+pub fn mode_is_fifo(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == 1) as i32
+    return type_bits == 1
 
-pub fn mode_is_socket(mode: i32) -> i32
+pub fn mode_is_socket(mode: i32) -> bool
     let type_bits: i32 = mode / 4096
-    return (type_bits == 12) as i32
+    return type_bits == 12
 
 # ============================================================================
 # Path predicates -> bool
@@ -162,28 +163,32 @@ pub fn mode_is_socket(mode: i32) -> i32
 # These use lstat(2): a symlink is reported as itself, never as its target, so
 # is_dir(link-to-dir) is false and a recursive walk does not follow links.
 
-# st_mode of `path` (lstat), or -1 if it cannot be statted.
-fn fs_lstat_mode(path: StrView) -> i32
+# st_mode of `path` (lstat), or None if it cannot be statted.
+fn fs_lstat_mode(path: StrView) -> Option<i32>
     var r: Result<Stat, Errno> = fs_stat_impl(path, 0)
     match r
-        Ok(st) => st.st_mode
-        Err(_) => -1
+        Ok(st) => Some(st.st_mode)
+        Err(_) => None
 
 # True if anything (file, directory, dangling symlink, ...) exists at `path`.
 pub fn path_exists(path: StrView) -> bool
-    fs_lstat_mode(path) >= 0
+    let m: Option<i32> = fs_lstat_mode(path)
+    option_is_some<i32>(@m) == 1
 
 pub fn is_dir(path: StrView) -> bool
-    let mode: i32 = fs_lstat_mode(path)
-    mode >= 0 and mode_is_dir(mode) != 0
+    match fs_lstat_mode(path)
+        Some(mode) => mode_is_dir(mode)
+        None => false
 
 pub fn is_file(path: StrView) -> bool
-    let mode: i32 = fs_lstat_mode(path)
-    mode >= 0 and mode_is_file(mode) != 0
+    match fs_lstat_mode(path)
+        Some(mode) => mode_is_file(mode)
+        None => false
 
 pub fn is_symlink(path: StrView) -> bool
-    let mode: i32 = fs_lstat_mode(path)
-    mode >= 0 and mode_is_link(mode) != 0
+    match fs_lstat_mode(path)
+        Some(mode) => mode_is_link(mode)
+        None => false
 
 # Size in bytes of `path` (lstat: a symlink's own size).
 pub fn file_size(path: StrView) -> Result<i64, Errno>
@@ -254,17 +259,19 @@ pub fn path_join(dir: StrView, name: StrView) -> String
     string_push_bytes(@&r, name.ptr, name.len)
     r
 
-# Index of the last '/' in `path`, or -1.
-fn fs_last_slash(path: StrView) -> i64
+# Index of the last '/' in `path`, or None.
+fn fs_last_slash(path: StrView) -> Option<i64>
     var last: i64 = -1
     for i in 0..path.len
         if *(path.ptr + i) == '/'
             last = i
-    last
+    if last < 0
+        return None
+    Some(last)
 
 # Index of the dot that starts the extension of `path`'s final component, or
-# -1 if it has none. A dot that opens the component (".gitignore") is not one.
-fn fs_ext_dot(path: StrView) -> i64
+# None if it has none. A dot that opens the component (".gitignore") is not one.
+fn fs_ext_dot(path: StrView) -> Option<i64>
     var last_dot: i64 = -1
     var last_slash: i64 = -1
     for i in 0..path.len
@@ -274,40 +281,37 @@ fn fs_ext_dot(path: StrView) -> i64
         else if c == '.'
             last_dot = i
     if last_dot < 0 or last_dot < last_slash or last_dot == last_slash + 1
-        return -1
-    last_dot
+        return None
+    Some(last_dot)
 
 # The final component: everything after the last '/' ("/a/b.txt" -> "b.txt").
 # A view into `path`.
 pub fn path_basename(path: StrView) -> StrView
-    let slash: i64 = fs_last_slash(path)
-    if slash < 0
-        return path
-    strview_from_ptr(path.ptr + slash + 1, path.len - slash - 1)
+    match fs_last_slash(path)
+        Some(slash) => return strview_from_ptr(path.ptr + slash + 1, path.len - slash - 1)
+        None => return path
 
 # Everything before the last '/' ("/a/b.txt" -> "/a"); "/" for a top-level
 # path and "." when there is no '/'. A view into `path` (or the literal ".").
 pub fn path_dirname(path: StrView) -> StrView
-    let slash: i64 = fs_last_slash(path)
-    if slash < 0
-        return "."
-    if slash == 0
-        return strview_from_ptr(path.ptr, 1)
-    strview_from_ptr(path.ptr, slash)
+    match fs_last_slash(path)
+        Some(slash) =>
+            if slash == 0
+                return strview_from_ptr(path.ptr, 1)
+            return strview_from_ptr(path.ptr, slash)
+        None => return "."
 
 # The extension without its dot ("/a/b.txt" -> "txt"), or an empty view.
 pub fn path_extension(path: StrView) -> StrView
-    let dot: i64 = fs_ext_dot(path)
-    if dot < 0
-        return strview_from_ptr(path.ptr + path.len, 0)
-    strview_from_ptr(path.ptr + dot + 1, path.len - dot - 1)
+    match fs_ext_dot(path)
+        Some(dot) => return strview_from_ptr(path.ptr + dot + 1, path.len - dot - 1)
+        None => return strview_from_ptr(path.ptr + path.len, 0)
 
 # `path` without its extension ("/a/b.txt" -> "/a/b"); `path` if it has none.
 pub fn path_stem(path: StrView) -> StrView
-    let dot: i64 = fs_ext_dot(path)
-    if dot < 0
-        return path
-    strview_from_ptr(path.ptr, dot)
+    match fs_ext_dot(path)
+        Some(dot) => return strview_from_ptr(path.ptr, dot)
+        None => return path
 
 # ============================================================================
 # File operations -> Result<T, Errno>
@@ -444,8 +448,9 @@ pub fn rmdir(path: StrView) -> Result<i32, Errno>
 #         # process entry...
 #     dir_close(@dir)
 #
-# dir_entry_type is the older u8 accessor; dir_entry(@dir).name replaces the
-# removed *u8 dir_entry_name (it returned null with no current entry).
+# dir_entry_type is the Option<u8> accessor for the raw d_type; dir_entry(@dir)
+# is the typed entry. dir_entry(@dir).name replaces the removed *u8
+# dir_entry_name (it returned null with no current entry).
 
 const DIR_BUF_SIZE: i64 = 4096
 
@@ -469,11 +474,11 @@ pub fn dir_open(path: StrView) -> Result<DirIter, Errno>
     dir.entry = null
     Ok(dir)
 
-# Advance to the next record; 1 if `dir.entry` now points at one, 0 at the end.
-# Shared by dir_next and dir_next_entry. It takes @&DirIter and only touches
-# fields, because ritz1 cannot forward an @&T parameter into a *T one
+# Advance to the next record; true if `dir.entry` now points at one, false at
+# the end. Shared by dir_next and dir_next_entry. It takes @&DirIter and only
+# touches fields, because ritz1 cannot forward an @&T parameter into a *T one
 # (AGAST #1652).
-fn dir_advance(dir: @&DirIter) -> i32
+fn dir_advance(dir: @&DirIter) -> bool
     # Need more data?
     if dir.buf_pos >= dir.buf_len
         # Read next batch of entries
@@ -482,7 +487,7 @@ fn dir_advance(dir: @&DirIter) -> i32
 
         if dir.buf_len <= 0
             dir.entry = null
-            return 0
+            return false
 
     # Point to current entry
     dir.entry = @dir.buf[0] + dir.buf_pos
@@ -491,15 +496,16 @@ fn dir_advance(dir: @&DirIter) -> i32
     let reclen: i32 = dirent_get_reclen(dir.entry)
     dir.buf_pos = dir.buf_pos + reclen as i64
 
-    1
+    true
 
 # Advance to next directory entry.
-# Returns 1 if an entry is available, 0 if done.
-pub fn dir_next(dir: *DirIter) -> i32
+# Returns true if an entry is available, false if done.
+pub fn dir_next(dir: *DirIter) -> bool
     dir_advance(dir)
 
-# The current entry as a typed DirEntry. Only valid after dir_next() returns 1;
-# before that (or after the end) it is { ino: 0, kind: DT_UNKNOWN, name: "" }.
+# The current entry as a typed DirEntry. Only valid after dir_next() returns
+# true; before that (or after the end) it is { ino: 0, kind: DT_UNKNOWN,
+# name: "" }. Prefer dir_next_entry, which cannot be consulted out of order.
 pub fn dir_entry(dir: @DirIter) -> DirEntry
     if dir.entry == null
         return DirEntry { ino: 0, kind: DT_UNKNOWN, name: strview_empty() }
@@ -514,28 +520,34 @@ pub fn dir_entry(dir: @DirIter) -> DirEntry
 #             None => break
 pub fn dir_next_entry(dir: @&DirIter) -> Option<DirEntry>
     # A closed iterator (fd < 0) ends here too: getdents64 fails, buf_len <= 0.
-    if dir_advance(dir) == 0
+    if not dir_advance(dir)
         return None
     Some(dirent_entry(dir.entry))
 
-# Type of the current entry: DT_REG, DT_DIR, etc. from sys.ritz, or DT_UNKNOWN
-# with no current entry (before dir_next, or after the end).
-pub fn dir_entry_type(dir: *DirIter) -> u8
+# Type of the current entry: Some(DT_REG), Some(DT_DIR), etc. from sys.ritz;
+# None when there is no current entry (before dir_next, or after the end).
+pub fn dir_entry_type(dir: *DirIter) -> Option<u8>
     if dir.entry == null
-        return DT_UNKNOWN
-    dirent_get_type(dir.entry)
+        return None
+    Some(dirent_get_type(dir.entry))
 
 # Check if current entry is a directory.
-pub fn dir_entry_is_dir(dir: *DirIter) -> i32
-    (dir_entry_type(dir) == DT_DIR) as i32
+pub fn dir_entry_is_dir(dir: *DirIter) -> bool
+    match dir_entry_type(dir)
+        Some(t) => t == DT_DIR
+        None => false
 
 # Check if current entry is a regular file.
-pub fn dir_entry_is_file(dir: *DirIter) -> i32
-    (dir_entry_type(dir) == DT_REG) as i32
+pub fn dir_entry_is_file(dir: *DirIter) -> bool
+    match dir_entry_type(dir)
+        Some(t) => t == DT_REG
+        None => false
 
 # Check if current entry is a symlink.
-pub fn dir_entry_is_link(dir: *DirIter) -> i32
-    (dir_entry_type(dir) == DT_LNK) as i32
+pub fn dir_entry_is_link(dir: *DirIter) -> bool
+    match dir_entry_type(dir)
+        Some(t) => t == DT_LNK
+        None => false
 
 # Close the directory iterator.
 pub fn dir_close(dir: *DirIter)
