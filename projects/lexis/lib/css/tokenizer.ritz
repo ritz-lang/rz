@@ -142,9 +142,31 @@ pub fn css_tokenizer_next(t:& CssTokenizer) -> CssToken
     if is_digit(c as u8) == 1
         return consume_numeric(t)
 
-    if c == '+' or c == '-'
+    if c == '+'
         if would_start_number(t) == 1
             return consume_numeric(t)
+        consume(t)
+        return css_token_delim(c as u8)
+
+    # '-' has its own dispatch order (CSS Syntax §4.3.1): number, then CDC,
+    # then ident sequence, then delim. Returning a delim on the number check
+    # alone would make '-x' idents and '-->' CDC unreachable (#4056).
+    if c == '-'
+        if would_start_number(t) == 1
+            return consume_numeric(t)
+        # CDC is '-' '-' '>' (the current '-' plus the next two code points).
+        if peek_n(t, 1) == '-' and peek_n(t, 2) == '>'
+            consume(t)
+            consume(t)
+            consume(t)
+            var tok = css_token_eof()
+            tok.kind = CSS_TOKEN_CDC
+            return tok
+        # §4.3.9: '-' followed by a name-start or another '-' starts an
+        # ident sequence. A lone '-' (or '-' before anything else) does not.
+        let n1 = peek_n(t, 1)
+        if n1 != -1 and (is_name_start(n1 as u8) == 1 or n1 == '-')
+            return consume_ident_like(t)
         consume(t)
         return css_token_delim(c as u8)
 
@@ -154,8 +176,9 @@ pub fn css_tokenizer_next(t:& CssTokenizer) -> CssToken
         consume(t)
         return css_token_delim(c as u8)
 
-    # Ident-like
-    if is_name_start(c as u8) == 1 or c == '-'
+    # Ident-like. A leading '-' never reaches this branch: the '-' dispatch
+    # above handles its number/CDC/ident/delim cases and always returns.
+    if is_name_start(c as u8) == 1
         return consume_ident_like(t)
 
     # At-keyword
@@ -209,16 +232,6 @@ pub fn css_tokenizer_next(t:& CssTokenizer) -> CssToken
             consume(t)
             var tok = css_token_eof()
             tok.kind = CSS_TOKEN_CDO
-            return tok
-
-    # CDC -->
-    if c == '-'
-        if peek_n(t, 1) == '-' and peek_n(t, 2) == '>'
-            consume(t)
-            consume(t)
-            consume(t)
-            var tok = css_token_eof()
-            tok.kind = CSS_TOKEN_CDC
             return tok
 
     # Anything else is a delim token
