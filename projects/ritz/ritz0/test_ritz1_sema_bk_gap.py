@@ -182,6 +182,114 @@ BKGAP = re.compile(r"sema-probe: \d+ compared, \d+ mismatched, \d+ lenient, "
                    r"\d+ unknown, \d+ bool-gap, (\d+) bk-gap")
 
 
+# AGAST #4403: `let bytes = s.as_bytes()` (a StrView.builtin with no FnDef)
+# and `KS[i]` of a `const [N]StrView`.  Sema left both unknown, so the
+# emitter's BK_INT guess was a bk-gap on `bytes.len()` / `bytes[0]` and on
+# `KS[i]` / `KS[1]`.  The dump pins Sema's answer (not merely that the two
+# sides are silently unsure), the summary pins that no gap is left.
+DUMP = re.compile(r"^sema-type: (\d+):(\d+) e(\d+) (-?\d+)(?: (\S+))?$", re.M)
+I64, U8, STRUCT, ARRAY = 2, 3, 100, 101
+E_IDENT, E_INDEX, E_METHOD = 4, 9, 12
+
+AS_BYTES = """\
+import ritzlib.strview
+
+fn first_byte_len(s: StrView) -> i32
+    let bytes = s.as_bytes()
+    if bytes.len() > 0 and bytes[0] == ('A' as u8)
+        1
+    else
+        0
+
+fn main() -> i32
+    first_byte_len("ABC")
+"""
+
+CONST_STRVIEW = """\
+import ritzlib.strview
+
+const KS: [3]StrView = ["Aµ", "A€", "A😀"]
+
+fn main() -> i32
+    var i: i64 = 2
+    let k4: StrView = KS[i]
+    let k5: StrView = KS[1]
+    (k4.len + k5.len) as i32
+"""
+
+
+def _at(src, snippet):
+    """1-based (line, col) of the first occurrence of `snippet` in `src`."""
+    for i, line in enumerate(src.splitlines(), 1):
+        col = line.find(snippet)
+        if col >= 0:
+            return i, col + 1
+    raise AssertionError(f"{snippet!r} not in the program")
+
+
+def _run_probe(compiler, tmp_path, name, src, mode):
+    # `dump` prints Sema's records but switches the comparison off
+    # (emitter_expr compares only in mode "1"), so each test runs both.
+    work = tmp_path / f"{name}_{mode}_{compiler}"
+    work.mkdir()
+    path = work / "main.ritz"
+    path.write_text(src)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT), RITZ1_SEMA_PROBE=mode,
+               RITZ_CACHE_DIR=str(work / "cache"))
+    comp = subprocess.run([str(RITZ1_BUILD / compiler), str(path), "-o", str(work / "main.ll")],
+                          cwd=work, env=env, capture_output=True, text=True, timeout=120)
+    return comp, comp.stdout + comp.stderr
+
+
+def _types(out):
+    return {(int(ln), int(col), int(kind)): (int(ty), name)
+            for ln, col, kind, ty, name in DUMP.findall(out)}
+
+
+def _assert_no_gap(compiler, out, comp, what):
+    assert "sema-probe: mismatch" not in out, f"{compiler} disagrees:\n{out}"
+    gap = BKGAP.search(out)
+    assert gap, f"{compiler} printed no probe summary:\n{out}"
+    assert int(gap.group(1)) == 0, f"{compiler}: {gap.group(1)} bool-kind gaps at {what}:\n{out}"
+    assert comp.returncode == 0, f"{compiler} refused {what}:\n{out}"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_strview_as_bytes_has_no_bool_kind_gap(request, tmp_path, compiler):
+    request.getfixturevalue("ritz1_bin")
+    comp, out = _run_probe(compiler, tmp_path, "bk_gap_as_bytes", AS_BYTES, "1")
+    _assert_no_gap(compiler, out, comp, "a StrView.as_bytes() Span$u8")
+    _, dumped = _run_probe(compiler, tmp_path, "bk_gap_as_bytes", AS_BYTES, "dump")
+    seen = _types(dumped)
+    for want in [
+        (*_at(AS_BYTES, "s.as_bytes"), E_METHOD, STRUCT, "Span$u8"),
+        (*_at(AS_BYTES, "bytes.len"), E_METHOD, I64, None),
+        (*_at(AS_BYTES, "bytes[0]"), E_INDEX, U8, None),
+    ]:
+        at = want[:3]
+        got = seen.get(at)
+        assert got is not None and got[0] == want[3] and (want[4] is None or got[1] == want[4]), \
+            f"{compiler}: {at} wanted {want[3]} {want[4] or ''}, got {got}\n{dumped}"
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_const_strview_array_element_has_no_bool_kind_gap(request, tmp_path, compiler):
+    request.getfixturevalue("ritz1_bin")
+    comp, out = _run_probe(compiler, tmp_path, "bk_gap_const_strview", CONST_STRVIEW, "1")
+    _assert_no_gap(compiler, out, comp, "a const [3]StrView's elements")
+    _, dumped = _run_probe(compiler, tmp_path, "bk_gap_const_strview", CONST_STRVIEW, "dump")
+    seen = _types(dumped)
+    for want in [
+        (*_at(CONST_STRVIEW, "KS[i]"), E_INDEX, STRUCT, "StrView"),
+        (*_at(CONST_STRVIEW, "KS[i]"), E_IDENT, ARRAY, "StrView"),
+        (*_at(CONST_STRVIEW, "KS[1]"), E_INDEX, STRUCT, "StrView"),
+    ]:
+        at = want[:3]
+        got = seen.get(at)
+        assert got is not None and got[0] == want[3] and (want[4] is None or got[1] == want[4]), \
+            f"{compiler}: {at} wanted {want[3]} {want[4] or ''}, got {got}\n{dumped}"
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_field_through_an_address_has_no_bool_kind_gap(request, tmp_path, compiler):
     request.getfixturevalue("ritz1_bin")

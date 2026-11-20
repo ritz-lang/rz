@@ -314,9 +314,13 @@ CORPUS_FLOOR = 15000
 # (test_ritz1_payload_bk_gap.py).  4 at #3948, which taught the emitter's
 # bk_receiver to see through `@` / `@&` (`(*(@o.s)).x`) and to take an index's
 # element struct from index_elem_struct_name (a Vec / Span element), closing the
-# six `(*(@x)).f` gaps.  What's left: `.as_bytes()` / a StrView index on Sema's
-# side, and `KS[i]` of a `const [N]StrView`.  Lower it as they go.
-BK_GAP_CEILING = 4
+# six `(*(@x)).f` gaps.  0 at #4403, which types `s.as_bytes()` as the
+# `Span$u8` the emitter lowers (and a Span's inline `.len()` / `.is_empty()`),
+# so `bytes.len()` / `bytes[0]` are its element, and types `KS[i]` of a
+# `const [N]StrView` off the ConstEntry's element while the emitter's
+# bk_element takes the same one.  Lower it as they go: it is a ceiling, and
+# an opened gap must fail here.
+BK_GAP_CEILING = 0
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

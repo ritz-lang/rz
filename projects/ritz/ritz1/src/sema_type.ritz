@@ -92,6 +92,10 @@ pub fn sema_name_ty(sm: *Sema, name: *u8, len: i32, t: *SemaTy) -> i32
     var c: *ConstEntry = sm.module.constants
     while c != null
         if name_eq(c.name, c.name_len, name, len) == 1
+            # AGAST #4403: a `const KS: [N]T` is an array of T, so `KS[i]`
+            # is T (sema_arr_elem).  The parser records T on the entry.
+            if c.const_type == TYPE_ARRAY
+                return sema_arr_ty(t, c.array_elem_type, c.array_elem_type_name, c.array_elem_type_name_len, null)
             if sema_is_int_kind(c.const_type) == 1 or c.const_type == TYPE_BOOL
                 return sema_ty_set(t, c.const_type, null, 0, TYPE_VOID, null)
             return sema_ty_none(t)
@@ -360,6 +364,30 @@ fn sema_index_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
         return sema_ty_none(t)
     sema_elem_ty(sm, e.left, t)
 
+# AGAST #4403: a `Span$T` method the emitter lowers inline
+# (emitter_expr_call's try_emit_len_builtin / try_emit_span_builtin) and so
+# has no FnDef to read: `.len()` an i64, `.is_empty()` a bool, `.slice(
+# lo, hi)` the same Span$T.  TYPE_UNKNOWN for any other.  Called only when
+# sema_method_fn found no method, as the emitter's dispatch falls back.
+pub fn sema_span_method_ty(tn: *u8, tn_len: i32, e: *Expr, t: *SemaTy) -> i32
+    if tn == null or tn_len <= 5 or memcmp(tn, c"Span$", 5 as i64) != 0
+        return sema_ty_none(t)
+    if e.args == null and name_eq(e.ident_ptr, e.ident_len, c"len", 3) == 1
+        return sema_ty_set(t, TYPE_I64, null, 0, TYPE_VOID, null)
+    if e.args == null and name_eq(e.ident_ptr, e.ident_len, c"is_empty", 8) == 1
+        return sema_ty_set(t, TYPE_BOOL, null, 0, TYPE_VOID, null)
+    if name_eq(e.ident_ptr, e.ident_len, c"slice", 5) == 1 and e.args != null and e.args.next != null and e.args.next.next == null
+        return sema_ty_set(t, TYPE_STRUCT, tn, tn_len, TYPE_VOID, null)
+    sema_ty_none(t)
+
+# 1 when `r` is the struct `name` or a pointer or reference to one.
+fn sema_recv_named(r: *SemaTy, name: *u8, len: i32) -> i32
+    if r.kind == TYPE_STRUCT
+        return name_eq(r.name, r.name_len, name, len)
+    if sema_is_ptr_kind(r.kind) == 1 and (r.pointee == TYPE_STRUCT or r.pointee == TYPE_VOID)
+        return name_eq(r.name, r.name_len, name, len)
+    0
+
 # `x.m(..)`: the method's result, on a struct or a pointer to one; `E.V(..)`
 # builds the enum E.
 fn sema_method_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
@@ -370,16 +398,39 @@ fn sema_method_ty(sm: *Sema, e: *Expr, t: *SemaTy) -> i32
         return sema_ty_set(t, TYPE_STRUCT, el.ident_ptr, el.ident_len, TYPE_VOID, null)
     var r: SemaTy
     sema_expr_ty(sm, el, @r)
+    # AGAST #4403: StrView.as_bytes() is an emitter intrinsic
+    # (try_emit_strview_as_bytes) with no FnDef, so sema_method_fn finds
+    # nothing and `let bytes = s.as_bytes()` stayed untyped.  It is the
+    # `Span$u8` the emitter lowers, as bool_check's bk_is_strview_as_bytes.
+    if e.args == null and sema_recv_named(@r, c"StrView", 7) == 1 and name_eq(e.ident_ptr, e.ident_len, c"as_bytes", 8) == 1
+        return sema_ty_set(t, TYPE_STRUCT, c"Span$u8", 7, TYPE_VOID, null)
     var st: *StructDef = sema_recv_struct(sm, @r)
     if st == null and el.kind == EXPR_IDENT and r.kind == TYPE_UNKNOWN and sema_find_local(sm, el.ident_ptr, el.ident_len) == null
         # AGAST #4251: `T.f(..)`, a static method of the struct T.
         st = sema_find_struct(sm, el.ident_ptr, el.ident_len)
-    if st == null
-        return sema_ty_none(t)
-    let fd: *FnDef = sema_method_fn(sm, st.name, st.name_len, e.ident_ptr, e.ident_len)
-    if fd == null
-        return sema_ty_none(t)
-    sema_fn_ret_ty(fd, t)
+    # AGAST #4403: a monomorphised Span (`bytes: Span$u8`, `s.as_bytes()`)
+    # may name no StructDef in Sema's map, which the emitter only spells as
+    # it lowers.  Its accessors are still typeable (the specialised
+    # `Span$u8_len`, else sema_span_method_ty's builtins above), so take
+    # the name off r.  Other unresolved receivers stay unknown: typing one
+    # `Option$i32.unwrap_or()` I32 would disagree with the emitter's i64
+    # local (test_issue_option_unwrap_or_method).
+    var tn: *u8 = null
+    var tn_len: i32 = 0
+    if st != null
+        tn = st.name
+        tn_len = st.name_len
+    else
+        if r.kind != TYPE_STRUCT and sema_is_ptr_kind(r.kind) == 0
+            return sema_ty_none(t)
+        if r.name == null or r.name_len <= 5 or memcmp(r.name, c"Span$", 5 as i64) != 0
+            return sema_ty_none(t)
+        tn = r.name
+        tn_len = r.name_len
+    let fd: *FnDef = sema_method_fn(sm, tn, tn_len, e.ident_ptr, e.ident_len)
+    if fd != null
+        return sema_fn_ret_ty(fd, t)
+    sema_span_method_ty(tn, tn_len, e, t)
 
 fn sema_struct_ty(st: *StructDef, t: *SemaTy) -> i32
     if st == null
