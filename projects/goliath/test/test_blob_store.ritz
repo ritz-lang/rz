@@ -1,7 +1,7 @@
 # Tests for MemoryBlobStore
 
 import goliath.blob_id { BlobId, blob_id_eq, blob_id_is_zero, blob_id_zero, blob_id_compute }
-import goliath.blob_store { MemoryBlobStore, memory_store_put, memory_store_get, memory_store_get_size, memory_store_exists, memory_store_delete, memory_store_count, memory_store_total_size, memory_store_free }
+import goliath.blob_store { MemoryBlobStore, memory_store_put, memory_store_get, memory_store_get_size, memory_store_exists, memory_store_delete, memory_store_count, memory_store_total_size, memory_store_free, memory_store_refs, memory_store_find_probes }
 import goliath.hosted { memory_store_new }
 
 # Test: New store is empty
@@ -228,6 +228,93 @@ fn test_store_grows_past_initial_capacity() -> i32
         if *got != (n & 255) as u8 or *(got + 3) != 11
             memory_store_free(@store)
             return 4
+        n = n + 1
+    memory_store_free(@store)
+    0
+
+# The ticket's RED case (AGAST #4228): store_find used to scan every slot,
+# so a lookup's cost grew with the table's capacity. 200 blobs force the
+# capacity to 256; a blob stored last sat near the end of a linear scan
+# (~199 slots). The hash index finds it in a few probes.
+[[test]]
+fn test_store_lookup_is_indexed() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var data: [4]u8
+    var last: BlobId = blob_id_zero()
+    var n: i32 = 0
+    while n < 200
+        data[0] = (n & 255) as u8
+        data[1] = 33
+        data[2] = 44
+        data[3] = 55
+        last = memory_store_put(@store, @data[0], 4)
+        if blob_id_is_zero(@last)
+            memory_store_free(@store)
+            return 1
+        n = n + 1
+    if memory_store_find_probes(@store, @last) > 16
+        memory_store_free(@store)
+        return 2
+    # A miss stops at the first empty cell too, without scanning the table
+    let fake: BlobId = blob_id_zero()
+    if memory_store_find_probes(@store, @fake) > 16
+        memory_store_free(@store)
+        return 3
+    memory_store_free(@store)
+    0
+
+# Every blob stays findable after deletions leave tombstones, and a freed
+# slot reused by new content does not shadow the old id (or vice versa).
+[[test]]
+fn test_store_lookup_after_churn() -> i32
+    var store: MemoryBlobStore = memory_store_new()
+    var data: [4]u8
+    var ids: [300]BlobId
+    var n: i32 = 0
+    while n < 300
+        data[0] = (n & 255) as u8
+        data[1] = (n >> 8) as u8
+        data[2] = 77
+        data[3] = 88
+        ids[n] = memory_store_put(@store, @data[0], 4)
+        if blob_id_is_zero(@ids[n])
+            memory_store_free(@store)
+            return 1
+        n = n + 1
+    # Delete every third blob, leaving tombstones all over the index
+    n = 0
+    while n < 300
+        if n % 3 == 0 and not memory_store_delete(@store, @ids[n])
+            memory_store_free(@store)
+            return 2
+        n = n + 1
+    # Survivors are found, the deleted ones are gone
+    n = 0
+    while n < 300
+        let found: bool = memory_store_exists(@store, @ids[n])
+        if n % 3 == 0
+            if found
+                memory_store_free(@store)
+                return 3
+        else if not found
+            memory_store_free(@store)
+            return 4
+        n = n + 1
+    # Re-store deleted content: the same id comes back, with one reference
+    n = 0
+    while n < 300
+        if n % 3 == 0
+            data[0] = (n & 255) as u8
+            data[1] = (n >> 8) as u8
+            data[2] = 77
+            data[3] = 88
+            let again: BlobId = memory_store_put(@store, @data[0], 4)
+            if not blob_id_eq(@again, @ids[n])
+                memory_store_free(@store)
+                return 5
+            if memory_store_refs(@store, @ids[n]) != 1
+                memory_store_free(@store)
+                return 6
         n = n + 1
     memory_store_free(@store)
     0

@@ -9,7 +9,7 @@
 # rewrites the directories from the changed entry up to the root and then
 # repoints the root (AGAST #1881: it used to rewrite only the parent and
 # repoint the root only when the parent *was* the root, so a write below the
-# root returned ERR_OK and was lost).
+# root returned ErrorCode.Ok and was lost).
 #
 # Reclamation is by reference count (goliath.blob_store): a blob is held once
 # per directory entry naming it (in a live directory blob) and the root once
@@ -28,7 +28,7 @@ import goliath.blob_id { BlobId, blob_id_zero, blob_id_is_zero, blob_id_copy }
 import goliath.blob_store { MemoryBlobStore, memory_store_get, memory_store_get_size, memory_store_get_span, memory_store_put, memory_store_refs, memory_store_retain, memory_store_release, memory_store_allocator, memory_store_mark_begin, memory_store_mark, memory_store_sweep, memory_store_hold_children, memory_store_holds_children }
 import goliath.dir_entry { DirEntry, dir_entry_file, dir_entry_dir, dir_entry_is_dir, dir_entry_name_eq, dir_entry_serialize, dir_entry_deserialize, dir_serialized_size, dir_entry_at, dir_entry_disk_size, DIR_HEADER_SIZE }
 import goliath.path { path_is_absolute, path_is_root, path_validate, PathIter, path_iter_new, path_iter_next }
-import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_ALREADY_EXISTS, ERR_INVALID_PATH, ERR_OUT_OF_SPACE, ERR_NOT_A_FILE, ERR_NOT_A_DIRECTORY, ERR_DIRECTORY_NOT_EMPTY, ERR_PERMISSION_DENIED }
+import goliath.error { ErrorCode }
 
 # Maximum entries per directory
 pub const MAX_DIR_ENTRIES: i32 = 256
@@ -189,26 +189,26 @@ pub fn namespace_unhold(ns: *Namespace, id: *BlobId)
 fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_is_dir: bool, size: u64, err: *ErrorCode) -> BlobId
     let old_count: i32 = read_dir_count(ns, dir)
     if old_count < 0
-        *err = ERR_NOT_FOUND
+        *err = ErrorCode.NotFound
         return blob_id_zero()
     let idx: i32 = find_entry_in_dir(ns, dir, name)
     var new_count: i32 = old_count
     if child == null
         if idx < 0
-            *err = ERR_NOT_FOUND
+            *err = ErrorCode.NotFound
             return blob_id_zero()
         new_count = old_count - 1
     else if idx < 0
         new_count = old_count + 1
     if new_count > MAX_DIR_ENTRIES
-        *err = ERR_OUT_OF_SPACE
+        *err = ErrorCode.OutOfSpace
         return blob_id_zero()
 
     let alloc: *Allocator = memory_store_allocator((*ns).store)
     let new_size: u64 = dir_serialized_size(new_count as u32)
     let buf: *u8 = allocator_alloc(alloc, new_size as i64)
     if buf == null
-        *err = ERR_OUT_OF_SPACE
+        *err = ErrorCode.OutOfSpace
         return blob_id_zero()
     *(buf as *u32) = new_count as u32
 
@@ -238,7 +238,7 @@ fn dir_with(ns: *Namespace, dir: *BlobId, name: StrView, child: *BlobId, child_i
     var id: BlobId = put_dir(ns, buf, new_size)
     allocator_free(alloc, buf, new_size as i64)
     if blob_id_is_zero(@id)
-        *err = ERR_OUT_OF_SPACE
+        *err = ErrorCode.OutOfSpace
     id
 
 fn write_entry(buf: *u8, index: i32, name: StrView, child: *BlobId, is_dir: bool, size: u64)
@@ -268,7 +268,7 @@ struct Change
 fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: *ErrorCode) -> BlobId
     var name: StrView = strview_empty()
     if not path_iter_next(iter, @name)
-        *err = ERR_INVALID_PATH
+        *err = ErrorCode.InvalidPath
         return blob_id_zero()
     var peek: PathIter = *iter
     var next: StrView = strview_empty()
@@ -278,11 +278,11 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
     if not last
         # An intermediate directory: rewrite below it, then relink it here
         if idx < 0
-            *err = ERR_NOT_FOUND
+            *err = ErrorCode.NotFound
             return blob_id_zero()
         var entry: DirEntry = read_dir_entry(ns, dir, idx)
         if not dir_entry_is_dir(@entry)
-            *err = ERR_NOT_A_DIRECTORY
+            *err = ErrorCode.NotADirectory
             return blob_id_zero()
         var sub: BlobId = rewrite(ns, @entry.blob_id, iter, change, err)
         if blob_id_is_zero(@sub)
@@ -293,27 +293,27 @@ fn rewrite(ns: *Namespace, dir: *BlobId, iter: *PathIter, change: *Change, err: 
 
     if (*change).op == OP_DELETE
         if idx < 0
-            *err = ERR_NOT_FOUND
+            *err = ErrorCode.NotFound
             return blob_id_zero()
         var target: DirEntry = read_dir_entry(ns, dir, idx)
         if dir_entry_is_dir(@target) and read_dir_count(ns, @target.blob_id) != 0
-            *err = ERR_DIRECTORY_NOT_EMPTY
+            *err = ErrorCode.DirectoryNotEmpty
             return blob_id_zero()
         return dir_with(ns, dir, name, null, false, 0, err)
 
     if idx >= 0
         var existing: DirEntry = read_dir_entry(ns, dir, idx)
         if (*change).op == OP_MKDIR
-            *err = ERR_ALREADY_EXISTS
+            *err = ErrorCode.AlreadyExists
             return blob_id_zero()
         if dir_entry_is_dir(@existing)
-            *err = ERR_NOT_A_FILE
+            *err = ErrorCode.NotAFile
             return blob_id_zero()
     dir_with(ns, dir, name, @(*change).id, (*change).op == OP_MKDIR, (*change).size, err)
 
 # Apply `change` at `path` and repoint the root at the result
 fn commit(ns: *Namespace, path: StrView, change: *Change) -> ErrorCode
-    var err: ErrorCode = ERR_OK
+    var err: ErrorCode = ErrorCode.Ok
     var iter: PathIter = path_iter_new(path)
     var new_root: BlobId = rewrite(ns, @(*ns).root, @iter, change, @err)
     if blob_id_is_zero(@new_root)
@@ -321,12 +321,12 @@ fn commit(ns: *Namespace, path: StrView, change: *Change) -> ErrorCode
     var old_root: BlobId = blob_id_copy(@(*ns).root)
     (*ns).root = new_root
     release(ns, @old_root)
-    ERR_OK
+    ErrorCode.Ok
 
 fn check_path(path: StrView) -> ErrorCode
     if not path_validate(path)
-        return ERR_INVALID_PATH
-    ERR_OK
+        return ErrorCode.InvalidPath
+    ErrorCode.Ok
 
 # ============================================================================
 # Public API
@@ -378,17 +378,17 @@ pub fn namespace_file_size(ns: *Namespace, path: StrView) -> u64
     memory_store_get_size((*ns).store, @id)
 
 # Write/create a file. Its directory must exist; a directory can't be
-# overwritten (ERR_NOT_A_FILE).
+# overwritten (ErrorCode.NotAFile).
 pub fn namespace_write(ns: *Namespace, path: StrView, data: @Span<u8>) -> ErrorCode
     let rc: ErrorCode = check_path(path)
-    if rc != ERR_OK
+    if rc != ErrorCode.Ok
         return rc
     if path_is_root(path)
-        return ERR_NOT_A_FILE
+        return ErrorCode.NotAFile
     var change: Change = Change { op: OP_WRITE, id: blob_id_zero(), size: data.len as u64 }
     change.id = memory_store_put((*ns).store, data.ptr, data.len as u64)
     if blob_id_is_zero(@change.id)
-        return ERR_OUT_OF_SPACE
+        return ErrorCode.OutOfSpace
     let result: ErrorCode = commit(ns, path, @change)
     # The new directory holds its own reference now (or the write failed)
     release(ns, @change.id)
@@ -397,25 +397,26 @@ pub fn namespace_write(ns: *Namespace, path: StrView, data: @Span<u8>) -> ErrorC
 # Create a directory
 pub fn namespace_mkdir(ns: *Namespace, path: StrView) -> ErrorCode
     let rc: ErrorCode = check_path(path)
-    if rc != ERR_OK
+    if rc != ErrorCode.Ok
         return rc
     if path_is_root(path)
-        return ERR_ALREADY_EXISTS
+        return ErrorCode.AlreadyExists
     var change: Change = Change { op: OP_MKDIR, id: put_empty_dir(ns), size: 0 }
     if blob_id_is_zero(@change.id)
-        return ERR_OUT_OF_SPACE
+        return ErrorCode.OutOfSpace
     let result: ErrorCode = commit(ns, path, @change)
     release(ns, @change.id)
     result
 
 # Delete a file or an empty directory, freeing the blobs nothing else holds.
-# ERR_NOT_FOUND, ERR_DIRECTORY_NOT_EMPTY, or ERR_PERMISSION_DENIED for "/".
+# ErrorCode.NotFound, ErrorCode.DirectoryNotEmpty, or
+# ErrorCode.PermissionDenied for "/".
 pub fn namespace_delete(ns: *Namespace, path: StrView) -> ErrorCode
     let rc: ErrorCode = check_path(path)
-    if rc != ERR_OK
+    if rc != ErrorCode.Ok
         return rc
     if path_is_root(path)
-        return ERR_PERMISSION_DENIED
+        return ErrorCode.PermissionDenied
     var change: Change = Change { op: OP_DELETE, id: blob_id_zero(), size: 0 }
     commit(ns, path, @change)
 

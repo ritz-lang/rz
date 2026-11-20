@@ -2,7 +2,7 @@
 #
 # Before #1881, namespace_write("/a/b") stored a new /a blob but repointed
 # only the root, and only when the parent *was* the root: the write returned
-# ERR_OK and was lost. Nothing was ever freed either: namespace_delete was a
+# ErrorCode.Ok and was lost. Nothing was ever freed either: namespace_delete was a
 # TODO and every overwrite leaked the superseded file and directory blobs.
 
 import ritzlib.strview { StrView }
@@ -11,7 +11,7 @@ import goliath.blob_id { BlobId }
 import goliath.blob_store { MemoryBlobStore, memory_store_free, memory_store_count, memory_store_get }
 import goliath.hosted { memory_store_new }
 import goliath.namespace { Namespace, namespace_new, namespace_read, namespace_write, namespace_mkdir, namespace_delete, namespace_exists, namespace_resolve, namespace_hold, namespace_unhold }
-import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_DIRECTORY_NOT_EMPTY, ERR_NOT_A_FILE }
+import goliath.error { ErrorCode }
 
 # 1 if `path` reads back exactly the `len` bytes at `want`.
 fn reads_back(ns: *Namespace, path: StrView, want: *u8, len: i64) -> bool
@@ -34,18 +34,18 @@ fn write_cstr(ns: *Namespace, path: StrView, text: *u8, len: i64) -> ErrorCode
 fn test_nested_write_reads_back() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
-    assert namespace_mkdir(@ns, "/a") == ERR_OK
-    assert write_cstr(@ns, "/a/b", c"nested", 6) == ERR_OK
+    assert namespace_mkdir(@ns, "/a") == ErrorCode.Ok
+    assert write_cstr(@ns, "/a/b", c"nested", 6) == ErrorCode.Ok
     assert reads_back(@ns, "/a/b", c"nested", 6)
     # Two levels down, and a sibling written earlier survives the rewrite
-    assert namespace_mkdir(@ns, "/a/c") == ERR_OK
-    assert write_cstr(@ns, "/a/c/d", c"deep", 4) == ERR_OK
-    assert write_cstr(@ns, "/a/b", c"again", 5) == ERR_OK
+    assert namespace_mkdir(@ns, "/a/c") == ErrorCode.Ok
+    assert write_cstr(@ns, "/a/c/d", c"deep", 4) == ErrorCode.Ok
+    assert write_cstr(@ns, "/a/b", c"again", 5) == ErrorCode.Ok
     assert reads_back(@ns, "/a/c/d", c"deep", 4)
     assert reads_back(@ns, "/a/b", c"again", 5)
     # A write under a missing directory, or over a directory, is refused
-    assert write_cstr(@ns, "/nope/x", c"x", 1) == ERR_NOT_FOUND
-    assert write_cstr(@ns, "/a/c", c"x", 1) == ERR_NOT_A_FILE
+    assert write_cstr(@ns, "/nope/x", c"x", 1) == ErrorCode.NotFound
+    assert write_cstr(@ns, "/a/c", c"x", 1) == ErrorCode.NotAFile
     memory_store_free(@store)
     0
 
@@ -56,15 +56,15 @@ fn test_delete_frees_blobs() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
     let empty: i32 = memory_store_count(@store)
-    assert namespace_mkdir(@ns, "/d") == ERR_OK
-    assert write_cstr(@ns, "/d/f", c"to be deleted", 13) == ERR_OK
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert write_cstr(@ns, "/d/f", c"to be deleted", 13) == ErrorCode.Ok
     assert memory_store_count(@store) > empty
 
-    assert namespace_delete(@ns, "/d") == ERR_DIRECTORY_NOT_EMPTY
-    assert namespace_delete(@ns, "/d/f") == ERR_OK
+    assert namespace_delete(@ns, "/d") == ErrorCode.DirectoryNotEmpty
+    assert namespace_delete(@ns, "/d/f") == ErrorCode.Ok
     assert not namespace_exists(@ns, "/d/f")
-    assert namespace_delete(@ns, "/d/f") == ERR_NOT_FOUND
-    assert namespace_delete(@ns, "/d") == ERR_OK
+    assert namespace_delete(@ns, "/d/f") == ErrorCode.NotFound
+    assert namespace_delete(@ns, "/d") == ErrorCode.Ok
     assert not namespace_exists(@ns, "/d")
     assert memory_store_count(@store) == empty
     memory_store_free(@store)
@@ -76,9 +76,9 @@ fn test_delete_frees_blobs() -> i32
 fn test_delete_keeps_shared_content() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
-    assert write_cstr(@ns, "/one", c"same", 4) == ERR_OK
-    assert write_cstr(@ns, "/two", c"same", 4) == ERR_OK
-    assert namespace_delete(@ns, "/one") == ERR_OK
+    assert write_cstr(@ns, "/one", c"same", 4) == ErrorCode.Ok
+    assert write_cstr(@ns, "/two", c"same", 4) == ErrorCode.Ok
+    assert namespace_delete(@ns, "/one") == ErrorCode.Ok
     assert reads_back(@ns, "/two", c"same", 4)
     memory_store_free(@store)
     0
@@ -89,13 +89,13 @@ fn test_delete_keeps_shared_content() -> i32
 fn test_overwrite_reclaims_superseded_blobs() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
-    assert namespace_mkdir(@ns, "/log") == ERR_OK
+    assert namespace_mkdir(@ns, "/log") == ErrorCode.Ok
     var buf: [8]u8
     var k: i32 = 0
     while k < 300
         buf[0] = (k & 255) as u8
         buf[1] = (k >> 8) as u8
-        assert write_cstr(@ns, "/log/cur", @buf[0], 2) == ERR_OK
+        assert write_cstr(@ns, "/log/cur", @buf[0], 2) == ErrorCode.Ok
         k = k + 1
     # root, /log and /log/cur
     assert memory_store_count(@store) == 3
@@ -111,23 +111,23 @@ fn test_hold_outlives_overwrite_and_delete() -> i32
     var store: MemoryBlobStore = memory_store_new()
     var ns: Namespace = namespace_new(@store)
     let empty: i32 = memory_store_count(@store)
-    assert write_cstr(@ns, "/f", c"old", 3) == ERR_OK
+    assert write_cstr(@ns, "/f", c"old", 3) == ErrorCode.Ok
     var file: BlobId = namespace_resolve(@ns, "/f")
     assert namespace_hold(@ns, @file)
-    assert write_cstr(@ns, "/f", c"new", 3) == ERR_OK
+    assert write_cstr(@ns, "/f", c"new", 3) == ErrorCode.Ok
     let old: *u8 = memory_store_get(@store, @file)
     assert old != null
     assert *old == 111 and *(old + 2) == 100
     namespace_unhold(@ns, @file)
     assert memory_store_get(@store, @file) == null
 
-    assert namespace_mkdir(@ns, "/d") == ERR_OK
-    assert write_cstr(@ns, "/d/x", c"child", 5) == ERR_OK
+    assert namespace_mkdir(@ns, "/d") == ErrorCode.Ok
+    assert write_cstr(@ns, "/d/x", c"child", 5) == ErrorCode.Ok
     var dir: BlobId = namespace_resolve(@ns, "/d")
     assert namespace_hold(@ns, @dir)
-    assert namespace_delete(@ns, "/d/x") == ERR_OK
-    assert namespace_delete(@ns, "/d") == ERR_OK
-    assert namespace_delete(@ns, "/f") == ERR_OK
+    assert namespace_delete(@ns, "/d/x") == ErrorCode.Ok
+    assert namespace_delete(@ns, "/d") == ErrorCode.Ok
+    assert namespace_delete(@ns, "/f") == ErrorCode.Ok
     # the held directory still names "child"
     assert memory_store_count(@store) == empty + 2
     namespace_unhold(@ns, @dir)

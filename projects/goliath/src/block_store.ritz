@@ -35,7 +35,7 @@ import goliath.alloc { allocator_alloc, allocator_free }
 import goliath.blob_store { MemoryBlobStore, memory_store_allocator }
 import goliath.namespace { Namespace, namespace_store }
 import goliath.image { ImageSink, image_size, image_write, image_load, image_put_le, image_get_le }
-import goliath.error { ErrorCode, ERR_OK, ERR_NOT_FOUND, ERR_CORRUPT_BLOB, ERR_IO_ERROR, ERR_OUT_OF_SPACE }
+import goliath.error { ErrorCode }
 
 pub const BLOCK_SECTOR_SIZE: i64 = 512
 pub const BLOCK_STORE_VERSION: u32 = 2
@@ -146,7 +146,7 @@ fn header_write(dev: *BlockDevice, idx: u64, gen: u64, lba: u64, len: u64) -> bo
     dev_write(dev, idx, 1, @sb[0])
 
 # The header in use: the valid one with the higher generation. -1 if neither
-# is valid; ERR_IO_ERROR as -2.
+# is valid; ErrorCode.IoError as -2.
 fn header_current(dev: *BlockDevice, h0: *SlotHeader, h1: *SlotHeader) -> i32
     if not header_read(dev, 0, h0) or not header_read(dev, 1, h1)
         return -2
@@ -190,20 +190,20 @@ fn writer_write(ctx: *u8, data: *u8, len: i64) -> bool
             return false
     true
 
-# Write `ns` (its whole store) to `dev`. ERR_OK, ERR_OUT_OF_SPACE (the image
-# doesn't fit beside the one in use; the device is untouched) or
-# ERR_IO_ERROR. Cut short at any point, the device still loads the tree of
-# the last save that returned ERR_OK.
+# Write `ns` (its whole store) to `dev`. ErrorCode.Ok, ErrorCode.OutOfSpace
+# (the image doesn't fit beside the one in use; the device is untouched) or
+# ErrorCode.IoError. Cut short at any point, the device still loads the tree
+# of the last save that returned ErrorCode.Ok.
 pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
     let len: u64 = image_size(ns)
     let sectors: u64 = sectors_for(len)
     if BLOCK_HEADERS + sectors > (*dev).sectors
-        return ERR_OUT_OF_SPACE
+        return ErrorCode.OutOfSpace
     var h0: SlotHeader
     var h1: SlotHeader
     let cur: i32 = header_current(dev, @h0, @h1)
     if cur == -2
-        return ERR_IO_ERROR
+        return ErrorCode.IoError
 
     # Where the new image goes, which header names it, and its generation
     var lba: u64 = BLOCK_HEADERS
@@ -219,7 +219,7 @@ pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
         if BLOCK_HEADERS + sectors > (*live).lba
             lba = (*live).lba + sectors_for((*live).len)
             if lba + sectors > (*dev).sectors
-                return ERR_OUT_OF_SPACE
+                return ErrorCode.OutOfSpace
 
     var w: SectorWriter
     w.dev = dev
@@ -227,11 +227,11 @@ pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
     w.fill = 0
     var sink: ImageSink = ImageSink { ctx: @w as *u8, write: writer_write }
     if not image_write(ns, @sink) or not writer_flush(@w)
-        return ERR_IO_ERROR
+        return ErrorCode.IoError
     # The flip: one sector, last
     if not header_write(dev, idx, gen, lba, len)
-        return ERR_IO_ERROR
-    ERR_OK
+        return ErrorCode.IoError
+    ErrorCode.Ok
 
 # ============================================================================
 # Load
@@ -240,22 +240,22 @@ pub fn block_store_save(dev: *BlockDevice, ns: *Namespace) -> ErrorCode
 # Load the newest whole image on `dev` into the empty `store` and set
 # `ns_out` to its namespace.
 #
-#   ERR_OK
-#   ERR_NOT_FOUND     no goliath header: a blank (or foreign) device;
+#   ErrorCode.Ok
+#   ErrorCode.NotFound     no goliath header: a blank (or foreign) device;
 #                     the caller starts an empty namespace (namespace_new)
-#   ERR_CORRUPT_BLOB  goliath headers, but none valid, or the image they
-#                     name isn't whole
-#   ERR_IO_ERROR / ERR_OUT_OF_SPACE
+#   ErrorCode.CorruptBlob  goliath headers, but none valid, or the image
+#                     they name isn't whole
+#   ErrorCode.IoError / ErrorCode.OutOfSpace
 pub fn block_store_load(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Namespace) -> ErrorCode
     var h0: SlotHeader
     var h1: SlotHeader
     let cur: i32 = header_current(dev, @h0, @h1)
     if cur == -2
-        return ERR_IO_ERROR
+        return ErrorCode.IoError
     if cur == -1
         if h0.state == HEADER_BAD or h1.state == HEADER_BAD
-            return ERR_CORRUPT_BLOB
-        return ERR_NOT_FOUND
+            return ErrorCode.CorruptBlob
+        return ErrorCode.NotFound
     var live: *SlotHeader = @h0
     if cur == 1
         live = @h1
@@ -267,7 +267,7 @@ pub fn block_store_load(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Nam
     let buf_len: i64 = (sectors * BLOCK_SECTOR_SIZE as u64) as i64
     let buf: *u8 = allocator_alloc(alloc, buf_len)
     if buf == null
-        return ERR_OUT_OF_SPACE
+        return ErrorCode.OutOfSpace
     var done: u64 = 0
     while done < sectors
         var n: u32 = BLOCK_IO_SECTORS
@@ -275,7 +275,7 @@ pub fn block_store_load(dev: *BlockDevice, store: *MemoryBlobStore, ns_out: *Nam
             n = (sectors - done) as u32
         if not dev_read(dev, first + done, n, buf + (done * BLOCK_SECTOR_SIZE as u64) as i64)
             allocator_free(alloc, buf, buf_len)
-            return ERR_IO_ERROR
+            return ErrorCode.IoError
         done = done + n as u64
 
     let rc: ErrorCode = image_load(buf, len as i64, store, ns_out)

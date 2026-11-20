@@ -45,9 +45,134 @@ pub struct MemoryBlobStore
     capacity: i32
     count: i32
     total_size: u64
+    # Open-addressing index from BlobId to a live slot in `entries`
+    # (AGAST #4228). Each cell is a slot, or INDEX_EMPTY / INDEX_TOMBSTONE.
+    # Its capacity is twice `capacity`, so lookups probe a fraction of the
+    # table rather than every slot.
+    index: *i32
+    index_capacity: i32
+
+# Index cell values. Slots are >= 0.
+const INDEX_EMPTY: i32 = -1
+const INDEX_TOMBSTONE: i32 = -2
 
 fn entries_bytes(capacity: i32) -> i64
     sizeof(BlobEntry) * capacity as i64
+
+fn index_bytes(capacity: i32) -> i64
+    sizeof(i32) * capacity as i64
+
+# `capacity` empty index cells from `a`, or null when out of memory
+fn index_alloc(a: *Allocator, capacity: i32) -> *i32
+    let index: *i32 = allocator_alloc(a, index_bytes(capacity)) as *i32
+    if index == null
+        return null
+    var i: i32 = 0
+    while i < capacity
+        *(index + i) = INDEX_EMPTY
+        i = i + 1
+    index
+
+# FNV-1a over the 32-byte id
+fn blob_hash(id: *BlobId) -> u64
+    var h: u64 = 14695981039346656037
+    var i: i32 = 0
+    while i < 32
+        h = h ^ ((*id).hash[i] as u64)
+        h = h * 1099511628211
+        i = i + 1
+    h
+
+# The live slot holding `id`, or -1. Linear probing; an empty cell ends the
+# probe (tombstones from deletes are skipped). `probes_out` (if not null)
+# takes the number of cells inspected.
+fn index_lookup(store: *MemoryBlobStore, id: *BlobId, probes_out: *i32) -> i32
+    var probes: i32 = 0
+    if (*store).index != null and (*store).index_capacity > 0
+        let mask: i32 = (*store).index_capacity - 1
+        var i: i32 = (blob_hash(id) as i32) & mask
+        while probes < (*store).index_capacity
+            let cell: i32 = *((*store).index + i)
+            probes = probes + 1
+            if cell == INDEX_EMPTY
+                break
+            if cell >= 0
+                let entry: *BlobEntry = (*store).entries + cell
+                if (*entry).refs > 0 and blob_id_eq(@(*entry).id, id)
+                    if probes_out != null
+                        *probes_out = probes
+                    return cell
+            i = (i + 1) & mask
+    if probes_out != null
+        *probes_out = probes
+    -1
+
+# Point `id`'s cell at `slot`, reusing the first tombstone on the probe path.
+fn index_insert(store: *MemoryBlobStore, id: *BlobId, slot: i32)
+    if (*store).index == null or (*store).index_capacity == 0
+        return
+    let mask: i32 = (*store).index_capacity - 1
+    var i: i32 = (blob_hash(id) as i32) & mask
+    var tombstone: i32 = -1
+    var probes: i32 = 0
+    while probes < (*store).index_capacity
+        let cell: i32 = *((*store).index + i)
+        if cell == INDEX_EMPTY
+            if tombstone >= 0
+                *((*store).index + tombstone) = slot
+            else
+                *((*store).index + i) = slot
+            return
+        if cell == INDEX_TOMBSTONE
+            if tombstone < 0
+                tombstone = i
+        else
+            let entry: *BlobEntry = (*store).entries + cell
+            if (*entry).refs > 0 and blob_id_eq(@(*entry).id, id)
+                *((*store).index + i) = slot
+                return
+        i = (i + 1) & mask
+        probes = probes + 1
+    # A full table can only happen if the load factor breaks; keep the
+    # tombstone rather than lose the entry.
+    if tombstone >= 0
+        *((*store).index + tombstone) = slot
+
+# Forget `id` (its slot is going away). The cell becomes a tombstone so
+# other probe chains keep working.
+fn index_remove(store: *MemoryBlobStore, id: *BlobId)
+    if (*store).index == null or (*store).index_capacity == 0
+        return
+    let mask: i32 = (*store).index_capacity - 1
+    var i: i32 = (blob_hash(id) as i32) & mask
+    var probes: i32 = 0
+    while probes < (*store).index_capacity
+        let cell: i32 = *((*store).index + i)
+        if cell == INDEX_EMPTY
+            return
+        if cell >= 0
+            let entry: *BlobEntry = (*store).entries + cell
+            if blob_id_eq(@(*entry).id, id)
+                *((*store).index + i) = INDEX_TOMBSTONE
+                return
+        i = (i + 1) & mask
+        probes = probes + 1
+
+# Rebuild the index from the entries (after the table moves).
+fn index_rebuild(store: *MemoryBlobStore)
+    if (*store).index == null
+        return
+    var i: i32 = 0
+    while i < (*store).index_capacity
+        *((*store).index + i) = INDEX_EMPTY
+        i = i + 1
+    i = 0
+    while i < (*store).capacity
+        let entry: *BlobEntry = (*store).entries + i
+        # refs is -1 transiently during mark-and-sweep: still present
+        if (*entry).refs != 0
+            index_insert(store, @(*entry).id, i)
+        i = i + 1
 
 # `capacity` unused entries from `a`, or null when out of memory
 fn entries_alloc(a: *Allocator, capacity: i32) -> *BlobEntry
@@ -64,23 +189,33 @@ fn entries_alloc(a: *Allocator, capacity: i32) -> *BlobEntry
         i = i + 1
     entries
 
-# Double the entry array. The first new (free) slot, or null when out of
-# memory (the store is unchanged).
+# Double the entry array (and its index). The first new (free) slot, or null
+# when out of memory (the store is unchanged).
 fn store_grow(store: *MemoryBlobStore) -> *BlobEntry
     let old_cap: i32 = (*store).capacity
     var new_cap: i32 = old_cap * 2
     if new_cap == 0
         new_cap = STORE_INITIAL_CAPACITY
+    let new_index_cap: i32 = new_cap * 2
     let entries: *BlobEntry = entries_alloc(@(*store).alloc, new_cap)
     if entries == null
+        return null
+    let index: *i32 = index_alloc(@(*store).alloc, new_index_cap)
+    if index == null
+        allocator_free(@(*store).alloc, entries as *u8, entries_bytes(new_cap))
         return null
     var i: i32 = 0
     while i < old_cap
         *(entries + i) = *((*store).entries + i)
         i = i + 1
     allocator_free(@(*store).alloc, (*store).entries as *u8, entries_bytes(old_cap))
+    if (*store).index != null
+        allocator_free(@(*store).alloc, (*store).index as *u8, index_bytes((*store).index_capacity))
     (*store).entries = entries
     (*store).capacity = new_cap
+    (*store).index = index
+    (*store).index_capacity = new_index_cap
+    index_rebuild(store)
     entries + old_cap
 
 # An empty store whose memory all comes from `alloc`. (goliath.hosted's
@@ -92,12 +227,20 @@ pub fn memory_store_new_in(alloc: Allocator) -> MemoryBlobStore
         entries: null,
         capacity: 0,
         count: 0,
-        total_size: 0
+        total_size: 0,
+        index: null,
+        index_capacity: 0
     }
     let entries: *BlobEntry = entries_alloc(@store.alloc, STORE_INITIAL_CAPACITY)
     if entries != null
-        store.entries = entries
-        store.capacity = STORE_INITIAL_CAPACITY
+        let index: *i32 = index_alloc(@store.alloc, STORE_INITIAL_CAPACITY * 2)
+        if index == null
+            allocator_free(@store.alloc, entries as *u8, entries_bytes(STORE_INITIAL_CAPACITY))
+        else
+            store.entries = entries
+            store.capacity = STORE_INITIAL_CAPACITY
+            store.index = index
+            store.index_capacity = STORE_INITIAL_CAPACITY * 2
     store
 
 # The allocator this store (and its users: namespace, image) draws on
@@ -106,15 +249,20 @@ pub fn memory_store_allocator(store: *MemoryBlobStore) -> *Allocator
 
 # The entry holding `id`, or null
 fn store_find(store: *MemoryBlobStore, id: *BlobId) -> *BlobEntry
-    var i: i32 = 0
-    while i < (*store).capacity
-        let entry: *BlobEntry = (*store).entries + i
-        if (*entry).refs > 0 and blob_id_eq(@(*entry).id, id)
-            return entry
-        i = i + 1
-    null
+    let slot: i32 = index_lookup(store, id, null)
+    if slot < 0
+        return null
+    (*store).entries + slot
+
+# Diagnostics (tests): how many index cells one lookup inspects. A linear
+# scan would grow with `memory_store_capacity`; the index's stay small.
+pub fn memory_store_find_probes(store: *MemoryBlobStore, id: *BlobId) -> i32
+    var probes: i32 = 0
+    index_lookup(store, id, @probes)
+    probes
 
 fn entry_free(store: *MemoryBlobStore, entry: *BlobEntry)
+    index_remove(store, @(*entry).id)
     allocator_free(@(*store).alloc, (*entry).data, (*entry).size as i64)
     (*store).total_size = (*store).total_size - (*entry).size
     (*store).count = (*store).count - 1
@@ -160,17 +308,21 @@ pub fn memory_store_put(store: *MemoryBlobStore, data: *u8, size: u64) -> BlobId
         return id
 
     var slot: *BlobEntry = null
+    var slot_index: i32 = -1
     var i: i32 = 0
     while i < (*store).capacity
         let entry: *BlobEntry = (*store).entries + i
         if (*entry).refs == 0
             slot = entry
+            slot_index = i
             break
         i = i + 1
     if slot == null
+        let old_cap: i32 = (*store).capacity
         slot = store_grow(store)
         if slot == null
             return blob_id_zero()
+        slot_index = old_cap
 
     var copy: *u8 = null
     if size > 0
@@ -189,6 +341,7 @@ pub fn memory_store_put(store: *MemoryBlobStore, data: *u8, size: u64) -> BlobId
     (*slot).holds_children = false
     (*store).count = (*store).count + 1
     (*store).total_size = (*store).total_size + size
+    index_insert(store, @(*slot).id, slot_index)
     id
 
 # References to `id` (0 if it isn't stored)
@@ -259,8 +412,12 @@ pub fn memory_store_free(store: *MemoryBlobStore) -> i32
             allocator_free(@(*store).alloc, (*entry).data, (*entry).size as i64)
         i = i + 1
     allocator_free(@(*store).alloc, (*store).entries as *u8, entries_bytes((*store).capacity))
+    if (*store).index != null
+        allocator_free(@(*store).alloc, (*store).index as *u8, index_bytes((*store).index_capacity))
     (*store).entries = null
+    (*store).index = null
     (*store).capacity = 0
+    (*store).index_capacity = 0
     (*store).count = 0
     (*store).total_size = 0
     0
