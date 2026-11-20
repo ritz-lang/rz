@@ -1110,8 +1110,10 @@ class LLVMEmitter:
         self.loop_stack: List[Tuple[ir.Block, ir.Block]] = []
 
         # Scope tracking for automatic Drop (RAII)
-        # Each scope is a list of (var_name, alloca, ritz_type) for variables that need Drop
-        self.drop_scope_stack: List[List[Tuple[str, ir.AllocaInstr, rast.Type]]] = []
+        # Each scope is a list of (var_name, alloca, ritz_type, seq) for
+        # variables that need Drop. `seq` is the registration order
+        # _emit_drop_for_all_scopes merges against pending temporaries'.
+        self.drop_scope_stack: List[List[Tuple[str, ir.AllocaInstr, rast.Type, int]]] = []
 
         # Drop flags for conditional scopes
         # Maps alloca -> flag_alloca (using id() since AllocaInstr is not hashable)
@@ -1132,8 +1134,13 @@ class LLVMEmitter:
         self._loop_drop_depth: List[int] = []
         # Move-only temporaries nobody owns (AGAST #2161): one frame per
         # statement being emitted (and per loop / `if` condition), each a
-        # list of (slot, drop flag, ritz type). The frame drops at its end.
-        self._temp_frames: List[List[Tuple[ir.AllocaInstr, ir.AllocaInstr, rast.Type]]] = []
+        # list of (slot, drop flag, ritz type, seq). The frame drops at its end.
+        self._temp_frames: List[List[Tuple[ir.AllocaInstr, ir.AllocaInstr, rast.Type, int]]] = []
+        # A `return` drops bindings, `defer`s and pending temporaries
+        # together, newest first (AGAST #4304). They live in two stacks, so
+        # each entry carries the sequence number it was registered with;
+        # _emit_drop_for_all_scopes merges by it. Per function.
+        self._drop_seq = 0
         # `@<call>` passed straight to a call (AGAST #3050): while its
         # address is taken, the call's value is spilled to a slot rather
         # than refused (TempPlace). One list per call being emitted: the
@@ -5572,7 +5579,8 @@ class LLVMEmitter:
         if self.drop_scope_stack and self._type_implements_drop(ritz_type):
             flag_alloca = self._new_drop_flag(name)
             # Register both the variable and its flag (key by alloca id, not name)
-            self.drop_scope_stack[-1].append((name, alloca, ritz_type))
+            self._drop_seq += 1
+            self.drop_scope_stack[-1].append((name, alloca, ritz_type, self._drop_seq))
             self.drop_flags[id(alloca)] = flag_alloca
             # A flag per field path the function moves out of a binding of
             # this name (AGAST #2171, #2232); set whenever it is initialised.
@@ -5620,7 +5628,8 @@ class LLVMEmitter:
         self.builder.store(val, slot)
         self.builder.store(ir.Constant(self.i1, 1), flag)
         self.drop_flags[id(slot)] = flag
-        self._temp_frames[-1].append((slot, flag, ty))
+        self._drop_seq += 1
+        self._temp_frames[-1].append((slot, flag, ty, self._drop_seq))
         self._last_temp = (id(expr), slot)
         return slot
 
@@ -5628,7 +5637,7 @@ class LLVMEmitter:
         """Drop a frame's live temporaries, newest first. Each flag is
         cleared, so a frame left early by return/break and again at its
         end can't drop one twice."""
-        for slot, _flag, ty in reversed(frame):
+        for slot, _flag, ty, _seq in reversed(frame):
             self._emit_flagged_drop("tmp", slot, ty, clear_flag=True)
 
     def _emit_cond_expr(self, expr: rast.Expr) -> ir.Value:
@@ -6039,7 +6048,7 @@ class LLVMEmitter:
         self.builder.position_at_end(current_block)
         return alloca
 
-    def _emit_drop_for_scope(self, drop_vars: List[Tuple[str, ir.AllocaInstr, rast.Type]],
+    def _emit_drop_for_scope(self, drop_vars: List[Tuple[str, ir.AllocaInstr, rast.Type, int]],
                               exclude_var: Optional[str] = None):
         """Emit drop calls for variables in reverse declaration order.
 
@@ -6047,12 +6056,12 @@ class LLVMEmitter:
         initialized in this execution path.
 
         Args:
-            drop_vars: List of (name, alloca, ritz_type) tuples
+            drop_vars: List of (name, alloca, ritz_type, seq) tuples
             exclude_var: Variable name to skip (for return moves)
         """
         # Drop in reverse order (LIFO - last declared, first dropped). A
         # `defer`'s entry sits among them, so it runs in the same order.
-        for name, alloca, ritz_type in reversed(drop_vars):
+        for name, alloca, ritz_type, _seq in reversed(drop_vars):
             if name == self._DEFER_ENTRY:
                 self._emit_deferred(*alloca)
                 continue
@@ -6076,7 +6085,9 @@ class LLVMEmitter:
         statement means what it would at the `defer` even if a later binding
         shadows one of them."""
         snapshot = {m: dict(getattr(self, m)) for m in self._DEFER_NAME_MAPS}
-        self.drop_scope_stack[-1].append((self._DEFER_ENTRY, (stmt, snapshot), None))
+        self._drop_seq += 1
+        self.drop_scope_stack[-1].append(
+            (self._DEFER_ENTRY, (stmt, snapshot), None, self._drop_seq))
 
     def _emit_deferred(self, stmt: rast.DeferStmt, snapshot) -> None:
         """Emit a deferred block at one exit, as its own block (its bindings
@@ -6259,15 +6270,34 @@ class LLVMEmitter:
     def _emit_drop_for_all_scopes(self, exclude_var: Optional[str] = None):
         """Emit drop calls for all scopes (used before return).
 
+        LANGUAGE_SPEC §13.6: a `return` drops what is live innermost first,
+        bindings, `defer`s and pending temporaries together, newest first
+        (AGAST #4304). They are held in two stacks, so each entry's
+        registration sequence number decides: a binding declared after a
+        pending temporary drops before it, as in Rust, and the value a
+        `return make(1)` is evaluating drops before any binding of the
+        enclosing statement. The `defer` entries take their place in the
+        same order (§13.7).
+
         Args:
             exclude_var: Variable name to exclude from dropping (for return moves)
         """
-        # The temporaries of the statements being emitted, then all scopes
-        # from innermost to outermost.
-        for frame in reversed(self._temp_frames):
-            self._drop_temp_frame(frame)
-        for scope in reversed(self.drop_scope_stack):
-            self._emit_drop_for_scope(scope, exclude_var)
+        entries = [(seq, name, alloca, ritz_type, False)
+                   for scope in self.drop_scope_stack
+                   for name, alloca, ritz_type, seq in scope]
+        for frame in self._temp_frames:
+            entries.extend((seq, "tmp", slot, ty, True) for slot, _flag, ty, seq in frame)
+        for _seq, name, alloca, ritz_type, is_temp in sorted(entries, key=lambda e: -e[0]):
+            if is_temp:
+                self._emit_flagged_drop("tmp", alloca, ritz_type, clear_flag=True)
+                continue
+            if name == self._DEFER_ENTRY:
+                self._emit_deferred(*alloca)
+                continue
+            if exclude_var and name == exclude_var:
+                # Skip - this variable is being moved out (returned)
+                continue
+            self._emit_flagged_drop(name, alloca, ritz_type)
 
     def _declare_extern(self, extern: rast.ExternFn) -> ir.Function:
         """Declare an external function in the LLVM module, so it can be
@@ -6596,6 +6626,7 @@ class LLVMEmitter:
         self._loop_drop_depth.clear()
         self._loop_temp_depth.clear()
         self._temp_frames.clear()
+        self._drop_seq = 0
         self.simd_expected_type = None  # Clear SIMD type context from previous function
         self.expected_ritz_type = None  # Expected Ritz type of the value being emitted
         self._literal_ctx_nodes = set()  # AGAST #1396: BinOps consumed at that type
@@ -6716,8 +6747,9 @@ class LLVMEmitter:
                 self._procedure_calls = set()
                 # The tail's temporaries (and a procedure's tail value, which
                 # goes nowhere, AGAST #2253) drop at the `ret`, before the
-                # defers: _emit_drop_for_all_scopes drops the temp frames
-                # first (§13.6 then §13.7, AGAST #2854).  The frame is
+                # defers: this frame is registered last, and
+                # _emit_drop_for_all_scopes drops what is live newest first
+                # (§13.6 then §13.7, AGAST #2854, #4304).  The frame is
                 # cleared with the fn's state (`_temp_frames.clear()`).
                 self._temp_frames.append([])
                 self._literal_into_slot(fn_def.ret_type, fn_def.body.expr)
@@ -12505,7 +12537,7 @@ class LLVMEmitter:
         if not slots or self.builder.block is None or self.builder.block.is_terminated:
             return
         entries = {id(slot): (slot, ty) for frame in self._temp_frames
-                   for slot, _flag, ty in frame}
+                   for slot, _flag, ty, _seq in frame}
         for slot in reversed(slots):
             if id(slot) in entries:
                 self._emit_flagged_drop("tmp", slot, entries[id(slot)][1], clear_flag=True)

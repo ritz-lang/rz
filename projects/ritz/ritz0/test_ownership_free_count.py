@@ -1102,6 +1102,42 @@ pub fn main() -> i32
     return inner + DROPS
 """, 1, {}),
 
+    # A `return` nested in a statement whose temporary is still pending, with
+    # a binding declared after it. Innermost scope first, as Rust does: the
+    # arm binding `t` (id 2) drops before the statement's temporary
+    # `make(1)` (id 1), so ORDER is 21, not 12. LANGUAGE_SPEC §13.6
+    # (AGAST #4304).
+    "ret_before_pending_temp": (SLOT + """\
+fn pick(id: i32) -> Slot
+    Slot.Full(make(id + 1))
+
+fn g() -> i32
+    match pick(make(1).id)
+        Full(t) =>
+            return t.id
+        _ =>
+            pass
+    return 0
+
+pub fn main() -> i32
+    g()
+    return ORDER
+""", 21, {}),
+
+    # The other direction of the same rule: a temporary the `return` itself
+    # creates is newer than a binding declared before it, so the temporary
+    # (id 2) drops first, then the binding (id 1): ORDER 21. A `return` that
+    # always dropped its bindings first would be 12 here (AGAST #4304).
+    "ret_temp_after_binding": ("""\
+fn f() -> i32
+    let t = make(1)
+    return make(2).id
+
+pub fn main() -> i32
+    f()
+    return ORDER
+""", 21, {}),
+
     # Plain copies: `a` stays usable after every copy, and nothing drops.
     "plain_struct_copy": ("""\
 fn take(p: Plain) -> i32

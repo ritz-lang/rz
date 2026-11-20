@@ -5749,7 +5749,10 @@ binding that still owns a value of that type when the binding's scope ends:
 
 - at the end of the block that declares the binding, nested blocks included;
 - on `return`, for every live binding of the function, after the return
-  value has been evaluated;
+  value has been evaluated and innermost scope first: a binding declared
+  after a temporary that is still pending drops before that temporary, and
+  a temporary the `return` itself creates drops before every binding
+  declared earlier (AGAST #4304);
 - on `break` and `continue`, for every binding declared inside the loop body;
 - on assignment to the binding, for the old value, before the new value is
   stored.
@@ -6084,9 +6087,47 @@ an `@T` parameter, or one whose field is read (`make().id`). A temporary is
 dropped at the end of the statement that creates it, except one lent straight to
 a call, `look(@make())` (§13.3): it is dropped as soon as that call returns, so
 `look(@make(1)) + DROPS` already counts it. A `return` drops it
-after the return value has been evaluated. A temporary in an `if` or `while`
+after the return value has been evaluated, and among everything live there it
+takes its place by age: a temporary newer than a live binding drops before it,
+and an older one after it. A temporary in an `if` or `while`
 condition is dropped once the condition has been evaluated, before the
 branch is taken.
+
+```ritz
+trait Drop
+    fn drop(self: @&Self)
+
+var ORDER: i32 = 0
+
+struct Tracked
+    id: i32
+
+impl Drop for Tracked
+    fn drop(self: @&Tracked)
+        ORDER = ORDER * 10 + self.id
+
+enum Slot
+    Full(Tracked)
+    Empty
+
+fn make(id: i32) -> Tracked
+    return Tracked { id: id }
+
+fn pick(id: i32) -> Slot
+    return Slot.Full(make(id + 1))
+
+fn g() -> i32
+    match pick(make(1).id)         # the statement's temporary: make(1), id 1
+        Full(t) =>
+            return t.id            # t (id 2) was declared after it, so t drops
+        _ =>                       # first: ORDER is 21, not 12
+            pass
+    return 0
+
+pub fn main() -> i32
+    g()
+    return ORDER - 21              # 0
+```
 
 A binding moved inside a loop body must own a value again on every path
 back to the loop head: an assignment after the move does that, and so does
