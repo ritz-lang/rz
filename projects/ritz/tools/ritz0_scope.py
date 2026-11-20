@@ -217,7 +217,14 @@ REGRESSION = Step(
               "projects/ritz/ritzlib/tests/*",
               "projects/ritz/ritz0/*.md", "projects/ritz/ritz1/*.md",
               "projects/ritz/ritzlib/*.md", "projects/ritz/runtime/*.md"),
-    lists=("projects/ritz", "projects/ritz/tools"),
+    # Re-measured 2026-11-20 (AGAST #4385), same recipe: every build.py run
+    # folds cache.py's ritz0 hash in, which imports
+    # ritz0/compiler_identity.py.  Its resolver walks ritz0/ once (os.walk)
+    # rather than stat'ing a candidate per module, so it lists ritz0/test,
+    # and adding or removing an entry there changes that walk.  The listing
+    # is declared, not the subtree read: the test files are still never
+    # opened, so `excludes` keeps a modification a skip.
+    lists=("projects/ritz", "projects/ritz/tools", "projects/ritz/ritz0/test"),
     label="regression-step")
 
 # Every step a gate may scope, in no particular order; RITZ0 first.

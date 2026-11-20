@@ -779,6 +779,50 @@ def test_the_harness_glob_is_in_its_read_set(real_scopes):
                  real_scopes) is None
 
 
+def test_the_regression_lists_the_ritz0_test_directory(real_scopes):
+    """AGAST #4385: every build.py run computes cache.py's ritz0 hash, which
+    loads ritz0/compiler_identity.py; its resolver os.walks ritz0/ (one walk
+    instead of a stat per candidate module), so the corpus regression lists
+    ritz0/test — an entry added to or removed from it changes that walk.
+    The listing is declared rather than the subtree read: a test file's
+    contents are still never opened, so a modification still skips."""
+    sc = real_scopes[ritz0_scope.REGRESSION.name]
+    changed = frozenset({"projects/ritz/ritz0/test/test_new.ritz"})
+    assert ritz0_scope.why_safe("A", "projects/ritz/ritz0/test/test_new.ritz",
+                                sc, ritz0_scope.REGRESSION, changed) is None
+    assert _real(ritz0_scope.REGRESSION, "M",
+                 "projects/ritz/ritz0/test/test_parser.ritz", real_scopes) is not None
+    # The parent's listing covers that directory only: a new entry one level
+    # deeper changes the listing of a directory the trace never listed.
+    nested = frozenset({"projects/ritz/ritz0/test/fixtures/x.py"})
+    assert ritz0_scope.why_safe("A", "projects/ritz/ritz0/test/fixtures/x.py",
+                                sc, ritz0_scope.REGRESSION, nested) is not None
+
+
+def test_the_regression_audit_covers_the_ritz0_test_listing():
+    """The exact trace shape CI rejected (AGAST #4385): the walk opens
+    ritz0/ and ritz0/test as directories; both listings are in the read set."""
+    log = _trace(
+        REAL,
+        '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0>',
+        '1 openat(AT_FDCWD<@/projects/ritz/ritz0>, "test", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0/test>',
+    )
+    assert ritz0_scope.audit(REAL, ritz0_scope.REGRESSION, log) == []
+
+
+def test_the_regression_audit_still_names_an_undeclared_excluded_listing():
+    """Declaring ritz0/test must not cover another excluded directory the
+    trace lists: ritzlib/tests is excluded from the read set too (the corpus
+    does not open its files), and it is not declared, so listing it stays a
+    finding.  A directory under an unexcluded read is covered by `reads`."""
+    log = _trace(
+        REAL,
+        '1 openat(AT_FDCWD</x>, "@/projects/ritz/ritzlib/tests", O_RDONLY|O_DIRECTORY) = 3<@/projects/ritz/ritzlib/tests>',
+    )
+    assert ritz0_scope.audit(REAL, ritz0_scope.REGRESSION, log) == [
+        "projects/ritz/ritzlib/tests/ (listed)"]
+
+
 @pytest.mark.parametrize("step", ritz0_scope.STEPS[1:], ids=lambda s: s.name)
 def test_every_python_input_imports_only_inputs(real_scopes, step):
     """A Python file the step reads finds its siblings on sys.path[0]: each
