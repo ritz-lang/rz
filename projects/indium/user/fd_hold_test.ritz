@@ -1,0 +1,117 @@
+# fd_hold_test: an open read fd still sees the bytes it opened after another
+# fd rewrites the same path and closes it (AGAST #4322).
+#
+# goliath frees a blob when its last reference goes. sys_open holds the open
+# file's blob until its last close (namespace_hold), because FsFile.data_ptr
+# points straight at that blob's bytes; without the hold a rewrite frees them
+# and a later rewrite reuses the block, so the reader sees new bytes. This is
+# the end-to-end counterpart of goliath's
+# test_hold_outlives_overwrite_and_delete: whatever the unit does, the kernel
+# must hold.
+#
+# Steps: mkdir /tmp; create /tmp/f holding 4096 'O's; open it read-only;
+# rewrite /tmp/f four times (1024 bytes of '1'..'4'), each through a fresh
+# write fd closed at once; the read fd must still read 'O's.
+#
+# The sizes are the mutation's business (AGAST #4322). Dropping the hold must
+# red this test, so its replacement allocation has to reach the freed block.
+# The kernel heap is first-fit and freed blocks are pushed to the head, but a
+# rewrite also frees the old directory blobs (a root entry is 4 + 64*N bytes,
+# a /tmp blob 68, both >= 128 with the block header), and those are freed
+# after the old file blob. A small replacement is satisfied by them and never
+# reaches the old file's block: a 4 KiB original is freed first and skipped as
+# too small. So the original is 4 KiB (block 4128) and each rewrite 1024 bytes
+# (block 1056): too big for the freed directory blocks, small enough for the
+# 4 KiB original's block, which is then the first fit and takes the new bytes.
+# Verified by mutating the kernel: with the hold dropped the test fails here
+# with a byte that is not 'O'.
+#
+# Each exit code names the step that failed. /tmp is made here because nothing
+# else does; a reboot that restored a namespace already holding it must not
+# fail on EEXIST.
+
+import libharland { print_str, print_int }
+import ritzlib.sys {
+    syscall2, sys_open, sys_close, sys_read, sys_write,
+    SYS_MKDIR, O_RDONLY, O_WRONLY, O_CREAT, O_TRUNC
+}
+
+const DIR_EXISTS: i64 = -17
+const ORIG_BYTES: i64 = 4096
+const NEW_BYTES: i64 = 1024
+const REWRITES: i32 = 4
+const O_ASCII: u8 = 79
+
+fn fail(step: i32, msg: *u8, value: i64) -> i32
+    print_str(c"[fd_hold_test] FAIL: ")
+    print_str(msg)
+    print_int(value)
+    print_str(c"\n")
+    return step
+
+# Open `path` with `flags`, write `len` bytes, close: 0 on success.
+fn write_all(path: *u8, data: *u8, len: i64, flags: i32) -> i32
+    let fd: i32 = sys_open(path, flags)
+    if fd < 0
+        return fd
+    let n: i64 = sys_write(fd, data, len)
+    let c: i32 = sys_close(fd)
+    if n != len
+        return -1
+    if c != 0
+        return c
+    return 0
+
+pub fn main() -> i32
+    let path: *u8 = c"/tmp/f"
+
+    # 1. /tmp. Created once per namespace; a reboot may have kept it.
+    let mk: i64 = syscall2(SYS_MKDIR, c"/tmp" as i64, 4)
+    if mk != 0 and mk != DIR_EXISTS
+        return fail(1, c"mkdir /tmp returned ", mk)
+
+    # 2. The original bytes: ORIG_BYTES 'O's.
+    var orig: [4096]u8
+    var i: i64 = 0
+    while i < ORIG_BYTES
+        orig[i] = O_ASCII
+        i = i + 1
+    let created: i32 = write_all(path, @orig[0], ORIG_BYTES, O_WRONLY | O_CREAT | O_TRUNC)
+    if created != 0
+        return fail(2, c"create /tmp/f returned ", created as i64)
+
+    # 3. The reader under test.
+    let rfd: i32 = sys_open(path, O_RDONLY)
+    if rfd < 0
+        return fail(3, c"read-only open returned ", rfd as i64)
+
+    # 4. Rewrite the path through other fds, each closed at once.
+    var new_data: [1024]u8
+    var k: i32 = 1
+    while k <= REWRITES
+        var j: i64 = 0
+        while j < NEW_BYTES
+            new_data[j] = (48 + k) as u8
+            j = j + 1
+        let r: i32 = write_all(path, @new_data[0], NEW_BYTES, O_WRONLY | O_TRUNC)
+        if r != 0
+            sys_close(rfd)
+            return fail(3 + k, c"rewrite returned ", r as i64)
+        k = k + 1
+
+    # 5. The old fd must still see the bytes it opened.
+    var buf: [8]u8
+    let n: i64 = sys_read(rfd, @buf[0], 8)
+    let c: i32 = sys_close(rfd)
+    if n != 8
+        return fail(8, c"read after rewrite returned ", n)
+    var b: i32 = 0
+    while b < 8
+        if buf[b] != O_ASCII
+            return fail(9, c"byte after rewrite is not 'O': ", buf[b] as i64)
+        b = b + 1
+    if c != 0
+        return fail(10, c"close of the read fd returned ", c as i64)
+
+    print_str(c"[fd_hold_test] PASS: open fd kept the original bytes\n")
+    return 0
