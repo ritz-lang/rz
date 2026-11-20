@@ -37,8 +37,10 @@
 # hands out NVMe namespaces after the virtio disks), so the filesystem layer
 # reads and writes them with virtio_blk_read/virtio_blk_write, unchanged.
 #
-# Memory: every queue, the identify buffer and the PRP list is one
-# identity-mapped physical page (pmm_alloc_page), as virtio uses. Data goes
+# Memory: every queue, the identify buffer and the PRP list is one physical
+# page (pmm_alloc_page). The controller is given their physical addresses; the
+# CPU reaches them through phys_to_virt (PML4[256]), since a process's address
+# space no longer maps low memory at identity (AGAST #1878). Data goes
 # through NVME_BOUNCE_PAGES bounce pages, which need not be contiguous: PRP1
 # names the first, PRP2 the second when a transfer spans two pages, or the
 # PRP list page holding the rest when it spans more. A command moves at most
@@ -52,7 +54,7 @@ import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
 import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count, msix_entry_irte, msix_entry_dest, MSIX_NO_IRTE }
 import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
 import mm.heap { kalloc, kfree }
-import mm.vmm { vmm_map_mmio }
+import mm.vmm { vmm_map_mmio, phys_to_virt }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
 
 # Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
@@ -163,13 +165,13 @@ pub struct NvmeController
     db_stride: u64          # Doorbell stride in bytes (4 << CAP.DSTRD)
     depth: u32              # Entries per queue
     next_cid: u32           # Next command identifier
-    sq: [2]u64              # SQ base (phys == virt), [admin, io]
-    cq: [2]u64              # CQ base (phys == virt)
+    sq: [2]u64              # SQ base (physical; CPU via phys_to_virt), [admin, io]
+    cq: [2]u64              # CQ base (physical; CPU via phys_to_virt)
     sq_tail: [2]u32
     cq_head: [2]u32
     cq_phase: [2]u32        # Phase tag that marks a new CQE
     buf: u64                # One page for identify data
-    bounce: [16]u64         # NVME_BOUNCE_PAGES data pages (phys == virt)
+    bounce: [16]u64         # NVME_BOUNCE_PAGES data pages (physical)
     prp_list: u64           # PRP list page, for transfers over two pages
     nn: u32                 # Number of namespaces (Identify Controller)
     max_pages: u32          # Pages per command: bounce pages, capped by MDTS
@@ -218,15 +220,16 @@ fn nvme_doorbell(c: *NvmeController, q: i32, is_cq: u64, value: u32)
     nvme_w32(c, off, value)
 
 fn mem_r32(addr: u64) -> u32
-    return volatile_load(addr as *u32)
+    return volatile_load(phys_to_virt(addr) as *u32)
 
 fn mem_w32(addr: u64, value: u32)
-    volatile_store(addr as *u32, value)
+    volatile_store(phys_to_virt(addr) as *u32, value)
 
 fn zero_page(addr: u64)
+    let virt: u64 = phys_to_virt(addr)
     var i: u64 = 0
     while i < PAGE_SIZE
-        *((addr + i) as *u64) = 0
+        *((virt + i) as *u64) = 0
         i = i + 8
 
 fn alloc_zeroed_page() -> u64
@@ -301,6 +304,7 @@ fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u6
         (*c).next_cid = 0
 
     # Build the SQE in place: CDW0 = opcode | CID << 16, NSID, PRP1, PRP2, CDW10-12.
+    # mem_w32/mem_r32 translate a physical address through the physmap.
     let sqe: u64 = (*c).sq[q] + ((*c).sq_tail[q] as u64) * NVME_SQE_SIZE
     var i: u64 = 0
     while i < NVME_SQE_SIZE
@@ -481,7 +485,7 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
         return nvme_fail(c, "identify controller")
     var i: u32 = 0
     while i < 20
-        let ch: u8 = *(((*c).buf + 4 + i as u64) as *u8)
+        let ch: u8 = *((phys_to_virt((*c).buf) + 4 + i as u64) as *u8)
         (*c).serial[i as i32] = ch
         if ch != 0x20 and ch != 0
             (*c).serial_len = i + 1
@@ -490,7 +494,7 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     # MDTS: the largest transfer is 2^MDTS minimum pages (CAP.MPSMIN is 4 KiB,
     # checked above); 0 means no limit.
     (*c).max_pages = NVME_BOUNCE_PAGES
-    let mdts: u32 = *(((*c).buf + 77) as *u8) as u32
+    let mdts: u32 = *((phys_to_virt((*c).buf) + 77) as *u8) as u32
     if mdts != 0 and mdts < 5 and (1 << mdts) < (*c).max_pages
         (*c).max_pages = 1 << mdts
 
@@ -579,8 +583,8 @@ fn nvme_scan_namespaces(c: *NvmeController)
         if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, nsid, (*c).buf, 0, NVME_CNS_NAMESPACE, 0, 0) == 0
             # NSZE (bytes 0-7, in LBAs); FLBAS (byte 26) picks an LBA format
             # at 128 + 4n, whose LBADS (bits 23:16) is log2 of the LBA size.
-            let nsze: u64 = *((*c).buf as *u64)
-            let flbas: u64 = (*(((*c).buf + 26) as *u8) & 0xF) as u64
+            let nsze: u64 = *((phys_to_virt((*c).buf)) as *u64)
+            let flbas: u64 = (*((phys_to_virt((*c).buf) + 26) as *u8) & 0xF) as u64
             let lbads: u32 = (mem_r32((*c).buf + 128 + 4 * flbas) >> 16) & 0xFF
             let supported: bool = lbads >= NVME_MIN_LBADS and lbads <= NVME_MAX_LBADS
             if nsze != 0 and not supported
@@ -647,7 +651,7 @@ fn nvme_io(c: *NvmeController, opc: u32, nsid: u32, off: u64, bytes: u64, lba: u
     if last > first + 1
         var k: u64 = first + 1
         while k <= last
-            *(((*c).prp_list + (k - first - 1) * 8) as *u64) = (*c).bounce[k as i32]
+            *((phys_to_virt((*c).prp_list) + (k - first - 1) * 8) as *u64) = (*c).bounce[k as i32]
             k = k + 1
         prp2 = (*c).prp_list
     return nvme_cmd(c, NVME_IO_Q, opc, nsid, prp1, prp2, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, nlb - 1)
@@ -662,7 +666,7 @@ fn nvme_bounce_copy(c: *NvmeController, off: u64, user: *u8, len: u64, to_bounce
         var n: u64 = PAGE_SIZE - in_page
         if n > len - i
             n = len - i
-        let page: *u8 = ((*c).bounce[(o / PAGE_SIZE) as i32] + in_page) as *u8
+        let page: *u8 = (phys_to_virt((*c).bounce[(o / PAGE_SIZE) as i32]) + in_page) as *u8
         let u: *u8 = user + i as i64
         var j: u64 = 0
         if to_bounce

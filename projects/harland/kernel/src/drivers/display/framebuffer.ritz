@@ -8,8 +8,7 @@
 
 import serial { prints, serial_print_hex, serial_print_dec }
 import mm.heap { kalloc, kfree }
-import mm.vmm { vmm_map_page, PTE_WRITABLE, PTE_WRITE_THROUGH }
-import mm.pmm { PAGE_SIZE }
+import mm.vmm { vmm_map_mmio }
 
 # Framebuffer pixel formats
 pub const FB_FORMAT_RGBX: u8 = 0     # Red-Green-Blue-Reserved (UEFI type 0)
@@ -21,7 +20,8 @@ const SIMPLE_FRAMEBUFFER_SIZE: u64 = 48
 
 # Simple framebuffer state
 pub struct SimpleFramebuffer
-    base: u64           # Physical address (also virtual in identity-mapped kernel)
+    base: u64           # Kernel virtual address (through the MMIO window)
+    phys: u64           # Physical base (device memory; for user mapping)
     width: u32          # Horizontal resolution
     height: u32         # Vertical resolution
     pitch: u32          # Bytes per scanline (may be > width * bytes_per_pixel)
@@ -56,20 +56,16 @@ pub fn fb_init(addr: u64, width: u32, height: u32, pitch: u32, bpp: u8, format: 
 
     # Calculate framebuffer size and map it into kernel address space
     let fb_size: u64 = (pitch as u64) * (height as u64)
-    let num_pages: u64 = (fb_size + PAGE_SIZE - 1) / PAGE_SIZE
 
-    # Map framebuffer pages (identity map the physical address)
-    # Use write-through caching for framebuffer (PTE_WRITE_THROUGH)
-    var page: u64 = 0
-    while page < num_pages
-        let page_addr: u64 = addr + (page * PAGE_SIZE)
-        let result: i32 = vmm_map_page(page_addr, page_addr, PTE_WRITABLE | PTE_WRITE_THROUGH)
-        if result != 0
-            prints("[fb] Failed to map framebuffer page at ")
-            serial_print_hex(page_addr)
-            prints("\n")
-            return 0 as *SimpleFramebuffer
-        page = page + 1
+    # Map through the kernel MMIO window (cache-disabled, write-through):
+    # the framebuffer was identity-mapped before AGAST #1878, and the kernel
+    # draws under a process's CR3, which has no identity map.
+    let fb_virt: u64 = vmm_map_mmio(addr, fb_size)
+    if fb_virt == 0
+        prints("[fb] Failed to map framebuffer at ")
+        serial_print_hex(addr)
+        prints("\n")
+        return 0 as *SimpleFramebuffer
 
     # Allocate framebuffer state
     let fb: *SimpleFramebuffer = kalloc(SIMPLE_FRAMEBUFFER_SIZE) as *SimpleFramebuffer
@@ -77,7 +73,8 @@ pub fn fb_init(addr: u64, width: u32, height: u32, pitch: u32, bpp: u8, format: 
         prints("[fb] Failed to allocate framebuffer state\n")
         return 0 as *SimpleFramebuffer
 
-    (*fb).base = addr
+    (*fb).base = fb_virt
+    (*fb).phys = addr
     (*fb).width = width
     (*fb).height = height
     (*fb).pitch = pitch
@@ -98,7 +95,7 @@ pub fn fb_init(addr: u64, width: u32, height: u32, pitch: u32, bpp: u8, format: 
     else
         prints("custom")
     prints(", ")
-    serial_print_dec(num_pages)
+    serial_print_dec((fb_size + 4095) / 4096)
     prints(" pages mapped)\n")
 
     return fb

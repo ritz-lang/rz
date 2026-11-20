@@ -184,12 +184,17 @@ pub fn kfree(ptr: *u8) -> i32
     0
 """
 
+# The legacy transport keeps its registers as raw physical addresses; queue
+# pages are reached through the physmap, the identity here (AGAST #1878).
 VMM_STUB = """\
 pub fn vmm_virt_to_phys(vaddr: u64) -> u64
     vaddr
 
 pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
     0
+
+pub fn phys_to_virt(paddr: u64) -> u64
+    paddr
 """
 
 # The device. Legacy registers at 0xC000 (virtio 1.1 §4.1.4.8): features 0,

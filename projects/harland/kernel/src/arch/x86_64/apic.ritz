@@ -20,7 +20,7 @@ import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import arch.x86_64.tsc_calc { LAPIC_CAL_WINDOW_US, lapic_timer_hz, lapic_timer_initial }
 import serial { prints, serial_print_dec, serial_print_hex }
 import mm.pmm { Mb2BootInfo, HarlandBootInfo, pmm_alloc_page }
-import mm.vmm { vmm_pml4_phys, vmm_map_page, PTE_WRITABLE, PTE_CACHE_DISABLE }
+import mm.vmm { vmm_pml4_phys, vmm_map_mmio }
 import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr }
 import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
 import arch.x86_64.irq_dest { irq_dest_pick, irq_ext_dest_from_cpuid, ioapic_rte_hi, ioapic_rte_dest, msi_addr_lo, IRQ_DEST_NONE }
@@ -214,11 +214,36 @@ fn irq_route_report() -> i32
         i = i + 1
     return 0
 
+# Kernel virtual base of the LAPIC and I/O APIC register windows. Both are
+# mapped once in apic_map_registers, through the kernel-half MMIO window
+# (PML4[257]) that every process inherits; before AGAST #1878 they were
+# identity-mapped below 1 GiB and read through the raw physical address.
+# Under x2APIC the LAPIC is MSRs and these are unused (but harmless).
+var lapic_mmio: u64 = 0
+var ioapic_mmio: u64 = 0
+
+# Map the LAPIC and I/O APIC registers through the MMIO window. Returns 0, or
+# -1 on failure.
+fn apic_map_registers() -> i32
+    prints("    Mapping APIC regions...")
+    if local_apic_addr != 0
+        lapic_mmio = vmm_map_mmio(local_apic_addr, PAGE_SIZE)
+        if lapic_mmio == 0
+            prints(" LAPIC map failed!\n")
+            return -1
+    if io_apic_addr != 0
+        ioapic_mmio = vmm_map_mmio(io_apic_addr, PAGE_SIZE)
+        if ioapic_mmio == 0
+            prints(" IOAPIC map failed!\n")
+            return -1
+    prints(" done\n")
+    return 0
+
 # Read LAPIC register
 fn lapic_read(offset: u64) -> u32
     if x2apic_mode != 0
         return rdmsr(X2APIC_MSR_BASE + (offset >> 4) as u32) as u32
-    let addr: *u32 = (local_apic_addr + offset) as *u32
+    let addr: *u32 = (lapic_mmio + offset) as *u32
     return *addr
 
 # Write LAPIC register (pub for scheduler timer)
@@ -226,7 +251,7 @@ pub fn lapic_write(offset: u64, value: u32) -> i32
     if x2apic_mode != 0
         wrmsr(X2APIC_MSR_BASE + (offset >> 4) as u32, value as u64)
         return 0
-    let addr: *u32 = (local_apic_addr + offset) as *u32
+    let addr: *u32 = (lapic_mmio + offset) as *u32
     *addr = value
     return 0
 
@@ -395,15 +420,15 @@ const IOAPIC_REDTBL: u8 = 0x10    # Redirection table (0x10 + 2*n for entry n)
 
 # Read I/O APIC register
 fn ioapic_read(reg: u8) -> u32
-    let regsel: *u32 = io_apic_addr as *u32
-    let window: *u32 = (io_apic_addr + IOAPIC_WINDOW) as *u32
+    let regsel: *u32 = ioapic_mmio as *u32
+    let window: *u32 = (ioapic_mmio + IOAPIC_WINDOW) as *u32
     *regsel = reg as u32
     return *window
 
 # Write I/O APIC register
 fn ioapic_write(reg: u8, value: u32) -> i32
-    let regsel: *u32 = io_apic_addr as *u32
-    let window: *u32 = (io_apic_addr + IOAPIC_WINDOW) as *u32
+    let regsel: *u32 = ioapic_mmio as *u32
+    let window: *u32 = (ioapic_mmio + IOAPIC_WINDOW) as *u32
     *regsel = reg as u32
     *window = value
     return 0
@@ -746,20 +771,9 @@ pub fn apic_init_with_mb(mb_info: *Mb2BootInfo) -> i32
         prints("\r  [!!] ACPI/APIC (ACPI not found)\n")
         return -1
 
-    # Map Local APIC and I/O APIC to identity addresses
-    # These are memory-mapped I/O regions above 1GB, outside our initial mapping
-    prints("    Mapping APIC regions...")
-    if local_apic_addr != 0
-        let lapic_result: i32 = vmm_map_page(local_apic_addr, local_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
-        if lapic_result != 0
-            prints(" LAPIC map failed!\n")
-            return -1
-    if io_apic_addr != 0
-        let ioapic_result: i32 = vmm_map_page(io_apic_addr, io_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
-        if ioapic_result != 0
-            prints(" IOAPIC map failed!\n")
-            return -1
-    prints(" done\n")
+    # Map Local APIC and I/O APIC through the kernel MMIO window
+    if apic_map_registers() != 0
+        return -1
 
     # xAPIC or x2APIC, before the LAPIC is first touched
     apic_select_mode()
@@ -793,19 +807,9 @@ pub fn apic_init_from_bootinfo(info: *HarlandBootInfo) -> i32
         prints("\r  [!!] ACPI/APIC (ACPI not found)\n")
         return -1
 
-    # Map Local APIC and I/O APIC to identity addresses
-    prints("    Mapping APIC regions...")
-    if local_apic_addr != 0
-        let lapic_result: i32 = vmm_map_page(local_apic_addr, local_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
-        if lapic_result != 0
-            prints(" LAPIC map failed!\n")
-            return -1
-    if io_apic_addr != 0
-        let ioapic_result: i32 = vmm_map_page(io_apic_addr, io_apic_addr, PTE_WRITABLE | PTE_CACHE_DISABLE)
-        if ioapic_result != 0
-            prints(" IOAPIC map failed!\n")
-            return -1
-    prints(" done\n")
+    # Map Local APIC and I/O APIC through the kernel MMIO window
+    if apic_map_registers() != 0
+        return -1
 
     # xAPIC or x2APIC, before the LAPIC is first touched
     apic_select_mode()

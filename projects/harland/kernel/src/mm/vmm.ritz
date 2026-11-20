@@ -6,7 +6,7 @@
 # Depends on PMM for page table allocation.
 
 import serial { StrView, prints, serial_print_hex, serial_print_dec, println }
-import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_mark_region_used, pmm_get_total_pages, pmm_range_has_free }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page, pmm_alloc_page_high, pmm_free_page, pmm_mark_region_used, pmm_get_total_pages, pmm_range_has_free, pmm_set_physmap_offset }
 import io { rdmsr, wrmsr, CpuidResult, cpuid }
 
 # ============================================================================
@@ -47,8 +47,8 @@ pub var vmm_pml4_phys: u64 = 0
 # direct map of RAM at PHYSMAP_BASE, PML4[256], the first kernel-half slot.
 # vmm_create_user_pml4 copies PML4[256..511] into every process, so the
 # physmap is there whatever CR3 is loaded. Before #3530 page tables were read
-# through the identity map, which processes only get for phys < 1 GiB: a
-# table pmm handed out above that faulted the kernel (-m 2G).
+# through the boot identity map; a table pmm handed out above 1 GiB faulted
+# the kernel (-m 2G). Since #1878 a process has no identity map at all.
 #
 # Until vmm_init_physmap runs, g_physmap_offset is 0 and phys_to_virt is the
 # boot identity map, which is how the physmap's own tables are written.
@@ -148,6 +148,9 @@ pub fn vmm_init_physmap() -> i32
     if vmm_init_mmio_window() != 0
         return -1
     g_physmap_offset = PHYSMAP_BASE
+    # From here the PMM bitmap is reached through the physmap, never the
+    # identity map: a process's PML4 has no lower half to fall back on.
+    pmm_set_physmap_offset(PHYSMAP_BASE)
     g_tables_high = true
     prints("[vmm] physmap: ")
     serial_print_dec(chunks as u64 * 2)
@@ -831,20 +834,22 @@ fn vmm_print_flags(entry: u64) -> i32
 # Create a new PML4 for a process, copying kernel mappings
 # Returns physical address of new PML4, or 0 on failure
 #
-# This creates a proper isolated address space:
+# This creates an isolated address space that shares NOTHING below
+# PML4[256] (AGAST #1878):
 #
-# 1. PML4[0] - We create a NEW PDPT that ONLY maps PDPT[0] (identity 0-1GB)
-#    and PDPT[3] (LAPIC/IOAPIC MMIO), both shared with the kernel. Code that
-#    still uses identity addresses for low memory needs them; page tables go
-#    through the physmap instead. PDPT[1-511] are otherwise private: user
-#    addresses like 0x100000000 (4GB = PDPT[4]) are the process's own.
+# 1. PML4[0-255] - the process's own. They start absent; the program image
+#    at 4 GiB (PML4[0]), the mmap region (from PML4[1],
+#    syscall/runtime/memory.ritz) and the user stack (PML4[255]) allocate
+#    their tables on demand. The kernel never needs an identity address
+#    here: RAM comes through the physmap and devices through the MMIO
+#    window, both in the kernel half below.
 #
-# 2. PML4[256-511] - Higher-half kernel space (shared copy): the physmap
-#    (PML4[256]), kernel code, data and heap.
+# 2. PML4[256-511] - kernel half (shared copy): the physmap (PML4[256]),
+#    the MMIO window (PML4[257]), kernel code, data and heap.
 #
-# 3. PML4[1-255] - Private user space: the mmap region (from PML4[1],
-#    syscall/runtime/memory.ritz) and the user stack (PML4[255]).
-#
+# The invariant that nothing below PML4[256] is shared is checked below: a
+# shared entry is the identity map reappearing and would alias kernel memory
+# into every process.
 pub fn vmm_create_user_pml4() -> u64
     # Allocate a new PML4 page
     let new_pml4: u64 = vmm_alloc_table()
@@ -853,41 +858,10 @@ pub fn vmm_create_user_pml4() -> u64
         return 0
     var i: u64 = 0
 
-    # For PML4[0], we need to create a NEW PDPT that only has the
-    # identity mapping for physical memory 0-1GB (at PDPT[0]).
-    # The rest of PDPT[1-511] is empty for user allocations.
-    let kernel_pml4_0: u64 = vmm_get_entry(vmm_pml4_phys, 0)
-    if (kernel_pml4_0 & PTE_PRESENT) != 0
-        # Allocate a new PDPT for this process
-        let new_pdpt: u64 = vmm_alloc_table()
-        if new_pdpt == 0
-            pmm_free_page(new_pml4)
-            prints("[vmm] Failed to allocate PDPT\n")
-            return 0
-
-        # Copy PDPT entries from kernel that the kernel needs:
-        # - PDPT[0]: 0-1GB identity mapping (physical memory)
-        # - PDPT[3]: 3-4GB range (contains LAPIC at 0xFEE00000 and I/O APIC at 0xFEC00000)
-        # These mappings are kernel-only (no USER bit) so userspace can't access them
-        # but the kernel can still use them when handling syscalls/interrupts.
-        let kernel_pdpt: u64 = kernel_pml4_0 & PTE_ADDR_MASK
-
-        # Copy PDPT[0] - identity mapping for 0-1GB physical
-        let pdpt_0: u64 = vmm_get_entry(kernel_pdpt, 0)
-        if (pdpt_0 & PTE_PRESENT) != 0
-            vmm_set_entry(new_pdpt, 0, pdpt_0 & ~PTE_USER)
-
-        # Copy PDPT[3] - 3-4GB range (LAPIC, I/O APIC, other MMIO)
-        let pdpt_3: u64 = vmm_get_entry(kernel_pdpt, 3)
-        if (pdpt_3 & PTE_PRESENT) != 0
-            vmm_set_entry(new_pdpt, 3, pdpt_3 & ~PTE_USER)
-
-        # Set PML4[0] to point to our new PDPT (without USER bit)
-        vmm_set_entry(new_pml4, 0, new_pdpt | PTE_PRESENT | PTE_WRITABLE)
-
     # Copy kernel mappings (upper half of address space)
     # PML4 indices 256-511 map addresses 0xFFFF800000000000 and above
     # This includes:
+    #   - Physmap (PML4[256]) and MMIO window (PML4[257])
     #   - Higher-half kernel code/data (0xFFFFFFFF80000000)
     #   - Kernel heap (0xFFFFFFFFC0000000)
     i = 256
@@ -898,7 +872,23 @@ pub fn vmm_create_user_pml4() -> u64
             vmm_set_entry(new_pml4, i, entry & ~PTE_USER)
         i = i + 1
 
+    # The lower half must be empty: vmm_alloc_table zeroed it and nothing
+    # above touches it. Fail loudly if that ever stops being true.
+    if vmm_lower_half_present(new_pml4)
+        prints("[vmm] user PML4 shares an entry below 256\n")
+        vmm_free_pml4(new_pml4)
+        return 0
+
     return new_pml4
+
+# True if any PML4 entry below the kernel half (index 256) is present.
+fn vmm_lower_half_present(pml4: u64) -> bool
+    var i: u64 = 0
+    while i < 256
+        if (vmm_get_entry(pml4, i) & PTE_PRESENT) != 0
+            return true
+        i = i + 1
+    return false
 
 # Switch to a different page table (set CR3)
 # pml4_phys: physical address of new PML4
@@ -976,9 +966,8 @@ pub fn vmm_map_page_in(pml4: u64, vaddr: u64, paddr: u64, flags: u64) -> i32
 # Free all user-space pages in a page table (for process cleanup)
 # Does NOT free the kernel mappings or the PML4 itself
 #
-# IMPORTANT: vmm_create_user_pml4 copies kernel PDPT entries [0] and [3] into
-# the child's PML4[0] PDPT. These point to SHARED kernel page tables that must
-# NOT be freed! We only free entries that were allocated for the child process.
+# Every PDPT below PML4[0..255] is the process's own: vmm_create_user_pml4
+# shares nothing below PML4[256] (AGAST #1878), so each is freed whole.
 pub fn vmm_free_user_pages(pml4: u64) -> i32
     # User space is in the lower half (PML4 indices 0-255)
     # Walk each level and free pages
@@ -992,24 +981,22 @@ pub fn vmm_free_user_pages(pml4: u64) -> i32
 
         # Free the PDPT subtree, then the PDPT itself (allocated by vmm_create_user_pml4)
         let pdpt_phys: u64 = pml4_entry & PTE_ADDR_MASK
-        vmm_free_user_pdpt(pdpt_phys, pml4_idx == 0)
+        vmm_free_user_pdpt(pdpt_phys)
         pmm_free_page(pdpt_phys)
         pml4_idx = pml4_idx + 1
 
     return 0
 
 # Free every user PD subtree below a PDPT (not the PDPT page itself).
-# is_pml4_zero: this PDPT hangs off PML4[0], whose entries [0] and [3] are
-# copies of kernel entries pointing at SHARED page tables (identity mapping
-# and APIC/MMIO regions). We must NOT free these!
-fn vmm_free_user_pdpt(pdpt_phys: u64, is_pml4_zero: bool) -> i32
+# The PDPT belongs to the process alone, so every present non-huge entry is
+# freed (AGAST #1878 removed the shared identity/APIC entries this used to
+# skip).
+fn vmm_free_user_pdpt(pdpt_phys: u64) -> i32
     var pdpt_idx: u64 = 0
     while pdpt_idx < 512
         let pdpt_entry: u64 = vmm_get_entry(pdpt_phys, pdpt_idx)
-        let shared: bool = is_pml4_zero and (pdpt_idx == 0 or pdpt_idx == 3)
-        # Skip shared kernel entries, absent entries, and 1GB pages (usually
-        # the kernel identity mapping)
-        if not shared and (pdpt_entry & PTE_PRESENT) != 0 and (pdpt_entry & PTE_HUGE) == 0
+        # Skip absent entries and 1GB pages
+        if (pdpt_entry & PTE_PRESENT) != 0 and (pdpt_entry & PTE_HUGE) == 0
             let pd_phys: u64 = pdpt_entry & PTE_ADDR_MASK
             vmm_free_user_pd(pd_phys)
             # Free the PD itself

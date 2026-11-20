@@ -165,7 +165,9 @@ pub fn pmm_free_page(addr: u64) -> i32
 """
 
 # Identity mapping, as on the kernel's low-memory direct map: a page's host
-# address is the address handed to the device.
+# address is the address handed to the device. The driver reaches MMIO and
+# queue pages through the kernel half (AGAST #1878); here both windows are
+# the identity, so the emulated device sees the addresses it expects.
 VMM_STUB = """\
 pub const PTE_WRITABLE: u64 = 2
 
@@ -174,6 +176,12 @@ pub fn vmm_virt_to_phys(vaddr: u64) -> u64
 
 pub fn vmm_map_page(virt: u64, phys: u64, flags: u64) -> i32
     return 0
+
+pub fn vmm_map_mmio(paddr: u64, size: u64) -> u64
+    return paddr
+
+pub fn phys_to_virt(paddr: u64) -> u64
+    return paddr
 """
 
 # The emulated ENA. Its register file is BAR0; a doorbell write is followed by

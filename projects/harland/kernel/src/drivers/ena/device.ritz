@@ -48,7 +48,7 @@ import drivers.ena.io_desc {
     ena_rx_cdesc_phase_matches, ena_rx_cdesc_get_length, ena_rx_cdesc_get_req_id
 }
 import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
-import mm.vmm { vmm_virt_to_phys, vmm_map_page, PTE_WRITABLE }
+import mm.vmm { vmm_virt_to_phys, vmm_map_mmio, phys_to_virt }
 
 # ============================================================================
 # Configuration Constants
@@ -133,7 +133,7 @@ struct EnaIoCq
 
 pub struct EnaDevice
     pci_dev: *PciDevice
-    bar0: u64                     # MMIO base address (from BAR0)
+    bar0: u64                     # MMIO base (kernel virtual, MMIO window)
     bar0_size: u64
     admin_queue: EnaAdminQueue
     aenq: EnaAenq                 # Async Event Notification Queue
@@ -394,10 +394,10 @@ fn ena_admin_queue_init(dev: *EnaDevice) -> i32
         prints("[ena] ERROR: Failed to allocate admin SQ\n")
         return -1
 
-    (*aq).sq_entries = sq_page as *EnaAdminAqEntry
-    (*aq).sq_phys = vmm_virt_to_phys(sq_page)
-    if (*aq).sq_phys == 0
-        (*aq).sq_phys = sq_page  # Identity mapped
+    # The device is told the physical pages; the CPU reaches them through
+    # the physmap (AGAST #1878).
+    (*aq).sq_entries = phys_to_virt(sq_page) as *EnaAdminAqEntry
+    (*aq).sq_phys = sq_page
 
     # Allocate admin CQ memory
     let cq_size: u64 = (ENA_ADMIN_CQ_DEPTH * ENA_ADMIN_ACQ_ENTRY_SIZE) as u64
@@ -406,16 +406,14 @@ fn ena_admin_queue_init(dev: *EnaDevice) -> i32
         prints("[ena] ERROR: Failed to allocate admin CQ\n")
         return -1
 
-    (*aq).cq_entries = cq_page as *EnaAdminAcqEntry
-    (*aq).cq_phys = vmm_virt_to_phys(cq_page)
-    if (*aq).cq_phys == 0
-        (*aq).cq_phys = cq_page
+    (*aq).cq_entries = phys_to_virt(cq_page) as *EnaAdminAcqEntry
+    (*aq).cq_phys = cq_page
 
     # Zero out the queues
     var i: u64 = 0
     while i < PAGE_SIZE
-        *((sq_page + i) as *u8) = 0
-        *((cq_page + i) as *u8) = 0
+        *((phys_to_virt(sq_page) + i) as *u8) = 0
+        *((phys_to_virt(cq_page) + i) as *u8) = 0
         i = i + 1
 
     # Initialize queue state
@@ -486,15 +484,13 @@ fn ena_aenq_init(dev: *EnaDevice) -> i32
         prints("[ena] ERROR: Failed to allocate AENQ\n")
         return -1
 
-    (*aenq).entries = aenq_page as *EnaAdminAenqEntry
-    (*aenq).phys = vmm_virt_to_phys(aenq_page)
-    if (*aenq).phys == 0
-        (*aenq).phys = aenq_page  # Identity mapped
+    (*aenq).entries = phys_to_virt(aenq_page) as *EnaAdminAenqEntry
+    (*aenq).phys = aenq_page
 
     # Zero out the queue
     var i: u64 = 0
     while i < PAGE_SIZE
-        *((aenq_page + i) as *u8) = 0
+        *((phys_to_virt(aenq_page) + i) as *u8) = 0
         i = i + 1
 
     # Initialize AENQ state
@@ -836,10 +832,8 @@ fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *
         prints("[ena] ERROR: Failed to allocate CQ memory\n")
         return -1
 
-    (*cq_out).entries = cq_page as *EnaRxCdescBase
-    (*cq_out).phys = vmm_virt_to_phys(cq_page)
-    if (*cq_out).phys == 0
-        (*cq_out).phys = cq_page
+    (*cq_out).entries = phys_to_virt(cq_page) as *EnaRxCdescBase
+    (*cq_out).phys = cq_page
     (*cq_out).depth = depth
     (*cq_out).head = 0
     (*cq_out).phase = 1
@@ -847,7 +841,7 @@ fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *
     # Zero out CQ
     var i: u64 = 0
     while i < PAGE_SIZE
-        *((cq_page + i) as *u8) = 0
+        *((phys_to_virt(cq_page) + i) as *u8) = 0
         i = i + 1
 
     # Build admin command
@@ -917,10 +911,8 @@ fn ena_create_sq(dev: *EnaDevice, qid: u16, cq_idx: u16, direction: u8, depth: u
         prints("[ena] ERROR: Failed to allocate SQ memory\n")
         return -1
 
-    (*sq_out).entries = sq_page as *EnaTxDesc
-    (*sq_out).phys = vmm_virt_to_phys(sq_page)
-    if (*sq_out).phys == 0
-        (*sq_out).phys = sq_page
+    (*sq_out).entries = phys_to_virt(sq_page) as *EnaTxDesc
+    (*sq_out).phys = sq_page
     (*sq_out).depth = depth
     (*sq_out).head = 0
     (*sq_out).tail = 0
@@ -929,7 +921,7 @@ fn ena_create_sq(dev: *EnaDevice, qid: u16, cq_idx: u16, direction: u8, depth: u
     # Zero out SQ
     var i: u64 = 0
     while i < PAGE_SIZE
-        *((sq_page + i) as *u8) = 0
+        *((phys_to_virt(sq_page) + i) as *u8) = 0
         i = i + 1
 
     # Build admin command
@@ -1125,27 +1117,22 @@ pub fn ena_init() -> i32
     serial_print_dec(ena_dev.bar0_size)
     prints("\n")
 
-    # Map the ENA MMIO region (BAR0) into virtual memory
-    # Identity map the BAR0 pages so we can access the registers
-    let bar0_page: u64 = ena_dev.bar0 & 0xFFFFFFFFFFFFF000  # Page-align
-    var num_pages: u64 = (ena_dev.bar0_size + PAGE_SIZE - 1) / PAGE_SIZE
-    if num_pages < 4
-        num_pages = 4  # Minimum 4 pages (16KB) for ENA registers
-
+    # Map the ENA MMIO region (BAR0) through the kernel MMIO window. It was
+    # identity-mapped before AGAST #1878; a process's address space has no
+    # identity map, and the driver runs during syscalls.
+    var map_size: u64 = ena_dev.bar0_size
+    if map_size < 4 * PAGE_SIZE
+        map_size = 4 * PAGE_SIZE  # Minimum 16KB for ENA registers
     prints("[ena] Mapping ")
-    serial_print_dec(num_pages)
+    serial_print_dec((map_size + PAGE_SIZE - 1) / PAGE_SIZE)
     prints(" pages for BAR0 MMIO\n")
-
-    var page_idx: u64 = 0
-    while page_idx < num_pages
-        let addr: u64 = bar0_page + (page_idx * PAGE_SIZE)
-        let map_result: i32 = vmm_map_page(addr, addr, PTE_WRITABLE)
-        if map_result != 0
-            prints("[ena] Failed to map BAR0 page at 0x")
-            serial_print_hex(addr)
-            prints("\n")
-            return -1
-        page_idx = page_idx + 1
+    let bar0_virt: u64 = vmm_map_mmio(ena_dev.bar0, map_size)
+    if bar0_virt == 0
+        prints("[ena] Failed to map BAR0 at 0x")
+        serial_print_hex(ena_dev.bar0)
+        prints("\n")
+        return -1
+    ena_dev.bar0 = bar0_virt
     prints("[ena] BAR0 MMIO region mapped\n")
 
     # Read version registers

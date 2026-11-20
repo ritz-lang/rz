@@ -19,9 +19,9 @@ pub const PAGE_SHIFT: u64 = 12
 # ceiling is what the physmap can reach: PML4[256], 512 GiB, a 16 MiB bitmap.
 pub const PMM_MAX_PAGES: u64 = 134217728
 
-# The bitmap is reached through the identity map, which every address space
-# has below 1 GiB (the boot map on Multiboot2, process PML4s): it must end
-# there.
+# Until the physmap is up the bitmap is reached through the boot identity
+# map, so it must end below 1 GiB; afterwards just below the top of RAM would
+# do, but keeping it in the first GiB costs nothing.
 const PMM_BITMAP_LIMIT: u64 = 0x40000000
 
 # ============================================================================
@@ -191,9 +191,20 @@ pub const BOOT_PROTOCOL_HARLAND: u32 = 2
 # PMM State
 # ============================================================================
 
-# Bitmap: 1 bit per page, 1 = free, 0 = used. Lives at pmm_bitmap_addr
-# (identity-mapped) and tracks pmm_bitmap_pages pages.
+# Bitmap: 1 bit per page, 1 = free, 0 = used. Lives at physical
+# pmm_bitmap_addr and tracks pmm_bitmap_pages pages.
 var pmm_bitmap_addr: u64 = 0
+
+# vmm owns the physmap and imports pmm, so pmm cannot import it back (no
+# import cycles). vmm tells us the direct map's offset once PML4[256] is up;
+# before that it is 0 and the boot identity map reaches the bitmap. Every
+# process shares PML4[256], so this is valid whatever CR3 is loaded (AGAST
+# #1878: process PML4s no longer carry the identity map).
+var pmm_physmap_offset: u64 = 0
+
+pub fn pmm_set_physmap_offset(offset: u64) -> i32
+    pmm_physmap_offset = offset
+    return 0
 var pmm_bitmap_pages: u64 = 0
 var pmm_total_pages: u64 = 0
 var pmm_free_pages: u64 = 0
@@ -225,7 +236,7 @@ var pmm_site: u64 = 0
 # ============================================================================
 
 fn pmm_byte(page: u64) -> *u8
-    return (pmm_bitmap_addr + page / 8) as *u8
+    return (pmm_bitmap_addr + pmm_physmap_offset + page / 8) as *u8
 
 # Set a bit (mark page as free)
 fn pmm_set_bit(page: u64) -> i32
@@ -269,7 +280,7 @@ pub fn pmm_init(bitmap: *u8, max_pages: u64) -> i32
     let bytes: u64 = (pages + 7) / 8
     var i: u64 = 0
     while i < bytes
-        let b: *u8 = (pmm_bitmap_addr + i) as *u8
+        let b: *u8 = (pmm_bitmap_addr + pmm_physmap_offset + i) as *u8
         *b = 0
         i = i + 1
     pmm_total_pages = 0
