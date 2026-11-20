@@ -461,6 +461,9 @@ def _assert_refused(compiler, tmp_path, name, marked, message):
         assert comp.returncode != 0, f"{compiler} accepted {name}:\n{src}"
         assert not ll.exists()
     found = re.findall(r"main\.ritz:(\d+:\d+): (?:error: )?(.*)", out)
+    # AGAST #1819: a parse diagnostic may end with `; expected one of: ...`;
+    # the row pins the message, not the grammar's FIRST set.
+    found = [(at, msg.split("; expected ")[0]) for at, msg in found]
     assert (where, message) in found, f"{compiler}: {name}, wanted {where}:\n{src}\n{out[-2000:]}"
 
 

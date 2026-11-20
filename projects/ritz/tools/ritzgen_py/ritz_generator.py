@@ -236,6 +236,43 @@ class RitzGenerator:
                 self._emit(f'const TOK_{name}: i32 = {tid}')
             self._emit('')
 
+        # AGAST #1819: kind -> printable spelling, for the "expected ..." half
+        # of a located parse error.  Generated here so it cannot drift from
+        # the %tokens section; regex tokens get a word, literals their text.
+        FRIENDLY = {
+            'EOF': 'end of file',
+            'NEWLINE': 'end of line',
+            'INDENT': 'indent',
+            'DEDENT': 'dedent',
+            'ERROR': 'token',
+            'SKIP': 'token',
+            'IDENT': 'identifier',
+            'NUMBER': 'number',
+            'FLOAT': 'number',
+            'INT': 'number',
+            'STRING': 'string',
+            'CSTRING': 'c string',
+            'CHAR': 'character',
+            'ASM_LINE': 'asm text',
+        }
+        self._emit('')
+        self._emit('# AGAST #1819: the spelling of a token kind, for diagnostics.')
+        self._emit('pub fn tok_display_name(kind: i32) -> *u8')
+        for tid, name in [(HAND_WRITTEN_TOKEN_IDS[b], b) for b in builtins]:
+            self._emit(f'    if kind == TOK_{name}')
+            self._emit(f'        return c"{FRIENDLY[name]}"')
+        for tid, name in all_user_toks:
+            tok = next(t for t in self.grammar.tokens if t.name == name)
+            if tok.is_skip:
+                continue
+            if tok.is_literal:
+                text = tok.pattern
+            else:
+                text = FRIENDLY.get(name, name.lower().replace('_', ' '))
+            self._emit(f'    if kind == TOK_{name}')
+            self._emit(f'        return c"{text}"')
+        self._emit('    return c"token"')
+
         # Token struct
         self._emit('# Token structure')
         self._emit('struct Token')
@@ -455,6 +492,11 @@ class RitzGenerator:
         self._emit('    p.var_fn_sig = null')
         # AGAST #2943: furthest token reached, for dropped-item diagnostics.
         self._emit('    p.max_pos = 0')
+        # AGAST #1819: farthest expected-token failure; -1 = none yet.
+        self._emit('    p.fail_pos = -1')
+        self._emit('    p.fail_b0 = 0 as u64')
+        self._emit('    p.fail_b1 = 0 as u64')
+        self._emit('    p.fail_b2 = 0 as u64')
 
     def _generate_parser_helpers(self):
         self._emit('pub fn p_peek(p: *Parser) -> i32')
@@ -477,6 +519,9 @@ class RitzGenerator:
         self._emit('    if p_peek(p) == kind')
         self._emit('        p_advance(p)')
         self._emit('        return 1')
+        # AGAST #1819: remember what a failure here wanted, at the farthest
+        # token the parse reached, for the located "expected ..." list.
+        self._emit('    p_record_fail(p, kind)')
         self._emit('    return 0')
         self._emit('')
         self._emit('fn p_current_token(p: *Parser) -> Token')
@@ -723,6 +768,11 @@ class RitzGenerator:
                     self._emit(f'        p_advance(p)')
                 else:
                     self._emit(f'    while 1 == 1')
+                    # AGAST #1819: a dropped-item diagnostic is about the item
+                    # that just failed, not about a deeper speculative failure
+                    # left behind by one that parsed.
+                    if sym.name in self.grammar.recovery:
+                        self._emit(f'        p_clear_fail(p)')
                     self._emit(f'        if parse_{sym.name}(p) == 0')
                     self._emit(f'            p.error = 0')
                     self._emit(f'            break')

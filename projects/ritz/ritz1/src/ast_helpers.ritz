@@ -1113,6 +1113,70 @@ fn eprint_legacy_amp_type(p: *Parser, fail_at: i32, kind: i32)
 # attempt reached (the `>>` of `Vec<*Vec<i32>>`, not the fn holding it), and
 # a note names the item.  When nothing past the item's first token was
 # consumed there is no deeper point, and the item itself is the error.
+# AGAST #1819: the farthest EXPECTED-token failure, for the located parse
+# error's "expected ..." half.  p_expect calls p_record_fail with the kind it
+# wanted; only kinds wanted at the farthest token the parse reached are kept
+# (a rewind does not lower the mark, exactly as with max_pos).  The mark is
+# reset per top-level item by the generated item loop, so one item's
+# speculative failures cannot leak into the next one's diagnostic.
+pub fn p_clear_fail(p: *Parser) -> i32
+    p.fail_pos = -1
+    p.fail_b0 = 0 as u64
+    p.fail_b1 = 0 as u64
+    p.fail_b2 = 0 as u64
+    0
+
+pub fn p_record_fail(p: *Parser, kind: i32) -> i32
+    if kind < 0 or kind > 191
+        return 0
+    if p.fail_pos < 0 or p.pos > p.fail_pos
+        p.fail_pos = p.pos
+        p.fail_b0 = 0 as u64
+        p.fail_b1 = 0 as u64
+        p.fail_b2 = 0 as u64
+    else if p.pos < p.fail_pos
+        return 0
+    if kind < 64
+        p.fail_b0 = p.fail_b0 | ((1 as u64) << (kind as u64))
+    else if kind < 128
+        p.fail_b1 = p.fail_b1 | ((1 as u64) << ((kind - 64) as u64))
+    else
+        p.fail_b2 = p.fail_b2 | ((1 as u64) << ((kind - 128) as u64))
+    1
+
+fn fail_bit(p: *Parser, kind: i32) -> i32
+    if kind < 64
+        return ((p.fail_b0 >> (kind as u64)) & (1 as u64)) as i32
+    if kind < 128
+        return ((p.fail_b1 >> ((kind - 64) as u64)) & (1 as u64)) as i32
+    ((p.fail_b2 >> ((kind - 128) as u64)) & (1 as u64)) as i32
+
+# `; expected one of: fn, struct, ...` — nothing when the parse recorded no
+# failed expectation (e.g. a locate-only refusal).
+pub fn p_eprint_expected(p: *Parser)
+    if p.fail_pos < 0
+        return
+    var count: i32 = 0
+    var k: i32 = 0
+    while k < 192
+        if fail_bit(p, k) == 1
+            count = count + 1
+        k = k + 1
+    if count == 0
+        return
+    eprints_cstr(c"; expected ")
+    if count > 1
+        eprints_cstr(c"one of: ")
+    var seen: i32 = 0
+    k = 0
+    while k < 192
+        if fail_bit(p, k) == 1
+            if seen > 0
+                eprints_cstr(c", ")
+            eprints_cstr(tok_display_name(k))
+            seen = seen + 1
+        k = k + 1
+
 pub fn parser_report_dropped_item(p: *Parser) -> i32
     let fail_at: i32 = p.max_pos
     if fail_at > p.pos
@@ -1145,6 +1209,10 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
             parse_error_at(p, fail_at)
             eprints_cstr(c"unexpected ")
             eprint_token_desc(p, fail_at)
+            # Only when the deepest attempt failed exactly here: an
+            # expectation recorded further on describes another token.
+            if p.fail_pos == fail_at
+                p_eprint_expected(p)
         eprintln_cstr(c"")
         eprints_cstr(c"note: ")
         diag_loc(g_parse_file, parse_span_at(p, p.pos))
@@ -1154,7 +1222,12 @@ pub fn parser_report_dropped_item(p: *Parser) -> i32
         parse_error_at(p, p.pos)
     eprints_cstr(c"cannot parse item starting at '")
     eprint_construct(p)
-    eprintln_cstr(c"'")
+    eprints_cstr(c"'")
+    # Nothing past the item's first token was consumed (else the detail line
+    # above already said what was expected where).
+    if fail_at == p.pos
+        p_eprint_expected(p)
+    eprintln_cstr(c"")
     return 1
 
 pub fn module_require_eof(p: *Parser) -> i32

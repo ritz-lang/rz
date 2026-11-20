@@ -149,7 +149,8 @@ def test_parse_error_names_a_layout_token(ritz1_bin, tmp_path):
     proc, src, _out = _compile_ritz1(ritz1_bin, tmp_path, "bad_eol", program)
     err = proc.stderr
     assert proc.returncode != 0, err
-    assert f"{src}:5:" in err and ": error: unexpected end of line\n" in err, err
+    # AGAST #1819: the diagnostic may continue `; expected one of: ...`.
+    assert f"{src}:5:" in err and ": error: unexpected end of line" in err, err
 
 
 @pytest.mark.integration

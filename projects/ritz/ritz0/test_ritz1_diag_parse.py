@@ -116,7 +116,9 @@ def test_error_is_file_line_col_error_message(request, tmp_path, compiler, name)
                           env=env, capture_output=True, text=True, timeout=300)
     err = proc.stderr
     assert proc.returncode != 0, f"{compiler} accepted {name}:\n{err[-1500:]}"
-    want = rf"^\S*unit\.ritz:\d+:\d+: error: {re.escape(message)}$"
+    # AGAST #1819: the located diagnostic may now end with
+    # `; expected one of: ...` (the grammar's FIRST set at the failure).
+    want = rf"^\S*unit\.ritz:\d+:\d+: error: {re.escape(message)}(; .*)?$"
     assert re.search(want, err, re.MULTILINE), f"{compiler}, {name}: want {want!r}:\n{err[-1500:]}"
 
 
