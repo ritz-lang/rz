@@ -135,7 +135,6 @@ fn ref_of_local(loc: *LocalVar, out: *RefTy) -> i32
         if loc.is_lent == 1 or loc.holds_lent_ptr == 1
             return ref_set(out, loc.pointee_type, 0, loc.type_name, loc.type_name_len)
         ref_set(out, t, loc.pointee_type, loc.type_name, loc.type_name_len)
-        out.ptr_pointee = loc.ref_ptr_pointee
         # The `[N]T` it points at, as ref_decl_slot and ref_of_param record
         # it, so `r = @g` into a `*[3]i32` local is judged (AGAST #3636).
         if loc.pointee_type == TYPE_ARRAY
@@ -194,7 +193,6 @@ pub fn rs_loc_new(loc: *LocalVar, name: *u8, len: i32, var_type: i32, type_name:
     loc.inner_pointee_type = TYPE_VOID
     loc.pointee_array_elem_type = TYPE_VOID
     loc.pointee_array_elem_pointee = TYPE_VOID
-    loc.ref_ptr_pointee = TYPE_VOID
 
 # What any other binding (a `for` variable, a match payload, a tuple's) reads
 # as: Sema's own type of it, held as the emitter holds it.
@@ -227,7 +225,14 @@ pub fn ref_of_ident_in(env: *RefEnv, name: *u8, len: i32, out: *RefTy) -> i32
     var is_local: i32 = 0
     let loc: *LocalVar = ref_local_in(env, name, len, @is_local)
     if loc != null
-        return ref_of_local(loc, out)
+        let ok: i32 = ref_of_local(loc, out)
+        # AGAST #2364: the U of an `@*U` / `@&*U` binding is Sema's fact, on
+        # its note.  Nothing on the emitter's lowering path read it.
+        if ok == 1 and env.sm != null and ref_is_pointer(out.kind) == 1
+            let n: *RsNote = rs_note(env.sm, sema_find_local(env.sm, name, len))
+            if n != null
+                out.ptr_pointee = n.ptr_pointee
+        return ok
     if is_local == 1
         return 0
     var g: *GlobalVarDef = null
@@ -539,7 +544,11 @@ pub struct RsNote
     # `let q = h(p)` a `*[N]T` (infer_array_ptr_let), which index_elem, from
     # what's written, can't know; TYPE_VOID otherwise (AGAST #4011).
     infer_view: i32
-    caller_place: i32     # LocalVar.is_caller_place (ref_mark_params)
+    caller_place: i32     # AGAST #2340: a `:&` param's `@x` names the caller's
+    # AGAST #2364: U for an `@*U` / `@&*U` param or local
+    # (Param.param_ref_ptr_pointee, ref_decl_ptr_pointee), TYPE_VOID otherwise.
+    # ref_of_ident_in copies it onto the RefTy; the emitter never read it.
+    ptr_pointee: i32
     # LocalVar.ref_root* (AGAST #2340): the local root this binding definitely
     # refers to, how many loops it was declared in, and what it points at.
     root: *u8
@@ -590,6 +599,7 @@ pub fn rs_note_new(sm: *Sema, v: *SemaVar) -> *RsNote
     n.ref_kind = TYPE_VOID
     n.infer_view = TYPE_VOID
     n.root_pointee = TYPE_VOID
+    n.ptr_pointee = TYPE_VOID
     n
 
 # A fn begins: no note is for any of its bindings yet.
@@ -1100,7 +1110,6 @@ pub fn ref_cast_reads_referent(s: *EmitterState, e: *Expr) -> i32
 pub fn ref_begin_fn(s: *EmitterState, f: *FnDef)
     REF_LAST_LINE = 0
     REF_LAST_COL = 0
-    ref_mark_params(s, f.params)
 
 # AGAST #2364: U for a local declared `@*U` / `@&*U`; TYPE_VOID otherwise.
 pub fn ref_decl_ptr_pointee(stmt: *Stmt) -> i32
@@ -1294,31 +1303,6 @@ pub fn ref_write_is_shared_in(env: *RefEnv, e0: *Expr) -> i32
 # An `@T` doesn't become an `@&T` (LANGUAGE_SPEC §3.2, §13.3, AGAST #2374).  ritz0's
 # twins are TypeChecker._check_borrow, _check_shared_into_mut and _check_receiver,
 # and ritz0/test_at_into_mut.py holds all three compilers to them.
-
-# What a `:&` param or `self:&` names is the caller's (ownership.ritz reads it).
-# A by-value `self` is a local root, as any by-value param is (#2393).
-fn ref_mark_params(s: *EmitterState, p0: *Param)
-    var p: *Param = p0
-    while p != null
-        let idx: i32 = find_local_idx(s, p.name, p.name_len)
-        if idx >= 0
-            let loc: *LocalVar = local_at(s, idx)
-            if p.is_borrow == 1 or loc.holds_lent_ptr == 1
-                loc.is_caller_place = 1
-            if p.param_pointee_type == TYPE_PTR
-                loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # AGAST #2364
-        p = p.next
-
-# After a statement is emitted: a declaration's binding exists now.
-pub fn ref_after_stmt(s: *EmitterState, stmt: *Stmt)
-    if stmt.kind == STMT_VAR_DECL and stmt.var_ref != null
-        ref_keep_ptr_pointee(s, stmt)
-
-# AGAST #2364: the local `stmt` declares keeps its `@&*U`'s U.
-fn ref_keep_ptr_pointee(s: *EmitterState, stmt: *Stmt)
-    let idx: i32 = find_local_idx(s, stmt.var_name, stmt.var_name_len)
-    if idx >= 0
-        local_at(s, idx).ref_ptr_pointee = ref_decl_ptr_pointee(stmt)
 
 # `a` and `ret` point at the same type.
 pub fn ref_same_referent(a: *RefTy, ret: *RefTy) -> i32

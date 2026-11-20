@@ -1307,7 +1307,7 @@ fn rv_walk(sm: *Sema, e: *Expr)
 
 # --- What Sema's scope doesn't keep -------------------------------------------------
 
-# What a `:&` param or `self:&` names is the caller's (ref_mark_params).  A
+# What a `:&` param or `self:&` names is the caller's (AGAST #2340).  A
 # by-value `self` is a local root, as any by-value param is (#2393).
 fn rv_caller_place(p: *Param) -> i32
     (p.is_borrow == 1 or p.is_self_borrow == 1) as i32
@@ -1320,8 +1320,8 @@ fn rv_loc_pointee_array(loc: *LocalVar, size: i32, elem: i32)
         loc.pointee_array_size = size
         loc.pointee_array_elem_type = elem
 
-# The LocalVar emit_fn binds for param `p` (bind_* and mark_lent_param, then
-# ref_mark_params): what ref_check's typing reads of it.
+# The LocalVar emit_fn binds for param `p` (bind_* and mark_lent_param): what
+# ref_check's typing reads of it.
 #
 # In an impl's method (`ib` non-null) emit_impl_method binds a lent `self`
 # one level from its struct as a pointer to the impl's type, whose `@self` is
@@ -1396,7 +1396,6 @@ fn rv_scalar_borrow_loc(p: *Param, loc: *LocalVar) -> i32
             # AGAST #4122: `p:& *[N][M]T` is a plane pointer, as a `p: *[N][M]T` is.
             loc.pointee_array_shape = p.param_pointee_array_shape
             name_array_ptr_param_loc(loc, p)
-            loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # ref_mark_params
             return 2
         let float_or_bool: bool = ipt == TYPE_BOOL or ipt == TYPE_F32 or ipt == TYPE_F64
         if is_borrow_scalar_kind(ipt) == 0 and ipt != TYPE_STRUCT and float_or_bool == false
@@ -1405,15 +1404,12 @@ fn rv_scalar_borrow_loc(p: *Param, loc: *LocalVar) -> i32
             return 0
         rs_loc_new(loc, p.name, p.name_len, TYPE_PTR, p.param_type_name, p.param_type_name_len, ipt, 0, 0)
         loc.inner_ref = p.param_inner_ref
-        loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # ref_mark_params
         return 2
     if param_borrows_struct_ptr_ptr(p) == 1
         rs_loc_new(loc, p.name, p.name_len, TYPE_PTR_PTR, p.param_type_name, p.param_type_name_len, TYPE_PTR, 0, 0)
         if p.param_inner_pointee_type != TYPE_VOID
             loc.inner_pointee_type = p.param_inner_pointee_type
         loc.inner_ref = p.param_inner_ref
-        if pt == TYPE_PTR
-            loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # ref_mark_params
         return 2
     let float_pt: bool = pt == TYPE_F32 or pt == TYPE_F64
     if is_borrow_scalar_kind(pt) == 0 and pt != TYPE_BOOL and float_pt == false
@@ -1423,10 +1419,8 @@ fn rv_scalar_borrow_loc(p: *Param, loc: *LocalVar) -> i32
         loc.is_bool = 1
     1
 
-# mark_lent_param and ref_mark_params, on the image.
+# mark_lent_param, on the image.
 fn rv_mark_lent(p: *Param, loc: *LocalVar)
-    if p.param_pointee_type == TYPE_PTR
-        loc.ref_ptr_pointee = p.param_ref_ptr_pointee   # AGAST #2364
     if (p.is_borrow == 1 or p.is_self_borrow == 1) and loc.var_type == TYPE_MUT_REF
         loc.holds_lent_ptr = 1
     if p.is_borrow != 1 or p.param_type != TYPE_MUT_REF
@@ -1446,6 +1440,8 @@ fn rv_note_params(sm: *Sema, f: *FnDef)
             n.inner_ref = p.param_inner_ref
             n.caller_place = rv_caller_place(p)
             rv_param_loc(p, @n.loc, ib)
+            # AGAST #2364: U of an `@*U` / `@&*U` param, on Sema's note.
+            n.ptr_pointee = p.param_ref_ptr_pointee
             n.fn_sig = p.fn_sig   # set_local_fn_sig
             n.has_fn = 1
             n.has_loc = 1
@@ -1492,14 +1488,12 @@ fn rv_decl_loc(stmt: *Stmt, loc: *LocalVar)
             loc.pointee_array_shape = stmt.var_pointee_array_shape
         name_array_ptr_local(loc, stmt, name, len)
     loc.is_bool = declared_bool
-    if stmt.var_ref != null
-        loc.ref_ptr_pointee = ref_decl_ptr_pointee(stmt)   # ref_after_stmt
 
 # The LocalVar the emitter's inference gives an un-annotated `let x = init`,
 # as far as Sema can tell it: the reference its view makes it (type_ref_view_let),
 # else the type of `init`, else let_check's reading of the binding.  `v` was
 # just bound.
-fn rv_infer_loc(sm: *Sema, stmt: *Stmt, v: *SemaVar, loc: *LocalVar) -> i32
+fn rv_infer_loc(sm: *Sema, stmt: *Stmt, v: *SemaVar, loc: *LocalVar, n: *RsNote) -> i32
     let name: *u8 = stmt.var_name
     let len: i32 = stmt.var_name_len
     # bool_kind can't type the initialiser (BK_UNSURE): the emitter's local
@@ -1514,7 +1508,7 @@ fn rv_infer_loc(sm: *Sema, stmt: *Stmt, v: *SemaVar, loc: *LocalVar) -> i32
         return 1
     if RV_DECL_KIND != TYPE_VOID
         rs_loc_new(loc, name, len, RV_DECL_KIND, RV_DECL_REF.name, RV_DECL_REF.name_len, RV_DECL_REF.pointee, 0, 0)
-        loc.ref_ptr_pointee = RV_DECL_REF.ptr_pointee
+        n.ptr_pointee = RV_DECL_REF.ptr_pointee
         rv_loc_pointee_array(loc, RV_DECL_REF.ref_size, RV_DECL_REF.ref_elem)
         if loc.pointee_type == TYPE_ARRAY
             loc.pointee_array_shape = RV_DECL_REF.ref_shape
@@ -1523,7 +1517,7 @@ fn rv_infer_loc(sm: *Sema, stmt: *Stmt, v: *SemaVar, loc: *LocalVar) -> i32
         let a: *RefTy = @RV_DECL_INIT
         if ref_is_pointer(a.kind) == 1
             rs_loc_new(loc, name, len, a.kind, a.name, a.name_len, a.pointee, 0, 0)
-            loc.ref_ptr_pointee = a.ptr_pointee
+            n.ptr_pointee = a.ptr_pointee
             rv_loc_pointee_array(loc, a.ref_size, a.ref_elem)
             if loc.pointee_type == TYPE_ARRAY
                 loc.pointee_array_shape = a.ref_shape
@@ -1631,9 +1625,11 @@ fn rv_note_decl(sm: *Sema, stmt: *Stmt)
     n.ref_name_len = RV_DECL_REF.name_len
     if stmt.var_declared_type != TYPE_VOID
         rv_decl_loc(stmt, @n.loc)
+        # AGAST #2364: U of a declared `@*U` / `@&*U`, on Sema's note.
+        n.ptr_pointee = ref_decl_ptr_pointee(stmt)
         n.has_loc = 1
     else
-        n.has_loc = rv_infer_loc(sm, stmt, v, @n.loc)
+        n.has_loc = rv_infer_loc(sm, stmt, v, @n.loc, n)
         # The `q#` view add_array_view gives what the inference made a `*[N]T`,
         # which SemaVar.index_elem, from what's written, can't know.
         let lo: *LocalVar = @n.loc
