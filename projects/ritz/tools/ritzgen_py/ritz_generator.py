@@ -635,10 +635,9 @@ class RitzGenerator:
             self._emit('        p.error = 0')
             self._emit(f'        return {recovery_ret}')
 
-        # Final return
+        # Final return.  The old `if p.error == 0 / return X / return X` pair
+        # returned the same value on both paths (AGAST #1819).
         self._emit('')
-        self._emit(f'    if p.error == 0')
-        self._emit(f'        return {default_ret}')
         self._emit(f'    return {default_ret}')
 
     def _generate_alternative(self, rule: GrammarRule, alt: GrammarAlt,
@@ -688,16 +687,29 @@ class RitzGenerator:
 
         symbols = alt.symbols
 
+        # AGAST #1819: capture only what the action reads.  A token capture
+        # is a 40-byte Token copy and two emitted lines; 69% of them used to
+        # be dead.  `$N` in the action is the only way a symbol is read, so
+        # anything else is parsed for its side effects and discarded.
+        used = {int(n) for n in re.findall(r'\$(\d+)', alt.action or '')}
+        if (alt.action is None and len(symbols) == 1
+                and symbols[0].kind == SymbolKind.NONTERMINAL):
+            used.add(1)  # the pass-through `return result_1` reads it
+
+        def is_used(i):
+            return (i + 1) in used
+
         # Emit variable declarations
         for i, sym in enumerate(symbols):
             var_name = f'{prefix}{i+1}'
             var_type = self._symbol_type(sym, rule.name)
-            if sym.kind == SymbolKind.STAR:
-                pass  # Star symbols don't need variables
+            if sym.kind == SymbolKind.STAR or not is_used(i):
+                pass  # Star symbols and unread ones need no variable
             else:
                 self._emit(f'    var {var_name}: {var_type}')
 
-        if symbols:
+        if symbols and any(s.kind != SymbolKind.STAR and is_used(i)
+                           for i, s in enumerate(symbols)):
             self._emit('')
 
         # Parse each symbol
@@ -708,11 +720,13 @@ class RitzGenerator:
 
         for i, sym in enumerate(symbols):
             var_name = f'{prefix}{i+1}'
+            read = is_used(i)
 
             if sym.kind == SymbolKind.TERMINAL:
                 if not had_first_required:
                     # First terminal in this alternative
-                    self._emit(f'    {var_name} = p_current_token(p)')
+                    if read:
+                        self._emit(f'    {var_name} = p_current_token(p)')
                     self._emit(f'    if p_expect(p, TOK_{sym.name}) == 0')
                     self._emit(f'        p.error = 1')
                     if is_multi_alt:
@@ -721,16 +735,18 @@ class RitzGenerator:
                 else:
                     # Subsequent terminal — guarded
                     self._emit(f'    if p.error == 0')
-                    self._emit(f'        {var_name} = p_current_token(p)')
+                    if read:
+                        self._emit(f'        {var_name} = p_current_token(p)')
                     self._emit(f'        if p_expect(p, TOK_{sym.name}) == 0')
                     self._emit(f'            p.error = 1')
                     if is_multi_alt:
                         self._emit(f'            p.pos = start_pos')
 
             elif sym.kind == SymbolKind.NONTERMINAL:
+                call = f'parse_{sym.name}(p)'
                 if not had_first_required:
                     # First nonterminal
-                    self._emit(f'    {var_name} = parse_{sym.name}(p)')
+                    self._emit(f'    {var_name} = {call}' if read else f'    {call}')
                     if is_multi_alt:
                         self._emit(f'    if p.error != 0')
                         self._emit(f'        p.pos = start_pos')
@@ -738,7 +754,7 @@ class RitzGenerator:
                 else:
                     # Subsequent nonterminal — guarded
                     self._emit(f'    if p.error == 0')
-                    self._emit(f'        {var_name} = parse_{sym.name}(p)')
+                    self._emit(f'        {var_name} = {call}' if read else f'        {call}')
                     if is_multi_alt:
                         self._emit(f'        if p.error != 0')
                         self._emit(f'            p.pos = start_pos')
@@ -746,17 +762,23 @@ class RitzGenerator:
             elif sym.kind == SymbolKind.OPTIONAL:
                 sym_type = self._symbol_type(sym, rule.name)
                 default = 'null' if sym_type.startswith('*') else '0 as i32'
-                self._emit(f'    {var_name} = {default}')
+                if read:
+                    self._emit(f'    {var_name} = {default}')
                 if sym.name.isupper():
                     # Optional terminal — peek-based
                     self._emit(f'    if p.error == 0')
                     self._emit(f'        if p_peek(p) == TOK_{sym.name}')
-                    self._emit(f'            {var_name} = p_current_token(p)')
+                    if read:
+                        self._emit(f'            {var_name} = p_current_token(p)')
                     self._emit(f'            p_advance(p)')
                 else:
                     # Optional nonterminal — parse and reset error
                     self._emit(f'    if p.error == 0')
-                    self._emit(f'        {var_name} = parse_{sym.name}(p)  # optional')
+                    call = f'parse_{sym.name}(p)'
+                    if read:
+                        self._emit(f'        {var_name} = {call}  # optional')
+                    else:
+                        self._emit(f'        {call}  # optional')
                     self._emit(f'        p.error = 0')
 
             elif sym.kind == SymbolKind.STAR:
