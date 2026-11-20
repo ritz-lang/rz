@@ -169,6 +169,28 @@ def test_the_emitter_rewrites_nothing():
 
 
 @pytest.mark.unit
+def test_the_emitter_names_tuples_without_writing_the_node():
+    # AGAST #4408 (#1816): the last write-back was tuple literal naming.
+    # tuple_lit_infer / tuple_lit_name wrote a nameless tuple's struct name
+    # into its Expr (`e.ident_ptr`/`e.ident_len`) mid-lowering, once per error
+    # path and once per success path, so a later site in the same emission
+    # read the name off the node.  They now decide the name and return it; the
+    # node is left as the parse built it.  `sub_e` and `id` below are nodes the
+    # emitter builds, so they are not write-backs (emitter_print.ritz's fmt_*
+    # constructors are new nodes too).
+    expr = (SRC / "emitter_expr.ritz").read_text()
+    writes = re.findall(r"^\s+e\.(?:ident_ptr|ident_len)\s*=", expr, re.MULTILINE)
+    assert writes == [], (
+        "emitter_expr.ritz still writes a field of an existing Expr node "
+        f"({len(writes)} sites): tuple naming must return the name, not store it")
+    for fn in ("tuple_lit_infer", "tuple_lit_name"):
+        m = re.search(rf"^(?:pub )?fn {fn}\(.*$", expr, re.MULTILINE)
+        assert m is not None, f"{fn} is gone or renamed"
+        assert "out_name: **u8" in m.group(0), \
+            f"{fn} must return the name through out-params (#1816)"
+
+
+@pytest.mark.unit
 def test_deref_field_types_its_receivers_with_sema_expr_ty():
     # AGAST #3810: `.`'s receiver is typed by sema_expr_ty, and sema_walk
     # binds the locals it used to leave untyped; deref_field keeps no typer

@@ -2640,7 +2640,9 @@ pub fn emit_struct_lit_field_store(s: *EmitterState, st: *StructDef, field_idx: 
     # AGAST #3005: a tuple field (`Box<(u32, u32)> { v: (1, 2) }`, a nested
     # tuple) names a nameless tuple literal.
     if field.field_type == TYPE_STRUCT
-        tuple_lit_name(s, value, field.field_type_name, field.field_type_name_len)
+        var lname: *u8 = null
+        var lname_len: i32 = 0
+        tuple_lit_name(s, value, field.field_type_name, field.field_type_name_len, @lname, @lname_len)
     # A nested literal (`E { name: V { .. } }`) has no value register:
     # emit_expr rejects a bare EXPR_STRUCT_LIT. Write it in place into the
     # field instead, recursively. (AGAST #1655)
@@ -2907,6 +2909,14 @@ fn tuple_elem_type(s: *EmitterState, v: *Expr, f: *StructField, spell: **u8) -> 
         f.field_type = TYPE_STRUCT
         f.field_type_name = v.ident_ptr
         f.field_type_name_len = v.ident_len
+        # A nested nameless tuple was named a moment ago by tuple_lit_infer;
+        # its name lives in the side table, not on the node (AGAST #4408).
+        if v.ident_len == 0
+            var nn: *u8 = null
+            var nnl: i32 = 0
+            if tuple_name_get(v, @nn, @nnl) == 1
+                f.field_type_name = nn
+                f.field_type_name_len = nnl
     else if bool_kind(s, v) == BK_BOOL
         f.field_type = TYPE_BOOL
     else
@@ -2958,9 +2968,38 @@ fn tuple_struct_new(s: *EmitterState, name: *u8, len: i32, fields: *StructField)
     namelist_push(@s.late_tuples, name, len)
     st
 
+# AGAST #4408 (#1816): the name tuple_lit_name decided for a literal is kept
+# here, not written into the Expr.  One emission lowers a literal more than
+# once (a call argument, a field or a match arm names it, then emit_expr names
+# it again), and the first decision must stand -- exactly what the write made
+# true.  This side table is that state without touching the node; ast.ritz
+# (#4407) and emitter_core.ritz (#4404) are other rooms' files.
+var g_tuple_names_on: i32 = 0
+var g_tuple_names: HashMapI64       # a nameless tuple *Expr -> its struct name
+var g_tuple_name_lens: HashMapI64   # the same *Expr -> that name's length
+
+fn tuple_name_note(e: *Expr, name: *u8, len: i32)
+    if g_tuple_names_on == 0
+        g_tuple_names = hashmap_i64_with_cap(1024)
+        g_tuple_name_lens = hashmap_i64_with_cap(1024)
+        g_tuple_names_on = 1
+    hashmap_i64_insert(@&g_tuple_names, e as i64, name as i64)
+    hashmap_i64_insert(@&g_tuple_name_lens, e as i64, len as i64)
+
+# 1 when `e`'s name was already decided this emission, with it in
+# out_name/out_len; 0 when it has none yet.
+fn tuple_name_get(e: *Expr, out_name: **u8, out_len: *i32) -> i32
+    if g_tuple_names_on == 0 or not hashmap_i64_contains(@g_tuple_names, e as i64)
+        return 0
+    *out_name = hashmap_i64_get(@g_tuple_names, e as i64) as *u8
+    *out_len = hashmap_i64_get(@g_tuple_name_lens, e as i64) as i32
+    1
+
 # Name the nameless tuple literal `e` from its elements' types (nested
-# nameless tuples first).  Returns 1 once named; 0 after a located error.
-fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
+# nameless tuples first).  Writes the name to out_name/out_len and returns 1
+# once named; returns 0 after a located error, out_name null.  The name is
+# remembered in the side table, never on the node (AGAST #4408).
+fn tuple_lit_infer(s: *EmitterState, e: *Expr, out_name: **u8, out_len: *i32) -> i32
     let n: i32 = tuple_lit_arity(e)
     let spells: **u8 = malloc((n as i64) * 8) as **u8
     let spell_lens: *i32 = malloc((n as i64) * 4) as *i32
@@ -2971,17 +3010,20 @@ fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
     var fi: *FieldInit = e.args as *FieldInit
     while fi != null
         let v: *Expr = fi.value
-        if tuple_lit_nameless(v) == 1 and tuple_lit_infer(s, v) == 0
-            e.ident_ptr = c"(untyped)"
-            e.ident_len = 9
-            return 0
+        if tuple_lit_nameless(v) == 1
+            var vn: *u8 = null
+            var vl: i32 = 0
+            if tuple_lit_infer(s, v, @vn, @vl) == 0
+                *out_name = null
+                *out_len = 0
+                return 0
         let f: *StructField = calloc(1, sizeof(StructField)) as *StructField
         var sp: *u8 = null
         let sl: i32 = tuple_elem_type(s, v, f, @sp)
         if sl == 0
             emit_nd_error(s, v.span.line, v.span.col, c"ritz1 can't infer the type of this tuple element (a `**T`, a reference, an N-D array, or a value whose type it can't name): give the tuple a type, as `let t: (A, B) = ..`")
-            e.ident_ptr = c"(untyped)"
-            e.ident_len = 9
+            *out_name = null
+            *out_len = 0
             return 0
         if last == null
             fields = f
@@ -3003,28 +3045,44 @@ fn tuple_lit_infer(s: *EmitterState, e: *Expr) -> i32
     *(name + pos) = 0
     if find_struct(s, name, pos) == null
         tuple_struct_new(s, name, pos, fields)
-    e.ident_ptr = name
-    e.ident_len = pos
+    *out_name = name
+    *out_len = pos
+    tuple_name_note(e, name, pos)
     1
 
 # Name `e`, if it is a nameless tuple literal: from the slot struct
 # `slot` / `slot_len` when that is a tuple of as many elements, else from its
-# elements.  Returns 0 after a located error.
-pub fn tuple_lit_name(s: *EmitterState, e: *Expr, slot: *u8, slot_len: i32) -> i32
+# elements.  Writes the decided name to out_name/out_len and returns 1, or
+# returns 0 after a located error with out_name null.  `e` is left as the
+# parse built it (AGAST #4408 / #1816).
+pub fn tuple_lit_name(s: *EmitterState, e: *Expr, slot: *u8, slot_len: i32, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
     if tuple_lit_nameless(e) == 0
+        if e != null
+            *out_name = e.ident_ptr
+            *out_len = e.ident_len
+        return 1
+    # The first site to name this literal fixes it, as the write did.
+    if tuple_name_get(e, out_name, out_len) == 1
         return 1
     let st: *StructDef = tuple_slot_def(s, slot, slot_len, tuple_lit_arity(e))
     if st != null
-        e.ident_ptr = st.name
-        e.ident_len = st.name_len
+        *out_name = st.name
+        *out_len = st.name_len
+        tuple_name_note(e, st.name, st.name_len)
         return 1
-    tuple_lit_infer(s, e)
+    tuple_lit_infer(s, e, out_name, out_len)
 
 # Emit a struct literal into an existing alloca and return the alloca register
 # Used for returning struct literals from functions
 pub fn emit_struct_lit_to_alloca(s: *EmitterState, e: *Expr, alloca_reg: i32) -> i32
-    tuple_lit_name(s, e, null, 0)   # AGAST #3005
-    let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
+    var lname: *u8 = null
+    var lname_len: i32 = 0
+    tuple_lit_name(s, e, null, 0, @lname, @lname_len)   # AGAST #3005
+    var st: *StructDef = null
+    if lname != null
+        st = find_struct(s, lname, lname_len)
     if st == null
         emit_ir_error(s, e.span, c"struct not found for literal")
         return alloca_reg
@@ -3095,8 +3153,12 @@ pub fn emit_struct_lit_zero_omitted(s: *EmitterState, st: *StructDef, e: *Expr, 
 # Unknown struct names are a located error (from emit_struct_lit_to_alloca's
 # lookup), never a silently wrong value. (AGAST #1362)
 fn emit_struct_lit_value(s: *EmitterState, e: *Expr) -> i32
-    tuple_lit_name(s, e, null, 0)   # AGAST #3005
-    let st: *StructDef = find_struct(s, e.ident_ptr, e.ident_len)
+    var lname: *u8 = null
+    var lname_len: i32 = 0
+    tuple_lit_name(s, e, null, 0, @lname, @lname_len)   # AGAST #3005
+    var st: *StructDef = null
+    if lname != null
+        st = find_struct(s, lname, lname_len)
     if st == null
         emit_ir_error(s, e.span, c"struct not found for literal")
         let zero: i32 = next_reg(s)
