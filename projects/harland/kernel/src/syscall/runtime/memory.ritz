@@ -87,21 +87,32 @@ fn mmap_cursor_pick(next: u64, num_pages: u64) -> u64
             i = i + 1
     return addr
 
+# Zero a freshly allocated frame through the physmap before any process can
+# see it: a frame comes back from pmm holding whatever its last owner left,
+# often another process's code or data (AGAST #4332).
+fn zero_user_frame(page_phys: u64)
+    let zero: *u64 = phys_to_virt(page_phys) as *u64
+    var w: i64 = 0
+    while w < 512
+        *(zero + w) = 0
+        w = w + 1
+
 # ============================================================================
 # User Stack Allocation Helper
 # ============================================================================
 #
-# Allocates and maps a multi-page user stack. The stack grows DOWN from
-# USER_STACK_TOP. We allocate USER_STACK_PAGES physical pages and map them
-# contiguously.
+# Allocates, zeroes and maps a multi-page user stack. The stack grows DOWN
+# from USER_STACK_TOP. We allocate USER_STACK_PAGES physical pages and map
+# them contiguously.
 #
-# ============================================================================
-# User Stack Allocation Helper
-# ============================================================================
-#
-# Allocates and maps a multi-page user stack. The stack grows DOWN from
-# USER_STACK_TOP. We allocate USER_STACK_PAGES physical pages and map them
-# contiguously.
+# The pages are zeroed (AGAST #4332): unzeroed, a child's stack leaks the
+# previous owner's bytes, and in the Tier-1 preempt test busy A's stack was a
+# recycled frame that had recently held executable code. QEMU's TCG still had
+# a translation for that physical page, so every store to A's stack took the
+# self-modifying-code slow path: A's eight steps cost 735 timer ticks against
+# B's 98 and the children interleaved as BBBBBBBABAAAAAAA instead of ABAB..
+# Writing the frame through the physmap before mapping it drops TCG's stale
+# translation; zeroing is also what a fresh user stack must be.
 #
 # Returns: Stack pointer (top of usable stack), or 0 on failure
 pub fn alloc_user_stack() -> u64
@@ -120,6 +131,7 @@ pub fn alloc_user_stack() -> u64
                     pmm_free_page(paddr)
                 j = j + 1
             return 0
+        zero_user_frame(phys_page)
 
         # Map page at USER_STACK_BASE + (i * PAGE_SIZE)
         let vaddr: u64 = USER_STACK_BASE + (i * PAGE_SIZE)
@@ -268,11 +280,7 @@ fn sys_mmap_impl(addr_hint: u64, length: u64, prot: u64, flags: u64) -> i64
             mmap_undo(map_addr, i)
             return Errno.NoMem as i64
 
-        let zero: *u64 = phys_to_virt(page_phys) as *u64
-        var w: i64 = 0
-        while w < 512
-            *(zero + w) = 0
-            w = w + 1
+        zero_user_frame(page_phys)
 
         let page_virt: u64 = map_addr + (i * PAGE_SIZE)
         let result: i32 = vmm_map_page(page_virt, page_phys, pte_flags)

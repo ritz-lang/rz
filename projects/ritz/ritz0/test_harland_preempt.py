@@ -286,7 +286,16 @@ def test_tier1_boot_requires_the_busy_lines_to_interleave():
     script = TIER1.read_text()
     fn = script[script.index("preempted() {"):]
     fn = fn[:fn.index("\n}\n")]
-    assert "runs < 3" in fn and 'done != {"A", "B"}' in fn
+    # The bar is 10 runs, not 3 (AGAST #4332): a healthy pair alternates most
+    # steps (14..16), while the two runs of an un-preempted pair, or of the
+    # ritz1/ritz1 regression (BBBBBBBABAAAAAAA), are 2..4. The old threshold
+    # of 3 let that regression pass as 4 runs.
+    assert "runs < 10" in fn and 'done != {"A", "B"}' in fn
+    # The interleave count alone is timing-sensitive, so the script must also
+    # read the scheduler's counters: the regression left one child running
+    # alone for hundreds of ticks (911 ticks / 195 preemptions, ratio 4.7)
+    # where a healthy pair is 1.1..1.5.
+    assert r"\[sched\]" in fn and "preemptions * 3" in fn
     assert r"\[timer\] LAPIC timer" in fn
     for boot in ("native", "grub"):
         assert f"preempted {boot} || rc=1" in script, boot

@@ -63,7 +63,11 @@ FAKE_QEMU = textwrap.dedent("""\
                 "key event code=30 value=1\\n"
                 "[OK] Persistent storage\\n"
                 "[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 100 Hz tick, initial count 625000\\n"
-                "[busy A] 1/2\\n[busy B] 1/2\\n[busy A] 2/2\\n[busy B] 2/2\\n"
+                "[busy A] 1/8\\n[busy B] 1/8\\n[busy A] 2/8\\n[busy B] 2/8\\n"
+                "[busy A] 3/8\\n[busy B] 3/8\\n[busy A] 4/8\\n[busy B] 4/8\\n"
+                "[busy A] 5/8\\n[busy B] 5/8\\n[busy A] 6/8\\n[busy B] 6/8\\n"
+                "[busy A] 7/8\\n[busy B] 7/8\\n[busy A] 8/8\\n[busy B] 8/8\\n"
+                "[sched] 350 ticks, 280 switches, 230 preemptions\\n"
                 "ALL TESTS PASSED\\n"
                 "[exit] init exited with code 0\\n")
     """)

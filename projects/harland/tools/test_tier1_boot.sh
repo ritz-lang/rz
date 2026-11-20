@@ -361,6 +361,12 @@ powered_off() {
 # broken by the other's at least twice (A..B..A or B..A..B). Neither child
 # makes a syscall between lines, so without timer preemption the first runs
 # to its end before the second starts: exactly two runs.
+#
+# The bar is 10 runs, not 3 (AGAST #4332). A healthy pair alternates almost
+# every step (14..16 runs); the two runs of an un-preempted pair (or of the
+# ritz1/ritz1 bug that made one child ~14x slower, BBBBBBBABAAAAAAA) are 2..4.
+# A threshold of 3 let that regression pass as 4 runs; 10 is far above both
+# failure shapes and below every measured healthy pairing.
 preempted() {
     local log="$WORK/$1.log"
     if ! grep -aqE '\[timer\] LAPIC timer [0-9]+ Hz .*periodic [0-9]+ Hz tick' "$log"; then
@@ -380,10 +386,27 @@ order = "".join(seq)
 if done != {"A", "B"}:
     print(f"FAIL ({name}): busy children did not both finish (progress: {order or 'none'})")
     sys.exit(1)
-if runs < 3:
-    print(f"FAIL ({name}): busy children ran one after the other, not preempted ({order})")
+if runs < 10:
+    print(f"FAIL ({name}): busy children barely interleaved, not preempted each step ({order}, {runs} runs)")
     sys.exit(1)
-print(f"PASS ({name}): two busy children preempted each other: {order} ({runs} runs)")
+# The interleave count is timing-sensitive, so also read the scheduler's own
+# counters (AGAST #4332). A healthy pair preempts on almost every timer tick
+# that interrupts ring 3, so the tick:preemption ratio is ~1.1..1.5 whichever
+# compiler built kernel and userland. The bug left one child running alone
+# for hundreds of ticks (911 ticks, 195 preemptions, ratio 4.7) while the fix
+# gives 356/233 (1.5). The ratio is scale-invariant: a loaded host slows the
+# guest and inflates ticks and preemptions together. 3 leaves margin on both
+# sides, and the run count above must pass as well, so neither a lone green
+# boot nor a lucky preemption can wave the regression through.
+sched = re.search(r"\[sched\] (\d+) ticks, (\d+) switches, (\d+) preemptions", text)
+if not sched:
+    print(f"FAIL ({name}): no [sched] tick/preemption counters to check the preempt path")
+    sys.exit(1)
+ticks, switches, preemptions = map(int, sched.groups())
+if preemptions == 0 or ticks > preemptions * 3:
+    print(f"FAIL ({name}): one child ran alone: {ticks} ticks but only {preemptions} preemptions (ratio {ticks / max(preemptions, 1):.1f}; AGAST #4332)")
+    sys.exit(1)
+print(f"PASS ({name}): two busy children preempted each other: {order} ({runs} runs, {ticks} ticks / {preemptions} preemptions)")
 PY
 }
 

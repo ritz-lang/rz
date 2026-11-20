@@ -189,7 +189,12 @@ INIT_EXIT = r"[exit] init exited with code 0, powering off\n"
 # The kernel calibrated its LAPIC tick, and init's two /bin/busy children
 # (Tier-1 `preempt`) ran side by side: their lines interleave (AGAST #3629).
 TIMER_OK = r"[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 100 Hz tick, initial count 625000\n"
-PREEMPT_OK = TIMER_OK + r"[busy A] 1/2\n[busy B] 1/2\n[busy A] 2/2\n[busy B] 2/2\n"
+# A healthy pair alternates almost every step: eight steps each, 16 runs, and
+# the scheduler preempts on most ticks (AGAST #4332 raised the bar from 3 runs
+# and added the counter check, so the fixture must look like a real boot).
+BUSY_OK = "".join(f"[busy A] {step}/8\n[busy B] {step}/8\n" for step in range(1, 9))
+SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions\n"
+PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
 PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SUITE_PASSED + INIT_EXIT
 
 
@@ -421,7 +426,23 @@ def test_busy_children_that_ran_one_after_the_other_fail(tree):
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS (native): init Tier-1 suite" in r.stdout
-    assert "busy children ran one after the other, not preempted (AABB)" in r.stdout
+    assert "busy children barely interleaved, not preempted each step (AABB, 2 runs)" in r.stdout
+
+
+@pytest.mark.integration
+def test_busy_children_interleaved_but_one_ran_alone_fail(tree):
+    """Interleave alone is timing-sensitive (AGAST #4332): the scheduler's own
+    counters must also show it kept preempting. The #4332 regression gave one
+    child 735 user ticks to the other's 98 (911 ticks, 195 preemptions), so the
+    lines still interleaved in spurts but one child ploughed through alone."""
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+              + BUSY_OK
+              + "[sched] 911 ticks, 246 switches, 195 preemptions\n"
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "PASS (native): init Tier-1 suite" in r.stdout
+    assert "one child ran alone: 911 ticks but only 195 preemptions" in r.stdout
 
 
 @pytest.mark.integration
