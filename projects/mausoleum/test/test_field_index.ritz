@@ -1,0 +1,247 @@
+# test/test_field_index.ritz - Tests for the multi-valued field index
+#
+# The field index is what Mausoleum answers "which documents hold this field
+# value" with, so nexus can find a wiki page by slug without scanning the
+# collection (AGAST #3644).  Unlike lib/index.ritz it keeps one entry per
+# (value, document), so the several copies of a slug left by an interrupted
+# save are all found (AGAST #2459's coherence requirement).
+
+import ritzlib.sys
+import ritzlib.str
+import ritzlib.memory
+import ritzlib.strview
+import ritzlib.option
+
+import mausoleum.m7m_types
+import mausoleum.buffer_pool
+import mausoleum.document
+import mausoleum.field_index
+
+const POOL_FRAMES: i32 = 128
+
+fn make_set() -> *FieldIndexSet
+    return field_index_new(POOL_FRAMES)
+
+fn make_doc(id: i64, slug_ptr: *u8, slug_len: i64) -> Document
+    var doc: Document
+    var inv: DocumentId = doc_id_invalid()
+    doc_init(@doc, @inv)
+    var f: Field = field_string(slug_ptr, slug_len)
+    doc_set_field(@doc, "slug", @f)
+    doc.id.value = id
+    doc
+
+fn add_slug(set: *FieldIndexSet, id: i64, slug: StrView) -> i32
+    var doc: Document = make_doc(id, strview_as_ptr(slug), strview_len(slug))
+    return field_index_insert_doc(set, @doc)
+
+fn del_slug(set: *FieldIndexSet, id: i64, slug: StrView) -> i32
+    var doc: Document = make_doc(id, strview_as_ptr(slug), strview_len(slug))
+    return field_index_delete_doc(set, @doc)
+
+fn find(set: *FieldIndexSet, field: StrView, value: StrView, out: *i64, max: i32) -> i32
+    return field_index_find_string(set, strview_as_ptr(field), strview_len(field) as i32, strview_as_ptr(value), strview_len(value) as i32, out, max)
+
+# ============================================================================
+# Life cycle
+# ============================================================================
+
+[[test]]
+fn test_field_index_new_and_destroy() -> i32
+    var set: *FieldIndexSet = make_set()
+    assert set != null
+    assert field_index_count(set) == 0
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_destroy_null_is_safe() -> i32
+    field_index_destroy(null)
+    0
+
+# ============================================================================
+# Creation
+# ============================================================================
+
+[[test]]
+fn test_field_index_create_counts_an_index() -> i32
+    var set: *FieldIndexSet = make_set()
+    assert field_index_create(set, "slug", 4) == ERR_OK
+    assert field_index_count(set) == 1
+    assert field_index_has(set, "slug", 4) == 1
+    assert field_index_has(set, "title", 5) == 0
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_create_is_idempotent() -> i32
+    var set: *FieldIndexSet = make_set()
+    assert field_index_create(set, "slug", 4) == ERR_OK
+    assert field_index_create(set, "slug", 4) == ERR_OK
+    assert field_index_count(set) == 1
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_create_rejects_null_and_long_names() -> i32
+    var set: *FieldIndexSet = make_set()
+    assert field_index_create(null, "slug", 4) == ERR_INVALID
+    assert field_index_create(set, null, 0) == ERR_INVALID
+    # Longer than any document field name.
+    assert field_index_create(set, "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmn", 65) == ERR_INVALID
+    assert field_index_count(set) == 0
+    field_index_destroy(set)
+    0
+
+# ============================================================================
+# Find
+# ============================================================================
+
+[[test]]
+fn test_field_index_find_on_unindexed_field_is_not_found() -> i32
+    var set: *FieldIndexSet = make_set()
+    var ids: [8]i64
+    assert find(set, "slug", "alpha", @ids[0], 8) == ERR_NOT_FOUND
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_find_with_no_match_is_zero() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    assert add_slug(set, 1, "alpha") == ERR_OK
+    var ids: [8]i64
+    assert find(set, "slug", "beta", @ids[0], 8) == 0
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_finds_every_copy_of_a_value() -> i32
+    # Two documents for one slug: a save interrupted between insert and
+    # delete, or two workers saving at once.  Both must be found so a
+    # delete removes both (AGAST #2459).
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    assert add_slug(set, 10, "twice") == ERR_OK
+    assert add_slug(set, 20, "twice") == ERR_OK
+    var ids: [8]i64
+    let n: i32 = find(set, "slug", "twice", @ids[0], 8)
+    assert n == 2
+    assert ids[0] == 10
+    assert ids[1] == 20
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_exact_match_not_prefix() -> i32
+    # Slugs share prefixes ("alpha", "alph", "alpha/beta"); a lookup for
+    # one must not return the others.
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    assert add_slug(set, 1, "alpha/beta") == ERR_OK
+    assert add_slug(set, 2, "alph") == ERR_OK
+    assert add_slug(set, 3, "alpha") == ERR_OK
+    var ids: [8]i64
+    let n: i32 = find(set, "slug", "alpha", @ids[0], 8)
+    assert n == 1
+    assert ids[0] == 3
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_find_respects_max() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    assert add_slug(set, 1, "many") == ERR_OK
+    assert add_slug(set, 2, "many") == ERR_OK
+    assert add_slug(set, 3, "many") == ERR_OK
+    var ids: [8]i64
+    assert find(set, "slug", "many", @ids[0], 2) == 2
+    assert ids[0] == 1
+    assert ids[1] == 2
+    field_index_destroy(set)
+    0
+
+# ============================================================================
+# Maintenance
+# ============================================================================
+
+[[test]]
+fn test_field_index_delete_removes_only_that_copy() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    assert add_slug(set, 10, "twice") == ERR_OK
+    assert add_slug(set, 20, "twice") == ERR_OK
+    assert del_slug(set, 10, "twice") == ERR_OK
+    var ids: [8]i64
+    let n: i32 = find(set, "slug", "twice", @ids[0], 8)
+    assert n == 1
+    assert ids[0] == 20
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_delete_unknown_is_harmless() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    assert del_slug(set, 99, "absent") == ERR_OK
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_update_moves_the_value() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    var old_doc: Document = make_doc(10, c"before", 6)
+    assert field_index_insert_doc(set, @old_doc) == ERR_OK
+
+    var new_doc: Document = make_doc(10, c"after", 5)
+    assert field_index_update_doc(set, @old_doc, @new_doc) == ERR_OK
+
+    var ids: [8]i64
+    assert find(set, "slug", "before", @ids[0], 8) == 0
+    assert find(set, "slug", "after", @ids[0], 8) == 1
+    assert ids[0] == 10
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_document_without_field_is_skipped() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    var doc: Document
+    var inv: DocumentId = doc_id_invalid()
+    doc_init(@doc, @inv)
+    var other: Field = field_string(c"x", 1)
+    doc_set_field(@doc, "title", @other)
+    doc.id.value = 7
+    assert field_index_insert_doc(set, @doc) == ERR_OK
+    var ids: [8]i64
+    assert find(set, "slug", "x", @ids[0], 8) == 0
+    field_index_destroy(set)
+    0
+
+[[test]]
+fn test_field_index_two_indexes_are_independent() -> i32
+    var set: *FieldIndexSet = make_set()
+    field_index_create(set, "slug", 4)
+    field_index_create(set, "title", 5)
+
+    var doc: Document
+    var inv: DocumentId = doc_id_invalid()
+    doc_init(@doc, @inv)
+    var slug: Field = field_string(c"a", 1)
+    var title: Field = field_string(c"b", 1)
+    doc_set_field(@doc, "slug", @slug)
+    doc_set_field(@doc, "title", @title)
+    doc.id.value = 5
+    assert field_index_insert_doc(set, @doc) == ERR_OK
+
+    var ids: [8]i64
+    assert find(set, "slug", "a", @ids[0], 8) == 1
+    assert ids[0] == 5
+    assert find(set, "title", "b", @ids[0], 8) == 1
+    assert ids[0] == 5
+    assert find(set, "title", "a", @ids[0], 8) == 0
+    field_index_destroy(set)
+    0

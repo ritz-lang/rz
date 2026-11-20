@@ -1,0 +1,428 @@
+# lib/field_index.ritz - Multi-valued secondary field index
+#
+# Answers "which documents hold this field value" from a B-tree instead of a
+# collection scan (AGAST #3644).  The index lives entirely in memory, in a
+# buffer pool of its own, so its pages are never written to a data
+# directory: it is derived state, rebuilt from the collection when created
+# (AGAST #3644).
+#
+# Coherence: the index is owned by the server's Collection, and the server
+# is the only writer, so every client sees writes made by every other client
+# on its next request.  A per-client index would not (AGAST #2459).
+#
+# Entry format:
+#   key   = serialized field value || document id (8 bytes, big-endian)
+#   value = one byte (0)
+#
+# The document id in the key makes every entry unique, so the several
+# documents that can hold one value (a save interrupted between its insert
+# and delete, or two writers at once) are all kept.  A lookup is one range
+# scan over the entries sharing the value prefix, not a collection scan.
+#
+# Only equality lookup on string values is exposed (what nexus needs); int,
+# bool and docref values are still indexed so they can match each other.
+
+import ritzlib.memory { malloc, free }
+import ritzlib.str { memcpy }
+import ritzlib.strview { StrView, strview_from_ptr }
+import ritzlib.option
+
+import mausoleum.m7m_types
+import mausoleum.buffer_pool {
+    BufferPool,
+    buffer_pool_new,
+    buffer_pool_destroy
+}
+import mausoleum.btree {
+    BTree,
+    BTreeIter,
+    btree_create,
+    btree_put,
+    btree_delete,
+    btree_scan,
+    btree_iter_valid,
+    btree_iter_key,
+    btree_iter_next,
+    btree_iter_destroy
+}
+import mausoleum.document {
+    Document,
+    Field,
+    FIELD_NULL,
+    FIELD_INT,
+    FIELD_BOOL,
+    FIELD_STRING,
+    FIELD_BYTES,
+    FIELD_DOCREF,
+    doc_get_field
+}
+
+# Indexes one collection can carry.  nexus uses one ("slug").
+pub const MAX_FIELD_INDEXES: i32 = 8
+
+# Longest field name (a document field key).
+pub const MAX_FIELD_INDEX_NAME: i32 = 64
+
+# An index key is a serialized value plus 8 bytes of document id, and the
+# B-tree takes at most 1024.  Value bytes are capped so the result fits.
+const KEY_BUF: i32 = 1024
+const VALUE_MAX: i32 = 1000
+
+# Buffer-pool frames an index set's B-trees may use (2 MiB).  Only allocated
+# when the first index is created.
+const DEFAULT_INDEX_POOL_FRAMES: i32 = 512
+
+# A one-byte entry value: the key carries all the information.
+const ENTRY_VALUE_LEN: i32 = 1
+
+
+# One indexed field and the B-tree of its (value, document id) entries.
+struct FieldIndex
+    field_len: i32
+    field: [64]u8
+    tree: *BTree
+
+
+# The indexes on one collection, and the private pool their pages live in.
+pub struct FieldIndexSet
+    pool: *BufferPool
+    pool_frames: i32
+    indexes: [8]FieldIndex
+    count: i32
+
+
+# ============================================================================
+# Life cycle
+# ============================================================================
+
+# An empty index set.  Its buffer pool is allocated when the first index is
+# created, so a collection without indexes costs nothing.
+pub fn field_index_new(pool_frames: i32) -> *FieldIndexSet
+    var set: *FieldIndexSet = malloc(sizeof(FieldIndexSet)) as *FieldIndexSet
+    if set == null
+        return null
+    set.pool = null
+    set.pool_frames = pool_frames
+    if set.pool_frames <= 0
+        set.pool_frames = DEFAULT_INDEX_POOL_FRAMES
+    set.count = 0
+    set
+
+
+pub fn field_index_destroy(set: *FieldIndexSet)
+    if set == null
+        return
+    var i: i32 = 0
+    while i < set.count
+        if set.indexes[i].tree != null
+            btree_destroy(set.indexes[i].tree)
+            set.indexes[i].tree = null
+        i += 1
+    set.count = 0
+    if set.pool != null
+        buffer_pool_destroy(set.pool)
+        set.pool = null
+    free(set as *u8)
+
+
+# Allocate the private page pool on first use.  ERR_OK, or < 0.
+fn ensure_pool(set: *FieldIndexSet) -> i32
+    if set.pool != null
+        return ERR_OK
+    let opt: Option<*BufferPool> = buffer_pool_new(set.pool_frames)
+    if option_is_none<*BufferPool>(@opt) == 1
+        return ERR_NO_MEMORY
+    set.pool = option_unwrap_or<*BufferPool>(@opt, null)
+    if set.pool == null
+        return ERR_NO_MEMORY
+    ERR_OK
+
+
+# ============================================================================
+# Index creation and lookup
+# ============================================================================
+
+# Index `field[0..field_len)` on `set`.  Idempotent: an existing index is
+# left as it is, so a reconnecting client can ensure it every time.
+# ERR_INVALID for a null/empty/too-long field, ERR_FULL past the limit.
+pub fn field_index_create(set: *FieldIndexSet, field: *u8, field_len: i32) -> i32
+    if set == null or field == null or field_len <= 0
+        return ERR_INVALID
+    if field_len > MAX_FIELD_INDEX_NAME
+        return ERR_INVALID
+    if field_index_find(set, field, field_len) != null
+        return ERR_OK
+    if set.count >= MAX_FIELD_INDEXES
+        return ERR_FULL
+    let pool_rc: i32 = ensure_pool(set)
+    if pool_rc != ERR_OK
+        return pool_rc
+
+    let idx: *FieldIndex = @set.indexes[set.count]
+    idx.field_len = field_len
+    var i: i32 = 0
+    while i < field_len
+        idx.field[i] = *(field + i)
+        i += 1
+    idx.tree = null
+
+    let tree_opt: Option<*BTree> = btree_create(set.pool)
+    if option_is_none<*BTree>(@tree_opt) == 1
+        return ERR_NO_MEMORY
+    idx.tree = option_unwrap_or<*BTree>(@tree_opt, null)
+    if idx.tree == null
+        return ERR_NO_MEMORY
+    set.count += 1
+    ERR_OK
+
+
+# The index on `field`, or null.  Field names compare exactly.
+pub fn field_index_find(set: *FieldIndexSet, field: *u8, field_len: i32) -> *FieldIndex
+    if set == null or field == null or field_len <= 0
+        return null
+    var i: i32 = 0
+    while i < set.count
+        let idx: *FieldIndex = @set.indexes[i]
+        if idx.field_len == field_len
+            var same: bool = true
+            var j: i32 = 0
+            while j < field_len
+                if idx.field[j] != *(field + j)
+                    same = false
+                    break
+                j += 1
+            if same
+                return idx
+        i += 1
+    null
+
+
+pub fn field_index_has(set: *FieldIndexSet, field: *u8, field_len: i32) -> i32
+    if field_index_find(set, field, field_len) != null
+        return 1
+    return 0
+
+
+pub fn field_index_count(set: *FieldIndexSet) -> i32
+    if set == null
+        return 0
+    return set.count
+
+
+# ============================================================================
+# Key encoding
+# ============================================================================
+
+# Write a field value's key prefix, the part a lookup shares.  Returns the
+# number of bytes written, or -1 for a value that can't be indexed.
+fn encode_prefix(f: *Field, buf: *u8, cap: i32) -> i32
+    if f.ftype == FIELD_NULL
+        return -1
+    if cap < 1
+        return -1
+    *(buf + 0) = f.ftype as u8
+    var pos: i32 = 1
+
+    if f.ftype == FIELD_STRING or f.ftype == FIELD_BYTES
+        var len: i32 = f.len_val as i32
+        if len < 0
+            return -1
+        if len > VALUE_MAX
+            len = VALUE_MAX
+        if pos + 2 + len > cap
+            return -1
+        *(buf + pos) = ((len >> 8) & 0xFF) as u8
+        *(buf + pos + 1) = (len & 0xFF) as u8
+        pos += 2
+        if len > 0
+            memcpy(buf + pos, f.ptr_val, len as i64)
+            pos += len
+        return pos
+
+    if f.ftype == FIELD_INT or f.ftype == FIELD_BOOL
+        if pos + 8 > cap
+            return -1
+        var v: i64 = f.int_val
+        if f.ftype == FIELD_INT
+            # Flip the sign bit so signed values sort correctly.
+            v = v ^ 0x8000000000000000
+        var i: i32 = 0
+        while i < 8
+            *(buf + pos + i) = ((v >> ((7 - i) * 8)) & 0xFF) as u8
+            i += 1
+        return pos + 8
+
+    if f.ftype == FIELD_DOCREF
+        if pos + 8 > cap
+            return -1
+        var v: i64 = f.ref_val
+        var i: i32 = 0
+        while i < 8
+            *(buf + pos + i) = ((v >> ((7 - i) * 8)) & 0xFF) as u8
+            i += 1
+        return pos + 8
+
+    return -1
+
+
+# Append `id` big-endian to `buf[pos..]`.  Returns the new length, or -1.
+fn append_id(buf: *u8, pos: i32, id: i64) -> i32
+    if pos + 8 > KEY_BUF
+        return -1
+    var i: i32 = 0
+    while i < 8
+        *(buf + pos + i) = ((id >> ((7 - i) * 8)) & 0xFF) as u8
+        i += 1
+    pos + 8
+
+
+fn decode_id(buf: *u8, off: i32) -> i64
+    var v: i64 = 0
+    var i: i32 = 0
+    while i < 8
+        v = v | ((*(buf + off + i) as i64) << ((7 - i) * 8))
+        i += 1
+    v
+
+
+# ============================================================================
+# Maintenance
+# ============================================================================
+
+# Add `doc`'s indexed values.  A document missing an indexed field (or
+# holding one that can't be indexed) is simply absent from that index.
+# ERR_OK when there is nothing to do.
+pub fn field_index_insert_doc(set: *FieldIndexSet, doc: *Document) -> i32
+    if set == null or doc == null
+        return ERR_INVALID
+    if set.count == 0
+        return ERR_OK
+    var i: i32 = 0
+    while i < set.count
+        let idx: *FieldIndex = @set.indexes[i]
+        var f: Field
+        let name: StrView = strview_from_ptr(@idx.field[0], idx.field_len as i64)
+        if doc_get_field(doc, name, @f) == ERR_OK and f.ftype != FIELD_NULL
+            var key: [KEY_BUF]u8
+            var n: i32 = encode_prefix(@f, @key[0], KEY_BUF)
+            if n > 0
+                n = append_id(@key[0], n, doc.id.value)
+                if n > 0
+                    var val: [1]u8
+                    val[0] = 0
+                    let rc: i32 = btree_put(idx.tree, @key[0], n, @val[0], ENTRY_VALUE_LEN)
+                    if rc != ERR_OK
+                        return rc
+        i += 1
+    ERR_OK
+
+
+# Remove `doc`'s indexed values.  Missing entries are not an error (a
+# document may have been indexed before the field was set, or never).
+pub fn field_index_delete_doc(set: *FieldIndexSet, doc: *Document) -> i32
+    if set == null or doc == null
+        return ERR_INVALID
+    if set.count == 0
+        return ERR_OK
+    var i: i32 = 0
+    while i < set.count
+        let idx: *FieldIndex = @set.indexes[i]
+        var f: Field
+        let name: StrView = strview_from_ptr(@idx.field[0], idx.field_len as i64)
+        if doc_get_field(doc, name, @f) == ERR_OK and f.ftype != FIELD_NULL
+            var key: [KEY_BUF]u8
+            var n: i32 = encode_prefix(@f, @key[0], KEY_BUF)
+            if n > 0
+                n = append_id(@key[0], n, doc.id.value)
+                if n > 0
+                    let rc: i32 = btree_delete(idx.tree, @key[0], n)
+                    if rc != ERR_OK and rc != ERR_NOT_FOUND
+                        return rc
+        i += 1
+    ERR_OK
+
+
+# Move `id`'s indexed values from `old_doc` to `new_doc`.
+pub fn field_index_update_doc(set: *FieldIndexSet, old_doc: *Document, new_doc: *Document) -> i32
+    if set == null or old_doc == null or new_doc == null
+        return ERR_INVALID
+    let del_rc: i32 = field_index_delete_doc(set, old_doc)
+    if del_rc != ERR_OK
+        return del_rc
+    field_index_insert_doc(set, new_doc)
+
+
+# Drop every index: used when maintenance fails, so lookups fall back to a
+# collection scan rather than serve an index that is missing entries.
+pub fn field_index_drop_all(set: *FieldIndexSet)
+    if set == null
+        return
+    var i: i32 = 0
+    while i < set.count
+        if set.indexes[i].tree != null
+            btree_destroy(set.indexes[i].tree)
+            set.indexes[i].tree = null
+        i += 1
+    set.count = 0
+
+
+# ============================================================================
+# Lookup
+# ============================================================================
+
+# Every document holding string `value` in `field`, in ascending document
+# id order, up to `max` of them.  Returns the count, 0 when none match,
+# ERR_NOT_FOUND when the field has no index, or < 0 on failure.
+#
+# Entry keys sort by the serialized value, whose first byte is the type tag
+# and whose string form begins with a 2-byte length.  A range from the
+# value's prefix to the same prefix followed by 8 x 0xFF (larger than any
+# positive document id) therefore covers exactly that value's entries.
+pub fn field_index_find_string(set: *FieldIndexSet, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+    if set == null or out == null or max <= 0
+        return ERR_INVALID
+    let idx: *FieldIndex = field_index_find(set, field, field_len)
+    if idx == null or idx.tree == null
+        return ERR_NOT_FOUND
+    if value_len < 0
+        return ERR_INVALID
+
+    var prefix: [KEY_BUF]u8
+    prefix[0] = FIELD_STRING as u8
+    var len: i32 = value_len
+    if len > VALUE_MAX
+        len = VALUE_MAX
+    if 3 + len > KEY_BUF
+        return ERR_INVALID
+    prefix[1] = ((len >> 8) & 0xFF) as u8
+    prefix[2] = (len & 0xFF) as u8
+    if len > 0 and value != null
+        memcpy(@prefix[3], value, len as i64)
+    let plen: i32 = 3 + len
+
+    # Exclusive upper bound: the prefix followed by the largest id bytes.
+    var end: [KEY_BUF]u8
+    memcpy(@end[0], @prefix[0], plen as i64)
+    var b: i32 = 0
+    while b < 8
+        end[plen + b] = 0xFF
+        b += 1
+
+    let iter_opt: Option<*BTreeIter> = btree_scan(idx.tree, @prefix[0], plen, @end[0], plen + 8)
+    if option_is_none<*BTreeIter>(@iter_opt) == 1
+        return ERR_NO_MEMORY
+    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    if iter == null
+        return ERR_NO_MEMORY
+
+    var n: i32 = 0
+    while btree_iter_valid(iter) != 0 and n < max
+        var kbuf: [KEY_BUF]u8
+        var klen: i32 = 0
+        btree_iter_key(iter, @kbuf[0], @klen)
+        if klen > 8
+            *(out + n) = decode_id(@kbuf[0], klen - 8)
+            n += 1
+        btree_iter_next(iter)
+    btree_iter_destroy(iter)
+    n

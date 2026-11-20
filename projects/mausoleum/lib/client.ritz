@@ -873,3 +873,94 @@ pub fn client_scan(client: *Client, callback: *u8, user_data: *u8) -> i32
 
     client.last_error = PROTO_OK
     return count
+
+# ============================================================================
+# Secondary field index (AGAST #3644)
+# ============================================================================
+
+# Ensure a secondary index on `field`.  Idempotent: the server confirms an
+# existing index without rebuilding.  0 on success, -4 if the server refused
+# (client_last_error says why), other < 0 on a transport failure.
+pub fn client_index_create(client: *Client, field: *u8, field_len: i32) -> i32
+    if client == null or client.connected == 0
+        return -1
+    if field == null or field_len <= 0
+        return -4
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    if build_index_create(client.send_buf, req_id, field, field_len, 0) < 0
+        client.last_error = PROTO_ERR_MESSAGE_TOO_LARGE
+        return -5
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        client.last_error = msgreader_read_i32(@reader)
+        return -4
+    if msg_type != MSG_INDEX_CREATED
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -5
+    client.last_error = PROTO_OK
+    return 0
+
+# Document ids holding string `value` in `field`, up to `max`, in ascending
+# id order.  Returns the count, or < 0: -4 means the server has no index on
+# the field (client_last_error is PROTO_ERR_NO_INDEX), so the caller scans.
+pub fn client_find(client: *Client, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+    if client == null or client.connected == 0
+        return -1
+    if field == null or field_len <= 0 or max < 0 or value_len < 0
+        return -4
+
+    let req_id: i32 = client.next_request_id
+    client.next_request_id += 1
+    if build_find(client.send_buf, req_id, field, field_len, value, value_len) < 0
+        client.last_error = PROTO_ERR_MESSAGE_TOO_LARGE
+        return -5
+
+    if send_message(client) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -2
+
+    var reader: MessageReader
+    if recv_message(client, @reader) < 0
+        client.connected = 0
+        client.last_error = PROTO_ERR_DISCONNECTED
+        return -3
+
+    let msg_type: i32 = msgreader_msg_type(@reader)
+    if msg_type == MSG_ERROR
+        client.last_error = msgreader_read_i32(@reader)
+        return -4
+    if msg_type != MSG_FIND_RESULT
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -5
+
+    let count: i32 = msgreader_read_i32(@reader)
+    if count < 0
+        client.last_error = PROTO_ERR_PROTOCOL
+        return -5
+
+    var i: i32 = 0
+    while i < count
+        let id: i64 = msgreader_read_i64(@reader)
+        if i < max and out != null
+            *(out + i) = id
+        i += 1
+
+    client.last_error = PROTO_OK
+    if count > max
+        return max
+    return count

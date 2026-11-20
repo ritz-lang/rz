@@ -15,6 +15,18 @@ import mausoleum.buffer_pool
 import mausoleum.btree
 import mausoleum.storage
 import mausoleum.document
+import mausoleum.field_index {
+    FieldIndexSet,
+    field_index_new,
+    field_index_destroy,
+    field_index_create,
+    field_index_has,
+    field_index_count,
+    field_index_insert_doc,
+    field_index_delete_doc,
+    field_index_drop_all,
+    field_index_find_string
+}
 
 # ============================================================================
 # Constants
@@ -47,6 +59,11 @@ struct Collection
     collection_id: i32
     next_sequence: i32
     doc_count: i64
+    # Secondary indexes on document fields, maintained by the operations
+    # below (AGAST #3644).  Their pages live in a private pool, so they are
+    # never written to the data directory: an index is derived state, built
+    # from the collection when it is created.
+    indexes: *FieldIndexSet
 
 pub fn collection_init(col: *Collection, pool: *BufferPool, collection_id: i32) -> i32
     if pool == null
@@ -56,6 +73,7 @@ pub fn collection_init(col: *Collection, pool: *BufferPool, collection_id: i32) 
     col.collection_id = collection_id
     col.next_sequence = 1
     col.doc_count = 0
+    col.indexes = field_index_new(0)
 
     # Initialize the B-tree
     let tree_opt = btree_create(pool)
@@ -77,6 +95,9 @@ pub fn collection_open(col: *Collection, pool: *BufferPool, collection_id: i32, 
     col.collection_id = collection_id
     col.next_sequence = meta.next_sequence as i32
     col.doc_count = meta.doc_count
+    # Indexes are in-memory state: a reopened collection starts with none
+    # and a client re-creates the ones it needs (AGAST #3644).
+    col.indexes = field_index_new(0)
     return ERR_OK
 
 # Snapshot what collection_open needs into *out.
@@ -143,6 +164,8 @@ pub fn collection_destroy(col: *Collection)
     if col.tree != null
         btree_destroy(col.tree)
         col.tree = null
+    field_index_destroy(col.indexes)
+    col.indexes = null
 
 # ============================================================================
 # Document Serialization
@@ -662,6 +685,13 @@ pub fn collection_insert(col: *Collection, doc: *Document, out_id: *DocumentId) 
     if result != ERR_OK
         return result
 
+    # Keep every secondary index in step.  If one can't be maintained the
+    # index is dropped instead of failing the write: the document is the
+    # source of truth, and a lookup with no index falls back to a scan.
+    let index_rc: i32 = field_index_insert_doc(col.indexes, doc)
+    if index_rc != ERR_OK
+        field_index_drop_all(col.indexes)
+
     col.doc_count = col.doc_count + 1
     *out_id = doc.id
     return ERR_OK
@@ -725,8 +755,43 @@ pub fn collection_update(col: *Collection, doc: *Document) -> i32
     if result != ERR_OK
         return ERR_NOT_FOUND
 
-    # Store the new version (put overwrites); the old chain goes after.
-    return store_doc(col, @key[0], doc)
+    # Move the index entries from the old version to the new one (AGAST
+    # #3644).  The old document is read first because the store overwrites
+    # it; if the store then fails the old entries are put back.
+    var indexed: bool = col.indexes != null and field_index_count(col.indexes) > 0
+    var old_doc: Document
+    var have_old: bool = false
+    var old_buf: *u8 = null
+    if indexed
+        old_buf = malloc(MAX_DOC_SIZE)
+        if old_buf != null
+            var old_len: i64 = 0
+            if collection_get_raw(col, @doc.id, old_buf, MAX_DOC_SIZE, @old_len) == ERR_OK
+                if doc_deserialize(old_buf, old_len, @old_doc) == ERR_OK
+                    have_old = true
+        if have_old
+            if field_index_delete_doc(col.indexes, @old_doc) != ERR_OK
+                field_index_drop_all(col.indexes)
+                indexed = false
+        else
+            # Can't read the old entries; don't leave a half-updated index.
+            field_index_drop_all(col.indexes)
+            indexed = false
+
+    let store_rc: i32 = store_doc(col, @key[0], doc)
+    if store_rc != ERR_OK
+        if indexed and have_old
+            field_index_insert_doc(col.indexes, @old_doc)   # put them back
+        if old_buf != null
+            free(old_buf)
+        return store_rc
+
+    if indexed
+        if field_index_insert_doc(col.indexes, doc) != ERR_OK
+            field_index_drop_all(col.indexes)
+    if old_buf != null
+        free(old_buf)
+    return ERR_OK
 
 pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
     if col == null or id == null
@@ -736,6 +801,20 @@ pub fn collection_delete(col: *Collection, id: *DocumentId) -> i32
     var key: [8]u8
     var key_ptr: *i64 = @key[0] as *i64
     *key_ptr = id.value
+
+    # Remove the document's index entries while it can still be read
+    # (AGAST #3644).  If they can't be kept exact, drop the index: a
+    # lookup then falls back to a scan.
+    if col.indexes != null and field_index_count(col.indexes) > 0
+        var dbuf: *u8 = malloc(MAX_DOC_SIZE)
+        if dbuf != null
+            var dlen: i64 = 0
+            if collection_get_raw(col, id, dbuf, MAX_DOC_SIZE, @dlen) == ERR_OK
+                var old_doc: Document
+                if doc_deserialize(dbuf, dlen, @old_doc) == ERR_OK
+                    if field_index_delete_doc(col.indexes, @old_doc) != ERR_OK
+                        field_index_drop_all(col.indexes)
+            free(dbuf)
 
     # Delete from B-tree, then give back its overflow chain if it had one.
     let chain: i64 = current_chain(col, @key[0])
@@ -750,6 +829,77 @@ pub fn collection_count(col: *Collection) -> i64
     if col == null
         return 0
     return col.doc_count
+
+# ============================================================================
+# Secondary field indexes (AGAST #3644)
+# ============================================================================
+
+# Index `field` on this collection, building entries for the documents
+# already stored.  Idempotent: an existing index is left alone, so a client
+# can ensure it after every connect.  ERR_INVALID for a bad field name,
+# ERR_FULL past the index limit, < 0 on failure.
+pub fn collection_index_create(col: *Collection, field: *u8, field_len: i32) -> i32
+    if col == null
+        return ERR_INVALID
+    let existed: i32 = field_index_has(col.indexes, field, field_len)
+    let create_rc: i32 = field_index_create(col.indexes, field, field_len)
+    if create_rc != ERR_OK
+        return create_rc
+    if existed == 1
+        return ERR_OK
+
+    # A new index starts empty: build it from the documents already here.
+    let iter_opt = collection_scan(col)
+    if option_is_none<*BTreeIter>(@iter_opt) == 1
+        field_index_drop_all(col.indexes)
+        return ERR_NO_MEMORY
+    let iter: *BTreeIter = option_unwrap_or<*BTreeIter>(@iter_opt, null)
+    let buf: *u8 = malloc(MAX_DOC_SIZE)
+    if buf == null
+        btree_iter_destroy(iter)
+        field_index_drop_all(col.indexes)
+        return ERR_NO_MEMORY
+
+    var build_rc: i32 = ERR_OK
+    while btree_iter_valid(iter) != 0
+        var dlen: i64 = 0
+        if collection_iter_value(col, iter, buf, MAX_DOC_SIZE, @dlen) == ERR_OK
+            var doc: Document
+            if doc_deserialize(buf, dlen, @doc) == ERR_OK
+                build_rc = field_index_insert_doc(col.indexes, @doc)
+                if build_rc != ERR_OK
+                    break
+        btree_iter_next(iter)
+    btree_iter_destroy(iter)
+    free(buf)
+
+    if build_rc != ERR_OK
+        field_index_drop_all(col.indexes)
+        return build_rc
+    return ERR_OK
+
+
+# Drop every index on this collection: a lookup then falls back to a scan
+# rather than answer from an index known to be incomplete.
+pub fn collection_index_drop_all(col: *Collection)
+    if col == null
+        return
+    field_index_drop_all(col.indexes)
+
+
+pub fn collection_index_count(col: *Collection) -> i32
+    if col == null
+        return 0
+    return field_index_count(col.indexes)
+
+
+# Every document holding `value` in string field `field`, up to `max`, in
+# ascending document id order.  Count, 0 for none, ERR_NOT_FOUND when the
+# field has no index, or < 0 on failure.
+pub fn collection_index_find_string(col: *Collection, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+    if col == null
+        return ERR_INVALID
+    return field_index_find_string(col.indexes, field, field_len, value, value_len, out, max)
 
 # Getter for root page ID (from the B-tree)
 pub fn collection_root_page_id(col: *Collection) -> i64

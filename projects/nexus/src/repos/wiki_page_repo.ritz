@@ -2,13 +2,15 @@
 #
 # Data access for wiki pages stored in Mausoleum, through Spire's adapter, or
 # in this process's memory (repos/memory_docs) when nexus runs as one worker
-# with no Mausoleum. Mausoleum has no secondary indexes or update operation
-# yet, which shapes the operations here:
+# with no Mausoleum. Mausoleum has a secondary index but no update operation,
+# which shapes the operations here:
 #
-#   - slug lookups scan the collection, O(pages) per lookup (AGAST #3644
-#     tracks an index). No per-worker index or cache may
-#     answer instead: zeus runs several workers, and one can't see another's
-#     writes (AGAST #2459);
+#   - slug lookups ask Mausoleum's "slug" index which documents hold the slug,
+#     O(log pages) per lookup (AGAST #3644). The index lives on the server,
+#     the only writer, so every worker sees every other worker's writes; a
+#     per-worker index or cache would not (AGAST #2459). The first dial
+#     creates it, the server rebuilds it from the collection if it ever drops
+#     it, and until it exists a lookup falls back to the scan it replaced;
 #   - update writes the new document, then deletes every older one for the
 #     slug, so a page's document id changes on every update. A crash (or a
 #     second worker saving) in between leaves two documents for the slug;
@@ -42,7 +44,10 @@ import spire.repo.mausoleum {
     db_get,
     db_delete,
     db_scan,
-    db_extract_field
+    db_extract_field,
+    db_index_create,
+    db_find_ids,
+    DB_REFUSED
 }
 import mausoleum.document { DocumentId, doc_id_invalid }
 
@@ -74,6 +79,9 @@ pub struct WikiPageRepository
     mem: MemDocs
     connect_error: i32       # the last failed dial's error, 0 if none
     adopted: bool            # "default"'s pages moved here (or being moved)
+    indexed: bool            # this connection has the server's "slug" index
+    index_unsupported: bool  # the server has no secondary indexes: don't ask
+    scans: i64               # collection scans issued (see scan_count)
 
 
 # Create a new repository (not yet connected)
@@ -83,6 +91,9 @@ pub fn wiki_page_repo_new() -> WikiPageRepository
     repo.memory = false
     repo.connect_error = 0
     repo.adopted = false
+    repo.indexed = false
+    repo.index_unsupported = false
+    repo.scans = 0
     repo.db.client = null
     repo.db.connected = 0
     repo
@@ -93,7 +104,11 @@ pub fn wiki_page_repo_new() -> WikiPageRepository
 # fails they stay where they are, and the next dial tries again.
 fn ensure_db(repo: *WikiPageRepository) -> i32
     if db_is_connected(@repo.db) == 1
+        ensure_index(repo)
         return 0
+    # A new connection may reach a server that has no index yet (a restart,
+    # another worker's first dial), so assert it again below.
+    repo.indexed = false
     let rc: i32 = db_connect(@repo.db)
     if rc < 0
         repo.connect_error = rc
@@ -104,7 +119,26 @@ fn ensure_db(repo: *WikiPageRepository) -> i32
         repo.adopted = true
         if adopt_default(repo) < 0
             repo.adopted = false
+    ensure_index(repo)
     0
+
+
+# Best effort: ask the server for the "slug" index, building it from the
+# documents it already holds. A failure is not fatal — a lookup scans instead,
+# and the next dial asks again — so the result only tells callers whether the
+# index is now there. A server that doesn't know the request is remembered
+# (`index_unsupported`) so it is asked once, not on every request.
+fn ensure_index(repo: *WikiPageRepository) -> i32
+    if repo.indexed or repo.index_unsupported or repo.memory
+        return 0
+    if db_is_connected(@repo.db) == 0
+        return 0
+    let rc: i32 = db_index_create(@repo.db, c"slug", 4)
+    if rc == 0
+        repo.indexed = true
+    else if rc == DB_REFUSED
+        repo.index_unsupported = true
+    rc
 
 
 # Open the repository on Mausoleum at host:port and dial it. `encrypted` must
@@ -243,6 +277,7 @@ fn doc_delete(repo: *WikiPageRepository, id: i64) -> i64
 # `reset(user)` runs before each attempt, so a retried scan starts clean.
 fn doc_scan(repo: *WikiPageRepository, step: *u8, reset: *u8, user: *u8) -> i64
     let reset_fn: fn(*u8) -> i32 = reset as fn(*u8) -> i32
+    repo.scans += 1
     if repo.memory
         reset_fn(user)
         return mem_docs_scan(@repo.mem, step, user) as i64
@@ -253,6 +288,33 @@ fn doc_scan(repo: *WikiPageRepository, step: *u8, reset: *u8, user: *u8) -> i64
             reset_fn(user)
             rc = db_scan(@repo.db, step, user) as i64
             if rc >= 0
+                return rc
+            db_close(@repo.db)
+        else
+            rc = UNREACHABLE
+        attempt += 1
+    rc
+
+
+# How many collection scans this repository has issued. A slug lookup must
+# not add to it (AGAST #3644): the count is what proves the index answered.
+pub fn wiki_page_repo_scan_count(repo: *WikiPageRepository) -> i64
+    repo.scans
+
+
+# Document ids holding `slug`, ascending, into `out` (at most `max`).
+# Returns the count, DB_REFUSED when the server has no usable "slug" index
+# (the caller scans), or UNREACHABLE/another error. Dialled again once if the
+# connection had gone stale, like the doc_* helpers.
+fn doc_find(repo: *WikiPageRepository, slug: StrView, out: *i64, max: i32) -> i64
+    var rc: i64 = UNREACHABLE
+    var attempt: i32 = 0
+    while attempt < 2
+        if ensure_db(repo) == 0
+            rc = db_find_ids(@repo.db, c"slug", 4, strview_as_ptr(slug), strview_len(slug) as i32, out, max) as i64
+            if rc >= 0
+                return rc
+            if rc == DB_REFUSED as i64
                 return rc
             db_close(@repo.db)
         else
@@ -336,9 +398,30 @@ fn slug_scan_step(doc_id: i64, data: *u8, len: i32, user_data: *u8) -> i32
     0   # never stop early: every copy counts
 
 
-# Scan for every document holding `slug` into `scan`.
+# Fill `scan` with every document holding `slug`: from the server's "slug"
+# index when it has one (no collection scan), otherwise by scanning.
 fn find_slug(repo: *WikiPageRepository, slug: StrView, scan: *SlugScan) -> Result<(), RepoError>
     scan.slug = slug
+    scan.newest = -1
+    scan.n_ids = 0
+    if not repo.memory and not repo.index_unsupported
+        let found: i64 = doc_find(repo, slug, @scan.ids[0], MAX_COPIES as i32)
+        if found >= 0
+            scan.n_ids = found
+            var i: i64 = 0
+            while i < found
+                # Ids only grow, so the largest is the latest save.
+                if scan.ids[i] > scan.newest
+                    scan.newest = scan.ids[i]
+                i += 1
+            return Ok(())
+        if found == DB_REFUSED as i64
+            # The server dropped the index (maintenance failed, or it was
+            # never built here). Scan now; the next dial rebuilds it.
+            repo.indexed = false
+        # Any other failure falls through too: the scan below redials and
+        # reports the error the way every operation does.
+
     scan.tmp = malloc(strview_len(slug) + 1)
     if scan.tmp == null
         return Err(RepoError.DatabaseError(string_from("Out of memory")))

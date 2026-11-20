@@ -38,7 +38,8 @@ import ritzlib.strview { StrView, strview_from_ptr }
 import mausoleum.client { Client, client_new, client_free }
 import mausoleum.client { client_connect, client_connect_encrypted, client_disconnect, client_is_connected }
 import mausoleum.client { client_insert, client_get, client_delete, client_scan }
-import mausoleum.protocol { MSG_SCAN_RESULT }
+import mausoleum.client { client_index_create, client_find, client_last_error }
+import mausoleum.protocol { MSG_SCAN_RESULT, PROTO_ERR_NO_INDEX, PROTO_ERR_INVALID_MSG_TYPE }
 import mausoleum.m7m_types { ERR_OK }
 import mausoleum.document { Document, DocumentId, Field }
 import mausoleum.document { doc_init, doc_id_invalid, field_string }
@@ -172,6 +173,43 @@ pub fn db_scan(db: *Db, callback: *u8, user_data: *u8) -> i32
     if db.connected == 0
         return -1
     return client_scan(db.client, callback, user_data)
+
+# ============================================================================
+# Secondary indexes
+# ============================================================================
+
+# Returned by db_index_create / db_find_ids when the server does not offer
+# secondary indexes: an older mausoleum without the protocol, or an index
+# the server has dropped.  Callers should fall back to db_scan and retry the
+# index later; do not treat this as a data error.
+pub const DB_REFUSED: i32 = -1001
+
+# Ask the server to index `field`, building it from the documents already
+# stored.  Idempotent — safe to call on every reconnect.
+# Returns 0, DB_REFUSED, or < 0 on a transport/protocol failure.
+pub fn db_index_create(db: *Db, field: *u8, field_len: i32) -> i32
+    if db.connected == 0
+        return -1
+    let rc: i32 = client_index_create(db.client, field, field_len)
+    if rc == -4
+        # The server answered with an error.  An old server does not know
+        # MSG_INDEX_CREATE and says so; that is permanent, not transient.
+        if client_last_error(db.client) == PROTO_ERR_INVALID_MSG_TYPE
+            return DB_REFUSED
+    return rc
+
+# Document ids whose `field` holds string `value`, ascending, up to `max`.
+# Returns the count, DB_REFUSED when there is no such index (so the caller
+# scans), or < 0 on a transport/protocol failure.
+pub fn db_find_ids(db: *Db, field: *u8, field_len: i32, value: *u8, value_len: i32, out: *i64, max: i32) -> i32
+    if db.connected == 0
+        return -1
+    let rc: i32 = client_find(db.client, field, field_len, value, value_len, out, max)
+    if rc == -4
+        let err: i32 = client_last_error(db.client)
+        if err == PROTO_ERR_NO_INDEX or err == PROTO_ERR_INVALID_MSG_TYPE
+            return DB_REFUSED
+    return rc
 
 # ============================================================================
 # Document Helpers

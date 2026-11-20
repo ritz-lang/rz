@@ -34,6 +34,7 @@ import repos.wiki_page_repo {
     wiki_page_repo_open,
     wiki_page_repo_open_memory,
     wiki_page_repo_max_content_len,
+    wiki_page_repo_scan_count,
     MEMORY_MAX_CONTENT_LEN
 }
 import test.support.live_db { LiveDb, live_db_start, live_db_stop, live_db_restart, live_db_start_store, live_db_remove_store }
@@ -805,6 +806,44 @@ fn test_repo_serves_a_page_another_worker_created() -> i32
         rc = insert_page(@b, "made-elsewhere", "hello from worker b")
     if rc == 0 and not serves(@a, "made-elsewhere", "hello from worker b")
         rc = 3
+    live_db_stop(@db)
+    rc
+
+
+# 0 = the lookup reports NotFound; 1 = it found a page or failed otherwise.
+fn expect_missing(repo: *WikiPageRepository, slug: StrView) -> i32
+    match wiki_page_repo_get_by_slug(repo, slug)
+        Ok(got) =>
+            var page: WikiPage = got
+            wiki_page_drop(@page)
+            1
+        Err(e) => expect_not_found(@e)
+
+
+# AGAST #3644: a slug lookup asks the server's index, it does not scan the
+# collection. The scan counter is the proof: it must not move across a hit
+# or a miss.
+[[test]]
+fn test_repo_get_by_slug_does_not_scan_the_collection() -> i32
+    var db: LiveDb
+    if live_db_start(@db) != 0
+        return 90
+    var repo = wiki_page_repo_new()
+    var rc: i32 = connect(@repo, @db)
+    if rc == 0
+        rc = insert_page(@repo, "indexed-slug", "body")
+    var before: i64 = 0
+    if rc == 0
+        before = wiki_page_repo_scan_count(@repo)
+    if rc == 0 and not serves(@repo, "indexed-slug", "body")
+        rc = 3
+    if rc == 0 and wiki_page_repo_scan_count(@repo) != before
+        rc = 4
+    if rc == 0 and expect_missing(@repo, "no-such-page") != 0
+        rc = 5
+    if rc == 0 and wiki_page_repo_scan_count(@repo) != before
+        rc = 6
+    wiki_page_repo_disconnect(@repo)
     live_db_stop(@db)
     rc
 

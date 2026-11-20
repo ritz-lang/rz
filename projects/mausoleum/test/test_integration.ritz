@@ -535,3 +535,101 @@ fn test_doc_over_the_client_buffer_is_refused() -> i32
     let rc: i32 = check_oversize_doc(@srv, 100000)
     server_stop(@srv)
     return rc
+
+# ============================================================================
+# Secondary field index (AGAST #3644)
+# ============================================================================
+#
+# A FIND must answer from an index whose entries the server maintained on
+# every INSERT and DELETE: all copies of a value come back, in id order, and
+# a value held by no document is 0 — never the "no index" refusal.
+
+fn make_string_doc(field: StrView, value: StrView, buf: *u8, cap: i64) -> i64
+    var doc: Document
+    var tmp_id: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp_id)
+    var f: Field = field_string(value.ptr, value.len)
+    doc_set_field(@doc, field, @f)
+    return doc_serialize(@doc, buf, cap)
+
+fn check_field_index(srv: *TestServer) -> i32
+    let client: *Client = connect_client(srv)
+    if client == null
+        return 1
+
+    if client_index_create(client, c"slug", 4) != 0
+        client_free(client)
+        return 2
+
+    var buf: [1024]u8
+    let d1: i64 = make_string_doc("slug", "twice", @buf[0], 1024)
+    if d1 <= 0
+        client_free(client)
+        return 3
+    let id1: i64 = client_insert(client, @buf[0], d1 as i32)
+    if id1 < 0
+        client_free(client)
+        return 4
+    let d2: i64 = make_string_doc("slug", "twice", @buf[0], 1024)
+    let id2: i64 = client_insert(client, @buf[0], d2 as i32)
+    if id2 < 0
+        client_free(client)
+        return 5
+    let d3: i64 = make_string_doc("slug", "only", @buf[0], 1024)
+    let id3: i64 = client_insert(client, @buf[0], d3 as i32)
+    if id3 < 0
+        client_free(client)
+        return 6
+
+    var ids: [8]i64
+    let n: i32 = client_find(client, c"slug", 4, c"twice", 5, @ids[0], 8)
+    if n != 2
+        client_free(client)
+        return 7
+    if ids[0] != id1 or ids[1] != id2
+        client_free(client)
+        return 8
+    if client_find(client, c"slug", 4, c"only", 4, @ids[0], 8) != 1
+        client_free(client)
+        return 9
+    if client_find(client, c"slug", 4, c"absent", 6, @ids[0], 8) != 0
+        client_free(client)
+        return 10
+    # No index on another field: the client is told to scan instead.
+    if client_find(client, c"title", 5, c"x", 1, @ids[0], 8) >= 0
+        client_free(client)
+        return 11
+    if client_last_error(client) != PROTO_ERR_NO_INDEX
+        client_free(client)
+        return 12
+
+    # A delete removes exactly one copy from the index.
+    if client_delete(client, id1) != 1
+        client_free(client)
+        return 13
+    if client_find(client, c"slug", 4, c"twice", 5, @ids[0], 8) != 1
+        client_free(client)
+        return 14
+    if ids[0] != id2
+        client_free(client)
+        return 15
+    if client_delete(client, id2) != 1
+        client_free(client)
+        return 16
+    if client_find(client, c"slug", 4, c"twice", 5, @ids[0], 8) != 0
+        client_free(client)
+        return 17
+
+    client_disconnect(client)
+    client_free(client)
+    return 0
+
+[[test]]
+fn test_field_index_end_to_end() -> i32
+    var srv: TestServer
+    let started: i32 = server_start(@srv)
+    if started != 0
+        return started
+    let rc: i32 = check_field_index(@srv)
+    server_stop(@srv)
+    return rc

@@ -85,6 +85,10 @@ import ritzlib.memory { secure_zero, memzero, malloc, free }
 
 const SESSION_MAX: i32 = 256
 
+# Document ids one FIND may return.  nexus keeps at most 64 copies of a
+# slug (repos/wiki_page_repo.ritz's MAX_COPIES); the rest are older copies
+# a lookup never needs (AGAST #3644).
+const FIND_MAX_IDS: i32 = 256
 # Parse-state values stored in M7SPSession.parse_state.
 #
 # Plain (--no-encryption) flow uses NEED_HEADER → NEED_BODY → DISPATCHING
@@ -969,6 +973,55 @@ fn m7sp_dispatch(reader: *MessageReader, resp: *MessageBuffer, session: *M7SPSes
     # error if a client somehow sends one.
     if msg_type == MSG_SCAN_NEXT
         build_error(resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "SCAN_NEXT not used by this server (push model)")
+        return
+
+    # INDEX_CREATE — create (or confirm) a secondary index on a field.
+    # Payload: [field_len: i32][field: bytes][unique: i32]; `unique` is
+    # reserved.  Idempotent, so a reconnecting client ensures its indexes
+    # after every dial; a new index is built from the documents already in
+    # the collection (AGAST #3644).
+    if msg_type == MSG_INDEX_CREATE
+        var field_len: i32 = 0
+        let field: *u8 = msgreader_read_bytes(reader, @field_len)
+        msgreader_read_i32(reader)      # reserved `unique` field
+        if field == null or field_len <= 0
+            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed index field")
+            return
+        let rc: i32 = collection_index_create(collection, field, field_len)
+        if rc == ERR_OK
+            build_index_created(resp, request_id)
+        else if rc == ERR_INVALID
+            build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid index field")
+        else if rc == ERR_FULL
+            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Too many indexes")
+        else
+            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to create index")
+        return
+
+    # FIND — document ids holding a field value.
+    # Payload: [field_len: i32][field][value_len: i32][value]
+    # A field with no index is PROTO_ERR_NO_INDEX, which tells the client to
+    # fall back to a scan rather than treat the value as absent.
+    if msg_type == MSG_FIND
+        var field_len: i32 = 0
+        let field: *u8 = msgreader_read_bytes(reader, @field_len)
+        var value_len: i32 = 0
+        let value: *u8 = msgreader_read_bytes(reader, @value_len)
+        if field == null or field_len <= 0 or value_len < 0
+            build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
+            return
+        let ids: *i64 = malloc(FIND_MAX_IDS as i64 * 8) as *i64
+        if ids == null
+            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
+            return
+        let rc: i32 = collection_index_find_string(collection, field, field_len, value, value_len, ids, FIND_MAX_IDS)
+        if rc == ERR_NOT_FOUND
+            build_error(resp, request_id, PROTO_ERR_NO_INDEX, "No index on field")
+        else if rc < 0
+            build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
+        else
+            build_find_result(resp, request_id, ids, rc)
+        free(ids as *u8)
         return
 
     # Unknown type — well-formed protocol error.

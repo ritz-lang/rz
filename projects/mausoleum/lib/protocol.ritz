@@ -71,6 +71,7 @@ pub const MSG_SCAN: i32 = 0x22          # Full collection scan
 pub const MSG_SCAN_NEXT: i32 = 0x23     # Continue scan
 pub const MSG_INDEX_CREATE: i32 = 0x30
 pub const MSG_INDEX_DROP: i32 = 0x31
+pub const MSG_FIND: i32 = 0x32          # Documents holding a field value
 pub const MSG_TXN_BEGIN: i32 = 0x40
 pub const MSG_TXN_COMMIT: i32 = 0x41
 pub const MSG_TXN_ABORT: i32 = 0x42
@@ -89,6 +90,7 @@ pub const MSG_SCAN_RESULT: i32 = 0xA2   # Scan results batch
 pub const MSG_SCAN_END: i32 = 0xA3      # Scan completed
 pub const MSG_INDEX_CREATED: i32 = 0xB0
 pub const MSG_INDEX_DROPPED: i32 = 0xB1
+pub const MSG_FIND_RESULT: i32 = 0xB2   # Document ids holding a value
 pub const MSG_TXN_BEGUN: i32 = 0xC0
 pub const MSG_TXN_COMMITTED: i32 = 0xC1
 pub const MSG_TXN_ABORTED: i32 = 0xC2
@@ -114,6 +116,7 @@ pub const PROTO_ERR_INTERNAL: i32 = 9        # Internal server error
 pub const PROTO_ERR_DISCONNECTED: i32 = 10   # Client disconnected
 pub const PROTO_ERR_DOCUMENT_TOO_LARGE: i32 = 11  # Document over MAX_DOC_SIZE (AGAST #2208)
 pub const PROTO_ERR_COLLECTION_REFUSED: i32 = 12  # CONNECT name too long, or no room for it (AGAST #3637)
+pub const PROTO_ERR_NO_INDEX: i32 = 13  # FIND on a field with no index (fall back to a scan)
 
 # ============================================================================
 # Message header
@@ -565,4 +568,47 @@ pub fn build_scan_end(buf: *MessageBuffer, request_id: i32) -> i32
 # Build SCAN_NEXT request (continue scan)
 pub fn build_scan_next(buf: *MessageBuffer, request_id: i32) -> i32
     msgbuf_start(buf, MSG_SCAN_NEXT, request_id)
+    return msgbuf_finish(buf)
+
+# ============================================================================
+# Secondary field index (AGAST #3644)
+# ============================================================================
+
+# Build INDEX_CREATE request (idempotent).
+# Payload: [field_len: i32][field: bytes][unique: i32]
+# `unique` is reserved; this server keeps every (value, document) entry.
+pub fn build_index_create(buf: *MessageBuffer, request_id: i32, field: *u8, field_len: i32, unique: i32) -> i32
+    msgbuf_start(buf, MSG_INDEX_CREATE, request_id)
+    if msgbuf_write_bytes(buf, field, field_len) < 0
+        msgbuf_reset(buf)
+        return -1
+    msgbuf_write_i32(buf, unique)
+    return msgbuf_finish(buf)
+
+# Build INDEX_CREATED response (no payload)
+pub fn build_index_created(buf: *MessageBuffer, request_id: i32) -> i32
+    msgbuf_start(buf, MSG_INDEX_CREATED, request_id)
+    return msgbuf_finish(buf)
+
+# Build FIND request.
+# Payload: [field_len: i32][field: bytes][value_len: i32][value: bytes]
+pub fn build_find(buf: *MessageBuffer, request_id: i32, field: *u8, field_len: i32, value: *u8, value_len: i32) -> i32
+    msgbuf_start(buf, MSG_FIND, request_id)
+    if msgbuf_write_bytes(buf, field, field_len) < 0
+        msgbuf_reset(buf)
+        return -1
+    if msgbuf_write_bytes(buf, value, value_len) < 0
+        msgbuf_reset(buf)
+        return -1
+    return msgbuf_finish(buf)
+
+# Build FIND_RESULT response.
+# Payload: [count: i32][doc_id: i64] * count
+pub fn build_find_result(buf: *MessageBuffer, request_id: i32, ids: *i64, count: i32) -> i32
+    msgbuf_start(buf, MSG_FIND_RESULT, request_id)
+    msgbuf_write_i32(buf, count)
+    var i: i32 = 0
+    while i < count
+        msgbuf_write_i64(buf, *(ids + i))
+        i += 1
     return msgbuf_finish(buf)

@@ -961,3 +961,142 @@ fn test_collection_get_string_outlives_call() -> i32
         return 6
     buffer_pool_destroy(pool)
     0
+
+# ============================================================================
+# Secondary field index (AGAST #3644)
+#
+# The collection maintains its indexes on insert/update/delete, so a lookup
+# by field value is one index range scan rather than a scan of every
+# document.  The indexes live in the collection (and so in the server), not
+# in a client, so every worker sees every other worker's writes (#2459).
+# ============================================================================
+
+fn insert_slug_doc(col: *Collection, slug_ptr: *u8, slug_len: i64, out: *DocumentId) -> i32
+    var doc: Document
+    var inv: DocumentId = doc_id_invalid()
+    doc_init(@doc, @inv)
+    var f: Field = field_string(slug_ptr, slug_len)
+    doc_set_field(@doc, "slug", @f)
+    return collection_insert(col, @doc, out)
+
+
+fn find_slug_ids(col: *Collection, slug: StrView, out: *i64, max: i32) -> i32
+    return collection_index_find_string(col, c"slug", 4, strview_as_ptr(slug), strview_len(slug) as i32, out, max)
+
+
+[[test]]
+fn test_collection_index_finds_inserted_documents() -> i32
+    var pool_opt = buffer_pool_new(64)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 10
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+    if collection_index_create(@col, c"slug", 4) != ERR_OK
+        return 1
+
+    var id_a: DocumentId
+    var id_b: DocumentId
+    if insert_slug_doc(@col, c"alpha", 5, @id_a) != ERR_OK
+        return 2
+    if insert_slug_doc(@col, c"beta", 4, @id_b) != ERR_OK
+        return 3
+
+    var ids: [8]i64
+    if find_slug_ids(@col, "alpha", @ids[0], 8) != 1
+        return 4
+    if ids[0] != id_a.value
+        return 5
+    if find_slug_ids(@col, "beta", @ids[0], 8) != 1
+        return 6
+    if ids[0] != id_b.value
+        return 7
+    if find_slug_ids(@col, "gamma", @ids[0], 8) != 0
+        return 8
+    collection_destroy(@col)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_collection_index_delete_removes_the_entry() -> i32
+    var pool_opt = buffer_pool_new(64)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 10
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+    collection_index_create(@col, c"slug", 4)
+
+    # Two documents for one slug: deleting one must leave the other.
+    var id_a: DocumentId
+    var id_b: DocumentId
+    if insert_slug_doc(@col, c"twice", 5, @id_a) != ERR_OK
+        return 1
+    if insert_slug_doc(@col, c"twice", 5, @id_b) != ERR_OK
+        return 2
+    if collection_delete(@col, @id_a) != ERR_OK
+        return 3
+
+    var ids: [8]i64
+    if find_slug_ids(@col, "twice", @ids[0], 8) != 1
+        return 4
+    if ids[0] != id_b.value
+        return 5
+
+    if collection_delete(@col, @id_b) != ERR_OK
+        return 6
+    if find_slug_ids(@col, "twice", @ids[0], 8) != 0
+        return 7
+    collection_destroy(@col)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_collection_index_update_moves_the_entry() -> i32
+    var pool_opt = buffer_pool_new(64)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 10
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+    collection_index_create(@col, c"slug", 4)
+
+    var id: DocumentId
+    if insert_slug_doc(@col, c"before", 6, @id) != ERR_OK
+        return 1
+
+    # Fetch, change the slug, and update: the old value must stop matching.
+    var doc: Document
+    var doc_buf: [2048]u8
+    if collection_get(@col, @id, @doc, @doc_buf[0], 2048) != ERR_OK
+        return 2
+    var f: Field = field_string(c"after", 5)
+    doc_set_field(@doc, "slug", @f)
+    if collection_update(@col, @doc) != ERR_OK
+        return 3
+
+    var ids: [8]i64
+    if find_slug_ids(@col, "before", @ids[0], 8) != 0
+        return 4
+    if find_slug_ids(@col, "after", @ids[0], 8) != 1
+        return 5
+    if ids[0] != id.value
+        return 6
+    collection_destroy(@col)
+    buffer_pool_destroy(pool)
+    0
+
+[[test]]
+fn test_collection_index_find_without_index_is_not_found() -> i32
+    var pool_opt = buffer_pool_new(64)
+    if option_is_none<*BufferPool>(@pool_opt) == 1
+        return 10
+    var pool: *BufferPool = option_unwrap_or<*BufferPool>(@pool_opt, null)
+    var col: Collection
+    collection_init(@col, pool, 1)
+    var ids: [8]i64
+    if find_slug_ids(@col, "anything", @ids[0], 8) != ERR_NOT_FOUND
+        return 1
+    collection_destroy(@col)
+    buffer_pool_destroy(pool)
+    0
