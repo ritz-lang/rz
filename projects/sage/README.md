@@ -103,8 +103,7 @@ break, continue and return; throw/try/catch/finally with Error objects
 Not yet: arrays (#4074), arrow functions (#4075), and `new`, `this`,
 classes, prototypes, for-in/of, switch, labels and the standard built-ins
 such as Math (#4077); each throws `SyntaxError: sage does not support this
-yet`. Numbers beyond 10^22 can print an ulp out (#4076). Nothing is freed:
-there is no GC yet. Full ECMAScript compliance, the bytecode VM, a garbage
+yet`. Nothing is freed: there is no GC yet. Full ECMAScript compliance, the bytecode VM, a garbage
 collector and DOM integration with [tempest](../tempest) are all still
 ahead. Note the `examples/` directory referenced by older docs does not
 exist.

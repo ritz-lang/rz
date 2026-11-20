@@ -1,0 +1,676 @@
+# Exact binary64 <-> decimal conversion for sage (AGAST #4076)
+#
+# Number::toString and Number(string) must agree with the nearest double for
+# every value. A double is m * 2^e, so the exact decimal scale can be far
+# outside the 10^k (|k| <= 22) range where an f64 multiply is exact. Doing it
+# in f64 there rounded the scaling, so a 17-digit result could be an ulp out:
+# Number.MAX_VALUE printed 1.7976931348623156e+308 rather than the literal.
+#
+# Both directions here use an exact big integer instead of f64 scaling:
+#
+#   push_number     Burger & Dybvig free-format digit generation: the
+#                   shortest decimal inside the double's rounding interval,
+#                   rounded to the closest one. The interval bounds are
+#                   inclusive when the significand is even (ties-to-even).
+#   decimal_to_f64  builds the exact rational digits * 10^exp and rounds it
+#                   to 53 bits (ties-to-even), with explicit subnormal and
+#                   overflow handling.
+#
+# The big integer is base 2^32 so shifts by powers of two (the double's
+# binary exponent) are cheap. It has no division: digit generation subtracts
+# S at most nine times per digit, and decimal parsing reads off a quotient
+# below 2^54 one bit at a time.
+
+import ritzlib.strview
+import ritzlib.gvec
+
+# 128 * 32 = 4096 bits. The largest intermediate is a 350-significant-digit
+# decimal (~1163 bits) shifted by 1074, plus a 10^-673 denominator (~2236
+# bits); everything stays well inside this.
+const BIG_LIMBS: i32 = 128
+
+# Decimal digits kept exactly when parsing; beyond these a nonzero remainder
+# is remembered as a sticky bit, which decides only an exact-half rounding.
+const KEPT_DIGITS: i64 = 350
+
+const MANT_IMPLICIT: u64 = 4503599627370496   # 2^52
+const MANT_MASK: u64 = 4503599627370495       # 2^52 - 1
+
+struct Big
+    limbs: [128]u64     # little-endian base 2^32, each < 2^32
+    n: i32              # significant limbs; limbs[n..] are zero
+
+# =============================================================================
+# Big integer primitives (base 2^32)
+# =============================================================================
+
+fn big_set_zero(a: @&Big)
+    var i: i32 = 0
+    while i < BIG_LIMBS
+        a.limbs[i] = 0
+        i = i + 1
+    a.n = 1
+
+fn big_set_u64(a: @&Big, v: u64)
+    big_set_zero(a)
+    a.limbs[0] = v & 4294967295
+    let hi: u64 = v >> 32
+    if hi != 0
+        a.limbs[1] = hi
+        a.n = 2
+
+fn big_copy(dst: @&Big, src: @Big)
+    var i: i32 = 0
+    while i < BIG_LIMBS
+        dst.limbs[i] = src.limbs[i]
+        i = i + 1
+    dst.n = src.n
+
+# A limb at i, or 0 above the significant length.
+fn big_limb(a: @Big, i: i32) -> u64
+    if i < 0 or i >= a.n
+        return 0
+    a.limbs[i]
+
+fn big_normalize(a: @&Big)
+    var i: i32 = a.n - 1
+    while i > 0 and a.limbs[i] == 0
+        i = i - 1
+    a.n = i + 1
+
+# -1, 0 or 1 as a < b, a == b, a > b.
+fn big_cmp(a: @Big, b: @Big) -> i32
+    var n: i32 = a.n
+    if b.n > n
+        n = b.n
+    var i: i32 = n - 1
+    while i >= 0
+        let av: u64 = big_limb(a, i)
+        let bv: u64 = big_limb(b, i)
+        if av < bv
+            return 0 - 1
+        if av > bv
+            return 1
+        i = i - 1
+    0
+
+# dst = a + b. dst must not alias a or b.
+fn big_add(dst: @&Big, a: @Big, b: @Big)
+    var carry: u64 = 0
+    var n: i32 = a.n
+    if b.n > n
+        n = b.n
+    var i: i32 = 0
+    while i < n
+        let s: u64 = big_limb(a, i) + big_limb(b, i) + carry
+        dst.limbs[i] = s & 4294967295
+        carry = s >> 32
+        i = i + 1
+    dst.n = i
+    while carry != 0
+        dst.limbs[i] = carry & 4294967295
+        carry = carry >> 32
+        i = i + 1
+        dst.n = i
+    big_normalize(dst)
+
+# a = a - b, assuming a >= b.
+fn big_sub_inplace(a: @&Big, b: @Big)
+    var borrow: u64 = 0
+    var i: i32 = 0
+    while i < a.n
+        let av: u64 = a.limbs[i]
+        let bv: u64 = big_limb(b, i)
+        var d: u64 = 0
+        if av >= bv + borrow
+            d = av - bv - borrow
+            borrow = 0
+        else
+            d = (av + 4294967296) - bv - borrow
+            borrow = 1
+        a.limbs[i] = d & 4294967295
+        i = i + 1
+    big_normalize(a)
+
+# a = a * m, for m < 2^32.
+fn big_mul_small(a: @&Big, m: u64)
+    var carry: u64 = 0
+    var i: i32 = 0
+    while i < a.n
+        let cur: u64 = a.limbs[i] * m + carry
+        a.limbs[i] = cur & 4294967295
+        carry = cur >> 32
+        i = i + 1
+    while carry != 0
+        a.limbs[i] = carry & 4294967295
+        carry = carry >> 32
+        i = i + 1
+        a.n = i
+    big_normalize(a)
+
+# a = a + v, for v < 2^32.
+fn big_add_small(a: @&Big, v: u64)
+    var carry: u64 = v
+    var i: i32 = 0
+    while carry != 0
+        let cur: u64 = a.limbs[i] + carry
+        a.limbs[i] = cur & 4294967295
+        carry = cur >> 32
+        i = i + 1
+        if i > a.n
+            a.n = i
+    big_normalize(a)
+
+# a = a << bits, in place.
+fn big_shl(a: @&Big, bits: i32)
+    if bits <= 0
+        return
+    let limb_shift: i32 = bits / 32
+    let bit_shift: i32 = bits % 32
+    if limb_shift >= BIG_LIMBS
+        big_set_zero(a)
+        return
+    # Move whole limbs, high to low.
+    var i: i32 = BIG_LIMBS - 1
+    while i >= 0
+        let src: i32 = i - limb_shift
+        if src >= 0
+            a.limbs[i] = a.limbs[src]
+        else
+            a.limbs[i] = 0
+        i = i - 1
+    # Shift the remainder of each limb, low to high.
+    if bit_shift > 0
+        var carry: u64 = 0
+        i = 0
+        while i < BIG_LIMBS
+            let cur: u64 = a.limbs[i]
+            a.limbs[i] = ((cur << bit_shift) | carry) & 4294967295
+            carry = cur >> (32 - bit_shift)
+            i = i + 1
+    a.n = a.n + limb_shift
+    if bit_shift > 0
+        a.n = a.n + 1
+    if a.n > BIG_LIMBS
+        a.n = BIG_LIMBS
+    big_normalize(a)
+
+fn big_bitlen(a: @Big) -> i32
+    var i: i32 = a.n - 1
+    while i >= 0
+        if a.limbs[i] != 0
+            var v: u64 = a.limbs[i]
+            var bits: i32 = 0
+            while v != 0
+                v = v >> 1
+                bits = bits + 1
+            return i * 32 + bits
+        i = i - 1
+    0
+
+# q = floor(num / den), remainder left in num. The caller guarantees the
+# quotient fits in 54 bits (both conversions scale it to ~2^52).
+fn big_divmod_to_u64(num: @&Big, den: @Big) -> u64
+    let nb: i32 = big_bitlen(num)
+    let db: i32 = big_bitlen(den)
+    if nb < db
+        return 0
+    var q: u64 = 0
+    var shifted: Big
+    var i: i32 = nb - db
+    while i >= 0
+        big_copy(@&shifted, den)
+        big_shl(@&shifted, i)
+        if big_cmp(num, @shifted) >= 0
+            big_sub_inplace(num, @shifted)
+            q = q | ((1 as u64) << i)
+        i = i - 1
+    q
+
+fn f64_from_bits(bits: u64) -> f64
+    var b: u64 = bits
+    let p: *f64 = @b as *f64
+    *p
+
+fn f64_bits(x: f64) -> u64
+    var t: f64 = x
+    let p: *u64 = @t as *u64
+    *p
+
+fn f64_infinity() -> f64
+    let z: f64 = 0.0
+    1.0 / z
+
+# =============================================================================
+# Shortest round-tripping digits (Burger & Dybvig free format)
+# =============================================================================
+
+struct Digits
+    d: [24]i64
+    n: i64
+    point: i64    # value = d[0].d[1]... * 10^(point - 1)
+
+# Find the shortest decimal in v's rounding interval, and the digit string
+# out.d[0..out.n) plus its decimal point position out.point.
+fn shortest_digits(v: f64, out: @&Digits)
+    let bits: u64 = f64_bits(v)
+    let expf: i64 = ((bits >> 52) & 2047) as i64
+    let mant: u64 = bits & MANT_MASK
+    var m: u64 = mant
+    var e: i64 = 0 - 1074
+    if expf != 0
+        m = mant | MANT_IMPLICIT
+        e = expf - 1075
+
+    # The rounding interval is [v - gap_down / 2, v + gap_up / 2]. At a
+    # normalized power of two the gap below is half the gap above.
+    var gap_down_half: i64 = e + t_shift(e) - 1
+    var boundary: i32 = 0
+    if m == MANT_IMPLICIT and e > 0 - 1074
+        boundary = 1
+    if boundary == 1
+        gap_down_half = e + t_shift(e) - 2
+
+    # Keep every bound integral: scale by S = 2^t.
+    let t: i64 = t_shift(e)
+    var R: Big
+    big_set_u64(@&R, m)
+    big_shl(@&R, (e + t) as i32)
+    var S: Big
+    big_set_u64(@&S, 1)
+    big_shl(@&S, t as i32)
+    var Mup: Big
+    big_set_u64(@&Mup, 1)
+    big_shl(@&Mup, (e + t - 1) as i32)
+    var Mdown: Big
+    big_set_u64(@&Mdown, 1)
+    big_shl(@&Mdown, gap_down_half as i32)
+    var incl: i32 = 0
+    if (m & 1) == 0
+        incl = 1   # even significand: the interval bounds are included
+
+    # Normalise to 1/10 <= R/S < 1, tracking the decimal exponent k so that
+    # v = (R/S) * 10^k.
+    var k: i64 = 0
+    while big_cmp(@R, @S) >= 0
+        big_mul_small(@&S, 10)
+        k = k + 1
+    var scaling: i32 = 1
+    while scaling == 1
+        var ten_r: Big
+        big_copy(@&ten_r, @R)
+        big_mul_small(@&ten_r, 10)
+        if big_cmp(@ten_r, @S) < 0
+            big_mul_small(@&R, 10)
+            big_mul_small(@&Mup, 10)
+            big_mul_small(@&Mdown, 10)
+            k = k - 1
+        else
+            scaling = 0
+
+    var nd: i64 = 0
+    var emitted: i32 = 0
+    while emitted == 0 and nd < 24
+        big_mul_small(@&R, 10)
+        big_mul_small(@&Mup, 10)
+        big_mul_small(@&Mdown, 10)
+        var d: i64 = 0
+        while big_cmp(@R, @S) >= 0
+            big_sub_inplace(@&R, @S)
+            d = d + 1
+        # Is the interval's nearest edge reached at this digit?
+        var hi: Big
+        big_add(@&hi, @R, @Mup)
+        let c_hi: i32 = big_cmp(@hi, @S)
+        let c_lo: i32 = big_cmp(@R, @Mdown)
+        var low: i32 = 0
+        var high: i32 = 0
+        if incl == 1
+            if c_lo <= 0
+                low = 1
+            if c_hi >= 0
+                high = 1
+        else
+            if c_lo < 0
+                low = 1
+            if c_hi > 0
+                high = 1
+        out.d[nd] = d
+        nd = nd + 1
+        if low == 1 or high == 1
+            var chosen: i64 = d
+            if low == 1 and high == 1
+                # Both edges reached: keep the decimal closest to v.
+                var twice_r: Big
+                big_copy(@&twice_r, @R)
+                big_shl(@&twice_r, 1)
+                let c: i32 = big_cmp(@twice_r, @S)
+                if c < 0
+                    chosen = d
+                else if c > 0
+                    chosen = d + 1
+                else
+                    # Exactly half way: choose the even digit.
+                    if d % 2 == 0
+                        chosen = d
+                    else
+                        chosen = d + 1
+            else if low == 1
+                chosen = d
+            else
+                chosen = d + 1
+            if chosen == 10
+                # Carry into the digits already emitted (9.99 -> 10.0).
+                out.d[nd - 1] = 0
+                var j: i64 = nd - 2
+                var carry: i64 = 1
+                while j >= 0 and carry == 1
+                    let nv: i64 = out.d[j] + 1
+                    if nv == 10
+                        out.d[j] = 0
+                    else
+                        out.d[j] = nv
+                        carry = 0
+                    j = j - 1
+                if carry == 1
+                    var z: i64 = 0
+                    while z < nd
+                        out.d[z] = 0
+                        z = z + 1
+                    out.d[0] = 1
+                    k = k + 1
+            else
+                out.d[nd - 1] = chosen
+            emitted = 1
+
+    while nd > 1 and out.d[nd - 1] == 0
+        nd = nd - 1
+    out.n = nd
+    out.point = k
+
+# t such that every rounding bound is an integer after scaling by 2^t.
+fn t_shift(e: i64) -> i64
+    if e >= 2
+        return 0
+    2 - e
+
+# =============================================================================
+# Number::toString
+# =============================================================================
+
+fn push_byte(buf: @&Vec<u8>, b: u8)
+    vec_push<u8>(buf, b)
+
+fn push_sv(buf: @&Vec<u8>, s: StrView)
+    let n: i64 = strview_len(s)
+    var i: i64 = 0
+    while i < n
+        vec_push<u8>(buf, strview_get(s, i))
+        i = i + 1
+
+fn push_i64(buf: @&Vec<u8>, value: i64)
+    var n: i64 = value
+    if n < 0
+        push_byte(buf, 45)
+        n = 0 - n
+    if n >= 10
+        push_i64(buf, n / 10)
+    push_byte(buf, (48 + n % 10) as u8)
+
+fn push_digit(buf: @&Vec<u8>, d: i64)
+    push_byte(buf, (48 + d) as u8)
+
+# Append JavaScript's Number::toString of x.
+pub fn float_push_number(buf: @&Vec<u8>, x: f64)
+    if x != x
+        push_sv(buf, "NaN")
+        return
+    if x == 0.0
+        push_byte(buf, 48)
+        return
+    var v: f64 = x
+    if v < 0.0
+        push_byte(buf, 45)
+        v = 0.0 - v
+    if v > 1.7976931348623157e308
+        push_sv(buf, "Infinity")
+        return
+    # Integers below 2^53 are exact as i64.
+    if v < 9007199254740992.0
+        let t: i64 = v as i64
+        if (t as f64) == v
+            push_i64(buf, t)
+            return
+
+    var dg: Digits
+    shortest_digits(v, @&dg)
+    let nd: i64 = dg.n
+    let point: i64 = dg.point
+
+    if nd <= point and point <= 21
+        var i: i64 = 0
+        while i < nd
+            push_digit(buf, dg.d[i])
+            i = i + 1
+        var z: i64 = nd
+        while z < point
+            push_byte(buf, 48)
+            z = z + 1
+        return
+    if 0 < point and point <= 21
+        var i: i64 = 0
+        while i < nd
+            if i == point
+                push_byte(buf, 46)
+            push_digit(buf, dg.d[i])
+            i = i + 1
+        return
+    if 0 - 6 < point and point <= 0
+        push_sv(buf, "0.")
+        var z: i64 = point
+        while z < 0
+            push_byte(buf, 48)
+            z = z + 1
+        var i: i64 = 0
+        while i < nd
+            push_digit(buf, dg.d[i])
+            i = i + 1
+        return
+    # Exponent form: d[0] "." d[1..] "e" (+|-) (point - 1)
+    push_digit(buf, dg.d[0])
+    if nd > 1
+        push_byte(buf, 46)
+        var i: i64 = 1
+        while i < nd
+            push_digit(buf, dg.d[i])
+            i = i + 1
+    push_byte(buf, 101)   # 'e'
+    let ex: i64 = point - 1
+    if ex >= 0
+        push_byte(buf, 43)
+    push_i64(buf, ex)
+
+# =============================================================================
+# String -> nearest double
+# =============================================================================
+
+# 1 if num / den >= 2^e, else 0.
+fn ge_pow2(num: @Big, den: @Big, e: i64) -> i32
+    var tmp: Big
+    if e >= 0
+        big_copy(@&tmp, den)
+        big_shl(@&tmp, e as i32)
+        if big_cmp(num, @tmp) >= 0
+            return 1
+        return 0
+    big_copy(@&tmp, num)
+    big_shl(@&tmp, (0 - e) as i32)
+    if big_cmp(@tmp, den) >= 0
+        return 1
+    0
+
+# Round num/den to the nearest double, ties to even. sticky is 1 when digits
+# beyond the retained ones were dropped and were nonzero.
+fn round_ratio(num: @Big, den: @Big, sticky: i32) -> f64
+    var e: i64 = (big_bitlen(num) - big_bitlen(den)) as i64
+    while ge_pow2(num, den, e) == 0
+        e = e - 1
+    while ge_pow2(num, den, e + 1) == 1
+        e = e + 1
+    if e >= 1024
+        return f64_infinity()
+
+    if e >= 0 - 1022
+        # Normal: scale so the quotient is the 53-bit significand.
+        var n2: Big
+        big_copy(@&n2, num)
+        var d2: Big
+        big_copy(@&d2, den)
+        let shift: i64 = 52 - e
+        if shift >= 0
+            big_shl(@&n2, shift as i32)
+        else
+            big_shl(@&d2, (0 - shift) as i32)
+        var q: u64 = big_divmod_to_u64(@&n2, @d2)
+        var twice: Big
+        big_copy(@&twice, @n2)
+        big_shl(@&twice, 1)
+        let c: i32 = big_cmp(@twice, @d2)
+        var up: i32 = 0
+        if c > 0
+            up = 1
+        else if c == 0
+            if (q & 1) == 1
+                up = 1
+            else if sticky == 1
+                up = 1
+        if up == 1
+            q = q + 1
+        if q == 9007199254740992   # 2^53: carry into the exponent
+            q = q >> 1
+            e = e + 1
+            if e > 1023
+                return f64_infinity()
+        let expf: u64 = (e + 1023) as u64
+        let frac: u64 = q - MANT_IMPLICIT
+        return f64_from_bits((expf << 52) | frac)
+
+    # Subnormal: round to a multiple of 2^-1074.
+    var n2: Big
+    big_copy(@&n2, num)
+    big_shl(@&n2, 1074)
+    var d2: Big
+    big_copy(@&d2, den)
+    var q: u64 = big_divmod_to_u64(@&n2, @d2)
+    var twice: Big
+    big_copy(@&twice, @n2)
+    big_shl(@&twice, 1)
+    let c: i32 = big_cmp(@twice, @d2)
+    var up: i32 = 0
+    if c > 0
+        up = 1
+    else if c == 0
+        if (q & 1) == 1
+            up = 1
+        else if sticky == 1
+            up = 1
+    if up == 1
+        q = q + 1
+    if q == 0
+        return 0.0
+    if q >= MANT_IMPLICIT
+        return f64_from_bits(1 << 52)   # rounded up to the smallest normal
+    f64_from_bits(q)
+
+# Parse a decimal number (digits, optional fraction, optional exponent) as
+# the nearest f64. Stops at the first other byte; the caller has stripped any
+# sign. Matches Number(string)'s rounding exactly (AGAST #4076).
+pub fn float_decimal_to_f64(s: StrView) -> f64
+    let len: i64 = strview_len(s)
+    var i: i64 = 0
+    var seen_dot: i32 = 0
+    var frac: i64 = 0
+    var started: i32 = 0
+    var nt: i64 = 0           # significant digits seen
+    var sticky: i32 = 0
+    var hit_exp: i32 = 0
+    var N: Big
+    big_set_zero(@&N)
+
+    var scanning: i32 = 1
+    while i < len and scanning == 1
+        let c: u8 = strview_get(s, i)
+        if c >= 48 and c <= 57
+            if seen_dot == 1
+                frac = frac + 1
+            if started == 0 and c == 48
+                # Leading zero: not a significant digit.
+                i = i + 1
+            else
+                started = 1
+                nt = nt + 1
+                if nt <= KEPT_DIGITS
+                    big_mul_small(@&N, 10)
+                    big_add_small(@&N, (c - 48) as u64)
+                else if c != 48
+                    sticky = 1
+                i = i + 1
+        else if c == 46 and seen_dot == 0
+            seen_dot = 1
+            i = i + 1
+        else if c == 101 or c == 69
+            hit_exp = 1
+            scanning = 0
+        else
+            scanning = 0
+
+    var exp: i64 = 0
+    if hit_exp == 1
+        i = i + 1
+        var neg: i32 = 0
+        if i < len and strview_get(s, i) == 45
+            neg = 1
+            i = i + 1
+        else if i < len and strview_get(s, i) == 43
+            i = i + 1
+        var e: i64 = 0
+        while i < len and strview_get(s, i) >= 48 and strview_get(s, i) <= 57
+            if e < 100000
+                e = e * 10 + ((strview_get(s, i) - 48) as i64)
+            i = i + 1
+        if neg == 1
+            exp = 0 - e
+        else
+            exp = e
+
+    if nt == 0
+        return 0.0
+
+    # Decimal exponent of the most significant digit. Outside this range the
+    # value cannot be finite and subnormal respectively, so skip the bignum.
+    var dec_exp: i64 = exp - frac
+    let msd: i64 = dec_exp + nt - 1
+    if msd > 308
+        return f64_infinity()
+    if msd < 0 - 324
+        return 0.0
+
+    # Keep at most KEPT_DIGITS significant digits; the sticky bit above
+    # remembers anything nonzero dropped here.
+    if nt > KEPT_DIGITS
+        dec_exp = dec_exp + (nt - KEPT_DIGITS)
+
+    var D: Big
+    big_set_u64(@&D, 1)
+    if dec_exp >= 0
+        var j: i64 = 0
+        while j < dec_exp
+            big_mul_small(@&N, 10)
+            j = j + 1
+    else
+        var j: i64 = 0
+        while j < 0 - dec_exp
+            big_mul_small(@&D, 10)
+            j = j + 1
+
+    round_ratio(@N, @D, sticky)
