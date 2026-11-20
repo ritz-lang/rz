@@ -32,8 +32,9 @@ the compiler then links invalid IR: an Option value returned as i32) and pin
 that the legitimate rewrites still happen, in the walked body and in each
 cloned generic body.
 
-ritz0's twin pass lacks the shadow guard; that divergence is AGAST #4414,
-and this file runs the two ritz1 compilers until it is fixed.
+ritz0's twin pass lacked the shadow guard until AGAST #4414 gave it lexical
+scopes; every row runs on all three compilers so the boundary cannot drift
+again.
 """
 
 import pytest
@@ -42,8 +43,7 @@ from test_enum_discriminants import _run
 
 pytestmark = pytest.mark.integration
 
-# ritz0's enum_from.py rewrites the shadowed name too (AGAST #4414).
-COMPILERS = ["ritz1", "ritz1_selfhosted"]
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 # A struct whose `from` method is what `E.from(...)` means once `E` is a
 # local or a param.  Returns 42 when the call reaches it.
@@ -87,6 +87,37 @@ fn main() -> i32
         None => 2
 """
 
+# The shadow guard is per fn and per scope: a same-named local elsewhere must
+# not suppress a real conversion.  Both compilers walk each body with its own
+# bindings, so the enum's `from` still lowers in `main`.
+SHADOW_ELSEWHERE = """\
+import ritzlib.option
+
+enum Colour: u8
+    Red = 1
+    Blue = 2
+
+struct Paint
+    n: i32
+
+impl Paint
+    fn from(self: @Paint, k: i32) -> i32
+        self.n + k
+
+fn shadow_elsewhere() -> i32
+    let Colour = Paint { n: 40 }
+    Colour.from(2)
+
+fn main() -> i32
+    if shadow_elsewhere() != 42
+        return 1
+    match Colour.from(2)
+        Some(c) => match c
+            Blue => 42
+            _ => 1
+        None => 2
+"""
+
 # `E.from` in a generic body reaches emission only as a specialisation:
 # rewrite_enum_from_call runs on each clone (clone_expr).  Two instantiations
 # at different type arguments pin that each clone is lowered on its own.
@@ -112,6 +143,11 @@ fn main() -> i32
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_a_shadowed_enum_name_is_not_rewritten(compiler, tmp_path):
     assert _run(compiler, tmp_path, SHADOWED) == 42
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_shadow_elsewhere_does_not_suppress_lowering(compiler, tmp_path):
+    assert _run(compiler, tmp_path, SHADOW_ELSEWHERE) == 42
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
