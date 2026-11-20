@@ -37,14 +37,61 @@ import emitter_expr_access
 # int_to_float_slot / expr_is_definitely_int moved to emitter_expr (AGAST
 # #2065) so emit_field_elem_narrow can convert integer values too.
 
+# AGAST #4407: the type an unannotated `let` / `var` takes, as the inference
+# below works it out, held for the length of that declaration's lowering.
+#
+# These are the only type facts the emitter computes.  Each inference arm used
+# to write its answer into the Stmt (`stmt.var_type = ...`, 267 writes) and the
+# next arm read it back, so one node carried both the parser's facts and the
+# emitter's.  Sema's checks and emit_tagged_enum_scan_stmts read the Stmt too,
+# before lowering: they see the parser's values, and this struct keeps them
+# that way.  The parser still writes these Stmt fields for an annotated decl
+# (capture_var_type) and for monomorph / async_lower, so they stay on the node;
+# nothing below writes them any more (tools/test_ritz1_stmt_writeback_freeze.py
+# holds that line).
+struct DeclTy
+    var_type: i32
+    var_type_name: *u8
+    var_type_name_len: i32
+    var_array_size: i32
+    var_array_elem_type: i32
+    var_array_elem_pointee: i32
+    var_array_shape: *ArrayShape
+    var_array: *ArrayElem
+    var_pointee_type: i32
+    var_inner_pointee_type: i32
+    var_inner_ref: i32
+    var_pointee_array_size: i32
+    var_pointee_array_elem_type: i32
+    var_pointee_array_elem_pointee: i32
+    var_pointee_array_shape: *ArrayShape
+
+# The parser's facts, where the inference starts.
+fn decl_ty_from(stmt: *Stmt, dt: *DeclTy)
+    dt.var_type = stmt.var_type
+    dt.var_type_name = stmt.var_type_name
+    dt.var_type_name_len = stmt.var_type_name_len
+    dt.var_array_size = stmt.var_array_size
+    dt.var_array_elem_type = stmt.var_array_elem_type
+    dt.var_array_elem_pointee = stmt.var_array_elem_pointee
+    dt.var_array_shape = stmt.var_array_shape
+    dt.var_array = stmt.var_array
+    dt.var_pointee_type = stmt.var_pointee_type
+    dt.var_inner_pointee_type = stmt.var_inner_pointee_type
+    dt.var_inner_ref = stmt.var_inner_ref
+    dt.var_pointee_array_size = stmt.var_pointee_array_size
+    dt.var_pointee_array_elem_type = stmt.var_pointee_array_elem_type
+    dt.var_pointee_array_elem_pointee = stmt.var_pointee_array_elem_pointee
+    dt.var_pointee_array_shape = stmt.var_pointee_array_shape
+
 # AGAST #2321: `let p = @a`, `let p = @&a` and `let q = p` hold what an annotated
 # local does: N and T, so `p[i]` is an element, and the kind, so it loads as one.
 # Returns 1 when it typed the local.
 # AGAST #2372: `let p = @q` with `q: *S` holds an `@*S`, so `p.f` reaches S.  It
 # stayed an i64 with no struct name: "unhandled EXPR_MEMBER".
-fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     let init: *Expr = stmt.var_init
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or init == null
         return 0
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
         return 0
@@ -59,28 +106,28 @@ fn infer_ref_to_pointer_let(s: *EmitterState, stmt: *Stmt) -> i32
     if src == null or (src.var_type != TYPE_PTR and src.var_type != TYPE_PTR_PTR)
         return 0
     if src.var_type == TYPE_PTR and src.pointee_type == TYPE_ARRAY
-        return infer_ref_to_array_pointer_let(stmt, src)
+        return infer_ref_to_array_pointer_let(dt, src)
     if src.type_name_len > 0 and is_enum_type(src.type_name, src.type_name_len) == 1
-        return infer_ref_to_enum_pointer_let(stmt, src)
+        return infer_ref_to_enum_pointer_let(dt, src)
     if find_struct(s, src.type_name, src.type_name_len) == null
-        return infer_ref_to_scalar_pointer_let(stmt, src)
-    stmt.var_type = TYPE_REF
+        return infer_ref_to_scalar_pointer_let(dt, src)
+    dt.var_type = TYPE_REF
     if init.op == OP_ADDR_MUT
-        stmt.var_type = TYPE_MUT_REF
-    stmt.var_type_name = src.type_name
-    stmt.var_type_name_len = src.type_name_len
-    stmt.var_pointee_type = src.var_type
-    stmt.var_inner_pointee_type = src.inner_pointee_type
-    stmt.var_inner_ref = src.inner_ref   # AGAST #2399: `@q` of a `*@S`
+        dt.var_type = TYPE_MUT_REF
+    dt.var_type_name = src.type_name
+    dt.var_type_name_len = src.type_name_len
+    dt.var_pointee_type = src.var_type
+    dt.var_inner_pointee_type = src.inner_pointee_type
+    dt.var_inner_ref = src.inner_ref   # AGAST #2399: `@q` of a `*@S`
     1
 
 # AGAST #3114: `let w = *v` with `v` a `**S` local (typed, or a `Some(v)` over
 # `Option<**S>`, #3047) holds the `*S`, as `let w: *S = *v` would.  It stayed an
 # i64 with no struct name, so `w.b` was "unhandled EXPR_MEMBER".  Returns 1
 # when it typed the local.
-fn infer_ptr_ptr_deref_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_ptr_ptr_deref_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     let init: *Expr = stmt.var_init
-    if stmt.var_declared_type != TYPE_VOID or stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+    if stmt.var_declared_type != TYPE_VOID or dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or init == null
         return 0
     if init.kind != EXPR_UNARY or init.op != OP_DEREF
         return 0
@@ -88,10 +135,10 @@ fn infer_ptr_ptr_deref_let(s: *EmitterState, stmt: *Stmt) -> i32
     let st_name: *u8 = ptr_ptr_local_struct(s, init.operand, @st_len)
     if st_name == null
         return 0
-    stmt.var_type = TYPE_PTR
-    stmt.var_type_name = st_name
-    stmt.var_type_name_len = st_len
-    stmt.var_pointee_type = TYPE_STRUCT
+    dt.var_type = TYPE_PTR
+    dt.var_type_name = st_name
+    dt.var_type_name_len = st_len
+    dt.var_pointee_type = TYPE_STRUCT
     1
 
 # AGAST #2960: the struct a `ptr`-valued if / match arm points at, or null:
@@ -160,7 +207,7 @@ fn ptr_phi_let_struct(s: *EmitterState, init: *Expr, out_len: *i32) -> *u8
 # AGAST #2532: `let r = @q` with `q: *T` or `**T`, T a scalar, holds what
 # `let r: **T` / `***T` does, as #2376 types `let r = @a[i]`.  It was an i64,
 # so `**r` loaded and stored 8 bytes and `*r + 1` strode by one.
-fn infer_ref_to_scalar_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
+fn infer_ref_to_scalar_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
     var inner: i32 = src.pointee_type
     if src.var_type == TYPE_PTR_PTR
         inner = src.inner_pointee_type
@@ -169,9 +216,9 @@ fn infer_ref_to_scalar_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
         return 0
     if src.var_type == TYPE_PTR_PTR
         inner = inner + PTR_DEPTH_UNIT
-    stmt.var_type = TYPE_PTR_PTR
-    stmt.var_pointee_type = TYPE_PTR
-    stmt.var_inner_pointee_type = inner
+    dt.var_type = TYPE_PTR_PTR
+    dt.var_pointee_type = TYPE_PTR
+    dt.var_inner_pointee_type = inner
     1
 
 # AGAST #2352: `let p = @n` / `@&n` with `n` a scalar local holds
@@ -180,9 +227,9 @@ fn infer_ref_to_scalar_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
 # tell what `*p` was, and `v(p)` into a by-value T wasn't R1's error.  A `:&`
 # scalar param is a plain T local that borrows its caller's place, so `@&r`
 # of it is left alone, as is `@x` of anything already a pointer.
-fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     let init: *Expr = stmt.var_init
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID or init == null
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID or init == null
         return 0
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT) or init.operand == null
         return 0
@@ -203,10 +250,10 @@ fn infer_ref_to_scalar_let(s: *EmitterState, stmt: *Stmt) -> i32
         if glob == null or glob.type_name_len != 0 or scalar_pointee(glob.var_type) == 0
             return 0
         pointee = glob.var_type
-    stmt.var_type = TYPE_REF
+    dt.var_type = TYPE_REF
     if init.op == OP_ADDR_MUT
-        stmt.var_type = TYPE_MUT_REF
-    stmt.var_pointee_type = pointee
+        dt.var_type = TYPE_MUT_REF
+    dt.var_pointee_type = pointee
     1
 
 # 1 for the integer and float kinds an `@T` local can point at by value.
@@ -216,29 +263,29 @@ fn scalar_pointee(t: i32) -> i32
 # AGAST #2539: `let r = @q` with `q: *E` or `**E`, E an enum, holds what
 # `let r: **E` / `***E` does: the name, so `**r` loads and stores an %E.  It
 # was an i64: `**r = E.V` stored an i64 of a %E and clang refused it.
-fn infer_ref_to_enum_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
+fn infer_ref_to_enum_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
     var inner: i32 = src.pointee_type
     if src.var_type == TYPE_PTR_PTR
         inner = src.inner_pointee_type + PTR_DEPTH_UNIT
-    stmt.var_type = TYPE_PTR_PTR
-    stmt.var_pointee_type = TYPE_PTR
-    stmt.var_inner_pointee_type = inner
-    stmt.var_type_name = src.type_name
-    stmt.var_type_name_len = src.type_name_len
+    dt.var_type = TYPE_PTR_PTR
+    dt.var_pointee_type = TYPE_PTR
+    dt.var_inner_pointee_type = inner
+    dt.var_type_name = src.type_name
+    dt.var_type_name_len = src.type_name_len
     1
 
 # AGAST #2539: `let r = @q` with `q: *[N]T` holds what `let r: **[N]T` does: a
 # `**` whose inner pointee is the array, with N and T, so `let p = *r` is a
 # `*[N]T` again.  It was an i64: `p[1]` strode one byte, and a store crashed.
 # Checked before the struct arm: a `*[N]S` names S, and isn't a `*S`.
-fn infer_ref_to_array_pointer_let(stmt: *Stmt, src: *LocalVar) -> i32
+fn infer_ref_to_array_pointer_let(dt: *DeclTy, src: *LocalVar) -> i32
     if src.pointee_array_size <= 0
         return 0
-    stmt.var_type = TYPE_PTR_PTR
-    stmt.var_pointee_type = TYPE_PTR
-    stmt.var_inner_pointee_type = TYPE_ARRAY
-    stmt.var_pointee_array_size = src.pointee_array_size
-    stmt.var_pointee_array_elem_type = src.pointee_array_elem_type
+    dt.var_type = TYPE_PTR_PTR
+    dt.var_pointee_type = TYPE_PTR
+    dt.var_inner_pointee_type = TYPE_ARRAY
+    dt.var_pointee_array_size = src.pointee_array_size
+    dt.var_pointee_array_elem_type = src.pointee_array_elem_type
     1
 
 # AGAST #2539: the `**[N]T` local that `*e` reads a `*[N]T` out of, or null.
@@ -265,27 +312,27 @@ fn nd_row_shape(s: *EmitterState, e: *Expr) -> *ArrayShape
         return null
     sh
 
-fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     if stmt.var_declared_type == TYPE_VOID and stmt.var_init != null
         # AGAST #2329: `let q = h(p)`, `let q = h.r` and `let q = g` hold what they
         # copy.  `-> @[N]S` named S, which made `q` a `*S`.
         let pa: *Param = base_ptr_array(s, stmt.var_init)
         if pa != null
-            stmt.var_type = pa.param_type
-            stmt.var_type_name = null
-            stmt.var_type_name_len = 0
-            stmt.var_pointee_type = TYPE_ARRAY
-            stmt.var_pointee_array_size = pa.param_pointee_array_size
-            stmt.var_pointee_array_elem_type = pa.param_pointee_array_elem_type
+            dt.var_type = pa.param_type
+            dt.var_type_name = null
+            dt.var_type_name_len = 0
+            dt.var_pointee_type = TYPE_ARRAY
+            dt.var_pointee_array_size = pa.param_pointee_array_size
+            dt.var_pointee_array_elem_type = pa.param_pointee_array_elem_type
             # AGAST #3635: and a `*[N][M]T`'s shape, so `q[i][j]` indexes it.
             if pa.param_pointee_array_shape != null
-                stmt.var_pointee_array_elem_pointee = pa.param_pointee_array_elem_pointee
-                stmt.var_pointee_array_shape = pa.param_pointee_array_shape
+                dt.var_pointee_array_elem_pointee = pa.param_pointee_array_elem_pointee
+                dt.var_pointee_array_shape = pa.param_pointee_array_shape
             return 1
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or stmt.var_init == null
         return 0
     let init: *Expr = stmt.var_init
-    stmt.var_pointee_array_shape = null
+    dt.var_pointee_array_shape = null
     var kind: i32 = TYPE_UNKNOWN
     var size: i32 = 0
     var elem: i32 = TYPE_VOID
@@ -298,7 +345,7 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
         kind = src.var_type
         size = src.pointee_array_size
         elem = src.pointee_array_elem_type
-        stmt.var_pointee_array_shape = src.pointee_array_shape   # #2570: a plane's copy
+        dt.var_pointee_array_shape = src.pointee_array_shape   # #2570: a plane's copy
     else if pp != null
         kind = TYPE_PTR
         size = pp.pointee_array_size
@@ -312,7 +359,7 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
         if row != null
             size = row.dims[row.rank - 1]
             elem = row.leaf_type
-            stmt.var_pointee_array_elem_pointee = row.leaf_pointee
+            dt.var_pointee_array_elem_pointee = row.leaf_pointee
         else if nd_plane_shape(s, oper) != null
             # AGAST #2570: a plane `@x[i]`, `[M][N]..T` (#2558 refused it): the
             # flat `@[M*N..]T`, so `q + k` strides planes and `q as *T` is
@@ -320,8 +367,8 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
             let plane: *ArrayShape = nd_plane_shape(s, oper)
             size = shape_leaf_count(plane)
             elem = plane.leaf_type
-            stmt.var_pointee_array_elem_pointee = plane.leaf_pointee
-            stmt.var_pointee_array_shape = plane
+            dt.var_pointee_array_elem_pointee = plane.leaf_pointee
+            dt.var_pointee_array_shape = plane
         else if oper.kind == EXPR_MEMBER
             let fld: *StructField = resolve_member_chain_field(s, oper)
             if fld != null and fld.field_type == TYPE_ARRAY
@@ -340,10 +387,10 @@ fn infer_array_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
                     elem = garr.array_elem_type
     if size <= 0
         return 0
-    stmt.var_type = kind
-    stmt.var_pointee_type = TYPE_ARRAY
-    stmt.var_pointee_array_size = size
-    stmt.var_pointee_array_elem_type = elem
+    dt.var_type = kind
+    dt.var_pointee_type = TYPE_ARRAY
+    dt.var_pointee_array_size = size
+    dt.var_pointee_array_elem_type = elem
     return 1
 
 # AGAST #2571: the scalar element type of the local, global or field array that
@@ -383,24 +430,24 @@ fn full_scalar_elem_type(s: *EmitterState, e: *Expr) -> i32
 # strode one.  A scalar T is the pointee; an N-D struct or enum element
 # (`x: [M][N]S`) is a `*S`, as the #175 arm in emit_var_decl types a 1-D one
 # (that arm walks one index only).  Returns 1 when it typed the local.
-fn infer_full_elem_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_full_elem_ref_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     let init: *Expr = stmt.var_init
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or init == null
         return 0
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
         return 0
     var depth: i32 = 0
     let sh: *ArrayShape = nd_index_shape(s, init.operand, @depth)
     if sh != null and depth == sh.rank and sh.leaf_type == TYPE_STRUCT and sh.leaf_name_len > 0
-        stmt.var_type = TYPE_PTR
-        stmt.var_type_name = sh.leaf_name
-        stmt.var_type_name_len = sh.leaf_name_len
+        dt.var_type = TYPE_PTR
+        dt.var_type_name = sh.leaf_name
+        dt.var_type_name_len = sh.leaf_name_len
         return 1
     let leaf: i32 = full_scalar_elem_type(s, init.operand)
     if leaf == TYPE_VOID
         return 0
-    stmt.var_type = TYPE_PTR
-    stmt.var_pointee_type = leaf
+    dt.var_type = TYPE_PTR
+    dt.var_pointee_type = leaf
     1
 
 # AGAST #2400: `let a = @p.f` and `let a = @&p.f`, f a scalar field, hold what
@@ -410,9 +457,9 @@ fn infer_full_elem_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
 # bytes of an i32 and `a + 1` strode one.  Struct fields are the #175 arm's;
 # pointer, array and enum fields aren't scalars here.  Returns 1 when it typed
 # the local.
-fn infer_field_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_field_ref_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     let init: *Expr = stmt.var_init
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or init == null
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or init == null
         return 0
     if init.kind != EXPR_UNARY or (init.op != OP_ADDR and init.op != OP_ADDR_MUT)
         return 0
@@ -424,17 +471,17 @@ fn infer_field_ref_let(s: *EmitterState, stmt: *Stmt) -> i32
     let t: i32 = f.field_type
     if t < TYPE_I32 or t > TYPE_F64 or t == TYPE_PTR or t == TYPE_PTR_PTR
         return 0
-    stmt.var_type = TYPE_PTR
-    stmt.var_pointee_type = t
+    dt.var_type = TYPE_PTR
+    dt.var_pointee_type = t
     1
 
 # AGAST #2330: the struct an un-annotated `let p = @a`, `let q = p` or `let q = p + k`
 # holds an array of, for add_array_view: infer_array_ptr_let records N and T but
 # no name, since a name would register `p` as a `*S`.  null for scalars.
-fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
-    *out_len = stmt.var_type_name_len
-    if stmt.var_type_name_len > 0 or stmt.var_init == null
-        return stmt.var_type_name
+fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, dt: *DeclTy, out_len: *i32) -> *u8
+    *out_len = dt.var_type_name_len
+    if dt.var_type_name_len > 0 or stmt.var_init == null
+        return dt.var_type_name
     let init: *Expr = stmt.var_init
     var src: *LocalVar = array_ptr_index_base(s, init)
     if src == null and init.kind == EXPR_BINARY and (init.op == OP_ADD or init.op == OP_SUB)
@@ -484,8 +531,8 @@ fn inferred_array_elem_name(s: *EmitterState, stmt: *Stmt, out_len: *i32) -> *u8
 # AGAST #2524: so is `p[i]` through a `*[N]S`, `@[N]S` or `@&[N]S` (the place
 # `*(p# + i)`), as `let s: S = p[i]` already was (#2330).  Returns 1 when it
 # typed the local.
-fn infer_through_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+fn infer_through_elem_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or stmt.var_init == null
         return 0
     # `let n: i64 = p[i]` is i64 too; it stays a refused integer (#2330).
     if stmt.var_declared_type != TYPE_VOID
@@ -496,9 +543,9 @@ fn infer_through_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
     var len: i32 = 0
     if index_through_value_struct(s, stmt.var_init, @name, @len) == 0
         return 0
-    stmt.var_type = TYPE_STRUCT
-    stmt.var_type_name = name
-    stmt.var_type_name_len = len
+    dt.var_type = TYPE_STRUCT
+    dt.var_type_name = name
+    dt.var_type_name_len = len
     1
 
 # AGAST #3972: S when `@ie` / `@&ie` points at an S, for `ie` = `x[i]` the
@@ -533,8 +580,8 @@ fn addr_index_elem_struct(s: *EmitterState, ie: *Expr, out_len: *i32) -> *u8
 # AGAST #2993: `let n: i64 = ps[i]` is i64 too, so it was retyped as a %S local
 # and compiled; ritz0 refuses it.  The %S load into the i64 slot then failed at
 # clang, unlocated, so it is refused here, located, as #2330's through form is.
-fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or stmt.var_init == null
         return 0
     var name: *u8 = null
     var len: i32 = 0
@@ -544,9 +591,9 @@ fn infer_struct_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
     if stmt.var_declared_type != TYPE_VOID
         emit_nd_error(s, stmt.var_init.span.line, stmt.var_init.span.col, whole_struct_value_message())
         return 0
-    stmt.var_type = TYPE_STRUCT
-    stmt.var_type_name = name
-    stmt.var_type_name_len = len
+    dt.var_type = TYPE_STRUCT
+    dt.var_type_name = name
+    dt.var_type_name_len = len
     1
 
 # AGAST #2525, #3188: `let n: i32 = *q` with `q: *S` declares an integer and
@@ -574,11 +621,11 @@ fn struct_value_int_let_refused(s: *EmitterState, stmt: *Stmt)
 # refuses `let n: i64 = *(p + i)`; ritz1 took it silently.
 # AGAST #3053: so is `let n: i64 = a[i][j]` with `a: [N]*S`.  emit_expr put the
 # `%S` load in the i64 slot: a clang error, unlocated.
-fn infer_ptr_index_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_ptr_index_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     # AGAST #3188: a declared `let n: <int> = p[i]` / `a[i][j]` is refused at the
     # load, as any integer slot is (whole_struct_elem_refused); only an untyped
     # let is a copy to type here.
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or stmt.var_declared_type != TYPE_VOID
         return 0
     let e: *Expr = stmt.var_init
     if e == null or e.kind != EXPR_INDEX or e.left == null or e.right == null or e.right.kind == EXPR_RANGE
@@ -591,16 +638,16 @@ fn infer_ptr_index_let(s: *EmitterState, stmt: *Stmt) -> i32
         deref_pointee_struct_name(s, e.left, @name, @len)
     if name == null or len <= 0
         return 0
-    stmt.var_type = TYPE_STRUCT
-    stmt.var_type_name = name
-    stmt.var_type_name_len = len
+    dt.var_type = TYPE_STRUCT
+    dt.var_type_name = name
+    dt.var_type_name_len = len
     1
 
 # AGAST #2332: `let q = a[i]` and `let q = a[i] + k` with `a: [N]*T` hold what
 # `let q: *T` does.  Returns 1 when it typed the local.
 # AGAST #2379: so does `let q = @a[i][j]` (or `@&`): `a[i][j]` is `*(a[i] + j)`,
 # and its address is `a[i] + j`.  It stayed an i64: `*q` loaded 8 bytes.
-fn infer_array_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_array_elem_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     if stmt.var_declared_type != TYPE_VOID or stmt.var_init == null
         return 0
     var init: *Expr = stmt.var_init
@@ -613,17 +660,17 @@ fn infer_array_elem_let(s: *EmitterState, stmt: *Stmt) -> i32
     var name_len: i32 = 0
     let pointee: i32 = array_elem_pointee(s, init, @name, @name_len)
     if pointee == TYPE_VOID
-        return infer_elem_ptr_ptr_let(s, stmt)
-    stmt.var_type = TYPE_PTR
-    stmt.var_pointee_type = pointee
-    stmt.var_type_name = name
-    stmt.var_type_name_len = name_len
+        return infer_elem_ptr_ptr_let(s, stmt, dt)
+    dt.var_type = TYPE_PTR
+    dt.var_pointee_type = pointee
+    dt.var_type_name = name
+    dt.var_type_name_len = name_len
     return 1
 
 # AGAST #2376: `let r = b[i]` and `let r = *b[i]` with `b: [N]**T`, and
 # `let r = @a[i]` with `a: [N]*T`, hold what `let r: **T` / `let r: *T` do.
 # They were i64s, so `**r` and `*r` loaded and stored 8 bytes.
-fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     var base: *Expr = stmt.var_init
     while base != null and base.kind == EXPR_UNARY and base.op == OP_DEREF
         base = base.operand
@@ -644,15 +691,15 @@ fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
     let levels: i32 = ptr_levels_of(s, init, @inner, @name, @name_len)
     if levels == 0 or inner == TYPE_VOID
         return 0
-    stmt.var_type_name = name
-    stmt.var_type_name_len = name_len
+    dt.var_type_name = name
+    dt.var_type_name_len = name_len
     if levels == 1
-        stmt.var_type = TYPE_PTR
-        stmt.var_pointee_type = inner
+        dt.var_type = TYPE_PTR
+        dt.var_pointee_type = inner
         return 1
-    stmt.var_type = TYPE_PTR_PTR
-    stmt.var_pointee_type = TYPE_PTR
-    stmt.var_inner_pointee_type = inner + (levels - 2) * PTR_DEPTH_UNIT
+    dt.var_type = TYPE_PTR_PTR
+    dt.var_pointee_type = TYPE_PTR
+    dt.var_inner_pointee_type = inner + (levels - 2) * PTR_DEPTH_UNIT
     return 1
 
 # AGAST #2791: `let p = f()` with `f() -> **U` (`vec_as_ptr<*U>`, or written)
@@ -663,7 +710,7 @@ fn infer_elem_ptr_ptr_let(s: *EmitterState, stmt: *Stmt) -> i32
 # packed as `let p: ***u8` packs it.  An unknown U is a `*U`, as the `*T`
 # record was before, so arithmetic on it is refused, not a byte add.
 # Returns the local's var_type.
-fn infer_ptr_ptr_call_let(s: *EmitterState, stmt: *Stmt, fd: *FnDef) -> i32
+fn infer_ptr_ptr_call_let(s: *EmitterState, dt: *DeclTy, fd: *FnDef) -> i32
     var name: *u8 = fd.return_type_name
     var len: i32 = fd.return_type_name_len
     if name == null or len <= 0
@@ -676,24 +723,24 @@ fn infer_ptr_ptr_call_let(s: *EmitterState, stmt: *Stmt, fd: *FnDef) -> i32
     var inner: i32 = primitive_type_from_name(name, len)
     if inner == 0   # primitive_type_from_name's miss value
         if find_struct(s, name, len) == null
-            stmt.var_type = TYPE_PTR
-            stmt.var_type_name = fd.return_type_name
-            stmt.var_type_name_len = fd.return_type_name_len
+            dt.var_type = TYPE_PTR
+            dt.var_type_name = fd.return_type_name
+            dt.var_type_name_len = fd.return_type_name_len
             return TYPE_PTR
         inner = TYPE_STRUCT
-        stmt.var_type_name = name
-        stmt.var_type_name_len = len
-    stmt.var_type = TYPE_PTR_PTR
-    stmt.var_pointee_type = TYPE_PTR
-    stmt.var_inner_pointee_type = inner + extra * PTR_DEPTH_UNIT
+        dt.var_type_name = name
+        dt.var_type_name_len = len
+    dt.var_type = TYPE_PTR_PTR
+    dt.var_pointee_type = TYPE_PTR
+    dt.var_inner_pointee_type = inner + extra * PTR_DEPTH_UNIT
     TYPE_PTR_PTR
 
 # AGAST #2335, #2338, #2445: what an un-annotated `let` or `var` holds, as far
 # as a write through it goes: `let p = @x` an `@T`, `@&x` an `@&T`, or a copy of
 # one from a local, a field or a call.  Ask before the inference in
-# emit_var_decl rewrites var_type, or `let p: *C = @c` looks like it.
-fn let_ref_view(s: *EmitterState, stmt: *Stmt) -> i32
-    if stmt.var_type != TYPE_I64 or stmt.var_type_name_len != 0 or stmt.var_init == null
+# emit_var_decl rewrites the type in DeclTy, or `let p: *C = @c` looks like it.
+fn let_ref_view(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
+    if dt.var_type != TYPE_I64 or dt.var_type_name_len != 0 or stmt.var_init == null
         return REF_VIEW_UNKNOWN
     ref_view(s, stmt.var_init)
 
@@ -704,16 +751,16 @@ fn let_ref_view(s: *EmitterState, stmt: *Stmt) -> i32
 # (let_ref_view is UNKNOWN for it).
 # A `**T` one (`let r = @q`, q a `*T` of a scalar, an enum or an array) is an
 # `@*T` / `@&*T`: the pointee stays the `*T`, so `**r` and `*r = d` keep working.
-fn type_ref_view_let(stmt: *Stmt, view: i32) -> i32
-    if stmt.var_type != TYPE_PTR and stmt.var_type != TYPE_PTR_PTR
+fn type_ref_view_let(dt: *DeclTy, view: i32) -> i32
+    if dt.var_type != TYPE_PTR and dt.var_type != TYPE_PTR_PTR
         return 0
     if view != REF_VIEW_SHARED and view != REF_VIEW_MUT
         return 0
-    if stmt.var_type == TYPE_PTR and stmt.var_type_name_len > 0 and stmt.var_pointee_type != TYPE_ARRAY
-        stmt.var_pointee_type = TYPE_STRUCT
-    stmt.var_type = TYPE_REF
+    if dt.var_type == TYPE_PTR and dt.var_type_name_len > 0 and dt.var_pointee_type != TYPE_ARRAY
+        dt.var_pointee_type = TYPE_STRUCT
+    dt.var_type = TYPE_REF
     if view == REF_VIEW_MUT
-        stmt.var_type = TYPE_MUT_REF
+        dt.var_type = TYPE_MUT_REF
     1
 
 # The integer type an unannotated `let x = init` takes from `init`, as ritz0
@@ -775,7 +822,7 @@ pub fn ctor_family_is(ctor: *Expr, name: *u8, len: i32) -> i32
 # then `o` in a `-> Option<i32>` fn); otherwise the one its payload names, as a
 # scrutinee's (#2419).  1 when it typed the local; a payload nothing names is a
 # located error, never the zero.
-fn infer_ctor_let(s: *EmitterState, stmt: *Stmt) -> i32
+fn infer_ctor_let(s: *EmitterState, stmt: *Stmt, dt: *DeclTy) -> i32
     let init: *Expr = stmt.var_init
     if stmt.var_declared_type != TYPE_VOID or init == null
         return 0
@@ -797,9 +844,9 @@ fn infer_ctor_let(s: *EmitterState, stmt: *Stmt) -> i32
     if name == null
         emit_ctor_type_error(s, init)
         return 0
-    stmt.var_type = TYPE_STRUCT
-    stmt.var_type_name = name
-    stmt.var_type_name_len = len
+    dt.var_type = TYPE_STRUCT
+    dt.var_type_name = name
+    dt.var_type_name_len = len
     1
 
 # 1 when `e` is a Some/None/Ok/Err the builtin Option / Result builds: not a
@@ -1169,16 +1216,48 @@ fn emit_tuple_decl(s: *EmitterState, stmt: *Stmt)
 # AGAST #2575 / #2596: type an un-annotated let as the `*T` that
 # ptr_root_pointee / ptr_arith_pointee resolved: `kind` is TYPE_STRUCT (with
 # the struct's name) for a `*S`, the primitive kind for a scalar `*T`, 0 for
-# neither.  Returns TYPE_PTR once the let is typed, else 0 (stmt untouched).
-fn narrow_to_ptr(stmt: *Stmt, kind: i32, name: *u8, name_len: i32) -> i32
+# neither.  Returns TYPE_PTR once the let is typed, else 0 (dt untouched).
+fn narrow_to_ptr(dt: *DeclTy, kind: i32, name: *u8, name_len: i32) -> i32
     if kind == 0
         return 0
-    stmt.var_type = TYPE_PTR
-    stmt.var_pointee_type = kind
+    dt.var_type = TYPE_PTR
+    dt.var_pointee_type = kind
     if kind == TYPE_STRUCT
-        stmt.var_type_name = name
-        stmt.var_type_name_len = name_len
+        dt.var_type_name = name
+        dt.var_type_name_len = name_len
     TYPE_PTR
+
+# 1 when the inferred pointee array's element is a struct: ast_query's
+# names_array_elem_struct, for a DeclTy instead of the Stmt.
+fn decl_pointee_array_elem_struct(dt: *DeclTy) -> i32
+    if dt.var_pointee_array_size <= 0
+        return 0
+    let elem: i32 = dt.var_pointee_array_elem_type
+    (elem == TYPE_STRUCT or (elem == TYPE_PTR and dt.var_pointee_array_elem_pointee == TYPE_STRUCT)) as i32
+
+# AGAST #4407: as ast_query.name_array_ptr_local, reading the type the
+# inference worked out (DeclTy) rather than the Stmt it no longer writes.
+# Sema's callers of the original still pass a Stmt holding the parser's facts.
+fn decl_name_array_ptr_local(loc: *LocalVar, dt: *DeclTy, name: *u8, len: i32)
+    let deep_ptr: bool = ref_to_ptr(loc) == 1 or loc.var_type == TYPE_PTR_PTR
+    if loc.type_name_len > 0 and deep_ptr and decl_pointee_array_elem_struct(dt) == 1
+        loc.pointee_array_elem_name = loc.type_name
+        loc.pointee_array_elem_name_len = loc.type_name_len
+        loc.type_name = null
+        loc.type_name_len = 0
+        return
+    if loc.type_name_len > 0 or name == null or len <= 0
+        return
+    if dt.var_pointee_array_size <= 0 or dt.var_pointee_array_elem_type != TYPE_STRUCT
+        return
+    let t: i32 = loc.var_type
+    let one: bool = (t == TYPE_PTR or t == TYPE_REF or t == TYPE_MUT_REF) and dt.var_pointee_type == TYPE_ARRAY
+    # AGAST #3079: an `@*[N]S` / `@&*[N]S` (`let r = @q`) is as deep as a `**[N]S`.
+    let deep: bool = t == TYPE_PTR_PTR or ((t == TYPE_REF or t == TYPE_MUT_REF) and dt.var_pointee_type == TYPE_PTR)
+    let two: bool = deep and dt.var_inner_pointee_type == TYPE_ARRAY
+    if one or two
+        loc.pointee_array_elem_name = name
+        loc.pointee_array_elem_name_len = len
 
 # AGAST #2417: the signature of an un-annotated `let f = mb`, a bare fn
 # name: mb's own.  Without it a call `f(..)` was the untyped `call i64` and
@@ -1216,7 +1295,10 @@ fn emit_var_decl(s: *EmitterState, stmt: *Stmt)
     emit_var_decl_at(s, stmt)
 
 fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
-    let view: i32 = let_ref_view(s, stmt)   # AGAST #3079
+    # AGAST #4407: the inferred type, local to this declaration (see DeclTy).
+    var dt: DeclTy
+    decl_ty_from(stmt, @dt)
+    let view: i32 = let_ref_view(s, stmt, @dt)   # AGAST #3079
     # Use the user's explicit type annotation. The parser defaults
     # missing annotations to TYPE_I64, so any TYPE_I32 we see here
     # came from an explicit `: i32` and must NOT be overridden —
@@ -1230,7 +1312,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         init_kind = bool_kind(s, stmt.var_init)
     # AGAST #2356 / #2527: as below, before `x` is in scope.
     let init_int: i32 = inferred_int_init(s, stmt, init_kind)
-    var var_type: i32 = stmt.var_type
+    var var_type: i32 = dt.var_type
     # AGAST #1521: remember a declared bool past the i64 promotion below.
     let declared_bool: i32 = (var_type == TYPE_BOOL) as i32
 
@@ -1244,21 +1326,21 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # so all subsequent var operations agree.
     if var_type == TYPE_BOOL
         var_type = TYPE_I64
-        stmt.var_type = TYPE_I64
+        dt.var_type = TYPE_I64
 
     # AGAST #2302: untyped `let b = f()` of a `-> [N]T` is the `[N]T` local
     # `let b: [N]T = f()` declares, as in ritz0.
-    if stmt.var_declared_type == TYPE_VOID and stmt.var_type_name_len == 0 and stmt.var_init != null
+    if stmt.var_declared_type == TYPE_VOID and dt.var_type_name_len == 0 and stmt.var_init != null
         let lra: *Param = call_ret_array(s, stmt.var_init)
         if lra != null
             var_type = TYPE_ARRAY
-            stmt.var_type = TYPE_ARRAY
-            stmt.var_array_size = lra.param_array_size
-            stmt.var_array_elem_type = lra.param_array_elem_type
-            stmt.var_array_elem_pointee = lra.param_array_elem_pointee
-            stmt.var_array_shape = lra.param_array_shape   # AGAST #3634: `[N][M]T`
-            stmt.var_type_name = lra.param_type_name
-            stmt.var_type_name_len = lra.param_type_name_len
+            dt.var_type = TYPE_ARRAY
+            dt.var_array_size = lra.param_array_size
+            dt.var_array_elem_type = lra.param_array_elem_type
+            dt.var_array_elem_pointee = lra.param_array_elem_pointee
+            dt.var_array_shape = lra.param_array_shape   # AGAST #3634: `[N][M]T`
+            dt.var_type_name = lra.param_type_name
+            dt.var_type_name_len = lra.param_type_name_len
         # AGAST #3191: so is `let c = *p` of a `*[N]T` (local, field, global,
         # `p + k`): the `[N]T` local `let c: [N]T = *p` declares, copied.
         else if stmt.var_init.kind == EXPR_UNARY and stmt.var_init.op == OP_DEREF
@@ -1273,33 +1355,33 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 # declares, copied (emit_nd_array_init_copy), as a plane is
                 # (#3350).  #2098 refused it: the #3191 copy was the flat one.
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = dnd.dims[0]
-                stmt.var_array_elem_type = TYPE_ARRAY
-                stmt.var_array_elem_pointee = TYPE_VOID
-                stmt.var_array_shape = dnd
-                stmt.var_type_name = null
-                stmt.var_type_name_len = 0
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = dnd.dims[0]
+                dt.var_array_elem_type = TYPE_ARRAY
+                dt.var_array_elem_pointee = TYPE_VOID
+                dt.var_array_shape = dnd
+                dt.var_type_name = null
+                dt.var_type_name_len = 0
             else if array_ptr_shape(s, stmt.var_init.operand, @dsh) == 1
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = dsh.size
-                stmt.var_array_elem_type = dsh.elem
-                stmt.var_type_name = dsh.name
-                stmt.var_type_name_len = dsh.name_len
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = dsh.size
+                dt.var_array_elem_type = dsh.elem
+                dt.var_type_name = dsh.name
+                dt.var_type_name_len = dsh.name_len
         # AGAST #2305: and `let r = if c then f() else g()`: an arm's array.
         # AGAST #3276: and `let r = match c` + arms of arrays.
         else if stmt.var_init.kind == EXPR_IF or stmt.var_init.kind == EXPR_MATCH
             var ish: ArraySrc
-            var ipt: i32 = stmt.var_array_elem_pointee
+            var ipt: i32 = dt.var_array_elem_pointee
             if if_array_shape(s, stmt.var_init, @ish, @ipt) == 1
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = ish.size
-                stmt.var_array_elem_type = ish.elem
-                stmt.var_array_elem_pointee = ipt
-                stmt.var_type_name = ish.name
-                stmt.var_type_name_len = ish.name_len
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = ish.size
+                dt.var_array_elem_type = ish.elem
+                dt.var_array_elem_pointee = ipt
+                dt.var_type_name = ish.name
+                dt.var_type_name_len = ish.name_len
         # AGAST #3017: and `let arr = h.a` of an `a: [N]T` field (any root
         # resolve_member_chain_field types, a Box's Deref included): the `[N]T`
         # local `let arr: [N]T = h.a` declares, copied.  The slot was i64, so
@@ -1308,13 +1390,13 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             let af: *StructField = resolve_member_chain_field(s, stmt.var_init)
             if af != null and af.field_type == TYPE_ARRAY
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = af.array_size
-                stmt.var_array_elem_type = af.array_elem_type
-                stmt.var_array_elem_pointee = af.array_elem_pointee
-                stmt.var_array_shape = af.array_shape
-                stmt.var_type_name = af.array_elem_type_name
-                stmt.var_type_name_len = af.array_elem_type_name_len
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = af.array_size
+                dt.var_array_elem_type = af.array_elem_type
+                dt.var_array_elem_pointee = af.array_elem_pointee
+                dt.var_array_shape = af.array_shape
+                dt.var_type_name = af.array_elem_type_name
+                dt.var_type_name_len = af.array_elem_type_name_len
         # AGAST #3322: and `let r = g[i]`, a row of an `[N][M]T` (local,
         # global, field, plane pointer; the inner row of a deeper one): the
         # `[M]T` local `let r: [M]T = g[i]` declares, copied, as ritz0 binds
@@ -1328,22 +1410,22 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             let row_sh: *ArrayShape = nd_index_shape(s, stmt.var_init, @row_depth)
             if row_sh != null and row_depth == row_sh.rank - 1 and (row_sh.leaf_type != TYPE_STRUCT or row_sh.leaf_name_len > 0)
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = row_sh.dims[row_sh.rank - 1]
-                stmt.var_array_elem_type = row_sh.leaf_type
-                stmt.var_array_elem_pointee = row_sh.leaf_pointee
-                stmt.var_type_name = row_sh.leaf_name
-                stmt.var_type_name_len = row_sh.leaf_name_len
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = row_sh.dims[row_sh.rank - 1]
+                dt.var_array_elem_type = row_sh.leaf_type
+                dt.var_array_elem_pointee = row_sh.leaf_pointee
+                dt.var_type_name = row_sh.leaf_name
+                dt.var_type_name_len = row_sh.leaf_name_len
             else if row_sh != null and row_depth <= row_sh.rank - 2 and (row_sh.leaf_type != TYPE_STRUCT or row_sh.leaf_name_len > 0)
                 let plane_sh: *ArrayShape = nd_plane_shape(s, stmt.var_init)
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = plane_sh.dims[0]
-                stmt.var_array_elem_type = TYPE_ARRAY
-                stmt.var_array_elem_pointee = TYPE_VOID
-                stmt.var_array_shape = plane_sh
-                stmt.var_type_name = null
-                stmt.var_type_name_len = 0
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = plane_sh.dims[0]
+                dt.var_array_elem_type = TYPE_ARRAY
+                dt.var_array_elem_pointee = TYPE_VOID
+                dt.var_array_shape = plane_sh
+                dt.var_type_name = null
+                dt.var_type_name_len = 0
 
     # AGAST #1666: untyped `let v = match ...`.  The merge phi's type is only
     # known once the arms are emitted (#1645: `%StrView`, `%Point`, or i64),
@@ -1353,7 +1435,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # Shadowing is unaffected: `v` is registered after its initializer.
     var pre_init_reg: i32 = 0
     var pre_emitted: i32 = 0
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+    if var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_init != null
         # EXPR_IF (#1613) publishes its phi type the same way.
         if stmt.var_init.kind == EXPR_MATCH or stmt.var_init.kind == EXPR_IF
             # Clear first so a stale type from an earlier match can't leak in.
@@ -1381,24 +1463,24 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             pre_emitted = 1
             if s.last_match_agg_name != null and s.last_match_agg_name_len > 0
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = s.last_match_agg_name
-                stmt.var_type_name_len = s.last_match_agg_name_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = s.last_match_agg_name
+                dt.var_type_name_len = s.last_match_agg_name_len
             else if s.last_match_float_ty != 0
                 # AGAST #1946: float-valued arms, `let v = match o` with
                 # `Some(x) => x` over Option<f64>: a `double` slot.
                 var_type = s.last_match_float_ty
-                stmt.var_type = var_type
+                dt.var_type = var_type
             else if ptr_phi_name != null and arms == 0
                 # AGAST #2960: a `ptr` phi of `@&C` arms is an `@&C` slot.
                 var_type = TYPE_MUT_REF
-                stmt.var_type = TYPE_MUT_REF
-                stmt.var_type_name = ptr_phi_name
-                stmt.var_type_name_len = ptr_phi_len
-                stmt.var_pointee_type = TYPE_STRUCT
+                dt.var_type = TYPE_MUT_REF
+                dt.var_type_name = ptr_phi_name
+                dt.var_type_name_len = ptr_phi_len
+                dt.var_pointee_type = TYPE_STRUCT
 
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and pre_emitted == 0
-        if infer_ctor_let(s, stmt) == 1
+    if var_type == TYPE_I64 and dt.var_type_name_len == 0 and pre_emitted == 0
+        if infer_ctor_let(s, stmt, @dt) == 1
             var_type = TYPE_STRUCT
 
     # AGAST #2266: `var a = [t, u]` of struct T is `[2]T`, as annotated.  It
@@ -1408,7 +1490,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # (array_init_elem): `[5, 6, 7]` is `[3]i64`, `[x; 4]` with `x: u8` is
     # `[4]u8`.  A scalar kept the i64 slot, which held the address of
     # emit_expr's shadow `[N x i64]`, so `a[2]` silently read garbage.
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_declared_type == TYPE_VOID and stmt.var_init != null and (stmt.var_init.kind == EXPR_ARRAY_LIT or stmt.var_init.kind == EXPR_ARRAY_FILL)
+    if var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_declared_type == TYPE_VOID and stmt.var_init != null and (stmt.var_init.kind == EXPR_ARRAY_LIT or stmt.var_init.kind == EXPR_ARRAY_FILL)
         var ael_name: *u8 = null
         var ael_len: i32 = 0
         var ael_ty: i32 = array_init_elem(s, stmt.var_init, @ael_name, @ael_len)
@@ -1428,12 +1510,12 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 ael_it = ael_it.next
         if ael_ty != TYPE_VOID and ael_n > 0
             var_type = TYPE_ARRAY
-            stmt.var_type = TYPE_ARRAY
-            stmt.var_array_size = ael_n
-            stmt.var_array_elem_type = ael_ty
-            stmt.var_array_elem_pointee = ael_pointee
-            stmt.var_type_name = ael_name
-            stmt.var_type_name_len = ael_len
+            dt.var_type = TYPE_ARRAY
+            dt.var_array_size = ael_n
+            dt.var_array_elem_type = ael_ty
+            dt.var_array_elem_pointee = ael_pointee
+            dt.var_type_name = ael_name
+            dt.var_type_name_len = ael_len
 
     # Infer struct type for `var IDENT = expr` (no annotation).
     # The parser defaults missing annotations to TYPE_I64, which is
@@ -1442,7 +1524,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # When we see a plain TYPE_I64 with no type-name but a call-style
     # initializer whose resolved function returns a struct, narrow
     # var_type to the struct so the alloca/store widths match.
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+    if var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_init != null
         if stmt.var_init.kind == EXPR_CALL
             # AGAST #1797: `let b = Holds(20)` is the user enum it builds.
             var uc_name: *u8 = null
@@ -1451,29 +1533,29 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             var fn_def: *FnDef = null
             if uc_name != null
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = uc_name
-                stmt.var_type_name_len = uc_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = uc_name
+                dt.var_type_name_len = uc_len
             else
                 fn_def = find_call_fn(s, stmt.var_init)
             if fn_def != null and fn_def.return_type == TYPE_PTR_PTR
-                var_type = infer_ptr_ptr_call_let(s, stmt, fn_def)
+                var_type = infer_ptr_ptr_call_let(s, @dt, fn_def)
             else if fn_def != null and fn_def.return_type == TYPE_STRUCT
                 if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
                     var_type = TYPE_STRUCT
-                    stmt.var_type = TYPE_STRUCT
-                    stmt.var_type_name = fn_def.return_type_name
-                    stmt.var_type_name_len = fn_def.return_type_name_len
+                    dt.var_type = TYPE_STRUCT
+                    dt.var_type_name = fn_def.return_type_name
+                    dt.var_type_name_len = fn_def.return_type_name_len
             # AGAST #1980: `let p = vec_as_ptr<i32>(@v)` -- monomorph names a
             # specialised `-> *T`'s pointee "i32".  That is a pointee kind, not
             # a struct: register p like `let p: *i32` (element stride/load
             # width from var_pointee_type), not as a pointer to struct %i32.
             else if fn_def != null and fn_def.return_type == TYPE_PTR and primitive_type_from_name(fn_def.return_type_name, fn_def.return_type_name_len) != 0
                 var_type = TYPE_PTR
-                stmt.var_type = TYPE_PTR
-                stmt.var_type_name = null
-                stmt.var_type_name_len = 0
-                stmt.var_pointee_type = primitive_type_from_name(fn_def.return_type_name, fn_def.return_type_name_len)
+                dt.var_type = TYPE_PTR
+                dt.var_type_name = null
+                dt.var_type_name_len = 0
+                dt.var_pointee_type = primitive_type_from_name(fn_def.return_type_name, fn_def.return_type_name_len)
             else if fn_def != null and fn_def.return_type == TYPE_PTR and fn_def.return_type_name != null and fn_def.return_type_name_len > 0
                 # `let cqe = uring_peek_cqe(...)` — fn returns `*IoUringCqe`.
                 # Narrow the local to TYPE_PTR with the pointee struct name
@@ -1484,15 +1566,15 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 # local at TYPE_I64 and tripped "; ERROR: unhandled
                 # EXPR_MEMBER".
                 var_type = TYPE_PTR
-                stmt.var_type = TYPE_PTR
-                stmt.var_type_name = fn_def.return_type_name
-                stmt.var_type_name_len = fn_def.return_type_name_len
+                dt.var_type = TYPE_PTR
+                dt.var_type_name = fn_def.return_type_name
+                dt.var_type_name_len = fn_def.return_type_name_len
             # Float-returning fn → narrow to TYPE_F32/F64 so the alloca
             # and downstream loads/stores are the right width (was
             # defaulting to i64 → `store i64 <float>` rejected by clang).
             else if fn_def != null and (fn_def.return_type == TYPE_F32 or fn_def.return_type == TYPE_F64)
                 var_type = fn_def.return_type
-                stmt.var_type = fn_def.return_type
+                dt.var_type = fn_def.return_type
             # AGAST #175: pointer-returning fn (`-> *Foo`) - narrow to TYPE_PTR
             # with the pointee struct name so `let x = peek_cqe(...)` registers
             # x as a struct-pointer binding and `x.field` resolves via
@@ -1502,9 +1584,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             else if fn_def != null and fn_def.return_type == TYPE_PTR
                 if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
                     var_type = TYPE_PTR
-                    stmt.var_type = TYPE_PTR
-                    stmt.var_type_name = fn_def.return_type_name
-                    stmt.var_type_name_len = fn_def.return_type_name_len
+                    dt.var_type = TYPE_PTR
+                    dt.var_type_name = fn_def.return_type_name
+                    dt.var_type_name_len = fn_def.return_type_name_len
             # AGAST #1453: reference-returning fn (`-> @L` / `-> @&L`).  A
             # reference is a pointer at the LLVM level, so register the local
             # exactly like #175's `-> *Foo` case: `let m = get(l); m.x` then
@@ -1515,14 +1597,14 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 if ret_ref_scalar_pointee(fn_def) != TYPE_VOID
                     # AGAST #2308: `-> @&i8` keeps its width, as `-> *i8` does.
                     var_type = TYPE_PTR
-                    stmt.var_type = TYPE_PTR
-                    stmt.var_pointee_type = ret_ref_scalar_pointee(fn_def)
+                    dt.var_type = TYPE_PTR
+                    dt.var_pointee_type = ret_ref_scalar_pointee(fn_def)
                 else if fn_def.return_type_name != null and fn_def.return_type_name_len > 0
                     if find_struct(s, fn_def.return_type_name, fn_def.return_type_name_len) != null
                         var_type = TYPE_PTR
-                        stmt.var_type = TYPE_PTR
-                        stmt.var_type_name = fn_def.return_type_name
-                        stmt.var_type_name_len = fn_def.return_type_name_len
+                        dt.var_type = TYPE_PTR
+                        dt.var_type_name = fn_def.return_type_name
+                        dt.var_type_name_len = fn_def.return_type_name_len
         # task-101: builtin method return-type table. Method calls like
         # `s.as_bytes()` hit compiler intrinsics (try_emit_strview_as_bytes),
         # NOT a real fn_def, so the EXPR_CALL branch above can't find them
@@ -1541,18 +1623,18 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             qualified_variant_enum(s, stmt.var_init, @qv_name, @qv_len)
             if qv_name != null
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = qv_name
-                stmt.var_type_name_len = qv_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = qv_name
+                dt.var_type_name_len = qv_len
             else if init_fmt != 0
                 var_type = init_fmt
-                stmt.var_type = init_fmt
+                dt.var_type = init_fmt
             # StrView.as_bytes() -> %Span$u8
             else if name_eq(stmt.var_init.ident_ptr, stmt.var_init.ident_len, c"as_bytes", 8) == 1
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = c"Span$u8"
-                stmt.var_type_name_len = 7
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = c"Span$u8"
+                dt.var_type_name_len = 7
             else
                 # task-112 / AGAST #1798: a method returning a struct or a
                 # float narrows the local to that type.  Resolve the callee
@@ -1571,18 +1653,18 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 if m != null
                     if m.return_type == TYPE_STRUCT and m.return_type_name_len > 0
                         var_type = TYPE_STRUCT
-                        stmt.var_type = TYPE_STRUCT
-                        stmt.var_type_name = m.return_type_name
-                        stmt.var_type_name_len = m.return_type_name_len
+                        dt.var_type = TYPE_STRUCT
+                        dt.var_type_name = m.return_type_name
+                        dt.var_type_name_len = m.return_type_name_len
                     else if m.return_type == TYPE_F32 or m.return_type == TYPE_F64
                         # Float-returning method: narrow so alloca/store
                         # width match (was `alloca i64; store float`).
                         var_type = m.return_type
-                        stmt.var_type = m.return_type
+                        dt.var_type = m.return_type
                     else if ret_ref_scalar_pointee(m) != TYPE_VOID
                         var_type = TYPE_PTR   # AGAST #2308, as for a call
-                        stmt.var_type = TYPE_PTR
-                        stmt.var_pointee_type = ret_ref_scalar_pointee(m)
+                        dt.var_type = TYPE_PTR
+                        dt.var_pointee_type = ret_ref_scalar_pointee(m)
                     else if (m.return_type == TYPE_PTR or m.return_type == TYPE_REF or m.return_type == TYPE_MUT_REF) and m.return_type_name_len > 0 and find_struct(s, m.return_type_name, m.return_type_name_len) != null
                         # AGAST #3620: `-> *S` / `-> @S` / `-> @&S` points
                         # at S, as a call's does (#175, #1453).  The local
@@ -1590,9 +1672,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                         # self.get_draw_buffer_ref(); buf.set(..)` had no
                         # receiver type.
                         var_type = TYPE_PTR
-                        stmt.var_type = TYPE_PTR
-                        stmt.var_type_name = m.return_type_name
-                        stmt.var_type_name_len = m.return_type_name_len
+                        dt.var_type = TYPE_PTR
+                        dt.var_type_name = m.return_type_name
+                        dt.var_type_name_len = m.return_type_name_len
                 else
                     # AGAST #2576: `let t = r.unwrap()`, r an Option<S> or a
                     # Result<S, E> (`mk().unwrap()`, angelo's ttf tests), is
@@ -1606,9 +1688,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     unwrap_payload_struct_name(s, stmt.var_init, @up_name, @up_len)
                     if up_len > 0 and (find_struct(s, up_name, up_len) != null or user_enum_index(up_name, up_len) >= 0)
                         var_type = TYPE_STRUCT
-                        stmt.var_type = TYPE_STRUCT
-                        stmt.var_type_name = up_name
-                        stmt.var_type_name_len = up_len
+                        dt.var_type = TYPE_STRUCT
+                        dt.var_type_name = up_name
+                        dt.var_type_name_len = up_len
                     else
                         # AGAST #3161: a built-in `Span<T>.slice` (no FnDef) is
                         # the receiver's own Span$T.
@@ -1617,9 +1699,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                         span_builtin_slice_struct(s, stmt.var_init, @sl_name, @sl_len)
                         if sl_len > 0
                             var_type = TYPE_STRUCT
-                            stmt.var_type = TYPE_STRUCT
-                            stmt.var_type_name = sl_name
-                            stmt.var_type_name_len = sl_len
+                            dt.var_type = TYPE_STRUCT
+                            dt.var_type_name = sl_name
+                            dt.var_type_name_len = sl_len
         # AGAST #1681: `var parsed = p` where `p` is a struct-typed local —
         # a by-value struct param or a struct `let`.  Copy its struct type
         # so the slot is `alloca %S` (was `alloca i64` → `store i64 %<%S>`
@@ -1633,14 +1715,14 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             # an array local, so the array arm below copies it (#2290).
             if lent_local(s, stmt.var_init) != null and src_loc.var_type == TYPE_MUT_REF
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = src_loc.type_name
-                stmt.var_type_name_len = src_loc.type_name_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = src_loc.type_name
+                dt.var_type_name_len = src_loc.type_name_len
             else if src_loc != null and src_loc.var_type == TYPE_STRUCT and src_loc.type_name_len > 0
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = src_loc.type_name
-                stmt.var_type_name_len = src_loc.type_name_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = src_loc.type_name
+                dt.var_type_name_len = src_loc.type_name_len
             # AGAST #2169: `var b = a` with `a: [N]T` -- `b` is `[N]T` too, and
             # the init copies the whole array (it was an i64 slot holding
             # a's first 8 bytes).  A multi-dimensional `a` keeps its shape
@@ -1649,22 +1731,22 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             # became an array copy, ignoring the `i64`; ritz0 refuses it.
             else if src_loc != null and src_loc.var_type == TYPE_ARRAY and stmt.var_declared_type == TYPE_VOID
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = src_loc.array_size
-                stmt.var_array_elem_type = src_loc.array_elem_type
-                stmt.var_array_shape = src_loc.array_shape
-                stmt.var_type_name = src_loc.type_name
-                stmt.var_type_name_len = src_loc.type_name_len
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = src_loc.array_size
+                dt.var_array_elem_type = src_loc.array_elem_type
+                dt.var_array_shape = src_loc.array_shape
+                dt.var_type_name = src_loc.type_name
+                dt.var_type_name_len = src_loc.type_name_len
             # AGAST #2287: `var b = G` with `G: [N]T`, as for a local.
             else if src_loc == null and global_array_named(s, stmt.var_init) != null and stmt.var_declared_type == TYPE_VOID
                 let src_g: *GlobalVarDef = global_array_named(s, stmt.var_init)
                 var_type = TYPE_ARRAY
-                stmt.var_type = TYPE_ARRAY
-                stmt.var_array_size = src_g.array_size
-                stmt.var_array_elem_type = src_g.array_elem_type
-                stmt.var_array_shape = src_g.array_shape
-                stmt.var_type_name = src_g.array_elem_type_name
-                stmt.var_type_name_len = src_g.array_elem_type_name_len
+                dt.var_type = TYPE_ARRAY
+                dt.var_array_size = src_g.array_size
+                dt.var_array_elem_type = src_g.array_elem_type
+                dt.var_array_shape = src_g.array_shape
+                dt.var_type_name = src_g.array_elem_type_name
+                dt.var_type_name_len = src_g.array_elem_type_name_len
             # AGAST #3275: `var x = G` with `G: S`, a module-level struct or
             # enum -- `x` is an `S` too, as ritz0 types it.  The slot was i64,
             # so clang rejected `store i64 %<%S>`, `x.f` was "unhandled
@@ -1673,9 +1755,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             else if src_loc == null and stmt.var_declared_type == TYPE_VOID and global_struct_named(s, stmt.var_init) != null
                 let src_sg: *GlobalVarDef = global_struct_named(s, stmt.var_init)
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = src_sg.type_name
-                stmt.var_type_name_len = src_sg.type_name_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = src_sg.type_name
+                dt.var_type_name_len = src_sg.type_name_len
             # AGAST #1754: `let q = s` with `s: @&S` / `@S` -- `q` takes `s`'s
             # reference type and pointee, so `q.a` resolves and the slot holds
             # the same `ptr` / i64 `s` loads as.  (Was i64 with no struct name:
@@ -1684,28 +1766,28 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             # AGAST #3079: and `p: @*i32` (`let p = @q`, q: *i32).
             else if src_loc != null and (src_loc.var_type == TYPE_MUT_REF or src_loc.var_type == TYPE_REF) and (src_loc.type_name_len > 0 or scalar_pointee(src_loc.pointee_type) == 1 or src_loc.pointee_type == TYPE_PTR)
                 var_type = src_loc.var_type
-                stmt.var_type = src_loc.var_type
-                stmt.var_type_name = src_loc.type_name
-                stmt.var_type_name_len = src_loc.type_name_len
-                stmt.var_pointee_type = src_loc.pointee_type
-                stmt.var_inner_pointee_type = src_loc.inner_pointee_type   # AGAST #2372: `s: @**S`
-                stmt.var_inner_ref = src_loc.inner_ref   # AGAST #2399: `s: @@S`
+                dt.var_type = src_loc.var_type
+                dt.var_type_name = src_loc.type_name
+                dt.var_type_name_len = src_loc.type_name_len
+                dt.var_pointee_type = src_loc.pointee_type
+                dt.var_inner_pointee_type = src_loc.inner_pointee_type   # AGAST #2372: `s: @**S`
+                dt.var_inner_ref = src_loc.inner_ref   # AGAST #2399: `s: @@S`
                 # AGAST #2321: `s: @[N]S`, so `q[i]` is what `s[i]` is.
-                stmt.var_pointee_array_size = src_loc.pointee_array_size
-                stmt.var_pointee_array_elem_type = src_loc.pointee_array_elem_type
+                dt.var_pointee_array_size = src_loc.pointee_array_size
+                dt.var_pointee_array_elem_type = src_loc.pointee_array_elem_type
             # AGAST #1938: `let pp = q` with `q: **S` -- `pp` takes `q`'s
             # TYPE_PTR_PTR and struct name, so the #1933
             # registration below keeps S and `(**pp).f` resolves.  (Was i64
             # with no struct name: "unhandled EXPR_MEMBER".)
             else if src_loc != null and src_loc.var_type == TYPE_PTR_PTR and src_loc.type_name_len > 0
                 var_type = TYPE_PTR_PTR
-                stmt.var_type = TYPE_PTR_PTR
-                stmt.var_type_name = src_loc.type_name
-                stmt.var_type_name_len = src_loc.type_name_len
+                dt.var_type = TYPE_PTR_PTR
+                dt.var_type_name = src_loc.type_name
+                dt.var_type_name_len = src_loc.type_name_len
                 # AGAST #1941: and q's inner pointee, so `*pp + 1` strides
                 # sizeof(S) (ptr_levels_of reads it).
-                stmt.var_inner_pointee_type = src_loc.inner_pointee_type
-                stmt.var_inner_ref = src_loc.inner_ref   # AGAST #2399: `q: *@S`
+                dt.var_inner_pointee_type = src_loc.inner_pointee_type
+                dt.var_inner_ref = src_loc.inner_ref   # AGAST #2399: `q: *@S`
             # AGAST #2596: `let e = p` with `p: *S` / `*T` -- `e` is a `*S` /
             # `*T` too.  It was an i64 with no pointee: `e.b` "unhandled
             # EXPR_MEMBER", `@e.b` "cannot take address".
@@ -1713,7 +1795,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 var cp_name: *u8 = null
                 var cp_len: i32 = 0
                 let cp_kind: i32 = ptr_root_pointee(s, stmt.var_init, @cp_name, @cp_len)
-                if narrow_to_ptr(stmt, cp_kind, cp_name, cp_len) != 0
+                if narrow_to_ptr(@dt, cp_kind, cp_name, cp_len) != 0
                     var_type = TYPE_PTR
             # AGAST #1600: `let s = C`, a bare unit variant -- the slot is
             # `alloca %S` like the qualified `let s = S.C` below.
@@ -1723,17 +1805,17 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 unit_enum_expr_name(s, stmt.var_init, @en_name, @en_len)
                 if en_len > 0
                     var_type = TYPE_STRUCT
-                    stmt.var_type = TYPE_STRUCT
-                    stmt.var_type_name = en_name
-                    stmt.var_type_name_len = en_len
+                    dt.var_type = TYPE_STRUCT
+                    dt.var_type_name = en_name
+                    dt.var_type_name_len = en_len
         # task-101: bare "..." literal lowers to a %Span$u8 aggregate
         # (see emit_expr EXPR_STRING_LIT). Without widening, `let s = "ABC"`
         # hits the same store-i64-of-%Span$u8 mismatch that as_bytes does.
         else if stmt.var_init.kind == EXPR_STRING_LIT
             var_type = TYPE_STRUCT
-            stmt.var_type = TYPE_STRUCT
-            stmt.var_type_name = c"Span$u8"
-            stmt.var_type_name_len = 7
+            dt.var_type = TYPE_STRUCT
+            dt.var_type_name = c"Span$u8"
+            dt.var_type_name_len = 7
         # AGAST #2131: `let s = "..." as StrView`.  A struct-target cast
         # emits its operand's register unchanged, so the local takes the
         # operand's struct type (the `%Span$u8` of the bare-literal arm above).
@@ -1743,9 +1825,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             resolve_expr_struct_name(s, stmt.var_init, @cast_sn, @cast_sn_len)
             if cast_sn_len > 0
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = cast_sn
-                stmt.var_type_name_len = cast_sn_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = cast_sn
+                dt.var_type_name_len = cast_sn_len
         # AGAST #1976: `let s = c"..."` is a `*u8`, exactly as if annotated.
         # Without this the local kept the parser default TYPE_I64 with no
         # pointee, so `*(s + 1)` loaded 8 bytes (`load i64`) and
@@ -1753,8 +1835,8 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         # EXPR_CAST arm below gives `let p = raw as *u8`.
         else if stmt.var_init.kind == EXPR_CSTRING_LIT
             var_type = TYPE_PTR
-            stmt.var_type = TYPE_PTR
-            stmt.var_pointee_type = TYPE_U8
+            dt.var_type = TYPE_PTR
+            dt.var_pointee_type = TYPE_U8
         # task-103: same widening for `let w = Wrap { ... }`. Without this,
         # var_type stays TYPE_I64 → alloca i64 (8 bytes) instead of %Wrap,
         # AND w isn't registered with add_local_struct, so later
@@ -1770,9 +1852,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 let lit_st: *StructDef = find_struct(s, lit_name, lit_name_len)
                 if lit_st != null
                     var_type = TYPE_STRUCT
-                    stmt.var_type = TYPE_STRUCT
-                    stmt.var_type_name = lit_name
-                    stmt.var_type_name_len = lit_name_len
+                    dt.var_type = TYPE_STRUCT
+                    dt.var_type_name = lit_name
+                    dt.var_type_name_len = lit_name_len
         # Qualified enum variant: `let a = Shade.Light`.  EXPR_MEMBER on an
         # enum type produces a %Shade-typed register (alloca/store/load
         # pattern in emit_expr_member); the var-decl slot must therefore be
@@ -1789,9 +1871,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             unit_enum_expr_name(s, stmt.var_init, @en_name, @en_len)
             if en_len > 0
                 var_type = TYPE_STRUCT
-                stmt.var_type = TYPE_STRUCT
-                stmt.var_type_name = en_name
-                stmt.var_type_name_len = en_len
+                dt.var_type = TYPE_STRUCT
+                dt.var_type_name = en_name
+                dt.var_type_name_len = en_len
             else
                 # AGAST #2172: a struct-typed field -- `var u = o.i`,
                 # `var w = mk().i`, `let a = d.o.i`, `let u = p.i` -- is a
@@ -1808,9 +1890,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     # `let action = self.hotkey_triggered` stored i64.
                     if find_struct(s, mf.field_type_name, mf.field_type_name_len) != null or is_tagged_enum_type(mf.field_type_name, mf.field_type_name_len) == 1
                         var_type = TYPE_STRUCT
-                        stmt.var_type = TYPE_STRUCT
-                        stmt.var_type_name = mf.field_type_name
-                        stmt.var_type_name_len = mf.field_type_name_len
+                        dt.var_type = TYPE_STRUCT
+                        dt.var_type_name = mf.field_type_name
+                        dt.var_type_name_len = mf.field_type_name_len
                 # AGAST #2596: a `*T` field -- `let e = v.data` of a `Vec<E>`
                 # -- is a `*T`, as if annotated (was i64: `e.b` "unhandled
                 # EXPR_MEMBER").
@@ -1818,7 +1900,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     var fp_name: *u8 = null
                     var fp_len: i32 = 0
                     let fp_kind: i32 = ptr_root_pointee(s, stmt.var_init, @fp_name, @fp_len)
-                    if narrow_to_ptr(stmt, fp_kind, fp_name, fp_len) != 0
+                    if narrow_to_ptr(@dt, fp_kind, fp_name, fp_len) != 0
                         var_type = TYPE_PTR
         # try-expression: `let data = read_bytes()?`. The try-emit hands back
         # the unwrapped Ok payload, which is a struct (e.g., %Vec$u8) when
@@ -1858,9 +1940,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                     let pay: *u8 = tagged_enum_payload_named(s, carrier_name, carrier_name_len, @pay_len, 1)
                     if pay != null
                         var_type = TYPE_STRUCT
-                        stmt.var_type = TYPE_STRUCT
-                        stmt.var_type_name = pay
-                        stmt.var_type_name_len = pay_len
+                        dt.var_type = TYPE_STRUCT
+                        dt.var_type_name = pay
+                        dt.var_type_name_len = pay_len
         # AGAST #1453: `let p = raw as *P`.  The parser records the cast's
         # pointee on the EXPR_CAST node (int_val = pointee kind, ident_ptr =
         # struct name; see apply_cast_tail).  Narrow the local exactly as the
@@ -1875,21 +1957,21 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 if cast_pointee == TYPE_STRUCT
                     if stmt.var_init.ident_ptr != null and stmt.var_init.ident_len > 0
                         var_type = TYPE_PTR
-                        stmt.var_type = TYPE_PTR
-                        stmt.var_type_name = stmt.var_init.ident_ptr
-                        stmt.var_type_name_len = stmt.var_init.ident_len
-                        stmt.var_pointee_type = TYPE_STRUCT
+                        dt.var_type = TYPE_PTR
+                        dt.var_type_name = stmt.var_init.ident_ptr
+                        dt.var_type_name_len = stmt.var_init.ident_len
+                        dt.var_pointee_type = TYPE_STRUCT
                 else
                     var_type = TYPE_PTR
-                    stmt.var_type = TYPE_PTR
-                    stmt.var_pointee_type = cast_pointee
+                    dt.var_type = TYPE_PTR
+                    dt.var_pointee_type = cast_pointee
         # AGAST #2575 / #2598: `let e = vec_as_ptr<E>(@v) + 1` is a `*E`, and
         # `let e = q + 1` (q: *i32) a `*i32`, as if annotated.
         else if stmt.var_init.kind == EXPR_BINARY
             var pa_name: *u8 = null
             var pa_len: i32 = 0
             let pa_kind: i32 = ptr_arith_pointee(s, stmt.var_init, @pa_name, @pa_len)
-            if narrow_to_ptr(stmt, pa_kind, pa_name, pa_len) != 0
+            if narrow_to_ptr(@dt, pa_kind, pa_name, pa_len) != 0
                 var_type = TYPE_PTR
         # AGAST #175: address-of expression. `let task = @pool.tasks[i]` used
         # to keep var_type=TYPE_I64 with no type_name → the local was added as
@@ -1965,9 +2047,9 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                                 addr_pointee_len = mfield.field_type_name_len
                 if addr_pointee != null and addr_pointee_len > 0
                     var_type = TYPE_PTR
-                    stmt.var_type = TYPE_PTR
-                    stmt.var_type_name = addr_pointee
-                    stmt.var_type_name_len = addr_pointee_len
+                    dt.var_type = TYPE_PTR
+                    dt.var_type_name = addr_pointee
+                    dt.var_type_name_len = addr_pointee_len
             # AGAST #2542: `let v = *p` / `*(p + i)` / `**r` with a struct or
             # enum pointee is that aggregate, as if annotated.  The slot stayed
             # i64 with no name: `v.b` was refused "unlowerable" and `match v`
@@ -1983,31 +2065,31 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                 deref_pointee_struct_name(s, stmt.var_init.operand, @dr_name, @dr_len)
                 if stmt.var_declared_type == TYPE_VOID and dr_name != null and dr_len > 0
                     var_type = TYPE_STRUCT
-                    stmt.var_type = TYPE_STRUCT
-                    stmt.var_type_name = dr_name
-                    stmt.var_type_name_len = dr_len
+                    dt.var_type = TYPE_STRUCT
+                    dt.var_type_name = dr_name
+                    dt.var_type_name_len = dr_len
 
     struct_value_int_let_refused(s, stmt)   # #2525, #3188, #3198: `= *q`, `= l`, `= mk()`
-    if infer_ref_to_pointer_let(s, stmt) == 1
-        var_type = stmt.var_type
-    if infer_ref_to_scalar_let(s, stmt) == 1
-        var_type = stmt.var_type
-    if infer_ptr_ptr_deref_let(s, stmt) == 1   # #3114: `*v`, v a `**S`
-        var_type = stmt.var_type
-    if infer_array_ptr_let(s, stmt) == 1
-        var_type = stmt.var_type
-    if infer_array_elem_let(s, stmt) == 1
-        var_type = stmt.var_type
-    if infer_through_elem_let(s, stmt) == 1
-        var_type = stmt.var_type
-    if infer_struct_elem_let(s, stmt) == 1
-        var_type = stmt.var_type
-    if infer_ptr_index_let(s, stmt) == 1   # #2377: `a[i][j]`, a struct
-        var_type = stmt.var_type
-    if infer_full_elem_ref_let(s, stmt) == 1   # #2571: `@&x[i]`, an element
-        var_type = stmt.var_type
-    if infer_field_ref_let(s, stmt) == 1   # #2400: `@&p.f`, a scalar field
-        var_type = stmt.var_type
+    if infer_ref_to_pointer_let(s, stmt, @dt) == 1
+        var_type = dt.var_type
+    if infer_ref_to_scalar_let(s, stmt, @dt) == 1
+        var_type = dt.var_type
+    if infer_ptr_ptr_deref_let(s, stmt, @dt) == 1   # #3114: `*v`, v a `**S`
+        var_type = dt.var_type
+    if infer_array_ptr_let(s, stmt, @dt) == 1
+        var_type = dt.var_type
+    if infer_array_elem_let(s, stmt, @dt) == 1
+        var_type = dt.var_type
+    if infer_through_elem_let(s, stmt, @dt) == 1
+        var_type = dt.var_type
+    if infer_struct_elem_let(s, stmt, @dt) == 1
+        var_type = dt.var_type
+    if infer_ptr_index_let(s, stmt, @dt) == 1   # #2377: `a[i][j]`, a struct
+        var_type = dt.var_type
+    if infer_full_elem_ref_let(s, stmt, @dt) == 1   # #2571: `@&x[i]`, an element
+        var_type = dt.var_type
+    if infer_field_ref_let(s, stmt, @dt) == 1   # #2400: `@&p.f`, a scalar field
+        var_type = dt.var_type
 
     # `let task = @member.field[i]` — when the indexed field is an array
     # of struct, infer the local as `*ElementStruct` so subsequent
@@ -2018,7 +2100,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # Handles single-level (`pool.tasks[i]`) and one-level chained
     # (`srv.pool.tasks[i]`) member access — the latter occurs in
     # async/tasks's `task_server_poll_tasks(srv: *TaskServer)`.
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null
+    if var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_init != null
         if stmt.var_init.kind == EXPR_UNARY and stmt.var_init.op == OP_ADDR
             let inner_addr: *Expr = stmt.var_init.operand
             if inner_addr != null and inner_addr.kind == EXPR_INDEX
@@ -2057,12 +2139,12 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
                                 let fa: *StructField = get_field_type(rst_a, fid_a)
                                 if fa.field_type == TYPE_ARRAY and fa.array_elem_type == TYPE_STRUCT and fa.array_elem_type_name_len > 0
                                     var_type = TYPE_PTR
-                                    stmt.var_type = TYPE_PTR
-                                    stmt.var_type_name = fa.array_elem_type_name
-                                    stmt.var_type_name_len = fa.array_elem_type_name_len
+                                    dt.var_type = TYPE_PTR
+                                    dt.var_type_name = fa.array_elem_type_name
+                                    dt.var_type_name_len = fa.array_elem_type_name_len
 
-    if type_ref_view_let(stmt, view) == 1   # AGAST #3079
-        var_type = stmt.var_type
+    if type_ref_view_let(@dt, view) == 1   # AGAST #3079
+        var_type = dt.var_type
 
     # AGAST #2047: a float-valued initializer no arm above typed -- a binary
     # (`x + 0.5`, binop_float_width #1965), a cast `n as f32`, a float field
@@ -2070,49 +2152,49 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     # as ritz0 infers.  The slot stayed i64 and clang rejected
     # `store i64 <float>`.  A pre-emitted match / if already published its
     # phi type above, so it is not re-typed here.
-    if var_type == TYPE_I64 and stmt.var_type_name_len == 0 and stmt.var_init != null and pre_emitted == 0
+    if var_type == TYPE_I64 and dt.var_type_name_len == 0 and stmt.var_init != null and pre_emitted == 0
         let init_fty: i32 = get_expr_type(s, stmt.var_init)
         if init_fty == TYPE_F32 or init_fty == TYPE_F64
             var_type = init_fty
-            stmt.var_type = init_fty
+            dt.var_type = init_fty
         # AGAST #2527: an i8 .. u32 initialiser no arm above typed is a slot of
         # that type, as if annotated.  (A u64 keeps the i64 slot; see below.)
         else if init_int != TYPE_VOID and init_int != TYPE_U64
             var_type = init_int
-            stmt.var_type = init_int
+            dt.var_type = init_int
 
     let alloca_reg: i32 = next_reg(s)
     emit_str(s, c"  ")
     emit_reg(s, alloca_reg)
     emit_str(s, c" = alloca ")
-    if var_type == TYPE_ARRAY and stmt.var_array_shape != null
+    if var_type == TYPE_ARRAY and dt.var_array_shape != null
         # AGAST #1509: `var g: [N][M]T` -> `alloca [N x [M x T]]` (it was
         # `[N x i64]`: the inner array lost, every access miscompiled).
-        emit_array_shape_llvm(s, stmt.var_array_shape, 0)
+        emit_array_shape_llvm(s, dt.var_array_shape, 0)
     else if var_type == TYPE_ARRAY
         # Emit array type: [N x elem_type]
         emit_str(s, c"[")
-        emit_int(s, stmt.var_array_size as i64)
+        emit_int(s, dt.var_array_size as i64)
         emit_str(s, c" x ")
-        if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
+        if dt.var_array_elem_type == TYPE_STRUCT and dt.var_type_name_len > 0
             emit_str(s, c"%")
-            emit_name(s, stmt.var_type_name, stmt.var_type_name_len)
+            emit_name(s, dt.var_type_name, dt.var_type_name_len)
         else
             # The spelling every access over the local uses (#1564, #1966).
-            emit_str(s, elem_mem_llvm(stmt.var_array_elem_type))
+            emit_str(s, elem_mem_llvm(dt.var_array_elem_type))
         emit_str(s, c"]")
     else
-        emit_llvm_type_struct(s, var_type, stmt.var_type_name, stmt.var_type_name_len)
+        emit_llvm_type_struct(s, var_type, dt.var_type_name, dt.var_type_name_len)
     emit_str(s, c"\n")
 
     # AGAST #2330: `p#`, the `*T` view of a `*[N]T` local, before `p` itself.
     var view_name_len: i32 = 0
-    let view_name: *u8 = inferred_array_elem_name(s, stmt, @view_name_len)
-    add_array_view(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_pointee_type, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type, view_name, view_name_len)
+    let view_name: *u8 = inferred_array_elem_name(s, stmt, @dt, @view_name_len)
+    add_array_view(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, dt.var_pointee_type, dt.var_pointee_array_size, dt.var_pointee_array_elem_type, view_name, view_name_len)
     # Track local variable type info for member access
     # For pointer-to-struct (*StructName), use add_local_struct to track struct name
     # References are treated as pointers at the LLVM level
-    if var_type == TYPE_PTR and stmt.var_type_name_len > 0 and stmt.var_pointee_type != TYPE_ARRAY
+    if var_type == TYPE_PTR and dt.var_type_name_len > 0 and dt.var_pointee_type != TYPE_ARRAY
         # Pointer to struct - track with struct name for ptr.field access.
         # AGAST #1451: record pointee_type = TYPE_STRUCT as well, exactly as
         # parameters of the same type are registered (emitter.ritz,
@@ -2126,60 +2208,60 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         # `let p: *T` at T = `[N]S` (monomorph, #2832) bound as a `*S`, so
         # `*p = value` in ritzlib's `__heap_new<[2]P>` refused the array.  It
         # binds as a `*[N]T` does, and name_array_ptr_local records S.
-        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len, TYPE_STRUCT, 0, 0)
-    else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and stmt.var_type_name_len > 0 and stmt.var_pointee_type != TYPE_ARRAY
+        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, dt.var_type_name, dt.var_type_name_len, TYPE_STRUCT, 0, 0)
+    else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and dt.var_type_name_len > 0 and dt.var_pointee_type != TYPE_ARRAY
         # AGAST #1754: `@S` / `@&S` local -- registered like a param of the
         # same type (struct name + pointee) so `q.a` resolves.  #2552: not an
         # `@[N]S` / `@&[N]S`, whose S made `p.b` an `@S` field read of element
         # 0; it binds as a `*[N]S` does, and name_array_ptr_local records S.
-        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_pointee_type, 0, 0)
-        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, stmt.var_inner_pointee_type)   # AGAST #2372: `@**S`
-    else if var_type == TYPE_PTR_PTR and stmt.var_type_name_len > 0
+        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, dt.var_type_name, dt.var_type_name_len, dt.var_pointee_type, 0, 0)
+        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, dt.var_inner_pointee_type)   # AGAST #2372: `@**S`
+    else if var_type == TYPE_PTR_PTR and dt.var_type_name_len > 0
         # AGAST #1933: `let pp: **S` -- keep the struct name, as a `**S`
         # param does, so emit_deref_operand_ptr resolves `(**pp).f`.  It
         # went through add_local_ptr, which drops the name, and both the
         # read and the store failed with "unhandled EXPR_MEMBER".
-        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_pointee_type, 0, 0)
-        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, stmt.var_inner_pointee_type)
+        add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, dt.var_type_name, dt.var_type_name_len, dt.var_pointee_type, 0, 0)
+        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, dt.var_inner_pointee_type)
     else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
-        add_local_ptr(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_pointee_type)
-        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, stmt.var_inner_pointee_type)
+        add_local_ptr(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, dt.var_pointee_type)
+        set_local_inner_pointee(s, stmt.var_name, stmt.var_name_len, dt.var_inner_pointee_type)
     else if var_type == TYPE_STRUCT
-        add_local_struct(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, stmt.var_type_name, stmt.var_type_name_len)
+        add_local_struct(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type, dt.var_type_name, dt.var_type_name_len)
     else if var_type == TYPE_ARRAY
         # For arrays of structs, also stash the element struct name in
         # type_name so emit_member_ptr can resolve `arr[i].field`.
         # AGAST #184: also stash the inner-pointee struct name for
         # `[N]*Foo` / `[N]**Foo` arrays — emit_member_ptr's PTR-element
         # branch loads the slot's *Foo and GEPs into Foo for the field.
-        if stmt.var_array_elem_type == TYPE_STRUCT and stmt.var_type_name_len > 0
-            add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, TYPE_ARRAY, stmt.var_type_name, stmt.var_type_name_len, TYPE_I64, stmt.var_array_size, stmt.var_array_elem_type)
+        if dt.var_array_elem_type == TYPE_STRUCT and dt.var_type_name_len > 0
+            add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, TYPE_ARRAY, dt.var_type_name, dt.var_type_name_len, TYPE_I64, dt.var_array_size, dt.var_array_elem_type)
         # AGAST #2369: and `[N]@Foo` / `[N]@&Foo`, for array_elem_referent.
-        else if (stmt.var_array_elem_type == TYPE_PTR or stmt.var_array_elem_type == TYPE_PTR_PTR or stmt.var_array_elem_type == TYPE_REF or stmt.var_array_elem_type == TYPE_MUT_REF) and stmt.var_type_name_len > 0
-            add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, TYPE_ARRAY, stmt.var_type_name, stmt.var_type_name_len, TYPE_I64, stmt.var_array_size, stmt.var_array_elem_type)
+        else if (dt.var_array_elem_type == TYPE_PTR or dt.var_array_elem_type == TYPE_PTR_PTR or dt.var_array_elem_type == TYPE_REF or dt.var_array_elem_type == TYPE_MUT_REF) and dt.var_type_name_len > 0
+            add_local_full(s, stmt.var_name, stmt.var_name_len, alloca_reg, TYPE_ARRAY, dt.var_type_name, dt.var_type_name_len, TYPE_I64, dt.var_array_size, dt.var_array_elem_type)
         else
-            add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type)
+            add_local_array(s, stmt.var_name, stmt.var_name_len, alloca_reg, dt.var_array_size, dt.var_array_elem_type)
         let arr_loc: *LocalVar = local_at(s, s.local_count - 1)
-        arr_loc.array_elem_pointee = stmt.var_array_elem_pointee   # AGAST #2341
-        arr_loc.array_rec = stmt.var_array   # AGAST #2995
-        if stmt.var_array_shape != null and s.local_count > 0
+        arr_loc.array_elem_pointee = dt.var_array_elem_pointee   # AGAST #2341
+        arr_loc.array_rec = dt.var_array   # AGAST #2995
+        if dt.var_array_shape != null and s.local_count > 0
             let nd_loc: *LocalVar = local_at(s, s.local_count - 1)
-            nd_loc.array_shape = stmt.var_array_shape  # AGAST #1509
+            nd_loc.array_shape = dt.var_array_shape  # AGAST #1509
     else
         add_local(s, stmt.var_name, stmt.var_name_len, alloca_reg, var_type)
     set_local_fn_sig(s, stmt.var_name, stmt.var_name_len, fn_sig)  # AGAST #1671, #2417
     let declared: *LocalVar = find_local_struct_name(s, stmt.var_name, stmt.var_name_len)
     if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
-        declared.inner_ref = stmt.var_inner_ref   # AGAST #2399
-        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_size, stmt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
-        set_local_pointee_elem(s, stmt.var_name, stmt.var_name_len, stmt.var_pointee_array_elem_pointee)
+        declared.inner_ref = dt.var_inner_ref   # AGAST #2399
+        set_local_pointee_array(s, stmt.var_name, stmt.var_name_len, dt.var_pointee_array_size, dt.var_pointee_array_elem_type)  # AGAST #1953, #2308, #2539 (`**[N]T`)
+        set_local_pointee_elem(s, stmt.var_name, stmt.var_name_len, dt.var_pointee_array_elem_pointee)
         if declared.pointee_type == TYPE_ARRAY
-            declared.pointee_array_shape = stmt.var_pointee_array_shape   # AGAST #2570
+            declared.pointee_array_shape = dt.var_pointee_array_shape   # AGAST #2570
         else if var_type == TYPE_PTR_PTR and declared.pointee_type == TYPE_PTR
-            declared.pointee_array_shape = stmt.var_pointee_array_shape   # AGAST #3635: `**[N][M]T`
+            declared.pointee_array_shape = dt.var_pointee_array_shape   # AGAST #3635: `**[N][M]T`
         else if (var_type == TYPE_REF or var_type == TYPE_MUT_REF) and declared.pointee_type == TYPE_PTR
-            declared.pointee_array_shape = stmt.var_pointee_array_shape   # AGAST #4122: `@*[N][M]T`
-        name_array_ptr_local(declared, stmt, view_name, view_name_len)   # AGAST #2543
+            declared.pointee_array_shape = dt.var_pointee_array_shape   # AGAST #4122: `@*[N][M]T`
+        decl_name_array_ptr_local(declared, @dt, view_name, view_name_len)   # AGAST #2543
     # An unannotated local takes its initialiser's kind; var_type can't say.
     var inferred_bool: i32 = 0
     var inferred_unsure: i32 = 0
@@ -2195,15 +2277,15 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
     if init_int == TYPE_U64 and var_type == TYPE_I64
         declared.var_type = TYPE_U64
 
-    if stmt.var_init != null and stmt.var_array_shape != null
+    if stmt.var_init != null and dt.var_array_shape != null
         # AGAST #3299: a whole N-D place (`h.m`, `p.m`, a local or global
         # `[N][M]T`) is copied into the slot.  #2169's `var b = a` and
         # #3017's `let g = h.m` reach here typed N-D.
-        if emit_nd_array_init_copy(s, alloca_reg, stmt.var_array_shape, stmt.var_init) == 1
+        if emit_nd_array_init_copy(s, alloca_reg, dt.var_array_shape, stmt.var_init) == 1
             return
         # AGAST #3377: a nested literal / fill, level by level.
         if stmt.var_init.kind == EXPR_ARRAY_LIT or stmt.var_init.kind == EXPR_ARRAY_FILL
-            emit_nd_array_init_into(s, stmt.var_array_shape, 0, alloca_reg, stmt.var_init)
+            emit_nd_array_init_into(s, dt.var_array_shape, 0, alloca_reg, stmt.var_init)
             return
         # AGAST #1509: no other initializer form of a multi-dimensional array
         # is lowered.  Fail closed: the error count stops the driver writing
@@ -2244,7 +2326,7 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         # squeeze/cryptosec/valet rely on this for inflate/sbox tables.
         # Lowering strategy lives in emit_array_fill_into (emitter_expr).
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_FILL
-            emit_array_fill_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init.left)
+            emit_array_fill_into(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, dt.var_type_name, dt.var_type_name_len, stmt.var_init.left)
             return
 
         # Array-literal init for typed [N]T slots (ritz0 parity —
@@ -2256,14 +2338,14 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         # it into slot[i] at the declared element type — mirrors ritz0's
         # direct-element-store behaviour.
         if var_type == TYPE_ARRAY and stmt.var_init.kind == EXPR_ARRAY_LIT
-            # `stmt.var_type_name` names the element struct of `[N]T`.
-            emit_array_lit_into(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
+            # `dt.var_type_name` names the element struct of `[N]T`.
+            emit_array_lit_into(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, dt.var_type_name, dt.var_type_name_len, stmt.var_init)
             return
 
         # AGAST #2035 / #2169: `let a: [N]T = x.f` / `= c` / `= *p` copy
         # the whole array.
         if var_type == TYPE_ARRAY
-            emit_array_local_whole_assign(s, alloca_reg, stmt.var_array_size, stmt.var_array_elem_type, stmt.var_type_name, stmt.var_type_name_len, stmt.var_init)
+            emit_array_local_whole_assign(s, alloca_reg, dt.var_array_size, dt.var_array_elem_type, dt.var_type_name, dt.var_type_name_len, stmt.var_init)
             return
 
         # ritz-task-133: thread enum ctx so `let r: Result<_,_> = Ok(x)` in
@@ -2278,26 +2360,26 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
         let _saved_simd: *u8 = s.ctx_simd_name
         let _saved_simd_len: i32 = s.ctx_simd_name_len
         if var_type == TYPE_STRUCT
-            if stmt.var_type_name_len > 0
-                if is_ctor_slot_enum(stmt.var_type_name, stmt.var_type_name_len) == 1
-                    s.ctx_enum_name = stmt.var_type_name
-                    s.ctx_enum_name_len = stmt.var_type_name_len
-                if is_simd_vector_type_name(stmt.var_type_name, stmt.var_type_name_len) == 1
-                    s.ctx_simd_name = stmt.var_type_name
-                    s.ctx_simd_name_len = stmt.var_type_name_len
+            if dt.var_type_name_len > 0
+                if is_ctor_slot_enum(dt.var_type_name, dt.var_type_name_len) == 1
+                    s.ctx_enum_name = dt.var_type_name
+                    s.ctx_enum_name_len = dt.var_type_name_len
+                if is_simd_vector_type_name(dt.var_type_name, dt.var_type_name_len) == 1
+                    s.ctx_simd_name = dt.var_type_name
+                    s.ctx_simd_name_len = dt.var_type_name_len
         var init_reg: i32 = pre_init_reg
         if pre_emitted == 0
             # AGAST #2296: the annotation, if any, is the slot `Span.empty()`
             # takes its T from; an untyped let is a slot with no type.
             var saved_slot: SlotCtx
-            if stmt.var_type_name_len > 0 and stmt.var_type_name != null
-                enter_slot_ctx(s, @saved_slot, var_type, stmt.var_type_name, stmt.var_type_name_len)
+            if dt.var_type_name_len > 0 and dt.var_type_name != null
+                enter_slot_ctx(s, @saved_slot, var_type, dt.var_type_name, dt.var_type_name_len)
             else
                 enter_slot_ctx(s, @saved_slot, 0, null, 0)
-            set_match_float_hint(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
-            init_reg = emit_expr_by_value(s, stmt.var_init, var_type, stmt.var_type_name, stmt.var_type_name_len)
+            set_match_float_hint(s, stmt.var_init, var_type, dt.var_type_name, dt.var_type_name_len)
+            init_reg = emit_expr_by_value(s, stmt.var_init, var_type, dt.var_type_name, dt.var_type_name_len)
             if var_type == TYPE_STRUCT
-                init_reg = coerce_array_to_span(s, stmt.var_init, init_reg, stmt.var_type_name, stmt.var_type_name_len)   # AGAST #2502
+                init_reg = coerce_array_to_span(s, stmt.var_init, init_reg, dt.var_type_name, dt.var_type_name_len)   # AGAST #2502
             leave_slot_ctx(s, @saved_slot)
         s.ctx_enum_name = _saved_ctx
         s.ctx_enum_name_len = _saved_ctx_len
@@ -2374,10 +2456,10 @@ fn emit_var_decl_at(s: *EmitterState, stmt: *Stmt)
             var src_name: *u8 = null
             var src_len: i32 = 0
             resolve_expr_struct_name(s, stmt.var_init, @src_name, @src_len)
-            if is_layout_equiv_pair(src_name, src_len, stmt.var_type_name, stmt.var_type_name_len) == 1
-                stored_reg = rebuild_layout_equiv(s, init_reg, src_name, src_len, stmt.var_type_name, stmt.var_type_name_len)
+            if is_layout_equiv_pair(src_name, src_len, dt.var_type_name, dt.var_type_name_len) == 1
+                stored_reg = rebuild_layout_equiv(s, init_reg, src_name, src_len, dt.var_type_name, dt.var_type_name_len)
             emit_str(s, c"  store ")
-            emit_llvm_type_struct(s, TYPE_STRUCT, stmt.var_type_name, stmt.var_type_name_len)
+            emit_llvm_type_struct(s, TYPE_STRUCT, dt.var_type_name, dt.var_type_name_len)
             emit_str(s, c" ")
             emit_reg(s, stored_reg)
             emit_str(s, c", ptr ")
