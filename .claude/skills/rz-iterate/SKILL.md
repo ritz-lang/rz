@@ -121,7 +121,7 @@ stays here; remote hosts only run rooms.
   host that runs `train.sh` also reads its **coordinator** keys there
   (AGAST #4409): `RZ_TRAIN_DEPTH` (default 6: trains in flight) and
   `RZ_TRAIN_HOSTS` (default `omegalisk huburght bangerang starbux toffee
-  chungus`: the hosts a speculative train gate may use, no skronk*); an
+  chungus`: the hosts any train gate may use, no skronk*); an
   environment variable overrides either for one call. Add those two keys to
   a host's file only once the `host-env.sh` it reads has #4409, which is
   what validates them (an older copy rejects unknown keys, as with
@@ -797,10 +797,12 @@ This is also how Borque's conductor works.
   after it is thrown away (its base holds the culprit) and its cars are
   rebuilt on train k-1's tail and re-gated (`train.sh fail`, step 6). **Up
   to 6 trains in flight** (AGAST #4409; `host.env` `RZ_TRAIN_DEPTH`, else
-  the environment, else 6): train 1 here, each later one on the first host
-  in `RZ_TRAIN_HOSTS` (default from `host.env`, else `omegalisk huburght
-  bangerang starbux toffee chungus`; no ephemeral skronk*) with a free
-  train slot.
+  the environment, else 6). `RZ_TRAIN_HOSTS` (default from `host.env`, else
+  `omegalisk huburght bangerang starbux toffee chungus`; no ephemeral
+  skronk*) applies to **every** train, train 1 included (AGAST #4422):
+  each gates on the first host with a free train slot. For train 1 this
+  host is tried last by preference, so the coordinator's one gate slot
+  stays free for rooms while a remote host gates train 1.
 - **Deepest train first (AGAST #4156):** a pass of train k lands trains
   1..k (step 5), so when a gate slot frees, here or on another host, gate
   the **deepest** built train's tip, not train 1: one gate covers every car
@@ -882,12 +884,19 @@ one to train 1.
    `GATE train <k>` (dispatch rule above), unless every train is
    `gate=not-needed` (only cars already on their base or on each other:
    their own gates cover them; `pending` lists nothing, `land` with no
-   log). `GATE train 1` (the only train, or a bisect prefix):
+   log). `pending`'s `GATE` line names `gate --next` for every train, so
+   `GATE train 1` (the only train, or a bisect prefix) also gates off this
+   host when another host has a free train slot (AGAST #4422;
+   `RZ_TRAIN_HOSTS` applies to every train, this host tried last by
+   preference):
    ```bash
-   LOG=$(.claude/skills/rz-iterate/train.sh gate)
+   LOG=$(.claude/skills/rz-iterate/train.sh gate --next)
    .claude/skills/rz-iterate/train.sh wait "$LOG"    # Bash run_in_background
    ```
-   (`train.sh wait` on a local log is `run-gate.sh --wait`.) Plain `gate`
+   `gate --next` starts train 1 on the first remote host with a free train
+   slot; when none is free (or every one is unreachable) it falls back to
+   plain `gate` here, so the coordinator's one gate slot is used only as
+   that fallback. Plain `gate` stays local-only, the fleet-broken path: it
    gates the train `pending` names here; for train 1 it records `GATED=` as
    before, for a deeper one a local `SPEC=<this host> - <log> <log>`, the
    same as `gate --next` on this host. It refuses while that train already
@@ -895,24 +904,27 @@ one to train 1.
    red train with nothing below it to bisect (`train.sh fail`, step 6; to
    re-gate it instead, e.g. a flake, `gate <k>`).
 
-   **4b. `GATE train <k>` for k > 1** (AGAST #3988, #4031, #4156): gate it
-   on the first host with a free slot, this one included:
+   **4b. `GATE train <k>`, train 1 included** (AGAST #3988, #4031, #4156,
+   #4422): gate it on the first host with a free slot:
    ```bash
    LOG2=$(.claude/skills/rz-iterate/train.sh gate --next)   # picks the host; or: gate --next <host>
    .claude/skills/rz-iterate/train.sh wait "$LOG2"         # Bash run_in_background
    ```
    `gate --next` gates the same train `pending` names (the deepest, or a
-   bisect prefix past train 1), on the first host in `RZ_TRAIN_HOSTS`
+   bisect prefix; train 1 too), on the first host in `RZ_TRAIN_HOSTS`
    (default from `host.env`, else `omegalisk huburght bangerang starbux
    toffee chungus`: the live hosts, no ephemeral skronk*) with a free train
    slot (`pick_train_host`: a gate
    slot no gate holds, less the train gates queued there, read from that
    host's `host.env` and gate dir; stderr says why it passed over each
    host, `no free train slot` or `unreachable`). omegalisk counts as local
-   (`RZ_TRAIN_LOCAL`, default `hostname -s`): if its slot is free (train 1
-   gating elsewhere), the train gates here, `SPEC=omegalisk - <log> <log>`.
-   No host free: it refuses (`no host in RZ_TRAIN_HOSTS ...`); run
-   `pending` again later. At most `RZ_TRAIN_DEPTH` (6: `host.env`, else the
+   (`RZ_TRAIN_LOCAL`, default `hostname -s`): a deeper train gates here if
+   its slot is free, `SPEC=omegalisk - <log> <log>`. For train 1 this host
+   is tried **last by preference** (AGAST #4422): it gates here only as the
+   fallback, as `GATED=` like plain `gate`, when no remote host has a free
+   train slot. No host free: a deeper train refuses (`no host in
+   RZ_TRAIN_HOSTS ...`) and `pending` is run again later; train 1 falls
+   back here. At most `RZ_TRAIN_DEPTH` (6: `host.env`, else the
    environment, else 6) trains in flight (each with a `GATED=` or `SPEC=`
    line). Each train's gate is named for its worktree slot
    (`train` for `rz-train`, `train-<s>` for `rz-train-<s>`) and a remote one
@@ -922,7 +934,7 @@ one to train 1.
    gates can't take those, train gates take them first and any free general
    slot after. **The contract**, all in `train.sh` (header and
    `REMOTE_SH`):
-   1. `gate --next` ensures train 2's tail is on origin
+   1. `gate --next` ensures the target train's tail is on origin
       `refs/heads/rz-train/<tip12>` (every built train's tail is published:
       see "Every train's tail is a base" below), then runs `ssh -F ~/.ssh/rz_hosts
       <host> bash -l -s -- start ...` with the script on stdin. On the host

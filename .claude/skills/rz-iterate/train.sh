@@ -14,11 +14,14 @@
 #                                             remote host too: then train 3)
 #   train.sh gate [<k>]                 gate the train to gate (below) here,
 #                                       or train <k> (prints the log)
-#   train.sh gate --next [<host>]       gate the train to gate, past train
-#                                       1, on <host>, default the first
-#                                       RZ_TRAIN_HOSTS host with a free train
-#                                       slot (prints the local log path;
-#                                       AGAST #4031)
+#   train.sh gate --next [<host>]       gate the train to gate (train 1
+#                                       included) on <host>, default the
+#                                       first RZ_TRAIN_HOSTS host with a free
+#                                       train slot; train 1 tries the remote
+#                                       hosts first and falls back to a gate
+#                                       here (plain `gate`) when none is free
+#                                       (prints the local log path; AGAST
+#                                       #4031, #4422)
 #   train.sh wait <log>                 wait for a gate, local or remote, and
 #                                       exit with its verdict (fetches a
 #                                       remote log back first)
@@ -86,10 +89,13 @@
 #   RZ_TRAIN_MAX   cars per train      (default 8)
 #   RZ_TRAIN_DEPTH trains in flight    (default: host.env RZ_TRAIN_DEPTH,
 #                  else 6; AGAST #4031, #4409)
-#   RZ_TRAIN_HOSTS where `gate --next` looks for a free train slot, in order
-#                  (default: host.env RZ_TRAIN_HOSTS, else "omegalisk
-#                  huburght bangerang starbux toffee chungus": the live hosts
-#                  of 2026-11-20, no ephemeral skronk*; AGAST #4409)
+#   RZ_TRAIN_HOSTS where every train (train 1 included) may gate, in order:
+#                  `gate --next` looks for a free train slot here (default:
+#                  host.env RZ_TRAIN_HOSTS, else "omegalisk huburght
+#                  bangerang starbux toffee chungus": the live hosts of
+#                  2026-11-20, no ephemeral skronk*; AGAST #4409, #4422).
+#                  For train 1 this host is tried last by preference, as its
+#                  local fallback.
 #   RZ_TRAIN_LOCAL this host's name in that list (default: hostname -s)
 #   RZ_TRAIN_DEBOUNCE  seconds `pending` waits for another car (default 60)
 #   RZ_MAIN_WT     main checkout       (default ~/dev/ritz-lang/rz)
@@ -113,8 +119,12 @@
 # Speculative trains (AGAST #3988): omegalisk has one gate slot, and a train
 # gate takes ~25-35 min for <= 8 cars, so trains were the merge bottleneck.
 # `gate --next` gates train 2 on train 1's tail while train 1 still gates,
-# on a remote host (omegalisk can't hold two gates):
-#   1. ensure train 2's tail is on origin refs/heads/rz-train/<tip12> (a
+# on a remote host (omegalisk can't hold two gates).  Train 1 itself gates
+# on a remote host too (AGAST #4422: otherwise its gate serialises every
+# local room gate): `gate --next` prefers a remote free slot for it and falls
+# back to plain `gate` here; plain `gate` stays local-only.  A remote start,
+# for any train:
+#   1. ensure the target train's tail is on origin refs/heads/rz-train/<tip12> (a
 #      build publishes every train's tail: see "Tail refs" below);
 #   2. ssh <host> (RZ_TRAIN_SSH) runs REMOTE_SH below, `start`: fetch that
 #      ref into the host's clone, check out <tip> in its own worktree
@@ -137,11 +147,15 @@
 # N trains in flight (AGAST #4031): the 2-train cap is RZ_TRAIN_DEPTH (default
 # 6: host.env RZ_TRAIN_DEPTH, else 6; AGAST #4409), counting every train with
 # a GATED= or SPEC=.  `gate --next` gates the
-# train to gate (pick_target, AGAST #4156: the deepest, or a bisect prefix)
-# past train 1, on the first host in RZ_TRAIN_HOSTS with a free train slot
-# (pick_train_host: rz_train_free in host-env.sh, over ssh for a remote host;
-# an unreachable host is skipped).  This host (RZ_TRAIN_LOCAL) is local: its
-# gate runs here and its SPEC is `SPEC=<host> - <log> <log>`.  Each train's
+# train to gate (pick_target, AGAST #4156: the deepest, or a bisect prefix;
+# train 1 included, #4422), on the first host in RZ_TRAIN_HOSTS with a free
+# train slot (pick_train_host: rz_train_free in host-env.sh, over ssh for a
+# remote host; an unreachable host is skipped).  Train 1 gates the same way:
+# `gate --next` tries the remote hosts first and falls back to a gate here
+# (plain `gate`) when none has a free train slot, so the coordinator's one
+# gate slot is free for rooms while a remote host gates train 1.  This host (RZ_TRAIN_LOCAL) is local: its
+# gate runs here and its SPEC is `SPEC=<host> - <log> <log>` (train 1's local
+# gate, as plain `gate`, is `GATED=<log>`).  Each train's
 # gate is named for its worktree slot (gname: `train` for slot 1, `train-<s>`
 # for slot s), and a remote one checks out in RZ_REMOTE_WT, -<s> for slot s,
 # so two trains can gate on one host at once (skronk has 2 train slots).
@@ -790,17 +804,17 @@ cmd_gate() {
 }
 
 # gate_next [<host>]: gate the train to gate (pick_target: the deepest, or a
-# bisect prefix; AGAST #4156), when it is past train 1, on <host> or the
-# first RZ_TRAIN_HOSTS host with a free train slot (AGAST #3988, #4031; see
-# the header).  stdout is only the local log path.
+# bisect prefix; AGAST #4156), train 1 included, on <host> or the first
+# RZ_TRAIN_HOSTS host with a free train slot (AGAST #3988, #4031, #4422; see
+# the header).  Train 1 tries the remote hosts first and falls back to a gate
+# here (plain `gate`) when none has a free train slot.  stdout is only the
+# local log path.
 gate_next() {
     local host="$1" q i k flight=0 st tip base ref pkgs=0 rlog llog after=""
     mapfile -t q < <(queue)
     [[ ${#q[@]} -gt 0 ]] || die "no train built"
-    [[ ${#q[@]} -ge 2 ]] || die "no train 2 to gate: build --next first (train 1 gates with plain \`gate\`)"
     pick_target || die "$WHY"
     k=$TGT
-    [[ $k -gt 1 ]] || die "the train to gate is train 1 ($REASON): train.sh gate"
     # The base is main (train 1's base), not the tail below (AGAST #4151): a
     # pass here lands every train below too, so the package tests and the
     # ritz0 diff scope must cover their cars as well.
@@ -814,8 +828,18 @@ gate_next() {
     tip="$(field TIP "$st")"
     [[ "$tip" == "$(g rev-parse HEAD)" ]] || die "train $k's worktree moved since build; rebuild"
     if [[ -z "$host" ]]; then
-        host="$(pick_train_host)" \
-            || die "no host in RZ_TRAIN_HOSTS ($HOSTS) has a free train slot: gate train $k when one frees"
+        if [[ $k -eq 1 ]]; then
+            # Train 1 goes off this host (AGAST #4422: the coordinator's one
+            # gate slot is for rooms then); plain `gate` here is the fallback
+            # when no remote host has a free train slot.
+            host="$(pick_train_host remote)" || {
+                echo "note: no remote host in RZ_TRAIN_HOSTS ($HOSTS) has a free train slot: gating train 1 here" >&2
+                host="$LOCAL"
+            }
+        else
+            host="$(pick_train_host)" \
+                || die "no host in RZ_TRAIN_HOSTS ($HOSTS) has a free train slot: gate train $k when one frees"
+        fi
     fi
     [[ -n "$(cd "$WT" && bash "$HERE/train.sh" pkgs list "$base")" ]] && pkgs=1
     # The tail is published for the remote gate and for a new room's base
@@ -826,14 +850,22 @@ gate_next() {
         [[ $pkgs -eq 0 ]] || after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
         llog="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$(gname)")" \
             || die "the local gate for train $k did not start"
-        printf 'SPEC=%s - %s %s\n' "$host" "$llog" "$llog" >> "$st"
-        echo "SPEC train $k tip=${tip:0:12} on $host (local): $llog" >&2
+        if [[ $k -eq 1 ]]; then
+            printf 'GATED=%s\n' "$llog" >> "$st"
+            echo "GATED train 1 tip=${tip:0:12} here${REASON:+ ($REASON)}: $llog" >&2
+        else
+            printf 'SPEC=%s - %s %s\n' "$host" "$llog" "$llog" >> "$st"
+            echo "SPEC train $k tip=${tip:0:12} on $host (local): $llog" >&2
+        fi
         echo "$llog"
         return
     fi
     if ! rlog="$(remote "$host" start "$REMOTE_REPO" "$(rwt)" "$REMOTE_GATE" "$ref" "$tip" "$base" "$(gname)" "$pkgs" | tail -1)" \
             || [[ "$rlog" != /*.log ]]; then
         g push -q origin --delete "refs/heads/$ref" 2>/dev/null || true
+        if [[ $k -eq 1 ]]; then
+            die "the remote gate on $host did not start (got '$rlog'); gate train 1 elsewhere (gate --next <host>) or here (plain \`gate\`)"
+        fi
         die "the remote gate on $host did not start (got '$rlog'); gate train $k elsewhere (gate --next <host>) or here once the trains below land"
     fi
     llog="$GATES/$(basename "${rlog%.log}")@$host.log"
@@ -842,13 +874,16 @@ gate_next() {
     echo "$llog"
 }
 
-# pick_train_host: the first RZ_TRAIN_HOSTS host with a free train slot
-# (rz_train_free: a slot no gate holds, less the train gates queued there).
+# pick_train_host [remote]: the first RZ_TRAIN_HOSTS host with a free train
+# slot (rz_train_free: a slot no gate holds, less the train gates queued there).
 # This host is asked directly, the rest over ssh; an unreachable one is
-# skipped.  Says why on stderr for each host it passes over.
+# skipped.  Says why on stderr for each host it passes over.  With `remote`,
+# this host is passed over too: train 1 prefers another host, and gates here
+# only as its fallback (AGAST #4422).
 pick_train_host() {
-    local h n
+    local remote="${1:-}" h n
     for h in $HOSTS; do
+        [[ -z "$remote" ]] || ! is_local "$h" || continue
         if is_local "$h"; then n="$(rz_train_free "$GATES" 2>/dev/null)" || n=""
         else n="$(remote "$h" free 2>/dev/null | tail -1)" || n=""; fi
         if [[ "$n" =~ ^[0-9]+$ && $n -gt 0 ]]; then echo "$h"; return 0; fi
@@ -1223,8 +1258,10 @@ cmd_fail() {
 # GATING below it skips the debounce and buffers to 8 cars: it takes no
 # second slot until it is full (Aaron, 2026-11-20), so the next train is
 # gated as a whole rather than car by car.  A bisect prefix gates at once:
-# no car boards it.  <command> is `train.sh gate` for train 1 (this host),
-# else `train.sh gate --next` (the first host with a free slot).
+# no car boards it.  <command> is `train.sh gate --next` for every train,
+# train 1 included (AGAST #4422: it prefers a remote free slot and falls
+# back to a local gate, plain `gate` here); plain `gate` stays the local-
+# only path.
 cmd_pending() {
     local q st n built left now cmd
     mapfile -t q < <(queue)
@@ -1249,7 +1286,7 @@ cmd_pending() {
         if [[ -n "$(field GATED "$(state)")" || -n "$(field SPEC "$(state)")" ]]; then below=1; break; fi
     done
     use_slot "${q[$((TGT - 1))]}"
-    if [[ $TGT -eq 1 ]]; then cmd="train.sh gate"; else cmd="train.sh gate --next"; fi
+    cmd="train.sh gate --next"
     if [[ $REASON != deepest ]]; then
         echo "GATE train $TGT n=$n ($REASON): $cmd"
     elif [[ $n -ge $MAX ]]; then
