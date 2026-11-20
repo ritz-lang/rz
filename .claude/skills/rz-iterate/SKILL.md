@@ -1036,8 +1036,16 @@ one to train 1.
    (dry run; add `--apply`). It reads the `ritz-task-<id>:` subjects on
    `main` and archives only rooms whose ticket is `completed`.
    **Remote room:** send `TEARDOWN ritz-task-<id> merged=<main sha12>` to its
-   host room instead of the local steps, and still delete the branch on
-   GitHub here. Spell out in the message that the commit was cherry-picked,
+   host room instead of the local steps, and delete the branch on GitHub
+   **only after the host answers `TORNDOWN`.** Delete it first and the host's
+   guard cannot see the work: plain `room rm` refuses with `N commit(s) on
+   <branch> not on main or any remote` (ritz-task-4381, 2026-11-20), and
+   `--merged-as` is not a general fallback — `git patch-id` hashes hunk
+   context, so the first stacked train whose cars touch adjacent lines gets a
+   false `is not the patch ... introduced` refusal (AGAST #4394). If it has
+   already been deleted, re-push the room's sha to the branch, run plain
+   `room rm`, then delete it again. Spell out in the message that the commit
+   was cherry-picked,
    so `git cherry origin/main ritz-task-<id>` prints `- <sha>` (same patch),
    not nothing; a `+` line is fine only if `<main sha12>`'s subject matches
    the branch tip's. The slot is free once the host answers `TORNDOWN`.
