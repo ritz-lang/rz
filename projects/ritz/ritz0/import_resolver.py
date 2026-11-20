@@ -356,6 +356,20 @@ class ImportResolver:
                 self._source_root_candidates.append(sr_path.resolve())
                 if sr_path.exists():
                     self.source_roots.append(sr_path.resolve())
+        # _home_source_roots' answer depends only on the importing file's
+        # directory; dependencies are fixed after __init__.  The dependency
+        # roots are resolved once here, not per import: this sits on every
+        # compile's import path.
+        self._home_roots_cache: Dict[str, List[Path]] = {}
+        self._dependency_source_roots: List[Path] = []
+        for dep in self.dependencies.values():
+            dep_root = Path(dep.path).resolve()
+            if self.project_root is not None and dep_root == self.project_root:
+                continue
+            for sr in dep.sources:
+                if sr.startswith("!"):
+                    continue
+                self._dependency_source_roots.append((dep_root / sr).resolve())
 
     def _auto_detect_dependencies_from_ritz_path(self):
         """Auto-detect dependencies from RITZ_PATH entries with ritz.toml.
@@ -826,14 +840,48 @@ class ImportResolver:
                 if winner is not None and winner.path == pkg_dir:
                     return
 
+    def _home_source_roots(self, from_file: str) -> List[Path]:
+        """Source roots of the *dependency* `from_file` belongs to.
+
+        A bare import inside a dependency names a module of that package:
+        angelo's `import types` means angelo/src/types.ritz wherever angelo
+        is compiled from. Without this, such an import fell through to the
+        top package's roots, so prism had to list ../angelo/src among its own
+        `sources` — and then a bare `import types` in prism bound angelo's
+        font types instead of prism's own (AGAST #3572).
+
+        Only dependencies get this treatment: this package's own precedence
+        is its `sources` order, unchanged. The most specific containing root
+        wins; negated `sources` entries (`!foo`) match nothing.
+        """
+        key = os.path.dirname(from_file)
+        cached = self._home_roots_cache.get(key)
+        if cached is not None:
+            return cached
+        if not self._dependency_source_roots:
+            return []
+        p = Path(from_file).resolve()
+        best: Optional[Path] = None
+        for root in self._dependency_source_roots:
+            try:
+                p.relative_to(root)
+            except ValueError:
+                continue
+            if best is None or len(root.parts) > len(best.parts):
+                best = root
+        roots = [best] if best is not None else []
+        self._home_roots_cache[key] = roots
+        return roots
+
     def _resolve_import_path(self, path_parts: List[str], from_file: str) -> Optional[str]:
         """Resolve an import path to an actual file path.
 
         Resolution order:
         1. Relative to importing file: foo.ritz, foo/bar.ritz
-        2. From source roots (e.g., ["src", "kernel/src"])
-        3. From project root: ritzlib/sys.ritz
-        4. From RITZ_PATH directories
+        2. The importing file's dependency's source roots
+        3. This package's source roots (e.g., ["src", "kernel/src"])
+        4. From project root: ritzlib/sys.ritz
+        5. From RITZ_PATH directories
         """
         base_dir = Path(from_file).parent
 
@@ -853,12 +901,14 @@ class ImportResolver:
 
         # Each root is tried as foo/bar.ritz, then foo.bar.ritz:
         #   1. the importing file's directory
-        #   2. source roots (e.g., ["src", "kernel/src"])
-        #   3. the project root
-        #   4. RITZ_PATH entries
+        #   2. the importing file's dependency's source roots
+        #   3. this package's source roots (e.g., ["src", "kernel/src"])
+        #   4. the project root
+        #   5. RITZ_PATH entries
         # Roots that do not exist are still tried: their candidates miss, and
         # are recorded as such, so creating the root later invalidates.
         roots: List[Path] = [base_dir]
+        roots.extend(self._home_source_roots(from_file))
         roots.extend(self._source_root_candidates)
         if self.project_root:
             roots.append(self.project_root)
