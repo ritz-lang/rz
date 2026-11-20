@@ -368,7 +368,7 @@ def test_unit_tier_starts_no_process_under_spawn_guard(tmp_path):
     """
     import subprocess
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
-    env["PYTHONPATH"] = str(RITZ0_DIR)
+    env["PYTHONPATH"] = os.pathsep.join([str(RITZ0_DIR), str(RITZ0_DIR / "harness")])
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
     r = subprocess.run(
         [sys.executable, "-m", "pytest", "-q", "-p", "spawn_guard", "-p", "no:cacheprovider",

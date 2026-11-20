@@ -42,25 +42,16 @@ COMPILER_HASH_FILE = "compiler_hash"
 # #3454). Nothing writes them now; a compiler change sweeps them away.
 LEGACY_ENTRIES = ("objects", "deps.json", "hashes.json")
 
-# The ritz0 fingerprint walk skips what cannot affect codegen: bytecode and
-# pytest caches, the test/ tree and test_*.py modules.
-RITZ0_EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "test"}
-RITZ0_EXCLUDE_FILE_PREFIXES = ("test_",)
-# ...except these, which are compiler code despite the prefix: ritz0.py
-# imports test_runner for `--test` (AGAST #4314). tools/check_liveness.py
-# carves out the same file. tools/test_compiler_hash_import_graph.py fails
-# if ritz0.py can import anything the hash misses.
-RITZ0_HASHED_DESPITE_PREFIX = {"test_runner.py"}
-
 # projects/ritz files hashed into every compiler's fingerprint, with their tag.
 # build.py owns the clang flags (-ffreestanding/-fno-builtin), the runtime
 # shims and the link order; leaving it out once let a new clang flag reuse
 # every stale object. The rest were part of build.py until AGAST #1835 /
 # #3632: resolve.py decides the --deps every module is compiled with,
 # build_pipeline.py owns the flags and links, manifest.py what each [[bin]] is
-# built as. cas.py derives every artifact key and ritz0's module_interface
-# imports it (AGAST #4314). (build_testrun.py and build_cli.py produce no
-# artefact.)
+# built as. cas.py derives every artifact key (AGAST #4314). (build_testrun.py
+# and build_cli.py produce no artefact.) ritz0's own files, which include
+# cas.py, resolve.py and manifest.py again through its imports, come from
+# compiler_identity (AGAST #3915).
 RITZ0_DRIVER_FILES = {
     "build.py": b"build-driver",
     "resolve.py": b"build-driver-resolve",
@@ -185,34 +176,22 @@ def compute_file_hash(file_path: Path) -> str:
     return h.hexdigest()
 
 
-def _collect_ritz0_sources(ritz0_root: Path) -> List[Path]:
-    """Every codegen-relevant `.py` under ritz0/, sorted by relative path.
-
-    Everything not excluded counts: a hand-curated allowlist used to be here,
-    and it silently missed new files (`ritz0/emitter/*.py`) twice, so edits
-    to them reused stale objects.
-    """
-    sources: List[Path] = []
-    for dirpath, dirnames, filenames in os.walk(ritz0_root):
-        # Prune excluded directories in-place so os.walk doesn't descend.
-        dirnames[:] = [d for d in dirnames if d not in RITZ0_EXCLUDE_DIRS]
-        for fn in filenames:
-            if not fn.endswith(".py"):
-                continue
-            if (fn.startswith(RITZ0_EXCLUDE_FILE_PREFIXES)
-                    and fn not in RITZ0_HASHED_DESPITE_PREFIX):
-                continue
-            sources.append(Path(dirpath) / fn)
-    sources.sort(key=lambda p: p.relative_to(ritz0_root).as_posix())
-    return sources
+def _compiler_identity():
+    """Import ritz0's compiler_identity (it needs ritz0/ on sys.path)."""
+    import sys
+    if str(_RITZ0_DIR) not in sys.path:
+        sys.path.insert(0, str(_RITZ0_DIR))
+    import compiler_identity
+    return compiler_identity
 
 
 def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
     """Fingerprint the compiler; part of every CAS key and import-scan store.
 
-    ``ritz0``: the ``RITZ0_DRIVER_FILES`` plus every ``.py`` under
-    ``ritz0/`` except tests and bytecode caches (the source tree is the
-    artifact); ``test_runner.py`` is compiler code, not a test.
+    ``ritz0``: the ``RITZ0_DRIVER_FILES`` plus
+    ``compiler_identity.hash_ritz0_sources``: the files ritz0's entry points
+    can import (``emitter/fn_cache.py`` keys sigs by the same digest). Tests,
+    conftest.py and ``ritz0/harness/`` are outside it by construction.
     ``ritz1`` / ``ritz1_selfhosted``: the driver files plus the binary
     under ``ritz1/build/``; a missing binary returns the sentinel ``"<compiler>-missing"`` so state
     recorded without it is invalidated once it appears.
@@ -230,11 +209,8 @@ def compute_compiler_hash(project_root: Path, compiler: str = "ritz0") -> str:
         ritz0_root = project_root / "ritz0"
         if not ritz0_root.is_dir():
             return h.hexdigest()
-        for src in _collect_ritz0_sources(ritz0_root):
-            rel = src.relative_to(ritz0_root).as_posix()
-            h.update(rel.encode())
-            h.update(b'\x00')
-            _hash_file_into(h, src)
+        sources = _compiler_identity().hash_ritz0_sources(ritz0_root)
+        h.update(b"ritz0-sources\x00" + sources.encode())
         return h.hexdigest()
 
     if compiler in ("ritz1", "ritz1_selfhosted"):

@@ -328,32 +328,15 @@ def _sig_path(source_path: str) -> Path:
 # Each sig now records COMPILER_HASH, and read_current_sig() treats a sig
 # from any other ritz0 (or from before this field) as absent.
 #
-# The hash covers the same files as build.py's ritz0 fingerprint
-# (cache.compute_compiler_hash, #1382): every .py under ritz0/ except tests
-# and bytecode. It is taken once, when this module is imported, so it
-# describes the code this process loaded (ritz0_inproc's forkserver children
-# inherit it), not whatever is on disk at compile time. About 2 ms for 1.7 MB.
+# The hash is `compiler_identity.hash_ritz0_sources` (AGAST #3915), the
+# function build.py's fingerprint (cache.compute_compiler_hash) folds in too:
+# the files ritz0's entry points can import, so tests, conftest.py and the
+# harness in ritz0/harness/ are outside it. It is taken once, when this module
+# is imported, so it describes the code this process loaded (ritz0_inproc's
+# forkserver children inherit it), not whatever is on disk at compile time.
+# About 20 ms for 2 MB.
 
-_EXCLUDE_DIRS = {"__pycache__", ".pytest_cache", "test"}
-_EXCLUDE_FILE_PREFIXES = ("test_",)
-
-
-def hash_ritz0_sources(ritz0_root) -> str:
-    """Hex sha256 over every codegen .py under `ritz0_root`, by relative path."""
-    root = Path(ritz0_root)
-    sources = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in _EXCLUDE_DIRS]
-        for fn in filenames:
-            if fn.endswith(".py") and not fn.startswith(_EXCLUDE_FILE_PREFIXES):
-                sources.append(Path(dirpath) / fn)
-    h = hashlib.sha256(b"ritz0-sig\n")
-    for src in sorted(sources, key=lambda p: p.relative_to(root).as_posix()):
-        h.update(src.relative_to(root).as_posix().encode() + b"\0")
-        h.update(src.read_bytes())
-        h.update(b"\0")
-    return h.hexdigest()
-
+from compiler_identity import hash_ritz0_sources  # noqa: E402  (re-exported)
 
 COMPILER_HASH = hash_ritz0_sources(Path(__file__).resolve().parent.parent)
 

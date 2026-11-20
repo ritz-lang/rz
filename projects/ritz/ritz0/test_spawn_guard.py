@@ -114,7 +114,7 @@ def verdicts(tmp_path_factory):
     # Not this session's PYTEST_* (the gate's PYTEST_ADDOPTS names files to
     # run, PYTEST_XDIST_WORKER, ...): the nested session runs only the cases.
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTEST_")}
-    env["PYTHONPATH"] = str(RITZ0_DIR)
+    env["PYTHONPATH"] = os.pathsep.join([str(RITZ0_DIR), str(RITZ0_DIR / "harness")])
     # Installed plugins (django, asyncio, cov, ...) cost seconds to load and
     # play no part in spawn_guard; it is loaded by name below.
     env["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"

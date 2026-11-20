@@ -126,7 +126,7 @@ def _check_static(item):
     if calls:
         pytest.fail(
             f"{item.nodeid} calls {', '.join(calls)} but is not marked "
-            f"`integration` (AGAST #1805, #4264; ritz0/spawn_guard.py): a skip "
+            f"`integration` (AGAST #1805, #4264; ritz0/harness/spawn_guard.py): a skip "
             f"when its tool is missing would hide the spawn on hosts without it.\n"
             f"Mark the test (or the module: `pytestmark = pytest.mark.integration`).",
             pytrace=False,
@@ -149,7 +149,7 @@ def _watch(item, static=False):
         more = f"\n  … and {len(seen) - 5} more" if len(seen) > 5 else ""
         pytest.fail(
             f"{item.nodeid} started {len(seen)} process(es) but is not marked "
-            f"`integration` (AGAST #1805; ritz0/spawn_guard.py):\n  {shown}{more}\n"
+            f"`integration` (AGAST #1805; ritz0/harness/spawn_guard.py):\n  {shown}{more}\n"
             f"Mark the test (or the module: `pytestmark = pytest.mark.integration`).",
             pytrace=False,
         )

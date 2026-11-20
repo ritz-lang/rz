@@ -50,7 +50,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-RITZ0_DIR = Path(__file__).resolve().parent
+RITZ0_DIR = Path(__file__).resolve().parent.parent  # this file is in ritz0/harness/
 RITZ_ROOT = RITZ0_DIR.parent
 RITZ0_PY = RITZ0_DIR / "ritz0.py"
 

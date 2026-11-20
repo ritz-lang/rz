@@ -121,7 +121,7 @@ AGAST #1392. Two things live here, and they are independent.
 
 11. `batched` (AGAST #2806) — a matrix file marked `pytest.mark.batched`
    compiles CHUNK of a test function's rows as one program per compiler
-   (ritz0/batching.py).  `pytest_pyfunc_call` below runs such a test with
+   (ritz0/harness/batching.py).  `pytest_pyfunc_call` below runs such a test with
    batching on and, if it fails on a batched answer, again with it off, so
    every failure is the row's own per-row compile.  A row that could lean on
    another row's import or generic instance is compiled alone too, and gets
@@ -137,14 +137,23 @@ AGAST #1392. Two things live here, and they are independent.
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
 import pytest
 
-import batching
-import fast_link
-import ritz0_inproc
+# The test harness lives in ritz0/harness/ (AGAST #3915): outside the files
+# ritz0 imports, so editing it, or this file, leaves the compiler hash (and
+# every sig and cached artifact) alone.  Tests still `import fast_link` etc.
+# by bare name.
+HARNESS_DIR = str(Path(__file__).resolve().parent / "harness")
+if HARNESS_DIR not in sys.path:
+    sys.path.append(HARNESS_DIR)
+
+import batching  # noqa: E402
+import fast_link  # noqa: E402
+import ritz0_inproc  # noqa: E402
 
 pytest_plugins = ["spawn_guard", "cost_meter", "only_files", "read_guard"]
 

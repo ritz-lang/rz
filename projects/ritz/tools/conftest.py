@@ -7,16 +7,17 @@ the guard loaded, an unmarked tools/ test that starts a process fails, naming
 the command, and `-m "not integration"` really is the no-subprocess tier for
 tools/ too.  tools/test_tools_spawn_guard.py checks this stays loaded.
 
-ritz0/ is appended to sys.path (not prepended) so no tools/ module is
-shadowed.  In a mixed session (`pytest ritz0/x.py tools/y.py`) both conftests
+ritz0/ and ritz0/harness/ (where spawn_guard lives, AGAST #3915) are
+appended to sys.path (not prepended) so no tools/ module is shadowed.  In a mixed session (`pytest ritz0/x.py tools/y.py`) both conftests
 name the plugin, and pytest registers it once.
 """
 
 import sys
 from pathlib import Path
 
-_RITZ0 = str(Path(__file__).resolve().parent.parent / "ritz0")
-if _RITZ0 not in sys.path:
-    sys.path.append(_RITZ0)
+_RITZ0 = Path(__file__).resolve().parent.parent / "ritz0"
+for _dir in (str(_RITZ0), str(_RITZ0 / "harness")):
+    if _dir not in sys.path:
+        sys.path.append(_dir)
 
 pytest_plugins = ["spawn_guard"]

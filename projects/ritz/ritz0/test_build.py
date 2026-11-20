@@ -462,11 +462,12 @@ class TestCacheCompilerHash:
         assert len(h) == 64  # SHA256 hex digest
 
     def test_compiler_hash_changes_with_file(self, tmp_path):
-        """Compiler hash changes when a critical file changes."""
+        """Compiler hash changes when an imported compiler file changes."""
         from cache import compute_compiler_hash
 
         ritz0_dir = tmp_path / "ritz0"
         ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("import emitter_llvmlite\n")
         emitter = ritz0_dir / "emitter_llvmlite.py"
         emitter.write_text("# version 1")
 
@@ -484,6 +485,7 @@ class TestCacheCompilerHash:
 
         ritz0_dir = tmp_path / "ritz0"
         ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("import emitter_llvmlite\n")
         emitter = ritz0_dir / "emitter_llvmlite.py"
         emitter.write_text("# version 1")
 
@@ -515,6 +517,7 @@ class TestCacheWholesaleInvalidation:
 
         ritz0_dir = tmp_path / "ritz0"
         ritz0_dir.mkdir()
+        (ritz0_dir / "ritz0.py").write_text("import emitter_llvmlite\n")
         (ritz0_dir / "emitter_llvmlite.py").write_text("# v1")
         (tmp_path / "main.ritz").write_text("fn main() -> i32\n    0\n")
         cache = BuildCache(project_root=tmp_path)
@@ -546,16 +549,17 @@ class TestCacheWholesaleInvalidation:
         assert BuildCache(project_root=tmp_path).invalidate_if_compiler_changed() is False
         assert (cache.cache_dir / "imports.json").exists(), "warm scans wrongly nuked"
 
-    def test_ritz0_walk_finds_emitter_subpackage(self, tmp_path):
-        """The pre-fix bug: hand-curated list missed `emitter/*.py`. Adding
-        a file under `emitter/` must change the fingerprint."""
+    def test_ritz0_hash_covers_emitter_subpackage(self, tmp_path):
+        """The pre-fix bug: hand-curated list missed `emitter/*.py`. Editing
+        an emitter module ritz0 imports must change the fingerprint."""
         from cache import compute_compiler_hash
 
         ritz0_dir = tmp_path / "ritz0"
         ritz0_dir.mkdir()
-        (ritz0_dir / "ritz0.py").write_text("# main")
+        (ritz0_dir / "ritz0.py").write_text("from emitter import fn_cache\n")
         emitter_dir = ritz0_dir / "emitter"
         emitter_dir.mkdir()
+        (emitter_dir / "__init__.py").write_text("")
         (emitter_dir / "fn_cache.py").write_text("# v1")
 
         h1 = compute_compiler_hash(tmp_path, "ritz0")
@@ -563,11 +567,12 @@ class TestCacheWholesaleInvalidation:
         h2 = compute_compiler_hash(tmp_path, "ritz0")
         assert h1 != h2, "edit to emitter/fn_cache.py did not change fingerprint"
 
-        # New file in emitter/ also changes fingerprint.
-        h3a = compute_compiler_hash(tmp_path, "ritz0")
+        # A new module in emitter/ counts once ritz0 imports it.
         (emitter_dir / "new_module.py").write_text("# new")
-        h3b = compute_compiler_hash(tmp_path, "ritz0")
-        assert h3a != h3b, "new file in emitter/ did not change fingerprint"
+        assert compute_compiler_hash(tmp_path, "ritz0") == h2, "unimported file"
+        (ritz0_dir / "ritz0.py").write_text(
+            "from emitter import fn_cache, new_module\n")
+        assert compute_compiler_hash(tmp_path, "ritz0") != h2, "imported file"
 
     def test_ritz0_walk_excludes_tests_and_pycache(self, tmp_path):
         """test_*.py and __pycache__ must NOT contribute to the fingerprint

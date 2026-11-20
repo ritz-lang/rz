@@ -42,7 +42,8 @@ from emitter.fn_cache import (
 
 def _stub_tree(root: Path) -> Path:
     (root / "emitter").mkdir(parents=True)
-    (root / "ritz0.py").write_text("print('main')\n")
+    (root / "emitter" / "__init__.py").write_text("")
+    (root / "ritz0.py").write_text("from emitter import fn_cache\n")
     (root / "emitter" / "fn_cache.py").write_text("X = 1\n")
     return root
 
@@ -60,11 +61,20 @@ class TestFingerprint:
         (root / "emitter" / "fn_cache.py").write_text("X = 2\n")
         assert hash_ritz0_sources(root) != before
 
-    def test_changes_when_a_source_is_added(self, tmp_path):
+    def test_changes_when_an_imported_source_is_added(self, tmp_path):
         root = _stub_tree(tmp_path / "r")
         before = hash_ritz0_sources(root)
         (root / "new_rules.py").write_text("")
+        (root / "ritz0.py").write_text("from emitter import fn_cache\nimport new_rules\n")
         assert hash_ritz0_sources(root) != before
+
+    def test_ignores_a_file_ritz0_cannot_import(self, tmp_path):
+        """The hash is ritz0's import set, not a walk: a stray file is not
+        compiler code and must not invalidate every sig."""
+        root = _stub_tree(tmp_path / "r")
+        before = hash_ritz0_sources(root)
+        (root / "scratch_notes.py").write_text("")
+        assert hash_ritz0_sources(root) == before
 
     def test_ignores_tests_and_bytecode(self, tmp_path):
         """Editing a test must not invalidate every sig (same rule as cache.py)."""

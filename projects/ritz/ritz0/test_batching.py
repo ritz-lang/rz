@@ -548,7 +548,9 @@ def _nested(tmp_path, *args, batch="1"):
     (tmp_path / "conftest.py").write_text(_NESTED_CONFTEST)
     (tmp_path / "test_nested.py").write_text(_NESTED_TESTS)
     log, per_row = tmp_path / "batch.log", tmp_path / "per_row.log"
-    env = dict(ENV, PYTHONPATH=str(Path(__file__).resolve().parent), RITZ_TEST_BATCH=batch,
+    env = dict(ENV, PYTHONPATH=os.pathsep.join(
+        [str(Path(__file__).resolve().parent), str(Path(__file__).resolve().parent / "harness")]),
+        RITZ_TEST_BATCH=batch,
                RITZ_TEST_BATCH_LOG=str(log), PER_ROW_LOG=str(per_row))
     # ci_local's "likely failures first" names this file in PYTEST_ADDOPTS; the
     # nested pytest, in tmp_path, would look for it there and run nothing.

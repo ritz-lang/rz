@@ -223,7 +223,7 @@ def test_oracle_is_cached_by_source():
 MISSING_PRELOAD_NAME = "_ritz_no_such_module_2844"
 LAZY_IMPORTS_PROBE = f"""\
 import contextlib, io, os, sys
-sys.path.insert(0, sys.argv[1])
+sys.path[:0] = sys.argv[1:3]  # ritz0/ and ritz0/harness/ (this file's dir)
 import ritz0_inproc
 for name in ritz0_inproc.PRELOAD + [{MISSING_PRELOAD_NAME!r}]:
     try:
@@ -232,7 +232,7 @@ for name in ritz0_inproc.PRELOAD + [{MISSING_PRELOAD_NAME!r}]:
         pass
 before = set(sys.modules)
 import ritz0
-sys.argv = ["ritz0.py", sys.argv[2], "-o", sys.argv[3]]
+sys.argv = ["ritz0.py", sys.argv[3], "-o", sys.argv[4]]
 with contextlib.redirect_stdout(io.StringIO()):
     try:
         ritz0.main()
@@ -247,6 +247,7 @@ def test_a_compile_imports_nothing_the_forkserver_did_not_preload(tmp_path):
     src.write_text(OK_PROGRAM)
     probe = subprocess.run(
         [sys.executable, "-c", LAZY_IMPORTS_PROBE, str(ritz0_inproc.RITZ0_DIR),
+         os.path.dirname(os.path.abspath(ritz0_inproc.__file__)),
          str(src), str(tmp_path / "main.ll")],
         cwd=tmp_path, env=_env(), capture_output=True, text=True, timeout=300)
     assert probe.returncode == 0, probe.stderr

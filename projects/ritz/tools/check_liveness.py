@@ -44,11 +44,16 @@ ENTRY_POINTS = {
     "list_deps.py": "build.py runs it as a script",
     "test_runner.py": "build.py loads it with importlib; not a test despite the name",
     "conftest.py": "pytest loads it",
-    "spawn_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
+    "harness/spawn_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "cost_meter.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "only_files.py": "pytest plugin; conftest.py names it in pytest_plugins",
     "read_guard.py": "pytest plugin; conftest.py names it in pytest_plugins",
 }
+
+# Directories under ritz0/ that are sys.path roots of their own: a module in
+# one is imported by its bare name.  harness/ holds the pytest harness, kept
+# out of the compiler hash (AGAST #3915); conftest.py puts it on sys.path.
+SYS_PATH_SUBDIRS = ("harness",)
 
 # Non-test Python outside ritz0/ that runs with ritz0/ on sys.path.  "" is the
 # project root itself, non-recursively.
@@ -105,6 +110,8 @@ def _module_name(rel):
     """`ritz0/emitter/fn_cache.py` -> `emitter.fn_cache`; a package's
     `__init__.py` takes the package's name."""
     parts = PurePosixPath(rel).relative_to(RITZ0).with_suffix("").parts
+    if len(parts) > 1 and parts[0] in SYS_PATH_SUBDIRS:
+        parts = parts[1:]
     if parts[-1] == "__init__":
         parts = parts[:-1]
     return ".".join(parts)
@@ -159,7 +166,8 @@ def find_orphans(root, files):
                 modules[_module_name(rel)] = rel
 
     def package_of(rel):
-        return list(PurePosixPath(rel).relative_to(RITZ0).parent.parts)
+        parts = list(PurePosixPath(rel).relative_to(RITZ0).parent.parts)
+        return parts[1:] if parts[:1] and parts[0] in SYS_PATH_SUBDIRS else parts
 
     entries = [f"{RITZ0}/{entry}" for entry in ENTRY_POINTS]
     missing = [e for e in entries if e not in files]
