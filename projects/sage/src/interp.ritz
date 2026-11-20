@@ -12,21 +12,25 @@
 #              of the arena, see `in_src`)
 #   objects    JsObject records holding an insertion-ordered linked list of
 #              Prop records
+#   arrays     JsArray records holding an insertion-ordered linked list of
+#              Elem slots, plus a JsObject for non-index properties
 #   functions  FuncRec records: the function's AST node + its closure scope
 #   control    Interp.ctl says how the last statement completed (normal,
 #              return, break, continue, throw); Interp.ret carries the
 #              returned or thrown value
 #
-# Supported: numbers, strings, booleans, null, undefined, objects;
+# Supported: numbers, strings, booleans, null, undefined, objects, arrays;
 # arithmetic, comparison, equality, logical, bitwise, unary, typeof,
 # update and (compound) assignment operators; let/const/var; function
 # declarations (hoisted) and expressions, closures, recursion; if, while,
-# do-while, for, break, continue, return; throw/try/catch/finally with
-# Error objects for runtime errors; console.log, console.error, and a
-# string's .length.
-# Not yet (each throws "SyntaxError: sage does not support ..."): arrays
-# (#4074), arrow functions (#4075), and classes, `new`, `this`, for-in/of,
-# labels, switch, delete, `in`, instanceof and built-ins like Math (#4077).
+# do-while, for, for-of over an array, break, continue, return;
+# throw/try/catch/finally with Error objects for runtime errors; console.log,
+# console.error, a string's .length, and array literals, indexing, .length,
+# push/pop and [ 1, 'a' ] rendering.
+# Not yet (each throws "SyntaxError: sage does not support ..."): arrow
+# functions (#4075), and classes, `new`, `this`, for-in, for-of over a
+# non-array, labels, switch, delete, `in`, instanceof and built-ins like Math
+# (#4077).
 # `var` is not hoisted (reading one before its declaration is a
 # ReferenceError), and a `for (let ...)` loop shares one binding across
 # iterations (#4077).
@@ -52,15 +56,24 @@ const V_STRING: i32 = 4    # a = arena start, b = length
 const V_FUNCTION: i32 = 5  # a = FuncRec index
 const V_NATIVE: i32 = 6    # a = NATIVE_* id
 const V_OBJECT: i32 = 7    # a = JsObject index
+const V_ARRAY: i32 = 8     # a = JsArray index
 
 const NATIVE_CONSOLE_LOG: i64 = 1
 const NATIVE_CONSOLE_ERROR: i64 = 2
+const NATIVE_ARRAY_PUSH: i64 = 3
+const NATIVE_ARRAY_POP: i64 = 4
 
 struct Value
     tag: i32
     num: f64
     a: i64
     b: i64
+
+# A property key: (in_src, start, len). Evaluates a computed key.
+struct Key
+    in_src: i32
+    start: i64
+    len: i64
 
 # How the last statement completed
 const CTL_NORMAL: i32 = 0
@@ -73,6 +86,11 @@ const CTL_THROW: i32 = 4
 # size exceeded". Each JS call costs several native frames; this keeps a
 # runaway recursion well inside the default 8 MB stack.
 const MAX_DEPTH: i64 = 2000
+
+# Extending an array (by index or by .length) materializes undefined slots,
+# so a huge sparse array would hang or exhaust memory until there is a GC
+# (#4077). Cap the materialized length; node accepts larger sparse arrays.
+const MAX_ARRAY_LEN: i64 = 1000000
 
 # =============================================================================
 # Interpreter State
@@ -103,6 +121,17 @@ struct JsObject
     last: i64
     is_error: i32   # prints and converts as "name: message"
 
+# One array element slot; slots are a linked list in index order, like Props
+struct Elem
+    value: Value
+    next: i64       # next slot, -1 at the end
+
+struct JsArray
+    first: i64      # element 0, -1 if empty
+    last: i64
+    len: i64
+    obj: i64        # JsObject holding non-index properties (a.foo, a[-1])
+
 struct FuncRec
     node: i64       # AstTag.FunctionDecl / AstTag.FunctionExpr node
     scope: i64      # closure scope
@@ -116,6 +145,8 @@ struct Interp
     bindings: Vec<Binding>
     objects: Vec<JsObject>
     props: Vec<Prop>
+    arrays: Vec<JsArray>
+    elems: Vec<Elem>
     funcs: Vec<FuncRec>
     lit_start: Vec<i64>   # per AST node: arena start of a decoded string literal, -1 if not yet
     lit_len: Vec<i64>
@@ -353,6 +384,8 @@ fn interp_new(source: StrView, echo: i32) -> Interp
         bindings: vec_new<Binding>(),
         objects: vec_new<JsObject>(),
         props: vec_new<Prop>(),
+        arrays: vec_new<JsArray>(),
+        elems: vec_new<Elem>(),
         funcs: vec_new<FuncRec>(),
         lit_start: vec_new<i64>(),
         lit_len: vec_new<i64>(),
@@ -650,6 +683,164 @@ fn prop_get_sv(it: @&Interp, obj: i64, key: StrView) -> Value
     prop_get(it, obj, 0, k.a, k.b)
 
 # =============================================================================
+# Arrays
+# =============================================================================
+#
+# A JsArray holds an insertion-ordered linked list of Elem slots (index order),
+# so an array's elements live in the interpreter's `elems` vector and grow
+# without moving the array record. Non-index properties share the JsObject
+# machinery with plain objects. Element elisions (`[1, , 3]`) evaluate to
+# undefined, so they print as `undefined` rather than node's `<1 empty item>`;
+# push/pop are bound methods on each array (a.push captured and called later
+# still mutates a, unlike node).
+
+fn arr_new(it: @&Interp) -> Value
+    let idx = vec_len<JsArray>(@it.arrays)
+    let o = obj_new(it)
+    vec_push<JsArray>(@&it.arrays, JsArray { first: -1, last: -1, len: 0, obj: o.a })
+    v_tagged(V_ARRAY, idx)
+
+fn arr_len(it: @&Interp, arr: i64) -> i64
+    vec_get<JsArray>(@it.arrays, arr).len
+
+# Slot holding element `i`, -1 outside 0 .. len-1
+fn arr_slot(it: @&Interp, arr: i64, i: i64) -> i64
+    if i < 0 or i >= arr_len(it, arr)
+        return -1
+    var p: i64 = vec_get<JsArray>(@it.arrays, arr).first
+    var k: i64 = 0
+    while p >= 0 and k < i
+        p = vec_get<Elem>(@it.elems, p).next
+        k = k + 1
+    p
+
+fn arr_get(it: @&Interp, arr: i64, i: i64) -> Value
+    let p = arr_slot(it, arr, i)
+    if p < 0
+        return v_undef()
+    vec_get<Elem>(@it.elems, p).value
+
+# Append one element (no bounds check; callers extend deliberately)
+fn arr_append(it: @&Interp, arr: i64, value: Value)
+    let idx = vec_len<Elem>(@it.elems)
+    vec_push<Elem>(@&it.elems, Elem { value: value, next: -1 })
+    let ap = vec_get_ptr<JsArray>(@&it.arrays, arr)
+    if ap.last < 0
+        ap.first = idx
+    else
+        let lp = vec_get_ptr<Elem>(@&it.elems, ap.last)
+        lp.next = idx
+    let ap2 = vec_get_ptr<JsArray>(@&it.arrays, arr)
+    ap2.last = idx
+    ap2.len = ap2.len + 1
+
+fn arr_set_index(it: @&Interp, arr: i64, i: i64, value: Value)
+    if i >= MAX_ARRAY_LEN
+        throw_error(it, "RangeError", "Array index too large", "")
+        return
+    while arr_len(it, arr) <= i
+        arr_append(it, arr, v_undef())
+    let p = arr_slot(it, arr, i)
+    if p >= 0
+        vec_get_ptr<Elem>(@&it.elems, p).value = value
+
+# Set the length: truncate (dropping the tail) or extend with undefined
+fn arr_set_len(it: @&Interp, arr: i64, n: i64)
+    let len = arr_len(it, arr)
+    if n < len
+        if n == 0
+            let ap = vec_get_ptr<JsArray>(@&it.arrays, arr)
+            ap.first = -1
+            ap.last = -1
+            ap.len = 0
+        else
+            let p = arr_slot(it, arr, n - 1)
+            vec_get_ptr<Elem>(@&it.elems, p).next = -1
+            let ap = vec_get_ptr<JsArray>(@&it.arrays, arr)
+            ap.last = p
+            ap.len = n
+    else
+        while arr_len(it, arr) < n
+            arr_append(it, arr, v_undef())
+
+fn arr_push_values(it: @&Interp, arr: i64, args: @Vec<Value>) -> Value
+    let n = vec_len<Value>(args)
+    var i: i64 = 0
+    while i < n
+        arr_append(it, arr, vec_get<Value>(args, i))
+        i = i + 1
+    v_num(arr_len(it, arr) as f64)
+
+fn arr_pop_value(it: @&Interp, arr: i64) -> Value
+    let len = arr_len(it, arr)
+    if len == 0
+        return v_undef()
+    let v = arr_get(it, arr, len - 1)
+    arr_set_len(it, arr, len - 1)
+    v
+
+# Canonical array index for a property key: 0 .. 2^32 - 2, else -1
+fn key_index(it: @&Interp, key: Key) -> i64
+    if key.len <= 0 or key.len > 10
+        return -1
+    if key.len > 1 and name_byte(it, key.in_src, key.start) == 48
+        return -1
+    var i: i64 = 0
+    var v: i64 = 0
+    while i < key.len
+        let c = name_byte(it, key.in_src, key.start + i)
+        if c < 48 or c > 57
+            return -1
+        v = v * 10 + (c - 48) as i64
+        i = i + 1
+    if v > 4294967294
+        return -1
+    v
+
+fn key_is(it: @&Interp, key: Key, name: StrView) -> i32
+    if strview_eq(name_view(it, key.in_src, key.start, key.len), name)
+        return 1
+    0
+
+# A native function bound to its receiver array
+fn v_method(recv: i64, id: i64) -> Value
+    Value { tag: V_NATIVE, num: 0.0, a: id, b: recv }
+
+fn array_get(it: @&Interp, arr: i64, key: Key) -> Value
+    let ix = key_index(it, key)
+    if ix >= 0
+        return arr_get(it, arr, ix)
+    if key_is(it, key, "length") == 1
+        return v_num(arr_len(it, arr) as f64)
+    let o = vec_get<JsArray>(@it.arrays, arr).obj
+    let p = prop_find(it, o, key.in_src, key.start, key.len)
+    if p >= 0
+        return vec_get<Prop>(@it.props, p).value
+    if key_is(it, key, "push") == 1
+        return v_method(arr, NATIVE_ARRAY_PUSH)
+    if key_is(it, key, "pop") == 1
+        return v_method(arr, NATIVE_ARRAY_POP)
+    v_undef()
+
+fn array_write(it: @&Interp, arr: i64, key: Key, value: Value)
+    let ix = key_index(it, key)
+    if ix >= 0
+        arr_set_index(it, arr, ix, value)
+        return
+    if key_is(it, key, "length") == 1
+        let n = to_number(it, value)
+        if n != n or n < 0.0 or n > 4294967295.0 or ((n as i64) as f64) != n
+            throw_error(it, "RangeError", "Invalid array length", "")
+            return
+        if n > (MAX_ARRAY_LEN as f64)
+            throw_error(it, "RangeError", "Array length too large", "")
+            return
+        arr_set_len(it, arr, n as i64)
+        return
+    let o = vec_get<JsArray>(@it.arrays, arr).obj
+    prop_set(it, o, key.in_src, key.start, key.len, value)
+
+# =============================================================================
 # Throwing
 # =============================================================================
 
@@ -771,6 +962,10 @@ fn func_name(it: @&Interp, v: Value) -> StrView
     if v.tag == V_NATIVE
         if v.a == NATIVE_CONSOLE_ERROR
             return "error"
+        if v.a == NATIVE_ARRAY_PUSH
+            return "push"
+        if v.a == NATIVE_ARRAY_POP
+            return "pop"
         return "log"
     let rec = vec_get<FuncRec>(@it.funcs, v.a)
     let fnode = node_at(it, rec.node)
@@ -795,6 +990,20 @@ fn push_to_string(it: @&Interp, buf: @&Vec<u8>, v: Value)
         var i: i64 = 0
         while i < v.b
             vec_push<u8>(buf, vec_get<u8>(@it.arena, v.a + i))
+            i = i + 1
+    else if v.tag == V_ARRAY
+        # Array.prototype.toString: elements joined by ",", null and
+        # undefined contributing nothing
+        let len = arr_len(it, v.a)
+        var i: i64 = 0
+        var p: i64 = vec_get<JsArray>(@it.arrays, v.a).first
+        while i < len and p >= 0
+            if i > 0
+                buf_push_sv(buf, ",")
+            let e = vec_get<Elem>(@it.elems, p)
+            if e.value.tag != V_UNDEFINED and e.value.tag != V_NULL
+                push_to_string(it, buf, e.value)
+            p = e.next
             i = i + 1
     else if v.tag == V_OBJECT
         if vec_get<JsObject>(@it.objects, v.a).is_error == 1
@@ -840,6 +1049,24 @@ fn push_inspect(it: @&Interp, buf: @&Vec<u8>, v: Value, depth: i64)
             buf_push_sv(buf, "[Function: ")
             buf_push_sv(buf, name)
             buf_push_sv(buf, "]")
+    else if v.tag == V_ARRAY
+        let len = arr_len(it, v.a)
+        if len == 0
+            buf_push_sv(buf, "[]")
+        else if depth > 2
+            buf_push_sv(buf, "[Array]")
+        else
+            buf_push_sv(buf, "[ ")
+            var i: i64 = 0
+            var p: i64 = vec_get<JsArray>(@it.arrays, v.a).first
+            while i < len and p >= 0
+                let e = vec_get<Elem>(@it.elems, p)
+                push_inspect(it, buf, e.value, depth + 1)
+                if i + 1 < len
+                    buf_push_sv(buf, ", ")
+                p = e.next
+                i = i + 1
+            buf_push_sv(buf, " ]")
     else if v.tag == V_OBJECT
         let obj = vec_get<JsObject>(@it.objects, v.a)
         if obj.is_error == 1
@@ -897,6 +1124,11 @@ fn strict_equals(it: @&Interp, x: Value, y: Value) -> i32
         return 1
     0
 
+fn is_objectish(v: Value) -> i32
+    if v.tag == V_OBJECT or v.tag == V_FUNCTION or v.tag == V_ARRAY
+        return 1
+    0
+
 fn loose_equals(it: @&Interp, x: Value, y: Value) -> i32
     if x.tag == y.tag
         return strict_equals(it, x, y)
@@ -914,7 +1146,7 @@ fn loose_equals(it: @&Interp, x: Value, y: Value) -> i32
         if to_number(it, x) == to_number(it, y)
             return 1
         return 0
-    if x.tag == V_OBJECT or y.tag == V_OBJECT or x.tag == V_FUNCTION or y.tag == V_FUNCTION
+    if is_objectish(x) == 1 or is_objectish(y) == 1
         # Compare an object by its string form with a primitive
         if x.tag == V_STRING or x.tag == V_NUMBER
             return loose_equals(it, x, to_string(it, y))
@@ -923,7 +1155,7 @@ fn loose_equals(it: @&Interp, x: Value, y: Value) -> i32
     0
 
 fn is_primitive_number_like(v: Value) -> i32
-    if v.tag == V_STRING or v.tag == V_OBJECT or v.tag == V_FUNCTION or v.tag == V_NATIVE
+    if is_objectish(v) == 1 or v.tag == V_STRING or v.tag == V_NATIVE
         return 0
     1
 
@@ -1102,6 +1334,8 @@ fn get_property(it: @&Interp, obj: Value, key: Key) -> Value
         return v_undef()
     if obj.tag == V_OBJECT
         return prop_get(it, obj.a, key.in_src, key.start, key.len)
+    if obj.tag == V_ARRAY
+        return array_get(it, obj.a, key)
     if obj.tag == V_STRING
         if strview_eq(name_view(it, key.in_src, key.start, key.len), "length")
             return v_num(obj.b as f64)
@@ -1126,6 +1360,8 @@ fn write_member(it: @&Interp, obj: Value, key: Key, value: Value)
         return
     if obj.tag == V_OBJECT
         prop_set(it, obj.a, key.in_src, key.start, key.len, value)
+    else if obj.tag == V_ARRAY
+        array_write(it, obj.a, key, value)
     # Writes to a primitive's property are ignored (sloppy mode)
 
 # =============================================================================
@@ -1295,6 +1531,23 @@ fn eval_update(it: @&Interp, idx: i64) -> Value
         return v_num(old + delta)
     v_num(old)
 
+fn eval_array(it: @&Interp, idx: i64) -> Value
+    let node = node_at(it, idx)
+    let arr = arr_new(it)
+    let start = node.children_start
+    let count = node.children_count
+    var i: i64 = 0
+    while i < count
+        let elem = child_at(it, start, i)
+        var value: Value = v_undef()   # an elision is a hole, treated as undefined
+        if elem != NO_CHILD
+            value = eval(it, elem)
+            if threw(it) == 1
+                return v_undef()
+        arr_append(it, arr.a, value)
+        i = i + 1
+    arr
+
 fn eval_object(it: @&Interp, idx: i64) -> Value
     let node = node_at(it, idx)
     let obj = obj_new(it)
@@ -1337,6 +1590,10 @@ fn console_print(it: @&Interp, native: i64, args: @Vec<Value>)
 
 fn call_function(it: @&Interp, f: Value, args: @Vec<Value>, callee: i64) -> Value
     if f.tag == V_NATIVE
+        if f.a == NATIVE_ARRAY_PUSH
+            return arr_push_values(it, f.b, args)
+        if f.a == NATIVE_ARRAY_POP
+            return arr_pop_value(it, f.b)
         console_print(it, f.a, args)
         return v_undef()
     if f.tag != V_FUNCTION
@@ -1434,6 +1691,8 @@ fn eval(it: @&Interp, idx: i64) -> Value
         return read_member(it, idx)
     if tag == AstTag.ObjectLiteral
         return eval_object(it, idx)
+    if tag == AstTag.ArrayLiteral
+        return eval_array(it, idx)
     if tag == AstTag.FunctionExpr
         return eval_function_expr(it, idx)
     throw_unsupported(it, ast_node_type_name(tag))
@@ -1547,6 +1806,55 @@ fn exec_for(it: @&Interp, node: *AstNode)
             let _ignored = eval(it, update)
     it.scope = saved
 
+# for (let x of arr) and for (x of arr): iterate an array's elements
+fn exec_for_of(it: @&Interp, node: *AstNode)
+    let iterable = eval(it, node.child2)
+    if threw(it) == 1
+        return
+    if iterable.tag != V_ARRAY
+        throw_error(it, "TypeError", node_text(it, node.child2), " is not iterable")
+        return
+    let left = node.child1
+    let lnode = node_at(it, left)
+    let num = arr_len(it, iterable.a)
+    let body = node.child3
+    var i: i64 = 0
+    while i < num
+        let value = arr_get(it, iterable.a, i)
+        if lnode.tag == AstTag.VarDecl
+            # A fresh binding per iteration, like `let` in for-of
+            let saved = it.scope
+            it.scope = scope_new(it, saved, 0)
+            let name = node_at(it, child_at(it, lnode.children_start, 0))
+            var is_const: i32 = 0
+            if lnode.int_value == VAR_CONST
+                is_const = 1
+            declare(it, it.scope, 1, name.str_start, name.str_len, value, is_const)
+            exec(it, body)
+            it.scope = saved
+        else if lnode.tag == AstTag.Identifier
+            write_identifier(it, left, value)
+            if threw(it) == 1
+                return
+            exec_scoped(it, body)
+        else if lnode.tag == AstTag.MemberExpr
+            let obj = eval(it, lnode.child1)
+            if threw(it) == 1
+                return
+            let key = member_key(it, lnode)
+            if threw(it) == 1
+                return
+            write_member(it, obj, key, value)
+            if threw(it) == 1
+                return
+            exec_scoped(it, body)
+        else
+            throw_unsupported(it, "this for-of target")
+            return
+        if loop_should_stop(it) == 1
+            break
+        i = i + 1
+
 fn exec_try(it: @&Interp, node: *AstNode)
     let catch_param = node.child2
     let catch_block = node.child3
@@ -1610,6 +1918,8 @@ fn exec(it: @&Interp, idx: i64)
                 break
     else if tag == AstTag.ForStmt
         exec_for(it, node)
+    else if tag == AstTag.ForOfStmt
+        exec_for_of(it, node)
     else if tag == AstTag.ReturnStmt
         var value: Value = v_undef()
         if node.child1 != NO_CHILD

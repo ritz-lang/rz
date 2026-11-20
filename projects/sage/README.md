@@ -92,7 +92,9 @@ Sage has no required dependencies beyond `ritzlib`.
 the lexer, parser, AST and `interp.ritz`, the evaluator (AGAST #2787).
 
 It supports numbers (printed as node prints them), strings with escapes,
-booleans, null, undefined and objects; arithmetic, comparison, equality,
+booleans, null, undefined, objects and arrays (literals, `a[i]` get/set,
+`.length` get/set, `push`/`pop`, `for (x of a)`, and `[ 1, 'a' ]` in
+console.log); arithmetic, comparison, equality,
 logical, bitwise, unary, `typeof`, update and compound assignment operators;
 let/const/var; function declarations (hoisted) and expressions, closures and
 recursion (a runaway recursion is a RangeError); if, while, do-while, for,
@@ -100,16 +102,19 @@ break, continue and return; throw/try/catch/finally with Error objects
 (`e.name`, `e.message`); console.log, console.error and a string's
 `.length`.
 
-Not yet: arrays (#4074), arrow functions (#4075), and `new`, `this`,
-classes, prototypes, for-in/of, switch, labels and the standard built-ins
+Not yet: arrow functions (#4075), and `new`, `this`,
+classes, prototypes, for-in, for-of over anything but an array, switch,
+labels and the standard built-ins
 such as Math (#4077); each throws `SyntaxError: sage does not support this
-yet`. Nothing is freed: there is no GC yet. Full ECMAScript compliance, the bytecode VM, a garbage
+yet`. Array elisions (`[1, , 3]`) read as undefined, and extending an
+array past 1,000,000 elements is a RangeError (no GC yet). Nothing else is
+freed: there is no GC yet. Full ECMAScript compliance, the bytecode VM, a garbage
 collector and DOM integration with [tempest](../tempest) are all still
 ahead. Note the `examples/` directory referenced by older docs does not
 exist.
 
 The unit tests pass: `./rz test sage` runs the lexer, parser and interpreter
-tests (116 at 2026-11-18) and `test.sh`, which checks `sage t.js` prints 42,
+tests (138 at 2026-11-20) and `test.sh`, which checks `sage t.js` prints 42,
 and that a script that throws or does not parse exits 1.
 
 ## License
