@@ -550,6 +550,8 @@ def test_every_scoped_step_is_a_step_main_yml_declares():
     ("M", "projects/ritz/tools/ritz0_scope.py"),
     ("M", "projects/ritz/docs/TESTING.md"),
     ("M", "projects/ritz/ritz0/test_parser.py"),
+    ("M", "projects/ritz/ritzlib/tests/test_argspec_errors.ritz"),
+    ("M", "projects/ritz/ritzlib/README.md"),
     ("M", ".claude/skills/rz-iterate/run-gate.sh"),
 ])
 def test_a_compiler_free_change_skips_both_regression_steps(real_scopes, status, path):

@@ -15,7 +15,10 @@ stdout and exit code. That observation is a function of:
     harness sets for itself;
   * what every example links against or is run by: ritzlib/, runtime/,
     cache.py, and regression.sh itself (the run sandbox, environment and
-    budgets live there);
+    budgets live there).  ritzlib/ is its *modules* only: the nested
+    ritzlib/tests package and the README are not linked by any example, and
+    reading them here puts files outside the regression step's read set
+    (read-set-audit, AGAST #4315/#4347);
   * where it runs: BUILD_DIR, because the per-example sandbox lives under it
     and a program that prints its cwd prints that path;
   * the example: its whole tree plus every `path = "..."` dependency named in
@@ -56,8 +59,16 @@ def _load_cache_module():
     return mod
 
 
-def tree_hash(root: Path) -> str:
-    """Content hash of every input file under `root`, by relative path."""
+def tree_hash(root: Path, *, skip_subpackages: bool = False,
+              skip_suffixes: tuple[str, ...] = ()) -> str:
+    """Content hash of every input file under `root`, by relative path.
+
+    `skip_subpackages` skips a subdirectory that holds its own ritz.toml: it
+    is a separate package, not part of what this tree links against
+    (ritzlib/tests).  `skip_suffixes` skips files with those suffixes (the
+    Markdown in a module tree: not code, and outside the regression step's
+    read set).  The default hashes the whole tree, as an example's key needs.
+    """
     h = hashlib.sha256()
     if root.is_file():
         h.update(root.read_bytes())
@@ -67,12 +78,16 @@ def tree_hash(root: Path) -> str:
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = sorted(
             d for d in dirnames
-            if d not in SKIP_DIRS and not d.startswith(SKIP_DIR_PREFIXES)
+            if d not in SKIP_DIRS
+            and not d.startswith(SKIP_DIR_PREFIXES)
+            and not (skip_subpackages and (Path(dirpath) / d / "ritz.toml").is_file())
         )
         for fn in sorted(filenames):
+            if fn.endswith(SKIP_SUFFIXES) or fn.endswith(skip_suffixes):
+                continue
             p = Path(dirpath) / fn
             # Symlinks are what test runs leave behind (./true -> build/...).
-            if p.is_symlink() or fn.endswith(SKIP_SUFFIXES):
+            if p.is_symlink():
                 continue
             h.update(p.relative_to(root).as_posix().encode() + b"\0")
             h.update(p.read_bytes())
@@ -107,7 +122,7 @@ def global_key(root: Path, build_dir: str, harness: Path, extra: str) -> str:
         KEY_VERSION,
         cache.compute_compiler_hash(root, "ritz0"),
         toolchain(),
-        tree_hash(root / "ritzlib"),
+        tree_hash(root / "ritzlib", skip_subpackages=True, skip_suffixes=(".md",)),
         tree_hash(root / "runtime"),
         tree_hash(root / "cache.py"),
         tree_hash(harness),
