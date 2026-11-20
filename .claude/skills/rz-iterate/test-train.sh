@@ -997,7 +997,7 @@ out="$(RZ_TRAIN_DEPTH=3 bash "$TR" gate --next 2>&1)"; rc=$?
 [[ $rc -ne 0 ]] && has "$out" "3 trains in flight already \(at most 3" "RZ_TRAIN_DEPTH caps the trains in flight" \
     || bad "RZ_TRAIN_DEPTH caps the trains in flight (rc=$rc)"
 l4="$(bash "$TR" gate --next 2>/dev/null)"
-[[ "$(gating)" == 3 ]] && ok "the default depth (4) lets a fourth train gate" || bad "the default depth (4) lets a fourth train gate ($(gating))"
+[[ "$(gating)" == 3 ]] && ok "the default depth (6) lets a fourth train gate" || bad "the default depth (6) lets a fourth train gate ($(gating))"
 t4="$(tipn 4)"
 for l in "$l2" "$l3" "$l4"; do bash "$TR" wait "$l" >/dev/null 2>&1; done
 out="$(bash "$TR" land "$log1" 2>&1)"; has "$out" "^NEXT .*spec=$l2" "train 1 lands first; train 2 is next"
@@ -1350,5 +1350,89 @@ out="$(bash "$TR" land 2>&1)"; rc=$?
 rm -f "$q"
 eq "$(bash "$TR" show 2>/dev/null | grep -c '^== train')" 1 "an absent list is still legacy train 1"
 rm -f "$st1"
+# 17. Configurable depth and hosts, and every train's tail published (AGAST
+# #4409; Aaron 2026-11-20).  DEPTH and HOSTS come from ~/.config/rz/host.env
+# (RZ_HOST_ENV here), an environment variable wins, and the defaults are the
+# 2026-11-20 policy: 6 trains in flight, and the live hosts only (no skronk).
+gatecount() { bash "$TR" show 2>/dev/null | grep -cE '^(GATED|SPEC)='; }
+
+# 17a. A plain build publishes train 1's tail, not only gate --next.
+fetch; git -C "$M" checkout -q main
+ta1="$(room ta1 s/ta1 X "$(git -C "$M" rev-parse origin/main~1)")"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "ta1:$ta1" 2>&1)"
+has "$out" "^TRAIN 1 .*n=1 gate=needed" "a one-car train 1 builds"
+tip1="$(tipn 1)"
+[[ "$(oref "${tip1:0:12}")" == "$tip1" ]] && ok "build publishes a train's tail (train 1, never gated)" \
+    || bad "build publishes a train's tail (train 1, never gated)"
+
+# 17b. A room based on that tail boards as KEPT: the new-room base rule.
+tr="$(room ta_room s/ta_room X "$tip1")"; fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "ta_room:$tr" 2>&1)"
+has "$out" "^KEPT +ta_room ${tr:0:12}" "a room based on the deepest tail boards as KEPT"
+t2="$(tipn 2)"
+[[ "$(oref "${t2:0:12}")" == "$t2" ]] && ok "build publishes a stacked train's tail" \
+    || bad "build publishes a stacked train's tail"
+
+# 17c. The default host list is the 2026-11-20 policy: live hosts only.
+touch "$T/ssh-down"
+out="$(RZ_TRAIN_HOSTS= RZ_HOST_ENV="$T/no-host.env" bash "$TR" gate --next 2>&1)"; rc=$?
+rm -f "$T/ssh-down"
+[[ $rc -ne 0 ]] && has "$out" "no host in RZ_TRAIN_HOSTS \(omegalisk huburght bangerang starbux toffee chungus\)" \
+    "the default host list is the 2026-11-20 policy, with no skronk" \
+    || { bad "the default host list is the 2026-11-20 policy (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+
+# 17d. host.env supplies DEPTH and HOSTS, with no environment variable set.
+printf 'RZ_TRAIN_DEPTH=2\nRZ_TRAIN_HOSTS=hosty\n' > "$T/host-train.env"
+fetch; git -C "$M" checkout -q main
+cars td1 1; bash "$TR" build "${items[@]}" >/dev/null 2>&1
+log1="$(bash "$TR" gate 1)"
+cars td2 1; bash "$TR" build --next "${items[@]}" >/dev/null 2>&1
+l2="$(RZ_TRAIN_HOSTS= RZ_TRAIN_DEPTH= RZ_HOST_ENV="$T/host-train.env" bash "$TR" gate --next 2>"$T/err")"; rc=$?
+[[ $rc -eq 0 && "$(specn 2 | cut -d' ' -f1)" == hosty ]] \
+    && ok "host.env supplies RZ_TRAIN_HOSTS (hosty, not the exported default)" \
+    || { bad "host.env supplies RZ_TRAIN_HOSTS (rc=$rc, spec: $(specn 2))"; sed 's/^/     | /' "$T/err"; }
+cars td3 1; bash "$TR" build --next "${items[@]}" >/dev/null 2>&1
+out="$(RZ_TRAIN_HOSTS= RZ_TRAIN_DEPTH= RZ_HOST_ENV="$T/host-train.env" bash "$TR" gate --next 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "2 trains in flight already \(at most 2" "host.env supplies RZ_TRAIN_DEPTH (2)" \
+    || { bad "host.env supplies RZ_TRAIN_DEPTH (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+bash "$TR" wait "$l2" >/dev/null 2>&1; bash "$TR" land "$l2" >/dev/null 2>&1
+
+# 17e. Bad values are refused, by host.env and by the environment.
+printf 'RZ_TRAIN_DEPTH=0\n' > "$T/host-bad-depth.env"
+out="$(RZ_HOST_ENV="$T/host-bad-depth.env" bash "$TR" show 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "RZ_TRAIN_DEPTH must be a whole number >= 1: '0'" \
+    "host.env rejects a bad RZ_TRAIN_DEPTH" || bad "host.env rejects a bad RZ_TRAIN_DEPTH (rc=$rc)"
+printf 'RZ_TRAIN_HOSTS=\n' > "$T/host-bad-hosts.env"
+out="$(RZ_HOST_ENV="$T/host-bad-hosts.env" bash "$TR" show 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "RZ_TRAIN_HOSTS must be a space-separated host list" \
+    "host.env rejects an empty RZ_TRAIN_HOSTS" || bad "host.env rejects an empty RZ_TRAIN_HOSTS (rc=$rc)"
+out="$(RZ_TRAIN_DEPTH=0 bash "$TR" show 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "RZ_TRAIN_DEPTH must be a whole number >= 1" \
+    "the environment's RZ_TRAIN_DEPTH is validated too" || bad "the environment's RZ_TRAIN_DEPTH is validated too (rc=$rc)"
+
+# 17f. The default depth is 6: six trains in flight, a seventh refused.
+fetch; git -C "$M" checkout -q main
+cars tf1 1; bash "$TR" build "${items[@]}" >/dev/null 2>&1
+log1="$(bash "$TR" gate 1)"
+logs=(); tips=()
+for i in 2 3 4 5 6; do
+    cars "tf$i" 1; bash "$TR" build --next "${items[@]}" >/dev/null 2>&1
+    logs+=("$(bash "$TR" gate --next 2>/dev/null)")
+    tips+=("$(tipn "$i")")
+done
+eq "$(gatecount)" 6 "the default depth (6) lets six trains be in flight"
+log6="${logs[4]}"; t6="${tips[4]}"
+cars tf7 1; bash "$TR" build --next "${items[@]}" >/dev/null 2>&1
+out="$(bash "$TR" gate --next 2>&1)"; rc=$?
+[[ $rc -ne 0 ]] && has "$out" "6 trains in flight already \(at most 6" \
+    "a seventh train is refused at the default depth (6)" \
+    || { bad "a seventh train is refused at the default depth (6) (rc=$rc)"; echo "$out" | sed 's/^/     | /'; }
+bash "$TR" wait "$log6" >/dev/null 2>&1
+out="$(bash "$TR" land "$log6" 2>&1)"
+[[ "$(grep -c '^MERGED' <<<"$out")" == 6 && "$(git -C "$M" rev-parse origin/main)" == "$t6" ]] \
+    && ok "a pass of train 6 lands all six trains" || { bad "a pass of train 6 lands all six trains"; echo "$out" | sed 's/^/     | /'; }
+[[ -z "$(oref "${tips[0]:0:12}")$(oref "${tips[2]:0:12}")$(oref "${t6:0:12}")" ]] \
+    && ok "landing deletes the published tails" || bad "landing deletes the published tails"
+
 unset RZ_TRAIN_DEBOUNCE; export RZ_TRAIN_MAX=8
 echo;[[ $fails -eq 0 ]] && echo "all passed" || { echo "$fails failed"; exit 1; }

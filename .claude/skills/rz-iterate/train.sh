@@ -84,15 +84,24 @@
 # Env overrides (for tests):
 #   RZ_TRAIN_WT    train 1's worktree  (default ~/dev/ritz-lang/rz-train)
 #   RZ_TRAIN_MAX   cars per train      (default 8)
-#   RZ_TRAIN_DEPTH trains in flight    (default 4; AGAST #4031)
+#   RZ_TRAIN_DEPTH trains in flight    (default: host.env RZ_TRAIN_DEPTH,
+#                  else 6; AGAST #4031, #4409)
 #   RZ_TRAIN_HOSTS where `gate --next` looks for a free train slot, in order
-#                  (default "omegalisk huburght skronk")
+#                  (default: host.env RZ_TRAIN_HOSTS, else "omegalisk
+#                  huburght bangerang starbux toffee chungus": the live hosts
+#                  of 2026-11-20, no ephemeral skronk*; AGAST #4409)
 #   RZ_TRAIN_LOCAL this host's name in that list (default: hostname -s)
 #   RZ_TRAIN_DEBOUNCE  seconds `pending` waits for another car (default 60)
 #   RZ_MAIN_WT     main checkout       (default ~/dev/ritz-lang/rz)
 #   RZ_TRAIN_NAME  gate name           (default train)
 #   RZ_GATE_SCRIPT run-gate.sh to use  (default: beside this script)
 #   RZ_GATE_DIR    gate logs/slots     (default ~/dev/ritz-lang/gate-logs)
+#
+# DEPTH and HOSTS are read from ~/.config/rz/host.env too (RZ_HOST_ENV
+# overrides the path), the environment winning over the file (AGAST #4409:
+# the operator wrapper ~/dev/ritz-lang/rz-train-ops.sh used to set them on
+# every call).  host-env.sh validates both, and so does this script for an
+# environment override.
 #
 # Slot reservation (AGAST #3365, #3427): the train's gate writes <gate
 # dir>/.train-reserved as it ends, and `land` renews it, so a room gate can't
@@ -105,7 +114,8 @@
 # gate takes ~25-35 min for <= 8 cars, so trains were the merge bottleneck.
 # `gate --next` gates train 2 on train 1's tail while train 1 still gates,
 # on a remote host (omegalisk can't hold two gates):
-#   1. push train 2's tail to origin refs/heads/rz-train/<tip12>;
+#   1. ensure train 2's tail is on origin refs/heads/rz-train/<tip12> (a
+#      build publishes every train's tail: see "Tail refs" below);
 #   2. ssh <host> (RZ_TRAIN_SSH) runs REMOTE_SH below, `start`: fetch that
 #      ref into the host's clone, check out <tip> in its own worktree
 #      (RZ_REMOTE_WT), and start that tree's run-gate.sh with
@@ -125,7 +135,8 @@
 # a rebuilt train on another base has another tip.
 #
 # N trains in flight (AGAST #4031): the 2-train cap is RZ_TRAIN_DEPTH (default
-# 4), counting every train with a GATED= or SPEC=.  `gate --next` gates the
+# 6: host.env RZ_TRAIN_DEPTH, else 6; AGAST #4409), counting every train with
+# a GATED= or SPEC=.  `gate --next` gates the
 # train to gate (pick_target, AGAST #4156: the deepest, or a bisect prefix)
 # past train 1, on the first host in RZ_TRAIN_HOSTS with a free train slot
 # (pick_train_host: rz_train_free in host-env.sh, over ssh for a remote host;
@@ -138,6 +149,16 @@
 # SPEC.  A failed train k (`fail <log>`) invalidates every train after it
 # (their bases hold its cars): their gates are stopped, and their cars are
 # rebuilt on train k-1's tail.  A pass still lands every train below it.
+#
+# Tail refs (AGAST #4409; Aaron 2026-11-20): every train's tail is pushed to
+# origin refs/heads/rz-train/<tip12> when the train is built, not only when
+# `gate --next` starts a remote gate, so a new room can base on the deepest
+# tail (SKILL.md "Spawning a room"): the host creates the worktree off main,
+# then the room runs `git fetch origin rz-train/<tip12> && git reset --hard
+# FETCH_HEAD`, and `build --next` boards its commit as KEPT instead of
+# cherry-picking it.  A tail ref is deleted when its train lands (a pass
+# covers it), is replaced by a build, or fails/discards it; publish_tail is
+# idempotent, so `gate --next` re-ensuring the target's ref costs one push.
 #
 # Dispatch (AGAST #4031, #4156; Aaron 2026-11-20; SKILL.md "Merge trains"):
 # `build` stamps each train it starts with BUILT=<epoch>, and each REAP is a
@@ -179,8 +200,6 @@ RESERVED="$GATES/.train-reserved"
 # ConnectTimeout: pick_train_host asks each host in turn, and a spot-killed
 # skronk must cost seconds, not the default TCP timeout (AGAST #4031).
 SSH="${RZ_TRAIN_SSH:-ssh -F $HOME/.ssh/rz_hosts -o ConnectTimeout=10}"
-DEPTH="${RZ_TRAIN_DEPTH:-4}"
-HOSTS="${RZ_TRAIN_HOSTS:-omegalisk huburght skronk}"
 LOCAL="${RZ_TRAIN_LOCAL:-$(hostname -s)}"
 DEBOUNCE="${RZ_TRAIN_DEBOUNCE:-60}"
 REMOTE_REPO="${RZ_REMOTE_REPO:-dev/ritz-lang/rz}"
@@ -195,6 +214,18 @@ QUEUED_PAUSE="${RZ_TRAIN_QUEUED_PAUSE:-15}"
 source "$HERE/../../host-env.sh"
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# DEPTH and HOSTS may also come from host.env (AGAST #4409): the environment
+# wins, then the file, then the 2026-11-20 policy.  rz_host_env_load prints
+# the file's own error for a bad key, with its line number.
+rz_host_env_load || exit 1
+DEPTH="${RZ_TRAIN_DEPTH:-${HOST_ENV[RZ_TRAIN_DEPTH]:-6}}"
+HOSTS="${RZ_TRAIN_HOSTS:-${HOST_ENV[RZ_TRAIN_HOSTS]:-omegalisk huburght bangerang starbux toffee chungus}}"
+[[ "$DEPTH" =~ ^[1-9][0-9]*$ ]] \
+    || die "RZ_TRAIN_DEPTH must be a whole number >= 1: '$DEPTH'"
+[[ "$HOSTS" =~ ^[A-Za-z0-9._-]+([[:space:]]+[A-Za-z0-9._-]+)*$ ]] \
+    || die "RZ_TRAIN_HOSTS must be a space-separated host list: '$HOSTS'"
+
 WT="$TRAIN_WT"                      # the train being worked on (use_slot)
 g() { git -C "$WT" "$@"; }
 state() { echo "$(g rev-parse --absolute-git-dir)/RZ_TRAIN"; }
@@ -382,6 +413,29 @@ stop_local() {
     if [[ "$(cat "$tw" 2>/dev/null)" == "$unit" ]]; then rm -f "$tw"; fi
 }
 
+# publish_tail: push the current train's tail to origin
+# refs/heads/rz-train/<tip12> (AGAST #3988 for a remote gate, #4409 for every
+# built train).  Idempotent: a ref already at that SHA takes a no-op push, so
+# gate --next can re-ensure a target built by an older train.sh.
+publish_tail() {
+    local st tip
+    st="$(state)"; tip="$(field TIP "$st")"
+    [[ -n "$tip" ]] || return 0
+    g push -q -f origin "$tip:refs/heads/rz-train/${tip:0:12}"
+}
+
+# unpublish_tail <slot>: delete <slot>'s built tail from origin, when a build
+# replaces the train, land covers it, or fail drops it (AGAST #4409).  Best
+# effort: an absent ref is not an error.  Call it before the state file goes.
+unpublish_tail() {
+    local st tip
+    st="$(git -C "$(slot_wt "$1")" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)/RZ_TRAIN"
+    [[ -f "$st" ]] || return 0
+    tip="$(field TIP "$st")"
+    [[ -n "$tip" ]] || return 0
+    git -C "$MAIN_WT" push -q origin --delete "refs/heads/rz-train/${tip:0:12}" 2>/dev/null || true
+}
+
 ensure_worktree() {
     if [[ ! -e "$WT/.git" ]]; then
         git -C "$MAIN_WT" worktree add -q --detach "$WT" "$1"
@@ -409,6 +463,10 @@ finish_train() {
     echo "TRAIN $k base=${TBASE:0:12} tip=$(g rev-parse --short=12 HEAD) n=$n gate=$need"
     if [[ $n -eq 0 && $k -gt 1 ]]; then
         rm -f "$st"; unset 'slots[-1]'; echo "         (empty: dropped)"
+    else
+        # Every train's tail is a possible new-room base, not just a remote
+        # gate's (AGAST #4409).
+        publish_tail
     fi
 }
 
@@ -432,6 +490,7 @@ build_abort() {
     [[ $1 -ne 0 && $BUILD_KEEP -ge 0 ]] || return 0
     local s d
     for s in "${slots[@]:BUILD_KEEP}"; do
+        unpublish_tail "$s"   # a tail built before the failure was published
         d="$(git -C "$(slot_wt "$s")" rev-parse --absolute-git-dir 2>/dev/null)" && rm -f "$d/RZ_TRAIN"
     done
     write_queue "${slots[@]:0:BUILD_KEEP}" || true
@@ -516,7 +575,7 @@ build_on() {
     BUILD_KEEP=$keep; trap 'build_abort $?' EXIT
     for s in ${old[@]+"${old[@]}"}; do
         [[ -e "$(slot_wt "$s")/.git" ]] || continue
-        use_slot "$s"; discard_spec
+        use_slot "$s"; discard_spec; unpublish_tail "$s"
         rm -f "$(state)"
     done
     # The lowest slot not holding a kept train.
@@ -597,6 +656,11 @@ build_on() {
     done
     finish_train
     write_queue "${slots[@]}"
+    # A kept train built before every build published tails (AGAST #4409)
+    # still gets the deepest one: a new room may base on it.
+    if [[ $picked -eq 0 && ${#slots[@]} -gt 0 ]]; then
+        use_slot "${slots[-1]}"; publish_tail
+    fi
     BUILD_KEEP=-1
     # No train gate is coming to take over the reservation: let rooms in.
     if [[ $first_new -eq 1 ]]; then
@@ -694,6 +758,9 @@ cmd_gate() {
     local st spec; st="$(state)"
     [[ "$(field TIP "$st")" == "$(g rev-parse HEAD)" ]] \
         || die "train $k's worktree moved since build; rebuild"
+    # A train built by an older train.sh has no tail ref yet (AGAST #4409);
+    # a build publishes it, and this is a no-op when it already did.
+    publish_tail
     spec="$(field SPEC "$st")"
     if [[ -n "$spec" ]]; then
         case "$(verdict)" in
@@ -751,6 +818,10 @@ gate_next() {
             || die "no host in RZ_TRAIN_HOSTS ($HOSTS) has a free train slot: gate train $k when one frees"
     fi
     [[ -n "$(cd "$WT" && bash "$HERE/train.sh" pkgs list "$base")" ]] && pkgs=1
+    # The tail is published for the remote gate and for a new room's base
+    # (AGAST #4409): a local gate needs the ref for the room, too.
+    ref="rz-train/${tip:0:12}"
+    publish_tail
     if is_local "$host"; then
         [[ $pkgs -eq 0 ]] || after="bash $(printf %q "$HERE/train.sh") pkgs test $base"
         llog="$(RZ_GATE_TRAIN=1 RZ_GATE_BASE="$base" RZ_GATE_AFTER="$after" "$GATE" "$WT" "$(gname)")" \
@@ -760,8 +831,6 @@ gate_next() {
         echo "$llog"
         return
     fi
-    ref="rz-train/${tip:0:12}"
-    g push -q -f origin "$tip:refs/heads/$ref"
     if ! rlog="$(remote "$host" start "$REMOTE_REPO" "$(rwt)" "$REMOTE_GATE" "$ref" "$tip" "$base" "$(gname)" "$pkgs" | tail -1)" \
             || [[ "$rlog" != /*.log ]]; then
         g push -q origin --delete "refs/heads/$ref" 2>/dev/null || true
@@ -1091,6 +1160,12 @@ cmd_land() {
                     || echo "warning: could not delete $spec on origin" >&2
             fi
         fi
+        # Every train's tail ref (AGAST #4409) is covered by main now; a
+        # local-gate or never-gated tail has no SPEC to delete it.  Best
+        # effort: a missing ref (or one already deleted above) is fine.
+        tip="$(field TIP "$st")"
+        [[ -z "$tip" ]] \
+            || g push -q origin --delete "refs/heads/rz-train/${tip:0:12}" 2>/dev/null || true
         rm -f "$st"
     done
     # Promote the next train: its base, train k's tail, is main now.
@@ -1130,7 +1205,7 @@ cmd_fail() {
     # first (AGAST #4337).
     write_queue "${q[@]:0:k-1}"
     for ((i = k - 1; i < ${#q[@]}; i++)); do
-        use_slot "${q[$i]}"; discard_spec; rm -f "$(state)"
+        use_slot "${q[$i]}"; discard_spec; unpublish_tail "${q[$i]}"; rm -f "$(state)"
     done
 }
 

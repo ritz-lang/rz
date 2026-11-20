@@ -22,10 +22,18 @@
 #                              it for a few seconds before each suite, which a
 #                              busy box misreads (skronk: 1.054 for ~1.67).
 #                              Measure it once, idle: cpu_calibrate.py --runs 5
+#   RZ_TRAIN_DEPTH=6           trains the coordinator may queue in flight
+#                              (AGAST #4409; train.sh).  A whole number >= 1.
+#   RZ_TRAIN_HOSTS="a b c"     hosts `train.sh gate --next` may start a
+#                              speculative train gate on, in order (AGAST
+#                              #4409).  A space-separated host list; no skronk*
+#                              by default, as those boxes are ephemeral.
 #
 # Every key is optional; a missing key (or no file at all) keeps the script's
 # default, which is sized for omegalisk's 15.6 GiB VM (7G / 8G / 1).  Only
-# hosts with more memory need the file: huburght (47 GB, 6 rooms) is the one.
+# hosts with more memory need the budget keys: huburght (47 GB, 6 rooms) is
+# the one.  The coordinator's train keys (RZ_TRAIN_DEPTH, RZ_TRAIN_HOSTS)
+# default in train.sh and live on the host that runs it (omegalisk).
 # The values are per host because rooms and gates share one machine's RAM
 # and cores: they live outside the repo, next to the machine they describe.
 #
@@ -80,10 +88,23 @@ rz_host_env_load() {
                     return 1
                 }
                 ;;
+            RZ_TRAIN_DEPTH)
+                [[ "$val" =~ ^[1-9][0-9]*$ ]] || {
+                    echo "error: $RZ_HOST_ENV_FILE:$n: $key must be a whole number >= 1: '$val'" >&2
+                    return 1
+                }
+                ;;
+            RZ_TRAIN_HOSTS)
+                [[ "$val" =~ ^[A-Za-z0-9._-]+([[:space:]]+[A-Za-z0-9._-]+)*$ ]] || {
+                    echo "error: $RZ_HOST_ENV_FILE:$n: $key must be a space-separated host list: '$val'" >&2
+                    return 1
+                }
+                ;;
             *)
                 echo "error: $RZ_HOST_ENV_FILE:$n: unknown key $key" \
                     "(known: RZ_ROOMS_MEMORY_HIGH RZ_ROOMS_MEMORY_MAX RZ_GATE_SLOTS" \
-                    "RZ_TRAIN_SLOTS RZ_TEST_BUDGET_SCALE RZ_CPU_FACTOR)" >&2
+                    "RZ_TRAIN_SLOTS RZ_TEST_BUDGET_SCALE RZ_CPU_FACTOR" \
+                    "RZ_TRAIN_DEPTH RZ_TRAIN_HOSTS)" >&2
                 return 1
                 ;;
         esac

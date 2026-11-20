@@ -117,7 +117,15 @@ stays here; remote hosts only run rooms.
   `RZ_ROOMS_MEMORY_MAX` (all of a host's rooms together, the
   `ritz-rooms.slice` caps), `RZ_GATE_SLOTS` (gates at once on that host)
   and `RZ_TRAIN_SLOTS` (AGAST #4031, default 0: how many of those slots
-  only merge-train gates may take; must be below `RZ_GATE_SLOTS`). huburght:
+  only merge-train gates may take; must be below `RZ_GATE_SLOTS`). The
+  host that runs `train.sh` also reads its **coordinator** keys there
+  (AGAST #4409): `RZ_TRAIN_DEPTH` (default 6: trains in flight) and
+  `RZ_TRAIN_HOSTS` (default `omegalisk huburght bangerang starbux toffee
+  chungus`: the hosts a speculative train gate may use, no skronk*); an
+  environment variable overrides either for one call. Add those two keys to
+  a host's file only once the `host-env.sh` it reads has #4409, which is
+  what validates them (an older copy rejects unknown keys, as with
+  `RZ_CPU_FACTOR`). huburght:
   `RZ_TRAIN_SLOTS=1` with `RZ_GATE_SLOTS=2` (1 room + 1 train gate: the
   same 2 gates, so the same memory; 2 train slots would need a third gate,
   over the 2-per-12-cores limit and ~4.5 GiB short). skronk: 2 of its 6.
@@ -344,7 +352,7 @@ brief, verify the agent woke), with these ritz values:
 | Parameter | Value |
 |---|---|
 | Room / branch / unit name | `ritz-task-<agast-id>` |
-| Worktree | `~/dev/ritz-lang/rz-task-<agast-id>` (branch off `origin/main`) |
+| Worktree | `~/dev/ritz-lang/rz-task-<agast-id>` (host makes it off `origin/main`; if a train queue exists, the room then resets it to the deepest tail: step 3 above) |
 | Install from | `~/dev/nevelis/adele`, `--workspace` pointing at the worktree |
 | Model | `deepseek-flash` (see "Fleet model" below), not `opus` |
 | Callback room | `rz` |
@@ -444,6 +452,13 @@ You can't run `git worktree`, `systemctl`, `provision-room.sh` or
    with the remote additions filled in. The host creates
    `~/dev/ritz-lang/rz-task-<id>` off `origin/main`, provisions it, puts it
    on the budget, installs, starts it and sends it the briefing.
+   **Base the room on the deepest train tail when a queue exists** (AGAST
+   #4409, Aaron 2026-11-20): `train.sh show` prints every train's `TIP=`,
+   the last one deepest; give the room that tail's first 12 as `<tail12>`
+   and tell it to run `git fetch origin rz-train/<tail12> && git reset
+   --hard FETCH_HEAD` after the worktree exists. Its commit then boards as
+   `KEPT` on the next `build --next`, instead of being cherry-picked onto
+   the tail. No queue: nothing to do; the room branches from main.
 4. **Wait for `SPAWNED`** (it wakes this room). Then check the agent woke
    by watching for its first room message or description change, not by
    reading a journal. No answer in 10 minutes: send `STATUS`.
@@ -464,6 +479,13 @@ host's `~/dev/ritz-lang/rz` checkout for the gate.
 
 Room and branch `ritz-task-<id>`, worktree `~/dev/ritz-lang/rz-task-<id>`,
 callback room `rz`.
+
+**If your SPAWN named a train tail `<tail12>`:** the host created the
+worktree off `origin/main`; base it on the deepest train tail instead:
+`git fetch origin rz-train/<tail12> && git reset --hard FETCH_HEAD`. Make
+and gate your commit on that base: it boards the train as KEPT. Do not
+rebase onto `origin/main` before you gate (step 5) unless `rz` tells you to:
+that would replay the train's cars and stop you boarding as KEPT.
 
 ### You own this: `rz` merges your commit without re-testing it
 
@@ -489,8 +511,11 @@ vouches for that exact commit.
    with `project_id=1` and `parent_task_id=<milestone>` (the parent of your
    own ticket). If it fits no milestone, use the Triage bucket `#3788`.
    Never file a ritz ticket with no project or no parent.
-5. **Finish on main:** `git fetch origin && git rebase origin/main`, then
-   squash to one commit: `ritz-task-<id>: 🤖 <terse description>`.
+5. **Finish on main:** `git fetch origin && git rebase origin/main` (not
+   when you were spawned on a train tail: that tail is your base, and a
+   rebase onto `origin/main` would replay the train's cars and stop you
+   boarding as KEPT), then squash to one commit: `ritz-task-<id>: 🤖
+   <terse description>`.
    Then run `make -C projects/ritz smoke` (≤ 2 min) before requesting a
    gate; fix anything it reports first. A gate slot is one machine-wide.
 6. **Gate that commit**, detached so a new message can't kill it, with
@@ -771,9 +796,11 @@ This is also how Borque's conductor works.
   once and cancels their gates (step 5). If train k fails, every train
   after it is thrown away (its base holds the culprit) and its cars are
   rebuilt on train k-1's tail and re-gated (`train.sh fail`, step 6). **Up
-  to 4 trains in flight** (`RZ_TRAIN_DEPTH`): train 1 here, each later one
-  on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk huburght
-  skronk`) with a free train slot.
+  to 6 trains in flight** (AGAST #4409; `host.env` `RZ_TRAIN_DEPTH`, else
+  the environment, else 6): train 1 here, each later one on the first host
+  in `RZ_TRAIN_HOSTS` (default from `host.env`, else `omegalisk huburght
+  bangerang starbux toffee chungus`; no ephemeral skronk*) with a free
+  train slot.
 - **Deepest train first (AGAST #4156):** a pass of train k lands trains
   1..k (step 5), so when a gate slot frees, here or on another host, gate
   the **deepest** built train's tip, not train 1: one gate covers every car
@@ -875,16 +902,19 @@ one to train 1.
    .claude/skills/rz-iterate/train.sh wait "$LOG2"         # Bash run_in_background
    ```
    `gate --next` gates the same train `pending` names (the deepest, or a
-   bisect prefix past train 1), on the first host in `RZ_TRAIN_HOSTS` (default `omegalisk
-   huburght skronk`) with a free train slot (`pick_train_host`: a gate
+   bisect prefix past train 1), on the first host in `RZ_TRAIN_HOSTS`
+   (default from `host.env`, else `omegalisk huburght bangerang starbux
+   toffee chungus`: the live hosts, no ephemeral skronk*) with a free train
+   slot (`pick_train_host`: a gate
    slot no gate holds, less the train gates queued there, read from that
    host's `host.env` and gate dir; stderr says why it passed over each
    host, `no free train slot` or `unreachable`). omegalisk counts as local
    (`RZ_TRAIN_LOCAL`, default `hostname -s`): if its slot is free (train 1
    gating elsewhere), the train gates here, `SPEC=omegalisk - <log> <log>`.
    No host free: it refuses (`no host in RZ_TRAIN_HOSTS ...`); run
-   `pending` again later. At most `RZ_TRAIN_DEPTH` (4) trains in flight
-   (each with a `GATED=` or `SPEC=` line). Each train's gate is named for its worktree slot
+   `pending` again later. At most `RZ_TRAIN_DEPTH` (6: `host.env`, else the
+   environment, else 6) trains in flight (each with a `GATED=` or `SPEC=`
+   line). Each train's gate is named for its worktree slot
    (`train` for `rz-train`, `train-<s>` for `rz-train-<s>`) and a remote one
    checks out in `rz-train-remote` or `rz-train-remote-<s>`, so two trains
    can gate on one host (skronk has 2 train slots). Hosts reserve slots for
@@ -892,8 +922,9 @@ one to train 1.
    gates can't take those, train gates take them first and any free general
    slot after. **The contract**, all in `train.sh` (header and
    `REMOTE_SH`):
-   1. `gate --next` pushes train 2's tail to origin
-      `refs/heads/rz-train/<tip12>`, then runs `ssh -F ~/.ssh/rz_hosts
+   1. `gate --next` ensures train 2's tail is on origin
+      `refs/heads/rz-train/<tip12>` (every built train's tail is published:
+      see "Every train's tail is a base" below), then runs `ssh -F ~/.ssh/rz_hosts
       <host> bash -l -s -- start ...` with the script on stdin. On the host
       it fetches that ref into `~/dev/ritz-lang/rz`, refuses unless it is
       exactly the tip, checks it out detached in
@@ -918,6 +949,18 @@ one to train 1.
       lands it (a `CANCELLED speculative gate on <host> ...` line), or when
       a `build` replaces the train (a `DISCARDED speculative gate on <host>
       ...` line). Both lines also stop the host's `ritz-gate-train` unit.
+
+   **Every train's tail is a base (AGAST #4409; Aaron 2026-11-20).** A
+   `build` publishes **every** built train's tail to origin
+   `refs/heads/rz-train/<tip12>` as it finishes the train, not only when
+   `gate --next` starts a remote gate, so the deepest tail is always there
+   for a new room to base on (`train.sh show` prints the `TIP=` lines, the
+   last one deepest). `gate --next` and plain `gate` re-ensure the target's
+   ref, which is a no-op if the build already pushed it. `land`, `fail` and
+   a replacing `build` delete the refs they cover. A commit based on that
+   tail boards as `KEPT` (same SHA) instead of `APPLIED`. Spawning a room on
+   the deepest tail is in "Spawning a room": the host creates the worktree
+   off `origin/main`, then the room fetches and resets to the tail.
 
    Refusals: no train 2 (`gate` is for train 1), the train to gate is
    train 1 (`train.sh gate`), the deepest train already gating (`already
