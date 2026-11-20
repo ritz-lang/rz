@@ -373,6 +373,14 @@ class RitzGenerator:
         self._emit('        return TOK_EOF')
         self._emit('    return (p.tokens + p.pos).kind')
         self._emit('')
+        # AGAST #4378: the token after the lookahead, for LL(2) dispatch.
+        # Past the end it is EOF, exactly what p_peek would say one token on.
+        self._emit('fn p_peek2(p: *Parser) -> i32')
+        self._emit('    let i: i32 = p.pos + 1')
+        self._emit('    if i >= p.token_count')
+        self._emit('        return TOK_EOF')
+        self._emit('    return (p.tokens + i).kind')
+        self._emit('')
         self._emit('pub fn p_advance(p: *Parser) -> i32')
         self._emit('    let k: i32 = p_peek(p)')
         self._emit('    if p.pos < p.token_count')
@@ -465,6 +473,25 @@ class RitzGenerator:
         self._emit('    p.fail_b0 = p.fail_b0 | b0')
         self._emit('    p.fail_b1 = p.fail_b1 | b1')
         self._emit('    p.fail_b2 = p.fail_b2 | b2')
+        self._emit('')
+        # AGAST #4378: an alternative skipped because its *second* token was
+        # wrong would, in the flat parser, have consumed its first terminal and
+        # failed one position on.  Record its SECOND set there, so the located
+        # "expected one of: ..." keeps both its position and its tokens; bump
+        # p.max_pos the way that p_advance would, so the dropped-item report
+        # still names the token the alternative got to (AGAST #2943).  #4374's
+        # LL(1) skip needs neither: there the first terminal cannot match, so
+        # the flat parser consumed nothing either.
+        # p_record_first's furthest-position rule orders it against the other
+        # alternatives' attempts; p.pos is restored because the guard runs at
+        # start_pos and the next alternative must still begin there.
+        self._emit('fn p_record_second(p: *Parser, b0: u64, b1: u64, b2: u64)')
+        self._emit('    let save: i32 = p.pos')
+        self._emit('    p.pos = p.pos + 1')
+        self._emit('    if p.pos > p.max_pos')
+        self._emit('        p.max_pos = p.pos')
+        self._emit('    p_record_first(p, b0, b1, b2)')
+        self._emit('    p.pos = save')
 
     def _get_return_type(self, rule: GrammarRule) -> str:
         """Get the Ritz return type for a rule."""
@@ -629,6 +656,72 @@ class RitzGenerator:
             return None
         return first
 
+    def _alt_second(self, alt: GrammarAlt) -> Optional[Set[str]]:
+        """The terminals that can follow the alternative's first terminal.
+
+        None when the grammar cannot say what the second token is: the
+        alternative ends after its first token, a nullable symbol in the
+        prefix may match non-empty (putting the second token inside it), or
+        the first token's symbol is a nonterminal and the second lies inside
+        that nonterminal.
+        """
+        nullable = self._nullable_rules()
+        first = self._first_sets()
+        second: Set[str] = set()
+        seen_first = False
+        for sym in alt.symbols:
+            if sym.kind == SymbolKind.TERMINAL:
+                if not seen_first:
+                    seen_first = True
+                else:
+                    second.add(sym.name)
+                    return second
+                continue
+            sym_first = first.get(sym.name, set())
+            sym_nullable = self._symbol_nullable(sym, nullable)
+            if not seen_first:
+                # A leading nonterminal (nullable or not) can consume tokens
+                # or fail without consuming before the first terminal, so
+                # "the alternative consumed its first terminal" -- the
+                # premise of recording at start_pos + 1 -- need not hold.
+                # closure_ahead is the concrete case: `|` after a type makes
+                # it fail at start_pos, where LL(2) would report one on.
+                return None
+            second |= sym_first
+            if not sym_nullable:
+                return second
+            # Nullable here may match empty, so the following symbol can also
+            # supply the second token; keep scanning.
+        # Ran out of symbols: the alternative can end after its first token.
+        return None
+
+    def _alt_second_dispatch(self, alt: GrammarAlt,
+                             dispatch: List[Optional[Set[str]]],
+                             alt_idx: int) -> Optional[Set[str]]:
+        """The second-token guard for this alternative, or None for LL(1) only.
+
+        Emitted only where FIRST sets collide -- otherwise the LL(1) guard
+        already separates the alternative and a second comparison is waste.
+        """
+        mine = dispatch[alt_idx]
+        if mine is None:
+            return None
+        collides = any(
+            d is not None and bool(mine & d)
+            for i, d in enumerate(dispatch) if i != alt_idx
+        )
+        if not collides:
+            return None
+        return self._alt_second(alt)
+
+    def _lookahead_test(self, token_names: Set[str], var: str) -> str:
+        """A Ritz condition: could `var` be one of these token kinds?"""
+        if len(token_names) == 1:
+            return f'{var} == TOK_{next(iter(token_names))}'
+        b0, b1, b2 = self._first_bits(token_names)
+        return (f'p_first_has({var}, {b0} as u64, {b1} as u64, '
+                f'{b2} as u64) != 0')
+
     def _generate_parse_function(self, rule: GrammarRule):
         """Generate a parse_<name>() function for one grammar rule."""
         rt = self._get_return_type(rule)
@@ -648,8 +741,16 @@ class RitzGenerator:
         # Single-alternative rules have nothing to choose, so they keep the
         # plain flat sequence.
         dispatch: List[Optional[Set[str]]] = [None] * len(rule.alternatives)
+        seconds: List[Optional[Set[str]]] = [None] * len(rule.alternatives)
         if len(rule.alternatives) > 1:
             dispatch = [self._alt_dispatch(alt) for alt in rule.alternatives]
+            # AGAST #4378: where two alternatives share a FIRST token, also
+            # compare the token after it, so the one that cannot match is
+            # skipped without re-parsing the shared prefix.
+            seconds = [
+                self._alt_second_dispatch(alt, dispatch, i)
+                for i, alt in enumerate(rule.alternatives)
+            ]
         any_guard = any(d is not None for d in dispatch)
         all_guard = any_guard and all(d is not None for d in dispatch)
         if any_guard:
@@ -657,6 +758,11 @@ class RitzGenerator:
             # there (every preceding alternative either returned or was
             # rewound), so one read serves them all.
             self._emit('    let la: i32 = p_peek(p)')
+        if any(s is not None for s in seconds):
+            # The second token is at the same index for every alternative
+            # (start_pos + 1), since a guarded alternative begins with its
+            # first terminal at start_pos.
+            self._emit('    let la2: i32 = p_peek2(p)')
         for alt_idx, alt in enumerate(rule.alternatives):
             if alt_idx > 0:
                 # Reset for next alternative
@@ -665,14 +771,16 @@ class RitzGenerator:
             if dispatch[alt_idx] is not None:
                 first = dispatch[alt_idx]
                 b0, b1, b2 = self._first_bits(first)
-                if len(first) == 1:
+                second = seconds[alt_idx]
+                first_test = self._lookahead_test(first, 'la')
+                if second is not None:
+                    self._emit(f'    if {first_test} and '
+                               f'{self._lookahead_test(second, "la2")}')
+                else:
                     # The common case is a one-token FIRST set: compare the
                     # lookahead directly.  p_first_has is a real call, and on
                     # this path it is inside every enclosing parse loop.
-                    self._emit(f'    if la == TOK_{next(iter(first))}')
-                else:
-                    self._emit(f'    if p_first_has(la, {b0} as u64, {b1} as u64, '
-                               f'{b2} as u64) != 0')
+                    self._emit(f'    if {first_test}')
                 self._generate_alternative_indented(rule, alt, alt_idx,
                                                     default_ret, 1)
                 # AGAST #4374: a skipped alternative fails at its first
@@ -682,8 +790,21 @@ class RitzGenerator:
                 # guard skipped (measured: `dedent` alone where the flat form
                 # said `dedent, self, identifier`).
                 self._emit('    else')
-                self._emit(f'        p_record_first(p, {b0} as u64, '
-                           f'{b1} as u64, {b2} as u64)')
+                if second is not None:
+                    # AGAST #4378: distinguish the two misses.  A first-token
+                    # miss fails at start_pos with the FIRST set; a
+                    # second-token miss would have consumed the first terminal
+                    # and failed one on, at the SECOND set.
+                    s0, s1, s2 = self._first_bits(second)
+                    self._emit(f'        if {first_test}')
+                    self._emit(f'            p_record_second(p, {s0} as u64, '
+                               f'{s1} as u64, {s2} as u64)')
+                    self._emit('        else')
+                    self._emit(f'            p_record_first(p, {b0} as u64, '
+                               f'{b1} as u64, {b2} as u64)')
+                else:
+                    self._emit(f'        p_record_first(p, {b0} as u64, '
+                               f'{b1} as u64, {b2} as u64)')
             else:
                 self._generate_alternative(rule, alt, alt_idx, default_ret)
 
