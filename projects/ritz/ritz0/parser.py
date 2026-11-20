@@ -589,15 +589,21 @@ class Parser:
 
     def _interpolate_print_arg(self, callee: rast.Expr,
                                args: List[rast.Expr]) -> List[rast.Expr]:
-        """Split `{expr}` placeholders in print / eprint's literal argument.
+        """Split `{expr}` placeholders in a print-family literal argument.
 
-        AGAST #2102: interpolation belongs to the print / eprint builtins, as
-        in ritz1 (interp.ritz). A "..." anywhere else -- a `let`, a call to
+        AGAST #2102: interpolation belongs to the print builtins, as in
+        ritz1 (interp.ritz). A "..." anywhere else -- a `let`, a call to
         any other function, a return, a field init, a bare statement -- keeps
         its braces as plain bytes, so only here does a StringLit carrying an
         `interp` split become an InterpString with parsed expressions.
+
+        AGAST #202: `println` and `eprintln` are print's line-terminated
+        forms (implicit stdout / stderr Writer). A call whose literal has no
+        placeholder keeps its plain StringLit, so `println("x")` still
+        resolves to whatever `println` is in scope.
         """
-        if (isinstance(callee, rast.Ident) and callee.name in ('print', 'eprint')
+        if (isinstance(callee, rast.Ident)
+                and callee.name in ('print', 'eprint', 'println', 'eprintln')
                 and len(args) == 1 and isinstance(args[0], rast.StringLit)
                 and args[0].interp is not None):
             lit = args[0]

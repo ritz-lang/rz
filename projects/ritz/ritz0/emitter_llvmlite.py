@@ -8528,51 +8528,274 @@ class LLVMEmitter:
 
     def _refuse_format_specs(self, lit: rast.InterpString):
         """AGAST #201: a `{x:spec}` placeholder's spec is parsed (and an
-        unknown one refused by the parser), but printing it is AGAST #202's,
+        unknown one refused by the parser), but printing it is #202's,
         through ritzlib.fmt's Display. Until then refuse a spec rather than
         print the value without it."""
         for spec in lit.specs:
             if spec:
                 raise EmitError(interp_spec.not_printed_message(spec), lit.span)
 
-    def _emit_interp_string_print(self, expr: rast.InterpString, fd: int = 1):
-        """Emit print calls for an interpolated string, writing to `fd`.
+    # ------------------------------------------------------------------
+    # Display dispatch (#202). `{x}` is `x.show(w)`, where `w` is the
+    # implicit stdout Writer, or stderr's for eprint, or the one the
+    # program passed to write/writeln. The compiler's primitive formatters
+    # remain only as the fallback for a self-contained program that has no
+    # ritzlib in scope, so they keep no say over user types.
+    # ------------------------------------------------------------------
 
-        `print` passes 1 and `eprint` passes 2 (AGAST #1641).
+    def _emit_interp_string_print(self, expr: rast.InterpString, fd: int = 1,
+                                  newline: bool = False, writer=None):
+        """Emit an interpolated string: literal parts, then each `{expr}`'s
+        Display, then a newline for println/writeln.
 
-        Desugars "x = {x}, y = {y}" to:
-            prints("x = ")
-            print_int(x)  # or appropriate print function based on type
-            prints(", y = ")
-            print_int(y)
+        `print`/`println` pass fd 1, `eprint`/`eprintln` fd 2 (AGAST #1641,
+        #202). `write`/`writeln` pass the program's Writer expression.
+        Returns the bytes written.
         """
         self._refuse_format_specs(expr)
+        if writer is None:
+            sink = {'kind': 'fd', 'fd': fd, 'arg': None}
+        else:
+            sink = self._fmt_explicit_sink(writer, expr)
+        total = ir.Constant(self.i64, 0)
         for i, part in enumerate(expr.parts):
-            # Print string literal part (if non-empty)
             if part:
-                str_const = self._get_string_constant(part)
-                ptr = self.builder.gep(str_const, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
-                self._emit_write_syscall(ir.Constant(self.i64, fd), ptr, ir.Constant(self.i64, self._utf8_len(part)))
-
-            # Print expression (if not past the last part)
+                got = self._sink_write_const(sink, part)
+                total = self.builder.add(total, got)
             if i < len(expr.exprs):
-                value = self._emit_expr(expr.exprs[i])
-                self._emit_print_value(value, expr.exprs[i], fd)
+                got = self._emit_display_value(expr.exprs[i], sink)
+                total = self.builder.add(total, got)
+        if newline:
+            got = self._sink_write_const(sink, "\n")
+            total = self.builder.add(total, got)
+        return total
 
-        # Return the byte count of the last write (or 0 if no parts)
-        return ir.Constant(self.i64, 0)
+    def _emit_display_value(self, expr: rast.Expr, sink, trait: str = 'Display',
+                            method: str = 'show'):
+        """Write `{expr}` to `sink` through the value's own trait impl.
 
-    def _emit_print_value(self, value: ir.Value, expr: rast.Expr, fd: int = 1):
-        """Emit code to print a value to `fd` based on its type.
+        The impl wins over the compiler's built-in form; only when there is
+        no impl in scope does a primitive use the intrinsic form, and a type
+        with neither is a located diagnostic naming the impl to add.
+        """
+        value = self._emit_expr(expr)
+        type_name, spelling = self._display_type_name(expr, value)
+        mangled = (self._display_method(type_name, trait, method)
+                   if type_name else None)
+        if mangled is not None:
+            return self._emit_display_call(expr, value, type_name, spelling,
+                                           method, sink)
+        got = self._emit_intrinsic_display(value, expr, sink)
+        if got is not None:
+            return got
+        span = getattr(expr, "span", None)
+        raise EmitError(
+            f"type `{spelling}` doesn't implement {trait}; "
+            f"add `impl {trait} for {spelling}`", span)
 
-        Handles: integers, booleans, StrView-shaped `{ i8*, i64 }` values
-        (StrView, and the Span$u8 a bare "..." produces) and pointers to them,
-        which write their `len` bytes (AGAST #1641), and other pointers, which
-        print as NUL-terminated strings.
-        Always uses inline printing (syscalls) for self-contained output.
+    def _display_type_name(self, expr: rast.Expr, value: ir.Value):
+        """The method-dispatch name and source spelling of `expr`'s type.
+
+        `Span<u8>` dispatches as `Span$u8`, `*u8` as `ptr_u8` (its impl
+        target), and a reference as the type it refers to. A pointer to
+        anything else prints as a pointer, not as a Display of its pointee.
+        """
+        ty = self._infer_ritz_type(expr, value)
+        if ty is not None:
+            ty = resolve_alias_in(ty, self.type_aliases)
+            if isinstance(ty, rast.RefType):
+                ty = resolve_alias_in(ty.inner, self.type_aliases)
+            if isinstance(ty, rast.PtrType):
+                inner = resolve_alias_in(ty.inner, self.type_aliases)
+                if (isinstance(inner, rast.NamedType) and inner.name == 'u8'
+                        and not inner.args):
+                    return 'ptr_u8', '*u8'
+                return None, self._show_type(ty)
+            if isinstance(ty, rast.NamedType):
+                name = (mangle_generic_name(ty.name, ty.args)
+                        if ty.args else ty.name)
+                return name, self._show_type(ty)
+            return None, self._show_type(ty)
+        # No Ritz type on the expression: an LLVM struct still says which
+        # impl would apply, but a bare integer's signedness is unknowable
+        # here, so it stays with the intrinsic formatter.
+        if isinstance(value.type, ir.PointerType) and self._is_strview_llvm_type(value.type.pointee):
+            return 'StrView', 'StrView'
+        name = self._get_struct_name_from_type(value.type)
+        return name, name if name is not None else str(value.type)
+
+    def _display_method(self, type_name: str, trait: str, method: str):
+        """The mangled fn for `trait::method` on `type_name`, or None.
+
+        The impls table is the authority: an inherent `show` is not Display.
+        A generic instance (`Span$u8`) finds its impl under the template's
+        name, where `_process_impl` registered both keys.
+        """
+        if (type_name, method) not in self.method_lookup:
+            return None
+        base = type_name.split('$')[0]
+        for key in ((trait, type_name), (trait, base)):
+            for m in self.impls.get(key, ()):
+                if m.name == method:
+                    return self.method_lookup[(type_name, method)]
+        return None
+
+    def _emit_display_call(self, expr: rast.Expr, value: ir.Value,
+                           type_name: str, spelling: str, method: str, sink):
+        """Call `value`'s trait method with the sink's Writer."""
+        span = getattr(expr, "span", None)
+        recv = self.builder._entry_alloca(value.type, "fmt.recv")
+        self.builder.store(value, recv)
+        recv_name = self._fmt_local_name("recv")
+        self.locals[recv_name] = (recv, value.type)
+        rty = self._infer_ritz_type(expr, value)
+        if rty is not None:
+            self.ritz_types[recv_name] = rty
+        arg = self._display_writer_arg(sink, span)
+        call = rast.MethodCall(span, rast.Ident(span, recv_name), method, [arg])
+        return self._emit_method_call(call)
+
+    # ------------------------------------------------------------------
+    # Sinks: a file descriptor (an implicit print) or the program's Writer.
+    # ------------------------------------------------------------------
+
+    def _fmt_explicit_sink(self, writer_expr: rast.Expr, span):
+        """Evaluate write/writeln's Writer expression once."""
+        ptr = self._emit_expr(writer_expr)
+        wty = self.struct_types.get('Writer')
+        if not (isinstance(ptr.type, ir.PointerType) and ptr.type.pointee == wty):
+            raise EmitError(
+                "write/writeln needs a Writer as its first argument "
+                "(`write(@&w, \"...\")`)", span)
+        return {'kind': 'writer', 'ptr': ptr, 'arg': None}
+
+    def _display_writer_arg(self, sink, span):
+        """The AST argument giving the sink's Writer to a Display method."""
+        if sink['arg'] is not None:
+            return sink['arg']
+        if sink['kind'] == 'writer':
+            # The evaluated pointer, in an lvalue: a `name:&` argument takes
+            # the pointer a place holds (emitter_llvmlite `_emit_place_addr`).
+            name = self._fmt_local_name("wptr")
+            slot = self.builder._entry_alloca(sink['ptr'].type, "fmt.wptr")
+            self.builder.store(sink['ptr'], slot)
+            self.locals[name] = (slot, sink['ptr'].type)
+            sink['arg'] = rast.Ident(span, name)
+        else:
+            sink['arg'] = self._make_fd_writer(sink['fd'], span)
+        return sink['arg']
+
+    def _fmt_local_name(self, role: str) -> str:
+        """A fresh hidden local for the temporary a print needs."""
+        seq = getattr(self, '_fmt_local_seq', 0)
+        self._fmt_local_seq = seq + 1
+        return f"__ritz_fmt_{role}_{seq}"
+
+    def _make_fd_writer(self, fd: int, span):
+        """A Writer value writing to `fd`, in a hidden local; `@&` it.
+
+        Built here rather than by calling ritzlib.fmt's `stdout_writer`, so
+        a self-contained program prints without importing a body it would
+        have to link. The layout is Writer's: sink, state, fd, cap, len.
+        """
+        wty = self.struct_types.get('Writer')
+        fields = self.struct_fields.get('Writer')
+        if wty is None or fields is None:
+            raise EmitError(
+                "printing needs the Writer struct in scope "
+                "(ritzlib.fmt.Writer): its Display impls take one", span)
+        names = [name for name, _ in fields]
+        if len(names) != 5 or set(names) != {'sink', 'state', 'fd', 'cap', 'len'}:
+            raise EmitError(
+                "the Writer's fields must be `sink, state, fd, cap, len`, "
+                "as ritzlib.fmt.Writer declares them", span)
+        idx = {name: i for i, name in enumerate(names)}
+        sink_fn = self._fmt_fd_sink_fn(wty)
+        val = ir.Constant(wty, ir.Undefined)
+        val = self.builder.insert_value(val, sink_fn, idx['sink'])
+        val = self.builder.insert_value(
+            val, self._zero_constant(wty.elements[idx['state']]), idx['state'])
+        val = self.builder.insert_value(
+            val, ir.Constant(wty.elements[idx['fd']], fd), idx['fd'])
+        val = self.builder.insert_value(
+            val, ir.Constant(wty.elements[idx['cap']], 0), idx['cap'])
+        val = self.builder.insert_value(
+            val, ir.Constant(wty.elements[idx['len']], 0), idx['len'])
+        slot = self.builder._entry_alloca(wty, "fmt.writer")
+        self.builder.store(val, slot)
+        name = self._fmt_local_name("writer")
+        self.locals[name] = (slot, wty)
+        return rast.UnaryOp(span, '@&', rast.Ident(span, name))
+
+    def _fmt_fd_sink_fn(self, wty):
+        """@__ritz_fmt_fd_sink(w, data, len): write to `w.fd`."""
+        name = "__ritz_fmt_fd_sink"
+        if name in self.module.globals:
+            return self.module.globals[name]
+        idx = self._get_struct_field_index('Writer', 'fd')
+        fld_ty = wty.elements[self._get_struct_field_index('Writer', 'sink')]
+        if not (isinstance(fld_ty, ir.PointerType)
+                and isinstance(fld_ty.pointee, ir.FunctionType)):
+            raise EmitError(
+                "the Writer's `sink` field must be a "
+                "`fn(@&Writer, *u8, i64) -> i64`")
+        fn = ir.Function(self.module, fld_ty.pointee, name=name)
+        fn.linkage = "internal"
+        entry = fn.append_basic_block("entry")
+        b = ir.IRBuilder(entry)
+        fd = b.load(b.gep(fn.args[0], [ir.Constant(self.i32, 0),
+                                       ir.Constant(self.i32, idx)]))
+        saved = self.builder
+        self.builder = b
+        try:
+            result = self._emit_write_syscall(fd, fn.args[1], fn.args[2])
+        finally:
+            self.builder = saved
+        b.ret(result)
+        return fn
+
+    def _sink_write_ptr(self, sink, ptr: ir.Value, length: ir.Value):
+        """Write `length` bytes at `ptr`; returns the bytes accepted."""
+        if sink['kind'] == 'fd':
+            return self._emit_write_syscall(
+                ir.Constant(self.i64, sink['fd']), ptr, length)
+        wptr = sink['ptr']
+        imported = self.functions.get('writer_write')
+        if imported is not None:
+            return self.builder.call(imported[0], [wptr, ptr, length])
+        # No ritzlib to call: the Writer's own sink, and the `len` accounting
+        # `writer_write` would do (writer_view/writer_len read it).
+        idx = {n: i for i, n in enumerate(
+            name for name, _ in self.struct_fields['Writer'])}
+        sink_ty = self.struct_types['Writer'].elements[idx['sink']]
+        sink_ptr = self.builder.load(self.builder.gep(
+            wptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx['sink'])]))
+        got = self.builder.call(sink_ty.pointee, sink_ptr, [wptr, ptr, length])
+        len_slot = self.builder.gep(
+            wptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx['len'])])
+        accepted = self.builder.select(
+            self.builder.icmp_signed('>', got, ir.Constant(self.i64, 0)),
+            got, ir.Constant(self.i64, 0))
+        self.builder.store(self.builder.add(self.builder.load(len_slot), accepted),
+                           len_slot)
+        return got
+
+    def _sink_write_const(self, sink, text: str):
+        """Write a literal part to `sink`."""
+        const = self._get_string_constant(text)
+        ptr = self.builder.gep(const, [ir.Constant(self.i64, 0),
+                                       ir.Constant(self.i64, 0)])
+        return self._sink_write_ptr(sink, ptr, ir.Constant(self.i64, self._utf8_len(text)))
+
+    def _emit_intrinsic_display(self, value: ir.Value, expr: rast.Expr, sink):
+        """The compiler's own form of a primitive, or None for other types.
+
+        Handles integers (decimal by Ritz signedness, AGAST #2128), booleans,
+        StrView-shaped `{ i8*, i64 }` values (StrView, and the Span$u8 a bare
+        "..." produces) and pointers to them, which write their `len` bytes
+        (#1641), and other pointers, which print as NUL-terminated strings.
         """
         ty = value.type
-        fd_val = ir.Constant(self.i64, fd)
 
         # @StrView / *StrView: print the view it points at.
         if isinstance(ty, ir.PointerType) and self._is_strview_llvm_type(ty.pointee):
@@ -8582,18 +8805,18 @@ class LLVMEmitter:
         # Integers: decimal by Ritz signedness, via @__ritz_fmt_int (#2128).
         if ty in (self.i8, self.i16, self.i32, self.i64):
             ptr, length = self._format_int_digits(value, expr)
-            self._emit_write_syscall(fd_val, ptr, length)
+            return self._sink_write_ptr(sink, ptr, length)
 
         # StrView: write exactly `len` bytes from `ptr` (no strlen, so a view
         # into a longer buffer prints only its own bytes).
         elif self._is_strview_llvm_type(ty):
             ptr = self.builder.extract_value(value, 0)
             length = self.builder.extract_value(value, 1)
-            self._emit_write_syscall(fd_val, ptr, length)
+            return self._sink_write_ptr(sink, ptr, length)
 
         # Pointer types (assume *u8 = string) - use strlen + write
         elif isinstance(ty, ir.PointerType):
-            self._emit_write_str(value, fd)
+            return self._emit_sink_cstr(sink, value)
 
         # Boolean - print "true" or "false"
         elif ty == self.i1:
@@ -8603,20 +8826,15 @@ class LLVMEmitter:
             false_ptr = self.builder.gep(false_str, [ir.Constant(self.i64, 0), ir.Constant(self.i64, 0)])
             ptr = self.builder.select(value, true_ptr, false_ptr)
             length = self.builder.select(value, ir.Constant(self.i64, 4), ir.Constant(self.i64, 5))
-            self._emit_write_syscall(fd_val, ptr, length)
+            return self._sink_write_ptr(sink, ptr, length)
 
-        else:
-            # For other types, try to print as integer
-            if isinstance(ty, ir.IntType):
-                ptr, length = self._format_int_digits(value, expr)
-                self._emit_write_syscall(fd_val, ptr, length)
-            else:
-                # A located diagnostic, not a traceback (AGAST #1651).
-                raise EmitError(f"Cannot print value of type {ty}",
-                                getattr(expr, "span", None))
+        elif isinstance(ty, ir.IntType):
+            ptr, length = self._format_int_digits(value, expr)
+            return self._sink_write_ptr(sink, ptr, length)
+        return None
 
-    def _emit_write_str(self, ptr: ir.Value, fd: int = 1):
-        """Write a null-terminated string to `fd` using strlen + write."""
+    def _emit_sink_cstr(self, sink, ptr: ir.Value):
+        """Write a NUL-terminated string to `sink` using strlen + write."""
         # Calculate length with loop
         len_loop = self.current_fn.append_basic_block("strlen.loop")
         len_body = self.current_fn.append_basic_block("strlen.body")
@@ -8645,7 +8863,7 @@ class LLVMEmitter:
         # Done: call write
         self.builder.position_at_end(len_done)
         final_len = self.builder.load(len_ptr)
-        self._emit_write_syscall(ir.Constant(self.i64, fd), ptr, final_len)
+        return self._sink_write_ptr(sink, ptr, final_len)
 
     def _emit_unsafe_block(self, stmt: rast.UnsafeBlock):
         """Emit an unsafe block.
@@ -13606,9 +13824,15 @@ class LLVMEmitter:
             return self._emit_future_poll(call)
 
         # Handle print / eprint builtins - print(string_literal) -> write(1, ptr, len).
-        # eprint is the same lowering to fd 2 (AGAST #1641).
-        if fname in ('print', 'eprint'):
-            out_fd = 1 if fname == 'print' else 2
+        # eprint is the same lowering to fd 2 (AGAST #1641). println and
+        # eprintln take the same lowering plus a newline (AGAST #202), but
+        # only for an interpolated literal: a plain one still resolves to
+        # whatever `println` names in this file (ritzlib.io's, or a test's).
+        line_print = fname in ('println', 'eprintln')
+        interp_line = (line_print and len(call.args) == 1
+                       and isinstance(call.args[0], rast.InterpString))
+        if fname in ('print', 'eprint') or interp_line:
+            out_fd = 1 if fname in ('print', 'println') else 2
             if len(call.args) == 1:
                 arg = call.args[0]
                 if isinstance(arg, rast.CStringLit) and self._has_interp_placeholder(arg.value):
@@ -13647,8 +13871,9 @@ class LLVMEmitter:
                     # Call write(out_fd, ptr, length) via syscall
                     return self._emit_write_syscall(ir.Constant(self.i64, out_fd), ptr, ir.Constant(self.i64, length))
                 elif isinstance(arg, rast.InterpString):
-                    # Handle interpolated string - desugar to print calls
-                    return self._emit_interp_string_print(arg, out_fd)
+                    # Handle interpolated string - desugar to Display calls
+                    return self._emit_interp_string_print(arg, out_fd,
+                                                          newline=line_print)
             # AGAST #3933: located, at the argument (at the call when there
             # isn't exactly one), as ritz1's call_check says it.
             at = call.args[0] if len(call.args) == 1 else call

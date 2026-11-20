@@ -925,7 +925,11 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
 
             # print(str) / eprint(str) -> void (eprint: AGAST #1641);
             # format_into(sink, str) -> void (AGAST #1824)
-            if fn_name in ('print', 'eprint', 'format_into'):
+            # println / eprintln interpolate too (AGAST #202), but keep their
+            # ordinary signature when the argument is not an InterpString.
+            if (fn_name in ('print', 'eprint', 'format_into')
+                    or (fn_name in ('println', 'eprintln')
+                        and any(isinstance(a, rast.InterpString) for a in expr.args))):
                 for arg in expr.args:
                     self._infer_type(arg)
                 return rast.NamedType(expr.span, 'void', [])
