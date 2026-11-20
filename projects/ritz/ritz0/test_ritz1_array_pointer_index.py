@@ -1053,10 +1053,10 @@ TABLE = [
     Row("a_deref_index_reads_into_a_whole_array_store", ALL, Run(SELF_COPY, 3)),
     *(Row(f"a_method_on_an_element[{kind}]", ALL, _method(kind)) for kind in sorted(KINDS)),
     *(Row(f"a_deref_index_is_the_same_place[{kind}]", ALL, _deref_index(kind)) for kind in WRITABLE),
-    # Not "multi-dimensional": emit_module's unlocated backstop says that too.
-    *(Row(f"ritz1_refuses_to_index_a_pointer_to_rows[{name}]", RITZ1S,
-          Refused(ROWS[name] + "pub fn main() -> i32\n    var a: [2][3]i32\n    a[1][2] = 6\n    return f(@a)\n",
-                  "a pointer to a multi-dimensional array can't be indexed", located=False))
+    # AGAST #4313: ritz1 and ritz1_selfhosted lower a row of an `@[N][M]T`
+    # plane now, so these run on every compiler instead of being refused.
+    *(Row(f"an_at_plane_is_indexed[{name}]", ALL,
+          Run(ROWS[name] + "pub fn main() -> i32\n    var a: [2][3]i32\n    a[1][2] = 6\n    return f(@a)\n", 6))
       for name in sorted(ROWS)),
     Row("a_row_is_no_pointer", ALL, Refused(ROW_AS_POINTER, ref_rules.VALUE_INTO_SHARED_REF, at=(2, 19))),
     *(Row(f"a_pointer_element[{name}]", ALL, Run(*POINTER_ELEMENT[name])) for name in sorted(POINTER_ELEMENT)),
