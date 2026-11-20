@@ -1,0 +1,456 @@
+# test/test_css_parser.ritz - CSS Parser Tests
+#
+# Restored from 04e6a822 and rewritten against the current lib API (AGAST
+# #3698). The old file's local no-op `fn assert` is gone; every check here
+# can fail. Unlike the old file, these tests inspect the parsed tree instead
+# of only counting rules: selector kinds/values and declaration values are
+# checked so a parser that drops data fails.
+
+import ritzlib.strview { strview_eq }
+import lib.css.parser { CssParser, css_parser_new, css_parse_stylesheet }
+import lib.css.rule { Stylesheet, StyleRule, RULE_STYLE, Declaration, DeclarationBlock,
+                      stylesheet_free, declaration_block_get, declaration_property_eq }
+import lib.css.selector { SimpleSelector, Specificity, specificity_compare,
+                          SELECTOR_UNIVERSAL, SELECTOR_TYPE, SELECTOR_ID, SELECTOR_CLASS,
+                          SELECTOR_ATTRIBUTE, ATTR_EXISTS, ATTR_EQUALS,
+                          COMBINATOR_NONE, COMBINATOR_DESCENDANT, COMBINATOR_CHILD,
+                          COMBINATOR_NEXT_SIBLING, COMBINATOR_SUBSEQUENT_SIBLING }
+import lib.css.value { CssValue, CSS_VALUE_KEYWORD, CSS_VALUE_LENGTH, CSS_VALUE_COLOR,
+                       CSS_VALUE_NUMBER, UNIT_PX, UNIT_EM, UNIT_PERCENT,
+                       css_value_is_keyword }
+
+# 1 when a simple selector's inline value buffer is exactly `want`.
+fn selector_value_is(s: SimpleSelector, want: StrView) -> i32
+    if s.value_len as u64 != want.len
+        return 0
+    var i: u32 = 0
+    while i < s.value_len
+        if s.value[i] != want.ptr[i]
+            return 0
+        i = i + 1
+    1
+
+fn attr_value_is(s: SimpleSelector, want: StrView) -> i32
+    if s.attr_value_len as u64 != want.len
+        return 0
+    var i: u32 = 0
+    while i < s.attr_value_len
+        if s.attr_value[i] != want.ptr[i]
+            return 0
+        i = i + 1
+    1
+
+fn decl_has_keyword(d: Declaration, kw: StrView) -> i32
+    css_value_is_keyword(d.value, kw)
+
+# Index of `property` in rule `r`'s declaration block, or -1.
+fn decl_index(r: @StyleRule, property: StrView) -> i32
+    declaration_block_get(@r.declarations, property)
+
+# =============================================================================
+# Basic Rule Parsing
+# =============================================================================
+
+[[test]]
+fn test_parse_empty() -> i32
+    var p = css_parser_new("")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 0, "expected 0 rules"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_whitespace_only() -> i32
+    var p = css_parser_new("  \n\t  ")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 0, "whitespace is not a rule"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_single_rule() -> i32
+    var p = css_parser_new("p { color: red; }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    assert sheet.rules[0].kind == RULE_STYLE, "expected a style rule"
+    assert sheet.rules[0].style_rule.selectors.selector_count == 1, "one selector"
+    assert sheet.rules[0].style_rule.declarations.count == 1, "one declaration"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_multiple_rules() -> i32
+    var p = css_parser_new("p { color: red; } div { margin: 0; }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 2, "expected 2 rules"
+    assert sheet.rules[0].style_rule.source_order == 0, "first rule source order 0"
+    assert sheet.rules[1].style_rule.source_order == 1, "second rule source order 1"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_multiple_declarations() -> i32
+    var p = css_parser_new("p { color: red; font-size: 16px; margin: 10px; }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let rule = @sheet.rules[0].style_rule
+    assert rule.declarations.count == 3, "expected 3 declarations"
+
+    let ci = decl_index(rule, "color")
+    assert ci >= 0, "color declaration present"
+    assert decl_has_keyword(rule.declarations.declarations[ci as u32], "red") == 1, "color: red"
+
+    let fi = decl_index(rule, "font-size")
+    assert fi >= 0, "font-size declaration present"
+    let fs = rule.declarations.declarations[fi as u32]
+    assert fs.value.kind == CSS_VALUE_LENGTH, "font-size is a length"
+    assert fs.value.number > 15.9 and fs.value.number < 16.1, "font-size 16"
+    assert fs.value.unit == UNIT_PX, "font-size in px"
+
+    let mi = decl_index(rule, "margin")
+    assert mi >= 0, "margin declaration present"
+    assert rule.declarations.declarations[mi as u32].value.number > 9.9, "margin 10"
+    stylesheet_free(sheet)
+    0
+
+# =============================================================================
+# Selector Parsing
+# =============================================================================
+
+[[test]]
+fn test_parse_type_selector() -> i32
+    var p = css_parser_new("div { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compound_count == 1, "one compound"
+    assert cx.compounds[0].simple_count == 1, "one simple selector"
+    assert cx.compounds[0].simple[0].kind == SELECTOR_TYPE, "type selector"
+    assert selector_value_is(cx.compounds[0].simple[0], "div") == 1, "tag name div"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_class_selector() -> i32
+    var p = css_parser_new(".container { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compounds[0].simple[0].kind == SELECTOR_CLASS, "class selector"
+    assert selector_value_is(cx.compounds[0].simple[0], "container") == 1, "class name"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_id_selector() -> i32
+    var p = css_parser_new("#main { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compounds[0].simple[0].kind == SELECTOR_ID, "id selector"
+    assert selector_value_is(cx.compounds[0].simple[0], "main") == 1, "id value"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_universal_selector() -> i32
+    var p = css_parser_new("* { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compounds[0].simple[0].kind == SELECTOR_UNIVERSAL, "universal selector"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_compound_selector() -> i32
+    var p = css_parser_new("div.container#main { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compound_count == 1, "one compound"
+    assert cx.compounds[0].simple_count == 3, "three simple selectors"
+    assert cx.compounds[0].simple[0].kind == SELECTOR_TYPE, "type first"
+    assert cx.compounds[0].simple[1].kind == SELECTOR_CLASS, "class second"
+    assert cx.compounds[0].simple[2].kind == SELECTOR_ID, "id third"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_child_combinator() -> i32
+    var p = css_parser_new("div > p { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compound_count == 2, "two compounds"
+    assert cx.combinators[0] == COMBINATOR_CHILD, "child combinator"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_sibling_combinator() -> i32
+    var p = css_parser_new("h1 + p { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compound_count == 2, "two compounds"
+    assert cx.combinators[0] == COMBINATOR_NEXT_SIBLING, "next-sibling combinator"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_general_sibling() -> i32
+    var p = css_parser_new("h1 ~ p { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compound_count == 2, "two compounds"
+    assert cx.combinators[0] == COMBINATOR_SUBSEQUENT_SIBLING, "subsequent-sibling combinator"
+    stylesheet_free(sheet)
+    0
+
+# The descendant combinator is not tested here on purpose: the parser folds
+# whitespace-separated compounds into one compound today (AGAST #4397). The
+# matcher's descendant handling is covered by test_selector_matching.
+
+[[test]]
+fn test_parse_attribute_selector() -> i32
+    var p = css_parser_new("[href] { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let cx = sheet.rules[0].style_rule.selectors.selectors[0]
+    assert cx.compounds[0].simple[0].kind == SELECTOR_ATTRIBUTE, "attribute selector"
+    assert selector_value_is(cx.compounds[0].simple[0], "href") == 1, "attribute name"
+    assert cx.compounds[0].simple[0].attr_matcher == ATTR_EXISTS, "exists matcher"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_attribute_equals() -> i32
+    var p = css_parser_new("[type=\"text\"] { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let simple = sheet.rules[0].style_rule.selectors.selectors[0].compounds[0].simple[0]
+    assert simple.kind == SELECTOR_ATTRIBUTE, "attribute selector"
+    assert simple.attr_matcher == ATTR_EQUALS, "equals matcher"
+    assert selector_value_is(simple, "type") == 1, "attribute name"
+    assert attr_value_is(simple, "text") == 1, "attribute value"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_selector_list() -> i32
+    var p = css_parser_new("h1, h2, h3 { }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    assert sheet.rules[0].style_rule.selectors.selector_count == 3, "three selectors"
+    stylesheet_free(sheet)
+    0
+
+# =============================================================================
+# Value Parsing
+# =============================================================================
+
+[[test]]
+fn test_parse_color_keyword() -> i32
+    var p = css_parser_new("p { color: red; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "color")
+    assert i >= 0, "color declaration present"
+    let d = rule.declarations.declarations[i as u32]
+    assert d.value.kind == CSS_VALUE_KEYWORD, "keyword value"
+    assert decl_has_keyword(d, "red") == 1, "keyword is red"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_color_hex() -> i32
+    var p = css_parser_new("p { color: #ff0000; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "color")
+    assert i >= 0, "color declaration present"
+    let v = rule.declarations.declarations[i as u32].value
+    assert v.kind == CSS_VALUE_COLOR, "hex parses to a color"
+    assert v.color_r == 255 and v.color_g == 0 and v.color_b == 0, "rgb(255,0,0)"
+    assert v.color_a == 255, "opaque"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_color_hex_short() -> i32
+    var p = css_parser_new("p { color: #0f0; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "color")
+    assert i >= 0, "color declaration present"
+    let v = rule.declarations.declarations[i as u32].value
+    assert v.kind == CSS_VALUE_COLOR, "short hex parses to a color"
+    assert v.color_r == 0 and v.color_g == 255 and v.color_b == 0, "#0f0 is green"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_length_px() -> i32
+    var p = css_parser_new("p { width: 100px; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "width")
+    assert i >= 0, "width declaration present"
+    let v = rule.declarations.declarations[i as u32].value
+    assert v.kind == CSS_VALUE_LENGTH, "length value"
+    assert v.number > 99.9 and v.number < 100.1, "value 100"
+    assert v.unit == UNIT_PX, "unit px"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_length_em() -> i32
+    var p = css_parser_new("p { font-size: 1.5em; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "font-size")
+    assert i >= 0, "font-size declaration present"
+    let v = rule.declarations.declarations[i as u32].value
+    assert v.kind == CSS_VALUE_LENGTH, "length value"
+    assert v.number > 1.49 and v.number < 1.51, "value 1.5"
+    assert v.unit == UNIT_EM, "unit em"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_percentage() -> i32
+    var p = css_parser_new("p { width: 50%; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "width")
+    assert i >= 0, "width declaration present"
+    let v = rule.declarations.declarations[i as u32].value
+    assert v.kind == CSS_VALUE_LENGTH, "percentage stores as a length"
+    assert v.unit == UNIT_PERCENT, "unit percent"
+    assert v.number > 49.9 and v.number < 50.1, "value 50"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_function_rgb() -> i32
+    var p = css_parser_new("p { color: rgb(255, 0, 0); }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "color")
+    assert i >= 0, "color declaration present"
+    let v = rule.declarations.declarations[i as u32].value
+    assert v.kind == CSS_VALUE_COLOR, "rgb() parses to a color"
+    assert v.color_r == 255 and v.color_g == 0 and v.color_b == 0, "rgb(255,0,0)"
+    stylesheet_free(sheet)
+    0
+
+# =============================================================================
+# Specificity Tests
+# =============================================================================
+
+[[test]]
+fn test_specificity_type() -> i32
+    let s = Specificity { id_count: 0, class_count: 0, type_count: 1 }
+    assert s.type_count == 1, "expected type_count 1"
+    0
+
+[[test]]
+fn test_specificity_compare_id_wins() -> i32
+    let a = Specificity { id_count: 1, class_count: 0, type_count: 0 }
+    let b = Specificity { id_count: 0, class_count: 10, type_count: 0 }
+    assert specificity_compare(a, b) > 0, "ID should beat classes"
+    0
+
+[[test]]
+fn test_specificity_compare_class_wins() -> i32
+    let a = Specificity { id_count: 0, class_count: 1, type_count: 0 }
+    let b = Specificity { id_count: 0, class_count: 0, type_count: 10 }
+    assert specificity_compare(a, b) > 0, "class should beat types"
+    0
+
+[[test]]
+fn test_specificity_compare_equal() -> i32
+    let a = Specificity { id_count: 1, class_count: 2, type_count: 3 }
+    let b = Specificity { id_count: 1, class_count: 2, type_count: 3 }
+    assert specificity_compare(a, b) == 0, "equal specificities"
+    0
+
+# =============================================================================
+# At-Rule Tests
+# =============================================================================
+
+# At-rules are parsed and skipped by design for now (parser.ritz parse_at_rule).
+# They must not be mistaken for style rules or corrupt the following rule.
+[[test]]
+fn test_parse_at_media() -> i32
+    var p = css_parser_new("@media screen { p { color: red; } }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 0, "at-rules are skipped, not style rules"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_at_import_then_rule() -> i32
+    var p = css_parser_new("@import url('style.css'); p { color: red; }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "import is skipped, the style rule remains"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_parse_at_charset() -> i32
+    var p = css_parser_new("@charset \"utf-8\";")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 0, "@charset produces no style rules"
+    stylesheet_free(sheet)
+    0
+
+# =============================================================================
+# Important Tests
+# =============================================================================
+
+[[test]]
+fn test_parse_important() -> i32
+    var p = css_parser_new("p { color: red !important; }")
+    var sheet = css_parse_stylesheet(p)
+    let rule = @sheet.rules[0].style_rule
+    let i = decl_index(rule, "color")
+    assert i >= 0, "color declaration present"
+    let d = rule.declarations.declarations[i as u32]
+    assert d.important == 1, "declaration is important"
+    assert d.value.important == 1, "value carries the important flag"
+    assert decl_has_keyword(d, "red") == 1, "still color: red"
+    stylesheet_free(sheet)
+    0
+
+# =============================================================================
+# Error Recovery
+# =============================================================================
+
+[[test]]
+fn test_recover_missing_semicolon() -> i32
+    # Without a ';' after red, the parser must recover at font-size rather
+    # than swallowing the rest of the block.
+    var p = css_parser_new("p { color: red font-size: 16px; }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 1, "expected 1 rule"
+    let rule = @sheet.rules[0].style_rule
+    assert rule.declarations.count == 2, "both declarations recovered"
+    assert decl_index(rule, "color") >= 0, "color kept"
+    assert decl_index(rule, "font-size") >= 0, "font-size kept"
+    stylesheet_free(sheet)
+    0
+
+[[test]]
+fn test_recover_bad_selector() -> i32
+    # A malformed selector must not stop the next rule parsing.
+    var p = css_parser_new("## { color: red; } p { margin: 0; }")
+    var sheet = css_parse_stylesheet(p)
+    assert sheet.rule_count == 2, "recovered and parsed both rules"
+    let last = sheet.rules[1].style_rule.selectors.selectors[0]
+    assert last.compounds[0].simple[0].kind == SELECTOR_TYPE, "second rule is type p"
+    assert selector_value_is(last.compounds[0].simple[0], "p") == 1, "second rule is p"
+    stylesheet_free(sheet)
+    0

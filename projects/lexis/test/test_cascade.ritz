@@ -1,0 +1,354 @@
+# test/test_cascade.ritz - Cascade Algorithm Tests
+#
+# Restored from 04e6a822 and rewritten against the current lib API (AGAST
+# #3698). The old local no-op `fn assert` is gone, and the old file's
+# comparisons were written against the *inverted* comparator: `cascade_compare`
+# now returns positive when `a` sorts after `b` (i.e. when `a` wins), so the
+# expectations here follow the engine and are checked by test_cascade_apply_*.
+
+import lib.style.cascade { ORIGIN_USER_AGENT, ORIGIN_USER, ORIGIN_AUTHOR,
+                           MatchedRule, MatchedRuleList, matched_rule_list_new,
+                           matched_rule_list_add, matched_rule_list_sort,
+                           cascade_compare, cascade_apply, property_inherits,
+                           get_initial_value, apply_inheritance }
+import lib.css.rule { Declaration, DeclarationBlock, declaration_new,
+                      declaration_block_new, declaration_block_add,
+                      declaration_block_get }
+import lib.css.selector { Specificity }
+import lib.css.value { CssValue, CSS_VALUE_KEYWORD, CSS_VALUE_LENGTH, CSS_VALUE_NUMBER,
+                       UNIT_PX, css_value_keyword, css_value_length, css_value_number,
+                       css_value_is_keyword }
+
+fn make_specificity(ids: u32, classes: u32, types: u32) -> Specificity
+    Specificity {
+        id_count: ids,
+        class_count: classes,
+        type_count: types
+    }
+
+# A MatchedRule with no declaration block: cascade_compare/sort never touch it.
+fn matched_meta(spec: Specificity, origin: i32, order: u32) -> MatchedRule
+    MatchedRule {
+        declarations: null,
+        specificity: spec,
+        origin: origin,
+        source_order: order,
+        important: 0
+    }
+
+fn block_with_keyword(property: StrView, kw: StrView) -> DeclarationBlock
+    var block = declaration_block_new()
+    declaration_block_add(block, declaration_new(property, css_value_keyword(kw)))
+    block
+
+# =============================================================================
+# Cascade Comparison Tests
+# =============================================================================
+
+# Rules are applied in sorted order and the last one wins, so the winner
+# compares *greater* (sorts after).
+
+[[test]]
+fn test_cascade_important_wins() -> i32
+    var a = matched_meta(make_specificity(0, 0, 1), ORIGIN_AUTHOR, 0)
+    a.important = 1
+
+    let b = matched_meta(make_specificity(1, 0, 0), ORIGIN_AUTHOR, 1)
+
+    assert cascade_compare(a, b) > 0, "!important should beat higher specificity"
+    0
+
+[[test]]
+fn test_cascade_author_beats_user() -> i32
+    let a = matched_meta(make_specificity(0, 0, 1), ORIGIN_AUTHOR, 0)
+    let b = matched_meta(make_specificity(0, 0, 1), ORIGIN_USER, 0)
+    assert cascade_compare(a, b) > 0, "author should beat user for normal declarations"
+    0
+
+[[test]]
+fn test_cascade_user_beats_ua() -> i32
+    let a = matched_meta(make_specificity(0, 0, 1), ORIGIN_USER, 0)
+    let b = matched_meta(make_specificity(0, 0, 1), ORIGIN_USER_AGENT, 0)
+    assert cascade_compare(a, b) > 0, "user should beat user-agent"
+    0
+
+[[test]]
+fn test_cascade_important_origin_reversed() -> i32
+    # For !important the origins are reversed: a user !important rule beats an
+    # author !important rule.
+    var a = matched_meta(make_specificity(0, 0, 1), ORIGIN_USER, 0)
+    a.important = 1
+    var b = matched_meta(make_specificity(0, 0, 1), ORIGIN_AUTHOR, 0)
+    b.important = 1
+    assert cascade_compare(a, b) > 0, "user !important should beat author !important"
+    0
+
+[[test]]
+fn test_cascade_specificity_id_beats_class() -> i32
+    let a = matched_meta(make_specificity(1, 0, 0), ORIGIN_AUTHOR, 0)
+    let b = matched_meta(make_specificity(0, 10, 0), ORIGIN_AUTHOR, 1)
+    assert cascade_compare(a, b) > 0, "ID selector should beat 10 classes"
+    0
+
+[[test]]
+fn test_cascade_specificity_class_beats_type() -> i32
+    let a = matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 0)
+    let b = matched_meta(make_specificity(0, 0, 10), ORIGIN_AUTHOR, 1)
+    assert cascade_compare(a, b) > 0, "class should beat 10 types"
+    0
+
+[[test]]
+fn test_cascade_source_order() -> i32
+    let a = matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 0)
+    let b = matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 1)
+    # Earlier source sorts first; the later rule applies last and wins.
+    assert cascade_compare(a, b) < 0, "earlier source should come before later"
+    0
+
+# =============================================================================
+# Property Inheritance Tests
+# =============================================================================
+
+[[test]]
+fn test_text_properties_inherit() -> i32
+    assert property_inherits("color") == 1, "color should inherit"
+    assert property_inherits("font-size") == 1, "font-size should inherit"
+    assert property_inherits("font-family") == 1, "font-family should inherit"
+    assert property_inherits("text-align") == 1, "text-align should inherit"
+    assert property_inherits("line-height") == 1, "line-height should inherit"
+    0
+
+[[test]]
+fn test_visibility_and_list_style_inherit() -> i32
+    assert property_inherits("visibility") == 1, "visibility should inherit"
+    assert property_inherits("list-style") == 1, "list-style should inherit"
+    0
+
+[[test]]
+fn test_box_properties_do_not_inherit() -> i32
+    assert property_inherits("margin") == 0, "margin should not inherit"
+    assert property_inherits("padding") == 0, "padding should not inherit"
+    assert property_inherits("border") == 0, "border should not inherit"
+    assert property_inherits("display") == 0, "display should not inherit"
+    assert property_inherits("width") == 0, "width should not inherit"
+    0
+
+# =============================================================================
+# Initial Value Tests
+# =============================================================================
+
+[[test]]
+fn test_initial_display() -> i32
+    let v = get_initial_value("display")
+    assert v.kind == CSS_VALUE_KEYWORD, "display initial should be keyword"
+    assert css_value_is_keyword(v, "inline") == 1, "display initial is inline"
+    0
+
+[[test]]
+fn test_initial_position() -> i32
+    let v = get_initial_value("position")
+    assert v.kind == CSS_VALUE_KEYWORD, "position initial should be keyword"
+    assert css_value_is_keyword(v, "static") == 1, "position initial is static"
+    0
+
+[[test]]
+fn test_initial_visibility() -> i32
+    let v = get_initial_value("visibility")
+    assert v.kind == CSS_VALUE_KEYWORD, "visibility initial should be keyword"
+    assert css_value_is_keyword(v, "visible") == 1, "visibility initial is visible"
+    0
+
+[[test]]
+fn test_initial_width_is_auto() -> i32
+    let v = get_initial_value("width")
+    assert css_value_is_keyword(v, "auto") == 1, "width initial is auto"
+    0
+
+[[test]]
+fn test_initial_opacity_is_one() -> i32
+    let v = get_initial_value("opacity")
+    assert v.kind == CSS_VALUE_NUMBER, "opacity initial is a number"
+    assert v.number > 0.99 and v.number < 1.01, "opacity initial is 1"
+    0
+
+[[test]]
+fn test_initial_margin_is_zero_length() -> i32
+    let v = get_initial_value("margin")
+    assert v.kind == CSS_VALUE_LENGTH, "margin initial is a length"
+    assert v.number == 0.0, "margin initial is 0"
+    assert v.unit == UNIT_PX, "margin initial unit is px"
+    0
+
+[[test]]
+fn test_initial_unknown_is_initial_keyword() -> i32
+    let v = get_initial_value("not-a-property")
+    assert css_value_is_keyword(v, "initial") == 1, "unknown properties get 'initial'"
+    0
+
+# =============================================================================
+# Cascade Apply Tests
+# =============================================================================
+
+[[test]]
+fn test_apply_empty() -> i32
+    let matched = matched_rule_list_new()
+    let result = cascade_apply(matched)
+    assert result.count == 0, "empty input should give empty output"
+    0
+
+[[test]]
+fn test_apply_higher_specificity_wins() -> i32
+    var low_block = block_with_keyword("color", "red")
+    var high_block = block_with_keyword("color", "blue")
+
+    var list = matched_rule_list_new()
+    matched_rule_list_add(list, MatchedRule {
+        declarations: @low_block as *DeclarationBlock,
+        specificity: make_specificity(0, 0, 1),
+        origin: ORIGIN_AUTHOR,
+        source_order: 0,
+        important: 0
+    })
+    matched_rule_list_add(list, MatchedRule {
+        declarations: @high_block as *DeclarationBlock,
+        specificity: make_specificity(1, 0, 0),
+        origin: ORIGIN_AUTHOR,
+        source_order: 1,
+        important: 0
+    })
+
+    let result = cascade_apply(list)
+    let idx = declaration_block_get(@result, "color")
+    assert idx >= 0, "computed block has color"
+    assert css_value_is_keyword(result.declarations[idx as u32].value, "blue") == 1, "higher specificity should win"
+    0
+
+[[test]]
+fn test_apply_later_source_order_wins() -> i32
+    var first_block = block_with_keyword("color", "red")
+    var second_block = block_with_keyword("color", "green")
+
+    var list = matched_rule_list_new()
+    matched_rule_list_add(list, MatchedRule {
+        declarations: @first_block as *DeclarationBlock,
+        specificity: make_specificity(0, 1, 0),
+        origin: ORIGIN_AUTHOR,
+        source_order: 0,
+        important: 0
+    })
+    matched_rule_list_add(list, MatchedRule {
+        declarations: @second_block as *DeclarationBlock,
+        specificity: make_specificity(0, 1, 0),
+        origin: ORIGIN_AUTHOR,
+        source_order: 1,
+        important: 0
+    })
+
+    let result = cascade_apply(list)
+    let idx = declaration_block_get(@result, "color")
+    assert idx >= 0, "computed block has color"
+    assert css_value_is_keyword(result.declarations[idx as u32].value, "green") == 1, "later source order should win"
+    0
+
+[[test]]
+fn test_apply_keeps_distinct_properties() -> i32
+    var color_block = block_with_keyword("color", "red")
+    var display_block = block_with_keyword("display", "block")
+
+    var list = matched_rule_list_new()
+    matched_rule_list_add(list, MatchedRule {
+        declarations: @color_block as *DeclarationBlock,
+        specificity: make_specificity(0, 0, 1),
+        origin: ORIGIN_AUTHOR,
+        source_order: 0,
+        important: 0
+    })
+    matched_rule_list_add(list, MatchedRule {
+        declarations: @display_block as *DeclarationBlock,
+        specificity: make_specificity(0, 0, 1),
+        origin: ORIGIN_AUTHOR,
+        source_order: 1,
+        important: 0
+    })
+
+    let result = cascade_apply(list)
+    assert result.count == 2, "both properties survive"
+    assert declaration_block_get(@result, "color") >= 0, "color kept"
+    assert declaration_block_get(@result, "display") >= 0, "display kept"
+    0
+
+# =============================================================================
+# Inheritance Apply Tests
+# =============================================================================
+
+[[test]]
+fn test_apply_inheritance_copies_inherited_property() -> i32
+    var parent = declaration_block_new()
+    declaration_block_add(parent, declaration_new("color", css_value_keyword("red")))
+    declaration_block_add(parent, declaration_new("margin", css_value_length(10.0, UNIT_PX)))
+
+    var child = declaration_block_new()
+    apply_inheritance(child, parent)
+
+    let ci = declaration_block_get(@child, "color")
+    assert ci >= 0, "color should be inherited"
+    assert css_value_is_keyword(child.declarations[ci as u32].value, "red") == 1, "inherited red"
+    assert declaration_block_get(@child, "margin") < 0, "margin must not be inherited"
+    0
+
+[[test]]
+fn test_apply_inheritance_keeps_child_value() -> i32
+    var parent = declaration_block_new()
+    declaration_block_add(parent, declaration_new("color", css_value_keyword("red")))
+
+    var child = declaration_block_new()
+    declaration_block_add(child, declaration_new("color", css_value_keyword("blue")))
+    apply_inheritance(child, parent)
+
+    let ci = declaration_block_get(@child, "color")
+    assert ci >= 0, "child has color"
+    assert css_value_is_keyword(child.declarations[ci as u32].value, "blue") == 1, "child value must not be overwritten"
+    assert child.count == 1, "no duplicate color declaration"
+    0
+
+# =============================================================================
+# Matched Rule List Tests
+# =============================================================================
+
+[[test]]
+fn test_rule_list_add() -> i32
+    var list = matched_rule_list_new()
+    assert list.count == 0, "new list should be empty"
+
+    matched_rule_list_add(list, matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 0))
+    assert list.count == 1, "list should have 1 rule"
+    matched_rule_list_add(list, matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 1))
+    assert list.count == 2, "list should have 2 rules"
+    0
+
+[[test]]
+fn test_rule_list_sort_by_specificity() -> i32
+    var list = matched_rule_list_new()
+
+    # Add high specificity first, low second: sort must reorder them.
+    matched_rule_list_add(list, matched_meta(make_specificity(1, 0, 0), ORIGIN_AUTHOR, 1))
+    matched_rule_list_add(list, matched_meta(make_specificity(0, 0, 1), ORIGIN_AUTHOR, 0))
+
+    matched_rule_list_sort(list)
+
+    assert list.rules[0].specificity.type_count == 1, "low specificity should be first"
+    assert list.rules[1].specificity.id_count == 1, "high specificity should be last"
+    0
+
+[[test]]
+fn test_rule_list_sort_by_source_order() -> i32
+    var list = matched_rule_list_new()
+
+    matched_rule_list_add(list, matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 5))
+    matched_rule_list_add(list, matched_meta(make_specificity(0, 1, 0), ORIGIN_AUTHOR, 1))
+
+    matched_rule_list_sort(list)
+
+    assert list.rules[0].source_order == 1, "earlier source order first"
+    assert list.rules[1].source_order == 5, "later source order last"
+    0

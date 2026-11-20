@@ -1,0 +1,491 @@
+# test/test_selector_matching.ritz - Selector Matching Tests
+#
+# Restored from 04e6a822 and rewritten against the current lib API (AGAST
+# #3698). The old local no-op `fn assert` is gone and the old "would need
+# parent/sibling setup" TODOs are now real tests: combinators, attribute
+# matchers and the structural pseudo-classes are exercised, not skipped.
+
+import ritzlib.strview { strview_eq }
+import lib.css.selector { ComplexSelector, CompoundSelector, SimpleSelector,
+                          SELECTOR_UNIVERSAL, SELECTOR_TYPE, SELECTOR_ID, SELECTOR_CLASS,
+                          SELECTOR_ATTRIBUTE, SELECTOR_PSEUDO_CLASS,
+                          COMBINATOR_NONE, COMBINATOR_DESCENDANT, COMBINATOR_CHILD,
+                          COMBINATOR_NEXT_SIBLING, COMBINATOR_SUBSEQUENT_SIBLING,
+                          ATTR_EXISTS, ATTR_EQUALS, ATTR_INCLUDES, ATTR_DASH_MATCH,
+                          ATTR_PREFIX, ATTR_SUFFIX, ATTR_SUBSTRING,
+                          simple_selector_universal, simple_selector_type,
+                          simple_selector_id, simple_selector_class,
+                          compound_selector_new, compound_selector_add,
+                          complex_selector_new, complex_selector_add }
+import lib.style.matching { ElementInfo, selector_matches, element_info_has_class }
+import lib.style.bloom { BloomFilter, bloom_filter_new, bloom_filter_insert_str }
+
+# =============================================================================
+# Fixtures
+# =============================================================================
+
+fn no_attribute(name: StrView) -> StrView
+    StrView { ptr: null, len: 0 }
+
+# Attributes "present" on every element built with element_with_attributes.
+fn test_attribute(name: StrView) -> StrView
+    if strview_eq(name, "href")
+        return "https://example.com/page"
+    if strview_eq(name, "type")
+        return "text"
+    if strview_eq(name, "lang")
+        return "en-US"
+    if strview_eq(name, "data")
+        return "foo bar baz"
+    StrView { ptr: null, len: 0 }
+
+fn element(tag: StrView, id: StrView, classes: StrView) -> ElementInfo
+    ElementInfo {
+        tag: tag,
+        id: id,
+        classes: classes,
+        get_attribute: no_attribute,
+        parent: null,
+        prev_sibling: null,
+        ancestor_filter: bloom_filter_new()
+    }
+
+fn element_with_attributes(tag: StrView) -> ElementInfo
+    ElementInfo {
+        tag: tag,
+        id: "",
+        classes: "",
+        get_attribute: test_attribute,
+        parent: null,
+        prev_sibling: null,
+        ancestor_filter: bloom_filter_new()
+    }
+
+fn compound_of(simple: SimpleSelector) -> CompoundSelector
+    var c = compound_selector_new()
+    compound_selector_add(c, simple)
+    c
+
+fn single(compound: CompoundSelector) -> ComplexSelector
+    var cx = complex_selector_new()
+    complex_selector_add(cx, compound, COMBINATOR_NONE)
+    cx
+
+# Two compounds joined left-to-right. The parser stores the combinator on
+# the compound it follows (combinators[i] joins compounds i and i+1).
+fn pair(left: CompoundSelector, combinator: i32, right: CompoundSelector) -> ComplexSelector
+    var cx = complex_selector_new()
+    complex_selector_add(cx, left, combinator)
+    complex_selector_add(cx, right, COMBINATOR_NONE)
+    cx
+
+fn attribute_selector(name: StrView, matcher: i32, value: StrView, ci: i32) -> SimpleSelector
+    var s = simple_selector_universal()
+    s.kind = SELECTOR_ATTRIBUTE
+    var i: u64 = 0
+    while i < name.len and i < 128
+        s.value[i] = name.ptr[i]
+        i = i + 1
+    s.value_len = i as u32
+    i = 0
+    while i < value.len and i < 128
+        s.attr_value[i] = value.ptr[i]
+        i = i + 1
+    s.attr_value_len = i as u32
+    s.attr_matcher = matcher
+    s.attr_case_insensitive = ci
+    s
+
+fn pseudo_selector(name: StrView) -> SimpleSelector
+    var s = simple_selector_universal()
+    s.kind = SELECTOR_PSEUDO_CLASS
+    var i: u64 = 0
+    while i < name.len and i < 128
+        s.value[i] = name.ptr[i]
+        i = i + 1
+    s.value_len = i as u32
+    s
+
+# =============================================================================
+# Type Selector Tests
+# =============================================================================
+
+[[test]]
+fn test_match_type_exact() -> i32
+    let elem = element("div", "", "")
+    let selector = single(compound_of(simple_selector_type("div")))
+    assert selector_matches(selector, elem) == 1, "div should match div"
+    0
+
+[[test]]
+fn test_match_type_mismatch() -> i32
+    let elem = element("span", "", "")
+    let selector = single(compound_of(simple_selector_type("div")))
+    assert selector_matches(selector, elem) == 0, "span should not match div"
+    0
+
+[[test]]
+fn test_match_type_case_insensitive() -> i32
+    let elem = element("DIV", "", "")
+    let selector = single(compound_of(simple_selector_type("div")))
+    assert selector_matches(selector, elem) == 1, "DIV should match div"
+    0
+
+# =============================================================================
+# Universal Selector Tests
+# =============================================================================
+
+[[test]]
+fn test_match_universal() -> i32
+    let elem = element("div", "", "")
+    let selector = single(compound_of(simple_selector_universal()))
+    assert selector_matches(selector, elem) == 1, "* should match any element"
+    0
+
+[[test]]
+fn test_match_universal_any_tag() -> i32
+    let elem = element("custom-element", "", "")
+    let selector = single(compound_of(simple_selector_universal()))
+    assert selector_matches(selector, elem) == 1, "* should match custom elements"
+    0
+
+# =============================================================================
+# Class Selector Tests
+# =============================================================================
+
+[[test]]
+fn test_match_class_single() -> i32
+    let elem = element("div", "", "container")
+    let selector = single(compound_of(simple_selector_class("container")))
+    assert selector_matches(selector, elem) == 1, ".container should match"
+    0
+
+[[test]]
+fn test_match_class_multiple() -> i32
+    let elem = element("div", "", "foo bar baz")
+    let selector = single(compound_of(simple_selector_class("bar")))
+    assert selector_matches(selector, elem) == 1, ".bar should match 'foo bar baz'"
+    0
+
+[[test]]
+fn test_match_class_not_found() -> i32
+    let elem = element("div", "", "foo bar")
+    let selector = single(compound_of(simple_selector_class("baz")))
+    assert selector_matches(selector, elem) == 0, ".baz should not match 'foo bar'"
+    0
+
+[[test]]
+fn test_match_class_partial_no_match() -> i32
+    let elem = element("div", "", "container-fluid")
+    let selector = single(compound_of(simple_selector_class("container")))
+    assert selector_matches(selector, elem) == 0, ".container must not match container-fluid"
+    0
+
+# =============================================================================
+# ID Selector Tests
+# =============================================================================
+
+[[test]]
+fn test_match_id() -> i32
+    let elem = element("div", "main", "")
+    let selector = single(compound_of(simple_selector_id("main")))
+    assert selector_matches(selector, elem) == 1, "#main should match"
+    0
+
+[[test]]
+fn test_match_id_mismatch() -> i32
+    let elem = element("div", "header", "")
+    let selector = single(compound_of(simple_selector_id("main")))
+    assert selector_matches(selector, elem) == 0, "#main should not match #header"
+    0
+
+# =============================================================================
+# Compound Selector Tests
+# =============================================================================
+
+[[test]]
+fn test_match_compound_type_class() -> i32
+    let elem = element("div", "", "container")
+
+    var compound = compound_selector_new()
+    compound_selector_add(compound, simple_selector_type("div"))
+    compound_selector_add(compound, simple_selector_class("container"))
+
+    assert selector_matches(single(compound), elem) == 1, "div.container should match"
+    0
+
+[[test]]
+fn test_match_compound_type_class_mismatch_type() -> i32
+    let elem = element("span", "", "container")
+
+    var compound = compound_selector_new()
+    compound_selector_add(compound, simple_selector_type("div"))
+    compound_selector_add(compound, simple_selector_class("container"))
+
+    assert selector_matches(single(compound), elem) == 0, "div.container should not match span.container"
+    0
+
+[[test]]
+fn test_match_compound_type_id_class() -> i32
+    let elem = element("div", "main", "container active")
+
+    var compound = compound_selector_new()
+    compound_selector_add(compound, simple_selector_type("div"))
+    compound_selector_add(compound, simple_selector_id("main"))
+    compound_selector_add(compound, simple_selector_class("container"))
+
+    assert selector_matches(single(compound), elem) == 1, "div#main.container should match"
+    0
+
+# =============================================================================
+# Combinator Tests
+# =============================================================================
+
+[[test]]
+fn test_match_child_combinator() -> i32
+    var parent = element("div", "", "")
+    var child = element("p", "", "")
+    child.parent = @parent
+
+    let selector = pair(compound_of(simple_selector_type("div")),
+                        COMBINATOR_CHILD,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, child) == 1, "div > p should match"
+    0
+
+[[test]]
+fn test_match_child_combinator_wrong_parent() -> i32
+    var parent = element("span", "", "")
+    var child = element("p", "", "")
+    child.parent = @parent
+
+    let selector = pair(compound_of(simple_selector_type("div")),
+                        COMBINATOR_CHILD,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, child) == 0, "div > p must not match under span"
+    0
+
+[[test]]
+fn test_match_child_combinator_no_parent() -> i32
+    let child = element("p", "", "")
+    let selector = pair(compound_of(simple_selector_type("div")),
+                        COMBINATOR_CHILD,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, child) == 0, "div > p needs a parent"
+    0
+
+[[test]]
+fn test_match_descendant_combinator() -> i32
+    var grandparent = element("div", "", "")
+    var parent = element("span", "", "")
+    parent.parent = @grandparent
+    var child = element("p", "", "")
+    child.parent = @parent
+    # Callers build this filter from the element's ancestors; without it the
+    # bloom fast path may reject a real match.
+    bloom_filter_insert_str(@&child.ancestor_filter, "div")
+
+    let selector = pair(compound_of(simple_selector_type("div")),
+                        COMBINATOR_DESCENDANT,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, child) == 1, "div p should match a grandparent div"
+    0
+
+[[test]]
+fn test_match_descendant_combinator_missing_ancestor() -> i32
+    var parent = element("span", "", "")
+    var child = element("p", "", "")
+    child.parent = @parent
+    bloom_filter_insert_str(@&child.ancestor_filter, "span")
+
+    let selector = pair(compound_of(simple_selector_type("div")),
+                        COMBINATOR_DESCENDANT,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, child) == 0, "div p needs a div ancestor"
+    0
+
+[[test]]
+fn test_match_next_sibling_combinator() -> i32
+    var prev = element("h1", "", "")
+    var elem = element("p", "", "")
+    elem.prev_sibling = @prev
+
+    let selector = pair(compound_of(simple_selector_type("h1")),
+                        COMBINATOR_NEXT_SIBLING,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, elem) == 1, "h1 + p should match"
+    0
+
+[[test]]
+fn test_match_next_sibling_combinator_wrong_sibling() -> i32
+    var prev = element("h2", "", "")
+    var elem = element("p", "", "")
+    elem.prev_sibling = @prev
+
+    let selector = pair(compound_of(simple_selector_type("h1")),
+                        COMBINATOR_NEXT_SIBLING,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, elem) == 0, "h1 + p must not match after h2"
+    0
+
+[[test]]
+fn test_match_subsequent_sibling_combinator() -> i32
+    var first = element("h1", "", "")
+    var middle = element("span", "", "")
+    middle.prev_sibling = @first
+    var elem = element("p", "", "")
+    elem.prev_sibling = @middle
+
+    let selector = pair(compound_of(simple_selector_type("h1")),
+                        COMBINATOR_SUBSEQUENT_SIBLING,
+                        compound_of(simple_selector_type("p")))
+    assert selector_matches(selector, elem) == 1, "h1 ~ p should match an earlier sibling"
+    0
+
+# =============================================================================
+# Attribute Selector Tests
+# =============================================================================
+
+[[test]]
+fn test_match_attribute_exists() -> i32
+    let elem = element_with_attributes("a")
+    let selector = single(compound_of(attribute_selector("href", ATTR_EXISTS, "", 0)))
+    assert selector_matches(selector, elem) == 1, "[href] should match"
+    0
+
+[[test]]
+fn test_match_attribute_missing() -> i32
+    let elem = element_with_attributes("a")
+    let selector = single(compound_of(attribute_selector("src", ATTR_EXISTS, "", 0)))
+    assert selector_matches(selector, elem) == 0, "[src] should not match"
+    0
+
+[[test]]
+fn test_match_attribute_equals() -> i32
+    let elem = element_with_attributes("input")
+    let selector = single(compound_of(attribute_selector("type", ATTR_EQUALS, "text", 0)))
+    assert selector_matches(selector, elem) == 1, "[type=text] should match"
+    0
+
+[[test]]
+fn test_match_attribute_equals_mismatch() -> i32
+    let elem = element_with_attributes("input")
+    let selector = single(compound_of(attribute_selector("type", ATTR_EQUALS, "password", 0)))
+    assert selector_matches(selector, elem) == 0, "[type=password] should not match"
+    0
+
+[[test]]
+fn test_match_attribute_equals_case_insensitive() -> i32
+    let elem = element_with_attributes("input")
+    let selector = single(compound_of(attribute_selector("type", ATTR_EQUALS, "TEXT", 1)))
+    assert selector_matches(selector, elem) == 1, "[type=TEXT i] should match"
+    0
+
+[[test]]
+fn test_match_attribute_includes() -> i32
+    let elem = element_with_attributes("div")
+    let yes = single(compound_of(attribute_selector("data", ATTR_INCLUDES, "bar", 0)))
+    assert selector_matches(yes, elem) == 1, "[data~=bar] should match"
+    let no = single(compound_of(attribute_selector("data", ATTR_INCLUDES, "ba", 0)))
+    assert selector_matches(no, elem) == 0, "[data~=ba] must not match a word prefix"
+    0
+
+[[test]]
+fn test_match_attribute_dash_match() -> i32
+    let elem = element_with_attributes("html")
+    let en = single(compound_of(attribute_selector("lang", ATTR_DASH_MATCH, "en", 0)))
+    assert selector_matches(en, elem) == 1, "[lang|=en] should match en-US"
+    let full = single(compound_of(attribute_selector("lang", ATTR_DASH_MATCH, "en-US", 0)))
+    assert selector_matches(full, elem) == 1, "[lang|=en-US] should match exactly"
+    let e = single(compound_of(attribute_selector("lang", ATTR_DASH_MATCH, "e", 0)))
+    assert selector_matches(e, elem) == 0, "[lang|=e] must not match en-US"
+    0
+
+[[test]]
+fn test_match_attribute_prefix_suffix_substring() -> i32
+    let elem = element_with_attributes("a")
+    let prefix = single(compound_of(attribute_selector("href", ATTR_PREFIX, "https", 0)))
+    assert selector_matches(prefix, elem) == 1, "[href^=https] should match"
+    let suffix = single(compound_of(attribute_selector("href", ATTR_SUFFIX, "/page", 0)))
+    assert selector_matches(suffix, elem) == 1, "[href$=/page] should match"
+    let substr = single(compound_of(attribute_selector("href", ATTR_SUBSTRING, "example", 0)))
+    assert selector_matches(substr, elem) == 1, "[href*=example] should match"
+    let miss = single(compound_of(attribute_selector("href", ATTR_SUBSTRING, "absent", 0)))
+    assert selector_matches(miss, elem) == 0, "[href*=absent] should not match"
+    0
+
+# =============================================================================
+# Pseudo-Class Tests
+# =============================================================================
+
+[[test]]
+fn test_match_first_child() -> i32
+    let elem = element("p", "", "")
+    let selector = single(compound_of(pseudo_selector("first-child")))
+    assert selector_matches(selector, elem) == 1, ":first-child with no previous sibling"
+    0
+
+[[test]]
+fn test_match_first_child_false() -> i32
+    var prev = element("span", "", "")
+    var elem = element("p", "", "")
+    elem.prev_sibling = @prev
+    let selector = single(compound_of(pseudo_selector("first-child")))
+    assert selector_matches(selector, elem) == 0, ":first-child needs no previous sibling"
+    0
+
+[[test]]
+fn test_match_root() -> i32
+    let elem = element("html", "", "")
+    let selector = single(compound_of(pseudo_selector("root")))
+    assert selector_matches(selector, elem) == 1, ":root with no parent"
+    0
+
+[[test]]
+fn test_match_root_false() -> i32
+    var parent = element("body", "", "")
+    var elem = element("div", "", "")
+    elem.parent = @parent
+    let selector = single(compound_of(pseudo_selector("root")))
+    assert selector_matches(selector, elem) == 0, ":root needs no parent"
+    0
+
+[[test]]
+fn test_match_dynamic_pseudo_never_matches() -> i32
+    # Dynamic state lives in the browser, not the element, so these do not
+    # match statically (matching.ritz pseudo_class_matches).
+    let elem = element("a", "", "")
+    let hover = single(compound_of(pseudo_selector("hover")))
+    assert selector_matches(hover, elem) == 0, ":hover is not statically matchable"
+    0
+
+# =============================================================================
+# Helper Function Tests
+# =============================================================================
+
+[[test]]
+fn test_element_has_class_single() -> i32
+    let elem = element("div", "", "foo")
+    assert element_info_has_class(elem, "foo") == 1, "should have class foo"
+    0
+
+[[test]]
+fn test_element_has_class_multiple() -> i32
+    let elem = element("div", "", "foo bar baz")
+    assert element_info_has_class(elem, "foo") == 1, "should have foo"
+    assert element_info_has_class(elem, "bar") == 1, "should have bar"
+    assert element_info_has_class(elem, "baz") == 1, "should have baz"
+    0
+
+[[test]]
+fn test_element_has_class_empty() -> i32
+    let elem = element("div", "", "")
+    assert element_info_has_class(elem, "foo") == 0, "empty should not have foo"
+    0
+
+[[test]]
+fn test_complex_empty() -> i32
+    let selector = complex_selector_new()
+    let elem = element("div", "", "")
+    assert selector_matches(selector, elem) == 0, "empty selector should not match"
+    0
