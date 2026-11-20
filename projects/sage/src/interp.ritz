@@ -22,18 +22,31 @@
 # Supported: numbers, strings, booleans, null, undefined, objects, arrays;
 # arithmetic, comparison, equality, logical, bitwise, unary, typeof,
 # update and (compound) assignment operators; let/const/var; function
-# declarations (hoisted) and expressions, closures, recursion; if, while,
-# do-while, for, for-of over an array, break, continue, return;
-# throw/try/catch/finally with Error objects for runtime errors; console.log,
-# console.error, a string's .length, and array literals, indexing, .length,
-# push/pop and [ 1, 'a' ] rendering.
-# Not yet (each throws "SyntaxError: sage does not support ..."): arrow
-# functions (#4075), and classes, `new`, `this`, for-in, for-of over a
-# non-array, labels, switch, delete, `in`, instanceof and built-ins like Math
-# (#4077).
+# declarations (hoisted) and expressions, arrow functions, closures,
+# recursion; if, while, do-while, for, for-of over an array, break, continue,
+# return; throw/try/catch/finally with Error objects for runtime errors;
+# console.log, console.error, array literals, indexing, .length, push/pop and
+# [ 1, 'a' ] rendering.
+# Built-ins (#4077): Math (abs/floor/ceil/round/trunc/sign/min/max/pow/sqrt/
+# cbrt/log/log2/log10/exp and PI/E/SQRT2/LN2/... constants); String(x),
+# Number(x), Boolean(x); Number.isInteger/isNaN/isFinite/isSafeInteger and
+# MAX_SAFE_INTEGER, MIN_SAFE_INTEGER, EPSILON, MAX_VALUE, MIN_VALUE,
+# POSITIVE_INFINITY, NEGATIVE_INFINITY, NaN; Object.keys/values/entries/
+# assign/is/freeze/isFrozen; and the String methods charAt, charCodeAt,
+# indexOf, includes, startsWith, endsWith, slice, substring, toUpperCase,
+# toLowerCase, trim, repeat and concat.
+# Not yet (each throws "SyntaxError: sage does not support ..."): classes,
+# `new`, `this`, for-in, for-of over a non-array, labels, switch, delete,
+# `in`, instanceof; Math's trig/random/hypot; String.fromCharCode/split/
+# replace; Number.prototype methods; Object.create/defineProperty.
 # `var` is not hoisted (reading one before its declaration is a
 # ReferenceError), and a `for (let ...)` loop shares one binding across
 # iterations (#4077).
+# Approximations: Math.log/log2/log10/exp are correctly rounded for the
+# tested inputs but can differ from node by one ulp elsewhere. Object.keys
+# and friends use insertion order, not node's integer-key-first order, and
+# do not list an array's named properties. String methods are byte-based, so
+# non-ASCII case mapping and UTF-16 charAt/charCodeAt differ from node.
 
 import ritzlib.io
 import ritzlib.strview
@@ -62,6 +75,65 @@ const NATIVE_CONSOLE_LOG: i64 = 1
 const NATIVE_CONSOLE_ERROR: i64 = 2
 const NATIVE_ARRAY_PUSH: i64 = 3
 const NATIVE_ARRAY_POP: i64 = 4
+
+# Callable globals. String/Number/Object/Boolean are functions in JS, so they
+# are V_NATIVE (typeof is "function") and expose their statics through
+# get_property; Math is a plain object.
+const NATIVE_STRING_CALL: i64 = 10
+const NATIVE_NUMBER_CALL: i64 = 11
+const NATIVE_BOOLEAN_CALL: i64 = 12
+const NATIVE_OBJECT_CALL: i64 = 13
+
+# Math statics (no receiver)
+const NATIVE_MATH_ABS: i64 = 20
+const NATIVE_MATH_FLOOR: i64 = 21
+const NATIVE_MATH_CEIL: i64 = 22
+const NATIVE_MATH_ROUND: i64 = 23
+const NATIVE_MATH_TRUNC: i64 = 24
+const NATIVE_MATH_SIGN: i64 = 25
+const NATIVE_MATH_MIN: i64 = 26
+const NATIVE_MATH_MAX: i64 = 27
+const NATIVE_MATH_POW: i64 = 28
+const NATIVE_MATH_SQRT: i64 = 29
+const NATIVE_MATH_CBRT: i64 = 30
+const NATIVE_MATH_LOG: i64 = 31
+const NATIVE_MATH_LOG2: i64 = 32
+const NATIVE_MATH_LOG10: i64 = 33
+const NATIVE_MATH_EXP: i64 = 34
+
+# Number statics
+const NATIVE_NUMBER_IS_INTEGER: i64 = 40
+const NATIVE_NUMBER_IS_NAN: i64 = 41
+const NATIVE_NUMBER_IS_FINITE: i64 = 42
+const NATIVE_NUMBER_IS_SAFE_INTEGER: i64 = 43
+
+# Object statics
+const NATIVE_OBJECT_KEYS: i64 = 50
+const NATIVE_OBJECT_VALUES: i64 = 51
+const NATIVE_OBJECT_ENTRIES: i64 = 52
+const NATIVE_OBJECT_ASSIGN: i64 = 53
+const NATIVE_OBJECT_IS: i64 = 54
+const NATIVE_OBJECT_FREEZE: i64 = 55
+const NATIVE_OBJECT_IS_FROZEN: i64 = 56
+
+# String.prototype methods. The receiver string (arena start, length) lives
+# in the method value's num/b fields; `a` is the id like every native.
+const NATIVE_STR_CHAR_AT: i64 = 60
+const NATIVE_STR_CHAR_CODE_AT: i64 = 61
+const NATIVE_STR_INDEX_OF: i64 = 62
+const NATIVE_STR_INCLUDES: i64 = 63
+const NATIVE_STR_STARTS_WITH: i64 = 64
+const NATIVE_STR_ENDS_WITH: i64 = 65
+const NATIVE_STR_SLICE: i64 = 66
+const NATIVE_STR_SUBSTRING: i64 = 67
+const NATIVE_STR_TO_UPPER: i64 = 68
+const NATIVE_STR_TO_LOWER: i64 = 69
+const NATIVE_STR_TRIM: i64 = 70
+const NATIVE_STR_REPEAT: i64 = 71
+const NATIVE_STR_CONCAT: i64 = 72
+
+# Longest string repeat() will build (memory is never freed without a GC)
+const MAX_REPEAT_LEN: i64 = 1000000
 
 struct Value
     tag: i32
@@ -120,6 +192,7 @@ struct JsObject
     first: i64
     last: i64
     is_error: i32   # prints and converts as "name: message"
+    frozen: i32     # Object.freeze was called (no actual write check yet)
 
 # One array element slot; slots are a linked list in index order, like Props
 struct Elem
@@ -227,6 +300,10 @@ fn buf_push_number(buf: @&Vec<u8>, x: f64)
 # Math helpers for ** with a fractional exponent
 # =============================================================================
 
+# Split double-double ln2 so k*ln2 keeps its low bits (fdlibm's constants)
+const LN2_HI: f64 = 0.6931471803691238
+const LN2_LO: f64 = 1.9082149292705877e-10
+
 fn f64_ln(x: f64) -> f64
     # x = m * 2^k with m in [1, 2); ln(m) = 2 atanh((m - 1) / (m + 1))
     var m: f64 = x
@@ -246,35 +323,88 @@ fn f64_ln(x: f64) -> f64
         sum = sum + term / (i as f64)
         term = term * t2
         i = i + 2
-    2.0 * sum + (k as f64) * 0.6931471805599453
+    2.0 * sum + ((k as f64) * LN2_HI + (k as f64) * LN2_LO)
+
+# Math.log's domain handling around f64_ln (which loops for m == 0)
+fn f64_log(x: f64) -> f64
+    if x != x or x < 0.0
+        return f64_nan()
+    if x == 0.0
+        return 0.0 - f64_inf()
+    if x > 1.7976931348623157e308
+        return x
+    f64_ln(x)
+
+# log2 by binary exponent decomposition, so exact powers of two are exact
+fn f64_log2(x: f64) -> f64
+    if x != x or x < 0.0
+        return f64_nan()
+    if x == 0.0
+        return 0.0 - f64_inf()
+    if x > 1.7976931348623157e308
+        return x
+    var m: f64 = x
+    var k: i64 = 0
+    while m >= 2.0
+        m = m / 2.0
+        k = k + 1
+    while m < 1.0
+        m = m * 2.0
+        k = k - 1
+    if m == 1.0
+        return k as f64
+    (k as f64) + f64_ln(m) / 0.6931471805599453
+
+# log10 by decimal exponent decomposition, so exact powers of ten are exact
+fn f64_log10(x: f64) -> f64
+    if x != x or x < 0.0
+        return f64_nan()
+    if x == 0.0
+        return 0.0 - f64_inf()
+    if x > 1.7976931348623157e308
+        return x
+    var m: f64 = x
+    var e: i64 = 0
+    while m >= 10.0
+        m = m / 10.0
+        e = e + 1
+    while m < 1.0
+        m = m * 10.0
+        e = e - 1
+    if m == 1.0
+        return e as f64
+    (e as f64) + f64_ln(m) / 2.302585092994046
 
 fn f64_exp(y: f64) -> f64
     if y > 709.8
         return f64_inf()
     if y < -745.2
         return 0.0
-    # y = k ln2 + r, |r| <= ln2 / 2
+    # y = k ln2 + r, |r| <= ln2 / 2, then exp(r) by fdlibm's rational
+    # approximation (more accurate than a plain Taylor sum)
     let ln2: f64 = 0.6931471805599453
     var k: i64 = 0
     if y >= 0.0
         k = (y / ln2 + 0.5) as i64
     else
         k = (y / ln2 - 0.5) as i64
-    let r: f64 = y - (k as f64) * ln2
-    var term: f64 = 1.0
-    var sum: f64 = 1.0
-    var i: i64 = 1
-    while i < 30
-        term = term * r / (i as f64)
-        sum = sum + term
-        i = i + 1
+    let hi: f64 = y - (k as f64) * LN2_HI
+    let lo: f64 = (k as f64) * LN2_LO
+    let r: f64 = hi - lo
+    let t: f64 = r * r
+    let c: f64 = r - t * (1.66666666666666019037e-01 + t * (-2.77777777770155933842e-03 + t * (6.61375632143793436117e-05 + t * (-1.65339022054652515390e-06 + t * 4.13813679705723846039e-08))))
+    var e: f64 = 0.0
+    if k == 0
+        e = 1.0 - ((r * c) / (c - 2.0) - r)
+    else
+        e = 1.0 - ((lo - (r * c) / (2.0 - c)) - hi)
     while k > 0
-        sum = sum * 2.0
+        e = e * 2.0
         k = k - 1
     while k < 0
-        sum = sum / 2.0
+        e = e / 2.0
         k = k + 1
-    sum
+    e
 
 # r * r - x without rounding error in r * r
 fn sqr_residual(r: f64, x: f64) -> f64
@@ -284,6 +414,8 @@ fn sqr_residual(r: f64, x: f64) -> f64
 fn f64_abs(x: f64) -> f64
     if x < 0.0
         return 0.0 - x
+    if x == 0.0
+        return 0.0           # Math.abs(-0) is +0
     x
 
 # Correctly rounded square root: Newton's iteration, then the neighbour
@@ -367,6 +499,107 @@ fn to_uint32_f(x: f64) -> i64
     if t < 0
         t = t + 4294967296
     t
+
+# 1 if x is neither NaN nor an infinity
+fn f64_is_finite(x: f64) -> i32
+    if x != x
+        return 0
+    if x > 1.7976931348623157e308 or x < -1.7976931348623157e308
+        return 0
+    1
+
+# 1 if x is negative zero (-0 compares equal to 0, so check the sign bit)
+fn is_neg_zero(x: f64) -> i32
+    if x != 0.0
+        return 0
+    if 1.0 / x < 0.0
+        return 1
+    0
+
+# Math.floor / ceil / trunc: values outside i64 range are already integral
+fn f64_floor(x: f64) -> f64
+    if x != x
+        return x
+    if x == 0.0
+        return x            # preserve -0
+    if x > 1.0e18 or x < -1.0e18
+        return x            # includes +/-Infinity
+    let t = x as i64
+    var tf = t as f64
+    if tf > x
+        tf = tf - 1.0
+    tf
+
+fn f64_ceil(x: f64) -> f64
+    if x != x
+        return x
+    if x == 0.0
+        return x
+    if x > 1.0e18 or x < -1.0e18
+        return x
+    let t = x as i64
+    var tf = t as f64
+    if tf < x
+        tf = tf + 1.0
+    tf
+
+fn f64_trunc(x: f64) -> f64
+    if x != x
+        return x
+    if x == 0.0
+        return x
+    if x > 1.0e18 or x < -1.0e18
+        return x
+    let t = x as i64
+    let tf = t as f64
+    if tf == 0.0 and x < 0.0
+        return -1.0 * 0.0  # trunc(-0.9) is -0
+    tf
+
+# Math.round: nearest integer, ties toward +Infinity; -0 for (-0.5, 0]
+fn f64_round(x: f64) -> f64
+    if x != x
+        return x
+    if x == 0.0
+        return x
+    if x > 1.0e18 or x < -1.0e18
+        return x
+    let f = f64_floor(x + 0.5)
+    if f == 0.0 and x < 0.0
+        return -1.0 * 0.0
+    f
+
+fn f64_sign(x: f64) -> f64
+    if x != x
+        return x
+    if x > 0.0
+        return 1.0
+    if x < 0.0
+        return 0.0 - 1.0
+    x                    # 0 or -0
+
+# Math.cbrt: Newton's iteration on the absolute value, sign restored
+fn f64_cbrt(x: f64) -> f64
+    if x != x or x == 0.0
+        return x
+    if x > 1.7976931348623157e308 or x < -1.7976931348623157e308
+        return x
+    var neg: i32 = 0
+    var a: f64 = x
+    if a < 0.0
+        neg = 1
+        a = 0.0 - a
+    var r: f64 = a
+    var i: i64 = 0
+    while i < 200
+        let next: f64 = (2.0 * r + a / (r * r)) / 3.0
+        if next == r
+            break
+        r = next
+        i = i + 1
+    if neg == 1
+        return 0.0 - r
+    r
 
 # =============================================================================
 # Construction
@@ -639,7 +872,7 @@ fn function_scope(it: @&Interp) -> i64
 
 fn obj_new(it: @&Interp) -> Value
     let idx = vec_len<JsObject>(@it.objects)
-    vec_push<JsObject>(@&it.objects, JsObject { first: -1, last: -1, is_error: 0 })
+    vec_push<JsObject>(@&it.objects, JsObject { first: -1, last: -1, is_error: 0, frozen: 0 })
     v_tagged(V_OBJECT, idx)
 
 fn prop_find(it: @&Interp, obj: i64, in_src: i32, key: i64, len: i64) -> i64
@@ -801,6 +1034,85 @@ fn key_is(it: @&Interp, key: Key, name: StrView) -> i32
     if strview_eq(name_view(it, key.in_src, key.start, key.len), name)
         return 1
     0
+
+# String.prototype: .length and the methods this interpreter implements,
+# bound to the receiver string
+fn string_get(it: @&Interp, s: Value, key: Key) -> Value
+    if key_is(it, key, "length") == 1
+        return v_num(s.b as f64)
+    if key_is(it, key, "charAt") == 1
+        return v_str_method(s, NATIVE_STR_CHAR_AT)
+    if key_is(it, key, "charCodeAt") == 1
+        return v_str_method(s, NATIVE_STR_CHAR_CODE_AT)
+    if key_is(it, key, "indexOf") == 1
+        return v_str_method(s, NATIVE_STR_INDEX_OF)
+    if key_is(it, key, "includes") == 1
+        return v_str_method(s, NATIVE_STR_INCLUDES)
+    if key_is(it, key, "startsWith") == 1
+        return v_str_method(s, NATIVE_STR_STARTS_WITH)
+    if key_is(it, key, "endsWith") == 1
+        return v_str_method(s, NATIVE_STR_ENDS_WITH)
+    if key_is(it, key, "slice") == 1
+        return v_str_method(s, NATIVE_STR_SLICE)
+    if key_is(it, key, "substring") == 1
+        return v_str_method(s, NATIVE_STR_SUBSTRING)
+    if key_is(it, key, "toUpperCase") == 1
+        return v_str_method(s, NATIVE_STR_TO_UPPER)
+    if key_is(it, key, "toLowerCase") == 1
+        return v_str_method(s, NATIVE_STR_TO_LOWER)
+    if key_is(it, key, "trim") == 1
+        return v_str_method(s, NATIVE_STR_TRIM)
+    if key_is(it, key, "repeat") == 1
+        return v_str_method(s, NATIVE_STR_REPEAT)
+    if key_is(it, key, "concat") == 1
+        return v_str_method(s, NATIVE_STR_CONCAT)
+    v_undef()
+
+# Statics on the callable String / Number / Object globals (typeof function)
+fn native_static(it: @&Interp, id: i64, key: Key) -> Value
+    if id == NATIVE_NUMBER_CALL
+        if key_is(it, key, "isInteger") == 1
+            return v_tagged(V_NATIVE, NATIVE_NUMBER_IS_INTEGER)
+        if key_is(it, key, "isNaN") == 1
+            return v_tagged(V_NATIVE, NATIVE_NUMBER_IS_NAN)
+        if key_is(it, key, "isFinite") == 1
+            return v_tagged(V_NATIVE, NATIVE_NUMBER_IS_FINITE)
+        if key_is(it, key, "isSafeInteger") == 1
+            return v_tagged(V_NATIVE, NATIVE_NUMBER_IS_SAFE_INTEGER)
+        if key_is(it, key, "MAX_SAFE_INTEGER") == 1
+            return v_num(9007199254740991.0)
+        if key_is(it, key, "MIN_SAFE_INTEGER") == 1
+            return v_num(-9007199254740991.0)
+        if key_is(it, key, "EPSILON") == 1
+            return v_num(2.220446049250313e-16)
+        if key_is(it, key, "MAX_VALUE") == 1
+            return v_num(1.7976931348623157e308)
+        if key_is(it, key, "MIN_VALUE") == 1
+            return v_num(5e-324)
+        if key_is(it, key, "POSITIVE_INFINITY") == 1
+            return v_num(f64_inf())
+        if key_is(it, key, "NEGATIVE_INFINITY") == 1
+            return v_num(0.0 - f64_inf())
+        if key_is(it, key, "NaN") == 1
+            return v_num(f64_nan())
+        return v_undef()
+    if id == NATIVE_OBJECT_CALL
+        if key_is(it, key, "keys") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_KEYS)
+        if key_is(it, key, "values") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_VALUES)
+        if key_is(it, key, "entries") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_ENTRIES)
+        if key_is(it, key, "assign") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_ASSIGN)
+        if key_is(it, key, "is") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_IS)
+        if key_is(it, key, "freeze") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_FREEZE)
+        if key_is(it, key, "isFrozen") == 1
+            return v_tagged(V_NATIVE, NATIVE_OBJECT_IS_FROZEN)
+        return v_undef()
+    v_undef()
 
 # A native function bound to its receiver array
 fn v_method(recv: i64, id: i64) -> Value
@@ -1033,6 +1345,172 @@ fn to_string(it: @&Interp, v: Value) -> Value
         i = i + 1
     vec_drop<u8>(@&tmp)
     v_str(start, n)
+
+# =============================================================================
+# Built-in call helpers
+# =============================================================================
+
+# Argument i, or undefined when the call passed fewer
+fn nth_arg(args: @Vec<Value>, i: i64) -> Value
+    if i < vec_len<Value>(args)
+        return vec_get<Value>(args, i)
+    v_undef()
+
+# ToIntegerOrInfinity: NaN -> 0, truncate toward zero, keep +/-Infinity
+fn to_int_or_inf(it: @&Interp, v: Value) -> f64
+    let n = to_number(it, v)
+    if n != n
+        return 0.0
+    if n > 9.0e18 or n < -9.0e18
+        return n
+    (n as i64) as f64
+
+# A string method bound to its receiver: num = arena start, b = length
+fn v_str_method(s: Value, id: i64) -> Value
+    Value { tag: V_NATIVE, num: s.a as f64, a: id, b: s.b }
+
+# Copy `len` bytes already in the arena to a fresh arena string. Reading each
+# byte through vec_get is realloc-safe while the arena grows.
+fn arena_copy(it: @&Interp, src: i64, len: i64) -> Value
+    let start = vec_len<u8>(@it.arena)
+    var i: i64 = 0
+    while i < len
+        vec_push<u8>(@&it.arena, vec_get<u8>(@it.arena, src + i))
+        i = i + 1
+    v_str(start, len)
+
+# Index of `needle` in `hay` at or after `from`, -1 if absent
+fn str_find(it: @&Interp, hay: Value, needle: Value, from: f64) -> i64
+    var f: f64 = from
+    if f < 0.0
+        f = 0.0
+    if f > hay.b as f64
+        f = hay.b as f64
+    let start = f as i64
+    if needle.b == 0
+        return start
+    if needle.b > hay.b
+        return -1
+    var i: i64 = start
+    while i + needle.b <= hay.b
+        var j: i64 = 0
+        var ok: i32 = 1
+        while j < needle.b
+            if vec_get<u8>(@it.arena, hay.a + i + j) != vec_get<u8>(@it.arena, needle.a + j)
+                ok = 0
+                break
+            j = j + 1
+        if ok == 1
+            return i
+        i = i + 1
+    -1
+
+# Slice with the relative-index rules of String.prototype.slice
+fn str_slice_rel(it: @&Interp, s: Value, from: f64, to: f64) -> Value
+    let len = s.b as f64
+    var a: f64 = from
+    var b: f64 = to
+    if a < 0.0
+        a = len + a
+        if a < 0.0
+            a = 0.0
+    else if a > len
+        a = len
+    if b < 0.0
+        b = len + b
+        if b < 0.0
+            b = 0.0
+    else if b > len
+        b = len
+    if b < a
+        b = a
+    arena_copy(it, s.a + (a as i64), (b as i64) - (a as i64))
+
+# Copy `s` with ASCII letters upper- or lower-cased (non-ASCII is unchanged)
+fn str_change_case(it: @&Interp, s: Value, upper: i32) -> Value
+    let r = arena_copy(it, s.a, s.b)
+    var i: i64 = 0
+    while i < r.b
+        let c = vec_get<u8>(@it.arena, r.a + i)
+        if upper == 1 and c >= 97 and c <= 122
+            vec_set<u8>(@&it.arena, r.a + i, c - 32)
+        else if upper == 0 and c >= 65 and c <= 90
+            vec_set<u8>(@&it.arena, r.a + i, c + 32)
+        i = i + 1
+    r
+
+# Build Object.keys' output: own enumerable keys of an object/array/string
+fn own_keys(it: @&Interp, target: Value) -> Value
+    let arr = arr_new(it)
+    if target.tag == V_OBJECT
+        var p: i64 = vec_get<JsObject>(@it.objects, target.a).first
+        while p >= 0
+            let pr = vec_get<Prop>(@it.props, p)
+            var k: Value = v_undef()
+            if pr.in_src == 1
+                k = str_from_sv(it, strview_from_ptr(it.src + pr.key, pr.key_len))
+            else
+                k = v_str(pr.key, pr.key_len)
+            arr_append(it, arr.a, k)
+            p = pr.next
+    else if target.tag == V_ARRAY
+        var i: i64 = 0
+        while i < arr_len(it, target.a)
+            arr_append(it, arr.a, to_string(it, v_num(i as f64)))
+            i = i + 1
+    else if target.tag == V_STRING
+        var i: i64 = 0
+        while i < target.b
+            arr_append(it, arr.a, to_string(it, v_num(i as f64)))
+            i = i + 1
+    arr
+
+fn own_values(it: @&Interp, target: Value) -> Value
+    let arr = arr_new(it)
+    if target.tag == V_OBJECT
+        var p: i64 = vec_get<JsObject>(@it.objects, target.a).first
+        while p >= 0
+            let pr = vec_get<Prop>(@it.props, p)
+            arr_append(it, arr.a, pr.value)
+            p = pr.next
+    else if target.tag == V_ARRAY
+        var i: i64 = 0
+        while i < arr_len(it, target.a)
+            arr_append(it, arr.a, arr_get(it, target.a, i))
+            i = i + 1
+    else if target.tag == V_STRING
+        var i: i64 = 0
+        while i < target.b
+            arr_append(it, arr.a, arena_copy(it, target.a + i, 1))
+            i = i + 1
+    arr
+
+fn own_entries(it: @&Interp, target: Value) -> Value
+    let keys = own_keys(it, target)
+    let vals = own_values(it, target)
+    let out = arr_new(it)
+    var i: i64 = 0
+    while i < arr_len(it, keys.a)
+        let pair = arr_new(it)
+        arr_append(it, pair.a, arr_get(it, keys.a, i))
+        arr_append(it, pair.a, arr_get(it, vals.a, i))
+        arr_append(it, out.a, pair)
+        i = i + 1
+    out
+
+# Shallow-copy own enumerable properties of `src` onto `dst`
+fn assign_into(it: @&Interp, dst: Value, src: Value)
+    if src.tag == V_OBJECT and dst.tag == V_OBJECT
+        var p: i64 = vec_get<JsObject>(@it.objects, src.a).first
+        while p >= 0
+            let pr = vec_get<Prop>(@it.props, p)
+            prop_set(it, dst.a, pr.in_src, pr.key, pr.key_len, pr.value)
+            p = pr.next
+    else if src.tag == V_ARRAY and dst.tag == V_ARRAY
+        var i: i64 = 0
+        while i < arr_len(it, src.a)
+            arr_set_index(it, dst.a, i, arr_get(it, src.a, i))
+            i = i + 1
 
 # console.log's rendering: strings raw at the top level, quoted inside
 # objects; functions as [Function: name]; objects as { k: v } to depth 2
@@ -1337,8 +1815,9 @@ fn get_property(it: @&Interp, obj: Value, key: Key) -> Value
     if obj.tag == V_ARRAY
         return array_get(it, obj.a, key)
     if obj.tag == V_STRING
-        if strview_eq(name_view(it, key.in_src, key.start, key.len), "length")
-            return v_num(obj.b as f64)
+        return string_get(it, obj, key)
+    if obj.tag == V_NATIVE
+        return native_static(it, obj.a, key)
     v_undef()
 
 fn read_member(it: @&Interp, idx: i64) -> Value
@@ -1594,14 +2073,290 @@ fn console_print(it: @&Interp, native: i64, args: @Vec<Value>)
         return
     buf_push_sv(@&it.out, text)
 
+fn object_is(it: @&Interp, x: Value, y: Value) -> i32
+    if x.tag != y.tag
+        return 0
+    if x.tag == V_NUMBER
+        if x.num != x.num and y.num != y.num
+            return 1
+        if x.num == 0.0 and y.num == 0.0
+            if is_neg_zero(x.num) == is_neg_zero(y.num)
+                return 1
+            return 0
+        if x.num == y.num
+            return 1
+        return 0
+    strict_equals(it, x, y)
+
+# Dispatch of every native callable: console, array methods, the String /
+# Number / Object / Boolean globals and their statics, Math, and the
+# String.prototype methods (whose receiver is in f.num/f.b, see v_str_method).
+fn call_native(it: @&Interp, f: Value, args: @Vec<Value>) -> Value
+    let id = f.a
+    if id == NATIVE_CONSOLE_LOG or id == NATIVE_CONSOLE_ERROR
+        console_print(it, id, args)
+        return v_undef()
+    if id == NATIVE_ARRAY_PUSH
+        return arr_push_values(it, f.b, args)
+    if id == NATIVE_ARRAY_POP
+        return arr_pop_value(it, f.b)
+
+    # --- callable globals -------------------------------------------------
+    if id == NATIVE_STRING_CALL
+        if vec_len<Value>(args) == 0
+            return str_from_sv(it, "")
+        return to_string(it, nth_arg(args, 0))
+    if id == NATIVE_NUMBER_CALL
+        if vec_len<Value>(args) == 0
+            return v_num(0.0)
+        return v_num(to_number(it, nth_arg(args, 0)))
+    if id == NATIVE_BOOLEAN_CALL
+        return v_bool(to_boolean(it, nth_arg(args, 0)))
+    if id == NATIVE_OBJECT_CALL
+        let v = nth_arg(args, 0)
+        if v.tag == V_UNDEFINED or v.tag == V_NULL
+            return obj_new(it)
+        return v
+
+    # --- Math -------------------------------------------------------------
+    if id == NATIVE_MATH_ABS
+        return v_num(f64_abs(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_FLOOR
+        return v_num(f64_floor(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_CEIL
+        return v_num(f64_ceil(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_ROUND
+        return v_num(f64_round(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_TRUNC
+        return v_num(f64_trunc(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_SIGN
+        return v_num(f64_sign(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_MIN or id == NATIVE_MATH_MAX
+        var r: f64 = 0.0 - f64_inf()
+        if id == NATIVE_MATH_MIN
+            r = f64_inf()
+        let n = vec_len<Value>(args)
+        var i: i64 = 0
+        while i < n
+            let x = to_number(it, vec_get<Value>(args, i))
+            if x != x
+                return v_num(x)
+            if id == NATIVE_MATH_MIN
+                if x < r or (x == 0.0 and r == 0.0 and is_neg_zero(x) == 1)
+                    r = x
+            else
+                if x > r or (x == 0.0 and r == 0.0 and is_neg_zero(x) == 0)
+                    r = x
+            i = i + 1
+        return v_num(r)
+    if id == NATIVE_MATH_POW
+        return v_num(f64_pow(to_number(it, nth_arg(args, 0)), to_number(it, nth_arg(args, 1))))
+    if id == NATIVE_MATH_SQRT
+        return v_num(f64_sqrt(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_CBRT
+        return v_num(f64_cbrt(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_LOG
+        return v_num(f64_log(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_LOG2
+        return v_num(f64_log2(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_LOG10
+        return v_num(f64_log10(to_number(it, nth_arg(args, 0))))
+    if id == NATIVE_MATH_EXP
+        return v_num(f64_exp(to_number(it, nth_arg(args, 0))))
+
+    # --- Number statics ---------------------------------------------------
+    if id == NATIVE_NUMBER_IS_INTEGER
+        let v = nth_arg(args, 0)
+        if v.tag == V_NUMBER and f64_is_finite(v.num) == 1 and v.num == f64_trunc(v.num)
+            return v_bool(1)
+        return v_bool(0)
+    if id == NATIVE_NUMBER_IS_NAN
+        let v = nth_arg(args, 0)
+        if v.tag == V_NUMBER and v.num != v.num
+            return v_bool(1)
+        return v_bool(0)
+    if id == NATIVE_NUMBER_IS_FINITE
+        let v = nth_arg(args, 0)
+        if v.tag == V_NUMBER and f64_is_finite(v.num) == 1
+            return v_bool(1)
+        return v_bool(0)
+    if id == NATIVE_NUMBER_IS_SAFE_INTEGER
+        let v = nth_arg(args, 0)
+        if v.tag == V_NUMBER and f64_is_finite(v.num) == 1 and v.num == f64_trunc(v.num)
+            if f64_abs(v.num) <= 9007199254740991.0
+                return v_bool(1)
+        return v_bool(0)
+
+    # --- Object statics ---------------------------------------------------
+    if id == NATIVE_OBJECT_KEYS or id == NATIVE_OBJECT_VALUES or id == NATIVE_OBJECT_ENTRIES
+        let v = nth_arg(args, 0)
+        if v.tag == V_UNDEFINED or v.tag == V_NULL
+            throw_error(it, "TypeError", "Cannot convert undefined or null to object", "")
+            return v_undef()
+        if id == NATIVE_OBJECT_KEYS
+            return own_keys(it, v)
+        if id == NATIVE_OBJECT_VALUES
+            return own_values(it, v)
+        return own_entries(it, v)
+    if id == NATIVE_OBJECT_ASSIGN
+        let target = nth_arg(args, 0)
+        let n = vec_len<Value>(args)
+        var i: i64 = 1
+        while i < n
+            assign_into(it, target, vec_get<Value>(args, i))
+            i = i + 1
+        return target
+    if id == NATIVE_OBJECT_IS
+        return v_bool(object_is(it, nth_arg(args, 0), nth_arg(args, 1)))
+    if id == NATIVE_OBJECT_FREEZE
+        let v = nth_arg(args, 0)
+        if v.tag == V_OBJECT
+            let op = vec_get_ptr<JsObject>(@&it.objects, v.a)
+            op.frozen = 1
+        return v
+    if id == NATIVE_OBJECT_IS_FROZEN
+        let v = nth_arg(args, 0)
+        if v.tag == V_OBJECT
+            return v_bool(vec_get<JsObject>(@it.objects, v.a).frozen)
+        if v.tag == V_ARRAY
+            return v_bool(0)
+        return v_bool(1)
+
+    # --- String.prototype (receiver is s = arena[start..start+len]) --------
+    if id >= NATIVE_STR_CHAR_AT
+        let s = v_str(f.num as i64, f.b)
+        if id == NATIVE_STR_CHAR_AT
+            let i = to_int_or_inf(it, nth_arg(args, 0))
+            if i < 0.0 or i >= s.b as f64
+                return str_from_sv(it, "")
+            return arena_copy(it, s.a + (i as i64), 1)
+        if id == NATIVE_STR_CHAR_CODE_AT
+            let i = to_int_or_inf(it, nth_arg(args, 0))
+            if i < 0.0 or i >= s.b as f64
+                return v_num(f64_nan())
+            return v_num(vec_get<u8>(@it.arena, s.a + (i as i64)) as f64)
+        if id == NATIVE_STR_INDEX_OF
+            let needle = to_string(it, nth_arg(args, 0))
+            let from = to_int_or_inf(it, nth_arg(args, 1))
+            return v_num(str_find(it, s, needle, from) as f64)
+        if id == NATIVE_STR_INCLUDES
+            let needle = to_string(it, nth_arg(args, 0))
+            let from = to_int_or_inf(it, nth_arg(args, 1))
+            let at = str_find(it, s, needle, from)
+            if at == -1
+                return v_bool(0)
+            return v_bool(1)
+        if id == NATIVE_STR_STARTS_WITH
+            let needle = to_string(it, nth_arg(args, 0))
+            var pos: f64 = to_int_or_inf(it, nth_arg(args, 1))
+            if pos < 0.0
+                pos = 0.0
+            if pos > s.b as f64
+                pos = s.b as f64
+            let p = pos as i64
+            if needle.b > s.b - p
+                return v_bool(0)
+            return v_bool(str_equal_at(it, s, p, needle))
+        if id == NATIVE_STR_ENDS_WITH
+            let needle = to_string(it, nth_arg(args, 0))
+            var end: f64 = s.b as f64
+            if vec_len<Value>(args) > 1
+                end = to_int_or_inf(it, nth_arg(args, 1))
+            if end < 0.0
+                end = 0.0
+            if end > s.b as f64
+                end = s.b as f64
+            let e = end as i64
+            if needle.b > e
+                return v_bool(0)
+            return v_bool(str_equal_at(it, s, e - needle.b, needle))
+        if id == NATIVE_STR_SLICE
+            let from = to_int_or_inf(it, nth_arg(args, 0))
+            var to: f64 = s.b as f64
+            if vec_len<Value>(args) > 1
+                to = to_int_or_inf(it, nth_arg(args, 1))
+            return str_slice_rel(it, s, from, to)
+        if id == NATIVE_STR_SUBSTRING
+            var a: f64 = to_int_or_inf(it, nth_arg(args, 0))
+            var b: f64 = s.b as f64
+            if vec_len<Value>(args) > 1
+                b = to_int_or_inf(it, nth_arg(args, 1))
+            if a < 0.0
+                a = 0.0
+            if b < 0.0
+                b = 0.0
+            if a > s.b as f64
+                a = s.b as f64
+            if b > s.b as f64
+                b = s.b as f64
+            if a > b
+                let t = a
+                a = b
+                b = t
+            return arena_copy(it, s.a + (a as i64), (b as i64) - (a as i64))
+        if id == NATIVE_STR_TO_UPPER
+            return str_change_case(it, s, 1)
+        if id == NATIVE_STR_TO_LOWER
+            return str_change_case(it, s, 0)
+        if id == NATIVE_STR_TRIM
+            var a: i64 = 0
+            var b: i64 = s.b
+            while a < b and is_space(vec_get<u8>(@it.arena, s.a + a)) == 1
+                a = a + 1
+            while b > a and is_space(vec_get<u8>(@it.arena, s.a + b - 1)) == 1
+                b = b - 1
+            return arena_copy(it, s.a + a, b - a)
+        if id == NATIVE_STR_REPEAT
+            let nf = to_int_or_inf(it, nth_arg(args, 0))
+            if nf < 0.0 or nf > MAX_REPEAT_LEN as f64
+                throw_error(it, "RangeError", "Invalid count value", "")
+                return v_undef()
+            let n = nf as i64
+            if s.b == 0 or n == 0
+                return str_from_sv(it, "")
+            if n * s.b > MAX_REPEAT_LEN
+                throw_error(it, "RangeError", "Invalid string length", "")
+                return v_undef()
+            let start = vec_len<u8>(@it.arena)
+            var k: i64 = 0
+            while k < n
+                var j: i64 = 0
+                while j < s.b
+                    vec_push<u8>(@&it.arena, vec_get<u8>(@it.arena, s.a + j))
+                    j = j + 1
+                k = k + 1
+            return v_str(start, n * s.b)
+        if id == NATIVE_STR_CONCAT
+            # Build in a temp buffer: to_string/formatting must not allocate
+            # in the arena inside the slice the result will name.
+            var tmp = vec_new<u8>()
+            push_to_string(it, @&tmp, s)
+            var i: i64 = 0
+            while i < vec_len<Value>(args)
+                push_to_string(it, @&tmp, vec_get<Value>(args, i))
+                i = i + 1
+            let start = vec_len<u8>(@it.arena)
+            var j: i64 = 0
+            let n = vec_len<u8>(@tmp)
+            while j < n
+                vec_push<u8>(@&it.arena, vec_get<u8>(@tmp, j))
+                j = j + 1
+            vec_drop<u8>(@&tmp)
+            return v_str(start, n)
+    v_undef()
+
+# 1 if `needle` occurs in `hay` starting exactly at `at`
+fn str_equal_at(it: @&Interp, hay: Value, at: i64, needle: Value) -> i32
+    var i: i64 = 0
+    while i < needle.b
+        if vec_get<u8>(@it.arena, hay.a + at + i) != vec_get<u8>(@it.arena, needle.a + i)
+            return 0
+        i = i + 1
+    1
+
 fn call_function(it: @&Interp, f: Value, args: @Vec<Value>, callee: i64) -> Value
     if f.tag == V_NATIVE
-        if f.a == NATIVE_ARRAY_PUSH
-            return arr_push_values(it, f.b, args)
-        if f.a == NATIVE_ARRAY_POP
-            return arr_pop_value(it, f.b)
-        console_print(it, f.a, args)
-        return v_undef()
+        return call_native(it, f, args)
     if f.tag != V_FUNCTION
         throw_error(it, "TypeError", node_text(it, callee), " is not a function")
         return v_undef()
@@ -1999,6 +2754,39 @@ fn run_program(it: @&Interp)
     declare_builtin(it, "console", console)
     declare_builtin(it, "NaN", v_num(f64_nan()))
     declare_builtin(it, "Infinity", v_num(f64_inf()))
+
+    # Math is an ordinary object whose properties are native functions
+    let math = obj_new(it)
+    prop_set_sv(it, math.a, "PI", v_num(3.141592653589793))
+    prop_set_sv(it, math.a, "E", v_num(2.718281828459045))
+    prop_set_sv(it, math.a, "SQRT2", v_num(1.4142135623730951))
+    prop_set_sv(it, math.a, "SQRT1_2", v_num(0.7071067811865476))
+    prop_set_sv(it, math.a, "LN2", v_num(0.6931471805599453))
+    prop_set_sv(it, math.a, "LN10", v_num(2.302585092994046))
+    prop_set_sv(it, math.a, "LOG2E", v_num(1.4426950408889634))
+    prop_set_sv(it, math.a, "LOG10E", v_num(0.4342944819032518))
+    prop_set_sv(it, math.a, "abs", v_tagged(V_NATIVE, NATIVE_MATH_ABS))
+    prop_set_sv(it, math.a, "floor", v_tagged(V_NATIVE, NATIVE_MATH_FLOOR))
+    prop_set_sv(it, math.a, "ceil", v_tagged(V_NATIVE, NATIVE_MATH_CEIL))
+    prop_set_sv(it, math.a, "round", v_tagged(V_NATIVE, NATIVE_MATH_ROUND))
+    prop_set_sv(it, math.a, "trunc", v_tagged(V_NATIVE, NATIVE_MATH_TRUNC))
+    prop_set_sv(it, math.a, "sign", v_tagged(V_NATIVE, NATIVE_MATH_SIGN))
+    prop_set_sv(it, math.a, "min", v_tagged(V_NATIVE, NATIVE_MATH_MIN))
+    prop_set_sv(it, math.a, "max", v_tagged(V_NATIVE, NATIVE_MATH_MAX))
+    prop_set_sv(it, math.a, "pow", v_tagged(V_NATIVE, NATIVE_MATH_POW))
+    prop_set_sv(it, math.a, "sqrt", v_tagged(V_NATIVE, NATIVE_MATH_SQRT))
+    prop_set_sv(it, math.a, "cbrt", v_tagged(V_NATIVE, NATIVE_MATH_CBRT))
+    prop_set_sv(it, math.a, "log", v_tagged(V_NATIVE, NATIVE_MATH_LOG))
+    prop_set_sv(it, math.a, "log2", v_tagged(V_NATIVE, NATIVE_MATH_LOG2))
+    prop_set_sv(it, math.a, "log10", v_tagged(V_NATIVE, NATIVE_MATH_LOG10))
+    prop_set_sv(it, math.a, "exp", v_tagged(V_NATIVE, NATIVE_MATH_EXP))
+    declare_builtin(it, "Math", math)
+
+    # String / Number / Object / Boolean are functions (typeof "function")
+    declare_builtin(it, "String", v_tagged(V_NATIVE, NATIVE_STRING_CALL))
+    declare_builtin(it, "Number", v_tagged(V_NATIVE, NATIVE_NUMBER_CALL))
+    declare_builtin(it, "Boolean", v_tagged(V_NATIVE, NATIVE_BOOLEAN_CALL))
+    declare_builtin(it, "Object", v_tagged(V_NATIVE, NATIVE_OBJECT_CALL))
 
     let root = node_at(it, parser_root(@it.parser))
     exec_list(it, root.children_start, root.children_count)
