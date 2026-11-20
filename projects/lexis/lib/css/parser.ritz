@@ -361,6 +361,10 @@ fn parse_declaration(p:& CssParser) -> Declaration
 
     # Colon
     if p.current.kind != CSS_TOKEN_COLON
+        # The property name was copied, but there is no value: leave
+        # property_len at 0 so parse_declaration_block drops this unit
+        # instead of storing a declaration with an uninitialised value.
+        decl.property_len = 0
         skip_invalid_declaration(p)
         return decl
     advance(p)
@@ -375,6 +379,41 @@ fn parse_declaration(p:& CssParser) -> Declaration
         decl.important = 1
 
     decl
+
+# Consume the components of a multi-component value after the first one.
+# CssValue has no component-list storage (AGAST #4400), so the extra
+# components are discarded rather than re-parsed as declarations. Stop before
+# an IDENT followed by ':' so a missing semicolon does not swallow the next
+# declaration (test_recover_missing_semicolon), and always stop at a value
+# terminator or '!important'.
+fn skip_extra_value_components(p:& CssParser)
+    loop
+        skip_whitespace(p)
+
+        if p.current.kind == CSS_TOKEN_EOF
+            break
+        if p.current.kind == CSS_TOKEN_SEMICOLON
+            break
+        if p.current.kind == CSS_TOKEN_CLOSE_CURLY
+            break
+        if p.current.kind == CSS_TOKEN_DELIM and p.current.delim == '!'
+            break
+
+        # Peek one token past an IDENT: IDENT ':' starts the next declaration.
+        if p.current.kind == CSS_TOKEN_IDENT
+            let save_t = p.tokenizer
+            let save_c = p.current
+            advance(p)
+            skip_whitespace(p)
+            var next_is_colon = 0
+            if p.current.kind == CSS_TOKEN_COLON
+                next_is_colon = 1
+            p.tokenizer = save_t
+            p.current = save_c
+            if next_is_colon == 1
+                break
+
+        advance(p)
 
 fn parse_value(p:& CssParser) -> CssValue
     skip_whitespace(p)
@@ -421,6 +460,9 @@ fn parse_value(p:& CssParser) -> CssValue
     else if p.current.kind == CSS_TOKEN_URL
         val = css_value_url(css_token_value_str(p.current))
         advance(p)
+
+    # Keep only the first component, but consume the rest of the value.
+    skip_extra_value_components(p)
 
     # Check for !important
     skip_whitespace(p)
