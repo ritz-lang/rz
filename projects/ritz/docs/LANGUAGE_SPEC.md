@@ -497,9 +497,10 @@ let x: i32 = 42
 print("{x:d}\n")
 ```
 
-A valid spec is parsed, but printing it lands with AGAST #202 (through
-`ritzlib.fmt`'s Display). Until then a placeholder with a spec is refused
-rather than printed without it:
+`?` prints (through `ritzlib.fmt`'s Debug, auto-derived for a struct with no
+impl; AGAST #202, #4381). Every other valid spec is still parsed but not
+printed, so a placeholder carrying one is refused rather than printed
+without it:
 
 ```ritz body expect-error="format spec `08x` is parsed but not printed until AGAST #202; drop `:08x` for now"
 let x: i32 = 42

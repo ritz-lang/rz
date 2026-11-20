@@ -9,6 +9,7 @@ import binder_check   # binder_call_refuse (AGAST #2407)
 import float_slot     # float_slot_unsigned (AGAST #2945, #4376)
 import emitter_expr
 import emitter_print
+import interp       # interp_lit_has_placeholder (AGAST #4381)
 import emitter_stmt   # the whole-array copy (AGAST #2287)
 import emitter_expr_access   # emit_whole_array_error (AGAST #2287)
 import emitter_expr_arith    # emit_nd_index_ptr (AGAST #3306)
@@ -3837,11 +3838,39 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
     if user_ctor != 0
         return user_ctor
     # print() / eprint() built-ins: the same lowering to fd 1 / fd 2 (#1641).
+    # println / eprintln take it too, but only for an interpolated literal
+    # (a plain one stays the ritzlib.io function that adds the newline).
     var print_fd: i64 = 0
+    var print_newline: i32 = 0
     if name_eq(e.func_name, e.func_name_len, c"print", 5) == 1
         print_fd = 1
     else if name_eq(e.func_name, e.func_name_len, c"eprint", 6) == 1
         print_fd = 2
+    else if name_eq(e.func_name, e.func_name_len, c"println", 7) == 1
+        print_fd = 1
+        print_newline = 1
+    else if name_eq(e.func_name, e.func_name_len, c"eprintln", 8) == 1
+        print_fd = 2
+        print_newline = 1
+    # Only an interpolated literal is lowered here; a plain one still
+    # resolves to whatever `println` names in this file, as ritz0 has it.
+    if print_newline == 1
+        if e.args == null or e.args.next != null or interp_lit_has_placeholder(e.args) == 0
+            print_fd = 0
+            print_newline = 0
+
+    # write(w, "...{x}...") / writeln: Display through the Writer the
+    # program named, not an implicit one (AGAST #4381, ritz0's #202). Only
+    # an interpolated literal is lowered here; a plain one is the ordinary
+    # StrView call. Checked before user fns, like print.
+    if name_eq(e.func_name, e.func_name_len, c"write", 5) == 1 or name_eq(e.func_name, e.func_name_len, c"writeln", 7) == 1
+        if e.args != null and e.args.next != null and e.args.next.next == null
+            let wlit: *Expr = e.args.next
+            if wlit.kind == EXPR_STRING_LIT and interp_lit_has_placeholder(wlit) == 1
+                var wnl: i32 = 0
+                if name_eq(e.func_name, e.func_name_len, c"writeln", 7) == 1
+                    wnl = 1
+                return emit_write_literal(s, wlit, e.args, wnl)
 
     # format_into(sink, "...") -- print's literal, appended to a buffer
     # through sink.push_bytes (AGAST #1824). emitter_print.ritz has it.
@@ -3857,7 +3886,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
             # verbatim, and rejected if it holds one (AGAST #1521, #1394).
             # emitter_print.ritz has the lowering.
             if arg.kind == EXPR_STRING_LIT or arg.kind == EXPR_CSTRING_LIT
-                return emit_print_literal(s, print_fd, arg)
+                return emit_print_literal(s, print_fd, arg, print_newline)
             else
                 # Non-literal: evaluate the expression and call syscall
                 let str_reg: i32 = emit_expr(s, arg)

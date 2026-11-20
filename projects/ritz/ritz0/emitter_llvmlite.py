@@ -8563,10 +8563,10 @@ class LLVMEmitter:
 
     def _refuse_format_specs(self, lit: rast.InterpString):
         """AGAST #201/#202: a placeholder's spec is parsed (and an unknown one
-        refused by the parser). `?` prints, through Debug. Every other spec
-        (width, radix, alignment) is still not printed, so refuse it rather
-        than print the value without it. ritz1 refuses every spec, `?`
-        included, until its Display/Debug port (AGAST #4381)."""
+        refused by the parser). `?` prints, through Debug; ritz1 gained the
+        same dispatch in AGAST #4381. Every other spec (width, radix,
+        alignment) is still not printed, so refuse it rather than print the
+        value without it."""
         for spec in lit.specs:
             if spec and spec != '?':
                 raise EmitError(interp_spec.not_printed_message(spec), lit.span)

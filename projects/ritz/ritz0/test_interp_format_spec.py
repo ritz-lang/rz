@@ -12,16 +12,17 @@ ritzlib/fmt/spec.ritz `fmt_spec_parse`'s grammar:
 with N decimal digits <= 4096. Any other spec is a compile error at the
 literal, the same text from all three compilers.
 
-Printing a spec is AGAST #202 (through ritzlib.fmt's Display). `?` now
-prints in ritz0 (Debug, auto-derived for a struct); every other spec is
-still parsed and refused at the emitter, so no program silently prints its
-value unformatted. ritz1 keeps refusing `?` until the parity follow-up.
+Printing a spec is AGAST #202 (through ritzlib.fmt's Display). `?` prints on
+every compiler since AGAST #4381 ported the dispatch to ritz1: Debug, with a
+struct's fields auto-derived when it has no impl. Every other spec is still
+parsed and refused at the emitter, so no program silently prints its value
+unformatted.
 
     INVALID      each unknown spec, refused with SPEC_MSG
     NOT_PRINTED  each remaining valid spec, refused with LATER_MSG (print,
                  eprint and format_into)
-    DEBUG_LATER  `?` in ritz1 / ritz1_selfhosted, refused with LATER_MSG;
-                 ritz0's `?` is covered by test_display_dispatch.py
+    test_debug_spec_prints_a_scalar
+                 `{x:?}` runs on ritz0, ritz1 and ritz1_selfhosted
     test_placeholders_without_a_spec_are_unchanged
                  `{x}`, a call, `{{x}}`, a struct literal and a char
                  literal holding `:` still print the same bytes
@@ -120,20 +121,19 @@ def test_a_valid_spec_is_refused_until_202(tmp_path, compiler, name):
     _assert_refused(compiler, tmp_path, f"later_{name}", _prog(line), LATER_MSG(spec))
 
 
-# ritz0 prints `?` (#202); ritz1's port is AGAST #4381. Until it lands the
-# refusal is pinned for the two Ritz-written compilers, so the divergence is
-# stated rather than silent (and this block is the reminder to delete).
-DEBUG_LATER = {
-    "debug": ('print(^"{x:?}")', "?"),
-    "debug_line": ('print(^"{x:?}\\n")', "?"),
-}
-
-
-@pytest.mark.parametrize("compiler", [c for c in COMPILERS if c != "ritz0"])
-@pytest.mark.parametrize("name", sorted(DEBUG_LATER))
-def test_debug_spec_is_refused_until_ritz1_parity(tmp_path, compiler, name):
-    line, spec = DEBUG_LATER[name]
-    _assert_refused(compiler, tmp_path, f"later_{name}", _prog(line), LATER_MSG(spec))
+# `?` prints on every compiler since AGAST #4381 ported ritz1's Display/Debug
+# dispatch. A scalar's Debug is its intrinsic form, so no Writer is needed.
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_debug_spec_prints_a_scalar(tmp_path, compiler):
+    comp, ll, work = _compile(compiler, tmp_path, "debug_scalar",
+                              _prog('print("{x:?}\\n")'))
+    assert comp.returncode == 0 and ll.exists(), (
+        f"{compiler} refused:\n{comp.stdout}{comp.stderr}")
+    link, exe = _link(compiler, ll, work)
+    assert link.returncode == 0, link.stderr[-2000:]
+    run = subprocess.run([str(exe)], capture_output=True, timeout=60)
+    assert run.returncode == 0
+    assert run.stdout == b"42\n", f"{compiler}: {run.stdout!r}"
 
 
 UNCHANGED = SINK + """\

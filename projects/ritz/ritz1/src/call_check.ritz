@@ -59,6 +59,7 @@ import ast
 import types
 import diag          # the error prefix (AGAST #3445)
 import ast_helpers
+import interp        # interp_lit_has_placeholder (AGAST #4381)
 import main_abi      # main_abi_call_msg (AGAST #4198)
 import emitter_core  # name_eq, eprint_bytes, mem_builtin_id, is_tagged_enum_type, ..
 import sema
@@ -648,6 +649,22 @@ fn cc_builtin(name: *u8, len: i32) -> i32
         return 1
     (mem_builtin_id(name, len) != 0) as i32
 
+# 1 for a println/eprintln/write/writeln call emit_expr_call lowers through
+# Display (AGAST #4381): the literal ritz0 reads as an InterpString, in the
+# position the special case names. Anything else is the ordinary function.
+fn cc_interp_literal_call(e: *Expr) -> i32
+    let n: *u8 = e.func_name
+    let l: i32 = e.func_name_len
+    if name_eq(n, l, c"println", 7) == 1 or name_eq(n, l, c"eprintln", 8) == 1
+        if e.args != null and e.args.next == null
+            return interp_lit_has_placeholder(e.args)
+        return 0
+    if name_eq(n, l, c"write", 5) == 1 or name_eq(n, l, c"writeln", 7) == 1
+        if e.args != null and e.args.next != null and e.args.next.next == null
+            return interp_lit_has_placeholder(e.args.next)
+        return 0
+    0
+
 # 1 for a call that builds an enum variant, which emit_expr_call lowers
 # before it looks for a fn: `Some` / `Ok` / `None` / `Err`, a user enum's
 # unit or one-payload variant (AGAST #1797, #1610), a name two enums declare
@@ -740,7 +757,7 @@ pub fn call_check_call(sm: *Sema, e: *Expr)
         return
     if cc_variant_ctor(sm, e) == 1
         return
-    if cc_builtin(e.func_name, e.func_name_len) == 1
+    if cc_builtin(e.func_name, e.func_name_len) == 1 or cc_interp_literal_call(e) == 1
         cc_print_arg(sm, e)
         return
     var full_len: i32 = 0
