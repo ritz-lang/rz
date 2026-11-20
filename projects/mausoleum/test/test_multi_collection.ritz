@@ -224,6 +224,19 @@ fn insert_tagged(client: *Client, count: i32, tag: i64) -> i32
         i += 1
     return 0
 
+# Insert one document {"slug": value}; its document id, or < 0.
+fn insert_slugged(client: *Client, value: StrView) -> i64
+    var buf: [256]u8
+    var doc: Document
+    var tmp: DocumentId = doc_id_invalid()
+    doc_init(@doc, @tmp)
+    var f: Field = field_string(value.ptr, value.len)
+    doc_set_field(@doc, "slug", @f)
+    let size: i64 = doc_serialize(@doc, @buf[0], 256)
+    if size < 0
+        return -1
+    return client_insert(client, @buf[0], size as i32)
+
 struct ScanTally
     tag: i64
     docs: i32
@@ -316,6 +329,108 @@ fn check_after_restart(srv: *TestServer) -> i32
         rc = 23
     close_client(a)
     close_client(b)
+    return rc
+
+# ============================================================================
+# Secondary field index on the --serial loop (AGAST #4417)
+# ============================================================================
+#
+# #3644 taught the async loop INDEX_CREATE / FIND but left the serial loops
+# answering PROTO_ERR_INVALID_MSG_TYPE, so a --serial client (Spire's scan
+# fallback) never got an index.  The serial loop serves one connection at a
+# time, so the creating client is closed before the finder dials: the index
+# lives on the collection, and the second client must see the first one's
+# documents.  It must also land on the collection CONNECT selected, not the
+# default one.
+
+fn check_serial_field_index(srv: *TestServer) -> i32
+    let a: *Client = connect_to(srv, c"a", 1)
+    if a == null
+        return 1
+    var rc: i32 = 0
+    if client_index_create(a, c"slug", 4) != 0
+        rc = 2
+    var id1: i64 = -1
+    var id2: i64 = -1
+    if rc == 0
+        id1 = insert_slugged(a, "twice")
+        if id1 < 0
+            rc = 3
+    if rc == 0
+        id2 = insert_slugged(a, "twice")
+        if id2 < 0
+            rc = 4
+    if rc == 0 and insert_slugged(a, "only") < 0
+        rc = 5
+    close_client(a)
+    if rc != 0
+        return rc
+
+    # A second client on "a", after the first closed: it must find the
+    # documents under an index the first one created.
+    let b: *Client = connect_to(srv, c"a", 1)
+    if b == null
+        return 6
+    # Idempotent ensure, the shape a reconnecting client uses.
+    if client_index_create(b, c"slug", 4) != 0
+        rc = 7
+    var ids: [8]i64
+    if rc == 0
+        let n: i32 = client_find(b, c"slug", 4, c"twice", 5, @ids[0], 8)
+        if n != 2
+            rc = 8
+        else if ids[0] != id1 or ids[1] != id2
+            rc = 9
+    if rc == 0 and client_find(b, c"slug", 4, c"only", 4, @ids[0], 8) != 1
+        rc = 10
+    if rc == 0 and client_find(b, c"slug", 4, c"absent", 6, @ids[0], 8) != 0
+        rc = 11
+    # No index on another field: the client is told to scan instead.
+    if rc == 0 and client_find(b, c"title", 5, c"x", 1, @ids[0], 8) >= 0
+        rc = 12
+    if rc == 0 and client_last_error(b) != PROTO_ERR_NO_INDEX
+        rc = 13
+    # A delete removes exactly one copy from the index.
+    if rc == 0
+        if client_delete(b, id1) != 1
+            rc = 14
+        else if client_find(b, c"slug", 4, c"twice", 5, @ids[0], 8) != 1
+            rc = 15
+        else if ids[0] != id2
+            rc = 16
+    close_client(b)
+    if rc != 0
+        return rc
+
+    # The index landed on "a" — the collection CONNECT selected — so the
+    # default collection has none and says so.
+    let d: *Client = connect_to(srv, c"", 0)
+    if d == null
+        return 17
+    if client_find(d, c"slug", 4, c"twice", 5, @ids[0], 8) >= 0
+        rc = 18
+    else if client_last_error(d) != PROTO_ERR_NO_INDEX
+        rc = 19
+    close_client(d)
+    return rc
+
+[[test]]
+fn test_serial_loop_secondary_index() -> i32
+    var dir: [96]u8
+    make_dir_path(@dir[0], c"serial_index")
+    rm_dir_flat(@dir[0])
+    var srv: TestServer
+    srv.pid = 0
+    srv.port = 0
+    srv.dir = @dir[0]
+    srv.serial = 1
+    let started: i32 = server_start(@srv, 0)
+    if started != 0
+        rm_dir_flat(@dir[0])
+        return started
+    let rc: i32 = check_serial_field_index(@srv)
+    server_stop(@srv)
+    rm_dir_flat(@dir[0])
     return rc
 
 # ============================================================================

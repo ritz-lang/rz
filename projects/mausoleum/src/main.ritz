@@ -652,6 +652,12 @@ fn handle_encrypted_session(ch: *EncryptedChannel, pool: *BufferPool, storage: *
         else if msg_type == MSG_SCAN
             handle_scan(@reader, @resp, request_id, collection, -1, ch)
 
+        else if msg_type == MSG_INDEX_CREATE
+            handle_index_create(@reader, @resp, request_id, collection)
+
+        else if msg_type == MSG_FIND
+            handle_find(@reader, @resp, request_id, collection)
+
         else
             build_error(@resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
 
@@ -960,6 +966,64 @@ fn handle_scan(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, co
     build_scan_end(resp, request_id)
 
 # ============================================================================
+# Secondary field indexes on the --serial loops (AGAST #4417)
+# ============================================================================
+#
+# #3644 gave the async loop INDEX_CREATE / FIND; the serial loops answered
+# PROTO_ERR_INVALID_MSG_TYPE, so a --serial client (Spire falls back to a
+# scan) never got an index.  Payloads and answers mirror
+# server_async.ritz's branches.  Both loops pass the session's `collection`,
+# which CONNECT rewrites (serial_connect), so an index created after a
+# connect lands on the collection the client selected — not the default.
+#
+# Replies are built inline and sent by the caller's normal path (write_all
+# on the plain loop, channel_send on the encrypted one); FIND fits one
+# message, so no fd-streaming like handle_scan's is needed.
+
+# INDEX_CREATE — [field_len: i32][field][unique: i32]; `unique` reserved.
+# Idempotent; a new index is built from the documents already stored.
+fn handle_index_create(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    var field_len: i32 = 0
+    let field: *u8 = msgreader_read_bytes(reader, @field_len)
+    msgreader_read_i32(reader)      # reserved `unique` field
+    if field == null or field_len <= 0
+        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed index field")
+        return
+    let rc: i32 = collection_index_create(collection, field, field_len)
+    if rc == ERR_OK
+        build_index_created(resp, request_id)
+    else if rc == ERR_INVALID
+        build_error(resp, request_id, PROTO_ERR_INVALID_DOCUMENT, "Invalid index field")
+    else if rc == ERR_FULL
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Too many indexes")
+    else
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Failed to create index")
+
+# FIND — [field_len: i32][field][value_len: i32][value].
+# A field with no index answers PROTO_ERR_NO_INDEX, so the client falls
+# back to a scan rather than read the value as absent.
+fn handle_find(reader: *MessageReader, resp: *MessageBuffer, request_id: i32, collection: *Collection)
+    var field_len: i32 = 0
+    let field: *u8 = msgreader_read_bytes(reader, @field_len)
+    var value_len: i32 = 0
+    let value: *u8 = msgreader_read_bytes(reader, @value_len)
+    if field == null or field_len <= 0 or value_len < 0
+        build_error(resp, request_id, PROTO_ERR_PROTOCOL, "Malformed find")
+        return
+    let ids: *i64 = malloc(FIND_MAX_IDS as i64 * 8) as *i64
+    if ids == null
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
+        return
+    let rc: i32 = collection_index_find_string(collection, field, field_len, value, value_len, ids, FIND_MAX_IDS)
+    if rc == ERR_NOT_FOUND
+        build_error(resp, request_id, PROTO_ERR_NO_INDEX, "No index on field")
+    else if rc < 0
+        build_error(resp, request_id, PROTO_ERR_INTERNAL, "Find failed")
+    else
+        build_find_result(resp, request_id, ids, rc)
+    free(ids as *u8)
+
+# ============================================================================
 # Plain (Unencrypted) Server Loop - Development Mode
 # ============================================================================
 
@@ -1124,6 +1188,12 @@ fn handle_plain_session(fd: i32, pool: *BufferPool, storage: *Storage, reg: *Col
 
         else if msg_type == MSG_SCAN
             handle_scan(@reader, @resp, request_id, collection, fd, null)
+
+        else if msg_type == MSG_INDEX_CREATE
+            handle_index_create(@reader, @resp, request_id, collection)
+
+        else if msg_type == MSG_FIND
+            handle_find(@reader, @resp, request_id, collection)
 
         else
             build_error(@resp, request_id, PROTO_ERR_INVALID_MSG_TYPE, "Unknown message type")
