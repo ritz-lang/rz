@@ -253,8 +253,9 @@ trait Eq
 
 `Eq`'s method is `equals`, not `eq`: a type has one method per name, and
 `StrView` already has a by-value `s.eq(t)`. A primitive can implement either
-now, but only in the trait's file (LARB R36's revisit, #4294), and ritzlib
-doesn't yet, so there is no `HashMap<i64, V>`: use `HashMapI64`.
+now, but only in the trait's file (LARB R36's revisit, #4294). This file is
+that file, so it carries `impl Hash for i64` and `impl Eq for i64`, and
+`HashMap<i64, V>` is legal.
 
 ---
 
@@ -679,7 +680,9 @@ Hash maps using open addressing with linear probing: the generic
 
 **`HashMap<K, V>`** (AGAST #1858) keeps its slots in a `Vec`. `K` needs
 `Hash` and `Eq` from `ritzlib.hash`; a key type without them is an error at
-the type argument. `get` returns `Option<V>`, so a missing key is `None`.
+the type argument. `ritzlib.hash` provides both for `StrView` and `i64` (the
+latter only there, the trait's file, #4294). `get` returns `Option<V>`, so a
+missing key is `None`.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|

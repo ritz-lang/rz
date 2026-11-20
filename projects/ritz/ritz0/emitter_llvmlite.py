@@ -14498,9 +14498,18 @@ class LLVMEmitter:
                 type_name = self._get_struct_name_from_type(receiver_type)
                 # Also check for primitive integer types (for BitOps support)
                 if type_name is None and isinstance(receiver_type, ir.IntType):
-                    bits = receiver_type.width
-                    # Default to unsigned for BitOps (both signed/unsigned work the same)
-                    type_name = f'u{bits}'
+                    # An integer's LLVM type has no sign.  Prefer the source
+                    # type when inference names it — `e.key` on a specialised
+                    # HashMapEntry<K, V> is i64 only through its fields — or
+                    # `e.key.equals(key)` saw u64 and missed `impl Eq for i64`
+                    # (AGAST #1858).  Unsigned is the BitOps default: both
+                    # signednesses work the same there.
+                    inferred = self._infer_ritz_type(expr.expr)
+                    if (isinstance(inferred, rast.NamedType) and not inferred.args
+                            and inferred.name in PRIMITIVES):
+                        type_name = inferred.name
+                    else:
+                        type_name = f'u{receiver_type.width}'
                 # Float primitive methods on expression receivers (ceil/floor/round/abs)
                 if type_name is None and self._is_float_type(receiver_type):
                     float_result = self._try_emit_float_intrinsic(expr, receiver_probe)
