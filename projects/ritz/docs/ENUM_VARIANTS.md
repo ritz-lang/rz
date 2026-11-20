@@ -290,8 +290,8 @@ gated on closing part of that gap.
 | Single-field tuple variants | yes | yes; user enums construct (`Holds(x)`, unqualified) and bind them since #1797 |
 | Multi-field tuple variants | parser yes; **emitter miscompiled** (fixed, §3.3) | yes (#1295): every field constructed and bound at its ritz0 offset |
 | Struct variants | yes; named patterns and construction since #4187, qualified construction since #4275 | parsed and laid out (#1797); constructed and matched positionally (#1295) and by name, `V { a: 1 }` / `V { a } =>` (#4187), `E.V { a: 1 }` (#4275) |
-| Payload types retained by parser | yes | yes, in the enum tracker (#1797) |
-| Enum AST node | yes (`EnumDef`/`Variant`) | **none** — a global name side-table |
+| Payload types retained by parser | yes | yes, in each `EnumDef`'s variants (#1797, #3994) |
+| Enum AST node | yes (`EnumDef`/`Variant`) | yes (`EnumDef`/`EnumVariant`, `Module.enums`, #3994) |
 | Payload sizing | exact, per enum | Result/Option: exact, ritz0's `{ i8, [P x i8], [N x i8] }` from the mangled type arguments (#1898; a fixed `[144 x i8]` before). Non-generic user enums: the same ritz0 layout from the recorded variant fields (#1797); all-unit stays `{ i8 }` |
 | Payload load | per-field, typed | per-field at its offset in field 2 (#1295); scalars at their own width (#1898) |
 | Match bindings per pattern | N | N (#1295), names or `_`; no literals in fields |
@@ -324,8 +324,9 @@ How ritz1 does it (#1295): the grammar records every payload type
 selector*, `vi + k * VARIANT_FIELD_STRIDE`, names field k of variant vi to the
 payload helpers, which lay the field out with `variant_field_offset`, the same
 walk that sizes the enum. Passes written for the single `Some(v)` binding run
-once per binding through `arm_select_bind`. The enum itself still lives in the
-tracker side-table rather than an AST node.
+once per binding through `arm_select_bind`. The enum itself is an `EnumDef`
+node under `Module.enums` (#3994); the parser builds it and the import merge
+appends to it, so declaration order is the index order every accessor uses.
 
 ---
 

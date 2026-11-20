@@ -209,11 +209,11 @@ fn imports_option(m: *Module) -> i32
 # its source: ritz0 does the same (parser.py, _enum_from_fns).  Only for a
 # module that imports ritzlib.option; elsewhere `E.from` is a located error
 # (emit_expr_method).  Returns -1 on a lex/parse failure of the generated text.
-fn add_enum_from_fns(m: *Module, first_ei: i32, path: *u8) -> i32
+fn add_enum_from_fns(m: *Module, path: *u8) -> i32
     if imports_option(m) == 0
         return 0
     var gen_len: i64 = 0
-    let gen: *u8 = enum_from_source(first_ei, @gen_len)
+    let gen: *u8 = enum_from_source(m, @gen_len)
     if gen == null or gen_len == 0
         return 0
     var tokens: Vec<Token> = vec_with_cap<Token>(1024)
@@ -904,6 +904,18 @@ fn merge_module_into(m: *Module, other: *Module)
             last = last.next
         last.next = m.structs
         m.structs = other.structs
+    # AGAST #3994: append, not prepend.  Enum indices are positions in this
+    # chain and the tracker this replaced recorded enums in parse order
+    # (importer first, then its imports depth-first), so appending keeps
+    # every recorded index and the "first declared wins" lookups unchanged.
+    if other.enums != null
+        if m.enums == null
+            m.enums = other.enums
+        else
+            var last_e: *EnumDef = m.enums
+            while last_e.next != null
+                last_e = last_e.next
+            last_e.next = other.enums
     if other.functions != null
         var last: *FnDef = other.functions
         while last.next != null
@@ -1099,7 +1111,6 @@ fn load_and_parse(path: @&String) -> *Module
 
     # Name the file in parse diagnostics (AGAST #1301).
     parser_set_source_file(path_ptr)
-    let first_ei: i32 = enum_count()
     let mod: *Module = parse_tokens(@tokens)
     if mod == null
         err2("Parse error in: ", path_ptr)
@@ -1118,7 +1129,7 @@ fn load_and_parse(path: @&String) -> *Module
         if iface_text_store(src.data, src.len - 1, made.data, made.len) == 0
             dep_buf = made.data
             dep_len = made.len
-    if add_enum_from_fns(mod, first_ei, path_ptr) < 0
+    if add_enum_from_fns(mod, path_ptr) < 0
         return null
 
     dep_record_note(path_ptr, dep_buf, dep_len)
@@ -1505,14 +1516,13 @@ fn print_usage()
 fn parse_program(tokens: *Vec<Token>, input_path: *u8, source_dir: StrView, ritz_path: StrView) -> *Module
     # Parse
     parser_set_source_file(input_path)
-    let first_ei: i32 = enum_count()
     let decl_mark: i32 = type_decl_log_count()   # AGAST #3907
     let alias_mark: i32 = alias_use_count()
     let m: *Module = parse_tokens(tokens)
     vis_alias_uses_set(alias_mark, alias_use_count())
     if m == null
         return null
-    if add_enum_from_fns(m, first_ei, input_path) < 0
+    if add_enum_from_fns(m, input_path) < 0
         return null
     if lower_main(m, input_path) < 0
         return null
@@ -1654,7 +1664,7 @@ fn main(argc: i32, argv: **u8) -> i32
         array_len_seed(m.constants)
         vec_clear<String>(@&g_processed)
         dep_record_reset()
-        enum_tracker_reset()
+        enum_program_reset()
         tuple_regs_reset()   # AGAST #3030
         tn_notes_reset()     # AGAST #4021
         test_fns_reset()
@@ -1667,6 +1677,11 @@ fn main(argc: i32, argv: **u8) -> i32
         m = parse_program(@tokens, args.input_path, source_dir2, ritz_path2)
         if m == null
             return 1
+
+    # AGAST #3994: the program's enum nodes are the merged Module.enums; the
+    # accessors every later pass calls (sema, emitter, monomorph) index that
+    # root.  Set it before the first reader (named_variants_resolve).
+    enum_program_set(m)
 
     # `V { b, a } =>` and `V { a: 1, b: 2 }` -> their positional forms
     # (AGAST #4187), before any pass reads a pattern or a literal.

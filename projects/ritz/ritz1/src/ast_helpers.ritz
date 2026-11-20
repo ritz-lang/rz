@@ -61,6 +61,7 @@ pub fn module_new(p: *Parser) -> *Module
     m.imports = null
     m.constants = null
     m.structs = null
+    m.enums = null
     m.functions = null
     m.globals = null
     m.impls = null
@@ -300,7 +301,8 @@ pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
     return 1
 
 pub fn item_dispatch_enum(p: *Parser) -> i32
-    # enum has no AST node yet; just reset skip flag and report progress.
+    # The enum's EnumDef is already in p.module.enums (enum_def_header built
+    # it); just reset skip flag and report progress.
     p.skip_item = 0
     g_attr_bits = 0
     return 1
@@ -8409,10 +8411,8 @@ pub fn stmt_for_iter(p: *Parser, name: *u8, name_len: i32, iter: *Expr, body: *S
     return stmt_for(p, name, name_len, iter, null as *Expr, body, line, col)
 
 # enum_def : ENUM ... { skip-and-return-zero }
-# ritz1's AST has no enum node yet — variant constructors resolve via
-# call-site special-casing in the emitter (Some/Ok/None/Err) plus the
-# unit-tag fallback layout.  This action just signals "syntactically
-# valid, nothing to add to module".
+# Kept for grammar rules that record nothing (item_dispatch_enum does the
+# bookkeeping for a real enum_def, whose variants the enum_def actions build).
 pub fn enum_def_skip(p: *Parser) -> i32
     return 0
 
@@ -8421,144 +8421,144 @@ pub fn enum_def_skip(p: *Parser) -> i32
 pub fn enum_def_end(p: *Parser, is_pub: i32) -> i32
     tn_claim(p, g_tn_enum_params, null)   # AGAST #4021
     g_tn_enum_params = null
-    if g_enum_count > 0
-        *(g_enum_pub + g_enum_count - 1) = is_pub
+    let e: *EnumDef = enum_cur(p)
+    if e != null
+        e.is_pub = is_pub
     return 0
 
 # ============================================================================
-# Enum variant tracker (for qualified enum-variant lookup at codegen)
+# Enum declarations (AGAST #3994)
 # ============================================================================
-# When the parser sees `enum Shade ... Light ... Dark`, ritz1 doesn't build
-# a real enum AST node — but downstream code references like `Shade.Light`
-# still need to resolve to the variant's tag value (0 for Light, 1 for Dark).
-#
-# Track each enum's variants in parallel arrays:
-#   g_enum_names      → enum type names (e.g., "Shade")
-#   g_enum_variant_starts → index into g_enum_variant_names where this enum's
-#                           variants begin
-#   g_enum_variant_count  → how many variants this enum has
-#   g_enum_variant_names → flattened list of variant names across all enums
+# When the parser sees `enum Shade ... Light ... Dark` it builds an EnumDef
+# (ast.ritz) whose EnumVariant list holds Light then Dark.  Those nodes are
+# the file's Module.enums; g_program_enums roots the merged program list once
+# imports have resolved (main.ritz), so downstream references like
+# `Shade.Light` still resolve to the variant's tag value (0, 1, ...).
 #
 # Lookup: enum_variant_index(enum_name, variant_name) returns index or -1.
 
-# Initial capacities; both tables grow by doubling (AGAST #1813).  They used
-# to be hard limits: the 33rd enum was never registered and its variants were
-# appended to the 32nd, with exit 0.
-const ENUM_INIT_CAP: i32 = 32
-const ENUM_VARIANT_INIT_CAP: i32 = 256
-
-var g_enum_names: **u8 = null
-var g_enum_name_lens: *i32 = null
-var g_enum_variant_starts: *i32 = null
-var g_enum_variant_counts: *i32 = null
-var g_enum_count: i32 = 0
-
-var g_enum_variant_names: **u8 = null
-var g_enum_variant_name_lens: *i32 = null
-var g_enum_variant_total: i32 = 0
-
 # AGAST #1797: what each variant carries, so the emitter can give the enum
 # ritz0's payload layout instead of a bare `{ i8 }` tag.
-#   g_enum_generic[e]          1 for `enum Name<T>` (its payload types are
-#                              unsubstituted; Option/Result have their own
-#                              layout path, emitter_core tagged_enum_layout)
-#   g_enum_variant_fields[v]   payload fields in declaration order, null for
-#                              a unit variant
-#   g_enum_variant_kinds[v]    ENUM_VARIANT_UNIT / _TUPLE / _STRUCT
 pub const ENUM_VARIANT_UNIT: i32 = 0
 pub const ENUM_VARIANT_TUPLE: i32 = 1
 pub const ENUM_VARIANT_STRUCT: i32 = 2
 
-var g_enum_generic: *i32 = null
-var g_enum_variant_fields: **StructField = null
-var g_enum_variant_kinds: *i32 = null
+# The program's merged enum list: the Module.enums chain once parse_program
+# has resolved every import.  It points at the AST's own nodes (a root, not a
+# side table); `ei` in every accessor below indexes this chain in
+# declaration order.
+var g_program_enums: *EnumDef = null
 
-# AGAST #1880, LANGUAGE_SPEC §10.4:
-#   g_enum_repr[e]            the representation type (TYPE_U64, ...), 0 for
-#                             none
-#   g_enum_pub[e] / _line[e]  `pub enum`; the line of its name (where the
-#                             generated `from` source starts)
-#   g_enum_variant_discr[v]   the discriminant's bits: an explicit `= N`, else
-#                             the previous one + 1, the first 0
-#   g_enum_variant_neg[v]     1 when the discriminant's value is negative
-#                             (else the bits read as a u64)
-var g_enum_repr: *i32 = null
-var g_enum_pub: *i32 = null
-var g_enum_line: *i32 = null
-var g_enum_variant_discr: *i64 = null
-var g_enum_variant_neg: *i32 = null
+# Set the program's enum root from the module parse_program just resolved.
+pub fn enum_program_set(m: *Module)
+    g_program_enums = m.enums
 
-var g_enum_initialized: i32 = 0
-var g_enum_cap: i32 = 0
-var g_enum_variant_cap: i32 = 0
+# Forget the program's enum root.  The driver's alias re-parse (AGAST #1475)
+# parses every module a second time; the fresh Module carries the only enums
+# that matter, so the root is cleared until that re-parse finishes.
+pub fn enum_program_reset()
+    g_program_enums = null
 
-fn init_enum_tracker()
-    if g_enum_initialized == 1
-        return
-    g_enum_cap = ENUM_INIT_CAP
-    g_enum_variant_cap = ENUM_VARIANT_INIT_CAP
-    g_enum_names = malloc((g_enum_cap as i64) * 8) as **u8
-    g_enum_name_lens = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_variant_starts = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_variant_counts = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_variant_names = malloc((g_enum_variant_cap as i64) * 8) as **u8
-    g_enum_variant_name_lens = malloc((g_enum_variant_cap as i64) * 4) as *i32
-    g_enum_generic = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_variant_fields = malloc((g_enum_variant_cap as i64) * 8) as **StructField
-    g_enum_variant_kinds = malloc((g_enum_variant_cap as i64) * 4) as *i32
-    g_enum_repr = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_pub = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_line = malloc((g_enum_cap as i64) * 4) as *i32
-    g_enum_variant_discr = malloc((g_enum_variant_cap as i64) * 8) as *i64
-    g_enum_variant_neg = malloc((g_enum_variant_cap as i64) * 4) as *i32
-    g_enum_initialized = 1
-    g_enum_count = 0
-    g_enum_variant_total = 0
+# Append `e` to the EnumDef chain rooted at `head`.
+fn enum_list_append(head: *EnumDef, e: *EnumDef)
+    var cur: *EnumDef = head
+    while cur.next != null
+        cur = cur.next
+    cur.next = e
 
-# Forget every recorded enum.  The driver's alias re-parse (AGAST #1475)
-# parses every module a second time; without this each enum would be
-# recorded twice.
-pub fn enum_tracker_reset()
-    g_enum_count = 0
-    g_enum_variant_total = 0
+# The last EnumDef in a chain, or null.
+fn enum_list_tail(head: *EnumDef) -> *EnumDef
+    if head == null
+        return null
+    var cur: *EnumDef = head
+    while cur.next != null
+        cur = cur.next
+    cur
 
-fn enum_def_start_impl(name: *u8, len: i32, generic: i32) -> i32
-    return enum_def_start_full(name, len, generic, 0, 0)
+# The program's `ei`-th enum, or null.
+fn enum_node_at(ei: i32) -> *EnumDef
+    if ei < 0
+        return null
+    var cur: *EnumDef = g_program_enums
+    var i: i32 = 0
+    while cur != null and i < ei
+        cur = cur.next
+        i = i + 1
+    cur
 
-fn enum_def_start_full(name: *u8, len: i32, generic: i32, repr: i32, line: i32) -> i32
-    init_enum_tracker()
-    if g_enum_count >= g_enum_cap
-        let cap: i64 = (g_enum_cap as i64) * 2
-        g_enum_names = realloc(g_enum_names as *u8, cap * 8) as **u8
-        g_enum_name_lens = realloc(g_enum_name_lens as *u8, cap * 4) as *i32
-        g_enum_variant_starts = realloc(g_enum_variant_starts as *u8, cap * 4) as *i32
-        g_enum_variant_counts = realloc(g_enum_variant_counts as *u8, cap * 4) as *i32
-        g_enum_generic = realloc(g_enum_generic as *u8, cap * 4) as *i32
-        g_enum_repr = realloc(g_enum_repr as *u8, cap * 4) as *i32
-        g_enum_pub = realloc(g_enum_pub as *u8, cap * 4) as *i32
-        g_enum_line = realloc(g_enum_line as *u8, cap * 4) as *i32
-        g_enum_cap = cap as i32
-    *(g_enum_names + g_enum_count) = name
-    *(g_enum_name_lens + g_enum_count) = len
-    *(g_enum_variant_starts + g_enum_count) = g_enum_variant_total
-    *(g_enum_variant_counts + g_enum_count) = 0
-    *(g_enum_generic + g_enum_count) = generic
-    *(g_enum_repr + g_enum_count) = repr
-    *(g_enum_pub + g_enum_count) = 0
-    *(g_enum_line + g_enum_count) = line
-    g_enum_count = g_enum_count + 1
+# The `vi`-th variant of `e`, or null.
+fn enum_variant_at_node(e: *EnumDef, vi: i32) -> *EnumVariant
+    if e == null or vi < 0
+        return null
+    var v: *EnumVariant = e.variants
+    var i: i32 = 0
+    while v != null and i < vi
+        v = v.next
+        i = i + 1
+    v
+
+# The last variant of `e`, or null.
+fn enum_variant_tail(e: *EnumDef) -> *EnumVariant
+    if e == null
+        return null
+    var v: *EnumVariant = e.variants
+    if v == null
+        return null
+    while v.next != null
+        v = v.next
+    v
+
+# Count `e`'s variants.
+fn enum_variant_count_node(e: *EnumDef) -> i32
+    if e == null
+        return 0
+    var n: i32 = 0
+    var v: *EnumVariant = e.variants
+    while v != null
+        n = n + 1
+        v = v.next
+    n
+
+# The enum this file started last (the one its variants append to), or null.
+fn enum_cur(p: *Parser) -> *EnumDef
+    if p.module == null
+        return null
+    enum_list_tail(p.module.enums)
+
+# Allocate and append a new EnumDef to the module being parsed.
+fn enum_new(p: *Parser, name: *u8, len: i32, generic: i32, repr: i32, line: i32) -> *EnumDef
+    let e: *EnumDef = parser_alloc(p, sizeof(EnumDef)) as *EnumDef
+    e.name = name
+    e.name_len = len
+    e.generic = generic
+    e.repr = repr
+    e.is_pub = 0
+    e.line = line
+    e.variants = null
+    e.next = null
+    if p.module.enums == null
+        p.module.enums = e
+    else
+        enum_list_append(p.module.enums, e)
+    e
+
+fn enum_def_start_impl(p: *Parser, name: *u8, len: i32, generic: i32) -> i32
+    return enum_def_start_full(p, name, len, generic, 0, 0)
+
+fn enum_def_start_full(p: *Parser, name: *u8, len: i32, generic: i32, repr: i32, line: i32) -> i32
+    enum_new(p, name, len, generic, repr, line)
     if generic != ENUM_INSTANCE   # `Slot$i32` is declared by no file
         type_decl_log(name, len)   # AGAST #3907
     return 0
 
-# Called from grammar rule enum_def_header: starts a new enum-tracking entry.
+# Called from grammar rule enum_def_header: starts a new EnumDef.
 pub fn enum_def_start(p: *Parser, name: *u8, len: i32) -> i32
-    return enum_def_start_impl(name, len, 0)
+    return enum_def_start_impl(p, name, len, 0)
 
 # `enum Name<T>`: as enum_def_start, flagged generic (AGAST #1797).
 pub fn enum_def_start_generic(p: *Parser, name: *u8, len: i32, params: *TypeParam) -> i32
     g_tn_enum_params = params   # AGAST #4021: in scope in its payloads
-    return enum_def_start_impl(name, len, 1)
+    return enum_def_start_impl(p, name, len, 1)
 
 # `enum E: T` (LANGUAGE_SPEC §10.4): as enum_def_start, with representation
 # type T, which must be an integer type (a located error otherwise).
@@ -8572,7 +8572,7 @@ pub fn enum_def_start_repr(p: *Parser, name: *u8, len: i32, repr: i32, line: i32
             eprintln_cstr(c"' must be an integer type")
             g_attr_errors = g_attr_errors + 1
         r = TYPE_I64
-    return enum_def_start_full(name, len, 0, r, line)
+    return enum_def_start_full(p, name, len, 0, r, line)
 
 # Called from grammar rule enum_variant: appends a unit variant to the most
 # recent enum's variant list.
@@ -8681,17 +8681,20 @@ fn discr_fits(ty: i32, bits: i64, neg: i32) -> i32
     return 1
 
 # The checks of LANGUAGE_SPEC §10.4 on the variant just recorded (index `v`
-# of the current enum `ei`), each a located error at the variant's name.
+# of the current enum `e`), each a located error at the variant's name.
 # ritz0 enforces the same rules with the same text (parser.py,
 # _check_discriminants).
-fn enum_variant_check(p: *Parser, ei: i32, v: i32, kind: i32, explicit: i32, line: i32, col: i32)
+fn enum_variant_check(p: *Parser, e: *EnumDef, v: i32, kind: i32, explicit: i32, line: i32, col: i32)
     if p.skip_item != 0
         return
-    let repr: i32 = *(g_enum_repr + ei)
-    let ename: *u8 = *(g_enum_names + ei)
-    let elen: i32 = *(g_enum_name_lens + ei)
-    let vname: *u8 = *(g_enum_variant_names + v)
-    let vlen: i32 = *(g_enum_variant_name_lens + v)
+    let repr: i32 = e.repr
+    let ename: *u8 = e.name
+    let elen: i32 = e.name_len
+    let vnode: *EnumVariant = enum_variant_at_node(e, v)
+    if vnode == null
+        return
+    let vname: *u8 = vnode.name
+    let vlen: i32 = vnode.name_len
     if repr != 0 and kind != ENUM_VARIANT_UNIT
         diag_error_at(g_parse_file, diag_span(line, col))
         eprints_cstr(c"variant '")
@@ -8711,8 +8714,8 @@ fn enum_variant_check(p: *Parser, ei: i32, v: i32, kind: i32, explicit: i32, lin
             eprintln_cstr(c": <integer type>'")
             g_attr_errors = g_attr_errors + 1
         return
-    let bits: i64 = *(g_enum_variant_discr + v)
-    let neg: i32 = *(g_enum_variant_neg + v)
+    let bits: i64 = vnode.discr
+    let neg: i32 = vnode.discr_neg
     if discr_fits(repr, bits, neg) == 0
         diag_error_at(g_parse_file, diag_span(line, col))
         eprints_cstr(c"discriminant ")
@@ -8725,12 +8728,13 @@ fn enum_variant_check(p: *Parser, ei: i32, v: i32, kind: i32, explicit: i32, lin
         eprintln_cstr(primitive_name_from_type(repr))
         g_attr_errors = g_attr_errors + 1
         return
-    var w: i32 = *(g_enum_variant_starts + ei)
-    while w < v
-        if *(g_enum_variant_discr + w) == bits
+    var w: i32 = 0
+    var wv: *EnumVariant = e.variants
+    while wv != null and w < v
+        if wv.discr == bits
             diag_error_at(g_parse_file, diag_span(line, col))
             eprints_cstr(c"variants '")
-            eprint_lexeme(*(g_enum_variant_names + w), *(g_enum_variant_name_lens + w))
+            eprint_lexeme(wv.name, wv.name_len)
             eprints_cstr(c"' and '")
             eprint_lexeme(vname, vlen)
             eprints_cstr(c"' of enum '")
@@ -8740,102 +8744,66 @@ fn enum_variant_check(p: *Parser, ei: i32, v: i32, kind: i32, explicit: i32, lin
             eprintln_cstr(c"")
             g_attr_errors = g_attr_errors + 1
             return
+        wv = wv.next
         w = w + 1
 
 fn enum_variant_record_impl(p: *Parser, name: *u8, len: i32, kind: i32, fields: *StructField, explicit: i32, discr: i64, discr_neg: i32, line: i32, col: i32) -> i32
-    init_enum_tracker()
-    if g_enum_count == 0
+    let e: *EnumDef = enum_cur(p)
+    if e == null
         return 0
     # The same token again: `enum_variants : enum_variant enum_variants`
     # fails after the last variant and backtracks into `enum_variant`, which
     # runs this action a second time for it.  That used to record a phantom
     # copy of every enum's last variant (AGAST #1880 found it: the copy
     # shares its discriminant).
-    if *(g_enum_variant_counts + g_enum_count - 1) > 0
-        if *(g_enum_variant_names + g_enum_variant_total - 1) == name
-            return 0
-    if g_enum_variant_total >= g_enum_variant_cap
-        let vcap: i64 = (g_enum_variant_cap as i64) * 2
-        g_enum_variant_names = realloc(g_enum_variant_names as *u8, vcap * 8) as **u8
-        g_enum_variant_name_lens = realloc(g_enum_variant_name_lens as *u8, vcap * 4) as *i32
-        g_enum_variant_fields = realloc(g_enum_variant_fields as *u8, vcap * 8) as **StructField
-        g_enum_variant_kinds = realloc(g_enum_variant_kinds as *u8, vcap * 4) as *i32
-        g_enum_variant_discr = realloc(g_enum_variant_discr as *u8, vcap * 8) as *i64
-        g_enum_variant_neg = realloc(g_enum_variant_neg as *u8, vcap * 4) as *i32
-        g_enum_variant_cap = vcap as i32
-    *(g_enum_variant_names + g_enum_variant_total) = name
-    *(g_enum_variant_name_lens + g_enum_variant_total) = len
-    *(g_enum_variant_fields + g_enum_variant_total) = fields
-    *(g_enum_variant_kinds + g_enum_variant_total) = kind
+    let last: *EnumVariant = enum_variant_tail(e)
+    if last != null and last.name == name
+        return 0
     # The discriminant: explicit, else the previous variant's + 1, else 0.
-    let ei: i32 = g_enum_count - 1
     var bits: i64 = discr
     var neg: i32 = discr_neg
     if explicit == 0
         bits = 0
         neg = 0
-        if *(g_enum_variant_counts + ei) > 0
-            let prev: i32 = g_enum_variant_total - 1
-            bits = *(g_enum_variant_discr + prev) + 1
-            neg = *(g_enum_variant_neg + prev)
+        if last != null
+            bits = last.discr + 1
+            neg = last.discr_neg
             if neg == 1 and bits == 0
                 neg = 0
-    *(g_enum_variant_discr + g_enum_variant_total) = bits
-    *(g_enum_variant_neg + g_enum_variant_total) = neg
-    let v: i32 = g_enum_variant_total
-    g_enum_variant_total = g_enum_variant_total + 1
-    *(g_enum_variant_counts + ei) = *(g_enum_variant_counts + ei) + 1
-    enum_variant_check(p, ei, v, kind, explicit, line, col)
+    let vnode: *EnumVariant = parser_alloc(p, sizeof(EnumVariant)) as *EnumVariant
+    vnode.name = name
+    vnode.name_len = len
+    vnode.kind = kind
+    vnode.fields = fields
+    vnode.discr = bits
+    vnode.discr_neg = neg
+    vnode.next = null
+    if e.variants == null
+        e.variants = vnode
+    else
+        last.next = vnode
+    enum_variant_check(p, e, enum_variant_count_node(e) - 1, kind, explicit, line, col)
     return 0
 
 # Lookup: returns the variant's tag index (0-based) within an enum, or -1
 # when either the enum or the variant is unknown.
 pub fn enum_variant_index(enum_name: *u8, enum_name_len: i32, var_name: *u8, var_name_len: i32) -> i32
-    if g_enum_initialized == 0
+    let e: *EnumDef = enum_find_node(enum_name, enum_name_len)
+    if e == null
         return 0 - 1
-    var ei: i32 = 0
-    while ei < g_enum_count
-        if *(g_enum_name_lens + ei) == enum_name_len
-            var match_e: i32 = 1
-            for k in 0..enum_name_len
-                if *(*(g_enum_names + ei) + k) != *(enum_name + k)
-                    match_e = 0
-            if match_e == 1
-                let start: i32 = *(g_enum_variant_starts + ei)
-                for vi in 0..*(g_enum_variant_counts + ei)
-                    if *(g_enum_variant_name_lens + start + vi) == var_name_len
-                        var match_v: i32 = 1
-                        for k in 0..var_name_len
-                            if *(*(g_enum_variant_names + start + vi) + k) != *(var_name + k)
-                                match_v = 0
-                        if match_v == 1
-                            return vi
-                return 0 - 1
-        ei = ei + 1
-    return 0 - 1
+    enum_variant_slot_node(e, var_name, var_name_len)
 
 # Returns 1 if name is a known enum type, 0 otherwise.
 pub fn is_enum_type(name: *u8, len: i32) -> i32
-    if g_enum_initialized == 0
-        return 0
-    var ei: i32 = 0
-    while ei < g_enum_count
-        if *(g_enum_name_lens + ei) == len
-            var match_e: i32 = 1
-            for k in 0..len
-                if *(*(g_enum_names + ei) + k) != *(name + k)
-                    match_e = 0
-            if match_e == 1
-                return 1
-        ei = ei + 1
-    return 0
+    (enum_find_node(name, len) != null) as i32
 
 # --- AGAST #1797: enum / variant accessors for the emitter -----------------
 
-fn enum_name_eq(ei: i32, name: *u8, len: i32) -> i32
-    if *(g_enum_name_lens + ei) != len
+# 1 when `e`'s name is `name`.
+fn enum_name_eq(e: *EnumDef, name: *u8, len: i32) -> i32
+    if e == null or e.name_len != len
         return 0
-    let stored: *u8 = *(g_enum_names + ei)
+    let stored: *u8 = e.name
     for k in 0..len
         let sb: u8 = *(stored + k)
         let qb: u8 = *(name + k)
@@ -8843,29 +8811,50 @@ fn enum_name_eq(ei: i32, name: *u8, len: i32) -> i32
             return 0
     return 1
 
-# Tracker index of the enum `name`, or -1.  The first one recorded wins, as
-# in enum_variant_index.
+# The EnumDef named `name`, or null.  The first one recorded wins, as in
+# enum_variant_index.
+pub fn enum_find_node(name: *u8, len: i32) -> *EnumDef
+    var e: *EnumDef = g_program_enums
+    while e != null
+        if enum_name_eq(e, name, len) == 1
+            return e
+        e = e.next
+    null
+
+# Index of the enum `name`, or -1.  The first one recorded wins.
 pub fn enum_find(name: *u8, len: i32) -> i32
-    if g_enum_initialized == 0
-        return 0 - 1
+    var e: *EnumDef = g_program_enums
     var ei: i32 = 0
-    while ei < g_enum_count
-        if enum_name_eq(ei, name, len) == 1
+    while e != null
+        if enum_name_eq(e, name, len) == 1
             return ei
+        e = e.next
         ei = ei + 1
     return 0 - 1
 
 pub fn enum_count() -> i32
-    return g_enum_count
+    var n: i32 = 0
+    var e: *EnumDef = g_program_enums
+    while e != null
+        n = n + 1
+        e = e.next
+    n
 
 pub fn enum_name_at(ei: i32, out_len: *i32) -> *u8
-    *out_len = *(g_enum_name_lens + ei)
-    return *(g_enum_names + ei)
+    let e: *EnumDef = enum_node_at(ei)
+    if e == null
+        *out_len = 0
+        return null
+    *out_len = e.name_len
+    e.name
 
 pub fn enum_is_generic(ei: i32) -> i32
-    return *(g_enum_generic + ei)
+    let e: *EnumDef = enum_node_at(ei)
+    if e == null
+        return 0
+    e.generic
 
-# AGAST #2422: g_enum_generic[e] is ENUM_INSTANCE for `Slot$i32`, an instance of
+# AGAST #2422: EnumDef.generic is ENUM_INSTANCE for `Slot$i32`, an instance of
 # a generic enum that monomorph recorded (enum_record_instance).  It is a
 # concrete enum (enum_is_generic(e) != 1), with ritz0's layout, but no declarer
 # of its variants: the template `Slot` declares `Full`, however many instances.
@@ -8873,61 +8862,87 @@ pub const ENUM_INSTANCE: i32 = 2
 
 # Record `name` (`Slot$i32`) as an instance of generic enum `base`: its variants
 # in order, with their kinds and discriminants, variant `vi` carrying
-# *(fields + vi).  Returns its tracker index.
+# *(fields + vi).  Returns its index.
 pub fn enum_record_instance(base: i32, name: *u8, len: i32, fields: **StructField) -> i32
-    enum_def_start_full(name, len, ENUM_INSTANCE, 0, *(g_enum_line + base))
-    let ei: i32 = g_enum_count - 1
-    *(g_enum_pub + ei) = *(g_enum_pub + base)
-    let count: i32 = *(g_enum_variant_counts + base)
-    for vi in 0..count
-        if g_enum_variant_total >= g_enum_variant_cap
-            let vcap: i64 = (g_enum_variant_cap as i64) * 2
-            g_enum_variant_names = realloc(g_enum_variant_names as *u8, vcap * 8) as **u8
-            g_enum_variant_name_lens = realloc(g_enum_variant_name_lens as *u8, vcap * 4) as *i32
-            g_enum_variant_fields = realloc(g_enum_variant_fields as *u8, vcap * 8) as **StructField
-            g_enum_variant_kinds = realloc(g_enum_variant_kinds as *u8, vcap * 4) as *i32
-            g_enum_variant_discr = realloc(g_enum_variant_discr as *u8, vcap * 8) as *i64
-            g_enum_variant_neg = realloc(g_enum_variant_neg as *u8, vcap * 4) as *i32
-            g_enum_variant_cap = vcap as i32
-        let from: i32 = *(g_enum_variant_starts + base) + vi
-        let to: i32 = g_enum_variant_total
-        *(g_enum_variant_names + to) = *(g_enum_variant_names + from)
-        *(g_enum_variant_name_lens + to) = *(g_enum_variant_name_lens + from)
-        *(g_enum_variant_kinds + to) = *(g_enum_variant_kinds + from)
-        *(g_enum_variant_discr + to) = *(g_enum_variant_discr + from)
-        *(g_enum_variant_neg + to) = *(g_enum_variant_neg + from)
-        *(g_enum_variant_fields + to) = *(fields + vi)
-        g_enum_variant_total = g_enum_variant_total + 1
-        *(g_enum_variant_counts + ei) = *(g_enum_variant_counts + ei) + 1
-    ei
+    let be: *EnumDef = enum_node_at(base)
+    if be == null
+        return 0 - 1
+    let e: *EnumDef = malloc(sizeof(EnumDef)) as *EnumDef
+    e.name = name
+    e.name_len = len
+    e.generic = ENUM_INSTANCE
+    e.repr = 0
+    e.is_pub = be.is_pub
+    e.line = be.line
+    e.variants = null
+    e.next = null
+    if g_program_enums == null
+        g_program_enums = e
+    else
+        enum_list_append(g_program_enums, e)
+    var vi: i32 = 0
+    var bv: *EnumVariant = be.variants
+    var last: *EnumVariant = null
+    while bv != null
+        let vnode: *EnumVariant = malloc(sizeof(EnumVariant)) as *EnumVariant
+        vnode.name = bv.name
+        vnode.name_len = bv.name_len
+        vnode.kind = bv.kind
+        vnode.fields = *(fields + vi)
+        vnode.discr = bv.discr
+        vnode.discr_neg = bv.discr_neg
+        vnode.next = null
+        if last == null
+            e.variants = vnode
+        else
+            last.next = vnode
+        last = vnode
+        bv = bv.next
+        vi = vi + 1
+    enum_count() - 1
 
 pub fn enum_variant_count(ei: i32) -> i32
-    return *(g_enum_variant_counts + ei)
+    enum_variant_count_node(enum_node_at(ei))
 
 # Name of variant `vi` of enum `ei`.
 pub fn enum_variant_name(ei: i32, vi: i32, out_len: *i32) -> *u8
-    let at: i32 = *(g_enum_variant_starts + ei) + vi
-    *out_len = *(g_enum_variant_name_lens + at)
-    return *(g_enum_variant_names + at)
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+    if v == null
+        *out_len = 0
+        return null
+    *out_len = v.name_len
+    v.name
 
 # Kind (ENUM_VARIANT_*) and payload fields of variant `vi` of enum `ei`.
 pub fn enum_variant_kind(ei: i32, vi: i32) -> i32
-    return *(g_enum_variant_kinds + *(g_enum_variant_starts + ei) + vi)
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+    if v == null
+        return ENUM_VARIANT_UNIT
+    v.kind
 
 pub fn enum_variant_fields(ei: i32, vi: i32) -> *StructField
-    return *(g_enum_variant_fields + *(g_enum_variant_starts + ei) + vi)
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+    if v == null
+        return null
+    v.fields
 
 # LANGUAGE_SPEC §10.4: enum `ei`'s representation type (0: none) and the
 # discriminant bits of its variant `vi`.
 pub fn enum_repr(ei: i32) -> i32
-    return *(g_enum_repr + ei)
+    let e: *EnumDef = enum_node_at(ei)
+    if e == null
+        return 0
+    e.repr
 
 pub fn enum_variant_discr(ei: i32, vi: i32) -> i64
-    return *(g_enum_variant_discr + *(g_enum_variant_starts + ei) + vi)
+    let v: *EnumVariant = enum_variant_at_node(enum_node_at(ei), vi)
+    if v == null
+        return 0 as i64
+    v.discr
 
 # 1 when every variant's discriminant is its index (no `= N` moved one).
 pub fn enum_discr_is_index(ei: i32) -> i32
-    for vi in 0..*(g_enum_variant_counts + ei)
+    for vi in 0..enum_variant_count(ei)
         if enum_variant_discr(ei, vi) != vi as i64
             return 0
     return 1
@@ -9022,24 +9037,24 @@ fn gen_discr(bits: i64, neg: i32)
         i = i - 1
     free(digits)
 
-# Source of `from` for every enum with a representation type recorded at
-# tracker index >= first_ei (the module just parsed), or null if there is
-# none.  *out_len gets its length.  The buffer is the caller's to keep.
-pub fn enum_from_source(first_ei: i32, out_len: *i64) -> *u8
+# Source of `from` for every enum with a representation type in `m` (the
+# module just parsed), or null if there is none.  *out_len gets its length.
+# The buffer is the caller's to keep.
+pub fn enum_from_source(m: *Module, out_len: *i64) -> *u8
     g_gen_buf = null
     g_gen_len = 0
     g_gen_cap = 0
     var line: i32 = 1
-    var ei: i32 = first_ei
-    while ei < g_enum_count
-        let repr: i32 = *(g_enum_repr + ei)
-        if repr != 0 and *(g_enum_generic + ei) == 0
-            let ename: *u8 = *(g_enum_names + ei)
-            let elen: i64 = *(g_enum_name_lens + ei) as i64
-            while line < *(g_enum_line + ei)
+    var e: *EnumDef = m.enums
+    while e != null
+        let repr: i32 = e.repr
+        if repr != 0 and e.generic == 0
+            let ename: *u8 = e.name
+            let elen: i64 = e.name_len as i64
+            while line < e.line
                 gen_cstr(c"\n")
                 line = line + 1
-            if *(g_enum_pub + ei) == 1
+            if e.is_pub == 1
                 gen_cstr(c"pub ")
             gen_cstr(c"fn ")
             gen_push(ename, elen)
@@ -9049,33 +9064,34 @@ pub fn enum_from_source(first_ei: i32, out_len: *i64) -> *u8
             gen_push(ename, elen)
             gen_cstr(c">\n")
             line = line + 1
-            let start: i32 = *(g_enum_variant_starts + ei)
-            for vi in 0..*(g_enum_variant_counts + ei)
+            var v: *EnumVariant = e.variants
+            while v != null
                 gen_cstr(c"    if v == ")
-                gen_discr(*(g_enum_variant_discr + start + vi), *(g_enum_variant_neg + start + vi))
+                gen_discr(v.discr, v.discr_neg)
                 gen_cstr(c"\n        return Some(")
                 gen_push(ename, elen)
                 gen_cstr(c".")
-                gen_push(*(g_enum_variant_names + start + vi), *(g_enum_variant_name_lens + start + vi) as i64)
+                gen_push(v.name, v.name_len as i64)
                 gen_cstr(c")\n")
                 line = line + 2
+                v = v.next
             gen_cstr(c"    return None\n")
             line = line + 1
-        ei = ei + 1
+        e = e.next
     *out_len = g_gen_len
     return g_gen_buf
 
-# 1 when enum `ea`'s name sorts before enum `eb`'s (bytewise; a proper prefix
+# 1 when enum `a`'s name sorts before enum `b`'s (bytewise; a proper prefix
 # sorts first), else 0.
-fn enum_name_lt(ea: i32, eb: i32) -> i32
-    let a: *u8 = *(g_enum_names + ea)
-    let b: *u8 = *(g_enum_names + eb)
-    let a_len: i32 = *(g_enum_name_lens + ea)
-    let b_len: i32 = *(g_enum_name_lens + eb)
+fn enum_name_lt(a: *EnumDef, b: *EnumDef) -> i32
+    let ap: *u8 = a.name
+    let bp: *u8 = b.name
+    let a_len: i32 = a.name_len
+    let b_len: i32 = b.name_len
     var k: i32 = 0
     while k < a_len and k < b_len
-        let ab: u8 = *(a + k)
-        let bb: u8 = *(b + k)
+        let ab: u8 = *(ap + k)
+        let bb: u8 = *(bp + k)
         if ab < bb
             return 1
         if ab > bb
@@ -9085,15 +9101,16 @@ fn enum_name_lt(ea: i32, eb: i32) -> i32
         return 1
     return 0
 
-# The tag of variant `name` within enum `ei`, or -1.
-fn enum_variant_slot(ei: i32, name: *u8, len: i32) -> i32
-    let start: i32 = *(g_enum_variant_starts + ei)
-    let count: i32 = *(g_enum_variant_counts + ei)
-    for vi in 0..count
-        let vidx: i32 = start + vi
-        if *(g_enum_variant_name_lens + vidx) == len
+# The tag of variant `name` within enum `e`, or -1.
+fn enum_variant_slot_node(e: *EnumDef, name: *u8, len: i32) -> i32
+    if e == null
+        return 0 - 1
+    var vi: i32 = 0
+    var v: *EnumVariant = e.variants
+    while v != null
+        if v.name_len == len
             var same: i32 = 1
-            let stored: *u8 = *(g_enum_variant_names + vidx)
+            let stored: *u8 = v.name
             for k in 0..len
                 let sb: u8 = *(stored + k)
                 let qb: u8 = *(name + k)
@@ -9101,6 +9118,8 @@ fn enum_variant_slot(ei: i32, name: *u8, len: i32) -> i32
                     same = 0
             if same == 1
                 return vi
+        v = v.next
+        vi = vi + 1
     return 0 - 1
 
 # AGAST #1600 / #2039: the enum a bare variant name denotes, as a VALUE
@@ -9114,42 +9133,48 @@ fn enum_variant_slot(ei: i32, name: *u8, len: i32) -> i32
 pub fn enum_of_variant_unique(name: *u8, len: i32, out_vi: *i32, out_other: *i32) -> i32
     *out_vi = 0 - 1
     *out_other = 0 - 1
-    if g_enum_initialized == 0
-        return 0 - 1
     # lo / hi: the two alphabetically-smallest distinct declarers so far.
-    var lo: i32 = 0 - 1
+    var lo: *EnumDef = null
+    var lo_i: i32 = 0 - 1
     var lo_vi: i32 = 0 - 1
-    var hi: i32 = 0 - 1
+    var hi: *EnumDef = null
+    var hi_i: i32 = 0 - 1
+    var e: *EnumDef = g_program_enums
     var ei: i32 = 0
-    while ei < g_enum_count
-        if *(g_enum_generic + ei) == 0
-            let vi: i32 = enum_variant_slot(ei, name, len)
+    while e != null
+        if e.generic == 0
+            let vi: i32 = enum_variant_slot_node(e, name, len)
             if vi >= 0
                 # The same enum recorded twice (a module reached again
                 # through an import cycle, as tempest's tab.ritz is) is not
-                # ambiguous; the tracker keys enums by name (enum_find).
+                # ambiguous; the list keys enums by name (enum_find).
                 var dup: i32 = 0
-                if lo >= 0 and enum_name_eq(ei, *(g_enum_names + lo), *(g_enum_name_lens + lo)) == 1
+                if lo != null and enum_name_eq(lo, e.name, e.name_len) == 1
                     dup = 1
-                if hi >= 0 and enum_name_eq(ei, *(g_enum_names + hi), *(g_enum_name_lens + hi)) == 1
+                if hi != null and enum_name_eq(hi, e.name, e.name_len) == 1
                     dup = 1
                 if dup == 0
-                    if lo < 0
-                        lo = ei
+                    if lo == null
+                        lo = e
+                        lo_i = ei
                         lo_vi = vi
-                    else if enum_name_lt(ei, lo) == 1
+                    else if enum_name_lt(e, lo) == 1
                         hi = lo
-                        lo = ei
+                        hi_i = lo_i
+                        lo = e
+                        lo_i = ei
                         lo_vi = vi
-                    else if hi < 0 or enum_name_lt(ei, hi) == 1
-                        hi = ei
+                    else if hi == null or enum_name_lt(e, hi) == 1
+                        hi = e
+                        hi_i = ei
+        e = e.next
         ei = ei + 1
-    if hi >= 0
-        *out_vi = lo
-        *out_other = hi
+    if hi != null
+        *out_vi = lo_i
+        *out_other = hi_i
         return 0 - 2
     *out_vi = lo_vi
-    return lo
+    return lo_i
 
 # =============================================================================
 # AGAST #1794: `id<@E>(e)` and `a[:]`
@@ -9298,9 +9323,11 @@ pub fn primitive_type_from_name(name: *u8, len: i32) -> i32
 # grammar's action records the enum as generic but drops the list
 # (enum_def_header).  null when no `<...>` follows the name.
 pub fn generic_enum_params(ei: i32) -> *TypeParam
-    var len: i32 = 0
-    let name: *u8 = enum_name_at(ei, @len)
-    var p: *u8 = name + len
+    let e: *EnumDef = enum_node_at(ei)
+    if e == null
+        return null
+    let name: *u8 = e.name
+    var p: *u8 = name + e.name_len
     while *p == 32 or *p == 9
         p = p + 1
     if *p != 60   # '<'
@@ -9348,22 +9375,24 @@ pub fn enum_type_param_count(ei: i32) -> i32
 # through an import cycle is one enum.
 pub fn generic_enum_of_variant(name: *u8, len: i32, out_vi: *i32) -> i32
     *out_vi = 0 - 1
-    if g_enum_initialized == 0
-        return 0 - 1
-    var found: i32 = 0 - 1
+    var found: *EnumDef = null
+    var found_i: i32 = 0 - 1
+    var e: *EnumDef = g_program_enums
     var ei: i32 = 0
-    while ei < g_enum_count
-        if *(g_enum_generic + ei) != ENUM_INSTANCE
-            let vi: i32 = enum_variant_slot(ei, name, len)
+    while e != null
+        if e.generic != ENUM_INSTANCE
+            let vi: i32 = enum_variant_slot_node(e, name, len)
             if vi >= 0
-                if found < 0
-                    found = ei
+                if found == null
+                    found = e
+                    found_i = ei
                     *out_vi = vi
-                else if enum_name_eq(ei, *(g_enum_names + found), *(g_enum_name_lens + found)) == 0
+                else if enum_name_eq(found, e.name, e.name_len) == 0
                     *out_vi = 0 - 1
                     return 0 - 1
+        e = e.next
         ei = ei + 1
-    if found < 0 or *(g_enum_generic + found) != 1
+    if found == null or found.generic != 1
         *out_vi = 0 - 1
         return 0 - 1
-    found
+    found_i
