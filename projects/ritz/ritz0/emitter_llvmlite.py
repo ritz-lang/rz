@@ -8767,10 +8767,9 @@ class LLVMEmitter:
         # `writer_write` would do (writer_view/writer_len read it).
         idx = {n: i for i, n in enumerate(
             name for name, _ in self.struct_fields['Writer'])}
-        sink_ty = self.struct_types['Writer'].elements[idx['sink']]
         sink_ptr = self.builder.load(self.builder.gep(
             wptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx['sink'])]))
-        got = self.builder.call(sink_ty.pointee, sink_ptr, [wptr, ptr, length])
+        got = self.builder.call(sink_ptr, [wptr, ptr, length])
         len_slot = self.builder.gep(
             wptr, [ir.Constant(self.i32, 0), ir.Constant(self.i32, idx['len'])])
         accepted = self.builder.select(
@@ -13879,6 +13878,15 @@ class LLVMEmitter:
             at = call.args[0] if len(call.args) == 1 else call
             raise EmitError(f"{fname}() requires a single string literal argument",
                             getattr(at, "span", None) or getattr(call, "span", None))
+
+        # write(w, "...{x}...") / writeln: Display through the Writer the
+        # program named, not an implicit one (AGAST #202). Only an
+        # interpolated literal is lowered here; a plain one is the ordinary
+        # StrView call. Checked before user fns, like print.
+        if (fname in ('write', 'writeln') and len(call.args) == 2
+                and isinstance(call.args[1], rast.InterpString)):
+            return self._emit_interp_string_print(
+                call.args[1], newline=(fname == 'writeln'), writer=call.args[0])
 
         # format_into(sink, "...") -- print's literal, appended to a buffer
         # (AGAST #1824). Reserved like print: checked before user functions.

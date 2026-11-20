@@ -927,11 +927,21 @@ class TypeChecker(SlotInferMixin, RefChecksMixin, TypeQueriesMixin):
             # format_into(sink, str) -> void (AGAST #1824)
             # println / eprintln interpolate too (AGAST #202), but keep their
             # ordinary signature when the argument is not an InterpString.
+            interp_line = (fn_name in ('println', 'eprintln')
+                           and any(isinstance(a, rast.InterpString)
+                                   for a in expr.args))
+            # write/writeln interpolate through their Writer; with ritzlib in
+            # scope their own i64 signature stays the authority.
+            interp_writer = (fn_name in ('write', 'writeln')
+                             and fn_name not in self.functions
+                             and len(expr.args) == 2
+                             and isinstance(expr.args[1], rast.InterpString))
             if (fn_name in ('print', 'eprint', 'format_into')
-                    or (fn_name in ('println', 'eprintln')
-                        and any(isinstance(a, rast.InterpString) for a in expr.args))):
+                    or interp_line or interp_writer):
                 for arg in expr.args:
                     self._infer_type(arg)
+                if interp_writer:
+                    return rast.NamedType(expr.span, 'i64', [])
                 return rast.NamedType(expr.span, 'void', [])
 
             # Instructions the emitter lowers by name

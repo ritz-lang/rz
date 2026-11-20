@@ -55,7 +55,10 @@ struct Writer
     len: i64
 
 fn raw_write(w: @&Writer, s: StrView) -> i64
-    (w.sink)(w, s.ptr, s.len)
+    let n: i64 = (w.sink)(w, s.ptr, s.len)
+    if n > 0
+        w.len = w.len + n
+    n
 
 trait Display
     fn show(self: @Self, w: @&Writer) -> i64
@@ -182,3 +185,73 @@ pub fn main() -> i32
     assert "Traceback" not in text, text
     assert "doesn't implement Display" in text, text
     assert "impl Display for Inner" in text, text
+
+
+# ---------------------------------------------------------------------------
+# write / writeln: the program names the Writer; no implicit fd.
+# ---------------------------------------------------------------------------
+
+WRITER_SINK = """\
+var buf: [256]u8
+
+fn buf_sink(w: @&Writer, data: *u8, len: i64) -> i64
+    let base: *u8 = w.state
+    var i: i64 = 0
+    while i < len
+        *(base + w.len + i) = *(data + i)
+        i = i + 1
+    len
+
+"""
+
+
+def test_write_and_writeln_use_the_explicit_writer(tmp_path):
+    program = SHAPE + POINT + WRITER_SINK + """\
+pub fn main() -> i32
+    var w: Writer = Writer { sink: buf_sink, state: @buf[0] as *u8, fd: -1, cap: 0, len: 0 }
+    let p: Point = Point { x: 3, y: 4 }
+    let n: i64 = writeln(@&w, "p={p}")
+    let m: i64 = write(@&w, "!{p}")
+    let v: StrView = StrView { ptr: @buf[0] as *u8, len: w.len }
+    print("[{v}] {n} {m}\\n")
+    0
+"""
+    out, err = _run(tmp_path, "display_writer", program)
+    assert out == b"[p=POINT\n!POINT] 8 6\n", out
+    assert err == b"", err
+
+
+PACKAGE_WRITER = """\
+import ritzlib.fmt
+import ritzlib.string
+
+struct Point
+    x: i64
+    y: i64
+
+impl Display for Point
+    fn show(self: @Point, w: @&Writer) -> i64
+        write(w, "({self.x}, {self.y})")
+
+pub fn main() -> i32
+    var s: String = string_new()
+    var w: Writer = string_writer(@&s)
+    let p: Point = Point { x: 3, y: 4 }
+    let n: i64 = writeln(@&w, "p={p} x={p.x}")
+    let v: StrView = string_as_view(@s)
+    print("[{v}] {n}\\n")
+    0
+"""
+
+
+def test_write_into_ritzlib_string_writer(tmp_path):
+    """The real ritzlib Writer: string_writer + writer_view round trip."""
+    from test_format_into import _build
+
+    proc, exe = _build("ritz0", tmp_path, "display_pkg_writer", PACKAGE_WRITER)
+    assert proc.returncode == 0 and exe.exists(), (
+        f"ritz0 failed to build:\n{proc.stdout[-3000:]}\n{proc.stderr[-3000:]}")
+    run = subprocess.run([str(exe)], capture_output=True, timeout=60, check=False)
+    assert run.returncode == 0, run.stderr[-1000:]
+    assert run.stdout == b"[p=(3, 4) x=3\n] 13\n", run.stdout
+    assert run.stderr == b"", run.stderr

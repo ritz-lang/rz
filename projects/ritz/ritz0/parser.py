@@ -598,9 +598,10 @@ class Parser:
         `interp` split become an InterpString with parsed expressions.
 
         AGAST #202: `println` and `eprintln` are print's line-terminated
-        forms (implicit stdout / stderr Writer). A call whose literal has no
-        placeholder keeps its plain StringLit, so `println("x")` still
-        resolves to whatever `println` is in scope.
+        forms (implicit stdout / stderr Writer); `write` and `writeln` are
+        the explicit-Writer forms, whose literal is their second argument.
+        A call whose literal has no placeholder keeps its plain StringLit,
+        so `println("x")` still resolves to whatever `println` is in scope.
         """
         if (isinstance(callee, rast.Ident)
                 and callee.name in ('print', 'eprint', 'println', 'eprintln')
@@ -610,6 +611,16 @@ class Parser:
             parts, expr_strs = lit.interp
             exprs, specs = self._parse_interp_placeholders(expr_strs, lit.span)
             return [rast.InterpString(lit.span, parts, exprs, specs)]
+        # `write(w, "...{x}...")` / `writeln(w, "...")`: the explicit Writer
+        # is the first argument, the literal the second (AGAST #202).
+        if (isinstance(callee, rast.Ident)
+                and callee.name in ('write', 'writeln')
+                and len(args) == 2 and isinstance(args[1], rast.StringLit)
+                and args[1].interp is not None):
+            lit = args[1]
+            parts, expr_strs = lit.interp
+            exprs, specs = self._parse_interp_placeholders(expr_strs, lit.span)
+            return [args[0], rast.InterpString(lit.span, parts, exprs, specs)]
         # AGAST #1824: format_into(sink, "...") -- the same literal rules,
         # on its second argument.
         if (isinstance(callee, rast.Ident) and callee.name == 'format_into'
