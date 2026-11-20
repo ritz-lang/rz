@@ -431,6 +431,96 @@ out="$(bash "$TR" build "sx:$x" "sy:$y" "sz:$z" 2>&1)"
 has "$out" "^CONFLICT +sy ${y:0:12} with sx on s/x$" "CONFLICT names the train car and file"
 has "$out" "^CONFLICT +sz ${z:0:12} with main on a$" "a conflict with no train car names main"
 
+# 10e. A multi-slice room (AGAST #4382): one branch, one REAP per slice, so
+# the branch tip has moved on when a later slice boards, and every earlier
+# slice is on main (or in a train) under the train's cherry-picked SHA.  Each
+# slice must board as it arrives; a multi-commit car with two genuinely
+# unlanded commits must still be refused.
+# sl <branch> <n>: commit slice <n> on the current branch; say its SHA.
+sl() {
+    mkdir -p "$M/sl"; echo "$1 slice $2" > "$M/sl/$1-$2"
+    git -C "$M" add -A; git -C "$M" commit -qm "$1: slice $2"
+    git -C "$M" rev-parse HEAD
+}
+# 10e. 4 slices, each REAPed at the tip: a fresh branch based one commit
+# behind main, so landing always cherry-picks to a new SHA.
+fetch; git -C "$M" checkout -q main
+mbase="$(git -C "$M" rev-parse origin/main~1)"
+git -C "$M" checkout -q --detach "$mbase"; git -C "$M" checkout -q -b mslice
+m1="$(sl mslice 1)"; git -C "$M" push -q origin HEAD:refs/heads/mslice
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "mslice:$m1" 2>&1)"
+has "$out" "^APPLIED +mslice ${m1:0:12} as " "slice 1 of 4 boards"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+has "$out" "^MERGED +mslice ${m1:0:12} as " "slice 1 of 4 lands under a new SHA"
+git -C "$M" checkout -q mslice
+m2="$(sl mslice 2)"; git -C "$M" push -q origin HEAD:refs/heads/mslice
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "mslice:$m2" 2>&1)"
+has "$out" "^APPLIED +mslice ${m2:0:12} as " \
+    "slice 2 of 4 boards after slice 1 landed under a new SHA"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+git -C "$M" checkout -q mslice
+m3="$(sl mslice 3)"; m4="$(sl mslice 4)"
+git -C "$M" push -q origin HEAD:refs/heads/mslice        # the tip is m4
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "mslice:$m3" 2>&1)"
+has "$out" "^APPLIED +mslice ${m3:0:12} as " \
+    "a REAP the branch tip has moved past boards its own slice"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+git -C "$M" checkout -q main
+out="$(bash "$TR" build "mslice:$m4" 2>&1)"
+has "$out" "^APPLIED +mslice ${m4:0:12} as " "slice 4 of 4 boards"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+has "$out" "^MERGED +mslice ${m4:0:12} as " "slice 4 of 4 lands"
+[[ "$(git -C "$M" show origin/main:sl/mslice-4)" == "mslice slice 4" ]] \
+    && ok "all 4 slices are on main" || bad "all 4 slices are on main"
+# 10f. 3 slices, slice 1 landed, slice 2 gating in train 1, slice 3 arrives:
+# the count is over unlanded, untrained commits, so it boards (the shape of
+# the ritz-task-202 repro).
+fetch; git -C "$M" checkout -q main
+tbase="$(git -C "$M" rev-parse origin/main~1)"
+git -C "$M" checkout -q --detach "$tbase"; git -C "$M" checkout -q -b tslice
+t1="$(sl tslice 1)"; git -C "$M" push -q origin HEAD:refs/heads/tslice
+fetch; git -C "$M" checkout -q main
+bash "$TR" build "tslice:$t1" >/dev/null 2>&1
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+git -C "$M" checkout -q tslice
+t2="$(sl tslice 2)"; git -C "$M" push -q origin HEAD:refs/heads/tslice
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "tslice:$t2" 2>&1)"
+has "$out" "^APPLIED +tslice ${t2:0:12} as " "the second slice boards as train 1"
+bash "$TR" gate >/dev/null 2>&1                      # train 1 gating
+git -C "$M" checkout -q tslice
+t3="$(sl tslice 3)"; git -C "$M" push -q origin HEAD:refs/heads/tslice
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build --next "tslice:$t3" 2>&1)"
+has "$out" "^APPLIED +tslice ${t3:0:12} as " \
+    "slice 3 boards with slice 1 on main and slice 2 in train 1"
+has "$out" "^TRAIN 2 .*n=1 gate=needed" "it is the only car of train 2"
+git -C "$M" checkout -q main
+# 10g. Two genuinely unlanded commits are still refused, also when an earlier
+# slice has landed under a new SHA; the named slice alone still boards.
+fetch; git -C "$M" checkout -q main
+ubase="$(git -C "$M" rev-parse origin/main~1)"
+git -C "$M" checkout -q --detach "$ubase"; git -C "$M" checkout -q -b uslice
+u1="$(sl uslice 1)"; git -C "$M" push -q origin HEAD:refs/heads/uslice
+fetch; git -C "$M" checkout -q main
+bash "$TR" build "uslice:$u1" >/dev/null 2>&1
+bash "$TR" land "$(bash "$TR" gate)" >/dev/null 2>&1
+git -C "$M" checkout -q uslice
+u2="$(sl uslice 2)"; u3="$(sl uslice 3)"
+git -C "$M" push -q origin HEAD:refs/heads/uslice
+fetch; git -C "$M" checkout -q main
+out="$(bash "$TR" build "uslice:$u3" 2>&1)"
+has "$out" "^BAD +uslice ${u3:0:12}: 3 commits over main, 2 not in the train" \
+    "two genuinely unlanded commits are still BAD"
+out="$(bash "$TR" build "uslice:$u2" 2>&1)"
+has "$out" "^APPLIED +uslice ${u2:0:12} as " \
+    "the named slice alone still boards when the tip has moved past it"
+out="$(bash "$TR" land "$(bash "$TR" gate)" 2>&1)"
+has "$out" "^MERGED +uslice ${u2:0:12} as " "the named slice lands"
+
 # 11. Speculative gates (AGAST #3988): train 2 gates on a remote host, on
 # train 1's tail, while train 1 gates here.  The remote side is a clone of
 # origin; the fake ssh runs the command line locally the way sshd would

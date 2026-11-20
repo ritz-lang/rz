@@ -70,6 +70,14 @@
 # patch, plus its own one.  Picks keep the car's committer date, so a rebuilt
 # train over the same cars has the same SHAs and such a car stays KEPT.
 #
+# A multi-slice room (AGAST #4382) REAPs one slice per commit on one branch,
+# so the tip has moved past the REAPed slice and earlier slices are on main
+# under the train's cherry-picked SHA.  An item may name any commit on its
+# branch, not just the tip; the car's commits over main are matched against
+# the base (main, every train below, and this train's earlier cars) by
+# `git patch-id --verbatim` as a multiset, and only one unlanded commit may
+# remain.  Two genuinely unlanded commits are still BAD.
+#
 # rz never resolves a conflict or edits a commit: a CONFLICT is aborted and
 # skipped, and the room gets the turn once the train lands.
 #
@@ -459,12 +467,13 @@ cmd_build() {
 # Nothing changes until every item checks out (AGAST #4337: a space for the
 # colon died after the replaced trains were gone and RZ_TRAINS removed, so
 # trains 2-4 gating remotely fell out of the queue): a malformed item dies
-# first; then, fetched, an item that is no commit or not its branch's tip is
-# a BAD line and stays out.  RZ_TRAINS is written once, when the new trains
-# are built; a death part-way (build_abort) leaves the kept trains queued.
+# first; then, fetched, an item that is no commit or not a commit on its
+# branch (its tip or an ancestor) is a BAD line and stays out.  RZ_TRAINS is
+# written once, when the new trains are built; a death part-way (build_abort)
+# leaves the kept trains queued.
 build_on() {
     local keep="$1"; shift
-    local item branch sha full items=()
+    local item branch sha full tip items=()
     for item in "$@"; do
         branch="${item%%:*}"; sha="${item#*:}"
         [[ "$branch" != "$item" && -n "$branch" && -n "$sha" ]] \
@@ -476,8 +485,14 @@ build_on() {
         if ! full="$(git -C "$MAIN_WT" rev-parse -q --verify "$sha^{commit}")"; then
             echo "BAD      $branch ${sha:0:12}: no such commit (fetched?)"; continue
         fi
-        # The REAP must name the branch tip, as in the one-at-a-time checks.
-        if [[ "$(git -C "$MAIN_WT" rev-parse -q --verify "origin/$branch" || true)" != "$full" ]]; then
+        # The REAP must name the branch tip, or a commit on it: a room that
+        # REAPs one slice per commit pushes the next slice before its train
+        # boards the last, so the tip has moved on (AGAST #4382).  The
+        # unlanded count below still limits the pick to the named slice.
+        tip="$(git -C "$MAIN_WT" rev-parse -q --verify "origin/$branch" || true)"
+        if [[ "$full" != "$tip" ]] \
+                && ! { [[ -n "$tip" ]] \
+                    && git -C "$MAIN_WT" merge-base --is-ancestor "$full" "$tip" 2>/dev/null; }; then
             echo "BAD      $branch ${full:0:12}: origin/$branch is not this commit"; continue
         fi
         items+=("$branch:$full")
@@ -509,37 +524,64 @@ build_on() {
     start_train "$(free_slot)" "$base"
     local first_new=$k
 
-    local parent count mb extra files
+    local parent count mb files pick p sha2 left=()
+    local -A have=() pid=()
     for item in ${items[@]+"${items[@]}"}; do
         branch="${item%%:*}"; full="${item#*:}"
-        # One commit over main, or over train commits (a car bounced to
-        # rebase onto a train's tail): every commit under it must be in the
-        # trains so far, as an ancestor of the tail or as the same patch.
+        # One unlanded commit over main, or over train commits (a car bounced
+        # to rebase onto a train's tail).  A commit already on the base (main,
+        # every train below, and this train's earlier cars) does not count
+        # when its patch is there under the train's cherry-picked SHA: that is
+        # how a multi-slice room lands its later slices (AGAST #4382).  Patch
+        # ids keep whitespace (--verbatim, not `git cherry`, #2796) and are
+        # matched as a multiset, so duplicated slices neither collapse nor
+        # hide a missing one (#4375).
         mb="$(g merge-base origin/main "$full")"
         count="$(g rev-list --count "$mb..$full")"
-        if [[ "$count" != 1 ]]; then
-            extra="$(g cherry HEAD "$full^" "$mb" | grep -c '^+' || true)"
-            if [[ "$extra" != 0 ]]; then
-                echo "BAD      $branch ${full:0:12}: $count commits over main, $extra not in the train; want 1 over it"
+        if [[ "$count" == 1 ]]; then
+            pick="$full"                       # the common shape: no patch-id work
+        else
+            have=(); pid=()
+            while read -r p sha2; do
+                [[ -n "$p" ]] && have[$p]=$(( ${have[$p]:-0} + 1 ))
+            done < <(g log -p --no-color --format='commit %H' "$mb..HEAD" | g patch-id --verbatim)
+            while read -r p sha2; do
+                [[ -n "$p" ]] && pid[$sha2]="$p"
+            done < <(g log -p --no-color --format='commit %H' "$mb..$full" | g patch-id --verbatim)
+            left=()
+            while read -r sha2; do
+                p="${pid[$sha2]:-}"
+                if [[ -n "$p" && ${have[$p]:-0} -gt 0 ]]; then
+                    have[$p]=$(( have[$p] - 1 ))
+                else
+                    left+=("$sha2")
+                fi
+            done < <(g rev-list --reverse "$mb..$full")
+            if [[ ${#left[@]} -eq 0 ]]; then
+                echo "EMPTY    $branch ${full:0:12}"; continue
+            fi
+            if [[ ${#left[@]} -ne 1 ]]; then
+                echo "BAD      $branch ${full:0:12}: $count commits over main, ${#left[@]} not in the train; want 1 over it"
                 continue
             fi
+            pick="${left[0]}"
         fi
         if [[ $n -ge $MAX ]]; then
             finish_train
             start_train "$(free_slot)" "$(g rev-parse HEAD)"
         fi
-        parent="$(g rev-parse "$full^")"
+        parent="$(g rev-parse "$pick^")"
         if [[ "$parent" == "$(g rev-parse HEAD)" ]]; then
             # On the tail already: keep its SHA, so its own gate still counts.
-            g merge -q --ff-only "$full"
+            g merge -q --ff-only "$pick"
             echo "KEPT     $branch ${full:0:12}"
-            printf 'ITEM=%s %s %s\n' "$branch" "$full" "$full" >> "$(state)"
+            printf 'ITEM=%s %s %s\n' "$branch" "$full" "$pick" >> "$(state)"
             n=$((n + 1)); continue
         fi
         # The car's committer date: the same car on the same tail is the
         # same commit, however often the train is rebuilt.
-        if ! GIT_COMMITTER_DATE="$(g log -1 --format=%cd --date=raw "$full")" \
-                g cherry-pick --empty=drop "$full" >/dev/null 2>&1; then
+        if ! GIT_COMMITTER_DATE="$(g log -1 --format=%cd --date=raw "$pick")" \
+                g cherry-pick --empty=drop "$pick" >/dev/null 2>&1; then
             files="$(g diff --name-only --diff-filter=U)"
             g cherry-pick --abort >/dev/null 2>&1 || g reset -q --hard
             echo "CONFLICT $branch ${full:0:12} with $(conflict_with "$files") on $(paste -sd, <<<"$files")"
