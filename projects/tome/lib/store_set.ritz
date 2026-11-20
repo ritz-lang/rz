@@ -210,70 +210,39 @@ fn set_members(set: *Set, out_count: @&i64) -> *StrView
 
 # Helper: Get or create set for key. Returns null if key exists with wrong type.
 fn store_get_or_create_set(s: *Store, key: StrView) -> *Set
-    # Check load factor
-    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
-    if load > 75
-        store_grow(s)
+    let entry: *Entry = store_find_entry(s, key)
 
-    let idx: i64 = store_find_slot(s, key)
-    if idx < 0
-        return null
-
-    let entry: *Entry = s.entries + idx
-
-    if entry.state == 1  # Occupied
+    if entry != null
         if entry.value_type == VALUE_SET
             return entry.value_ptr as *Set
         return null  # Wrong type
 
     # Create new set
     let set: *Set = set_new()
-    let now: i64 = time_now_secs()
-
-    if entry.state == 2  # Was tombstone
-        s.tombstones -= 1
-
-    entry.key = string_from_strview(key)
-    entry.value_ptr = set as *u8
-    entry.value_type = VALUE_SET
-    entry.expires_at = 0
-    entry.last_access = now
-    entry.state = 1
-    s.len += 1
+    let fresh: *Entry = store_create_entry(s, key)
+    fresh.value_ptr = set as *u8
+    fresh.value_type = VALUE_SET
 
     # Track initial memory
-    s.used_memory += entry_memory(entry)
+    s.used_memory += entry_memory(fresh)
 
     return set
 
 # Helper: Get existing set for key (read-only). Returns null if not found or wrong type.
 fn store_get_set(s: *Store, key: StrView) -> *Set
-    let h: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (h as i64) & mask
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
+        return null
 
-    var i: i64 = 0
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
+    # Check expiration
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
+            return null  # Expired
 
-        if entry.state == 0
-            return null
-
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                # Check expiration
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        return null  # Expired
-                if entry.value_type == VALUE_SET
-                    return entry.value_ptr as *Set
-                return null  # Wrong type
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return null
+    if entry.value_type == VALUE_SET
+        return entry.value_ptr as *Set
+    return null  # Wrong type
 
 # SADD: Add member(s) to set. Returns number of elements added.
 # Creates set if key doesn't exist. Returns -1 if key exists with wrong type.
@@ -286,23 +255,20 @@ pub fn store_sadd(s: *Store, key: StrView, member: StrView) -> i64
 # SREM: Remove member(s) from set. Returns number of elements removed.
 # Returns 0 if key doesn't exist. Returns -1 if key exists with wrong type.
 pub fn store_srem(s: *Store, key: StrView, member: StrView) -> i64
-    let set: *Set = store_get_set(s, key)
-    if set == null
-        # Check if key exists with wrong type
-        let h: u64 = hash_strview(key)
-        let mask: i64 = s.cap - 1
-        var idx: i64 = (h as i64) & mask
-        var i: i64 = 0
-        while i < s.cap
-            let entry: *Entry = s.entries + idx
-            if entry.state == 0
-                return 0  # Key not found
-            if entry.state == 1
-                if tome_string_eq_strview(@entry.key, key) == 1
-                    return -1  # Wrong type
-            idx = (idx + 1) & mask
-            i += 1
-        return 0
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
+        return 0  # Key not found
+
+    # Check expiration
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
+            return 0  # Expired
+
+    if entry.value_type != VALUE_SET
+        return -1  # Wrong type
+
+    let set: *Set = entry.value_ptr as *Set
     return set_remove(set, member) as i64
 
 # SISMEMBER: Check if member is in set. Returns 1 if present, 0 if not.
@@ -316,33 +282,20 @@ pub fn store_sismember(s: *Store, key: StrView, member: StrView) -> i32
 # SCARD: Get cardinality (number of members) of set.
 # Returns 0 if key doesn't exist. Returns -1 if key exists with wrong type.
 pub fn store_scard(s: *Store, key: StrView) -> i64
-    let h: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (h as i64) & mask
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
+        return 0  # Key not found
 
-    var i: i64 = 0
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
+    # Check expiration
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
+            return 0  # Expired
 
-        if entry.state == 0
-            return 0  # Key not found
-
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                # Check expiration
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        return 0  # Expired
-                if entry.value_type == VALUE_SET
-                    let set: *Set = entry.value_ptr as *Set
-                    return set.len
-                return -1  # Wrong type
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return 0
+    if entry.value_type == VALUE_SET
+        let set: *Set = entry.value_ptr as *Set
+        return set.len
+    return -1  # Wrong type
 
 # SMEMBERS: Get all members of set. Returns array of borrowed views.
 # Caller must free the returned array (but not the strings - they're borrowed).

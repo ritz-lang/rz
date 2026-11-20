@@ -691,7 +691,18 @@ missing key is `None`.
 | `hashmap_insert<K, V>` | `fn(m: @&HashMap<K, V>, key: K, value: V)` | Insert or overwrite |
 | `hashmap_get<K, V>` | `fn(m: @HashMap<K, V>, key: K) -> Option<V>` | The value, or `None` |
 | `hashmap_remove<K, V>` | `fn(m: @&HashMap<K, V>, key: K) -> bool` | Remove key (true if it was there) |
+| `hashmap_len<K, V>` | `fn(m: @HashMap<K, V>) -> i64` | The number of keys |
+| `hashmap_cap<K, V>` | `fn(m: @HashMap<K, V>) -> i64` | The number of slots (a power of 2) |
+| `hashmap_slot_state<K, V>` | `fn(m: @HashMap<K, V>, i: i64) -> Slot` | Slot `i`'s state: `Empty`, `Full` or `Tomb` |
+| `hashmap_slot_value<K, V>` | `fn(m: @HashMap<K, V>, i: i64) -> V` | Slot `i`'s value (read it when `Full`) |
+| `hashmap_clear<K, V>` | `fn(m: @&HashMap<K, V>)` | Remove every key, keeping the table allocated |
 | `hashmap_drop<K, V>` | `fn(m: @&HashMap<K, V>)` | Free the table |
+
+**Iteration** walks the slots: `for i in 0..hashmap_cap(@m)` and
+`hashmap_slot_state(@m, i) == Slot.Full`. `Tomb` is a removed key's slot; a
+probe chain still steps over it. The map never frees a value, so drop what
+the values own before `hashmap_clear` or `hashmap_drop`, and do not insert
+or remove during a walk.
 
 **Methods**: `len`, `insert`, `get`, `contains`, `remove`. The map has no
 `Drop` impl yet (its `Vec` hasn't either, #3614): free it with `hashmap_drop`.

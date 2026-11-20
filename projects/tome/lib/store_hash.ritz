@@ -219,153 +219,61 @@ fn hash_getall(h: *Hash, out_count: @&i64) -> *StrView
 
 # Helper to get or create a hash for a key
 fn store_get_or_create_hash(s: *Store, key: StrView) -> *Hash
-    # Check if key already exists
-    let hash_val: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var i: i64 = 0
+    var entry: *Entry = store_find_entry(s, key)
 
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
+    if entry != null
+        # Check expiration
+        if entry.expires_at > 0
+            let now: i64 = time_now_secs()
+            if now >= entry.expires_at
+                # Expired - clean up and treat as new
+                store_erase_entry(s, entry)
+                entry = null
 
-        if entry.state == 0
-            break
-
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                # Check expiration
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        # Expired - clean up and treat as new
-                        let mem: i64 = entry_memory(entry)
-                        string_drop(@&entry.key)
-                        if entry.value_type == VALUE_STRING
-                            string_drop(@&entry.value)
-                        else if entry.value_type == VALUE_LIST
-                            list_drop(entry.value_ptr as *List)
-                        else if entry.value_type == VALUE_SET
-                            set_drop(entry.value_ptr as *Set)
-                        else if entry.value_type == VALUE_ZSET
-                            zset_drop(entry.value_ptr as *ZSet)
-                        else if entry.value_type == VALUE_HASH
-                            hash_drop(entry.value_ptr as *Hash)
-                        entry.state = 2  # TOMBSTONE
-                        entry.value_type = VALUE_NONE
-                        s.len -= 1
-                        s.tombstones += 1
-                        s.used_memory -= mem
-                        break
-                # Return existing hash
-                if entry.value_type == VALUE_HASH
-                    return entry.value_ptr as *Hash
-                # Wrong type - return null
-                return null
-
-        idx = (idx + 1) & mask
-        i += 1
+    if entry != null
+        # Return existing hash
+        if entry.value_type == VALUE_HASH
+            return entry.value_ptr as *Hash
+        # Wrong type - return null
+        return null
 
     # Key doesn't exist - create new hash
-    # Check load factor and resize if needed (> 75%)
-    let load: i64 = (s.len + s.tombstones + 1) * 100 / s.cap
-    if load > 75
-        store_grow(s)
-
     let h: *Hash = hash_new()
-
-    # Insert new entry
-    let new_hash: u64 = hash_strview(key)
-    let new_mask: i64 = s.cap - 1
-    var new_idx: i64 = (new_hash as i64) & new_mask
-    var first_tombstone: i64 = -1
-    var j: i64 = 0
-
-    while j < s.cap
-        let entry: *Entry = s.entries + new_idx
-
-        if entry.state == 0  # EMPTY
-            var insert_idx: i64 = new_idx
-            if first_tombstone >= 0
-                insert_idx = first_tombstone
-                s.tombstones -= 1
-            let target: *Entry = s.entries + insert_idx
-            let now: i64 = time_now_secs()
-            target.key = string_from_strview(key)
-            target.value_ptr = h as *u8
-            target.value_type = VALUE_HASH
-            target.expires_at = 0
-            target.last_access = now
-            target.state = 1
-            s.len += 1
-            # Track initial memory
-            s.used_memory += entry_memory(target)
-            return h
-
-        if entry.state == 2  # TOMBSTONE
-            if first_tombstone < 0
-                first_tombstone = new_idx
-
-        new_idx = (new_idx + 1) & new_mask
-        j += 1
-
-    # Shouldn't happen
-    hash_drop(h)
-    return null
+    let fresh: *Entry = store_create_entry(s, key)
+    fresh.value_ptr = h as *u8
+    fresh.value_type = VALUE_HASH
+    # Track initial memory
+    s.used_memory += entry_memory(fresh)
+    return h
 
 # Helper to get existing hash for a key
 fn store_get_hash(s: *Store, key: StrView) -> *Hash
-    if s.len == 0
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
         return null
 
-    let hash_val: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var i: i64 = 0
-
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
-
-        if entry.state == 0
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
             return null
 
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        return null
-                if entry.value_type == VALUE_HASH
-                    return entry.value_ptr as *Hash
-                return null
-
-        idx = (idx + 1) & mask
-        i += 1
-
+    if entry.value_type == VALUE_HASH
+        return entry.value_ptr as *Hash
     return null
 
 # HSET: Set field in hash. Returns 1 if new, 0 if updated, -1 if wrong type.
 pub fn store_hset(s: *Store, key: StrView, field: StrView, value: StrView) -> i32
-    # Check if key exists with wrong type
-    if s.len > 0
-        let hash_val: u64 = hash_strview(key)
-        let mask: i64 = s.cap - 1
-        var idx: i64 = (hash_val as i64) & mask
-        var i: i64 = 0
-        while i < s.cap
-            let entry: *Entry = s.entries + idx
-            if entry.state == 0
-                break
-            if entry.state == 1
-                if tome_string_eq_strview(@entry.key, key) == 1
-                    if entry.expires_at > 0
-                        let now: i64 = time_now_secs()
-                        if now >= entry.expires_at
-                            break  # Expired, will be overwritten
-                    if entry.value_type != VALUE_HASH
-                        return -1  # Wrong type
-                    break
-            idx = (idx + 1) & mask
-            i += 1
+    # Check if key exists with wrong type.  An expired key is replaced, not a
+    # type conflict.
+    let entry: *Entry = store_find_entry(s, key)
+    if entry != null
+        var live: i32 = 1
+        if entry.expires_at > 0
+            let now: i64 = time_now_secs()
+            if now >= entry.expires_at
+                live = 0
+        if live == 1 && entry.value_type != VALUE_HASH
+            return -1  # Wrong type
 
     let h: *Hash = store_get_or_create_hash(s, key)
     if h == null
@@ -381,101 +289,51 @@ pub fn store_hget(s: *Store, key: StrView, field: StrView) -> StrView
 
 # HDEL: Delete field from hash. Returns 1 if deleted, 0 if not found, -1 if wrong type.
 pub fn store_hdel(s: *Store, key: StrView, field: StrView) -> i32
-    # Check if key exists
-    if s.len == 0
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
         return 0
 
-    let hash_val: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var i: i64 = 0
-
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
-
-        if entry.state == 0
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
             return 0
 
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        return 0
-                if entry.value_type != VALUE_HASH
-                    return -1
-                let h: *Hash = entry.value_ptr as *Hash
-                return hash_del(h, field)
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return 0
+    if entry.value_type != VALUE_HASH
+        return -1
+    let h: *Hash = entry.value_ptr as *Hash
+    return hash_del(h, field)
 
 # HEXISTS: Check if field exists. Returns 1 if exists, 0 if not, -1 if wrong type.
 pub fn store_hexists(s: *Store, key: StrView, field: StrView) -> i32
-    # Check if key exists
-    if s.len == 0
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
         return 0
 
-    let hash_val: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var i: i64 = 0
-
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
-
-        if entry.state == 0
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
             return 0
 
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        return 0
-                if entry.value_type != VALUE_HASH
-                    return -1
-                let h: *Hash = entry.value_ptr as *Hash
-                return hash_exists(h, field)
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return 0
+    if entry.value_type != VALUE_HASH
+        return -1
+    let h: *Hash = entry.value_ptr as *Hash
+    return hash_exists(h, field)
 
 # HLEN: Get number of fields. Returns count, 0 if not found, -1 if wrong type.
 pub fn store_hlen(s: *Store, key: StrView) -> i64
-    if s.len == 0
+    let entry: *Entry = store_find_entry(s, key)
+    if entry == null
         return 0
 
-    let hash_val: u64 = hash_strview(key)
-    let mask: i64 = s.cap - 1
-    var idx: i64 = (hash_val as i64) & mask
-    var i: i64 = 0
-
-    while i < s.cap
-        let entry: *Entry = s.entries + idx
-
-        if entry.state == 0
+    if entry.expires_at > 0
+        let now: i64 = time_now_secs()
+        if now >= entry.expires_at
             return 0
 
-        if entry.state == 1
-            if tome_string_eq_strview(@entry.key, key) == 1
-                if entry.expires_at > 0
-                    let now: i64 = time_now_secs()
-                    if now >= entry.expires_at
-                        return 0
-                if entry.value_type != VALUE_HASH
-                    return -1
-                let h: *Hash = entry.value_ptr as *Hash
-                return hash_len(h)
-
-        idx = (idx + 1) & mask
-        i += 1
-
-    return 0
+    if entry.value_type != VALUE_HASH
+        return -1
+    let h: *Hash = entry.value_ptr as *Hash
+    return hash_len(h)
 
 # HKEYS: Get all field names. Returns array of borrowed views.
 pub fn store_hkeys(s: *Store, key: StrView, out_count: @&i64) -> *StrView
