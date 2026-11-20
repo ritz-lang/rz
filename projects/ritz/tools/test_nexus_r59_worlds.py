@@ -1,8 +1,11 @@
 """nexus's World/App tests build the value whole before borrowing it (LARB R59).
 
-R59: a `var x: T` with no initialiser, T move-only, starts as moved; a field
-store, read, borrow, move or return before a whole assignment is refused once
-ritz0 (#3477) / ritz1 (#3478) enforce it.  nexus's tests declared
+R59, narrowed 2026-11-20 (AGAST #4328): a `var x: T` with no initialiser, T
+move-only and *not splittable* (its own Drop, an enum, an array, a tuple),
+starts unwritten whole; a field store, read, borrow, move or return before a
+whole assignment is refused.  A splittable struct (no Drop of its own) is
+definite-initialised field by field instead (#4033); this recount is stricter
+than the rule and keeps nexus building values whole.  nexus's tests declared
 `var w: World` / `var app: App` and then lent them out as `world_open(@w)` /
 `app_new(@app)`: 31 sites (AGAST #4158).  This recount hooks ritz0's MoveWalk
 at every `var` statement and records each uninitialised move-only one, as

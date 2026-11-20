@@ -1438,6 +1438,52 @@ let mut x = 5
 Compound assignment operators are `+=`, `-=`, `*=`, `/=`. There is no `%=`,
 `&=`, `|=`, `^=`, `<<=` or `>>=`.
 
+A `var` with no initialiser, `var x: T`, owns nothing yet. When T can be split
+(`splittable`: a struct with no `drop` of its own), it may be written field by
+field: each part with drop glue starts unwritten, and writing every such part
+on every path before x is moved, lent, returned or dropped is enough. LARB
+R59, narrowed on 2026-11-20 (AGAST #4328), covers only a T that cannot be
+split (its own `drop`, an enum, an array, a tuple): that T starts unwritten
+whole and must be assigned whole, `x = T { … }`, before any field store, read,
+borrow, move or return. §13.6 has the rule.
+
+```ritz
+struct Fd
+    n: i32
+
+impl Drop for Fd
+    fn drop(self: @&Fd)
+        self.n = 0
+
+struct Holder
+    t: Fd
+
+fn take(h: Holder) -> i32
+    h.t.n
+
+fn make(n: i32) -> Fd
+    Fd { n: n }
+
+fn build() -> i32
+    var h: Holder
+    h.t = make(1)     # splittable: field by field is legal
+    take(h)
+```
+
+```ritz expect-error="`g` may be unwritten: `g` has no initialiser (§13.6)"
+struct G
+    tag: i32
+
+impl Drop for G
+    fn drop(self: @&G)
+        self.tag = 0
+
+fn f() -> i32
+    var g: G
+    g.tag = 7     # G has its own drop: not splittable, assign the whole value
+    0
+```
+
 ### 4.3 Constants
 
 Module-level constants:
@@ -5717,12 +5763,17 @@ moved-from binding drops nothing and makes the binding an owner again.
 **Definite initialisation.** A binding declared with no initialiser, `var x: T`,
 owns nothing yet. When T has drop glue, every part of x with drop glue must be
 written, on every path, before x is moved, lent, returned or dropped (AGAST
-#4033, #4096). Each such part starts *unwritten*: T's fields, followed down
-through every struct with no `drop` of its own, to the first part that can't be
-split (a type with its own `drop`, an enum, an array, a tuple). When T itself
-can't be split, x is unwritten whole. Storing a part (`x.f = v`, `x.a.f = v`) or
-assigning x whole writes it, and drops nothing the first time, because there is
-no old value. Until every path has written it:
+#4033, #4096; LARB R59, narrowed on 2026-11-20, AGAST #4328). Each such part
+starts *unwritten*: for a **splittable** T — a struct with no `drop` of its
+own — T's fields, followed down through every splittable struct, to the first
+part that can't be split (a type with its own `drop`, an enum, an array, a
+tuple). A splittable T may therefore be built field by field:
+`var h: Holder; h.t = make(1); h` is legal as long as every part with drop glue
+is written on every path. When T itself can't be split, x starts unwritten
+whole, and R59's whole-assignment rule applies: a field store, read, borrow,
+move or return before `x = T { … }` is an error. Storing a part (`x.f = v`,
+`x.a.f = v`) or assigning x whole writes it, and drops nothing the first time,
+because there is no old value. Until every path has written it:
 
 - using x whole (moving, returning or lending it, `@x` or `@&x`), or using an
   unwritten part, is an error at the use. A store into a part of an unwritten

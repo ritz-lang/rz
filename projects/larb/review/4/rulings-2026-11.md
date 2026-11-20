@@ -1902,7 +1902,7 @@ point at uninitialised memory: `box_new` writes `*b.ptr = value` into fresh
 room measures with an instrumented build and stops at ~10. Tickets on confirm:
 ritz0, ritz1; before #2159.
 
-### R59: an uninitialised move-only `var` starts moved (#2180), CONFIRMED
+### R59: an uninitialised move-only `var` starts moved (#2180), CONFIRMED; narrowed to types that cannot be split (2026-11-20)
 **Measured.** `var h: Holder; h.t = make(1)` is never dropped on either
 compiler. Reading `h.t` before any store compiles and reads garbage (exit 48 on
 ritz0, 32 on ritz1); returning a partly built Holder hands garbage to the
@@ -1921,6 +1921,17 @@ struct literals; the room recounts with the checker. #2173's runtime root-flag
 guard becomes unreachable. Not covered: an uninitialised *copy* struct read,
 which is a general definite-initialisation question. Tickets on confirm: ritz0
 with the migration, then ritz1; before #2159.
+
+**Amended 2026-11-20 (Aaron, AGAST #4328): only a type that cannot be split.**
+A *splittable* struct — one with no `drop` of its own — does not start moved.
+It is definite-initialised field by field (option (a), #4033): each part with
+drop glue starts unwritten, and writing every such part on every path before a
+move, return or drop is enough. `var h: Holder; h.t = make(1); h` is legal.
+R59's "assign the whole value" refusal covers only a T that cannot be split:
+its own `Drop`, an enum, an array or a tuple. #4033 already implements this
+split, with the diagnostic "`x` may be unwritten: `x` has no initialiser
+(§13.6)"; #3477 and #3478 are narrowed to match. Language spec §4.2 and §13.6
+now say "splittable" explicitly. Corpus had 0 sites either way at #4033.
 
 ### R60: module-level values (#3338, #3412, #3436, ROADMAP GH #95): `const` AND `var`, ONE CONSTANT-INITIALISER RULE, CONFIRMED
 **Measured.**

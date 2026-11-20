@@ -1,9 +1,13 @@
 """ritz1's sources build every move-only value whole (LARB R59, AGAST #3592).
 
-R59: a `var x: T` with no initialiser, T move-only, starts as moved; a field
-store, read, borrow, move or return before a whole assignment is refused.
-ritz0 (#3477) and ritz1 (#3478) enforce it; once they do, any such `var` in
-ritz1's own sources stops ritz0 compiling ritz1, i.e. the bootstrap.
+R59, narrowed 2026-11-20 (AGAST #4328): a `var x: T` with no initialiser, T
+move-only and *not splittable* (its own Drop, an enum, an array, a tuple),
+starts unwritten whole; a field store, read, borrow, move or return before a
+whole assignment is refused.  A splittable struct (no Drop of its own) is
+definite-initialised field by field instead (#4033), so this recount is
+stricter than the rule: it keeps ritz1's sources building every value whole.
+ritz0 (#3477) and ritz1 (#3478) enforce the narrowed rule; #3592 converted
+these sites before the bootstrap could break.
 
 `emit_module` declared `var s: EmitterState` (move-only: five HashMapI64
 fields, which have Drop) and filled it field by field.  These tests hook
