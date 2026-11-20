@@ -311,9 +311,12 @@ CORPUS_FLOOR = 15000
 # binding as a pointer too (bk_tagged_binding, LocalVar.bk_ptr), Sema types a
 # user-enum payload (`Err(e)` of Result<T, Errno>) as its enum, and a payload
 # binding Sema typed (a struct one too) takes its bool kind from that type
-# (test_ritz1_payload_bk_gap.py).  What's left: `(*(@x)).f` where the emitter
-# is the unsure side, and `.as_bytes()` / a StrView index.  Lower it as they go.
-BK_GAP_CEILING = 10
+# (test_ritz1_payload_bk_gap.py).  4 at #3948, which taught the emitter's
+# bk_receiver to see through `@` / `@&` (`(*(@o.s)).x`) and to take an index's
+# element struct from index_elem_struct_name (a Vec / Span element), closing the
+# six `(*(@x)).f` gaps.  What's left: `.as_bytes()` / a StrView index on Sema's
+# side, and `KS[i]` of a `const [N]StrView`.  Lower it as they go.
+BK_GAP_CEILING = 4
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)

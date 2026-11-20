@@ -37,11 +37,13 @@ got an integer", not "cannot tell"; and one of `bool`s in the same shapes
 `const [N]bool`), which must compile.  Both failed before the change, row by row.
 """
 
+import os
 import re
+import subprocess
 
 import pytest
 
-from test_ref_into_value import _compile
+from test_ref_into_value import RITZ1_BUILD, RITZ_ROOT, _compile
 
 pytestmark = pytest.mark.integration
 
@@ -143,3 +145,59 @@ def test_a_bool_of_each_shape_is_a_condition(request, tmp_path, compiler):
     comp, ll, _ = _compile(compiler, tmp_path, "bk_gap_bool", src)
     out = comp.stdout + comp.stderr
     assert comp.returncode == 0 and ll.exists(), f"{compiler} refused it:\n{out}"
+
+
+# AGAST #3948: the emitter's bk_receiver read the struct through `*p`, `a[i]`
+# and a field, but not through the `@` / `@&` it derefs: `(*(@o.s)).x` and
+# `(*(@v[0])).x` were BK_UNSURE while Sema typed them, so a bool field of that
+# shape was refused.  The probe pins the two sides together; zero bk-gaps here
+# means the emitter now sees through the address too.
+ADDR_FIELD = """\
+import ritzlib.gvec
+
+struct S
+    a: i32
+    x: bool
+
+struct Outer
+    pad: i64
+    s: S
+
+fn main() -> i32
+    var o: Outer = Outer { pad: 0, s: S { a: 1, x: true } }
+    var arr: [2]S = [S { a: 0, x: true }, S { a: 0, x: false }]
+    var v = vec_new<S>()
+    v.push(S { a: 0, x: true })
+    v.push(S { a: 0, x: false })
+    if (*(@o.s)).x
+        if (*(@&o.s)).x
+            if (*(@arr[0])).x
+                if (*(@&arr[1])).x
+                    if (*(@v[0])).x
+                        return 0
+    1
+"""
+
+BKGAP = re.compile(r"sema-probe: \d+ compared, \d+ mismatched, \d+ lenient, "
+                   r"\d+ unknown, \d+ bool-gap, (\d+) bk-gap")
+
+
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_a_field_through_an_address_has_no_bool_kind_gap(request, tmp_path, compiler):
+    request.getfixturevalue("ritz1_bin")
+    binary = RITZ1_BUILD / compiler
+    work = tmp_path / f"bk_gap_addr_{compiler}"
+    work.mkdir()
+    src = work / "main.ritz"
+    src.write_text(ADDR_FIELD)
+    env = dict(os.environ, RITZ_PATH=str(RITZ_ROOT), RITZ1_SEMA_PROBE="1",
+               RITZ_CACHE_DIR=str(work / "cache"))
+    comp = subprocess.run([str(binary), str(src), "-o", str(work / "main.ll")],
+                          cwd=work, env=env, capture_output=True, text=True, timeout=120)
+    out = comp.stdout + comp.stderr
+    assert "sema-probe: mismatch" not in out, f"{compiler} disagrees:\n{out}"
+    gap = BKGAP.search(out)
+    assert gap, f"{compiler} printed no probe summary:\n{out}"
+    assert int(gap.group(1)) == 0, f"{compiler}: {gap.group(1)} bool-kind gaps\n{out}"
+    assert comp.returncode == 0 and (work / "main.ll").exists(), \
+        f"{compiler} refused a bool field through an address:\n{out}"
