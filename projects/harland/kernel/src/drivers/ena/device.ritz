@@ -42,10 +42,11 @@ import drivers.ena.admin {
     ENA_ADMIN_AENQ_NOTIFICATION, ENA_ADMIN_AENQ_KEEP_ALIVE
 }
 import drivers.ena.io_desc {
-    EnaTxDesc, EnaRxDesc, EnaRxCdescBase,
-    ENA_TX_DESC_SIZE, ENA_RX_DESC_SIZE, ENA_RX_CDESC_BASE_SIZE,
+    EnaTxDesc, EnaRxDesc, EnaRxCdescBase, EnaTxCdesc,
+    ENA_TX_DESC_SIZE, ENA_RX_DESC_SIZE, ENA_RX_CDESC_BASE_SIZE, ENA_TX_CDESC_EXT_SIZE,
     ena_tx_build_len_ctrl, ena_tx_build_meta_ctrl_simple, ena_rx_build_ctrl,
-    ena_rx_cdesc_phase_matches, ena_rx_cdesc_get_length, ena_rx_cdesc_get_req_id
+    ena_rx_cdesc_phase_matches, ena_rx_cdesc_get_length, ena_rx_cdesc_get_req_id,
+    ena_tx_cdesc_phase_matches
 }
 import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
 import mm.vmm { vmm_virt_to_phys, vmm_map_mmio, phys_to_virt }
@@ -71,6 +72,10 @@ const ENA_TX_BUFFER_COUNT: u32 = ENA_IO_QUEUE_DEPTH
 const ENA_ADMIN_TIMEOUT_US: u32 = 3000000   # 3 seconds
 const ENA_READY_TIMEOUT_US: u64 = 1000000   # 1 second
 const ENA_RESET_TIMEOUT_MS: u32 = 1000
+# A TX slot may be rewritten only once the device has completed its previous
+# use (#1851). If the completion queue somehow stops, fail the send rather
+# than overwrite a descriptor the NIC may still read.
+const ENA_TX_ROOM_TIMEOUT_US: u64 = 1000000
 
 # Local constants to avoid module access issues
 const SQ_DIR_TX: u8 = 1
@@ -125,6 +130,7 @@ struct EnaIoCq
     head: u16                     # Next to process
     phase: u8                     # Expected phase
     hw_index: u16                 # Hardware-assigned CQ index
+    head_db_offset: u32           # Completion head doorbell offset (0 = none)
     unmask_offset: u32            # Interrupt unmask register offset
 
 # ============================================================================
@@ -261,6 +267,16 @@ fn ena_get_phys_or_virt(phys: u64, virt: u64) -> u64
     if phys != 0
         return phys
     virt
+
+# Tell the device how many completion entries the driver has consumed. The
+# CreateCQ response names the register (cq_head_db_offset); a device that
+# returns 0 does not need it. Without this the device's completion queue
+# fills after `depth` entries and it stops writing more: on the first Nitro
+# boot that was 244 replies out of a 300-frame TX burst, and then total RX
+# silence (AGAST #1851).
+fn ena_cq_head_doorbell(dev: *EnaDevice, cq: *EnaIoCq)
+    if (*cq).head_db_offset != 0
+        ena_write32(dev, (*cq).head_db_offset, (*cq).head as u32)
 
 # ============================================================================
 # MMIO Register Access
@@ -883,12 +899,17 @@ fn ena_create_cq(dev: *EnaDevice, qid: u16, depth: u16, direction: u8, cq_out: *
     let resp: *EnaAdminCreateCqResp = entry_addr as *EnaAdminCreateCqResp
 
     (*cq_out).hw_index = (*resp).cq_idx
+    (*cq_out).head_db_offset = (*resp).cq_head_db_offset
     (*cq_out).unmask_offset = (*resp).cq_interrupt_unmask_offset
 
     prints("[ena] CQ ")
     serial_print_dec(qid as u64)
     prints(" created, hw_idx=")
     serial_print_dec((*cq_out).hw_index as u64)
+    prints(" head_db=0x")
+    serial_print_hex((*cq_out).head_db_offset as u64)
+    prints(" unmask=0x")
+    serial_print_hex((*cq_out).unmask_offset as u64)
     prints("\n")
 
     return 0
@@ -1204,6 +1225,53 @@ pub fn ena_init() -> i32
 
     return 0
 
+# ============================================================================
+# TX Completion Reclamation (AGAST #1851)
+# ============================================================================
+#
+# The device writes one 8-byte completion per TX descriptor that asked for
+# one, in submission order. Each completion frees the ring slot it names;
+# without this the ring wraps into descriptors the NIC still owns, the last
+# 56 frames of a 300-frame burst are never sent, and a full completion queue
+# stops the device entirely.
+
+fn ena_tx_reap(dev: *EnaDevice) -> u32
+    let tx_cq: *EnaIoCq = @(*dev).tx_cq
+    let tx_sq: *EnaIoSq = @(*dev).tx_sq
+    var n: u32 = 0
+    while true
+        read_barrier()
+        let entry_addr: u64 = ena_io_cq_entry_addr(tx_cq, (*tx_cq).head, ENA_TX_CDESC_EXT_SIZE)
+        let cqe: *EnaTxCdesc = entry_addr as *EnaTxCdesc
+        if not ena_tx_cdesc_phase_matches(cqe, (*tx_cq).phase)
+            break
+        (*tx_cq).head = (*tx_cq).head + 1
+        if (*tx_cq).head >= (*tx_cq).depth
+            (*tx_cq).head = 0
+            (*tx_cq).phase = (*tx_cq).phase ^ 1
+        (*tx_sq).tail = (*tx_sq).tail + 1
+        if (*tx_sq).tail >= (*tx_sq).depth
+            (*tx_sq).tail = 0
+        n = n + 1
+    if n > 0
+        ena_cq_head_doorbell(dev, tx_cq)
+    n
+
+# The ring holds depth-1 descriptors: one slot separates head from tail.
+fn ena_tx_slot_available(sq: *EnaIoSq) -> bool
+    var next: u16 = (*sq).head + 1
+    if next >= (*sq).depth
+        next = 0
+    next != (*sq).tail
+
+# Descriptors submitted and not yet completed, for the driver's own tests.
+pub fn ena_tx_outstanding() -> u16
+    let sq: *EnaIoSq = @ena_dev.tx_sq
+    let used: u16 = (*sq).head + (*sq).depth - (*sq).tail
+    if used >= (*sq).depth
+        return used - (*sq).depth
+    used
+
 pub fn ena_send(data: *u8, len: u32) -> i32
     if ena_dev.initialized == 0
         return -1
@@ -1212,6 +1280,17 @@ pub fn ena_send(data: *u8, len: u32) -> i32
         return -1
 
     let tx_sq: *EnaIoSq = @ena_dev.tx_sq
+
+    # Never rewrite a slot the device may still read: reap what it has
+    # completed, and if the ring is momentarily full wait for it (bounded).
+    ena_tx_reap(@ena_dev)
+    let room_deadline: u64 = deadline_after_us(ENA_TX_ROOM_TIMEOUT_US)
+    while not ena_tx_slot_available(tx_sq)
+        if deadline_passed(room_deadline)
+            prints("[ena] TX ring full: no completions\n")
+            return -1
+        cpu_pause()
+        ena_tx_reap(@ena_dev)
 
     # Get buffer for this packet (simple: use head index)
     let buf_idx: u32 = tx_sq.head as u32
@@ -1247,6 +1326,9 @@ pub fn ena_send(data: *u8, len: u32) -> i32
     memory_barrier()
     ena_write32(@ena_dev, (*tx_sq).doorbell_offset, (*tx_sq).head as u32)
 
+    # Take a completion that is already there, so the next send has room.
+    ena_tx_reap(@ena_dev)
+
     return 0
 
 pub fn ena_poll(buf: *u8, max_len: u32) -> i32
@@ -1276,6 +1358,7 @@ pub fn ena_poll(buf: *u8, max_len: u32) -> i32
         if (*rx_cq).head >= (*rx_cq).depth
             (*rx_cq).head = 0
             (*rx_cq).phase = (*rx_cq).phase ^ 1
+        ena_cq_head_doorbell(@ena_dev, rx_cq)
         return 0
 
     let src_addr: u64 = ena_rx_buffer_addr(buf_idx as u32)
@@ -1317,9 +1400,10 @@ pub fn ena_poll(buf: *u8, max_len: u32) -> i32
         (*rx_sq).head = 0
         (*rx_sq).phase = (*rx_sq).phase ^ 1
 
-    # Ring RX doorbell
+    # Ring RX doorbell, then return the consumed completion entry (#1851).
     memory_barrier()
     ena_write32(@ena_dev, (*rx_sq).doorbell_offset, (*rx_sq).head as u32)
+    ena_cq_head_doorbell(@ena_dev, rx_cq)
 
     return copy_len as i32
 

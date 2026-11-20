@@ -213,6 +213,14 @@ var g_rx_cq_base: u64 = 0
 var g_rx_cq_depth: u16 = 0
 var g_rx_cq_prod: u32 = 0
 var g_rx_cq_phase: u8 = 1
+# TX completions (#1851): one 8-byte entry per TX doorbell, in order, as the
+# device writes them. The driver must reap them to reuse ring slots.
+var g_tx_cq_base: u64 = 0
+var g_tx_cq_depth: u16 = 0
+var g_tx_cq_prod: u32 = 0
+var g_tx_cq_phase: u8 = 1
+var g_tx_db_off: u32 = 0
+var g_last_tx_db: u32 = 0
 
 pub fn mmio_base() -> u64
     return @g_mmio[0] as u64
@@ -288,6 +296,9 @@ fn service()
         if (caps2 & 0x1F) == 4
             g_rx_cq_base = ba
             g_rx_cq_depth = cq_depth
+        else if (caps2 & 0x1F) == 2
+            g_tx_cq_base = ba
+            g_tx_cq_depth = cq_depth
     else if opcode == ENA_ADMIN_CREATE_SQ
         let identity: u8 = *((cmd + 4) as *u8)
         let direction: u8 = (identity >> 5) & 7
@@ -297,6 +308,7 @@ fn service()
         *((cqe + 10) as *u16) = 0
         if direction == 1
             *((cqe + 12) as *u32) = 0x100
+            g_tx_db_off = 0x100
         else
             *((cqe + 12) as *u32) = 0x200
         *((cqe + 16) as *u32) = 0
@@ -307,6 +319,19 @@ fn service()
         g_cq_idx = 0
         g_cq_phase = g_cq_phase ^ 1
 
+fn post_tx_complete()
+    if g_tx_cq_base == 0 or g_tx_cq_depth == 0
+        return
+    let cqe: u64 = g_tx_cq_base + (g_tx_cq_prod as u64) * 8
+    zero(cqe, 8)
+    *(cqe as *u16) = g_tx_cq_prod as u16
+    *((cqe + 2) as *u8) = 0
+    *((cqe + 3) as *u8) = g_tx_cq_phase
+    g_tx_cq_prod = g_tx_cq_prod + 1
+    if g_tx_cq_prod >= g_tx_cq_depth as u32
+        g_tx_cq_prod = 0
+        g_tx_cq_phase = g_tx_cq_phase ^ 1
+
 pub fn on_barrier() -> i32
     let sq: u64 = rd_addr(ENA_REGS_AQ_BASE_LO_OFF, ENA_REGS_AQ_BASE_HI_OFF)
     if sq != 0
@@ -314,6 +339,12 @@ pub fn on_barrier() -> i32
         if db != g_last_db
             g_last_db = db
             service()
+    # A TX doorbell completes the descriptor just submitted.
+    if g_tx_cq_base != 0 and g_tx_db_off != 0
+        let tdb: u32 = rd32(g_tx_db_off)
+        if tdb != g_last_tx_db
+            g_last_tx_db = tdb
+            post_tx_complete()
     let ctl: u32 = rd32(ENA_REGS_DEV_CTL_OFF)
     if (ctl & ENA_REGS_DEV_CTL_DEV_RESET_MASK) != 0
         wr32(ENA_REGS_DEV_STS_OFF, ENA_REGS_DEV_STS_RESET_IN_PROGRESS_MASK)
@@ -367,13 +398,14 @@ CHECKS = {
     15: "ena_send failed",
     16: "a submitted TX descriptor names a buffer outside the TX arena",
     17: "an RX completion whose req_id names no buffer was delivered",
+    18: "TX completions were not reaped: the ring filled with uncompleted slots",
 }
 
 PROGRAM = """\
 import drivers.ena.device {
     ena_init, ena_send, ena_poll,
     ena_tx_buffer_owned, ena_rx_buffer_owned, ena_rx_req_to_buf_index,
-    ena_check_io_buffers
+    ena_check_io_buffers, ena_tx_outstanding
 }
 import fakeena { post_rx_complete }
 
@@ -429,6 +461,11 @@ fn main() -> i32
 
     if ena_check_io_buffers() != 0
         return 16
+
+    # 300 sends into a 256-slot ring only work if completions are reaped:
+    # an unreaping driver leaves ~255 slots outstanding here (#1851).
+    if ena_tx_outstanding() > 2
+        return 18
     0
 """
 

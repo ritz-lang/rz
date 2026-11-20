@@ -92,16 +92,29 @@ EC2_INITRAMFS = $(BUILD_DIR)/ec2-initramfs.tar
 #
 # tools/mkec2disk.py builds the disk without root: no sudo, losetup, sgdisk
 # or mkfs.vfat, none of which a task room has (AGAST #1849).
+#
+# EC2_NET_RESPONDER=1 also writes the \harland\net-responder marker: the
+# acceptance boot (AGAST #1851) then keeps polling for a peer instance's ping.
+# The stamp file makes toggling the flag rebuild the image; a plain
+# `make ec2-disk` never waits for a peer that is not there.
+EC2_NET_RESPONDER ?= 0
+EC2_RESPONDER_STAMP = $(BUILD_DIR)/.ec2-net-responder-$(EC2_NET_RESPONDER)
+EC2_DISK_ARGS = $(if $(filter 1,$(EC2_NET_RESPONDER)),--net-responder,)
 ec2-disk: $(EC2_DISK)
 
 $(EC2_INITRAMFS): initramfs-bin
 	python3 $(HARLAND_DIR)/tools/mkinitramfs.py --bin-dir $(INITRAMFS_BIN) \
 		--init init_interactive --output $@
 
-$(EC2_DISK): kernel $(EC2_INITRAMFS)
+$(EC2_RESPONDER_STAMP):
+	@mkdir -p $(BUILD_DIR)
+	@rm -f $(BUILD_DIR)/.ec2-net-responder-*
+	@touch $@
+
+$(EC2_DISK): kernel $(EC2_INITRAMFS) $(EC2_RESPONDER_STAMP)
 	@echo "=== Creating EC2 Boot Disk (GPT + ESP) ==="
 	@mkdir -p $(BUILD_DIR)
-	python3 ./tools/mkec2disk.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(EC2_INITRAMFS)
+	python3 ./tools/mkec2disk.py $@ $(BOOTLOADER) $(KERNEL_ELF) $(EC2_INITRAMFS) $(EC2_DISK_ARGS)
 
 # One guarded boot on a real Nitro t3.micro: build, snapshot, apply, poll the
 # serial console for rzsh, save the log to boot-logs/, destroy everything.

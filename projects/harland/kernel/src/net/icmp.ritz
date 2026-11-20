@@ -26,6 +26,12 @@ var icmp_last_rtt: u64 = 0
 var icmp_reply_seen: [128]u8
 var icmp_distinct_replies: u32 = 0
 
+# Inbound echo requests answered (AGAST #1851). The pre-init responder window
+# stops polling once a peer's request has been answered, and these totals are
+# printed into the serial log as the acceptance evidence.
+var icmp_echo_requests: u32 = 0
+var icmp_echo_replies_sent: u32 = 0
+
 # ============================================================================
 # ICMP Echo Header Structure
 # ============================================================================
@@ -102,7 +108,7 @@ pub fn icmp_ping(dst_ip: *u8) -> i32
 # Handle Received ICMP Packet
 # ============================================================================
 
-pub fn icmp_handle_packet(icmp_buf: *u8, len: u32, src_ip: *u8)
+pub fn icmp_handle_packet(icmp_buf: *u8, len: u32, src_ip: *u8, src_mac: *u8)
     if len < ICMP_HEADER_SIZE
         return
 
@@ -120,30 +126,35 @@ pub fn icmp_handle_packet(icmp_buf: *u8, len: u32, src_ip: *u8)
 
     else if icmp_type == ICMP_ECHO_REQUEST
         # Respond to ping
+        icmp_echo_requests = icmp_echo_requests + 1
         prints("[icmp] Echo request from ")
         icmp_print_ip(src_ip)
         prints("\n")
 
         # Send echo reply
-        icmp_send_reply(icmp_buf, len, src_ip)
+        icmp_send_reply(icmp_buf, len, src_ip, src_mac)
 
 # ============================================================================
 # Send ICMP Echo Reply
 # ============================================================================
 
-fn icmp_send_reply(request_buf: *u8, request_len: u32, dst_ip: *u8)
-    var frame: [128]u8
-    var ip_buf: [64]u8
-    var icmp_buf: [64]u8
+fn icmp_send_reply(request_buf: *u8, request_len: u32, dst_ip: *u8, next_hop_mac: *u8)
+    # A standard Linux ping carries 56 bytes of data, so the ICMP message is
+    # 64 bytes; the IP header adds 20 and the Ethernet header 14. The old
+    # 64-byte ip_buf overflowed on exactly that size and corrupted the frame
+    # being built, which is why a peer's ping went unanswered (AGAST #1851).
+    var frame: [192]u8
+    var ip_buf: [160]u8
+    var icmp_buf: [160]u8
 
     # Copy the request data
     var i: i32 = 0
-    while i < request_len as i32 and i < 64
+    while i < request_len as i32 and i < 128
         icmp_buf[i] = *(request_buf + i as i64)
         i = i + 1
 
     let icmp_len: u32 = request_len
-    if icmp_len > 64
+    if icmp_len > 128
         return  # Too large
 
     # Change type to reply
@@ -166,24 +177,38 @@ fn icmp_send_reply(request_buf: *u8, request_len: u32, dst_ip: *u8)
         ip_buf[ip_len as i32 + j] = icmp_buf[j]
         j = j + 1
 
-    # Get next hop IP
-    let next_hop: *u8 = ip_get_next_hop(dst_ip)
-
-    # Look up MAC address
+    # The L2 destination is the frame's source MAC: the peer itself when it
+    # is on-link, or the router that relayed the request. ARP cannot supply
+    # this when the request arrived through a router that resolved us on the
+    # peer's behalf (AGAST #1851: on EC2 the VPC relayed the peer's ping and
+    # the ARP cache held no entry for the peer's address).
     var dst_mac: [6]u8
-    if arp_cache_lookup(next_hop, @dst_mac[0]) < 0
-        # Can't send reply without MAC - ARP cache should have it from request
-        prints("[icmp] Cannot send reply: no MAC for sender\n")
-        return
+    var have_mac: u8 = 0
+    if next_hop_mac != (0 as *u8)
+        var k: i32 = 0
+        while k < 6
+            dst_mac[k] = *(next_hop_mac + k as i64)
+            if dst_mac[k] != 0
+                have_mac = 1
+            k = k + 1
+
+    # Fall back to the neighbour table when no source MAC was carried.
+    if have_mac == 0
+        let next_hop: *u8 = ip_get_next_hop(dst_ip)
+        if arp_cache_lookup(next_hop, @dst_mac[0]) < 0
+            prints("[icmp] Cannot send reply: no MAC for sender\n")
+            return
 
     # Build Ethernet frame
     let frame_len: u32 = eth_build_frame(@frame[0], @dst_mac[0], ETHERTYPE_IPV4, @ip_buf[0], ip_len + icmp_len)
 
     # Send
-    net_send(@frame[0], frame_len)
-    prints("[icmp] Sent reply to ")
-    icmp_print_ip(dst_ip)
-    prints("\n")
+    let sent: i32 = net_send(@frame[0], frame_len)
+    if sent >= 0
+        icmp_echo_replies_sent = icmp_echo_replies_sent + 1
+        prints("[icmp] Sent reply to ")
+        icmp_print_ip(dst_ip)
+        prints("\n")
 
 # ============================================================================
 # Query State
@@ -211,6 +236,13 @@ fn icmp_note_reply(seq: u16)
 # Echo replies with a sequence number not seen before (seq < 1024 only)
 pub fn icmp_distinct_reply_count() -> u32
     return icmp_distinct_replies
+
+# Inbound echo requests seen, and replies we actually sent for them (#1851).
+pub fn icmp_echo_request_count() -> u32
+    return icmp_echo_requests
+
+pub fn icmp_echo_reply_sent_count() -> u32
+    return icmp_echo_replies_sent
 
 # ============================================================================
 # Debug

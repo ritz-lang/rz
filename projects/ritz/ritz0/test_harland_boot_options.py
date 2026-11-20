@@ -82,6 +82,10 @@ def test_boot_info_v3_appends_the_network_self_test_flag():
     code = _code(PMM)
     assert _const(code, "HARLAND_BOOT_VERSION_FLAGS") == 3
     assert _const(code, "HARLAND_BOOT_FLAG_NET_SELFTEST") == 1
+    # AGAST #1851: a second boot option, so the EC2 acceptance image can ask
+    # the kernel to keep polling until a peer instance's ping is answered
+    # without making every other net-selftest boot wait for a peer.
+    assert _const(code, "HARLAND_BOOT_FLAG_NET_RESPONDER") == 2
     fields = _struct_fields(code, "pub struct HarlandBootInfo")
     # Appended after version 2's initramfs fields: an older loader's offset
     # for every field it knows must not move.
@@ -102,6 +106,8 @@ def test_loader_and_kernel_agree_on_the_boot_option():
     assert _const(loader, "BOOT_VERSION") == 3
     assert _const(loader, "BOOT_FLAG_NET_SELFTEST") == _const(
         kernel, "HARLAND_BOOT_FLAG_NET_SELFTEST")
+    assert _const(loader, "BOOT_FLAG_NET_RESPONDER") == _const(
+        kernel, "HARLAND_BOOT_FLAG_NET_RESPONDER")
 
 
 def test_loader_reads_the_marker_from_the_boot_volume():
@@ -109,10 +115,46 @@ def test_loader_reads_the_marker_from_the_boot_volume():
     probe = _fn_body(code, "load_boot_options_from_fs")
     assert 'ascii_to_ucs2("\\\\harland\\\\net-selftest"' in probe
     assert "boot_flags = boot_flags | BOOT_FLAG_NET_SELFTEST" in probe
+
+
+def test_loader_reads_the_net_responder_marker():
+    """AGAST #1851: the EC2 acceptance image adds \\harland\\net-responder;
+    the kernel then waits a bounded window for an inbound ICMP echo request."""
+    code = _code(BOOT_MAIN)
+    probe = _fn_body(code, "load_boot_options_from_fs")
+    assert 'ascii_to_ucs2("\\\\harland\\\\net-responder"' in probe
+    assert "boot_flags = boot_flags | BOOT_FLAG_NET_RESPONDER" in probe
     # Called while the root volume is open, as the initramfs probe is...
     assert "load_boot_options_from_fs(root_file)" in _fn_body(code, "load_kernel_from_fs")
     # ...and handed to the kernel in BootInfo.
     assert "boot_info.flags = boot_flags" in _fn_body(code, "build_boot_info")
+
+
+def test_kernel_hands_the_responder_option_to_postinit():
+    body = _fn_body(_code(MAIN), "kernel_main")
+    assert "var run_net_responder: bool = false" in body
+    assert re.search(
+        r"run_net_responder = "
+        r"\(\(\*harland_boot_info\)\.flags & HARLAND_BOOT_FLAG_NET_RESPONDER\) != 0",
+        body), body
+    assert "postinit_diagnostics(run_net_selftests, run_net_responder)" in body
+
+
+def test_postinit_waits_for_a_peer_ping_only_when_asked():
+    """The responder window must be bounded, must poll the NIC (so ARP and
+    ICMP are answered), and must log the counters that are the acceptance
+    evidence in the serial log."""
+    code = _code(KERNEL_SRC / "postinit.ritz")
+    diagnostics = _fn_body(code, "postinit_diagnostics")
+    assert "network_dhcp_ping(run_net_responder)" in diagnostics
+    net = _fn_body(code, "network_dhcp_ping")
+    assert "network_wait_for_peer_ping()" in net
+    wait = _fn_body(code, "network_wait_for_peer_ping")
+    assert "net_poll()" in wait
+    assert "deadline_after_us" in wait and "deadline_passed" in wait
+    assert "icmp_echo_request_count()" in wait
+    assert "icmp_echo_reply_sent_count()" in wait
+    assert "[net] peer ping" in wait
 
 
 def test_kernel_reads_flags_only_from_a_v3_boot_info():
@@ -125,12 +167,13 @@ def test_kernel_reads_flags_only_from_a_v3_boot_info():
         r"\s+run_net_selftests = "
         r"\(\(\*harland_boot_info\)\.flags & HARLAND_BOOT_FLAG_NET_SELFTEST\) != 0",
         body), body
-    assert "postinit_diagnostics(run_net_selftests)" in body
+    assert "postinit_diagnostics(run_net_selftests, run_net_responder)" in body
 
 
 def test_main_imports_the_flag_constants():
     names = _imports_from(_code(MAIN), "mm.pmm")
-    assert {"HARLAND_BOOT_VERSION_FLAGS", "HARLAND_BOOT_FLAG_NET_SELFTEST"} <= names
+    assert {"HARLAND_BOOT_VERSION_FLAGS", "HARLAND_BOOT_FLAG_NET_SELFTEST",
+            "HARLAND_BOOT_FLAG_NET_RESPONDER"} <= names
 
 
 def test_only_the_qemu_nic_gate_asks_for_the_network_self_tests():

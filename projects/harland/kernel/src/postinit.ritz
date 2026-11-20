@@ -18,12 +18,13 @@ import drivers.msix { msix_print_all }
 import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop }
-import arch.x86_64.tsc { delay_us }
+import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test }
-import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_configured }
+import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_configured, net_device_type }
 import net.ip { ip_get_gateway, ip_print_config }
-import net.icmp { icmp_ping, icmp_distinct_reply_count }
+import net.icmp { icmp_ping, icmp_distinct_reply_count, icmp_echo_request_count, icmp_echo_reply_sent_count }
 import net.arp { arp_cache_lookup, arp_send_request }
+import drivers.netdev { NETDEV_TYPE_ENA }
 import loader.elf { test_elf_loader }
 import syscall.runtime.memory { munmap_self_test, mmap_failure_self_test, mmap_overlap_self_test, mmap_cursor_self_test }
 
@@ -404,9 +405,16 @@ fn network_tx_burst()
     serial_print_dec((icmp_distinct_reply_count() - base) as u64)
     prints("\n")
 
+# AGAST #1851: how long the EC2 acceptance boot keeps polling for an inbound
+# ping from the peer instance after DHCP. Bounded, and only armed by the
+# \harland\net-responder boot option (the acceptance image), so no other
+# boot pays for it. It runs before the TX burst so the peer's first packets
+# meet a quiet RX path, and a peer that answers ends the wait immediately.
+const NET_PEER_PING_WINDOW_US: u64 = 240000000   # 240 seconds
+
 # Only called when the boot option asked for it (AGAST #4335): this probes
 # every NIC driver, so on hardware whose driver is broken it can panic.
-fn network_dhcp_ping()
+fn network_dhcp_ping(run_net_responder: bool)
     # Initialize network stack (includes VirtIO-net driver)
     prints("\n=== Initializing Network Stack ===\n")
     let net_result: i32 = net_stack_init()
@@ -454,11 +462,48 @@ fn network_dhcp_ping()
         if net_is_configured()
             prints("\n  Network configured!\n")
             ip_print_config()
+            # The acceptance peer pings this instance; answer it from the
+            # serial log's point of view before the TX burst starts moving
+            # the device's queues (#1851).
+            if run_net_responder and net_device_type() == NETDEV_TYPE_ENA
+                network_wait_for_peer_ping()
             network_tx_burst()
         else
             prints("\n  DHCP timeout (no response in test window)\n")
     else
         prints("  Network stack initialization failed\n")
+
+# AGAST #1851: keep polling for a peer instance's ping. The QEMU NIC gate has
+# no peer, so this runs only on ENA and only when the boot image carries the
+# \harland\net-responder marker. net_poll answers the peer's ARP request and
+# replies to its ICMP echo request; icmp.ritz logs both, and the counters
+# below are printed so the serial log carries the totals as evidence.
+fn network_wait_for_peer_ping()
+    prints("\n  Waiting up to 240s for a peer ping...\n")
+    let deadline: u64 = deadline_after_us(NET_PEER_PING_WINDOW_US)
+    # Once a request has been answered, keep answering for a short grace
+    # period: if the first reply is lost, the peer's next ping still gets an
+    # answer instead of finding us gone.
+    var answered: u8 = 0
+    var grace_deadline: u64 = 0
+    while not deadline_passed(deadline)
+        net_poll()
+        if icmp_echo_request_count() > 0 and icmp_echo_reply_sent_count() > 0
+            if answered == 0
+                answered = 1
+                grace_deadline = deadline_after_us(5000000)   # 5 seconds
+            else if deadline_passed(grace_deadline)
+                break
+        delay_us(1000)
+
+    if icmp_echo_request_count() > 0
+        prints("[net] peer ping: requests=")
+        serial_print_dec(icmp_echo_request_count() as u64)
+        prints(" replies=")
+        serial_print_dec(icmp_echo_reply_sent_count() as u64)
+        prints("\n")
+    else
+        prints("[net] peer ping: no echo request within 240s\n")
 
 # Switch the NVMe controllers nvme_probe found at boot (polled: the APIC was
 # not up yet) to MSI-X, then read each namespace with interrupts on, so every
@@ -510,14 +555,14 @@ fn virtio_blk_check()
 # not find the boot volume's \harland\net-selftest marker (every boot except
 # QEMU's NIC gate), the NIC is left alone until init is up, so a misbehaving
 # driver cannot keep init_interactive and rzsh from starting.
-pub fn postinit_diagnostics(run_net_selftests: bool)
+pub fn postinit_diagnostics(run_net_selftests: bool, run_net_responder: bool)
     # PCI already initialized early - just print discovered devices
     prints("\n=== PCI Devices ===\n")
     pci_print_all_devices()
     msix_print_all()
 
     if run_net_selftests
-        network_dhcp_ping()
+        network_dhcp_ping(run_net_responder)
     else
         prints("[net] Network self-tests skipped: boot option \\harland\\net-selftest not set\n")
 

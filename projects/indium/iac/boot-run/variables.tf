@@ -24,3 +24,9 @@ variable "instance_type" {
     error_message = "The cost guard allows t3.micro only (AGAST #1849); anything else goes to Aaron."
   }
 }
+
+variable "peer_ping" {
+  description = "Launch the one ping peer for the #1851 acceptance (same t3.micro type, same subnet)"
+  type        = bool
+  default     = true
+}

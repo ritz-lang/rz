@@ -115,11 +115,45 @@ def test_boot_run_only_allows_t3_micro():
     assert "validation" in block and '== "t3.micro"' in block
 
 
-def test_boot_run_has_no_ingress_and_standard_credits():
+def test_boot_run_ingress_is_only_icmp_from_itself():
+    """AGAST #1851: the acceptance boot must be pingable from a peer in the
+    same subnet. One self-referencing ICMP rule does that; nothing else is
+    exposed, and egress stays open because DHCP and the gateway ping need it.
+    """
     tf = (BOOT_RUN / "main.tf").read_text()
-    assert not re.search(r"^\s*ingress\s*\{", tf, re.M), "the boot instance needs no inbound traffic"
+    rules = re.findall(r"^\s*ingress\s*\{(.*?)^\s*\}", tf, re.M | re.S)
+    assert len(rules) == 1, rules
+    assert 'protocol    = "icmp"' in rules[0] or 'protocol = "icmp"' in rules[0]
+    assert re.search(r"^\s*self\s*=\s*true", rules[0], re.M)
+    assert "cidr_blocks" not in rules[0]
+    assert re.search(r"^\s*egress\s*\{.*?0\.0\.0\.0/0", tf, re.M | re.S), \
+        "egress is needed for DHCP and the gateway ping"
     assert 'cpu_credits = "standard"' in tf, "t3 unlimited bills surplus credits"
     assert 'instance_initiated_shutdown_behavior = "terminate"' in tf
+
+
+def test_boot_run_launches_at_most_one_ping_peer_in_the_same_subnet():
+    """The peer exists only to ping harland: one t3.micro, the same subnet,
+    the same (self-ICMP) security group, and a user-data loop that pings the
+    harland private IP until it gets a reply."""
+    tf = (BOOT_RUN / "main.tf").read_text()
+    assert 'resource "aws_instance" "peer"' in tf
+    peer = tf[tf.index('resource "aws_instance" "peer"'):]
+    assert "count" in peer[:200] and "var.peer_ping ? 1 : 0" in peer[:300]
+    assert "instance_type               = var.instance_type" in tf
+    assert "subnet_id                   = local.subnet_id" in tf, \
+        "both instances must come up in the same subnet"
+    assert "aws_instance.harland.private_ip" in peer
+    assert "ping -c 1" in peer
+    assert "shutdown -h now" in peer, "the peer must end its own bill"
+    assert "vpc_security_group_ids      = [aws_security_group.harland.id]" in peer
+    assert 'instance_initiated_shutdown_behavior = "terminate"' in peer
+
+
+def test_boot_run_outputs_the_peer_for_the_log_header():
+    out = (BOOT_RUN / "outputs.tf").read_text()
+    assert 'output "peer_instance_id"' in out
+    assert 'output "peer_ip"' in out
 
 
 @pytest.mark.skipif(shutil.which("terraform") is None, reason="terraform not installed")
@@ -342,6 +376,58 @@ def test_mkec2disk_lays_out_the_esp(tmp_path, monkeypatch):
     assert files["harland/kernel.elf"] == kernel.read_bytes()
     assert files["harland/initramfs.tar"] == initrd.read_bytes()
     assert b"BOOTX64.EFI" in files["startup.nsh"]
+    # AGAST #1851: the EC2 image runs the NIC self-tests (ENA, DHCP), and
+    # only the peer-ping build adds the responder window.
+    assert files["harland/net-selftest"] == b""
+    assert "harland/net-responder" not in files
+
+
+def test_mkec2disk_can_ask_for_the_peer_ping_window(tmp_path):
+    """--net-responder adds the second boot marker; the default image does
+    not, so an ordinary EC2 boot never waits for a peer that is not there."""
+    sys.path.insert(0, str(INDIUM.parent / "harland" / "inventory"))
+    import esp_image
+    import mkec2disk
+
+    efi, kernel, initrd = (tmp_path / n for n in ("BOOTX64.EFI", "kernel.elf", "initramfs.tar"))
+    efi.write_bytes(b"MZ")
+    kernel.write_bytes(b"\x7fELF")
+    initrd.write_bytes(b"t")
+    out = tmp_path / "ec2-boot.img"
+    mkec2disk.build(out, efi, kernel, initrd, size_mib=64, net_responder=True)
+    files = {k.lower(): v for k, v in esp_image.read_files(out).items()}
+    assert files["harland/net-selftest"] == b""
+    assert files["harland/net-responder"] == b""
+
+
+def test_apply_asks_for_the_ping_peer_by_default(env):
+    # Without --no-build: the dry run prints the make command it would run.
+    p = run(env, "--dry-run", "--image", str(env["image"]), "--log-dir", str(env["logs"]))
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "peer_ping=true" in p.stderr
+    assert "EC2_NET_RESPONDER=1" in p.stdout
+
+
+def test_no_peer_flag_leaves_the_peer_out(env):
+    p = run(env, "--dry-run", "--image", str(env["image"]), "--log-dir", str(env["logs"]),
+            "--no-peer")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "peer_ping=false" in p.stderr
+    assert "EC2_NET_RESPONDER=0" in p.stdout
+    text = next(env["logs"].iterdir()).read_text()
+    assert "# peer: none" in text
+
+
+def test_log_header_names_the_peer_for_correlation(env):
+    p = dry(env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    text = next(env["logs"].iterdir()).read_text()
+    assert "# peer: i-peer-dry 172.31.32.10" in text
+
+
+def test_two_instances_are_billed_when_the_peer_runs(env):
+    p = dry(env)
+    assert re.search(r"billed seconds: \d+ x 2 instances", p.stdout), p.stdout
 
 
 def test_a_committed_nitro_boot_log_exists():
@@ -353,3 +439,17 @@ def test_a_committed_nitro_boot_log_exists():
     assert text.startswith("# harland boot on EC2 Nitro (AGAST #1849)")
     assert re.search(r"^# instance: i-[0-9a-f]+ t3\.micro us-west-2", text, re.M)
     assert "Harland kernel starting..." in text
+
+
+def test_the_1851_acceptance_log_records_dhcp_and_an_answered_peer_ping():
+    """AGAST #1851's acceptance, in the committed artefact: a VPC DHCP lease,
+    an echo request from the peer instance, harland's reply, and the peer's
+    own console confirming it got the reply."""
+    log = INDIUM / "boot-logs" / "2026-11-20-d6937a69d5a3.txt"
+    text = log.read_text(errors="replace")
+    assert re.search(r"^# peer: i-[0-9a-f]+ 172\.31\.", text, re.M)
+    assert re.search(r"\[dhcp\] ACK: 172\.31\.", text)
+    assert re.search(r"\[icmp\] Echo request from 172\.31\.", text)
+    assert re.search(r"\[icmp\] Sent reply to 172\.31\.", text)
+    assert re.search(r"\[net\] peer ping: requests=[1-9]\d* replies=[1-9]\d*", text)
+    assert "PEER: got a ping reply from 172.31." in text

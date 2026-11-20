@@ -148,13 +148,15 @@ def test_network_self_tests_are_opt_in():
     gate turns it on with the boot option; every other boot leaves the NIC
     alone until init is up."""
     code = _code(POSTINIT)
-    assert re.search(r"^pub fn postinit_diagnostics\(run_net_selftests: bool\)$", code, re.M)
+    assert re.search(
+        r"^pub fn postinit_diagnostics\(run_net_selftests: bool, run_net_responder: bool\)$",
+        code, re.M)
     body = _body(code, "postinit_diagnostics")
     # Exactly one call, and it is indented under `if run_net_selftests`.
     assert body.count("network_dhcp_ping(") == 1, body
     guard = re.search(r"^    if run_net_selftests\n(        .*\n)+", body, re.M)
     assert guard, "network_dhcp_ping() is not guarded by run_net_selftests"
-    assert "network_dhcp_ping()" in guard.group(0)
+    assert "network_dhcp_ping(run_net_responder)" in guard.group(0)
 
 
 @pytest.mark.parametrize("line", MOVED_LINES)
@@ -201,7 +203,7 @@ def test_kernel_main_keeps_the_boot_order():
         r"\bpostinit_self_tests\(has_boot_info\)",
         re.escape(r'prints("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",
-        r"\bpostinit_diagnostics\(run_net_selftests\)",
+        r"\bpostinit_diagnostics\(run_net_selftests, run_net_responder\)",
         r"\brun_init\(\)",
     ]
     hits = [list(re.finditer(s, body)) for s in steps]
