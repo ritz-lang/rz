@@ -665,7 +665,7 @@ pub fn emit_ir_error(s: *EmitterState, span: SrcSpan, msg: *u8)
 pub fn emit_ir_error_begin(s: *EmitterState, span: SrcSpan, msg: *u8)
     emit_str(s, c"  ; ERROR: ")
     emit_str(s, msg)
-    diag_error_at(g_emit_file, span)
+    diag_error_at(diag_source_file(), span)
     eprints_cstr(c"ritz1 cannot emit: ")
     eprints_cstr(msg)
 
@@ -735,22 +735,23 @@ pub fn emit_nd_error(s: *EmitterState, line: i32, col: i32, msg: *u8)
 # prints the rest, then a newline): `<file>:<line>:<col>: error: `, counted.
 pub fn emit_nd_error_begin(s: *EmitterState, line: i32, col: i32)
     emit_str(s, c"  ; ERROR\n")
-    diag_error_at(g_emit_file, diag_span(line, col))
+    diag_error_at(diag_source_file(), diag_span(line, col))
     s.error_count = s.error_count + 1
 
 # AGAST #1813 — where the emitter is, for fatal capacity errors: the input
-# file (set by the driver) and the function being emitted (set by emit_fn).
-var g_emit_file: *u8 = null
+# file and the function being emitted (set by emit_fn).  The file itself
+# moved to diag (AGAST #4319), so a check module can read it without
+# importing the emitter; these names stay as wrappers for emitter call sites.
 var g_emit_fn: *FnDef = null
 
 pub fn emitter_set_source_file(path: *u8)
-    g_emit_file = path
+    diag_set_source_file(path)
 
 pub fn emitter_set_current_fn(f: *FnDef)
     g_emit_fn = f
 
 pub fn emitter_source_file() -> *u8
-    g_emit_file
+    diag_source_file()
 
 pub fn emitter_current_fn() -> *FnDef
     g_emit_fn
@@ -768,8 +769,9 @@ const ASSERT_FN_HELPER: i32 = 2   # [[test_helper]]: reports the test's call sit
 # but no column, so this is the one emitter error diag_loc can't print
 # (#3445): it would have to invent the column.
 fn emit_fatal_limit(what: *u8, limit: i32)
-    if g_emit_file != null
-        eprints_cstr(g_emit_file)
+    let file: *u8 = diag_source_file()
+    if file != null
+        eprints_cstr(file)
     else
         eprints_cstr(c"<input>")
     # Through a local: ritz1 cannot lower a member read on a global pointer.
@@ -1655,13 +1657,10 @@ pub fn find_fn(s: *EmitterState, name: *u8, len: i32) -> *FnDef
     return null
 
 # The file a fn's lines belong to: a specialised generic may come from an import.
+# The body moved to diag (AGAST #4319); kept here for the emitter modules that
+# import only emitter_core.
 pub fn fn_source_file(f: *FnDef) -> *u8
-    if f != null and f.def_file != null
-        return f.def_file
-    let file: *u8 = emitter_source_file()
-    if file != null
-        return file
-    c"<input>"
+    diag_fn_source_file(f)
 
 # AGAST #2260: is `e`'s value used by a statement being emitted?
 fn value_wanted(s: *EmitterState, e: *Expr) -> i32
@@ -1857,28 +1856,10 @@ pub fn value_fn_sig(s: *EmitterState, c: *Expr) -> *FnDef
             return fd.ret_fn_sig
     return null
 
-# Find a struct definition by name.  Same null-as-miss optimization.
+# struct_map_find moved to ast_query (AGAST #4319); re-exported through
+# `pub import ast_query` above.
 pub fn find_struct(s: *EmitterState, name: *u8, len: i32) -> *StructDef
     struct_map_find(@s.struct_map, s.module, name, len)
-
-# find_struct over any fnv1a(name) -> first-StructDef map of `m`'s structs:
-# the emitter's, or Sema's (AGAST #3505).
-pub fn struct_map_find(map: *HashMapI64, m: *Module, name: *u8, len: i32) -> *StructDef
-    let key: i64 = fnv1a_str(name, len) as i64
-    let st: *StructDef = hashmap_i64_get(map, key) as *StructDef
-    if st == null
-        return null
-    if name_eq(st.name, st.name_len, name, len) == 1
-        return st
-    # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
-    # another name is a collision, not a miss.  Scan the list (first
-    # occurrence wins, as in build_symbol_maps).
-    var cur: *StructDef = m.structs
-    while cur != null
-        if name_eq(cur.name, cur.name_len, name, len) == 1
-            return cur
-        cur = cur.next
-    return null
 
 # Result struct for emit_member_ptr - returns pointer register and field info
 struct MemberPtrResult
@@ -2011,29 +1992,8 @@ pub fn was_global_emitted(s: *EmitterState, name: *u8, len: i32) -> i32
 pub fn mark_global_emitted(s: *EmitterState, name: *u8, len: i32)
     namelist_push(@s.emitted_globals, name, len)
 
-# Check for well-known constants from ritzlib.sys
-fn find_builtin_const(name: *u8, len: i32) -> i64
-    # STDIN, STDOUT, STDERR
-    if name_eq(name, len, c"STDIN", 5) == 1
-        return 0
-    if name_eq(name, len, c"STDOUT", 6) == 1
-        return 1
-    if name_eq(name, len, c"STDERR", 6) == 1
-        return 2
-    # O_RDONLY, O_WRONLY, O_RDWR
-    if name_eq(name, len, c"O_RDONLY", 8) == 1
-        return 0
-    if name_eq(name, len, c"O_WRONLY", 8) == 1
-        return 1
-    if name_eq(name, len, c"O_RDWR", 6) == 1
-        return 2
-    # Return a sentinel that means "not found"
-    return -9999
-
-pub fn is_builtin_const(name: *u8, len: i32) -> i32
-    if find_builtin_const(name, len) != -9999
-        return 1
-    0
+# find_builtin_const / is_builtin_const moved to ast_query (AGAST #4319);
+# re-exported through `pub import ast_query` above.
 
 pub fn find_const(s: *EmitterState, name: *u8, len: i32) -> i64
     # First check module constants via HashMap
@@ -2427,50 +2387,8 @@ pub fn tagged_enum_err_payload_named(s: *EmitterState, name: *u8, name_len: i32,
 # had when this was the only size (AGAST #1476).
 const TAGGED_ENUM_FALLBACK_BYTES: i64 = 144
 
-# Arity of the generic one `$`-component of a mangled name names: Result 2,
-# Option 1, a generic struct or enum template its parameter count; 0 for a leaf
-# (primitive, concrete struct, pointer to a leaf).  `ptr_` prefixes are
-# skipped: `ptr_Vec$u8` is one argument.
-fn te_component_arity(structs: *HashMapI64, m: *Module, name: *u8, len: i32) -> i32
-    var p: *u8 = name
-    var n: i32 = len
-    var k0: i32 = mangled_ref_prefix(p, n)
-    while k0 > 0
-        p = p + k0
-        n = n - k0
-        k0 = mangled_ref_prefix(p, n)
-    if name_eq(p, n, c"Result", 6) == 1
-        return 2
-    if name_eq(p, n, c"Option", 6) == 1
-        return 1
-    let st: *StructDef = struct_map_find(structs, m, p, n)
-    if st == null
-        # AGAST #3021: a generic enum template's parameter count, so
-        # `Option$Slot$i32` splits into Option's one argument `Slot$i32`.
-        return enum_type_param_count(enum_find(p, n))
-    if st.type_params == null
-        return 0
-    var k: i32 = 0
-    var tp: *TypeParam = st.type_params
-    while tp != null
-        k = k + 1
-        tp = tp.next
-    k
-
-# End (exclusive) of the mangled type argument starting at buf[pos]: its
-# first component plus one nested argument per generic parameter.
-fn te_arg_end(structs: *HashMapI64, m: *Module, buf: *u8, len: i32, pos: i32) -> i32
-    var end: i32 = pos
-    while end < len and *(buf + end) != 36   # '$'
-        end = end + 1
-    let arity: i32 = te_component_arity(structs, m, buf + pos, end - pos)
-    var k: i32 = 0
-    while k < arity
-        if end >= len
-            return end
-        end = te_arg_end(structs, m, buf, len, end + 1)
-        k = k + 1
-    end
+# te_component_arity, te_arg_end and tagged_enum_arg_in moved to ast_query
+# (AGAST #4319); re-exported through `pub import ast_query` above.
 
 # The mangled type argument a tagged-enum variant carries: variant 0 is T
 # (Ok / Some), variant 1 is Result's E.  null (out_len 0) for Option's None,
@@ -2478,35 +2396,6 @@ fn te_arg_end(structs: *HashMapI64, m: *Module, buf: *u8, len: i32, pos: i32) ->
 # arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
 pub fn tagged_enum_arg(s: *EmitterState, name: *u8, len: i32, variant: i32, out_len: *i32) -> *u8
     tagged_enum_arg_in(@s.struct_map, s.module, name, len, variant, out_len)
-
-# tagged_enum_arg over a struct map of `m` (struct_map_find): Sema's too.
-pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name: *u8, len: i32, variant: i32, out_len: *i32) -> *u8
-    *out_len = 0
-    if name == null or is_tagged_enum_type(name, len) == 0
-        return null
-    let start: i32 = 7
-    if start >= len
-        return null
-    let is_result: i32 = name_eq(name, 6, c"Result", 6)
-    let end0: i32 = te_arg_end(structs, m, name, len, start)
-    if is_result == 0
-        if variant != 0 or end0 != len
-            return null
-        *out_len = end0 - start
-        return name + start
-    if end0 + 1 >= len
-        return null
-    let e_start: i32 = end0 + 1
-    let e_end: i32 = te_arg_end(structs, m, name, len, e_start)
-    if e_end != len
-        return null
-    if variant == 0
-        *out_len = end0 - start
-        return name + start
-    if variant != 1
-        return null
-    *out_len = e_end - e_start
-    return name + e_start
 
 # AGAST #2272: is a mangled argument `unit`, the `()` type?  It is zero bytes,
 # 1-aligned: `Result<(), i32>` is { i8, [3 x i8], [4 x i8] }, as in ritz0.
@@ -6146,7 +6035,7 @@ pub fn mem_builtin_pointee(s: *EmitterState, arg: *Expr) -> i32
 # `<file>:<line>:<col>: error: <builtin name> <msg>` (AGAST #1879).
 pub fn mem_builtin_error(s: *EmitterState, e: *Expr, msg: *u8)
     emit_str(s, c"  ; ERROR: memory builtin\n")
-    diag_error_at(g_emit_file, e.span)
+    diag_error_at(diag_source_file(), e.span)
     var i: i32 = 0
     while i < e.func_name_len
         eprint_char(*(e.func_name + i))

@@ -1,9 +1,10 @@
 # ritz1/src/ast_query.ritz - pure AST and name queries (AGAST #3513)
 #
-# Helpers that read only the AST, the parser's enum tables (ast_helpers) and
-# the primitive type table (types): no EmitterState, no Sema, no emitter
-# global.  They lived in emitter_core until #3513 (LARB F5, #1816), which made
-# every Sema module import the emitter for `name_eq` and its kin.  Sema
+# Helpers that read only the AST, the parser's enum tables (ast_helpers), the
+# primitive type table (types) and a caller-supplied struct map: no
+# EmitterState, no Sema, no emitter global.  They lived in emitter_core until
+# #3513 (LARB F5, #1816), which made every Sema module import the emitter for
+# `name_eq` and its kin.  Sema
 # and the check modules import this module; emitter_core `pub import`s it, so
 # an emitter module still reaches every one of them through emitter_core.
 #
@@ -13,6 +14,8 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.memory
+import ritzlib.hash       # fnv1a_str (struct_map_find)
+import ritzlib.hashmap    # HashMapI64
 
 import ast
 import types
@@ -421,3 +424,139 @@ pub fn mem_builtin_id(name: *u8, len: i32) -> i32
     if name_eq(name, len, c"fence", 5) == 1
         return MEM_FENCE
     0
+
+# =============================================================================
+# Builtin constants (AGAST #4319, moved off emitter_core so the check modules
+# that name them import no emitter module).
+# =============================================================================
+
+# The value of a well-known constant from ritzlib.sys, or -9999 for a name
+# that is not one.
+pub fn find_builtin_const(name: *u8, len: i32) -> i64
+    # STDIN, STDOUT, STDERR
+    if name_eq(name, len, c"STDIN", 5) == 1
+        return 0
+    if name_eq(name, len, c"STDOUT", 6) == 1
+        return 1
+    if name_eq(name, len, c"STDERR", 6) == 1
+        return 2
+    # O_RDONLY, O_WRONLY, O_RDWR
+    if name_eq(name, len, c"O_RDONLY", 8) == 1
+        return 0
+    if name_eq(name, len, c"O_WRONLY", 8) == 1
+        return 1
+    if name_eq(name, len, c"O_RDWR", 6) == 1
+        return 2
+    # Return a sentinel that means "not found"
+    return -9999
+
+pub fn is_builtin_const(name: *u8, len: i32) -> i32
+    if find_builtin_const(name, len) != -9999
+        return 1
+    0
+
+# =============================================================================
+# Struct lookup (AGAST #4319, moved off emitter_core with tagged_enum_arg_in).
+# =============================================================================
+
+# find a struct definition by name over any fnv1a(name) -> first-StructDef map
+# of `m`'s structs: the emitter's, or Sema's (AGAST #3505).
+pub fn struct_map_find(map: *HashMapI64, m: *Module, name: *u8, len: i32) -> *StructDef
+    let key: i64 = fnv1a_str(name, len) as i64
+    let st: *StructDef = hashmap_i64_get(map, key) as *StructDef
+    if st == null
+        return null
+    if name_eq(st.name, st.name_len, name, len) == 1
+        return st
+    # AGAST #1813: the map is keyed by the 64-bit hash alone, so a hit with
+    # another name is a collision, not a miss.  Scan the list (first
+    # occurrence wins, as in build_symbol_maps).
+    var cur: *StructDef = m.structs
+    while cur != null
+        if name_eq(cur.name, cur.name_len, name, len) == 1
+            return cur
+        cur = cur.next
+    return null
+
+# =============================================================================
+# Tagged-enum mangled arguments (AGAST #4319, moved off emitter_core).
+# =============================================================================
+
+# Arity of the generic one `$`-component of a mangled name names: Result 2,
+# Option 1, a generic struct or enum template its parameter count; 0 for a leaf
+# (primitive, concrete struct, pointer to a leaf).  `ptr_` prefixes are
+# skipped: `ptr_Vec$u8` is one argument.
+fn te_component_arity(structs: *HashMapI64, m: *Module, name: *u8, len: i32) -> i32
+    var p: *u8 = name
+    var n: i32 = len
+    var k0: i32 = mangled_ref_prefix(p, n)
+    while k0 > 0
+        p = p + k0
+        n = n - k0
+        k0 = mangled_ref_prefix(p, n)
+    if name_eq(p, n, c"Result", 6) == 1
+        return 2
+    if name_eq(p, n, c"Option", 6) == 1
+        return 1
+    let st: *StructDef = struct_map_find(structs, m, p, n)
+    if st == null
+        # AGAST #3021: a generic enum template's parameter count, so
+        # `Option$Slot$i32` splits into Option's one argument `Slot$i32`.
+        return enum_type_param_count(enum_find(p, n))
+    if st.type_params == null
+        return 0
+    var k: i32 = 0
+    var tp: *TypeParam = st.type_params
+    while tp != null
+        k = k + 1
+        tp = tp.next
+    k
+
+# End (exclusive) of the mangled type argument starting at buf[pos]: its
+# first component plus one nested argument per generic parameter.
+fn te_arg_end(structs: *HashMapI64, m: *Module, buf: *u8, len: i32, pos: i32) -> i32
+    var end: i32 = pos
+    while end < len and *(buf + end) != 36   # '$'
+        end = end + 1
+    let arity: i32 = te_component_arity(structs, m, buf + pos, end - pos)
+    var k: i32 = 0
+    while k < arity
+        if end >= len
+            return end
+        end = te_arg_end(structs, m, buf, len, end + 1)
+        k = k + 1
+    end
+
+# The mangled type argument a tagged-enum variant carries: variant 0 is T
+# (Ok / Some), variant 1 is Result's E.  null (out_len 0) for Option's None,
+# a non-tagged name, or a name that does not split into exactly its
+# arguments.  `Result$Vec$u8$i32`, variant 0 -> `Vec$u8`, 1 -> `i32`.
+#
+# The EmitterState wrapper (tagged_enum_arg) stays in emitter_core.
+pub fn tagged_enum_arg_in(structs: *HashMapI64, m: *Module, name: *u8, len: i32, variant: i32, out_len: *i32) -> *u8
+    *out_len = 0
+    if name == null or is_tagged_enum_type(name, len) == 0
+        return null
+    let start: i32 = 7
+    if start >= len
+        return null
+    let is_result: i32 = name_eq(name, 6, c"Result", 6)
+    let end0: i32 = te_arg_end(structs, m, name, len, start)
+    if is_result == 0
+        if variant != 0 or end0 != len
+            return null
+        *out_len = end0 - start
+        return name + start
+    if end0 + 1 >= len
+        return null
+    let e_start: i32 = end0 + 1
+    let e_end: i32 = te_arg_end(structs, m, name, len, e_start)
+    if e_end != len
+        return null
+    if variant == 0
+        *out_len = end0 - start
+        return name + start
+    if variant != 1
+        return null
+    *out_len = e_end - e_start
+    return name + e_start
