@@ -342,7 +342,13 @@ class TestRitz1:
 
     def test_ritz1_closure_ir_identical(self, tmp_path, monkeypatch):
         """A real closure: ritz1's own main.ritz and every module it imports,
-        warm (all interface texts stored) vs cold."""
+        warm (all interface texts stored) vs cold.
+
+        The cold compile's store is also checked: every import's stored text
+        is ritz0's bytes (AGAST #4418 folded the former
+        `test_ritz1_closure_texts_equal_ritz0s` in here — it cold-compiled
+        the same closure a second time, 13.6 CPU-s for an assertion the
+        cold compile already paid for)."""
         from import_resolver import collect_all_source_files
         main = RITZ_DIR / "ritz1" / "src" / "main.ritz"
         monkeypatch.setenv("RITZ_PATH", str(RITZ_DIR))
@@ -354,8 +360,15 @@ class TestRitz1:
         log = tmp_path / "parse.log"
         _ritz1(main, tmp_path / "warm.ll", store, log)
         assert _parsed(log) == [str(main)]
-        _ritz1(main, tmp_path / "cold.ll", tmp_path / "empty")
+        cold_store = tmp_path / "empty"
+        _ritz1(main, tmp_path / "cold.ll", cold_store)
         assert (tmp_path / "warm.ll").read_text() == (tmp_path / "cold.ll").read_text()
+        # Every import of the cold compile stored its text, and it is ritz0's
+        # -- the text `_warm` already wrote above, so no module is parsed a
+        # second time.
+        for p in closure:
+            assert (_text_path(cold_store, p.read_bytes()).read_text()
+                    == _text_path(store, p.read_bytes()).read_text()), p
 
 
 # ---------------------------------------------------------------------------
@@ -459,22 +472,6 @@ class TestRitz1Stores:
         _ritz1(proj / "main.ritz", tmp_path / "b.ll", store, log)
         assert _parsed(log) == [str(proj / "main.ritz")]
         assert (tmp_path / "a.ll").read_text() == (tmp_path / "b.ll").read_text()
-
-
-@pytest.mark.integration
-def test_ritz1_closure_texts_equal_ritz0s(ritz1_bin, tmp_path, monkeypatch):
-    """ritz1's own closure, cold: every import's stored text is ritz0's."""
-    from import_resolver import collect_all_source_files
-    main = RITZ_DIR / "ritz1" / "src" / "main.ritz"
-    monkeypatch.setenv("RITZ_PATH", str(RITZ_DIR))
-    closure = [Path(p) for p in collect_all_source_files(str(main))
-               if Path(p).resolve() != main.resolve()]
-    store = tmp_path / "store"
-    _ritz1(main, tmp_path / "m.ll", store)
-    for p in closure:
-        stored = _text_path(store, p.read_bytes())
-        assert stored.read_text() == _text(p.read_text()), p
-    assert len(closure) > 20
 
 
 # ---------------------------------------------------------------------------

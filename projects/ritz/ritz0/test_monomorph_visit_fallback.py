@@ -23,9 +23,11 @@ enters these kinds, so all three compilers run them.
 
 import pytest
 import ritz_ast as rast
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
 from monomorph import Monomorphizer
 from parser import parse
-from test_ritz1_builtin_struct_shadow import _run_pkg
+from test_table_rows import Row, Run
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
@@ -118,11 +120,18 @@ fn main() -> i32
 }
 
 
+# One table per compiler (AGAST #4418): each case used to launch its own
+# `build.py` package.  The nine cases share HEAD's imports, so as rows they
+# pay one ritzlib compile per process per compiler (#3906).
+RUNS = [Row(f"generic_instance_under_unlisted_kind_is_instantiated[{name}]",
+            table_rows.ALL, Run(HEAD + CASES[name], 42)) for name in sorted(CASES)]
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(CASES))
-def test_generic_instance_under_unlisted_kind_is_instantiated(tmp_path, compiler, name):
-    assert _run_pkg(compiler, tmp_path, name, HEAD + CASES[name]) == 42
+def test_generic_instance_under_unlisted_kind_is_instantiated(ritz1_bin, tmp_path, compiler):
+    table_rows.assert_rows(compiler, RUNS, build=table_rows.ritzlib_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
 
 
 # --- the walk itself, every wrapping kind ------------------------------------

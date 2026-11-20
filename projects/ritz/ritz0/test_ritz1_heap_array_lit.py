@@ -22,9 +22,9 @@ padded-size canary):
 """
 
 import pytest
-from test_borrow_param_ref_field import _compile
-from test_ritz1_builtin_struct_shadow import _run_pkg
-from test_ritz1_for_iterable import SELFHOSTED_BIN
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
+from test_table_rows import Row, Run
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
@@ -130,10 +130,18 @@ PROGRAMS = {
 }
 
 
+# One table per compiler (AGAST #4418): each case used to launch its own
+# `build.py` package.  The eight programs share HEAD's imports, so as rows
+# they pay one ritzlib compile per process per compiler (#3906); a failing
+# row is still compiled alone and named.
+RUNS = [Row(f"heap_array_holds_its_elements[{name}]", table_rows.ALL,
+            Run(HEAD + "pub fn main() -> i32\n" + PROGRAMS[name], 0))
+        for name in sorted(PROGRAMS)]
+
+
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_heap_array_holds_its_elements(tmp_path, compiler, name):
-    program = HEAD + "pub fn main() -> i32\n" + PROGRAMS[name]
-    assert _run_pkg(compiler, tmp_path, name, program) == 0
+def test_heap_array_holds_its_elements(ritz1_bin, tmp_path, compiler):
+    table_rows.assert_rows(compiler, RUNS, build=table_rows.ritzlib_build(ritz1_bin),
+                           compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
 

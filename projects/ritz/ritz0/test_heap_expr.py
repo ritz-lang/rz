@@ -24,8 +24,9 @@ wrong width or the wrong value still fails.
 
 import pytest
 
+import test_table_rows as table_rows
 from test_ref_into_value import _compile
-from test_ritz1_builtin_struct_shadow import _run_pkg
+from test_table_rows import Run
 
 pytestmark = pytest.mark.integration
 
@@ -136,11 +137,18 @@ pub fn main() -> i32
 }
 
 
+# One table per compiler (AGAST #4418): each case used to launch `build.py`
+# for its own package, paying a Python start and a cold build cache.  As rows,
+# every ritzlib module a chunk imports is compiled once per process per
+# compiler and linked onto the batch (test_table_rows.ritzlib_build, #3906);
+# a row that fails is still compiled again on its own and named.
+RUNS = [table_rows.Row(f"heap_expr[{name}]", table_rows.ALL, Run(*PROGRAMS[name]))
+        for name in sorted(PROGRAMS)]
+
+
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_heap_expr(tmp_path, compiler, name):
-    src, want = PROGRAMS[name]
-    assert _run_pkg(compiler, tmp_path, name, src) == want
+def test_heap_expr(ritz1_bin, tmp_path, compiler):
+    table_rows.assert_ritzlib_rows(compiler, RUNS, ritz1_bin, tmp_path)
 
 
 # Without ritzlib.memory there is no malloc (ritz0) and no `__heap_new`

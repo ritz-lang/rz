@@ -32,8 +32,10 @@ import pytest
 
 import fast_link
 
+import test_table_rows as table_rows
 from ritz0_inproc import run_ritz0
 from test_ritz1_builtin_struct_shadow import _run_pkg
+from test_table_rows import Row, Run
 
 RITZ_ROOT = Path(__file__).resolve().parent.parent
 RITZ1_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1"
@@ -525,62 +527,25 @@ def _check(code: int, name: str) -> None:
     assert code == want, f"{name}: exit {code}, want {want}"
 
 
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(PROGRAMS))
-def test_ritz0_is_the_oracle(tmp_path, name):
-    """The reference answer. If this changes, the oracle moved, not ritz1."""
-    _check(_run("ritz0", tmp_path, name), name)
+# The eight parametrised groups above are one table per compiler (AGAST
+# #4418): each case used to compile, link and run its own program, and a
+# package for the ones that import ritzlib.  As rows they are batched
+# (AGAST #2806) and every ritzlib module a chunk imports is compiled once per
+# process per compiler (#3906).  A row keeps its old parametrised id, and a
+# failure names it.  Coverage is unchanged:
+#   ritz0           PROGRAMS (the oracle) + MEMBER_SLICE
+#   ritz1           PROGRAMS + MEMBER_SLICE
+#   ritz1_selfhosted MEMBER_SLICE (only the #3803 slice tests ran it before)
+ALL_PROGRAMS = {**PROGRAMS, **MEMBER_SLICE}
+
+
+def _rows(compiler):
+    names = (sorted(MEMBER_SLICE) if compiler == "ritz1_selfhosted"
+             else sorted(ALL_PROGRAMS))
+    return [Row(name, (compiler,), Run(*ALL_PROGRAMS[name])) for name in names]
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(EMPTY_ARRAY))
-def test_ritz1_empty_array_literal(ritz1_bin, tmp_path, name):
-    """Item 2: `[]` died with `cannot parse item`."""
-    _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(REF_TYPE_ARG))
-def test_ritz1_generic_call_ref_type_arg(ritz1_bin, tmp_path, name):
-    """Item 3: `id<@E>(e)` called `@id$` with a `void` argument."""
-    _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(QUALIFIED_PATTERN))
-def test_ritz1_qualified_enum_pattern(ritz1_bin, tmp_path, name):
-    """Item 4: `Opt.None =>` died with `cannot parse item`."""
-    _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(FULL_SLICE))
-def test_ritz1_full_slice(ritz1_bin, tmp_path, name):
-    """Item 5: `a[:]` died with `cannot parse item`."""
-    _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(COLON_SLICE))
-def test_ritz1_colon_slice(ritz1_bin, tmp_path, name):
-    """`a[lo:hi]`, `a[:hi]` and `a[lo:]` died with `unexpected ':'`."""
-    _check(_run("ritz1", tmp_path, name), name)
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(MEMBER_SLICE))
 @pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
-def test_member_slice(request, tmp_path, compiler, name):
-    """AGAST #3803: `h.v[2..4]` was "this can't be sliced" under ritz1."""
-    if compiler != "ritz0":
-        request.getfixturevalue("ritz1_bin")
-    program, want = MEMBER_SLICE[name]
-    code = _run_pkg(compiler, tmp_path, name, program)
-    assert code == want, f"{compiler} {name}: exit {code}, want {want}"
-
-
-@pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(GENERIC_LOCAL))
-def test_ritz1_generic_bare_t_local(ritz1_bin, tmp_path, name):
-    """`let y: T` at T = i32 became `alloca %T$i32`."""
-    _check(_run("ritz1", tmp_path, name), name)
+def test_small_syntax_gaps(ritz1_bin, tmp_path, compiler):
+    table_rows.assert_ritzlib_rows(compiler, _rows(compiler), ritz1_bin, tmp_path)

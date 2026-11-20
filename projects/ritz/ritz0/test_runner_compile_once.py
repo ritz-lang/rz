@@ -71,6 +71,15 @@ TEST_SOURCE = textwrap.dedent(
 N_TESTS = 5
 
 
+# One worker runs all three: the fixture below is module-scoped, and under
+# `--dist loadgroup` an ungrouped module's tests are spread over workers, so
+# each worker paid the ~8 s ritzlib+ritzunit build again (AGAST #4418: the
+# file cost ~38 CPU-s for three assertions over one run).  A group makes the
+# shares-one-store claim (#3898) true under the gate's xdist, not just
+# serially.
+pytestmark = pytest.mark.xdist_group("compile_once")
+
+
 @pytest.fixture(scope="module")
 def run(tmp_path_factory):
     """One `run_test_file` over a minimal package, with every command it ran.

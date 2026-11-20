@@ -160,7 +160,23 @@ def test_real_budget_file_loads_and_every_override_names_a_ticket():
 # collapsed the eight matrix files (AGAST #3557, at 2c597655): 39,126 -> 29,700.
 # AGAST #3889 collapsed 18 more: 31,171 -> 26,329 (counted on 8eddf0d6).
 # AGAST #4141 collapsed 7 more, 28,269 -> 24,431 (267f9e0b), under the same 27,700 cap.
-COLLECTED_AT_LAST_CAP = 26_329
+# AGAST #4418 collapsed 144 more cases into table rows: 25,677 -> 25,533
+# (measured on huburght at c552928b; 25,634 passed + 11 skipped + 32 xfailed
+# before, 25,489 passed + 11 + 32 after, and the one regression the first
+# after-run found in a scheduling meta-test is fixed).
+COLLECTED_AT_LAST_CAP = 25_533
+
+
+# Reference-host (toffee) CPU-s the cap is set from.  The cap is in normalised
+# CPU-s (see [calibration]), so it is measured on the reference scale, not on
+# whatever host runs this file.  CI on main at 4d5f05cb read 1,118.5
+# normalised; #4418 cut the work 11.2% raw, so ~993 here.  test_budget.toml's
+# 1,090 is that +~10%.
+MEASURED_SUITE_CPU_S = 995.0
+# test_interface_text.py: the file the old blank 90.0 cap took red on CI
+# (91.5 CPU-s).  #4418 cut its duplicate cold closure compile, 85.3 -> 68.9
+# CPU-s on huburght; reference scale ~72, and its override (80.0) is +~10%.
+MEASURED_HOT_FILE_CPU_S = 73.0
 
 
 @pytest.mark.unit
@@ -174,6 +190,30 @@ def test_real_test_cap_sits_just_above_the_collected_count():
 
 
 @pytest.mark.unit
+def test_real_cpu_cap_sits_just_above_the_measured_cost():
+    """AGAST #4418: the CPU cap is a ratchet, not a ceiling above the old
+    suite.  It must sit above the measured reference-scale cost (or the gate
+    false-reds) and no more than ~10% above it (or growth is free again)."""
+    cap = float(ctb.load_budget(ctb.DEFAULT_BUDGET)["suite"]["cpu_s"])
+    assert MEASURED_SUITE_CPU_S <= cap <= MEASURED_SUITE_CPU_S * 1.10, (
+        f"[suite] cpu_s = {cap}: set it to the measured cost plus ~10%")
+
+
+@pytest.mark.unit
+def test_real_hot_file_override_sits_just_above_its_measured_cost():
+    """AGAST #4418: the one explicit per-file cap is also a ratchet.  It is
+    above its file's measured cost, within ~10%, and still below the 90 s the
+    blank cap used to allow (which the file crossed and turned CI red)."""
+    b = ctb.load_budget(ctb.DEFAULT_BUDGET)
+    override = b["file"]["override"]["test_interface_text.py"]
+    cap = float(override["cpu_s"])
+    assert MEASURED_HOT_FILE_CPU_S <= cap <= MEASURED_HOT_FILE_CPU_S * 1.10, (
+        f"test_interface_text.py override = {cap}: set it to the measured "
+        f"cost plus ~10%")
+    assert cap < 90.0, "the override must be below the blank cap it replaces"
+
+
+@pytest.mark.unit
 def test_real_budget_goes_red_on_one_extra_test_file():
     """Under the real budget, a suite already at the cap plus one more test
     file fails, and the failure names the cap.  Without that file it passes."""
@@ -181,11 +221,39 @@ def test_real_budget_goes_red_on_one_extra_test_file():
     cap = int(b["suite"]["tests"])
     r = report({"test_suite.py": 1.0})
     r["files"]["test_suite.py"]["tests"] = cap
+    # Every file the real budget overrides must appear in the report, or the
+    # check also reports the override as orphaned.
+    for name in b["file"].get("override", {}):
+        r["files"][name] = {"tests": 0, "cpu_s": 0.0, "wall_s": 0.0}
     assert ctb.check(r, b) == []
     r["files"]["test_planted_extra.py"] = {"tests": 1, "cpu_s": 0.1, "wall_s": 0.1}
     errs = ctb.check(r, b)
     assert errs == [f"suite: {cap + 1} tests over its cap of {cap}; "
                     f"collapse a matrix into table rows before adding cases"]
+
+
+def _suite_report(total: float, files: int = 20) -> dict:
+    """A whole suite costing `total` CPU-s, spread so no file trips the
+    per-file cap (the default is above total / files for every cap this
+    budget uses)."""
+    r = report({f"test_planted_{i}.py": total / files for i in range(files)})
+    # The budget's overrides must name files the report contains (see check).
+    for name in ctb.load_budget(ctb.DEFAULT_BUDGET)["file"].get("override", {}):
+        r["files"].setdefault(name, {"tests": 0, "cpu_s": 0.0, "wall_s": 0.0})
+    return r
+
+
+@pytest.mark.unit
+def test_real_budget_goes_red_on_a_planted_cost_increase():
+    """AGAST #4418: the CPU cap must still bite.  A suite at the cap passes;
+    one 1% over it fails and names the suite.  After this ticket the cap sits
+    just above the measured cost, so a planted increase is the check that it
+    is a ratchet and not merely a number above the old suite."""
+    b = ctb.load_budget(ctb.DEFAULT_BUDGET)
+    cap = float(b["suite"]["cpu_s"])
+    assert ctb.check(_suite_report(cap), b) == []
+    errs = ctb.check(_suite_report(cap * 1.01), b)
+    assert len(errs) == 1 and errs[0].startswith("suite:"), errs
 
 
 # --- AGAST #3897: CPU-s normalised by the host's calibration -------------------

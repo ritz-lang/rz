@@ -42,14 +42,24 @@ import re
 
 import llvmlite.binding as llvm
 import pytest
-import ritz_ast as rast
-from emitter_llvmlite import LLVMEmitter
 from llvmlite import ir
-from test_borrow_param_ref_field import _compile, _run
-from test_ritz1_builtin_struct_shadow import _run_pkg
-from test_ritz1_for_iterable import SELFHOSTED_BIN
+
+import ritz_ast as rast
+import test_ritz1_for_header as for_header
+import test_table_rows as table_rows
+from emitter_llvmlite import LLVMEmitter
+from test_borrow_param_ref_field import _compile
+from test_table_rows import Row, Run
 
 COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+# The three rules below are tables (AGAST #4418): each row used to launch its
+# own `build.py` package, paying a Python start and a cold build cache.  As
+# rows of one table per rule, every ritzlib module a chunk imports is compiled
+# once per process per compiler (#3906); a failing row is compiled again alone
+# and named.  `xdist_group` keeps the three tables on one worker so they share
+# those objects.
+pytestmark = pytest.mark.xdist_group("heap_padded_size")
 
 HEAD = """\
 import ritzlib.memory
@@ -157,20 +167,6 @@ def _heap_program(name):
     )
 
 
-@pytest.fixture
-def run_with(ritz1_bin, tmp_path):
-    bins = {"ritz1": ritz1_bin, "ritz1_selfhosted": SELFHOSTED_BIN}
-
-    def go(compiler, name, program):
-        if "import " in program:  # build.py links ritzlib's allocator
-            return _run_pkg(compiler, tmp_path, name, program)
-        if compiler == "ritz0":
-            return _run("ritz0", None, tmp_path, name, program)
-        return _run("ritz1", bins[compiler], tmp_path, name, program)
-
-    return go
-
-
 # x86-64 Linux, as clang writes it (test_byval_exact_size.py's oracle, #1744).
 X86_64_DATA_LAYOUT = (
     "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-f80:128-n8:16:32:64-S128"
@@ -213,18 +209,18 @@ def test_ritz0_heap_mallocs_the_padded_size(tmp_path, name):
 RITZ1_HEAP_GAPS: dict[str, int] = {}
 
 
-def _block_params():
-    for name in sorted(HEAPS):
-        for compiler in COMPILERS:
-            gap = RITZ1_HEAP_GAPS.get(name) if compiler != "ritz0" else None
-            marks = [pytest.mark.xfail(strict=True, reason=f"AGAST #{gap}")] if gap else []
-            yield pytest.param(name, compiler, marks=marks)
-
-
 @pytest.mark.integration
-@pytest.mark.parametrize("name,compiler", list(_block_params()))
-def test_heap_store_stays_in_its_block(tmp_path, compiler, name):
-    assert _run_pkg(compiler, tmp_path, name, _heap_program(name)) == 0
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_heap_store_stays_in_its_block(ritz1_bin, tmp_path, compiler):
+    rows = [Row(f"heap_store_stays_in_its_block[{name}]", (compiler,),
+                Run(_heap_program(name), 0))
+            for name in sorted(HEAPS)]
+    gaps = ({} if compiler == "ritz0" else
+            {f"heap_store_stays_in_its_block[{name}]": ticket
+             for name, ticket in RITZ1_HEAP_GAPS.items()})
+    table_rows.assert_rows(
+        compiler, rows, build=table_rows.ritzlib_build(ritz1_bin),
+        compile=for_header.batch_compile(ritz1_bin), work=tmp_path, gaps=gaps)
 
 
 # Ritzlib's generic containers of a padded struct, on every compiler.
@@ -260,10 +256,13 @@ CONTAINERS = {
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("name", sorted(CONTAINERS))
-def test_container_of_padded_struct(run_with, compiler, name):
-    program = HEAD + "pub fn main() -> i32\n" + CONTAINERS[name]
-    assert run_with(compiler, name, program) == 0
+def test_container_of_padded_struct(ritz1_bin, tmp_path, compiler):
+    rows = [Row(f"container_of_padded_struct[{name}]", (compiler,),
+                Run(HEAD + "pub fn main() -> i32\n" + CONTAINERS[name], 0))
+            for name in sorted(CONTAINERS)]
+    table_rows.assert_rows(
+        compiler, rows, build=table_rows.ritzlib_build(ritz1_bin),
+        compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
 
 
 # A large bool fill: memset by the element's alloc size (1), not `1 // 8`.
@@ -316,8 +315,11 @@ pub fn main() -> i32
 
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-def test_large_bool_fill_sets_every_element(run_with, compiler):
-    assert run_with(compiler, "bool_fill", BOOL_FILL) == 0
+def test_large_bool_fill_sets_every_element(ritz1_bin, tmp_path, compiler):
+    table_rows.assert_rows(
+        compiler, [Row("large_bool_fill_sets_every_element", (compiler,), Run(BOOL_FILL, 0))],
+        build=table_rows.ritzlib_build(ritz1_bin),
+        compile=for_header.batch_compile(ritz1_bin), work=tmp_path)
 
 
 @pytest.mark.integration
