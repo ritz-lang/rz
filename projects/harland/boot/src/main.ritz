@@ -395,6 +395,12 @@ struct BootInfo
     # 0/0 when the ESP has none: the kernel then reads a virtio-blk disk.
     initramfs_phys: u64              # Physical address of the TAR, or 0
     initramfs_size: u64              # Its size in bytes, or 0
+    # Version 3 (AGAST #4335): boot options. BOOT_FLAG_NET_SELFTEST when the
+    # boot volume has \harland\net-selftest; the kernel then runs its NIC
+    # self-tests before init. Without it the NIC is left alone until init is
+    # up, so a broken driver cannot keep the shell from starting.
+    flags: u32
+    _pad3: u32
 
 [[packed]]
 struct MemoryMapEntry
@@ -404,7 +410,10 @@ struct MemoryMapEntry
     reserved: u32
 
 const BOOT_MAGIC: u32 = 0x4841524C   # "HARL"
-const BOOT_VERSION: u32 = 2
+const BOOT_VERSION: u32 = 3
+# Boot option bits (BootInfo.flags): the kernel's pre-init network
+# self-tests (AGAST #4335), on when the boot volume has the marker file.
+const BOOT_FLAG_NET_SELFTEST: u32 = 1
 
 # Memory types for our simplified map
 const MEM_USABLE: u32 = 1
@@ -1060,6 +1069,9 @@ fn build_boot_info() -> i32
     boot_info.initramfs_phys = initramfs_addr
     boot_info.initramfs_size = initramfs_size
 
+    # Boot options from the boot volume (AGAST #4335)
+    boot_info.flags = boot_flags
+
     # Set framebuffer info (populated by init_graphics)
     boot_info.framebuffer_addr = fb_addr
     boot_info.framebuffer_width = fb_width
@@ -1279,6 +1291,9 @@ fn load_kernel_from_fs() -> i32
     # fatal here: the kernel can still find a virtio-blk initramfs disk.
     load_initramfs_from_fs(root_file)
 
+    # Boot options from the same volume (AGAST #4335).
+    load_boot_options_from_fs(root_file)
+
     # Close root
     (root.close as EfiFn1)(root_file)
 
@@ -1363,6 +1378,34 @@ fn load_initramfs_from_fs(root_file: u64) -> i32
     prints(" bytes at ")
     serial_print_hex(addr)
     prints("\n")
+    return 0
+
+# ============================================================================
+# Boot options from the boot volume (AGAST #4335)
+# ============================================================================
+
+# \harland\net-selftest on the boot volume asks the kernel for its pre-init
+# network self-tests (DHCP, a gateway ping, the 300-frame TX burst). The NIC
+# gate (tools/test_msix_boot.sh) writes it, so the tests keep running under
+# QEMU's virtio-net. Every other boot -- EC2, laptops, no NIC at all --
+# leaves it out, and the kernel then leaves the NIC alone until init is up:
+# a broken driver can no longer keep init_interactive and rzsh from starting.
+# The file's contents do not matter; it only has to exist.
+var boot_options_path: [32]u16
+var boot_flags: u32 = 0
+
+fn load_boot_options_from_fs(root_file: u64) -> i32
+    ascii_to_ucs2("\\harland\\net-selftest", @boot_options_path[0])
+    let root: *EfiFile = root_file as *EfiFile
+    var file: u64 = 0
+    let st_open: u64 = (root.open as EfiFn5)(root_file, @file as u64, @boot_options_path[0] as u64, EFI_FILE_MODE_READ, 0)
+    if st_open != EFI_SUCCESS
+        prints("    No \\harland\\net-selftest (network self-tests off)\n")
+        return 1
+    let f: *EfiFile = file as *EfiFile
+    (f.close as EfiFn1)(file)
+    boot_flags = boot_flags | BOOT_FLAG_NET_SELFTEST
+    prints("    Boot option \\harland\\net-selftest: network self-tests on\n")
     return 0
 
 # ============================================================================

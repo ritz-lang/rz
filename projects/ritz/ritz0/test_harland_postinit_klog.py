@@ -141,6 +141,22 @@ def test_postinit_module_defines_the_self_tests():
     assert body.index("if has_boot_info") < body.index("vmm_self_test(")
 
 
+def test_network_self_tests_are_opt_in():
+    """AGAST #4335: the NIC loop runs only when the boot asked for it, so a
+    misbehaving driver (the ENA path on EC2 Nitro) cannot panic the kernel
+    before init, and the shell comes up whatever the NIC does. The QEMU NIC
+    gate turns it on with the boot option; every other boot leaves the NIC
+    alone until init is up."""
+    code = _code(POSTINIT)
+    assert re.search(r"^pub fn postinit_diagnostics\(run_net_selftests: bool\)$", code, re.M)
+    body = _body(code, "postinit_diagnostics")
+    # Exactly one call, and it is indented under `if run_net_selftests`.
+    assert body.count("network_dhcp_ping(") == 1, body
+    guard = re.search(r"^    if run_net_selftests\n(        .*\n)+", body, re.M)
+    assert guard, "network_dhcp_ping() is not guarded by run_net_selftests"
+    assert "network_dhcp_ping()" in guard.group(0)
+
+
 @pytest.mark.parametrize("line", MOVED_LINES)
 def test_moved_block_is_in_postinit_not_main(line):
     assert line in POSTINIT.read_text(), f"postinit.ritz lacks {line}"
@@ -185,7 +201,7 @@ def test_kernel_main_keeps_the_boot_order():
         r"\bpostinit_self_tests\(has_boot_info\)",
         re.escape(r'prints("\nKernel initialized successfully.\n")'),
         r"\bsyscall_init\(\)",
-        r"\bpostinit_diagnostics\(\)",
+        r"\bpostinit_diagnostics\(run_net_selftests\)",
         r"\brun_init\(\)",
     ]
     hits = [list(re.finditer(s, body)) for s in steps]

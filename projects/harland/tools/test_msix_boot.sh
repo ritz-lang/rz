@@ -54,6 +54,12 @@
 # The NIC uses QEMU's user-mode network (slirp): its built-in DHCP server
 # answers inside QEMU, so this needs no root and no host network.
 #
+# The kernel's pre-init network self-tests are a boot option (AGAST #4335):
+# this ESP carries the empty \harland\net-selftest marker, so the kernel
+# runs DHCP, the gateway ping and the TX burst before init. Without it the
+# kernel leaves the NIC alone until init is up, so a misbehaving driver
+# cannot keep rzsh from starting (EC2 Nitro's ENA path did).
+#
 # Usage: tools/test_msix_boot.sh
 #        SKIP_BUILD=1   use the existing build/debug outputs
 #        BOOT_TIMEOUT=N seconds for the boot (default 120)
@@ -118,6 +124,11 @@ python3 "$HARLAND_DIR/tools/mkinitramfs.py" --bin-dir "$WORK/bin" \
     --output "$WORK/initramfs.qcow2" >/dev/null || { echo "FAIL: mkinitramfs failed"; exit 1; }
 cp "$LOADER_EFI" "$WORK/esp/EFI/BOOT/BOOTX64.EFI"
 cp "$KERNEL_ELF" "$WORK/esp/harland/kernel.elf"
+# This ESP asks for the kernel's pre-init network self-tests (AGAST #4335):
+# the boot option is the presence of this marker on the boot volume. Every
+# other boot script leaves it out, so a misbehaving NIC can't keep rzsh from
+# starting there; here the NIC coverage below runs.
+: > "$WORK/esp/harland/net-selftest"
 # The NVMe disk (16 MiB, 32768 sectors): sector N holds the pattern
 # test_nvme_boot.sh uses, ("LBA" + N as u32 LE + "!") * 64. Prints the
 # FNV-1a (32-bit) of sectors 32568-32767, the bytes the kernel reads under

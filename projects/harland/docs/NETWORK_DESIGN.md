@@ -489,6 +489,17 @@ This is **future work** - first we get the code organized properly in the kernel
 - Respond to incoming pings
 - ARP resolution works
 
+### Boot-time self-tests are opt-in (AGAST #4335):
+`postinit_diagnostics` runs the DHCP / gateway-ping / TX-burst loop before
+`/bin/init` only when the UEFI boot volume holds the zero-byte marker
+`\harland\net-selftest`. The marker sets `BOOT_FLAG_NET_SELFTEST` in
+BootInfo version 3; without it the kernel never probes a NIC driver on the
+boot path, so a misbehaving driver cannot panic before init and keep `rzsh`
+from starting (EC2 Nitro's ENA path did). QEMU's NIC gate
+(`tools/test_msix_boot.sh`) writes the marker, so the coverage stays where
+virtio-net is; every other boot script leaves it out and asserts the skip.
+To run the tests on real hardware, put the marker on the ESP.
+
 ### End-to-end tests:
 - `ping 10.0.2.2` (gateway) succeeds
 - `ping 1.1.1.1` (external) succeeds

@@ -32,7 +32,11 @@
 #   - sectors 65-71 still hold the pattern: persist's format writes sectors
 #     0-64 one at a time, and on 4 KiB LBAs sector 64 shares an LBA with
 #     them, so a write that skipped read-modify-write would clobber them;
-#   - the kernel took no exception.
+#   - the kernel took no exception;
+#   - this ESP has no \harland\net-selftest boot option, so the kernel
+#     skipped the pre-init network self-tests and never probed a NIC
+#     (AGAST #4335: a broken driver on real hardware must not keep init
+#     from starting).
 #
 # Usage: tools/test_nvme_boot.sh
 #        SKIP_BUILD=1   use the existing build/debug outputs
@@ -159,6 +163,20 @@ rc=0
 if grep -aqE "EXCEPTION|KERNEL PANIC" "$SERIAL"; then
     sed -n '/EXCEPTION/,/CR2/p' "$SERIAL" | head -20
     echo "FAIL: kernel exception during boot"
+    rc=1
+fi
+# This ESP has no \harland\net-selftest marker, so the kernel must skip the
+# pre-init network self-tests and leave the NIC (and its driver probes:
+# netdev_init tries virtio-net, then the ENA path that panicked on EC2
+# Nitro) alone until init is up (AGAST #4335).
+if grep -aqF "[net] Network self-tests skipped" "$SERIAL"; then
+    echo "PASS: network self-tests skipped without the boot option"
+else
+    echo "FAIL: boot did not skip the network self-tests without the boot option"
+    rc=1
+fi
+if grep -aqE "\[net\] Initializing network stack|\[ena\]|\[virtio-net\] Initializing" "$SERIAL"; then
+    echo "FAIL: boot initialized the network without the boot option"
     rc=1
 fi
 want="[nvme] harland-data nsid 1: $DATA_SECTORS sectors, LBA 1-200 fnv1a=$want_fnv, $LBA_SIZE-byte LBAs"

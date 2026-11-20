@@ -98,8 +98,11 @@ def nvme_line(sectors: int = 8192, fnv: int | None = None, lba: int = 512) -> st
 
 INITRAMFS = r"[initramfs] Loaded 42 entries\n"
 PERSIST = r"  [OK] Persistent storage (0 blobs)\n"
+# No \harland\net-selftest on this ESP, so the kernel leaves the NIC alone
+# before init (AGAST #4335); test_nvme_boot.sh requires this line.
+NET_SKIPPED = r"[net] Network self-tests skipped: boot option off\n"
 SUITE_PASSED = r"  Results: 10 passed, 0 failed\n  ALL TESTS PASSED\n"
-PASSED = nvme_line() + INITRAMFS + PERSIST + SUITE_PASSED
+PASSED = NET_SKIPPED + nvme_line() + INITRAMFS + PERSIST + SUITE_PASSED
 
 
 # --------------------------------------------------------------------------
@@ -282,7 +285,27 @@ def test_no_verdict_before_the_timeout_fails(tree):
 # --------------------------------------------------------------------------
 
 
-PASSED_4K = nvme_line(lba=4096) + INITRAMFS + PERSIST + SUITE_PASSED
+PASSED_4K = NET_SKIPPED + nvme_line(lba=4096) + INITRAMFS + PERSIST + SUITE_PASSED
+
+
+@pytest.mark.integration
+def test_network_initialized_without_the_boot_option_fails(tree):
+    """The mutation that runs the boot-path NIC tests unconditionally
+    (AGAST #4335): this ESP has no \\harland\\net-selftest, so the kernel must
+    not even initialize the stack (which probes ENA)."""
+    r = _run(tree, NET_SKIPPED + nvme_line() + INITRAMFS + PERSIST + SUITE_PASSED
+             + r"[ena] Initializing ENA driver...\n")
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "network without the boot option" in r.stdout
+
+
+@pytest.mark.integration
+def test_missing_network_skip_line_fails(tree):
+    """The boot must say the NIC tests are off, so a serial log without the
+    line can't pass as a gated boot."""
+    r = _run(tree, nvme_line() + INITRAMFS + PERSIST + SUITE_PASSED)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "skip the network self-tests" in r.stdout
 
 
 @pytest.mark.integration
