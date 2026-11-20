@@ -163,14 +163,24 @@ RITZ0 = Step(STEP)
 # -testscripts) and the root known-failures/ (an unknown top-level dir:
 # always an input).  Python lists tools/ (known_failures.py's sys.path[0])
 # and projects/ritz/.
+#
+# Re-measured 2026-11-20 (AGAST #4380), same recipe: the baseline-cache
+# self-test loads cache.py, whose compiler hash imports ritz0/'s
+# compiler_identity to fingerprint ritz0.  It opens
+# ritz0/compiler_identity.py and the import finder lists ritz0/ (it is
+# sys.path[0] for that import).  Both are required: a change to either can
+# change the key the self-test computes, so the harness declares them
+# rather than skipping.  #3915 moved the harness out of the package and
+# introduced the import, which the first measurement predated.
 HARNESS = Step(
     "Regression harness self-tests",
     reads=("projects/ritz/scripts/",
            "projects/ritz/examples/",
            "projects/ritz/Makefile",
            "projects/ritz/cache.py",
-           "projects/ritz/tools/known_failures.py"),
-    lists=("projects/ritz", "projects/ritz/tools"),
+           "projects/ritz/tools/known_failures.py",
+           "projects/ritz/ritz0/compiler_identity.py"),
+    lists=("projects/ritz", "projects/ritz/tools", "projects/ritz/ritz0"),
     label="harness-step")
 
 # Measured 2026-11-19 (AGAST #4206), as HARNESS, over a cold

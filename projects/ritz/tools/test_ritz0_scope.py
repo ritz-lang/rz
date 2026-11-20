@@ -572,6 +572,7 @@ def test_a_compiler_free_change_skips_both_regression_steps(real_scopes, status,
     ("projects/ritz/examples/tier1_basics/01_hello/test.sh", True, True),
     ("known-failures/4000.toml", True, True),
     ("projects/ritz/ritz0/parser.py", False, True),
+    ("projects/ritz/ritz0/compiler_identity.py", True, True),
     ("projects/ritz/ritz1/src/main.ritz", False, True),
     ("projects/ritz/ritzlib/io.ritz", False, True),
     ("projects/ritz/runtime/ritz_start.x86_64.ll", False, True),
@@ -741,6 +742,36 @@ def test_the_regression_scripts_name_only_paths_in_their_read_set(real_scopes):
             assert why is None, (t.name, rel, why)
 
 
+def test_the_harness_reads_compiler_identity_and_lists_ritz0(real_scopes):
+    """AGAST #4380: the baseline-cache self-test loads cache.py, whose
+    compiler hash imports the real ritz0/compiler_identity.py, and Python's
+    import finder lists ritz0/ (it is sys.path[0] for that import).  Both
+    are required reads: the 2026-11-19 measurement missed them and the audit
+    went red.  Only that one ritz0 source is an input; a modification to any
+    other still skips the harness."""
+    assert _real(ritz0_scope.HARNESS, "M",
+                 "projects/ritz/ritz0/compiler_identity.py", real_scopes) is None
+    assert _real(ritz0_scope.HARNESS, "M",
+                 "projects/ritz/ritz0/parser.py", real_scopes) is not None
+    # The listing: a new entry in ritz0/ changes what sys.path[0] resolves.
+    # projects/ritz is listed too, but a file inside an existing top-level
+    # directory leaves its listing unchanged, so ritz0/ needs its own entry.
+    sc = real_scopes[ritz0_scope.HARNESS.name]
+    changed = frozenset({"projects/ritz/ritz0/shadow.py"})
+    assert ritz0_scope.why_safe("A", "projects/ritz/ritz0/shadow.py", sc,
+                                ritz0_scope.HARNESS, changed) is None
+
+
+def test_the_harness_audit_covers_compiler_identity_and_the_listing():
+    """The exact trace shape CI rejected after #3915 (AGAST #4380)."""
+    log = _trace(
+        REAL,
+        '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0", O_RDONLY|O_NONBLOCK|O_CLOEXEC|O_DIRECTORY) = 3<@/projects/ritz/ritz0>',
+        '1 openat(AT_FDCWD<@/projects/ritz>, "ritz0/compiler_identity.py", O_RDONLY|O_CLOEXEC) = 3<@/projects/ritz/ritz0/compiler_identity.py>',
+    )
+    assert ritz0_scope.audit(REAL, ritz0_scope.HARNESS, log) == []
+
+
 def test_the_harness_glob_is_in_its_read_set(real_scopes):
     mk = (REAL / "projects/ritz/Makefile").read_text()
     assert "scripts/test-regression-*.sh" in mk
@@ -752,8 +783,8 @@ def test_the_harness_glob_is_in_its_read_set(real_scopes):
 def test_every_python_input_imports_only_inputs(real_scopes, step):
     """A Python file the step reads finds its siblings on sys.path[0]: each
     sibling module it can import is in the read set.  (cache.py's lazy
-    ritz0/ import is not checked: it runs only for a compiler hash over the
-    real ritz0/, which the harness never takes, measured.)"""
+    ritz0 import is not a sibling and is not checked here; the harness does
+    take that read and declares it explicitly, AGAST #4380.)"""
     import ast
     for rel in ritz0_scope.step_files(REAL, step):
         if not rel.endswith(".py") or "/examples/" in rel:
