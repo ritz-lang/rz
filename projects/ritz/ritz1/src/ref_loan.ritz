@@ -10,6 +10,14 @@
 # into a `:&` param, a receiver taken `self: @&T` (or as a UFCS fn's first
 # `self:&` param), and a write into p's own storage.
 #
+# LARB R57 (AGAST #3473): a `Span<T>` made from a local root in a Span slot,
+# `@x` or a view `v[a..b]` of a Vec or String, is an `@` of that root: monomorph
+# has already made the view a `Span$T { ptr: v.data + a, len: b - a }` struct
+# literal (ast_query.span_view_base).  So it lends v to the end of its block,
+# and moving an overlapping place conflicts with it as a mutable borrow does
+# (ref_loan_move_conflict, asked by own_check.ritz's move check).  A Span's
+# slice views what that Span does, so it lends nothing.
+#
 # A loan lasts to the end of its holder's block.  Loans are lexical, so
 # Sema's blocks end them: sema_walk calls ref_loan_enter / ref_loan_leave
 # around each statement list and match arm, where the emitter's own_pop_scope
@@ -134,6 +142,23 @@ fn rl_local_idx(sm: *Sema, name: *u8, len: i32) -> i32
         i = i - 1
     0 - 1
 
+# 1 when `stmt`, a declaration, writes a `Span<T>` type (LARB R57): a view it
+# binds lends its root for both of §13.5's rules.
+fn rl_is_span_decl(stmt: *Stmt) -> i32
+    if stmt.var_declared_type != TYPE_STRUCT or stmt.var_type_name_len <= 5
+        return 0
+    (memcmp(stmt.var_type_name, c"Span$", 5) == 0) as i32
+
+# 1 when `t` is a Vec or String: a `v[a..b]` of one in a Span slot is a view of
+# v's storage rather than a copy (§7.8, LARB R57).  A Span's slice views what
+# that Span does, so it lends nothing here.
+fn rl_is_vec_or_string(t: *SemaTy) -> i32
+    if t.kind != TYPE_STRUCT or t.name == null
+        return 0
+    if t.name_len > 4 and memcmp(t.name, c"Vec$", 4) == 0
+        return 1
+    name_eq(t.name, t.name_len, c"String", 6)
+
 # --- Places ----------------------------------------------------------------------
 
 # The index of the local whose storage the place `e0` is in, reached by fields and
@@ -246,9 +271,11 @@ fn rl_eprint_place(e: *Expr)
     else
         eprint_bytes(e.ident_ptr, e.ident_len)
 
-# A borrow of `place`, on local `root`, at line:col (a write when `assign` is 1).
-# 1 if there's no conflict, so the borrow can be lent; 0 otherwise.
-fn rl_use(sm: *Sema, line: i32, col: i32, root: i32, place: *Expr, mutable: i32, assign: i32) -> i32
+# A borrow of `place`, on local `root`, at line:col: `what` is 0 for a borrow,
+# 1 for a write and 2 for a move (LARB R57: moving a place conflicts with a
+# live `@` of an overlapping one, as a mutable borrow does).  1 if there's no
+# conflict, so the borrow can be lent; 0 otherwise.
+fn rl_use(sm: *Sema, line: i32, col: i32, root: i32, place: *Expr, mutable: i32, what: i32) -> i32
     if root < 0
         return 0
     let l: *RefLoan = rl_conflict(root, place, mutable)
@@ -260,12 +287,14 @@ fn rl_use(sm: *Sema, line: i32, col: i32, root: i32, place: *Expr, mutable: i32,
     RL_LAST_COL = col
     diag_error_at(sema_file(sm), diag_span(line, col))
     sm.error_count = sm.error_count + 1
-    if assign == 1
+    if what == 1
         eprints_cstr(c"cannot assign to `")
+    else if what == 2
+        eprints_cstr(c"cannot move out of `")
     else
         eprints_cstr(c"cannot borrow `")
     rl_eprint_place(place)
-    if assign == 1
+    if what == 1 or what == 2
         eprints_cstr(c"` - `")
     else if mutable == 1
         eprints_cstr(c"` as mutable - `")
@@ -277,6 +306,17 @@ fn rl_use(sm: *Sema, line: i32, col: i32, root: i32, place: *Expr, mutable: i32,
     else
         eprints_cstr(c"` is already borrowed as immutable\n")
     0
+
+# LARB R57 (AGAST #3473): a move of the place `place` is refused while a live
+# loan of an overlapping place is held, as a mutable borrow of it would be.
+# 1 when it reported, so the move check stops there.
+pub fn ref_loan_move_conflict(sm: *Sema, place: *Expr) -> i32
+    if place == null
+        return 0
+    let root: i32 = rl_root(sm, place)
+    if root < 0
+        return 0
+    (rl_use(sm, place.span.line, place.span.col, root, place, 1, 2) == 0) as i32
 
 # --- Borrows -----------------------------------------------------------------------
 
@@ -586,8 +626,10 @@ fn rl_asm(sm: *Sema, stmt: *Stmt)
         o = o.next
 
 # The `@place` and `@&place` a declaration's binding holds: its value, or an arm's
-# tail of an `if` or `match` value.
-fn rl_hold(sm: *Sema, e: *Expr)
+# tail of an `if` or `match` value.  In a Span slot (`span_slot` 1) a view
+# `v[a..b]` of a Vec or String is an `@` of `v` too (LARB R57); a Span's slice
+# views what that Span does.
+fn rl_hold(sm: *Sema, e: *Expr, span_slot: i32)
     if e == null
         return
     if e.kind == EXPR_UNARY and (e.op == OP_ADDR or e.op == OP_ADDR_MUT)
@@ -607,14 +649,25 @@ fn rl_hold(sm: *Sema, e: *Expr)
         var arm: *MatchArm = e.args as *MatchArm
         while arm != null
             if arm.is_pass == 0 and arm.body != null
-                rl_hold(sm, arm.body)
+                rl_hold(sm, arm.body, span_slot)
             else if arm.body_stmts != null
                 var st: *Stmt = arm.body_stmts
                 while st.next != null
                     st = st.next
                 if st.kind == STMT_EXPR
-                    rl_hold(sm, st.expr)
+                    rl_hold(sm, st.expr, span_slot)
             arm = arm.next
+    else if span_slot == 1
+        # A view `v[a..b]` of a Vec or String: monomorph has made it a Span
+        # struct literal, `Span$T { ptr: v.data + a, len: b - a }`, or left the
+        # index for the emitter to refuse.
+        let base: *Expr = span_view_base(e)
+        if base != null
+            var t: SemaTy
+            if rs_loan_ty(sm, base, @t) == 1 and rl_is_vec_or_string(@t) == 1
+                let root: i32 = rl_root(sm, base)
+                if root >= 0
+                    rl_add(root, base, 0, RL_DEPTH)
 
 # --- The walk's hooks ---------------------------------------------------------------
 
@@ -656,4 +709,4 @@ pub fn ref_loan_check_value(sm: *Sema, e: *Expr)
 # `*T` isn't a borrow (#2371).
 pub fn ref_loan_after(sm: *Sema, stmt: *Stmt)
     if stmt.kind == STMT_VAR_DECL and stmt.var_declared_type != TYPE_PTR
-        rl_hold(sm, stmt.var_init)
+        rl_hold(sm, stmt.var_init, rl_is_span_decl(stmt))

@@ -18,7 +18,10 @@
 # or of a call returning `@U` / `@&U` that was given one.  Statements are seen
 # in order, as ritz0 sees them: a `var` that's written stops counting there, and
 # a loop can reach that write first.  ritz0's twin is TypeChecker._check_return;
-# ritz0/test_return_local_ref.py holds all three compilers to it.
+# ritz0/test_return_local_ref.py holds all three compilers to it.  LARB R57
+# (AGAST #3473) makes a `-> Span<T>` return a reference slot: `@x` in one and a
+# view `v[a..b]` of a local Vec or String are refused alike, directly or through
+# a Span binding that holds one.
 #
 # The slot checks (LANGUAGE_SPEC §13.2-13.4, LARB R1): an `@T`, `@&T` or `*T`
 # where a `T` goes is a located error at every slot: argument, `let`/`var`,
@@ -266,6 +269,39 @@ fn rv_local_root(sm: *Sema, e0: *Expr) -> *SemaVar
         e = e.left
     null
 
+# 1 when `t` is a Vec or String: a `v[a..b]` of one in a Span slot is a view of
+# v's storage rather than a copy (§7.8, LARB R57).  A Span's slice views what
+# that Span does, so it lends nothing for R2.
+fn rv_is_vec_or_string(t: *SemaTy) -> i32
+    if t.kind != TYPE_STRUCT or t.name == null
+        return 0
+    if t.name_len > 4 and memcmp(t.name, c"Vec$", 4) == 0
+        return 1
+    name_eq(t.name, t.name_len, c"String", 6)
+
+# LARB R57 (AGAST #3473): the local root a Span `v[a..b]` views, `v` a Vec or
+# String held by value.  monomorph makes the view a Span struct literal in a
+# Span slot; an unrewritten slice is its index.  Null when `e` isn't a view of
+# a Vec or String, or `v` isn't a local root.
+fn rv_span_view_root(sm: *Sema, e: *Expr, len: *i32) -> *u8
+    let base: *Expr = span_view_base(e)
+    if base == null
+        return null
+    var t: SemaTy
+    if sema_expr_ty(sm, base, @t) == 0 or rv_is_vec_or_string(@t) == 0
+        return null
+    let root: *SemaVar = rv_local_root(sm, base)
+    if root == null
+        return null
+    *len = root.name_len
+    root.name
+
+# 1 when `stmt`, a declaration, writes a `Span<T>` type (LARB R57).
+fn rv_decl_is_span(stmt: *Stmt) -> i32
+    if stmt.var_declared_type != TYPE_STRUCT or stmt.var_type_name_len <= 5
+        return 0
+    (memcmp(stmt.var_type_name, c"Span$", 5) == 0) as i32
+
 # The name of the local root `e` definitely refers to, with its length in `len`:
 # `@x` of one, or a binding that holds such a reference.  Null if there's none.
 fn rv_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
@@ -369,6 +405,10 @@ fn rv_call_referent(sm: *Sema, e: *Expr, len: *i32) -> *u8
 fn rv_check_return(sm: *Sema, e: *Expr)
     var len: i32 = 0
     var root: *u8 = rv_referent(sm, e, @len)
+    # LARB R57: a Span return of a view of a local Vec or String, as `@x` in a
+    # Span slot already is by rv_referent.
+    if root == null and rv_is_span(@RV_RET) == 1
+        root = rv_span_view_root(sm, e, @len)
     if root == null and (e.kind == EXPR_CALL or e.kind == EXPR_METHOD)
         root = rv_call_referent(sm, e, @len)
     if root == null or rv_report(sm, e.span.line, e.span.col) == 0
@@ -1645,7 +1685,7 @@ fn rv_note_decl(sm: *Sema, stmt: *Stmt)
     # An un-annotated `let` holds the `@T`.  `let n: i64 = @c` is a pointer as an
     # integer: no reference, whatever the binding says.
     let declared: i32 = stmt.var_declared_type
-    if declared == TYPE_VOID or declared == TYPE_PTR_PTR or ref_is_pointer(declared) == 1
+    if declared == TYPE_VOID or declared == TYPE_PTR_PTR or ref_is_pointer(declared) == 1 or rv_decl_is_span(stmt) == 1
         n.root = RV_DECL_ROOT
         n.root_len = RV_DECL_ROOT_LEN
         n.root_loops = RV_LOOPS
@@ -1678,6 +1718,9 @@ fn rv_decl_fn_sig(sm: *Sema, stmt: *Stmt) -> *FnDef
 # reference (emitter_stmt's let_ref_view / type_ref_view_let, AGAST #3079).
 fn rv_before_decl(sm: *Sema, stmt: *Stmt)
     RV_DECL_ROOT = rv_referent(sm, stmt.var_init, @RV_DECL_ROOT_LEN)
+    # LARB R57: a Span slot holds a view of the local Vec or String it slices.
+    if RV_DECL_ROOT == null and rv_decl_is_span(stmt) == 1
+        RV_DECL_ROOT = rv_span_view_root(sm, stmt.var_init, @RV_DECL_ROOT_LEN)
     if RV_DECL_ROOT != null and rv_referent_ty(sm, stmt.var_init, @RV_DECL_TY) == 0
         RV_DECL_TY.pointee = TYPE_VOID
     RV_DECL_KIND = TYPE_VOID
@@ -1771,6 +1814,9 @@ pub fn ref_value_begin_fn(sm: *Sema, f: *FnDef)
     # `-> *i32` and `-> **T` name nothing ref_of_fn can, and still leave as pointers.
     RV_RET.returned = 0
     if ref_is_pointer(f.return_type) == 1 or f.return_type == TYPE_PTR_PTR
+        RV_RET.returned = 1
+    # LARB R57: a `-> Span<T>` return leaves with a view the caller holds.
+    if rv_is_span(@RV_RET) == 1
         RV_RET.returned = 1
     if RV_RET.kind != TYPE_VOID or RV_RET.returned == 1
         rv_note_stmts(f.body, @RV_RET)

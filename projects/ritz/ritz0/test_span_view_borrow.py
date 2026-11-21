@@ -18,8 +18,9 @@ test_return_local_ref.py's `in_a_span`).
 `Vec<i32>` is Copy until #2159 gives Vec a Drop, so the move rows use a
 `Vec<T>` of a Drop `T`, which is move-only already.
 
-ritz1 and ritz1_selfhosted get the same rule in #3473: their refused rows are
-strict xfails until then.
+AGAST #3473 gives ritz1 and ritz1_selfhosted the same rule, in Sema's checking
+phase (ref_loan.ritz's loans and ref_value.ritz's return check), not in the
+emitter.
 """
 
 import pytest
@@ -104,21 +105,19 @@ LEGAL = {
 }
 
 
-def _params(table, refused):
+def _params(table):
     for site in sorted(table):
         for compiler in COMPILERS:
-            marks = ([pytest.mark.xfail(strict=True, reason="#3473")]
-                     if refused and compiler != "ritz0" else [])
-            yield pytest.param(site, compiler, marks=marks, id=f"{site}-{compiler}")
+            yield pytest.param(site, compiler, id=f"{site}-{compiler}")
 
 
-@pytest.mark.parametrize("site,compiler", list(_params(REFUSED, True)))
+@pytest.mark.parametrize("site,compiler", list(_params(REFUSED)))
 def test_a_view_or_move_against_a_loan_is_refused(tmp_path, compiler, site):
     body, message = REFUSED[site]
     _assert_refused(compiler, tmp_path, site, _main(TYPES + body, "    0\n"), message)
 
 
-@pytest.mark.parametrize("site,compiler", list(_params(LEGAL, False)))
+@pytest.mark.parametrize("site,compiler", list(_params(LEGAL)))
 def test_what_the_rule_allows_runs(run_with, compiler, site):
     body, want = LEGAL[site]
     assert run_with(compiler, site, _main(TYPES + body, "    f()\n")) == want
