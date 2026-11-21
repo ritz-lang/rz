@@ -49,15 +49,23 @@ MOVE_CHECKER_READS = (
 # examples and the .ritz tests the emitted IR is byte-identical.  A "..." in a
 # `*u8` slot is a `*u8` here (LARB R3), and a match is its first arm with a
 # known type, as the emitter's rules said when they were set as it emitted
-# (as_ptr, result_ritz_type; #4068).  The
-# kinds left (Ident, UnaryOp, BinOp, Call, Field, Index, MethodCall, ArrayLit)
-# disagree, mostly in generic instances (#3554); they stay the emitter's
-# (#4066, #4067).
+# (as_ptr, result_ritz_type; #4068).  MethodCall followed (#4066), with the
+# typing pass typing a `sizeof` operand of one; an array literal is here too,
+# taken from the table where its old rule inferred the element type, though no
+# corpus input reaches that rule (#4066).  The kinds left (Ident, UnaryOp,
+# BinOp, Field, Index, Call) disagree, mostly in generic instances (#3554), or
+# type `&x` as a reference where the emitter's rule built a pointer; they stay
+# the emitter's (#4066, #4067).  Call stayed because the emitter synthesises
+# calls as it lowers (operators, indexing, awaits) that the pass never types,
+# and the pass types an async fn's call `unknown` where the emitter's
+# post-transform definition answers its future struct.
 EMITTER_READS = (
     rast.IntLit, rast.FloatLit, rast.BoolLit, rast.CharLit,
     rast.StringLit, rast.CStringLit, rast.NullLit,
     rast.Cast, rast.StructLit, rast.TupleLit,
     rast.If, rast.Block, rast.Match, rast.TryOp,
+    rast.ArrayLit,
+    rast.MethodCall,
 )
 
 

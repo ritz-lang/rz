@@ -35,12 +35,15 @@ from type_queries import FloatLitType, TypeQueriesMixin
 from type_refs import RefChecksMixin
 from type_slots import SlotInferMixin
 
-# `sizeof(v)` operands typed as values, for the emitter (#3555): the kinds
-# that can't spell a type.
+# `sizeof(v)` operands typed as values, for the emitter (#3555, #4066): the
+# kinds that can't spell a type.  MethodCall is here because the emitter reads
+# its type from the table, which it must have for `sizeof(recv.method())`
+# (#4066); a Call's stays the emitter's rule.
 SIZEOF_VALUE_OPERANDS = (
     rast.IntLit, rast.FloatLit, rast.BoolLit, rast.CharLit,
     rast.CStringLit, rast.NullLit,
     rast.Cast, rast.StructLit, rast.TupleLit,
+    rast.MethodCall,
 )
 
 

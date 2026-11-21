@@ -10,10 +10,10 @@ emission (AGAST #3556 removed the `--check-types` flag that gated them;
 #4260 kept the emitter's words where both refuse).  The move checker takes the
 types of literals, casts, struct literals and calls from the table; its own
 rules for those kinds are gone.  So does the emitter, for typed.EMITTER_READS
-(#3555), and so does monomorph (#3554, test_monomorph_reads_typed.py).
+(#3555, #4066), and so does monomorph (#3554, test_monomorph_reads_typed.py).
 
-Every case but one parses a few lines in-process, in milliseconds; the
-win64 call case compiles once.
+Every case but two parses a few lines in-process, in milliseconds; the
+win64 call case and the sizeof-call case compile once.
 """
 
 import pytest
@@ -519,6 +519,96 @@ def test_the_emitter_takes_the_types_of_the_kinds_it_reads_from_the_table():
     assert [_name(em._infer_ritz_type(n)) for n, _ in rows] == [ty for _, ty in rows]
     # Signedness of a cast and a char comes from the table too.
     assert [em._infer_unsigned_expr(n) for n in (cast, char)] == [False, False]
+
+
+CALL_METHOD_ARRAY = """
+struct S
+    v: i32
+
+impl S
+    fn get(self: @&S) -> i32
+        self.v
+
+fn make() -> i32
+    7
+
+fn main() -> i32
+    let s = S { v: 1 }
+    let c = make()
+    let m = s.get()
+    let a = [1u8, 2u8]
+    c + m + a[0] as i32
+"""
+
+
+def test_the_emitter_reads_method_calls_and_array_literals_from_the_table():
+    """MethodCall and ArrayLit joined EMITTER_READS (#4066).  Their old rules
+    resolved the method's declared return type and the first element's; the
+    emitter answers with the table's type instead.  Call stayed: the emitter
+    synthesises calls the pass never types, and reads an async fn's call as
+    its post-transform future."""
+    module = parse(CALL_METHOD_ARRAY)
+    table = typed.type_module(module)
+    (method,) = _nodes(module, rast.MethodCall)
+    (array,) = _nodes(module, rast.ArrayLit)
+    rows = ((method, "i8"), (array, "bool"))
+    for node, ty in rows:
+        table.record(node, rast.NamedType(None, ty, []))
+    em = _emitter_over(table)
+    assert [_name(em._infer_ritz_type(n)) for n, _ in rows] == [ty for _, ty in rows]
+
+
+def test_an_untyped_let_reaches_the_array_literals_old_rule():
+    """No corpus input reached `_infer_ritz_type(ArrayLit)` (#4066), so its
+    agreement there meant nothing.  An untyped `let a = [..]` does reach it,
+    and the table types the literal as the old rule did, so the read is safe."""
+    module = parse("fn main() -> i32\n    let a = [1u8, 2u8, 3u8]\n    a[0] as i32\n")
+    table = typed.type_module(module)
+    (array,) = _nodes(module, rast.ArrayLit)
+    assert _name(table.type_of(array)) == "[3]u8"
+    assert _name(_emitter_over(table)._infer_ritz_type(array)) == "[3]u8"
+
+
+SIZEOF_OPERANDS = """
+struct S
+    v: i32
+
+impl S
+    fn get(self: @&S) -> i32
+        self.v
+
+fn bump() -> i32
+    return 1
+
+fn main() -> i32
+    let s = S { v: 1 }
+    let a = sizeof(bump())
+    let b = sizeof(s.get())
+    (a + b) as i32
+"""
+
+
+def test_a_sizeof_operand_of_a_method_call_is_typed():
+    """The emitter reads a MethodCall's type from the table (#4066), so the
+    typing pass must type `sizeof`'s operand of that kind: `sizeof(s.get())`
+    would otherwise have no type to measure.  A Call's operand stays untyped;
+    its type is still the emitter's rule to find."""
+    module = parse(SIZEOF_OPERANDS)
+    table = typed.type_module(module)
+    (bump,) = [c for c in _nodes(module, rast.Call)
+               if isinstance(c.func, rast.Ident) and c.func.name == 'bump']
+    (get,) = _nodes(module, rast.MethodCall)
+    assert table.type_of(bump) is None
+    assert _name(table.type_of(get)) == "i32"
+
+
+def test_sizeof_a_method_call_operand_compiles(tmp_path):
+    """The end-to-end form of the rule above: before #4066 the emitter's own
+    MethodCall rule measured it; it is now the table's, so it must be recorded.
+    `sizeof(bump())` alongside it is a Call's operand, still the emitter's."""
+    src = tmp_path / "a.ritz"
+    src.write_text(SIZEOF_OPERANDS)
+    assert ritz0.compile_file(str(src), str(tmp_path / "a.ll"), check_ownership=True)
 
 
 def test_the_emitter_reads_unknown_as_no_type():

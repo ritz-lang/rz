@@ -2189,59 +2189,6 @@ class LLVMEmitter:
                     if name.startswith(fn_name + '$'):
                         return fn_def.ret_type
             return None
-        elif isinstance(expr, rast.MethodCall):
-            # Method call return type - look up in method signatures.
-            # Handle a few well-known builtins so let bindings get usable types.
-            if expr.method == 'as_bytes':
-                recv_type = self._infer_ritz_type(expr.expr)
-                if isinstance(recv_type, rast.NamedType) and recv_type.name == 'StrView':
-                    return rast.NamedType(
-                        expr.span, 'Span',
-                        [rast.NamedType(expr.span, 'u8', [])],
-                    )
-            # Static method call `Type.method(...)`: the receiver is a *type
-            # name*, not a value, so value inference below can never resolve
-            # it. Look the mangled function up directly. Without this,
-            # `var reader = Reader.new(data)` recorded no type for `reader`,
-            # and a later `reader.read_u16()?` failed with "Try operator
-            # requires a Result type" (AGAST #1321, cmap/hmtx/loca trio).
-            if isinstance(expr.expr, rast.Ident) and (
-                    expr.expr.name in self.struct_types
-                    or expr.expr.name in self.enum_types):
-                mangled = f"{expr.expr.name}_{expr.method}"
-                if mangled in self.functions:
-                    fn_def = self.functions[mangled][1]
-                    if fn_def is not None and fn_def.ret_type is not None:
-                        return fn_def.ret_type
-            # User-defined methods: impl methods are emitted as free functions
-            # named `<Type>_<method>`, so resolve the receiver's type and look
-            # the mangled function up to recover the declared return type.
-            # Without this, `recv.method()?` had no inferrable Result type.
-            recv_type = self._infer_ritz_type(expr.expr)
-            while isinstance(recv_type, (rast.PtrType, rast.RefType)):
-                recv_type = recv_type.inner
-            if isinstance(recv_type, rast.NamedType):
-                candidates = [recv_type.name]
-                if recv_type.args:
-                    candidates.insert(0, self._get_specialized_type_name(recv_type))
-                for type_name in candidates:
-                    mangled = f"{type_name}_{expr.method}"
-                    if mangled in self.functions:
-                        fn_def = self.functions[mangled][1]
-                        if fn_def is not None and fn_def.ret_type is not None:
-                            return fn_def.ret_type
-                # `.unwrap()` / `.unwrap_or(d)` on an Option<T> / Result<T, E>
-                # is _try_emit_enum_unwrap_method's intrinsic, with no FnDef to
-                # read a return type off: it's the payload T, as monomorph's
-                # _infer_value_type says.  Without it `let t = r.unwrap()` had
-                # no Ritz type, so `t[0].tag.m()` with `m(self: @Tag)` couldn't
-                # see `t` as a Vec on the lvalue path: "Cannot index type:
-                # %Vec$E" (AGAST #3237).
-                if (expr.method in ('unwrap', 'unwrap_or')
-                        and recv_type.name in ('Option', 'Result')
-                        and recv_type.args):
-                    return recv_type.args[0]
-            return None  # Complex - would need full type resolution
         elif isinstance(expr, rast.Field):
             # Field access - resolve struct type and return field type
             base_type = self._infer_ritz_type(expr.expr)
@@ -2307,12 +2254,6 @@ class LLVMEmitter:
                         return pointee.inner
                 if isinstance(base_type, rast.PtrType):
                     return base_type.inner
-            return None
-        elif isinstance(expr, rast.ArrayLit):
-            if expr.elements:
-                elem_type = self._infer_ritz_type(expr.elements[0])
-                if elem_type:
-                    return rast.ArrayType(expr.span, len(expr.elements), elem_type)
             return None
         return None
 
