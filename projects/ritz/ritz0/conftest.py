@@ -147,9 +147,27 @@ import pytest
 # ritz0 imports, so editing it, or this file, leaves the compiler hash (and
 # every sig and cached artifact) alone.  Tests still `import fast_link` etc.
 # by bare name.
-HARNESS_DIR = str(Path(__file__).resolve().parent / "harness")
+#
+# The tests themselves live in ritz0/tests/ (AGAST #4373).  pytest inserts a
+# test file's own directory (tests/) on sys.path, not ritz0/, so put ritz0 on
+# it explicitly: the tests import the compiler modules (`import lexer`, ...)
+# by bare name.  Without this, `pytest ritz0/tests/test_lexer.py` from
+# projects/ritz fails, though `cd ritz0 && python -m pytest` would not (the
+# interpreter puts the cwd on sys.path).
+RITZ0_DIR = str(Path(__file__).resolve().parent)
+if RITZ0_DIR not in sys.path:
+    sys.path.append(RITZ0_DIR)
+HARNESS_DIR = str(Path(RITZ0_DIR) / "harness")
 if HARNESS_DIR not in sys.path:
     sys.path.append(HARNESS_DIR)
+# Tests also import sibling *test* modules by bare name (from test_ref_into_value
+# import COMPILERS).  pytest's prepend import mode puts a test file's own
+# directory on sys.path, but that is an implementation detail of one import
+# mode: name tests/ here so the imports hold even under an explicit
+# --import-mode=importlib, a nested pytest, or a direct `pytest <file>` run.
+TESTS_DIR = str(Path(RITZ0_DIR) / "tests")
+if TESTS_DIR not in sys.path:
+    sys.path.append(TESTS_DIR)
 
 import batching  # noqa: E402
 import fast_link  # noqa: E402
@@ -174,22 +192,22 @@ _SESSION_CACHE = None
 # front end and of the build/test tooling: no compiler subprocess, no ritz1.
 # tools/test_smoke.py fails if an entry no longer exists or contributes no test.
 SMOKE_FILES = (
-    "test_parser.py",
-    "test_lexer.py",
-    "test_const_eval.py",
-    "test_type_checker.py",
-    "test_move_checker.py",
-    "test_monomorph.py",
-    "test_metadata.py",
-    "test_export_map.py",
-    "test_attrs.py",
-    "test_reritz_integration.py",
+    "tests/test_parser.py",
+    "tests/test_lexer.py",
+    "tests/test_const_eval.py",
+    "tests/test_type_checker.py",
+    "tests/test_move_checker.py",
+    "tests/test_monomorph.py",
+    "tests/test_metadata.py",
+    "tests/test_export_map.py",
+    "tests/test_attrs.py",
+    "tests/test_reritz_integration.py",
     "emitter/test_struct_layout.py",
     "emitter/test_fn_cache.py",
-    "test_runner_source_roots.py",
-    "test_scratch_dir_location.py",
-    "test_no_artifact_skips.py",
-    "test_build.py",
+    "tests/test_runner_source_roots.py",
+    "tests/test_scratch_dir_location.py",
+    "tests/test_no_artifact_skips.py",
+    "tests/test_build.py",
 )
 _SMOKE_PATHS = frozenset((Path(__file__).resolve().parent / f) for f in SMOKE_FILES)
 # Fixtures that build ritz1; a test that asks for one is not smoke.

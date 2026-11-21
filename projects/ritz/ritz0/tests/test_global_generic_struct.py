@@ -1,0 +1,184 @@
+"""AGAST #3016: a module-level `var` of a generic struct type has the struct's layout.
+
+    struct Box<T>
+        ptr: *T
+    var gb: Box<H>
+    ...
+    gb.ptr = @h        # ritz0 was ValueError "Invalid type for field assignment: i8"
+
+ritz0's monomorphiser found generic instantiations in fn signatures, bodies and
+struct fields, but never in a module-level `var`'s type.  A `Box<H>` named only
+by a global was never specialised, so the global fell back to the opaque `i8`
+placeholder and every store, read and `@` of it went wrong.  ritz1 already
+lowered each of these.
+
+Each program returns 0, or the number of the first check that failed.
+"""
+
+from pathlib import Path
+
+import pytest
+
+from test_borrow_param_ref_field import _run
+
+RITZ_ROOT = Path(__file__).resolve().parents[2]
+SELFHOSTED_BIN = RITZ_ROOT / "ritz1" / "build" / "ritz1_selfhosted"
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
+
+_BOX = "struct Box<T>\n    ptr: *T\n\nstruct H\n    k: i64\n\n"
+# `pad` first, so `v` is not at offset 0: an i8-sized global, or a GEP that
+# misses the field index, reads the wrong word.
+_P = "struct P<T>\n    pad: i64\n    v: T\n\n"
+_MAIN = "pub fn main() -> i32\n"
+
+PROGRAMS = {
+    # A store to the global's field and a read back through it.  Box<H> is
+    # spelled nowhere but the global's type: a fn signature or let naming it
+    # would instantiate it and hide the bug.
+    "box": (_BOX + "var gb: Box<H>\n\n"
+            + _MAIN + "    var h: H\n    h.k = 9\n    gb.ptr = @h\n"
+            "    if gb.ptr.k != 9\n        return 1\n    return 0\n"),
+    # `@gb` is a pointer to the struct, not to an i8.
+    "address": (_BOX + "var gb: Box<H>\n\n"
+                + _MAIN + "    var h: H\n    h.k = 9\n    gb.ptr = @h\n"
+                "    let p = @gb\n    if p.ptr.k != 9\n        return 1\n    return 0\n"),
+    # AGAST #3026: the same through a plain (non-generic) struct global, and
+    # an index through the pointer field (ritz1 was "unhandled EXPR_MEMBER").
+    "address_plain": ("struct W\n    ptr: *i64\n\nvar gw: W\n\n" + _MAIN
+                      + "    var x: i64 = 5\n    gw.ptr = @x\n    let p = @gw\n"
+                      "    if p.ptr[0] != 5\n        return 1\n    return 0\n"),
+    # AGAST #3026: `@&g` writes through to the global.
+    "address_mut": (_BOX + "var gb: Box<H>\n\n" + _MAIN
+                    + "    var h: H\n    h.k = 4\n    let p = @&gb\n    p.ptr = @h\n"
+                    "    if gb.ptr.k != 4\n        return 1\n"
+                    "    if p.ptr.k != 4\n        return 2\n    return 0\n"),
+    # AGAST #3129: `@&` of an element of a global generic-struct array writes
+    # through (ritz1 was "unhandled EXPR_MEMBER in assignment").
+    "address_element": (_BOX + "var ga: [2]Box<H>\n\n" + _MAIN
+                        + "    var h: H\n    h.k = 4\n    let p = @&ga[1]\n    p.ptr = @h\n"
+                        "    if ga[1].ptr.k != 4\n        return 1\n    return 0\n"),
+    # Two instances of a user generic struct, each sized by its own T: an i64
+    # value that does not fit an i32 shows a shared or wrong layout.
+    "two_instances": (_P + "var gi: P<i32>\nvar gl: P<i64>\n\n" + _MAIN
+                      + "    gi.v = 7\n    gl.v = 1099511627776\n    gi.pad = 3\n"
+                      "    if gi.v != 7\n        return 1\n"
+                      "    if gl.v != 1099511627776\n        return 2\n"
+                      "    if gi.pad + gi.v != 10\n        return 3\n    return 0\n"),
+    # An array of a generic struct, global.
+    "array": (_P + "var ga: [2]P<i64>\n\n" + _MAIN
+              + "    ga[1].v = 1099511627776\n    ga[0].v = 5\n"
+              "    if ga[1].v != 1099511627776\n        return 1\n"
+              "    if ga[0].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3110: a 2-D array of a generic struct, global and local.  The
+    # leaf P$i64 lives only in the array's shape, not its 1-D element name,
+    # so a walk of `array_elem_type_name` alone never instantiates it.
+    "array_2d": (_P + "var gb: [2][3]P<i64>\n\n" + _MAIN
+                 + "    gb[1][2].v = 1099511627776\n    gb[0][1].v = 5\n"
+                 "    if gb[1][2].v != 1099511627776\n        return 1\n"
+                 "    if gb[0][1].v != 5\n        return 2\n    return 0\n"),
+    "local_array_2d": (_P + _MAIN
+                       + "    var lb: [2][3]P<i64>\n"
+                       "    lb[1][2].v = 1099511627776\n    lb[0][1].v = 5\n"
+                       "    if lb[1][2].v != 1099511627776\n        return 1\n"
+                       "    if lb[0][1].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3119: the same 2-D array as a struct field.  The concrete-struct
+    # field walk read only `array_elem_type_name`, so P$i64 was never
+    # instantiated and `w.a[1][2].v` was "unhandled EXPR_MEMBER".
+    "field_array_2d": (_P + "struct W\n    a: [2][3]P<i64>\n\n" + _MAIN
+                       + "    var w: W\n"
+                       "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                       "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                       "    if w.a[0][1].v != 5\n        return 2\n    return 0\n"),
+    # ... and a generic struct's `[2][3]P<T>` field, specialised as W$i64.
+    "generic_field_array_2d": (_P + "struct W<T>\n    a: [2][3]P<T>\n\n" + _MAIN
+                               + "    var w: W<i64>\n"
+                               "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                               "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                               "    if w.a[0][1].v != 5\n        return 2\n    return 0\n"),
+    # AGAST #3140: ... through the multi-parameter clone, which copied the
+    # shape as it stood, leaf `P$T` (or `P$U`): "unhandled EXPR_MEMBER".
+    # Over the first parameter, beside a field of the second ...
+    "generic2_field_array_2d_t": (_P + "struct W<T, U>\n    a: [2][3]P<T>\n    u: U\n\n" + _MAIN
+                                  + "    var w: W<i64, i32>\n    w.u = 9\n"
+                                  "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                                  "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                                  "    if w.a[0][1].v != 5\n        return 2\n"
+                                  "    if w.u != 9\n        return 3\n    return 0\n"),
+    # ... and over the second, so the leaf takes U's argument, not T's.
+    "generic2_field_array_2d_u": (_P + "struct W<T, U>\n    t: T\n    a: [2][3]P<U>\n\n" + _MAIN
+                                  + "    var w: W<i8, i64>\n    w.t = 9\n"
+                                  "    w.a[1][2].v = 1099511627776\n    w.a[0][1].v = 5\n"
+                                  "    if w.a[1][2].v != 1099511627776\n        return 1\n"
+                                  "    if w.a[0][1].v != 5\n        return 2\n"
+                                  "    if w.t != 9\n        return 3\n    return 0\n"),
+    # AGAST #3141: a generic struct's bare `[2][3]T` field.  The field clone
+    # kept the shape's leaf as a struct named `T`, so ritz1 refused
+    # `w.a[1][2] = x` ("assigning a row or a whole struct element").
+    "generic_field_bare_2d": ("struct W<T>\n    a: [2][3]T\n\n" + _MAIN
+                              + "    var w: W<i64>\n"
+                              "    w.a[1][2] = 1099511627776\n    w.a[0][1] = 5\n"
+                              "    if w.a[1][2] != 1099511627776\n        return 1\n"
+                              "    if w.a[0][1] != 5\n        return 2\n    return 0\n"),
+    # ... at a narrower T, beside a following field: an i64-wide leaf would
+    # overrun `a` into `k`, or read a neighbour into the element.
+    "generic_field_bare_2d_i8": ("struct W<T>\n    a: [2][3]T\n    k: i8\n\n" + _MAIN
+                                 + "    var w: W<i8>\n    w.k = 9\n"
+                                 "    w.a[1][1] = 4\n    w.a[1][2] = 7\n"
+                                 "    if w.a[1][2] != 7\n        return 1\n"
+                                 "    if w.a[1][1] != 4\n        return 2\n"
+                                 "    if w.k != 9\n        return 3\n    return 0\n"),
+    # ... and through the multi-parameter clone, each leaf its own argument.
+    "generic2_field_bare_2d": ("struct W<T, U>\n    a: [2][3]T\n    b: [2][3]U\n\n" + _MAIN
+                               + "    var w: W<i64, i8>\n"
+                               "    w.a[1][2] = 1099511627776\n    w.b[1][1] = 4\n    w.b[1][2] = 7\n"
+                               "    if w.a[1][2] != 1099511627776\n        return 1\n"
+                               "    if w.b[1][2] != 7\n        return 2\n"
+                               "    if w.b[1][1] != 4\n        return 3\n    return 0\n"),
+    # AGAST #3120: a `[2][3]P<T>` local in a generic fn body.  The clone
+    # substituted var_type_name but kept the shape's leaf `P$T`, so P$i64 was
+    # never instantiated and `lb[1][2].v` was "unhandled EXPR_MEMBER".
+    "generic_fn_local_array_2d": (_P + "fn pick<T>(x: T, y: T) -> i32\n"
+                                  "    var lb: [2][3]P<T>\n"
+                                  "    lb[1][2].v = x\n    lb[0][1].v = y\n"
+                                  "    if lb[1][2].v != x\n        return 1\n"
+                                  "    if lb[0][1].v != y\n        return 2\n    return 0\n\n"
+                                  + _MAIN + "    pick(1099511627776, 5)\n"),
+    # ... and a bare `[2][3]T` local: the leaf `T` is the argument type itself.
+    "generic_fn_local_bare_array_2d": ("fn pick<T>(x: T, y: T) -> i32\n"
+                                       "    var lb: [2][3]T\n"
+                                       "    lb[1][2] = x\n    lb[0][1] = y\n"
+                                       "    if lb[1][2] != x\n        return 1\n"
+                                       "    if lb[0][1] != y\n        return 2\n    return 0\n\n"
+                                       + _MAIN + "    pick(1099511627776, 5)\n"),
+}
+
+
+@pytest.fixture
+def run_with(ritz1_bin, tmp_path):
+    bins = {"ritz1": ritz1_bin, "ritz1_selfhosted": SELFHOSTED_BIN}
+
+    def go(compiler, name, program):
+        if compiler == "ritz0":
+            return _run("ritz0", None, tmp_path, name, program)
+        return _run("ritz1", bins[compiler], tmp_path, name, program)
+    return go
+
+
+# ritz1 gaps: none open.  (`address*` was #3026: ritz1 typed `let p = @g` of a
+# struct global as an i64, so `p.ptr` was "unhandled EXPR_MEMBER"; `array` was
+# #3025: ritz1's monomorphiser never instantiated a global array's element.)
+_RITZ1_GAPS = {}
+
+
+def _row(compiler, name):
+    if name in _RITZ1_GAPS and compiler != "ritz0":
+        return pytest.param(compiler, name, marks=pytest.mark.xfail(
+            strict=True, reason=_RITZ1_GAPS[name]))
+    return pytest.param(compiler, name)
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler,name", [_row(c, n) for n in sorted(PROGRAMS)
+                                           for c in COMPILERS])
+def test_a_global_of_a_generic_struct(run_with, compiler, name):
+    assert run_with(compiler, name, PROGRAMS[name]) == 0

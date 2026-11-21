@@ -77,7 +77,7 @@ def test_a_test_importer_does_not_keep_a_module_alive(tmp_path):
     """emitter/struct_layout.py's only importer was its test."""
     assert orphans(tmp_path, {
         "ritz0/dead.py": "",
-        "ritz0/test_dead.py": "import dead\n",
+        "ritz0/tests/test_dead.py": "import dead\n",
         "ritz0/emitter/test_dead2.py": "import dead\n",
     }) == ["ritz0/dead.py"]
 

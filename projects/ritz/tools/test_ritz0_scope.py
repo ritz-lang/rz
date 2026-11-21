@@ -32,7 +32,7 @@ pytestmark = pytest.mark.integration  # every test starts a process (AGAST #4092
 # path (as ritz0's tests name harland, indium, cryptosec, ...) and one
 # Markdown file by basename, plus packages nothing names.
 TREE = {
-    "projects/ritz/ritz0/test_reads.py": (
+    "projects/ritz/ritz0/tests/test_reads.py": (
         'NAMED = PROJECTS / "named"\n'
         'SPEC = RITZ_ROOT / "docs" / "LANGUAGE_SPEC.md"\n'
         'KC = REPO / "docs" / "KERNEL_CONTRACT.md"\n'),
@@ -213,8 +213,8 @@ def test_a_file_set_change_in_an_unnamed_package_runs(repo, edits, why):
 def test_a_top_dir_a_ritz_source_names_runs(repo):
     """.claude is allowlisted only while no ritz0-step source names it."""
     r, _ = repo
-    change(r, ("projects/ritz/ritz0/test_reads.py",
-               TREE["projects/ritz/ritz0/test_reads.py"] + 'G = ROOT / ".claude"\n'))
+    change(r, ("projects/ritz/ritz0/tests/test_reads.py",
+               TREE["projects/ritz/ritz0/tests/test_reads.py"] + 'G = ROOT / ".claude"\n'))
     head = git(r, "rev-parse", "HEAD")
     change(r, (".claude/skills/x/run.sh", "echo bye\n"))
     assert not decide(r, head).skip
@@ -230,7 +230,7 @@ def test_a_tools_test_naming_a_path_does_not_make_it_an_input(repo):
 
 def test_a_wildcard_markdown_read_makes_every_md_an_input(repo):
     r, _ = repo
-    change(r, ("projects/ritz/ritz0/test_globs.py", 'DOCS = sorted(D.glob("*.md"))\n'))
+    change(r, ("projects/ritz/ritz0/tests/test_globs.py", 'DOCS = sorted(D.glob("*.md"))\n'))
     head = git(r, "rev-parse", "HEAD")
     change(r, ("docs/guide.md", "# x\n"))
     assert not decide(r, head).skip
@@ -305,20 +305,20 @@ def test_a_git_failure_runs(tmp_path):
 # --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("rel, text", [
-    pytest.param("projects/ritz/ritz0/test_c.py", "x = 1  # see projects/lonely/src\n",
+    pytest.param("projects/ritz/ritz0/tests/test_c.py", "x = 1  # see projects/lonely/src\n",
                  id="py-comment"),
-    pytest.param("projects/ritz/ritz0/test_c.py",
+    pytest.param("projects/ritz/ritz0/tests/test_c.py",
                  '"""Like projects/lonely/src, but smaller."""\nx = 1\n', id="py-module-docstring"),
-    pytest.param("projects/ritz/ritz0/test_c.py",
+    pytest.param("projects/ritz/ritz0/tests/test_c.py",
                  'def f():\n    """reads "lonely" once"""\n    return 1\n', id="py-function-docstring"),
     pytest.param("projects/ritz/tools/smoke_stack/hollow.py", 'P = ROOT / "lonely"\n',
                  id="smoke-stack-is-never-run"),
     pytest.param("projects/ritz/ritz0/test/t.ritz", "# ../lonely/src/main.ritz does this too\n",
                  id="ritz-comment"),
     pytest.param("projects/ritz/scripts/t.sh", "# ../lonely is not built here\n", id="sh-comment"),
-    pytest.param("projects/ritz/ritz0/test_c.py", 'URL = "lonely://example.com/x"\n',
+    pytest.param("projects/ritz/ritz0/tests/test_c.py", 'URL = "lonely://example.com/x"\n',
                  id="url-scheme"),
-    pytest.param("projects/ritz/ritz0/test_c.py", 'CMD = "lonely --help"\n',
+    pytest.param("projects/ritz/ritz0/tests/test_c.py", 'CMD = "lonely --help"\n',
                  id="command-string"),
 ])
 def test_a_mention_that_cannot_read_a_package_does_not_name_it(repo, rel, text):
@@ -332,17 +332,17 @@ def test_a_mention_that_cannot_read_a_package_does_not_name_it(repo, rel, text):
 
 
 @pytest.mark.parametrize("rel, text", [
-    pytest.param("projects/ritz/ritz0/test_c.py", 'P = PROJECTS / "lonely"\n', id="py-path"),
-    pytest.param("projects/ritz/ritz0/test_c.py", 'P = f"{PROJECTS}/lonely/src"\n',
+    pytest.param("projects/ritz/ritz0/tests/test_c.py", 'P = PROJECTS / "lonely"\n', id="py-path"),
+    pytest.param("projects/ritz/ritz0/tests/test_c.py", 'P = f"{PROJECTS}/lonely/src"\n',
                  id="py-fstring-path"),
-    pytest.param("projects/ritz/ritz0/test_c.py",
+    pytest.param("projects/ritz/ritz0/tests/test_c.py",
                  'PROG = """\nimport lonely.main\nfn main() -> i32\n    0\n"""\n',
                  id="ritz-import-in-py-string"),
     pytest.param("projects/ritz/ritz0/test/t.ritz", "import lonely.main { f }\n",
                  id="ritz-import"),
     pytest.param("projects/ritz/scripts/t.sh", "RITZ_PATH=$ROOT/lonely:$ROOT/x\n",
                  id="sh-search-path"),
-    pytest.param("projects/ritz/ritz0/test_c.py", 'P = PROJECTS / "lonely"\ndef f(:\n',
+    pytest.param("projects/ritz/ritz0/tests/test_c.py", 'P = PROJECTS / "lonely"\ndef f(:\n',
                  id="unparsable-py-is-read-raw"),
 ])
 def test_a_mention_that_can_read_a_package_names_it(repo, rel, text):
@@ -488,7 +488,7 @@ def test_a_narrow_steps_sources_name_its_packages(narrow):
     head = git(r, "rev-parse", "HEAD")
     change(r, ("projects/lonely/src/main.ritz", "fn main() -> i32\n    4\n"))
     assert not decide_narrow(r, head).skip
-    # `named` is named only by ritz0/test_reads.py, outside NARROW.
+    # `named` is named only by ritz0/tests/test_reads.py, outside NARROW.
     sc = ritz0_scope.scope(r, step=NARROW)
     assert "lonely" in sc.named and "named" not in sc.named
 
@@ -549,7 +549,7 @@ def test_every_scoped_step_is_a_step_main_yml_declares():
     ("M", "projects/ritz/tools/ci_local.py"),
     ("M", "projects/ritz/tools/ritz0_scope.py"),
     ("M", "projects/ritz/docs/TESTING.md"),
-    ("M", "projects/ritz/ritz0/test_parser.py"),
+    ("M", "projects/ritz/ritz0/tests/test_parser.py"),
     ("M", "projects/ritz/ritzlib/tests/test_argspec_errors.ritz"),
     ("M", "projects/ritz/ritzlib/README.md"),
     ("M", ".claude/skills/rz-iterate/run-gate.sh"),

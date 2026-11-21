@@ -153,7 +153,7 @@ def _touch(path: Path):
 @pytest.mark.parametrize("rel", [
     "ritz0/conftest.py",
     *(f"ritz0/harness/{n}" for n in HARNESS_FILES),
-    "ritz0/test_lexer.py",
+    "ritz0/tests/test_lexer.py",
 ])
 def test_editing_test_support_leaves_the_hash(tree, rel):
     path = tree / rel

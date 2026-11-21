@@ -8,8 +8,8 @@ the command, and `-m "not integration"` really is the no-subprocess tier for
 tools/ too.  tools/test_tools_spawn_guard.py checks this stays loaded.
 
 ritz0/ and ritz0/harness/ (where spawn_guard lives, AGAST #3915) are
-appended to sys.path (not prepended) so no tools/ module is shadowed.  In a mixed session (`pytest ritz0/x.py tools/y.py`) both conftests
-name the plugin, and pytest registers it once.
+appended to sys.path (not prepended) so no tools/ module is shadowed.  In a mixed session (`pytest ritz0/tests/x.py tools/y.py`) both
+conftests name the plugin, and pytest registers it once.
 """
 
 import sys

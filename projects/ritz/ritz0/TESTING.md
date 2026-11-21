@@ -192,7 +192,7 @@ ritz0.py --test-all
 
 **Lexer tests:** `test_lexer.py`
 ```bash
-pytest ritz0/test_lexer.py -v
+pytest ritz0/tests/test_lexer.py -v
 ```
 - 28 lexer tests
 - Token type validation
@@ -202,7 +202,7 @@ pytest ritz0/test_lexer.py -v
 
 **Parser tests:** `test_parser.py`
 ```bash
-pytest ritz0/test_parser.py -v
+pytest ritz0/tests/test_parser.py -v
 ```
 - 39 parser tests
 - AST construction validation

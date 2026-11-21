@@ -209,10 +209,11 @@ REGRESSION = Step(
            "projects/ritz/cache.py",
            "projects/ritz/cas.py",
            "projects/ritz/resolve.py"),
-    # Never opened (the trace): ritz0's tests (cache.py's compiler hash
-    # skips test_* and test/ too), ritzlib/tests, the Markdown.
+    # Never opened (the trace): ritz0's tests (the compiler hash follows the
+    # compiler's imports, which reach no test), ritzlib/tests, the Markdown.
     # ritz0.py imports test_runner.py (its --test mode): not a test.
-    excludes=("projects/ritz/ritz0/test_*", "projects/ritz/ritz0/*/test_*",
+    excludes=("projects/ritz/ritz0/test_*", "projects/ritz/ritz0/tests/*",
+              "projects/ritz/ritz0/*/test_*",
               "projects/ritz/ritz0/test/*", "projects/ritz/ritz0/*/test/*",
               "projects/ritz/ritzlib/tests/*",
               "projects/ritz/ritz0/*.md", "projects/ritz/ritz1/*.md",

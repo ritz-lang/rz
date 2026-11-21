@@ -212,7 +212,7 @@ def test_real_hot_file_override_sits_just_above_its_measured_cost():
     the override clears the worse run and is within ~15% of it.  It must be
     *above* the old blank 90.0 -- a cap at 90 is what took main red."""
     b = ctb.load_budget(ctb.DEFAULT_BUDGET)
-    override = b["file"]["override"]["test_interface_text.py"]
+    override = b["file"]["override"]["tests/test_interface_text.py"]
     cap = float(override["cpu_s"])
     assert MEASURED_HOT_FILE_CPU_S <= cap <= MEASURED_HOT_FILE_CPU_S * 1.15, (
         f"test_interface_text.py override = {cap}: set it to the worse CI "

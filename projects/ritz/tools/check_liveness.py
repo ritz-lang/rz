@@ -65,7 +65,7 @@ EXTERNAL_DIRS = ("", "tools", "scripts")
 RITZLIB_ALLOWLIST = {
     "testlib.ritz": "the test assertion library: every importer is a test by design",
     "ptr.ritz": "ptr_read is LANGUAGE_SPEC §13.2's documented way to move a value "
-                "out of raw memory; only ritz0/test_ref_into_value.py calls it so far",
+                "out of raw memory; only ritz0/tests/test_ref_into_value.py calls it so far",
     "fmt.ritz": "#198 Phase 2 (#201) ships the Writer / Display surface tested in "
                 "isolation (ritzlib/tests/test_fmt_*); Phase 3 (#202) lowers "
                 "interpolation onto it. Drop this entry when #202 lands",

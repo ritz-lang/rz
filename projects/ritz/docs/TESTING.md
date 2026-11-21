@@ -352,7 +352,10 @@ vs. clean rebuilds, when matrix-full is needed, hard rules).
 
 ## What a ritz0 pytest case costs (read before adding a matrix)
 
-The `ritz0/` pytest suite is a gate step, and it grows with every ticket:
+The `ritz0/tests/` pytest suite is a gate step, and it grows with every ticket:
+(the tests moved out of `ritz0/` itself in AGAST #4373; cost-report keys and
+the budget's overrides are relative to `ritz0/`, so they read
+`tests/test_foo.py`.)
 150 files on 2026-10-29, 332 on 2026-11-12, ~31k cases and over half the
 gate before AGAST #2793.  Every parametrised row is paid on every gate, by
 every room, forever.  Rough per-case costs on the gate host (idle; the gate's
@@ -410,7 +413,7 @@ Rules:
 
    **Or make the table one test (AGAST #3518, #3519, #3566).**  Batching
    still collects, dispatches and reports every row as a case.  A table test
-   doesn't, and `ritz0/test_table_rows.py` is the one helper for it (#3566
+   doesn't, and `ritz0/tests/test_table_rows.py` is the one helper for it (#3566
    folded #3518's `test_row_table.py` into #3519's).  Rows are data,
    compiled as one program per compiler and chunk (`batching.run_rows` /
    `refuse_rows`, #2867's leaning checks included), each run row in its own
@@ -467,7 +470,7 @@ Rules:
    `RITZ_BUILD_CACHE_DIR` to a directory in the test's package: ritzlib
    objects then come from the session's content-addressed store, and the
    tree's `.ritz-cache` is left alone (see `_run_pkg` in
-   `ritz0/test_ritz1_builtin_struct_shadow.py`).
+   `ritz0/tests/test_ritz1_builtin_struct_shadow.py`).
 5. **Compile ritz0 in process** (`ritz0_inproc.run_ritz0` / `ritz0_oracle`),
    never `python3 ritz0.py` per case.
 6. **Measure.**  `pytest --cost-report=cost.json` prints the costliest
@@ -576,7 +579,8 @@ dated in the future: gate-queue tests set future mtimes) whose
 ```
 projects/ritz/
 ├── ritz0/
-│   ├── test_*.py             # Python unit tests (pytest)
+│   ├── tests/
+│   │   └── test_*.py         # Python unit tests (pytest), AGAST #4373
 │   ├── test_runner.py        # ritz0 --test driver
 │   └── test/
 │       └── test_issue_*.ritz # 33 regression tests (compiler matrix)
