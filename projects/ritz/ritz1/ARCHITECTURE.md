@@ -166,6 +166,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `sema_type` | Types an expression from the AST and Sema's scope alone, including what `x[i]` holds (index_through's type facts: a Vec, Span, String or `*[N]T` element, an `[N]*T` element's pointee). |
 | `sema_walk` | Walks the module and calls each Sema check. |
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
+| `struct_cast` | `as` between two different struct types is refused (§7.5, LARB R72, #4000). |
 
 **Checks**
 
@@ -304,6 +305,12 @@ empty. A note that belongs to a move goes on that check's own entry.
   `return`, a fn's tail value (§7.5, #4081) and a struct literal field
   (#4218), on Sema, at the slots literal_slot visits; a tail is judged where
   the walk reaches it, with its block's `let`s and its arm's bindings in scope.
+
+- `struct_cast` — `as` between two different struct types, by value or
+  through a reference, is a located refusal at the `as` (§7.5, LARB R72,
+  #4000): build the other struct from the fields. `r as C` with `r` an `@C` /
+  `@&C` / `*C` reads a copy of the referent (#3004), and `@c as *D` is a
+  pointer cast; both stay legal.
 
 - `struct_variants` — same-named structs (§15.3, §17.2, #4111): the parser
   notes every struct, `[[target_os]]`-filtered or not, with its target and a

@@ -596,12 +596,7 @@ def test_a_copy_type_cast_lands_as_the_referent(tmp_path, compiler, site):
     assert _run(compiler, tmp_path, f"copy_cast_{site}", COPY + _main(COPY_CAST_SITES[site], entry)) == 4
 
 
-# ritz1's half of R72 is AGAST #4000: strict, so it fails when that lands.
-RITZ1_STRUCT_CAST = pytest.mark.xfail(strict=True, reason="AGAST #4000: ritz1 emits clang-rejected IR")
-
-
-@pytest.mark.parametrize("compiler", [
-    "ritz0", *(pytest.param(c, marks=RITZ1_STRUCT_CAST) for c in COMPILERS[1:])])
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("site", _ids(STRUCT_CASTS))
 def test_as_between_two_structs_is_refused(tmp_path, compiler, site):
     src = COPY + STRUCT_D + _main(STRUCT_CASTS[site], CALL_F)

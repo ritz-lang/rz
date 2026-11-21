@@ -76,6 +76,7 @@ SOURCES = \
 	float_slot \
 	fn_slot \
 	slot_narrowing \
+	struct_cast \
 	float_compare \
 	tail_value \
 	trait_bound \
