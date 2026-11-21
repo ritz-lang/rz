@@ -2103,8 +2103,9 @@ struct Runtime
 ```
 
 `waker_io_ready`, not the value of `waker_io_result`, says whether a completion
-is waiting, so a read at EOF returns 0 rather than being resubmitted. A poll
-function that returns an -EPERM result it was handed is Ready(-1): `block_on`
+is waiting, so a read at EOF returns 0 rather than being resubmitted. A
+hand-written poll function that returns an -EPERM result it was handed is
+Ready(-1); the legacy poll-fn driver the examples and tests keep until #4009
 returns -1 instead of reading it as Pending (AGAST #2328).
 
 | Function | Signature | Description |
@@ -2114,7 +2115,7 @@ returns -1 instead of reading it as Pending (AGAST #2328).
 | `runtime_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Read, waiting for the result |
 | `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Write, waiting for the result |
 | `runtime_close` | `fn(rt: *Runtime, fd: i32) -> Result<(), Errno>` | Close, waiting for the result |
-| `block_on` | `fn(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32` | Poll a future to completion; -EINVAL if it is Pending with nothing to wake it |
+| `block_on` | `fn(rt: *Runtime, f: @&Future)` | Poll a future to completion; read the result with `await p` (LARB R79) |
 | `runtime_poll_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a read and return Pending, then return its result |
 | `runtime_poll_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a write and return Pending, then return its result |
 | `runtime_wait_for_io` | `fn(rt: *Runtime) -> i32` | Wait for a completion and record it for the waker |

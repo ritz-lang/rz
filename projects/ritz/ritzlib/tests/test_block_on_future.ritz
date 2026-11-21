@@ -1,0 +1,105 @@
+# test_block_on_future.ritz - block_on drives a held future (LARB R79, AGAST #4008)
+#
+# block_on(rt, f: @&Future) polls the future through future_poll until it is
+# ready and returns nothing; the caller reads the value with `await p`.  A
+# future with no await points completes on its first poll.
+#
+# These are generated-future contract tests: a real i64 above 2^31 and a real
+# -1, neither of which is the Pending encoding any more, plus the R78 contract
+# that a Pending poll must have suspended: block_on fails loudly, not silently
+# and not by spinning, when it did not.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.async.runtime
+
+async fn big_value() -> i64
+    5000000000
+
+async fn minus_one() -> i32
+    0 - 1
+
+# A poll source that is always Pending but registers nothing on the ring, so
+# the generated future is Pending with no waker: a contract violation.
+fn always_pending(x: i32) -> i32
+    0 - 1
+
+async fn never_ready() -> i32
+    let v: i32 = await always_pending(0)
+    v
+
+[[test]]
+fn test_block_on_drives_future_to_i64_above_2_to_31() -> i32
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    var p = big_value()
+    block_on(@rt, @&p)
+    let v: i64 = await p
+    runtime_destroy(@rt)
+
+    if v != 5000000000
+        prints("FAIL: expected 5000000000, got ")
+        print_int(v)
+        prints("\n")
+        return 1
+    return 0
+
+[[test]]
+fn test_block_on_await_yields_minus_one_result() -> i32
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: runtime_init failed\n")
+        return 1
+
+    var p = minus_one()
+    block_on(@rt, @&p)
+    let v: i32 = await p
+    runtime_destroy(@rt)
+
+    if v != 0 - 1
+        prints("FAIL: expected -1, got ")
+        print_int(v as i64)
+        prints("\n")
+        return 1
+    return 0
+
+[[test]]
+fn test_block_on_pending_without_a_waker_fails_loudly() -> i32
+    var err_pipe: [2]i32
+    if sys_pipe(@err_pipe[0]) < 0
+        prints("FAIL: sys_pipe failed\n")
+        return 1
+
+    let pid: i32 = sys_fork()
+    if pid == 0
+        # Child: block_on must not return; the contract violation exits 101.
+        sys_dup2(err_pipe[1], 2)
+        sys_close(err_pipe[0])
+        sys_close(err_pipe[1])
+
+        var rt: Runtime
+        if runtime_init(@rt) < 0
+            sys_exit(2)
+        var p = never_ready()
+        block_on(@rt, @&p)
+        sys_exit(0)   # reached only if the failure was not loud
+
+    sys_close(err_pipe[1])
+    var msg: [256]u8
+    let n: i64 = sys_read(err_pipe[0], @msg[0], 256)
+    sys_close(err_pipe[0])
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    let code: i32 = (status >> 8) & 255
+
+    if code != 101
+        prints("FAIL: expected exit 101 for a Pending poll with no waker\n")
+        return 1
+    if n <= 0
+        prints("FAIL: expected a failure message on stderr\n")
+        return 1
+    return 0

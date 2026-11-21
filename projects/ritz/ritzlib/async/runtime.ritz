@@ -14,8 +14,9 @@
 #       var rt: Runtime
 #       if runtime_init(@rt) < 0
 #           return 1
-#       let poll_fn: fn(*u8) -> i32 = my_poll_fn
-#       let result: i32 = block_on(@rt, @future as *u8, poll_fn)
+#       var p = my_async_fn()
+#       block_on(@rt, @&p)
+#       let result: i32 = await p
 #       runtime_destroy(@rt)
 #       result
 
@@ -23,6 +24,7 @@ import ritzlib.sys
 import ritzlib.uring
 import ritzlib.result
 import ritzlib.errno
+import ritzlib.strview
 
 # ============================================================================
 # Constants
@@ -53,7 +55,7 @@ struct Runtime
     waker_io_ready: i32
     waker_active: i32
     # Set when the result just taken was -1, which a poll function returns
-    # as-is and block_on would otherwise read as POLL_PENDING
+    # as-is and the legacy block_on_op driver would otherwise read as Pending
     took_pending_code: i32
 
 # Initialize the runtime with an io_uring instance
@@ -270,34 +272,30 @@ pub fn runtime_wait_for_io(rt: *Runtime) -> i32
 
     return 0
 
-# Poll a future until it is Ready, waiting on io_uring whenever it is Pending.
-# A future that returns Pending must have suspended on an operation; one that
-# has not could never be woken, so block_on returns -EINVAL rather than spin.
-# A future that returns an -EPERM result it was handed is Ready(-1), not
-# Pending: the runtime knows it handed one over, so block_on returns -1.
-pub fn block_on(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
-    var completed: i32 = 0
-    var result: i32 = 0
+# Poll a future until it is Ready (LARB R79), waiting on io_uring whenever the
+# future's poll reports Pending.  Returns nothing; the caller reads the result
+# with `await p`.
+#
+# A poll that reports Pending must have suspended on an operation (LARB R78).
+# One that did not can never be woken, so the future would stay unfinished: a
+# silent return would let `await p` read an unset result slot, and a busy loop
+# would hang.  Both are contract violations, so fail loudly instead.
+pub fn block_on(rt: *Runtime, f: @&Future)
+    while !future_poll(f)
+        if rt.waker_active == 0
+            block_on_contract_violation()
+        let wait_result: i32 = runtime_wait_for_io(rt)
+        if wait_result < 0
+            block_on_fatal("block_on: runtime_wait_for_io failed")
 
-    while completed == 0
-        rt.took_pending_code = 0
-        result = poll_fn(future_ptr)
+# A Pending poll with nothing registered to wake it: the future can never run
+# again, so returning would hand the caller an unfinished future.
+fn block_on_contract_violation()
+    block_on_fatal("block_on: Pending future did not suspend on the ring")
 
-        if result != POLL_PENDING
-            completed = 1
-        else
-            if rt.took_pending_code != 0 and rt.waker_active == 0
-                completed = 1   # Ready(-EPERM)
-            else if rt.waker_active != 0
-                let wait_result: i32 = runtime_wait_for_io(rt)
-                if wait_result < 0
-                    result = wait_result
-                    completed = 1
-            else
-                result = -22  # EINVAL
-                completed = 1
-
-    return result
+# Loud failure for the loop's impossible states: message on stderr, exit 101.
+fn block_on_fatal(msg: StrView)
+    ritz_platform_fatal(msg.ptr, msg.len, 101)
 
 # ============================================================================
 # Global Runtime (for convenience)
