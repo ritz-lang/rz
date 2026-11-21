@@ -190,8 +190,10 @@ INIT_EXIT = r"[exit] init exited with code 0, powering off\n"
 # (Tier-1 `preempt`) ran side by side: their lines interleave (AGAST #3629).
 TIMER_OK = r"[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 100 Hz tick, initial count 625000\n"
 # A healthy pair alternates almost every step: eight steps each, 16 runs, and
-# the scheduler preempts on most ticks (AGAST #4332 raised the bar from 3 runs
-# and added the counter check, so the fixture must look like a real boot).
+# the scheduler preempts on most ticks (AGAST #4332 added the counter check).
+# The run floor is 6, not 10 (AGAST #4438): a loaded host can pair the lines
+# to 9 runs while preemption stays healthy, so the counter ratio is the real
+# invariant and 6 only has to separate that from the 2..4-run failure shapes.
 BUSY_OK = "".join(f"[busy A] {step}/8\n[busy B] {step}/8\n" for step in range(1, 9))
 SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions\n"
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
@@ -427,6 +429,39 @@ def test_busy_children_that_ran_one_after_the_other_fail(tree):
     assert r.returncode == 1, r.stdout + r.stderr
     assert "PASS (native): init Tier-1 suite" in r.stdout
     assert "busy children barely interleaved, not preempted each step (AABB, 2 runs)" in r.stdout
+
+
+def _busy(seq: str) -> str:
+    """Serial lines for busy children that print one step each in seq order."""
+    step = {"A": 0, "B": 0}
+    out = []
+    for tag in seq:
+        step[tag] += 1
+        out.append(f"[busy {tag}] {step[tag]}/8\n")
+    return "".join(out)
+
+
+# The Main Branch Validation failure of AGAST #4438: the two children were
+# preempted (the [sched] counters are healthy) but each timeslice covered two
+# steps, so the lines paired ABBAABBA... for 9 runs instead of alternating for
+# 16. The interleave count is a relative-speed measure, not a preemption one.
+BUSY_PAIRED_9 = _busy("ABBAABBAABBAABBA")
+assert BUSY_PAIRED_9.count("[busy A]") == 8 and BUSY_PAIRED_9.count("[busy B]") == 8
+
+
+@pytest.mark.integration
+def test_busy_children_coarsely_paired_by_load_pass(tree):
+    """The #4438 CI failure: healthy preemption, but the host gave each child
+    two steps per timeslice, so the lines paired (ABBAABBA..., 9 runs). The
+    run count must tolerate that; only the [sched] ratio proves the scheduler
+    kept preempting."""
+    serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
+              + BUSY_PAIRED_9
+              + SCHED_OK
+              + SUITE_PASSED + INIT_EXIT)
+    r = _run(tree, serial)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "two busy children preempted each other: ABBAABBAABBAABBA (9 runs" in r.stdout
 
 
 @pytest.mark.integration
