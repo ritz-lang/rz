@@ -273,19 +273,41 @@ fi
 #   RZ_EXEC_DIRS  colon list; one must run a binary
 #                 (default $TMPDIR:/tmp:~/tmp:$RZ_GATE_DIR or ~/dev/ritz-lang/gate-logs:~)
 #
-# The python checked is the one the gate runs: the first python3 on PATH
-# (run-gate.sh passes PATH on; with none, the default above), looked up
-# before LLVM's bin dir and ~/.local/bin (where starbux and chungus keep
-# lld-link) go on PATH here.  No venv path is assumed: omegalisk's is
-# ~/dev/nevelis/.venv, the others' ~/dev/.venv.
+# Which python: the one the gate runs.  run-gate.sh passes its PATH on, so
+# under the room's unit that is PATH's first python3, looked up before LLVM's
+# bin dir and ~/.local/bin (where starbux and chungus keep lld-link) go on
+# PATH here.  A plain SSH/login shell is NOT the unit though: its PATH has
+# /usr/bin/python3, which has no llvmlite and no pytest, and refusing that
+# sent spawners off to "fix" a healthy machine (AGAST #4432, starbux
+# 2026-11-21).  room_python resolves the interpreter, using the venv the
+# unit puts first when PATH's own python cannot gate, and the caller says
+# which one it judged.  No venv path is hardcoded in a branch: rz_venv_path
+# names ~/dev/.venv and ~/dev/nevelis/.venv (omegalisk).
 # Tests: projects/ritz/tools/test_borque_hooks.py.
-host_problems() {
-    local py p=() tool f ovmf="" tmp out
-    py="$(command -v python3)" || py=""
-    local PATH="${RZ_LLVM_BIN:-/usr/lib/llvm-21/bin}:$HOME/.local/bin:$PATH"
-    if [[ -z "$py" ]]; then
-        p+=("no python3 on PATH ($PATH)")
-    elif ! out="$("$py" - "$py" 2>&1 <<'PY'
+
+# room_venv_bins: the venv bin dirs a room unit puts first on PATH, in the
+# order rz_venv_path prepends them (the last prepended ends up first):
+# ~/dev/.venv, then ~/dev/nevelis/.venv.  Only the ones that exist.
+room_venv_bins() {
+    local IFS=: v
+    for v in $(rz_venv_path ""); do
+        [[ -n "$v" ]] && printf '%s\n' "$v"
+    done
+}
+
+# same_dir <a> <b>: both name the same physical directory.
+same_dir() {
+    local a b
+    a="$(cd "$1" 2>/dev/null && pwd -P)" || return 1
+    b="$(cd "$2" 2>/dev/null && pwd -P)" || return 1
+    [[ "$a" == "$b" ]]
+}
+
+# pylacks <python>: print what <python> lacks to run the gate's Python side
+# (llvmlite, yaml, pytest < 9.2); return 0 when it can gate, 1 when it cannot.
+# A crashed interpreter prints nothing, so callers say "<path> failed".
+pylacks() {
+    "$1" - "$1" 2>&1 <<'PY'
 import importlib.metadata as md, importlib.util as iu, sys
 py = sys.argv[1]
 bad = [f"{m} not importable by {py}" for m in ("llvmlite", "yaml") if iu.find_spec(m) is None]
@@ -298,7 +320,42 @@ except md.PackageNotFoundError:
 print("; ".join(bad))
 sys.exit(1 if bad else 0)
 PY
-)"; then
+}
+
+# room_python: print the python3 the gate will run, or nothing when PATH has
+# no python3 at all.  PATH's own python wins while it can gate.  When it
+# cannot and it is NOT one of the room venvs' interpreters, PATH is not the
+# unit's (a login shell's /usr/bin/python3), so take the venv the unit puts
+# first -- that is the #4432 fix; the venv is then judged like any other, so
+# a broken one still refuses.  A python already selected FROM a room venv IS
+# the gate's: a second venv must not mask it.
+room_python() {
+    local py vbin alt=""
+    py="$(command -v python3)" || py=""
+    [[ -n "$py" ]] || return 0
+    if pylacks "$py" >/dev/null 2>&1; then
+        printf '%s\n' "$py"
+        return 0
+    fi
+    while IFS= read -r vbin; do
+        if same_dir "$vbin" "$(dirname "$py")"; then
+            printf '%s\n' "$py"
+            return 0
+        fi
+        if [[ -z "$alt" && -x "$vbin/python3" ]]; then
+            alt="$vbin/python3"
+        fi
+    done < <(room_venv_bins)
+    printf '%s\n' "${alt:-$py}"
+}
+
+host_problems() {
+    local py p=() tool f ovmf="" tmp out
+    py="$(room_python)"
+    local PATH="${RZ_LLVM_BIN:-/usr/lib/llvm-21/bin}:$HOME/.local/bin:$PATH"
+    if [[ -z "$py" ]]; then
+        p+=("no python3 on PATH ($PATH)")
+    elif ! out="$(pylacks "$py")"; then
         p+=("${out:-$py failed}")
     fi
     for tool in qemu-system-x86_64 lld-link; do
@@ -361,6 +418,9 @@ EOF
         fi
         exit 1
     fi
+    # Say which interpreter passed.  From a login shell this is a venv's, not
+    # PATH's first, and a spawner reading the log needs to see that (#4432).
+    echo "  python3 the gate will use: $(room_python)"
 fi
 if [[ $MODE == check ]]; then
     echo "provision-room: host ok"

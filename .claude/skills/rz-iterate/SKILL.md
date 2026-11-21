@@ -410,7 +410,10 @@ build priority for rooms" or "Re-gating after rebase".
 
 **Provision every worktree** with `.claude/provision-room.sh <worktree>` after
 `git worktree add` and before starting the agent. It must print "room
-permissions OK". Trust is not per-worktree: for a worktree the CLI checks the
+permissions OK". A plain SSH/login shell is fine: when PATH's own `python3`
+cannot gate, the host check probes the room venv (`~/dev/.venv`, or
+`~/dev/nevelis/.venv` on omegalisk) and says which interpreter it judged
+(#4432). Trust is not per-worktree: for a worktree the CLI checks the
 **main checkout's** key (`~/dev/ritz-lang/rz`) in
 `${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json`, so the script trusts that key as
 well as the worktree's own (#2746). Without it the room's allow list is ignored,

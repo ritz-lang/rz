@@ -325,6 +325,55 @@ def test_provision_refuses_without_python3_on_path(host):
     assert "no python3 on PATH" in r.stderr, r.stderr
 
 
+def _login_shell_path(h: dict) -> str:
+    """A plain SSH/login shell's PATH: a python3 outside every room venv.
+
+    /usr/bin/python3 on the hosts the ticket names has no llvmlite and no
+    pytest but is otherwise a working interpreter (it runs json).  This
+    stand-in is the same: the real interpreter with -S, so no site-packages.
+    Its dir is not a room venv's, so provision-room.sh must probe the venv
+    for the gate's Python side (AGAST #4432).  The rest of BASICS is the same
+    host, tools included."""
+    d = h["home"] / "usr-bin"
+    if not d.is_dir():
+        d.mkdir()
+        for name in BASICS:
+            if name != "python3":
+                (d / name).symlink_to(shutil.which(name))
+    _exe(d / "python3", f'#!/bin/sh\nPYTHONPATH= exec "{sys.executable}" -S "$@"\n')
+    return str(d)
+
+
+def test_provision_uses_the_room_venv_from_a_login_shell_path(host):
+    """AGAST #4432: `ssh host '.claude/provision-room.sh <wt>'` has
+    /usr/bin/python3 on PATH, which has no llvmlite; the room's unit runs
+    with the venv first, so the venv's python is the one that gates.  The
+    host is provisioned, and the output says which interpreter was judged."""
+    r = _hook(host, "provision-room.sh", str(host["wt"]), PATH=_login_shell_path(host))
+    assert r.returncode == 0, r.stderr
+    assert _settings(host).is_file()
+    assert f"{host['venv']}/bin/python3" in r.stdout, r.stdout
+
+
+def test_provision_refuses_when_the_room_venv_cannot_gate_either(host):
+    """The fallback is a probe, not a waiver: with the venv broken too the
+    host is still refused, in the one-line report, naming the interpreter
+    the gate would have run."""
+    _exe(host["venv"] / "bin" / "python3", "#!/bin/sh\nexit 3\n")
+    r = _hook(
+        host,
+        "provision-room.sh",
+        "--check-host",
+        str(host["wt"]),
+        PATH=_login_shell_path(host),
+    )
+    assert r.returncode == 1
+    lines = r.stderr.strip().splitlines()
+    assert len(lines) == 1, r.stderr
+    assert f"{host['venv']}/bin/python3 failed" in lines[0], lines[0]
+    assert not _settings(host).exists()
+
+
 def _noexec_path(h: dict, *dirs: Path | str) -> str:
     """BASICS, but files under DIRS can't run, as on a noexec mount.
 
