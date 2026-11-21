@@ -319,12 +319,14 @@ impl Drop for D
 # The binding is a view of an element, not an owner: nothing drops per iteration.
 @pytest.mark.integration
 @pytest.mark.parametrize("compiler", COMPILERS)
-@pytest.mark.parametrize("holder,pre,it", [
-    ("global", "var a: [2]D\n\n", "a"),
-    ("field", "struct W\n    a: [2]D\n\nvar w: W\n\n", "w.a"),
+@pytest.mark.parametrize("holder,pre,init,it", [
+    ("global", "var A_STORE: [4]i64\nvar a: *[2]D = null\n\n",
+     "    a = @&A_STORE as *[2]D\n", "*a"),
+    ("field", "struct W\n    a: [2]D\n\nvar W_STORE: [8]i64\nvar w: *W = null\n\n",
+     "    w = @&W_STORE as *W\n", "(*w).a"),
 ])
-def test_a_move_only_element_is_not_dropped_by_the_loop(run_with, compiler, holder, pre, it):
-    program = (_DROPS + pre + MAIN + "    var t: i32 = 0\n    for e in " + it + "\n"
+def test_a_move_only_element_is_not_dropped_by_the_loop(run_with, compiler, holder, pre, init, it):
+    program = (_DROPS + pre + MAIN + init + "    var t: i32 = 0\n    for e in " + it + "\n"
                "        t = t + 1\n    if t != 2\n        return 1\n"
                "    if drops != 0\n        return 2\n    return 0\n")
     assert run_with(compiler, holder, program) == 0

@@ -2734,13 +2734,15 @@ class LLVMEmitter:
         del self._pending_const_data[name]
         return gvar
 
-    def _refuse_drop_const(self, item: rast.ConstDef) -> None:
-        """LARB R60: a const of a type with `Drop` is an error (§4.3).
-        Nothing drops it: it lives until the process exits.  A global `var`'s
-        half waits on migrating the 11 globals that have one (AGAST #4079)."""
+    def _refuse_drop_const(self, item) -> None:
+        """LARB R60: a const or global `var` of a type with `Drop` is an error
+        (§4.3).  Nothing drops it: it lives until the process exits.  A global
+        that needs one is a pointer (`var g: *T`), allocated in its init path
+        (AGAST #4079)."""
         if not self.move_types.is_move_only(item.type):
             return
-        raise EmitError(f"const '{item.name}' has type `{self._show_type(item.type)}`, "
+        kind = "const" if isinstance(item, rast.ConstDef) else "global"
+        raise EmitError(f"{kind} '{item.name}' has type `{self._show_type(item.type)}`, "
                         f"which has Drop: a module-level value is never dropped", item.span)
 
     def _emit_const_array(self, name: str, ritz_type: rast.Type, value: rast.Expr) -> None:
@@ -3566,6 +3568,7 @@ class LLVMEmitter:
                     # every literal const is known (AGAST #2150).
                     const_exprs.append((item, ty))
             elif isinstance(item, rast.VarDef):
+                self._refuse_drop_const(item)
                 global_vars.append(item)
             elif isinstance(item, rast.ExternFn):
                 self._declare_extern(item)

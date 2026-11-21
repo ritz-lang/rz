@@ -1560,9 +1560,10 @@ through a `self:&` method are errors. A const isn't a pattern: an arm naming
 a struct or enum const is refused as any binder taking a const's name is
 (below); match the variant itself.
 
-A const of a type with `Drop`, or one holding a type with `Drop`, is an error
-at the `const`: nothing would ever drop it. The same rule for a global `var`
-is pending AGAST #4079, which first migrates the globals that have one.
+A const or global `var` of a type with `Drop`, or one holding a type with
+`Drop`, is an error at the declaration: nothing would ever drop it. A global
+that needs such a value holds a pointer instead (`var g: *T`, allocated once
+in its init path and never freed).
 
 #### One meaning per name
 

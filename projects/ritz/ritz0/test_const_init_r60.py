@@ -67,6 +67,8 @@ fn shp(s: Shape) -> i64
 
 """
 
+_DROP_TYPE = "struct D\n    v: i64\n\nimpl Drop for D\n    fn drop(self: @&D)\n        pass\n\n"
+
 RUN = {
     # R60 table: `var g: f64 = 2.5`; float arithmetic and a float const.
     "float": """\
@@ -212,6 +214,16 @@ pub fn main() -> i32
         return 10
     3
 """,
+    # R60/R71: the migration shape.  A pointer global of a Drop type is
+    # accepted; only a value global would be refused (it is never dropped).
+    "drop_pointer_global": _DROP_TYPE + """\
+var g: *D = null
+
+pub fn main() -> i32
+    if g != null
+        return 10
+    3
+""",
 }
 
 
@@ -239,7 +251,6 @@ def test_a_constant_initialiser_runs(tmp_path, name):
 
 
 _NON_CONST = "global 'g' has a non-constant initializer"
-_DROP_TYPE = "struct D\n    v: i64\n\nimpl Drop for D\n    fn drop(self: @&D)\n        pass\n\n"
 _HOLDS_DROP = "struct H\n    d: D\n\n"
 _MAIN = "\npub fn main() -> i32\n    0\n"
 _USE = "\npub fn main() -> i32\n    {}\n    0\n"
@@ -262,12 +273,16 @@ REFUSED = {
                     "an array literal of 2 elements for a `[3]i32`"),
     "missing_field": ("var g: In = ^In { }\n" + _MAIN, "global 'g' has no value for field 'k'"),
     "wrong_struct": ("var g: In = ^P { a: 1 }\n" + _MAIN, "global 'g' is a `P` literal for a `In`"),
-    # A const of a type with Drop, or holding one.  A global `var`'s half
-    # waits on migrating the globals that have one (AGAST #4079).
+    # A const or global `var` of a type with Drop, or holding one (R60/R71).
     "drop_const": (_DROP_TYPE + "^const C: D = D { v: 1 }\n" + _MAIN,
                    "const 'C' has type `D`, which has Drop: a module-level value is never dropped"),
     "drop_inside": (_DROP_TYPE + _HOLDS_DROP + "^const C: H = H { d: D { v: 1 } }\n" + _MAIN,
                     "const 'C' has type `H`, which has Drop: a module-level value is never dropped"),
+    "drop_global": (_DROP_TYPE + "^var g: D = D { v: 1 }\n" + _MAIN,
+                    "global 'g' has type `D`, which has Drop: a module-level value is never dropped"),
+    "drop_global_inside": (_DROP_TYPE + _HOLDS_DROP
+                           + "^var g: H = H { d: D { v: 1 } }\n" + _MAIN,
+                           "global 'g' has type `H`, which has Drop: a module-level value is never dropped"),
     # A struct const is read-only data (R48).  It isn't a pattern: an arm
     # naming it is refused as any binder taking a const's name is.
     "const_mut_borrow": ("const C: In = In { k: 1 }\n\nfn w(p: @&In)\n    p.k = 2\n"

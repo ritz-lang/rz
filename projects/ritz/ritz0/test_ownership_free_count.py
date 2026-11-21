@@ -793,17 +793,21 @@ pub fn main() -> i32
     # AGAST #2269 typed a binding from a module-level `var` (ritz0 saw only
     # locals, so `x` was a copy and dropped twice); LARB R34 (#3366) then
     # refused moving a move-only value out of one: GLOBAL_MOVE_OUT. A borrow
-    # of the global's field is unaffected, and nothing drops.
+    # of the global's field is unaffected, and nothing drops.  LARB R60
+    # refuses a value global of a Drop type, so GLOBAL is a pointer into a
+    # static buffer (R71's migration shape).
     "borrow_of_global_field": (SLOT + FIELDS + """\
-var GLOBAL: Holder
+var GLOBAL: *Holder = null
+var GLOBAL_STORE: [4]i64
 
 fn see(t: @Tracked) -> i32
     return t.id
 
 fn f() -> i32
-    GLOBAL = make_holder(1)
-    var r = @GLOBAL.t
-    see(@GLOBAL.t)
+    GLOBAL = @&GLOBAL_STORE as *Holder
+    *GLOBAL = make_holder(1)
+    var r = @(*GLOBAL).t
+    see(@(*GLOBAL).t)
     return see(r)
 
 pub fn main() -> i32
@@ -827,13 +831,16 @@ pub fn main() -> i32
 """, 30, {}),
 
     # LARB R34b: a by-value `match G.t` moves (GLOBAL_MOVE_OUT); `match @G.t`
-    # lends it, reads the payload in place and drops nothing.
+    # lends it, reads the payload in place and drops nothing.  LARB R60: the
+    # global is a pointer into a static buffer (R71's migration shape).
     "match_on_borrowed_global_field": (SLOT + FIELDS + """\
-var SL: Slotted
+var SL: *Slotted = null
+var SL_STORE: [8]i64
 
 fn f() -> i32
-    SL = Slotted { e: Slot.Full(make(4)), s: make(5) }
-    match @SL.e
+    SL = @&SL_STORE as *Slotted
+    *SL = Slotted { e: Slot.Full(make(4)), s: make(5) }
+    match @(*SL).e
         Full(x) => x.id
         _ => 0
 

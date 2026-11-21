@@ -52,9 +52,9 @@ import bool_check
 import ritzlib.memory
 
 var g_sema_probe_on: i32 = 0
-var g_sema_probe_map: HashMapI64
-var g_sema_probe_local_calls: HashMapI64
-var g_sema_probe_local_names: HashMapI64
+var g_sema_probe_map: *HashMapI64 = null
+var g_sema_probe_local_calls: *HashMapI64 = null
+var g_sema_probe_local_names: *HashMapI64 = null
 var g_sema_probe_compared: i64 = 0
 var g_sema_probe_mismatched: i64 = 0
 var g_sema_probe_unknown: i64 = 0
@@ -64,7 +64,7 @@ var g_sema_probe_bk_gap: i64 = 0
 var g_sema_probe_slot_compared: i64 = 0
 var g_sema_probe_slot_mismatched: i64 = 0
 var g_sema_probe_slot_lenient: i64 = 0
-var g_sema_probe_bk: HashMapI64        # e -> sema_bool_kind + 100
+var g_sema_probe_bk: *HashMapI64 = null        # e -> sema_bool_kind + 100
 
 # The emitter's view of an expression, for sema_probe_expr (AGAST #3513):
 # `s` is the *EmitterState, opaque here, that each fn is called with.
@@ -79,10 +79,14 @@ pub struct SemaProbeEmitter
 # pin Sema's answer for one expression.
 pub fn sema_probe_enable(dump: i32)
     g_sema_probe_on = 1 + dump
-    g_sema_probe_map = hashmap_i64_with_cap(65536)
-    g_sema_probe_local_calls = hashmap_i64_with_cap(256)
-    g_sema_probe_local_names = hashmap_i64_with_cap(65536)
-    g_sema_probe_bk = hashmap_i64_with_cap(65536)
+    g_sema_probe_map = malloc(sizeof(HashMapI64)) as *HashMapI64
+    *g_sema_probe_map = hashmap_i64_with_cap(65536)
+    g_sema_probe_local_calls = malloc(sizeof(HashMapI64)) as *HashMapI64
+    *g_sema_probe_local_calls = hashmap_i64_with_cap(256)
+    g_sema_probe_local_names = malloc(sizeof(HashMapI64)) as *HashMapI64
+    *g_sema_probe_local_names = hashmap_i64_with_cap(65536)
+    g_sema_probe_bk = malloc(sizeof(HashMapI64)) as *HashMapI64
+    *g_sema_probe_bk = hashmap_i64_with_cap(65536)
 
 pub fn sema_probe_on() -> i32
     g_sema_probe_on
@@ -93,14 +97,14 @@ pub fn sema_probe_record(sm: *Sema, e: *Expr)
         return
     let t: *SemaTy = malloc(sizeof(SemaTy)) as *SemaTy
     sema_expr_ty(sm, e, t)
-    hashmap_i64_insert(@&g_sema_probe_map, e as i64, t as i64)
-    hashmap_i64_insert(@&g_sema_probe_bk, e as i64, sema_bool_kind(sm, e) as i64 + 100)
+    hashmap_i64_insert(@&(*g_sema_probe_map), e as i64, t as i64)
+    hashmap_i64_insert(@&(*g_sema_probe_bk), e as i64, sema_bool_kind(sm, e) as i64 + 100)
     if g_sema_probe_on == 2
         sema_probe_dump(e, t)
     if e.kind == EXPR_CALL and e.func_name_len > 0 and sema_is_local(sm, e.func_name, e.func_name_len) == 1
-        hashmap_i64_insert(@&g_sema_probe_local_calls, e as i64, 1)
+        hashmap_i64_insert(@&(*g_sema_probe_local_calls), e as i64, 1)
     if e.kind == EXPR_IDENT and sema_is_local(sm, e.ident_ptr, e.ident_len) == 1
-        hashmap_i64_insert(@&g_sema_probe_local_names, e as i64, 1)
+        hashmap_i64_insert(@&(*g_sema_probe_local_names), e as i64, 1)
 
 fn sema_probe_dump(e: *Expr, t: *SemaTy)
     eprints_cstr(c"sema-type: ")
@@ -162,7 +166,7 @@ fn sema_probe_note(em: *SemaProbeEmitter, e: *Expr, rule: *u8, sema_k: i32, emit
 fn sema_probe_local_call(e: *Expr) -> bool
     if e.kind != EXPR_CALL
         return false
-    hashmap_i64_contains(@g_sema_probe_local_calls, e as i64)
+    hashmap_i64_contains(@(*g_sema_probe_local_calls), e as i64)
 
 # True for `*p`, `a[i]`, `x.m()` or `c?` that Sema types a struct or a
 # pointer, or a user enum's unit variant `E.V` it types as E: synth_slot_ty's
@@ -175,7 +179,7 @@ fn sema_probe_aggregate_default(e: *Expr, k: i32) -> bool
         return e.op == OP_DEREF
     if e.kind == EXPR_MEMBER
         let l: *Expr = e.left
-        if k != TYPE_STRUCT or l == null or l.kind != EXPR_IDENT or hashmap_i64_contains(@g_sema_probe_local_names, l as i64)
+        if k != TYPE_STRUCT or l == null or l.kind != EXPR_IDENT or hashmap_i64_contains(@(*g_sema_probe_local_names), l as i64)
             return false
         return user_enum_index(l.ident_ptr, l.ident_len) >= 0 and enum_variant_index(l.ident_ptr, l.ident_len, e.ident_ptr, e.ident_len) >= 0
     e.kind == EXPR_INDEX or e.kind == EXPR_METHOD or e.kind == EXPR_TRY
@@ -185,7 +189,7 @@ pub fn sema_probe_expr(em: *SemaProbeEmitter, e: *Expr)
     let bk_of: fn(*u8, *Expr) -> i32 = em.bool_kind
     let type_of: fn(*u8, *Expr) -> i32 = em.slot_type
     let s: *u8 = em.s
-    let t: *SemaTy = hashmap_i64_get(@g_sema_probe_map, e as i64) as *SemaTy
+    let t: *SemaTy = hashmap_i64_get(@(*g_sema_probe_map), e as i64) as *SemaTy
     if t == null
         return
     # AGAST #4410: the slot the emitter reads is the one Sema annotated
@@ -209,7 +213,7 @@ pub fn sema_probe_expr(em: *SemaProbeEmitter, e: *Expr)
             else
                 g_sema_probe_slot_mismatched = g_sema_probe_slot_mismatched + 1
                 sema_probe_note(em, e, c"slot", ss, ek)
-    let sbk: i32 = (hashmap_i64_get(@g_sema_probe_bk, e as i64) - 100) as i32
+    let sbk: i32 = (hashmap_i64_get(@(*g_sema_probe_bk), e as i64) - 100) as i32
     let ebk: i32 = bk_of(s, e)
     if sbk != ebk
         if sbk != BK_UNSURE and ebk != BK_UNSURE
@@ -228,7 +232,7 @@ pub fn sema_probe_expr(em: *SemaProbeEmitter, e: *Expr)
     if t.kind != TYPE_BOOL
         let ek: i32 = type_of(s, e)
         if ek != t.kind
-            let int_default: i32 = (sema_is_int_kind(t.kind) == 1 and not hashmap_i64_contains(@g_sema_probe_local_names, e as i64)) as i32
+            let int_default: i32 = (sema_is_int_kind(t.kind) == 1 and not hashmap_i64_contains(@(*g_sema_probe_local_names), e as i64)) as i32
             let ref_field: i32 = (e.kind == EXPR_MEMBER and ek == TYPE_PTR and (t.kind == TYPE_REF or t.kind == TYPE_MUT_REF)) as i32
             let struct_lit: i32 = (e.kind == EXPR_STRUCT_LIT and ek == TYPE_I64) as i32
             let aggregate: i32 = (ek == TYPE_I64 and sema_probe_aggregate_default(e, t.kind)) as i32

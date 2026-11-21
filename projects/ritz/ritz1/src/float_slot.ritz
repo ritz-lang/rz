@@ -36,6 +36,7 @@
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.hashmap
+import ritzlib.memory
 
 import ast
 import types           # the one primitive type table (AGAST #1889)
@@ -77,20 +78,21 @@ fn fs_exact(src: i32, dst: i32) -> i32
 # Sema's annotation: the values landing in a float slot whose source type is
 # an unsigned integer exact there (u8 / u16 / u32), keyed by the Expr, mapped
 # to that type.  Absent means signed or unknown: `sitofp`, as before.
-var g_fs_unsigned: HashMapI64
+var g_fs_unsigned: *HashMapI64 = null
 var g_fs_ready: i32 = 0
 
 fn float_slot_note(value: *Expr, src: i32)
     if g_fs_ready == 0
-        g_fs_unsigned = hashmap_i64_with_cap(256)
+        g_fs_unsigned = malloc(sizeof(HashMapI64)) as *HashMapI64
+        *g_fs_unsigned = hashmap_i64_with_cap(256)
         g_fs_ready = 1
-    hashmap_i64_insert(@&g_fs_unsigned, value as i64, src as i64)
+    hashmap_i64_insert(@&(*g_fs_unsigned), value as i64, src as i64)
 
 # The unsigned source type Sema noted for `value`, or 0.
 pub fn float_slot_unsigned(value: *Expr) -> i32
     if g_fs_ready == 0 or value == null
         return 0
-    hashmap_i64_get(@g_fs_unsigned, value as i64) as i32
+    hashmap_i64_get(@(*g_fs_unsigned), value as i64) as i32
 
 # `value` lands in an f32 / f64 slot of type `dst` (a Sema check, AGAST #3510):
 # refuse an inexact integer source (see the header), and note an unsigned one.
@@ -121,24 +123,25 @@ pub fn float_slot_judge(sm: *Sema, value: *Expr, src: i32, dst: i32)
 # arm: so literal_slot defers the check to the value (float_slot_defer), and
 # sema_walk runs it when it reaches that value (float_slot_due), with the
 # bindings it sees then, as the emitter did.
-var g_fs_pending: HashMapI64
+var g_fs_pending: *HashMapI64 = null
 var g_fs_pending_ready: i32 = 0
 
 pub fn float_slot_defer(value: *Expr, dst: i32)
     if value == null
         return
     if g_fs_pending_ready == 0
-        g_fs_pending = hashmap_i64_with_cap(256)
+        g_fs_pending = malloc(sizeof(HashMapI64)) as *HashMapI64
+        *g_fs_pending = hashmap_i64_with_cap(256)
         g_fs_pending_ready = 1
-    hashmap_i64_insert(@&g_fs_pending, value as i64, dst as i64)
+    hashmap_i64_insert(@&(*g_fs_pending), value as i64, dst as i64)
 
 # `e` is about to be walked: run the check deferred to it, if any.
 pub fn float_slot_due(sm: *Sema, e: *Expr)
     if g_fs_pending_ready == 0
         return
-    let dst: i32 = hashmap_i64_get(@g_fs_pending, e as i64) as i32
+    let dst: i32 = hashmap_i64_get(@(*g_fs_pending), e as i64) as i32
     if dst != 0
-        hashmap_i64_remove(@&g_fs_pending, e as i64)
+        hashmap_i64_remove(@&(*g_fs_pending), e as i64)
         float_slot_check(sm, e, dst)
 
 # `val_reg`, the i64 register integer expression `value` was emitted into,
@@ -150,18 +153,19 @@ pub fn float_slot_due(sm: *Sema, e: *Expr)
 
 # The pointer values already reported: a pointer arm of a nested if in a float
 # slot is the slot's and its if's, and is said once.
-var g_fs_ptr_said: HashMapI64
+var g_fs_ptr_said: *HashMapI64 = null
 var g_fs_ptr_said_ready: i32 = 0
 
 # 1 if pointer `value` was said already (or is another rule's to say), else
 # 0 and it is now.
 fn fs_pointer_said(value: *Expr) -> i32
     if g_fs_ptr_said_ready == 0
-        g_fs_ptr_said = hashmap_i64_with_cap(64)
+        g_fs_ptr_said = malloc(sizeof(HashMapI64)) as *HashMapI64
+        *g_fs_ptr_said = hashmap_i64_with_cap(64)
         g_fs_ptr_said_ready = 1
-    if hashmap_i64_get(@g_fs_ptr_said, value as i64) != 0
+    if hashmap_i64_get(@(*g_fs_ptr_said), value as i64) != 0
         return 1
-    hashmap_i64_insert(@&g_fs_ptr_said, value as i64, 1)
+    hashmap_i64_insert(@&(*g_fs_ptr_said), value as i64, 1)
     0
 
 # Report `value`, a pointer landing in a float, once.
@@ -196,14 +200,16 @@ pub fn float_slot_pointer_to(sm: *Sema, value: *Expr, pointee: i32, dst: i32)
 # An if / match's arms, judged in each arm's scope as the walk leaves it
 # (float_arm_note), then settled once all are (float_arms_settle): the if /
 # matches with a float arm, and the arm values that are pointers.
-var g_fs_float_owner: HashMapI64   # EXPR_IF / EXPR_MATCH -> 1: an arm is a float
-var g_fs_ptr_arm: HashMapI64       # arm value -> 1: a pointer
+var g_fs_float_owner: *HashMapI64 = null   # EXPR_IF / EXPR_MATCH -> 1: an arm is a float
+var g_fs_ptr_arm: *HashMapI64 = null       # arm value -> 1: a pointer
 var g_fs_arms_ready: i32 = 0
 
 fn fs_arms_init()
     if g_fs_arms_ready == 0
-        g_fs_float_owner = hashmap_i64_with_cap(64)
-        g_fs_ptr_arm = hashmap_i64_with_cap(64)
+        g_fs_float_owner = malloc(sizeof(HashMapI64)) as *HashMapI64
+        *g_fs_float_owner = hashmap_i64_with_cap(64)
+        g_fs_ptr_arm = malloc(sizeof(HashMapI64)) as *HashMapI64
+        *g_fs_ptr_arm = hashmap_i64_with_cap(64)
         g_fs_arms_ready = 1
 
 # The walk just left `arm` of `owner` (an EXPR_IF / EXPR_MATCH), with the
@@ -216,25 +222,25 @@ pub fn float_arm_note(sm: *Sema, owner: *Expr, arm: *MatchArm)
     fs_arms_init()
     let v: *Expr = arm.body
     if v.kind == EXPR_IF or v.kind == EXPR_MATCH
-        if hashmap_i64_get(@g_fs_float_owner, v as i64) != 0
-            hashmap_i64_insert(@&g_fs_float_owner, owner as i64, 1)
+        if hashmap_i64_get(@(*g_fs_float_owner), v as i64) != 0
+            hashmap_i64_insert(@&(*g_fs_float_owner), owner as i64, 1)
         return
     let k: i32 = sema_bool_kind(sm, v)
     if k == BK_FLOAT
-        hashmap_i64_insert(@&g_fs_float_owner, owner as i64, 1)
+        hashmap_i64_insert(@&(*g_fs_float_owner), owner as i64, 1)
     else if k == BK_PTR
-        hashmap_i64_insert(@&g_fs_ptr_arm, v as i64, 1)
+        hashmap_i64_insert(@&(*g_fs_ptr_arm), v as i64, 1)
 
 # Every arm of `owner` was noted: with a float arm, each pointer arm, on
 # either side of it, is refused (as LARB R43 refuses an integer arm).
 pub fn float_arms_settle(sm: *Sema, owner: *Expr, arms: *MatchArm)
     if owner == null or g_fs_arms_ready == 0
         return
-    if hashmap_i64_get(@g_fs_float_owner, owner as i64) == 0
+    if hashmap_i64_get(@(*g_fs_float_owner), owner as i64) == 0
         return
     var arm: *MatchArm = arms
     while arm != null
-        if arm.is_pass == 0 and arm.body != null and hashmap_i64_get(@g_fs_ptr_arm, arm.body as i64) != 0
+        if arm.is_pass == 0 and arm.body != null and hashmap_i64_get(@(*g_fs_ptr_arm), arm.body as i64) != 0
             float_slot_pointer_at(sm, arm.body)
         arm = arm.next
 
