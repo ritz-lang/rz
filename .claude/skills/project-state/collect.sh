@@ -105,8 +105,13 @@ for f in files:
     elif f.endswith(".py") and proj == "ritz":
         py_lines["ritz0" if f.startswith("projects/ritz/ritz0/") else "tooling"] += nlines(f)
 
+# Only packages that exist at REF. A local scratch directory (untracked or
+# gitignored) is not a layer, and reporting it as "unmapped" hides the real
+# signal: a package that landed in projects/ without a layer assignment.
+tracked_projects = {f.split("/")[1] for f in files if f.startswith("projects/")}
 projects = sorted(d for d in os.listdir("projects")
-                  if os.path.isdir(f"projects/{d}") and not d.startswith("."))
+                  if d in tracked_projects and os.path.isdir(f"projects/{d}")
+                  and not d.startswith("."))
 mapped = {p for ps in LAYERS.values() for p in ps}
 layers = []
 for name, pkgs in LAYERS.items():
