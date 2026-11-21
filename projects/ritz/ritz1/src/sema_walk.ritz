@@ -47,6 +47,8 @@ import call_check   # AGAST #1629, on Sema since #3503
 
 import deref_field   # `.` through Deref (AGAST #3015 / #3509)
 
+import diag   # the located error prefix (AGAST #3445)
+
 import discarded_array   # AGAST #3189, on Sema since #3512
 
 import enum_as_int   # AGAST #2136, on Sema since #3511
@@ -821,6 +823,97 @@ fn sema_seen_before(m: *Module, seen: *HashMapI64, f: *FnDef) -> i32
         cur = cur.next
     0
 
+# LARB R79 (AGAST #4007): `Future` is the built-in "some async fn's future";
+# it has no size, so every by-value slot written with it -- a `let` / `var`,
+# a struct field, a param, a return type, an array element -- is refused where
+# the name is written, as ritz0's future_rules.py does.  ritz1's mirror is
+# #4007; the slot fitting (`@&NAME_Future` into `@&Future`) is sema_type's.
+fn fv_named_future(name: *u8, len: i32) -> i32
+    if name == null or len != 6
+        return 0
+    name_eq(StrView { ptr: (name), len: (6) as i64 }, StrView { ptr: (c"Future"), len: (6) as i64 })
+
+fn fv_error(name: *u8) -> i32
+    let at: *TypeNameAt = type_name_written_at(name)
+    if at == null or at.reported == 1
+        return 0
+    at.reported = 1
+    diag_error(at.file, diag_span(at.line, at.col), c"`Future` has no size; take it by reference, `@&Future`")
+    1
+
+# 1 when `ty` (a `TYPE_ARRAY` of `elem`) is `Future` by value, refused.
+fn fv_slot(ty: i32, elem: i32, name: *u8, len: i32) -> i32
+    var by_value: i32 = 0
+    if ty == TYPE_STRUCT
+        by_value = 1
+    else if ty == TYPE_ARRAY and elem == TYPE_STRUCT
+        by_value = 1
+    if by_value == 0 or fv_named_future(name, len) == 0
+        return 0
+    fv_error(name)
+
+fn fv_stmts(s: *Stmt) -> i32
+    var n: i32 = 0
+    var cur: *Stmt = s
+    while cur != null
+        let k: i32 = cur.kind
+        if k == STMT_VAR_DECL
+            n = n + fv_slot(cur.var_type, cur.var_array_elem_type, cur.var_type_name, cur.var_type_name_len)
+            if cur.var_array != null
+                n = n + fv_slot(cur.var_type, cur.var_array.elem, cur.var_array.name, cur.var_array.name_len)
+        else if k == STMT_IF
+            n = n + fv_stmts(cur.if_then)
+            n = n + fv_stmts(cur.if_else)
+        else if k == STMT_WHILE or k == STMT_LOOP or k == STMT_DEFER or k == STMT_UNSAFE
+            n = n + fv_stmts(cur.while_body)
+        else if k == STMT_FOR
+            n = n + fv_stmts(cur.for_body)
+        else if k == STMT_MATCH
+            var arm: *MatchArm = cur.if_then as *MatchArm
+            while arm != null
+                n = n + fv_stmts(arm.body_stmts)
+                arm = arm.next
+        cur = cur.next
+    n
+
+fn fv_fn(f: *FnDef) -> i32
+    var n: i32 = fv_slot(f.return_type, TYPE_VOID, f.return_type_name, f.return_type_name_len)
+    if f.ret_array_param != null
+        n = n + fv_slot(TYPE_ARRAY, f.ret_array_param.param_array_elem_type, f.ret_array_param.param_type_name, f.ret_array_param.param_type_name_len)
+    var p: *Param = f.params
+    while p != null
+        n = n + fv_slot(p.param_type, p.param_array_elem_type, p.param_type_name, p.param_type_name_len)
+        p = p.next
+    n + fv_stmts(f.body)
+
+fn fv_module(m: *Module) -> i32
+    var n: i32 = 0
+    var st: *StructDef = m.structs
+    while st != null
+        var fld: *StructField = st.fields
+        while fld != null
+            n = n + fv_slot(fld.field_type, fld.array_elem_type, fld.field_type_name, fld.field_type_name_len)
+            n = n + fv_slot(TYPE_ARRAY, fld.array_elem_type, fld.array_elem_type_name, fld.array_elem_type_name_len)
+            fld = fld.next
+        st = st.next
+    var g: *GlobalVarDef = m.globals
+    while g != null
+        n = n + fv_slot(g.var_type, g.array_elem_type, g.type_name, g.type_name_len)
+        n = n + fv_slot(TYPE_ARRAY, g.array_elem_type, g.array_elem_type_name, g.array_elem_type_name_len)
+        g = g.next
+    var f: *FnDef = m.functions
+    while f != null
+        n = n + fv_fn(f)
+        f = f.next
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var method: *FnDef = ib.methods
+        while method != null
+            n = n + fv_fn(method)
+            method = method.next
+        ib = ib.next
+    n
+
 # Run every Sema check over the fns emit_module lowers.  Returns how many
 # errors it reported; main stops the compile on any.
 pub fn sema_check_module(m: *Module, path: *u8) -> i32
@@ -837,6 +930,9 @@ pub fn sema_check_module(m: *Module, path: *u8) -> i32
     sema_note_module_inits(sm)   # AGAST #4404: global / const initialisers
 
     sema_vis_alias_uses(sm)  # AGAST #3907
+
+    sm.error_count = sm.error_count + fv_module(m)   # LARB R79 / AGAST #4007
+
     var seen: HashMapI64 = hashmap_i64_with_cap(4096)
     var f: *FnDef = m.functions
     while f != null

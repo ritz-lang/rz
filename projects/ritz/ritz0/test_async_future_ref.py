@@ -15,16 +15,18 @@ fn on it.  `await p`, with `p` a held future (`var p = f(args)`), drives it to
 completion if it isn't finished, then reads its result: after an executor has
 driven it, it only reads.
 
-ritz0 only: ritz1's mirror is #4007.  Each row separates one rule: polling
+ritz0 landed as #4006, ritz1 as #4007.  Each row separates one rule: polling
 through the header, `await p` before and after it's driven (in a sync fn and
 inside an async fn), an i64 result above 2^31 and a real -1 through both, and
-each by-value `Future` slot refused where the `Future` is written.
+each by-value `Future` slot refused where the `Future` is written.  All three
+compilers answer alike.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from test_ref_into_value import COMPILERS
 from test_table_rows import assert_refusals, assert_runs
 
 # `slow` is Pending twice: its awaited poll source answers -1 until its third
@@ -93,10 +95,12 @@ REFUSALS = {
 
 
 @pytest.mark.integration
-def test_held_future_behind_a_future_ref(tmp_path):
-    assert_runs("ritz0", tmp_path, RUNS)
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_held_future_behind_a_future_ref(compiler, tmp_path):
+    assert_runs(compiler, tmp_path, RUNS)
 
 
 @pytest.mark.integration
-def test_future_by_value_is_refused(tmp_path):
-    assert_refusals("ritz0", tmp_path, REFUSALS)
+@pytest.mark.parametrize("compiler", COMPILERS)
+def test_future_by_value_is_refused(compiler, tmp_path):
+    assert_refusals(compiler, tmp_path, REFUSALS)

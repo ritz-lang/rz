@@ -189,13 +189,8 @@ def test_bare_async_call_refused_as_ritz0(ritz1_bin, tmp_path, name):
             assert re.search(rf":{line}:{col}: error: ", errors[0]), res.stderr
 
 
-# ritz1 doesn't yet start a future with R79's header (`__poll`, `__state`):
-# AGAST #4007.
-_NO_HEADER = pytest.mark.xfail(strict=True, reason="AGAST #4007: ritz1's futures have no R79 header")
-
-
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", ["ritz0", pytest.param("ritz1", marks=_NO_HEADER)])
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1"])
 def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path, compiler):
     """#3726: an imported async fn is declared in its importer, defined in its
     file.  The importer allocates its future, so it lays it out from the fn's
@@ -212,14 +207,17 @@ def test_imported_async_fn_runs_as_ritz0(ritz1_bin, tmp_path, compiler):
 
 def _future_fields(ll: str, name: str) -> list:
     """`name`'s LLVM struct fields, module prefixes dropped: ritz1 names a
-    struct `%"struct.ritz_module_1.X"`, ritz0 `%X`."""
+    struct `%"struct.ritz_module_1.X"`, ritz0 `%X`.  A fn pointer is `ptr`
+    in ritz1 (opaque pointers) and spelled out in ritz0's IR, so both are
+    reduced to `ptr`."""
     m = re.search(rf'^%"?(?:struct\.\w+\.)?{name}"? = type \{{(.*)\}}$', ll, re.MULTILINE)
     assert m, f"no {name} in the module"
-    return [re.sub(r'%"?(?:struct\.\w+\.)?(\w+)"?', r"%\1", f.strip()) for f in m.group(1).split(",")]
+    return [re.sub(r'i1 \(i8\*\)\*', 'ptr',
+                   re.sub(r'%"?(?:struct\.\w+\.)?(\w+)"?', r"%\1", f.strip()))
+            for f in m.group(1).split(",")]
 
 
 @pytest.mark.integration
-@_NO_HEADER
 def test_if_operand_future_layout_as_ritz0(ritz1_bin, tmp_path):
     """#4190: an awaiting `if` operand's `__if_K` field comes after its
     condition's fields, as the arms' do after it, in both compilers: the
