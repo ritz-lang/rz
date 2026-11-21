@@ -717,6 +717,7 @@ let d: f64 = 2.718281828
 | `@T` | Immutable reference to `T` |
 | `@&T` | Mutable reference to `T` |
 | `name:& T` | Mutable-borrow parameter: `name` is the caller's place, of type `T` (§13.4) |
+| `name:= T` | By-value parameter; the `:=` sigil records ownership intent and lowers exactly as `name: T` (§13.2, AGAST #4062) |
 
 ```ritz
 struct Point
@@ -4997,10 +4998,53 @@ fn main() -> i32
 The same uses of a move-only value **move** it. The destination becomes the
 owner, and the source binding can't be used again until something is assigned
 to it. A by-value parameter `name: T` of a move-only type takes ownership. To
-lend the value instead, pass `@x` or `@&x` (§13.3, §13.4). If a value is moved
-on only some paths, the binding counts as moved after those paths join. The
-arms of a `match` or an `if` each start from the state before it, and paths
-that leave by `return`, `break` or `continue` don't join.
+lend the value instead, pass `@x` or `@&x` (§13.3, §13.4).
+
+`name:= T` is an accepted spelling of a by-value parameter. The `:=` sigil
+records ownership intent and carries no additional semantics: it lowers
+identically to `name: T`, so a copy type is copied and a move-only type moves
+into the callee exactly as above. `self:= T` is the same lowering for a
+by-value receiver. The form exists because shipped code writes it — angelo's
+`fn add_contour(self:& GlyphOutline, contour:= Contour)` and
+`fn load_font_data(data:= Vec<u8>)`, plus prism and lexis, failed to parse in
+ritz1 without it (AGAST #1527, #3249). New code should write `name: T`.
+
+`:=` on a struct field (`pos:= i64`) is **not a language feature**. ritz0
+parses it as a no-op, but ritz1 and ritz1_selfhosted refuse it with
+`unexpected ':='; expected one of: :, :&`; a field is written `pos: i64`
+(AGAST #4062).
+
+```ritz
+struct Contour
+    points: i32
+
+struct GlyphOutline
+    total: i32
+
+struct R
+    pos: i64
+
+impl GlyphOutline
+    fn add_contour(self:& GlyphOutline, contour:= Contour)
+        self.total = self.total + contour.points
+
+    fn take(self:= GlyphOutline) -> i32
+        self.total
+
+fn take(r:= R) -> i64
+    r.pos
+
+fn main() -> i32
+    var g = GlyphOutline { total: 0 }
+    g.add_contour(Contour { points: 2 })
+    let r = R { pos: 4 }
+    (take(r) as i32) + g.take()
+```
+
+If a value is moved on only some paths, the binding counts as moved after
+those paths join. The arms of a `match` or an `if` each start from the state
+before it, and paths that leave by `return`, `break` or `continue` don't
+join.
 
 Using a move-only field by value (`return h.t`, `consume(h.t)`) moves that
 field out of the binding, and only that field. Afterwards `h.t` and `h` as a
@@ -7656,6 +7700,9 @@ impl_block   := 'impl' generic_params? (IDENT 'for')? IDENT NEWLINE
 trait_def    := 'pub'? 'trait' IDENT NEWLINE INDENT trait_sig+ DEDENT
 trait_sig    := 'fn' IDENT '(' params? ')' ('->' type)? NEWLINE
 params       := param (',' param)* ','?
+param        := 'self' ((':' | ':=') type | ':&' type | ':&')?
+              | IDENT (':' type | ':&' type | ':=' type)
+                # ':=' is a by-value parameter's ownership sigil (§13.2)
 call         := expr '(' (expr (',' expr)* ','?)? ')'
 
 type         := 'i8'|'i16'|'i32'|'i64'|'u8'|'u16'|'u32'|'u64'|'bool'
