@@ -1,0 +1,161 @@
+# Harland argv capture tests (AGAST #1888)
+#
+# spawn_args validated every argv[i] in the handler (a scan of each string)
+# and then re-read the array and strings in the impl to copy them. A string
+# that changed between the two passes could make the bounded scan pass while
+# the unbounded copy ran past the buffer, and what the child received was
+# never what was validated.
+#
+# argv_capture reads the caller's argv exactly once: it validates a page and
+# then copies the bytes it just read, into one bounded kernel buffer. These
+# tests run it against ordinary memory (the checker is injectable) and prove
+# a mutation after a check is what gets copied, never a stale snapshot.
+
+import syscall.runtime.argv { ArgvStatus, ArgvCapture, ARGV_BYTES_MAX, ARGV_COUNT_MAX, argv_capture, argv_buf, argv_offsets, argv_count }
+
+fn ok_check(ptr: *u8, len: u64) -> i64
+    return 0
+
+var g_fault: bool = false
+
+fn fault_check(ptr: *u8, len: u64) -> i64
+    if g_fault
+        return -14 as i64
+    return 0
+
+# Mutates the first source byte the first time it is asked about it, then
+# behaves. If the copy is the same pass as the check, the mutated byte is
+# what lands in the buffer.
+var g_mutate_at: *u8 = 0 as *u8
+var g_mutated: bool = false
+
+fn mutate_check(ptr: *u8, len: u64) -> i64
+    if not g_mutated and ptr as u64 == g_mutate_at as u64
+        *ptr = 0x51  # 'Q'
+        g_mutated = true
+    return 0
+
+[[test]]
+fn test_capture_two_args() -> i32
+    var a0: [8]u8
+    var a1: [8]u8
+    a0[0] = 0x61  # 'a'
+    a0[1] = 0x6C  # 'l'
+    a0[2] = 0x70  # 'p'
+    a0[3] = 0x68  # 'h'
+    a0[4] = 0x61  # 'a'
+    a0[5] = 0
+    a1[0] = 0x62  # 'b'
+    a1[1] = 0x65  # 'e'
+    a1[2] = 0x74  # 't'
+    a1[3] = 0x61  # 'a'
+    a1[4] = 0
+    var arr: [2]*u8
+    arr[0] = @a0 as *u8
+    arr[1] = @a1 as *u8
+
+    let cap: ArgvCapture = argv_capture(@arr as **u8, 2, ok_check)
+    if cap.status != ArgvStatus.Ok
+        return 1
+    if cap.bytes != 11
+        return 2
+    if argv_count != 2
+        return 3
+    if argv_offsets[0] != 0
+        return 4
+    if argv_offsets[1] != 6
+        return 5
+    if argv_buf[0] != 0x61
+        return 6
+    if argv_buf[5] != 0
+        return 7
+    if argv_buf[6] != 0x62
+        return 8
+    if argv_buf[10] != 0
+        return 9
+    return 0
+
+[[test]]
+fn test_capture_zero_args() -> i32
+    let cap: ArgvCapture = argv_capture(0 as **u8, 0, ok_check)
+    if cap.status != ArgvStatus.Ok
+        return 1
+    if cap.bytes != 0
+        return 2
+    if argv_count != 0
+        return 3
+    return 0
+
+[[test]]
+fn test_too_many_args_rejected() -> i32
+    let cap: ArgvCapture = argv_capture(0 as **u8, ARGV_COUNT_MAX + 1, ok_check)
+    if cap.status != ArgvStatus.TooMany
+        return 1
+    return 0
+
+[[test]]
+fn test_negative_argc_rejected() -> i32
+    let cap: ArgvCapture = argv_capture(0 as **u8, -1, ok_check)
+    if cap.status != ArgvStatus.Invalid
+        return 1
+    return 0
+
+# A string with no terminator inside the byte budget must be rejected, not
+# copied past the buffer (the old strlen-then-reread copy could overrun).
+[[test]]
+fn test_unterminated_string_rejected() -> i32
+    var big: [4200]u8
+    var i: u64 = 0
+    while i < 4200
+        big[i] = 0x41
+        i = i + 1
+    var arr: [1]*u8
+    arr[0] = @big as *u8
+    let cap: ArgvCapture = argv_capture(@arr as **u8, 1, ok_check)
+    if cap.status != ArgvStatus.TooBig
+        return 1
+    return 0
+
+[[test]]
+fn test_bad_pointer_rejected() -> i32
+    var arr: [1]*u8
+    var a0: [2]u8
+    a0[0] = 0x61
+    a0[1] = 0
+    arr[0] = @a0 as *u8
+    g_fault = true
+    let cap: ArgvCapture = argv_capture(@arr as **u8, 1, fault_check)
+    g_fault = false
+    if cap.status != ArgvStatus.Fault
+        return 1
+    return 0
+
+# The check mutates the string it is checking. The copy must contain the
+# mutated byte: bytes are read once, in the same pass, not validated then
+# fetched again.
+[[test]]
+fn test_mutation_after_validation_is_what_is_copied() -> i32
+    var a0: [8]u8
+    a0[0] = 0x61  # 'a'
+    a0[1] = 0x62  # 'b'
+    a0[2] = 0
+    var arr: [1]*u8
+    arr[0] = @a0 as *u8
+    g_mutate_at = @a0 as *u8
+    g_mutated = false
+    let cap: ArgvCapture = argv_capture(@arr as **u8, 1, mutate_check)
+    if cap.status != ArgvStatus.Ok
+        return 1
+    if cap.bytes != 3
+        return 2
+    if argv_buf[0] != 0x51  # 'Q': the mutated byte was copied
+        return 3
+    if argv_buf[1] != 0x62
+        return 4
+    return 0
+
+[[test]]
+fn test_byte_budget_is_4096() -> i32
+    if ARGV_BYTES_MAX != 4096
+        return 1
+    return 0

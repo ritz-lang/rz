@@ -4,7 +4,7 @@
 # kernel objects with associated rights.
 
 import serial { prints, println, serial_print_dec }
-import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, cap_entry_init, cap_handle_init, cap_handle_invalid }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid }
 
 # ============================================================================
 # Constants
@@ -266,4 +266,60 @@ pub fn cap_system_debug_print() -> i32
     prints("Capability tables: ")
     serial_print_dec(cap_tables_count as u64)
     println(" allocated")
+    return 0
+
+# ============================================================================
+# Process-wide checks and bootstrap (AGAST #1888)
+# ============================================================================
+
+# True if process `pid` holds a capability of `cap_type` with `right`.
+# A process with no table (or no such capability) has no access.
+pub fn cap_process_has(pid: u32, cap_type: u8, right: u32) -> bool
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return false
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*table).entries[i]
+        if (*entry).cap_type == cap_type and ((*entry).rights & right) == right
+            return true
+        i = i + 1
+    return false
+
+# Free the table of `pid` if it has one (a process exiting or a spawn undo).
+pub fn cap_table_free_pid(pid: u32) -> i32
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return -1
+    return cap_table_free(table)
+
+# Give init (pid 1) the capabilities the kernel reserves for the first
+# process: power off the machine and map the display. Spawned processes
+# start with an empty table (see cap_inherit_display).
+pub fn cap_init_bootstrap() -> i32
+    let table: *CapTable = cap_table_alloc(1)
+    if table == 0 as *CapTable
+        return -1
+    if cap_table_insert(table, CAP_TYPE_POWER, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return -2
+    if cap_table_insert(table, CAP_TYPE_DISPLAY, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return -3
+    return 0
+
+# Copy the parent's DISPLAY capability to a new child. The display is the
+# one capability a spawned process inherits: a compositor's client runs with
+# its parent's framebuffer access. POWER is never inherited - only init has
+# it, so no child can power the machine off (AGAST #1888).
+pub fn cap_inherit_display(parent_pid: u32, child_pid: u32) -> i32
+    let from: *CapTable = cap_table_get(parent_pid)
+    let to: *CapTable = cap_table_get(child_pid)
+    if from == 0 as *CapTable or to == 0 as *CapTable
+        return -1
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*from).entries[i]
+        if (*entry).cap_type == CAP_TYPE_DISPLAY
+            if cap_table_insert(to, CAP_TYPE_DISPLAY, (*entry).rights, (*entry).object_id).index == 0xFFFFFFFF
+                return -2
+        i = i + 1
     return 0

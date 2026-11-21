@@ -241,7 +241,7 @@ ELF_PRELUDE = """\
         return 106
 """
 
-ELF_MODULES = ["loader.elf", "mm.vmm", "mm.pmm", *SERIAL]
+ELF_MODULES = ["loader.image", "loader.elf", "mm.vmm", "mm.pmm", *SERIAL]
 
 
 # elf_exec calls into the kernel (extern fns: alloc_user_stack is in
@@ -270,13 +270,18 @@ def test_elf_status_owns_its_codes():
     integer representation (so no negative discriminant), and the kernel turns
     one into a number only through elf_status_errno (spawn's errno) or
     elf_status_code (serial logs)."""
+    # The enum, the status and header validation live in the pure
+    # loader/image.ritz (AGAST #1888) so a hosted test can link them alone;
+    # loader/elf.ritz re-exports them for its callers.
+    image = (KERNEL_SRC / "loader" / "image.ritz").read_text()
     src = (KERNEL_SRC / "loader" / "elf.ritz").read_text()
-    assert re.search(r"^pub enum ElfStatus\n", src, re.M), \
-        "loader/elf.ritz has no `pub enum ElfStatus` (without an integer representation)"
+    both = src + image
+    assert re.search(r"^pub enum ElfStatus\n", image, re.M), \
+        "loader/image.ritz has no `pub enum ElfStatus` (without an integer representation)"
     assert re.search(r"^\s+error: ElfStatus\b", src, re.M), "ElfLoadResult.error is not an ElfStatus"
-    assert re.search(r"^pub fn elf_validate_header\(.*\) -> ElfStatus$", src, re.M)
-    assert not re.search(r"\bELF_(OK|ERR_\w+)\b", src), "ELF_OK/ELF_ERR_* constants remain"
-    assert "syscall.errno" not in src, "the loader should not speak errno"
+    assert re.search(r"^pub fn elf_validate_header\(.*\) -> ElfStatus$", image, re.M)
+    assert not re.search(r"\bELF_(OK|ERR_\w+)\b", both), "ELF_OK/ELF_ERR_* constants remain"
+    assert "syscall.errno" not in both, "the loader should not speak errno"
     # run_init (main.ritz) and spawn (syscall/runtime/process.ritz, #2751) load ELFs.
     main = (KERNEL_SRC / "main.ritz").read_text() + (KERNEL_SRC / "syscall" / "runtime" / "process.ritz").read_text()
     uses = re.findall(r"load_result\.error[^\n]*", main)

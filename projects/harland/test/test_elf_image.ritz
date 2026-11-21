@@ -1,0 +1,216 @@
+# Harland ELF image validation tests (AGAST #1888)
+#
+# The loader used to trust every field in the file: e_phoff, the program
+# header table, p_offset + p_filesz and p_vaddr were never checked against
+# elf_size or the user address space, and PT_LOAD segments could overlap.
+# An ELF is user-writable and spawnable, so a crafted one could read past its
+# buffer or map a user page into the kernel heap.
+#
+# elf_validate_image is the pure gate elf_load runs before mapping anything;
+# these tests feed it truncated, overlapping and kernel-address images.
+
+import loader.image { Elf64Ehdr, Elf64Phdr, ElfStatus, ELF64_EHDR_SIZE, ELF64_PHDR_SIZE, ET_EXEC, ET_DYN, EM_X86_64, ELFCLASS64, ELFDATA2LSB, elf_validate_image, elf_validate_header }
+
+# One scratch image, big enough for a header, a program header table and a
+# segment's file bytes.
+const IMAGE_SIZE: u64 = 4096
+const PHDR0: u64 = 64
+const SEG_DATA: u64 = 512
+const USER_END: u64 = 0x00007FFFFFFFFFFF
+
+var g_image: [4096]u8
+
+fn base() -> u64
+    return @g_image as u64
+
+fn put_u8(off: u64, v: u8)
+    *( (base() + off) as *u8 ) = v
+
+fn put_u16(off: u64, v: u16)
+    *( (base() + off) as *u16 ) = v
+
+fn put_u32(off: u64, v: u32)
+    *( (base() + off) as *u32 ) = v
+
+fn put_u64(off: u64, v: u64)
+    *( (base() + off) as *u64 ) = v
+
+fn clear_image()
+    var i: u64 = 0
+    while i < IMAGE_SIZE
+        put_u8(i, 0)
+        i = i + 1
+
+# A well-formed ET_EXEC: one PT_LOAD at 0x1000000, 16 file bytes in 32
+# memory bytes.
+fn build_valid()
+    clear_image()
+    put_u8(0, 0x7F)
+    put_u8(1, 0x45)
+    put_u8(2, 0x4C)
+    put_u8(3, 0x46)
+    put_u8(4, ELFCLASS64)
+    put_u8(5, ELFDATA2LSB)
+    put_u16(16, ET_EXEC)
+    put_u16(18, EM_X86_64)
+    put_u64(24, 0x1000000)        # e_entry
+    put_u64(32, PHDR0)            # e_phoff
+    put_u16(54, ELF64_PHDR_SIZE)  # e_phentsize
+    put_u16(56, 1)                # e_phnum
+
+    put_u32(PHDR0, 1)             # p_type = PT_LOAD
+    put_u32(PHDR0 + 4, 5)         # p_flags = R|X
+    put_u64(PHDR0 + 8, SEG_DATA)  # p_offset
+    put_u64(PHDR0 + 16, 0x1000000)  # p_vaddr
+    put_u64(PHDR0 + 32, 16)       # p_filesz
+    put_u64(PHDR0 + 40, 32)       # p_memsz
+    put_u64(PHDR0 + 48, 0x1000)   # p_align
+
+[[test]]
+fn test_valid_image_accepted() -> i32
+    build_valid()
+    let st: ElfStatus = elf_validate_image(base() as *u8, IMAGE_SIZE, 0)
+    if st != ElfStatus.Ok
+        return 1
+    return 0
+
+[[test]]
+fn test_valid_header_accepted() -> i32
+    build_valid()
+    if elf_validate_header(base() as *Elf64Ehdr) != ElfStatus.Ok
+        return 1
+    return 0
+
+[[test]]
+fn test_truncated_header_rejected() -> i32
+    build_valid()
+    # Fewer bytes than an ELF64 header.
+    if elf_validate_image(base() as *u8, 32, 0) != ElfStatus.Truncated
+        return 1
+    return 0
+
+[[test]]
+fn test_program_header_table_beyond_image_rejected() -> i32
+    build_valid()
+    put_u64(32, IMAGE_SIZE - 8)   # e_phoff: only 8 bytes left, needs 56
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadPhdr
+        return 1
+    return 0
+
+[[test]]
+fn test_wrong_program_header_size_rejected() -> i32
+    build_valid()
+    put_u16(54, 32)               # e_phentsize must be sizeof(Elf64Phdr)
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadPhdr
+        return 1
+    return 0
+
+[[test]]
+fn test_too_many_program_headers_rejected() -> i32
+    build_valid()
+    put_u16(56, 100)              # 100 * 56 > IMAGE_SIZE - 64
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadPhdr
+        return 1
+    return 0
+
+[[test]]
+fn test_segment_file_range_beyond_image_rejected() -> i32
+    build_valid()
+    put_u64(PHDR0 + 8, IMAGE_SIZE - 8)  # p_offset
+    put_u64(PHDR0 + 32, 32)             # p_filesz: runs past elf_size
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.Truncated
+        return 1
+    return 0
+
+[[test]]
+fn test_segment_offset_beyond_image_rejected() -> i32
+    build_valid()
+    put_u64(PHDR0 + 8, IMAGE_SIZE + 64)  # p_offset itself past the image
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.Truncated
+        return 1
+    return 0
+
+[[test]]
+fn test_filesz_greater_than_memsz_rejected() -> i32
+    build_valid()
+    put_u64(PHDR0 + 32, 64)       # p_filesz > p_memsz (32)
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadPhdr
+        return 1
+    return 0
+
+[[test]]
+fn test_kernel_segment_address_rejected() -> i32
+    build_valid()
+    put_u64(PHDR0 + 16, 0xFFFFFFFF80000000)  # kernel image base
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadAddress
+        return 1
+    return 0
+
+[[test]]
+fn test_segment_running_past_user_end_rejected() -> i32
+    build_valid()
+    put_u64(PHDR0 + 16, 0x00007FFFFFFFFFF0)  # last user page
+    put_u64(PHDR0 + 40, 0x2000)              # runs past USER_SPACE_END
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadAddress
+        return 1
+    return 0
+
+[[test]]
+fn test_segment_address_overflow_rejected() -> i32
+    build_valid()
+    put_u64(PHDR0 + 16, 0xFFFFFFFFFFFFFF00)  # + memsz wraps
+    put_u64(PHDR0 + 40, 0x200)
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadAddress
+        return 1
+    return 0
+
+[[test]]
+fn test_overlapping_segments_rejected() -> i32
+    build_valid()
+    put_u16(56, 2)
+    put_u32(PHDR0 + ELF64_PHDR_SIZE, 1)              # second PT_LOAD
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 8, SEG_DATA)   # p_offset
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 16, 0x1000010) # p_vaddr inside the first
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 32, 0)
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 40, 16)
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.Overlap
+        return 1
+    return 0
+
+[[test]]
+fn test_adjacent_segments_accepted() -> i32
+    build_valid()
+    put_u16(56, 2)
+    put_u32(PHDR0 + ELF64_PHDR_SIZE, 1)
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 8, SEG_DATA)
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 16, 0x1000020) # exactly at first's end
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 32, 0)
+    put_u64(PHDR0 + ELF64_PHDR_SIZE + 40, 16)
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.Ok
+        return 1
+    return 0
+
+[[test]]
+fn test_no_load_segment_rejected() -> i32
+    build_valid()
+    put_u32(PHDR0, 4)             # PT_NOTE: nothing to load
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.NoSegments
+        return 1
+    return 0
+
+[[test]]
+fn test_entry_past_user_end_rejected() -> i32
+    build_valid()
+    put_u64(24, 0xFFFF800000000000)
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0) != ElfStatus.BadAddress
+        return 1
+    return 0
+
+[[test]]
+fn test_pie_bias_past_user_end_rejected() -> i32
+    build_valid()
+    put_u16(16, ET_DYN)
+    # vaddr + bias lands in the kernel half.
+    if elf_validate_image(base() as *u8, IMAGE_SIZE, 0xFFFFFFFF80000000) != ElfStatus.BadAddress
+        return 1
+    return 0

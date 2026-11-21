@@ -25,91 +25,14 @@
 import serial { prints, serial_print_hex, serial_print_dec }
 import mm.pmm { pmm_alloc_page, pmm_free_page, PAGE_SIZE }
 import mm.vmm { vmm_map_page, vmm_virt_to_phys, vmm_flush_tlb_all, phys_to_virt, PTE_USER, PTE_WRITABLE }
+# ELF structures, constants and the pure image gate (AGAST #1888).
+# pub: loader.elf is still the module callers (and test_harland_errno.py)
+# import for ElfStatus, so re-export what moved to loader.image.
+pub import loader.image
 
 # External functions from main.ritz
 extern fn alloc_user_stack() -> u64
 extern fn jump_to_userspace(entry: u64, stack: u64)
-
-# ============================================================================
-# ELF Constants
-# ============================================================================
-
-# ELF magic bytes: 0x7F 'E' 'L' 'F'
-const ELF_MAGIC_0: u8 = 0x7F
-const ELF_MAGIC_1: u8 = 0x45  # 'E'
-const ELF_MAGIC_2: u8 = 0x4C  # 'L'
-const ELF_MAGIC_3: u8 = 0x46  # 'F'
-
-# e_ident indices
-const EI_MAG0: i32 = 0
-const EI_MAG1: i32 = 1
-const EI_MAG2: i32 = 2
-const EI_MAG3: i32 = 3
-const EI_CLASS: i32 = 4     # 1=32-bit, 2=64-bit
-const EI_DATA: i32 = 5      # 1=little-endian, 2=big-endian
-const EI_VERSION: i32 = 6
-const EI_OSABI: i32 = 7
-const EI_ABIVERSION: i32 = 8
-
-# ELF class values
-const ELFCLASS64: u8 = 2
-
-# ELF data encoding
-const ELFDATA2LSB: u8 = 1  # Little-endian
-
-# e_type values
-pub const ET_EXEC: u16 = 2   # Executable file
-pub const ET_DYN: u16 = 3    # Shared object file (PIE)
-
-# e_machine values
-const EM_X86_64: u16 = 62
-
-# Program header types
-const PT_NULL: u32 = 0
-const PT_LOAD: u32 = 1    # Loadable segment
-const PT_DYNAMIC: u32 = 2
-const PT_INTERP: u32 = 3
-const PT_NOTE: u32 = 4
-const PT_PHDR: u32 = 6
-const PT_GNU_STACK: u32 = 0x6474E551
-const PT_GNU_RELRO: u32 = 0x6474E552
-
-# Program header flags
-const PF_X: u32 = 1       # Execute
-const PF_W: u32 = 2       # Write
-const PF_R: u32 = 4       # Read
-
-# ============================================================================
-# ELF Structures
-# ============================================================================
-
-# ELF64 Header structure (64 bytes)
-pub struct Elf64Ehdr
-    e_ident: [16]u8       # Magic number and other info
-    e_type: u16           # Object file type
-    e_machine: u16        # Architecture
-    e_version: u32        # Object file version
-    e_entry: u64          # Entry point virtual address
-    e_phoff: u64          # Program header table file offset
-    e_shoff: u64          # Section header table file offset
-    e_flags: u32          # Processor-specific flags
-    e_ehsize: u16         # ELF header size in bytes
-    e_phentsize: u16      # Program header table entry size
-    e_phnum: u16          # Program header table entry count
-    e_shentsize: u16      # Section header table entry size
-    e_shnum: u16          # Section header table entry count
-    e_shstrndx: u16       # Section header string table index
-
-# ELF64 Program Header structure (56 bytes)
-pub struct Elf64Phdr
-    p_type: u32           # Segment type
-    p_flags: u32          # Segment flags
-    p_offset: u64         # Segment file offset
-    p_vaddr: u64          # Segment virtual address
-    p_paddr: u64          # Segment physical address
-    p_filesz: u64         # Segment size in file
-    p_memsz: u64          # Segment size in memory
-    p_align: u64          # Segment alignment
 
 # ELF loader result
 pub struct ElfLoadResult
@@ -118,66 +41,8 @@ pub struct ElfLoadResult
     error: ElfStatus      # ElfStatus.Ok, or why the load failed
 
 # ============================================================================
-# ELF Load Status
-# ============================================================================
-#
-# Why a load failed (or Ok). Not an errno, and not an integer: a spawn that
-# fails maps it to the errno user space sees (main.ritz: elf_status_errno),
-# so a loader code can't reach rax as -EPERM..-ENOEXEC by accident (AGAST
-# #2123: ELF_ERR_* were the i32s -1..-8).
-
-pub enum ElfStatus
-    Ok
-    InvalidMagic        # e_ident does not start 0x7F 'E' 'L' 'F'
-    NotElf64            # not ELFCLASS64
-    NotLittleEndian     # not ELFDATA2LSB
-    NotExecutable       # neither ET_EXEC nor ET_DYN
-    WrongMachine        # not EM_X86_64
-    NoSegments          # no program headers
-    AllocFailed         # out of physical pages
-    MapFailed           # vmm_map_page failed
-
-# Numeric code for serial logs (Ok = 0).
-pub fn elf_status_code(s: ElfStatus) -> u64
-    s as u64
-
-# ============================================================================
 # ELF Functions
 # ============================================================================
-
-# Validate ELF header
-pub fn elf_validate_header(ehdr: *Elf64Ehdr) -> ElfStatus
-    # Check magic number
-    if (*ehdr).e_ident[EI_MAG0] != ELF_MAGIC_0
-        return ElfStatus.InvalidMagic
-    if (*ehdr).e_ident[EI_MAG1] != ELF_MAGIC_1
-        return ElfStatus.InvalidMagic
-    if (*ehdr).e_ident[EI_MAG2] != ELF_MAGIC_2
-        return ElfStatus.InvalidMagic
-    if (*ehdr).e_ident[EI_MAG3] != ELF_MAGIC_3
-        return ElfStatus.InvalidMagic
-
-    # Check 64-bit class
-    if (*ehdr).e_ident[EI_CLASS] != ELFCLASS64
-        return ElfStatus.NotElf64
-
-    # Check little-endian encoding
-    if (*ehdr).e_ident[EI_DATA] != ELFDATA2LSB
-        return ElfStatus.NotLittleEndian
-
-    # Check executable type (accept both ET_EXEC and ET_DYN for PIE)
-    if (*ehdr).e_type != ET_EXEC and (*ehdr).e_type != ET_DYN
-        return ElfStatus.NotExecutable
-
-    # Check x86-64 architecture
-    if (*ehdr).e_machine != EM_X86_64
-        return ElfStatus.WrongMachine
-
-    # Check program headers exist
-    if (*ehdr).e_phnum == 0
-        return ElfStatus.NoSegments
-
-    return ElfStatus.Ok
 
 # Convert ELF flags to page table flags
 fn elf_flags_to_pte(p_flags: u32) -> u64
@@ -319,17 +184,17 @@ pub fn elf_load(elf_data: *u8, elf_size: u64, load_base: u64) -> ElfLoadResult
     # Parse ELF header
     let ehdr: *Elf64Ehdr = elf_data as *Elf64Ehdr
 
-    # Validate header
-    let validate_result: ElfStatus = elf_validate_header(ehdr)
+    # Validate the whole image before touching a page: header, program
+    # header table, every segment's file range and user address, overlaps
+    # (AGAST #1888). Nothing below reads outside [elf_data, +elf_size).
+    let validate_result: ElfStatus = elf_validate_image(elf_data, elf_size, load_base)
     if validate_result != ElfStatus.Ok
         result.error = validate_result
         return result
 
     # For PIE executables (ET_DYN), add the load_base offset to the entry
     # point and every segment; static executables (ET_EXEC) load as-is
-    var bias: u64 = 0
-    if (*ehdr).e_type == ET_DYN and load_base != 0
-        bias = load_base
+    let bias: u64 = elf_bias((*ehdr).e_type, load_base)
     result.entry_point = (*ehdr).e_entry + bias
 
     # Process program headers

@@ -30,11 +30,15 @@ import ritzlib.strview { strview_from_ptr }
 import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
 import syscall.stack { syscall_stack_check, syscall_stack_used }
 import drivers.acpi.tables { acpi_poweroff }
-import loader.elf { ElfLoadResult, ElfStatus, elf_load }
+import loader.image { ElfStatus }
+import loader.elf { ElfLoadResult, elf_load }
 import syscall.errno { Errno }
 import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
+import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
 import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait }
 import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
+import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_display }
+import cap.types { CAP_TYPE_POWER, CAP_RIGHT_EXECUTE }
 
 extern fn syscall_stack_size() -> u64
 
@@ -42,15 +46,10 @@ extern fn syscall_stack_size() -> u64
 # spawn
 # ============================================================================
 
-# spawn_process' copy of the parent's argv, made before it switches to the
-# child's page table (AGAST #1877: 5 KiB that used to be syscall-stack
-# locals). Static: the kernel is not preempted, and spawn_process fills and
-# is done with them before anything can switch away.
-const SPAWN_ARGV_BYTES: i64 = 4096
-const SPAWN_ARGV_MAX: i32 = 64
-var g_spawn_argv_copy: [4096]u8
-var g_spawn_argv_offsets: [64]i64     # offset of each arg in g_spawn_argv_copy
-var g_spawn_child_argv: [64]u64       # each arg's address on the child's stack
+# The child's argv addresses on its stack, filled by spawn_push_argv.
+# The strings themselves live in argv.ritz's capture buffer: argv is read
+# from user memory exactly once, in the handler (AGAST #1888).
+var g_spawn_child_argv: [64]u64
 
 # init's page table: the kernel's own, mapped for as long as the kernel
 # runs. An exiting process leaves its own for this one before freeing it.
@@ -101,6 +100,7 @@ fn elf_status_errno(s: ElfStatus) -> i64
 # parent keeps its pid throughout (AGAST #2762).
 fn spawn_undo(slot: i32, parent_pid: u64)
     let c: *Proc = proc_at(slot)
+    cap_table_free_pid(c.pid as u32)
     fs_process_select(c.pid)
     fs_process_end()
     fs_process_select(parent_pid)
@@ -108,33 +108,24 @@ fn spawn_undo(slot: i32, parent_pid: u64)
         vmm_free_pml4(c.pml4)
     proc_abort_child(slot)
 
-# Copy argv (argc strings in the caller's address space) into
-# g_spawn_argv_copy. Its total size, or Errno.TooBig.
-fn spawn_copy_argv(argv: **u8, argc: i32) -> i64
-    if argc > SPAWN_ARGV_MAX
-        prints("[spawn_args] too many arguments\n")
-        return Errno.TooBig as i64
-    var total: i64 = 0
-    var i: i32 = 0
-    while i < argc
-        total = total + syscall_strlen(*(argv + i)) + 1  # +1 for null
-        i = i + 1
-    if total > SPAWN_ARGV_BYTES
-        prints("[spawn_args] argv too large\n")
-        return Errno.TooBig as i64
-    var copy_pos: i64 = 0
-    i = 0
-    while i < argc
-        g_spawn_argv_offsets[i] = copy_pos
-        let arg: *u8 = *(argv + i)
-        var j: i64 = 0
-        while *(arg + j) != 0
-            g_spawn_argv_copy[(copy_pos + j) as i32] = *(arg + j)
-            j = j + 1
-        g_spawn_argv_copy[(copy_pos + j) as i32] = 0
-        copy_pos = copy_pos + j + 1
-        i = i + 1
-    return total
+# The errno argv_capture's status maps to.
+fn argv_status_errno(s: ArgvStatus) -> i64
+    match s
+        TooMany => Errno.TooBig as i64
+        TooBig => Errno.TooBig as i64
+        Fault => Errno.Fault as i64
+        Invalid => Errno.Inval as i64
+        _ => 0
+
+# Capture the caller's argv before spawn_process switches page tables: one
+# pass, validation fused with the copy (AGAST #1888). Returns the captured
+# byte count, or a negative errno.
+fn spawn_capture_argv(argv: **u8, argc: i32) -> i64
+    let cap: ArgvCapture = argv_capture(argv, argc, uptr_check_read)
+    if cap.status != ArgvStatus.Ok
+        prints("[spawn_args] argv capture failed\n")
+        return argv_status_errno(cap.status)
+    return cap.bytes
 
 # Lay out argv on the child's user stack (the child's page table is
 # current): the strings at the top, below them the argv array and its NULL,
@@ -149,10 +140,10 @@ fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
     var dst_offset: i64 = 0
     while i < argc
         g_spawn_child_argv[i] = strings_base + (dst_offset as u64)
-        let src_offset: i64 = g_spawn_argv_offsets[i]
+        let src_offset: i64 = argv_offsets[i]
         var j: i64 = 0
-        while g_spawn_argv_copy[(src_offset + j) as i32] != 0
-            *((strings_base + dst_offset as u64 + j as u64) as *u8) = g_spawn_argv_copy[(src_offset + j) as i32]
+        while argv_buf[(src_offset + j) as i32] != 0
+            *((strings_base + dst_offset as u64 + j as u64) as *u8) = argv_buf[(src_offset + j) as i32]
             j = j + 1
         *((strings_base + dst_offset as u64 + j as u64) as *u8) = 0
         dst_offset = dst_offset + j + 1
@@ -175,7 +166,7 @@ fn spawn_push_argv(argc: i32, total_string_bytes: i64, child_argv: *u64) -> u64
 #
 # ISOLATION: each child gets its own page table (CR3); it cannot read or
 # write the parent's user memory.
-fn spawn_process(path: *u8, argv: **u8, argc: i32) -> i64
+fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     # Read file from namespace (using kernel's page table). A path under
     # /var comes from the persistent subtree (fs/kfs.ritz, #4321).
     let path_len: i64 = syscall_strlen(path)
@@ -194,12 +185,9 @@ fn spawn_process(path: *u8, argv: **u8, argc: i32) -> i64
             prints("\n")
         return Errno.NoEnt as i64
 
-    # argv lives in the parent's address space: copy it out first.
-    var total_string_bytes: i64 = 0
-    if argc > 0
-        total_string_bytes = spawn_copy_argv(argv, argc)
-        if total_string_bytes < 0
-            return total_string_bytes
+    # The caller's argv was captured in the handler, before this point
+    # (AGAST #1888): use that copy and never re-read the user array.
+    let total_string_bytes: i64 = argv_bytes
 
     let parent: *Proc = proc_current()
     let parent_pid: u64 = parent.pid
@@ -212,6 +200,13 @@ fn spawn_process(path: *u8, argv: **u8, argc: i32) -> i64
     let child: *Proc = proc_at(slot)
     let child_pid: u64 = child.pid
 
+    # The child's capability table: empty except the display capability it
+    # inherits from its parent. POWER is init's alone (AGAST #1888).
+    if cap_table_alloc(child_pid as u32) == 0 as *CapTable
+        proc_abort_child(slot)
+        return Errno.NoMem as i64
+    cap_inherit_display(parent_pid as u32, child_pid as u32)
+
     # The child's own fd table (#2753); its exit releases it. Made here, in
     # the parent's address space: kalloc may grow the heap, and vmm_map_page
     # walks the page tables through the identity map, which a child's page
@@ -221,6 +216,7 @@ fn spawn_process(path: *u8, argv: **u8, argc: i32) -> i64
     fs_process_select(parent_pid)
     if fs_result != 0
         prints("[spawn_args] No fd table for the child\n")
+        cap_table_free_pid(child_pid as u32)
         proc_abort_child(slot)
         return fs_result as i64
 
@@ -293,8 +289,8 @@ fn wait_for_child(pid: u64, code: *i64) -> i32
 # spawn, blocking: start the child and sleep until it exits. Its pid, for
 # sys_wait to collect the status; a negative exit code fails the spawn with
 # -1 instead, and the child is reaped here since no wait will come.
-fn spawn_and_block(path: *u8, argv: **u8, argc: i32) -> i64
-    let pid: i64 = spawn_process(path, argv, argc)
+fn spawn_and_block(path: *u8, argc: i32, argv_bytes: i64) -> i64
+    let pid: i64 = spawn_process(path, argc, argv_bytes)
     if pid <= 0
         return pid
     var code: i64 = 0
@@ -306,17 +302,17 @@ fn spawn_and_block(path: *u8, argv: **u8, argc: i32) -> i64
 
 # sys_spawn: run a binary from the filesystem and wait for it to exit.
 fn sys_spawn_impl(path: *u8) -> i64
-    return spawn_and_block(path, 0 as **u8, 0)
+    return spawn_and_block(path, 0, 0)
 
 # sys_spawn_args: run a binary with arguments and wait for it to exit. The
 # child's main() receives: fn main(argc: i32, argv: **u8) -> i32
-fn sys_spawn_args_impl(path: *u8, argv: **u8, argc: i32) -> i64
+fn sys_spawn_args_impl(path: *u8, argc: i32, argv_bytes: i64) -> i64
     prints("[spawn_args] spawn_args(")
     prints_str(path)
     prints(", argc=")
     serial_print_dec(argc as u64)
     prints(")\n")
-    return spawn_and_block(path, argv, argc)
+    return spawn_and_block(path, argc, argv_bytes)
 
 # sys_exit: the running process exits. Its fds are flushed and closed, its
 # address space freed, and it becomes a zombie for its parent's wait (a
@@ -333,6 +329,8 @@ fn sys_exit_impl(code: i32) -> i64
         # Close the fds it left open (flushing their writes) and free its
         # fd table, so none outlive it (#2753).
         fs_process_end()
+        # Its capabilities die with it, so the slot can be reused.
+        cap_table_free_pid(me.pid as u32)
 
         # Save-on-close is debounced (#4321): a write it deferred is not lost
         # when the process that made it goes away. Only then is a save owed,
@@ -434,24 +432,15 @@ pub fn sys_spawn_args_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
         return Errno.Fault as i64
-    # SECURITY: Validate argv array (each pointer + the strings they point to)
+    # SECURITY: capture argv exactly once, validating each page as it is
+    # copied (AGAST #1888). The impl and the child use only the copy.
     let argc: i32 = rdx as i32
+    var argv_bytes: i64 = 0
     if argc > 0
-        # Validate the argv array itself
-        let argv_size: u64 = (argc as u64) * 8  # sizeof(*u8) = 8 on x86-64
-        let argv_result: i64 = uptr_check_read(rsi as *u8, argv_size)
-        if argv_result != 0
-            return Errno.Fault as i64
-        # Validate each string in argv
-        var i: i32 = 0
-        let argv: **u8 = rsi as **u8
-        while i < argc
-            let arg: *u8 = *(argv + i)
-            let arg_result: i64 = uptr_validate_string(arg, 4096)
-            if arg_result < 0
-                return Errno.Fault as i64
-            i = i + 1
-    return sys_spawn_args_impl(rdi as *u8, rsi as **u8, rdx as i32)
+        argv_bytes = spawn_capture_argv(rsi as **u8, argc)
+        if argv_bytes < 0
+            return argv_bytes
+    return sys_spawn_args_impl(rdi as *u8, argc, argv_bytes)
 
 # spawn_bg(path, argv, argc): like spawn_args, but the caller doesn't wait:
 # the child's pid comes back at once, both run (#3629), and wait(pid)
@@ -463,16 +452,13 @@ pub fn sys_spawn_bg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let argc: i32 = rdx as i32
     if argc < 0
         return Errno.Inval as i64
+    # Capture argv exactly once (AGAST #1888); spawn_process uses the copy.
+    var argv_bytes: i64 = 0
     if argc > 0
-        if uptr_check_read(rsi as *u8, (argc as u64) * 8) != 0
-            return Errno.Fault as i64
-        var i: i32 = 0
-        let argv: **u8 = rsi as **u8
-        while i < argc
-            if uptr_validate_string(*(argv + i), 4096) < 0
-                return Errno.Fault as i64
-            i = i + 1
-    return spawn_process(rdi as *u8, rsi as **u8, argc)
+        argv_bytes = spawn_capture_argv(rsi as **u8, argc)
+        if argv_bytes < 0
+            return argv_bytes
+    return spawn_process(rdi as *u8, argc, argv_bytes)
 
 # wait(pid)
 pub fn sys_wait_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
@@ -490,6 +476,11 @@ pub fn sys_yield_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
 # acpi_poweroff()
 pub fn sys_acpi_poweroff_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # POWER is init's capability; a process without it cannot power the
+    # machine off (AGAST #1888).
+    if not cap_process_has(proc_current_pid() as u32, CAP_TYPE_POWER, CAP_RIGHT_EXECUTE)
+        prints("[syscall] ACPI poweroff denied (no capability)\n")
+        return Errno.Perm as i64
     prints("[syscall] ACPI poweroff requested\n")
     # Whatever save-on-close deferred (#4321) goes to the disk before the
     # machine goes down.

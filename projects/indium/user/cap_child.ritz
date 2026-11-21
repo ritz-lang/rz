@@ -1,0 +1,58 @@
+# cap_child: the syscall boundary rejects an unprivileged process (AGAST
+# #1888).
+#
+# Spawned processes start without the kernel-reserved POWER capability, so
+# SYS_ACPI_POWEROFF must answer -EPERM instead of powering the machine off.
+# The display capability IS inherited from the parent; this child revokes it
+# and then SYS_FB_MAP must answer -EPERM too.
+#
+# Before #1888 both syscalls ran for any caller: this program would have
+# powered the machine off (no verdict for the boot gate) and mapped the
+# framebuffer.
+#
+# Exit 0 only if both are denied.
+
+import libharland { print_str, print_int }
+import ritzlib.sys { syscall0, syscall1 }
+
+# Numbers from the kernel's Syscall enum; ritzlib.sys does not export the
+# first two. Not named SYS_*: tools/test_package_syscall_numbers.py keeps
+# syscall numbers in ritzlib.sys, not beside an import of it.
+const NR_CAP_REVOKE: i64 = 41
+const NR_ACPI_POWEROFF: i64 = 200
+const NR_FB_MAP: i64 = 211
+const DENIED: i64 = -1
+
+# A spawned process's table is empty and cap_inherit_display inserts the
+# inherited DISPLAY capability first: index 0, generation 1.
+const INHERITED_DISPLAY_HANDLE: i64 = (1 << 32) | 0
+
+pub fn main() -> i32
+    print_str(c"[cap_child] asking an unprivileged process for poweroff\n")
+    let power: i64 = syscall0(NR_ACPI_POWEROFF)
+    print_str(c"[cap_child] acpi_poweroff -> ")
+    print_int(power)
+    print_str(c"\n")
+    if power != DENIED
+        print_str(c"[cap_child] FAIL: poweroff was not denied\n")
+        return 1
+
+    print_str(c"[cap_child] revoking the inherited display capability\n")
+    let revoked: i64 = syscall1(NR_CAP_REVOKE, INHERITED_DISPLAY_HANDLE)
+    print_str(c"[cap_child] cap_revoke -> ")
+    print_int(revoked)
+    print_str(c"\n")
+    if revoked != 0
+        print_str(c"[cap_child] FAIL: could not revoke the display capability\n")
+        return 2
+
+    let fb: i64 = syscall1(NR_FB_MAP, 0)
+    print_str(c"[cap_child] fb_map -> ")
+    print_int(fb)
+    print_str(c"\n")
+    if fb != DENIED
+        print_str(c"[cap_child] FAIL: fb_map was not denied\n")
+        return 3
+
+    print_str(c"[cap_child] PASS: both syscalls denied without a capability\n")
+    return 0
