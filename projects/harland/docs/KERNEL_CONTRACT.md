@@ -466,6 +466,47 @@ The ELF loader's failures are not errnos: `loader/elf.ritz` returns an
 | 8 | CAP_FILE | Open file |
 | 9 | CAP_SHM | Shared memory |
 | 10 | CAP_SERVICE | Named service |
+| 11 | CAP_POWER | ACPI power-off (AGAST #1888) |
+| 12 | CAP_DISPLAY | Framebuffer mapping (AGAST #1888) |
+
+### Capability Gate Policy
+
+The syscall boundary checks a process-wide capability before a reserved
+operation runs (`cap/table.ritz`, AGAST #1888 and #4472). A process with no
+capability table, or no entry of that type with the required right, is
+refused with `-EPERM`; the operation never reaches the subsystem.
+
+| Syscall | Capability | Right |
+|---------|------------|-------|
+| SYS_ACPI_POWEROFF | CAP_POWER | EXECUTE |
+| SYS_FB_MAP | CAP_DISPLAY | WRITE |
+| SYS_IPC_SEND | CAP_CHANNEL | SEND |
+| SYS_IPC_RECV | CAP_CHANNEL | RECV |
+| SYS_IPC_CLOSE | CAP_CHANNEL | SEND or RECV |
+| SYS_OPEN | CAP_NAMESPACE | READ; CREATE too for O_CREAT |
+| SYS_READ (filesystem fd) | CAP_NAMESPACE | READ |
+| SYS_WRITE (filesystem fd) | CAP_NAMESPACE | WRITE |
+| SYS_LSEEK, SYS_CLOSE (filesystem fd) | CAP_NAMESPACE | READ or WRITE |
+| SYS_READDIR | CAP_NAMESPACE | LIST |
+| SYS_MKDIR | CAP_NAMESPACE | CREATE |
+| SYS_SYNC | CAP_NAMESPACE | WRITE |
+
+Console fds 0-2 stay ungated: a process denied the filesystem must still be
+able to report why.
+
+**Seeding and inheritance.** Init (pid 1) is seeded with POWER, DISPLAY,
+CHANNEL and NAMESPACE with CAP_RIGHT_ALL. A spawned child starts with an
+empty table and inherits DISPLAY, CHANNEL and NAMESPACE with its parent's
+rights, never widened (`cap_inherit_ambient`). POWER is never inherited:
+only init can power the machine off, so no child can.
+
+**Granting.** Every other capability is granted explicitly. SYS_CAP_GRANT
+copies an entry from the caller's table when the entry carries
+CAP_RIGHT_GRANT; the recipient's rights are the source rights intersected
+with the requested rights. SYS_CAP_DERIVE narrows a held capability, and
+SYS_CAP_REVOKE removes one. A child that revokes an inherited CHANNEL or
+NAMESPACE capability loses IPC or filesystem access from the next syscall
+(the boot-gate children `cap_ipc_child` and `cap_fs_child` prove this).
 
 ---
 

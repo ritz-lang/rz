@@ -1,0 +1,136 @@
+# Harland capability gate policy tests (AGAST #4472)
+#
+# #1888 gave init POWER and DISPLAY and let a child inherit DISPLAY only.
+# #4472 extends the policy to the IPC and filesystem syscalls: init is
+# seeded with CHANNEL and NAMESPACE too, and a spawned child inherits the
+# ambient trio (DISPLAY, CHANNEL, NAMESPACE) with its parent's rights.
+# POWER stays init's alone.
+#
+# These tests call the table directly. They never call cap_table_init (it
+# prints through the serial port, which a hosted test does not have), so the
+# registry starts zeroed, exactly as a fresh boot has it. The pids are
+# unique per test because the registry outlives each test function.
+
+import cap.table { CapTable, cap_table_alloc, cap_table_get, cap_table_insert, cap_process_has, cap_process_has_any, cap_init_bootstrap, cap_inherit_ambient }
+import cap.types { CapEntry, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_EXECUTE, CAP_RIGHT_SEND, CAP_RIGHT_RECV, CAP_RIGHT_CREATE, CAP_RIGHT_LIST, CAP_RIGHT_ALL }
+
+# Entry `i` of pid's table, or null.
+fn entry_at(pid: u32, i: i32) -> *CapEntry
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return 0 as *CapEntry
+    return @(*table).entries[i]
+
+# init is seeded with the four kernel-reserved capabilities.
+[[test]]
+fn test_init_bootstrap_seeds_ambient_caps() -> i32
+    if cap_init_bootstrap() != 0
+        return 1
+    if not cap_process_has(1, CAP_TYPE_POWER, CAP_RIGHT_EXECUTE)
+        return 2
+    if not cap_process_has(1, CAP_TYPE_DISPLAY, CAP_RIGHT_WRITE)
+        return 3
+    if not cap_process_has(1, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND)
+        return 4
+    if not cap_process_has(1, CAP_TYPE_CHANNEL, CAP_RIGHT_RECV)
+        return 5
+    if not cap_process_has(1, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
+        return 6
+    if not cap_process_has(1, CAP_TYPE_NAMESPACE, CAP_RIGHT_WRITE)
+        return 7
+    if not cap_process_has(1, CAP_TYPE_NAMESPACE, CAP_RIGHT_LIST)
+        return 8
+    return 0
+
+# A spawned child inherits DISPLAY, CHANNEL and NAMESPACE, never POWER.
+[[test]]
+fn test_child_inherits_ambient_caps() -> i32
+    if cap_table_alloc(50) == 0 as *CapTable
+        return 1
+    let parent: *CapTable = cap_table_get(50)
+    if cap_table_insert(parent, CAP_TYPE_POWER, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return 2
+    if cap_table_insert(parent, CAP_TYPE_DISPLAY, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return 3
+    if cap_table_insert(parent, CAP_TYPE_CHANNEL, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return 4
+    if cap_table_insert(parent, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return 5
+
+    if cap_table_alloc(51) == 0 as *CapTable
+        return 6
+    if cap_inherit_ambient(50, 51) != 0
+        return 7
+
+    if not cap_process_has(51, CAP_TYPE_DISPLAY, CAP_RIGHT_WRITE)
+        return 8
+    if not cap_process_has(51, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND)
+        return 9
+    if not cap_process_has(51, CAP_TYPE_CHANNEL, CAP_RIGHT_RECV)
+        return 10
+    if not cap_process_has(51, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
+        return 11
+    if not cap_process_has(51, CAP_TYPE_NAMESPACE, CAP_RIGHT_CREATE)
+        return 12
+    if cap_process_has(51, CAP_TYPE_POWER, CAP_RIGHT_EXECUTE)
+        return 13
+
+    # The boot-gate children revoke their inherited capabilities by handle.
+    # That only works while the insertion order is DISPLAY, CHANNEL,
+    # NAMESPACE -> child indices 0, 1, 2.
+    let display: *CapEntry = entry_at(51, 0)
+    let channel: *CapEntry = entry_at(51, 1)
+    let namespace: *CapEntry = entry_at(51, 2)
+    if display == 0 as *CapEntry or (*display).cap_type != CAP_TYPE_DISPLAY
+        return 14
+    if channel == 0 as *CapEntry or (*channel).cap_type != CAP_TYPE_CHANNEL
+        return 15
+    if namespace == 0 as *CapEntry or (*namespace).cap_type != CAP_TYPE_NAMESPACE
+        return 16
+    return 0
+
+# A capability is inherited with the parent's rights, not CAP_RIGHT_ALL.
+[[test]]
+fn test_inheritance_copies_rights() -> i32
+    if cap_table_alloc(52) == 0 as *CapTable
+        return 1
+    let parent: *CapTable = cap_table_get(52)
+    if cap_table_insert(parent, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND, 0).index == 0xFFFFFFFF
+        return 2
+    if cap_table_alloc(53) == 0 as *CapTable
+        return 3
+    if cap_inherit_ambient(52, 53) != 0
+        return 4
+
+    if not cap_process_has(53, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND)
+        return 5
+    if cap_process_has(53, CAP_TYPE_CHANNEL, CAP_RIGHT_RECV)
+        return 6
+    return 0
+
+# Empty table: no capability answers yes.
+[[test]]
+fn test_empty_table_has_nothing() -> i32
+    if cap_table_alloc(54) == 0 as *CapTable
+        return 1
+    if cap_process_has(54, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND)
+        return 2
+    if cap_process_has(54, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
+        return 3
+    return 0
+
+# cap_process_has_any is true when at least one requested right is held.
+[[test]]
+fn test_has_any_right() -> i32
+    if cap_table_alloc(55) == 0 as *CapTable
+        return 1
+    let table: *CapTable = cap_table_get(55)
+    if cap_table_insert(table, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, 0).index == 0xFFFFFFFF
+        return 2
+    if not cap_process_has_any(55, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ | CAP_RIGHT_WRITE)
+        return 3
+    if cap_process_has_any(55, CAP_TYPE_NAMESPACE, CAP_RIGHT_WRITE | CAP_RIGHT_CREATE)
+        return 4
+    if cap_process_has_any(55, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND | CAP_RIGHT_RECV)
+        return 5
+    return 0

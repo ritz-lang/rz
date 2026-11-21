@@ -5,7 +5,7 @@
 # Each sys_*_handler is a `fn(rdi, rsi, rdx, r10) -> i64` registered in
 # syscall/runtime/entry.ritz: syscall_table_init (AGAST #2121).
 
-import serial { StrView, serial_buffer_write, serial_drain_output }
+import serial { StrView, prints, serial_buffer_write, serial_drain_output }
 import tty.console { tty_console_read, tty_console_get_flags, tty_console_set_flags, tty_console_set_fg }
 import mm.uptr { uptr_validate_string, uptr_check_read, uptr_check_write }
 import fs.kfs { kfs_ns_for, kfs_local, kfs_list }
@@ -14,7 +14,9 @@ import goliath.dir_entry { DirEntry }
 import ritzlib.strview { strview_from_ptr }
 import fs.syscall { sys_close, sys_fs_read, sys_fs_write, sys_lseek, sys_mkdir, is_fs_fd, fs_sync }
 import syscall.errno { Errno }
-import syscall.runtime.process { syscall_strlen }
+import syscall.runtime.process { syscall_strlen, current_pid }
+import cap.table { cap_process_has, cap_process_has_any }
+import cap.types { CAP_TYPE_NAMESPACE, CAP_RIGHT_READ, CAP_RIGHT_WRITE, CAP_RIGHT_CREATE, CAP_RIGHT_LIST }
 import mm.heap { kalloc, kfree }
 
 # Most entries one readdir returns.
@@ -88,6 +90,11 @@ pub fn sys_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let fd: i32 = rdi as i32
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
+        # Closing a file mutates the namespace-backed fd table, so either
+        # namespace right makes the caller eligible (AGAST #4472).
+        if not cap_process_has_any(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_READ | CAP_RIGHT_WRITE)
+            prints("[syscall] close denied (no namespace capability)\n")
+            return Errno.Perm as i64
         return sys_close(fd)
     # Otherwise, return success (stdin/stdout/stderr don't close)
     return 0
@@ -97,10 +104,18 @@ pub fn sys_lseek_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     let fd: i32 = rdi as i32
     if not is_fs_fd(fd)
         return Errno.BadF as i64
+    if not cap_process_has_any(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_READ | CAP_RIGHT_WRITE)
+        prints("[syscall] lseek denied (no namespace capability)\n")
+        return Errno.Perm as i64
     return sys_lseek(fd, rsi as i64, rdx as i32)
 
 # mkdir(path, len): create a directory in the kernel namespace.
 pub fn sys_mkdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # Creating a directory entry needs CAP_RIGHT_CREATE in the namespace
+    # (AGAST #4472).
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_CREATE)
+        prints("[syscall] mkdir denied (no namespace capability)\n")
+        return Errno.Perm as i64
     # SECURITY: Validate path buffer (same contract as open)
     if rsi == 0
         return Errno.Inval as i64
@@ -123,6 +138,12 @@ pub fn sys_write_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
+        # Writing a file needs WRITE in the namespace. The console fds stay
+        # ungated: a process denied the filesystem must still be able to
+        # report why (AGAST #4472).
+        if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_WRITE)
+            prints("[syscall] write denied (no namespace capability)\n")
+            return Errno.Perm as i64
         return sys_fs_write(fd, buf, len as u64)
 
     # Otherwise, write to serial (fd 1 = stdout, fd 2 = stderr)
@@ -153,6 +174,11 @@ pub fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
     # Check if it's a filesystem fd
     if is_fs_fd(fd)
+        # Reading a file needs READ in the namespace; stdin stays ungated
+        # (AGAST #4472).
+        if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
+            prints("[syscall] read denied (no namespace capability)\n")
+            return Errno.Perm as i64
         return sys_fs_read(fd, buf, count as u64)
 
     # Only support stdin (fd 0) for serial input
@@ -164,6 +190,10 @@ pub fn sys_read_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
 # readdir(path, buf, size)
 pub fn sys_readdir_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # Listing a directory needs CAP_RIGHT_LIST in the namespace (#4472).
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_LIST)
+        prints("[syscall] readdir denied (no namespace capability)\n")
+        return Errno.Perm as i64
     # SECURITY: Validate path string and output buffer
     let path_result: i64 = uptr_validate_string(rdi as *u8, 4096)
     if path_result < 0
@@ -209,4 +239,8 @@ pub fn sys_tty_setfg_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 # Save-on-close is debounced (fs/syscall.ritz, #4321); Sync is the way a
 # program says "now". Returns 0, or an Errno (NoDev without a disk).
 pub fn sys_sync_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # Flushing the persistent subtree is a namespace write (AGAST #4472).
+    if not cap_process_has(current_pid(), CAP_TYPE_NAMESPACE, CAP_RIGHT_WRITE)
+        prints("[syscall] sync denied (no namespace capability)\n")
+        return Errno.Perm as i64
     return fs_sync() as i64

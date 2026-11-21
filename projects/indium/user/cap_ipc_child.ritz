@@ -1,0 +1,67 @@
+# cap_ipc_child: the IPC syscalls reject a process without a channel
+# capability (AGAST #4472, the #1888 cap_child pattern).
+#
+# A spawned process inherits its parent's ambient capabilities: DISPLAY,
+# CHANNEL and NAMESPACE, in that order (cap_inherit_ambient). This child
+# revokes the inherited CHANNEL capability, so SYS_IPC_SEND, SYS_IPC_RECV
+# and SYS_IPC_CLOSE must answer -EPERM even before they look at the handle.
+#
+# Before #4472 the endpoint-owner check was the only gate: handle 0 is not
+# an endpoint, so each call answered -EBADF (-9). Exit 0 only if all three
+# are denied with -EPERM (-1).
+
+import libharland { print_str, print_int }
+import ritzlib.sys { syscall1, syscall2, syscall3 }
+
+# Numbers from the kernel's Syscall enum; ritzlib.sys wraps none of IPC.
+const NR_IPC_SEND: i64 = 30
+const NR_IPC_RECV: i64 = 31
+const NR_IPC_CLOSE: i64 = 33
+const NR_CAP_REVOKE: i64 = 41
+const DENIED: i64 = -1
+
+# The child's inherited handles, in cap_inherit_ambient's insertion order:
+# DISPLAY (index 0, generation 1), CHANNEL (index 1, generation 2),
+# NAMESPACE (index 2, generation 3).
+const INHERITED_CHANNEL_HANDLE: i64 = (2 << 32) | 1
+
+# A syscall's user buffer must be readable (the kernel checks 4096 bytes
+# before the gate): a page-sized global keeps that check out of the way.
+var g_msg: [4096]u8
+
+pub fn main() -> i32
+    print_str(c"[cap_ipc_child] revoking the inherited channel capability\n")
+    let revoked: i64 = syscall1(NR_CAP_REVOKE, INHERITED_CHANNEL_HANDLE)
+    print_str(c"[cap_ipc_child] cap_revoke -> ")
+    print_int(revoked)
+    print_str(c"\n")
+    if revoked != 0
+        print_str(c"[cap_ipc_child] FAIL: could not revoke the channel capability\n")
+        return 1
+
+    let sent: i64 = syscall2(NR_IPC_SEND, 0, @g_msg as i64)
+    print_str(c"[cap_ipc_child] ipc_send -> ")
+    print_int(sent)
+    print_str(c"\n")
+    if sent != DENIED
+        print_str(c"[cap_ipc_child] FAIL: ipc_send was not denied\n")
+        return 2
+
+    let recvd: i64 = syscall3(NR_IPC_RECV, 0, @g_msg as i64, 0)
+    print_str(c"[cap_ipc_child] ipc_recv -> ")
+    print_int(recvd)
+    print_str(c"\n")
+    if recvd != DENIED
+        print_str(c"[cap_ipc_child] FAIL: ipc_recv was not denied\n")
+        return 3
+
+    let closed: i64 = syscall1(NR_IPC_CLOSE, 0)
+    print_str(c"[cap_ipc_child] ipc_close -> ")
+    print_int(closed)
+    print_str(c"\n")
+    if closed != DENIED
+        print_str(c"[cap_ipc_child] FAIL: ipc_close was not denied\n")
+        return 4
+
+    print_str(c"[cap_ipc_child] PASS: IPC denied without a channel capability\n")
+    return 0

@@ -25,6 +25,7 @@ import mm.pmm { PAGE_SIZE }
 import mm.vmm { vmm_create_user_pml4, vmm_switch_pml4, vmm_get_current_pml4, vmm_free_pml4, vmm_read_pml4_entry }
 import mm.uptr { uptr_validate_string, uptr_check_read }
 import fs.kfs { kfs_ns_for, kfs_local, kfs_read, kfs_save, kfs_save_pending }
+import fs.vfs { O_CREAT }
 import goliath.namespace { Namespace }
 import ritzlib.strview { strview_from_ptr }
 import fs.syscall { sys_open, fs_process_end, fs_process_start, fs_process_select }
@@ -37,8 +38,8 @@ import syscall.runtime.memory { USER_STACK_TOP, alloc_user_stack }
 import syscall.runtime.argv { ArgvStatus, ArgvCapture, argv_capture, argv_buf, argv_offsets }
 import proc.table { Proc, BLOCK_CHILD, PROC_CHILD_EXITED, PROC_CHILD_LIVE, proc_table_reset, proc_enter_init, proc_current, proc_current_pid, proc_current_slot, proc_at, proc_is_init, proc_new_child, proc_start, proc_abort_child, proc_block, proc_exit_current, proc_child_status, proc_wait }
 import proc.sched { sched_start, sched_yield, sched_block, sched_exit, sched_prepare_user, sched_report }
-import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_display }
-import cap.types { CAP_TYPE_POWER, CAP_RIGHT_EXECUTE }
+import cap.table { CapTable, cap_process_has, cap_table_alloc, cap_table_free_pid, cap_inherit_ambient }
+import cap.types { CAP_TYPE_POWER, CAP_TYPE_NAMESPACE, CAP_RIGHT_EXECUTE, CAP_RIGHT_READ, CAP_RIGHT_CREATE }
 
 extern fn syscall_stack_size() -> u64
 
@@ -200,12 +201,13 @@ fn spawn_process(path: *u8, argc: i32, argv_bytes: i64) -> i64
     let child: *Proc = proc_at(slot)
     let child_pid: u64 = child.pid
 
-    # The child's capability table: empty except the display capability it
-    # inherits from its parent. POWER is init's alone (AGAST #1888).
+    # The child's capability table: the ambient capabilities it inherits
+    # from its parent (display, channel, namespace). POWER is init's alone
+    # (AGAST #1888, extended by #4472).
     if cap_table_alloc(child_pid as u32) == 0 as *CapTable
         proc_abort_child(slot)
         return Errno.NoMem as i64
-    cap_inherit_display(parent_pid as u32, child_pid as u32)
+    cap_inherit_ambient(parent_pid as u32, child_pid as u32)
 
     # The child's own fd table (#2753); its exit releases it. Made here, in
     # the parent's address space: kalloc may grow the heap, and vmm_map_page
@@ -411,12 +413,22 @@ pub fn sys_exit_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
 
 # open(path, path_len, flags)
 pub fn sys_open_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # Resolving a path needs a namespace capability with READ; creating one
+    # needs CREATE as well (AGAST #4472).
+    let pid: u32 = current_pid()
+    if not cap_process_has(pid, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)
+        prints("[syscall] open denied (no namespace capability)\n")
+        return Errno.Perm as i64
+    let flags: i32 = rdx as i32
+    if (flags & O_CREAT) != 0 and not cap_process_has(pid, CAP_TYPE_NAMESPACE, CAP_RIGHT_CREATE)
+        prints("[syscall] open(O_CREAT) denied (no create right)\n")
+        return Errno.Perm as i64
     # SECURITY: Validate path buffer
     if rsi > 0
         let path_result: i64 = uptr_check_read(rdi as *u8, rsi as u64)
         if path_result != 0
             return Errno.Fault as i64
-    return sys_open(rdi as *u8, rsi, rdx as i32)
+    return sys_open(rdi as *u8, rsi, flags)
 
 # spawn(path)
 pub fn sys_spawn_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

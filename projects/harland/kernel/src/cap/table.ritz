@@ -4,7 +4,7 @@
 # kernel objects with associated rights.
 
 import serial { prints, println, serial_print_dec }
-import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid }
+import cap.types { CapHandle, CapEntry, CapInfo, CAP_TYPE_NONE, CAP_TYPE_POWER, CAP_TYPE_DISPLAY, CAP_TYPE_CHANNEL, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, cap_entry_init, cap_handle_init, cap_handle_invalid }
 
 # ============================================================================
 # Constants
@@ -286,6 +286,22 @@ pub fn cap_process_has(pid: u32, cap_type: u8, right: u32) -> bool
         i = i + 1
     return false
 
+# True if process `pid` holds a capability of `cap_type` with at least one
+# of `rights`. Used where several rights are interchangeable at the
+# boundary: closing a channel needs SEND or RECV, and closing/seeking a
+# file needs READ or WRITE (AGAST #4472).
+pub fn cap_process_has_any(pid: u32, cap_type: u8, rights: u32) -> bool
+    let table: *CapTable = cap_table_get(pid)
+    if table == 0 as *CapTable
+        return false
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*table).entries[i]
+        if (*entry).cap_type == cap_type and ((*entry).rights & rights) != 0
+            return true
+        i = i + 1
+    return false
+
 # Free the table of `pid` if it has one (a process exiting or a spawn undo).
 pub fn cap_table_free_pid(pid: u32) -> i32
     let table: *CapTable = cap_table_get(pid)
@@ -294,8 +310,12 @@ pub fn cap_table_free_pid(pid: u32) -> i32
     return cap_table_free(table)
 
 # Give init (pid 1) the capabilities the kernel reserves for the first
-# process: power off the machine and map the display. Spawned processes
-# start with an empty table (see cap_inherit_display).
+# process: power off the machine, map the display, and use the ambient IPC
+# and filesystem facilities every process starts with. A spawned child
+# inherits the latter three (see cap_inherit_ambient); POWER is init's alone.
+#
+# AGAST #1888 seeded POWER and DISPLAY; #4472 added CHANNEL and NAMESPACE
+# when the IPC and filesystem syscalls were gated.
 pub fn cap_init_bootstrap() -> i32
     let table: *CapTable = cap_table_alloc(1)
     if table == 0 as *CapTable
@@ -304,22 +324,45 @@ pub fn cap_init_bootstrap() -> i32
         return -2
     if cap_table_insert(table, CAP_TYPE_DISPLAY, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
         return -3
+    if cap_table_insert(table, CAP_TYPE_CHANNEL, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return -4
+    if cap_table_insert(table, CAP_TYPE_NAMESPACE, CAP_RIGHT_ALL, 0).index == 0xFFFFFFFF
+        return -5
     return 0
 
-# Copy the parent's DISPLAY capability to a new child. The display is the
-# one capability a spawned process inherits: a compositor's client runs with
-# its parent's framebuffer access. POWER is never inherited - only init has
-# it, so no child can power the machine off (AGAST #1888).
-pub fn cap_inherit_display(parent_pid: u32, child_pid: u32) -> i32
+# Copy every capability of `cap_type` from `from` to `to`, with the source
+# entry's rights. 0, or -2 when the destination table is full.
+fn cap_inherit_type(from: *CapTable, to: *CapTable, cap_type: u8) -> i32
+    var i: i32 = 0
+    while i < 64
+        let entry: *CapEntry = @(*from).entries[i]
+        if (*entry).cap_type == cap_type
+            if cap_table_insert(to, cap_type, (*entry).rights, (*entry).object_id).index == 0xFFFFFFFF
+                return -2
+        i = i + 1
+    return 0
+
+# Give a new child the capabilities its parent passes on implicitly: DISPLAY
+# (a compositor's client runs with its parent's framebuffer access), CHANNEL
+# (IPC) and NAMESPACE (the filesystem). Rights are copied, never widened.
+# POWER is never inherited - only init has it, so no child can power the
+# machine off (AGAST #1888).
+#
+# The insertion order is part of the boot-gate contract: a child's inherited
+# handles are DISPLAY=index 0, CHANNEL=index 1, NAMESPACE=index 2 (each with
+# generation i+1), which is how projects/indium/user/cap_*_child.ritz
+# revokes the capability it is testing. Explicitly granted capabilities are
+# the other route: SYS_CAP_GRANT copies an entry from a holder with
+# CAP_RIGHT_GRANT, intersected with the requested rights (cap_grant).
+pub fn cap_inherit_ambient(parent_pid: u32, child_pid: u32) -> i32
     let from: *CapTable = cap_table_get(parent_pid)
     let to: *CapTable = cap_table_get(child_pid)
     if from == 0 as *CapTable or to == 0 as *CapTable
         return -1
-    var i: i32 = 0
-    while i < 64
-        let entry: *CapEntry = @(*from).entries[i]
-        if (*entry).cap_type == CAP_TYPE_DISPLAY
-            if cap_table_insert(to, CAP_TYPE_DISPLAY, (*entry).rights, (*entry).object_id).index == 0xFFFFFFFF
-                return -2
-        i = i + 1
-    return 0
+    let display: i32 = cap_inherit_type(from, to, CAP_TYPE_DISPLAY)
+    if display != 0
+        return display
+    let channel: i32 = cap_inherit_type(from, to, CAP_TYPE_CHANNEL)
+    if channel != 0
+        return channel
+    return cap_inherit_type(from, to, CAP_TYPE_NAMESPACE)

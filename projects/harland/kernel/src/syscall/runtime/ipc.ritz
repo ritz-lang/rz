@@ -8,8 +8,10 @@
 import mm.uptr { uptr_check_read, uptr_check_write }
 import ipc.message { Message }
 import ipc.syscall { sys_channel_create, sys_ipc_send, sys_ipc_recv, sys_ipc_close }
-import cap.types { CapInfo }
+import cap.types { CapInfo, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND, CAP_RIGHT_RECV }
+import cap.table { cap_process_has, cap_process_has_any }
 import cap.syscall { sys_cap_grant, sys_cap_revoke, sys_cap_derive, sys_cap_info, sys_cap_check }
+import serial { prints }
 import syscall.errno { Errno }
 import syscall.runtime.process { current_pid }
 
@@ -18,13 +20,24 @@ pub fn sys_channel_create_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
     return sys_channel_create(current_pid())
 
 pub fn sys_ipc_send_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # A channel capability with SEND is the authority for SYS_IPC_SEND; the
+    # per-handle endpoint ownership check is not a substitute (AGAST #4472).
+    let pid: u32 = current_pid()
+    if not cap_process_has(pid, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND)
+        prints("[ipc_send] denied (no channel capability)\n")
+        return Errno.Perm as i64
     # SECURITY: Validate Message struct (4096 bytes) is readable
     let msg_result: i64 = uptr_check_read(rsi as *u8, 4096)
     if msg_result != 0
         return Errno.Fault as i64
-    return sys_ipc_send(current_pid(), rdi as i32, rsi as *Message)
+    return sys_ipc_send(pid, rdi as i32, rsi as *Message)
 
 pub fn sys_ipc_recv_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
+    # RECV is the receiving half of the channel capability (AGAST #4472).
+    let pid: u32 = current_pid()
+    if not cap_process_has(pid, CAP_TYPE_CHANNEL, CAP_RIGHT_RECV)
+        prints("[ipc_recv] denied (no channel capability)\n")
+        return Errno.Perm as i64
     # SECURITY: Validate Message struct (4096 bytes) is writable
     let msg_result: i64 = uptr_check_write(rsi as *u8, 4096)
     if msg_result != 0
@@ -34,10 +47,16 @@ pub fn sys_ipc_recv_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
         let sender_result: i64 = uptr_check_write(rdx as *u8, 4)
         if sender_result != 0
             return Errno.Fault as i64
-    return sys_ipc_recv(current_pid(), rdi as i32, rsi as *Message, rdx as *u32)
+    return sys_ipc_recv(pid, rdi as i32, rsi as *Message, rdx as *u32)
 
 pub fn sys_ipc_close_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64
-    return sys_ipc_close(current_pid(), rdi as i32)
+    # Closing an endpoint needs one of the two channel rights; a process
+    # with neither cannot touch the endpoint table at all (AGAST #4472).
+    let pid: u32 = current_pid()
+    if not cap_process_has_any(pid, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND | CAP_RIGHT_RECV)
+        prints("[ipc_close] denied (no channel capability)\n")
+        return Errno.Perm as i64
+    return sys_ipc_close(pid, rdi as i32)
 
 # Capability syscalls - use current_pid() instead of hardcoded 1
 pub fn sys_cap_grant_handler(rdi: u64, rsi: u64, rdx: u64, r10: u64) -> i64

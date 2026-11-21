@@ -221,13 +221,16 @@ def test_table_registers_handlers_imported_from_their_area():
 
 
 def test_sys_open_handler_calls_sys_open_without_the_old_workaround():
-    """The open handler, in the process module, validates the path and returns sys_open's result directly. The save/restore
-    of those globals that used to wrap the call is gone (#2761): what clobbered
-    them was the 4 KiB syscall stack overrunning .data, fixed in
-    syscall_entry.s."""
+    """The open handler, in the process module, checks the namespace
+    capability, validates the path and returns sys_open's result directly.
+    The save/restore of those globals that used to wrap the call is gone
+    (#2761): what clobbered them was the 4 KiB syscall stack overrunning
+    .data, fixed in syscall_entry.s. The flags have a name since #4472
+    because the O_CREAT path needs a second capability check."""
     code = _code(_area("process"))
     body = _body(code, "sys_open_handler")
-    assert re.search(r"return sys_open\(rdi as \*u8, rsi, rdx as i32\)", body), body
+    assert "cap_process_has(pid, CAP_TYPE_NAMESPACE, CAP_RIGHT_READ)" in body, body
+    assert re.search(r"return sys_open\(rdi as \*u8, rsi, flags\)", body), body
     assert "saved_child_pid" not in body and "saved_has_parent" not in body, body
     assert "WORKAROUND" not in _area("process").read_text()
 
