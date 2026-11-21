@@ -1,0 +1,86 @@
+# ritz1/src/wrapping.ritz - `+%` / `-%` / `*%` wrap an integer
+#
+# LARB R63 (AGAST #3486).  The wrapping operators are integer operators: a
+# float or a pointer operand is refused where the source wrote the operation,
+# in ritz0's words:
+#
+#     fn f(x: f64) -> f64
+#         x +% 1.0       # error: `+%` wraps an integer, and `f64` isn't one
+#
+# The parser keeps `+%` as `+` with `Expr.wrapping` set (ast.ritz), so every
+# other pass reads it as `+`.  The operand types come from Sema's typer
+# (sema_type.ritz, AGAST #1816), never from the emitter.  A value Sema can't
+# type is left alone, as bool_check leaves BK_UNSURE.
+#
+# sema_walk calls this for every expression it walks; the `+%=` family
+# desugars to a binary too, so it is covered by the same call.  A global or
+# const initialiser is not walked, and ritz0 doesn't check one either.
+# ritz0's tests: test_wrapping_ops.py, on all three compilers.
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.strview
+
+import ast
+import ast_query   # TYPE_UNKNOWN & co., off emitter_core (AGAST #3513)
+import sema
+import sema_type
+import types
+
+# `t` as the source spells it, for a refusal that names an operand's type: a
+# primitive, a struct, or a pointer or reference to one.  ritz0's _type_str,
+# for the shapes a wrapping operand can be.
+fn wrapping_ty_eprint(t: *SemaTy)
+    if t.kind == TYPE_PTR or t.kind == TYPE_REF or t.kind == TYPE_MUT_REF
+        if t.kind == TYPE_MUT_REF
+            eprints_cstr(c"@&")
+        else if t.kind == TYPE_REF
+            eprint_char('@')
+        else
+            eprint_char('*')
+        if t.name_len > 0
+            eprints(StrView { ptr: t.name, len: t.name_len as i64 })
+        else
+            eprints_cstr(ty_name(t.pointee))
+        return
+    if t.kind == TYPE_STRUCT and t.name_len > 0
+        eprints(StrView { ptr: t.name, len: t.name_len as i64 })
+        return
+    eprints_cstr(ty_name(t.kind))
+
+# Refuse at the operation, where the source wrote it.  A place is said once:
+# the walk can reach the same expression twice (a match arm's value, a tail).
+fn wrapping_refuse(sm: *Sema, e: *Expr, side: *SemaTy)
+    if sm.wrap_err_line == e.span.line and sm.wrap_err_col == e.span.col
+        return
+    sm.wrap_err_line = e.span.line
+    sm.wrap_err_col = e.span.col
+    sema_error_at(sm, e.span.line, e.span.col)
+    eprint_char('`')
+    if e.op == OP_ADD
+        eprint_char('+')
+    else if e.op == OP_SUB
+        eprint_char('-')
+    else
+        eprint_char('*')
+    eprints_cstr(c"%` wraps an integer, and `")
+    wrapping_ty_eprint(side)
+    eprints_cstr(c"` isn't one\n")
+
+# The walk's per-expression check: a wrapping operation's operands are both
+# integers.  They are typed through sema_expr_ty; the operation itself needs
+# no typing of its own, since its op is the plain `+` / `-` / `*`.
+pub fn wrapping_check(sm: *Sema, e: *Expr)
+    if e == null or e.kind != EXPR_BINARY or e.wrapping != 1
+        return
+    var l: SemaTy
+    var r: SemaTy
+    if sema_expr_ty(sm, e.left, @l) == TYPE_UNKNOWN
+        return
+    if sema_expr_ty(sm, e.right, @r) == TYPE_UNKNOWN
+        return
+    if sema_is_int_kind(l.kind) != 1
+        wrapping_refuse(sm, e, @l)
+        return
+    if sema_is_int_kind(r.kind) != 1
+        wrapping_refuse(sm, e, @r)

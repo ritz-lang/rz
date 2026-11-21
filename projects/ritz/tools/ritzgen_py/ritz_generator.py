@@ -84,6 +84,10 @@ HAND_WRITTEN_TOKEN_IDS = {
     'ASM_LINE': 136,
     # Whitespace
     'WHITESPACE': 140, 'COMMENT': 141,
+    # Wrapping arithmetic (LARB R63, AGAST #3486).  One token each; the ids sit
+    # past every range in use and inside p_first_has's three u64 words (0-191).
+    'PLUSPCT': 150, 'MINUSPCT': 151, 'STARPCT': 152,
+    'PLUSPCT_EQ': 153, 'MINUSPCT_EQ': 154, 'STARPCT_EQ': 155,
 }
 
 
@@ -194,6 +198,7 @@ class RitzGenerator:
             (120, 128, 'Punctuation'),
             (130, 136, 'Identifiers and literals'),
             (140, 141, 'Whitespace'),
+            (150, 155, 'Wrapping arithmetic (LARB R63)'),
         ]
 
         # AGAST #1530: an ID outside every group used to vanish from

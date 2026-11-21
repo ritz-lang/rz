@@ -167,6 +167,7 @@ an entry here, and every entry names a module that exists (`--check`).
 | `sema_walk` | Walks the module and calls each Sema check. |
 | `sema_probe` | Test-only: compares Sema's typing with the emitter's (`RITZ1_SEMA_PROBE`). |
 | `struct_cast` | `as` between two different struct types is refused (§7.5, LARB R72, #4000). |
+| `wrapping` | `+%` / `-%` / `*%` are integer operators: a float or pointer operand is refused (LARB R63, §7.1, #3486). |
 
 **Checks**
 
@@ -335,6 +336,11 @@ empty. A note that belongs to a move goes on that check's own entry.
 - `type_name_check` — a written type name must name a type: "unknown type
   `Nope`" at the name (#3932). Run by main over the whole module before
   monomorphisation; `type_named` records where each name was written.
+
+- `wrapping` — `+%` / `-%` / `*%` wrap an integer: a float or a pointer
+  operand is refused where the source wrote the operation (LARB R63, §7.1,
+  #3486). The parser keeps the plain operator with `Expr.wrapping` set, so
+  every other pass reads it as `+`.
 
 **Emitter**
 

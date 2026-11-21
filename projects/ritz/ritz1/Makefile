@@ -81,6 +81,7 @@ SOURCES = \
 	float_compare \
 	tail_value \
 	trait_bound \
+	wrapping \
 	reachability \
 	emitter_asm \
 	emitter_stmt \

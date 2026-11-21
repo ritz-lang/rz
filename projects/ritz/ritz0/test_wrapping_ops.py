@@ -4,7 +4,7 @@
 
 R63 makes `+`, `-` and `*` stop the program on overflow (#3488, later); the
 `%` forms are how code that means to wrap (hashes, crypto rounds, PRNGs) says
-so.  Step 1 is the operators themselves, on ritz0:
+so.  The operators themselves, on ritz0 (#3485) and ritz1 (#3486):
 
 - they lex as one token each and parse at the precedence of `+`, `-`, `*`;
 - they type as R21 types `+`: operands and result at the operand type, a
@@ -16,10 +16,10 @@ so.  Step 1 is the operators themselves, on ritz0:
 - they are integer operators: on a float or a pointer they are refused,
   located, on every compile.
 
-The parser keeps them as `BinOp('+', wrapping=True)`, so every rule for `+`
-applies unchanged and only the two differences above look at the flag.
-
-ritz1 is #3486.  Each runtime row's `main` returns 3 when it holds.
+The parser keeps them as `BinOp('+', wrapping=True)` (ritz1: `Expr.wrapping`),
+so every rule for `+` applies unchanged and only the two differences above look
+at the flag.  Each runtime row's `main` returns 3 when it holds, on all three
+compilers; the lexing and parsing rows are ritz0's front end.
 """
 
 import pytest
@@ -30,6 +30,10 @@ from test_ref_into_value import _assert_refused, _run
 from tokens import TokenType
 
 U64_MAX = "18446744073709551615"
+
+# Every compiler, as test_ref_into_value runs a row: the rule is the language's,
+# not ritz0's, and ritz1_selfhosted must accept what ritz1 does.
+COMPILERS = ["ritz0", "ritz1", "ritz1_selfhosted"]
 
 
 # --- lexing and parsing -------------------------------------------------------
@@ -108,6 +112,13 @@ RUNS = {
     "wider_slot_assign": _f("u8", "    var r: u16 = 0\n    r = a *% b\n", "200, 200", 64),
     # ... but the plain `*` above it still runs in the slot: (200 +% 100) * 10.
     "wider_slot_outer_plain": _f("u8", "    let r: u16 = (a +% b) * 10\n", "200, 100", 440),
+    # The walk stops at the wrapping node too: the `/` below it stays a u8
+    # divide, so `b * c` wraps to 144 before it (14, not 400 / 10 = 40).
+    "wider_slot_stops_below": (
+        "fn f(a: u8, b: u8, c: u8) -> i32\n"
+        "    let r: u16 = a +% ((b * c) / 10)\n"
+        "    if r == 15\n        return 3\n    return 4\n"
+        "\npub fn main() -> i32\n    f(1, 200, 2)\n"),
     # A generic's instance is rebuilt by monomorph, and keeps the wrap.
     "generic_instance": ("fn g<T>(t: T, a: u8, b: u8) -> i32\n    let r: u16 = a +% b\n"
                          "    if r == 44\n        return 3\n    return 4\n"
@@ -117,9 +128,10 @@ RUNS = {
 
 @pytest.mark.integration
 @pytest.mark.batched
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(RUNS))
-def test_wrapping_operator_wraps_at_its_operand_type(tmp_path, name):
-    assert _run("ritz0", tmp_path, name, RUNS[name]) == 3
+def test_wrapping_operator_wraps_at_its_operand_type(tmp_path, compiler, name):
+    assert _run(compiler, tmp_path, name, RUNS[name]) == 3
 
 
 # --- refused: they are integer operators ---------------------------------------------
@@ -134,7 +146,8 @@ REFUSED = {
 
 @pytest.mark.integration
 @pytest.mark.batched
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(REFUSED))
-def test_wrapping_operator_on_a_non_integer_is_refused(tmp_path, name):
+def test_wrapping_operator_on_a_non_integer_is_refused(tmp_path, compiler, name):
     body, message = REFUSED[name]
-    _assert_refused("ritz0", tmp_path, name, body + "\npub fn main() -> i32\n    0\n", message)
+    _assert_refused(compiler, tmp_path, name, body + "\npub fn main() -> i32\n    0\n", message)
