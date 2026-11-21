@@ -218,7 +218,12 @@ fn run_server(port: i32)
     var keep_alive: i32
 
     # Submit initial accept
-    let accept_sqe = uring_get_sqe(@ring)
+    var accept_sqe: *IoUringSqe = null
+    match uring_get_sqe(@ring)
+        Some(p) => accept_sqe = p
+        None =>
+            prints("FAIL: could not get accept SQE\n")
+            return
     uring_prep_accept(accept_sqe, server_fd, null, null, 0, encode_user_data(0, OP_ACCEPT))
     uring_sqe_submit(@ring)
     uring_submit(@ring)
@@ -229,11 +234,10 @@ fn run_server(port: i32)
         if n < 0
             break
 
-        var cqe: *IoUringCqe
         loop
-            cqe = uring_peek_cqe(@ring)
-            if cqe == null
-                break
+            let cqe: *IoUringCqe = match uring_peek_cqe(@ring)
+                Some(p) => p
+                None => break
 
             let user_data: i64 = uring_cqe_get_data64(cqe)
             let result: i32 = cqe.res
@@ -256,23 +260,27 @@ fn run_server(port: i32)
                         conn_keep_alive[found_slot] = 0
 
                         # Submit recv for this connection
-                        let recv_sqe = uring_get_sqe(@ring)
+                        var recv_sqe: *IoUringSqe = null
+                        match uring_get_sqe(@ring)
+                            Some(p) => recv_sqe = p
+                            None =>
+                                # SQ full - close connection
+                                sys_close(result)
+                                conn_fds[found_slot] = -1
                         if recv_sqe != null
                             uring_prep_recv(recv_sqe, result, recv_bufs[found_slot], BUF_SIZE as u64, 0, encode_user_data(found_slot, OP_RECV))
                             uring_sqe_submit(@ring)
-                        else
-                            # SQ full - close connection
-                            sys_close(result)
-                            conn_fds[found_slot] = -1
                     else
                         # No free slots
                         sys_close(result)
 
                 # Always re-submit accept
-                let new_accept = uring_get_sqe(@ring)
-                if new_accept != null
-                    uring_prep_accept(new_accept, server_fd, null, null, 0, encode_user_data(0, OP_ACCEPT))
-                    uring_sqe_submit(@ring)
+                match uring_get_sqe(@ring)
+                    Some(p) =>
+                        let new_accept: *IoUringSqe = p
+                        uring_prep_accept(new_accept, server_fd, null, null, 0, encode_user_data(0, OP_ACCEPT))
+                        uring_sqe_submit(@ring)
+                    None => pass
 
             else if op == OP_RECV
                 # Validate slot is still active
@@ -318,14 +326,16 @@ fn run_server(port: i32)
                         *(send_bufs[slot] + i) = *(resp_buf + i)
 
                     # Submit send
-                    let send_sqe = uring_get_sqe(@ring)
+                    var send_sqe: *IoUringSqe = null
+                    match uring_get_sqe(@ring)
+                        Some(p) => send_sqe = p
+                        None =>
+                            # SQ full - close connection
+                            sys_close(conn_fds[slot])
+                            conn_fds[slot] = -1
                     if send_sqe != null
                         uring_prep_send(send_sqe, conn_fds[slot], send_bufs[slot], resp_len as u64, 0, encode_user_data(slot, OP_SEND))
                         uring_sqe_submit(@ring)
-                    else
-                        # SQ full - close connection
-                        sys_close(conn_fds[slot])
-                        conn_fds[slot] = -1
 
             else if op == OP_SEND
                 # Validate slot is still active
@@ -340,14 +350,16 @@ fn run_server(port: i32)
                 else
                     if conn_keep_alive[slot] != 0
                         # Keep-alive: submit another recv
-                        let recv_sqe = uring_get_sqe(@ring)
-                        if recv_sqe != null
-                            uring_prep_recv(recv_sqe, conn_fds[slot], recv_bufs[slot], BUF_SIZE as u64, 0, encode_user_data(slot, OP_RECV))
+                        var recv_sqe2: *IoUringSqe = null
+                        match uring_get_sqe(@ring)
+                            Some(p) => recv_sqe2 = p
+                            None =>
+                                # SQ full - close connection
+                                sys_close(conn_fds[slot])
+                                conn_fds[slot] = -1
+                        if recv_sqe2 != null
+                            uring_prep_recv(recv_sqe2, conn_fds[slot], recv_bufs[slot], BUF_SIZE as u64, 0, encode_user_data(slot, OP_RECV))
                             uring_sqe_submit(@ring)
-                        else
-                            # SQ full - close connection
-                            sys_close(conn_fds[slot])
-                            conn_fds[slot] = -1
                     else
                         # Close connection
                         sys_close(conn_fds[slot])

@@ -37,7 +37,7 @@ RITZ1_SH = str(RITZ_ROOT / "ritz1/build/ritz1_selfhosted")
 RITZLIB_DIR = RITZ_ROOT / "ritzlib"
 RITZLIB_MODULES = ["sys", "io", "str", "fmt/digits", "strview", "string", "hash", "memory",
                    "gvec", "drop", "option", "result", "hashmap",
-                   "span"]
+                   "span", "errno"]
 
 # Cells that are known to fail live in known-failures/<agast>.toml at the
 # workspace root, as gate = "matrix" entries keyed by (compiler, unit), and are

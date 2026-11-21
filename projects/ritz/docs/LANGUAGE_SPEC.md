@@ -5325,7 +5325,7 @@ caller's place: `name` is an alias of it, so it has type `T` in the whole body.
 ```ritz
 import ritzlib.string
 
-fn append(s: @&String) -> i32
+fn append(s: @&String) -> bool
     string_push_str(s, " world")
 
 fn main() -> i32

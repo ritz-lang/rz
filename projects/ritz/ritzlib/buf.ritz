@@ -34,6 +34,7 @@ import ritzlib.memory
 import ritzlib.drop
 import ritzlib.strview
 import ritzlib.string
+import ritzlib.result
 
 # ============================================================================
 # Buffer: In-memory byte buffer with position tracking
@@ -318,10 +319,19 @@ pub fn buf_read_while_alnum(buf: @&Buffer, out: *u8, max_len: i64) -> i64
     *(out + count) = 0
     return count
 
-pub fn buf_read_quoted(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> i64
+# Why a quoted read can fail: the cursor is not on `quote`, or the closing
+# quote is missing before end of input / `max_len`.
+pub enum BufQuoteError
+    NotQuoted
+    Unterminated
+
+# Read a quoted string, handling escapes.  Ok(bytes written, excluding the
+# NUL), or Err(why).  On Err, `out` is not written and the cursor is left
+# wherever the scan stopped.
+pub fn buf_read_quoted(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> Result<i64, BufQuoteError>
     # Read a quoted string, handling escapes
     if buf.pos >= buf.len or *(buf.data + buf.pos) != quote
-        return -1  # Not starting with quote
+        return Err(BufQuoteError.NotQuoted)
 
     buf.pos = buf.pos + 1  # Skip opening quote
     var count: i64 = 0
@@ -331,7 +341,7 @@ pub fn buf_read_quoted(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> i64
         if c == quote
             buf.pos = buf.pos + 1  # Skip closing quote
             *(out + count) = 0
-            return count
+            return Ok(count)
         if c == '\\'  # backslash
             buf.pos = buf.pos + 1
             if buf.pos >= buf.len
@@ -357,7 +367,7 @@ pub fn buf_read_quoted(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> i64
             buf.pos = buf.pos + 1
 
     *(out + count) = 0
-    return -1  # Unterminated string
+    return Err(BufQuoteError.Unterminated)
 
 # ============================================================================
 # Position save/restore (for backtracking)
@@ -452,23 +462,23 @@ pub fn growbuf_free(b: @&GrowBuf) -> i32
 # Growth and capacity
 # ============================================================================
 
-# Grow the buffer to a new capacity.
-pub fn growbuf_grow(b: @&GrowBuf, new_cap: i64) -> i32
+# Grow the buffer to a new capacity.  true on success.
+pub fn growbuf_grow(b: @&GrowBuf, new_cap: i64) -> bool
     if new_cap <= b.cap
-        return 0
+        return true
 
     let new_data: *u8 = realloc(b.data, new_cap)
     if new_data == null
-        return -1
+        return false
 
     b.data = new_data
     b.cap = new_cap
-    return 0
+    return true
 
-# Ensure the buffer has at least the given capacity.
-pub fn growbuf_ensure_cap(b: @&GrowBuf, needed: i64) -> i32
+# Ensure the buffer has at least the given capacity.  true on success.
+pub fn growbuf_ensure_cap(b: @&GrowBuf, needed: i64) -> bool
     if b.cap >= needed
-        return 0
+        return true
 
     var new_cap: i64 = b.cap
     if new_cap == 0
@@ -482,40 +492,40 @@ pub fn growbuf_ensure_cap(b: @&GrowBuf, needed: i64) -> i32
 # Append operations
 # ============================================================================
 
-# Append bytes to the buffer.
-pub fn growbuf_append(b: @&GrowBuf, data: *u8, len: i64) -> i32
-    if growbuf_ensure_cap(b, b.len + len) != 0
-        return -1
+# Append bytes to the buffer.  true on success.
+pub fn growbuf_append(b: @&GrowBuf, data: *u8, len: i64) -> bool
+    if not growbuf_ensure_cap(b, b.len + len)
+        return false
 
     for i in 0..len
         *(b.data + b.len + i) = *(data + i)
     b.len = b.len + len
-    return 0
+    return true
 
 # Append the bytes of `s` (a "..." literal is a StrView).
-pub fn growbuf_append_view(b: @&GrowBuf, s: StrView) -> i32
+pub fn growbuf_append_view(b: @&GrowBuf, s: StrView) -> bool
     return growbuf_append(b, s.ptr, s.len)
 
 # The `push_bytes` sink method `format_into(@&b, "...")` appends through
 # (AGAST #1824), named like string_push_bytes / vec_push_bytes so
 # `GrowBuf.push_bytes` resolves by UFCS.
-pub fn growbuf_push_bytes(b: @&GrowBuf, data: *u8, len: i64) -> i32
+pub fn growbuf_push_bytes(b: @&GrowBuf, data: *u8, len: i64) -> bool
     return growbuf_append(b, data, len)
 
 # Method syntax (LARB R66, #3496/#3497): `format_into(@&gb, "...")` appends
 # through `gb.push_bytes(..)`, which the compilers' UFCS table resolved to
 # growbuf_push_bytes until it went. The one GrowBuf method anything calls.
 impl GrowBuf
-    pub fn push_bytes(self: @&GrowBuf, data: *u8, len: i64) -> i32
+    pub fn push_bytes(self: @&GrowBuf, data: *u8, len: i64) -> bool
         return growbuf_push_bytes(self, data, len)
 
-# Append a single byte to the buffer.
-pub fn growbuf_append_byte(b: @&GrowBuf, byte: u8) -> i32
-    if growbuf_ensure_cap(b, b.len + 1) != 0
-        return -1
+# Append a single byte to the buffer.  true on success.
+pub fn growbuf_append_byte(b: @&GrowBuf, byte: u8) -> bool
+    if not growbuf_ensure_cap(b, b.len + 1)
+        return false
     *(b.data + b.len) = byte
     b.len = b.len + 1
-    return 0
+    return true
 
 # ============================================================================
 # Accessors

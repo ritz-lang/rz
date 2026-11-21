@@ -17,6 +17,8 @@
 import ritzlib.sys
 import ritzlib.uring
 import ritzlib.async.runtime
+import ritzlib.result
+import ritzlib.errno
 
 # Socket syscall wrappers + byte-order helpers live in ritzlib.net.  This
 # was historically duplicated here as `pub fn`, which made async_net and
@@ -188,15 +190,16 @@ pub fn tcp_getsockname(fd: i32, ip: *i32, port: *i32) -> i32
 # Async operations via runtime
 # ============================================================================
 
-# Accept a connection asynchronously via io_uring
-pub fn runtime_accept(rt: *Runtime, server_fd: i32) -> i32
+# Accept a connection asynchronously via io_uring.
+# Ok(the new fd) or Err(errno) from submission or the completion.
+pub fn runtime_accept(rt: *Runtime, server_fd: i32) -> Result<i32, Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
     # Get an SQE
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.NoMem)
 
     # Prepare accept SQE
     uring_prep_accept(sqe, server_fd, null, null, 0, user_data)
@@ -205,26 +208,29 @@ pub fn runtime_accept(rt: *Runtime, server_fd: i32) -> i32
     # Submit and wait for completion
     let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
     if ret < 0
-        return ret
+        return Err(errno_from_raw(ret))
 
     # Get the completion
-    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-    if cqe == (null)
-        return -5  # EIO
+    let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.Io)
 
     let result: i32 = cqe.res
     uring_cqe_seen(@rt.ring, cqe)
+    if result < 0
+        return Err(errno_from_raw(result))
 
-    return result
+    return Ok(result)
 
-# Send data asynchronously via io_uring
-pub fn runtime_send(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64
+# Send data asynchronously via io_uring.
+# Ok(bytes written) or Err(errno) from submission or the completion.
+pub fn runtime_send(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> Result<i64, Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.NoMem)
 
     # Use WRITE for send (works for sockets)
     uring_prep_write(sqe, fd, buf, len, 0, user_data)
@@ -232,25 +238,28 @@ pub fn runtime_send(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64
 
     let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
     if ret < 0
-        return ret as i64
+        return Err(errno_from_raw(ret))
 
-    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-    if cqe == (null)
-        return -5
+    let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.Io)
 
     let result: i64 = cqe.res as i64
     uring_cqe_seen(@rt.ring, cqe)
+    if result < 0
+        return Err(errno_from_raw(result as i32))
 
-    return result
+    return Ok(result)
 
-# Receive data asynchronously via io_uring
-pub fn runtime_recv(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64
+# Receive data asynchronously via io_uring.
+# Ok(bytes read, 0 at EOF) or Err(errno) from submission or the completion.
+pub fn runtime_recv(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> Result<i64, Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.NoMem)
 
     # Use READ for recv (works for sockets)
     uring_prep_read(sqe, fd, buf, len, 0, user_data)
@@ -258,16 +267,18 @@ pub fn runtime_recv(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64
 
     let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
     if ret < 0
-        return ret as i64
+        return Err(errno_from_raw(ret))
 
-    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-    if cqe == (null)
-        return -5
+    let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.Io)
 
     let result: i64 = cqe.res as i64
     uring_cqe_seen(@rt.ring, cqe)
+    if result < 0
+        return Err(errno_from_raw(result as i32))
 
-    return result
+    return Ok(result)
 
 # ============================================================================
 # IP address helpers

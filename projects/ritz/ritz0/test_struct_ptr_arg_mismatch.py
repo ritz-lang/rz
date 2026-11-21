@@ -246,7 +246,9 @@ import ritzlib.string
 fn main() -> i32
     var s: String = string_new()
     var t: String = string_new()
-    return s.push_string(@t) + 3
+    if not s.push_string(@t)
+        return 1
+    return 3
 """, None),
     "static": (TWO_STRUCTS + """
 impl C

@@ -457,9 +457,9 @@ fn get_storage() -> *Storage
 # a configurable buffer offset.
 fn m7sp_submit_recv_at(task: *Task, offset: i32) -> i32
     let pool: *TaskPool = task.user_data as *TaskPool
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return -12  # ENOMEM
 
     let buf_ptr: *u8 = @task.read_buf[0] + offset
     let remaining: i32 = TASK_BUFFER_SIZE - offset
@@ -513,7 +513,9 @@ fn m7sp_recv_more(task: *Task, session: *M7SPSession) -> i32
         # Exactly the rest of this message: what follows is the next one's.
         let pool: *TaskPool = task.user_data as *TaskPool
         let rest: *u8 = (session.big_recv as *u8) + session.have
-        return task_submit_recv_buf(pool, task, rest, session.msg_len - session.have)
+        if task_submit_recv_buf(pool, task, rest, session.msg_len - session.have)
+            return 0
+        return -12  # ENOMEM
     return m7sp_submit_recv_at(task, session.have)
 
 
@@ -523,7 +525,9 @@ fn m7sp_submit_out(task: *Task, session: *M7SPSession, out: *u8, len: i32) -> i3
     session.send_len = len
     session.send_pos = 0
     let pool: *TaskPool = task.user_data as *TaskPool
-    return task_submit_send_buf(pool, task, out, len)
+    if task_submit_send_buf(pool, task, out, len)
+        return 0
+    return -12  # ENOMEM
 
 
 # Send a reply: from task.write_buf when it fits, else from big_send.
@@ -563,7 +567,7 @@ pub fn m7sp_send_progress(task: *Task, session: *M7SPSession) -> i32
         return 0
     let pool: *TaskPool = task.user_data as *TaskPool
     let rest: *u8 = (session.send_ptr as *u8) + session.send_pos
-    if task_submit_send_buf(pool, task, rest, session.send_len - session.send_pos) < 0
+    if not task_submit_send_buf(pool, task, rest, session.send_len - session.send_pos)
         return -1
     return 1
 
@@ -1070,9 +1074,9 @@ fn shutdown_submit_signal_read()
     if g_signal_fd < 0 or g_srv == 0
         return
     let srv: *TaskServer = g_srv as *TaskServer
-    let sqe = uring_get_sqe(@srv.ring)
-    if sqe == null
-        return
+    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+        Some(p) => p
+        None => return
     # Offset -1: read at the file position (a signalfd has none to seek).
     uring_prep_read(sqe, g_signal_fd, @g_sig_buf[0], 128, -1, SHUTDOWN_SIGNAL_UD)
     uring_sqe_submit(@srv.ring)
@@ -1082,9 +1086,9 @@ fn shutdown_wake_loop()
     if g_srv == 0
         return
     let srv: *TaskServer = g_srv as *TaskServer
-    let sqe = uring_get_sqe(@srv.ring)
-    if sqe == null
-        return
+    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+        Some(p) => p
+        None => return
     uring_prep_nop(sqe, SHUTDOWN_WAKE_UD)
     uring_sqe_submit(@srv.ring)
 
@@ -1107,12 +1111,13 @@ fn shutdown_begin_drain()
     # that refuses IORING_OP_TIMEOUT completes it at once with -EINVAL;
     # then only a second signal cuts a stalled drain short.
     let srv: *TaskServer = g_srv as *TaskServer
-    let sqe = uring_get_sqe(@srv.ring)
-    if sqe != null
-        g_drain_ts.tv_sec = DRAIN_GRACE_SECS
-        g_drain_ts.tv_nsec = 0
-        uring_prep_timeout(sqe, @g_drain_ts, 0, 0, SHUTDOWN_TIMER_UD)
-        uring_sqe_submit(@srv.ring)
+    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+        Some(p) => p
+        None => return
+    g_drain_ts.tv_sec = DRAIN_GRACE_SECS
+    g_drain_ts.tv_nsec = 0
+    uring_prep_timeout(sqe, @g_drain_ts, 0, 0, SHUTDOWN_TIMER_UD)
+    uring_sqe_submit(@srv.ring)
 
 
 # One drain pass: count busy sessions.  Returns 1 when none is (the loop
@@ -1205,8 +1210,7 @@ fn handle_task_event(task: *Task) -> i32
             return 1    # shutting down: close a new connection unserved
         m7sp_session_init(idx)
         let pool: *TaskPool = task.user_data as *TaskPool
-        let ret: i32 = task_submit_recv(pool, task)
-        if ret < 0
+        if not task_submit_recv(pool, task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1280,8 +1284,7 @@ fn handle_task_event(task: *Task) -> i32
         session.msg_len = 0
         session.recv_big = 0
 
-        let ret: i32 = task_reset_for_recv(task)
-        if ret < 0
+        if not task_reset_for_recv(task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1398,8 +1401,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
             return 1    # shutting down: close a new connection unserved
         m7sp_session_init_encrypted(idx)
         let pool: *TaskPool = task.user_data as *TaskPool
-        let ret: i32 = task_submit_recv(pool, task)
-        if ret < 0
+        if not task_submit_recv(pool, task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1416,8 +1418,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         session.parse_state = PARSE_NEED_HEADER
         session.have = 0
         session.msg_len = 0
-        let ret: i32 = task_reset_for_recv(task)
-        if ret < 0
+        if not task_reset_for_recv(task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1495,8 +1496,7 @@ fn handle_task_event_encrypted(task: *Task) -> i32
         session.have = 0
         session.msg_len = 0
         session.recv_big = 0
-        let ret: i32 = task_reset_for_recv(task)
-        if ret < 0
+        if not task_reset_for_recv(task)
             m7sp_session_destroy(idx)
             return 1
         return -1
@@ -1644,11 +1644,13 @@ pub fn serve_async(listen_fd: i32, pool: *BufferPool, storage: *Storage, collect
     prints("\n")
 
     # TaskServer — same runtime valet uses.
-    let srv: *TaskServer = task_server_create(listen_fd)
-    if srv == null
-        prints("serve_async: task_server_create failed\n")
-        registry_destroy(@g_registry)
-        return 1
+    var srv: *TaskServer = null
+    match task_server_create(listen_fd)
+        Some(s) => srv = s
+        None =>
+            prints("serve_async: task_server_create failed\n")
+            registry_destroy(@g_registry)
+            return 1
 
     srv.pool.ring = @srv.ring
 
@@ -1686,11 +1688,13 @@ pub fn serve_async_encrypted(listen_fd: i32, pool: *BufferPool, storage: *Storag
     print_int(listen_fd as i64)
     prints("\n")
 
-    let srv: *TaskServer = task_server_create(listen_fd)
-    if srv == null
-        prints("serve_async_encrypted: task_server_create failed\n")
-        registry_destroy(@g_registry)
-        return 1
+    var srv: *TaskServer = null
+    match task_server_create(listen_fd)
+        Some(s) => srv = s
+        None =>
+            prints("serve_async_encrypted: task_server_create failed\n")
+            registry_destroy(@g_registry)
+            return 1
 
     srv.pool.ring = @srv.ring
 

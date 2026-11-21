@@ -26,6 +26,8 @@
 
 import ritzlib.sys
 import ritzlib.fmt.digits
+import ritzlib.result
+import ritzlib.errno
 
 # ============================================================================
 # Buffer primitives
@@ -107,31 +109,37 @@ pub fn make_sandbox_path(dst: *u8, prefix: *u8, suffix: *u8) -> i64
 # ============================================================================
 
 # Write content (len bytes) to path, creating/truncating with 0o600 perms.
-# Returns 0 on success, -1 if open fails.
-pub fn write_file(path: *u8, content: *u8, len: i64) -> i32
+# true when every byte was written (false on open or write failure).
+pub fn write_file(path: *u8, content: *u8, len: i64) -> bool
     let fd: i32 = sys_open3(path, O_WRONLY + O_CREAT + O_TRUNC, 384)
     if fd < 0
-        return -1
+        return false
     if len > 0
-        sys_write(fd, content, len)
+        let w: i64 = sys_write(fd, content, len)
+        if w < 0
+            sys_close(fd)
+            return false
     sys_close(fd)
-    return 0
+    return true
 
 # Read up to max bytes from path into buf.  Loops on sys_read until EOF —
 # critical because sys_read returns as soon as ANY data is available, not
-# when the writer is done.  Returns bytes read, or -1 if open fails.
-pub fn read_file(path: *u8, buf: *u8, max: i64) -> i64
+# when the writer is done.  Ok(bytes read), or Err(errno) from open/read.
+pub fn read_file(path: *u8, buf: *u8, max: i64) -> Result<i64, Errno>
     let fd: i32 = sys_open(path, O_RDONLY)
     if fd < 0
-        return -1
+        return Err(errno_from_raw(fd))
     var total: i64 = 0
     while total < max
         let r: i64 = sys_read(fd, buf + total, max - total)
-        if r <= 0
+        if r < 0
+            sys_close(fd)
+            return Err(errno_from_raw(r as i32))
+        if r == 0
             break
         total += r
     sys_close(fd)
-    return total
+    return Ok(total)
 
 # ============================================================================
 # Process exec / capture
@@ -153,6 +161,7 @@ pub fn read_file(path: *u8, buf: *u8, max: i64) -> i64
 # like "./grep").  argv[0] should typically match bin.
 #
 # standard-exempt: lib-exit: the forked child before execve(2) has no caller to return to (S-ERR-3)
+# standard-exempt: sentinel-return: process status: a non-negative return is the child's exit code (0-255); a negative one is a setup failure that happened before exec (pipe/fork/exec), a separate channel, not an in-band error code
 pub fn exec_capture(
     bin: *u8,
     argv: **u8,

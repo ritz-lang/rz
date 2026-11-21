@@ -21,6 +21,8 @@
 
 import ritzlib.sys
 import ritzlib.uring
+import ritzlib.result
+import ritzlib.errno
 
 # ============================================================================
 # Constants
@@ -83,16 +85,16 @@ pub fn runtime_destroy(rt: *Runtime)
 # I/O Operations - submit to io_uring and get result
 # ============================================================================
 
-# Submit a read operation and wait for completion
-# This is a blocking call - it submits to io_uring and waits for the result
-pub fn runtime_read(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64
+# Submit a read operation and wait for completion.
+# Ok(bytes read, 0 at EOF) or Err(errno) from submission or the completion.
+pub fn runtime_read(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
     # Get an SQE
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.NoMem)
 
     # Prepare the read
     uring_prep_read(sqe, fd, buf, count, offset, user_data)
@@ -101,67 +103,75 @@ pub fn runtime_read(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) ->
     # Submit and wait for completion
     let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
     if ret < 0
-        return ret as i64
+        return Err(errno_from_raw(ret))
 
     # Get the completion
-    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-    if cqe == (null)
-        return -5  # EIO
+    let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.Io)
 
     let result: i64 = cqe.res as i64
     uring_cqe_seen(@rt.ring, cqe)
+    if result < 0
+        return Err(errno_from_raw(result as i32))
 
-    return result
+    return Ok(result)
 
-# Submit a write operation and wait for completion
-pub fn runtime_write(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64
+# Submit a write operation and wait for completion.
+# Ok(bytes written) or Err(errno) from submission or the completion.
+pub fn runtime_write(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.NoMem)
 
     uring_prep_write(sqe, fd, buf, count, offset, user_data)
     uring_sqe_submit(@rt.ring)
 
     let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
     if ret < 0
-        return ret as i64
+        return Err(errno_from_raw(ret))
 
-    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-    if cqe == (null)
-        return -5  # EIO
+    let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.Io)
 
     let result: i64 = cqe.res as i64
     uring_cqe_seen(@rt.ring, cqe)
+    if result < 0
+        return Err(errno_from_raw(result as i32))
 
-    return result
+    return Ok(result)
 
-# Submit a close operation and wait for completion
-pub fn runtime_close(rt: *Runtime, fd: i32) -> i32
+# Submit a close operation and wait for completion.
+# Ok(()) or Err(errno) from submission or the completion.
+pub fn runtime_close(rt: *Runtime, fd: i32) -> Result<(), Errno>
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
 
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.NoMem)
 
     uring_prep_close(sqe, fd, user_data)
     uring_sqe_submit(@rt.ring)
 
     let ret: i32 = uring_submit_and_wait(@rt.ring, 1)
     if ret < 0
-        return ret
+        return Err(errno_from_raw(ret))
 
-    let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-    if cqe == (null)
-        return -5  # EIO
+    let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+        Some(p) => p
+        None => return Err(Errno.Io)
 
     let result: i32 = cqe.res
     uring_cqe_seen(@rt.ring, cqe)
+    if result < 0
+        return Err(errno_from_raw(result))
 
-    return result
+    return Ok(())
 
 # ============================================================================
 # Waker - which operation the current future is suspended on
@@ -199,26 +209,28 @@ fn runtime_suspend_on(rt: *Runtime, user_data: i64) -> i32
 # completion, the next call returns the result, whatever its value: 0 at EOF,
 # or -1 for -EPERM, which block_on returns rather than read as Pending.
 
+# standard-exempt: sentinel-return: compiler future ABI: a poll fn returns i32 where POLL_PENDING (-1) means Pending and any other value is the Ready result, a convention fixed by the generated-future calling instruction
 pub fn runtime_poll_read(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32
     if rt.waker_io_ready != 0
         return runtime_take_io_result(rt)
 
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return -12  # ENOMEM
 
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
     uring_prep_read(sqe, fd, buf, len, offset, user_data)
     return runtime_suspend_on(rt, user_data)
 
+# standard-exempt: sentinel-return: compiler future ABI: a poll fn returns i32 where POLL_PENDING (-1) means Pending and any other value is the Ready result, a convention fixed by the generated-future calling instruction
 pub fn runtime_poll_write(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32
     if rt.waker_io_ready != 0
         return runtime_take_io_result(rt)
 
-    let sqe: *IoUringSqe = uring_get_sqe(@rt.ring)
-    if sqe == (null)
-        return -12  # ENOMEM
+    let sqe: *IoUringSqe = match uring_get_sqe(@rt.ring)
+        Some(p) => p
+        None => return -12  # ENOMEM
 
     let user_data: i64 = rt.next_user_data
     rt.next_user_data = rt.next_user_data + 1
@@ -239,9 +251,9 @@ pub fn runtime_wait_for_io(rt: *Runtime) -> i32
     # Process completions
     var processed: i32 = 0
     while processed < 100  # Safety limit
-        let cqe: *IoUringCqe = uring_peek_cqe(@rt.ring)
-        if cqe == (null)
-            break  # No more completions
+        let cqe: *IoUringCqe = match uring_peek_cqe(@rt.ring)
+            Some(p) => p
+            None => break  # No more completions
 
         # Check if this completion matches our waker
         let user_data: i64 = cqe.user_data

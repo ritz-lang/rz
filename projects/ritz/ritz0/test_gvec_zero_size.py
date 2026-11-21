@@ -51,16 +51,16 @@ pub fn main() -> i32
     return pushed * 10 + v.len as i32
 """, 32),
     # vec_get of a zero-size element is a valid (empty) value, and the push
-    # that put it there succeeded (returned 0).
+    # that put it there succeeded (returned true).
     "zst_get": (UNIT + """\
 fn relay(u: Unit) -> Unit
     u
 
 pub fn main() -> i32
     var v: Vec<Unit> = vec_new<Unit>()
-    let rc: i32 = vec_push<Unit>(@&v, Unit {})
+    let ok: bool = vec_push<Unit>(@&v, Unit {})
     let u: Unit = relay(vec_get<Unit>(@v, 0))
-    if rc != 0
+    if not ok
         return 1
     return 7
 """, 7),

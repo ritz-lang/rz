@@ -16,6 +16,7 @@
 #   - Common I/O operations (read, write, accept, connect, etc.)
 
 import ritzlib.sys
+import ritzlib.option
 
 # ============================================================================
 # Syscall numbers
@@ -312,15 +313,15 @@ pub fn uring_destroy(ring: *IoUring)
 # SQE preparation helpers
 # ============================================================================
 
-# Get the next available SQE (returns null if queue is full)
-pub fn uring_get_sqe(ring: *IoUring) -> *IoUringSqe
+# Get the next available SQE, or None if the queue is full.
+pub fn uring_get_sqe(ring: *IoUring) -> Option<*IoUringSqe>
     let tail: i32 = *ring.sq_tail
     let head: i32 = *ring.sq_head
     let next: i32 = tail + 1
 
     # Check if queue is full
     if (next - head) > ring.sq_entries
-        return null
+        return None
 
     let index: i32 = tail & ring.sq_mask
     let sqe: *IoUringSqe = ring.sqes + index as i64
@@ -328,7 +329,7 @@ pub fn uring_get_sqe(ring: *IoUring) -> *IoUringSqe
     # Update the index array
     *(ring.sq_array + index as i64) = index
 
-    return sqe
+    return Some(sqe)
 
 # Advance the SQ tail after preparing an SQE
 pub fn uring_sqe_submit(ring: *IoUring)
@@ -481,36 +482,33 @@ pub fn uring_submit_and_wait(ring: *IoUring, min_complete: i32) -> i32
 
     return sys_io_uring_enter(ring.ring_fd, to_submit, min_complete, IORING_ENTER_GETEVENTS)
 
-# Peek at the next CQE without consuming it
-# Returns null if no completions are available
-pub fn uring_peek_cqe(ring: *IoUring) -> *IoUringCqe
+# Peek at the next CQE without consuming it, or None if none is available.
+pub fn uring_peek_cqe(ring: *IoUring) -> Option<*IoUringCqe>
     let head: i32 = *ring.cq_head
     let tail: i32 = *ring.cq_tail
 
     if head == tail
-        return null
+        return None
 
     let index: i32 = head & ring.cq_mask
-    return ring.cqes + index as i64
+    return Some(ring.cqes + index as i64)
 
 # Consume a CQE after processing it
 pub fn uring_cqe_seen(ring: *IoUring, cqe: *IoUringCqe)
     let head: i32 = *ring.cq_head
     *ring.cq_head = head + 1
 
-# Wait for a CQE, blocking if necessary
-pub fn uring_wait_cqe(ring: *IoUring) -> *IoUringCqe
+# Wait for a CQE, blocking if necessary, or None if the wait fails.
+pub fn uring_wait_cqe(ring: *IoUring) -> Option<*IoUringCqe>
     # First check if there's already a CQE available
-    let cqe: *IoUringCqe = uring_peek_cqe(ring)
-    if cqe != (null)
-        return cqe
-
-    # No CQE available, need to wait
-    let ret: i32 = sys_io_uring_enter(ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS)
-    if ret < 0
-        return null
-
-    return uring_peek_cqe(ring)
+    match uring_peek_cqe(ring)
+        Some(p) => return Some(p)
+        None =>
+            # No CQE available; ask the kernel to wait for one.
+            let ret: i32 = sys_io_uring_enter(ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS)
+            if ret < 0
+                return None
+            return uring_peek_cqe(ring)
 
 
 # Get user_data from a CQE

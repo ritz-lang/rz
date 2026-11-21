@@ -166,7 +166,7 @@ pub fn string_from(sv: StrView) -> String
     s.data = vec_new<u8>()
 
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
-    if vec_ensure_cap<u8>(@&s.data, sv.len + 1) == 0
+    if vec_ensure_cap<u8>(@&s.data, sv.len + 1)
         string_push_bytes(@&s, sv.ptr, sv.len)
 
     return s
@@ -180,7 +180,7 @@ pub fn string_from_cstr(cstr: *u8) -> String
 
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
     let len: i64 = strlen(cstr)
-    if vec_ensure_cap<u8>(@&s.data, len + 1) == 0
+    if vec_ensure_cap<u8>(@&s.data, len + 1)
         string_push_bytes(@&s, cstr, len)
 
     return s
@@ -191,7 +191,7 @@ pub fn string_from_bytes(bytes: *u8, len: i64) -> String
     s.data = vec_new<u8>()
 
     # Reserve room for the NUL string_as_ptr adds; on failure, stay empty.
-    if vec_ensure_cap<u8>(@&s.data, len + 1) == 0
+    if vec_ensure_cap<u8>(@&s.data, len + 1)
         string_push_bytes(@&s, bytes, len)
 
     return s
@@ -228,10 +228,11 @@ pub fn string_is_empty(s: @String) -> bool
 # The pointer is valid until the String is modified or dropped.
 # If the byte for the NUL can't be allocated, nothing is written: an empty
 # String reads as c"", a non-empty one returns null (AGAST #3551).
+# standard-exempt: null-return: raw pointer to the String's own buffer; null only when the NUL slot allocation fails (allocator boundary)
 pub fn string_as_ptr(s: @&String) -> *u8
     # Ensure null-terminated
     let len: i64 = s.data.len
-    if vec_ensure_cap<u8>(@&s.data, len + 1) != 0
+    if not vec_ensure_cap<u8>(@&s.data, len + 1)
         if len == 0
             return c""
         return null
@@ -255,37 +256,37 @@ pub fn string_get(s: @String, idx: i64) -> u8
 # ============================================================================
 
 # Push a single byte onto the string.
-pub fn string_push(s: @&String, b: u8) -> i32
+pub fn string_push(s: @&String, b: u8) -> bool
     return vec_push<u8>(@&s.data, b)
 
 # Push a StrView onto the string. A "..." literal is a StrView, so it passes
 # straight in. For a NUL-terminated C string use string_push_cstr.
-pub fn string_push_str(s: @&String, sv: StrView) -> i32
+pub fn string_push_str(s: @&String, sv: StrView) -> bool
     return string_push_bytes(s, sv.ptr, sv.len)
 
 # Push a NUL-terminated C string onto the string (FFI / *u8 interop).
 # The length is measured first, so cstr may be string_as_ptr(s) itself.
-pub fn string_push_cstr(s: @&String, cstr: *u8) -> i32
+pub fn string_push_cstr(s: @&String, cstr: *u8) -> bool
     return string_push_bytes(s, cstr, strlen(cstr))
 
 # Push another String onto this string. `other` may be `s` itself.
-pub fn string_push_string(s: @&String, other: @String) -> i32
+pub fn string_push_string(s: @&String, other: @String) -> bool
     return string_push_bytes(s, other.data.data, other.data.len)
 
 # Push a slice of bytes (explicit length, no null-termination required).
 #
 # The one bulk append every other push_*, constructor and clone goes through
-# (AGAST #1931): reserve the whole length once, then memcpy. Returns 0, or -1
-# if the reserve fails, in which case the String is left untouched. len <= 0
-# appends nothing. `bytes` may point into s's own buffer: it is re-derived
-# after the reserve, which can move that buffer.
-pub fn string_push_bytes(s: @&String, bytes: *u8, len: i64) -> i32
+# (AGAST #1931): reserve the whole length once, then memcpy. true on success,
+# false if the reserve fails, in which case the String is left untouched.
+# len <= 0 appends nothing. `bytes` may point into s's own buffer: it is
+# re-derived after the reserve, which can move that buffer.
+pub fn string_push_bytes(s: @&String, bytes: *u8, len: i64) -> bool
     if len <= 0
-        return 0
+        return true
     let old_len: i64 = s.data.len
     # Keep old_len + len (and vec_ensure_cap's doubling of it) from overflowing.
     if len > 4611686018427387904 - old_len
-        return -1
+        return false
 
     # Is the source inside our own buffer? Remember its offset if so.
     let base: i64 = s.data.data as i64
@@ -294,15 +295,15 @@ pub fn string_push_bytes(s: @&String, bytes: *u8, len: i64) -> i32
     if base != 0 and src >= base and src < base + s.data.cap
         own = true
 
-    if vec_ensure_cap<u8>(@&s.data, old_len + len) != 0
-        return -1
+    if not vec_ensure_cap<u8>(@&s.data, old_len + len)
+        return false
 
     var from: *u8 = bytes
     if own
         from = s.data.data + (src - base)
     memcpy(s.data.data + old_len, from, len)
     s.data.len = old_len + len
-    return 0
+    return true
 
 # Clear the string (keeps capacity).
 pub fn string_clear(s: @&String)
@@ -424,7 +425,9 @@ pub fn string_contains_string(s: @String, needle: @String) -> bool
 
     return false
 
-# Find first occurrence of needle in string. Returns index or -1 if not found.
+# Index of the first occurrence of needle in s, or s.data.len when there is
+# none (S-RESULT-1's sanctioned index-or-length form, not an error). Compare
+# `i < s.data.len`.
 pub fn string_find(s: @String, needle: @String) -> i64
     let len: i64 = s.data.len
     let needle_len: i64 = needle.data.len
@@ -433,7 +436,7 @@ pub fn string_find(s: @String, needle: @String) -> i64
         return 0  # Empty needle at start
 
     if needle_len > len
-        return -1
+        return len
 
     let search_end: i64 = len - needle_len + 1
     for i in 0..search_end
@@ -447,7 +450,7 @@ pub fn string_find(s: @String, needle: @String) -> i64
         if found == 1
             return i
 
-    return -1
+    return len
 
 # Extract a substring from start (inclusive) to end (exclusive).
 pub fn string_slice(s: @String, start: i64, end: i64) -> String
@@ -476,12 +479,12 @@ pub fn string_char_at(s: @String, idx: i64) -> u8
         return 0
     return vec_get<u8>(@s.data, idx)
 
-# Set character at index. Returns 0 on success, -1 if out of bounds.
-pub fn string_set_char(s: @&String, idx: i64, c: u8) -> i32
+# Set character at index. true on success, false if out of bounds.
+pub fn string_set_char(s: @&String, idx: i64, c: u8) -> bool
     if idx < 0 or idx >= s.data.len
-        return -1
+        return false
     vec_set<u8>(@&s.data, idx, c)
-    return 0
+    return true
 
 # ============================================================================
 # StrView predicates (a "..." literal is a StrView)
@@ -551,8 +554,8 @@ pub fn string_from_i64(n: i64) -> String
     return s
 
 # Push an i64 value onto the string in decimal: the String replacement for
-# str.itoa, with no caller-sized buffer. Returns 0, or -1 if a push failed.
-pub fn string_push_i64(s: @&String, n: i64) -> i32
+# str.itoa, with no caller-sized buffer. true on success.
+pub fn string_push_i64(s: @&String, n: i64) -> bool
     var buf: [20]u8
     let len: i64 = fmt_i64_into(@buf[0], n)
     return string_push_bytes(s, @buf[0], len)
@@ -651,19 +654,19 @@ impl String
     pub fn get(self: @String, idx: i64) -> u8
         return string_get(self, idx)
 
-    pub fn push(self: @&String, b: u8) -> i32
+    pub fn push(self: @&String, b: u8) -> bool
         return string_push(self, b)
 
-    pub fn push_str(self: @&String, sv: StrView) -> i32
+    pub fn push_str(self: @&String, sv: StrView) -> bool
         return string_push_str(self, sv)
 
-    pub fn push_cstr(self: @&String, cstr: *u8) -> i32
+    pub fn push_cstr(self: @&String, cstr: *u8) -> bool
         return string_push_cstr(self, cstr)
 
-    pub fn push_string(self: @&String, other: @String) -> i32
+    pub fn push_string(self: @&String, other: @String) -> bool
         return string_push_string(self, other)
 
-    pub fn push_bytes(self: @&String, bytes: *u8, len: i64) -> i32
+    pub fn push_bytes(self: @&String, bytes: *u8, len: i64) -> bool
         return string_push_bytes(self, bytes, len)
 
     pub fn clear(self: @&String)
@@ -705,7 +708,7 @@ impl String
     pub fn char_at(self: @String, idx: i64) -> u8
         return string_char_at(self, idx)
 
-    pub fn set_char(self: @&String, idx: i64, c: u8) -> i32
+    pub fn set_char(self: @&String, idx: i64, c: u8) -> bool
         return string_set_char(self, idx, c)
 
     pub fn starts_with(self: @String, prefix: StrView) -> bool
@@ -717,7 +720,7 @@ impl String
     pub fn contains(self: @String, needle: StrView) -> bool
         return string_contains(self, needle)
 
-    pub fn push_i64(self: @&String, n: i64) -> i32
+    pub fn push_i64(self: @&String, n: i64) -> bool
         return string_push_i64(self, n)
 
     pub fn to_lower(self: @String) -> String

@@ -549,7 +549,7 @@ struct Vec<T>
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `vec_push` | `fn<T>(v: @&Vec<T>, item: T) -> i32` | Push element (0 on success) |
+| `vec_push` | `fn<T>(v: @&Vec<T>, item: T) -> bool` | Push element (true on success) |
 | `vec_pop` | `fn<T>(v: @&Vec<T>) -> T` | Pop last element |
 | `vec_get` | `fn<T>(v: @Vec<T>, idx: i64) -> T` | Get element by index |
 | `vec_get_ptr` | `fn<T>(v: @&Vec<T>, idx: i64) -> *T` | Get pointer to element |
@@ -574,8 +574,8 @@ count elements as usual, and `data` is a non-null dangling pointer that
 | `vec_slice` | `fn<T>(v: @Vec<T>, start: i64, end: i64) -> Vec<T>` | Create slice copy |
 | `vec_clone` | `fn<T>(v: @Vec<T>) -> Vec<T>` | Copy every element (`v.clone()`); shallow, so a heap-owning `T` ends up owned twice |
 | `vec_swap` | `fn<T>(v: @&Vec<T>, i: i64, j: i64) -> i32` | Swap elements |
-| `vec_push_bytes` | `fn<T>(v: @&Vec<T>, data: *T, len: i64) -> i32` | Push multiple |
-| `vec_push_str` | `fn(v: @&Vec<u8>, s: *u8) -> i32` | Push C string |
+| `vec_push_bytes` | `fn<T>(v: @&Vec<T>, data: *T, len: i64) -> bool` | Push multiple (true on success) |
+| `vec_push_str` | `fn(v: @&Vec<u8>, s: *u8) -> bool` | Push C string (true on success) |
 | `vec_as_str` | `fn(v: @&Vec<u8>) -> *u8` | Get null-terminated string |
 
 **Line Utilities** (to read a whole fd into a `Vec<u8>`, use `vec_read_all_fd` in [io](#io)):
@@ -630,12 +630,12 @@ struct String
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `string_push` | `fn(s: @&String, b: u8) -> i32` | Push byte |
-| `string_push_str` | `fn(s: @&String, sv: StrView) -> i32` | Push StrView (a `"..."` literal) |
-| `string_push_cstr` | `fn(s: @&String, cstr: *u8) -> i32` | Push NUL-terminated C string |
-| `string_push_string` | `fn(s: @&String, other: @String) -> i32` | Push String |
-| `string_push_bytes` | `fn(s: @&String, bytes: *u8, len: i64) -> i32` | Push bytes; what `format_into(@&s, "...")` appends through (AGAST #1824) |
-| `string_push_i64` | `fn(s: @&String, n: i64) -> i32` | Push an integer in decimal (all of i64); replaces `itoa` |
+| `string_push` | `fn(s: @&String, b: u8) -> bool` | Push byte |
+| `string_push_str` | `fn(s: @&String, sv: StrView) -> bool` | Push StrView (a `"..."` literal) |
+| `string_push_cstr` | `fn(s: @&String, cstr: *u8) -> bool` | Push NUL-terminated C string |
+| `string_push_string` | `fn(s: @&String, other: @String) -> bool` | Push String |
+| `string_push_bytes` | `fn(s: @&String, bytes: *u8, len: i64) -> bool` | Push bytes; what `format_into(@&s, "...")` appends through (AGAST #1824) |
+| `string_push_i64` | `fn(s: @&String, n: i64) -> bool` | Push an integer in decimal (all of i64); replaces `itoa` |
 | `string_clear` | `fn(s: @&String)` | Clear string |
 | `string_pop` | `fn(s: @&String) -> u8` | Pop last byte |
 | `string_set_char` | `fn(s: @&String, idx: i64, c: u8) -> i32` | Set char at index |
@@ -769,7 +769,7 @@ struct HashMapI64
 | `hashmap_i64_cap` | `fn(m: @HashMapI64) -> i64` | Get capacity |
 | `hashmap_i64_is_empty` | `fn(m: @HashMapI64) -> bool` | Check if empty |
 | `hashmap_i64_drop` | `fn(m: @&HashMapI64)` | Free the map |
-| `hashmap_i64_value_ptr` | `fn(m: @HashMapI64, key: i64) -> *i64` | The value's slot (null if not found) |
+| `hashmap_i64_value_ptr` | `fn(m: @HashMapI64, key: i64) -> Option<*i64>` | The value's slot (None if not found) |
 | `hashmap_i64_missing_key` | `fn(key: i64)` | Exit 101: `HashMapI64: key not found: <key>` |
 
 **Methods** (via impl): `len`, `cap`, `is_empty`, `insert`, `get`, `contains`, `remove`
@@ -990,7 +990,7 @@ New code uses `StrView` (`ritzlib.strview`, borrowed) and `String`
 | `strcpy`, `strncpy` | `string_from` (a `String` owns its copy); `strview_take` to bound it |
 | `strcat` | `string_push_str`, `string_push_string` |
 | `atoi` | `strview_parse_i64(s: StrView) -> Option<i64>`: `None` for empty, junk or overflow, where `atoi` returns 0 or a prefix |
-| `itoa` | `string_push_i64(s: @&String, n: i64) -> i32` / `string_from_i64`: no caller-sized buffer |
+| `itoa` | `string_push_i64(s: @&String, n: i64) -> bool` / `string_from_i64`: no caller-sized buffer |
 
 The byte predicates (`isdigit` .. `tolower`) take a `u8`, not a C string, and
 are fine to use. `memset`/`memcpy`/`memcmp`/`bcmp`/`memmove` stay here because
@@ -1308,7 +1308,7 @@ copy into a caller-sized `out`, NUL-terminate within `max_len` (so `max_len`
 | `buf_read_until` | `fn(buf: @&Buffer, c: u8, out: *u8, max_len: i64) -> i64` | `buf_take_until` |
 | `buf_read_while_digit` | `fn(buf: @&Buffer, out: *u8, max_len: i64) -> i64` | `buf_take_digits` |
 | `buf_read_while_alnum` | `fn(buf: @&Buffer, out: *u8, max_len: i64) -> i64` | `buf_take_ident` |
-| `buf_read_quoted` | `fn(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> i64` | `buf_take_quoted` |
+| `buf_read_quoted` | `fn(buf: @&Buffer, quote: u8, out: *u8, max_len: i64) -> Result<i64, BufQuoteError>` | `buf_take_quoted` |
 
 **Location Tracking**:
 
@@ -1345,12 +1345,12 @@ explicit release. To read a whole file descriptor, use `vec_read_all_fd`
 | `growbuf_new` | `fn() -> GrowBuf` | Create empty |
 | `growbuf_with_cap` | `fn(cap: i64) -> GrowBuf` | Create with capacity |
 | `growbuf_free` | `fn(b: @&GrowBuf) -> i32` | Free (deprecated, use Drop) |
-| `growbuf_grow` | `fn(b: @&GrowBuf, new_cap: i64) -> i32` | Grow capacity |
-| `growbuf_ensure_cap` | `fn(b: @&GrowBuf, needed: i64) -> i32` | Ensure capacity |
-| `growbuf_append` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> i32` | Append bytes |
-| `growbuf_append_view` | `fn(b: @&GrowBuf, s: StrView) -> i32` | Append a StrView |
-| `growbuf_append_byte` | `fn(b: @&GrowBuf, byte: u8) -> i32` | Append single byte |
-| `growbuf_push_bytes` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> i32` | `growbuf_append` under the `push_bytes` name `format_into(@&b, "...")` appends through (AGAST #1824) |
+| `growbuf_grow` | `fn(b: @&GrowBuf, new_cap: i64) -> bool` | Grow capacity |
+| `growbuf_ensure_cap` | `fn(b: @&GrowBuf, needed: i64) -> bool` | Ensure capacity |
+| `growbuf_append` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> bool` | Append bytes |
+| `growbuf_append_view` | `fn(b: @&GrowBuf, s: StrView) -> bool` | Append a StrView |
+| `growbuf_append_byte` | `fn(b: @&GrowBuf, byte: u8) -> bool` | Append single byte |
+| `growbuf_push_bytes` | `fn(b: @&GrowBuf, data: *u8, len: i64) -> bool` | `growbuf_append` under the `push_bytes` name `format_into(@&b, "...")` appends through (AGAST #1824) |
 | `growbuf_clear` | `fn(b: @&GrowBuf) -> i32` | Clear (keep capacity) |
 | `growbuf_len` | `fn(b: @GrowBuf) -> i64` | Get length |
 | `growbuf_cap` | `fn(b: @GrowBuf) -> i64` | Get capacity |
@@ -1616,7 +1616,7 @@ High-level console I/O functions.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `vec_read_all_fd` | `fn(fd: i32, v: @&Vec<u8>) -> i64` | Append everything `fd` yields to `v`; bytes read, or -1. Here rather than in gvec, which is core |
+| `vec_read_all_fd` | `fn(fd: i32, v: @&Vec<u8>) -> Result<i64, Errno>` | Append everything `fd` yields to `v`; `Ok(bytes)`, or `Err(errno)`. Here rather than in gvec, which is core |
 
 ---
 
@@ -2062,7 +2062,7 @@ Async TCP networking using io_uring.
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `runtime_accept` | `fn(rt: *Runtime, server_fd: i32) -> i32` | Async accept |
+| `runtime_accept` | `fn(rt: *Runtime, server_fd: i32) -> Result<i32, Errno>` | Async accept |
 | `runtime_send` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64` | Async send |
 | `runtime_recv` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32) -> i64` | Async receive |
 
@@ -2111,9 +2111,9 @@ returns -1 instead of reading it as Pending (AGAST #2328).
 |----------|-----------|-------------|
 | `runtime_init` | `fn(rt: *Runtime) -> i32` | Initialize runtime |
 | `runtime_destroy` | `fn(rt: *Runtime)` | Destroy runtime |
-| `runtime_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64` | Read, waiting for the result |
-| `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> i64` | Write, waiting for the result |
-| `runtime_close` | `fn(rt: *Runtime, fd: i32) -> i32` | Close, waiting for the result |
+| `runtime_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Read, waiting for the result |
+| `runtime_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, count: i32, offset: i64) -> Result<i64, Errno>` | Write, waiting for the result |
+| `runtime_close` | `fn(rt: *Runtime, fd: i32) -> Result<(), Errno>` | Close, waiting for the result |
 | `block_on` | `fn(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32` | Poll a future to completion; -EINVAL if it is Pending with nothing to wake it |
 | `runtime_poll_read` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a read and return Pending, then return its result |
 | `runtime_poll_write` | `fn(rt: *Runtime, fd: i32, buf: *u8, len: i32, offset: i64) -> i32` | Inside a poll function: submit a write and return Pending, then return its result |
@@ -2193,11 +2193,11 @@ struct TaskServer
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `task_recv` | `fn(task: *Task) -> i32` | Submit recv |
-| `task_send` | `fn(task: *Task, len: i32) -> i32` | Submit send |
-| `task_sendv` | `fn(task: *Task, iov: *u8, iovcnt: i32) -> i32` | Submit writev |
-| `task_sendv_builder` | `fn(task: *Task) -> i32` | Send from IoVecBuilder |
-| `task_send_zc` | `fn(task: *Task, len: i32) -> i32` | Zero-copy send |
+| `task_recv` | `fn(task: *Task) -> bool` | Submit recv |
+| `task_send` | `fn(task: *Task, len: i32) -> bool` | Submit send |
+| `task_sendv` | `fn(task: *Task, iov: *u8, iovcnt: i32) -> bool` | Submit writev |
+| `task_sendv_builder` | `fn(task: *Task) -> bool` | Send from IoVecBuilder |
+| `task_send_zc` | `fn(task: *Task, len: i32) -> bool` | Zero-copy send |
 | `task_splice` | `fn(task: *Task, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> i32` | Splice |
 | `task_reset_for_recv` | `fn(task: *Task) -> i32` | Reset for keep-alive |
 
@@ -2287,12 +2287,12 @@ struct IoUring
 |----------|-----------|-------------|
 | `uring_init` | `fn(ring: *IoUring, entries: i32) -> i32` | Initialize ring |
 | `uring_destroy` | `fn(ring: *IoUring)` | Destroy ring |
-| `uring_get_sqe` | `fn(ring: *IoUring) -> *IoUringSqe` | Get SQE |
+| `uring_get_sqe` | `fn(ring: *IoUring) -> Option<*IoUringSqe>` | Get SQE (None when the ring is full) |
 | `uring_sqe_submit` | `fn(ring: *IoUring)` | Advance SQ tail |
 | `uring_submit` | `fn(ring: *IoUring) -> i32` | Submit pending SQEs |
 | `uring_submit_and_wait` | `fn(ring: *IoUring, min_complete: i32) -> i32` | Submit and wait |
-| `uring_peek_cqe` | `fn(ring: *IoUring) -> *IoUringCqe` | Peek CQE |
-| `uring_wait_cqe` | `fn(ring: *IoUring) -> *IoUringCqe` | Wait for CQE |
+| `uring_peek_cqe` | `fn(ring: *IoUring) -> Option<*IoUringCqe>` | Peek CQE (None when none is ready) |
+| `uring_wait_cqe` | `fn(ring: *IoUring) -> Option<*IoUringCqe>` | Wait for CQE |
 | `uring_cqe_seen` | `fn(ring: *IoUring, cqe: *IoUringCqe)` | Mark CQE consumed |
 
 **SQE Preparation**:
@@ -2586,8 +2586,8 @@ struct Stopwatch
 | Function | Signature | Description |
 |----------|-----------|-------------|
 | `stopwatch_init` | `fn(sw: *Stopwatch) -> i32` | Initialize |
-| `stopwatch_start` | `fn(sw: *Stopwatch) -> i32` | Start |
-| `stopwatch_stop` | `fn(sw: *Stopwatch) -> i32` | Stop |
+| `stopwatch_start` | `fn(sw: *Stopwatch) -> bool` | Start (false if already running) |
+| `stopwatch_stop` | `fn(sw: *Stopwatch) -> bool` | Stop (false if not running) |
 | `stopwatch_reset` | `fn(sw: *Stopwatch) -> i32` | Reset |
 | `stopwatch_total_nanos` | `fn(sw: *Stopwatch) -> i64` | Total ns |
 | `stopwatch_avg_nanos` | `fn(sw: *Stopwatch) -> i64` | Average ns |
@@ -2731,8 +2731,8 @@ struct ElfReader
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `elf_init` | `fn(reader: *ElfReader, data: *u8, size: i64) -> i32` | Initialize |
-| `elf_parse_sections` | `fn(reader: *ElfReader) -> i32` | Parse sections |
+| `elf_init` | `fn(reader: *ElfReader, data: *u8, size: i64) -> Result<(), ElfError>` | Initialize |
+| `elf_parse_sections` | `fn(reader: *ElfReader) -> Result<(), ElfError>` | Parse sections |
 | `elf_get_symbol_name` | `fn(reader: *ElfReader, sym_index: i64) -> *u8` | Get symbol name |
 | `elf_get_symbol_info` | `fn(reader: *ElfReader, sym_index: i64) -> u8` | Get symbol info |
 | `elf_is_function` | `fn(info: u8) -> i32` | Is function? |

@@ -25,6 +25,7 @@ import ritzlib.io
 import ritzlib.uring
 import ritzlib.async_net
 import ritzlib.iovec
+import ritzlib.option
 
 
 # ============================================================================
@@ -119,21 +120,31 @@ pub fn task_pool_init(pool: *TaskPool, ring: *IoUring)
         task.user_data = null
 
 
-# Find a free task slot, returns null if pool is full
-pub fn task_pool_alloc(pool: *TaskPool) -> *Task
+# Find a free task slot, or None if the pool is full.
+pub fn task_pool_alloc(pool: *TaskPool) -> Option<*Task>
     for i in 0..MAX_TASKS
         if pool.tasks[i].state == TASK_IDLE
-            return @pool.tasks[i]
-    return null
+            return Some(@pool.tasks[i])
+    return None
 
 
-# Find a task by its ID (user_data)
-pub fn task_pool_find(pool: *TaskPool, task_id: i64) -> *Task
+# Find a live task by its ID (user_data), or None if there is none.
+pub fn task_pool_find(pool: *TaskPool, task_id: i64) -> Option<*Task>
     for i in 0..MAX_TASKS
         if pool.tasks[i].id == task_id
             if pool.tasks[i].state != TASK_IDLE
-                return @pool.tasks[i]
-    return null
+                return Some(@pool.tasks[i])
+    return None
+
+
+# Make the task named by `task_id` READY with `result`.  An I/O completion for
+# a task that is no longer live is dropped: there is nothing to wake.
+fn task_pool_wake(pool: *TaskPool, task_id: i64, result: i32)
+    let task: *Task = match task_pool_find(pool, task_id)
+        Some(t) => t
+        None => return
+    task.io_result = result
+    task.state = TASK_READY
 
 
 # ============================================================================
@@ -151,12 +162,12 @@ pub fn get_current_time() -> i64
 # Task lifecycle
 # ============================================================================
 
-# Spawn a new task for handling a connection
-# Returns 0 on success, -1 if pool is full
-pub fn spawn_task(pool: *TaskPool, fd: i32, handler: fn(*Task) -> i32) -> i32
-    let task = task_pool_alloc(pool)
-    if task == null
-        return -1
+# Spawn a new task for handling a connection.
+# true on success, false if the pool is full.
+pub fn spawn_task(pool: *TaskPool, fd: i32, handler: fn(*Task) -> i32) -> bool
+    let task: *Task = match task_pool_alloc(pool)
+        Some(t) => t
+        None => return false
 
     # Initialize the task
     task.id = pool.next_id
@@ -174,7 +185,7 @@ pub fn spawn_task(pool: *TaskPool, fd: i32, handler: fn(*Task) -> i32) -> i32
     task.last_activity = get_current_time()  # Initialize activity timestamp
 
     pool.active_count += 1
-    return 0
+    return true
 
 
 # Mark a task as complete and free its slot
@@ -195,30 +206,30 @@ pub fn task_complete(pool: *TaskPool, task: *Task)
 
 # Submit an async recv for a task
 # Returns 0 on success
-pub fn task_submit_recv(pool: *TaskPool, task: *Task) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_recv(pool: *TaskPool, task: *Task) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     uring_prep_recv(sqe, task.fd, @task.read_buf[0], TASK_BUFFER_SIZE as u64, 0, task.id)
     uring_sqe_submit(pool.ring)  # Advance the SQ tail
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # Submit an async send for a task
 # Returns 0 on success
-pub fn task_submit_send(pool: *TaskPool, task: *Task, len: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_send(pool: *TaskPool, task: *Task, len: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     task.write_len = len
     task.write_pos = 0
     uring_prep_send(sqe, task.fd, @task.write_buf[0], len as u64, 0, task.id)
     uring_sqe_submit(pool.ring)  # Advance the SQ tail
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # ============================================================================
@@ -226,7 +237,7 @@ pub fn task_submit_send(pool: *TaskPool, task: *Task, len: i32) -> i32
 # ============================================================================
 
 # Submit recv using pool from task.user_data
-pub fn task_recv(task: *Task) -> i32
+pub fn task_recv(task: *Task) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_recv(pool, task)
 
@@ -240,19 +251,19 @@ pub fn task_recv(task: *Task) -> i32
 # The KernelTimespec MUST live until the CQE fires.  Pass a pointer
 # into stable storage (a Task field, a static, or the task's own
 # read/write buf) — not a stack temporary.
-pub fn task_submit_timeout(pool: *TaskPool, task: *Task, ts: *KernelTimespec) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_timeout(pool: *TaskPool, task: *Task, ts: *KernelTimespec) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     # count=0, flags=0 means "fire after the relative duration in ts".
     uring_prep_timeout(sqe, ts, 0, 0, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
 # Submit timeout using pool from task.user_data
-pub fn task_timeout(task: *Task, ts: *KernelTimespec) -> i32
+pub fn task_timeout(task: *Task, ts: *KernelTimespec) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_timeout(pool, task, ts)
 
@@ -271,25 +282,25 @@ pub fn task_timeout(task: *Task, ts: *KernelTimespec) -> i32
 # Cost: tight polling loop while the task is "yielded" — but cheaper
 # than blocking the whole io_uring loop on a futex_wait syscall, and it
 # allows N concurrent tasks to actually overlap their async work.
-pub fn task_submit_nop(pool: *TaskPool, task: *Task) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_nop(pool: *TaskPool, task: *Task) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     uring_prep_nop(sqe, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # Submit NOP using pool from task.user_data
-pub fn task_yield(task: *Task) -> i32
+pub fn task_yield(task: *Task) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_nop(pool, task)
 
 
 # Submit send using pool from task.user_data
-pub fn task_send(task: *Task, len: i32) -> i32
+pub fn task_send(task: *Task, len: i32) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_send(pool, task, len)
 
@@ -300,59 +311,59 @@ pub fn task_send(task: *Task, len: i32) -> i32
 # The buffer MUST stay valid until the CQE arrives.  Returns 0 or -errno.
 # The _submit_ form takes the pool explicitly, for handlers that keep
 # their own state in task.user_data (tome, valet's TLS path).
-pub fn task_submit_send_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_send_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
     uring_prep_send(sqe, task.fd, buf, len as u64, 0, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
-pub fn task_send_buf(task: *Task, buf: *u8, len: i32) -> i32
+pub fn task_send_buf(task: *Task, buf: *u8, len: i32) -> bool
     return task_submit_send_buf(task.user_data as *TaskPool, task, buf, len)
 
 
 # Submit an async recv of up to `len` bytes into an external buffer (for
 # requests that outgrow task.read_buf).  The buffer MUST stay valid until
 # the CQE arrives.  Returns 0 or -errno.
-pub fn task_submit_recv_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_recv_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
     uring_prep_recv(sqe, task.fd, buf, len as u64, 0, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
-pub fn task_recv_buf(task: *Task, buf: *u8, len: i32) -> i32
+pub fn task_recv_buf(task: *Task, buf: *u8, len: i32) -> bool
     return task_submit_recv_buf(task.user_data as *TaskPool, task, buf, len)
 
 
 # Submit an async vectored send for a task
 # iov points to an array of Iovec structs, iovcnt is the count
 # Returns 0 on success
-pub fn task_submit_sendv(pool: *TaskPool, task: *Task, iov: *u8, iovcnt: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_sendv(pool: *TaskPool, task: *Task, iov: *u8, iovcnt: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     # Use writev with offset=-1 to indicate no seek (for sockets)
     uring_prep_writev(sqe, task.fd, iov, iovcnt, -1, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # Submit vectored send using pool from task.user_data
-pub fn task_sendv(task: *Task, iov: *u8, iovcnt: i32) -> i32
+pub fn task_sendv(task: *Task, iov: *u8, iovcnt: i32) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_sendv(pool, task, iov, iovcnt)
 
 
 # Submit vectored send using the task's built-in IoVecBuilder
 # Call this after building a response in task.iov_builder
-pub fn task_sendv_builder(task: *Task) -> i32
+pub fn task_sendv_builder(task: *Task) -> bool
     let pool = task.user_data as *TaskPool
     let iov = iovec_ptr(@task.iov_builder) as *u8
     let cnt = iovec_count(@task.iov_builder)
@@ -373,21 +384,21 @@ pub fn task_sendv_builder(task: *Task) -> i32
 # Submit an async zero-copy send for a task
 # Uses the task's write_buf, which must remain valid until completion
 # Returns 0 on success, negative errno on failure
-pub fn task_submit_send_zc(pool: *TaskPool, task: *Task, len: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_send_zc(pool: *TaskPool, task: *Task, len: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     task.write_len = len
     task.write_pos = 0
     uring_prep_send_zc(sqe, task.fd, @task.write_buf[0], len as u64, 0, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # Submit zero-copy send using pool from task.user_data
-pub fn task_send_zc(task: *Task, len: i32) -> i32
+pub fn task_send_zc(task: *Task, len: i32) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_send_zc(pool, task, len)
 
@@ -396,19 +407,19 @@ pub fn task_send_zc(task: *Task, len: i32) -> i32
 # CAUTION: The buffer MUST remain valid until CQE is received!
 # Use this for sending data that's already in a stable location
 # (e.g., static .rodata strings, mmap'd files, pre-allocated pools)
-pub fn task_submit_send_zc_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_send_zc_buf(pool: *TaskPool, task: *Task, buf: *u8, len: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     uring_prep_send_zc(sqe, task.fd, buf, len as u64, 0, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # Zero-copy send from external buffer (simplified API)
-pub fn task_send_zc_buf(task: *Task, buf: *u8, len: i32) -> i32
+pub fn task_send_zc_buf(task: *Task, buf: *u8, len: i32) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_send_zc_buf(pool, task, buf, len)
 
@@ -426,28 +437,28 @@ pub fn task_send_zc_buf(task: *Task, buf: *u8, len: i32) -> i32
 # off_in: offset in source file (-1 to use and update file position)
 # len: number of bytes to transfer
 # Returns 0 on success, negative errno on failure
-pub fn task_submit_splice(pool: *TaskPool, task: *Task, fd_out: i32, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> i32
-    let sqe = uring_get_sqe(pool.ring)
-    if sqe == null
-        return -12  # ENOMEM
+pub fn task_submit_splice(pool: *TaskPool, task: *Task, fd_out: i32, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(pool.ring)
+        Some(p) => p
+        None => return false
 
     # For sockets, off_out should be -1 (non-seekable)
     uring_prep_splice(sqe, fd_out, -1, fd_in, off_in, len, splice_flags, task.id)
     uring_sqe_submit(pool.ring)
     task.state = TASK_WAITING
-    return 0
+    return true
 
 
 # Submit splice using pool from task.user_data
 # Transfers len bytes from fd_in at off_in to task's socket (task.fd)
-pub fn task_splice(task: *Task, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> i32
+pub fn task_splice(task: *Task, fd_in: i32, off_in: i64, len: u32, splice_flags: i32) -> bool
     let pool = task.user_data as *TaskPool
     return task_submit_splice(pool, task, task.fd, fd_in, off_in, len, splice_flags)
 
 
 # Reset task state for keep-alive (after send completes, prepare for next recv)
 # This properly handles the task state so it will poll and submit a new recv
-pub fn task_reset_for_recv(task: *Task) -> i32
+pub fn task_reset_for_recv(task: *Task) -> bool
     let pool = task.user_data as *TaskPool
 
     # Reset state for next request
@@ -494,16 +505,12 @@ pub fn run_tasks(pool: *TaskPool) -> i32
 
         # Process all available CQEs
         loop
-            let cqe = uring_peek_cqe(pool.ring)
-            if cqe == null
-                break
+            let cqe: *IoUringCqe = match uring_peek_cqe(pool.ring)
+                Some(p) => p
+                None => break
 
             # Find the task and wake it
-            let task_id = cqe.user_data
-            let task = task_pool_find(pool, task_id)
-            if task != null
-                task.io_result = cqe.res
-                task.state = TASK_READY
+            task_pool_wake(pool, cqe.user_data, cqe.res)
 
             uring_cqe_seen(pool.ring, cqe)
 
@@ -599,9 +606,10 @@ pub fn task_server_destroy(srv: *TaskServer)
     uring_destroy(@srv.ring)
 
 
-# Create a TaskServer on the heap (too large for stack - ~4.5MB)
-# Returns null on allocation failure
-pub fn task_server_create(listen_fd: i32) -> *TaskServer
+# Allocate and initialise a TaskServer (~5MB, too large for the stack).  A raw
+# pointer, null on allocation or init failure; private to the boundary, so the
+# public constructor can report the same failure as None.
+fn task_server_alloc(listen_fd: i32) -> *TaskServer
     # TaskServer is large due to TaskPool containing arrays
     # Allocate via mmap
     let size: i64 = 5 * 1024 * 1024  # 5MB to be safe
@@ -620,6 +628,14 @@ pub fn task_server_create(listen_fd: i32) -> *TaskServer
     return srv
 
 
+# Create a TaskServer on the heap.  None on allocation or init failure.
+pub fn task_server_create(listen_fd: i32) -> Option<*TaskServer>
+    let srv: *TaskServer = task_server_alloc(listen_fd)
+    if srv == null
+        return None
+    return Some(srv)
+
+
 # Free a heap-allocated TaskServer
 pub fn task_server_free(srv: *TaskServer)
     if srv == null
@@ -630,26 +646,26 @@ pub fn task_server_free(srv: *TaskServer)
 
 
 # Submit an accept SQE
-pub fn task_server_submit_accept(srv: *TaskServer) -> i32
-    let sqe = uring_get_sqe(@srv.ring)
-    if sqe == null
-        return -12
+pub fn task_server_submit_accept(srv: *TaskServer) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+        Some(p) => p
+        None => return false
 
     uring_prep_accept(sqe, srv.listen_fd, null, null, 0, srv.accept_user_data)
     uring_sqe_submit(@srv.ring)  # Advance the SQ tail
-    return 0
+    return true
 
 
 # Submit a multishot accept SQE (kernel 5.19+)
 # Only needs to be submitted once - generates continuous CQEs for new connections
-pub fn task_server_submit_accept_multishot(srv: *TaskServer) -> i32
-    let sqe = uring_get_sqe(@srv.ring)
-    if sqe == null
-        return -12
+pub fn task_server_submit_accept_multishot(srv: *TaskServer) -> bool
+    let sqe: *IoUringSqe = match uring_get_sqe(@srv.ring)
+        Some(p) => p
+        None => return false
 
     uring_prep_accept_multishot(sqe, srv.listen_fd, null, null, 0, srv.accept_user_data)
     uring_sqe_submit(@srv.ring)
-    return 0
+    return true
 
 
 # ============================================================================
@@ -677,19 +693,20 @@ pub fn task_server_handle_accept(srv: *TaskServer, client_fd: i32, handler: fn(*
 
     # Set TCP_NODELAY for low latency
     set_nodelay(client_fd)
-    let spawn_ret = spawn_task(@srv.pool, client_fd, handler)
-    if spawn_ret < 0
+    let spawned = spawn_task(@srv.pool, client_fd, handler)
+    if not spawned
         # Pool full, close connection
         sys_close(client_fd)
 
 
 # Wake a task with an I/O result
 pub fn task_server_wake_task(srv: *TaskServer, task_id: i64, result: i32)
-    let task = task_pool_find(@srv.pool, task_id)
-    if task != null
-        task.io_result = result
-        task.state = TASK_READY
-        task.last_activity = get_current_time()  # Update activity timestamp
+    let task: *Task = match task_pool_find(@srv.pool, task_id)
+        Some(t) => t
+        None => return
+    task.io_result = result
+    task.state = TASK_READY
+    task.last_activity = get_current_time()  # Update activity timestamp
 
 
 # Check for idle connections and close them
@@ -755,9 +772,9 @@ pub fn task_server_run(srv: *TaskServer, handler: fn(*Task) -> i32) -> i32
 
         # Process all CQEs
         loop
-            let cqe = uring_peek_cqe(@srv.ring)
-            if cqe == null
-                break
+            let cqe: *IoUringCqe = match uring_peek_cqe(@srv.ring)
+                Some(p) => p
+                None => break
 
             let user_data = cqe.user_data
             let cqe_res = cqe.res
@@ -814,9 +831,9 @@ pub fn task_server_run_multishot(srv: *TaskServer, handler: fn(*Task) -> i32) ->
 
         # Process all CQEs
         loop
-            let cqe = uring_peek_cqe(@srv.ring)
-            if cqe == null
-                break
+            let cqe: *IoUringCqe = match uring_peek_cqe(@srv.ring)
+                Some(p) => p
+                None => break
 
             let user_data = cqe.user_data
             let cqe_res = cqe.res

@@ -16,6 +16,7 @@
 import ritzlib.memory
 import ritzlib.drop
 import ritzlib.str
+import ritzlib.option
 
 # ============================================================================
 # Vec<T> - Generic Dynamic Array
@@ -141,31 +142,31 @@ pub fn vec_is_empty<T>(v: @Vec<T>) -> i32
 # has bytes, so nothing is ever read or written there; it is never freed.
 const VEC_ZST_DANGLING: i64 = 1
 
-# Grow the Vec to a new capacity.
-pub fn vec_grow<T>(v: @&Vec<T>, new_cap: i64) -> i32
+# Grow the Vec to a new capacity.  true when the Vec has the capacity.
+pub fn vec_grow<T>(v: @&Vec<T>, new_cap: i64) -> bool
     if new_cap <= v.cap
-        return 0
+        return true
 
     # A zero-size element needs no storage: realloc of 0 bytes is null, which
     # would read as failure (AGAST #2965).  Set cap, keep data non-null.
     if sizeof(T) == 0
         v.data = VEC_ZST_DANGLING as *T
         v.cap = new_cap
-        return 0
+        return true
 
     let new_size: i64 = new_cap * sizeof(T)
     let new_data: *u8 = realloc(v.data as *u8, new_size)
     if new_data == null
-        return -1
+        return false
 
     v.data = new_data as *T
     v.cap = new_cap
-    return 0
+    return true
 
-# Ensure the Vec has at least the given capacity.
-pub fn vec_ensure_cap<T>(v: @&Vec<T>, needed: i64) -> i32
+# Ensure the Vec has at least the given capacity.  true on success.
+pub fn vec_ensure_cap<T>(v: @&Vec<T>, needed: i64) -> bool
     if v.cap >= needed
-        return 0
+        return true
 
     var new_cap: i64 = v.cap
     if new_cap == 0
@@ -179,13 +180,14 @@ pub fn vec_ensure_cap<T>(v: @&Vec<T>, needed: i64) -> i32
 # Element Access
 # ============================================================================
 
-# Push an element onto the end of the Vec.
-pub fn vec_push<T>(v: @&Vec<T>, item: T) -> i32
-    if vec_ensure_cap<T>(v, v.len + 1) != 0
-        return -1
+# Push an element onto the end of the Vec.  true when it was appended (false
+# only when the growth allocation fails; OOM is not recoverable here).
+pub fn vec_push<T>(v: @&Vec<T>, item: T) -> bool
+    if not vec_ensure_cap<T>(v, v.len + 1)
+        return false
     *(v.data + v.len) = item
     v.len = v.len + 1
-    return 0
+    return true
 
 # Pop the last element from the Vec.
 # Returns the element. Caller must ensure vec is not empty!
@@ -269,42 +271,43 @@ pub fn vec_clone<T>(v: @Vec<T>) -> Vec<T>
 # These functions provide convenient byte-level operations on Vec<u8>.
 
 # Push multiple bytes from a pointer.
-pub fn vec_push_bytes<T>(v: @&Vec<T>, data: *T, len: i64) -> i32
+pub fn vec_push_bytes<T>(v: @&Vec<T>, data: *T, len: i64) -> bool
     for i in 0..len
-        if vec_push<T>(v, *(data + i)) != 0
-            return -1
-    return 0
+        if not vec_push<T>(v, *(data + i))
+            return false
+    return true
 
 # Push a null-terminated string (excluding the null terminator).
-pub fn vec_push_str(v: @&Vec<u8>, s: *u8) -> i32
+pub fn vec_push_str(v: @&Vec<u8>, s: *u8) -> bool
     var i: i64 = 0
     while *(s + i) != 0
-        if vec_push<u8>(v, *(s + i)) != 0
-            return -1
+        if not vec_push<u8>(v, *(s + i))
+            return false
         i += 1
-    return 0
+    return true
 
 # Get a null-terminated string view of the Vec contents.
-# Appends a null terminator (doesn't count in len) and returns the data pointer.
-pub fn vec_as_str(v: @&Vec<u8>) -> *u8
+# Appends a null terminator (doesn't count in len) and returns the data
+# pointer, or None if the terminator's capacity cannot be allocated.
+pub fn vec_as_str(v: @&Vec<u8>) -> Option<*u8>
     # Ensure there's room for null terminator
-    if vec_ensure_cap<u8>(v, v.len + 1) != 0
-        return null
+    if not vec_ensure_cap<u8>(v, v.len + 1)
+        return None
     # Add null terminator without increasing len
     *(v.data + v.len) = 0
-    return v.data
+    return Some(v.data)
 
 # Swap two elements at indices i and j.
 # Returns 0 on success, -1 if indices out of bounds.
-pub fn vec_swap<T>(v: @&Vec<T>, i: i64, j: i64) -> i32
+pub fn vec_swap<T>(v: @&Vec<T>, i: i64, j: i64) -> bool
     if i < 0 or i >= v.len or j < 0 or j >= v.len
-        return -1
+        return false
     if i == j
-        return 0
+        return true
     let tmp: T = *(v.data + i)
     *(v.data + i) = *(v.data + j)
     *(v.data + j) = tmp
-    return 0
+    return true
 
 # ============================================================================
 # Methods: `v.len()`, `v.push(x)`, ... (LARB R66, #3495/#4231)
@@ -324,7 +327,7 @@ impl<T> Vec<T>
     pub fn is_empty(self: @Vec<T>) -> i32
         return vec_is_empty<T>(self)
 
-    pub fn push(self: @&Vec<T>, item: T) -> i32
+    pub fn push(self: @&Vec<T>, item: T) -> bool
         return vec_push<T>(self, item)
 
     pub fn pop(self: @&Vec<T>) -> T
@@ -357,11 +360,11 @@ impl<T> Vec<T>
     pub fn clone(self: @Vec<T>) -> Vec<T>
         return vec_clone<T>(self)
 
-    pub fn swap(self: @&Vec<T>, i: i64, j: i64) -> i32
+    pub fn swap(self: @&Vec<T>, i: i64, j: i64) -> bool
         return vec_swap<T>(self, i, j)
 
     # A print-to-a-Vec sink lowers to `sink.push_bytes(data, len)`.
-    pub fn push_bytes(self: @&Vec<T>, data: *T, len: i64) -> i32
+    pub fn push_bytes(self: @&Vec<T>, data: *T, len: i64) -> bool
         return vec_push_bytes<T>(self, data, len)
 
 # ============================================================================
@@ -381,7 +384,7 @@ struct LineBounds
 
 # Scan a Vec<u8> and record line boundaries into a Vec<LineBounds>.
 # Each line includes its trailing newline (if present).
-pub fn vec_find_lines(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> i32
+pub fn vec_find_lines(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> bool
     var line_start: i64 = 0
     var i: i64 = 0
 
@@ -390,8 +393,8 @@ pub fn vec_find_lines(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> i32
             var bounds: LineBounds
             bounds.start = line_start
             bounds.length = i - line_start + 1
-            if vec_push<LineBounds>(lines, bounds) != 0
-                return -1
+            if not vec_push<LineBounds>(lines, bounds)
+                return false
             line_start = i + 1
         i += 1
 
@@ -400,7 +403,7 @@ pub fn vec_find_lines(buf: @Vec<u8>, lines: @&Vec<LineBounds>) -> i32
         var bounds: LineBounds
         bounds.start = line_start
         bounds.length = buf.len - line_start
-        if vec_push<LineBounds>(lines, bounds) != 0
-            return -1
+        if not vec_push<LineBounds>(lines, bounds)
+            return false
 
-    return 0
+    return true

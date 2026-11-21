@@ -103,15 +103,15 @@ get(0): 120
 get(12): 57
 get(13) (out of range): 0
 get(-1) (out of range): 0
-ensure_cap(64): 0
+ensure_cap(64): 1
   -> len=13 cap=64 empty=0
-ensure_cap(65): 0
+ensure_cap(65): 1
   -> len=13 cap=128 empty=0
-ensure_cap(300): 0
+ensure_cap(300): 1
   -> len=13 cap=512 empty=0
-grow(100) (smaller): 0
+grow(100) (smaller): 1
   -> len=13 cap=512 empty=0
-grow(1000): 0
+grow(1000): 1
   -> len=13 cap=1000 empty=0
 contents kept: [xyz0123456789] (13)
 +1000 bytes: len=1013 cap=2000 empty=0

@@ -492,7 +492,7 @@ pub fn main() -> i32
     let bad: StrView = "3x"
     var q: Option<i64> = bad.parse_i64()
     var b: Vec<u8> = vec_new<u8>()
-    if b.push_bytes(c"abc", 3) != 0
+    if not b.push_bytes(c"abc", 3)
         return 1
     (r.unwrap_or(0) + q.unwrap_or(2) + b.len()) as i32
 """
