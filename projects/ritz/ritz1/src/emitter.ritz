@@ -18,6 +18,7 @@ import types           # the one primitive type table (AGAST #1889)
 import ast_helpers   # is_enum_type (AGAST #1660)
 import tokens_gen
 import emitter_core
+import emitter_ir
 import emitter_expr
 import emitter_stmt
 import ll_copy_scan   # AGAST #1732
@@ -109,15 +110,15 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
         # fn (an arm `q` with `q: *C`), or a `ptr` in a `-> *T` / `-> @T` one.
         if ival > 0 and ret_type == TYPE_MUT_REF and s.last_expr_model == LAST_EXPR_I64
             let p: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, p)
-            emit_str(s, c" = inttoptr i64 ")
+            emit_str(s, IR_INTTOPTR)
             emit_reg(s, ival)
             emit_str(s, c" to ptr  ; #2950\n")
             ival = p
         else if ival > 0 and (ret_type == TYPE_PTR or ret_type == TYPE_REF) and s.last_expr_model == LAST_EXPR_PTR
             let q: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, q)
             emit_str(s, c" = ptrtoint ptr ")
             emit_reg(s, ival)
@@ -129,49 +130,29 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
                 # value (an `if` / `match` arm's, say) is no `[N x T]`.
                 emit_ir_error(s, tail, c"a `-> [N]T` fn's value here is not lowered by ritz1 (return the array from each arm)")
             else if ty_int_bits(ret_type) == 32
-                let trunc: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, trunc)
-                emit_str(s, c" = trunc i64 ")
-                emit_reg(s, ival)
-                emit_str(s, c" to i32\n")
+                let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, ival)
                 emit_str(s, c"  ret i32 ")
                 emit_reg(s, trunc)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
             else if ret_type == TYPE_BOOL
                 # Match arms / binops carry their result as i64 even when the
                 # function signature is bool; trunc back to i1 at the implicit
                 # return (mirrors the explicit-return path at line ~195).
-                let btrunc: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, btrunc)
-                emit_str(s, c" = trunc i64 ")
-                emit_reg(s, ival)
-                emit_str(s, c" to i1\n")
+                let btrunc: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, ival)
                 emit_str(s, c"  ret i1 ")
                 emit_reg(s, btrunc)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
             else if ty_int_bits(ret_type) == 8
                 # Narrow byte return — expressions carry i64; trunc down.
-                let btrunc8: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, btrunc8)
-                emit_str(s, c" = trunc i64 ")
-                emit_reg(s, ival)
-                emit_str(s, c" to i8\n")
+                let btrunc8: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, ival)
                 emit_str(s, c"  ret i8 ")
                 emit_reg(s, btrunc8)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
             else if ty_int_bits(ret_type) == 16
-                let btrunc16: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, btrunc16)
-                emit_str(s, c" = trunc i64 ")
-                emit_reg(s, ival)
-                emit_str(s, c" to i16\n")
+                let btrunc16: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, ival)
                 emit_str(s, c"  ret i16 ")
                 emit_reg(s, btrunc16)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
             else if named_struct == 1 and s.ret_sret == 1
                 emit_sret_ret_value(s, ival)   # AGAST #1730
             else if named_struct == 1
@@ -180,15 +161,15 @@ fn emit_implicit_return_tail(s: *EmitterState, has_explicit_return: i32, ret_typ
                 # carries `%Result$...` but the ret claims `i64`.
                 emit_str(s, c"  ret ")
                 emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (ret_type_name), len: (ret_type_name_len) as i64 })
-                emit_str(s, c" ")
+                emit_str(s, IR_SP)
                 emit_reg(s, ival)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
             else
                 emit_str(s, c"  ret ")
                 emit_str(s, ty_value_llvm(ret_type))
-                emit_str(s, c" ")
+                emit_str(s, IR_SP)
                 emit_reg(s, ival)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
         else
             # No value here, and this block is dead.  Sema's tail_value_check (AGAST
             # #2236) rejected every fn the rule says ends without one, and the
@@ -372,9 +353,9 @@ fn mark_lent_param(s: *EmitterState, param: *Param)
 # Load a borrow param's pointer, spilled to `alloca_reg`, once at entry.
 fn emit_borrow_slot_load(s: *EmitterState, alloca_reg: i32) -> i32
     let slot: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, slot)
-    emit_str(s, c" = load ptr, ptr ")
+    emit_str(s, IR_LOAD_PTR)
     emit_reg(s, alloca_reg)
     emit_str(s, c"  ; #1644 scalar borrow\n")
     return slot
@@ -390,7 +371,7 @@ fn bind_byval_param(s: *EmitterState, param: *Param) -> i32
     if param_uses_byval(s, param) == 0
         return 0
     let slot: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, slot)
     emit_str(s, c" = getelementptr i8, ptr %")
     emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
@@ -409,14 +390,14 @@ fn bind_array_param(s: *EmitterState, param: *Param) -> i32
     if param.param_type != TYPE_ARRAY
         return 0
     let slot: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, slot)
     if array_param_uses_byval(s, param) == 1
         emit_str(s, c" = getelementptr i8, ptr %")
         emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
         emit_str(s, c".arg, i64 0  ; #2306 byval array param\n")
     else
-        emit_str(s, c" = alloca ")
+        emit_str(s, IR_ALLOCA)
         emit_array_value_llvm_type(s, param)
         emit_str(s, c"\n  store ")
         emit_array_value_llvm_type(s, param)
@@ -424,7 +405,7 @@ fn bind_array_param(s: *EmitterState, param: *Param) -> i32
         emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
         emit_str(s, c".arg, ptr ")
         emit_reg(s, slot)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
     add_local_full(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, slot, TYPE_ARRAY, StrView { ptr: (param.param_type_name), len: (param.param_type_name_len) as i64 }, TYPE_I64, param.param_array_size, param.param_array_elem_type)
     let arr: *LocalVar = find_local_struct_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
     arr.array_elem_pointee = param.param_array_elem_pointee   # AGAST #2343
@@ -442,20 +423,20 @@ fn bind_array_param(s: *EmitterState, param: *Param) -> i32
 # `icmp ne i64` it, and bool call args / bool returns `trunc` it back to i1.
 fn emit_bool_param_spill(s: *EmitterState, param: *Param)
     let alloca_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, alloca_reg)
     emit_str(s, c" = alloca i64\n")
     let wide: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, wide)
     emit_str(s, c" = zext i1 %")
     emit_name(s, StrView { ptr: (param.name), len: (param.name_len) as i64 })
     emit_str(s, c".arg to i64\n")
     emit_str(s, c"  store i64 ")
     emit_reg(s, wide)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, alloca_reg)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     add_local(s, StrView { ptr: (param.name), len: (param.name_len) as i64 }, alloca_reg, TYPE_I64)
     # AGAST #1521: the slot is i64, but print interpolation must still see a
     # bool (`print("{b}")` prints true/false), the same as emit_var_decl's
@@ -568,11 +549,11 @@ fn try_emit_large_copy(s: *EmitterState, base: *u8, line_sv: StrView) -> i32
         return 0
     emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
     emit_name(s, StrView { ptr: (line + cp.dst_off), len: (cp.dst_len as i32) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_name(s, StrView { ptr: (cp.src), len: (cp.src_len as i32) as i64 })
-    emit_str(s, c", ")
+    emit_str(s, IR_COMMA)
     emit_sret_size(s, StrView { ptr: (tname), len: (tlen) as i64 })
-    emit_str(s, c")\n")
+    emit_str(s, IR_CLOSE)
     s.sret_helpers_used = 1
     1
 
@@ -1027,7 +1008,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
         first2 = 0
     while param2 != null
         if first2 == 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         first2 = 0
         emit_param_llvm_type(s, param2)   # AGAST #1739: large struct -> ptr byval
         emit_str(s, c" %")
@@ -1073,18 +1054,18 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             param3 = param3.next
             continue
         let alloca_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, alloca_reg)
-        emit_str(s, c" = alloca ")
+        emit_str(s, IR_ALLOCA)
         emit_llvm_type_struct(s, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })
-        emit_str(s, c"\n")
-        emit_str(s, c"  store ")
+        emit_str(s, IR_NL)
+        emit_str(s, IR_STORE_IND)
         emit_llvm_type_struct(s, param3.param_type, StrView { ptr: (param3.param_type_name), len: (param3.param_type_name_len) as i64 })
         emit_str(s, c" %")
         emit_name(s, StrView { ptr: (param3.name), len: (param3.name_len) as i64 })
         emit_str(s, c".arg, ptr ")
         emit_reg(s, alloca_reg)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         # Track parameter type including struct name for method calls
         # For pointer-to-struct params like *Vec<u8>, we need both:
         # - param_pointee_type (TYPE_STRUCT) to know it's a pointer to struct
@@ -1138,29 +1119,29 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
             else if stmt.expr.kind == EXPR_STRUCT_LIT and f.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, alloca_reg)
-                emit_str(s, c" = alloca %")
+                emit_str(s, IR_ALLOCA_NAMED)
                 emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 emit_struct_lit_to_alloca(s, stmt.expr, alloca_reg)
                 if s.ret_sret == 1
                     emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
                 else
                     # Load the struct value and return it
                     let val: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, val)
-                    emit_str(s, c" = load %")
+                    emit_str(s, IR_LOAD_NAMED)
                     emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, alloca_reg)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     emit_str(s, c"  ret %")
                     emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
-                    emit_str(s, c" ")
+                    emit_str(s, IR_SP)
                     emit_reg(s, val)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
             else if f.return_type == TYPE_STRUCT
                 # Struct return — handle ident (load from alloca) or call result.
                 # Use emit_llvm_type_struct so tagged-enum types (Result$/Option$)
@@ -1174,13 +1155,13 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     else if local != null
                         let loc: i32 = find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
                         let val: i32 = next_reg(s)
-                        emit_str(s, c"  ")
+                        emit_str(s, IR_INDENT)
                         emit_reg(s, val)
-                        emit_str(s, c" = load ")
+                        emit_str(s, IR_LOAD)
                         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
-                        emit_str(s, c", ptr ")
+                        emit_str(s, IR_PTR_SEP)
                         emit_reg(s, loc)
-                        emit_str(s, c"\n")
+                        emit_str(s, IR_NL)
                         # AGAST #3564: a tail `v` for `let v = "..."` loads a
                         # %Span$u8; a `-> StrView` fn returns it as a %StrView.
                         var ret_name: *u8 = local.type_name
@@ -1192,18 +1173,18 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                             ret_name_len = s.ret_type_name_len
                         emit_str(s, c"  ret ")
                         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (ret_name), len: (ret_name_len) as i64 })
-                        emit_str(s, c" ")
+                        emit_str(s, IR_SP)
                         emit_reg(s, ret_val)
-                        emit_str(s, c"\n")
+                        emit_str(s, IR_NL)
                     else if s.ret_sret == 1
                         emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TYPE_STRUCT))   # AGAST #1730
                     else
                         let val: i32 = emit_struct_copy(s, stmt.expr, TYPE_STRUCT)
                         emit_str(s, c"  ret ")
                         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
-                        emit_str(s, c" ")
+                        emit_str(s, IR_SP)
                         emit_reg(s, val)
-                        emit_str(s, c"\n")
+                        emit_str(s, IR_NL)
                 else if s.ret_sret == 1
                     emit_sret_ret_value(s, emit_struct_copy(s, stmt.expr, TYPE_STRUCT))   # AGAST #1730
                 else
@@ -1214,9 +1195,9 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
                     emit_str(s, c"  ret ")
                     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
-                    emit_str(s, c" ")
+                    emit_str(s, IR_SP)
                     emit_reg(s, ret_reg)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
             else
                 # AGAST #1652: a tail `s` (`s: @&S`) from a `-> *S` fn is a `ptr`.
                 # (`let`, not `var` + reassign: ritz0 mis-scopes a `var` that
@@ -1229,56 +1210,36 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                 # AGAST #2074: a `1.0` tail in an `-> f32` fn is fptrunc'd.
                 let val: i32 = float_ret_value(s, tail_ptr, f.return_type, stmt.expr)
                 if ty_int_bits(f.return_type) == 32
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i32\n")
+                    let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i32 ")
                     emit_reg(s, trunc)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if f.return_type == TYPE_BOOL
                     # Comparisons zext to i64; trunc back for bool returns.
                     # (task-99 cluster #1)
-                    let btrunc: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, btrunc)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i1\n")
+                    let btrunc: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i1 ")
                     emit_reg(s, btrunc)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if ty_int_bits(f.return_type) == 8
                     # Narrow byte return
-                    let btrunc8: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, btrunc8)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i8\n")
+                    let btrunc8: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i8 ")
                     emit_reg(s, btrunc8)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if ty_int_bits(f.return_type) == 16
-                    let btrunc16: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, btrunc16)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i16\n")
+                    let btrunc16: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i16 ")
                     emit_reg(s, btrunc16)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if f.return_type == 0
                     emit_str(s, c"  ret void\n")
                 else
                     emit_str(s, c"  ret ")
                     emit_str(s, ty_value_llvm(f.return_type))
-                    emit_str(s, c" ")
+                    emit_str(s, IR_SP)
                     emit_reg(s, val)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
         else
             # AGAST #2823: only the LAST statement decides.  A `return` followed
             # by dead code (an `if` that returns, say) leaves the final block
@@ -1409,7 +1370,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         first = 0
     while param != null
         if first == 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         first = 0
         # A lent `self` (task-99 cluster #1): callers pass the receiver as
         # `ptr <reg>`.  A by-value one is a by-value param (AGAST #2393).
@@ -1455,15 +1416,15 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             param2 = param2.next
             continue
         let alloca_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, alloca_reg)
-        emit_str(s, c" = alloca ")
+        emit_str(s, IR_ALLOCA)
         if p2_self_ptr == 1
             emit_str(s, c"ptr")
         else
             emit_llvm_type_struct(s, param2.param_type, StrView { ptr: (param2.param_type_name), len: (param2.param_type_name_len) as i64 })
-        emit_str(s, c"\n")
-        emit_str(s, c"  store ")
+        emit_str(s, IR_NL)
+        emit_str(s, IR_STORE_IND)
         if p2_self_ptr == 1
             emit_str(s, c"ptr")
         else
@@ -1472,7 +1433,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
         emit_name(s, StrView { ptr: (param2.name), len: (param2.name_len) as i64 })
         emit_str(s, c".arg, ptr ")
         emit_reg(s, alloca_reg)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         # Track parameter type including struct name for method calls
         if p2_is_self == 0 and bind_scalar_borrow_param(s, param2, alloca_reg) == 1
             param2 = param2.next
@@ -1548,29 +1509,29 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
             else if stmt.expr.kind == EXPR_STRUCT_LIT and method.return_type == TYPE_STRUCT
                 # Allocate space for the struct, initialize fields, load and return
                 let alloca_reg: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, alloca_reg)
-                emit_str(s, c" = alloca %")
+                emit_str(s, IR_ALLOCA_NAMED)
                 emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 emit_struct_lit_to_alloca(s, stmt.expr, alloca_reg)
                 if s.ret_sret == 1
                     emit_sret_ret_from_ptr(s, alloca_reg)   # AGAST #1730
                 else
                     # Load the struct value and return it
                     let val: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, val)
-                    emit_str(s, c" = load %")
+                    emit_str(s, IR_LOAD_NAMED)
                     emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, alloca_reg)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     emit_str(s, c"  ret %")
                     emit_name(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
-                    emit_str(s, c" ")
+                    emit_str(s, IR_SP)
                     emit_reg(s, val)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
             else
                 # AGAST #1652: a tail `s` (`s: @&S`) from a `-> *S` fn is a `ptr`.
                 # (`let`, not `var` + reassign: ritz0 mis-scopes a `var` that
@@ -1583,47 +1544,27 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                 # AGAST #2074: a `1.0` tail in an `-> f32` method is fptrunc'd.
                 let val: i32 = float_ret_value(s, tail_ptr, method.return_type, stmt.expr)
                 if ty_int_bits(method.return_type) == 32
-                    let trunc: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, trunc)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i32\n")
+                    let trunc: i32 = ir_trunc_i64_i32(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i32 ")
                     emit_reg(s, trunc)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if method.return_type == TYPE_BOOL
                     # Comparisons zext to i64 in emit_binary; trunc back to
                     # i1 for bool-returning methods. (task-99 cluster #1)
-                    let btrunc: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, btrunc)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i1\n")
+                    let btrunc: i32 = ir_trunc_i64_i1(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i1 ")
                     emit_reg(s, btrunc)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if ty_int_bits(method.return_type) == 8
-                    let btrunc8: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, btrunc8)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i8\n")
+                    let btrunc8: i32 = ir_trunc_i64_i8(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i8 ")
                     emit_reg(s, btrunc8)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if ty_int_bits(method.return_type) == 16
-                    let btrunc16: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, btrunc16)
-                    emit_str(s, c" = trunc i64 ")
-                    emit_reg(s, val)
-                    emit_str(s, c" to i16\n")
+                    let btrunc16: i32 = ir_trunc_i64_i16(s.out, @s.reg_counter, val)
                     emit_str(s, c"  ret i16 ")
                     emit_reg(s, btrunc16)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                 else if method.return_type == 0
                     emit_str(s, c"  ret void\n")
                 else if method_returns_named_struct(method) == 1
@@ -1645,51 +1586,41 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
                     let tail_is_local: i32 = (stmt.expr.kind == EXPR_IDENT and find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 }) >= 0) as i32
                     let tail_holds_ptr: i32 = (tail_is_local == 1 and struct_value_local(s, stmt.expr) == null) as i32
                     if tail_holds_ptr == 1 and s.ret_sret == 1
-                        let spp: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, spp)
-                        emit_str(s, c" = inttoptr i64 ")
-                        emit_reg(s, val)
-                        emit_str(s, c" to ptr\n")
+                        let spp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, val)
                         emit_sret_ret_from_ptr(s, spp)   # AGAST #1730
                     else if s.ret_sret == 1
                         emit_sret_ret_value(s, val)   # AGAST #1730
                     else if tail_holds_ptr == 1
-                        let pp: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, pp)
-                        emit_str(s, c" = inttoptr i64 ")
-                        emit_reg(s, val)
-                        emit_str(s, c" to ptr\n")
+                        let pp: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, val)
                         let sv: i32 = next_reg(s)
-                        emit_str(s, c"  ")
+                        emit_str(s, IR_INDENT)
                         emit_reg(s, sv)
-                        emit_str(s, c" = load %")
+                        emit_str(s, IR_LOAD_NAMED)
                         emit_name(s, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
-                        emit_str(s, c", ptr ")
+                        emit_str(s, IR_PTR_SEP)
                         emit_reg(s, pp)
-                        emit_str(s, c"\n")
+                        emit_str(s, IR_NL)
                         emit_str(s, c"  ret %")
                         emit_name(s, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
-                        emit_str(s, c" ")
+                        emit_str(s, IR_SP)
                         emit_reg(s, sv)
-                        emit_str(s, c"\n")
+                        emit_str(s, IR_NL)
                     else
                         # AGAST #1643: a tail `"..."` is a %Span$u8; coerce
                         # it to a %StrView return (same as emit_fn).
                         let ret_reg: i32 = coerce_struct_ret_value(s, stmt.expr, val, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
                         emit_str(s, c"  ret %")
                         emit_name(s, StrView { ptr: (method.return_type_name), len: (method.return_type_name_len) as i64 })
-                        emit_str(s, c" ")
+                        emit_str(s, IR_SP)
                         emit_reg(s, ret_reg)
-                        emit_str(s, c"\n")
+                        emit_str(s, IR_NL)
                 else
                     # AGAST #2565: typed as the `define` line types it.
                     emit_str(s, c"  ret ")
                     emit_method_ret_type(s, method)
-                    emit_str(s, c" ")
+                    emit_str(s, IR_SP)
                     emit_reg(s, val)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
         else
             # AGAST #2823: only the LAST statement decides.  A `return` followed
             # by dead code (an `if` that returns, say) leaves the final block
@@ -1977,7 +1908,7 @@ fn emit_concrete_extern_declare(s: *EmitterState, f: *FnDef, name_sv: StrView, i
     var p: *Param = f.params
     while p != null
         if first == 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         first = 0
         if is_method == 1 and param_self_is_ptr(p) == 1
             emit_str(s, c"ptr")
@@ -2034,7 +1965,7 @@ fn emit_extern_declarations(s: *EmitterState)
                 else if fn_def != null and fn_def.return_type == TYPE_STRUCT
                     emit_str(s, c"declare ")
                     emit_str(s, fn_callconv_kw(fn_def))
-                    emit_str(s, c"%")
+                    emit_str(s, IR_PCT)
                     emit_name(s, StrView { ptr: (fn_def.return_type_name), len: (fn_def.return_type_name_len) as i64 })
                     emit_str(s, c" @")
                     emit_name(s, StrView { ptr: (sym_name), len: (sym_len) as i64 })
@@ -2062,7 +1993,7 @@ fn emit_extern_declarations(s: *EmitterState)
                     emit_str(s, c"(...)")
                     emit_declare_attrs_nl(s)
     if namelist_count(@s.externs) > 0
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 # Returns 1 if every value-type struct dependency of `st` has already been
 # emitted, 0 otherwise.  Pointer fields (TYPE_PTR / TYPE_PTR_PTR) are not
 # dependencies — LLVM's opaque `ptr` lets us reference a forward-declared
@@ -2095,7 +2026,7 @@ fn struct_deps_satisfied(s: *EmitterState, st: *StructDef) -> i32
 # Emit a single `%Name = type { ... }` definition and mark it emitted.
 fn emit_one_struct_type(s: *EmitterState, st: *StructDef)
     mark_struct_emitted(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
-    emit_str(s, c"%")
+    emit_str(s, IR_PCT)
     emit_name(s, StrView { ptr: (st.name), len: (st.name_len) as i64 })
     # `[[packed]]` (AGAST #1847): an LLVM packed struct, no padding.
     let packed: i32 = struct_is_packed(st)
@@ -2108,7 +2039,7 @@ fn emit_one_struct_type(s: *EmitterState, st: *StructDef)
     var field: *StructField = st.fields
     while field != null
         if first == 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         first = 0
         emit_field_llvm_type(s, field)
         field = field.next
@@ -2161,7 +2092,7 @@ fn emit_struct_types(s: *EmitterState)
         emit_one_struct_type(s, st2)
         st2 = st2.next
 
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # Emit one `%Result$... = type { i8, [P x i8], [N x i8] }` decl (dedup via
 # emitted_structs) for the tagged-enum name at (name, len).  No-op when
@@ -2196,7 +2127,7 @@ fn emit_tagged_enum_decl_once(s: *EmitterState, name_sv: StrView)
     if was_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 }) == 1
         return
     mark_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"%")
+    emit_str(s, IR_PCT)
     emit_name(s, StrView { ptr: (name), len: (len) as i64 })
     # AGAST #1898: ritz0's layout, the pad field always present (field 2 is
     # the payload); see tagged_enum_layout in emitter_core.
@@ -2305,7 +2236,7 @@ fn emit_tagged_enum_types(s: *EmitterState)
                     emit_tagged_enum_decl_once(s, StrView { ptr: (vf.field_type_name), len: (vf.field_type_name_len) as i64 })
                     vf = vf.next
 
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # AGAST #2419: the enums the fn bodies named as they went, spliced in at `pos`.
 # Ahead of those bodies, not after: an `alloca` needs its type sized where the
@@ -2405,7 +2336,7 @@ fn emit_enum_fallback_decl(s: *EmitterState, name_sv: StrView)
                 return
             i = i + 1
     mark_struct_emitted(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c"%")
+    emit_str(s, IR_PCT)
     emit_name(s, StrView { ptr: (name), len: (len) as i64 })
     # AGAST #1797: a user enum with payload variants gets ritz0's layout
     # (emitter_core user_enum_layout); tag-only enums stay `{ i8 }`.
@@ -2502,7 +2433,7 @@ fn emit_enum_fallback_types(s: *EmitterState)
             emit_enum_fallback_decl(s, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
         g = g.next
 
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # =============================================================================
 # Global initializers (AGAST #1501)
@@ -2765,7 +2696,7 @@ fn global_init_error(s: *EmitterState, g: *GlobalVarDef, line: i32, col: i32, wh
     emit_name(s, StrView { ptr: (g.name), len: (g.name_len) as i64 })
     emit_str(s, c": ")
     emit_str(s, why)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     s.error_count = s.error_count + 1
 
 # AGAST #2357: `@.str.N`, a string constant as a constant `ptr` operand.
@@ -2830,13 +2761,13 @@ fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
         root.idx = 0
         root.at = g.init_expr
         root.root = 1
-        emit_str(s, c" ")
+        emit_str(s, IR_SP)
         emit_const_value(s, @c, 0 - 1, @f, g.init_expr, @root)
         return
     # Storage `ptr`.
     if g.var_type == TYPE_PTR
         if gi.kind == GINIT_STR
-            emit_str(s, c" ")
+            emit_str(s, IR_SP)
             emit_cstring_const(s, StrView { ptr: (gi.text), len: (gi.text_len) as i64 })
         else if gi.kind == GINIT_NULL or (gi.kind == GINIT_INT and gi.int_val == 0)
             emit_str(s, c" null")
@@ -2849,11 +2780,11 @@ fn emit_global_init(s: *EmitterState, g: *GlobalVarDef, gi: *GlobalInit)
     # and its folded bits are the initializer, exactly as a run-time literal
     # rounds.  gi.int_val holds the bits of the widened `double`.
     if g.var_type == TYPE_F64 or g.var_type == TYPE_F32
-        emit_str(s, c" ")
+        emit_str(s, IR_SP)
         emit_double_bits(s, gi.int_val)
         return
     # Every other storage type is an LLVM integer.
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     if gi.kind == GINIT_NULL
         emit_int(s, 0)
     else
@@ -2978,7 +2909,7 @@ fn emit_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
         return
     # Emit the type
     if g.var_type == TYPE_STRUCT
-        emit_str(s, c"%")
+        emit_str(s, IR_PCT)
         emit_name(s, StrView { ptr: (g.type_name), len: (g.type_name_len) as i64 })
     else if ty_int_bits(g.var_type) == 32
         emit_str(s, c"i32")
@@ -3000,7 +2931,7 @@ fn emit_global_llvm_type(s: *EmitterState, g: *GlobalVarDef)
         # the emitter had no array-stride context to GEP through.
         emit_str(s, c"[")
         emit_int(s, g.array_size as i64)
-        emit_str(s, c" x ")
+        emit_str(s, IR_X)
         if g.array_elem_type == TYPE_STRUCT and g.array_elem_type_name_len > 0
             emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (g.array_elem_type_name), len: (g.array_elem_type_name_len) as i64 })
         else
@@ -3118,7 +3049,7 @@ fn emit_global_vars(s: *EmitterState)
             emit_name(s, StrView { ptr: (g.name), len: (g.name_len) as i64 })
             emit_str(s, c" = external global ")
             emit_extern_global_llvm_type(s, g)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             g = g.next
             continue
         # Fold (and diagnose) the initializer before the declaration line so
@@ -3137,9 +3068,9 @@ fn emit_global_vars(s: *EmitterState)
         emit_str(s, c" = weak_odr global ")
         emit_global_llvm_type(s, g)
         emit_global_init(s, g, @gi)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         g = g.next
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # =============================================================================
 # Const Arrays of Struct Literals (ritz0 parity — B1 wave-1)
@@ -3221,9 +3152,9 @@ fn emit_const_array_elem_string(s: *EmitterState, c: *ConstEntry, elem_idx: i32,
 
 # Emit one struct-literal element inside the top-level array constant.
 fn emit_const_struct_literal(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *StructDef, elem: *Expr)
-    emit_str(s, c"%")
+    emit_str(s, IR_PCT)
     emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     # The element's own site, so a missing field reads `const 'A' element 0`
     # and is located at the element (LARB R60).
     var at: ConstFieldPath
@@ -3281,7 +3212,7 @@ fn emit_const_struct_body(s: *EmitterState, c: *ConstEntry, elem_idx: i32, st: *
     var first: i32 = 1
     while field != null
         if first == 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         first = 0
         let fi: *FieldInit = find_field_init(fields, StrView { ptr: (field.name), len: (field.name_len) as i64 })
         if fi == null or fi.value == null
@@ -3329,7 +3260,7 @@ fn emit_const_field_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field
     here.at = fi.value
     here.root = 0
     emit_field_llvm_type(s, field)
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     emit_const_value(s, c, elem_idx, field, fi.value, @here)
 
 # The constant value `v` of a slot typed as `field` (its type already written):
@@ -3373,7 +3304,7 @@ fn emit_const_value(s: *EmitterState, c: *ConstEntry, elem_idx: i32, field: *Str
         # Treat target struct as StrView-shaped: { ptr, i64 len }.
         emit_str(s, c"{ ptr ")
         emit_const_string_ref(s, c, elem_idx, v, path)
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_int(s, v.string_len as i64)
         emit_str(s, c" }")
         return
@@ -3563,7 +3494,7 @@ fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *Ar
     var i: i32 = 0
     while i < n and (fill != null or e != null)
         if i > 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         var val: *Expr = e
         if fill != null
             val = fill
@@ -3575,11 +3506,11 @@ fn emit_const_array_dim(s: *EmitterState, c: *ConstEntry, elem_idx: i32, sh: *Ar
         at.root = 0
         if inner == 1
             emit_array_shape_llvm(s, sh, d + 1)
-            emit_str(s, c" ")
+            emit_str(s, IR_SP)
             emit_const_array_dim(s, c, elem_idx, sh, d + 1, sh.dims[d + 1], el, val, @at)
         else
             emit_field_llvm_type(s, el)
-            emit_str(s, c" ")
+            emit_str(s, IR_SP)
             emit_const_value(s, c, elem_idx, el, val, @at)
         i += 1
         if fill == null
@@ -3873,15 +3804,15 @@ fn emit_const_array_fill_entry(s: *EmitterState, c: *ConstEntry)
     emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
     emit_str(s, c" = internal constant [")
     emit_int(s, c.array_size as i64)
-    emit_str(s, c" x ")
+    emit_str(s, IR_X)
     emit_str(s, ty_value_llvm(c.array_elem_type))
     emit_str(s, c"] [")
     var i: i32 = 0
     while i < c.array_size
         if i > 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         emit_str(s, ty_value_llvm(c.array_elem_type))
-        emit_str(s, c" ")
+        emit_str(s, IR_SP)
         emit_int(s, v)
         i = i + 1
     emit_str(s, c"]\n")
@@ -3996,7 +3927,7 @@ fn emit_const_ptr_array(s: *EmitterState, c: *ConstEntry)
     var pe: *Expr = first
     while pi < c.array_size and pe != null
         if pi > 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         emit_const_ptr_elem(s, pe)
         if fill == null
             pe = pe.next
@@ -4021,7 +3952,7 @@ fn emit_const_strview_fill(s: *EmitterState, c: *ConstEntry)
     var i: i32 = 0
     while i < c.array_size
         if i > 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         emit_str(s, c"%StrView { ptr @.const.")
         emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
         emit_str(s, c".0, i64 ")
@@ -4069,15 +4000,15 @@ fn emit_const_array_shared_entry(s: *EmitterState, c: *ConstEntry)
     emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
     emit_str(s, c" = internal constant [")
     emit_int(s, c.array_size as i64)
-    emit_str(s, c" x ")
+    emit_str(s, IR_X)
     if c.array_elem_type == TYPE_STRUCT and c.array_elem_type_name_len > 0
-        emit_str(s, c"%")
+        emit_str(s, IR_PCT)
         emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
     else
         emit_str(s, elem_mem_llvm(c.array_elem_type))
     emit_str(s, c"] ")
     emit_const_array_field(s, c, 0 - 1, @f, c.value_expr, @root)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # Emit a single ConstEntry as an LLVM global constant (if applicable).
 fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
@@ -4136,16 +4067,16 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
         emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
         emit_str(s, c" = internal constant [")
         emit_int(s, c.array_size as i64)
-        emit_str(s, c" x ")
+        emit_str(s, IR_X)
         emit_str(s, ty_value_llvm(c.array_elem_type))
         emit_str(s, c"] [")
         var pe: *Expr = c.value_expr.args
         var pi: i32 = 0
         while pe != null
             if pi > 0
-                emit_str(s, c", ")
+                emit_str(s, IR_COMMA)
             emit_str(s, ty_value_llvm(c.array_elem_type))
-            emit_str(s, c" ")
+            emit_str(s, IR_SP)
             var v: i64 = 0
             const_fold_int(s.module.constants, pe, 1, @v)
             emit_int(s, v)
@@ -4194,24 +4125,24 @@ fn emit_const_array_entry(s: *EmitterState, c: *ConstEntry)
     elem_idx = 0
     while elem != null
         if elem_idx > 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         if elem.kind == EXPR_STRUCT_LIT
             emit_const_struct_literal(s, c, elem_idx, st, elem)
         else if elem.kind == EXPR_STRING_LIT
             # AGAST #3325: a `[N]StrView` element `"..."` is `{ ptr, len }`
             # over its backing bytes; it was a zeroinitializer, an empty view.
-            emit_str(s, c"%")
+            emit_str(s, IR_PCT)
             emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
             emit_str(s, c" { ptr @.const.")
             emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
             emit_str(s, c".")
             emit_int(s, elem_idx as i64)
-            emit_str(s, c", i64 ")
+            emit_str(s, IR_I64_SEP)
             emit_int(s, elem.string_len as i64)
             emit_str(s, c" }")
         else
             # Unexpected non-struct element in a struct-array; emit zero.
-            emit_str(s, c"%")
+            emit_str(s, IR_PCT)
             emit_name(s, StrView { ptr: (c.array_elem_type_name), len: (c.array_elem_type_name_len) as i64 })
             emit_str(s, c" zeroinitializer")
         elem_idx = elem_idx + 1
@@ -4279,9 +4210,9 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
         emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
         emit_str(s, c" = internal constant %")
         emit_name(s, StrView { ptr: (c.type_name), len: (c.type_name_len) as i64 })
-        emit_str(s, c" ")
+        emit_str(s, IR_SP)
         emit_const_value(s, c, 0 - 1, @f, c.value_expr, @root)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         return
 
     let strlen: i32 = c.value_expr.string_len
@@ -4304,7 +4235,7 @@ fn emit_const_struct_entry(s: *EmitterState, c: *ConstEntry)
     emit_name(s, StrView { ptr: (c.type_name), len: (c.type_name_len) as i64 })
     emit_str(s, c" { ptr @.const.")
     emit_name(s, StrView { ptr: (c.name), len: (c.name_len) as i64 })
-    emit_str(s, c", i64 ")
+    emit_str(s, IR_I64_SEP)
     emit_int(s, strlen as i64)
     emit_str(s, c" }\n")
 
@@ -4321,7 +4252,7 @@ fn emit_const_arrays(s: *EmitterState)
             # TYPE_STRUCT here, not TYPE_ARRAY.
             emit_const_struct_entry(s, c)
         c = c.next
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # =============================================================================
 # The string-literal type
@@ -4412,7 +4343,7 @@ fn ensure_view_struct(s: *EmitterState, m: *Module, name_sv: StrView, err: *u8)
         if is_string_literal_layout(existing) == 0
             emit_str(s, c"  ; ERROR: ")
             emit_str(s, err)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             eprints_cstr(c"error: ritz1 cannot emit: ")
             eprints_cstr(err)
             eprint_char('\n')
@@ -4675,7 +4606,7 @@ fn emit_test_table(s: *EmitterState)
 
     emit_str(s, c"@__ritz_tests = constant [")
     emit_int(s, n)
-    emit_str(s, c" x ")
+    emit_str(s, IR_X)
     emit_test_entry_type(s)
     emit_str(s, c"] ")
     if n == 0
@@ -4686,11 +4617,11 @@ fn emit_test_table(s: *EmitterState)
         while i < n
             let f: *FnDef = *(idx + i) as *FnDef
             if i > 0
-                emit_str(s, c", ")
+                emit_str(s, IR_COMMA)
             emit_test_entry_type(s)
             emit_str(s, c" { { ptr, i64 } { ptr @__ritz_test_name.")
             emit_int(s, i)
-            emit_str(s, c", i64 ")
+            emit_str(s, IR_I64_SEP)
             emit_int(s, f.name_len as i64)
             emit_str(s, c" }, ptr @")
             if test_ret_bits(f) == 32
@@ -4705,7 +4636,7 @@ fn emit_test_table(s: *EmitterState)
         emit_str(s, c"]\n")
     emit_str(s, c"@__ritz_tests_count = constant i64 ")
     emit_int(s, n)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     emit_str(s, c"define ptr @__ritz_test_table(ptr %count) {\nentry:\n  store i64 ")
     emit_int(s, n)
     emit_str(s, c", ptr %count\n  ret ptr @__ritz_tests\n}\n")

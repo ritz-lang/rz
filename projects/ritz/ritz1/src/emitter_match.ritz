@@ -47,6 +47,7 @@ import types
 import ast_helpers
 import tokens_gen
 import emitter_core
+import emitter_ir
 import diag                 # diag_error_at (AGAST #3621)
 import emitter_expr
 import emitter_expr_call     # is_variant_carrier, is_variant_null, resolve_enum_ctx
@@ -162,48 +163,48 @@ fn emit_variant_tag_check_eq(s: *EmitterState, slot_reg: i32, enum_name_sv: StrV
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
     let tag_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, tag_ptr)
-    emit_str(s, c" = getelementptr %")
+    emit_str(s, IR_GEP_NAMED)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot_reg)
     emit_str(s, c", i32 0, i32 0\n")
     let tag_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, tag_reg)
     emit_str(s, c" = load i8, ptr ")
     emit_reg(s, tag_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let cmp_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, cmp_reg)
     emit_str(s, c" = icmp eq i8 ")
     emit_reg(s, tag_reg)
-    emit_str(s, c", ")
+    emit_str(s, IR_COMMA)
     emit_int(s, tag_value as i64)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     return cmp_reg
 
 fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name_sv: StrView, tag_one: i32) -> i32
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
     let tag_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, tag_ptr)
-    emit_str(s, c" = getelementptr %")
+    emit_str(s, IR_GEP_NAMED)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot_reg)
     emit_str(s, c", i32 0, i32 0\n")
     let tag_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, tag_reg)
     emit_str(s, c" = load i8, ptr ")
     emit_reg(s, tag_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let cmp_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, cmp_reg)
     if tag_one == 1
         # carrier (Ok/Some) → tag == 0
@@ -212,7 +213,7 @@ fn emit_variant_tag_check(s: *EmitterState, slot_reg: i32, enum_name_sv: StrView
         # null (Err/None) → tag != 0
         emit_str(s, c" = icmp ne i8 ")
     emit_reg(s, tag_reg)
-    emit_str(s, c", 0\n")
+    emit_str(s, IR_COMMA_0)
     return cmp_reg
 
 # Extract the variant payload as an i64 (the common scalar case).  Payload
@@ -242,15 +243,15 @@ fn emit_variant_tag_check_i64(s: *EmitterState, scrut_reg: i32, tag_one: i32) ->
     # covers the latter.  Returns a conservative always-false for "variant"
     # patterns against a scalar scrutinee.
     let r: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, r)
     emit_str(s, c" = icmp eq i64 ")
     emit_reg(s, scrut_reg)
-    emit_str(s, c", 0\n")
+    emit_str(s, IR_COMMA_0)
     if tag_one == 1
         return r
     let inv: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, inv)
     emit_str(s, c" = xor i1 ")
     emit_reg(s, r)
@@ -375,20 +376,15 @@ fn emit_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum_n
     var st_name: *u8 = st_name_sv.ptr
     var st_name_len: i32 = st_name_sv.len as i32
     let raw: i32 = emit_variant_payload(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, variant)
-    let ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, ptr)
-    emit_str(s, c" = inttoptr i64 ")
-    emit_reg(s, raw)
-    emit_str(s, c" to ptr\n")
+    let ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, raw)
     let alloca_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, alloca_reg)
     emit_str(s, c" = alloca ptr  ; match pointer payload bind\n  store ptr ")
     emit_reg(s, ptr)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, alloca_reg)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     if var_type == TYPE_PTR_PTR
         # AGAST #3047: as `let pp: **Pair` registers (emitter_stmt.ritz,
         # #1933): pointee `*`, then the struct one level further in.
@@ -430,20 +426,15 @@ fn emit_primitive_ptr_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i
     if uvi >= 0
         sel = uvi
     let raw: i32 = emit_variant_payload(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
-    let ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, ptr)
-    emit_str(s, c" = inttoptr i64 ")
-    emit_reg(s, raw)
-    emit_str(s, c" to ptr\n")
+    let ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, raw)
     let alloca_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, alloca_reg)
     emit_str(s, c" = alloca ptr  ; match pointer payload bind\n  store ptr ")
     emit_reg(s, ptr)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, alloca_reg)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     add_local_ptr(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TYPE_PTR, pointee)
 
 # AGAST #1515: bind `Some(p)` / `Ok(s)` to a copy of a struct payload.  The
@@ -460,26 +451,26 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
         sel = 0   # Result / Option: the payload is at offset 0
     let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
     let val: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, val)
-    emit_str(s, c" = load %")
+    emit_str(s, IR_LOAD_NAMED)
     emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, pay_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let alloca_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, alloca_reg)
-    emit_str(s, c" = alloca %")
+    emit_str(s, IR_ALLOCA_NAMED)
     emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
     emit_str(s, c"  ; match struct payload bind\n")
-    emit_str(s, c"  store %")
+    emit_str(s, IR_STORE_STRUCT)
     emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     emit_reg(s, val)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, alloca_reg)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     add_local_struct(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TYPE_STRUCT, StrView { ptr: (st_name), len: (st_name_len) as i64 })
 
 # AGAST #3029: bind `V(a)` / `Some(a)` to a copy of an array payload, at the
@@ -498,26 +489,26 @@ fn emit_array_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enum
         return 0
     let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, tag)
     let val: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, val)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_local_array_llvm_type(s, arr.size, arr.elem, StrView { ptr: (arr.name), len: (arr.name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, pay_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let alloca_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, alloca_reg)
-    emit_str(s, c" = alloca ")
+    emit_str(s, IR_ALLOCA)
     emit_local_array_llvm_type(s, arr.size, arr.elem, StrView { ptr: (arr.name), len: (arr.name_len) as i64 })
     emit_str(s, c"  ; match array payload bind\n")
-    emit_str(s, c"  store ")
+    emit_str(s, IR_STORE_IND)
     emit_local_array_llvm_type(s, arr.size, arr.elem, StrView { ptr: (arr.name), len: (arr.name_len) as i64 })
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     emit_reg(s, val)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, alloca_reg)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     if arr.name_len > 0 and (arr.elem == TYPE_STRUCT or arr.elem == TYPE_PTR)
         add_local_full(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TYPE_ARRAY, StrView { ptr: (arr.name), len: (arr.name_len) as i64 }, TYPE_I64, arr.size, arr.elem)
     else
@@ -760,18 +751,18 @@ fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, b
         return
     if result.slot == 0
         result.slot = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result.slot)
-        emit_str(s, c" = alloca ")
+        emit_str(s, IR_ALLOCA)
         emit_match_phi_type(s, result)
-        emit_str(s, c"\n")
-    emit_str(s, c"  store ")
+        emit_str(s, IR_NL)
+    emit_str(s, IR_STORE_IND)
     emit_match_phi_type(s, result)
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     emit_match_phi_value(s, result, body_reg)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, result.slot)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # AGAST #3696: at the merge, the arms' value read back from their slot (see
 # match_arm_into_slot), or 0 when they meet in a phi instead.
@@ -779,13 +770,13 @@ fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
     if result.slot == 0 or result.slot_misses > 0
         return 0
     let reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, reg)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_match_phi_type(s, result)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, result.slot)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     reg
 
 # AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
@@ -946,27 +937,27 @@ fn emit_arm_payload_bind(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut
                     # The payload was widened to an i64 register; the
                     # local holds it at its width, truncated back.
                     let narrow_reg: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, narrow_reg)
-                    emit_str(s, c" = trunc i64 ")
+                    emit_str(s, IR_TRUNC)
                     emit_reg(s, payload_reg)
-                    emit_str(s, c" to ")
+                    emit_str(s, IR_TO_SP)
                     emit_str(s, bind_llvm)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     payload_reg = narrow_reg
                 let alloca_reg: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, alloca_reg)
-                emit_str(s, c" = alloca ")
+                emit_str(s, IR_ALLOCA)
                 emit_str(s, bind_llvm)
                 emit_str(s, c"  ; match payload bind\n")
-                emit_str(s, c"  store ")
+                emit_str(s, IR_STORE_IND)
                 emit_str(s, bind_llvm)
-                emit_str(s, c" ")
+                emit_str(s, IR_SP)
                 emit_reg(s, payload_reg)
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, alloca_reg)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 add_local(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, bind_type)
                 narrow_note_binding(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, bind_it)   # AGAST #3345
                 if bind_ft == 0
@@ -1002,25 +993,25 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
         if s.match_scrut_str == 1
             # AGAST #1876: a name over a StrView binds the StrView.
             let str_reg: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, str_reg)
             emit_str(s, c" = alloca %StrView  ; match binding\n")
             emit_str(s, c"  store %StrView ")
             emit_reg(s, scrut_reg)
-            emit_str(s, c", ptr ")
+            emit_str(s, IR_PTR_SEP)
             emit_reg(s, str_reg)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             add_local_struct(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, str_reg, TYPE_STRUCT, StrView { ptr: (c"StrView"), len: (7) as i64 })
         else if find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == null and is_ident_none_name(StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }) == 0
             let bind_reg: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, bind_reg)
             emit_str(s, c" = alloca i64  ; match binding\n")
             emit_str(s, c"  store i64 ")
             emit_reg(s, scrut_reg)
-            emit_str(s, c", ptr ")
+            emit_str(s, IR_PTR_SEP)
             emit_reg(s, bind_reg)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             add_local(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, bind_reg, TYPE_I64)
             bool_note_binding(s, s.match_scrut_kind)   # AGAST #2342
             narrow_note_binding(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 }, s.match_scrut_int)   # AGAST #3358
@@ -1185,9 +1176,9 @@ fn emit_match_arm_body(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_s
     if arm_index + 1 > result.count
         result.count = arm_index + 1
 
-    emit_str(s, c"  br label %")
+    emit_str(s, IR_BR)
     emit_label(s, end_label)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
 # AGAST #3276: an arm of a `match` of whole arrays stores its value at `into`,
 # with its pattern binding in scope, as emit_array_arm_into does an `if` arm's
@@ -1211,71 +1202,71 @@ fn match_arm_array_into(s: *EmitterState, arm: *MatchArm, into: *ArrayInto)
 # emit_match_arm's branch.  ritz0's twin is _emit_strview_match.
 fn emit_str_pattern_test(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, miss: i32) -> i32
     let len_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, len_reg)
     emit_str(s, c" = extractvalue %StrView ")
     emit_reg(s, scrut_reg)
-    emit_str(s, c", 1\n")
+    emit_str(s, IR_COMMA_1)
     let same_len: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, same_len)
     emit_str(s, c" = icmp eq i64 ")
     emit_reg(s, len_reg)
-    emit_str(s, c", ")
+    emit_str(s, IR_COMMA)
     emit_int(s, arm.pattern_name_len as i64)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     if arm.pattern_name_len == 0
         return same_len
     let bytes_label: i32 = next_label(s)
     emit_str(s, c"  br i1 ")
     emit_reg(s, same_len)
-    emit_str(s, c", label %")
+    emit_str(s, IR_LABEL_SEP)
     emit_label(s, bytes_label)
-    emit_str(s, c", label %")
+    emit_str(s, IR_LABEL_SEP)
     emit_label(s, miss)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     begin_block(s, bytes_label)
     let ptr_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, ptr_reg)
     emit_str(s, c" = extractvalue %StrView ")
     emit_reg(s, scrut_reg)
-    emit_str(s, c", 0\n")
+    emit_str(s, IR_COMMA_0)
     var acc: i32 = 0
     for k in 0..arm.pattern_name_len
         let at_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, at_reg)
         emit_str(s, c" = getelementptr i8, ptr ")
         emit_reg(s, ptr_reg)
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_int(s, k as i64)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         let byte_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, byte_reg)
         emit_str(s, c" = load i8, ptr ")
         emit_reg(s, at_reg)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         let hit: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, hit)
         emit_str(s, c" = icmp eq i8 ")
         emit_reg(s, byte_reg)
-        emit_str(s, c", ")
+        emit_str(s, IR_COMMA)
         emit_int(s, *(arm.pattern_name + k) as i64)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         if acc == 0
             acc = hit
         else
             let both: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, both)
             emit_str(s, c" = and i1 ")
             emit_reg(s, acc)
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
             emit_reg(s, hit)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             acc = both
     acc
 
@@ -1291,13 +1282,13 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
 
     if arm.pattern_kind == PAT_INT_LIT or arm.pattern_kind == PAT_CHAR or arm.pattern_kind == PAT_BOOL
         cond_reg = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, cond_reg)
         emit_str(s, c" = icmp eq i64 ")
         emit_reg(s, scrut_reg)
-        emit_str(s, c", ")
+        emit_str(s, IR_COMMA)
         emit_int(s, arm.pattern_int)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
     else if arm.pattern_kind == PAT_STR
         cond_reg = emit_str_pattern_test(s, arm, scrut_reg, next_label_id)
     else if arm.pattern_kind == PAT_WILDCARD
@@ -1325,13 +1316,13 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
             let ce: *ConstEntry = find_const_entry(s, StrView { ptr: (arm.pattern_name), len: (arm.pattern_name_len) as i64 })
             if ce != null and is_int_const_type(ce.const_type) == 1
                 cond_reg = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, cond_reg)
                 emit_str(s, c" = icmp eq i64 ")
                 emit_reg(s, scrut_reg)
-                emit_str(s, c", ")
+                emit_str(s, IR_COMMA)
                 emit_int(s, ce.value)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
         if cond_reg == 0
             always_true = 1
     else if arm.pattern_kind == PAT_VARIANT
@@ -1354,17 +1345,17 @@ fn emit_match_arm(s: *EmitterState, arm: *MatchArm, scrut_reg: i32, scrut_slot: 
         always_true = 1
 
     if always_true == 1
-        emit_str(s, c"  br label %")
+        emit_str(s, IR_BR)
         emit_label(s, body_label)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
     else
         emit_str(s, c"  br i1 ")
         emit_reg(s, cond_reg)
-        emit_str(s, c", label %")
+        emit_str(s, IR_LABEL_SEP)
         emit_label(s, body_label)
-        emit_str(s, c", label %")
+        emit_str(s, IR_LABEL_SEP)
         emit_label(s, next_label_id)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
     begin_block(s, body_label)
     emit_match_arm_body(s, arm, scrut_reg, scrut_slot, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, result, arm_index, end_label)
@@ -1417,55 +1408,55 @@ pub fn emit_enum_to_int(s: *EmitterState, cast: *Expr, raw_reg: i32, out_src_ty:
             s.error_count = s.error_count + 1
             *out_src_ty = TYPE_I64
             let z: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, z)
-            emit_str(s, c" = add i64 0, 0\n")
+            emit_str(s, IR_ADD_ZERO)
             return z
     *out_src_ty = enum_repr(ei)
     if *out_src_ty == 0
         *out_src_ty = TYPE_I64
     let tag: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, tag)
     emit_str(s, c" = extractvalue %")
     emit_name(s, StrView { ptr: (en), len: (en_len) as i64 })
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     emit_reg(s, raw_reg)
-    emit_str(s, c", 0\n")
+    emit_str(s, IR_COMMA_0)
     var r: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, r)
     emit_str(s, c" = zext i8 ")
     emit_reg(s, tag)
-    emit_str(s, c" to i64\n")
+    emit_str(s, IR_TO_I64)
     if enum_discr_is_index(ei) == 1
         return r
     let first: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, first)
     emit_str(s, c" = add i64 0, ")
     emit_int(s, enum_variant_discr(ei, 0))
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     r = first
     for vi in 1..n
         let is_vi: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, is_vi)
         emit_str(s, c" = icmp eq i8 ")
         emit_reg(s, tag)
-        emit_str(s, c", ")
+        emit_str(s, IR_COMMA)
         emit_int(s, vi as i64)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         let sel: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, sel)
         emit_str(s, c" = select i1 ")
         emit_reg(s, is_vi)
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_int(s, enum_variant_discr(ei, vi as i32))
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_reg(s, r)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         r = sel
     return r
 
@@ -2613,11 +2604,11 @@ fn emit_match_place_load(s: *EmitterState, slot: i32, enum_name_sv: StrView) -> 
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
     let reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, reg)
-    emit_str(s, c" = load %")
+    emit_str(s, IR_LOAD_NAMED)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot)
     emit_str(s, c"  ; match @place\n")
     reg
@@ -2724,18 +2715,18 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         scrut_reg = emit_expr(s, scrutinee)
     if is_enum == 1 and from_place == 0
         scrut_slot = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, scrut_slot)
-        emit_str(s, c" = alloca %")
+        emit_str(s, IR_ALLOCA_NAMED)
         emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
         emit_str(s, c"  ; match scrut spill\n")
-        emit_str(s, c"  store %")
+        emit_str(s, IR_STORE_STRUCT)
         emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-        emit_str(s, c" ")
+        emit_str(s, IR_SP)
         emit_reg(s, scrut_reg)
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, scrut_slot)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
     # AGAST #2174: the match owns a scrutinee it moved (ownership.ritz);
     # `match @place` moves nothing.
@@ -2809,7 +2800,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
     if result.count == 0
         # No arm phi: the match's value is this register itself.
         let no_arm_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, no_arm_reg)
         emit_str(s, c" = add i64 0, 0  ; match: no arm yields a value\n")
         own_match_end(s, own_old)
@@ -2820,22 +2811,22 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         own_match_end(s, own_old)
         return slot_reg
     let phi_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, phi_reg)
     emit_str(s, c" = phi ")
     emit_match_phi_type(s, @result)
-    emit_str(s, c" ")
+    emit_str(s, IR_SP)
     var i: i32 = 0
     while i < result.count
         if i > 0
-            emit_str(s, c", ")
+            emit_str(s, IR_COMMA)
         emit_str(s, c"[ ")
         emit_match_phi_value(s, @result, result.values[i])
         emit_str(s, c", %")
         emit_label(s, result.labels[i])
         emit_str(s, c" ]")
         i = i + 1
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     own_match_end(s, own_old)
     return phi_reg
 
@@ -2871,22 +2862,22 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
     # Narrowed to i1 for the `br`, as STMT_IF does (AGAST #1367, #1646).
     let cond: i32 = emit_expr(s, e.left)
     let cond_i1: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, cond_i1)
     emit_str(s, c" = icmp ne i64 ")
     emit_reg(s, cond)
-    emit_str(s, c", 0\n")
+    emit_str(s, IR_COMMA_0)
 
     let then_label: i32 = next_label(s)
     let else_label: i32 = next_label(s)
     let end_label: i32 = next_label(s)
     emit_str(s, c"  br i1 ")
     emit_reg(s, cond_i1)
-    emit_str(s, c", label %")
+    emit_str(s, IR_LABEL_SEP)
     emit_label(s, then_label)
-    emit_str(s, c", label %")
+    emit_str(s, IR_LABEL_SEP)
     emit_label(s, else_label)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
 
     var result: MatchResult
     match_result_init(@result, 2)
@@ -2917,7 +2908,7 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
         return slot_reg
 
     let phi_reg: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, phi_reg)
     emit_str(s, c" = phi ")
     emit_match_phi_type(s, @result)
@@ -2931,5 +2922,5 @@ pub fn emit_if_expr(s: *EmitterState, e: *Expr) -> i32
         emit_label(s, result.labels[i])
         emit_str(s, c" ]")
         i = i + 1
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     return phi_reg

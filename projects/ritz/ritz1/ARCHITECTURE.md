@@ -350,6 +350,7 @@ empty. A note that belongs to a move goes on that check's own entry.
 |---|---|
 | `emitter` | `emit_module`, `emit_fn`, impl methods; post-passes over the emitted IR text. |
 | `emitter_core` | `EmitterState`, struct-aware type→LLVM mapping over `types`, local/struct/fn lookup, IR text helpers, member-access GEPs. |
+| `emitter_ir` | Typed IR builders (casts, load/store, alloca, branches): the spelling of an instruction lives here, not at each site. A leaf module, so it stays out of the emitter import cycle (AGAST #1817). |
 | `emitter_expr` | `emit_expr` dispatch and struct literals. |
 | `emitter_expr_access`, `emitter_expr_arith`, `emitter_expr_call` | Identifiers/index/member; binary/unary; calls and methods. |
 | `emitter_stmt` | Statements: declarations, assignment, control flow, `for`. |

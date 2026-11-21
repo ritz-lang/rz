@@ -5,6 +5,7 @@ import types           # the one primitive type table (AGAST #1889)
 import index_through
 import ast_helpers
 import emitter_core
+import emitter_ir
 import diag                 # diag_error_at (AGAST #3445)
 import emitter_expr
 import emitter_expr_arith   # emit_nd_index_value (AGAST #1509)
@@ -79,35 +80,35 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
                         return emit_no_enum_ctx_error(s, e)   # AGAST #2454
                     # alloca + zero-init + store tag=1 + load.
                     let slot: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, slot)
-                    emit_str(s, c" = alloca %")
+                    emit_str(s, IR_ALLOCA_NAMED)
                     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
                     emit_str(s, c"  ; None\n")
-                    emit_str(s, c"  store %")
+                    emit_str(s, IR_STORE_STRUCT)
                     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
                     emit_str(s, c" zeroinitializer, ptr ")
                     emit_reg(s, slot)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     let tptr: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, tptr)
-                    emit_str(s, c" = getelementptr %")
+                    emit_str(s, IR_GEP_NAMED)
                     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, slot)
                     emit_str(s, c", i32 0, i32 0\n")
                     emit_str(s, c"  store i8 1, ptr ")
                     emit_reg(s, tptr)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     let result: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, result)
-                    emit_str(s, c" = load %")
+                    emit_str(s, IR_LOAD_NAMED)
                     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, slot)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     return result
 
     if is_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }) == 1
@@ -123,13 +124,13 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
             return 0
         if ce != null and ce.const_type == TYPE_STRUCT and ce.type_name_len > 0 and ce.value_expr != null
             let result: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, result)
-            emit_str(s, c" = load %")
+            emit_str(s, IR_LOAD_NAMED)
             emit_name(s, StrView { ptr: (ce.type_name), len: (ce.type_name_len) as i64 })
             emit_str(s, c", ptr @")
             emit_name(s, StrView { ptr: (ce.name), len: (ce.name_len) as i64 })
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             return result
         # AGAST #2341: a string `*u8` const is its literal.  Its folded value is
         # 0, which is what `*P` used to read.
@@ -140,7 +141,7 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
         let cft: i32 = const_int_init_float_ty(s, ce, @folded)
         if cft != 0
             let fres: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, fres)
             emit_str(s, c" = sitofp i64 ")
             emit_int(s, folded)
@@ -155,20 +156,15 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
             let dv: i32 = emit_expr(s, ce.value_expr)
             if lft == TYPE_F64
                 return dv
-            let nres: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, nres)
-            emit_str(s, c" = fptrunc double ")
-            emit_reg(s, dv)
-            emit_str(s, c" to float\n")
+            let nres: i32 = ir_fptrunc_f64_f32(s.out, @s.reg_counter, dv)
             return nres
         let val: i64 = find_const(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
         emit_str(s, c" = add i64 0, ")
         emit_int(s, val)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         return result
 
     let loc: i32 = find_local(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
@@ -187,67 +183,52 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
             emit_whole_array_error(s, e)
             return 0
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
-        emit_str(s, c" = load ")
+        emit_str(s, IR_LOAD)
         emit_llvm_type_struct(s, var_type, StrView { ptr: (local_var.type_name), len: (local_var.type_name_len) as i64 })
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, loc)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
         if var_type == TYPE_I32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i32 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, result)
             return ext
         else if var_type == TYPE_U32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i32 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, result)
             return ext
         else if ty_int_bits(var_type) == 8
             # AGAST #2021: i8 sign-extends, matching the i8 global reload and
             # every *i8 / [N]i8 element load; zext made `let x: i8 = -3`
             # compare as 0xFD against a sext'd p[i] of 0xFF..FD.
             let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, ext)
             if var_type == TYPE_I8
                 emit_str(s, c" = sext i8 ")
             else
                 emit_str(s, c" = zext i8 ")
             emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            emit_str(s, IR_TO_I64)
             return ext
         else if ty_int_bits(var_type) == 16
             # Was missing: u16/i16 idents left their value at i16 width,
             # so any subsequent `store i64 %val` (the unified-i64 path)
             # produced an LLVM type-mismatch error.  Extend like u8/i8.
             let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, ext)
             if var_type == TYPE_I16
                 emit_str(s, c" = sext i16 ")
             else
                 emit_str(s, c" = zext i16 ")
             emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            emit_str(s, IR_TO_I64)
             return ext
         else if var_type == TYPE_BOOL
             # AGAST #2994: a `b:& bool` param's one byte, as the i64 a bool
             # value lives in (#1646).
-            let bext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, bext)
-            emit_str(s, c" = zext i1 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            let bext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
             return bext
         else if var_type == TYPE_PTR or var_type == TYPE_PTR_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
             # Pointers are already stored/loaded as i64, no conversion needed
@@ -265,65 +246,50 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
         # site taking the value (`return gh`, `var v: Vec<i32> = g`, an
         # argument, a field init, an assignment) was invalid IR.
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
-        emit_str(s, c" = load ")
+        emit_str(s, IR_LOAD)
         if glob.var_type == TYPE_STRUCT and glob.type_name_len > 0
             emit_llvm_type_struct(s, glob.var_type, StrView { ptr: (glob.type_name), len: (glob.type_name_len) as i64 })
         else
             emit_str(s, ty_value_llvm(glob.var_type))
         emit_str(s, c", ptr @")
         emit_name(s, StrView { ptr: (glob.name), len: (glob.name_len) as i64 })
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         # Extend to i64 if needed
         if glob.var_type == TYPE_I32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i32 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, result)
             return ext
         else if glob.var_type == TYPE_U32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i32 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, result)
             return ext
         else if ty_int_bits(glob.var_type) == 16
             let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, ext)
             if glob.var_type == TYPE_I16
                 emit_str(s, c" = sext i16 ")
             else
                 emit_str(s, c" = zext i16 ")
             emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            emit_str(s, IR_TO_I64)
             return ext
         else if ty_int_bits(glob.var_type) == 8
             let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, ext)
             if glob.var_type == TYPE_I8
                 emit_str(s, c" = sext i8 ")
             else
                 emit_str(s, c" = zext i8 ")
             emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            emit_str(s, IR_TO_I64)
             return ext
         else if glob.var_type == TYPE_BOOL
             # AGAST #3001: the i1 byte, as the i64 a bool value lives in
             # (#1646), as for a `b:& bool` param above.  The raw i1 was invalid
             # IR in `not g`, `g and h`, `g as i32` and `f(g)`.
-            let bext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, bext)
-            emit_str(s, c" = zext i1 ")
-            emit_reg(s, result)
-            emit_str(s, c" to i64\n")
+            let bext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
             return bext
         return result
 
@@ -339,14 +305,14 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     if fn_def != null
         add_extern(s, StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 })
         let fn_addr: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, fn_addr)
         emit_str(s, c" = ptrtoint ptr @")
         # AGAST #4356: a private free fn's symbol carries its file (fn_symbol).
         var fn_sym_len: i32 = 0
         let fn_sym: *u8 = fn_symbol(fn_def, @fn_sym_len)
         emit_name(s, StrView { ptr: (fn_sym), len: (fn_sym_len) as i64 })
-        emit_str(s, c" to i64\n")
+        emit_str(s, IR_TO_I64)
         return fn_addr
 
     # AGAST #2422: `Empty` where the slot is a `Slot<i32>`.
@@ -377,9 +343,9 @@ pub fn emit_expr_ident(s: *EmitterState, e: *Expr) -> i32
     emit_ir_error_begin(s, e.span, c"unknown identifier '")
     emit_ir_error_end(s, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
     let zero: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, zero)
-    emit_str(s, c" = add i64 0, 0\n")
+    emit_str(s, IR_ADD_ZERO)
     return zero
 
 # LLVM element type of a primitive const array (the spelling
@@ -405,13 +371,13 @@ fn emit_struct_array_elem_load(s: *EmitterState, name_sv: StrView, size: i32, tn
     var name_len: i32 = name_sv.len as i32
     let sptr: i32 = emit_struct_array_elem_ptr(s, StrView { ptr: (name), len: (name_len) as i64 }, size, tn, tl, idx_expr)
     let sval: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, sval)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (tn), len: (tl) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, sptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     sval
 
 # The address of `name[idx]` in a module `[size x %tn]` global or const.
@@ -420,17 +386,17 @@ pub fn emit_struct_array_elem_ptr(s: *EmitterState, name_sv: StrView, size: i32,
     var name_len: i32 = name_sv.len as i32
     let sidx: i32 = emit_expr(s, idx_expr)
     let sptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, sptr)
-    emit_str(s, c" = getelementptr [")
+    emit_str(s, IR_GEP_ARRAY)
     emit_int(s, size as i64)
-    emit_str(s, c" x ")
+    emit_str(s, IR_X)
     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (tn), len: (tl) as i64 })
     emit_str(s, c"], ptr @")
     emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
-    emit_str(s, c", i64 0, i64 ")
+    emit_str(s, IR_I64_ZERO)
     emit_reg(s, sidx)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     sptr
 
 # `name[idx]` on a module-level `[size x elem_ty]` global (a `var` global or a
@@ -441,25 +407,25 @@ fn emit_global_array_index(s: *EmitterState, name_sv: StrView, size: i32, elem_t
     var name_len: i32 = name_sv.len as i32
     let gidx: i32 = emit_expr(s, idx_expr)
     let gptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, gptr)
-    emit_str(s, c" = getelementptr [")
+    emit_str(s, IR_GEP_ARRAY)
     emit_int(s, size as i64)
-    emit_str(s, c" x ")
+    emit_str(s, IR_X)
     emit_str(s, elem_ty)
     emit_str(s, c"], ptr @")
     emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
-    emit_str(s, c", i64 0, i64 ")
+    emit_str(s, IR_I64_ZERO)
     emit_reg(s, gidx)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let gval: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, gval)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_str(s, elem_ty)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, gptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     return emit_array_elem_widen(s, gval, elem_t, elem_ty)
 
 # `v[i]` element read through a pointer to a Vec$T struct: load the data
@@ -472,19 +438,19 @@ fn emit_vec_ptr_index(s: *EmitterState, vec_ptr: i32, type_name_sv: StrView, idx
     let idx_v: i32 = emit_expr(s, idx_expr)
     # GEP to data ptr field (index 0 of Vec struct)
     let v_data_ptr_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, v_data_ptr_ptr)
-    emit_str(s, c" = getelementptr %")
+    emit_str(s, IR_GEP_NAMED)
     emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, vec_ptr)
     emit_str(s, c", i32 0, i32 0\n")
     let v_data_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, v_data_ptr)
-    emit_str(s, c" = load ptr, ptr ")
+    emit_str(s, IR_LOAD_PTR)
     emit_reg(s, v_data_ptr_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     # Decode element type from suffix after "Vec$".
     let v_en: *u8 = type_name + 4
     let v_el: i32 = type_name_len - 4
@@ -509,71 +475,41 @@ fn emit_vec_ptr_index(s: *EmitterState, vec_ptr: i32, type_name_sv: StrView, idx
         v_ty = c"i32"
         v_kind = TYPE_I32
     let v_ep: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, v_ep)
     emit_str(s, c" = getelementptr ")
     emit_str(s, v_ty)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, v_data_ptr)
-    emit_str(s, c", i64 ")
+    emit_str(s, IR_I64_SEP)
     emit_reg(s, idx_v)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let v_val: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, v_val)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_str(s, v_ty)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, v_ep)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     # Extend to i64 for uniform value representation.
     if v_kind == TYPE_U8
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = zext i8 ")
-        emit_reg(s, v_val)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, v_val)
         return ext
     else if v_kind == TYPE_I8
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = sext i8 ")
-        emit_reg(s, v_val)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, v_val)
         return ext
     else if v_kind == TYPE_U16
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = zext i16 ")
-        emit_reg(s, v_val)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, v_val)
         return ext
     else if v_kind == TYPE_I16
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = sext i16 ")
-        emit_reg(s, v_val)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, v_val)
         return ext
     else if v_kind == TYPE_U32
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = zext i32 ")
-        emit_reg(s, v_val)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, v_val)
         return ext
     else if v_kind == TYPE_I32
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = sext i32 ")
-        emit_reg(s, v_val)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, v_val)
         return ext
     return v_val
 
@@ -605,25 +541,25 @@ fn emit_array_ptr_index(s: *EmitterState, e: *Expr, out: *i32) -> i32
     let idx: i32 = emit_expr(s, e.right)
     let base: i32 = emit_load_ptr(s, loc.reg)
     let elem_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, elem_ptr)
-    emit_str(s, c" = getelementptr [")
+    emit_str(s, IR_GEP_ARRAY)
     emit_int(s, loc.pointee_array_size as i64)
-    emit_str(s, c" x ")
+    emit_str(s, IR_X)
     emit_str(s, elem_ty)
-    emit_str(s, c"], ptr ")
+    emit_str(s, IR_RBRACK_PTR)
     emit_reg(s, base)
-    emit_str(s, c", i64 0, i64 ")
+    emit_str(s, IR_I64_ZERO)
     emit_reg(s, idx)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let loaded: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, loaded)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_str(s, elem_ty)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, elem_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     *out = emit_array_elem_widen(s, loaded, elem, elem_ty)
     return 1
 
@@ -661,23 +597,23 @@ fn emit_deref_index(s: *EmitterState, e: *Expr, elem: i32) -> i32
     let base_ptr: i32 = emit_index_base_ptr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
     let ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, ptr)
     emit_str(s, c" = getelementptr ")
     emit_str(s, ty)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, base_ptr)
-    emit_str(s, c", i64 ")
+    emit_str(s, IR_I64_SEP)
     emit_reg(s, idx)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let val: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, val)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_str(s, ty)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     return emit_array_elem_widen(s, val, elem, ty)
 
 # AGAST #2330, #2996: `e`, a whole struct element, where a number goes.  A copy
@@ -847,12 +783,7 @@ pub fn emit_index_base_ptr(s: *EmitterState, e: *Expr) -> i32
     let base: i32 = emit_expr(s, e)
     if expr_is_ptr_valued(s, e) == 1
         return base
-    let bptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
-    emit_reg(s, bptr)
-    emit_str(s, c" = inttoptr i64 ")
-    emit_reg(s, base)
-    emit_str(s, c" to ptr\n")
+    let bptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, base)
     bptr
 
 # AGAST #3565: the pointee of an index store's base `x` when it names a `*T`
@@ -884,23 +815,23 @@ fn emit_struct_ptr_index(s: *EmitterState, e: *Expr, name_sv: StrView) -> i32
     let base_ptr: i32 = emit_index_base_ptr(s, e.left)
     let idx: i32 = emit_expr(s, e.right)
     let ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, ptr)
     emit_str(s, c" = getelementptr ")
     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, base_ptr)
-    emit_str(s, c", i64 ")
+    emit_str(s, IR_I64_SEP)
     emit_reg(s, idx)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let val: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, val)
-    emit_str(s, c" = load ")
+    emit_str(s, IR_LOAD)
     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     return val
 
 pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
@@ -1093,25 +1024,25 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             return 0
         let sidx: i32 = emit_expr(s, e.right)
         let sptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, sptr)
-        emit_str(s, c" = getelementptr [")
+        emit_str(s, IR_GEP_ARRAY)
         emit_int(s, local.array_size as i64)
-        emit_str(s, c" x ")
+        emit_str(s, IR_X)
         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
-        emit_str(s, c"], ptr ")
+        emit_str(s, IR_RBRACK_PTR)
         emit_reg(s, local.reg)
-        emit_str(s, c", i64 0, i64 ")
+        emit_str(s, IR_I64_ZERO)
         emit_reg(s, sidx)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         let sval: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, sval)
-        emit_str(s, c" = load ")
+        emit_str(s, IR_LOAD)
         emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, sptr)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         return sval
 
     if base_type == TYPE_ARRAY and local != null
@@ -1122,25 +1053,25 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         let elem_ty: *u8 = elem_mem_llvm(local.array_elem_type)
         let idx: i32 = emit_expr(s, e.right)
         let elem_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, elem_ptr)
-        emit_str(s, c" = getelementptr [")
+        emit_str(s, IR_GEP_ARRAY)
         emit_int(s, local.array_size as i64)
-        emit_str(s, c" x ")
+        emit_str(s, IR_X)
         emit_str(s, elem_ty)
-        emit_str(s, c"], ptr ")
+        emit_str(s, IR_RBRACK_PTR)
         emit_reg(s, local.reg)
-        emit_str(s, c", i64 0, i64 ")
+        emit_str(s, IR_I64_ZERO)
         emit_reg(s, idx)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
-        emit_str(s, c" = load ")
+        emit_str(s, IR_LOAD)
         emit_str(s, elem_ty)
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, elem_ptr)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         return emit_array_elem_widen(s, result, local.array_elem_type, elem_ty)
 
     # AGAST #1504: a GLOBAL `[N]T` array. The branch above covers only an
@@ -1205,19 +1136,19 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             let idx_s: i32 = emit_expr(s, e.right)
             # GEP to data ptr field (index 0 of Span struct)
             let data_ptr_ptr: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, data_ptr_ptr)
-            emit_str(s, c" = getelementptr %")
+            emit_str(s, IR_GEP_NAMED)
             emit_name(s, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
-            emit_str(s, c", ptr ")
+            emit_str(s, IR_PTR_SEP)
             emit_reg(s, local.reg)
             emit_str(s, c", i32 0, i32 0\n")
             let data_ptr: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, data_ptr)
-            emit_str(s, c" = load ptr, ptr ")
+            emit_str(s, IR_LOAD_PTR)
             emit_reg(s, data_ptr_ptr)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             # Decode element type from suffix after "Span$"
             let elem_name_s: *u8 = local.type_name + 5
             let elem_len_s: i32 = local.type_name_len - 5
@@ -1243,71 +1174,41 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 elem_kind_s = TYPE_U16
             # GEP by index
             let elem_ptr_s: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, elem_ptr_s)
             emit_str(s, c" = getelementptr ")
             emit_str(s, elem_ty_s3)
-            emit_str(s, c", ptr ")
+            emit_str(s, IR_PTR_SEP)
             emit_reg(s, data_ptr)
-            emit_str(s, c", i64 ")
+            emit_str(s, IR_I64_SEP)
             emit_reg(s, idx_s)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             let val_s: i32 = next_reg(s)
-            emit_str(s, c"  ")
+            emit_str(s, IR_INDENT)
             emit_reg(s, val_s)
-            emit_str(s, c" = load ")
+            emit_str(s, IR_LOAD)
             emit_str(s, elem_ty_s3)
-            emit_str(s, c", ptr ")
+            emit_str(s, IR_PTR_SEP)
             emit_reg(s, elem_ptr_s)
-            emit_str(s, c"\n")
+            emit_str(s, IR_NL)
             # Zero/sign-extend to i64 for uniform value representation
             if elem_kind_s == TYPE_U8
-                let ext: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ext)
-                emit_str(s, c" = zext i8 ")
-                emit_reg(s, val_s)
-                emit_str(s, c" to i64\n")
+                let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val_s)
                 return ext
             else if elem_kind_s == TYPE_I8
-                let ext: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ext)
-                emit_str(s, c" = sext i8 ")
-                emit_reg(s, val_s)
-                emit_str(s, c" to i64\n")
+                let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val_s)
                 return ext
             else if elem_kind_s == TYPE_I32
-                let ext: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ext)
-                emit_str(s, c" = sext i32 ")
-                emit_reg(s, val_s)
-                emit_str(s, c" to i64\n")
+                let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val_s)
                 return ext
             else if elem_kind_s == TYPE_U32
-                let ext: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ext)
-                emit_str(s, c" = zext i32 ")
-                emit_reg(s, val_s)
-                emit_str(s, c" to i64\n")
+                let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val_s)
                 return ext
             else if elem_kind_s == TYPE_I16
-                let ext: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ext)
-                emit_str(s, c" = sext i16 ")
-                emit_reg(s, val_s)
-                emit_str(s, c" to i64\n")
+                let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val_s)
                 return ext
             else if elem_kind_s == TYPE_U16
-                let ext: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, ext)
-                emit_str(s, c" = zext i16 ")
-                emit_reg(s, val_s)
-                emit_str(s, c" to i64\n")
+                let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val_s)
                 return ext
             return val_s
 
@@ -1325,11 +1226,11 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 # Array field in struct - GEP directly into it
                 let idx: i32 = emit_expr(s, e.right)
                 let elem_ptr: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, elem_ptr)
-                emit_str(s, c" = getelementptr [")
+                emit_str(s, IR_GEP_ARRAY)
                 emit_int(s, field.array_size as i64)
-                emit_str(s, c" x ")
+                emit_str(s, IR_X)
                 if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
                     # AGAST #188: struct-array RHS — `[N x %T]` so the GEP
                     # element stride matches the actual struct layout.  Without
@@ -1341,11 +1242,11 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 else
                     # AGAST #1814: the field's declared element type.
                     emit_str(s, elem_mem_llvm(et))
-                emit_str(s, c"], ptr ")
+                emit_str(s, IR_RBRACK_PTR)
                 emit_reg(s, member_result.reg)
-                emit_str(s, c", i64 0, i64 ")
+                emit_str(s, IR_I64_ZERO)
                 emit_reg(s, idx)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 # Load element. Integer/pointer elements load at their own
                 # width (array_elem_llvm) and widen to i64. Bool loads its i1
                 # and zero-extends. AGAST #1954: f32 / f64 elements load the
@@ -1357,28 +1258,23 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 if et == TYPE_BOOL or et == TYPE_F32 or et == TYPE_F64
                     load_ty = elem_mem_llvm(et)
                 let result: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, result)
-                emit_str(s, c" = load ")
+                emit_str(s, IR_LOAD)
                 if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
                     # AGAST #188: load the struct value as `%T`, not as i64.
                     emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (field.array_elem_type_name), len: (field.array_elem_type_name_len) as i64 })
                 else
                     emit_str(s, load_ty)
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, elem_ptr)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 if et == TYPE_STRUCT and field.array_elem_type_name_len > 0
                     return result
                 if et == TYPE_F32 or et == TYPE_F64
                     return result
                 if et == TYPE_BOOL
-                    let bext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, bext)
-                    emit_str(s, c" = zext i1 ")
-                    emit_reg(s, result)
-                    emit_str(s, c" to i64\n")
+                    let bext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, result)
                     return bext
                 # Extend to i64 if needed (zext unsigned, sext signed,
                 # ptrtoint pointers; i64 as-is).
@@ -1395,31 +1291,26 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
             else if field.field_type == TYPE_PTR_PTR and field.field_type_name_len > 0
                 let idx_pp: i32 = emit_expr(s, e.right)
                 let arr_base_pp: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, arr_base_pp)
-                emit_str(s, c" = load ptr, ptr ")
+                emit_str(s, IR_LOAD_PTR)
                 emit_reg(s, member_result.reg)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 let slot_pp: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, slot_pp)
                 emit_str(s, c" = getelementptr ptr, ptr ")
                 emit_reg(s, arr_base_pp)
-                emit_str(s, c", i64 ")
+                emit_str(s, IR_I64_SEP)
                 emit_reg(s, idx_pp)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 let val_pp: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, val_pp)
-                emit_str(s, c" = load ptr, ptr ")
+                emit_str(s, IR_LOAD_PTR)
                 emit_reg(s, slot_pp)
-                emit_str(s, c"\n")
-                let pti_pp: i32 = next_reg(s)
-                emit_str(s, c"  ")
-                emit_reg(s, pti_pp)
-                emit_str(s, c" = ptrtoint ptr ")
-                emit_reg(s, val_pp)
-                emit_str(s, c" to i64\n")
+                emit_str(s, IR_NL)
+                let pti_pp: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, val_pp)
                 return pti_pp
             # AGAST #1596: `x.f[i]` value-read with `f: *T` (primitive int
             # pointee) or `**T`: load the pointer from the field, GEP by the
@@ -1435,13 +1326,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 let pf_idx: i32 = emit_expr(s, e.right)
                 let pf_ptr: i32 = emit_ptr_field_elem_addr(s, member_result.reg, field, pf_kind, pf_idx)
                 let pf_val: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, pf_val)
-                emit_str(s, c" = load ")
+                emit_str(s, IR_LOAD)
                 emit_str(s, pf_ty)
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, pf_ptr)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 return emit_array_elem_widen(s, pf_val, pf_kind, pf_ty)
             # AGAST #3972: `x.f[i]` with `f: *S`, the whole S by value, as
             # `p[i]` on a `*S` local is (#3052).  It took the byte path below:
@@ -1454,13 +1345,13 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 let ps_idx: i32 = emit_expr(s, e.right)
                 let ps_ptr: i32 = emit_ptr_field_elem_addr(s, member_result.reg, field, TYPE_STRUCT, ps_idx)
                 let ps_val: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, ps_val)
-                emit_str(s, c" = load ")
+                emit_str(s, IR_LOAD)
                 emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, ps_ptr)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 return ps_val
             # Port of ritz0 bedc85b: Vec<T> field indexing — s.vec_field[i]
             # The field is a Vec$T struct: { *T data, i64 len, i64 cap }.
@@ -1471,20 +1362,20 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     let idx_v: i32 = emit_expr(s, e.right)
                     # GEP to data field of Vec struct
                     let data_ptr_ptr: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, data_ptr_ptr)
-                    emit_str(s, c" = getelementptr %")
+                    emit_str(s, IR_GEP_NAMED)
                     emit_name(s, StrView { ptr: (field.field_type_name), len: (field.field_type_name_len) as i64 })
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, member_result.reg)
                     emit_str(s, c", i32 0, i32 0\n")
                     # Load data pointer
                     let data_ptr: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, data_ptr)
-                    emit_str(s, c" = load ptr, ptr ")
+                    emit_str(s, IR_LOAD_PTR)
                     emit_reg(s, data_ptr_ptr)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     # Determine element type from suffix after "Vec$"
                     let elem_name: *u8 = field.field_type_name + 4
                     let elem_len: i32 = field.field_type_name_len - 4
@@ -1517,72 +1408,42 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                         elem_kind = TYPE_U16
                     # GEP by index
                     let elem_ptr: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, elem_ptr)
                     emit_str(s, c" = getelementptr ")
                     emit_str(s, elem_ty_str)
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, data_ptr)
-                    emit_str(s, c", i64 ")
+                    emit_str(s, IR_I64_SEP)
                     emit_reg(s, idx_v)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     # Load the element
                     let val_reg: i32 = next_reg(s)
-                    emit_str(s, c"  ")
+                    emit_str(s, IR_INDENT)
                     emit_reg(s, val_reg)
-                    emit_str(s, c" = load ")
+                    emit_str(s, IR_LOAD)
                     emit_str(s, elem_ty_str)
-                    emit_str(s, c", ptr ")
+                    emit_str(s, IR_PTR_SEP)
                     emit_reg(s, elem_ptr)
-                    emit_str(s, c"\n")
+                    emit_str(s, IR_NL)
                     # Extend to i64 for uniform value representation
                     if elem_kind == TYPE_I32
-                        let ext: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ext)
-                        emit_str(s, c" = sext i32 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i64\n")
+                        let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val_reg)
                         return ext
                     else if elem_kind == TYPE_U32
-                        let ext: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ext)
-                        emit_str(s, c" = zext i32 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i64\n")
+                        let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val_reg)
                         return ext
                     else if elem_kind == TYPE_I16
-                        let ext: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ext)
-                        emit_str(s, c" = sext i16 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i64\n")
+                        let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val_reg)
                         return ext
                     else if elem_kind == TYPE_U16
-                        let ext: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ext)
-                        emit_str(s, c" = zext i16 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i64\n")
+                        let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val_reg)
                         return ext
                     else if elem_kind == TYPE_I8
-                        let ext: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ext)
-                        emit_str(s, c" = sext i8 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i64\n")
+                        let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val_reg)
                         return ext
                     else if elem_kind == TYPE_U8
-                        let ext: i32 = next_reg(s)
-                        emit_str(s, c"  ")
-                        emit_reg(s, ext)
-                        emit_str(s, c" = zext i8 ")
-                        emit_reg(s, val_reg)
-                        emit_str(s, c" to i64\n")
+                        let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val_reg)
                         return ext
                     return val_reg
 
@@ -1599,33 +1460,33 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                 let idx_v: i32 = emit_expr(s, e.right)
                 # Allocate a stack slot for the returned Vec and store
                 let slot: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, slot)
-                emit_str(s, c" = alloca %")
+                emit_str(s, IR_ALLOCA_NAMED)
                 emit_name(s, StrView { ptr: (cfn.return_type_name), len: (cfn.return_type_name_len) as i64 })
-                emit_str(s, c"\n")
-                emit_str(s, c"  store %")
+                emit_str(s, IR_NL)
+                emit_str(s, IR_STORE_STRUCT)
                 emit_name(s, StrView { ptr: (cfn.return_type_name), len: (cfn.return_type_name_len) as i64 })
-                emit_str(s, c" ")
+                emit_str(s, IR_SP)
                 emit_reg(s, call_val)
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, slot)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 # GEP to data field
                 let data_ptr_ptr: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, data_ptr_ptr)
-                emit_str(s, c" = getelementptr %")
+                emit_str(s, IR_GEP_NAMED)
                 emit_name(s, StrView { ptr: (cfn.return_type_name), len: (cfn.return_type_name_len) as i64 })
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, slot)
                 emit_str(s, c", i32 0, i32 0\n")
                 let data_ptr: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, data_ptr)
-                emit_str(s, c" = load ptr, ptr ")
+                emit_str(s, IR_LOAD_PTR)
                 emit_reg(s, data_ptr_ptr)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 # Decode elem type suffix after "Vec$"
                 let elem_name2: *u8 = cfn.return_type_name + 4
                 let elem_len2: i32 = cfn.return_type_name_len - 4
@@ -1657,72 +1518,42 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
                     elem_kind2 = TYPE_U16
                 # GEP by index
                 let elem_ptr2: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, elem_ptr2)
                 emit_str(s, c" = getelementptr ")
                 emit_str(s, elem_ty_s2)
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, data_ptr)
-                emit_str(s, c", i64 ")
+                emit_str(s, IR_I64_SEP)
                 emit_reg(s, idx_v)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 # Load
                 let val2: i32 = next_reg(s)
-                emit_str(s, c"  ")
+                emit_str(s, IR_INDENT)
                 emit_reg(s, val2)
-                emit_str(s, c" = load ")
+                emit_str(s, IR_LOAD)
                 emit_str(s, elem_ty_s2)
-                emit_str(s, c", ptr ")
+                emit_str(s, IR_PTR_SEP)
                 emit_reg(s, elem_ptr2)
-                emit_str(s, c"\n")
+                emit_str(s, IR_NL)
                 # Extend to i64
                 if elem_kind2 == TYPE_I32
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = sext i32 ")
-                    emit_reg(s, val2)
-                    emit_str(s, c" to i64\n")
+                    let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val2)
                     return ext
                 else if elem_kind2 == TYPE_U32
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = zext i32 ")
-                    emit_reg(s, val2)
-                    emit_str(s, c" to i64\n")
+                    let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val2)
                     return ext
                 else if elem_kind2 == TYPE_I16
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = sext i16 ")
-                    emit_reg(s, val2)
-                    emit_str(s, c" to i64\n")
+                    let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val2)
                     return ext
                 else if elem_kind2 == TYPE_U16
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = zext i16 ")
-                    emit_reg(s, val2)
-                    emit_str(s, c" to i64\n")
+                    let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val2)
                     return ext
                 else if elem_kind2 == TYPE_I8
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = sext i8 ")
-                    emit_reg(s, val2)
-                    emit_str(s, c" to i64\n")
+                    let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val2)
                     return ext
                 else if elem_kind2 == TYPE_U8
-                    let ext: i32 = next_reg(s)
-                    emit_str(s, c"  ")
-                    emit_reg(s, ext)
-                    emit_str(s, c" = zext i8 ")
-                    emit_reg(s, val2)
-                    emit_str(s, c" to i64\n")
+                    let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val2)
                     return ext
                 return val2
 
@@ -1739,36 +1570,26 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
     if base_type == TYPE_PTR_PTR
         # Pointer-to-pointer: index by pointer size, load pointer
         # First convert base i64 back to ptr
-        let base_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, base_ptr)
-        emit_str(s, c" = inttoptr i64 ")
-        emit_reg(s, base)
-        emit_str(s, c" to ptr\n")
+        let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, base)
 
         let ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, ptr)
         emit_str(s, c" = getelementptr ptr, ptr ")
         emit_reg(s, base_ptr)
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_reg(s, idx)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
-        emit_str(s, c" = load ptr, ptr ")
+        emit_str(s, IR_LOAD_PTR)
         emit_reg(s, ptr)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
         # Convert ptr to i64 for our uniform value representation
-        let pti: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, pti)
-        emit_str(s, c" = ptrtoint ptr ")
-        emit_reg(s, result)
-        emit_str(s, c" to i64\n")
+        let pti: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, result)
         return pti
     else if (base_type == TYPE_PTR or base_type == TYPE_REF or base_type == TYPE_MUT_REF) and ((ty_is_int(elem_pointee) == 1 and elem_pointee != TYPE_U8) or ty_is_float(elem_pointee) == 1)
         # AGAST #1328: pointee-typed pointer indexing — GEP by the element
@@ -1779,76 +1600,61 @@ pub fn emit_expr_index(s: *EmitterState, e: *Expr) -> i32
         # `double` (local_array_elem_llvm's spelling) and returns the value
         # as-is; it used to fall to the byte path below (`load i8`).
         let elem_ty: *u8 = elem_mem_llvm(elem_pointee)
-        let base_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, base_ptr)
-        emit_str(s, c" = inttoptr i64 ")
-        emit_reg(s, base)
-        emit_str(s, c" to ptr\n")
+        let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, base)
         let ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, ptr)
         emit_str(s, c" = getelementptr ")
         emit_str(s, elem_ty)
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, base_ptr)
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_reg(s, idx)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
-        emit_str(s, c" = load ")
+        emit_str(s, IR_LOAD)
         emit_str(s, elem_ty)
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, ptr)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         if ty_int_bits(elem_pointee) == 64 or elem_pointee == TYPE_F32 or elem_pointee == TYPE_F64
             return result
         let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, ext)
         if ty_is_unsigned(elem_pointee) == 1
             emit_str(s, c" = zext ")
         else
             emit_str(s, c" = sext ")
         emit_str(s, elem_ty)
-        emit_str(s, c" ")
+        emit_str(s, IR_SP)
         emit_reg(s, result)
-        emit_str(s, c" to i64\n")
+        emit_str(s, IR_TO_I64)
         return ext
     else
         # Pointer-to-byte: index by 1, load byte
         # First convert i64 value back to ptr
-        let base_ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, base_ptr)
-        emit_str(s, c" = inttoptr i64 ")
-        emit_reg(s, base)
-        emit_str(s, c" to ptr\n")
+        let base_ptr: i32 = ir_inttoptr_ptr(s.out, @s.reg_counter, base)
 
         let ptr: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, ptr)
         emit_str(s, c" = getelementptr i8, ptr ")
         emit_reg(s, base_ptr)
-        emit_str(s, c", i64 ")
+        emit_str(s, IR_I64_SEP)
         emit_reg(s, idx)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
         let result: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, result)
         emit_str(s, c" = load i8, ptr ")
         emit_reg(s, ptr)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
 
-        let ext: i32 = next_reg(s)
-        emit_str(s, c"  ")
-        emit_reg(s, ext)
-        emit_str(s, c" = zext i8 ")
-        emit_reg(s, result)
-        emit_str(s, c" to i64\n")
+        let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, result)
         return ext
 
 # Build a `%Enum` value whose tag is `tag` (alloca + zero + store i8 + load),
@@ -1914,7 +1720,7 @@ pub fn emit_no_instance_error(s: *EmitterState, name_sv: StrView, span: SrcSpan)
     eprints_cstr(c"<...>` type\n")
     s.error_count = s.error_count + 1
     let z: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, z)
     emit_str(s, c" = add i64 0, 0  ; constructor with no instance (error)\n")
     z
@@ -1923,39 +1729,39 @@ fn emit_unit_variant_value(s: *EmitterState, enum_name_sv: StrView, tag: i32) ->
     var enum_name: *u8 = enum_name_sv.ptr
     var enum_name_len: i32 = enum_name_sv.len as i32
     let slot: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, slot)
-    emit_str(s, c" = alloca %")
+    emit_str(s, IR_ALLOCA_NAMED)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
     emit_str(s, c"  ; enum variant ctor\n")
     # Zero-init so any padding is deterministic
-    emit_str(s, c"  store %")
+    emit_str(s, IR_STORE_STRUCT)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
     emit_str(s, c" zeroinitializer, ptr ")
     emit_reg(s, slot)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     # Pointer to the tag byte (field 0)
     let tag_ptr: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, tag_ptr)
-    emit_str(s, c" = getelementptr %")
+    emit_str(s, IR_GEP_NAMED)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot)
     emit_str(s, c", i32 0, i32 0\n")
     emit_str(s, c"  store i8 ")
     emit_int(s, tag as i64)
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, tag_ptr)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     let val: i32 = next_reg(s)
-    emit_str(s, c"  ")
+    emit_str(s, IR_INDENT)
     emit_reg(s, val)
-    emit_str(s, c" = load %")
+    emit_str(s, IR_LOAD_NAMED)
     emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-    emit_str(s, c", ptr ")
+    emit_str(s, IR_PTR_SEP)
     emit_reg(s, slot)
-    emit_str(s, c"\n")
+    emit_str(s, IR_NL)
     return val
 
 # Copy `len` bytes of `src` to `dst`; returns `dst + len`.
@@ -2085,7 +1891,7 @@ fn emit_strlit_field(s: *EmitterState, e: *Expr) -> i32
     let lit: *Expr = e.left
     if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"len"), len: (3) as i64 }) == 1
         let r: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, r)
         emit_str(s, c" = add i64 0, ")
         emit_int(s, lit.string_len as i64)
@@ -2094,15 +1900,15 @@ fn emit_strlit_field(s: *EmitterState, e: *Expr) -> i32
     if name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"ptr"), len: (3) as i64 }) == 1
         let str_idx: i32 = add_string(s, StrView { ptr: (lit.string_ptr), len: (lit.string_len) as i64 })
         let gep: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, gep)
-        emit_str(s, c" = getelementptr [")
+        emit_str(s, IR_GEP_ARRAY)
         emit_int(s, (lit.string_len + 1) as i64)
         emit_str(s, c" x i8], ptr @.str.")
         emit_int(s, str_idx as i64)
         emit_str(s, c", i64 0, i64 0\n")
         let r: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, r)
         emit_str(s, c" = ptrtoint ptr ")
         emit_reg(s, gep)
@@ -2154,81 +1960,41 @@ pub fn emit_expr_member(s: *EmitterState, e: *Expr) -> i32
         let field_ptr: i32 = member_result.reg
         # Load the field value
         let val_reg: i32 = next_reg(s)
-        emit_str(s, c"  ")
+        emit_str(s, IR_INDENT)
         emit_reg(s, val_reg)
-        emit_str(s, c" = load ")
+        emit_str(s, IR_LOAD)
         emit_field_llvm_type(s, field)
-        emit_str(s, c", ptr ")
+        emit_str(s, IR_PTR_SEP)
         emit_reg(s, field_ptr)
-        emit_str(s, c"\n")
+        emit_str(s, IR_NL)
         # Convert to i64 if needed
         if field.field_type == TYPE_I32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i32 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_sext_i32_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else if field.field_type == TYPE_U32
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i32 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_zext_i32_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else if field.field_type == TYPE_I8
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i8 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_sext_i8_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else if field.field_type == TYPE_U8
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i8 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_zext_i8_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else if field.field_type == TYPE_I16
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = sext i16 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_sext_i16_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else if field.field_type == TYPE_U16
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i16 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_zext_i16_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else if field.field_type == TYPE_PTR or field.field_type == TYPE_PTR_PTR
-            let pti: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, pti)
-            emit_str(s, c" = ptrtoint ptr ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let pti: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, val_reg)
             return pti
         else if field.field_type == TYPE_BOOL
             # AGAST #1646: a bool field is stored as i1 but, like every other
             # scalar, read into an i64 register. Operators (`not`, `and`,
             # `==`), `-> bool` returns and bool call args all assume i64;
             # the raw i1 load was invalid IR in each.
-            let ext: i32 = next_reg(s)
-            emit_str(s, c"  ")
-            emit_reg(s, ext)
-            emit_str(s, c" = zext i1 ")
-            emit_reg(s, val_reg)
-            emit_str(s, c" to i64\n")
+            let ext: i32 = ir_zext_i1_i64(s.out, @s.reg_counter, val_reg)
             return ext
         else
             return val_reg
