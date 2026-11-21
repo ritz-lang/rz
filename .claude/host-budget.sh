@@ -111,12 +111,23 @@ set -euo pipefail
 # .borque/profile.toml): maybe no HOME, PATH or XDG_RUNTIME_DIR.  Supply the
 # standard ones; `systemctl --user` can't reach the user manager without the
 # runtime dir.  Tests: projects/ritz/tools/test_borque_hooks.py.
+HOME_FROM_PASSWD=""
+[[ -n "${HOME:-}" ]] || HOME_FROM_PASSWD=1
 : "${HOME:=$(getent passwd "$(id -u)" | cut -d: -f6)}"
 : "${PATH:=/usr/local/bin:/usr/bin:/bin}"
 : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
 export HOME PATH XDG_RUNTIME_DIR
 # shellcheck source=host-env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/host-env.sh"
+# Name the host.env this hook read when the environment did not carry HOME
+# (AGAST #4424).  hostd's hooks run with a clean environment (#3722), so the
+# file then comes from the passwd home — not necessarily the file the caller
+# expected.  Saying so turns "unknown key RZ_..." from a mystery into a
+# file:line, and a host operator's config can no longer silently decide a
+# test's verdict.
+if [[ -n "$HOME_FROM_PASSWD" ]]; then
+    echo "note: HOME unset; host config is $RZ_HOST_ENV_FILE" >&2
+fi
 
 UNITS="${RZ_SYSTEMD_USER_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user}"
 CONTROL="${RZ_SYSTEMD_CONTROL_DIR:-$XDG_RUNTIME_DIR/systemd/user.control}"

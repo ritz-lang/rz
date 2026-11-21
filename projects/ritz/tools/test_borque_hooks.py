@@ -500,24 +500,78 @@ def test_host_budget_keeps_a_given_runtime_dir(host):
     )
 
 
-def test_host_budget_runs_without_home_or_path(host):
-    """--verify reads only: no HOME, no PATH, and it still gives a verdict.
+def _verify_without_home(host: dict, env_file: Path) -> subprocess.CompletedProcess:
+    """--verify as hostd runs it: no HOME, no PATH, config at ENV_FILE.
 
-    No RZ_HOST_ENV either, so host.env's default path needs a home: the
-    passwd entry's (read only; this host's own file, if it has one).
+    RZ_HOST_ENV is host-env.sh's explicit path (AGAST #2998), so the test
+    controls the whole host.env it reads.  Without it the hook would fall back
+    to the passwd entry's ~/.config/rz/host.env: the operator's real file,
+    whose contents (a key this base's host-env.sh predates, say) must not be
+    able to red a gate about the hooks (AGAST #4424).
     """
-    units = host["home"] / "units"
-    r = _hook(
+    return _hook(
         host,
         "host-budget.sh",
         "--verify",
         ROOM,
         HOME=None,
-        RZ_SYSTEMD_USER_DIR=str(units),
+        RZ_HOST_ENV=str(env_file),
+        RZ_SYSTEMD_USER_DIR=str(host["home"] / "units"),
     )
+
+
+def test_host_budget_runs_without_home_or_path(host):
+    """(a) No host.env at all: --verify reads only and still gives a verdict."""
+    cfg = host["home"] / "cfg" / "host.env"  # never written
+    r = _verify_without_home(host, cfg)
     assert r.returncode == 1, r.stderr
     assert "MISSING OR STALE" in r.stderr
     assert "unbound" not in r.stderr
+    # With HOME unset the hook must say which file it consulted.  This is the
+    # file we chose, not the operator's: if the isolation is lost, the note
+    # names the passwd home instead and this fails (AGAST #4424).
+    assert f"note: HOME unset; host config is {cfg}" in r.stderr
+
+
+def test_host_budget_accepts_a_host_env_with_only_known_keys(host):
+    """(b) KNOWN keys load: install works and --verify reports them as in effect."""
+    cfg = host["home"] / "cfg" / "host.env"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text(
+        "RZ_ROOMS_MEMORY_HIGH=2G\n"
+        "RZ_ROOMS_MEMORY_MAX=3G\n"
+        "RZ_GATE_SLOTS=2\n"
+        "RZ_TEST_BUDGET_SCALE=1.5\n"
+    )
+    units = host["home"] / "units"
+    path = f"{_systemctl(host)}:/usr/bin:/bin"
+    install = _hook(
+        host,
+        "host-budget.sh",
+        ROOM,
+        PATH=path,
+        RZ_HOST_ENV=str(cfg),
+        RZ_SYSTEMD_USER_DIR=str(units),
+    )
+    assert install.returncode == 0, install.stderr
+    r = _verify_without_home(host, cfg)
+    assert r.returncode == 0, r.stderr
+    assert "host budget OK" in r.stdout
+    assert f"from {cfg}" in r.stdout
+
+
+def test_host_budget_names_a_host_env_key_this_tree_does_not_know(host):
+    """(c) An UNKNOWN key fails, naming the file: not an anonymous mystery."""
+    cfg = host["home"] / "cfg" / "host.env"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("RZ_NOT_A_KEY=1\n")
+    r = _verify_without_home(host, cfg)
+    assert r.returncode == 2, r.stderr
+    assert f"{cfg}:1: unknown key RZ_NOT_A_KEY" in r.stderr
+    # The verdict is about OUR file; the operator's was never read.
+    assert str(Path(os.path.expanduser("~")) / ".config" / "rz" / "host.env") not in (
+        r.stderr
+    )
 
 
 # --------------------------------------------------------------------------
