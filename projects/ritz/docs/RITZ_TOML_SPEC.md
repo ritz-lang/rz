@@ -106,7 +106,7 @@ One binary. Its source is `entry`, else `path`, else src/<name>.ritz.
 | Key | Type | Default | Read by | Description |
 |---|---|---|---|---|
 | `name` | string | **required** | `projects/ritz/manifest.py plan_binaries` | Binary name. |
-| `entry` | string |  | `projects/ritz/manifest.py plan_binaries` | `"module::function"`, resolved under `sources`. |
+| `entry` | string |  | `projects/ritz/manifest.py plan_binaries` | `"module::function"`: `module` selects the source file under `sources`; `function` is the target's entry fn, which the file must define (a hosted binary's is `main`). |
 | `path` | string |  | `projects/ritz/manifest.py plan_binaries` | Source file, relative to the package. A non-.ritz path is listed and skipped. |
 | `sources` | string or string list |  | `projects/ritz/manifest.py plan_binaries` | Source roots for this binary. Defaults to the package's. |
 | `freestanding` | bool | `false` | `projects/ritz/manifest.py plan_binaries` | No libc, no runtime. |

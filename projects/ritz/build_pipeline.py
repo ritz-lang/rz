@@ -1729,8 +1729,16 @@ def freestanding_runtime_object(bin_config: BinaryConfig) -> Optional[Path]:
     return runtime_path
 
 
-def link_uefi(name: str, bin_path: Path, object_files: list[Path]) -> bool:
-    """Link a PE/COFF EFI application with lld-link. False once reported."""
+def link_uefi(name: str, bin_path: Path, object_files: list[Path],
+              entry_symbol: str) -> bool:
+    """Link a PE/COFF EFI application with lld-link. False once reported.
+
+    `entry_symbol` is the target's `[[bin]] entry` function half (AGAST
+    #4434): UEFI is the one freestanding link that owns an entry symbol on
+    its command line, so it comes from the manifest, not a hardcode. The
+    PE entry is that function directly; a target with no `entry` uses the
+    language entry, `main`.
+    """
     # Use find_llvm_tool so versioned installs (lld-link-19, ...) are
     # found — a bare which("lld-link") misses every distro package that
     # only ships the versioned name.
@@ -1765,7 +1773,7 @@ def link_uefi(name: str, bin_path: Path, object_files: list[Path]) -> bool:
     # Direct PE/COFF linking with lld-link: a proper PE32+ with the
     # optional header UEFI expects.
     print(f"  📦 Linking PE/COFF with lld-link...")
-    link_cmd = [lld_link, "/subsystem:efi_application", "/entry:efi_main",
+    link_cmd = [lld_link, "/subsystem:efi_application", f"/entry:{entry_symbol}",
                 f"/out:{bin_path}", *[str(obj) for obj in object_files]]
     result = bounded_run.step(link_cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -1828,9 +1836,14 @@ def freestanding_provenance(bin_config: BinaryConfig, sources: list[Path], compi
                        if ".incbin" in line and (m := _INCBIN.search(line))]
         asm.append(_file_record(asm_file) + [incbins])
     script = bin_config.linker_script
+    target_flags = {"objects": freestanding_target(bin_config).key_flags, "uefi": is_uefi,
+                    "pic": bin_config.pic, "link_runtime": bin_config.link_runtime}
+    if is_uefi:
+        # The manifest's entry function half is the PE entry symbol (AGAST
+        # #4434), so changing it must relink rather than reuse this binary.
+        target_flags["entry"] = bin_config.entry_fn
     record.update(
-        target={"objects": freestanding_target(bin_config).key_flags, "uefi": is_uefi,
-                "pic": bin_config.pic, "link_runtime": bin_config.link_runtime},
+        target=target_flags,
         asm=asm,
         linker_script=_file_record(script) if script else None,
     )
@@ -1844,7 +1857,8 @@ def _link_freestanding(bin_config: BinaryConfig, bin_path: Path, is_uefi: bool,
     linked = private_output_path(bin_path)
     try:
         if is_uefi:
-            ok = link_uefi(bin_config.name, linked, object_files)
+            ok = link_uefi(bin_config.name, linked, object_files,
+                           bin_config.entry_fn)
         else:
             ok = link_freestanding_elf(bin_config, linked, object_files)
         if ok:

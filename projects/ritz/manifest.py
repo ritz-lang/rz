@@ -204,8 +204,11 @@ PACKAGE_SCHEMA = Table(
                 {
                     "name": Value(STRING, "Binary name.",
                                   (f"{MANIFEST_PY}::plan_binaries",), required=True),
-                    "entry": Value(STRING, '`"module::function"`, resolved under '
-                                   "`sources`.", (f"{MANIFEST_PY}::plan_binaries",)),
+                    "entry": Value(STRING, '`"module::function"`: `module` '
+                                   "selects the source file under `sources`; "
+                                   "`function` is the target's entry fn, which "
+                                   "the file must define (a hosted binary's is "
+                                   "`main`).", (f"{MANIFEST_PY}::plan_binaries",)),
                     "path": Value(STRING, "Source file, relative to the package. "
                                   "A non-.ritz path is listed and skipped.",
                                   (f"{MANIFEST_PY}::plan_binaries",)),
@@ -552,16 +555,21 @@ def load(path) -> dict:
 def resolve_entry_point(entry: str, pkg_dir: Path, sources: list[str]) -> tuple[Path, str] | None:
     """Resolve entry = "module::function" to (file_path, function_name).
 
-    Per RFC #109 §2.4:
-    - Parse entry = "path.to.module::function"
-    - Convert module path to file: path/to/module.ritz
-    - Search in sources directories
-    - Return (file_path, function_name) or None if not found
+    `module` selects the source file under `sources`; `function` names that
+    binary target's entry function. Both halves are part of the contract
+    (AGAST #4434, LARB R68):
+
+    - a hosted binary's entry function is `main` (§5.7);
+    - a freestanding target may name another function, and a UEFI link uses
+      it as the PE entry symbol (`plan_binaries` refuses a function the file
+      does not define).
+
+    Returns (file_path, function_name), or None when no source file matches
+    `module`, or `entry` has no `::`.
 
     Examples:
-        main::main          → src/main.ritz, fn main()
-        http.server::run    → src/http/server.ritz, fn run()
-        tools.cli::main     → src/tools/cli.ritz, fn main()
+        main::main          → src/main.ritz, "main"
+        main::kernel_main   → src/main.ritz, "kernel_main"
     """
     if "::" not in entry:
         return None
@@ -591,29 +599,49 @@ def resolve_entry_point(entry: str, pkg_dir: Path, sources: list[str]) -> tuple[
     return None
 
 
-def detect_main_function(source_path: Path) -> str | None:
-    """Detect the main function name in a source file.
+def defined_functions(source_path: Path) -> set[str] | None:
+    """The fns `source_path` defines, or None if it cannot be parsed.
 
-    Used for backward compatibility with path = "file.ritz" syntax.
-    Returns "main" if found, or None.
+    Used to hold a manifest's `entry` function half to something real: a
+    named function that the declared source file does not define is a build
+    failure, not a silent fall-through to `main` (AGAST #4434). A parse
+    failure is left to the compiler, whose diagnostic is more precise.
     """
+    ritz0_dir = Path(__file__).resolve().parent / "ritz0"
+    if str(ritz0_dir) not in sys.path:
+        sys.path.insert(0, str(ritz0_dir))
     from lexer import Lexer
     from parser import Parser
     import ritz_ast as rast
 
     try:
-        source = source_path.read_text()
-        lexer = Lexer(source, str(source_path))
-        tokens = lexer.tokenize()
-        parser = Parser(tokens)
-        module = parser.parse_module()
-
-        for item in module.items:
-            if isinstance(item, rast.FnDef) and item.name == 'main':
-                return 'main'
-        return None
+        source = source_path.read_text(encoding="utf-8")
+        module = Parser(Lexer(source, str(source_path)).tokenize()).parse_module()
     except Exception:
         return None
+    return {item.name for item in module.items if isinstance(item, rast.FnDef)}
+
+
+def _entry_function_error(entry: str, fn_name: str, src_path: Path,
+                          pkg_dir: Path, freestanding: bool) -> str | None:
+    """Why `entry` cannot name `fn_name` in `src_path`, or None.
+
+    The language has one entry convention — `main` in one of §5.7's shapes —
+    so a hosted binary cannot name another function. Freestanding targets may
+    (harland's `kernel_main`/`efi_main`), but the function must still be
+    defined by the file `entry` selected.
+    """
+    if not freestanding and fn_name != "main":
+        return (f"entry '{entry}' names '{fn_name}'; a hosted binary's entry "
+                f"function is 'main'")
+    defined = defined_functions(src_path)
+    if defined is not None and fn_name not in defined:
+        try:
+            where = src_path.relative_to(pkg_dir).as_posix()
+        except ValueError:
+            where = str(src_path)
+        return f"entry '{entry}' names '{fn_name}', which {where} does not define"
+    return None
 
 
 def discover_sources(pkg_dir: Path, sources: list[str] | None) -> list[Path]:
@@ -748,6 +776,8 @@ class BinaryConfig:
     name: str                    # Binary name
     src_path: Path               # Main source file
     additional_sources: list[Path]  # Extra sources (deprecated)
+    entry_fn: str = "main"       # Entry function in src_path ([[bin]] entry's
+                                 # function half; `main` for a hosted binary)
     freestanding: bool = False   # If True, no runtime, custom linker
     target: str = ""             # Target triple (e.g., "x86_64-none-elf")
     target_os: str = ""          # Target OS for conditional compilation (e.g., "harland", "linux")
@@ -931,8 +961,13 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
     if "bin" in config:
         for bin_entry in config["bin"]:
             name = bin_entry["name"]
+            # Read before entry resolution: whether the target is freestanding
+            # decides which entry functions `entry` may name (AGAST #4434).
+            freestanding = bin_entry.get("freestanding", False)
 
-            # RFC #109: entry = "module::function"
+            # RFC #109: entry = "module::function". Both halves are honoured:
+            # the module selects the source file, the function is the target's
+            # entry function (AGAST #4434, LARB R68).
             if "entry" in bin_entry:
                 entry = bin_entry["entry"]
                 # Use bin-specific sources if provided, else package-level
@@ -948,10 +983,16 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
                     plan.unresolved.append(SkippedBinary(
                         name, f"could not resolve entry point '{entry}'"))
                     continue
-                src_path, _fn_name = result
+                src_path, entry_fn = result
+                error = _entry_function_error(entry, entry_fn, src_path,
+                                              pkg_dir, freestanding)
+                if error is not None:
+                    plan.unresolved.append(SkippedBinary(name, error))
+                    continue
             # Legacy: path = "src/main.ritz"
             elif "path" in bin_entry:
                 src_path = pkg_dir / bin_entry["path"]
+                entry_fn = "main"
                 # Legitimate skip: a [[bin]] pointing at a .py/.sh script is
                 # not something this compiler builds. Named, not inferred.
                 if not src_path.suffix == ".ritz":
@@ -961,6 +1002,7 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
             # Default: src/{name}.ritz
             else:
                 src_path = pkg_dir / "src" / f"{name}.ritz"
+                entry_fn = "main"
 
             # Get additional sources if specified (legacy, deprecated)
             additional_sources = []
@@ -972,7 +1014,6 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
                         additional_sources.append(src_path_check)
 
             # Parse freestanding build options
-            freestanding = bin_entry.get("freestanding", False)
             target = bin_entry.get("target", "")
             target_os = bin_entry.get("target_os", "")
 
@@ -1010,6 +1051,7 @@ def plan_binaries(pkg_dir: Path, config: dict) -> BinaryPlan:
                 name=name,
                 src_path=src_path,
                 additional_sources=additional_sources,
+                entry_fn=entry_fn,
                 freestanding=freestanding,
                 target=target,
                 target_os=target_os,

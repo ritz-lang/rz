@@ -47,7 +47,11 @@ class TestEntryPointResolution:
         assert fn_name == "main"
 
     def test_nested_module(self, tmp_path):
-        """http.server::run → src/http/server.ritz, fn run()"""
+        """http.server::run → src/http/server.ritz, fn run().
+
+        Resolution keeps both halves; plan_binaries is what decides whether
+        the named function is a legal entry for the target (AGAST #4434).
+        """
         src_dir = tmp_path / "src" / "http"
         src_dir.mkdir(parents=True)
         server_file = src_dir / "server.ritz"
@@ -99,6 +103,135 @@ class TestEntryPointResolution:
         path, fn_name = result
         assert path == main_file
         assert fn_name == "main"
+
+
+class TestEntryFunctionContract:
+    """`entry`'s function half is honoured (AGAST #4434, LARB R68).
+
+    R68: the language has one entry convention, `main` in one of §5.7's
+    shapes.  `[[bin]] entry` is a build-target key: its module half selects
+    the source file, its function half names that target's entry function.
+    A hosted binary's entry function is `main`; a freestanding target may
+    name another (harland's `kernel_main`/`efi_main`), and the UEFI link
+    takes its PE entry symbol from the manifest rather than a hardcode.
+    """
+
+    @staticmethod
+    def _config(root: Path) -> dict:
+        import tomllib
+        return tomllib.loads((root / "ritz.toml").read_text())
+
+    @pytest.mark.unit
+    def test_hosted_entry_must_name_main(self, tmp_path):
+        """A non-`main` function half on a hosted target is refused."""
+        (tmp_path / "src" / "http").mkdir(parents=True)
+        (tmp_path / "src" / "http" / "server.ritz").write_text(
+            "pub fn run() -> i32\n    0\n")
+        (tmp_path / "ritz.toml").write_text(
+            '[package]\nname = "p"\nversion = "0.1.0"\n'
+            '\n[[bin]]\nname = "srv"\nentry = "http.server::run"\n')
+
+        plan = _build_module.plan_binaries(tmp_path, self._config(tmp_path))
+        assert plan.buildable == []
+        assert [u.name for u in plan.unresolved] == ["srv"]
+        assert "entry" in plan.unresolved[0].reason
+        assert "main" in plan.unresolved[0].reason
+
+    @pytest.mark.unit
+    def test_hosted_entry_file_without_main_names_entry(self, tmp_path):
+        """The file exists but defines no `main`: the error names `entry`."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.ritz").write_text(
+            "pub fn other() -> i32\n    0\n")
+        (tmp_path / "ritz.toml").write_text(
+            '[package]\nname = "p"\nversion = "0.1.0"\n'
+            '\n[[bin]]\nname = "p"\nentry = "main::main"\n')
+
+        plan = _build_module.plan_binaries(tmp_path, self._config(tmp_path))
+        assert plan.buildable == []
+        assert [u.name for u in plan.unresolved] == ["p"]
+        reason = plan.unresolved[0].reason
+        assert "entry" in reason
+        assert "main" in reason
+        assert "main.ritz" in reason
+
+    @pytest.mark.unit
+    def test_freestanding_entry_function_is_carried_to_the_link(self, tmp_path):
+        """harland's `main::kernel_main` names the target's entry function."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.ritz").write_text(
+            "pub fn kernel_main(boot_info: u64) -> i32\n    0\n")
+        (tmp_path / "ritz.toml").write_text(
+            '[package]\nname = "p"\nversion = "0.1.0"\n'
+            '\n[[bin]]\nname = "k"\nentry = "main::kernel_main"\n'
+            'freestanding = true\ntarget = "x86_64-none-elf"\n')
+
+        plan = _build_module.plan_binaries(tmp_path, self._config(tmp_path))
+        assert plan.unresolved == []
+        assert [(b.name, b.entry_fn) for b in plan.buildable] == [("k", "kernel_main")]
+
+    @pytest.mark.unit
+    def test_freestanding_entry_missing_function_names_entry(self, tmp_path):
+        """A freestanding entry that names an absent fn is a named failure."""
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "main.ritz").write_text(
+            "pub fn other() -> i32\n    0\n")
+        (tmp_path / "ritz.toml").write_text(
+            '[package]\nname = "p"\nversion = "0.1.0"\n'
+            '\n[[bin]]\nname = "k"\nentry = "main::kernel_main"\n'
+            'freestanding = true\n')
+
+        plan = _build_module.plan_binaries(tmp_path, self._config(tmp_path))
+        assert plan.buildable == []
+        assert [u.name for u in plan.unresolved] == ["k"]
+        reason = plan.unresolved[0].reason
+        assert "entry" in reason and "kernel_main" in reason
+
+    @pytest.mark.unit
+    def test_uefi_link_takes_its_entry_symbol_from_the_manifest(self, tmp_path, monkeypatch):
+        """No `/entry:efi_main` hardcode: the caller supplies the symbol."""
+        import types
+        bp = _build_module.build_pipeline
+        calls = []
+        monkeypatch.setattr(bp, "shutil", types.SimpleNamespace(which=lambda tool: tool))
+        monkeypatch.setattr(bp, "bounded_run", types.SimpleNamespace(
+            step=lambda cmd, **kw: (calls.append(cmd),
+                                    types.SimpleNamespace(returncode=0, stderr=""))[1]))
+
+        assert bp.link_uefi("bootx64", tmp_path / "BOOTX64.EFI", [], "efi_main")
+        assert "/entry:efi_main" in calls[0]
+
+    @pytest.mark.unit
+    def test_uefi_link_is_given_the_binary_configs_entry_fn(self, tmp_path, monkeypatch):
+        """`_link_freestanding` passes BinaryConfig.entry_fn to the UEFI link."""
+        bp = _build_module.build_pipeline
+        seen = {}
+        monkeypatch.setattr(bp, "link_uefi",
+                            lambda name, path, objs, entry: seen.update(entry=entry) or True)
+        monkeypatch.setattr(bp, "publish_binary", lambda *a, **k: None)
+        config = bp.BinaryConfig(
+            name="bootx64", src_path=tmp_path / "main.ritz",
+            additional_sources=[], freestanding=True,
+            target="x86_64-unknown-uefi", entry_fn="efi_main")
+
+        assert bp._link_freestanding(config, tmp_path / "BOOTX64.EFI", True, [], None)
+        assert seen["entry"] == "efi_main"
+
+    @pytest.mark.unit
+    def test_uefi_entry_symbol_is_part_of_the_provenance(self, tmp_path):
+        """Changing the entry fn must relink, not reuse the cached PE."""
+        bp = _build_module.build_pipeline
+        src = tmp_path / "main.ritz"
+        src.write_text("pub fn efi_main() -> u64\n    0\n")
+        config = bp.BinaryConfig(
+            name="bootx64", src_path=src, additional_sources=[], freestanding=True,
+            target="x86_64-unknown-uefi", entry_fn="efi_main")
+
+        prov = bp.freestanding_provenance(config, [src], "ritz0", "hash", tmp_path)
+        assert prov["target"]["entry"] == "efi_main"
+        config.entry_fn = "other_entry"
+        prov = bp.freestanding_provenance(config, [src], "ritz0", "hash", tmp_path)
+        assert prov["target"]["entry"] == "other_entry"
 
 
 class TestSourceDiscovery:
@@ -227,14 +360,14 @@ def resolve_entry_point_from_path(path: str, pkg_dir: Path) -> tuple[Path, str] 
 
     Backward compatibility for path = "src/main.ritz" syntax.
     """
-    from build import detect_main_function
+    from build import defined_functions
     file_path = Path(path)
     if not file_path.is_absolute():
         file_path = pkg_dir / file_path
     if not file_path.exists():
         return None
-    fn_name = detect_main_function(file_path)
-    return (file_path, fn_name) if fn_name else None
+    names = defined_functions(file_path)
+    return (file_path, "main") if names and "main" in names else None
 
 
 # =============================================================================

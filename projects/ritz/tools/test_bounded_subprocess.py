@@ -177,7 +177,8 @@ def test_hung_freestanding_link_fails_the_link(hung_tools, tmp_path, capsys):
 @pytest.mark.integration
 def test_hung_uefi_link_fails_the_link(hung_tools, tmp_path, capsys):
     b = _load_build()
-    assert b.link_uefi("boot", tmp_path / "BOOT.EFI", [tmp_path / "a.o"]) is False
+    assert b.link_uefi("boot", tmp_path / "BOOT.EFI", [tmp_path / "a.o"],
+                       "efi_main") is False
     assert "timed out after 1s" in capsys.readouterr().err
 
 
