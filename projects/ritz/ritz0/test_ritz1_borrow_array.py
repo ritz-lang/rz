@@ -984,25 +984,17 @@ pub fn main() -> i32
 
 
 # `a[1] = v` through the `a:& [2]R` borrow drops the old a[1] (LARB R58,
-# §13.6): 3 drops. ritz0 does (AGAST #3474); ritz1 still drops 2 (AGAST #3475).
-R58_RITZ1_PENDING = {"element_store"}
-
-
+# §13.6): 3 drops, on both compilers (AGAST #3474, #3475).
 @pytest.mark.integration
-@pytest.mark.parametrize("name", [
-    pytest.param(n, marks=pytest.mark.xfail(
-        strict=True, reason="ritz1: a store through a borrow drops (AGAST #3475)"))
-    if n in R58_RITZ1_PENDING else n
-    for n in sorted(DROPS)])
+@pytest.mark.parametrize("name", sorted(DROPS))
 def test_drop_count_agrees(ritz1_bin, tmp_path, name):
     want = _run("ritz0", None, tmp_path / "..", f"{tmp_path.name}_r0", DROPS[name])
     assert _run("ritz1", ritz1_bin, tmp_path, name, DROPS[name]) == want
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("name", sorted(R58_RITZ1_PENDING))
-def test_ritz0_store_through_borrow_drops(tmp_path, name):
-    assert _run("ritz0", None, tmp_path, name, DROPS[name]) == 3
+def test_store_through_borrow_drops(tmp_path):
+    assert _run("ritz0", None, tmp_path, "element_store", DROPS["element_store"]) == 3
 
 
 WRONG_TYPE = r"main\.ritz:\d+:\d+: (error: )?argument \d+ of `\w+` has the wrong type"

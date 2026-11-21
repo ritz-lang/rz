@@ -2049,8 +2049,9 @@ fn own_assign_target(s: *EmitterState, stmt: *Stmt) -> *OwnBinding
 # x's flag and the bits of a and t: the move check rejects it with a moved
 # out (as Rust does, E0382), so the store never re-owns part of a moved
 # field.  A field with parts moved out drops what is left of it (AGAST
-# #2242).  A store through a pointer, or into an array element, drops nothing
-# (AGAST #2179).
+# #2242).  A store through an `@&T` / `:&` reference drops the field's old
+# value unconditionally; through a `*T` it drops nothing (LARB R58, see
+# own_store_reach).
 
 # The i1 "x owns the path whose bit and its parents' are `bits`" (x's flag,
 # and those bits clear), or 0 when x can't own it (an array binding).
@@ -2094,6 +2095,88 @@ fn own_field_drop_cond(s: *EmitterState, b: *OwnBinding, bits: i32) -> i32
     emit_str(s, c"\n")
     r
 
+# =============================================================================
+# Stores through a reference (LARB R58, §13.6)
+# =============================================================================
+#
+# A store through an `@T` / `@&T` / `:&` place drops the old value: a mutable
+# borrow always refers to a live owned value, so there is no flag to consult.
+# A store through a `*T` is a raw write and drops nothing.  Which one a place
+# is comes from the typing phase's expression types (ref_ty_of), not from the
+# IR already emitted.
+
+# How a place is reached: through a reference, through a raw pointer, or to a
+# binding's own storage.
+const OWN_REACH_OWNED: i32 = 0
+const OWN_REACH_REF: i32 = 1
+const OWN_REACH_RAW: i32 = 2
+
+# How the binding `loc` is reached: a `:&` / lent param, or an `@T` / `@&T`
+# local, is a reference; a `*T` is raw; anything else is owned.
+pub fn own_local_reach(loc: *LocalVar) -> i32
+    if loc == null
+        return OWN_REACH_OWNED
+    # A `:&` param (incl. a `self:&` impl receiver) holds the caller's
+    # pointer (AGAST #2286).
+    if loc.is_lent == 1 or loc.holds_lent_ptr == 1
+        return OWN_REACH_REF
+    if loc.var_type == TYPE_REF or loc.var_type == TYPE_MUT_REF
+        return OWN_REACH_REF
+    if loc.var_type == TYPE_PTR or loc.var_type == TYPE_PTR_PTR
+        return OWN_REACH_RAW
+    OWN_REACH_OWNED
+
+# How the place base `e` is reached: a borrow is a reference, a `*T` is raw,
+# anything else is owned.
+pub fn own_place_reach(s: *EmitterState, e: *Expr) -> i32
+    if e == null
+        return OWN_REACH_OWNED
+    if e.kind == EXPR_IDENT
+        return own_local_reach(find_local_struct_name(s, e.ident_ptr, e.ident_len))
+    var t: RefTy
+    if ref_ty_of(s, e, @t) == 1
+        if t.kind == TYPE_REF or t.kind == TYPE_MUT_REF
+            return OWN_REACH_REF
+        if t.kind == TYPE_PTR or t.kind == TYPE_PTR_PTR
+            return OWN_REACH_RAW
+    OWN_REACH_OWNED
+
+# How the store target `target` is reached (LARB R58, §13.6): walk up its
+# place -- a member's struct, an index's array, a deref's pointer -- and the
+# first base that is a reference or pointer says how.  A root binding is
+# owned unless it is a borrow.  A step the types can't name is owned, so the
+# binding's drop flag decides, as it did before.
+pub fn own_store_reach(s: *EmitterState, target: *Expr) -> i32
+    var place: *Expr = target
+    while place != null
+        if place.kind == EXPR_IDENT
+            return own_place_reach(s, place)
+        var base: *Expr = null
+        if place.kind == EXPR_MEMBER or place.kind == EXPR_INDEX
+            base = place.left
+        else if place.kind == EXPR_UNARY and place.op == OP_DEREF
+            base = place.operand
+        else
+            return OWN_REACH_OWNED
+        if base == null
+            return OWN_REACH_OWNED
+        let r: i32 = own_place_reach(s, base)
+        if r != OWN_REACH_OWNED
+            return r
+        place = base
+    OWN_REACH_OWNED
+
+# Drop the old field `f`'s value at `ptr` for a store through a reference:
+# its own Drop, then its move-only parts.  Nothing when it isn't move-only.
+pub fn own_drop_old_ref_field(s: *EmitterState, ptr: i32, f: *StructField)
+    if own_field_move_only(s, f, 0) == 1
+        own_emit_field_glue(s, ptr, f, 0)
+
+# Drop the old whole value `name` at `ptr` for a store through a reference.
+pub fn own_drop_old_ref_value(s: *EmitterState, ptr: i32, name: *u8, len: i32)
+    if own_type_is_move_only(s, name, len) == 1
+        own_emit_glue(s, ptr, name, len, 0)
+
 # A store to the move-only value at `path` of `b`: the drop condition of its
 # old value into o.fa_cond, and when `path` is the value stored to, the mask
 # saying which of its parts that old value has left.
@@ -2129,13 +2212,21 @@ fn own_local_field_path(s: *EmitterState, b: *OwnBinding, stmt: *Stmt, out_exact
 # and before v is stored: drop the old element at `elem_ptr`, of type `name`,
 # when a binding owns the array `arr` (the store's target without its
 # indexes): an array local's drop flag, or for a field path `h.a` h's flag
-# with `a` not moved out.  Through a pointer or reference, or into a global,
-# nothing owns the old element (AGAST #2179).  Every element of an owned Drop
-# array holds a value: such an array must be initialised (§3.3).
+# with `a` not moved out.  Through an `@&T` / `:&` reference it always drops
+# (LARB R58); through a `*T` or into a global, nothing does.  Every element
+# of an owned Drop array holds a value: such an array must be initialised
+# (§3.3).
 pub fn own_drop_old_elem(s: *EmitterState, arr: *Expr, elem_ptr: i32, name: *u8, len: i32)
     if arr == null or name == null or len <= 0
         return
     if own_type_is_move_only(s, name, len) == 0
+        return
+    # Through a reference it always drops (LARB R58); through a `*T` never.
+    let reach: i32 = own_store_reach(s, arr)
+    if reach == OWN_REACH_REF
+        own_emit_glue(s, elem_ptr, name, len, 0)
+        return
+    if reach == OWN_REACH_RAW
         return
     var cond: i32 = 0
     if arr.kind == EXPR_IDENT

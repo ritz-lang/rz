@@ -1,5 +1,5 @@
 """A store through a reference drops the old value; through `*T` it doesn't
-(LARB R58, AGAST #3474).
+(LARB R58, AGAST #3474 ritz0 / #3475 ritz1).
 
 LANGUAGE_SPEC §13.6: a store through an `@&T`, a `:&` parameter, or a place
 reached through one, drops the old value, in the same order as a store to an
@@ -11,13 +11,13 @@ nothing: a raw pointer may point at uninitialised memory (`box_new`).
 it builds its value, so `D` spells out what dropped and in what order.  Each
 program exits 42 when `D` is what the spec says, otherwise `D % 200`.
 
-ritz0 only: ritz1 is AGAST #3475.
+Runs on ritz0, ritz1 and ritz1_selfhosted; ritz0 is the oracle.
 """
 
 import pytest
-from test_ref_into_value import _run
+from test_ref_into_value import COMPILERS, _run
 
-pytestmark = pytest.mark.integration
+pytestmark = [pytest.mark.integration, pytest.mark.batched]
 
 PRELUDE = """\
 var D: i64 = 0
@@ -136,6 +136,17 @@ fn f()
     var r = Arr { a: [S { x: 1 }, S { x: 2 }] }
     put(@&r)
 """, 8152),
+    # An element of an array behind a `:& [2]S` borrow (the array-local
+    # element store, STMT_INDEX_ASSIGN): v (8), the old a[1] (2); at the
+    # caller's scope end a[0] (1), a[1] (5).
+    "element_through_array_borrow": ("""\
+fn put(a:& [2]S)
+    a[1] = mk(5)
+
+fn f()
+    var a: [2]S = [S { x: 1 }, S { x: 2 }]
+    put(@&a)
+""", 8215),
     # As an assignment expression (a match arm), `*p = v` and `p.t = v`
     # through a reference drop the old value too (AGAST #3583).
     "match_arm_deref_through_mut_ref": ("""\
@@ -188,10 +199,11 @@ fn f()
 }
 
 
+@pytest.mark.parametrize("compiler", COMPILERS)
 @pytest.mark.parametrize("name", sorted(RUNS))
-def test_store_through_reference_drops(tmp_path, name):
+def test_store_through_reference_drops(compiler, tmp_path, name):
     body, want = RUNS[name]
     src = (PRELUDE + body + "\npub fn main() -> i32\n    f()"
            + f"\n    return verdict({want})\n")
-    rc = _run("ritz0", tmp_path, name, src)
-    assert rc == 42, f"{name}: D % 200 == {rc}, spec says D == {want}"
+    rc = _run(compiler, tmp_path, name, src)
+    assert rc == 42, f"{compiler} {name}: D % 200 == {rc}, spec says D == {want}"

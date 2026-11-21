@@ -2644,6 +2644,9 @@ fn emit_lent_whole_store(s: *EmitterState, stmt: *Stmt, slot: i32) -> i32
         # A bare "..." is a %Span$u8; `r:& StrView` wants it as a %StrView.
         let val: i32 = coerce_struct_ret_value(s, stmt.assign_value, raw, loc.type_name, loc.type_name_len)
         let dst: i32 = emit_load_ptr(s, slot)
+        # LARB R58 (§13.6): `h = v` on a `h:& T` borrow stores the caller's
+        # T, so the old value drops after v, before the store.
+        own_drop_old_ref_value(s, dst, loc.type_name, loc.type_name_len)
         emit_str(s, c"  store ")
         emit_llvm_type_struct(s, TYPE_STRUCT, loc.type_name, loc.type_name_len)
         emit_str(s, c" ")
@@ -2692,6 +2695,12 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
     # When assign_target_len == 0, the target is in if_cond as an expression
     if stmt.assign_target_len == 0
         var target_expr: *Expr = stmt.if_cond as *Expr
+        # LARB R58 (§13.6): a store through an `@&T` / `:&` reference, or a
+        # place reached through one, drops the old value.  `orig_target` is
+        # the place as written; the rewrites below may restate it (e.g. an
+        # index as a deref), and the reach must be read from the original.
+        let orig_target: *Expr = target_expr
+        let orig_reach: i32 = own_store_reach(s, orig_target)
 
         # AGAST #2332: `a[i][j] = v` with `a: [N]*T` is `*(a[i] + j) = v`.  The
         # generic path below stored through the VALUE of `a[i][j]`.
@@ -2768,6 +2777,10 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
                 let field: *StructField = member_result.field
                 # AGAST #2142: `p.shape = Rect(..)` builds the field's enum.
                 let val: i32 = emit_expr_into_field(s, stmt.assign_value, field)
+                # LARB R58 (§13.6): through a reference, `p.t = v` drops the
+                # field's old value after v, before the store.
+                if orig_reach == OWN_REACH_REF and orig_target.kind == EXPR_MEMBER
+                    own_drop_old_ref_field(s, member_result.reg, field)
                 # AGAST #2048: f32 / f64 fields store float / double.
                 if emit_float_field_store(s, member_result.reg, field.field_type, val, stmt.assign_value) == 1
                     return
@@ -3089,6 +3102,13 @@ fn emit_assign(s: *EmitterState, stmt: *Stmt)
             val = emit_store_into_slot(s, stmt.assign_value, value_type, struct_name, struct_name_len)   # AGAST #2390
         else
             val = emit_expr(s, stmt.assign_value)
+        # LARB R58 (§13.6): `*p = v` through a reference drops the pointee's
+        # old value after v, before the store.  Only a literal `*p` target --
+        # not an index the rewrites restated as a deref -- and never through
+        # a `*T`, whose pointee may be uninitialised.
+        if orig_reach == OWN_REACH_REF and orig_target.kind == EXPR_UNARY and orig_target.op == OP_DEREF
+            if value_type == TYPE_STRUCT and struct_name_len > 0
+                own_drop_old_ref_value(s, ptr, struct_name, struct_name_len)
         # Store based on value type
         if value_type == TYPE_STRUCT and struct_name_len > 0
             # Struct store - emit: store %StructName %val, ptr %ptr
@@ -6798,6 +6818,11 @@ fn emit_stmt_inner(s: *EmitterState, stmt: *Stmt, ret_type: i32)
                     # Emit the value.  AGAST #2142: `f.cmap = None` builds
                     # the field's enum.
                     let val_reg: i32 = emit_expr_into_field(s, stmt.assign_value, field)
+                    # LARB R58 (§13.6): through a reference (`r.t = v` on a
+                    # local `@&T`, `h.t = v` on a `:& T` param) the field's
+                    # old value drops after v, before the store.
+                    if own_local_reach(loc) == OWN_REACH_REF
+                        own_drop_old_ref_field(s, field_ptr, field)
                     # Store the value based on field type.
                     #
                     # AGAST #1303: narrow fields (u8/i8/u16/i16) used to fall

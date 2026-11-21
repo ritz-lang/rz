@@ -5921,8 +5921,8 @@ in the same order: after `v`, before the store. A mutable borrow always refers
 to a live owned value, so there is no flag to consult. A store through a `*T`
 is a raw write and drops nothing: a raw pointer may point at uninitialised
 memory, as `box_new`'s `*b.ptr = value` into fresh `malloc` does. To replace a
-live value through a `*T`, lend it as `@&T` (LARB R58). ritz0 does this
-(AGAST #3474); ritz1 is AGAST #3475.
+live value through a `*T`, lend it as `@&T` (LARB R58). Both compilers do this
+(AGAST #3474, #3475).
 
 An assignment evaluates its place before its value, whatever the place is: a
 binding, a field, an element or a dereference. Every call in the place runs
