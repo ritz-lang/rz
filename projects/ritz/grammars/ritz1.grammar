@@ -288,7 +288,7 @@ trait_method_sig -> i32
 # never sees an alias.  Aliases declared after their use, or in a module
 # parsed after its importer, are handled by the driver re-parsing once the
 # table is populated (see main.ritz).  Honours [[target_os]] skipping.
-type_alias_def -> i32
+type_alias_def -> *TypeRef
     : TYPE IDENT ASSIGN alias_type_spec NEWLINE
       { type_alias_record(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, $4) }
     | PUB TYPE IDENT ASSIGN alias_type_spec NEWLINE
@@ -297,7 +297,7 @@ type_alias_def -> i32
 
 # AGAST #1879: latch a fn type's signature where the type ends (the record
 # action runs after NEWLINE, where fresh_fn_sig no longer hands it out).
-alias_type_spec -> i32
+alias_type_spec -> *TypeRef
     : type_spec { alias_type_latch(p, $1) }
     ;
 
@@ -468,7 +468,7 @@ param -> *Param
     | IDENT COLON type_spec { param_new(p, StrView { ptr: ($1.start), len: ($1.len) as i64 }, $3, $1.line, $1.col) }
     ;
 
-return_type -> i32
+return_type -> *TypeRef
     : ARROW ptr_nd_type { capture_fn_return_type(p, $2) }   # AGAST #3635
     | ARROW type_spec { capture_fn_return_type(p, $2) }
     ;
@@ -476,7 +476,7 @@ return_type -> i32
 # AGAST #3635: `*T` / `*mut T` where an N-D T `[N][M]..T` is lowered
 # (type_ptr_nd): a field, a global and a return type record its shape
 # (ptr_array_of_last).  Tried before type_spec at each of those sites.
-ptr_nd_type -> i32
+ptr_nd_type -> *TypeRef
     : STAR MUT type_spec { type_ptr_nd(p, $3) }
     # AGAST #4122: and `**[N][M]T`, whose `*x` is the `*[N][M]T`.  Before
     # `STAR type_spec`, whose type_spec would take the inner `*`.
@@ -609,7 +609,7 @@ global_var_def -> *GlobalVarDef
     ;
 
 # AGAST #3635: a global's type, `*[N][M]T` included (ptr_nd_type).
-global_type -> i32
+global_type -> *TypeRef
     : ptr_nd_type { $1 }
     | type_spec { $1 }
     ;
@@ -619,11 +619,11 @@ global_type -> i32
 # runs after the initializer, too late for fresh_fn_sig.  Both wrappers run
 # immediately after their type rule, while p.pos is still the token it ended
 # on.  extern_var_type keeps the extern forms' narrower type_spec.
-extern_var_type -> i32
+extern_var_type -> *TypeRef
     : type_spec { capture_global_fn_sig(p, $1) }
     ;
 
-global_var_type -> i32
+global_var_type -> *TypeRef
     : global_type { capture_global_fn_sig(p, $1) }
     ;
 
@@ -640,17 +640,19 @@ module_path -> *ImportPath
     | HEAP { path_new(p, StrView { ptr: ($1.start), len: ($1.len) as i64 }, 0 as *ImportPath) }
     ;
 
-# Type specification
-type_spec -> i32
-    : I8 { TYPE_I8 }
-    | I16 { TYPE_I16 }
-    | I32 { TYPE_I32 }
-    | I64 { TYPE_I64 }
-    | U8 { TYPE_U8 }
-    | U16 { TYPE_U16 }
-    | U32 { TYPE_U32 }
-    | U64 { TYPE_U64 }
-    | BOOL { TYPE_BOOL }
+# Type specification.  #4035: the parser builds a recursive `*TypeRef`; the
+# pointer / array / reference chain is its `pointee` / `elem`, not a flat kind
+# plus parser side channels.
+type_spec -> *TypeRef
+    : I8 { type_prim(p, TYPE_I8) }
+    | I16 { type_prim(p, TYPE_I16) }
+    | I32 { type_prim(p, TYPE_I32) }
+    | I64 { type_prim(p, TYPE_I64) }
+    | U8 { type_prim(p, TYPE_U8) }
+    | U16 { type_prim(p, TYPE_U16) }
+    | U32 { type_prim(p, TYPE_U32) }
+    | U64 { type_prim(p, TYPE_U64) }
+    | BOOL { type_prim(p, TYPE_BOOL) }
     | STAR MUT type_spec { type_ptr(p, $3) }   # AGAST #3930
     | STAR type_spec { type_ptr(p, $2) }
     | LBRACKET NUMBER RBRACKET type_spec { type_array(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, $4) }
@@ -678,13 +680,13 @@ type_spec -> i32
     # the callee's definition rather than `call i64 %f(i64 ...)`.
     # AGAST #3690: the `fn` token locates the type (a refused call through it).
     | FN LPAREN fn_ptr_params RPAREN ARROW type_spec { type_fn(p, $3, $6, $1.line, $1.col) }
-    | FN LPAREN fn_ptr_params RPAREN { type_fn(p, $3, TYPE_VOID, $1.line, $1.col) }
+    | FN LPAREN fn_ptr_params RPAREN { type_fn(p, $3, type_void(p), $1.line, $1.col) }
     | FN LPAREN RPAREN ARROW type_spec { type_fn(p, 0 as *Param, $5, $1.line, $1.col) }
-    | FN LPAREN RPAREN { type_fn(p, 0 as *Param, TYPE_VOID, $1.line, $1.col) }
+    | FN LPAREN RPAREN { type_fn(p, 0 as *Param, type_void(p), $1.line, $1.col) }
     # The unit type `()` (AGAST #2272), as in `Result<(), E>`.  It has no
     # value, so it is TYPE_VOID; as a generic argument it spells "unit", as
     # ritz0's mangle_type_name spells an empty TupleType.
-    | LPAREN RPAREN { TYPE_VOID }
+    | LPAREN RPAREN { type_void(p) }
     # A tuple type `(A, B, ...)` (AGAST #2956), two or more elements: a
     # struct type_tuple synthesizes once per spelling, named as ritz0's
     # mangle_type_name spells a TupleType ("tuple_u32_u32") and laid out as
@@ -770,7 +772,7 @@ generic_args -> *GenericArg
 # wraps the inner type exactly as its type_spec alternative does.  `[N]`
 # needs no NUMBER form: type_array_expr folds a literal length to the same
 # type type_array builds.
-type_spec_shr -> i32
+type_spec_shr -> *TypeRef
     : IDENT LT first_generic_type_arg type_arg_tail SHR { type_generic_with_saved(p, StrView { ptr: ($1.start), len: ($1.len) as i64 }, link_generic_arg($3, $4)) }
     | STAR MUT type_spec_shr { type_ptr(p, $3) }   # AGAST #3930
     | STAR type_spec_shr { type_ptr(p, $2) }
@@ -1066,7 +1068,7 @@ var_stmt -> *Stmt
 
 # Variable type - like type_spec but captures the type name for struct types
 # This prevents the type name from being clobbered when parsing the initializer expression
-var_type -> i32
+var_type -> *TypeRef
     : var_nd_type { $1 }   # AGAST #4122
     | STAR MUT type_spec { capture_var_type(p, type_ptr_nd(p, $3)) }   # AGAST #3930
     | STAR STAR type_spec { capture_var_type(p, type_ptr_nd(p, type_ptr_nd(p, $3))) }   # AGAST #3635
@@ -1078,7 +1080,7 @@ var_type -> i32
 # type (var_type's own `*` / `**` forms): behind a reference, `@*[N][M]T` /
 # `@&*[N][M]T`, or as the element of an array, `[K]*[N][M]T`.  Each latches
 # the shape (capture_var_type), with or without an initialiser.
-var_nd_type -> i32
+var_nd_type -> *TypeRef
     : AT AMP STAR type_spec { capture_var_type(p, type_mut_ref(p, type_ptr_nd(p, $4))) }
     | AT STAR type_spec { capture_var_type(p, type_ref(p, type_ptr_nd(p, $3))) }
     | LBRACKET NUMBER RBRACKET STAR type_spec { capture_var_type(p, type_array(p, StrView { ptr: ($2.start), len: ($2.len) as i64 }, type_ptr_nd(p, $5))) }
@@ -1443,7 +1445,7 @@ cast_tail -> *CastTail
 # (cast_type_end); otherwise a bare name is retried and the `<` is left to
 # the comparison.  `x as *Box<i64>` (or `Box<i64>`) at end of line, before
 # `)`, `.` or an operator, is the generic type.
-cast_type -> i32
+cast_type -> *TypeRef
     # AGAST #4122: `x as *[N][M]T`, which cast_tail_new records the shape of.
     : STAR type_spec cast_type_end { type_ptr_nd(p, $2) }
     | type_spec cast_type_end { $1 }
