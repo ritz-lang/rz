@@ -7,8 +7,8 @@ ritz1-built kernel would lay out GDT/IDT/ACPI structures wrong in silence.
 The rule (LANGUAGE_SPEC §17):
 
 * the attributes are `test`, `test_helper` (AGAST #1869),
-  `target_os = "..."`, `packed`, `naked`, `inline`, `always_inline`,
-  `noinline` and `callconv = "..."`;
+  `target_os = "..."`, `target_arch = "..."` (AGAST #4117), `packed`,
+  `naked`, `inline`, `always_inline`, `noinline` and `callconv = "..."`;
 * anything else, or a known attribute on an item kind it does not apply to,
   is a compile error located at the attribute (file:line:col);
 * `[[packed]]` structs have no padding: LLVM `<{ ... }>`, alignment 1, and
@@ -112,7 +112,7 @@ fn main() -> i32
 """
 
 UNKNOWN_KV = """\
-[[target_arch = "x86_64"]]
+[[target_cpu = "x86_64"]]
 fn main() -> i32
     0
 """
@@ -143,6 +143,12 @@ fn main() -> i32
 
 TARGET_OS_BARE = """\
 [[target_os]]
+fn main() -> i32
+    0
+"""
+
+TARGET_ARCH_BARE = """\
+[[target_arch]]
 fn main() -> i32
     0
 """
@@ -183,11 +189,12 @@ fn main() -> i32
 ERRORS = {
     # name: (source, line, col, needles)
     "unknown_bare": (UNKNOWN_BARE, 4, 3, ["unknown attribute", "frobnicate"]),
-    "unknown_kv": (UNKNOWN_KV, 1, 3, ["unknown attribute", "target_arch"]),
+    "unknown_kv": (UNKNOWN_KV, 1, 3, ["unknown attribute", "target_cpu"]),
     "packed_on_fn": (PACKED_ON_FN, 1, 3, ["packed", "struct"]),
     "naked_on_struct": (NAKED_ON_STRUCT, 1, 3, ["naked", "fn"]),
     "test_on_struct": (TEST_ON_STRUCT, 1, 3, ["test", "fn"]),
     "target_os_bare": (TARGET_OS_BARE, 1, 3, ["target_os", "value"]),
+    "target_arch_bare": (TARGET_ARCH_BARE, 1, 3, ["target_arch", "value"]),
     "packed_with_value": (PACKED_WITH_VALUE, 1, 3, ["packed", "value"]),
     "test_helper_on_struct": (TEST_HELPER_ON_STRUCT, 1, 3, ["test_helper", "fn"]),
     "test_helper_with_value": (TEST_HELPER_WITH_VALUE, 1, 3, ["test_helper", "value"]),
@@ -214,6 +221,9 @@ fn which() -> i32
 fn which() -> i32
     2
 
+[[target_arch = "x86_64"]]
+const ARCH_OK: i32 = 1
+
 [[test]]
 fn test_it() -> i32
     0
@@ -235,14 +245,14 @@ fn c() -> i32
     3
 
 fn main() -> i32
-    which() + a() + b() + c()
+    which() + a() + b() + c() + ARCH_OK
 """
 
 
 @pytest.mark.parametrize("compiler", COMPILERS)
 def test_known_attributes_compile(request, tmp_path, compiler):
     _need(compiler, request)
-    assert _run(compiler, tmp_path, KNOWN_OK) == 7
+    assert _run(compiler, tmp_path, KNOWN_OK) == 8
 
 
 # `[[a, b]]` is `[[a]] [[b]]` (LANGUAGE_SPEC §17, AGAST #1919): every entry

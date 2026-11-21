@@ -84,25 +84,40 @@ pub fn module_add_fn(m: *Module, f: *FnDef)
 # =============================================================================
 #
 # Items marked `[[target_os = "X"]]` are kept only when X is the target OS
-# (`--target-os`, default "linux" as in ritz0; AGAST #1550).  The skipped
-# variants must never reach the module — otherwise the wrong variant can win
-# the name-based dedup, breaking syscalls (e.g. sys_mmap with 4 params
-# instead of 6 → r8/r9 garbage → EINVAL → crash).
+# (`--target-os`, default "linux" as in ritz0; AGAST #1550).  Items marked
+# `[[target_arch = "A"]]` are kept only when A is the target architecture
+# (`--target-arch`, default "x86_64"; LANGUAGE_SPEC §17.2, AGAST #4117).  An
+# item carrying both must satisfy both.  The skipped variants must never
+# reach the module — otherwise the wrong variant can win the name-based
+# dedup, breaking syscalls (e.g. sys_mmap with 4 params instead of 6 →
+# r8/r9 garbage → EINVAL → crash).
 #
 # parse_attr calls check_target_os_filter(p, ident, str) after successfully
-# matching `[[ident = "string"]]`. If ident == "target_os" and string is not
-# the target OS, we set p.skip_item = 1. parse_item consumes this flag and
-# drops the item instead of adding it to the module.
+# matching `[[ident = "string"]]`. If ident is "target_os" or "target_arch"
+# and string is not the corresponding target, we set p.skip_item = 1.
+# parse_item consumes this flag and drops the item instead of adding it to
+# the module.
 
 # The target OS.  null means the default, "linux".  Set once by main.
 var g_target_os: *u8 = null
 var g_target_os_len: i32 = 0
+
+# The target architecture.  null means the default, "x86_64".  Set once by
+# main.
+var g_target_arch: *u8 = null
+var g_target_arch_len: i32 = 0
 
 pub fn set_target_os(os_sv: StrView)
     var os: *u8 = os_sv.ptr
     var os_len: i32 = os_sv.len as i32
     g_target_os = os
     g_target_os_len = os_len
+
+pub fn set_target_arch(arch_sv: StrView)
+    var arch: *u8 = arch_sv.ptr
+    var arch_len: i32 = arch_sv.len as i32
+    g_target_arch = arch
+    g_target_arch_len = arch_len
 
 # Check two byte buffers for exact equality over `len` bytes.
 # Duplicated here (not imported from emitter_core) to keep ast_helpers
@@ -124,14 +139,23 @@ pub fn check_target_os_filter(p: *Parser, ident_start_sv: StrView, str_val_sv: S
     var ident_len: i32 = ident_start_sv.len as i32
     var str_val: *u8 = str_val_sv.ptr
     var str_len: i32 = str_val_sv.len as i32
-    # Only act on `target_os` attribute.
-    if buf_eq(StrView { ptr: (ident_start), len: (ident_len) as i64 }, StrView { ptr: (c"target_os"), len: (9) as i64 }) == 0
+    # Only act on `target_os` and `target_arch` attributes.
+    let is_os: i32 = buf_eq(StrView { ptr: (ident_start), len: (ident_len) as i64 }, StrView { ptr: (c"target_os"), len: (9) as i64 })
+    let is_arch: i32 = buf_eq(StrView { ptr: (ident_start), len: (ident_len) as i64 }, StrView { ptr: (c"target_arch"), len: (11) as i64 })
+    if is_os == 0 and is_arch == 0
         return
-    if g_target_os == null
-        if buf_eq(StrView { ptr: (str_val), len: (str_len) as i64 }, StrView { ptr: (c"linux"), len: (5) as i64 }) == 1
+    if is_os == 1
+        if g_target_os == null
+            if buf_eq(StrView { ptr: (str_val), len: (str_len) as i64 }, StrView { ptr: (c"linux"), len: (5) as i64 }) == 1
+                return
+        else if buf_eq(StrView { ptr: (str_val), len: (str_len) as i64 }, StrView { ptr: (g_target_os), len: (g_target_os_len) as i64 }) == 1
             return
-    else if buf_eq(StrView { ptr: (str_val), len: (str_len) as i64 }, StrView { ptr: (g_target_os), len: (g_target_os_len) as i64 }) == 1
-        return
+    else
+        if g_target_arch == null
+            if buf_eq(StrView { ptr: (str_val), len: (str_len) as i64 }, StrView { ptr: (c"x86_64"), len: (6) as i64 }) == 1
+                return
+        else if buf_eq(StrView { ptr: (str_val), len: (str_len) as i64 }, StrView { ptr: (g_target_arch), len: (g_target_arch_len) as i64 }) == 1
+            return
     p.skip_item = 1
 
 # AGAST #1908: `[[test]]` (LANGUAGE_SPEC §17.1).  attr_flag notes it for the
@@ -193,6 +217,8 @@ pub fn test_fn_at(i: i64) -> *FnDef
 pub fn test_fns_reset()
     g_test_fn_count = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     # The re-parse allocates new items, possibly at a freed item's address.
     g_item_attr_count = 0
 
@@ -248,15 +274,15 @@ pub fn gated_decl_at(i: i32, out_len: *i32) -> *u8
 pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
     # AGAST #4055: a fn gated out never reaches the module, so main's
     # fn-conflict checks can't see two gated to one other target; note it.
-    if p.skip_item != 0 and (g_attr_bits & ATTR_TARGET_OS) != 0 and fn_def.body != null
-        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p), g_attr_target)
+    if p.skip_item != 0 and (g_attr_bits & ATTR_TARGET_ANY) != 0 and fn_def.body != null
+        fn_variant_note(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 }, fn_def.line, parse_file_copy_shared(p), attr_target_key())
     if p.skip_item != 0
         gated_decl_log(StrView { ptr: (fn_def.name), len: (fn_def.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
         module_add_fn(p.module, fn_def)
         # AGAST #2148: what main.ritz's fn-conflict checks read.
         fn_def.def_file = parse_file_copy_shared(p)
-        if (g_attr_bits & ATTR_TARGET_OS) != 0
+        if (g_attr_bits & ATTR_TARGET_ANY) != 0
             fn_def.target_gated = 1
         if (g_attr_bits & ATTR_TEST) != 0
             if fn_is_decl(fn_def) == 1
@@ -271,13 +297,15 @@ pub fn item_dispatch_fn(p: *Parser, fn_def: *FnDef) -> i32
             item_attr_record(fn_def as *u8, fn_bits)
     p.skip_item = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
     # AGAST #4111: noted kept or not; main checks same-named ones conflict.
     var target: u64 = 0
-    if (g_attr_bits & ATTR_TARGET_OS) != 0
-        target = g_attr_target
+    if (g_attr_bits & ATTR_TARGET_ANY) != 0
+        target = attr_target_key()
     var exists: i32 = 1
     if p.skip_item != 0
         exists = 0
@@ -290,17 +318,21 @@ pub fn item_dispatch_struct(p: *Parser, st: *StructDef) -> i32
             item_attr_record(st as *u8, ATTR_PACKED)
     p.skip_item = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_const(p: *Parser, c: *ConstEntry) -> i32
     if p.skip_item != 0
         gated_decl_log(StrView { ptr: (c.name), len: (c.name_len) as i64 })   # AGAST #3467
     if p.skip_item == 0
-        if (g_attr_bits & ATTR_TARGET_OS) != 0
+        if (g_attr_bits & ATTR_TARGET_ANY) != 0
             c.target_gated = 1
         module_add_const(p.module, c)
     p.skip_item = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
@@ -310,6 +342,8 @@ pub fn item_dispatch_global(p: *Parser, g: *GlobalVarDef) -> i32
         module_add_global_var(p.module, g)
     p.skip_item = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     return 1
 
 pub fn item_dispatch_enum(p: *Parser) -> i32
@@ -317,6 +351,8 @@ pub fn item_dispatch_enum(p: *Parser) -> i32
     # it); just reset skip flag and report progress.
     p.skip_item = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     return 1
 
 # =============================================================================
@@ -480,6 +516,9 @@ const ATTR_NOINLINE: i32 = 16
 const ATTR_WIN64: i32 = 32       # [[callconv = "win64"]] (AGAST #1879)
 const ATTR_TEST_HELPER: i32 = 64 # [[test_helper]]: may `assert` (AGAST #1869)
 const ATTR_TARGET_OS: i32 = 128  # any [[target_os = ..]] (AGAST #2149)
+const ATTR_TARGET_ARCH: i32 = 1024  # any [[target_arch = ..]] (§17.2, #4117)
+# Every [[target_*]] gate: an item carrying one is a gated variant.
+const ATTR_TARGET_ANY: i32 = ATTR_TARGET_OS + ATTR_TARGET_ARCH
 const ATTR_MUST_USE: i32 = 256   # [[must_use]]: result may not be discarded (AGAST #2137)
 const ATTR_NAKED: i32 = 512      # [[naked]]: body is asm only (§17.5, AGAST #3394)
 
@@ -491,10 +530,19 @@ const ATTR_ITEM_EXTERN_FN: i32 = 4
 const ATTR_ITEM_FN_ALIAS: i32 = 5    # `type X = fn(..) ..`
 
 var g_attr_bits: i32 = 0
-# The [[target_os]] value's hash, read only while ATTR_TARGET_OS is noted.
-var g_attr_target: u64 = 0
+# The [[target_os]] / [[target_arch]] value hashes, read only while their
+# bits are noted.  Reset with g_attr_bits after each item.
+var g_attr_target_os: u64 = 0
+var g_attr_target_arch: u64 = 0
 var g_attr_errors: i32 = 0
 var g_attr_last_err: *u8 = null
+
+# The identity of one gated item's target: the pair of hashes, in a fixed
+# order so that two definitions of one name conflict iff they are gated to
+# the same pair (0 when ungated).  A single hash cannot tell `linux` from
+# `x86_64`, and two attributes must not let the last one win.
+fn attr_target_key() -> u64
+    struct_variant_target_pair_key(g_attr_target_os, g_attr_target_arch)
 
 # (item pointer, ATTR_* bits) pairs, for attributes the emitter reads.
 var g_item_attrs: *i64 = null
@@ -556,7 +604,7 @@ fn attr_unknown(name_sv: StrView, line: i32, col: i32)
         return
     g_attr_last_err = name
     g_attr_errors = g_attr_errors + 1
-    diag_error_name(g_parse_file, diag_span(line, col), c"unknown attribute '", StrView { ptr: (name), len: (len) as i64 }, c"' (known: always_inline, callconv, inline, must_use, naked, noinline, packed, target_os, test, test_helper)")
+    diag_error_name(g_parse_file, diag_span(line, col), c"unknown attribute '", StrView { ptr: (name), len: (len) as i64 }, c"' (known: always_inline, callconv, inline, must_use, naked, noinline, packed, target_arch, target_os, test, test_helper)")
 
 # 1 for the attributes written bare, `[[name]]`.
 fn attr_is_bare_name(name_sv: StrView) -> i32
@@ -598,6 +646,9 @@ pub fn attr_flag(p: *Parser, name_sv: StrView, line: i32, col: i32) -> i32
     else if buf_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"target_os"), len: (9) as i64 }) == 1
         attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[target_os = <os name string>]]")
         return 0
+    else if buf_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"target_arch"), len: (11) as i64 }) == 1
+        attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[target_arch = <arch name string>]]")
+        return 0
     else if buf_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"callconv"), len: (8) as i64 }) == 1
         attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"needs a value: [[callconv = \"win64\"]] or [[callconv = \"c\"]]")
         return 0
@@ -625,7 +676,16 @@ pub fn attr_kv(p: *Parser, name_sv: StrView, line: i32, col: i32, str_val_sv: St
             attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, struct or const items only")
             return 0
         g_attr_bits = g_attr_bits | ATTR_TARGET_OS
-        g_attr_target = struct_variant_target_hash(StrView { ptr: (str_val), len: (str_len) as i64 })   # AGAST #4111
+        g_attr_target_os = struct_variant_target_hash(StrView { ptr: (c"target_os"), len: (9) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })   # AGAST #4111
+        check_target_os_filter(p, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
+        return 0
+    if buf_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"target_arch"), len: (11) as i64 }) == 1
+        let ak: i32 = attr_item_kind(p)
+        if ak != ATTR_ITEM_FN and ak != ATTR_ITEM_STRUCT and ak != ATTR_ITEM_CONST
+            attr_error(StrView { ptr: (name), len: (len) as i64 }, line, col, c"applies to fn, struct or const items only")
+            return 0
+        g_attr_bits = g_attr_bits | ATTR_TARGET_ARCH
+        g_attr_target_arch = struct_variant_target_hash(StrView { ptr: (c"target_arch"), len: (11) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
         check_target_os_filter(p, StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (str_val), len: (str_len) as i64 })
         return 0
     if buf_eq(StrView { ptr: (name), len: (len) as i64 }, StrView { ptr: (c"callconv"), len: (8) as i64 }) == 1
@@ -4892,6 +4952,8 @@ pub fn type_alias_sizeof_shape(name_sv: StrView, count: *i64, leaf: *i32, leaf_n
 pub fn item_dispatch_alias(p: *Parser) -> i32
     p.skip_item = 0
     g_attr_bits = 0
+    g_attr_target_os = 0
+    g_attr_target_arch = 0
     return 1
 
 # Handle immutable reference type @T

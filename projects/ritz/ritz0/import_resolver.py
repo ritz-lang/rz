@@ -42,6 +42,18 @@ from resolve import package_sources  # noqa: E402
 _CACHED_SPAN = rast.Span("<cached>", 0, 0, 0)
 
 
+def target_key(item) -> tuple:
+    """The (os, arch) pair a gated item is restricted to.
+
+    An item may carry `[[target_os]]`, `[[target_arch]]`, both, or neither
+    (LANGUAGE_SPEC §17.2, AGAST #4117).  Only items with the same pair can be
+    variants of one name; `(None, None)` is ungated.
+    """
+    if not hasattr(item, 'get_attr_value'):
+        return (None, None)
+    return (item.get_attr_value('target_os'), item.get_attr_value('target_arch'))
+
+
 def _calls(node, name: str) -> bool:
     """Does the AST under `node` call the free fn `name`?"""
     if isinstance(node, rast.Call) and isinstance(node.func, rast.Ident) \
@@ -1193,9 +1205,7 @@ class ImportResolver:
         file whose body calls it would bind to the kept one when instanced
         here, so that is refused rather than run wrong (AGAST #1858)."""
         for name, fns in self.functions.items():
-            ungated = [f for f in fns
-                       if not (hasattr(f, 'get_attr_value')
-                               and f.get_attr_value('target_os') is not None)]
+            ungated = [f for f in fns if target_key(f) == (None, None)]
             if len(ungated) < 2:
                 continue
             keep = (next((f for f in ungated if f.source_file == source_path), None)
@@ -1239,17 +1249,17 @@ class ImportResolver:
         item.source_file = source_file
 
         if isinstance(item, rast.StructDef):
-            # LANGUAGE_SPEC §17.2: a [[target_os]] struct exists only on its
-            # target, so a name may have one variant per target (AGAST
-            # #4054). Two that always coexist -- both ungated, or both gated
-            # to one target -- must be identical (an identical repeat is
-            # dropped). A gated variant beside an ungated one coexists only
-            # on its own target; resolve_struct_variants decides that after
-            # target_os filtering.
-            item_target_os = item.get_attr_value('target_os')
+            # LANGUAGE_SPEC §17.2: a [[target_os]] / [[target_arch]] struct
+            # exists only on its target, so a name may have one variant per
+            # target pair (AGAST #4054, #4117). Two that always coexist --
+            # both ungated, or both gated to the same pair -- must be
+            # identical (an identical repeat is dropped). A gated variant
+            # beside an ungated one coexists only on its own target;
+            # resolve_struct_variants decides that after target filtering.
+            item_target = target_key(item)
             variants = self.structs.setdefault(item.name, [])
             for existing in variants:
-                if existing.get_attr_value('target_os') != item_target_os:
+                if target_key(existing) != item_target:
                     continue
                 if not self._structs_equal(existing, item):
                     raise ImportError(
@@ -1260,31 +1270,31 @@ class ImportResolver:
             variants.append(item)
 
         elif isinstance(item, rast.FnDef):
-            # Store functions as lists to support multiple definitions with different
-            # [[target_os]] attributes. The correct one is selected by target_os filtering.
+            # Store functions as lists to support multiple definitions with
+            # different [[target_os]] / [[target_arch]] attributes. The
+            # correct one is selected by target filtering.
             if item.name not in self.functions:
                 self.functions[item.name] = []
 
-            # Check if this function has a target_os attribute
-            item_target_os = None
-            if hasattr(item, 'get_attr_value'):
-                item_target_os = item.get_attr_value('target_os')
+            # Check the item's (os, arch) gate
+            item_target = target_key(item)
 
-            if item_target_os is not None:
-                # A [[target_os]] fn: one variant per target (LANGUAGE_SPEC
-                # §17.2, AGAST #4055).  target_os filtering keeps the one for
-                # the target being compiled; two gated to the same target
-                # are an error whatever that target is -- this used to keep
-                # both, and filtering left the first to win silently.
+            if item_target != (None, None):
+                # A target-gated fn: one variant per target pair
+                # (LANGUAGE_SPEC §17.2, AGAST #4055, #4117).  Filtering keeps
+                # the one for the target being compiled; two gated to the
+                # same pair are an error whatever that target is -- this
+                # used to keep both, and filtering left the first to win
+                # silently.
                 for existing in self.functions[item.name]:
-                    if existing.get_attr_value('target_os') == item_target_os:
+                    if target_key(existing) == item_target:
                         raise ImportError(
                             f"Conflicting function definition for '{item.name}': "
                             f"defined in both {existing.source_file} and {source_file}"
                         )
                 self.functions[item.name].append(item)
             else:
-                # No target_os attribute: at most one ungated definition per
+                # No target attribute: at most one ungated definition per
                 # name in any one file's namespace (AGAST #2148, #1858;
                 # LANGUAGE_SPEC §15.3).  This used to keep the last one, so
                 # callers in the earlier module silently ran the later body.
@@ -1295,9 +1305,7 @@ class ImportResolver:
                 # Two generated `E__from` fns come from enums _enums_equal has
                 # already found identical, so the first is kept.
                 for existing in self.functions[item.name]:
-                    existing_target_os = (existing.get_attr_value('target_os')
-                                          if hasattr(existing, 'get_attr_value') else None)
-                    if existing_target_os is not None:
+                    if target_key(existing) != (None, None):
                         continue
                     if getattr(existing, 'generated', False) and getattr(item, 'generated', False):
                         return
@@ -1316,17 +1324,19 @@ class ImportResolver:
                 self.extern_fns[item.name] = item
 
         elif isinstance(item, rast.ConstDef):
-            # Constants with [[target_os]] can have multiple definitions with same name
-            # Add to list if it has target_os attribute, or if name doesn't exist
-            has_target_os = hasattr(item, 'get_attr_value') and item.get_attr_value('target_os') is not None
+            # Constants with [[target_os]] / [[target_arch]] can have
+            # multiple definitions with the same name
+            # Add to list if it is target-gated, or if name doesn't exist
+            has_target = target_key(item) != (None, None)
             if item.name in self.constants:
                 existing_list = self.constants[item.name]
-                # Check if any existing constant conflicts (same target_os or neither has target_os)
+                # Check if any existing constant conflicts (same target pair
+                # or neither is gated)
                 for existing in existing_list:
-                    existing_has_target_os = hasattr(existing, 'get_attr_value') and existing.get_attr_value('target_os') is not None
-                    if has_target_os and existing_has_target_os:
-                        # Both have target_os - OK if different values
-                        if item.get_attr_value('target_os') == existing.get_attr_value('target_os'):
+                    existing_has_target = target_key(existing) != (None, None)
+                    if has_target and existing_has_target:
+                        # Both gated - OK if different pairs
+                        if target_key(item) == target_key(existing):
                             if not self._consts_equal(existing, item):
                                 raise ImportError(
                                     f"Conflicting constant definition for '{item.name}': "
@@ -1334,8 +1344,8 @@ class ImportResolver:
                                 )
                             # Same definition - skip adding duplicate
                             break
-                    elif not has_target_os and not existing_has_target_os:
-                        # Neither has target_os - must be identical
+                    elif not has_target and not existing_has_target:
+                        # Neither is gated - must be identical
                         if not self._consts_equal(existing, item):
                             raise ImportError(
                                 f"Conflicting constant definition for '{item.name}': "
@@ -1343,7 +1353,7 @@ class ImportResolver:
                             )
                         # Same definition - skip adding duplicate
                         break
-                    # else: one has target_os and one doesn't - this is OK, both should be kept
+                    # else: one gated and one not - this is OK, both should be kept
                 else:
                     # No conflict found - add to list
                     self.constants[item.name].append(item)

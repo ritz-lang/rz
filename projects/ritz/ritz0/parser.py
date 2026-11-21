@@ -84,6 +84,8 @@ ATTRS = {
     # the calling [[test]] fn's location.
     "test_helper": (False, ("fn",)),
     "target_os": (True, ("fn", "struct", "const")),
+    # LANGUAGE_SPEC §17.2 (AGAST #4117): the item exists only for one arch.
+    "target_arch": (True, ("fn", "struct", "const")),
     "packed": (False, ("struct",)),
     "naked": (False, ("fn",)),
     "inline": (False, ("fn",)),

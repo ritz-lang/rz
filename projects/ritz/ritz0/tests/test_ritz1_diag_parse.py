@@ -50,7 +50,7 @@ CASES = {
         "fn main() -> i32\n"
         "    0\n"),
         ("unknown attribute 'nope' (known: always_inline, callconv, inline, "
-        "must_use, naked, noinline, packed, target_os, test, test_helper)"),
+        "must_use, naked, noinline, packed, target_arch, target_os, test, test_helper)"),
     ),
     "enum": (
         ("enum E: u8\n"

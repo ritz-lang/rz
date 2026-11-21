@@ -56,15 +56,25 @@ from emitter.fn_cache import (
 import ritz_ast as rast
 
 
+def _arch_from_triple(target: str) -> str:
+    """The architecture a target triple names: its first component.
+
+    `x86_64-unknown-linux-gnu` and `x86_64-none-elf` are `x86_64`.  This is
+    the default for `[[target_arch]]` (LANGUAGE_SPEC §17.2, AGAST #4117).
+    """
+    return target.split('-')[0] if target else 'x86_64'
+
+
 def _compile_mode(no_runtime, check_names, check_ownership,
                   dependencies, source_roots, project_root, target, target_os,
-                  test_mode, stack_protector=False, no_red_zone=False) -> dict:
+                  target_arch, test_mode, stack_protector=False,
+                  no_red_zone=False) -> dict:
     """Every compile_file input, besides the sources themselves, that shapes
     the output or whether the compile succeeds (AGAST #2020).
 
     The source-level fast path may only reuse an output built under the same
     mode.  Covered: the emit flags (no_runtime, test_mode, target, target_os,
-    stack_protector, no_red_zone);
+    target_arch, stack_protector, no_red_zone);
     the import roots, which decide WHICH file an import resolves to (the
     import hashes only vouch for the files the last compile resolved), as
     ImportResolver resolves them; and the checks, since a skip would stand in
@@ -87,6 +97,11 @@ def _compile_mode(no_runtime, check_names, check_ownership,
         'test_mode': bool(test_mode),
         'target': target,
         'target_os': target_os,
+        # The arch the triple names is already implied by `target`; record a
+        # differing override only, so existing mode keys stay valid (AGAST
+        # #4117, as for no_red_zone below).
+        **({'target_arch': target_arch}
+           if target_arch != _arch_from_triple(target) else {}),
         'stack_protector': bool(stack_protector),
         # Only when set: every existing mode key stays valid (AGAST #4308).
         **({'no_red_zone': True} if no_red_zone else {}),
@@ -100,27 +115,35 @@ def _compile_mode(no_runtime, check_names, check_ownership,
     }
 
 
-def _filter_by_target_os(module: rast.Module, target_os: str) -> rast.Module:
-    """Filter out items that don't match the target OS.
+def _filter_by_target_os(module: rast.Module, target_os: str,
+                         target_arch: str = None) -> rast.Module:
+    """Filter out items that don't match the target OS (and arch).
 
-    Items with [[target_os = "..."]] attribute are only included if the
-    attribute value matches the current target_os. Items without the
-    attribute are always included.
+    Items with [[target_os = "..."]] are only included if the attribute
+    value matches the current target_os; the same goes for [[target_arch]]
+    against target_arch.  An item carrying both must satisfy both
+    (LANGUAGE_SPEC §17.2, AGAST #4117).  Items without an attribute are
+    always included.
 
     Args:
         module: The module to filter
         target_os: The target OS to match (e.g., "linux", "harland")
+        target_arch: The target arch to match (e.g., "x86_64"); None keeps
+            every arch-gated item, as before this parameter existed.
 
     Returns:
         A new module with only matching items
     """
     filtered_items = []
     for item in module.items:
-        # Check if item has target_os attribute via get_attr_value method
+        # Check if item has a target attribute via get_attr_value method
         if hasattr(item, 'get_attr_value'):
             item_target_os = item.get_attr_value('target_os')
             if item_target_os is not None and item_target_os != target_os:
-                # Skip items that don't match target_os
+                continue
+            item_target_arch = item.get_attr_value('target_arch')
+            if (target_arch is not None and item_target_arch is not None
+                    and item_target_arch != target_arch):
                 continue
         filtered_items.append(item)
 
@@ -143,6 +166,7 @@ class _Compile:
     project_root: Optional[str] = None
     target: str = 'x86_64-unknown-linux-gnu'
     target_os: str = 'linux'
+    target_arch: str = 'x86_64'
     test_mode: bool = False
     stack_protector: bool = False
     no_red_zone: bool = False
@@ -284,13 +308,13 @@ def _resolve(ctx: _Compile) -> bool:
     # ...and the candidates it probed and missed on the way (AGAST #2030).
     ctx.import_misses = sorted(resolver.missed_candidates)
 
-    # Filter out items that don't match target_os
+    # Filter out items that don't match target_os and target_arch.
     # This must happen after import resolution but before name resolution
     # so that name resolution doesn't see excluded items.  Then at most one
     # definition of each struct and fn name may survive (AGAST #4054, #4270).
     ctx.module = resolver.resolve_fn_variants(
         resolver.resolve_struct_variants(
-            _filter_by_target_os(module, ctx.target_os)))
+            _filter_by_target_os(module, ctx.target_os, ctx.target_arch)))
     return True
 
 
@@ -585,7 +609,8 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
                   dependencies: dict = None,
                   source_roots: list = None, project_root: str = None,
                   target: str = 'x86_64-unknown-linux-gnu',
-                  target_os: str = 'linux', test_mode: bool = False,
+                  target_os: str = 'linux', target_arch: Optional[str] = None,
+                  test_mode: bool = False,
                   stack_protector: bool = False,
                   no_red_zone: bool = False) -> bool:
     """Compile a single Ritz source file to LLVM IR, by running PASSES.
@@ -594,18 +619,21 @@ def compile_file(source_path: str, output_path: str, no_runtime: bool = False,
     emitted as external declarations for linking.  The arguments are
     _Compile's inputs; see ritz0.py's argument parser for each flag.
     `test_mode` compiles the root of a test binary (LANGUAGE_SPEC §17.1).
+    `target_arch` defaults to the arch of `target`'s triple (§17.2).
     """
+    if target_arch is None:
+        target_arch = _arch_from_triple(target)
     try:
         ctx = _Compile(source_path, output_path, no_runtime, check_names,
                        check_ownership, dependencies, source_roots,
-                       project_root, target, target_os, test_mode,
+                       project_root, target, target_os, target_arch, test_mode,
                        stack_protector, no_red_zone)
         ctx.source = Path(source_path).read_text()
         ctx.source_abs_path = str(Path(source_path).resolve())
         ctx.mode_key = compile_mode_key(_compile_mode(
             no_runtime, check_names, check_ownership,
             dependencies, source_roots, project_root, target, target_os,
-            test_mode, stack_protector, no_red_zone))
+            target_arch, test_mode, stack_protector, no_red_zone))
         if _up_to_date(ctx):
             print(f"Skipped {source_path} (unchanged)")
             return True
@@ -696,6 +724,10 @@ def main():
     parser.add_argument('--target-os', default='linux',
                         help='Target OS for conditional compilation (default: linux). '
                              'Used with [[target_os = "..."]] attributes.')
+    parser.add_argument('--target-arch', default=None,
+                        help='Target architecture for conditional compilation '
+                             '(default: the first component of --target, e.g. '
+                             'x86_64). Used with [[target_arch = "..."]] attributes.')
     parser.add_argument('--stack-protector', action='store_true',
                         help='Give every defined function except a [[naked]] one '
                              'LLVM\'s sspstrong (AGAST #2590). The program must '
@@ -778,6 +810,7 @@ def main():
                                project_root=project_root,
                                target=args.target,
                                target_os=args.target_os,
+                               target_arch=args.target_arch,
                                test_mode=args.test_table,
                                stack_protector=args.stack_protector,
                                no_red_zone=args.no_red_zone)

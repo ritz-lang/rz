@@ -281,6 +281,10 @@ def _ritzlib_harland_numbers(src):
         if a:
             attr = a.group(1)
             continue
+        # Any other attribute (`[[target_arch = "x86_64"]]`, AGAST #4117)
+        # does not change which OS the following const is gated to.
+        if line.strip().startswith("[[") and line.strip().endswith("]]"):
+            continue
         c = re.match(r"^(?:pub\s+)?const\s+(SYS_\w+)\s*:\s*\w+\s*=\s*(\d+)", line)
         if c and attr in (None, "harland"):
             assert c.group(1) not in nums, f"ritzlib declares {c.group(1)} twice for harland"

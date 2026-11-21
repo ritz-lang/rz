@@ -11,8 +11,9 @@ The contract pinned here:
 
 * `const SYS_*` is declared in ritzlib/sys.ritz and nowhere else in ritzlib,
   and every one there carries a `[[target_os = "..."]]` attribute, so a
-  target only ever sees its own table. (`target_arch` gating is LARB's to
-  specify first; filed as a follow-up.)
+  target only ever sees its own table.
+* every Linux `SYS_*` also carries `[[target_arch = "x86_64"]]` (AGAST
+  #4117): the Linux numbers are x86_64's, and so are `syscall0..6`.
 * The collections a harland user program uses (gvec, string, hashmap, over
   memory) compile for `--target-os harland`.
 
@@ -34,7 +35,53 @@ RITZLIB = RITZ_ROOT / "ritzlib"
 SYS = RITZLIB / "sys.ritz"
 
 CONST_SYS = re.compile(r"^\s*(?:pub\s+)?const\s+(SYS_\w+)\b")
-TARGET_OS = re.compile(r'^\[\[target_os\s*=\s*"\w+"\]\]')
+SYS_VALUE = re.compile(r"^\s*(?:pub\s+)?const\s+(SYS_\w+)\s*:\s*\w+\s*=\s*(\d+)")
+ATTR = re.compile(r"^\[\[(.*)\]\]$")
+
+
+def _attr_entries(line):
+    """Entries in one `[[a, b = "c"]]` line, as stripped text."""
+    m = ATTR.match(line.strip())
+    return [e.strip() for e in m.group(1).split(",")] if m else []
+
+
+def _sys_consts(src):
+    """[(name, [attribute entries above it], value, line number)] for
+    `const SYS_*`; value is None when the initializer is not a plain integer.
+
+    Attribute lines accumulate; a blank line does not end the block (the
+    historical helper's "previous non-empty line" behaviour), and any other
+    line does.
+    """
+    out = []
+    attrs = []
+    for n, line in enumerate(src.splitlines(), 1):
+        m = SYS_VALUE.match(line)
+        if m:
+            out.append((m.group(1), attrs, int(m.group(2)), n))
+            attrs = []
+            continue
+        m = CONST_SYS.match(line)
+        if m:
+            out.append((m.group(1), attrs, None, n))
+            attrs = []
+            continue
+        if line.strip():
+            entries = _attr_entries(line)
+            if entries:
+                attrs = attrs + entries
+            else:
+                attrs = []
+    return out
+
+
+def _gate(attrs, name):
+    """The value an item is gated to by attribute `name`, or None."""
+    for entry in attrs:
+        m = re.match(rf'^{name}\s*=\s*"([\w-]+)"$', entry)
+        if m:
+            return m.group(1)
+    return None
 
 
 def _sys_consts_outside_sys():
@@ -52,15 +99,8 @@ def _sys_consts_outside_sys():
 
 def _ungated_sys_consts(src):
     """Names of `const SYS_*` in `src` not directly under a [[target_os]]."""
-    ungated = []
-    prev = ""
-    for line in src.splitlines():
-        m = CONST_SYS.match(line)
-        if m and not TARGET_OS.match(prev):
-            ungated.append(m.group(1))
-        if line.strip():
-            prev = line
-    return ungated
+    return [name for name, attrs, _, _ in _sys_consts(src)
+            if _gate(attrs, "target_os") is None]
 
 
 @pytest.mark.unit
@@ -76,6 +116,22 @@ def test_every_syscall_number_in_sys_is_target_gated():
     assert sum(1 for l in src.splitlines() if CONST_SYS.match(l)) > 80
     ungated = _ungated_sys_consts(src)
     assert not ungated, "SYS_* in sys.ritz with no [[target_os]]: " + repr(ungated)
+
+
+@pytest.mark.unit
+def test_every_linux_syscall_number_is_x86_64_gated():
+    """The Linux numbers are the x86_64 ABI's: another arch must not see them."""
+    consts = _sys_consts(SYS.read_text())
+    linux = [name for name, attrs, _, _ in consts
+             if _gate(attrs, "target_os") == "linux"]
+    # Not vacuous: the table is almost entirely Linux.
+    assert len(linux) > 80
+    ungated = [name for name, attrs, _, _ in consts
+               if _gate(attrs, "target_os") == "linux"
+               and _gate(attrs, "target_arch") != "x86_64"]
+    assert not ungated, (
+        "Linux SYS_* in sys.ritz with no [[target_arch = \"x86_64\"]]: "
+        + repr(ungated))
 
 
 # --- packages outside ritzlib take their numbers from sys.ritz too (#4121) ----
@@ -98,16 +154,9 @@ SYS_VALUE = re.compile(r"^\s*(?:pub\s+)?const\s+(SYS_\w+)\s*:\s*\w+\s*=\s*(\d+)"
 
 
 def _gated_table(src, os_name):
-    """{SYS_NAME: number} for each const directly under [[target_os = os_name]]."""
-    table = {}
-    prev = ""
-    for line in src.splitlines():
-        m = SYS_VALUE.match(line)
-        if m and prev.strip() == f'[[target_os = "{os_name}"]]':
-            table[m.group(1)] = int(m.group(2))
-        if line.strip():
-            prev = line
-    return table
+    """{SYS_NAME: number} for each const gated to `os_name`."""
+    return {name: value for name, attrs, value, _ in _sys_consts(src)
+            if _gate(attrs, "target_os") == os_name and value is not None}
 
 
 @pytest.mark.unit

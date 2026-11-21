@@ -6910,6 +6910,7 @@ The attributes are a closed set:
 | `[[test]]` | `fn` | a test ([§17.1](#171-test-attribute)) |
 | `[[test_helper]]` | `fn` | may `assert`; a failure reports the calling test's line ([§17.1](#171-test-attribute)) |
 | `[[target_os = "<os>"]]` | `fn`, `struct`, `const` | the item exists only when compiling for `<os>` ([§17.2](#172-target-attribute)) |
+| `[[target_arch = "<arch>"]]` | `fn`, `struct`, `const` | the item exists only when compiling for `<arch>` ([§17.2](#172-target-attribute)) |
 | `[[packed]]` | `struct` | no padding; alignment 1 ([§17.4](#174-packed-structs)) |
 | `[[naked]]` | `fn` | no prologue or epilogue; the body is `asm` only ([§17.5](#175-naked-functions)) |
 | `[[inline]]` | `fn` | inlining hint ([§17.6](#176-inlining-attributes)) |
@@ -7036,8 +7037,27 @@ fn platform_id() -> i32
     1
 ```
 
-A `fn` or `struct` name may have one `[[target_os]]` variant per target.
-Two definitions gated to the same target are an error naming both
+A `fn`, `struct` or `const` may be gated to a target OS with
+`[[target_os = "<os>"]]`, to a target architecture with
+`[[target_arch = "<arch>"]]`, or to both:
+
+```ritz
+[[target_arch = "x86_64"]]
+fn word_size() -> i32
+    64
+```
+
+`<os>` is a target OS name (`"linux"` and `"harland"` are defined).
+`<arch>` is a target architecture name; `"x86_64"` is defined today, and it
+is the first component of the target triple, so the default target
+`x86_64-unknown-linux-gnu` is `"x86_64"`. The compiler takes the arch from
+its target triple (`--target` in ritz0; ritz1 emits an x86_64 triple) unless
+a `--target-arch` flag overrides it. An item with no target attribute is
+always kept. An item carrying both must match both: gating to one does not
+excuse a mismatch in the other.
+
+A `fn` or `struct` name may have one variant per target. Two definitions
+gated to the same target are an error naming both
 locations, whatever the target being compiled. The compiler never silently
 picks one of them. Two such fns conflict even if they are identical. Two
 such structs conflict unless their fields are identical, in which case the
@@ -7045,7 +7065,8 @@ repeat is dropped, as for ungated structs. How a gated variant relates to
 an ungated definition of the same name is set out in
 [§15.3](#153-qualified-access) for fns. A struct gated variant may stand
 beside an ungated struct only if the two are identical, and this is checked
-only on the variant's own target.
+only on the variant's own target. A variant gated by OS alone and one gated
+by arch alone are different variants.
 
 ```ritz expect-error="Conflicting function definition for 'get_platform_id'"
 [[target_os = "linux"]]
@@ -7494,8 +7515,8 @@ fn wipe(ptr: *u8, len: i64)
 
 **Architecture.** `ARCH` names the instruction set, and only `x86_64` is
 defined. A block whose `ARCH` isn't the target's is an error at the name. A
-function that needs several architectures uses `[[target(...)]]` (§17.2) to pick
-one.
+function that needs several architectures uses `[[target_arch = "<arch>"]]`
+(§17.2) to pick one.
 
 **Lines are text.** Each indented line is passed to the assembler as written,
 not tokenised as Ritz. x86_64 is AT&T syntax. The compiler changes the text in
