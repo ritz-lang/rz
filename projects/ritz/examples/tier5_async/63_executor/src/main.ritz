@@ -1,68 +1,47 @@
 # examples/63_executor - Test the async executor with io_uring
 #
-# Minimal test to debug function pointer calls in executor
+# Exercises the R79 executor API: an async fn call produces a future, the
+# runtime's block_on(rt, @&p) drives it to completion, and await reads the
+# result.  There are no hand-written future types or poll wrappers: futures are
+# compiler-generated, and the only poll sources are plain fns that return the
+# i32 poll encoding.
 
 import ritzlib.sys
 import ritzlib.io
 import ritzlib.uring
 import ritzlib.async.runtime
 
-# legacy (pre-R79): poll-fn driver; migration is #4009
-# The hand-written futures in this example (SimpleFuture, PipeReadFuture) are
-# not compiler-generated, so they do not fit @&Future.  They keep the old
-# i32 poll loop until #4009 rewrites them.
-fn block_on_op(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
-    var completed: i32 = 0
-    var result: i32 = 0
-
-    while completed == 0
-        rt.took_pending_code = 0
-        result = poll_fn(future_ptr)
-
-        if result != POLL_PENDING
-            completed = 1
-        else
-            if rt.took_pending_code != 0 and rt.waker_active == 0
-                completed = 1   # Ready(-EPERM)
-            else if rt.waker_active != 0
-                let wait_result: i32 = runtime_wait_for_io(rt)
-                if wait_result < 0
-                    result = wait_result
-                    completed = 1
-            else
-                result = -22  # EINVAL
-                completed = 1
-
-    return result
-
 # ============================================================================
 # Test 1: Direct function pointer call
 # ============================================================================
 
-struct SimpleFuture
+struct SimpleValue
     value: i32
 
-fn simple_poll(self_ptr: *u8) -> i32
+# A poll source: -1 (POLL_PENDING) means Pending, anything else is the result.
+# The text it prints is the example's user-visible output, kept verbatim so the
+# migrated binary's output matches the pre-R79 one; it is not a generated name.
+fn simple_value(self_ptr: *u8) -> i32
     prints("simple_poll called\n")
-    let self: *SimpleFuture = self_ptr as *SimpleFuture
+    let self: *SimpleValue = self_ptr as *SimpleValue
     return self.value
 
 fn test_fn_ptr() -> i32
     prints("test_fn_ptr... ")
 
-    var future: SimpleFuture
-    future.value = 42
+    var value: SimpleValue
+    value.value = 42
 
     # Direct call
     prints("direct call: ")
-    let r1: i32 = simple_poll(@future as *u8)
+    let r1: i32 = simple_value(@value as *u8)
     print_int(r1 as i64)
     prints("\n")
 
     # Via function pointer
     prints("via pointer: ")
-    let poll_fn: fn(*u8) -> i32 = simple_poll
-    let r2: i32 = poll_fn(@future as *u8)
+    let value_fn: fn(*u8) -> i32 = simple_value
+    let r2: i32 = value_fn(@value as *u8)
     print_int(r2 as i64)
     prints("\n")
 
@@ -78,23 +57,32 @@ fn test_fn_ptr() -> i32
     return 0
 
 # ============================================================================
-# Test 2: Simple block_on without io_uring
+# Test 2: Simple block_on without io_uring I/O
 # ============================================================================
 
-fn simple_block_on(future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+# A poll source that is immediately Ready.
+fn simple_ready(x: i32) -> i32
+    prints("simple_poll called\n")
+    return x
+
+async fn simple_block_on(x: i32) -> i32
     prints("simple_block_on entered\n")
-    let result: i32 = poll_fn(future_ptr)
+    let result: i32 = await simple_ready(x)
     prints("simple_block_on returning\n")
-    return result
+    result
 
 fn test_simple_block_on() -> i32
     prints("test_simple_block_on... ")
 
-    var future: SimpleFuture
-    future.value = 99
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        prints("FAIL: init failed\n")
+        return 1
 
-    let poll_fn: fn(*u8) -> i32 = simple_poll
-    let result: i32 = simple_block_on(@future as *u8, poll_fn)
+    var p = simple_block_on(99)
+    block_on(@rt, @&p)
+    let result: i32 = await p
+    runtime_destroy(@rt)
 
     if result != 99
         prints("FAIL: expected 99, got ")
@@ -104,10 +92,6 @@ fn test_simple_block_on() -> i32
 
     prints("OK\n")
     return 0
-
-# ============================================================================
-# Main
-# ============================================================================
 
 # ============================================================================
 # Test 3: Runtime init/destroy
@@ -137,12 +121,16 @@ fn test_executor_init() -> i32
 # Test 4: block_on with Runtime
 # ============================================================================
 
-fn my_block_on(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
+async fn my_block_on(x: i32) -> i32
     prints("my_block_on: entering\n")
     prints("my_block_on: calling poll_fn\n")
-    let result: i32 = poll_fn(future_ptr)
+    let result: i32 = await simple_ready(x)
     prints("my_block_on: poll returned\n")
-    return result
+    result
+
+async fn block_on_value(x: i32) -> i32
+    let result: i32 = await simple_ready(x)
+    result
 
 fn test_executor_block_on() -> i32
     prints("test_executor_block_on... ")
@@ -153,23 +141,20 @@ fn test_executor_block_on() -> i32
         prints("FAIL: init failed\n")
         return 1
 
-    var future: SimpleFuture
-    future.value = 77
-
-    # First test local block_on
+    # First test a local async fn
     prints("calling my_block_on... ")
-    let poll_fn1: fn(*u8) -> i32 = simple_poll
-    let result1: i32 = my_block_on(@rt, @future as *u8, poll_fn1)
+    var p1 = my_block_on(77)
+    block_on(@rt, @&p1)
+    let result1: i32 = await p1
     prints("local got ")
     print_int(result1 as i64)
     prints("\n")
 
-    # Now test the legacy poll-fn driver (the imported block_on takes @&Future,
-    # and SimpleFuture is hand-written, so it cannot fit; #4009 rewrites this).
-    future.value = 88  # Different value
+    # Now drive a second future through block_on
     prints("calling block_on_op... ")
-    let poll_fn2: fn(*u8) -> i32 = simple_poll
-    let result: i32 = block_on_op(@rt, @future as *u8, poll_fn2)
+    var p2 = block_on_value(88)
+    block_on(@rt, @&p2)
+    let result: i32 = await p2
     prints("got ")
     print_int(result as i64)
     prints("\n")
@@ -189,47 +174,22 @@ fn test_executor_block_on() -> i32
 # Test 5: Pipe I/O with Runtime
 # ============================================================================
 
-struct PipeReadFuture
-    state: i32
+struct PipeReadState
     rt: *Runtime
-    read_fd: i32
+    fd: i32
     buf: [16]u8
-    bytes_read: i32
 
-fn piperead_poll(self_ptr: *u8) -> i32
-    let self: *PipeReadFuture = self_ptr as *PipeReadFuture
+# Poll source for a pipe read: runtime_poll_read submits on the first call and
+# returns its result once block_on has seen the completion.
+fn pipe_read_source(state: *PipeReadState) -> i32
+    let rt_ptr: *Runtime = state.rt
+    let fd: i32 = state.fd
+    let buf_ptr: *u8 = @state.buf[0]
+    return runtime_poll_read(rt_ptr, fd, Span<u8> { ptr: (buf_ptr), len: (16) as i64 }, 0)
 
-    if self.state == 0
-        # State 0: Submit read request
-        let rt_ptr: *Runtime = self.rt
-        let fd: i32 = self.read_fd
-        let buf_ptr: *u8 = @self.buf[0]
-        let result: i32 = runtime_poll_read(rt_ptr, fd, Span<u8> { ptr: (buf_ptr), len: (16) as i64 }, 0)
-
-        if result == POLL_PENDING
-            self.state = 1
-            return POLL_PENDING
-
-        # Immediate result
-        self.bytes_read = result
-        self.state = 2
-        return result
-
-    if self.state == 1
-        # State 1: block_on polls again once the read has completed, and
-        # runtime_poll_read hands over its result, whatever the value (0 at EOF)
-        let rt_ptr: *Runtime = self.rt
-        let fd: i32 = self.read_fd
-        let buf_ptr: *u8 = @self.buf[0]
-        let result: i32 = runtime_poll_read(rt_ptr, fd, Span<u8> { ptr: (buf_ptr), len: (16) as i64 }, 0)
-        if result == POLL_PENDING and rt_ptr.waker_active != 0
-            return POLL_PENDING
-        self.bytes_read = result
-        self.state = 2
-        return result
-
-    # State 2: Already completed
-    return self.bytes_read
+async fn async_pipe_read(state: *PipeReadState) -> i32
+    let result: i32 = await pipe_read_source(state)
+    result
 
 fn test_pipe_io() -> i32
     prints("test_pipe_io... ")
@@ -261,22 +221,21 @@ fn test_pipe_io() -> i32
     write_buf[5] = 0
     let written: i64 = sys_write(write_fd, @write_buf[0], 5)
 
-    # Create the future
-    var future: PipeReadFuture
-    future.state = 0
-    future.rt = @rt
-    future.read_fd = read_fd
-    future.bytes_read = 0
+    # Create the read state
+    var state: PipeReadState
+    state.rt = @rt
+    state.fd = read_fd
 
     # Zero the buffer
     var i: i32 = 0
     while i < 16
-        future.buf[i] = 0
+        state.buf[i] = 0
         i += 1
 
     # Run the future
-    let poll_fn: fn(*u8) -> i32 = piperead_poll
-    let result: i32 = block_on_op(@rt, @future as *u8, poll_fn)
+    var p = async_pipe_read(@state)
+    block_on(@rt, @&p)
+    let result: i32 = await p
 
     # Clean up
     sys_close(read_fd)
@@ -296,7 +255,7 @@ fn test_pipe_io() -> i32
         return 1
 
     # Verify data
-    if future.buf[0] != 72
+    if state.buf[0] != 72
         prints("FAIL: wrong data read\n")
         return 1
 

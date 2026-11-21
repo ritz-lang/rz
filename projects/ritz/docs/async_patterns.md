@@ -76,7 +76,6 @@ struct IoReadState
     fd: i32
     buf: *u8
     len: i32
-    result: i32
 ```
 
 ### Step 2: Poll Function
@@ -86,45 +85,39 @@ EOF included). Do not read `rt.waker_io_result` yourself: before AGAST #2328 the
 examples did, and a result of 0 looked like "none yet".
 
 ```ritz
-fn poll_io_read(state: *IoReadState) -> i32
-    let rt: *Runtime = state.rt
-    let result: i32 = runtime_poll_read(rt, state.fd, state.buf, state.len, 0)
-    if result != POLL_PENDING or rt.waker_active == 0
-        state.result = result
-    return result
+fn io_read_source(state: *IoReadState) -> i32
+    return runtime_poll_read(state.rt, state.fd, Span<u8> { ptr: (state.buf), len: (state.len) as i64 }, 0)
 ```
 
 ### Step 3: Async Wrapper
 ```ritz
 async fn do_async_read(state: *IoReadState) -> i32
-    let result: i32 = await poll_io_read(state)
+    let result: i32 = await io_read_source(state)
     result
 ```
 
-### Step 4: Poll Wrapper for block_on
-```ritz
-fn do_async_read_wrapper(future_ptr: *u8) -> i32
-    let future: *do_async_read_Future = future_ptr as *do_async_read_Future
-    return do_async_read_poll(future)
-```
+### Step 4: Usage with Runtime (LARB R79)
 
-### Step 5: Usage with Runtime
+The future is compiler-generated, so it is passed to `block_on` through the
+nominal `@&Future`; no hand-written poll wrapper can be substituted. Read the
+result with `await p`.
+
 ```ritz
 fn main() -> i32
     var rt: Runtime
-    runtime_init(&rt)
+    runtime_init(@rt)
 
     var state: IoReadState
-    state.rt = &rt
+    state.rt = @rt
     state.fd = some_fd
-    state.buf = &buffer[0]
+    state.buf = @buffer[0]
     state.len = buffer_size
 
-    var future: do_async_read_Future = do_async_read(&state)
-    let poll_fn: fn(*u8) -> i32 = do_async_read_wrapper
-    let result: i32 = block_on(&rt, &future as *u8, poll_fn)
+    var p = do_async_read(@state)
+    block_on(@rt, @&p)
+    let result: i32 = await p
 
-    runtime_destroy(&rt)
+    runtime_destroy(@rt)
     result
 ```
 
@@ -304,6 +297,9 @@ Compare to the current 100+ line manual state machine. This is the goal.
 
 ## Current Limitations
 
-1. **Manual wrappers** - Need poll wrapper functions for block_on (will be simplified)
+1. **No manual wrappers** - `block_on(@rt, @&p)` drives a compiler-generated
+   future and `await p` reads its result; a hand-written future cannot be
+   passed as `@&Future` (LARB R79, AGAST #4009). See
+   `examples/tier5_async/64_async_io`.
 2. **No tuple returns** - `join()` will need struct returns until tuples are implemented
 3. **No async closures** - Must use explicit state structs for now

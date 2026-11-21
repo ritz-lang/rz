@@ -9,34 +9,6 @@ import ritzlib.uring
 import ritzlib.async.tasks
 import ritzlib.async.runtime
 
-# legacy (pre-R79): poll-fn driver; migration is #4009
-# These tests drive hand-written PipeOp poll adapters over runtime_poll_read/
-# write.  Such adapters are not compiler-generated futures, so they do not fit
-# @&Future; they keep the old i32 poll loop until #4009 rewrites them.
-fn block_on_op(rt: *Runtime, future_ptr: *u8, poll_fn: fn(*u8) -> i32) -> i32
-    var completed: i32 = 0
-    var result: i32 = 0
-
-    while completed == 0
-        rt.took_pending_code = 0
-        result = poll_fn(future_ptr)
-
-        if result != POLL_PENDING
-            completed = 1
-        else
-            if rt.took_pending_code != 0 and rt.waker_active == 0
-                completed = 1   # Ready(-EPERM)
-            else if rt.waker_active != 0
-                let wait_result: i32 = runtime_wait_for_io(rt)
-                if wait_result < 0
-                    result = wait_result
-                    completed = 1
-            else
-                result = -22  # EINVAL
-                completed = 1
-
-    return result
-
 
 # ============================================================================
 # Test 1: Task initialization and pool management
@@ -218,15 +190,24 @@ struct PipeOp
     len: i32
     polls: i32
 
-fn pipe_read_poll(raw: *u8) -> i32
-    let op = raw as *PipeOp
+# Poll sources over the runtime's poll operations.  A plain fn returning the
+# i32 poll encoding is awaited directly by the compiler-generated future; there
+# is no hand-written adapter to cast to *Future (LARB R79, AGAST #4009).
+fn pipe_read_source(op: *PipeOp) -> i32
     op.polls = op.polls + 1
     return runtime_poll_read(op.rt, op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
 
-fn pipe_write_poll(raw: *u8) -> i32
-    let op = raw as *PipeOp
+fn pipe_write_source(op: *PipeOp) -> i32
     op.polls = op.polls + 1
     return runtime_poll_write(op.rt, op.fd, Span<u8> { ptr: (op.buf), len: (op.len) as i64 }, 0)
+
+async fn pipe_read(op: *PipeOp) -> i32
+    let result: i32 = await pipe_read_source(op)
+    result
+
+async fn pipe_write(op: *PipeOp) -> i32
+    let result: i32 = await pipe_write_source(op)
+    result
 
 [[test]]
 fn test_block_on_read_suspends_then_returns_the_io_result() -> i32
@@ -249,8 +230,9 @@ fn test_block_on_read_suspends_then_returns_the_io_result() -> i32
     op.len = 5
     op.polls = 0
 
-    let poll_fn: fn(*u8) -> i32 = pipe_read_poll
-    let result: i32 = block_on_op(@rt, @op as *u8, poll_fn)
+    var p = pipe_read(@op)
+    block_on(@rt, @&p)
+    let result: i32 = await p
     let leftover: i32 = rt.waker_io_ready
     let armed: i32 = rt.waker_active
     runtime_destroy(@rt)
@@ -293,8 +275,9 @@ fn test_block_on_write_reaches_the_fd() -> i32
     op.len = 2
     op.polls = 0
 
-    let poll_fn: fn(*u8) -> i32 = pipe_write_poll
-    let result: i32 = block_on_op(@rt, @op as *u8, poll_fn)
+    var p = pipe_write(@op)
+    block_on(@rt, @&p)
+    let result: i32 = await p
     runtime_destroy(@rt)
 
     var buf: [4]u8
@@ -343,8 +326,9 @@ fn test_block_on_read_at_eof_returns_zero() -> i32
     op.len = 8
     op.polls = 0
 
-    let poll_fn: fn(*u8) -> i32 = pipe_read_poll
-    let result: i32 = block_on_op(@rt, @op as *u8, poll_fn)
+    var p = pipe_read(@op)
+    block_on(@rt, @&p)
+    let result: i32 = await p
     let leftover: i32 = rt.waker_io_ready
     runtime_destroy(@rt)
     sys_close(fds[0])
@@ -379,8 +363,9 @@ fn test_block_on_zero_length_write_returns_zero() -> i32
     op.len = 0
     op.polls = 0
 
-    let poll_fn: fn(*u8) -> i32 = pipe_write_poll
-    let result: i32 = block_on_op(@rt, @op as *u8, poll_fn)
+    var p = pipe_write(@op)
+    block_on(@rt, @&p)
+    let result: i32 = await p
     runtime_destroy(@rt)
     sys_close(fds[0])
     sys_close(fds[1])
@@ -394,9 +379,12 @@ fn test_block_on_zero_length_write_returns_zero() -> i32
     return 0
 
 # io_uring will not easily fail a pipe read with -EPERM, so stand in for
-# runtime_wait_for_io: record -1 as the completed operation's result.
+# runtime_wait_for_io: record -1 as the completed operation's result.  The
+# source takes it as a result and clears the flag; only block_on's read of the
+# poll encoding would confuse -1 with Pending, and the generated futures never
+# see this path (LARB R79).
 [[test]]
-fn test_block_on_eperm_result_is_not_pending() -> i32
+fn test_poll_source_eperm_result_is_not_pending() -> i32
     var fds: [2]i32
     if sys_pipe(@fds[0]) < 0
         prints("FAIL: sys_pipe failed\n")
@@ -418,8 +406,8 @@ fn test_block_on_eperm_result_is_not_pending() -> i32
     rt.waker_io_result = -1
     rt.waker_io_ready = 1
 
-    let poll_fn: fn(*u8) -> i32 = pipe_read_poll
-    let result: i32 = block_on_op(@rt, @op as *u8, poll_fn)
+    let result: i32 = pipe_read_source(@op)
+    let cleared: i32 = rt.waker_io_ready
     runtime_destroy(@rt)
     sys_close(fds[0])
     sys_close(fds[1])
@@ -430,34 +418,62 @@ fn test_block_on_eperm_result_is_not_pending() -> i32
     if op.polls != 1
         prints("FAIL: the recorded result should be taken on the first poll\n")
         return 1
+    if cleared != 0
+        prints("FAIL: taking the result should clear it\n")
+        return 1
     return 0
 
 
 # ============================================================================
-# Test 6: the legacy driver refuses to spin on a future that can never wake
+# Test 6: block_on refuses to spin on a future that can never wake
 # ============================================================================
 #
 # The public block_on takes @&Future and fails loudly on this contract
-# violation (see test_block_on_future.ritz); this pins the legacy driver's
-# -EINVAL, which is what the hand-written adapters still use until #4009.
+# violation: a Pending poll that registered no waker would stay unfinished for
+# ever (see test_block_on_future.ritz).  The failure exits the process, so fork.
 
-fn always_pending_poll(raw: *u8) -> i32
+fn always_pending(x: i32) -> i32
     return POLL_PENDING
 
+async fn never_ready() -> i32
+    let v: i32 = await always_pending(0)
+    v
+
 [[test]]
-fn test_legacy_block_on_op_pending_without_a_waker_is_einval() -> i32
-    var rt: Runtime
-    if runtime_init(@rt) < 0
-        prints("FAIL: runtime_init failed\n")
+fn test_block_on_pending_without_a_waker_fails_loudly() -> i32
+    var err_pipe: [2]i32
+    if sys_pipe(@err_pipe[0]) < 0
+        prints("FAIL: sys_pipe failed\n")
         return 1
 
-    var unused: i32 = 0
-    let poll_fn: fn(*u8) -> i32 = always_pending_poll
-    let result: i32 = block_on_op(@rt, @unused as *u8, poll_fn)
-    runtime_destroy(@rt)
+    let pid: i32 = sys_fork()
+    if pid == 0
+        # Child: block_on must not return; the contract violation exits 101.
+        sys_dup2(err_pipe[1], 2)
+        sys_close(err_pipe[0])
+        sys_close(err_pipe[1])
 
-    if result != -22
-        prints("FAIL: expected -EINVAL\n")
+        var rt: Runtime
+        if runtime_init(@rt) < 0
+            sys_exit(2)
+        var p = never_ready()
+        block_on(@rt, @&p)
+        sys_exit(0)   # reached only if the failure was not loud
+
+    sys_close(err_pipe[1])
+    var msg: [256]u8
+    let n: i64 = sys_read(err_pipe[0], @msg[0], 256)
+    sys_close(err_pipe[0])
+
+    var status: i32 = 0
+    sys_wait4(pid, @status, 0, null)
+    let code: i32 = (status >> 8) & 255
+
+    if code != 101
+        prints("FAIL: expected exit 101 for a Pending poll with no waker\n")
+        return 1
+    if n <= 0
+        prints("FAIL: expected a failure message on stderr\n")
         return 1
     return 0
 

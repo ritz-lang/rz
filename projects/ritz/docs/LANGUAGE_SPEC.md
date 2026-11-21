@@ -6715,7 +6715,9 @@ fn main() -> i32
 
 Keeping the future is still allowed.  `var p: f_Future = f(args)` hands it to
 an executor that polls it with `f_poll(@p)` until that is `true`, then reads
-`p.__result` (see the poll contract in §16.1, and `examples/tier5_async/64_async_io`).
+`p.__result` (see the poll contract in §16.1).  The executor API of LARB R79 is
+`block_on(rt, @&p)` to drive the future, then `await p` to read its result
+(`examples/tier5_async/64_async_io`, `ritzlib/tests/test_block_on_future.ritz`).
 
 An awaited value may be bound without a type (AGAST #1318).  Inside an
 `async fn` the binding lives in the fn's future, with the awaited fn's
