@@ -233,13 +233,13 @@ stays here; remote hosts only run rooms.
     **Exec-capable TMPDIR (bangerang, 2026-11-17):** bangerang's `/tmp` is
     `noexec` and room units run with `PrivateTmp=yes`, so a hand-run
     `pytest` that execs a built ritz1 from `tmp_path` fails (#1334). Gates
-    are fine (`run-gate.sh` sets its own exec-capable TMPDIR, #3704). At
-    SPAWN the host makes `~/tmp/rz-room-<id>` and sets
-    `TMPDIR=/home/aaron/tmp/rz-room-<id>` in a systemd drop-in,
-    `adele-agent@ritz-task-<id>.service.d/60-rz-room-tmpdir.conf`, before
-    the unit starts. Not `room.env`: `adele room spawn` rewrites it at
-    install and starts the unit at once. TEARDOWN deletes the drop-in and
-    the dir.
+    are fine (`run-gate.sh` sets its own exec-capable TMPDIR, #3704).
+    `adele room spawn` does not create this drop-in: it is a host step.
+    Before starting the unit the host creates `~/tmp/rz-room-<id>` and
+    installs `adele-agent@ritz-task-<id>.service.d/60-rz-room-tmpdir.conf`
+    with `TMPDIR=/home/aaron/tmp/rz-room-<id>`. Not `room.env`: `adele
+    room spawn` rewrites it at install and starts the unit at once.
+    TEARDOWN deletes the drop-in and the dir.
   - `TEARDOWN ritz-task-<id>`: removes the room's unit, budget, worktree and
     local branch after its merge. The host answers `TORNDOWN ritz-task-<id>
     on <host>` (one word, no hyphen); the slot is free from then. Refusal is
@@ -377,24 +377,15 @@ room spawn`'s default is `<repo-dir>-<room>`, which for repo `rz` and room
 reap, or teardown step expects (2026-11-20).
 
 **Fleet model (AGAST #2609 follow-up).** While the Claude weekly limit is
-exhausted the whole fleet runs DeepSeek. `adele room spawn --harness
-deepseek` writes `ADELE_HARNESS` but the unit template's `ExecStart` never
-passes `--harness`, so the agent falls back to Claude and its first turn
-dies with "You've hit your weekly limit · resets <date>". Two steps per
-room, **before** the unit starts:
-1. `adele install … --harness deepseek --model deepseek-flash` (or pass
-   `model=deepseek-flash` to the host room's `SPAWN`).
-2. Write
-   `~/.config/systemd/user/adele-agent@<room>.service.d/90-adele-deepseek.conf`:
-   ```
-   [Service]
-   ExecStart=
-   ExecStart=/usr/bin/env PYTHONPATH=%h/dev/nevelis/adele %h/dev/nevelis/.venv/bin/python -m cli.main agent --room %i --harness deepseek --model deepseek-flash
-   ```
-   then `systemctl --user daemon-reload` *before* starting the unit.
-Remove the drop-in once the spawn template passes the harness itself.
-Rooms that keep dying on their first turn, or whose last `claude_response`
-is the synthetic "weekly limit" line, are this, not a bug in their work.
+exhausted the whole fleet runs DeepSeek. Pass `--harness deepseek --model
+deepseek-flash` to `adele install` (or `model=deepseek-flash` to the host
+room's `SPAWN`). Since adele #4367 `adele install --harness deepseek`
+writes `~/.config/systemd/user/adele-agent@<room>.service.d/95-adele-harness.conf`
+directly, pinning `--harness deepseek --model deepseek-flash`, before the
+unit starts. Do not hand-write a `90-adele-deepseek.conf` harness drop-in:
+a surviving `90-` sorts before the `95-` pin and is overridden. Rooms that
+keep dying on their first turn, or whose last `claude_response` is the
+synthetic "weekly limit" line, are this, not a bug in their work.
 
 **"START poke sent" doesn't mean the room started.** Within ~2 minutes of
 `adele room spawn`, check the room has posted a `claude_response` or tool use

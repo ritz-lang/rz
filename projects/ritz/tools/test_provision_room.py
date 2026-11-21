@@ -406,6 +406,41 @@ def test_briefing_tells_rooms_to_script_rm_plus_background_kill():
 
 
 @pytest.mark.unit
+def test_briefing_says_spawn_does_not_create_tmpdir_dropin():
+    """AGAST #4476: the `60-rz-room-tmpdir.conf` drop-in is a host step,
+    not something `adele room spawn` creates; the host installs it before
+    the unit starts."""
+    text = SKILL.read_text()
+    at = text.index("**Exec-capable TMPDIR (bangerang")
+    end = text.index("`TEARDOWN ritz-task-<id>`", at)
+    flat = " ".join(text[at:end].split()).lower()
+    # The drop-in is still named where the host installs it ...
+    assert "60-rz-room-tmpdir.conf" in flat
+    # ... but the stale "At SPAWN the host makes ... before the unit starts"
+    # is replaced by an explicit spawn-does-not-create / host-step statement.
+    assert "does not create" in flat
+    assert "host step" in flat
+    assert "before starting the unit" in flat
+
+
+@pytest.mark.unit
+def test_briefing_says_install_writes_harness_pin_directly():
+    """AGAST #4476: `adele install --harness deepseek` writes
+    `95-adele-harness.conf` itself; a hand-written `90-` harness drop-in
+    sorts before that pin and is overridden, so do not write one."""
+    para = _briefing_paragraph("**Fleet model")
+    flat = " ".join(para.split()).lower()
+    # The generated pin is named, with the install flags that write it.
+    assert "95-adele-harness.conf" in flat
+    assert "--harness deepseek --model deepseek-flash" in flat
+    # The obsolete hand-written drop-in is named only as a "do not".
+    assert "do not hand-write" in flat
+    assert "90-adele-deepseek.conf" in flat
+    assert "sorts before" in flat
+    assert "overridden" in flat
+
+
+@pytest.mark.unit
 def test_briefing_says_budget_only_gate_verdict_is_terminal():
     """AGAST #4423: a budget-only verdict is final, not a reason to re-queue."""
     text = SKILL.read_text()
