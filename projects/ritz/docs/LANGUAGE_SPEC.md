@@ -6631,22 +6631,17 @@ fn main() -> i32
     0
 ```
 
-**The poll contract** (LARB R78, AGAST #3728).  An `async fn f` with params
-`P` and declared result type `T` becomes three items:
-
-- `struct f_Future`, which starts with `__state: i32` and then `__result: T`.
-  A unit fn's future has no `__result`.  Next come the params, and then
-  whatever the body keeps across an `await`.
-- `fn f(P) -> f_Future`, which builds the future in its first state and runs
-  none of the body.
-- `fn f_poll(self: *f_Future) -> bool`, which runs the body until it either
-  suspends or finishes.  It answers `false` while Pending.  Once the body has
-  finished it writes the result into `__result` and answers `true`.
-
-An executor polls a future through a pointer, with no knowledge of `T`, until
-the poll answers `true`, and then reads `__result` if it wants the value.
-The result is kept whole whatever its type: an `i64` above 2^31, a pointer, a
+**The poll contract** (LARB R78, AGAST #3728).  An `async fn` lowers to a
+future: a state-machine value holding the fn's state, its declared result, and
+the params and locals it keeps across an `await`.  Driving the future runs the
+body until it either suspends or finishes; once it has finished, the result is
+written into the future, of the fn's declared type (none for a unit fn).  The
+result is kept whole whatever its type: an `i64` above 2^31, a pointer, a
 struct, or a `-1` that is a genuine answer and not Pending.
+
+`await` drives a future to completion in place (§16.2).  An executor drives a
+held future through the built-in `future_poll` and then reads the result with
+`await` (§16.3).
 
 ```ritz
 async fn neg() -> i32
@@ -6656,22 +6651,20 @@ async fn big() -> i64
     5000000000
 
 fn main() -> i32
-    var f: neg_Future = neg()
-    while !neg_poll(@f)
-        pass
+    let n: i32 = await neg()
     let b: i64 = await big()
     if b != 5000000000
         return 1
-    f.__result + 1
+    n + 1
 ```
 
 ### 16.2 Await
 
 **Calling an `async fn` requires `await`, whatever its body does** (decided
 2026-09-09, AGAST #1395).  An `async fn` with no suspension point is not
-callable synchronously.  A bare call `f(args)` evaluates to the fn's future, a
-value of type `f_Future`, and runs none of the body.  `await f(args)` runs the
-body and is the call's result.  This holds for any `async fn`, unit or valued,
+callable synchronously.  A bare call `f(args)` evaluates to the fn's future and
+runs none of the body.  `await f(args)` runs the body and is the call's
+result.  This holds for any `async fn`, unit or valued,
 empty-bodied or not.  `await` is allowed outside an `async fn` too, where it
 drives the future to completion in place.
 
@@ -6704,7 +6697,7 @@ fn main() -> i32
 - Where the fn's result type is expected: `let`, an argument, `return`, an
   operand.
 
-```ritz expect-error="is an async fn call, which without `await` is its future `ready_Future`"
+```ritz expect-error="is an async fn call, which without `await` is its future"
 async fn ready() -> i32
     42
 
@@ -6713,11 +6706,11 @@ fn main() -> i32
     v
 ```
 
-Keeping the future is still allowed.  `var p: f_Future = f(args)` hands it to
-an executor that polls it with `f_poll(@p)` until that is `true`, then reads
-`p.__result` (see the poll contract in §16.1).  The executor API of LARB R79 is
-`block_on(rt, @&p)` to drive the future, then `await p` to read its result
-(`examples/tier5_async/64_async_io`, `ritzlib/tests/test_block_on_future.ritz`).
+A bare call can be bound instead of awaited.  `var p = f(args)` keeps the
+future, with an inferred type that can't be named.  `await p` drives a held
+future to completion if it isn't finished, and returns its result.  This is how
+an executor takes a future: it drives `p` and the caller reads the result with
+`await p` after (§16.3).
 
 An awaited value may be bound without a type (AGAST #1318).  Inside an
 `async fn` the binding lives in the fn's future, with the awaited fn's
@@ -6891,9 +6884,51 @@ fn main() -> i32
     r - 2
 ```
 
-### 16.3 Runtime
+### 16.3 Executors
 
-The async runtime uses io_uring for asynchronous I/O on Linux; see
+An executor drives a future the caller holds.  It refers to one through the
+built-in type `Future`, which is not generic and means "some async fn's
+future".  A future's size is the async fn's, which `Future` doesn't say, so
+only a reference to one is a value: a `Future` by value, in a `let`/`var`, a
+parameter, a field, an array element or a return, is refused at the `Future`
+with "`Future` has no size; take it by reference, `@&Future`".  Any async fn's
+future fits an `@&Future` slot, and a field of type `@&Future` to a future held
+elsewhere works.
+
+The built-in `future_poll(f: @&Future) -> bool` drives a future one step: it
+returns `false` while the future is Pending and `true` once it has finished.
+The result is read with `await`, not through the poll (LARB R78).
+
+ritzlib's runtime drives one future on one io_uring, waiting on the ring
+whenever a poll answers Pending (`ritzlib/async/runtime.ritz`):
+
+```ritz
+import ritzlib.async.runtime
+
+async fn ready() -> i32
+    42
+
+fn main() -> i32
+    var rt: Runtime
+    if runtime_init(@rt) < 0
+        return 1
+    var p = ready()
+    block_on(@rt, @&p)
+    let v: i32 = await p
+    runtime_destroy(@rt)
+    v - 42
+```
+
+`block_on(rt, f: @&Future)` returns nothing: it polls `f` until it is ready,
+then the caller reads the result with `await p` (above).  A poll that answers
+`false` must have suspended on an operation it will be woken by; otherwise the
+future can never finish, so `block_on` fails loudly rather than spin.
+
+**Not covered.**  A future stored by value in a struct field or an array needs
+a nameable type, which `Future` isn't; keep the future in a local and store an
+`@&Future` field to it, or drive it directly.  (LARB R79.)
+
+The runtime uses io_uring for asynchronous I/O on Linux; see
 `ritzlib/uring.ritz`, `ritzlib/async/runtime.ritz` and `ritzlib/async/tasks.ritz`.
 
 ---
