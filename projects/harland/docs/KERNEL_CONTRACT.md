@@ -133,7 +133,8 @@ pub struct ChannelPair
 ```
 
 - **Returns**: Two capabilities (send and receive endpoints)
-- **Errors**: -ENOMEM if out of resources
+- **Errors**: -EPERM without a CAP_CHANNEL capability (AGAST #4479);
+  -ENOMEM if out of resources
 
 #### SYS_IPC_SEND (30)
 
@@ -483,6 +484,7 @@ refused with `-EPERM`; the operation never reaches the subsystem.
 | SYS_IPC_SEND | CAP_CHANNEL | SEND |
 | SYS_IPC_RECV | CAP_CHANNEL | RECV |
 | SYS_IPC_CLOSE | CAP_CHANNEL | SEND or RECV |
+| SYS_CHANNEL_CREATE | CAP_CHANNEL | SEND or RECV |
 | SYS_OPEN | CAP_NAMESPACE | READ; CREATE too for O_CREAT |
 | SYS_READ (filesystem fd) | CAP_NAMESPACE | READ |
 | SYS_WRITE (filesystem fd) | CAP_NAMESPACE | WRITE |
@@ -505,8 +507,15 @@ copies an entry from the caller's table when the entry carries
 CAP_RIGHT_GRANT; the recipient's rights are the source rights intersected
 with the requested rights. SYS_CAP_DERIVE narrows a held capability, and
 SYS_CAP_REVOKE removes one. A child that revokes an inherited CHANNEL or
-NAMESPACE capability loses IPC or filesystem access from the next syscall
-(the boot-gate children `cap_ipc_child` and `cap_fs_child` prove this).
+NAMESPACE capability loses IPC (send, receive, close and channel creation)
+or filesystem access from the next syscall (the boot-gate children
+`cap_ipc_child` and `cap_fs_child` prove this).
+
+**SYS_DUP.** `sys_dup` (`fs/syscall.ritz`) has no dispatcher entry, so it is
+not a user-reachable syscall and needs no boundary gate (AGAST #4479). If it
+is wired, its handler must require CAP_NAMESPACE with READ or WRITE, like
+SYS_CLOSE and SYS_LSEEK, because duplicating an fd mutates the
+namespace-backed fd table.
 
 ---
 

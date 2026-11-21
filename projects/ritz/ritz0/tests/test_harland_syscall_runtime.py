@@ -235,6 +235,17 @@ def test_sys_open_handler_calls_sys_open_without_the_old_workaround():
     assert "WORKAROUND" not in _area("process").read_text()
 
 
+def test_channel_create_handler_gates_on_channel_capability():
+    """SYS_CHANNEL_CREATE mints endpoint handles, so a process whose CHANNEL
+    capability was revoked must be refused before the endpoint table is
+    touched (AGAST #4479). Either channel right qualifies, as for
+    SYS_IPC_CLOSE (#4472)."""
+    body = _body(_code(_area("ipc")), "sys_channel_create_handler")
+    assert "cap_process_has_any(pid, CAP_TYPE_CHANNEL, CAP_RIGHT_SEND | CAP_RIGHT_RECV)" in body, body
+    assert "Errno.Perm as i64" in body, body
+    assert "return sys_channel_create(pid)" in body, body
+
+
 @pytest.mark.integration   # runs ritz-metrics in a subprocess (AGAST #1805)
 def test_main_sloc_dropped(tmp_path):
     out = tmp_path / "m.json"
