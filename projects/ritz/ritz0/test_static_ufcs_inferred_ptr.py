@@ -181,13 +181,9 @@ ON_STRING = [
     *(Row(f"a_static_call_with_no_fn_is_refused[{name}]", ALL,
           Refused(f"{STRING}{REFUSED[name]}", None, located=False)) for name in sorted(REFUSED)),
     Row("a_user_impl_still_wins", ALL, Run(USER_IMPL, 11)),
-    # LARB R65 (#3493): `impl String` belongs in ritzlib/string.ritz, so ritz0
-    # refuses this file's at the type name.  ritz1 still runs it, until #3494.
-    Row("an_impl_method_on_string_beats_the_ufcs_fn", ("ritz0",),
+    Row("an_impl_method_on_string_beats_the_ufcs_fn", ALL,
         Refused(IMPL_STRING, Whole("`String` is declared in string.ritz: "
                                    "its `impl` must be there (§12.2)"), at=(4, 6))),
-    Row("an_impl_method_on_string_beats_the_ufcs_fn", ("ritz1", "ritz1_selfhosted"),
-        Run(IMPL_STRING, 22)),
 ]
 INFERRED = [
     # `let e = <*T> ± k` is a `*T`, exactly as if annotated.

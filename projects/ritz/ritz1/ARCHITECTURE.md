@@ -217,6 +217,10 @@ empty. A note that belongs to a move goes on that check's own entry.
 
 - `if_arm_value` — an if-expression arm must end in a value (§6.1, #1613), only where the value is wanted: a match statement's arms are statements (#3980).
 
+- `impl_placement` — an `impl` lives in the type's file (or the trait's) and
+  covers every instantiation, `impl<T> G<T>` (LARB R65, §12.2, #3494). Run by
+  main after imports merge and before monomorphisation.
+
 - `import_vis` — a plain `import` is private (§15.4, R54, #3891): a name
   that reaches the input only through another module's plain `import` is an
   error at its use. main records each loaded module and import edge before

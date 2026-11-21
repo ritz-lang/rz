@@ -543,10 +543,10 @@ def test_ritz1_runs_spec_mangled_multi_arg(ritz1_bin, tmp_path):
 
 
 # `>>` in an impl header: the only such header names one instantiation
-# (`impl Box<Box<i64>>`), which LARB R65 refuses (#3493), so the header is
-# parsed through to that error, at the impl's type name. This row compiled the
-# method without calling it: neither compiler dispatched to an impl on one
-# instantiation. ritz1's refusal is #3494.
+# (`impl Box<Box<i64>>`), which LARB R65 refuses (#3493 ritz0, #3494 ritz1),
+# so the header is parsed through to that error, at the impl's type name.
+# This row compiled the method without calling it: neither compiler
+# dispatched to an impl on one instantiation.
 IMPL_HEADER = BOX + """\
 impl ^Box<Box<i64>>
     fn seven(self: *Box<Box<i64>>) -> i32
@@ -558,10 +558,7 @@ pub fn main() -> i32
 
 
 @pytest.mark.integration
-@pytest.mark.parametrize("compiler", [
-    "ritz0",
-    pytest.param("ritz1", marks=pytest.mark.xfail(strict=True, reason="#3494")),
-])
+@pytest.mark.parametrize("compiler", ["ritz0", "ritz1", "ritz1_selfhosted"])
 def test_impl_header_closing_with_shr_is_one_instantiation(request, tmp_path, compiler):
     if compiler != "ritz0":
         request.getfixturevalue("ritz1_bin")

@@ -119,9 +119,9 @@ def test_impl_on_builtin_type_refused(request, tmp_path, compiler, row):
 
 # A module's own enum of a built-in's name is ordinary: check_builtin_impls
 # lets its impl through.  These rows compiled `impl Option<i32>`, one
-# instantiation, without calling it; LARB R65 (#3493) refuses that shape on
-# any type, so they are now R65's refusal rows, past this file's check.
-# ritz1's half is #3494.
+# instantiation, without calling it; LARB R65 (#3493 ritz0, #3494 ritz1)
+# refuses that shape on any type, so they are now R65's refusal rows, past
+# this file's check.
 DECLARED = {
     "own_option": ("Option", "impl<T> Option<T>", """\
 enum Option<T>
@@ -155,9 +155,7 @@ pub fn main() -> i32
 def _declared_params():
     for row in sorted(DECLARED):
         for compiler in COMPILERS:
-            marks = ([pytest.mark.xfail(strict=True, reason="#3494")]
-                     if compiler != "ritz0" else [])
-            yield pytest.param(row, compiler, marks=marks, id=f"{row}-{compiler}")
+            yield pytest.param(row, compiler, id=f"{row}-{compiler}")
 
 
 @pytest.mark.parametrize("row,compiler", list(_declared_params()))

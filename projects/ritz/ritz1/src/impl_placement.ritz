@@ -1,0 +1,187 @@
+# ritz1/src/impl_placement.ritz - where an `impl` may live, and what it
+# covers (LARB R65, AGAST #3494; LANGUAGE_SPEC §12.2).
+#
+# An inherent `impl T` is in the file that declares `T`.  A trait impl is in
+# the type's file or the trait's file; a trait no module declares (Drop,
+# Index..., the compiler's own) counts as the type's file.  Otherwise, at the
+# impl's type name:
+#
+#     main.ritz:4:6: `Foo` is declared in a.ritz: its `impl` must be there (§12.2)
+#
+# One flat namespace (§15.3) gives no way to say which file's method a call
+# means: before this, ritz1 silently kept one body per module, and a method
+# added in one file leaked through the whole import closure.
+#
+# An impl covers every instantiation: `impl<T> G<T>`, never `impl G<u8>`:
+#
+#     main.ritz:4:6: an impl covers every instantiation of `G`: write `impl<T> G<T>`
+#
+# Before this, the grammar threw the target's arguments away, so `impl G<u8>`
+# looked generic and emitted invalid IR.  R36's revisit (#4294) is the one
+# exception: a concrete built-in target (`impl Display for Span<u8>`) stands
+# in the trait's file.
+#
+# Runs after imports are merged (every declaration carries its file) and
+# before ensure_builtin_span_template.  Impls on types nothing declares
+# (primitives, built-ins, unknown names) are monomorph.ritz's errors.
+# ritz0 says the same (ritz0/impl_placement.py).
+
+import ast
+import ast_helpers   # enum params, the trait log
+import diag          # diag_error_at
+import ritzlib.io
+import ritzlib.str   # memcmp
+import ritzlib.sys
+
+# The base name length of a possibly mangled target: `Span$u8` names `Span`.
+fn type_base_len(name: *u8, len: i32) -> i32
+    var i: i64 = 0
+    while i < len as i64 and *(name + i) != 36   # '$'
+        i = i + 1
+    i as i32
+
+fn file_eq(a: *u8, b: *u8) -> i32
+    if a == null or b == null
+        return 0
+    var i: i64 = 0
+    while *(a + i) != 0 and *(b + i) != 0
+        if *(a + i) != *(b + i)
+            return 0
+        i = i + 1
+    (*(a + i) == *(b + i)) as i32
+
+# The file that declared the impl's target, or null when nothing declares it,
+# and that declaration's type parameters (`impl<T> G<T>`'s suggestion).
+fn decl_file(m: *Module, ib: *ImplBlock, out_params: **TypeParam) -> *u8
+    let base: i32 = type_base_len(ib.type_name, ib.type_name_len)
+    var st: *StructDef = m.structs
+    while st != null
+        if st.name_len == base and memcmp(st.name, ib.type_name, base as i64) == 0
+            *out_params = st.type_params
+            return st.def_file
+        st = st.next
+    var ei: i64 = 0
+    var e: *EnumDef = m.enums
+    while e != null
+        if e.name_len == base and memcmp(e.name, ib.type_name, base as i64) == 0
+            *out_params = generic_enum_params(ei as i32)
+            return e.def_file
+        e = e.next
+        ei = ei + 1
+    *out_params = null
+    null
+
+fn impl_in_trait_file(ib: *ImplBlock) -> i32
+    if ib.trait_name == null
+        return 0
+    trait_declared_in_file(ib.trait_name, ib.trait_name_len, ib.def_file)
+
+fn arg_is_param(ib: *ImplBlock, ga: *GenericArg) -> i32
+    var tp: *TypeParam = ib.type_params
+    while tp != null
+        if tp.name_len == ga.name_len and memcmp(tp.name, ga.name, ga.name_len as i64) == 0
+            return 1
+        tp = tp.next
+    0
+
+# R65: every argument of the impl's target is one of the impl's own type
+# parameters, each used once.  `impl G<u8>` fails on `u8`, `impl<T> P<T, T>`
+# on the repeat, `impl<K> P<K, i32>` on the fixed `i32`.  As ritz0: an impl
+# with no arguments covers a generic type (its methods spell the type's own
+# parameters), and a non-generic declaration with no arguments is trivially
+# covered.
+fn covers_every_instantiation(ib: *ImplBlock, decl_params: *TypeParam) -> i32
+    if decl_params == null and ib.impl_args == null
+        return 1
+    var cur: *GenericArg = ib.impl_args
+    while cur != null
+        if cur.ty != TYPE_STRUCT or cur.name == null
+            return 0
+        if arg_is_param(ib, cur) == 0
+            return 0
+        var prev: *GenericArg = ib.impl_args
+        while prev != cur
+            if prev.name_len == cur.name_len and memcmp(prev.name, cur.name, cur.name_len as i64) == 0
+                return 0
+            prev = prev.next
+        cur = cur.next
+    1
+
+# R36's revisit (#4294): `impl Display for Span<u8>` is a concrete
+# instantiation R65 otherwise refuses, and is legal in the trait's file.
+fn builtin_concrete_in_trait_file(ib: *ImplBlock) -> i32
+    if ib.trait_name == null
+        return 0
+    let base: i32 = type_base_len(ib.type_name, ib.type_name_len)
+    if base == 4 and memcmp(ib.type_name, c"Span", 4) == 0
+        return impl_in_trait_file(ib)
+    if base == 7 and memcmp(ib.type_name, c"StrView", 7) == 0
+        return impl_in_trait_file(ib)
+    0
+
+fn eprint_type_params(params: *TypeParam)
+    if params == null
+        return
+    sys_write(2, params.name, params.name_len as i64)
+    var p: *TypeParam = params.next
+    while p != null
+        eprints_cstr(c", ")
+        sys_write(2, p.name, p.name_len as i64)
+        p = p.next
+
+# The last path component of `file` and its length.
+fn file_base(file: *u8, out_len: *i64) -> *u8
+    var i: i64 = 0
+    var start: i64 = 0
+    while *(file + i) != 0
+        if *(file + i) == 47   # '/'
+            start = i + 1
+        i = i + 1
+    *out_len = i - start
+    file + start
+
+fn eprint_placed(ib: *ImplBlock, type_file: *u8)
+    let base: i32 = type_base_len(ib.type_name, ib.type_name_len)
+    eprints_cstr(c"`")
+    sys_write(2, ib.type_name, base as i64)
+    eprints_cstr(c"` is declared in ")
+    var flen: i64 = 0
+    let fname: *u8 = file_base(type_file, @flen)
+    sys_write(2, fname, flen)
+    eprints_cstr(c": its `impl` must be there (§12.2)\n")
+
+fn eprint_partial(ib: *ImplBlock, params: *TypeParam)
+    let base: i32 = type_base_len(ib.type_name, ib.type_name_len)
+    eprints_cstr(c"an impl covers every instantiation of `")
+    sys_write(2, ib.type_name, base as i64)
+    eprints_cstr(c"`: write `impl<")
+    eprint_type_params(params)
+    eprints_cstr(c"> ")
+    sys_write(2, ib.type_name, base as i64)
+    eprints_cstr(c"<")
+    eprint_type_params(params)
+    eprints_cstr(c">`\n")
+
+# One located error per impl in the wrong file or on one instantiation; at
+# most one per impl (placement first, as ritz0).  `path` is the main file, for
+# a block with no recorded file.
+pub fn refuse_misplaced_impls(m: *Module, path: *u8) -> i32
+    var errors: i32 = 0
+    var ib: *ImplBlock = m.impls
+    while ib != null
+        var params: *TypeParam = null
+        let type_file: *u8 = decl_file(m, ib, @params)
+        if type_file != null
+            var file: *u8 = path
+            if ib.def_file != null
+                file = ib.def_file
+            if file_eq(type_file, file) == 0 and impl_in_trait_file(ib) == 0
+                diag_error_at(file, ib.type_span)
+                eprint_placed(ib, type_file)
+                errors = errors + 1
+            else if builtin_concrete_in_trait_file(ib) == 0 and covers_every_instantiation(ib, params) == 0
+                diag_error_at(file, ib.type_span)
+                eprint_partial(ib, params)
+                errors = errors + 1
+        ib = ib.next
+    errors

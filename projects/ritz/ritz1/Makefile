@@ -34,6 +34,7 @@ SOURCES = \
 	struct_index \
 	struct_variants \
 	monomorph \
+	impl_placement \
 	generic_infer \
 	emitter_core \
 	frame_limit \
