@@ -2138,3 +2138,131 @@ design covers callbacks with state and mixed-type collections.
 - #3442 ritz1: `arr()[idx(1)] = val(3)` crashes with SIGSEGV.
 - #3443 ritz1: `(p as @&Holder).t = …` fails with "unhandled EXPR_MEMBER in
   assignment".
+
+# Answers from Aaron, 2026-11-21: R68–R73, CONFIRMED
+
+Six questions sat in AGAST as "LARB to rule" but none carried
+`needs_decision`, so the roll-up reported *zero* questions for Aaron while six
+were open. The M1.2/M1.3 review of 2026-11-21 measured each against `defd5047`
+and flagged them; Aaron answered all six: "sounds good to all".
+
+### R68: the `main` entry ABI (#4015): §5.7 AS WRITTEN, CONFIRMED
+**Measured.** §5.7 already states the three shapes and both transitional C
+shapes; `ritz0/main_abi.py`, `ritz1/src/main_abi.ritz` and
+`ritz0/test_main_abi.py` (4 rows) exist, and both compilers rename a span or
+void `main` to `__ritz_main` and emit the `main(argc, argv, envp)` adapter.
+Corpus mains: 51 `fn main(argc: i32, argv: **u8) -> i32`, 45 `fn main() -> i32`,
+3 `pub fn main() -> i32`, and one each of the three §5.7 shapes — i.e. every
+corpus `main` is non-`pub`, and every args-taking one is C-shaped, so #203's
+migration is the whole corpus. `[[bin]] entry` is used by 27 manifests, almost
+all `module::main`; 4 name another function (harland `main::efi_main` ×3,
+`main::kernel_main`).
+
+**RULED.**
+1. `pub` is required on all three §5.7 shapes once #203 migrates. The C shapes
+   keep the non-`pub` tolerance until #204 removes them; after that a non-`pub`
+   `main` is an error at `main`.
+2. A `main` with no `-> i32` returns 0, always; its tail is discarded. The
+   signature, not the tail, says whether a value is an exit status (§5.7
+   already says this; ritz0 no longer returns the tail).
+3. `[[bin]] entry` is a build-target key, not language. The language has one
+   entry convention: `main` in one of the §5.7 shapes. Measured defect:
+   `manifest.py::resolve_entry_point` parses `module::function`, then
+   `plan_binaries` discards the function half (`src_path, _fn_name = result`,
+   :947), and the schema text still promises a function — so today `entry`
+   selects only the *file*. Harland's `efi_main`/`kernel_main` work because the
+   UEFI link hardcodes `/entry:efi_main` (`build_pipeline.py:1768`), not
+   because of the manifest. Filed as **#4434**; prefer narrowing either the
+   key or the schema string before the discard bites an author.
+
+### R69: trait receivers (#4016): `@Self` READ-ONLY, `@&Self` MUTABLE; `*Self` ORDINARY, CONFIRMED
+**Measured.** §12.1 already declares `fn show(self: @Self)` and
+`fn drop(self: @&Self)`. ritzlib declares 2 traits (`Hash`, `Eq`) and none uses
+`self: *Self`; inherent impls already borrow with `self: @T` / `self: @&T`.
+
+**RULED.** A trait method's receiver is an ordinary parameter whose type
+mentions `Self`: `@Self` is a read-only borrow, `@&Self` a mutable borrow, and
+`*Self` means what `*T` means everywhere — not a fourth receiver form. `Display`'s
+`show` takes `self: @Self`; `Writer`'s `write` takes `self: @&Writer`. Dispatch
+stays static (§12.2), so a receiver form an impl's method can't match is an
+error at the impl. §12.1 stands as written; Phase 2 (#201) needs no new syntax.
+
+### R70: bounded generic impls (#4017): THE LANGUAGE; ritz0'S BOUND TABLE IS THE DEFECT, CONFIRMED
+**Measured.** The corpus already has a bounded generic inherent impl
+(`impl<K: Hash + Eq, V> HashMap<K, V>`, ritzlib/hashmap.ritz:414) and generic
+trait impls (`impl<T> Drop for Box<T>`, box.ritz:30). §11.5 defines bounds and
+§12.2 says an impl covers every instantiation. R55 already records the parity
+defect: ritz0's instantiation-time check does not see a generic impl —
+`impl<T> Drop for Box<T>` fails `Box<i64>: Drop`. Still closed by R26/R36: a
+generic impl on a built-in (`impl<T> Span<T>`); #4294 admits only the concrete
+`Span<u8>`.
+
+**RULED.** A bounded generic impl is part of the language and both compilers
+must accept it; where ritz0 cannot yet, that is a parity bug to fix, not a
+reason to weaken the rule. Phase 2 (#201) may ship monomorphic impls for the
+substitutions it needs (`Span<u8>`, `Option<i32>`, … — already admitted by
+#4294) and convert to the bounded generic form once both compilers pass the
+parity rows. Reopening a generic impl on `Span<T>`/`Option<T>`/`Result<T,E>`
+is a separate ruling, not part of #201.
+
+### R71: a global of a `Drop` type (#4079): ERROR, NO EXEMPTION; POINTER GLOBALS, CONFIRMED
+**Measured (recount 2026-11-21).** The list has shrunk from 11 sites to 10:
+`tome/lib/server_blocking.ritz` no longer declares a `Store` global. Today — 8
+in ritz1: sema_probe.ritz:55/56/57/67, bool_check.ritz:1047,
+binder_check.ritz:44, enum_as_int.ritz:65/66 (`HashMapI64`); 2 in tome:
+server.ritz:81, blocking_server.ritz:38 (`Store`). Each is process-lifetime
+first-use state behind a `*_ready`/`*_on` flag, and none is ever dropped.
+
+**RULED.** R60's rule stands unchanged — a global of a type with `Drop` is an
+error — with no exemption: the destructor would never run, which is the leak
+the rule exists to prevent. All 10 sites migrate to (a) a pointer global
+(`var g_x: *HashMapI64`), allocated once in the existing first-use/init path
+and never freed; that preserves today's behaviour exactly and needs no
+teardown. A site that later gains a real shutdown upgrades to (b) an explicit
+init/teardown pair. Then extend `_refuse_drop_const` to VarDef with the
+`drop_global` row in `ritz0/test_const_init_r60.py`, and drop §4.3's "pending"
+note. **Recount first** — the ticket's list is stale.
+
+### R72: char-literal patterns (#4196): ACCEPT, CONFIRMED
+**Measured.** 0 char patterns exist in the corpus; both compilers refuse one
+(ritz0 "Expected pattern, got CHAR", ritz1 does not parse it). A char literal
+is `u8` (§2.6), so a char pattern is an integer-literal pattern exactly. sage's
+`lexer_scan_punct` writes 24 of them as decimal literals with a comment
+(`40 => … # '('`).
+
+**RULED.** §8.2 Literal Patterns: a `'.'` literal is an integer literal
+pattern, typed `u8`, in a `u8` scrutinee's arm, under the same catch-all and
+repeated-arm rules as an integer. Implement on both compilers with located
+expect-error rows, then convert sage's 24 arms to `'(' =>`. A literal wider
+than `u8` is already refused at the literal (§2.6).
+
+### R73: narrowing through a congruent operator chain (#4219): WIDEN #1445, CONFIRMED
+**Measured.** `var m: i32 = b; m += if a < b then a else 255` is refused on
+both compilers: `op=` lowers to `x = x op v`, `_arith_context_nodes` refuses to
+follow `if`/`match` arms below an operator (#1445: arms under `*` ahead of a
+`/`, `%` or `>>` would change the value), so the arm stays `i64` and the store
+is refused. Same for `let k: i32 = b + (if c then a else 255)`.
+
+**RULED.** Follow the arm path when every operator from the slot down to the
+`if`/`match` is congruent mod 2\*\*width — `+ - * & | ^ <<` — and stop, as #1445
+does, at `/ % >>` and at comparisons. Losslessness is the argument: typing the
+arm at the slot's width cannot change a bit of the stored value along that
+path, and a value that would overflow at the slot's width could not be stored
+losslessly at that width either (and R63 traps there, so it is loud). Implement
+in `_arith_context_nodes` and `narrow_src_type_in` with the same rows, plus a
+negative row for each of `/ % >>`. The `as i32` idiom then needs no
+documenting.
+
+### Implementation tickets
+
+| R | Ticket | After this batch |
+|---|---|---|
+| R68 | #4015 | ratified; `main_abi` implements answers 1–2; `entry` lawlessness filed as #4434 |
+| R69 | #4016 | ratified; no code change; §12.1 stands |
+| R70 | #4017 | ratified; the ritz0 bound-through-generic-impl parity fix; #201 may ship monomorphic impls meanwhile |
+| R71 | #4079 | **ready** — 10 sites + ritz0 check + §4.3; recount first |
+| R72 | #4196 | **ready** — both compilers + §8.2 + sage's 24 arms |
+| R73 | #4219 | **ready** — both compilers, congruent path only |
+
+Closed on this batch: #4015, #4016, #4017 (the ratification is the
+deliverable). #4079, #4196 and #4219 become executable.
