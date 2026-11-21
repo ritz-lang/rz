@@ -108,10 +108,11 @@ arch-report:
 	@$(PYTHON) tools/ritz1_arch.py
 
 # M1.3's thresholds as a one-way ratchet over the numbers arch-report prints
-# (tools/ritz1_metrics_baseline.json): a metric may improve, not worsen.
-# Runs in tools-unit (tools/test_ritz1_ratchet.py); this target is for humans.
-# Refresh the baseline only with an explicit --update, in the commit that
-# earned the improvement.
+# (tools/ritz1_metrics_baseline.json, plus one acceptance file per ticket in
+# tools/ratchet_accept/): a metric may improve, not worsen.  Runs in
+# tools-unit (tools/test_ritz1_ratchet.py); this target is for humans.
+# Accept a deliberate feature cost with `--update`, which writes only this
+# ticket's raised metrics so two rooms never share a hunk (AGAST #4447).
 .PHONY: arch-ratchet
 arch-ratchet:
 	@$(PYTHON) tools/ritz1_ratchet.py

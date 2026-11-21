@@ -12,6 +12,7 @@ prints) and excludes generated modules **by name**, as the milestone says
 """
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -20,9 +21,13 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent))
 
 from ritz1_ratchet import (
+    DEFAULT_ACCEPT,
     DEFAULT_BASELINE,
     DEFAULT_GENERATED,
+    acceptance_deltas,
     compare,
+    effective_baseline,
+    load_acceptances,
     load_baseline,
     main,
     measure,
@@ -185,7 +190,7 @@ def test_better_scalar_passes_and_reports_the_improvement():
     msg = findings[0].detail
     assert "ptr_len_param_pair" in msg
     assert "916" in msg and "900" in msg
-    assert "--update" in msg
+    assert "no record" in msg
 
 
 def test_long_fn_growing_regresses_names_the_fn():
@@ -273,14 +278,278 @@ def test_main_exit_0_on_improvement_without_touching_baseline(tmp_path):
     assert bpath.read_text() == before
 
 
-def test_update_records_the_measured_values(tmp_path):
+# --------------------------------------------------------------------------
+# One acceptance file per ticket (AGAST #4447): the shared blob is the base
+# and is never rewritten by a room, so two rooms raising the same metric touch
+# different files and cherry-pick in either order.  This is the repo's
+# merge-magnet idiom from #3963 (known-failures/<ticket>.toml).
+# --------------------------------------------------------------------------
+
+
+def _accept(path, doc):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
+    return path
+
+
+def test_update_accepts_a_raise_in_a_per_ticket_file(tmp_path):
+    """--update is a deliberate acceptance, written per ticket; the shared
+    base blob stays byte-identical so unrelated rooms never share a hunk."""
     bpath = tmp_path / "baseline.json"
     _write_baseline(bpath, _baseline())
-    measured = _baseline(scalars={"ptr_len_param_pair": 900})
+    adir = tmp_path / "ratchet_accept"
+    measured = _baseline(scalars={"ptr_len_param_pair": 917})
     mpath = tmp_path / "measured.json"
     mpath.write_text(json.dumps(measured))
-    assert main(["--measured", str(mpath), "--baseline", str(bpath), "--update"]) == 0
-    assert load_baseline(bpath)["scalars"]["ptr_len_param_pair"] == 900
+    before = bpath.read_text()
+
+    rc = main(
+        [
+            "--measured",
+            str(mpath),
+            "--baseline",
+            str(bpath),
+            "--accept-dir",
+            str(adir),
+            "--ticket",
+            "4447",
+            "--update",
+        ]
+    )
+    assert rc == 0
+    assert bpath.read_text() == before  # the merge magnet is not touched
+    files = sorted(p.name for p in adir.glob("*.json"))
+    assert files == ["4447.json"]
+    assert json.loads((adir / "4447.json").read_text())["scalars"] == {
+        "ptr_len_param_pair": 1
+    }
+
+
+def test_update_records_a_raise_as_a_delta_not_the_absolute_value(tmp_path):
+    """Deltas compose: two rooms raising the same metric add up, which is the
+    superposition a merge train gates.  An absolute value would not."""
+    bpath = tmp_path / "baseline.json"
+    _write_baseline(bpath, _baseline())
+    adir = tmp_path / "ratchet_accept"
+    mpath = tmp_path / "measured.json"
+    mpath.write_text(json.dumps(_baseline(scalars={"ptr_len_param_pair": 924})))
+    assert (
+        main(
+            [
+                "--measured",
+                str(mpath),
+                "--baseline",
+                str(bpath),
+                "--accept-dir",
+                str(adir),
+                "--ticket",
+                "4447",
+                "--update",
+            ]
+        )
+        == 0
+    )
+    assert json.loads((adir / "4447.json").read_text())["scalars"] == {
+        "ptr_len_param_pair": 8
+    }
+
+
+def test_update_with_no_raise_writes_no_acceptance(tmp_path):
+    bpath = tmp_path / "baseline.json"
+    _write_baseline(bpath, _baseline())
+    adir = tmp_path / "ratchet_accept"
+    mpath = tmp_path / "measured.json"
+    mpath.write_text(json.dumps(_baseline(scalars={"ptr_len_param_pair": 900})))
+    assert (
+        main(
+            [
+                "--measured",
+                str(mpath),
+                "--baseline",
+                str(bpath),
+                "--accept-dir",
+                str(adir),
+                "--ticket",
+                "4447",
+                "--update",
+            ]
+        )
+        == 0
+    )
+    assert not adir.exists() or not list(adir.glob("*.json"))
+
+
+def test_re_running_update_rewrites_this_tickets_file_not_a_second_one(tmp_path):
+    """A room that re-runs --update after a rebase replaces its own delta."""
+    bpath = tmp_path / "baseline.json"
+    _write_baseline(bpath, _baseline())
+    adir = tmp_path / "ratchet_accept"
+    for measured, expected in ((917, 1), (922, 6)):
+        mpath = tmp_path / f"measured-{measured}.json"
+        mpath.write_text(
+            json.dumps(_baseline(scalars={"ptr_len_param_pair": measured}))
+        )
+        assert (
+            main(
+                [
+                    "--measured",
+                    str(mpath),
+                    "--baseline",
+                    str(bpath),
+                    "--accept-dir",
+                    str(adir),
+                    "--ticket",
+                    "4447",
+                    "--update",
+                ]
+            )
+            == 0
+        )
+        (doc,) = [json.loads(p.read_text()) for p in adir.glob("*.json")]
+        assert doc["scalars"] == {"ptr_len_param_pair": expected}
+    assert [p.name for p in adir.glob("*.json")] == ["4447.json"]
+
+
+def test_acceptance_raises_the_allowance_and_still_refuses_one_more(tmp_path):
+    adir = tmp_path / "ratchet_accept"
+    _accept(adir / "4447.json", {"scalars": {"ptr_len_param_pair": 1}})
+    allowance = effective_baseline(_baseline(), load_acceptances(adir))
+    assert allowance["scalars"]["ptr_len_param_pair"] == 917
+    assert compare(_baseline(scalars={"ptr_len_param_pair": 917}), allowance) == []
+    regs = [
+        f
+        for f in compare(_baseline(scalars={"ptr_len_param_pair": 918}), allowance)
+        if f.kind == "regression"
+    ]
+    assert regs and "918" in regs[0].detail
+
+
+def test_acceptances_for_the_same_metric_compose_additively():
+    """The merged tree costs both features, so allowances add; taking the max
+    would let the second room's feature cost escape the train's gate."""
+    allowance = effective_baseline(
+        _baseline(),
+        [
+            {"scalars": {"ptr_len_param_pair": 1}},
+            {"scalars": {"ptr_len_param_pair": 5}},
+        ],
+    )
+    assert allowance["scalars"]["ptr_len_param_pair"] == 922
+    # Neither room rebased: the train tree carries base + both feature costs.
+    assert compare(_baseline(scalars={"ptr_len_param_pair": 922}), allowance) == []
+
+
+def test_acceptances_compose_for_long_fns_and_new_cycle_members():
+    allowance = effective_baseline(
+        _baseline(),
+        [
+            {"long_fns": {"hand::big": 20}, "cycle_module_names": ["c"]},
+            {"long_fns": {"hand::big": 5}, "cycle_module_names": ["d"]},
+        ],
+    )
+    assert allowance["long_fns"]["hand::big"] == 425
+    assert allowance["cycle_module_names"] == ["a", "b", "c", "d"]
+
+
+def test_acceptance_is_excluded_when_it_is_recomputed(tmp_path):
+    """--update must measure against everything *except* its own stale file,
+    or a re-run would see its own delta and accept nothing."""
+    doc = _baseline(scalars={"ptr_len_param_pair": 917})
+    own_path = tmp_path / "4447.json"
+    own = {"scalars": {"ptr_len_param_pair": 1}, "_path": own_path}
+    allowance = effective_baseline(_baseline(), [own], exclude=own_path)
+    assert acceptance_deltas(doc, allowance)["scalars"] == {"ptr_len_param_pair": 1}
+
+
+def test_malformed_acceptance_fails_closed(tmp_path):
+    adir = tmp_path / "ratchet_accept"
+    adir.mkdir()
+    (adir / "4447.json").write_text("{not json")
+    with pytest.raises(ValueError):
+        load_acceptances(adir)
+    (adir / "4447.json").write_text(json.dumps({"scalars": {"cstr_literal": -1}}))
+    with pytest.raises(ValueError):
+        load_acceptances(adir)
+    (adir / "4447.json").write_text(json.dumps({"scalars": [1]}))
+    with pytest.raises(TypeError):
+        load_acceptances(adir)
+
+
+def test_raising_one_function_is_refused_until_this_ticket_accepts_it(tmp_path):
+    """Mutation-check the ratchet end to end: a grown function fails, the same
+    ticket may accept that exact cost, and one more SLOC is refused again."""
+    bpath = tmp_path / "baseline.json"
+    _write_baseline(bpath, _baseline())
+    adir = tmp_path / "ratchet_accept"
+    common = ["--baseline", str(bpath), "--accept-dir", str(adir), "--ticket", "4447"]
+
+    def measured(n: int) -> Path:
+        path = tmp_path / f"measured-{n}.json"
+        path.write_text(json.dumps(_baseline(long_fns={"hand::big": n})))
+        return path
+
+    assert main(["--measured", str(measured(401)), *common]) == 1
+    assert main(["--measured", str(measured(401)), *common, "--update"]) == 0
+    assert main(["--measured", str(measured(401)), *common]) == 0
+    assert main(["--measured", str(measured(402)), *common]) == 1
+
+
+def test_old_format_baseline_update_is_still_honoured_as_the_base(tmp_path):
+    """An in-flight room on the old tool rewrites the blob (trap 3).  The new
+    loader reads it as the base, so its accepted cost is not lost."""
+    bpath = tmp_path / "baseline.json"
+    _write_baseline(bpath, _baseline(scalars={"ptr_len_param_pair": 917}))
+    allowance = effective_baseline(load_baseline(bpath), [])
+    assert allowance["scalars"]["ptr_len_param_pair"] == 917
+
+
+@pytest.mark.integration
+def test_two_tickets_raising_the_same_metric_cherry_pick_in_either_order(tmp_path):
+    """The acceptance itself: two rooms, different bases, same raised metric,
+    one train, neither rebasing.  Each writes only its own ticket's file."""
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            [
+                "git",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                *args,
+            ],
+            cwd=repo,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    repo = tmp_path / "repo"
+    accept = repo / "tools" / "ratchet_accept"
+    accept.mkdir(parents=True)
+    _write_baseline(repo / "tools" / "baseline.json", _baseline())
+    git("init", "-q", "-b", "base")
+    git("add", "-A")
+    git("commit", "-qm", "base")
+    fixes = []
+    for ticket, delta in (("4447", 18), ("4324", 68)):
+        git("checkout", "-q", "-b", f"task-{ticket}", "base")
+        _accept(accept / f"{ticket}.json", {"scalars": {"cstr_literal": delta}})
+        git("add", "-A")
+        git("commit", "-qm", f"task-{ticket}")
+        fixes.append(git("rev-parse", "HEAD"))
+    for order in (fixes, fixes[::-1]):
+        git("checkout", "-q", "-B", "train", "base")
+        for sha in order:
+            git("cherry-pick", sha)  # check=True: a conflict raises, failing us
+        allowance = effective_baseline(
+            load_baseline(repo / "tools" / "baseline.json"),
+            load_acceptances(accept),
+        )
+        # 6763 + 18 + 68: both feature costs, no rebase, no re-gate.
+        assert allowance["scalars"]["cstr_literal"] == 6763 + 18 + 68
 
 
 # --------------------------------------------------------------------------
@@ -291,7 +560,10 @@ def test_update_records_the_measured_values(tmp_path):
 
 def test_committed_baseline_matches_this_tree():
     assert DEFAULT_BASELINE.exists(), DEFAULT_BASELINE
+    allowance = effective_baseline(
+        load_baseline(DEFAULT_BASELINE), load_acceptances(DEFAULT_ACCEPT)
+    )
     measured = measure()
-    findings = compare(measured, load_baseline(DEFAULT_BASELINE))
+    findings = compare(measured, allowance)
     regressions = [f for f in findings if f.kind == "regression"]
     assert regressions == [], "\n".join(f.detail for f in regressions)

@@ -8,15 +8,24 @@ Milestone M1.3 (#1830) is "done when ritz-metrics on ritz1/src shows: no fn
 <= 40, no silent capacity limits".  None of those was a gate before this.
 
 A metric may improve; it may not get worse.  Improvements pass (so a good
-change is never blocked) but do not silently rewrite history: the baseline
-is only refreshed by an explicit `--update`, which records the new numbers
-for the commit that brought them.  A regression exits 1 and names the
-metric, the committed baseline and the measured value.
+change is never blocked) and need no record.  A deliberate feature cost is
+accepted by `--update`, which writes **only that ticket's raised metrics** to
+`ratchet_accept/<ticket>.json`; the shared baseline blob is left untouched.
+One file per ticket is the repo's merge-magnet idiom (AGAST #3963): two rooms
+that both accept a cost, even on the same metric, add different files and
+cherry-pick in either order without rebasing.  Acceptances are *deltas*, so
+the train's gate can budget their superposition (base + d1 + d2) rather than
+the weaker max(v1, v2).  The allowance is monotonic: improvements are not
+written back, so a deliberate edit is needed to tighten it.  A regression
+outside the allowance exits 1 and names the metric, the baseline and the
+measured value.  An in-flight room running the old `--update` still writes a
+valid baseline blob, which is read as the base (AGAST #4447 trap 3).
 
-    ritz1_ratchet.py                     # compare this tree to the baseline
-    ritz1_ratchet.py --update            # record this tree's improvements
+    ritz1_ratchet.py                     # compare this tree to the allowance
+    ritz1_ratchet.py --update            # accept this tree's raised metrics
     ritz1_ratchet.py --measured FILE     # compare a saved measurement
     ritz1_ratchet.py --src DIR --metrics PATH
+    ritz1_ratchet.py --accept-dir DIR --ticket 4447
 
 Generated modules are excluded from the length thresholds by explicit name
 (``GENERATED_MODULES``), as M1.3 says "outside generated code".  A size
@@ -33,9 +42,12 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
+import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -57,6 +69,10 @@ DEFAULT_GENERATED = GENERATED_MODULES
 
 DEFAULT_SRC = ritz1_arch.DEFAULT_SRC
 DEFAULT_BASELINE = _TOOLS / "ritz1_metrics_baseline.json"
+# One acceptance file per AGAST ticket (AGAST #4447).  The shared baseline
+# blob above is the base and is not rewritten by a room, so two rooms raising
+# the same metric never edit the same hunk (the repo idiom from #3963).
+DEFAULT_ACCEPT = _TOOLS / "ratchet_accept"
 # projects/ritz/tools -> projects/ritz -> projects -> repo root.
 _REPO_ROOT = _TOOLS.parents[2]
 DEFAULT_METRICS = (
@@ -192,17 +208,138 @@ def load_baseline(path: Path = DEFAULT_BASELINE) -> dict:
 
 
 def dump_baseline(measured: dict, path: Path, previous: dict | None = None) -> None:
-    """Write `measured`, keeping provenance/notes from the old baseline."""
+    """Legacy whole-blob write, kept for the old `--update` (AGAST #4447).
+
+    New `--update` writes a per-ticket acceptance instead, so this shared file
+    is not a merge magnet.  A blob written by an in-flight room's old tool is
+    still read as the base, so the transition is tolerant.
+    """
     doc = dict(previous or {})
     doc.update(measured)
     path.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
 
 
+def _validate_acceptance(doc: object, path: Path) -> None:
+    if not isinstance(doc, dict):
+        raise TypeError(f"{path}: an acceptance must be a JSON object")
+    for key in ("scalars", "long_fns", "large_files"):
+        table = doc.get(key, {})
+        if not isinstance(table, dict):
+            raise TypeError(f"{path}: `{key}` must be an object")
+        for name, delta in table.items():
+            if not isinstance(delta, int) or isinstance(delta, bool) or delta < 0:
+                raise ValueError(
+                    f"{path}: `{key}.{name}` must be a non-negative integer "
+                    f"delta, not {delta!r}"
+                )
+    names = doc.get("cycle_module_names", [])
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise TypeError(f"{path}: `cycle_module_names` must be a list of names")
+
+
+def load_acceptances(directory: Path = DEFAULT_ACCEPT) -> list[dict]:
+    """Load the per-ticket acceptance files in `directory`.
+
+    Malformed JSON, a non-table or a negative delta raises: a gate that cannot
+    read its excuses must not read them as none.  A missing directory is no
+    acceptances, which is the normal state on main.
+    """
+    directory = Path(directory)
+    if not directory.exists():
+        return []
+    out: list[dict] = []
+    for path in sorted(directory.glob("*.json")):
+        try:
+            doc = json.loads(path.read_text())
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"{path}: {exc}") from exc
+        _validate_acceptance(doc, path)
+        out.append({**doc, "_path": path})
+    return out
+
+
+def effective_baseline(
+    baseline: dict,
+    acceptances: list[dict],
+    *,
+    exclude: Path | None = None,
+) -> dict:
+    """The committed baseline plus every ticket's accepted raise.
+
+    Acceptances are deltas, so they compose as base + d1 + d2: the train gates
+    the superposition of two rooms' feature costs, which max(v1, v2) would
+    under-budget.  A ticket's own file is skipped while it is recomputed.
+    """
+    doc = json.loads(json.dumps(baseline))  # deep copy; baseline is JSON-shaped
+    excluded = Path(exclude) if exclude is not None else None
+    for acc in acceptances:
+        if excluded is not None and Path(acc.get("_path", "")) == excluded:
+            continue
+        for key in ("scalars", "long_fns", "large_files"):
+            table = doc.setdefault(key, {})
+            for name, delta in acc.get(key, {}).items():
+                table[name] = table.get(name, 0) + delta
+        names = set(doc.get("cycle_module_names", []))
+        names.update(acc.get("cycle_module_names", []))
+        doc["cycle_module_names"] = sorted(names)
+    return doc
+
+
+def acceptance_deltas(measured: dict, allowance: dict) -> dict:
+    """The metrics this tree raises above `allowance`; empty when none."""
+    out: dict = {}
+    base_scalars = allowance.get("scalars", {})
+    scalars = {
+        name: measured["scalars"][name] - base_scalars.get(name, 0)
+        for name in SCALARS
+        if name in measured.get("scalars", {})
+        and measured["scalars"][name] > base_scalars.get(name, 0)
+    }
+    if scalars:
+        out["scalars"] = scalars
+    for key in ("long_fns", "large_files"):
+        allowed = allowance.get(key, {})
+        grown = {
+            name: value - allowed.get(name, 0)
+            for name, value in measured.get(key, {}).items()
+            if value > allowed.get(name, 0)
+        }
+        if grown:
+            out[key] = grown
+    joined = sorted(
+        set(measured.get("cycle_module_names", []))
+        - set(allowance.get("cycle_module_names", []))
+    )
+    if joined:
+        out["cycle_module_names"] = joined
+    return out
+
+
+def _ticket_slug(explicit: str | None = None) -> str | None:
+    """The file stem for this acceptance: an explicit ticket, else the room.
+
+    `ADELE_ROOM`/`RZ_TASK` is `ritz-task-4447` for a room; a human outside a
+    room falls back to a content-derived name (see `_content_slug`).
+    """
+    if explicit:
+        slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(explicit)).strip("-")
+        return slug or None
+    room = os.environ.get("ADELE_ROOM") or os.environ.get("RZ_TASK") or ""
+    match = re.search(r"(\d+)\s*$", room)
+    return match.group(1) if match else None
+
+
+def _content_slug(deltas: dict) -> str:
+    payload = json.dumps(deltas, sort_keys=True, separators=(",", ":")).encode()
+    return "accept-" + hashlib.sha1(payload).hexdigest()[:12]
+
+
 def compare(measured: dict, baseline: dict) -> list[Finding]:
     """Every place the tree moved against the baseline.
 
-    Regressions are failures; improvements are reported so the operator can
-    run `--update`.  Equal metrics produce nothing.
+    Regressions are failures unless this ticket's acceptance covers them;
+    improvements are reported and need no record.  Equal metrics produce
+    nothing.
     """
     out: list[Finding] = []
     base_scalars = baseline.get("scalars", {})
@@ -230,7 +367,7 @@ def compare(measured: dict, baseline: dict) -> list[Finding]:
                     b,
                     m,
                     f"{name} improved: baseline {b}, measured {m}; "
-                    "run with --update to record it",
+                    "improvements need no record",
                 )
             )
 
@@ -246,7 +383,7 @@ def compare(measured: dict, baseline: dict) -> list[Finding]:
                         item,
                         b,
                         None,
-                        f"{item} is now at most {unit}; run with --update to record it",
+                        f"{item} is now at most {unit}; improvements need no record",
                     )
                 )
             elif b is None:
@@ -277,7 +414,7 @@ def compare(measured: dict, baseline: dict) -> list[Finding]:
                         b,
                         m,
                         f"{item} improved: baseline {b}, measured {m}; "
-                        "run with --update to record it",
+                        "improvements need no record",
                     )
                 )
 
@@ -305,7 +442,7 @@ def compare(measured: dict, baseline: dict) -> list[Finding]:
                 name,
                 sorted(base_cycle),
                 sorted(meas_cycle),
-                f"`{name}` left the import cycle; run with --update to record it",
+                f"`{name}` left the import cycle; improvements need no record",
             )
         )
     return out
@@ -337,13 +474,26 @@ def main(argv: list[str] | None = None) -> int:
         help="compare a saved measurement instead of scanning --src",
     )
     ap.add_argument(
+        "--accept-dir",
+        type=Path,
+        default=DEFAULT_ACCEPT,
+        help="per-ticket acceptance directory (default: tools/ratchet_accept)",
+    )
+    ap.add_argument(
+        "--ticket",
+        help="AGAST ticket naming this acceptance (default: the room, else a "
+        "content hash)",
+    )
+    ap.add_argument(
         "--update",
         action="store_true",
-        help="record the measured values (including improvements) in the baseline",
+        help="accept this tree's raised metrics in its own per-ticket file",
     )
     args = ap.parse_args(argv)
 
     baseline = load_baseline(args.baseline)
+    acceptances = load_acceptances(args.accept_dir)
+    allowance = effective_baseline(baseline, acceptances)
     # The committed file is the authority on which modules are generated.
     generated = tuple(baseline.get("generated_modules", DEFAULT_GENERATED))
     if args.measured:
@@ -352,8 +502,27 @@ def main(argv: list[str] | None = None) -> int:
         measured = measure(
             args.src, metrics_py=args.metrics, generated_modules=generated
         )
-    findings = compare(measured, baseline)
+    findings = compare(measured, allowance)
     _report(findings)
+
+    if args.update:
+        # Deliberate acceptance: write only this ticket's deltas.  Excluding
+        # its own file lets a re-run after a rebase replace the old delta.
+        slug = _ticket_slug(args.ticket)
+        own = args.accept_dir / f"{slug}.json" if slug else None
+        recomputed = effective_baseline(baseline, acceptances, exclude=own)
+        deltas = acceptance_deltas(measured, recomputed)
+        if not deltas:
+            print("no metric raised above its allowance; nothing to accept")
+            return 0
+        if own is None:
+            own = args.accept_dir / f"{_content_slug(deltas)}.json"
+        doc = {"ticket": slug or own.stem, **deltas}
+        own.parent.mkdir(parents=True, exist_ok=True)
+        own.write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
+        raises = sum(len(values) for values in deltas.values())
+        print(f"accepted {raises} raise(s) in {own}")
+        return 0
 
     regressions = [f for f in findings if f.kind == "regression"]
     if regressions:
@@ -362,9 +531,6 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
-    if args.update:
-        dump_baseline(measured, args.baseline, baseline)
-        print(f"recorded {len(findings)} change(s) in {args.baseline}")
     return 0
 
 
