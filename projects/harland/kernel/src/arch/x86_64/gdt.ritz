@@ -11,6 +11,8 @@
 # In 64-bit mode, most of the GDT fields are ignored, but we still
 # need valid entries for segmentation to work.
 
+import arch.x86_64.cpu_map { MAX_CPUS }
+
 # ============================================================================
 # GDT Segment Selectors
 # ============================================================================
@@ -104,26 +106,36 @@ struct Tss
     iopb_offset: u16    # I/O permission bitmap offset
 
 # ============================================================================
-# Global GDT and TSS Storage
+# Global GDT and per-CPU TSS storage (AGAST #4192)
 # ============================================================================
+# One GDT is shared by every CPU, but the TSS is per CPU: it holds the ring-0
+# RSP (TSS.rsp0) and the IST stacks an interrupt from ring 3 lands on, and two
+# CPUs must never share those. The first five descriptors are fixed; each CPU
+# owns a 16-byte TSS descriptor after them, at index GDT_TSS_FIRST +
+# cpu_index*2, and loads TR with that selector. 133 entries = 5 + 2*64
+# (arch/x86_64/cpu_map.ritz MAX_CPUS; a literal because array lengths are).
+const GDT_TSS_FIRST: i32 = 5
+const GDT_ENTRIES: i32 = 133
 
-# GDT with 6 entries: null, kernel code, kernel data, user code, user data, TSS (2 slots)
-var gdt: [7]GdtEntry
+# GDT with 133 entries: null, kernel code, kernel data, user code, user data,
+# then 64 pairs of TSS descriptors.
+var gdt: [133]GdtEntry
 
-# TSS structure
-var tss: Tss
+# The TSS of each CPU, indexed by CPU index (cpu_map), not APIC ID.
+var tsses: [64]Tss
 
 # GDT descriptor for LGDT
 var gdt_descriptor: GdtDescriptor
 
-# Kernel stack for ring 0 (used when transitioning from ring 3)
+# CPU 0's fallback stacks, used from gdt_init (before the PMM exists) until
+# arch/x86_64/percpu.ritz cpu_bringup gives every CPU PMM-backed, guard-paged
+# stacks.
 var kernel_stack: [4096]u8
 
 # IST1: Interrupt stack for critical exceptions (NMI, double fault, stack fault, machine check)
 var interrupt_stack: [4096]u8
 
 # IST2: Interrupt stack for hardware IRQs (timer, etc.)
-# This allows interrupts to fire safely during syscall execution
 var irq_stack: [4096]u8
 
 # IST3: the scheduler's timer tick (isr_stubs.s irq_stub_timer, #3629)
@@ -173,6 +185,28 @@ fn set_tss_entry(gdt_index: i32, tss_addr: u64)
 # GDT Initialization
 # ============================================================================
 
+# The TSS selector of CPU `cpu_idx`: its 16-byte descriptor after the five
+# fixed entries.
+fn tss_selector(cpu_idx: i32) -> u16
+    return ((GDT_TSS_FIRST + cpu_idx * 2) * 8) as u16
+
+# Fill CPU `cpu_idx`'s TSS: ring-0 RSP and the three IST stacks.
+fn tss_fill(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64) -> i32
+    # Zero out the TSS
+    let tss_ptr: *u8 = @tsses[cpu_idx] as *u8
+    var i: i32 = 0
+    while i < 104
+        *(tss_ptr + i as i64) = 0
+        i = i + 1
+
+    tsses[cpu_idx].rsp0 = rsp0
+    tsses[cpu_idx].ist1 = ist1
+    tsses[cpu_idx].ist2 = ist2
+    tsses[cpu_idx].ist3 = ist3
+    # I/O permission bitmap offset (beyond TSS = no IOPB)
+    tsses[cpu_idx].iopb_offset = 104
+    return 0
+
 pub fn gdt_init() -> i32
     # Entry 0: Null descriptor (required)
     gdt[0] = make_gdt_entry(0, 0, 0, 0)
@@ -197,52 +231,46 @@ pub fn gdt_init() -> i32
     let udata_flags: u8 = GDT_FLAG_GRANULARITY
     gdt[4] = make_gdt_entry(0, 0xFFFFF, udata_access, udata_flags)
 
-    # Initialize TSS
-    tss_init()
-
-    # Entry 5-6: TSS (16 bytes, spans two entries)
-    let tss_addr: u64 = @tss as u64
-    set_tss_entry(5, tss_addr)
+    # CPU 0's TSS with the early fallback stacks. cpu_bringup replaces them
+    # with PMM-backed, guard-paged stacks once the VMM is up.
+    tss_fill(0, (@kernel_stack[0] as u64) + 4096,
+             (@interrupt_stack[0] as u64) + 4096,
+             (@irq_stack[0] as u64) + 4096,
+             (@timer_stack[0] as u64) + 4096)
+    set_tss_entry(GDT_TSS_FIRST, @tsses[0] as u64)
 
     # Set up GDT descriptor
-    gdt_descriptor.size = (7 * 8 - 1) as u16  # 7 entries * 8 bytes - 1
+    gdt_descriptor.size = (GDT_ENTRIES * 8 - 1) as u16
     gdt_descriptor.offset = @gdt[0] as u64
 
     # Load the GDT
     gdt_load()
 
     # Load the TSS
-    tss_load()
+    tss_load(tss_selector(0))
 
     return 0
 
-fn tss_init() -> i32
-    # Zero out the TSS
-    let tss_ptr: *u8 = @tss as *u8
-    var i: i32 = 0
-    while i < 104
-        *(tss_ptr + i as i64) = 0
-        i = i + 1
+# Give CPU `cpu_idx` its own TSS (rsp0 + IST1/2/3 stacks) and load TR with its
+# selector. Called by arch/x86_64/percpu.ritz cpu_bringup on every CPU; on the
+# BSP it replaces the early fallback stacks, on an AP it is the first TSS.
+pub fn gdt_init_cpu(cpu_idx: i32, rsp0: u64, ist1: u64, ist2: u64, ist3: u64) -> i32
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return -1
+    # The AP must be on the kernel GDT before loading its own TSS descriptor
+    # (the trampoline's GDT has no TSS); reloading on the BSP is harmless.
+    gdt_load()
+    tss_fill(cpu_idx, rsp0, ist1, ist2, ist3)
+    set_tss_entry(GDT_TSS_FIRST + cpu_idx * 2, @tsses[cpu_idx] as u64)
+    tss_load(tss_selector(cpu_idx))
+    return 0
 
-    # Set up ring 0 stack (used when switching from ring 3 to ring 0)
-    let stack_top: u64 = (@kernel_stack[0] as u64) + 4096
-    tss.rsp0 = stack_top
-
-    # Set up IST1 for critical exceptions (NMI, double fault, stack fault, machine check)
-    let ist1_top: u64 = (@interrupt_stack[0] as u64) + 4096
-    tss.ist1 = ist1_top
-
-    # Set up IST2 for hardware IRQs (timer, etc.)
-    # This allows interrupts to fire safely during syscall execution
-    let ist2_top: u64 = (@irq_stack[0] as u64) + 4096
-    tss.ist2 = ist2_top
-
-    # IST3 for the timer tick
-    tss.ist3 = (@timer_stack[0] as u64) + 4096
-
-    # I/O permission bitmap offset (beyond TSS = no IOPB)
-    tss.iopb_offset = 104
-
+# Set CPU `cpu_idx`'s ring-0 RSP (TSS.rsp0): where an interrupt from ring 3
+# starts. proc/sched.ritz points it at the running process's kernel stack.
+pub fn gdt_set_kernel_stack_cpu(cpu_idx: i32, stack_top: u64) -> i32
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return -1
+    tsses[cpu_idx].rsp0 = stack_top
     return 0
 
 # ============================================================================
@@ -257,9 +285,8 @@ fn gdt_load() -> i32
     gdt_flush(gdt_ptr as u64)
     return 0
 
-fn tss_load() -> i32
+fn tss_load(tss_seg: u16) -> i32
     # Load TSS selector into TR register
-    let tss_seg: u16 = 0x28
     asm x86_64:
         movw {tss_seg}, %ax
         ltr %ax
@@ -280,7 +307,3 @@ pub fn gdt_get_user_code_selector() -> u16
 
 pub fn gdt_get_user_data_selector() -> u16
     return GDT_USER_DATA
-
-pub fn gdt_set_kernel_stack(stack_top: u64) -> i32
-    tss.rsp0 = stack_top
-    return 0

@@ -20,15 +20,50 @@
 .set KSTACK_STRIDE, KSTACK_GUARD_SIZE + SYSCALL_STACK_SIZE
 .set KSTACK_SLOTS, 8                # proc/table.ritz MAX_PROCS
 
+# ============================================================================
+# Per-CPU area (AGAST #4192)
+# ============================================================================
+# Every CPU has one of these, reached through GS (arch/x86_64/percpu.ritz sets
+# IA32_GS_BASE to it). syscall_entry runs in the kernel with GS on this CPU's
+# area -- swapgs at entry, swapgs at exit -- so a SYSCALL on one CPU never
+# touches another CPU's saved user frame or stack. The offsets are exported as
+# absolute symbols so isr_stubs.s can name them too; the per-CPU module's
+# layout mirrors them, and ritz0/test_harland_percpu.py pins every site to
+# the same table.
+.set PERCPU_SIZE, 64
+.set PERCPU_SLOTS, 64               # arch/x86_64/cpu_map.ritz MAX_CPUS
+.global PC_SELF
+.set PC_SELF, 0                      # u64: address of this area
+.global PC_CPU_INDEX
+.set PC_CPU_INDEX, 8                 # u64: CPU index (cpu_map), not APIC ID
+.global PC_KSTACK_TOP
+.set PC_KSTACK_TOP, 16               # u64: kernel RSP syscall_entry loads
+.global PC_USER_RSP
+.set PC_USER_RSP, 24                 # u64: user RSP saved on entry
+.global PC_USER_RIP
+.set PC_USER_RIP, 32                 # u64: user RIP (RCX on entry)
+.global PC_USER_RFLAGS
+.set PC_USER_RFLAGS, 40              # u64: user RFLAGS (R11 on entry)
+.global PC_USER_RAX
+.set PC_USER_RAX, 48                 # u64: syscall number/return value
+
+# The per-CPU areas themselves: index * PERCPU_SIZE. .bss, zeroed at boot.
+.section .bss
+.align 64
+percpu_areas:
+    .space PERCPU_SIZE * PERCPU_SLOTS
+percpu_areas_end:
+
 .section .bss
 # One kernel stack per process-table slot (AGAST #3629): the running
 # process's syscalls, the IRQs taken during them (IST=0), and the timer IRQ
 # that preempts it in ring 3 (TSS.rsp0) all run on its own stack, and a
 # process switched out in the kernel (blocked in wait/spawn/read, or
 # preempted) keeps its frames there until it runs again. proc/sched.ritz
-# points kstack_current_top and TSS.rsp0 at the next process's stack on
-# every switch. Before #3629 this was a single syscall_stack, so a process
-# could only stop in the kernel by never coming back (blocking spawn).
+# points this CPU's PC_KSTACK_TOP and TSS.rsp0 (both per-CPU, AGAST #4192)
+# at the next process's stack on every switch. Before #3629 this was a single
+# syscall_stack, so a process could only stop in the kernel by never coming
+# back (blocking spawn).
 #
 # Each slot is a guard page, then SYSCALL_STACK_SIZE of stack:
 #
@@ -49,35 +84,18 @@ proc_kstacks:
 proc_kstacks_end:
 
 .section .data
-# Saved user RSP during syscall
-user_rsp_save:
-    .quad 0
-
-# Top of the running process's kernel stack: syscall_entry's RSP, and
-# where irq_stub_timer (isr_stubs.s) moves a ring-3 tick's frame.
-# proc/sched.ritz sets it (with TSS.rsp0) on every switch.
-.global kstack_current_top
-kstack_current_top:
+# The BSP's saved kernel RSP while smp_test_enter_user runs a ring-3 test
+# stub: smp_test_resume_bsp returns through it (AGAST #4192). Only the BSP
+# uses this; it is not per-CPU state, because only one CPU runs the caller.
+smp_test_bsp_rsp:
     .quad 0
 
 # ============================================================================
 # Exported User Context (for spawn/exit)
 # ============================================================================
-# These globals are updated on syscall entry and can be read/written by
-# the syscall handler to implement spawn (save parent) and exit (restore parent).
-
-.global syscall_user_rip
-.global syscall_user_rsp
-.global syscall_user_rflags
-
-syscall_user_rip:
-    .quad 0
-syscall_user_rsp:
-    .quad 0
-syscall_user_rflags:
-    .quad 0
-syscall_user_rax:
-    .quad 0
+# The saved user frame is per-CPU (AGAST #4192): the accessors below read and
+# write this CPU's area through GS, so two CPUs in SYSCALL at once keep their
+# own RIP/RSP/RFLAGS/RAX.
 
 .section .text
 
@@ -89,23 +107,75 @@ syscall_user_rax:
 .global get_syscall_user_rip
 .type get_syscall_user_rip, @function
 get_syscall_user_rip:
-    movq syscall_user_rip(%rip), %rax
+    movq %gs:PC_USER_RIP, %rax
     ret
 .size get_syscall_user_rip, . - get_syscall_user_rip
 
 .global get_syscall_user_rsp
 .type get_syscall_user_rsp, @function
 get_syscall_user_rsp:
-    movq syscall_user_rsp(%rip), %rax
+    movq %gs:PC_USER_RSP, %rax
     ret
 .size get_syscall_user_rsp, . - get_syscall_user_rsp
 
 .global get_syscall_user_rflags
 .type get_syscall_user_rflags, @function
 get_syscall_user_rflags:
-    movq syscall_user_rflags(%rip), %rax
+    movq %gs:PC_USER_RFLAGS, %rax
     ret
 .size get_syscall_user_rflags, . - get_syscall_user_rflags
+
+# ============================================================================
+# Per-CPU area accessors (AGAST #4192)
+# ============================================================================
+# arch/x86_64/percpu.ritz binds these. The area accessors take a CPU index
+# (cpu_map order); the GS ones read the area the current CPU is on.
+
+# u64 percpu_area_for(u64 cpu_idx): the area's address (not this CPU's).
+.global percpu_area_for
+.type percpu_area_for, @function
+percpu_area_for:
+    movq %rdi, %rax
+    shlq $6, %rax                    # * PERCPU_SIZE (64)
+    leaq percpu_areas(%rip), %rcx
+    addq %rcx, %rax
+    ret
+.size percpu_area_for, . - percpu_area_for
+
+# u64 percpu_area_init(u64 cpu_idx): zero it, set self/index, return it.
+.global percpu_area_init
+.type percpu_area_init, @function
+percpu_area_init:
+    movq %rdi, %rax
+    shlq $6, %rax
+    leaq percpu_areas(%rip), %rcx
+    addq %rcx, %rax
+    movq $0, PC_SELF(%rax)
+    movq $0, PC_CPU_INDEX(%rax)
+    movq $0, PC_KSTACK_TOP(%rax)
+    movq $0, PC_USER_RSP(%rax)
+    movq $0, PC_USER_RIP(%rax)
+    movq $0, PC_USER_RFLAGS(%rax)
+    movq $0, PC_USER_RAX(%rax)
+    movq $0, 56(%rax)
+    movq %rax, PC_SELF(%rax)
+    movq %rdi, PC_CPU_INDEX(%rax)
+    ret
+.size percpu_area_init, . - percpu_area_init
+
+.global percpu_self
+.type percpu_self, @function
+percpu_self:
+    movq %gs:PC_SELF, %rax
+    ret
+.size percpu_self, . - percpu_self
+
+.global percpu_cpu_index
+.type percpu_cpu_index, @function
+percpu_cpu_index:
+    movq %gs:PC_CPU_INDEX, %rax
+    ret
+.size percpu_cpu_index, . - percpu_cpu_index
 
 .section .text
 
@@ -123,31 +193,27 @@ syscall_entry:
     #   - RAX = syscall number
     #   - Interrupts are disabled (SFMASK clears IF)
 
-    # CRITICAL: Switch to kernel stack immediately
-    # Save user RSP first
-    movq %rsp, user_rsp_save(%rip)
+    # CRITICAL: switch to this CPU's kernel stack immediately (AGAST #4192).
+    # GS_BASE was the user's (0) in ring 3; swapgs puts this CPU's area there
+    # so the saves and the stack load touch nothing another CPU owns.
+    swapgs
 
-    # Load the running process's kernel stack
-    movq kstack_current_top(%rip), %rsp
+    # Save the user's RSP and frame in this CPU's area before using RAX.
+    movq %rsp, %gs:PC_USER_RSP
+    movq %rax, %gs:PC_USER_RAX      # Save syscall number
+    movq %rcx, %gs:PC_USER_RIP      # User return RIP
+    movq %r11, %gs:PC_USER_RFLAGS   # User RFLAGS
 
-    # Now we have a safe kernel stack
+    # Load the running process's kernel stack (per process, selected by this
+    # CPU: proc/sched.ritz sets it on every switch).
+    movq %gs:PC_KSTACK_TOP, %rsp
 
-    # Save RAX (syscall number) to global FIRST before using it as scratch
-    # This is critical - we were clobbering it before!
-    movq %rax, syscall_user_rax(%rip)      # Save syscall number
-
-    # Export user context to globals (for spawn/exit to access)
-    movq %rcx, syscall_user_rip(%rip)      # User return RIP
-    movq user_rsp_save(%rip), %rax         # Use RAX as scratch now (already saved)
-    movq %rax, syscall_user_rsp(%rip)      # User RSP
-    movq %r11, syscall_user_rflags(%rip)   # User RFLAGS
-
-    # Restore RAX from saved value before pushing to frame
-    movq syscall_user_rax(%rip), %rax
+    # Now we have a safe kernel stack. Restore RAX from the saved value.
+    movq %gs:PC_USER_RAX, %rax
 
     # Save all registers that the syscall handler might need
     # Build a SyscallFrame on the stack
-    pushq user_rsp_save(%rip)   # user_rsp
+    pushq %gs:PC_USER_RSP        # user_rsp
     pushq %r11                   # saved RFLAGS
     pushq %rcx                   # return RIP
     pushq %r9                    # arg6
@@ -252,6 +318,9 @@ syscall_entry:
     pushq $0x1B                  # CS (user code segment, ring 3)
     pushq %rcx                   # RIP (from RCX)
 
+    # Back to the user's GS before ring 3 (AGAST #4192): the next SYSCALL's
+    # swapgs then puts this CPU's area back.
+    swapgs
     iretq
 
 .size syscall_entry, . - syscall_entry
@@ -301,7 +370,9 @@ jump_to_userspace:
     xorq %r14, %r14
     xorq %r15, %r15
 
-    # Jump to userspace!
+    # Jump to userspace! swapgs first: in ring 3 GS is the user's (0), and
+    # KERNEL_GS_BASE holds this CPU's area for the next SYSCALL (AGAST #4192).
+    swapgs
     iretq
 
 .size jump_to_userspace, . - jump_to_userspace
@@ -323,11 +394,11 @@ syscall_set_return_context:
     #   RSI = new user RSP
     #   RDX = new user RFLAGS
     #
-    # Update the global context variables - these will be used
+    # Update this CPU's saved context variables - these will be used
     # by the next syscall return
-    movq %rdi, syscall_user_rip(%rip)
-    movq %rsi, syscall_user_rsp(%rip)
-    movq %rdx, syscall_user_rflags(%rip)
+    movq %rdi, %gs:PC_USER_RIP
+    movq %rsi, %gs:PC_USER_RSP
+    movq %rdx, %gs:PC_USER_RFLAGS
     ret
 
 .size syscall_set_return_context, . - syscall_set_return_context
@@ -386,7 +457,8 @@ jump_to_userspace_with_args:
     xorq %r14, %r14
     xorq %r15, %r15
 
-    # Jump to userspace!
+    # Jump to userspace! swapgs first (see jump_to_userspace).
+    swapgs
     iretq
 
 .size jump_to_userspace_with_args, . - jump_to_userspace_with_args
@@ -464,11 +536,12 @@ syscall_stack_size:
     ret
 .size syscall_stack_size, . - syscall_stack_size
 
-# void kstack_set_current(u64 top): the stack syscall_entry loads.
+# void kstack_set_current(u64 top): the stack syscall_entry loads, per CPU.
+# Called with GS on this CPU's area (arch/x86_64/percpu.ritz cpu_bringup).
 .global kstack_set_current
 .type kstack_set_current, @function
 kstack_set_current:
-    movq %rdi, kstack_current_top(%rip)
+    movq %rdi, %gs:PC_KSTACK_TOP
     ret
 .size kstack_set_current, . - kstack_set_current
 
@@ -476,6 +549,75 @@ kstack_set_current:
 .global kstack_get_current
 .type kstack_get_current, @function
 kstack_get_current:
-    movq kstack_current_top(%rip), %rax
+    movq %gs:PC_KSTACK_TOP, %rax
     ret
 .size kstack_get_current, . - kstack_get_current
+
+# ============================================================================
+# SYSCALL MSRs (AGAST #4192)
+# ============================================================================
+# EFER.SCE, STAR (kernel CS 0x08), LSTAR (syscall_entry) and SFMASK (IF) are
+# per-CPU MSRs: every CPU sets its own in cpu_bringup, before it can enter
+# ring 3. Same values syscall/runtime/entry.ritz writes on the BSP.
+.global syscall_msr_init
+.type syscall_msr_init, @function
+syscall_msr_init:
+    # EFER.SCE = 1
+    movl $0xC0000080, %ecx
+    rdmsr
+    orl $1, %eax
+    wrmsr
+    # STAR: bits 47:32 = kernel CS 0x08
+    movl $0xC0000081, %ecx
+    xorl %eax, %eax
+    movl $0x08, %edx
+    wrmsr
+    # LSTAR = syscall_entry
+    movabsq $syscall_entry, %rax
+    movq %rax, %rdx
+    shrq $32, %rdx
+    movl $0xC0000082, %ecx
+    wrmsr
+    # SFMASK = 0x200 (clear IF)
+    movl $0xC0000084, %ecx
+    movl $0x200, %eax
+    xorl %edx, %edx
+    wrmsr
+    ret
+.size syscall_msr_init, . - syscall_msr_init
+
+# ============================================================================
+# Ring-3 self-test entry/resume (AGAST #4192)
+# ============================================================================
+# uint64 smp_test_enter_user(u64 entry, u64 user_stack): run a user stub
+# from kernel mode and return when it SYSCALLs the "done" phase. Saves the
+# caller's callee-saved registers and RSP; smp_test_resume_bsp restores them.
+# Kernel GS state on return is the state syscall_entry leaves (GS = this
+# CPU's area), so the caller continues in the kernel as usual.
+.global smp_test_enter_user
+.type smp_test_enter_user, @function
+smp_test_enter_user:
+    pushq %rbp
+    pushq %rbx
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+    movq %rsp, smp_test_bsp_rsp(%rip)
+    # RDI = entry, RSI = user_stack: jump_to_userspace's arguments.
+    jmp jump_to_userspace
+.size smp_test_enter_user, . - smp_test_enter_user
+
+.global smp_test_resume_bsp
+.type smp_test_resume_bsp, @function
+smp_test_resume_bsp:
+    movq smp_test_bsp_rsp(%rip), %rsp
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %rbx
+    popq %rbp
+    xorl %eax, %eax
+    ret
+.size smp_test_resume_bsp, . - smp_test_resume_bsp

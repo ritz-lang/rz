@@ -34,6 +34,7 @@ RITZ_ROOT = RITZ0_DIR.parent
 KERNEL_SRC = RITZ_ROOT.parent / "harland" / "kernel" / "src"
 CPU_MAP = KERNEL_SRC / "arch" / "x86_64" / "cpu_map.ritz"
 APIC = KERNEL_SRC / "arch" / "x86_64" / "apic.ritz"
+PERCPU = KERNEL_SRC / "arch" / "x86_64" / "percpu.ritz"
 TABLES = KERNEL_SRC / "drivers" / "acpi" / "tables.ritz"
 
 # The kernel is built by ritz0 only, so one compiler row (TESTING.md, "What a
@@ -238,7 +239,9 @@ def test_per_cpu_arrays_are_max_cpus_long():
     (sched/mod.ritz's cpu_sched was one; #1882 deleted the unused scheduler.)"""
     n = _max_cpus()
     assert n > 16, "MAX_CPUS still 16: CPUs past 16 are dropped"
-    for path, names in ((CPU_MAP, ("cpu_apic_ids", "cpu_started")), (APIC, ("ap_stack_tops",))):
+    for path, names in ((CPU_MAP, ("cpu_apic_ids", "cpu_started")),
+                        (APIC, ("ap_stack_tops",)),
+                        (PERCPU, ("cpu_stack_bases",))):
         code = _code(path)
         for name in names:
             m = re.search(rf"^(?:pub\s+)?var {name}: \[(\d+)\]", code, re.M)
@@ -252,7 +255,13 @@ def test_apic_x2apic_mode():
     code = _code(APIC)
     assert not re.search(r"cpu_apic_ids\[\w+\] as u8", code), "APIC ID cut to 8 bits"
     assert not re.search(r"^var ap_stacks: \[", code, re.M), "AP stacks still a static array"
-    assert "pmm_alloc_page()" in _body(code, "get_ap_stack_top"), "AP stacks not from the PMM"
+    # Each AP's bootstrap stack is part of its per-CPU block (percpu.ritz,
+    # AGAST #4192): contiguous PMM pages so the block can carry guard pages.
+    assert "cpu_stack_alloc(cpu_idx)" in _body(code, "get_ap_stack_top"), \
+        "AP stacks not from the per-CPU block"
+    percpu = _code(PERCPU)
+    assert "pmm_alloc_contig(CPU_STACK_PAGES)" in _body(percpu, "cpu_stack_alloc"), \
+        "per-CPU stacks not from the PMM"
     assert "get_ap_stack_top(i)" in _body(code, "ap_boot_all"), "ap_boot_all does not use the PMM stacks"
     assert re.search(r"cpuid\(1\)", code) and re.search(r"1 << 21", code), "no CPUID.1:ECX[21] check"
     assert re.search(r"0x1B\b", code) and re.search(r"1 << 10", code), "x2APIC not enabled via IA32_APIC_BASE"

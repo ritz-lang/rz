@@ -1,0 +1,184 @@
+# Harland per-CPU state and stacks (AGAST #4192)
+#
+# Every CPU has a per-CPU area (syscall_entry.s percpu_areas) and its own four
+# guard-paged kernel stacks, reached through GS. syscall_entry, the timer
+# stub and the spawn/exit context accessors use this CPU's area, so a SYSCALL
+# on an application processor cannot collide with the BSP's frame:
+#
+#   * PC_USER_RSP/RIP/RFLAGS/RAX hold the frame of the syscall in flight on
+#     this CPU (they were one set of globals when only the BSP took SYSCALL).
+#   * PC_KSTACK_TOP is the RSP syscall_entry loads. proc/sched.ritz makes it
+#     the running process's kernel stack on every switch; a CPU that is not
+#     running a process (an AP in the SMP self-test) uses the stack below.
+#   * TSS.rsp0 and TSS.ist1/2/3 (gdt.ritz) are per CPU, so two CPUs can take
+#     a ring-3 IRQ, a #PF or a tick at once without sharing a stack.
+#
+# Each CPU's stack block is eight PMM pages, two per stack: an unmapped guard
+# page, then the stack. The stack's lowest quadword holds a sentinel checked
+# by syscall/stack.ritz when a syscall leaves the kernel.
+#
+# GS convention (swapgs): in the kernel IA32_GS_BASE is this CPU's area and
+# IA32_KERNEL_GS_BASE is the user's (0). syscall_entry swaps on entry and
+# exit, interrupt stubs swap when the frame came from ring 3, and
+# jump_to_userspace swaps before its iretq.
+
+import io { wrmsr, halt_loop }
+import serial { prints, serial_print_hex, serial_print_dec }
+import mm.pmm { pmm_alloc_contig }
+import mm.vmm { PTE_WRITABLE, vmm_map_page, vmm_unmap_kernel_page, vmm_virt_to_phys }
+import arch.x86_64.gdt { gdt_init_cpu }
+import arch.x86_64.idt { idt_load_current }
+import arch.x86_64.cpu_map { MAX_CPUS }
+
+# syscall_entry.s owns the area and the GS accessors.
+extern fn percpu_area_init(cpu_idx: u64) -> u64
+extern fn percpu_area_for(cpu_idx: u64) -> u64
+extern fn percpu_cpu_index() -> u64
+extern fn kstack_set_current(top: u64)
+extern fn kstack_get_current() -> u64
+extern fn syscall_msr_init()
+
+# IA32_GS_BASE / IA32_KERNEL_GS_BASE.
+const GS_BASE_MSR: u32 = 0xC0000101
+const KERNEL_GS_BASE_MSR: u32 = 0xC0000102
+
+# One stack: a guard page then 4 KiB of stack.
+pub const CPU_STACK_GUARD: u64 = 4096
+pub const CPU_STACK_SIZE: u64 = 4096
+pub const CPU_STACK_STRIDE: u64 = 8192
+# Four stacks per CPU: syscall/kernel, IST1 (exceptions), IST2 (IRQs), IST3 (tick).
+pub const CPU_STACK_COUNT: i32 = 4
+pub const CPU_KSTACK: i32 = 0
+pub const CPU_IST1: i32 = 1
+pub const CPU_IST2: i32 = 2
+pub const CPU_IST3: i32 = 3
+# Eight pages = four (guard + stack) pairs.
+const CPU_STACK_PAGES: u64 = 8
+# Eight pages of virtual space per CPU (guard + stack, four times), mapped in
+# the kernel half so every user PML4 (which shares PML4[256..511]) reaches
+# the stacks. PML4 index 300, clear of the physmap (256), MMIO (257) and the
+# kernel image (511).
+pub const CPU_STACK_VA_BASE: u64 = 0xFFFF960000000000
+pub const CPU_STACK_BLOCK_VA: u64 = CPU_STACK_STRIDE * (CPU_STACK_COUNT as u64)
+
+# syscall/stack.ritz checks this in every stack's lowest quadword.
+pub const SYSCALL_STACK_SENTINEL: u64 = 0x5359534B53544B21   # "SYSKSTK!"
+
+# Stack block base by CPU index (0 = not allocated). Literal length: MAX_CPUS.
+var cpu_stack_bases: [64]u64
+
+# The base of CPU `cpu_idx`'s stack block, or 0 if it has none.
+pub fn cpu_stack_base(cpu_idx: i32) -> u64
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return 0
+    return cpu_stack_bases[cpu_idx]
+
+# The unmapped guard page under stack `which` of CPU `cpu_idx` (a kernel-half
+# virtual address; the physical page is unmapped in the identity map too).
+pub fn cpu_stack_guard(cpu_idx: i32, which: i32) -> u64
+    return CPU_STACK_VA_BASE + (cpu_idx as u64) * CPU_STACK_BLOCK_VA +
+        (which as u64) * CPU_STACK_STRIDE
+
+# The lowest quadword of stack `which`: where its sentinel lives.
+pub fn cpu_stack_bottom(cpu_idx: i32, which: i32) -> u64
+    return cpu_stack_guard(cpu_idx, which) + CPU_STACK_GUARD
+
+# One past stack `which`'s highest byte (what RSP starts at).
+pub fn cpu_stack_top(cpu_idx: i32, which: i32) -> u64
+    return cpu_stack_guard(cpu_idx, which) + CPU_STACK_STRIDE
+
+# Allocate CPU `cpu_idx`'s eight-page stack block and unmap its four guard
+# pages. The pages are identity-mapped and are used as physical addresses by
+# the AP trampoline, so a block that is not is a boot-time panic. Returns the
+# base, or 0 if the PMM is out of contiguous pages.
+pub fn cpu_stack_alloc(cpu_idx: i32) -> u64
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return 0
+    if cpu_stack_bases[cpu_idx] != 0
+        return cpu_stack_bases[cpu_idx]
+    let base: u64 = pmm_alloc_contig(CPU_STACK_PAGES)
+    if base == 0
+        return 0
+    # The AP trampoline runs on base+8192 before paging maps anything else.
+    if vmm_virt_to_phys(base) != base
+        prints("[percpu] CPU stack block not identity-mapped at 0x")
+        serial_print_hex(base)
+        prints("\n")
+        halt_loop()
+    var which: i32 = 0
+    while which < CPU_STACK_COUNT
+        let phys: u64 = base + (which as u64) * CPU_STACK_STRIDE
+        # The guard page goes away in the identity map, and is never mapped
+        # at the kernel-half address either: both fault on a write past the
+        # bottom of the stack.
+        vmm_unmap_kernel_page(phys)
+        if vmm_virt_to_phys(phys) != 0
+            prints("[percpu] CPU stack guard page still mapped at 0x")
+            serial_print_hex(phys)
+            prints("\n")
+            halt_loop()
+        # Map the stack page itself in the kernel half, where every address
+        # space can reach it (vmm_create_user_pml4 shares PML4[256..511]).
+        let stack_va: u64 = cpu_stack_bottom(cpu_idx, which)
+        if vmm_map_page(stack_va, phys + CPU_STACK_GUARD, PTE_WRITABLE) != 0
+            prints("[percpu] cannot map CPU stack at 0x")
+            serial_print_hex(stack_va)
+            prints("\n")
+            halt_loop()
+        *(stack_va as *u64) = SYSCALL_STACK_SENTINEL
+        which = which + 1
+    cpu_stack_bases[cpu_idx] = base
+    return base
+
+# The identity-mapped top an AP's trampoline starts it on. The AP runs
+# ap_entry here; syscalls and interrupts use cpu_stack_top (kernel half), so
+# its bootstrap frame is never overwritten.
+pub fn cpu_boot_stack_top(cpu_idx: i32) -> u64
+    return cpu_stack_base(cpu_idx) + CPU_STACK_STRIDE
+
+# Bring CPU `cpu_idx` up: its own TSS (rsp0 + IST stacks), IDT, per-CPU area
+# in GS, SYSCALL MSRs and per-CPU kernel stack. Called on the BSP once the VMM
+# and PMM are up, and by every AP in ap_entry before it can enter ring 3.
+pub fn cpu_bringup(cpu_idx: i32) -> i32
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return -1
+    if cpu_stack_alloc(cpu_idx) == 0
+        prints("[percpu] no memory for CPU ")
+        serial_print_dec(cpu_idx as u64)
+        prints(" stacks\n")
+        return -2
+    let ktop: u64 = cpu_stack_top(cpu_idx, CPU_KSTACK)
+    let result: i32 = gdt_init_cpu(cpu_idx, ktop,
+                                   cpu_stack_top(cpu_idx, CPU_IST1),
+                                   cpu_stack_top(cpu_idx, CPU_IST2),
+                                   cpu_stack_top(cpu_idx, CPU_IST3))
+    if result != 0
+        return result
+    idt_load_current()
+
+    # GS on this CPU's area; the kernel-side convention has KERNEL_GS_BASE
+    # (the user's GS) clear.
+    let area: u64 = percpu_area_init(cpu_idx as u64)
+    wrmsr(GS_BASE_MSR, area)
+    wrmsr(KERNEL_GS_BASE_MSR, 0)
+
+    # EFER/STAR/LSTAR/SFMASK are per-CPU.
+    syscall_msr_init()
+
+    # The stack syscall_entry loads until proc/sched.ritz picks a process.
+    kstack_set_current(ktop)
+    return 0
+
+# The CPU index this code is running on (cpu_map order, not the APIC ID).
+pub fn cpu_index() -> i32
+    return percpu_cpu_index() as i32
+
+# The per-CPU kernel stack top this CPU's syscalls currently use.
+pub fn cpu_kstack_top() -> u64
+    return kstack_get_current()
+
+# The area address of CPU `cpu_idx` (for the self-test's distinctness check).
+pub fn cpu_area_for(cpu_idx: i32) -> u64
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS
+        return 0
+    return percpu_area_for(cpu_idx as u64)

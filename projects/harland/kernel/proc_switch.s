@@ -67,5 +67,9 @@ proc_first_entry:
     popq %rbx
     popq %rax
     addq $16, %rsp
+    # A new process is first switched to from kernel mode (a spawn's
+    # sched_switch), where GS is this CPU's area; ring 3 needs the user's GS
+    # and KERNEL_GS_BASE to hold the area for its next SYSCALL (AGAST #4192).
+    swapgs
     iretq
 .size proc_first_entry, . - proc_first_entry

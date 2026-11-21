@@ -166,6 +166,19 @@ if [ -n "$NCPUS" ]; then
     fi
     echo "PASS (bios): all $((NCPUS - 1)) APs started (-smp $SMP, -cpu $CPU)"
 fi
+# Every CPU must have proved (AGAST #4192) that it can be in a ring-3 SYSCALL
+# on its own per-CPU stack at the same time as the others. The kernel runs
+# the self-test after ap_boot_all; it must see every CPU -smp starts (a
+# PLUG_CPU is not in the MADT, so that combination is not asserted).
+if [ -z "${PLUG_CPU:-}" ] && [ -n "$NCPUS" ] && [ "$NCPUS" -ge 2 ]; then
+    smp="$(grep -aoE '\[smp\] syscall stacks OK: [0-9]+ CPUs' "$SERIAL_LOG" | head -1)"
+    if [ "$smp" != "[smp] syscall stacks OK: $NCPUS CPUs" ]; then
+        grep -aE '\[smp\]' "$SERIAL_LOG" | head -5
+        echo "FAIL (bios): -smp $SMP should have $NCPUS CPUs in SYSCALL at once (got: ${smp:-nothing})"
+        exit 1
+    fi
+    echo "PASS (bios): $smp in ring-3 SYSCALL at once"
+fi
 # Every kernel wait is a deadline on the calibrated TSC (#4181): the boot must
 # log a measured frequency, not the uncalibrated fallback guess.
 tsc=$(grep -aoE "\[tsc\] [0-9]+\.[0-9]{3} MHz \([^)]*\)" "$SERIAL_LOG" | head -1)

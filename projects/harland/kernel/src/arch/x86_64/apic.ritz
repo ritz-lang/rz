@@ -19,11 +19,13 @@ import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult, enable_inter
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import arch.x86_64.tsc_calc { LAPIC_CAL_WINDOW_US, lapic_timer_hz, lapic_timer_initial }
 import serial { prints, serial_print_dec, serial_print_hex }
-import mm.pmm { Mb2BootInfo, HarlandBootInfo, pmm_alloc_page }
+import mm.pmm { Mb2BootInfo, HarlandBootInfo }
 import mm.vmm { vmm_pml4_phys, vmm_map_mmio }
 import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr }
-import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
+import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_index_of_apic_id, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
 import arch.x86_64.idt { idt_load_current }
+import arch.x86_64.percpu { cpu_bringup, cpu_boot_stack_top, cpu_stack_alloc }
+import arch.x86_64.cpu_smp { smp_ap_run }
 import arch.x86_64.irq_dest { irq_dest_pick, irq_ext_dest_from_cpuid, ioapic_rte_hi, ioapic_rte_dest, msi_addr_lo, IRQ_DEST_NONE }
 import drivers.iommu.ir { ir_init, ir_enabled, ir_x2apic, ir_set, ir_get_dest, ir_ioapic_sid, ir_ioapic_rte_hi, ir_ioapic_rte_lo, ir_ioapic_rte_handle, IR_NO_HANDLE }
 import drivers.iommu.dmar { ir_handle_ioapic }
@@ -614,23 +616,24 @@ fn pic_disable() -> i32
 
 # AP bootstrap state. Each AP's "started" flag is cpu_map's, by CPU index
 # (an APIC ID can be 16 or more: #1883).
-# Each AP's stack is one PMM page (low, identity-mapped), allocated when
-# first asked for: a static [MAX_CPUS][4096] would be 256 KiB of BSS (#4184).
-const AP_STACK_SIZE: u64 = 4096
-var ap_stack_tops: [64]u64      # Stack top by CPU index (0 = not allocated)
+# Each AP's stack is part of its eight-page per-CPU block (guard-paged kernel
+# stack plus IST1/2/3, arch/x86_64/percpu.ritz), allocated when first asked
+# for: a static [MAX_CPUS][...] would be a large BSS (#4184, #4192).
+var ap_stack_tops: [64]u64      # Trampoline stack top by CPU index (0 = none)
 var ap_count: u32 = 0           # Number of APs that have started
 var bsp_apic_id: u32 = 0        # BSP's APIC ID
 var bsp_apic_known: u8 = 0      # bsp_apic_id is recorded (0 is a valid ID)
 
-# The stack top of the AP at this CPU index (the scheduler runs that AP's
-# idle task on it). 0 for an index out of range or if the PMM is out of pages.
+# The stack top the AP trampoline starts an AP on: its per-CPU kernel stack's
+# identity-mapped top (syscalls then use the kernel-half alias). 0 for an
+# index out of range or if the PMM is out of pages.
 pub fn get_ap_stack_top(cpu_idx: i32) -> u64
     if cpu_idx < 0 or cpu_idx >= MAX_CPUS
         return 0
     if ap_stack_tops[cpu_idx] == 0
-        let page: u64 = pmm_alloc_page()
-        if page != 0
-            ap_stack_tops[cpu_idx] = page + AP_STACK_SIZE
+        # Allocates the whole per-CPU block (four guard-paged stacks).
+        if cpu_stack_alloc(cpu_idx) != 0
+            ap_stack_tops[cpu_idx] = cpu_boot_stack_top(cpu_idx)
     return ap_stack_tops[cpu_idx]
 
 # Trampoline code location (must be in low memory, <1MB)
@@ -707,18 +710,42 @@ pub fn ap_entry() -> i32
     # so no TSS is needed (#4220).
     idt_load_current()
 
+    # This CPU's index: per-CPU state (GS area, TSS, IDT, SYSCALL MSRs and
+    # its own guard-paged stacks) is indexed by it, never by the APIC ID.
+    let my_index: i32 = cpu_index_of_apic_id(my_apic_id)
+
     # Print message (need mutex for serial, but for now just try)
     prints("    AP ")
     serial_print_dec(my_apic_id as u64)
     prints(" started!\n")
 
+    if my_index < 0
+        # An APIC ID the MADT did not list has no per-CPU state: halt it.
+        while true
+            asm x86_64:
+                hlt
+
+    # Bring the CPU up before marking it started: ap_boot_all returns once
+    # the flag is set, and the BSP's SMP syscall self-test then expects this
+    # CPU to be able to enter ring 3 on its own TSS and stacks.
+    if cpu_bringup(my_index) != 0
+        while true
+            asm x86_64:
+                hlt
+
     # Mark our CPU index as started (an unlisted APIC ID flags nothing)
     cpu_map_mark_started(my_apic_id)
     atomic_fetch_add(@ap_count as *u32, 1)   # every AP does this at once
 
-    # Wait for work: an AP-call IPI runs a function, and an NVMe completion
-    # interrupt meant for this CPU is counted here too (#4220).
+    # Interrupts on before the self-test: an AP-call IPI runs a function, and
+    # an NVMe completion interrupt meant for this CPU is counted here (#4220).
     enable_interrupts()
+
+    # The SMP syscall-stack self-test (AGAST #4192) enters ring 3 here when
+    # the BSP starts it; otherwise this AP idles below.
+    smp_ap_run(my_index)
+
+    # Wait for work: the AP-call IPI and this CPU's NVMe completions (#4220).
     while true
         asm x86_64:
             hlt

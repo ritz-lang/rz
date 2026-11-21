@@ -46,7 +46,7 @@ MOVED_VARS = ["ap_stack_tops", "ap_count", "bsp_apic_id"]
 MOVED_CONST_PREFIXES = ("LAPIC_", "IOAPIC_", "IPI_DELIVERY_", "AP_TRAMPOLINE_ADDR")
 
 # What kernel_main calls; main must import exactly these from the new module.
-MAIN_USES = {"pic_remap", "apic_init_with_mb", "apic_init_from_bootinfo", "ap_boot_all"}
+MAIN_USES = {"pic_remap", "apic_init_with_mb", "apic_init_from_bootinfo", "ap_boot_all", "lapic_id"}
 
 # Bound by name through `extern fn` from exceptions.ritz (sched/mod.ritz was
 # deleted, AGAST #1882; lapic_write and get_ap_stack_top stay pub for a

@@ -77,6 +77,7 @@ ABI = {
     "Sync": 162,
     "AcpiPoweroff": 200,
     "FbInfo": 210, "FbMap": 211,
+    "Smp": 254,
     "DebugPrint": 255,
 }
 
@@ -90,7 +91,7 @@ DISPATCHED = {
     "IpcRecv", "IpcClose", "CapGrant", "CapRevoke", "CapDerive", "CapInfo",
     "CapCheck", "Mmap", "Munmap", "Getcwd", "Chdir", "InputPoll", "InputRead",
     "AcpiPoweroff", "FbInfo", "FbMap", "Lseek", "Mkdir", "TtyGetattr", "TtySetattr", "TtySetfg",
-    "Sync",
+    "Sync", "Smp",
 }
 
 

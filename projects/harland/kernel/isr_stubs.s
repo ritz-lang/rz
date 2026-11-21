@@ -40,6 +40,26 @@ gdt_flush:
     ret
 
 # ============================================================================
+# SWAPGS_IF_USER: enter the per-CPU GS state for a frame from ring 3
+# ============================================================================
+# GS_BASE is the user's when the CPU is in ring 3 (swapgs in syscall_entry
+# and jump_to_userspace) and this CPU's area in the kernel (AGAST #4192).
+# An interrupt or exception from user has to swapgs before any code can
+# touch per-CPU state, and an exit to user has to swap it back. At stub entry
+# the frame's CS is at 8(%rsp) (RIP, CS, ...) -- except that an exception
+# with a CPU-pushed error code has the error at 0 and so CS at 16. Testing
+# flags here is safe: the frame's RFLAGS is on the stack, untouched.
+.macro SWAPGS_IF_USER_AT cs_off
+    testq $3, \cs_off(%rsp)
+    jz 8f
+    swapgs
+8:
+.endm
+.macro SWAPGS_IF_USER
+    SWAPGS_IF_USER_AT 8
+.endm
+
+# ============================================================================
 # Common ISR Handler
 # ============================================================================
 
@@ -71,6 +91,9 @@ isr_common:
 
     # Remove vector and error code from stack
     addq $16, %rsp
+
+    # Return to user: restore the user's GS (see SWAPGS_IF_USER).
+    SWAPGS_IF_USER
 
     # Return from interrupt
     iretq
@@ -105,6 +128,9 @@ irq_common:
     # Remove vector and error code from stack
     addq $16, %rsp
 
+    # Return to user: restore the user's GS (see SWAPGS_IF_USER).
+    SWAPGS_IF_USER
+
     # Return from interrupt
     iretq
 
@@ -115,6 +141,7 @@ irq_common:
 .macro ISR_NOERR num
 .global isr_stub_\num
 isr_stub_\num:
+    SWAPGS_IF_USER
     # Push dummy error code (0)
     pushq $0
     # Push interrupt vector number
@@ -146,6 +173,7 @@ isr_stub_\num:
 .macro ISR_ERR num
 .global isr_stub_\num
 isr_stub_\num:
+    SWAPGS_IF_USER_AT 16
     # Error code already pushed by CPU
     # Push interrupt vector number
     pushq $\num
@@ -176,6 +204,7 @@ isr_stub_\num:
 .macro IRQ_STUB num irq
 .global irq_stub_\num
 irq_stub_\num:
+    SWAPGS_IF_USER
     # Push dummy error code
     pushq $0
     # Push vector number (32 + IRQ number)
@@ -324,17 +353,18 @@ IRQ_STUB 65, 96
 # stacks), so its frames must live on the process's own kernel stack, where
 # they stay while it is switched out: the stub saves %rax/%rbx on IST3
 # (push, so nothing is below %rsp), copies the CPU's 5-word IRET frame from
-# IST3 to the top of the running process's kernel stack
-# (kstack_current_top, which is TSS.rsp0) and continues there. A tick from
+# IST3 to the top of this CPU's kernel stack (PC_KSTACK_TOP via GS, which is
+# TSS.rsp0; per-CPU, AGAST #4192) and continues there. A tick from
 # ring 0 never switches, so it stays on IST3. IF=0 throughout (interrupt
 # gate), and nothing else runs on IST3 (NMI and #DF are IST1).
 .global irq_stub_timer
 irq_stub_timer:
+    SWAPGS_IF_USER              # before any per-CPU access (AGAST #4192)
     testq $3, 8(%rsp)            # CS of the interrupted code
     jz 1f
     pushq %rax                   # IRET frame now starts at 16(%rsp)
     pushq %rbx
-    movq kstack_current_top(%rip), %rax
+    movq %gs:PC_KSTACK_TOP, %rax
     subq $40, %rax
     movq 16(%rsp), %rbx          # RIP
     movq %rbx, 0(%rax)

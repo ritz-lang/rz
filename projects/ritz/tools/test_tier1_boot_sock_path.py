@@ -68,6 +68,7 @@ FAKE_QEMU = textwrap.dedent("""\
                 "[busy A] 5/8\\n[busy B] 5/8\\n[busy A] 6/8\\n[busy B] 6/8\\n"
                 "[busy A] 7/8\\n[busy B] 7/8\\n[busy A] 8/8\\n[busy B] 8/8\\n"
                 "[sched] 350 ticks, 280 switches, 230 preemptions\\n"
+                "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\\n"
                 "ALL TESTS PASSED\\n"
                 "[exit] init exited with code 0\\n")
     """)

@@ -21,7 +21,7 @@ ISO = $(BUILD_DIR)/harland.iso
 # Phony targets
 # ============================================================================
 
-.PHONY: all build clean test test-boot test-tier1 test-uefi-boot test-uefi-gui run-gui kernel iso help inventory-img test-inventory
+.PHONY: all build clean test test-boot test-smp test-tier1 test-uefi-boot test-uefi-gui run-gui kernel iso help inventory-img test-inventory
 
 all: kernel
 
@@ -67,6 +67,12 @@ test: test-boot
 test-boot: iso
 	@echo "=== Testing Kernel Boot (GRUB) ==="
 	./tools/test_boot.sh
+
+# AGAST #4192: two CPUs in a ring-3 SYSCALL at once, each on its own per-CPU
+# stack. The acceptance boot; test-boot also checks the verdict at -smp 4.
+test-smp:
+	@echo "=== Testing per-CPU syscall stacks (-smp 2) ==="
+	QEMU_SMP=2 ./tools/test_tier1_boot.sh native
 
 # Boot the kernel and the indium userspace (native loader and GRUB multiboot2)
 # and check init's Tier-1 suite: the spawn -> exit -> parent resume path (#2132)
@@ -122,6 +128,7 @@ help:
 	@echo "  iso          - Create test ISO with GRUB"
 	@echo "  test         - Run kernel boot test (= test-boot)"
 	@echo "  test-boot    - Boot the ISO (BIOS/GRUB) with the initramfs; needs ALL TESTS PASSED"
+	@echo "  test-smp     - Boot with -smp 2 and check two CPUs in SYSCALL at once (#4192)"
 	@echo "  test-tier1   - Boot with indium, check init Tier-1 suite (OVMF)"
 	@echo "  test-uefi-boot - Test UEFI bootloader (headless)"
 	@echo "  test-uefi-gui  - Test UEFI bootloader with display"

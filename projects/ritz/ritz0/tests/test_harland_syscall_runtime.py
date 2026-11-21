@@ -95,7 +95,7 @@ CONSTS = {
 
 # What main.ritz still calls (kernel_main, run_init), by area.
 MAIN_USES = {
-    "entry": {"syscall_init"},
+    "entry": {"syscall_init", "syscall_register_smp_test"},
     "memory": {"alloc_user_stack"},
     "process": {"process_enter_init"},
 }

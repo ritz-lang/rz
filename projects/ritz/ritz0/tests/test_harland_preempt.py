@@ -181,12 +181,13 @@ def test_timer_irq_runs_on_ist3_and_moves_a_ring3_frame_to_the_process_stack():
     idt = IDT.read_text()
     assert re.search(r"idt_set_gate\(32, irq_stub_timer as u64, cs, 3,", idt)
     gdt = (KERNEL_SRC / "arch" / "x86_64" / "gdt.ritz").read_text()
-    assert "tss.ist3 = " in gdt
+    assert "tsses[cpu_idx].ist3 = " in gdt
     asm = _isr_s()
     stub = asm[asm.index("\nirq_stub_timer:"):]
-    # ring 3 only: copy the 5-word IRET frame to kstack_current_top and run there
+    # ring 3 only: copy the 5-word IRET frame to this CPU's kernel stack and
+    # run there (AGAST #4192 moved the top into the per-CPU area, via GS)
     assert "testq $3, 8(%rsp)" in stub
-    assert "movq kstack_current_top(%rip), %rax" in stub and "subq $40, %rax" in stub
+    assert "movq %gs:PC_KSTACK_TOP, %rax" in stub and "subq $40, %rax" in stub
     for off in (0, 8, 16, 24, 32):
         assert f"movq %rbx, {off}(%rax)" in stub, off
     assert "pushq $32" in stub and "jmp irq_common" in stub
@@ -222,7 +223,7 @@ def test_switch_points_everything_per_process_at_the_next_process():
     idx = [sw.index(s) for s in order]
     assert idx == sorted(idx), sw
     use = _body(_code(SCHED), "sched_use_kstack")
-    assert "gdt_set_kernel_stack(top)" in use and "kstack_set_current(top)" in use
+    assert "gdt_set_kernel_stack_cpu(cpu_index(), top)" in use and "kstack_set_current(top)" in use
 
 
 def test_sched_switch_saves_callee_saved_registers_and_rflags():

@@ -73,12 +73,56 @@ def test_syscall_stack_is_in_bss_and_big_enough():
     assert re.search(
         r"^proc_kstacks:\s*\n\s*\.space KSTACK_STRIDE \* KSTACK_SLOTS", asm, re.MULTILINE
     )
-    # The globals that sit after it stay in .data.
-    assert _section_of(asm, "user_rsp_save") == ".data"
-    assert _section_of(asm, "kstack_current_top") == ".data"
-    # syscall_entry runs on the running process's stack.
+
+
+def test_per_cpu_area_holds_the_syscall_frame():
+    """AGAST #4192: one user frame and one kernel-stack pointer per CPU, in the
+    area GS points at -- not the globals that two CPUs could clobber."""
+    asm = _asm()
+    assert _section_of(asm, "percpu_areas") == ".bss"
+    for off in ("PC_KSTACK_TOP", "PC_USER_RSP", "PC_USER_RIP", "PC_USER_RFLAGS", "PC_USER_RAX"):
+        assert re.search(rf"^\.global {off}$\n\.set {off},", asm, re.M), off
+    # The old single-CPU globals are gone.
+    for gone in ("user_rsp_save", "syscall_user_rip", "kstack_current_top"):
+        assert not re.search(rf"^{gone}:", asm, re.M), f"{gone} is back"
+    # syscall_entry runs on this CPU's stack, saved through GS.
     entry = asm[asm.index("\nsyscall_entry:"):asm.index(".size syscall_entry")]
-    assert "movq kstack_current_top(%rip), %rsp" in entry
+    assert entry.index("swapgs") < entry.index("movq %gs:PC_KSTACK_TOP, %rsp")
+    assert "movq %rsp, %gs:PC_USER_RSP" in entry
+    assert "movq %rax, %gs:PC_USER_RAX" in entry
+    assert "pushq %gs:PC_USER_RSP" in entry
+    # ...and returns to the user's GS before iretq.
+    assert entry.rindex("swapgs") > entry.index("pushq $0x1B")
+    # The accessors read this CPU's area too.
+    for fn, off in (("get_syscall_user_rip", "PC_USER_RIP"),
+                    ("get_syscall_user_rsp", "PC_USER_RSP"),
+                    ("get_syscall_user_rflags", "PC_USER_RFLAGS"),
+                    ("kstack_get_current", "PC_KSTACK_TOP")):
+        body = asm[asm.index(f"\n{fn}:"):]
+        assert f"movq %gs:{off}, %rax" in body.split("ret")[0], fn
+    assert "movq %rdi, %gs:PC_KSTACK_TOP" in asm[asm.index("\nkstack_set_current:"):]
+
+
+def test_tss_and_stacks_are_per_cpu():
+    """AGAST #4192: TSS.rsp0 and the IST stacks are per CPU, and every CPU
+    loads its own at bring-up; one shared TSS would let two CPUs' IRQs use
+    the same stack."""
+    gdt = (KERNEL / "src" / "arch" / "x86_64" / "gdt.ritz").read_text()
+    assert "var tsses: [64]Tss" in gdt
+    assert "tsses[cpu_idx].rsp0 = rsp0" in gdt
+    for ist in ("ist1", "ist2", "ist3"):
+        assert f"tsses[cpu_idx].{ist} = {ist}" in gdt, ist
+    assert "gdt_set_kernel_stack_cpu(cpu_idx: i32, stack_top: u64)" in gdt
+    percpu = (KERNEL / "src" / "arch" / "x86_64" / "percpu.ritz").read_text()
+    assert "pub fn cpu_bringup(cpu_idx: i32) -> i32" in percpu
+    assert "gdt_init_cpu(cpu_idx, ktop," in percpu
+    assert "wrmsr(GS_BASE_MSR, area)" in percpu
+    # The AP brings itself up before it flags started: ap_boot_all then
+    # returns to the self-test with a CPU that can enter ring 3.
+    apic = (KERNEL / "src" / "arch" / "x86_64" / "apic.ritz").read_text()
+    entry = apic[apic.index("\npub fn ap_entry()"):]
+    assert entry.index("cpu_bringup(my_index)") < entry.index("cpu_map_mark_started("), \
+        "an AP is flagged started before its per-CPU state exists"
 
 
 def test_sentinel_helpers_use_the_stack_bottom():
@@ -137,6 +181,21 @@ def test_guard_page_sits_directly_below_the_stack():
     stack = STACK.read_text()
     assert "proc_kstacks_base() + slot * kstack_stride()" in _body(stack, "kstack_guard")
     assert "kstack_guard(slot as u64) + kstack_stride()" in _body(stack, "kstack_top")
+
+
+def test_each_cpu_stack_has_a_guard_page_too():
+    """AGAST #4192: the per-CPU stacks are guard-paged as well, in the kernel
+    half (every user PML4 shares PML4[256..511]), and their guard pages are
+    unmapped before the stack is used."""
+    percpu = (KERNEL / "src" / "arch" / "x86_64" / "percpu.ritz").read_text()
+    alloc = percpu[percpu.index("pub fn cpu_stack_alloc"):]
+    assert "vmm_unmap_kernel_page(phys)" in alloc
+    assert "vmm_virt_to_phys(phys) != 0" in alloc
+    assert "vmm_map_page(stack_va, phys + CPU_STACK_GUARD, PTE_WRITABLE)" in alloc
+    assert "CPU_STACK_VA_BASE: u64 = 0xFFFF960000000000" in percpu
+    stack = STACK.read_text()
+    hit = _body(stack, "syscall_stack_guard_hit")
+    assert "cpu_stack_guard(cpu, which)" in hit and "CPU_STACK_GUARD" in hit
 
 
 def test_init_unmaps_the_guard_page_and_checks_it():

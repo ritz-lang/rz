@@ -1,0 +1,302 @@
+# Boot-time SMP syscall-stack self-test (AGAST #4192)
+#
+# Acceptance for the per-CPU syscall stacks: prove two CPUs take SYSCALL at
+# once, each on its own per-CPU kernel stack, with its own saved user frame.
+# The test runs after ap_boot_all, before /bin/init:
+#
+#   1. Map one ring-3 stub page and one user stack page per participating CPU
+#      in the kernel's own PML4 (all CPUs share it here).
+#   2. Every CPU enters the stub through jump_to_userspace with its own stack.
+#      The stub SYSCALLs phase 1 and then phase 2.
+#   3. In the phase-1 handler each CPU records its CPU index, its kernel
+#      stack top (syscall_entry's PC_KSTACK_TOP) and its per-CPU area, then
+#      waits until every participant is inside the handler. Two CPUs are
+#      therefore in a syscall at the same instant.
+#   4. Phase 2: the BSP resumes the kernel caller through
+#      smp_test_resume_bsp (syscall_entry.s); an AP stays in the kernel on
+#      its IST1 stack, idling with interrupts on (so #4220's AP-call IPI and
+#      CPU-local device interrupts still reach it after boot).
+#   5. The BSP checks that the recorded stacks and areas are distinct and
+#      prints the verdict the boot tests grep:
+#        [smp] syscall stacks OK: N CPUs in ring-3 SYSCALL at once
+#
+# Before this change the BSP's user-frame globals and one shared TSS stack
+# made step 3 impossible: the two CPUs overwrote each other's frame.
+
+import io { memory_barrier, cpu_pause, sti_hlt }
+import serial { prints, serial_print_dec }
+import mm.pmm { PAGE_SIZE, pmm_alloc_page }
+import mm.vmm { PTE_USER, PTE_WRITABLE, phys_to_virt, vmm_map_page }
+import arch.x86_64.cpu_map { MAX_CPUS, cpu_map_started }
+import arch.x86_64.tsc { deadline_after_us, deadline_passed }
+import arch.x86_64.percpu { CPU_IST1, cpu_area_for, cpu_index, cpu_kstack_top, cpu_stack_top }
+import syscall.numbers { Syscall }
+import syscall.errno { Errno }
+
+# syscall_entry.s.
+extern fn smp_test_enter_user(entry: u64, stack: u64) -> u64
+extern fn smp_test_resume_bsp() -> u64
+extern fn jump_to_userspace(entry: u64, stack: u64)
+extern fn kstack_set_current(top: u64)
+
+# The stub and its stacks, below the kernel half and clear of the user ELF
+# (4 GiB) and user stack (top of the lower half). PML4 index 128.
+const SMP_CODE_VA: u64 = 0x400000000000
+const SMP_STACK_VA: u64 = 0x400000100000
+
+# How long a CPU waits for the others to reach the syscall handler, and about
+# how long an AP waits for the BSP to start the test. Generous: a loaded TCG
+# host may run the vCPUs one at a time.
+const SMP_BARRIER_US: u64 = 5000000
+const SMP_START_US: u64 = 10000000
+
+# The phase-1/phase-2 argument the stub passes in RDI.
+const SMP_PHASE_PING: u64 = 1
+const SMP_PHASE_DONE: u64 = 2
+
+var smp_expected: u32 = 0            # CPUs that must reach the handler
+var smp_in_syscall: u32 = 0          # how many are inside right now
+var smp_participant: [64]u8          # by CPU index
+var smp_seen_top: [64]u64            # recorded PC_KSTACK_TOP per CPU
+var smp_seen_area: [64]u64           # recorded per-CPU area per CPU
+var smp_go: u32 = 0                  # APs enter the stub when set
+var smp_bsp_inside: u32 = 0          # 1 only while the BSP runs the test
+var smp_barrier_deadline: u64 = 0
+var smp_bsp_cpu: i32 = -1
+
+# Write the ring-3 stub: SYSCALL phase 1, SYSCALL phase 2, spin if either
+# returns. RAX = syscall number, RDI = phase.
+fn smp_write_stub(code: *u8)
+    let nr: u8 = Syscall.Smp as u8
+    var p: i32 = 0
+    # mov $nr, %eax
+    *(code + p) = 0xB8
+    p = p + 1
+    *(code + p) = nr
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    # mov $SMP_PHASE_PING, %edi
+    *(code + p) = 0xBF
+    p = p + 1
+    *(code + p) = SMP_PHASE_PING as u8
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    # syscall
+    *(code + p) = 0x0F
+    p = p + 1
+    *(code + p) = 0x05
+    p = p + 1
+    # mov $nr, %eax
+    *(code + p) = 0xB8
+    p = p + 1
+    *(code + p) = nr
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    # mov $SMP_PHASE_DONE, %edi
+    *(code + p) = 0xBF
+    p = p + 1
+    *(code + p) = SMP_PHASE_DONE as u8
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    *(code + p) = 0
+    p = p + 1
+    # syscall
+    *(code + p) = 0x0F
+    p = p + 1
+    *(code + p) = 0x05
+    p = p + 1
+    # jmp . (never reached: phase 2 does not return to ring 3 here)
+    *(code + p) = 0xEB
+    p = p + 1
+    *(code + p) = 0xFE
+
+# A zeroed, user-mapped page at `va`. Returns its physical address, or 0.
+fn smp_map_user_page(va: u64) -> u64
+    let phys: u64 = pmm_alloc_page()
+    if phys == 0
+        return 0
+    let p: *u64 = phys_to_virt(phys) as *u64
+    var i: i32 = 0
+    while i < 512
+        *(p + i as i64) = 0
+        i = i + 1
+    if vmm_map_page(va, phys, PTE_USER | PTE_WRITABLE) != 0
+        return 0
+    return phys
+
+fn smp_stack_va(cpu_idx: i32) -> u64
+    return SMP_STACK_VA + (cpu_idx as u64) * PAGE_SIZE
+
+# The kernel's SMP stack self-test. Call after ap_boot_all, before init.
+# Returns 0 when at least two CPUs were in SYSCALL at once on distinct
+# stacks, 1 otherwise (and prints why).
+pub fn smp_syscall_selftest(bsp_cpu: i32) -> i32
+    smp_bsp_cpu = bsp_cpu
+    if bsp_cpu < 0 or bsp_cpu >= MAX_CPUS
+        bsp_cpu = 0
+        smp_bsp_cpu = 0
+
+    # Participants: the BSP and every AP that flagged itself started.
+    smp_participant[bsp_cpu] = 1
+    var expected: u32 = 1
+    var cpu: i32 = 0
+    while cpu < MAX_CPUS
+        if cpu != bsp_cpu and cpu_map_started(cpu) != 0
+            smp_participant[cpu] = 1
+            expected = expected + 1
+        cpu = cpu + 1
+    smp_expected = expected
+    if expected < 2
+        prints("[smp] single CPU: per-CPU syscall stack test skipped\n")
+        return 0
+
+    # One stub page, and one stack page per participant.
+    let code_phys: u64 = smp_map_user_page(SMP_CODE_VA)
+    if code_phys == 0
+        prints("[smp] cannot map the syscall test stub\n")
+        return 1
+    smp_write_stub(phys_to_virt(code_phys) as *u8)
+    cpu = 0
+    while cpu < MAX_CPUS
+        if smp_participant[cpu] != 0
+            if smp_map_user_page(smp_stack_va(cpu)) == 0
+                prints("[smp] cannot map CPU ")
+                serial_print_dec(cpu as u64)
+                prints("'s test stack\n")
+                return 1
+        cpu = cpu + 1
+
+    # Let every AP enter the stub, then enter it here.
+    smp_barrier_deadline = deadline_after_us(SMP_BARRIER_US)
+    memory_barrier()
+    smp_bsp_inside = 1
+    atomic_store(@smp_go as *u32, 1)
+    memory_barrier()
+    let bsp_stack: u64 = smp_stack_va(bsp_cpu) + PAGE_SIZE - 16
+    smp_test_enter_user(SMP_CODE_VA, bsp_stack)
+    # Past this point SYS_SMP is not a user ABI: the handler answers ENOSYS
+    # (and halts an AP still finishing phase 2).
+    smp_bsp_inside = 0
+
+    # Back in the kernel: every participant recorded its own stack and area.
+    let seen: u32 = atomic_load(@smp_in_syscall as *u32)
+    if seen != expected
+        prints("[smp] syscall stacks FAILED: ")
+        serial_print_dec(seen as u64)
+        prints(" of ")
+        serial_print_dec(expected as u64)
+        prints(" CPUs reached the syscall handler together\n")
+        return 1
+
+    var i: i32 = 0
+    while i < MAX_CPUS
+        if smp_participant[i] != 0
+            if smp_seen_top[i] == 0 or smp_seen_area[i] == 0
+                prints("[smp] syscall stacks FAILED: CPU ")
+                serial_print_dec(i as u64)
+                prints(" recorded no frame\n")
+                return 1
+            var j: i32 = 0
+            while j < i
+                if smp_participant[j] != 0
+                    if smp_seen_top[i] == smp_seen_top[j]
+                        prints("[smp] syscall stacks FAILED: CPUs ")
+                        serial_print_dec(j as u64)
+                        prints(" and ")
+                        serial_print_dec(i as u64)
+                        prints(" share a kernel stack\n")
+                        return 1
+                    if smp_seen_area[i] == smp_seen_area[j]
+                        prints("[smp] syscall stacks FAILED: CPUs ")
+                        serial_print_dec(j as u64)
+                        prints(" and ")
+                        serial_print_dec(i as u64)
+                        prints(" share a per-CPU area\n")
+                        return 1
+                j = j + 1
+        i = i + 1
+
+    prints("[smp] syscall stacks OK: ")
+    serial_print_dec(expected as u64)
+    prints(" CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n")
+    return 0
+
+# An AP that has finished the self-test stays in the kernel with interrupts
+# on, idling on the IST1 stack smp_ap_run selected. It must not halt: #4220's
+# AP-call IPI (vector 240) and CPU-local device interrupts are what an AP does
+# after boot, and both need a live, interrupt-enabled CPU.
+fn smp_ap_idle()
+    while true
+        sti_hlt()
+
+# An AP's side: wait for the BSP to start the test, then enter the stub on
+# this CPU's own user stack. Returns with an error if the test never starts.
+pub fn smp_ap_run(cpu_idx: i32) -> i32
+    let deadline: u64 = deadline_after_us(SMP_START_US)
+    # An AP that started after the BSP counted the participants has no stub
+    # stack mapped: do not enter ring 3.
+    while atomic_load(@smp_go as *u32) == 0
+        if deadline_passed(deadline)
+            return -1
+        cpu_pause()
+    memory_barrier()
+    if cpu_idx < 0 or cpu_idx >= MAX_CPUS or smp_participant[cpu_idx] == 0
+        return -1
+    # The test's syscalls run on this CPU's IST1 stack, clear of the bootstrap
+    # stack the trampoline started us on: after phase 2 the AP idles there
+    # with interrupts on, ready for #4220's AP-call IPI.
+    kstack_set_current(cpu_stack_top(cpu_idx, CPU_IST1))
+    let stack: u64 = smp_stack_va(cpu_idx) + PAGE_SIZE - 16
+    jump_to_userspace(SMP_CODE_VA, stack)
+    return 0
+
+# The syscall handler (registered as Syscall.Smp). Phase 1 records and
+# barriers; phase 2 leaves ring 3 for good on this CPU.
+pub fn sys_smp_test_handler(phase: u64, a2: u64, a3: u64, a4: u64) -> i64
+    let cpu: i32 = cpu_index()
+    if cpu < 0 or cpu >= MAX_CPUS
+        return 0
+    if smp_bsp_inside == 0
+        # Outside the boot self-test SYS_SMP is not a user ABI. An AP can
+        # only be our stub finishing phase 2 (the BSP resumed first): let it
+        # idle, ready for its AP-call IPIs and device interrupts. A user
+        # program on the BSP gets ENOSYS instead of the test's resume
+        # mechanism.
+        if cpu != smp_bsp_cpu
+            smp_ap_idle()
+        return Errno.NoSys as i64
+    if phase == SMP_PHASE_PING
+        smp_seen_top[cpu] = cpu_kstack_top()
+        smp_seen_area[cpu] = cpu_area_for(cpu)
+        memory_barrier()
+        atomic_fetch_add(@smp_in_syscall as *u32, 1)
+        while atomic_load(@smp_in_syscall as *u32) < smp_expected
+            if deadline_passed(smp_barrier_deadline)
+                return 0
+            cpu_pause()
+        return 0
+    # Phase 2: the BSP continues in the kernel test; an AP is done running
+    # user code and idles in the kernel with interrupts on.
+    if cpu == smp_bsp_cpu
+        smp_test_resume_bsp()
+        return 0
+    smp_ap_idle()
+    return 0

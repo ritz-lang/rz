@@ -46,6 +46,7 @@ kernel          Build the kernel (default)
 iso             Create test ISO with GRUB
 test            Run kernel boot test (= test-boot)
 test-boot       Boot the ISO (BIOS/GRUB) with the initramfs; needs ALL TESTS PASSED
+test-smp        Boot with -smp 2 and check two CPUs in SYSCALL at once (#4192)
 test-tier1      Boot with indium, check init Tier-1 suite (OVMF)
 test-uefi-boot  Test UEFI bootloader (headless)
 test-uefi-gui   Test UEFI bootloader with display

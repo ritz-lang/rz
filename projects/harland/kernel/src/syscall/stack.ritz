@@ -1,4 +1,4 @@
-# Kernel stacks: sentinels and guard pages (AGAST #2761, #1877, #3629)
+# Kernel stacks: sentinels and guard pages (AGAST #2761, #1877, #3629, #4192)
 #
 # Every process-table slot has its own kernel stack (syscall_entry.s
 # proc_kstacks, AGAST #3629): the running process's syscalls, the IRQs taken
@@ -11,14 +11,24 @@
 # in .data, directly above g_child_pid and fs_current, and a deep write-back
 # flush overwrote them without a trace (#4064).
 #
+# Every CPU also has four guard-paged stacks of its own
+# (arch/x86_64/percpu.ritz): the CPU's kernel stack, and IST1/2/3 for
+# exceptions, IRQs and the tick. A CPU running user code without a process
+# (an AP in the #4192 self-test) syscalls on its per-CPU kernel stack; the
+# same sentinel check covers it. This is what makes two CPUs in syscalls at
+# once safe: each has its own stack and its own per-CPU user frame.
+#
 # The sentinel only notices an overflow once the syscall is over. Below each
-# stack sits a guard page that syscall_stack_init unmaps (AGAST #1877): the
-# first write past the bottom page-faults, the #PF handler runs on IST1 and
-# exception_handler names the overflow (syscall_stack_guard_hit).
+# stack sits a guard page that syscall_stack_init (process stacks) or
+# cpu_stack_alloc (per-CPU stacks) unmaps: the first write past the bottom
+# page-faults, the #PF handler runs on IST1 and exception_handler names the
+# overflow (syscall_stack_guard_hit).
 
 import serial { prints, serial_print_dec, serial_print_hex }
 import io { halt_loop }
 import mm.vmm { vmm_unmap_kernel_page, vmm_virt_to_phys }
+import arch.x86_64.cpu_map { MAX_CPUS }
+import arch.x86_64.percpu { CPU_STACK_BLOCK_VA, CPU_STACK_COUNT, CPU_STACK_GUARD, CPU_STACK_SIZE, CPU_STACK_VA_BASE, SYSCALL_STACK_SENTINEL, cpu_stack_base, cpu_stack_bottom, cpu_stack_guard, cpu_stack_top }
 
 extern fn proc_kstacks_base() -> u64
 extern fn kstack_stride() -> u64
@@ -27,7 +37,6 @@ extern fn syscall_stack_size() -> u64
 extern fn kstack_get_current() -> u64
 
 const GUARD_PAGE_SIZE: u64 = 4096
-const SYSCALL_STACK_SENTINEL: u64 = 0x5359534B53544B21   # "SYSKSTK!"
 
 # Slot `slot`'s guard page.
 fn kstack_guard(slot: u64) -> u64
@@ -42,18 +51,41 @@ fn kstack_bottom(slot: u64) -> u64
 pub fn kstack_top(slot: i32) -> u64
     return kstack_guard(slot as u64) + kstack_stride()
 
-# The running process's slot, from the stack syscall_entry uses.
+# The running process's slot, from the stack syscall_entry uses. Only valid
+# when that stack is one of proc_kstacks (see kstack_is_proc_stack).
 fn kstack_current_slot() -> u64
     let top: u64 = kstack_get_current()
     return (top - proc_kstacks_base()) / kstack_stride() - 1
 
+# True if `top` is a proc_kstacks top (not a per-CPU stack's).
+fn kstack_is_proc_stack(top: u64) -> bool
+    let base: u64 = proc_kstacks_base()
+    return top > base and top <= base + kstack_stride() * kstack_slots()
+
 fn kstack_sentinel_intact(slot: u64) -> bool
     return *(kstack_bottom(slot) as *u64) == SYSCALL_STACK_SENTINEL
 
-# Write every stack's sentinel and unmap every guard page. Call once, after
-# the physmap is up (vmm_unmap_kernel_page may need a page table) and before
-# the first syscall. A guard page still mapped afterwards is a boot-time
-# panic.
+# The CPU index whose kernel stack has this top, or -1. Per-CPU stacks sit in
+# one kernel-half window (percpu.ritz CPU_STACK_VA_BASE), so this is a range
+# check rather than a scan: syscall_stack_check runs on every syscall.
+fn cpu_stack_owner(top: u64) -> i32
+    if top < CPU_STACK_VA_BASE
+        return -1
+    let offset: u64 = top - CPU_STACK_VA_BASE
+    let cpu: u64 = offset / CPU_STACK_BLOCK_VA
+    if cpu >= MAX_CPUS as u64
+        return -1
+    if cpu_stack_base(cpu as i32) == 0
+        return -1
+    if top != cpu_stack_top(cpu as i32, 0)
+        return -1
+    return cpu as i32
+
+# Write every process stack's sentinel and unmap every process guard page.
+# Per-CPU stacks get theirs in cpu_stack_alloc; this re-checks them here too.
+# Call once, after the physmap is up (vmm_unmap_kernel_page may need a page
+# table) and before the first syscall. A guard page still mapped afterwards
+# is a boot-time panic.
 pub fn syscall_stack_init()
     var slot: u64 = 0
     while slot < kstack_slots()
@@ -67,6 +99,23 @@ pub fn syscall_stack_init()
             halt_loop()
         slot = slot + 1
 
+    # The per-CPU stacks were unmapped by cpu_stack_alloc; their guards must
+    # still be gone.
+    var cpu: i32 = 0
+    while cpu < MAX_CPUS
+        if cpu_stack_base(cpu) != 0
+            var which: i32 = 0
+            while which < CPU_STACK_COUNT
+                *(cpu_stack_bottom(cpu, which) as *u64) = SYSCALL_STACK_SENTINEL
+                let guard: u64 = cpu_stack_guard(cpu, which)
+                if vmm_virt_to_phys(guard) != 0
+                    prints("\n*** KERNEL PANIC: CPU stack guard page still mapped at 0x")
+                    serial_print_hex(guard)
+                    prints(" ***\n")
+                    halt_loop()
+                which = which + 1
+        cpu = cpu + 1
+
 # True if addr (a page fault's CR2) lies in any kernel stack's guard page.
 pub fn syscall_stack_guard_hit(addr: u64) -> bool
     var slot: u64 = 0
@@ -75,17 +124,30 @@ pub fn syscall_stack_guard_hit(addr: u64) -> bool
         if addr >= guard and addr < guard + GUARD_PAGE_SIZE
             return true
         slot = slot + 1
+    var cpu: i32 = 0
+    while cpu < MAX_CPUS
+        if cpu_stack_base(cpu) != 0
+            var which: i32 = 0
+            while which < CPU_STACK_COUNT
+                let guard: u64 = cpu_stack_guard(cpu, which)
+                if addr >= guard and addr < guard + CPU_STACK_GUARD
+                    return true
+                which = which + 1
+        cpu = cpu + 1
     return false
 
-# Bytes of slot's stack ever used: from the top down to the lowest non-zero
+# Bytes of a stack ever used: from the top down to the lowest non-zero
 # quadword above the sentinel (.bss starts zeroed). A lower bound: a zero
 # word left deep in a frame doesn't count.
-fn kstack_high_water(slot: u64) -> u64
-    let top: u64 = kstack_bottom(slot) + syscall_stack_size()
-    var p: u64 = kstack_bottom(slot) + 8
+fn stack_high_water(bottom: u64, size: u64) -> u64
+    let top: u64 = bottom + size
+    var p: u64 = bottom + 8
     while p < top and *(p as *u64) == 0
         p = p + 8
     return top - p
+
+fn kstack_high_water(slot: u64) -> u64
+    return stack_high_water(kstack_bottom(slot), syscall_stack_size())
 
 # The deepest any kernel stack has been (a lower bound, see above).
 pub fn syscall_stack_used() -> u64
@@ -96,11 +158,29 @@ pub fn syscall_stack_used() -> u64
         if used > peak
             peak = used
         slot = slot + 1
+    var cpu: i32 = 0
+    while cpu < MAX_CPUS
+        if cpu_stack_base(cpu) != 0
+            let used: u64 = stack_high_water(cpu_stack_bottom(cpu, 0), CPU_STACK_SIZE)
+            if used > peak
+                peak = used
+        cpu = cpu + 1
     return peak
 
-# Panic if a syscall has run off the bottom of the running process's stack.
+# Panic if a syscall has run off the bottom of this CPU's stack.
 pub fn syscall_stack_check()
-    if kstack_get_current() == 0
+    let top: u64 = kstack_get_current()
+    if top == 0
+        return
+    let cpu: i32 = cpu_stack_owner(top)
+    if cpu >= 0
+        if *(cpu_stack_bottom(cpu, 0) as *u64) == SYSCALL_STACK_SENTINEL
+            return
+        prints("\n*** KERNEL PANIC: syscall stack overflow (")
+        serial_print_dec(CPU_STACK_SIZE)
+        prints(" bytes) ***\n")
+        halt_loop()
+    if not kstack_is_proc_stack(top)
         return
     if kstack_sentinel_intact(kstack_current_slot())
         return

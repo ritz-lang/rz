@@ -54,6 +54,9 @@
 #        QEMU_MEM=SIZE  guest RAM (default 2G; 512M puts every pmm page under
 #                       the low 1 GiB identity map, AGAST #3530; above 4G each
 #                       boot must also pass high_memory, AGAST #4183)
+#        QEMU_SMP=SPEC  QEMU -smp (default 4). The kernel's per-CPU syscall
+#                       stack self-test (AGAST #4192) must see every CPU, so
+#                       `QEMU_SMP=2` runs the acceptance boot at two CPUs.
 #        COMPILER=NAME  ritz0, ritz1 or ritz1_selfhosted (AGAST #1848): build
 #                       with `./rz build PKG --compiler NAME`, and require
 #                       every binary the boot loads (kernel, BOOTX64.EFI,
@@ -77,6 +80,11 @@ ROOT_DIR="$(dirname "$PROJECTS_DIR")"
 TIMEOUT="${BOOT_TIMEOUT:-600}"
 STALL="${BOOT_STALL:-90}"
 MEM="${QEMU_MEM:-2G}"
+SMP="${QEMU_SMP:-4}"
+# The leading number of QEMU's -smp spec: how many CPUs must reach the
+# per-CPU syscall self-test.
+SMP_NCPUS="$(printf '%s\n' "$SMP" | sed -nE 's/^([0-9]+).*/\1/p' | head -1)"
+[ -n "$SMP_NCPUS" ] || SMP_NCPUS=4
 MODE="${1:-all}"
 
 EXIT_SETUP=3
@@ -196,7 +204,7 @@ boot() {
     qemu-img create -q -f qcow2 -F qcow2 -b "$WORK/initramfs.qcow2" "$WORK/$name-initramfs.qcow2"
     # The loop below enforces $TIMEOUT; this one only backs it up, late enough
     # that a hung guest's monitor is still there to report on.
-    timeout "$((TIMEOUT + 30))" qemu-system-x86_64 -cpu Haswell-v1 -smp 4 -m "$MEM" \
+    timeout "$((TIMEOUT + 30))" qemu-system-x86_64 -cpu Haswell-v1 -smp "$SMP" -m "$MEM" \
         -display none -no-reboot -monitor "unix:$SOCK_DIR/$name-mon.sock,server,nowait" \
         -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" "${vars[@]}" \
         -drive "format=raw,file=fat:rw:$esp" \
@@ -562,6 +570,22 @@ all_passed() {
     fi
 }
 
+# smp_stacks NAME: pass only if the kernel proved (AGAST #4192) that every
+# CPU -smp starts was inside a ring-3 SYSCALL at once, each on its own per-CPU
+# stack and with its own saved user frame. The self-test runs after
+# ap_boot_all and before init, so it is in every boot's log.
+smp_stacks() {
+    local line
+    line="$(grep -aoE '\[smp\] syscall stacks OK: [0-9]+ CPUs' "$WORK/$1.log" | head -1)"
+    if [ "$line" = "[smp] syscall stacks OK: $SMP_NCPUS CPUs" ]; then
+        echo "PASS ($1): $SMP_NCPUS CPUs in ring-3 SYSCALL at once on per-CPU stacks"
+    else
+        grep -a '\[smp\]' "$WORK/$1.log" | head -5
+        echo "FAIL ($1): no per-CPU syscall stack verdict for $SMP_NCPUS CPUs (got: ${line:-none})"
+        return 1
+    fi
+}
+
 rc=0
 HIGH_MEM=0
 [ "$(mem_mib "$MEM")" -gt 4096 ] 2>/dev/null && HIGH_MEM=1
@@ -574,6 +598,7 @@ if [ "$MODE" != grub ]; then
         -drive "driver=null-co,size=1M,read-zeroes=on,latency-ns=100000000,if=none,id=persist" \
         -device "virtio-blk-pci,drive=persist,disable-legacy=on" || rc=1
     all_passed native || rc=1
+    smp_stacks native || rc=1
     blk_transport native modern || rc=1
     slow_disk native || rc=1
     key_received native || rc=1
@@ -608,6 +633,7 @@ EOF
         rc=1
     fi
     all_passed grub || rc=1
+    smp_stacks grub || rc=1
     blk_transport grub legacy || rc=1
     key_received grub || rc=1
     preempted grub || rc=1
@@ -618,6 +644,7 @@ EOF
     # The same storage disk, booted again: the image survives the reboot
     boot grub-reboot "$WORK/esp-grub" "" "${STORAGE[@]}" || rc=1
     all_passed grub-reboot || rc=1
+    smp_stacks grub-reboot || rc=1
     persisted grub-reboot 2 || rc=1
     saved_subtree grub-reboot || rc=1
 fi

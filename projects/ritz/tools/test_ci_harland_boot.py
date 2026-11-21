@@ -196,8 +196,11 @@ TIMER_OK = r"[timer] LAPIC timer 62500000 Hz (bus/16, TSC-calibrated), periodic 
 # invariant and 6 only has to separate that from the 2..4-run failure shapes.
 BUSY_OK = "".join(f"[busy A] {step}/8\n[busy B] {step}/8\n" for step in range(1, 9))
 SCHED_OK = "[sched] 356 ticks, 285 switches, 233 preemptions\n"
+# The kernel's SMP syscall-stack self-test (AGAST #4192): all four CPUs were
+# in a ring-3 SYSCALL at once, each on its own per-CPU stack.
+SMP_OK = "[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n"
 PREEMPT_OK = TIMER_OK + BUSY_OK + SCHED_OK
-PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SUITE_PASSED + INIT_EXIT
+PASSED = BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SMP_OK + SUITE_PASSED + INIT_EXIT
 
 
 @pytest.fixture
@@ -458,6 +461,7 @@ def test_busy_children_coarsely_paired_by_load_pass(tree):
     serial = (BLK_MODERN + PERSIST_OK + KEY_OK + TIMER_OK
               + BUSY_PAIRED_9
               + SCHED_OK
+              + SMP_OK
               + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 0, r.stdout + r.stderr
@@ -494,10 +498,21 @@ def test_busy_child_that_never_finished_fails(tree):
 def test_no_calibrated_timer_fails(tree):
     serial = (BLK_MODERN + PERSIST_OK + KEY_OK
               + r"[busy A] 1/2\n[busy B] 1/2\n[busy A] 2/2\n[busy B] 2/2\n"
-              + SUITE_PASSED + INIT_EXIT)
+              + SMP_OK + SUITE_PASSED + INIT_EXIT)
     r = _run(tree, serial)
     assert r.returncode == 1, r.stdout + r.stderr
     assert "no calibrated LAPIC timer tick" in r.stdout
+
+
+@pytest.mark.integration
+def test_missing_per_cpu_syscall_stack_verdict_fails(tree):
+    """A boot must prove the per-CPU syscall stacks (AGAST #4192): without the
+    self-test's verdict the boot fails, so an AP that never entered ring 3
+    cannot pass silently."""
+    serial = BLK_MODERN + PERSIST_OK + KEY_OK + PREEMPT_OK + SUITE_PASSED + INIT_EXIT
+    r = _run(tree, serial)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "no per-CPU syscall stack verdict" in r.stdout
 
 
 @pytest.mark.integration

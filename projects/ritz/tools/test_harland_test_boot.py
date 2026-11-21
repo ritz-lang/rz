@@ -87,7 +87,10 @@ TSC = r"[tsc] 2304.186 MHz (PIT), not invariant\n"
 LOADED = TSC + r"[initramfs] Loaded 27 files from disk\n"
 # The default -smp 4 starts 3 APs, and every one must come up (#4184).
 APS = r"  [OK] Boot APs (3 APs started)\n"
-PASSED = APS + r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
+# The kernel's per-CPU syscall stack self-test (#4192): all four CPUs were in
+# a ring-3 SYSCALL at once on their own stacks.
+SMP = r"[smp] syscall stacks OK: 4 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n"
+PASSED = APS + SMP + r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
 SUITE_ONLY = r"  Results: 15 passed, 0 failed\n  ALL TESTS PASSED\n"
 # What the blank disk produced (#3437): the banner, then a panic.
 PANIC_AFTER_BANNER = (
@@ -258,7 +261,8 @@ def test_no_ap_line_fails(tree):
 @pytest.mark.integration
 def test_the_ap_count_follows_smp_and_plug_cpu(tree):
     """SMP=20,... expects 19 APs; PLUG_CPU cold-plugs one more (APIC ID 256)."""
-    r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (19 APs started)\n" + SUITE_ONLY,
+    smp20 = r"[smp] syscall stacks OK: 20 CPUs in ring-3 SYSCALL at once, distinct per-CPU stacks and frames\n"
+    r = _run(tree, BANNER + LOADED + r"  [OK] Boot APs (19 APs started)\n" + smp20 + SUITE_ONLY,
              env_extra={"SMP": "20,sockets=2,cores=10", "CPU": "Haswell-v1,+x2apic"})
     assert r.returncode == 0, r.stdout + r.stderr
     assert "-smp 20,sockets=2,cores=10" in _stub_log(tree) and "-cpu Haswell-v1,+x2apic" in _stub_log(tree)
@@ -268,6 +272,15 @@ def test_the_ap_count_follows_smp_and_plug_cpu(tree):
     assert r.returncode == 0, r.stdout + r.stderr
     qemu = [line for line in _stub_log(tree).splitlines() if line.startswith("qemu ")][-1]
     assert "-machine q35" in qemu and "-device Haswell-v1-x86_64-cpu,socket-id=1,core-id=0,thread-id=0" in qemu, qemu
+
+
+@pytest.mark.integration
+def test_a_missing_per_cpu_syscall_verdict_fails(tree):
+    """AGAST #4192: the boot must prove every CPU took SYSCALL on its own
+    stack. A green suite and all APs up are not enough."""
+    r = _run(tree, BANNER + LOADED + APS + SUITE_ONLY)
+    assert r.returncode == 1, r.stdout + r.stderr
+    assert "CPUs in SYSCALL at once" in r.stdout
 
 
 # --- the TSC is calibrated (#4181) ---------------------------------------------

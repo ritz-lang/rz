@@ -39,10 +39,14 @@ import drivers.display.framebuffer { fb_fill_rect_rgb, fb_clear_rgb }
 import drivers.virtio.input { virtio_input_init }
 
 # ACPI driver imports
-import arch.x86_64.cpu_map { num_cpus }
+import arch.x86_64.cpu_map { num_cpus, cpu_index_of_apic_id }
 
 # PIC, Local/I/O APIC and AP bootstrap
-import arch.x86_64.apic { pic_remap, apic_init_with_mb, apic_init_from_bootinfo, ap_boot_all }
+import arch.x86_64.apic { pic_remap, apic_init_with_mb, apic_init_from_bootinfo, ap_boot_all, lapic_id }
+# Per-CPU state (GS area, TSS/IST stacks, SYSCALL MSRs) and the #4192
+# syscall-stack self-test.
+import arch.x86_64.percpu { cpu_bringup }
+import arch.x86_64.cpu_smp { smp_syscall_selftest }
 
 # Exception and IRQ handlers: only isr_stubs.s calls them, so this bare
 # import is what keeps the module linked (#3458).
@@ -171,7 +175,7 @@ extern fn jump_to_userspace(entry: u64, stack: u64)
 # The syscall handlers, their sys_*_impl bodies and the dispatch-table fill
 # live in syscall/runtime/<area>.ritz (AGAST #2751); syscall/runtime/entry.ritz
 # sets up SYSCALL and is what syscall_entry.s calls.
-import syscall.runtime.entry { syscall_init }
+import syscall.runtime.entry { syscall_init, syscall_register_smp_test }
 import syscall.runtime.memory { alloc_user_stack }
 import syscall.runtime.process { process_enter_init }
 
@@ -529,20 +533,29 @@ pub fn kernel_main(boot_info_addr: u64) -> i32
     else
         klog(c"\r  [!!] Kernel namespace (out of memory)\n")
 
-    # Initialize APIC based on boot protocol
+    # Initialize APIC based on boot protocol (this also reads the MADT, so
+    # num_cpus is known afterwards).
     if boot_protocol == BOOT_PROTOCOL_HARLAND
         apic_init_from_bootinfo(harland_boot_info)
-
-        # Boot Application Processors (APs)
-        if num_cpus > 1
-            ap_boot_all()
     else if boot_protocol == BOOT_PROTOCOL_MULTIBOOT2
         let mb_info: *Mb2BootInfo = boot_info_addr as *Mb2BootInfo
         apic_init_with_mb(mb_info)
 
+    # BSP per-CPU state (AGAST #4192): its GS area, own TSS with guard-paged
+    # kernel/IST stacks, IDT and SYSCALL MSRs. Then the APs, and the
+    # boot-time proof that two CPUs can be in SYSCALL at once.
+    if boot_protocol != BOOT_PROTOCOL_UNKNOWN
+        var bsp_cpu: i32 = cpu_index_of_apic_id(lapic_id())
+        if bsp_cpu < 0
+            bsp_cpu = 0
+        if cpu_bringup(bsp_cpu) != 0
+            prints("[percpu] BSP bring-up failed\n")
+            halt_loop()
+        syscall_register_smp_test()
         # Boot Application Processors (APs)
         if num_cpus > 1
             ap_boot_all()
+            smp_syscall_selftest(bsp_cpu)
 
     # Enable serial port receive interrupts (IRQ 4 already routed by ioapic_init)
     # Use serial_enable_rx() which tracks IER state for TX interrupt coexistence
