@@ -32,16 +32,19 @@
 
 import ritzlib.sys
 import ritzlib.io
+import ritzlib.str      # memcmp, for the payload's mangled prefix (AGAST #4458)
 
 import ast
 import diag   # diag_error_at, diag_loc (AGAST #3621)
 import ast_helpers
+import types             # ty_from_name, TYPE_* (AGAST #4458)
 import emitter_core      # pure helpers: name_eq, find_field_index, ...
 import emitter_expr      # self_struct_levels, ptr_ptr_ident_levels, ...
 import sema
 import sema_type
 import bool_check        # Sema's resolvers: sbk_method_def, sbk_receiver, ...
 import index_through     # name_is_indexable
+import ast_query         # is_tagged_enum_type, tagged_enum_arg_in, user_enum_index
 
 # Where a place lookup reads: the emitter's locals (s), or Sema's scope (sm).
 struct LetEnv
@@ -420,6 +423,95 @@ fn let_value_ty(sm: *Sema, e: *Expr, out_kind: *i32, out_name: **u8, out_len: *i
             arm = arm.next
     0
 
+# AGAST #4458: `let x = r.unwrap()` whose Option / Result payload is a
+# reference or pointer (`Option<@&Font>`, `Option<*T>`): the kind, the pointee
+# and its name, as the emitter's unwrap_payload_pointer_type types the slot.
+# let_value_ty's unwrap arm names only a struct payload, so such a local stayed
+# an untyped i64 for Sema's checks and call_check refused passing it.
+# `r`'s mangled carrier name comes from sbk_receiver, the payload from
+# tagged_enum_arg_in (the same `ref_` / `refmut_` / `ptr_` spelling the emitter
+# reads).  Returns 1 when it typed the payload, 0 otherwise.
+pub fn let_unwrap_payload_pointer(sm: *Sema, e: *Expr, out_kind: *i32, out_name: **u8, out_len: *i32, out_pointee: *i32) -> i32
+    *out_kind = TYPE_VOID
+    *out_name = null
+    *out_len = 0
+    *out_pointee = TYPE_VOID
+    if e == null or e.kind != EXPR_METHOD or e.left == null
+        return 0
+    let is_unwrap: bool = e.args == null and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 1
+    let is_unwrap_or: bool = e.args != null and e.args.next == null and name_eq(StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 }, StrView { ptr: (c"unwrap_or"), len: (9) as i64 }) == 1
+    if not is_unwrap and not is_unwrap_or
+        return 0
+    var en: *u8 = null
+    var en_len: i32 = 0
+    sbk_receiver(sm, e.left, @en, @en_len)
+    if en == null or en_len <= 0 or is_tagged_enum_type(StrView { ptr: (en), len: (en_len) as i64 }) == 0
+        return 0
+    var pay_len: i32 = 0
+    let pay: *u8 = tagged_enum_arg_in(@sm.struct_map, sm.module, StrView { ptr: (en), len: (en_len) as i64 }, 0, @pay_len)
+    if pay == null or pay_len <= 0
+        return 0
+    var kind: i32 = TYPE_VOID
+    var skip: i32 = 0
+    if pay_len > 7 and memcmp(pay, c"refmut_", 7) == 0
+        kind = TYPE_MUT_REF
+        skip = 7
+    else if pay_len > 4 and memcmp(pay, c"ref_", 4) == 0
+        kind = TYPE_REF
+        skip = 4
+    else if pay_len > 4 and memcmp(pay, c"ptr_", 4) == 0
+        kind = TYPE_PTR
+        skip = 4
+    else
+        return 0
+    let base: *u8 = pay + skip
+    let base_len: i32 = pay_len - skip
+    if base_len <= 0
+        return 0
+    if base_len > 4 and memcmp(base, c"ptr_", 4) == 0
+        let inner: *u8 = base + 4
+        let inner_len: i32 = base_len - 4
+        if inner_len <= 0
+            return 0
+        if kind == TYPE_PTR
+            *out_kind = TYPE_PTR_PTR
+            if sema_find_struct(sm, StrView { ptr: (inner), len: (inner_len) as i64 }) != null
+                *out_name = inner
+                *out_len = inner_len
+            else if ty_from_name(StrView { ptr: (inner), len: (inner_len) as i64 }) == TYPE_VOID and is_tagged_enum_type(StrView { ptr: (inner), len: (inner_len) as i64 }) == 0 and user_enum_index(StrView { ptr: (inner), len: (inner_len) as i64 }) < 0
+                return 0
+        else
+            *out_kind = kind
+        *out_pointee = TYPE_PTR
+        return 1
+    if sema_find_struct(sm, StrView { ptr: (base), len: (base_len) as i64 }) != null or is_tagged_enum_type(StrView { ptr: (base), len: (base_len) as i64 }) == 1 or user_enum_index(StrView { ptr: (base), len: (base_len) as i64 }) >= 0
+        *out_kind = kind
+        *out_name = base
+        *out_len = base_len
+        *out_pointee = TYPE_STRUCT
+        return 1
+    let prim: i32 = ty_from_name(StrView { ptr: (base), len: (base_len) as i64 })
+    if prim == TYPE_VOID
+        return 0
+    *out_kind = kind
+    *out_pointee = prim
+    1
+
+# let_unwrap_payload_pointer onto the binding, keeping the fields untouched
+# when it can't type it.
+fn let_note_unwrap_pointer(sm: *Sema, init: *Expr, v: *SemaVar) -> i32
+    var k: i32 = TYPE_VOID
+    var n: *u8 = null
+    var nl: i32 = 0
+    var p: i32 = TYPE_VOID
+    if let_unwrap_payload_pointer(sm, init, @k, @n, @nl, @p) == 0
+        return 0
+    v.let_kind = k
+    v.let_name = n
+    v.let_name_len = nl
+    v.let_pointee = p
+    1
+
 # The `let` / `var` `st` just bound by sema_bind_decl: an array's element,
 # and what an untyped one holds where Sema's typer leaves it unknown and
 # the emitter types it anyway (an array literal, a tuple).
@@ -438,6 +530,8 @@ pub fn let_note_decl(sm: *Sema, st: *Stmt)
         v.tuple = 1
     else if v.let_kind == TYPE_UNKNOWN and let_value_ty(sm, init, @v.let_kind, @v.let_name, @v.let_name_len, 0) == 1
         v.let_pointee = TYPE_VOID
+    else if v.let_kind == TYPE_UNKNOWN and let_note_unwrap_pointer(sm, init, v) == 1
+        pass   # AGAST #4458: a `@T` / `@&T` / `*T` unwrap payload
     else if v.let_kind == TYPE_UNKNOWN and (init.kind == EXPR_ARRAY_LIT or init.kind == EXPR_ARRAY_FILL)
         # AGAST #2266 / #3014: `[a, b]` / `[x; N]` is an `[N]T` local.
         var first: *Expr = init.args

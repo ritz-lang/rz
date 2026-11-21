@@ -3987,25 +3987,40 @@ pub fn call_result_struct_name(s: *EmitterState, e: *Expr, out_name: **u8, out_l
     *out_name = fd.return_type_name
     *out_len = fd.return_type_name_len
 
-# AGAST #2594: the struct payload `init` = `r.unwrap()` gives, `r` an
-# Option<S> or Result<S, E> (try_emit_enum_unwrap loads it as a `%S`), or
-# null/0.  AGAST #3250 / #2863: `r.unwrap_or(d)` gives the same `%S` (its
-# select is on `%S`), so `let t = r.unwrap_or(d)` is an `%S` slot too.
-pub fn unwrap_payload_struct_name(s: *EmitterState, init: *Expr, out_name: **u8, out_len: *i32)
+# `init` = `r.unwrap()` / `r.unwrap_or(d)`, r an Option<T> or Result<T, E>:
+# the mangled `Option$T` / `Result$T$E` name of that carrier, or null/0.  The
+# two payload helpers below share this lookup.  (AGAST #3250 / #2863: the
+# `unwrap_or` select is on the payload too, so it types a let the same way.)
+fn unwrap_receiver_enum_name(s: *EmitterState, init: *Expr, out_name: **u8, out_len: *i32) -> i32
+    *out_name = null
+    *out_len = 0
     if init.kind != EXPR_METHOD or init.left == null
-        return
+        return 0
     let is_unwrap: bool = init.args == null and name_eq(StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }, StrView { ptr: (c"unwrap"), len: (6) as i64 }) == 1
     let is_unwrap_or: bool = init.args != null and init.args.next == null and name_eq(StrView { ptr: (init.ident_ptr), len: (init.ident_len) as i64 }, StrView { ptr: (c"unwrap_or"), len: (9) as i64 }) == 1
     if not is_unwrap and not is_unwrap_or
-        return
+        return 0
     var enum_name: *u8 = null
     var enum_len: i32 = 0
     call_result_struct_name(s, init.left, @enum_name, @enum_len)
     if enum_len == 0
         resolve_expr_struct_name(s, init.left, @enum_name, @enum_len)
     if enum_len == 0
-        return
+        return 0
     if starts_with(StrView { ptr: (enum_name), len: (enum_len) as i64 }, StrView { ptr: (c"Option$"), len: (7) as i64 }) == 0 and starts_with(StrView { ptr: (enum_name), len: (enum_len) as i64 }, StrView { ptr: (c"Result$"), len: (7) as i64 }) == 0
+        return 0
+    *out_name = enum_name
+    *out_len = enum_len
+    1
+
+# AGAST #2594: the struct payload `init` = `r.unwrap()` gives, `r` an
+# Option<S> or Result<S, E> (try_emit_enum_unwrap loads it as a `%S`), or
+# null/0.  AGAST #3250 / #2863: `r.unwrap_or(d)` gives the same `%S` (its
+# select is on `%S`), so `let t = r.unwrap_or(d)` is an `%S` slot too.
+pub fn unwrap_payload_struct_name(s: *EmitterState, init: *Expr, out_name: **u8, out_len: *i32)
+    var enum_name: *u8 = null
+    var enum_len: i32 = 0
+    if unwrap_receiver_enum_name(s, init, @enum_name, @enum_len) == 0
         return
     # A user-enum payload too (AGAST #3620), as try_emit_enum_unwrap loads it.
     var pay_len: i32 = 0
@@ -4013,6 +4028,81 @@ pub fn unwrap_payload_struct_name(s: *EmitterState, init: *Expr, out_name: **u8,
     if pay != null and pay_len > 0
         *out_name = pay
         *out_len = pay_len
+
+# AGAST #4458: the pointer an un-annotated `let x = r.unwrap()` holds when the
+# Option / Result payload is a reference or pointer: `Option<@&Font>` gives an
+# `@&Font` local, `Option<*T>` a `*T`, exactly as `let x: @&Font = ...`
+# declares it.  The #2576 arm only recognised a struct payload, so the slot
+# stayed i64: `x.f` was "unhandled EXPR_MEMBER" and passing `x` to a `:& T` /
+# `@T` parameter failed borrow_arg_kind.
+#
+# The payload is the carrier's first mangled argument (`ref_T` / `refmut_T` /
+# `ptr_T`, ast_helpers' mangle_type_name spelling), which tagged_enum_arg
+# splits off both Option and Result.  Writes the kind (TYPE_REF /
+# TYPE_MUT_REF / TYPE_PTR, or TYPE_PTR_PTR for a `ptr_ptr_` payload) and the
+# pointee: its name when it is a struct / enum (`@&Font` -> "Font"), else a
+# primitive kind with no name, as an annotated local records it.  Returns 1
+# when it typed the payload, 0 otherwise (then out_kind is TYPE_VOID).
+pub fn unwrap_payload_pointer_type(s: *EmitterState, init: *Expr, out_kind: *i32, out_name: **u8, out_len: *i32, out_pointee: *i32) -> i32
+    *out_kind = TYPE_VOID
+    *out_name = null
+    *out_len = 0
+    *out_pointee = TYPE_VOID
+    var enum_name: *u8 = null
+    var enum_len: i32 = 0
+    if unwrap_receiver_enum_name(s, init, @enum_name, @enum_len) == 0
+        return 0
+    var pay_len: i32 = 0
+    let pay: *u8 = tagged_enum_arg(s, StrView { ptr: (enum_name), len: (enum_len) as i64 }, 0, @pay_len)
+    if pay == null or pay_len <= 0
+        return 0
+    var kind: i32 = TYPE_VOID
+    var skip: i32 = 0
+    if pay_len > 7 and memcmp(pay, c"refmut_", 7) == 0
+        kind = TYPE_MUT_REF
+        skip = 7
+    else if pay_len > 4 and memcmp(pay, c"ref_", 4) == 0
+        kind = TYPE_REF
+        skip = 4
+    else if pay_len > 4 and memcmp(pay, c"ptr_", 4) == 0
+        kind = TYPE_PTR
+        skip = 4
+    else
+        return 0
+    let base: *u8 = pay + skip
+    let base_len: i32 = pay_len - skip
+    if base_len <= 0
+        return 0
+    if base_len > 4 and memcmp(base, c"ptr_", 4) == 0
+        # `*T` with T itself a pointer (`**Font`), or a `@**Font` / `@&**Font`.
+        let inner: *u8 = base + 4
+        let inner_len: i32 = base_len - 4
+        if inner_len <= 0
+            return 0
+        if kind == TYPE_PTR
+            *out_kind = TYPE_PTR_PTR
+            if find_struct(s, StrView { ptr: (inner), len: (inner_len) as i64 }) != null
+                *out_name = inner
+                *out_len = inner_len
+            else if ty_from_name(StrView { ptr: (inner), len: (inner_len) as i64 }) == TYPE_VOID and is_tagged_enum_type(StrView { ptr: (inner), len: (inner_len) as i64 }) == 0 and user_enum_index(StrView { ptr: (inner), len: (inner_len) as i64 }) < 0
+                return 0
+        else
+            *out_kind = kind
+        *out_pointee = TYPE_PTR
+        return 1
+    let st: *StructDef = find_struct(s, StrView { ptr: (base), len: (base_len) as i64 })
+    if st != null or is_tagged_enum_type(StrView { ptr: (base), len: (base_len) as i64 }) == 1 or user_enum_index(StrView { ptr: (base), len: (base_len) as i64 }) >= 0
+        *out_kind = kind
+        *out_name = base
+        *out_len = base_len
+        *out_pointee = TYPE_STRUCT
+        return 1
+    let prim: i32 = ty_from_name(StrView { ptr: (base), len: (base_len) as i64 })
+    if prim == TYPE_VOID
+        return 0
+    *out_kind = kind
+    *out_pointee = prim
+    1
 
 # AGAST #3161: `.slice(lo, hi)` on a `Span<T>` that no FnDef resolves (the
 # callers ask only once method_callee_def found none) is try_emit_span_builtin's

@@ -159,3 +159,81 @@ def test_unwrap_or_let_borrowed_receiver(run_with, compiler):
     program = _program("vec", "res", "call", recv="self: @Tag").replace(
         ".unwrap()", ".unwrap_or(vec_of(9))")
     assert run_with(compiler, "unwrap_or_borrowed", program) == 0
+
+
+# AGAST #4458: the same let takes the payload's type when that payload is a
+# reference or pointer (`Option<@Font>`, `Option<@&Font>`, `Option<*Font>`,
+# and the Result forms).  The mangled payload names are `ref_` / `refmut_` /
+# `ptr_`, which the emitter's struct-payload rule did not read, so the local
+# stayed i64: reading it was "unhandled EXPR_MEMBER" and passing it to a
+# `:&` / `@` parameter was "this place doesn't hold what the `:&` parameter
+# borrows".  prism's `test_text_rendering.ritz` hit it through
+# `mgr.get_mut(id).unwrap()` (`Option<@&Font>`).
+#
+# Each row exercises both uses a single local gets: a field read (`x.size`)
+# and the argument to a parameter taking the pointer (`@Font` by value,
+# `:& Font`, `*Font`), so the emitter's slot and Sema's place image must agree.
+_PTR_TYPES = """\
+struct Font
+    size: i32
+
+fn mk_opt_ref(p: @Font) -> Option<@Font>
+    Some(p)
+
+fn mk_opt_mut(p: @&Font) -> Option<@&Font>
+    Some(p)
+
+fn mk_opt_ptr(p: *Font) -> Option<*Font>
+    Some(p)
+
+fn mk_res_ref(p: @Font) -> Result<@Font, i32>
+    Ok(p)
+
+fn mk_res_mut(p: @&Font) -> Result<@&Font, i32>
+    Ok(p)
+
+fn mk_res_ptr(p: *Font) -> Result<*Font, i32>
+    Ok(p)
+
+fn take_ref(p: @Font) -> i32
+    p.size
+
+fn take_mut(p:& Font) -> i32
+    p.size
+
+fn take_ptr(p: *Font) -> i32
+    p.size
+
+"""
+
+# Payload spelling -> how main builds it from `f` and how it is passed on.
+_PTR_PAYLOADS = {
+    "ref": ("@f", "take_ref"),
+    "mut": ("@&f", "take_mut"),
+    "ptr": ("@f", "take_ptr"),
+}
+
+
+def _ptr_program(carrier: str, payload: str) -> str:
+    arg, take = _PTR_PAYLOADS[payload]
+    return (
+        _PTR_TYPES
+        + "pub fn main() -> i32\n"
+        + "    var f: Font = Font { size: 7 }\n"
+        + f"    let r = mk_{carrier}_{payload}({arg})\n"
+        + "    let x = r.unwrap()\n"
+        + "    if x.size != 7\n"
+        + "        return 1\n"
+        + f"    if {take}(x) != 7\n"
+        + "        return 2\n"
+        + "    0\n"
+    )
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("compiler", COMPILERS)
+@pytest.mark.parametrize("carrier", ["opt", "res"])
+@pytest.mark.parametrize("payload", sorted(_PTR_PAYLOADS))
+def test_unwrap_let_takes_pointer_payload_type(run_with, carrier, payload, compiler):
+    name = f"unwrap_ptr_{carrier}_{payload}"
+    assert run_with(compiler, name, _ptr_program(carrier, payload)) == 0
