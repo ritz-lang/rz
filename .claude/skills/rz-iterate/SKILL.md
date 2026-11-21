@@ -1146,7 +1146,12 @@ one to train 1.
    was cherry-picked,
    so `git cherry origin/main ritz-task-<id>` prints `- <sha>` (same patch),
    not nothing; a `+` line is fine only if `<main sha12>`'s subject matches
-   the branch tip's. The slot is free once the host answers `TORNDOWN`.
+   the branch tip's. Proof of the land is patch identity, not ancestry: after
+   a rebase the gated SHA is *expected* to be a non-ancestor, so
+   `merge-base --is-ancestor` of it exits 1 even though the work is on `main`.
+   Check ancestry only on the *landed* `main` SHA, and do not check ancestry
+   of the gated SHA (AGAST #4470). The slot is free once the host answers
+   `TORNDOWN`.
 6. **Gate fails: reason first, then bisect.** Read the failing lines
    (`train.sh wait` / `run-gate.sh --wait` prints them; a remote gate's
    whole log is the fetched `...@<host>.log`) against each car's diff

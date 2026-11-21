@@ -457,3 +457,23 @@ def test_briefing_bans_machine_wide_kills_and_direct_ci_local():
     gate_sh = (SKILL.parent / "run-gate.sh").read_text()
     assert "AGAST #4468" in gate_sh
     assert "pkill -f" in gate_sh
+
+
+@pytest.mark.unit
+def test_briefing_teardown_proves_land_by_patch_identity_not_ancestry():
+    """AGAST #4470: after a rebase the gated SHA is an expected non-ancestor,
+    so ancestry of it proves nothing; patch identity is the proof."""
+    text = SKILL.read_text()
+    # The **Remote room:** paragraph has no blank line before item 6, so the
+    # _briefing_paragraph() helper would run into the next step and let these
+    # assertions pass on the wrong text. Cut on the next item explicitly.
+    at = text.index("**Remote room:**")
+    end = text.index("6. **Gate fails", at)
+    flat = " ".join(text[at:end].split())
+    # After a rebase the gated SHA is expected to be a non-ancestor.
+    assert "non-ancestor" in flat
+    # Ancestry is checked on the landed main SHA, not on the gated SHA.
+    assert "landed" in flat
+    assert "do not check ancestry" in flat
+    # The proof is patch identity: the `-` line, or a subject match for `+`.
+    assert "patch identity" in flat
