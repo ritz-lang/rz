@@ -13,8 +13,10 @@ after `=>`, so the whole enclosing fn failed with
 
     cannot parse item starting at 'fn pick'
 
-ritzlib/os/env.ritz (env_must) was refused for this reason, and angelo has 78
-such arms. The fix adds `pattern FAT_ARROW NEWLINE INDENT stmts DEDENT` and
+ritzlib/os/env.ritz's env_must was refused for this reason, and angelo has 78
+such arms. (env_must has since moved into the program, S-ERR-3; the block-arm
+shape it used lives on in STRVIEW_BLOCK below.) The fix adds
+`pattern FAT_ARROW NEWLINE INDENT stmts DEDENT` and
 `pattern FAT_ARROW assign_stmt`. Like an `if` branch, a block's value is its
 trailing bare expression: match_arm_set_block moves it into MatchArm.body and
 keeps the leading statements in MatchArm.body_stmts, which emit_match_arm_body
@@ -159,8 +161,8 @@ fn main() -> i32
     f(0, 9) as i32
 """
 
-# env_must's shape: a struct-valued (StrView) match whose block arm builds
-# its value in a local. The phi must be typed %StrView on both arms.
+# env_must's old shape: a struct-valued (StrView) match whose block arm
+# builds its value in a local. The phi must be typed %StrView on both arms.
 STRVIEW_BLOCK = """\
 import ritzlib.strview
 import ritzlib.option
@@ -307,14 +309,18 @@ def test_ritz1_block_match_arm(ritz1_bin, tmp_path, name):
 
 @pytest.mark.integration
 def test_ritz1_compiles_os_env(ritz1_bin, tmp_path):
-    """#1454 acceptance: ritz1 compiles ritzlib/os/env.ritz (env_must) standalone."""
+    """#1454 acceptance: ritz1 compiles ritzlib/os/env.ritz standalone.
+
+    env_must, the original block-arm trigger, now belongs to the program
+    (S-ERR-3); its block-arm shape is covered by STRVIEW_BLOCK.
+    """
     comp, ll, _ = _compile(
         "ritz1", tmp_path, "os_env", "", RITZ_ROOT / "ritzlib" / "os" / "env.ritz"
     )
     assert comp.returncode == 0 and ll.exists(), (
         f"ritz1 refused ritzlib/os/env.ritz:\n{comp.stdout[-2000:]}\n{comp.stderr[-2000:]}"
     )
-    assert "@env_must" in ll.read_text(), "env_must was not emitted"
+    assert "@env_raw_envp" in ll.read_text(), "env.ritz functions were not emitted"
 
 
 @pytest.mark.integration

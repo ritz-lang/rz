@@ -16,7 +16,9 @@ expect() {
     local out err rc errf
     errf=$(mktemp)
     out=$(env -i "$@" ./osenv 2>"$errf"); rc=$?
-    err=$(cat "$errf"); rm -f "$errf"
+    # $(...) strips trailing newlines; append a sentinel so a missing final
+    # newline on stderr still fails the byte comparison below.
+    err=$(cat "$errf"; printf x); err=${err%x}; rm -f "$errf"
     [[ "$rc" == "$want_rc" ]]   || fail "env -i $* ./osenv: exit $rc, want $want_rc"
     [[ "$out" == "$want_out" ]] || fail "env -i $* ./osenv: stdout
 --- got ---
@@ -44,10 +46,11 @@ OSENV_UNSET: (unset)
 entries: 1
 must FOO: ' '' -- FOO=
 
-# env_must on a missing variable: exit 1 with the error on stderr, and
-# nothing after the env_must call is printed.
+# env_must on a missing variable: exit 1 with the error (and exactly one
+# trailing newline) on stderr, and nothing after the env_must call is printed.
 expect 1 'FOO: (unset)
 OSENV_UNSET: (unset)
-entries: 0' 'error: required environment variable not set: FOO' --
+entries: 0' 'error: required environment variable not set: FOO
+' --
 
 echo PASS

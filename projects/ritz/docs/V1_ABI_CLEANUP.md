@@ -163,7 +163,8 @@ import ritzlib.os.env
 # Most common patterns
 let port = env_get_or("PORT", "8080")        # StrView
 let debug = env_get("DEBUG")                  # Option<StrView>
-let home = env_must("HOME")                   # StrView, exits 1 if missing
+# A get-or-die helper is the program's, not the library's (S-ERR-3):
+# `match env_get("HOME") { Some(h) => h, None => ... }`
 
 # Rare path — full iteration
 for var in env_iter()                         # Span<StrView> of "KEY=VALUE"
@@ -217,8 +218,8 @@ __ritz_main(args, env)             ← the user's Ritz-native main
 # ritzlib.os.env — implicit env access (no Span<StrView> required)
 pub fn env_get(name: StrView) -> Option<StrView>
 pub fn env_get_or(name: StrView, default: StrView) -> StrView
-pub fn env_must(name: StrView) -> StrView   # missing → exits 1 with friendly error
 pub fn env_iter() -> Span<StrView>          # "KEY=VALUE" each
+# get-or-die belongs to the program (S-ERR-3), built on env_get's Option
 ```
 
 argv helpers (`args_skip`, an `Args` parser) are out of scope (see the end of

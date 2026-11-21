@@ -2494,9 +2494,13 @@ value is a zero-copy `StrView` into that cache.
 | `env_get` | `fn(name: StrView) -> Option<StrView>` | Value of `name`, or `None` if unset |
 | `env_get_p` | `fn(name: *StrView) -> Option<StrView>` | `env_get` taking the name by pointer |
 | `env_get_or` | `fn(name: StrView, default: StrView) -> StrView` | Value of `name`, or `default` |
-| `env_must` | `fn(name: StrView) -> StrView` | Value of `name`; exits 1 with an error if unset |
 | `env_iter` | `fn() -> Span<StrView>` | Every `"KEY=VALUE"` entry, in order |
 | `env_raw_envp` | `fn() -> **u8` | The same entries as a NULL-terminated C `envp`, for `sys_execve` only |
+
+A get-or-die `env_must` helper deliberately does *not* live here: S-ERR-3 says
+a library returns its failure to the caller, so only a program decides to
+exit. A program that wants one writes it on top of `env_get` (see
+`examples/tier4_applications/41_osenv`).
 
 **Example**:
 ```ritz
