@@ -370,10 +370,13 @@ def test_a_literal_too_large_for_its_context_is_a_located_error(tmp_path):
 # An arm's value is consumed at the if / match's own type, which is the slot's,
 # so the declared type follows the value tails: then / else block values and
 # match arm bodies, through nested if / match / block. Never the condition or
-# the scrutinee, which are consumed as a bool and at their own type, and never
-# into an if that sits under an operator: `2 * (if c then a else 200) / 4` at
-# u8 would multiply in 8 bits before the `/` (the #1396 `>>` / `/` / `%`
-# hazard), where today it does so at 64.
+# the scrutinee, which are consumed as a bool and at their own type.
+#
+# AGAST #4219 (LARB R73): a chain of congruent operators (`+ - * & | ^ <<`)
+# carries the slot's width down too, so `x + (if c then x else 255)` is i32.
+# `/`, `%` and `>>` still stop it: `2 * (if c then a else 200) / 4` at u8
+# would multiply in 8 bits before the `/` (the #1396 `>>` / `/` / `%` hazard),
+# where today it does so at 64.
 
 def _no_round_trip(body):
     """No i64 value and no truncation anywhere in a function body."""
@@ -437,8 +440,8 @@ def test_a_literal_arm_takes_the_type_of_every_narrowing_slot(tmp_path):
 
     An assignment, a call argument and a fn's tail are narrowing-checked too,
     so a literal arm merged at i64 there was a round-trip that loses no bits.
-    (`m += if ...` is `m = m + (if ...)`: an if under an operator, which keeps
-    its i64 arms as it does in a `let`.)
+    (`m += if ...` is `m = m + (if ...)`: an if under a congruent operator,
+    which takes the slot's width as a `let` does — AGAST #4219, LARB R73.)
     """
     ir_text = _emit_ir(tmp_path, (
         "fn take_i32(v: i32) -> i32\n"
@@ -447,6 +450,11 @@ def test_a_literal_arm_takes_the_type_of_every_narrowing_slot(tmp_path):
         "fn assign(a: i32, b: i32) -> i32\n"
         "    var m: i32 = b\n"
         "    m = if a < b then a else 255\n"
+        "    m\n"
+        "\n"
+        "fn assign_add(a: i32, b: i32) -> i32\n"
+        "    var m: i32 = b\n"
+        "    m += if a < b then a else 255\n"
         "    m\n"
         "\n"
         "fn arg(a: i32, b: i32) -> i32\n"
@@ -462,7 +470,7 @@ def test_a_literal_arm_takes_the_type_of_every_narrowing_slot(tmp_path):
         "    take_u32(if a < b then a else 4000000000)\n"
     ))
     # arg_u32: the arm fits the slot only read as unsigned.
-    for fn in ("assign", "arg", "tail", "arg_u32"):
+    for fn in ("assign", "assign_add", "arg", "tail", "arg_u32"):
         body = _body(ir_text, fn)
         assert _no_round_trip(body), f"{fn}: an arm was computed in i64: {body}"
 
@@ -509,6 +517,23 @@ def test_the_condition_and_scrutinee_keep_their_own_type(tmp_path):
         body = _body(ir_text, fn)
         assert any("shl i64" in line for line in body), f"{fn}: narrowed: {body}"
         assert not any("shl i32" in line for line in body), f"{fn}: {body}"
+
+
+@pytest.mark.unit
+def test_a_congruent_path_does_not_enter_the_condition(tmp_path):
+    """AGAST #4219: following the if through `+` does not follow its condition.
+
+    `1 << n` in the condition stays i64 — with n = 31 an i32 `1 << n` is
+    negative, which would flip the comparison and change which arm runs.
+    """
+    ir_text = _emit_ir(tmp_path, (
+        "fn f(n: i32, x: i32) -> i32\n"
+        "    let k: i32 = x + (if (1 << n) < 0 then x else 255)\n"
+        "    return k\n"
+    ))
+    body = _body(ir_text, "f")
+    assert any("shl i64" in line for line in body), f"condition narrowed: {body}"
+    assert not any("shl i32" in line for line in body), body
 
 
 @pytest.mark.unit

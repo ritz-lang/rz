@@ -1739,6 +1739,14 @@ class LLVMEmitter:
         'i64': 64, 'u64': 64,
     }
 
+    # Operators congruent mod 2**width (LARB R73, AGAST #4219): a value path
+    # through them carries the slot's width down to an if / match. `/`, `%`
+    # and `>>` are not, nor is a comparison or a logical operator; the
+    # wrapping `+%` forms share `op` with `+` and are excluded by
+    # `BinOp.wrapping` (they are congruent, but outside R73's list and not
+    # expressible in ritz1).
+    _CONGRUENT_BINOPS = frozenset({'+', '-', '*', '&', '|', '^', '<<'})
+
     def _arith_context_nodes(self, root: rast.Expr) -> set:
         """Ids of the BinOps whose result is consumed at the declared type.
 
@@ -1776,10 +1784,26 @@ class LLVMEmitter:
         an untyped integer literal (`255`, `-128`) is added as well, and
         `_literal_at_slot_width` emits it at the slot's width; otherwise
         `if a < b then a else 255` (a: i32) merged at the literal's i64.
+
+        AGAST #4219 (LARB R73): "below an operator" is refined to "below an
+        operator that is not congruent mod 2**width". `x op= v` is
+        `x = x op v`, so the ticket's value is a BinOp with the if as its
+        operand. Each of `+ - * & | ^ <<` is congruent, so retyping the arms
+        at the slot's width cannot change a bit of the value the store keeps;
+        an overflow there could not be stored losslessly either (R63 traps).
+        The path therefore continues through those operators only, and an
+        if / match reached that way has its arms followed as an arm of the
+        slot. `/ % >>` and every other operator (comparisons, `&&` / `||`,
+        the wrapping `+%` forms) still stop it. A bare literal operand of a
+        congruent operator is NOT retyped: only the chains carry the width,
+        and the arms of an if / match at their end are 'arm', not 'cong'.
         """
         qualifying = set()
         # (node, how it is reached): 'root' for the slot's own value, 'arm'
-        # for an if / match tail, None below an operator.
+        # for an if / match tail, 'cong' for a value consumed at the slot's
+        # width through congruent operators only, None below any other
+        # operator. 'cong' and 'root' / 'arm' all carry the width on through
+        # congruent operators; only 'arm' retypes a bare literal.
         stack = [(root, 'root')]
         seen = set()
         while stack:
@@ -1818,10 +1842,18 @@ class LLVMEmitter:
                     if isinstance(node.left, rast.BinOp) and node.left.op == '>>':
                         stack.append((node.left, None))
                     continue
-                stack.append((node.left, None))
-                stack.append((node.right, None))
+                congruent = (node.op in self._CONGRUENT_BINOPS
+                             and not node.wrapping
+                             and tail in ('root', 'arm', 'cong'))
+                # AGAST #4219: only the left operand of `<<` is a value at
+                # the slot's width; its right operand is a shift count.
+                left_tail = 'cong' if congruent else None
+                right_tail = (None if node.op == '<<' else left_tail)
+                stack.append((node.left, left_tail))
+                stack.append((node.right, right_tail))
             elif isinstance(node, rast.UnaryOp):
-                # `-(x + 1)` is still consumed at the declared width.
+                # `-(x + 1)` is still consumed at the declared width. Not
+                # extended to 'cong' (AGAST #4219): R73's list is binary.
                 stack.append((node.operand, None))
         return qualifying
 

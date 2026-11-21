@@ -123,6 +123,12 @@ REJECTED = {
     # Below an operator an if's arms are not the slot's: the `*` ran at 64
     # bits, so the `/` result needs proof (there is none).
     "if_under_operator":         "let n: u8 = 2 * (if x > 0 then 200 else 100) / 4",
+    # AGAST #4219 (LARB R73): only `+ - * & | ^ <<` are congruent mod
+    # 2**width. `/`, `%` and `>>` are not, so the if below them keeps its
+    # i64 arm and the narrowing stays unproven.
+    "if_under_div":              "let n: i32 = (if x < 0 then x else 255) / 2",
+    "if_under_mod":              "let n: i32 = (if x < 0 then x else 255) % 2",
+    "if_under_shr":              "let n: i32 = (if x < 0 then x else 255) >> 2",
     # AGAST #4082: an all-literal operand is one literal of its i64 value, so
     # it takes the sibling's type only if that value fits it ...
     "all_literal_operand_too_big":   "let n: i32 = x ^ (1 << 40)",
@@ -189,6 +195,30 @@ ACCEPTED = {
     "if_arith_arm_and_literal":  "let n: i32 = if x - 1 < 255 then x - 1 else 255",
     "if_negative_literal_arm":   "var n: i32 = if x > 0 then -1 else x",
     "if_nested_literal_arms":    "let n: i32 = if x < 0 then 0 else if x > 9 then 9 else x",
+    # AGAST #4219 (LARB R73): `x op= v` is `x = x op v`, so the if sits under
+    # the operator. When every operator from the slot down to the if is
+    # congruent mod 2**width, the arms are still consumed at the slot's
+    # width, and typing them there cannot change a bit the store keeps.
+    "op_assign_if_literal_arm":  ("var m: i32 = x\n"
+                                  "    m += if x < 0 then x else 255"),
+    "add_if_literal_arm":        "let k: i32 = x + (if x < 0 then x else 255)",
+    "sub_if_literal_arm":        "let k: i32 = x - (if x < 0 then x else 255)",
+    "mul_if_literal_arm":        "let k: i32 = 3 * (if x < 0 then x else 255)",
+    "and_if_literal_arm":        "let k: i32 = x & (if x < 0 then x else 255)",
+    "or_if_literal_arm":         "let k: i32 = x | (if x < 0 then x else 255)",
+    "xor_if_literal_arm":        "let k: i32 = x ^ (if x < 0 then x else 255)",
+    "shl_if_literal_arm":        "let k: i32 = (if x < 0 then x else 255) << 1",
+    # A match at the slot with the congruent chain inside an arm: the same
+    # path, reached through a followed match tail (`x + match` opens a block
+    # inside an expression, which neither parser allows).
+    "match_arm_add_if_literal_arm": ("let k: i32 = match o\n"
+                                     "        Gray => x\n"
+                                     "        RGB => x + (if x < 0 then x else 255)\n"
+                                     "        BGR => 255"),
+    # A comparison between the slot and the if stops the path: the condition
+    # of a followed if is not a value at the slot's width (its IR is pinned
+    # in test_literal_type_context.py).
+    "add_if_with_comparison":    "let k: i32 = x + (if x < 255 then x else 255)",
     # AGAST #4082: an all-literal operand (`0 - 1`, `~63`) is one literal and
     # takes its sibling's type (R21), as `x ^ -1` does: no i64 to narrow.
     "all_literal_operand":       "let n: i32 = x ^ (0 - 1)",

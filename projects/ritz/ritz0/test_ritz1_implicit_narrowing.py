@@ -121,8 +121,6 @@ RITZ1_EXTRA_REJECTED.update({
     "if_block_i64_arm":            (_IF.format(t="i32", a="x", b="five()"), None),
     # The i32 arm into a u8: the literal arm being a u8 does not hide it.
     "if_block_literal_arm_into_u8": (_IF.format(t="u8", a="x", b="0"), None),
-    # Below an operator an if's literal arm is an i64 again.
-    "if_block_under_operator":     ("let n: i32 = 1 + (if x > 0 then x else 0) * x", None),
 })
 
 # AGAST #1688: shapes ritz1 used to answer NARROW_UNKNOWN for.  Each one in
@@ -208,6 +206,10 @@ RITZ1_EXTRA_ACCEPTED = {
                                  "        BGR => 1", None),
     "if_block_same_type_arms": (_IF.format(t="i32", a="x", b="SMALL32"), None),
     "if_block_constant_arms":  (_IF.format(t="u8", a="1", b="0"), None),
+    # AGAST #4219 (LARB R73): `*` is congruent mod 2**width, so the if below
+    # it is still consumed at the slot's width and its literal arm is an i32.
+    "if_block_under_congruent_operator":
+        ("let n: i32 = 1 + (if x > 0 then x else 0) * x", None),
     "if_block_const_arm":      (_IF.format(t="i32", a="SMALL32", b="x"), None),
     "match_literal_arms_first": ("let n: i32 = match o\n"
                                  "        Gray => 0\n"

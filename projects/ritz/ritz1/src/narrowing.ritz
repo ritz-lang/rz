@@ -423,6 +423,19 @@ pub fn narrow_is_arith_op(op: i32) -> i32
         return 1
     0
 
+# The operators congruent mod 2**width (LARB R73, AGAST #4219): a value path
+# through them carries a slot's width down to an if / match below it, so
+# `x op= v` (`x = x op v`, v an if) is not a narrowing.  `/`, `%` and `>>`
+# are not congruent, nor are comparisons or `&&` / `||`; ritz0's
+# _CONGRUENT_BINOPS has the same rows.  Wrapping `+%` has no syntax here
+# (ritz1 does not parse it), and is excluded there too.
+fn narrow_is_congruent_op(op: i32) -> i32
+    if op == OP_ADD or op == OP_SUB or op == OP_MUL
+        return 1
+    if op == OP_BIT_AND or op == OP_BIT_OR or op == OP_BIT_XOR or op == OP_SHL
+        return 1
+    0
+
 # 1 when operand `e` is an integer literal (`-` and all) and `other` isn't, so
 # that `e` is `other`'s type (LARB R21, AGAST #3112).
 fn narrow_operand_lit(e: *Expr, other: *Expr) -> i32
@@ -557,8 +570,9 @@ pub fn narrow_src_type(s: *EmitterState, e: *Expr) -> i32
 # carries the slot's type into an if / match's arm values
 # (_arith_context_nodes), so a literal arm is the slot's type there, as the
 # whole initialiser is, and `let n: i32 = if c then x else 255` is an i32.
-# Only through if / match: below an operator an if is that operator's operand
-# and its literal arms are i64 again.
+# Only through if / match, and through operators congruent mod 2**width
+# (LARB R73, AGAST #4219): below any other operator an if is that operator's
+# operand and its literal arms are i64 again.
 const NARROW_SLOT: i32 = 2
 
 fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
@@ -606,12 +620,24 @@ fn narrow_src_type_in(env: *NarrowEnv, e: *Expr, lit_i64: i32) -> i32
             # LARB R21 (AGAST #3112): a literal operand is the other operand's
             # type, in an `if` arm or under `>>` too: `(a << 4) >> 4` is a's.
             # A shift's left literal is not (`1 << n`), as before.
+            # AGAST #4219 (LARB R73): a congruent operator is itself consumed
+            # at the slot's width, so it passes the slot marker on to its
+            # operands; an if / match below it is then a tail of the slot and
+            # its literal arms take the slot's type.  `/`, `%` and the rest
+            # keep demoting (`op_lit`), as before.
+            var operand_lit: i32 = op_lit
+            if narrow_is_congruent_op(e.op) == 1
+                operand_lit = lit_i64
             var lt: i32 = NARROW_LIT
             if e.op == OP_SHL or narrow_operand_lit(e.left, e.right) == 0
-                lt = narrow_src_type_in(env, e.left, op_lit)
+                lt = narrow_src_type_in(env, e.left, operand_lit)
             var rt: i32 = NARROW_LIT
+            # A shift's count is an amount, not a value at the slot's width.
+            var right_lit: i32 = operand_lit
+            if e.op == OP_SHL
+                right_lit = op_lit
             if narrow_operand_lit(e.right, e.left) == 0
-                rt = narrow_src_type_in(env, e.right, op_lit)
+                rt = narrow_src_type_in(env, e.right, right_lit)
             # AGAST #4082: an all-literal operand is one literal, R21 and all.
             var shl_arm: i32 = 0
             if e.op == OP_SHL and op_lit == 1
