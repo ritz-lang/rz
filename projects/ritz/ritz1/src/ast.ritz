@@ -689,6 +689,31 @@ struct OwnedBinds
   count: i32
   cap: i32
 
+# AGAST #4035 (#1889 FIX step 1): the parser's type, recursively.  A pointer or
+# reference is the `pointee` chain; an array is `elem` plus `count` (and
+# `shape` when it is multi-dimensional).  What used to be 17 `Parser.last_*`
+# side channels is now the recursion itself, so a consumer the grammar hands a
+# `*TypeRef` answers every question from it.
+#
+# `kind` is the flat TYPE_* code the rest of the compiler already speaks: a
+# pointer whose pointee is a pointer is TYPE_PTR_PTR, exactly as the old
+# type_ptr computed, so flat AST fields and the IR do not move.
+struct TypeRef
+  kind: i32
+  name: *u8            # struct/generic name when kind == TYPE_STRUCT
+  name_len: i32
+  pointee: *TypeRef    # inner of `*T` / `@T` / `@&T`; null otherwise
+  elem: *TypeRef       # element of `[N]T`; null otherwise
+  count: i64           # N of `[N]T`; 0 when unknown
+  shape: *ArrayShape   # `[N][M]..T` shape; null for 1-D
+  array_rec: *ArrayElem  # the `[N]T` record (ptr_array / ptr_plane) for a local
+  fn_sig: *FnDef       # `fn(..) -> T` signature; null otherwise
+  # AGAST #2399: the indirection nearest the pointee (INNER_REF_*), as
+  # `inner_ref_of` reported; it is the inner level's when that is itself one.
+  inner_ref: i32
+  # For `@T` / `@&T`: the referent's flat kind, as `last_ref_inner_type` held.
+  ref_inner: i32
+
 # Const declaration
 struct ConstEntry
   name: *u8
@@ -970,6 +995,9 @@ struct CastTail
   # and, for a struct pointee, its name.  TYPE_VOID / null when unknown.
   # Copied onto the EXPR_CAST node by apply_cast_tail.
   pointee_type: i32
+  # #4035: the `*T` / `@T` / `@&T` pointee a cast leaves on the EXPR_CAST node
+  # (Expr.cast_pointee), derived from the tail's *TypeRef.
+  cast_pointee: i32
   next: *CastTail   # Next cast in chain
   pointee_name: *u8
   pointee_name_len: i32
@@ -1094,30 +1122,6 @@ struct Parser
   heap_base: *u8
   heap_offset: i64
   module: *Module
-  # For struct return types - stores the last parsed type name
-  last_type_name: *u8
-  last_type_name_len: i32
-  # For pointer types - stores the element type
-  last_pointee_type: i32     # Element type for pointers (e.g., TYPE_U8 for *u8)
-  # AGAST #184: deepest non-pointer pointee in a *T / **T / ***T chain.
-  # Used by field_new to decide whether to capture last_type_name for a
-  # TYPE_PTR_PTR field (e.g. **ZSetNode → TYPE_STRUCT, **u8 → TYPE_U8).
-  # Set by type_ptr only when the immediate inner is NOT a pointer.
-  last_inner_pointee_type: i32
-  # AGAST #1924: pointer levels of the type type_ptr just built (1 = *T,
-  # 2 = **T, 3 = ***T ...).  last_pointee_type alone cannot tell ***T
-  # from ****T.
-  last_ptr_depth: i32
-  # For array types - stores the last parsed array info
-  last_array_size: i32       # Size of array (e.g., 16 for [16]i32)
-  last_array_elem_type: i32  # Element type (e.g., TYPE_I32)
-  last_array_elem_type_name: *u8    # Struct name when array_elem_type == TYPE_STRUCT
-  last_array_elem_type_name_len: i32
-  last_array_elem_pointee: i32      # AGAST #2341: T for `[N]*T`; TYPE_VOID otherwise
-  # AGAST #1509: shape of the last array type when it is multi-dimensional,
-  # null for a 1-D `[N]T`.  type_array always writes it, so it is current
-  # whenever the type just parsed is TYPE_ARRAY.
-  last_array_shape: *ArrayShape
   # For function return types - stores the return type name before body parsing overwrites it
   fn_return_type_name: *u8
   fn_return_type_name_len: i32
@@ -1128,26 +1132,13 @@ struct Parser
   # annotation, which `<*S>` in the initializer would overwrite.
   var_pointee: i32
   var_inner_pointee: i32
-  # For generic function calls - stores the last parsed generic type arg suffix
-  last_call_type_suffix: *u8       # e.g., "$u8" for vec_with_cap<u8>()
-  last_call_type_suffix_len: i32
-  # For reference types - stores the inner type
-  last_ref_inner_type: i32         # Inner type for @T or @@T (e.g., TYPE_STRUCT)
-  # AGAST #2399: the indirection nearest the pointee of the type just parsed,
-  # INNER_REF_*.  var_inner_ref latches it across a `let` initializer.
-  last_inner_ref: i32
   var_inner_ref: i32
   # Conditional compilation: set to 1 by parse_attr when it sees
   # [[target_os = "xxx"]] where xxx != the target OS. Consumed (and reset) by
   # parse_item's module_add_* calls to skip adding that item to the module.
   skip_item: i32
-  # AGAST #1671: the signature the last `fn(...) -> T` type_spec built, and
-  # the token position it ended at.  A consumer (param_new, capture_var_type)
-  # only trusts it when p.pos still equals last_fn_sig_pos, i.e. the type
-  # it just parsed IS that fn type -- no stale signature leaks onto a later
-  # `*u8` param.  var_fn_sig latches it across a `let` initializer.
-  last_fn_sig: *FnDef
-  last_fn_sig_pos: i32
+  # AGAST #1671: the signature latched across a `let` initializer, so a
+  # `fn(...) -> T`-typed local calls typed.
   var_fn_sig: *FnDef
   # AGAST #2943: high-water mark of p.pos, raised by p_advance.  Backtracking
   # rewinds p.pos but not this, so when an item fails it is the token the

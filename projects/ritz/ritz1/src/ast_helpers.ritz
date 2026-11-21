@@ -1764,7 +1764,7 @@ fn decl_refused(at: SrcSpan, what: *u8, name_sv: StrView, owner_sv: StrView, why
     eprintln_cstr(why)
 
 # Grammar action: `[pub] fn name[<T>](params) [-> R] = extern`.
-pub fn decl_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
+pub fn decl_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, params: *Param, ret: *TypeRef, line: i32, col: i32) -> *FnDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if type_params != null
@@ -1873,28 +1873,18 @@ pub fn trait_decl_refused(name_sv: StrView, line: i32, col: i32) -> i32
 # Global variable helpers
 # =============================================================================
 
-# AGAST #4324: a global's fn signature, latched between its type and
-# global_var_new.  global_var_new runs after the initializer expression is
-# parsed, by which time fresh_fn_sig (which hands out p.last_fn_sig only at
-# the very token the fn type ended on) has moved on; capture_global_fn_sig
-# takes it from that token.  A global is never nested in another, so one slot
-# is enough.
-var g_global_fn_sig: *FnDef = null
+# Grammar action around a global's type.  #4035: the parsed `*TypeRef` answers
+# every fact global_var_new needs, including a `fn(..) -> T`'s signature, so
+# there is nothing to latch between the type and the initializer.
+pub fn capture_global_fn_sig(p: *Parser, tr: *TypeRef) -> *TypeRef
+    tr
 
-# Grammar action around a global's type, where fresh_fn_sig still answers.
-pub fn capture_global_fn_sig(p: *Parser, ty: i32) -> i32
-    g_global_fn_sig = null
-    if ty == TYPE_PTR or ty == TYPE_ARRAY
-        # A fn type lowers to TYPE_PTR; `[N]fn(..) -> T` latches the element's
-        # signature, as capture_var_type does for a local (#1671 / #1747).
-        g_global_fn_sig = fresh_fn_sig(p)
-    ty
-
-# Grammar signature: global_var_new(p, name, len, var_type, init_expr, line, col)
-pub fn global_var_new(p: *Parser, name_sv: StrView, var_type: i32, init_expr: *Expr, line: i32, col: i32) -> *GlobalVarDef
+# Grammar signature: global_var_new(p, name, len, tr, init_expr, line, col)
+pub fn global_var_new(p: *Parser, name_sv: StrView, tr: *TypeRef, init_expr: *Expr, line: i32, col: i32) -> *GlobalVarDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    array_lit_length_decl(p, var_type, init_expr)   # AGAST #3383 (LARB R42)
+    let var_type: i32 = tr_kind(tr)
+    array_lit_length_decl(p, tr, init_expr)   # AGAST #3383 (LARB R42)
     # AGAST #190: bumped from 64 → 96 to fit the array_* fields below.
     # Without the extra slack, parser_alloc handed back 64 bytes and the
     # `array_*` writes scribbled past the end of the allocation into the
@@ -1906,14 +1896,14 @@ pub fn global_var_new(p: *Parser, name_sv: StrView, var_type: i32, init_expr: *E
     g.var_type = var_type
     # AGAST #4324: `var g: fn(..) -> T` keeps the signature capture_global_fn_sig
     # latched; every other type has none.
+    let f: *TypeFacts = type_facts(p, tr)
     g.fn_sig = null
     if var_type == TYPE_PTR or var_type == TYPE_ARRAY
-        g.fn_sig = g_global_fn_sig
-    g_global_fn_sig = null
-    # For struct types, get the type name from parser state (set by parse_type_spec)
+        g.fn_sig = f.fn_sig
+    # For struct types, the TypeRef carries the name.
     if var_type == TYPE_STRUCT
-        g.type_name = p.last_type_name
-        g.type_name_len = p.last_type_name_len
+        g.type_name = f.type_name
+        g.type_name_len = f.type_name_len
     else
         g.type_name = null
         g.type_name_len = 0
@@ -1921,23 +1911,23 @@ pub fn global_var_new(p: *Parser, name_sv: StrView, var_type: i32, init_expr: *E
     # scale pointer arithmetic and pick the right load/store width at use
     # sites (TYPE_I32 → load i32 + add stride 4, etc.).
     if var_type == TYPE_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF
-        g.pointee_type = p.last_pointee_type
+        g.pointee_type = f.pointee_type
     else
         g.pointee_type = TYPE_I64
-    g.inner_pointee_type = ptr_ptr_inner_pointee(p, var_type)
-    g.inner_ref = inner_ref_of(p, var_type)   # AGAST #2399
-    g.ptr_array = ptr_array_of_last(p, var_type)   # AGAST #2329
+    g.inner_pointee_type = tr_ptr_ptr_inner_pointee(tr)
+    g.inner_ref = f.inner_ref   # AGAST #2399
+    g.ptr_array = ptr_array_of_type(p, tr)   # AGAST #2329
     # AGAST #190: capture array dimensions for `var g: [N]T` so the global
     # gets emitted as `[N x %T] zeroinitializer` and indexing GEPs can
     # synthesise the right stride.  Mirrors what var_decl does for locals
     # via stmt.var_array_size / var_array_elem_type.
     if var_type == TYPE_ARRAY
-        g.array_size = p.last_array_size
-        g.array_elem_type = p.last_array_elem_type
-        g.array_elem_pointee = p.last_array_elem_pointee
-        g.array_elem_type_name = p.last_array_elem_type_name
-        g.array_elem_type_name_len = p.last_array_elem_type_name_len
-        g.array_shape = p.last_array_shape  # AGAST #1509
+        g.array_size = f.array_size
+        g.array_elem_type = f.array_elem_type
+        g.array_elem_pointee = f.array_elem_pointee
+        g.array_elem_type_name = f.array_elem_type_name
+        g.array_elem_type_name_len = f.array_elem_type_name_len
+        g.array_shape = f.array_shape  # AGAST #1509
     else
         g.array_shape = null
         g.array_size = 0
@@ -1947,26 +1937,26 @@ pub fn global_var_new(p: *Parser, name_sv: StrView, var_type: i32, init_expr: *E
     # AGAST #1908: the St of `var g: *St` (struct size 120, within the 128),
     # and #2374: of `var g: @St`, which a method on `g` needs to be judged.
     if (var_type == TYPE_PTR or var_type == TYPE_REF or var_type == TYPE_MUT_REF) and g.pointee_type == TYPE_STRUCT
-        g.pointee_type_name = p.last_type_name
-        g.pointee_type_name_len = p.last_type_name_len
+        g.pointee_type_name = f.type_name
+        g.pointee_type_name_len = f.type_name_len
     else if var_type == TYPE_PTR_PTR and ptr_ptr_slot_inner(g.inner_pointee_type) == TYPE_STRUCT
         # AGAST #1944: and the S of `var g: **S` (any depth), so `*g + 1`
         # strides sizeof(S) as it does for a `**S` param or local.
-        g.pointee_type_name = p.last_type_name
-        g.pointee_type_name_len = p.last_type_name_len
+        g.pointee_type_name = f.type_name
+        g.pointee_type_name_len = f.type_name_len
     else
         g.pointee_type_name = null
         g.pointee_type_name_len = 0
     # AGAST #2399: `var g: @*S` is the `**S` it is at runtime, as a field is
     # (lower_ref_fields).  It was recorded as an `@S`, `*S`'s pointee taken for
     # its own: `g = @q` was refused and `g.f` "unhandled EXPR_MEMBER".
-    let ref_slot: i32 = ref_field_ptr_ptr_slot(p, var_type)
+    let ref_slot: i32 = ref_field_ptr_ptr_slot(p, tr)
     if ref_slot != TYPE_VOID
         g.var_type = TYPE_PTR_PTR
         g.pointee_type = TYPE_I64
         g.inner_pointee_type = ref_slot
-        g.pointee_type_name = p.last_type_name
-        g.pointee_type_name_len = p.last_type_name_len
+        g.pointee_type_name = f.type_name
+        g.pointee_type_name_len = f.type_name_len
     g.init_expr = init_expr
     g.src_file = parse_file_copy(p)
     g.line = line
@@ -1992,10 +1982,10 @@ pub fn global_pointee_struct(g: *GlobalVarDef, out_len: *i32) -> *u8
 
 # `extern var NAME: T` (LANGUAGE_SPEC §5.3, AGAST #1879): a global with no
 # definition here.  emit_global_vars declares it `external global`.
-pub fn extern_var_new(p: *Parser, name_sv: StrView, var_type: i32, line: i32, col: i32) -> *GlobalVarDef
+pub fn extern_var_new(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32) -> *GlobalVarDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let g: *GlobalVarDef = global_var_new(p, StrView { ptr: (name), len: (len) as i64 }, var_type, 0 as *Expr, line, col) as *GlobalVarDef
+    let g: *GlobalVarDef = global_var_new(p, StrView { ptr: (name), len: (len) as i64 }, tr, 0 as *Expr, line, col) as *GlobalVarDef
     g.is_extern = 1
     g
 
@@ -2007,7 +1997,7 @@ pub fn extern_var_init_refused(p: *Parser, name_sv: StrView, line: i32, col: i32
     if p.skip_item == 0
         diag_error_name(g_parse_file, diag_span(line, col), c"extern var cannot have an initializer: '", StrView { ptr: (name), len: (len) as i64 }, c"' is defined in another object")
         g_attr_errors = g_attr_errors + 1
-    extern_var_new(p, StrView { ptr: (name), len: (len) as i64 }, TYPE_I64, line, col)
+    extern_var_new(p, StrView { ptr: (name), len: (len) as i64 }, type_prim(p, TYPE_I64), line, col)
 
 # The type a declaration would spell for an untyped global's initializer, as
 # ritz0 names it in "a global needs a type" (#3375), or "T" when the parser
@@ -2051,7 +2041,7 @@ pub fn global_var_untyped_refused(p: *Parser, name_sv: StrView, init_expr: *Expr
         eprints_cstr(untyped_global_shown(init_expr))
         eprints_cstr(c" = ...`\n")
         g_attr_errors = g_attr_errors + 1
-    global_var_new(p, StrView { ptr: (name), len: (len) as i64 }, TYPE_I64, 0 as *Expr, line, col)
+    global_var_new(p, StrView { ptr: (name), len: (len) as i64 }, type_prim(p, TYPE_I64), 0 as *Expr, line, col)
 
 # Copy of the current parse file's path in the parser arena, or null.
 # g_parse_file itself is borrowed: for an import it points into a String the
@@ -2106,72 +2096,31 @@ pub fn fn_pub(f: *FnDef) -> *FnDef
         f.is_pub = 1
     f
 
-pub fn fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
+# Set a FnDef's return type and the name a caller can narrow it by, from the
+# parsed `*TypeRef` (#4035).  `-> void` (a TYPE_STRUCT named `void`) becomes
+# TYPE_VOID: `define %void @...` + `ret void zeroinitializer` is not valid IR.
+fn set_fn_return(f: *FnDef, p: *Parser, ret: *TypeRef)
+    f.return_type = tr_kind(ret)
+    ret_name_of_type(p, ret, @f.return_type_name, @f.return_type_name_len)
+    let rt: *u8 = f.return_type_name
+    if f.return_type == TYPE_STRUCT and f.return_type_name_len == 4 and rt != null and *rt == 118 and *(rt + 1) == 111 and *(rt + 2) == 105 and *(rt + 3) == 100
+        f.return_type = TYPE_VOID
+        f.return_type_name = null
+        f.return_type_name_len = 0
+
+pub fn fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: *TypeRef, body: *Stmt, line: i32, col: i32) -> *FnDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
-    f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
-    f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
-    f.ret_array = fn_ret_array(ret)     # AGAST #2343
-    f.ret_ptr_array = fn_ret_ptr_array(ret)   # AGAST #2329
-    f.ret_array_param = fn_ret_array_param(ret)   # AGAST #2302
     f.name = name as *u8
     f.name_len = len
     f.params = params
-    # ret == 0 means TYPE_VOID (no return type specified)
-    f.return_type = ret
-    # If return type is a struct, copy the type name from parser state
-    # Use fn_return_type_name if available (set after parsing return type but before parsing body)
-    # Otherwise fall back to last_type_name
-    #
-    # AGAST #175: also propagate name for TYPE_PTR/TYPE_REF returns (e.g.
-    # `-> *IoUringCqe`).  capture_fn_return_type now records the pointee
-    # struct name in fn_return_type_name when ret is a pointer/ref kind, so
-    # downstream var-decl narrowing can see the pointee type.
-    if ret == TYPE_STRUCT
-        var rt_name: *u8 = null
-        var rt_len: i32 = 0
-        if p.fn_return_type_name != null
-            rt_name = p.fn_return_type_name as *u8
-            rt_len = p.fn_return_type_name_len
-        else
-            rt_name = p.last_type_name as *u8
-            rt_len = p.last_type_name_len
-        # Normalize `-> void` (parsed as TYPE_STRUCT name="void") down to
-        # TYPE_VOID so downstream emitter paths see a real void return.
-        # Without this, `pub fn aes128_decrypt_block_ni(...) -> void`
-        # emits `define %void @...` and `ret void zeroinitializer`,
-        # both of which clang rejects.
-        if rt_len == 4 and rt_name != null and *rt_name == 118 and *(rt_name + 1) == 111 and *(rt_name + 2) == 105 and *(rt_name + 3) == 100
-            f.return_type = TYPE_VOID
-            f.return_type_name = null
-            f.return_type_name_len = 0
-        else
-            f.return_type_name = rt_name
-            f.return_type_name_len = rt_len
-    else if ret == TYPE_PTR
-        # `-> *Struct` — pull the pointee struct name from fn_return_type_name
-        # (saved by capture_fn_return_type before the body parses) so
-        # call-site var-decl narrowing (`let x = make_struct_ptr()`) can
-        # resolve `x.field`.  Without this, return_type_name stays null
-        # and downstream member accesses fail with "; ERROR: unhandled
-        # EXPR_MEMBER".
-        if p.fn_return_type_name != null and p.fn_return_type_name_len > 0
-            f.return_type_name = p.fn_return_type_name as *u8
-            f.return_type_name_len = p.fn_return_type_name_len
-        else
-            f.return_type_name = p.last_type_name as *u8
-            f.return_type_name_len = p.last_type_name_len
-    else if ret == TYPE_PTR or ret == TYPE_PTR_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
-        if p.fn_return_type_name != null and p.fn_return_type_name_len > 0
-            f.return_type_name = p.fn_return_type_name as *u8
-            f.return_type_name_len = p.fn_return_type_name_len
-        else
-            f.return_type_name = null
-            f.return_type_name_len = 0
-    else
-        f.return_type_name = null
-        f.return_type_name_len = 0
+    f.ret_fn_sig = fn_ret_fn_sig(ret)               # AGAST #2120
+    f.ret_ref = fn_ret_ref(p, ret)                  # AGAST #2308
+    f.ret_array = fn_ret_array(p, ret)              # AGAST #2343
+    f.ret_ptr_array = fn_ret_ptr_array(p, ret)      # AGAST #2329
+    f.ret_array_param = fn_ret_array_param(p, ret)  # AGAST #2302
+    set_fn_return(f, p, ret)
     f.body = body
     f.line = line
     f.next = null
@@ -2187,66 +2136,30 @@ pub fn fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: i32, body: 
     return f
 
 # Extern function declaration (no body) - forward declaration
-pub fn extern_fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: i32, line: i32, col: i32) -> *FnDef
+pub fn extern_fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: *TypeRef, line: i32, col: i32) -> *FnDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
-    f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
-    f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
-    f.ret_array = fn_ret_array(ret)     # AGAST #2343
-    f.ret_ptr_array = fn_ret_ptr_array(ret)   # AGAST #2329
-    f.ret_array_param = fn_ret_array_param(ret)   # AGAST #2302
     f.name = name as *u8
     f.name_len = len
     f.params = params
-    # ret == 0 means TYPE_VOID (no return type specified)
-    f.return_type = ret
-    if ret == TYPE_STRUCT
-        var rt_name: *u8 = null
-        var rt_len: i32 = 0
-        if p.fn_return_type_name != null
-            rt_name = p.fn_return_type_name as *u8
-            rt_len = p.fn_return_type_name_len
-        else
-            rt_name = p.last_type_name as *u8
-            rt_len = p.last_type_name_len
-        # Normalize `-> void` to TYPE_VOID — see fn_def_new for rationale.
-        if rt_len == 4 and rt_name != null and *rt_name == 118 and *(rt_name + 1) == 111 and *(rt_name + 2) == 105 and *(rt_name + 3) == 100
-            f.return_type = TYPE_VOID
-            f.return_type_name = null
-            f.return_type_name_len = 0
-        else
-            f.return_type_name = rt_name
-            f.return_type_name_len = rt_len
-    else if ret == TYPE_PTR
-        # `-> *Struct` — same rationale as fn_def_new.
-        if p.fn_return_type_name != null and p.fn_return_type_name_len > 0
-            f.return_type_name = p.fn_return_type_name as *u8
-            f.return_type_name_len = p.fn_return_type_name_len
-        else
-            f.return_type_name = p.last_type_name as *u8
-            f.return_type_name_len = p.last_type_name_len
-    else if ret == TYPE_PTR or ret == TYPE_PTR_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
-        if p.fn_return_type_name != null and p.fn_return_type_name_len > 0
-            f.return_type_name = p.fn_return_type_name as *u8
-            f.return_type_name_len = p.fn_return_type_name_len
-        else
-            f.return_type_name = null
-            f.return_type_name_len = 0
-    else
-        f.return_type_name = null
-        f.return_type_name_len = 0
+    f.ret_fn_sig = fn_ret_fn_sig(ret)               # AGAST #2120
+    f.ret_ref = fn_ret_ref(p, ret)                  # AGAST #2308
+    f.ret_array = fn_ret_array(p, ret)              # AGAST #2343
+    f.ret_ptr_array = fn_ret_ptr_array(p, ret)      # AGAST #2329
+    f.ret_array_param = fn_ret_array_param(p, ret)  # AGAST #2302
+    set_fn_return(f, p, ret)
     f.body = null  # No body for extern functions
     f.line = line
     f.next = null
     f.type_params = null  # Non-generic function (field at end to preserve layout)
-    f.is_local = 0  # AGAST #194: extern decls always emit as `declare`; flag is unused
-    f.def_file = null  # AGAST #2148: item_dispatch_fn sets these three
+    f.is_local = 0
+    f.def_file = null
     f.target_gated = 0
     f.from_generated = 0
-    f.is_pub = 0   # AGAST #3419: fn_pub sets it for a `pub fn`
+    f.is_pub = 0
     f.col = col
-    f.extern_decl = 0   # AGAST #3419: decl_fn_def_new sets it
+    f.extern_decl = 0
     tn_claim(p, f.type_params, f)   # AGAST #4021
     return f
 
@@ -2254,68 +2167,75 @@ pub fn extern_fn_def_new(p: *Parser, name_sv: StrView, params: *Param, ret: i32,
 # Parameter helpers
 # =============================================================================
 
-# AGAST #2139: 1 when last_type_name belongs to the just-parsed param type
-# `ty`: a struct, or a pointer / reference whose (innermost) pointee is one.
-# `*[N]S` / `@[N]S` keep S, and `name:& *S` (a TYPE_MUT_REF to a TYPE_PTR,
-# #2075) keeps S, as before.
-fn param_type_names_pointee(p: *Parser, ty: i32) -> i32
-    if ty == TYPE_STRUCT
+# AGAST #2139: 1 when the just-parsed param type `tr` names a struct: a struct,
+# or a pointer / reference whose (innermost) pointee is one.  `*[N]S` /
+# `@[N]S` keep S, and `name:& *S` (a TYPE_MUT_REF to a TYPE_PTR, #2075) keeps
+# S, as before.
+fn param_type_names_pointee(p: *Parser, tr: *TypeRef) -> i32
+    if tr == null
+        return 0
+    if tr.kind == TYPE_STRUCT
         return 1
-    if ty == TYPE_PTR
-        # AGAST #2145: a `fn(...) -> T` type is a TYPE_PTR too, but type_fn
-        # sets no pointee, so last_pointee_type / last_type_name are left
-        # from whatever came before (an earlier `*S` param, or the fn type's
-        # own `*S` param).  Copying them made `f.w` GEP into S.
-        if fresh_fn_sig(p) != null
+    if tr.kind == TYPE_PTR
+        # AGAST #2145: a `fn(...) -> T` type is a TYPE_PTR too but names no
+        # pointee; copying one made `f.w` GEP into an earlier param's S.
+        if tr.fn_sig != null
             return 0
-        if p.last_pointee_type == TYPE_STRUCT
+        let po: *TypeRef = tr.pointee
+        if po == null
+            return 0
+        if po.kind == TYPE_STRUCT
             return 1
-        if p.last_pointee_type == TYPE_ARRAY and p.last_array_elem_type == TYPE_STRUCT
+        if po.kind == TYPE_ARRAY and po.elem != null
+            if po.elem.kind == TYPE_STRUCT
+                return 1
+            # AGAST #2343: `*[N]*S`, as a by-value `[N]*S` is named.
+            if po.elem.kind == TYPE_PTR and tr_pointee_kind(po.elem) == TYPE_STRUCT
+                return 1
+        return 0
+    if tr.kind == TYPE_PTR_PTR
+        if ptr_ptr_slot_inner(tr_ptr_ptr_inner_pointee(tr)) == TYPE_STRUCT
             return 1
-        # AGAST #2343: `*[N]*S`, as a by-value `[N]*S` is named.
-        if p.last_pointee_type == TYPE_ARRAY and p.last_array_elem_type == TYPE_PTR and p.last_array_elem_pointee == TYPE_STRUCT
+        let arr: *TypeRef = tr_ptr_array(tr)
+        if arr != null and arr.elem != null and arr.elem.kind == TYPE_STRUCT
+            return 1   # AGAST #2553: `**[N]S`
+        if ptr_names_array_of_struct_ptrs(p, tr) == 1   # AGAST #3074: `**[N]*S`
             return 1
         return 0
-    if ty == TYPE_PTR_PTR
-        if ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, ty)) == TYPE_STRUCT
+    if tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF
+        if tr.ref_inner == TYPE_STRUCT
             return 1
-        # AGAST #2553: `**[N]S`, as `*[N]S` is named.  It named nothing, so
-        # `(*r)[i].f` and `let p = *r; p[i].f` had no S.  The emitter keeps S
-        # off the local's type_name (name_array_ptr_param).
-        if ptr_names_array(p, ty) == 1 and p.last_array_elem_type == TYPE_STRUCT
-            return 1
-        if ptr_names_array_of_struct_ptrs(p, ty) == 1   # AGAST #3074: `**[N]*S`
-            return 1
-        return 0
-    if ty == TYPE_REF or ty == TYPE_MUT_REF
-        if p.last_ref_inner_type == TYPE_STRUCT
-            return 1
-        if p.last_ref_inner_type == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
+        if tr.ref_inner == TYPE_PTR and tr_pointee_kind(tr.pointee) == TYPE_STRUCT
             return 1
         # AGAST #2331: `@*[N]S` and `@&*[N]S`, as `**[N]S` (name_array_ptr_param).
-        if ptr_names_array(p, ty) == 1 and p.last_array_elem_type == TYPE_STRUCT
+        let arr: *TypeRef = tr_ptr_array(tr)
+        if arr != null and arr.elem != null and arr.elem.kind == TYPE_STRUCT
             return 1
-        if ptr_names_array_of_struct_ptrs(p, ty) == 1   # AGAST #3074: `@*[N]*S`
+        if ptr_names_array_of_struct_ptrs(p, tr) == 1   # AGAST #3074: `@*[N]*S`
             return 1
         # AGAST #2372: `@**S`, as `**S` is named above.
-        if p.last_ref_inner_type == TYPE_PTR_PTR and ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, ty)) == TYPE_STRUCT
+        if tr.ref_inner == TYPE_PTR_PTR and ptr_ptr_slot_inner(tr_ptr_ptr_inner_pointee(tr)) == TYPE_STRUCT
             return 1
-        if p.last_ref_inner_type == TYPE_ARRAY and p.last_array_elem_type == TYPE_STRUCT
-            return 1
-        if p.last_ref_inner_type == TYPE_ARRAY and p.last_array_elem_type == TYPE_PTR and p.last_array_elem_pointee == TYPE_STRUCT
-            return 1   # AGAST #2343: `@[N]*S`
+        if tr.ref_inner == TYPE_ARRAY and tr.pointee != null and tr.pointee.elem != null
+            if tr.pointee.elem.kind == TYPE_STRUCT
+                return 1
+            if tr.pointee.elem.kind == TYPE_PTR and tr_pointee_kind(tr.pointee.elem) == TYPE_STRUCT
+                return 1   # AGAST #2343: `@[N]*S`
         return 0
     return 0
 
 # AGAST #3074: 1 for `**[N]*S`, `@*[N]*S` or `@&*[N]*S`, one level out from the
 # `*[N]*S` named above.  Unnamed, `(*q)[i].f` was "unhandled EXPR_MEMBER".  The
 # emitter keeps S off the local's type_name (name_array_ptr_param).
-fn ptr_names_array_of_struct_ptrs(p: *Parser, ty: i32) -> i32
-    if ty == TYPE_PTR or ptr_names_array(p, ty) == 0
+fn ptr_names_array_of_struct_ptrs(p: *Parser, tr: *TypeRef) -> i32
+    if tr == null or tr.kind == TYPE_PTR or tr_ptr_array(tr) == null
         return 0
-    (p.last_array_elem_type == TYPE_PTR and p.last_array_elem_pointee == TYPE_STRUCT) as i32
+    let arr: *TypeRef = tr_ptr_array(tr)
+    if arr.elem == null
+        return 0
+    (arr.elem.kind == TYPE_PTR and tr_pointee_kind(arr.elem) == TYPE_STRUCT) as i32
 
-pub fn param_new(p: *Parser, name_sv: StrView, ty: i32, line: i32, col: i32) -> *Param
+pub fn param_new(p: *Parser, name_sv: StrView, ty: *TypeRef, line: i32, col: i32) -> *Param
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     # AGAST #3634: a by-value `[N][M]T` keeps its shape (param_of_type).
@@ -2325,49 +2245,50 @@ pub fn param_new(p: *Parser, name_sv: StrView, ty: i32, line: i32, col: i32) -> 
     param.name_span.col = col
     return param
 
-# The just-parsed type `ty` as a param declares it.  AGAST #2308: a `@T` local
+# The just-parsed type `tr` as a param declares it.  AGAST #2308: a `@T` local
 # or return type is recorded this way too, so they all know the same things.
-fn param_of_type(p: *Parser, name_sv: StrView, ty: i32) -> *Param
+fn param_of_type(p: *Parser, name_sv: StrView, ty: *TypeRef) -> *Param
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
+    let kind: i32 = tr_kind(ty)
     let param: *Param = parser_alloc(p, sizeof(Param)) as *Param
     param.name = name as *u8
     param.name_span.line = 0
     param.name_span.col = 0
     param.name_len = len
-    param.param_type = ty
-    # Copy the struct type name from parser state for a struct, or a pointer
-    # / reference whose pointee is a named type.  AGAST #2139: only then: a
-    # primitive (`*u8`) never resets last_type_name, so it still names the
-    # last named type parsed (an earlier `*Res` param, a `s: St` field).
+    param.param_type = kind
+    # Copy the struct type name for a struct, or a pointer / reference whose
+    # pointee is a named type.  AGAST #2139: only then.
+    var nm_len: i32 = 0
     if param_type_names_pointee(p, ty) == 1
-        param.param_type_name = p.last_type_name as *u8
-        param.param_type_name_len = p.last_type_name_len
-    else if ty == TYPE_ARRAY
-        param.param_type_name = p.last_array_elem_type_name as *u8
-        param.param_type_name_len = p.last_array_elem_type_name_len
+        param.param_type_name = tr_name(ty, @nm_len)
+        param.param_type_name_len = nm_len
+    else if kind == TYPE_ARRAY
+        param.param_type_name = tr_elem_name(ty, @nm_len)
+        param.param_type_name_len = nm_len
     else
         param.param_type_name = null
         param.param_type_name_len = 0
-    # Copy pointee/inner type from parser state if this is a pointer or reference type
-    if ty == TYPE_PTR or ty == TYPE_PTR_PTR
-        param.param_pointee_type = p.last_pointee_type
-    else if ty == TYPE_REF or ty == TYPE_MUT_REF
-        param.param_pointee_type = p.last_ref_inner_type
+    # Copy pointee/inner type if this is a pointer or reference type.
+    if kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        param.param_pointee_type = tr_pointee_kind(ty)
+    else if kind == TYPE_REF or kind == TYPE_MUT_REF
+        param.param_pointee_type = tr_ref_inner(ty)
     else
         param.param_pointee_type = TYPE_I64  # Default
-    param.param_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
-    param.param_inner_ref = inner_ref_of(p, ty)   # AGAST #2399
+    param.param_inner_pointee_type = tr_ptr_ptr_inner_pointee(ty)
+    param.param_inner_ref = tr_inner_ref(ty)   # AGAST #2399
     param.param_pointee_array_size = ptr_array_pointee_size(p, ty)
     param.param_pointee_array_elem_type = ptr_array_pointee_elem(p, ty)
     param.param_pointee_array_elem_pointee = ptr_array_elem_pointee(p, ty)
     # AGAST #2279, #2287: `@[N]T` and `@&[N]T` keep N and T, as `*[N]T` does.
     param.param_pointee_array_shape = null
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_ARRAY
-        param.param_pointee_array_size = p.last_array_size
-        param.param_pointee_array_elem_type = p.last_array_elem_type
-        param.param_pointee_array_elem_pointee = p.last_array_elem_pointee
-        param.param_pointee_array_shape = p.last_array_shape
+    if (kind == TYPE_REF or kind == TYPE_MUT_REF) and tr_ref_inner(ty) == TYPE_ARRAY and ty.pointee != null
+        let arr: *TypeRef = ty.pointee
+        param.param_pointee_array_size = tr_count(arr) as i32
+        param.param_pointee_array_elem_type = tr_elem_kind(arr)
+        param.param_pointee_array_elem_pointee = tr_elem_pointee(arr)
+        param.param_pointee_array_shape = tr_shape(arr)
     let nd: *ArrayShape = ptr_nd_pointee_shape(p, ty)   # AGAST #2098: `*[N][M]T`
     if nd != null
         param.param_pointee_array_size = nd_shape_count(nd)
@@ -2375,58 +2296,59 @@ fn param_of_type(p: *Parser, name_sv: StrView, ty: i32) -> *Param
         param.param_pointee_array_elem_pointee = nd.leaf_pointee
         param.param_pointee_array_shape = nd
     param.param_ref_ptr_pointee = TYPE_VOID
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR
-        param.param_ref_ptr_pointee = p.last_pointee_type
+    if (kind == TYPE_REF or kind == TYPE_MUT_REF) and tr_ref_inner(ty) == TYPE_PTR
+        param.param_ref_ptr_pointee = tr_pointee_kind(ty.pointee)
     param.param_array_size = 0
     param.param_array_elem_type = TYPE_VOID
+    param.param_array_elem_pointee = TYPE_VOID
     param.param_array_shape = null
-    if ty == TYPE_ARRAY
-        param.param_array_size = p.last_array_size
-        param.param_array_elem_type = p.last_array_elem_type
-        param.param_array_elem_pointee = p.last_array_elem_pointee
-        param.param_array_shape = p.last_array_shape   # AGAST #3634: `[N][M]T`
+    if kind == TYPE_ARRAY
+        param.param_array_size = tr_count(ty) as i32
+        param.param_array_elem_type = tr_elem_kind(ty)
+        param.param_array_elem_pointee = tr_elem_pointee(ty)
+        param.param_array_shape = tr_shape(ty)   # AGAST #3634: `[N][M]T`
     param.next = null
     param.is_borrow = 0
     param.is_self_borrow = 0
     # AGAST #1671: a `fn(...) -> T` param keeps its signature.
     param.fn_sig = null
-    if ty == TYPE_PTR
-        param.fn_sig = fresh_fn_sig(p)
+    if kind == TYPE_PTR
+        param.fn_sig = tr_fn_sig(ty)
     return param
 
-# AGAST #2329: the just-parsed `ty` as a param would hold it, when it's a `*[N]T`,
-# `@[N]T` or `@&[N]T`, so a field, a global or a return type knows N and T, and
-# `x[i]` on one is element i at stride T, as on a local (#2330, LARB R9).  null
-# for any other type.
-pub fn ptr_array_of_last(p: *Parser, ty: i32) -> *Param
-    if ty == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
-        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ty)
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_ARRAY
-        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ty)
+# AGAST #2329: the just-parsed `tr` as a param would hold it, when it's a
+# `*[N]T`, `@[N]T` or `@&[N]T`, so a field, a global or a return type knows N
+# and T, and `x[i]` on one is element i at stride T, as on a local (#2330,
+# LARB R9).  null for any other type.
+pub fn ptr_array_of_type(p: *Parser, tr: *TypeRef) -> *Param
+    if tr == null
+        return null
+    if tr.kind == TYPE_PTR and tr.pointee != null and tr.pointee.kind == TYPE_ARRAY
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
+    if (tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF) and tr_ref_inner(tr) == TYPE_ARRAY
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
     # AGAST #4122: and a `**[N][M]..T`, the shape of the `*[N][M]..T` that `*x`
     # reads (plane_ptr_shape; base_ptr_array itself answers for `*` only).
-    if ty == TYPE_PTR_PTR and ptr_nd_pointee_shape(p, ty) != null
-        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ty)
+    if tr.kind == TYPE_PTR_PTR and ptr_nd_pointee_shape(p, tr) != null
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
     null
 
 # `name:& T` (AGAST #1644): a TYPE_MUT_REF param that ritz0 auto-derefs.
-pub fn param_borrow(p: *Parser, name_sv: StrView, ty: i32, line: i32, col: i32) -> *Param
+pub fn param_borrow(p: *Parser, name_sv: StrView, ty: *TypeRef, line: i32, col: i32) -> *Param
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let param: *Param = param_new(p, StrView { ptr: (name), len: (len) as i64 }, ty, line, col)
     param.is_borrow = 1
     # AGAST #2075: for `name:& *T` keep T (the borrowed pointer's own
-    # pointee; type_ptr left it in last_pointee_type, and a struct T's name
-    # in last_type_name, which param_new already copied).  The emitter binds
-    # the borrow as a plain `*T` local, as ritz0 does (see
-    # bind_scalar_borrow_param).  Only a borrow uses the field this way:
-    # param_new leaves it TYPE_VOID for every other `@&*T`.
-    if ty == TYPE_MUT_REF and p.last_ref_inner_type == TYPE_PTR
-        param.param_inner_pointee_type = p.last_pointee_type
+    # pointee).  The emitter binds the borrow as a plain `*T` local, as ritz0
+    # does (see bind_scalar_borrow_param).  Only a borrow uses the field this
+    # way: param_new leaves it TYPE_VOID for every other `@&*T`.
+    if ty != null and ty.kind == TYPE_MUT_REF and tr_ref_inner(ty) == TYPE_PTR
+        param.param_inner_pointee_type = tr_pointee_kind(ty.pointee)
     return param
 
 # `self:& T` (AGAST #2286): see Param.is_self_borrow.
-pub fn param_self_borrow(p: *Parser, name_sv: StrView, ty: i32, line: i32, col: i32) -> *Param
+pub fn param_self_borrow(p: *Parser, name_sv: StrView, ty: *TypeRef, line: i32, col: i32) -> *Param
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     let param: *Param = param_new(p, StrView { ptr: (name), len: (len) as i64 }, ty, line, col)
@@ -2445,10 +2367,8 @@ pub fn param_link(first: *Param, rest: *Param) -> *Param
 pub fn param_self(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *Param
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    # Clear any "last type name" left by an earlier type_spec.
-    p.last_type_name = null
-    p.last_type_name_len = 0
-    return param_new(p, StrView { ptr: (name), len: (len) as i64 }, TYPE_STRUCT, line, col)
+    # A nameless TYPE_STRUCT: any earlier type name is not this one's.
+    return param_new(p, StrView { ptr: (name), len: (len) as i64 }, typeref_new(p, TYPE_STRUCT), line, col)
 
 # Bare `self:&`: the caller's place, where a bare `self` is a copy (AGAST #2393).
 pub fn param_self_lent(p: *Parser, name_sv: StrView, line: i32, col: i32) -> *Param
@@ -2530,146 +2450,119 @@ pub fn struct_def_new(p: *Parser, name_sv: StrView, fields: *StructField, line: 
 
 # AGAST #2399: the inner pointee slot of the `**S` (or deeper) that a just-parsed
 # reference field to a pointer to a struct is at runtime; TYPE_VOID for any other.
-fn ref_field_ptr_ptr_slot(p: *Parser, ty: i32) -> i32
+fn ref_field_ptr_ptr_slot(p: *Parser, tr: *TypeRef) -> i32
+    let ty: i32 = tr_kind(tr)
     if ty != TYPE_REF and ty != TYPE_MUT_REF
         return TYPE_VOID
-    if p.last_ref_inner_type == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
+    let rf: i32 = tr_ref_inner(tr)
+    if rf == TYPE_PTR and tr_pointee_kind(tr.pointee) == TYPE_STRUCT
         return TYPE_STRUCT
-    if p.last_ref_inner_type != TYPE_PTR_PTR
+    if rf != TYPE_PTR_PTR
         return TYPE_VOID
-    let slot: i32 = ptr_ptr_inner_pointee(p, ty)
+    let slot: i32 = tr_ptr_ptr_inner_pointee(tr)
     if ptr_ptr_slot_inner(slot) != TYPE_STRUCT
         return TYPE_VOID
     if slot < PTR_DEPTH_UNIT
         return TYPE_STRUCT + PTR_DEPTH_UNIT
     slot + PTR_DEPTH_UNIT
 
-pub fn field_new(p: *Parser, name_sv: StrView, ty: i32, line: i32, col: i32) -> *StructField
+pub fn field_new(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32) -> *StructField
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
+    let facts: *TypeFacts = type_facts(p, tr)
+    let ty: i32 = facts.kind
     let f: *StructField = parser_alloc(p, sizeof(StructField)) as *StructField
     f.field_mut_ref = 0
     f.field_shared_ref = 0
-    # AGAST #2097: an N-D field keeps its shape (it was a located error
-    # under #1509, and a silent `[N x i64]` before that).
+    # AGAST #2097: an N-D field keeps its shape.
     f.array_shape = null
-    if is_nd_array_type(p, ty) == 1
-        f.array_shape = p.last_array_shape
+    if is_nd_array_type(p, tr) == 1
+        f.array_shape = facts.array_shape
     f.name = name as *u8
     # AGAST #1924: `rows: **i32` -> `*(*(s.rows + i) + k)` loads an i32.
-    f.inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
-    f.field_inner_ref = inner_ref_of(p, ty)   # AGAST #2399
+    # The slot (AGAST #1815 / #2372): a `@S` field records none, as the flat
+    # parse left it, so lowered_field_type still makes it a `*S`.
+    f.inner_pointee_type = tr_ptr_ptr_inner_pointee(tr)
+    f.field_inner_ref = facts.inner_ref   # AGAST #2399
     f.name_len = len
     f.field_type = ty
     f.ptr_pointee = TYPE_VOID
     if ty == TYPE_PTR
-        f.ptr_pointee = p.last_pointee_type
-    f.ptr_array = ptr_array_of_last(p, ty)   # AGAST #2329
+        f.ptr_pointee = facts.pointee_type
+    f.ptr_array = ptr_array_of_type(p, tr)   # AGAST #2329
     # AGAST #2120: `f: EfiFn` keeps the signature, so `(t.f)(..)` calls typed.
-    # The action runs after the field's NEWLINE, one token past the type.
     f.fn_sig = null
-    if ty == TYPE_PTR and p.last_fn_sig != null and p.last_fn_sig_pos == p.pos - 1
-        f.fn_sig = p.last_fn_sig
+    if ty == TYPE_PTR
+        f.fn_sig = facts.fn_sig
     # AGAST #3666: `fs: [N]fn(..) -> T` ends with its element's fn type too.
     f.elem_fn_sig = null
-    if ty == TYPE_ARRAY and p.last_fn_sig != null and p.last_fn_sig_pos == p.pos - 1
-        f.elem_fn_sig = p.last_fn_sig
-    # Copy struct type name if this is a struct-typed field OR a pointer-to-struct field
-    # For *StructName, last_type_name is preserved from inner type parsing.
-    # For *u8/*i32/etc. we must NOT inherit a stale last_type_name from a
-    # previous sibling field — otherwise get_ptr_elem_size treats *u8 as
-    # *SomeStruct and scales pointer arithmetic by that struct's size,
-    # producing e.g. `mul i64 pos, 16` for `lex.src + pos` where src is *u8.
+    if ty == TYPE_ARRAY
+        f.elem_fn_sig = facts.fn_sig
+    # Copy struct type name if this is a struct-typed field OR a pointer-to-struct
+    # field.  It comes from the chain, never from a sibling field.
     if ty == TYPE_STRUCT
-        f.field_type_name = p.last_type_name as *u8
-        f.field_type_name_len = p.last_type_name_len
+        f.field_type_name = facts.type_name
+        f.field_type_name_len = facts.type_name_len
     else if ty == TYPE_PTR
-        # Only inherit the name if the pointee is a struct — primitives
-        # (u8/i32/i64) must have field_type_name_len = 0.
-        if p.last_pointee_type == TYPE_STRUCT
-            f.field_type_name = p.last_type_name as *u8
-            f.field_type_name_len = p.last_type_name_len
+        if facts.pointee_type == TYPE_STRUCT
+            f.field_type_name = facts.type_name
+            f.field_type_name_len = facts.type_name_len
         else
             f.field_type_name = null
             f.field_type_name_len = 0
     else if ty == TYPE_PTR_PTR
-        # AGAST #184: **Foo / **u8 distinction via last_inner_pointee_type
-        # (set by type_ptr's innermost call).  Only inherit last_type_name
-        # when the innermost pointee is a named struct — otherwise we'd
-        # inherit a stale name from a previous sibling field and
-        # downstream find_struct calls would mis-resolve.
-        if p.last_inner_pointee_type == TYPE_STRUCT
-            f.field_type_name = p.last_type_name as *u8
-            f.field_type_name_len = p.last_type_name_len
+        if facts.inner_pointee_type == TYPE_STRUCT
+            f.field_type_name = facts.type_name
+            f.field_type_name_len = facts.type_name_len
         else
             f.field_type_name = null
             f.field_type_name_len = 0
     else if ty == TYPE_REF or ty == TYPE_MUT_REF
-        # Refs store the inner type in last_ref_inner_type.
-        if p.last_ref_inner_type == TYPE_STRUCT
-            f.field_type_name = p.last_type_name as *u8
-            f.field_type_name_len = p.last_type_name_len
-        else if ref_field_ptr_ptr_slot(p, ty) != TYPE_VOID
-            # AGAST #2399: `@*S`, `@&*S`, `@**S`: lower_ref_fields makes it the
-            # `**S` / `***S` it is at runtime, so `.` goes through each level.
-            f.field_type_name = p.last_type_name as *u8
-            f.field_type_name_len = p.last_type_name_len
-            f.inner_pointee_type = ref_field_ptr_ptr_slot(p, ty)
+        if facts.ref_inner_type == TYPE_STRUCT
+            f.field_type_name = facts.type_name
+            f.field_type_name_len = facts.type_name_len
+        else if ref_field_ptr_ptr_slot(p, tr) != TYPE_VOID
+            f.field_type_name = facts.type_name
+            f.field_type_name_len = facts.type_name_len
+            f.inner_pointee_type = ref_field_ptr_ptr_slot(p, tr)
         else
             f.field_type_name = null
             f.field_type_name_len = 0
     else
         f.field_type_name = null
         f.field_type_name_len = 0
-    # Copy array info from parser state if this is an array type
+    # Copy array info if this is an array type.
     if ty == TYPE_ARRAY
-        f.array_size = p.last_array_size
-        f.array_elem_type = p.last_array_elem_type
-        f.array_elem_pointee = p.last_array_elem_pointee
-        f.array_elem_type_name = p.last_array_elem_type_name
-        f.array_elem_type_name_len = p.last_array_elem_type_name_len
+        f.array_size = facts.array_size
+        f.array_elem_type = facts.array_elem_type
+        f.array_elem_pointee = facts.array_elem_pointee
+        f.array_elem_type_name = facts.array_elem_type_name
+        f.array_elem_type_name_len = facts.array_elem_type_name_len
     else
         f.array_size = 0
         f.array_elem_type = 0
         f.array_elem_type_name = null
         f.array_elem_type_name_len = 0
         # AGAST #1304: record the pointee of a primitive pointer field.
-        # `array_elem_type` is the established slot for this — see
-        # make_ptr_prim_field, which populates it for compiler-builtin
-        # structs (Vec$T.data, Nfa.state_trans_offset).  User-declared
-        # fields were never given one, so get_member_pointee_type fell
-        # through to its `assume u8` default and `*ring.sq_tail` (a *i32)
-        # emitted `load i8`, and get_ptr_elem_size scaled `field + i` by 1
-        # instead of 4.  Struct pointer fields now carry the same pointee
-        # info that local pointer vars do via LocalVar.pointee_type.
-        # Struct pointees keep using field_type_name (set above); only
-        # primitives are recorded here.
-        if ty == TYPE_PTR and p.last_pointee_type != TYPE_STRUCT
-            f.array_elem_type = p.last_pointee_type
-        # AGAST #2050: a ref to a primitive (`p: @i32`, `@&u8`, `p:& f64`)
-        # records its pointee the same way, so lower_ref_fields
-        # (emitter.ritz) can rewrite it to a `*T` field.  Exactly the
-        # primitive pointees ptr_field_elem_kind (emitter_core.ritz)
-        # handles: integers, and f32/f64/bool since #2053.  Refs to
-        # slices/pointers/arrays record nothing and stay on the fail-closed
-        # ref path.
+        if ty == TYPE_PTR and facts.pointee_type != TYPE_STRUCT
+            f.array_elem_type = facts.pointee_type
+        # AGAST #2050: a ref to a primitive records its pointee the same way.
         if ty == TYPE_REF or ty == TYPE_MUT_REF
             f.field_mut_ref = (ty == TYPE_MUT_REF) as i32
             f.field_shared_ref = (ty == TYPE_REF) as i32
-            let rt: i32 = p.last_ref_inner_type
+            let rt: i32 = facts.ref_inner_type
             if ty_int_in(rt, 8, 16) == 1
                 f.array_elem_type = rt
             else if ty_int_in(rt, 32, 64) == 1
                 f.array_elem_type = rt
             else if rt == TYPE_F32 or rt == TYPE_F64 or rt == TYPE_BOOL
                 f.array_elem_type = rt
-    # AGAST #3151: `r: @&*U` keeps U, so ref_check judges the `*U` it's given,
-    # and a scalar U names the `**U` slot lower_ref_fields makes it.
+    # AGAST #3151: `r: @&*U` keeps U.
     f.field_ref_ptr_pointee = TYPE_VOID
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR
-        f.field_ref_ptr_pointee = p.last_pointee_type
+    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and facts.ref_inner_type == TYPE_PTR
+        f.field_ref_ptr_pointee = facts.pointee_type
         if ref_field_scalar_pointee(f) == 1
-            f.inner_pointee_type = p.last_pointee_type
+            f.inner_pointee_type = facts.pointee_type
     f.next = null
     return f
 
@@ -2733,67 +2626,31 @@ pub fn type_param_link(first: *TypeParam, rest: *TypeParam) -> *TypeParam
     return first
 
 # Generic function definition (with type parameters)
-pub fn generic_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, params: *Param, ret: i32, body: *Stmt, line: i32, col: i32) -> *FnDef
+pub fn generic_fn_def_new(p: *Parser, name_sv: StrView, type_params: *TypeParam, params: *Param, ret: *TypeRef, body: *Stmt, line: i32, col: i32) -> *FnDef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     g_pass_bound = 0   # AGAST #3320: this fn's `pass` bindings end with it
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
-    f.ret_fn_sig = fn_ret_fn_sig(ret)   # AGAST #2120
-    f.ret_ref = fn_ret_ref(ret)         # AGAST #2308
-    f.ret_array = fn_ret_array(ret)     # AGAST #2343
-    f.ret_ptr_array = fn_ret_ptr_array(ret)   # AGAST #2329
-    f.ret_array_param = fn_ret_array_param(ret)   # AGAST #2302
     f.name = name as *u8
     f.name_len = len
     f.params = params
-    # ret == 0 means TYPE_VOID (no return type specified)
-    f.return_type = ret
-    if ret == TYPE_STRUCT
-        var rt_name: *u8 = null
-        var rt_len: i32 = 0
-        if p.fn_return_type_name != null
-            rt_name = p.fn_return_type_name as *u8
-            rt_len = p.fn_return_type_name_len
-        else
-            rt_name = p.last_type_name as *u8
-            rt_len = p.last_type_name_len
-        # Normalize `-> void` to TYPE_VOID — see fn_def_new for rationale.
-        if rt_len == 4 and rt_name != null and *rt_name == 118 and *(rt_name + 1) == 111 and *(rt_name + 2) == 105 and *(rt_name + 3) == 100
-            f.return_type = TYPE_VOID
-            f.return_type_name = null
-            f.return_type_name_len = 0
-        else
-            f.return_type_name = rt_name
-            f.return_type_name_len = rt_len
-    else if ret == TYPE_PTR
-        # `-> *Struct` — same rationale as fn_def_new.
-        if p.fn_return_type_name != null and p.fn_return_type_name_len > 0
-            f.return_type_name = p.fn_return_type_name as *u8
-            f.return_type_name_len = p.fn_return_type_name_len
-        else
-            f.return_type_name = p.last_type_name as *u8
-            f.return_type_name_len = p.last_type_name_len
-    else if ret == TYPE_PTR or ret == TYPE_PTR_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
-        if p.fn_return_type_name != null and p.fn_return_type_name_len > 0
-            f.return_type_name = p.fn_return_type_name as *u8
-            f.return_type_name_len = p.fn_return_type_name_len
-        else
-            f.return_type_name = null
-            f.return_type_name_len = 0
-    else
-        f.return_type_name = null
-        f.return_type_name_len = 0
+    f.ret_fn_sig = fn_ret_fn_sig(ret)               # AGAST #2120
+    f.ret_ref = fn_ret_ref(p, ret)                  # AGAST #2308
+    f.ret_array = fn_ret_array(p, ret)              # AGAST #2343
+    f.ret_ptr_array = fn_ret_ptr_array(p, ret)      # AGAST #2329
+    f.ret_array_param = fn_ret_array_param(p, ret)  # AGAST #2302
+    set_fn_return(f, p, ret)
     f.body = body
     f.line = line
     f.next = null
-    f.type_params = type_params  # Generic type parameters (field at end to preserve layout)
-    f.is_local = 0  # AGAST #194: generic templates are skipped in emit (type_params != null)
-    f.def_file = null  # AGAST #2148: item_dispatch_fn sets these three
+    f.type_params = type_params  # Generic type parameters
+    f.is_local = 0  # AGAST #194: generic templates are skipped in emit
+    f.def_file = null
     f.target_gated = 0
     f.from_generated = 0
-    f.is_pub = 0   # AGAST #3419: fn_pub sets it for a `pub fn`
+    f.is_pub = 0
     f.col = col
-    f.extern_decl = 0   # AGAST #3419: decl_fn_def_new sets it
+    f.extern_decl = 0
     tn_claim(p, f.type_params, f)   # AGAST #4021
     return f
 
@@ -2832,11 +2689,13 @@ pub fn field_link(first: *StructField, rest: *StructField) -> *StructField
 # Const definition helpers
 # =============================================================================
 
-pub fn const_new(p: *Parser, name_sv: StrView, ty: i32, val: *Expr, line: i32, col: i32) -> *ConstEntry
+pub fn const_new(p: *Parser, name_sv: StrView, tr: *TypeRef, val: *Expr, line: i32, col: i32) -> *ConstEntry
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    nd_array_reject(p, ty, line, col, c"a const")  # AGAST #1509
-    array_lit_length_decl(p, ty, val)   # AGAST #3383 (LARB R42)
+    let facts: *TypeFacts = type_facts(p, tr)
+    let ty: i32 = facts.kind
+    nd_array_reject(p, tr, line, col, c"a const")  # AGAST #1509
+    array_lit_length_decl(p, tr, val)   # AGAST #3383 (LARB R42)
     # Bumped from 40 → 128 to fit the extra metadata fields appended to
     # ConstEntry for non-integer constants (value_expr, array_size, etc.).
     let c: *ConstEntry = parser_alloc(p, sizeof(ConstEntry)) as *ConstEntry
@@ -2873,16 +2732,16 @@ pub fn const_new(p: *Parser, name_sv: StrView, ty: i32, val: *Expr, line: i32, c
     c.value_expr = val
     c.ptr_pointee = TYPE_VOID
     if ty == TYPE_PTR
-        c.ptr_pointee = p.last_pointee_type
+        c.ptr_pointee = facts.pointee_type
     # Capture array element info from the parser's latched state. When
     # ty != TYPE_ARRAY these are zero/null. parse_type_spec populates
-    # p.last_array_* when it consumes `[N]T`.
+    # the last_array_* side channel when it consumes `[N]T`.
     if ty == TYPE_ARRAY
-        c.array_size = p.last_array_size
-        c.array_elem_type = p.last_array_elem_type
-        c.array_elem_pointee = p.last_array_elem_pointee
-        c.array_elem_type_name = p.last_array_elem_type_name
-        c.array_elem_type_name_len = p.last_array_elem_type_name_len
+        c.array_size = facts.array_size
+        c.array_elem_type = facts.array_elem_type
+        c.array_elem_pointee = facts.array_elem_pointee
+        c.array_elem_type_name = facts.array_elem_type_name
+        c.array_elem_type_name_len = facts.array_elem_type_name_len
     else
         c.array_size = 0
         c.array_elem_type = 0
@@ -2890,12 +2749,12 @@ pub fn const_new(p: *Parser, name_sv: StrView, ty: i32, val: *Expr, line: i32, c
         c.array_elem_type_name_len = 0
     # AGAST #189 — capture the named-struct type for scalar struct consts
     # (`const FOO: StrView = "..."`).  parse_type_spec sets
-    # p.last_type_name when it consumes a struct/named type; we latch it
+    # the last_type_name side channel when it consumes a struct/named type; we latch it
     # so the emitter can lower the const as a `%StrView { ... }` global
     # and use-site loads can produce the proper aggregate.
     if ty == TYPE_STRUCT
-        c.type_name = p.last_type_name
-        c.type_name_len = p.last_type_name_len
+        c.type_name = facts.type_name
+        c.type_name_len = facts.type_name_len
     else
         c.type_name = null
         c.type_name_len = 0
@@ -3232,13 +3091,302 @@ fn word_type(name: *u8) -> i32
         return TYPE_U64
     TYPE_I64
 
-pub fn type_named(p: *Parser, name_sv: StrView) -> i32
+# =============================================================================
+# TypeRef (AGAST #4035): the parser's type, and the accessors that replace the
+# 17 `Parser.last_*` type side channels.
+# =============================================================================
+
+pub fn typeref_new(p: *Parser, kind: i32) -> *TypeRef
+    let t: *TypeRef = parser_alloc(p, sizeof(TypeRef)) as *TypeRef
+    t.kind = kind
+    t.name = null
+    t.name_len = 0
+    t.pointee = null
+    t.elem = null
+    t.count = 0
+    t.shape = null
+    t.array_rec = null
+    t.fn_sig = null
+    t.inner_ref = 0
+    t.ref_inner = TYPE_VOID
+    return t
+
+pub fn type_prim(p: *Parser, kind: i32) -> *TypeRef
+    typeref_new(p, kind)
+
+# The unit type `()`: TYPE_VOID, as the flat `0` was before #4035.
+pub fn type_void(p: *Parser) -> *TypeRef
+    typeref_new(p, TYPE_VOID)
+
+pub fn tr_kind(tr: *TypeRef) -> i32
+    if tr == null
+        return TYPE_VOID
+    tr.kind
+
+# 1 for no written type at all (a `let x = ...`), or the unit type, which the
+# flat code spelled `0` and treated alike.
+pub fn tr_is_void(tr: *TypeRef) -> i32
+    if tr == null or tr.kind == TYPE_VOID
+        return 1
+    0
+
+# The name `last_type_name` held after parsing this type: a struct's own, or
+# the deepest struct a pointer / reference / array wraps.  #4035: defined in
+# types.ritz with the other `*TypeRef` accessors; ast_helpers imports it.
+
+# `last_pointee_type`: the immediate pointee of a `*T`/`**T`, or of the
+# pointer a reference wraps (`@*T` recorded T).
+pub fn tr_pointee_kind(tr: *TypeRef) -> i32
+    if tr == null or tr.pointee == null
+        return TYPE_VOID
+    tr.pointee.kind
+
+pub fn tr_ptr_pointee_kind(tr: *TypeRef) -> i32
+    if tr == null
+        return TYPE_VOID
+    if tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF
+        return tr_pointee_kind(tr.pointee)
+    tr_pointee_kind(tr)
+
+pub fn tr_inner_ref(tr: *TypeRef) -> i32
+    if tr == null
+        return 0
+    if is_indirection_kind(tr.kind) == 0
+        return 0
+    tr.inner_ref
+
+fn is_indirection_kind(kind: i32) -> i32
+    (kind == TYPE_PTR or kind == TYPE_PTR_PTR or kind == TYPE_REF or kind == TYPE_MUT_REF) as i32
+
+# `last_ptr_depth` (`tr_depth`) lives in types.ritz with the other accessors.
+
+# `last_ref_inner_type`: the referent's flat kind of `@T` / `@&T`.
+pub fn tr_ref_inner(tr: *TypeRef) -> i32
+    if tr == null
+        return TYPE_VOID
+    if tr.kind != TYPE_REF and tr.kind != TYPE_MUT_REF
+        return TYPE_VOID
+    tr.ref_inner
+
+# `last_fn_sig`: the signature of the fn type just parsed (null otherwise).
+pub fn tr_fn_sig(tr: *TypeRef) -> *FnDef
+    if tr == null
+        return null
+    tr.fn_sig
+
+# `last_array_shape`: the shape of a `[N][M]..T`.
+pub fn tr_shape(tr: *TypeRef) -> *ArrayShape
+    if tr == null
+        return null
+    tr.shape
+
+pub fn tr_count(tr: *TypeRef) -> i64
+    if tr == null
+        return 0
+    tr.count
+
+# `tr_elem` / `tr_pointee` live in types.ritz with the other accessors.
+
+# `last_array_elem_type`.
+pub fn tr_elem_kind(tr: *TypeRef) -> i32
+    if tr == null or tr.elem == null
+        return TYPE_VOID
+    tr.elem.kind
+
+# `last_array_elem_pointee`: U for `[N]*U` / `[N]**U` / `[N]@U` / `[N]@&U`.
+pub fn tr_elem_pointee(tr: *TypeRef) -> i32
+    if tr == null or tr.elem == null
+        return TYPE_VOID
+    let e: *TypeRef = tr.elem
+    if e.kind == TYPE_PTR
+        return tr_pointee_kind(e)
+    if e.kind == TYPE_PTR_PTR
+        return tr_ptr_ptr_inner_pointee(e)
+    if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
+        return tr_ref_inner(e)
+    TYPE_VOID
+
+# `last_array_elem_type_name`: the struct an array's element (or the struct
+# it points at / refers to) is named, null otherwise.
+pub fn tr_elem_name(tr: *TypeRef, out_len: *i32) -> *u8
+    *out_len = 0
+    if tr == null or tr.elem == null
+        return null
+    let e: *TypeRef = tr.elem
+    if e.kind == TYPE_STRUCT
+        *out_len = e.name_len
+        return e.name
+    if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
+        if tr_ref_inner(e) == TYPE_STRUCT
+            return tr_name(e.pointee, out_len)
+        return null
+    if e.kind == TYPE_PTR or e.kind == TYPE_PTR_PTR
+        if tr_slot_inner(e) == TYPE_STRUCT
+            return tr_name(e, out_len)
+        return null
+    null
+
+# The `[N]..T` a pointer names via `*[N]T`, `**[N]T` or `@*[N]T`; null for any
+# other pointer.  This is `ptr_names_array`'s subject.
+fn tr_ptr_array(tr: *TypeRef) -> *TypeRef
+    if tr == null
+        return null
+    if tr.kind == TYPE_PTR
+        if tr.pointee != null and tr.pointee.kind == TYPE_ARRAY
+            return tr.pointee
+        return null
+    if tr.kind == TYPE_PTR_PTR
+        if tr_depth(tr) == 2 and tr.pointee != null and tr.pointee.kind == TYPE_PTR and tr.pointee.pointee != null and tr.pointee.pointee.kind == TYPE_ARRAY
+            return tr.pointee.pointee
+        return null
+    if tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF
+        if tr.ref_inner == TYPE_PTR and tr.pointee != null and tr.pointee.pointee != null and tr.pointee.pointee.kind == TYPE_ARRAY
+            return tr.pointee.pointee
+        return null
+    null
+
+# `last_inner_pointee_type`: the deepest non-pointer kind of a `*..T`.
+pub fn tr_slot_inner(tr: *TypeRef) -> i32
+    if tr == null
+        return TYPE_VOID
+    var p: *TypeRef = tr
+    while p != null and (p.kind == TYPE_PTR or p.kind == TYPE_PTR_PTR)
+        p = p.pointee
+    if p == null
+        return TYPE_VOID
+    p.kind
+
+# AGAST #1815 / #1924: `ptr_ptr_inner_pointee`.  A `***T` packs its extra
+# levels as multiples of PTR_DEPTH_UNIT, exactly as the flat slot did.
+pub fn tr_ptr_ptr_inner_pointee(tr: *TypeRef) -> i32
+    var slot: *TypeRef = tr
+    if tr != null and (tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF)
+        slot = tr.pointee
+    if slot == null or slot.kind != TYPE_PTR_PTR
+        return TYPE_VOID
+    let d: i32 = tr_depth(slot)
+    let deep: i32 = tr_slot_inner(slot)
+    if d <= 2
+        return deep
+    if d < 3 or deep == TYPE_VOID
+        return TYPE_VOID
+    deep + (d - 2) * PTR_DEPTH_UNIT
+
+# AGAST #3108: `var_inner_pointee_of`.
+pub fn tr_var_inner_pointee(tr: *TypeRef) -> i32
+    if tr != null and (tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF) and tr.ref_inner == TYPE_PTR
+        return tr_pointee_kind(tr.pointee)
+    tr_ptr_ptr_inner_pointee(tr)
+
+# The first `[N]T` in this type's chain: the type itself, or the array a
+# pointer / reference wraps.  Its facts are the ones the flat parser state
+# described after parsing the type.
+fn tr_array_node(tr: *TypeRef) -> *TypeRef
+    var t: *TypeRef = tr
+    while t != null
+        if t.kind == TYPE_ARRAY
+            return t
+        t = t.pointee
+    null
+
+fn tr_array_node_elem(tr: *TypeRef) -> *TypeRef
+    let a: *TypeRef = tr_array_node(tr)
+    if a == null
+        return null
+    a.elem
+
+# The fn signature of this type: its own, or the one an array's element holds.
+fn tr_chain_fn_sig(tr: *TypeRef) -> *FnDef
+    var t: *TypeRef = tr
+    while t != null
+        if t.fn_sig != null
+            return t.fn_sig
+        if t.elem != null
+            t = t.elem
+        else
+            t = t.pointee
+    null
+
+# One flat snapshot of a `*TypeRef`: exactly the facts the 17 `Parser.last_*`
+# side channels held after `type_spec` parsed it.  #4035 keeps the flat
+# consumers (Param / StructField / GlobalVarDef / Stmt) unchanged by deriving
+# that snapshot from the chain instead of latching it on the Parser.
+struct TypeFacts
+    kind: i32
+    type_name: *u8
+    type_name_len: i32
+    pointee_type: i32
+    inner_pointee_type: i32
+    ptr_depth: i32
+    array_size: i32
+    array_elem_type: i32
+    array_elem_type_name: *u8
+    array_elem_type_name_len: i32
+    array_elem_pointee: i32
+    array_shape: *ArrayShape
+    ref_inner_type: i32
+    inner_ref: i32
+    fn_sig: *FnDef
+
+pub fn type_facts(p: *Parser, tr: *TypeRef) -> *TypeFacts
+    let f: *TypeFacts = parser_alloc(p, sizeof(TypeFacts)) as *TypeFacts
+    let kind: i32 = tr_kind(tr)
+    f.kind = kind
+    f.type_name = tr_name(tr, @f.type_name_len)
+    # `last_pointee_type`: the pointer's pointee, or, for a reference, the
+    # pointer it wraps one level in (`@*T` recorded T) -- and for a reference
+    # to a value, that value's own kind (`@S` recorded S, which is what a
+    # member or `*g` of a global `@S` reads).
+    f.pointee_type = TYPE_VOID
+    if kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        f.pointee_type = tr_pointee_kind(tr)
+    else if kind == TYPE_REF or kind == TYPE_MUT_REF
+        if tr.pointee != null
+            if tr.ref_inner == TYPE_PTR or tr.ref_inner == TYPE_PTR_PTR
+                f.pointee_type = tr_pointee_kind(tr.pointee)
+            else
+                f.pointee_type = tr.pointee.kind
+    # `last_inner_pointee_type`: the deepest non-pointer kind, with a
+    # reference unwrapped to the pointer it holds (a `@*T` recorded T).
+    f.inner_pointee_type = TYPE_VOID
+    if kind == TYPE_REF or kind == TYPE_MUT_REF
+        f.inner_pointee_type = tr_slot_inner(tr.pointee)
+    else if kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        f.inner_pointee_type = tr_slot_inner(tr)
+    # `last_ptr_depth`: a reference inherited the pointer's depth from its
+    # referent's parse (`@*T` was depth 1).
+    f.ptr_depth = 0
+    if kind == TYPE_REF or kind == TYPE_MUT_REF
+        f.ptr_depth = tr_depth(tr.pointee)
+    else if kind == TYPE_PTR or kind == TYPE_PTR_PTR
+        f.ptr_depth = tr_depth(tr)
+    # `last_array_*` / `last_array_shape`: the first `[N]T` in the chain, which
+    # for a `*[N]T` / `@[N]T` is the pointee's.
+    let a: *TypeRef = tr_array_node(tr)
+    f.array_size = 0
+    f.array_elem_type = TYPE_VOID
+    f.array_elem_pointee = TYPE_VOID
+    f.array_elem_type_name = null
+    f.array_elem_type_name_len = 0
+    f.array_shape = null
+    if a != null
+        f.array_size = tr_count(a) as i32
+        f.array_elem_type = tr_elem_kind(a)
+        f.array_elem_pointee = tr_elem_pointee(a)
+        f.array_elem_type_name = tr_elem_name(a, @f.array_elem_type_name_len)
+        f.array_shape = tr_shape(a)
+    f.ref_inner_type = tr_ref_inner(tr)
+    f.inner_ref = tr_inner_ref(tr)
+    f.fn_sig = tr_chain_fn_sig(tr)
+    f
+
+pub fn type_named(p: *Parser, name_sv: StrView) -> *TypeRef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    # AGAST #1475: a type alias resolves to its target's parse state.
+    # AGAST #1475: a type alias resolves to its target's TypeRef.
     if g_alias_count > 0
-        let alias_ty: i32 = type_alias_resolve(p, StrView { ptr: (name), len: (len) as i64 })
-        if alias_ty != TYPE_VOID
+        let alias_ty: *TypeRef = type_alias_resolve(p, StrView { ptr: (name), len: (len) as i64 })
+        if tr_is_void(alias_ty) == 0
             alias_use_log(p, StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907
             return alias_ty
     # AGAST #2198: `usize` / `isize` are primitives, not a TYPE_STRUCT named
@@ -3247,21 +3395,21 @@ pub fn type_named(p: *Parser, name_sv: StrView) -> i32
     # `i64`, so a usize is unsigned (lshr, udiv, icmp ult, uitofp).  A generic
     # argument spells as the integer too (`Vec$u64`, AGAST #3935).
     if is_word_type_name(StrView { ptr: (name), len: (len) as i64 }) == 1
-        return word_type(name)
+        return type_prim(p, word_type(name))
     # Float types: f32 / f64 are first-class type kinds, not TYPE_STRUCT+name.
     # Detect by exact name and return the proper kind so downstream type-
     # tracking (get_expr_type, param_type, etc.) doesn't fall through to
     # struct-shape paths that emit `add i64`/`icmp` instead of fadd/fcmp.
     if len == 3
         if *(name + 0) == 102 and *(name + 1) == 51 and *(name + 2) == 50  # 'f','3','2'
-            return TYPE_F32
+            return type_prim(p, TYPE_F32)
         if *(name + 0) == 102 and *(name + 1) == 54 and *(name + 2) == 52  # 'f','6','4'
-            return TYPE_F64
+            return type_prim(p, TYPE_F64)
     note_type_name_at(p, name)
-    # Store the type name in parser state for later retrieval by fn_def_new
-    p.last_type_name = name
-    p.last_type_name_len = len
-    return TYPE_STRUCT
+    let t: *TypeRef = typeref_new(p, TYPE_STRUCT)
+    t.name = name
+    t.name_len = len
+    t
 
 # AGAST #3932: where each type name type_named saw was written, keyed by the
 # name's pointer into the source, which the AST's type-name slots keep.
@@ -3464,113 +3612,75 @@ pub fn type_name_written_at(name: *u8) -> *TypeNameAt
 # resolve the pointee struct → var-decl narrowing missed → `cqe.field`
 # member access fell through to "; ERROR: unhandled EXPR_MEMBER" with a
 # stale `%.0` reference.
-# AGAST #2120: the signature of the fn type the last `-> T` named (null for
-# any other T), latched by capture_fn_return_type for the FnDef the
-# enclosing fn_def action builds after the body.  Every `-> T` rewrites it,
-# and fn_ret_fn_sig hands it out only for a TYPE_PTR return, so a fn with no
-# `->` (TYPE_VOID) never sees a stale one.
-var g_ret_fn_sig: *FnDef = null
+# AGAST #2120 / #2308 / #2343 / #2329: the return-side records a FnDef keeps,
+# all derived from the parsed return `*TypeRef` (#4035).  The body is parsed
+# after the return type, so a nested type in it cannot disturb these.
+fn fn_ret_fn_sig(ret: *TypeRef) -> *FnDef
+    if tr_kind(ret) == TYPE_PTR
+        return tr_fn_sig(ret)
+    null
 
-fn fn_ret_fn_sig(ret: i32) -> *FnDef
-    if ret == TYPE_PTR
-        return g_ret_fn_sig
-    return null
+fn fn_ret_ref(p: *Parser, ret: *TypeRef) -> *Param
+    if tr_kind(ret) == TYPE_REF or tr_kind(ret) == TYPE_MUT_REF
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)
+    null
 
-# AGAST #2308: a `-> @T` / `-> @&T`, latched as g_ret_fn_sig is.
-var g_ret_ref: *Param = null
+fn fn_ret_ptr_array(p: *Parser, ret: *TypeRef) -> *Param
+    let k: i32 = tr_kind(ret)
+    if k == TYPE_PTR or k == TYPE_REF or k == TYPE_MUT_REF or k == TYPE_PTR_PTR
+        return ptr_array_of_type(p, ret)
+    null
 
-fn fn_ret_ref(ret: i32) -> *Param
-    if ret == TYPE_REF or ret == TYPE_MUT_REF
-        return g_ret_ref
-    return null
+fn fn_ret_array(p: *Parser, ret: *TypeRef) -> *ArrayElem
+    if tr_kind(ret) == TYPE_ARRAY
+        return array_elem_of_type(p, ret)
+    null
 
-# AGAST #2343: a `-> [N]T`, latched the same way.
-var g_ret_array: *ArrayElem = null
-
-# AGAST #2329: a `-> *[N]T`, `-> @[N]T` or `-> @&[N]T`, latched the same way.
-var g_ret_ptr_array: *Param = null
-
-fn fn_ret_ptr_array(ret: i32) -> *Param
-    if ret == TYPE_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
-        return g_ret_ptr_array
-    if ret == TYPE_PTR_PTR   # AGAST #4122: `-> **[N][M]T` (ptr_array_of_last)
-        return g_ret_ptr_array
-    return null
-
-fn fn_ret_array(ret: i32) -> *ArrayElem
-    if ret == TYPE_ARRAY
-        return g_ret_array
-    return null
-
-# AGAST #2302: a `-> [N]T` as a by-value param would hold it, latched the same way.
-var g_ret_array_param: *Param = null
-
-fn fn_ret_array_param(ret: i32) -> *Param
-    if ret == TYPE_ARRAY
-        return g_ret_array_param
-    return null
+# AGAST #2302: a `-> [N]T` as a by-value param would hold it.
+fn fn_ret_array_param(p: *Parser, ret: *TypeRef) -> *Param
+    if tr_kind(ret) == TYPE_ARRAY
+        return param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)
+    null
 
 # The name a `-> T` return gives the fn, from the parser state its type_spec
 # just left: a struct, the pointee of a `-> *T` / `-> **U` / `-> @T`, or
 # nothing where a name would be stale.  Shared by capture_fn_return_type (a
 # named fn writes p.fn_return_type_name) and type_fn (a fn type writes
 # FnDef.return_type_name), so the two spellings can't drift (AGAST #4324).
-fn ret_name_of_last(p: *Parser, ret: i32, out: **u8, out_len: *i32)
+fn ret_name_of_type(p: *Parser, tr: *TypeRef, out: **u8, out_len: *i32)
+    let ret: i32 = tr_kind(tr)
     if ret == TYPE_STRUCT
-        *out = p.last_type_name
-        *out_len = p.last_type_name_len
-    else if (ret == TYPE_REF or ret == TYPE_MUT_REF) and p.last_ref_inner_type != TYPE_STRUCT
-        # AGAST #1453: `-> @i64` leaves last_type_name stale (from an earlier
-        # `@P` param, say).  Only a struct referent names itself; var-decl
-        # narrowing trusts this name for `let m = get(...)`.
+        *out = tr.name
+        *out_len = tr.name_len
+    else if (ret == TYPE_REF or ret == TYPE_MUT_REF) and tr_ref_inner(tr) != TYPE_STRUCT
+        # AGAST #1453: `-> @i64` names nothing; only a struct referent does.
         *out = null
         *out_len = 0
-    else if ret == TYPE_PTR and primitive_name_len(p.last_pointee_type) > 0
-        # AGAST #1984: `-> *i32` / `-> *u64`.  last_type_name is null (or
-        # stale from an earlier `*S` param), so name the primitive pointee
-        # itself, as monomorph does for a specialised `-> *T` (#1980);
-        # emit_var_decl maps it to var_pointee_type for `let p = f()`.
-        *out = primitive_name_from_type(p.last_pointee_type)
-        *out_len = primitive_name_len(p.last_pointee_type)
+    else if ret == TYPE_PTR and primitive_name_len(tr_pointee_kind(tr)) > 0
+        # AGAST #1984: `-> *i32` / `-> *u64` name the primitive pointee.
+        *out = primitive_name_from_type(tr_pointee_kind(tr))
+        *out_len = primitive_name_len(tr_pointee_kind(tr))
     else if ret == TYPE_PTR_PTR
-        # AGAST #2791: `-> **U` names U as monomorph names a `*T` at T = *U:
-        # the primitive, or the struct.  A `***U` (packed inner) or an unknown
-        # U names nothing, so a stale last_type_name can't type `let p = f()`.
-        let inner: i32 = ptr_ptr_inner_pointee(p, ret)
+        # AGAST #2791: `-> **U` names U as monomorph names a `*T` at T = *U.
+        let inner: i32 = tr_ptr_ptr_inner_pointee(tr)
         if primitive_name_len(inner) > 0
             *out = primitive_name_from_type(inner)
             *out_len = primitive_name_len(inner)
-        else if inner == TYPE_STRUCT and p.last_type_name != null and p.last_type_name_len > 0
-            *out = p.last_type_name
-            *out_len = p.last_type_name_len
+        else if inner == TYPE_STRUCT
+            *out = tr_name(tr, out_len)
         else
             *out = null
             *out_len = 0
     else if ret == TYPE_PTR or ret == TYPE_REF or ret == TYPE_MUT_REF
-        if p.last_type_name != null and p.last_type_name_len > 0
-            *out = p.last_type_name
-            *out_len = p.last_type_name_len
-        else
-            *out = null
-            *out_len = 0
+        *out = tr_name(tr, out_len)
     else
         *out = null
         *out_len = 0
 
-pub fn capture_fn_return_type(p: *Parser, ret: i32) -> i32
-    # AGAST #3634: a `-> [N][M]T` keeps its shape on g_ret_array_param.
-    g_ret_fn_sig = fresh_fn_sig(p)   # the type_spec just ended here
-    g_ret_ref = null
-    g_ret_array = null
-    g_ret_array_param = null
-    if ret == TYPE_ARRAY
-        g_ret_array = array_elem_of_last(p)
-        g_ret_array_param = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)   # AGAST #2302
-    g_ret_ptr_array = ptr_array_of_last(p, ret)   # AGAST #2329
-    if ret == TYPE_REF or ret == TYPE_MUT_REF
-        g_ret_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)
-    ret_name_of_last(p, ret, @p.fn_return_type_name, @p.fn_return_type_name_len)
-    return ret
+# AGAST #3634: the return `*TypeRef` itself carries the shape and the fn
+# signature, so #4035 leaves nothing to latch on the Parser.
+pub fn capture_fn_return_type(p: *Parser, ret: *TypeRef) -> *TypeRef
+    ret
 
 # Capture the variable type name after parsing type_spec but before parsing initializer expr.
 # This prevents last_type_name from being overwritten when the initializer contains a generic call.
@@ -3685,19 +3795,21 @@ fn pop_var_latch(p: *Parser, line: i32, col: i32)
     g_var_ptr_array_elem_name = mine.ptr_array_elem_name
     g_var_ptr_array_elem_name_len = mine.ptr_array_elem_name_len
 
-pub fn capture_var_type(p: *Parser, ty: i32) -> i32
+pub fn capture_var_type(p: *Parser, tr: *TypeRef) -> *TypeRef
+    let ty: i32 = tr_kind(tr)
+    let facts: *TypeFacts = type_facts(p, tr)
     g_var_ref = null
     if ty == TYPE_REF or ty == TYPE_MUT_REF
-        g_var_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ty)
+        g_var_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, tr)
     g_var_array = null
     g_var_array_size = 0
     if ty == TYPE_ARRAY
-        g_var_array = array_elem_of_last(p)
-        g_var_array_size = p.last_array_size
-    g_var_ptr_array_size = ptr_array_pointee_size(p, ty)
-    g_var_ptr_array_elem = ptr_array_pointee_elem(p, ty)
-    g_var_ptr_array_elem_pointee = ptr_array_elem_pointee(p, ty)
-    g_var_ptr_array_shape = ptr_nd_pointee_shape(p, ty)   # AGAST #2098
+        g_var_array = array_elem_of_type(p, tr)
+        g_var_array_size = facts.array_size
+    g_var_ptr_array_size = ptr_array_pointee_size(p, tr)
+    g_var_ptr_array_elem = ptr_array_pointee_elem(p, tr)
+    g_var_ptr_array_elem_pointee = ptr_array_elem_pointee(p, tr)
+    g_var_ptr_array_shape = ptr_nd_pointee_shape(p, tr)   # AGAST #2098
     if g_var_ptr_array_shape != null
         g_var_ptr_array_size = nd_shape_count(g_var_ptr_array_shape)
         g_var_ptr_array_elem = g_var_ptr_array_shape.leaf_type
@@ -3706,52 +3818,36 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
     g_var_ptr_array_elem_name = null
     g_var_ptr_array_elem_name_len = 0
     if ty == TYPE_PTR and g_var_ptr_array_shape == null and (g_var_ptr_array_elem == TYPE_STRUCT or (g_var_ptr_array_elem == TYPE_PTR and g_var_ptr_array_elem_pointee == TYPE_STRUCT))
-        g_var_ptr_array_elem_name = p.last_type_name
-        g_var_ptr_array_elem_name_len = p.last_type_name_len
+        g_var_ptr_array_elem_name = facts.type_name
+        g_var_ptr_array_elem_name_len = facts.type_name_len
     if ty == TYPE_STRUCT
-        p.var_type_name = p.last_type_name
-        p.var_type_name_len = p.last_type_name_len
-    else if ty == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
-        # AGAST #2822: `let p: *A = pick<*B>(..)` -- the `<*B>` re-sets
-        # last_type_name, so p took B's field offsets and stride.
-        p.var_type_name = p.last_type_name
-        p.var_type_name_len = p.last_type_name_len
-    else if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_STRUCT
-        # AGAST #1754: `let q: @&S = ...` / `let r: @S = ...` keep the pointee
-        # struct name (as params do) so `q.a` resolves.
-        p.var_type_name = p.last_type_name
-        p.var_type_name_len = p.last_type_name_len
-    else if ty == TYPE_PTR_PTR and ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, ty)) == TYPE_STRUCT
-        # AGAST #1933: `let pp: **S = ...` keeps S (as a `**S` param does)
-        # so `(**pp).f` resolves.  AGAST #1924: `***S` too; its depth rides
-        # in var_inner_pointee_type.
-        p.var_type_name = p.last_type_name
-        p.var_type_name_len = p.last_type_name_len
-    else if ty == TYPE_PTR_PTR and ptr_names_array_of_struct_ptrs(p, ty) == 1
-        # AGAST #3104: `let r: **[N]*S` keeps S, as a `**[N]*S` param does
-        # (#3074), so `(*r)[i].f` resolves.  The emitter moves it off the
-        # local's type_name (name_array_ptr_local): `(*r).f` stays refused.
-        p.var_type_name = p.last_type_name
-        p.var_type_name_len = p.last_type_name_len
+        p.var_type_name = facts.type_name
+        p.var_type_name_len = facts.type_name_len
+    else if ty == TYPE_PTR and facts.pointee_type == TYPE_STRUCT
+        p.var_type_name = facts.type_name
+        p.var_type_name_len = facts.type_name_len
+    else if (ty == TYPE_REF or ty == TYPE_MUT_REF) and facts.ref_inner_type == TYPE_STRUCT
+        p.var_type_name = facts.type_name
+        p.var_type_name_len = facts.type_name_len
+    else if ty == TYPE_PTR_PTR and ptr_ptr_slot_inner(tr_ptr_ptr_inner_pointee(tr)) == TYPE_STRUCT
+        p.var_type_name = facts.type_name
+        p.var_type_name_len = facts.type_name_len
+    else if ty == TYPE_PTR_PTR and ptr_names_array_of_struct_ptrs(p, tr) == 1
+        p.var_type_name = facts.type_name
+        p.var_type_name_len = facts.type_name_len
     else
         p.var_type_name = null
         p.var_type_name_len = 0
-    # AGAST #2805: `let qq: **S = vec_as_ptr<*S>(@w)` -- the `<*S>` re-sets
-    # last_pointee_type, so stmt_var_decl read a `*S`'s pointee and slot for
-    # qq: `qq + 1` strode sizeof(S), not 8, and `(*(qq + 1)).b` was "unhandled
-    # EXPR_MEMBER".  `let p: *i32 = f<*u8>(..)` strode one byte the same way.
-    p.var_pointee = p.last_pointee_type
-    p.var_inner_pointee = var_inner_pointee_of(p, ty)   # AGAST #3108
-    p.var_inner_ref = inner_ref_of(p, ty)   # AGAST #2399
+    p.var_pointee = facts.pointee_type
+    p.var_inner_pointee = tr_var_inner_pointee(tr)   # AGAST #3108
+    p.var_inner_ref = facts.inner_ref   # AGAST #2399
     # AGAST #1671: latch a `let f: fn(...) -> T` signature before the
-    # initializer is parsed (it may contain fn types of its own).
-    # AGAST #1747: on a `[N]fn(...) -> T` array it is the ELEMENT signature
-    # (the fn type ends where the array type does); `fs[i](..)` calls by it.
+    # initializer is parsed.
     p.var_fn_sig = null
     if ty == TYPE_PTR or ty == TYPE_ARRAY
-        p.var_fn_sig = fresh_fn_sig(p)
+        p.var_fn_sig = facts.fn_sig
     push_var_latch(p)
-    return ty
+    return tr
 
 # =============================================================================
 # Function-pointer types (AGAST #1671)
@@ -3762,12 +3858,12 @@ pub fn capture_var_type(p: *Parser, ty: i32) -> i32
 # `define i1 @is_d(i8 ...)`, and calling it as `call i64 %f(i64 ...)` reads
 # rax's garbage upper bits as the bool.  type_fn keeps the signature as a
 # nameless FnDef (params + return type), the same shape a direct call
-# consults, and leaves it in p.last_fn_sig tagged with the token position
+# consults, and leaves it in the last_fn_sig side channel tagged with the token position
 # the type ended at.  fresh_fn_sig hands it out only while p.pos is still
 # there, so it attaches to exactly the declaration whose type it is.
 # Its line / col are the type's `fn` token (AGAST #3690): a call through it
 # that can't be lowered is refused there.
-pub fn type_fn(p: *Parser, params: *Param, ret: i32, line: i32, col: i32) -> i32
+pub fn type_fn(p: *Parser, params: *Param, ret: *TypeRef, line: i32, col: i32) -> *TypeRef
     let f: *FnDef = parser_alloc(p, sizeof(FnDef)) as *FnDef
     # AGAST #4324: the return side as capture_fn_return_type records it for a
     # named fn, from the same state (the return type_spec is the last thing
@@ -3776,26 +3872,24 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32, line: i32, col: i32) -> i32
     #
     # ret_fn_sig stays null (AGAST #2120), unlike capture_fn_return_type: a fn
     # type is re-parsed on every backtracked attempt, and each attempt ends on
-    # the same token, so fresh_fn_sig here returns the previous attempt's own
-    # FnDef -- a self-chain that spells `fn(i32) -> fn(i32) -> fn(i32) -> ..`.
-    # A `-> fn(..)` return is therefore still unjudged; guessing would be worse.
+    # the same token, so a nested `-> fn(..)` would self-chain.
     f.ret_fn_sig = null
     f.ret_ref = null
     f.ret_array = null
-    f.ret_ptr_array = ptr_array_of_last(p, ret)   # AGAST #2329
+    f.ret_ptr_array = ptr_array_of_type(p, ret)   # AGAST #2329
     f.ret_array_param = null
-    if ret == TYPE_ARRAY
-        f.ret_array = array_elem_of_last(p)   # AGAST #2343
+    if tr_kind(ret) == TYPE_ARRAY
+        f.ret_array = array_elem_of_type(p, ret)   # AGAST #2343
         f.ret_array_param = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)   # AGAST #2302
-    if ret == TYPE_REF or ret == TYPE_MUT_REF
+    if tr_kind(ret) == TYPE_REF or tr_kind(ret) == TYPE_MUT_REF
         f.ret_ref = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ret)   # AGAST #2308
     f.name = null
     f.name_len = 0
     f.params = params
-    f.return_type = ret
+    f.return_type = tr_kind(ret)
     # A `-> *T` / `-> @T` names its pointee as a named fn's return does, so a
     # fn-type slot spells and judges it (AGAST #4324).
-    ret_name_of_last(p, ret, @f.return_type_name, @f.return_type_name_len)
+    ret_name_of_type(p, ret, @f.return_type_name, @f.return_type_name_len)
     # AGAST #3286: `fn(..) -> void` returns nothing, as fn_def_new
     # normalises `-> void` for a named fn, so fn_is_procedure(sig)
     # refuses a use of its call's value instead of `%r = call void`.
@@ -3815,51 +3909,14 @@ pub fn type_fn(p: *Parser, params: *Param, ret: i32, line: i32, col: i32) -> i32
     f.is_pub = 0
     f.col = col
     f.extern_decl = 0
-    p.last_fn_sig = f
-    p.last_fn_sig_pos = p.pos
-    return TYPE_PTR
-
-# The signature of the fn type that ends at the current token, or null.
-pub fn fresh_fn_sig(p: *Parser) -> *FnDef
-    if p.last_fn_sig != null and p.last_fn_sig_pos == p.pos
-        return p.last_fn_sig
-    return null
-
-# AGAST #1509: the shape of `[size]<inner>`, where <inner> is the array type
-# whose info p.last_array_* / p.last_array_shape still hold.  A 1-D inner
-# `[M]T` becomes rank 2 `[size][M]T`; a deeper inner gains one leading dim.
-# Returns null (and reports) past MAX_ARRAY_RANK.
-fn array_shape_prepend(p: *Parser, size: i32) -> *ArrayShape
-    let sh: *ArrayShape = parser_alloc(p, sizeof(ArrayShape)) as *ArrayShape
-    let inner: *ArrayShape = p.last_array_shape
-    sh.dims[0] = size
-    if inner == null
-        sh.rank = 2
-        sh.dims[1] = p.last_array_size
-        sh.leaf_type = p.last_array_elem_type
-        sh.leaf_name = p.last_array_elem_type_name
-        sh.leaf_name_len = p.last_array_elem_type_name_len
-        sh.leaf_pointee = p.last_array_elem_pointee
-        return sh
-    if inner.rank >= MAX_ARRAY_RANK
-        diag_error(g_parse_file, parse_span_at(p, p.pos), c"array type has more than 8 dimensions")
-        g_attr_errors = g_attr_errors + 1
-        return null
-    sh.rank = inner.rank + 1
-    var d: i32 = 0
-    while d < inner.rank
-        sh.dims[d + 1] = inner.dims[d]
-        d = d + 1
-    sh.leaf_type = inner.leaf_type
-    sh.leaf_name = inner.leaf_name
-    sh.leaf_name_len = inner.leaf_name_len
-    sh.leaf_pointee = inner.leaf_pointee
-    return sh
+    let t: *TypeRef = typeref_new(p, TYPE_PTR)
+    t.fn_sig = f
+    t
 
 # AGAST #1509: 1 when the type just parsed (`ty`, with p's array state) is
 # a multi-dimensional array `[N][M]..T`.
-pub fn is_nd_array_type(p: *Parser, ty: i32) -> i32
-    if ty == TYPE_ARRAY and p.last_array_elem_type == TYPE_ARRAY
+pub fn is_nd_array_type(p: *Parser, tr: *TypeRef) -> i32
+    if tr != null and tr.kind == TYPE_ARRAY and tr.elem != null and tr.elem.kind == TYPE_ARRAY
         return 1
     0
 
@@ -3875,8 +3932,8 @@ var g_nd_reject_col: i32 = -1
 # position (the grammar can re-run an action while backtracking); the
 # parse-time error count (g_attr_errors) fails the compile.
 # Returns 1 when it rejected `ty`.
-pub fn nd_array_reject(p: *Parser, ty: i32, line: i32, col: i32, what: *u8) -> i32
-    if is_nd_array_type(p, ty) == 0
+pub fn nd_array_reject(p: *Parser, tr: *TypeRef, line: i32, col: i32, what: *u8) -> i32
+    if is_nd_array_type(p, tr) == 0
         return 0
     return nd_array_report(line, col, what)
 
@@ -4010,20 +4067,21 @@ fn array_lit_length_walk(e: *Expr, shape: *ArrayShape, at: i32)
             el = el.next
 
 # A const's or global's `[N]..T` initialiser, as the parser has just latched
-# the type: the N-D shape if there is one, else `[N]T` from p.last_array_*.
-pub fn array_lit_length_decl(p: *Parser, ty: i32, init: *Expr)
-    if ty != TYPE_ARRAY or init == null
+# the type: the N-D shape if there is one, else `[N]T` from the last_array_* side channel.
+pub fn array_lit_length_decl(p: *Parser, tr: *TypeRef, init: *Expr)
+    if tr_kind(tr) != TYPE_ARRAY or init == null
         return
-    if p.last_array_shape != null
-        array_lit_length_walk(init, p.last_array_shape, 0)
+    let facts: *TypeFacts = type_facts(p, tr)
+    if facts.array_shape != null
+        array_lit_length_walk(init, facts.array_shape, 0)
         return
     var one: ArrayShape
     one.rank = 1
-    one.dims[0] = p.last_array_size
-    one.leaf_type = p.last_array_elem_type
-    one.leaf_name = p.last_array_elem_type_name
-    one.leaf_name_len = p.last_array_elem_type_name_len
-    one.leaf_pointee = p.last_array_elem_pointee
+    one.dims[0] = facts.array_size
+    one.leaf_type = facts.array_elem_type
+    one.leaf_name = facts.array_elem_type_name
+    one.leaf_name_len = facts.array_elem_type_name_len
+    one.leaf_pointee = facts.array_elem_pointee
     array_lit_length_walk(init, @one, 0)
 
 # AGAST #2298: the furthest `dyn` reported in this file, null for none.  The
@@ -4122,8 +4180,8 @@ fn parse_pos_col(p: *Parser) -> i32
         return tok.col
     0
 
-# Parse array size from digit string and store array info in parser state
-pub fn type_array(p: *Parser, size_str_sv: StrView, elem_type: i32) -> i32
+# Parse array size from digit string and build the `[N]elem` TypeRef.
+pub fn type_array(p: *Parser, size_str_sv: StrView, elem: *TypeRef) -> *TypeRef
     var size_str: *u8 = size_str_sv.ptr
     var size_len: i32 = size_str_sv.len as i32
     # Parse the size string to an integer
@@ -4131,7 +4189,7 @@ pub fn type_array(p: *Parser, size_str_sv: StrView, elem_type: i32) -> i32
     for i in 0..size_len
         let digit: i32 = (*(size_str + i)) as i32 - 48  # '0' = 48
         size = size * 10 + digit
-    type_array_sized(p, size, elem_type)
+    type_array_sized(p, size, elem)
 
 # AGAST #2153: `[N]T` / `[N * 2]T` — the length is a constant integer
 # expression, folded now against the consts parsed so far.
@@ -4160,7 +4218,7 @@ pub fn array_len_seed(consts: *ConstEntry)
     g_array_len_reparse = 1
     g_array_len_pending = 0
 
-pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem_type: i32) -> i32
+pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem: *TypeRef) -> *TypeRef
     var v: i64 = 0
     var folded: i32 = const_fold_int(p.module.constants, len_expr, 0, @v)
     if folded == 0 and g_array_len_seed != null
@@ -4174,7 +4232,7 @@ pub fn type_array_expr(p: *Parser, len_expr: *Expr, line: i32, col: i32, elem_ty
     else if v < 0 or v > 2147483647
         array_len_report(line, col, c"is out of range (it must be 0 to 2147483647)")
         v = 0
-    type_array_sized(p, v as i32, elem_type)
+    type_array_sized(p, v as i32, elem)
 
 # The backtracking parser re-runs an action each time it retries the
 # alternative: report each `[` once, as nd_array_report does.
@@ -4191,152 +4249,122 @@ fn array_len_report(line: i32, col: i32, why: *u8)
     eprints_cstr(c"array length ")
     eprintln_cstr(why)
 
-# AGAST #2343: the element of the `[N]T` just parsed.
-fn array_elem_of_last(p: *Parser) -> *ArrayElem
-    let a: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
-    a.elem = p.last_array_elem_type
-    a.pointee = p.last_array_elem_pointee
-    a.name = p.last_array_elem_type_name
-    a.name_len = p.last_array_elem_type_name_len
-    a.shape = p.last_array_shape
-    a.ptr_array = g_last_ptr_array
-    a.ptr_array_size = g_last_ptr_array_size
-    a.ptr_plane = g_last_ptr_plane
-    return a
+# AGAST #2343: the element of the `[N]T` this type wraps, as an ArrayElem.
+fn array_elem_of_type(p: *Parser, tr: *TypeRef) -> *ArrayElem
+    let a: *TypeRef = tr_array_node(tr)
+    let e: *TypeRef = tr_array_node_elem(tr)
+    let ae: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+    ae.elem = tr_kind(e)
+    ae.pointee = tr_elem_pointee(a)
+    ae.name = tr_elem_name(a, @ae.name_len)
+    ae.shape = tr_shape(a)
+    # AGAST #2995: the `[M]T` that the element of `[N]*[M]T` points at.
+    ae.ptr_array = null
+    ae.ptr_array_size = 0
+    ae.ptr_plane = null
+    if e != null and e.kind == TYPE_PTR
+        if e.pointee != null and e.pointee.kind == TYPE_ARRAY
+            if e.pointee.shape == null
+                let inner: *ArrayElem = parser_alloc(p, sizeof(ArrayElem)) as *ArrayElem
+                inner.elem = tr_elem_kind(e.pointee)
+                inner.pointee = tr_elem_pointee(e.pointee)
+                inner.name = tr_elem_name(e.pointee, @inner.name_len)
+                inner.shape = null
+                inner.ptr_array = null
+                inner.ptr_array_size = 0
+                inner.ptr_plane = null
+                ae.ptr_array = inner
+                ae.ptr_array_size = tr_count(e.pointee) as i32
+            else
+                ae.ptr_plane = e.pointee.shape
+    return ae
 
-# AGAST #2995: the `[M]T` that the element of the `[N]*[M]T` just parsed points at,
-# and M; null / 0 for any other `[N]T`.  type_array_sized writes them as it does
-# last_array_*, so they're current whenever the type just parsed is TYPE_ARRAY.
-var g_last_ptr_array: *ArrayElem = null
-var g_last_ptr_array_size: i32 = 0
-# AGAST #4122: the `[N][M]..T` the element of the `[K]*[N][M]..T` just parsed
-# points at; null for any other `[K]T`.
-var g_last_ptr_plane: *ArrayShape = null
+# AGAST #2995 / #1509: `[N]T` from an already-parsed element type `elem`.
+fn type_array_sized(p: *Parser, size: i32, elem: *TypeRef) -> *TypeRef
+    let t: *TypeRef = typeref_new(p, TYPE_ARRAY)
+    t.elem = elem
+    t.count = size as i64
+    # AGAST #1509: `[size]<array>` is multi-dimensional.  `elem` is the inner
+    # `[M]T`, so prepend `size` to its shape.
+    t.shape = null
+    if elem != null
+        if elem.kind == TYPE_ARRAY
+            t.shape = array_shape_prepend_type(p, size, elem)
+    t
 
-fn type_array_sized(p: *Parser, size: i32, elem_type: i32) -> i32
-    # AGAST #2995: `[N]*[M]T`.  The `*[M]T` just parsed left the `[M]T` in
-    # last_array_*, which the lines below overwrite with the outer `[N]`.
-    var inner: *ArrayElem = null
-    var inner_size: i32 = 0
-    if elem_type == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY and p.last_array_shape == null
-        inner = array_elem_of_last(p)
-        inner_size = p.last_array_size
-    g_last_ptr_array = inner
-    g_last_ptr_array_size = inner_size
-    g_last_ptr_plane = null
-    if elem_type == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY and p.last_array_shape != null
-        g_last_ptr_plane = p.last_array_shape
-    # AGAST #1509: `[size]<array>` is multi-dimensional.  The inner array's
-    # info is still in p.last_array_* (type_spec is right-recursive, so the
-    # inner `[M]T` action ran just before this one): prepend `size` to its
-    # shape before the 1-D fields below are overwritten with the outer dim.
-    if elem_type == TYPE_ARRAY
-        p.last_array_shape = array_shape_prepend(p, size)
-    else
-        p.last_array_shape = null
-    # Store in parser state for field_new to retrieve
-    p.last_array_size = size
-    p.last_array_elem_type = elem_type
-    p.last_array_elem_pointee = TYPE_VOID
-    if elem_type == TYPE_PTR
-        p.last_array_elem_pointee = p.last_pointee_type
-    else if elem_type == TYPE_PTR_PTR
-        # AGAST #2376: `[N]**T` records T packed as a `**T` does, so `**a[i]`
-        # loads a T.  Every reader of an element's pointee asks for a TYPE_PTR
-        # element first, and ptr_levels_of reads this one.
-        p.last_array_elem_pointee = ptr_ptr_inner_pointee(p, TYPE_PTR_PTR)
-    else if elem_type == TYPE_REF or elem_type == TYPE_MUT_REF
-        # AGAST #2369: `[N]@T` / `[N]@&T` records T too, for `a[i].f`
-        # (array_elem_referent).  The pointer readers still see no TYPE_PTR
-        # element, so a reference gets no arithmetic or index from this.
-        p.last_array_elem_pointee = p.last_ref_inner_type
-    # If element type is a struct, capture the struct name from last_type_name
-    if elem_type == TYPE_STRUCT
-        p.last_array_elem_type_name = p.last_type_name
-        p.last_array_elem_type_name_len = p.last_type_name_len
-    else if (elem_type == TYPE_REF or elem_type == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_STRUCT
-        p.last_array_elem_type_name = p.last_type_name
-        p.last_array_elem_type_name_len = p.last_type_name_len
-    else if (elem_type == TYPE_PTR or elem_type == TYPE_PTR_PTR) and p.last_inner_pointee_type == TYPE_STRUCT
-        # AGAST #184: [N]*Foo / [N]**Foo — array of pointer-to-struct.
-        # Save the deepest pointee struct name so emit_member_ptr can resolve
-        # `arr[i].field` by loading the *Foo and GEPing into Foo. Without this,
-        # ritz1's emit_member_ptr fell through to "; ERROR: unhandled
-        # EXPR_MEMBER" for tome's `update[k].forward[k]` pattern (zset_add).
-        p.last_array_elem_type_name = p.last_type_name
-        p.last_array_elem_type_name_len = p.last_type_name_len
-    else
-        p.last_array_elem_type_name = null
-        p.last_array_elem_type_name_len = 0
-    return TYPE_ARRAY
+# AGAST #1509: rank-2 shape for `[size][M]T`, or one leading dim on a deeper
+# inner shape.  null (and reported) past MAX_ARRAY_RANK.
+fn array_shape_prepend_type(p: *Parser, size: i32, elem: *TypeRef) -> *ArrayShape
+    let inner: *ArrayShape = tr_shape(elem)
+    let sh: *ArrayShape = parser_alloc(p, sizeof(ArrayShape)) as *ArrayShape
+    sh.dims[0] = size
+    if inner == null
+        sh.rank = 2
+        sh.dims[1] = tr_count(elem) as i32
+        sh.leaf_type = tr_elem_kind(elem)
+        sh.leaf_name = tr_elem_name(elem, @sh.leaf_name_len)
+        sh.leaf_pointee = tr_elem_pointee(elem)
+        return sh
+    if inner.rank >= MAX_ARRAY_RANK
+        diag_error(g_parse_file, parse_span_at(p, p.pos), c"array type has more than 8 dimensions")
+        g_attr_errors = g_attr_errors + 1
+        return null
+    sh.rank = inner.rank + 1
+    var d: i32 = 0
+    while d < inner.rank
+        sh.dims[d + 1] = inner.dims[d]
+        d = d + 1
+    sh.leaf_type = inner.leaf_type
+    sh.leaf_name = inner.leaf_name
+    sh.leaf_name_len = inner.leaf_name_len
+    sh.leaf_pointee = inner.leaf_pointee
+    return sh
 
-# AGAST #1815: the innermost pointee of a just-parsed `**T`, for
-# Param / Stmt / GlobalVarDef / StructField.  AGAST #1924: a `***T` (or
-# deeper) packs its extra levels in as multiples of PTR_DEPTH_UNIT, so
-# `*(*(*(ppp + i) + j) + k)` knows both the 8-byte strides and T.
-# AGAST #2372: a reference to one (`@**T`) records the same, so `.` knows the depth.
-pub fn ptr_ptr_inner_pointee(p: *Parser, ty: i32) -> i32
-    var pointer: i32 = ty
-    if ty == TYPE_REF or ty == TYPE_MUT_REF
-        pointer = p.last_ref_inner_type
-    if pointer != TYPE_PTR_PTR
+# AGAST #1815: the innermost pointee of `**T`, for Param / Stmt /
+# GlobalVarDef / StructField.  AGAST #1924: a `***T` (or deeper) packs its
+# extra levels in as multiples of PTR_DEPTH_UNIT.
+pub fn ptr_ptr_inner_pointee(p: *Parser, tr: *TypeRef) -> i32
+    tr_ptr_ptr_inner_pointee(tr)
+
+# AGAST #3108: the inner pointee slot a local type records.
+pub fn var_inner_pointee_of(p: *Parser, tr: *TypeRef) -> i32
+    tr_var_inner_pointee(tr)
+
+# AGAST #2343: U for `*[N]*U` (TYPE_VOID otherwise).
+pub fn ptr_array_elem_pointee(p: *Parser, tr: *TypeRef) -> i32
+    if ptr_names_array(p, tr) == 0
         return TYPE_VOID
-    if p.last_pointee_type == TYPE_PTR
-        return p.last_inner_pointee_type
-    if p.last_ptr_depth < 3 or p.last_inner_pointee_type == TYPE_VOID
-        return TYPE_VOID
-    return p.last_inner_pointee_type + (p.last_ptr_depth - 2) * PTR_DEPTH_UNIT
+    let a: *TypeRef = tr_array_node(tr)
+    tr_elem_pointee(a)
 
-# AGAST #3108: the inner pointee slot a just-parsed local type records.  An
-# `@*T` / `@&*T` local records T as a `**T` does (T is the `*T`'s pointee), as
-# the un-annotated `let r = @q` already does (#3079).  It recorded none, so
-# `**r = E.B` stored an i64 and `**r` of an enum or a struct loaded one.
-pub fn var_inner_pointee_of(p: *Parser, ty: i32) -> i32
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR
-        return p.last_pointee_type
-    ptr_ptr_inner_pointee(p, ty)
-
-# AGAST #2343: U for a just-parsed `*[N]*U` (TYPE_VOID otherwise).
-pub fn ptr_array_elem_pointee(p: *Parser, ty: i32) -> i32
-    # AGAST #3074: and `**[N]*U`, `@*[N]*U`, `@&*[N]*U`, which ptr_names_array names as
-    # it does N and T.  They recorded no U: `*(*q)[i]` loaded a byte and stored a
-    # word into the slot the pointer was read from, and `(*q)[i].f` failed to emit.
-    if ptr_names_array(p, ty) == 0 or p.last_array_elem_type != TYPE_PTR
-        return TYPE_VOID
-    return p.last_array_elem_pointee
-
-# AGAST #2539: 1 for a just-parsed `*[N]T` or `**[N]T`.  type_array set
-# last_array_* while parsing the pointee, and the outer `*` of `**[N]T` parses
-# nothing, so they are current in both.  A `**[N]T` records N and T as the
-# `*[N]T` that `*r` reads does.
-fn ptr_names_array(p: *Parser, ty: i32) -> i32
-    if ty == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
-        return 1
-    if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR and p.last_inner_pointee_type == TYPE_ARRAY and p.last_ptr_depth == 2
-        return 1
-    # AGAST #2331: and `@*[N]T` / `@&*[N]T`, as `**[N]T`.  They recorded none, so
-    # `(*q)[i]` took the byte path: it read and stored the wrong bytes, SILENT.
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
-        return 1
+# AGAST #2539: 1 for `*[N]T` / `**[N]T` / `@*[N]T` / `@&*[N]T`.
+fn ptr_names_array(p: *Parser, tr: *TypeRef) -> i32
+    let a: *TypeRef = tr_array_node(tr)
+    if a == null
+        return 0
+    if tr == null
+        return 0
+    if tr.kind == TYPE_PTR
+        return (a == tr.pointee) as i32
+    if tr.kind == TYPE_PTR_PTR
+        if tr_depth(tr) != 2 or tr.pointee == null
+            return 0
+        if a == tr.pointee.pointee
+            return 1
+        return 0
+    if tr.kind == TYPE_REF or tr.kind == TYPE_MUT_REF
+        if tr.ref_inner == TYPE_PTR and a == tr.pointee.pointee
+            return 1
+        return 0
     0
 
-# AGAST #2098: the shape of a just-parsed `*[N][M]..T` (only type_ptr_nd lets
-# one parse), null for any other type.  Its holder records the flat `*[N*M..]T`
-# as a plane pointer `let q = @x[i]` does (#2570): `q + k` strides the whole
-# array and `q[i][j]` / `(*q)[i][j]` index over the shape.
-#
-# AGAST #3635: and a `**[N][M]..T`, which records it as the `*[N][M]..T` that
-# `*r` reads does, as a `**[N]T` records N and T (#2539).
-pub fn ptr_nd_pointee_shape(p: *Parser, ty: i32) -> *ArrayShape
-    if ty == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
-        return p.last_array_shape
-    if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR and p.last_inner_pointee_type == TYPE_ARRAY and p.last_ptr_depth == 2
-        return p.last_array_shape
-    # AGAST #4122: and `@*[N][M]..T` / `@&*[N][M]..T`, the `*[N][M]..T` that `*r`
-    # reads, as `@*[N]T` records N and T (#2331).
-    if (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
-        return p.last_array_shape
-    null
+# AGAST #2098: the shape of `*[N][M]..T`; null for any other type.  #3635: and
+# a `**[N][M]..T`; #4122: `@*[N][M]..T` / `@&*[N][M]..T`.
+pub fn ptr_nd_pointee_shape(p: *Parser, tr: *TypeRef) -> *ArrayShape
+    if ptr_names_array(p, tr) == 0
+        return null
+    let a: *TypeRef = tr_array_node(tr)
+    tr_shape(a)
 
 # The element count of `sh`, every dimension multiplied.
 fn nd_shape_count(sh: *ArrayShape) -> i32
@@ -4347,52 +4375,41 @@ fn nd_shape_count(sh: *ArrayShape) -> i32
         i = i + 1
     n
 
-# AGAST #1953: N for a just-parsed `*[N]T` (0 otherwise), or `**[N]T` (#2539).
-pub fn ptr_array_pointee_size(p: *Parser, ty: i32) -> i32
-    if ptr_names_array(p, ty) == 0
+# AGAST #1953: N for `*[N]T` (0 otherwise), or `**[N]T` (#2539).
+pub fn ptr_array_pointee_size(p: *Parser, tr: *TypeRef) -> i32
+    if ptr_names_array(p, tr) == 0
         return 0
-    return p.last_array_size
+    let a: *TypeRef = tr_array_node(tr)
+    tr_count(a) as i32
 
-# AGAST #1953: T for a just-parsed `*[N]T` (TYPE_VOID otherwise), or `**[N]T` (#2539).
-pub fn ptr_array_pointee_elem(p: *Parser, ty: i32) -> i32
-    if ptr_names_array(p, ty) == 0
+# AGAST #1953: T for `*[N]T` (TYPE_VOID otherwise), or `**[N]T` (#2539).
+pub fn ptr_array_pointee_elem(p: *Parser, tr: *TypeRef) -> i32
+    if ptr_names_array(p, tr) == 0
         return TYPE_VOID
-    return p.last_array_elem_type
+    let a: *TypeRef = tr_array_node(tr)
+    tr_elem_kind(a)
 
 # Handle pointer type *T
-# Stores the pointee type and preserves type name if pointing to struct/generic
-pub fn type_ptr(p: *Parser, written: i32) -> i32
-    nd_array_reject(p, written, parse_pos_line(p), parse_pos_col(p), c"a pointee")  # AGAST #1509
-    type_ptr_nd(p, written)
+pub fn type_ptr(p: *Parser, inner: *TypeRef) -> *TypeRef
+    nd_array_reject(p, inner, parse_pos_line(p), parse_pos_col(p), c"a pointee")  # AGAST #1509
+    type_ptr_nd(p, inner)
 
-# AGAST #2098: `*T`, where an N-D T `[N][M]..T` is lowered: the grammar calls
-# this only where the holder records the shape (ptr_nd_pointee_shape): a
-# param, a typed local, a field, a global, a return (#3635), and behind `@`,
-# `@&`, `:&`, an array's `[K]` or an `as` (#4122).  Every other `*` is
-# type_ptr, which refuses an N-D pointee.
-pub fn type_ptr_nd(p: *Parser, written: i32) -> i32
-    let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
-    if is_indirection(inner_type) == 0
-        p.last_inner_ref = INNER_REF_NONE
-    # Store pointee type for emitter
-    p.last_pointee_type = inner_type
-    # AGAST #184: track the deepest non-pointer pointee.  For **Foo the
-    # innermost type_ptr call has inner_type=TYPE_STRUCT and we lock that
-    # in; the outer call (inner_type=TYPE_PTR) leaves it alone.  This lets
-    # field_new tell **Foo from **u8 even though both end up with
-    # last_pointee_type=TYPE_PTR.
-    if inner_type != TYPE_PTR and inner_type != TYPE_PTR_PTR
-        p.last_inner_pointee_type = inner_type
-        p.last_ptr_depth = 1
+# AGAST #2098: `*T`, where an N-D T `[N][M]..T` is lowered (#4122: `**[N]T`,
+# `@*[N]T` too).  `inner` is what the `*` wraps.
+pub fn type_ptr_nd(p: *Parser, inner: *TypeRef) -> *TypeRef
+    var target: *TypeRef = ref_as_pointer(p, inner)   # AGAST #2399
+    let t: *TypeRef = typeref_new(p, TYPE_PTR)
+    # AGAST #184 / #1924: `T` and `**T`/`***T` — the kind is flat PTR_PTR for
+    # any depth >= 2; the chain carries the depth.
+    if tr_kind(target) == TYPE_PTR or tr_kind(target) == TYPE_PTR_PTR
+        t.kind = TYPE_PTR_PTR
+    t.pointee = target
+    # `last_inner_ref`: what the nearest level was, for a write and `*p`.
+    if is_indirection_kind(tr_kind(target)) == 0
+        t.inner_ref = INNER_REF_NONE
     else
-        # AGAST #1924: one more level on the pointer just built.
-        p.last_ptr_depth = p.last_ptr_depth + 1
-    # Note: last_type_name/len was already set by parsing inner_type if it's a struct/generic
-    # No need to modify it - stmt_var_decl will read both
-    # Return TYPE_PTR_PTR for pointer-to-pointer types
-    if inner_type == TYPE_PTR or inner_type == TYPE_PTR_PTR
-        return TYPE_PTR_PTR
-    return TYPE_PTR
+        t.inner_ref = tr_inner_ref(target)
+    t
 
 # =============================================================================
 # Type aliases (AGAST #1475)
@@ -4427,6 +4444,7 @@ struct AliasEntry
     inner_pointee_type: i32
     array_size: i32
     array_elem_type: i32
+    array_elem_pointee: i32
     array_elem_type_name: *u8
     array_elem_type_name_len: i32
     ref_inner_type: i32
@@ -4614,15 +4632,15 @@ fn type_alias_kind_has_state(kind: i32) -> i32
         return 1
     return 0
 
-# Grammar action for type_alias_def.  Runs after type_spec, so the parser
-# state is exactly the target type's.  attrs ran first, so p.skip_item is
-# already set for a [[target_os = "<not linux>"]] alias: don't record it.
-pub fn type_alias_record(p: *Parser, name_sv: StrView, kind: i32) -> i32
+# Grammar action for type_alias_def.  Runs after type_spec, so `tr` is the
+# target type.  attrs ran first, so p.skip_item is already set for a
+# [[target_os = "<not linux>"]] alias: don't record it.
+pub fn type_alias_record(p: *Parser, name_sv: StrView, tr: *TypeRef) -> *TypeRef
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
     if p.skip_item != 0
         gated_decl_log(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3467
-        return kind
+        return tr
     # AGAST #4021: the target, before NEWLINE, judged even if the alias is
     # never used (a use replays it, and is judged as the target).
     tn_note_last(p, 2)
@@ -4636,48 +4654,210 @@ pub fn type_alias_record(p: *Parser, name_sv: StrView, kind: i32) -> i32
             # surface much later as an unknown struct type.
             diag_error(g_parse_file, parse_span_at(p, p.pos), c"too many type aliases (raise MAX_TYPE_ALIASES)")
             p.error = 1
-            return kind
+            return tr
         e = malloc(sizeof(AliasEntry)) as *AliasEntry
         *(g_alias_table + g_alias_count) = e as *u8
         g_alias_count = g_alias_count + 1
     type_decl_log(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3907: a redeclaration too
+    # The alias table is process-wide (it must outlive this Parser's arena), so
+    # it keeps the flat snapshot, and type_alias_resolve rebuilds a *TypeRef
+    # from it.  Nothing is latched on the Parser any more (#4035).
+    let f: *TypeFacts = type_facts(p, tr)
     e.name = name
     e.name_len = len
-    e.kind = kind
-    e.type_name = p.last_type_name
-    e.type_name_len = p.last_type_name_len
-    e.pointee_type = p.last_pointee_type
-    e.inner_pointee_type = p.last_inner_pointee_type
-    e.ptr_depth = p.last_ptr_depth
-    e.array_size = p.last_array_size
-    e.array_elem_type = p.last_array_elem_type
-    e.array_elem_type_name = p.last_array_elem_type_name
-    e.array_elem_type_name_len = p.last_array_elem_type_name_len
-    e.array_shape = p.last_array_shape
-    e.ref_inner_type = p.last_ref_inner_type
-    e.inner_ref = p.last_inner_ref   # AGAST #2399
-    # AGAST #1879: a fn-type alias keeps its signature, so a value typed
-    # with the alias calls typed (and with the alias's [[callconv]]).
-    e.fn_sig = g_alias_fn_sig
-    g_alias_fn_sig = null
+    e.kind = f.kind
+    e.type_name = f.type_name
+    e.type_name_len = f.type_name_len
+    e.pointee_type = f.pointee_type
+    e.inner_pointee_type = f.inner_pointee_type
+    e.ptr_depth = f.ptr_depth
+    e.array_size = f.array_size
+    e.array_elem_type = f.array_elem_type
+    e.array_elem_pointee = f.array_elem_pointee
+    e.array_elem_type_name = f.array_elem_type_name
+    e.array_elem_type_name_len = f.array_elem_type_name_len
+    e.array_shape = f.array_shape
+    e.ref_inner_type = f.ref_inner_type
+    e.inner_ref = f.inner_ref   # AGAST #2399
+    # AGAST #1879: a fn-type alias keeps its signature.
+    e.fn_sig = f.fn_sig
+    if e.fn_sig != null and (g_attr_bits & ATTR_WIN64) != 0
+        item_attr_record(e.fn_sig as *u8, ATTR_WIN64)
     var slen: i32 = 0
     e.spelling = type_alias_spell(p, name, @slen)
     e.spelling_len = slen
-    if e.fn_sig != null and (g_attr_bits & ATTR_WIN64) != 0
-        item_attr_record(e.fn_sig as *u8, ATTR_WIN64)
-    return kind
+    return tr
 
-# The signature of the fn type an alias names, latched by alias_type_latch
-# where the type ends; null for any other type.
-var g_alias_fn_sig: *FnDef = null
+# Grammar action around an alias's type.  #4035: the *TypeRef is already the
+# whole snapshot, so there is nothing left to latch.
+pub fn alias_type_latch(p: *Parser, tr: *TypeRef) -> *TypeRef
+    tr
 
-pub fn alias_type_latch(p: *Parser, kind: i32) -> i32
-    g_alias_fn_sig = fresh_fn_sig(p)
-    kind
+# The leaf `*TypeRef` an alias snapshot names: a struct by the recorded name,
+# a primitive by the recorded kind.
+fn alias_leaf_typeref(p: *Parser, kind: i32, name: *u8, name_len: i32) -> *TypeRef
+    let t: *TypeRef = typeref_new(p, kind)
+    if kind == TYPE_STRUCT
+        t.name = name
+        t.name_len = name_len
+    t
+
+# A pointer chain `depth` levels deep ending in `leaf`, as type_ptr_nd builds
+# it (`**T` is PTR_PTR -> PTR -> T).  `inner_ref` goes on the outermost level,
+# as type_ptr_nd leaves it.
+fn alias_ptr_chain(p: *Parser, depth: i32, leaf: *TypeRef, inner_ref: i32) -> *TypeRef
+    var t: *TypeRef = typeref_new(p, TYPE_PTR)
+    t.pointee = leaf
+    var d: i32 = 1
+    while d < depth
+        let outer: *TypeRef = typeref_new(p, TYPE_PTR_PTR)
+        outer.pointee = t
+        outer.inner_ref = INNER_REF_NONE
+        t = outer
+        d = d + 1
+    t.inner_ref = inner_ref
+    t
+
+# A deep pointee from the flat, PTR_DEPTH_UNIT-packed slot the alias table
+# keeps (`tr_ptr_ptr_inner_pointee`'s answer): the kind itself, plus one
+# `**` level per PTR_DEPTH_UNIT past the first two.
+fn alias_packed_ptr_typeref(p: *Parser, slot: i32, name: *u8, name_len: i32) -> *TypeRef
+    let raw: i32 = ptr_ptr_slot_inner(slot)
+    var depth: i32 = 2
+    if slot >= PTR_DEPTH_UNIT and raw > 0
+        depth = 2 + (slot - raw) / PTR_DEPTH_UNIT
+    let leaf: *TypeRef = alias_leaf_typeref(p, raw, name, name_len)
+    alias_ptr_chain(p, depth, leaf, INNER_REF_NONE)
+
+# The element of an alias snapshot's array: a primitive, a struct by its
+# recorded name, or the pointer / reference / packed-pointer the flat
+# `array_elem_type` / `array_elem_pointee` pair describes.
+fn alias_array_elem_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
+    let k: i32 = e.array_elem_type
+    var name: *u8 = e.array_elem_type_name
+    var name_len: i32 = e.array_elem_type_name_len
+    if k == TYPE_PTR
+        let t: *TypeRef = typeref_new(p, TYPE_PTR)
+        t.pointee = alias_leaf_typeref(p, e.array_elem_pointee, name, name_len)
+        return t
+    if k == TYPE_PTR_PTR
+        return alias_packed_ptr_typeref(p, e.array_elem_pointee, name, name_len)
+    if k == TYPE_REF or k == TYPE_MUT_REF
+        let t: *TypeRef = typeref_new(p, k)
+        t.pointee = alias_leaf_typeref(p, e.array_elem_pointee, name, name_len)
+        t.ref_inner = e.array_elem_pointee
+        return t
+    alias_leaf_typeref(p, k, name, name_len)
+
+# An array `[N]..T` from an alias snapshot.  `shape` (when present) names every
+# dimension; otherwise `count` is the one dimension.
+fn alias_array_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
+    let sh: *ArrayShape = e.array_shape
+    var count: i64 = e.array_size as i64
+    var elem_kind: i32 = e.array_elem_type
+    if sh != null
+        count = sh.dims[0] as i64
+        elem_kind = sh.leaf_type
+        if sh.rank > 1
+            elem_kind = TYPE_ARRAY
+    let t: *TypeRef = typeref_new(p, TYPE_ARRAY)
+    t.count = count
+    t.shape = sh
+    if elem_kind == TYPE_ARRAY
+        let inner: *TypeRef = typeref_new(p, TYPE_ARRAY)
+        if sh != null and sh.rank > 1
+            inner.count = sh.dims[1] as i64
+            if sh.rank > 2
+                inner.elem = typeref_new(p, TYPE_ARRAY)
+        else
+            inner.count = e.array_size as i64
+        t.elem = inner
+    else
+        t.elem = alias_array_elem_typeref(p, e)
+    t
+
+# The referent of an alias's `@T` / `@&T`: its own pointer when `ref_inner` is
+# one, else the referent kind itself.
+fn alias_referent_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
+    if e.ref_inner_type == TYPE_PTR
+        if e.pointee_type == TYPE_ARRAY
+            let arr: *TypeRef = alias_array_typeref(p, e)
+            let ptr: *TypeRef = typeref_new(p, TYPE_PTR)
+            ptr.pointee = arr
+            return ptr
+        let ptr: *TypeRef = typeref_new(p, TYPE_PTR)
+        ptr.pointee = alias_leaf_typeref(p, e.pointee_type, e.type_name, e.type_name_len)
+        return ptr
+    if e.ref_inner_type == TYPE_PTR_PTR
+        # The referent is a `**..T`: its depth comes from the snapshot's
+        # ptr_depth, its leaf from the recorded inner pointee.
+        var leaf_kind: i32 = e.inner_pointee_type
+        if leaf_kind >= PTR_DEPTH_UNIT
+            leaf_kind = ptr_ptr_slot_inner(leaf_kind)
+        let leaf: *TypeRef = alias_leaf_typeref(p, leaf_kind, e.type_name, e.type_name_len)
+        var depth: i32 = e.ptr_depth
+        if depth < 2
+            depth = 2
+        return alias_ptr_chain(p, depth, leaf, INNER_REF_NONE)
+    if e.ref_inner_type == TYPE_ARRAY
+        return alias_array_typeref(p, e)
+    alias_leaf_typeref(p, e.ref_inner_type, e.type_name, e.type_name_len)
+
+# A `*..T` from an alias snapshot: `ptr_depth` levels ending in the recorded
+# leaf kind (`PTR_DEPTH_UNIT`-packed past two, as the flat slot was).
+fn alias_pointer_typeref(p: *Parser, e: *AliasEntry) -> *TypeRef
+    let depth: i32 = e.ptr_depth
+    if depth >= 2
+        # Every level past two is packed into the inner-pointee slot; unpack
+        # it back into the chain the parser would have built.
+        if e.inner_pointee_type >= PTR_DEPTH_UNIT
+            return alias_packed_ptr_typeref(p, e.inner_pointee_type, e.type_name, e.type_name_len)
+        let leaf_kind: i32 = ptr_ptr_slot_inner(e.inner_pointee_type)
+        var leaf: *TypeRef = null
+        if leaf_kind == TYPE_ARRAY
+            leaf = alias_array_typeref(p, e)
+        else
+            leaf = alias_leaf_typeref(p, leaf_kind, e.type_name, e.type_name_len)
+        return alias_ptr_chain(p, depth, leaf, e.inner_ref)
+    var leaf: *TypeRef = null
+    if e.pointee_type == TYPE_ARRAY
+        leaf = alias_array_typeref(p, e)
+    else
+        leaf = alias_leaf_typeref(p, e.pointee_type, e.type_name, e.type_name_len)
+    alias_ptr_chain(p, 1, leaf, e.inner_ref)
+
+# Called from type_named.  Returns the alias's target as a `*TypeRef`, or null
+# when `name` is not an alias (no alias can be TYPE_VOID: type_spec never
+# yields it).  #4035: the alias table keeps the flat snapshot (it outlives the
+# Parser arena); this rebuilds the chain from it.
+pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> *TypeRef
+    var name: *u8 = name_sv.ptr
+    var len: i32 = name_sv.len as i32
+    let e: *AliasEntry = type_alias_find(StrView { ptr: (name), len: (len) as i64 })
+    if e == null
+        return null
+    var t: *TypeRef = null
+    if e.kind == TYPE_STRUCT
+        t = alias_leaf_typeref(p, TYPE_STRUCT, e.type_name, e.type_name_len)
+    else if e.kind == TYPE_PTR or e.kind == TYPE_PTR_PTR
+        t = alias_pointer_typeref(p, e)
+    else if e.kind == TYPE_ARRAY
+        t = alias_array_typeref(p, e)
+    else if e.kind == TYPE_REF or e.kind == TYPE_MUT_REF
+        t = typeref_new(p, e.kind)
+        t.pointee = alias_referent_typeref(p, e)
+        t.ref_inner = e.ref_inner_type
+        t.inner_ref = e.inner_ref
+    else
+        t = typeref_new(p, e.kind)
+    if e.fn_sig != null
+        t.fn_sig = e.fn_sig
+    t
 
 # `sizeof(Alias)` (AGAST #2124): the alias's target as `count` values of leaf
 # kind `*leaf` (struct `*leaf_name` for TYPE_STRUCT).  0 when `name` is no
 # alias.  The emitter sizes the leaf; an alias of a pointer is one pointer.
+# #4035: reads the alias table's flat snapshot, which outlives the Parser.
 pub fn type_alias_sizeof_shape(name_sv: StrView, count: *i64, leaf: *i32, leaf_name: **u8, leaf_len: *i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
@@ -4707,34 +4887,6 @@ pub fn type_alias_sizeof_shape(name_sv: StrView, count: *i64, leaf: *i32, leaf_n
             *leaf_len = e.array_elem_type_name_len
     return 1
 
-# Called from type_named.  Returns the alias's kind with its parse state
-# replayed into p, or TYPE_VOID when `name` is not an alias (no alias can
-# have kind TYPE_VOID: type_spec never yields it).
-pub fn type_alias_resolve(p: *Parser, name_sv: StrView) -> i32
-    var name: *u8 = name_sv.ptr
-    var len: i32 = name_sv.len as i32
-    let e: *AliasEntry = type_alias_find(StrView { ptr: (name), len: (len) as i64 })
-    if e == null
-        return TYPE_VOID
-    if type_alias_kind_has_state(e.kind) == 1
-        p.last_type_name = e.type_name
-        p.last_type_name_len = e.type_name_len
-        p.last_pointee_type = e.pointee_type
-        p.last_inner_pointee_type = e.inner_pointee_type
-        p.last_ptr_depth = e.ptr_depth
-        p.last_array_size = e.array_size
-        p.last_array_elem_type = e.array_elem_type
-        p.last_array_elem_type_name = e.array_elem_type_name
-        p.last_array_elem_type_name_len = e.array_elem_type_name_len
-        p.last_array_shape = e.array_shape
-        p.last_ref_inner_type = e.ref_inner_type
-        p.last_inner_ref = e.inner_ref
-    if e.fn_sig != null
-        # As type_fn leaves it: fresh at the token after the alias name.
-        p.last_fn_sig = e.fn_sig
-        p.last_fn_sig_pos = p.pos
-    return e.kind
-
 # item dispatcher for type_alias_def: like item_dispatch_enum, the alias
 # has no AST node (it lives in the alias table), so only reset skip_item.
 pub fn item_dispatch_alias(p: *Parser) -> i32
@@ -4743,57 +4895,59 @@ pub fn item_dispatch_alias(p: *Parser) -> i32
     return 1
 
 # Handle immutable reference type @T
-# References are semantically pointers for now - store the inner type info
-pub fn type_ref(p: *Parser, written: i32) -> i32
-    let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
-    if is_indirection(inner_type) == 0
-        p.last_inner_ref = INNER_REF_SHARED
-    # Store inner type information for emitter
-    p.last_ref_inner_type = inner_type
-    return TYPE_REF
+# References are semantically pointers for now - the referent rides in pointee.
+pub fn type_ref(p: *Parser, inner: *TypeRef) -> *TypeRef
+    let target: *TypeRef = ref_as_pointer(p, inner)   # AGAST #2399
+    let t: *TypeRef = typeref_new(p, TYPE_REF)
+    t.pointee = target
+    t.ref_inner = tr_kind(target)
+    if is_indirection_kind(tr_kind(target)) == 0
+        t.inner_ref = INNER_REF_SHARED
+    else
+        t.inner_ref = tr_inner_ref(target)
+    t
 
-# Handle mutable reference type @@T
-# References are semantically pointers for now - store the inner type info
-pub fn type_mut_ref(p: *Parser, written: i32) -> i32
-    let inner_type: i32 = ref_as_pointer(p, written)   # AGAST #2399
-    if is_indirection(inner_type) == 0
-        p.last_inner_ref = INNER_REF_MUT
-    # Store inner type information for emitter
-    p.last_ref_inner_type = inner_type
-    return TYPE_MUT_REF
+# Handle mutable reference type @&T
+pub fn type_mut_ref(p: *Parser, inner: *TypeRef) -> *TypeRef
+    let target: *TypeRef = ref_as_pointer(p, inner)   # AGAST #2399
+    let t: *TypeRef = typeref_new(p, TYPE_MUT_REF)
+    t.pointee = target
+    t.ref_inner = tr_kind(target)
+    if is_indirection_kind(tr_kind(target)) == 0
+        t.inner_ref = INNER_REF_MUT
+    else
+        t.inner_ref = tr_inner_ref(target)
+    t
 
-fn is_indirection(ty: i32) -> i32
-    (ty == TYPE_PTR or ty == TYPE_PTR_PTR or ty == TYPE_REF or ty == TYPE_MUT_REF) as i32
-
-# AGAST #2399: last_inner_ref, for a just-parsed `ty` that has a level.
-pub fn inner_ref_of(p: *Parser, ty: i32) -> i32
-    if is_indirection(ty) == 0
-        return 0
-    p.last_inner_ref
+# AGAST #2399: `last_inner_ref`, for a just-parsed type that has a level.
+pub fn inner_ref_of(p: *Parser, tr: *TypeRef) -> i32
+    tr_inner_ref(tr)
 
 # AGAST #2399: a reference is a pointer, so one to a reference to a struct is
 # held as one to a pointer: `@@S` as `@*S`, `*@&S` as `**S`, `@&@*S` as `@&**S`.
-# `.` then goes through each level as it does for those, and the struct's name
-# stays in last_type_name.  `inner_type` is what the `@` / `*` wraps; the kind
-# returned is what it wraps now.  What the nearest level was stays in
-# last_inner_ref, which decides a write (§13.3) and what `*p` is.
-fn ref_as_pointer(p: *Parser, inner_type: i32) -> i32
-    if inner_type != TYPE_REF and inner_type != TYPE_MUT_REF
-        return inner_type
-    let x: i32 = p.last_ref_inner_type
+# `.` then goes through each level as it does for those.  `inner` is what the
+# `@` / `*` wraps; the `*TypeRef` returned is what it wraps now.
+fn ref_as_pointer(p: *Parser, inner: *TypeRef) -> *TypeRef
+    let k: i32 = tr_kind(inner)
+    if k != TYPE_REF and k != TYPE_MUT_REF
+        return inner
+    let x: i32 = tr_ref_inner(inner)
     var named: i32 = 0
     if x == TYPE_STRUCT
         named = 1
-    else if x == TYPE_PTR and p.last_pointee_type == TYPE_STRUCT
+    else if x == TYPE_PTR and tr_pointee_kind(inner.pointee) == TYPE_STRUCT
         named = 1
-    else if x == TYPE_PTR_PTR and ptr_ptr_slot_inner(ptr_ptr_inner_pointee(p, TYPE_PTR_PTR)) == TYPE_STRUCT
+    else if x == TYPE_PTR_PTR and ptr_ptr_slot_inner(tr_ptr_ptr_inner_pointee(inner.pointee)) == TYPE_STRUCT
         named = 1
     if named == 0
-        return inner_type
-    let nearest: i32 = p.last_inner_ref
-    let k: i32 = type_ptr(p, x)
-    p.last_inner_ref = nearest
-    k
+        return inner
+    # The type wrapped is the referent itself, so a `*` on it keeps its name.
+    let t: *TypeRef = typeref_new(p, TYPE_PTR)
+    if tr_kind(inner.pointee) == TYPE_PTR or tr_kind(inner.pointee) == TYPE_PTR_PTR
+        t.kind = TYPE_PTR_PTR
+    t.pointee = inner.pointee
+    t.inner_ref = tr_inner_ref(inner)
+    t
 
 # Saved identity of ONE generic type argument, captured right after it
 # parses.  Without it, mangling `Result<Vec<u8>, StrView>` would read StrView
@@ -4811,31 +4965,33 @@ fn ref_as_pointer(p: *Parser, inner_type: i32) -> i32
 #
 # Called from grammar rules first_generic_type_arg / first_generic_type_arg_shr
 # right after the argument's type_spec parses, while last_type_name is fresh.
-pub fn capture_first_generic_arg(p: *Parser, ty: i32) -> *GenericArg
+pub fn capture_first_generic_arg(p: *Parser, tr: *TypeRef) -> *GenericArg
     let ga: *GenericArg = parser_alloc(p, sizeof(GenericArg)) as *GenericArg
+    let ty: i32 = tr_kind(tr)
+    let facts: *TypeFacts = type_facts(p, tr)
     ga.ty = ty
     if ty == TYPE_STRUCT
-        ga.name = p.last_type_name
-        ga.name_len = p.last_type_name_len
+        ga.name = facts.type_name
+        ga.name_len = facts.type_name_len
     else if ty == TYPE_PTR or ty == TYPE_PTR_PTR
         # AGAST #1519: a pointer's pointee is only in parser state now, so
         # spell it here ("ptr_u8", "ptr_ptr_Foo"); generic_arg_spelling
         # returns the saved name.
         var n: i32 = 0
-        ga.name = spell_ptr_generic_arg(p, ty, @n)
+        ga.name = spell_ptr_generic_arg(p, tr, @n)
         ga.name_len = n
     else if ty == TYPE_ARRAY
         # AGAST #2832: `[2]i8` is "arr2_i8".  It spelled as nothing, so
         # `Box<[2]i8>` and `Box<[4]i64>` were one `%Box$`.
         var n: i32 = 0
-        ga.name = spell_last_array(p, @n)
+        ga.name = spell_last_array(p, tr, @n)
         ga.name_len = n
     else if ty == TYPE_REF or ty == TYPE_MUT_REF
         # AGAST #2384: `@C` is "ref_C", `@&C` "refmut_C".  Both spelled as
         # nothing, so `Option<@&A>` and `Option<@&B>` were one `%Option$`
         # with no payload to measure or judge.
         var n: i32 = 0
-        ga.name = spell_ref_generic_arg(p, ty, @n)
+        ga.name = spell_ref_generic_arg(p, tr, @n)
         ga.name_len = n
     else if ty == TYPE_VOID
         # AGAST #2272: `()`.  Only the unit type parses to TYPE_VOID here.
@@ -4865,8 +5021,8 @@ pub fn generic_arg_mark(p: *Parser) -> i32
     p.pos
 
 # capture_first_generic_arg for an argument that started at token `start`.
-pub fn capture_generic_arg_at(p: *Parser, ty: i32, start: i32) -> *GenericArg
-    let ga: *GenericArg = capture_first_generic_arg(p, ty)
+pub fn capture_generic_arg_at(p: *Parser, tr: *TypeRef, start: i32) -> *GenericArg
+    let ga: *GenericArg = capture_first_generic_arg(p, tr)
     if start >= 0 and start < p.token_count
         let t: *Token = p.tokens + start
         ga.at = diag_span(t.line, t.col)
@@ -4918,18 +5074,19 @@ pub fn primitive_arg_spelling(ty: i32, out: **u8) -> i32
 # primitive's name or the struct/generic name in last_type_name.  `*u8` is
 # "ptr_u8", `**Foo` "ptr_ptr_Foo", `***u8` "ptr_ptr_ptr_u8" (the depth past
 # two levels is packed into the inner-pointee slot, AGAST #3686).
-fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
-    if p.last_inner_pointee_type == TYPE_ARRAY
-        # AGAST #2832: `*[2]i8` is "ptr_arr2_i8".  The array's spelling stands
-        # where a struct pointee's name would.
+fn spell_ptr_generic_arg(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
+    let ty: i32 = tr_kind(tr)
+    let facts: *TypeFacts = type_facts(p, tr)
+    if facts.inner_pointee_type == TYPE_ARRAY
+        # AGAST #2832: `*[2]i8` is "ptr_arr2_i8".
         var n: i32 = 0
-        let arr: *u8 = spell_last_array(p, @n)
-        return spell_ptr_parts(p, ty, p.last_pointee_type, TYPE_STRUCT, StrView { ptr: (arr), len: (n) as i64 }, out_len)
+        let arr: *u8 = spell_last_array(p, tr.pointee, @n)
+        return spell_ptr_parts(p, ty, facts.pointee_type, TYPE_STRUCT, StrView { ptr: (arr), len: (n) as i64 }, out_len)
     # AGAST #3686: past two levels the pointee is itself a `**`; pass the
     # depth-packed slot, as a `***u8` local records it.
-    if ty == TYPE_PTR_PTR and p.last_pointee_type == TYPE_PTR_PTR
-        return spell_ptr_parts(p, ty, TYPE_PTR, ptr_ptr_inner_pointee(p, ty), StrView { ptr: (p.last_type_name), len: (p.last_type_name_len) as i64 }, out_len)
-    return spell_ptr_parts(p, ty, p.last_pointee_type, p.last_inner_pointee_type, StrView { ptr: (p.last_type_name), len: (p.last_type_name_len) as i64 }, out_len)
+    if ty == TYPE_PTR_PTR and facts.pointee_type == TYPE_PTR_PTR
+        return spell_ptr_parts(p, ty, TYPE_PTR, tr_ptr_ptr_inner_pointee(tr), StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, out_len)
+    return spell_ptr_parts(p, ty, facts.pointee_type, facts.inner_pointee_type, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, out_len)
 
 # AGAST #2384: the reference type that just parsed, spelled as ritz0's
 # mangle_type_name spells a RefType: "ref_" (`@T`) or "refmut_" (`@&T`), then
@@ -4938,17 +5095,19 @@ fn spell_ptr_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
 # state in p, so it reads as if the referent alone had just parsed.  A
 # referent that has no spelling (a reference to a reference, whose state the
 # outer one overwrote; a fn type) spells as "" (out_len 0), as before.
-fn spell_ref_generic_arg(p: *Parser, ty: i32, out_len: *i32) -> *u8
-    let inner: i32 = p.last_ref_inner_type
+fn spell_ref_generic_arg(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
+    let ty: i32 = tr_kind(tr)
+    let facts: *TypeFacts = type_facts(p, tr)
+    let inner: i32 = facts.ref_inner_type
     var base: *u8 = null
     var base_len: i32 = 0
     if inner == TYPE_STRUCT
-        base = p.last_type_name
-        base_len = p.last_type_name_len
+        base = facts.type_name
+        base_len = facts.type_name_len
     else if inner == TYPE_PTR or inner == TYPE_PTR_PTR
-        base = spell_ptr_generic_arg(p, inner, @base_len)
+        base = spell_ptr_generic_arg(p, tr.pointee, @base_len)
     else if inner == TYPE_ARRAY
-        base = spell_last_array(p, @base_len)
+        base = spell_last_array(p, tr.pointee, @base_len)
     else
         base_len = primitive_arg_spelling(inner, @base)
     if base == null or base_len <= 0
@@ -4985,20 +5144,21 @@ pub fn mangled_ref_prefix(name_sv: StrView) -> i32
 # struct's, or "ptr_" + either for a one-level pointer element.  `[2]i8` is
 # "arr2_i8", `[3]Foo` "arr3_Foo", `[4]*u8` "arr4_ptr_u8".  Any other element
 # spells as "" (out_len 0), as an unspellable argument always has.  Reads
-# p.last_array_*, which type_array wrote for this array.
+# the last_array_* side channel, which type_array wrote for this array.
 #
 # AGAST #3634: a `[N][M]..E` is every dimension's prefix around its leaf, as
 # ritz0 nests it: `[2][3]u8` is "arr2_arr3_u8".  monomorph's array_arg_decode
 # reads the shape back.
-fn spell_last_array(p: *Parser, out_len: *i32) -> *u8
+fn spell_last_array(p: *Parser, tr: *TypeRef, out_len: *i32) -> *u8
+    let facts: *TypeFacts = type_facts(p, tr)
     var elem: *u8 = null
     var elem_len: i32 = 0
     var ptr: i32 = 0
-    let sh: *ArrayShape = p.last_array_shape
-    var et: i32 = p.last_array_elem_type
-    var ep: i32 = p.last_array_elem_pointee
-    var en: *u8 = p.last_array_elem_type_name
-    var en_len: i32 = p.last_array_elem_type_name_len
+    let sh: *ArrayShape = facts.array_shape
+    var et: i32 = facts.array_elem_type
+    var ep: i32 = facts.array_elem_pointee
+    var en: *u8 = facts.array_elem_type_name
+    var en_len: i32 = facts.array_elem_type_name_len
     var dims: i32 = 1
     if sh != null
         et = sh.leaf_type
@@ -5032,7 +5192,7 @@ fn spell_last_array(p: *Parser, out_len: *i32) -> *u8
         if sh != null
             pos = pos + write_dec_i32(name + pos, sh.dims[d])
         else
-            pos = pos + write_dec_i32(name + pos, p.last_array_size)
+            pos = pos + write_dec_i32(name + pos, facts.array_size)
         *(name + pos) = 95  # '_'
         pos = pos + 1
     if ptr == 1
@@ -5206,8 +5366,8 @@ fn mangle_generic_args(p: *Parser, base_name_sv: StrView, ga: *GenericArg, out_l
 
 # Mangle a generic type like Result<Vec<u8>, StrView> → Result$Vec$u8$StrView
 # from the arguments captured by capture_first_generic_arg.  Returns
-# TYPE_STRUCT with the name in p.last_type_name, like type_generic.
-pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericArg) -> i32
+# TYPE_STRUCT with the name in the last_type_name side channel, like type_generic.
+pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericArg) -> *TypeRef
     var base_name: *u8 = base_name_sv.ptr
     var base_len: i32 = base_name_sv.len as i32
     var cur: *GenericArg = ga
@@ -5215,11 +5375,13 @@ pub fn type_generic_with_saved(p: *Parser, base_name_sv: StrView, ga: *GenericAr
         tn_note(p, StrView { ptr: (cur.written), len: (cur.written_len) as i64 })   # AGAST #4021
         cur = cur.next
     var len: i32 = 0
-    p.last_type_name = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga, @len)
-    p.last_type_name_len = len
+    let mangled: *u8 = mangle_generic_args(p, StrView { ptr: (base_name), len: (base_len) as i64 }, ga, @len)
     if p.skip_item == 0
-        generic_use_note_mangled(StrView { ptr: (p.last_type_name), len: (len) as i64 }, ga, diag_span(0, 0), parse_file_copy_shared(p))
-    return TYPE_STRUCT
+        generic_use_note_mangled(StrView { ptr: (mangled), len: (len) as i64 }, ga, diag_span(0, 0), parse_file_copy_shared(p))
+    let t: *TypeRef = typeref_new(p, TYPE_STRUCT)
+    t.name = mangled
+    t.name_len = len
+    t
 
 # =============================================================================
 # Where each generic instance is first written (AGAST #3469)
@@ -5297,7 +5459,7 @@ pub fn generic_use_first(name_sv: StrView, suffix_sv: StrView) -> *GenericUse
 # as ritz0's make_slice_type desugars it.  `elem` is T, captured by
 # first_generic_type_arg as for `Span<T>`, so `[u8]` is TYPE_STRUCT "Span$u8":
 # the same type, so either one fits wherever the other does.
-pub fn type_slice(p: *Parser, elem: *GenericArg) -> i32
+pub fn type_slice(p: *Parser, elem: *GenericArg) -> *TypeRef
     return type_generic_with_saved(p, StrView { ptr: (c"Span"), len: (4) as i64 }, elem)
 
 # =============================================================================
@@ -5341,12 +5503,12 @@ var g_tuple_regs: *TupleReg = null
 # 1 once the current module's parse built a tuple literal (tuple_lit).
 var g_tuple_lits: i32 = 0
 
-# Called from grammar rule tuple_type_elem right after the element's
-# type_spec parses, while its parse state (struct name, pointee) is fresh.
-pub fn tuple_elem_new(p: *Parser, ty: i32) -> *TupleElem
+# Called from grammar rule tuple_type_elem with the element's parsed
+# *TypeRef (AGAST #4035: the type is the chain, not parser side state).
+pub fn tuple_elem_new(p: *Parser, tr: *TypeRef) -> *TupleElem
     let te: *TupleElem = parser_alloc(p, sizeof(TupleElem)) as *TupleElem
-    te.field = field_new(p, StrView { ptr: (null), len: (0) as i64 }, ty, parse_pos_line(p), parse_pos_col(p))
-    te.ga = capture_first_generic_arg(p, ty)
+    te.field = field_new(p, StrView { ptr: (null), len: (0) as i64 }, tr, parse_pos_line(p), parse_pos_col(p))
+    te.ga = capture_first_generic_arg(p, tr)
     te.next = null
     return te
 
@@ -5411,8 +5573,8 @@ pub fn tuple_reg_place(r: *TupleReg, m: *Module)
     module_add_struct(m, r.def)
 
 # The tuple type `(A, B, ...)`: TYPE_STRUCT named "tuple_A_B..." in
-# p.last_type_name, its StructDef added to p.module the first time.
-pub fn type_tuple(p: *Parser, elems: *TupleElem) -> i32
+# the last_type_name side channel, its StructDef added to p.module the first time.
+pub fn type_tuple(p: *Parser, elems: *TupleElem) -> *TypeRef
     var total: i32 = 5  # "tuple"
     var spell: *u8 = null
     var cur: *TupleElem = elems
@@ -5459,9 +5621,10 @@ pub fn type_tuple(p: *Parser, elems: *TupleElem) -> i32
         r.placed = 1
         r.next = g_tuple_regs
         g_tuple_regs = r
-    p.last_type_name = name
-    p.last_type_name_len = pos
-    return TYPE_STRUCT
+    let t: *TypeRef = typeref_new(p, TYPE_STRUCT)
+    t.name = name
+    t.name_len = pos
+    t
 
 # The tuple expression `(first, rest...)`: a struct literal whose fields are
 # "0", "1", ... and whose type name tuple_resolve_module fills in.
@@ -5908,16 +6071,18 @@ pub fn stmt_named2(s: *Stmt, line: i32, col: i32) -> *Stmt
     s.name2_span.col = col
     return s
 
-pub fn stmt_let_decl(p: *Parser, name_sv: StrView, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_let_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, line: i32, col: i32) -> *Stmt
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let s: *Stmt = stmt_var_decl(p, StrView { ptr: (name), len: (len) as i64 }, ty, init, line, col)
+    let s: *Stmt = stmt_var_decl(p, StrView { ptr: (name), len: (len) as i64 }, tr, init, line, col)
     s.var_is_let = 1
     return s
 
-pub fn stmt_var_decl(p: *Parser, name_sv: StrView, ty: i32, init: *Expr, line: i32, col: i32) -> *Stmt
+pub fn stmt_var_decl(p: *Parser, name_sv: StrView, tr: *TypeRef, init: *Expr, line: i32, col: i32) -> *Stmt
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
+    let ty: i32 = tr_kind(tr)
+    let facts: *TypeFacts = type_facts(p, tr)
     note_pass_binding(StrView { ptr: (name), len: (len) as i64 })   # AGAST #3320
     let s: *Stmt = parser_alloc(p, sizeof(Stmt)) as *Stmt
     s.kind = STMT_VAR_DECL
@@ -5965,8 +6130,8 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, ty: i32, init: *Expr, line: i
             s.var_type_name = p.var_type_name as *u8
             s.var_type_name_len = p.var_type_name_len
         else
-            s.var_type_name = p.last_type_name as *u8
-            s.var_type_name_len = p.last_type_name_len
+            s.var_type_name = facts.type_name
+            s.var_type_name_len = facts.type_name_len
     else if ty == TYPE_PTR and p.var_pointee == TYPE_STRUCT and p.var_type_name != null
         # AGAST #2822: `*S`, latched by capture_var_type (every typed decl
         # goes through it) before a `<*B>` in the initializer re-set it.
@@ -6017,7 +6182,7 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, ty: i32, init: *Expr, line: i
     if (ty == TYPE_PTR or ty == TYPE_PTR_PTR) and init != null
         s.var_pointee_type = p.var_pointee
     else if ty == TYPE_PTR or ty == TYPE_PTR_PTR
-        s.var_pointee_type = p.last_pointee_type
+        s.var_pointee_type = facts.pointee_type
     else if (ty == TYPE_REF or ty == TYPE_MUT_REF) and s.var_type_name_len > 0
         s.var_pointee_type = TYPE_STRUCT  # AGAST #1754, as param_new
     else
@@ -6029,8 +6194,8 @@ pub fn stmt_var_decl(p: *Parser, name_sv: StrView, ty: i32, init: *Expr, line: i
         s.var_inner_pointee_type = p.var_inner_pointee
         s.var_inner_ref = p.var_inner_ref   # AGAST #2399
     else
-        s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, ty)
-        s.var_inner_ref = inner_ref_of(p, ty)
+        s.var_inner_pointee_type = ptr_ptr_inner_pointee(p, tr)
+        s.var_inner_ref = inner_ref_of(p, tr)
     # AGAST #2822: a `*[N]T`'s pointee array, latched by capture_var_type.
     s.var_pointee_array_size = 0
     s.var_pointee_array_elem_type = TYPE_VOID
@@ -7333,7 +7498,7 @@ pub fn expr_float(p: *Parser, src_sv: StrView, line: i32, col: i32) -> *Expr
         if sfx != TYPE_VOID
             e.string_len = len - 3
             float_text_with_point(p, e)
-            let c: *Expr = expr_cast(p, e, sfx)
+            let c: *Expr = expr_cast(p, e, sfx, TYPE_VOID)
             c.cast_pointee = TYPE_VOID
             return c
     float_text_with_point(p, e)
@@ -7475,13 +7640,13 @@ pub fn expr_unary(p: *Parser, op: i32, operand: *Expr, line: i32, col: i32) -> *
     e.next = null
     return e
 
-pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32) -> *Expr
+pub fn expr_cast(p: *Parser, left: *Expr, target_type: i32, cast_pointee: i32) -> *Expr
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = EXPR_CAST
     e.span = left.span
     e.left = left
     e.op = target_type
-    e.cast_pointee = p.last_pointee_type
+    e.cast_pointee = cast_pointee
     e.cast_array = null
     e.cast_ptr_array = null
     e.fn_sig = null
@@ -7514,20 +7679,20 @@ pub fn expr_type_operand(p: *Parser, count: i64, t: i32, name_sv: StrView, line:
 
 # `sizeof([N]..T)` (AGAST #2124): an array type is no expression, so the
 # grammar reads `IDENT ( [N] type_spec )` here.  Any callee but `sizeof`
-# rejects (p.error) — `f([8]u8)` is not a program.  type_array runs for the
-# outer dimension, so p.last_array_* / last_array_shape describe the whole
-# type, exactly as for a declaration.
-pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, lbracket: Token, len_expr: *Expr, elem_type: i32) -> *Expr
+# rejects (p.error) — `f([8]u8)` is not a program.  type_array_expr builds the
+# whole `[N]..T` TypeRef; type_facts reads its shape.
+pub fn sizeof_array_type_call(p: *Parser, name_tok: Token, lbracket: Token, len_expr: *Expr, elem: *TypeRef) -> *Expr
     if name_tok.len != 6 or memcmp(name_tok.start, c"sizeof", 6) != 0
         p.error = 1
         return null
     # AGAST #2167: any constant length, folded as a declaration's is.
-    type_array_expr(p, len_expr, lbracket.line, lbracket.col, elem_type)
-    var count: i64 = p.last_array_size as i64
-    var leaf: i32 = p.last_array_elem_type
-    var leaf_name: *u8 = p.last_array_elem_type_name
-    var leaf_len: i32 = p.last_array_elem_type_name_len
-    let sh: *ArrayShape = p.last_array_shape
+    let t: *TypeRef = type_array_expr(p, len_expr, lbracket.line, lbracket.col, elem)
+    let facts: *TypeFacts = type_facts(p, t)
+    var count: i64 = facts.array_size as i64
+    var leaf: i32 = facts.array_elem_type
+    var leaf_name: *u8 = facts.array_elem_type_name
+    var leaf_len: i32 = facts.array_elem_type_name_len
+    let sh: *ArrayShape = facts.array_shape
     if sh != null
         count = 1
         var d: i32 = 0
@@ -7548,8 +7713,9 @@ pub fn sizeof_generic_type_call(p: *Parser, name_tok: Token, base_tok: Token, ga
     if name_tok.len != 6 or memcmp(name_tok.start, c"sizeof", 6) != 0
         p.error = 1
         return null
-    let t: i32 = type_generic_with_saved(p, StrView { ptr: (base_tok.start), len: (base_tok.len) as i64 }, ga)
-    let arg: *Expr = expr_type_operand(p, 1, t, StrView { ptr: (p.last_type_name), len: (p.last_type_name_len) as i64 }, base_tok.line, base_tok.col)
+    let t: *TypeRef = type_generic_with_saved(p, StrView { ptr: (base_tok.start), len: (base_tok.len) as i64 }, ga)
+    let facts: *TypeFacts = type_facts(p, t)
+    let arg: *Expr = expr_type_operand(p, 1, facts.kind, StrView { ptr: (facts.type_name), len: (facts.type_name_len) as i64 }, base_tok.line, base_tok.col)
     return expr_call(p, StrView { ptr: (name_tok.start), len: (name_tok.len) as i64 }, arg, name_tok.line, name_tok.col)
 
 pub fn expr_call(p: *Parser, name_sv: StrView, args: *Expr, line: i32, col: i32) -> *Expr
@@ -7569,15 +7735,18 @@ pub fn expr_call(p: *Parser, name_sv: StrView, args: *Expr, line: i32, col: i32)
 
 # Generic function call: name<type>(args) -> mangled_name(args)
 # Mangles the function name like type_generic does for types
-pub fn expr_generic_call(p: *Parser, name_sv: StrView, type_arg: i32, args: *Expr, line: i32, col: i32) -> *Expr
+pub fn expr_generic_call(p: *Parser, name_sv: StrView, type_arg: *TypeRef, args: *Expr, line: i32, col: i32) -> *Expr
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
+    let ta: i32 = tr_kind(type_arg)
+    var tn_len: i32 = 0
+    let tn: *u8 = tr_name(type_arg, @tn_len)
     # Build mangled name: name$type (e.g., vec_new$u8)
-    # name + '$' + type suffix + NUL.  A struct type can be as long as the
-    # parser's last type name; primitives add at most 3 chars ("i32").
+    # name + '$' + type suffix + NUL.  A struct type can be as long as its
+    # parsed name; primitives add at most 3 chars ("i32").
     var suffix_cap: i32 = 3
-    if type_arg == TYPE_STRUCT
-        suffix_cap = p.last_type_name_len
+    if ta == TYPE_STRUCT
+        suffix_cap = tn_len
     var mangled: *u8 = parser_alloc(p, (len + 1 + suffix_cap + 1) as i64) as *u8
     var pos: i32 = 0
 
@@ -7591,34 +7760,34 @@ pub fn expr_generic_call(p: *Parser, name_sv: StrView, type_arg: i32, args: *Exp
     pos = pos + 1
 
     # Add type argument name based on type
-    if type_arg == TYPE_U8
+    if ta == TYPE_U8
         *(mangled + pos) = 117  # 'u'
         pos = pos + 1
         *(mangled + pos) = 56   # '8'
         pos = pos + 1
-    else if type_arg == TYPE_I8
+    else if ta == TYPE_I8
         *(mangled + pos) = 105  # 'i'
         pos = pos + 1
         *(mangled + pos) = 56   # '8'
         pos = pos + 1
-    else if type_arg == TYPE_I32
+    else if ta == TYPE_I32
         *(mangled + pos) = 105  # 'i'
         pos = pos + 1
         *(mangled + pos) = 51   # '3'
         pos = pos + 1
         *(mangled + pos) = 50   # '2'
         pos = pos + 1
-    else if type_arg == TYPE_I64
+    else if ta == TYPE_I64
         *(mangled + pos) = 105  # 'i'
         pos = pos + 1
         *(mangled + pos) = 54   # '6'
         pos = pos + 1
         *(mangled + pos) = 52   # '4'
         pos = pos + 1
-    else if type_arg == TYPE_STRUCT
-        # Generic type or struct - use the last_type_name
-        for i in 0..p.last_type_name_len
-            *(mangled + pos) = *(p.last_type_name + i)
+    else if ta == TYPE_STRUCT
+        # Generic type or struct - use the parsed type's name
+        for i in 0..tn_len
+            *(mangled + pos) = *(tn + i)
             pos = pos + 1
 
     # Create call expression with mangled name
@@ -7696,69 +7865,60 @@ pub fn apply_binary_opt_p(p: *Parser, left: *Expr, chain: *BinaryOp) -> *Expr
 # Cast tail helpers (for cast expression parsing)
 # =============================================================================
 
-pub fn cast_tail_new(p: *Parser, ty: i32, next: *CastTail, as_line: i32, as_col: i32) -> *CastTail
+pub fn cast_tail_new(p: *Parser, tr: *TypeRef, next: *CastTail, as_line: i32, as_col: i32) -> *CastTail
     let ct: *CastTail = parser_alloc(p, sizeof(CastTail)) as *CastTail
+    let ty: i32 = tr_kind(tr)
+    let f: *TypeFacts = type_facts(p, tr)
     ct.cast_type = ty
     ct.next = next
     ct.as_at.line = as_line
     ct.as_at.col = as_col
+    ct.cast_pointee = f.pointee_type
     # AGAST #2120: `as EfiFn` keeps the signature (with the alias's
-    # [[callconv]]).  Same outermost-only rule as the pointee below: only
-    # then is the fn type the last thing parsed.
+    # [[callconv]]).  Only the outermost cast (next == null) takes it.
     ct.fn_sig = null
     if next == null and ty == TYPE_PTR
-        ct.fn_sig = fresh_fn_sig(p)
+        ct.fn_sig = f.fn_sig
     ct.array = null
     if next == null and ty == TYPE_ARRAY
-        ct.array = array_elem_of_last(p)
+        ct.array = array_elem_of_type(p, tr)
     # AGAST #4122: `as *[N][M]..T` keeps its shape, as a `*[N][M]..T` return does.
     # AGAST #4154: and `as *[N]T` its element's name, for the `p#` view of a
     # `let p = x as *[N]S` (inferred_array_elem_name reads it via base_ptr_array).
     ct.ptr_array = null
-    if next == null and ty == TYPE_PTR and p.last_pointee_type == TYPE_ARRAY
-        ct.ptr_array = param_of_type(p, StrView { ptr: (null), len: (0) as i64 }, ty)
+    if next == null and ty == TYPE_PTR and f.pointee_type == TYPE_ARRAY
+        ct.ptr_array = ptr_array_of_type(p, tr)
     ct.pointee_type = TYPE_VOID
     ct.pointee_name = null
     ct.pointee_name_len = 0
-    # AGAST #1453: record the pointee of `as *T`.  parse_cast_tail parses
-    # this tail's type, THEN the rest of the chain, THEN calls us, so the
-    # parser's last_* state belongs to this tail's type only when it is the
-    # last in the chain (next == null).  That is the outermost cast — the
-    # one whose type a `let x = ... as *T` takes.  Earlier tails stay
-    # unknown rather than pick up a later type's name.
+    # AGAST #1453: record the pointee of `as *T` for the outermost cast only —
+    # earlier tails stay unknown rather than pick up a later type's name.
     if next == null and ty == TYPE_PTR
-        ct.pointee_type = p.last_pointee_type
-        # last_type_name is stale for a primitive pointee (`*u8`); only a
-        # struct pointee names itself (same rule as stmt_var_decl).
-        if p.last_pointee_type == TYPE_STRUCT
-            ct.pointee_name = p.last_type_name as *u8
-            ct.pointee_name_len = p.last_type_name_len
-    # AGAST #3443: and the struct of `as @S` / `as @&S`, which type_ref /
-    # type_mut_ref leave in last_ref_inner_type, not last_pointee_type.
-    # Without it `(p as @&S).f = v` named no struct and was "unhandled
-    # EXPR_MEMBER in assignment".
-    if next == null and (ty == TYPE_REF or ty == TYPE_MUT_REF) and p.last_ref_inner_type == TYPE_STRUCT
+        ct.pointee_type = f.pointee_type
+        if f.pointee_type == TYPE_STRUCT
+            ct.pointee_name = f.type_name
+            ct.pointee_name_len = f.type_name_len
+    # AGAST #3443: and the struct of `as @S` / `as @&S`.
+    if next == null and (ty == TYPE_REF or ty == TYPE_MUT_REF) and f.ref_inner_type == TYPE_STRUCT
         ct.pointee_type = TYPE_STRUCT
-        ct.pointee_name = p.last_type_name as *u8
-        ct.pointee_name_len = p.last_type_name_len
+        ct.pointee_name = f.type_name
+        ct.pointee_name_len = f.type_name_len
     # AGAST #3757: and the scalar of `as @T` / `as @&T` (`(p as @&i32)[i] = v`
-    # strides by it), which type_ref / type_mut_ref leave there too.
-    if next == null and (ty == TYPE_REF or ty == TYPE_MUT_REF) and primitive_name_len(p.last_ref_inner_type) > 0
-        ct.pointee_type = p.last_ref_inner_type
+    # strides by it).
+    if next == null and (ty == TYPE_REF or ty == TYPE_MUT_REF) and primitive_name_len(f.ref_inner_type) > 0
+        ct.pointee_type = f.ref_inner_type
     # AGAST #2288: and the struct of `as C`, so `c as C` with `c:& C` can
     # read the referent.  pointee_type stays TYPE_VOID: there's no pointee.
     if next == null and ty == TYPE_STRUCT
-        ct.pointee_name = p.last_type_name as *u8
-        ct.pointee_name_len = p.last_type_name_len
+        ct.pointee_name = f.type_name
+        ct.pointee_name_len = f.type_name_len
     # AGAST #2544: and of `as **S` (`***S`, ...): pointee_type is the packed
-    # inner-pointee slot a `**S` local records (ptr_ptr_inner_pointee), so
-    # ptr_levels_of reads `**(x as **S)` as it reads `**pp`.  It recorded
-    # nothing, and the deref loaded i64 into a %S slot.
+    # inner-pointee slot a `**S` local records (ptr_ptr_inner_pointee).
     if next == null and ty == TYPE_PTR_PTR
-        ct.pointee_type = ptr_ptr_inner_pointee(p, ty)
+        ct.pointee_type = ptr_ptr_inner_pointee(p, tr)
         if ptr_ptr_slot_inner(ct.pointee_type) == TYPE_STRUCT
-            ct.pointee_name = p.last_type_name as *u8
-            ct.pointee_name_len = p.last_type_name_len
+            ct.pointee_name = f.type_name
+            ct.pointee_name_len = f.type_name_len
     return ct
 
 # AGAST #3435: the grammar's block_ended.  Matches nothing, and fails unless
@@ -7799,7 +7959,7 @@ pub fn apply_cast_tail(p: *Parser, expr: *Expr, tail: *CastTail) -> *Expr
     var result: *Expr = expr
     var ct: *CastTail = tail
     while ct != null
-        result = expr_cast(p, result, ct.cast_type)
+        result = expr_cast(p, result, ct.cast_type, ct.cast_pointee)
         result.int_val = ct.pointee_type as i64
         result.ident_ptr = ct.pointee_name
         result.ident_len = ct.pointee_name_len
@@ -7818,9 +7978,10 @@ pub fn postfix_call(p: *Parser, args: *Expr) -> *PostfixOp
     let op: *PostfixOp = parser_alloc(p, sizeof(PostfixOp)) as *PostfixOp
     op.kind = POSTFIX_CALL
     op.args = args
-    # Copy type suffix from parser state (set by p_skip_generic_args for generic calls)
-    op.call_type_suffix = p.last_call_type_suffix
-    op.call_type_suffix_len = p.last_call_type_suffix_len
+    # #4035: the parser never records a call type suffix (it was always null),
+    # so nothing carries one here.
+    op.call_type_suffix = null
+    op.call_type_suffix_len = 0
     op.next = null
     return op
 
@@ -8214,7 +8375,7 @@ pub fn pattern_variant_named(p: *Parser, head: Token, name: Token, binds: *Tuple
 # Generic struct literal parsed through generic_args (AGAST #1300):
 # `Pair<i64, Vec<i64>> { ... }`.  Mangles on every argument (AGAST #1574),
 # from the capture records: parsing the literal's fields clobbers
-# p.last_type_name.
+# the last_type_name side channel.
 pub fn generic_struct_lit_arg(p: *Parser, tok: Token, ga: *GenericArg, lit: *FieldInit) -> *Expr
     let e: *Expr = parser_alloc(p, sizeof(Expr)) as *Expr
     e.kind = EXPR_STRUCT_LIT
@@ -8248,7 +8409,7 @@ pub fn expr_int_lit(p: *Parser, start_sv: StrView, line: i32, col: i32) -> *Expr
     # an i64 local, so `take_u32(p)` was refused as a narrowing.
     let sfx: i32 = int_lit_suffix_type(StrView { ptr: (start), len: (len) as i64 })
     if sfx != TYPE_VOID
-        let c: *Expr = expr_cast(p, e, sfx)
+        let c: *Expr = expr_cast(p, e, sfx, TYPE_VOID)
         c.cast_pointee = TYPE_VOID
         return c
     return e
@@ -9038,9 +9199,10 @@ pub fn enum_def_start_generic(p: *Parser, name_sv: StrView, params: *TypeParam) 
 
 # `enum E: T` (LANGUAGE_SPEC §10.4): as enum_def_start, with representation
 # type T, which must be an integer type (a located error otherwise).
-pub fn enum_def_start_repr(p: *Parser, name_sv: StrView, repr: i32, line: i32, col: i32) -> i32
+pub fn enum_def_start_repr(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
+    let repr: i32 = tr_kind(tr)
     var r: i32 = repr
     if is_int_const_type(repr) == 0 or repr == TYPE_BOOL
         if p.skip_item == 0
@@ -9062,10 +9224,10 @@ pub fn enum_variant_record(p: *Parser, name_sv: StrView, line: i32, col: i32) ->
 # `Name(T)` (AGAST #1797): the payload type is the type_spec just parsed;
 # field_new captures its struct / pointer / array detail from the parser
 # state exactly as for a struct field.
-pub fn enum_variant_record_tuple(p: *Parser, name_sv: StrView, ty: i32, line: i32, col: i32) -> i32
+pub fn enum_variant_record_tuple(p: *Parser, name_sv: StrView, tr: *TypeRef, line: i32, col: i32) -> i32
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    let f: *StructField = field_new(p, StrView { ptr: (name), len: (len) as i64 }, ty, 0, 0)
+    let f: *StructField = field_new(p, StrView { ptr: (name), len: (len) as i64 }, tr, 0, 0)
     f.next = null
     nd_payload_reject(f, line, col)
     return enum_variant_record_impl(p, StrView { ptr: (name), len: (len) as i64 }, ENUM_VARIANT_TUPLE, f, 0, 0, 0, line, col)
@@ -9074,11 +9236,11 @@ pub fn enum_variant_record_tuple(p: *Parser, name_sv: StrView, ty: i32, line: i3
 # ..)`.  Its own grammar rule, so field_new reads the parser's type detail
 # (struct name, pointee, array shape) right after THIS type_spec, before the
 # next one overwrites it.  Named by enum_variant_record_tuple_n.
-pub fn variant_type_field(p: *Parser, ty: i32) -> *StructField
+pub fn variant_type_field(p: *Parser, tr: *TypeRef) -> *StructField
     # AGAST #4021: noted here for `A(T)` too, which enum_variant tries as
     # `A(T, ..)` first: this rule parses T before the missing comma fails it.
     tn_note_last(p, 1)
-    let f: *StructField = field_new(p, StrView { ptr: (null), len: (0) as i64 }, ty, 0, 0)
+    let f: *StructField = field_new(p, StrView { ptr: (null), len: (0) as i64 }, tr, 0, 0)
     f.next = null
     return f
 
