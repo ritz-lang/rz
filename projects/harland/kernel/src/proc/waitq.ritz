@@ -1,0 +1,49 @@
+# Harland interrupt wait queue (AGAST #4220)
+#
+# A driver waiting for a device interrupt needs to give the CPU to another
+# process while the command is in flight. The scheduler already knows how to
+# park a process (proc.block + sched_block, the same path read(0) uses), so a
+# wait is: mark the current process BLOCKED for BLOCK_IRQ, switch away, and
+# let the interrupt handler make it runnable again (waitq_wake_irq). With
+# nothing else runnable sched_block idles in sti;hlt, exactly like the old
+# driver sleep, so a single-process boot behaves the same.
+#
+# Only the BSP runs processes (proc/sched.ritz): an AP calling a driver, or
+# any command issued before init, cannot park and the caller falls back to
+# sti;hlt. waitq_can_park says which path applies.
+#
+# The wait itself is in the driver: it arms the LAPIC watchdog, re-checks its
+# completion condition after every wake, and finishes when the vector has
+# fired or the watchdog has expired. No state lives here beyond the blocking
+# protocol, so a spurious wake (another device's MSI-X, the watchdog) only
+# costs one re-check.
+
+import proc.table { Proc, BLOCK_IRQ, proc_current, proc_block, proc_wake }
+import proc.sched { sched_block }
+import arch.x86_64.apic { lapic_is_bsp }
+
+# True when blocking is possible: the BSP, with a process to park.
+pub fn waitq_can_park() -> bool
+    if not lapic_is_bsp()
+        return false
+    return proc_current() != 0 as *Proc
+
+# Park the running process until an interrupt wakes BLOCK_IRQ waiters.
+# Called with interrupts off; returns with them off. Returns -1 (and does
+# nothing) when this CPU cannot park.
+pub fn waitq_park() -> i32
+    if not waitq_can_park()
+        return -1
+    proc_block(BLOCK_IRQ, 0)
+    sched_block()
+    return 0
+
+# Wake every process parked for a device interrupt. Safe from an interrupt
+# handler: it only rewrites process states, as the TTY path already does.
+# Only the BSP's process table is touched; an AP's interrupt acknowledges
+# itself and returns.
+pub fn waitq_wake_irq() -> i32
+    if not lapic_is_bsp()
+        return 0
+    proc_wake(BLOCK_IRQ)
+    return 0

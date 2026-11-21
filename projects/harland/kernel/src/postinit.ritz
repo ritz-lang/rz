@@ -19,6 +19,7 @@ import drivers.virtio.net { virtio_net_msix_enabled, virtio_net_irq_count }
 import drivers.nvme.nvme { nvme_enable_msix, nvme_msix_read_check, nvme_irq_count, nvme_irq_wait_count, nvme_irq_missed_count, nvme_irq_halt_count, nvme_irq_idle_probe }
 import io { enable_interrupts, disable_interrupts, halt_loop }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
+import arch.x86_64.apcall { ap_run_nvme_probe }
 import drivers.virtio.blk { VirtioBlkDevice, virtio_blk_get_device, virtio_blk_test }
 import net.stack { net_stack_init, net_poll, net_configure_dhcp, net_is_configured, net_device_type }
 import net.ip { ip_get_gateway, ip_print_config }
@@ -507,14 +508,16 @@ fn network_wait_for_peer_ping()
 
 # Switch the NVMe controllers nvme_probe found at boot (polled: the APIC was
 # not up yet) to MSI-X, then read each namespace with interrupts on, so every
-# command waits for its completion interrupt (AGAST #3630). Logs
+# command waits for its completion interrupt (AGAST #3630, per-CPU queues
+# #4220). Each started AP is then called through an IPI and reads the end of
+# its own disk through its own queue and vector. Logs
 #   [msix] nvme interrupts: N, commands waited: W, completions without one: M
 #   [msix] nvme waits halted: H
 #   [msix] nvme idle wait halted: P
 # (W counts every command since MSI-X went on that waited for its interrupt;
 # H the hlts those waits slept in, 0 when every interrupt beat its wait's
-# first check; P the hlts of one watchdog round of the same wait with no
-# command outstanding, AGAST #4246.)
+# first check or the wait parked a process; P the hlts of one watchdog round
+# of the same wait with no command outstanding, AGAST #4246.)
 # tools/test_msix_boot.sh wants N > 0, W > 0, M = 0, 0 < P <= 64 and the
 # read's fingerprint.
 fn nvme_msix_check()
@@ -522,6 +525,10 @@ fn nvme_msix_check()
         return
     enable_interrupts()
     nvme_msix_read_check()
+    # An AP-issued command goes through its own I/O queue and vector
+    # (AGAST #4220): each started AP reads the end of its disk, and logs
+    # whether it waited for an interrupt delivered to it.
+    ap_run_nvme_probe()
     let idle_halts: u64 = nvme_irq_idle_probe()
     disable_interrupts()
     prints("[msix] nvme interrupts: ")

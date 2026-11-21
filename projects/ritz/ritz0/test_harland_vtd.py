@@ -227,9 +227,12 @@ def test_dmar_module_is_import_free():
 
 @pytest.mark.unit
 def test_msix_entry_uses_an_irte_when_remapping_is_on():
-    # through drivers/iommu/ir.ritz (#4329), which hands VT-d the remappable format
+    # through drivers/iommu/ir.ritz (#4329), which hands VT-d the remappable format.
+    # msix_set_entry delegates to msix_set_entry_to, which takes the CPU the
+    # entry is aimed at (AGAST #4220: per-CPU vectors).
     code = _code(MSIX)
-    body = _body(code, "msix_set_entry")
+    assert "msix_set_entry_to(" in _body(code, "msix_set_entry")
+    body = _body(code, "msix_set_entry_to")
     assert "ir_enabled()" in body, body
     assert re.search(r"ir_set\(\s*\w+\s*,\s*vector\s*,\s*dest\s*,\s*\w+\s*,\s*msix_sid\(info\)", body), \
         "the IRTE must carry the vector, destination and requester ID"

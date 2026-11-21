@@ -161,11 +161,15 @@ def test_irq_dest_module_is_import_free():
 @pytest.mark.unit
 def test_msix_entry_targets_a_reachable_cpu():
     code = _code(MSIX)
-    body = _body(code, "msix_set_entry")
+    # msix_set_entry aims at the current CPU by delegating to the function
+    # that takes an explicit destination (AGAST #4220: per-CPU vectors).
+    entry = _body(code, "msix_set_entry")
+    assert re.search(r"msix_set_entry_to\([^)]*lapic_id\(\)", entry), entry
+    body = _body(code, "msix_set_entry_to")
     assert "& 0xFF" not in body, "msix_set_entry still truncates the APIC ID to 8 bits"
     assert not re.search(r"<<\s*12", body), "msix_set_entry still encodes the address itself"
-    # the destination is picked for the CPU this runs on
-    m = re.search(r"let (\w+): u32 = lapic_id\(\)", body)
+    # the destination is picked for the CPU the entry is meant for
+    m = re.search(r"let (\w+): u32 = want", body)
     assert m and re.search(rf"irq_route_dest\(\s*{m.group(1)}\s*\)", body), body
     assert "msi_addr_lo(" in body, body
     assert "IRQ_DEST_NONE" in body, "msix_set_entry ignores 'no reachable CPU'"

@@ -30,10 +30,10 @@ import io { sti_hlt, disable_interrupts, enable_interrupts, interrupts_enabled }
 import serial { prints, serial_print_dec }
 import mm.vmm { vmm_switch_pml4, vmm_get_current_pml4 }
 import arch.x86_64.gdt { gdt_set_kernel_stack }
-import arch.x86_64.apic { lapic_timer_start }
+import arch.x86_64.apic { lapic_timer_start, lapic_tick_advance, lapic_watchdog_expired }
 import fs.syscall { fs_process_select }
 import syscall.stack { kstack_top }
-import proc.table { Proc, PROC_RUNNING, proc_at, proc_current_slot, proc_pick_next, proc_set_current }
+import proc.table { Proc, PROC_RUNNING, BLOCK_IRQ, proc_at, proc_current_slot, proc_pick_next, proc_set_current, proc_wake }
 
 extern fn sched_switch(save_ksp: *u64, new_ksp: u64)
 extern fn proc_first_entry()
@@ -144,6 +144,11 @@ pub fn sched_exit()
 # ring 3, the only place a process is preempted.
 pub fn sched_tick(from_user: bool)
     sched_ticks = sched_ticks + 1
+    # The NVMe watchdog rides this tick instead of reprogramming the timer
+    # (#4220): count the tick, and wake a parked driver wait when it expires.
+    lapic_tick_advance()
+    if lapic_watchdog_expired()
+        proc_wake(BLOCK_IRQ)
     if not from_user or sched_running == 0
         return
     let next: i32 = proc_pick_next()

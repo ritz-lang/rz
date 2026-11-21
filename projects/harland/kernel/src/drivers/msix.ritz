@@ -17,6 +17,9 @@
 #   - hands out IDT vectors MSIX_VECTOR_BASE.. (msix_vector_alloc) and points
 #     a table entry at one, aimed at the current CPU if an MSI can reach
 #     it, else the BSP (msix_set_entry);
+#   - hands out a second pool, MSIX_LOCAL_VECTOR_BASE.., for interrupts aimed
+#     at whichever CPU submits a command (msix_vector_alloc_local, #4220).
+#     Its IDT gates have no IST, so an AP (which has no TSS) can take one;
 #   - counts each vector's interrupts (msix_dispatch, from irq_handler), so a
 #     driver or a test can see interrupts were delivered (msix_vector_count).
 #
@@ -64,6 +67,12 @@ const MSIX_ENTRY_CTRL_MASKED: u32 = 1
 pub const MSIX_VECTOR_BASE: u8 = 64
 pub const MSIX_VECTOR_COUNT: u8 = 16
 
+# A second pool, 0x50-0x5F, for interrupts aimed at the CPU that submits a
+# command (AGAST #4220). These get IST-free IDT gates, so an AP (which has no
+# TSS) can take one; the pool above keeps its IST2 gate for the BSP.
+pub const MSIX_LOCAL_VECTOR_BASE: u8 = 80
+pub const MSIX_LOCAL_VECTOR_COUNT: u8 = 16
+
 # ============================================================================
 # State
 # ============================================================================
@@ -79,6 +88,8 @@ pub struct MsixInfo
 
 var msix_next_vector: u8 = 0                # next free slot past MSIX_VECTOR_BASE
 var msix_irq_count: [16]u64                 # interrupts seen, per slot
+var msix_local_next_vector: u8 = 0          # next free local slot
+var msix_local_irq_count: [16]u64           # local pools' interrupts
 
 # ============================================================================
 # Capability discovery
@@ -161,6 +172,16 @@ pub fn msix_vector_alloc() -> u8
     msix_next_vector = msix_next_vector + 1
     return vector
 
+# Allocate one CPU-local IDT vector for an MSI-X entry. Returns the vector,
+# or 0 when all MSIX_LOCAL_VECTOR_COUNT are taken.
+pub fn msix_vector_alloc_local() -> u8
+    if msix_local_next_vector >= MSIX_LOCAL_VECTOR_COUNT
+        return 0
+    let vector: u8 = MSIX_LOCAL_VECTOR_BASE + msix_local_next_vector
+    msix_local_irq_count[msix_local_next_vector as i32] = 0
+    msix_local_next_vector = msix_local_next_vector + 1
+    return vector
+
 # Point table entry `entry` at `vector` on the current CPU (the BSP during
 # boot) and unmask it. A CPU an MSI can't reach (APIC ID 255 or more with
 # no extended destination ID) gets the entry sent to the BSP, or the first
@@ -171,10 +192,17 @@ pub fn msix_vector_alloc() -> u8
 # validates (VT-d) the table. Returns 0, or -1 if the entry is out of range, the table
 # isn't mapped, no CPU can take the interrupt or the IRTE can't be set.
 pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
+    return msix_set_entry_to(info, entry, vector, lapic_id())
+
+# Like msix_set_entry, but aimed at the CPU with APIC ID `want` rather than
+# the current CPU: a per-CPU completion vector (AGAST #4220). If `want` can't
+# take device interrupts the entry goes to the CPU irq_route_dest picks, as
+# msix_set_entry does.
+pub fn msix_set_entry_to(info: *MsixInfo, entry: u16, vector: u8, want: u32) -> i32
     if (*info).table_virt == 0 or entry >= (*info).table_size
         return -1
     let e: u64 = (*info).table_virt + (entry as u64) * MSIX_ENTRY_SIZE
-    let here: u32 = lapic_id()
+    let here: u32 = want
     let dest: u32 = irq_route_dest(here)
     if dest == IRQ_DEST_NONE
         prints("[msix] no CPU can take MSI-X vector ")
@@ -222,19 +250,23 @@ pub fn msix_set_entry(info: *MsixInfo, entry: u16, vector: u8) -> i32
 # Called by irq_handler for every hardware vector. Counts the interrupt and
 # returns true if `vector` is an MSI-X vector (the caller still sends EOI).
 pub fn msix_dispatch(vector: u64) -> bool
-    if vector < MSIX_VECTOR_BASE as u64
-        return false
-    let slot: u64 = vector - (MSIX_VECTOR_BASE as u64)
-    if slot >= MSIX_VECTOR_COUNT as u64
-        return false
-    msix_irq_count[slot as i32] = msix_irq_count[slot as i32] + 1
-    return true
+    if vector >= MSIX_VECTOR_BASE as u64 and vector < (MSIX_VECTOR_BASE + MSIX_VECTOR_COUNT) as u64
+        let slot: u64 = vector - (MSIX_VECTOR_BASE as u64)
+        msix_irq_count[slot as i32] = msix_irq_count[slot as i32] + 1
+        return true
+    if vector >= MSIX_LOCAL_VECTOR_BASE as u64 and vector < (MSIX_LOCAL_VECTOR_BASE + MSIX_LOCAL_VECTOR_COUNT) as u64
+        let slot: u64 = vector - (MSIX_LOCAL_VECTOR_BASE as u64)
+        msix_local_irq_count[slot as i32] = msix_local_irq_count[slot as i32] + 1
+        return true
+    return false
 
 # Interrupts delivered on `vector` so far (0 for a vector that isn't MSI-X).
 pub fn msix_vector_count(vector: u8) -> u64
-    if vector < MSIX_VECTOR_BASE or vector >= MSIX_VECTOR_BASE + MSIX_VECTOR_COUNT
-        return 0
-    return volatile_load(@msix_irq_count[(vector - MSIX_VECTOR_BASE) as i32])
+    if vector >= MSIX_VECTOR_BASE and vector < MSIX_VECTOR_BASE + MSIX_VECTOR_COUNT
+        return volatile_load(@msix_irq_count[(vector - MSIX_VECTOR_BASE) as i32])
+    if vector >= MSIX_LOCAL_VECTOR_BASE and vector < MSIX_LOCAL_VECTOR_BASE + MSIX_LOCAL_VECTOR_COUNT
+        return volatile_load(@msix_local_irq_count[(vector - MSIX_LOCAL_VECTOR_BASE) as i32])
+    return 0
 
 # ============================================================================
 # Diagnostics

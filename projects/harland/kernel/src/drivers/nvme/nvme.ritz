@@ -4,30 +4,43 @@
 # volumes on Nitro EC2 instances, most laptop SSDs and QEMU's `-device nvme`.
 # AGAST #1850.
 #
-# Per controller: reset, admin queue, enable, Identify Controller, one I/O
-# completion/submission queue pair (qid 1), then Identify Namespace for each
-# active namespace with 512-byte to 4 KiB LBAs.
+# Per controller: reset, admin queue, enable, Identify Controller, then
+# Identify Namespace for each active namespace with 512-byte to 4 KiB LBAs.
 #
-# Interrupts (AGAST #3630). nvme_probe runs early, before the APIC is set up
-# and with IF=0, so it polls: INTx is disabled and INTMS masks pin-based
+# Interrupts (AGAST #3630, #4220). nvme_probe runs early, before the APIC is
+# set up and with IF=0, so it polls: INTx is disabled and INTMS masks pin-based
 # interrupts. It does turn MSI-X on, with every table entry masked, before
-# creating the I/O CQ on entry 1 (the admin CQ always uses entry 0): a
+# creating the first I/O CQ on entry 1 (the admin CQ always uses entry 0): a
 # controller refuses a nonzero vector while MSI-X is off (QEMU: Invalid
-# Interrupt Vector). Masked entries only set their pending bits. Once the
-# APIC is up, nvme_enable_msix gives each controller two IDT vectors from
-# drivers/msix and points entries 0 (admin CQ) and 1 (I/O CQ) at them,
-# unmasking them. Without a usable MSI-X table the I/O CQ uses entry 0 and
-# the controller stays polled.
+# Interrupt Vector). Masked entries only set their pending bits.
 #
-# From then on a command issued with IF=1 on the CPU the entries target
-# waits for its queue's vector to fire before reaping the completion; one
-# whose CQE turns up without an interrupt is counted (nvme_irq_missed). The
-# CQE's phase tag stays the ground truth: an IF=0 caller, or another CPU,
-# still polls, and a stale interrupt cannot complete the wrong command.
-# The wait sleeps in hlt (cli, check the vector's counter, sti;hlt), with a
-# one-shot LAPIC timer as its watchdog, so the CPU idles until the interrupt
-# and still gives up if it never comes (AGAST #4212). Blocking the caller so
-# another thread runs needs a wait queue, which the kernel does not have yet.
+# Once the APIC is up and the APs are running, nvme_enable_msix gives the
+# controller one I/O queue pair per CPU (qid 1 + cpu index), each on its own
+# CPU-local IDT vector and MSI-X table entry aimed at that CPU's Local APIC.
+# A command is submitted on the queue of the CPU issuing it, so its completion
+# interrupts that CPU and no other: the BSP, and now APs too, wait for the
+# interrupt instead of polling. The admin CQ keeps the BSP's global vector.
+#
+# From then on a command issued with IF=1 on the CPU its queue targets waits
+# for its queue's vector to fire before reaping the completion; one whose CQE
+# turns up without an interrupt is counted (nvme_irq_missed). The CQE's phase
+# tag stays the ground truth: a stale interrupt cannot complete the wrong
+# command. A command with IF=0, or from a CPU with no I/O queue (more CPUs
+# than the 16 local vectors), still polls.
+#
+# The wait sleeps on the kernel's interrupt wait queue (proc/waitq.ritz): on
+# the BSP with a process running it parks that process (proc_block BLOCK_IRQ +
+# sched_block, waking from msix_dispatch), so other processes run while the
+# command is in flight; before init, and on an AP, it sleeps in sti;hlt. A
+# one-shot LAPIC watchdog bounds both (AGAST #4212): before the scheduler tick
+# starts it is its own vector 96; once the tick runs it rides the tick, so the
+# tick keeps running and vector 32 is never taken from the scheduler.
+#
+# One I/O queue per CPU also means one set of bounce pages, PRP list and
+# command id per CPU: two CPUs never share a submission queue. Within a CPU
+# the queue is owned by one command at a time (`busy`), and a second process
+# waits on the same wait queue, so a parked command's bounce pages cannot be
+# overwritten.
 #
 # The block interface speaks 512-byte sectors whatever the namespace's LBA
 # size (AGAST #4088): a request is widened to whole native LBAs, and a write
@@ -37,25 +50,27 @@
 # hands out NVMe namespaces after the virtio disks), so the filesystem layer
 # reads and writes them with virtio_blk_read/virtio_blk_write, unchanged.
 #
-# Memory: every queue, the identify buffer and the PRP list is one physical
-# page (pmm_alloc_page). The controller is given their physical addresses; the
-# CPU reaches them through phys_to_virt (PML4[256]), since a process's address
-# space no longer maps low memory at identity (AGAST #1878). Data goes
-# through NVME_BOUNCE_PAGES bounce pages, which need not be contiguous: PRP1
-# names the first, PRP2 the second when a transfer spans two pages, or the
-# PRP list page holding the rest when it spans more. A command moves at most
-# max_pages pages (the bounce pages, capped by MDTS); longer requests split.
+# Memory: every queue, the identify buffer, the PRP list and the bounce pages
+# are physical pages (pmm_alloc_page). The controller is given their physical
+# addresses; the CPU reaches them through phys_to_virt (PML4[256]), since a
+# process's address space no longer maps low memory at identity (AGAST #1878).
+# Data goes through NVME_BOUNCE_PAGES bounce pages, which need not be
+# contiguous: PRP1 names the first, PRP2 the second when a transfer spans two
+# pages, or the PRP list page holding the rest when it spans more. A command
+# moves at most max_pages pages (the bounce pages, capped by MDTS); longer
+# requests split.
 #
 # Reference: NVM Express Base Specification 1.4, sections 3 (registers),
 # 4 (queues), 5 (admin commands) and the NVM Command Set (read/write).
 
 import io { memory_barrier, read_barrier, cpu_pause, interrupts_enabled, disable_interrupts, enable_interrupts, sti_hlt }
 import serial { prints, serial_print_dec, serial_print_hex, serial_write_byte }
-import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_set_entry, msix_vector_count, msix_entry_irte, msix_entry_dest, MSIX_NO_IRTE }
+import drivers.msix { MsixInfo, msix_probe, msix_enable, msix_vector_alloc, msix_vector_alloc_local, msix_set_entry_to, msix_vector_count, msix_entry_irte, msix_entry_dest, MSIX_NO_IRTE }
 import drivers.pci { PciDevice, PCI_CLASS_STORAGE, pci_get_device_count, pci_get_device, pci_enable_bus_master, pci_enable_memory, pci_read_config16, pci_write_config16 }
 import mm.heap { kalloc, kfree }
 import mm.vmm { vmm_map_mmio, phys_to_virt }
 import mm.pmm { pmm_alloc_page, PAGE_SIZE }
+import arch.x86_64.cpu_map { num_cpus, cpu_apic_ids, cpu_index_of_apic_id }
 
 # Current CPU's Local APIC ID (arch/x86_64/apic.ritz)
 extern fn lapic_id() -> u32
@@ -63,6 +78,12 @@ extern fn lapic_id() -> u32
 extern fn lapic_watchdog_arm(ticks: u32) -> i32
 extern fn lapic_watchdog_expired() -> bool
 extern fn lapic_watchdog_stop() -> i32
+# The kernel's interrupt wait queue (proc/waitq.ritz). Declared, not imported:
+# proc/sched imports fs/syscall, which reaches this driver through virtio/blk,
+# so importing it here would close an import cycle.
+extern fn waitq_can_park() -> bool
+extern fn waitq_park() -> i32
+extern fn waitq_wake_irq() -> i32
 
 # ============================================================================
 # PCI identification
@@ -113,16 +134,17 @@ const NVME_CNS_CONTROLLER: u32 = 0x01
 # IEN (bit 1), PC (bit 0, physically contiguous).
 const NVME_CQ_IEN: u32 = 0x2
 const NVME_CQ_PC: u32 = 0x1
-# MSI-X table entries: the admin CQ always signals entry 0; the I/O CQ ours.
+# MSI-X table entries: the admin CQ always signals entry 0; CPU n's I/O CQ
+# entry 1 + n (#4220).
 const NVME_MSIX_ADMIN_ENTRY: u16 = 0
 const NVME_MSIX_IO_ENTRY: u16 = 1
 
 const NVME_SQE_SIZE: u64 = 64
 const NVME_CQE_SIZE: u64 = 16
 
-# Queue IDs: index 0 is the admin queue pair, index 1 the I/O queue pair.
+# The admin queue pair is index 0 in the controller; I/O queue pairs live in
+# c.ioq, one per CPU index, qid 1 + cpu.
 const NVME_ADMIN_Q: i32 = 0
-const NVME_IO_Q: i32 = 1
 
 # Entries per queue (capped by CAP.MQES + 1). One page holds 64 SQEs.
 const NVME_QUEUE_DEPTH: u32 = 16
@@ -146,7 +168,8 @@ const NVME_CMD_SPINS: u32 = 20000000
 
 # An interrupt wait gives up after NVME_IRQ_WATCHDOG_ROUNDS runs of the LAPIC
 # watchdog, each NVME_IRQ_WATCHDOG_TICKS of bus clock / 16 (~0.27 s at
-# QEMU's 1 GHz APIC bus, longer on hardware's slower ones).
+# QEMU's 1 GHz APIC bus, longer on hardware's slower ones; once the scheduler
+# tick runs it rides the tick, ~0.27 s of ticks too).
 const NVME_IRQ_WATCHDOG_TICKS: u32 = 0x01000000
 const NVME_IRQ_WATCHDOG_ROUNDS: u32 = 4
 
@@ -154,31 +177,51 @@ const MAX_NVME_CONTROLLERS: i32 = 4
 const MAX_NVME_NAMESPACES: i32 = 8
 # Namespaces per controller we look at (NN can be huge on real arrays).
 const MAX_NSID_SCAN: u32 = 8
+# I/O queue pairs per controller: one per CPU, bounded by the pool of
+# CPU-local MSI-X vectors (drivers/msix.ritz). CPUs past this poll.
+const NVME_MAX_IO_QUEUES: i32 = 16
 
 # ============================================================================
 # Structures
 # ============================================================================
+
+# One I/O queue pair and the CPU it belongs to (AGAST #4220). The queue, its
+# PRP list and its bounce pages are private to that CPU.
+pub struct NvmeIoQueue
+    qid: u32                # controller queue id, 1 + cpu
+    cpu: u32                # CPU index in the MADT order
+    apic: u32               # APIC ID the CQ's MSI-X entry reaches
+    sq: u64                 # SQ base (physical; CPU via phys_to_virt)
+    cq: u64                 # CQ base (physical)
+    sq_tail: u32
+    cq_head: u32
+    cq_phase: u32           # phase tag that marks a new CQE
+    next_cid: u32
+    vec: u8                 # CPU-local IDT vector for this CQ (0 = polled)
+    busy: u8                # a command is in flight on this queue
+    prp_list: u64           # PRP list page, for transfers over two pages
+    bounce: [16]u64         # NVME_BOUNCE_PAGES data pages (physical)
 
 pub struct NvmeController
     pci: *PciDevice
     bar: u64                # BAR0, mapped through the MMIO window
     db_stride: u64          # Doorbell stride in bytes (4 << CAP.DSTRD)
     depth: u32              # Entries per queue
-    next_cid: u32           # Next command identifier
-    sq: [2]u64              # SQ base (physical; CPU via phys_to_virt), [admin, io]
-    cq: [2]u64              # CQ base (physical; CPU via phys_to_virt)
-    sq_tail: [2]u32
-    cq_head: [2]u32
-    cq_phase: [2]u32        # Phase tag that marks a new CQE
+    admin_cid: u32          # Next admin command identifier
+    admin_sq: u64           # Admin SQ base (physical; CPU via phys_to_virt)
+    admin_cq: u64           # Admin CQ base (physical)
+    admin_tail: u32
+    admin_head: u32
+    admin_phase: u32
+    admin_vec: u8           # BSP-global IDT vector for the admin CQ
+    bsp_apic: u32           # APIC ID the admin CQ's entry targets
+    ioq: [16]NvmeIoQueue    # per-CPU I/O queues, one per CPU index
+    ioq_count: i32
     buf: u64                # One page for identify data
-    bounce: [16]u64         # NVME_BOUNCE_PAGES data pages (physical)
-    prp_list: u64           # PRP list page, for transfers over two pages
     nn: u32                 # Number of namespaces (Identify Controller)
     max_pages: u32          # Pages per command: bounce pages, capped by MDTS
     serial_len: u32
     serial: [20]u8          # Serial number (Identify Controller bytes 4-23)
-    vec: [2]u8              # IDT vector per queue's CQ (0 = polled), [admin, io]
-    irq_cpu: u32            # APIC ID the MSI-X entries target
     msix: *MsixInfo         # MSI-X table, enabled (entries masked) at probe; null = none
 
 pub struct NvmeNamespace
@@ -196,7 +239,8 @@ var nvme_probed: i32 = 0
 # interrupt never came (the CQE was found by polling)
 var nvme_irq_waits: u64 = 0
 var nvme_irq_missed: u64 = 0
-# hlts those waits slept in until an interrupt woke the CPU
+# hlts those waits slept in until an interrupt woke the CPU (parked waits do
+# not count: they let another process run instead)
 var nvme_irq_halts: u64 = 0
 
 # ============================================================================
@@ -214,7 +258,7 @@ fn nvme_w64(c: *NvmeController, off_lo: u64, value: u64)
     nvme_w32(c, off_lo + 4, (value >> 32) as u32)
 
 # Doorbell for queue `q`: SQ tail when is_cq is 0, CQ head when 1.
-fn nvme_doorbell(c: *NvmeController, q: i32, is_cq: u64, value: u32)
+fn nvme_doorbell(c: *NvmeController, q: u32, is_cq: u64, value: u32)
     let off: u64 = NVME_REG_DOORBELLS + ((2 * (q as u64)) + is_cq) * (*c).db_stride
     memory_barrier()
     nvme_w32(c, off, value)
@@ -254,21 +298,18 @@ fn nvme_wait_csts(c: *NvmeController, mask: u32, want: u32) -> i32
     return -1
 
 # ============================================================================
-# Command submission (polled)
+# Interrupt wait
 # ============================================================================
 
-# Submit one command on queue `q` and wait for its completion: its MSI-X
-# interrupt when the controller is in MSI-X mode and this CPU takes it, then
-# the CQE (polled for its phase tag).
-# Returns 0 on success, the NVMe status (positive) on a command error, or -1
-# on timeout.
 # Sleep until `vec` has fired more than `irqs` times, or `max_rounds` runs
-# of the LAPIC watchdog have passed. Called with IF=1. Each round checks the
-# counter with interrupts off and then does sti;hlt, so an interrupt landing
-# between the check and the hlt still wakes it. Any interrupt wakes it; the
-# watchdog bounds the wait. Adds the hlts it slept in to `*halts`. Returns 1
-# if the vector fired, 0 if it gave up. Returns with IF=1, the timer masked
-# (or back on the scheduler tick, #3629).
+# of the LAPIC watchdog have passed. Called with IF=1. On the BSP with a
+# process running it parks the process on the kernel wait queue, so other
+# processes run; otherwise (boot, an AP) it does sti;hlt. Either way the
+# condition is re-checked after every wake with interrupts off, so an
+# interrupt landing between the check and the sleep still wakes it. Any
+# interrupt wakes a hlt; the watchdog bounds the wait. Adds the hlts it slept
+# in to `*halts`. Returns 1 if the vector fired, 0 if it gave up. Returns
+# with IF=1 and the watchdog disarmed.
 fn nvme_irq_sleep(vec: u8, irqs: u64, max_rounds: u32, halts: *u64) -> i32
     var fired: i32 = 1
     var rounds: u32 = 0
@@ -283,8 +324,11 @@ fn nvme_irq_sleep(vec: u8, irqs: u64, max_rounds: u32, halts: *u64) -> i32
                 fired = 0
                 break
             lapic_watchdog_arm(NVME_IRQ_WATCHDOG_TICKS)
-        *halts = *halts + 1
-        sti_hlt()
+        if waitq_can_park()
+            waitq_park()
+        else
+            *halts = *halts + 1
+            sti_hlt()
     lapic_watchdog_stop()
     enable_interrupts()
     return fired
@@ -297,15 +341,53 @@ fn nvme_wait_irq(vec: u8, irqs: u64)
     if nvme_irq_sleep(vec, irqs, NVME_IRQ_WATCHDOG_ROUNDS, @nvme_irq_halts) == 0
         nvme_irq_missed = nvme_irq_missed + 1
 
-fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
-    let cid: u32 = (*c).next_cid & 0xFFFF
-    (*c).next_cid = (*c).next_cid + 1
-    if (*c).next_cid > 0xFFFF
-        (*c).next_cid = 0
+# ============================================================================
+# Queues
+# ============================================================================
 
-    # Build the SQE in place: CDW0 = opcode | CID << 16, NSID, PRP1, PRP2, CDW10-12.
-    # mem_w32/mem_r32 translate a physical address through the physmap.
-    let sqe: u64 = (*c).sq[q] + ((*c).sq_tail[q] as u64) * NVME_SQE_SIZE
+# Lock a CPU's I/O queue for one transfer, waiting on the interrupt wait
+# queue when another process on this CPU owns it. The owner finishes (its
+# interrupt fires or its watchdog gives up) and unlocks, waking us.
+fn nvme_q_lock(q: *NvmeIoQueue)
+    while (*q).busy != 0
+        if waitq_can_park()
+            waitq_park()
+        else
+            sti_hlt()
+    (*q).busy = 1
+    memory_barrier()
+
+fn nvme_q_unlock(q: *NvmeIoQueue)
+    memory_barrier()
+    (*q).busy = 0
+    waitq_wake_irq()
+
+# This controller's I/O queue for the calling CPU, or 0: a CPU with no queue
+# of its own (more CPUs than queue slots) uses the BSP's, polled, because
+# its vector names another CPU.
+fn nvme_ioq_for_current(c: *NvmeController) -> i32
+    let idx: i32 = cpu_index_of_apic_id(lapic_id())
+    if idx >= 0 and idx < (*c).ioq_count
+        return idx
+    return 0
+
+fn nvme_ioq_index_for_apic(c: *NvmeController, apic: u32) -> i32
+    var i: i32 = 0
+    while i < (*c).ioq_count
+        if (*c).ioq[i].apic == apic and (*c).ioq[i].vec != 0
+            return i
+        i = i + 1
+    return -1
+
+# One command on the admin queue, polled. Returns 0 on success, the NVMe
+# status (positive) on a command error, or -1 on timeout.
+fn nvme_admin_cmd(c: *NvmeController, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
+    let cid: u32 = (*c).admin_cid & 0xFFFF
+    (*c).admin_cid = (*c).admin_cid + 1
+    if (*c).admin_cid > 0xFFFF
+        (*c).admin_cid = 0
+
+    let sqe: u64 = (*c).admin_sq + ((*c).admin_tail as u64) * NVME_SQE_SIZE
     var i: u64 = 0
     while i < NVME_SQE_SIZE
         mem_w32(sqe + i, 0)
@@ -320,36 +402,98 @@ fn nvme_cmd(c: *NvmeController, q: i32, opc: u32, nsid: u32, prp1: u64, prp2: u6
     mem_w32(sqe + 44, cdw11)
     mem_w32(sqe + 48, cdw12)
 
-    (*c).sq_tail[q] = (*c).sq_tail[q] + 1
-    if (*c).sq_tail[q] >= (*c).depth
-        (*c).sq_tail[q] = 0
+    (*c).admin_tail = (*c).admin_tail + 1
+    if (*c).admin_tail >= (*c).depth
+        (*c).admin_tail = 0
+    nvme_doorbell(c, NVME_ADMIN_Q as u32, 0, (*c).admin_tail)
 
-    # In MSI-X mode, with interrupts deliverable here, the queue's vector
-    # firing is the completion signal. Its count is sampled before the
-    # doorbell, so the interrupt cannot slip past unseen.
-    let vec: u8 = (*c).vec[q]
+    var spins: u32 = 0
+    while spins < NVME_CMD_SPINS
+        let cqe: u64 = (*c).admin_cq + ((*c).admin_head as u64) * NVME_CQE_SIZE
+        let dw3: u32 = mem_r32(cqe + 12)
+        if ((dw3 >> 16) & 1) == (*c).admin_phase
+            read_barrier()
+            (*c).admin_head = (*c).admin_head + 1
+            if (*c).admin_head >= (*c).depth
+                (*c).admin_head = 0
+                (*c).admin_phase = (*c).admin_phase ^ 1
+            nvme_doorbell(c, NVME_ADMIN_Q as u32, 1, (*c).admin_head)
+            let status: u32 = (dw3 >> 17) & 0x7FFF
+            if (dw3 & 0xFFFF) != cid
+                prints("[nvme] completion for cid ")
+                serial_print_dec((dw3 & 0xFFFF) as u64)
+                prints(", expected ")
+                serial_print_dec(cid as u64)
+                prints("\n")
+                return -1
+            if status != 0
+                prints("[nvme] command 0x")
+                serial_print_hex(opc as u64)
+                prints(" failed, status 0x")
+                serial_print_hex(status as u64)
+                prints("\n")
+                return status as i32
+            return 0
+        cpu_pause()
+        spins = spins + 1
+
+    prints("[nvme] command 0x")
+    serial_print_hex(opc as u64)
+    prints(" timed out\n")
+    return -1
+
+# One command on CPU index `qi`'s I/O queue. In MSI-X mode, with interrupts
+# deliverable here, the queue's vector firing is the completion signal; its
+# count is sampled before the doorbell, so the interrupt cannot slip past
+# unseen. Returns 0, the NVMe status (positive), or -1.
+fn nvme_io_cmd(c: *NvmeController, qi: i32, opc: u32, nsid: u32, prp1: u64, prp2: u64, cdw10: u32, cdw11: u32, cdw12: u32) -> i32
+    let q: *NvmeIoQueue = @(*c).ioq[qi]
+    let cid: u32 = (*q).next_cid & 0xFFFF
+    (*q).next_cid = (*q).next_cid + 1
+    if (*q).next_cid > 0xFFFF
+        (*q).next_cid = 0
+
+    let sqe: u64 = (*q).sq + ((*q).sq_tail as u64) * NVME_SQE_SIZE
+    var i: u64 = 0
+    while i < NVME_SQE_SIZE
+        mem_w32(sqe + i, 0)
+        i = i + 4
+    mem_w32(sqe + 0, opc | (cid << 16))
+    mem_w32(sqe + 4, nsid)
+    mem_w32(sqe + 24, (prp1 & 0xFFFFFFFF) as u32)
+    mem_w32(sqe + 28, (prp1 >> 32) as u32)
+    mem_w32(sqe + 32, (prp2 & 0xFFFFFFFF) as u32)
+    mem_w32(sqe + 36, (prp2 >> 32) as u32)
+    mem_w32(sqe + 40, cdw10)
+    mem_w32(sqe + 44, cdw11)
+    mem_w32(sqe + 48, cdw12)
+
+    (*q).sq_tail = (*q).sq_tail + 1
+    if (*q).sq_tail >= (*c).depth
+        (*q).sq_tail = 0
+
+    let vec: u8 = (*q).vec
     var irq_wait: bool = false
     var irqs: u64 = 0
     if vec != 0 and interrupts_enabled()
-        if lapic_id() == (*c).irq_cpu
+        if lapic_id() == (*q).apic
             irq_wait = true
             irqs = msix_vector_count(vec)
-    nvme_doorbell(c, q, 0, (*c).sq_tail[q])
+    nvme_doorbell(c, (*q).qid, 0, (*q).sq_tail)
     if irq_wait
         nvme_wait_irq(vec, irqs)
 
-    # Reap the CQE at the head for the expected phase tag (DW3 bit 16).
     var spins: u32 = 0
     while spins < NVME_CMD_SPINS
-        let cqe: u64 = (*c).cq[q] + ((*c).cq_head[q] as u64) * NVME_CQE_SIZE
+        let cqe: u64 = (*q).cq + ((*q).cq_head as u64) * NVME_CQE_SIZE
         let dw3: u32 = mem_r32(cqe + 12)
-        if ((dw3 >> 16) & 1) == (*c).cq_phase[q]
+        if ((dw3 >> 16) & 1) == (*q).cq_phase
             read_barrier()
-            (*c).cq_head[q] = (*c).cq_head[q] + 1
-            if (*c).cq_head[q] >= (*c).depth
-                (*c).cq_head[q] = 0
-                (*c).cq_phase[q] = (*c).cq_phase[q] ^ 1
-            nvme_doorbell(c, q, 1, (*c).cq_head[q])
+            (*q).cq_head = (*q).cq_head + 1
+            if (*q).cq_head >= (*c).depth
+                (*q).cq_head = 0
+                (*q).cq_phase = (*q).cq_phase ^ 1
+            nvme_doorbell(c, (*q).qid, 1, (*q).cq_head)
             let status: u32 = (dw3 >> 17) & 0x7FFF
             if (dw3 & 0xFFFF) != cid
                 prints("[nvme] completion for cid ")
@@ -392,6 +536,41 @@ fn nvme_fail(c: *NvmeController, what: StrView) -> *NvmeController
     prints(")\n")
     return 0 as *NvmeController
 
+# Set up CPU index `cpu`'s I/O queue pair (qid 1 + cpu) on MSI-X table entry
+# `entry`, physically contiguous, interrupts on. Returns 0, or -1 when the
+# pages are gone.
+fn nvme_create_io_queue(c: *NvmeController, cpu: i32, entry: u32) -> i32
+    let q: *NvmeIoQueue = @(*c).ioq[cpu]
+    (*q).qid = (1 + cpu) as u32
+    (*q).cpu = cpu as u32
+    (*q).apic = 0
+    (*q).vec = 0
+    (*q).busy = 0
+    (*q).next_cid = 0
+    (*q).sq = alloc_zeroed_page()
+    (*q).cq = alloc_zeroed_page()
+    (*q).prp_list = alloc_zeroed_page()
+    if (*q).sq == 0 or (*q).cq == 0 or (*q).prp_list == 0
+        return -1
+    var b: i32 = 0
+    while b < NVME_BOUNCE_PAGES as i32
+        (*q).bounce[b] = alloc_zeroed_page()
+        if (*q).bounce[b] == 0
+            return -1
+        b = b + 1
+    (*q).sq_tail = 0
+    (*q).cq_head = 0
+    (*q).cq_phase = 1
+
+    let qsize: u32 = ((*c).depth - 1) << 16
+    let cq_flags: u32 = (entry << 16) | NVME_CQ_IEN | NVME_CQ_PC
+    if nvme_admin_cmd(c, NVME_ADMIN_CREATE_CQ, 0, (*q).cq, 0, qsize | (*q).qid, cq_flags, 0) != 0
+        return -1
+    # Create SQ: CDW11 bits 31:16 are the CQID, bits 15:0 the SQ flags (PC).
+    if nvme_admin_cmd(c, NVME_ADMIN_CREATE_SQ, 0, (*q).sq, 0, qsize | (*q).qid, ((*q).qid << 16) | NVME_CQ_PC, 0) != 0
+        return -1
+    return 0
+
 fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     let bar_phys: u64 = (*pci).bar[0]
     if bar_phys == 0 or (*pci).bar_is_io[0] != 0
@@ -404,7 +583,8 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     let cmd: u16 = pci_read_config16((*pci).bus, (*pci).device, (*pci).function, PCI_COMMAND_REG)
     pci_write_config16((*pci).bus, (*pci).device, (*pci).function, PCI_COMMAND_REG, cmd | PCI_COMMAND_INTX_DISABLE)
 
-    # Registers end at 0x1000; the doorbells we use follow (two queue pairs).
+    # Registers end at 0x1000; the doorbells we use follow (queue pairs per
+    # CPU, 16 at most).
     var map_len: u64 = 0x4000
     if (*pci).bar_size[0] != 0 and (*pci).bar_size[0] < map_len
         map_len = (*pci).bar_size[0]
@@ -418,10 +598,10 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
         return c
     (*c).pci = pci
     (*c).bar = bar
-    (*c).next_cid = 0
-    (*c).vec[0] = 0
-    (*c).vec[1] = 0
-    (*c).irq_cpu = 0
+    (*c).admin_cid = 0
+    (*c).admin_vec = 0
+    (*c).bsp_apic = 0
+    (*c).ioq_count = 0
     (*c).msix = 0 as *MsixInfo
     (*c).nn = 0
     (*c).serial_len = 0
@@ -447,33 +627,21 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     if nvme_wait_csts(c, NVME_CSTS_RDY, 0) != 0
         return nvme_fail(c, "reset timed out")
 
-    (*c).sq[0] = alloc_zeroed_page()
-    (*c).cq[0] = alloc_zeroed_page()
-    (*c).sq[1] = alloc_zeroed_page()
-    (*c).cq[1] = alloc_zeroed_page()
+    (*c).admin_sq = alloc_zeroed_page()
+    (*c).admin_cq = alloc_zeroed_page()
     (*c).buf = alloc_zeroed_page()
-    (*c).prp_list = alloc_zeroed_page()
-    if (*c).sq[0] == 0 or (*c).cq[0] == 0 or (*c).sq[1] == 0 or (*c).cq[1] == 0 or (*c).buf == 0 or (*c).prp_list == 0
+    if (*c).admin_sq == 0 or (*c).admin_cq == 0 or (*c).buf == 0
         return nvme_fail(c, "out of pages")
-    var b: i32 = 0
-    while b < NVME_BOUNCE_PAGES as i32
-        (*c).bounce[b] = alloc_zeroed_page()
-        if (*c).bounce[b] == 0
-            return nvme_fail(c, "out of pages")
-        b = b + 1
-    var q: i32 = 0
-    while q < 2
-        (*c).sq_tail[q] = 0
-        (*c).cq_head[q] = 0
-        (*c).cq_phase[q] = 1
-        q = q + 1
+    (*c).admin_tail = 0
+    (*c).admin_head = 0
+    (*c).admin_phase = 1
 
     # Admin queue, then enable: NVM command set, 4 KiB pages, 64/16-byte entries.
     # INTMS masks pin-based interrupts while we poll (MSI-X ignores it).
     nvme_w32(c, NVME_REG_INTMS, 0xFFFFFFFF)
     nvme_w32(c, NVME_REG_AQA, (((*c).depth - 1) << 16) | ((*c).depth - 1))
-    nvme_w64(c, NVME_REG_ASQ_LO, (*c).sq[0])
-    nvme_w64(c, NVME_REG_ACQ_LO, (*c).cq[0])
+    nvme_w64(c, NVME_REG_ASQ_LO, (*c).admin_sq)
+    nvme_w64(c, NVME_REG_ACQ_LO, (*c).admin_cq)
     memory_barrier()
     nvme_w32(c, NVME_REG_CC, NVME_CC_EN | NVME_CC_IOSQES_64 | NVME_CC_IOCQES_16)
     if nvme_wait_csts(c, NVME_CSTS_RDY, NVME_CSTS_RDY) != 0
@@ -481,7 +649,7 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
 
     # Identify Controller: serial number (bytes 4-23), MDTS (byte 77), NN
     # (bytes 516-519).
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, 0, (*c).buf, 0, NVME_CNS_CONTROLLER, 0, 0) != 0
+    if nvme_admin_cmd(c, NVME_ADMIN_IDENTIFY, 0, (*c).buf, 0, NVME_CNS_CONTROLLER, 0, 0) != 0
         return nvme_fail(c, "identify controller")
     var i: u32 = 0
     while i < 20
@@ -498,18 +666,16 @@ fn nvme_init_controller(pci: *PciDevice) -> *NvmeController
     if mdts != 0 and mdts < 5 and (1 << mdts) < (*c).max_pages
         (*c).max_pages = 1 << mdts
 
-    # I/O queue pair 1: the CQ first (physically contiguous, interrupts on
-    # MSI-X entry 1, masked until nvme_enable_msix), then the SQ bound to it
-    # (physically contiguous).
+    # CPU 0's I/O queue pair: the CQ first (physically contiguous, interrupts
+    # on MSI-X entry 1 when the controller has a table, else entry 0), then
+    # the SQ bound to it. Its vector is assigned by nvme_enable_msix; until
+    # then the queue is polled.
     var io_entry: u32 = 0
     if nvme_msix_table_on(c) == 0
         io_entry = NVME_MSIX_IO_ENTRY as u32
-    let qsize: u32 = ((*c).depth - 1) << 16
-    let cq_flags: u32 = (io_entry << 16) | NVME_CQ_IEN | NVME_CQ_PC
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_CQ, 0, (*c).cq[1], 0, qsize | 1, cq_flags, 0) != 0
-        return nvme_fail(c, "create I/O CQ")
-    if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_CREATE_SQ, 0, (*c).sq[1], 0, qsize | 1, (1 << 16) | 1, 0) != 0
-        return nvme_fail(c, "create I/O SQ")
+    if nvme_create_io_queue(c, 0, io_entry) != 0
+        return nvme_fail(c, "create I/O queue")
+    (*c).ioq_count = 1
 
     prints("[nvme] ")
     nvme_print_serial(c)
@@ -553,7 +719,6 @@ fn nvme_print_fingerprint(ns: *NvmeNamespace, first: u64) -> i32
     serial_print_dec(fnv1a(0x811C9DC5, probe, NVME_PROBE_SECTORS * SECTOR_SIZE))
     kfree(probe)
     return 0
-
 # Log the namespace, a fingerprint of 512-byte sectors 1-200 and the LBA
 # size, so the boot test can check identify, sector translation and long
 # reads in one call. 100 KiB from sector 1 is more than one command can
@@ -580,7 +745,7 @@ fn nvme_announce(ns: *NvmeNamespace)
 fn nvme_scan_namespaces(c: *NvmeController)
     var nsid: u32 = 1
     while nsid <= (*c).nn and nsid <= MAX_NSID_SCAN and nvme_ns_count < MAX_NVME_NAMESPACES
-        if nvme_cmd(c, NVME_ADMIN_Q, NVME_ADMIN_IDENTIFY, nsid, (*c).buf, 0, NVME_CNS_NAMESPACE, 0, 0) == 0
+        if nvme_admin_cmd(c, NVME_ADMIN_IDENTIFY, nsid, (*c).buf, 0, NVME_CNS_NAMESPACE, 0, 0) == 0
             # NSZE (bytes 0-7, in LBAs); FLBAS (byte 26) picks an LBA format
             # at 128 + 4n, whose LBADS (bits 23:16) is log2 of the LBA size.
             let nsze: u64 = *((phys_to_virt((*c).buf)) as *u64)
@@ -638,27 +803,30 @@ pub fn nvme_ns_sectors(ns: *NvmeNamespace) -> u64
     return (*ns).sectors
 
 # One read or write of `nlb` LBAs at `lba`, moving `bytes` bytes at byte
-# offset `off` of the bounce pages (off + bytes <= max_pages * PAGE_SIZE).
-# PRP1 is the first page plus the offset; PRP2 is the second page, or the
-# PRP list of every page after the first.
-fn nvme_io(c: *NvmeController, opc: u32, nsid: u32, off: u64, bytes: u64, lba: u64, nlb: u32) -> i32
+# offset `off` of queue `qi`'s bounce pages (off + bytes <= max_pages *
+# PAGE_SIZE). PRP1 is the first page plus the offset; PRP2 is the second
+# page, or the PRP list of every page after the first.
+fn nvme_io(c: *NvmeController, qi: i32, opc: u32, nsid: u32, off: u64, bytes: u64, lba: u64, nlb: u32) -> i32
+    let q: *NvmeIoQueue = @(*c).ioq[qi]
     let first: u64 = off / PAGE_SIZE
     let last: u64 = (off + bytes - 1) / PAGE_SIZE
-    let prp1: u64 = (*c).bounce[first as i32] + (off % PAGE_SIZE)
+    let prp1: u64 = (*q).bounce[first as i32] + (off % PAGE_SIZE)
     var prp2: u64 = 0
     if last == first + 1
-        prp2 = (*c).bounce[last as i32]
+        prp2 = (*q).bounce[last as i32]
     if last > first + 1
         var k: u64 = first + 1
         while k <= last
-            *((phys_to_virt((*c).prp_list) + (k - first - 1) * 8) as *u64) = (*c).bounce[k as i32]
+            *((phys_to_virt((*q).prp_list) + (k - first - 1) * 8) as *u64) = (*q).bounce[k as i32]
             k = k + 1
-        prp2 = (*c).prp_list
-    return nvme_cmd(c, NVME_IO_Q, opc, nsid, prp1, prp2, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, nlb - 1)
+        prp2 = (*q).prp_list
+    return nvme_io_cmd(c, qi, opc, nsid, prp1, prp2, (lba & 0xFFFFFFFF) as u32, (lba >> 32) as u32, nlb - 1)
 
-# Copy `len` bytes between `user` and byte offset `off` of the bounce pages,
-# which are not contiguous: into the bounce pages when to_bounce.
-fn nvme_bounce_copy(c: *NvmeController, off: u64, user: *u8, len: u64, to_bounce: bool)
+# Copy `len` bytes between `user` and byte offset `off` of queue `qi`'s
+# bounce pages, which are not contiguous: into the bounce pages when
+# to_bounce.
+fn nvme_bounce_copy(c: *NvmeController, qi: i32, off: u64, user: *u8, len: u64, to_bounce: bool)
+    let q: *NvmeIoQueue = @(*c).ioq[qi]
     var i: u64 = 0
     while i < len
         let o: u64 = off + i
@@ -666,7 +834,7 @@ fn nvme_bounce_copy(c: *NvmeController, off: u64, user: *u8, len: u64, to_bounce
         var n: u64 = PAGE_SIZE - in_page
         if n > len - i
             n = len - i
-        let page: *u8 = (phys_to_virt((*c).bounce[(o / PAGE_SIZE) as i32]) + in_page) as *u8
+        let page: *u8 = (phys_to_virt((*q).bounce[(o / PAGE_SIZE) as i32]) + in_page) as *u8
         let u: *u8 = user + i as i64
         var j: u64 = 0
         if to_bounce
@@ -679,17 +847,21 @@ fn nvme_bounce_copy(c: *NvmeController, off: u64, user: *u8, len: u64, to_bounce
                 j = j + 1
         i = i + n
 
-# Read or write `count` 512-byte sectors at `sector` through the bounce
-# pages. Each command covers whole native LBAs, at most max_pages pages; the
-# wanted sectors start `head` bytes into its first LBA. A write that leaves
-# part of its first or last LBA uncovered reads the span first and writes
-# the sectors over it (read-modify-write). Returns 0, or a negative error.
+# Read or write `count` 512-byte sectors at `sector` through the calling
+# CPU's bounce pages. Each command covers whole native LBAs, at most
+# max_pages pages; the wanted sectors start `head` bytes into its first LBA.
+# A write that leaves part of its first or last LBA uncovered reads the span
+# first and writes the sectors over it (read-modify-write). The CPU's queue
+# is locked for the whole transfer, so a parked transfer's bounce pages
+# survive. Returns 0, or a negative error.
 fn nvme_ns_rw(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8, write: bool) -> i32
     if ns == 0 as *NvmeNamespace
         return -1
     if sector >= (*ns).sectors or (count as u64) > (*ns).sectors - sector
         return -1
     let c: *NvmeController = (*ns).ctrl
+    let qi: i32 = nvme_ioq_for_current(c)
+    let q: *NvmeIoQueue = @(*c).ioq[qi]
     let shift: u64 = (*ns).lba_shift as u64
     let lba_size: u64 = 1 << shift
     let sectors_per_lba: u64 = lba_size / SECTOR_SIZE
@@ -699,6 +871,8 @@ fn nvme_ns_rw(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8, write: bool
         opc = NVME_CMD_WRITE
     let total: u64 = count as u64
     var done: u64 = 0
+    var rc: i32 = 0
+    nvme_q_lock(q)
     while done < total
         let s: u64 = sector + done
         let lba: u64 = s / sectors_per_lba
@@ -712,15 +886,18 @@ fn nvme_ns_rw(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8, write: bool
         let user: *u8 = buf + (done * SECTOR_SIZE) as i64
         if write
             if span != bytes
-                if nvme_io(c, NVME_CMD_READ, (*ns).nsid, 0, span, lba, nlb) != 0
-                    return -5
-            nvme_bounce_copy(c, head, user, bytes, true)
-        if nvme_io(c, opc, (*ns).nsid, 0, span, lba, nlb) != 0
-            return -5
+                if nvme_io(c, qi, NVME_CMD_READ, (*ns).nsid, 0, span, lba, nlb) != 0
+                    rc = -5
+                    break
+            nvme_bounce_copy(c, qi, head, user, bytes, true)
+        if nvme_io(c, qi, opc, (*ns).nsid, 0, span, lba, nlb) != 0
+            rc = -5
+            break
         if not write
-            nvme_bounce_copy(c, head, user, bytes, false)
+            nvme_bounce_copy(c, qi, head, user, bytes, false)
         done = done + bytes / SECTOR_SIZE
-    return 0
+    nvme_q_unlock(q)
+    return rc
 
 pub fn nvme_ns_read(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i32
     return nvme_ns_rw(ns, sector, count, buf, false)
@@ -729,13 +906,13 @@ pub fn nvme_ns_write(ns: *NvmeNamespace, sector: u64, count: u32, buf: *u8) -> i
     return nvme_ns_rw(ns, sector, count, buf, true)
 
 # ============================================================================
-# MSI-X (AGAST #3630)
+# MSI-X (AGAST #3630, per-CPU queues #4220)
 # ============================================================================
 
-# Map c's MSI-X table, mask every entry and turn MSI-X on, so the I/O CQ
-# can name entry 1. Needs no APIC: nothing is delivered until the entries
-# are programmed. Returns 0, or -1 (c.msix stays null) when the controller
-# has no usable table.
+# Map c's MSI-X table, mask every entry and turn MSI-X on, so the I/O CQs
+# can name their entries. Needs no APIC: nothing is delivered until the
+# entries are programmed. Returns 0, or -1 (c.msix stays null) when the
+# controller has no usable table.
 fn nvme_msix_table_on(c: *NvmeController) -> i32
     let info: *MsixInfo = kalloc(sizeof(MsixInfo) as u64) as *MsixInfo
     if info == 0 as *MsixInfo
@@ -752,32 +929,67 @@ fn nvme_msix_table_on(c: *NvmeController) -> i32
     (*c).msix = info
     return 0
 
-# Aim c's admin CQ (table entry 0) and I/O CQ (entry 1) at two fresh vectors
-# on this CPU and unmask them. Returns 0 if c is in MSI-X mode; -1 leaves it
-# polled.
+# Give the controller one I/O queue pair per CPU, each on a CPU-local vector
+# aimed at that CPU, and point the admin CQ at a fresh BSP vector. Returns 0
+# if c is in MSI-X mode; -1 leaves it polled.
 fn nvme_setup_msix(c: *NvmeController) -> i32
-    if (*c).vec[NVME_ADMIN_Q] != 0
+    if (*c).admin_vec != 0
         return 0
-    prints("[msix] nvme ")
-    nvme_print_serial(c)
     if (*c).msix == 0 as *MsixInfo
+        prints("[msix] nvme ")
+        nvme_print_serial(c)
         prints(": no usable MSI-X table, polling\n")
         return -1
     let admin: u8 = msix_vector_alloc()
-    let io: u8 = msix_vector_alloc()
-    if admin == 0 or io == 0
+    if admin == 0
+        prints("[msix] nvme ")
+        nvme_print_serial(c)
         prints(": out of MSI-X vectors, polling\n")
         return -1
-    (*c).irq_cpu = lapic_id()
-    msix_set_entry((*c).msix, NVME_MSIX_ADMIN_ENTRY, admin)
-    msix_set_entry((*c).msix, NVME_MSIX_IO_ENTRY, io)
-    (*c).vec[NVME_ADMIN_Q] = admin
-    (*c).vec[NVME_IO_Q] = io
+    let bsp: u32 = lapic_id()
+    (*c).bsp_apic = bsp
+    (*c).admin_vec = admin
+    # Program every entry before logging the summary: msix_set_entry_to
+    # explains an unreachable CPU on its own line, which must not land in
+    # the middle of the summary the boot tests match.
+    msix_set_entry_to((*c).msix, NVME_MSIX_ADMIN_ENTRY, admin, bsp)
+
+    # One I/O queue pair per CPU, up to the table's entries and the local
+    # vector pool. CPU 0's pair exists from probe; the others are created
+    # here, after the APs are up (#4220).
+    let ncpus: i32 = num_cpus as i32
+    var cpu: i32 = 0
+    var queue_fail: i32 = -1
+    while cpu < ncpus and cpu < NVME_MAX_IO_QUEUES
+        let entry: u16 = NVME_MSIX_IO_ENTRY + (cpu as u16)
+        if (*c).msix.table_size <= entry
+            break
+        if cpu > 0
+            if nvme_create_io_queue(c, cpu, entry as u32) != 0
+                queue_fail = cpu
+                break
+            (*c).ioq_count = cpu + 1
+        # Aim this queue's completion at its CPU. A CPU the MSI can't reach
+        # leaves the entry masked and the queue polled.
+        let vec: u8 = msix_vector_alloc_local()
+        let want: u32 = cpu_apic_ids[cpu]
+        if vec != 0 and msix_set_entry_to((*c).msix, entry, vec, want) == 0
+            (*c).ioq[cpu].vec = vec
+            (*c).ioq[cpu].apic = msix_entry_dest((*c).msix, entry)
+        else
+            (*c).ioq[cpu].vec = 0
+            (*c).ioq[cpu].apic = want
+        cpu = cpu + 1
+
+    prints("[msix] nvme ")
+    nvme_print_serial(c)
     prints(": MSI-X on, vectors admin=")
     serial_print_dec(admin as u64)
     prints(" io=")
-    serial_print_dec(io as u64)
+    serial_print_dec((*c).ioq[0].vec as u64)
     # Through interrupt remapping (#4316): the IRTEs, and where they send.
+    # Kept directly after "io=<n>" so the remapping boot test's pattern
+    # ("vectors admin=A io=I (IRTE a, i -> APIC ID d, d)") still matches.
     let irte_admin: u32 = msix_entry_irte((*c).msix, NVME_MSIX_ADMIN_ENTRY)
     if irte_admin != MSIX_NO_IRTE
         prints(" (IRTE ")
@@ -789,11 +1001,18 @@ fn nvme_setup_msix(c: *NvmeController) -> i32
         prints(", ")
         serial_print_dec(msix_entry_dest((*c).msix, NVME_MSIX_IO_ENTRY) as u64)
         prints(")")
+    prints(", CPUs=")
+    serial_print_dec((*c).ioq_count as u64)
+    if queue_fail >= 0
+        prints(" (CPU ")
+        serial_print_dec(queue_fail as u64)
+        prints(" has no I/O queue: controller queue limit)")
     prints("\n")
     return 0
 
 # Switch every controller nvme_probe brought up to MSI-X. Needs the Local
-# APIC set up; call with interrupts off. Returns how many are on MSI-X.
+# APIC set up and every AP running; call with interrupts off. Returns how
+# many are on MSI-X.
 pub fn nvme_enable_msix() -> i32
     var on: i32 = 0
     var i: i32 = 0
@@ -813,7 +1032,8 @@ pub fn nvme_msix_read_check()
     while i < nvme_ns_count
         let ns: *NvmeNamespace = nvme_nss[i]
         let c: *NvmeController = (*ns).ctrl
-        if (*c).vec[NVME_IO_Q] != 0 and (*ns).sectors > NVME_PROBE_SECTORS
+        let qi: i32 = nvme_ioq_for_current(c)
+        if (*c).ioq[qi].vec != 0 and (*ns).sectors > NVME_PROBE_SECTORS
             prints("[msix] nvme ")
             nvme_print_serial(c)
             prints(" nsid ")
@@ -823,15 +1043,56 @@ pub fn nvme_msix_read_check()
             prints("\n")
         i = i + 1
 
+# Run on an AP (arch/x86_64/apcall.ritz): read the end of a namespace whose
+# I/O queue is aimed at this CPU, with interrupts on, and log
+#   [msix] nvme AP <apic>: nsid <N>: LBA <first>-<last> fnv1a=H, waited=W, interrupted=I
+# W is the commands that waited for this AP's vector; I is what the vector's
+# counter advanced by. A CPU that polled logs W = 0, one whose vector went
+# elsewhere logs I = 0. Returns 0 when the read worked.
+pub fn nvme_ap_probe() -> i32
+    let apic: u32 = lapic_id()
+    var i: i32 = 0
+    while i < nvme_ns_count
+        let ns: *NvmeNamespace = nvme_nss[i]
+        let c: *NvmeController = (*ns).ctrl
+        let qi: i32 = nvme_ioq_index_for_apic(c, apic)
+        if qi >= 0 and (*ns).sectors > NVME_PROBE_SECTORS
+            let vec: u8 = (*c).ioq[qi].vec
+            let waits_before: u64 = nvme_irq_waits
+            let irqs_before: u64 = msix_vector_count(vec)
+            prints("[msix] nvme AP ")
+            serial_print_dec(apic as u64)
+            prints(": nsid ")
+            serial_print_dec((*ns).nsid as u64)
+            prints(": ")
+            let rc: i32 = nvme_print_fingerprint(ns, (*ns).sectors - NVME_PROBE_SECTORS)
+            prints(", waited=")
+            serial_print_dec(nvme_irq_waits - waits_before)
+            prints(", interrupted=")
+            serial_print_dec(msix_vector_count(vec) - irqs_before)
+            prints("\n")
+            if rc != 0
+                return -1
+            return 0
+        i = i + 1
+    prints("[msix] nvme AP ")
+    serial_print_dec(apic as u64)
+    prints(": no MSI-X I/O queue\n")
+    return -1
+
 # MSI-X interrupts delivered by every NVMe controller so far
 pub fn nvme_irq_count() -> u64
     var total: u64 = 0
     var i: i32 = 0
     while i < nvme_ctrl_count
         let c: *NvmeController = nvme_ctrls[i]
-        if (*c).vec[NVME_ADMIN_Q] != 0
-            total = total + msix_vector_count((*c).vec[NVME_ADMIN_Q])
-            total = total + msix_vector_count((*c).vec[NVME_IO_Q])
+        if (*c).admin_vec != 0
+            total = total + msix_vector_count((*c).admin_vec)
+        var q: i32 = 0
+        while q < (*c).ioq_count
+            if (*c).ioq[q].vec != 0
+                total = total + msix_vector_count((*c).ioq[q].vec)
+            q = q + 1
         i = i + 1
     return total
 
@@ -843,27 +1104,31 @@ pub fn nvme_irq_wait_count() -> u64
 pub fn nvme_irq_missed_count() -> u64
     return nvme_irq_missed
 
-# hlts the interrupt waits slept in (0 means they never had to sleep)
+# hlts the interrupt waits slept in (0 means they never had to sleep; a
+# parked process wait does not hlt)
 pub fn nvme_irq_halt_count() -> u64
     return nvme_irq_halts
 
 # Run the commands' interrupt wait (nvme_irq_sleep) on the first MSI-X
-# controller's I/O vector for one watchdog round with no command
-# outstanding, and return the hlts it slept in (AGAST #4246). The vector
-# cannot fire, so the wait must sleep however fast the device is: a correct
-# wait halts at least once and wakes only for the watchdog and whatever other
-# interrupts land in the window; one that spun would halt 0 times, or count
-# thousands of rounds. A command's own wait halts only if its interrupt is
-# still pending when it first checks, which QEMU often is not. Call with
-# IF=1 and the controller idle. Returns 0 when no controller is in MSI-X mode.
+# controller's first CPU-local I/O vector for one watchdog round with no
+# command outstanding, and return the hlts it slept in (AGAST #4246). The
+# vector cannot fire, so the wait must sleep however fast the device is: a
+# correct wait halts at least once and wakes only for the watchdog and
+# whatever other interrupts land in the window; one that spun would halt 0
+# times, or count thousands of rounds. Call with IF=1, the controller idle,
+# and (this runs before init) no process to park. Returns 0 when no
+# controller is in MSI-X mode.
 pub fn nvme_irq_idle_probe() -> u64
     var i: i32 = 0
     while i < nvme_ctrl_count
         let c: *NvmeController = nvme_ctrls[i]
-        let vec: u8 = (*c).vec[NVME_IO_Q]
-        if vec != 0
-            var halts: u64 = 0
-            nvme_irq_sleep(vec, msix_vector_count(vec), 1, @halts)
-            return halts
+        var q: i32 = 0
+        while q < (*c).ioq_count
+            let vec: u8 = (*c).ioq[q].vec
+            if vec != 0
+                var halts: u64 = 0
+                nvme_irq_sleep(vec, msix_vector_count(vec), 1, @halts)
+                return halts
+            q = q + 1
         i = i + 1
     return 0

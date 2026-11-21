@@ -278,6 +278,38 @@ IRQ_STUB 45, 77
 IRQ_STUB 46, 78
 IRQ_STUB 47, 79
 
+# AP call (vector 240, AGAST #4220): an IPI that makes one AP run a kernel
+# function. It uses the interrupted stack (no IST), so it works on an AP that
+# has no TSS.
+IRQ_STUB 48, 240
+
+# CPU-local MSI-X vectors 80-95 (drivers/msix.ritz, AGAST #4220): device
+# interrupts aimed at the CPU that submitted the command, so an AP can take
+# its own completion without the BSP's IST2 stack. No IST: an AP has no TSS.
+IRQ_STUB 49, 80
+IRQ_STUB 50, 81
+IRQ_STUB 51, 82
+IRQ_STUB 52, 83
+IRQ_STUB 53, 84
+IRQ_STUB 54, 85
+IRQ_STUB 55, 86
+IRQ_STUB 56, 87
+IRQ_STUB 57, 88
+IRQ_STUB 58, 89
+IRQ_STUB 59, 90
+IRQ_STUB 60, 91
+IRQ_STUB 61, 92
+IRQ_STUB 62, 93
+IRQ_STUB 63, 94
+IRQ_STUB 64, 95
+
+# LAPIC watchdog (vector 96, AGAST #4220): the one-shot timer used by a wait
+# that must wake even if its device interrupt never comes. It no longer uses
+# vector 32, which belongs to the scheduler tick; once the tick runs, the
+# watchdog rides the tick instead of reprogramming the timer. Its own vector
+# is IST-free, so an AP without a TSS can use it.
+IRQ_STUB 65, 96
+
 # ============================================================================
 # Timer IRQ stub (vector 32, AGAST #3629)
 # ============================================================================

@@ -614,7 +614,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
     boot/test.sh (#2200; test_harland_uefi_boot_script.py), the inventory
     stick's inventory/test.sh (#3406; test_ci_inventory_boot.py), the MSI-X
     boot (#1852; test_ci_msix_boot.py), the NVMe boot (#1850;
-    test_ci_nvme_boot.py), the ESP-initramfs boot (#4253;
+    test_ci_nvme_boot.py), the AP-issued NVMe boot (#4220;
+    test_ci_nvme_ap_boot.py), the ESP-initramfs boot (#4253;
     test_ci_esp_initramfs_boot.py) and the rzsh serial session (#4252;
     test_ci_shell_boot.py). A new step here must make the same promise."""
     steps = [s for s in ci_local.load_steps() if s.job == "build-all" and not s.is_setup]
@@ -640,6 +641,8 @@ def test_real_build_all_job_is_rz_build_all_then_the_e2e():
         "bash projects/harland/tools/test_nvme_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_nvme_boot.sh",
+        'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
+        "bash projects/harland/tools/test_nvme_ap_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '
         "bash projects/harland/tools/test_esp_initramfs_boot.sh",
         'KEEP_WORK="$PWD/projects/harland/build/boot-logs" '

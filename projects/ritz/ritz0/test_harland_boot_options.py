@@ -40,6 +40,7 @@ TOOLS = HARLAND / "tools"
 BOOT_SCRIPTS = [
     "test_tier1_boot.sh",
     "test_nvme_boot.sh",
+    "test_nvme_ap_boot.sh",
     "test_esp_initramfs_boot.sh",
     "test_shell_boot.sh",
     "test_irq_dest_boot.sh",

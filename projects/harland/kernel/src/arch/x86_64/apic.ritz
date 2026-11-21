@@ -15,7 +15,7 @@
 # can be started. Without x2APIC the MMIO xAPIC is used and such CPUs are
 # skipped (#4184).
 
-import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult }
+import io { outb, inb, cpu_pause, rdmsr, wrmsr, cpuid, CpuidResult, enable_interrupts }
 import arch.x86_64.tsc { delay_us, deadline_after_us, deadline_passed }
 import arch.x86_64.tsc_calc { LAPIC_CAL_WINDOW_US, lapic_timer_hz, lapic_timer_initial }
 import serial { prints, serial_print_dec, serial_print_hex }
@@ -23,6 +23,7 @@ import mm.pmm { Mb2BootInfo, HarlandBootInfo, pmm_alloc_page }
 import mm.vmm { vmm_pml4_phys, vmm_map_mmio }
 import drivers.acpi.tables { acpi_init_with_mb, acpi_init_from_bootinfo, local_apic_addr, io_apic_addr }
 import arch.x86_64.cpu_map { MAX_CPUS, num_cpus, cpu_apic_ids, cpu_map_mark_started, cpu_map_started, cpu_map_needs_x2apic }
+import arch.x86_64.idt { idt_load_current }
 import arch.x86_64.irq_dest { irq_dest_pick, irq_ext_dest_from_cpuid, ioapic_rte_hi, ioapic_rte_dest, msi_addr_lo, IRQ_DEST_NONE }
 import drivers.iommu.ir { ir_init, ir_enabled, ir_x2apic, ir_set, ir_get_dest, ir_ioapic_sid, ir_ioapic_rte_hi, ir_ioapic_rte_lo, ir_ioapic_rte_handle, IR_NO_HANDLE }
 import drivers.iommu.dmar { ir_handle_ioapic }
@@ -130,6 +131,7 @@ fn apic_select_mode() -> i32
     # The BSP's ID, before ioapic_init routes the legacy IRQs to it: it is
     # not always 0 (#4233). ap_boot_all reads it again; it can't change.
     bsp_apic_id = lapic_id()
+    bsp_apic_known = 1
     irq_ext_dest_detect()
     # Interrupt remapping (VT-d #4316, AMD-Vi #4329: drivers/iommu/ir.ritz)
     # before the I/O APIC is programmed:
@@ -266,32 +268,82 @@ pub fn lapic_eoi() -> i32
     lapic_write(LAPIC_EOI, 0)
     return 0
 
-# One-shot LAPIC timer, used as a watchdog for a hlt that waits on a device
+# One-shot LAPIC timer, used as a watchdog for a sleep that waits on a device
 # interrupt (drivers/nvme, AGAST #4212): if the interrupt never comes, the
-# timer still wakes the CPU. It fires on vector 32, which irq_handler only
-# acknowledges (the 8259 PIC behind that vector is masked). Divide by 16.
-const LAPIC_WATCHDOG_VECTOR: u32 = 32
+# timer still wakes the CPU.
+#
+# Vector 32 belongs to the scheduler tick (#3629). Before the tick starts (and
+# always on an AP) the watchdog is a one-shot on vector 96, whose IDT gate has
+# no IST, so an AP without a TSS can use it. Once lapic_timer_start has armed
+# the periodic tick, the watchdog instead rides that tick: it counts tick
+# periods down and never reprograms the timer, so it shares vector 32 without
+# suspending preemption. (AGAST #4220.)
+const LAPIC_WATCHDOG_VECTOR: u32 = 96
+const LAPIC_TIMER_VECTOR: u32 = 32
 const LAPIC_TIMER_MASKED: u32 = 0x10000
 const LAPIC_TIMER_DIV16: u32 = 0x3
 
-# Arm the timer to fire once on this CPU after `ticks` (bus clock / 16).
+var lapic_watchdog_active: u8 = 0
+var lapic_watchdog_oneshot: u8 = 0
+var lapic_watchdog_ticks_left: u32 = 0
+
+# Is this the bootstrap processor? Before ap_boot_all records the BSP's APIC
+# ID every CPU is treated as the BSP (there are no APs yet).
+pub fn lapic_is_bsp() -> bool
+    if bsp_apic_known == 0
+        return true
+    return lapic_id() == bsp_apic_id
+
+# Arm the watchdog for `ticks` (bus clock / 16) or, when the periodic tick is
+# running on this CPU, for the same interval in scheduler ticks.
 pub fn lapic_watchdog_arm(ticks: u32) -> i32
+    lapic_watchdog_active = 1
+    if lapic_tick_initial != 0 and lapic_is_bsp()
+        # Ride the periodic tick: convert bus-clock ticks to tick periods.
+        var periods: u64 = 1
+        if lapic_timer_rate_hz != 0 and lapic_tick_hz != 0
+            periods = ((ticks as u64) * lapic_tick_hz + lapic_timer_rate_hz - 1) / lapic_timer_rate_hz
+            if periods == 0
+                periods = 1
+        lapic_watchdog_oneshot = 0
+        if periods > 0xFFFFFFFF
+            lapic_watchdog_ticks_left = 0xFFFFFFFF
+        else
+            lapic_watchdog_ticks_left = periods as u32
+        return 0
+    lapic_watchdog_oneshot = 1
+    lapic_watchdog_ticks_left = 0
     lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV16)
     lapic_write(LAPIC_TIMER, LAPIC_WATCHDOG_VECTOR)
     lapic_write(LAPIC_TIMER_INITIAL, ticks)
     return 0
 
-# True once the armed timer has counted down to zero (it has fired, or is
-# about to be delivered).
+# True once the armed interval has passed: the tick countdown reached 0
+# (riding the tick), or the one-shot counted down to zero (it fired).
 pub fn lapic_watchdog_expired() -> bool
-    return lapic_read(LAPIC_TIMER_CURRENT) == 0
+    if lapic_watchdog_active == 0
+        return false
+    if lapic_watchdog_oneshot != 0
+        return lapic_read(LAPIC_TIMER_CURRENT) == 0
+    return lapic_watchdog_ticks_left == 0
 
-# Stop the timer: masked again, as lapic_init leaves it, or back to the
-# scheduler's periodic tick once lapic_timer_start has run (#3629).
+# One scheduler tick passed on this CPU: count it against the watchdog.
+pub fn lapic_tick_advance() -> i32
+    if lapic_watchdog_active != 0 and lapic_watchdog_oneshot == 0 and lapic_watchdog_ticks_left > 0
+        lapic_watchdog_ticks_left = lapic_watchdog_ticks_left - 1
+    return 0
+
+# Stop the watchdog: a one-shot is masked, and the periodic tick is restored
+# if this BSP had one (riding the tick never touched the timer).
 pub fn lapic_watchdog_stop() -> i32
-    lapic_write(LAPIC_TIMER_INITIAL, 0)
-    lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED)
-    lapic_timer_resume()
+    if lapic_watchdog_oneshot != 0
+        lapic_write(LAPIC_TIMER_INITIAL, 0)
+        lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED)
+        if lapic_is_bsp()
+            lapic_timer_resume()
+    lapic_watchdog_active = 0
+    lapic_watchdog_oneshot = 0
+    lapic_watchdog_ticks_left = 0
     return 0
 
 # ============================================================================
@@ -310,6 +362,7 @@ const LAPIC_COUNT_MAX: u32 = 0xFFFFFFFF
 
 # The periodic tick's initial count; 0 while there is no tick.
 var lapic_tick_initial: u32 = 0
+var lapic_tick_hz: u64 = 0
 var lapic_timer_rate_hz: u64 = 0
 
 fn lapic_present() -> bool
@@ -338,6 +391,7 @@ pub fn lapic_timer_start(tick_hz: u64) -> i32
         return -1
     lapic_timer_rate_hz = hz
     lapic_tick_initial = initial
+    lapic_tick_hz = tick_hz
     prints("[timer] LAPIC timer ")
     serial_print_dec(hz)
     prints(" Hz (bus/16, TSC-calibrated), periodic ")
@@ -353,7 +407,7 @@ pub fn lapic_timer_resume() -> i32
     if lapic_tick_initial == 0
         return 0
     lapic_write(LAPIC_TIMER_DIVIDE, LAPIC_TIMER_DIV16)
-    lapic_write(LAPIC_TIMER, LAPIC_WATCHDOG_VECTOR | LAPIC_TIMER_PERIODIC)
+    lapic_write(LAPIC_TIMER, LAPIC_TIMER_VECTOR | LAPIC_TIMER_PERIODIC)
     lapic_write(LAPIC_TIMER_INITIAL, lapic_tick_initial)
     return 0
 
@@ -566,6 +620,7 @@ const AP_STACK_SIZE: u64 = 4096
 var ap_stack_tops: [64]u64      # Stack top by CPU index (0 = not allocated)
 var ap_count: u32 = 0           # Number of APs that have started
 var bsp_apic_id: u32 = 0        # BSP's APIC ID
+var bsp_apic_known: u8 = 0      # bsp_apic_id is recorded (0 is a valid ID)
 
 # The stack top of the AP at this CPU index (the scheduler runs that AP's
 # idle task on it). 0 for an index out of range or if the PMM is out of pages.
@@ -618,17 +673,39 @@ fn lapic_send_ipi(dest_apic: u32, vector: u8, delivery_mode: u8) -> i32
     let icr_lo: u32 = (vector as u32) | ((delivery_mode as u32) << 8)
     return lapic_send_icr(dest_apic, icr_lo)
 
+# Send a fixed-delivery IPI carrying `vector` to one CPU. Other modules use
+# this to make an AP run kernel code (arch/x86_64/apcall.ritz, #4220).
+pub fn lapic_send_fixed_ipi(dest_apic: u32, vector: u8) -> i32
+    return lapic_send_ipi(dest_apic, vector, IPI_DELIVERY_FIXED)
+
 # AP entry point (called by ap_trampoline.s after transition to long mode)
 pub fn ap_entry() -> i32
     # Follow the BSP into x2APIC mode before touching our LAPIC
     x2apic_enable_local()
 
+    # EFER is per CPU and INIT clears it. vmm_init enabled no-execute pages
+    # on the BSP, and the physmap's huge pages (and every 4 KiB mapping) set
+    # the NX bit: with EFER.NXE clear, an NX entry is a reserved-bit
+    # violation and an AP faults on its first physmap access (AGAST #4220).
+    wrmsr(0xC0000080, rdmsr(0xC0000080) | 0x800)
+
     # Get our APIC ID
     let my_apic_id: u32 = lapic_id()
 
-    # Initialize our local APIC
+    # Initialize our local APIC, as lapic_init does on the BSP. The timer is
+    # masked: the scheduler tick runs on the BSP only (#4192).
     lapic_write(LAPIC_SVR, LAPIC_SVR_ENABLE | LAPIC_SPURIOUS_VEC)
     lapic_write(LAPIC_TPR, 0)
+    lapic_write(LAPIC_ESR, 0)
+    lapic_write(LAPIC_ESR, 0)
+    lapic_write(LAPIC_EOI, 0)
+    lapic_write(LAPIC_TIMER, LAPIC_TIMER_MASKED)
+
+    # The IDTR is per CPU and was reset by INIT: without this, the first IPI
+    # or device interrupt an AP takes is a triple fault. The IDT's gates for
+    # an AP (the AP-call IPI, CPU-local MSI-X and the watchdog) use no IST,
+    # so no TSS is needed (#4220).
+    idt_load_current()
 
     # Print message (need mutex for serial, but for now just try)
     prints("    AP ")
@@ -639,7 +716,9 @@ pub fn ap_entry() -> i32
     cpu_map_mark_started(my_apic_id)
     atomic_fetch_add(@ap_count as *u32, 1)   # every AP does this at once
 
-    # For now, just halt - scheduler will give us work later
+    # Wait for work: an AP-call IPI runs a function, and an NVMe completion
+    # interrupt meant for this CPU is counted here too (#4220).
+    enable_interrupts()
     while true
         asm x86_64:
             hlt
@@ -725,6 +804,7 @@ fn ap_boot_one(apic_id: u32, cpu_idx: i32, stack_top: u64) -> i32
 pub fn ap_boot_all() -> i32
     # Record BSP's APIC ID
     bsp_apic_id = lapic_id()
+    bsp_apic_known = 1
 
     prints("  [..] Boot APs\n")
     prints("    BSP APIC ID: ")

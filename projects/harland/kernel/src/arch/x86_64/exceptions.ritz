@@ -11,6 +11,8 @@ import drivers.msix { msix_dispatch }
 import syscall.runtime.process { process_kill_current, current_pid }
 import syscall.stack { syscall_stack_guard_hit }
 import proc.sched { sched_tick }
+import proc.waitq { waitq_wake_irq }
+import arch.x86_64.apcall { ap_call_dispatch }
 
 # External functions from main.ritz
 extern fn ring_dump() -> i32
@@ -352,8 +354,20 @@ pub fn irq_handler(frame: *InterruptFrame) -> i32
             lapic_eoi()
             tty_console_irq_kill()
 
-    # MSI-X vectors (64-79): count the interrupt (drivers/msix.ritz)
-    msix_dispatch((*frame).vector)
+    if irq_num == 208
+        # Vector 240: an AP-call IPI (#4220). Acknowledge it *before*
+        # running the call: while this ISR is in service its priority (15)
+        # blocks the lower-priority completion and watchdog vectors the
+        # call is about to wait for.
+        lapic_eoi()
+        ap_call_dispatch()
+        return 0
+
+    # MSI-X vectors (64-79 and the CPU-local 80-95): count the interrupt
+    # (drivers/msix.ritz). A driver waiting for it is parked; wake it to
+    # re-check its completion condition (#4220).
+    if msix_dispatch((*frame).vector)
+        waitq_wake_irq()
 
     # Send EOI to LAPIC (for APIC-delivered interrupts)
     lapic_eoi()

@@ -150,9 +150,14 @@ def test_timer_is_calibrated_against_the_tsc_not_a_second_pit_gate():
     # the rate is logged, and the tick is periodic on vector 32
     assert "[timer] LAPIC timer " in APIC.read_text()
     resume = _body(apic, "lapic_timer_resume")
-    assert "LAPIC_WATCHDOG_VECTOR | LAPIC_TIMER_PERIODIC" in resume
+    assert "LAPIC_TIMER_VECTOR | LAPIC_TIMER_PERIODIC" in resume
     assert re.search(r"LAPIC_TIMER_PERIODIC: u32 = 0x20000\b", apic)
-    # the NVMe watchdog borrows the timer one-shot and gives the tick back
+    # The NVMe watchdog no longer owns vector 32 (AGAST #4220): it is a
+    # one-shot on its own vector before the tick runs, and rides the tick
+    # (counting periods) once it does. Stopping a one-shot gives the tick back.
+    assert re.search(r"LAPIC_WATCHDOG_VECTOR: u32 = 96\b", apic)
+    arm = _body(apic, "lapic_watchdog_arm")
+    assert "lapic_tick_initial != 0" in arm and "lapic_watchdog_ticks_left" in arm
     assert "lapic_timer_resume()" in _body(apic, "lapic_watchdog_stop")
 
 
