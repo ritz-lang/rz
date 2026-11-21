@@ -168,7 +168,7 @@ Qualify a variant with `.`: `ParseError.Empty`.
 
 ## 3. Propagating errors
 
-#### S-ERR-1 Propagate a `Result` with `?`
+#### S-ERR-1 Propagate a `Result` or `Option` with `?`
 
 **Status: CHECKED**
 
@@ -202,8 +202,10 @@ fn load(raw: i64) -> Result<Config, LoadError>
     Ok(Config { port: q })
 ```
 
-All three compilers also accept `?` on an `Option`, which §14.2 doesn't
-define (AGAST #4061). Don't rely on it until the spec says what it means.
+`?` works on an `Option` too: `expr?` yields the `Some` payload and returns
+`None` from the enclosing function, which must return an `Option`
+(LANGUAGE_SPEC §14.2). This is specified, not incidental — all three compilers
+accept it, so relying on it is the same as relying on the `Result` form.
 
 #### S-ERR-2 A `[[must_use]]` result is not thrown away
 

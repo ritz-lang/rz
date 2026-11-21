@@ -6350,7 +6350,8 @@ type, so a `Result`-returning signature is required to construct one.
 
 ### 14.2 Try Operator (?)
 
-`?` unwraps an `Ok` and returns early on `Err`:
+`?` propagates a failure or absence to the caller. On a `Result`, it unwraps an
+`Ok` and returns early on `Err`:
 
 ```ritz
 import ritzlib.result
@@ -6365,8 +6366,42 @@ fn double(x: i32) -> Result<i32, i32>
     Ok(v + v)
 ```
 
-The operand must be a `Result`-typed call; applying `?` to anything else fails
-with `Try operator requires a Result type`.
+On an `Option`, it unwraps a `Some` and returns early on `None`:
+
+```ritz
+import ritzlib.option
+
+fn find(x: i32) -> Option<i32>
+    if x > 0
+        return Some(x)
+    None
+
+fn twice(x: i32) -> Option<i32>
+    let v = find(x)?
+    Some(v + v)
+```
+
+The operand must be a call returning `Result<T, E>` or `Option<T>`, and the
+enclosing function must return the same carrier: a `Result` with the same `E`
+for a `Result` operand, an `Option` for an `Option` operand. Applying `?` to
+another type fails — `Try operator requires a Result type` for a plain value,
+or `Try operator requires a Result or Option type, got: <carrier>` for another
+enum. Applying `?` to an `Option` from a function that does not return an
+`Option` fails with `Try operator on an Option used in a function that does not
+return an Option`:
+
+```ritz expect-error="Try operator on an Option used in a function that does not return an Option"
+import ritzlib.option
+
+fn find(x: i32) -> Option<i32>
+    if x > 0
+        return Some(x)
+    None
+
+fn twice(x: i32) -> i32
+    let v = find(x)?
+    v + v
+```
 
 ### 14.3 Pattern Matching
 
