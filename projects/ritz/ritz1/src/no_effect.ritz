@@ -1,0 +1,365 @@
+# ritz1/src/no_effect.ritz - a statement with no effect (LARB R64; AGAST #3492)
+#
+# LANGUAGE_SPEC §6.6.  An expression whose value is discarded must do
+# something.  When its outermost node is a literal, name, field, index,
+# borrow, `*p`, cast, aggregate literal or operator, it computes a value and
+# throws it away:
+#
+#     t.ritz:<line>:<col>: error: statement has no effect: the value of `<expr>` is discarded
+#
+# A string on its own line is the commonest case, a print that was never
+# written, so its message adds a hint (the 259 lost zeus "FAIL: …" lines,
+# AGAST #3490).  Calls, assignments and `if`/`match`/blocks are allowed; a
+# discarded `[[must_use]]` call is must_use.ritz's (§17.8).
+#
+# LARB R69 (AGAST #3968 / #3997): a block has a value only when it is used as
+# one.  The last line of a void fn, a loop body, a statement `if` branch or a
+# statement `match` arm is discarded like any other statement, so `_ => 0` in
+# a statement match is refused; a do-nothing arm is `_ => pass`.
+#
+# The message shows the expression as written, the capability ritz0's
+# no_effect.py already had (its _Source.text).  A SrcSpan carries only a line
+# and a column, so this re-reads the source and walks the logical line: to the
+# next newline outside brackets, a `#` comment, a bracket the expression did
+# not open, or an inline `if` arm's `else`; quotes and `\` escapes are
+# honoured, runs of whitespace collapse.  When the text cannot be recovered
+# the node kind's name stands in, as ritz0 does.
+#
+# Two traps, both ritz0's:
+#   * `pass` is the no-op (an EXPR_INT_LIT marked LIT_PASS), never refused;
+#   * a whole array alone is discarded_array.ritz's, a more specific message
+#     at the same positions, so this one stays quiet there.
+#
+# Sema walks exactly the statements the emitter lowers: sema_walk calls
+# no_effect_check for a STMT_EXPR with a next statement, for the tail of a fn
+# or method that returns nothing, and — R69 — for the tail of a block that is
+# no value and for a statement `if` / `match`'s arm values.  It takes
+# `sm: *Sema`, never an EmitterState (tools/test_ritz1_emitter_check_freeze.py).
+
+import ritzlib.sys
+import ritzlib.io
+import ritzlib.gvec
+import ritzlib.string
+
+import ast
+import ast_helpers
+import sema
+import sema_type
+import deref_field
+
+# Read `path` whole.  The error path only, so a re-read per report is fine.
+fn ne_read_file(path: *u8) -> Vec<u8>
+    var buf: Vec<u8> = vec_new<u8>()
+    if path == null
+        return buf
+    let fd: i32 = sys_open(path, O_RDONLY)
+    if fd < 0
+        return buf
+    var chunk: [8192]u8
+    let chunk_ptr: *u8 = @chunk[0]
+    var n: i64 = 1
+    while n > 0
+        n = sys_read(fd, chunk_ptr, 8192)
+        var i: i64 = 0
+        while i < n
+            vec_push<u8>(@&buf, chunk[i])
+            i += 1
+    sys_close(fd)
+    buf
+
+# The bytes of `word` (a c-string) equal the bytes at `start`?
+fn ne_eq_at(data: *u8, start: i64, word: *u8) -> i32
+    var i: i64 = 0
+    while *(word + i) != 0
+        if *(data + start + i) != *(word + i)
+            return 0
+        i += 1
+    1
+
+fn ne_is_start(ch: u8) -> i32
+    if ch >= 65 and ch <= 90
+        return 1
+    if ch >= 97 and ch <= 122
+        return 1
+    if ch == 95
+        return 1
+    0
+
+fn ne_is_word_char(ch: u8) -> i32
+    if ne_is_start(ch) == 1
+        return 1
+    if ch >= 48 and ch <= 57
+        return 1
+    0
+
+# Python's str.split() whitespace, which the contract's `<expr>` collapses on.
+fn ne_is_space(ch: u8) -> i32
+    if ch == 32 or ch == 9 or ch == 10 or ch == 11 or ch == 12 or ch == 13
+        return 1
+    0
+
+# The start of a word at `pos`: a letter or `_`, not preceded by a word char.
+fn ne_word_start(data: *u8, pos: i64) -> i32
+    if ne_is_start(*(data + pos)) == 0
+        return 0
+    if pos == 0
+        return 1
+    if ne_is_word_char(*(data + pos - 1)) == 1
+        return 0
+    1
+
+# Collapse runs of whitespace, as ritz0's _Source._joined does.
+fn ne_collapse(raw: @String) -> String
+    var out: String = string_new()
+    var have: i32 = 0
+    var pending: i32 = 0
+    var i: i64 = 0
+    let n: i64 = string_len(raw)
+    while i < n
+        let ch: u8 = string_get(raw, i)
+        if ne_is_space(ch) == 1
+            if have == 1
+                pending = 1
+        else
+            if pending == 1
+                string_push(@&out, 32)
+                pending = 0
+            string_push(@&out, ch)
+            have = 1
+        i += 1
+    out
+
+# The source text of the expression starting at `line`:`col`, or an empty
+# String when it cannot be recovered.  Ported from ritz0/no_effect.py's
+# _Source.text: the logical line, from the span to where the expression ends.
+fn ne_text(file: *u8, line: i32, col: i32) -> String
+    var out: String = string_new()
+    if file == null or line < 1 or col < 1
+        return out
+    let src: Vec<u8> = ne_read_file(file)
+    if src.len == 0
+        return out
+    # Byte offset `line` starts at (SrcSpan lines are 1-based).
+    var pos: i64 = 0
+    var ln: i32 = 1
+    while ln < line and pos < src.len
+        if *(src.data + pos) == 10
+            ln += 1
+        pos += 1
+    if ln != line or pos >= src.len
+        return out
+    pos += (col - 1) as i64
+    if pos >= src.len
+        return out
+    var raw: String = string_new()
+    var depth: i32 = 0
+    var quote: i32 = 0
+    var open_ifs: i32 = 0
+    var done: i32 = 0
+    while pos < src.len and done == 0
+        let ch: u8 = *(src.data + pos)
+        if ch == 10
+            # End of the logical line: a new one only inside brackets.
+            if depth <= 0
+                done = 1
+            else
+                string_push(@&raw, 32)
+            pos += 1
+        else if quote != 0
+            string_push(@&raw, ch)
+            if ch == 92 and pos + 1 < src.len
+                # A `\` escape keeps its next byte.
+                pos += 1
+                string_push(@&raw, *(src.data + pos))
+            else if (ch as i32) == quote
+                quote = 0
+            pos += 1
+        else if ch == 34 or ch == 39
+            quote = ch as i32
+            string_push(@&raw, ch)
+            pos += 1
+        else if ch == 35
+            # A `#` comment ends the expression.
+            done = 1
+        else if depth == 0 and (ch == 41 or ch == 93 or ch == 125)
+            # Closes a group the expression sits in: `(if c then ^x)`.
+            done = 1
+        else
+            if depth == 0 and ne_word_start(src.data, pos) == 1
+                let wstart: i64 = pos
+                pos += 1
+                while pos < src.len and ne_is_word_char(*(src.data + pos)) == 1
+                    pos += 1
+                let wlen: i64 = pos - wstart
+                if wlen == 4 and ne_eq_at(src.data, wstart, c"else") == 1 and open_ifs == 0
+                    # An inline `if` arm's end: `if c then ^x else y`.
+                    done = 1
+                else
+                    if wlen == 2 and ne_eq_at(src.data, wstart, c"if") == 1
+                        open_ifs += 1
+                    else if wlen == 4 and ne_eq_at(src.data, wstart, c"else") == 1
+                        open_ifs -= 1
+                    var k: i64 = wstart
+                    while k < pos
+                        string_push(@&raw, *(src.data + k))
+                        k += 1
+            else
+                if ch == 40 or ch == 91 or ch == 123
+                    depth += 1
+                if ch == 41 or ch == 93 or ch == 125
+                    depth -= 1
+                string_push(@&raw, ch)
+                pos += 1
+    let collapsed: String = ne_collapse(@raw)
+    string_drop(@&raw)
+    collapsed
+
+fn ne_is_string_kind(k: i32) -> i32
+    if k == EXPR_STRING_LIT or k == EXPR_CSTRING_LIT
+        return 1
+    0
+
+# ritz0's fallback: the node kind's class name, when the text is lost.
+fn ne_kind_name(k: i32) -> *u8
+    if k == EXPR_INT_LIT
+        return c"IntLit"
+    if k == EXPR_FLOAT_LIT
+        return c"FloatLit"
+    if k == EXPR_NIL_LIT
+        return c"NullLit"
+    if k == EXPR_STRING_LIT
+        return c"StringLit"
+    if k == EXPR_CSTRING_LIT
+        return c"CStringLit"
+    if k == EXPR_CHAR_LIT
+        return c"CharLit"
+    if k == EXPR_IDENT
+        return c"Ident"
+    if k == EXPR_MEMBER
+        return c"Field"
+    if k == EXPR_INDEX
+        return c"Index"
+    if k == EXPR_CAST
+        return c"Cast"
+    if k == EXPR_STRUCT_LIT
+        return c"StructLit"
+    if k == EXPR_ARRAY_LIT
+        return c"ArrayLit"
+    if k == EXPR_ARRAY_FILL
+        return c"ArrayFill"
+    if k == EXPR_BINARY
+        return c"BinOp"
+    if k == EXPR_UNARY
+        return c"UnaryOp"
+    if k == EXPR_RANGE
+        return c"Range"
+    c"Expr"
+
+# Is a bare `pass` at `len` bytes `name`?  ritz0's _Judge.discarded lets a
+# bound `pass` through as it lets the no-op through.
+fn ne_is_pass(p: *u8, len: i32) -> i32
+    if len == 4 and *p == 112 and *(p + 1) == 97 and *(p + 2) == 115 and *(p + 3) == 115
+        return 1
+    0
+
+# 1 when `e` is a place holding a whole array: a local or global `[N]T`, a
+# `:& [N]T` param, an array field or `*p` of a `*[N]T`.  ritz0's typing pass
+# reports these with "a whole array is not a value here" at the same span
+# (type_refs._check_discarded), so this rule stays quiet: in ritz1
+# discarded_array.ritz reports the field and the emitter the rest, and a Sema
+# error would stop the compile before the emitter could.  Only the three
+# shapes ritz0's _check_discarded covers (AGAST #3189, #3054).
+fn ne_whole_array_place(sm: *Sema, e: *Expr, k: i32) -> i32
+    if k == EXPR_IDENT
+        if sema_expr_type(sm, e) == TYPE_ARRAY
+            return 1
+        # A `:& [N]T` param reads as the array; its binding is untyped.
+        let v: *SemaVar = sema_find_local(sm, StrView { ptr: (e.ident_ptr), len: (e.ident_len) as i64 })
+        if v != null and v.lent != null
+            if v.lent.param_type == TYPE_ARRAY or v.lent.param_pointee_type == TYPE_ARRAY
+                return 1
+        return 0
+    if k == EXPR_MEMBER
+        let f: *StructField = df_member_field(sm, e)
+        if f != null and f.field_type == TYPE_ARRAY
+            return 1
+        return 0
+    if k == EXPR_UNARY and e.op == OP_DEREF
+        var o: SemaTy
+        sema_expr_ty(sm, e.operand, @o)
+        if o.pointee == TYPE_ARRAY or o.kind == TYPE_ARRAY
+            return 1
+        return 0
+    0
+
+# 1 when `e`, a discarded expression, may not be: its outermost node computes
+# a value and throws it away (R64).  `pass` and a whole array are excepted.
+fn ne_refused(sm: *Sema, e: *Expr, k: i32) -> i32
+    if k == EXPR_INT_LIT
+        if e.lit_kind == LIT_PASS
+            return 0
+        return 1
+    if k == EXPR_FLOAT_LIT or k == EXPR_NIL_LIT
+        return 1
+    if k == EXPR_STRING_LIT or k == EXPR_CSTRING_LIT or k == EXPR_CHAR_LIT
+        return 1
+    if k == EXPR_IDENT
+        if ne_is_pass(e.ident_ptr, e.ident_len) == 1
+            return 0
+        if ne_whole_array_place(sm, e, k) == 1
+            return 0
+        return 1
+    if k == EXPR_INDEX or k == EXPR_CAST
+        return 1
+    if k == EXPR_MEMBER
+        # A whole array is discarded_array.ritz's more specific message, at
+        # the same position; this one stays quiet there (trap 6).
+        if ne_whole_array_place(sm, e, k) == 1
+            return 0
+        return 1
+    if k == EXPR_STRUCT_LIT or k == EXPR_ARRAY_LIT or k == EXPR_ARRAY_FILL
+        return 1
+    if k == EXPR_BINARY or k == EXPR_UNARY or k == EXPR_RANGE
+        # `*p` of a `*[N]T` is a whole array place (trap 6).
+        if k == EXPR_UNARY and ne_whole_array_place(sm, e, k) == 1
+            return 0
+        return 1
+    0
+
+# Report `e`, whose value is discarded, if it has no effect.
+pub fn no_effect_check(sm: *Sema, e: *Expr)
+    if e == null
+        return
+    let k: i32 = e.kind
+    if ne_refused(sm, e, k) == 0
+        return
+    let file: *u8 = sema_file(sm)
+    var text: String = ne_text(file, e.span.line, e.span.col)
+    sema_error_at(sm, e.span.line, e.span.col)
+    eprints_cstr(c"statement has no effect: the value of `")
+    if string_len(@text) == 0
+        eprints_cstr(ne_kind_name(k))
+    else
+        eprint_string(@text)
+    eprints_cstr(c"` is discarded")
+    if ne_is_string_kind(k) == 1
+        eprints_cstr(c"; a string on its own line prints nothing: call print")
+    eprints_cstr(c"\n")
+    string_drop(@&text)
+
+# LARB R69 (AGAST #3968 / #3997): `e`, a discarded statement's expression,
+# judged through an `if` / `match` expression's arms (`if c then ^x else 0`),
+# as ritz0's _Judge.discarded judges a dropped one's.  Only for a statement's
+# own expression: sema_walk_arms judges the arms of one nested in a discarded
+# arm.
+pub fn no_effect_check_value(sm: *Sema, e: *Expr)
+    if e == null
+        return
+    if e.kind != EXPR_IF and e.kind != EXPR_MATCH
+        no_effect_check(sm, e)
+        return
+    var arm: *MatchArm = e.args as *MatchArm
+    while arm != null
+        if arm.is_pass == 0
+            no_effect_check_value(sm, arm.body)
+        arm = arm.next

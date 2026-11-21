@@ -204,8 +204,9 @@ REACH = {
 OPEN = {
     # A `*T` element of a Vec is a pointer, not the T (AGAST #2444).
     "vec_of_pointers": "fn o_vec(p: @Vec<*Tracked>) -> i32\n    let q: *Tracked = p[1]\n    q.id\n",
-    # A discarded match's arm reads no referent (AGAST #3028).
-    "discarded_arm": ("fn o_discard(t:& Tracked, k: i32)\n    match k\n        0 => t\n        _ => pass\n"
+    # A discarded match's arm reads no referent (AGAST #3028).  The arm is a
+    # call, not a bare `t`: a discarded arm value is R64's (AGAST #3492).
+    "discarded_arm": ("fn o_discard(t:& Tracked, k: i32)\n    match k\n        0 => note(t.id)\n        _ => pass\n"
                       "    let z: i32 = k\n"),
 }
 

@@ -62,7 +62,7 @@ LENT_ESCAPE = ("this call returns a reference, and `@mk()` lends a temporary tha
                "the call returns: bind it to a local first")
 
 # name -> (the program, the error's line:col, its words); then an emitter-only error.
-_FOR = "    var q: i32 = 3\n    for x in q\n        x\n"
+_FOR = "    var q: i32 = 3\n    for x in q\n        pass\n"
 STOPS = {
     "ref_into_value": ("struct C\n    x: i32\n\nfn f(p: @C)\n    let c: C = p\n" + _FOR, "5:16", SLOT_REF),
     "value_into_ref": ("struct C\n    x: i32\n\nfn g(r: @C) -> i32\n    r.x\n\nfn f(c: C)\n    g(c)\n" + _FOR,
@@ -91,8 +91,8 @@ REACH = {
     # An array param's element; an `a:& [2]i32` binds as the array; `@a`'s size.
     "array_param_element": ("fn g(a: [2]i64) -> i64\n    a[0]\n\nfn f(a: [2]i32)\n    g(a)\n", "5:7", ARRAY_ELEM),
     "lent_array_bare": ("fn g(p: *[2]i32) -> i32\n    0\n\nfn f(a:& [2]i32)\n    g(a)\n", "5:7", INTO_REF),
-    "lent_array_referent": ("fn g(p: *[3]i32)\n    0\n\nfn f(a:& [2]i32)\n    g(@a)\n", "5:7", OTHER_TYPE),
-    "array_referent_size": ("fn g(p: *[2][3]i32)\n    0\n\nfn f(a: [6]i32)\n    g(@a)\n", "5:7", OTHER_TYPE),
+    "lent_array_referent": ("fn g(p: *[3]i32)\n    pass\n\nfn f(a:& [2]i32)\n    g(@a)\n", "5:7", OTHER_TYPE),
+    "array_referent_size": ("fn g(p: *[2][3]i32)\n    pass\n\nfn f(a: [6]i32)\n    g(@a)\n", "5:7", OTHER_TYPE),
     # An un-annotated `let`: its initialiser's type, or the reference its view makes it.
     "inferred_let_from_call": ("fn pick(p: *C) -> *C\n    p\n\nfn f(d: *C)\n    let p = pick(d)\n    let c: C = p\n",
                                "6:16", SLOT_REF),

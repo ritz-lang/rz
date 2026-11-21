@@ -111,8 +111,8 @@ fn main() -> i32
     match n
         3 =>
             check(3)
-            0
-        _ => 0
+            pass
+        _ => pass
     let v: i32 = if n == 2
         check(8)
         1
@@ -139,6 +139,8 @@ fn main() -> i32
 """
 
 # line:col of each report, one per lowered copy: twice<T> has two instances.
+# The statement `match` arms end in `pass`, not `0`: a discarded arm value is
+# LARB R69's (no_effect.ritz, AGAST #3492), and this test pins must_use's reach.
 REACH_WANTED = sorted(["15:9", "19:5", "19:5", "23:5", "28:9", "31:9", "34:9",
                        "37:9", "42:9", "45:9", "49:13", "53:9", "60:17",
                        "68:5"])

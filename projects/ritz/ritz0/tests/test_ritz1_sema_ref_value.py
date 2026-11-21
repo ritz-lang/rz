@@ -50,9 +50,9 @@ def _returns(name):
 # name -> (the program, the error's line:col, its words); then an emitter-only error.
 STOPS = {
     "write": ("struct C\n    x: i32\n\nfn f(p: @C)\n    p.x = 3\n    var q: i32 = 3\n"
-              "    for x in q\n        p.x\n", "5:5", WRITE),
+              "    for x in q\n        pass\n", "5:5", WRITE),
     "return_local": ("struct C\n    x: i32\n\nfn f() -> @C\n    let c = C { x: 1 }\n"
-                     "    var q: i32 = 3\n    for x in q\n        c.x\n    @c\n", "9:5", _returns("c")),
+                     "    var q: i32 = 3\n    for x in q\n        pass\n    @c\n", "9:5", _returns("c")),
 }
 
 
@@ -94,7 +94,7 @@ REACH = {
     "ref_to_ref": ("fn f(r: @@C)\n    (*r).x = 3\n", "2:6", WRITE),
     # A match payload of an `@C` variant binds as an `@C` (RsNote.ref_kind).
     "match_payload": ("enum E\n    S(@C)\n    N\n\nfn f(e: E) -> i32\n    match e\n"
-                      "        E.S(v) => v.x = 6\n        _ => 0\n    0\n", "7:19", WRITE),
+                      "        E.S(v) => v.x = 6\n        _ => pass\n    0\n", "7:19", WRITE),
     "borrow": ("fn bump(q: @&i32)\n    *q = 1\n\nfn f(p: @C)\n    bump(@&p.x)\n", "5:10", BORROW),
     "receiver": ("fn f(h: @H)\n    h.r.up()\n", "2:5", INTO_MUT),
     # An element of a Span reached through an `@`: its method is the element's.

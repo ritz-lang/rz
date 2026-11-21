@@ -103,7 +103,7 @@ fn f(w: W, h: H, p: *W, ws: [2]W, c: i32) -> i32
     mk().a
     mkp(p).a
     w.get().a
-    w.n
+    let wn: i32 = w.n
     if c == 1
         w.a
     while c == 2
@@ -112,8 +112,8 @@ fn f(w: W, h: H, p: *W, ws: [2]W, c: i32) -> i32
     match c
         3 =>
             w.a
-            1
-        _ => 0
+            pass
+        _ => pass
     3
 
 fn v(w: W)
@@ -149,7 +149,10 @@ fn s(w: W, c: i32) -> [2]i32
 """
 
 # line:col of each report, as ritz0 makes them.  38:13, an arm's statement
-# before its value, joined in AGAST #3920.  LARB R69 (AGAST #3968): 32:9, the
+# before its value, joined in AGAST #3920.  The non-array field is read into
+# a `let`, and the statement `match` arms end in `pass`: a discarded value is
+# no_effect's (LARB R64/R69, AGAST #3492), and this test pins array reach.
+# LARB R69 (AGAST #3968): 32:9, the
 # trailing value of an else-less `if` body, and fn s's statement `if` / loop
 # bodies' tails and statement `match` arm; its `let` and tail `if` are values.
 ARRAY_WANTED = sorted(["22:5", "23:5", "24:5", "25:6", "26:5", "27:5", "28:5",

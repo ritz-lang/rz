@@ -178,7 +178,7 @@ fn noisy()
     pass
 
 fn proc()
-    St.A
+    noisy()
 
 fn spin() -> i64
     while true

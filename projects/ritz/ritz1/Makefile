@@ -59,6 +59,7 @@ SOURCES = \
 	sema_type \
 	sema_probe \
 	must_use \
+	no_effect \
 	discarded_array \
 	if_arm_value \
 	sema_index_store \

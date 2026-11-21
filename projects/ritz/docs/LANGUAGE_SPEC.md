@@ -370,7 +370,9 @@ refused at its opening quote:
 let bad = s"hello"
 ```
 
-`make check-no-s-strings` fails the build if one reappears in the tree.
+`make check-no-s-strings` fails the build if one reappears in the tree. A
+string left alone on a line is also a statement with no effect
+([§6.6](#66-statements-with-no-effect)); the parse error comes first.
 
 **Escape sequences:** `\n`, `\t`, `\r`, `\\`, `\"`, `\'`, `\0`, `\e` (ESC,
 0x1B), `\xNN`, and `\{` / `\}` for a literal brace anywhere. They mean the same
@@ -2401,6 +2403,46 @@ while true
         n += 2
         continue
     n += 1
+```
+
+### 6.6 Statements With No Effect
+
+An expression statement whose value is discarded must do something. When its outermost node is a literal, a name, a field, an index, a borrow (`@x`), a dereference (`*p`), a cast, an aggregate literal (struct, array, tuple) or an operator, it computes a value and throws it away, and it is an error, located at the expression (LARB R64, AGAST #3491, #3492):
+
+    t.ritz:<line>:<col>: statement has no effect: the value of `<expr>` is discarded
+
+```ritz expect-error="statement has no effect: the value of `x == 1` is discarded"
+fn main() -> i32
+    let x: i32 = 1
+    x == 1
+    0
+```
+
+A string on its own line is the commonest case, a print that was never written, so its message adds a hint:
+
+```ritz expect-error="a string on its own line prints nothing: call print"
+fn main() -> i32
+    "FAIL: x\n"
+    1
+```
+
+Calls, assignments, `if`, `match` and blocks are allowed. A call's result may be discarded unless its fn is `[[must_use]]` (§17.8).
+
+A block has a value only when it is used as one (LARB R69). A value-returning fn's last line, a `let`'s `if` branch or a value `match` arm are values. The last line of a fn that returns nothing, of a loop body, of a statement `if` branch or of a statement `match` arm is discarded like any other statement. A do-nothing arm is `pass`, not `0`:
+
+```ritz
+fn bump(n: *i32, k: i32)
+    match k
+        0 => pass
+        _ => *n = *n + k
+
+fn main() -> i32
+    var n: i32 = 0
+    bump(@n, 0)
+    let w: i32 = match n
+        0 => 0
+        _ => 1
+    w
 ```
 
 ---

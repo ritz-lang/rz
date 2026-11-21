@@ -44,7 +44,7 @@ struct P
 fn main() -> i32
     let b: bool = true
     match b + 1
-        _ => 0
+        _ => pass
     let p: P = P { x: true }
     var m: i32 = huge()
     0

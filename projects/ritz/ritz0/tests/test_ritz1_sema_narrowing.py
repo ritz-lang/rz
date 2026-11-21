@@ -81,7 +81,7 @@ fn arms(o: Option<i64>, w: u64) -> i32
         Some(x) =>
             let c: i32 = x
             return c
-        None => 0
+        None => pass
     let d: u8 = match w
         k =>
             let e: u8 = k

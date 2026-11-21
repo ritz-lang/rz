@@ -37,23 +37,11 @@ fn main() -> i32
     0
 """
 
-# A void arm next to a StrView-valued arm: before the fix this also typed a
-# `%StrView` phi whose incoming value from the void arm was %.0.
-VOID_AND_STRUCT_ARMS = """\
-import ritzlib.option
-
-fn say(x: i32)
-    pass
-
-fn pick(o: Option<StrView>) -> i32
-    match o
-        Some(s) => s
-        None => say(0)
-    0
-
-fn main() -> i32
-    pick(None)
-"""
+# A void arm next to a StrView-valued arm (`Some(s) => s` / `None => say(0)`)
+# was the second shape this bug reached: before the fix it typed a `%StrView`
+# phi whose incoming value from the void arm was %.0.  It is no longer a legal
+# program: the match is a statement, so the `s` arm's value is discarded and
+# LARB R64/R69 refuses it (ritz0 #3491, ritz1 #3492), before any phi.
 
 # A void-arm match as the tail of a void procedure (#1468).
 VOID_PROC_TAIL = """\
@@ -102,7 +90,6 @@ def _compile(ritz1_bin: Path, tmp_path: Path, name: str, program: str) -> str:
     "name,program,fn",
     [
         ("void_arms", VOID_ARMS, "main"),
-        ("void_and_struct_arms", VOID_AND_STRUCT_ARMS, "pick"),
         ("void_proc_tail", VOID_PROC_TAIL, "tail"),
     ],
 )

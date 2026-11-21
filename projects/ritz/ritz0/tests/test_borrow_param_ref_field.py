@@ -3839,9 +3839,10 @@ MOVE_OUT_SEMA_FIRST = {
 
 
 # A bare `t` or `t.h` whose value is discarded (LARB R69) has no effect, so
-# ritz0 refuses it with R64's words before #2949's move question arises (AGAST
-# #3491).  ritz1 keeps its DROP_STORES / MOVE_OUT rows until it has R64 too
-# (#3492); ritz0's are test_ritz0_a_bare_reference_alone_has_no_effect's.
+# both compilers refuse it with R64's words before #2949's move question
+# arises (AGAST #3491 for ritz0, #3492 for ritz1).  The rows run on both and
+# say that, wherever their source lands; ritz0 also pins the exact wording in
+# test_ritz0_a_bare_reference_alone_has_no_effect.
 NO_EFFECT_ROWS = {
     "stmt_mid_block", "stmt_field_tail", "stmt_defer_tail", "stmt_copy_tail",
     "stmt_tail", "stmt_method_tail", "stmt_while", "stmt_for", "stmt_match_arm",
@@ -3849,9 +3850,7 @@ NO_EFFECT_ROWS = {
     "stmt_match_block_arm_generic",
 }
 
-
-def _pair_of(name):
-    return ("ritz1",) if name in NO_EFFECT_ROWS else PAIR
+NO_EFFECT = "statement has no effect: the value of `t"
 
 
 def _pair_rows():
@@ -3868,8 +3867,11 @@ def _pair_rows():
     for name in sorted(CONTROLS):
         yield f"slot_holds_what_it_is_given[{name}]", PAIR, CONTROLS[name], "run", 3
     for name in sorted(DROP_STORES):
-        yield (f"reference_to_a_drop_type_is_not_a_move[{name}]", _pair_of(name),
-               DROP_STORES[name], "run", 3)
+        rid = f"reference_to_a_drop_type_is_not_a_move[{name}]"
+        if name in NO_EFFECT_ROWS:
+            yield rid, PAIR, DROP_STORES[name], "anywhere", NO_EFFECT
+        else:
+            yield rid, PAIR, DROP_STORES[name], "run", 3
     # Loading the referent would hand one value to two owners, so ritz1 has to
     # refuse here where it used to leave the rejection to clang. The error names a
     # line in the source, which clang's never could.
@@ -3879,7 +3881,10 @@ def _pair_rows():
             yield rid, ("ritz0",), MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE
             yield rid, ("ritz1",), MOVE_OUT[name], "at", MOVE_OUT_SEMA_FIRST[name]
             continue
-        yield rid, _pair_of(name), MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE
+        if name in NO_EFFECT_ROWS:
+            yield rid, PAIR, MOVE_OUT[name], "anywhere", NO_EFFECT
+        else:
+            yield rid, PAIR, MOVE_OUT[name], "at", MOVE_OUT_OF_A_REFERENCE
     for name in sorted(NO_IMPLICIT_DEREF):
         yield f"a_reference_is_not_its_referent[{name}]", PAIR, NO_IMPLICIT_DEREF[name], "at", REF_INTO_VALUE
     for name in sorted(POINTER_SLOTS):

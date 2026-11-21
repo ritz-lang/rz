@@ -261,6 +261,13 @@ empty. A note that belongs to a move goes on that check's own entry.
   mid-lowering (sizeof), from the emitter's own table of written types;
   float_slot and literal_slot read it on Sema (`narrow_sema_*`, #3510).
 
+- `no_effect` — an expression statement whose value is discarded must do
+  something (§6.6, LARB R64, #3492): a literal, name, field, index, borrow,
+  `*p`, cast, aggregate literal or operator is refused with its source text;
+  `pass` and a whole array place are not this rule's. LARB R69 (#3968,
+  #3997): the value of a non-value block's tail and of a statement `if` /
+  `match` arm is discarded too, so a do-nothing arm is `_ => pass`.
+
 - `own_check` — the move check (§13, #2158), on Sema since #3507: a use
   of a moved value, a move out of a reference, an array element or a global,
   a `:&` param's referent read by value, and a deferred statement checked at

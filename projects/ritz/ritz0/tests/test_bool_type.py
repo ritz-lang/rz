@@ -395,9 +395,12 @@ RITZ0_ONLY_ACCEPTED = {
 }
 
 
-# A discarded `if`/`match` arm has no value (LARB R69), so there is no mix to
-# judge: a literal arm alone has no effect, and ritz0 says so first (LARB R64,
-# AGAST #3491).  ritz1 keeps #2046's words until it has R64 too (#3492).
+# A discarded `if`/`match` arm has no value (LARB R69): a literal arm alone is
+# a statement with no effect, and ritz0 aborts with R64's words first (AGAST
+# #3491).  ritz1 says them too (#3492) but keeps checking the arm's type, so
+# it also reports #2046's words at the same place; its row pins those, the
+# check that a discarded arm is still not an excuse for a mix.  R64's words
+# on ritz1 are test_ritz1_sema_no_effect.py's.
 NO_EFFECT_ARMS = {
     "discarded_if_arms_mix": (2, 23, no_effect_message("true", is_string=False)),
     "discarded_nested_match_arms_mix": (5, 22, no_effect_message("true", is_string=False)),
