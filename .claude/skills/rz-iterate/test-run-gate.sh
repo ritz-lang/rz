@@ -565,6 +565,46 @@ kill $qp; wait $qp 2>/dev/null; : > "$Q"; exec 7>&-
 check '[[ "$(RZ_TRAIN_SLOTS=5 free 2>/dev/null)" == 0 ]]' "rz_train_free: a bad slot config is 0"
 unset RZ_TRAIN_SLOTS RZ_GATE_POLL; export RZ_GATE_SLOTS=1
 
+# 22. No run-gate scratch in the worktree it tests (AGAST #4420).  A caller
+# kept the log's path in an untracked `.gate-log-name` at the worktree root so
+# a later turn could --wait; at teardown `adele room rm` refused the dirty
+# worktree until it was moved by hand.  A gate now removes it on every exit
+# path, so `git status --porcelain` is the same before and after.
+V22="$T/wt22"
+git init -q "$V22"; echo a > "$V22/a"; git -C "$V22" add a; git -C "$V22" commit -qm init
+clean22() { [[ -z "$(git -C "$V22" status --porcelain)" ]]; }
+# Section 21f's train gate reserved the slot as it ended (#3427): a room gate
+# with no reserved train slots would wait out RZ_GATE_TRAIN_HOLD.
+rm -f "$RES" "$MARK" "$OVR"
+printf 'gate-logs/22-scratch-1.log\n' > "$V22/.gate-log-name"
+check '! clean22' "the caller's scratch dirties the worktree before the gate"
+l22="$(RZ_GATE_CMD='exit 0' gate "$V22" t22p)"
+check 'grep -qx EXIT=0 "$l22"' "a passing gate still passes"
+check '[[ ! -e "$V22/.gate-log-name" ]]' "a passing gate removes the caller's scratch"
+check 'clean22' "the worktree is unchanged after a passing gate"
+printf 'gate-logs/22-scratch-2.log\n' > "$V22/.gate-log-name"
+l22="$(RZ_GATE_CMD='exit 2' gate "$V22" t22f)"
+check 'grep -qx EXIT=2 "$l22"' "a failing gate still fails"
+check '[[ ! -e "$V22/.gate-log-name" ]]' "a failing gate removes the scratch too"
+check 'clean22' "the worktree is unchanged after a failing gate"
+# The `timeout 540` around a --wait (exit 124) is the one path where the unit
+# may still be running: the wait itself must clean before it dies.
+printf 'gate-logs/22-scratch-3.log\n' > "$V22/.gate-log-name"
+W22="$RZ_GATE_DIR/t22-still-running.log"
+printf 'UNIT=ritz-gate-t22w\nSHA=%s\nWT=%s\n' "$(git -C "$V22" rev-parse HEAD)" "$V22" > "$W22"
+touch "$RZ_TEST_ACTIVE/ritz-gate-t22w"
+timeout 2 bash "$G" --wait "$W22" >/dev/null 2>&1; rc=$?
+rm -f "$RZ_TEST_ACTIVE/ritz-gate-t22w"
+check '[[ $rc -eq 124 ]]' "--wait killed by timeout exits 124, got $rc"
+check '[[ ! -e "$V22/.gate-log-name" ]]' "a timed-out --wait removes the scratch"
+check 'clean22' "the worktree is unchanged after a timed-out --wait"
+# A *tracked* .gate-log-name is the caller's content, never deleted.
+printf 'x\n' > "$V22/.gate-log-name"
+git -C "$V22" add .gate-log-name; git -C "$V22" commit -qm keep
+l22="$(RZ_GATE_CMD='exit 0' gate "$V22" t22k)"
+check '[[ -e "$V22/.gate-log-name" ]]' "a tracked .gate-log-name is left alone"
+check 'clean22' "and the tracked worktree stays unchanged"
+
 echo
 [[ $fails -eq 0 ]] && { echo "all passed"; exit 0; }
 echo "$fails failed"; exit 1

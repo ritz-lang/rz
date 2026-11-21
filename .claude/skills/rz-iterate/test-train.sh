@@ -171,8 +171,15 @@ grep -q "reserved for the merge train" "$(logof rroom)" && ok "the room gate's l
     || bad "the room gate's log says why it waits"
 bash "$TR" build "r10:$s10" "r11:$s11" >/dev/null 2>&1
 gstart="$(date +%s)"
+# #4420: a caller's `.gate-log-name` in the worktree the gate tests must not
+# outlive the gate, or `adele room rm` of that worktree refuses it at teardown.
+pre22="$(git -C "$T/train" status --porcelain)"
+printf 'gate-logs/stale-1.log\n' > "$T/train/.gate-log-name"
 log="$(RZ_GATE_SCRIPT="$RG" RZ_TEST_NAME=T RZ_GATE_CMD="$rec; ls -A \"\$RZ_DIR\" > \"\$RZ_TEST_ORDER.during-t\"" \
     timeout 30 bash "$TR" gate)"
+[[ ! -e "$T/train/.gate-log-name" && "$(git -C "$T/train" status --porcelain)" == "$pre22" ]] \
+    && ok "the train's gate leaves no .gate-log-name in its worktree (#4420)" \
+    || bad "the train's gate leaves no .gate-log-name in its worktree (#4420)"
 # The train's gate reserves the slot again as it ends (AGAST #3427): the room
 # gate keeps waiting through the gap before `land`.
 sleep 0.5

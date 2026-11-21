@@ -140,6 +140,17 @@
 #     SETUP ERROR (exit 2) naming the dir, and the command never runs.  The
 #     log's header names the dir (TMPDIR=); the trap removes it with the
 #     checkout.  RZ_GATE_PROBE overrides the probe (tests).
+#   * no run-gate scratch in the worktree it tests (AGAST #4420): a caller
+#     kept the log's path in `.gate-log-name` at the worktree root so a later
+#     turn could --wait.  Untracked, it made `adele room rm` refuse the worktree
+#     at teardown, and on a busy train that papercut is resolved with --force,
+#     the one thing the dirty-worktree guard exists to prevent.  A scratch
+#     file is never needed inside the tree: the start removes it before the
+#     first check (a stale one from an earlier run), the unit removes it as it
+#     exits (pass or fail), and --wait removes it on every exit path, including
+#     the SIGTERM a `timeout` slice sends (exit 124).  Only an *untracked* file
+#     of that exact name is touched; a tracked one is the caller's content.
+#     Tests: test-run-gate.sh (section 22), test-train.sh (6b).
 #   * EXIT line always written, and --wait reports a unit that died without
 #     one (exit 98): "no verdict" must never read as "passed".
 #   * build-all as well as bootstrap (AGAST #2141): #2124 broke angelo,
@@ -155,6 +166,20 @@ GATES="${RZ_GATE_DIR:-$HOME/dev/ritz-lang/gate-logs}"
 if [[ "${1:-}" == "--wait" ]]; then
     LOG="${2:?usage: $0 --wait <log>}"
     UNIT="$(sed -n 's/^UNIT=//p' "$LOG" | head -1)"
+    # The worktree this log gated, if the log is new enough to name it
+    # (AGAST #4420; see the header).
+    WT="$(sed -n 's/^WT=//p' "$LOG" | head -1)"
+    # Remove run-gate's scratch from the worktree on every exit path, the
+    # SIGTERM a `timeout` slice sends included: on 124 the unit may still be
+    # running, and this caller is the only one left to clean it.  Never a
+    # tracked file: that would be the caller's content, not our scratch.
+    scratch_clean() {
+        [[ -n "$WT" && -e "$WT/.gate-log-name" ]] || return 0
+        git -C "$WT" ls-files --error-unmatch -- .gate-log-name >/dev/null 2>&1 && return 0
+        rm -f "$WT/.gate-log-name" 2>/dev/null || true
+    }
+    trap 'scratch_clean' EXIT
+    trap 'scratch_clean; exit 124' TERM INT
     while ! grep -q '^EXIT=' "$LOG"; do
         if ! systemctl --user is-active -q "$UNIT"; then
             sleep 2
@@ -178,6 +203,15 @@ fi
 
 WT="$(cd "$1" && pwd -P)"
 NAME="$2"
+# run-gate's scratch (AGAST #4420; see the header).  Clear a stale one before
+# anything else can fail: it is untracked, so it would otherwise outlive a
+# refused gate too.  Never a *tracked* file of that name: that is content.
+scratch_clean() {
+    [[ -e "$WT/.gate-log-name" ]] || return 0
+    git -C "$WT" ls-files --error-unmatch -- .gate-log-name >/dev/null 2>&1 && return 0
+    rm -f "$WT/.gate-log-name" 2>/dev/null || true
+}
+scratch_clean
 # shellcheck source=../../host-env.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../../host-env.sh"
 rz_host_env_load || exit 2
@@ -270,8 +304,8 @@ while :; do
     fi
     n=$((n + 1))
 done
-printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\nSLOTS=%s TRAIN_SLOTS=%s\n' \
-    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" "$SLOTS" "$TSLOTS" >> "$LOG"
+printf 'UNIT=%s\nSHA=%s\nBASE=%s\nCMD=%s\nTMPDIR=%s\nWT=%s\nBUDGET_SCALE=%s\nCPU_FACTOR=%s\nSLOTS=%s TRAIN_SLOTS=%s\n' \
+    "$UNIT" "$SHA" "$BASE" "$CMD" "$GATE_TMP" "$WT" "$BUDGET_SCALE" "$CPU_FACTOR_HDR" "$SLOTS" "$TSLOTS" >> "$LOG"
 
 # Source files the room's worktree has and the commit doesn't (AGAST #3559).
 # The gate can't see them (it runs on a checkout of the SHA), so a gate that
@@ -409,7 +443,14 @@ untree() {
     chmod -R u+rwx "$RZ_TMPDIR" 2>/dev/null
     rm -rf "$RZ_TMPDIR"
 }
-trap 'dequeue; unmark; untree' EXIT
+# run-gate's scratch in the worktree it tests (AGAST #4420; see the header).
+# Untracked only: a tracked file of that name is the caller's content.
+scratch_clean() {
+    [ -n "${RZ_WT:-}" ] && [ -e "$RZ_WT/.gate-log-name" ] || return 0
+    git -C "$RZ_WT" ls-files --error-unmatch -- .gate-log-name >/dev/null 2>&1 && return 0
+    rm -f "$RZ_WT/.gate-log-name"
+}
+trap 'dequeue; unmark; untree; scratch_clean' EXIT
 # Fail fast if the unit can't write: otherwise the slot loop below spins
 # forever and never writes a verdict.  (Seen: an agent sandbox's /tmp is not
 # the /tmp systemd units see.)  The unit ends with no EXIT line; --wait -> 98.
@@ -508,6 +549,7 @@ systemd-run --user --quiet --unit="$UNIT" --collect --working-directory="$WT" \
     --setenv=PATH="$PATH" --setenv=HOME="$HOME" \
     --setenv=RZ_LOG="$LOG" --setenv=RZ_SHA="$SHA" --setenv=RZ_CMD="$CMD" \
     --setenv=RZ_SLOTS="$SLOTS" --setenv=RZ_TSLOTS="$TSLOTS" --setenv=RZ_DIR="$GATES" \
+    --setenv=RZ_WT="$WT" \
     --setenv=RZ_POLL="${RZ_GATE_POLL:-20}" --setenv=RZ_UNIT="$UNIT" \
     --setenv=RZ_TRAIN="${RZ_GATE_TRAIN:-0}" \
     --setenv=RZ_HOLD="${RZ_GATE_TRAIN_HOLD:-600}" \
