@@ -8,17 +8,18 @@ After every sret call ritz1 loaded the result slot as a first-class value:
     %.4 = load %Resp, ptr %.3
     call void @__ritz_sret_copy(ptr %ret.sret, ptr %.3, i64 ...)
 
-#1732's rewrite turns the matching `store` into the copy call and leaves the
-load dead "for -O2 to delete".  -O2 does not delete it first: IPSCCP and
-InstCombine expand it per leaf.  spire's lib/presenter/mod.ritz, with ~20 dead
+#1732 turned the matching `store` into a copy call and left the load dead
+"for -O2 to delete".  -O2 does not delete it first: IPSCCP and InstCombine
+expand it per leaf.  spire's lib/presenter/mod.ritz, with ~20 dead
 `load %Response` (a [65536 x i8] body each), ran clang -O2 past build.py's
 300 s bound and out of memory.  Five spire test files failed the same way
 (`./rz test spire --compiler ritz1`).
 
 THE FIX
 
-ritz1's rewrite_large_struct_copies drops every large-struct `load` whose
-register has no use.  ritz0 never emitted these loads.
+The emitter holds a large-struct `load` back until the next emission; one no
+consumer took is a dead load and is never written (#4461).  ritz0 never
+emitted these loads.
 """
 
 import pytest

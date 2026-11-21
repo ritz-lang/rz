@@ -358,7 +358,6 @@ empty. A note that belongs to a move goes on that check's own entry.
 | `emitter_print` | The `print` builtin, byte-identical to ritz0's output. |
 | `emitter_asm` | `asm` blocks to LLVM inline asm. |
 | `bool_kind` | The emitter's bool kind of an expression: bool_check's inference (`sema_bool_kind`), still read by codegen and the emitter-side checks. |
-| `ll_copy_scan` | Text scan of emitted IR for large-struct copies (used by `emitter`'s rewrite pass). |
 | `frame_limit` | Text scan of a fn's allocas: refuses a stack frame over 8 MiB at its largest local or temporary (#3739). |
 
 ### Generated vs hand-written
@@ -393,7 +392,8 @@ Tracked under AGAST #1812 (M1.3). `make arch-report` shows its shape.
   Breaking it, dissolving `emitter_core` and splitting the long functions
   the report lists is #1818.
 - **Raw IR text** — the emitter writes IR as string fragments and re-parses
-  its own output in post-passes (`ll_copy_scan`). A typed IR builder is #1817.
+  its own output in post-passes (the packed-align and frame-limit scans). A
+  typed IR builder is #1817.
 - **Duplicated type tables** — several type→LLVM/size/sign ladders; one
   `TypeRef` and one table is #1889.
 - **C idioms** — `i32` flags for bool, `*u8`+length for names, kind codes

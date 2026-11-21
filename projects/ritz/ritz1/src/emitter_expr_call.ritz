@@ -681,13 +681,7 @@ pub fn find_spec_impl_method(s: *EmitterState, type_name_sv: StrView, method_sv:
 # receiver: `c.g(bump(@&c))` passes the c from before the bump (AGAST #2393).
 fn emit_self_value(s: *EmitterState, p: *Param, recv: i32) -> i32
     let val: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, val)
-    emit_str(s, IR_LOAD)
-    emit_llvm_type_struct(s, p.param_type, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, recv)
-    emit_str(s, IR_NL)
+    emit_struct_load_or_defer(s, p.param_type, val, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, recv, null, 0)
     if param_uses_byval(s, p) == 1
         return spill_byval_arg(s, null, val, p)
     val
@@ -1242,13 +1236,7 @@ pub fn emit_lent_referent(s: *EmitterState, e: *Expr, name_sv: StrView) -> i32
         emit_str(s, c" to ptr  ; #2278 lent self\n")
         src = addr
     let val: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, val)
-    emit_str(s, IR_LOAD)
-    emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (name), len: (name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, src)
-    emit_str(s, IR_NL)
+    emit_struct_load_or_defer(s, TYPE_STRUCT, val, StrView { ptr: (name), len: (name_len) as i64 }, src, null, 0)
     return val
 
 # AGAST #2278: the `self:& T` / `self:&` receiver `e` names, or null.
@@ -1994,8 +1982,8 @@ fn emit_borrowed_place(s: *EmitterState, arg: *Expr, p: *Param) -> i32
 # Spill the argument into a fresh slot right after evaluating it, before the
 # next argument runs (which keeps evaluation order: a later arg cannot change
 # what this one passes).  The value is almost always a `load %T` just
-# emitted, so rewrite_large_struct_copies (#1732) turns this store into a
-# pointer-to-pointer @__ritz_sret_copy.  Returns the slot; every arg-coercion
+# emitted, so the store site emits this store as a pointer-to-pointer
+# @__ritz_sret_copy (#4461).  Returns the slot; every arg-coercion
 # cascade passes it through and the call writes it as `ptr byval(%T)`.
 fn spill_byval_arg(s: *EmitterState, arg: *Expr, reg: i32, p: *Param) -> i32
     var val: i32 = reg
@@ -2018,13 +2006,7 @@ fn spill_byval_arg(s: *EmitterState, arg: *Expr, reg: i32, p: *Param) -> i32
     emit_name(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
     emit_str(s, c"  ; #1739 byval arg\n")
     entry_alloca_reg_end(s)
-    emit_str(s, IR_STORE_STRUCT)
-    emit_name(s, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot)
-    emit_str(s, IR_NL)
+    emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (p.param_type_name), len: (p.param_type_name_len) as i64 }, val, slot)
     return slot
 
 # Emit an Ok/Some/Err/None constructor as a `%Result$.../Option$...` struct
@@ -2450,13 +2432,7 @@ fn store_variant_payload(s: *EmitterState, slot: i32, enum_name_sv: StrView, sel
                     aggregate_name_len = decl_len
 
         if is_aggregate == 1
-            emit_str(s, IR_STORE_STRUCT)
-            emit_name(s, StrView { ptr: (aggregate_name), len: (aggregate_name_len) as i64 })
-            emit_str(s, IR_SP)
-            emit_reg(s, pv.reg)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, pay_ptr)
-            emit_str(s, IR_NL)
+            emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (aggregate_name), len: (aggregate_name_len) as i64 }, pv.reg, pay_ptr)
         else
             # AGAST #1945: a float payload is stored at its own type; a
             # literal (always double) or an integer is converted first.
@@ -4308,13 +4284,7 @@ pub fn emit_expr_call(s: *EmitterState, e: *Expr) -> i32
                         emit_name(s, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 })
                         emit_str(s, c"  ; rvalue auto-borrow\n")
                         entry_alloca_reg_end(s)
-                        emit_str(s, IR_STORE_STRUCT)
-                        emit_name(s, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 })
-                        emit_str(s, IR_SP)
-                        emit_reg(s, arg_regs[j])
-                        emit_str(s, IR_PTR_SEP)
-                        emit_reg(s, spill)
-                        emit_str(s, IR_NL)
+                        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (param_ptr.param_type_name), len: (param_ptr.param_type_name_len) as i64 }, arg_regs[j], spill)
                         let pti_rv: i32 = ir_ptrtoint_i64(s.out, @s.reg_counter, spill)
                         converted_regs[j] = pti_rv
                         ref_done = 1
@@ -4708,13 +4678,7 @@ fn try_emit_enum_unwrap(s: *EmitterState, e: *Expr, type_name_sv: StrView, recei
         emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
         emit_str(s, c"  ; unwrap scrut spill\n")
         entry_alloca_reg_end(s)
-        emit_str(s, IR_STORE_STRUCT)
-        emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
-        emit_str(s, IR_SP)
-        emit_reg(s, recv_value_reg)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, scrut_slot)
-        emit_str(s, IR_NL)
+        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (type_name), len: (type_name_len) as i64 }, recv_value_reg, scrut_slot)
     else
         scrut_slot = receiver_reg
         if recv_is_ptr_of_ptr == 1
@@ -6082,13 +6046,7 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
             emit_str(s, c"  ; method-on-call-result (struct value)\n")
             entry_alloca_reg_end(s)
-            emit_str(s, IR_STORE_STRUCT)
-            emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
-            emit_str(s, IR_SP)
-            emit_reg(s, recv_value_reg)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, call_slot)
-            emit_str(s, IR_NL)
+            emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (type_name), len: (type_name_len) as i64 }, recv_value_reg, call_slot)
         else
             call_slot = next_reg(s)
             entry_alloca_reg(s, call_slot, c"i64", c"method-call-on-call-result receiver")
@@ -6138,13 +6096,7 @@ pub fn emit_expr_method(s: *EmitterState, e: *Expr) -> i32
             emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
             emit_str(s, c"  ; method-on-method-result (struct value)\n")
             entry_alloca_reg_end(s)
-            emit_str(s, IR_STORE_STRUCT)
-            emit_name(s, StrView { ptr: (type_name), len: (type_name_len) as i64 })
-            emit_str(s, IR_SP)
-            emit_reg(s, recv_value_reg)
-            emit_str(s, IR_PTR_SEP)
-            emit_reg(s, chain_slot)
-            emit_str(s, IR_NL)
+            emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (type_name), len: (type_name_len) as i64 }, recv_value_reg, chain_slot)
         else
             type_name = null
             type_name_len = 0

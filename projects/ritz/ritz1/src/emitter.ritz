@@ -21,7 +21,6 @@ import emitter_core
 import emitter_ir
 import emitter_expr
 import emitter_stmt
-import ll_copy_scan   # AGAST #1732
 import emitter_print
 import narrowing         # narrowing_begin_fn (AGAST #1364)
 import ownership         # own_begin_fn / own_end_fn (AGAST #2158)
@@ -517,134 +516,16 @@ fn splice_entry_allocas(s: *EmitterState, body_start: i64)
     s.fm = marks
     s.fm_count = w
     s.fm_cap = cap
+    # AGAST #4461: deferred load lines move with the body too.
+    defer_loads_shift(s, n)
     # The next fn starts empty (grows are kept for reuse).
     s.entry_allocas.len = 0
     s.ea_count = 0
 
-# AGAST #1732 — copy large structs pointer-to-pointer, never first-class.
-#
-# #1730 moved large struct RETURNS to sret, but every other copy of a large
-# struct still went through a first-class value:
-#
-#     %.5 = load %Big, ptr %.4
-#     store %Big %.5, ptr %.2
-#
-# That is `var x: Big = *p`, `x = y`, `x = f()` (the sret slot is loaded
-# and re-stored), `var x: Big = f()`, `*q = *p`, `o.big = *p`.  clang -O2's
-# InstCombine splits such a load/store into one scalar per leaf, and for a
-# 22 KB struct (~21k leaves) it grows without bound.
-#
-# Like align_packed_accesses below, this runs once over the finished body
-# rather
-# than at the dozens of sites that emit a struct store.  A store of a
-# struct %T at the sret threshold, whose value register is `load %T, ptr
-# SRC` with nothing that can write memory in between, is rewritten to
-#
-#     call void @__ritz_sret_copy(ptr DST, ptr SRC, i64 sizeof(%T))
-#
-# Nothing wrote memory since the load, so the bytes at SRC still ARE the
-# loaded value.  (Two %T objects cannot partially overlap, and an exact
-# overlap copies onto itself.)
-#
-# The load is then dead, and so is the one the emitter writes after every
-# sret call whose result is copied or discarded.  AGAST #3952: such a load
-# must not reach clang either.  -O2 does not delete it before IPSCCP and
-# InstCombine expand it per leaf.  spire's presenter, with ~20 dead
-# `load %Response` (a [65536 x i8] body each), ran clang -O1/-O2 past 300 s
-# and out of memory.  drop_dead_large_loads removes them.
-
-# The scanning lives in ll_copy_scan.ritz; here we only decide whether %T is
-# large and emit the replacement.  Returns 1 when `line` was replaced.
-fn try_emit_large_copy(s: *EmitterState, base: *u8, line_sv: StrView) -> i32
-    var line: *u8 = line_sv.ptr
-    var len: i64 = line_sv.len
-    var cp: LlCopy
-    if ll_find_copy(base, StrView { ptr: (line), len: (len) }, @cp) == 0
-        return 0
-    let tname: *u8 = line + cp.tname_off
-    let tlen: i32 = cp.tname_len as i32
-    if struct_ret_uses_sret(s, TYPE_STRUCT, StrView { ptr: (tname), len: (tlen) as i64 }) == 0
-        return 0
-    emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
-    emit_name(s, StrView { ptr: (line + cp.dst_off), len: (cp.dst_len as i32) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_name(s, StrView { ptr: (cp.src), len: (cp.src_len as i32) as i64 })
-    emit_str(s, IR_COMMA)
-    emit_sret_size(s, StrView { ptr: (tname), len: (tlen) as i64 })
-    emit_str(s, IR_CLOSE)
-    s.sret_helpers_used = 1
-    1
-
-fn rewrite_large_struct_copies(s: *EmitterState, body_start: i64)
-    let n: i64 = s.out.len - body_start
-    if n <= 0
-        return
-    # Rebuild the body into s.out from a copy: a rewritten line changes length.
-    let base: *u8 = malloc(n)
-    memcpy(base, s.out.data + body_start, n)
-    let end: *u8 = base + n
-    s.out.len = body_start
-    var p: *u8 = base
-    while p < end
-        let ll: i64 = ll_line_len(p, end)
-        if try_emit_large_copy(s, base, StrView { ptr: (p), len: (ll) }) == 0
-            vec_push_bytes<u8>(s.out, Span<u8> { ptr: (p), len: (ll) as i64 })
-        p = p + ll
-    free(base)
-    drop_dead_large_loads(s, body_start)
-
-# AGAST #3952: `  %.N = load %T, ptr SRC` for a large struct %T (the sret
-# threshold) whose %.N is used nowhere else in the body.  Returns N, or -1.
-fn dead_large_load_reg(s: *EmitterState, p_sv: StrView, uses: *i32, cap: i32) -> i32
-    var p: *u8 = p_sv.ptr
-    var len: i64 = p_sv.len
-    var e: i64 = 0
-    let r: i32 = ll_dot_reg_at(StrView { ptr: (p), len: (len) }, 2, @e)
-    if r < 0 or r >= cap or *(uses + r) != 1
-        return 0 - 1
-    if ll_starts_with(StrView { ptr: (p), len: (2) }, c"  ") == 0 or ll_starts_with(StrView { ptr: (p + e), len: (len - e) }, c" = load %") == 0
-        return 0 - 1
-    let t: i64 = e + 9
-    let comma: i64 = ll_find(StrView { ptr: (p), len: (len) }, t, 44)
-    if comma <= t or ll_starts_with(StrView { ptr: (p + comma), len: (len - comma) }, c", ptr ") == 0
-        return 0 - 1
-    if struct_ret_uses_sret(s, TYPE_STRUCT, StrView { ptr: (p + t), len: ((comma - t) as i32) as i64 }) == 0
-        return 0 - 1
-    r
-
-# Drop every dead large-struct load from the body (see the #1732 comment
-# above).  A plain `load` has no side effect, so dropping an unused one is
-# exact.  `uses[N]` counts every `%.N` in the body, its definition included,
-# so 1 means "defined and never read".
-fn drop_dead_large_loads(s: *EmitterState, body_start: i64)
-    let n: i64 = s.out.len - body_start
-    if n <= 0
-        return
-    let cap: i32 = s.reg_counter + 1
-    let uses: *i32 = malloc((cap as i64) * 4) as *i32
-    memzero(uses as *u8, (cap as i64) * 4)
-    let base: *u8 = malloc(n)
-    memcpy(base, s.out.data + body_start, n)
-    var i: i64 = 0
-    while i < n
-        var e: i64 = 0
-        let r: i32 = ll_dot_reg_at(StrView { ptr: (base), len: (n) }, i, @e)
-        if r >= 0
-            if r < cap
-                *(uses + r) = *(uses + r) + 1
-            i = e
-        else
-            i += 1
-    let end: *u8 = base + n
-    s.out.len = body_start
-    var p: *u8 = base
-    while p < end
-        let ll: i64 = ll_line_len(p, end)
-        if dead_large_load_reg(s, StrView { ptr: (p), len: (ll) }, uses, cap) < 0
-            vec_push_bytes<u8>(s.out, Span<u8> { ptr: (p), len: (ll) as i64 })
-        p = p + ll
-    free(base)
-    free(uses as *u8)
+# AGAST #4461: the generic line scanners the packed-align pass below and the
+# deferred-load splice use live in emitter_core (scan_starts_with and
+# friends); they were the deleted copy-scan module's, and the copy rewrite
+# that drove it is gone.
 
 # AGAST #1918 — packed-field loads and stores say `align 1`.
 #
@@ -685,7 +566,7 @@ fn ll_last_ptr_operand(p_sv: StrView) -> i64
     var len: i64 = p_sv.len
     var i: i64 = len - 8
     while i >= 0
-        if ll_starts_with(StrView { ptr: (p + i), len: (len - i) }, c", ptr %.") == 1
+        if scan_starts_with(StrView { ptr: (p + i), len: (len - i) }, c", ptr %.") == 1
             return i + 6
         i -= 1
     0 - 1
@@ -696,7 +577,7 @@ fn ll_has_align(p_sv: StrView) -> i32
     var len: i64 = p_sv.len
     var i: i64 = 0
     while i + 5 <= len
-        if ll_starts_with(StrView { ptr: (p + i), len: (len - i) }, c"align") == 1
+        if scan_starts_with(StrView { ptr: (p + i), len: (len - i) }, c"align") == 1
             return 1
         i += 1
     0
@@ -715,12 +596,12 @@ fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
     let dst: i32 = ll_dot_reg_at(StrView { ptr: (p), len: (len) }, 2, @e)
     if dst < 0 or dst >= cap
         return
-    if ll_starts_with(StrView { ptr: (p + e), len: (len - e) }, c" = getelementptr ") == 0
+    if scan_starts_with(StrView { ptr: (p + e), len: (len - e) }, c" = getelementptr ") == 0
         return
     var t: i64 = e + 17
-    if ll_starts_with(StrView { ptr: (p + t), len: (len - t) }, c"inbounds ") == 1
+    if scan_starts_with(StrView { ptr: (p + t), len: (len - t) }, c"inbounds ") == 1
         t += 9
-    let comma: i64 = ll_find(StrView { ptr: (p), len: (len) }, t, 44)
+    let comma: i64 = scan_find(StrView { ptr: (p), len: (len) }, t, 44)
     if comma < 0
         return
     if *(p + t) == 37 and *(p + t + 1) != 46
@@ -728,7 +609,7 @@ fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
         if st != null and struct_is_packed(st) == 1
             *(marks + dst) = 1
             return
-    if ll_starts_with(StrView { ptr: (p + comma), len: (len - comma) }, c", ptr ") == 0
+    if scan_starts_with(StrView { ptr: (p + comma), len: (len - comma) }, c", ptr ") == 0
         return
     var be: i64 = 0
     if ll_is_packed_reg(marks, cap, ll_dot_reg_at(StrView { ptr: (p), len: (len) }, comma + 6, @be)) == 1
@@ -738,10 +619,10 @@ fn packed_mark_gep(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
 fn packed_emit_line(s: *EmitterState, marks: *u8, cap: i32, p_sv: StrView)
     var p: *u8 = p_sv.ptr
     var len: i64 = p_sv.len
-    var is_access: i32 = ll_starts_with(StrView { ptr: (p), len: (len) }, c"  store ")
-    if is_access == 0 and ll_starts_with(StrView { ptr: (p), len: (len) }, c"  %.") == 1
-        let sp: i64 = ll_find(StrView { ptr: (p), len: (len) }, 4, 32)
-        if sp > 0 and ll_starts_with(StrView { ptr: (p + sp), len: (len - sp) }, c" = load ") == 1
+    var is_access: i32 = scan_starts_with(StrView { ptr: (p), len: (len) }, c"  store ")
+    if is_access == 0 and scan_starts_with(StrView { ptr: (p), len: (len) }, c"  %.") == 1
+        let sp: i64 = scan_find(StrView { ptr: (p), len: (len) }, 4, 32)
+        if sp > 0 and scan_starts_with(StrView { ptr: (p + sp), len: (len - sp) }, c" = load ") == 1
             is_access = 1
     if is_access == 1 and ll_has_align(StrView { ptr: (p), len: (len) }) == 0
         let at: i64 = ll_last_ptr_operand(StrView { ptr: (p), len: (len) })
@@ -769,7 +650,7 @@ fn align_packed_accesses(s: *EmitterState, body_start: i64)
     s.out.len = body_start
     var p: *u8 = base
     while p < end
-        let ll: i64 = ll_line_len(p, end)
+        let ll: i64 = scan_line_len(p, end)
         packed_mark_gep(s, marks, cap, StrView { ptr: (p), len: (ll) })
         packed_emit_line(s, marks, cap, StrView { ptr: (p), len: (ll) })
         p = p + ll
@@ -1144,13 +1025,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
                     else if local != null
                         let loc: i32 = find_local(s, StrView { ptr: (stmt.expr.ident_ptr), len: (stmt.expr.ident_len) as i64 })
                         let val: i32 = next_reg(s)
-                        emit_str(s, IR_INDENT)
-                        emit_reg(s, val)
-                        emit_str(s, IR_LOAD)
-                        emit_llvm_type_struct(s, TYPE_STRUCT, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 })
-                        emit_str(s, IR_PTR_SEP)
-                        emit_reg(s, loc)
-                        emit_str(s, IR_NL)
+                        emit_struct_load_or_defer(s, TYPE_STRUCT, val, StrView { ptr: (local.type_name), len: (local.type_name_len) as i64 }, loc, null, 0)
                         # AGAST #3564: a tail `v` for `let v = "..."` loads a
                         # %Span$u8; a `-> StrView` fn returns it as a %StrView.
                         var ret_name: *u8 = local.type_name
@@ -1249,7 +1124,7 @@ fn emit_fn(s: *EmitterState, f: *FnDef)
     splice_entry_allocas(s, body_start)          # AGAST #4460: static allocas into entry:
     refuse_huge_frame(s, f, body_start)          # AGAST #3739: before any rewrite
     own_end_fn(s)                                # AGAST #2158, #3508
-    rewrite_large_struct_copies(s, body_start)   # AGAST #1732
+    splice_deferred_struct_loads(s)              # AGAST #4461: before align
     align_packed_accesses(s, body_start)         # AGAST #1918
     tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
@@ -1630,7 +1505,7 @@ fn emit_impl_method(s: *EmitterState, ib: *ImplBlock, method: *FnDef)
     splice_entry_allocas(s, body_start)          # AGAST #4460: static allocas into entry:
     refuse_huge_frame(s, method, body_start)     # AGAST #3739: before any rewrite
     own_end_fn(s)                                # AGAST #2158, #3508
-    rewrite_large_struct_copies(s, body_start)   # AGAST #1732
+    splice_deferred_struct_loads(s)              # AGAST #4461: before align
     align_packed_accesses(s, body_start)         # AGAST #1918
     tag_intrinsic_target_features(s, attr_pos)   # AGAST #1737
     emit_str(s, c"}\n\n")
@@ -4677,6 +4552,9 @@ pub fn emit_module(m: *Module, out: *Vec<u8>) -> i32
         ea_count: 0,
         ea_cap: 0,
         entry_out_saved: null,
+        dloads: null,   # AGAST #4461 — deferred large-struct loads
+        dload_count: 0,
+        dload_cap: 0,
         reg_counter: 1,
         label_counter: 0,
         locals: null,

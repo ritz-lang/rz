@@ -449,25 +449,13 @@ fn emit_struct_payload_bind(s: *EmitterState, arm: *MatchArm, slot_reg: i32, enu
         sel = 0   # Result / Option: the payload is at offset 0
     let pay_ptr: i32 = emit_payload_ptr(s, slot_reg, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, sel)
     let val: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, val)
-    emit_str(s, IR_LOAD_NAMED)
-    emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, pay_ptr)
-    emit_str(s, IR_NL)
+    emit_struct_load_or_defer(s, TYPE_STRUCT, val, StrView { ptr: (st_name), len: (st_name_len) as i64 }, pay_ptr, null, 0)
     let alloca_reg: i32 = next_reg(s)
     entry_alloca_reg_begin_named(s, alloca_reg)
     emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
     emit_str(s, c"  ; match struct payload bind\n")
     entry_alloca_reg_end(s)
-    emit_str(s, IR_STORE_STRUCT)
-    emit_name(s, StrView { ptr: (st_name), len: (st_name_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, alloca_reg)
-    emit_str(s, IR_NL)
+    emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (st_name), len: (st_name_len) as i64 }, val, alloca_reg)
     add_local_struct(s, StrView { ptr: (arm.pattern_inner_name), len: (arm.pattern_inner_name_len) as i64 }, alloca_reg, TYPE_STRUCT, StrView { ptr: (st_name), len: (st_name_len) as i64 })
 
 # AGAST #3029: bind `V(a)` / `Some(a)` to a copy of an array payload, at the
@@ -721,15 +709,15 @@ pub fn float_arm_settle(s: *EmitterState, aft: i32, arm_body: *Expr, at: SrcSpan
 
 # AGAST #3696: an arm of a large struct %T writes its value into the
 # match's slot, in its own block, while its value is fresh: before its
-# bindings drop (a drop is a call, which would hide the value's load from
-# rewrite_large_struct_copies) and before its `br`.
+# bindings drop (a drop is a call, which would keep the value's load from
+# becoming a pointer copy) and before its `br`.
 #
 # A `phi %T` over the arms, stored to the destination, is a first-class %T
 # the #1732 rewrite can't see (it is not a load), and it is what sends clang
 # -O2's InstCombine superlinear (#3692).  Through the slot, each arm's
 # `store %T (load %T, src), slot` and the merge's consumer `store %T (load
-# %T, slot), dst` are copies rewrite_large_struct_copies turns into
-# @__ritz_sret_copy.  The slot's alloca is emitted here, in the first such
+# %T, slot), dst` are pointer copies the store site emits as @__ritz_sret_copy
+# (#4461).  The slot's alloca is emitted here, in the first such
 # arm, into the entry-block buffer (AGAST #4460), so it
 # dominates the merge.  An arm that leaves (`return`) stores nothing: it
 # never reaches the merge.  A `pass` arm, whose phi incoming was the zero of
@@ -751,13 +739,16 @@ fn match_arm_into_slot(s: *EmitterState, arm: *MatchArm, result: *MatchResult, b
         emit_match_phi_type(s, result)
         emit_str(s, IR_NL)
         entry_alloca_reg_end(s)
-    emit_str(s, IR_STORE_IND)
-    emit_match_phi_type(s, result)
-    emit_str(s, IR_SP)
-    emit_match_phi_value(s, result, body_reg)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, result.slot)
-    emit_str(s, IR_NL)
+    if result.agg_name != null and result.agg_name_len > 0 and body_reg != MATCH_ZERO_VALUE
+        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, body_reg, result.slot)
+    else
+        emit_str(s, IR_STORE_IND)
+        emit_match_phi_type(s, result)
+        emit_str(s, IR_SP)
+        emit_match_phi_value(s, result, body_reg)
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, result.slot)
+        emit_str(s, IR_NL)
 
 # AGAST #3696: at the merge, the arms' value read back from their slot (see
 # match_arm_into_slot), or 0 when they meet in a phi instead.
@@ -765,13 +756,16 @@ fn match_merge_slot(s: *EmitterState, result: *MatchResult) -> i32
     if result.slot == 0 or result.slot_misses > 0
         return 0
     let reg: i32 = next_reg(s)
-    emit_str(s, IR_INDENT)
-    emit_reg(s, reg)
-    emit_str(s, IR_LOAD)
-    emit_match_phi_type(s, result)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, result.slot)
-    emit_str(s, IR_NL)
+    if result.agg_name != null and result.agg_name_len > 0
+        emit_struct_load_or_defer(s, TYPE_STRUCT, reg, StrView { ptr: (result.agg_name), len: (result.agg_name_len) as i64 }, result.slot, null, 0)
+    else
+        emit_str(s, IR_INDENT)
+        emit_reg(s, reg)
+        emit_str(s, IR_LOAD)
+        emit_match_phi_type(s, result)
+        emit_str(s, IR_PTR_SEP)
+        emit_reg(s, result.slot)
+        emit_str(s, IR_NL)
     reg
 
 # AGAST #1946: the merge phi's type: the arms' struct, their float, or i64.
@@ -2709,13 +2703,7 @@ fn emit_match_arms(s: *EmitterState, scrutinee: *Expr, arms: *MatchArm, span: Sr
         emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
         emit_str(s, c"  ; match scrut spill\n")
         entry_alloca_reg_end(s)
-        emit_str(s, IR_STORE_STRUCT)
-        emit_name(s, StrView { ptr: (enum_name), len: (enum_name_len) as i64 })
-        emit_str(s, IR_SP)
-        emit_reg(s, scrut_reg)
-        emit_str(s, IR_PTR_SEP)
-        emit_reg(s, scrut_slot)
-        emit_str(s, IR_NL)
+        emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (enum_name), len: (enum_name_len) as i64 }, scrut_reg, scrut_slot)
 
     # AGAST #2174: the match owns a scrutinee it moved (ownership.ritz);
     # `match @place` moves nothing.

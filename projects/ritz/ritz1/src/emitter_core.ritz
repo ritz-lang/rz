@@ -109,6 +109,31 @@ struct NarrowDecl
     declared: i32
     init: *Expr
 
+# AGAST #4461 — a whole-struct load of an sret-sized type, held in emission
+# order instead of written into the body.  A struct store of the same type and
+# register, emitted with nothing in between, replaces it with an
+# `@__ritz_sret_copy` call; a use of the register or any intervening
+# instruction keeps the load (written back at `off` by
+# splice_deferred_struct_loads); a record used for neither is a dead load and
+# is dropped as a dead load (#3952).
+#
+# `off` is an offset into s.out, i.e. into the function body being emitted.
+# It is shifted when splice_entry_allocas inserts the entry-block buffer.
+const DLOAD_PENDING: i32 = 0
+const DLOAD_KEEP: i32 = 1
+const DLOAD_DROPPED: i32 = 2
+
+struct DeferredLoad
+    reg: i32          # the load's result register (already burned)
+    off: i64          # s.out offset the line belongs at
+    src_reg: i32      # `ptr %.N` source, or -1 when it is a named global
+    src_name: *u8     # `ptr @<name>` source when src_reg < 0
+    src_name_len: i32
+    ty: *u8          # the struct type name, internal (pre-emit_name) spelling
+    ty_len: i32
+    state: i32
+    used: i32         # 1 once emit_reg referenced the register
+
 struct EmitterState
     out: *Vec<u8>
     # AGAST #4460 — this fn's STATIC allocas, in emission order, and the
@@ -122,6 +147,12 @@ struct EmitterState
     ea_count: i32
     ea_cap: i32
     entry_out_saved: *Vec<u8>
+    # AGAST #4461 — the deferred large-struct loads of this fn (see
+    # DeferredLoad).  Grown for reuse across fns; reset when the body's loads
+    # are spliced at the end of each.
+    dloads: *DeferredLoad
+    dload_count: i32
+    dload_cap: i32
     reg_counter: i32
     label_counter: i32
     # Heap array of `locals_cap` LocalVars (AGAST #1905); index it with
@@ -758,6 +789,9 @@ pub fn emit_int(s: *EmitterState, n: i64)
         vec_push<u8>(s.out, buf[i])
 
 pub fn emit_reg(s: *EmitterState, reg: i32)
+    # AGAST #4461: any use of a deferred load's register means the copy
+    # rewrite cannot fire; the load is written back at fn end.
+    dload_note_use(s, reg)
     emit_str(s, c"%.")
     emit_int(s, reg as i64)
 
@@ -765,6 +799,321 @@ pub fn next_reg(s: *EmitterState) -> i32
     let r: i32 = s.reg_counter
     s.reg_counter = s.reg_counter + 1
     r
+
+# =============================================================================
+# Deferred large-struct loads (AGAST #4461)
+# =============================================================================
+#
+# #1732's copy rewrite was a text pass over the finished body.  The emitter
+# has the same facts where it emits them: a whole-struct load of an
+# sret-sized type and the store that consumes it.  This holds such a load's
+# line out of the body until the next emission decides:
+#
+#   * a struct store of the same type and register, with nothing emitted in
+#     between, becomes `call void @__ritz_sret_copy(ptr dst, ptr src, i64 n)`;
+#   * any use of the register, or any other emission in between, keeps the
+#     load, which splice_deferred_struct_loads writes back at its offset;
+#   * neither: it is a dead load (e.g. the one every sret call used to leave
+#     behind, #3952) and is dropped.
+#
+# The load site still calls next_reg, so register numbering -- and the gaps
+# the dropped loads leave -- are exactly what the old pass produced.
+
+fn dload_note_use(s: *EmitterState, reg: i32)
+    var i: i32 = 0
+    while i < s.dload_count
+        let r: *DeferredLoad = s.dloads + (i as i64)
+        if r.state != DLOAD_DROPPED and r.reg == reg
+            r.used = 1
+            return
+        i += 1
+
+# --- line scanners ----------------------------------------------------------
+#
+# The packed-align pass (#1918) in emitter.ritz and the deferred-load check
+# below both need to look at emitted text a line at a time.  These were the
+# deleted copy-scan module's; the copy pass is gone, so they are private to
+# the emitter's own two uses (AGAST #4461).
+
+# 1 when the line `p_sv` starts with the C string `lit`.
+pub fn scan_starts_with(p_sv: StrView, lit: *u8) -> i32
+    var p: *u8 = p_sv.ptr
+    var len: i64 = p_sv.len
+    var i: i64 = 0
+    while *(lit + i) != 0
+        if i >= len or *(p + i) != *(lit + i)
+            return 0
+        i += 1
+    1
+
+# Offset of the first `ch` in `p_sv[from..len)`, or -1.
+pub fn scan_find(p_sv: StrView, from: i64, ch: u8) -> i64
+    var p: *u8 = p_sv.ptr
+    var len: i64 = p_sv.len
+    var i: i64 = from
+    while i < len
+        if *(p + i) == ch
+            return i
+        i += 1
+    0 - 1
+
+# Length of the line starting at `p` (up to `end`), including its '\n'.
+pub fn scan_line_len(p: *u8, end: *u8) -> i64
+    var q: *u8 = p
+    var len: i64 = 0
+    while q < end and *q != 10
+        q = q + 1
+        len += 1
+    if q < end
+        len += 1
+    len
+
+# 1 when the line cannot write memory: an assignment `  %x = <op>` whose op
+# is not a call / invoke / atomic RMW, and not an ordered load.  Everything
+# else -- `store`, call, branch, label, comment -- is treated as a possible
+# write.  This is #1732's test, kept because a deferred load may be rewritten
+# only when nothing emitted after it can change the source bytes.
+fn dload_cannot_write(p_sv: StrView) -> i32
+    var p: *u8 = p_sv.ptr
+    var len: i64 = p_sv.len
+    if scan_starts_with(StrView { ptr: (p), len: (len) }, c"  %") == 0
+        return 0
+    let sp: i64 = scan_find(StrView { ptr: (p), len: (len) }, 3, 32)
+    if sp < 0 or scan_starts_with(StrView { ptr: (p + sp), len: (len - sp) }, c" = ") == 0
+        return 0
+    let op: *u8 = p + sp + 3
+    let oplen: i64 = len - sp - 3
+    if scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"call ") == 1 or scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"tail call ") == 1
+        return 0
+    if scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"invoke ") == 1 or scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"atomicrmw ") == 1
+        return 0
+    if scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"cmpxchg ") == 1
+        return 0
+    if scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"load atomic ") == 1 or scan_starts_with(StrView { ptr: (op), len: (oplen) }, c"load volatile ") == 1
+        return 0
+    1
+
+# 1 when every line emitted since offset `from` cannot write memory.
+fn dload_region_cannot_write(s: *EmitterState, from: i64) -> i32
+    if from >= s.out.len
+        return 1
+    var p: *u8 = s.out.data + from
+    let end: *u8 = s.out.data + s.out.len
+    while p < end
+        let ll: i64 = scan_line_len(p, end)
+        if dload_cannot_write(StrView { ptr: (p), len: (ll) }) == 0
+            return 0
+        p = p + ll
+    1
+
+fn dload_dup(p: *u8, n: i32) -> *u8
+    if p == null or n <= 0
+        return null
+    let d: *u8 = malloc(n as i64)
+    memcpy(d, p, n as i64)
+    d
+
+fn dload_add(s: *EmitterState, reg: i32, ty_sv: StrView, src_reg: i32, src_name: *u8, src_name_len: i32)
+    if s.dload_count >= s.dload_cap
+        var cap: i32 = 8
+        if s.dload_cap > 0
+            cap = s.dload_cap * 2
+        s.dloads = realloc(s.dloads as *u8, (cap as i64) * sizeof(DeferredLoad)) as *DeferredLoad
+        s.dload_cap = cap
+    var ty: *u8 = ty_sv.ptr
+    var ty_len: i32 = ty_sv.len as i32
+    let r: *DeferredLoad = s.dloads + (s.dload_count as i64)
+    r.reg = reg
+    r.off = s.out.len
+    r.src_reg = src_reg
+    r.src_name = dload_dup(src_name, src_name_len)
+    r.src_name_len = src_name_len
+    r.ty = dload_dup(ty, ty_len)
+    r.ty_len = ty_len
+    r.state = DLOAD_PENDING
+    r.used = 0
+    s.dload_count = s.dload_count + 1
+
+# 1 (and the load line is held) when `t`/`ty_sv` is an sret-sized struct;
+# 0 when the caller must emit the load as usual.  `src_reg` is the pointer
+# register the line would say `, ptr %.N` for.
+pub fn defer_large_struct_load(s: *EmitterState, t: i32, reg: i32, ty_sv: StrView, src_reg: i32) -> i32
+    if struct_ret_uses_sret(s, t, ty_sv) == 0
+        return 0
+    dload_add(s, reg, ty_sv, src_reg, null, 0)
+    1
+
+# As defer_large_struct_load, for `, ptr @<name>` (a global or const struct).
+pub fn defer_large_struct_load_named(s: *EmitterState, t: i32, reg: i32, ty_sv: StrView, name: *u8, name_len: i32) -> i32
+    if struct_ret_uses_sret(s, t, ty_sv) == 0
+        return 0
+    dload_add(s, reg, ty_sv, 0 - 1, name, name_len)
+    1
+
+# 1 when the store `store %T %.val, ptr %.dst` is the copy of a deferred load
+# and was emitted as the helper call.  0 means "emit the store as usual".
+pub fn defer_try_struct_copy_store(s: *EmitterState, t: i32, ty_sv: StrView, val: i32, dst: i32) -> i32
+    return defer_try_struct_copy_store_at(s, t, ty_sv, val, dst, null, 0)
+
+# As defer_try_struct_copy_store, for `, ptr @<name>` (a global destination).
+pub fn defer_try_struct_copy_store_named(s: *EmitterState, t: i32, ty_sv: StrView, val: i32, name: *u8, name_len: i32) -> i32
+    return defer_try_struct_copy_store_at(s, t, ty_sv, val, 0 - 1, name, name_len)
+
+fn defer_try_struct_copy_store_at(s: *EmitterState, t: i32, ty_sv: StrView, val: i32, dst: i32, dst_name: *u8, dst_name_len: i32) -> i32
+    if s.dload_count <= 0
+        return 0
+    if struct_ret_uses_sret(s, t, ty_sv) == 0
+        return 0
+    var ty: *u8 = ty_sv.ptr
+    var ty_len: i32 = ty_sv.len as i32
+    var i: i32 = 0
+    while i < s.dload_count
+        let r: *DeferredLoad = s.dloads + (i as i64)
+        if r.state == DLOAD_PENDING and r.reg == val and dload_region_cannot_write(s, r.off) == 1
+            if name_eq(StrView { ptr: (r.ty), len: (r.ty_len) as i64 }, StrView { ptr: (ty), len: (ty_len) as i64 }) == 1
+                emit_str(s, c"  call void @__ritz_sret_copy(ptr ")
+                if dst >= 0
+                    emit_reg(s, dst)
+                else
+                    emit_str(s, c"@")
+                    emit_name(s, StrView { ptr: (dst_name), len: (dst_name_len) as i64 })
+                emit_str(s, IR_PTR_SEP)
+                if r.src_reg >= 0
+                    emit_reg(s, r.src_reg)
+                else
+                    emit_str(s, c"@")
+                    emit_name(s, StrView { ptr: (r.src_name), len: (r.src_name_len) as i64 })
+                emit_str(s, IR_COMMA)
+                emit_sret_size(s, ty_sv)
+                emit_str(s, IR_CLOSE)
+                s.sret_helpers_used = 1
+                if r.used == 0
+                    r.state = DLOAD_DROPPED
+                else
+                    # Also read elsewhere: keep the load, copy anyway, as the
+                    # #1732 pass did when its dead-load count saw a reader.
+                    r.state = DLOAD_KEEP
+                return 1
+        i += 1
+    0
+
+# `  %.reg = <tytext>, ptr <src>` where <tytext> is what the load sites
+# spell for the type kind `t`.  Emits the load line, or holds it when `ty_sv`
+# is an sret-sized struct (AGAST #4461).  `src_reg` < 0 means the source is
+# the named global `src_name`.  Returns 1 when the line was held.
+pub fn emit_struct_load_or_defer(s: *EmitterState, t: i32, reg: i32, ty_sv: StrView, src_reg: i32, src_name: *u8, src_name_len: i32) -> i32
+    if src_reg < 0
+        if defer_large_struct_load_named(s, t, reg, ty_sv, src_name, src_name_len) == 1
+            return 1
+    else
+        if defer_large_struct_load(s, t, reg, ty_sv, src_reg) == 1
+            return 1
+    emit_str(s, IR_INDENT)
+    emit_reg(s, reg)
+    emit_str(s, IR_LOAD)
+    emit_llvm_type_struct(s, t, ty_sv)
+    emit_str(s, IR_PTR_SEP)
+    if src_reg < 0
+        emit_str(s, c"@")
+        emit_name(s, StrView { ptr: (src_name), len: (src_name_len) as i64 })
+    else
+        emit_reg(s, src_reg)
+    emit_str(s, IR_NL)
+    0
+
+# `  store %<ty> %.val, ptr %.dst`.  When it copies a held sret-sized struct
+# load, this is the `@__ritz_sret_copy` call instead (AGAST #4461).
+# Returns 1 when the copy call was emitted.
+pub fn emit_struct_store_or_copy(s: *EmitterState, t: i32, ty_sv: StrView, val: i32, dst: i32) -> i32
+    if defer_try_struct_copy_store(s, t, ty_sv, val, dst) == 1
+        return 1
+    emit_str(s, IR_STORE_IND)
+    emit_llvm_type_struct(s, t, ty_sv)
+    emit_str(s, IR_SP)
+    emit_reg(s, val)
+    emit_str(s, IR_PTR_SEP)
+    emit_reg(s, dst)
+    emit_str(s, IR_NL)
+    0
+
+# As emit_struct_store_or_copy, for a `, ptr @<name>` global destination.
+pub fn emit_struct_store_or_copy_named(s: *EmitterState, t: i32, ty_sv: StrView, val: i32, name: *u8, name_len: i32) -> i32
+    if defer_try_struct_copy_store_named(s, t, ty_sv, val, name, name_len) == 1
+        return 1
+    emit_str(s, IR_STORE_IND)
+    emit_llvm_type_struct(s, t, ty_sv)
+    emit_str(s, IR_SP)
+    emit_reg(s, val)
+    emit_str(s, c", ptr @")
+    emit_name(s, StrView { ptr: (name), len: (name_len) as i64 })
+    emit_str(s, IR_NL)
+    0
+
+# splice_entry_allocas inserted `n` bytes at body_start: every deferred line
+# moved with the body.
+pub fn defer_loads_shift(s: *EmitterState, n: i64)
+    var i: i32 = 0
+    while i < s.dload_count
+        let r: *DeferredLoad = s.dloads + (i as i64)
+        r.off = r.off + n
+        i += 1
+
+# The function body is complete: write each kept load back at its offset,
+# drop the rest, and forget the fn.
+pub fn splice_deferred_struct_loads(s: *EmitterState)
+    if s.dload_count <= 0
+        return
+    # Whatever is still pending was never paired with a store: dead if no
+    # reader, kept (written back) if one.
+    var j: i32 = 0
+    while j < s.dload_count
+        let r: *DeferredLoad = s.dloads + (j as i64)
+        if r.state == DLOAD_PENDING
+            if r.used == 0
+                r.state = DLOAD_DROPPED
+            else
+                r.state = DLOAD_KEEP
+        j += 1
+    var i: i32 = 0
+    var shift: i64 = 0
+    while i < s.dload_count
+        let r: *DeferredLoad = s.dloads + (i as i64)
+        if r.state == DLOAD_KEEP
+            # Render through the ordinary emitters into a scratch buffer, so
+            # the line is spelled exactly as the load site spells it.
+            var line: Vec<u8> = Vec<u8> { data: null, len: 0, cap: 0 }
+            let saved: *Vec<u8> = s.out
+            s.out = @line
+            emit_str(s, c"  ")
+            emit_reg(s, r.reg)
+            emit_str(s, c" = load %")
+            emit_name(s, StrView { ptr: (r.ty), len: (r.ty_len) as i64 })
+            emit_str(s, IR_PTR_SEP)
+            if r.src_reg >= 0
+                emit_reg(s, r.src_reg)
+            else
+                emit_str(s, c"@")
+                emit_name(s, StrView { ptr: (r.src_name), len: (r.src_name_len) as i64 })
+            emit_str(s, IR_NL)
+            s.out = saved
+            let at: i64 = r.off + shift
+            let old_len: i64 = s.out.len
+            vec_ensure_cap<u8>(s.out, old_len + line.len)
+            memmove(s.out.data + at + line.len, s.out.data + at, old_len - at)
+            memcpy(s.out.data + at, line.data, line.len)
+            s.out.len = old_len + line.len
+            shift = shift + line.len
+            free(line.data)
+        i += 1
+    var k: i32 = 0
+    while k < s.dload_count
+        let r2: *DeferredLoad = s.dloads + (k as i64)
+        if r2.ty != null
+            free(r2.ty)
+        if r2.src_name != null
+            free(r2.src_name)
+        k += 1
+    s.dload_count = 0
 
 # =============================================================================
 # Entry-block alloca buffer (AGAST #4460)
@@ -3327,8 +3676,8 @@ pub fn emit_sret_attr(s: *EmitterState, name_sv: StrView)
 # clang emits for a C `struct T` param on x86-64 SysV (a struct aligned past
 # 8, one of `v4i64`, takes its own alignment: AGAST #3656).  The callee
 # binds the param to the byval pointer, which it owns; the caller spills the argument into a fresh slot right after
-# evaluating it (emit_call_arg), so rewrite_large_struct_copies (#1732)
-# turns that spill into a pointer-to-pointer copy.  Uses the sret threshold,
+# evaluating it (emit_call_arg), and the store site emits that spill as a
+# pointer-to-pointer copy (#4461).  Uses the sret threshold,
 # so small structs, tagged enums and primitives keep their ABI.
 pub fn param_uses_byval(s: *EmitterState, p: *Param) -> i32
     if p == null
@@ -3728,13 +4077,7 @@ pub fn emit_sret_ret_value(s: *EmitterState, val: i32)
     emit_name(s, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
     emit_str(s, c"\n")
     entry_alloca_reg_end(s)
-    emit_str(s, c"  store %")
-    emit_name(s, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 })
-    emit_str(s, IR_SP)
-    emit_reg(s, val)
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, tmp)
-    emit_str(s, IR_NL)
+    emit_struct_store_or_copy(s, TYPE_STRUCT, StrView { ptr: (s.ret_type_name), len: (s.ret_type_name_len) as i64 }, val, tmp)
     emit_sret_ret_from_ptr(s, tmp)
 
 # Caller side: allocate the result slot for a call to an sret fn.  Emit it
@@ -3754,13 +4097,7 @@ pub fn emit_sret_call_slot(s: *EmitterState, name_sv: StrView) -> i32
 fn emit_sret_call_result(s: *EmitterState, result: i32, slot: i32, name_sv: StrView)
     var name: *u8 = name_sv.ptr
     var len: i32 = name_sv.len as i32
-    emit_str(s, IR_INDENT)
-    emit_reg(s, result)
-    emit_str(s, IR_LOAD_NAMED)
-    emit_name(s, StrView { ptr: (name), len: (len) as i64 })
-    emit_str(s, IR_PTR_SEP)
-    emit_reg(s, slot)
-    emit_str(s, IR_NL)
+    emit_struct_load_or_defer(s, TYPE_STRUCT, result, StrView { ptr: (name), len: (len) as i64 }, slot, null, 0)
     s.sret_last_val = result
     s.sret_last_slot = slot
 

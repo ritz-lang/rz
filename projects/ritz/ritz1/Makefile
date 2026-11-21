@@ -43,7 +43,6 @@ SOURCES = \
 	type_name_check \
 	named_variants \
 	index_through \
-	ll_copy_scan \
 	narrowing \
 	let_check \
 	ref_check \

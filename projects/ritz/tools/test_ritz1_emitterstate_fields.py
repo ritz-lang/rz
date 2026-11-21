@@ -50,7 +50,12 @@ SEMA_TYPE = SRC / "sema_type.ritz"
 # #4460 added five, all lowering state: entry_allocas and its saved out/reg
 # (the entry-block buffer and the swap), plus ea_marks/ea_count/ea_cap (the
 # frame-limit marks each buffered alloca records as it is emitted).
-MEASURED_FIELDS = 96
+#
+# #4461 added three, all lowering state: dloads/dload_count/dload_cap hold the
+# whole-struct loads this fn deferred (the sret copy choice is made at the
+# store site now), so they are the emitter's own buffer and counters, exactly
+# like entry_allocas and its marks -- not a fact Sema knows.
+MEASURED_FIELDS = 99
 
 # The three names the superseded acceptance grep counted (101 hits on main).
 # They are lowering state: every file that touches them is emitter-side.
